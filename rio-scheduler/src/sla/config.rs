@@ -39,6 +39,38 @@ pub enum CapacityType {
     Od,
 }
 
+impl CapacityType {
+    pub const ALL: [Self; 2] = [Self::Spot, Self::Od];
+
+    /// `karpenter.sh/capacity-type` label value (the string Karpenter
+    /// reads on `nodeSelectorTerms`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Spot => "spot",
+            Self::Od => "on-demand",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "spot" => Some(Self::Spot),
+            "od" | "on-demand" => Some(Self::Od),
+            _ => None,
+        }
+    }
+}
+
+/// `"h:cap"` ↔ `Cell` for the controller's `unfulfillable_cells` wire
+/// encoding and `sla_ema_state.key` strings.
+pub fn parse_cell(s: &str) -> Option<Cell> {
+    let (h, c) = s.rsplit_once(':')?;
+    Some((h.to_string(), CapacityType::parse(c)?))
+}
+
+pub fn cell_label((h, c): &Cell) -> String {
+    format!("{h}:{}", c.label())
+}
+
 /// Operator-chosen hw-class identifier (key into
 /// [`SlaConfig::hw_classes`]).
 pub type HwClassName = String;
@@ -225,7 +257,7 @@ fn default_max_forecast_cores_per_tenant() -> u32 {
 fn default_max_keys_per_tenant() -> usize {
     50_000
 }
-fn default_max_lead_time() -> f64 {
+pub(super) fn default_max_lead_time() -> f64 {
     600.0
 }
 fn default_consolidate_explore_epsilon() -> f64 {

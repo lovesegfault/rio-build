@@ -876,6 +876,92 @@ pub(crate) fn bare_actor_sla(pool: sqlx::PgPool) -> DagActor {
     )
 }
 
+/// `[sla]` config with 3 hw_classes + `hw_cost_source=Static` so the
+/// admissible-set solve_full path is reachable. ε_h=0 so per-dispatch
+/// results are deterministic (set explicitly in ε_h tests).
+pub(crate) fn test_hw_sla_config() -> crate::sla::config::SlaConfig {
+    use crate::sla::config::{HwClassDef, NodeLabelMatch};
+    let mut cfg = test_sla_config();
+    cfg.hw_cost_source = Some(crate::sla::cost::HwCostSource::Static);
+    cfg.hw_explore_epsilon = 0.0;
+    for h in ["intel-6", "intel-7", "intel-8"] {
+        cfg.hw_classes.insert(
+            h.into(),
+            HwClassDef {
+                labels: vec![NodeLabelMatch {
+                    key: "rio.build/hw-class".into(),
+                    value: h.into(),
+                }],
+            },
+        );
+    }
+    cfg
+}
+
+/// Seed one fitted Amdahl key (`S=30, P=2000`) on `actor`.
+pub(crate) fn seed_fit(actor: &DagActor, pname: &str) {
+    use crate::sla::types::*;
+    actor.sla_estimator.seed(FittedParams {
+        key: ModelKey {
+            pname: pname.into(),
+            system: "x86_64-linux".into(),
+            tenant: String::new(),
+        },
+        fit: DurationFit::Amdahl {
+            s: RefSeconds(30.0),
+            p: RefSeconds(2000.0),
+        },
+        mem: MemFit::Independent {
+            p90: MemBytes(6 << 30),
+        },
+        disk_p90: Some(DiskBytes(10 << 30)),
+        sigma_resid: 0.1,
+        log_residuals: Vec::new(),
+        n_eff: 10.0,
+        n_distinct_c: 5,
+        sum_w: 10.0,
+        span: 8.0,
+        explore: ExploreState {
+            distinct_c: 3,
+            min_c: RawCores(1.0),
+            max_c: RawCores(32.0),
+            saturated: false,
+            last_wall: WallSeconds(0.0),
+        },
+        t_min_ci: None,
+        ci_computed_at: None,
+        tier: None,
+        hw_bias: Default::default(),
+        alpha: crate::sla::alpha::UNIFORM,
+        prior_source: None,
+        is_fod: false,
+    });
+}
+
+/// Bare (unspawned) actor with [`test_hw_sla_config`] + populated
+/// 3-class hw table + one fitted key `"test-pkg"`. For
+/// admissible-set / ε_h / ICE-mask tests.
+pub(crate) fn bare_actor_hw(pool: sqlx::PgPool) -> DagActor {
+    let mut actor = bare_actor_cfg(
+        pool,
+        DagActorConfig {
+            sla: test_hw_sla_config(),
+            ..Default::default()
+        },
+    );
+    actor.sla_tiers = actor.sla_config.solve_tiers();
+    actor.sla_ceilings = actor.sla_config.ceilings();
+    let mut m = std::collections::HashMap::new();
+    m.insert("intel-6".into(), 1.0);
+    m.insert("intel-7".into(), 1.4);
+    m.insert("intel-8".into(), 2.0);
+    actor
+        .sla_estimator
+        .seed_hw(crate::sla::hw::HwTable::from_map(m));
+    seed_fit(&actor, "test-pkg");
+    actor
+}
+
 /// Bootstrap PG + spawned actor with the realistic-ceiling `[sla]`
 /// config. For end-to-end `GetSpawnIntents` tests via [`ActorHandle`].
 pub(crate) async fn setup_with_big_ceilings() -> (TestDb, ActorHandle, tokio::task::JoinHandle<()>)

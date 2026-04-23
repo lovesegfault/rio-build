@@ -430,7 +430,7 @@ mod tests {
             };
             let (_, _, alpha, rounds) = als_fit(&cs, &walls, &factors, &w, &gate, UNIFORM);
             prop_assert!(on_simplex(alpha), "α={alpha:?}");
-            prop_assert!(rounds >= 1 && rounds <= ALS_MAX_ROUNDS);
+            prop_assert!((1..=ALS_MAX_ROUNDS).contains(&rounds));
         }
     }
 }

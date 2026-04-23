@@ -4,8 +4,6 @@ See ADR-023 for design rationale. This document is the normative spec.
 
 r[sched.sla.tier-envelope]
 
-r[sched.sla.solve-per-band-cap]
-
 r[sched.sla.model-key-tenant-scoped]
 
 r[sched.sla.fit-nnls]
@@ -37,9 +35,6 @@ r[sched.sla.hw-bench-append-only]
 
 r[sched.sla.cost-leader-edge-reload]
 On a false→true leader edge, the cost-table poller MUST reload `sla_ema_state` from PG before its first `persist()`. A failed reload MUST NOT proceed to `persist()` (which would overwrite the previous leader's evolved EMA with this replica's stale startup snapshot); retry on the next tick.
-
-r[sched.sla.ice-ladder-cap]
-A single derivation's ICE-backoff ladder MUST NOT exceed `ladder_cap = clamp(⌈max_tier_bound/hw_fallback_after/4⌉, 1, 8)` Pending-watch timeouts; on exhaustion the derivation MUST fall through to band-agnostic dispatch (`solve_intent_for` skips `solve_full`). The fleet-wide `IceBackoff::exhausted()` is unreachable from one build's serial probing because `ICE_TTL=60s < hw_fallback_after≈120s`. Attempted `(band, cap)` cells SHOULD be recorded for forensics.
 
 `hw_class` is bounded at `MAX_HW_CLASS_LEN` (64) chars of `[a-z0-9-]`
 (the controller-stamped 4-segment format); longer or out-of-charset

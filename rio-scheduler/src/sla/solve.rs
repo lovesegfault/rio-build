@@ -1,13 +1,16 @@
-use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use rand::{Rng, RngExt};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
-use super::config::SlaConfig;
-use super::cost::{Band, Cap, CostTable, IceBackoff};
+use super::alpha;
+use super::config::{CapacityType, Cell, HwClassDef, HwClassName, SlaConfig};
+use super::cost::CostTable;
 use super::explore;
 use super::fit::headroom;
-use super::hw::HwTable;
+use super::hw::{HW_FACTOR_SANITY_FLOOR, HwTable};
 use super::r#override::ResolvedTarget;
 use super::quantile;
 use super::types::{DiskBytes, DurationFit, FittedParams, MemBytes, RawCores};
@@ -79,16 +82,11 @@ pub enum SolveResult {
         c_star: RawCores,
         mem: MemBytes,
         disk: DiskBytes,
-        /// `rio.build/hw-band` + `karpenter.sh/capacity-type` (+
-        /// optionally `rio.build/storage`). `None` under
-        /// `hw_cost_source = None` (band-agnostic [`solve_mvp`]).
-        node_selector: Option<BTreeMap<String, String>>,
     },
     BestEffort {
         c: RawCores,
         mem: MemBytes,
         disk: DiskBytes,
-        node_selector: Option<BTreeMap<String, String>>,
     },
 }
 
@@ -109,26 +107,17 @@ impl SolveResult {
             Self::Feasible { disk, .. } | Self::BestEffort { disk, .. } => *disk,
         }
     }
-    pub fn node_selector(&self) -> Option<&BTreeMap<String, String>> {
-        match self {
-            Self::Feasible { node_selector, .. } | Self::BestEffort { node_selector, .. } => {
-                node_selector.as_ref()
-            }
-        }
-    }
 }
 
-/// `rio_scheduler_sla_infeasible_total{reason=…}` label values. The
-/// type-safe single emit point for the metric — every caller routes
-/// through [`Self::emit`] so the label string can't drift from
-/// `observability.md` and adding the `tenant` label later (A9, when the
-/// admissible-set solve threads tenant through `solve_full`) is a
-/// 1-line change.
+/// `rio_scheduler_sla_infeasible_total{reason=…,tenant=…}` label
+/// values. The type-safe single emit point for the metric — every
+/// caller routes through [`Self::emit`] so the label string can't drift
+/// from `observability.md`.
 ///
 /// ADR-023 §Observability splits the legacy `ceiling_exhausted` reason
 /// into the four specific ceilings + `interrupt_runaway` so the alert
 /// names which dimension is binding. [`classify_ceiling`] computes the
-/// split for the pre-A9 `solve_mvp`/`solve_full` BestEffort fallthrough.
+/// split for the [`solve_mvp`] BestEffort fallthrough.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InfeasibleReason {
     /// `S ≥ bound` at the loosest tier — even infinite cores can't help.
@@ -168,12 +157,14 @@ impl InfeasibleReason {
         }
     }
 
-    /// Increment `rio_scheduler_sla_infeasible_total{reason=…}`. Single
-    /// emit point — grep `\.emit()` to find every infeasible call site.
-    pub fn emit(self) {
+    /// Increment `rio_scheduler_sla_infeasible_total{reason=…,tenant=…}`.
+    /// Single emit point — grep `\.emit(` to find every infeasible call
+    /// site.
+    pub fn emit(self, tenant: &str) {
         metrics::counter!(
             "rio_scheduler_sla_infeasible_total",
-            "reason" => self.as_str()
+            "reason" => self.as_str(),
+            "tenant" => tenant.to_owned()
         )
         .increment(1);
     }
@@ -210,27 +201,43 @@ pub fn classify_ceiling(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> 
     }
 }
 
-/// One feasible `(band, cap)` cell from [`solve_full`]'s inner loop.
-/// `e_cost` is the comparable scalar for [`softmax_pick`].
+/// One feasible `(h, cap)` cell from [`solve_full`]'s inner loop.
+/// `e_cost_upper` (ADR-023 L621) is the comparable scalar for the
+/// admissible-set Schmitt deadband; `factor`/`lambda` are kept so the
+/// re-filter can recompute `e_cost(c*)` without re-reading the tables.
 #[derive(Debug, Clone)]
 pub struct Candidate {
-    pub band: Band,
-    pub cap: Cap,
-    pub c_star: RawCores,
-    pub mem: MemBytes,
-    pub e_cost: f64,
+    pub cell: Cell,
+    pub c_star: u32,
+    pub e_cost_upper: f64,
+    /// Per-h `(α·factor[h]) / bias[h]` — what `T_ref(c)` is divided by.
+    pub factor: f64,
+    /// Per-h Poisson interrupt rate (0.0 for `Od`).
+    pub lambda: f64,
 }
 
-impl Candidate {
-    /// Pod nodeSelector for this `(band, cap)`. Storage is left to the
-    /// controller's per-pool `rio.build/storage` selector (the solve
-    /// doesn't yet bias storage; phase-14 wires `disk_p90` → nvme).
-    pub fn selector(&self) -> BTreeMap<String, String> {
-        BTreeMap::from([
-            ("rio.build/hw-band".into(), self.band.label().into()),
-            ("karpenter.sh/capacity-type".into(), self.cap.label().into()),
-        ])
-    }
+/// Re-filtered admissible set + sizing. The deterministic output of
+/// [`solve_full`] given `(fit, override, hw, cost, cfg)` — what the
+/// memo caches.
+#[derive(Debug, Clone)]
+pub struct AdmissibleSet {
+    /// Re-filtered cells — all satisfy fit-at-c*, cost-at-c* ≤
+    /// (1+τ)E_min, c*_{h,cap} ≥ c*/k. Never empty (the argmax cell
+    /// provably survives all three).
+    pub cells: Vec<Cell>,
+    pub c_star: u32,
+    pub mem_bytes: u64,
+    pub disk_bytes: u64,
+}
+
+/// One memo entry: `(A', candidates, tier)`. `all_candidates` lets the
+/// per-dispatch ε_h draw and the controller's `GetSpawnIntents`
+/// per-cell deficit see every feasible cell, not just `A'`.
+#[derive(Debug, Clone)]
+pub struct SolveMemo {
+    pub a: AdmissibleSet,
+    pub all_candidates: Vec<Candidate>,
+    pub tier: String,
 }
 
 /// Dispatch-time prediction snapshot. Stored on
@@ -412,7 +419,7 @@ pub fn intent_for(
             .iter()
             .any(|t| t.p50.is_some() || t.p90.is_some() || t.p99.is_some())
     {
-        classify_ceiling(fit, tiers, ceil).emit();
+        classify_ceiling(fit, tiers, ceil).emit(&fit.key.tenant);
     }
     // ceil + clamp ≥1: solve_mvp's c_star is already ≥1.0 but
     // BestEffort.c can be fractional below 1 for degenerate fits.
@@ -563,7 +570,6 @@ pub fn solve_mvp(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> SolveRe
             c_star,
             mem: MemBytes(mem),
             disk: DiskBytes(disk),
-            node_selector: None,
         };
     }
     // Pure: callers emit `rio_scheduler_sla_infeasible_total{reason=…}`
@@ -590,7 +596,6 @@ fn best_effort(fit: &FittedParams, cap_c: f64, h: f64, disk: u64, ceil: &Ceiling
         c: RawCores(cap_c),
         mem: MemBytes(mem),
         disk: DiskBytes(disk.min(ceil.max_disk)),
-        node_selector: None,
     }
 }
 
@@ -610,19 +615,63 @@ fn c_lambda(fit: &FittedParams, lambda: f64, factor: f64) -> f64 {
     (p / (target - s)).max(1.0)
 }
 
-// r[impl sched.sla.solve-per-band-cap]
-/// Algorithm 4: per-`(band, cap)` envelope solve + cost softmax.
+/// Admissible-set [`solve_full`] outcome. `Feasible` carries the
+/// memoizable [`SolveMemo`]; `BestEffort` carries the full `H × cap`
+/// cell list (no admissible-set filtering).
+#[derive(Debug, Clone)]
+pub enum SolveFullResult {
+    Feasible(SolveMemo),
+    BestEffort {
+        c: u32,
+        mem_bytes: u64,
+        disk_bytes: u64,
+        cells: Vec<Cell>,
+    },
+}
+
+/// `E[cost]^upper` for one cell at core count `c` (ADR-023 L621):
+/// `price · c · (T(c)/factor)/3600 · e^{σ²/2} / (1-p)`. `p` is clamped
+/// at 0.499 — callers gate `p(C)>0.5` separately so the divisor
+/// stays `> 0.5`.
+fn e_cost_upper(fit: &FittedParams, c: u32, factor: f64, lambda: f64, price: f64) -> f64 {
+    let t = fit.fit.t_at(RawCores(f64::from(c))).0 / factor;
+    let p = if lambda > 0.0 {
+        (1.0 - (-lambda * t).exp()).min(0.499)
+    } else {
+        0.0
+    };
+    price * f64::from(c) * t / 3600.0 * (fit.sigma_resid.powi(2) / 2.0).exp() / (1.0 - p)
+}
+
+/// Per-h effective scalar factor for `fit`: `(α·factor[h]) / bias[h]`,
+/// floored at [`HW_FACTOR_SANITY_FLOOR`]. ADR-023 L612 — `T(c, h) =
+/// T_ref(c) / factor`. Unknown / <3-pod h → 1.0.
+fn hw_factor_for(fit: &FittedParams, hw: &HwTable, h: &str) -> f64 {
+    let f = hw.factor(h).unwrap_or([1.0; super::hw::K]);
+    let bias = fit.hw_bias.get(h).copied().unwrap_or(1.0);
+    (alpha::dot(fit.alpha, f) / bias).max(HW_FACTOR_SANITY_FLOOR)
+}
+
+// r[impl sched.sla.hw-class.admissible-set]
+/// Algorithm `alg-estimate-full` (ADR-023 L781-812): per-`(h, cap)`
+/// envelope solve + admissible-set + re-filter.
 ///
-/// For each tier (tightest-first), enumerate all 6 `(band, cap)`
-/// cells, skip ICE-backed-off ones, run [`solve_envelope`] with that
-/// cell's `(h†_factor, λ)`, gate on `p(C) ≤ 0.5` for spot, gate on
-/// mem/disk ceilings, compute `E[cost]`. If ≥1 candidate survives,
-/// [`softmax_pick`] one and return `Feasible` with its nodeSelector.
-/// If no tier yields a candidate, fall through to band-agnostic
-/// `BestEffort`.
+/// For each tier (tightest-first), enumerate `(h, cap) ∈ h_set ×
+/// {spot, od}`: gate spot on `p(C) ≤ 0.5`; bisect c* satisfying the
+/// envelope; gate on mem ceiling and `smallest_fitting`; compute
+/// `E[cost]^upper`. If ≥1 candidate survives, build the admissible
+/// set with Schmitt deadband (`τ_enter=τ`, `τ_exit=1.3τ`), take
+/// `c* = max_A c*_{h,cap}`, then re-filter `A` by fit-at-c*,
+/// cost-at-c* ≤ (1+τ)E_min, and capacity-ratio `c*_{h,cap} ≥ c*/k`.
 ///
-/// `temp` is the softmax temperature — `0.0` = greedy
-/// argmin, higher = more spread.
+/// **Deterministic** — the ICE mask and ε_h draw are applied at
+/// dispatch time outside this function (read-time mask), so the
+/// result is memoizable on `(fit_hash, override_hash, inputs_gen)`.
+/// `prev_a` (the previous tick's admissible set for THIS key) feeds
+/// the Schmitt deadband.
+///
+/// `h_set` is `cfg.hw_classes.keys()` for the unrestricted solve;
+/// the ε_h pin passes a singleton.
 #[allow(clippy::too_many_arguments)]
 pub fn solve_full(
     fit: &FittedParams,
@@ -630,40 +679,39 @@ pub fn solve_full(
     hw: &HwTable,
     cost: &CostTable,
     ceil: &Ceilings,
-    ice: &IceBackoff,
-    temp: f64,
-    rng: &mut impl Rng,
-) -> SolveResult {
+    cfg: &SlaConfig,
+    h_set: &[HwClassName],
+    prev_a: &HashSet<Cell>,
+) -> SolveFullResult {
     debug_assert!(
         !matches!(fit.fit, DurationFit::Probe),
         "solve_full called with DurationFit::Probe — gate must filter"
     );
     let cap_c = fit.fit.p_bar().0.min(fit.fit.c_opt().0).min(ceil.max_cores);
-    let h = headroom(fit.n_eff);
+    let hr = headroom(fit.n_eff);
     let disk = fit.disk_p90.map(|d| d.0).unwrap_or(ceil.default_disk);
+    let tau = cfg.hw_cost_tolerance;
+    let k = 2.0;
 
     for tier in tiers {
-        let mut candidates = Vec::with_capacity(6);
-        for band in Band::ALL {
-            for cap in Cap::ALL {
-                if ice.is_infeasible(band, cap) {
-                    continue;
-                }
-                let (_, factor) = hw.h_dagger(fit.alpha, band, &fit.hw_bias);
+        let mut candidates: Vec<Candidate> = Vec::with_capacity(h_set.len() * 2);
+        for h in h_set {
+            let factor = hw_factor_for(fit, hw, h);
+            for cap in CapacityType::ALL {
+                let cell = (h.clone(), cap);
                 let lambda = match cap {
-                    Cap::Spot => cost.lambda_band(band),
-                    Cap::OnDemand => 0.0,
+                    CapacityType::Spot => cost.lambda_for(h),
+                    CapacityType::Od => 0.0,
                 };
                 // p(cap_c) > 0.5 ⇒ spot infeasible regardless of c
                 // (the geometric retry tail blows every quantile).
-                if cap == Cap::Spot {
+                if cap == CapacityType::Spot {
                     let t_cap = fit.fit.t_at(RawCores(cap_c)).0 / factor;
-                    let p_at_cap = 1.0 - (-lambda * t_cap).exp();
-                    if p_at_cap > 0.5 {
+                    if 1.0 - (-lambda * t_cap).exp() > 0.5 {
                         continue;
                     }
                 }
-                let c_lo = if cap == Cap::Spot {
+                let c_lo = if cap == CapacityType::Spot {
                     c_lambda(fit, lambda, factor).ceil()
                 } else {
                     1.0
@@ -674,88 +722,237 @@ pub fn solve_full(
                 let Some(c_star) = solve_envelope(fit, tier, c_lo, cap_c, factor, lambda) else {
                     continue;
                 };
-                let mem = (fit.mem.at(c_star).0 as f64 * h) as u64;
+                let c_star = (c_star.0.ceil() as u32).max(1);
+                let mem = (fit.mem.at(RawCores(f64::from(c_star))).0 as f64 * hr) as u64;
                 if mem > ceil.max_mem || disk > ceil.max_disk {
                     continue;
                 }
-                let e_cost = cost.expected_cost(band, cap, c_star, mem, fit, factor, lambda);
+                let Some(price) = cost.smallest_fitting(&cell, c_star, mem) else {
+                    continue; // menu non-empty AND no type fits → reject
+                };
                 candidates.push(Candidate {
-                    band,
-                    cap,
+                    cell,
                     c_star,
-                    mem: MemBytes(mem),
-                    e_cost,
+                    e_cost_upper: e_cost_upper(fit, c_star, factor, lambda, price),
+                    factor,
+                    lambda,
                 });
             }
         }
-        if let Some(chosen) = softmax_pick(&candidates, temp, rng) {
-            return SolveResult::Feasible {
-                tier: tier.name.clone(),
-                c_star: chosen.c_star,
-                mem: chosen.mem,
-                disk: DiskBytes(disk),
-                node_selector: Some(chosen.selector()),
-            };
+        if candidates.is_empty() {
+            continue;
         }
+        // Schmitt deadband: τ_enter for cells not in prev_A, τ_exit
+        // (=1.3τ) for cells already in.
+        let e_min = candidates
+            .iter()
+            .map(|c| c.e_cost_upper)
+            .fold(f64::INFINITY, f64::min);
+        let in_a: Vec<&Candidate> = candidates
+            .iter()
+            .filter(|c| {
+                let thresh = if prev_a.contains(&c.cell) {
+                    1.0 + 1.3 * tau
+                } else {
+                    1.0 + tau
+                };
+                c.e_cost_upper <= thresh * e_min
+            })
+            .collect();
+        // c* = max over A — SLA-correct on the slowest h ∈ A.
+        let c_star = in_a.iter().map(|c| c.c_star).max().expect("e_min ∈ A");
+        let mem = (fit.mem.at(RawCores(f64::from(c_star))).0 as f64 * hr) as u64;
+        // Re-filter at c*: type-fit, cost-at-c* ≤ (1+τ)E_min, and
+        // capacity-ratio c*_{h,cap} ≥ c*/k. The argmax cell has
+        // c*_{h,cap} = c*, e_cost(c*) = e_cost_upper, and was admitted
+        // by smallest_fitting at its own c* ≤ c* — but a larger
+        // shared c* MAY exceed its menu, so the argmax-survives proof
+        // relies on the e_cost(c*) check using the candidate's OWN
+        // factor/lambda (it does) and on the menu degrading to EMA
+        // when empty. The non-empty guarantee is `debug_assert`ed.
+        let cells: Vec<Cell> = in_a
+            .iter()
+            .filter(|c| {
+                f64::from(c.c_star) >= f64::from(c_star) / k
+                    && cost
+                        .smallest_fitting(&c.cell, c_star, mem)
+                        .is_some_and(|price| {
+                            e_cost_upper(fit, c_star, c.factor, c.lambda, price)
+                                <= (1.0 + tau) * e_min
+                        })
+            })
+            .map(|c| c.cell.clone())
+            .collect();
+        debug_assert!(
+            !cells.is_empty(),
+            "argmax cell must survive re-filter (A'≠∅)"
+        );
+        return SolveFullResult::Feasible(SolveMemo {
+            a: AdmissibleSet {
+                cells,
+                c_star,
+                mem_bytes: mem,
+                disk_bytes: disk.min(ceil.max_disk),
+            },
+            all_candidates: candidates,
+            tier: tier.name.clone(),
+        });
     }
-    if ice.exhausted() {
-        InfeasibleReason::CapacityExhausted.emit();
-    } else if tiers
+    // All tiers infeasible → BestEffort over the full H×cap. The
+    // capacity-exhausted vs ceiling-exhausted distinction (and the
+    // metric emit) is the dispatch wrapper's job — this function is
+    // pure for memoization.
+    let cells: Vec<Cell> = h_set
         .iter()
-        .any(|t| t.p50.is_some() || t.p90.is_some() || t.p99.is_some())
-    {
-        classify_ceiling(fit, tiers, ceil).emit();
+        .flat_map(|h| CapacityType::ALL.map(|c| (h.clone(), c)))
+        .collect();
+    let mem = ((fit.mem.at(RawCores(cap_c)).0 as f64 * hr) as u64).min(ceil.max_mem);
+    SolveFullResult::BestEffort {
+        c: (cap_c.ceil() as u32).max(1),
+        mem_bytes: mem,
+        disk_bytes: disk.min(ceil.max_disk),
+        cells,
     }
-    // `cap_c` already includes `c_opt` so a USL fit isn't pushed into
-    // its slowdown region (e.g. p̄=∞ with c_opt=20 must NOT return 64).
-    best_effort(fit, cap_c, h, disk, ceil)
 }
 
-/// Weighted-random pick over `candidates` by `exp(-e_cost/min/temp)`.
-/// `temp ≤ 0` or `len()==1` → argmin. `None` for empty input.
+/// Per-key solve memo. Keyed on `(fit_hash, override_hash)`; the stored
+/// `inputs_gen` is checked against the cache's atomic counter — a miss
+/// means the shared inputs (HwTable / CostTable / SlaConfig) changed,
+/// and the stored entry's `a.cells` becomes the Schmitt `prev_a`.
 ///
-/// Normalizing by `min(e_cost)` makes the softmax scale-free: a 2×
-/// price ratio gets the same weight split whether the absolute costs
-/// are $0.01 or $10. The exponent is clamped to avoid `inf` on
-/// degenerate inputs.
-pub fn softmax_pick<'a>(
-    candidates: &'a [Candidate],
-    temp: f64,
-    rng: &mut impl Rng,
-) -> Option<&'a Candidate> {
-    match candidates {
-        [] => return None,
-        [only] => return Some(only),
-        _ => {}
+/// `inputs_gen` is bumped by the actor on `HwTable`/`CostTable` refresh
+/// and `SlaConfig` reload (ADR-023 L616). ICE state is NOT in
+/// `inputs_gen` — the read-time mask touches only intents whose cached
+/// `A` intersects the masked cell.
+#[derive(Debug, Default)]
+pub struct SolveCache {
+    inputs_gen: AtomicU64,
+    entries: DashMap<(u64, u64), (u64, SolveMemo)>,
+}
+
+impl SolveCache {
+    /// Bump the fleet-wide solve-input generation. Call on
+    /// `HwTable`/`CostTable` refresh and `SlaConfig` reload.
+    pub fn bump_inputs_gen(&self) {
+        self.inputs_gen.fetch_add(1, Ordering::Relaxed);
     }
-    let min = candidates
-        .iter()
-        .map(|c| c.e_cost)
-        .fold(f64::INFINITY, f64::min)
-        .max(f64::EPSILON);
-    if temp <= 0.0 {
-        return candidates
-            .iter()
-            .min_by(|a, b| a.e_cost.partial_cmp(&b.e_cost).unwrap());
+
+    pub fn inputs_gen(&self) -> u64 {
+        self.inputs_gen.load(Ordering::Relaxed)
     }
-    let weights: Vec<f64> = candidates
-        .iter()
-        .map(|c| ((-c.e_cost / min) / temp).clamp(-700.0, 0.0).exp())
-        .collect();
-    let total: f64 = weights.iter().sum();
-    if total <= 0.0 || !total.is_finite() {
-        return candidates
-            .iter()
-            .min_by(|a, b| a.e_cost.partial_cmp(&b.e_cost).unwrap());
-    }
-    let mut r = rng.random::<f64>() * total;
-    for (c, w) in candidates.iter().zip(&weights) {
-        r -= w;
-        if r <= 0.0 {
-            return Some(c);
+
+    /// Read the memo for `(fit_hash, override_hash)` at the current
+    /// generation, or compute via `f(prev_a)` and insert. `prev_a` is
+    /// the previous generation's `A'` (Schmitt history), empty on
+    /// first sight.
+    pub fn get_or_insert_with(
+        &self,
+        fit_hash: u64,
+        override_hash: u64,
+        f: impl FnOnce(&HashSet<Cell>) -> Option<SolveMemo>,
+    ) -> Option<SolveMemo> {
+        let g = self.inputs_gen();
+        let key = (fit_hash, override_hash);
+        // Copy out under guard (DashMap shard non-reentrant), then
+        // decide: hit if stored gen matches; otherwise stored A' is
+        // prev_a for the recompute.
+        let prior = self.entries.get(&key).map(|e| e.clone());
+        if let Some((stored_g, memo)) = &prior
+            && *stored_g == g
+        {
+            return Some(memo.clone());
         }
+        let prev_a: HashSet<Cell> = prior
+            .map(|(_, m)| m.a.cells.into_iter().collect())
+            .unwrap_or_default();
+        let memo = f(&prev_a)?;
+        self.entries.insert(key, (g, memo.clone()));
+        Some(memo)
     }
-    candidates.last()
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Stable hash of the solve-relevant fields of `fit`. Changes whenever
+/// a refit moves the curve enough to change the solve output.
+pub fn fit_hash(fit: &FittedParams) -> u64 {
+    let mut h = std::hash::DefaultHasher::new();
+    fit.key.pname.hash(&mut h);
+    fit.key.system.hash(&mut h);
+    fit.key.tenant.hash(&mut h);
+    let (s, p, q) = fit.fit.spq();
+    for x in [
+        s,
+        p,
+        q,
+        fit.fit.p_bar().0,
+        fit.sigma_resid,
+        fit.n_eff,
+        fit.sum_w,
+    ] {
+        x.to_bits().hash(&mut h);
+    }
+    fit.n_distinct_c.hash(&mut h);
+    fit.disk_p90.map(|d| d.0).hash(&mut h);
+    match &fit.mem {
+        super::types::MemFit::Coupled { a, b, .. } => {
+            a.to_bits().hash(&mut h);
+            b.to_bits().hash(&mut h);
+        }
+        super::types::MemFit::Independent { p90 } => p90.0.hash(&mut h),
+    }
+    for a in fit.alpha {
+        a.to_bits().hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Stable hash of the solve-relevant override fields. `None` → 0.
+pub fn override_hash(o: Option<&ResolvedTarget>) -> u64 {
+    let Some(o) = o else { return 0 };
+    let mut h = std::hash::DefaultHasher::new();
+    o.forced_cores.map(f64::to_bits).hash(&mut h);
+    o.forced_mem.hash(&mut h);
+    o.tier.hash(&mut h);
+    h.finish()
+}
+
+/// Map `cells` to `nodeSelectorTerms` — OR of (h-label conjunction AND
+/// `karpenter.sh/capacity-type=cap`). ADR-023 L650: capacity-type MUST
+/// be in the term — the solve may admit `(h, od)` while rejecting
+/// `(h, spot)` on interruption tail. An `h` not in `hw_classes` is
+/// dropped.
+pub fn cells_to_selector_terms(
+    cells: &[Cell],
+    hw_classes: &HashMap<HwClassName, HwClassDef>,
+) -> Vec<rio_proto::types::NodeSelectorTerm> {
+    use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm};
+    cells
+        .iter()
+        .filter_map(|(h, cap)| {
+            let def = hw_classes.get(h)?;
+            let mut match_expressions: Vec<NodeSelectorRequirement> = def
+                .labels
+                .iter()
+                .map(|l| NodeSelectorRequirement {
+                    key: l.key.clone(),
+                    operator: "In".into(),
+                    values: vec![l.value.clone()],
+                })
+                .collect();
+            match_expressions.push(NodeSelectorRequirement {
+                key: "karpenter.sh/capacity-type".into(),
+                operator: "In".into(),
+                values: vec![cap.label().into()],
+            });
+            Some(NodeSelectorTerm { match_expressions })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1364,185 +1561,396 @@ mod tests {
         let (_, _, d) = intent(Some(&explore_fit), &DrvHints::default());
         assert!(d <= max, "explore: disk {d} > max_disk {max}");
     }
-    // ─── solve_full / softmax (Algorithm 4) ─────────────────────────
+    // ─── solve_full (admissible set, alg-estimate-full) ─────────────
 
-    use rand::SeedableRng;
-    use rand::rngs::StdRng;
-    use std::collections::HashMap;
+    use proptest::prelude::*;
 
-    fn hw_mid_only() -> HwTable {
-        // Only mid-band has bench data; hi/lo fall back to factor=1.0
-        // (the empty-band h_dagger path).
+    fn hw_three() -> HwTable {
         let mut m = HashMap::new();
-        m.insert("aws-7-ebs-mid".into(), 1.0);
-        m.insert("aws-7-nvme-mid".into(), 1.2);
+        m.insert("intel-6".into(), 1.0);
+        m.insert("intel-7".into(), 1.4);
+        m.insert("intel-8".into(), 2.0);
         HwTable::from_map(m)
     }
 
-    fn cand(band: Band, cap: Cap, e_cost: f64) -> Candidate {
-        Candidate {
-            band,
-            cap,
-            c_star: RawCores(4.0),
-            mem: MemBytes(2 << 30),
-            e_cost,
-        }
+    fn h_set() -> Vec<HwClassName> {
+        vec!["intel-6".into(), "intel-7".into(), "intel-8".into()]
     }
 
-    // r[verify sched.sla.solve-per-band-cap]
+    fn cfg_hw() -> SlaConfig {
+        let mut c = cfg();
+        for h in h_set() {
+            c.hw_classes.insert(
+                h.clone(),
+                super::super::config::HwClassDef {
+                    labels: vec![super::super::config::NodeLabelMatch {
+                        key: "rio.build/hw-class".into(),
+                        value: h,
+                    }],
+                },
+            );
+        }
+        c
+    }
+
+    // r[verify sched.sla.hw-class.admissible-set]
     #[test]
-    fn picks_cheapest_feasible_band_cap() {
+    fn admissible_set_schmitt_deadband() {
+        // 3 hw_classes at factor 1.0/1.4/2.0, equal price (seed). The
+        // fastest h needs the FEWEST cores to hit p90, so e_cost ∝ c·T
+        // is lowest there → e_min at (intel-8, spot). Slow classes'
+        // c*·T ratio determines admission against τ.
         let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
-        let cost = CostTable::default(); // seed: spot < on-demand
-        let mut rng = StdRng::seed_from_u64(0);
+        let cfg = cfg_hw();
         let r = solve_full(
             &fit,
-            &[t("normal", 1200.0)],
-            &hw_mid_only(),
+            &[t("normal", 300.0)],
+            &hw_three(),
+            &CostTable::default(),
+            &ceil(),
+            &cfg,
+            &h_set(),
+            &HashSet::new(),
+        );
+        let SolveFullResult::Feasible(memo) = r else {
+            panic!("Feasible expected")
+        };
+        // All 6 (h,cap) candidates feasible at p90=300 (intel-6 c*≈9,
+        // intel-8 c*≈4); admissible set is governed by τ=0.15.
+        assert_eq!(memo.all_candidates.len(), 6);
+        let e_min = memo
+            .all_candidates
+            .iter()
+            .map(|c| c.e_cost_upper)
+            .fold(f64::INFINITY, f64::min);
+        for cell in &memo.a.cells {
+            let cand = memo
+                .all_candidates
+                .iter()
+                .find(|c| c.cell == *cell)
+                .unwrap();
+            assert!(
+                cand.e_cost_upper <= (1.0 + cfg.hw_cost_tolerance) * e_min + 1e-9,
+                "{cell:?} e_cost {} > (1+τ)·{e_min}",
+                cand.e_cost_upper
+            );
+        }
+        // c* = max over A → SLA-correct on slowest admitted h.
+        let max_c_in_a = memo
+            .all_candidates
+            .iter()
+            .filter(|c| memo.a.cells.contains(&c.cell))
+            .map(|c| c.c_star)
+            .max()
+            .unwrap();
+        assert_eq!(memo.a.c_star, max_c_in_a);
+        // The argmax cell (highest c*_{h,cap}) MUST be in A'.
+        let argmax = memo
+            .all_candidates
+            .iter()
+            .filter(|c| memo.a.cells.contains(&c.cell))
+            .max_by_key(|c| c.c_star)
+            .unwrap();
+        assert!(memo.a.cells.contains(&argmax.cell), "argmax cell survives");
+
+        // Schmitt: a cell at e=1.18·e_min is OUT fresh (τ=0.15) but IN
+        // when prev_a contains it (τ_exit=0.195). Construct such a
+        // cell via a price bump on intel-6.
+        let mut cost = CostTable::default();
+        cost.set_price(
+            "intel-6",
+            CapacityType::Spot,
+            super::super::cost::ON_DEMAND_SEED * 0.35 * 1.18,
+            1e9,
+        );
+        let prev: HashSet<Cell> = [("intel-6".into(), CapacityType::Spot)].into();
+        let SolveFullResult::Feasible(m_fresh) = solve_full(
+            &fit,
+            &[t("normal", 300.0)],
+            &hw_three(),
             &cost,
             &ceil(),
-            &IceBackoff::default(),
-            0.0, // greedy
-            &mut rng,
-        );
-        let SolveResult::Feasible { node_selector, .. } = r else {
-            panic!("expected Feasible")
+            &cfg,
+            &h_set(),
+            &HashSet::new(),
+        ) else {
+            panic!()
         };
-        let ns = node_selector.expect("solve_full sets selector");
-        // Greedy + seed prices ⇒ spot. Band depends on h_dagger; with
-        // mid-only hw table, all bands solve at factor≤1.0 so cheapest
-        // $/vCPU·hr (lo-band spot) wins.
-        assert_eq!(ns.get("karpenter.sh/capacity-type").unwrap(), "spot");
-        assert_eq!(ns.get("rio.build/hw-band").unwrap(), "lo");
+        let SolveFullResult::Feasible(m_prev) = solve_full(
+            &fit,
+            &[t("normal", 300.0)],
+            &hw_three(),
+            &cost,
+            &ceil(),
+            &cfg,
+            &h_set(),
+            &prev,
+        ) else {
+            panic!()
+        };
+        // The deadband can only widen membership, never shrink.
+        assert!(
+            m_prev.a.cells.len() >= m_fresh.a.cells.len(),
+            "Schmitt τ_exit ≥ τ_enter ⇒ prev_a never shrinks A"
+        );
+    }
+
+    #[test]
+    fn refilter_drops_capacity_ratio_violators() {
+        // intel-8 (factor 2.0) needs ~half the cores of intel-6 (1.0)
+        // to hit p90=80. S=5, P=2000: c6≈31, c8≈15 → 15 < 31/2=15.5.
+        // Faster hw is normally e_min so the slow class is COST-dropped
+        // before the cap-ratio check; compensate with prices
+        // (intel-6 cheap, intel-8 dear) so BOTH are cost-admissible
+        // and the cap-ratio re-filter is the binding constraint.
+        let fit = mk_fit(5.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        let mut cfg = cfg_hw();
+        cfg.hw_cost_tolerance = 0.5;
+        let mut cost = CostTable::default();
+        for cap in CapacityType::ALL {
+            cost.set_price("intel-6", cap, 0.009, 1e9);
+            cost.set_price("intel-8", cap, 0.043, 1e9);
+        }
+        let hs: Vec<HwClassName> = vec!["intel-6".into(), "intel-8".into()];
+        let SolveFullResult::Feasible(memo) = solve_full(
+            &fit,
+            &[t("tight", 80.0)],
+            &hw_three(),
+            &cost,
+            &ceil(),
+            &cfg,
+            &hs,
+            &HashSet::new(),
+        ) else {
+            panic!()
+        };
+        let by_h = |h: &str| {
+            memo.all_candidates
+                .iter()
+                .find(|c| c.cell.0 == h && c.cell.1 == CapacityType::Spot)
+                .map(|c| c.c_star)
+        };
+        let c6 = by_h("intel-6").expect("intel-6 feasible");
+        let c8 = by_h("intel-8").expect("intel-8 feasible");
+        assert!(
+            f64::from(c8) < f64::from(c6) / 2.0,
+            "fixture: c8={c8} < c6={c6}/2 so cap-ratio binds"
+        );
+        assert_eq!(memo.a.c_star, c6, "c* = max over cost-admissible A");
+        assert!(
+            !memo
+                .a
+                .cells
+                .contains(&("intel-8".into(), CapacityType::Spot)),
+            "c*_{{intel-8}}={c8} < c*/k={} → re-filter drops",
+            f64::from(c6) / 2.0
+        );
+        assert!(
+            memo.a.cells.iter().any(|c| c.0 == "intel-6"),
+            "argmax (intel-6) survives"
+        );
     }
 
     #[test]
     fn spot_infeasible_when_p_gt_half() {
-        // λ huge ⇒ p(cap_c) > 0.5 for every band ⇒ spot rejected,
-        // on-demand survives. Fix temp=0 (greedy) so the pick is
-        // deterministic. Gamma-Poisson pooling means a single 1/1
+        // λ huge ⇒ p(cap_c) > 0.5 for every h ⇒ spot rejected,
+        // on-demand survives. Gamma-Poisson pooling means a single 1/1
         // ratio is pulled to ~seed; the data must show "many
         // interrupts over little exposure" to overwhelm the n_λ
         // prior (≈ 1e6/86400 ≈ 11.6/s).
         let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
         let mut lambda = HashMap::new();
-        for b in Band::ALL {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        for h in h_set() {
             lambda.insert(
-                b,
+                h,
                 super::super::cost::RatioEma {
                     numerator: 1e6,
                     denominator: 1.0,
-                    updated_at: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs_f64(),
+                    updated_at: now,
                 },
             );
         }
         let cost = CostTable::from_parts(HashMap::new(), lambda);
-        let mut rng = StdRng::seed_from_u64(0);
+        let SolveFullResult::Feasible(memo) = solve_full(
+            &fit,
+            &[t("normal", 1200.0)],
+            &hw_three(),
+            &cost,
+            &ceil(),
+            &cfg_hw(),
+            &h_set(),
+            &HashSet::new(),
+        ) else {
+            panic!()
+        };
+        assert!(
+            memo.a.cells.iter().all(|(_, c)| *c == CapacityType::Od),
+            "spot must be rejected when p>0.5: A={:?}",
+            memo.a.cells
+        );
+    }
+
+    /// Regression: `hw_factor_for` returned `dot/bias` unclamped; with
+    /// a pathological factor row OR a large `hw_bias` denominator the
+    /// effective factor went ≪ 0.25 → `t = T(c)/factor` blew up →
+    /// `feasible(cap_c) = false` → cell dropped out.
+    #[test]
+    fn hw_factor_floors_after_bias_division() {
+        let mut fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        let mut m = HashMap::new();
+        m.insert("h".into(), 0.3);
+        let hw = HwTable::from_map(m);
+        fit.hw_bias.insert("h".into(), 3.0);
+        // Raw 0.3/3.0 = 0.1; must floor to 0.25.
+        assert_eq!(hw_factor_for(&fit, &hw, "h"), HW_FACTOR_SANITY_FLOOR);
+        // Unknown h → 1.0.
+        assert_eq!(hw_factor_for(&fit, &hw, "unknown"), 1.0);
+    }
+
+    #[test]
+    fn cells_to_selector_terms_or_of_ands() {
+        let cfg = cfg_hw();
+        let cells = vec![
+            ("intel-8".into(), CapacityType::Spot),
+            ("intel-7".into(), CapacityType::Od),
+        ];
+        let terms = cells_to_selector_terms(&cells, &cfg.hw_classes);
+        assert_eq!(terms.len(), 2, "one term per cell");
+        // Each term: h-label conjunction PLUS capacity-type.
+        for term in &terms {
+            assert!(
+                term.match_expressions
+                    .iter()
+                    .any(|r| r.key == "karpenter.sh/capacity-type")
+            );
+            assert!(
+                term.match_expressions
+                    .iter()
+                    .any(|r| r.key == "rio.build/hw-class")
+            );
+        }
+        // capacity-type encoded per-term (spot ≠ od).
+        let caps: HashSet<&str> = terms
+            .iter()
+            .flat_map(|t| {
+                t.match_expressions
+                    .iter()
+                    .filter(|r| r.key == "karpenter.sh/capacity-type")
+                    .flat_map(|r| r.values.iter().map(String::as_str))
+            })
+            .collect();
+        assert_eq!(caps, HashSet::from(["spot", "on-demand"]));
+        // h not in hw_classes → dropped.
+        assert!(
+            cells_to_selector_terms(&[("nope".into(), CapacityType::Spot)], &cfg.hw_classes)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn memo_key_includes_inputs_gen() {
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        let cache = SolveCache::default();
+        let fh = fit_hash(&fit);
+        let calls = std::cell::Cell::new(0);
+        let go = |prev: &HashSet<Cell>| {
+            calls.set(calls.get() + 1);
+            match solve_full(
+                &fit,
+                &[t("normal", 1200.0)],
+                &hw_three(),
+                &CostTable::default(),
+                &ceil(),
+                &cfg_hw(),
+                &h_set(),
+                prev,
+            ) {
+                SolveFullResult::Feasible(m) => Some(m),
+                _ => None,
+            }
+        };
+        let m1 = cache.get_or_insert_with(fh, 0, go).unwrap();
+        let m1b = cache.get_or_insert_with(fh, 0, go).unwrap();
+        assert_eq!(calls.get(), 1, "second call hits memo");
+        assert_eq!(m1.a.cells, m1b.a.cells);
+        // Different override_hash → miss.
+        cache.get_or_insert_with(fh, 7, go).unwrap();
+        assert_eq!(calls.get(), 2);
+        // bump_inputs_gen → miss; prev_a from old entry.
+        cache.bump_inputs_gen();
+        cache
+            .get_or_insert_with(fh, 0, |p| {
+                assert_eq!(p.len(), m1.a.cells.len(), "prev_a comes from old-gen entry");
+                go(p)
+            })
+            .unwrap();
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn disk_ceiling_checked_before_explore() {
+        // disk_p90 > max_disk: solve_full returns BestEffort (clamped),
+        // and the per-tier disk gate rejects every tier so no
+        // candidates exist. The dispatch wrapper emits DiskCeiling.
+        let mut fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        fit.disk_p90 = Some(DiskBytes(300 << 30)); // > ceil.max_disk=200Gi
         let r = solve_full(
             &fit,
             &[t("normal", 1200.0)],
-            &hw_mid_only(),
-            &cost,
-            &ceil(),
-            &IceBackoff::default(),
-            0.0,
-            &mut rng,
-        );
-        let SolveResult::Feasible { node_selector, .. } = r else {
-            panic!()
-        };
-        assert_eq!(
-            node_selector.unwrap().get("karpenter.sh/capacity-type"),
-            Some(&"on-demand".to_string()),
-            "spot must be rejected when p>0.5"
-        );
-    }
-
-    #[test]
-    fn h_dagger_is_per_pname_effective_slowest() {
-        // Two mid-band classes: ebs factor=1.0, nvme factor=1.2.
-        // With no bias, h† = ebs (slowest = lowest factor). With this
-        // pname biased 1.5× SLOWER on nvme (bias>1 = under-performs
-        // the bench), nvme's effective factor 1.2/1.5=0.8 < ebs's
-        // 1.0/1.0 → h† flips to nvme.
-        let hw = hw_mid_only();
-        let no_bias = HashMap::new();
-        let (h, f) = hw.h_dagger(crate::sla::alpha::UNIFORM, Band::Mid, &no_bias);
-        assert_eq!(h, "aws-7-ebs-mid");
-        assert!((f - 1.0).abs() < 1e-9);
-
-        let mut bias = HashMap::new();
-        bias.insert("aws-7-nvme-mid".into(), 1.5);
-        let (h, f) = hw.h_dagger(crate::sla::alpha::UNIFORM, Band::Mid, &bias);
-        assert_eq!(
-            h, "aws-7-nvme-mid",
-            "per-pname bias flips effective-slowest"
-        );
-        assert!((f - 0.8).abs() < 1e-9);
-
-        // Band with no hw_classes → ("", 1.0).
-        let (h, f) = hw.h_dagger(crate::sla::alpha::UNIFORM, Band::Hi, &no_bias);
-        assert_eq!(h, "");
-        assert!((f - 1.0).abs() < 1e-9);
-    }
-
-    /// Regression: `h_dagger` returned `f / bias` unclamped; with a
-    /// pathological factor row OR a large `hw_bias` denominator the
-    /// effective factor went ≪ 0.25 → `t = T(c)/factor` blew up →
-    /// `feasible(cap_c) = false` → entire band dropped out for both
-    /// Spot and OnDemand.
-    #[test]
-    fn h_dagger_floors_after_bias_division() {
-        use super::super::hw::HW_FACTOR_SANITY_FLOOR;
-        let mut m = HashMap::new();
-        m.insert("aws-7-ebs-mid".into(), 0.3);
-        let hw = HwTable::from_map(m);
-        let mut bias = HashMap::new();
-        bias.insert("aws-7-ebs-mid".into(), 3.0);
-        // Raw 0.3/3.0 = 0.1; must floor to 0.25.
-        let (_, f) = hw.h_dagger(crate::sla::alpha::UNIFORM, Band::Mid, &bias);
-        assert_eq!(f, HW_FACTOR_SANITY_FLOOR);
-    }
-
-    #[test]
-    fn solve_full_survives_pathological_hw_factor() {
-        // T(cap_c)=30+2000/64≈61s, tier p90=600. With factor=0.01,
-        // t=6100 → infeasible → mid drops out. With FLOOR=0.25, t=244
-        // → feasible. Hi/Lo bands have no hw_classes → factor=1.0 →
-        // would survive anyway, so check Mid specifically.
-        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
-        let mut m = HashMap::new();
-        m.insert("aws-7-ebs-mid".into(), 0.01);
-        let hw = HwTable::from_map(m);
-        let mut bias = HashMap::new();
-        // Further: bias-divides 0.01 / 10 = 0.001. Floor must catch.
-        bias.insert("aws-7-ebs-mid".into(), 10.0);
-        let mut fit_b = fit.clone();
-        fit_b.hw_bias = bias;
-        let ice = IceBackoff::default();
-        // Mark all non-Mid cells so the solve must pick Mid or fail.
-        for c in Cap::ALL {
-            ice.mark(Band::Hi, c);
-            ice.mark(Band::Lo, c);
-        }
-        let mut rng = StdRng::seed_from_u64(0);
-        let r = solve_full(
-            &fit_b,
-            &[t("normal", 600.0)],
-            &hw,
+            &hw_three(),
             &CostTable::default(),
             &ceil(),
-            &ice,
-            0.0,
-            &mut rng,
+            &cfg_hw(),
+            &h_set(),
+            &HashSet::new(),
         );
-        assert!(
-            matches!(r, SolveResult::Feasible { .. }),
-            "pathological factor must not drop band: {r:?}"
+        let SolveFullResult::BestEffort { disk_bytes, .. } = r else {
+            panic!("disk > ceil → BestEffort, got {r:?}")
+        };
+        assert_eq!(disk_bytes, 200 << 30, "clamped");
+        assert_eq!(
+            classify_ceiling(&fit, &[t("normal", 1200.0)], &ceil()),
+            InfeasibleReason::DiskCeiling
         );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        // r[verify sched.sla.hw-class.admissible-set]
+        /// ADR-023 L636-638: the argmax cell trivially survives all
+        /// three re-filter checks ⇒ A' provably non-empty.
+        #[test]
+        fn argmax_cell_always_survives_refilter(
+            s in 5.0f64..100.0,
+            p in 200.0f64..5000.0,
+            sigma in 0.05f64..0.35,
+            p90 in 100.0f64..3000.0,
+            tau in 0.01f64..0.5,
+        ) {
+            let fit = mk_fit(s, p, 0.0, f64::INFINITY, sigma);
+            let mut cfg = cfg_hw();
+            cfg.hw_cost_tolerance = tau;
+            match solve_full(
+                &fit, &[t("x", p90)], &hw_three(), &CostTable::default(),
+                &ceil(), &cfg, &h_set(), &HashSet::new(),
+            ) {
+                SolveFullResult::Feasible(memo) => {
+                    prop_assert!(!memo.a.cells.is_empty(), "A' ≠ ∅");
+                    prop_assert!(
+                        memo.all_candidates
+                            .iter()
+                            .filter(|c| memo.a.cells.contains(&c.cell))
+                            .any(|c| c.c_star == memo.a.c_star),
+                        "argmax cell ∈ A'"
+                    );
+                }
+                SolveFullResult::BestEffort { .. } => {}
+            }
+        }
     }
 
     // ─── infeasible_total emission ──────────────────────────────────
@@ -1563,38 +1971,6 @@ mod tests {
                 })
             })
             .unwrap_or(0)
-    }
-
-    /// Regression: `rio_scheduler_sla_infeasible_total` was registered +
-    /// documented but `capacity_exhausted()` had ZERO non-test callers.
-    /// observability.md:147 documented an alerting hook that could not
-    /// fire.
-    #[test]
-    fn solve_full_emits_capacity_exhausted_when_ice_exhausted() {
-        let rec = metrics_util::debugging::DebuggingRecorder::new();
-        let snapshotter = rec.snapshotter();
-        metrics::with_local_recorder(&rec, || {
-            let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
-            let ice = IceBackoff::default();
-            for b in Band::ALL {
-                for c in Cap::ALL {
-                    ice.mark(b, c);
-                }
-            }
-            let mut rng = StdRng::seed_from_u64(0);
-            let r = solve_full(
-                &fit,
-                &[t("normal", 1200.0)],
-                &hw_mid_only(),
-                &CostTable::default(),
-                &ceil(),
-                &ice,
-                0.0,
-                &mut rng,
-            );
-            assert!(matches!(r, SolveResult::BestEffort { .. }));
-        });
-        assert_eq!(infeasible_count(&snapshotter, "capacity_exhausted"), 1);
     }
 
     #[test]
@@ -1671,66 +2047,6 @@ mod tests {
         for r in InfeasibleReason::ALL {
             assert_eq!(infeasible_count(&snapshotter, r.as_str()), 0);
         }
-    }
-
-    #[test]
-    fn softmax_spreads_at_temp03() {
-        // Two candidates at 1.0 vs 1.5 cost. At temp=0.3, the cheap
-        // one should win clearly (>70%) but not always (<98%).
-        let cands = [
-            cand(Band::Lo, Cap::Spot, 1.0),
-            cand(Band::Hi, Cap::OnDemand, 1.5),
-        ];
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut cheap = 0;
-        for _ in 0..10_000 {
-            if softmax_pick(&cands, 0.3, &mut rng).unwrap().e_cost == 1.0 {
-                cheap += 1;
-            }
-        }
-        let frac = cheap as f64 / 10_000.0;
-        assert!(
-            (0.70..0.98).contains(&frac),
-            "temp=0.3 should spread but favor cheapest; got {frac}"
-        );
-        // temp=0 → greedy: always cheapest.
-        for _ in 0..100 {
-            assert_eq!(softmax_pick(&cands, 0.0, &mut rng).unwrap().e_cost, 1.0);
-        }
-        // Single candidate → that one.
-        assert_eq!(
-            softmax_pick(&cands[..1], 0.3, &mut rng).unwrap().band,
-            Band::Lo
-        );
-        assert!(softmax_pick(&[], 0.3, &mut rng).is_none());
-    }
-
-    #[test]
-    fn ice_backoff_excludes_cell() {
-        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
-        let ice = IceBackoff::default();
-        // Mark every spot cell infeasible.
-        for b in Band::ALL {
-            ice.mark(b, Cap::Spot);
-        }
-        let mut rng = StdRng::seed_from_u64(0);
-        let r = solve_full(
-            &fit,
-            &[t("normal", 1200.0)],
-            &hw_mid_only(),
-            &CostTable::default(),
-            &ceil(),
-            &ice,
-            0.0,
-            &mut rng,
-        );
-        let SolveResult::Feasible { node_selector, .. } = r else {
-            panic!()
-        };
-        assert_eq!(
-            node_selector.unwrap().get("karpenter.sh/capacity-type"),
-            Some(&"on-demand".to_string())
-        );
     }
 
     #[test]

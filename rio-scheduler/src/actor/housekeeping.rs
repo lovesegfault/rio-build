@@ -95,6 +95,10 @@ impl DagActor {
                 warn!(error = %e, "sla estimator refresh failed; keeping previous fits");
             }
         }
+        // ADR-023 L616: HwTable refresh (inside `sla_estimator.refresh`)
+        // is a shared solve input — invalidate the per-key memo. The
+        // CostTable poller bumps separately on its own 10min cadence.
+        self.solve_cache.bump_inputs_gen();
 
         // Full critical-path sweep (same 60s cadence). Belt-and-
         // suspenders over the incremental update_ancestors calls: any
@@ -134,7 +138,6 @@ impl DagActor {
         let now = Instant::now();
         self.tick_check_heartbeats(now).await;
         self.tick_sweep_recently_disconnected(now);
-        self.tick_sweep_pending_intents(now);
 
         // Ordering is load-bearing: backstop-process runs before the
         // per-build-timeout check, poison-expire runs last — matches
@@ -182,111 +185,6 @@ impl DagActor {
     // -----------------------------------------------------------------------
     // handle_tick helpers — one per periodic check
     // -----------------------------------------------------------------------
-
-    /// ADR-023 §2.8 Pending-watch: sweep `pending_intents` entries
-    /// older than the 60s window (jittered ±20% per-entry, derived
-    /// from drv_hash so the threshold is stable across ticks) → mark
-    /// `(band, cap)` ICE-infeasible for 60s and drop the entry. The
-    /// window is a literal stub pending the admissible-set rewrite,
-    /// which replaces this sweep entirely.
-    /// Next `compute_spawn_intents` re-runs `solve_full` for that
-    /// drv with the cell excluded.
-    ///
-    /// Also drops entries for drvs that have left Ready (dispatched
-    /// elsewhere, cancelled, completed-via-substitute) — those will
-    /// never see a heartbeat and shouldn't mark ICE.
-    ///
-    /// Scheduler-side approximation of the controller seeing
-    /// `phase=Pending`: less precise (cannot tell Pending from
-    /// "controller hasn't spawned yet" or "container crashed before
-    /// first heartbeat") but all three mean the `(band, cap)` failed to
-    /// produce capacity within the window, and the 60s ICE TTL bounds
-    /// the false-positive cost. See [`crate::sla::cost::IceBackoff`].
-    // r[impl sched.sla.ice-ladder-cap]
-    pub(super) fn tick_sweep_pending_intents(&self, now: Instant) {
-        let fallback = 60.0_f64; /* removed: A9 deletes call site */
-        let ladder_cap = self.ice_ladder_cap();
-        // Reap `ice_attempts` for drvs that left Ready. Keyed on dag
-        // state directly — NOT parasitic on `pending_intents` membership:
-        // a ladder-exhausted drv dispatches band-agnostic, so its acks
-        // don't re-enter `pending_intents` (parse_selector → None) and
-        // a parasitic cleanup would orphan the entry forever. A re-queue
-        // (e.g. resubmit) must not inherit a prior generation's exhaust.
-        self.ice_attempts.retain(|drv_hash, _| {
-            self.dag
-                .node(drv_hash)
-                .is_some_and(|s| s.status() == crate::state::DerivationStatus::Ready)
-        });
-        self.pending_intents.retain(|drv_hash, (band, cap, since)| {
-            // Drop entries whose drv left Ready: they won't heartbeat
-            // and the timeout isn't a capacity signal.
-            if self
-                .dag
-                .node(drv_hash)
-                .is_none_or(|s| s.status() != crate::state::DerivationStatus::Ready)
-            {
-                return false;
-            }
-            // Stable per-drv jitter ∈ [0.8, 1.2): hash low byte → factor.
-            // Stable so a single entry doesn't flip in/out across ticks.
-            let h = drv_hash.bytes().fold(0u8, |a, b| a.wrapping_add(b));
-            let jitter = 0.8 + 0.4 * f64::from(h) / 256.0;
-            if now.duration_since(*since).as_secs_f64() <= fallback * jitter {
-                return true;
-            }
-            self.ice.mark(*band, *cap);
-            // Per-build ladder cap: bound retries so a tier with a 1h
-            // p90 doesn't burn ~30 fallback rounds before demoting. The
-            // fleet-wide `ice.exhausted()` (all 6 cells live) is
-            // unreachable from one build's serial probing because
-            // `ICE_TTL=60s < hw_fallback_after≈120s`. `ice_attempts`
-            // is separate from `pending_intents` so it survives this
-            // drop + the controller's reap/respawn/ack `or_insert`.
-            let mut attempted = self.ice_attempts.entry(drv_hash.clone()).or_default();
-            attempted.push((*band, *cap));
-            // `_ice_backoff_total` retired — ADR-023 §Observability
-            // replaces it with `_hw_ladder_exhausted_total{tenant,exit}`
-            // emitted at ladder-cap below. A9 deletes this whole
-            // pending_intents Pending-watch block.
-            debug!(
-                drv_hash = %drv_hash, band = band.label(), cap = cap.label(),
-                pending_secs = now.duration_since(*since).as_secs(),
-                attempted = attempted.len(), ladder_cap,
-                "pending-watch: no heartbeat within hw_fallback_after; \
-                 marking (band, cap) ICE-infeasible for 60s"
-            );
-            if attempted.len() as u32 >= ladder_cap {
-                crate::sla::solve::InfeasibleReason::CapacityExhausted.emit();
-                debug!(
-                    drv_hash = %drv_hash,
-                    attempted = ?crate::sla::cost::IceBackoff::encode_attempted(&attempted),
-                    "pending-watch: ICE ladder cap reached; forcing band-agnostic dispatch"
-                );
-            }
-            false
-        });
-    }
-
-    /// `IceBackoff::ladder_cap` evaluated against the configured tier
-    /// ladder + the 60s Pending-watch window. Shared between the sweep
-    /// and `solve_intent_for`'s ladder-exhausted gate so both agree on
-    /// the same threshold. Literal stub pending the admissible-set
-    /// rewrite, which retires the ladder-cap concept.
-    pub(crate) fn ice_ladder_cap(&self) -> u32 {
-        let max_tier_bound = self
-            .sla_tiers
-            .iter()
-            .filter_map(crate::sla::solve::Tier::binding_bound)
-            .fold(0.0_f64, f64::max);
-        crate::sla::cost::IceBackoff::ladder_cap(
-            if max_tier_bound > 0.0 {
-                max_tier_bound
-            } else {
-                3600.0
-            },
-            60.0_f64, /* removed: A9 deletes call site */
-        )
-    }
 
     /// Credit every executor's `last_heartbeat` for an actor-side
     /// stall. The merge-time `FindMissingPaths` runs inside the actor

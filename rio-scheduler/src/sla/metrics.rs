@@ -309,7 +309,7 @@ mod tests {
             resize_retry("oom");
             als_cap_hit("t");
             hw_cost_stale_seconds(0.0);
-            InfeasibleReason::SerialFloor.emit();
+            InfeasibleReason::SerialFloor.emit("t");
             gauge!("rio_scheduler_sla_prior_divergence", "param" => "S").set(1.0);
         });
         let seen: std::collections::HashSet<_> = snap

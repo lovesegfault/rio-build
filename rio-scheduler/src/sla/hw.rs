@@ -397,10 +397,10 @@ mod tests {
     }
 
     /// Regression: `aggregate` clamps at the chokepoint so `iter()`
-    /// (the source for `h_dagger`) returns `[FLOOR, CEIL]` values.
-    /// Before, `normalize`/`factor`/`min_factor` clamped per-consumer
-    /// but `iter()` returned raw — a pathological row dropped an entire
-    /// band out of `solve_full` for both Spot and OnDemand.
+    /// returns `[FLOOR, CEIL]` values. Before,
+    /// `normalize`/`factor`/`min_factor` clamped per-consumer but
+    /// `iter()` returned raw — a pathological row dropped an entire
+    /// hw_class out of `solve_full` for both Spot and OnDemand.
     #[test]
     fn load_clamps_pathological_factor() {
         let mut m = HashMap::new();

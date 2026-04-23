@@ -292,36 +292,18 @@ pub struct DagActor {
     /// `solve_full` always has a comparable scalar even before the
     /// first poll.
     pub(crate) cost_table: Arc<parking_lot::RwLock<crate::sla::cost::CostTable>>,
-    /// In-process insufficient-capacity backoff. `solve_full` skips
-    /// marked cells; the Pending-watch marks them. Arc so the snapshot
-    /// path (`&self`) and housekeeping (`&mut self`) share one map.
+    /// In-process insufficient-capacity mask. `handle_ack_spawned_intents`
+    /// marks cells the controller reported `unfulfillable`; the
+    /// per-dispatch read-time mask (`A \ masked`) is applied in
+    /// `solve_intent_for` AFTER reading the memo, so unmasking is free.
     pub(crate) ice: Arc<crate::sla::cost::IceBackoff>,
-    /// Pending-watch ledger: `drv_hash → (band, cap, armed_at)`.
-    /// Inserted by `handle_ack_spawned_intents` when the CONTROLLER
-    /// confirms it created a Job for a band-targeted intent (NOT at
-    /// emit time — `compute_spawn_intents` is read-only so dashboard
-    /// polls and headroom-gated intents don't false-arm).
-    /// `compute_spawn_intents` LOOKS UP entries to pin the returned
-    /// selector across re-emits (a re-solve would otherwise drift it
-    /// and trip the controller's selector-drift reaper).
-    /// `handle_heartbeat` removes when the pod checks in. Housekeeping
-    /// sweeps entries past the Pending-watch window →
-    /// [`ice`](Self::ice) `.mark(band, cap)` and removes (next snapshot
-    /// re-solves excluding the cell). DashMap because the snapshot
-    /// lookup is `&self`.
-    pub(crate) pending_intents:
-        dashmap::DashMap<DrvHash, (crate::sla::cost::Band, crate::sla::cost::Cap, Instant)>,
-    /// Per-derivation ICE-ladder attempt log: `(band, cap)` cells this
-    /// drv has timed-out on so far. Separate from `pending_intents`
-    /// because the sweep DROPS that entry on timeout (so the selector-
-    /// pin doesn't re-emit the dead cell) and the next ack `or_insert`s
-    /// fresh — `attempted` must survive that cycle. `solve_intent_for`
-    /// checks `len() >= IceBackoff::ladder_cap()` to force band-
-    /// agnostic dispatch (`r[sched.sla.ice-ladder-cap]`).
-    /// `handle_heartbeat` clears on first heartbeat (pod scheduled →
-    /// ladder reset); `clear_persisted_state` clears on leader edge.
-    pub(crate) ice_attempts:
-        dashmap::DashMap<DrvHash, Vec<(crate::sla::cost::Band, crate::sla::cost::Cap)>>,
+    /// Per-key admissible-set memo. `solve_full` is deterministic
+    /// given `(fit_hash, override_hash, inputs_gen)` so most
+    /// `compute_spawn_intents` ticks are pure cache hits (ADR-023
+    /// L616). `bump_inputs_gen()` is called from `tick_refresh_sla`
+    /// after `HwTable`/`CostTable` refresh and from `apply_config`
+    /// on `[sla]` reload.
+    pub(crate) solve_cache: Arc<crate::sla::solve::SolveCache>,
     /// Tick counter for periodic tasks that run less often than every
     /// Tick (e.g., estimator refresh every ~60s with a 10s tick interval).
     /// Wraps at u64::MAX — harmless, just means the 60s cadence drifts
@@ -519,6 +501,7 @@ impl DagActor {
     pub fn new(db: SchedulerDb, cfg: DagActorConfig, plumbing: DagActorPlumbing) -> Self {
         let mut dag = DerivationDag::new();
         dag.set_soft_features(cfg.soft_features.clone());
+        let max_lead_time = cfg.sla.max_lead_time;
 
         Self {
             dag,
@@ -542,9 +525,8 @@ impl DagActor {
             sla_ceilings: cfg.sla.ceilings(),
             sla_config: cfg.sla,
             cost_table: plumbing.cost_table,
-            ice: Arc::new(crate::sla::cost::IceBackoff::default()),
-            pending_intents: dashmap::DashMap::new(),
-            ice_attempts: dashmap::DashMap::new(),
+            ice: Arc::new(crate::sla::cost::IceBackoff::new(max_lead_time)),
+            solve_cache: Arc::new(crate::sla::solve::SolveCache::default()),
             tick_count: 0,
             backpressure_active: Arc::new(AtomicBool::new(false)),
             leader: plumbing.leader,
@@ -590,17 +572,10 @@ impl DagActor {
         self.ready_queue.clear();
         self.builds.clear();
         self.events.clear();
-        // Per-generation maps: a same-process lose→reacquire (apiserver
-        // blip) would otherwise carry stale `(band, cap, since)` entries
-        // into the new generation → `compute_spawn_intents` pins
-        // selectors to the previous leader's cell + false `ice.mark()`
-        // from stale `since`. `recently_disconnected` is keyed by
-        // executor IDs from the previous generation — a stale entry
-        // would let a `ReportExecutorTermination` from the previous gen
-        // spuriously bump `resource_floor` on a drv this generation
-        // never assigned.
-        self.pending_intents.clear();
-        self.ice_attempts.clear();
+        // `recently_disconnected` is keyed by executor IDs from the
+        // previous generation — a stale entry would let a
+        // `ReportExecutorTermination` from the previous gen spuriously
+        // bump `resource_floor` on a drv this generation never assigned.
         self.recently_disconnected.clear();
         // Deliberately retained across generations:
         // - `executors`: live connections, not persisted (doc above).
@@ -773,14 +748,12 @@ impl DagActor {
                 }
                 ActorCommand::AckSpawnedIntents {
                     spawned,
-                    unfulfillable_cells: _,
+                    unfulfillable_cells,
                 } => {
                     // r[impl sched.lease.standby-drops-writes] —
-                    // would arm `pending_intents` for a previous
-                    // generation's spawn.
+                    // ICE state is lease-holder only.
                     if self.leader.is_leader() {
-                        // §13b `unfulfillable_cells` consumed by B11.
-                        self.handle_ack_spawned_intents(&spawned);
+                        self.handle_ack_spawned_intents(&spawned, &unfulfillable_cells);
                     }
                 }
                 ActorCommand::PrefetchComplete {

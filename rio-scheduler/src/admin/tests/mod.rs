@@ -191,17 +191,20 @@ async fn append_interrupt_sample_rejects_invalid_inputs() {
         tonic::Code::InvalidArgument
     );
 
-    let bad_hw = AppendInterruptSampleRequest {
-        hw_class: "no-band".into(),
-        ..base
-    };
-    assert_eq!(
-        svc.append_interrupt_sample(Request::new(bad_hw))
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::InvalidArgument
-    );
+    for bad in ["", "Upper-Case", &"x".repeat(65)] {
+        let bad_hw = AppendInterruptSampleRequest {
+            hw_class: bad.into(),
+            ..base.clone()
+        };
+        assert_eq!(
+            svc.append_interrupt_sample(Request::new(bad_hw))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument,
+            "{bad:?} must be rejected"
+        );
+    }
 }
 
 /// Construct svc with a real `service_verifier`. Other defaults match

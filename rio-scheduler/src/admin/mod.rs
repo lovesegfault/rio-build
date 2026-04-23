@@ -1068,8 +1068,8 @@ impl AdminService for AdminServiceImpl {
         self.ensure_service_caller(request.metadata(), &["rio-controller"])?;
         let r = request.into_inner();
         // Defense-in-depth input validation: lands regardless of the
-        // token gate. `band_of_hw_class` parses the 4-segment shape so
-        // garbage hw_class can't pollute the table even in dev mode.
+        // token gate. `MAX_HW_CLASS_LEN` charset gate so garbage
+        // hw_class can't pollute the table even in dev mode.
         if !matches!(r.kind.as_str(), "interrupt" | "exposure") {
             return Err(Status::invalid_argument(format!(
                 "kind must be 'interrupt' or 'exposure', got {:?}",
@@ -1082,9 +1082,16 @@ impl AdminService for AdminServiceImpl {
                 r.value
             )));
         }
-        if crate::sla::cost::band_of_hw_class(&r.hw_class).is_none() {
+        const MAX_HW_CLASS_LEN: usize = 64;
+        if r.hw_class.is_empty()
+            || r.hw_class.len() > MAX_HW_CLASS_LEN
+            || !r
+                .hw_class
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
             return Err(Status::invalid_argument(format!(
-                "hw_class {:?} does not parse to a known band",
+                "hw_class {:?} must be 1..={MAX_HW_CLASS_LEN} chars of [a-z0-9-]",
                 r.hw_class
             )));
         }

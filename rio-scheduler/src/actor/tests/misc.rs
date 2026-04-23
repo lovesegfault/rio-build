@@ -1619,23 +1619,14 @@ async fn test_dispatch_wait_recorded_on_assignment() -> TestResult {
 // clear_persisted_state: per-generation maps
 // ---------------------------------------------------------------------------
 
-/// `clear_persisted_state` clears `pending_intents` and
-/// `recently_disconnected` (per-generation maps). Same-process
-/// lose→reacquire would otherwise carry stale `(band, cap, since)` /
-/// stale executor IDs into the new generation.
+/// `clear_persisted_state` clears `recently_disconnected`
+/// (per-generation map). Same-process lose→reacquire would otherwise
+/// carry stale executor IDs into the new generation.
 #[tokio::test]
 async fn clear_persisted_state_clears_per_generation_maps() {
-    use crate::sla::cost::{Band, Cap};
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor(db.pool.clone());
 
-    actor.pending_intents.insert(
-        "stale".into(),
-        (Band::Mid, Cap::Spot, std::time::Instant::now()),
-    );
-    actor
-        .ice_attempts
-        .insert("stale".into(), vec![(Band::Mid, Cap::Spot)]);
     actor.recently_disconnected.insert(
         "stale-exec".into(),
         ("stale".into(), std::time::Instant::now()),
@@ -1643,14 +1634,6 @@ async fn clear_persisted_state_clears_per_generation_maps() {
 
     actor.clear_persisted_state();
 
-    assert!(
-        actor.pending_intents.is_empty(),
-        "pending_intents must be cleared on leader transition"
-    );
-    assert!(
-        actor.ice_attempts.is_empty(),
-        "ice_attempts must be cleared on leader transition"
-    );
     assert!(
         actor.recently_disconnected.is_empty(),
         "recently_disconnected must be cleared on leader transition"

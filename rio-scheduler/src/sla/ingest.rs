@@ -68,9 +68,13 @@ impl AnchorRing {
     /// Build from a completed_at-ascending slice + parallel vdists.
     /// `cap` here is the eviction threshold; `refit` passes the slice
     /// length so eviction is a no-op (DB already capped).
-    // TODO(A9): DB-side `trim_build_samples_batch` is recency-only and
-    // can drop anchors; once that learns anchor-awareness, `refit` can
-    // pass `ring_buffer` here and drop the special-case.
+    // TODO: trim_build_samples_batch (db/history.rs) prunes by recency
+    // only, so a key's widest-span anchor rows can be deleted before
+    // the in-memory AnchorRing sees them on a cold leader. The ring
+    // re-derives anchors from what survives, so this is a span-
+    // narrowing under heavy churn, not a correctness gap. Fix: teach
+    // the DB-side trim to keep one row per distinct cpu_limit value
+    // (the anchor invariant).
     pub fn from_rows(cap: usize, rows: &[&BuildSampleRow], vdists: &[u32]) -> Self {
         debug_assert_eq!(rows.len(), vdists.len());
         let mut ring = Self::new(cap);

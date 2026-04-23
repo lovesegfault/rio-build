@@ -87,12 +87,11 @@ pub fn rejection_reason(w: &ExecutorState, drv: &DerivationState) -> Option<&'st
     // resource-fit is skipped when this worker was spawned FOR this
     // drv (`intent_id == drv_hash`): its cgroup limits ARE the
     // spawn-time `solve_intent_for` output, but `last_intent` here is
-    // a fresh dispatch-time re-solve. solve_full's softmax (rng) — or
-    // an estimator refit / cost-table update / ICE mark between the
-    // controller poll and this tick — can yield a higher `mem_bytes`,
-    // and the purpose-built pod would reject itself. The
-    // intent-reserved gate above already handles the inverse (worker
-    // for X never gets Y).
+    // a fresh dispatch-time re-solve. An estimator refit / `inputs_gen`
+    // bump / ICE mask change between the controller poll and this tick
+    // can yield a higher `mem_bytes`, and the purpose-built pod would
+    // reject itself. The intent-reserved gate above already handles
+    // the inverse (worker for X never gets Y).
     if let Some(intent) = &drv.sched.last_intent
         && let Some(r) = &w.last_resources
         && r.memory_total_bytes != 0

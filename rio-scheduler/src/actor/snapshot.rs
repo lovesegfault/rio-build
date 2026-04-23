@@ -14,6 +14,35 @@ use super::{
     SpawnIntentsSnapshot, command,
 };
 
+/// Recover `(h, cap)` from a `NodeSelectorTerm` by matching its label
+/// conjunction (sans `karpenter.sh/capacity-type`) against `hw_classes`.
+/// `None` for terms that don't correspond to a configured class.
+fn term_to_cell(
+    term: &rio_proto::types::NodeSelectorTerm,
+    hw_classes: &HashMap<String, crate::sla::config::HwClassDef>,
+) -> Option<crate::sla::config::Cell> {
+    let cap = term
+        .match_expressions
+        .iter()
+        .find(|r| r.key == "karpenter.sh/capacity-type")
+        .and_then(|r| r.values.first())
+        .and_then(|v| crate::sla::config::CapacityType::parse(v))?;
+    let labels: std::collections::HashSet<(&str, &str)> = term
+        .match_expressions
+        .iter()
+        .filter(|r| r.key != "karpenter.sh/capacity-type")
+        .filter_map(|r| Some((r.key.as_str(), r.values.first()?.as_str())))
+        .collect();
+    let h = hw_classes.iter().find(|(_, def)| {
+        def.labels.len() == labels.len()
+            && def
+                .labels
+                .iter()
+                .all(|l| labels.contains(&(l.key.as_str(), l.value.as_str())))
+    })?;
+    Some((h.0.clone(), cap))
+}
+
 impl DagActor {
     /// Dispatch a read-only [`AdminQuery`].
     pub(super) fn handle_admin(&self, q: AdminQuery) {
@@ -279,27 +308,11 @@ impl DagActor {
             // before the pod heartbeats, the match misses and dispatch
             // falls through to pick-from-queue.
             let intent = self.solve_intent_for(state);
-            // ADR-023 §2.8 selector pin: if a Pending-watch entry
-            // already exists for this drv (controller acked a spawn),
-            // REUSE its `(band, cap)` for the returned selector instead
-            // of the freshly-solved one. `solve_full`'s softmax re-rolls
-            // on every poll (default temp=0.3 → ~15% per-tick flip);
-            // without the pin the controller's `reap_stale_for_intents`
-            // sees fingerprint drift and reap-respawns a still-Pending
-            // Job each tick. The ICE-timeout sweep DROPS the entry, so
-            // a deliberate re-solve (excluding the marked cell) flows
-            // through unpinned and the reaper correctly replaces the
-            // stale Pending Job.
-            //
-            // Read-only: this method NEVER writes `pending_intents`
-            // (the timer is armed by `handle_ack_spawned_intents` only
-            // for intents the controller actually created Jobs for —
-            // see that method for why arm-on-emit was wrong).
-            let node_selector = self
-                .pending_intents
-                .get(drv_hash)
-                .map(|e| crate::sla::cost::selector_for(e.0, e.1))
-                .unwrap_or(intent.node_selector);
+            // ADR-023 §13a affinity is deterministic (memoized) — no
+            // selector-pin needed; the controller's `reap_stale_for_
+            // intents` sees the SAME fingerprint across re-polls until
+            // `inputs_gen` bumps or the ICE mask changes.
+            let node_affinity = intent.node_affinity;
             // r[impl sec.executor.identity-token+2]
             // Sign per-intent so the spawned pod can prove on
             // BuildExecution/Heartbeat that it was spawned for THIS
@@ -331,16 +344,17 @@ impl DagActor {
                     cores: intent.cores,
                     mem_bytes: intent.mem_bytes,
                     disk_bytes: intent.disk_bytes,
-                    node_selector: node_selector.into_iter().collect(),
+                    // Compat (proto field 5): controller derives the
+                    // single-cell selector from `node_affinity[0]` until
+                    // A18; scheduler-side stays empty.
+                    node_selector: HashMap::new(),
                     kind: kind.into(),
                     system: state.system.clone(),
                     required_features: state.required_features.clone(),
                     deadline_secs: intent.deadline_secs,
                     executor_token,
-                    // §13a OR-of-ANDs targeting + forecast ETA: populated
-                    // by A9/A10. Empty / 0.0 ⇔ "Ready, single-cell" —
-                    // controller treats both as "use node_selector".
-                    node_affinity: vec![],
+                    node_affinity,
+                    // §13b forecast horizon — A10. 0.0 ⇔ Ready.
                     eta_seconds: 0.0,
                 },
             ));
@@ -363,45 +377,33 @@ impl DagActor {
         }
     }
 
-    /// Arm the Pending-watch for intents the controller just created
-    /// Jobs for. Separated from [`Self::compute_spawn_intents`] so that
-    /// RPC stays a pure read:
-    ///
-    ///  - dashboard/CLI/ComponentScaler polls of `GetSpawnIntents` no
-    ///    longer mutate scheduler state;
-    ///  - intents the controller TRUNCATES under `maxConcurrent` are
-    ///    not armed — under sustained saturation those would never
-    ///    heartbeat, so arm-on-emit false-marked their `(band, cap)`
-    ///    cells ICE every Pending-watch window until the solve
-    ///    degraded to band-agnostic.
-    ///
-    /// `or_insert`: the controller re-acks the FULL still-Pending set
-    /// every tick (covers scheduler restart, where in-memory
-    /// `pending_intents` is empty and existing Pending Jobs would
-    /// otherwise never re-arm under deterministic softmax). A live
-    /// timer is NOT reset by re-ack. After ICE-sweep removes a
-    /// timed-out entry, the controller's reap-on-selector-drift +
-    /// respawn + ack lands the NEW `(band, cap)` here as a fresh
-    /// insert. A re-ack of a cell ICE-marked SINCE the controller's
-    /// poll is dropped — the next poll returns the freshly-solved
-    /// (cell-excluded) selector, so reap-on-selector-drift fires.
-    /// Without the guard, a Tick sweep landing between poll and ack
-    /// (~1-5s of k8s work) would have the stale ack re-pin the swept
-    /// cell with a fresh timer, defeating ICE-backoff failover.
-    pub(super) fn handle_ack_spawned_intents(&self, spawned: &[rio_proto::types::SpawnIntent]) {
-        let now = std::time::Instant::now();
+    /// Process the controller's spawn ack: `spawned` cells that
+    /// reached `Registered=True` reset their ICE backoff;
+    /// `unfulfillable_cells` (`"h:cap"` strings — NodeClaim
+    /// `Launched=False` or `Registered` timeout) are ICE-marked with
+    /// exponential backoff. ADR-023 §Capacity backoff: the *scheduler*
+    /// owns ICE state (in-memory, lease-holder only); the controller
+    /// reports, the scheduler decides.
+    // r[impl sched.sla.hw-class.ice-mask]
+    pub(super) fn handle_ack_spawned_intents(
+        &self,
+        spawned: &[rio_proto::types::SpawnIntent],
+        unfulfillable_cells: &[String],
+    ) {
+        // Success path: each spawned intent's bound cells reset
+        // backoff. The intent's `node_affinity` carries the cells the
+        // controller picked from; the FIRST term is what the NodeClaim
+        // was created for (controller routes to one cell per intent).
         for i in spawned {
-            let sel: std::collections::BTreeMap<_, _> = i
-                .node_selector
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            if let Some((band, cap)) = crate::sla::cost::parse_selector(&sel)
-                && !self.ice.is_infeasible(band, cap)
+            if let Some(term) = i.node_affinity.first()
+                && let Some(cell) = term_to_cell(term, &self.sla_config.hw_classes)
             {
-                self.pending_intents
-                    .entry(i.intent_id.clone().into())
-                    .or_insert((band, cap, now));
+                self.ice.clear(&cell);
+            }
+        }
+        for s in unfulfillable_cells {
+            if let Some(cell) = crate::sla::config::parse_cell(s) {
+                self.ice.mark(&cell);
             }
         }
     }
@@ -411,14 +413,27 @@ impl DagActor {
     /// population) and dispatch's resource-fit filter so the controller
     /// spawns and the scheduler accepts the SAME shape.
     ///
-    /// When `[sla].hw_cost_source` is set AND the hw-factor table is
-    /// populated, the fitted-key branch routes through
-    /// [`solve::solve_full`] (per-`(band, cap)` envelope + cost
-    /// softmax) and returns a `rio.build/hw-band` +
-    /// `karpenter.sh/capacity-type` nodeSelector. Otherwise — or for
-    /// override/probe/explore branches — it routes through
-    /// [`solve::intent_for`] (band-agnostic `solve_mvp`) and returns
-    /// an empty selector.
+    /// When `[sla].hw_cost_source` is set, `[sla].hw_classes` is
+    /// non-empty, AND the hw-factor table is populated, the fitted-key
+    /// branch routes through the memoized [`solve::solve_full`]
+    /// (admissible-set), draws ε_h, applies the read-time ICE mask,
+    /// and returns `nodeAffinity` over `A' \ masked`. Otherwise — or
+    /// for override/probe/explore branches — it routes through
+    /// [`solve::intent_for`] (hw-agnostic `solve_mvp`) and returns an
+    /// empty affinity.
+    // r[impl sched.sla.hw-class.epsilon-explore]
+    // r[impl sched.sla.hw-class.ice-mask]
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(
+            pname = state.pname.as_deref().unwrap_or(""),
+            tier,
+            c_star,
+            n_candidates_feasible,
+            hw_explore
+        )
+    )]
     pub(crate) fn solve_intent_for(&self, state: &crate::state::DerivationState) -> SolvedIntent {
         use crate::sla::{
             quantile, solve,
@@ -431,7 +446,7 @@ impl DagActor {
         let key = state.pname.as_deref().map(|p| ModelKey {
             pname: p.to_string(),
             system: state.system.clone(),
-            tenant,
+            tenant: tenant.clone(),
         });
         let fit = key.as_ref().and_then(|k| self.sla_estimator.cached(k));
         // Override resolved from the same tick snapshot the fit cache
@@ -445,37 +460,28 @@ impl DagActor {
             required_features: state.required_features.clone(),
         };
 
-        // r[impl sched.sla.solve-per-band-cap]
-        // solve_full path: gated on hw_cost_source set ∧ hw-factor
-        // table populated ∧ a usable fit (same n_eff/span gate as
-        // intent_for's solve branch — probe/explore stay on the
-        // band-agnostic path). A `forced_cores` OR `tier` override
-        // also gates it off: solve_full doesn't take `override_`, so
-        // those fall through to `intent_for` which honors both.
-        // `forced_mem` is overlaid below regardless of arm.
+        // r[impl sched.sla.hw-class.admissible-set]
+        // solve_full path: gated on hw_cost_source set ∧ hw_classes
+        // non-empty ∧ hw-factor table populated ∧ a usable fit (same
+        // n_eff/span gate as intent_for's solve branch — probe/explore
+        // stay on the hw-agnostic path). A `forced_cores` OR `tier`
+        // override also gates it off: solve_full doesn't take
+        // `override_`, so those fall through to `intent_for` which
+        // honors both. `forced_mem` is overlaid below regardless of
+        // arm.
         //
-        // FOD / required_features / serial drvs MUST stay band-
-        // agnostic: solve_full emits a `rio.build/hw-band` selector
-        // that `apply_intent_resources` merges unconditionally, but the
-        // `rio-fetcher` and `rio-builder-metal` NodePools carry no
-        // hw-band label — `{node-role:fetcher, hw-band:X}` matches zero
+        // FOD / required_features / serial drvs MUST stay hw-agnostic:
+        // the `rio-fetcher` and `rio-builder-metal` NodePools carry no
+        // hw-class labels — affinity over `{hw-class:X}` matches zero
         // templates and the pod is permanently Pending. Serial drvs
         // additionally need `intent_for`'s 1-core pin
         // (`r[sched.sla.intent-from-solve]`); solve_full ignores
         // `hints` and would multi-core a `enableParallelBuilding=false`
-        // build. The hw_table snapshot is one RwLock-read clone
-        // (~dozens of entries); cost_table same.
-        // r[impl sched.sla.ice-ladder-cap]
-        // Per-build ICE-ladder exhausted → skip `solve_full` so the
-        // band-agnostic `intent_for` arm dispatches under no
-        // hw-band/capacity-type selector.
-        let ladder_exhausted = self
-            .ice_attempts
-            .get(&state.drv_hash)
-            .is_some_and(|a| a.len() as u32 >= self.ice_ladder_cap());
+        // build.
         let hw = self.sla_estimator.hw_table();
-        let full = (!ladder_exhausted
-            && self.sla_config.hw_cost_source.is_some()
+        let h_all: Vec<_> = self.sla_config.hw_classes.keys().cloned().collect();
+        let full = (self.sla_config.hw_cost_source.is_some()
+            && !h_all.is_empty()
             && !hw.is_empty()
             && override_
                 .as_ref()
@@ -494,25 +500,110 @@ impl DagActor {
             {
                 return None;
             }
-            Some(solve::solve_full(
-                f,
-                &self.sla_tiers,
-                &hw,
-                &self.cost_table.read(),
-                &self.sla_ceilings,
-                &self.ice,
-                0.3_f64, /* removed: A9 deletes call site */
-                &mut rand::rng(),
-            ))
+            let cost = self.cost_table.read().clone();
+            // Memo: deterministic given (fit_hash, override_hash,
+            // inputs_gen). The ε_h draw and ICE mask are applied AFTER
+            // reading the memo — per-dispatch, never overwriting it.
+            let memo = self.solve_cache.get_or_insert_with(
+                solve::fit_hash(f),
+                solve::override_hash(override_.as_ref()),
+                |prev_a| match solve::solve_full(
+                    f,
+                    &self.sla_tiers,
+                    &hw,
+                    &cost,
+                    &self.sla_ceilings,
+                    &self.sla_config,
+                    &h_all,
+                    prev_a,
+                ) {
+                    solve::SolveFullResult::Feasible(m) => Some(m),
+                    solve::SolveFullResult::BestEffort { .. } => None,
+                },
+            );
+            // ε_h draw (per-dispatch, OUTSIDE memo): pin one h ∉ A
+            // (or H \ {argmin price} on miss / A=H), restrict the
+            // solve to `(h_explore, *)`, and emit ITS A' if feasible.
+            // The cached memo's `A` is read but never overwritten.
+            use rand::RngExt as _;
+            let mut rng = rand::rng();
+            if h_all.len() > 1 && rng.random::<f64>() < self.sla_config.hw_explore_epsilon {
+                use rand::seq::IndexedRandom;
+                let in_a: std::collections::HashSet<_> = memo
+                    .as_ref()
+                    .map(|m| m.a.cells.iter().map(|(h, _)| h.clone()).collect())
+                    .unwrap_or_default();
+                // Cache miss (in_a=∅) or A=H: H\A would be H or ∅ —
+                // either way ε_h would re-select the price-dominant
+                // cell. Draw from H \ {argmin price} instead so the
+                // pin still explores (ADR-023 L748).
+                let pool: Vec<_> = if in_a.is_empty() || in_a.len() == h_all.len() {
+                    let cheapest = cost.cheapest_h(&h_all);
+                    h_all
+                        .iter()
+                        .filter(|h| Some(*h) != cheapest.as_ref())
+                        .collect()
+                } else {
+                    h_all.iter().filter(|h| !in_a.contains(*h)).collect()
+                };
+                if let Some(&h_explore) = pool.choose(&mut rng) {
+                    tracing::Span::current().record("hw_explore", h_explore.as_str());
+                    if let solve::SolveFullResult::Feasible(m) = solve::solve_full(
+                        f,
+                        &self.sla_tiers,
+                        &hw,
+                        &cost,
+                        &self.sla_ceilings,
+                        &self.sla_config,
+                        std::slice::from_ref(h_explore),
+                        &std::collections::HashSet::new(),
+                    ) {
+                        return Some((m, h_all.clone()));
+                    }
+                    // h_explore infeasible at every tier → abandon the
+                    // draw and fall through to the unrestricted memo.
+                }
+            }
+            memo.map(|m| (m, h_all.clone()))
         });
 
-        let (cores, mem, disk, node_selector) = match &full {
-            Some(r) => (
-                (r.cores().0.ceil() as u32).max(1),
-                r.mem().0,
-                r.disk().0,
-                r.node_selector().cloned().unwrap_or_default(),
-            ),
+        let (cores, mem, disk, node_affinity, full_tier) = match full {
+            Some((memo, h_all)) => {
+                tracing::Span::current()
+                    .record("tier", memo.tier.as_str())
+                    .record("c_star", memo.a.c_star)
+                    .record("n_candidates_feasible", memo.all_candidates.len());
+                // Read-time ICE mask: A \ masked. Never empty — fall
+                // back to A if all of A is masked (the controller will
+                // see `unfulfillable` again and the backoff doubles;
+                // emitting an empty affinity would land hw-agnostic
+                // which §Capacity backoff reserves for envelope-
+                // infeasibility).
+                let masked = self.ice.masked_cells();
+                let cells: Vec<_> = memo
+                    .a
+                    .cells
+                    .iter()
+                    .filter(|c| !masked.contains(c))
+                    .cloned()
+                    .collect();
+                let cells = if cells.is_empty() {
+                    if self.ice.exhausted(&h_all) {
+                        crate::sla::metrics::hw_ladder_exhausted(&tenant, "all_masked");
+                        solve::InfeasibleReason::CapacityExhausted.emit(&tenant);
+                    }
+                    memo.a.cells
+                } else {
+                    cells
+                };
+                (
+                    memo.a.c_star,
+                    memo.a.mem_bytes,
+                    memo.a.disk_bytes,
+                    solve::cells_to_selector_terms(&cells, &self.sla_config.hw_classes),
+                    Some(memo.tier),
+                )
+            }
             None => {
                 let (c, m, d) = solve::intent_for(
                     fit.as_ref(),
@@ -522,7 +613,7 @@ impl DagActor {
                     &self.sla_tiers,
                     &self.sla_ceilings,
                 );
-                (c, m, d, Default::default())
+                (c, m, d, Vec::new(), None)
             }
         };
         // `forced_mem` overlays whichever arm fired — `intent_for`
@@ -625,29 +716,25 @@ impl DagActor {
                 let tiers = pinned.as_deref().unwrap_or(&self.sla_tiers);
                 let (tier, tier_target) = if no_tier {
                     (None, None)
+                } else if let Some(tier) = full_tier.as_deref() {
+                    (
+                        Some(tier.to_owned()),
+                        self.sla_tiers
+                            .iter()
+                            .find(|t| t.name == tier)
+                            .and_then(solve::Tier::binding_bound),
+                    )
                 } else {
-                    // `full` is `None` ⇒ re-run `solve_mvp` (now pure)
-                    // for the tier name. Match-on-borrow so the local
-                    // `mvp` outlives the `&SolveResult`. Previously
-                    // `unwrap_or(&solve_mvp(...))` evaluated EAGERLY,
-                    // running `solve_mvp` even when `full` was Some —
-                    // wasted compute, and double-counted the
-                    // `sla_infeasible_total` metric back when
-                    // `solve_mvp` emitted internally.
-                    let mvp;
-                    let r: &solve::SolveResult = match full.as_ref() {
-                        Some(r) => r,
-                        None => {
-                            mvp = solve::solve_mvp(f, tiers, &self.sla_ceilings);
-                            &mvp
-                        }
-                    };
-                    match r {
+                    // hw-agnostic arm ⇒ re-run `solve_mvp` (pure) for
+                    // the tier name. The admissible-set arm carries
+                    // `full_tier` directly so this only fires when
+                    // gates routed away from solve_full.
+                    match solve::solve_mvp(f, tiers, &self.sla_ceilings) {
                         solve::SolveResult::Feasible { tier, .. } => (
                             Some(tier.clone()),
                             self.sla_tiers
                                 .iter()
-                                .find(|t| t.name == *tier)
+                                .find(|t| t.name == tier)
                                 .and_then(solve::Tier::binding_bound),
                         ),
                         solve::SolveResult::BestEffort { .. } => (None, None),
@@ -666,7 +753,7 @@ impl DagActor {
             disk_bytes: disk,
             deadline_secs,
             predicted,
-            node_selector,
+            node_affinity,
         }
     }
 

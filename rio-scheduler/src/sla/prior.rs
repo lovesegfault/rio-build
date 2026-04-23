@@ -181,8 +181,12 @@ pub fn validate_seed_entry(e: &SeedEntry, cfg: &SlaConfig) -> Result<(), String>
     check!(e.p, "P", 0.0, bt_ref);
     check!(e.q, "Q", 0.0, bt_ref);
     check!(e.p_bar, "p̄", 0.0, cfg.max_cores);
-    check!(e.a, "a", 0.0, cfg.max_mem as f64);
-    check!(e.b, "b", 0.0, cfg.max_mem as f64);
+    // `a`/`b` are `MemFit::Coupled` log-log params (`ln M = a + b·ln c`),
+    // NOT bytes. `a = ln M(1)` so `[0, ln(max_mem)]`; `b` is the slope
+    // and may be slightly negative on mem-independent workloads where
+    // the regression fits noise — |b|>2 means M ∝ c^±2, pathological.
+    check!(e.a, "a", 0.0, (cfg.max_mem as f64).ln());
+    check!(e.b, "b", -2.0, 2.0);
     check!(e.n_eff, "n_eff", 0.0, 32.0);
     for (d, &x) in e.alpha.iter().enumerate() {
         if !x.is_finite() || !(0.0..=1.0).contains(&x) {
@@ -688,20 +692,19 @@ mod tests {
         }
         let m = fleet_median(&all, 2, 2).expect("6 keys ≥ 2, 2 tenants ≥ 2");
         let want = [0.45, 0.25, 0.3];
-        for d in 0..K {
+        for (d, w) in want.iter().enumerate() {
             assert!(
-                (m.alpha[d] - want[d]).abs() < 1e-9,
-                "α[{d}]={} want {}",
-                m.alpha[d],
-                want[d]
+                (m.alpha[d] - w).abs() < 1e-9,
+                "α[{d}]={} want {w}",
+                m.alpha[d]
             );
         }
         assert!((m.alpha.iter().sum::<f64>() - 1.0).abs() < 1e-9);
         // Per-component clamp around UNIFORM=[⅓;3]: band [⅙, ⅔].
         // [.45,.25,.3] all inside → unchanged after clamp+reproject.
         let clamped = clamp_to_operator(&m, &probe(), 600.0);
-        for d in 0..K {
-            assert!((clamped.alpha[d] - want[d]).abs() < 1e-9);
+        for (d, w) in want.iter().enumerate() {
+            assert!((clamped.alpha[d] - w).abs() < 1e-9);
         }
     }
 
@@ -1039,7 +1042,7 @@ mod tests {
     #[test]
     fn validate_rejects_non_finite() {
         let cfg = vcfg();
-        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 1e12] {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e12] {
             for setter in [
                 |e: &mut SeedEntry, v| e.s = v,
                 |e: &mut SeedEntry, v| e.p = v,
@@ -1061,6 +1064,28 @@ mod tests {
             e.alpha = vec![0.5, bad];
             assert!(validate_seed_entry(&e, &cfg).is_err(), "α={bad} accepted");
         }
+        // -1.0 rejected on every scalar EXCEPT b (log-log slope, may be
+        // negative on mem-independent workloads).
+        for setter in [
+            |e: &mut SeedEntry, v| e.s = v,
+            |e: &mut SeedEntry, v| e.p = v,
+            |e: &mut SeedEntry, v| e.q = v,
+            |e: &mut SeedEntry, v| e.a = v,
+            |e: &mut SeedEntry, v| e.n_eff = v,
+            |e: &mut SeedEntry, v| e.p_bar = v,
+        ] {
+            let mut e = ok_entry();
+            setter(&mut e, -1.0);
+            assert!(validate_seed_entry(&e, &cfg).is_err());
+        }
+        let mut e = ok_entry();
+        e.b = -0.5;
+        assert!(
+            validate_seed_entry(&e, &cfg).is_ok(),
+            "b<0 accepted (export→import roundtrip on mem-indep fit)"
+        );
+        e.b = -3.0;
+        assert!(validate_seed_entry(&e, &cfg).is_err(), "|b|>2 rejected");
         // Control: ok_entry passes.
         assert!(validate_seed_entry(&ok_entry(), &cfg).is_ok());
     }

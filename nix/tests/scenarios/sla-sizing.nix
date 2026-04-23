@@ -32,17 +32,15 @@
 #   one sample -> SlaStatus.prior_source == "seed". Covers
 #   sched.sla.prior-partial-pool.
 #
-# cost-solve — seed band-aware hw_perf_samples + low lambda, queue a
-#   build with the worker stopped, assert GetSpawnIntents
-#   intents[].nodeSelector carries rio.build/hw-band. Covers
-#   sched.sla.solve-per-band-cap. Requires the solve_full -> intent_for
-#   node_selector wiring; fails until that lands.
+# cost-solve — seed hw-class-aware hw_perf_samples + low lambda,
+#   queue a build with the worker stopped, assert GetSpawnIntents
+#   intents[].nodeAffinity carries OR-of-ANDs (h,cap) terms. Covers
+#   sched.sla.hw-class.admissible-set.
 #
-# ice-backoff — append interrupt_samples (RPC + DB roundtrip) and
-#   re-observe the queued build: nodeSelector still carries a valid
-#   (band, cap) pair. lambda fold is on a 10min poller tick so the
-#   on-demand flip is NOT observable here; covered by solve.rs unit
-#   tests. Covers sched.sla.tier-envelope (selector envelope shape).
+# ice-backoff — append interrupt_samples (RPC + DB roundtrip), then
+#   AckSpawnedIntents.unfulfillableCells one cell and re-observe the
+#   queued build: that cell is dropped from nodeAffinity (read-time
+#   mask, memo unchanged). Covers sched.sla.hw-class.ice-mask.
 #
 # CAVEAT: standalone-fixture workers read effective_cores from the host
 # cgroup, NOT from a per-dispatch SpawnIntent (no controller). The
@@ -307,23 +305,26 @@ let
           # ~1500. 10% band tolerates NNLS + partial-pool shrinkage.
           assert 1800 < st["p"] < 2200, f"P={st['p']} (norm failed?)"
           sigma = st.get("sigmaResid", 0.0)
-          assert sigma < 0.2, f"sigma={sigma}"
+          # 0.25: bounded-ALS (alpha-als) adds one alternation round of
+          # residual jitter on top of the NNLS fit; the P-band above is
+          # the structural assertion, sigma is a noise-floor sanity
+          # check. Without normalization sigma > 0.4 (ln 2 gap between
+          # the two hw_class curves dominates).
+          assert sigma < 0.25, f"sigma={sigma}"
     '';
 
     cost-solve = ''
-      with subtest("cost-solve: solve_full populates SpawnIntent.nodeSelector"):
-          # Phase-13 wiring: hw_cost_source="static" + populated
-          # hw_perf_factors + non-seed lambda -> solve_full picks a
-          # (band, cap) and stamps it into SpawnIntent.node_selector.
-          # ASSERT-LIGHT: only checks the selector is non-empty and
-          # carries rio.build/hw-band; the per-band cost ranking is
+      with subtest("cost-solve: solve_full populates SpawnIntent.nodeAffinity"):
+          # Phase-13 wiring: hw_cost_source="static" + sla.hw_classes
+          # configured + populated hw_perf_samples -> solve_full builds
+          # the admissible set and stamps it into
+          # SpawnIntent.node_affinity (OR-of-ANDs over (h,cap)).
+          # ASSERT-LIGHT: only checks the affinity is non-empty and
+          # each term carries rio.build/hw-class +
+          # karpenter.sh/capacity-type; the admissible-set ranking is
           # unit-tested in solve.rs. Standalone fixture has no
           # controller, so we read the scheduler-side intent via
           # GetSpawnIntents instead of inspecting a pod spec.
-          #
-          # NOTE: requires solve_full -> intent_for -> intents
-          # node_selector wiring (impl-todos commit 3). Until that
-          # lands, nodeSelector stays {} and this subtest fails.
           band_hw = [("intel-6-ebs-lo", 1.0), ("intel-7-ebs-mid", 1.4), ("intel-8-nvme-hi", 2.0)]
           for hw, factor in band_hw:
               for i in range(3):
@@ -342,8 +343,9 @@ let
           # Structural precondition: HwTable.aggregate admits a class
           # once >=3 distinct pod_ids exist in the 7d window (M_054
           # dropped the hw_perf_factors view; same gate, app-side now).
-          # solve_intent_for gates on !hw_table.is_empty(); if this is
-          # 0 the gate never opens and node_selector stays {}.
+          # solve_intent_for gates on !hw_table.is_empty() AND
+          # !sla.hw_classes.is_empty(); if this is 0 the gate never
+          # opens and node_affinity stays [].
           n_hw = int(psql(${gatewayHost},
               "SELECT COUNT(*) FROM ("
               "  SELECT hw_class FROM hw_perf_samples "
@@ -394,37 +396,44 @@ let
               f"GetSpawnIntents={resp!r} "
               f"nix-build={client.execute('cat /tmp/synth-cost.log')[1]!r}"
           )
-          sel = intent.get("nodeSelector", {})
-          print(f"cost-solve: nodeSelector={sel}")
-          if not sel:
+          aff = intent.get("nodeAffinity", [])
+          print(f"cost-solve: nodeAffinity={aff}")
+          if not aff:
               # Diagnostic: which solve_intent_for gate failed?
               st = json.loads(grpcurl_admin("SlaStatus", {
                   "pname": "synth-cost", "system": "x86_64-linux", "tenant": "",
               }))
               raise AssertionError(
-                  "SpawnIntent.nodeSelector empty: solve_full gate not "
-                  "satisfied. Gate = hw_cost_source set AND !hw_table."
-                  "is_empty() AND n_eff>=3 AND (span>=4 OR frozen). "
+                  "SpawnIntent.nodeAffinity empty: solve_full gate not "
+                  "satisfied. Gate = hw_cost_source set AND "
+                  "!sla.hw_classes.is_empty() AND !hw_table.is_empty() "
+                  "AND n_eff>=3 AND (span>=4 OR frozen). "
                   f"hw classes admitted={n_hw}, "
                   f"SlaStatus[synth-cost]={st!r}, intent={intent!r}"
               )
-          assert "rio.build/hw-band" in sel, sel
-          assert sel.get("rio.build/hw-band") in ("hi", "mid", "lo"), sel
+          # Each term: h-label conjunction PLUS karpenter capacity-type.
+          for term in aff:
+              keys = {r["key"] for r in term.get("matchExpressions", [])}
+              assert "karpenter.sh/capacity-type" in keys, term
+              assert "rio.build/hw-class" in keys, term
+              hw = next(r["values"][0] for r in term["matchExpressions"]
+                        if r["key"] == "rio.build/hw-class")
+              assert hw in (
+                  "intel-6-ebs-lo", "intel-7-ebs-mid", "intel-8-nvme-hi"
+              ), term
     '';
 
     ice-backoff = ''
-      with subtest("ice-backoff: per-(band,cap) selector survives interrupt-sample churn"):
-          # ASSERT-LIGHT: AppendInterruptSample exercises the
-          # controller -> interrupt_samples write path; lambda is
-          # folded into CostTable by spot_price_poller on a 10-MINUTE
-          # tick (cost.rs:587), so we cannot observe the high-lambda
-          # -> on-demand flip within the 300s test budget. The
-          # lambda-driven p>0.5 gate is unit-tested in solve.rs
-          # (r[verify sched.sla.solve-per-band-cap]). Here we verify
-          # that after seeding interrupt_samples + an estimator tick,
-          # the queued build still receives a well-formed (band,cap)
-          # nodeSelector — i.e. the solve_full path is stable across
-          # the per-(band,cap) candidate enumeration.
+      with subtest("ice-backoff: read-time ICE mask drops cell from nodeAffinity"):
+          # AppendInterruptSample exercises the controller ->
+          # interrupt_samples write path; lambda is folded into
+          # CostTable by spot_price_poller on a 10-MINUTE tick, so we
+          # cannot observe the high-lambda -> on-demand flip within
+          # the 300s test budget (the p>0.5 gate is unit-tested in
+          # solve.rs). Here we verify the read-time mask: report one
+          # cell unfulfillable via AckSpawnedIntents and assert the
+          # next nodeAffinity drops it WITHOUT re-solving (memo
+          # unchanged).
           for hw in ("intel-6-ebs-lo", "intel-7-ebs-mid", "intel-8-nvme-hi"):
               grpcurl_admin("AppendInterruptSample",
                   {"hwClass": hw, "kind": "interrupt", "value": 100})
@@ -439,18 +448,61 @@ let
           )
           wait_estimator_tick()
           # synth-cost is still queued (worker stopped); its SpawnIntent
-          # is recomputed every snapshot.
-          sel: dict = {}
+          # is recomputed every snapshot. Baseline nodeAffinity:
+          aff0: list = []
           for _ in range(15):
               resp = json.loads(grpcurl_admin("GetSpawnIntents", {}))
               intents = resp.get("intents", [])
               if intents:
-                  sel = intents[0].get("nodeSelector", {})
+                  aff0 = intents[0].get("nodeAffinity", [])
                   break
               time.sleep(2)
-          print(f"ice-backoff: nodeSelector={sel}")
-          assert sel.get("rio.build/hw-band") in ("hi", "mid", "lo"), sel
-          assert sel.get("karpenter.sh/capacity-type") in ("spot", "on-demand"), sel
+          print(f"ice-backoff: baseline nodeAffinity={aff0}")
+          assert aff0, "solve_full path active"
+          def cells_of(aff: list) -> set:
+              return {
+                  (next(r["values"][0] for r in t["matchExpressions"]
+                        if r["key"] == "rio.build/hw-class"),
+                   next(r["values"][0] for r in t["matchExpressions"]
+                        if r["key"] == "karpenter.sh/capacity-type"))
+                  for t in aff
+              }
+          a0 = cells_of(aff0)
+          # Read-time mask is a subset op on A: masking a cell NOT in A
+          # is a no-op; masking ALL of A falls back to A (never empty).
+          # Under seed prices A often collapses to one cell; the
+          # multi-cell subset behavior is unit-tested
+          # (actor::tests::dispatch::ice_mask_is_read_time). Here:
+          # (1) AckSpawnedIntents.unfulfillableCells RPC plumbing,
+          # (2) cell not in A is a no-op,
+          # (3) cell IN A masked: result is A \ {it} or A (never empty).
+          not_in_a = next(h for h in (
+              "intel-6-ebs-lo", "intel-7-ebs-mid", "intel-8-nvme-hi"
+          ) if (h, "on-demand") not in a0)
+          grpcurl_admin("AckSpawnedIntents", {
+              "spawned": [],
+              "unfulfillableCells": [f"{not_in_a}:on-demand"],
+          })
+          resp = json.loads(grpcurl_admin("GetSpawnIntents", {}))
+          aff1 = resp.get("intents", [{}])[0].get("nodeAffinity", [])
+          assert cells_of(aff1) == a0, (
+              f"masking cell not in A is no-op: before={a0} after={cells_of(aff1)}"
+          )
+          masked_h, masked_cap = next(iter(a0))
+          grpcurl_admin("AckSpawnedIntents", {
+              "spawned": [],
+              "unfulfillableCells": [f"{masked_h}:{masked_cap}"],
+          })
+          resp = json.loads(grpcurl_admin("GetSpawnIntents", {}))
+          aff2 = resp.get("intents", [{}])[0].get("nodeAffinity", [])
+          a2 = cells_of(aff2)
+          print(f"ice-backoff: post-mask nodeAffinity={aff2}")
+          assert a2, "read-time mask never yields empty affinity"
+          assert a2.issubset(a0), f"mask is subset op: {a2} not subset of {a0}"
+          if len(a0) > 1:
+              assert (masked_h, masked_cap) not in a2, (
+                  f"masked cell ({masked_h},{masked_cap}) dropped from |A|>1"
+              )
           # Cleanup: drain the backgrounded build + restore the worker
           # so seed-corpus (chained after) has a working fixture.
           client.execute("pkill -f 'nix-build.*synth-cost' || true")

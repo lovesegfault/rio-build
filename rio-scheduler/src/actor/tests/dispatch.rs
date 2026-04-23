@@ -1629,374 +1629,210 @@ async fn spawn_intent_from_sla_estimator() {
     assert_eq!(cold.mem_bytes, 8 << 30);
 }
 
-/// ADR-023 §2.8 Pending-watch: an entry in `pending_intents` past the
-/// 60s window marks its `(band, cap)` ICE-infeasible and is dropped;
-/// an entry whose drv left Ready is dropped without marking; a
-/// heartbeat with matching `intent_id` clears the entry.
+/// `r[sched.sla.hw-class.ice-mask]`: `unfulfillable_cells` from the
+/// controller marks the cell ICE; the read-time mask drops it from
+/// `node_affinity` WITHOUT re-solving (memo unchanged); a successful
+/// spawn ack clears the cell and the next dispatch sees it again.
+// r[verify sched.sla.hw-class.ice-mask]
 #[tokio::test]
-async fn pending_intent_timeout_marks_ice() {
-    use crate::sla::cost::{Band, Cap};
-    use std::time::{Duration, Instant};
+async fn ice_mask_is_read_time() {
+    use crate::sla::config::CapacityType;
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_cfg(db.pool.clone(), DagActorConfig::default());
-    actor.sla_config = test_sla_config();
+    let mut actor = bare_actor_hw(db.pool.clone());
+    actor.test_inject_ready("d", Some("test-pkg"), "x86_64-linux", false);
 
-    // "stuck": Ready, backdated past max-jitter (1.2×60s).
-    actor.test_inject_ready("stuck", Some("p"), "x86_64-linux", false);
-    let old = Instant::now() - Duration::from_secs(200);
-    actor
-        .pending_intents
-        .insert("stuck".into(), (Band::Mid, Cap::Spot, old));
-    // "fresh": Ready, just emitted → kept.
-    actor.test_inject_ready("fresh", Some("p"), "x86_64-linux", false);
-    actor
-        .pending_intents
-        .insert("fresh".into(), (Band::Hi, Cap::Spot, Instant::now()));
-    // "gone": no DAG node → dropped without marking.
-    actor
-        .pending_intents
-        .insert("gone".into(), (Band::Lo, Cap::OnDemand, old));
-
-    actor.tick_sweep_pending_intents(Instant::now());
-
-    assert!(
-        actor.ice.is_infeasible(Band::Mid, Cap::Spot),
-        "stuck → marked"
-    );
-    assert!(
-        !actor.ice.is_infeasible(Band::Lo, Cap::OnDemand),
-        "gone → dropped without marking (drv left Ready)"
-    );
-    assert!(!actor.ice.is_infeasible(Band::Hi, Cap::Spot), "fresh kept");
-    assert_eq!(actor.pending_intents.len(), 1, "only fresh remains");
-    assert!(actor.pending_intents.contains_key("fresh"));
-
-    // Heartbeat with intent_id="fresh" clears it (pod made it past
-    // Pending). handle_heartbeat requires a stream entry first.
-    let (tx, _rx) = tokio::sync::mpsc::channel(1);
-    let _ = actor.handle_worker_connected(&"w0".into(), tx, next_stream_epoch_for("w0"), None);
-    actor.handle_heartbeat(HeartbeatPayload {
-        executor_id: "w0".into(),
-        systems: vec!["x86_64-linux".into()],
-        supported_features: vec![],
-        running_build: None,
-        resources: None,
-        store_degraded: false,
-        draining: false,
-        kind: rio_proto::types::ExecutorKind::Builder,
-        intent_id: Some("fresh".into()),
-    });
-    assert!(actor.pending_intents.is_empty(), "heartbeat clears entry");
-}
-
-/// `r[sched.sla.ice-ladder-cap]`: a single drv's Pending-watch timeouts
-/// are bounded by `ladder_cap`; on exhaustion `solve_intent_for` skips
-/// `solve_full` and dispatches band-agnostic. Before, `ladder_cap` had
-/// zero production callers and a 1h-tier build cycled `(band, cap)`
-/// cells ~30 times until tier-deadline.
-// r[verify sched.sla.ice-ladder-cap]
-#[tokio::test]
-async fn ladder_cap_forces_band_agnostic_after_n_timeouts() {
-    use crate::sla::cost::{self, Band, Cap};
-    use crate::sla::{hw, types::*};
-    use std::time::{Duration, Instant};
-    let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_cfg(db.pool.clone(), DagActorConfig::default());
-    actor.sla_config = crate::sla::config::SlaConfig {
-        hw_cost_source: Some(cost::HwCostSource::Static),
-        ..test_sla_config()
-    };
-    actor.sla_ceilings = actor.sla_config.ceilings();
-    // p90=1920s, fallback=60s → ladder_cap = ⌈1920/60/4⌉ = 8.
-    actor.sla_tiers = vec![crate::sla::solve::Tier {
-        name: "normal".into(),
-        p50: None,
-        p90: Some(1920.0),
-        p99: None,
-    }];
-    let cap = actor.ice_ladder_cap();
-    assert_eq!(cap, 8);
-    let mut m = HashMap::new();
-    m.insert("aws-7-ebs-mid".into(), 1.0);
-    actor.sla_estimator.seed_hw(hw::HwTable::from_map(m));
-    actor.sla_estimator.seed(FittedParams {
-        key: ModelKey {
-            pname: "p".into(),
-            system: "x86_64-linux".into(),
-            tenant: String::new(),
-        },
-        fit: DurationFit::Amdahl {
-            s: RefSeconds(10.0),
-            p: RefSeconds(500.0),
-        },
-        mem: MemFit::Independent {
-            p90: MemBytes(2 << 30),
-        },
-        disk_p90: Some(DiskBytes(10 << 30)),
-        sigma_resid: 0.1,
-        log_residuals: Vec::new(),
-        n_eff: 10.0,
-        n_distinct_c: 5,
-        sum_w: 10.0,
-        span: 8.0,
-        explore: ExploreState {
-            distinct_c: 3,
-            min_c: RawCores(1.0),
-            max_c: RawCores(8.0),
-            saturated: false,
-            last_wall: WallSeconds(0.0),
-        },
-        t_min_ci: None,
-        ci_computed_at: None,
-        tier: None,
-        hw_bias: Default::default(),
-        alpha: crate::sla::alpha::UNIFORM,
-        prior_source: None,
-        is_fod: false,
-    });
-    actor.test_inject_ready("d", Some("p"), "x86_64-linux", false);
-
-    // Precondition: solve_full fires, selector populated.
+    // Precondition: solve_full fires, affinity over A' populated.
     let intent = actor.solve_intent_for(actor.dag.node("d").unwrap());
     assert!(
-        !intent.node_selector.is_empty(),
+        !intent.node_affinity.is_empty(),
         "precondition: solve_full path active"
     );
+    let n0 = intent.node_affinity.len();
+    let g0 = actor.solve_cache.inputs_gen();
 
-    // Simulate `cap` consecutive Pending-watch timeouts.
-    let old = Instant::now() - Duration::from_secs(100);
-    for i in 0..cap {
-        actor
-            .pending_intents
-            .insert("d".into(), (Band::Mid, Cap::Spot, old));
-        actor.tick_sweep_pending_intents(Instant::now());
+    // Mask one cell from A' via the controller's unfulfillable report.
+    let masked: crate::sla::config::Cell = ("intel-6".into(), CapacityType::Spot);
+    actor.handle_ack_spawned_intents(&[], &["intel-6:spot".into()]);
+    assert!(actor.ice.is_masked(&masked));
+
+    // Read-time mask: the next dispatch returns A \ {masked} WITHOUT
+    // touching the memo (deterministic — same inputs_gen).
+    let intent2 = actor.solve_intent_for(actor.dag.node("d").unwrap());
+    assert_eq!(
+        actor.solve_cache.inputs_gen(),
+        g0,
+        "ICE state is NOT in inputs_gen"
+    );
+    let intel6_spot = |t: &rio_proto::types::NodeSelectorTerm| {
+        t.match_expressions
+            .iter()
+            .any(|r| r.key == "rio.build/hw-class" && r.values == ["intel-6"])
+            && t.match_expressions
+                .iter()
+                .any(|r| r.key == "karpenter.sh/capacity-type" && r.values == ["spot"])
+    };
+    if intent.node_affinity.iter().any(intel6_spot) {
         assert!(
-            !actor.pending_intents.contains_key("d"),
-            "timeout drops entry (selector-pin must not re-emit dead cell)"
+            !intent2.node_affinity.iter().any(intel6_spot),
+            "masked cell dropped from affinity"
         );
-        assert_eq!(
-            actor.ice_attempts.get("d").map(|v| v.len() as u32),
-            Some(i + 1),
-            "attempt {i}: ice_attempts survives the drop"
-        );
+        assert_eq!(intent2.node_affinity.len(), n0 - 1);
     }
 
-    // Ladder exhausted → band-agnostic.
-    let intent = actor.solve_intent_for(actor.dag.node("d").unwrap());
-    assert!(
-        intent.node_selector.is_empty(),
-        "ladder_cap reached → solve_full skipped → band-agnostic selector"
-    );
-
-    // Heartbeat clears the attempt log → next solve is band-targeted again.
-    let (tx, _rx) = tokio::sync::mpsc::channel(1);
-    let _ = actor.handle_worker_connected(&"w0".into(), tx, next_stream_epoch_for("w0"), None);
-    actor.handle_heartbeat(HeartbeatPayload {
-        executor_id: "w0".into(),
-        systems: vec!["x86_64-linux".into()],
-        supported_features: vec![],
-        running_build: None,
-        resources: None,
-        store_degraded: false,
-        draining: false,
-        kind: rio_proto::types::ExecutorKind::Builder,
-        intent_id: Some("d".into()),
-    });
-    assert!(
-        !actor.ice_attempts.contains_key("d"),
-        "heartbeat resets ladder"
-    );
-    let intent = actor.solve_intent_for(actor.dag.node("d").unwrap());
-    assert!(
-        !intent.node_selector.is_empty(),
-        "post-heartbeat: solve_full path restored"
-    );
-
-    // Orphan case: a ladder-exhausted drv that then leaves Ready
-    // (band-agnostic dispatch → no `pending_intents` entry → parasitic
-    // cleanup wouldn't fire). The dag-state-keyed sweep reaps it.
-    actor
-        .ice_attempts
-        .insert("orphan".into(), vec![(Band::Mid, Cap::Spot); cap as usize]);
-    assert!(!actor.pending_intents.contains_key("orphan"));
-    actor.tick_sweep_pending_intents(Instant::now());
-    assert!(
-        !actor.ice_attempts.contains_key("orphan"),
-        "ice_attempts reaped for drv not in dag (left Ready), \
-         independent of pending_intents membership"
-    );
-}
-
-/// `handle_ack_spawned_intents` is idempotent: a re-ack of an
-/// already-armed intent (the controller acks the FULL still-Pending
-/// set every tick) MUST NOT reset `armed_at` — `or_insert`, not
-/// `insert`. Otherwise a pod stuck Pending forever never crosses the
-/// Pending-watch window because each tick re-arms it at `now`.
-/// After the ICE-sweep removes a timed-out entry, a subsequent ack
-/// is a fresh insert at the new time.
-#[tokio::test]
-async fn ack_spawned_intents_reack_preserves_armed_at() {
-    use crate::sla::cost::{self, Band, Cap};
-    use std::time::{Duration, Instant};
-    let db = TestDb::new(&MIGRATOR).await;
-    let actor = bare_actor_cfg(db.pool.clone(), DagActorConfig::default());
-
-    let sel = cost::selector_for(Band::Mid, Cap::Spot);
-    let intent = rio_proto::types::SpawnIntent {
-        intent_id: "x".into(),
-        node_selector: sel.into_iter().collect(),
-        ..Default::default()
-    };
-
-    actor.handle_ack_spawned_intents(std::slice::from_ref(&intent));
-    let t1 = actor.pending_intents.get("x").unwrap().2;
-
-    // Re-ack after measurable elapsed time. `Instant::now()` inside
-    // `handle_ack_spawned_intents` would yield > t1 if it overwrote.
-    std::thread::sleep(Duration::from_millis(5));
-    actor.handle_ack_spawned_intents(std::slice::from_ref(&intent));
-    let t1_again = actor.pending_intents.get("x").unwrap().2;
+    // Clear (success report): unmasking is free — the SAME memo is
+    // read, full A' returns.
+    actor.ice.clear(&masked);
+    let intent3 = actor.solve_intent_for(actor.dag.node("d").unwrap());
     assert_eq!(
-        t1, t1_again,
-        "re-ack preserves armed_at (or_insert, not insert)"
+        intent3.node_affinity.len(),
+        n0,
+        "memo never overwritten — unmask restores full A'"
     );
-    assert!(Instant::now() > t1, "sleep was observable");
 
-    // Simulate ICE-sweep removing the timed-out entry.
-    actor.pending_intents.remove("x");
-    std::thread::sleep(Duration::from_millis(5));
-    actor.handle_ack_spawned_intents(std::slice::from_ref(&intent));
-    let t3 = actor.pending_intents.get("x").unwrap().2;
+    // All-of-H masked → §Capacity backoff exit (b): falls back to A
+    // (not empty affinity) and emits capacity_exhausted.
+    for h in actor.sla_config.hw_classes.keys() {
+        for cap in CapacityType::ALL {
+            actor.ice.mark(&(h.clone(), cap));
+        }
+    }
+    let intent4 = actor.solve_intent_for(actor.dag.node("d").unwrap());
     assert!(
-        t3 > t1,
-        "post-removal ack arms fresh: t3={t3:?} > t1={t1:?}"
+        !intent4.node_affinity.is_empty(),
+        "all-masked → still emit A (best-effort reserved for envelope-infeasibility)"
     );
 }
 
-/// `handle_ack_spawned_intents` drops a re-ack of an ICE-marked cell.
-/// When the scheduler's `Tick` → `tick_sweep_pending_intents` lands
-/// between the controller's poll and ack (~1-5s of k8s work), the
-/// sweep removes the entry and ICE-marks `(band, cap)`. The stale ack
-/// — built from the PRE-sweep poll result — must NOT re-pin the swept
-/// cell with a fresh timer, or the next poll returns the ICE-marked
-/// selector instead of the freshly-solved (cell-excluded) one and
-/// `reap_stale_for_intents` sees no drift. Contrast the
-/// `post-removal ack arms fresh` case in
-/// [`ack_spawned_intents_reack_preserves_armed_at`]: there the cell is
-/// NOT ICE-marked (scheduler restart case) so re-arm is correct.
+/// `r[sched.sla.hw-class.epsilon-explore]`: per-dispatch ε_h draw
+/// pins `h_explore ∈ H\A` (or `H\{argmin price}` on miss / A=H) and
+/// the resulting affinity is `⊆ {h_explore}×{spot,od}`. The memo is
+/// never overwritten.
+// r[verify sched.sla.hw-class.epsilon-explore]
 #[tokio::test]
-async fn ack_after_ice_sweep_does_not_repin() {
-    use crate::sla::cost::{self, Band, Cap};
+async fn epsilon_h_draws_outside_a() {
     let db = TestDb::new(&MIGRATOR).await;
-    let actor = bare_actor_cfg(db.pool.clone(), DagActorConfig::default());
+    let mut actor = bare_actor_hw(db.pool.clone());
+    actor.test_inject_ready("d", Some("test-pkg"), "x86_64-linux", false);
 
-    let sel = cost::selector_for(Band::Mid, Cap::Spot);
-    let intent = rio_proto::types::SpawnIntent {
-        intent_id: "x".into(),
-        node_selector: sel.into_iter().collect(),
-        ..Default::default()
-    };
+    // Baseline at ε=0 (bare_actor_hw default) so the memo is the
+    // unrestricted solve, not an ε_h hit.
+    let baseline = actor.solve_intent_for(actor.dag.node("d").unwrap());
+    actor.sla_config.hw_explore_epsilon = 0.2; // max — high hit rate
+    let in_a: std::collections::HashSet<String> = baseline
+        .node_affinity
+        .iter()
+        .filter_map(|t| {
+            t.match_expressions
+                .iter()
+                .find(|r| r.key == "rio.build/hw-class")
+                .and_then(|r| r.values.first().cloned())
+        })
+        .collect();
+    let h_all: std::collections::HashSet<String> =
+        actor.sla_config.hw_classes.keys().cloned().collect();
+    assert_ne!(in_a, h_all, "fixture: distinct factors ⇒ A⊊H");
 
-    // Ack → armed.
-    actor.handle_ack_spawned_intents(std::slice::from_ref(&intent));
-    assert!(actor.pending_intents.contains_key("x"));
+    // 200 dispatches: every ε_h hit emits ≤2 terms over a single h.
+    let mut explore_hits = 0;
+    for _ in 0..200 {
+        let intent = actor.solve_intent_for(actor.dag.node("d").unwrap());
+        let hs: std::collections::HashSet<String> = intent
+            .node_affinity
+            .iter()
+            .filter_map(|t| {
+                t.match_expressions
+                    .iter()
+                    .find(|r| r.key == "rio.build/hw-class")
+                    .and_then(|r| r.values.first().cloned())
+            })
+            .collect();
+        if hs.len() == 1 && hs != in_a {
+            explore_hits += 1;
+            let h = hs.into_iter().next().unwrap();
+            assert!(!in_a.contains(&h), "h_explore={h} must be ∉ A; A={in_a:?}");
+            // A' ⊆ {h_explore}×{spot,od}.
+            assert!(intent.node_affinity.len() <= 2);
+        }
+    }
+    // ε=0.2, 200 trials → ~40 expected; ≥10 with overwhelming prob.
+    assert!(explore_hits >= 10, "ε_h fires: got {explore_hits}/200");
+    // Memo unchanged across all draws.
+    assert_eq!(actor.solve_cache.len(), 1);
 
-    // tick_sweep_pending_intents fires: removes entry + marks ICE.
-    actor.ice.mark(Band::Mid, Cap::Spot);
-    actor.pending_intents.remove("x");
-
-    // Stale ack (controller built to_ack from pre-sweep poll) → dropped.
-    actor.handle_ack_spawned_intents(std::slice::from_ref(&intent));
-    assert!(
-        !actor.pending_intents.contains_key("x"),
-        "ack of ICE-marked cell must not re-pin (next poll must see no \
-         pin → freshly-solved selector → reap-on-drift fires)"
-    );
-
-    // A different (non-ICE-marked) cell still arms — guard is per-cell.
-    let sel2 = cost::selector_for(Band::Mid, Cap::OnDemand);
-    let intent2 = rio_proto::types::SpawnIntent {
-        intent_id: "y".into(),
-        node_selector: sel2.into_iter().collect(),
-        ..Default::default()
-    };
-    actor.handle_ack_spawned_intents(std::slice::from_ref(&intent2));
-    assert!(
-        actor.pending_intents.contains_key("y"),
-        "non-ICE-marked cell still arms"
-    );
-}
-
-/// `solve_full` wired into the actor: with `hw_cost_source` set, a
-/// populated hw-factor table, and a fitted key, `SpawnIntent.
-/// node_selector` carries `rio.build/hw-band` + `karpenter.sh/
-/// capacity-type` and the Pending-watch ledger is armed.
-// r[verify sched.sla.solve-per-band-cap]
-#[tokio::test]
-async fn spawn_intent_node_selector_from_solve_full() {
-    use crate::sla::{cost, hw, types::*};
-    let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_cfg(db.pool.clone(), DagActorConfig::default());
-    actor.sla_config = crate::sla::config::SlaConfig {
-        hw_cost_source: Some(cost::HwCostSource::Static),
-        ..test_sla_config()
-    };
-    actor.sla_ceilings = actor.sla_config.ceilings();
-    actor.sla_tiers = vec![crate::sla::solve::Tier {
-        name: "normal".into(),
-        p50: None,
-        p90: Some(1200.0),
-        p99: None,
-    }];
-    // hw table with one Mid-band class only (so h_dagger picks it for
-    // every band → only Mid is feasible, Hi/Lo fall back to factor=1.0
-    // via empty match … actually h_dagger returns ("",1.0) for bands
-    // with no hw_class, which is still feasible). To make the assertion
-    // tight, populate one class per band so all 6 cells are candidates
-    // and the argmin picks the cheapest spot.
+    // ── Fallback branch: in_a=∅ OR A=H → H\{argmin price} ──────────
+    // Regression: with the old `pool = H\in_a; if empty → H\{cheapest}`,
+    // the in_a=∅ case (memo=None / BestEffort) gave pool=H and the
+    // fallback never fired. Both `in_a.is_empty()` and `in_a==H` now
+    // route directly to H\{cheapest}. Exercise via A=H (observable):
+    // equalize hw factors + prices within τ → every spot cell in A.
+    // Seed prices are cap-only (all h equal) → cheapest_h would be
+    // HashMap-iteration order; set distinct prices within τ=0.15 so
+    // cheapest is deterministic AND A still spans H.
+    {
+        use crate::sla::config::CapacityType::Spot;
+        let mut ct = actor.cost_table.write();
+        ct.set_price("intel-6", Spot, 0.0100, 1e9);
+        ct.set_price("intel-7", Spot, 0.0105, 1e9);
+        ct.set_price("intel-8", Spot, 0.0110, 1e9);
+    }
+    let cheapest = actor.cost_table.read().cheapest_h(&h_all).unwrap();
+    assert_eq!(cheapest, "intel-6");
     let mut m = HashMap::new();
-    m.insert("aws-7-ebs-mid".into(), 1.0);
-    actor.sla_estimator.seed_hw(hw::HwTable::from_map(m));
-    // cost_table left at seed defaults — spot < on-demand for every
-    // band, Lo cheapest. With only Mid in hw table, h_dagger for Hi/Lo
-    // returns ("",1.0); all bands are feasible at factor=1.0 so argmin
-    // by E[cost] picks (Lo, Spot).
+    for h in &h_all {
+        m.insert(h.clone(), 1.0);
+    }
+    actor
+        .sla_estimator
+        .seed_hw(crate::sla::hw::HwTable::from_map(m));
+    actor.solve_cache.bump_inputs_gen();
+    actor.sla_config.hw_explore_epsilon = 0.0;
+    let in_a2: std::collections::HashSet<_> = actor
+        .solve_intent_for(actor.dag.node("d").unwrap())
+        .node_affinity
+        .iter()
+        .filter_map(|t| {
+            t.match_expressions
+                .iter()
+                .find(|r| r.key == "rio.build/hw-class")
+                .and_then(|r| r.values.first().cloned())
+        })
+        .collect();
+    assert_eq!(in_a2, h_all, "fixture: equal factors + prices in τ ⇒ A=H");
+    actor.sla_config.hw_explore_epsilon = 0.2;
+    let mut hits = 0;
+    for _ in 0..200 {
+        let intent = actor.solve_intent_for(actor.dag.node("d").unwrap());
+        let hs: std::collections::HashSet<String> = intent
+            .node_affinity
+            .iter()
+            .filter_map(|t| {
+                t.match_expressions
+                    .iter()
+                    .find(|r| r.key == "rio.build/hw-class")
+                    .and_then(|r| r.values.first().cloned())
+            })
+            .collect();
+        if hs.len() == 1 {
+            hits += 1;
+            let h = hs.into_iter().next().unwrap();
+            assert_ne!(
+                h, cheapest,
+                "A=H fallback must draw from H\\{{argmin price={cheapest}}}"
+            );
+        }
+    }
+    assert!(hits >= 10, "ε_h fires under A=H: got {hits}/200");
+}
 
-    actor.sla_estimator.seed(FittedParams {
-        key: ModelKey {
-            pname: "test-pkg".into(),
-            system: "x86_64-linux".into(),
-            tenant: String::new(),
-        },
-        fit: DurationFit::Amdahl {
-            s: RefSeconds(30.0),
-            p: RefSeconds(2000.0),
-        },
-        mem: MemFit::Independent {
-            p90: MemBytes(6 << 30),
-        },
-        disk_p90: Some(DiskBytes(10 << 30)),
-        sigma_resid: 0.1,
-        log_residuals: Vec::new(),
-        n_eff: 10.0,
-        n_distinct_c: 5,
-        sum_w: 10.0,
-        span: 8.0,
-        explore: ExploreState {
-            distinct_c: 3,
-            min_c: RawCores(1.0),
-            max_c: RawCores(32.0),
-            saturated: false,
-            last_wall: WallSeconds(0.0),
-        },
-        t_min_ci: None,
-        ci_computed_at: None,
-        tier: None,
-        hw_bias: Default::default(),
-        alpha: crate::sla::alpha::UNIFORM,
-        prior_source: None,
-        is_fod: false,
-    });
+/// `solve_full` wired into the actor: with `hw_cost_source` set,
+/// `hw_classes` configured, a populated hw-factor table, and a fitted
+/// key, `SpawnIntent.node_affinity` carries OR-of-ANDs `(h, cap)`
+/// terms.
+// r[verify sched.sla.hw-class.admissible-set]
+#[tokio::test]
+async fn spawn_intent_node_affinity_from_solve_full() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
 
     actor.test_inject_ready("fitted", Some("test-pkg"), "x86_64-linux", false);
     actor.test_inject_ready("cold", Some("never-seen"), "x86_64-linux", false);
@@ -2009,51 +1845,33 @@ async fn spawn_intent_node_selector_from_solve_full() {
         .find(|i| i.intent_id == "fitted")
         .unwrap();
     assert!(
-        fitted.node_selector.contains_key("rio.build/hw-band"),
-        "solve_full populated band selector: {:?}",
-        fitted.node_selector
+        !fitted.node_affinity.is_empty(),
+        "solve_full populated affinity: {:?}",
+        fitted.node_affinity
     );
-    assert!(
-        fitted
-            .node_selector
-            .contains_key("karpenter.sh/capacity-type"),
-        "solve_full populated capacity selector: {:?}",
-        fitted.node_selector
-    );
-    assert!(
-        !actor.pending_intents.contains_key("fitted"),
-        "compute_spawn_intents is read-only: Pending-watch NOT armed on emit"
-    );
+    // Each term: h-label conjunction PLUS capacity-type.
+    for term in &fitted.node_affinity {
+        assert!(
+            term.match_expressions
+                .iter()
+                .any(|r| r.key == "karpenter.sh/capacity-type")
+        );
+        assert!(
+            term.match_expressions
+                .iter()
+                .any(|r| r.key == "rio.build/hw-class")
+        );
+    }
 
     let cold = snap.intents.iter().find(|i| i.intent_id == "cold").unwrap();
     assert!(
-        cold.node_selector.is_empty(),
-        "no fit → band-agnostic intent_for path"
-    );
-    assert!(!actor.pending_intents.contains_key("cold"));
-
-    // Ack arms it; band-agnostic ack is ignored.
-    actor.handle_ack_spawned_intents(&snap.intents);
-    assert!(
-        actor.pending_intents.contains_key("fitted"),
-        "Pending-watch armed on controller ack"
-    );
-    assert!(
-        !actor.pending_intents.contains_key("cold"),
-        "band-agnostic selector → ack ignored (no ICE ladder)"
+        cold.node_affinity.is_empty(),
+        "no fit → hw-agnostic intent_for path"
     );
 
-    // Selector pin: a re-emit reuses the acked (band, cap) — overwrite
-    // the entry to a sentinel cell and assert the next snapshot
-    // returns THAT, not a fresh solve_full pick.
-    actor.pending_intents.insert(
-        "fitted".into(),
-        (
-            cost::Band::Hi,
-            cost::Cap::OnDemand,
-            std::time::Instant::now(),
-        ),
-    );
+    // Determinism: re-emit returns the SAME affinity (memoized; no
+    // softmax re-roll). The controller's `reap_stale_for_intents` sees
+    // the same fingerprint across re-polls.
     let snap2 = actor.compute_spawn_intents(&Default::default());
     let fitted2 = snap2
         .intents
@@ -2061,24 +1879,12 @@ async fn spawn_intent_node_selector_from_solve_full() {
         .find(|i| i.intent_id == "fitted")
         .unwrap();
     assert_eq!(
-        fitted2
-            .node_selector
-            .get("rio.build/hw-band")
-            .map(String::as_str),
-        Some("hi"),
-        "re-emit reuses pinned selector, not fresh softmax roll"
-    );
-    assert_eq!(
-        fitted2
-            .node_selector
-            .get("karpenter.sh/capacity-type")
-            .map(String::as_str),
-        Some("on-demand"),
+        fitted.node_affinity, fitted2.node_affinity,
+        "deterministic — memoized"
     );
 
     // Gate: hw_cost_source unset → solve_full skipped even with hw table.
     actor.sla_config.hw_cost_source = None;
-    actor.pending_intents.clear();
     let snap = actor.compute_spawn_intents(&Default::default());
     let fitted = snap
         .intents
@@ -2086,74 +1892,37 @@ async fn spawn_intent_node_selector_from_solve_full() {
         .find(|i| i.intent_id == "fitted")
         .unwrap();
     assert!(
-        fitted.node_selector.is_empty(),
-        "hw_cost_source=None → band-agnostic"
+        fitted.node_affinity.is_empty(),
+        "hw_cost_source=None → hw-agnostic"
+    );
+    actor.sla_config.hw_cost_source = Some(crate::sla::cost::HwCostSource::Static);
+    // Gate: hw_classes empty → static-mode, solve_full unreachable.
+    actor.sla_config.hw_classes.clear();
+    let snap = actor.compute_spawn_intents(&Default::default());
+    assert!(
+        snap.intents
+            .iter()
+            .find(|i| i.intent_id == "fitted")
+            .unwrap()
+            .node_affinity
+            .is_empty()
     );
 }
 
 /// `solve_full` gate predicates: each of FOD / `required_features` /
 /// `enableParallelBuilding=false` / `--tier` override falls through to
-/// the band-agnostic `intent_for` path even with `hw_cost_source` set
-/// and a usable fit. The first three would otherwise emit a
-/// `rio.build/hw-band` selector that no fetcher / metal NodePool
-/// carries → permanently Pending. `--mem`-only override does NOT gate
-/// it off — solve_full runs and the override overlays the result.
-// r[verify sched.sla.solve-per-band-cap]
+/// the hw-agnostic `intent_for` path even with `hw_cost_source` set
+/// and a usable fit. The first three would otherwise emit hw-class
+/// affinity that no fetcher / metal NodePool carries → permanently
+/// Pending. `--mem`-only override does NOT gate it off — solve_full
+/// runs and the override overlays the result.
+// r[verify sched.sla.hw-class.admissible-set]
 #[tokio::test]
 async fn solve_full_gate_skips_fod_kvm_serial_and_override() {
-    use crate::sla::{cost, hw, types::*};
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_sla(db.pool.clone());
-    actor.sla_config = crate::sla::config::SlaConfig {
-        hw_cost_source: Some(cost::HwCostSource::Static),
-        ..test_sla_config()
-    };
-    actor.sla_ceilings = actor.sla_config.ceilings();
-    actor.sla_tiers = vec![crate::sla::solve::Tier {
-        name: "normal".into(),
-        p50: None,
-        p90: Some(1200.0),
-        p99: None,
-    }];
-    let mut m = HashMap::new();
-    m.insert("aws-7-ebs-mid".into(), 1.0);
-    actor.sla_estimator.seed_hw(hw::HwTable::from_map(m));
-    // One fitted key reused by every variant below.
-    actor.sla_estimator.seed(FittedParams {
-        key: ModelKey {
-            pname: "pkg".into(),
-            system: "x86_64-linux".into(),
-            tenant: String::new(),
-        },
-        fit: DurationFit::Amdahl {
-            s: RefSeconds(30.0),
-            p: RefSeconds(2000.0),
-        },
-        mem: MemFit::Independent {
-            p90: MemBytes(6 << 30),
-        },
-        disk_p90: Some(DiskBytes(10 << 30)),
-        sigma_resid: 0.1,
-        log_residuals: Vec::new(),
-        n_eff: 10.0,
-        n_distinct_c: 5,
-        sum_w: 10.0,
-        span: 8.0,
-        explore: ExploreState {
-            distinct_c: 3,
-            min_c: RawCores(1.0),
-            max_c: RawCores(32.0),
-            saturated: false,
-            last_wall: WallSeconds(0.0),
-        },
-        t_min_ci: None,
-        ci_computed_at: None,
-        tier: None,
-        hw_bias: Default::default(),
-        alpha: crate::sla::alpha::UNIFORM,
-        prior_source: None,
-        is_fod: false,
-    });
+    let mut actor = bare_actor_hw(db.pool.clone());
+    // Re-seed under pname "pkg" (bare_actor_hw seeds "test-pkg").
+    seed_fit(&actor, "pkg");
 
     // Baseline (non-FOD, no features) — proves the fixture DOES route
     // through solve_full so the negative assertions below are
@@ -2176,23 +1945,21 @@ async fn solve_full_gate_skips_fod_kvm_serial_and_override() {
     let by_id = |id: &str| snap.intents.iter().find(|i| i.intent_id == id).unwrap();
 
     assert!(
-        by_id("base")
-            .node_selector
-            .contains_key("rio.build/hw-band"),
+        !by_id("base").node_affinity.is_empty(),
         "fixture sanity: baseline routes through solve_full"
     );
     assert!(
-        by_id("fod").node_selector.is_empty(),
-        "FOD must not get hw-band selector (fetcher NodePool has none)"
+        by_id("fod").node_affinity.is_empty(),
+        "FOD must not get hw-class affinity (fetcher NodePool has none)"
     );
     assert!(
-        by_id("kvm").node_selector.is_empty(),
-        "required_features must not get hw-band selector (metal pool has none)"
+        by_id("kvm").node_affinity.is_empty(),
+        "required_features must not get hw-class affinity (metal pool has none)"
     );
     let serial = by_id("serial");
     assert!(
-        serial.node_selector.is_empty(),
-        "enableParallelBuilding=false stays band-agnostic"
+        serial.node_affinity.is_empty(),
+        "enableParallelBuilding=false stays hw-agnostic"
     );
     assert_eq!(
         serial.cores, 1,
@@ -2211,11 +1978,11 @@ async fn solve_full_gate_skips_fod_kvm_serial_and_override() {
     let snap = actor.compute_spawn_intents(&Default::default());
     let base = snap.intents.iter().find(|i| i.intent_id == "base").unwrap();
     assert!(
-        base.node_selector.is_empty(),
+        base.node_affinity.is_empty(),
         "tier override gates solve_full off"
     );
 
-    // `mem`-only override → solve_full RUNS (selector populated), mem
+    // `mem`-only override → solve_full RUNS (affinity populated), mem
     // overlaid post-solve.
     actor
         .sla_estimator
@@ -2227,7 +1994,7 @@ async fn solve_full_gate_skips_fod_kvm_serial_and_override() {
     let snap = actor.compute_spawn_intents(&Default::default());
     let base = snap.intents.iter().find(|i| i.intent_id == "base").unwrap();
     assert!(
-        base.node_selector.contains_key("rio.build/hw-band"),
+        !base.node_affinity.is_empty(),
         "mem-only override does NOT gate solve_full off"
     );
     assert_eq!(

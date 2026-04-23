@@ -1,25 +1,28 @@
-//! ADR-023 phase-13 hw-band + capacity-type cost model.
+//! ADR-023 phase-13 hw-class + capacity-type cost model.
 //!
 //! Two halves, both feeding [`super::solve::solve_full`]:
 //!
-//! - [`CostTable`]: per-`(Band, Cap)` `$/vCPU·hr` snapshot. Populated by
-//!   [`spot_price_poller`] (lease-gated, 10min tick, 3h-halflife EMA over
-//!   `DescribeSpotPriceHistory`) and persisted to `sla_ema_state` so a
-//!   restart doesn't re-warm. `expected_cost` turns a candidate
-//!   `(band, cap, c*, T(c*))` into a comparable scalar for the softmax.
-//! - λ\[h\]: per-hw-band Poisson interrupt rate. Gamma-Poisson partial
+//! - [`CostTable`]: per-[`Cell`] `$/vCPU·hr` snapshot + per-cell
+//!   instance-type [`menu`](CostTable::menu). Populated by
+//!   [`spot_price_poller`] (lease-gated, 10min tick, 3h-halflife EMA
+//!   over `DescribeSpotPriceHistory`) and persisted to `sla_ema_state`
+//!   so a restart doesn't re-warm. `smallest_fitting` resolves the
+//!   `price_per_vcpu_hr` of what Karpenter would actually launch for
+//!   a given `(c*, M(c*))`.
+//! - λ\[h\]: per-hw-class Poisson interrupt rate. Gamma-Poisson partial
 //!   pooling over `interrupt_samples` (controller-appended): the seed
 //!   acts as a prior with weight `n_λ = 1day · max(1, node_count_ema)`
 //!   so a single interrupt doesn't spike λ, and exiled-spot decay
 //!   collapses to the seed rather than freezing at the spike.
 //!
-//! [`IceBackoff`] is the in-process insufficient-capacity ladder: a
-//! `(band, cap)` that left a pod Pending past the Pending-watch window
-//! is marked infeasible fleet-wide for 60s so the next solve excludes
-//! it. Superseded by the admissible-set + lead-time design; retained
-//! until that lands.
+//! [`IceBackoff`] is the in-process insufficient-capacity mask: a
+//! [`Cell`] reported `unfulfillable` by the controller (NodeClaim
+//! `Launched=False` or `Registered` timeout) is masked fleet-wide with
+//! exponential backoff `60s → 120s → … ≤ max_lead_time`, reset on
+//! first success. The mask is **read-time** — the per-key solve memo is
+//! never overwritten; each dispatch computes `A \ ice_masked`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -28,53 +31,17 @@ use serde::{Deserialize, Serialize};
 use crate::db::SchedulerDb;
 use crate::lease::LeaderState;
 
-use super::hw::HwTable;
-use super::types::{FittedParams, RawCores};
+use super::config::{CapacityType, Cell, HwClassName, cell_label, parse_cell};
 
-/// Hardware-generation band. Maps to the `rio.build/hw-band` Node label
-/// (12-NodePool topology). The label is the source of truth — bands are
-/// non-disjoint by `instance-generation` (helm `mid` admits gen 6+7 so
-/// `mid-nvme-x86` can fall back to c6id), so the generation digit alone
-/// cannot recover the band.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Band {
-    Hi,
-    Mid,
-    Lo,
-}
-
-impl Band {
-    pub const ALL: [Band; 3] = [Band::Hi, Band::Mid, Band::Lo];
-
-    /// `rio.build/hw-band` label value.
-    pub fn label(self) -> &'static str {
-        match self {
-            Band::Hi => "hi",
-            Band::Mid => "mid",
-            Band::Lo => "lo",
-        }
-    }
-}
-
-/// Capacity type. Maps to `karpenter.sh/capacity-type`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Cap {
-    Spot,
-    OnDemand,
-}
-
-impl Cap {
-    pub const ALL: [Cap; 2] = [Cap::Spot, Cap::OnDemand];
-
-    /// `karpenter.sh/capacity-type` label value.
-    pub fn label(self) -> &'static str {
-        match self {
-            Cap::Spot => "spot",
-            Cap::OnDemand => "on-demand",
-        }
-    }
+/// One instance type in a cell's menu. `price_per_vcpu_hr` is the
+/// EMA-smoothed `$/vCPU·hr` (or seed); `cores`/`mem_bytes` gate
+/// `smallest_fitting`.
+#[derive(Debug, Clone)]
+pub struct InstanceType {
+    pub name: String,
+    pub cores: u32,
+    pub mem_bytes: u64,
+    pub price_per_vcpu_hr: f64,
 }
 
 /// Where `$/vCPU·hr` numbers come from.
@@ -177,11 +144,11 @@ pub fn lambda_hat(
     (ema_interrupts + n_lambda * lambda_seed) / (ema_exposure_secs + n_lambda)
 }
 
-/// Seed `$/vCPU·hr` per band, on-demand. Roughly c6a/c7a/c8g list
-/// price ÷ vCPU. Ratios are what matter (softmax normalizes); absolute
-/// values only surface in `SlaExplain`.
-pub const ON_DEMAND_SEED: [(Band, f64); 3] =
-    [(Band::Hi, 0.048), (Band::Mid, 0.043), (Band::Lo, 0.038)];
+/// Seed `$/vCPU·hr`, on-demand. Roughly c7a list price ÷ vCPU. Under
+/// the admissible-set solve only the spot/od *ratio* matters when the
+/// per-h price EMA is unpopulated (every h shares this seed → the
+/// solve degenerates to "argmin λ\[h\]").
+pub const ON_DEMAND_SEED: f64 = 0.043;
 
 /// Spot discount applied to [`ON_DEMAND_SEED`] when the poller has no
 /// live data (source=static or first tick).
@@ -196,10 +163,9 @@ const SPOT_HALFLIFE_SECS: f64 = 3.0 * 3600.0;
 /// Same halflife for the `node_count_ema` that scales the prior.
 const LAMBDA_HALFLIFE_SECS: f64 = 24.0 * 3600.0;
 
-/// ICE-backoff TTL. A `(band, cap)` that left a pod Pending past the
-/// Pending-watch window is fleet-wide infeasible for this long. Short
-/// — capacity recovers in minutes; the ladder re-probes.
-const ICE_TTL: Duration = Duration::from_secs(60);
+/// First step of the per-cell exponential ICE backoff (`60s → 120s →
+/// … ≤ max_lead_time`). ADR-023 §Capacity backoff.
+const ICE_BASE_TTL: Duration = Duration::from_secs(60);
 
 /// EMA-smoothed scalar with its own last-update timestamp. Used for
 /// `$/vCPU·hr` and per-band `node_count`. Per-key timestamp (mirroring
@@ -232,36 +198,39 @@ impl PriceEma {
     }
 }
 
-/// Static `$/vCPU·hr` seed for `(band, cap)`. Backstop for
-/// [`CostTable::price`] (missing key, or stale-clamped).
-fn seed_price(band: Band, cap: Cap) -> f64 {
-    let od = ON_DEMAND_SEED
-        .iter()
-        .find(|(b, _)| *b == band)
-        .map(|(_, p)| *p)
-        .unwrap_or(0.043);
+/// Static `$/vCPU·hr` seed for `cap`. Backstop for [`CostTable::price`]
+/// (missing key, or stale-clamped). Per-h price differentiation comes
+/// from the live poller / menu; the seed is cap-only.
+fn seed_price(cap: CapacityType) -> f64 {
     match cap {
-        Cap::OnDemand => od,
-        Cap::Spot => od * SPOT_SEED_DISCOUNT,
+        CapacityType::Od => ON_DEMAND_SEED,
+        CapacityType::Spot => ON_DEMAND_SEED * SPOT_SEED_DISCOUNT,
     }
 }
 
-/// Per-`(band, cap)` `$/vCPU·hr` + per-band λ. Cheap to clone (three
-/// small maps); the solve takes a snapshot by value.
-#[derive(Debug, Clone)]
+/// Per-[`Cell`] `$/vCPU·hr` + per-h λ + per-cell instance-type menu.
+/// Cheap to clone (small maps); the solve takes a snapshot by value.
+#[derive(Debug, Clone, Default)]
 pub struct CostTable {
     /// EMA-smoothed `$/vCPU·hr`. Missing key → seed.
-    price: HashMap<(Band, Cap), PriceEma>,
-    /// Per-band interrupt-rate EMA. `numerator` = Σ interrupts,
+    price: HashMap<Cell, PriceEma>,
+    /// Per-h interrupt-rate EMA. `numerator` = Σ interrupts,
     /// `denominator` = Σ exposure-secs (24h halflife). Read via
     /// [`lambda_hat`], not as a bare ratio.
-    lambda: HashMap<Band, RatioEma>,
-    /// Per-band 24h-EMA of live spot-node count. The `n_λ` scaler in
+    lambda: HashMap<HwClassName, RatioEma>,
+    /// Per-h 24h-EMA of live spot-node count. The `n_λ` scaler in
     /// [`lambda_hat`]: keeps the prior's relative weight ~constant at
     /// "one day of fleet exposure" regardless of fleet size. Derived
     /// from `interrupt_samples` exposure rows in
     /// [`CostTable::refresh_lambda`] as `Σ exposure_secs / Δt`.
-    node_count: HashMap<Band, PriceEma>,
+    node_count: HashMap<HwClassName, PriceEma>,
+    /// Per-cell instance-type menu, sorted by `cores` asc. Seeded from
+    /// helm `sla.hwClasses[*].menu` (Part-B); the poller refreshes
+    /// `price_per_vcpu_hr` in-place. Empty ⇔ [`Self::smallest_fitting`]
+    /// degrades to the per-cell EMA scalar (one synthetic "fits-all"
+    /// type) so the admissible-set solve produces candidates before
+    /// menu population is wired.
+    cells: HashMap<Cell, Vec<InstanceType>>,
     /// `price_updated_at() > 6 × pollInterval` ago. Set by
     /// [`CostTable::apply_stale_clamp`] each tick; while true,
     /// [`CostTable::price`] returns the static seed so a wedged poller
@@ -276,84 +245,66 @@ pub struct CostTable {
     cluster: String,
 }
 
-impl Default for CostTable {
-    fn default() -> Self {
-        let mut price = HashMap::new();
-        for &(b, od) in &ON_DEMAND_SEED {
-            price.insert(
-                (b, Cap::OnDemand),
-                PriceEma {
-                    value: od,
-                    updated_at: 0.0,
-                },
-            );
-            price.insert(
-                (b, Cap::Spot),
-                PriceEma {
-                    value: od * SPOT_SEED_DISCOUNT,
-                    updated_at: 0.0,
-                },
-            );
-        }
-        Self {
-            price,
-            lambda: HashMap::new(),
-            node_count: HashMap::new(),
-            stale_clamp: false,
-            cluster: String::new(),
-        }
-    }
-}
-
 impl CostTable {
-    /// `$/vCPU·hr` for `(band, cap)`. Seed-backed — never `None`.
-    /// Clamps to seed while [`Self::apply_stale_clamp`] has the
-    /// stale-clamp latched.
-    pub fn price(&self, band: Band, cap: Cap) -> f64 {
+    /// `$/vCPU·hr` for `cell`. Seed-backed — never `None`. Clamps to
+    /// seed while [`Self::apply_stale_clamp`] has the stale-clamp
+    /// latched.
+    pub fn price(&self, cell: &Cell) -> f64 {
         if self.stale_clamp {
-            return seed_price(band, cap);
+            return seed_price(cell.1);
         }
         self.price
-            .get(&(band, cap))
+            .get(cell)
             .map(|p| p.value)
-            .unwrap_or_else(|| seed_price(band, cap))
+            .unwrap_or_else(|| seed_price(cell.1))
     }
 
-    /// Per-band Poisson interrupt rate (events/sec) via [`lambda_hat`].
+    /// Per-h Poisson interrupt rate (events/sec) via [`lambda_hat`].
     /// `(EMA(interrupts) + n_λ·seed) / (EMA(exposure) + n_λ)` with
     /// `n_λ = 1day · max(1, node_count_ema)`. Returns [`LAMBDA_SEED`]
-    /// for a band with no observations (default RatioEma + node_count=0
+    /// for an h with no observations (default RatioEma + node_count=0
     /// reduces exactly).
-    pub fn lambda_band(&self, band: Band) -> f64 {
-        let ema = self.lambda.get(&band).copied().unwrap_or_default();
-        let nc = self.node_count.get(&band).map(|p| p.value).unwrap_or(0.0);
+    pub fn lambda_for(&self, h: &str) -> f64 {
+        let ema = self.lambda.get(h).copied().unwrap_or_default();
+        let nc = self.node_count.get(h).map(|p| p.value).unwrap_or(0.0);
         lambda_hat(ema.numerator, ema.denominator, nc, LAMBDA_SEED)
     }
 
-    /// `E[cost]` for a candidate: `price · c* · E[wall] / 3600` where
-    /// `E[wall] = (T(c*)/factor) / (1-p)` accounts for geometric
-    /// retries under preemption probability `p = 1 - e^{-λT}`.
-    /// Memory contributes via the same per-vCPU-hr proxy (memory
-    /// scales with cores in the c/m/r families the NodePools admit).
-    #[allow(clippy::too_many_arguments)]
-    pub fn expected_cost(
+    /// Instance-type menu for `cell`, sorted by `cores` asc. Empty
+    /// before Part-B menu population.
+    pub fn menu(&self, cell: &Cell) -> &[InstanceType] {
+        self.cells.get(cell).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// `price_per_vcpu_hr` of the smallest instance type in `cell`
+    /// fitting `(c, mem)` — i.e., what Karpenter would actually launch
+    /// (ADR-023 L624). `None` ⇔ menu non-empty AND no type fits
+    /// (cell rejected on capacity). Empty menu ⇔ degrade to the
+    /// per-cell EMA scalar (one synthetic fits-all type).
+    pub fn smallest_fitting(&self, cell: &Cell, c: u32, mem: u64) -> Option<f64> {
+        let menu = self.menu(cell);
+        if menu.is_empty() {
+            return Some(self.price(cell));
+        }
+        menu.iter()
+            .find(|t| t.cores >= c && t.mem_bytes >= mem)
+            .map(|t| t.price_per_vcpu_hr)
+    }
+
+    /// Cheapest hw_class by `(h, Spot)` price. For the ε_h `A=H`
+    /// fallback (`H \ {argmin_H price}`). Seed-backed so always
+    /// returns some h when `hw_classes` is non-empty.
+    pub fn cheapest_h<'a>(
         &self,
-        band: Band,
-        cap: Cap,
-        c_star: RawCores,
-        _mem: u64,
-        fit: &FittedParams,
-        hw_factor: f64,
-        lambda: f64,
-    ) -> f64 {
-        let t = fit.fit.t_at(c_star).0 / hw_factor;
-        let p = if lambda > 0.0 {
-            (1.0 - (-lambda * t).exp()).min(0.499)
-        } else {
-            0.0
-        };
-        let e_wall = t / (1.0 - p);
-        self.price(band, cap) * c_star.0 * e_wall / 3600.0
+        hw_classes: impl IntoIterator<Item = &'a HwClassName>,
+    ) -> Option<HwClassName> {
+        hw_classes
+            .into_iter()
+            .min_by(|a, b| {
+                self.price(&((*a).clone(), CapacityType::Spot))
+                    .total_cmp(&self.price(&((*b).clone(), CapacityType::Spot)))
+            })
+            .cloned()
     }
 
     /// Seed-backed table scoped to `cluster`. Use instead of
@@ -411,31 +362,27 @@ impl CostTable {
         .await?;
         for (key, value, num, den, at) in rows {
             if let Some(rest) = key.strip_prefix("price:")
-                && let Some((b, c)) = parse_band_cap(rest)
+                && let Some(cell) = parse_cell(rest)
             {
                 t.price.insert(
-                    (b, c),
+                    cell,
                     PriceEma {
                         value,
                         updated_at: at,
                     },
                 );
-            } else if let Some(rest) = key.strip_prefix("lambda:")
-                && let Some(b) = parse_band(rest)
-            {
+            } else if let Some(h) = key.strip_prefix("lambda:") {
                 t.lambda.insert(
-                    b,
+                    h.to_owned(),
                     RatioEma {
                         numerator: num.unwrap_or(0.0),
                         denominator: den.unwrap_or(0.0),
                         updated_at: at,
                     },
                 );
-            } else if let Some(rest) = key.strip_prefix("node_count:")
-                && let Some(b) = parse_band(rest)
-            {
+            } else if let Some(h) = key.strip_prefix("node_count:") {
                 t.node_count.insert(
-                    b,
+                    h.to_owned(),
                     PriceEma {
                         value,
                         updated_at: at,
@@ -447,9 +394,9 @@ impl CostTable {
     }
 
     /// Persist all EMAs to `sla_ema_state` (upsert). One row per
-    /// `(cluster, key)`; small (≤9 rows), so no batching.
+    /// `(cluster, key)`; small (≤ 2·|H| + 2·|H| rows), so no batching.
     pub async fn persist(&self, db: &SchedulerDb) -> anyhow::Result<()> {
-        for (&(b, c), p) in &self.price {
+        for (cell, p) in &self.price {
             // `to_timestamp($4)` (data-time), NOT `now()`: a tick where
             // `poll_spot_once` failed must not advance the persisted
             // timestamp, or on reload staleness is lost and the next
@@ -460,13 +407,13 @@ impl CostTable {
                  ON CONFLICT (cluster, key) DO UPDATE SET value = $3, updated_at = to_timestamp($4)",
             )
             .bind(&self.cluster)
-            .bind(format!("price:{}:{}", b.label(), c.label()))
+            .bind(format!("price:{}", cell_label(cell)))
             .bind(p.value)
             .bind(p.updated_at)
             .execute(db.pool())
             .await?;
         }
-        for (&b, ema) in &self.lambda {
+        for (h, ema) in &self.lambda {
             sqlx::query(
                 "INSERT INTO sla_ema_state (cluster, key, value, numerator, denominator, updated_at) \
                  VALUES ($1, $2, $3, $4, $5, to_timestamp($6)) \
@@ -474,7 +421,7 @@ impl CostTable {
                    value = $3, numerator = $4, denominator = $5, updated_at = to_timestamp($6)",
             )
             .bind(&self.cluster)
-            .bind(format!("lambda:{}", b.label()))
+            .bind(format!("lambda:{h}"))
             .bind(ema.value_or(LAMBDA_SEED))
             .bind(ema.numerator)
             .bind(ema.denominator)
@@ -482,14 +429,14 @@ impl CostTable {
             .execute(db.pool())
             .await?;
         }
-        for (&b, nc) in &self.node_count {
+        for (h, nc) in &self.node_count {
             sqlx::query(
                 "INSERT INTO sla_ema_state (cluster, key, value, updated_at) \
                  VALUES ($1, $2, $3, to_timestamp($4)) \
                  ON CONFLICT (cluster, key) DO UPDATE SET value = $3, updated_at = to_timestamp($4)",
             )
             .bind(&self.cluster)
-            .bind(format!("node_count:{}", b.label()))
+            .bind(format!("node_count:{h}"))
             .bind(nc.value)
             .bind(nc.updated_at)
             .execute(db.pool())
@@ -499,14 +446,11 @@ impl CostTable {
     }
 
     /// Recompute λ\[h\] from `interrupt_samples` rows newer than each
-    /// band's `updated_at`. Called from the poller tick (lease-gated)
-    /// — controller appends, scheduler aggregates.
+    /// h's `updated_at`. Called from the poller tick (lease-gated) —
+    /// controller appends, scheduler aggregates. Keyed directly on
+    /// `interrupt_samples.hw_class` (the controller-stamped node
+    /// label).
     pub async fn refresh_lambda(&mut self, db: &SchedulerDb) -> anyhow::Result<()> {
-        // Aggregate per-hw_class since the last per-band update; map
-        // hw_class → band via the band segment. Unknown hw_classes
-        // (band segment absent or `unknown` — non-builder/fetcher
-        // nodes) are dropped — they contribute to neither numerator
-        // nor denominator.
         let rows: Vec<(String, String, f64, f64)> = sqlx::query_as(
             "SELECT hw_class, kind, COALESCE(SUM(value), 0), \
                     EXTRACT(EPOCH FROM MAX(at))::float8 \
@@ -532,33 +476,30 @@ impl CostTable {
             .map(|e| e.updated_at)
             .fold(0.0, f64::max);
         let prev_hwm = hwm;
-        let mut per_band: HashMap<Band, (f64, f64)> = HashMap::new();
+        let mut per_h: HashMap<HwClassName, (f64, f64)> = HashMap::new();
         for (hw_class, kind, sum, max_at) in rows {
             hwm = hwm.max(max_at);
-            let Some(band) = band_of_hw_class(&hw_class) else {
-                continue;
-            };
-            let e = per_band.entry(band).or_default();
+            let e = per_h.entry(hw_class).or_default();
             match kind.as_str() {
                 "interrupt" => e.0 += sum,
                 "exposure" => e.1 += sum,
                 _ => {}
             }
         }
-        // Per-band node_count = Σ exposure_secs / Δt over the batch
-        // window (each `kind='exposure'` row is "node-seconds accrued
-        // since last flush", so the sum ÷ wall-window is mean live
-        // nodes). Skip when `prev_hwm == 0` — first refresh has no
-        // window baseline, and a `Δt` from epoch would zero the count.
+        // Per-h node_count = Σ exposure_secs / Δt over the batch window
+        // (each `kind='exposure'` row is "node-seconds accrued since
+        // last flush", so the sum ÷ wall-window is mean live nodes).
+        // Skip when `prev_hwm == 0` — first refresh has no window
+        // baseline, and a `Δt` from epoch would zero the count.
         let dt = hwm - prev_hwm;
-        for (band, (n, d)) in per_band {
+        for (h, (n, d)) in per_h {
             self.lambda
-                .entry(band)
+                .entry(h.clone())
                 .or_default()
                 .update(n, d, hwm, LAMBDA_HALFLIFE_SECS);
             if prev_hwm > 0.0 && dt > 0.0 {
                 self.node_count
-                    .entry(band)
+                    .entry(h)
                     .or_default()
                     .update(d / dt, hwm, LAMBDA_HALFLIFE_SECS);
             }
@@ -567,15 +508,15 @@ impl CostTable {
     }
 
     /// Fold one round of spot-price observations into the price EMA.
-    /// `obs` is `$/vCPU·hr` keyed by `(band, cap)` — already
-    /// vCPU-normalized by the caller. Per-key `dt`: a key absent from
-    /// `obs` keeps its OWN `updated_at`, so when it next appears its
-    /// decay reflects the full elapsed interval, not just the gap since
-    /// the last (partial) fold.
-    pub fn fold_prices(&mut self, obs: &HashMap<(Band, Cap), f64>, now: f64) {
-        for (&k, &v) in obs {
+    /// `obs` is `$/vCPU·hr` keyed by [`Cell`] — already vCPU-normalized
+    /// by the caller. Per-key `dt`: a key absent from `obs` keeps its
+    /// OWN `updated_at`, so when it next appears its decay reflects the
+    /// full elapsed interval, not just the gap since the last (partial)
+    /// fold.
+    pub fn fold_prices(&mut self, obs: &HashMap<Cell, f64>, now: f64) {
+        for (k, &v) in obs {
             self.price
-                .entry(k)
+                .entry(k.clone())
                 .or_default()
                 .update(v, now, SPOT_HALFLIFE_SECS);
         }
@@ -583,7 +524,7 @@ impl CostTable {
 
     /// Test constructor.
     #[cfg(test)]
-    pub fn from_parts(price: HashMap<(Band, Cap), f64>, lambda: HashMap<Band, RatioEma>) -> Self {
+    pub fn from_parts(price: HashMap<Cell, f64>, lambda: HashMap<HwClassName, RatioEma>) -> Self {
         let now = now_epoch();
         Self {
             price: price
@@ -599,71 +540,30 @@ impl CostTable {
                 })
                 .collect(),
             lambda,
-            node_count: HashMap::new(),
-            stale_clamp: false,
-            cluster: String::new(),
+            ..Self::default()
         }
     }
 
     /// Test setter: insert a price with an explicit `updated_at`.
     #[cfg(test)]
-    pub fn set_price(&mut self, band: Band, cap: Cap, value: f64, updated_at: f64) {
+    pub fn set_price(&mut self, h: &str, cap: CapacityType, value: f64, updated_at: f64) {
         self.price
-            .insert((band, cap), PriceEma { value, updated_at });
+            .insert((h.to_owned(), cap), PriceEma { value, updated_at });
     }
 
-    /// Test setter: per-band node-count EMA.
+    /// Test setter: per-h node-count EMA.
     #[cfg(test)]
-    pub fn set_node_count(&mut self, band: Band, value: f64, updated_at: f64) {
-        self.node_count.insert(band, PriceEma { value, updated_at });
+    pub fn set_node_count(&mut self, h: &str, value: f64, updated_at: f64) {
+        self.node_count
+            .insert(h.to_owned(), PriceEma { value, updated_at });
     }
-}
 
-/// Map `"{mfr}-{gen}-{storage}-{band}"` → `Band` via the trailing band
-/// segment (the node's `rio.build/hw-band` label, captured by
-/// `node_informer`). `None` for hw_classes with no/unknown band segment
-/// — fetcher/metal/non-Karpenter nodes carry no `rio.build/hw-band`
-/// label, and the 12-NodePool builder topology always sets one.
-///
-/// Keys on the band label, NOT the generation digit: helm
-/// `builderBands.mid` admits gen 6+7, so a c6id node provisioned via the
-/// mid NodePool has gen=`6` but band=`mid`.
-pub fn band_of_hw_class(hw_class: &str) -> Option<Band> {
-    parse_band(hw_class.split('-').nth(3)?)
-}
-
-fn parse_band(s: &str) -> Option<Band> {
-    Band::ALL.into_iter().find(|b| b.label() == s)
-}
-
-fn parse_band_cap(s: &str) -> Option<(Band, Cap)> {
-    let (b, c) = s.split_once(':')?;
-    let band = parse_band(b)?;
-    let cap = Cap::ALL.into_iter().find(|x| x.label() == c)?;
-    Some((band, cap))
-}
-
-/// Build the `(band, cap)` nodeSelector — inverse of
-/// [`parse_selector`]. Same shape as
-/// [`super::solve::Candidate::selector`] but usable from a bare
-/// `(Band, Cap)` (the Pending-watch pin reuses this on re-emit).
-pub fn selector_for(band: Band, cap: Cap) -> std::collections::BTreeMap<String, String> {
-    std::collections::BTreeMap::from([
-        ("rio.build/hw-band".into(), band.label().into()),
-        ("karpenter.sh/capacity-type".into(), cap.label().into()),
-    ])
-}
-
-/// Recover `(Band, Cap)` from a [`super::solve::Candidate::selector`]
-/// nodeSelector. `None` for band-agnostic selectors (`solve_mvp` /
-/// `BestEffort` paths). Used by the actor's Pending-watch to map a
-/// stuck intent back to its ICE-backoff cell.
-pub fn parse_selector(ns: &std::collections::BTreeMap<String, String>) -> Option<(Band, Cap)> {
-    let band = parse_band(ns.get("rio.build/hw-band")?)?;
-    let cap = Cap::ALL
-        .into_iter()
-        .find(|c| Some(c.label()) == ns.get("karpenter.sh/capacity-type").map(String::as_str))?;
-    Some((band, cap))
+    /// Test setter: per-cell instance-type menu (sorted by `cores`).
+    #[cfg(test)]
+    pub fn set_menu(&mut self, cell: Cell, mut menu: Vec<InstanceType>) {
+        menu.sort_by_key(|t| t.cores);
+        self.cells.insert(cell, menu);
+    }
 }
 
 fn now_epoch() -> f64 {
@@ -673,100 +573,136 @@ fn now_epoch() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// In-process insufficient-capacity backoff. A `(band, cap)` that left
-/// a pod Pending past the Pending-watch window is marked here for 60s;
-/// [`super::solve::solve_full`] skips marked cells. Shared across all
-/// dispatch threads (DashMap). Superseded by the admissible-set +
-/// lead-time design; retained until that lands.
+/// Per-cell exponential backoff state. `until` is the masked-until
+/// boundary; `step` doubles `60s → 120s → … ≤ max_lead_time` per
+/// consecutive [`IceBackoff::mark`], reset on [`IceBackoff::clear`].
+#[derive(Debug, Clone, Copy)]
+struct IceState {
+    until: Instant,
+    step: u32,
+}
+
+/// In-process insufficient-capacity mask. A [`Cell`] reported
+/// `unfulfillable` by the controller (NodeClaim `Launched=False` or
+/// `Registered` timeout — ADR-023 §Capacity backoff) is masked
+/// fleet-wide with exponential backoff `60s → 120s → …` capped at
+/// `max_lead_time`, reset on first success.
 ///
-/// # Ladder protocol
+/// The mask is **read-time** (`r[sched.sla.hw-class.ice-mask]`): the
+/// per-key solve memo holds the full-H `(c*, A)` and is never
+/// overwritten; each dispatch computes `A \ masked_cells()`. Unmasking
+/// is therefore free (no resolve), and ICE state is NOT in
+/// `inputs_gen`.
 ///
-/// 1. Dispatch picks `(b₀, c₀)` via `solve_full`, spawns.
-/// 2. Pending-watch sees the pod still `Pending` after the 60s window
-///    → [`Self::mark`]`(b₀, c₀)`, records it in the actor's per-drv
-///    `ice_attempts`, deletes the pod, re-runs `solve_full` (which now
-///    skips `(b₀, c₀)`).
-/// 3. Repeat up to [`Self::ladder_cap`] times. On exhaust the drv
-///    falls through to band-agnostic dispatch (`solve_intent_for`
-///    skips `solve_full`; emits `infeasible_total{reason=
-///    capacity_exhausted}`); the [`Self::encode_attempted`] JSON of
-///    the attempt log is emitted at `debug!` for forensics. The
-///    `builds.attempted_candidates` JSONB column (M_042) is reserved
-///    for a future persisted write — currently log-only.
-///
-/// Step 2 is scheduler-side: the actor records `(drv_hash → (band,
-/// cap, emitted_at))` when `solve_intent_for` first emits a
-/// band-targeted SpawnIntent, clears the entry when a heartbeat with
-/// `intent_id == drv_hash` arrives (pod made it past Pending), and on
-/// each housekeeping tick marks ICE for entries older than the 60s
-/// window (jittered ±20%). Tradeoff vs a controller-side Pod
-/// watch: less precise (cannot distinguish `phase=Pending` from
-/// "controller hasn't spawned yet" or "container crashed before first
-/// heartbeat") — but all three cases mean the `(band, cap)` failed to
-/// produce capacity within the window, and the 60s ICE TTL bounds the
-/// false-positive cost. Avoids a proto change + cross-component RPC.
-#[derive(Debug, Default)]
-pub struct IceBackoff(DashMap<(Band, Cap), Instant>);
+/// In-memory, lease-holder only — a scheduler lease handoff costs at
+/// most one wasted NodeClaim round per masked cell.
+#[derive(Debug)]
+pub struct IceBackoff {
+    cells: DashMap<Cell, IceState>,
+    max_lead_time: Duration,
+}
+
+impl Default for IceBackoff {
+    fn default() -> Self {
+        Self::new(super::config::default_max_lead_time())
+    }
+}
 
 impl IceBackoff {
-    /// Mark `(band, cap)` infeasible for `ICE_TTL` (60s).
-    pub fn mark(&self, band: Band, cap: Cap) {
-        self.0.insert((band, cap), Instant::now() + ICE_TTL);
-    }
-
-    /// Whether `(band, cap)` is currently backed off. Expired entries
-    /// are reaped lazily on read.
-    pub fn is_infeasible(&self, band: Band, cap: Cap) -> bool {
-        // `.map(|r| *r)` copies the `Instant` and drops the `Ref` guard
-        // BEFORE the match arms run. `get()` then `remove()` while the
-        // guard is live deadlocks (DashMap shard RwLock is non-
-        // reentrant) — this fired the first time any cell crossed the
-        // 60s TTL and froze the single-threaded actor.
-        match self.0.get(&(band, cap)).map(|r| *r) {
-            Some(until) if until > Instant::now() => true,
-            Some(_) => {
-                self.0.remove(&(band, cap));
-                false
-            }
-            None => false,
+    pub fn new(max_lead_time_secs: f64) -> Self {
+        Self {
+            cells: DashMap::new(),
+            max_lead_time: Duration::from_secs_f64(max_lead_time_secs.max(1.0)),
         }
     }
 
-    /// Max ladder depth: `min(⌈max_tier_bound / hw_fallback_after / 4⌉, 8)`.
-    /// ADR-023 §ICE: bound retries so a tier with a 1h p90 doesn't
-    /// burn 30 fallback rounds before demoting.
-    pub fn ladder_cap(max_tier_bound_secs: f64, hw_fallback_after_secs: f64) -> u32 {
-        let raw = (max_tier_bound_secs / hw_fallback_after_secs / 4.0).ceil() as u32;
-        raw.clamp(1, 8)
+    /// Mark `cell` infeasible. TTL is `min(60s · 2^step, max_lead_time)`;
+    /// `step` increments per consecutive mark and resets via
+    /// [`Self::clear`].
+    pub fn mark(&self, cell: &Cell) {
+        // Match-on-map then insert: see `is_masked` for the
+        // DashMap-guard-reentrance hazard.
+        let step = self
+            .cells
+            .get(cell)
+            .map(|s| s.step.saturating_add(1))
+            .unwrap_or(0);
+        let ttl = (ICE_BASE_TTL * 2u32.saturating_pow(step)).min(self.max_lead_time);
+        self.cells.insert(
+            cell.clone(),
+            IceState {
+                until: Instant::now() + ttl,
+                step,
+            },
+        );
     }
 
-    /// Count of currently-live backoff entries. For tests and
-    /// debugging.
+    /// Reset `cell`'s backoff (first success after a mark). The
+    /// controller calls this via `AckSpawnedIntents` when a NodeClaim
+    /// for `cell` reaches `Registered=True`.
+    pub fn clear(&self, cell: &Cell) {
+        self.cells.remove(cell);
+    }
+
+    /// Whether `cell` is currently masked. Expired entries are NOT
+    /// reaped — the `step` must survive expiry so a re-mark doubles
+    /// (only `clear` on success resets).
+    pub fn is_masked(&self, cell: &Cell) -> bool {
+        // `.map(|r| r.until)` copies the `Instant` and drops the `Ref`
+        // guard BEFORE comparison. `get()` then `remove()` while the
+        // guard is live deadlocks (DashMap shard RwLock is non-
+        // reentrant) — this fired the first time any cell crossed TTL
+        // and froze the single-threaded actor.
+        self.cells
+            .get(cell)
+            .map(|r| r.until)
+            .is_some_and(|u| u > Instant::now())
+    }
+
+    /// Snapshot of currently-masked cells for the read-time `A \ masked`
+    /// step. O(|ever-marked cells|) — bounded by `|H| × 2`.
+    pub fn masked_cells(&self) -> HashSet<Cell> {
+        let now = Instant::now();
+        self.cells
+            .iter()
+            .filter(|e| e.value().until > now)
+            .map(|e| e.key().clone())
+            .collect()
+    }
+
+    /// Max ladder steps before `_hw_ladder_exhausted_total{exit="step"}`
+    /// — `min(⌈max(tier_bound, ladder_budget) / lead_time / 4⌉, 8)`.
+    /// ADR-023 §Capacity backoff exit (a): caps capacity-retry latency
+    /// at ~¼ of the tier's wall-clock budget.
+    pub fn ladder_cap(
+        max_tier_bound_secs: f64,
+        ladder_budget_secs: f64,
+        lead_time_secs: f64,
+    ) -> u32 {
+        ((max_tier_bound_secs.max(ladder_budget_secs) / lead_time_secs.max(1.0) / 4.0).ceil()
+            as u32)
+            .clamp(1, 8)
+    }
+
+    /// Count of currently-masked entries. For tests and debugging.
     pub fn live(&self) -> usize {
         let now = Instant::now();
-        self.0.iter().filter(|e| *e.value() > now).count()
+        self.cells.iter().filter(|e| e.value().until > now).count()
     }
 
-    /// All 6 `(band, cap)` cells currently backed off → no candidate
-    /// can survive `solve_full`'s ICE gate. Caller should demote a
-    /// tier (or, at terminal tier, emit `infeasible_total{reason=
-    /// capacity_exhausted}` and fail).
-    pub fn exhausted(&self) -> bool {
-        Band::ALL
-            .into_iter()
-            .all(|b| Cap::ALL.into_iter().all(|c| self.is_infeasible(b, c)))
-    }
-
-    /// `attempted_candidates` JSONB encoding for one ladder run.
-    /// `[{band:"hi", cap:"spot"}, ...]` — forensics; the live state is
-    /// in-process.
-    pub fn encode_attempted(attempted: &[(Band, Cap)]) -> serde_json::Value {
-        serde_json::Value::Array(
-            attempted
-                .iter()
-                .map(|(b, c)| serde_json::json!({"band": b.label(), "cap": c.label()}))
-                .collect(),
-        )
+    /// All `|H| × 2` cells currently masked → §Capacity backoff exit
+    /// (b). Caller emits `infeasible_total{reason=capacity_exhausted}`.
+    pub fn exhausted<'a>(&self, hw_classes: impl IntoIterator<Item = &'a HwClassName>) -> bool {
+        let mut any = false;
+        for h in hw_classes {
+            any = true;
+            for cap in CapacityType::ALL {
+                if !self.is_masked(&(h.clone(), cap)) {
+                    return false;
+                }
+            }
+        }
+        any
     }
 }
 
@@ -819,7 +755,7 @@ pub async fn spot_price_poller(
         // clone is cheap.
         let mut snap = cost.read().clone();
         if let Some(ec2) = &ec2 {
-            match poll_spot_once(ec2).await {
+            match poll_spot_once(ec2, &snap.cells).await {
                 Ok(obs) if !obs.is_empty() => snap.fold_prices(&obs, now_epoch()),
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "spot-price poll failed; keeping previous"),
@@ -912,84 +848,45 @@ pub(crate) async fn poller_tick_prelude(
     true
 }
 
-/// Representative instance types per band for the spot-price poll. The
-/// 12-NodePool topology admits c/m/r families across gen 6-8; querying a
-/// few c+m `.large` shapes per band and taking the median gives a stable
-/// `$/vCPU·hr` (the per-vCPU price is near-flat across sizes within a
-/// family). Graviton + x86 are both included so a band-wide ARM
-/// discount (or x86 premium) shows up in the EMA.
-///
-/// Band is tagged explicitly per entry — bands are non-disjoint by
-/// generation (helm `mid` spans 6+7), so it cannot be recovered by
-/// parsing the family's generation digit.
-const BAND_INSTANCE_TYPES: &[(Band, &str)] = &[
-    (Band::Hi, "c8g.large"),
-    (Band::Hi, "m8g.large"),
-    (Band::Mid, "c7a.large"),
-    (Band::Mid, "c7g.large"),
-    (Band::Mid, "m7a.large"),
-    (Band::Mid, "m7g.large"),
-    (Band::Lo, "c6a.large"),
-    (Band::Lo, "c6g.large"),
-    (Band::Lo, "m6a.large"),
-    (Band::Lo, "m6g.large"),
-];
-
 /// One `DescribeSpotPriceHistory` round. Returns vCPU-normalized
-/// `$/vCPU·hr` per `(band, Cap::Spot)`.
+/// `$/vCPU·hr` per `(h, Spot)`.
 ///
-/// Queries the last hour of `Linux/UNIX` spot-price history for
-/// [`BAND_INSTANCE_TYPES`], normalizes each row by its vCPU count
-/// (from `DescribeInstanceTypes`, cached for the process lifetime),
-/// then takes the per-band median. Median not mean: a single AZ's
-/// spot spike for one type shouldn't drag the whole band. On-demand
-/// prices stay seed-backed (no public on-demand API without
-/// `pricing:GetProducts`).
-async fn poll_spot_once(ec2: &aws_sdk_ec2::Client) -> anyhow::Result<HashMap<(Band, Cap), f64>> {
-    use aws_sdk_ec2::types::InstanceType;
+/// Queries the last hour of `Linux/UNIX` spot-price history for the
+/// instance types in `cells` (the per-h menu), normalizes each row by
+/// its menu `cores`, then takes the per-h median. Median not mean: a
+/// single AZ's spot spike for one type shouldn't drag the whole class.
+/// On-demand prices stay seed-backed (no public on-demand API without
+/// `pricing:GetProducts`). Empty menu → empty result (poller is a
+/// no-op until Part-B menu population).
+async fn poll_spot_once(
+    ec2: &aws_sdk_ec2::Client,
+    cells: &HashMap<Cell, Vec<InstanceType>>,
+) -> anyhow::Result<HashMap<Cell, f64>> {
+    use aws_sdk_ec2::types::InstanceType as Ec2InstanceType;
 
-    // vCPU-count cache. Process-lifetime static: instance-type vCPU
-    // counts are immutable. One DescribeInstanceTypes round-trip on
-    // first poll, then never again.
-    static VCPU: tokio::sync::OnceCell<HashMap<String, f64>> = tokio::sync::OnceCell::const_new();
-    let vcpu = VCPU
-        .get_or_try_init(|| async {
-            let r = ec2
-                .describe_instance_types()
-                .set_instance_types(Some(
-                    BAND_INSTANCE_TYPES
-                        .iter()
-                        .map(|(_, t)| InstanceType::from(*t))
-                        .collect(),
-                ))
-                .send()
-                .await?;
-            anyhow::Ok(
-                r.instance_types()
-                    .iter()
-                    .filter_map(|it| {
-                        Some((
-                            it.instance_type()?.as_str().to_owned(),
-                            f64::from(it.v_cpu_info()?.default_v_cpus()?),
-                        ))
-                    })
-                    .collect::<HashMap<_, _>>(),
-            )
+    // instance-type → (h, vCPU). Spot only — on-demand is seed-backed.
+    let h_of: HashMap<String, (HwClassName, f64)> = cells
+        .iter()
+        .filter(|((_, c), _)| *c == CapacityType::Spot)
+        .flat_map(|((h, _), m)| {
+            m.iter()
+                .map(|it| (it.name.clone(), (h.clone(), f64::from(it.cores))))
         })
-        .await?;
+        .collect();
+    if h_of.is_empty() {
+        return Ok(HashMap::new());
+    }
 
     // Spot history, last hour, all configured types, paginated. AWS
     // returns one row per (type, AZ, price-change); a quiet hour can
     // be empty for some types — those just drop out of the median.
-    let band_of: HashMap<&str, Band> = BAND_INSTANCE_TYPES.iter().map(|&(b, t)| (t, b)).collect();
     let start = aws_sdk_ec2::primitives::DateTime::from_secs((now_epoch() - 3600.0) as i64);
-    let mut per_band: HashMap<Band, Vec<f64>> = HashMap::new();
+    let mut per_h: HashMap<HwClassName, Vec<f64>> = HashMap::new();
     let mut pages = ec2
         .describe_spot_price_history()
         .set_instance_types(Some(
-            BAND_INSTANCE_TYPES
-                .iter()
-                .map(|(_, t)| InstanceType::from(*t))
+            h_of.keys()
+                .map(|t| Ec2InstanceType::from(t.as_str()))
                 .collect(),
         ))
         .product_descriptions("Linux/UNIX")
@@ -1001,63 +898,26 @@ async fn poll_spot_once(ec2: &aws_sdk_ec2::Client) -> anyhow::Result<HashMap<(Ba
             let Some(t) = row.instance_type().map(|t| t.as_str()) else {
                 continue;
             };
-            let Some(&band) = band_of.get(t) else {
-                continue;
-            };
-            let Some(v) = vcpu.get(t).copied().filter(|v| *v > 0.0) else {
+            let Some((h, vcpu)) = h_of.get(t).filter(|(_, v)| *v > 0.0) else {
                 continue;
             };
             let Some(price) = row.spot_price().and_then(|p| p.parse::<f64>().ok()) else {
                 continue;
             };
-            per_band.entry(band).or_default().push(price / v);
+            per_h.entry(h.clone()).or_default().push(price / vcpu);
         }
     }
 
-    Ok(per_band
+    Ok(per_h
         .into_iter()
-        .filter_map(|(b, mut xs)| {
+        .filter_map(|(h, mut xs)| {
             if xs.is_empty() {
                 return None;
             }
             xs.sort_by(|a, b| a.total_cmp(b));
-            Some(((b, Cap::Spot), xs[xs.len() / 2]))
+            Some(((h, CapacityType::Spot), xs[xs.len() / 2]))
         })
         .collect())
-}
-
-impl HwTable {
-    /// Per-pname effective-slowest hw_class within `band`: the `h ∈
-    /// band` minimizing `(α · factor[h]) / bias[pname,h]`. ADR-023 §h†:
-    /// the envelope solve is conservative — it sizes for the SLOWEST
-    /// hardware the pod might land on within the band, scored under
-    /// THIS pname's K=3 mixture (an I/O-bound pname's `α≈[0,0,1]` makes
-    /// `storage=nvme` classes fast and `ebs` slow regardless of their
-    /// alu factor) and adjusted for the per-hw residual bias. Returns
-    /// `(hw_class, effective_factor)`; falls back to `("", 1.0)` if no
-    /// hw_class in the band has ≥3 samples.
-    pub fn h_dagger(
-        &self,
-        alpha: super::alpha::Alpha,
-        band: Band,
-        hw_bias: &HashMap<String, f64>,
-    ) -> (String, f64) {
-        self.iter()
-            .filter(|(h, _)| band_of_hw_class(h) == Some(band))
-            .map(|(h, f)| {
-                let bias = hw_bias.get(h).copied().unwrap_or(1.0);
-                (h.clone(), super::alpha::dot(alpha, *f) / bias)
-            })
-            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            // `dot / bias` can push below [`HW_FACTOR_SANITY_FLOOR`] even
-            // with clamped inputs (e.g. 0.25/2.0). The result is divided
-            // into `T(c)` at solve_full's `feasible` gate; an unclamped
-            // tiny factor blows `t = T(c)/factor` up → `feasible(cap_c)
-            // = false` → entire band drops out for both Spot AND
-            // OnDemand.
-            .map(|(h, f)| (h, f.max(super::hw::HW_FACTOR_SANITY_FLOOR)))
-            .unwrap_or_else(|| (String::new(), 1.0))
-    }
 }
 
 #[cfg(test)]
@@ -1101,86 +961,84 @@ mod tests {
         let l = lambda_hat(0.0, 0.0, 0.0, 1e-5);
         assert!((l - 1e-5).abs() < 1e-12);
         // Same floor at the CostTable level (no entries → seed).
-        assert!((CostTable::default().lambda_band(Band::Mid) - LAMBDA_SEED).abs() < 1e-12);
+        assert!((CostTable::default().lambda_for("h") - LAMBDA_SEED).abs() < 1e-12);
     }
 
     #[test]
-    fn lambda_band_uses_node_count_scaler() {
+    fn lambda_for_uses_node_count_scaler() {
         // 100-node fleet: n_λ = 86400·100 = 8.64e6. Prior swamps a
         // single interrupt over 1h — λ̂ ≈ seed (within 0.05%).
         let mut t = CostTable::default();
         t.lambda.insert(
-            Band::Mid,
+            "h".into(),
             RatioEma {
                 numerator: 1.0,
                 denominator: 3600.0,
                 updated_at: 1000.0,
             },
         );
-        t.set_node_count(Band::Mid, 100.0, 1000.0);
-        let l = t.lambda_band(Band::Mid);
+        t.set_node_count("h", 100.0, 1000.0);
+        let l = t.lambda_for("h");
         assert!((l - LAMBDA_SEED).abs() / LAMBDA_SEED < 1e-3, "{l}");
     }
 
-    #[test]
-    fn band_of_hw_class_parses_band_label() {
-        assert_eq!(band_of_hw_class("aws-8-nvme-hi"), Some(Band::Hi));
-        assert_eq!(band_of_hw_class("intel-7-ebs-mid"), Some(Band::Mid));
-        assert_eq!(band_of_hw_class("amd-6-ebs-lo"), Some(Band::Lo));
-        // Regression: helm `mid` admits gen 6+7. A c6id provisioned via
-        // the mid NodePool is `gen=6, band=mid` — must map to Mid, NOT
-        // Lo. This is why band is keyed on the label segment, not the
-        // generation digit.
-        assert_eq!(band_of_hw_class("amd-6-nvme-mid"), Some(Band::Mid));
-        // No band segment / unknown band → None.
-        assert_eq!(band_of_hw_class("aws-7-ebs"), None);
-        assert_eq!(band_of_hw_class("unknown-unknown-ebs-unknown"), None);
+    fn it(name: &str, cores: u32, mem_gib: u64, p: f64) -> InstanceType {
+        InstanceType {
+            name: name.into(),
+            cores,
+            mem_bytes: mem_gib << 30,
+            price_per_vcpu_hr: p,
+        }
     }
 
     #[test]
-    fn parse_selector_roundtrips_candidate() {
-        let ns = std::collections::BTreeMap::from([
-            ("rio.build/hw-band".into(), "mid".into()),
-            ("karpenter.sh/capacity-type".into(), "spot".into()),
-        ]);
-        assert_eq!(parse_selector(&ns), Some((Band::Mid, Cap::Spot)));
-        assert_eq!(parse_selector(&Default::default()), None);
+    fn smallest_fitting_is_first_menu_match() {
+        let mut t = CostTable::default();
+        let cell = ("h".into(), CapacityType::Spot);
+        t.set_menu(
+            cell.clone(),
+            vec![
+                it("c.large", 2, 4, 0.04),
+                it("c.xlarge", 4, 8, 0.04),
+                it("c.4xlarge", 16, 32, 0.038),
+            ],
+        );
+        // (c=3, mem=6Gi) → first fit is xlarge.
+        assert_eq!(t.smallest_fitting(&cell, 3, 6 << 30), Some(0.04));
+        // (c=12) → 4xlarge.
+        assert_eq!(t.smallest_fitting(&cell, 12, 0), Some(0.038));
+        // (c=32) → no fit (menu non-empty).
+        assert_eq!(t.smallest_fitting(&cell, 32, 0), None);
+        // Empty menu cell → degrades to EMA price (seed here).
+        let other = ("h2".into(), CapacityType::Spot);
+        assert_eq!(
+            t.smallest_fitting(&other, 32, 0),
+            Some(seed_price(CapacityType::Spot))
+        );
     }
 
-    /// `poll_spot_once`: per-band median of `price/vCPU` over the
-    /// returned history. Mock both EC2 calls; assert the median pick
-    /// (not mean — the 0.10 outlier for Mid is ignored).
+    /// `poll_spot_once`: per-h median of `price/vCPU` over the returned
+    /// history, with vCPU read from the menu (not a separate EC2 call).
+    /// The 0.10 outlier for `intel-7` is the median's mid-value, not
+    /// the mean.
     #[tokio::test]
-    async fn poll_spot_once_median_per_band() {
-        use aws_sdk_ec2::types::{InstanceTypeInfo, SpotPrice, VCpuInfo};
+    async fn poll_spot_once_median_per_h() {
+        use aws_sdk_ec2::types::SpotPrice;
         use aws_smithy_mocks::{RuleMode, mock, mock_client};
         type Ec2 = aws_sdk_ec2::Client;
 
-        let it = |name: &str, vcpu: i32| {
-            InstanceTypeInfo::builder()
-                .instance_type(name.into())
-                .v_cpu_info(VCpuInfo::builder().default_v_cpus(vcpu).build())
-                .build()
-        };
         let sp = |name: &str, price: &str| {
             SpotPrice::builder()
                 .instance_type(name.into())
                 .spot_price(price)
                 .build()
         };
-        let types = mock!(Ec2::describe_instance_types).then_output(move || {
-            aws_sdk_ec2::operation::describe_instance_types::DescribeInstanceTypesOutput::builder()
-                .instance_types(it("c8g.large", 2))
-                .instance_types(it("c7a.large", 2))
-                .instance_types(it("m7a.large", 4))
-                .build()
-        });
         let history = mock!(Ec2::describe_spot_price_history).then_output(move || {
             aws_sdk_ec2::operation::describe_spot_price_history::DescribeSpotPriceHistoryOutput::builder()
-                // Hi: one sample → 0.04/2 = 0.02.
+                // intel-8: one sample → 0.04/2 = 0.02.
                 .spot_price_history(sp("c8g.large", "0.0400"))
-                // Mid: three samples → median of [0.03/2, 0.05/2, 0.40/4]
-                // = median of [0.015, 0.025, 0.10] = 0.025.
+                // intel-7: three samples → median of [0.03/2, 0.05/2,
+                // 0.40/4] = median of [0.015, 0.025, 0.10] = 0.025.
                 .spot_price_history(sp("c7a.large", "0.0300"))
                 .spot_price_history(sp("c7a.large", "0.0500"))
                 .spot_price_history(sp("m7a.large", "0.4000"))
@@ -1189,13 +1047,33 @@ mod tests {
                 .spot_price_history(sp("c5.large", "0.0100"))
                 .build()
         });
-        let client = mock_client!(aws_sdk_ec2, RuleMode::MatchAny, &[&types, &history]);
+        let client = mock_client!(aws_sdk_ec2, RuleMode::MatchAny, &[&history]);
 
-        let obs = poll_spot_once(&client).await.unwrap();
-        assert_eq!(obs.len(), 2, "Lo had no rows → absent");
-        assert!((obs[&(Band::Hi, Cap::Spot)] - 0.02).abs() < 1e-9);
-        assert!((obs[&(Band::Mid, Cap::Spot)] - 0.025).abs() < 1e-9);
-        assert!(!obs.contains_key(&(Band::Lo, Cap::Spot)));
+        let mut cells: HashMap<Cell, Vec<InstanceType>> = HashMap::new();
+        cells.insert(
+            ("intel-8".into(), CapacityType::Spot),
+            vec![it("c8g.large", 2, 4, 0.0)],
+        );
+        cells.insert(
+            ("intel-7".into(), CapacityType::Spot),
+            vec![it("c7a.large", 2, 4, 0.0), it("m7a.large", 4, 16, 0.0)],
+        );
+        cells.insert(
+            ("intel-6".into(), CapacityType::Spot),
+            vec![it("c6a.large", 2, 4, 0.0)],
+        );
+
+        let obs = poll_spot_once(&client, &cells).await.unwrap();
+        assert_eq!(obs.len(), 2, "intel-6 had no rows → absent");
+        assert!((obs[&("intel-8".into(), CapacityType::Spot)] - 0.02).abs() < 1e-9);
+        assert!((obs[&("intel-7".into(), CapacityType::Spot)] - 0.025).abs() < 1e-9);
+        // Empty menu → no-op.
+        assert!(
+            poll_spot_once(&client, &HashMap::new())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// `persist`/`load`/`refresh_lambda` are cluster-scoped: two
@@ -1206,16 +1084,17 @@ mod tests {
     async fn persist_load_cluster_scoped() {
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
         let sdb = SchedulerDb::new(db.pool.clone());
+        let cell = ("intel-8".into(), CapacityType::Spot);
 
-        // Cluster A writes price=0.5 for (Hi, Spot) and a Hi-band
+        // Cluster A writes price=0.5 for (intel-8, Spot) and an
         // interrupt row.
         let mut a = CostTable::seeded("us-east-1");
-        a.set_price(Band::Hi, Cap::Spot, 0.5, 1000.0);
+        a.set_price("intel-8", CapacityType::Spot, 0.5, 1000.0);
         a.persist(&sdb).await.unwrap();
         sqlx::query(
             "INSERT INTO interrupt_samples (cluster, hw_class, kind, value) \
-             VALUES ('us-east-1', 'aws-8-nvme-hi', 'interrupt', 5), \
-                    ('us-east-1', 'aws-8-nvme-hi', 'exposure', 100)",
+             VALUES ('us-east-1', 'intel-8', 'interrupt', 5), \
+                    ('us-east-1', 'intel-8', 'exposure', 100)",
         )
         .execute(&db.pool)
         .await
@@ -1224,27 +1103,24 @@ mod tests {
         // Cluster B loads → sees seeds (NOT A's 0.5), and refresh_lambda
         // sees no rows.
         let mut b = CostTable::load(&sdb, "eu-west-2").await.unwrap();
-        assert!(
-            (b.price(Band::Hi, Cap::Spot) - 0.5).abs() > 1e-3,
-            "B leaked A's price"
-        );
+        assert!((b.price(&cell) - 0.5).abs() > 1e-3, "B leaked A's price");
         b.refresh_lambda(&sdb).await.unwrap();
         assert!(b.lambda.is_empty(), "B leaked A's interrupt rows");
 
         // Cluster A reload roundtrips its own price.
         let a2 = CostTable::load(&sdb, "us-east-1").await.unwrap();
-        assert!((a2.price(Band::Hi, Cap::Spot) - 0.5).abs() < 1e-9);
+        assert!((a2.price(&cell) - 0.5).abs() < 1e-9);
         // And sees its own interrupt rows.
         let mut a3 = CostTable::seeded("us-east-1");
         a3.refresh_lambda(&sdb).await.unwrap();
-        assert!(a3.lambda.contains_key(&Band::Hi));
+        assert!(a3.lambda.contains_key("intel-8"));
 
         // B persists then A reloads: A's price unchanged (PK is
         // (cluster, key) — no overwrite).
-        b.set_price(Band::Hi, Cap::Spot, 0.01, 2000.0);
+        b.set_price("intel-8", CapacityType::Spot, 0.01, 2000.0);
         b.persist(&sdb).await.unwrap();
         let a4 = CostTable::load(&sdb, "us-east-1").await.unwrap();
-        assert!((a4.price(Band::Hi, Cap::Spot) - 0.5).abs() < 1e-9);
+        assert!((a4.price(&cell) - 0.5).abs() < 1e-9);
     }
 
     /// Regression: `persist()` wrote `updated_at = now()` instead of
@@ -1256,10 +1132,14 @@ mod tests {
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
         let sdb = SchedulerDb::new(db.pool.clone());
         let mut t = CostTable::seeded("c");
-        t.set_price(Band::Hi, Cap::Spot, 0.5, 1000.0);
+        t.set_price("h", CapacityType::Spot, 0.5, 1000.0);
         t.persist(&sdb).await.unwrap();
         let r = CostTable::load(&sdb, "c").await.unwrap();
-        let at = r.price.get(&(Band::Hi, Cap::Spot)).unwrap().updated_at;
+        let at = r
+            .price
+            .get(&("h".into(), CapacityType::Spot))
+            .unwrap()
+            .updated_at;
         assert!(
             (at - 1000.0).abs() < 1.0,
             "reloaded updated_at must be data-time 1000, not now(); got {at}"
@@ -1275,29 +1155,30 @@ mod tests {
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
         let sdb = SchedulerDb::new(db.pool.clone());
         let mut t = CostTable::seeded("c");
-        t.set_price(Band::Mid, Cap::Spot, 0.0123, 7000.0);
+        let cell = ("intel-7".into(), CapacityType::Spot);
+        t.set_price("intel-7", CapacityType::Spot, 0.0123, 7000.0);
         t.lambda.insert(
-            Band::Mid,
+            "intel-7".into(),
             RatioEma {
                 numerator: 3.0,
                 denominator: 9000.0,
                 updated_at: 7100.0,
             },
         );
-        t.set_node_count(Band::Mid, 12.5, 7100.0);
+        t.set_node_count("intel-7", 12.5, 7100.0);
         t.persist(&sdb).await.unwrap();
 
         let r = CostTable::load(&sdb, "c").await.unwrap();
-        assert!((r.price(Band::Mid, Cap::Spot) - 0.0123).abs() < 1e-9);
-        let l = r.lambda.get(&Band::Mid).unwrap();
+        assert!((r.price(&cell) - 0.0123).abs() < 1e-9);
+        let l = r.lambda.get("intel-7").unwrap();
         assert!((l.numerator - 3.0).abs() < 1e-9);
         assert!((l.denominator - 9000.0).abs() < 1e-9);
         assert!((l.updated_at - 7100.0).abs() < 1.0);
-        let nc = r.node_count.get(&Band::Mid).unwrap();
+        let nc = r.node_count.get("intel-7").unwrap();
         assert!((nc.value - 12.5).abs() < 1e-9);
         assert!((nc.updated_at - 7100.0).abs() < 1.0);
         // λ̂ recomputed identically from the round-tripped state.
-        assert!((r.lambda_band(Band::Mid) - t.lambda_band(Band::Mid)).abs() < 1e-12);
+        assert!((r.lambda_for("intel-7") - t.lambda_for("intel-7")).abs() < 1e-12);
     }
 
     /// `> 6 × pollInterval` stale → `price()` clamps to the static seed
@@ -1306,7 +1187,8 @@ mod tests {
     #[test]
     fn stale_price_clamps_to_seed_and_emits_fallback() {
         let mut t = CostTable::seeded("c");
-        t.set_price(Band::Hi, Cap::Spot, 0.5, 1000.0);
+        let cell = ("h".into(), CapacityType::Spot);
+        t.set_price("h", CapacityType::Spot, 0.5, 1000.0);
         let rec = metrics_util::debugging::DebuggingRecorder::new();
         let snap = rec.snapshotter();
         let _g = metrics::set_default_local_recorder(&rec);
@@ -1314,7 +1196,7 @@ mod tests {
         // Stale: now − updated_at = 7200 > 3600.
         assert!(t.apply_stale_clamp(1000.0 + STALE_CLAMP_AFTER_SECS + 1.0));
         assert!(
-            (t.price(Band::Hi, Cap::Spot) - seed_price(Band::Hi, Cap::Spot)).abs() < 1e-9,
+            (t.price(&cell) - seed_price(CapacityType::Spot)).abs() < 1e-9,
             "clamped → seed, not 0.5"
         );
         let fired = snap.snapshot().into_vec().iter().any(|(ck, _, _, _)| {
@@ -1324,9 +1206,9 @@ mod tests {
         assert!(fired, "fallback_total{{reason=stale}} must increment");
 
         // Fresh: clamp clears; price() reads through.
-        t.set_price(Band::Hi, Cap::Spot, 0.5, 9000.0);
+        t.set_price("h", CapacityType::Spot, 0.5, 9000.0);
         assert!(!t.apply_stale_clamp(9000.0 + 60.0));
-        assert!((t.price(Band::Hi, Cap::Spot) - 0.5).abs() < 1e-9);
+        assert!((t.price(&cell) - 0.5).abs() < 1e-9);
     }
 
     /// `refresh_lambda` derives `node_count_ema = Σ exposure / Δt` over
@@ -1355,7 +1237,7 @@ mod tests {
         .await
         .unwrap();
         t.refresh_lambda(&sdb).await.unwrap();
-        let nc = t.node_count.get(&Band::Hi).unwrap().value;
+        let nc = t.node_count.get("aws-8-nvme-hi").unwrap().value;
         assert!(
             (nc - 2.0).abs() < 1e-9,
             "120 node-secs / 60s window = 2; got {nc}"
@@ -1369,34 +1251,30 @@ mod tests {
     /// value's decay `dt = now − that value's last-update`.
     #[test]
     fn fold_prices_partial_obs_decays_per_key() {
-        let mut t = CostTable {
-            price: HashMap::new(),
-            lambda: HashMap::new(),
-            node_count: HashMap::new(),
-            stale_clamp: false,
-            cluster: String::new(),
-        };
+        let mut t = CostTable::default();
+        let h1: Cell = ("h1".into(), CapacityType::Spot);
+        let h2: Cell = ("h2".into(), CapacityType::Spot);
         let mut obs = HashMap::new();
-        obs.insert((Band::Hi, Cap::Spot), 0.02);
-        obs.insert((Band::Mid, Cap::Spot), 0.01);
+        obs.insert(h1.clone(), 0.02);
+        obs.insert(h2.clone(), 0.01);
         t.fold_prices(&obs, 1000.0);
-        // t=1600: Mid only (Hi absent).
+        // t=1600: h2 only (h1 absent).
         let mut obs2 = HashMap::new();
-        obs2.insert((Band::Mid, Cap::Spot), 0.015);
+        obs2.insert(h2.clone(), 0.015);
         t.fold_prices(&obs2, 1600.0);
-        // Hi's updated_at must NOT have moved.
-        assert_eq!(t.price[&(Band::Hi, Cap::Spot)].updated_at, 1000.0);
-        // t=2200: Hi reappears. dt=1200 (vs old global-stamp dt=600).
+        // h1's updated_at must NOT have moved.
+        assert_eq!(t.price[&h1].updated_at, 1000.0);
+        // t=2200: h1 reappears. dt=1200 (vs old global-stamp dt=600).
         let mut obs3 = HashMap::new();
-        obs3.insert((Band::Hi, Cap::Spot), 0.03);
+        obs3.insert(h1.clone(), 0.03);
         t.fold_prices(&obs3, 2200.0);
         // decay = 0.5^(1200/SPOT_HALFLIFE_SECS); SPOT_HALFLIFE_SECS=3h.
         let decay = 0.5f64.powf(1200.0 / SPOT_HALFLIFE_SECS);
         let want = 0.02 * decay + 0.03 * (1.0 - decay);
         assert!(
-            (t.price(Band::Hi, Cap::Spot) - want).abs() < 1e-9,
+            (t.price(&h1) - want).abs() < 1e-9,
             "want {want}, got {}",
-            t.price(Band::Hi, Cap::Spot)
+            t.price(&h1)
         );
     }
 
@@ -1411,14 +1289,15 @@ mod tests {
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
         let sdb = SchedulerDb::new(db.pool.clone());
 
+        let cell = ("h".into(), CapacityType::Spot);
         // Seed PG with the previous leader's evolved state.
         let mut prev = CostTable::seeded("c");
-        prev.set_price(Band::Hi, Cap::Spot, 0.08, 5000.0);
+        prev.set_price("h", CapacityType::Spot, 0.08, 5000.0);
         prev.persist(&sdb).await.unwrap();
 
         // This replica's stale in-mem startup snapshot.
         let mut mine = CostTable::seeded("c");
-        mine.set_price(Band::Hi, Cap::Spot, 0.02, 100.0);
+        mine.set_price("h", CapacityType::Spot, 0.02, 100.0);
         let cost = Arc::new(parking_lot::RwLock::new(mine));
 
         // (a) standby: emits gauge, returns false. Captured via local
@@ -1438,23 +1317,24 @@ mod tests {
             .any(|(ck, _, _, _)| ck.key().name() == "rio_scheduler_sla_hw_cost_stale_seconds");
         assert!(saw_gauge, "standby must emit the staleness gauge");
         // Standby did NOT reload (still 0.02).
-        assert!((cost.read().price(Band::Hi, Cap::Spot) - 0.02).abs() < 1e-9);
+        assert!((cost.read().price(&cell) - 0.02).abs() < 1e-9);
 
         // (b) false→true edge: reloads from PG, returns true.
         let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &sdb, 6100.0).await;
         assert!(proceed);
         assert!(was_leader);
         assert!(
-            (cost.read().price(Band::Hi, Cap::Spot) - 0.08).abs() < 1e-9,
+            (cost.read().price(&cell) - 0.08).abs() < 1e-9,
             "leader-edge must reload PG state, not keep startup snapshot"
         );
 
         // Subsequent leader tick: no reload (would clobber in-flight
         // mutation if it did).
-        cost.write().set_price(Band::Hi, Cap::Spot, 0.09, 6000.0);
+        cost.write()
+            .set_price("h", CapacityType::Spot, 0.09, 6000.0);
         let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &sdb, 6100.0).await;
         assert!(proceed);
-        assert!((cost.read().price(Band::Hi, Cap::Spot) - 0.09).abs() < 1e-9);
+        assert!((cost.read().price(&cell) - 0.09).abs() < 1e-9);
     }
 
     /// Regression: when `CostTable::load` fails on the false→true
@@ -1470,14 +1350,15 @@ mod tests {
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
         let sdb = SchedulerDb::new(db.pool.clone());
 
+        let cell = ("h".into(), CapacityType::Spot);
         // Seed PG with the previous leader's evolved state.
         let mut prev = CostTable::seeded("c");
-        prev.set_price(Band::Hi, Cap::Spot, 0.08, 5000.0);
+        prev.set_price("h", CapacityType::Spot, 0.08, 5000.0);
         prev.persist(&sdb).await.unwrap();
 
         // This replica's stale in-mem startup snapshot.
         let mut mine = CostTable::seeded("c");
-        mine.set_price(Band::Hi, Cap::Spot, 0.02, 100.0);
+        mine.set_price("h", CapacityType::Spot, 0.02, 100.0);
         let cost = Arc::new(parking_lot::RwLock::new(mine));
 
         // Broken DB: a separate pool closed before use → load() Errs.
@@ -1498,7 +1379,7 @@ mod tests {
             "load() Err → was_leader stays false so next tick retries"
         );
         assert!(
-            (cost.read().price(Band::Hi, Cap::Spot) - 0.02).abs() < 1e-9,
+            (cost.read().price(&cell) - 0.02).abs() < 1e-9,
             "in-mem unchanged on Err"
         );
 
@@ -1507,7 +1388,7 @@ mod tests {
         assert!(proceed, "retry with working DB → proceed");
         assert!(was_leader, "retry success → latched");
         assert!(
-            (cost.read().price(Band::Hi, Cap::Spot) - 0.08).abs() < 1e-9,
+            (cost.read().price(&cell) - 0.08).abs() < 1e-9,
             "retry reloaded PG state (previous leader's EMA)"
         );
     }
@@ -1534,7 +1415,7 @@ mod tests {
         .unwrap();
         let mut t = CostTable::seeded("c");
         t.refresh_lambda(&sdb).await.unwrap();
-        let hwm = t.lambda[&Band::Hi].updated_at;
+        let hwm = t.lambda["aws-8-nvme-hi"].updated_at;
         assert_eq!(hwm, 1500.0, "HWM must be MAX(at), got {hwm}");
         // Second tick with a row at at=1200 (between prev rows): the
         // `at > to_timestamp(1500)` filter excludes it, AND hwm stays
@@ -1547,7 +1428,7 @@ mod tests {
         .await
         .unwrap();
         t.refresh_lambda(&sdb).await.unwrap();
-        assert_eq!(t.lambda[&Band::Hi].updated_at, 1500.0);
+        assert_eq!(t.lambda["aws-8-nvme-hi"].updated_at, 1500.0);
     }
 
     /// `interrupt_samples` is bounded: rows >7d are swept (the 24h-
@@ -1591,67 +1472,89 @@ mod tests {
     #[test]
     fn price_seed_backed() {
         let t = CostTable::default();
-        // Seeds: spot < on-demand for every band.
-        for b in Band::ALL {
-            assert!(t.price(b, Cap::Spot) < t.price(b, Cap::OnDemand));
-        }
-        // Lo cheapest, Hi priciest (on-demand seeds).
-        assert!(t.price(Band::Lo, Cap::OnDemand) < t.price(Band::Hi, Cap::OnDemand));
+        // Seeds: spot < on-demand for any unknown h.
+        let h = "any".to_string();
+        assert!(t.price(&(h.clone(), CapacityType::Spot)) < t.price(&(h, CapacityType::Od)));
     }
 
+    // r[verify sched.sla.hw-class.ice-mask]
     #[test]
-    fn ice_mark_and_expire() {
-        let ice = IceBackoff::default();
-        assert!(!ice.is_infeasible(Band::Hi, Cap::Spot));
-        ice.mark(Band::Hi, Cap::Spot);
-        assert!(ice.is_infeasible(Band::Hi, Cap::Spot));
-        assert!(!ice.is_infeasible(Band::Hi, Cap::OnDemand));
+    fn ice_mark_exponential_then_clear_resets() {
+        let ice = IceBackoff::new(600.0);
+        let cell: Cell = ("h".into(), CapacityType::Spot);
+        assert!(!ice.is_masked(&cell));
+        ice.mark(&cell);
+        assert!(ice.is_masked(&cell));
+        assert!(!ice.is_masked(&("h".into(), CapacityType::Od)));
         assert_eq!(ice.live(), 1);
+        // Backoff doubles per consecutive mark, capped at max_lead_time.
+        // step=0 → 60s. After another mark: step=1 → 120s.
+        let u0 = ice.cells.get(&cell).unwrap().until;
+        ice.mark(&cell);
+        let s1 = *ice.cells.get(&cell).unwrap();
+        assert_eq!(s1.step, 1);
+        assert!(
+            s1.until > u0 + Duration::from_secs(50),
+            "step=1 TTL ~2× step=0: {:?}",
+            s1.until.duration_since(u0)
+        );
+        // step=10 would be 60·1024=61440s; clamped to 600s.
+        for _ in 0..10 {
+            ice.mark(&cell);
+        }
+        let until = ice.cells.get(&cell).unwrap().until;
+        assert!(
+            until <= Instant::now() + Duration::from_secs(601),
+            "TTL capped at max_lead_time"
+        );
+        // clear() resets — next mark is step=0 again.
+        ice.clear(&cell);
+        assert!(!ice.is_masked(&cell));
+        ice.mark(&cell);
+        assert_eq!(ice.cells.get(&cell).unwrap().step, 0);
     }
 
-    /// Regression: the lazy-reap arm previously called `remove()` while
-    /// the match scrutinee's `Ref` guard was still live → DashMap shard
-    /// deadlock. Seed a past-expiry entry directly so the test doesn't
-    /// wait `ICE_TTL`; if the deadlock is reintroduced, this hangs and
+    /// Regression: `mark()` reads the prior step then inserts; holding
+    /// the `Ref` guard across the insert deadlocks (DashMap shard
+    /// RwLock is non-reentrant). If reintroduced, this hangs and
     /// nextest's per-test timeout catches it.
     #[test]
-    fn ice_expired_entry_reaped_without_deadlock() {
+    fn ice_mark_re_mark_no_deadlock() {
         let ice = IceBackoff::default();
-        ice.0.insert((Band::Hi, Cap::Spot), Instant::now());
-        assert!(!ice.is_infeasible(Band::Hi, Cap::Spot), "expired → false");
-        assert!(
-            ice.0.get(&(Band::Hi, Cap::Spot)).is_none(),
-            "expired entry removed on read"
-        );
-        // Same lazy-reap hazard across all 6 cells.
-        for b in Band::ALL {
-            for c in Cap::ALL {
-                ice.0.insert((b, c), Instant::now());
-            }
+        let cell: Cell = ("h".into(), CapacityType::Spot);
+        for _ in 0..5 {
+            ice.mark(&cell);
         }
-        for b in Band::ALL {
-            for c in Cap::ALL {
-                assert!(!ice.is_infeasible(b, c), "expired → false, no deadlock");
-            }
-        }
+        assert_eq!(ice.cells.get(&cell).unwrap().step, 4);
     }
 
     #[test]
-    fn encode_attempted_roundtrips_labels() {
-        let v = IceBackoff::encode_attempted(&[(Band::Hi, Cap::Spot), (Band::Lo, Cap::OnDemand)]);
-        assert_eq!(
-            v.to_string(),
-            r#"[{"band":"hi","cap":"spot"},{"band":"lo","cap":"on-demand"}]"#
-        );
+    fn ice_masked_cells_and_exhausted() {
+        let ice = IceBackoff::default();
+        let hs: Vec<HwClassName> = vec!["h1".into(), "h2".into()];
+        assert!(!ice.exhausted(&hs), "no cells masked");
+        for h in &hs {
+            for c in CapacityType::ALL {
+                ice.mark(&(h.clone(), c));
+            }
+        }
+        assert_eq!(ice.masked_cells().len(), 4);
+        assert!(ice.exhausted(&hs));
+        ice.clear(&("h1".into(), CapacityType::Od));
+        assert!(!ice.exhausted(&hs), "one cell clear → not exhausted");
+        // Empty H → not exhausted (vacuously not "all of H masked").
+        assert!(!ice.exhausted(std::iter::empty::<&HwClassName>()));
     }
 
     #[test]
     fn ladder_cap_bounds() {
-        // 1h tier, 120s fallback → ceil(3600/120/4)=8 → clamp 8.
-        assert_eq!(IceBackoff::ladder_cap(3600.0, 120.0), 8);
-        // 5min tier → ceil(300/120/4)=1.
-        assert_eq!(IceBackoff::ladder_cap(300.0, 120.0), 1);
+        // 1h tier, budget 600s, lead 120s → ceil(3600/120/4)=8 → clamp 8.
+        assert_eq!(IceBackoff::ladder_cap(3600.0, 600.0, 120.0), 8);
+        // 5min tier, budget 300s, lead 120s → ceil(300/120/4)=1.
+        assert_eq!(IceBackoff::ladder_cap(300.0, 300.0, 120.0), 1);
+        // tier < budget → budget binds: max(60, 600)/45/4 = 3.33 → 4.
+        assert_eq!(IceBackoff::ladder_cap(60.0, 600.0, 45.0), 4);
         // Huge tier → still 8.
-        assert_eq!(IceBackoff::ladder_cap(86400.0, 120.0), 8);
+        assert_eq!(IceBackoff::ladder_cap(86400.0, 600.0, 120.0), 8);
     }
 }

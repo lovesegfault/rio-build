@@ -83,6 +83,7 @@ let
         [sla]
         default_tier = "normal"
         hw_cost_source = "static"
+        hw_explore_epsilon = 0.0
         max_cores = 64
         max_mem = 274877906944
         max_disk = 214748364800
@@ -96,6 +97,13 @@ let
         cpu = 4
         mem_per_core = 2147483648
         mem_base = 4294967296
+
+        [sla.hw_classes.intel-6-ebs-lo]
+        labels = [{ key = "rio.build/hw-class", value = "intel-6-ebs-lo" }]
+        [sla.hw_classes.intel-7-ebs-mid]
+        labels = [{ key = "rio.build/hw-class", value = "intel-7-ebs-mid" }]
+        [sla.hw_classes.intel-8-nvme-hi]
+        labels = [{ key = "rio.build/hw-class", value = "intel-8-nvme-hi" }]
       '';
     };
     extraPackages = [
@@ -436,9 +444,9 @@ in
           "override-precedence"
           # r[verify sched.sla.hw-ref-seconds]
           "hw-normalize"
-          # r[verify sched.sla.solve-per-band-cap]
+          # r[verify sched.sla.hw-class.admissible-set]
           "cost-solve"
-          # r[verify sched.sla.tier-envelope]
+          # r[verify sched.sla.hw-class.ice-mask]
           "ice-backoff"
           # r[verify sched.sla.prior-partial-pool]
           "seed-corpus"

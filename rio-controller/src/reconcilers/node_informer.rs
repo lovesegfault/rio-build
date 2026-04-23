@@ -637,9 +637,10 @@ mod tests {
 
     /// Regression: helm `mid` admits gen 6+7, so a c6id node provisioned
     /// by the mid NodePool has `instance-generation: 6` AND
-    /// `rio.build/hw-band: mid`. The hw_class string must carry the band
-    /// label so the scheduler's `band_of_hw_class` can recover `Mid` —
-    /// parsing the generation digit alone would mis-bucket it as `Lo`.
+    /// `rio.build/hw-band: mid`. The hw_class string carries the band
+    /// label so `interrupt_samples` rows from this node aggregate under
+    /// the correct hw_class key — parsing the generation digit alone
+    /// would mis-bucket it.
     #[test]
     fn hw_class_carries_band_label_not_just_generation() {
         let cache = NodeLabelCache::default();

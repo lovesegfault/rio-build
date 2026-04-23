@@ -501,9 +501,12 @@ pub struct SolvedIntent {
     /// `None` on cold-start / probe / forced-cores override — the
     /// prediction-ratio histogram only sees model-backed dispatches.
     pub predicted: Option<crate::sla::solve::SlaPrediction>,
-    /// `rio.build/hw-band` + `karpenter.sh/capacity-type` when
-    /// `solve_full` ran; empty for the band-agnostic path.
-    pub node_selector: std::collections::BTreeMap<String, String>,
+    /// ADR-023 §13a OR-of-ANDs `(h, cap)` targeting when `solve_full`
+    /// ran; empty for the hw-agnostic path. The legacy single-cell
+    /// `node_selector` map is gone — `compute_spawn_intents` derives
+    /// the proto's compat `node_selector` field from `node_affinity[0]`
+    /// until A18 lands.
+    pub node_affinity: Vec<rio_proto::types::NodeSelectorTerm>,
 }
 
 /// Scheduling-hint sub-state of a [`DerivationState`].
