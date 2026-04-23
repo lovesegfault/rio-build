@@ -202,7 +202,8 @@ fn migration_checksums_frozen() {
         (52, "ada24ea4f6799486d131027e7a8c995e64bd3e56d0716b614eabb683ca3c18beb2eea860de60dc1b6c63003002ab7516"),
         (53, "5b63404691d5229bbdfb2936686f2014f84e11fbc142b9fc945c8f18e1fd3035973f3780e4494f5cd87cc00cab90af3a"),
         (54, "b82007070c87e904074836f8d1d737ed593163cbb0ae87f112dbde4de6be97fef66e31a91b40412f8674d7a6e4a2250c"),
-        (55, "4a1376ece5c8f6b70714bb11e3f28a627c0248b43d1adc42bfcf092cf31f99758527e5d8dae1182fd2eefa943799cdcc"),
+        // 055 deleted (dead schema on never-queried hw_cost_factors) —
+        // sqlx tolerates the gap; see rio-store/src/migrations.rs.
         (56, "b456694bdc1a9b6dbc5cb36025ec198e389b77960ce783ed0afd276ff37476ad632c6c468826239316624433de4e8672"),
         (57, "6c626a27371ef3f46b23a2cfcdcd0052f487c1a90cbd6cade384ad7dda48e71835f94d40b718354ef0c2b46c1c1bae92"),
         (58, "3e2f05cc03b48c2e82bbaa8dc3b36fe89260c12bb9a5f921acac104dc2b9772e8f4c3b9a0ba9867599ec6901e20984d7"),
@@ -303,6 +304,120 @@ async fn cross_service_schema_contract() {
             "cross-service contract broken: rio-store reads {table}.{col} as {want_udt}, \
              but schema has {got:?} — see gc/mark.rs, gc/sweep.rs, gc/tenant.rs for the \
              dependent queries",
+        );
+    }
+}
+
+/// Schema-liveness guard: every table that exists after applying all
+/// `migrations/*.sql` is referenced by name in ≥1 workspace `.rs` file.
+///
+/// `migration_checksums_frozen` only catches *edits* to shipped
+/// migrations — it does not catch a NEW migration that creates or
+/// extends schema nothing reads. Migration 055 added EMA-state columns
+/// to `hw_cost_factors`; the actual EMA persist shipped via
+/// `sla_ema_state` instead, so 055 (and 042's `hw_cost_factors` itself)
+/// were dead on arrival, and the `M_055` doc-const actively misled.
+/// Once a dead migration ships, the checksum freeze means dropping the
+/// schema needs a SECOND migration. This test fails the first one
+/// before it freezes.
+///
+/// Corpus is concatenated `.rs` source from the PG-querying crates
+/// (rio-store, rio-scheduler, xtask), produced by `rio-store/build.rs`.
+/// NOT `.sqlx/query-*.json` — that only covers `query!`/`query_as!`
+/// macro callsites; the ≈200 non-macro `sqlx::query()` / `QueryBuilder`
+/// sites leave no `.sqlx/` entry. `src/migrations.rs` is excluded so
+/// doc-const prose can't mask a dead table.
+///
+/// **A new table this test flags as dead:** either it IS dead (delete
+/// the migration before it ships), or add it to `ALLOW_DEAD` below
+/// with a one-line rationale naming the consumer-to-be.
+#[test]
+fn every_table_is_queried() {
+    use std::collections::BTreeSet;
+
+    // Tables intentionally present in the schema with zero `.rs`
+    // references. Each entry MUST carry a rationale.
+    const ALLOW_DEAD: &[(&str, &str)] = &[(
+        "hw_cost_factors",
+        "ADR-023 chose sla_ema_state instead; DROP TABLE deferred to a \
+         follow-up migration (042 is frozen)",
+    )];
+
+    // ── Live-table set: CREATE/ALTER add, DROP removes, in version
+    // order. `MIGRATOR.iter()` already yields by ascending version
+    // (sqlx sorts at macro-expansion time) and exposes the embedded
+    // `.sql` body — no separate `include_dir!` needed.
+    //
+    // SQL `--` comment lines are stripped first (017 has the prose
+    // "CREATE TABLE inline REFERENCES" in a comment, which would
+    // otherwise extract a phantom `inline` table). No block comments
+    // exist in `migrations/` today; if one appears the regex simply
+    // misses tables inside it, which is a false negative, not a false
+    // positive — acceptable.
+    let ddl = regex::Regex::new(
+        r"(?x)
+          \b CREATE \s+ TABLE \s+ (?: IF \s+ NOT \s+ EXISTS \s+ )? (?<create> \w+ )
+        | \b ALTER  \s+ TABLE \s+                                  (?<alter>  \w+ )
+        | \b DROP   \s+ TABLE \s+ (?: IF \s+ EXISTS \s+ )?         (?<drop>   \w+ )
+        ",
+    )
+    .unwrap();
+    let mut live: BTreeSet<String> = BTreeSet::new();
+    for m in MIGRATOR.iter() {
+        let stripped: String = m
+            .sql
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for c in ddl.captures_iter(&stripped) {
+            if let Some(t) = c.name("create").or_else(|| c.name("alter")) {
+                live.insert(t.as_str().to_owned());
+            } else if let Some(t) = c.name("drop") {
+                live.remove(t.as_str());
+            }
+        }
+    }
+    // Floor guard: a regex regression that matches nothing would make
+    // the loop below vacuously pass.
+    assert!(live.len() > 20, "parsed only {} live tables", live.len());
+
+    // ── Corpus: `rio-store/build.rs` concats `**/*.rs` from rio-store +
+    // rio-scheduler + xtask (excluding `migrations.rs`) into OUT_DIR.
+    let rs_corpus = include_str!(concat!(env!("OUT_DIR"), "/all_rs.txt"));
+
+    let mut dead = Vec::new();
+    for t in &live {
+        if ALLOW_DEAD.iter().any(|(n, _)| n == t) {
+            continue;
+        }
+        // Word-boundary match so `foo` doesn't satisfy on `foo_bar` /
+        // `foobar`. Table names are `\w+` so `\b` is the right anchor.
+        let re = regex::Regex::new(&format!(r"\b{}\b", regex::escape(t))).unwrap();
+        if !re.is_match(rs_corpus) {
+            dead.push(t.clone());
+        }
+    }
+    assert!(
+        dead.is_empty(),
+        "\n  table(s) declared in migrations/ but never referenced in \
+         rio-store/rio-scheduler/xtask Rust source:\n    {dead:?}\n  \
+         dead schema — delete the migration before it ships, or add to \
+         ALLOW_DEAD with rationale",
+    );
+
+    // Reverse check: ALLOW_DEAD entries that ARE now referenced (or no
+    // longer exist) are stale — drop them so the allowlist doesn't
+    // accrete.
+    for &(t, _) in ALLOW_DEAD {
+        assert!(
+            live.contains(t),
+            "ALLOW_DEAD lists `{t}` but no live migration creates it — remove the entry",
+        );
+        let re = regex::Regex::new(&format!(r"\b{}\b", regex::escape(t))).unwrap();
+        assert!(
+            !re.is_match(rs_corpus),
+            "ALLOW_DEAD lists `{t}` but it IS referenced in Rust source — remove the entry",
         );
     }
 }

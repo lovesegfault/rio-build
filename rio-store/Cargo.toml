@@ -161,6 +161,9 @@ serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 rstest = { workspace = true }
+# every_table_is_queried (tests/migrations.rs): word-boundary table-name
+# search over the OUT_DIR/all_rs.txt corpus produced by build.rs.
+regex = { workspace = true }
 # Self-reference to enable `test-utils` for integration tests under
 # tests/ — those compile the lib as a dep WITHOUT cfg(test), so the
 # feature is the only way they see `test_helpers` / `MIGRATOR`.

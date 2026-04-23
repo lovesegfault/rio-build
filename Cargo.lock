@@ -6796,6 +6796,7 @@ dependencies = [
  "metrics",
  "moka",
  "proptest",
+ "regex",
  "reqwest 0.13.2",
  "rio-auth",
  "rio-common",

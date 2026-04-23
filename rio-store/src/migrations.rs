@@ -877,14 +877,12 @@ pub const M_053: () = ();
 /// +`submitting_tenant` for §Threat-model gap (b) median-of-medians.
 pub const M_054: () = ();
 
-/// `migrations/055_hw_cost_ema_state.sql`
-///
-/// `hw_cost_factors` EMA-state persist (ADR-023 §13a §Cost-model): so a
-/// scheduler lease failover resumes the smoothed price/λ rather than
-/// resetting to seed. `lambda_{num,den}_ema` are the Gamma-Poisson
-/// numerator/denominator; `node_count_ema` is the n_λ floor input.
-/// `updated_at` is NOT added here — 042 already created it.
-pub const M_055: () = ();
+// M_055 deleted: `hw_cost_factors` EMA-state columns were dead schema —
+// the EMA persist they described shipped via `sla_ema_state` (042's
+// other table; see `cost.rs` `CostTable::{load,persist}`). The
+// `hw_cost_factors` base table itself (042) is also dead — DROP
+// deferred to a follow-up migration since 042 is frozen. sqlx tolerates
+// the version gap; renumbering 056-058 would churn `PINNED` for nothing.
 
 /// `migrations/056_build_samples_enable_parallel_checking.sql`
 ///

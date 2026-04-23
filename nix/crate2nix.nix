@@ -236,6 +236,20 @@ let
     root = ../rio-proto;
     fileset = pkgs.lib.fileset.fileFilter (f: f.hasExt "proto") ../rio-proto/proto;
   };
+  # rio-store/build.rs walks `../rio-scheduler/src` + `../xtask/src` to
+  # build the schema-liveness corpus for `every_table_is_queried`
+  # (tests/migrations.rs). Same cross-directory-at-compile-time problem
+  # as `migrations/`: buildRustCrate's src is just `rio-store/`. `.rs`
+  # filter keeps the fileset hash stable across Cargo.toml / proptest-
+  # regression / fixture churn. rio-store's OWN src/ is already present
+  # (it IS the crate being built).
+  pgQuerySrcFileset = pkgs.lib.fileset.toSource {
+    root = ../.;
+    fileset = pkgs.lib.fileset.unions [
+      (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
+      (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../xtask/src)
+    ];
+  };
   # rio-scheduler/src/sla/config.rs::helm_renders_every_sla_key does
   # include_str!("../../../infra/helm/rio-build/templates/scheduler.yaml")
   # — class-level guard against `[sla]` keys helm forgot to render.
@@ -394,7 +408,25 @@ let
     # succeeds without this — but buildTests=true compiles tests/
     # and needs the symlink.
     rio-scheduler = withMigrations;
-    rio-store = withMigrations;
+    # rio-store: withMigrations + sibling-crate src/ symlinks for
+    # build.rs's schema-liveness corpus walk. Separate override (not
+    # folded into `withMigrations`) so editing rio-scheduler/xtask
+    # source doesn't invalidate rio-scheduler's / rio-gateway's own
+    # crate2nix builds.
+    rio-store =
+      attrs:
+      let
+        base = withMigrations attrs;
+      in
+      base
+      // {
+        postUnpack = ''
+          ${base.postUnpack}
+          mkdir -p $NIX_BUILD_TOP/rio-scheduler $NIX_BUILD_TOP/xtask
+          ln -sf ${pgQuerySrcFileset}/rio-scheduler/src $NIX_BUILD_TOP/rio-scheduler/src
+          ln -sf ${pgQuerySrcFileset}/xtask/src $NIX_BUILD_TOP/xtask/src
+        '';
+      };
     rio-gateway = withMigrations;
 
     # include_str!("../../../../../nix/nixos-node/seccomp/...") in
