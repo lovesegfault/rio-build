@@ -22,6 +22,10 @@ spec:
         {{- include "rio.labels" (dict "root" . "name" "rio-controller" "component" "controller") | nindent 8 }}
     spec:
       serviceAccountName: rio-controller
+      {{- if .Values.karpenter.enabled }}
+      nodeSelector:
+        rio.build/node-role: general
+      {{- end }}
       {{- if $c.hostNetwork }}
       # VM-test concession: CoreDNS doesn't know NixOS-test VM hostnames.
       # hostNetwork → pod uses node's /etc/hosts. Production never sets this.

@@ -37,6 +37,13 @@ spec:
         checksum/scheduler-toml: {{ list (toJson $s.softFeatures) (toJson $s.sla) | join "" | sha256sum }}
     spec:
       serviceAccountName: rio-scheduler
+      {{- if .Values.karpenter.enabled }}
+      # Explicit pin to rio-general NodePool. Belt-and-suspenders over
+      # the NodePool's instance-family requirement — keeps control-plane
+      # off the EKS-managed `system` m5.large nodes if those untaint.
+      nodeSelector:
+        rio.build/node-role: general
+      {{- end }}
       {{- include "rio.podSecurityContext" . | nindent 6 }}
       {{- if gt (int $s.replicas) 1 }}
       # REQUIRE different nodes for replicas>1. Both on one node → node drain

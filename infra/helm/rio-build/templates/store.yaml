@@ -28,6 +28,10 @@ spec:
         {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 8 }}
     spec:
       serviceAccountName: rio-store
+      {{- if .Values.karpenter.enabled }}
+      nodeSelector:
+        rio.build/node-role: general
+      {{- end }}
       # ≥ RIO_DRAIN_GRACE_SECS(6) + streamDrainSecs + slack. kubelet
       # SIGKILLs at this deadline; the store's own stream_drain timeout
       # fires first and exits cleanly, so SIGKILL is a backstop for a

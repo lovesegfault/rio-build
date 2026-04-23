@@ -29,6 +29,10 @@ spec:
         {{- include "rio.labels" (dict "root" . "name" "rio-gateway" "component" "gateway") | nindent 8 }}
     spec:
       serviceAccountName: rio-gateway
+      {{- if .Values.karpenter.enabled }}
+      nodeSelector:
+        rio.build/node-role: general
+      {{- end }}
       # ≥ nlbDeregisterSecs (preStop) + drainGraceSecs + sessionDrainSecs +
       # CANCEL_GRACE(5) + slack. kubelet SIGKILLs at this deadline; the
       # gateway's own session_drain timeout fires first and exits cleanly,
