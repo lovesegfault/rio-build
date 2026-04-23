@@ -200,12 +200,12 @@ in
 
   # Fast coverage-infrastructure smoke. ONE scenario in coverage
   # mode, asserts the profraw→lcov pipeline produced real data.
-  # ~5min. In .#ci (blocking) — catches "coverage infra broken"
+  # ~5min. In checks (blocking) — catches "coverage infra broken"
   # without the 25min coverage-full cost. A PSA break went 118
   # commits undetected because coverage-full is backgrounded and
   # its failures were triaged as individual test-gaps instead of a
-  # pipeline-level halt. With cov-smoke in .#ci, infra breaks fail
-  # the merge gate directly.
+  # pipeline-level halt. With cov-smoke in checks, infra breaks
+  # fail the merge gate directly.
   smoke =
     let
       lcov = perTestLcov.${smokeScenario};

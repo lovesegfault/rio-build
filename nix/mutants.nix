@@ -202,7 +202,7 @@ let
       "--package"
       "rio-auth"
       "--file"
-      "src/jwt.rs"
+      "rio-auth/src/jwt.rs"
       "--timeout"
       "30"
     ];

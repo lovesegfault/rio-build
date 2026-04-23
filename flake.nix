@@ -11,7 +11,7 @@
       };
     };
 
-    # Multi-version Nix compat matrix inputs (weekly tier — NOT in .#ci).
+    # Multi-version Nix compat matrix inputs (weekly tier — NOT in checks).
     # See nix/golden-matrix.nix + docs/src/verification.md § Protocol
     # Conformance. Each input provides a nix-daemon binary; the golden
     # conformance suite runs once per daemon to surface protocol-version
@@ -902,7 +902,7 @@
           };
 
           # --------------------------------------------------------------
-          # Mutation testing (weekly tier — NOT in .#ci)
+          # Mutation testing (weekly tier — NOT in checks)
           # --------------------------------------------------------------
           inherit
             (import ./nix/mutants.nix {
@@ -943,10 +943,11 @@
           githubActions = {
             matrix = {
               # Rust + static checks. Derived from config.checks — same
-              # P0525 rationale as .#ci above: a manual list had drifted
-              # to miss executor-seed-layer-parity, node-ami-eval, and
-              # codecov-matrix-sync (the very check P0525 added .#ci
-              # derivation for). Subtract what other matrices already
+              # P0525 rationale as the old .#ci aggregate: a manual list
+              # had drifted to miss executor-seed-layer-parity,
+              # node-ami-eval, and codecov-matrix-sync (the very check
+              # P0525 added that aggregate for, now retired). Subtract
+              # what other matrices already
               # cover (fuzz, vm-test, coverage) plus `build` (clippy/
               # nextest deps already build the workspace). attrNames
               # forces only key names, not values — codecov-matrix-sync's
@@ -1233,7 +1234,7 @@
             # ──────────────────────────────────────────────────────────
             #
             # coverage-full: unit + all VM tests merged. ~25min,
-            # needs KVM (run via nix-build-remote). Output:
+            # needs KVM (run via nix-fast-build --remote). Output:
             #   result/lcov.info   — combined, stripped to workspace paths
             #   result/html/       — genhtml report
             #   result/per-test/   — vm-<scenario>.lcov individual breakdowns
@@ -1245,11 +1246,9 @@
               ln -s ${coverage.full}/html $out
             '';
 
-            # Multi-Nix golden matrix (weekly). Exported Linux-only:
-            # nix-daemon needs a unix socket; macOS matrix not
-            # supported. Under `packages` not `checks` → checks gate
-            # won't build the three extra Nix source trees on every
-            # push.
+            # Multi-Nix golden matrix (weekly). Under `packages` not
+            # `checks` → checks gate won't build the three extra Nix
+            # source trees on every push.
             golden-matrix = goldenMatrix;
             inherit mutants mutants-report-assert;
           };
@@ -1314,9 +1313,10 @@
                   .github/codecov.yml after_n_builds=${toString declared} but coverage matrix has ${toString expected} entries.
                   Update .github/codecov.yml → codecov.notify.after_n_builds to ${toString expected}.
                 '';
-                # Named (not pkgs.emptyFile) so `ls result/` of .#ci shows
-                # which constituent this is — eval-time asserts are invisible
-                # otherwise once they pass.
+                # Named (not pkgs.emptyFile) so `nix log` /
+                # nix-fast-build attribution shows which check this is
+                # — eval-time asserts are invisible otherwise once
+                # they pass.
                 pkgs.runCommand "rio-codecov-matrix-sync" { } "touch $out";
             };
 

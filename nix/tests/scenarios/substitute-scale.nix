@@ -701,7 +701,7 @@ pkgs.testers.runNixOSTest {
         # time — NOT subject to WatchBuild stream serialization (gRPC
         # stream → grpcurl → journalctl trickles events serially even
         # when the actor dispatches all 49 in one burst, so an anchored
-        # `grep -c` sees only the first 1-2 under .#ci contention).
+        # `grep -c` sees only the first 1-2 under gate contention).
         # Eager: one MergeDag burst → +49. Lazy: depth-50 chain at
         # ~1/tick → +1-4 at first sighting. cache_check_failures /
         # topdown_prune are diagnostic deltas printed on failure.
@@ -729,7 +729,7 @@ pkgs.testers.runNixOSTest {
 
         # Anchor: first SUBSTITUTING event in the WatchBuild stream —
         # proves MergeDag completed (absorbs SubmitBuild + merge-phase
-        # latency under .#ci builder contention). The counter scrape
+        # latency under gate builder contention). The counter scrape
         # AFTER this point sees the full burst.
         k3s_server.wait_until_succeeds(
             "journalctl -u subchain-submit --no-pager "

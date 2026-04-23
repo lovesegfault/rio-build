@@ -93,7 +93,7 @@ pkgs.stdenvNoCC.mkDerivation {
   '';
 
   # lint → test → build. `pnpm run build` = `svelte-check && vite build`.
-  # All three must pass for a green dashboard check in .#ci.
+  # All three must pass for a green dashboard check in the gate.
   buildPhase = ''
     runHook preBuild
     pnpm run lint

@@ -1,4 +1,4 @@
-# Multi-Nix golden conformance matrix (weekly tier — NOT in .#ci).
+# Multi-Nix golden conformance matrix (weekly tier — NOT in checks).
 #
 # Runs `cargo-nextest run -E 'binary(golden_conformance)'` once per daemon
 # variant, each pointing at a different nix-daemon binary. Surfaces wire-

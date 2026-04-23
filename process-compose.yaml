@@ -13,8 +13,8 @@
 # `--eval-store auto` due to a Nix client bug (applies to any ssh-ng store,
 # not just rio-gateway).
 #
-# Controller is excluded (needs a K8s API server). Worker runs in a QEMU
-# microVM (rio-builder-vm, disabled by default — start from TUI or CLI).
+# Controller and builder are excluded (controller needs a K8s API server;
+# builder needs FUSE/namespaces — run via the k3s VM tests instead).
 
 version: "0.5"
 
@@ -132,28 +132,3 @@ processes:
       initial_delay_seconds: 5
       period_seconds: 5
       failure_threshold: 100
-
-  # Worker in a QEMU microVM (needs KVM). Disabled by default — start from
-  # the process-compose TUI (select it, press 's') or via CLI.
-  rio-builder-vm:
-    command: |
-      set -euo pipefail
-      if [ ! -e /dev/kvm ]; then
-        echo "Worker VM requires KVM (/dev/kvm not found), skipping"
-        exit 0
-      fi
-      nix build .#worker-vm -o result-worker-vm --log-format bar-with-logs
-      exec result-worker-vm/bin/run-rio-builder-dev-vm
-    disabled: true
-    depends_on:
-      rio-scheduler:
-        condition: process_healthy
-    readiness_probe:
-      exec:
-        command: curl -sf http://127.0.0.1:9193/readyz
-      initial_delay_seconds: 30
-      period_seconds: 5
-      failure_threshold: 100 # VM boot + worker connecting to scheduler
-    shutdown:
-      signal: 2 # SIGINT for clean QEMU shutdown
-      timeout_seconds: 30

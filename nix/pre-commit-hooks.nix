@@ -47,8 +47,8 @@
   # fails to compile — so `cargo check` on the crates that
   # use query! is the definitive staleness check. ~5s
   # incremental. Fires only on .rs changes to skip docs-only
-  # commits. CI (`.#ci`) catches the same failure via the
-  # clippy/nextest builds, so this hook is dev-ergonomics:
+  # commits. CI catches the same failure via the clippy/nextest
+  # builds, so this hook is dev-ergonomics:
   # fail at commit time instead of 10min later.
   sqlx-prepare-check = {
     enable = true;

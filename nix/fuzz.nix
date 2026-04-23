@@ -263,7 +263,8 @@ let
       # -fork=N spawns N libFuzzer workers that share corpus. Cap at
       # 16: wall time is fixed (-max_total_time), so more workers =
       # more inputs covered but also more CPU stolen from the rest of
-      # `.#ci` (10 targets × 192 cores = 1920 procs on the big box).
+      # the checks gate (10 targets × 192 cores = 1920 procs on the
+      # big box).
       # Workers write to fuzz-*.log; dump those on failure so crash
       # stacks land in the Nix build log.
       cores=''${NIX_BUILD_CORES:-1}

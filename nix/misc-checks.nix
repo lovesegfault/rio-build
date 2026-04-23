@@ -235,7 +235,7 @@ in
   # imageTag`) is the primary enforcement; this is the CI-time
   # backstop that fires if that filter regresses or an image attr
   # ever produces non-zstd output — otherwise the failure surfaces
-  # only at deploy-time skopeo, which .#ci can't exercise.
+  # only at deploy-time skopeo, which the checks gate can't exercise.
   docker-images-linkfarm-are-archives =
     pkgs.runCommand "rio-docker-images-are-archives"
       {
@@ -296,12 +296,12 @@ in
   # same skopeo transcode push.rs would do and asserts every
   # resulting blob is present in the seed. Builds the
   # builder+fetcher images — but those are already in the
-  # VM-test closure, so no extra cold-cache cost in .#ci.
+  # VM-test closure, so no extra cold-cache cost in the gate.
   executor-seed-layer-parity = dockerImages.executorSeedLayerParity;
 
   # Eval-only: instantiate both AMI nixosSystems so a typo in
   # the seedImages wiring (or any nixos-node module change)
-  # fails .#ci without building the multi-GB disk image.
+  # fails the gate without building the multi-GB disk image.
   # drvPath forces full module eval; unsafeDiscardStringContext
   # prevents the drvPath's context from making this derivation
   # depend on actually BUILDING the AMI.

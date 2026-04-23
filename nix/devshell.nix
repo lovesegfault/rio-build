@@ -2,7 +2,7 @@
 #
 # Default = nightly so `cargo fuzz run` works out of the box. CI builds
 # use stable (rustStable via crate2nix), so if you write nightly-only
-# code, checks.clippy / checks.nextest will catch it.
+# code, checks.clippy-* / checks.nextest-* will catch it.
 #
 # Use `nix develop .#stable` for strict CI-parity dev.
 {

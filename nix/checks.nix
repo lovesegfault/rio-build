@@ -854,10 +854,10 @@ in
   inherit covProfraw;
   coverage = coverageLcov;
 
-  # Aggregate checks (CI entry points). All of these go in checks.*:
-  #   checks.clippy  — fails if any workspace member has clippy warnings
-  #   checks.nextest — fails if any test binary exits nonzero
-  #   checks.doc     — fails if rustdoc errors on any member
+  # Aggregate checks. The granular per-member maps (clippy,
+  # clippyTest, doc, nextestRuns) are what populate checks.*;
+  # these aggregates remain for callers that want a single entry
+  # point.
   clippyCheck = clippyAll;
   docCheck = docAll;
 

@@ -228,8 +228,8 @@ in
   #   Lix. Lix is policy-frozen at daemon protocol 1.35, so this
   #   exercises rio's MIN_CLIENT_VERSION floor and the ≥1.37
   #   BuildResult.cpu_* gate against a real ssh-ng client end-to-end.
-  #   Single Lix test in .#ci — wire-level Lix-as-daemon coverage lives
-  #   in the weekly .#golden-matrix.
+  #   Single Lix test in checks — wire-level Lix-as-daemon coverage
+  #   lives in the weekly .#golden-matrix.
   vm-protocol-warm-lix-standalone = protocol {
     inherit pkgs common;
     nameSuffix = "-lix";
@@ -696,8 +696,8 @@ in
   #   builder pods for the leaves. ~7min (k3s + cache-seed + 90s poll).
   #
   # Distinct runNixOSTest name (rio-substitute-scale) — NOT a variant
-  # of rio-componentscaler / rio-substitute, so .#ci aggregate doesn't
-  # collide.
+  # of rio-componentscaler / rio-substitute, so the derivation name
+  # doesn't collide.
   #
   # jwtEnabled: substitution is tenant-scoped (try_substitute_on_miss
   # short-circuits without x-rio-tenant-token); the gateway must mint
