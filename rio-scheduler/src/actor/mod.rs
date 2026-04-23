@@ -146,8 +146,8 @@ pub const SUBSTITUTE_FETCH_MAX_ATTEMPTS: u32 = 8;
 /// r[sched.substitute.detached+2]
 pub const SUBSTITUTE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-/// Re-mint cadence for [`SubstituteAuth`](dispatch::SubstituteAuth)
-/// inside `walk_substitute_closure`'s serial `'paths` loop. The
+/// Re-mint cadence for `dispatch::SubstituteAuth` inside
+/// `walk_substitute_closure`'s serial `'paths` loop. The
 /// per-layer mint covers the `BatchQueryPathInfo` fast-path; the
 /// per-path QPI loop within a layer is serial and a wide cold layer
 /// (hundreds of paths × store-side `SUBSTITUTE_ADMISSION_WAIT` /

@@ -2,168 +2,122 @@
 #
 # Fuzz crates are their own workspace roots — excluded from the main
 # workspace, each with its own Cargo.lock, needing nightly for
-# libfuzzer-sys. They depend on in-tree crates by path, so the source
-# must include the full workspace Cargo.toml tree.
+# libfuzzer-sys + `-Zsanitizer`. They depend on in-tree crates by path.
 #
 # Two fuzz workspaces:
-#   rio-nix/fuzz    — protocol/wire parsers (lean deps, ~70 crates)
-#   rio-store/fuzz  — manifest parser (pulls full rio-store dep
-#                     tree: tonic, sqlx, aws-sdk-s3, fuse3, protobuf;
-#                     ~470 crates)
+#   rio-nix/fuzz    — protocol/wire parsers (~450 sancov crates)
+#   rio-store/fuzz  — manifest parser (~590 sancov crates; pulls
+#                     rio-store's full dep tree)
 #
-# Build: stdenv.mkDerivation + rustPlatformNightly.importCargoLock +
-# cargoSetupHook. `cargo fuzz build` sets its own RUSTFLAGS (sancov
-# instrumentation: -Cpasses=sancov-module -Zsanitizer=address etc.),
-# so per-crate caching (crate2nix) wouldn't share rlibs with the main
-# workspace anyway — the sancov-instrumented object files are
-# incompatible. A monolithic cargo-fuzz build is the right shape here.
+# Build: per-crate via crate2nix (third + fourth instantiations
+# alongside the main + coverage trees). Same `globalExtraRustcOpts`
+# mechanism as crateBuildCov, but with the exact RUSTFLAGS that
+# `cargo fuzz build --release` injects (extracted from cargo-fuzz
+# src/project.rs — see `fuzzRustcOpts` below).
+#
+# The sancov-instrumented rlibs CAN'T share with the release tree
+# (different codegen), but they cache per-crate within their own tree:
+# editing rio-nix/src rebuilds rio-nix-sancov + the rio-nix-fuzz
+# member (one drv → 9 bins), not the ~450 transitive deps.
 {
   pkgs,
+  lib,
   rustNightly,
-  rustPlatformNightly,
+  crate2nixSrc,
+  sysCrateEnv,
   unfilteredRoot,
-  # Full workspace fileset. Narrowed below to manifests-only for crates
-  # outside each fuzz workspace's path-dep closure — cargo's resolver
-  # needs every [workspace.members] entry's Cargo.toml present (sqlx-
-  # macros runs `cargo metadata` to find the workspace root, and that
-  # validates all members), but not their source.
-  workspaceFileset,
+  # Main-workspace per-crate srcs (rio-nix, rio-store, rio-auth, …).
+  # Reused so the fuzz tree's path-dep crates get the SAME isolated
+  # store hashes as the release tree's — editing rio-cli leaves
+  # rio-nix-sancov untouched.
+  memberSrcs,
 }:
 let
-  inherit (pkgs.lib) fileset;
-  rustTarget = pkgs.stdenv.hostPlatform.rust.rustcTarget;
+  inherit (lib) fileset;
 
-  # All Cargo.toml files in the workspace. Gives cargo metadata what
-  # it needs without dragging in full crate source.
-  manifestFiles = fileset.intersection workspaceFileset (
-    fileset.fileFilter (f: f.name == "Cargo.toml") unfilteredRoot
-  );
+  # cargo-fuzz's RUSTFLAGS for `cargo fuzz build --release` on Linux,
+  # default sanitizer (address). Extracted from cargo-fuzz
+  # src/project.rs::cargo() — defaults: trace-compares ON, branch-
+  # folding disabled, stack-depth ON (linux-only), cfg fuzzing ON,
+  # debug-assertions OFF (--release), codegen-units=1 (release default
+  # — sancov breaks ThinLTO function imports otherwise).
+  # has_sanitizers_on_stable() is u32::MAX-gated → -Zsanitizer (not
+  # -Csanitizer) and no -Zunstable-options.
+  fuzzRustcOpts = [
+    "-Cpasses=sancov-module"
+    "-Cllvm-args=-sanitizer-coverage-level=4"
+    "-Cllvm-args=-sanitizer-coverage-inline-8bit-counters"
+    "-Cllvm-args=-sanitizer-coverage-pc-table"
+    "-Cllvm-args=-sanitizer-coverage-trace-compares"
+    "--cfg=fuzzing"
+    "-Cllvm-args=-simplifycfg-branch-fold-threshold=0"
+    "-Zsanitizer=address"
+    "-Cllvm-args=-sanitizer-coverage-stack-depth"
+    "-Ccodegen-units=1"
+  ];
 
-  # Builder for a fuzz-workspace build derivation.
-  # `fuzzDir` is relative to the repo root (e.g., "rio-nix/fuzz").
-  # `cargoLock` is the Nix path to that workspace's lockfile.
-  # `targets` is the list of `[[bin]]` names in its Cargo.toml.
-  # `pathDeps` is the transitive in-tree path-dep closure (filesets,
-  #   relative to unfilteredRoot) — narrowing src to this set instead
-  #   of the full workspace means edits to unrelated crates don't
-  #   invalidate the ~540-crate sancov-instrumented monolith.
-  # `extraNativeBuildInputs` / `extraBuildInputs` extend the base
-  #   (rio-store fuzz needs protobuf+cmake+fuse3 because rio-store
-  #   transitively builds rio-proto's build.rs and links fuse3).
-  mkFuzzWorkspace =
+  # Per-fuzz-workspace crate2nix instantiation. `resolvedJson` is the
+  # workspace's checked-in Cargo.json (regenerated alongside the root
+  # one by `cargo xtask regen cargo-json`). `fuzzCrateSrc` is the
+  # fileset for the fuzz crate itself; `memberSrcs` covers the
+  # path-dep in-tree crates (and workspace-hack, which the
+  # crate2nix.nix interceptor stubs to zero deps regardless).
+  #
+  # `workspaceSrc` is set to the fuzz crate's own src — this is what
+  # build-from-json.nix uses for `source.path: "."` (the fuzz crate).
+  # All other locals (rio-nix, rio-store, …) have `source.path:
+  # "../.."`-style paths that would resolve outside the store, but the
+  # `memberSrcs` interceptor in crate2nix.nix replaces those by
+  # crateName before build-from-json's bad path is ever read.
+  mkFuzzBuild =
     {
-      fuzzDir,
-      cargoLock,
-      targets,
-      pathDeps,
-      extraNativeBuildInputs ? [ ],
-      extraBuildInputs ? [ ],
+      resolvedJson,
+      fuzzCrateName,
+      fuzzCrateSrc,
     }:
-    let
-      cargoDeps = rustPlatformNightly.importCargoLock {
-        lockFile = cargoLock;
+    import ./crate2nix.nix {
+      inherit
+        pkgs
+        lib
+        sysCrateEnv
+        crate2nixSrc
+        resolvedJson
+        ;
+      rust = rustNightly;
+      localExtraRustcOpts = fuzzRustcOpts;
+      workspaceSrc = fuzzCrateSrc;
+      memberSrcs = memberSrcs // {
+        ${fuzzCrateName} = fuzzCrateSrc;
       };
-    in
-    pkgs.stdenv.mkDerivation {
-      pname = "rio-fuzz-${builtins.replaceStrings [ "/" ] [ "-" ] fuzzDir}";
-      version = "0.0.0";
-
-      src = fileset.toSource {
-        root = unfilteredRoot;
-        fileset = fileset.unions (
-          [
-            (unfilteredRoot + "/Cargo.toml")
-            (unfilteredRoot + "/Cargo.lock")
-            manifestFiles
-            (unfilteredRoot + "/workspace-hack")
-            (unfilteredRoot + "/${fuzzDir}/Cargo.toml")
-            (unfilteredRoot + "/${fuzzDir}/Cargo.lock")
-            (unfilteredRoot + "/${fuzzDir}/fuzz_targets")
-          ]
-          ++ pathDeps
-        );
-      };
-
-      # cargo metadata also validates each member's auto-detected
-      # targets (src/lib.rs / src/main.rs) exist. Stub them for
-      # members whose source we excluded — those crates aren't in the
-      # fuzz dep graph so the stubs are never compiled.
-      postPatch = ''
-        for m in */Cargo.toml; do
-          d=''${m%/Cargo.toml}
-          [ -d "$d/src" ] && continue
-          mkdir -p "$d/src"
-          touch "$d/src/lib.rs" "$d/src/main.rs"
-        done
-      '';
-
-      inherit cargoDeps;
-      # cargoSetupHook validates $src/$cargoRoot/Cargo.lock against
-      # the vendored lockfile. Without this, it compares the MAIN
-      # workspace's Cargo.lock at source root — which differs (the
-      # fuzz crate is its own workspace with its own lockfile).
-      cargoRoot = fuzzDir;
-
-      nativeBuildInputs =
-        (with pkgs; [
-          pkg-config
-          cargo-fuzz
-          rustPlatformNightly.cargoSetupHook
-        ])
-        ++ [ rustNightly ]
-        ++ extraNativeBuildInputs;
-
-      buildInputs =
-        (with pkgs; [
-          openssl
-          llvmPackages.libclang.lib
-        ])
-        ++ extraBuildInputs;
-
-      LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-      PROTOC = "${pkgs.protobuf}/bin/protoc";
-      # sqlx::query! macros read .sqlx/ instead of a live DB. Without
-      # this, the rio-store-fuzz build fails on queries.rs with
-      # "set DATABASE_URL ... or run cargo sqlx prepare".
-      SQLX_OFFLINE = "true";
-
-      # cmake is in nativeBuildInputs for aws-lc-sys's build.rs, not
-      # for this derivation's configurePhase. The cmake setup hook
-      # auto-injects a cmake configurePhase that looks for
-      # CMakeLists.txt at source root — there isn't one.
-      dontUseCmakeConfigure = true;
-
-      # cargoSetupHook vendors into cargo-vendor-dir/ at top level;
-      # the cd into ${fuzzDir} below means cargo sees the vendored
-      # deps via the .cargo/config.toml that cargoSetupHook writes.
-      # cargo-fuzz itself doesn't read the hook's config — cargo does.
-      #
-      # cargo fuzz build sets RUSTFLAGS internally (sancov module,
-      # -Zsanitizer=address). --release for optimized throughput;
-      # the 2min check runs want coverage, not debug symbols.
-      buildPhase = ''
-        runHook preBuild
-        cd ${fuzzDir}
-        cargo fuzz build --release
-        runHook postBuild
-      '';
-
-      # cargo-fuzz writes binaries to target/<triple>/release/ (the
-      # --target flag is implicit — cargo-fuzz always cross-compiles
-      # to the host triple so linking libfuzzer works on Linux).
-      installPhase = ''
-        runHook preInstall
-        mkdir -p $out/bin
-        for t in ${pkgs.lib.concatStringsSep " " targets}; do
-          cp target/${rustTarget}/release/$t $out/bin/
-        done
-        runHook postInstall
-      '';
+      # libFuzzer's main() is in the asan-linked binary; stripping
+      # would drop the sancov counter sections libFuzzer reads.
+      stripBins = false;
     };
 
-  # rio-nix fuzz target names. Used both as the `targets` list for
-  # the build derivation and to generate the per-target
-  # (target, fuzzBuild, corpusRoot) triples below.
+  rio-nix-fuzz-build = mkFuzzBuild {
+    resolvedJson = ../rio-nix/fuzz/Cargo.json;
+    fuzzCrateName = "rio-nix-fuzz";
+    fuzzCrateSrc = fileset.toSource {
+      root = ../rio-nix/fuzz;
+      fileset = fileset.unions [
+        ../rio-nix/fuzz/Cargo.toml
+        ../rio-nix/fuzz/fuzz_targets
+      ];
+    };
+  };
+
+  rio-store-fuzz-build = mkFuzzBuild {
+    resolvedJson = ../rio-store/fuzz/Cargo.json;
+    fuzzCrateName = "rio-store-fuzz";
+    fuzzCrateSrc = fileset.toSource {
+      root = ../rio-store/fuzz;
+      fileset = fileset.unions [
+        ../rio-store/fuzz/Cargo.toml
+        ../rio-store/fuzz/fuzz_targets
+      ];
+    };
+  };
+
   rioNixFuzzTargets = [
     "wire_primitives"
     "opcode_parsing"
@@ -176,63 +130,21 @@ let
     "stderr_message_parsing"
   ];
 
-  # rio-nix fuzz: wire/protocol parsers. Lean — rio-nix has zero
-  # in-tree path-deps beyond workspace-hack.
-  rio-nix-fuzz-build = mkFuzzWorkspace {
-    fuzzDir = "rio-nix/fuzz";
-    cargoLock = unfilteredRoot + "/rio-nix/fuzz/Cargo.lock";
-    targets = rioNixFuzzTargets;
-    pathDeps = [
-      (unfilteredRoot + "/rio-nix/src")
-      (unfilteredRoot + "/rio-nix/Cargo.toml")
-    ];
-  };
-
-  # rio-store fuzz: manifest parser. Heavy — pulls in the full
-  # rio-store dep tree (it's path = ".." in the fuzz Cargo.toml).
-  # Needs the same native deps as the main workspace build. pathDeps
-  # closure derived from rio-store/fuzz/Cargo.lock's `name = "rio-*"`
-  # entries. .sqlx + migrations: rio-store unconditionally compiles
-  # sqlx::query! / sqlx::migrate! which read these at compile time.
-  rio-store-fuzz-build = mkFuzzWorkspace {
-    fuzzDir = "rio-store/fuzz";
-    cargoLock = unfilteredRoot + "/rio-store/fuzz/Cargo.lock";
-    targets = [
-      "manifest_deserialize"
-    ];
-    pathDeps = [
-      (unfilteredRoot + "/rio-store/src")
-      (unfilteredRoot + "/rio-store/Cargo.toml")
-      (unfilteredRoot + "/rio-auth")
-      (unfilteredRoot + "/rio-common")
-      (unfilteredRoot + "/rio-proto")
-      (unfilteredRoot + "/rio-nix/src")
-      (unfilteredRoot + "/rio-nix/Cargo.toml")
-      (unfilteredRoot + "/migrations")
-      (fileset.maybeMissing (unfilteredRoot + "/.sqlx"))
-    ];
-    extraNativeBuildInputs = with pkgs; [
-      protobuf
-      cmake
-    ];
-    extraBuildInputs = with pkgs; [
-      fuse3
-    ];
-  };
-
-  # Flat list of (target, fuzzBuild, corpusRoot) for generating
-  # the per-target run derivations. All target names must be unique
+  # Flat list of (target, fuzzBins, corpusRoot) for generating the
+  # per-target run derivations. All target names must be unique
   # across workspaces (they become attr names in `runs` below).
+  # `fuzzBins` is the workspace member's built crate — buildRustCrate
+  # puts every `[[bin]]` under $out/bin/.
   fuzzTargets =
     (map (t: {
       target = t;
-      fuzzBuild = rio-nix-fuzz-build;
+      fuzzBins = rio-nix-fuzz-build.members.rio-nix-fuzz;
       corpusRoot = unfilteredRoot + "/rio-nix/fuzz/corpus";
     }) rioNixFuzzTargets)
     ++ [
       {
         target = "manifest_deserialize";
-        fuzzBuild = rio-store-fuzz-build;
+        fuzzBins = rio-store-fuzz-build.members.rio-store-fuzz;
         corpusRoot = unfilteredRoot + "/rio-store/fuzz/corpus";
       }
     ];
@@ -244,7 +156,7 @@ let
   mkFuzzCheck =
     {
       target,
-      fuzzBuild,
+      fuzzBins,
       corpusRoot,
     }:
     let
@@ -253,7 +165,7 @@ let
     in
     pkgs.runCommand "rio-fuzz-${target}" { } ''
       workCorpus=$(mktemp -d)
-      ${pkgs.lib.optionalString hasCorpus ''
+      ${lib.optionalString hasCorpus ''
         cp -r ${seedCorpus}/. "$workCorpus"/
         chmod -R u+w "$workCorpus"
       ''}
@@ -268,7 +180,7 @@ let
       # Workers write to fuzz-*.log; dump those on failure so crash
       # stacks land in the Nix build log.
       cores=''${NIX_BUILD_CORES:-1}
-      ${fuzzBuild}/bin/${target} "$workCorpus" \
+      ${fuzzBins}/bin/${target} "$workCorpus" \
         -max_total_time=120 \
         -timeout=30 \
         -print_final_stats=1 \
@@ -283,9 +195,13 @@ let
     '';
 in
 {
-  # Per-crate build derivations, exposed under legacyPackages.fuzz-builds
-  # for debugging (`nix build .#fuzz-builds.rio-nix-fuzz-build && ls result/bin/`).
-  builds = { inherit rio-nix-fuzz-build rio-store-fuzz-build; };
+  # Per-workspace crate2nix tree, exposed under
+  # legacyPackages.fuzz-builds for debugging
+  # (`nix build .#fuzz-builds.rio-nix-fuzz && ls result/bin/`).
+  builds = {
+    inherit (rio-nix-fuzz-build.members) rio-nix-fuzz;
+    inherit (rio-store-fuzz-build.members) rio-store-fuzz;
+  };
 
   # 2min fuzz runs. Keys: "fuzz-<target>". Spliced into `checks.*`.
   runs = builtins.listToAttrs (

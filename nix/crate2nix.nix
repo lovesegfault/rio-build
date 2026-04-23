@@ -19,20 +19,21 @@
 {
   pkgs,
   lib,
-  # rust-overlay stable toolchain (edition 2024). nixpkgs' packaged
-  # rustc lags; build-from-json.nix plumbs this through to every
-  # buildRustCrate invocation.
-  rustStable,
+  # rust-overlay toolchain (edition 2024). nixpkgs' packaged rustc
+  # lags; build-from-json.nix plumbs this through to every
+  # buildRustCrate invocation. Main workspace + coverage use stable;
+  # fuzz uses nightly (libfuzzer-sys + -Zsanitizer).
+  rust,
   # The crate2nix flake source tree. We only need
   # lib/build-from-json.nix from it (packages.default is the CLI).
   crate2nixSrc,
   # Workspace root — must match what `crate2nix generate` ran against.
   # Fileset-filtered to avoid rebuilds on .claude/ or doc churn.
   workspaceSrc,
-  # Per-member filesets for src isolation. Each entry's value is a
-  # `lib.fileset` rooted under `../<name>`. Members not listed fall
-  # back to `workspaceSrc + "/<name>"` (the build-from-json default).
-  memberFilesets ? { },
+  # Per-crate src isolation. Maps crateName → store path (the result
+  # of `lib.fileset.toSource`). Local crates not listed fall back to
+  # build-from-json's `workspaceSrc + "/<source.path>"` resolution.
+  memberSrcs ? { },
   # Path to the pre-resolved JSON (checked in at repo root).
   resolvedJson ? ../Cargo.json,
   # Whether to strip binaries in workspaceBins/memberBins. Coverage
@@ -47,6 +48,15 @@
   # parallel instrumented tree with `-Cinstrument-coverage`.
   # Empty = no wrap.
   globalExtraRustcOpts ? [ ],
+  # Extra rustc flags applied only to crates listed in `memberSrcs`
+  # (= local in-tree crates). The fuzz tree uses this for sancov+asan
+  # instrumentation: cargo-fuzz instruments EVERYTHING via RUSTFLAGS,
+  # which buildRustCrate can't replicate (it has no host/target split,
+  # so build-deps and proc-macros would also be instrumented and then
+  # fail to link/load without the asan runtime). Restricting to local
+  # crates is the unit-fuzz compromise — libFuzzer's coverage signal
+  # comes from the code under test (rio-*), not from serde/tokio.
+  localExtraRustcOpts ? [ ],
 }:
 let
   # ──────────────────────────────────────────────────────────────────
@@ -77,14 +87,14 @@ let
   # `.override { defaultCrateOverrides }` branch must be skipped for
   # this to work; we arrange that by NOT passing our custom overrides
   # to build-from-json.nix (they're already baked into `base` here).
-  remapOpts = [ "--remap-path-prefix=${rustStable}=/rustc" ];
+  remapOpts = [ "--remap-path-prefix=${rust}=/rustc" ];
 
   buildRustCrateForPkgs =
     cratePkgs:
     let
       base = cratePkgs.buildRustCrate.override {
-        rustc = rustStable;
-        cargo = rustStable;
+        rustc = rust;
+        cargo = rust;
         inherit defaultCrateOverrides;
       };
     in
@@ -113,6 +123,7 @@ let
       # per-member fileset from flake.nix; content-identical, hash-
       # independent. memberFilesets keys must match Cargo.json's
       # source.path (= crate dir name, which == crateName here).
+      isLocal = memberSrcs ? ${crate_.crateName};
       crate_' =
         if crate_.crateName == "workspace-hack" then
           crate_
@@ -121,7 +132,7 @@ let
             buildDependencies = [ ];
             src = memberSrcs.workspace-hack or crate_.src;
           }
-        else if memberSrcs ? ${crate_.crateName} then
+        else if isLocal then
           crate_ // { src = memberSrcs.${crate_.crateName}; }
         else
           crate_;
@@ -129,7 +140,11 @@ let
     (base (
       crate_'
       // {
-        extraRustcOpts = remapOpts ++ globalExtraRustcOpts ++ (crate_'.extraRustcOpts or [ ]);
+        extraRustcOpts =
+          remapOpts
+          ++ globalExtraRustcOpts
+          ++ lib.optionals isLocal localExtraRustcOpts
+          ++ (crate_'.extraRustcOpts or [ ]);
       }
       // lib.optionalAttrs (globalExtraRustcOpts != [ ]) {
         # Discard build-time profraws. Test runners override at
@@ -167,26 +182,6 @@ let
   # migrations dir next to the crate src. Same trick Naersk users apply;
   # crate2nix issue #17 tracks the upstream limitation.
   #
-  # ──────────────────────────────────────────────────────────────────
-  # Per-crate source isolation
-  # ──────────────────────────────────────────────────────────────────
-  #
-  # build-from-json.nix resolves local crate srcs as
-  # `workspaceSrc + "/<crate>"` — a subpath of ONE store hash. Editing
-  # rio-cli rehashes workspaceSrc → invalidates every member. We
-  # intercept at buildRustCrateForPkgs (above) and replace `src` with
-  # a per-member `lib.fileset.toSource` rooted at the crate dir.
-  # buildRustCrate's unpack copies the store path to $NIX_BUILD_TOP
-  # and `workspace_member` defaults to "." (Cargo.toml at root), so a
-  # crate-root-shaped src works without sourceRoot games.
-  memberSrcs = lib.mapAttrs (
-    name: fileset:
-    lib.fileset.toSource {
-      root = ../. + "/${name}";
-      inherit fileset;
-    }
-  ) memberFilesets;
-
   migrationsFileset = pkgs.lib.fileset.toSource {
     root = ../migrations;
     fileset = ../migrations;
@@ -393,6 +388,20 @@ let
     # include_str!("../../../../../nix/nixos-node/seccomp/...") in
     # pool tests — compile-time file read crossing crate boundary.
     rio-controller = withSeccompProfiles;
+
+    # build.rs compiles libFuzzer's C++ via the `cc` crate. stdenv's
+    # g++ (NOT clang — see below) plus -fsanitize=address so the C++
+    # internals (FuzzWithFork's merge step in particular) are
+    # asan-instrumented and don't trip __interceptor_memset on
+    # std::vector ops with negative-size-param. cargo-fuzz only
+    # instruments the Rust side, but it cross-compiles with --target
+    # which makes rustc link the asan-aware C++ runtime; buildRustCrate
+    # has no host/target split, so we instrument the C++ directly.
+    # clangStdenv was tried first — its libc++/libstdc++ mix vs the
+    # binary's gcc-lib RUNPATH caused the same false positive.
+    libfuzzer-sys = _: {
+      CXXFLAGS = "-fsanitize=address";
+    };
   };
 
   cargoNix = import "${crate2nixSrc}/lib/build-from-json.nix" {
@@ -422,7 +431,7 @@ let
   binSuffix = if stripBins then "" else "-cov";
   scrubBins =
     name: drvBin:
-    pkgs.runCommand name { disallowedReferences = [ rustStable ]; } ''
+    pkgs.runCommand name { disallowedReferences = [ rust ]; } ''
       mkdir -p $out/bin
       cp -L ${drvBin}/* $out/bin/
       ${lib.optionalString stripBins ''

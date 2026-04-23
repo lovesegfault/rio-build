@@ -356,10 +356,12 @@
             inherit
               pkgs
               rustNightly
-              rustPlatformNightly
+              sysCrateEnv
               unfilteredRoot
-              workspaceFileset
+              memberSrcs
               ;
+            inherit (pkgs) lib;
+            crate2nixSrc = inputs.crate2nix;
           };
 
           # Spec-coverage CLI + web dashboard. The SPA is built via
@@ -401,18 +403,35 @@
           # .claude/notes/crate2nix-migration-assessment.md for the
           # rationale and caveats. Exposed below as
           # packages.workspace + packages.rio-<crate>.
+          # Per-crate src isolation: build-from-json.nix resolves local
+          # crate srcs as `workspaceSrc + "/<path>"` — a subpath of ONE
+          # store hash. Editing rio-cli rehashes workspaceSrc →
+          # invalidates every member. Precompute a per-member
+          # `lib.fileset.toSource` rooted at the crate dir; crate2nix.nix
+          # intercepts `crate_.src` at buildRustCrateForPkgs.
+          # buildRustCrate's unpack copies the store path to
+          # $NIX_BUILD_TOP and `workspace_member` defaults to "."
+          # (Cargo.toml at root), so a crate-root-shaped src works
+          # without sourceRoot games.
+          memberSrcs = pkgs.lib.mapAttrs (
+            name: fileset:
+            pkgs.lib.fileset.toSource {
+              root = ./. + "/${name}";
+              inherit fileset;
+            }
+          ) memberFilesets;
           mkCrateBuild =
             extra:
             import ./nix/crate2nix.nix (
               {
                 inherit
                   pkgs
-                  rustStable
                   sysCrateEnv
                   workspaceSrc
-                  memberFilesets
+                  memberSrcs
                   ;
                 inherit (pkgs) lib;
+                rust = rustStable;
                 crate2nixSrc = inputs.crate2nix;
               }
               // extra
@@ -1081,7 +1100,7 @@
             helm = subcharts;
             # Compiled fuzz target binaries — `checks.fuzz-*` consume
             # these as inputs. Debug: `nix build
-            # .#legacyPackages.<sys>.fuzz-builds.rio-nix-fuzz-build`.
+            # .#legacyPackages.<sys>.fuzz-builds.rio-nix-fuzz`.
             fuzz-builds = fuzz.builds;
             # Per-member test binaries (`rustc --test`). nextest
             # consumes these via crateChecks.testBins; exposed here

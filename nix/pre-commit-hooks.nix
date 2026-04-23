@@ -95,24 +95,29 @@
           exit 0
         fi
         tmp=$(mktemp -d)
-        # Snapshot Cargo.lock — `cargo metadata` inside
-        # crate2nix can bump transitive deps if the local
-        # cache is cold. Restore via TRAP so the check
-        # has no side effects even if crate2nix fails
-        # under set -e (the old trap only rm'd the
-        # snapshot, leaving a mutated Cargo.lock).
-        cp Cargo.lock "$tmp/Cargo.lock.orig"
-        trap '[ -f "$tmp/Cargo.lock.orig" ] && cp "$tmp/Cargo.lock.orig" Cargo.lock; rm -rf "$tmp"; rm -f Cargo.json.check' EXIT
-        # Generate in workspace root — crate2nix emits path
-        # fields relative to the output file's directory, so
-        # -o $tmp/... would produce ../../root/... paths that
-        # never match the committed Cargo.json.
-        ${crate2nixCli}/bin/crate2nix generate --format json -o Cargo.json.check
-        echo >> Cargo.json.check  # match end-of-file-fixer
-        if ! diff -q Cargo.json Cargo.json.check >/dev/null; then
-          echo 'error: Cargo.json is stale — run `cargo xtask regen cargo-json`'
-          exit 1
-        fi
+        trap 'rm -rf "$tmp"' EXIT
+        # Three workspaces: root + the two fuzz subworkspaces
+        # (each has its own Cargo.lock + Cargo.json consumed by
+        # nix/fuzz.nix). crate2nix emits path fields relative to
+        # the output file's directory, so -o $tmp/... would
+        # produce ../../root/... paths that never match — generate
+        # in-place under .check, diff, then clean up.
+        for dir in . rio-nix/fuzz rio-store/fuzz; do
+          # Snapshot Cargo.lock — `cargo metadata` inside
+          # crate2nix can bump transitive deps if the local
+          # cache is cold. Restore so the check has no side
+          # effects even if crate2nix fails under set -e.
+          cp "$dir/Cargo.lock" "$tmp/Cargo.lock.orig"
+          ( cd "$dir" && ${crate2nixCli}/bin/crate2nix generate --format json -o Cargo.json.check )
+          cp "$tmp/Cargo.lock.orig" "$dir/Cargo.lock"
+          echo >> "$dir/Cargo.json.check"  # match end-of-file-fixer
+          if ! diff -q "$dir/Cargo.json" "$dir/Cargo.json.check" >/dev/null; then
+            rm -f "$dir/Cargo.json.check"
+            echo "error: $dir/Cargo.json is stale — run \`cargo xtask regen cargo-json\`"
+            exit 1
+          fi
+          rm -f "$dir/Cargo.json.check"
+        done
       ''
     );
     files = "(^|/)Cargo\\.(toml|lock)$";
