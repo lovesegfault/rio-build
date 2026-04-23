@@ -18,7 +18,33 @@
 //! caught all three round-2 bugs and the round-1 bugs they shadow.
 
 use super::*;
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use std::collections::BTreeMap;
+
+/// The three counters `solve_intent_for` may emit. After §Third-strike
+/// + arm-on-ack, `compute_spawn_intents` is **side-effect-free except
+/// idempotent memo fill + once-per-miss emits of these** — every other
+/// counter write is a regression of merged_bug_001 / the validator's
+/// r3 BLOCKED finding (per-poll over-emission).
+const ONCE_PER_MISS: &[&str] = &[
+    "rio_scheduler_sla_infeasible_total",
+    "rio_scheduler_sla_hw_ladder_exhausted_total",
+    "rio_scheduler_sla_hw_cost_unknown_total",
+];
+
+/// `(counter-name → Σ label-variants)` from ONE drained snapshot.
+/// `Snapshotter::snapshot` **drains** (counters swap to 0) — never call
+/// it twice expecting cumulative values; always diff against a single
+/// `counter_map` capture.
+fn counter_map(snap: &Snapshotter) -> BTreeMap<String, u64> {
+    let mut m = BTreeMap::new();
+    for (ck, _, _, v) in snap.snapshot().into_vec() {
+        if let DebugValue::Counter(c) = v {
+            *m.entry(ck.key().name().to_owned()).or_default() += c;
+        }
+    }
+    m
+}
 
 /// `(intent_id → node_affinity)` from one `compute_spawn_intents` poll.
 /// `BTreeMap` so equality is order-insensitive on intent_id.
@@ -96,7 +122,37 @@ async fn contract_selector_stability() -> TestResult {
     }
 
     // ── (1a) 8× poll, no state change → identical selectors ────────────
-    let polls: Vec<_> = (0..8).map(|_| affinity_map(&actor)).collect();
+    // Side-effect-free except idempotent memo + once-per-miss emits:
+    // capture the full counter map before/after; ONLY the three
+    // `ONCE_PER_MISS` counters may have moved, and each by ≤ |Ready
+    // drvs| (the first-miss bound — 10 drvs share 1 model_key, so the
+    // actual bound is 1; ≤10 is the loose form that survives fixture
+    // reshuffles). Any other counter delta is a per-poll side effect
+    // the validator's r3 BLOCKED finding flagged.
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let polls: Vec<_> = {
+        let _g = metrics::set_default_local_recorder(&rec);
+        (0..8).map(|_| affinity_map(&actor)).collect()
+    };
+    let after = counter_map(&snap);
+    for (name, &post) in &after {
+        if post == 0 {
+            continue;
+        }
+        assert!(
+            ONCE_PER_MISS.contains(&name.as_str()),
+            "8× no-change poll moved counter `{name}` (0→{post}) — \
+             compute_spawn_intents must be side-effect-free except \
+             once-per-miss emits of {ONCE_PER_MISS:?}"
+        );
+        assert!(
+            post <= polls[0].len() as u64,
+            "`{name}` moved by {post} > |Ready drvs|={} — once-per-miss \
+             bound violated (per-poll over-emission; merged_bug_001 shape)",
+            polls[0].len()
+        );
+    }
     assert_eq!(polls[0].len(), 10, "all 10 Ready drvs intent-eligible");
     assert!(
         polls[0].values().any(|a| !a.is_empty()),
@@ -348,5 +404,138 @@ async fn contract_ice_step_doubles_then_clears_on_registered() {
         actor.ice.step(&cell),
         None,
         "registered_cells is the success edge → clears"
+    );
+}
+
+/// **Metrics once per miss** (`r[sched.sla.hw-class.admissible-set]`):
+/// the three `solve_intent_for` counter emits are gated on `was_miss` —
+/// N polls at fixed `(model_key, inputs_gen)` increment by exactly 1
+/// (the first miss), not N. An `inputs_gen` change is a fresh miss →
+/// +1 more.
+///
+/// Direct guard for the validator's r3 BLOCKED finding: three emit
+/// sites survived arm-on-ack + derived `inputs_gen` and still fired
+/// per-poll (`ladder_exhausted` outside the memo closure; ε_h's
+/// unmemoized `solve_full` re-emitting `hw_cost_unknown`; `intent_for`
+/// fallback re-emitting `infeasible`). Would have caught merged_bug_001
+/// (`BestEffort` not memoized → re-solve + re-emit every poll) and the
+/// "Memoized — fires once per (key, inputs_gen)" comment being false
+/// on two of three paths.
+// r[verify sched.sla.hw-class.admissible-set]
+#[tokio::test]
+async fn contract_metrics_once_per_miss() {
+    use crate::sla::config::CapacityType;
+    const POLLS: usize = 5;
+    const INFEASIBLE: &str = "rio_scheduler_sla_infeasible_total";
+    const LADDER: &str = "rio_scheduler_sla_hw_ladder_exhausted_total";
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let _g = metrics::set_default_local_recorder(&rec);
+
+    // ── (a) BestEffort via DiskCeiling: `_infeasible_total` ────────────
+    // disk_p90=300GiB > max_disk=200GiB → `solve_full` returns
+    // `BestEffort{why=DiskCeiling}`. The hw-aware path memoizes that
+    // result; `was_miss` gates `why.emit()`.
+    let mut fit = make_fit("disk-hog");
+    fit.disk_p90 = Some(crate::sla::types::DiskBytes(300 << 30));
+    actor.sla_estimator.seed(fit);
+    actor.test_inject_ready("d-disk", Some("disk-hog"), "x86_64-linux", false);
+
+    let _ = counter_map(&snap); // drain anything from setup
+    for _ in 0..POLLS {
+        let _ = actor.compute_spawn_intents(&Default::default());
+    }
+    let d = counter_map(&snap);
+    assert_eq!(
+        d.get(INFEASIBLE).copied().unwrap_or(0),
+        1,
+        "`_infeasible_total` must fire once per (model_key, inputs_gen) \
+         miss, not once per poll — {POLLS}× poll at fixed inputs_gen \
+         incremented by ≠1 (BestEffort not memoized OR `was_miss` not \
+         gating `why.emit()`)"
+    );
+
+    // ── (b) ladder exhausted via all-ICE-masked ───────────────────────
+    // Feasible solve, but every (h, cap) cell ICE-masked → A\masked = ∅
+    // → `ladder_exhausted_total{exit=all_masked}` +
+    // `infeasible_total{reason=capacity_exhausted}`. Both gated on
+    // `was_miss`; the ICE mask is read-time (NOT in `inputs_gen`), so
+    // poll 2+ are memo hits → `was_miss=false` → no re-emit. The
+    // `test-pkg` fit from `bare_actor_hw` is feasible.
+    for h in ["intel-6", "intel-7", "intel-8"] {
+        for cap in CapacityType::ALL {
+            actor.ice.mark(&(h.into(), cap));
+        }
+    }
+    assert!(
+        actor
+            .ice
+            .exhausted(["intel-6", "intel-7", "intel-8"].map(String::from).iter()),
+        "precondition: all H × cap masked"
+    );
+    actor.test_inject_ready("d-ice", Some("test-pkg"), "x86_64-linux", false);
+
+    for _ in 0..POLLS {
+        let _ = actor.compute_spawn_intents(&Default::default());
+    }
+    let d = counter_map(&snap);
+    assert_eq!(
+        d.get(LADDER).copied().unwrap_or(0),
+        1,
+        "`_hw_ladder_exhausted_total` must fire once per miss, not once \
+         per poll — was OUTSIDE the memo closure pre-r3 (snapshot.rs \
+         emit-site 1 in the validator's BLOCKED finding)"
+    );
+    assert_eq!(
+        d.get(INFEASIBLE).copied().unwrap_or(0),
+        1,
+        "`CapacityExhausted.emit()` paired with ladder_exhausted must \
+         also fire once per miss"
+    );
+
+    // ── (c) inputs_gen change → fresh miss → +1 each ──────────────────
+    // `apply_stale_clamp` flips a CostTable solve-relevant field →
+    // derived `inputs_gen` changes → next poll is a miss for both
+    // model_keys.
+    let g_before = actor.solve_inputs().2;
+    actor
+        .cost_table
+        .write()
+        .apply_stale_clamp(crate::sla::cost::STALE_CLAMP_AFTER_SECS + 1.0);
+    assert_ne!(actor.solve_inputs().2, g_before, "inputs_gen changed");
+
+    let _ = actor.compute_spawn_intents(&Default::default());
+    let d = counter_map(&snap);
+    assert_eq!(
+        d.get(LADDER).copied().unwrap_or(0),
+        1,
+        "fresh inputs_gen → fresh miss → ladder +1"
+    );
+    // Both `disk-hog` (BestEffort) and `test-pkg` (CapacityExhausted)
+    // re-emit at the new gen.
+    assert_eq!(
+        d.get(INFEASIBLE).copied().unwrap_or(0),
+        2,
+        "fresh inputs_gen → fresh miss → infeasible +1 per model_key"
+    );
+
+    // ── (d) re-poll at the new gen → no further emits ─────────────────
+    for _ in 0..POLLS {
+        let _ = actor.compute_spawn_intents(&Default::default());
+    }
+    let d = counter_map(&snap);
+    assert_eq!(
+        d.get(LADDER).copied().unwrap_or(0),
+        0,
+        "memo hit at new gen"
+    );
+    assert_eq!(
+        d.get(INFEASIBLE).copied().unwrap_or(0),
+        0,
+        "memo hit at new gen"
     );
 }
