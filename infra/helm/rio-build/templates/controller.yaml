@@ -75,6 +75,14 @@ spec:
             - name: RIO_NODEPOOL_BUDGET__SELECTOR
               value: {{ .selector | quote }}
             {{- end }}
+            {{- with .Values.scheduler.sla }}
+            # ADR-023 §13a hw-bench gate: same floor as the scheduler's
+            # `[sla].hw_bench_mem_floor` so the controller's create-time
+            # `rio.build/hw-bench-needed` decision and the scheduler's
+            # threat-model assumption never diverge.
+            - name: RIO_HW_BENCH_MEM_FLOOR
+              value: {{ int64 .hwBenchMemFloor | quote }}
+            {{- end }}
             {{- with $c.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

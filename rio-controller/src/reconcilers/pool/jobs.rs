@@ -29,10 +29,10 @@
 //! untrusted tenant CANNOT leave poisoned cache entries for the
 //! next build — there is no "next build" on that pod.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{Pod, PodSpec, ResourceRequirements};
+use k8s_openapi::api::core::v1::{NodeAffinity, NodeSelector, Pod, PodSpec, ResourceRequirements};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Api, DeleteParams, ListParams};
@@ -50,9 +50,10 @@ use super::job::{
 use super::pod::{self, UpstreamAddrs};
 use crate::error::{Error, Result};
 use crate::reconcilers::admin_call;
+use crate::reconcilers::node_informer::HwClass;
 use crate::reconcilers::{Ctx, KubeErrorExt, require_namespace};
 use rio_crds::pool::{ExecutorKind, Pool};
-use rio_proto::types::SpawnIntent;
+use rio_proto::types::{NodeSelectorTerm, SpawnIntent};
 
 /// Pod-template annotation carrying `SpawnIntent.intent_id`. Read by
 /// the builder via downward-API → `RIO_INTENT_ID` → heartbeat.
@@ -64,6 +65,20 @@ pub(crate) const INTENT_ID_ANNOTATION: &str = "rio.build/intent-id";
 /// (ICE-backoff spot→on-demand fallback) is reaped instead of
 /// NameCollision-blocking the re-solved intent forever.
 pub(crate) const INTENT_SELECTOR_ANNOTATION: &str = "rio.build/intent-selector";
+
+/// Pod-template annotation carrying the controller's create-time
+/// bench-gate decision. `"true"` ⇒ the spawned builder runs the full
+/// K=3 microbench (STREAM/ioseq/alu) before accepting work. Read via
+/// downward-API → `RIO_HW_BENCH_NEEDED` (`rio_builder::Config.
+/// hw_bench_needed`). ADR-023 §13a: fail-closed on the BUILDER side
+/// (annotation absent → skip K=3, only the scalar `alu` probe runs).
+pub(crate) const HW_BENCH_NEEDED_ANNOTATION: &str = "rio.build/hw-bench-needed";
+
+/// `hw_perf_factors` view's `HAVING count(DISTINCT pod_id) >= 3`
+/// floor. The bench-needed gate over-benches at most until every
+/// `h ∈ A` reaches this — `HwTable::factor` ignores under-threshold
+/// rows so duplicate benches before then are harmless.
+pub(crate) const HW_BENCH_SAMPLE_THRESHOLD: u32 = 3;
 
 /// Log + scratch budget. nix `build-dir` lands in the overlay emptyDir
 /// (nix ≥2.30 default = stateDir/builds), but stdout/stderr capture and
@@ -91,6 +106,73 @@ const WORKER_DEADLINE_SLACK_SECS: i64 = 90;
 // r[impl ctrl.ephemeral.intent-deadline]
 pub(super) fn ephemeral_deadline(intent: &SpawnIntent) -> i64 {
     i64::from(intent.deadline_secs).max(180)
+}
+
+/// `hw_class` strings the `HwClassSampled` RPC keys on, recovered from
+/// one intent's allowed-set `A`. Each term encodes one `(h, cap)` cell;
+/// the same `h` may appear under both spot and on-demand —
+/// [`HwSampledCache::fetch`] dedupes across the whole tick.
+pub(super) fn hw_classes_in(terms: &[NodeSelectorTerm]) -> impl Iterator<Item = String> + '_ {
+    terms
+        .iter()
+        .map(|t| HwClass::from_selector_term(t).as_string())
+}
+
+/// Per-tick `HwClassSampled` snapshot: `h → distinct pod_id` from the
+/// scheduler's `HwTable` (~60s stale at worst). One RPC per
+/// pool-reconcile tick covers every intent — the request is the union
+/// of `hw_classes_in` over all intents this tick.
+///
+/// RPC failure / scheduler unreachable → empty map. Unknown `h` reads
+/// as 0 in [`Self::any_under_threshold`], so an outage marks
+/// `hw-bench-needed=true` on every affinity-carrying intent that
+/// clears the mem floor — over-benching, never under-benching. The
+/// mem-floor gate keeps STREAM's ~4.6 GiB working set off small pods
+/// regardless.
+#[derive(Default)]
+pub(crate) struct HwSampledCache(HashMap<String, u32>);
+
+impl HwSampledCache {
+    /// One `HwClassSampled` RPC for the given (deduped) classes.
+    /// Empty input → empty cache (no RPC) so non-hw-targeted ticks
+    /// (Static-mode, FOD-only, fetcher pools) cost nothing.
+    pub(crate) async fn fetch(ctx: &Ctx, hw_classes: HashSet<String>) -> Self {
+        if hw_classes.is_empty() {
+            return Self::default();
+        }
+        match admin_call(ctx.admin.clone().hw_class_sampled(
+            rio_proto::types::HwClassSampledRequest {
+                hw_classes: hw_classes.into_iter().collect(),
+            },
+        ))
+        .await
+        {
+            Ok(r) => Self(r.into_inner().sampled_count),
+            Err(e) => {
+                warn!(error = %e, "HwClassSampled poll failed; treating all as undersampled");
+                Self::default()
+            }
+        }
+    }
+
+    /// `∃ h ∈ A : sampled_count[h] < HW_BENCH_SAMPLE_THRESHOLD`.
+    /// `A = ∅` (no `node_affinity`) is vacuously false — the actual
+    /// `h` is unknown until kube-scheduler bind, so the create-time
+    /// check cannot be applied; the builder still runs the scalar
+    /// `alu` probe. Unknown `h` reads as 0 (under-threshold).
+    pub(crate) fn any_under_threshold<I>(&self, a: I) -> bool
+    where
+        I: IntoIterator<Item = String>,
+    {
+        a.into_iter()
+            .any(|h| self.0.get(&h).copied().unwrap_or(0) < HW_BENCH_SAMPLE_THRESHOLD)
+    }
+
+    /// Test-only constructor.
+    #[cfg(test)]
+    pub(crate) fn from_map(m: HashMap<String, u32>) -> Self {
+        Self(m)
+    }
 }
 
 // r[impl ctrl.pool.ephemeral]
@@ -121,7 +203,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // is unreachable: log + treat as queued=0 + requeue. Next tick
     // retries. We ALSO set a SchedulerUnreachable condition on the
     // Pool so operators can see WHY nothing is spawning.
-    let (intents, scheduler_err): (Vec<SpawnIntent>, Option<String>) =
+    let (mut intents, scheduler_err): (Vec<SpawnIntent>, Option<String>) =
         match queued_for_pool(ctx, pool).await {
             Ok(intents) => (intents, None),
             Err(e) => {
@@ -132,7 +214,27 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                 (Vec::new(), Some(e.to_string()))
             }
         };
+    // ADR-023 §13a ship-standalone gate: forecast intents (`eta > 0` —
+    // deps not yet built) flow through `GetSpawnIntents` so the §13b
+    // `nodeclaim_pool` reconciler can pre-provision, but until that
+    // reconciler exists they MUST NOT spawn Jobs (the pod would
+    // heartbeat, get no assignment for `eta_seconds`, then idle-exit).
+    // Filtered here so `queued`/reap/ack all see one consistent set.
+    // §13b removes this — `placeable` from the NodeClaim FFD sim
+    // becomes the gate instead.
+    intents.retain(|i| i.eta_seconds == 0.0);
     let queued = intents.len().min(u32::MAX as usize) as u32;
+
+    // ---- HwClassSampled (per-tick, one RPC for the union of A's) ----
+    // r[impl ctrl.pool.hw-bench-needed]
+    let hw_sampled = HwSampledCache::fetch(
+        ctx,
+        intents
+            .iter()
+            .flat_map(|i| hw_classes_in(&i.node_affinity))
+            .collect(),
+    )
+    .await;
 
     // ---- Count active Jobs for this pool ----
     // ORDERING (I-183): list AFTER the queued poll. The reap step
@@ -231,7 +333,17 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         &to_spawn_intents,
         &existing_names,
         &name,
-        |intent| build_job(pool, oref.clone(), &ctx.scheduler, &ctx.store, intent),
+        |intent| {
+            build_job(
+                pool,
+                oref.clone(),
+                &ctx.scheduler,
+                &ctx.store,
+                intent,
+                &hw_sampled,
+                ctx.hw_bench_mem_floor,
+            )
+        },
     )
     .await;
     // Ack to the scheduler so it arms the Pending-watch (ICE-backoff)
@@ -353,13 +465,40 @@ async fn queued_for_pool(
     Ok(resp.intents)
 }
 
-/// Stable fingerprint of `SpawnIntent.node_selector`: `k=v,k=v` over
-/// sorted keys. Empty map → "". Only the intent-supplied selector is
-/// fingerprinted (NOT the pool's base selector that
-/// `build_executor_pod_spec` merges in) so drift detection compares
-/// scheduler decisions, not pool config.
-fn selector_fingerprint(sel: &std::collections::HashMap<String, String>) -> String {
-    let mut kv: Vec<_> = sel.iter().map(|(k, v)| format!("{k}={v}")).collect();
+/// Stable fingerprint of an intent's scheduler-decided placement:
+/// `node_affinity` when non-empty (ADR-023 §13a — `k=v|k=v;k=v|...`
+/// over sorted requirements per term, terms sorted), else the legacy
+/// `node_selector` map (`k=v,k=v` over sorted keys). Empty → "". Only
+/// the intent-supplied placement is fingerprinted (NOT the pool's base
+/// selector that `build_executor_pod_spec` merges in) so drift
+/// detection compares scheduler decisions, not pool config.
+///
+/// The §13a scheduler emits `node_selector: {}` (snapshot.rs:350), so
+/// the legacy arm only fires on pre-§13a intents and on the
+/// `node_affinity = []` Static-mode/FOD/feature-gated path.
+fn selector_fingerprint(intent: &SpawnIntent) -> String {
+    if !intent.node_affinity.is_empty() {
+        let mut terms: Vec<String> = intent
+            .node_affinity
+            .iter()
+            .map(|t| {
+                let mut kv: Vec<_> = t
+                    .match_expressions
+                    .iter()
+                    .map(|r| format!("{}={}", r.key, r.values.join("+")))
+                    .collect();
+                kv.sort_unstable();
+                kv.join("|")
+            })
+            .collect();
+        terms.sort_unstable();
+        return terms.join(";");
+    }
+    let mut kv: Vec<_> = intent
+        .node_selector
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
     kv.sort_unstable();
     kv.join(",")
 }
@@ -415,14 +554,13 @@ pub(super) async fn reap_stale_for_intents(
     pool: &str,
     kind: ExecutorKind,
 ) -> HashSet<String> {
-    use std::collections::HashMap;
     let mut reaped = HashSet::new();
     let want: HashMap<String, String> = intents
         .iter()
         .map(|i| {
             (
                 pod::job_name(pool, kind, &intent_suffix(&i.intent_id)),
-                selector_fingerprint(&i.node_selector),
+                selector_fingerprint(i),
             )
         })
         .collect();
@@ -503,6 +641,8 @@ pub(super) fn build_job(
     scheduler: &UpstreamAddrs,
     store: &UpstreamAddrs,
     intent: &SpawnIntent,
+    hw_sampled: &HwSampledCache,
+    hw_bench_mem_floor: u64,
 ) -> Result<Job> {
     let pool_name = pool.name_any();
     // Suffix derives from `intent_id` so a re-polled still-Ready
@@ -534,15 +674,26 @@ pub(super) fn build_job(
         ephemeral_deadline(intent),
         pod_spec,
     );
+    // r[impl ctrl.pool.hw-bench-needed]
+    // ADR-023 §13a bench gate: (a) `mem ≥ hw_bench_mem_floor` so
+    // STREAM's ~4.6 GiB working set cannot OOM a `preferLocalBuild`/
+    // fetcher pod; AND (b) any `h ∈ A` is under the `hw_perf_factors`
+    // 3-distinct-pod_id trust floor. The actual `h` is fixed only at
+    // kube-scheduler bind, so the create-time check is over the whole
+    // `A` — over-benches at most until every `h ∈ A` reaches the floor.
+    let bench_needed = intent.mem_bytes >= hw_bench_mem_floor
+        && hw_sampled.any_under_threshold(hw_classes_in(&intent.node_affinity));
     // Stamp `rio.build/intent-id` on the pod template so the builder
     // reads it via downward-API → `RIO_INTENT_ID` → heartbeat →
     // scheduler matches the pod to its pre-computed assignment.
-    job.spec
+    let pod_anns = job
+        .spec
         .as_mut()
         .and_then(|s| s.template.metadata.as_mut())
         .and_then(|m| m.annotations.as_mut())
-        .expect("ephemeral_job sets template.metadata.annotations")
-        .insert(INTENT_ID_ANNOTATION.into(), intent.intent_id.clone());
+        .expect("ephemeral_job sets template.metadata.annotations");
+    pod_anns.insert(INTENT_ID_ANNOTATION.into(), intent.intent_id.clone());
+    pod_anns.insert(HW_BENCH_NEEDED_ANNOTATION.into(), bench_needed.to_string());
     // Stamp the selector fingerprint on the JOB metadata (not pod
     // template) so `reap_stale_for_intents` can compare without
     // dereferencing `spec.template`.
@@ -551,7 +702,7 @@ pub(super) fn build_job(
         .get_or_insert_with(BTreeMap::new)
         .insert(
             INTENT_SELECTOR_ANNOTATION.into(),
-            selector_fingerprint(&intent.node_selector),
+            selector_fingerprint(intent),
         );
     Ok(job)
 }
@@ -608,6 +759,18 @@ fn apply_intent_resources(pod_spec: &mut PodSpec, pool: &Pool, i: &SpawnIntent) 
         "RIO_DAEMON_TIMEOUT_SECS",
         &worker_timeout.to_string(),
     ));
+    // r[impl ctrl.pool.hw-bench-needed]
+    // Downward-API env var for `rio.build/hw-bench-needed`. The
+    // annotation is stamped at pod-CREATE time by `build_job` (above on
+    // the call stack), so the env-var form's resolve-once-at-container-
+    // create is race-free here — unlike `rio.build/hw-class` which is
+    // stamped after-bind by `run_pod_annotator` and so MUST use the
+    // volume form. Absent annotation (recovery path) → kubelet resolves
+    // to "" → `figment` → `hw_bench_needed: false` (fail-closed).
+    env.push(pod::env_from_field(
+        "RIO_HW_BENCH_NEEDED",
+        &format!("metadata.annotations['{HW_BENCH_NEEDED_ANNOTATION}']"),
+    ));
 
     // ADR-023 phase-13: per-(band, cap) targeting. Merge into the
     // existing nodeSelector; intent keys win on collision.
@@ -616,6 +779,26 @@ fn apply_intent_resources(pod_spec: &mut PodSpec, pool: &Pool, i: &SpawnIntent) 
         for (k, v) in &i.node_selector {
             ns.insert(k.clone(), v.clone());
         }
+    }
+    // r[impl ctrl.pool.node-affinity-from-intent]
+    // ADR-023 §13a: OR-of-ANDs over `(h, cap)` cells. `required…
+    // ignored…` so a Pending pod whose admissible set narrows after
+    // create stays Pending until `reap_stale_for_intents` notices the
+    // fingerprint drift; a RUNNING pod is never evicted on a re-solve.
+    // `build_executor_pod_spec` sets no affinity, so `get_or_insert_
+    // default` is currently a plain insert; written as a merge so a
+    // future pod-level pod-anti-affinity (or §13b's `preferred…`
+    // soft-spread) survives.
+    if !i.node_affinity.is_empty() {
+        pod_spec
+            .affinity
+            .get_or_insert_with(Default::default)
+            .node_affinity = Some(NodeAffinity {
+            required_during_scheduling_ignored_during_execution: Some(NodeSelector {
+                node_selector_terms: i.node_affinity.iter().map(pod::proto_term_to_k8s).collect(),
+            }),
+            ..Default::default()
+        });
     }
 
     // Overlay emptyDir sizeLimit — same `overlay_limit` used as the
@@ -644,6 +827,22 @@ mod tests {
         }
     }
 
+    /// `build_job` wrapper for tests that don't exercise the §13a
+    /// hw-bench gate. Empty cache + 0 floor → `bench_needed = false`
+    /// (vacuous on `A = ∅`).
+    fn job(pool: &Pool, i: &SpawnIntent) -> Job {
+        build_job(
+            pool,
+            crate::fixtures::oref(pool),
+            &test_sched_addrs(),
+            &test_store_addrs(),
+            i,
+            &HwSampledCache::default(),
+            0,
+        )
+        .unwrap()
+    }
+
     /// Built Job has all the load-bearing settings. If any of these
     /// drift, the Job reconciler breaks silently:
     ///   - restartPolicy != Never → K8s rejects the Job on create
@@ -656,15 +855,7 @@ mod tests {
     #[test]
     fn job_spec_load_bearing_fields() {
         let pool = test_pool("eph-pool", ExecutorKind::Builder);
-        let oref = crate::fixtures::oref(&pool);
-        let job = build_job(
-            &pool,
-            oref,
-            &test_sched_addrs(),
-            &test_store_addrs(),
-            &intent("abc123"),
-        )
-        .unwrap();
+        let job = job(&pool, &intent("abc123"));
 
         let orefs = job.metadata.owner_references.as_ref().unwrap();
         assert_eq!(orefs[0].kind, "Pool");
@@ -729,15 +920,7 @@ mod tests {
     #[test]
     fn job_name_format() {
         let pool = test_pool("eph-pool", ExecutorKind::Builder);
-        let oref = crate::fixtures::oref(&pool);
-        let job = build_job(
-            &pool,
-            oref,
-            &test_sched_addrs(),
-            &test_store_addrs(),
-            &intent("0a1b2c3d4f5g6h7i"),
-        )
-        .unwrap();
+        let job = job(&pool, &intent("0a1b2c3d4f5g6h7i"));
         assert_eq!(
             job.metadata.name.as_deref(),
             Some("rio-builder-eph-pool-0a1b2c3d4f5g")
@@ -772,14 +955,7 @@ mod tests {
                 deadline_secs: deadline,
                 ..Default::default()
             };
-            let job = build_job(
-                &pool,
-                crate::fixtures::oref(&pool),
-                &test_sched_addrs(),
-                &test_store_addrs(),
-                &i,
-            )
-            .unwrap();
+            let job = job(&pool, &i);
             let env = job
                 .spec
                 .as_ref()
@@ -805,51 +981,82 @@ mod tests {
         }
     }
 
-    /// `selector_fingerprint` is deterministic over key order. Empty
+    /// `selector_fingerprint` is deterministic over key/term order. Empty
     /// → "". `build_job` stamps it on Job metadata.annotations so
     /// `reap_stale_for_intents` can compare without dereferencing
     /// `spec.template`.
     #[test]
     fn build_job_stamps_selector_fingerprint() {
-        use std::collections::HashMap;
-        let a: HashMap<_, _> = [
-            ("karpenter.sh/capacity-type".into(), "spot".into()),
-            ("rio.build/hw-band".into(), "mid".into()),
-        ]
-        .into();
-        let b: HashMap<_, _> = [
-            ("rio.build/hw-band".into(), "mid".into()),
-            ("karpenter.sh/capacity-type".into(), "spot".into()),
-        ]
-        .into();
-        assert_eq!(selector_fingerprint(&a), selector_fingerprint(&b));
+        use rio_proto::types::NodeSelectorRequirement;
+        let term = |kv: &[(&str, &str)]| NodeSelectorTerm {
+            match_expressions: kv
+                .iter()
+                .map(|(k, v)| NodeSelectorRequirement {
+                    key: (*k).into(),
+                    operator: "In".into(),
+                    values: vec![(*v).into()],
+                })
+                .collect(),
+        };
+        let a = SpawnIntent {
+            node_affinity: vec![
+                term(&[
+                    ("karpenter.sh/capacity-type", "spot"),
+                    ("rio.build/hw-band", "mid"),
+                ]),
+                term(&[
+                    ("rio.build/hw-band", "hi"),
+                    ("karpenter.sh/capacity-type", "spot"),
+                ]),
+            ],
+            ..Default::default()
+        };
+        let b = SpawnIntent {
+            node_affinity: vec![
+                term(&[
+                    ("karpenter.sh/capacity-type", "spot"),
+                    ("rio.build/hw-band", "hi"),
+                ]),
+                term(&[
+                    ("rio.build/hw-band", "mid"),
+                    ("karpenter.sh/capacity-type", "spot"),
+                ]),
+            ],
+            ..Default::default()
+        };
         assert_eq!(
             selector_fingerprint(&a),
+            selector_fingerprint(&b),
+            "deterministic over both per-term key order and term order"
+        );
+        // Legacy `node_selector` arm still works for non-§13a intents.
+        let legacy = SpawnIntent {
+            node_selector: [
+                ("karpenter.sh/capacity-type".into(), "spot".into()),
+                ("rio.build/hw-band".into(), "mid".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            selector_fingerprint(&legacy),
             "karpenter.sh/capacity-type=spot,rio.build/hw-band=mid"
         );
-        assert_eq!(selector_fingerprint(&HashMap::new()), "");
+        assert_eq!(selector_fingerprint(&SpawnIntent::default()), "");
 
         let pool = test_pool("p", ExecutorKind::Builder);
         let i = SpawnIntent {
             intent_id: "abc".into(),
-            node_selector: a,
-            ..Default::default()
+            ..a
         };
-        let job = build_job(
-            &pool,
-            crate::fixtures::oref(&pool),
-            &test_sched_addrs(),
-            &test_store_addrs(),
-            &i,
-        )
-        .unwrap();
+        let job = job(&pool, &i);
         assert_eq!(
             job.metadata
                 .annotations
                 .as_ref()
                 .and_then(|a| a.get(INTENT_SELECTOR_ANNOTATION))
                 .map(String::as_str),
-            Some("karpenter.sh/capacity-type=spot,rio.build/hw-band=mid"),
+            Some(selector_fingerprint(&i).as_str()),
         );
     }
 
@@ -861,18 +1068,12 @@ mod tests {
     #[test]
     fn fetcher_overlay_is_disk_backed() {
         let pool = test_pool("f", ExecutorKind::Fetcher);
-        let job = build_job(
-            &pool,
-            crate::fixtures::oref(&pool),
-            &test_sched_addrs(),
-            &test_store_addrs(),
-            &SpawnIntent {
-                intent_id: "abc".into(),
-                disk_bytes: 8 << 30,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let i = SpawnIntent {
+            intent_id: "abc".into(),
+            disk_bytes: 8 << 30,
+            ..Default::default()
+        };
+        let job = job(&pool, &i);
         let overlay = job
             .spec
             .as_ref()
@@ -932,7 +1133,6 @@ mod tests {
     fn build_job_with_intent_computed_resources() {
         const GI: u64 = 1 << 30;
         let pool = test_pool("eph-pool", ExecutorKind::Builder);
-        let oref = crate::fixtures::oref(&pool);
         let i = SpawnIntent {
             intent_id: "i-abc".into(),
             cores: 8,
@@ -945,7 +1145,7 @@ mod tests {
             .into(),
             ..Default::default()
         };
-        let job = build_job(&pool, oref, &test_sched_addrs(), &test_store_addrs(), &i).unwrap();
+        let job = job(&pool, &i);
 
         let tmpl = &job.spec.as_ref().unwrap().template;
         assert_eq!(
@@ -1004,18 +1204,12 @@ mod tests {
         ] {
             let mut pool = test_pool("p", kind);
             pool.spec.fuse_cache_bytes = override_;
-            let job = build_job(
-                &pool,
-                crate::fixtures::oref(&pool),
-                &test_sched_addrs(),
-                &test_store_addrs(),
-                &SpawnIntent {
-                    intent_id: "abc".into(),
-                    disk_bytes: 5 * GI,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+            let i = SpawnIntent {
+                intent_id: "abc".into(),
+                disk_bytes: 5 * GI,
+                ..Default::default()
+            };
+            let job = job(&pool, &i);
             let pod_spec = job
                 .spec
                 .as_ref()
@@ -1060,18 +1254,12 @@ mod tests {
         const GI: u64 = 1 << 30;
         for kind in [ExecutorKind::Builder, ExecutorKind::Fetcher] {
             let pool = test_pool("p", kind);
-            let job = build_job(
-                &pool,
-                crate::fixtures::oref(&pool),
-                &test_sched_addrs(),
-                &test_store_addrs(),
-                &SpawnIntent {
-                    intent_id: "abc".into(),
-                    disk_bytes: 40 * GI,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+            let i = SpawnIntent {
+                intent_id: "abc".into(),
+                disk_bytes: 40 * GI,
+                ..Default::default()
+            };
+            let job = job(&pool, &i);
             let pod_spec = job
                 .spec
                 .as_ref()

@@ -123,6 +123,40 @@ impl HwClass {
             band: get(LABEL_HW_BAND).unwrap_or_else(|| "unknown".into()),
         }
     }
+
+    /// Recover the `hw_class` string from one `SpawnIntent.node_affinity`
+    /// term. The scheduler's `cells_to_selector_terms` emits each `(h,
+    /// cap)` cell as the operator-configured `[sla.hw_classes.$h].labels`
+    /// conjunction + `karpenter.sh/capacity-type`. For the
+    /// `HwClassSampled` gate to be useful, those configured labels MUST
+    /// be the same {manufacturer, generation, storage, band} tuple
+    /// `Self::from_node` reads — otherwise the controller's
+    /// reconstructed string here would not match what the builder writes
+    /// to `hw_perf_samples.hw_class` and the `<3` check would query a
+    /// non-existent key. The coupling is enforced by helm rendering both
+    /// from the same `builderBands`/`hwClasses` block.
+    ///
+    /// Missing labels default identically to `Self::from_node` so a
+    /// term targeting only a subset (e.g. no `rio.build/storage` key →
+    /// pod free to land on either) reconstructs the same string the
+    /// `from_node` post-bind path will produce on the `ebs` half. The
+    /// `<3` check is conservative under this collapse — a missing
+    /// dimension over-benches, never under-benches.
+    pub fn from_selector_term(term: &rio_proto::types::NodeSelectorTerm) -> Self {
+        let get = |k: &str| {
+            term.match_expressions
+                .iter()
+                .find(|r| r.key == k && r.operator == "In")
+                .and_then(|r| r.values.first())
+                .cloned()
+        };
+        Self {
+            manufacturer: get(LABEL_MANUFACTURER).unwrap_or_else(|| "unknown".into()),
+            generation: get(LABEL_GENERATION).unwrap_or_else(|| "unknown".into()),
+            storage: get(LABEL_STORAGE).unwrap_or_else(|| "ebs".into()),
+            band: get(LABEL_HW_BAND).unwrap_or_else(|| "unknown".into()),
+        }
+    }
 }
 
 /// Node-name → `HwClass` cache. Cheap to clone (`Arc`); share one

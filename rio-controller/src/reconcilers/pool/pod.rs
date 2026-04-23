@@ -14,8 +14,8 @@ use std::collections::BTreeMap;
 use k8s_openapi::api::core::v1::{
     Capabilities, ConfigMapVolumeSource, Container, ContainerPort, DownwardAPIVolumeFile,
     DownwardAPIVolumeSource, EmptyDirVolumeSource, EnvVar, EnvVarSource, HostPathVolumeSource,
-    ObjectFieldSelector, PodSecurityContext, PodSpec, SeccompProfile, SecurityContext, Toleration,
-    Volume, VolumeMount,
+    NodeSelectorRequirement, NodeSelectorTerm, ObjectFieldSelector, PodSecurityContext, PodSpec,
+    SeccompProfile, SecurityContext, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::ResourceExt;
@@ -240,6 +240,33 @@ pub fn executor_labels(pool: &Pool) -> BTreeMap<String, String> {
         ),
         ("app.kubernetes.io/part-of".into(), "rio-build".into()),
     ])
+}
+
+/// Proto → k8s-openapi `NodeSelectorTerm`. Field-by-field copy — the
+/// proto message in `admin_types.proto` deliberately mirrors the k8s
+/// shape (including `match_expressions` only; `match_fields` is unused
+/// by the §13a admissible-set encoding). A `From` impl would violate
+/// the orphan rule (both types foreign to rio-controller), so this
+/// free fn — same pattern as [`super::executor_kind_to_proto`] — is
+/// the single conversion point.
+pub(super) fn proto_term_to_k8s(t: &rio_proto::types::NodeSelectorTerm) -> NodeSelectorTerm {
+    NodeSelectorTerm {
+        match_expressions: Some(
+            t.match_expressions
+                .iter()
+                .map(|r| NodeSelectorRequirement {
+                    key: r.key.clone(),
+                    operator: r.operator.clone(),
+                    values: if r.values.is_empty() {
+                        None
+                    } else {
+                        Some(r.values.clone())
+                    },
+                })
+                .collect(),
+        ),
+        match_fields: None,
+    }
 }
 
 /// Map a nix `systems` list to the `kubernetes.io/arch` nodeSelector value

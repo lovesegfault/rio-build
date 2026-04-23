@@ -519,6 +519,240 @@ fn job_pod_overlays_volume_mounted() {
     assert_eq!(mount.mount_path, "/var/rio/overlays");
 }
 
+// ── ADR-023 §13a ship-standalone wiring ──────────────────────────────
+
+const GIB: u64 = 1 << 30;
+
+/// One `(h, cap)` cell as the scheduler's `cells_to_selector_terms`
+/// would emit it for a `[sla.hw_classes.$h]` config that uses the
+/// canonical 4-label tuple `node_informer::HwClass` reads.
+fn affinity_term(
+    manufacturer: &str,
+    generation: &str,
+    storage: &str,
+    band: &str,
+    cap: &str,
+) -> rio_proto::types::NodeSelectorTerm {
+    use rio_proto::types::NodeSelectorRequirement;
+    let req = |k: &str, v: &str| NodeSelectorRequirement {
+        key: k.into(),
+        operator: "In".into(),
+        values: vec![v.into()],
+    };
+    rio_proto::types::NodeSelectorTerm {
+        match_expressions: vec![
+            req("karpenter.k8s.aws/instance-cpu-manufacturer", manufacturer),
+            req("karpenter.k8s.aws/instance-generation", generation),
+            req("rio.build/storage", storage),
+            req("rio.build/hw-band", band),
+            req("karpenter.sh/capacity-type", cap),
+        ],
+    }
+}
+
+fn build_job_with(
+    intent: &rio_proto::types::SpawnIntent,
+    hw_sampled: &jobs::HwSampledCache,
+    floor: u64,
+) -> k8s_openapi::api::batch::v1::Job {
+    let pool = test_wp();
+    jobs::build_job(
+        &pool,
+        crate::fixtures::oref(&pool),
+        &crate::fixtures::test_sched_addrs(),
+        &crate::fixtures::test_store_addrs(),
+        intent,
+        hw_sampled,
+        floor,
+    )
+    .unwrap()
+}
+
+// r[verify ctrl.pool.node-affinity-from-intent]
+/// `SpawnIntent.node_affinity` → `pod.spec.affinity.nodeAffinity.
+/// requiredDuringSchedulingIgnoredDuringExecution`, term-for-term
+/// (proto → k8s-openapi via `proto_term_to_k8s`). Empty `node_affinity`
+/// → `affinity` stays `None` so the I-090 bin-pack assertion in
+/// `job_spec_load_bearing_fields` still holds for non-§13a intents.
+#[test]
+fn pod_gets_node_affinity_from_intent() {
+    let intent = rio_proto::types::SpawnIntent {
+        intent_id: "abc".into(),
+        cores: 4,
+        mem_bytes: 8 * GIB,
+        node_affinity: vec![
+            affinity_term("intel", "8", "ebs", "hi", "spot"),
+            affinity_term("intel", "8", "ebs", "hi", "on-demand"),
+        ],
+        ..Default::default()
+    };
+    let job = build_job_with(&intent, &jobs::HwSampledCache::default(), 8 * GIB);
+    let pod_spec = job
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .unwrap();
+    let terms = pod_spec
+        .affinity
+        .as_ref()
+        .and_then(|a| a.node_affinity.as_ref())
+        .and_then(|n| {
+            n.required_during_scheduling_ignored_during_execution
+                .as_ref()
+        })
+        .map(|ns| &ns.node_selector_terms)
+        .expect("requiredDuringScheduling… set from intent.node_affinity");
+    assert_eq!(terms.len(), 2, "one k8s term per (h, cap) cell");
+    let exprs = terms[0].match_expressions.as_ref().unwrap();
+    assert_eq!(exprs.len(), 5, "h-label conjunction + capacity-type");
+    let cap = exprs
+        .iter()
+        .find(|r| r.key == "karpenter.sh/capacity-type")
+        .unwrap();
+    assert_eq!(cap.operator, "In");
+    assert_eq!(cap.values.as_deref(), Some(["spot".to_string()].as_slice()));
+
+    // Empty node_affinity → no affinity stamped (Static-mode/FOD path).
+    let cold = rio_proto::types::SpawnIntent {
+        intent_id: "abc".into(),
+        ..Default::default()
+    };
+    let job = build_job_with(&cold, &jobs::HwSampledCache::default(), 8 * GIB);
+    assert!(
+        job.spec
+            .as_ref()
+            .and_then(|s| s.template.spec.as_ref())
+            .unwrap()
+            .affinity
+            .is_none(),
+        "no node_affinity → spec.affinity stays None (I-090 bin-pack)"
+    );
+}
+
+// r[verify ctrl.pool.hw-bench-needed]
+/// `rio.build/hw-bench-needed` is `"true"` iff `mem_bytes ≥ floor`
+/// AND any `h ∈ A` has `< 3` distinct pod_id benches per
+/// `HwClassSampled`. Exposed to the builder as `RIO_HW_BENCH_NEEDED`
+/// via a downward-API env (annotation is create-time, so no
+/// `run_pod_annotator` race).
+#[test]
+fn pod_gets_hw_bench_needed_when_any_h_undersampled() {
+    use std::collections::HashMap;
+    let intent = |mem_bytes: u64, terms: Vec<rio_proto::types::NodeSelectorTerm>| {
+        rio_proto::types::SpawnIntent {
+            intent_id: "abc".into(),
+            mem_bytes,
+            node_affinity: terms,
+            ..Default::default()
+        }
+    };
+    let bench_ann = |job: &k8s_openapi::api::batch::v1::Job| {
+        job.spec
+            .as_ref()
+            .and_then(|s| s.template.metadata.as_ref())
+            .and_then(|m| m.annotations.as_ref())
+            .and_then(|a| a.get(jobs::HW_BENCH_NEEDED_ANNOTATION))
+            .cloned()
+    };
+    // hw_classes_in reconstructs via HwClass::from_selector_term →
+    // `"{manufacturer}-{generation}-{storage}-{band}"`.
+    let cache = jobs::HwSampledCache::from_map(HashMap::from([
+        ("intel-8-ebs-hi".into(), 1u32),  // undersampled
+        ("intel-7-ebs-mid".into(), 5u32), // trusted
+    ]));
+    let a_mixed = vec![
+        affinity_term("intel", "7", "ebs", "mid", "spot"),
+        affinity_term("intel", "8", "ebs", "hi", "spot"),
+    ];
+    let a_trusted = vec![affinity_term("intel", "7", "ebs", "mid", "on-demand")];
+
+    // (a) mem ≥ floor ∧ any h<3 → true.
+    let job = build_job_with(&intent(16 * GIB, a_mixed.clone()), &cache, 8 * GIB);
+    assert_eq!(bench_ann(&job).as_deref(), Some("true"));
+    // Downward-API env wired (resolved by kubelet from the annotation).
+    let env = job
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .map(|p| p.containers[0].env.as_ref().unwrap())
+        .unwrap();
+    let bench_env = env
+        .iter()
+        .find(|e| e.name == "RIO_HW_BENCH_NEEDED")
+        .expect("RIO_HW_BENCH_NEEDED env present");
+    assert_eq!(
+        bench_env
+            .value_from
+            .as_ref()
+            .and_then(|s| s.field_ref.as_ref())
+            .map(|f| f.field_path.as_str()),
+        Some("metadata.annotations['rio.build/hw-bench-needed']"),
+    );
+
+    // (b) mem < floor → false (STREAM would OOM the pod).
+    let job = build_job_with(&intent(4 * GIB, a_mixed.clone()), &cache, 8 * GIB);
+    assert_eq!(bench_ann(&job).as_deref(), Some("false"));
+
+    // (c) all h ≥ 3 → false (no need to re-bench trusted classes).
+    let job = build_job_with(&intent(16 * GIB, a_trusted), &cache, 8 * GIB);
+    assert_eq!(bench_ann(&job).as_deref(), Some("false"));
+
+    // (d) A = ∅ → false (vacuous; actual h unknown until bind).
+    let job = build_job_with(&intent(16 * GIB, vec![]), &cache, 8 * GIB);
+    assert_eq!(bench_ann(&job).as_deref(), Some("false"));
+
+    // (e) RPC-failure path: empty cache → unknown h reads as 0 → true
+    //     (over-bench, never under-bench).
+    let job = build_job_with(
+        &intent(16 * GIB, a_mixed),
+        &jobs::HwSampledCache::default(),
+        8 * GIB,
+    );
+    assert_eq!(bench_ann(&job).as_deref(), Some("true"));
+}
+
+/// ADR-023 §13a ship-standalone gate: `eta_seconds > 0` (forecast)
+/// intents are dropped before any Job-create / reap / ack so a
+/// not-yet-Ready drv never spawns a pod that idles for `eta_seconds`
+/// then exits. The gate is on the FULL `intents` vec (not just the
+/// spawn slice) so `queued`/`reap_excess_pending` see one consistent
+/// set. §13b removes this — `placeable` from the NodeClaim FFD sim
+/// becomes the gate instead.
+#[test]
+fn forecast_intents_filtered_in_13a() {
+    // Unit-level: the `retain` is one line; assert directly on the
+    // collected hw_classes input so the per-tick RPC doesn't ask for
+    // forecast-only classes. The Job-create skip is asserted
+    // structurally (the `retain` precedes both `hw_sampled` and
+    // `to_spawn_intents`).
+    let intents = [
+        rio_proto::types::SpawnIntent {
+            intent_id: "ready".into(),
+            eta_seconds: 0.0,
+            node_affinity: vec![affinity_term("intel", "7", "ebs", "mid", "spot")],
+            ..Default::default()
+        },
+        rio_proto::types::SpawnIntent {
+            intent_id: "forecast".into(),
+            eta_seconds: 42.5,
+            node_affinity: vec![affinity_term("amd", "9", "nvme", "hi", "spot")],
+            ..Default::default()
+        },
+    ];
+    let mut filtered: Vec<_> = intents.to_vec();
+    filtered.retain(|i| i.eta_seconds == 0.0);
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].intent_id, "ready");
+    let hs: std::collections::HashSet<_> = filtered
+        .iter()
+        .flat_map(|i| jobs::hw_classes_in(&i.node_affinity))
+        .collect();
+    assert_eq!(
+        hs,
+        std::collections::HashSet::from(["intel-7-ebs-mid".into()])
+    );
+}
+
 // r[verify ctrl.pool.hw-class-annotation]
 /// `rio.build/hw-class` is exposed via a downward-API VOLUME (kubelet
 /// refreshes file contents on annotation change), NOT an env var

@@ -142,6 +142,15 @@ pub struct Ctx {
     pub error_counts: Mutex<HashMap<String, u32>>,
     /// In-process state owned by the ComponentScaler reconciler.
     pub scaler: ScalerState,
+    /// ADR-023 §13a: `resources.requests.memory` floor below which the
+    /// `rio.build/hw-bench-needed` annotation is forced false. STREAM
+    /// triad's working set is ~4.6 GiB on the largest LLC; running it
+    /// on a `preferLocalBuild`/fetcher pod sized at 1-4 GiB would OOM
+    /// before the build even starts. Same value as the scheduler's
+    /// `[sla].hw_bench_mem_floor` (helm renders both from
+    /// `sla.hwBenchMemFloor`); duplicated here so the controller stays
+    /// PG-/scheduler-config-free.
+    pub hw_bench_mem_floor: u64,
 }
 
 /// ComponentScaler reconciler state.

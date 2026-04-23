@@ -69,6 +69,12 @@ struct Config {
     /// also `None` and passes through). Env:
     /// `RIO_SERVICE_HMAC_KEY_PATH`. See `r[sec.authz.service-token]`.
     service_hmac_key_path: Option<std::path::PathBuf>,
+    /// ADR-023 §13a: pod `requests.memory` floor for the
+    /// `rio.build/hw-bench-needed` gate (STREAM triad working-set
+    /// safety). MUST match the scheduler's `[sla].hw_bench_mem_floor`;
+    /// helm renders both from `sla.hwBenchMemFloor`. Env:
+    /// `RIO_HW_BENCH_MEM_FLOOR`.
+    hw_bench_mem_floor: u64,
 }
 
 impl Default for Config {
@@ -86,6 +92,10 @@ impl Default for Config {
             gc_interval_hours: 24,
             nodepool_budget: NodePoolBudgetConfig::default(),
             service_hmac_key_path: None,
+            // 8 GiB: matches `rio_scheduler::sla::config::
+            // default_hw_bench_mem_floor`. STREAM triad's 3×4×LLC
+            // working set tops out ~4.6 GiB on c7a.48xlarge.
+            hw_bench_mem_floor: 8 * (1 << 30),
         }
     }
 }
@@ -240,6 +250,7 @@ async fn main() -> anyhow::Result<()> {
         service_interceptor: service_interceptor.clone(),
         error_counts: Default::default(),
         scaler: Default::default(),
+        hw_bench_mem_floor: cfg.hw_bench_mem_floor,
     });
 
     // ---- Reconcilers ----

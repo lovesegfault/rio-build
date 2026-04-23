@@ -60,6 +60,7 @@ pub(crate) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
         service_interceptor: rio_auth::hmac::ServiceTokenInterceptor::new(None, "rio-controller"),
         error_counts: Default::default(),
         scaler: Default::default(),
+        hw_bench_mem_floor: 8 * (1 << 30),
     })
 }
 

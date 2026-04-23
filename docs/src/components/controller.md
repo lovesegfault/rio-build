@@ -277,6 +277,26 @@ container-create and races the annotator permanently. The builder
 reads the file with a bounded 30s poll (`hw_class::resolve`) so a
 late stamp still reaches a running pod.
 
+r[ctrl.pool.node-affinity-from-intent]
+When `SpawnIntent.node_affinity` is non-empty the pool reconciler MUST
+set `pod.spec.affinity.nodeAffinity.
+requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms` to
+the proto terms (field-by-field copy). Empty `node_affinity` MUST leave
+`spec.affinity` unset so non-hw-targeted intents (Static-mode, FOD,
+feature-gated) bin-pack freely (I-090).
+
+r[ctrl.pool.hw-bench-needed]
+The pool reconciler MUST stamp `rio.build/hw-bench-needed` on the pod
+template at create time and expose it as `RIO_HW_BENCH_NEEDED` via a
+downward-API env var. The annotation is `"true"` iff
+`intent.mem_bytes ≥ hw_bench_mem_floor` AND any `h` in the intent's
+admissible-set `A` (recovered from `node_affinity` terms) has fewer
+than 3 distinct `pod_id` benches per `AdminService.HwClassSampled`
+(one RPC per reconcile tick over the union of all `A`). When `A` is
+empty the annotation MUST be `"false"` — the actual `h` is unknown
+until kube-scheduler bind. On RPC failure unknown `h` MUST read as 0
+(over-bench, never under-bench).
+
 r[ctrl.reconcile.owner-refs]
 - **Pool reconciler**: spawn/reap one-shot Jobs (builder or fetcher per `spec.kind`) based on scheduler `SpawnIntent`s. All Jobs carry `ownerReferences` to the Pool CRD with `controller: true`, ensuring garbage collection on Pool deletion.
 - **GC reconciler**: trigger store garbage collection on schedule.
