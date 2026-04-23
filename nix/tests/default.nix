@@ -146,11 +146,15 @@ let
     };
     extraSchedulerConfig = {
       tickIntervalSecs = 2;
-      # [sla] is mandatory; sized for 3× tiny VM workers (2 GiB each).
+      # [sla] is mandatory. ProbeShape::validate requires
+      # cpu ∈ [4, max_cores/4] (span≥4 reach for both explore paths) →
+      # max_cores ≥ 16. mem_per_core/mem_base sized so a 4-core probe
+      # (4×128Mi + 256Mi = 768Mi) fits the 2 GiB worker VMs. Mirrors
+      # values/vmtest-full.yaml.
       extraConfig = ''
         [sla]
         default_tier = "normal"
-        max_cores = 2
+        max_cores = 16
         max_mem = 2147483648
         max_disk = 6442450944
         default_disk = 2147483648
@@ -159,9 +163,9 @@ let
         name = "normal"
 
         [sla.probe]
-        cpu = 1
-        mem_per_core = 1073741824
-        mem_base = 1073741824
+        cpu = 4
+        mem_per_core = 134217728
+        mem_base = 268435456
       '';
     };
     extraStoreConfig = {
