@@ -182,6 +182,12 @@ When `GetPathRequest.manifest_hint` is set with a non-null `info`, `GetPath` byp
 r[store.get.size-sanity-check]
 Before streaming, `GetPath` MUST verify the manifest's summed size (inline blob length, or sum of chunk sizes) equals `narinfo.nar_size`. A mismatch indicates manifest/narinfo drift — PutPath wrote inconsistent state, or the DB was manually modified. The store MUST return `DATA_LOSS` without streaming any NAR bytes. This is a fail-fast over the post-stream integrity check, which would only catch the drift after the client received (and wasted bandwidth on) a corrupt NAR.
 
+r[store.get.chunk-prefetch]
+The chunked-manifest stream MUST drive `chunk_prefetch_k` (default 64, configurable via `RIO_CHUNK_PREFETCH_K`) `get_verified()` futures in flight via order-preserving `.buffered()`. Cold-cache throughput is latency-bound at `K × CHUNK_AVG / s3_ttfb`, so K is the primary throughput knob; per-stream memory cost is bounded by `K × CHUNK_MAX`. `buffer_unordered` MUST NOT be used --- chunk order is the NAR byte order.
+
+r[store.shutdown.drain-getpath]
+On SIGTERM, after flipping health to `NOT_SERVING` and sleeping `drain_grace` for endpoint propagation, rio-store MUST wait for the active-`GetPath`-stream count to reach zero (or `stream_drain_secs` to elapse, default 90) BEFORE cancelling the tonic listener. The pod's `terminationGracePeriodSeconds` MUST cover `drain_grace + stream_drain_secs` plus slack so kubelet's SIGKILL is a backstop, not the normal exit path. ComponentScaler's `MAX_SCALE_DOWN_STEP` is sized assuming SIGTERM drains in-flight work; without this wait, a scale-down resets the h2 connection mid-stream and the client retries the whole NAR from byte zero.
+
 ## Request Coalescing (Singleflight)
 
 r[store.singleflight]

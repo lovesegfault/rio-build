@@ -237,6 +237,18 @@ store:
   # admission=64 that's 512. Lower if DispatchFailure appears in
   # store logs during large-NAR ingest (try s3MaxAttempts first).
   chunkUploadMaxConcurrent: 8
+  # GetPath chunk-prefetch depth (.buffered(K)). Cold-cache throughput
+  # ceiling ≈ K × 64KiB / s3_ttfb; per-stream memory ≤ K × 256KiB.
+  # K=8 (the old hardcoded value) capped a cold 250MB path at ~3m
+  # against S3-standard. 64 → ceiling ~90MB/s at 45ms TTFB, ≤16MiB/stream.
+  chunkPrefetchK: 64
+  # Max wait for in-flight GetPath body streams to complete on SIGTERM,
+  # after the drain-grace endpoint-propagation sleep. ComponentScaler
+  # scale-down assumes SIGTERM drains in-flight work; without this a
+  # 14→2 scale-down resets the underlying h2 connection mid-stream and
+  # the builder retries the whole NAR from byte 0.
+  # terminationGracePeriodSeconds = 6 + this + 24.
+  streamDrainSecs: 90
   # aws-sdk retry ceiling per S3 op. Raised from sdk default (3) —
   # S3-compatible backends (Rook RGW, MinIO) recycle idle connections
   # more aggressively than AWS S3; closed-pool-connection surfaces as

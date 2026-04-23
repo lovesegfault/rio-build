@@ -28,6 +28,11 @@ spec:
         {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 8 }}
     spec:
       serviceAccountName: rio-store
+      # ≥ RIO_DRAIN_GRACE_SECS(6) + streamDrainSecs + slack. kubelet
+      # SIGKILLs at this deadline; the store's own stream_drain timeout
+      # fires first and exits cleanly, so SIGKILL is a backstop for a
+      # hung process. Same shape as gateway.yaml's three-stage budget.
+      terminationGracePeriodSeconds: {{ add 6 ($s.streamDrainSecs | default 90) 24 }}
       {{- include "rio.podSecurityContext" . | nindent 6 }}
       containers:
         - name: store
@@ -51,6 +56,10 @@ spec:
               value: "true"
             - name: RIO_DRAIN_GRACE_SECS
               value: "6"  # readinessProbe.periodSeconds (5) + 1
+            - name: RIO_STREAM_DRAIN_SECS
+              value: {{ $s.streamDrainSecs | default 90 | quote }}
+            - name: RIO_CHUNK_PREFETCH_K
+              value: {{ $s.chunkPrefetchK | default 64 | quote }}
             - name: RIO_CHUNK_UPLOAD_MAX_CONCURRENT
               value: {{ $s.chunkUploadMaxConcurrent | quote }}
             - name: RIO_S3_MAX_ATTEMPTS

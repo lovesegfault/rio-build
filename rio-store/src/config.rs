@@ -114,6 +114,18 @@ pub(crate) struct Config {
     /// Default 1M — ~80 MB of path strings per request. Set via
     /// `RIO_MAX_BATCH_PATHS`.
     pub max_batch_paths: usize,
+    /// `GetPath` chunk-prefetch depth (`.buffered(K)`). Cold-cache
+    /// throughput ceiling is `K × CHUNK_AVG / s3_ttfb`; per-stream
+    /// memory cost is `K × CHUNK_MAX` (≤ 16 MiB at 64). Default 64.
+    /// Set via `RIO_CHUNK_PREFETCH_K`.
+    pub chunk_prefetch_k: usize,
+    /// Max time to wait for in-flight `GetPath` body streams to
+    /// complete after the drain-grace sleep, before tearing down the
+    /// listener on SIGTERM. `terminationGracePeriodSeconds` MUST cover
+    /// `drain_grace + stream_drain` + slack, or kubelet SIGKILLs
+    /// mid-wait. Default 90 s. Set via `RIO_STREAM_DRAIN_SECS`.
+    #[serde(rename = "stream_drain_secs", with = "rio_common::config::secs")]
+    pub stream_drain: std::time::Duration,
     /// PG connection pool size. Default 50 (was hardcoded 20). The
     /// QueryPathInfo / FindMissingPaths hot path under autoscaled
     /// builder load (60+ builders × ~100 input paths each at fan-out)
@@ -153,6 +165,8 @@ impl Default for Config {
             chunk_upload_max_concurrent: rio_store::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
             s3_max_attempts: DEFAULT_S3_MAX_ATTEMPTS,
             max_batch_paths: rio_store::grpc::DEFAULT_MAX_BATCH_PATHS,
+            chunk_prefetch_k: rio_store::grpc::DEFAULT_CHUNK_PREFETCH_K,
+            stream_drain: std::time::Duration::from_secs(90),
             pg_max_connections: DEFAULT_PG_MAX_CONNECTIONS,
             substitute_admission_permits: None,
         }
@@ -343,6 +357,9 @@ mod tests {
         assert!(d.jwt.key_path.is_none());
         assert!(!d.jwt.required);
         assert_eq!(d.max_batch_paths, rio_store::grpc::DEFAULT_MAX_BATCH_PATHS);
+        // r[verify store.get.chunk-prefetch]
+        assert_eq!(d.chunk_prefetch_k, 64);
+        assert_eq!(d.stream_drain, std::time::Duration::from_secs(90));
         assert_eq!(d.pg_max_connections, DEFAULT_PG_MAX_CONNECTIONS);
         // None → main.rs derives via derive_substitute_admission_cap.
         assert!(d.substitute_admission_permits.is_none());

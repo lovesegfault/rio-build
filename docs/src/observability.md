@@ -192,6 +192,7 @@ r[obs.metric.store]
 | `rio_store_get_path_bytes_total` | Counter | Bytes served via GetPath (nar_size on stream start) |
 | `rio_store_get_path_total` | Counter | Total GetPath operations (incremented on successful whole-NAR verify) |
 | `rio_store_get_path_duration_seconds` | Histogram | GetPath latency (stream_path entry to whole-NAR verify) |
+| `rio_store_get_path_active` | Gauge | GetPath body-stream tasks currently writing (drives SIGTERM stream-drain) |
 | `rio_store_substitute_total` | Counter | Upstream substitution attempts, labeled by `result` (hit/miss/error) and `tenant` (UUID). Per-upstream debugging detail is in the `debug!`/`warn!` log lines. |
 | `rio_store_substitute_integrity_failures_total` | Counter | Upstream substitution NAR hash or size mismatches, labeled by `tenant`. Nonzero is security-relevant: upstream served corrupt/tampered bytes or a lying `NarSize`. |
 | `rio_store_substitute_probe_cache_hits_total` | Counter | `check_available` HEAD-probe cache hits (positive or negative cached result; no upstream HEAD made for this path). |

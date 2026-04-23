@@ -252,7 +252,31 @@ pub struct StoreServiceImpl {
     /// [`DEFAULT_MAX_BATCH_PATHS`] (1M); override via
     /// `.with_max_batch_paths()`.
     max_batch_paths: usize,
+    /// `GetPath` chunk-prefetch depth: max in-flight `get_verified()`
+    /// futures inside `.buffered()`. Throughput ceiling on a cold moka
+    /// cache is `K × CHUNK_AVG / s3_ttfb` — at K=8 (the old hardcoded
+    /// value), cold S3-standard (~45 ms TTFB) caps at ~11 MB/s and
+    /// real-world ~1.4 MB/s under load, making a 250 MB path take ~3 m.
+    /// Default [`DEFAULT_CHUNK_PREFETCH_K`] (64); per-stream memory
+    /// cost is `K × CHUNK_MAX` (≤ 16 MiB at 64). Override via
+    /// `.with_chunk_prefetch_k()`.
+    chunk_prefetch_k: usize,
+    /// Count of GetPath body-stream tasks currently writing. Incremented
+    /// synchronously in `stream_path` BEFORE the response is returned,
+    /// decremented on the spawned task's drop (any exit path).
+    /// `main.rs` polls this via [`wait_for_active_drain`] in the
+    /// `spawn_drain_task_ext` after-grace hook so SIGTERM doesn't tear
+    /// down the listener while a multi-second NAR stream is mid-flight
+    /// — the contract `componentscaler/decide.rs MAX_SCALE_DOWN_STEP`
+    /// already assumes.
+    ///
+    /// [`wait_for_active_drain`]: rio_common::server::wait_for_active_drain
+    active_get_path_streams: Arc<std::sync::atomic::AtomicUsize>,
 }
+
+/// Default `GetPath` chunk-prefetch depth. See
+/// [`StoreServiceImpl::with_chunk_prefetch_k`].
+pub const DEFAULT_CHUNK_PREFETCH_K: usize = 64;
 
 /// Default global NAR buffer budget: 8 × MAX_NAR_SIZE (32 GiB on 64-bit).
 /// `tokio::sync::Semaphore` max permits is `usize::MAX >> 3`; this fits
@@ -277,6 +301,8 @@ impl StoreServiceImpl {
             substituter: None,
             chunk_upload_max_concurrent: cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
             max_batch_paths: DEFAULT_MAX_BATCH_PATHS,
+            chunk_prefetch_k: DEFAULT_CHUNK_PREFETCH_K,
+            active_get_path_streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -371,6 +397,20 @@ impl StoreServiceImpl {
     pub fn with_max_batch_paths(mut self, n: usize) -> Self {
         self.max_batch_paths = n;
         self
+    }
+
+    /// Override the GetPath chunk-prefetch depth. Builder-style.
+    /// main.rs threads `RIO_CHUNK_PREFETCH_K` here.
+    pub fn with_chunk_prefetch_k(mut self, k: usize) -> Self {
+        self.chunk_prefetch_k = k;
+        self
+    }
+
+    /// Handle to the active-GetPath-stream counter for SIGTERM drain.
+    /// main.rs passes this to `wait_for_active_drain` in the
+    /// `spawn_drain_task_ext` after-grace hook.
+    pub fn active_get_path_streams_handle(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.active_get_path_streams)
     }
 
     /// Borrow the NAR-bytes budget semaphore. main.rs clones this into

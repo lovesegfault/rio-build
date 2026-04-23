@@ -145,6 +145,10 @@ pub fn describe_metrics() {
         "rio_store_get_path_duration_seconds",
         "GetPath latency (stream_path entry to whole-NAR verify)"
     );
+    describe_gauge!(
+        "rio_store_get_path_active",
+        "GetPath body-stream tasks currently writing (drives SIGTERM stream-drain)"
+    );
     describe_counter!(
         "rio_store_integrity_failures_total",
         "GetPath content integrity check failures (bitrot/corruption)"

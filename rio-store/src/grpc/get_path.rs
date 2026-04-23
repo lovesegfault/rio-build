@@ -9,11 +9,15 @@
 //! 4. Verify whole-NAR SHA-256 (belt-and-suspenders over per-chunk BLAKE3)
 //!
 //! The chunked path streams chunk-by-chunk without materializing the
-//! full NAR in memory — that's the whole point. K=8 parallel prefetch
-//! via `buffered()` (NOT `buffer_unordered` — chunk order matters for
-//! correct NAR reconstruction).
+//! full NAR in memory — that's the whole point. K-parallel prefetch
+//! (default 64, see [`DEFAULT_CHUNK_PREFETCH_K`]) via `buffered()`
+//! (NOT `buffer_unordered` — chunk order matters for correct NAR
+//! reconstruction).
+//!
+//! [`DEFAULT_CHUNK_PREFETCH_K`]: super::DEFAULT_CHUNK_PREFETCH_K
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
@@ -33,6 +37,28 @@ use crate::metadata::{self, ManifestKind};
 use super::{StoreServiceImpl, metadata_status, validate_store_path};
 
 pub(super) type GetPathStream = ReceiverStream<Result<GetPathResponse, Status>>;
+
+/// RAII guard for [`StoreServiceImpl::active_get_path_streams`] and the
+/// `rio_store_get_path_active` gauge. Increment in `new()`, decrement
+/// on `Drop` — moved into the spawned body-stream task so any exit
+/// path (success, error send, timeout, panic, abort) decrements.
+struct ActiveStreamGuard(Arc<AtomicUsize>);
+
+impl ActiveStreamGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        // r[impl obs.metric.store]
+        metrics::gauge!("rio_store_get_path_active").increment(1.0);
+        Self(counter)
+    }
+}
+
+impl Drop for ActiveStreamGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+        metrics::gauge!("rio_store_get_path_active").decrement(1.0);
+    }
+}
 
 /// Stream a Bytes value to the GetPath channel in NAR_CHUNK_SIZE pieces.
 ///
@@ -250,11 +276,19 @@ impl StoreServiceImpl {
         // Clone for the spawned task. Arc-clone is cheap; the cache
         // itself (moka + DashMap) is shared.
         let cache = self.chunk_cache.clone();
+        let prefetch_k = self.chunk_prefetch_k;
 
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let info_raw: PathInfo = info.into();
 
+        // r[impl store.shutdown.drain-getpath]
+        // Incremented HERE (synchronously, before returning Response)
+        // so a SIGTERM that races the spawn sees active≥1. Guard moves
+        // into the task; drops on any exit path.
+        let guard = ActiveStreamGuard::new(Arc::clone(&self.active_get_path_streams));
+
         rio_common::task::spawn_monitored("get-path-stream", async move {
+            let _guard = guard;
             // Bound the entire streaming task. A slow client otherwise
             // keeps this alive forever.
             let stream_fut = async {
@@ -287,7 +321,8 @@ impl StoreServiceImpl {
                         // Pre-flight checked cache is Some.
                         let cache = cache.expect("pre-flight checked chunk_cache is Some");
 
-                        // K=8 parallel prefetch. `buffered()` preserves
+                        // r[impl store.get.chunk-prefetch]
+                        // K-parallel prefetch. `buffered()` preserves
                         // order — chunk i arrives before chunk i+1 even if
                         // i+1's fetch finishes first. `buffer_unordered`
                         // would scramble the NAR.
@@ -296,14 +331,13 @@ impl StoreServiceImpl {
                         // BLAKE3 verify happens inside that; any corrupt
                         // chunk surfaces as ChunkError here.
                         use futures_util::stream::{self, StreamExt};
-                        const PREFETCH_K: usize = 8;
 
                         let mut chunk_stream = stream::iter(entries)
                             .map(|(hash, _size)| {
                                 let cache = Arc::clone(&cache);
                                 async move { cache.get_verified(&hash).await }
                             })
-                            .buffered(PREFETCH_K);
+                            .buffered(prefetch_k);
 
                         while let Some(result) = chunk_stream.next().await {
                             let chunk_bytes = match result {
@@ -443,6 +477,35 @@ mod tests {
             err.message().contains("MAX_NAR_SIZE"),
             "msg: {}",
             err.message()
+        );
+    }
+
+    /// Guard increments synchronously on `new()` and decrements on
+    /// drop — including when the holding future is aborted (the
+    /// `spawn_monitored` task may be cancelled if the runtime shuts
+    /// down before the stream completes).
+    // r[verify store.shutdown.drain-getpath]
+    #[tokio::test]
+    async fn active_stream_guard_decrements_on_abort() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        let guard = ActiveStreamGuard::new(Arc::clone(&counter));
+        assert_eq!(counter.load(Ordering::Relaxed), 1, "increments on new()");
+
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(counter.load(Ordering::Relaxed), 1, "still held by task");
+
+        handle.abort();
+        let _ = handle.await;
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "decrements on abort via Drop"
         );
     }
 }

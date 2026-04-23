@@ -51,21 +51,6 @@ async fn main() -> anyhow::Result<()> {
     // migrations failed, the `?` above already bailed.
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
 
-    // Two-stage shutdown — see rio_common::server::spawn_drain_task
-    // for the INDEPENDENT-token rationale + proof test. Closure flips
-    // the NAMED StoreService (BalancedChannel probe target).
-    let reporter = health_reporter.clone();
-    rio_common::server::spawn_drain_task(
-        shutdown.clone(),
-        serve_shutdown.clone(),
-        cfg.common.drain_grace,
-        move || async move {
-            reporter
-                .set_not_serving::<StoreServiceServer<StoreServiceImpl>>()
-                .await;
-        },
-    );
-
     let chunk_cache = init_chunk_backend(
         &cfg.chunk_backend,
         cfg.chunk_cache_capacity_bytes,
@@ -142,7 +127,8 @@ async fn main() -> anyhow::Result<()> {
     // overrides when explicitly set.
     let mut store_service = StoreServiceImpl::new(pool.clone())
         .with_chunk_upload_max_concurrent(cfg.chunk_upload_max_concurrent)
-        .with_max_batch_paths(cfg.max_batch_paths);
+        .with_max_batch_paths(cfg.max_batch_paths)
+        .with_chunk_prefetch_k(cfg.chunk_prefetch_k);
     if let Some(cache) = &chunk_cache {
         store_service = store_service.with_chunk_cache(Arc::clone(cache));
     }
@@ -183,6 +169,33 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(s)
     };
     let store_service = store_service.with_substituter(substituter);
+
+    // r[impl store.shutdown.drain-getpath]
+    // Three-stage shutdown — see rio_common::server::spawn_drain_task
+    // for the INDEPENDENT-token rationale + proof test. Closure flips
+    // the NAMED StoreService (BalancedChannel probe target). The
+    // after-grace hook waits for in-flight GetPath body streams to
+    // complete (or `stream_drain` to elapse) BEFORE serve_shutdown
+    // tears down the listener — ComponentScaler scale-down assumes
+    // SIGTERM drains in-flight work (decide.rs MAX_SCALE_DOWN_STEP).
+    // Spawned here (not at the top of main) because the active-stream
+    // counter lives on store_service.
+    let reporter = health_reporter.clone();
+    let active_streams = store_service.active_get_path_streams_handle();
+    let stream_drain = cfg.stream_drain;
+    rio_common::server::spawn_drain_task_ext(
+        shutdown.clone(),
+        serve_shutdown.clone(),
+        cfg.common.drain_grace,
+        move || async move {
+            reporter
+                .set_not_serving::<StoreServiceServer<StoreServiceImpl>>()
+                .await;
+        },
+        move || async move {
+            rio_common::server::wait_for_active_drain(&active_streams, stream_drain).await;
+        },
+    );
 
     // ChunkServiceImpl: same cache Arc. None → FAILED_PRECONDITION
     // on GetChunk, which is correct for an inline-only store (there

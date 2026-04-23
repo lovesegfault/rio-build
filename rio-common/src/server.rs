@@ -371,6 +371,33 @@ pub fn spawn_drain_task<F, Fut>(
     F: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    spawn_drain_task_ext(parent, serve_shutdown, grace, set_not_serving, || {
+        std::future::ready(())
+    });
+}
+
+/// [`spawn_drain_task`] with an extra `after_grace` hook that runs
+/// AFTER the grace sleep (i.e. after endpoint propagation, so no new
+/// requests are arriving) and BEFORE `serve_shutdown` fires. Components
+/// with long-lived server-streaming RPCs pass [`wait_for_active_drain`]
+/// here so in-flight body streams complete before tonic tears down the
+/// listener and resets the underlying h2 connections.
+///
+/// Kept separate from [`spawn_drain_task`] so the three existing
+/// callers (scheduler, gateway, store-pre-drain) keep their
+/// signatures; only callers that NEED the hook take the extra param.
+pub fn spawn_drain_task_ext<F, Fut, G, Fut2>(
+    parent: CancellationToken,
+    serve_shutdown: CancellationToken,
+    grace: std::time::Duration,
+    set_not_serving: F,
+    after_grace: G,
+) where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+    G: FnOnce() -> Fut2 + Send + 'static,
+    Fut2: Future<Output = ()> + Send + 'static,
+{
     spawn_monitored("drain-on-sigterm", async move {
         parent.cancelled().await;
         set_not_serving().await;
@@ -383,8 +410,46 @@ pub fn spawn_drain_task<F, Fut>(
         if !grace.is_zero() {
             tokio::time::sleep(grace).await;
         }
+        after_grace().await;
         serve_shutdown.cancel();
     });
+}
+
+/// Poll `active` until 0 or `max_wait`. 1-second tick — coarse is fine
+/// (the whole drain is bounded by `terminationGracePeriodSeconds`).
+/// Logs every tick so `kubectl logs -f` shows live progress during a
+/// rollout. `max_wait.is_zero()` returns immediately.
+///
+/// Generalized from `rio-gateway`'s `wait_for_session_drain` minus the
+/// gateway-specific cancel-builds choreography. Intended for the
+/// `after_grace` hook of [`spawn_drain_task_ext`].
+pub async fn wait_for_active_drain(
+    active: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    max_wait: std::time::Duration,
+) {
+    use std::sync::atomic::Ordering;
+    if max_wait.is_zero() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + max_wait;
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        let n = active.load(Ordering::Relaxed);
+        if n == 0 {
+            tracing::info!("active drain: all in-flight streams completed");
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                remaining = n,
+                max_wait_secs = max_wait.as_secs(),
+                "active drain: deadline reached with streams still open; proceeding to shutdown"
+            );
+            return;
+        }
+        tracing::info!(remaining = n, "active drain: waiting for in-flight streams");
+        tick.tick().await;
+    }
 }
 
 #[cfg(test)]
@@ -627,5 +692,86 @@ mod tests {
             serve_shutdown.is_cancelled(),
             "zero grace → serve_shutdown fires without a sleep"
         );
+    }
+
+    /// `spawn_drain_task_ext`: after_grace hook runs AFTER the grace
+    /// sleep and BEFORE serve_shutdown fires. This is the ordering
+    /// rio-store relies on — endpoint propagation first (no new
+    /// streams), THEN wait for in-flight streams, THEN tear down.
+    #[tokio::test(start_paused = true)]
+    async fn drain_task_ext_after_grace_runs_between_sleep_and_cancel() {
+        let parent = CancellationToken::new();
+        let serve_shutdown = CancellationToken::new();
+        let not_serving = Arc::new(AtomicBool::new(false));
+        let after_grace_ran = Arc::new(AtomicBool::new(false));
+        let (ns, ag) = (Arc::clone(&not_serving), Arc::clone(&after_grace_ran));
+
+        spawn_drain_task_ext(
+            parent.clone(),
+            serve_shutdown.clone(),
+            Duration::from_secs(6),
+            move || async move { ns.store(true, Ordering::SeqCst) },
+            move || async move { ag.store(true, Ordering::SeqCst) },
+        );
+
+        parent.cancel();
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert!(not_serving.load(Ordering::SeqCst));
+        assert!(
+            !after_grace_ran.load(Ordering::SeqCst),
+            "after_grace must NOT run before grace elapses"
+        );
+        assert!(!serve_shutdown.is_cancelled());
+
+        tokio::time::advance(Duration::from_secs(7)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            after_grace_ran.load(Ordering::SeqCst),
+            "after_grace runs after grace sleep"
+        );
+        assert!(
+            serve_shutdown.is_cancelled(),
+            "serve_shutdown fires after after_grace completes"
+        );
+    }
+
+    /// `wait_for_active_drain` returns as soon as the counter zeroes,
+    /// without waiting out `max_wait`.
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_active_drain_returns_on_zero() {
+        use std::sync::atomic::AtomicUsize;
+        let active = Arc::new(AtomicUsize::new(2));
+        let a = Arc::clone(&active);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            a.store(0, Ordering::Relaxed);
+        });
+        let start = tokio::time::Instant::now();
+        wait_for_active_drain(&active, Duration::from_secs(60)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "should return ~3s after zeroing, not wait out 60s max_wait"
+        );
+    }
+
+    /// `wait_for_active_drain` gives up at `max_wait` even with streams
+    /// still open. Load-bearing: kubelet SIGKILLs at
+    /// `terminationGracePeriodSeconds` regardless, so a stuck stream
+    /// must not hang the drain past that.
+    // r[verify store.shutdown.drain-getpath]
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_active_drain_times_out() {
+        use std::sync::atomic::AtomicUsize;
+        let active = Arc::new(AtomicUsize::new(1));
+        let start = tokio::time::Instant::now();
+        wait_for_active_drain(&active, Duration::from_secs(10)).await;
+        let elapsed = start.elapsed();
+        assert!(
+            (Duration::from_secs(10)..Duration::from_secs(12)).contains(&elapsed),
+            "should give up at ~max_wait, got {elapsed:?}"
+        );
+        assert_eq!(active.load(Ordering::Relaxed), 1, "counter untouched");
     }
 }
