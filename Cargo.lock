@@ -6593,6 +6593,7 @@ dependencies = [
  "kube",
  "metrics",
  "parking_lot",
+ "prost",
  "rand 0.10.1",
  "rio-auth",
  "rio-common",

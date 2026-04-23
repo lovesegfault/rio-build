@@ -61,3 +61,5 @@ rio-test-support = { workspace = true }
 http = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 figment.workspace = true
+# Proto back-compat decode tests (tests/roundtrip.rs).
+prost = { workspace = true }

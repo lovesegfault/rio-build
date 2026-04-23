@@ -226,11 +226,13 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // becomes the gate instead. Keys on the explicit `ready` bit, NOT
     // `eta_seconds == 0.0`: a forecast intent with overdue deps clamps
     // to eta=0.0 and would otherwise pass as Ready (bug_030).
-    // TODO(bug_001): `unwrap_or(false)` preserves the pre-`optional`
-    // proto3 default; flip to `unwrap_or(true)` with the back-compat
-    // roundtrip test (batch 8) so a pre-§13a scheduler's absent field
-    // decodes as Ready, not filtered.
-    intents.retain(|i| i.ready.unwrap_or(false));
+    // `unwrap_or(true)`: field 13 is `optional`, so a pre-§13a
+    // scheduler's absent field decodes as `None`. Pre-§13a only ever
+    // emitted Ready-loop intents, so absent ⇒ Ready is provably the
+    // old behaviour; `unwrap_or(false)` would drop everything during a
+    // new-controller/old-scheduler skew window (bug_001). Pinned by
+    // `tests/roundtrip.rs::spawn_intent_ready_absent_is_legacy_ready`.
+    intents.retain(|i| i.ready.unwrap_or(true));
     let queued = intents.len().min(u32::MAX as usize) as u32;
 
     // ---- HwClassSampled (per-tick, one RPC for the union of A's) ----

@@ -720,6 +720,11 @@ fn pod_gets_hw_bench_needed_when_any_h_undersampled() {
 /// `eta_seconds == 0.0`. The third intent below has overdue deps
 /// (`eta_seconds` clamped to 0.0) but `ready=false` — it MUST be
 /// filtered out.
+///
+/// bug_001: `ready=None` (a pre-§13a scheduler that doesn't know
+/// field 13) MUST be retained — pre-§13a only emitted Ready-loop
+/// intents, so absent ⇒ Ready. The fourth intent below is the
+/// legacy-skew case.
 #[test]
 fn forecast_intents_filtered_in_13a() {
     // Unit-level: the `retain` is one line; assert directly on the
@@ -749,13 +754,24 @@ fn forecast_intents_filtered_in_13a() {
             hw_class_names: vec!["amd-9-hi".into()],
             ..Default::default()
         },
+        rio_proto::types::SpawnIntent {
+            intent_id: "legacy".into(),
+            ready: None, // pre-§13a sender — field 13 absent on wire
+            eta_seconds: 0.0,
+            hw_class_names: vec!["arm-v2-lo".into()],
+            ..Default::default()
+        },
     ];
     let mut filtered: Vec<_> = intents.to_vec();
-    filtered.retain(|i| i.ready.unwrap_or(false));
-    assert_eq!(filtered.len(), 1);
+    filtered.retain(|i| i.ready.unwrap_or(true));
+    assert_eq!(filtered.len(), 2);
     assert_eq!(filtered[0].intent_id, "ready");
+    assert_eq!(filtered[1].intent_id, "legacy");
     let hs: std::collections::HashSet<_> = filtered.iter().flat_map(jobs::hw_classes_in).collect();
-    assert_eq!(hs, std::collections::HashSet::from(["intel-7-mid".into()]));
+    assert_eq!(
+        hs,
+        std::collections::HashSet::from(["intel-7-mid".into(), "arm-v2-lo".into()])
+    );
 }
 
 // r[verify ctrl.pool.hw-class-annotation]
