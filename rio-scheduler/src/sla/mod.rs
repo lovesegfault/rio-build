@@ -445,7 +445,7 @@ impl SlaEstimator {
             .entry(key.tenant.clone())
             .or_insert_with(|| LruCache::new(self.max_keys_per_tenant));
         let k = (key.pname.clone(), key.system.clone());
-        // r[impl sched.sla.threat.corpus-clamp]
+        // r[impl sched.sla.threat.corpus-clamp+2]
         // Emitted BEFORE put: at-cap + key-absent ⇔ this insert evicts.
         // `LruCache::put`'s return is the OLD value of the same key on
         // overwrite (not the evicted entry), so checking the return

@@ -829,11 +829,11 @@ r[sched.sla.threat.hw-median-of-medians]
 `FLEET_MEDIAN_MIN_TENANTS = 5` so two colluding tenants cannot
 capture the cross-tenant median (§Threat-model gap b).
 
-r[sched.sla.threat.corpus-clamp]
+r[sched.sla.threat.corpus-clamp+2]
 `ImportSlaCorpus` / `sla.seedCorpus` MUST reject entries with
 non-finite or out-of-range params: `ref_factor_vec` per-dim
 `∈ [0.1,10]`, `Q ≥ 0`, `n_eff ≤ 32`, `S,P ∈ [0, buildTimeout_ref]`,
-`a,b ∈ [0, sla.maxMem]` (§Threat-model gap c).
+`a ∈ [0, ln(sla.maxMem)]`, `b ∈ [-2, 2]` (§Threat-model gap c).
 
 ## Key Files
 

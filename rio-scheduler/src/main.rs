@@ -161,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
     // default seeds are used and the poller only runs the λ refresh.
     let hw_cost_source = cfg.sla.hw_cost_source;
     let sla_cluster = cfg.sla.cluster.clone();
-    // r[sched.sla.threat.corpus-clamp]: AdminServiceImpl needs the
+    // r[sched.sla.threat.corpus-clamp+2]: AdminServiceImpl needs the
     // [sla] block for ImportSlaCorpus param-range validation. Cloned
     // before cfg.sla is moved into DagActorConfig below.
     let sla_for_admin = std::sync::Arc::new(cfg.sla.clone());

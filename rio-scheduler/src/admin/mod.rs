@@ -1007,7 +1007,7 @@ impl AdminService for AdminServiceImpl {
             _ => serde_json::from_str(&r.json)
                 .map_err(|e| Status::invalid_argument(format!("parse corpus json: {e}")))?,
         };
-        // r[impl sched.sla.threat.corpus-clamp]
+        // r[impl sched.sla.threat.corpus-clamp+2]
         // Gap (c): is_finite + range checks BEFORE the corpus reaches
         // the actor / priors.seed. The seed table bypasses
         // clamp_to_operator, so a single `s = 1e308` would otherwise

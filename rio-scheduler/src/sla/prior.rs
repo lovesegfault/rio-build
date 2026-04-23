@@ -154,7 +154,7 @@ impl From<rio_proto::types::SeedCorpus> for SeedCorpus {
     }
 }
 
-// r[impl sched.sla.threat.corpus-clamp]
+// r[impl sched.sla.threat.corpus-clamp+2]
 /// Reject one entry whose params are non-finite or outside the
 /// `[sla]`-derived bounds. The seed table is operator-supplied (via
 /// `[sla].seedCorpus` file or `ImportSlaCorpus` RPC) and is exempt from
@@ -165,6 +165,18 @@ impl From<rio_proto::types::SeedCorpus> for SeedCorpus {
 /// Bounds are coarse — they catch adversarial / corrupt inputs, not
 /// "this seed is a bit off". A legitimate seed that fails here is a
 /// config bug (e.g. `max_cores` too small for the exporting cluster).
+///
+/// **Spec-MUST fields** (range-checked per
+/// `r[sched.sla.threat.corpus-clamp]` — they feed
+/// [`ValidatedSeedCorpus::into_seed_map`] → [`partial_pool`]):
+/// `s`, `p`, `q`, `a`, `b`, `n_eff`, `alpha[]`.
+///
+/// **Round-trip-only fields** (operator inspection / export-import
+/// fidelity; NOT read by `into_seed_map` — finiteness check at most,
+/// never bounded by the *importer's* config): `p_bar`, `n`, `version`.
+/// Bounding these by local `cfg` would reject a valid corpus exported
+/// from a larger cluster (e.g. `Capped{p̄=90}` from `max_cores=128`
+/// fails on import to `max_cores=64`).
 pub fn validate_seed_entry(e: &SeedEntry, cfg: &SlaConfig) -> Result<(), String> {
     let bt_ref = cfg.build_timeout_ref();
     macro_rules! check {
@@ -180,7 +192,10 @@ pub fn validate_seed_entry(e: &SeedEntry, cfg: &SlaConfig) -> Result<(), String>
     check!(e.s, "S", 0.0, bt_ref);
     check!(e.p, "P", 0.0, bt_ref);
     check!(e.q, "Q", 0.0, bt_ref);
-    check!(e.p_bar, "p̄", 0.0, cfg.max_cores);
+    // p̄ is round-trip-only (see header) — finiteness only.
+    if !e.p_bar.is_finite() {
+        return Err(format!("{}: p̄ non-finite", e.pname));
+    }
     // `a`/`b` are `MemFit::Coupled` log-log params (`ln M = a + b·ln c`),
     // NOT bytes. `a = ln M(1)` so `[0, ln(max_mem)]`; `b` is the slope
     // and may be slightly negative on mem-independent workloads where
@@ -219,7 +234,7 @@ pub fn validate_corpus(c: &SeedCorpus, cfg: &SlaConfig) -> Result<(), String> {
 /// `AdminService.ImportSlaCorpus` at runtime) must construct one or
 /// the code doesn't compile; a future third ingress (e.g. a streaming
 /// `SyncSlaCorpus`) inherits the same guarantee.
-// r[impl sched.sla.threat.corpus-clamp]
+// r[impl sched.sla.threat.corpus-clamp+2]
 #[derive(Debug)]
 pub struct ValidatedSeedCorpus(SeedCorpus);
 
@@ -1081,7 +1096,7 @@ mod tests {
         }
     }
 
-    // r[verify sched.sla.threat.corpus-clamp]
+    // r[verify sched.sla.threat.corpus-clamp+2]
     #[test]
     fn validate_rejects_non_finite() {
         let cfg = vcfg();
@@ -1093,7 +1108,6 @@ mod tests {
                 |e: &mut SeedEntry, v| e.a = v,
                 |e: &mut SeedEntry, v| e.b = v,
                 |e: &mut SeedEntry, v| e.n_eff = v,
-                |e: &mut SeedEntry, v| e.p_bar = v,
             ] {
                 let mut e = ok_entry();
                 setter(&mut e, bad);
@@ -1107,15 +1121,14 @@ mod tests {
             e.alpha = vec![0.5, bad];
             assert!(validate_seed_entry(&e, &cfg).is_err(), "α={bad} accepted");
         }
-        // -1.0 rejected on every scalar EXCEPT b (log-log slope, may be
-        // negative on mem-independent workloads).
+        // -1.0 rejected on every range-checked scalar EXCEPT b (log-log
+        // slope, may be negative on mem-independent workloads).
         for setter in [
             |e: &mut SeedEntry, v| e.s = v,
             |e: &mut SeedEntry, v| e.p = v,
             |e: &mut SeedEntry, v| e.q = v,
             |e: &mut SeedEntry, v| e.a = v,
             |e: &mut SeedEntry, v| e.n_eff = v,
-            |e: &mut SeedEntry, v| e.p_bar = v,
         ] {
             let mut e = ok_entry();
             setter(&mut e, -1.0);
@@ -1129,11 +1142,31 @@ mod tests {
         );
         e.b = -3.0;
         assert!(validate_seed_entry(&e, &cfg).is_err(), "|b|>2 rejected");
+        // p̄ is round-trip-only: finiteness checked, NOT bounded by the
+        // importer's max_cores. A `Capped{p̄=90}` exported from a
+        // max_cores=128 cluster must import cleanly to max_cores=64.
+        assert_eq!(cfg.max_cores, 64.0);
+        let mut e = ok_entry();
+        e.p_bar = 90.0;
+        assert!(
+            validate_seed_entry(&e, &cfg).is_ok(),
+            "p̄=90 > importer max_cores=64 must be Ok (round-trip-only)"
+        );
+        e.p_bar = -1.0;
+        assert!(
+            validate_seed_entry(&e, &cfg).is_ok(),
+            "p̄=-1 finite → Ok (no range check on round-trip-only field)"
+        );
+        e.p_bar = f64::NAN;
+        assert!(
+            validate_seed_entry(&e, &cfg).is_err(),
+            "p̄=NaN must still be rejected"
+        );
         // Control: ok_entry passes.
         assert!(validate_seed_entry(&ok_entry(), &cfg).is_ok());
     }
 
-    // r[verify sched.sla.threat.corpus-clamp]
+    // r[verify sched.sla.threat.corpus-clamp+2]
     #[test]
     fn validate_clamps_ranges() {
         let cfg = vcfg();
@@ -1145,10 +1178,7 @@ mod tests {
         let mut e = ok_entry();
         e.q = -0.1;
         assert!(validate_seed_entry(&e, &cfg).is_err(), "Q < 0");
-        // p̄ ∈ [0, max_cores] (0 is the export sentinel for ∞)
-        let mut e = ok_entry();
-        e.p_bar = cfg.max_cores + 1.0;
-        assert!(validate_seed_entry(&e, &cfg).is_err(), "p̄ > max_cores");
+        // p̄ finite-only (round-trip field; 0 is the export sentinel for ∞)
         let mut e = ok_entry();
         e.p_bar = 0.0;
         assert!(
@@ -1159,10 +1189,10 @@ mod tests {
         let mut e = ok_entry();
         e.n_eff = 33.0;
         assert!(validate_seed_entry(&e, &cfg).is_err(), "n_eff > 32");
-        // a, b ∈ [0, max_mem]
+        // a ∈ [0, ln(max_mem)], b ∈ [-2, 2] (log-log domain, NOT bytes)
         let mut e = ok_entry();
-        e.a = (256.0 * GIB as f64) + 1.0;
-        assert!(validate_seed_entry(&e, &cfg).is_err(), "a > max_mem");
+        e.a = (cfg.max_mem as f64).ln() + 1.0;
+        assert!(validate_seed_entry(&e, &cfg).is_err(), "a > ln(max_mem)");
         // α ∈ [0, 1]^K
         let mut e = ok_entry();
         e.alpha = vec![1.1];
@@ -1199,7 +1229,7 @@ mod tests {
         assert!(validate_corpus(&ok, &cfg).is_ok());
     }
 
-    // r[verify sched.sla.threat.corpus-clamp]
+    // r[verify sched.sla.threat.corpus-clamp+2]
     #[test]
     fn validate_accepts_v1_entry_defaults() {
         // v1 JSON has no version/alpha/n_eff/ref_factor_vec → all
