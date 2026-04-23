@@ -193,6 +193,53 @@ pub const SLA_METRICS: &[&str] = &[
     "rio_scheduler_sla_keys_evicted_total",
 ];
 
+/// Metrics with a closed-domain label whose VALUES are each a separate
+/// observability contract — the operator alerts on
+/// `reason="api_error"`, not the bare counter. Each `(name, label,
+/// value)` triple is checked by
+/// [`tests::labeled_metric_values_have_emit_sites`] for a production
+/// emit. Catches the bug_039 / merged_bug_006 class: name has ≥1 emit,
+/// but a documented value has zero (`infeasible_total` had emits;
+/// `reason="interrupt_runaway"` had none).
+///
+/// Two emit shapes are matched (see the test for the matcher):
+///   1. Inline literal — `counter!("name", …, "label" => "value")`
+///   2. Enum-dispatch — `counter!("name", …, "label" => x.as_str())`
+///      where `=> "value"` is a match arm AND `Reason::{Variant}`
+///      appears as a constructor in production source (i.e., NOT just
+///      `Self::Variant` in `ALL` / `as_str()`).
+///
+/// `_envelope_result_total{result}` is deliberately NOT listed: its
+/// `hit`/`miss` literals originate in [`score_completion`] above
+/// (excluded from `SLA_FILES` by design — emit sites must live next to
+/// the production code path) and are pinned directly by the
+/// `envelope_*` tests below.
+#[cfg(test)]
+pub const SLA_LABELED_METRICS: &[(&str, &str, &[&str])] = &[
+    (
+        "rio_scheduler_sla_infeasible_total",
+        "reason",
+        &[
+            "serial_floor",
+            "mem_ceiling",
+            "disk_ceiling",
+            "core_ceiling",
+            "interrupt_runaway",
+            "capacity_exhausted",
+        ],
+    ),
+    (
+        "rio_scheduler_sla_hw_cost_fallback_total",
+        "reason",
+        &["api_error", "empty_history", "parse", "stale"],
+    ),
+    (
+        "rio_scheduler_sla_hw_ladder_exhausted_total",
+        "exit",
+        &["all_masked"],
+    ),
+];
+
 #[cfg(test)]
 mod tests {
     use super::super::solve::InfeasibleReason;
@@ -214,13 +261,14 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// Concatenated source of every file containing a `counter!` /
-    /// `gauge!` / `histogram!` call for an `SLA_METRICS` name.
-    /// Excludes THIS file: emit sites must live next to the production
-    /// code path, not in a wrapper here. Adding an emit-file means
-    /// adding it here too — but forgetting to do so fails the test
-    /// (the metric appears nowhere), which is the safe direction.
-    const SLA_SOURCE: &str = concat!(
+    /// Source of every file with an SLA emit site, as separate strings
+    /// so [`prod`] can strip each file's trailing `mod tests` block
+    /// independently. Excludes THIS file: emit sites must live next to
+    /// the production code path, not in a wrapper here. Adding an
+    /// emit-file means adding it here too — but forgetting to do so
+    /// fails the test (the metric appears nowhere), which is the safe
+    /// direction.
+    const SLA_FILES: &[&str] = &[
         include_str!("solve.rs"),
         include_str!("ingest.rs"),
         include_str!("cost.rs"),
@@ -229,49 +277,85 @@ mod tests {
         include_str!("prior.rs"),
         include_str!("../actor/snapshot.rs"),
         include_str!("../actor/completion.rs"),
-    );
+    ];
 
-    /// `src` contains `"{name}"` as the first argument of a `counter!`
-    /// / `gauge!` / `histogram!` macro (possibly across a line break).
-    /// Rejects `describe_counter!` etc. by checking the char before
-    /// the macro name is not a word-char.
-    fn has_emit(src: &str, name: &str) -> bool {
+    const EMIT_MACROS: [&str; 3] = ["counter!(", "gauge!(", "histogram!("];
+    const DESCRIBE_MACROS: [&str; 3] = [
+        "describe_counter!(",
+        "describe_gauge!(",
+        "describe_histogram!(",
+    ];
+
+    /// `src` truncated at its trailing `#[cfg(test)] mod tests` block.
+    /// Inline `#[cfg(test)] fn` helpers earlier in the file are kept;
+    /// only the test MODULE is dropped, so the label-value coverage
+    /// check ignores test fixtures' `InfeasibleReason::Foo` references
+    /// and test-only `counter!` calls.
+    fn prod(src: &str) -> &str {
+        src.split_once("#[cfg(test)]\nmod tests")
+            .map_or(src, |(p, _)| p)
+    }
+
+    /// Argument-tail (next ≤256 bytes) of every `macros`-prefixed
+    /// `"{name}"` literal in `src` — i.e., the slice immediately after
+    /// the metric-name argument, holding the `"label" => value` pairs.
+    /// Rejects word-char-prefixed matches so `describe_counter!(` does
+    /// not satisfy `counter!(`. 256B covers every emit call in the
+    /// codebase (≤8 lines) without bleeding past the next `counter!`
+    /// for a *different* metric name.
+    fn macro_call_tails<'a>(src: &'a str, name: &str, macros: &[&str]) -> Vec<&'a str> {
         let needle = format!("\"{name}\"");
+        let mut out = vec![];
         let mut at = 0;
         while let Some(i) = src[at..].find(&needle) {
             let pos = at + i;
-            let head = &src[pos.saturating_sub(64)..pos];
-            let head = head.trim_end();
-            for m in ["counter!(", "gauge!(", "histogram!("] {
-                if let Some(pre) = head.strip_suffix(m)
-                    && !pre
-                        .chars()
+            let mut hs = pos.saturating_sub(64);
+            while !src.is_char_boundary(hs) {
+                hs += 1;
+            }
+            let head = src[hs..pos].trim_end();
+            if macros.iter().any(|m| {
+                head.strip_suffix(m).is_some_and(|pre| {
+                    !pre.chars()
                         .last()
                         .is_some_and(|c| c.is_alphanumeric() || c == '_')
-                {
-                    return true;
+                })
+            }) {
+                let start = pos + needle.len();
+                let mut end = (start + 256).min(src.len());
+                while !src.is_char_boundary(end) {
+                    end -= 1;
                 }
+                out.push(&src[start..end]);
             }
             at = pos + needle.len();
         }
-        false
+        out
+    }
+
+    /// `src` contains `"{name}"` as the first argument of one of
+    /// `macros` (possibly across a line break).
+    fn has_macro_call(src: &str, name: &str, macros: &[&str]) -> bool {
+        !macro_call_tails(src, name, macros).is_empty()
     }
 
     /// Every `SLA_METRICS` name has a `describe_*!` registration AND at
     /// least one production `counter!`/`gauge!`/`histogram!` emit site
-    /// in [`SLA_SOURCE`]. The previous version of this test
+    /// in [`SLA_FILES`]. The previous version of this test
     /// self-invoked the wrapper functions, which made it pass for
     /// metrics with zero production callers — exactly the drift it was
-    /// meant to catch.
+    /// meant to catch. The version before THAT checked registration
+    /// via `describe_src.contains("\"name\"")`, which matched the
+    /// `SLA_METRICS` const itself — vacuously true.
     #[test]
     fn registered_and_emitted_are_consistent() {
-        // Registration side: every SLA_METRICS name must appear as a
-        // string literal in describe_all()'s source. THIS file is the
-        // only place describe_* lives, so include_str! itself.
+        // Registration side: every SLA_METRICS name must appear inside
+        // a describe_*! macro in describe_all()'s source. THIS file is
+        // the only place describe_* lives, so include_str! itself.
         let describe_src = include_str!("metrics.rs");
         for name in SLA_METRICS {
             assert!(
-                describe_src.contains(&format!("\"{name}\"")),
+                has_macro_call(describe_src, name, &DESCRIBE_MACROS),
                 "{name} in SLA_METRICS but no describe_*! registration"
             );
         }
@@ -280,9 +364,11 @@ mod tests {
         // source file (NOT this one).
         for name in SLA_METRICS {
             assert!(
-                has_emit(SLA_SOURCE, name),
+                SLA_FILES
+                    .iter()
+                    .any(|f| has_macro_call(f, name, &EMIT_MACROS)),
                 "{name} registered but never emitted in production code \
-                 (no counter!/gauge!/histogram! call found in SLA_SOURCE)"
+                 (no counter!/gauge!/histogram! call found in SLA_FILES)"
             );
         }
         // Retired metrics must NOT appear at any emit site.
@@ -292,25 +378,133 @@ mod tests {
             "rio_scheduler_sla_als_cap_hit_total",
         ] {
             assert!(
-                !has_emit(SLA_SOURCE, retired),
+                !SLA_FILES
+                    .iter()
+                    .any(|f| has_macro_call(f, retired, &EMIT_MACROS)),
                 "{retired} is retired but still emitted"
             );
         }
     }
 
+    /// `snake_case` → `PascalCase` for the enum-dispatch variant check
+    /// (`interrupt_runaway` → `InterruptRunaway`).
+    fn pascal(s: &str) -> String {
+        s.split('_')
+            .filter_map(|w| {
+                let mut it = w.chars();
+                it.next()
+                    .map(|c| c.to_ascii_uppercase().to_string() + it.as_str())
+            })
+            .collect()
+    }
+
+    /// Every `(name, label, value)` in [`SLA_LABELED_METRICS`] has a
+    /// production emit. Two shapes are accepted:
+    ///
+    /// 1. **Inline literal** — an emit-macro call for `name` whose
+    ///    argument tail contains `"label" => "value"` verbatim.
+    ///    Covers `_hw_cost_fallback_total`, `_hw_ladder_exhausted_total`.
+    /// 2. **Enum-dispatch** — an emit-macro call for `name` whose tail
+    ///    contains `"label" => …as_str()`, AND production source has a
+    ///    `=> "value"` match arm, AND production source constructs the
+    ///    variant as `Reason::{Pascal}` (the `Self::` references in
+    ///    `ALL` / `as_str()` don't count — they're definition-site, not
+    ///    a reachable constructor). Covers `_infeasible_total`.
+    ///
+    /// Also asserts the converse for inline literals: every
+    /// `"label" => "literal"` value at an emit site for `name` is in
+    /// the declared set (the `emitted ⊆ documented` direction the
+    /// `admissible-set` VM subtest used to own). Enum-dispatch
+    /// soundness is [`infeasible_reasons_complete`] — `ALL` is the
+    /// closed domain.
     #[test]
-    fn has_emit_distinguishes_describe_from_emit() {
+    fn labeled_metric_values_have_emit_sites() {
+        let prod_src: String = SLA_FILES.iter().copied().map(prod).collect();
+        for &(name, label, values) in SLA_LABELED_METRICS {
+            let tails: Vec<&str> = SLA_FILES
+                .iter()
+                .flat_map(|f| macro_call_tails(prod(f), name, &EMIT_MACROS))
+                .collect();
+            assert!(!tails.is_empty(), "{name}: no production emit site");
+            // Completeness: every documented value is emitted.
+            for &v in values {
+                let inline = format!(r#""{label}" => "{v}""#);
+                if tails.iter().any(|t| t.contains(&inline)) {
+                    continue;
+                }
+                let via_as_str = tails
+                    .iter()
+                    .any(|t| t.contains(&format!(r#""{label}" => "#)) && t.contains(".as_str()"));
+                let arm = format!(r#"=> "{v}""#);
+                let ctor = format!("Reason::{}", pascal(v));
+                assert!(
+                    via_as_str && prod_src.contains(&arm) && prod_src.contains(&ctor),
+                    "{name}{{{label}=\"{v}\"}}: no production emit. \
+                     inline `{inline}` absent; enum-dispatch \
+                     via_as_str={via_as_str}, arm `{arm}` present={}, \
+                     ctor `{ctor}` present={}",
+                    prod_src.contains(&arm),
+                    prod_src.contains(&ctor),
+                );
+            }
+            // Soundness: every inline literal value is documented.
+            let lit = format!(r#""{label}" => ""#);
+            for t in &tails {
+                for (i, _) in t.match_indices(&lit) {
+                    let vs = i + lit.len();
+                    let Some(ve) = t[vs..].find('"') else {
+                        continue;
+                    };
+                    let found = &t[vs..vs + ve];
+                    assert!(
+                        values.contains(&found),
+                        "{name}{{{label}=\"{found}\"}} emitted but NOT in \
+                         SLA_LABELED_METRICS — undocumented label value"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn has_macro_call_distinguishes_prefix_and_bare_literal() {
         // Guard the guard. Test data is built at runtime so the
         // crate-wide `grep_emitted_names` source-grep (which scans
         // THIS file for `metrics::counter!("…"` literals) doesn't
         // pick up synthetic names.
         let m = "metrics";
-        // `describe_counter!("X"` must NOT match — its tail is
-        // `counter!(` but the preceding `_` disqualifies.
-        assert!(!has_emit(r#"describe_counter!("X")"#, "X"));
-        assert!(has_emit(&format!(r#"::{m}::counter!("X")"#), "X"));
-        assert!(has_emit(&format!("{m}::gauge!(\n            \"X\""), "X"));
-        assert!(!has_emit(r#"// see "X" metric"#, "X"));
+        // `describe_counter!("X"` must NOT match EMIT_MACROS — its
+        // tail is `counter!(` but the preceding `_` disqualifies.
+        assert!(!has_macro_call(
+            r#"describe_counter!("X")"#,
+            "X",
+            &EMIT_MACROS
+        ));
+        assert!(has_macro_call(
+            &format!(r#"::{m}::counter!("X")"#),
+            "X",
+            &EMIT_MACROS
+        ));
+        assert!(has_macro_call(
+            &format!("{m}::gauge!(\n            \"X\""),
+            "X",
+            &EMIT_MACROS
+        ));
+        assert!(!has_macro_call(r#"// see "X" metric"#, "X", &EMIT_MACROS));
+        // DESCRIBE_MACROS: matches `describe_counter!("X"` but NOT a
+        // bare `"X",` literal (the bug_040 vacuous-match case — the
+        // SLA_METRICS const definition itself).
+        assert!(has_macro_call(
+            r#"describe_counter!("X")"#,
+            "X",
+            &DESCRIBE_MACROS
+        ));
+        assert!(!has_macro_call(r#""foo","#, "foo", &DESCRIBE_MACROS));
+        assert!(!has_macro_call(
+            &format!(r#"::{m}::counter!("X")"#),
+            "X",
+            &DESCRIBE_MACROS
+        ));
     }
 
     fn pred(wall: f64, mem: u64, tier: &str, target: f64) -> SlaPrediction {

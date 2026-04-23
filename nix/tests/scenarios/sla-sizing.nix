@@ -645,13 +645,9 @@ let
               assert reason in help_line, (
                   f"reason '{reason}' missing from /metrics HELP: {help_line!r}"
               )
-          # Every emitted reason= label is one of the documented six.
-          import re as _re
-          emitted = set(_re.findall(r'reason="([^"]+)"', body))
-          assert emitted, f"no reason= series emitted: {body!r}"
-          assert emitted.issubset(set(reasons)), (
-              f"undocumented reason label(s) {emitted - set(reasons)!r} in /metrics"
-          )
+          # Per-value emit coverage (both directions) is owned by the
+          # `labeled_metric_values_have_emit_sites` unit test now —
+          # this subtest only asserts the HELP line surfaces.
           # Cleanup: drain + restore worker for seed-corpus.
           client.execute("pkill -f 'nix-build.*synth-' || true")
           worker.systemctl("start rio-builder")
