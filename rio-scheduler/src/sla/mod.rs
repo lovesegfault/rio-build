@@ -180,7 +180,7 @@ pub struct SlaEstimator {
     /// (`factor(anything)=1.0`); converting there would silently bypass
     /// cross-fleet rescaling. [`Self::refresh`] one-shot-converts this
     /// after the first POPULATED `HwTable::load` (Ok ∧ non-empty).
-    pending_seed: Mutex<Option<prior::SeedCorpus>>,
+    pending_seed: Mutex<Option<prior::ValidatedSeedCorpus>>,
     /// `[sla].default_tier`'s [`binding_bound`] in the operator-facing
     /// **wall-second** basis (as written in config). `refresh()`
     /// converts to ref-seconds (`× factor[hw.reference]`) and stores
@@ -210,10 +210,10 @@ impl SlaEstimator {
         let pending_seed =
             cfg.seed_corpus
                 .as_deref()
-                .and_then(|p| match prior::SeedCorpus::load(p) {
+                .and_then(|p| match prior::SeedCorpus::load(p, cfg) {
                     Ok(corpus) => {
                         tracing::info!(
-                            entries = corpus.entries.len(),
+                            entries = corpus.entries_len(),
                             path = %p.display(),
                             "sla seed corpus parsed; rescale deferred to first refresh"
                         );
@@ -413,10 +413,10 @@ impl SlaEstimator {
     /// `rio-cli sla import-corpus` scripted immediately after `helm
     /// install`); the corpus is stashed into `pending_seed` and
     /// rescaled on the next populated `refresh` tick.
-    pub fn import_seed(&self, corpus: prior::SeedCorpus) -> (usize, f64) {
+    pub fn import_seed(&self, corpus: prior::ValidatedSeedCorpus) -> (usize, f64) {
         let hw = self.hw.read();
         if hw.is_empty() {
-            let n = corpus.entries.len();
+            let n = corpus.entries_len();
             *self.pending_seed.lock() = Some(corpus);
             return (n, f64::NAN);
         }
@@ -941,7 +941,7 @@ mod tests {
         m.insert("ref".into(), 1.0);
         dst.seed_hw(hw::HwTable::from_map(m));
         let parsed: prior::SeedCorpus = serde_json::from_str(&json).unwrap();
-        let (n, _) = dst.import_seed(parsed);
+        let (n, _) = dst.import_seed(prior::ValidatedSeedCorpus::assume_valid(parsed));
         assert_eq!(n, 5);
 
         // prior_for on a key from the corpus → Seed; on an unknown →
@@ -1024,22 +1024,24 @@ mod tests {
         // bypassed); `apply_pending_seed` against a populated table
         // must rescale by `factor[fast]/factor[reference]`.
         let est = SlaEstimator::for_test(&cfg());
-        *est.pending_seed.lock() = Some(prior::SeedCorpus {
-            ref_hw_class: "fast".into(),
-            entries: vec![prior::SeedEntry {
-                pname: "hello".into(),
-                system: "x86_64-linux".into(),
-                s: 100.0,
-                p: 200.0,
-                q: 0.0,
-                p_bar: 0.0,
-                a: 22.0,
-                b: 0.5,
-                n: 5,
+        *est.pending_seed.lock() = Some(prior::ValidatedSeedCorpus::assume_valid(
+            prior::SeedCorpus {
+                ref_hw_class: "fast".into(),
+                entries: vec![prior::SeedEntry {
+                    pname: "hello".into(),
+                    system: "x86_64-linux".into(),
+                    s: 100.0,
+                    p: 200.0,
+                    q: 0.0,
+                    p_bar: 0.0,
+                    a: 22.0,
+                    b: 0.5,
+                    n: 5,
+                    ..Default::default()
+                }],
                 ..Default::default()
-            }],
-            ..Default::default()
-        });
+            },
+        ));
         assert!(
             est.prior_sources().seed.is_empty(),
             "new() defers conversion"
@@ -1073,22 +1075,24 @@ mod tests {
         // fresh cluster). apply_pending_seed must NOT consume the seed
         // against an empty table (scale would be 1.0/1.0).
         let est = SlaEstimator::for_test(&cfg());
-        *est.pending_seed.lock() = Some(prior::SeedCorpus {
-            ref_hw_class: "fast".into(),
-            entries: vec![prior::SeedEntry {
-                pname: "hello".into(),
-                system: "x86_64-linux".into(),
-                s: 100.0,
-                p: 200.0,
-                q: 0.0,
-                p_bar: 0.0,
-                a: 22.0,
-                b: 0.5,
-                n: 5,
+        *est.pending_seed.lock() = Some(prior::ValidatedSeedCorpus::assume_valid(
+            prior::SeedCorpus {
+                ref_hw_class: "fast".into(),
+                entries: vec![prior::SeedEntry {
+                    pname: "hello".into(),
+                    system: "x86_64-linux".into(),
+                    s: 100.0,
+                    p: 200.0,
+                    q: 0.0,
+                    p_bar: 0.0,
+                    a: 22.0,
+                    b: 0.5,
+                    n: 5,
+                    ..Default::default()
+                }],
                 ..Default::default()
-            }],
-            ..Default::default()
-        });
+            },
+        ));
         est.apply_pending_seed(&hw::HwTable::default());
         assert!(
             est.pending_seed.lock().is_some(),
@@ -1130,7 +1134,7 @@ mod tests {
             ..Default::default()
         };
         // hw empty → stashed, factor=NaN sentinel.
-        let (n, scale) = est.import_seed(corpus);
+        let (n, scale) = est.import_seed(prior::ValidatedSeedCorpus::assume_valid(corpus));
         assert_eq!(n, 1);
         assert!(scale.is_nan(), "deferred sentinel");
         assert!(est.prior_sources().seed.is_empty());

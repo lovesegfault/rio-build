@@ -140,10 +140,6 @@ pub struct BuildSpawnContext {
     /// `Clone` and the panic handler can read whatever the consumer
     /// wrote.
     pub hw_class: Arc<std::sync::Mutex<Option<String>>>,
-    /// `RIO_TENANT` (downward-API): which tenant's build this pod was
-    /// spawned for. Written to `hw_perf_samples.submitting_tenant` via
-    /// `AppendHwPerfSample` for the median-of-medians defense.
-    pub tenant: String,
     /// Shared handle to the cgroup-poll `ResourceUsage` snapshot
     /// (same `Arc` as the heartbeat loop). Read once at completion
     /// time to populate `CompletionReport.final_resources` — the
@@ -274,7 +270,6 @@ pub async fn spawn_build_task(
         let mut store = ctx.store_clients.store.clone();
         let hw_class_cell = Arc::clone(&ctx.hw_class);
         let pod_id = ctx.executor_id.clone();
-        let tenant = ctx.tenant.clone();
         let token = assignment_token.clone();
         rio_common::task::spawn_monitored("hw-bench-send", async move {
             let (hw_class, factor) = match bench.await {
@@ -289,8 +284,7 @@ pub async fn spawn_build_task(
             *hw_class_cell.lock().unwrap_or_else(|e| e.into_inner()) =
                 (!hw_class.is_empty()).then(|| hw_class.clone());
             if let Some(factor) = factor {
-                crate::hw_bench::send(&mut store, &hw_class, &pod_id, factor, &tenant, &token)
-                    .await;
+                crate::hw_bench::send(&mut store, &hw_class, &pod_id, factor, &token).await;
             }
         });
     }

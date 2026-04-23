@@ -1,7 +1,7 @@
 //! ADR-023 §Hardware heterogeneity: K=3 self-calibration microbench.
 //!
 //! Runs once at builder init (before accepting any assignment) and
-//! reports `(hw_class, pod_id, factor jsonb, submitting_tenant)` to
+//! reports `(hw_class, pod_id, factor jsonb)` to
 //! `hw_perf_samples` via the store's `AppendHwPerfSample` RPC. The
 //! scheduler's `HwTable` per-dimension median maps wall-seconds →
 //! reference-seconds before fitting T(c).
@@ -344,21 +344,17 @@ pub fn spawn_measure(
 /// caller (`spawn_build_task`) awaits the spawned resolve→bench task
 /// and passes the `[f64; K]` here.
 ///
-/// `submitting_tenant` is the pod's `RIO_TENANT` (downward-API): which
-/// tenant's build this pod was spawned for. Feeds the per-tenant
-/// median-of-medians defense (ADR-023 threat-model gap b).
-///
 /// **Why deferred until an assignment token is in hand:** the store
 /// gates `AppendHwPerfSample` on `x-rio-assignment-token` and derives
-/// `pod_id` from the token's `executor_id` claim
-/// (`r[sec.boundary.grpc-hmac]`). The body `pod_id` is sent for
-/// dev-mode fallback only.
+/// `pod_id` AND `submitting_tenant` from the token's signed claims
+/// (`r[sec.boundary.grpc-hmac]`, `r[sched.sla.threat.
+/// hw-median-of-medians]`). The body `pod_id` is sent for dev-mode
+/// fallback only; tenant never transits the body.
 pub async fn send(
     store: &mut rio_proto::StoreServiceClient<tonic::transport::Channel>,
     hw_class: &str,
     pod_id: &str,
     factor: [f64; K],
-    submitting_tenant: &str,
     assignment_token: &str,
 ) {
     let factor_json = serde_json::json!({
@@ -367,13 +363,11 @@ pub async fn send(
         "ioseq": factor[IOSEQ],
     })
     .to_string();
-    tracing::info!(%hw_class, %pod_id, %factor_json, %submitting_tenant,
-                   "hw_bench: measured");
+    tracing::info!(%hw_class, %pod_id, %factor_json, "hw_bench: measured");
     let mut req = tonic::Request::new(rio_proto::types::AppendHwPerfSampleRequest {
         hw_class: hw_class.to_owned(),
         pod_id: pod_id.to_owned(),
         factor_json,
-        submitting_tenant: submitting_tenant.to_owned(),
     });
     if let Err(e) = crate::upload::common::attach_assignment_token(&mut req, assignment_token) {
         tracing::warn!(error = %e, "hw_bench: attach_assignment_token failed (best-effort)");

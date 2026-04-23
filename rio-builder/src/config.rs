@@ -138,12 +138,6 @@ pub struct Config {
     /// Fail-closed: when `false` only the scalar `alu` probe runs and
     /// the K=3 bench is skipped (`r[sched.sla.hw-class.k3-bench]`).
     pub hw_bench_needed: bool,
-    /// Tenant whose build this pod was spawned for (downward API →
-    /// `RIO_TENANT`, from the SpawnIntent). Written to
-    /// `hw_perf_samples.submitting_tenant` so the per-tenant
-    /// median-of-medians defense (ADR-023 threat-model gap b) can
-    /// isolate one compromised tenant's bench rows. Empty outside k8s.
-    pub tenant: String,
     /// ADR-023 SpawnIntent match key from the pod's `rio.build/
     /// intent-id` annotation (downward API → `RIO_INTENT_ID`). Sent
     /// in every heartbeat so the scheduler can match this pod to its
@@ -222,7 +216,6 @@ impl Default for Config {
             node_name: String::new(),
             hw_class: String::new(),
             hw_bench_needed: false,
-            tenant: String::new(),
             intent_id: String::new(),
             executor_token: String::new(),
             daemon_timeout: crate::executor::DEFAULT_DAEMON_TIMEOUT,

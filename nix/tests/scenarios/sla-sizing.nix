@@ -297,18 +297,19 @@ let
 
     hw-normalize = ''
       with subtest("hw-normalize: mixed hw_class samples refit to same ref-seconds"):
-          # Two synthetic hw_classes with a 2x throughput gap. HwTable
-          # admits a class once >=3 distinct pod_ids have benched (the
-          # app-side aggregate after M_054 dropped the hw_perf_factors
-          # view); seed those directly so the refit reads
-          # factor[slow]=1.0, factor[fast]=2.0.
+          # Two synthetic hw_classes with a 2x throughput gap.
+          # cross_tenant_median admits a class once >=3 distinct
+          # pod_ids AND >=FLEET_MEDIAN_MIN_TENANTS (5) distinct
+          # submitting_tenant have benched; seed 5 of each so the
+          # refit reads factor[slow]=1.0, factor[fast]=2.0.
           for hw, factor in [("synth-slow", 1.0), ("synth-fast", 2.0)]:
-              for i in range(3):
+              for i in range(5):
                   ${gatewayHost}.succeed(
                       "sudo -u postgres psql -d rio -c \""
-                      "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) "
+                      "INSERT INTO hw_perf_samples "
+                      "(hw_class, pod_id, factor, submitting_tenant) "
                       f"VALUES ('{hw}', 'pod-{hw}-{i}', "
-                      f"jsonb_build_object('alu', {factor}))\""
+                      f"jsonb_build_object('alu', {factor}), 't{i}')\""
                   )
           # Same true T(c) curve (S=30, P=2000) sampled on both: fast
           # hw reports half the wall-clock. After hw normalization both
@@ -355,12 +356,13 @@ let
           # GetSpawnIntents instead of inspecting a pod spec.
           band_hw = [("intel-6-ebs-lo", 1.0), ("intel-7-ebs-mid", 1.4), ("intel-8-nvme-hi", 2.0)]
           for hw, factor in band_hw:
-              for i in range(3):
+              for i in range(5):
                   ${gatewayHost}.succeed(
                       "sudo -u postgres psql -d rio -c \""
-                      "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) "
+                      "INSERT INTO hw_perf_samples "
+                      "(hw_class, pod_id, factor, submitting_tenant) "
                       f"VALUES ('{hw}', 'pod-{hw}-{i}', "
-                      f"jsonb_build_object('alu', {factor}))\""
+                      f"jsonb_build_object('alu', {factor}), 't{i}')\""
                   )
               # Low lambda (1 interrupt / 3600s exposure) so spot
               # stays feasible under the p>0.5 gate.

@@ -318,7 +318,6 @@ pub async fn setup(
         // `hw_bench` on the first assignment. Before then, `None` —
         // the documented "unknown hw" semantics.
         hw_class: Arc::new(std::sync::Mutex::new(None)),
-        tenant: cfg.tenant.clone(),
         // Same Arc as the heartbeat loop (above) — completion reads
         // the snapshot the cgroup poller has been maintaining.
         resources: resource_snapshot,

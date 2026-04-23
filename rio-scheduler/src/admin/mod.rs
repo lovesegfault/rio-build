@@ -123,10 +123,10 @@ pub struct AdminServiceImpl {
     /// Empty for the single-cluster default (matches the `DEFAULT ''`
     /// migration-043 column).
     cluster: String,
-    /// Full `[sla]` block — `import_sla_corpus` calls
-    /// `prior::validate_corpus(&corpus, &self.sla_config)` BEFORE the
-    /// corpus reaches the actor (`r[sched.sla.threat.corpus-clamp]`).
-    /// `Arc` because `DagActor` holds the same.
+    /// Full `[sla]` block — `import_sla_corpus` constructs a
+    /// `prior::ValidatedSeedCorpus` against this BEFORE the corpus
+    /// reaches the actor (`r[sched.sla.threat.corpus-clamp]`). `Arc`
+    /// because `DagActor` holds the same.
     sla_config: Arc<crate::sla::config::SlaConfig>,
     /// Verifies `x-rio-service-token` for controller-only mutating RPCs
     /// (`AppendInterruptSample`, `DrainExecutor`). `None` = dev mode
@@ -1012,9 +1012,12 @@ impl AdminService for AdminServiceImpl {
         // the actor / priors.seed. The seed table bypasses
         // clamp_to_operator, so a single `s = 1e308` would otherwise
         // propagate verbatim into partial_pool → T(c) → solve.
-        crate::sla::prior::validate_corpus(&corpus, &self.sla_config)
+        // `ValidatedSeedCorpus` is the only type the actor accepts —
+        // both this RPC and the startup `[sla].seedCorpus` load go
+        // through the same constructor, so neither path can skip it.
+        let corpus = crate::sla::prior::ValidatedSeedCorpus::validate(corpus, &self.sla_config)
             .map_err(|e| Status::invalid_argument(format!("corpus rejected: {e}")))?;
-        let ref_hw_class = corpus.ref_hw_class.clone();
+        let ref_hw_class = corpus.ref_hw_class().to_owned();
         let (n, scale) = query_actor(&self.actor, |reply| {
             ActorCommand::Admin(AdminQuery::SlaImportCorpus { corpus, reply })
         })

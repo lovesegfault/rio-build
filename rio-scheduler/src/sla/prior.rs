@@ -22,7 +22,7 @@ use super::types::ModelKey;
 ///
 /// All time-domain fields (`s`, `p`, `q`) are in this cluster's
 /// reference-second basis (`r[sched.sla.hw-ref-seconds]`). Construct via
-/// `ingest::extract_fit_params` / [`SeedCorpus::into_seed_map`] /
+/// `ingest::extract_fit_params` / [`ValidatedSeedCorpus::into_seed_map`] /
 /// [`operator_to_spq`]; never from wall-seconds directly. (`a`, `b` are
 /// in raw bytes / dimensionless and are NOT hw-normalized.)
 #[derive(Debug, Clone, PartialEq)]
@@ -197,11 +197,9 @@ pub fn validate_seed_entry(e: &SeedEntry, cfg: &SlaConfig) -> Result<(), String>
 }
 
 /// Reject a corpus whose `ref_factor_vec` is out-of-band or any of
-/// whose entries fail [`validate_seed_entry`]. Called from
-/// `AdminService::import_sla_corpus` BEFORE the corpus reaches the
-/// actor (so a rejected import never touches `priors.seed`), and from
-/// [`SeedCorpus::load`] so a malformed `[sla].seedCorpus` file is
-/// rejected at startup.
+/// whose entries fail [`validate_seed_entry`]. Chokepoint: callers go
+/// through [`ValidatedSeedCorpus::validate`] (the only constructor),
+/// not this directly. `pub` for the existing direct-validation tests.
 pub fn validate_corpus(c: &SeedCorpus, cfg: &SlaConfig) -> Result<(), String> {
     for (d, &f) in c.ref_factor_vec.iter().enumerate() {
         if !f.is_finite() || !(0.1..=10.0).contains(&f) {
@@ -213,14 +211,41 @@ pub fn validate_corpus(c: &SeedCorpus, cfg: &SlaConfig) -> Result<(), String> {
         .try_for_each(|e| validate_seed_entry(e, cfg))
 }
 
-impl SeedCorpus {
-    /// Read + parse from `path`. Called once at startup from
-    /// [`super::SlaEstimator::new`] when `[sla].seed_corpus` is set.
-    pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let bytes = std::fs::read(path)
-            .map_err(|e| anyhow::anyhow!("read seed_corpus {}: {e}", path.display()))?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| anyhow::anyhow!("parse seed_corpus {}: {e}", path.display()))
+/// A [`SeedCorpus`] that has passed [`validate_corpus`]. The private
+/// field with single constructor [`Self::validate`] means an
+/// unvalidated corpus cannot reach [`Self::into_seed_map`] /
+/// `pending_seed` / `import_seed`. Both ingress paths (the
+/// `[sla].seedCorpus` file at startup via [`SeedCorpus::load`], and
+/// `AdminService.ImportSlaCorpus` at runtime) must construct one or
+/// the code doesn't compile; a future third ingress (e.g. a streaming
+/// `SyncSlaCorpus`) inherits the same guarantee.
+// r[impl sched.sla.threat.corpus-clamp]
+#[derive(Debug)]
+pub struct ValidatedSeedCorpus(SeedCorpus);
+
+impl ValidatedSeedCorpus {
+    /// The only constructor. Runs [`validate_corpus`] against `cfg`.
+    pub fn validate(raw: SeedCorpus, cfg: &SlaConfig) -> Result<Self, String> {
+        validate_corpus(&raw, cfg)?;
+        Ok(Self(raw))
+    }
+
+    /// Entry count. Accessor since the inner corpus is private.
+    pub fn entries_len(&self) -> usize {
+        self.0.entries.len()
+    }
+
+    /// Exporter's reference hw_class. Accessor for the RPC response.
+    pub fn ref_hw_class(&self) -> &str {
+        &self.0.ref_hw_class
+    }
+
+    /// Test-only bypass: wrap without validating. For tests of
+    /// `into_seed_map`'s rescale logic that don't want to thread a
+    /// full `SlaConfig` through.
+    #[cfg(test)]
+    pub(super) fn assume_valid(raw: SeedCorpus) -> Self {
+        Self(raw)
     }
 
     /// Project to the seed map, rescaling time-domain params (S, P, Q)
@@ -239,8 +264,9 @@ impl SeedCorpus {
     /// rescaled — it's a mixture weight, dimensionless across fleets.
     pub fn into_seed_map(self, hw: &HwTable) -> (HashMap<SeedKey, FitParams>, f64) {
         let f = |h: &str| hw.factor(h).map_or(1.0, |v| dot(UNIFORM, v));
-        let scale = f(&self.ref_hw_class) / f(&hw.reference);
+        let scale = f(&self.0.ref_hw_class) / f(&hw.reference);
         let map = self
+            .0
             .entries
             .into_iter()
             .map(|e| {
@@ -260,6 +286,21 @@ impl SeedCorpus {
             })
             .collect();
         (map, scale)
+    }
+}
+
+impl SeedCorpus {
+    /// Read + parse + validate from `path`. Called once at startup
+    /// from [`super::SlaEstimator::new`] when `[sla].seed_corpus` is
+    /// set. Returns a [`ValidatedSeedCorpus`] so the load path cannot
+    /// bypass [`validate_corpus`].
+    pub fn load(path: &Path, cfg: &SlaConfig) -> anyhow::Result<ValidatedSeedCorpus> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("read seed_corpus {}: {e}", path.display()))?;
+        let raw: Self = serde_json::from_slice(&bytes)
+            .map_err(|e| anyhow::anyhow!("parse seed_corpus {}: {e}", path.display()))?;
+        ValidatedSeedCorpus::validate(raw, cfg)
+            .map_err(|e| anyhow::anyhow!("validate seed_corpus {}: {e}", path.display()))
     }
 }
 
@@ -749,7 +790,7 @@ mod tests {
                 },
             ],
         };
-        let (map, _) = corpus.into_seed_map(&HwTable::default());
+        let (map, _) = ValidatedSeedCorpus::assume_valid(corpus).into_seed_map(&HwTable::default());
         let v2 = &map[&("v2".into(), String::new())];
         assert!((v2.alpha.iter().sum::<f64>() - 1.0).abs() < 1e-9);
         assert!(v2.alpha[0] > v2.alpha[2], "rank order survives projection");
@@ -852,7 +893,8 @@ mod tests {
         let mut hw = HashMap::new();
         hw.insert("aws-5-ebs".into(), 1.0); // local reference
         hw.insert("aws-6-ebs".into(), 1.5);
-        let (map, scale) = parsed.into_seed_map(&HwTable::from_map(hw));
+        let (map, scale) =
+            ValidatedSeedCorpus::assume_valid(parsed).into_seed_map(&HwTable::from_map(hw));
         assert!((scale - 1.5).abs() < 1e-9);
         let fp = &map[&("hello".into(), "x86_64-linux".into())];
         assert!((fp.s - 15.0).abs() < 1e-9);
@@ -882,7 +924,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        let (map, scale) = corpus.into_seed_map(&HwTable::default());
+        let (map, scale) =
+            ValidatedSeedCorpus::assume_valid(corpus).into_seed_map(&HwTable::default());
         assert_eq!(scale, 1.0);
         assert_eq!(map[&("x".into(), "x86_64-linux".into())].s, 5.0);
     }

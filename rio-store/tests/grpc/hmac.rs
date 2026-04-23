@@ -32,13 +32,23 @@ fn sign_claims_full(
     is_ca: bool,
     expiry_offset_secs: i64,
 ) -> String {
+    sign_claims_tenant(executor_id, outputs, is_ca, expiry_offset_secs, None)
+}
+
+fn sign_claims_tenant(
+    executor_id: &str,
+    outputs: Vec<String>,
+    is_ca: bool,
+    expiry_offset_secs: i64,
+    tenant: Option<&str>,
+) -> String {
     let claims = AssignmentClaims {
         executor_id: executor_id.into(),
         drv_hash: "0000000000000000000000000000000000000000000000000000000000000000".into(),
         expected_outputs: outputs,
         expiry_unix: (now_unix() as i64 + expiry_offset_secs) as u64,
         is_ca,
-        tenant: None,
+        tenant: tenant.map(String::from),
     };
     HmacSigner::from_key(TEST_KEY.to_vec()).sign(&claims)
 }
@@ -559,7 +569,6 @@ async fn append_hw(
         hw_class: "aws-8-ebs-hi".into(),
         pod_id: body_pod_id.into(),
         factor_json: r#"{"alu":1.5,"membw":1.0,"ioseq":1.0}"#.into(),
-        submitting_tenant: String::new(),
     });
     if let Some((h, v)) = header {
         req.metadata_mut().insert(h, v.parse().unwrap());
@@ -605,6 +614,94 @@ async fn append_hw_perf_sample_forged_pod_id_ignored() -> TestResult {
     Ok(())
 }
 
+/// `submitting_tenant` is derived from `claims.tenant` (signed at
+/// dispatch). The body field was REMOVED from the proto so it cannot be
+/// supplied; this asserts the claims value reaches PG. A token without
+/// a tenant claim → NULL.
+// r[verify sched.sla.threat.hw-median-of-medians]
+#[tokio::test]
+async fn append_hw_perf_sample_tenant_from_claims() -> TestResult {
+    let s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    let mut client = s.client.clone();
+    // Token with tenant claim → that value is written.
+    let token = sign_claims_tenant(
+        "p-with-tenant",
+        vec![String::new()],
+        false,
+        60,
+        Some("tenant-uuid-a"),
+    );
+    append_hw(
+        &mut client,
+        "ignored",
+        Some((rio_proto::ASSIGNMENT_TOKEN_HEADER, &token)),
+    )
+    .await
+    .context("append with tenant claim")?;
+    // Token without tenant claim (pre-tenant scheduler / orphan) → NULL.
+    let token = sign_claims_tenant("p-no-tenant", vec![String::new()], false, 60, None);
+    append_hw(
+        &mut client,
+        "ignored",
+        Some((rio_proto::ASSIGNMENT_TOKEN_HEADER, &token)),
+    )
+    .await
+    .context("append without tenant claim")?;
+
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT pod_id, submitting_tenant FROM hw_perf_samples \
+         WHERE hw_class = 'aws-8-ebs-hi' ORDER BY pod_id",
+    )
+    .fetch_all(&s.db.pool)
+    .await?;
+    assert_eq!(
+        rows,
+        vec![
+            ("p-no-tenant".into(), None),
+            ("p-with-tenant".into(), Some("tenant-uuid-a".into())),
+        ],
+        "tenant from claims (signed), not body; absent claim → NULL"
+    );
+    Ok(())
+}
+
+/// `factor_json` is parsed, validated, then REBUILT from the three
+/// scalars. Extra keys / padding in the body never reach PG — the
+/// stored jsonb is exactly `{alu, membw, ioseq}`. A 4MB body padding
+/// would otherwise land verbatim in `hw_perf_samples.factor`.
+// r[verify sched.sla.hw-bench-append-only]
+#[tokio::test]
+async fn append_hw_perf_sample_factor_json_extra_keys_stripped() -> TestResult {
+    let s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    let mut client = s.client.clone();
+    let token = sign_claims_full("p0", vec![String::new()], false, 60);
+    let padding = "x".repeat(64 * 1024);
+    let mut req = tonic::Request::new(AppendHwPerfSampleRequest {
+        hw_class: "aws-8-ebs-hi".into(),
+        pod_id: "ignored".into(),
+        factor_json: format!(
+            r#"{{"alu":1.5,"membw":1.0,"ioseq":1.0,"evil":"{padding}","z":[1,2,3]}}"#
+        ),
+    });
+    req.metadata_mut()
+        .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, token.parse().unwrap());
+    client
+        .append_hw_perf_sample(req)
+        .await
+        .context("append with padded factor_json")?;
+
+    let stored: serde_json::Value =
+        sqlx::query_scalar("SELECT factor FROM hw_perf_samples WHERE pod_id = 'p0'")
+            .fetch_one(&s.db.pool)
+            .await?;
+    assert_eq!(
+        stored,
+        serde_json::json!({"alu": 1.5, "membw": 1.0, "ioseq": 1.0}),
+        "stored jsonb rebuilt from validated scalars; extra keys dropped"
+    );
+    Ok(())
+}
+
 /// `hw_class` length-bounded at MAX_HW_CLASS_LEN. Unique key is
 /// `(hw_class, pod_id)` — without a bound, one compromised builder with a
 /// legitimate token could loop distinct multi-MB strings and fill
@@ -620,7 +717,6 @@ async fn append_hw_perf_sample_oversized_hw_class_rejected() -> TestResult {
         hw_class: "a".repeat(rio_common::limits::MAX_HW_CLASS_LEN + 1),
         pod_id: "ignored".into(),
         factor_json: r#"{"alu":1.5,"membw":1.0,"ioseq":1.0}"#.into(),
-        submitting_tenant: String::new(),
     });
     req.metadata_mut()
         .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, token.parse().unwrap());
@@ -649,7 +745,6 @@ async fn append_hw_perf_sample_bad_charset_rejected() -> TestResult {
             hw_class: bad.into(),
             pod_id: "ignored".into(),
             factor_json: r#"{"alu":1.5,"membw":1.0,"ioseq":1.0}"#.into(),
-            submitting_tenant: String::new(),
         });
         req.metadata_mut()
             .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, token.parse().unwrap());

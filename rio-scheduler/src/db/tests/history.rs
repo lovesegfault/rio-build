@@ -616,12 +616,15 @@ async fn test_refresh_outlier_gate_normalizes_hw_class() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
     let db = SchedulerDb::new(test_db.pool.clone());
 
-    // HwTable::aggregate needs ≥3 distinct pod_ids per hw_class.
+    // cross_tenant_median needs ≥3 distinct pod_ids AND
+    // ≥FLEET_MEDIAN_MIN_TENANTS (5) distinct submitting_tenant per
+    // hw_class.
     for (h, f) in [("ref", 1.0_f64), ("fast", 2.0)] {
-        for p in 0..3 {
+        for p in 0..5 {
             sqlx::query(
-                "INSERT INTO hw_perf_samples (hw_class, pod_id, factor)
-                 VALUES ($1, $2, $3)",
+                "INSERT INTO hw_perf_samples \
+                 (hw_class, pod_id, factor, submitting_tenant) \
+                 VALUES ($1, $2, $3, $4)",
             )
             .bind(h)
             .bind(format!("{h}-{p}"))
@@ -630,6 +633,7 @@ async fn test_refresh_outlier_gate_normalizes_hw_class() -> anyhow::Result<()> {
             .bind(sqlx::types::Json(
                 serde_json::json!({ "alu": f, "membw": f, "ioseq": f }),
             ))
+            .bind(format!("t{p}"))
             .execute(&test_db.pool)
             .await?;
         }

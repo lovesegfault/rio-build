@@ -40,6 +40,11 @@ pub(crate) const HW_FACTOR_SANITY_FLOOR: f64 = 0.25;
 /// one rank.
 pub(crate) const HW_FACTOR_SANITY_CEIL: f64 = 4.0;
 
+/// Minimum distinct `pod_id` count before an hw_class's aggregated
+/// `factor` is trusted. Below this, [`cross_tenant_median`] returns
+/// `[1.0; K]` (pass-through) and [`HwTable::factor`] returns `None`.
+pub(crate) const HW_MIN_PODS: u32 = 3;
+
 /// K=3 microbench dimensions: `[alu, membw, ioseq]`. Index constants
 /// rather than a struct so per-dimension reductions stay `for d in 0..K`.
 pub const K: usize = 3;
@@ -99,7 +104,7 @@ impl HwTable {
     pub fn factor(&self, hw_class: &str) -> Option<[f64; K]> {
         self.factors
             .get(hw_class)
-            .filter(|f| f.pod_ids >= 3)
+            .filter(|f| f.pod_ids >= HW_MIN_PODS)
             .map(|f| {
                 f.factor
                     .map(|d| d.clamp(HW_FACTOR_SANITY_FLOOR, HW_FACTOR_SANITY_CEIL))
@@ -121,7 +126,7 @@ impl HwTable {
     pub fn iter(&self) -> impl Iterator<Item = (&String, &[f64; K])> {
         self.factors
             .iter()
-            .filter(|(_, f)| f.pod_ids >= 3)
+            .filter(|(_, f)| f.pod_ids >= HW_MIN_PODS)
             .map(|(k, f)| (k, &f.factor))
     }
 
@@ -141,7 +146,10 @@ impl HwTable {
 
     /// Distinct hw_classes with ≥3 pod samples. For SlaStatus.
     pub fn len(&self) -> usize {
-        self.factors.values().filter(|f| f.pod_ids >= 3).count()
+        self.factors
+            .values()
+            .filter(|f| f.pod_ids >= HW_MIN_PODS)
+            .count()
     }
 
     /// `len() == 0`. Clippy `len_without_is_empty`.
@@ -151,17 +159,12 @@ impl HwTable {
 
     /// App-side median-of-medians (ADR-023 §Threat-model gap (b)).
     ///
-    /// 1. Group by `(hw_class, submitting_tenant)`.
-    /// 2. Per tenant-group: per-dimension median, then 3·MAD reject,
-    ///    then per-dimension median of survivors.
-    /// 3. Per hw_class: per-dimension median across tenant-group medians.
-    /// 4. hw_classes with <3 distinct `pod_id` get `factor := [1.0; K]`
-    ///    (untrusted pass-through; the entry is kept so
-    ///    [`Self::distinct_pod_ids`] reports the count).
-    ///
-    /// All output dimensions clamped to `[FLOOR, CEIL]` — the
-    /// chokepoint clamp the old `load()` did, now post-aggregation so
-    /// MAD-reject sees raw values.
+    /// Group by `(hw_class, submitting_tenant)`, then per hw_class call
+    /// `cross_tenant_median` with `FLEET_MEDIAN_MIN_TENANTS` — the pod
+    /// gate, tenant-count gate, MAD-reject, fleet median, and
+    /// clamp all live there so a future caller can't omit a step. The
+    /// entry is kept (with `factor := [1.0; K]` when gated) so
+    /// [`Self::distinct_pod_ids`] reports the count.
     // r[impl sched.sla.threat.hw-median-of-medians]
     pub fn aggregate(rows: &[HwPerfSampleRow]) -> HashMap<String, HwFactor> {
         // hw_class → submitting_tenant → Vec<[f64;K]>
@@ -183,19 +186,8 @@ impl HwTable {
             .into_iter()
             .map(|(h, tenants)| {
                 let pod_ids = pods[&h].len() as u32;
-                let factor = if pod_ids < 3 {
-                    [1.0; K]
-                } else {
-                    let tenant_medians: Vec<[f64; K]> = tenants
-                        .into_values()
-                        .map(|v| mad_reject_median(&v))
-                        .collect();
-                    let mut m = per_dim_median(&tenant_medians);
-                    for d in &mut m {
-                        *d = d.clamp(HW_FACTOR_SANITY_FLOOR, HW_FACTOR_SANITY_CEIL);
-                    }
-                    m
-                };
+                let factor =
+                    cross_tenant_median(&tenants, pod_ids, super::FLEET_MEDIAN_MIN_TENANTS);
                 (h, HwFactor { factor, pod_ids })
             })
             .collect()
@@ -230,7 +222,7 @@ impl HwTable {
         // (the calibration target). Ties → lexicographic for determinism.
         let reference = factors
             .iter()
-            .filter(|(_, f)| f.pod_ids >= 3)
+            .filter(|(_, f)| f.pod_ids >= HW_MIN_PODS)
             .min_by(|(ka, va), (kb, vb)| {
                 (va.factor[0] - 1.0)
                     .abs()
@@ -277,6 +269,42 @@ impl HwTable {
                 .collect(),
         )
     }
+}
+
+/// ADR-023 §Threat-model gap (b) chokepoint: every gate the
+/// median-of-medians defence depends on, in order, so a caller can't
+/// omit one. Returns `[1.0; K]` (untrusted pass-through) when EITHER
+/// gate trips; otherwise the per-tenant MAD-rejected median, then the
+/// per-dimension median across tenants, clamped to `[FLOOR, CEIL]`.
+///
+/// 1. **Pod gate:** `n_pods < HW_MIN_PODS` → `[1.0; K]`. With <3
+///    distinct pods the per-tenant median is one or two samples.
+/// 2. **Tenant gate:** `by_tenant.len() < min_tenants` → `[1.0; K]`. A
+///    "median-of-tenant-medians" with one tenant IS that tenant's
+///    median; with two, the fleet median is one of them. The caller
+///    must supply `min_tenants` (no default) — see
+///    [`super::FLEET_MEDIAN_MIN_TENANTS`].
+/// 3. Per tenant: 3·MAD reject, then per-dimension median.
+/// 4. Across tenants: per-dimension median.
+/// 5. Clamp `[FLOOR, CEIL]` post-aggregation so MAD sees raw values.
+///
+/// `min_tenants` is a parameter (not a const reference) so a new
+/// median-of-medians consumer (e.g. §13b's per-cell bias table) can't
+/// silently skip the gate — the type forces them to supply a value.
+pub(super) fn cross_tenant_median(
+    by_tenant: &HashMap<Option<String>, Vec<[f64; K]>>,
+    n_pods: u32,
+    min_tenants: usize,
+) -> [f64; K] {
+    if n_pods < HW_MIN_PODS || by_tenant.len() < min_tenants {
+        return [1.0; K];
+    }
+    let tenant_medians: Vec<[f64; K]> = by_tenant.values().map(|v| mad_reject_median(v)).collect();
+    let mut m = per_dim_median(&tenant_medians);
+    for d in &mut m {
+        *d = d.clamp(HW_FACTOR_SANITY_FLOOR, HW_FACTOR_SANITY_CEIL);
+    }
+    m
 }
 
 /// jsonb `{"alu":a,"membw":b,"ioseq":c}` → `[a,b,c]`. Missing keys
@@ -442,6 +470,64 @@ mod tests {
             "median-of-medians resists flood: got {f}, want ~1.5 (row-median would be 10.0)"
         );
         assert_eq!(agg["intel-8"].pod_ids, 1004);
+
+        // Tenant gate: 3 distinct tenants < FLEET_MEDIAN_MIN_TENANTS (5)
+        // → `[1.0; K]` even though pod gate (3 ≥ 3) passes. With 3
+        // tenants the "fleet median" is one of them — not an aggregate.
+        // Before `cross_tenant_median` extracted the gate, `aggregate`
+        // skipped this check entirely.
+        let under = vec![
+            row("intel-8", "p0", Some("t0"), 1.5),
+            row("intel-8", "p1", Some("t1"), 1.5),
+            row("intel-8", "p2", Some("t2"), 1.5),
+        ];
+        let agg = HwTable::aggregate(&under);
+        assert_eq!(
+            agg["intel-8"].factor, [1.0; K],
+            "3 tenants < FLEET_MEDIAN_MIN_TENANTS → untrusted pass-through"
+        );
+        assert_eq!(agg["intel-8"].pod_ids, 3, "pod count still reported");
+
+        // All rows in the `None` tenant bucket (pre-claims-tenant rows
+        // / dev mode) → 1 distinct tenant → gated. Regression for the
+        // merged_bug_001 coupling: before claims-derived tenant, EVERY
+        // row had `submitting_tenant=NULL`, so the gate would have
+        // disabled normalization fleet-wide had it been enforced.
+        let null_tenant: Vec<_> = (0..10)
+            .map(|i| row("intel-8", &format!("p{i}"), None, 1.5))
+            .collect();
+        let agg = HwTable::aggregate(&null_tenant);
+        assert_eq!(
+            agg["intel-8"].factor, [1.0; K],
+            "all-NULL tenant → 1 bucket < min_tenants → gated"
+        );
+    }
+
+    /// `cross_tenant_median` is the chokepoint: the same gates apply
+    /// when called directly (e.g. by a future §13b per-cell consumer).
+    /// `min_tenants` is a parameter so the caller MUST supply it.
+    #[test]
+    fn cross_tenant_median_gates_directly() {
+        let mut by_tenant: HashMap<Option<String>, Vec<[f64; K]>> = HashMap::new();
+        for t in 0..5 {
+            by_tenant.insert(Some(format!("t{t}")), vec![[1.5, 1.0, 1.0]]);
+        }
+        // Both gates pass → median.
+        assert_eq!(cross_tenant_median(&by_tenant, 5, 5), [1.5, 1.0, 1.0]);
+        // Pod gate trips.
+        assert_eq!(cross_tenant_median(&by_tenant, 2, 5), [1.0; K]);
+        // Tenant gate trips (caller asked for 6).
+        assert_eq!(cross_tenant_median(&by_tenant, 5, 6), [1.0; K]);
+        // Clamp applies post-median.
+        let mut huge: HashMap<Option<String>, Vec<[f64; K]>> = HashMap::new();
+        for t in 0..5 {
+            huge.insert(Some(format!("t{t}")), vec![[1e6, 1.0, 1.0]]);
+        }
+        assert_eq!(
+            cross_tenant_median(&huge, 5, 5)[0],
+            HW_FACTOR_SANITY_CEIL,
+            "chokepoint clamp"
+        );
     }
 
     /// Aggregate floor: <3 distinct pods → `factor := [1.0; K]` but the

@@ -717,25 +717,33 @@ impl StoreService for StoreServiceImpl {
     /// business here and are rejected. Dev mode (`hmac_verifier` is
     /// None) falls back to the body field — same as PutPath dev-mode.
     ///
-    /// `hw_class` and `factor` remain body-supplied: a valid token
-    /// holder can write its one row to a foreign `hw_class`, but
-    /// that's one rank in that class's median, bounded by
-    /// `HW_FACTOR_SANITY_CEIL` in `HwTable`. `hw_class` is bounded at
-    /// [`rio_common::limits::MAX_HW_CLASS_LEN`] chars of `[a-z0-9-]` —
-    /// the unique key is `(hw_class, pod_id)`, so without a format
-    /// bound a compromised builder could spam distinct multi-MB strings
-    /// and fill the table (M_041's "one row per pod start" assumed
-    /// honest callers).
+    /// `hw_class` remains body-supplied: a valid token holder can write
+    /// its one row to a foreign `hw_class`, but that's one rank in that
+    /// class's median, bounded by `HW_FACTOR_SANITY_CEIL` in `HwTable`.
+    /// `hw_class` is bounded at [`rio_common::limits::MAX_HW_CLASS_LEN`]
+    /// chars of `[a-z0-9-]` — the unique key is `(hw_class, pod_id)`, so
+    /// without a format bound a compromised builder could spam distinct
+    /// multi-MB strings and fill the table (M_041's "one row per pod
+    /// start" assumed honest callers). `factor_json` is parsed,
+    /// per-dimension validated, then REBUILT from the three scalars so
+    /// extra keys / padding never reach PG.
+    ///
+    /// `submitting_tenant` is derived from `claims.tenant` (signed at
+    /// dispatch), NOT the body — `r[sched.sla.threat.
+    /// hw-median-of-medians]` keys on it; a body field would let one
+    /// compromised builder fabricate ≥5 tenant identities.
     // r[impl sched.sla.hw-bench-append-only]
     // r[impl sec.boundary.grpc-hmac]
+    // r[impl sched.sla.threat.hw-median-of-medians]
     #[instrument(skip(self, request), fields(rpc = "AppendHwPerfSample"))]
     async fn append_hw_perf_sample(
         &self,
         request: Request<AppendHwPerfSampleRequest>,
     ) -> Result<Response<()>, Status> {
-        let pod_id = match self.verify_assignment_token(&request)? {
-            Some(claims) => claims.executor_id,
-            None if self.hmac_verifier.is_none() => request.get_ref().pod_id.clone(),
+        let (pod_id, tenant) = match self.verify_assignment_token(&request)? {
+            Some(claims) => (claims.executor_id, claims.tenant),
+            // Dev mode (no HMAC verifier): body pod_id, NULL tenant.
+            None if self.hmac_verifier.is_none() => (request.get_ref().pod_id.clone(), None),
             None => {
                 metrics::counter!("rio_store_hmac_rejected_total",
                                   "reason" => "service_caller_not_permitted")
@@ -761,12 +769,16 @@ impl StoreService for StoreServiceImpl {
         }
         // K=3 jsonb factor: parse + validate every dimension here
         // (NOT a CHECK constraint) so a malformed payload is an
-        // InvalidArgument, not a PG error surfaced as Internal.
-        let factor: serde_json::Value = serde_json::from_str(&req.factor_json).map_err(|e| {
+        // InvalidArgument, not a PG error surfaced as Internal. The
+        // INSERTed jsonb is REBUILT from the three validated scalars
+        // — the raw `Value` is body-supplied and unbounded (extra
+        // keys, MB-scale padding); rebuilding makes that structurally
+        // impossible.
+        let raw: serde_json::Value = serde_json::from_str(&req.factor_json).map_err(|e| {
             Status::invalid_argument(format!("factor_json must be a JSON object: {e}"))
         })?;
-        for d in ["alu", "membw", "ioseq"] {
-            let v = factor
+        let dim = |d: &str| -> Result<f64, Status> {
+            let v = raw
                 .get(d)
                 .and_then(serde_json::Value::as_f64)
                 .ok_or_else(|| {
@@ -777,7 +789,10 @@ impl StoreService for StoreServiceImpl {
                     "factor_json.{d}={v} must be finite and > 0"
                 )));
             }
-        }
+            Ok(v)
+        };
+        let (alu, membw, ioseq) = (dim("alu")?, dim("membw")?, dim("ioseq")?);
+        let factor = serde_json::json!({"alu": alu, "membw": membw, "ioseq": ioseq});
         sqlx::query!(
             "INSERT INTO hw_perf_samples (hw_class, pod_id, factor, submitting_tenant) \
              VALUES ($1, $2, $3, $4) \
@@ -788,7 +803,7 @@ impl StoreService for StoreServiceImpl {
             req.hw_class,
             pod_id,
             sqlx::types::Json(factor) as _,
-            (!req.submitting_tenant.is_empty()).then_some(req.submitting_tenant),
+            tenant,
         )
         .execute(&self.pool)
         .await
@@ -892,7 +907,6 @@ mod tests {
                 hw_class: "aws-8-ebs-hi".into(),
                 pod_id: "p0".into(),
                 factor_json: format!(r#"{{"alu":{f},"membw":1.0,"ioseq":1.0}}"#),
-                submitting_tenant: "t0".into(),
             })
         };
         svc.append_hw_perf_sample(mk(0.9)).await.unwrap();
@@ -928,7 +942,6 @@ mod tests {
                     hw_class: "aws-8-ebs-hi".into(),
                     pod_id: "p0".into(),
                     factor_json: bad.into(),
-                    submitting_tenant: String::new(),
                 }))
                 .await
                 .expect_err(bad);

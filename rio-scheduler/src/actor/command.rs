@@ -476,10 +476,10 @@ pub enum AdminQuery {
         min_n: u32,
         reply: oneshot::Sender<crate::sla::prior::SeedCorpus>,
     },
-    /// `AdminService.ImportSlaCorpus`: merge a parsed corpus into the
-    /// seed-prior table. Reply is `(entries, rescale_factor)`.
+    /// `AdminService.ImportSlaCorpus`: merge a validated corpus into
+    /// the seed-prior table. Reply is `(entries, rescale_factor)`.
     SlaImportCorpus {
-        corpus: crate::sla::prior::SeedCorpus,
+        corpus: crate::sla::prior::ValidatedSeedCorpus,
         reply: oneshot::Sender<(usize, f64)>,
     },
     /// `AdminService.HwClassSampled`: per-hw_class distinct-pod_id
