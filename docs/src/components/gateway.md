@@ -733,6 +733,10 @@ r[gw.activity.stop-parity]
 
 Every `STDERR_START_ACTIVITY` the gateway emits to a client MUST be matched by a `STDERR_STOP_ACTIVITY` for the same id before the build's terminal `BuildResult` is written. The scheduler routes `Event::Log` on a separate broadcast ring from `DerivationEvent` so log volume cannot evict per-derivation `Completed` events; the gateway additionally drains any still-tracked activity ids at terminus to cover upstream loss.
 
+r[gw.activity.progress-before-stop]
+
+For each per-derivation terminal transition (`COMPLETED`/`FAILED`), the root `actBuilds` `STDERR_RESULT{resProgress, [done, expected, running, failed]}` reflecting that derivation's increment MUST reach the client before the derivation's `STDERR_STOP_ACTIVITY`. nom marks an `actBuild` ✔ only when `done` increments while the activity is still open (matching native nix's `Goal::done()` ordering: parent counter update precedes `Activity` destructor). The scheduler emits `Event::Progress` before `DerivationEvent::Completed`/`Failed` on the state channel; the gateway relays in arrival order.
+
 r[gw.activity.subst-progress]
 
 For each `DerivationEventKind::SUBSTITUTING` the gateway emits an `actSubstitute` (108) activity AND a child `actCopyPath` (100) activity (`fields=[storePath, "", machineName]`), and increments the root `actBuilds` `SetExpected{actCopyPath, N}` so nom shows an "X/Y copied" denominator. `Event::SubstituteProgress` (display-only, routed via the log broadcast ring; see `r[store.substitute.progress-stream]`) maps to `STDERR_RESULT{copy_aid, resProgress, [bytes_done, bytes_expected, 0, 0]}` so nom renders a per-derivation download bar. Both activities stop together (child first) on the paired `CACHED`/`STARTED`/`COMPLETED`/`FAILED`.

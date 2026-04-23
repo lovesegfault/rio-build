@@ -1103,26 +1103,19 @@ impl DagActor {
         // r[impl sched.event.derivation-terminal]
         // Orphan completion is worker-built (not cached) — emit
         // DerivationCompleted so WatchBuild clients see it finish.
-        // `release_downstream` below does NOT emit per-drv events
-        // (only progress + build-level); the analogue in
-        // `handle_success_completion` emits before calling it.
+        // Passed to `release_downstream` so it lands AFTER Progress
+        // (nom ordering — r[impl gw.activity.progress-before-stop]).
         let output_paths = self
             .dag
             .node(drv_hash)
             .map(|s| s.output_paths.clone())
             .unwrap_or_default();
-        let drv_path = self.dag.path_or_hash_fallback(drv_hash);
-        for build_id in &interested {
-            self.events.emit(
-                *build_id,
-                rio_proto::types::build_event::Event::Derivation(
-                    rio_proto::types::DerivationEvent::completed(
-                        drv_path.clone(),
-                        output_paths.clone(),
-                    ),
-                ),
-            );
-        }
+        let completed_event = rio_proto::types::build_event::Event::Derivation(
+            rio_proto::types::DerivationEvent::completed(
+                self.dag.path_or_hash_fallback(drv_hash),
+                output_paths,
+            ),
+        );
         // r[impl sched.gc.path-tenants-upsert]
         // Orphan completion during recovery: derivation was
         // Running at crash, completed during downtime. The
@@ -1135,7 +1128,7 @@ impl DagActor {
         // reconcile (the drv was Assigned/Running in PG then —
         // kept), so it won't catch this one.
         self.unpin_best_effort(drv_hash).await;
-        self.release_downstream(drv_hash, &interested, HashSet::new())
+        self.release_downstream(drv_hash, &interested, HashSet::new(), Some(completed_event))
             .await;
     }
 

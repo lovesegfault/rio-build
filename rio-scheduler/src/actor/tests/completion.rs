@@ -3147,6 +3147,67 @@ async fn test_transient_retry_emits_progress() -> TestResult {
     Ok(())
 }
 
+// r[verify gw.activity.progress-before-stop]
+/// Success completion emits Progress (with this drv counted) BEFORE
+/// the per-drv `DerivationEvent::Completed`, and Completed BEFORE the
+/// build-level `BuildCompleted`. nom marks an actBuild ✔ only when
+/// `Progress.done` increments while the activity is still open
+/// (native nix `Goal::done()` ordering: parent counter before
+/// `Activity` destructor). With the previous Completed-then-Progress
+/// order, every drv except the last stayed ⏵ in nom.
+#[tokio::test]
+async fn test_progress_precedes_drv_completed_on_state_channel() -> TestResult {
+    use rio_proto::types::{DerivationEventKind, build_event::Event};
+
+    let (_db, handle, _task, _rx) = setup_with_worker("ord-w", "x86_64-linux").await?;
+    let build_id = Uuid::new_v4();
+    let mut ev = merge_single_node(&handle, build_id, "ord-drv", PriorityClass::Scheduled).await?;
+
+    // Drain dispatch-time events; stop once we see the dispatch-phase
+    // Progress (DrvStarted precedes it per dispatch.rs ordering).
+    loop {
+        let e = tokio::time::timeout(Duration::from_secs(5), ev.recv())
+            .await
+            .expect("dispatch event within 5s")?;
+        if matches!(e.event, Some(Event::Progress(_))) {
+            break;
+        }
+    }
+
+    complete_success_empty(&handle, "ord-w", &test_drv_path("ord-drv")).await?;
+    barrier(&handle).await;
+
+    // Collect post-completion events in arrival order; record positions
+    // of the FIRST Progress with completed≥1, the DrvCompleted, and
+    // BuildCompleted.
+    let (mut p_pos, mut d_pos, mut b_pos) = (None, None, None);
+    let mut i = 0usize;
+    while let Ok(e) = ev.try_recv() {
+        match e.event {
+            Some(Event::Progress(p)) if p.completed >= 1 && p_pos.is_none() => p_pos = Some(i),
+            Some(Event::Derivation(d)) if d.kind() == DerivationEventKind::Completed => {
+                assert!(d_pos.is_none(), "DrvCompleted emitted more than once");
+                d_pos = Some(i);
+            }
+            Some(Event::Completed(_)) => b_pos = Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    let p = p_pos.expect("Progress with completed≥1 not emitted");
+    let d = d_pos.expect("DerivationEvent::Completed not emitted");
+    let b = b_pos.expect("BuildCompleted not emitted");
+    assert!(
+        p < d,
+        "Progress(completed≥1) must precede DerivationCompleted: positions {p} vs {d}"
+    );
+    assert!(
+        d < b,
+        "DerivationCompleted must precede BuildCompleted: positions {d} vs {b}"
+    );
+    Ok(())
+}
+
 // r[verify sched.build.keep-going]
 /// `keep_going=true` build's eventual `BuildFailed` records the FIRST
 /// failed derivation. Previously `error_summary`/`failed_derivation`

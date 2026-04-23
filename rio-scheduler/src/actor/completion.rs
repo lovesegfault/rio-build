@@ -967,36 +967,21 @@ impl DagActor {
         )
         .await;
 
-        // Emit derivation completed event
+        // Build the per-drv terminal event ONCE; release_downstream
+        // emits it per interested build AFTER Progress (nom ordering —
+        // r[impl gw.activity.progress-before-stop]).
         let output_paths: Vec<String> = self
             .dag
             .node(drv_hash)
             .map(|s| s.output_paths.clone())
             .unwrap_or_default();
-
         let interested_builds = self.get_interested_builds(drv_hash);
-        for build_id in &interested_builds {
-            self.events.emit(
-                *build_id,
-                rio_proto::types::build_event::Event::Derivation(
-                    rio_proto::types::DerivationEvent::completed(
-                        self.dag.path_or_hash_fallback(drv_hash),
-                        output_paths.clone(),
-                    ),
-                ),
-            );
-        }
-
-        // Trigger log flush AFTER the Completed event has gone out. By the
-        // time the gateway sees Completed, the ring buffer still has the full
-        // log (flusher hasn't drained yet — it's async on a separate task).
-        // So AdminService.GetBuildLogs can serve from the ring buffer in the
-        // gap between Completed and the S3 upload landing.
-        // Seal first: late LogBatch pushes between now and the
-        // flusher's drain are dropped instead of recreating an orphan
-        // entry; the buffer present NOW survives for drain.
-        self.seal_log_buffer(drv_hash);
-        self.trigger_log_flush(drv_hash, interested_builds.clone());
+        let completed_event = rio_proto::types::build_event::Event::Derivation(
+            rio_proto::types::DerivationEvent::completed(
+                self.dag.path_or_hash_fallback(drv_hash),
+                output_paths,
+            ),
+        );
 
         // r[impl sched.gc.path-tenants-upsert]
         self.upsert_path_tenants_for(drv_hash).await;
@@ -1030,9 +1015,28 @@ impl DagActor {
         crate::critical_path::update_ancestors(&mut self.dag, drv_hash);
         phase!("4-update-ancestors");
 
-        self.release_downstream(drv_hash, &interested_builds, skipped_interested)
-            .await;
+        self.release_downstream(
+            drv_hash,
+            &interested_builds,
+            skipped_interested,
+            Some(completed_event),
+        )
+        .await;
         phase!("5-newly-ready+per-build-counts");
+
+        // Trigger log flush AFTER the Completed event has gone out (now
+        // emitted inside release_downstream, after Progress). By the
+        // time the gateway sees Completed, the ring buffer still has
+        // the full log (flusher hasn't drained yet — async on a
+        // separate task). So AdminService.GetBuildLogs can serve from
+        // the ring buffer in the gap before the S3 upload lands. Seal
+        // first: late LogBatch pushes between now and the flusher's
+        // drain are dropped instead of recreating an orphan entry; the
+        // buffer present NOW survives for drain. Actor is single-
+        // threaded — no LogBatch can have arrived since the
+        // transition() above.
+        self.seal_log_buffer(drv_hash);
+        self.trigger_log_flush(drv_hash, interested_builds);
         let _ = &mut t_phase;
         let total = t_total.elapsed();
         // IA-branch parity with the CA `info!` in `ca_insert_realisations`:
@@ -1675,6 +1679,7 @@ impl DagActor {
         drv_hash: &DrvHash,
         interested_builds: &[Uuid],
         skipped_interested: HashSet<Uuid>,
+        terminal_event: Option<rio_proto::types::build_event::Event>,
     ) {
         self.promote_newly_ready(drv_hash).await;
 
@@ -1682,7 +1687,8 @@ impl DagActor {
         // interested_builds with skipped nodes' — a CA-cutoff-skipped
         // node may belong to a merged build the trigger does not, and
         // that build needs check_build_completion too.
-        let mut check_builds: HashSet<Uuid> = interested_builds.iter().copied().collect();
+        let trigger_set: HashSet<Uuid> = interested_builds.iter().copied().collect();
+        let mut check_builds: HashSet<Uuid> = trigger_set.clone();
         check_builds.extend(skipped_interested);
         for build_id in check_builds {
             // I-140: build_summary is O(dag_nodes). Compute ONCE per
@@ -1698,6 +1704,21 @@ impl DagActor {
             // _with bypasses debounce: completion always carries
             // user-visible state change, and the scan is already paid.
             self.events.emit_progress_with(build_id, &summary);
+            // r[impl gw.activity.progress-before-stop]
+            // Per-drv terminal event AFTER Progress: nom marks an
+            // actBuild ✔ only when Progress.done increments while the
+            // activity is still open (native nix Goal::done() updates
+            // the parent counter before the Activity destructor).
+            // Emitting here — between Progress and check_build_
+            // completion — gives gateway progress→stop_activity→
+            // BuildCompleted in that order. Only to the trigger's
+            // interested builds; skipped-only builds don't have this
+            // drv in their DAG.
+            if let Some(ref ev) = terminal_event
+                && trigger_set.contains(&build_id)
+            {
+                self.events.emit(build_id, ev.clone());
+            }
             self.check_build_completion(build_id).await;
         }
     }
@@ -1794,6 +1815,15 @@ impl DagActor {
         self.trigger_log_flush(drv_hash, trigger_builds.clone());
         let trigger_path = self.dag.path_or_hash_fallback(drv_hash);
         for build_id in &trigger_builds {
+            // r[impl gw.activity.progress-before-stop]
+            // Progress BEFORE the per-drv terminal event so nom sees
+            // failed++ while the actBuild is still open. Failure path
+            // doesn't go through release_downstream, so this is
+            // emitted inline (cost: one extra build_summary scan per
+            // failure — rare, and handle_derivation_failure recomputes
+            // it anyway after cascade mutates the DAG).
+            let summary = self.dag.build_summary(*build_id);
+            self.events.emit_progress_with(*build_id, &summary);
             self.events.emit(
                 *build_id,
                 rio_proto::types::build_event::Event::Derivation(
