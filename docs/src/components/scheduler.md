@@ -738,6 +738,95 @@ Critical-path priorities are maintained **incrementally**, not via full O(V+E) r
 
 This approach keeps per-event processing well under the 1ms budget needed for 1000+ ops/sec throughput.
 
+## SLA hardware-class targeting (ADR-023 §13a)
+
+r[sched.sla.hw-class.config]
+`sla.hwClasses: {h → [{key,value}...]}` maps each hardware class to a
+node-label conjunction. A change to `sla.referenceHwClass` MUST be
+rejected at config-load unless `--allow-reference-change` is set
+(ref-second normalization is anchored on it).
+
+r[sched.sla.hw-class.k3-bench]
+The builder supervisor runs a K=3 microbench (`alu`, `membw`
+STREAM-triad, `ioseq` O_DIRECT) at init when the
+`rio.build/hw-bench-needed=true` annotation is set; the result is
+appended to `hw_perf_samples(hw_class, pod_id, factor jsonb,
+submitting_tenant)`.
+
+r[sched.sla.hw-class.alpha-als]
+Per-pname mixture α∈Δ^{K-1} is fitted via bounded heuristic
+alternation: NNLS on `wall·(α·factor[h])` ↔ simplex-LS on
+`exp(-ε̂)≈α·factor[h]`, ≤5 rounds, terminating at ‖Δα‖₁<10⁻².
+
+r[sched.sla.hw-class.admissible-set]
+The admissible set is `A = {(h,cap): 𝔼[cost]^upper ≤ (1+τ)·𝔼^min}`
+with Schmitt deadband `τ_enter=τ`, `τ_exit=1.3τ`. The emitted
+allocation is `c* = max_A c*_{h,cap}`; A is then re-filtered by
+type-fit at c*, cost-at-c* ≤ (1+τ)·𝔼^min, and capacity-ratio
+`c*_{h,cap} ≥ c*/k` (default k=2). The argmax cell survives all three
+checks so `A' ≠ ∅` provably.
+
+r[sched.sla.hw-class.epsilon-explore]
+With probability `sla.hwExploreEpsilon` per dispatch, the scheduler
+pins `h_explore ~ Unif(H\A)` (or `H\{argmin_H price}` on cache-miss
+or A=H), restricts the solve to `(h_explore,*)`, and emits
+`A' ⊆ {h_explore}×{spot,od}`. The draw is per-dispatch, OUTSIDE the
+memoization — the cached A is never overwritten by an exploration
+result.
+
+r[sched.sla.hw-class.ice-mask]
+ICE state is a read-time mask: the memo holds the full-H solve and is
+never overwritten; each dispatch computes `A \ ice_masked`. Per-cell
+exponential backoff is `60s → 120s → …` capped at `sla.maxLeadTime`,
+reset on first success. ICE state is in-memory (lease-holder only) and
+NOT in `inputs_gen`.
+
+r[sched.sla.hw-class.anchor-slots]
+The 32-slot ring buffer reserves one anchor slot per distinct
+`cpu_limit`, holding the highest-weight sample at that value, never
+recency-displaced; the anchor weight floor is
+`w_anchor ≥ 0.5^vdist / n_anchors`.
+
+r[sched.sla.hw-class.sample-weight-ordinal]
+Sample weight is `w_i = 0.5^(ordinal_age/20) · 0.5^vdist` — ordinal
+half-life of 20 samples, with no wall-clock arm.
+
+r[sched.sla.hw-class.zq-inflation]
+The quantile inflation factor is
+`z_q = t_(q, max(3, min(n_eff, n_distinct_c) − n_par)) · √(1+1/Σw)`;
+`Quantile()` uses `σ' = σ·z_q/Φ⁻¹(q)` (with the q=0.5 limit branch).
+
+r[sched.sla.hw-class.lambda-gamma-poisson]
+The per-class spot-interrupt rate estimate is
+`λ̂[h] = (EMA(interrupts) + n_λ·λ_seed) / (EMA(exposure) + n_λ)` with
+`n_λ = 1day · max(1, EMA_24h(node_count_{h,spot}))`.
+
+r[sched.sla.forecast.one-layer]
+`compute_spawn_intents` walks the Ready frontier AND a forecast
+frontier of `Queued` derivations whose every incomplete dependency is
+running with `ETA < max_{(h,cap)∈A} lead_time[h,cap]`. Each
+`SpawnIntent` carries `(A, c*, M, D, eta)` with `eta=0` for Ready and
+max-dep-ETA for forecast. Forecast lookahead is exactly one DAG layer.
+
+r[sched.sla.forecast.tenant-ceiling]
+Per-tenant Ready cores MUST be subtracted from the
+`sla.maxForecastCoresPerTenant` budget before forecast intents are
+admitted, so a tenant's wide layer-2 fanout cannot capture shared
+`maxFleetCores` ahead of other tenants' Ready intents (§Threat-model
+gap d).
+
+r[sched.sla.threat.read-path-auth]
+All read-path AdminService SLA RPCs (`SlaStatus` / `SlaExplain` /
+`ExportSlaCorpus` / `ListSlaOverrides` / `ListTenants` /
+`ListPoisoned`) MUST gate on `ensure_service_caller`, not only
+`ensure_leader` (§Threat-model gap a).
+
+r[sched.sla.threat.corpus-clamp]
+`ImportSlaCorpus` / `sla.seedCorpus` MUST reject entries with
+non-finite or out-of-range params: `ref_factor_vec` per-dim
+`∈ [0.1,10]`, `Q ≥ 0`, `n_eff ≤ 32`, `S,P ∈ [0, buildTimeout_ref]`,
+`a,b ∈ [0, sla.maxMem]` (§Threat-model gap c).
+
 ## Key Files
 
 - `rio-scheduler/src/actor/` — DAG actor (single-owner event loop, dispatch, retry, cleanup; split into mod/merge/completion/dispatch/executor/build submodules)

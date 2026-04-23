@@ -447,6 +447,56 @@ native cross-pool limit). Metrics: `rio_controller_nodepool_budget_
 reconcilers/nodepoolbudget.rs`; wired via `spawn_monitored
 ("nodepool-budget", ...)` gated on `cpu_millicores > 0`.
 
+## NodeClaim pool (ADR-023 §13b)
+
+r[ctrl.nodeclaim.ffd-sim]
+The per-tick NodeClaim-pool reconcile simulates placement via
+first-fit-decreasing — intents sorted `(eta=0, c*)` descending (Ready
+before forecast, large before small), bin-select `MostAllocated` on
+the `allocatable` divisor — so the deficit is the unplaced residual
+and matches the `schedulerName: rio-packed` instance.
+
+r[ctrl.nodeclaim.anchor-bulk]
+Unplaced intents per `(h,cap)` cell are covered by `1×anchor`
+(smallest type fitting `max_U(c*,M,D)`) plus
+`⌈(Σc* − anchor.cores)/bulk.cores⌉ × bulk` (cheapest \$/core type
+meeting `median_U(M/c*)`). NodeClaim creation is capped at
+`sla.maxNodeClaimsPerCellPerTick` and the `sla.maxFleetCores` budget;
+cells are iterated round-robin from a rotating start so no cell
+starves under sustained pressure.
+
+r[ctrl.nodeclaim.lead-time-ddsketch]
+`lead_time[h,cap] = q_0.9(boot − eta_error)` is read from a sliding
+active/shadow DDSketch pair per cell, persisted to PG as
+`u32`-version-tagged BYTEA. Sketches are seeded from
+`sla.leadTimeSeed[h,cap]` at synthetic count `n_seed = 1/(1-q) = 10`;
+the closed-loop `forecast_warm_hit_ratio` Schmitt widens/narrows the
+quantile by `Δq=0.02` per firing, capped at `q ≤ 0.99` and
+`lead_time ≤ sla.maxLeadTime`.
+
+r[ctrl.nodeclaim.consolidate-na]
+An empty NodeClaim is kept while
+`λ(t)·𝔼[c_arrival·𝟙{c_arrival ≤ cores}] > cores/q_0.5(boot[h,cap])`.
+The hazard `λ(t)` is the Nelson–Aalen estimate over right-censored
+`idle_gap[h,cap]`; the fitting-core term is the current tick's
+per-cell mean over `intents` (defined as 0 when intents is ⊥ or
+empty). A floor `consolidate_after ≥ q_0.5(boot)/2` prevents a
+transient lull from collapsing to always-delete.
+
+r[ctrl.nodeclaim.shim-nodepool]
+A single shim NodePool (`limits:{cpu:0}`,
+`disruption.budgets:[{nodes:"0"}]`) satisfies Karpenter's
+state-tracking lookup; the controller stamps
+`karpenter.sh/nodepool: rio-nodeclaim-shim` plus `rio.build/*` on
+`NodeClaim.metadata.labels`. NodeClaims reference EC2NodeClass
+directly (`rio-nvme` / `rio-default` by storage); rio owns deletion.
+
+r[ctrl.nodeclaim.priority-bucket]
+Builder pods MUST set `priorityClassName=rio-builder-prio-{⌊log₂c*⌋}`
+(10 fixed PriorityClasses, buckets 0–9, `globalDefault:false`,
+`preemptionPolicy:Never`) and `schedulerName=rio-packed`. Config-load
+asserts `maxCores < 1024`.
+
 ## Build CRD (removed)
 
 The `Build` CRD (`rio.build/v1alpha1 Build`) was removed in P0294. It was an
