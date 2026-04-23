@@ -243,6 +243,11 @@ pub enum ActorCommand {
     /// acceptable under backpressure.
     AckSpawnedIntents {
         spawned: Vec<rio_proto::types::SpawnIntent>,
+        /// §13b: cells the controller saw NodeClaim Launched=False /
+        /// Registered timeout for this tick. Scheduler marks each
+        /// ICE-infeasible on a backoff ladder. Consumed by B11; until
+        /// then the actor handler accepts and ignores it.
+        unfulfillable_cells: Vec<String>,
     },
 
     /// A worker ACKed its initial `PrefetchHint` with `PrefetchComplete`.
@@ -477,6 +482,13 @@ pub enum AdminQuery {
         corpus: crate::sla::prior::SeedCorpus,
         reply: oneshot::Sender<(usize, f64)>,
     },
+    /// `AdminService.HwClassSampled`: per-hw_class distinct-pod_id
+    /// count from the estimator's last `HwTable::load`. Reply is
+    /// `h → count`; absent classes map to 0 (handled RPC-side).
+    SlaHwSampled {
+        hw_classes: Vec<String>,
+        reply: oneshot::Sender<std::collections::HashMap<String, u32>>,
+    },
 }
 
 /// `cfg(test)` debug commands that bypass the state machine / dispatch
@@ -625,6 +637,7 @@ impl AdminQuery {
             Self::SlaEvict { .. } => "SlaEvict",
             Self::SlaExplain { .. } => "SlaExplain",
             Self::SlaExportCorpus { .. } => "SlaExportCorpus",
+            Self::SlaHwSampled { .. } => "SlaHwSampled",
             Self::SlaImportCorpus { .. } => "SlaImportCorpus",
         }
     }

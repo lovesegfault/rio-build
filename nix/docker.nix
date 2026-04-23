@@ -304,6 +304,52 @@ let
     "WatchBuild"
     "QueryBuildStatus"
   ];
+  # nginx with njs: r[sched.sla.threat.read-path-auth] gates
+  # ListPoisoned/ListTenants/GetBuildGraph on a service token. The
+  # browser can't hold the HMAC key, so the proxy mints
+  # `ServiceClaims{caller:"rio-dashboard", expiry_unix:now+60}` per
+  # request and injects it as `x-rio-service-token`. Same envelope as
+  # rio-auth's ServiceTokenInterceptor (b64url(json).b64url(hmac)).
+  dashboardNginx = pkgs.nginx.override {
+    modules = [ pkgs.nginxModules.njs ];
+  };
+  dashboardServiceTokenJs = pkgs.writeText "service-token.js" ''
+    import crypto from 'crypto';
+    import fs from 'fs';
+
+    // Key file mounted from the rio-service-hmac Secret. Read once at
+    // worker init (njs caches the module-level binding); a key rotation
+    // requires a pod restart, same as every other rio component.
+    // Missing mount → empty string → scheduler in dev mode (verifier=
+    // None) accepts anything; with verifier set, the empty-key HMAC is
+    // rejected and the request fails closed (PermissionDenied).
+    let key;
+    try {
+      key = fs.readFileSync('/etc/rio/hmac/service-hmac.key');
+    } catch (e) {
+      key = Buffer.from("");
+    }
+
+    function b64url(buf) {
+      return buf
+        .toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, "");
+    }
+
+    function token(r) {
+      const claims = JSON.stringify({
+        caller: 'rio-dashboard',
+        expiry_unix: Math.floor(Date.now() / 1000) + 60,
+      });
+      const body = Buffer.from(claims);
+      const tag = crypto.createHmac('sha256', key).update(body).digest();
+      return b64url(body) + '.' + b64url(tag);
+    }
+
+    export default { token };
+  '';
   # Shared proxy_pass directives for both allow-list locations (admin
   # + scheduler). Unbuffered streaming + long read-timeout are LOAD-
   # BEARING — see the in-config comment.
@@ -314,6 +360,11 @@ let
     proxy_read_timeout 3600s;
     proxy_set_header Content-Type $content_type;
     proxy_set_header X-Grpc-Web $http_x_grpc_web;
+    # r[impl sched.sla.threat.read-path-auth] (documentary — tracey
+    # does not scan .nix outside nix/tests/default.nix). The njs
+    # variable is computed per request; 60s expiry matches
+    # ServiceTokenInterceptor.
+    proxy_set_header x-rio-service-token $rio_service_token;
   '';
   dashboardNginxConf = pkgs.writeText "nginx.conf" ''
     # Non-root container (runAsUser, readOnlyRootFilesystem). Master
@@ -326,7 +377,9 @@ let
     error_log /dev/stderr info;
     events { worker_connections 1024; }
     http {
-      include ${pkgs.nginx}/conf/mime.types;
+      include ${dashboardNginx}/conf/mime.types;
+      js_import svc from ${dashboardServiceTokenJs};
+      js_set $rio_service_token svc.token;
       access_log /dev/stdout;
       # All writable paths in /tmp. readOnlyRootFilesystem blocks the
       # compiled-in defaults (/var/cache/nginx/* on most distros,
@@ -454,7 +507,7 @@ rec {
     ++ map (m: "/rio.scheduler.SchedulerService/${m}") dashboardReadonlyScheduler;
 
   # Exported for checks.dashboard-nginx-conf-guard (misc-checks.nix).
-  inherit dashboardNginxConf;
+  inherit dashboardNginxConf dashboardNginx;
 
   gateway = mkImage {
     name = "gateway";
@@ -776,12 +829,12 @@ rec {
     # resolves. dashboardNginxConf is referenced by absolute store
     # path in Cmd — the layer closure includes it transitively.
     contents = [
-      pkgs.nginx
+      dashboardNginx
       rioDashboard
     ];
     config = {
       Cmd = [
-        "${pkgs.nginx}/bin/nginx"
+        "${dashboardNginx}/bin/nginx"
         "-c"
         "${dashboardNginxConf}"
       ];

@@ -258,9 +258,11 @@ fn req_with_token<T>(signer: &rio_auth::hmac::HmacSigner, caller: &str, body: T)
 ///
 /// Read-only RPCs (intentionally ungated — dashboard/grpc-web reach
 /// them with no HMAC): `GetBuildLogs`, `ClusterStatus`, `ListExecutors`,
-/// `ListBuilds`, `ListPoisoned`, `ListTenants`, `GetBuildGraph`,
-/// `GetSpawnIntents`, `InspectBuildDag`, `DebugListExecutors`,
-/// `ListSlaOverrides`, `SlaStatus`, `SlaExplain`, `ExportSlaCorpus`.
+/// `ListBuilds`, `GetSpawnIntents`, `DebugListExecutors`.
+///
+/// Read-only but **gated** (threat-model gap (a) — a compromised
+/// builder reaching these leaks tenant/DAG/SLA topology): see
+/// [`read_path_rpcs_require_service_token`].
 // r[verify sec.authz.service-token]
 #[tokio::test]
 async fn mutating_rpcs_require_service_token() {
@@ -290,7 +292,10 @@ async fn mutating_rpcs_require_service_token() {
     );
     assert_gated!(
         "AckSpawnedIntents",
-        svc.ack_spawned_intents(Request::new(AckSpawnedIntentsRequest { spawned: vec![] }))
+        svc.ack_spawned_intents(Request::new(AckSpawnedIntentsRequest {
+            spawned: vec![],
+            unfulfillable_cells: vec![],
+        }))
     );
     assert_gated!(
         "AppendInterruptSample",
@@ -359,6 +364,60 @@ async fn mutating_rpcs_require_service_token() {
         status.code(),
         denied,
         "TriggerGC must be service-token gated"
+    );
+}
+
+/// Read-path RPCs that leak tenant/DAG/SLA topology are service-token
+/// gated. Threat-model gap (a): builders share port 9001 and the JWT
+/// interceptor is permissive-on-absent — without this gate a
+/// compromised builder enumerates tenants, reads any build's DAG, and
+/// learns which (pname,system) keys are under-/over-provisioned.
+// r[verify sched.sla.threat.read-path-auth]
+#[tokio::test]
+async fn read_path_rpcs_require_service_token() {
+    let (svc, _signer, _task, _db) = setup_svc_with_service_verifier().await;
+    let denied = tonic::Code::PermissionDenied;
+
+    macro_rules! assert_gated {
+        ($name:literal, $call:expr) => {{
+            let code = $call.await.unwrap_err().code();
+            assert_eq!(code, denied, "{} must be service-token gated", $name);
+        }};
+    }
+
+    assert_gated!("ListPoisoned", svc.list_poisoned(Request::new(())));
+    assert_gated!("ListTenants", svc.list_tenants(Request::new(())));
+    assert_gated!(
+        "GetBuildGraph",
+        svc.get_build_graph(Request::new(GetBuildGraphRequest {
+            build_id: Uuid::nil().to_string(),
+        }))
+    );
+    assert_gated!(
+        "InspectBuildDag",
+        svc.inspect_build_dag(Request::new(InspectBuildDagRequest {
+            build_id: Uuid::nil().to_string(),
+        }))
+    );
+    assert_gated!(
+        "ListSlaOverrides",
+        svc.list_sla_overrides(Request::new(ListSlaOverridesRequest::default()))
+    );
+    assert_gated!(
+        "SlaStatus",
+        svc.sla_status(Request::new(SlaStatusRequest::default()))
+    );
+    assert_gated!(
+        "SlaExplain",
+        svc.sla_explain(Request::new(SlaExplainRequest::default()))
+    );
+    assert_gated!(
+        "ExportSlaCorpus",
+        svc.export_sla_corpus(Request::new(ExportSlaCorpusRequest::default()))
+    );
+    assert_gated!(
+        "HwClassSampled",
+        svc.hw_class_sampled(Request::new(HwClassSampledRequest::default()))
     );
 }
 

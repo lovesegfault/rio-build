@@ -269,11 +269,14 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     if to_ack.is_empty() {
         debug!(pool = %name, queued, active = census.active, ?ceiling, "no Pending intents to ack");
     } else {
-        if let Err(e) =
-            admin_call(ctx.admin.clone().ack_spawned_intents(
-                rio_proto::types::AckSpawnedIntentsRequest { spawned: to_ack },
-            ))
-            .await
+        if let Err(e) = admin_call(ctx.admin.clone().ack_spawned_intents(
+            rio_proto::types::AckSpawnedIntentsRequest {
+                spawned: to_ack,
+                // §13b NodeClaim watcher (A18) populates this.
+                unfulfillable_cells: vec![],
+            },
+        ))
+        .await
         {
             warn!(pool = %name, error = %e, "ack_spawned_intents failed; ICE-timer not armed this tick");
         }

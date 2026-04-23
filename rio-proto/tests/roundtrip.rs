@@ -44,6 +44,14 @@ fn spawn_intents_proto_roundtrip() {
                 required_features: vec!["kvm".into()],
                 deadline_secs: 600,
                 executor_token: "tok".into(),
+                node_affinity: vec![rio_proto::types::NodeSelectorTerm {
+                    match_expressions: vec![rio_proto::types::NodeSelectorRequirement {
+                        key: "rio.build/hw-band".into(),
+                        operator: "In".into(),
+                        values: vec!["mid".into(), "hi".into()],
+                    }],
+                }],
+                eta_seconds: 0.0,
             },
             rio_proto::types::SpawnIntent {
                 intent_id: "i-fod".into(),
@@ -56,9 +64,13 @@ fn spawn_intents_proto_roundtrip() {
                 required_features: vec![],
                 deadline_secs: 300,
                 executor_token: String::new(),
+                node_affinity: vec![],
+                eta_seconds: 42.5,
             },
         ],
         queued_by_system: [("x86_64-linux".into(), 4), ("aarch64-linux".into(), 1)].into(),
+        dead_nodes: vec!["ip-10-0-1-42".into()],
+        ice_masked_cells: vec!["mid:spot".into()],
     };
     let bytes = orig.encode_to_vec();
     let decoded = GetSpawnIntentsResponse::decode(&*bytes).unwrap();

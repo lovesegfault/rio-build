@@ -45,5 +45,9 @@ pub(super) async fn get_spawn_intents(
     Ok(GetSpawnIntentsResponse {
         intents: snap.intents,
         queued_by_system: snap.queued_by_system,
+        // §13b dead-node detector + ICE mask: populated by B11. Empty
+        // until the actor's `compute_spawn_intents` carries them.
+        dead_nodes: vec![],
+        ice_masked_cells: vec![],
     })
 }

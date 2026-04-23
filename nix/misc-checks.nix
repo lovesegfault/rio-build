@@ -226,6 +226,16 @@ in
       echo "FAIL: dashboardNginxConf lost 'proxy_buffering off;' — gRPC-Web streams will buffer" >&2
       exit 1
     }
+    # Syntax check: njs js_import/js_set wiring is easy to get wrong
+    # and vm-dashboard-k3s is the only other place nginx parses this.
+    # `nginx -t` resolves upstream hostnames at parse time, which the
+    # sandbox can't do for the cluster FQDN — sed it to a sandbox-
+    # resolvable address. Everything else (directives, regex, njs
+    # module presence, js script syntax) is checked verbatim.
+    mkdir -p $TMPDIR/logs
+    sed 's/rio-scheduler\.rio-system\.svc\.cluster\.local/127.0.0.1/' \
+      ${dockerImages.dashboardNginxConf} > $TMPDIR/nginx.conf
+    ${dockerImages.dashboardNginx}/bin/nginx -t -p $TMPDIR -c $TMPDIR/nginx.conf
     touch $out
   '';
 

@@ -69,6 +69,13 @@ spec:
             # but never writes (error_log redirects immediately).
             - name: tmp
               mountPath: /tmp
+            # r[sched.sla.threat.read-path-auth]: the njs proxy_set_header
+            # mints x-rio-service-token (caller=rio-dashboard) per
+            # request from this key. Same Secret store.yaml/gateway.yaml
+            # mount; readOnly because the key is verify-side-shared.
+            - name: service-hmac
+              mountPath: /etc/rio/hmac
+              readOnly: true
           # / (index.html) is served from the baked-in SPA bundle. If
           # nginx is up, the SPA is servable — no backend dep to
           # readiness-gate on (Cilium Gateway being down means gRPC
@@ -89,6 +96,9 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        - name: service-hmac
+          secret:
+            secretName: rio-service-hmac
 ---
 apiVersion: v1
 kind: Service

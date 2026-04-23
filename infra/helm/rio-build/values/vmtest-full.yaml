@@ -85,8 +85,12 @@ scheduler:
     tiers:
       - {name: normal}
     defaultTier: normal
-    probe: {cpu: 1, memPerCore: 1073741824, memBase: 1073741824, deadlineSecs: 3600}
-    maxCores: 2
+    # ProbeShape::validate requires cpu ∈ [4, maxCores/4] (span≥4 reach
+    # for both explore paths) → maxCores ≥ 16. memPerCore/memBase sized
+    # so a 4-core probe (4×128Mi + 256Mi = 768Mi) still schedules on
+    # the 2 GiB k3s agent VM.
+    probe: {cpu: 4, memPerCore: 134217728, memBase: 268435456, deadlineSecs: 3600}
+    maxCores: 16
     maxMem: 2147483648         # 2 GiB
     maxDisk: 6442450944        # 6 GiB
     defaultDisk: 2147483648    # 2 GiB

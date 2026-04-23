@@ -418,6 +418,33 @@ message SpawnIntent {
   // it to bind the connection to this intent. Empty when the scheduler
   // has no HMAC key configured (dev mode).
   string executor_token = 10;
+  // ADR-023 §13a: OR-of-ANDs over (h, cap) cells. Each term carries the
+  // h-label conjunction PLUS karpenter.sh/capacity-type=cap. Supersedes
+  // `node_selector` (field 5, kept for compat — controller writes both
+  // until A18 lands; readers prefer `node_affinity` when non-empty).
+  repeated NodeSelectorTerm node_affinity = 11;
+  // §13a forecast horizon: 0 for Ready derivations; max-dep-ETA
+  // (reference-seconds) for not-yet-Ready. Controller filters
+  // `eta_seconds > 0` until the §13b NodeClaim pool exists, so
+  // forecast intents don't spawn pods that immediately gate on
+  // unbuilt deps.
+  double eta_seconds = 12;
+}
+
+// One conjunction of node-match requirements. Mirrors k8s core/v1
+// `NodeSelectorTerm` so a `From<...>` into `k8s_openapi::api::core::v1::
+// NodeSelectorTerm` is a field-by-field copy (rio-controller A18).
+// Defined here rather than importing k8s-openapi into rio-proto so the
+// proto stays buildable without the k8s dep tree.
+message NodeSelectorTerm {
+  repeated NodeSelectorRequirement match_expressions = 1;
+}
+message NodeSelectorRequirement {
+  string key = 1;
+  // "In" only for §13a; full k8s operator set is
+  // In/NotIn/Exists/DoesNotExist/Gt/Lt.
+  string operator = 2;
+  repeated string values = 3;
 }
 
 message GetSpawnIntentsRequest {
@@ -457,6 +484,15 @@ message GetSpawnIntentsResponse {
   // snapshot with `intents` so a controller reading both sees one
   // queue state.
   map<string, uint64> queued_by_system = 2;
+  // §13b: scheduler-computed hung-node detector. A node enters this
+  // list when ≥max(3, ⌈0.5·occupancy⌉) executors across ≥2 distinct
+  // tenants on that node have stale-heartbeat. Controller cordons +
+  // evicts. Empty until B11 wires the detector.
+  repeated string dead_nodes = 3;
+  // §13b: per-cell ICE mask ("h:cap" strings) so the controller's
+  // @alg-pool excludes the same cells the scheduler has marked
+  // ICE-infeasible. Coherent snapshot with `intents` (one tick).
+  repeated string ice_masked_cells = 4;
 }
 
 // Controller → scheduler ack: "I created Jobs for these intents".
@@ -471,6 +507,74 @@ message AckSpawnedIntentsRequest {
   // Band-agnostic selectors (empty / no `rio.build/hw-band`) are
   // ignored — they don't enter the ICE ladder.
   repeated SpawnIntent spawned = 1;
+  // §13b: cells where NodeClaim Launched=False or Registered timed
+  // out this tick. "h:cap" string. Scheduler marks each ICE-infeasible
+  // on a 60s→120s→… backoff ladder so subsequent `solve_intent_for`
+  // routes around the cell. Empty until controller A18 wires the
+  // NodeClaim watcher.
+  repeated string unfulfillable_cells = 2;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// HwClassSampled (ADR-023 §13a hw-bench gating)
+// ───────────────────────────────────────────────────────────────────────────
+
+// Controller asks "does any h in this intent's allowed-set A have <3
+// distinct pod_id benches?" — if so, set `rio.build/hw-bench-needed` on
+// the spawned pod so the builder runs the microbench before the build.
+// Batched per controller tick (one RPC for all hw_classes seen this
+// tick, not per-intent).
+message HwClassSampledRequest {
+  repeated string hw_classes = 1;
+}
+message HwClassSampledResponse {
+  // h → distinct pod_id count from `hw_perf_samples`. Includes
+  // hw_classes with 0 rows (count=0). Controller checks `any < 3` —
+  // the same threshold the `hw_perf_factors` view's HAVING clause uses
+  // to admit a class into the normalize table.
+  map<string, uint32> sampled_count = 1;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// SeedCorpus v2 (typed Export/ImportSlaCorpus body)
+// ───────────────────────────────────────────────────────────────────────────
+
+// SeedCorpus v2. v1 was an opaque JSON string (`ExportSlaCorpusResponse
+// .json` / `ImportSlaCorpusRequest.json`, kept for compat). This typed
+// shape lets the import handler range-validate (s,p,q,a,b,n_eff,alpha)
+// server-side instead of trusting whatever the JSON parser yielded.
+message SeedCorpus {
+  // Exporter's full per-hw_class factor vector at export time. One per
+  // hw_class in the exporter's table, NOT per entry. Lets a §13a
+  // importer reconstruct the exporter's normalize basis even when the
+  // local table has drifted. Empty for v1 round-trips.
+  repeated double ref_factor_vec = 1;
+  // Exporter's reference hw_class (the one with factor closest to 1.0).
+  // Same field as the v1 JSON; importers rescale (s,p,q) by
+  // `local.factor[ref_hw_class]`.
+  string ref_hw_class = 2;
+  repeated SeedEntry entries = 3;
+}
+message SeedEntry {
+  string pname = 1;
+  string system = 2;
+  // Package version string at export time. Informational (operator can
+  // tell a stale seed for gcc-12 from a fresh gcc-14). Empty for v1.
+  string version = 3;
+  double s = 4;
+  double p = 5;
+  double q = 6;
+  double p_bar = 7;
+  double a = 8;
+  double b = 9;
+  // §13a: per-hw_class residual-bias vector (same index order as
+  // `ref_factor_vec`). #[serde(default)] on the Rust side so v1 JSON
+  // (no alpha) imports as empty.
+  repeated double alpha = 10;
+  // Effective sample count behind this fit. v1 carried `n: u32`
+  // (truncated); v2 carries the f64 the partial-pool weighting
+  // actually uses. #[serde(default)] for v1 import compat.
+  double n_eff = 11;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -647,14 +751,21 @@ message ExportSlaCorpusResponse {
   // SeedCorpus JSON (see rio-scheduler::sla::prior::SeedCorpus). Carried
   // as an opaque string so the wire format and the on-disk format are
   // the same blob — `rio-cli sla export-corpus -o f.json` is just a
-  // write(response.json).
+  // write(response.json). Kept for compat; new clients read `corpus`.
   string json = 1;
   uint32 entries = 2;
+  // Typed v2 body. Same content as `json` (server populates both);
+  // typed so a consuming service can range-validate without re-parsing.
+  SeedCorpus corpus = 3;
 }
 
 message ImportSlaCorpusRequest {
-  // SeedCorpus JSON. Same shape ExportSlaCorpus produces.
+  // SeedCorpus JSON. Same shape ExportSlaCorpus produces. Kept for
+  // compat; server prefers `corpus` when set (non-empty entries).
   string json = 1;
+  // Typed v2 body. Server prefers this over `json` when `entries` is
+  // non-empty so range-validation runs on the typed fields.
+  SeedCorpus corpus = 2;
 }
 
 message ImportSlaCorpusResponse {

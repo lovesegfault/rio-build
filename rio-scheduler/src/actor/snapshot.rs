@@ -70,6 +70,18 @@ impl DagActor {
             AdminQuery::SlaImportCorpus { corpus, reply } => {
                 let _ = reply.send(self.sla_estimator.import_seed(corpus));
             }
+            AdminQuery::SlaHwSampled { hw_classes, reply } => {
+                let hw = self.sla_estimator.hw_table();
+                let _ = reply.send(
+                    hw_classes
+                        .into_iter()
+                        .map(|h| {
+                            let n = hw.distinct_pod_ids(&h);
+                            (h, n)
+                        })
+                        .collect(),
+                );
+            }
         }
     }
 
@@ -325,6 +337,11 @@ impl DagActor {
                     required_features: state.required_features.clone(),
                     deadline_secs: intent.deadline_secs,
                     executor_token,
+                    // §13a OR-of-ANDs targeting + forecast ETA: populated
+                    // by A9/A10. Empty / 0.0 ⇔ "Ready, single-cell" —
+                    // controller treats both as "use node_selector".
+                    node_affinity: vec![],
+                    eta_seconds: 0.0,
                 },
             ));
         }

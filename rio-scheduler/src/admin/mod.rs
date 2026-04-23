@@ -32,10 +32,10 @@ use rio_proto::types::{
     DeleteTenantRequest, DeleteTenantResponse, DrainExecutorRequest, DrainExecutorResponse,
     ExportSlaCorpusRequest, ExportSlaCorpusResponse, GcProgress, GcRequest, GetBuildGraphRequest,
     GetBuildGraphResponse, GetBuildLogsRequest, GetSpawnIntentsRequest, GetSpawnIntentsResponse,
-    ImportSlaCorpusRequest, ImportSlaCorpusResponse, InjectBuildSampleRequest,
-    InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse,
-    ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse, ListSlaOverridesRequest,
-    ListSlaOverridesResponse, ListTenantsResponse, PoisonedDerivation,
+    HwClassSampledRequest, HwClassSampledResponse, ImportSlaCorpusRequest, ImportSlaCorpusResponse,
+    InjectBuildSampleRequest, InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest,
+    ListBuildsResponse, ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse,
+    ListSlaOverridesRequest, ListSlaOverridesResponse, ListTenantsResponse, PoisonedDerivation,
     ReportExecutorTerminationRequest, ReportExecutorTerminationResponse, ResetSlaModelRequest,
     SetSlaOverrideRequest, SlaExplainRequest, SlaExplainResponse, SlaOverride, SlaStatusRequest,
     SlaStatusResponse, TerminationReason,
@@ -543,6 +543,8 @@ impl AdminService for AdminServiceImpl {
         request: Request<()>,
     ) -> Result<Response<ListPoisonedResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // r[impl sched.sla.threat.read-path-auth]
+        self.ensure_service_caller(request.metadata(), &["rio-cli", "rio-dashboard"])?;
         self.ensure_leader()?;
         // DB is the source of truth for poisoned_at (the in-memory DAG
         // reconstructs Instant from elapsed_secs at startup but doesn't
@@ -570,6 +572,8 @@ impl AdminService for AdminServiceImpl {
         request: Request<()>,
     ) -> Result<Response<ListTenantsResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // r[impl sched.sla.threat.read-path-auth]
+        self.ensure_service_caller(request.metadata(), &["rio-cli", "rio-dashboard"])?;
         self.ensure_leader()?;
         let db = crate::db::SchedulerDb::new(self.pool.clone());
         let resp = tenants::list_tenants(&db).await?;
@@ -619,6 +623,8 @@ impl AdminService for AdminServiceImpl {
         request: Request<GetBuildGraphRequest>,
     ) -> Result<Response<GetBuildGraphResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // r[impl sched.sla.threat.read-path-auth]
+        self.ensure_service_caller(request.metadata(), &["rio-cli", "rio-dashboard"])?;
         self.ensure_leader()?;
         let req = request.into_inner();
         let db = crate::db::SchedulerDb::new(self.pool.clone());
@@ -661,10 +667,39 @@ impl AdminService for AdminServiceImpl {
         self.actor
             .send_unchecked(ActorCommand::AckSpawnedIntents {
                 spawned: req.spawned,
+                unfulfillable_cells: req.unfulfillable_cells,
             })
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(()))
+    }
+
+    /// ADR-023 §13a: per-hw_class distinct-pod_id bench count, for the
+    /// controller's `rio.build/hw-bench-needed` annotation gate.
+    /// Reflects the estimator's last `HwTable::load` (~60s stale at
+    /// worst), NOT a live PG count.
+    #[instrument(skip(self, request), fields(rpc = "HwClassSampled"))]
+    async fn hw_class_sampled(
+        &self,
+        request: Request<HwClassSampledRequest>,
+    ) -> Result<Response<HwClassSampledResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        // Service-token gate: hw-class topology is operational
+        // telemetry on par with `SlaStatus`. The threat is a
+        // compromised builder enumerating which hw_classes are
+        // under-sampled to target bench-poisoning at exactly those.
+        self.ensure_service_caller(request.metadata(), &["rio-controller"])?;
+        self.ensure_leader()?;
+        self.check_actor_alive()?;
+        let req = request.into_inner();
+        let sampled_count = query_actor(&self.actor, |reply| {
+            ActorCommand::Admin(AdminQuery::SlaHwSampled {
+                hw_classes: req.hw_classes,
+                reply,
+            })
+        })
+        .await?;
+        Ok(Response::new(HwClassSampledResponse { sampled_count }))
     }
 
     /// Actor in-memory DAG snapshot for a build — the exact view
@@ -677,6 +712,8 @@ impl AdminService for AdminServiceImpl {
         request: Request<InspectBuildDagRequest>,
     ) -> Result<Response<InspectBuildDagResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // r[impl sched.sla.threat.read-path-auth]
+        self.ensure_service_caller(request.metadata(), &["rio-cli", "rio-dashboard"])?;
         self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
@@ -765,6 +802,8 @@ impl AdminService for AdminServiceImpl {
         request: Request<ListSlaOverridesRequest>,
     ) -> Result<Response<ListSlaOverridesResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // r[impl sched.sla.threat.read-path-auth]
+        self.ensure_service_caller(request.metadata(), &["rio-cli"])?;
         self.ensure_leader()?;
         let pname = request.into_inner().pname;
         let db = crate::db::SchedulerDb::new(self.pool.clone());
@@ -832,6 +871,8 @@ impl AdminService for AdminServiceImpl {
         request: Request<SlaStatusRequest>,
     ) -> Result<Response<SlaStatusResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // r[impl sched.sla.threat.read-path-auth]
+        self.ensure_service_caller(request.metadata(), &["rio-cli"])?;
         self.ensure_leader()?;
         self.check_actor_alive()?;
         let r = request.into_inner();
@@ -856,6 +897,8 @@ impl AdminService for AdminServiceImpl {
         request: Request<SlaExplainRequest>,
     ) -> Result<Response<SlaExplainResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // r[impl sched.sla.threat.read-path-auth]
+        self.ensure_service_caller(request.metadata(), &["rio-cli"])?;
         self.ensure_leader()?;
         self.check_actor_alive()?;
         let r = request.into_inner();
@@ -877,6 +920,8 @@ impl AdminService for AdminServiceImpl {
         request: Request<ExportSlaCorpusRequest>,
     ) -> Result<Response<ExportSlaCorpusResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // r[impl sched.sla.threat.read-path-auth]
+        self.ensure_service_caller(request.metadata(), &["rio-cli"])?;
         self.ensure_leader()?;
         self.check_actor_alive()?;
         let r = request.into_inner();
@@ -891,7 +936,14 @@ impl AdminService for AdminServiceImpl {
         let entries = corpus.entries.len() as u32;
         let json = serde_json::to_string(&corpus)
             .map_err(|e| Status::internal(format!("serialize corpus: {e}")))?;
-        Ok(Response::new(ExportSlaCorpusResponse { json, entries }))
+        // Populate BOTH `json` (v1, on-disk format for `[sla].seed_corpus`)
+        // and `corpus` (v2, typed wire body).
+        let proto_corpus = rio_proto::types::SeedCorpus::from(&corpus);
+        Ok(Response::new(ExportSlaCorpusResponse {
+            json,
+            entries,
+            corpus: Some(proto_corpus),
+        }))
     }
 
     #[instrument(skip(self, request), fields(rpc = "ImportSlaCorpus"))]
@@ -904,8 +956,14 @@ impl AdminService for AdminServiceImpl {
         self.ensure_leader()?;
         self.check_actor_alive()?;
         let r = request.into_inner();
-        let corpus: crate::sla::prior::SeedCorpus = serde_json::from_str(&r.json)
-            .map_err(|e| Status::invalid_argument(format!("parse corpus json: {e}")))?;
+        // Prefer the typed v2 body when present (non-empty entries) so
+        // range-validation runs on proto-typed fields. Fall back to the
+        // v1 `json` string for old clients / on-disk-file passthrough.
+        let corpus: crate::sla::prior::SeedCorpus = match r.corpus {
+            Some(c) if !c.entries.is_empty() => c.into(),
+            _ => serde_json::from_str(&r.json)
+                .map_err(|e| Status::invalid_argument(format!("parse corpus json: {e}")))?,
+        };
         let ref_hw_class = corpus.ref_hw_class.clone();
         let (n, scale) = query_actor(&self.actor, |reply| {
             ActorCommand::Admin(AdminQuery::SlaImportCorpus { corpus, reply })

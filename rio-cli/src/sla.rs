@@ -325,7 +325,14 @@ pub(crate) async fn run(
         SlaCmd::ImportCorpus { path } => {
             let json = std::fs::read_to_string(&path)
                 .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
-            let req = ImportSlaCorpusRequest { json };
+            // v2: send the typed body so server-side range-validation
+            // runs on proto-typed fields. Parse failures (e.g. a v1
+            // file whose serde shape differs from the proto-serde
+            // shape) fall back to the opaque `json` string — the
+            // server's `serde_json::from_str::<prior::SeedCorpus>`
+            // accepts both via #[serde(default)].
+            let corpus = serde_json::from_str::<rio_proto::types::SeedCorpus>(&json).ok();
+            let req = ImportSlaCorpusRequest { json, corpus };
             let resp = crate::rpc("ImportSlaCorpus", async || {
                 client.import_sla_corpus(req.clone()).await
             })

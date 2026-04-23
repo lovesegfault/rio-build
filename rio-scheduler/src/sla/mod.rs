@@ -246,6 +246,12 @@ impl SlaEstimator {
                     a,
                     b,
                     n: f.n_eff as u32,
+                    // v2: f64 n_eff (the partial-pool weight). `version`/
+                    // `alpha` are §13a fields populated by A13's
+                    // per-hw_class residual computation.
+                    n_eff: f.n_eff,
+                    version: String::new(),
+                    alpha: vec![],
                 })
             })
             .collect();
@@ -267,6 +273,8 @@ impl SlaEstimator {
             entries.dedup_by(|a, b| a.pname == b.pname && a.system == b.system);
         }
         prior::SeedCorpus {
+            // §13a full factor vector populated by A13.
+            ref_factor_vec: vec![],
             ref_hw_class: self.hw.read().reference.clone(),
             entries,
         }
@@ -745,7 +753,9 @@ mod tests {
                 a: 22.0,
                 b: 0.5,
                 n: 5,
+                ..Default::default()
             }],
+            ..Default::default()
         });
         assert!(
             est.prior_sources().seed.is_empty(),
@@ -792,7 +802,9 @@ mod tests {
                 a: 22.0,
                 b: 0.5,
                 n: 5,
+                ..Default::default()
             }],
+            ..Default::default()
         });
         est.apply_pending_seed(&hw::HwTable::default());
         assert!(
@@ -830,7 +842,9 @@ mod tests {
                 a: 22.0,
                 b: 0.5,
                 n: 5,
+                ..Default::default()
             }],
+            ..Default::default()
         };
         // hw empty → stashed, factor=NaN sentinel.
         let (n, scale) = est.import_seed(corpus);

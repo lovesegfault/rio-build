@@ -172,6 +172,13 @@ service AdminService {
   // value=node_seconds). Append-only; the scheduler's lease-gated
   // poller aggregates into λ[h].
   rpc AppendInterruptSample(rio.types.AppendInterruptSampleRequest) returns (google.protobuf.Empty);
+
+  // ADR-023 §13a: per-hw_class distinct pod_id bench count. Read-only,
+  // controller-allowlisted (the controller batches one call per
+  // reconcile tick to decide `rio.build/hw-bench-needed`). Reflects
+  // the estimator's last refresh tick (~60s stale at worst), NOT a
+  // live PG count.
+  rpc HwClassSampled(rio.types.HwClassSampledRequest) returns (rio.types.HwClassSampledResponse);
 }
 
 // ControllerService (Scheduler→Controller push) removed 2026-03 — the

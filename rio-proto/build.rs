@@ -26,6 +26,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "ListExecutorsResponse",
         "ListBuildsResponse",
         "SpawnIntent",
+        "NodeSelectorTerm",
+        "NodeSelectorRequirement",
         "GetSpawnIntentsResponse",
         "UpstreamInfo",
         "ListUpstreamsResponse",
@@ -38,6 +40,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "SlaExplainResponse",
     ] {
         b = b.type_attribute(format!("rio.types.{ty}"), "#[derive(serde::Serialize)]");
+    }
+    // SeedCorpus/SeedEntry: Serialize + Deserialize so rio-cli can write
+    // a typed corpus to disk and read it back for `import-corpus`
+    // without depending on rio-scheduler's `prior::SeedCorpus`.
+    for ty in ["SeedCorpus", "SeedEntry"] {
+        b = b.type_attribute(
+            format!("rio.types.{ty}"),
+            "#[derive(serde::Serialize, serde::Deserialize)]",
+        );
     }
     for field in [
         "ClusterStatusResponse.uptime_since",

@@ -771,11 +771,15 @@ impl DagActor {
                     };
                     let _ = reply.send(promoted);
                 }
-                ActorCommand::AckSpawnedIntents { spawned } => {
+                ActorCommand::AckSpawnedIntents {
+                    spawned,
+                    unfulfillable_cells: _,
+                } => {
                     // r[impl sched.lease.standby-drops-writes] —
                     // would arm `pending_intents` for a previous
                     // generation's spawn.
                     if self.leader.is_leader() {
+                        // §13b `unfulfillable_cells` consumed by B11.
                         self.handle_ack_spawned_intents(&spawned);
                     }
                 }

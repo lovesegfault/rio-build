@@ -43,25 +43,108 @@ pub type SeedKey = (String, String);
 /// [`HwTable::reference`] — the hw_class whose factor is closest to 1.0
 /// in THEIR table — so an importer can rescale time-domain params via
 /// its own `factor[ref_hw_class]`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// **v1/v2 compat:** v1 JSON had `{ref_hw_class, entries[{..., n}]}`.
+/// v2 adds `ref_factor_vec` and per-entry `{version, alpha, n_eff}`.
+/// Every v2 field is `#[serde(default)]` so v1 files still parse;
+/// `n` is also `#[serde(default)]` so a v2-proto-shaped JSON (which
+/// carries `n_eff` not `n`) parses too.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SeedCorpus {
+    /// Exporter's full per-hw_class factor vector at export time. v2;
+    /// empty on v1 import.
+    #[serde(default)]
+    pub ref_factor_vec: Vec<f64>,
     pub ref_hw_class: String,
     pub entries: Vec<SeedEntry>,
 }
 
 /// One `(pname, system)` row. `p_bar`/`n` are informational (round-trip
 /// fidelity, operator inspection); only `(s, p, q, a, b)` feed the prior.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SeedEntry {
     pub pname: String,
     pub system: String,
+    /// Package version at export time. v2; empty on v1 import.
+    #[serde(default)]
+    pub version: String,
     pub s: f64,
     pub p: f64,
     pub q: f64,
     pub p_bar: f64,
     pub a: f64,
     pub b: f64,
+    /// v1 truncated effective-sample count. `#[serde(default)]` so a
+    /// v2-proto-shaped JSON (carries `n_eff` only) still parses.
+    #[serde(default)]
     pub n: u32,
+    /// §13a per-hw_class residual-bias vector. v2; empty on v1 import.
+    #[serde(default)]
+    pub alpha: Vec<f64>,
+    /// Effective sample count (the f64 the partial-pool weighting uses).
+    /// v2; 0.0 on v1 import — callers fall back to `n as f64` when
+    /// `n_eff == 0.0`.
+    #[serde(default)]
+    pub n_eff: f64,
+}
+
+impl From<&SeedCorpus> for rio_proto::types::SeedCorpus {
+    fn from(c: &SeedCorpus) -> Self {
+        Self {
+            ref_factor_vec: c.ref_factor_vec.clone(),
+            ref_hw_class: c.ref_hw_class.clone(),
+            entries: c
+                .entries
+                .iter()
+                .map(|e| rio_proto::types::SeedEntry {
+                    pname: e.pname.clone(),
+                    system: e.system.clone(),
+                    version: e.version.clone(),
+                    s: e.s,
+                    p: e.p,
+                    q: e.q,
+                    p_bar: e.p_bar,
+                    a: e.a,
+                    b: e.b,
+                    alpha: e.alpha.clone(),
+                    // Prefer the f64 n_eff; fall back to v1 `n` so a v1
+                    // corpus round-tripped through proto carries it.
+                    n_eff: if e.n_eff > 0.0 {
+                        e.n_eff
+                    } else {
+                        f64::from(e.n)
+                    },
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<rio_proto::types::SeedCorpus> for SeedCorpus {
+    fn from(c: rio_proto::types::SeedCorpus) -> Self {
+        Self {
+            ref_factor_vec: c.ref_factor_vec,
+            ref_hw_class: c.ref_hw_class,
+            entries: c
+                .entries
+                .into_iter()
+                .map(|e| SeedEntry {
+                    pname: e.pname,
+                    system: e.system,
+                    version: e.version,
+                    s: e.s,
+                    p: e.p,
+                    q: e.q,
+                    p_bar: e.p_bar,
+                    a: e.a,
+                    b: e.b,
+                    n: e.n_eff as u32,
+                    alpha: e.alpha,
+                    n_eff: e.n_eff,
+                })
+                .collect(),
+        }
+    }
 }
 
 impl SeedCorpus {
@@ -557,7 +640,9 @@ mod tests {
                 a: 22.0,
                 b: 0.6,
                 n: 12,
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let json = serde_json::to_string(&corpus).unwrap();
         let parsed: SeedCorpus = serde_json::from_str(&json).unwrap();
@@ -590,11 +675,50 @@ mod tests {
                 a: 20.0,
                 b: 1.0,
                 n: 3,
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let (map, scale) = corpus.into_seed_map(&HwTable::default());
         assert_eq!(scale, 1.0);
         assert_eq!(map[&("x".into(), "x86_64-linux".into())].s, 5.0);
+    }
+
+    /// v1 JSON (no `ref_factor_vec`/`version`/`alpha`/`n_eff`) still
+    /// parses via `#[serde(default)]`. v2-proto JSON (no `n`) parses
+    /// with `n=0`. The proto round-trip carries `n_eff` (preferred) and
+    /// derives `n` from it.
+    #[test]
+    fn corpus_v1_v2_compat() {
+        // v1 on-disk shape (what existing `[sla].seed_corpus` files have).
+        let v1 = r#"{"ref_hw_class":"aws-5-ebs","entries":[
+            {"pname":"x","system":"y","s":1,"p":2,"q":0,"p_bar":4,"a":5,"b":6,"n":7}
+        ]}"#;
+        let parsed: SeedCorpus = serde_json::from_str(v1).expect("v1 parses");
+        let e = &parsed.entries[0];
+        assert_eq!(e.n, 7);
+        assert_eq!(e.n_eff, 0.0, "v1 had no n_eff");
+        assert!(e.alpha.is_empty());
+        assert!(e.version.is_empty());
+        assert!(parsed.ref_factor_vec.is_empty());
+        // v1 → proto: n_eff falls back to n.
+        let proto = rio_proto::types::SeedCorpus::from(&parsed);
+        assert_eq!(proto.entries[0].n_eff, 7.0);
+        // proto → Rust: n derived from n_eff.
+        let back = SeedCorpus::from(proto);
+        assert_eq!(back.entries[0].n, 7);
+        assert_eq!(back.entries[0].n_eff, 7.0);
+
+        // v2-proto-shaped JSON (no `n`, has `n_eff`).
+        let v2 = r#"{"ref_factor_vec":[1.0,1.5],"ref_hw_class":"r","entries":[
+            {"pname":"x","system":"y","version":"1.2","s":1,"p":2,"q":0,
+             "p_bar":4,"a":5,"b":6,"alpha":[0.1],"n_eff":12.5}
+        ]}"#;
+        let parsed: SeedCorpus = serde_json::from_str(v2).expect("v2 parses");
+        assert_eq!(parsed.entries[0].n, 0);
+        assert_eq!(parsed.entries[0].n_eff, 12.5);
+        assert_eq!(parsed.entries[0].alpha, vec![0.1]);
+        assert_eq!(parsed.ref_factor_vec, vec![1.0, 1.5]);
     }
 
     #[test]

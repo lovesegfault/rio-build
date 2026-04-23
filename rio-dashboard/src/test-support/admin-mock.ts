@@ -81,6 +81,7 @@ export const adminMock = {
   exportSlaCorpus: vi.fn(),
   importSlaCorpus: vi.fn(),
   appendInterruptSample: vi.fn(),
+  hwClassSampled: vi.fn(),
   // Extend as AdminService grows — one site, not N test files.
 } satisfies Record<string, Mock>;
 
