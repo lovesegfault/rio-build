@@ -367,18 +367,19 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             }
             if let Some(aid) = act.drv.remove(&drv_event.derivation_path) {
                 stderr.stop_activity(aid).await?;
+                debug!(aid, drv = %drv_event.derivation_path, "stop_activity sent");
             } else {
-                // I-206 witness: Completed for a drv we
-                // never (or no longer) have an aid for —
-                // path-key mismatch, or Started was dropped
-                // by a Lagged window. Display-only; the
-                // root actBuilds stop at terminal clears
-                // children. Logged so the next repro
-                // captures which case.
+                // Completed for a drv we never (or no
+                // longer) have an aid for — path-key
+                // mismatch (dispatch.rs drv_path vs
+                // completion.rs path_or_hash_fallback), or
+                // Started was dropped by a state-channel
+                // Lagged window. Display-only; the
+                // act.drv terminal-drain below covers it.
                 debug!(
                     drv = %drv_event.derivation_path,
                     tracked = act.drv.len(),
-                    "Completed with no tracked activity (I-206)"
+                    "Completed with no tracked activity"
                 );
             }
         }
@@ -419,6 +420,35 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
         }
         // Queued: no activity to start/stop, no STDERR.
         types::DerivationEventKind::Queued => {}
+    }
+    Ok(())
+}
+
+// r[impl gw.activity.stop-parity]
+/// Emit `stop_activity` for every aid still tracked in `act.drv` /
+/// `act.subst`. Called once at build terminus before the root
+/// `actBuilds` stop.
+///
+/// A non-empty drain set means an upstream `DerivationEvent` was lost:
+/// scheduler state-channel `Lagged` (rare post-split), a Started/
+/// Completed path-key mismatch (`dispatch.rs drv_path` vs `completion.rs
+/// path_or_hash_fallback`), or a future bug. Without this the client's
+/// nom shows the drv stuck at its last phase forever — the Apr-7
+/// large-shallow repro had 44 `start` / 34 `stop` on the wire.
+async fn drain_unstopped_activities<W: AsyncWrite + Unpin>(
+    stderr: &mut StderrWriter<&mut W>,
+    act: &mut BuildActivityState,
+) -> Result<(), StreamProcessError> {
+    if !act.drv.is_empty() || !act.subst.is_empty() {
+        tracing::warn!(
+            drv = act.drv.len(),
+            subst = act.subst.len(),
+            "draining unstopped activities at terminal (upstream event loss)"
+        );
+    }
+    for (drv, aid) in act.drv.drain().chain(act.subst.drain()) {
+        stderr.stop_activity(aid).await?;
+        debug!(aid, %drv, "stop_activity sent (terminal drain)");
     }
     Ok(())
 }
@@ -904,6 +934,14 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // down, client is alive, cancel would have nowhere to go anyway.
     if !matches!(outcome, Err(StreamProcessError::Wire(_))) {
         active_build_ids.remove(&build_id);
+    }
+
+    // Best-effort terminal drain: a Wire error means the client is
+    // gone (write would BrokenPipe), and the writer may already be
+    // poisoned. nom tolerates unstopped activities (closes on EOF),
+    // but stop-parity makes the live display correct.
+    if !matches!(outcome, Err(StreamProcessError::Wire(_))) {
+        let _ = drain_unstopped_activities(stderr, &mut act).await;
     }
 
     // Close the top-level actBuilds activity. Best-effort: a Wire
@@ -1719,5 +1757,68 @@ mod tests {
             act.subst.is_empty(),
             "Completed must clear subst aid (terminal-arm symmetry)"
         );
+    }
+
+    // r[verify gw.activity.stop-parity]
+    /// Three drvs Started, only one Completed (the other two
+    /// completions were lost upstream). `drain_unstopped_activities`
+    /// must emit `stop_activity` for the leaked aids and clear the
+    /// maps.
+    #[tokio::test]
+    async fn drain_unstopped_activities_emits_stop_for_leaked() {
+        use types::DerivationEventKind::*;
+        let drvs = [
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a.drv",
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b.drv",
+            "/nix/store/cccccccccccccccccccccccccccccccc-c.drv",
+        ];
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+
+        for d in &drvs {
+            relay_derivation_status(&mut stderr, &mut act, ev(Started, d, &[]))
+                .await
+                .unwrap();
+        }
+        let aid_a = *act.drv.get(drvs[0]).unwrap();
+        let aid_b = *act.drv.get(drvs[1]).unwrap();
+        let aid_c = *act.drv.get(drvs[2]).unwrap();
+
+        // One Completed arrives normally; aids b/c leak.
+        relay_derivation_status(&mut stderr, &mut act, ev(Completed, drvs[0], &[]))
+            .await
+            .unwrap();
+        assert_eq!(act.drv.len(), 2, "two aids leaked into terminal");
+
+        let pre_drain_len = buf.len();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        drain_unstopped_activities(&mut stderr, &mut act)
+            .await
+            .unwrap();
+        assert!(act.drv.is_empty() && act.subst.is_empty(), "maps drained");
+
+        // Wire after the drain point: exactly two STOP_ACTIVITY frames
+        // for aids b and c (order is HashMap iteration — accept either).
+        let mut r = std::io::Cursor::new(&buf[pre_drain_len..]);
+        let mut stopped = Vec::new();
+        for _ in 0..2 {
+            assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_STOP_ACTIVITY);
+            stopped.push(wire::read_u64(&mut r).await.unwrap());
+        }
+        stopped.sort_unstable();
+        let mut expected = [aid_b, aid_c];
+        expected.sort_unstable();
+        assert_eq!(stopped, expected, "leaked aids must be stopped at terminal");
+        // No extra bytes — drain emits ONLY the leaked stops, never
+        // a duplicate of aid_a (already stopped via Completed).
+        assert!(
+            r.position() as usize == buf.len() - pre_drain_len,
+            "no surplus frames after drain"
+        );
+        let _ = aid_a;
     }
 }

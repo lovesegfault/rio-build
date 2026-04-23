@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::state::{BuildOptions, DrvHash, ExecutorId, PriorityClass};
@@ -99,8 +99,7 @@ pub enum ActorCommand {
     /// Merge a new build's derivation DAG into the global graph.
     MergeDag {
         req: MergeDagRequest,
-        reply:
-            oneshot::Sender<Result<broadcast::Receiver<rio_proto::types::BuildEvent>, ActorError>>,
+        reply: oneshot::Sender<Result<super::BuildEventReceivers, ActorError>>,
     },
 
     /// Process a completion report from a worker.
@@ -278,9 +277,7 @@ pub enum ActorCommand {
         /// See [`ActorCommand::CancelBuild::caller_tenant`].
         caller_tenant: Option<Uuid>,
         since_sequence: u64,
-        reply: oneshot::Sender<
-            Result<(broadcast::Receiver<rio_proto::types::BuildEvent>, u64), ActorError>,
-        >,
+        reply: oneshot::Sender<Result<(super::BuildEventReceivers, u64), ActorError>>,
     },
 
     /// Internal: clean up terminal build state (maps + DAG interest) after

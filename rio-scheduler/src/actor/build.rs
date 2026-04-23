@@ -2,7 +2,6 @@
 // r[impl sched.build.state]
 // r[impl sched.build.keep-going]
 
-use tokio::sync::broadcast;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
@@ -309,7 +308,7 @@ impl DagActor {
         &self,
         build_id: Uuid,
         caller_tenant: Option<Uuid>,
-    ) -> Result<(broadcast::Receiver<rio_proto::types::BuildEvent>, u64), ActorError> {
+    ) -> Result<(super::BuildEventReceivers, u64), ActorError> {
         let build = self
             .builds
             .get(&build_id)
@@ -318,14 +317,6 @@ impl DagActor {
         if caller_tenant.is_some() && build.tenant_id != caller_tenant {
             return Err(ActorError::PermissionDenied { build_id });
         }
-        // builds and events.channels are removed together
-        // (handle_cleanup_terminal_build); the second lookup is
-        // defense-in-depth.
-        let tx = self
-            .events
-            .channels
-            .get(&build_id)
-            .ok_or(ActorError::BuildNotFound(build_id))?;
 
         // Subscribe FIRST so we receive anything sent after this point.
         // Then capture last_seq. The actor is single-threaded and
@@ -335,7 +326,14 @@ impl DagActor {
         // emitted before subscribe (PG replay covers it; may also be
         // in the broadcast ring → gRPC dedups); everything > last_seq
         // was emitted after (guaranteed on broadcast, not in PG yet).
-        let rx = tx.subscribe();
+        //
+        // builds and events.channels are removed together
+        // (handle_cleanup_terminal_build); subscribe() returning None
+        // is defense-in-depth against maps drift.
+        let rx = self
+            .events
+            .subscribe(build_id)
+            .ok_or(ActorError::BuildNotFound(build_id))?;
         let last_seq = self.events.last_seq(build_id);
 
         // If the build is already terminal, the BuildCompleted/Failed/Cancelled
@@ -403,7 +401,13 @@ impl DagActor {
             // watermark stays below — this re-send passes dedup and
             // IS what the watcher sees. Same for PG-down (watermark
             // 0).
-            let _ = tx.send(event);
+            //
+            // Direct on the state-channel sender (NOT via emit()):
+            // emit() would bump the sequence past last_seq and
+            // re-persist a row PG may already have.
+            if let Some(tx) = self.events.channels.get(&build_id) {
+                let _ = tx.send(event);
+            }
         }
 
         Ok((rx, last_seq))

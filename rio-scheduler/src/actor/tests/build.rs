@@ -69,7 +69,7 @@ async fn test_watch_build_after_terminal_replays_event(#[case] how: Terminalize)
         .await?;
     let (mut watch_rx, _) = reply_rx.await??;
 
-    let event = tokio::time::timeout(Duration::from_secs(2), watch_rx.recv())
+    let event = tokio::time::timeout(Duration::from_secs(2), watch_rx.state.recv())
         .await
         .expect("WatchBuild on terminal build should not hang")
         .expect("should receive an event");
@@ -233,7 +233,7 @@ async fn test_watch_build_receives_events() -> TestResult {
     let mut saw_completed = false;
     // Drain events with a timeout.
     for _ in 0..10 {
-        match tokio::time::timeout(Duration::from_millis(200), watch_rx.recv()).await {
+        match tokio::time::timeout(Duration::from_millis(200), watch_rx.state.recv()).await {
             Ok(Ok(event)) => {
                 if matches!(
                     event.event,

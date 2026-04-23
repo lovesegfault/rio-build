@@ -6,7 +6,6 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use tokio::sync::broadcast;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
@@ -37,7 +36,7 @@ pub(super) struct MergeIngest {
     /// the edges themselves are consumed by `dag.merge` + persist.
     pub edges_len: usize,
     pub merge_result: crate::dag::MergeResult,
-    pub event_rx: broadcast::Receiver<rio_proto::types::BuildEvent>,
+    pub event_rx: super::BuildEventReceivers,
     /// Pre-existing not-done nodes that were re-probed in step 4.
     pub existing_reprobe: HashSet<DrvHash>,
     pub cached_hits: HashMap<DrvHash, Vec<String>>,
@@ -78,7 +77,7 @@ impl DagActor {
     pub(super) async fn handle_merge_dag(
         &mut self,
         req: MergeDagRequest,
-    ) -> Result<broadcast::Receiver<rio_proto::types::BuildEvent>, ActorError> {
+    ) -> Result<super::BuildEventReceivers, ActorError> {
         // I-139: per-phase timing. handle_merge_dag was >300s for a
         // 153k-node / 837k-edge DAG with only ~22s in the batched DB
         // phase; the rest had no logging. Each phase now self-reports

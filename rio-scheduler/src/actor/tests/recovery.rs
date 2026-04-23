@@ -497,7 +497,7 @@ async fn merge_chain(
             reply: tx,
         })
         .await?;
-    Ok(rx.await??)
+    Ok(rx.await??.state)
 }
 
 /// Phase-1 + backdate-to-Assigned for the orphan-reconcile tests:
@@ -625,7 +625,7 @@ async fn test_orphan_completion_fires_build_completion() -> TestResult {
     use rio_proto::types::{DerivationEventKind, build_event::Event};
     let mut drv_completed: Vec<rio_proto::types::DerivationEvent> = Vec::new();
     let mut got_build_completed = false;
-    while let Ok(ev) = events.try_recv() {
+    while let Ok(ev) = events.state.try_recv() {
         match ev.event {
             Some(Event::Derivation(d)) if d.kind() == DerivationEventKind::Completed => {
                 assert!(

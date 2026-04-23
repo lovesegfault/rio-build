@@ -60,6 +60,7 @@ pub(super) use breaker::CacheCheckBreaker;
 pub use command::*;
 pub use config::{DagActorConfig, DagActorPlumbing};
 use event::BuildEventBus;
+pub use event::BuildEventReceivers;
 #[cfg(test)]
 pub(crate) use executor::compute_initial_prefetch_paths;
 pub use handle::ActorHandle;
@@ -88,17 +89,32 @@ const BACKPRESSURE_HIGH_WATERMARK: f64 = 0.80;
 /// Backpressure: resume accepting work below this fraction.
 const BACKPRESSURE_LOW_WATERMARK: f64 = 0.60;
 
-/// Number of events to retain in each build's event buffer for late subscribers.
+/// Number of state events to retain in each build's broadcast ring for
+/// late subscribers.
 ///
 /// 4096 (was 1024 — I-144): `handle_merge_dag` calls `dispatch_ready()`
 /// BEFORE returning `event_rx`, so the initial dispatch burst (one
 /// Derivation::Started per ready node) lands in the ring before the
 /// SubmitBuild bridge starts draining. A 153k-node submission with ~500
-/// ready nodes plus Progress/Log emitted ~1.3k events synchronously →
-/// the bridge's first `recv()` was `Lagged`. 4096 gives headroom for the
+/// ready nodes plus Progress emitted ~1.3k events synchronously → the
+/// bridge's first `recv()` was `Lagged`. 4096 gives headroom for the
 /// initial burst; the bridge now also continues across `Lagged` instead
 /// of dropping the receiver (see `bridge_build_events`).
+///
+/// `Event::Log` is NOT routed through this channel — it has its own
+/// [`LOG_EVENT_BUFFER_SIZE`]-sized ring so log volume cannot evict
+/// state-transition events (`r[gw.activity.stop-parity]`).
 pub(super) const BUILD_EVENT_BUFFER_SIZE: usize = 4096;
+
+/// `Event::Log` broadcast ring size, per build. Separate from
+/// [`BUILD_EVENT_BUFFER_SIZE`] so chatty parallel builds (chromium /
+/// firefox / rustc at ~20 batches/s each) cannot lag the state-event
+/// channel and drop `DerivationEvent::Completed`. The Apr-7 large-shallow
+/// repro had 44 `start_activity` but only 34 `stop` on the wire —
+/// `Lagged` skip-and-continue silently dropped 10 completions. Log loss
+/// is acceptable (S3 + AdminService is the authoritative path); state
+/// loss is not.
+pub(crate) const LOG_EVENT_BUFFER_SIZE: usize = 1024;
 
 /// Default cap on concurrent detached substitute-fetch tasks: an
 /// in-flight detached-task MEMORY bound, NOT a throughput throttle.

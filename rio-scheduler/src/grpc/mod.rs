@@ -29,7 +29,7 @@ use rio_auth::hmac::{ExecutorClaims, HmacKey};
 use rio_common::grpc::StatusExt;
 use rio_common::tenant::NormalizedName;
 
-use crate::actor::{ActorCommand, ActorError, ActorHandle};
+use crate::actor::{ActorCommand, ActorError, ActorHandle, BuildEventReceivers};
 use crate::db::SchedulerDb;
 use crate::logs::LogBuffers;
 
@@ -347,21 +347,33 @@ pub(crate) struct EventReplay {
 /// to the oldest in-ring event — it's still subscribed. Breaking here
 /// drops the receiver → `receiver_count() == 0` → orphan-watcher
 /// (`r[sched.backstop.orphan-watcher]`) starts the 5-min grace timer.
-/// Under sustained event burst (large DAG, many concurrent drvs emitting
-/// Log lines) the gateway can't drain fast enough and the bridge re-lags
-/// every reconnect, so the receiver keeps dropping → orphan-watcher
-/// eventually cancels a perfectly-watched build (I-144).
+/// Under sustained event burst (large DAG initial dispatch) the gateway
+/// can't drain fast enough and the bridge re-lags every reconnect, so
+/// the receiver keeps dropping → orphan-watcher eventually cancels a
+/// perfectly-watched build (I-144).
 ///
-/// The gap is acceptable: Log events are recoverable via S3 (LogFlusher);
-/// Derivation/Progress events are UX-only. A terminal event lost in the
-/// gap is recovered by the Closed → `EofWithoutTerminal` → WatchBuild
-/// reconnect → `handle_watch_build` terminal-resend path (≤60s delay
-/// from `TERMINAL_CLEANUP_DELAY`).
+/// State and Log events arrive on separate broadcast rings
+/// (`r[gw.activity.stop-parity]`). Log volume cannot lag the state ring;
+/// state-channel `Lagged` should now be very rare (only initial dispatch
+/// burst > 4096). Log-channel `Lagged` is expected under chatty parallel
+/// builds and is debug-level: S3 + AdminService is the authoritative log
+/// path. A *state-channel* terminal lost to `Lagged` is recovered by the
+/// Closed → `EofWithoutTerminal` → WatchBuild reconnect →
+/// `handle_watch_build` terminal-resend path (≤60s delay from
+/// `TERMINAL_CLEANUP_DELAY`).
 pub(crate) fn bridge_build_events(
     task_name: &'static str,
-    mut bcast: broadcast::Receiver<rio_proto::types::BuildEvent>,
+    rx: BuildEventReceivers,
     replay: Option<EventReplay>,
 ) -> ReceiverStream<Result<rio_proto::types::BuildEvent, Status>> {
+    enum StateOrLog<T> {
+        State(T),
+        Log(T),
+    }
+    let BuildEventReceivers {
+        state: mut bcast,
+        log: mut log_bcast,
+    } = rx;
     let (tx, rx) = mpsc::channel(256);
     rio_common::task::spawn_monitored(task_name, async move {
         // Phase 1: PG replay. Best-effort — on error, fall through.
@@ -442,58 +454,85 @@ pub(crate) fn bridge_build_events(
             }
         }
 
-        // Phase 2: broadcast drain.
+        // Phase 2: merge-drain state + log broadcast rings.
+        //
+        // `biased` toward state: under contention a state-transition
+        // (Derivation/Completed) is forwarded before backlogged log
+        // batches. This is a fairness preference, not the correctness
+        // guarantee — the guarantee is the channel split itself.
+        let mut log_closed = false;
         loop {
-            match bcast.recv().await {
-                Ok(event) => {
-                    use rio_proto::types::build_event::Event;
+            let recv = tokio::select! {
+                biased;
+                r = bcast.recv() => StateOrLog::State(r),
+                r = log_bcast.recv(), if !log_closed => StateOrLog::Log(r),
+            };
+            match recv {
+                StateOrLog::State(Ok(event)) => {
                     // Dedup: PG already delivered seq ≤ watermark.
-                    // The broadcast ring (1024 cap) holds recent
-                    // events — some were emitted BEFORE subscribe
-                    // and have seq ≤ last_seq. Skip those.
-                    //
-                    // Log is EXEMPT: it is never persisted to PG
-                    // (event.rs filters it from the persister) AND
-                    // reuses the last persisted seq without bumping
-                    // (event.rs Log arm). After a reconnect-with-
-                    // replay, `dedup_watermark = last_seq` and every
-                    // live Log line arrives at `seq = last_seq` →
-                    // would be dropped here until the next non-Log
-                    // event bumps the counter — an unbounded live-log
-                    // blackout for a single long-running drv. Log
-                    // can never be a Phase-1 duplicate (PG never had
-                    // it), so skipping the check is safe.
-                    if event.sequence <= dedup_watermark
-                        && !matches!(event.event, Some(Event::Log(_)))
-                    {
+                    // The broadcast ring holds recent events — some
+                    // were emitted BEFORE subscribe and have seq ≤
+                    // last_seq. Skip those.
+                    if event.sequence <= dedup_watermark {
                         continue;
                     }
                     if tx.send(Ok(event)).await.is_err() {
                         break; // client disconnected
                     }
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
-                Err(broadcast::error::RecvError::Lagged(n)) => {
+                StateOrLog::Log(Ok(event)) => {
+                    // No dedup: Log is never persisted to PG
+                    // (event.rs filters it from the persister) AND
+                    // reuses the last persisted seq without bumping.
+                    // It can never be a Phase-1 duplicate.
+                    if tx.send(Ok(event)).await.is_err() {
+                        break;
+                    }
+                }
+                StateOrLog::State(Err(broadcast::error::RecvError::Closed)) => break,
+                StateOrLog::Log(Err(broadcast::error::RecvError::Closed)) => {
+                    // Log channel closed (cleanup) but state still
+                    // open — keep draining state. The arm guard above
+                    // stops re-polling the closed log receiver.
+                    log_closed = true;
+                    continue;
+                }
+                StateOrLog::State(Err(broadcast::error::RecvError::Lagged(n))) => {
                     // I-144: do NOT break. Breaking drops `bcast` →
                     // `receiver_count() == 0` → orphan-watcher cancels
                     // the build after grace even though the gateway is
-                    // still attached and would reconnect. Under burst
-                    // (large DAG initial dispatch, or hundreds of drvs
-                    // emitting Log lines) the gateway can't keep up and
-                    // re-lags on every reconnect — receiver_count stays
-                    // 0 long enough for orphan-cancel.
+                    // still attached and would reconnect.
                     //
-                    // The receiver is still valid post-Lagged (tokio
-                    // repositions it to the oldest in-ring event). The
-                    // gap is acceptable: Log recoverable via S3; a
-                    // missed terminal event surfaces via Closed →
-                    // EofWithoutTerminal → WatchBuild reconnect →
-                    // handle_watch_build terminal-resend.
+                    // Post-split this should be rare (only initial
+                    // dispatch burst > BUILD_EVENT_BUFFER_SIZE). The
+                    // receiver is still valid (tokio repositions to
+                    // oldest in-ring). A missed terminal surfaces via
+                    // Closed → EofWithoutTerminal → WatchBuild
+                    // reconnect → handle_watch_build terminal-resend;
+                    // a missed per-drv Completed surfaces via the
+                    // gateway's act.drv terminal-drain.
                     warn!(
-                        lagged = n,
-                        "build event subscriber lagged; {n} events skipped, continuing"
+                        task = task_name,
+                        skipped = n,
+                        "state-event subscriber lagged; {n} events skipped, continuing"
                     );
-                    metrics::counter!("rio_scheduler_broadcast_lagged_total").increment(n);
+                    metrics::counter!("rio_scheduler_broadcast_lagged_total", "kind" => "state")
+                        .increment(n);
+                    continue;
+                }
+                StateOrLog::Log(Err(broadcast::error::RecvError::Lagged(n))) => {
+                    // Expected under chatty parallel builds. Log loss
+                    // is acceptable — S3 + AdminService is
+                    // authoritative; this is the live convenience
+                    // tail. debug-level so chatty builds don't spam
+                    // the scheduler log.
+                    tracing::debug!(
+                        task = task_name,
+                        skipped = n,
+                        "log-event subscriber lagged; {n} log batches skipped"
+                    );
+                    metrics::counter!("rio_scheduler_broadcast_lagged_total", "kind" => "log")
+                        .increment(n);
                     continue;
                 }
             }

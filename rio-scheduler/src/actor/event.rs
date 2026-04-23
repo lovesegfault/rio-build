@@ -15,7 +15,20 @@ use uuid::Uuid;
 
 use crate::state::DrvHash;
 
-use super::{BUILD_EVENT_BUFFER_SIZE, DagActor};
+use super::{BUILD_EVENT_BUFFER_SIZE, DagActor, LOG_EVENT_BUFFER_SIZE};
+
+/// Paired broadcast receivers for one build: state-transition events
+/// (Derivation/Progress/Started/Completed/...) on `state`, build-log
+/// batches on `log`. Split so log volume cannot evict state events from
+/// the broadcast ring (`r[gw.activity.stop-parity]`).
+///
+/// `bridge_build_events` holds both for the lifetime of the gRPC stream;
+/// orphan-watcher checks `receiver_count()` on the *state* sender only.
+#[derive(Debug)]
+pub struct BuildEventReceivers {
+    pub state: broadcast::Receiver<rio_proto::types::BuildEvent>,
+    pub log: broadcast::Receiver<rio_proto::types::BuildEvent>,
+}
 
 /// Minimum interval between `BuildProgress` emits for one build (I-140).
 /// `emit_progress` → `build_summary` is O(dag_nodes); on a 153k-node DAG
@@ -32,8 +45,13 @@ const PROGRESS_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(
 /// (recovery seq seed, watch_build terminal-resend); everything else
 /// goes through the methods below.
 pub(super) struct BuildEventBus {
-    /// Build event broadcast channels.
+    /// State-event broadcast channels (everything but `Event::Log`).
+    /// Orphan-watcher checks `receiver_count()` on this sender.
     pub(super) channels: HashMap<Uuid, broadcast::Sender<rio_proto::types::BuildEvent>>,
+    /// `Event::Log` broadcast channels — separate so log volume cannot
+    /// lag the state ring and drop completions. See
+    /// [`LOG_EVENT_BUFFER_SIZE`].
+    pub(super) log_channels: HashMap<Uuid, broadcast::Sender<rio_proto::types::BuildEvent>>,
     /// Per-build sequence counters.
     pub(super) sequences: HashMap<Uuid, u64>,
     /// Per-build last-BuildProgress emit time. `emit_progress` debounces
@@ -68,6 +86,7 @@ impl BuildEventBus {
     ) -> Self {
         Self {
             channels: HashMap::new(),
+            log_channels: HashMap::new(),
             sequences: HashMap::new(),
             progress_at: HashMap::new(),
             persist_tx,
@@ -75,23 +94,35 @@ impl BuildEventBus {
         }
     }
 
-    /// Create a fresh broadcast channel for `build_id` and seed
-    /// `sequences[build_id] = 0`. Returns the receiver (merge step 3
-    /// hands it to the SubmitBuild bridge; recovery drops it).
-    pub(super) fn register(
-        &mut self,
-        build_id: Uuid,
-    ) -> broadcast::Receiver<rio_proto::types::BuildEvent> {
-        let (tx, rx) = broadcast::channel(BUILD_EVENT_BUFFER_SIZE);
+    /// Create fresh state + log broadcast channels for `build_id` and
+    /// seed `sequences[build_id] = 0`. Returns both receivers (merge
+    /// step 3 hands them to the SubmitBuild bridge; recovery drops them).
+    pub(super) fn register(&mut self, build_id: Uuid) -> BuildEventReceivers {
+        let (tx, state) = broadcast::channel(BUILD_EVENT_BUFFER_SIZE);
+        let (log_tx, log) = broadcast::channel(LOG_EVENT_BUFFER_SIZE);
         self.channels.insert(build_id, tx);
+        self.log_channels.insert(build_id, log_tx);
         self.sequences.insert(build_id, 0);
-        rx
+        BuildEventReceivers { state, log }
+    }
+
+    /// Subscribe to an existing build's state + log channels. `None` if
+    /// no channel registered (build unknown / already cleaned up).
+    /// `handle_watch_build` uses this for late-attach gateways.
+    pub(super) fn subscribe(&self, build_id: Uuid) -> Option<BuildEventReceivers> {
+        let state = self.channels.get(&build_id)?.subscribe();
+        // log_channels is created/removed in lockstep with channels;
+        // a None here would mean a maps-out-of-sync bug. Treat as
+        // build-not-found rather than panicking.
+        let log = self.log_channels.get(&build_id)?.subscribe();
+        Some(BuildEventReceivers { state, log })
     }
 
     /// Drop all per-build state for `build_id` (channels + seq +
     /// debounce). Called from terminal-cleanup and merge-rollback.
     pub(super) fn remove(&mut self, build_id: Uuid) {
         self.channels.remove(&build_id);
+        self.log_channels.remove(&build_id);
         self.sequences.remove(&build_id);
         self.progress_at.remove(&build_id);
     }
@@ -101,6 +132,7 @@ impl BuildEventBus {
     /// task channels, not per-build state.
     pub(super) fn clear(&mut self) {
         self.channels.clear();
+        self.log_channels.clear();
         self.sequences.clear();
         self.progress_at.clear();
     }
@@ -181,7 +213,18 @@ impl BuildEventBus {
             // metric — spawn_monitored already logged the panic.
         }
 
-        if let Some(tx) = self.channels.get(&build_id) {
+        // r[impl gw.activity.stop-parity]
+        // Log → its own ring; everything else → the state ring. The
+        // bridge merges both. This is the load-bearing split: a chatty
+        // build's log volume can lag the *log* ring (acceptable — S3
+        // is authoritative) but never the *state* ring, so
+        // `DerivationEvent::Completed` is not evictable by log lines.
+        let tx = if matches!(build_event.event, Some(Event::Log(_))) {
+            self.log_channels.get(&build_id)
+        } else {
+            self.channels.get(&build_id)
+        };
+        if let Some(tx) = tx {
             // broadcast::send returns Err only if there are no receivers, which is fine
             let _ = tx.send(build_event);
         }

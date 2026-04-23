@@ -729,6 +729,10 @@ r[gw.stderr.activity+2]
 
 Note: values 1--99 are unused. The enum starts at 0 (Unknown) then jumps to 100. For `Build` (105) the `fields` array is `[drvPath, machineName, curRound, nrRounds]`; nom and `--log-format bar` read `fields[0]` as the derivation name and `fields[1]` as the "on `<machine>`" suffix. For `Substitute` (108) the `fields` array is `[storePath, substituterUri]`; the gateway emits one per `DerivationEventKind::SUBSTITUTING` (`r[sched.substitute.detached]`) with `fields[1]` empty (the store picks the upstream — the scheduler doesn't see which), and stops it on the paired `CACHED` (success) or `STARTED` (fetch failed → fell through to a build).
 
+r[gw.activity.stop-parity]
+
+Every `STDERR_START_ACTIVITY` the gateway emits to a client MUST be matched by a `STDERR_STOP_ACTIVITY` for the same id before the build's terminal `BuildResult` is written. The scheduler routes `Event::Log` on a separate broadcast ring from `DerivationEvent` so log volume cannot evict per-derivation `Completed` events; the gateway additionally drains any still-tracked activity ids at terminus to cover upstream loss.
+
 ### STDERR_RESULT BuildEvent mapping
 
 r[gw.stderr.result.build-log-line]

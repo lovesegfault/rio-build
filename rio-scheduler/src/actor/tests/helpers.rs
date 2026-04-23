@@ -481,7 +481,8 @@ pub(crate) async fn merge_dag_req(
             reply: reply_tx,
         })
         .await?;
-    Ok(reply_rx.await??)
+    // Tests assert on state events; the log channel is dropped here.
+    Ok(reply_rx.await??.state)
 }
 
 /// Connect a worker (stream + heartbeat) so it becomes fully registered.
@@ -534,7 +535,7 @@ pub(crate) async fn merge_single_node(
             reply: reply_tx,
         })
         .await?;
-    Ok(reply_rx.await??)
+    Ok(reply_rx.await??.state)
 }
 
 /// Merge a multi-node DAG with default options (tenant=None,
@@ -565,7 +566,7 @@ pub(crate) async fn merge_dag(
             reply: reply_tx,
         })
         .await?;
-    Ok(reply_rx.await??)
+    Ok(reply_rx.await??.state)
 }
 
 /// Query build status. Propagates BuildNotFound as an error.

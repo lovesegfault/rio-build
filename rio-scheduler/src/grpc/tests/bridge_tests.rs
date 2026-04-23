@@ -12,6 +12,14 @@ use super::*;
 use std::time::Duration;
 use tokio_stream::StreamExt;
 
+/// Pair a state receiver with a fresh empty log channel. Tests that
+/// drive `bridge_build_events` with a bare `broadcast::channel` only
+/// care about the state ring; the log ring is part of the signature.
+fn state_only(state: broadcast::Receiver<rio_proto::types::BuildEvent>) -> BuildEventReceivers {
+    let (_tx, log) = broadcast::channel(1);
+    BuildEventReceivers { state, log }
+}
+
 /// I-144: when a broadcast receiver lags, the bridge MUST keep the
 /// receiver alive (continue, not break). Breaking drops the receiver →
 /// `receiver_count() == 0` → orphan-watcher (5-min grace) auto-cancels
@@ -38,7 +46,7 @@ async fn test_bridge_build_events_lagged_keeps_receiver_alive() {
         });
     }
 
-    let mut stream = bridge_build_events("test-bridge", rx, None);
+    let mut stream = bridge_build_events("test-bridge", state_only(rx), None);
 
     // First poll: bridge's first recv() hits Lagged(2), continues, next
     // recv() returns seq=3 (oldest still in the cap-1 ring). NOT an Err.
@@ -75,6 +83,90 @@ async fn test_bridge_build_events_lagged_keeps_receiver_alive() {
         .expect("Ok event");
     assert_eq!(next.sequence, 4);
     assert_eq!(tx.receiver_count(), 1, "still subscribed after second send");
+}
+
+/// State events MUST survive log-channel flooding. Before the
+/// state/log channel split, `Event::Log` and `DerivationEvent` shared
+/// one `broadcast(4096)` ring; chatty parallel builds (chromium /
+/// firefox / rustc) flooded it, the bridge's `Lagged` skip-and-continue
+/// silently dropped `DerivationEvent::Completed`, and the gateway never
+/// emitted `stop_activity` — repro JSON had 44 `start` / 34 `stop`.
+///
+/// Asserts: emitting >> ring-capacity Log events on the log channel
+/// does NOT prevent a single `Derivation::Completed` on the state
+/// channel from reaching the bridge output.
+// r[verify gw.activity.stop-parity]
+#[tokio::test]
+async fn test_completed_event_survives_log_flood() {
+    use rio_proto::types::build_event::Event;
+    let build_id = Uuid::new_v4();
+
+    // Log ring sized at the production LOG_EVENT_BUFFER_SIZE so the
+    // flood actually lags it. State ring sized at 16 — irrelevant,
+    // only one state event is sent.
+    let (state_tx, state_rx) = broadcast::channel(16);
+    let (log_tx, log_rx) = broadcast::channel(crate::actor::LOG_EVENT_BUFFER_SIZE);
+    let mut stream = bridge_build_events(
+        "test-log-flood",
+        BuildEventReceivers {
+            state: state_rx,
+            log: log_rx,
+        },
+        None,
+    );
+
+    // Flood the log channel well past its capacity so the log receiver
+    // is guaranteed Lagged. This is what emit() routes Event::Log to.
+    for _ in 0..6000 {
+        let _ = log_tx.send(mk_log_event(build_id, 0));
+    }
+    // The state event under test: a per-derivation Completed.
+    let _ = state_tx.send(rio_proto::types::BuildEvent {
+        build_id: build_id.to_string(),
+        sequence: 1,
+        timestamp: None,
+        event: Some(Event::Derivation(rio_proto::types::DerivationEvent {
+            derivation_path: "/nix/store/x.drv".into(),
+            kind: rio_proto::types::DerivationEventKind::Completed as i32,
+            output_paths: vec![],
+            executor_id: String::new(),
+            error_message: String::new(),
+            failure_status: 0,
+        })),
+    });
+
+    // Drain until we see the Completed. A 2s budget at 6001 events is
+    // ample (in-process). Some Log events were evicted by Lagged —
+    // count how many reached the bridge to assert the flood actually
+    // overflowed the log ring (otherwise the test isn't proving the
+    // split, just that 6000 < capacity).
+    let mut log_seen = 0usize;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let saw_completed = loop {
+        let Ok(Some(ev)) = tokio::time::timeout_at(deadline, stream.next()).await else {
+            break false;
+        };
+        match ev.expect("Ok event").event {
+            Some(Event::Log(_)) => log_seen += 1,
+            Some(Event::Derivation(d))
+                if d.kind == rio_proto::types::DerivationEventKind::Completed as i32 =>
+            {
+                break true;
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    };
+
+    assert!(
+        saw_completed,
+        "DerivationEvent::Completed must reach the bridge despite log flood"
+    );
+    assert!(
+        log_seen < 6000,
+        "log channel should have lagged (saw {log_seen}/6000); \
+         if all logs arrived, LOG_EVENT_BUFFER_SIZE >= 6000 and the test \
+         isn't exercising the split"
+    );
 }
 
 /// UUID v7 build_ids are time-ordered: two submissions ~apart in time
@@ -243,7 +335,7 @@ async fn test_bridge_replays_from_pg_and_dedups_broadcast() -> anyhow::Result<()
     // last_seq=5 (actor's watermark at subscribe time).
     let mut stream = bridge_build_events(
         "test-replay",
-        bcast_rx,
+        state_only(bcast_rx),
         Some(EventReplay {
             pool: db.pool.clone(),
             build_id,
@@ -271,11 +363,10 @@ async fn test_bridge_replays_from_pg_and_dedups_broadcast() -> anyhow::Result<()
 /// bug_125: `Event::Log` reuses the last persisted seq (event.rs Log
 /// arm) and is never written to PG. After a reconnect-with-replay,
 /// `dedup_watermark = last_seq` and a fresh Log arrives at `seq =
-/// last_seq` — the dedup MUST NOT drop it (it's not a Phase-1
-/// duplicate; PG never had it). Without the Log exemption, every live
-/// log line is silently dropped until the next non-Log event bumps the
-/// counter — for a single long-running drv that's the rest of its
-/// stdout/stderr.
+/// last_seq` — the dedup MUST NOT drop it. Log now arrives on a
+/// separate channel that the bridge never dedups, so this is
+/// structural; the test pins that the split is wired and a Log at the
+/// watermark seq still reaches the client.
 #[tokio::test]
 async fn test_bridge_log_event_at_watermark_seq_not_deduped() -> anyhow::Result<()> {
     let db = TestDb::new(&MIGRATOR).await;
@@ -286,20 +377,23 @@ async fn test_bridge_log_event_at_watermark_seq_not_deduped() -> anyhow::Result<
         insert_event(&db.pool, build_id, seq).await?;
     }
 
-    // Broadcast: the same 3 persisted events (still in ring) PLUS a
-    // Log at seq=3 — emit() reuses the last persisted seq for Log.
-    // The persisted seq=3 is a real Phase-1 duplicate (dedup it); the
-    // Log at seq=3 is NOT (it's a fresh post-subscribe event).
+    // State ring: the same 3 persisted events (still in buffer) — all
+    // Phase-1 duplicates, all deduped.
     let (bcast_tx, bcast_rx) = broadcast::channel(16);
     for seq in 1..=3 {
         bcast_tx.send(mk_event(build_id, seq))?;
     }
-    bcast_tx.send(mk_log_event(build_id, 3))?;
+    // Log ring: a Log at seq=3 (emit() reuses the last persisted seq).
+    let (log_tx, log_rx) = broadcast::channel(16);
+    log_tx.send(mk_log_event(build_id, 3))?;
 
     // Gateway reconnects: saw nothing (since=0), actor's watermark is 3.
     let mut stream = bridge_build_events(
         "test-log-dedup",
-        bcast_rx,
+        BuildEventReceivers {
+            state: bcast_rx,
+            log: log_rx,
+        },
         Some(EventReplay {
             pool: db.pool.clone(),
             build_id,
@@ -308,9 +402,9 @@ async fn test_bridge_log_event_at_watermark_seq_not_deduped() -> anyhow::Result<
         }),
     );
 
-    // Phase 1: PG replay yields seq 1,2,3 (Cancelled events). Phase 2:
-    // broadcast's persisted 1..3 are deduped (seq ≤ 3 AND not Log);
-    // the Log at seq=3 passes. 4 events total.
+    // Phase 1: PG replay yields seq 1,2,3. Phase 2: state-ring 1..3 all
+    // deduped (seq ≤ 3); Log@3 from log-ring passes (no dedup applied
+    // to log channel). 4 events total.
     let mut events = Vec::new();
     for _ in 0..4 {
         let ev = tokio::time::timeout(Duration::from_secs(2), stream.next())
@@ -321,18 +415,18 @@ async fn test_bridge_log_event_at_watermark_seq_not_deduped() -> anyhow::Result<
     assert_eq!(
         events.iter().map(|e| e.sequence).collect::<Vec<_>>(),
         vec![1, 2, 3, 3],
-        "PG replay 1..3 then Log@3 from broadcast"
+        "PG replay 1..3 then Log@3 from log channel"
     );
     use rio_proto::types::build_event::Event;
     assert!(
         matches!(events[3].event, Some(Event::Log(_))),
         "4th event is the Log (not a deduped duplicate of the persisted seq=3)"
     );
-    // The 3 persisted broadcast duplicates were skipped — no 5th event.
+    // The 3 persisted state-ring duplicates were skipped — no 5th event.
     let extra = tokio::time::timeout(Duration::from_millis(100), stream.next()).await;
     assert!(
         extra.is_err(),
-        "persisted-event broadcast duplicates still deduped: {extra:?}"
+        "persisted-event state-ring duplicates still deduped: {extra:?}"
     );
 
     Ok(())
@@ -359,7 +453,7 @@ async fn test_bridge_post_subscribe_events_pass_dedup() -> anyhow::Result<()> {
 
     let mut stream = bridge_build_events(
         "test-post-sub",
-        bcast_rx,
+        state_only(bcast_rx),
         Some(EventReplay {
             pool: db.pool.clone(),
             build_id,
@@ -399,7 +493,7 @@ async fn test_bridge_pg_failure_falls_through_no_dedup() -> anyhow::Result<()> {
 
     let mut stream = bridge_build_events(
         "test-pg-fail",
-        bcast_rx,
+        state_only(bcast_rx),
         Some(EventReplay {
             pool: db.pool.clone(),
             build_id,
@@ -443,7 +537,7 @@ async fn test_bridge_watermark_tracks_pg_max_not_last_seq() -> anyhow::Result<()
     // Gateway reconnects with since=0; actor's last_seq=10.
     let mut stream = bridge_build_events(
         "test-watermark",
-        bcast_rx,
+        state_only(bcast_rx),
         Some(EventReplay {
             pool: db.pool.clone(),
             build_id,

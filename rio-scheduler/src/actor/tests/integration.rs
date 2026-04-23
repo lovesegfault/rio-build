@@ -353,6 +353,25 @@ async fn test_assign_send_failure_cleans_running_build() -> TestResult {
 // Log forwarding (ForwardLogBatch → gateway via BuildEvent::Log)
 // -----------------------------------------------------------------------
 
+/// Subscribe to a build's *log* channel via WatchBuild. The merge
+/// helpers return only the state receiver; log-forwarding tests need
+/// the log receiver explicitly post-split.
+async fn subscribe_log(
+    handle: &ActorHandle,
+    build_id: Uuid,
+) -> anyhow::Result<broadcast::Receiver<rio_proto::types::BuildEvent>> {
+    let (tx, rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::WatchBuild {
+            build_id,
+            caller_tenant: None,
+            since_sequence: 0,
+            reply: tx,
+        })
+        .await?;
+    Ok(rx.await??.0.log)
+}
+
 /// ForwardLogBatch with a drv_path the DAG knows → BuildEvent::Log arrives
 /// on the broadcast rx for the interested build.
 ///
@@ -370,23 +389,8 @@ async fn test_assign_send_failure_cleans_running_build() -> TestResult {
 async fn test_forward_log_batch_reaches_interested_build() -> TestResult {
     let (_db, handle, _task) = setup().await;
     let build_id = Uuid::new_v4();
-    let mut events =
-        merge_single_node(&handle, build_id, "logtest", PriorityClass::Scheduled).await?;
-
-    // Drain merge-time events. With no worker present, dispatch is a no-op,
-    // so after InputsResolved the stream goes quiet until we push a log
-    // batch. Merge-time sequence: [DerivationCached*] → Started →
-    // InputsResolved. Breaking on InputsResolved (not Started) ensures
-    // we've consumed the full merge-time burst.
-    loop {
-        let ev = events.recv().await?;
-        if matches!(
-            ev.event,
-            Some(rio_proto::types::build_event::Event::InputsResolved(_))
-        ) {
-            break;
-        }
-    }
+    merge_single_node(&handle, build_id, "logtest", PriorityClass::Scheduled).await?;
+    let mut events = subscribe_log(&handle, build_id).await?;
 
     let batch = rio_proto::types::BuildLogBatch {
         derivation_path: test_drv_path("logtest"),
@@ -424,19 +428,8 @@ async fn test_forward_log_batch_reaches_interested_build() -> TestResult {
 async fn test_forward_log_batch_unknown_drv_path_dropped() -> TestResult {
     let (_db, handle, _task) = setup().await;
     let build_id = Uuid::new_v4();
-    let mut events =
-        merge_single_node(&handle, build_id, "knowndrv", PriorityClass::Scheduled).await?;
-
-    // Drain merge-time events (through InputsResolved — last merge-time event).
-    loop {
-        let ev = events.recv().await?;
-        if matches!(
-            ev.event,
-            Some(rio_proto::types::build_event::Event::InputsResolved(_))
-        ) {
-            break;
-        }
-    }
+    merge_single_node(&handle, build_id, "knowndrv", PriorityClass::Scheduled).await?;
+    let mut events = subscribe_log(&handle, build_id).await?;
 
     // Send a log batch for a drv_path that is NOT in the DAG.
     handle
@@ -494,24 +487,11 @@ async fn test_forward_log_batch_fanout_to_multiple_interested_builds() -> TestRe
     // Two builds, SAME derivation tag → DAG merge dedupes to one node with
     // interested_builds = {build1, build2}.
     let build1 = Uuid::new_v4();
-    let mut events1 =
-        merge_single_node(&handle, build1, "shared-drv", PriorityClass::Scheduled).await?;
+    merge_single_node(&handle, build1, "shared-drv", PriorityClass::Scheduled).await?;
     let build2 = Uuid::new_v4();
-    let mut events2 =
-        merge_single_node(&handle, build2, "shared-drv", PriorityClass::Scheduled).await?;
-
-    // Drain merge-time events on both (through InputsResolved).
-    for events in [&mut events1, &mut events2] {
-        loop {
-            let ev = events.recv().await?;
-            if matches!(
-                ev.event,
-                Some(rio_proto::types::build_event::Event::InputsResolved(_))
-            ) {
-                break;
-            }
-        }
-    }
+    merge_single_node(&handle, build2, "shared-drv", PriorityClass::Scheduled).await?;
+    let mut events1 = subscribe_log(&handle, build1).await?;
+    let mut events2 = subscribe_log(&handle, build2).await?;
 
     handle
         .send_unchecked(ActorCommand::ForwardLogBatch {
