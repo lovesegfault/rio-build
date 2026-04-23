@@ -18,16 +18,29 @@ resolver = "2"
 # https://doc.rust-lang.org/rustc/platform-support.html
 platforms = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 
-# Dev-only features (tokio[test-util], aws-sdk-s3[test-util],
-# aws-smithy-runtime[test-util], figment[test]) appear in workspace-hack's
-# [dependencies] — not [dev-dependencies] — and so compile into release
-# binaries. This is hakari's intended one-build-per-dep tradeoff: a single
-# feature set per crate across dev+release means tokio etc. build exactly
-# once. Excluding the test crates via [final-excludes] would re-introduce
-# the duplicate builds hakari exists to remove. Accepted: the test-util
-# surface is small (mock connectors, paused-clock); revisit if a test-only
-# feature ever pulls a heavyweight transitive (audit via `cargo tree
-# -e features -i <crate>` against a non-hakari build).
+# xtask is deploy tooling (aws-sdk-{ec2,ecr,elbv2,sts}, gix). Excluding it
+# from final unification stops ~600K LoC of generated AWS API bindings
+# from leaking into rio-auth/rio-nix/rio-crds via workspace-hack. The nix
+# build path already stubs workspace-hack (nix/crate2nix.nix), so this
+# only affects local cargo + the importCargoLock-based checks (mutants/
+# fuzz/deny).
+[final-excludes]
+workspace-members = ["xtask"]
+
+# aws-smithy-runtime[test-util] → legacy-test-util → connector-hyper-0-14-x
+# pulls hyper 0.14 / h2 0.3 / http 0.2 into [dependencies] — exactly the
+# heavyweight-transitive case the previous comment said to revisit. Excluding
+# the smithy crates from feature traversal means test-util features don't
+# unify into the prod feature set; aws-smithy-mocks (dev-dep) still gets what
+# it needs at test time.
+[traversal-excludes]
+third-party = [
+  { name = "aws-smithy-runtime" },
+  { name = "aws-smithy-http-client" },
+  { name = "aws-sdk-s3" },
+  { name = "aws-sdk-ec2" },
+  { name = "aws-sdk-sts" },
+]
 
 # Write out exact versions rather than a semver range. (Defaults to false.)
 # exact-versions = true

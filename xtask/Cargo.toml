@@ -83,4 +83,3 @@ nix = { workspace = true, features = ["process", "signal"] }
 rustls.workspace = true
 regex.workspace = true
 filetime.workspace = true
-workspace-hack = { version = "0.1", path = "../workspace-hack" }

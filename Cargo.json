@@ -30680,24 +30680,8 @@
           "packageId": "aws-lc-rs"
         },
         {
-          "name": "aws-sdk-ec2",
-          "packageId": "aws-sdk-ec2"
-        },
-        {
-          "name": "aws-sdk-s3",
-          "packageId": "aws-sdk-s3"
-        },
-        {
-          "name": "aws-sdk-sts",
-          "packageId": "aws-sdk-sts"
-        },
-        {
-          "name": "aws-smithy-http-client",
-          "packageId": "aws-smithy-http-client"
-        },
-        {
-          "name": "aws-smithy-runtime",
-          "packageId": "aws-smithy-runtime"
+          "name": "aws-smithy-types",
+          "packageId": "aws-smithy-types"
         },
         {
           "name": "axum",
@@ -30750,10 +30734,6 @@
           "packageId": "crossbeam-utils"
         },
         {
-          "name": "crypto-bigint",
-          "packageId": "crypto-bigint 0.5.5"
-        },
-        {
           "name": "crypto-common",
           "packageId": "crypto-common 0.1.7",
           "rename": "crypto_common_c65f7effa3be6d31"
@@ -30766,10 +30746,6 @@
         {
           "name": "ctutils",
           "packageId": "ctutils"
-        },
-        {
-          "name": "data-encoding",
-          "packageId": "data-encoding"
         },
         {
           "name": "der",
@@ -30863,16 +30839,22 @@
           "packageId": "hyper-util"
         },
         {
+          "name": "hyper-util",
+          "packageId": "hyper-util",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "hyper-util",
+          "packageId": "hyper-util",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
           "name": "indexmap",
           "packageId": "indexmap"
         },
         {
           "name": "inout",
           "packageId": "inout 0.1.4"
-        },
-        {
-          "name": "ipnet",
-          "packageId": "ipnet"
         },
         {
           "name": "jiff",
@@ -30941,10 +30923,6 @@
         {
           "name": "num-integer",
           "packageId": "num-integer"
-        },
-        {
-          "name": "num-rational",
-          "packageId": "num-rational"
         },
         {
           "name": "num-traits",
@@ -31745,10 +31723,6 @@
         {
           "name": "tracing-subscriber",
           "packageId": "tracing-subscriber"
-        },
-        {
-          "name": "workspace-hack",
-          "packageId": "workspace-hack"
         },
         {
           "name": "xshell",
