@@ -176,13 +176,18 @@ async fn main() -> anyhow::Result<()> {
     // λ refresh + sweep + persist run regardless of `hw_cost_source`
     // (the controller appends `interrupt_samples` even under Static).
     // `inputs_gen` is derived from the table at poll time — pollers
-    // just write; nobody bumps.
+    // just write; nobody bumps. `cost_was_leader` is shared between both
+    // pollers and written ONLY by interrupt_housekeeping (the
+    // edge-reload owner); the spot poller reads it to skip one body on
+    // the false→true edge so its first fold lands post-reload.
+    let cost_was_leader = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     rio_common::task::spawn_monitored(
         "sla-interrupt-housekeeping",
         rio_scheduler::sla::cost::interrupt_housekeeping(
             SchedulerDb::new(pool.clone()),
             leader.clone(),
             std::sync::Arc::clone(&cost_table),
+            std::sync::Arc::clone(&cost_was_leader),
             shutdown.clone(),
         ),
     );
@@ -196,9 +201,9 @@ async fn main() -> anyhow::Result<()> {
         rio_common::task::spawn_monitored(
             "sla-cost-poller",
             rio_scheduler::sla::cost::spot_price_poller(
-                SchedulerDb::new(pool.clone()),
                 leader.clone(),
                 std::sync::Arc::clone(&cost_table),
+                std::sync::Arc::clone(&cost_was_leader),
                 shutdown.clone(),
             ),
         );

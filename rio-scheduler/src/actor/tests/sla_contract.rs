@@ -115,6 +115,12 @@ async fn contract_selector_stability() -> TestResult {
         g0,
         "compute_spawn_intents is read-only on inputs_gen"
     );
+    assert!(
+        actor.dispatched_cells.is_empty(),
+        "compute_spawn_intents is read-only on dispatched_cells — \
+         arm-on-ack, not arm-on-emit (merged_bug_002: 8× poll with no \
+         ack must leave it empty)"
+    );
 
     // ── (1b) no-op refresh → solve_relevant_hash same → still g0 ──────
     refresh_cycle(&mut actor).await;
@@ -327,6 +333,14 @@ async fn contract_ice_step_doubles_then_clears_on_registered() {
         actor.ice.step(&cell),
         Some(2),
         "spawned-ack must NOT clear; backoff doubles across consecutive marks"
+    );
+    // Arm-on-ack: the spawned echo populates `dispatched_cells` with
+    // the cell recovered from `(hw_class_names[0], node_affinity[0])`
+    // — `cells[0]` round-trips through the wire.
+    assert_eq!(
+        actor.dispatched_cells.get("d0").as_deref(),
+        Some(&(intent.hw_class_names[0].clone(), CapacityType::Spot)),
+        "spawned-ack arms dispatched_cells from the wire form"
     );
 
     actor.handle_ack_spawned_intents(&[], &[], &["intel-6:spot".into()]);

@@ -1110,9 +1110,10 @@ impl DagActor {
             // node existed ⇒ the cell this pod was spawned for had
             // capacity. `auth_intent` is the token-attested drv hash
             // (immutable, NOT the dispatch-downgradeable `intent_id`);
-            // `dispatched_cells` was populated at `solve_intent_for`
-            // time. §13b's `AckSpawnedIntents.registered_cells`
-            // (NodeClaim watcher) supersedes once wired.
+            // `dispatched_cells` was armed at `handle_ack_spawned_
+            // intents` (arm-on-ack — emit path is read-only). §13b's
+            // `AckSpawnedIntents.registered_cells` (NodeClaim watcher)
+            // supersedes once wired.
             if let Some(intent) = auth_intent
                 && let Some((_, cell)) = self.dispatched_cells.remove(intent.as_str())
             {

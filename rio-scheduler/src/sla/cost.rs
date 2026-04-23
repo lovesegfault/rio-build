@@ -780,22 +780,26 @@ impl IceBackoff {
 
 /// Lease-gated spot-price poller: every 10min, the leader pulls
 /// `DescribeSpotPriceHistory` for each band's representative instance
-/// type, EMA-smooths into `cost`, re-evaluates the stale-clamp, exports
-/// the staleness gauge, and bumps `inputs_gen`.
+/// type, EMA-smooths into `cost`, re-evaluates the stale-clamp, and
+/// exports the staleness gauge.
 ///
 /// Spot-only — `main.rs` spawns this only under `hw_cost_source =
-/// Some(Spot)`. λ refresh / sweep / persist live in
-/// [`interrupt_housekeeping`] (which runs unconditionally). Standby
-/// replicas emit the staleness gauge (per-replica, observability.md
-/// says it "climbs when … this replica is standby") but skip the AWS
-/// body. On a false→true leader edge the in-mem table is reloaded from
-/// PG (see `poller_tick_prelude`).
+/// Some(Spot)`. λ refresh / sweep / persist / leader-edge reload live
+/// in [`interrupt_housekeeping`] (which runs unconditionally and is the
+/// SOLE owner of `was_leader` writes — see `poller_tick_prelude`).
+/// This poller reads the shared `was_leader` and skips exactly one body
+/// on its own observed false→true edge so its first fold lands on the
+/// freshly-reloaded table, not the stale in-mem one (which the reload
+/// would then overwrite). Standby replicas emit the staleness gauge
+/// (per-replica, observability.md says it "climbs when … this replica
+/// is standby") but skip the AWS body.
 pub async fn spot_price_poller(
-    db: SchedulerDb,
     leader: LeaderState,
     cost: std::sync::Arc<parking_lot::RwLock<CostTable>>,
+    was_leader: std::sync::Arc<std::sync::atomic::AtomicBool>,
     shutdown: rio_common::signal::Token,
 ) {
+    use std::sync::atomic::Ordering;
     // EC2 client built once. Same `from_env()` chain as
     // `rio_common::s3::default_client` — IRSA in-cluster, profile/env
     // locally. The caller already gated on `hw_cost_source == Spot`, so
@@ -803,29 +807,34 @@ pub async fn spot_price_poller(
     let ec2 = aws_sdk_ec2::Client::new(&aws_config::from_env().load().await);
     let mut tick = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut was_leader = false;
     loop {
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => return,
             _ = tick.tick() => {},
         }
-        if !poller_tick_prelude(
-            &mut was_leader,
-            leader.is_leader(),
-            &cost,
-            &db,
-            now_epoch(),
-            Some(HwCostSource::Spot),
-        )
-        .await
-        {
+        let now = now_epoch();
+        // Pre-leader-gate emit: per-replica gauge — observability.md
+        // documents "climbs on standby" as the failover-health signal.
+        // Spot-only (this poller doesn't spawn under Static/None).
+        ::metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds")
+            .set(now - cost.read().price_updated_at());
+        if !leader.is_leader() {
+            continue;
+        }
+        // Edge-reload owned by `interrupt_housekeeping`. If this tick
+        // observes the false→true edge (interrupt_housekeeping hasn't
+        // reloaded yet), skip the body so the first fold lands on the
+        // post-reload table.
+        if !was_leader.load(Ordering::Relaxed) {
             continue;
         }
         // parking_lot guards aren't Send → clone the menu out, await the
-        // AWS call, then mutate under a brief sync lock. `fold_spot_poll`
-        // touches only `price`; `interrupt_housekeeping` writes only
-        // `lambda`/`node_count`, so no swap-race.
+        // AWS call, then mutate under a brief sync lock. Field-disjoint
+        // in steady-state: `fold_spot_poll` touches only `price`;
+        // `interrupt_housekeeping` writes only `lambda`/`node_count`.
+        // Edge-reload is owned by interrupt_housekeeping; this poller
+        // skips one body on the edge so the disjointness holds there too.
         let cells = cost.read().cells.clone();
         let result = poll_spot_once(&ec2, &cells).await;
         let now = now_epoch();
@@ -853,33 +862,30 @@ pub async fn spot_price_poller(
 /// off — without this, the standby's startup snapshot (loaded once at
 /// main.rs) would be `persist()`ed on the first leader tick,
 /// overwriting the previous leader's evolved EMA.
+///
+/// **Single edge-reload owner.** This task is the only writer of the
+/// shared `was_leader` flag (via `poller_tick_prelude`); it's the
+/// task that `persist()`s, so it owns the load↔persist symmetry.
+/// [`spot_price_poller`] reads `was_leader` and skips one body on its
+/// observed false→true edge so its first fold lands on the post-reload
+/// table — dual edge-reload would have one task's body write clobbered
+/// by the other's `*cost.write() = fresh`.
 pub async fn interrupt_housekeeping(
     db: SchedulerDb,
     leader: LeaderState,
     cost: std::sync::Arc<parking_lot::RwLock<CostTable>>,
+    was_leader: std::sync::Arc<std::sync::atomic::AtomicBool>,
     shutdown: rio_common::signal::Token,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut was_leader = false;
     loop {
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => return,
             _ = tick.tick() => {},
         }
-        // `source=None`: leader-gate + edge-reload only; no staleness
-        // gauge / clamp (Spot-only — meaningless without a live source).
-        if !poller_tick_prelude(
-            &mut was_leader,
-            leader.is_leader(),
-            &cost,
-            &db,
-            now_epoch(),
-            None,
-        )
-        .await
-        {
+        if !poller_tick_prelude(&was_leader, leader.is_leader(), &cost, &db).await {
             continue;
         }
         // Snapshot → refresh_lambda → write back λ ONLY (don't clobber
@@ -951,53 +957,38 @@ pub(crate) fn fold_spot_poll(
     }
 }
 
-/// Per-tick gauge-emit + leader-edge-reload, shared by
-/// [`spot_price_poller`] and [`interrupt_housekeeping`]. Returns `true`
-/// if the caller should proceed with the tick body.
+/// Per-tick leader-gate + edge-reload for [`interrupt_housekeeping`]
+/// (the SOLE caller — [`spot_price_poller`] reads the shared
+/// `was_leader` directly and does NOT invoke this). Returns `true` if
+/// the caller should proceed with the tick body.
 ///
-/// - When `source == Some(Spot)`: emits
-///   `rio_scheduler_sla_hw_cost_stale_seconds` BEFORE the leader gate
-///   (per-replica metric — observability.md says it "climbs when … this
-///   replica is standby"; `r[obs.metric.scheduler-leader-gate]` does
-///   NOT list it). The gauge and `apply_stale_clamp` are gated on Spot:
-///   "stale relative to a source that doesn't exist" reads as 56 years
-///   under `Static`/`None` and trips the false-positive
-///   `_hw_cost_fallback_total{reason="stale"}`.
-/// - On a false→true leader edge, reloads from PG so the new leader
-///   resumes from the previous leader's persisted state, not its own
-///   startup snapshot.
+/// On a false→true leader edge, reloads from PG so the new leader
+/// resumes from the previous leader's persisted state, not its own
+/// startup snapshot. The staleness gauge and `apply_stale_clamp` are
+/// NOT here: they're Spot-only and live inline in `spot_price_poller`
+/// (this task runs unconditionally; "stale relative to a source that
+/// doesn't exist" reads as 56 years under Static/None).
+///
+/// `was_leader` is the shared `Arc<AtomicBool>` written ONLY here; the
+/// spot poller observes it to skip one body on the edge.
 pub(crate) async fn poller_tick_prelude(
-    was_leader: &mut bool,
+    was_leader: &std::sync::atomic::AtomicBool,
     is_leader: bool,
     cost: &std::sync::Arc<parking_lot::RwLock<CostTable>>,
     db: &SchedulerDb,
-    now: f64,
-    source: Option<HwCostSource>,
 ) -> bool {
-    let spot = matches!(source, Some(HwCostSource::Spot));
-    if spot {
-        ::metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds")
-            .set(now - cost.read().price_updated_at());
-    }
+    use std::sync::atomic::Ordering;
     if !is_leader {
-        *was_leader = false;
+        was_leader.store(false, Ordering::Relaxed);
         return false;
     }
     // r[impl sched.sla.cost-leader-edge-reload]
-    if !*was_leader {
+    if !was_leader.load(Ordering::Relaxed) {
         let cluster = cost.read().cluster().to_owned();
         match CostTable::load(db, &cluster).await {
-            Ok(mut fresh) => {
-                // Reloaded EMA may itself be stale (previous leader
-                // wedged before failover) — evaluate clamp on the
-                // resumed timestamps so the FIRST solve under new
-                // leadership doesn't trust a dead snapshot. Spot-only
-                // (see fn doc).
-                if spot {
-                    fresh.apply_stale_clamp(now);
-                }
+            Ok(fresh) => {
                 *cost.write() = fresh;
-                *was_leader = true;
+                was_leader.store(true, Ordering::Relaxed);
             }
             Err(e) => {
                 tracing::warn!(error = %e, "cost reload on leader-acquire failed; retrying next tick");
@@ -1493,14 +1484,16 @@ mod tests {
         );
     }
 
-    /// merged_bug_006b: under `hw_cost_source ∈ {Static, None}` there is
-    /// no live source, so `_hw_cost_stale_seconds` reads as 56 years
-    /// (epoch) and `apply_stale_clamp` trips the false-positive
-    /// `_hw_cost_fallback_total{reason="stale"}`. Both are now gated on
-    /// `source == Some(Spot)` in `poller_tick_prelude`.
+    /// merged_bug_006b + bug_009: `poller_tick_prelude` is now the
+    /// `interrupt_housekeeping`-only edge-reload primitive — no `source`
+    /// param, no gauge emit, no `apply_stale_clamp`. Under
+    /// `hw_cost_source ∈ {Static, None}` the spot poller doesn't spawn,
+    /// so the gauge / clamp (now inline in `spot_price_poller`) never
+    /// fire. This test guards against re-adding Spot logic to the
+    /// prelude (which runs unconditionally → 56-year false positive).
     #[tokio::test]
-    async fn stale_metric_silent_under_static() {
-        use std::sync::Arc;
+    async fn prelude_is_spot_agnostic() {
+        use std::sync::{Arc, atomic::AtomicBool};
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
         let sdb = SchedulerDb::new(db.pool.clone());
         // No price keys → price_updated_at()=0 → "56 years stale".
@@ -1508,12 +1501,12 @@ mod tests {
 
         let rec = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = rec.snapshotter();
-        let mut was_leader = false;
-        for source in [None, Some(HwCostSource::Static)] {
+        let was_leader = AtomicBool::new(false);
+        {
             let _g = metrics::set_default_local_recorder(&rec);
             // Standby + leader-edge ticks: neither emits gauge / counter.
-            poller_tick_prelude(&mut was_leader, false, &cost, &sdb, 6100.0, source).await;
-            poller_tick_prelude(&mut was_leader, true, &cost, &sdb, 6100.0, source).await;
+            poller_tick_prelude(&was_leader, false, &cost, &sdb).await;
+            poller_tick_prelude(&was_leader, true, &cost, &sdb).await;
         }
         let metrics: Vec<_> = snapshotter
             .snapshot()
@@ -1525,13 +1518,13 @@ mod tests {
             !metrics
                 .iter()
                 .any(|n| n == "rio_scheduler_sla_hw_cost_stale_seconds"),
-            "gauge unset under non-Spot source: {metrics:?}"
+            "prelude is Spot-agnostic — gauge lives inline in spot_price_poller: {metrics:?}"
         );
         assert!(
             !metrics
                 .iter()
                 .any(|n| n == "rio_scheduler_sla_hw_cost_fallback_total"),
-            "stale-clamp counter zero under non-Spot source: {metrics:?}"
+            "prelude never engages stale_clamp: {metrics:?}"
         );
         // stale_clamp not latched (would be `true` after 6100s if the
         // leader-edge `apply_stale_clamp` ran un-gated).
@@ -1539,18 +1532,22 @@ mod tests {
             (cost.read().price(&("h".into(), CapacityType::Spot)) - seed_price(CapacityType::Spot))
                 .abs()
                 < 1e-9,
-            "non-Spot leader-edge does not engage stale_clamp"
+            "prelude does not engage stale_clamp"
         );
     }
 
-    /// Regression (a): standby replicas `continue`d before the gauge
-    /// `.set()` so `hw_cost_stale_seconds` was frozen on standby.
-    /// Regression (b): on false→true leader edge the in-mem startup
-    /// snapshot was `persist()`ed, overwriting the previous leader's
-    /// evolved EMA.
+    /// bug_009 single edge-reload owner. (a) standby: returns false,
+    /// does NOT reload, `was_leader` stays false (so the spot poller
+    /// keeps skipping). The standby `_hw_cost_stale_seconds` emit moved
+    /// inline to `spot_price_poller` (pre-leader-gate) — observability
+    /// .md "climbs on standby" is preserved there. (b) false→true edge:
+    /// reloads from PG, latches the shared flag, returns true.
     #[tokio::test]
-    async fn poller_prelude_standby_emits_gauge_and_edge_reloads() {
-        use std::sync::Arc;
+    async fn poller_prelude_edge_reloads() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
         let sdb = SchedulerDb::new(db.pool.clone());
 
@@ -1565,30 +1562,18 @@ mod tests {
         mine.set_price("h", CapacityType::Spot, 0.02, 100.0);
         let cost = Arc::new(parking_lot::RwLock::new(mine));
 
-        // (a) standby: emits gauge, returns false. Captured via local
-        // recorder so parallel tests can't interfere.
-        let rec = metrics_util::debugging::DebuggingRecorder::new();
-        let snapshotter = rec.snapshotter();
-        let mut was_leader = false;
-        let spot = Some(HwCostSource::Spot);
-        let proceed = {
-            let _g = metrics::set_default_local_recorder(&rec);
-            poller_tick_prelude(&mut was_leader, false, &cost, &sdb, 6100.0, spot).await
-        };
+        // (a) standby: returns false, does NOT reload, flag stays false.
+        let was_leader = AtomicBool::new(false);
+        let proceed = poller_tick_prelude(&was_leader, false, &cost, &sdb).await;
         assert!(!proceed);
-        let saw_gauge = snapshotter
-            .snapshot()
-            .into_vec()
-            .iter()
-            .any(|(ck, _, _, _)| ck.key().name() == "rio_scheduler_sla_hw_cost_stale_seconds");
-        assert!(saw_gauge, "standby must emit the staleness gauge");
+        assert!(!was_leader.load(Ordering::Relaxed));
         // Standby did NOT reload (still 0.02).
         assert!((cost.read().price(&cell) - 0.02).abs() < 1e-9);
 
         // (b) false→true edge: reloads from PG, returns true.
-        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &sdb, 6100.0, spot).await;
+        let proceed = poller_tick_prelude(&was_leader, true, &cost, &sdb).await;
         assert!(proceed);
-        assert!(was_leader);
+        assert!(was_leader.load(Ordering::Relaxed));
         assert!(
             (cost.read().price(&cell) - 0.08).abs() < 1e-9,
             "leader-edge must reload PG state, not keep startup snapshot"
@@ -1598,9 +1583,14 @@ mod tests {
         // mutation if it did).
         cost.write()
             .set_price("h", CapacityType::Spot, 0.09, 6000.0);
-        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &sdb, 6100.0, spot).await;
+        let proceed = poller_tick_prelude(&was_leader, true, &cost, &sdb).await;
         assert!(proceed);
         assert!((cost.read().price(&cell) - 0.09).abs() < 1e-9);
+
+        // Leader→standby: flag drops back so the next acquire reloads.
+        let proceed = poller_tick_prelude(&was_leader, false, &cost, &sdb).await;
+        assert!(!proceed);
+        assert!(!was_leader.load(Ordering::Relaxed));
     }
 
     /// Regression: when `CostTable::load` fails on the false→true
@@ -1634,16 +1624,14 @@ mod tests {
         bad.pool.close().await;
         let bad_db = SchedulerDb::new(bad.pool.clone());
 
-        let mut was_leader = false;
-        let spot = Some(HwCostSource::Spot);
-        let proceed =
-            poller_tick_prelude(&mut was_leader, true, &cost, &bad_db, 6100.0, spot).await;
+        let was_leader = std::sync::atomic::AtomicBool::new(false);
+        let proceed = poller_tick_prelude(&was_leader, true, &cost, &bad_db).await;
         assert!(
             !proceed,
             "load() Err → tick body skipped (no persist of stale snapshot)"
         );
         assert!(
-            !was_leader,
+            !was_leader.load(std::sync::atomic::Ordering::Relaxed),
             "load() Err → was_leader stays false so next tick retries"
         );
         assert!(
@@ -1652,9 +1640,12 @@ mod tests {
         );
 
         // Retry with a working DB: reload succeeds, latches, proceeds.
-        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &sdb, 6100.0, spot).await;
+        let proceed = poller_tick_prelude(&was_leader, true, &cost, &sdb).await;
         assert!(proceed, "retry with working DB → proceed");
-        assert!(was_leader, "retry success → latched");
+        assert!(
+            was_leader.load(std::sync::atomic::Ordering::Relaxed),
+            "retry success → latched"
+        );
         assert!(
             (cost.read().price(&cell) - 0.08).abs() < 1e-9,
             "retry reloaded PG state (previous leader's EMA)"

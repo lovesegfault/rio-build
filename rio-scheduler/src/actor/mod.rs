@@ -297,14 +297,17 @@ pub struct DagActor {
     /// per-dispatch read-time mask (`A \ masked`) is applied in
     /// `solve_intent_for` AFTER reading the memo, so unmasking is free.
     pub(crate) ice: Arc<crate::sla::cost::IceBackoff>,
-    /// §13a interim ICE-clear path: `solve_intent_for` records the
-    /// first cell of `A' \ masked` per drv; the registration edge in
-    /// `handle_heartbeat` looks it up and `ice.clear()`s (heartbeat ⇒
-    /// pod scheduled ⇒ node existed ⇒ cell had capacity). Removed on
-    /// that edge or executor disconnect. §13b's
-    /// `AckSpawnedIntents.registered_cells` (NodeClaim watcher)
-    /// supersedes this once wired. DashMap: `solve_intent_for` is
-    /// `&self`.
+    /// §13a interim ICE-clear path: `handle_ack_spawned_intents`
+    /// records the first cell of the controller-acked `SpawnIntent`
+    /// per drv (arm-on-**ack**, not arm-on-emit — `solve_intent_for`
+    /// is read-only so dashboard/CLI polls don't leak entries); the
+    /// registration edge in `handle_heartbeat` looks it up and
+    /// `ice.clear()`s (heartbeat ⇒ pod scheduled ⇒ node existed ⇒
+    /// cell had capacity). Removed on that edge, executor disconnect,
+    /// or the `handle_tick` DAG-state sweep (cancel/substitute/
+    /// terminal). §13b's `AckSpawnedIntents.registered_cells`
+    /// (NodeClaim watcher) supersedes this once wired. DashMap:
+    /// `handle_ack_spawned_intents` is `&self`.
     pub(crate) dispatched_cells: dashmap::DashMap<DrvHash, crate::sla::config::Cell>,
     /// Per-key admissible-set memo. Keyed on `(model_key_hash,
     /// override_hash)`; `(inputs_gen, fit_content_hash)` are staleness

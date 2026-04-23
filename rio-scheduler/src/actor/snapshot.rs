@@ -552,13 +552,18 @@ impl DagActor {
     /// (`"h:cap"` strings — NodeClaim `Registered=True` edges) reset
     /// ICE backoff; `unfulfillable_cells` (NodeClaim `Launched=False`
     /// or `Registered` timeout) are ICE-marked with exponential
-    /// backoff. `spawned` is informational-only — "Pending Job
-    /// created" is NOT a success signal (clearing on it defeats
-    /// backoff doubling: the all-masked fallback re-emits the masked
-    /// cell at `[0]`, so each tick would `clear(C)` then `mark(C)` and
-    /// `step` never climbed past 0). ADR-023 §Capacity backoff: the
-    /// *scheduler* owns ICE state (in-memory, lease-holder only); the
-    /// controller reports, the scheduler decides.
+    /// backoff. `spawned` ("the controller created a Job for these")
+    /// arms `dispatched_cells` so the §13a heartbeat-edge ICE clear
+    /// has a cell to clear — this is the **commit** path; the emit
+    /// path (`compute_spawn_intents`) stays read-only so dashboard /
+    /// CLI / ComponentScaler polls don't mutate scheduler state.
+    /// "Pending Job created" is NOT an ICE-clear signal (clearing on
+    /// it defeats backoff doubling: the all-masked fallback re-emits
+    /// the masked cell at `[0]`, so each tick would `clear(C)` then
+    /// `mark(C)` and `step` never climbed past 0). ADR-023 §Capacity
+    /// backoff: the *scheduler* owns ICE state (in-memory,
+    /// lease-holder only); the controller reports, the scheduler
+    /// decides.
     ///
     /// Until §13b A18 populates `registered_cells`, the §13a interim
     /// success signal is first-heartbeat — see `handle_heartbeat`'s
@@ -570,7 +575,28 @@ impl DagActor {
         unfulfillable_cells: &[String],
         registered_cells: &[String],
     ) {
-        let _ = spawned;
+        // Arm-on-ack: recover `cells[0]` from the wire form. `h` is
+        // `hw_class_names[0]` (parallel to `node_affinity[0]` by
+        // construction in `cells_to_selector_terms`); `cap` is the
+        // `karpenter.sh/capacity-type` requirement's value. hw-agnostic
+        // intents (empty `node_affinity`) skip — no cell to arm.
+        for i in spawned {
+            let cell = i.hw_class_names.first().and_then(|h| {
+                let cap = i
+                    .node_affinity
+                    .first()?
+                    .match_expressions
+                    .iter()
+                    .find(|r| r.key == "karpenter.sh/capacity-type")?
+                    .values
+                    .first()?;
+                Some((h.clone(), crate::sla::config::CapacityType::parse(cap)?))
+            });
+            if let Some(cell) = cell {
+                self.dispatched_cells
+                    .insert(i.intent_id.as_str().into(), cell);
+            }
+        }
         for s in registered_cells {
             if let Some(cell) = crate::sla::config::parse_cell(s) {
                 self.ice.clear(&cell);
@@ -864,19 +890,13 @@ impl DagActor {
                 } else {
                     cells
                 };
-                // §13a interim ICE-clear bookkeeping: record the cell
-                // this intent's pod will be created for so the
-                // registration edge in `handle_heartbeat` can
-                // `ice.clear()` it. `cells[0]` is what the controller
-                // routes to (one NodeClaim per intent, first term).
-                // Idempotent — same drv → same cell given fixed
-                // `(inputs_gen, ice)`; an inputs_gen bump between
-                // emit and heartbeat may clear the wrong cell, which
-                // the §13b `registered_cells` path fixes.
-                if let Some(cell) = cells.first() {
-                    self.dispatched_cells
-                        .insert(state.drv_hash.clone(), cell.clone());
-                }
+                // `dispatched_cells` is NOT armed here — that's a state
+                // write on the emit path (dashboard/CLI/ComponentScaler
+                // also poll this), and budget-reject / cancel /
+                // substitute / never-Ready forecast drvs would all leak.
+                // Armed on the controller's ack instead
+                // (`handle_ack_spawned_intents`); `cells[0]` round-trips
+                // via `(hw_class_names[0], node_affinity[0].cap-type)`.
                 let (terms, names) =
                     solve::cells_to_selector_terms(&cells, &self.sla_config.hw_classes);
                 (

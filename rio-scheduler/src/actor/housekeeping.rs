@@ -164,6 +164,7 @@ impl DagActor {
 
         self.tick_sweep_event_log();
         self.tick_gc_orphan_derivations().await;
+        self.tick_sweep_dispatched_cells();
         self.tick_publish_gauges();
 
         // r[impl sched.actor.dispatch-decoupled]
@@ -601,6 +602,23 @@ impl DagActor {
             // Remove (not reset) — same rationale as handle_clear_poison.
             self.dag.remove_node(&drv_hash);
         }
+    }
+
+    /// DAG-state sweep for `dispatched_cells`. The arm-on-ack write
+    /// (`handle_ack_spawned_intents`) can't fire for a drv that was
+    /// acked then cancelled / substituted / dependency-failed before
+    /// its pod heartbeated, so the heartbeat-edge / disconnect remove
+    /// paths never run for it. Retain only entries whose DAG node is
+    /// still in a pre-terminal state where a heartbeat is plausible.
+    /// Cheap: `dispatched_cells` is bounded by acked-but-not-yet-
+    /// heartbeated drvs (≪ DAG size).
+    fn tick_sweep_dispatched_cells(&self) {
+        use DerivationStatus::{Assigned, Ready, Running};
+        self.dispatched_cells.retain(|k, _| {
+            self.dag
+                .node(k)
+                .is_some_and(|s| matches!(s.status(), Ready | Assigned | Running))
+        });
     }
 
     /// `build_event_log` time-based sweep. Every 360 ticks (~1h at
