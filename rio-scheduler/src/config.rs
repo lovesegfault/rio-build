@@ -86,6 +86,12 @@ pub(super) struct Config {
     /// only. Validated via
     /// [`rio_scheduler::sla::config::SlaConfig::validate`].
     pub(super) sla: rio_scheduler::sla::config::SlaConfig,
+    /// Permit a `[sla].reference_hw_class` change vs the value
+    /// persisted in `sla_config_epoch` (M_058). DESTRUCTIVE — resets
+    /// `build_samples`, `hw_perf_samples`, and this cluster's
+    /// `sla_ema_state`. CLI-only (`--allow-reference-change`); never
+    /// set from TOML/env so a stale flag can't survive a rollout.
+    pub(super) allow_reference_change: bool,
 }
 
 /// Dashboard browser-facing settings. The scheduler serves gRPC-Web
@@ -137,6 +143,7 @@ impl Default for Config {
             substitute_max_concurrent: default_substitute_concurrency(),
             dashboard: DashboardConfig::default(),
             sla: rio_scheduler::sla::config::SlaConfig::test_default(),
+            allow_reference_change: false,
         }
     }
 }
@@ -171,6 +178,13 @@ pub(super) struct CliArgs {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) log_s3_bucket: Option<String>,
+
+    /// Permit an `[sla].reference_hw_class` change vs persisted —
+    /// DESTRUCTIVE: resets build_samples / hw_perf_samples /
+    /// sla_ema_state. See `rio_scheduler::sla::check_reference_epoch`.
+    #[arg(long)]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(super) allow_reference_change: bool,
 }
 
 impl rio_common::config::ValidateConfig for Config {

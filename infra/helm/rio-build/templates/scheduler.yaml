@@ -63,6 +63,12 @@ spec:
           image: {{ include "rio.image" (list . $s.image) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
           {{- include "rio.containerSecurityContext" . | nindent 10 }}
+          {{- if $s.sla.allowReferenceChange }}
+          # DESTRUCTIVE one-shot: M_058 reference_hw_class guard. Set
+          # for ONE rollout after changing referenceHwClass, then unset
+          # — leaving it set means every restart re-TRUNCATEs.
+          args: ["--allow-reference-change"]
+          {{- end }}
           ports:
             - name: grpc
               containerPort: 9001
@@ -202,6 +208,9 @@ data:
     {{- end }}
     {{- with .referenceHwClass }}
     reference_hw_class = {{ . | quote }}
+    {{- end }}
+    {{- with .hwCostSource }}
+    hw_cost_source = {{ . | quote }}
     {{- end }}
     {{- with .nodeClassRef }}
     node_class_ref = {{ . | quote }}

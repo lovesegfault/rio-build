@@ -3,6 +3,97 @@
 use rio_test_support::TestDb;
 
 use crate::db::{BuildSampleRow, SchedulerDb};
+use crate::sla::config::SlaConfig;
+
+/// bug_051: `validate_reload` was dead — `[sla]` has no SIGHUP path
+/// and no `prev` config across restarts. The replacement persists
+/// `reference_hw_class` in PG (M_058) and checks at startup.
+///
+/// Boot 1 records the value; boot 2 with the same value is a no-op;
+/// boot 2 with a different value errors without the flag and resets
+/// ref-second state with it.
+// r[verify sched.sla.hw-class.config]
+#[tokio::test]
+async fn check_reference_epoch_guards_across_restarts() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let mut cfg = SlaConfig::test_default();
+    cfg.cluster = "us-east-2".into();
+    cfg.reference_hw_class = Some("intel-8-nvme".into());
+
+    // Boot 1: no row → record at epoch 0.
+    crate::sla::check_reference_epoch(&db, &cfg, false).await?;
+    let (got, epoch): (Option<String>, i64) =
+        sqlx::query_as("SELECT reference_hw_class, epoch FROM sla_config_epoch WHERE cluster = $1")
+            .bind("us-east-2")
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(got.as_deref(), Some("intel-8-nvme"));
+    assert_eq!(epoch, 0);
+
+    // Boot 2, same ref: idempotent no-op.
+    crate::sla::check_reference_epoch(&db, &cfg, false).await?;
+
+    // Seed ref-second state we expect to be reset.
+    db.write_build_sample(&BuildSampleRow {
+        pname: "x".into(),
+        system: "x86_64-linux".into(),
+        ..Default::default()
+    })
+    .await?;
+    sqlx::query("INSERT INTO sla_ema_state (cluster, key, value) VALUES ('us-east-2', 'k', 1.0)")
+        .execute(&test_db.pool)
+        .await?;
+    sqlx::query("INSERT INTO sla_ema_state (cluster, key, value) VALUES ('eu-west-1', 'k', 1.0)")
+        .execute(&test_db.pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) \
+         VALUES ('intel-8-nvme', 'p', '{}')",
+    )
+    .execute(&test_db.pool)
+    .await?;
+
+    // Boot 3, changed ref, no flag: error.
+    cfg.reference_hw_class = Some("amd-8-nvme".into());
+    let err = crate::sla::check_reference_epoch(&db, &cfg, false)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("--allow-reference-change"), "{err}");
+    // State untouched on the reject path.
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM build_samples")
+        .fetch_one(&test_db.pool)
+        .await?;
+    assert_eq!(n, 1, "reject path must not reset");
+
+    // Boot 3b, changed ref, WITH flag: reset + epoch bump.
+    crate::sla::check_reference_epoch(&db, &cfg, true).await?;
+    let (got, epoch): (Option<String>, i64) =
+        sqlx::query_as("SELECT reference_hw_class, epoch FROM sla_config_epoch WHERE cluster = $1")
+            .bind("us-east-2")
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(got.as_deref(), Some("amd-8-nvme"));
+    assert_eq!(epoch, 1);
+    for t in ["build_samples", "hw_perf_samples"] {
+        let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {t}"))
+            .fetch_one(&test_db.pool)
+            .await?;
+        assert_eq!(n, 0, "{t} reset");
+    }
+    // sla_ema_state cluster-scoped: us-east-2 cleared, eu-west-1 kept.
+    let kept: Vec<String> = sqlx::query_scalar("SELECT cluster FROM sla_ema_state")
+        .fetch_all(&test_db.pool)
+        .await?;
+    assert_eq!(kept, vec!["eu-west-1".to_string()]);
+
+    // Boot 4, same (new) ref: idempotent again.
+    crate::sla::check_reference_epoch(&db, &cfg, false).await?;
+
+    Ok(())
+}
 
 /// build_samples insert + retention roundtrip. Also proves migration
 /// 013 applies cleanly (every TestDb::new runs the full migrate!).

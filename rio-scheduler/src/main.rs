@@ -48,6 +48,12 @@ async fn main() -> anyhow::Result<()> {
     // exits (channel-close). event_log::spawn doesn't need a token.
 
     let (pool, db) = init_db_pool(&cfg.database_url, &shutdown).await?;
+    // M_058: reference_hw_class change guard. Runs before any
+    // ref-second state is read (CostTable, SlaEstimator). On mismatch
+    // without --allow-reference-change, abort here — the persisted
+    // build_samples / EMA state are denominated in the OLD reference
+    // and would corrupt every fit.
+    rio_scheduler::sla::check_reference_epoch(&db, &cfg.sla, cfg.allow_reference_change).await?;
     let store_client = connect_store_lazy(&cfg.store.addr);
 
     // Shared log ring buffers. Written by the BuildExecution recv task

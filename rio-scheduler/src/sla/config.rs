@@ -195,8 +195,8 @@ pub struct SlaConfig {
     #[serde(default = "default_ladder_budget")]
     pub ladder_budget: f64,
     /// hw-class whose bench result anchors the ref-second normalization.
-    /// Immutable across reloads unless `--allow-reference-change` is
-    /// passed — see [`SlaConfig::validate_reload`]. MUST appear in
+    /// Immutable across restarts unless `--allow-reference-change` is
+    /// passed — see [`super::check_reference_epoch`]. MUST appear in
     /// `hw_classes` when set.
     #[serde(default)]
     pub reference_hw_class: Option<HwClassName>,
@@ -430,6 +430,15 @@ impl SlaConfig {
                 "sla.hwClasses[{h}].labels must be non-empty"
             );
         }
+        // §13a admissible-set solve gates on `hw_cost_source.is_some()`;
+        // a populated `hw_classes` with no cost source silently falls
+        // through to MVP solve. Reject the inconsistent state so
+        // "static-mode" means exactly `hwClasses: {}`.
+        anyhow::ensure!(
+            self.hw_classes.is_empty() || self.hw_cost_source.is_some(),
+            "sla.hwClasses populated but sla.hwCostSource unset; §13a admissible-set \
+             solve will not engage — set hwCostSource or clear hwClasses for static-mode"
+        );
         if let Some(ref_h) = &self.reference_hw_class {
             anyhow::ensure!(
                 self.hw_classes.contains_key(ref_h),
@@ -439,24 +448,6 @@ impl SlaConfig {
         self.probe.validate("sla.probe", hi)?;
         for (feat, p) in &self.feature_probes {
             p.validate(&format!("sla.feature_probes[{feat}]"), hi)?;
-        }
-        Ok(())
-    }
-
-    /// Called on SIGHUP config-reload. `allow_ref_change` from CLI
-    /// flag. Runs [`Self::validate`] then rejects a
-    /// `reference_hw_class` change unless explicitly allowed —
-    /// changing the reference invalidates every stored ref-second
-    /// (corpus, EMA state, ring buffers) so it MUST be paired with
-    /// `rio-cli sla reset --all` + corpus re-import.
-    pub fn validate_reload(&self, prev: &Self, allow_ref_change: bool) -> Result<(), String> {
-        self.validate().map_err(|e| e.to_string())?;
-        if self.reference_hw_class != prev.reference_hw_class && !allow_ref_change {
-            return Err(format!(
-                "sla.referenceHwClass changed {:?}→{:?}; pass --allow-reference-change \
-                 AND run `rio-cli sla reset --all` + corpus re-import (all ref-seconds invalidated)",
-                prev.reference_hw_class, self.reference_hw_class
-            ));
         }
         Ok(())
     }
@@ -716,6 +707,7 @@ mod tests {
             default_disk = 1
             hw_cost_tolerance = 0.15
             hw_explore_epsilon = 0.02
+            hw_cost_source = "static"
             reference_hw_class = "intel-8-nvme"
             [probe]
             cpu = 4.0
@@ -748,7 +740,7 @@ mod tests {
 
     // r[verify sched.sla.hw-class.config]
     #[test]
-    fn rejects_reference_hw_class_change_without_flag() {
+    fn rejects_hw_classes_without_cost_source() {
         let mut cfg = base();
         cfg.hw_classes.insert(
             "intel-7-ebs".into(),
@@ -759,16 +751,20 @@ mod tests {
                 }],
             },
         );
+        // hw_classes populated, hw_cost_source None → §13a silently
+        // unreachable; validate() must reject.
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("hwCostSource"), "{err}");
+        assert!(err.contains("static-mode"), "{err}");
+        // With a cost source the same config is valid.
+        cfg.hw_cost_source = Some(super::super::cost::HwCostSource::Static);
         cfg.reference_hw_class = Some("intel-7-ebs".into());
-        let prev = SlaConfig {
-            reference_hw_class: Some("amd-8-ebs".into()),
-            ..cfg.clone()
-        };
-        let err = cfg.validate_reload(&prev, false).unwrap_err();
-        assert!(err.contains("--allow-reference-change"), "{err}");
-        assert!(cfg.validate_reload(&prev, true).is_ok());
-        // Same ref → no flag needed.
-        assert!(cfg.validate_reload(&cfg.clone(), false).is_ok());
+        cfg.validate().unwrap();
+        // Empty hw_classes + no cost source = static-mode, valid.
+        cfg.hw_classes.clear();
+        cfg.hw_cost_source = None;
+        cfg.reference_hw_class = None;
+        cfg.validate().unwrap();
     }
 
     #[test]
@@ -827,6 +823,83 @@ mod tests {
         "#;
         let err = toml::from_str::<SlaConfig>(toml).unwrap_err().to_string();
         assert!(err.contains("unknown field"), "{err}");
+    }
+
+    /// Class-level guard for merged_bug_056 (helm forgot
+    /// `hw_cost_source` → §13a unreachable in production). Asserts
+    /// every `[sla]` TOML key appears verbatim in the helm template,
+    /// and that the key list itself is complete (so adding a field
+    /// without listing it here ALSO fails).
+    #[test]
+    fn helm_renders_every_sla_key() {
+        const TPL: &str = include_str!("../../../infra/helm/rio-build/templates/scheduler.yaml");
+
+        // Snake-case TOML field names that the helm `[sla]` block MUST
+        // render. `TPL.contains` is a substring check — the template
+        // writes each as `name = ...` or `[sla.name]` so the bare
+        // snake_case key is sufficient.
+        const RENDERED: &[&str] = &[
+            "tiers",
+            "default_tier",
+            "probe",
+            "feature_probes",
+            "max_cores",
+            "max_mem",
+            "max_disk",
+            "default_disk",
+            "hw_cost_source",
+            "hw_classes",
+            "hw_cost_tolerance",
+            "hw_explore_epsilon",
+            "hw_bench_mem_floor",
+            "lead_time_seed",
+            "max_fleet_cores",
+            "ladder_budget",
+            "reference_hw_class",
+            "max_forecast_cores_per_tenant",
+            "max_keys_per_tenant",
+            "max_lead_time",
+            "max_consolidation_time",
+            "consolidate_explore_epsilon",
+            "max_node_claims_per_cell_per_tick",
+            "node_class_ref",
+            "cluster",
+        ];
+        // Intentionally NOT helm-rendered (with rationale). Adding a
+        // field here requires justifying why operators never set it.
+        const NOT_RENDERED: &[(&str, &str)] = &[
+            ("ring_buffer", "internal refit window; not operator-tuned"),
+            (
+                "seed_corpus",
+                "file path — corpus loads via ImportSlaCorpus RPC in k8s",
+            ),
+        ];
+
+        for k in RENDERED {
+            assert!(
+                TPL.contains(k),
+                "[sla] key `{k}` not rendered by infra/helm/rio-build/templates/scheduler.yaml \
+                 — add a `{{{{- with .X }}}}` block, or move to NOT_RENDERED with rationale"
+            );
+        }
+
+        // Completeness: serde_json emits every struct field (incl.
+        // `Option::None` as null, empty maps as `{{}}`); compare its
+        // top-level key set against RENDERED ∪ NOT_RENDERED so a new
+        // `SlaConfig` field that nobody listed fails here.
+        let v = serde_json::to_value(SlaConfig::test_default()).unwrap();
+        let actual: std::collections::BTreeSet<&str> =
+            v.as_object().unwrap().keys().map(String::as_str).collect();
+        let listed: std::collections::BTreeSet<&str> = RENDERED
+            .iter()
+            .copied()
+            .chain(NOT_RENDERED.iter().map(|(k, _)| *k))
+            .collect();
+        assert_eq!(
+            actual, listed,
+            "\nSlaConfig serde fields ≠ RENDERED ∪ NOT_RENDERED — \
+             add the new field to one of the two lists above"
+        );
     }
 
     #[test]

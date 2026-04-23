@@ -906,6 +906,25 @@ pub const M_056: () = ();
 /// can exclude.
 pub const M_057: () = ();
 
+/// `migrations/058_sla_config_epoch.sql`
+///
+/// Persists the active `[sla].reference_hw_class` per cluster so a
+/// scheduler restart (the only `[sla]` config-change path — there is no
+/// SIGHUP hot-reload) can detect a reference change. Replaces the dead
+/// `SlaConfig::validate_reload`, which guarded the same invariant on a
+/// code path that never ran (no `prev` config across restarts).
+///
+/// `epoch` bumps on each accepted reference change; not read by the
+/// scheduler today but lets a future corpus-export carry "valid for
+/// epoch N" so stale ref-second data can be rejected at import.
+///
+/// `build_samples` / `hw_perf_samples` are NOT cluster-scoped (no
+/// `cluster` column), so the reset on reference change TRUNCATEs them
+/// unconditionally. Multi-cluster shared-DB deploys (ADR-023 §2.13)
+/// must coordinate reference changes across regions — acceptable for a
+/// rare, operator-intended, destructive operation.
+pub const M_058: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

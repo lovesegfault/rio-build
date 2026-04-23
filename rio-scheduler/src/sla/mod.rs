@@ -9,6 +9,94 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::db::{SchedulerDb, SlaOverrideRow};
 
+/// Startup-time guard for `[sla].reference_hw_class` changes. Replaces
+/// the dead `SlaConfig::validate_reload` (which compared against a
+/// `prev` config that doesn't exist across restarts — there is no
+/// `[sla]` SIGHUP hot-reload, and helm rollout restarts the pod).
+///
+/// Reads `sla_config_epoch` (M_058) for `cluster`, compares the
+/// persisted `reference_hw_class` against `cfg`'s. On first boot
+/// (no row) records the current value at epoch 0. On mismatch:
+///
+/// - without `--allow-reference-change`: returns `Err` (caller maps to
+///   process-abort) — the change invalidates every stored ref-second;
+/// - with the flag: bumps `epoch`, records the new value, and resets
+///   the ref-second-denominated state (`sla_ema_state` for this
+///   cluster; `build_samples` + `hw_perf_samples` unconditionally —
+///   neither is cluster-scoped, see `rio_store::migrations::M_058`).
+///
+/// Idempotent: a second boot with the same `cfg` is a no-op.
+// r[impl sched.sla.hw-class.config]
+pub async fn check_reference_epoch(
+    db: &SchedulerDb,
+    cfg: &config::SlaConfig,
+    allow_reference_change: bool,
+) -> anyhow::Result<()> {
+    let cluster = cfg.cluster.as_str();
+    let want = cfg.reference_hw_class.as_deref();
+    let row: Option<(Option<String>, i64)> =
+        sqlx::query_as("SELECT reference_hw_class, epoch FROM sla_config_epoch WHERE cluster = $1")
+            .bind(cluster)
+            .fetch_optional(db.pool())
+            .await?;
+
+    match row {
+        None => {
+            // First boot for this cluster — record, no reset.
+            sqlx::query(
+                "INSERT INTO sla_config_epoch (cluster, reference_hw_class, epoch) \
+                 VALUES ($1, $2, 0) ON CONFLICT (cluster) DO NOTHING",
+            )
+            .bind(cluster)
+            .bind(want)
+            .execute(db.pool())
+            .await?;
+            tracing::info!(cluster, reference_hw_class = ?want, epoch = 0, "sla reference epoch initialised");
+            Ok(())
+        }
+        Some((prev, _)) if prev.as_deref() == want => Ok(()),
+        Some((prev, _)) if !allow_reference_change => anyhow::bail!(
+            "sla.referenceHwClass changed {prev:?}→{want:?}; pass --allow-reference-change \
+             to reset ref-second state (build_samples, sla_ema_state, hw_perf_samples) \
+             and re-import corpus — all ref-seconds are invalidated"
+        ),
+        Some((prev, epoch)) => {
+            tracing::warn!(
+                cluster,
+                prev = ?prev,
+                new = ?want,
+                epoch_from = epoch,
+                epoch_to = epoch + 1,
+                "sla.referenceHwClass changed with --allow-reference-change; \
+                 RESETTING build_samples + hw_perf_samples (cluster-unscoped) + \
+                 sla_ema_state[cluster] — re-import seed corpus"
+            );
+            let mut tx = db.pool().begin().await?;
+            // sla_ema_state is cluster-scoped (M_043).
+            sqlx::query("DELETE FROM sla_ema_state WHERE cluster = $1")
+                .bind(cluster)
+                .execute(&mut *tx)
+                .await?;
+            // build_samples / hw_perf_samples are NOT cluster-scoped —
+            // see M_058 doc-const for the multi-cluster caveat.
+            sqlx::query("TRUNCATE build_samples, hw_perf_samples")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "UPDATE sla_config_epoch \
+                 SET reference_hw_class = $2, epoch = epoch + 1, set_at = now() \
+                 WHERE cluster = $1",
+            )
+            .bind(cluster)
+            .bind(want)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(())
+        }
+    }
+}
+
 pub mod alpha;
 pub mod bootstrap;
 pub mod config;

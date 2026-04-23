@@ -393,6 +393,14 @@ scheduler:
     maxNodeClaimsPerCellPerTick: 8
     # referenceHwClass set per deployment; hwClasses populated below
     hwClasses: {}
+    # §13a master gate: "spot" (live EC2 poll) or "static" (seed
+    # prices). Empty = admissible-set solve disabled. validate()
+    # rejects hwClasses-populated + hwCostSource-empty.
+    hwCostSource: ""
+    # DESTRUCTIVE one-shot: pass --allow-reference-change for ONE
+    # rollout when changing referenceHwClass (resets ref-second state),
+    # then revert to false.
+    allowReferenceChange: false
     leadTimeSeed: {}
   resources:
     requests: {cpu: 500m, memory: 512Mi}

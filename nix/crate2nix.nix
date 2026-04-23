@@ -236,12 +236,24 @@ let
     root = ../rio-proto;
     fileset = pkgs.lib.fileset.fileFilter (f: f.hasExt "proto") ../rio-proto/proto;
   };
+  # rio-scheduler/src/sla/config.rs::helm_renders_every_sla_key does
+  # include_str!("../../../infra/helm/rio-build/templates/scheduler.yaml")
+  # — class-level guard against `[sla]` keys helm forgot to render.
+  # Single-file fileset so unrelated chart edits don't invalidate the
+  # rio-scheduler build.
+  schedulerTplFileset = pkgs.lib.fileset.toSource {
+    root = ../infra;
+    fileset = ../infra/helm/rio-build/templates/scheduler.yaml;
+  };
   # Reconstruct the sibling-dir structure that cross-crate compile-time
   # reads expect. Only USED by rio-scheduler but costs nothing in
   # crates that don't reference it.
   linkGolden = ''
     mkdir -p $NIX_BUILD_TOP/rio-test-support
     ln -sf ${goldenFileset}/golden $NIX_BUILD_TOP/rio-test-support/golden
+    mkdir -p $NIX_BUILD_TOP/infra/helm/rio-build/templates
+    ln -sf ${schedulerTplFileset}/helm/rio-build/templates/scheduler.yaml \
+      $NIX_BUILD_TOP/infra/helm/rio-build/templates/scheduler.yaml
   '';
 
   withMigrations = _: {
