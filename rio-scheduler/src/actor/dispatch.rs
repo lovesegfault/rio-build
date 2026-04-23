@@ -2404,9 +2404,14 @@ pub(super) async fn walk_substitute_closure(
     // Aggregate across the closure for `r[gw.activity.subst-progress]`.
     // `done_base` accumulates completed-path nar_sizes; the per-path
     // callback adds its in-flight `done` on top. `expected` grows as
-    // each path's narinfo is read (first progress emit). `seen_expected`
-    // tracks which paths have already contributed to `expected` so a
-    // retry after a transient error doesn't double-count.
+    // each path's narinfo is read (first progress emit OR Ok(Some)).
+    // `seen_expected` tracks which paths have already contributed to
+    // `expected` so a retry after a transient error doesn't double-count.
+    //
+    // `expected_total` grows as the BFS discovers references — nom's
+    // denominator increases mid-stream. Inherent to walk-and-discover
+    // (we don't pre-fetch all narinfos), not a bug; the invariants
+    // below keep it from rendering as >100%.
     let mut done_base: u64 = 0;
     let mut expected_total: u64 = 0;
     let mut seen_expected: HashSet<String> = HashSet::new();
@@ -2475,6 +2480,12 @@ pub(super) async fn walk_substitute_closure(
         // try_substitute. Same retry/error handling as before; on
         // success, push references for the next layer.
         'paths: for p in absent {
+            // Per-path high-water mark for the in-flight `done`.
+            // `do_substitute` may iterate upstreams (or the outer
+            // attempt loop may retry), each restarting at `done=0`;
+            // emitting raw `done` would make the bar jump backward.
+            // The hwm makes the per-path contribution monotone.
+            let mut in_flight_hwm: u64 = 0;
             // Per-path re-mint cadence: the per-layer mint above is
             // not enough — this serial loop can run >30 min on a wide
             // cold layer (hundreds of paths × admission-wait + retry
@@ -2503,15 +2514,19 @@ pub(super) async fn walk_substitute_closure(
                 // Per-path progress: store streams (done, expected,
                 // upstream) per ~1 MiB. First emit for `p` adds its
                 // `expected` to the closure aggregate; subsequent emits
-                // (and retries) only update the in-flight `done` on top
-                // of `done_base`. `seen_expected` keys on path so a
-                // retry after a transient error doesn't re-add
-                // `expected`.
+                // (and retries) only update the in-flight hwm on top of
+                // `done_base`. `seen_expected` keys on path so a retry
+                // after a transient error doesn't re-add `expected`.
                 let path_progress = |done: u64, expected: u64, upstream: &str| {
                     if seen_expected.insert(p.clone()) {
                         expected_total = expected_total.saturating_add(expected);
                     }
-                    on_progress(done_base.saturating_add(done), expected_total, upstream);
+                    in_flight_hwm = in_flight_hwm.max(done);
+                    on_progress(
+                        done_base.saturating_add(in_flight_hwm),
+                        expected_total,
+                        upstream,
+                    );
                 };
                 match rio_proto::client::substitute_path_with_progress(
                     &mut c,
@@ -2523,6 +2538,14 @@ pub(super) async fn walk_substitute_closure(
                 .await
                 {
                     Ok(Some(info)) => {
+                        // Store-side cache-hit / AlreadyComplete returns
+                        // here without ever calling `path_progress`, so
+                        // `expected_total` must learn `nar_size` here too
+                        // — otherwise `done_base` outgrows it and the
+                        // next path's emit shows >100%.
+                        if seen_expected.insert(p.clone()) {
+                            expected_total = expected_total.saturating_add(info.nar_size);
+                        }
                         done_base = done_base.saturating_add(info.nar_size);
                         for r in &info.references {
                             if visited.insert(r.to_string()) {

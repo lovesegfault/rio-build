@@ -340,12 +340,14 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             // `to` is the cluster's stable identifier (same source as
             // actBuild machineName); `from` is empty until the first
             // SubstituteProgress arrives — nom renders the bar from
-            // resProgress alone, the from/to are cosmetic ("copying X
-            // from Y to Z" header line).
+            // resProgress alone, the from/to are cosmetic. The text
+            // says "fetching closure of" (not "copying path") because
+            // resProgress carries CLOSURE-aggregate bytes from
+            // `walk_substitute_closure`, not single-path bytes.
             let copy = stderr
                 .start_activity(
                     ActivityType::CopyPath,
-                    &format!("copying path '{out}'"),
+                    &format!("fetching closure of '{out}'"),
                     verbosity::INFO,
                     subst,
                     &[

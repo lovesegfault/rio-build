@@ -42,6 +42,16 @@ pub struct MockStoreState {
     /// set (not in `self.paths`) land in `substitutable_paths` — a
     /// present path is never substitutable.
     pub substitutable: Arc<RwLock<Vec<String>>>,
+    /// Per-path `SubstitutePath` shape: `(nar_size, progress_ticks)`.
+    /// When present, `substitute_path` streams each `(done, expected)`
+    /// as a `Progress` message before the terminal `Info`, and uses
+    /// `nar_size` for the terminal `Info.nar_size`. Absent key → no
+    /// `Progress` emits, `nar_size = 1` (original behavior). Lets
+    /// scheduler tests assert `walk_substitute_closure` aggregation
+    /// invariants (done≤expected, monotone) without driving the real
+    /// `Substituter`.
+    #[allow(clippy::type_complexity)]
+    pub subst_progress_ticks: Arc<RwLock<HashMap<String, (u64, Vec<(u64, u64)>)>>>,
     /// BLAKE3 digest → chunk bytes. dataplane2: backs the in-memory
     /// `ChunkService.GetChunk` impl. Seed via [`MockStore::seed_chunked`].
     pub chunks: Arc<RwLock<HashMap<Vec<u8>, Vec<u8>>>>,
@@ -810,9 +820,9 @@ impl StoreService for MockStore {
     /// Mock SubstitutePath: behaves like `query_path_info`'s on-miss
     /// substitute fallback. If the path is seeded as `substitutable`,
     /// inserts it into `paths` (mirroring the real store's ingest) and
-    /// streams a single terminal `Info`. Otherwise NotFound. No
-    /// progress emits — tests asserting progress must drive the real
-    /// `Substituter` with a fake upstream.
+    /// streams a terminal `Info`. Otherwise NotFound. `Progress` emits
+    /// + `nar_size` per `MockStoreState::subst_progress_ticks`; absent
+    /// key → no `Progress`, `nar_size = 1`.
     async fn substitute_path(
         &self,
         request: Request<types::SubstitutePathRequest>,
@@ -839,6 +849,14 @@ impl StoreService for MockStore {
             .write()
             .unwrap()
             .push(store_path.clone());
+        let (nar_size, ticks) = self
+            .state
+            .subst_progress_ticks
+            .read()
+            .unwrap()
+            .get(&store_path)
+            .cloned()
+            .unwrap_or((1, Vec::new()));
         let info = {
             if !self
                 .state
@@ -855,7 +873,7 @@ impl StoreService for MockStore {
             let info = types::PathInfo {
                 store_path: store_path.clone(),
                 nar_hash: vec![0u8; 32],
-                nar_size: 1,
+                nar_size,
                 ..Default::default()
             };
             self.state
@@ -865,7 +883,20 @@ impl StoreService for MockStore {
                 .insert(store_path.clone(), (info.clone(), Vec::new()));
             info
         };
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (tx, rx) = tokio::sync::mpsc::channel(ticks.len() + 1);
+        for (done, expected) in ticks {
+            let _ = tx
+                .send(Ok(types::SubstitutePathResponse {
+                    msg: Some(types::substitute_path_response::Msg::Progress(
+                        types::SubstitutePathProgress {
+                            bytes_done: done,
+                            bytes_expected: expected,
+                            upstream_uri: "mock://upstream".to_string(),
+                        },
+                    )),
+                }))
+                .await;
+        }
         let _ = tx
             .send(Ok(types::SubstitutePathResponse {
                 msg: Some(types::substitute_path_response::Msg::Info(info)),

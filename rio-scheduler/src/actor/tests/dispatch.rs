@@ -3579,6 +3579,70 @@ async fn substitute_fetch_cold_seed_pushes_refs() -> TestResult {
     Ok(())
 }
 
+// r[verify gw.activity.subst-progress]
+/// Aggregate-progress invariants: across all `on_progress` emits,
+/// `done <= expected` AND `done` is monotone non-decreasing — even when
+/// (a) some paths return Ok(Some) without ever emitting Progress
+/// (store-side moka hit / `AlreadyComplete`) and (b) within-path `done`
+/// regresses (multi-upstream fallback or retry restarting at 0).
+///
+/// Pre-fix: A's no-callback `done_base += 1000` left `expected_total=0`;
+/// B's first emit was `(1050, 100)` — 1050%. C's `[(160,200),(60,200)]`
+/// emitted `(prev+160,…)` then `(prev+60,…)` — backward.
+#[tokio::test]
+async fn walk_substitute_closure_progress_monotone_and_bounded() -> TestResult {
+    let (store, client, _task) = rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let a = test_store_path("aggprog-a");
+    let b = test_store_path("aggprog-b");
+    let c = test_store_path("aggprog-c");
+    // A: nar_size=1000, NO ticks → store-side cache-hit shape (callback
+    //    never fires). `done_base += 1000` must also grow `expected`.
+    // B: nar_size=100, one tick (50,100) → first callback after A's
+    //    no-callback completion; this is where >100% surfaced pre-fix.
+    // C: nar_size=200, ticks (160,200) then (60,200) → within-stream
+    //    `done` regression (multi-upstream fallback shape).
+    {
+        let mut t = store.state.subst_progress_ticks.write().unwrap();
+        t.insert(a.clone(), (1000, vec![]));
+        t.insert(b.clone(), (100, vec![(50, 100)]));
+        t.insert(c.clone(), (200, vec![(160, 200), (60, 200)]));
+    }
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .extend([a.clone(), b.clone(), c.clone()]);
+
+    let shutdown = rio_common::signal::Token::new();
+    let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
+    let mut emits: Vec<(u64, u64)> = Vec::new();
+    let ok = crate::actor::dispatch::walk_substitute_closure(
+        &client,
+        vec![a, b, c],
+        &auth,
+        &shutdown,
+        |done, expected, _| emits.push((done, expected)),
+    )
+    .await;
+    assert!(ok);
+    assert_eq!(emits.len(), 3, "B emits once, C emits twice; A emits zero");
+
+    let mut prev_done = 0u64;
+    for (done, expected) in &emits {
+        assert!(
+            done <= expected,
+            "emit ({done}, {expected}) has done>expected → renders >100%"
+        );
+        assert!(
+            *done >= prev_done,
+            "emit done={done} < prev {prev_done} → bar jumps backward"
+        );
+        prev_done = *done;
+    }
+    Ok(())
+}
+
 // r[verify sched.substitute.detached+2]
 /// merged_001: a hostile upstream returning > `MAX_SUBSTITUTE_CLOSURE`
 /// references on a SINGLE path must trip the per-path cap check
