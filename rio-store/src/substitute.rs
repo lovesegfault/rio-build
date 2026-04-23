@@ -16,7 +16,6 @@
 //! cousin that feeds `FindMissingPathsResponse.substitutable_paths`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -34,7 +33,7 @@ use rio_proto::validated::ValidatedPathInfo;
 
 use rio_common::limits::{
     MAX_CACHE_INFO_BYTES, MAX_NAR_SIZE, MAX_NARINFO_BYTES, MAX_REFERENCES, MAX_SIGNATURES,
-    MAX_SUBSTITUTE_CLOSURE, MIN_NAR_CHUNK_CHARGE,
+    MIN_NAR_CHUNK_CHARGE,
 };
 
 use crate::admission::{AdmissionError, AdmissionGate};
@@ -182,7 +181,7 @@ pub enum SubstituteError {
     /// `do_substitute`. `retry_after = None` is the placeholder-claim
     /// case (`Concurrent` — another uploader holds the slot; retry
     /// reaches `AlreadyComplete` once it finishes). `Some(d)` is the
-    /// upstream-429 case (`r[store.substitute.probe-429-retry]`): the
+    /// upstream-429 case (`r[store.substitute.probe-429-retry+2]`): the
     /// admission permit is dropped on return so the wait happens
     /// caller-side without holding per-replica capacity.
     #[error("transient busy (retry after {retry_after:?})")]
@@ -249,7 +248,7 @@ enum ProbeOutcome {
 /// Accepts both forms: delta-seconds (`"120"`) and HTTP-date
 /// (`"Wed, 21 Oct 2026 07:28:00 GMT"`). Returns the raw duration —
 /// NO clamping; the caller's deadline budget decides whether to honor
-/// it (`r[store.substitute.probe-429-retry]`).
+/// it (`r[store.substitute.probe-429-retry+2]`).
 ///
 /// Takes `&HeaderMap` (not `&reqwest::Response`) so the HTTP-date
 /// branch is unit-testable without a live socket — see
@@ -432,44 +431,18 @@ impl Substituter {
     /// Singleflight-wrapped: concurrent calls for the same `(tenant,
     /// path)` coalesce into one fetch. The moka TTL (30s) means a hit
     /// within the window returns the cached result without re-checking.
+    ///
+    /// **One path, one answer.** The store does NOT walk
+    /// `info.references`; closure completeness is the caller's
+    /// responsibility (`r[sched.substitute.detached+2]` for the
+    /// scheduler; the nix client for the gateway). Matches upstream
+    /// Nix's `BinaryCacheStore::queryPathInfo` contract.
     #[instrument(skip(self), fields(tenant = %tenant_id, path = store_path))]
     pub async fn try_substitute(
         &self,
         tenant_id: Uuid,
         store_path: &str,
     ) -> Result<Option<ValidatedPathInfo>, SubstituteError> {
-        // r[impl store.substitute.untrusted-upstream+2]
-        // Seed a per-call closure-node budget. The recursive
-        // `ensure_references` walk decrements once per path; hitting
-        // zero truncates (best-effort semantics — the build still
-        // fails with a clear ENOENT naming the missing ref).
-        let budget = Arc::new(AtomicUsize::new(MAX_SUBSTITUTE_CLOSURE));
-        self.try_substitute_inner(tenant_id, store_path, &budget)
-            .await
-    }
-
-    /// [`try_substitute`](Self::try_substitute) body with a threaded
-    /// closure-node budget. `pub(crate)` so tests can seed a small
-    /// budget without burning 50 000 paths.
-    pub(crate) async fn try_substitute_inner(
-        &self,
-        tenant_id: Uuid,
-        store_path: &str,
-        budget: &Arc<AtomicUsize>,
-    ) -> Result<Option<ValidatedPathInfo>, SubstituteError> {
-        // Saturating decrement: the seed call also charges one slot, so
-        // a budget of N admits at most N paths total (seed + closure).
-        // `fetch_update` with `checked_sub` so the counter never wraps —
-        // `ensure_references` walks siblings without re-checking, so
-        // every post-truncation sibling MUST also see budget=0.
-        if budget
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
-            .is_err()
-        {
-            warn!(%store_path, "closure walk hit MAX_SUBSTITUTE_CLOSURE; truncating");
-            metrics::counter!("rio_store_substitute_closure_truncated_total").increment(1);
-            return Ok(None);
-        }
         let key = (tenant_id, store_path.to_string());
         // moka's `try_get_with`: if another caller is already computing
         // this key, we wait and share its result. The init future runs
@@ -500,12 +473,7 @@ impl Substituter {
                 // Leader-only permit: this init future runs ONCE per
                 // `(tenant, path)` per TTL window; coalesced waiters
                 // block on the moka future without entering this body,
-                // so they consume no permits. The recursive closure
-                // walk in `ensure_references` runs AFTER this future
-                // returns (permit dropped) and re-enters via fresh
-                // `try_substitute_inner` calls — each closure node
-                // acquires its own permit sequentially, never more
-                // than one at a time per call chain.
+                // so they consume no permits.
                 let _permit = match &self.admission {
                     Some(g) => Some(g.acquire_bounded().await?),
                     None => None,
@@ -533,137 +501,7 @@ impl Substituter {
                 }
                 (*e).clone()
             })?;
-        let result = cached.map(|arc| (*arc).clone());
-        // Closure walk AFTER the singleflight slot is released (recursing
-        // from inside the init future would deadlock on moka). A path is
-        // only usable once its runtime references are also present —
-        // standard Nix substituter semantics. Without this, a builder's
-        // compute_input_closure BFS reaches a transitive ref that was
-        // never fetched, BatchQueryPathInfo (local-only) returns None,
-        // the ref is dropped from the JIT allowlist, and the build fails
-        // with ENOENT when the wrapped binary execs it (e.g.
-        // rustc-wrapper → rustc-1.94.0). The scheduler's
-        // eager_substitute_fetch only covers DAG-output paths, not their
-        // runtime closures, so this is the only place the closure can be
-        // completed.
-        if let Some(info) = &result {
-            Box::pin(self.ensure_references(tenant_id, &info.references, budget)).await;
-        }
-        Ok(result)
-    }
-
-    /// Inline-retry budget for [`SubstituteError::Admission`] inside
-    /// [`ensure_references`](Self::ensure_references). 250 ms ×4, 4 s
-    /// cap, no jitter (single sequential walker — no herd to desync),
-    /// 5 attempts → ≤ 9.25 s of backoff sleep. Kept short: the seed
-    /// ingest already consumed wall-clock under the caller's gRPC
-    /// timeout, and each attempt also queues server-side for
-    /// [`SUBSTITUTE_ADMISSION_WAIT`](crate::admission::SUBSTITUTE_ADMISSION_WAIT).
-    const ENSURE_REFS_ADMISSION_MAX_ATTEMPTS: u32 = 5;
-    const ENSURE_REFS_ADMISSION_BACKOFF: rio_common::backoff::Backoff =
-        rio_common::backoff::Backoff {
-            base: Duration::from_millis(250),
-            mult: 4.0,
-            cap: Duration::from_secs(4),
-            jitter: rio_common::backoff::Jitter::None,
-        };
-
-    /// Ensure every reference is present locally, substituting misses.
-    /// Depth-first via mutual recursion with
-    /// [`try_substitute_inner`](Self::try_substitute_inner) (which
-    /// singleflights per-ref and walks each ref's own closure). The
-    /// local `query_path_info` check short-circuits already-present
-    /// paths so the recursion converges; self-references hit the
-    /// just-ingested row and skip.
-    ///
-    /// Best-effort for UPSTREAM failures: a 5xx/hash-mismatch on a
-    /// ref logs + continues so a partial closure doesn't poison the
-    /// seed (the build still fails with a clear ENOENT naming the
-    /// missing ref).
-    ///
-    /// LOCAL backpressure ([`SubstituteError::Admission`]) AND
-    /// upstream backpressure ([`SubstituteError::Busy`] with a
-    /// `retry_after` hint) are retried INLINE (5 attempts; admission
-    /// uses 250 ms ×4 backoff, 4 s cap; `Busy` honors `retry_after`
-    /// capped at the same 4 s). By the time this runs,
-    /// [`do_substitute`](Self::do_substitute) has already persisted
-    /// the seed to PG inside the moka init future, so propagating to
-    /// the gRPC caller cannot help: their retry of
-    /// `QueryPathInfo(seed)` short-circuits at
-    /// `metadata::query_path_info → Some` without re-entering
-    /// `try_substitute_on_miss`; and at depth ≥ 2 the parent's own
-    /// PG-presence check at the top of this loop short-circuits the
-    /// whole subtree. So on inline-retry exhaust we WARN and CONTINUE
-    /// to the remaining siblings — propagation would only abandon
-    /// them without giving the caller any way to retry. The build
-    /// still fails with a clear ENOENT naming the missing ref.
-    async fn ensure_references(
-        &self,
-        tenant_id: Uuid,
-        refs: &[StorePath],
-        budget: &Arc<AtomicUsize>,
-    ) {
-        for r in refs {
-            let r = r.as_str();
-            match metadata::query_path_info(&self.pool, r).await {
-                Ok(Some(_)) => continue,
-                Ok(None) => {}
-                Err(e) => {
-                    warn!(reference = %r, error = %e, "closure: local check failed");
-                    continue;
-                }
-            }
-            // r[impl store.substitute.admission]
-            // r[impl store.substitute.probe-429-retry]
-            // Transient backpressure (local Admission OR upstream
-            // Busy) → retry HERE. Propagation alone is ineffective
-            // (see fn doc): the seed is in PG, so the caller's retry
-            // never re-enters this closure walk. `Busy{None}` (CDN
-            // 429 without Retry-After) is still backpressure — falls
-            // through to the standard backoff curve.
-            let mut attempt = 0u32;
-            loop {
-                match Box::pin(self.try_substitute_inner(tenant_id, r, budget)).await {
-                    Ok(_) => break,
-                    Err(e @ (SubstituteError::Admission(_) | SubstituteError::Busy { .. })) => {
-                        attempt += 1;
-                        if attempt >= Self::ENSURE_REFS_ADMISSION_MAX_ATTEMPTS {
-                            warn!(
-                                reference = %r, attempts = attempt, error = %e,
-                                "closure: backpressure past inline retry budget; \
-                                 seed already persisted — continuing siblings best-effort"
-                            );
-                            break;
-                        }
-                        // Busy honors the upstream hint (capped at the
-                        // backoff cap so a hostile `Retry-After: 3600`
-                        // can't pin the singleflight slot); Admission
-                        // and Busy{None} use the standard curve.
-                        let delay = match &e {
-                            SubstituteError::Busy {
-                                retry_after: Some(ra),
-                            } => (*ra).min(Self::ENSURE_REFS_ADMISSION_BACKOFF.cap),
-                            _ => Self::ENSURE_REFS_ADMISSION_BACKOFF.duration(attempt - 1),
-                        };
-                        debug!(
-                            reference = %r, attempt, ?delay, error = %e,
-                            "closure: transient backpressure; retrying inline"
-                        );
-                        // Refund the budget slot the failed attempt
-                        // consumed at try_substitute_inner's entry —
-                        // the retry re-decrements, so without this a
-                        // backpressured ref burns up to
-                        // ENSURE_REFS_ADMISSION_MAX_ATTEMPTS slots.
-                        budget.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(delay).await;
-                    }
-                    Err(e) => {
-                        warn!(reference = %r, error = %e, "closure: reference substitution failed");
-                        break;
-                    }
-                }
-            }
-        }
+        Ok(cached.map(|arc| (*arc).clone()))
     }
 
     /// One full fetch cycle — the singleflight body. `http` and
@@ -740,7 +578,7 @@ impl Substituter {
                     // not cache the eventual `Err(Busy)`, and the
                     // admission permit drops on return so the wait
                     // happens caller-side
-                    // (r[store.substitute.probe-429-retry]).
+                    // (r[store.substitute.probe-429-retry+2]).
                     debug!(upstream = %upstream.url, ?retry_after,
                            "upstream 429, trying next");
                     // Max across upstreams that 429'd (matches probe_one).
@@ -814,7 +652,7 @@ impl Substituter {
         if is_not_found(resp.status()) {
             return Ok(UpstreamOutcome::Miss);
         }
-        // r[impl store.substitute.probe-429-retry]
+        // r[impl store.substitute.probe-429-retry+2]
         // 429 on the GET path: return Busy{retry_after} immediately.
         // The AdmissionGate permit drops on return so the wait happens
         // caller-side without holding per-replica capacity. NO inline
@@ -874,7 +712,7 @@ impl Substituter {
         // ValidatedPathInfo + the post-decompress hash check.
         let expected_hash = parse_nar_hash(&ni.nar_hash)?;
 
-        // r[impl store.substitute.untrusted-upstream+2]
+        // r[impl store.substitute.untrusted-upstream+3]
         // Declared-size gate. `trusted_keys` is also tenant-supplied so
         // a verified sig is NOT a trust boundary; gate before download.
         // The decompressed cap in `fetch_nar` catches a narinfo that
@@ -965,7 +803,7 @@ impl Substituter {
                 .fetch_nar(http, tenant_id, &nar_url, &ni.compression)
                 .await?;
 
-            // r[impl store.substitute.untrusted-upstream+2]
+            // r[impl store.substitute.untrusted-upstream+3]
             // Size check: actual decompressed length MUST equal the
             // narinfo's `NarSize:` line. The Nix signature fingerprint
             // is `1;path;hash;size;refs`; persisting an unchecked size
@@ -1064,7 +902,7 @@ impl Substituter {
             .send()
             .await
             .map_err(|e| SubstituteError::Fetch(format!("{nar_url}: {e}")))?;
-        // r[impl store.substitute.probe-429-retry]
+        // r[impl store.substitute.probe-429-retry+2]
         // 429 on the NAR body GET maps to `Busy` (same as the narinfo
         // GET) so `do_substitute` continues to the next upstream and
         // moka doesn't cache the result. Without this, a body-level 429
@@ -1086,7 +924,7 @@ impl Substituter {
                 resp.status()
             )));
         }
-        // r[impl store.substitute.untrusted-upstream+2]
+        // r[impl store.substitute.untrusted-upstream+3]
         // bytes_stream → StreamReader → decoder → `.take(cap+1)` →
         // budgeted read loop. The `.take()` wraps the DECOMPRESSED
         // side so a zstd bomb is bounded regardless of what `NarSize`
@@ -1250,7 +1088,7 @@ impl Substituter {
     /// hide paths that OTHER upstreams have). 429 responses are retried
     /// (≤ `SUBSTITUTE_PROBE_429_MAX_PASSES`) with `Retry-After`
     /// honored and concurrency adaptively halved — see
-    /// `r[store.substitute.probe-429-retry]`. No batch-size truncation:
+    /// `r[store.substitute.probe-429-retry+2]`. No batch-size truncation:
     /// the originating RPC's wall-clock is `⌈N_uncached/128⌉ × RTT`;
     /// the scheduler's merge-time caller carries a wider timeout
     /// (`r[sched.substitute.eager-probe]`).
@@ -1394,7 +1232,7 @@ impl Substituter {
         };
 
         // r[impl store.substitute.probe-bounded+4]
-        // r[impl store.substitute.probe-429-retry]
+        // r[impl store.substitute.probe-429-retry+2]
         // 429-aware retry loop. Pass 0 covers the full uncached set;
         // each retry pass re-probes only the RateLimited subset after
         // sleeping max(Retry-After) (Fastly's 429 is edge-wide, not
@@ -1515,7 +1353,7 @@ fn is_not_found(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 404 | 403 | 410)
 }
 
-// r[impl store.substitute.untrusted-upstream+2]
+// r[impl store.substitute.untrusted-upstream+3]
 /// Read a small text body (`.narinfo`, `/nix-cache-info`) with a hard
 /// size cap. `tenant_upstreams` rows are tenant-supplied; an unbounded
 /// `.text()` against a hostile upstream is an OOM vector for the
@@ -1563,7 +1401,7 @@ fn narinfo_to_validated(
 ) -> Result<ValidatedPathInfo, SubstituteError> {
     use rio_proto::types::PathInfo;
 
-    // r[impl store.substitute.untrusted-upstream+2]
+    // r[impl store.substitute.untrusted-upstream+3]
     // Per-node count caps — parity with PutPath (`put_path/common.rs`).
     // `ValidatedPathInfo::try_from` validates per-element syntax only;
     // it does NOT bound the count.
@@ -1620,6 +1458,7 @@ mod tests {
     use rio_nix::narinfo::fingerprint;
     use rio_test_support::TestDb;
     use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // — test fixture: an in-process upstream cache —
     //
@@ -2299,7 +2138,7 @@ mod tests {
         assert!(got.is_none(), "no upstreams → None");
     }
 
-    // r[verify store.substitute.probe-429-retry]
+    // r[verify store.substitute.probe-429-retry+2]
     /// First upstream 429s the narinfo GET; second upstream has the
     /// path. `do_substitute` MUST continue to the second (matching the
     /// HEAD-probe semantics) and return a hit, not stop at the first
@@ -2456,7 +2295,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.probe-429-retry]
+    // r[verify store.substitute.probe-429-retry+2]
     /// 429 + `Retry-After` honored: upstream 429s the first
     /// `head_429_first_n` HEADs then 200s. All paths MUST end up in
     /// `hits` (the rate-limited subset is retried, not dropped to
@@ -2521,7 +2360,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.probe-429-retry]
+    // r[verify store.substitute.probe-429-retry+2]
     /// >10% rate-limited → concurrency halves for the retry pass.
     /// 200 paths at 128 concurrency; ALL of pass-0 429s. Retry pass
     /// MUST observe max-concurrent ≤ 64.
@@ -2568,7 +2407,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.probe-429-retry]
+    // r[verify store.substitute.probe-429-retry+2]
     /// `Retry-After` exceeding the caller's deadline budget → retry
     /// pass is SKIPPED (no sleep), rate-limited paths returned as
     /// not-substitutable for this call (uncached → re-probed next time).
@@ -2718,7 +2557,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.probe-429-retry]
+    // r[verify store.substitute.probe-429-retry+2]
     /// `Retry-After` as an RFC 9110 HTTP-date (not delta-seconds):
     /// parsed via `httpdate` and honored. Upstream sends a date ~3s
     /// in the future (`fmt_http_date` truncates sub-second, so +2s
@@ -2773,7 +2612,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.probe-429-retry]
+    // r[verify store.substitute.probe-429-retry+2]
     /// Direct unit test of [`parse_retry_after`]'s HTTP-date branch.
     /// The integration test above (`check_available_429_http_date`)
     /// can't tell a parsed ~2 s from the None-default 1 s floor via
@@ -2816,7 +2655,7 @@ mod tests {
         assert_eq!(parse_retry_after(&h), None);
     }
 
-    // r[verify store.substitute.probe-429-retry]
+    // r[verify store.substitute.probe-429-retry+2]
     /// 429 on the narinfo GET path (`try_upstream`) → returns
     /// `Err(Busy{retry_after: Some})` IMMEDIATELY (no inline sleep).
     /// The admission permit drops on return so per-replica capacity
@@ -3199,305 +3038,6 @@ mod tests {
         );
     }
 
-    /// Setup for `ensure_references_retries_admission_then_succeeds`:
-    /// pre-seed the moka `inflight` slot with a result carrying one
-    /// ref, so the seed call is a cache hit (no permit needed) and
-    /// goes straight to `ensure_references`. Upstream config must be
-    /// non-empty so the ref's init future proceeds past the hoisted
-    /// no-upstreams check to `acquire_bounded`.
-    async fn admission_refs_fixture(
-        slug: &str,
-    ) -> (TestDb, Uuid, AdmissionGate, Substituter, String) {
-        let db = TestDb::new(&crate::MIGRATOR).await;
-        let tid = seed_tenant(&db.pool, slug).await;
-        metadata::upstreams::insert(
-            &db.pool,
-            tid,
-            "http://127.0.0.1:1",
-            50,
-            &["dummy:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()],
-            SigMode::Keep,
-        )
-        .await
-        .unwrap();
-        let gate = AdmissionGate::new(1);
-        let sub = test_substituter(db.pool.clone()).with_admission_gate(gate.clone());
-        let seed = rio_test_support::fixtures::test_store_path("adm-seed");
-        let ref_a = format!(
-            "/nix/store/{}-adm-ref-a",
-            rio_test_support::fixtures::rand_store_hash()
-        );
-        let info = ValidatedPathInfo::try_from(rio_proto::types::PathInfo {
-            store_path: seed.clone(),
-            store_path_hash: Vec::new(),
-            deriver: String::new(),
-            nar_hash: vec![0u8; 32],
-            nar_size: 1,
-            references: vec![ref_a],
-            registration_time: 0,
-            ultimate: false,
-            signatures: Vec::new(),
-            content_address: String::new(),
-        })
-        .unwrap();
-        sub.inflight
-            .insert((tid, seed.clone()), Some(Arc::new(info)))
-            .await;
-        (db, tid, gate, sub, seed)
-    }
-
-    // r[verify store.substitute.admission]
-    /// `ensure_references` MUST retry `SubstituteError::Admission`
-    /// inline. By the time the closure walk runs, `do_substitute` has
-    /// already persisted the seed to PG, so propagating to the gRPC
-    /// caller is ineffective: their `QueryPathInfo(seed)` retry hits
-    /// `metadata::query_path_info → Some` and never re-enters
-    /// substitution. The inline retry is the only place the closure
-    /// can be completed.
-    ///
-    /// cap=1, the only permit held externally. Paused time so
-    /// `acquire_bounded`'s 25 s queue auto-advances to `Saturated`; a
-    /// spawned task drops the permit at virtual t=+51 s — past two
-    /// 25 s waits + the 250 ms first backoff — so attempts 1-2 see
-    /// `Saturated` and attempt 3 proceeds. Structural assertion is on
-    /// virtual elapsed (≥ 50 s ⇒ ≥ 2 inline retries ran), NOT on the
-    /// ref's eventual outcome: attempt 3's `do_substitute` may fail
-    /// for unrelated reasons (sqlx pool-acquire under auto-advance is
-    /// brittle past two cycles; 127.0.0.1:1 is unreachable anyway),
-    /// but either way the call returns `Ok(Some(seed))` instead of
-    /// propagating — which is exactly the regression bar.
-    ///
-    /// `pause()` is called AFTER PG setup; the first two attempts'
-    /// real-socket PG reads don't trip auto-advance.
-    #[tokio::test]
-    async fn ensure_references_retries_admission_then_succeeds() {
-        let (_db, tid, gate, sub, seed) = admission_refs_fixture("sub-admission-refs-retry").await;
-
-        let held = gate.semaphore().clone().acquire_owned().await.unwrap();
-        tokio::time::pause();
-        let start = tokio::time::Instant::now();
-        let releaser = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(51)).await;
-            drop(held);
-        });
-
-        let got = sub.try_substitute(tid, &seed).await;
-        let elapsed = start.elapsed();
-        releaser.await.unwrap();
-        assert!(
-            matches!(got, Ok(Some(_))),
-            "inline retry must absorb transient admission backpressure \
-             instead of propagating; got {got:?}"
-        );
-        assert!(
-            elapsed >= Duration::from_secs(50),
-            "virtual elapsed {elapsed:?} < 50 s ⇒ fewer than 2 \
-             `Saturated` cycles ran — inline retry did not engage"
-        );
-    }
-
-    // r[verify store.substitute.probe-429-retry]
-    /// `ensure_references` MUST retry `Busy{retry_after: None}` (429
-    /// without a `Retry-After` header — common from CDN edges) inline
-    /// via the `_ =>` backoff arm. Prior to merged_bug_001 the match
-    /// arm was `Busy{retry_after: Some(_)}` only, so a bare 429 fell
-    /// through to the non-retried error arm and the ref was skipped
-    /// (seed returned `Ok(Some)` with refs absent → builder ENOENT).
-    ///
-    /// Upstream serves the closure ref's narinfo as 429 (no header)
-    /// for the first 2 GETs, then 200. Seed is pre-inserted in moka
-    /// so `try_substitute_inner` goes straight to the closure walk.
-    /// Budget seeded at 3 also proves the per-retry refund: without
-    /// it, seed(1) + 3 ref-attempts would exhaust to 0 and the third
-    /// attempt would truncate to `Ok(None)`.
-    #[tokio::test]
-    async fn ensure_references_retries_busy_without_retry_after() {
-        let db = TestDb::new(&crate::MIGRATOR).await;
-        let tid = seed_tenant(&db.pool, "sub-refs-429-none").await;
-
-        let ref_path = rio_test_support::fixtures::test_store_path("ref-429-none");
-        let (ref_nar, _) = rio_test_support::fixtures::make_nar(b"ref-body");
-        let fake = spawn_flex_upstream(
-            &ref_path,
-            ref_nar,
-            "cache.ref-429-none",
-            FlexCfg {
-                narinfo_429_first_n: 2,
-                ..Default::default()
-            },
-        )
-        .await;
-        insert_flex(&db.pool, tid, &fake, 50).await;
-
-        let sub = test_substituter(db.pool.clone());
-        let seed = rio_test_support::fixtures::test_store_path("seed-429-none");
-        let info = ValidatedPathInfo::try_from(rio_proto::types::PathInfo {
-            store_path: seed.clone(),
-            store_path_hash: Vec::new(),
-            deriver: String::new(),
-            nar_hash: vec![0u8; 32],
-            nar_size: 1,
-            references: vec![ref_path.clone()],
-            registration_time: 0,
-            ultimate: false,
-            signatures: Vec::new(),
-            content_address: String::new(),
-        })
-        .unwrap();
-        sub.inflight
-            .insert((tid, seed.clone()), Some(Arc::new(info)))
-            .await;
-
-        let budget = Arc::new(AtomicUsize::new(3));
-        let t0 = tokio::time::Instant::now();
-        let got = sub.try_substitute_inner(tid, &seed, &budget).await;
-        let elapsed = t0.elapsed();
-
-        assert!(
-            matches!(got, Ok(Some(_))),
-            "Busy{{None}} must be retried inline, not propagated; got {got:?}"
-        );
-        // Structural: 2×429 + 1×200 on the narinfo GET.
-        assert_eq!(
-            fake.narinfo_hits.load(Ordering::SeqCst),
-            3,
-            "two 429 retries + one success"
-        );
-        // Ref actually persisted (not skipped via the old non-retried arm).
-        assert!(
-            metadata::query_path_info(&db.pool, &ref_path)
-                .await
-                .unwrap()
-                .is_some(),
-            "closure ref must be persisted, not skipped"
-        );
-        // Budget refund: 3 - seed - ref = 1 (without refund: 3 - 1 - 3 → 0).
-        assert_eq!(
-            budget.load(Ordering::SeqCst),
-            1,
-            "transient retries must refund their budget slot"
-        );
-        // `_ =>` backoff arm: 250ms + 1s = 1.25s of sleep.
-        assert!(
-            elapsed >= Duration::from_secs(1),
-            "Busy{{None}} uses standard backoff (250ms+1s); elapsed={elapsed:?}"
-        );
-    }
-
-    // r[verify store.substitute.admission]
-    // r[verify store.substitute.probe-429-retry]
-    /// After `ENSURE_REFS_ADMISSION_MAX_ATTEMPTS` inline retries
-    /// exhaust on ref A, the closure walk WARNs and CONTINUES to
-    /// siblings B, C — it does NOT propagate. Propagation can't help
-    /// (seed already in PG → caller's retry short-circuits at
-    /// `query_path_info`; depth ≥ 2 → grandparent short-circuits at
-    /// the top-of-loop presence check) and would only abandon B/C.
-    ///
-    /// Three refs, two flex upstreams: fake_a serves ref_a with
-    /// `narinfo_429_first_n` ≫ 5 (always-Busy for our purposes) and
-    /// fake_b serves ref_b + ref_c normally. ref_a: A=429, B/C=404 →
-    /// `Err(Busy{None})` ×5 → exhaust → break → continue. ref_b,
-    /// ref_c: A=404, B/C=Hit → persisted. Real time (NOT paused:
-    /// auto-advance through the backoff sleeps races sqlx's
-    /// pool-acquire timeout). 4 backoff sleeps total 9.25 s
-    /// wall-clock — slow, but proves all 5 attempts ran.
-    #[tokio::test]
-    #[tracing_test::traced_test]
-    async fn ensure_references_exhausts_then_continues_siblings() {
-        use rio_test_support::fixtures::rand_store_hash;
-        let db = TestDb::new(&crate::MIGRATOR).await;
-        let tid = seed_tenant(&db.pool, "sub-refs-exhaust-siblings").await;
-
-        // Distinct hash parts so each flex upstream's narinfo route is
-        // disjoint — cross-probes 404 instead of identity-mismatching.
-        let ref_a = format!("/nix/store/{}-ref-exhaust-a", rand_store_hash());
-        let ref_b = format!("/nix/store/{}-ref-exhaust-b", rand_store_hash());
-        let ref_c = format!("/nix/store/{}-ref-exhaust-c", rand_store_hash());
-        let (nar_a, _) = rio_test_support::fixtures::make_nar(b"a");
-        let (nar_b, _) = rio_test_support::fixtures::make_nar(b"b");
-        let (nar_c, _) = rio_test_support::fixtures::make_nar(b"c");
-        // ref_a: 429 forever (well past 5 attempts).
-        let fake_a = spawn_flex_upstream(
-            &ref_a,
-            nar_a,
-            "cache.exhaust-a",
-            FlexCfg {
-                narinfo_429_first_n: 100,
-                ..Default::default()
-            },
-        )
-        .await;
-        // ref_b, ref_c: served normally from separate upstreams (each
-        // flex instance serves exactly one path; cross-probes 404).
-        let fake_b =
-            spawn_flex_upstream(&ref_b, nar_b, "cache.exhaust-b", FlexCfg::default()).await;
-        let fake_c =
-            spawn_flex_upstream(&ref_c, nar_c, "cache.exhaust-c", FlexCfg::default()).await;
-        insert_flex(&db.pool, tid, &fake_a, 50).await;
-        insert_flex(&db.pool, tid, &fake_b, 50).await;
-        insert_flex(&db.pool, tid, &fake_c, 50).await;
-
-        let sub = test_substituter(db.pool.clone());
-        let seed = rio_test_support::fixtures::test_store_path("seed-exhaust");
-        let info = ValidatedPathInfo::try_from(rio_proto::types::PathInfo {
-            store_path: seed.clone(),
-            store_path_hash: Vec::new(),
-            deriver: String::new(),
-            nar_hash: vec![0u8; 32],
-            nar_size: 1,
-            references: vec![ref_a.clone(), ref_b.clone(), ref_c.clone()],
-            registration_time: 0,
-            ultimate: false,
-            signatures: Vec::new(),
-            content_address: String::new(),
-        })
-        .unwrap();
-        sub.inflight
-            .insert((tid, seed.clone()), Some(Arc::new(info)))
-            .await;
-
-        let got = sub.try_substitute(tid, &seed).await;
-
-        assert!(
-            matches!(got, Ok(Some(_))),
-            "exhaust on one ref must NOT propagate (caller-retry can't \
-             re-enter the closure walk); got {got:?}"
-        );
-        // Structural: ref_a probed exactly 5× (all attempts ran).
-        assert_eq!(
-            fake_a.narinfo_hits.load(Ordering::SeqCst),
-            Substituter::ENSURE_REFS_ADMISSION_MAX_ATTEMPTS as usize,
-            "all inline-retry attempts must run before exhaust"
-        );
-        assert!(
-            logs_contain("continuing siblings best-effort"),
-            "exhaustion must WARN that siblings continue best-effort"
-        );
-        // Structural: siblings B, C WERE fetched after A exhausted.
-        assert!(
-            metadata::query_path_info(&db.pool, &ref_b)
-                .await
-                .unwrap()
-                .is_some(),
-            "sibling ref_b must be fetched despite ref_a exhausting"
-        );
-        assert!(
-            metadata::query_path_info(&db.pool, &ref_c)
-                .await
-                .unwrap()
-                .is_some(),
-            "sibling ref_c must be fetched despite ref_a exhausting"
-        );
-        // ref_a was NOT persisted (every attempt 429'd).
-        assert!(
-            metadata::query_path_info(&db.pool, &ref_a)
-                .await
-                .unwrap()
-                .is_none(),
-            "ref_a must remain absent (all attempts Busy)"
-        );
-    }
-
     // — flexible fixture for the regression tests below —
     //
     // Serves one (path, NAR) pair with tunable misbehavior: oversized
@@ -3841,7 +3381,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.untrusted-upstream+2]
+    // r[verify store.substitute.untrusted-upstream+3]
     /// bug_172: oversized narinfo body → `TooLarge`, NAR endpoint never
     /// hit.
     #[tokio::test]
@@ -3887,7 +3427,7 @@ mod tests {
         assert_eq!(fake.nar_hits.load(Ordering::SeqCst), 0);
     }
 
-    // r[verify store.substitute.untrusted-upstream+2]
+    // r[verify store.substitute.untrusted-upstream+3]
     /// bug_093: a NAR larger than the decompressed cap → `TooLarge`.
     /// Uses the test-only 64 KiB `SUBSTITUTE_NAR_DECOMPRESSED_CAP` so
     /// this doesn't allocate 4 GiB.
@@ -4185,7 +3725,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.untrusted-upstream+2]
+    // r[verify store.substitute.untrusted-upstream+3]
     /// bug_005: a narinfo whose `NarSize` differs from the actual
     /// decompressed length MUST be rejected (integrity failure).
     /// Signatures are computed over `nar_size`; persisting an unchecked
@@ -4435,7 +3975,7 @@ mod tests {
         assert_eq!(got2.nar_size, nar.len() as u64);
     }
 
-    // r[verify store.substitute.untrusted-upstream+2]
+    // r[verify store.substitute.untrusted-upstream+3]
     /// bug_144: `narinfo_to_validated` MUST reject `References:` count
     /// > MAX_REFERENCES (parity with PutPath).
     #[test]
@@ -4465,141 +4005,5 @@ mod tests {
             narinfo_to_validated(&ni, [0u8; 32]),
             Err(SubstituteError::NarInfo(_))
         ));
-    }
-
-    // r[verify store.substitute.untrusted-upstream+2]
-    /// bug_144: the recursive closure walk MUST honour the per-call
-    /// node budget. Seed a tiny budget; serve a path whose `References:`
-    /// names a second path the same upstream also serves; assert the
-    /// budget hits zero and the truncation metric fires.
-    #[tokio::test]
-    async fn closure_walk_respects_budget() {
-        use rio_test_support::metrics::CountingRecorder;
-
-        let db = TestDb::new(&crate::MIGRATOR).await;
-        let tid = seed_tenant(&db.pool, "sub-closure-budget").await;
-
-        // Three paths: root references leaf1 + leaf2. TWO siblings so the
-        // test exercises the post-truncation budget state — a wrapping
-        // `fetch_sub` would let leaf2 through after leaf1 truncates.
-        // All served by the SAME key so one trusted_keys entry covers all.
-        let root = rio_test_support::fixtures::test_store_path("closure-root");
-        let leaf1 = format!(
-            "/nix/store/{}-closure-leaf1",
-            rio_test_support::fixtures::rand_store_hash()
-        );
-        let leaf2 = format!(
-            "/nix/store/{}-closure-leaf2",
-            rio_test_support::fixtures::rand_store_hash()
-        );
-        let (_, nar) = make_path();
-        let root_hash = StorePath::parse(&root).unwrap().hash_part();
-
-        // Root narinfo: signed over References=[leaf1, leaf2].
-        let seed = [0x42u8; 32];
-        let signer = Signer::from_seed("cache.closure", &seed);
-        let nar_hash: [u8; 32] = sha2::Sha256::digest(&nar).into();
-        let nar_hash_str = format!(
-            "sha256:{}",
-            rio_nix::store_path::nixbase32::encode(&nar_hash)
-        );
-        let refs = [leaf1.clone(), leaf2.clone()];
-        let fp_root = fingerprint(&root, &nar_hash, nar.len() as u64, &refs);
-        let root_body = format!(
-            "StorePath: {root}\n\
-             URL: nar/{root_hash}.nar\n\
-             Compression: none\n\
-             NarHash: {nar_hash_str}\n\
-             NarSize: {}\n\
-             References: {} {}\n\
-             Sig: {}\n",
-            nar.len(),
-            leaf1.rsplit_once('/').unwrap().1,
-            leaf2.rsplit_once('/').unwrap().1,
-            signer.sign(&fp_root)
-        );
-
-        // Root upstream: serves root narinfo (with two refs) + NAR.
-        let root_up = spawn_flex_upstream(
-            &root,
-            nar.clone(),
-            "cache.closure",
-            FlexCfg {
-                narinfo_override: Some(root_body),
-                ..Default::default()
-            },
-        )
-        .await;
-        // Leaf upstreams: each serves its own narinfo + NAR (same key seed).
-        let mut urls = vec![root_up.url.clone()];
-        for leaf in &refs {
-            let h = StorePath::parse(leaf).unwrap().hash_part();
-            let body = signed_narinfo_for(leaf, &nar, "cache.closure", &h, None);
-            let up = spawn_flex_upstream(
-                leaf,
-                nar.clone(),
-                "cache.closure",
-                FlexCfg {
-                    narinfo_override: Some(body),
-                    ..Default::default()
-                },
-            )
-            .await;
-            urls.push(up.url.clone());
-            // Hold the server task alive past the substitution.
-            std::mem::forget(up);
-        }
-        for url in &urls {
-            metadata::upstreams::insert(
-                &db.pool,
-                tid,
-                url,
-                50,
-                std::slice::from_ref(&root_up.trusted_key),
-                SigMode::Keep,
-            )
-            .await
-            .unwrap();
-        }
-
-        let sub = test_substituter(db.pool.clone());
-        // Budget = 1: root consumes the only slot; BOTH leaves must
-        // truncate (the second proves the budget didn't wrap).
-        let budget = Arc::new(AtomicUsize::new(1));
-        let rec = CountingRecorder::default();
-        let _g = metrics::set_default_local_recorder(&rec);
-        let got = sub
-            .try_substitute_inner(tid, &root, &budget)
-            .await
-            .unwrap()
-            .expect("root ingested");
-        assert_eq!(got.references.len(), 2);
-        assert_eq!(
-            budget.load(Ordering::SeqCst),
-            0,
-            "budget must saturate at 0, not wrap"
-        );
-        assert_eq!(
-            rec.get("rio_store_substitute_closure_truncated_total{}"),
-            2,
-            "both siblings truncated; keys={:?}",
-            rec.all_keys()
-        );
-        // Root persisted; NEITHER leaf persisted (truncated).
-        assert!(
-            metadata::query_path_info(&db.pool, &root)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        for leaf in &refs {
-            assert!(
-                metadata::query_path_info(&db.pool, leaf)
-                    .await
-                    .unwrap()
-                    .is_none(),
-                "{leaf} must be truncated when budget=1 (wraparound would let sibling 2 through)"
-            );
-        }
     }
 }

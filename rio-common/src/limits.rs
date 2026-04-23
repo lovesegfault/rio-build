@@ -36,8 +36,8 @@ pub const MAX_REFERENCES: usize = 10_000;
 /// Maximum number of signatures in a single PathInfo.
 pub const MAX_SIGNATURES: usize = 100;
 
-/// Maximum store paths a single `try_substitute` will recursively fetch
-/// via `ensure_references`. Bounds the closure walk against a hostile
+/// Maximum store paths the scheduler's `spawn_substitute_fetches` BFS
+/// will visit per derivation. Bounds the closure walk against a hostile
 /// upstream serving an infinite reference chain. Real closures (full
 /// nixpkgs stdenv ~5k, full system ~20k) are well under this.
 pub const MAX_SUBSTITUTE_CLOSURE: usize = 50_000;

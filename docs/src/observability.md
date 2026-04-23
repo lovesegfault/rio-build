@@ -194,7 +194,6 @@ r[obs.metric.store]
 | `rio_store_get_path_duration_seconds` | Histogram | GetPath latency (stream_path entry to whole-NAR verify) |
 | `rio_store_substitute_total` | Counter | Upstream substitution attempts, labeled by `result` (hit/miss/error) and `tenant` (UUID). Per-upstream debugging detail is in the `debug!`/`warn!` log lines. |
 | `rio_store_substitute_integrity_failures_total` | Counter | Upstream substitution NAR hash or size mismatches, labeled by `tenant`. Nonzero is security-relevant: upstream served corrupt/tampered bytes or a lying `NarSize`. |
-| `rio_store_substitute_closure_truncated_total` | Counter | `try_substitute` closure walks that hit `MAX_SUBSTITUTE_CLOSURE` and were truncated. Nonzero is security-relevant: a tenant-configured upstream is serving an implausibly deep reference chain. |
 | `rio_store_substitute_probe_cache_hits_total` | Counter | `check_available` HEAD-probe cache hits (positive or negative cached result; no upstream HEAD made for this path). |
 | `rio_store_substitute_probe_cache_misses_total` | Counter | `check_available` HEAD-probe cache misses (path was uncached; an upstream HEAD was issued). |
 | `rio_store_substitute_probe_ratelimited_total` | Counter | Upstream HEAD/GET probes that returned 429, labeled by `tenant` (NOT by upstream URL — tenant-supplied URLs are unbounded cardinality). The rate-limited subset is retried (≤3 passes) after honoring `Retry-After`; concurrency halves when >10% of a pass 429s. |

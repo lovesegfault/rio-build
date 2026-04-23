@@ -256,13 +256,6 @@ pub fn describe_metrics() {
          served corrupt or tampered bytes / a lying NarSize."
     );
     describe_counter!(
-        "rio_store_substitute_closure_truncated_total",
-        "try_substitute closure walks that hit MAX_SUBSTITUTE_CLOSURE and \
-         were truncated. Nonzero is a security-relevant signal: a \
-         tenant-configured upstream is serving an implausibly deep \
-         reference chain."
-    );
-    describe_counter!(
         "rio_store_putpath_stale_reclaimed_total",
         "Stale 'uploading' placeholders reclaimed on the PutPath hot path \
          (I-207). Nonzero expected under fetcher churn; sustained high \
