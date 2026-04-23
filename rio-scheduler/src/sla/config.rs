@@ -425,6 +425,16 @@ impl SlaConfig {
             self.hw_explore_epsilon
         );
         for (h, def) in &self.hw_classes {
+            // bug_038: the charset constraint is enforced at every gRPC
+            // sink (`AppendHwPerfSample`, `AppendInterruptSample`) but
+            // was NOT checked here at the trusted-but-fallible source.
+            // An operator key like `c7a.xlarge` booted cleanly; every
+            // sample for it was then silently rejected with `warn!` only.
+            anyhow::ensure!(
+                rio_common::limits::is_hw_class_name(h),
+                "sla.hwClasses key {h:?} must match [a-z0-9-]{{1,64}} \
+                 (rejected by AppendHwPerfSample / AppendInterruptSample otherwise)"
+            );
             anyhow::ensure!(
                 !def.labels.is_empty(),
                 "sla.hwClasses[{h}].labels must be non-empty"
@@ -736,6 +746,43 @@ mod tests {
             38.0
         );
         sla.validate().unwrap();
+    }
+
+    /// bug_038: `c7a.xlarge` (dot) booted cleanly, then every
+    /// `AppendHwPerfSample` for it was silently rejected at the gRPC
+    /// sink. The charset constraint MUST be enforced at the config
+    /// source, not just the N untrusted sinks.
+    // r[verify sched.sla.hw-class.config]
+    #[test]
+    fn validate_rejects_hw_class_dot() {
+        let mut cfg = base();
+        cfg.hw_cost_source = Some(super::super::cost::HwCostSource::Static);
+        cfg.hw_classes.insert(
+            "c7a.xlarge".into(),
+            HwClassDef {
+                labels: vec![NodeLabelMatch {
+                    key: "k".into(),
+                    value: "v".into(),
+                }],
+            },
+        );
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("c7a.xlarge") && err.contains("[a-z0-9-]"),
+            "{err}"
+        );
+        // Positive control: dash-separated key passes.
+        cfg.hw_classes.clear();
+        cfg.hw_classes.insert(
+            "c7a-xlarge".into(),
+            HwClassDef {
+                labels: vec![NodeLabelMatch {
+                    key: "k".into(),
+                    value: "v".into(),
+                }],
+            },
+        );
+        cfg.validate().unwrap();
     }
 
     // r[verify sched.sla.hw-class.config]

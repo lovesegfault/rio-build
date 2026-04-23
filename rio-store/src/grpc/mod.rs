@@ -755,44 +755,51 @@ impl StoreService for StoreServiceImpl {
             }
         };
         let req = request.into_inner();
-        if req.hw_class.is_empty()
-            || req.hw_class.len() > rio_common::limits::MAX_HW_CLASS_LEN
-            || !req
-                .hw_class
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-            || pod_id.is_empty()
-        {
+        if !rio_common::limits::is_hw_class_name(&req.hw_class) || pod_id.is_empty() {
             return Err(Status::invalid_argument(
                 "hw_class must be 1-64 chars of [a-z0-9-]; pod_id required",
             ));
         }
-        // K=3 jsonb factor: parse + validate every dimension here
-        // (NOT a CHECK constraint) so a malformed payload is an
-        // InvalidArgument, not a PG error surfaced as Internal. The
-        // INSERTed jsonb is REBUILT from the three validated scalars
-        // — the raw `Value` is body-supplied and unbounded (extra
-        // keys, MB-scale padding); rebuilding makes that structurally
+        // K=3 jsonb factor: parse + validate every PRESENT dimension
+        // here (NOT a CHECK constraint) so a malformed payload is an
+        // InvalidArgument, not a PG error surfaced as Internal.
+        // bug_037: `membw`/`ioseq` are optional — `bench_needed=false`
+        // and tmpfs-O_DIRECT-EINVAL both omit dims rather than write
+        // a `1.0` placeholder; the scheduler's per-dim median ignores
+        // absent dims. `alu` stays mandatory (always measured). The
+        // INSERTed jsonb is REBUILT from the validated scalars — the
+        // raw `Value` is body-supplied and unbounded (extra keys,
+        // MB-scale padding); rebuilding makes that structurally
         // impossible.
         let raw: serde_json::Value = serde_json::from_str(&req.factor_json).map_err(|e| {
             Status::invalid_argument(format!("factor_json must be a JSON object: {e}"))
         })?;
-        let dim = |d: &str| -> Result<f64, Status> {
-            let v = raw
-                .get(d)
-                .and_then(serde_json::Value::as_f64)
-                .ok_or_else(|| {
-                    Status::invalid_argument(format!("factor_json.{d} missing or not a number"))
-                })?;
+        let dim = |d: &str| -> Result<Option<f64>, Status> {
+            let Some(raw_v) = raw.get(d) else {
+                return Ok(None);
+            };
+            let v = raw_v
+                .as_f64()
+                .ok_or_else(|| Status::invalid_argument(format!("factor_json.{d} not a number")))?;
             if !v.is_finite() || v <= 0.0 {
                 return Err(Status::invalid_argument(format!(
                     "factor_json.{d}={v} must be finite and > 0"
                 )));
             }
-            Ok(v)
+            Ok(Some(v))
         };
-        let (alu, membw, ioseq) = (dim("alu")?, dim("membw")?, dim("ioseq")?);
-        let factor = serde_json::json!({"alu": alu, "membw": membw, "ioseq": ioseq});
+        let alu = dim("alu")?.ok_or_else(|| {
+            Status::invalid_argument("factor_json.alu missing (mandatory dimension)")
+        })?;
+        let mut factor = serde_json::Map::new();
+        factor.insert("alu".into(), alu.into());
+        if let Some(v) = dim("membw")? {
+            factor.insert("membw".into(), v.into());
+        }
+        if let Some(v) = dim("ioseq")? {
+            factor.insert("ioseq".into(), v.into());
+        }
+        let factor = serde_json::Value::Object(factor);
         sqlx::query!(
             "INSERT INTO hw_perf_samples (hw_class, pod_id, factor, submitting_tenant) \
              VALUES ($1, $2, $3, $4) \
@@ -922,9 +929,12 @@ mod tests {
         assert!((alu - 1.1).abs() < 1e-9, "upsert keeps latest factor");
     }
 
-    /// Per-dimension validation: missing key, non-numeric, NaN, ≤0 →
-    /// InvalidArgument. Regression for the K=3 jsonb migration: a
-    /// half-populated row would NaN the per-dimension median.
+    /// Per-dimension validation: `alu` missing, present-but-non-
+    /// numeric, NaN, ≤0 → InvalidArgument. bug_037: `membw`/`ioseq`
+    /// MAY be absent (per-dim presence carried end-to-end); a
+    /// `bench_needed=false` builder sends `{"alu":x}` only and the
+    /// scheduler's per-dim median ignores absent dims. Present dims
+    /// are still validated.
     #[tokio::test]
     async fn append_hw_perf_sample_rejects_malformed_factor() {
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
@@ -932,7 +942,7 @@ mod tests {
         for bad in [
             "not json",
             "{}",
-            r#"{"alu":1.0,"membw":1.0}"#,
+            r#"{"membw":1.0,"ioseq":1.0}"#, // alu mandatory
             r#"{"alu":1.0,"membw":"x","ioseq":1.0}"#,
             r#"{"alu":1.0,"membw":0.0,"ioseq":1.0}"#,
             r#"{"alu":-1.0,"membw":1.0,"ioseq":1.0}"#,
@@ -947,5 +957,19 @@ mod tests {
                 .expect_err(bad);
             assert_eq!(err.code(), tonic::Code::InvalidArgument, "input: {bad}");
         }
+        // Missing membw/ioseq is now valid; stored jsonb omits them.
+        svc.append_hw_perf_sample(Request::new(AppendHwPerfSampleRequest {
+            hw_class: "aws-8-ebs-hi".into(),
+            pod_id: "p-alu-only".into(),
+            factor_json: r#"{"alu":1.5}"#.into(),
+        }))
+        .await
+        .expect("alu-only is valid");
+        let stored: serde_json::Value =
+            sqlx::query_scalar("SELECT factor FROM hw_perf_samples WHERE pod_id = 'p-alu-only'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, serde_json::json!({"alu": 1.5}));
     }
 }

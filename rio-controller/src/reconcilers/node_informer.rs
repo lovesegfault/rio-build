@@ -83,14 +83,16 @@ impl HwClassConfig {
                 .iter()
                 .all(|(k, v)| labels.get(k).is_some_and(|nv| nv == v))
             {
-                // rio-store rejects hw_class > MAX_HW_CLASS_LEN. The
+                // rio-store rejects `!is_hw_class_name(hw_class)`. The
                 // operator's `$h` is the value written to
                 // `hw_perf_samples.hw_class`; a config change that
-                // exceeds the limit would silently break the builder's
-                // AppendHwPerfSample. Fail fast in tests.
+                // violates the charset would silently break the
+                // builder's AppendHwPerfSample. `SlaConfig::validate`
+                // is the load-bearing check (bug_038); this is a
+                // belt-and-suspenders fail-fast in tests.
                 debug_assert!(
-                    h.len() <= rio_common::limits::MAX_HW_CLASS_LEN,
-                    "hw_class {h:?} exceeds MAX_HW_CLASS_LEN"
+                    rio_common::limits::is_hw_class_name(h),
+                    "hw_class {h:?} fails is_hw_class_name"
                 );
                 return Some(h.clone());
             }

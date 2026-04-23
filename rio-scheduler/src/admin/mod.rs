@@ -1122,17 +1122,11 @@ impl AdminService for AdminServiceImpl {
                 r.value
             )));
         }
-        const MAX_HW_CLASS_LEN: usize = 64;
-        if r.hw_class.is_empty()
-            || r.hw_class.len() > MAX_HW_CLASS_LEN
-            || !r
-                .hw_class
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        {
+        if !rio_common::limits::is_hw_class_name(&r.hw_class) {
             return Err(Status::invalid_argument(format!(
-                "hw_class {:?} must be 1..={MAX_HW_CLASS_LEN} chars of [a-z0-9-]",
-                r.hw_class
+                "hw_class {:?} must be 1..={} chars of [a-z0-9-]",
+                r.hw_class,
+                rio_common::limits::MAX_HW_CLASS_LEN
             )));
         }
         sqlx::query(

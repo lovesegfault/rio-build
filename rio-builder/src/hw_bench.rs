@@ -25,9 +25,10 @@
 //!
 //! The full K=3 bench runs only when the controller stamps
 //! `rio.build/hw-bench-needed=true` on the pod (downward-API →
-//! `RIO_HW_BENCH_NEEDED`). Fail-closed: when unset only the scalar
-//! `alu` probe runs and `membw`/`ioseq` report `1.0`, so with
-//! default-uniform α the model degrades to scalar.
+//! `RIO_HW_BENCH_NEEDED`). When unset only the scalar `alu` probe
+//! runs and `membw`/`ioseq` are omitted (`None`); the row contributes
+//! nothing to those dimensions' fleet median (bug_037 — `1.0`
+//! placeholders dominated the median once the tenant gate opened).
 
 use std::alloc::Layout;
 use std::hint::black_box;
@@ -36,11 +37,11 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// Index order matches the jsonb keys and the per-pname mixture α.
-pub const K: usize = 3;
-pub const ALU: usize = 0;
-pub const MEMBW: usize = 1;
-pub const IOSEQ: usize = 2;
+/// `(alu, membw?, ioseq?)`. `alu` is always measured; `membw`/`ioseq`
+/// are `None` when `bench_needed=false` (or, for `ioseq`, when tmpfs
+/// rejects O_DIRECT). bug_037: per-dim presence carried end-to-end so
+/// an unmeasured dim contributes nothing to the fleet median.
+pub type HwBenchResult = (f64, Option<f64>, Option<f64>);
 
 // ─── alu probe (pointer-chase) ───────────────────────────────────────
 
@@ -279,9 +280,10 @@ pub async fn ioseq_odirect_mbps(dir: &Path, loop_bytes: u64) -> std::io::Result<
 /// (downward-API → `RIO_HW_BENCH_NEEDED`, set by the controller when
 /// any h in the intent's admissible set has <3 distinct pod_id AND
 /// `requests.memory ≥ sla.hwBenchMemFloor`). When `false` only the
-/// scalar `alu` probe runs and `membw`/`ioseq` are reported as `1.0`
-/// (the reference-class value), so with default-uniform α the model
-/// degrades to scalar — fail-closed.
+/// scalar `alu` probe runs and `membw`/`ioseq` are `None` — bug_037:
+/// the old `1.0` placeholder collided with "reference-class
+/// measurement" and dominated the cross-tenant median once the tenant
+/// gate opened, degrading K=3 to scalar at steady state.
 ///
 /// `overlay_dir` is `cfg.overlay_base_dir` (the overlays emptyDir);
 /// the ioseq probe writes there so it measures the same volume builds
@@ -289,14 +291,15 @@ pub async fn ioseq_odirect_mbps(dir: &Path, loop_bytes: u64) -> std::io::Result<
 ///
 /// Called from the resolve→bench task spawned at init
 /// (`runtime/setup.rs`), which itself runs concurrently with FUSE
-/// mount + cold-start (~30 s); the `[f64; K]` result is consumed once
-/// the first `WorkAssignment` (and its assignment token) is in hand.
+/// mount + cold-start (~30 s); the `(alu, membw?, ioseq?)` result is
+/// consumed once the first `WorkAssignment` (and its assignment
+/// token) is in hand.
 // r[impl sched.sla.hw-class.k3-bench]
 pub fn spawn_measure(
     hw_class: &str,
     bench_needed: bool,
     overlay_dir: PathBuf,
-) -> Option<tokio::task::JoinHandle<[f64; K]>> {
+) -> Option<tokio::task::JoinHandle<HwBenchResult>> {
     if hw_class.is_empty() {
         tracing::debug!("hw_bench: no hw_class (downward volume empty); skipping");
         return None;
@@ -307,32 +310,35 @@ pub fn spawn_measure(
         let alu_h = tokio::task::spawn_blocking(alu_factor);
         let ioseq = if bench_needed {
             match ioseq_odirect_mbps(&overlay_dir, IOSEQ_LOOP_BYTES).await {
-                Ok(mbps) => mbps / REF_IOSEQ_MBPS,
+                Ok(mbps) => Some(mbps / REF_IOSEQ_MBPS),
                 Err(e) => {
                     // tmpfs (some CI / VM-test fixtures) rejects
-                    // O_DIRECT with EINVAL. Fall through to 1.0 so
-                    // the alu/membw dimensions still land.
+                    // O_DIRECT with EINVAL. `None` ⇒ the row simply
+                    // doesn't contribute to ioseq's median (bug_037);
+                    // alu/membw still land.
                     tracing::warn!(error = %e, dir = %overlay_dir.display(),
-                                   "hw_bench: ioseq O_DIRECT failed; reporting 1.0");
-                    1.0
+                                   "hw_bench: ioseq O_DIRECT failed; omitting dim");
+                    None
                 }
             }
         } else {
-            1.0
+            None
         };
         let alu = alu_h.await.expect("alu spawn_blocking join");
         // membw runs ALONE after alu+ioseq: STREAM triad saturates the
         // memory bus and would contaminate the alu pointer-chase.
         let membw = if bench_needed {
             let bytes = membw_array_bytes();
-            tokio::task::spawn_blocking(move || stream_triad_gbps(bytes))
-                .await
-                .expect("membw spawn_blocking join")
-                / REF_MEMBW_GBPS
+            Some(
+                tokio::task::spawn_blocking(move || stream_triad_gbps(bytes))
+                    .await
+                    .expect("membw spawn_blocking join")
+                    / REF_MEMBW_GBPS,
+            )
         } else {
-            1.0
+            None
         };
-        [alu, membw, ioseq]
+        (alu, membw, ioseq)
     }))
 }
 
@@ -342,7 +348,11 @@ pub fn spawn_measure(
 ///
 /// `factor` is the already-awaited result of [`spawn_measure`]; the
 /// caller (`spawn_build_task`) awaits the spawned resolve→bench task
-/// and passes the `[f64; K]` here.
+/// and passes the `(alu, membw?, ioseq?)` tuple here. `None` dims are
+/// omitted from the JSON (bug_037: per-dim presence carried
+/// end-to-end so unmeasured dims contribute nothing to the median,
+/// instead of a `1.0` placeholder that drags the fleet median to
+/// reference).
 ///
 /// **Why deferred until an assignment token is in hand:** the store
 /// gates `AppendHwPerfSample` on `x-rio-assignment-token` and derives
@@ -354,15 +364,19 @@ pub async fn send(
     store: &mut rio_proto::StoreServiceClient<tonic::transport::Channel>,
     hw_class: &str,
     pod_id: &str,
-    factor: [f64; K],
+    factor: HwBenchResult,
     assignment_token: &str,
 ) {
-    let factor_json = serde_json::json!({
-        "alu": factor[ALU],
-        "membw": factor[MEMBW],
-        "ioseq": factor[IOSEQ],
-    })
-    .to_string();
+    let (alu, membw, ioseq) = factor;
+    let mut m = serde_json::Map::new();
+    m.insert("alu".into(), alu.into());
+    if let Some(v) = membw {
+        m.insert("membw".into(), v.into());
+    }
+    if let Some(v) = ioseq {
+        m.insert("ioseq".into(), v.into());
+    }
+    let factor_json = serde_json::Value::Object(m).to_string();
     tracing::info!(%hw_class, %pod_id, %factor_json, "hw_bench: measured");
     let mut req = tonic::Request::new(rio_proto::types::AppendHwPerfSampleRequest {
         hw_class: hw_class.to_owned(),
@@ -497,23 +511,29 @@ mod tests {
         unsafe { std::env::set_var("RIO_HW_BENCH_MEMBW_BYTES", "67108864") };
         let dir = tempfile::tempdir().unwrap();
         let h = spawn_measure("test-hw", true, dir.path().to_path_buf()).unwrap();
-        let v = h.await.unwrap();
-        assert_eq!(v.len(), K);
-        for (d, &f) in v.iter().enumerate() {
-            assert!(f.is_finite() && f > 0.0, "factor[{d}]={f}");
+        let (alu, membw, ioseq) = h.await.unwrap();
+        assert!(alu.is_finite() && alu > 0.0, "alu={alu}");
+        // membw always Some when bench_needed; ioseq may be None on
+        // tmpfs (O_DIRECT EINVAL) — both must be finite-positive when
+        // present.
+        let membw = membw.expect("bench_needed=true ⇒ membw measured");
+        assert!(membw.is_finite() && membw > 0.0, "membw={membw}");
+        if let Some(ioseq) = ioseq {
+            assert!(ioseq.is_finite() && ioseq > 0.0, "ioseq={ioseq}");
         }
     }
 
-    /// Fail-closed: `bench_needed=false` → only alu runs; membw/ioseq
-    /// report exactly 1.0 (reference-class value).
+    /// `bench_needed=false` → only alu runs; membw/ioseq are `None`
+    /// (bug_037: NOT a `1.0` placeholder — that collided with
+    /// "reference-class measurement" and dragged the fleet median).
     // r[verify sched.sla.hw-class.k3-bench]
     #[tokio::test(flavor = "multi_thread")]
     async fn spawn_measure_scalar_only_when_not_needed() {
         let h = spawn_measure("test-hw", false, std::env::temp_dir()).unwrap();
-        let v = h.await.unwrap();
-        assert!(v[ALU].is_finite() && v[ALU] > 0.0);
-        assert_eq!(v[MEMBW], 1.0);
-        assert_eq!(v[IOSEQ], 1.0);
+        let (alu, membw, ioseq) = h.await.unwrap();
+        assert!(alu.is_finite() && alu > 0.0);
+        assert_eq!(membw, None);
+        assert_eq!(ioseq, None);
     }
 
     /// Empty hw_class → `None` (no row written).

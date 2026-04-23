@@ -49,7 +49,11 @@ pub(crate) const HW_MIN_PODS: u32 = 3;
 /// rather than a struct so per-dimension reductions stay `for d in 0..K`.
 pub const K: usize = 3;
 
-/// One `hw_perf_samples` row, jsonb `factor` parsed to `[f64; K]`.
+/// One `hw_perf_samples` row, jsonb `factor` parsed to per-dimension
+/// `Option<f64>`. `None` ⇔ key absent in the jsonb (bug_037: per-dim
+/// presence carried end-to-end so a `bench_needed=false` row
+/// contributes nothing to membw/ioseq medians, instead of a `1.0`
+/// placeholder that drags the fleet median to reference).
 /// `submitting_tenant` is `None` for pre-M_054 rows and for builders
 /// without a tenant context (e.g. probe pods).
 #[derive(Debug, Clone)]
@@ -57,7 +61,7 @@ pub struct HwPerfSampleRow {
     pub hw_class: String,
     pub pod_id: String,
     pub submitting_tenant: Option<String>,
-    pub factor: [f64; K],
+    pub factor: [Option<f64>; K],
 }
 
 /// Aggregated per-hw_class factor: K=3 vector + distinct-pod count.
@@ -188,8 +192,9 @@ impl HwTable {
     /// [`Self::distinct_pod_ids`] reports the count.
     // r[impl sched.sla.threat.hw-median-of-medians]
     pub fn aggregate(rows: &[HwPerfSampleRow]) -> HashMap<String, HwFactor> {
-        // hw_class → submitting_tenant → Vec<[f64;K]>
-        let mut by_class: HashMap<String, HashMap<Option<String>, Vec<[f64; K]>>> = HashMap::new();
+        // hw_class → submitting_tenant → Vec<[Option<f64>;K]>
+        type ByTenant = HashMap<Option<String>, Vec<[Option<f64>; K]>>;
+        let mut by_class: HashMap<String, ByTenant> = HashMap::new();
         // hw_class → distinct pod_ids
         let mut pods: HashMap<String, HashSet<String>> = HashMap::new();
         for r in rows {
@@ -216,8 +221,9 @@ impl HwTable {
 
     /// Snapshot `hw_perf_samples` (7-day window, mirroring the dropped
     /// `hw_perf_factors` view's recency filter) and [`Self::aggregate`].
-    /// Legacy scalar rows (pre-M_054 backfill `{"alu": <f64>}`) default
-    /// `membw`/`ioseq` to 1.0.
+    /// Legacy scalar rows (pre-M_054 backfill `{"alu": <f64>}`) and
+    /// `bench_needed=false` rows parse `membw`/`ioseq` as `None` —
+    /// they contribute nothing to those dims' median (bug_037).
     pub async fn load(db: &SchedulerDb) -> anyhow::Result<Self> {
         let raw: Vec<(String, String, Option<String>, serde_json::Value)> = sqlx::query_as(
             "SELECT hw_class, pod_id, submitting_tenant, factor \
@@ -312,62 +318,82 @@ impl HwTable {
 /// `min_tenants` is a parameter (not a const reference) so a new
 /// median-of-medians consumer (e.g. §13b's per-cell bias table) can't
 /// silently skip the gate — the type forces them to supply a value.
+///
+/// **Per-dim presence (bug_037):** input rows carry `[Option<f64>; K]`;
+/// the per-tenant MAD-median and the cross-tenant median both operate
+/// per-dimension over the rows where that dim is `Some`. A tenant with
+/// zero `membw` rows contributes nothing to membw's fleet median (it
+/// is NOT a `1.0` rank). The `None → 1.0` fallback applies ONLY here
+/// at the final aggregate step, when zero tenants have that dim — at
+/// which point the fleet has no information and `1.0` (pass-through)
+/// is the bias-neutral choice. The pod/tenant gates stay per-row.
 pub(super) fn cross_tenant_median(
-    by_tenant: &HashMap<Option<String>, Vec<[f64; K]>>,
+    by_tenant: &HashMap<Option<String>, Vec<[Option<f64>; K]>>,
     n_pods: u32,
     min_tenants: usize,
 ) -> [f64; K] {
     if n_pods < HW_MIN_PODS || by_tenant.len() < min_tenants {
         return [1.0; K];
     }
-    let tenant_medians: Vec<[f64; K]> = by_tenant.values().map(|v| mad_reject_median(v)).collect();
-    let mut m = per_dim_median(&tenant_medians);
-    for d in &mut m {
-        *d = d.clamp(HW_FACTOR_SANITY_FLOOR, HW_FACTOR_SANITY_CEIL);
-    }
-    m
+    let tenant_medians: Vec<[Option<f64>; K]> =
+        by_tenant.values().map(|v| mad_reject_median(v)).collect();
+    per_dim_median(&tenant_medians).map(|d| {
+        d.unwrap_or(1.0)
+            .clamp(HW_FACTOR_SANITY_FLOOR, HW_FACTOR_SANITY_CEIL)
+    })
 }
 
-/// jsonb `{"alu":a,"membw":b,"ioseq":c}` → `[a,b,c]`. Missing keys
-/// default to 1.0 (legacy scalar rows have only `alu` after M_054's
-/// `USING jsonb_build_object('alu', factor)`).
-fn parse_factor(j: &serde_json::Value) -> [f64; K] {
-    let get = |k: &str| j.get(k).and_then(serde_json::Value::as_f64).unwrap_or(1.0);
+/// jsonb `{"alu":a,"membw":b,"ioseq":c}` → `[Some(a),Some(b),Some(c)]`.
+/// Missing keys → `None` (bug_037: NOT `1.0` — that's a sentinel
+/// collision with "reference-class measurement"). Legacy scalar rows
+/// (M_054's `USING jsonb_build_object('alu', factor)`) and
+/// `bench_needed=false` rows both yield `[Some(alu), None, None]`.
+fn parse_factor(j: &serde_json::Value) -> [Option<f64>; K] {
+    let get = |k: &str| j.get(k).and_then(serde_json::Value::as_f64);
     [get("alu"), get("membw"), get("ioseq")]
 }
 
-/// Per-dimension median of `v`. Upper-middle for even `n` (matches
-/// `cost::interrupt_rate`'s convention). Empty → `[1.0; K]`.
-fn per_dim_median(v: &[[f64; K]]) -> [f64; K] {
-    if v.is_empty() {
-        return [1.0; K];
-    }
-    let mut out = [0.0; K];
-    for (d, slot) in out.iter_mut().enumerate() {
-        let mut xs: Vec<f64> = v.iter().map(|r| r[d]).collect();
+/// Per-dimension median over the rows where that dim is `Some`.
+/// Upper-middle for even `n` (matches `cost::interrupt_rate`'s
+/// convention). `None` when zero rows have dim `d` — the caller
+/// decides the fallback.
+fn per_dim_median(v: &[[Option<f64>; K]]) -> [Option<f64>; K] {
+    std::array::from_fn(|d| {
+        let mut xs: Vec<f64> = v.iter().filter_map(|r| r[d]).collect();
+        if xs.is_empty() {
+            return None;
+        }
         xs.sort_by(f64::total_cmp);
-        *slot = xs[xs.len() / 2];
-    }
-    out
+        Some(xs[xs.len() / 2])
+    })
 }
 
 /// Per-dimension 3·MAD outlier reject, then [`per_dim_median`] of
-/// survivors. A row is rejected if **any** dimension's `|x − med| >
-/// 3·1.4826·MAD` (a poisoned bench result poisons the whole vector).
-/// `MAD == 0` → no rejection on that dimension.
-fn mad_reject_median(v: &[[f64; K]]) -> [f64; K] {
+/// survivors. A row is rejected if **any** measured dimension's
+/// `|x − med| > 3·1.4826·MAD` (a poisoned bench result poisons the
+/// whole vector). A row's `None` dim is not an outlier (unmeasured ≠
+/// out-of-band) and never triggers rejection. `MAD == 0` / `med =
+/// None` → no rejection on that dimension.
+fn mad_reject_median(v: &[[Option<f64>; K]]) -> [Option<f64>; K] {
     let med = per_dim_median(v);
-    let mad: [f64; K] = {
-        let dev: Vec<[f64; K]> = v
+    let mad: [Option<f64>; K] = {
+        let dev: Vec<[Option<f64>; K]> = v
             .iter()
-            .map(|r| std::array::from_fn(|d| (r[d] - med[d]).abs()))
+            .map(|r| std::array::from_fn(|d| Some((r[d]? - med[d]?).abs())))
             .collect();
         per_dim_median(&dev)
     };
-    let kept: Vec<[f64; K]> = v
+    let kept: Vec<[Option<f64>; K]> = v
         .iter()
         .copied()
-        .filter(|r| (0..K).all(|d| mad[d] == 0.0 || (r[d] - med[d]).abs() <= 3.0 * 1.4826 * mad[d]))
+        .filter(|r| {
+            (0..K).all(|d| match (r[d], med[d], mad[d]) {
+                (Some(x), Some(m), Some(mad_d)) if mad_d != 0.0 => {
+                    (x - m).abs() <= 3.0 * 1.4826 * mad_d
+                }
+                _ => true,
+            })
+        })
         .collect();
     per_dim_median(if kept.is_empty() { v } else { &kept })
 }
@@ -385,8 +411,13 @@ mod tests {
             hw_class: hw.into(),
             pod_id: pod.into(),
             submitting_tenant: tenant.map(String::from),
-            factor: [alu, 1.0, 1.0],
+            factor: [Some(alu), Some(1.0), Some(1.0)],
         }
+    }
+
+    /// Shorthand: all-K-present row.
+    const fn s(v: [f64; K]) -> [Option<f64>; K] {
+        [Some(v[0]), Some(v[1]), Some(v[2])]
     }
 
     #[test]
@@ -529,9 +560,9 @@ mod tests {
     /// `min_tenants` is a parameter so the caller MUST supply it.
     #[test]
     fn cross_tenant_median_gates_directly() {
-        let mut by_tenant: HashMap<Option<String>, Vec<[f64; K]>> = HashMap::new();
+        let mut by_tenant: HashMap<Option<String>, Vec<[Option<f64>; K]>> = HashMap::new();
         for t in 0..5 {
-            by_tenant.insert(Some(format!("t{t}")), vec![[1.5, 1.0, 1.0]]);
+            by_tenant.insert(Some(format!("t{t}")), vec![s([1.5, 1.0, 1.0])]);
         }
         // Both gates pass → median.
         assert_eq!(cross_tenant_median(&by_tenant, 5, 5), [1.5, 1.0, 1.0]);
@@ -540,15 +571,44 @@ mod tests {
         // Tenant gate trips (caller asked for 6).
         assert_eq!(cross_tenant_median(&by_tenant, 5, 6), [1.0; K]);
         // Clamp applies post-median.
-        let mut huge: HashMap<Option<String>, Vec<[f64; K]>> = HashMap::new();
+        let mut huge: HashMap<Option<String>, Vec<[Option<f64>; K]>> = HashMap::new();
         for t in 0..5 {
-            huge.insert(Some(format!("t{t}")), vec![[1e6, 1.0, 1.0]]);
+            huge.insert(Some(format!("t{t}")), vec![s([1e6, 1.0, 1.0])]);
         }
         assert_eq!(
             cross_tenant_median(&huge, 5, 5)[0],
             HW_FACTOR_SANITY_CEIL,
             "chokepoint clamp"
         );
+    }
+
+    /// bug_037: 1 tenant with a real `membw=2.0` measurement + 4
+    /// tenants with `membw=None` (`bench_needed=false` /
+    /// O_DIRECT-EINVAL) → `factor[membw] == 2.0`, NOT 1.0. Before, the
+    /// 4 `1.0` placeholders out-ranked the one real measurement and
+    /// the fleet median converged to reference (K=3 → scalar). Now the
+    /// `None` rows contribute nothing to membw's per-dim median; the
+    /// one `Some(2.0)` tenant IS the membw fleet median. The pod/
+    /// tenant gates stay per-row (5 tenants, 5 pods → both pass).
+    #[test]
+    fn placeholder_free_membw_median() {
+        let mut by_tenant: HashMap<Option<String>, Vec<[Option<f64>; K]>> = HashMap::new();
+        by_tenant.insert(Some("t0".into()), vec![[Some(1.0), Some(2.0), Some(1.5)]]);
+        for t in 1..5 {
+            // alu-only rows (`bench_needed=false` shape).
+            by_tenant.insert(Some(format!("t{t}")), vec![[Some(1.0), None, None]]);
+        }
+        let m = cross_tenant_median(&by_tenant, 5, 5);
+        assert_eq!(m[0], 1.0, "alu: 5 tenants at 1.0");
+        assert_eq!(m[1], 2.0, "membw: 1 tenant Some(2.0), 4 None → 2.0 not 1.0");
+        assert_eq!(m[2], 1.5, "ioseq: 1 tenant Some(1.5), 4 None → 1.5");
+        // Zero tenants have a dim → 1.0 fallback at the FINAL step.
+        let mut none_membw: HashMap<Option<String>, Vec<[Option<f64>; K]>> = HashMap::new();
+        for t in 0..5 {
+            none_membw.insert(Some(format!("t{t}")), vec![[Some(1.3), None, Some(1.0)]]);
+        }
+        let m = cross_tenant_median(&none_membw, 5, 5);
+        assert_eq!(m, [1.3, 1.0, 1.0], "membw: zero observations → 1.0");
     }
 
     /// Aggregate floor: <3 distinct pods → `factor := [1.0; K]` but the
@@ -567,37 +627,49 @@ mod tests {
         assert_eq!(t.distinct_pod_ids("absent"), 0);
     }
 
-    /// Legacy `{"alu": x}` rows default `membw`/`ioseq` to 1.0.
+    /// Legacy `{"alu": x}` rows / `bench_needed=false` rows yield
+    /// `None` for absent dims (bug_037: NOT a `1.0` placeholder).
     #[test]
-    fn parse_factor_defaults_missing_dims() {
+    fn parse_factor_absent_dims_are_none() {
         assert_eq!(
             parse_factor(&serde_json::json!({"alu": 2.0})),
-            [2.0, 1.0, 1.0]
+            [Some(2.0), None, None]
         );
         assert_eq!(
             parse_factor(&serde_json::json!({"alu": 0.5, "membw": 0.8, "ioseq": 1.2})),
-            [0.5, 0.8, 1.2]
+            [Some(0.5), Some(0.8), Some(1.2)]
         );
-        assert_eq!(parse_factor(&serde_json::json!({})), [1.0, 1.0, 1.0]);
+        assert_eq!(parse_factor(&serde_json::json!({})), [None; K]);
     }
 
     /// MAD-reject discards a single per-tenant outlier before the
     /// tenant-median is taken; the cross-tenant median then ignores
-    /// the outlier entirely.
+    /// the outlier entirely. A row's `None` dim never triggers
+    /// rejection (unmeasured ≠ out-of-band).
     #[test]
     fn mad_reject_discards_tenant_outlier() {
         let v = [
-            [1.0, 1.0, 1.0],
-            [1.1, 1.0, 1.0],
-            [0.9, 1.0, 1.0],
-            [1.05, 1.0, 1.0],
-            [50.0, 1.0, 1.0],
+            s([1.0, 1.0, 1.0]),
+            s([1.1, 1.0, 1.0]),
+            s([0.9, 1.0, 1.0]),
+            s([1.05, 1.0, 1.0]),
+            s([50.0, 1.0, 1.0]),
         ];
         let m = mad_reject_median(&v);
         assert!(
-            (m[0] - 1.05).abs() < 0.2,
+            (m[0].unwrap() - 1.05).abs() < 0.2,
             "outlier 50.0 rejected, got {m:?}"
         );
+        // None dim doesn't trigger rejection: alu-only row at 1.0
+        // survives the MAD pass even though membw/ioseq are absent.
+        let mixed = [
+            [Some(1.0), None, None],
+            s([1.1, 2.0, 2.0]),
+            s([0.9, 2.0, 2.0]),
+        ];
+        let m = mad_reject_median(&mixed);
+        assert_eq!(m[0], Some(1.0), "None-dim row not rejected");
+        assert_eq!(m[1], Some(2.0));
     }
 
     /// ADR-023 §Threat-model gap (b) raised the floor 2→5: with 2

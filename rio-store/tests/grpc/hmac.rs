@@ -665,10 +665,10 @@ async fn append_hw_perf_sample_tenant_from_claims() -> TestResult {
     Ok(())
 }
 
-/// `factor_json` is parsed, validated, then REBUILT from the three
+/// `factor_json` is parsed, validated, then REBUILT from the present
 /// scalars. Extra keys / padding in the body never reach PG — the
-/// stored jsonb is exactly `{alu, membw, ioseq}`. A 4MB body padding
-/// would otherwise land verbatim in `hw_perf_samples.factor`.
+/// stored jsonb is exactly `{alu[, membw][, ioseq]}`. A 4MB body
+/// padding would otherwise land verbatim in `hw_perf_samples.factor`.
 // r[verify sched.sla.hw-bench-append-only]
 #[tokio::test]
 async fn append_hw_perf_sample_factor_json_extra_keys_stripped() -> TestResult {

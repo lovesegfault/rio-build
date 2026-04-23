@@ -100,7 +100,7 @@ pub async fn setup(
             None => crate::hw_class::resolve().await.unwrap_or_default(),
         };
         // Flatten: await the K=3 bench handle inside this task so the
-        // consumer sees one JoinHandle<(String, Option<[f64; K]>)>.
+        // consumer sees one JoinHandle<(String, Option<(alu, membw?, ioseq?)>)>.
         let factor = match crate::hw_bench::spawn_measure(&hw_class, hw_bench_needed, overlay_dir) {
             Some(h) => h.await.ok(),
             None => None,

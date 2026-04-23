@@ -68,9 +68,14 @@ pub fn is_stale_assignment(assignment_gen: u64, latest_observed: u64) -> bool {
 /// `BuildSpawnContext::hw_bench` payload: the spawned resolve→bench
 /// task's handle. Yields `(hw_class, factor)` — `hw_class` is empty if
 /// the resolver expired (annotator dead / non-k8s); `factor` is `None`
-/// if `hw_class` was empty (bench skipped) or the bench panicked.
+/// if `hw_class` was empty (bench skipped) or the bench panicked. The
+/// inner tuple is `(alu, membw?, ioseq?)`: per-dim presence so an
+/// unmeasured dimension contributes nothing to the fleet median
+/// (bug_037).
 pub type HwBenchHandle = Arc<
-    std::sync::Mutex<Option<tokio::task::JoinHandle<(String, Option<[f64; crate::hw_bench::K]>)>>>,
+    std::sync::Mutex<
+        Option<tokio::task::JoinHandle<(String, Option<crate::hw_bench::HwBenchResult>)>>,
+    >,
 >;
 
 /// Shared context for spawning build tasks.
