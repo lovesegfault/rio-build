@@ -89,16 +89,31 @@ impl DagActor {
         // (pname, system, tenant) keys. Log-and-keep-stale on PG
         // failure; the cache holds the previous fit. The tier ladder
         // feeds the Schmitt-trigger reassignment inside refit.
-        match self.sla_estimator.refresh(&self.db, &self.sla_tiers).await {
-            Ok(n) => debug!(keys_refit = n, "sla estimator refreshed"),
+        // `on_evict` propagates LRU eviction to `solve_cache` so the
+        // memo's bound (|live keys| × |overrides|) actually holds.
+        let solve_cache = Arc::clone(&self.solve_cache);
+        match self
+            .sla_estimator
+            .refresh(&self.db, &self.sla_tiers, |k| {
+                solve_cache.remove_model_key(crate::sla::solve::model_key_hash(k))
+            })
+            .await
+        {
+            Ok((n, hw_changed)) => {
+                debug!(keys_refit = n, hw_changed, "sla estimator refreshed");
+                // ADR-023 L616: HwTable is a shared solve input. Bump on
+                // CONTENT change only — an unconditional bump re-rolls
+                // ε_h every 60s (selector-drift reap before Karpenter
+                // provisions). CostTable bumps live in
+                // `spot_price_poller` / `interrupt_housekeeping`.
+                if hw_changed {
+                    self.solve_cache.bump_inputs_gen();
+                }
+            }
             Err(e) => {
                 warn!(error = %e, "sla estimator refresh failed; keeping previous fits");
             }
         }
-        // ADR-023 L616: HwTable refresh (inside `sla_estimator.refresh`)
-        // is a shared solve input — invalidate the per-key memo. The
-        // CostTable poller bumps separately on its own 10min cadence.
-        self.solve_cache.bump_inputs_gen();
 
         // Full critical-path sweep (same 60s cadence). Belt-and-
         // suspenders over the incremental update_ancestors calls: any

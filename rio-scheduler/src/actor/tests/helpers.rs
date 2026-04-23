@@ -898,10 +898,11 @@ pub(crate) fn test_hw_sla_config() -> crate::sla::config::SlaConfig {
     cfg
 }
 
-/// Seed one fitted Amdahl key (`S=30, P=2000`) on `actor`.
-pub(crate) fn seed_fit(actor: &DagActor, pname: &str) {
+/// One fitted Amdahl key (`S=30, P=2000`) for `pname`. Pair with
+/// [`seed_fit`] or `sla_estimator.insert(..)` directly.
+pub(crate) fn make_fit(pname: &str) -> crate::sla::types::FittedParams {
     use crate::sla::types::*;
-    actor.sla_estimator.seed(FittedParams {
+    FittedParams {
         key: ModelKey {
             pname: pname.into(),
             system: "x86_64-linux".into(),
@@ -935,7 +936,12 @@ pub(crate) fn seed_fit(actor: &DagActor, pname: &str) {
         alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
         is_fod: false,
-    });
+    }
+}
+
+/// Seed one fitted Amdahl key (`S=30, P=2000`) on `actor`.
+pub(crate) fn seed_fit(actor: &DagActor, pname: &str) {
+    actor.sla_estimator.seed(make_fit(pname));
 }
 
 /// Bare (unspawned) actor with [`test_hw_sla_config`] + populated

@@ -3504,3 +3504,114 @@ async fn walk_closure_hostile_refs_bounds_memory() -> TestResult {
     );
     Ok(())
 }
+
+/// merged_bug_017: SolveCache is keyed on `model_key_hash` and bounded
+/// by "|live SlaEstimator keys| × |overrides|" — but the bound only
+/// holds if LRU eviction propagates. Without the `on_evict` hook, the
+/// solve_cache entry for an evicted fit is orphaned forever
+/// (`solve_intent_for` short-circuits on `cached(k) == None` before
+/// reaching `get_or_insert_with`).
+#[tokio::test]
+async fn solve_cache_evicted_with_lru() {
+    use crate::sla::solve::model_key_hash;
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut cfg = test_hw_sla_config();
+    cfg.max_keys_per_tenant = 3;
+    let mut actor = bare_actor_cfg(
+        db.pool.clone(),
+        DagActorConfig {
+            sla: cfg,
+            ..Default::default()
+        },
+    );
+    actor.sla_tiers = actor.sla_config.solve_tiers();
+    actor.sla_ceilings = actor.sla_config.ceilings();
+    let mut m = std::collections::HashMap::new();
+    m.insert("intel-6".into(), 1.0);
+    m.insert("intel-7".into(), 1.4);
+    m.insert("intel-8".into(), 2.0);
+    actor
+        .sla_estimator
+        .seed_hw(crate::sla::hw::HwTable::from_map(m));
+
+    // Fill LRU to cap and populate solve_cache for each.
+    for p in ["p0", "p1", "p2"] {
+        seed_fit(&actor, p);
+        actor.test_inject_ready(p, Some(p), "x86_64-linux", false);
+        let _ = actor.solve_intent_for(actor.dag.node(p).unwrap());
+    }
+    assert_eq!(actor.solve_cache.len(), 3, "solve_cache one per fit");
+
+    // cap+1 insert via the SAME `on_evict` wiring `maybe_refresh_estimator`
+    // uses (housekeeping.rs). LRU evicts the least-recently-used fit;
+    // solve_cache must drop its memo.
+    let solve_cache = std::sync::Arc::clone(&actor.solve_cache);
+    let p3 = make_fit("p3");
+    actor.sla_estimator.insert(&p3.key.clone(), p3, |k| {
+        solve_cache.remove_model_key(model_key_hash(k))
+    });
+    assert_eq!(
+        actor.solve_cache.len(),
+        2,
+        "evicted ModelKey's solve_cache entry dropped via on_evict"
+    );
+
+    // Steady-state: solving for the surviving fits + p3 stays ≤ cap.
+    seed_fit(&actor, "p3");
+    actor.test_inject_ready("p3", Some("p3"), "x86_64-linux", false);
+    let _ = actor.solve_intent_for(actor.dag.node("p3").unwrap());
+    assert!(
+        actor.solve_cache.len() <= 3,
+        "solve_cache bounded by max_keys_per_tenant"
+    );
+}
+
+/// merged_bug_028: `bump_inputs_gen()` was unconditional every 60s, so
+/// ε_h re-rolled before Karpenter could provision an explore node. The
+/// fix: `refresh()` returns `hw_table_changed` and the actor bumps only
+/// then. This drives `refresh()` directly with the housekeeping wiring
+/// and asserts `inputs_gen` is stable across no-op refreshes.
+// r[verify sched.sla.hw-class.epsilon-explore+2]
+#[tokio::test]
+async fn inputs_gen_stable_across_noop_refresh() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let sdb = SchedulerDb::new(db.pool.clone());
+    let est = crate::sla::SlaEstimator::for_test(&test_hw_sla_config());
+    let solve_cache = std::sync::Arc::new(crate::sla::solve::SolveCache::default());
+
+    // 10 refreshes, no hw_perf rows → hw_changed=false → inputs_gen
+    // stays at 0.
+    for i in 0..10 {
+        let (_, hw_changed) = est.refresh(&sdb, &[], |_| {}).await?;
+        assert!(!hw_changed, "tick {i}: empty hw_perf_samples → no change");
+        if hw_changed {
+            solve_cache.bump_inputs_gen();
+        }
+    }
+    assert_eq!(
+        solve_cache.inputs_gen(),
+        0,
+        "no-op refresh must NOT bump inputs_gen"
+    );
+
+    // Insert one hw_perf row → content_hash changes → next refresh
+    // bumps. (One row → entry kept as ([1.0;K], pod_ids=1) — gated to
+    // pass-through but still a content change.)
+    sqlx::query(
+        "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) \
+         VALUES ('intel-7', 'pod-a', '{\"alu\":1.4}')",
+    )
+    .execute(&db.pool)
+    .await?;
+    let (_, hw_changed) = est.refresh(&sdb, &[], |_| {}).await?;
+    assert!(hw_changed, "new hw_perf row → content_hash changed");
+    if hw_changed {
+        solve_cache.bump_inputs_gen();
+    }
+    assert_eq!(solve_cache.inputs_gen(), 1, "bumped exactly once");
+
+    // Idempotent: same row, no further inserts → next refresh is no-op.
+    let (_, hw_changed) = est.refresh(&sdb, &[], |_| {}).await?;
+    assert!(!hw_changed, "stable hw_perf_samples → no change");
+    Ok(())
+}

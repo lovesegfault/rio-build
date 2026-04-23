@@ -438,26 +438,40 @@ impl SlaEstimator {
     }
 
     /// Insert/replace one fit, creating the per-tenant LRU on first
-    /// sight. Evicts the tenant's least-recently-used key if at cap.
-    fn insert(&self, key: &types::ModelKey, fit: types::FittedParams) {
+    /// sight. Evicts the tenant's least-recently-used key if at cap;
+    /// `on_evict` receives the evicted key so the caller can drop the
+    /// paired [`solve::SolveCache`] entry (the bound there is "live
+    /// SlaEstimator keys × overrides" — only holds if eviction here
+    /// propagates).
+    pub(crate) fn insert(
+        &self,
+        key: &types::ModelKey,
+        fit: types::FittedParams,
+        on_evict: impl FnOnce(&types::ModelKey),
+    ) {
         let mut cache = self.cache.write();
         let lru = cache
             .entry(key.tenant.clone())
             .or_insert_with(|| LruCache::new(self.max_keys_per_tenant));
         let k = (key.pname.clone(), key.system.clone());
         // r[impl sched.sla.threat.corpus-clamp+2]
-        // Emitted BEFORE put: at-cap + key-absent ⇔ this insert evicts.
-        // `LruCache::put`'s return is the OLD value of the same key on
-        // overwrite (not the evicted entry), so checking the return
-        // would mis-count overwrites as evictions.
-        if lru.len() >= self.max_keys_per_tenant.get() && !lru.contains(&k) {
+        // `LruCache::push` (unlike `put`) returns the EVICTED entry, so
+        // an at-cap insert and an in-place overwrite are distinguishable
+        // by `evicted_k != k`.
+        if let Some((evicted_k, _)) = lru.push(k.clone(), fit)
+            && evicted_k != k
+        {
             ::metrics::counter!(
                 "rio_scheduler_sla_keys_evicted_total",
                 "tenant" => key.tenant.clone()
             )
             .increment(1);
+            on_evict(&types::ModelKey {
+                pname: evicted_k.0,
+                system: evicted_k.1,
+                tenant: key.tenant.clone(),
+            });
         }
-        lru.put(k, fit);
     }
 
     /// `T_min` (**ref-seconds**, hw-normalized — NOT wall-clock) for
@@ -517,7 +531,7 @@ impl SlaEstimator {
     #[cfg(test)]
     pub fn seed(&self, fit: types::FittedParams) {
         let key = fit.key.clone();
-        self.insert(&key, fit);
+        self.insert(&key, fit, |_| {});
     }
 
     /// Test constructor: `[sla]`-configured estimator without touching
@@ -545,7 +559,12 @@ impl SlaEstimator {
 
     /// Pull samples completed since the last tick, refit each touched
     /// key from its `ring_buffer` most-recent rows, swap into the cache.
-    /// Returns the number of keys refit.
+    /// Returns `(n_refit, hw_table_changed)`: `hw_table_changed` is true
+    /// iff the [`hw::HwTable`] reload produced a content-hash different
+    /// from the previous snapshot — caller bumps
+    /// [`solve::SolveCache::bump_inputs_gen`] only then (an
+    /// unconditional bump re-rolls ε_h every 60s, so explore Jobs are
+    /// reaped before Karpenter provisions).
     ///
     /// The incremental query and the per-key reads are separate round-
     /// trips: incremental tells us *which* keys moved (cheap, indexed
@@ -555,8 +574,15 @@ impl SlaEstimator {
     ///
     /// `tiers` (sorted tightest-first, as from
     /// [`config::SlaConfig::solve_tiers`]) feeds the Schmitt-trigger tier
-    /// reassignment; empty → tier reassignment is a no-op.
-    pub async fn refresh(&self, db: &SchedulerDb, tiers: &[solve::Tier]) -> anyhow::Result<usize> {
+    /// reassignment; empty → tier reassignment is a no-op. `on_evict`
+    /// fires for each LRU-evicted key so the caller can drop the paired
+    /// [`solve::SolveCache`] entry.
+    pub async fn refresh(
+        &self,
+        db: &SchedulerDb,
+        tiers: &[solve::Tier],
+        on_evict: impl Fn(&types::ModelKey),
+    ) -> anyhow::Result<(usize, bool)> {
         // Override snapshot first: cheap (operator-written, tens of
         // rows) and independent of the sample refit, so a PG blip on
         // the heavier incremental query below still leaves the override
@@ -569,11 +595,13 @@ impl SlaEstimator {
         // Hw factor table: same cheap-and-independent treatment as
         // overrides (a few dozen rows from a view). Failure → keep
         // previous; an empty table is factor=1.0 everywhere.
+        let hw_before = self.hw.read().content_hash();
         match hw::HwTable::load(db).await {
             Ok(t) => self.apply_hw(t),
             Err(e) => tracing::warn!(error = %e, "sla hw-table refresh failed; keeping previous"),
         }
         let hw_snapshot = self.hw.read().clone();
+        let hw_changed = hw_snapshot.content_hash() != hw_before;
         let priors_snapshot = self.priors.read().clone();
 
         let since = *self.last_tick.read();
@@ -687,7 +715,7 @@ impl SlaEstimator {
                 &hw_snapshot,
                 Some(&priors_snapshot),
             );
-            self.insert(key, fit);
+            self.insert(key, fit, |k| on_evict(k));
         }
 
         // Persist outlier flags BEFORE advancing `hwm`. NOT best-effort:
@@ -752,7 +780,7 @@ impl SlaEstimator {
         self.priors.write().fleet =
             prior::fleet_median(&coupled, FLEET_MEDIAN_MIN_KEYS, FLEET_MEDIAN_MIN_TENANTS);
 
-        Ok(touched.len())
+        Ok((touched.len(), hw_changed))
     }
 }
 

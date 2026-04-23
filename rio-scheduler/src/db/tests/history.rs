@@ -294,7 +294,7 @@ async fn test_sla_estimator_incremental_refresh() -> anyhow::Result<()> {
         .await?;
 
     let est = SlaEstimator::new(&crate::sla::config::SlaConfig::test_default());
-    let n = est.refresh(&db, &[]).await?;
+    let (n, _) = est.refresh(&db, &[], |_| {}).await?;
     assert_eq!(n, 1, "one (pname,system,tenant) key touched");
 
     let key = ModelKey {
@@ -313,7 +313,7 @@ async fn test_sla_estimator_incremental_refresh() -> anyhow::Result<()> {
     assert_eq!(f.explore.distinct_c, 5, "outlier row excluded");
 
     // Incremental: no new writes → high-water-mark holds → zero refits.
-    let n2 = est.refresh(&db, &[]).await?;
+    let (n2, _) = est.refresh(&db, &[], |_| {}).await?;
     assert_eq!(n2, 0, "second refresh with no new rows is a no-op");
 
     // read_build_samples_for_key returns ASC (oldest first → last is
@@ -696,7 +696,7 @@ async fn test_refresh_outlier_gate_normalizes_hw_class() -> anyhow::Result<()> {
     // Control: genuine 10× outlier on ref hw.
     db.write_build_sample(&row(16.0, 1550.0, "ref")).await?;
 
-    est.refresh(&db, &[]).await?;
+    est.refresh(&db, &[], |_| {}).await?;
 
     // Precondition: HwTable loaded both classes (the gate is the test
     // subject; don't let a view-shape mismatch silently degrade to

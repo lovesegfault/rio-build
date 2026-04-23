@@ -866,11 +866,13 @@ pub fn solve_full(
 ///
 /// Keying on content (`fit_content_hash`) would orphan the prior entry
 /// on every refit — unbounded growth AND `prev_a = ∅` (hysteresis
-/// lost). Cache size is now bounded by `|live ModelKeys| ×
-/// |distinct overrides|`.
+/// lost). Cache size is bounded by `|SlaEstimator live keys| ×
+/// |distinct overrides|` — the `SlaEstimator` LRU's `on_evict` hook
+/// calls [`SolveCache::remove_model_key`] so an eviction there drops
+/// every override-keyed entry here.
 ///
-/// `inputs_gen` is bumped by the actor on `HwTable`/`CostTable` refresh
-/// and `SlaConfig` reload (ADR-023 L616). ICE state is NOT in
+/// `inputs_gen` is bumped on `HwTable`/`CostTable` *content* change
+/// (ADR-023 L616). ICE state is NOT in
 /// `inputs_gen` — the read-time mask touches only intents whose cached
 /// `A` intersects the masked cell.
 #[derive(Debug, Default)]
@@ -927,6 +929,16 @@ impl SolveCache {
     }
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Drop every entry keyed on `mkh` (across all override hashes).
+    /// Wired as the `SlaEstimator` LRU's `on_evict` hook so this map's
+    /// cardinality is bounded by the LRU's live set — without this an
+    /// evicted fit's entry is orphaned forever (`solve_intent_for`
+    /// short-circuits on `fit.as_ref()?` before reaching
+    /// [`Self::get_or_insert_with`], so nothing ever overwrites it).
+    pub fn remove_model_key(&self, mkh: u64) {
+        self.entries.retain(|(mk, _), _| *mk != mkh);
     }
 }
 

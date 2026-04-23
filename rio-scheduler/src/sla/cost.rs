@@ -447,11 +447,13 @@ impl CostTable {
     }
 
     /// Recompute λ\[h\] from `interrupt_samples` rows newer than each
-    /// h's `updated_at`. Called from the poller tick (lease-gated) —
-    /// controller appends, scheduler aggregates. Keyed directly on
-    /// `interrupt_samples.hw_class` (the controller-stamped node
-    /// label).
-    pub async fn refresh_lambda(&mut self, db: &SchedulerDb) -> anyhow::Result<()> {
+    /// h's `updated_at`. Called from [`interrupt_housekeeping`]
+    /// (lease-gated) — controller appends, scheduler aggregates. Keyed
+    /// directly on `interrupt_samples.hw_class` (the controller-stamped
+    /// node label). Returns `true` iff any new rows were folded (λ is a
+    /// solve input via [`super::solve::solve_full`]; caller bumps
+    /// `inputs_gen` only on change).
+    pub async fn refresh_lambda(&mut self, db: &SchedulerDb) -> anyhow::Result<bool> {
         let rows: Vec<(String, String, f64, f64)> = sqlx::query_as(
             "SELECT hw_class, kind, COALESCE(SUM(value), 0), \
                     EXTRACT(EPOCH FROM MAX(at))::float8 \
@@ -505,7 +507,17 @@ impl CostTable {
                     .update(d / dt, hwm, LAMBDA_HALFLIFE_SECS);
             }
         }
-        Ok(())
+        Ok(hwm > prev_hwm)
+    }
+
+    /// Move `lambda` + `node_count` from `from` into `self`, leaving
+    /// `price`/`cells`/`stale_clamp` untouched. Used by
+    /// [`interrupt_housekeeping`]'s write-back so a concurrent
+    /// [`spot_price_poller`] price update isn't clobbered by a full
+    /// snapshot swap.
+    pub(crate) fn absorb_lambda(&mut self, from: Self) {
+        self.lambda = from.lambda;
+        self.node_count = from.node_count;
     }
 
     /// Fold one round of spot-price observations into the price EMA.
@@ -709,35 +721,28 @@ impl IceBackoff {
 
 /// Lease-gated spot-price poller: every 10min, the leader pulls
 /// `DescribeSpotPriceHistory` for each band's representative instance
-/// type, EMA-smooths into `cost`, refreshes λ from `interrupt_samples`,
-/// persists to PG, and exports the staleness gauge.
+/// type, EMA-smooths into `cost`, re-evaluates the stale-clamp, exports
+/// the staleness gauge, and bumps `inputs_gen`.
 ///
-/// `source = None | Some(Static)` → AWS calls skipped; only the λ
-/// refresh + gauge run. Standby replicas emit the staleness gauge
-/// (per-replica, observability.md says it "climbs when … this replica is
-/// standby") but skip the AWS/PG body. On a false→true leader edge the
-/// in-mem table is reloaded from PG so the next leader picks up where
-/// the last left off — without this, the standby's startup snapshot
-/// (loaded once at main.rs) would be `persist()`ed on the first leader
-/// tick, overwriting the previous leader's evolved EMA.
+/// Spot-only — `main.rs` spawns this only under `hw_cost_source =
+/// Some(Spot)`. λ refresh / sweep / persist live in
+/// [`interrupt_housekeeping`] (which runs unconditionally). Standby
+/// replicas emit the staleness gauge (per-replica, observability.md
+/// says it "climbs when … this replica is standby") but skip the AWS
+/// body. On a false→true leader edge the in-mem table is reloaded from
+/// PG (see `poller_tick_prelude`).
 pub async fn spot_price_poller(
     db: SchedulerDb,
     leader: LeaderState,
     cost: std::sync::Arc<parking_lot::RwLock<CostTable>>,
-    source: Option<HwCostSource>,
+    solve_cache: std::sync::Arc<super::solve::SolveCache>,
     shutdown: rio_common::signal::Token,
 ) {
     // EC2 client built once. Same `from_env()` chain as
     // `rio_common::s3::default_client` — IRSA in-cluster, profile/env
-    // locally. None when source≠Spot so non-live deploys don't pay the
-    // credential-chain probe.
-    let ec2 = if matches!(source, Some(HwCostSource::Spot)) {
-        Some(aws_sdk_ec2::Client::new(
-            &aws_config::from_env().load().await,
-        ))
-    } else {
-        None
-    };
+    // locally. The caller already gated on `hw_cost_source == Spot`, so
+    // no `Option` dance.
+    let ec2 = aws_sdk_ec2::Client::new(&aws_config::from_env().load().await);
     let mut tick = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut was_leader = false;
@@ -747,34 +752,108 @@ pub async fn spot_price_poller(
             _ = shutdown.cancelled() => return,
             _ = tick.tick() => {},
         }
-        if !poller_tick_prelude(&mut was_leader, leader.is_leader(), &cost, &db, now_epoch()).await
+        if !poller_tick_prelude(
+            &mut was_leader,
+            leader.is_leader(),
+            &cost,
+            &db,
+            now_epoch(),
+            Some(HwCostSource::Spot),
+        )
+        .await
         {
             continue;
         }
-        // Snapshot → mutate → swap: parking_lot guards aren't Send, so
-        // no await while holding one. CostTable is two small maps;
-        // clone is cheap.
+        // parking_lot guards aren't Send → clone the menu out, await the
+        // AWS call, then mutate under a brief sync lock. `fold_spot_poll`
+        // touches only `price`; `interrupt_housekeeping` writes only
+        // `lambda`/`node_count`, so no swap-race.
+        let cells = cost.read().cells.clone();
+        let result = poll_spot_once(&ec2, &cells).await;
+        let now = now_epoch();
+        let folded = {
+            let mut g = cost.write();
+            let folded = fold_spot_poll(&mut g, result, now);
+            g.apply_stale_clamp(now);
+            folded
+        };
+        ::metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds")
+            .set(now - cost.read().price_updated_at());
+        // r[impl sched.sla.hw-class.epsilon-explore+2]
+        // Price is a solve input — bump iff `fold_prices` ran (Ok ∧
+        // non-empty) so the memo + ε_h seed track the new CostTable.
+        if folded {
+            solve_cache.bump_inputs_gen();
+        }
+    }
+}
+
+/// Lease-gated λ/persist housekeeping: every 10min, the leader
+/// refreshes λ from `interrupt_samples`, sweeps the retention window,
+/// persists the full `CostTable` to PG, and bumps `inputs_gen` if λ
+/// changed. Runs unconditionally (independent of `hw_cost_source`) —
+/// the controller appends `interrupt_samples` regardless, and the
+/// EMA-state persist covers both λ and any spot-price updates from
+/// [`spot_price_poller`]. On a false→true leader edge the in-mem table
+/// is reloaded from PG so the next leader picks up where the last left
+/// off — without this, the standby's startup snapshot (loaded once at
+/// main.rs) would be `persist()`ed on the first leader tick,
+/// overwriting the previous leader's evolved EMA.
+pub async fn interrupt_housekeeping(
+    db: SchedulerDb,
+    leader: LeaderState,
+    cost: std::sync::Arc<parking_lot::RwLock<CostTable>>,
+    solve_cache: std::sync::Arc<super::solve::SolveCache>,
+    shutdown: rio_common::signal::Token,
+) {
+    let mut tick = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut was_leader = false;
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            _ = tick.tick() => {},
+        }
+        // `source=None`: leader-gate + edge-reload only; no staleness
+        // gauge / clamp (Spot-only — meaningless without a live source).
+        if !poller_tick_prelude(
+            &mut was_leader,
+            leader.is_leader(),
+            &cost,
+            &db,
+            now_epoch(),
+            None,
+        )
+        .await
+        {
+            continue;
+        }
+        // Snapshot → refresh_lambda → write back λ ONLY (don't clobber
+        // a concurrent `spot_price_poller` price fold).
         let mut snap = cost.read().clone();
-        if let Some(ec2) = &ec2 {
-            let result = poll_spot_once(ec2, &snap.cells).await;
-            fold_spot_poll(&mut snap, result, now_epoch());
+        let lambda_changed = match snap.refresh_lambda(&db).await {
+            Ok(changed) => changed,
+            Err(e) => {
+                tracing::warn!(error = %e, "λ refresh failed; keeping previous");
+                false
+            }
+        };
+        let cluster = snap.cluster.clone();
+        cost.write().absorb_lambda(snap);
+        if lambda_changed {
+            solve_cache.bump_inputs_gen();
         }
-        if let Err(e) = snap.refresh_lambda(&db).await {
-            tracing::warn!(error = %e, "λ refresh failed; keeping previous");
-        }
-        if let Err(e) = sweep_interrupt_samples(&db, &snap.cluster).await {
+        if let Err(e) = sweep_interrupt_samples(&db, &cluster).await {
             tracing::warn!(error = %e, "interrupt_samples retention sweep failed");
         }
+        // Persist a FRESH snapshot (re-read after absorb so any
+        // concurrent price update is included). Bound to a let:
+        // parking_lot guards aren't Send across .await.
+        let snap = cost.read().clone();
         if let Err(e) = snap.persist(&db).await {
             tracing::warn!(error = %e, "cost-table persist failed");
         }
-        // Re-evaluate stale-clamp on the post-fold timestamps and
-        // re-emit the gauge so the leader's view doesn't lag one tick.
-        let now = now_epoch();
-        snap.apply_stale_clamp(now);
-        ::metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds")
-            .set(now - snap.price_updated_at());
-        *cost.write() = snap;
     }
 }
 
@@ -801,19 +880,25 @@ pub(crate) async fn sweep_interrupt_samples(db: &SchedulerDb, cluster: &str) -> 
 /// matching `_hw_cost_fallback_total{reason=…}` on the non-success
 /// arms. Factored from [`spot_price_poller`] so the `api_error` /
 /// `empty_history` reasons are unit-testable without an EC2 client.
+/// Returns `true` iff `fold_prices` ran (Ok ∧ non-empty) — caller
+/// bumps `inputs_gen` only then.
 pub(crate) fn fold_spot_poll(
     snap: &mut CostTable,
     result: anyhow::Result<HashMap<Cell, f64>>,
     now: f64,
-) {
+) -> bool {
     match result {
-        Ok(obs) if !obs.is_empty() => snap.fold_prices(&obs, now),
+        Ok(obs) if !obs.is_empty() => {
+            snap.fold_prices(&obs, now);
+            true
+        }
         Ok(_) => {
             ::metrics::counter!(
                 "rio_scheduler_sla_hw_cost_fallback_total",
                 "reason" => "empty_history"
             )
             .increment(1);
+            false
         }
         Err(e) => {
             tracing::warn!(error = %e, "spot-price poll failed; keeping previous");
@@ -822,19 +907,23 @@ pub(crate) fn fold_spot_poll(
                 "reason" => "api_error"
             )
             .increment(1);
+            false
         }
     }
 }
 
-/// Per-tick gauge-emit + leader-edge-reload, factored out of
-/// [`spot_price_poller`] for unit-testability (the poller body needs a
-/// live EC2 client). Returns `true` if the caller should proceed with
-/// the AWS/PG tick body.
+/// Per-tick gauge-emit + leader-edge-reload, shared by
+/// [`spot_price_poller`] and [`interrupt_housekeeping`]. Returns `true`
+/// if the caller should proceed with the tick body.
 ///
-/// - Emits `rio_scheduler_sla_hw_cost_stale_seconds` BEFORE the leader
-///   gate (per-replica metric — observability.md says it "climbs when …
-///   this replica is standby"; `r[obs.metric.scheduler-leader-gate]`
-///   does NOT list it).
+/// - When `source == Some(Spot)`: emits
+///   `rio_scheduler_sla_hw_cost_stale_seconds` BEFORE the leader gate
+///   (per-replica metric — observability.md says it "climbs when … this
+///   replica is standby"; `r[obs.metric.scheduler-leader-gate]` does
+///   NOT list it). The gauge and `apply_stale_clamp` are gated on Spot:
+///   "stale relative to a source that doesn't exist" reads as 56 years
+///   under `Static`/`None` and trips the false-positive
+///   `_hw_cost_fallback_total{reason="stale"}`.
 /// - On a false→true leader edge, reloads from PG so the new leader
 ///   resumes from the previous leader's persisted state, not its own
 ///   startup snapshot.
@@ -844,9 +933,13 @@ pub(crate) async fn poller_tick_prelude(
     cost: &std::sync::Arc<parking_lot::RwLock<CostTable>>,
     db: &SchedulerDb,
     now: f64,
+    source: Option<HwCostSource>,
 ) -> bool {
-    ::metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds")
-        .set(now - cost.read().price_updated_at());
+    let spot = matches!(source, Some(HwCostSource::Spot));
+    if spot {
+        ::metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds")
+            .set(now - cost.read().price_updated_at());
+    }
     if !is_leader {
         *was_leader = false;
         return false;
@@ -859,8 +952,11 @@ pub(crate) async fn poller_tick_prelude(
                 // Reloaded EMA may itself be stale (previous leader
                 // wedged before failover) — evaluate clamp on the
                 // resumed timestamps so the FIRST solve under new
-                // leadership doesn't trust a dead snapshot.
-                fresh.apply_stale_clamp(now);
+                // leadership doesn't trust a dead snapshot. Spot-only
+                // (see fn doc).
+                if spot {
+                    fresh.apply_stale_clamp(now);
+                }
                 *cost.write() = fresh;
                 *was_leader = true;
             }
@@ -1358,6 +1454,56 @@ mod tests {
         );
     }
 
+    /// merged_bug_006b: under `hw_cost_source ∈ {Static, None}` there is
+    /// no live source, so `_hw_cost_stale_seconds` reads as 56 years
+    /// (epoch) and `apply_stale_clamp` trips the false-positive
+    /// `_hw_cost_fallback_total{reason="stale"}`. Both are now gated on
+    /// `source == Some(Spot)` in `poller_tick_prelude`.
+    #[tokio::test]
+    async fn stale_metric_silent_under_static() {
+        use std::sync::Arc;
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        // No price keys → price_updated_at()=0 → "56 years stale".
+        let cost = Arc::new(parking_lot::RwLock::new(CostTable::seeded("c")));
+
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = rec.snapshotter();
+        let mut was_leader = false;
+        for source in [None, Some(HwCostSource::Static)] {
+            let _g = metrics::set_default_local_recorder(&rec);
+            // Standby + leader-edge ticks: neither emits gauge / counter.
+            poller_tick_prelude(&mut was_leader, false, &cost, &sdb, 6100.0, source).await;
+            poller_tick_prelude(&mut was_leader, true, &cost, &sdb, 6100.0, source).await;
+        }
+        let metrics: Vec<_> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(ck, _, _, _)| ck.key().name().to_owned())
+            .collect();
+        assert!(
+            !metrics
+                .iter()
+                .any(|n| n == "rio_scheduler_sla_hw_cost_stale_seconds"),
+            "gauge unset under non-Spot source: {metrics:?}"
+        );
+        assert!(
+            !metrics
+                .iter()
+                .any(|n| n == "rio_scheduler_sla_hw_cost_fallback_total"),
+            "stale-clamp counter zero under non-Spot source: {metrics:?}"
+        );
+        // stale_clamp not latched (would be `true` after 6100s if the
+        // leader-edge `apply_stale_clamp` ran un-gated).
+        assert!(
+            (cost.read().price(&("h".into(), CapacityType::Spot)) - seed_price(CapacityType::Spot))
+                .abs()
+                < 1e-9,
+            "non-Spot leader-edge does not engage stale_clamp"
+        );
+    }
+
     /// Regression (a): standby replicas `continue`d before the gauge
     /// `.set()` so `hw_cost_stale_seconds` was frozen on standby.
     /// Regression (b): on false→true leader edge the in-mem startup
@@ -1385,9 +1531,10 @@ mod tests {
         let rec = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = rec.snapshotter();
         let mut was_leader = false;
+        let spot = Some(HwCostSource::Spot);
         let proceed = {
             let _g = metrics::set_default_local_recorder(&rec);
-            poller_tick_prelude(&mut was_leader, false, &cost, &sdb, 6100.0).await
+            poller_tick_prelude(&mut was_leader, false, &cost, &sdb, 6100.0, spot).await
         };
         assert!(!proceed);
         let saw_gauge = snapshotter
@@ -1400,7 +1547,7 @@ mod tests {
         assert!((cost.read().price(&cell) - 0.02).abs() < 1e-9);
 
         // (b) false→true edge: reloads from PG, returns true.
-        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &sdb, 6100.0).await;
+        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &sdb, 6100.0, spot).await;
         assert!(proceed);
         assert!(was_leader);
         assert!(
@@ -1412,7 +1559,7 @@ mod tests {
         // mutation if it did).
         cost.write()
             .set_price("h", CapacityType::Spot, 0.09, 6000.0);
-        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &sdb, 6100.0).await;
+        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &sdb, 6100.0, spot).await;
         assert!(proceed);
         assert!((cost.read().price(&cell) - 0.09).abs() < 1e-9);
     }
@@ -1449,7 +1596,9 @@ mod tests {
         let bad_db = SchedulerDb::new(bad.pool.clone());
 
         let mut was_leader = false;
-        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &bad_db, 6100.0).await;
+        let spot = Some(HwCostSource::Spot);
+        let proceed =
+            poller_tick_prelude(&mut was_leader, true, &cost, &bad_db, 6100.0, spot).await;
         assert!(
             !proceed,
             "load() Err → tick body skipped (no persist of stale snapshot)"
@@ -1464,7 +1613,7 @@ mod tests {
         );
 
         // Retry with a working DB: reload succeeds, latches, proceeds.
-        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &sdb, 6100.0).await;
+        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &sdb, 6100.0, spot).await;
         assert!(proceed, "retry with working DB → proceed");
         assert!(was_leader, "retry success → latched");
         assert!(

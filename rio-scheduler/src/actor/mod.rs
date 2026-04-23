@@ -300,10 +300,10 @@ pub struct DagActor {
     /// Per-key admissible-set memo. Keyed on `(model_key_hash,
     /// override_hash)`; `(inputs_gen, fit_content_hash)` are staleness
     /// fields, so most `compute_spawn_intents` ticks are pure cache
-    /// hits (ADR-023 L616). `bump_inputs_gen()` is called from
-    /// `tick_refresh_sla`
-    /// after `HwTable`/`CostTable` refresh and from `apply_config`
-    /// on `[sla]` reload.
+    /// hits (ADR-023 L616). `bump_inputs_gen()` callers:
+    /// `maybe_refresh_estimator` (iff `HwTable` content-hash changed),
+    /// `spot_price_poller` (after `CostTable` price fold),
+    /// `interrupt_housekeeping` (after λ refresh, iff new rows).
     pub(crate) solve_cache: Arc<crate::sla::solve::SolveCache>,
     /// Tick counter for periodic tasks that run less often than every
     /// Tick (e.g., estimator refresh every ~60s with a 10s tick interval).
@@ -527,7 +527,7 @@ impl DagActor {
             sla_config: cfg.sla,
             cost_table: plumbing.cost_table,
             ice: Arc::new(crate::sla::cost::IceBackoff::new(max_lead_time)),
-            solve_cache: Arc::new(crate::sla::solve::SolveCache::default()),
+            solve_cache: plumbing.solve_cache,
             tick_count: 0,
             backpressure_active: Arc::new(AtomicBool::new(false)),
             leader: plumbing.leader,
@@ -583,6 +583,9 @@ impl DagActor {
         // - `ice`: cluster-level cell-backoff signal, 60s TTL self-heals.
         // - `cache_breaker`: store availability is generation-independent.
         // - `sla_estimator`: cluster-wide fitted curves.
+        // - `solve_cache`: bounded by `sla_estimator`'s live set via the
+        //   `on_evict` hook; per-key Schmitt `prev_a` is generation-
+        //   independent.
         // - `tick_count`: harmless counter.
     }
 
