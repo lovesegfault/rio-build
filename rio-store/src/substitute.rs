@@ -176,16 +176,26 @@ pub enum SubstituteError {
     #[error("NAR size mismatch: narinfo declared {declared}, got {actual} decompressed bytes")]
     SizeMismatch { declared: u64, actual: u64 },
 
-    /// Transient: returned as `Err` (not `Ok(None)`) so moka's
-    /// `try_get_with` does NOT cache it; the caller's retry re-runs
-    /// `do_substitute`. `retry_after = None` is the placeholder-claim
-    /// case (`Concurrent` — another uploader holds the slot; retry
-    /// reaches `AlreadyComplete` once it finishes). `Some(d)` is the
-    /// upstream-429 case (`r[store.substitute.probe-429-retry+2]`): the
-    /// admission permit is dropped on return so the wait happens
-    /// caller-side without holding per-replica capacity.
-    #[error("transient busy (retry after {retry_after:?})")]
-    Busy { retry_after: Option<Duration> },
+    /// Transient placeholder-claim: another uploader (concurrent
+    /// replica or closure walk) holds the slot. Returned as `Err` (not
+    /// `Ok(None)`) so moka's `try_get_with` does NOT cache it; the
+    /// caller's retry re-runs `do_substitute` and reaches
+    /// `AlreadyComplete` once the in-flight upload lands. gRPC maps to
+    /// `NotFound` (the gateway's 2-attempt budget can't outlast a
+    /// multi-second NAR fetch, so callers re-probe later).
+    #[error("transient: concurrent uploader holds placeholder")]
+    Raced,
+
+    /// Transient upstream-429 (`r[store.substitute.probe-429-retry+2]`).
+    /// `retry_after` is the parsed `Retry-After` header (delta-seconds
+    /// or HTTP-date), `None` if absent or unparseable. Returned as
+    /// `Err` so moka does NOT cache it; the admission permit is
+    /// dropped on return so the wait happens caller-side without
+    /// holding per-replica capacity. gRPC maps to `Unavailable` so the
+    /// scheduler's 8-attempt backoff retries — a bare 429 (no
+    /// `Retry-After`) is still a real rate-limit, NOT a miss.
+    #[error("transient: upstream rate-limited (retry after {retry_after:?})")]
+    RateLimited { retry_after: Option<Duration> },
 
     /// Per-replica admission gate timed out (or closed). Transient —
     /// `Err` so moka does NOT cache it; the next caller after the
@@ -219,7 +229,7 @@ enum UpstreamOutcome {
     /// narinfo 404 or sig didn't verify — this upstream doesn't have it.
     Miss,
     /// `claim_placeholder` returned `Concurrent` — another replica or
-    /// closure-walk holds the slot. Mapped to `Err(Busy)` in
+    /// closure-walk holds the slot. Mapped to `Err(Raced)` in
     /// `do_substitute` so moka does not cache it; caller's retry
     /// re-runs and reaches `AlreadyComplete`. Trying remaining
     /// upstreams would just race the same slot again.
@@ -484,13 +494,16 @@ impl Substituter {
             })
             .await
             .map_err(|e: Arc<SubstituteError>| {
-                // `Busy`/`Admission` are not-an-error transients
-                // (concurrent uploader / local backpressure); skip the
-                // error metric so they don't show up as upstream
-                // failure. Admission has its own dedicated counter.
+                // `Raced`/`RateLimited`/`Admission` are not-an-error
+                // transients (concurrent uploader / upstream 429 /
+                // local backpressure); skip the error metric so they
+                // don't show up as upstream failure. Admission has its
+                // own dedicated counter.
                 if !matches!(
                     *e,
-                    SubstituteError::Busy { .. } | SubstituteError::Admission(_)
+                    SubstituteError::Raced
+                        | SubstituteError::RateLimited { .. }
+                        | SubstituteError::Admission(_)
                 ) {
                     metrics::counter!(
                         "rio_store_substitute_total",
@@ -565,17 +578,17 @@ impl Substituter {
                 Ok(UpstreamOutcome::Raced) => {
                     // Another uploader holds the placeholder. STOP —
                     // remaining upstreams would race the same slot.
-                    // Return `Err(Busy)` so moka does NOT cache this
+                    // Return `Err(Raced)` so moka does NOT cache this
                     // as a definitive miss; caller's retry re-runs and
                     // reaches `AlreadyComplete` once the upload lands.
                     debug!(upstream = %upstream.url, "concurrent uploader, stopping");
-                    return Err(SubstituteError::Busy { retry_after: None });
+                    return Err(SubstituteError::Raced);
                 }
-                Err(SubstituteError::Busy { retry_after }) => {
+                Err(SubstituteError::RateLimited { retry_after }) => {
                     // Upstream 429'd the narinfo or NAR GET. CONTINUE
-                    // to the next upstream — only return `Busy` after
-                    // the loop if no other upstream had it. moka will
-                    // not cache the eventual `Err(Busy)`, and the
+                    // to the next upstream — only return `RateLimited`
+                    // after the loop if no other upstream had it. moka
+                    // will not cache the eventual `Err`, and the
                     // admission permit drops on return so the wait
                     // happens caller-side
                     // (r[store.substitute.probe-429-retry+2]).
@@ -615,12 +628,12 @@ impl Substituter {
             }
         }
 
-        // No upstream had it. If ≥1 upstream 429'd, propagate `Busy`
-        // so moka does NOT cache a definitive miss (the rate-limited
-        // upstream may have it on retry). Clean miss only when every
-        // upstream gave a definitive verdict.
+        // No upstream had it. If ≥1 upstream 429'd, propagate
+        // `RateLimited` so moka does NOT cache a definitive miss (the
+        // rate-limited upstream may have it on retry). Clean miss only
+        // when every upstream gave a definitive verdict.
         if let Some(retry_after) = any_429 {
-            return Err(SubstituteError::Busy { retry_after });
+            return Err(SubstituteError::RateLimited { retry_after });
         }
         Ok(None)
     }
@@ -653,12 +666,13 @@ impl Substituter {
             return Ok(UpstreamOutcome::Miss);
         }
         // r[impl store.substitute.probe-429-retry+2]
-        // 429 on the GET path: return Busy{retry_after} immediately.
-        // The AdmissionGate permit drops on return so the wait happens
-        // caller-side without holding per-replica capacity. NO inline
-        // sleep+retry: the scheduler's existing 8-attempt backoff
-        // (250ms→16s, ~32s total) absorbs short Retry-Afters; long
-        // ones fall through to the next dispatch-time probe pass.
+        // 429 on the GET path: return RateLimited{retry_after}
+        // immediately. The AdmissionGate permit drops on return so the
+        // wait happens caller-side without holding per-replica
+        // capacity. NO inline sleep+retry: the scheduler's existing
+        // 8-attempt backoff (250ms→16s, ~32s total) absorbs short
+        // Retry-Afters; long ones fall through to the next
+        // dispatch-time probe pass.
         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             let retry_after = parse_retry_after(resp.headers());
             debug!(upstream = %base, ?retry_after, "narinfo GET 429");
@@ -667,7 +681,7 @@ impl Substituter {
                 "tenant" => tenant_id.to_string(),
             )
             .increment(1);
-            return Err(SubstituteError::Busy { retry_after });
+            return Err(SubstituteError::RateLimited { retry_after });
         }
         if !resp.status().is_success() {
             return Err(SubstituteError::Fetch(format!(
@@ -903,18 +917,19 @@ impl Substituter {
             .await
             .map_err(|e| SubstituteError::Fetch(format!("{nar_url}: {e}")))?;
         // r[impl store.substitute.probe-429-retry+2]
-        // 429 on the NAR body GET maps to `Busy` (same as the narinfo
-        // GET) so `do_substitute` continues to the next upstream and
-        // moka doesn't cache the result. Without this, a body-level 429
-        // surfaced as a generic `Fetch` error, was logged as
-        // `result=error`, and let `Ok(None)` cache a miss for 30s.
+        // 429 on the NAR body GET maps to `RateLimited` (same as the
+        // narinfo GET) so `do_substitute` continues to the next
+        // upstream and moka doesn't cache the result. Without this, a
+        // body-level 429 surfaced as a generic `Fetch` error, was
+        // logged as `result=error`, and let `Ok(None)` cache a miss
+        // for 30s.
         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             metrics::counter!(
                 "rio_store_substitute_probe_ratelimited_total",
                 "tenant" => tenant_id.to_string(),
             )
             .increment(1);
-            return Err(SubstituteError::Busy {
+            return Err(SubstituteError::RateLimited {
                 retry_after: parse_retry_after(resp.headers()),
             });
         }
@@ -2142,8 +2157,8 @@ mod tests {
     /// First upstream 429s the narinfo GET; second upstream has the
     /// path. `do_substitute` MUST continue to the second (matching the
     /// HEAD-probe semantics) and return a hit, not stop at the first
-    /// 429. If both miss-or-429, the loop falls through to `Err(Busy)`
-    /// so moka doesn't cache a definitive miss.
+    /// 429. If both miss-or-429, the loop falls through to
+    /// `Err(RateLimited)` so moka doesn't cache a definitive miss.
     #[tokio::test]
     async fn do_substitute_429_first_upstream_tries_second() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -2177,16 +2192,16 @@ mod tests {
         );
 
         // Now invert: only the 429 upstream configured → no hit, but
-        // the result MUST be `Err(Busy)` (uncached), not `Ok(None)`
-        // (cached miss).
+        // the result MUST be `Err(RateLimited)` (uncached), not
+        // `Ok(None)` (cached miss).
         let tid2 = seed_tenant(&db.pool, "sub-429-only").await;
         metadata::upstreams::insert(&db.pool, tid2, &a.url, 10, &[], SigMode::Keep)
             .await
             .unwrap();
         let got2 = sub.try_substitute(tid2, &path).await;
         assert!(
-            matches!(got2, Err(SubstituteError::Busy { .. })),
-            "all-429 must propagate Busy (uncached), not Ok(None); got {got2:?}"
+            matches!(got2, Err(SubstituteError::RateLimited { .. })),
+            "all-429 must propagate RateLimited (uncached), not Ok(None); got {got2:?}"
         );
     }
 
@@ -2657,9 +2672,9 @@ mod tests {
 
     // r[verify store.substitute.probe-429-retry+2]
     /// 429 on the narinfo GET path (`try_upstream`) → returns
-    /// `Err(Busy{retry_after: Some})` IMMEDIATELY (no inline sleep).
-    /// The admission permit drops on return so per-replica capacity
-    /// isn't held across the wait.
+    /// `Err(RateLimited{retry_after: Some})` IMMEDIATELY (no inline
+    /// sleep). The admission permit drops on return so per-replica
+    /// capacity isn't held across the wait.
     #[tokio::test]
     async fn try_upstream_429_returns_busy_no_sleep() {
         use axum::http::HeaderValue;
@@ -2708,11 +2723,11 @@ mod tests {
         assert!(
             matches!(
                 got,
-                Err(SubstituteError::Busy {
+                Err(SubstituteError::RateLimited {
                     retry_after: Some(_)
                 })
             ),
-            "narinfo GET 429 → Err(Busy{{retry_after: Some}}); got {got:?}"
+            "narinfo GET 429 → Err(RateLimited{{retry_after: Some}}); got {got:?}"
         );
         assert!(
             elapsed < Duration::from_millis(500),
@@ -2721,7 +2736,7 @@ mod tests {
         assert_eq!(
             gate.utilization(),
             0.0,
-            "admission permit must be released on Busy return"
+            "admission permit must be released on RateLimited return"
         );
     }
 
@@ -2905,7 +2920,7 @@ mod tests {
 
     // r[verify store.substitute.singleflight+3]
     /// A young 'uploading' placeholder means a live concurrent
-    /// uploader — do NOT reclaim, return `Err(Busy)` (NOT a cached
+    /// uploader — do NOT reclaim, return `Err(Raced)` (NOT a cached
     /// `Ok(None)`). Once the placeholder completes, a retry MUST reach
     /// `AlreadyComplete` and return `Ok(Some)` — proving the moka
     /// singleflight did NOT cache the transient `Raced` outcome.
@@ -2932,11 +2947,11 @@ mod tests {
         let sub = test_substituter(db.pool.clone());
         let got = sub.try_substitute(tid, &path).await;
 
-        // Young placeholder → PlaceholderClaim::Concurrent → `Err(Busy)`
+        // Young placeholder → PlaceholderClaim::Concurrent → `Err(Raced)`
         // so moka does NOT cache. Caller retries on the next request.
         assert!(
-            matches!(got, Err(SubstituteError::Busy { retry_after: None })),
-            "young placeholder should yield Err(Busy), got {got:?}"
+            matches!(got, Err(SubstituteError::Raced)),
+            "young placeholder should yield Err(Raced), got {got:?}"
         );
 
         // Placeholder still present (NOT reclaimed).
@@ -3338,8 +3353,8 @@ mod tests {
         let sub = test_substituter(db.pool.clone());
         let got = sub.try_substitute(tid, &path).await;
         assert!(
-            matches!(got, Err(SubstituteError::Busy { retry_after: None })),
-            "Raced → Err(Busy), got {got:?}"
+            matches!(got, Err(SubstituteError::Raced)),
+            "Raced → Err(Raced), got {got:?}"
         );
         assert_eq!(
             fake1.nar_hits.load(Ordering::SeqCst),

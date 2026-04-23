@@ -137,12 +137,26 @@ pub const SUBSTITUTE_FETCH_BACKOFF: rio_common::backoff::Backoff = rio_common::b
 pub const SUBSTITUTE_FETCH_MAX_ATTEMPTS: u32 = 8;
 
 /// Per-path timeout for the detached substitute fetch's
-/// `QueryPathInfo`. Separate from `grpc_timeout` (30s) because the
-/// store-side `try_substitute` recursively walks the runtime closure
-/// — a single ghc-9.8.4 (1.9 GB) fetch legitimately takes minutes.
-/// The fetch runs OUTSIDE the actor loop, so a long timeout here
-/// doesn't head-of-line block. r[sched.substitute.detached+2]
+/// `QueryPathInfo`. Separate from `grpc_timeout` (30s): the call
+/// covers `walk_substitute_closure` (scheduler-side BFS over
+/// `info.references`) plus the largest single NAR fetch a
+/// `try_substitute` may block on — a single ghc-9.8.4 (1.9 GB) fetch
+/// legitimately takes minutes. The fetch runs OUTSIDE the actor loop,
+/// so a long timeout here doesn't head-of-line block.
+/// r[sched.substitute.detached+2]
 pub const SUBSTITUTE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Re-mint cadence for [`SubstituteAuth`](dispatch::SubstituteAuth)
+/// inside `walk_substitute_closure`'s serial `'paths` loop. The
+/// per-layer mint covers the `BatchQueryPathInfo` fast-path; the
+/// per-path QPI loop within a layer is serial and a wide cold layer
+/// (hundreds of paths × store-side `SUBSTITUTE_ADMISSION_WAIT` /
+/// retry backoff each) can outlive a `Service` token's 30 min expiry.
+/// Re-mint every 50 paths or 5 min, whichever comes first — 6×
+/// headroom under the 30 min `Service` expiry. `Jwt` re-mint is a
+/// cheap clone (and merge-time now uses `Service` anyway).
+pub const SUBSTITUTE_REMINT_PATHS: usize = 50;
+pub const SUBSTITUTE_REMINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// Timeout for the merge-time `FindMissingPaths` only
 /// (`find_missing_with_breaker`). Separate from `grpc_timeout` (30s):

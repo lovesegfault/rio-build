@@ -495,27 +495,29 @@ impl StoreServiceImpl {
                 SubstituteError::TooLarge { what, limit } => Status::resource_exhausted(format!(
                     "upstream substitute {what} exceeds {limit}-byte cap"
                 )),
-                // Raced (`retry_after = None`): a concurrent uploader
-                // holds the placeholder. The NAR fetch may still be
-                // seconds–minutes away — the gateway's 2-attempt/250ms
-                // `r[gw.store.transient-retry]` budget can't outlast it,
-                // so `Unavailable` here would surface a hard error where
-                // the pre-substitute behaviour was a benign
+                // Raced: a concurrent uploader holds the placeholder.
+                // The NAR fetch may still be seconds–minutes away —
+                // the gateway's 2-attempt/250ms
+                // `r[gw.store.transient-retry]` budget can't outlast
+                // it, so `Unavailable` here would surface a hard error
+                // where the pre-substitute behaviour was a benign
                 // `valid=false`. Map to `NotFound` instead: gateway
                 // treats it as miss (caller re-probes later); scheduler
                 // `walk_substitute_closure` treats it as `ok=false →
                 // revert` and the next dispatch pass re-probes once the
                 // concurrent upload completes. Moka didn't cache `Err`
                 // either way.
-                SubstituteError::Busy { retry_after: None } => {
+                SubstituteError::Raced => {
                     Status::not_found("substitution in progress on another replica")
                 }
-                // Upstream-429 (`Some`): genuinely transient with a
-                // bounded server-supplied wait — `Unavailable` so the
-                // scheduler's 8-attempt backoff retries.
-                SubstituteError::Busy {
-                    retry_after: Some(_),
-                } => Status::unavailable("upstream rate-limited; retry"),
+                // Upstream-429: genuinely transient — `Unavailable` so
+                // the scheduler's 8-attempt backoff retries. A bare
+                // 429 (no `Retry-After`) is STILL a rate-limit, not a
+                // miss; the previous `Busy{None}` overload conflated
+                // it with `Raced` and demoted to build-from-source.
+                SubstituteError::RateLimited { .. } => {
+                    Status::unavailable("upstream rate-limited; retry")
+                }
                 SubstituteError::Admission(a) => a.into(),
                 SubstituteError::HashMismatch { .. }
                 | SubstituteError::SizeMismatch { .. }

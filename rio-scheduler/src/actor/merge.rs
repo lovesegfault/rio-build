@@ -14,7 +14,6 @@ use rio_proto::types::FindMissingPathsRequest;
 
 use crate::state::{BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash};
 
-use super::dispatch::SubstituteAuth;
 use super::{ActorError, DagActor, MergeDagRequest};
 
 /// Cross-phase carrier from [`DagActor::validate_and_ingest`] to
@@ -49,6 +48,11 @@ pub(super) struct MergeIngest {
     pub pending_substitute: Vec<(DrvHash, Vec<String>)>,
     /// Threaded for `verify_preexisting_completed`'s store call.
     pub jwt_token: Option<String>,
+    /// Threaded so `reconcile_merged_state` can build a re-mintable
+    /// `SubstituteAuth::Service` for `spawn_substitute_fetches`
+    /// (the gateway JWT is never re-mintable; a wide cold closure
+    /// outlives its ~65 min expiry).
+    pub tenant_id: Option<Uuid>,
 }
 
 /// Output of [`DagActor::reconcile_merged_state`].
@@ -427,6 +431,7 @@ impl DagActor {
             cached_hits,
             pending_substitute,
             jwt_token,
+            tenant_id,
         })
     }
 
@@ -509,6 +514,7 @@ impl DagActor {
             cached_hits,
             pending_substitute,
             jwt_token,
+            tenant_id,
             ..
         } = ingest;
         let newly_inserted = &merge_result.newly_inserted;
@@ -528,12 +534,17 @@ impl DagActor {
             };
         }
 
-        let jwt_auth = SubstituteAuth::Jwt(
-            jwt_token
-                .as_deref()
-                .map(|t| vec![(rio_proto::TENANT_TOKEN_HEADER, t.to_string())])
-                .unwrap_or_default(),
-        );
+        // `Service` (re-mintable) for the detached closure walk: the
+        // gateway JWT (`jwt_token`) is single-shot — a wide cold
+        // closure walk can outlive its ~65 min expiry, and an expired
+        // JWT surfaces as `NotFound`/`Unauthenticated` (NON-transient)
+        // → spurious demote-to-build. With `Service`, the per-layer +
+        // per-N-paths re-mint in `walk_substitute_closure` keeps the
+        // token fresh for the full walk. Falls back to `Jwt(vec![])`
+        // (no-auth) only when no `service_signer` (dev mode) or no
+        // `tenant_id` (single-tenant). The gateway JWT is still used
+        // for FMP metadata (`find_missing_with_breaker`) below.
+        let sub_auth = self.substitute_auth_for_tenant(*tenant_id);
 
         // r[sched.merge.reconcile-order]: split pending_substitute by
         // lane. Reprobe-substitutable (pre-existing Poisoned/Failed/
@@ -585,7 +596,13 @@ impl DagActor {
         // Reset stale nodes to Ready; they re-dispatch and re-complete.
         // r[impl sched.merge.stale-completed-verify+3]
         let stale_reset = self
-            .verify_preexisting_completed(nodes, newly_inserted, cached_hits, jwt_token.as_deref())
+            .verify_preexisting_completed(
+                nodes,
+                newly_inserted,
+                cached_hits,
+                jwt_token.as_deref(),
+                *tenant_id,
+            )
             .await;
         phase!("6c-verify-preexisting");
 
@@ -599,7 +616,7 @@ impl DagActor {
         // first_dep_failed=Some(A), and !keep_going builds fail-fast
         // while B's fetch is mid-flight.
         if !reprobe_sub.is_empty() {
-            self.spawn_substitute_fetches(reprobe_sub, jwt_auth.clone())
+            self.spawn_substitute_fetches(reprobe_sub, sub_auth.clone())
                 .await;
         }
         phase!("6d-spawn-substitute-reprobe");
@@ -654,7 +671,7 @@ impl DagActor {
         // completed a chain that included them) fall through to normal
         // scheduling.
         if !new_sub.is_empty() {
-            self.spawn_substitute_fetches(new_sub, jwt_auth).await;
+            self.spawn_substitute_fetches(new_sub, sub_auth).await;
         }
         phase!("6g-spawn-substitute-new");
 
@@ -1180,6 +1197,7 @@ impl DagActor {
         newly_inserted: &HashSet<DrvHash>,
         cached_hits: &HashMap<DrvHash, Vec<String>>,
         jwt_token: Option<&str>,
+        tenant_id: Option<Uuid>,
     ) -> HashSet<String> {
         // Collect (drv_hash, output_paths) for pre-existing Completed
         // OR Skipped nodes in this merge. Skipped carries real
@@ -1458,12 +1476,8 @@ impl DagActor {
         }
 
         if !to_spawn.is_empty() {
-            let jwt_auth = SubstituteAuth::Jwt(
-                jwt_token
-                    .map(|t| vec![(rio_proto::TENANT_TOKEN_HEADER, t.to_string())])
-                    .unwrap_or_default(),
-            );
-            self.spawn_substitute_fetches(to_spawn, jwt_auth).await;
+            let auth = self.substitute_auth_for_tenant(tenant_id);
+            self.spawn_substitute_fetches(to_spawn, auth).await;
         }
 
         reset

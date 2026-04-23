@@ -673,20 +673,28 @@ impl DagActor {
         &self,
         drv_hashes: impl Iterator<Item = &'a DrvHash>,
     ) -> SubstituteAuth {
-        let Some(signer) = &self.service_signer else {
-            return SubstituteAuth::Jwt(Vec::new());
-        };
-        let Some(tid) = drv_hashes
+        let tid = drv_hashes
             .filter_map(|h| self.dag.node(h))
             .flat_map(|s| s.interested_builds.iter())
             .filter_map(|bid| self.builds.get(bid))
-            .find_map(|b| b.tenant_id)
-        else {
-            return SubstituteAuth::Jwt(Vec::new());
-        };
-        SubstituteAuth::Service {
-            signer: signer.clone(),
-            tenant_id: tid,
+            .find_map(|b| b.tenant_id);
+        self.substitute_auth_for_tenant(tid)
+    }
+
+    /// Build a [`SubstituteAuth`] for a known `tenant_id`. `Service`
+    /// when both `service_signer` and `tenant_id` are present (so
+    /// `walk_substitute_closure` can re-mint past the original
+    /// expiry); `Jwt(vec![])` (no-auth) otherwise — dev mode or
+    /// single-tenant. Used by both `probe_substitute_auth`
+    /// (dispatch-time, derives `tenant_id` from the DAG) and
+    /// merge-time (`MergeDagRequest.tenant_id` is already in hand).
+    pub(super) fn substitute_auth_for_tenant(&self, tenant_id: Option<Uuid>) -> SubstituteAuth {
+        match (&self.service_signer, tenant_id) {
+            (Some(signer), Some(tid)) => SubstituteAuth::Service {
+                signer: signer.clone(),
+                tenant_id: tid,
+            },
+            _ => SubstituteAuth::Jwt(Vec::new()),
         }
     }
 
@@ -712,13 +720,14 @@ impl DagActor {
     ///
     /// Candidates whose transition is rejected (vanished, wrong status)
     /// are skipped — they fall through to normal scheduling.
-    /// `auth` is either the gateway-forwarded JWT (merge-time, 1h
-    /// expiry — used as-is) or the `(signer, tenant_id)` pair
-    /// (dispatch-time) so the spawned task can re-mint a fresh service
-    /// token AFTER acquiring `substitute_sem` and once per BFS layer:
-    /// a 60s token minted at spawn-time would expire while parked on
-    /// the semaphore or mid-way through a ghc-sized closure walk
-    /// (later QPIs → `NotFound` → spurious `ok=false`).
+    /// `auth` is the `(signer, tenant_id)` pair (both merge- and
+    /// dispatch-time, via `substitute_auth_for_tenant`) so the spawned
+    /// task can re-mint a fresh service token AFTER acquiring
+    /// `substitute_sem`, once per BFS layer, and every
+    /// `SUBSTITUTE_REMINT_PATHS` / `SUBSTITUTE_REMINT_INTERVAL` inside
+    /// the per-path loop: a token minted at spawn-time would expire
+    /// while parked on the semaphore or mid-way through a wide cold
+    /// closure walk (later QPIs → `NotFound` → spurious `ok=false`).
     pub(super) async fn spawn_substitute_fetches(
         &mut self,
         candidates: Vec<(DrvHash, Vec<String>)>,
@@ -2230,13 +2239,15 @@ impl DagActor {
 // r[impl sched.substitute.detached+2]
 /// Auth source for the detached substitute closure walk.
 ///
-/// `Jwt` carries the gateway-forwarded tenant token (merge-time, ~1h
-/// expiry) or `vec![]` for dev/no-tenant — used as-is, never re-minted.
 /// `Service` holds `(signer, tenant_id)` and re-mints a fresh
 /// `SUBSTITUTE_FETCH_TIMEOUT`-expiry token on every `mint()` so a long
 /// closure walk or time parked on `substitute_sem` can't outlive the
 /// token (a 60s spawn-time token expired mid-walk → later QPIs
-/// `NotFound` → spurious `ok=false`).
+/// `NotFound` → spurious `ok=false`). Both merge-time and dispatch-time
+/// callers now use `Service` (via `substitute_auth_for_tenant`): the
+/// gateway JWT is single-shot and a wide cold closure can outlive its
+/// ~65 min expiry. `Jwt` remains only for the dev/no-signer/no-tenant
+/// fallback (`vec![]` — no-auth) where re-minting is meaningless.
 #[derive(Clone)]
 pub(super) enum SubstituteAuth {
     Jwt(Vec<(&'static str, String)>),
@@ -2334,9 +2345,9 @@ pub(super) async fn walk_substitute_closure(
         // time on `substitute_sem` outlived the token. `Jwt` is a
         // cheap clone. Only the per-path QPIs need tenant context (for
         // store-side `try_substitute_on_miss → tenant_upstreams`).
-        let meta_owned = auth.mint();
-        let meta: Vec<(&'static str, &str)> =
-            meta_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let mut meta_owned = auth.mint();
+        let mut paths_since_mint = 0usize;
+        let mut mint_at = Instant::now();
         // Layer-batched fast-path: drain the current frontier into one
         // BatchQueryPathInfo. Present refs (warm in PG) push their
         // references; absent refs go to per-path QPI to trigger
@@ -2387,6 +2398,25 @@ pub(super) async fn walk_substitute_closure(
         // try_substitute. Same retry/error handling as before; on
         // success, push references for the next layer.
         'paths: for p in absent {
+            // Per-path re-mint cadence: the per-layer mint above is
+            // not enough — this serial loop can run >30 min on a wide
+            // cold layer (hundreds of paths × admission-wait + retry
+            // backoff each), outliving a `Service` token. Re-mint
+            // every `SUBSTITUTE_REMINT_PATHS` paths OR
+            // `SUBSTITUTE_REMINT_INTERVAL` elapsed, whichever first.
+            // Expired-token QPI surfaces as `NotFound`/
+            // `Unauthenticated` (NON-transient) → spurious `ok=false`
+            // → demote to build-from-source.
+            if paths_since_mint >= super::SUBSTITUTE_REMINT_PATHS
+                || mint_at.elapsed() >= super::SUBSTITUTE_REMINT_INTERVAL
+            {
+                meta_owned = auth.mint();
+                paths_since_mint = 0;
+                mint_at = Instant::now();
+            }
+            paths_since_mint += 1;
+            let meta: Vec<(&'static str, &str)> =
+                meta_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
             for attempt in 0..super::SUBSTITUTE_FETCH_MAX_ATTEMPTS {
                 if shutdown.is_cancelled() {
                     return false;
