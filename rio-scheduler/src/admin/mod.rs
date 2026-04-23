@@ -122,6 +122,11 @@ pub struct AdminServiceImpl {
     /// Empty for the single-cluster default (matches the `DEFAULT ''`
     /// migration-043 column).
     cluster: String,
+    /// Full `[sla]` block — `import_sla_corpus` calls
+    /// `prior::validate_corpus(&corpus, &self.sla_config)` BEFORE the
+    /// corpus reaches the actor (`r[sched.sla.threat.corpus-clamp]`).
+    /// `Arc` because `DagActor` holds the same.
+    sla_config: Arc<crate::sla::config::SlaConfig>,
     /// Verifies `x-rio-service-token` for controller-only mutating RPCs
     /// (`AppendInterruptSample`, `DrainExecutor`). `None` = dev mode
     /// (accept all) — same pass-through pattern as the store's
@@ -144,6 +149,7 @@ impl AdminServiceImpl {
         leader: crate::lease::LeaderState,
         shutdown: rio_common::signal::Token,
         cluster: String,
+        sla_config: Arc<crate::sla::config::SlaConfig>,
         service_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
     ) -> Self {
         Self {
@@ -157,6 +163,7 @@ impl AdminServiceImpl {
             leader,
             shutdown,
             cluster,
+            sla_config,
             service_verifier,
         }
     }
@@ -964,6 +971,13 @@ impl AdminService for AdminServiceImpl {
             _ => serde_json::from_str(&r.json)
                 .map_err(|e| Status::invalid_argument(format!("parse corpus json: {e}")))?,
         };
+        // r[impl sched.sla.threat.corpus-clamp]
+        // Gap (c): is_finite + range checks BEFORE the corpus reaches
+        // the actor / priors.seed. The seed table bypasses
+        // clamp_to_operator, so a single `s = 1e308` would otherwise
+        // propagate verbatim into partial_pool → T(c) → solve.
+        crate::sla::prior::validate_corpus(&corpus, &self.sla_config)
+            .map_err(|e| Status::invalid_argument(format!("corpus rejected: {e}")))?;
         let ref_hw_class = corpus.ref_hw_class.clone();
         let (n, scale) = query_actor(&self.actor, |reply| {
             ActorCommand::Admin(AdminQuery::SlaImportCorpus { corpus, reply })
@@ -976,42 +990,56 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
-    /// VM-test fixture: write one synthetic `build_samples` row. Gated
-    /// on `RIO_ADMIN_TEST_FIXTURES` so a misrouted prod call is refused
-    /// even with admin auth — the env var is only set by the sla-sizing
-    /// VM scenario's standalone fixture.
+    /// VM-test fixture: write one synthetic `build_samples` row.
+    /// Compile-gated on `feature = "test-fixtures"` (default-on; same
+    /// pattern as rio-builder's `RIO_BUILDER_SCRIPT` — crate2nix bakes
+    /// features at lock-time so a per-crate override hook doesn't
+    /// exist) AND runtime-gated on `RIO_ADMIN_TEST_FIXTURES` so a
+    /// misrouted prod call is refused even with admin auth. The env var
+    /// is only set by the sla-sizing VM scenario's standalone fixture.
     #[instrument(skip(self, request), fields(rpc = "InjectBuildSample"))]
     async fn inject_build_sample(
         &self,
         request: Request<InjectBuildSampleRequest>,
     ) -> Result<Response<()>, Status> {
-        rio_proto::interceptor::link_parent(&request);
-        // Service-token gate first (defence-in-depth: env-gate below is
-        // NOT authz; a misconfigured prod with the var set is still gated).
-        self.ensure_service_caller(request.metadata(), &["rio-cli"])?;
-        self.ensure_leader()?;
-        if std::env::var_os("RIO_ADMIN_TEST_FIXTURES").is_none() {
-            return Err(Status::permission_denied(
-                "InjectBuildSample is a test fixture; set RIO_ADMIN_TEST_FIXTURES to enable",
-            ));
+        #[cfg(feature = "test-fixtures")]
+        {
+            rio_proto::interceptor::link_parent(&request);
+            // Service-token gate first (defence-in-depth: env-gate
+            // below is NOT authz; a misconfigured prod with the var set
+            // is still gated).
+            self.ensure_service_caller(request.metadata(), &["rio-cli"])?;
+            self.ensure_leader()?;
+            if std::env::var_os("RIO_ADMIN_TEST_FIXTURES").is_none() {
+                return Err(Status::permission_denied(
+                    "InjectBuildSample is a test fixture; set RIO_ADMIN_TEST_FIXTURES to enable",
+                ));
+            }
+            let r = request.into_inner();
+            let db = crate::db::SchedulerDb::new(self.pool.clone());
+            db.write_build_sample(&crate::db::BuildSampleRow {
+                pname: r.pname,
+                system: r.system,
+                tenant: r.tenant,
+                duration_secs: r.duration_secs,
+                peak_memory_bytes: r.peak_memory_bytes,
+                cpu_limit_cores: r.cpu_limit_cores,
+                cpu_seconds_total: r.cpu_seconds_total,
+                version: r.version,
+                hw_class: r.hw_class,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| Status::internal(format!("write_build_sample: {e}")))?;
+            Ok(Response::new(()))
         }
-        let r = request.into_inner();
-        let db = crate::db::SchedulerDb::new(self.pool.clone());
-        db.write_build_sample(&crate::db::BuildSampleRow {
-            pname: r.pname,
-            system: r.system,
-            tenant: r.tenant,
-            duration_secs: r.duration_secs,
-            peak_memory_bytes: r.peak_memory_bytes,
-            cpu_limit_cores: r.cpu_limit_cores,
-            cpu_seconds_total: r.cpu_seconds_total,
-            version: r.version,
-            hw_class: r.hw_class,
-            ..Default::default()
-        })
-        .await
-        .map_err(|e| Status::internal(format!("write_build_sample: {e}")))?;
-        Ok(Response::new(()))
+        #[cfg(not(feature = "test-fixtures"))]
+        {
+            let _ = request;
+            Err(Status::unimplemented(
+                "InjectBuildSample requires a test-fixtures build",
+            ))
+        }
     }
 
     /// ADR-023 phase-13: append one `interrupt_samples` row. Called by

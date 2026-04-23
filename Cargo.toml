@@ -129,6 +129,9 @@ figment = { version = "0.10", features = ["toml", "env", "test"] }
 # Concurrent map (phase2b: scheduler log ring buffers, written from
 # BuildExecution recv tasks outside the actor loop)
 dashmap = "6"
+# Per-tenant SlaEstimator fit cache (ADR-023 §Threat-model gap c).
+# Already transitive via aws-sdk-* (zero lockfile churn).
+lru = "0.16"
 
 # Per-tenant rate limiting (phase4b gateway). DefaultKeyedRateLimiter
 # keyed on tenant_name (bounded keyspace — authorized_keys comment is

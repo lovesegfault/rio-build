@@ -1635,7 +1635,11 @@ impl DagActor {
                         // drv-declared sizing inputs — on the dag node.
                         version: state.version.clone(),
                         enable_parallel_building: state.enable_parallel_building,
+                        enable_parallel_checking: state.enable_parallel_checking,
                         prefer_local_build: state.prefer_local_build,
+                        // §A17: FOD fleet-prior exclusion keyed on
+                        // output-spec, not pname-absence.
+                        is_fixed_output: Some(state.is_fixed_output),
                         node_name,
                         // r[impl sched.sla.hw-ref-seconds]
                         // From CompletionReport.hw_class (builder reads

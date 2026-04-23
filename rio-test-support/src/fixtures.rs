@@ -71,6 +71,7 @@ pub fn make_derivation_node(tag: &str, system: &str) -> DerivationNode {
         needs_resolve: false,
         version: None,
         enable_parallel_building: None,
+        enable_parallel_checking: None,
         prefer_local_build: None,
     }
 }

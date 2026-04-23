@@ -105,7 +105,9 @@ async fn test_write_build_sample_full_telemetry() -> anyhow::Result<()> {
         hw_class: None,
         node_name: Some("ip-10-0-1-42.ec2.internal".into()),
         enable_parallel_building: Some(true),
+        enable_parallel_checking: Some(false),
         prefer_local_build: Some(false),
+        is_fixed_output: Some(false),
         completed_at: 0.0, // ignored on write — server-side now()
         id: 0,
     };
@@ -580,6 +582,7 @@ async fn test_refresh_outlier_gate_normalizes_hw_class() -> anyhow::Result<()> {
         hw_bias: std::collections::HashMap::new(),
         alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
+        is_fod: false,
     });
 
     let row = |c: f64, t: f64, hw: &str| BuildSampleRow {

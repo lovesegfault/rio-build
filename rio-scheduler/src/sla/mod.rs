@@ -1,8 +1,10 @@
 //! ADR-023 SLA-driven per-derivation sizing.
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
 
 use crate::db::{SchedulerDb, SlaOverrideRow};
@@ -23,6 +25,13 @@ pub mod prior;
 pub mod quantile;
 pub mod solve;
 pub mod types;
+
+/// Per-tenant fit-cache key: `(pname, system)`. The tenant lives in the
+/// outer `HashMap` so the LRU bound is per-tenant
+/// (`r[sched.sla.threat.corpus-clamp]` — one tenant's 10⁶ distinct
+/// pnames can't OOM the scheduler or evict other tenants' fits).
+type FitKey = (String, String);
+type FitCache = HashMap<String, LruCache<FitKey, types::FittedParams>>;
 
 /// cgroup poll interval (`executor::monitors`). Feeds the MAD floor in
 /// [`ingest::is_outlier`] — a 1s sampler on a 10s build is ±10% wall-
@@ -52,7 +61,16 @@ pub(super) const FLEET_MEDIAN_MIN_TENANTS: usize = 5;
 /// — workspace sqlx has no chrono/time feature). It starts at 0.0 so the
 /// first refresh is a full warm: every existing sample is "new".
 pub struct SlaEstimator {
-    cache: Arc<RwLock<HashMap<types::ModelKey, types::FittedParams>>>,
+    /// `tenant → LruCache<(pname, system), FittedParams>` capped at
+    /// `[sla].max_keys_per_tenant`. ADR-023 §Threat-model: per-tenant
+    /// LRU so one tenant submitting 10⁶ distinct pnames evicts only
+    /// THEIR oldest fits, not other tenants'. `RwLock` (not per-tenant
+    /// `Mutex`) because [`Self::cached`] needs `&mut LruCache` to bump
+    /// recency — the dispatch hot-path takes a write guard either way.
+    cache: Arc<RwLock<FitCache>>,
+    /// `[sla].max_keys_per_tenant` — captured here so [`Self::insert`]
+    /// can construct a fresh `LruCache` for a never-seen tenant.
+    max_keys_per_tenant: NonZeroUsize,
     /// Non-expired `sla_overrides` rows. Full-table snapshot, refreshed
     /// each [`Self::refresh`] tick. Dispatch reads via
     /// [`Self::resolved_override`] (O(n) scan; n is operator-written —
@@ -134,6 +152,8 @@ impl SlaEstimator {
         }));
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
+            max_keys_per_tenant: NonZeroUsize::new(cfg.max_keys_per_tenant.max(1))
+                .expect("max(1) ⇒ nonzero"),
             overrides: Arc::new(RwLock::new(Vec::new())),
             hw: Arc::new(RwLock::new(hw::HwTable::default())),
             priors,
@@ -209,11 +229,13 @@ impl SlaEstimator {
 
     /// Per-pname α for `key` from the cache, or [`alpha::UNIFORM`] when
     /// unfitted. For per-completion metrics paths that need a scalar
-    /// `α·factor` before the new sample lands in the ring.
+    /// `α·factor` before the new sample lands in the ring. Same
+    /// write-guard `.get()` recency-bump as [`Self::cached`].
     pub fn cached_alpha(&self, key: &types::ModelKey) -> alpha::Alpha {
         self.cache
-            .read()
-            .get(key)
+            .write()
+            .get_mut(&key.tenant)
+            .and_then(|lru| lru.get(&(key.pname.clone(), key.system.clone())))
             .map_or(alpha::UNIFORM, |f| f.alpha)
     }
 
@@ -234,8 +256,9 @@ impl SlaEstimator {
     pub fn export_corpus(&self, tenant: Option<&str>, min_n: u32) -> prior::SeedCorpus {
         let cache = self.cache.read();
         let mut entries: Vec<prior::SeedEntry> = cache
-            .values()
-            .filter(|f| tenant.is_none_or(|t| f.key.tenant == t))
+            .iter()
+            .filter(|(t, _)| tenant.is_none_or(|want| *t == want))
+            .flat_map(|(_, lru)| lru.iter().map(|(_, f)| f))
             .filter(|f| f.n_eff >= f64::from(min_n))
             .filter_map(|f| {
                 let (s, p, q) = f.fit.spq();
@@ -316,9 +339,24 @@ impl SlaEstimator {
     }
 
     /// Snapshot one cached fit. `None` for never-seen keys — caller falls
-    /// back to the cold-start probe path.
+    /// back to the cold-start probe path. Takes the write guard:
+    /// `LruCache::get` bumps recency (`&mut self`).
     pub fn cached(&self, key: &types::ModelKey) -> Option<types::FittedParams> {
-        self.cache.read().get(key).cloned()
+        self.cache
+            .write()
+            .get_mut(&key.tenant)?
+            .get(&(key.pname.clone(), key.system.clone()))
+            .cloned()
+    }
+
+    /// Insert/replace one fit, creating the per-tenant LRU on first
+    /// sight. Evicts the tenant's least-recently-used key if at cap.
+    fn insert(&self, key: &types::ModelKey, fit: types::FittedParams) {
+        self.cache
+            .write()
+            .entry(key.tenant.clone())
+            .or_insert_with(|| LruCache::new(self.max_keys_per_tenant))
+            .put((key.pname.clone(), key.system.clone()), fit);
     }
 
     /// `T_min` (**ref-seconds**, hw-normalized — NOT wall-clock) for
@@ -352,7 +390,10 @@ impl SlaEstimator {
     /// — next dispatch falls back to the cold-start probe path. Returns
     /// whether an entry was present.
     pub fn evict(&self, key: &types::ModelKey) -> bool {
-        self.cache.write().remove(key).is_some()
+        self.cache
+            .write()
+            .get_mut(&key.tenant)
+            .is_some_and(|lru| lru.pop(&(key.pname.clone(), key.system.clone())).is_some())
     }
 
     /// Most-specific override matching `key` from the last-refreshed
@@ -374,7 +415,8 @@ impl SlaEstimator {
     /// ephemeral PG round-trip.
     #[cfg(test)]
     pub fn seed(&self, fit: types::FittedParams) {
-        self.cache.write().insert(fit.key.clone(), fit);
+        let key = fit.key.clone();
+        self.insert(&key, fit);
     }
 
     /// Test constructor: `[sla]`-configured estimator without touching
@@ -490,7 +532,15 @@ impl SlaEstimator {
             if i > 0 && i.is_multiple_of(64) {
                 tokio::task::yield_now().await;
             }
-            let prev = self.cache.read().get(key).cloned();
+            // peek (not get): don't bump recency on the refit pass —
+            // `cached()` from dispatch is the authoritative "this key
+            // is in use" signal.
+            let prev = self
+                .cache
+                .read()
+                .get(&key.tenant)
+                .and_then(|lru| lru.peek(&(key.pname.clone(), key.system.clone())))
+                .cloned();
             // r[impl sched.sla.outlier-mad-reject]
             // BEFORE refit: score each NEW sample for this key against
             // the PREVIOUS fit. A 3·1.4826·MAD outlier is flagged in PG
@@ -532,7 +582,7 @@ impl SlaEstimator {
                 &hw_snapshot,
                 Some(&priors_snapshot),
             );
-            self.cache.write().insert(key.clone(), fit);
+            self.insert(key, fit);
         }
 
         // Persist outlier flags BEFORE advancing `hwm`. NOT best-effort:
@@ -564,10 +614,15 @@ impl SlaEstimator {
         // fits feed the NEXT tick's prior (one-tick lag is fine — the
         // fleet aggregate moves slowly). Only Coupled-mem fits
         // contribute (FitParams.{a,b} are meaningless for Independent).
+        // §A17: FOD fits are excluded — download-time outliers, not
+        // build-time, and a tenant's fetchurl corpus would otherwise
+        // drag the cross-tenant median.
         let coupled: Vec<(types::ModelKey, prior::FitParams)> = self
             .cache
             .read()
             .values()
+            .flat_map(|lru| lru.iter().map(|(_, f)| f))
+            .filter(|f| !f.is_fod)
             .filter_map(|f| {
                 let (s, p, q) = f.fit.spq();
                 if !s.is_finite() {
@@ -663,7 +718,103 @@ mod tests {
             hw_bias: HashMap::new(),
             alpha: crate::sla::alpha::UNIFORM,
             prior_source: None,
+            is_fod: false,
         }
+    }
+
+    /// §A15(b): per-tenant LRU evicts least-recently-used at cap.
+    /// `cached()` bumps recency; `seed()`/`insert()` past cap evicts.
+    #[test]
+    fn lru_evicts_oldest_at_cap_per_tenant() {
+        let est = SlaEstimator::for_test(&config::SlaConfig {
+            max_keys_per_tenant: 3,
+            ..cfg()
+        });
+        for i in 0..3 {
+            est.seed(fitted(&format!("p{i}"), 5.0));
+        }
+        // All present.
+        for i in 0..3 {
+            assert!(est.cached(&fitted(&format!("p{i}"), 0.0).key).is_some());
+        }
+        // 4th insert evicts. The cached() loop above bumped p0..p2 in
+        // order, so p0 is least-recent.
+        est.seed(fitted("p3", 5.0));
+        assert!(est.cached(&fitted("p0", 0.0).key).is_none(), "p0 evicted");
+        assert!(est.cached(&fitted("p1", 0.0).key).is_some());
+        assert!(est.cached(&fitted("p3", 0.0).key).is_some());
+        // Different tenant has its OWN cap — t0's eviction didn't touch
+        // t1, and t1 at cap=3 holds 3 independently.
+        for i in 0..3 {
+            let mut f = fitted(&format!("q{i}"), 5.0);
+            f.key.tenant = "t1".into();
+            est.seed(f);
+        }
+        let mut f = fitted("q0", 0.0);
+        f.key.tenant = "t1".into();
+        assert!(est.cached(&f.key).is_some(), "t1's q0 unaffected by t0");
+        // t0's surviving entries also untouched by t1's inserts.
+        assert!(est.cached(&fitted("p1", 0.0).key).is_some());
+    }
+
+    /// §A17: `is_fod=true` fits are excluded from the fleet-median input
+    /// set (filter happens at the call site in `refresh()`, not in
+    /// `fleet_median` itself — the filter chain in refresh() is what
+    /// production runs). This test exercises the filter chain directly.
+    #[test]
+    fn fleet_median_input_excludes_fods() {
+        let est = SlaEstimator::for_test(&cfg());
+        // 3 normal fits across 3 tenants (so fleet_median's min-tenants
+        // gate passes), 1 FOD with a huge outlier P.
+        for (t, p) in [("t0", 100.0), ("t1", 200.0), ("t2", 300.0)] {
+            let mut f = fitted("hello", 10.0);
+            f.key.tenant = t.into();
+            f.fit = DurationFit::Amdahl {
+                s: RefSeconds(10.0),
+                p: RefSeconds(p),
+            };
+            est.seed(f);
+        }
+        let mut fod = fitted("source.tar.gz", 10.0);
+        fod.is_fod = true;
+        fod.key.tenant = "t3".into();
+        fod.fit = DurationFit::Amdahl {
+            s: RefSeconds(1e6),
+            p: RefSeconds(1e6),
+        };
+        est.seed(fod);
+        // Replicate refresh()'s fleet-median input collection.
+        let coupled: Vec<(ModelKey, prior::FitParams)> = est
+            .cache
+            .read()
+            .values()
+            .flat_map(|lru| lru.iter().map(|(_, f)| f))
+            .filter(|f| !f.is_fod)
+            .filter_map(|f| {
+                let (s, p, q) = f.fit.spq();
+                let MemFit::Coupled { a, b, .. } = f.mem else {
+                    return None;
+                };
+                Some((
+                    f.key.clone(),
+                    prior::FitParams {
+                        s,
+                        p,
+                        q,
+                        a,
+                        b,
+                        alpha: f.alpha,
+                    },
+                ))
+            })
+            .collect();
+        assert_eq!(coupled.len(), 3, "FOD excluded from input set");
+        let m = prior::fleet_median(&coupled, 3, 3).expect("3 keys, 3 tenants");
+        assert!(
+            (m.p - 200.0).abs() < 1e-9,
+            "median{{100,200,300}}, FOD ignored"
+        );
+        assert!(m.s < 1000.0, "FOD outlier did NOT contaminate");
     }
 
     // r[verify sched.sla.prior-partial-pool]

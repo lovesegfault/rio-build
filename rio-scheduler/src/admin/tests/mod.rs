@@ -57,6 +57,7 @@ pub(super) async fn setup_svc(
         crate::lease::LeaderState::default(),
         rio_common::signal::Token::new(),
         String::new(),
+        Arc::new(crate::sla::config::SlaConfig::test_default()),
         // service_verifier=None → dev-mode pass-through. Tests that
         // exercise the gate construct svc with Some(verifier) below.
         None,
@@ -226,6 +227,7 @@ async fn setup_svc_with_service_verifier() -> (
         crate::lease::LeaderState::default(),
         rio_common::signal::Token::new(),
         String::new(),
+        Arc::new(crate::sla::config::SlaConfig::test_default()),
         Some(verifier),
     );
     (svc, signer, task, db)

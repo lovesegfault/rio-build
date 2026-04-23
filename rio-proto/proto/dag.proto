@@ -77,6 +77,12 @@ message DerivationNode {
   // preferLocalBuild: true → trivially short (writeText, symlinkJoin,
   // etc.), skip learning entirely.
   optional bool prefer_local_build = 16;
+  // enableParallelChecking: ADR-023 §Model-staging — `enableParallelBuilding
+  // && !enableParallelChecking` is the common stdenv split where compile
+  // scales but checkPhase is serial. Recorded into build_samples
+  // (migration 056) so a later p̄:=1 seed can distinguish. Absent ≠ false
+  // (same as enable_parallel_building).
+  optional bool enable_parallel_checking = 17;
 }
 
 // A dependency edge in the derivation DAG.

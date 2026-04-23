@@ -291,6 +291,18 @@ impl ProbeShape {
 }
 
 impl SlaConfig {
+    /// Upper bound for time-domain seed-corpus parameters (S, P, Q) in
+    /// reference-seconds, for `r[sched.sla.threat.corpus-clamp]`. Not a
+    /// real timeout — a "this is pathological" gate. `P` is the 1-core
+    /// parallel time (`T(1)·1` in the Amdahl basis) so it can legitimately
+    /// be `wall × cores`; the bound is therefore `7d × max_cores` (~38 Ms
+    /// at `max_cores=64`, well above any real seed but well below the
+    /// `1e12` / `f64::MAX` an adversary would inject to NaN/Inf the
+    /// solver).
+    pub fn build_timeout_ref(&self) -> f64 {
+        7.0 * 86400.0 * self.max_cores
+    }
+
     /// Minimal `[sla]` block for tests and `Default for DagActorConfig`:
     /// single best-effort tier, 1-core probe, tiny ceilings sized for a
     /// VM-test pool. Production deployments override every field via

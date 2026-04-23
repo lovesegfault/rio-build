@@ -894,6 +894,18 @@ pub const M_055: () = ();
 /// `enable_parallel_building` already exists from 039.
 pub const M_056: () = ();
 
+/// `migrations/057_build_samples_is_fixed_output.sql`
+///
+/// `build_samples.is_fixed_output` (ADR-023 §13a §A17): FOD fleet-prior
+/// exclusion is keyed on the derivation's output-spec (`outputHashMode`
+/// set), NOT pname-absence. Named FODs exist (`fetchurl { name = … }`)
+/// and would otherwise pollute `fleet_median` with download-time
+/// outliers. The column is informational on the row (the SLA fit per
+/// `(pname, system, tenant)` ring is unchanged); `SlaEstimator::refresh`
+/// reads it to set `FittedParams.is_fod` so the fleet-aggregate filter
+/// can exclude.
+pub const M_057: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

@@ -363,6 +363,12 @@ pub fn validate_dag(
 /// `requiredSystemFeatures` / `__noChroot`) were always None for
 /// structuredAttrs drvs. JSON is checked first, then raw env, matching
 /// upstream semantics.
+/// Clamp for tenant-controlled string attrs (`pname`/`version`/`name`)
+/// that become cache keys / PG columns. 256 chars: longest real nixpkgs
+/// pname is ~90; this leaves headroom for monorepos with path-style
+/// pnames while bounding the per-key cost.
+const MAX_ATTR_LEN: usize = 256;
+
 pub(crate) struct StructuredEnv<'a> {
     env: &'a std::collections::BTreeMap<String, String>,
     json: Option<serde_json::Value>,
@@ -379,6 +385,20 @@ impl<'a> StructuredEnv<'a> {
             .as_ref()
             .and_then(|j| j.get(key)?.as_str().map(String::from))
             .or_else(|| self.env.get(key).cloned())
+    }
+
+    /// [`Self::string`] with a `MAX_ATTR_LEN`-char clamp. ADR-023
+    /// §Threat-model: `pname`/`version` are tenant-controlled and feed
+    /// the per-tenant `SlaEstimator` cache key + `build_samples.pname`
+    /// PG column; a 1 MiB pname is otherwise carried verbatim through
+    /// proto → DerivationNode → ModelKey → cache key → PG.
+    fn string_clamped(&self, key: &str) -> Option<String> {
+        self.string(key).map(|mut s| {
+            if s.chars().count() > MAX_ATTR_LEN {
+                s = s.chars().take(MAX_ATTR_LEN).collect();
+            }
+            s
+        })
     }
 
     pub(crate) fn bool(&self, key: &str) -> Option<bool> {
@@ -448,17 +468,19 @@ pub fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::Derivati
         // build_samples (keyed on pname,system) → cold-start probe
         // sizing every time. name includes version suffix so it's a
         // LESS stable key (hello-2.12 vs hello-2.13 are different
-        // rows), but some history beats none.
+        // rows), but some history beats none. Clamped at MAX_ATTR_LEN
+        // (§Threat-model: tenant-controlled, becomes a cache key).
         pname: env
-            .string("pname")
-            .or_else(|| env.string("name"))
+            .string_clamped("pname")
+            .or_else(|| env.string_clamped("name"))
             .unwrap_or_default(),
         // ADR-023 sizing attrs. Nix bool env values are "1"/"" (older
         // stdenv) or "true"/"false" (newer). Absent stays None — for
         // enableParallelBuilding in particular, absent ≠ false (nixpkgs
         // is migrating to default-true; None means "unknown, explore").
-        version: env.string("version"),
+        version: env.string_clamped("version"),
         enable_parallel_building: env.bool("enableParallelBuilding"),
+        enable_parallel_checking: env.bool("enableParallelChecking"),
         prefer_local_build: env.bool("preferLocalBuild"),
         system: drv.platform().to_string(),
         required_features: env.strings("requiredSystemFeatures").unwrap_or_default(),
@@ -884,6 +906,7 @@ mod tests {
         let node = build_node("/nix/store/x.drv", &drv);
         assert_eq!(node.version.as_deref(), Some("2.12"));
         assert_eq!(node.enable_parallel_building, Some(true));
+        assert_eq!(node.enable_parallel_checking, None, "absent stays None");
         assert_eq!(node.prefer_local_build, Some(true));
 
         // Explicit false: "" and "false" both → Some(false), distinct
@@ -891,11 +914,51 @@ mod tests {
         // spells false.
         let mut env = BTreeMap::new();
         env.insert("enableParallelBuilding".into(), "".into());
+        env.insert("enableParallelChecking".into(), "1".into());
         env.insert("preferLocalBuild".into(), "false".into());
         let drv = make_basic_drv(env)?;
         let node = build_node("/nix/store/x.drv", &drv);
         assert_eq!(node.enable_parallel_building, Some(false));
+        assert_eq!(node.enable_parallel_checking, Some(true));
         assert_eq!(node.prefer_local_build, Some(false));
+        Ok(())
+    }
+
+    /// ADR-023 §Threat-model: tenant-controlled `pname`/`version` are
+    /// clamped at 256 chars before they become cache keys / PG columns.
+    #[test]
+    fn test_clamps_pname_and_version() -> anyhow::Result<()> {
+        let long = "x".repeat(10_000);
+        let mut env = BTreeMap::new();
+        env.insert("pname".into(), long.clone());
+        env.insert("version".into(), long.clone());
+        let drv = make_basic_drv(env)?;
+        let node = build_node("/nix/store/x.drv", &drv);
+        assert_eq!(node.pname.chars().count(), MAX_ATTR_LEN);
+        assert_eq!(
+            node.version.as_deref().map(|s| s.chars().count()),
+            Some(MAX_ATTR_LEN)
+        );
+        // name fallback also clamps.
+        let mut env = BTreeMap::new();
+        env.insert("name".into(), long.clone());
+        let drv = make_basic_drv(env)?;
+        let node = build_node("/nix/store/x.drv", &drv);
+        assert_eq!(node.pname.chars().count(), MAX_ATTR_LEN);
+        // Multi-byte: clamp is by chars not bytes (don't split a code
+        // point). 300×'é' (2 bytes each) → 256 chars = 512 bytes.
+        let mb = "é".repeat(300);
+        let mut env = BTreeMap::new();
+        env.insert("pname".into(), mb);
+        let drv = make_basic_drv(env)?;
+        let node = build_node("/nix/store/x.drv", &drv);
+        assert_eq!(node.pname.chars().count(), MAX_ATTR_LEN);
+        assert_eq!(node.pname.len(), MAX_ATTR_LEN * 2, "bytes ≠ chars");
+        // Under-threshold is unchanged (no spurious reallocation/copy).
+        let mut env = BTreeMap::new();
+        env.insert("pname".into(), "hello".into());
+        let drv = make_basic_drv(env)?;
+        assert_eq!(build_node("/nix/store/x.drv", &drv).pname, "hello");
         Ok(())
     }
 

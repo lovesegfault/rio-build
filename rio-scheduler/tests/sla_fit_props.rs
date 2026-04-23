@@ -61,6 +61,7 @@ fn mk_fit(s: f64, p: f64, q: f64, sigma: f64) -> FittedParams {
         hw_bias: Default::default(),
         alpha: rio_scheduler::sla::alpha::UNIFORM,
         prior_source: None,
+        is_fod: false,
     }
 }
 

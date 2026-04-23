@@ -33,7 +33,13 @@ pub struct BuildSampleRow {
     pub hw_class: Option<String>,
     pub node_name: Option<String>,
     pub enable_parallel_building: Option<bool>,
+    pub enable_parallel_checking: Option<bool>,
     pub prefer_local_build: Option<bool>,
+    /// drv `outputHashMode` set (strict `is_fixed_output` predicate).
+    /// ADR-023 §A17: FOD fleet-prior exclusion is keyed on this, not
+    /// pname-absence — named FODs (`fetchurl { name = … }`) exist.
+    /// `None` on rows written before migration 057.
+    pub is_fixed_output: Option<bool>,
     /// Unix epoch seconds. Read via `EXTRACT(EPOCH FROM completed_at)` —
     /// the workspace sqlx has no chrono/time feature, so TIMESTAMPTZ
     /// round-trips as f64 epoch (matches `tenants.rs` pattern). On the
@@ -84,9 +90,9 @@ impl SchedulerDb {
                (pname, system, tenant, duration_secs, peak_memory_bytes,
                 cpu_limit_cores, peak_cpu_cores, cpu_seconds_total,
                 peak_disk_bytes, peak_io_pressure_pct, version, hw_class,
-                node_name, enable_parallel_building, prefer_local_build,
-                completed_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now())",
+                node_name, enable_parallel_building, enable_parallel_checking,
+                prefer_local_build, is_fixed_output, completed_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,now())",
             row.pname,
             row.system,
             row.tenant,
@@ -101,7 +107,9 @@ impl SchedulerDb {
             row.hw_class,
             row.node_name,
             row.enable_parallel_building,
+            row.enable_parallel_checking,
             row.prefer_local_build,
+            row.is_fixed_output,
         )
         .execute(&self.pool)
         .await?;
@@ -146,7 +154,8 @@ impl SchedulerDb {
             SELECT id, pname, system, tenant, duration_secs, peak_memory_bytes,
                    cpu_limit_cores, peak_cpu_cores, cpu_seconds_total,
                    peak_disk_bytes, peak_io_pressure_pct, version, hw_class,
-                   node_name, enable_parallel_building, prefer_local_build,
+                   node_name, enable_parallel_building, enable_parallel_checking,
+                   prefer_local_build, is_fixed_output,
                    EXTRACT(EPOCH FROM completed_at)::float8 AS "completed_at!"
             FROM build_samples
             WHERE completed_at > to_timestamp($1) AND NOT outlier_excluded
@@ -199,7 +208,8 @@ impl SchedulerDb {
             SELECT id, pname, system, tenant, duration_secs, peak_memory_bytes,
                    cpu_limit_cores, peak_cpu_cores, cpu_seconds_total,
                    peak_disk_bytes, peak_io_pressure_pct, version, hw_class,
-                   node_name, enable_parallel_building, prefer_local_build,
+                   node_name, enable_parallel_building, enable_parallel_checking,
+                   prefer_local_build, is_fixed_output,
                    EXTRACT(EPOCH FROM completed_at)::float8 AS "completed_at!"
             FROM build_samples
             WHERE pname = $1 AND system = $2 AND tenant = $3
@@ -295,7 +305,8 @@ impl SchedulerDb {
             SELECT id, pname, system, tenant, duration_secs, peak_memory_bytes,
                    cpu_limit_cores, peak_cpu_cores, cpu_seconds_total,
                    peak_disk_bytes, peak_io_pressure_pct, version, hw_class,
-                   node_name, enable_parallel_building, prefer_local_build,
+                   node_name, enable_parallel_building, enable_parallel_checking,
+                   prefer_local_build, is_fixed_output,
                    EXTRACT(EPOCH FROM completed_at)::float8 AS "completed_at!"
             FROM (
               SELECT *, ROW_NUMBER() OVER

@@ -816,6 +816,7 @@ mod tests {
             hw_bias: Default::default(),
             alpha: crate::sla::alpha::UNIFORM,
             prior_source: None,
+            is_fod: false,
         }
     }
     fn t(name: &str, p90: f64) -> Tier {

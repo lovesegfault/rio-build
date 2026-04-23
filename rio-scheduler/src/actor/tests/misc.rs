@@ -1011,6 +1011,7 @@ async fn solve_intent_for_clamps_at_ceil() {
         hw_bias: Default::default(),
         alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
+        is_fod: false,
     });
     actor.test_inject_ready("d", Some("big"), "x86_64-linux", false);
     actor.dag.node_mut("d").unwrap().enable_parallel_building = Some(false);
@@ -1093,6 +1094,7 @@ async fn solve_intent_for_clamps_at_ceil() {
         hw_bias: Default::default(),
         alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
+        is_fod: false,
     });
     actor.test_inject_ready("w", Some("wide"), "x86_64-linux", false);
     let intent = actor.solve_intent_for(actor.dag.node("w").unwrap());
@@ -1145,6 +1147,7 @@ async fn solve_intent_for_probe_fit_uses_probe_deadline() {
         hw_bias: Default::default(),
         alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
+        is_fod: false,
     });
     actor.test_inject_ready("p", Some("exploring"), "x86_64-linux", false);
     let intent = actor.solve_intent_for(actor.dag.node("p").unwrap());
@@ -1203,6 +1206,7 @@ async fn solve_intent_for_subsecond_fit_floored_at_probe_deadline() {
         hw_bias: Default::default(),
         alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
+        is_fod: false,
     });
     actor.test_inject_ready("t", Some("trivial"), "x86_64-linux", false);
     let intent = actor.solve_intent_for(actor.dag.node("t").unwrap());

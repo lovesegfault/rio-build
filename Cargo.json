@@ -21470,6 +21470,10 @@
           "packageId": "kube"
         },
         {
+          "name": "lru",
+          "packageId": "lru"
+        },
+        {
           "name": "metrics",
           "packageId": "metrics"
         },
@@ -21659,6 +21663,10 @@
           "name": "tracing-test",
           "packageId": "tracing-test"
         }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "test-fixtures"
       ],
       "crateBin": [
         {

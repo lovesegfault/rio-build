@@ -272,6 +272,7 @@ mod tests {
             hw_bias: HashMap::new(),
             alpha: crate::sla::alpha::UNIFORM,
             prior_source: None,
+            is_fod: false,
         });
     }
 

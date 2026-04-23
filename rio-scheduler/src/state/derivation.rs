@@ -562,6 +562,11 @@ pub struct DerivationState {
     /// `Some(false)` → fix p̄=1 (no multi-core exploration). `None`
     /// means unknown (NOT false — historical stdenv default was unset).
     pub enable_parallel_building: Option<bool>,
+    /// drv.env `enableParallelChecking`. ADR-023 §Model-staging:
+    /// recorded into `build_samples` (migration 056) so a later p̄:=1
+    /// seed can distinguish "compile scales, checkPhase serial". Not
+    /// consulted by the solver yet — telemetry-only.
+    pub enable_parallel_checking: Option<bool>,
     /// drv.env `preferLocalBuild`. ADR-023: `Some(true)` → trivially
     /// short, skip learning entirely.
     pub prefer_local_build: Option<bool>,
@@ -680,6 +685,7 @@ impl DerivationState {
             pname: (!node.pname.is_empty()).then(|| node.pname.clone()),
             version: node.version.clone(),
             enable_parallel_building: node.enable_parallel_building,
+            enable_parallel_checking: node.enable_parallel_checking,
             prefer_local_build: node.prefer_local_build,
             system: node.system.clone(),
             required_features: node.required_features.clone(),
@@ -762,6 +768,7 @@ impl DerivationState {
             // gets NULL for these; the SLA fit tolerates sparse columns).
             version: None,
             enable_parallel_building: None,
+            enable_parallel_checking: None,
             prefer_local_build: None,
             system: row.system,
             required_features: row.required_features,
@@ -858,6 +865,7 @@ impl DerivationState {
             pname: row.pname,
             version: None,
             enable_parallel_building: None,
+            enable_parallel_checking: None,
             prefer_local_build: None,
             system: row.system,
             required_features: Vec::new(),

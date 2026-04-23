@@ -12,6 +12,16 @@ description = "DAG-aware build scheduler for rio-build"
 name = "rio-scheduler"
 path = "src/main.rs"
 
+[features]
+# AdminService.InjectBuildSample fixture (sla-sizing VM scenario): writes
+# a synthetic build_samples row keyed on (pname, system, tenant). Runtime-
+# gated on RIO_ADMIN_TEST_FIXTURES so default-on is harmless in production;
+# default because crate2nix bakes features at lock-time and the VM-test
+# workspace package has no per-crate feature override hook (same pattern
+# as rio-builder's RIO_BUILDER_SCRIPT intercept).
+default = ["test-fixtures"]
+test-fixtures = []
+
 [dependencies]
 rio-common = { workspace = true, features = ["postgres", "aws"] }
 rio-auth = { workspace = true }
@@ -98,6 +108,10 @@ hex = { workspace = true }
 # Sync RwLock for SLA fit-cache hot-swap (refit-hourly write, per-
 # dispatch read; no .await across guard).
 parking_lot = { workspace = true }
+# ADR-023 §Threat-model: per-tenant SlaEstimator fit cache capped at
+# `[sla].max_keys_per_tenant` so one tenant submitting 10⁶ distinct
+# pnames can't grow the in-memory cache unbounded.
+lru = { workspace = true }
 # ADR-023: NNLS fit + Φ/Student-t quantiles for SLA-driven sizing.
 # See sla/fit.rs.
 nalgebra = { workspace = true }

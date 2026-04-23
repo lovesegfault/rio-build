@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, pname, system, tenant, duration_secs, peak_memory_bytes,\n                   cpu_limit_cores, peak_cpu_cores, cpu_seconds_total,\n                   peak_disk_bytes, peak_io_pressure_pct, version, hw_class,\n                   node_name, enable_parallel_building, prefer_local_build,\n                   EXTRACT(EPOCH FROM completed_at)::float8 AS \"completed_at!\"\n            FROM build_samples\n            WHERE completed_at > to_timestamp($1) AND NOT outlier_excluded\n            ORDER BY completed_at\n            ",
+  "query": "\n            SELECT id, pname, system, tenant, duration_secs, peak_memory_bytes,\n                   cpu_limit_cores, peak_cpu_cores, cpu_seconds_total,\n                   peak_disk_bytes, peak_io_pressure_pct, version, hw_class,\n                   node_name, enable_parallel_building, enable_parallel_checking,\n                   prefer_local_build, is_fixed_output,\n                   EXTRACT(EPOCH FROM completed_at)::float8 AS \"completed_at!\"\n            FROM build_samples\n            WHERE pname = $1 AND system = $2 AND tenant = $3\n              AND NOT outlier_excluded\n            ORDER BY completed_at DESC\n            LIMIT $4\n            ",
   "describe": {
     "columns": [
       {
@@ -80,18 +80,31 @@
       },
       {
         "ordinal": 15,
-        "name": "prefer_local_build",
+        "name": "enable_parallel_checking",
         "type_info": "Bool"
       },
       {
         "ordinal": 16,
+        "name": "prefer_local_build",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 17,
+        "name": "is_fixed_output",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 18,
         "name": "completed_at!",
         "type_info": "Float8"
       }
     ],
     "parameters": {
       "Left": [
-        "Float8"
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
       ]
     },
     "nullable": [
@@ -111,8 +124,10 @@
       true,
       true,
       true,
+      true,
+      true,
       null
     ]
   },
-  "hash": "b9ce59ac2141c7297c93930b84119a7682b5b90d7bc36b65dbcf989cfb137045"
+  "hash": "0118b3cacd50d8598ebfa8519eb5e96cdbcecb5645256f7f02b40bcfde2608d5"
 }

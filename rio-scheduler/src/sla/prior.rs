@@ -12,7 +12,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use super::alpha::{UNIFORM, dot, simplex_project};
-use super::config::ProbeShape;
+use super::config::{ProbeShape, SlaConfig};
 use super::hw::{HwTable, K};
 use super::types::ModelKey;
 
@@ -152,6 +152,61 @@ impl From<rio_proto::types::SeedCorpus> for SeedCorpus {
                 .collect(),
         }
     }
+}
+
+// r[impl sched.sla.threat.corpus-clamp]
+/// Reject one entry whose params are non-finite or outside the
+/// `[sla]`-derived bounds. The seed table is operator-supplied (via
+/// `[sla].seedCorpus` file or `ImportSlaCorpus` RPC) and is exempt from
+/// the `clamp_to_operator` band that guards the fleet aggregate, so
+/// a single `s = 1e308` row would otherwise propagate verbatim into
+/// [`partial_pool`] → `T(c)` → `solve_intent_for`.
+///
+/// Bounds are coarse — they catch adversarial / corrupt inputs, not
+/// "this seed is a bit off". A legitimate seed that fails here is a
+/// config bug (e.g. `max_cores` too small for the exporting cluster).
+pub fn validate_seed_entry(e: &SeedEntry, cfg: &SlaConfig) -> Result<(), String> {
+    let bt_ref = cfg.build_timeout_ref();
+    macro_rules! check {
+        ($f:expr, $name:literal, $lo:expr, $hi:expr) => {
+            if !$f.is_finite() || !($lo..=$hi).contains(&$f) {
+                return Err(format!(
+                    "{}={}: {} out of [{}, {}]",
+                    e.pname, $name, $f, $lo, $hi
+                ));
+            }
+        };
+    }
+    check!(e.s, "S", 0.0, bt_ref);
+    check!(e.p, "P", 0.0, bt_ref);
+    check!(e.q, "Q", 0.0, bt_ref);
+    check!(e.p_bar, "p̄", 0.0, cfg.max_cores);
+    check!(e.a, "a", 0.0, cfg.max_mem as f64);
+    check!(e.b, "b", 0.0, cfg.max_mem as f64);
+    check!(e.n_eff, "n_eff", 0.0, 32.0);
+    for (d, &x) in e.alpha.iter().enumerate() {
+        if !x.is_finite() || !(0.0..=1.0).contains(&x) {
+            return Err(format!("{}: α[{d}]={x} out of [0, 1]", e.pname));
+        }
+    }
+    Ok(())
+}
+
+/// Reject a corpus whose `ref_factor_vec` is out-of-band or any of
+/// whose entries fail [`validate_seed_entry`]. Called from
+/// `AdminService::import_sla_corpus` BEFORE the corpus reaches the
+/// actor (so a rejected import never touches `priors.seed`), and from
+/// [`SeedCorpus::load`] so a malformed `[sla].seedCorpus` file is
+/// rejected at startup.
+pub fn validate_corpus(c: &SeedCorpus, cfg: &SlaConfig) -> Result<(), String> {
+    for (d, &f) in c.ref_factor_vec.iter().enumerate() {
+        if !f.is_finite() || !(0.1..=10.0).contains(&f) {
+            return Err(format!("ref_factor_vec[{d}]={f} out of [0.1, 10]"));
+        }
+    }
+    c.entries
+        .iter()
+        .try_for_each(|e| validate_seed_entry(e, cfg))
 }
 
 impl SeedCorpus {
@@ -953,5 +1008,154 @@ mod tests {
             "s=500 clamps to 2×150=300; got {}",
             clamped.s
         );
+    }
+
+    fn vcfg() -> SlaConfig {
+        SlaConfig {
+            max_cores: 64.0,
+            max_mem: 256 * GIB,
+            ..SlaConfig::test_default()
+        }
+    }
+
+    fn ok_entry() -> SeedEntry {
+        SeedEntry {
+            pname: "hello".into(),
+            system: "x86_64-linux".into(),
+            version: "2.12".into(),
+            s: 30.0,
+            p: 600.0,
+            q: 0.01,
+            p_bar: 8.0,
+            a: 22.0,
+            b: 0.5,
+            n: 5,
+            n_eff: 5.0,
+            alpha: vec![0.2, 0.8],
+        }
+    }
+
+    // r[verify sched.sla.threat.corpus-clamp]
+    #[test]
+    fn validate_rejects_non_finite() {
+        let cfg = vcfg();
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 1e12] {
+            for setter in [
+                |e: &mut SeedEntry, v| e.s = v,
+                |e: &mut SeedEntry, v| e.p = v,
+                |e: &mut SeedEntry, v| e.q = v,
+                |e: &mut SeedEntry, v| e.a = v,
+                |e: &mut SeedEntry, v| e.b = v,
+                |e: &mut SeedEntry, v| e.n_eff = v,
+                |e: &mut SeedEntry, v| e.p_bar = v,
+            ] {
+                let mut e = ok_entry();
+                setter(&mut e, bad);
+                assert!(
+                    validate_seed_entry(&e, &cfg).is_err(),
+                    "{bad} accepted on a scalar field"
+                );
+            }
+            // alpha vector: each element checked.
+            let mut e = ok_entry();
+            e.alpha = vec![0.5, bad];
+            assert!(validate_seed_entry(&e, &cfg).is_err(), "α={bad} accepted");
+        }
+        // Control: ok_entry passes.
+        assert!(validate_seed_entry(&ok_entry(), &cfg).is_ok());
+    }
+
+    // r[verify sched.sla.threat.corpus-clamp]
+    #[test]
+    fn validate_clamps_ranges() {
+        let cfg = vcfg();
+        let bt_ref = cfg.build_timeout_ref();
+        // S/P/Q ∈ [0, bt_ref]
+        let mut e = ok_entry();
+        e.s = bt_ref + 1.0;
+        assert!(validate_seed_entry(&e, &cfg).is_err(), "S > bt_ref");
+        let mut e = ok_entry();
+        e.q = -0.1;
+        assert!(validate_seed_entry(&e, &cfg).is_err(), "Q < 0");
+        // p̄ ∈ [0, max_cores] (0 is the export sentinel for ∞)
+        let mut e = ok_entry();
+        e.p_bar = cfg.max_cores + 1.0;
+        assert!(validate_seed_entry(&e, &cfg).is_err(), "p̄ > max_cores");
+        let mut e = ok_entry();
+        e.p_bar = 0.0;
+        assert!(
+            validate_seed_entry(&e, &cfg).is_ok(),
+            "p̄=0 is the ∞ sentinel from export_corpus"
+        );
+        // n_eff ∈ [0, 32]
+        let mut e = ok_entry();
+        e.n_eff = 33.0;
+        assert!(validate_seed_entry(&e, &cfg).is_err(), "n_eff > 32");
+        // a, b ∈ [0, max_mem]
+        let mut e = ok_entry();
+        e.a = (256.0 * GIB as f64) + 1.0;
+        assert!(validate_seed_entry(&e, &cfg).is_err(), "a > max_mem");
+        // α ∈ [0, 1]^K
+        let mut e = ok_entry();
+        e.alpha = vec![1.1];
+        assert!(validate_seed_entry(&e, &cfg).is_err(), "α > 1");
+        // ref_factor_vec ∈ [0.1, 10]^K
+        let bad_vec = SeedCorpus {
+            ref_hw_class: "x".into(),
+            ref_factor_vec: vec![0.05, 1.0, 1.0],
+            entries: vec![ok_entry()],
+        };
+        assert!(validate_corpus(&bad_vec, &cfg).is_err(), "factor < 0.1");
+        let bad_vec = SeedCorpus {
+            ref_factor_vec: vec![1.0, 11.0],
+            ..bad_vec
+        };
+        assert!(validate_corpus(&bad_vec, &cfg).is_err(), "factor > 10");
+        // validate_corpus also checks every entry.
+        let bad_entry = SeedCorpus {
+            ref_hw_class: "x".into(),
+            ref_factor_vec: vec![1.0],
+            entries: vec![ok_entry(), {
+                let mut e = ok_entry();
+                e.s = f64::NAN;
+                e
+            }],
+        };
+        assert!(validate_corpus(&bad_entry, &cfg).is_err());
+        // Clean corpus passes.
+        let ok = SeedCorpus {
+            ref_hw_class: "x".into(),
+            ref_factor_vec: vec![1.0, 2.0],
+            entries: vec![ok_entry()],
+        };
+        assert!(validate_corpus(&ok, &cfg).is_ok());
+    }
+
+    // r[verify sched.sla.threat.corpus-clamp]
+    #[test]
+    fn validate_accepts_v1_entry_defaults() {
+        // v1 JSON has no version/alpha/n_eff/ref_factor_vec → all
+        // serde-default to empty/0.0. The validator must accept those
+        // defaults so a v1 corpus still imports.
+        let cfg = vcfg();
+        let v1 = SeedEntry {
+            pname: "hello".into(),
+            system: "x86_64-linux".into(),
+            s: 30.0,
+            p: 600.0,
+            q: 0.0,
+            p_bar: 8.0,
+            a: 22.0,
+            b: 0.5,
+            n: 5,
+            ..Default::default()
+        };
+        assert!(validate_seed_entry(&v1, &cfg).is_ok());
+        let c = SeedCorpus {
+            ref_hw_class: "x".into(),
+            entries: vec![v1],
+            ..Default::default()
+        };
+        assert!(validate_corpus(&c, &cfg).is_ok(), "empty ref_factor_vec ok");
     }
 }

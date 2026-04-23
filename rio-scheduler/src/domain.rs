@@ -67,6 +67,7 @@ pub struct DerivationNode {
     /// optional: absent ≠ false/empty (see dag.proto field comments).
     pub version: Option<String>,
     pub enable_parallel_building: Option<bool>,
+    pub enable_parallel_checking: Option<bool>,
     pub prefer_local_build: Option<bool>,
 }
 
@@ -87,6 +88,7 @@ impl From<proto::DerivationNode> for DerivationNode {
             needs_resolve: n.needs_resolve,
             version: n.version,
             enable_parallel_building: n.enable_parallel_building,
+            enable_parallel_checking: n.enable_parallel_checking,
             prefer_local_build: n.prefer_local_build,
         }
     }

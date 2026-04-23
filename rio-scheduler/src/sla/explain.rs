@@ -242,6 +242,7 @@ mod tests {
             hw_bias: Default::default(),
             alpha: crate::sla::alpha::UNIFORM,
             prior_source: None,
+            is_fod: false,
         }
     }
     fn key() -> ModelKey {

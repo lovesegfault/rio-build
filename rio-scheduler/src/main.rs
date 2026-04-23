@@ -155,6 +155,10 @@ async fn main() -> anyhow::Result<()> {
     // default seeds are used and the poller only runs the λ refresh.
     let hw_cost_source = cfg.sla.hw_cost_source;
     let sla_cluster = cfg.sla.cluster.clone();
+    // r[sched.sla.threat.corpus-clamp]: AdminServiceImpl needs the
+    // [sla] block for ImportSlaCorpus param-range validation. Cloned
+    // before cfg.sla is moved into DagActorConfig below.
+    let sla_for_admin = std::sync::Arc::new(cfg.sla.clone());
     let cost_table = std::sync::Arc::new(parking_lot::RwLock::new(
         rio_scheduler::sla::cost::CostTable::load(&SchedulerDb::new(pool.clone()), &sla_cluster)
             .await
@@ -338,6 +342,7 @@ async fn main() -> anyhow::Result<()> {
         leader_for_admin,
         shutdown.clone(),
         sla_cluster,
+        sla_for_admin,
         service_verifier,
     );
 

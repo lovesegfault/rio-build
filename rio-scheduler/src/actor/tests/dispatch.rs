@@ -1593,6 +1593,7 @@ async fn spawn_intent_from_sla_estimator() {
         hw_bias: Default::default(),
         alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
+        is_fod: false,
     });
 
     // "fitted" matches the seeded key; "cold" has no fit (different
@@ -1751,6 +1752,7 @@ async fn ladder_cap_forces_band_agnostic_after_n_timeouts() {
         hw_bias: Default::default(),
         alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
+        is_fod: false,
     });
     actor.test_inject_ready("d", Some("p"), "x86_64-linux", false);
 
@@ -1993,6 +1995,7 @@ async fn spawn_intent_node_selector_from_solve_full() {
         hw_bias: Default::default(),
         alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
+        is_fod: false,
     });
 
     actor.test_inject_ready("fitted", Some("test-pkg"), "x86_64-linux", false);
@@ -2149,6 +2152,7 @@ async fn solve_full_gate_skips_fod_kvm_serial_and_override() {
         hw_bias: Default::default(),
         alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
+        is_fod: false,
     });
 
     // Baseline (non-FOD, no features) — proves the fixture DOES route
@@ -2276,6 +2280,7 @@ async fn work_assignment_carries_sla_cores() {
         hw_bias: Default::default(),
         alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
+        is_fod: false,
     });
 
     actor.test_inject_ready("fitted", Some("test-pkg"), "x86_64-linux", false);
@@ -2359,6 +2364,7 @@ async fn solve_intent_deadline_denormalized_to_slowest_hw() {
         hw_bias: Default::default(),
         alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
+        is_fod: false,
     });
     actor.test_inject_ready("d", Some("test-pkg"), "x86_64-linux", false);
     let state = actor.dag.node("d").unwrap();

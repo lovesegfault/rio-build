@@ -31,6 +31,7 @@ async fn test_get_spawn_intents_reports_ready() -> anyhow::Result<()> {
         crate::lease::LeaderState::default(),
         rio_common::signal::Token::new(),
         String::new(),
+        Arc::new(crate::sla::config::SlaConfig::test_default()),
         None,
     );
 

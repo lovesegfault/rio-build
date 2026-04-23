@@ -135,6 +135,7 @@ async fn get_build_logs_from_s3_fallback() -> anyhow::Result<()> {
         crate::lease::LeaderState::default(),
         rio_common::signal::Token::new(),
         String::new(),
+        Arc::new(crate::sla::config::SlaConfig::test_default()),
         None,
     );
 
@@ -376,6 +377,7 @@ async fn try_s3_short_circuits_on_since_ge_line_count() -> anyhow::Result<()> {
         crate::lease::LeaderState::default(),
         rio_common::signal::Token::new(),
         String::new(),
+        Arc::new(crate::sla::config::SlaConfig::test_default()),
         None,
     );
 

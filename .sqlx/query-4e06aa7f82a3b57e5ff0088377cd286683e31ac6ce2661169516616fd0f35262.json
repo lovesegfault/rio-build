@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, pname, system, tenant, duration_secs, peak_memory_bytes,\n                   cpu_limit_cores, peak_cpu_cores, cpu_seconds_total,\n                   peak_disk_bytes, peak_io_pressure_pct, version, hw_class,\n                   node_name, enable_parallel_building, prefer_local_build,\n                   EXTRACT(EPOCH FROM completed_at)::float8 AS \"completed_at!\"\n            FROM (\n              SELECT *, ROW_NUMBER() OVER\n                (PARTITION BY pname, system, tenant ORDER BY completed_at DESC) AS rn\n              FROM build_samples\n              WHERE (pname, system, tenant) IN\n                (SELECT * FROM unnest($1::text[], $2::text[], $3::text[]))\n                AND NOT outlier_excluded\n            ) t\n            WHERE rn <= $4\n            ORDER BY pname, system, tenant, completed_at ASC\n            ",
+  "query": "\n            SELECT id, pname, system, tenant, duration_secs, peak_memory_bytes,\n                   cpu_limit_cores, peak_cpu_cores, cpu_seconds_total,\n                   peak_disk_bytes, peak_io_pressure_pct, version, hw_class,\n                   node_name, enable_parallel_building, enable_parallel_checking,\n                   prefer_local_build, is_fixed_output,\n                   EXTRACT(EPOCH FROM completed_at)::float8 AS \"completed_at!\"\n            FROM build_samples\n            WHERE completed_at > to_timestamp($1) AND NOT outlier_excluded\n            ORDER BY completed_at\n            ",
   "describe": {
     "columns": [
       {
@@ -80,21 +80,28 @@
       },
       {
         "ordinal": 15,
-        "name": "prefer_local_build",
+        "name": "enable_parallel_checking",
         "type_info": "Bool"
       },
       {
         "ordinal": 16,
+        "name": "prefer_local_build",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 17,
+        "name": "is_fixed_output",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 18,
         "name": "completed_at!",
         "type_info": "Float8"
       }
     ],
     "parameters": {
       "Left": [
-        "TextArray",
-        "TextArray",
-        "TextArray",
-        "Int8"
+        "Float8"
       ]
     },
     "nullable": [
@@ -114,8 +121,10 @@
       true,
       true,
       true,
+      true,
+      true,
       null
     ]
   },
-  "hash": "0eaf7f612d0aedae4afb8cfcb66e3b654ac4a7462f0ead8c2758fe9c95579592"
+  "hash": "4e06aa7f82a3b57e5ff0088377cd286683e31ac6ce2661169516616fd0f35262"
 }

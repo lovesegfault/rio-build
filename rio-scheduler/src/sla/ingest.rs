@@ -392,6 +392,10 @@ pub fn refit(
         ci_computed_at: ci_at,
         tier,
         prior_source,
+        // §A17: any row with is_fixed_output=true marks the key FOD.
+        // (pname, system) is stable across a FOD's lifetime so one row
+        // suffices; pre-057 NULL → false (no exclusion, old behavior).
+        is_fod: rows.iter().any(|r| r.is_fixed_output == Some(true)),
     }
 }
 
@@ -692,6 +696,7 @@ fn probe_only(key: &ModelKey, last: Option<&BuildSampleRow>) -> FittedParams {
         hw_bias: HashMap::new(),
         alpha: alpha::UNIFORM,
         prior_source: None,
+        is_fod: last.is_some_and(|r| r.is_fixed_output == Some(true)),
     }
 }
 
@@ -1192,6 +1197,7 @@ mod tests {
             hw_bias: HashMap::new(),
             alpha: alpha::UNIFORM,
             prior_source: None,
+            is_fod: false,
         }
     }
 
