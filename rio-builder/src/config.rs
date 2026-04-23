@@ -131,6 +131,19 @@ pub struct Config {
     /// kept for non-k8s test injection (`RIO_HW_CLASS`); when empty,
     /// the volume resolver runs.
     pub hw_class: String,
+    /// ADR-023 §13a: `rio.build/hw-bench-needed` pod annotation
+    /// (downward API → `RIO_HW_BENCH_NEEDED`). Set by the controller
+    /// at pod-create when any h in the intent's admissible set has <3
+    /// distinct `pod_id` AND `requests.memory ≥ sla.hwBenchMemFloor`.
+    /// Fail-closed: when `false` only the scalar `alu` probe runs and
+    /// the K=3 bench is skipped (`r[sched.sla.hw-class.k3-bench]`).
+    pub hw_bench_needed: bool,
+    /// Tenant whose build this pod was spawned for (downward API →
+    /// `RIO_TENANT`, from the SpawnIntent). Written to
+    /// `hw_perf_samples.submitting_tenant` so the per-tenant
+    /// median-of-medians defense (ADR-023 threat-model gap b) can
+    /// isolate one compromised tenant's bench rows. Empty outside k8s.
+    pub tenant: String,
     /// ADR-023 SpawnIntent match key from the pod's `rio.build/
     /// intent-id` annotation (downward API → `RIO_INTENT_ID`). Sent
     /// in every heartbeat so the scheduler can match this pod to its
@@ -208,6 +221,8 @@ impl Default for Config {
             log_size_limit: 100 * 1024 * 1024, // 100 MiB
             node_name: String::new(),
             hw_class: String::new(),
+            hw_bench_needed: false,
+            tenant: String::new(),
             intent_id: String::new(),
             executor_token: String::new(),
             daemon_timeout: crate::executor::DEFAULT_DAEMON_TIMEOUT,

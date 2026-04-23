@@ -51,6 +51,7 @@ server = [
   "dep:anyhow",
   "dep:scopeguard",
   "dep:serde",
+  "dep:serde_json",
 ]
 # Exposes `test_helpers` (StoreSeed/ChunkSeed builders, spawn_store_service,
 # put_path) and `MIGRATOR` to downstream crates' tests. Without this, every
@@ -156,6 +157,7 @@ scopeguard = { workspace = true, optional = true }
 
 # Config
 serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 rstest = { workspace = true }

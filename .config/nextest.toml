@@ -51,14 +51,15 @@ max-threads = 8
 max-threads = 8
 
 # ── Overrides ────────────────────────────────────────────────────────
-# hw_bench reproducibility test measures wall-clock; under parallel
-# nextest load (contended L2 + DVFS) the ±20% band still flaked. Give
-# it the whole machine — it's ~10s total and the production bench runs
-# on an idle pod anyway, so this is the representative environment.
+# hw_bench wall-clock tests: the alu reproducibility band, the STREAM
+# triad, and the K=3 orchestration all measure throughput. Under
+# parallel nextest load (contended L2/LLC/membw + DVFS) the bands flake.
+# Give them the whole machine — ~25s total and the production bench
+# runs on an idle pod anyway, so this is the representative environment.
 [[profile.default.overrides]]
-filter = 'test(hw_bench::tests::run_is_reproducible_within_band)'
+filter = 'test(hw_bench::tests::alu_is_reproducible_within_band) or test(hw_bench::tests::stream_triad_returns_positive_gbps) or test(hw_bench::tests::spawn_measure_returns_k3_vector) or test(hw_bench::tests::spawn_measure_scalar_only_when_not_needed)'
 threads-required = 'num-cpus'
-slow-timeout = { period = "30s", terminate-after = 2 }
+slow-timeout = { period = "60s", terminate-after = 2 }
 
 # Golden live-daemon tests: longer timeout since they spawn real daemons.
 [[profile.default.overrides]]

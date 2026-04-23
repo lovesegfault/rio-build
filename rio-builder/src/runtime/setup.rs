@@ -92,14 +92,16 @@ pub async fn setup(
     // hw_bench`); the store gates `AppendHwPerfSample` on the
     // assignment token (`r[sec.boundary.grpc-hmac]`).
     let hw_class_override = (!cfg.hw_class.is_empty()).then(|| cfg.hw_class.clone());
+    let hw_bench_needed = cfg.hw_bench_needed;
+    let overlay_dir = cfg.overlay_base_dir.clone();
     let hw_bench = tokio::spawn(async move {
         let hw_class = match hw_class_override {
             Some(c) => c,
             None => crate::hw_class::resolve().await.unwrap_or_default(),
         };
-        // Flatten: await the spawn_blocking handle inside this task so
-        // the consumer sees one JoinHandle<(String, Option<f64>)>.
-        let factor = match crate::hw_bench::spawn_measure(&hw_class) {
+        // Flatten: await the K=3 bench handle inside this task so the
+        // consumer sees one JoinHandle<(String, Option<[f64; K]>)>.
+        let factor = match crate::hw_bench::spawn_measure(&hw_class, hw_bench_needed, overlay_dir) {
             Some(h) => h.await.ok(),
             None => None,
         };
@@ -316,6 +318,7 @@ pub async fn setup(
         // `hw_bench` on the first assignment. Before then, `None` —
         // the documented "unknown hw" semantics.
         hw_class: Arc::new(std::sync::Mutex::new(None)),
+        tenant: cfg.tenant.clone(),
         // Same Arc as the heartbeat loop (above) — completion reads
         // the snapshot the cgroup poller has been maintaining.
         resources: resource_snapshot,

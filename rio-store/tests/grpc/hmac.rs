@@ -556,7 +556,8 @@ async fn append_hw(
     let mut req = tonic::Request::new(AppendHwPerfSampleRequest {
         hw_class: "aws-8-ebs-hi".into(),
         pod_id: body_pod_id.into(),
-        factor: 1.5,
+        factor_json: r#"{"alu":1.5,"membw":1.0,"ioseq":1.0}"#.into(),
+        submitting_tenant: String::new(),
     });
     if let Some((h, v)) = header {
         req.metadata_mut().insert(h, v.parse().unwrap());
@@ -616,7 +617,8 @@ async fn append_hw_perf_sample_oversized_hw_class_rejected() -> TestResult {
     let mut req = tonic::Request::new(AppendHwPerfSampleRequest {
         hw_class: "a".repeat(rio_common::limits::MAX_HW_CLASS_LEN + 1),
         pod_id: "ignored".into(),
-        factor: 1.5,
+        factor_json: r#"{"alu":1.5,"membw":1.0,"ioseq":1.0}"#.into(),
+        submitting_tenant: String::new(),
     });
     req.metadata_mut()
         .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, token.parse().unwrap());
@@ -644,7 +646,8 @@ async fn append_hw_perf_sample_bad_charset_rejected() -> TestResult {
         let mut req = tonic::Request::new(AppendHwPerfSampleRequest {
             hw_class: bad.into(),
             pod_id: "ignored".into(),
-            factor: 1.5,
+            factor_json: r#"{"alu":1.5,"membw":1.0,"ioseq":1.0}"#.into(),
+            submitting_tenant: String::new(),
         });
         req.metadata_mut()
             .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, token.parse().unwrap());

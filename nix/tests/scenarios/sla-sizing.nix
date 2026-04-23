@@ -271,17 +271,18 @@ let
 
     hw-normalize = ''
       with subtest("hw-normalize: mixed hw_class samples refit to same ref-seconds"):
-          # Two synthetic hw_classes with a 2x throughput gap. The
-          # hw_perf_factors view needs >=3 distinct pod_ids per class
-          # before it admits the class; seed those directly so the
-          # HwTable that the refit reads has factor[slow]=1.0,
-          # factor[fast]=2.0.
+          # Two synthetic hw_classes with a 2x throughput gap. HwTable
+          # admits a class once >=3 distinct pod_ids have benched (the
+          # app-side aggregate after M_054 dropped the hw_perf_factors
+          # view); seed those directly so the refit reads
+          # factor[slow]=1.0, factor[fast]=2.0.
           for hw, factor in [("synth-slow", 1.0), ("synth-fast", 2.0)]:
               for i in range(3):
                   ${gatewayHost}.succeed(
                       "sudo -u postgres psql -d rio -c \""
                       "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) "
-                      f"VALUES ('{hw}', 'pod-{hw}-{i}', {factor})\""
+                      f"VALUES ('{hw}', 'pod-{hw}-{i}', "
+                      f"jsonb_build_object('alu', {factor}))\""
                   )
           # Same true T(c) curve (S=30, P=2000) sampled on both: fast
           # hw reports half the wall-clock. After hw normalization both
@@ -329,7 +330,8 @@ let
                   ${gatewayHost}.succeed(
                       "sudo -u postgres psql -d rio -c \""
                       "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) "
-                      f"VALUES ('{hw}', 'pod-{hw}-{i}', {factor})\""
+                      f"VALUES ('{hw}', 'pod-{hw}-{i}', "
+                      f"jsonb_build_object('alu', {factor}))\""
                   )
               # Low lambda (1 interrupt / 3600s exposure) so spot
               # stays feasible under the p>0.5 gate.
@@ -337,17 +339,22 @@ let
                   {"hwClass": hw, "kind": "exposure", "value": 3600})
               grpcurl_admin("AppendInterruptSample",
                   {"hwClass": hw, "kind": "interrupt", "value": 1})
-          # Structural precondition: the hw_perf_factors view (HAVING
-          # count(DISTINCT pod_id)>=3, 7d window) admits the band-aware
-          # rows just inserted. solve_intent_for gates on
-          # !hw_table.is_empty(); if this is 0 the gate never opens
-          # and node_selector stays {}.
+          # Structural precondition: HwTable.aggregate admits a class
+          # once >=3 distinct pod_ids exist in the 7d window (M_054
+          # dropped the hw_perf_factors view; same gate, app-side now).
+          # solve_intent_for gates on !hw_table.is_empty(); if this is
+          # 0 the gate never opens and node_selector stays {}.
           n_hw = int(psql(${gatewayHost},
-              "SELECT COUNT(*) FROM hw_perf_factors "
-              "WHERE hw_class IN ('intel-6-ebs-lo','intel-7-ebs-mid','intel-8-nvme-hi')"
+              "SELECT COUNT(*) FROM ("
+              "  SELECT hw_class FROM hw_perf_samples "
+              "  WHERE measured_at > now() - interval '7 days' "
+              "    AND hw_class IN "
+              "      ('intel-6-ebs-lo','intel-7-ebs-mid','intel-8-nvme-hi') "
+              "  GROUP BY hw_class HAVING count(DISTINCT pod_id) >= 3"
+              ") q"
           ))
           assert n_hw == 3, (
-              f"hw_perf_factors view shows {n_hw}/3 band-aware classes; "
+              f"hw_perf_samples shows {n_hw}/3 band-aware classes admitted; "
               "measured_at default or HAVING gate broken?"
           )
           # On-curve samples (S=30 P=2000) -> synth-cost gets a fit on
@@ -398,7 +405,7 @@ let
                   "SpawnIntent.nodeSelector empty: solve_full gate not "
                   "satisfied. Gate = hw_cost_source set AND !hw_table."
                   "is_empty() AND n_eff>=3 AND (span>=4 OR frozen). "
-                  f"hw_perf_factors rows={n_hw}, "
+                  f"hw classes admitted={n_hw}, "
                   f"SlaStatus[synth-cost]={st!r}, intent={intent!r}"
               )
           assert "rio.build/hw-band" in sel, sel

@@ -9967,6 +9967,7 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "json",
         "migrate",
         "offline",
         "uuid"
@@ -10061,6 +10062,7 @@
       ],
       "resolvedDefaultFeatures": [
         "bundled",
+        "json",
         "migrate",
         "offline",
         "serde",

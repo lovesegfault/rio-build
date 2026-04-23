@@ -13031,6 +13031,10 @@
           "packageId": "serde"
         },
         {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        },
+        {
           "name": "sha2",
           "packageId": "sha2 0.11.0"
         },
@@ -14770,6 +14774,7 @@
         "_rt-tokio",
         "_sqlite",
         "derive",
+        "json",
         "macros",
         "migrate",
         "postgres",
@@ -14981,6 +14986,7 @@
         "_tls-rustls-aws-lc-rs",
         "default",
         "derive",
+        "json",
         "macros",
         "migrate",
         "postgres",
@@ -15075,6 +15081,7 @@
         "_tls-rustls-aws-lc-rs",
         "default",
         "derive",
+        "json",
         "macros",
         "migrate",
         "postgres",
@@ -15245,6 +15252,7 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "json",
         "migrate",
         "offline",
         "serde",
@@ -15392,6 +15400,7 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "json",
         "migrate",
         "offline",
         "uuid"
@@ -15486,6 +15495,7 @@
       ],
       "resolvedDefaultFeatures": [
         "bundled",
+        "json",
         "migrate",
         "offline",
         "serde",

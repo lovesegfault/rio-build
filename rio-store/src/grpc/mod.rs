@@ -759,17 +759,36 @@ impl StoreService for StoreServiceImpl {
                 "hw_class must be 1-64 chars of [a-z0-9-]; pod_id required",
             ));
         }
-        if !req.factor.is_finite() || req.factor <= 0.0 {
-            return Err(Status::invalid_argument("factor must be finite and > 0"));
+        // K=3 jsonb factor: parse + validate every dimension here
+        // (NOT a CHECK constraint) so a malformed payload is an
+        // InvalidArgument, not a PG error surfaced as Internal.
+        let factor: serde_json::Value = serde_json::from_str(&req.factor_json).map_err(|e| {
+            Status::invalid_argument(format!("factor_json must be a JSON object: {e}"))
+        })?;
+        for d in ["alu", "membw", "ioseq"] {
+            let v = factor
+                .get(d)
+                .and_then(serde_json::Value::as_f64)
+                .ok_or_else(|| {
+                    Status::invalid_argument(format!("factor_json.{d} missing or not a number"))
+                })?;
+            if !v.is_finite() || v <= 0.0 {
+                return Err(Status::invalid_argument(format!(
+                    "factor_json.{d}={v} must be finite and > 0"
+                )));
+            }
         }
         sqlx::query!(
-            "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) \
-             VALUES ($1, $2, jsonb_build_object('alu', $3::double precision)) \
+            "INSERT INTO hw_perf_samples (hw_class, pod_id, factor, submitting_tenant) \
+             VALUES ($1, $2, $3, $4) \
              ON CONFLICT (hw_class, pod_id) \
-             DO UPDATE SET factor = EXCLUDED.factor, measured_at = now()",
+             DO UPDATE SET factor = EXCLUDED.factor, \
+                           submitting_tenant = EXCLUDED.submitting_tenant, \
+                           measured_at = now()",
             req.hw_class,
             pod_id,
-            req.factor,
+            sqlx::types::Json(factor) as _,
+            (!req.submitting_tenant.is_empty()).then_some(req.submitting_tenant),
         )
         .execute(&self.pool)
         .await
@@ -872,19 +891,48 @@ mod tests {
             Request::new(AppendHwPerfSampleRequest {
                 hw_class: "aws-8-ebs-hi".into(),
                 pod_id: "p0".into(),
-                factor: f,
+                factor_json: format!(r#"{{"alu":{f},"membw":1.0,"ioseq":1.0}}"#),
+                submitting_tenant: "t0".into(),
             })
         };
         svc.append_hw_perf_sample(mk(0.9)).await.unwrap();
         svc.append_hw_perf_sample(mk(1.1)).await.unwrap();
-        let (n, factor): (i64, f64) = sqlx::query_as(
-            "SELECT count(*), max((factor->>'alu')::double precision) FROM hw_perf_samples \
+        let (n, alu): (i64, f64) = sqlx::query_as(
+            "SELECT count(*), max((factor->>'alu')::float8) FROM hw_perf_samples \
              WHERE hw_class = 'aws-8-ebs-hi' AND pod_id = 'p0'",
         )
         .fetch_one(&db.pool)
         .await
         .unwrap();
         assert_eq!(n, 1, "duplicate (hw_class, pod_id) must upsert, not append");
-        assert!((factor - 1.1).abs() < 1e-9, "upsert keeps latest factor");
+        assert!((alu - 1.1).abs() < 1e-9, "upsert keeps latest factor");
+    }
+
+    /// Per-dimension validation: missing key, non-numeric, NaN, ≤0 →
+    /// InvalidArgument. Regression for the K=3 jsonb migration: a
+    /// half-populated row would NaN the per-dimension median.
+    #[tokio::test]
+    async fn append_hw_perf_sample_rejects_malformed_factor() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreServiceImpl::new(db.pool.clone());
+        for bad in [
+            "not json",
+            "{}",
+            r#"{"alu":1.0,"membw":1.0}"#,
+            r#"{"alu":1.0,"membw":"x","ioseq":1.0}"#,
+            r#"{"alu":1.0,"membw":0.0,"ioseq":1.0}"#,
+            r#"{"alu":-1.0,"membw":1.0,"ioseq":1.0}"#,
+        ] {
+            let err = svc
+                .append_hw_perf_sample(Request::new(AppendHwPerfSampleRequest {
+                    hw_class: "aws-8-ebs-hi".into(),
+                    pod_id: "p0".into(),
+                    factor_json: bad.into(),
+                    submitting_tenant: String::new(),
+                }))
+                .await
+                .expect_err(bad);
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "input: {bad}");
+        }
     }
 }

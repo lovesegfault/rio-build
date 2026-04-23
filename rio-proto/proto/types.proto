@@ -370,7 +370,17 @@ message AppendHwPerfSampleRequest {
   // (r[sec.boundary.grpc-hmac]). Kept for wire-compat + dev-mode
   // fallback.
   string pod_id = 2;
-  double factor = 3;  // REF_TIME_SECS / measured_secs
+  // K=3 factor vector serialized as `{"alu":f, "membw":f, "ioseq":f}`.
+  // Stored verbatim into hw_perf_samples.factor (jsonb, M_054). Each
+  // dimension is observed_throughput / REF_throughput so factor[d] >= 1
+  // on faster hardware. JSON-string (not three doubles) so the wire
+  // format and the jsonb column stay structurally aligned as K evolves.
+  string factor_json = 3;
+  // Tenant whose build this pod was spawned for (downward-API
+  // RIO_TENANT). Feeds the per-tenant median-of-medians defense
+  // (ADR-023 threat-model gap b): a compromised tenant's bench rows
+  // are isolated to one rank in the OUTER median.
+  string submitting_tenant = 4;
 }
 
 // StoreAdminService.GetLoad — per-replica load snapshot for the

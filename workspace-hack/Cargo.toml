@@ -100,8 +100,8 @@ smallvec = { version = "1", default-features = false, features = ["const_new", "
 spin = { version = "0.9" }
 spki = { version = "0.7", default-features = false, features = ["pem", "std"] }
 sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-aws-lc-rs", "any", "json", "migrate", "offline", "uuid"] }
-sqlx-postgres = { version = "0.8", default-features = false, features = ["migrate", "offline", "uuid"] }
-sqlx-sqlite = { version = "0.8", default-features = false, features = ["bundled", "migrate", "offline", "uuid"] }
+sqlx-postgres = { version = "0.8", default-features = false, features = ["json", "migrate", "offline", "uuid"] }
+sqlx-sqlite = { version = "0.8", default-features = false, features = ["bundled", "json", "migrate", "offline", "uuid"] }
 ssh-cipher = { version = "0.2", default-features = false, features = ["aes-cbc", "aes-ctr", "aes-gcm", "chacha20poly1305"] }
 ssh-encoding = { version = "0.2", default-features = false, features = ["bytes", "pem", "sha2", "std"] }
 subtle = { version = "2", features = ["const-generics"] }
@@ -169,8 +169,8 @@ slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde", "write"] }
 spin = { version = "0.9" }
 sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-aws-lc-rs", "any", "json", "migrate", "offline", "uuid"] }
-sqlx-postgres = { version = "0.8", default-features = false, features = ["migrate", "offline", "uuid"] }
-sqlx-sqlite = { version = "0.8", default-features = false, features = ["bundled", "migrate", "offline", "uuid"] }
+sqlx-postgres = { version = "0.8", default-features = false, features = ["json", "migrate", "offline", "uuid"] }
+sqlx-sqlite = { version = "0.8", default-features = false, features = ["bundled", "json", "migrate", "offline", "uuid"] }
 subtle = { version = "2", features = ["const-generics"] }
 syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 tokio = { version = "1", features = ["full", "test-util"] }
