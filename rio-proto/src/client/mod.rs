@@ -57,9 +57,10 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// next RPC blocks until kernel TCP timeout. With it, the h2 layer
 /// fires `GoAway` proactively, all streams error, callers reconnect.
 ///
-/// **Flow-control windows** (1 MiB stream / 16 MiB conn / adaptive):
-/// see [`H2_INITIAL_STREAM_WINDOW`]. Mirrored server-side via
-/// [`rio_common::server::tonic_builder`] — h2 windows are per-direction.
+/// **Flow-control windows** (1 MiB stream / 16 MiB conn, fixed — NOT
+/// adaptive): see [`H2_INITIAL_STREAM_WINDOW`]. Mirrored server-side
+/// via [`rio_common::server::tonic_builder`] — h2 windows are
+/// per-direction.
 ///
 /// Factored out after I-048c: the balanced channel diverged from
 /// `connect_store_lazy` and went 7 minutes dark on scheduler SIGKILL.
@@ -80,10 +81,9 @@ pub(crate) fn with_h2_keepalive(ep: tonic::transport::Endpoint) -> tonic::transp
 /// spurious GoAway → EIO in fetch tests. The lazy/balanced paths
 /// (long-lived channels, the production builder path) take both via
 /// [`with_h2_keepalive`].
-// r[impl proto.h2.adaptive-window]
+// r[impl proto.h2.adaptive-window+2]
 pub(crate) fn with_h2_throughput(ep: tonic::transport::Endpoint) -> tonic::transport::Endpoint {
-    ep.http2_adaptive_window(true)
-        .initial_stream_window_size(Some(H2_INITIAL_STREAM_WINDOW))
+    ep.initial_stream_window_size(Some(H2_INITIAL_STREAM_WINDOW))
         .initial_connection_window_size(Some(H2_INITIAL_CONN_WINDOW))
 }
 
@@ -269,7 +269,7 @@ mod retry_tests {
     /// constants directly; `with_h2_keepalive` is the single application
     /// site (covered by `connect_closed_port_fails_fast_then_succeeds`
     /// going through it via `connect_channel`).
-    // r[verify proto.h2.adaptive-window]
+    // r[verify proto.h2.adaptive-window+2]
     #[test]
     #[allow(
         clippy::assertions_on_constants,
@@ -287,6 +287,30 @@ mod retry_tests {
         assert!(
             H2_INITIAL_CONN_WINDOW >= H2_INITIAL_STREAM_WINDOW,
             "connection window must be at least the stream window"
+        );
+    }
+
+    /// `Endpoint` has no public accessor for the configured adaptive-
+    /// window flag, so this asserts on source: `with_h2_throughput`
+    /// must NOT call `http2_adaptive_window`. hyper's
+    /// `adaptive_window(true)` resets initial windows to 65 535,
+    /// silently overriding `H2_INITIAL_STREAM_WINDOW` (tonic applies
+    /// it last). Reintroducing it would regress builder↔store
+    /// throughput to ~1 MB/s with no test or compile failure.
+    ///
+    /// Server-side mirror: `rio_common::server::tests::
+    /// tonic_builder_does_not_set_adaptive_window`.
+    // r[verify proto.h2.adaptive-window+2]
+    #[test]
+    fn h2_throughput_does_not_set_adaptive_window() {
+        let calls = include_str!("mod.rs")
+            .lines()
+            .filter(|l| l.contains(concat!(".", "http2_adaptive_window(")))
+            .count();
+        assert_eq!(
+            calls, 0,
+            "adaptive_window resets initial_stream_window_size to 65 KiB \
+             (hyper SPEC_WINDOW_SIZE) — see H2_INITIAL_STREAM_WINDOW doc"
         );
     }
 

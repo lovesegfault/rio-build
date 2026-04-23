@@ -71,10 +71,9 @@ pub async fn health_reporter_not_serving() -> (
 /// streams. The h2 default 64 KiB was the 30 MB/s wall on builder NAR
 /// fetch (I-180). Mirrored client-side in `rio-proto::client`; see
 /// [`H2_INITIAL_STREAM_WINDOW`] for the rationale.
-// r[impl proto.h2.adaptive-window]
+// r[impl proto.h2.adaptive-window+2]
 pub fn tonic_builder() -> tonic::transport::Server {
     tonic::transport::Server::builder()
-        .http2_adaptive_window(Some(true))
         .initial_stream_window_size(Some(H2_INITIAL_STREAM_WINDOW))
         .initial_connection_window_size(Some(H2_INITIAL_CONN_WINDOW))
 }
@@ -461,6 +460,26 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    /// `tonic_builder()` must NOT call `http2_adaptive_window`: hyper's
+    /// `adaptive_window(true)` resets initial windows to 65 535,
+    /// silently overriding `H2_INITIAL_STREAM_WINDOW`. No public
+    /// accessor on `Server`, so this asserts on source. Client-side
+    /// mirror: `rio_proto::client::tests::
+    /// h2_throughput_does_not_set_adaptive_window`.
+    // r[verify proto.h2.adaptive-window+2]
+    #[test]
+    fn tonic_builder_does_not_set_adaptive_window() {
+        let calls = include_str!("server.rs")
+            .lines()
+            .filter(|l| l.contains(concat!(".", "http2_adaptive_window(")))
+            .count();
+        assert_eq!(
+            calls, 0,
+            "adaptive_window resets initial_stream_window_size to 65 KiB \
+             (hyper SPEC_WINDOW_SIZE) — see H2_INITIAL_STREAM_WINDOW doc"
+        );
+    }
 
     /// `/healthz` is unconditional; `/readyz` tracks the flag.
     #[tokio::test]

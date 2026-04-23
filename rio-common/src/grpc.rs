@@ -119,9 +119,18 @@ pub const GRPC_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
 /// Initial h2 per-stream flow-control window (1 MiB). h2's default is
 /// 65 535 bytes — at 2-3 ms cross-AZ RTT that's a ~20-30 MB/s ceiling
 /// (each 256 KiB NAR chunk needs ~4 WINDOW_UPDATE round-trips before
-/// the next can flow). 1 MiB lifts the floor; `http2_adaptive_window`
-/// (BDP probing) auto-tunes upward from there. I-180: this was the
-/// 30 MB/s wall on builder NAR fetch, not S3 prefetch or proto decode.
+/// the next can flow). A fixed 1 MiB gives ≥100 MB/s at any RTT
+/// ≤10 ms (in-cluster + cross-AZ).
+///
+/// Do NOT pair this with `http2_adaptive_window(true)`: hyper's
+/// `adaptive_window(true)` *resets* both initial windows to
+/// `SPEC_WINDOW_SIZE = 65 535` and BDP-probes upward from there, and
+/// tonic's builder applies it AFTER `initial_stream_window_size` —
+/// silently overriding this constant. Measured live: with both set,
+/// builder↔store wire moved ~1 MB/s while store-only could push 55+.
+///
+/// I-180: the original 30 MB/s wall on builder NAR fetch (not S3
+/// prefetch or proto decode).
 pub const H2_INITIAL_STREAM_WINDOW: u32 = 1024 * 1024;
 
 /// Initial h2 connection-level window (16 MiB). Shared across all
