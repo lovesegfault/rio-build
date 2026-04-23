@@ -244,12 +244,10 @@ impl DagActor {
             // drop + the controller's reap/respawn/ack `or_insert`.
             let mut attempted = self.ice_attempts.entry(drv_hash.clone()).or_default();
             attempted.push((*band, *cap));
-            metrics::counter!(
-                "rio_scheduler_sla_ice_backoff_total",
-                "band" => band.label(),
-                "cap" => cap.label(),
-            )
-            .increment(1);
+            // `_ice_backoff_total` retired — ADR-023 §Observability
+            // replaces it with `_hw_ladder_exhausted_total{tenant,exit}`
+            // emitted at ladder-cap below. A9 deletes this whole
+            // pending_intents Pending-watch block.
             debug!(
                 drv_hash = %drv_hash, band = band.label(), cap = cap.label(),
                 pending_secs = now.duration_since(*since).as_secs(),
@@ -258,7 +256,7 @@ impl DagActor {
                  marking (band, cap) ICE-infeasible for 60s"
             );
             if attempted.len() as u32 >= ladder_cap {
-                crate::sla::cost::capacity_exhausted();
+                crate::sla::solve::InfeasibleReason::CapacityExhausted.emit();
                 debug!(
                     drv_hash = %drv_hash,
                     attempted = ?crate::sla::cost::IceBackoff::encode_attempted(&attempted),

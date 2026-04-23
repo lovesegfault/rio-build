@@ -118,6 +118,98 @@ impl SolveResult {
     }
 }
 
+/// `rio_scheduler_sla_infeasible_total{reason=…}` label values. The
+/// type-safe single emit point for the metric — every caller routes
+/// through [`Self::emit`] so the label string can't drift from
+/// `observability.md` and adding the `tenant` label later (A9, when the
+/// admissible-set solve threads tenant through `solve_full`) is a
+/// 1-line change.
+///
+/// ADR-023 §Observability splits the legacy `ceiling_exhausted` reason
+/// into the four specific ceilings + `interrupt_runaway` so the alert
+/// names which dimension is binding. [`classify_ceiling`] computes the
+/// split for the pre-A9 `solve_mvp`/`solve_full` BestEffort fallthrough.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InfeasibleReason {
+    /// `S ≥ bound` at the loosest tier — even infinite cores can't help.
+    SerialFloor,
+    /// `M(c*)·headroom > sla.maxMem` at the feasible `c*`.
+    MemCeiling,
+    /// `disk_p90 > sla.maxDisk` (c-independent).
+    DiskCeiling,
+    /// Envelope infeasible at `cap_c = min(p̄, c_opt, sla.maxCores)`.
+    CoreCeiling,
+    /// `λ` makes spot infeasible at every `c` (preemption-rate runaway).
+    InterruptRunaway,
+    /// All `(hw_class, cap)` cells ICE-masked at the terminal tier.
+    CapacityExhausted,
+}
+
+impl InfeasibleReason {
+    /// All variants, in ADR-023 §Observability order (the order the
+    /// `infeasible_reasons_complete` test pins).
+    pub const ALL: [Self; 6] = [
+        Self::SerialFloor,
+        Self::MemCeiling,
+        Self::DiskCeiling,
+        Self::CoreCeiling,
+        Self::InterruptRunaway,
+        Self::CapacityExhausted,
+    ];
+
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::SerialFloor => "serial_floor",
+            Self::MemCeiling => "mem_ceiling",
+            Self::DiskCeiling => "disk_ceiling",
+            Self::CoreCeiling => "core_ceiling",
+            Self::InterruptRunaway => "interrupt_runaway",
+            Self::CapacityExhausted => "capacity_exhausted",
+        }
+    }
+
+    /// Increment `rio_scheduler_sla_infeasible_total{reason=…}`. Single
+    /// emit point — grep `\.emit()` to find every infeasible call site.
+    pub fn emit(self) {
+        metrics::counter!(
+            "rio_scheduler_sla_infeasible_total",
+            "reason" => self.as_str()
+        )
+        .increment(1);
+    }
+}
+
+/// Which of the four ceiling reasons bound at the loosest bounded tier
+/// when [`solve_mvp`] / [`solve_full`] fell through to `BestEffort`.
+/// Mirrors `solve_mvp`'s per-tier reject gates so the metric label
+/// matches what `sla explain` shows. `InterruptRunaway` /
+/// `CapacityExhausted` are gated separately by callers (those need λ /
+/// ICE state this fn doesn't see).
+pub fn classify_ceiling(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> InfeasibleReason {
+    let cap_c = fit.fit.p_bar().0.min(fit.fit.c_opt().0).min(ceil.max_cores);
+    let h = headroom(fit.n_eff);
+    if fit.disk_p90.is_some_and(|d| d.0 > ceil.max_disk) {
+        return InfeasibleReason::DiskCeiling;
+    }
+    // Loosest bounded tier — the last one solve_mvp's reject-not-clamp
+    // loop tried. `unreachable` arm: callers gate on ≥1 bounded tier.
+    let Some(tier) = tiers.iter().rev().find(|t| t.binding_bound().is_some()) else {
+        return InfeasibleReason::CoreCeiling;
+    };
+    match explain_envelope(fit, tier, cap_c) {
+        (None, "serial-floor") => InfeasibleReason::SerialFloor,
+        (None, _) => InfeasibleReason::CoreCeiling,
+        (Some(c), _) if (fit.mem.at(RawCores(c)).0 as f64 * h) as u64 > ceil.max_mem => {
+            InfeasibleReason::MemCeiling
+        }
+        // Envelope feasible AND mem under ceiling at the loosest tier
+        // yet solve_mvp returned BestEffort — only reachable if a
+        // tighter tier's feasible c* tripped mem and the loosest one
+        // didn't (shouldn't happen with tiers sorted tight→loose).
+        (Some(_), _) => InfeasibleReason::CoreCeiling,
+    }
+}
+
 /// One feasible `(band, cap)` cell from [`solve_full`]'s inner loop.
 /// `e_cost` is the comparable scalar for [`softmax_pick`].
 #[derive(Debug, Clone)]
@@ -320,7 +412,7 @@ pub fn intent_for(
             .iter()
             .any(|t| t.p50.is_some() || t.p90.is_some() || t.p99.is_some())
     {
-        super::cost::ceiling_exhausted();
+        classify_ceiling(fit, tiers, ceil).emit();
     }
     // ceil + clamp ≥1: solve_mvp's c_star is already ≥1.0 but
     // BestEffort.c can be fractional below 1 for degenerate fits.
@@ -604,12 +696,12 @@ pub fn solve_full(
         }
     }
     if ice.exhausted() {
-        super::cost::capacity_exhausted();
+        InfeasibleReason::CapacityExhausted.emit();
     } else if tiers
         .iter()
         .any(|t| t.p50.is_some() || t.p90.is_some() || t.p99.is_some())
     {
-        super::cost::ceiling_exhausted();
+        classify_ceiling(fit, tiers, ceil).emit();
     }
     // `cap_c` already includes `c_opt` so a USL fit isn't pushed into
     // its slowdown region (e.g. p̄=∞ with c_opt=20 must NOT return 64).
@@ -1492,12 +1584,14 @@ mod tests {
     }
 
     #[test]
-    fn intent_for_emits_ceiling_exhausted_on_all_bounded_infeasible() {
+    fn intent_for_emits_serial_floor_on_all_bounded_infeasible() {
         let rec = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = rec.snapshotter();
         metrics::with_local_recorder(&rec, || {
             // T(c) ≫ 10 for all c ≤ 64: S=1e6. n_eff/span force the
-            // solve branch (not explore).
+            // solve branch (not explore). S alone breaches the bound
+            // → classify_ceiling = SerialFloor (not the legacy
+            // catch-all `ceiling_exhausted`).
             let fit = mk_fit(1e6, 0.0, 0.0, f64::INFINITY, 0.1);
             intent_for(
                 Some(&fit),
@@ -1508,7 +1602,8 @@ mod tests {
                 &ceil(),
             );
         });
-        assert_eq!(infeasible_count(&snapshotter, "ceiling_exhausted"), 1);
+        assert_eq!(infeasible_count(&snapshotter, "serial_floor"), 1);
+        assert_eq!(infeasible_count(&snapshotter, "core_ceiling"), 0);
     }
 
     /// `solve_mvp` is pure: emission is at the sizing decision-point
@@ -1524,11 +1619,13 @@ mod tests {
             let r = solve_mvp(&fit, &[t("normal", 10.0)], &ceil());
             assert!(matches!(r, SolveResult::BestEffort { .. }));
         });
-        assert_eq!(
-            infeasible_count(&snapshotter, "ceiling_exhausted"),
-            0,
-            "solve_mvp must not emit; callers do at the decision-point"
-        );
+        for r in InfeasibleReason::ALL {
+            assert_eq!(
+                infeasible_count(&snapshotter, r.as_str()),
+                0,
+                "solve_mvp must not emit; callers do at the decision-point"
+            );
+        }
     }
 
     #[test]
@@ -1557,8 +1654,9 @@ mod tests {
             // an exhaust event.
             intent_for(Some(&fit), &DrvHints::default(), None, &cfg(), &[], &ceil());
         });
-        assert_eq!(infeasible_count(&snapshotter, "ceiling_exhausted"), 0);
-        assert_eq!(infeasible_count(&snapshotter, "capacity_exhausted"), 0);
+        for r in InfeasibleReason::ALL {
+            assert_eq!(infeasible_count(&snapshotter, r.as_str()), 0);
+        }
     }
 
     #[test]

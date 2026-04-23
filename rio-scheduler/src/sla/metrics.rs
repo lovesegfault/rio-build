@@ -3,7 +3,9 @@
 //! called inline from `SlaEstimator::refresh` / `explore::next` /
 //! `solve::intent_for` so the metric names live in one place.
 
-use metrics::{Unit, counter, describe_counter, describe_gauge, describe_histogram, histogram};
+use metrics::{
+    Unit, counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram,
+};
 
 use super::solve::SlaPrediction;
 
@@ -25,11 +27,10 @@ pub fn describe_all() {
     );
     describe_counter!(
         "rio_scheduler_sla_infeasible_total",
-        "infeasible-at-any-tier count, labeled `reason`: \
-         `ceiling_exhausted` (solve returned BestEffort because c* \
-         exceeded ceilings on every bounded tier) | \
-         `capacity_exhausted` (the ICE-backoff ladder exhausted all 6 \
-         (band, cap) cells at the terminal tier)"
+        "infeasible-at-any-tier count, labeled `reason` ∈ \
+         {serial_floor, mem_ceiling, disk_ceiling, core_ceiling, \
+         interrupt_runaway, capacity_exhausted}. The reason names which \
+         constraint bound at the loosest tier (see InfeasibleReason)."
     );
     describe_counter!(
         "rio_scheduler_sla_suspicious_scaling_total",
@@ -65,11 +66,37 @@ pub fn describe_all() {
          standby (price is PG-backed; standby reads but doesn't write)"
     );
     describe_counter!(
-        "rio_scheduler_sla_ice_backoff_total",
-        "(band, cap) cells marked ICE-infeasible by the Pending-watch \
-         (no heartbeat within 60s of the controller acking a \
-         band-targeted SpawnIntent). 60s TTL; next solve excludes the \
-         cell. Labeled `band`, `cap`."
+        "rio_scheduler_sla_hw_ladder_exhausted_total",
+        "ICE-mask hardware ladder exhausted at the terminal tier with \
+         no admissible (hw_class, cap) cell left. Labeled `tenant`, \
+         `exit` (the cell the ladder gave up on). Replaces \
+         `_ice_backoff_total`."
+    );
+    describe_counter!(
+        "rio_scheduler_sla_hw_cost_unknown_total",
+        "solve hit a (hw_class, cap) cell the cost table has no $/vCPU·hr \
+         for; the cell is dropped from the admissible set (labeled \
+         `tenant`). Sustained nonzero ⇒ hwClasses config drifted from \
+         the cost-poller's instance-type menu."
+    );
+    describe_counter!(
+        "rio_scheduler_sla_hw_cost_fallback_total",
+        "cost-poller fell back from a live spot-price source. Labeled \
+         `reason` ∈ {api_error, empty_history, parse}. Distinct from \
+         `_hw_cost_stale_seconds` (which measures age, not the \
+         fallback event)."
+    );
+    describe_counter!(
+        "rio_scheduler_sla_resize_retry_total",
+        "penalty-bump retries on under-provisioning. Labeled `reason` ∈ \
+         {oom, enospc}. The under-provisioning signal — \
+         `_prediction_ratio` is blind to censored samples."
+    );
+    describe_counter!(
+        "rio_scheduler_sla_als_cap_hit_total",
+        "ALS α-regression hit `sla.maxKeysPerTenant` and evicted a key \
+         (labeled `tenant`). Nonzero ⇒ a tenant is exhausting the \
+         per-tenant LRU; check for random-pname submissions."
     );
 }
 
@@ -90,6 +117,36 @@ pub fn mem_fit_weak(tenant: &str) {
 pub fn residual_multimodal(tenant: &str) {
     counter!("rio_scheduler_sla_residual_multimodal_total", "tenant" => tenant.to_string())
         .increment(1);
+}
+
+pub fn hw_ladder_exhausted(tenant: &str, exit: &str) {
+    counter!(
+        "rio_scheduler_sla_hw_ladder_exhausted_total",
+        "tenant" => tenant.to_string(),
+        "exit" => exit.to_string(),
+    )
+    .increment(1);
+}
+
+pub fn hw_cost_unknown(tenant: &str) {
+    counter!("rio_scheduler_sla_hw_cost_unknown_total", "tenant" => tenant.to_string())
+        .increment(1);
+}
+
+pub fn hw_cost_fallback(reason: &'static str) {
+    counter!("rio_scheduler_sla_hw_cost_fallback_total", "reason" => reason).increment(1);
+}
+
+pub fn resize_retry(reason: &'static str) {
+    counter!("rio_scheduler_sla_resize_retry_total", "reason" => reason).increment(1);
+}
+
+pub fn als_cap_hit(tenant: &str) {
+    counter!("rio_scheduler_sla_als_cap_hit_total", "tenant" => tenant.to_string()).increment(1);
+}
+
+pub fn hw_cost_stale_seconds(age: f64) {
+    gauge!("rio_scheduler_sla_hw_cost_stale_seconds").set(age);
 }
 
 pub fn prediction_ratio(dim: &'static str, ratio: f64) {
@@ -180,9 +237,102 @@ pub fn emit_completion_score(s: &CompletionScore) {
     }
 }
 
+/// Every `rio_scheduler_sla_*` metric name. Single source of truth for
+/// the [`tests::registered_and_emitted_are_consistent`] guard — adding
+/// a metric means adding it here AND to [`describe_all`] AND wiring an
+/// emit helper, or that test fails. Catches the "registered but never
+/// emitted" / "emitted but never registered" drift that left
+/// `_infeasible_total{reason=capacity_exhausted}` documented with zero
+/// non-test callers (see `solve_full_emits_capacity_exhausted_*`).
+#[cfg(test)]
+pub const SLA_METRICS: &[&str] = &[
+    "rio_scheduler_sla_prediction_ratio",
+    "rio_scheduler_sla_envelope_result_total",
+    "rio_scheduler_sla_infeasible_total",
+    "rio_scheduler_sla_suspicious_scaling_total",
+    "rio_scheduler_sla_outlier_rejected_total",
+    "rio_scheduler_sla_mem_fit_weak_total",
+    "rio_scheduler_sla_residual_multimodal_total",
+    "rio_scheduler_sla_prior_divergence",
+    "rio_scheduler_sla_hw_cost_stale_seconds",
+    "rio_scheduler_sla_hw_ladder_exhausted_total",
+    "rio_scheduler_sla_hw_cost_unknown_total",
+    "rio_scheduler_sla_hw_cost_fallback_total",
+    "rio_scheduler_sla_resize_retry_total",
+    "rio_scheduler_sla_als_cap_hit_total",
+];
+
 #[cfg(test)]
 mod tests {
+    use super::super::solve::InfeasibleReason;
     use super::*;
+
+    /// ADR-023 §Observability pins exactly these six `reason` label
+    /// values, in this order. The enum's `ALL` is the contract.
+    #[test]
+    fn infeasible_reasons_complete() {
+        let want = [
+            "serial_floor",
+            "mem_ceiling",
+            "disk_ceiling",
+            "core_ceiling",
+            "interrupt_runaway",
+            "capacity_exhausted",
+        ];
+        let got: Vec<_> = InfeasibleReason::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(got, want);
+    }
+
+    /// Every `SLA_METRICS` name has a `describe_*!` registration AND at
+    /// least one emit-site token in this crate's source. Grep-based —
+    /// brittle by design: a rename that misses one of {describe_all,
+    /// emit helper, SLA_METRICS} fails here, which is the point.
+    #[test]
+    fn registered_and_emitted_are_consistent() {
+        // describe_all() side: install a recorder, call it, collect
+        // the names that got `# HELP` lines.
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        metrics::with_local_recorder(&rec, || {
+            describe_all();
+            // exercise every emit helper once so the snapshot sees the
+            // name as a live metric (not just a description).
+            outlier_rejected("t");
+            suspicious_scaling("t");
+            mem_fit_weak("t");
+            residual_multimodal("t");
+            prediction_ratio("wall", 1.0);
+            envelope_result("t", "hit", "-");
+            hw_ladder_exhausted("t", "x");
+            hw_cost_unknown("t");
+            hw_cost_fallback("api_error");
+            resize_retry("oom");
+            als_cap_hit("t");
+            hw_cost_stale_seconds(0.0);
+            InfeasibleReason::SerialFloor.emit();
+            gauge!("rio_scheduler_sla_prior_divergence", "param" => "S").set(1.0);
+        });
+        let seen: std::collections::HashSet<_> = snap
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(ck, _, _, _)| ck.key().name().to_string())
+            .collect();
+        for name in SLA_METRICS {
+            assert!(
+                seen.contains(*name),
+                "{name} in SLA_METRICS but not emitted"
+            );
+        }
+        for name in &seen {
+            assert!(
+                SLA_METRICS.contains(&name.as_str()),
+                "{name} emitted but not in SLA_METRICS"
+            );
+        }
+        // `_ice_backoff_total` is retired: must NOT appear.
+        assert!(!seen.contains("rio_scheduler_sla_ice_backoff_total"));
+    }
 
     fn pred(wall: f64, mem: u64, tier: &str, target: f64) -> SlaPrediction {
         SlaPrediction {

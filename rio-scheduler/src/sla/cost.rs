@@ -654,27 +654,6 @@ impl IceBackoff {
     }
 }
 
-/// Emit `infeasible_total{reason=capacity_exhausted}`. Called when the
-/// ICE ladder exhausts at the terminal tier.
-pub fn capacity_exhausted() {
-    metrics::counter!(
-        "rio_scheduler_sla_infeasible_total",
-        "reason" => "capacity_exhausted"
-    )
-    .increment(1);
-}
-
-/// Emit `infeasible_total{reason=ceiling_exhausted}`. Called when
-/// [`super::solve::solve_mvp`] falls through to `BestEffort` because
-/// `c*` exceeded ceilings on every bounded tier.
-pub fn ceiling_exhausted() {
-    metrics::counter!(
-        "rio_scheduler_sla_infeasible_total",
-        "reason" => "ceiling_exhausted"
-    )
-    .increment(1);
-}
-
 /// Lease-gated spot-price poller: every 10min, the leader pulls
 /// `DescribeSpotPriceHistory` for each band's representative instance
 /// type, EMA-smooths into `cost`, refreshes λ from `interrupt_samples`,
@@ -740,8 +719,7 @@ pub async fn spot_price_poller(
         }
         *cost.write() = snap;
         // Re-emit post-swap so the leader's gauge doesn't lag one tick.
-        metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds")
-            .set(now_epoch() - cost.read().price_updated_at());
+        super::metrics::hw_cost_stale_seconds(now_epoch() - cost.read().price_updated_at());
     }
 }
 
@@ -782,8 +760,7 @@ pub(crate) async fn poller_tick_prelude(
     cost: &std::sync::Arc<parking_lot::RwLock<CostTable>>,
     db: &SchedulerDb,
 ) -> bool {
-    metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds")
-        .set(now_epoch() - cost.read().price_updated_at());
+    super::metrics::hw_cost_stale_seconds(now_epoch() - cost.read().price_updated_at());
     if !is_leader {
         *was_leader = false;
         return false;
