@@ -2,7 +2,7 @@
 #
 # Runs `cargo-nextest run -E 'binary(golden_conformance)'` once per daemon
 # variant, each pointing at a different nix-daemon binary. Surfaces wire-
-# protocol divergences across Nix 2.20 / Nix pinned / Nix master / Lix
+# protocol divergences across Nix 2.28 / Nix pinned / Nix master / Lix
 # before they bite real clients.
 #
 # Output: a linkFarm keyed by variant name, each entry → the nextest run
