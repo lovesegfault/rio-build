@@ -5832,6 +5832,30 @@
         "bluss"
       ]
     },
+    "memoffset": {
+      "crateName": "memoffset",
+      "version": "0.9.1",
+      "edition": "2015",
+      "sha256": "12i17wh9a9plx869g7j4whf62xw68k5zd4k0k5nh6ys5mszid028",
+      "source": {
+        "type": "crates-io"
+      },
+      "buildDependencies": [
+        {
+          "name": "autocfg",
+          "packageId": "autocfg"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Gilad Naaman <gilad.naaman@gmail.com>"
+      ]
+    },
     "metrics": {
       "crateName": "metrics",
       "version": "0.24.3",
@@ -6081,6 +6105,10 @@
         {
           "name": "libc",
           "packageId": "libc"
+        },
+        {
+          "name": "memoffset",
+          "packageId": "memoffset"
         }
       ],
       "buildDependencies": [
@@ -6094,11 +6122,13 @@
         "feature",
         "fs",
         "hostname",
+        "memoffset",
         "mman",
         "mount",
         "process",
         "sched",
         "signal",
+        "socket",
         "uio",
         "user"
       ],
