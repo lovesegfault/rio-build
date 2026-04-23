@@ -636,6 +636,12 @@ impl DagActor {
         // "pure function of (drv_hash, inputs_gen)" contract.
         let mut h_all: Vec<_> = self.sla_config.hw_classes.keys().cloned().collect();
         h_all.sort_unstable();
+        // Set when the hw-aware arm emitted `infeasible_total` (via
+        // `BestEffort.why` below). Threaded to the `intent_for`
+        // fallback so a drv that's BestEffort under BOTH solves isn't
+        // double-counted. `Cell` because the `get_or_insert_with`
+        // closure runs under a `&self` receiver.
+        let hw_emitted = std::cell::Cell::new(false);
         let full = (self.sla_config.hw_cost_source.is_some()
             && !h_all.is_empty()
             && !hw.is_empty()
@@ -676,7 +682,11 @@ impl DagActor {
                     prev_a,
                 ) {
                     solve::SolveFullResult::Feasible(m) => Some(m),
-                    solve::SolveFullResult::BestEffort { .. } => None,
+                    solve::SolveFullResult::BestEffort { why, .. } => {
+                        why.emit(&tenant);
+                        hw_emitted.set(true);
+                        None
+                    }
                 },
             );
             // ε_h draw (OUTSIDE memo): pin one h ∉ A (or
@@ -794,6 +804,7 @@ impl DagActor {
                     &self.sla_config,
                     &self.sla_tiers,
                     &self.sla_ceilings,
+                    hw_emitted.get(),
                 );
                 (c, m, d, Vec::new(), Vec::new(), None)
             }

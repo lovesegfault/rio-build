@@ -756,11 +756,8 @@ pub async fn spot_price_poller(
         // clone is cheap.
         let mut snap = cost.read().clone();
         if let Some(ec2) = &ec2 {
-            match poll_spot_once(ec2, &snap.cells).await {
-                Ok(obs) if !obs.is_empty() => snap.fold_prices(&obs, now_epoch()),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "spot-price poll failed; keeping previous"),
-            }
+            let result = poll_spot_once(ec2, &snap.cells).await;
+            fold_spot_poll(&mut snap, result, now_epoch());
         }
         if let Err(e) = snap.refresh_lambda(&db).await {
             tracing::warn!(error = %e, "λ refresh failed; keeping previous");
@@ -798,6 +795,35 @@ pub(crate) async fn sweep_interrupt_samples(db: &SchedulerDb, cluster: &str) -> 
     .execute(db.pool())
     .await?;
     Ok(r.rows_affected())
+}
+
+/// Fold one [`poll_spot_once`] result into `snap` and emit the
+/// matching `_hw_cost_fallback_total{reason=…}` on the non-success
+/// arms. Factored from [`spot_price_poller`] so the `api_error` /
+/// `empty_history` reasons are unit-testable without an EC2 client.
+pub(crate) fn fold_spot_poll(
+    snap: &mut CostTable,
+    result: anyhow::Result<HashMap<Cell, f64>>,
+    now: f64,
+) {
+    match result {
+        Ok(obs) if !obs.is_empty() => snap.fold_prices(&obs, now),
+        Ok(_) => {
+            ::metrics::counter!(
+                "rio_scheduler_sla_hw_cost_fallback_total",
+                "reason" => "empty_history"
+            )
+            .increment(1);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "spot-price poll failed; keeping previous");
+            ::metrics::counter!(
+                "rio_scheduler_sla_hw_cost_fallback_total",
+                "reason" => "api_error"
+            )
+            .increment(1);
+        }
+    }
 }
 
 /// Per-tick gauge-emit + leader-edge-reload, factored out of
@@ -905,6 +931,11 @@ async fn poll_spot_once(
                 continue;
             };
             let Some(price) = row.spot_price().and_then(|p| p.parse::<f64>().ok()) else {
+                ::metrics::counter!(
+                    "rio_scheduler_sla_hw_cost_fallback_total",
+                    "reason" => "parse"
+                )
+                .increment(1);
                 continue;
             };
             per_h.entry(h.clone()).or_default().push(price / vcpu);
@@ -1212,6 +1243,52 @@ mod tests {
         t.set_price("h", CapacityType::Spot, 0.5, 9000.0);
         assert!(!t.apply_stale_clamp(9000.0 + 60.0));
         assert!((t.price(&cell) - 0.5).abs() < 1e-9);
+    }
+
+    /// `fold_spot_poll` emits `_hw_cost_fallback_total{reason=…}` on
+    /// the two non-success arms and folds prices on success. Wires the
+    /// previously-dead `api_error` / `empty_history` label values
+    /// (observability.md:164).
+    #[test]
+    fn fold_spot_poll_emits_fallback_reasons() {
+        use metrics_util::debugging::DebugValue;
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let mut t = CostTable::seeded("c");
+        let cell = ("h".to_owned(), CapacityType::Spot);
+
+        // One call per arm. Ok(non-empty) folds and emits nothing;
+        // Err / Ok(empty) emit one reason each.
+        fold_spot_poll(&mut t, Err(anyhow::anyhow!("boom")), 1000.0);
+        fold_spot_poll(&mut t, Ok(HashMap::new()), 1000.0);
+        fold_spot_poll(&mut t, Ok(HashMap::from([(cell.clone(), 0.07)])), 1000.0);
+        assert!((t.price(&cell) - 0.07).abs() < 1e-9, "folded into EMA");
+
+        // Snapshot once (Snapshotter::snapshot drains): exactly the two
+        // failure reasons fired, once each.
+        let counts: HashMap<String, u64> = snap
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                (k.name() == "rio_scheduler_sla_hw_cost_fallback_total").then(|| {
+                    let r = k
+                        .labels()
+                        .find(|l| l.key() == "reason")
+                        .map(|l| l.value().to_owned())
+                        .unwrap_or_default();
+                    let DebugValue::Counter(c) = v else {
+                        return (r, 0);
+                    };
+                    (r, c)
+                })
+            })
+            .collect();
+        assert_eq!(counts.get("api_error"), Some(&1));
+        assert_eq!(counts.get("empty_history"), Some(&1));
+        assert_eq!(counts.len(), 2, "Ok(non-empty) emits no fallback reason");
     }
 
     /// `refresh_lambda` derives `node_count_ema = Σ exposure / Δt` over

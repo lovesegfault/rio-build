@@ -310,6 +310,11 @@ pub fn intent_for(
     cfg: &SlaConfig,
     tiers: &[Tier],
     ceil: &Ceilings,
+    // `true` when the hw-aware path already emitted (`BestEffort.why` at
+    // the dispatch wrapper) and this call is the fallback sizing only —
+    // prevents double-counting `infeasible_total` when `solve_full`
+    // and `solve_mvp` agree the drv is BestEffort.
+    suppress_infeasible_metric: bool,
 ) -> (u32, u64, u64) {
     // Feature-aware probe + headroom-scaled mem hoisted ONCE so every
     // early-return branch reads the same definitions as `solve_mvp` /
@@ -414,7 +419,8 @@ pub fn intent_for(
     // (unknown pinned-tier override) is not an exhaust event. Emitted
     // HERE (the actual sizing decision-point for the non-hw-cost path)
     // so `solve_mvp` stays pure for tier-name lookup callers.
-    if matches!(r, SolveResult::BestEffort { .. })
+    if !suppress_infeasible_metric
+        && matches!(r, SolveResult::BestEffort { .. })
         && tiers
             .iter()
             .any(|t| t.p50.is_some() || t.p90.is_some() || t.p99.is_some())
@@ -617,7 +623,10 @@ fn c_lambda(fit: &FittedParams, lambda: f64, factor: f64) -> f64 {
 
 /// Admissible-set [`solve_full`] outcome. `Feasible` carries the
 /// memoizable [`SolveMemo`]; `BestEffort` carries the full `H × cap`
-/// cell list (no admissible-set filtering).
+/// cell list (no admissible-set filtering) plus `why` — the
+/// [`InfeasibleReason`] the dispatch wrapper emits, computed here so
+/// the per-cell λ-vs-envelope binding-constraint information isn't
+/// lost at the fallthrough.
 #[derive(Debug, Clone)]
 pub enum SolveFullResult {
     Feasible(SolveMemo),
@@ -626,6 +635,7 @@ pub enum SolveFullResult {
         mem_bytes: u64,
         disk_bytes: u64,
         cells: Vec<Cell>,
+        why: InfeasibleReason,
     },
 }
 
@@ -693,6 +703,15 @@ pub fn solve_full(
     let disk = fit.disk_p90.map(|d| d.0).unwrap_or(ceil.default_disk);
     let tau = cfg.hw_cost_tolerance;
     let k = 2.0;
+    // Binding-constraint witnesses for the BestEffort fallthrough's
+    // `why` field. λ-gated: a spot cell was rejected on `p(cap_c)>0.5`
+    // alone. Envelope-gated: a cell reached `solve_envelope` and got
+    // `None` (the SLA bound itself is infeasible at cap_c, λ aside).
+    // `λ-gated ∧ ¬envelope-gated` ⇒ `InterruptRunaway` — λ was the
+    // binding constraint and the alert names it; otherwise
+    // `classify_ceiling` picks the tightest static ceiling.
+    let mut any_lambda_gated = false;
+    let mut any_envelope_gated = false;
 
     for tier in tiers {
         let mut candidates: Vec<Candidate> = Vec::with_capacity(h_set.len() * 2);
@@ -709,6 +728,7 @@ pub fn solve_full(
                 if cap == CapacityType::Spot {
                     let t_cap = fit.fit.t_at(RawCores(cap_c)).0 / factor;
                     if 1.0 - (-lambda * t_cap).exp() > 0.5 {
+                        any_lambda_gated = true;
                         continue;
                     }
                 }
@@ -721,6 +741,7 @@ pub fn solve_full(
                     continue;
                 }
                 let Some(c_star) = solve_envelope(fit, tier, c_lo, cap_c, factor, lambda) else {
+                    any_envelope_gated = true;
                     continue;
                 };
                 let c_star = (c_star.0.ceil() as u32).max(1);
@@ -813,19 +834,25 @@ pub fn solve_full(
         });
     }
     // All tiers infeasible → BestEffort over the full H×cap. The
-    // capacity-exhausted vs ceiling-exhausted distinction (and the
-    // metric emit) is the dispatch wrapper's job — this function is
-    // pure for memoization.
+    // metric emit is the dispatch wrapper's job (this function stays
+    // pure for memoization), but `why` is computed here — only the
+    // per-cell loop knows whether λ or the envelope was binding.
     let cells: Vec<Cell> = h_set
         .iter()
         .flat_map(|h| CapacityType::ALL.map(|c| (h.clone(), c)))
         .collect();
     let mem = ((fit.mem.at(RawCores(cap_c)).0 as f64 * hr) as u64).min(ceil.max_mem);
+    let why = if any_lambda_gated && !any_envelope_gated {
+        InfeasibleReason::InterruptRunaway
+    } else {
+        classify_ceiling(fit, tiers, ceil)
+    };
     SolveFullResult::BestEffort {
         c: (cap_c.ceil() as u32).max(1),
         mem_bytes: mem,
         disk_bytes: disk.min(ceil.max_disk),
         cells,
+        why,
     }
 }
 
@@ -1274,7 +1301,15 @@ mod tests {
     // ─── intent_for branching ───────────────────────────────────────
 
     fn intent(fit: Option<&FittedParams>, hints: &DrvHints) -> (u32, u64, u64) {
-        intent_for(fit, hints, None, &cfg(), &[t("normal", 1200.0)], &ceil())
+        intent_for(
+            fit,
+            hints,
+            None,
+            &cfg(),
+            &[t("normal", 1200.0)],
+            &ceil(),
+            false,
+        )
     }
 
     // r[verify sched.sla.override-precedence]
@@ -1294,6 +1329,7 @@ mod tests {
             &cfg(),
             &[t("normal", 1200.0)],
             &ceil(),
+            false,
         );
         assert_eq!(c, 12);
         assert_eq!(m, 32 << 30);
@@ -1315,6 +1351,7 @@ mod tests {
             &cfg(),
             &[],
             &ceil(),
+            false,
         );
         assert_eq!(c, 12);
     }
@@ -1336,6 +1373,7 @@ mod tests {
                 &cfg(),
                 &tiers,
                 &ceil(),
+                false,
             )
             .0
         };
@@ -1346,6 +1384,7 @@ mod tests {
             &cfg(),
             &tiers,
             &ceil(),
+            false,
         )
         .0;
         assert_eq!(unpinned, 9);
@@ -1368,11 +1407,20 @@ mod tests {
             &cfg(),
             &[t("normal", 1200.0)],
             &ceil(),
+            false,
         );
         assert_eq!(c, 2, "cores still solved");
         assert_eq!(m, 64 << 30, "mem forced");
         // Also applies on the explore path (no fit).
-        let (c, m, _) = intent_for(None, &DrvHints::default(), Some(&o), &cfg(), &[], &ceil());
+        let (c, m, _) = intent_for(
+            None,
+            &DrvHints::default(),
+            Some(&o),
+            &cfg(),
+            &[],
+            &ceil(),
+            false,
+        );
         assert_eq!(c, 4, "probe.cpu");
         assert_eq!(m, 64 << 30);
     }
@@ -1403,6 +1451,7 @@ mod tests {
             &cfg(),
             &[t("normal", 1200.0)],
             &ceil(),
+            false,
         );
         assert_eq!(
             c, 2,
@@ -1487,6 +1536,7 @@ mod tests {
             &cfg(),
             &[],
             &ceil(),
+            false,
         );
         assert_eq!(c, 12);
         let raw = fit.mem.at(RawCores(12.0)).0;
@@ -1513,7 +1563,7 @@ mod tests {
             required_features: vec!["kvm".into()],
             ..Default::default()
         };
-        let (c, m, _) = intent_for(None, &hints, None, &cfg, &[], &ceil());
+        let (c, m, _) = intent_for(None, &hints, None, &cfg, &[], &ceil(), false);
         assert_eq!(c, 1);
         // 4×2Gi + 16Gi = 24Gi (kvm probe), NOT 4×1Gi + 4Gi = 8Gi (default).
         assert_eq!(m, 24 << 30, "feature_probes[kvm], not cfg.probe");
@@ -1527,7 +1577,7 @@ mod tests {
             forced_mem: Some(64 << 30),
             ..Default::default()
         };
-        let go = |hints| intent_for(None, &hints, Some(&o), &cfg(), &[], &ceil());
+        let go = |hints| intent_for(None, &hints, Some(&o), &cfg(), &[], &ceil(), false);
         let (c, m, _) = go(DrvHints {
             enable_parallel_building: Some(false),
             ..Default::default()
@@ -1577,6 +1627,7 @@ mod tests {
             &cfg(),
             &[],
             &ceil(),
+            false,
         );
         assert!(d <= max, "forced_cores: disk {d} > max_disk {max}");
         // prefer_local_build.
@@ -2068,14 +2119,14 @@ mod tests {
             &h_set(),
             &HashSet::new(),
         );
-        let SolveFullResult::BestEffort { disk_bytes, .. } = r else {
+        let SolveFullResult::BestEffort {
+            disk_bytes, why, ..
+        } = r
+        else {
             panic!("disk > ceil → BestEffort, got {r:?}")
         };
         assert_eq!(disk_bytes, 200 << 30, "clamped");
-        assert_eq!(
-            classify_ceiling(&fit, &[t("normal", 1200.0)], &ceil()),
-            InfeasibleReason::DiskCeiling
-        );
+        assert_eq!(why, InfeasibleReason::DiskCeiling);
     }
 
     proptest! {
@@ -2150,10 +2201,108 @@ mod tests {
                 &cfg(),
                 &[t("normal", 10.0)],
                 &ceil(),
+                false,
             );
         });
         assert_eq!(infeasible_count(&snapshotter, "serial_floor"), 1);
         assert_eq!(infeasible_count(&snapshotter, "core_ceiling"), 0);
+    }
+
+    /// `suppress_infeasible_metric` swallows the emit when the
+    /// hw-aware path already counted this drv via `BestEffort.why`.
+    #[test]
+    fn intent_for_suppress_gates_emit() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = rec.snapshotter();
+        metrics::with_local_recorder(&rec, || {
+            let fit = mk_fit(1e6, 0.0, 0.0, f64::INFINITY, 0.1);
+            intent_for(
+                Some(&fit),
+                &DrvHints::default(),
+                None,
+                &cfg(),
+                &[t("normal", 10.0)],
+                &ceil(),
+                true,
+            );
+        });
+        for r in InfeasibleReason::ALL {
+            assert_eq!(infeasible_count(&snapshotter, r.as_str()), 0);
+        }
+    }
+
+    /// λ gates every spot cell + OD price-infeasible (menu has no
+    /// fitting type) → `BestEffort{why: InterruptRunaway}`. Counter-
+    /// case: same fit but the *envelope* itself is infeasible at every
+    /// cell (S alone breaches the bound) → `why` falls through to
+    /// `classify_ceiling` even though λ also fired.
+    #[test]
+    fn solve_full_besteffort_why_interrupt_runaway() {
+        use super::super::cost::{InstanceType, RatioEma};
+        // λ ≈ 1e6 / (1 + 86400) ≈ 11.6/s — `p(cap_c) > 0.5` for any
+        // T(cap_c) > 0.06s. mk_fit's S=30s alone guarantees that.
+        let runaway: HashMap<_, _> = h_set()
+            .into_iter()
+            .map(|h| {
+                (
+                    h,
+                    RatioEma {
+                        numerator: 1e6,
+                        denominator: 1.0,
+                        updated_at: 0.0,
+                    },
+                )
+            })
+            .collect();
+        let mut cost = CostTable::from_parts(HashMap::new(), runaway);
+        // OD: envelope feasible (c*≈4-9 against p90=300), but the only
+        // menu type is 2-core → `smallest_fitting → None` → cell drops
+        // WITHOUT setting `any_envelope_gated`.
+        for h in h_set() {
+            cost.set_menu(
+                (h, CapacityType::Od),
+                vec![InstanceType {
+                    name: "tiny".into(),
+                    cores: 2,
+                    mem_bytes: 256 << 30,
+                    price_per_vcpu_hr: 0.05,
+                }],
+            );
+        }
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        let r = solve_full(
+            &fit,
+            &[t("normal", 300.0)],
+            &hw_three(),
+            &cost,
+            &ceil(),
+            &cfg_hw(),
+            &h_set(),
+            &HashSet::new(),
+        );
+        let SolveFullResult::BestEffort { why, .. } = r else {
+            panic!("λ-gated spot + OD menu-unfit → BestEffort, got {r:?}")
+        };
+        assert_eq!(why, InfeasibleReason::InterruptRunaway);
+
+        // Counter-case: S=1e6 → envelope infeasible at cap_c for OD too
+        // (`solve_envelope → None`) → `any_envelope_gated` set →
+        // `classify_ceiling`, NOT `InterruptRunaway`.
+        let fit = mk_fit(1e6, 0.0, 0.0, f64::INFINITY, 0.1);
+        let r = solve_full(
+            &fit,
+            &[t("normal", 300.0)],
+            &hw_three(),
+            &cost,
+            &ceil(),
+            &cfg_hw(),
+            &h_set(),
+            &HashSet::new(),
+        );
+        let SolveFullResult::BestEffort { why, .. } = r else {
+            panic!("S=1e6 → BestEffort")
+        };
+        assert_eq!(why, InfeasibleReason::SerialFloor);
     }
 
     /// `solve_mvp` is pure: emission is at the sizing decision-point
@@ -2199,10 +2348,19 @@ mod tests {
                 &cfg(),
                 &[unbounded],
                 &ceil(),
+                false,
             );
             // Empty ladder (unknown pinned-tier) → BestEffort but NOT
             // an exhaust event.
-            intent_for(Some(&fit), &DrvHints::default(), None, &cfg(), &[], &ceil());
+            intent_for(
+                Some(&fit),
+                &DrvHints::default(),
+                None,
+                &cfg(),
+                &[],
+                &ceil(),
+                false,
+            );
         });
         for r in InfeasibleReason::ALL {
             assert_eq!(infeasible_count(&snapshotter, r.as_str()), 0);
