@@ -286,14 +286,11 @@ in
   # for debugging (`nix build .#fuzz-builds.rio-nix-fuzz-build && ls result/bin/`).
   builds = { inherit rio-nix-fuzz-build rio-store-fuzz-build; };
 
-  # 2min fuzz runs (Linux-only — libFuzzer).
-  # Keys: "fuzz-<target>". Spliced into `checks.*`.
-  runs = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
-    builtins.listToAttrs (
-      map (t: {
-        name = "fuzz-${t.target}";
-        value = mkFuzzCheck t;
-      }) fuzzTargets
-    )
+  # 2min fuzz runs. Keys: "fuzz-<target>". Spliced into `checks.*`.
+  runs = builtins.listToAttrs (
+    map (t: {
+      name = "fuzz-${t.target}";
+      value = mkFuzzCheck t;
+    }) fuzzTargets
   );
 }

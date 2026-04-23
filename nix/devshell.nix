@@ -125,7 +125,7 @@ let
       # speeds dev-loop relinks without touching RUSTFLAGS
       # (shared build-dir fingerprints stay valid). crate2nix
       # uses its own stdenv — `nix build` stays on GNU ld.
-      stdenv = if pkgs.stdenv.isLinux then pkgs.stdenvAdapters.useMoldLinker pkgs.stdenv else pkgs.stdenv;
+      stdenv = pkgs.stdenvAdapters.useMoldLinker pkgs.stdenv;
     })
       (
         sysCrateEnv.allEnv

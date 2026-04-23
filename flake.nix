@@ -154,8 +154,6 @@
       systems = [
         "x86_64-linux"
         "aarch64-linux"
-        "x86_64-darwin"
-        "aarch64-darwin"
       ];
 
       imports = [
@@ -600,22 +598,20 @@
               rio-crates,
               coverage ? false,
             }:
-            pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
-              import ./nix/docker.nix {
-                inherit
-                  pkgs
-                  rio-crates
-                  coverage
-                  ;
-                # Dashboard only for the non-coverage image set.
-                # nginx+static has no LLVM instrumentation and the
-                # coverage VM fixture doesn't deploy it — passing
-                # null elides the `dashboard` attr (docker.nix
-                # optionalAttrs guard) so the linkFarm doesn't
-                # reference a redundant drv.
-                rioDashboard = if coverage then null else rioDashboard;
-              }
-            );
+            (import ./nix/docker.nix {
+              inherit
+                pkgs
+                rio-crates
+                coverage
+                ;
+              # Dashboard only for the non-coverage image set.
+              # nginx+static has no LLVM instrumentation and the
+              # coverage VM fixture doesn't deploy it — passing
+              # null elides the `dashboard` attr (docker.nix
+              # optionalAttrs guard) so the linkFarm doesn't
+              # reference a redundant drv.
+              rioDashboard = if coverage then null else rioDashboard;
+            });
           dockerImages = mkDockerImages { inherit rio-crates; };
 
           # NixOS EKS node AMI builder (ADR-021). Exposed below as
@@ -813,20 +809,18 @@
                   "cpuHints has entries for tests not in nix/tests/default.nix: ${
                     toString (pkgs.lib.filter (k: !(allTests ? ${k})) (pkgs.lib.attrNames cpuHints))
                   }";
-            pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
-              pkgs.lib.mapAttrs (
-                name:
-                withMinCpu (
-                  cpuHints.${name}
-                    # k3s fixture: 2-node cluster, k3s-server 8-core + k3s-agent
-                    # 8-core. Every -k3s test in the table is 8; encode that as
-                    # the suffix default so new -k3s tests don't fall through to
-                    # 4. Catchup-fix precedent: d6f74e27 + fa55ef13 both added
-                    # forgotten -k3s entries. Dead entries fail the assert above.
-                    or (if pkgs.lib.hasSuffix "-k3s" name then 8 else 4)
-                )
-              ) allTests
-            );
+            (pkgs.lib.mapAttrs (
+              name:
+              withMinCpu (
+                cpuHints.${name}
+                  # k3s fixture: 2-node cluster, k3s-server 8-core + k3s-agent
+                  # 8-core. Every -k3s test in the table is 8; encode that as
+                  # the suffix default so new -k3s tests don't fall through to
+                  # 4. Catchup-fix precedent: d6f74e27 + fa55ef13 both added
+                  # forgotten -k3s entries. Dead entries fail the assert above.
+                  or (if pkgs.lib.hasSuffix "-k3s" name then 8 else 4)
+              )
+            ) allTests);
 
           vmTests = mkVmTests {
             inherit rio-workspace dockerImages;
@@ -881,20 +875,18 @@
           # Coverage mode uses crateBuildCov (stripBins=false) —
           # same closure-scrub but skips strip so the __llvm_covfun /
           # __llvm_covmap sections llvm-cov needs stay intact.
-          coverage = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
-            import ./nix/coverage.nix {
-              # workspaceSrc is the genhtml source root — coverage.nix
-              # cd's there so repo-relative lcov paths resolve.
-              inherit
-                pkgs
-                rustStable
-                rio-workspace-cov
-                vmTestsCov
-                workspaceSrc
-                ;
-              unitCoverage = crateChecks.coverage;
-            }
-          );
+          coverage = import ./nix/coverage.nix {
+            # workspaceSrc is the genhtml source root — coverage.nix
+            # cd's there so repo-relative lcov paths resolve.
+            inherit
+              pkgs
+              rustStable
+              rio-workspace-cov
+              vmTestsCov
+              workspaceSrc
+              ;
+            unitCoverage = crateChecks.coverage;
+          };
 
           # --------------------------------------------------------------
           # Multi-Nix golden conformance matrix (weekly tier)
@@ -902,11 +894,8 @@
           #
           # Runs golden_conformance against 4 daemon variants: pinned Nix,
           # Nix 2.20-maintenance, Nix master, Lix. Weekly cron invokes
-          # `nix build .#golden-matrix`. NOT in `.#ci` — building three
-          # extra Nix source trees is a 60-90min cold-cache tax. Exported
-          # Linux-only at the `packages` site (the flake inputs eval fine
-          # on Darwin but `nix-daemon` needs a real unix socket + /nix
-          # layout, and we don't run the matrix on macs anyway).
+          # `nix build .#golden-matrix`. NOT a check — building three
+          # extra Nix source trees is a 60-90min cold-cache tax.
           goldenMatrix = import ./nix/golden-matrix.nix {
             inherit pkgs inputs system;
             inherit (crateChecks) mkNextestRun;
@@ -931,6 +920,7 @@
             })
             mutants
             mutants-smoke
+            mutants-report-assert
             ;
 
           # ──────────────────────────────────────────────────────────
@@ -950,10 +940,7 @@
           # everything else on `rio-ci` (spot). This keeps the flake
           # emitting simple name→drv maps without per-entry metadata.
           #
-          # CI runners are Linux-only. vmTests/coverage/fuzz.runs are
-          # all optionalAttrs isLinux upstream, so this whole block is
-          # too — on Darwin it's {} (harmless).
-          githubActions = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          githubActions = {
             matrix = {
               # Rust + static checks. Derived from config.checks — same
               # P0525 rationale as .#ci above: a manual list had drifted
@@ -1032,7 +1019,7 @@
           }
           # Coverage-mode VM test runs: cov-vm.<scenario>. Build one to
           # get raw profraws at result/coverage/<node>/.
-          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          // {
             cov-vm = vmTestsCov;
             # Per-test lcovs: coverage-vm.<scenario>. Inspect one VM
             # test's contribution in isolation.
@@ -1161,9 +1148,7 @@
           # Container images: docker-{gateway,scheduler,store,worker}
           # plus a linkFarm aggregate at `.#dockerImages` (milestone
           # target per docs/src/phases/phase2b.md:46).
-          # Linux-only — optionalAttrs means these simply don't exist
-          # on Darwin, rather than failing evaluation.
-          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          // {
             docker-gateway = dockerImages.gateway;
             docker-scheduler = dockerImages.scheduler;
             docker-store = dockerImages.store;
@@ -1266,7 +1251,7 @@
             # won't build the three extra Nix source trees on every
             # push.
             golden-matrix = goldenMatrix;
-            inherit mutants mutants-smoke;
+            inherit mutants mutants-report-assert;
           };
 
           # --------------------------------------------------------------
@@ -1297,12 +1282,7 @@
             #   nix build .#checks.x86_64-linux.vm-protocol-warm-standalone.driverInteractive
             #   ./result/bin/nixos-test-driver
             // vmTests
-            # Eval-time assertion: codecov.yml after_n_builds must
-            # equal the coverage matrix length. Catches drift when
-            # vm-* fragments are added without bumping the Codecov
-            # gate. Linux-only because githubActions is optionalAttrs
-            # isLinux.
-            // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            // {
               # cov-smoke: one coverage-mode VM scenario, asserts
               # profraw→lcov pipeline works. ~5min. Catches "coverage
               # infra broken" at merge-gate instead of 118 commits
@@ -1311,6 +1291,12 @@
               # use nix-fast-build's --skip-cached or build the
               # checks subset that excludes it.
               cov-smoke = coverage.smoke;
+              # mutants-smoke: bounded cargo-mutants run on
+              # rio-auth/src/jwt.rs (~5min cold). Proves the
+              # mutate→rebuild→retest→classify pipeline works and
+              # catches ≥1 mutant. The full sweep is .#mutants
+              # (weekly, hours).
+              inherit mutants-smoke;
               # Regression: per-node profraw extract must not drop
               # filename-colliding profraws across multi-worker nodes.
               # No KVM needed (synthetic tarballs).

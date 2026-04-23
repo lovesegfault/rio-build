@@ -288,9 +288,7 @@ in
     regenHint = "nix build .#tfvars && jq -S . result > infra/eks/generated.auto.tfvars.json";
   };
 }
-# Linux-only checks (dockerTools, nixosSystem). On Darwin
-# miscChecks degrades to the policy checks above.
-// pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+// {
   # Seed↔ECR-push layer-digest parity. The seed warms
   # containerd's content store; the warm only works if the
   # seed's layer digests match what push.rs puts in ECR
