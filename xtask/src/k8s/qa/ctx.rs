@@ -287,7 +287,7 @@ impl PgHandle {
     /// pod (5432 → RDS endpoint) and port-forward to THAT, then
     /// sqlx connects to `localhost:{bound}`.
     ///
-    /// `wipe` calls this with a URL captured BEFORE `helm uninstall`
+    /// `up --wipe` calls this with a URL captured BEFORE `helm uninstall`
     /// (which removes the ExternalSecret-backed `rio-postgres` Secret).
     pub async fn open_with_url(url: &str) -> Result<Self> {
         let (host, port) = pg_host_port(url)?;
@@ -330,8 +330,8 @@ impl PgHandle {
 /// Running, port-forward to it. Named `rio-qa-pg-relay`; pre-deletes
 /// any prior instance so re-runs are idempotent. The pod is left
 /// behind when the run ends — it's a 5MB image listening on a socket,
-/// and `wipe` clears it (it's in `rio-system` which `wipe` keeps, but
-/// the next qa run's pre-delete handles it).
+/// and `up --wipe` clears it (it's in `rio-system` which wipe keeps,
+/// but the next qa run's pre-delete handles it).
 async fn spawn_socat_relay(host: &str, port: u16) -> Result<(u16, ProcessGuard)> {
     const POD: &str = "rio-qa-pg-relay";
     let s = sh::shell()?;

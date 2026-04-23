@@ -1,18 +1,17 @@
-//! `xtask k8s wipe` — reset a cluster to pristine state without
-//! `destroy`+`up`.
+//! `xtask k8s up --wipe` — reset the data plane to pristine state
+//! before the `up` pipeline runs.
 //!
 //! Clears the data plane (S3 chunks, PG schema, tenants/builds, builder
-//! Jobs, gateway authorized_keys) and re-runs `up --deploy`. Infra
-//! shape — RDS instance, S3 bucket, AMI, Karpenter NodePool
-//! definitions, tofu-managed helm releases (cilium, karpenter, aws-lbc)
-//! — is preserved. Target wall-clock: ~2min vs `destroy`+`up`'s ~20min.
+//! Jobs, gateway authorized_keys). Infra shape — RDS instance, S3
+//! bucket, AMI, Karpenter NodePool definitions, tofu-managed helm
+//! releases (cilium, karpenter, aws-lbc) — is preserved. Target
+//! wall-clock: ~2min vs `destroy`+`up`'s ~20min.
 //!
 //! Secrets policy: `rio-gateway-ssh` (tenant keys) is wiped; internal
 //! auth (`rio-jwt-signing`, `rio-service-hmac`, `rio-postgres*`) stays.
 //! Those live in `rio-system`, which is the one namespace this command
 //! does NOT delete.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -20,10 +19,9 @@ use tracing::{info, warn};
 
 use super::eks::TF_DIR;
 use super::eks::destroy::{k, uninstall_chart};
-use super::provider::{Provider, ProviderKind};
+use super::provider::ProviderKind;
 use super::qa::ctx::PgHandle;
-use super::{NS, NS_BUILDERS, NS_FETCHERS, NS_STORE, UpOpts, client as kube, run_up};
-use crate::config::XtaskConfig;
+use super::{NS, NS_BUILDERS, NS_FETCHERS, NS_STORE, client as kube};
 use crate::sh::{self, cmd, shell};
 use crate::{aws, tofu, ui};
 
@@ -31,7 +29,7 @@ use crate::{aws, tofu, ui};
 /// auth secrets survive.
 const WIPE_NAMESPACES: &[&str] = &[NS_STORE, NS_BUILDERS, NS_FETCHERS];
 
-pub async fn run(p: Arc<dyn Provider>, kind: ProviderKind, cfg: &XtaskConfig) -> Result<()> {
+pub(super) async fn run(kind: ProviderKind) -> Result<()> {
     let client = kube::client().await?;
 
     // ── 0. Capture PG URL BEFORE uninstall (eks) ────────────────────
@@ -53,8 +51,8 @@ pub async fn run(p: Arc<dyn Provider>, kind: ProviderKind, cfg: &XtaskConfig) ->
     uninstall_chart().await?;
 
     // ── 4. Wipe tenant keys ─────────────────────────────────────────
-    // The only `rio-system` Secret we touch. `up --deploy` recreates it
-    // with just the operator's RIO_SSH_PUBKEY.
+    // The only `rio-system` Secret we touch. The deploy phase recreates
+    // it with just the operator's RIO_SSH_PUBKEY.
     ui::step("delete rio-gateway-ssh Secret", || async {
         kube::delete_secret(&client, NS, "rio-gateway-ssh").await
     })
@@ -93,7 +91,7 @@ pub async fn run(p: Arc<dyn Provider>, kind: ProviderKind, cfg: &XtaskConfig) ->
                 None => warn!(
                     "rio-postgres Secret was already gone before wipe started \
                      (prior partial wipe?) — skipping schema reset; \
-                     `up --deploy` migration will fail if old tables remain"
+                     the deploy phase's migration will fail if old tables remain"
                 ),
             }
         }
@@ -106,28 +104,13 @@ pub async fn run(p: Arc<dyn Provider>, kind: ProviderKind, cfg: &XtaskConfig) ->
         }
     }
 
-    // ── 9. Redeploy ─────────────────────────────────────────────────
-    // `up --push --deploy`: deploy's preflight rejects tags not in ECR,
-    // and HEAD has typically moved since the last push (this is a dev
-    // iteration tool). Push is idempotent — `nix build .#images` is
-    // cached and the ECR tag-exists check skips re-upload. NOT full
-    // `up` — provision/ami are infra-shape and untouched by wipe.
-    ui::step("redeploy (up --push --deploy)", || {
-        let cfg = cfg.clone();
-        let opts = UpOpts {
-            push: true,
-            deploy: true,
-            ..Default::default()
-        };
-        async move { run_up(p, kind, &cfg, opts).await }
-    })
-    .await
+    Ok(())
 }
 
 /// Karpenter reconciles deleted NodePools by terminating their
 /// NodeClaims; we just wait. Unlike `destroy` (which `kubectl delete
 /// nodeclaim --all` because Karpenter itself is about to be torn down),
-/// `wipe` keeps Karpenter alive so it does the work.
+/// `up --wipe` keeps Karpenter alive so it does the work.
 ///
 /// Filters on `rio-` nodepool prefix in case the cluster ever carries
 /// non-rio NodePools.
@@ -166,7 +149,7 @@ async fn empty_chunk_bucket() -> Result<()> {
 }
 
 /// `DROP SCHEMA public CASCADE; CREATE SCHEMA public;` so the
-/// migration Job (run by `up --deploy`) starts from 001.
+/// migration Job (run by the deploy phase) starts from 001.
 ///
 /// RDS lives in private VPC subnets — the operator's machine can't
 /// reach it directly, and by this step we've deleted every rio pod

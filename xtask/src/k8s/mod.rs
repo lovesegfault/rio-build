@@ -91,6 +91,15 @@ pub struct UpOpts {
     /// helm upgrade rio chart.
     #[arg(long)]
     pub(super) deploy: bool,
+    /// Wipe the data plane (S3 chunks, PG schema, tenants/builds, builder
+    /// Jobs, gateway authorized_keys) BEFORE running the full `up`
+    /// pipeline. Infra shape (RDS instance, bucket, AMI, NodePools,
+    /// tofu-managed helm releases) is preserved. ~2min wipe vs
+    /// `destroy`+`up`'s ~20min. Incompatible with phase flags — `--wipe`
+    /// always runs the full pipeline so the redeployed cluster is
+    /// consistent with current HEAD (push + deploy in particular).
+    #[arg(long)]
+    wipe: bool,
 
     // Namespaced per-phase opts. NO clap `requires` attribute —
     // validated at runtime by `validate_phase_opts()` so the
@@ -169,6 +178,18 @@ impl UpOpts {
     /// explicit and `--deploy` isn't among them.
     fn validate_phase_opts(&self, selected: &[Phase]) -> Result<()> {
         let explicit = selected.len() != Phase::ALL.len();
+        // --wipe must run the full pipeline: a partial up after wipe
+        // leaves the cluster half-reset (e.g. no ECR tag for HEAD if
+        // push is skipped, no chart if deploy is skipped). Reject any
+        // phase-flag combination rather than guess which subset is
+        // safe.
+        if self.wipe && explicit {
+            let flags: Vec<_> = selected.iter().map(|p| format!("--{}", p.name())).collect();
+            bail!(
+                "--wipe requires the full pipeline; drop {} or drop --wipe",
+                flags.join(" ")
+            );
+        }
         if !explicit {
             return Ok(());
         }
@@ -270,16 +291,6 @@ pub enum K8sCmd {
     Destroy {
         /// Skip the interactive confirm. Destroy is irreversible —
         /// only use this from CI / scripted teardowns.
-        #[arg(long)]
-        yes: bool,
-    },
-    /// Reset the data plane (S3 chunks, PG schema, tenants/builds,
-    /// builder Jobs, gateway authorized_keys) and redeploy.
-    /// Infrastructure (RDS instance, bucket, AMI, NodePools, tofu-
-    /// managed helm releases) is preserved. ~2min vs `destroy`+`up`'s
-    /// ~20min.
-    Wipe {
-        /// Skip the interactive confirm.
         #[arg(long)]
         yes: bool,
     },
@@ -434,23 +445,6 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             }
             p.destroy(cfg).await
         }
-        K8sCmd::Wipe { yes } => {
-            let what = match kind {
-                ProviderKind::Eks => crate::tofu::output(eks::TF_DIR, "cluster_name")
-                    .map(|n| format!("EKS cluster '{n}'"))
-                    .unwrap_or_else(|_| "the EKS cluster".into()),
-                ProviderKind::K3s => "the local k3s rio deployment".into(),
-            };
-            if !yes
-                && !ui::confirm_destroy(&format!(
-                    "This will WIPE all rio data (S3 chunks, PG schema, tenants, builds) on {what}. \
-                     Infrastructure (RDS instance, bucket, AMI, NodePools) is preserved. Continue?"
-                ))?
-            {
-                bail!("wipe cancelled (use --yes to bypass)");
-            }
-            wipe::run(p, kind, cfg).await
-        }
         K8sCmd::RemoteStoreBuild { remote } => {
             with_remote_store(&*p, cfg, remote.port, |sh, store| {
                 let args = &remote.args;
@@ -590,6 +584,10 @@ pub(super) async fn run_up(
         }
     };
 
+    if o.wipe {
+        wipe::run(kind).await?;
+    }
+
     ui::step("k8s up", || async move {
         run_up_phases(p, cfg, &selected, pp, ami_branch).await?;
         // Auto-GC stale AMIs once the new one is registered + deployed.
@@ -707,6 +705,21 @@ mod tests {
         // OK once --deploy is added.
         o.deploy = true;
         assert!(o.validate_phase_opts(&o.phases()).is_ok());
+    }
+
+    #[test]
+    fn wipe_rejects_phase_flags() {
+        let mut o = opts();
+        o.wipe = true;
+        // bare --wipe → full pipeline, OK
+        assert!(o.validate_phase_opts(&o.phases()).is_ok());
+        // --wipe --push → error naming the offending flag
+        o.push = true;
+        let e = o.validate_phase_opts(&o.phases()).unwrap_err().to_string();
+        assert!(
+            e.contains("--wipe requires the full pipeline") && e.contains("--push"),
+            "{e}"
+        );
     }
 
     #[test]

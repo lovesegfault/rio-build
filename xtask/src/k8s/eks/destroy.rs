@@ -133,14 +133,14 @@ async fn k_patch_all(ns: &str, kind: &str, patch: &str) -> Result<()> {
     Ok(())
 }
 
-/// Steps 1–3 shared between `destroy` and `wipe`: kick off Pool CR
+/// Steps 1–3 shared between `destroy` and `up --wipe`: kick off Pool CR
 /// deletion, `helm uninstall rio --wait`, then strip orphaned
 /// `*.rio.build` finalizers and wait for the Pool deletes to complete.
 /// After this returns, the chart's resources are gone and no rio CR
 /// has a finalizer that could wedge a subsequent namespace delete.
 ///
 /// Provider-agnostic — kubectl/helm only. NodeClaim handling is
-/// caller-specific (destroy explicitly deletes; wipe waits for
+/// caller-specific (destroy explicitly deletes; up --wipe waits for
 /// Karpenter to reconcile).
 pub(in crate::k8s) async fn uninstall_chart() -> Result<()> {
     // ── 1. Kick off pool CR deletion ───────────────────────────────

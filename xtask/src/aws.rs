@@ -52,7 +52,7 @@ pub async fn config(region: Option<&str>) -> &'static SdkConfig {
 ///
 /// `aws s3 rm --recursive` is too slow at >100K objects; lifecycle
 /// rules are async (≤24h to fire) so unsuitable for a synchronous
-/// `wipe`. This is the lister→batched-DeleteObjects pattern at ~9K
+/// `up --wipe`. This is the lister→batched-DeleteObjects pattern at ~9K
 /// obj/s with `concurrency=8`.
 pub async fn empty_bucket(region: &str, bucket: &str) -> Result<usize> {
     const CONCURRENCY: usize = 8;
