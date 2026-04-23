@@ -79,6 +79,9 @@ impl DagActor {
             AdminQuery::GetSpawnIntents { req, reply } => {
                 let _ = reply.send(self.compute_spawn_intents(&req));
             }
+            AdminQuery::MintExecutorTokens { intent_ids, reply } => {
+                let _ = reply.send(self.mint_executor_tokens(&intent_ids));
+            }
             AdminQuery::GcRoots { reply } => {
                 let _ = reply.send(self.handle_gc_roots());
             }
@@ -276,12 +279,15 @@ impl DagActor {
         let cap = i64::from(self.sla_config.max_forecast_cores_per_tenant);
 
         // SpawnIntent constructor shared by Ready + forecast passes.
-        // The HMAC token's expiry is `deadline + eta + 5min` so a
-        // forecast-spawned pod's token covers its boot horizon.
         // `ready` is the explicit Ready/forecast discriminator —
         // `eta_seconds` is purely the §13b horizon (a forecast intent
         // with overdue deps clamps to 0.0, which would otherwise
         // collide with the Ready filter; bug_030).
+        //
+        // NO `executor_token` here: `SpawnIntent` is plain data
+        // (dashboard/CLI also read it). The credential mints via
+        // `MintExecutorTokens` (controller-only) — see
+        // `r[sched.sla.threat.read-path-auth]`.
         let to_proto = |drv_hash: &str,
                         state: &crate::state::DerivationState,
                         intent: &SolvedIntent,
@@ -289,25 +295,6 @@ impl DagActor {
                         eta_seconds: f64|
          -> rio_proto::types::SpawnIntent {
             let kind = crate::state::kind_for_drv(state.is_fixed_output);
-            // r[impl sec.executor.identity-token+2]
-            let executor_token = self
-                .hmac_signer
-                .as_ref()
-                .map(|s| {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    s.sign(&rio_auth::hmac::ExecutorClaims {
-                        intent_id: drv_hash.to_string(),
-                        kind: kind.into(),
-                        expiry_unix: now
-                            .saturating_add(u64::from(intent.deadline_secs))
-                            .saturating_add(eta_seconds as u64)
-                            .saturating_add(300),
-                    })
-                })
-                .unwrap_or_default();
             rio_proto::types::SpawnIntent {
                 intent_id: drv_hash.to_string(),
                 cores: intent.cores,
@@ -321,7 +308,6 @@ impl DagActor {
                 system: state.system.clone(),
                 required_features: state.required_features.clone(),
                 deadline_secs: intent.deadline_secs,
-                executor_token,
                 node_affinity: intent.node_affinity.clone(),
                 eta_seconds,
                 ready: Some(ready),
@@ -498,6 +484,58 @@ impl DagActor {
             intents: intents.into_iter().map(|(_, i)| i).collect(),
             queued_by_system,
         }
+    }
+
+    /// Mint per-intent `ExecutorClaims` tokens for
+    /// `AdminService.MintExecutorTokens`. Controller-only — the
+    /// credential lives on a controller-only surface so
+    /// dashboard/CLI/ComponentScaler never hold it
+    /// (`r[sched.sla.threat.read-path-auth]`).
+    ///
+    /// Reads `(kind, deadline_secs, eta_seconds)` from the current
+    /// [`compute_spawn_intents`] snapshot — the controller calls this
+    /// immediately after `GetSpawnIntents` so the `SolveCache` is warm
+    /// and the second pass is O(dag_nodes) HashMap walk + memo hits.
+    /// `intent_ids` not in the snapshot (drv left Ready/Queued between
+    /// the two calls) are omitted from the map; the controller spawns
+    /// those pods without a token and the scheduler's HMAC verifier
+    /// rejects the connection — pod idle-exits, next tick re-spawns.
+    /// Empty map when `hmac_signer` is None (dev mode).
+    ///
+    /// [`compute_spawn_intents`]: Self::compute_spawn_intents
+    // r[impl sec.executor.identity-token+2]
+    pub(crate) fn mint_executor_tokens(&self, intent_ids: &[String]) -> HashMap<String, String> {
+        let Some(signer) = &self.hmac_signer else {
+            return HashMap::new();
+        };
+        let now = rio_auth::now_unix().unwrap_or(0);
+        // Unfiltered: same population GetSpawnIntents serves. The
+        // controller's request may span Builder+Fetcher pools and
+        // Ready+forecast; one snapshot covers both.
+        let snap = self.compute_spawn_intents(&SpawnIntentsRequest::default());
+        let by_id: HashMap<&str, &rio_proto::types::SpawnIntent> = snap
+            .intents
+            .iter()
+            .map(|i| (i.intent_id.as_str(), i))
+            .collect();
+        intent_ids
+            .iter()
+            .filter_map(|id| {
+                let intent = by_id.get(id.as_str())?;
+                let token = signer.sign(&rio_auth::hmac::ExecutorClaims {
+                    intent_id: id.clone(),
+                    kind: intent.kind,
+                    // `deadline + eta + 5min`: a forecast-spawned pod's
+                    // token covers its boot horizon. Preserved verbatim
+                    // from the pre-split `to_proto` mint.
+                    expiry_unix: now
+                        .saturating_add(u64::from(intent.deadline_secs))
+                        .saturating_add(intent.eta_seconds as u64)
+                        .saturating_add(300),
+                });
+                Some((id.clone(), token))
+            })
+            .collect()
     }
 
     /// Process the controller's spawn ack. `registered_cells`

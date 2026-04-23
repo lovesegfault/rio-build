@@ -134,6 +134,10 @@ rstest = { workspace = true }
 # ADR-023: property invariants on T(c) monotonicity + solve_mvp bounds
 # (tests/sla_fit_props.rs).
 proptest = { workspace = true }
+# admin/tests/mod.rs::admin_rpc_gate_coverage parses admin.proto via
+# include_str! + regex (rio-proto/build.rs doesn't emit a
+# FILE_DESCRIPTOR_SET; rio-test-support's is for MockAdmin codegen only).
+regex = { workspace = true }
 aws-smithy-mocks = { workspace = true }
 # sla/solve.rs + cost.rs: assert that documented-but-unwired metrics are
 # actually emitted. Already transitive via metrics-exporter-prometheus

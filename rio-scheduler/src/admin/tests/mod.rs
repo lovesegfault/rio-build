@@ -249,25 +249,71 @@ fn req_with_token<T>(signer: &rio_auth::hmac::HmacSigner, caller: &str, body: T)
     req
 }
 
+/// EVERY AdminService RPC appears in exactly one of these. A new RPC
+/// that's in neither fails [`admin_rpc_gate_coverage`]. The
+/// `SERVICE_GATED` list is mutating + topology/credential-leaking
+/// read-paths; `UNGATED_PUBLIC` is the dashboard/grpc-web surface.
+///
+/// **Payload-sensitivity rule** (`r[sched.sla.threat.read-path-auth]`):
+/// an RPC's gate is determined by the most sensitive *field* it
+/// returns, not its verb. Any response field that is a signed
+/// credential (`*_token`, `*_claims`) or a tenant-scoped secret is
+/// `rio-controller`-only regardless of read/write classification —
+/// `GetSpawnIntents` was "intentionally ungated" here while it carried
+/// `executor_token`, which let a compromised builder on port 9001
+/// harvest another tenant's executor identity (bug_028).
+/// [`admin_rpc_gate_coverage`] enforces both: every RPC is classified,
+/// and no `UNGATED_PUBLIC` response transitively contains a
+/// credential-shaped field.
+const SERVICE_GATED: &[&str] = &[
+    // Mutating ([`mutating_rpcs_require_service_token`]):
+    "TriggerGC",
+    "DrainExecutor",
+    "CancelBuild",
+    "ReportExecutorTermination",
+    "ClearPoison",
+    "CreateTenant",
+    "DeleteTenant",
+    "AckSpawnedIntents",
+    "SetSlaOverride",
+    "ClearSlaOverride",
+    "ResetSlaModel",
+    "ImportSlaCorpus",
+    "InjectBuildSample",
+    "AppendInterruptSample",
+    // Read-path gated ([`read_path_rpcs_require_service_token`]):
+    "ListPoisoned",
+    "ListTenants",
+    "GetBuildGraph",
+    "GetSpawnIntents",
+    "MintExecutorTokens",
+    "InspectBuildDag",
+    "ListSlaOverrides",
+    "SlaStatus",
+    "SlaExplain",
+    "ExportSlaCorpus",
+    "HwClassSampled",
+    "GetHwClassConfig",
+];
+const UNGATED_PUBLIC: &[&str] = &[
+    "GetBuildLogs",
+    "ClusterStatus",
+    "ListExecutors",
+    "ListBuilds",
+    "DebugListExecutors",
+];
+
 /// Every mutating AdminService RPC is service-token gated. Builders
 /// share port 9001 with this service (CCNP allows scheduler:9001 at L4
 /// only) and the JWT interceptor is permissive-on-absent-header — so
 /// without `ensure_service_caller` a compromised builder reaches every
 /// handler. Per the threat model "the worker is NOT trusted".
 ///
-/// **Adding a new RPC:** add it to either this table (mutating) or the
-/// read-only allowlist comment below — never neither. The table is the
-/// structural lock that makes "forgot the gate on a new RPC" surface as
-/// an obvious review diff (bug_013: 7 of 11 mutating RPCs were ungated
-/// before this test became the canonical list).
-///
-/// Read-only RPCs (intentionally ungated — dashboard/grpc-web reach
-/// them with no HMAC): `GetBuildLogs`, `ClusterStatus`, `ListExecutors`,
-/// `ListBuilds`, `GetSpawnIntents`, `DebugListExecutors`.
-///
-/// Read-only but **gated** (threat-model gap (a) — a compromised
-/// builder reaching these leaks tenant/DAG/SLA topology): see
-/// [`read_path_rpcs_require_service_token`].
+/// **Adding a new RPC:** add it to [`SERVICE_GATED`] or
+/// [`UNGATED_PUBLIC`] above — never neither.
+/// [`admin_rpc_gate_coverage`] fails until classified (bug_013: 7 of
+/// 11 mutating RPCs were ungated before the canonical list became a
+/// test, not a comment).
 // r[verify sec.authz.service-token]
 #[tokio::test]
 async fn mutating_rpcs_require_service_token() {
@@ -425,6 +471,190 @@ async fn read_path_rpcs_require_service_token() {
         "HwClassSampled",
         svc.hw_class_sampled(Request::new(HwClassSampledRequest::default()))
     );
+    assert_gated!(
+        "GetHwClassConfig",
+        svc.get_hw_class_config(Request::new(()))
+    );
+    assert_gated!(
+        "GetSpawnIntents",
+        svc.get_spawn_intents(Request::new(GetSpawnIntentsRequest::default()))
+    );
+    assert_gated!(
+        "MintExecutorTokens",
+        svc.mint_executor_tokens(Request::new(MintExecutorTokensRequest::default()))
+    );
+}
+
+/// Exhaustive gate-coverage: every `AdminService` RPC is in exactly one
+/// of [`SERVICE_GATED`] / [`UNGATED_PUBLIC`], and no `UNGATED_PUBLIC`
+/// response type transitively contains a credential-shaped field.
+///
+/// Part (a) is the structural close for bug_013 / bug_028 — the
+/// "intentionally ungated" comment was a list nobody enforced; this
+/// test fails on a new RPC until it's classified. Part (b) is the
+/// payload-sensitivity rule (`r[sched.sla.threat.read-path-auth]`): a
+/// signed credential on a multi-caller read-path response is a
+/// cross-tenant leak regardless of the verb's gating.
+///
+/// `rio-proto/build.rs` does NOT emit a `FILE_DESCRIPTOR_SET` (only
+/// `rio-test-support/build.rs` does, for its own MockAdmin codegen), so
+/// both parts parse the proto sources via [`rio_proto::proto_src`] +
+/// regex (crate2nix sandboxes each crate's build, so a sibling-crate
+/// `include_str!` does NOT resolve under nix builds). The proto grammar
+/// this needs (rpc decls, message blocks, field decls) is regular
+/// enough that regex is robust; protoc validates the rest.
+// r[verify sched.sla.threat.read-path-auth]
+#[test]
+fn admin_rpc_gate_coverage() {
+    use std::collections::{HashMap, HashSet};
+
+    // ─── (a) every RPC is classified, partition is disjoint ──────────
+    let admin_proto = rio_proto::proto_src::ADMIN;
+    let rpc_re = regex::Regex::new(r"\brpc\s+(\w+)\s*\(").unwrap();
+    let all_rpcs: HashSet<&str> = rpc_re
+        .captures_iter(admin_proto)
+        .map(|c| c.get(1).unwrap().as_str())
+        .collect();
+    assert!(!all_rpcs.is_empty(), "rpc regex matched nothing");
+
+    let gated: HashSet<&str> = SERVICE_GATED.iter().copied().collect();
+    let public: HashSet<&str> = UNGATED_PUBLIC.iter().copied().collect();
+    let overlap: Vec<_> = gated.intersection(&public).collect();
+    assert!(overlap.is_empty(), "gated ∩ public must be ∅: {overlap:?}");
+
+    let classified: HashSet<&str> = gated.union(&public).copied().collect();
+    let unclassified: Vec<_> = all_rpcs.difference(&classified).collect();
+    assert!(
+        unclassified.is_empty(),
+        "every AdminService RPC must be in SERVICE_GATED or UNGATED_PUBLIC \
+         (admin/tests/mod.rs); unclassified: {unclassified:?}"
+    );
+    let stale: Vec<_> = classified.difference(&all_rpcs).collect();
+    assert!(
+        stale.is_empty(),
+        "SERVICE_GATED/UNGATED_PUBLIC names not in admin.proto: {stale:?}"
+    );
+
+    // ─── (b) no UNGATED_PUBLIC response transitively carries a
+    //         credential-shaped field ───────────────────────────────────
+    // Field-name suffixes that mark a credential. `_token`/`_secret`/
+    // `_claims` are unambiguous; `_key` is too FP-prone (model_key,
+    // cache_key) so it's matched only as the bare `key` in a
+    // `*_secret_key`/`*_signing_key` compound — none exist today, and
+    // map<K,V> field names like `key` are scoped to the map entry, not
+    // the message.
+    let bad_suffix = |name: &str| {
+        name.ends_with("_token")
+            || name.ends_with("_secret")
+            || name.ends_with("_claims")
+            || name.ends_with("_key")
+    };
+
+    // Parse `rpc Name(Req) returns (stream? Resp)` → Name → Resp.
+    // Resp is `.`-qualified (`rio.types.Foo`); take the last segment.
+    let ret_re = regex::Regex::new(
+        r"\brpc\s+(\w+)\s*\([^)]*\)\s*returns\s*\(\s*(?:stream\s+)?([\w.]+)\s*\)",
+    )
+    .unwrap();
+    let response_of: HashMap<&str, &str> = ret_re
+        .captures_iter(admin_proto)
+        .map(|c| {
+            let name = c.get(1).unwrap().as_str();
+            let resp = c.get(2).unwrap().as_str();
+            (name, resp.rsplit('.').next().unwrap())
+        })
+        .collect();
+
+    // Parse all message blocks across the four `package rio.types`
+    // files into `name → [(field_type_last_segment, field_name)]`.
+    // `message X { ... }` blocks may nest one level (oneof / nested
+    // message); a brace-counting walk handles both.
+    let protos = [
+        rio_proto::proto_src::ADMIN_TYPES,
+        rio_proto::proto_src::TYPES,
+        rio_proto::proto_src::DAG,
+        rio_proto::proto_src::BUILD_TYPES,
+    ]
+    .join("\n");
+    let protos = protos.as_str();
+    let msg_re = regex::Regex::new(r"\bmessage\s+(\w+)\s*\{").unwrap();
+    // `[qualifier] type name = N;` — qualifier ∈ optional|repeated;
+    // `map<K,V>` collapses to V (the value message is what we'd
+    // recurse into; K is always scalar in this proto set).
+    let field_re = regex::Regex::new(
+        r"^\s*(?:optional\s+|repeated\s+)?(?:map<\s*\w+\s*,\s*([\w.]+)\s*>|([\w.]+))\s+(\w+)\s*=\s*\d+\s*;",
+    )
+    .unwrap();
+    let mut messages: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let bytes = protos.as_bytes();
+    for m in msg_re.captures_iter(protos) {
+        let name = m.get(1).unwrap().as_str().to_owned();
+        let body_start = m.get(0).unwrap().end();
+        // Brace-count to find the matching `}`.
+        let mut depth = 1usize;
+        let mut i = body_start;
+        while depth > 0 {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        let body = &protos[body_start..i - 1];
+        let fields: Vec<(String, String)> = body
+            .lines()
+            .filter_map(|l| field_re.captures(l))
+            .map(|c| {
+                let ty = c
+                    .get(1)
+                    .or_else(|| c.get(2))
+                    .unwrap()
+                    .as_str()
+                    .rsplit('.')
+                    .next()
+                    .unwrap()
+                    .to_owned();
+                (ty, c.get(3).unwrap().as_str().to_owned())
+            })
+            .collect();
+        messages.entry(name).or_default().extend(fields);
+    }
+    assert!(
+        messages.contains_key("SpawnIntent"),
+        "message regex matched nothing useful"
+    );
+
+    // Transitive walk from each UNGATED_PUBLIC response type.
+    for &rpc in UNGATED_PUBLIC {
+        let resp = response_of
+            .get(rpc)
+            .unwrap_or_else(|| panic!("response type for {rpc} not parsed"));
+        if *resp == "Empty" {
+            continue;
+        }
+        let mut seen = HashSet::new();
+        let mut stack = vec![resp.to_string()];
+        while let Some(ty) = stack.pop() {
+            if !seen.insert(ty.clone()) {
+                continue;
+            }
+            let Some(fields) = messages.get(ty.as_str()) else {
+                // Scalar / well-known (Timestamp, Empty) — leaf.
+                continue;
+            };
+            for (fty, fname) in fields {
+                assert!(
+                    !bad_suffix(fname),
+                    "UNGATED_PUBLIC rpc {rpc} → {ty}.{fname}: credential-shaped \
+                     field on an ungated read-path response — gate the RPC \
+                     (add to SERVICE_GATED) or move the field to a \
+                     controller-only RPC (r[sched.sla.threat.read-path-auth])"
+                );
+                stack.push(fty.clone());
+            }
+        }
+    }
 }
 
 /// Positive path: valid token with allowlisted `caller` passes the

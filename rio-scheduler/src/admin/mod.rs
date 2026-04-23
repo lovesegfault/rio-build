@@ -36,10 +36,10 @@ use rio_proto::types::{
     ImportSlaCorpusResponse, InjectBuildSampleRequest, InspectBuildDagRequest,
     InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse, ListExecutorsRequest,
     ListExecutorsResponse, ListPoisonedResponse, ListSlaOverridesRequest, ListSlaOverridesResponse,
-    ListTenantsResponse, PoisonedDerivation, ReportExecutorTerminationRequest,
-    ReportExecutorTerminationResponse, ResetSlaModelRequest, SetSlaOverrideRequest,
-    SlaExplainRequest, SlaExplainResponse, SlaOverride, SlaStatusRequest, SlaStatusResponse,
-    TerminationReason,
+    ListTenantsResponse, MintExecutorTokensRequest, MintExecutorTokensResponse, PoisonedDerivation,
+    ReportExecutorTerminationRequest, ReportExecutorTerminationResponse, ResetSlaModelRequest,
+    SetSlaOverrideRequest, SlaExplainRequest, SlaExplainResponse, SlaOverride, SlaStatusRequest,
+    SlaStatusResponse, TerminationReason,
 };
 use uuid::Uuid;
 
@@ -648,9 +648,37 @@ impl AdminService for AdminServiceImpl {
         request: Request<GetSpawnIntentsRequest>,
     ) -> Result<Response<GetSpawnIntentsResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // r[impl sched.sla.threat.read-path-auth]
+        // Gated on payload sensitivity, not verb: builders share port
+        // 9001 and the response leaks per-tenant DAG topology
+        // (intent_id == drv_hash, system, required_features). The
+        // credential previously carried here (`executor_token`) now
+        // mints via `MintExecutorTokens` (controller-only) so
+        // dashboard/CLI hold plain data.
+        self.ensure_service_caller(
+            request.metadata(),
+            &["rio-controller", "rio-dashboard", "rio-cli"],
+        )?;
         self.ensure_leader()?;
         self.check_actor_alive()?;
         let resp = spawn_intents::get_spawn_intents(&self.actor, request.into_inner()).await?;
+        Ok(Response::new(resp))
+    }
+
+    /// Mint per-intent `RIO_EXECUTOR_TOKEN`s. Controller-only: a signed
+    /// credential is the most sensitive payload class
+    /// (`r[sched.sla.threat.read-path-auth]`); dashboard/CLI never held
+    /// a use for it.
+    #[instrument(skip(self, request), fields(rpc = "MintExecutorTokens"))]
+    async fn mint_executor_tokens(
+        &self,
+        request: Request<MintExecutorTokensRequest>,
+    ) -> Result<Response<MintExecutorTokensResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_service_caller(request.metadata(), &["rio-controller"])?;
+        self.ensure_leader()?;
+        self.check_actor_alive()?;
+        let resp = spawn_intents::mint_executor_tokens(&self.actor, request.into_inner()).await?;
         Ok(Response::new(resp))
     }
 

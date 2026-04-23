@@ -342,6 +342,44 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         .cloned()
         .collect();
 
+    // r[impl sec.executor.identity-token+2]
+    // Mint per-intent `RIO_EXECUTOR_TOKEN`s on a controller-only
+    // surface — `SpawnIntent` is plain data (dashboard/CLI also read
+    // it via `GetSpawnIntents`), so the credential lives here, not on
+    // the intent. One RPC per reconcile per pool, only for the
+    // headroom-truncated set the controller is about to create Jobs
+    // for. Empty `to_spawn_intents` skips the round-trip; on RPC
+    // failure pods spawn without a token (dev-mode parity — the
+    // builder omits the header, scheduler rejects under HMAC mode, pod
+    // idle-exits, next tick re-spawns). intent_ids the scheduler no
+    // longer recognizes (drv left Ready between the two calls) are
+    // omitted from the map → same fail-safe.
+    let executor_tokens: HashMap<String, String> = if to_spawn_intents.is_empty() {
+        HashMap::new()
+    } else {
+        match admin_call(
+            ctx.admin
+                .clone()
+                .mint_executor_tokens(rio_proto::types::MintExecutorTokensRequest {
+                    intent_ids: to_spawn_intents
+                        .iter()
+                        .map(|i| i.intent_id.clone())
+                        .collect(),
+                }),
+        )
+        .await
+        {
+            Ok(r) => r.into_inner().tokens,
+            Err(e) => {
+                warn!(
+                    pool = %name, error = %e,
+                    "mint_executor_tokens failed; spawning without tokens this tick"
+                );
+                HashMap::new()
+            }
+        }
+    };
+
     // One pod per intent with that intent's resources + annotation.
     // Headroom truncates; the remainder is picked up next tick after
     // `active` decreases. Under mandatory `[sla]` (Phase 5) the
@@ -359,6 +397,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                 &ctx.scheduler,
                 &ctx.store,
                 intent,
+                executor_tokens.get(&intent.intent_id).map(String::as_str),
                 &hw_sampled,
                 ctx.hw_bench_mem_floor,
             )
@@ -658,12 +697,14 @@ pub(super) async fn reap_stale_for_intents(
 ///     pool spawns.
 // r[impl ctrl.pool.ephemeral]
 // r[impl ctrl.ephemeral.intent-deadline]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_job(
     pool: &Pool,
     oref: OwnerReference,
     scheduler: &UpstreamAddrs,
     store: &UpstreamAddrs,
     intent: &SpawnIntent,
+    executor_token: Option<&str>,
     hw_sampled: &HwSampledCache,
     hw_bench_mem_floor: u64,
 ) -> Result<Job> {
@@ -676,18 +717,20 @@ pub(super) fn build_job(
     let mut pod_spec = pod::build_executor_pod_spec(pool, scheduler, store);
     apply_intent_resources(&mut pod_spec, pool, intent);
     // r[impl sec.executor.identity-token+2]
-    // Pass the scheduler-signed token through verbatim so the builder
-    // presents it on `BuildExecution` / `Heartbeat`. Per-intent (not
-    // per-Pool), so it's appended here rather than in the static
-    // `build_executor_pod_spec` env list. Empty in dev mode → builder
-    // omits the header → scheduler permissive (no HMAC key configured
-    // either).
-    if !intent.executor_token.is_empty()
+    // Pass the scheduler-signed token (from `MintExecutorTokens`, NOT
+    // `SpawnIntent`) through verbatim so the builder presents it on
+    // `BuildExecution` / `Heartbeat`. Per-intent (not per-Pool), so
+    // it's appended here rather than in the static
+    // `build_executor_pod_spec` env list. `None` in dev mode (or when
+    // the mint RPC failed / drv left Ready between poll and mint) →
+    // builder omits the header → scheduler permissive in dev mode,
+    // rejects under HMAC mode → pod idle-exits, next tick re-spawns.
+    if let Some(tok) = executor_token.filter(|t| !t.is_empty())
         && let Some(c) = pod_spec.containers.first_mut()
     {
         c.env
             .get_or_insert_with(Vec::new)
-            .push(pod::env("RIO_EXECUTOR_TOKEN", &intent.executor_token));
+            .push(pod::env("RIO_EXECUTOR_TOKEN", tok));
     }
     let mut job = ephemeral_job(
         job_name,
@@ -860,6 +903,7 @@ mod tests {
             &test_sched_addrs(),
             &test_store_addrs(),
             i,
+            None,
             &HwSampledCache::default(),
             0,
         )

@@ -43,7 +43,6 @@ fn spawn_intents_proto_roundtrip() {
                 system: "x86_64-linux".into(),
                 required_features: vec!["kvm".into()],
                 deadline_secs: 600,
-                executor_token: "tok".into(),
                 node_affinity: vec![rio_proto::types::NodeSelectorTerm {
                     match_expressions: vec![rio_proto::types::NodeSelectorRequirement {
                         key: "rio.build/hw-band".into(),
@@ -65,7 +64,6 @@ fn spawn_intents_proto_roundtrip() {
                 system: "aarch64-linux".into(),
                 required_features: vec![],
                 deadline_secs: 300,
-                executor_token: String::new(),
                 node_affinity: vec![],
                 eta_seconds: 42.5,
                 ready: Some(false),

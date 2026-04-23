@@ -112,6 +112,15 @@ service AdminService {
   // intents the controller truncates aren't falsely marked ICE.
   rpc AckSpawnedIntents(rio.types.AckSpawnedIntentsRequest) returns (google.protobuf.Empty);
 
+  // Mint per-intent `RIO_EXECUTOR_TOKEN`s for the controller's Job-spawn
+  // loop. rio-controller-only (r[sec.executor.identity-token]): the token
+  // is a signed credential, so it lives on a controller-only surface
+  // rather than as a field on `SpawnIntent` (which dashboard/CLI also
+  // read via `GetSpawnIntents`). Called once per reconcile per pool with
+  // the headroom-truncated `intent_id` set the controller is about to
+  // create Jobs for.
+  rpc MintExecutorTokens(rio.types.MintExecutorTokensRequest) returns (rio.types.MintExecutorTokensResponse);
+
   // ─── ADR-023 SLA overrides ────────────────────────────────────────
 
   // Pin a (pname, system?, tenant?) key to a forced tier / cores / mem,

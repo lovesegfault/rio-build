@@ -497,6 +497,16 @@ pub enum AdminQuery {
         hw_classes: Vec<String>,
         reply: oneshot::Sender<std::collections::HashMap<String, [u32; crate::sla::hw::K]>>,
     },
+    /// `AdminService.MintExecutorTokens`: HMAC-sign `ExecutorClaims` for
+    /// each requested `intent_id`. Controller-only — the credential
+    /// lives on a controller-only surface so dashboard/CLI never hold
+    /// it (`r[sec.executor.identity-token]`). Reply is
+    /// `intent_id → token`; intent_ids not in the current
+    /// `compute_spawn_intents` snapshot are omitted.
+    MintExecutorTokens {
+        intent_ids: Vec<String>,
+        reply: oneshot::Sender<std::collections::HashMap<String, String>>,
+    },
 }
 
 /// `cfg(test)` debug commands that bypass the state machine / dispatch
@@ -647,6 +657,7 @@ impl AdminQuery {
             Self::SlaExportCorpus { .. } => "SlaExportCorpus",
             Self::SlaHwSampled { .. } => "SlaHwSampled",
             Self::SlaImportCorpus { .. } => "SlaImportCorpus",
+            Self::MintExecutorTokens { .. } => "MintExecutorTokens",
         }
     }
 }

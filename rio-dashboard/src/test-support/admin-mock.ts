@@ -69,6 +69,7 @@ export const adminMock = {
   // overrides via .mockResolvedValueOnce(...) still work.
   getBuildGraph: vi.fn(emptyGraph) as Mock,
   getSpawnIntents: vi.fn(),
+  mintExecutorTokens: vi.fn(),
   ackSpawnedIntents: vi.fn(),
   reportExecutorTermination: vi.fn(),
   injectBuildSample: vi.fn(),

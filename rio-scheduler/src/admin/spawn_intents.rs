@@ -5,7 +5,10 @@
 //! translates the proto request to the internal `SpawnIntentsRequest`
 //! and the actor result to the proto response.
 
-use rio_proto::types::{ExecutorKind, GetSpawnIntentsRequest, GetSpawnIntentsResponse};
+use rio_proto::types::{
+    ExecutorKind, GetSpawnIntentsRequest, GetSpawnIntentsResponse, MintExecutorTokensRequest,
+    MintExecutorTokensResponse,
+};
 use tonic::Status;
 
 use crate::actor::{ActorCommand, ActorHandle, AdminQuery, SpawnIntentsRequest};
@@ -50,4 +53,21 @@ pub(super) async fn get_spawn_intents(
         dead_nodes: vec![],
         ice_masked_cells: vec![],
     })
+}
+
+/// Query the actor for per-intent `ExecutorClaims` tokens.
+/// Controller-only — callers MUST have passed
+/// `ensure_service_caller(&["rio-controller"])`.
+pub(super) async fn mint_executor_tokens(
+    actor: &ActorHandle,
+    req: MintExecutorTokensRequest,
+) -> Result<MintExecutorTokensResponse, Status> {
+    let tokens = super::query_actor(actor, |reply| {
+        ActorCommand::Admin(AdminQuery::MintExecutorTokens {
+            intent_ids: req.intent_ids,
+            reply,
+        })
+    })
+    .await?;
+    Ok(MintExecutorTokensResponse { tokens })
 }

@@ -21636,6 +21636,10 @@
           "packageId": "proptest"
         },
         {
+          "name": "regex",
+          "packageId": "regex"
+        },
+        {
           "name": "rio-store",
           "packageId": "rio-store"
         },

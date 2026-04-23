@@ -556,6 +556,7 @@ fn build_job_with(
         &crate::fixtures::test_sched_addrs(),
         &crate::fixtures::test_store_addrs(),
         intent,
+        None,
         hw_sampled,
         floor,
     )

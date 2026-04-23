@@ -411,13 +411,14 @@ message SpawnIntent {
   // Precedence in `ephemeral_deadline`: this > spec.deadline_seconds
   // > DEFAULT_EPHEMERAL_DEADLINE_SECS.
   uint32 deadline_secs = 9;
-  // r[sec.executor.identity-token]: HMAC-signed `ExecutorClaims
-  // {intent_id, expiry}` the controller passes through verbatim as the
-  // pod env `RIO_EXECUTOR_TOKEN`. The builder presents it on
-  // `BuildExecution` open and every `Heartbeat`; the scheduler verifies
-  // it to bind the connection to this intent. Empty when the scheduler
-  // has no HMAC key configured (dev mode).
-  string executor_token = 10;
+  // Field 10 was `string executor_token` — REMOVED. A signed credential
+  // on a multi-caller read-path response is the payload-sensitivity
+  // anti-pattern (r[sched.sla.threat.read-path-auth]): GetSpawnIntents
+  // is reachable by dashboard/CLI/ComponentScaler, and a compromised
+  // builder on port 9001 could harvest another tenant's executor_token.
+  // Tokens now mint via `MintExecutorTokens` (rio-controller-only).
+  reserved 10;
+  reserved "executor_token";
   // ADR-023 §13a: OR-of-ANDs over (h, cap) cells. Each term carries the
   // h-label conjunction PLUS karpenter.sh/capacity-type=cap. Supersedes
   // `node_selector` (field 5, kept for compat — controller writes both
@@ -541,6 +542,25 @@ message AckSpawnedIntentsRequest {
   // signal (bug_008). Empty until controller A18 wires the NodeClaim
   // watcher; interim clear path is first-heartbeat.
   repeated string registered_cells = 3;
+}
+
+// Mint per-intent `RIO_EXECUTOR_TOKEN`s for the controller's Job-spawn
+// loop. rio-controller-only — the credential lives on a controller-only
+// surface so dashboard/CLI never hold it (r[sec.executor.identity-token]).
+// `intent_ids` are the `SpawnIntent.intent_id` (= drv_hash) the
+// controller is about to create Jobs for; the response maps each to its
+// HMAC-signed `ExecutorClaims{intent_id, kind, expiry}`. Unknown
+// intent_ids (drv left Ready between GetSpawnIntents and this call) are
+// omitted from the map; the controller spawns those pods without a token
+// (dev-mode parity — the builder omits the header, scheduler rejects
+// under HMAC mode, pod idle-exits, next tick re-spawns).
+message MintExecutorTokensRequest {
+  repeated string intent_ids = 1;
+}
+message MintExecutorTokensResponse {
+  // intent_id → signed ExecutorClaims token. Empty map when the
+  // scheduler has no HMAC key configured (dev mode).
+  map<string, string> tokens = 1;
 }
 
 // ───────────────────────────────────────────────────────────────────────────

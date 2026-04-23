@@ -143,6 +143,20 @@ pub mod admin {
     tonic::include_proto!("rio.admin");
 }
 
+/// Raw `.proto` source for downstream structural tests
+/// (`rio-scheduler/src/admin/tests::admin_rpc_gate_coverage`). crate2nix
+/// sandboxes each crate's build, so a downstream
+/// `include_str!("../../../../rio-proto/proto/admin.proto")` does NOT
+/// resolve under nix builds. Exposed here so the proto sources travel
+/// with the rio-proto rlib. NOT a stable API — test-support only.
+pub mod proto_src {
+    pub const ADMIN: &str = include_str!("../proto/admin.proto");
+    pub const ADMIN_TYPES: &str = include_str!("../proto/admin_types.proto");
+    pub const TYPES: &str = include_str!("../proto/types.proto");
+    pub const DAG: &str = include_str!("../proto/dag.proto");
+    pub const BUILD_TYPES: &str = include_str!("../proto/build_types.proto");
+}
+
 // ---------------------------------------------------------------------------
 // Flattened service re-exports
 //
