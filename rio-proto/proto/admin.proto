@@ -179,6 +179,13 @@ service AdminService {
   // the estimator's last refresh tick (~60s stale at worst), NOT a
   // live PG count.
   rpc HwClassSampled(rio.types.HwClassSampledRequest) returns (rio.types.HwClassSampledResponse);
+
+  // ADR-023 §13a: read-only dump of `[sla.hw_classes]` (h → label
+  // conjunction). The controller's post-bind annotator matches a
+  // bound Node's labels against this map to derive the hw_class name
+  // for `hw_perf_samples.hw_class` — instead of reverse-engineering
+  // it from a hardcoded 4-label schema. Controller-allowlisted.
+  rpc GetHwClassConfig(google.protobuf.Empty) returns (rio.types.GetHwClassConfigResponse);
 }
 
 // ControllerService (Scheduler→Controller push) removed 2026-03 — the

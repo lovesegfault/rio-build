@@ -38,6 +38,7 @@ fn sign_claims_full(
         expected_outputs: outputs,
         expiry_unix: (now_unix() as i64 + expiry_offset_secs) as u64,
         is_ca,
+        tenant: None,
     };
     HmacSigner::from_key(TEST_KEY.to_vec()).sign(&claims)
 }
@@ -244,6 +245,7 @@ async fn hmac_wrong_key_signed_rejected() -> TestResult {
         expected_outputs: vec![path.clone()],
         expiry_unix: now_unix() + 60,
         is_ca: false,
+        tenant: None,
     };
     let bad_token = HmacSigner::from_key(wrong_key.to_vec()).sign(&claims);
 

@@ -31,14 +31,15 @@ use rio_proto::types::{
     CreateTenantRequest, CreateTenantResponse, DebugExecutorState, DebugListExecutorsResponse,
     DeleteTenantRequest, DeleteTenantResponse, DrainExecutorRequest, DrainExecutorResponse,
     ExportSlaCorpusRequest, ExportSlaCorpusResponse, GcProgress, GcRequest, GetBuildGraphRequest,
-    GetBuildGraphResponse, GetBuildLogsRequest, GetSpawnIntentsRequest, GetSpawnIntentsResponse,
-    HwClassSampledRequest, HwClassSampledResponse, ImportSlaCorpusRequest, ImportSlaCorpusResponse,
-    InjectBuildSampleRequest, InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest,
-    ListBuildsResponse, ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse,
-    ListSlaOverridesRequest, ListSlaOverridesResponse, ListTenantsResponse, PoisonedDerivation,
-    ReportExecutorTerminationRequest, ReportExecutorTerminationResponse, ResetSlaModelRequest,
-    SetSlaOverrideRequest, SlaExplainRequest, SlaExplainResponse, SlaOverride, SlaStatusRequest,
-    SlaStatusResponse, TerminationReason,
+    GetBuildGraphResponse, GetBuildLogsRequest, GetHwClassConfigResponse, GetSpawnIntentsRequest,
+    GetSpawnIntentsResponse, HwClassSampledRequest, HwClassSampledResponse, ImportSlaCorpusRequest,
+    ImportSlaCorpusResponse, InjectBuildSampleRequest, InspectBuildDagRequest,
+    InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse, ListExecutorsRequest,
+    ListExecutorsResponse, ListPoisonedResponse, ListSlaOverridesRequest, ListSlaOverridesResponse,
+    ListTenantsResponse, PoisonedDerivation, ReportExecutorTerminationRequest,
+    ReportExecutorTerminationResponse, ResetSlaModelRequest, SetSlaOverrideRequest,
+    SlaExplainRequest, SlaExplainResponse, SlaOverride, SlaStatusRequest, SlaStatusResponse,
+    TerminationReason,
 };
 use uuid::Uuid;
 
@@ -707,6 +708,41 @@ impl AdminService for AdminServiceImpl {
         })
         .await?;
         Ok(Response::new(HwClassSampledResponse { sampled_count }))
+    }
+
+    /// ADR-023 §13a: read-only dump of `[sla.hw_classes]` (h → label
+    /// conjunction) so the controller's post-bind annotator matches a
+    /// bound Node's labels against the OPERATOR'S schema instead of a
+    /// hardcoded 4-key guess. Static config — no actor round-trip.
+    #[instrument(skip(self, request), fields(rpc = "GetHwClassConfig"))]
+    async fn get_hw_class_config(
+        &self,
+        request: Request<()>,
+    ) -> Result<Response<GetHwClassConfigResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        // Service-token gate: hw-class label schema is operational
+        // config; same threat surface as `HwClassSampled` (a
+        // compromised builder enumerating which label-conjunctions
+        // map to under-sampled classes).
+        self.ensure_service_caller(request.metadata(), &["rio-controller"])?;
+        self.ensure_leader()?;
+        let hw_classes = self
+            .sla_config
+            .hw_classes
+            .iter()
+            .map(|(h, def)| {
+                let labels = def
+                    .labels
+                    .iter()
+                    .map(|l| rio_proto::types::NodeLabelMatch {
+                        key: l.key.clone(),
+                        value: l.value.clone(),
+                    })
+                    .collect();
+                (h.clone(), rio_proto::types::HwClassLabels { labels })
+            })
+            .collect();
+        Ok(Response::new(GetHwClassConfigResponse { hw_classes }))
     }
 
     /// Actor in-memory DAG snapshot for a build — the exact view

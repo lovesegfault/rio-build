@@ -85,6 +85,20 @@ pub struct AssignmentClaims {
     /// after build completion is well within that window. Prevents
     /// replay from a leaked token months later.
     pub expiry_unix: u64,
+    /// Attributing tenant UUID (hyphenated). Stamped scheduler-side at
+    /// dispatch from `attributed_tenant`; the store writes it to
+    /// `hw_perf_samples.submitting_tenant` (`r[sched.sla.threat.
+    /// hw-median-of-medians]`). `None` for orphaned/recovered nodes
+    /// (no live owning build). The store derives tenant from CLAIMS
+    /// (signed) — never from the request body — so a compromised
+    /// worker cannot fabricate tenant identities to defeat the
+    /// median-of-medians defence.
+    ///
+    /// `#[serde(default)]`: tokens minted by a pre-tenant scheduler
+    /// (in-flight at deploy time) lack this field; they must still
+    /// verify (→ `tenant=None`).
+    #[serde(default)]
+    pub tenant: Option<String>,
 }
 
 impl HmacClaims for AssignmentClaims {
@@ -434,6 +448,7 @@ mod tests {
             ],
             is_ca: false,
             expiry_unix: (now as i64 + expiry_offset_secs).max(0) as u64,
+            tenant: None,
         }
     }
 
@@ -654,6 +669,49 @@ mod tests {
             verifier.verify::<ServiceClaims>(&asn_token),
             Err(HmacError::Json(_))
         ));
+    }
+
+    /// Back-compat: a token minted WITHOUT the `tenant` field (by a
+    /// pre-tenant scheduler) must still verify under the new struct —
+    /// `#[serde(default)]` on `tenant` is load-bearing for in-flight
+    /// tokens at deploy time. `deny_unknown_fields` only rejects
+    /// EXTRA fields, not MISSING ones.
+    #[test]
+    fn assignment_claims_tenant_backcompat() {
+        let key = HmacKey::from_key(TEST_KEY.to_vec());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Hand-roll the pre-tenant claims JSON (no `tenant` key).
+        let old_json = serde_json::json!({
+            "executor_id": "w",
+            "drv_hash": "abc",
+            "expected_outputs": ["/nix/store/aaa-x"],
+            "is_ca": false,
+            "expiry_unix": now + 3600,
+        });
+        let old_bytes = serde_json::to_vec(&old_json).unwrap();
+        let mut mac = HmacSha256::new_from_slice(TEST_KEY).unwrap();
+        mac.update(&old_bytes);
+        let tag = mac.finalize().into_bytes();
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let token = format!("{}.{}", b64.encode(&old_bytes), b64.encode(tag));
+
+        let claims = key
+            .verify::<AssignmentClaims>(&token)
+            .expect("pre-tenant token still verifies (serde default)");
+        assert_eq!(claims.tenant, None);
+        assert_eq!(claims.executor_id, "w");
+
+        // And a token WITH tenant round-trips it.
+        let mut with_tenant = test_claims(3600);
+        with_tenant.tenant = Some("4f8a3c0e-0000-4000-8000-000000000001".into());
+        let tok = key.sign(&with_tenant);
+        assert_eq!(
+            key.verify::<AssignmentClaims>(&tok).unwrap().tenant,
+            with_tenant.tenant
+        );
     }
 
     #[test]

@@ -507,6 +507,13 @@ pub struct SolvedIntent {
     /// the proto's compat `node_selector` field from `node_affinity[0]`
     /// until A18 lands.
     pub node_affinity: Vec<rio_proto::types::NodeSelectorTerm>,
+    /// Operator's `[sla.hw_classes.$h]` keys parallel to
+    /// `node_affinity` — `hw_class_names[i]` is the `h` whose label
+    /// conjunction produced `node_affinity[i]`. Carried through to
+    /// `SpawnIntent.hw_class_names` so the controller doesn't
+    /// reverse-engineer `h` from a hardcoded label schema. Empty for
+    /// the hw-agnostic path (same as `node_affinity`).
+    pub hw_class_names: Vec<String>,
 }
 
 /// Scheduling-hint sub-state of a [`DerivationState`].

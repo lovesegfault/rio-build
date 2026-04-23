@@ -931,15 +931,21 @@ pub fn override_hash(o: Option<&ResolvedTarget>) -> u64 {
     h.finish()
 }
 
-/// Map `cells` to `nodeSelectorTerms` — OR of (h-label conjunction AND
-/// `karpenter.sh/capacity-type=cap`). ADR-023 L650: capacity-type MUST
-/// be in the term — the solve may admit `(h, od)` while rejecting
-/// `(h, spot)` on interruption tail. An `h` not in `hw_classes` is
-/// dropped.
+/// Map `cells` to `(nodeSelectorTerms, hw_class_names)` — OR of
+/// (h-label conjunction AND `karpenter.sh/capacity-type=cap`), plus the
+/// parallel `h` names that produced each term. ADR-023 L650:
+/// capacity-type MUST be in the term — the solve may admit `(h, od)`
+/// while rejecting `(h, spot)` on interruption tail. An `h` not in
+/// `hw_classes` is dropped from BOTH outputs (so `terms[i]` always
+/// corresponds to `names[i]`).
+///
+/// The names are carried alongside so the controller doesn't
+/// reverse-engineer `h` from a hardcoded label schema (bug_061) — the
+/// operator's `[sla.hw_classes.$h].labels` is arbitrary.
 pub fn cells_to_selector_terms(
     cells: &[Cell],
     hw_classes: &HashMap<HwClassName, HwClassDef>,
-) -> Vec<rio_proto::types::NodeSelectorTerm> {
+) -> (Vec<rio_proto::types::NodeSelectorTerm>, Vec<String>) {
     use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm};
     cells
         .iter()
@@ -959,9 +965,9 @@ pub fn cells_to_selector_terms(
                 operator: "In".into(),
                 values: vec![cap.label().into()],
             });
-            Some(NodeSelectorTerm { match_expressions })
+            Some((NodeSelectorTerm { match_expressions }, h.clone()))
         })
-        .collect()
+        .unzip()
 }
 
 #[cfg(test)]
@@ -1827,8 +1833,11 @@ mod tests {
             ("intel-8".into(), CapacityType::Spot),
             ("intel-7".into(), CapacityType::Od),
         ];
-        let terms = cells_to_selector_terms(&cells, &cfg.hw_classes);
+        let (terms, names) = cells_to_selector_terms(&cells, &cfg.hw_classes);
         assert_eq!(terms.len(), 2, "one term per cell");
+        // names are parallel to terms, in cell order, with the
+        // operator's `$h` keys (not derived from labels).
+        assert_eq!(names, vec!["intel-8", "intel-7"]);
         // Each term: h-label conjunction PLUS capacity-type.
         for term in &terms {
             assert!(
@@ -1853,11 +1862,11 @@ mod tests {
             })
             .collect();
         assert_eq!(caps, HashSet::from(["spot", "on-demand"]));
-        // h not in hw_classes → dropped.
-        assert!(
-            cells_to_selector_terms(&[("nope".into(), CapacityType::Spot)], &cfg.hw_classes)
-                .is_empty()
-        );
+        // h not in hw_classes → dropped from BOTH outputs.
+        let (t, n) =
+            cells_to_selector_terms(&[("nope".into(), CapacityType::Spot)], &cfg.hw_classes);
+        assert!(t.is_empty());
+        assert!(n.is_empty());
     }
 
     #[test]

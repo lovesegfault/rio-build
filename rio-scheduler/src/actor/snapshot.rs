@@ -307,9 +307,14 @@ impl DagActor {
         // SpawnIntent constructor shared by Ready + forecast passes.
         // The HMAC token's expiry is `deadline + eta + 5min` so a
         // forecast-spawned pod's token covers its boot horizon.
+        // `ready` is the explicit Ready/forecast discriminator —
+        // `eta_seconds` is purely the §13b horizon (a forecast intent
+        // with overdue deps clamps to 0.0, which would otherwise
+        // collide with the Ready filter; bug_030).
         let to_proto = |drv_hash: &str,
                         state: &crate::state::DerivationState,
                         intent: &SolvedIntent,
+                        ready: bool,
                         eta_seconds: f64|
          -> rio_proto::types::SpawnIntent {
             let kind = crate::state::kind_for_drv(state.is_fixed_output);
@@ -348,6 +353,8 @@ impl DagActor {
                 executor_token,
                 node_affinity: intent.node_affinity.clone(),
                 eta_seconds,
+                ready,
+                hw_class_names: intent.hw_class_names.clone(),
             }
         };
 
@@ -420,7 +427,7 @@ impl DagActor {
             // Ready.
             intents.push((
                 state.sched.priority,
-                to_proto(drv_hash, state, &intent, 0.0),
+                to_proto(drv_hash, state, &intent, true, 0.0),
             ));
         }
 
@@ -491,7 +498,7 @@ impl DagActor {
                 *budget -= i64::from(intent.cores);
                 intents.push((
                     state.sched.priority,
-                    to_proto(drv_hash, state, &intent, eta),
+                    to_proto(drv_hash, state, &intent, false, eta),
                 ));
             }
         }
@@ -707,7 +714,7 @@ impl DagActor {
             memo.map(|m| (m, h_all.clone()))
         });
 
-        let (cores, mem, disk, node_affinity, full_tier) = match full {
+        let (cores, mem, disk, node_affinity, hw_class_names, full_tier) = match full {
             Some((memo, h_all)) => {
                 tracing::Span::current()
                     .record("tier", memo.tier.as_str())
@@ -741,11 +748,14 @@ impl DagActor {
                 } else {
                     cells
                 };
+                let (terms, names) =
+                    solve::cells_to_selector_terms(&cells, &self.sla_config.hw_classes);
                 (
                     memo.a.c_star,
                     memo.a.mem_bytes,
                     memo.a.disk_bytes,
-                    solve::cells_to_selector_terms(&cells, &self.sla_config.hw_classes),
+                    terms,
+                    names,
                     Some(memo.tier),
                 )
             }
@@ -758,7 +768,7 @@ impl DagActor {
                     &self.sla_tiers,
                     &self.sla_ceilings,
                 );
-                (c, m, d, Vec::new(), None)
+                (c, m, d, Vec::new(), Vec::new(), None)
             }
         };
         // `forced_mem` overlays whichever arm fired — `intent_for`
@@ -899,6 +909,7 @@ impl DagActor {
             deadline_secs,
             predicted,
             node_affinity,
+            hw_class_names,
         }
     }
 

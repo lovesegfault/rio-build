@@ -1803,6 +1803,12 @@ impl DagActor {
                 // as IA for the membership check.
                 is_ca: state.ca.is_ca && !state.is_fixed_output,
                 expiry_unix,
+                // r[sched.sla.threat.hw-median-of-medians]: tenant
+                // attribution stamped scheduler-side into the SIGNED
+                // claims so the store derives `submitting_tenant`
+                // from a verified token, never from the worker's
+                // request body. `None` for orphaned/recovered nodes.
+                tenant: state.attributed_tenant(&self.builds).map(|u| u.to_string()),
             })
         } else {
             // Legacy unsigned: format-string. Store with

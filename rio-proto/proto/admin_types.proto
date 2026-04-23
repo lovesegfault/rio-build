@@ -429,6 +429,21 @@ message SpawnIntent {
   // forecast intents don't spawn pods that immediately gate on
   // unbuilt deps.
   double eta_seconds = 12;
+  // True ⇔ the derivation is in the Ready loop (status==Ready, deps
+  // satisfied). False ⇔ forecast frontier (Queued, deps Running with
+  // ETA < lead_time). Explicit discriminator so the controller's
+  // Ready filter doesn't depend on `eta_seconds == 0.0` — a forecast
+  // intent with overdue deps clamps to eta=0.0 and would otherwise
+  // pass as Ready (bug_030). `eta_seconds` is now purely the §13b
+  // NodeClaim pre-provisioning horizon.
+  bool ready = 13;
+  // §13a hw-class names parallel to `node_affinity` — one entry per
+  // term, the operator's `[sla.hw_classes.$h]` key that produced that
+  // term's label conjunction. Carries the scheduler-internal name
+  // through the wire so the controller doesn't reverse-engineer it
+  // from a hardcoded label schema (bug_061). Empty under
+  // hw_cost_source=None (same as `node_affinity`).
+  repeated string hw_class_names = 14;
 }
 
 // One conjunction of node-match requirements. Mirrors k8s core/v1
@@ -533,6 +548,32 @@ message HwClassSampledResponse {
   // the same threshold the `hw_perf_factors` view's HAVING clause uses
   // to admit a class into the normalize table.
   map<string, uint32> sampled_count = 1;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// GetHwClassConfig (ADR-023 §13a)
+// Read-only dump of the scheduler's `[sla.hw_classes]` map so the
+// controller's post-bind annotator can match a bound Node's labels
+// against the OPERATOR'S label schema (not a hardcoded 4-key guess)
+// and stamp `hw_perf_samples.hw_class` with the operator's `$h` name.
+// ───────────────────────────────────────────────────────────────────────────
+
+// Single `key=value` node-label match. Mirrors
+// `rio-scheduler/src/sla/config.rs::NodeLabelMatch` so the
+// `From<config::NodeLabelMatch>` is a field-by-field copy.
+message NodeLabelMatch {
+  string key = 1;
+  string value = 2;
+}
+// One hw-class definition: an ANDed label conjunction.
+message HwClassLabels {
+  repeated NodeLabelMatch labels = 1;
+}
+message GetHwClassConfigResponse {
+  // h → `[sla.hw_classes.$h].labels`. The controller matches a Node's
+  // labels against each conjunction; first all-match wins. Empty when
+  // `hw_cost_source=None` (static-mode).
+  map<string, HwClassLabels> hw_classes = 1;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
