@@ -648,9 +648,18 @@ impl DagActor {
         let mut to_spawn = Vec::new();
         for (drv_hash, paths) in candidates {
             checked.insert(drv_hash.clone());
+            let substitute_tried = self.dag.node(&drv_hash).is_some_and(|s| s.substitute_tried);
             if paths.iter().all(|p| !missing.contains(p)) {
-                locally_present.push(drv_hash);
-            } else if !self.dag.node(&drv_hash).is_some_and(|s| s.substitute_tried)
+                // `substitute_tried` ⇒ the closure walk ingested the
+                // seed (output) then failed on a ref — output-present
+                // in PG does NOT imply closure-complete. FMP probes
+                // output paths only, so "present" here can hide a
+                // hole. Fall through to dispatch (build re-derives the
+                // full closure) instead of marking Completed.
+                if !substitute_tried {
+                    locally_present.push(drv_hash);
+                }
+            } else if !substitute_tried
                 && paths
                     .iter()
                     .all(|p| !missing.contains(p) || substitutable.contains(p))
@@ -1083,6 +1092,13 @@ impl DagActor {
                 self.credit_heartbeats_for_stall(fmp_start.elapsed());
                 let resp = r.into_inner();
                 if resp.missing_paths.is_empty() {
+                    // Same partial-closure gate as
+                    // `batch_probe_cached_ready`: substitute_tried ⇒
+                    // walk ingested seed then failed; output-present
+                    // doesn't imply closure-complete. Fall through.
+                    if substitute_tried {
+                        return false;
+                    }
                     self.complete_ready_from_store(drv_hash).await;
                     return true;
                 }

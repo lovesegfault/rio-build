@@ -2834,6 +2834,80 @@ async fn substitute_ok_false_suppresses_respawn() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.substitute.detached+2]
+/// `walk_substitute_closure` may ingest the seed (output) then fail on
+/// a ref → `ok=false` → `substitute_tried=true`. The seed is now in
+/// PG. Next-tick FMP probes OUTPUT paths only, sees present, and
+/// pre-fix marked Completed — leaving a hole in the runtime closure
+/// (dependent ENOENT at exec time). The `locally_present` branch must
+/// gate on `!substitute_tried`: a present-but-tried output falls
+/// through to dispatch so the build re-derives the full closure.
+#[tokio::test]
+async fn partial_closure_walk_seed_in_pg_does_not_mark_completed() -> TestResult {
+    use std::sync::atomic::Ordering;
+
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let mut frx = connect_executor_kind(
+        &handle,
+        "pcw-f",
+        "x86_64-linux",
+        rio_proto::types::ExecutorKind::Fetcher,
+    )
+    .await?;
+
+    let out = test_store_path("pcw-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    // Detached walk: QPI fails permanently → ok=false on attempt 1.
+    // The "seed in PG" half of the scenario is modeled explicitly
+    // below (insert into `paths` after revert) so the test doesn't
+    // depend on MockStore's QPI side-effect ordering.
+    store
+        .faults
+        .fail_query_path_info_permanent
+        .store(true, Ordering::SeqCst);
+
+    let mut n = make_node("pcw");
+    n.is_fixed_output = true;
+    n.expected_output_paths = vec![out.clone()];
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
+    settle_substituting(&handle, &["pcw"]).await;
+
+    let info = expect_drv(&handle, "pcw").await;
+    assert!(info.substitute_tried, "ok=false sets substitute_tried");
+    assert_eq!(info.status, DerivationStatus::Ready);
+
+    // Model "seed ingested, ref-walk failed": output now present in
+    // PG (FMP returns it as not-missing); refs are not.
+    store
+        .faults
+        .fail_query_path_info_permanent
+        .store(false, Ordering::SeqCst);
+    store
+        .state
+        .paths
+        .write()
+        .unwrap()
+        .insert(out.clone(), Default::default());
+
+    // Next pass: FMP says output present. Pre-fix: locally_present →
+    // Completed (closure hole). Post-fix: substitute_tried gates the
+    // locally_present branch → falls through to find_executor.
+    tick(&handle).await?;
+    let info = expect_drv(&handle, "pcw").await;
+    assert_ne!(
+        info.status,
+        DerivationStatus::Completed,
+        "substitute_tried + output-present must NOT short-circuit to \
+         Completed (closure walk failed; refs may be absent)"
+    );
+    let a = recv_assignment(&mut frx).await;
+    assert!(
+        a.drv_path.contains("pcw"),
+        "substitute_tried + output-present falls through to worker dispatch"
+    );
+    Ok(())
+}
+
 /// Ready→Substituting and Substituting→Ready/Queued both flip
 /// `build_summary`'s running count; both paths must `emit_progress`
 /// so the dashboard sees the change. Pre-fix neither did — the next

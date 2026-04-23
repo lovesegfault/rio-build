@@ -504,9 +504,11 @@ impl StoreServiceImpl {
                 // `valid=false`. Map to `NotFound` instead: gateway
                 // treats it as miss (caller re-probes later); scheduler
                 // `walk_substitute_closure` treats it as `ok=false →
-                // revert` and the next dispatch pass re-probes once the
-                // concurrent upload completes. Moka didn't cache `Err`
-                // either way.
+                // revert with substitute_tried` and the next dispatch
+                // pass falls through to a build (the partial-closure
+                // gate at `batch_probe_cached_ready` refuses to mark
+                // Completed on output-present-only). Moka didn't cache
+                // `Err` either way.
                 SubstituteError::Raced => {
                     Status::not_found("substitution in progress on another replica")
                 }
