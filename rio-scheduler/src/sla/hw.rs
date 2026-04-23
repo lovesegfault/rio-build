@@ -171,23 +171,38 @@ impl HwTable {
             .max(HW_FACTOR_SANITY_FLOOR)
     }
 
-    /// Stable hash of `(hw_class, factor[K], pod_ids)` over all entries
-    /// (sorted by key so iteration order is irrelevant). Used by
-    /// [`super::SlaEstimator::refresh`] to detect a no-op `HwTable`
-    /// reload — the [`super::solve::SolveCache::bump_inputs_gen`] call
-    /// (and the ε_h re-roll it implies) only fires on content change.
-    pub fn content_hash(&self) -> u64 {
+    /// Stable hash of the **solve-relevant projection**: per entry,
+    /// `(hw_class, factor[K].map(clamp), pod_ids >= HW_MIN_PODS)` —
+    /// exactly what [`Self::factor`] / [`Self::iter`] / [`Self::len`]
+    /// expose to [`super::solve::solve_full`]. NOT raw `pod_ids`: solve
+    /// reads it only as the `>= HW_MIN_PODS` trust bool, and `pod_ids`
+    /// is monotone under one-shot Jobs (every annotated builder writes a
+    /// row), so hashing the raw count would re-roll ε_h ~every 60s in
+    /// steady state — the same selector-drift reap r1/r2 each fixed.
+    ///
+    /// Feeds [`super::solve::SolveInputs::inputs_gen`] (the derived
+    /// `inputs_gen`). Sorted by key so iteration order is irrelevant.
+    /// Untrusted (`pod_ids < HW_MIN_PODS`) entries are filtered — they
+    /// are invisible to every solve accessor, so their appearance in
+    /// `factors` (e.g. a 1-pod row landing) is NOT a solve-relevant
+    /// change. Crossing the 2→3 threshold IS: the key enters the hash.
+    pub fn solve_relevant_hash(&self) -> u64 {
         use std::hash::{Hash, Hasher};
-        let mut keys: Vec<_> = self.factors.keys().collect();
+        let mut keys: Vec<_> = self
+            .factors
+            .iter()
+            .filter(|(_, f)| f.pod_ids >= HW_MIN_PODS)
+            .map(|(k, _)| k)
+            .collect();
         keys.sort();
         let mut h = std::hash::DefaultHasher::new();
         for k in keys {
             k.hash(&mut h);
-            let f = &self.factors[k];
-            for d in f.factor {
-                d.to_bits().hash(&mut h);
+            for d in self.factors[k].factor {
+                d.clamp(HW_FACTOR_SANITY_FLOOR, HW_FACTOR_SANITY_CEIL)
+                    .to_bits()
+                    .hash(&mut h);
             }
-            f.pod_ids.hash(&mut h);
         }
         h.finish()
     }

@@ -944,6 +944,18 @@ pub(crate) fn seed_fit(actor: &DagActor, pname: &str) {
     actor.sla_estimator.seed(make_fit(pname));
 }
 
+/// Snapshot `(hw, cost, inputs_gen)` and solve. Convenience for tests
+/// that don't care about the snapshot threading; tests asserting
+/// determinism / `inputs_gen` call `solve_inputs` + `solve_intent_for`
+/// directly so they can pin or vary `inputs_gen`.
+pub(crate) fn solve_intent(
+    actor: &DagActor,
+    state: &crate::state::DerivationState,
+) -> crate::state::SolvedIntent {
+    let (hw, cost, ig) = actor.solve_inputs();
+    actor.solve_intent_for(state, &hw, &cost, ig)
+}
+
 /// Bare (unspawned) actor with [`test_hw_sla_config`] + populated
 /// 3-class hw table + one fitted key `"test-pkg"`. For
 /// admissible-set / ε_h / ICE-mask tests.

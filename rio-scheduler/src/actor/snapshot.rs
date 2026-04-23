@@ -108,7 +108,11 @@ impl DagActor {
                 let _ = reply.send((self.sla_estimator.cached(&key), active));
             }
             AdminQuery::SlaEvict { key, reply } => {
-                let _ = reply.send(self.sla_estimator.evict(&key));
+                let evicted = self.sla_estimator.evict(&key);
+                if evicted {
+                    self.on_fit_evicted(&key);
+                }
+                let _ = reply.send(evicted);
             }
             AdminQuery::SlaExplain { key, reply } => {
                 let fit = self.sla_estimator.cached(&key);
@@ -269,6 +273,12 @@ impl DagActor {
         let mut intents = Vec::new();
         let mut queued_by_system: HashMap<String, u64> = HashMap::new();
         let probe_gate = self.store_client.is_some();
+        // ONE snapshot of the shared solve inputs for the whole poll —
+        // every drv sees the SAME `(hw, cost, inputs_gen)`. Per-drv
+        // re-read meant two drvs in one poll could see different
+        // `cheapest_h` if `spot_price_poller` wrote between them
+        // (latent TOCTOU at the same `inputs_gen`).
+        let (hw, cost, inputs_gen) = self.solve_inputs();
         // r[impl sched.sla.forecast.tenant-ceiling]
         // §Threat-model gap (d): per-tenant `max_forecast_cores_per_
         // tenant` budget, debited by Ready cores BEFORE the forecast
@@ -371,7 +381,7 @@ impl DagActor {
             // intent→drv map to keep in sync; if the drv leaves Ready
             // before the pod heartbeats, the match misses and dispatch
             // falls through to pick-from-queue.
-            let intent = self.solve_intent_for(state);
+            let intent = self.solve_intent_for(state, &hw, &cost, inputs_gen);
             // gap (d): debit Ready cores from the tenant's forecast
             // budget. A negative balance is fine — the forecast pass
             // checks `> cores`, not `>= 0`.
@@ -445,7 +455,7 @@ impl DagActor {
                 if !had_incomplete || eta >= max_lead {
                     continue;
                 }
-                let intent = self.solve_intent_for(state);
+                let intent = self.solve_intent_for(state, &hw, &cost, inputs_gen);
                 let budget = tenant_forecast_budget
                     .entry(state.attributed_tenant(&self.builds))
                     .or_insert(cap);
@@ -573,6 +583,42 @@ impl DagActor {
         }
     }
 
+    /// One snapshot of the **shared solve inputs** + the derived
+    /// `inputs_gen`. [`Self::compute_spawn_intents`] calls this ONCE at
+    /// the top and threads `(&hw, &cost, inputs_gen)` to every
+    /// [`Self::solve_intent_for`]; `try_dispatch_one` calls it once per
+    /// drv. See [`crate::sla::solve::SolveInputs`] for the "derived,
+    /// not bumped" rationale.
+    pub(crate) fn solve_inputs(
+        &self,
+    ) -> (crate::sla::hw::HwTable, crate::sla::cost::CostTable, u64) {
+        let hw = self.sla_estimator.hw_table();
+        let cost = self.cost_table.read().clone();
+        let inputs_gen = crate::sla::solve::SolveInputs {
+            hw: &hw,
+            cost: &cost,
+        }
+        .inputs_gen();
+        (hw, cost, inputs_gen)
+    }
+
+    /// Propagate `SlaEstimator` fit eviction to every paired map. Wired
+    /// from BOTH the housekeeping LRU `on_evict` hook and the
+    /// `AdminQuery::SlaEvict` handler — one body, two callers, so the
+    /// memo's `|live keys| × |overrides|` bound holds AND an operator
+    /// `rio-cli sla reset` doesn't leave a Schmitt `prev_a` alive.
+    ///
+    /// **Known-weak:** convention, not type-checked. A future third
+    /// paired map can still forget to register itself here. Reduces N
+    /// "remember to propagate" sites to 1, which is strictly better; a
+    /// stronger close (e.g. a `PairedWith<SlaEstimator>` marker trait
+    /// whose impls this iterates) is deferred until a third paired map
+    /// actually appears.
+    pub(crate) fn on_fit_evicted(&self, k: &crate::sla::types::ModelKey) {
+        self.solve_cache
+            .remove_model_key(crate::sla::solve::model_key_hash(k));
+    }
+
     /// [`SolvedIntent`] for one queued derivation via the SLA estimator.
     /// Shared between [`Self::compute_spawn_intents`] (SpawnIntent
     /// population) and dispatch's resource-fit filter so the controller
@@ -599,7 +645,13 @@ impl DagActor {
             hw_explore
         )
     )]
-    pub(crate) fn solve_intent_for(&self, state: &crate::state::DerivationState) -> SolvedIntent {
+    pub(crate) fn solve_intent_for(
+        &self,
+        state: &crate::state::DerivationState,
+        hw: &crate::sla::hw::HwTable,
+        cost: &crate::sla::cost::CostTable,
+        inputs_gen: u64,
+    ) -> SolvedIntent {
         use crate::sla::{
             quantile, solve,
             types::{ModelKey, RawCores},
@@ -643,18 +695,22 @@ impl DagActor {
         // (`r[sched.sla.intent-from-solve]`); solve_full ignores
         // `hints` and would multi-core a `enableParallelBuilding=false`
         // build.
-        let hw = self.sla_estimator.hw_table();
+        //
         // Sorted: ε_h's seeded `pool.choose()` indexes into this Vec,
         // so HashMap iteration order would otherwise leak into the
         // "pure function of (drv_hash, inputs_gen)" contract.
         let mut h_all: Vec<_> = self.sla_config.hw_classes.keys().cloned().collect();
         h_all.sort_unstable();
-        // Set when the hw-aware arm emitted `infeasible_total` (via
-        // `BestEffort.why` below). Threaded to the `intent_for`
-        // fallback so a drv that's BestEffort under BOTH solves isn't
-        // double-counted. `Cell` because the `get_or_insert_with`
-        // closure runs under a `&self` receiver.
-        let hw_emitted = std::cell::Cell::new(false);
+        // `was_miss`: first time this `(model_key, inputs_gen)` was
+        // solved. Gates ALL post-memo metric emits — `BestEffort.why`,
+        // `ladder_exhausted`, `intent_for`'s infeasible — so cache-hits
+        // don't re-emit per poll. `false` for drvs that never enter the
+        // hw-aware path (FOD/featured/serial), which suppresses their
+        // unmemoized per-poll `intent_for` infeasible emit. `hw_emitted`
+        // tracks "hw-aware arm already emitted" for the double-count
+        // suppress.
+        let mut was_miss = false;
+        let mut hw_emitted = false;
         let full = (self.sla_config.hw_cost_source.is_some()
             && !h_all.is_empty()
             && !hw.is_empty()
@@ -675,53 +731,59 @@ impl DagActor {
             {
                 return None;
             }
-            let cost = self.cost_table.read().clone();
             // Memo: keyed on (model_key_hash, override_hash); hit iff
             // (inputs_gen, fit_content_hash) both match. The ε_h draw
             // and ICE mask are applied AFTER reading the memo — never
-            // overwriting it.
-            let memo = self.solve_cache.get_or_insert_with(
+            // overwriting it. `was_miss` gates every post-memo emit.
+            let (result, miss) = self.solve_cache.get_or_insert_with(
                 solve::model_key_hash(&f.key),
                 solve::override_hash(override_.as_ref()),
+                inputs_gen,
                 solve::fit_content_hash(f),
-                |prev_a| match solve::solve_full(
-                    f,
-                    &self.sla_tiers,
-                    &hw,
-                    &cost,
-                    &self.sla_ceilings,
-                    &self.sla_config,
-                    &h_all,
-                    prev_a,
-                ) {
-                    solve::SolveFullResult::Feasible(m) => Some(m),
-                    solve::SolveFullResult::BestEffort { why, .. } => {
-                        why.emit(&tenant);
-                        hw_emitted.set(true);
-                        None
-                    }
+                |prev_a| {
+                    solve::solve_full(
+                        f,
+                        &self.sla_tiers,
+                        hw,
+                        cost,
+                        &self.sla_ceilings,
+                        &self.sla_config,
+                        &h_all,
+                        prev_a,
+                        true,
+                    )
                 },
             );
+            was_miss = miss;
+            let memo = match result {
+                solve::SolveFullResult::Feasible(m) => Some(m),
+                solve::SolveFullResult::BestEffort { why, .. } => {
+                    if was_miss {
+                        why.emit(&tenant);
+                    }
+                    hw_emitted = true;
+                    None
+                }
+            };
             // ε_h draw (OUTSIDE memo): pin one h ∉ A (or
             // H \ {argmin price} on miss / A=H), restrict the solve
             // to `(h_explore, *)`, and emit ITS A' if feasible. The
             // cached memo's `A` is read but never overwritten.
             //
             // The draw is a **pure function of (drv_hash,
-            // inputs_gen)** — stable across every controller poll
-            // between `inputs_gen` bumps. `compute_spawn_intents`
-            // must be deterministic given (DAG state, fit cache,
-            // inputs_gen) or `reap_stale_for_intents` reaps an
-            // explore Job the next tick on a tails coin
-            // (selector-drift churn). ε_h re-rolls on `inputs_gen`
-            // bump, which is already the legitimate "selector may
-            // drift" signal.
+            // inputs_gen)** — stable across every controller poll at
+            // the same `inputs_gen`. `compute_spawn_intents` must be
+            // deterministic given (DAG state, fit cache, inputs_gen)
+            // or `reap_stale_for_intents` reaps an explore Job the
+            // next tick on a tails coin (selector-drift churn). ε_h
+            // re-rolls when `inputs_gen` changes, which is already the
+            // legitimate "selector may drift" signal.
             use rand::{RngExt as _, SeedableRng};
             let seed = {
                 use std::hash::{DefaultHasher, Hash, Hasher};
                 let mut h = DefaultHasher::new();
                 state.drv_hash.as_str().hash(&mut h);
-                h.finish() ^ self.solve_cache.inputs_gen()
+                h.finish() ^ inputs_gen
             };
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
             if h_all.len() > 1 && rng.random::<f64>() < self.sla_config.hw_explore_epsilon {
@@ -748,12 +810,16 @@ impl DagActor {
                     if let solve::SolveFullResult::Feasible(m) = solve::solve_full(
                         f,
                         &self.sla_tiers,
-                        &hw,
-                        &cost,
+                        hw,
+                        cost,
                         &self.sla_ceilings,
                         &self.sla_config,
                         std::slice::from_ref(h_explore),
                         &std::collections::HashSet::new(),
+                        // Unmemoized — gate `_hw_cost_unknown_total`
+                        // on the unrestricted memo's `was_miss` so it
+                        // fires once per (key, inputs_gen).
+                        was_miss,
                     ) {
                         return Some((m, h_all.clone()));
                     }
@@ -785,7 +851,7 @@ impl DagActor {
                     .cloned()
                     .collect();
                 let cells = if cells.is_empty() {
-                    if self.ice.exhausted(&h_all) {
+                    if was_miss && self.ice.exhausted(&h_all) {
                         ::metrics::counter!(
                             "rio_scheduler_sla_hw_ladder_exhausted_total",
                             "tenant" => tenant.clone(),
@@ -830,7 +896,12 @@ impl DagActor {
                     &self.sla_config,
                     &self.sla_tiers,
                     &self.sla_ceilings,
-                    hw_emitted.get(),
+                    // Suppress when hw-aware already emitted OR this is
+                    // a memo hit (per-poll re-emit) OR the hw-aware
+                    // path was never entered (`was_miss=false` initial)
+                    // — those drvs (FOD/featured/serial) have no memo,
+                    // so once-per-gen has no anchor; per-poll noise.
+                    hw_emitted || !was_miss,
                 );
                 (c, m, d, Vec::new(), Vec::new(), None)
             }

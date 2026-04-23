@@ -258,8 +258,10 @@ impl DagActor {
         //
         // `want_kind`/`system` captured into locals so the `state`
         // borrow ends here — `node_mut` below needs exclusive access
-        // to `self.dag`.
-        let intent = self.solve_intent_for(state);
+        // to `self.dag`. One `(hw, cost, inputs_gen)` snapshot per
+        // dispatch — same pattern as `compute_spawn_intents`.
+        let (hw, cost, inputs_gen) = self.solve_inputs();
+        let intent = self.solve_intent_for(state, &hw, &cost, inputs_gen);
         let want_kind = crate::state::kind_for_drv(state.is_fixed_output);
         let system = state.system.clone();
 

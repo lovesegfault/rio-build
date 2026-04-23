@@ -348,6 +348,56 @@ impl CostTable {
         &self.cluster
     }
 
+    /// Stable hash of the **solve-relevant projection**: every field
+    /// [`super::solve::solve_full`] reads through [`Self::price`] /
+    /// [`Self::lambda_for`] / [`Self::smallest_fitting`] /
+    /// [`Self::cheapest_h`]. Feeds [`super::solve::SolveInputs::inputs_gen`]
+    /// (the derived `inputs_gen`). Includes `stale_clamp` — a clamp
+    /// flip changes `price()` from EMA→seed without ANY caller action.
+    ///
+    /// `price`/`node_count` hash **`.value` only** — NOT the whole
+    /// [`PriceEma`], whose `updated_at` is a timestamp, not a solve
+    /// input; hashing it would re-roll ε_h on every persist. `lambda`
+    /// hashes `(numerator, denominator)` (what [`lambda_hat`] reads).
+    /// All `f64` via `.to_bits()` since `f64: !Hash`; safe because the
+    /// EMA fold is deterministic — same inputs → bit-identical, no NaN.
+    /// Sorted by key so iteration order is irrelevant.
+    pub fn solve_relevant_hash(&self) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        self.stale_clamp.hash(&mut h);
+        let mut price: Vec<_> = self.price.iter().collect();
+        price.sort_by_key(|(k, _)| cell_label(k));
+        for (k, v) in price {
+            cell_label(k).hash(&mut h);
+            v.value.to_bits().hash(&mut h);
+        }
+        let mut lambda: Vec<_> = self.lambda.iter().collect();
+        lambda.sort_by_key(|(k, _)| (*k).clone());
+        for (k, v) in lambda {
+            k.hash(&mut h);
+            v.numerator.to_bits().hash(&mut h);
+            v.denominator.to_bits().hash(&mut h);
+        }
+        let mut nc: Vec<_> = self.node_count.iter().collect();
+        nc.sort_by_key(|(k, _)| (*k).clone());
+        for (k, v) in nc {
+            k.hash(&mut h);
+            v.value.to_bits().hash(&mut h);
+        }
+        let mut cells: Vec<_> = self.cells.iter().collect();
+        cells.sort_by_key(|(k, _)| cell_label(k));
+        for (k, menu) in cells {
+            cell_label(k).hash(&mut h);
+            for t in menu {
+                t.cores.hash(&mut h);
+                t.mem_bytes.hash(&mut h);
+                t.price_per_vcpu_hr.to_bits().hash(&mut h);
+            }
+        }
+        h.finish()
+    }
+
     /// Load persisted EMAs from `sla_ema_state`. Called once at
     /// startup so a scheduler restart doesn't re-warm. `cluster`
     /// scopes the rows (ADR-023 §2.13 global-DB safety).
@@ -450,10 +500,9 @@ impl CostTable {
     /// h's `updated_at`. Called from [`interrupt_housekeeping`]
     /// (lease-gated) — controller appends, scheduler aggregates. Keyed
     /// directly on `interrupt_samples.hw_class` (the controller-stamped
-    /// node label). Returns `true` iff any new rows were folded (λ is a
-    /// solve input via [`super::solve::solve_full`]; caller bumps
-    /// `inputs_gen` only on change).
-    pub async fn refresh_lambda(&mut self, db: &SchedulerDb) -> anyhow::Result<bool> {
+    /// node label). λ is a solve input; the next poll's
+    /// [`super::solve::SolveInputs::inputs_gen`] reflects the change.
+    pub async fn refresh_lambda(&mut self, db: &SchedulerDb) -> anyhow::Result<()> {
         let rows: Vec<(String, String, f64, f64)> = sqlx::query_as(
             "SELECT hw_class, kind, COALESCE(SUM(value), 0), \
                     EXTRACT(EPOCH FROM MAX(at))::float8 \
@@ -473,12 +522,12 @@ impl CostTable {
         // PG-stamped `at` is behind the scheduler clock (skew, or commit
         // lagged the SELECT) would otherwise be permanently skipped on
         // the next tick. Same pattern as `SlaEstimator::refresh`.
-        let mut hwm = self
+        let prev_hwm = self
             .lambda
             .values()
             .map(|e| e.updated_at)
             .fold(0.0, f64::max);
-        let prev_hwm = hwm;
+        let mut hwm = prev_hwm;
         let mut per_h: HashMap<HwClassName, (f64, f64)> = HashMap::new();
         for (hw_class, kind, sum, max_at) in rows {
             hwm = hwm.max(max_at);
@@ -507,7 +556,7 @@ impl CostTable {
                     .update(d / dt, hwm, LAMBDA_HALFLIFE_SECS);
             }
         }
-        Ok(hwm > prev_hwm)
+        Ok(())
     }
 
     /// Move `lambda` + `node_count` from `from` into `self`, leaving
@@ -745,7 +794,6 @@ pub async fn spot_price_poller(
     db: SchedulerDb,
     leader: LeaderState,
     cost: std::sync::Arc<parking_lot::RwLock<CostTable>>,
-    solve_cache: std::sync::Arc<super::solve::SolveCache>,
     shutdown: rio_common::signal::Token,
 ) {
     // EC2 client built once. Same `from_env()` chain as
@@ -781,27 +829,23 @@ pub async fn spot_price_poller(
         let cells = cost.read().cells.clone();
         let result = poll_spot_once(&ec2, &cells).await;
         let now = now_epoch();
-        let folded = {
+        {
             let mut g = cost.write();
-            let folded = fold_spot_poll(&mut g, result, now);
+            fold_spot_poll(&mut g, result, now);
             g.apply_stale_clamp(now);
-            folded
-        };
+        }
         ::metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds")
             .set(now - cost.read().price_updated_at());
         // r[impl sched.sla.hw-class.epsilon-explore+2]
-        // Price is a solve input — bump iff `fold_prices` ran (Ok ∧
-        // non-empty) so the memo + ε_h seed track the new CostTable.
-        if folded {
-            solve_cache.bump_inputs_gen();
-        }
+        // Price is a solve input — the next poll's derived
+        // `SolveInputs::inputs_gen` reflects the new table.
     }
 }
 
 /// Lease-gated λ/persist housekeeping: every 10min, the leader
 /// refreshes λ from `interrupt_samples`, sweeps the retention window,
-/// persists the full `CostTable` to PG, and bumps `inputs_gen` if λ
-/// changed. Runs unconditionally (independent of `hw_cost_source`) —
+/// and persists the full `CostTable` to PG. Runs unconditionally
+/// (independent of `hw_cost_source`) —
 /// the controller appends `interrupt_samples` regardless, and the
 /// EMA-state persist covers both λ and any spot-price updates from
 /// [`spot_price_poller`]. On a false→true leader edge the in-mem table
@@ -813,7 +857,6 @@ pub async fn interrupt_housekeeping(
     db: SchedulerDb,
     leader: LeaderState,
     cost: std::sync::Arc<parking_lot::RwLock<CostTable>>,
-    solve_cache: std::sync::Arc<super::solve::SolveCache>,
     shutdown: rio_common::signal::Token,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
@@ -842,18 +885,11 @@ pub async fn interrupt_housekeeping(
         // Snapshot → refresh_lambda → write back λ ONLY (don't clobber
         // a concurrent `spot_price_poller` price fold).
         let mut snap = cost.read().clone();
-        let lambda_changed = match snap.refresh_lambda(&db).await {
-            Ok(changed) => changed,
-            Err(e) => {
-                tracing::warn!(error = %e, "λ refresh failed; keeping previous");
-                false
-            }
-        };
+        if let Err(e) = snap.refresh_lambda(&db).await {
+            tracing::warn!(error = %e, "λ refresh failed; keeping previous");
+        }
         let cluster = snap.cluster.clone();
         cost.write().absorb_lambda(snap);
-        if lambda_changed {
-            solve_cache.bump_inputs_gen();
-        }
         if let Err(e) = sweep_interrupt_samples(&db, &cluster).await {
             tracing::warn!(error = %e, "interrupt_samples retention sweep failed");
         }
@@ -890,25 +926,19 @@ pub(crate) async fn sweep_interrupt_samples(db: &SchedulerDb, cluster: &str) -> 
 /// matching `_hw_cost_fallback_total{reason=…}` on the non-success
 /// arms. Factored from [`spot_price_poller`] so the `api_error` /
 /// `empty_history` reasons are unit-testable without an EC2 client.
-/// Returns `true` iff `fold_prices` ran (Ok ∧ non-empty) — caller
-/// bumps `inputs_gen` only then.
 pub(crate) fn fold_spot_poll(
     snap: &mut CostTable,
     result: anyhow::Result<HashMap<Cell, f64>>,
     now: f64,
-) -> bool {
+) {
     match result {
-        Ok(obs) if !obs.is_empty() => {
-            snap.fold_prices(&obs, now);
-            true
-        }
+        Ok(obs) if !obs.is_empty() => snap.fold_prices(&obs, now),
         Ok(_) => {
             ::metrics::counter!(
                 "rio_scheduler_sla_hw_cost_fallback_total",
                 "reason" => "empty_history"
             )
             .increment(1);
-            false
         }
         Err(e) => {
             tracing::warn!(error = %e, "spot-price poll failed; keeping previous");
@@ -917,7 +947,6 @@ pub(crate) fn fold_spot_poll(
                 "reason" => "api_error"
             )
             .increment(1);
-            false
         }
     }
 }

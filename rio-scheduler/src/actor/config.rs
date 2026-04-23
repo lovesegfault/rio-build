@@ -99,10 +99,6 @@ pub struct DagActorPlumbing {
     /// `spot_price_poller`; the actor reads a snapshot per
     /// `solve_intent_for`. Default → seed prices.
     pub cost_table: Arc<parking_lot::RwLock<crate::sla::cost::CostTable>>,
-    /// Per-key admissible-set memo. Shared with `spot_price_poller` /
-    /// `interrupt_housekeeping` so a `CostTable` write outside the
-    /// actor loop bumps `inputs_gen` (the ε_h seed). Default → empty.
-    pub solve_cache: Arc<crate::sla::solve::SolveCache>,
     /// Shutdown token. The run loop `select!`s on `cancelled()` with
     /// `biased` ordering so SIGTERM drains workers immediately.
     pub shutdown: rio_common::signal::Token,
@@ -129,7 +125,6 @@ impl Default for DagActorPlumbing {
             service_signer: None,
             leader: LeaderState::default(),
             cost_table: Arc::default(),
-            solve_cache: Arc::default(),
             shutdown: rio_common::signal::Token::new(),
             #[cfg(test)]
             recovery_toctou_gate: None,

@@ -1642,13 +1642,13 @@ async fn ice_mask_is_read_time() {
     actor.test_inject_ready("d", Some("test-pkg"), "x86_64-linux", false);
 
     // Precondition: solve_full fires, affinity over A' populated.
-    let intent = actor.solve_intent_for(actor.dag.node("d").unwrap());
+    let (hw, cost, g0) = actor.solve_inputs();
+    let intent = actor.solve_intent_for(actor.dag.node("d").unwrap(), &hw, &cost, g0);
     assert!(
         !intent.node_affinity.is_empty(),
         "precondition: solve_full path active"
     );
     let n0 = intent.node_affinity.len();
-    let g0 = actor.solve_cache.inputs_gen();
 
     // Mask one cell from A' via the controller's unfulfillable report.
     let masked: crate::sla::config::Cell = ("intel-6".into(), CapacityType::Spot);
@@ -1657,12 +1657,8 @@ async fn ice_mask_is_read_time() {
 
     // Read-time mask: the next dispatch returns A \ {masked} WITHOUT
     // touching the memo (deterministic — same inputs_gen).
-    let intent2 = actor.solve_intent_for(actor.dag.node("d").unwrap());
-    assert_eq!(
-        actor.solve_cache.inputs_gen(),
-        g0,
-        "ICE state is NOT in inputs_gen"
-    );
+    let intent2 = actor.solve_intent_for(actor.dag.node("d").unwrap(), &hw, &cost, g0);
+    assert_eq!(actor.solve_inputs().2, g0, "ICE state is NOT in inputs_gen");
     let intel6_spot = |t: &rio_proto::types::NodeSelectorTerm| {
         t.match_expressions
             .iter()
@@ -1682,7 +1678,7 @@ async fn ice_mask_is_read_time() {
     // Clear (success report): unmasking is free — the SAME memo is
     // read, full A' returns.
     actor.ice.clear(&masked);
-    let intent3 = actor.solve_intent_for(actor.dag.node("d").unwrap());
+    let intent3 = actor.solve_intent_for(actor.dag.node("d").unwrap(), &hw, &cost, g0);
     assert_eq!(
         intent3.node_affinity.len(),
         n0,
@@ -1696,7 +1692,7 @@ async fn ice_mask_is_read_time() {
             actor.ice.mark(&(h.clone(), cap));
         }
     }
-    let intent4 = actor.solve_intent_for(actor.dag.node("d").unwrap());
+    let intent4 = actor.solve_intent_for(actor.dag.node("d").unwrap(), &hw, &cost, g0);
     assert!(
         !intent4.node_affinity.is_empty(),
         "all-masked → still emit A (best-effort reserved for envelope-infeasibility)"
@@ -1774,7 +1770,8 @@ async fn epsilon_h_draws_outside_a() {
 
     // Baseline at ε=0 (bare_actor_hw default) so the memo is the
     // unrestricted solve, not an ε_h hit.
-    let baseline = actor.solve_intent_for(actor.dag.node("d").unwrap());
+    let (hw, cost, g0) = actor.solve_inputs();
+    let baseline = actor.solve_intent_for(actor.dag.node("d").unwrap(), &hw, &cost, g0);
     actor.sla_config.hw_explore_epsilon = 0.2; // max
     let in_a: std::collections::HashSet<String> = baseline
         .node_affinity
@@ -1794,19 +1791,21 @@ async fn epsilon_h_draws_outside_a() {
     // Same (drv_hash, inputs_gen) → identical affinity across 10
     // calls. Before the fix, `rand::rng()` re-rolled per call →
     // selector-drift reap churn.
-    let first = actor.solve_intent_for(actor.dag.node("d").unwrap());
+    let first = actor.solve_intent_for(actor.dag.node("d").unwrap(), &hw, &cost, g0);
     for _ in 0..10 {
-        let again = actor.solve_intent_for(actor.dag.node("d").unwrap());
+        let again = actor.solve_intent_for(actor.dag.node("d").unwrap(), &hw, &cost, g0);
         assert_eq!(
             again.node_affinity, first.node_affinity,
             "ε_h draw is deterministic for fixed (drv_hash, inputs_gen)"
         );
     }
-    // inputs_gen bump → re-roll permitted (the seed changes).
-    actor.solve_cache.bump_inputs_gen();
-    let after_bump = actor.solve_intent_for(actor.dag.node("d").unwrap());
+    // Different inputs_gen → re-roll permitted (the seed changes).
+    // Derived design: pass `g0+1` directly — equivalent to a real
+    // hw/cost solve-relevant change.
+    let g1 = g0.wrapping_add(1);
+    let after_bump = actor.solve_intent_for(actor.dag.node("d").unwrap(), &hw, &cost, g1);
     for _ in 0..10 {
-        let again = actor.solve_intent_for(actor.dag.node("d").unwrap());
+        let again = actor.solve_intent_for(actor.dag.node("d").unwrap(), &hw, &cost, g1);
         assert_eq!(
             again.node_affinity, after_bump.node_affinity,
             "still deterministic at the new generation"
@@ -1818,7 +1817,7 @@ async fn epsilon_h_draws_outside_a() {
     for i in 0..200 {
         let dh = format!("d{i}");
         actor.test_inject_ready(&dh, Some("test-pkg"), "x86_64-linux", false);
-        let intent = actor.solve_intent_for(actor.dag.node(dh.as_str()).unwrap());
+        let intent = actor.solve_intent_for(actor.dag.node(dh.as_str()).unwrap(), &hw, &cost, g1);
         let hs: std::collections::HashSet<String> = intent
             .node_affinity
             .iter()
@@ -1867,10 +1866,12 @@ async fn epsilon_h_draws_outside_a() {
     actor
         .sla_estimator
         .seed_hw(crate::sla::hw::HwTable::from_map(m));
-    actor.solve_cache.bump_inputs_gen();
+    // hw + cost both changed → re-derive (no bump call to forget).
+    let (hw2, cost2, g2) = actor.solve_inputs();
+    assert_ne!(g2, g0, "seed_hw + set_price → derived inputs_gen changed");
     actor.sla_config.hw_explore_epsilon = 0.0;
     let in_a2: std::collections::HashSet<_> = actor
-        .solve_intent_for(actor.dag.node("d").unwrap())
+        .solve_intent_for(actor.dag.node("d").unwrap(), &hw2, &cost2, g2)
         .node_affinity
         .iter()
         .filter_map(|t| {
@@ -1886,7 +1887,7 @@ async fn epsilon_h_draws_outside_a() {
     for i in 0..200 {
         let dh = format!("e{i}");
         actor.test_inject_ready(&dh, Some("test-pkg"), "x86_64-linux", false);
-        let intent = actor.solve_intent_for(actor.dag.node(dh.as_str()).unwrap());
+        let intent = actor.solve_intent_for(actor.dag.node(dh.as_str()).unwrap(), &hw2, &cost2, g2);
         let hs: std::collections::HashSet<String> = intent
             .node_affinity
             .iter()
@@ -2138,7 +2139,7 @@ async fn work_assignment_carries_sla_cores() {
     actor.test_inject_ready("fitted", Some("test-pkg"), "x86_64-linux", false);
     let expected_cores = {
         let state = actor.dag.node("fitted").unwrap();
-        actor.solve_intent_for(state).cores
+        solve_intent(&actor, state).cores
     };
     actor.push_ready("fitted".to_string().into());
 
@@ -2222,13 +2223,13 @@ async fn solve_intent_deadline_denormalized_to_slowest_hw() {
     let state = actor.dag.node("d").unwrap();
 
     // Baseline: empty hw table → min_factor()=1.0 → deadline ≈ ref_q99×5.
-    let baseline = actor.solve_intent_for(state).deadline_secs;
+    let baseline = solve_intent(&actor, state).deadline_secs;
 
     // Fast-only table (factor 2.0): wall = ref/2 → deadline ≈ baseline/2.
     let mut fast = HashMap::new();
     fast.insert("aws-8-nvme".into(), 2.0);
     actor.sla_estimator.seed_hw(hw::HwTable::from_map(fast));
-    let fast_dl = actor.solve_intent_for(state).deadline_secs;
+    let fast_dl = solve_intent(&actor, state).deadline_secs;
     assert!(
         fast_dl < baseline,
         "factor>1 → deadline shrinks (was over-budget): {fast_dl} < {baseline}"
@@ -2240,7 +2241,7 @@ async fn solve_intent_deadline_denormalized_to_slowest_hw() {
     mixed.insert("aws-8-nvme".into(), 2.0);
     mixed.insert("aws-4-slow".into(), 0.5);
     actor.sla_estimator.seed_hw(hw::HwTable::from_map(mixed));
-    let slow_dl = actor.solve_intent_for(state).deadline_secs;
+    let slow_dl = solve_intent(&actor, state).deadline_secs;
     assert!(
         slow_dl > baseline && slow_dl > fast_dl,
         "factor<1 in table → deadline budgets slowest wall: {slow_dl} > {baseline}"
@@ -3596,7 +3597,7 @@ async fn solve_cache_evicted_with_lru() {
     for p in ["p0", "p1", "p2"] {
         seed_fit(&actor, p);
         actor.test_inject_ready(p, Some(p), "x86_64-linux", false);
-        let _ = actor.solve_intent_for(actor.dag.node(p).unwrap());
+        let _ = solve_intent(&actor, actor.dag.node(p).unwrap());
     }
     assert_eq!(actor.solve_cache.len(), 3, "solve_cache one per fit");
 
@@ -3617,59 +3618,72 @@ async fn solve_cache_evicted_with_lru() {
     // Steady-state: solving for the surviving fits + p3 stays ≤ cap.
     seed_fit(&actor, "p3");
     actor.test_inject_ready("p3", Some("p3"), "x86_64-linux", false);
-    let _ = actor.solve_intent_for(actor.dag.node("p3").unwrap());
+    let _ = solve_intent(&actor, actor.dag.node("p3").unwrap());
     assert!(
         actor.solve_cache.len() <= 3,
         "solve_cache bounded by max_keys_per_tenant"
     );
 }
 
-/// merged_bug_028: `bump_inputs_gen()` was unconditional every 60s, so
-/// ε_h re-rolled before Karpenter could provision an explore node. The
-/// fix: `refresh()` returns `hw_table_changed` and the actor bumps only
-/// then. This drives `refresh()` directly with the housekeeping wiring
-/// and asserts `inputs_gen` is stable across no-op refreshes.
+/// merged_bug_028: `inputs_gen` was an `AtomicU64` whose `bump()` was
+/// unconditional every 60s, so ε_h re-rolled before Karpenter could
+/// provision an explore node. Third-strike redesign: `inputs_gen` is
+/// **derived** from `(HwTable, CostTable)` solve-relevant projection;
+/// nobody bumps. This asserts the projection's stability properties.
 // r[verify sched.sla.hw-class.epsilon-explore+2]
 #[tokio::test]
 async fn inputs_gen_stable_across_noop_refresh() -> TestResult {
+    use crate::sla::solve::SolveInputs;
     let db = TestDb::new(&MIGRATOR).await;
     let sdb = SchedulerDb::new(db.pool.clone());
     let est = crate::sla::SlaEstimator::for_test(&test_hw_sla_config());
-    let solve_cache = std::sync::Arc::new(crate::sla::solve::SolveCache::default());
-
-    // 10 refreshes, no hw_perf rows → hw_changed=false → inputs_gen
-    // stays at 0.
-    for i in 0..10 {
-        let (_, hw_changed) = est.refresh(&sdb, &[], |_| {}).await?;
-        assert!(!hw_changed, "tick {i}: empty hw_perf_samples → no change");
-        if hw_changed {
-            solve_cache.bump_inputs_gen();
+    let cost = crate::sla::cost::CostTable::default();
+    let derive = |est: &crate::sla::SlaEstimator| {
+        SolveInputs {
+            hw: &est.hw_table(),
+            cost: &cost,
         }
-    }
-    assert_eq!(
-        solve_cache.inputs_gen(),
-        0,
-        "no-op refresh must NOT bump inputs_gen"
-    );
+        .inputs_gen()
+    };
 
-    // Insert one hw_perf row → content_hash changes → next refresh
-    // bumps. (One row → entry kept as ([1.0;K], pod_ids=1) — gated to
-    // pass-through but still a content change.)
+    // 10 refreshes, no hw_perf rows → solve_relevant_hash unchanged →
+    // derived inputs_gen identical.
+    let g0 = derive(&est);
+    for _ in 0..10 {
+        est.refresh(&sdb, &[], |_| {}).await?;
+    }
+    assert_eq!(derive(&est), g0, "no-op refresh → inputs_gen stable");
+
+    // 3 rows for one class → pod_ids 0→3 crosses HW_MIN_PODS → trust
+    // bool flips → inputs_gen changes.
+    for p in ["a", "b", "c"] {
+        sqlx::query(
+            "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) \
+             VALUES ('intel-7', $1, '{\"alu\":1.4}')",
+        )
+        .bind(format!("pod-{p}"))
+        .execute(&db.pool)
+        .await?;
+    }
+    est.refresh(&sdb, &[], |_| {}).await?;
+    let g1 = derive(&est);
+    assert_ne!(g1, g0, "0→3 pods crosses trust threshold → derived change");
+
+    // merged_bug_011 regression: pod_ids 3→4, factor unchanged → trust
+    // bool stays true, factor[K] post-clamp identical → inputs_gen
+    // UNCHANGED. The old `content_hash` hashed raw `pod_ids` and would
+    // have changed here.
     sqlx::query(
         "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) \
-         VALUES ('intel-7', 'pod-a', '{\"alu\":1.4}')",
+         VALUES ('intel-7', 'pod-d', '{\"alu\":1.4}')",
     )
     .execute(&db.pool)
     .await?;
-    let (_, hw_changed) = est.refresh(&sdb, &[], |_| {}).await?;
-    assert!(hw_changed, "new hw_perf row → content_hash changed");
-    if hw_changed {
-        solve_cache.bump_inputs_gen();
-    }
-    assert_eq!(solve_cache.inputs_gen(), 1, "bumped exactly once");
-
-    // Idempotent: same row, no further inserts → next refresh is no-op.
-    let (_, hw_changed) = est.refresh(&sdb, &[], |_| {}).await?;
-    assert!(!hw_changed, "stable hw_perf_samples → no change");
+    est.refresh(&sdb, &[], |_| {}).await?;
+    assert_eq!(
+        derive(&est),
+        g1,
+        "pod_ids 3→4 within trusted, factor unchanged → inputs_gen UNCHANGED"
+    );
     Ok(())
 }

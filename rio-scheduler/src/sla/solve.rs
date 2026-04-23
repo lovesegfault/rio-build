@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -682,7 +681,10 @@ fn hw_factor_for(fit: &FittedParams, hw: &HwTable, h: &str) -> f64 {
 /// Schmitt deadband.
 ///
 /// `h_set` is `cfg.hw_classes.keys()` for the unrestricted solve;
-/// the ε_h pin passes a singleton.
+/// the ε_h pin passes a singleton. `emit_metrics` gates the
+/// `_hw_cost_unknown_total` per-cell emit so the unmemoized ε_h
+/// restricted re-solve at `snapshot.rs` doesn't fire it per-poll —
+/// the unrestricted memo's `was_miss` is the once-per-gen signal.
 #[allow(clippy::too_many_arguments)]
 pub fn solve_full(
     fit: &FittedParams,
@@ -693,6 +695,7 @@ pub fn solve_full(
     cfg: &SlaConfig,
     h_set: &[HwClassName],
     prev_a: &HashSet<Cell>,
+    emit_metrics: bool,
 ) -> SolveFullResult {
     debug_assert!(
         !matches!(fit.fit, DurationFit::Probe),
@@ -751,14 +754,17 @@ pub fn solve_full(
                 }
                 let Some(price) = cost.smallest_fitting(&cell, c_star, mem) else {
                     // Menu has no type fitting (c*, mem) → drop cell.
-                    // Memoized — fires once per (key, inputs_gen), not
+                    // Gated on `emit_metrics` (the memo's `was_miss`)
+                    // so it fires once per (key, inputs_gen), not
                     // per-dispatch; that's the right cardinality for a
                     // config-drift signal.
-                    ::metrics::counter!(
-                        "rio_scheduler_sla_hw_cost_unknown_total",
-                        "tenant" => fit.key.tenant.clone()
-                    )
-                    .increment(1);
+                    if emit_metrics {
+                        ::metrics::counter!(
+                            "rio_scheduler_sla_hw_cost_unknown_total",
+                            "tenant" => fit.key.tenant.clone()
+                        )
+                        .increment(1);
+                    }
                     continue;
                 };
                 candidates.push(Candidate {
@@ -856,72 +862,107 @@ pub fn solve_full(
     }
 }
 
+/// Snapshot of the **shared solve inputs**. THE definition of "what
+/// counts as a fleet-wide solve-input change" — derived at read time
+/// from the inputs themselves; **nobody bumps**. Replaces the
+/// `AtomicU64 inputs_gen` whose invariant ("every behavioural change
+/// bumps") was enforced by N callers each remembering to bump on the
+/// right edge — 7/12 SolveCache bugs across 3 rounds were a caller
+/// that forgot, bumped at the wrong granularity, or bumped spuriously.
+pub struct SolveInputs<'a> {
+    pub hw: &'a HwTable,
+    pub cost: &'a CostTable,
+    // SlaConfig (tiers, ceilings, hw_classes, hw_cost_tolerance,
+    // hw_explore_epsilon) is restart-only — no runtime term needed.
+    // If hot-reload ever lands, add `cfg_epoch: u64` here.
+}
+
+impl SolveInputs<'_> {
+    /// Hash of exactly the projection [`solve_full`] + the ε_h dispatch
+    /// arm read. Adding a new solve input = adding a term here;
+    /// forgetting is a determinism bug `contract_selector_stability`
+    /// catches.
+    ///
+    /// NOT XOR — XOR is symmetric (hw⊕cost == cost⊕hw is fine, but
+    /// hw==cost → 0, and any pair of equal sub-hashes cancels). A
+    /// sequenced [`Hasher`] preserves term order and arity.
+    ///
+    /// ICE mask is **intentionally NOT** here: it's a read-time mask
+    /// applied AFTER the memo, changing `node_affinity` only for
+    /// intents whose cached `A` intersects it; the controller's
+    /// selector-drift reap is the *intended* response. Hashing
+    /// `ice.masked_cells()` would re-roll ε_h for *every* intent on
+    /// every ICE mark — wrong.
+    pub fn inputs_gen(&self) -> u64 {
+        let mut h = std::hash::DefaultHasher::new();
+        self.hw.solve_relevant_hash().hash(&mut h);
+        self.cost.solve_relevant_hash().hash(&mut h);
+        h.finish()
+    }
+}
+
 /// Per-key solve memo. Keyed on `(model_key_hash, override_hash)` —
 /// logical identity, NOT the fit content — so each `(pname, system,
 /// tenant, override)` owns exactly one slot. The stored
 /// `(inputs_gen, fit_content_hash)` are checked as staleness fields:
 /// a mismatch on EITHER means the shared inputs changed or the fit was
-/// refitted, and the stored entry's `a.cells` becomes the Schmitt
-/// `prev_a` for the recompute (which then overwrites in place).
+/// refitted, and the stored entry's Feasible `a.cells` becomes the
+/// Schmitt `prev_a` for the recompute (which then overwrites in place).
 ///
 /// Keying on content (`fit_content_hash`) would orphan the prior entry
 /// on every refit — unbounded growth AND `prev_a = ∅` (hysteresis
 /// lost). Cache size is bounded by `|SlaEstimator live keys| ×
-/// |distinct overrides|` — the `SlaEstimator` LRU's `on_evict` hook
-/// calls [`SolveCache::remove_model_key`] so an eviction there drops
-/// every override-keyed entry here.
+/// |distinct overrides|` — `DagActor::on_fit_evicted` calls
+/// [`SolveCache::remove_model_key`] so an eviction there drops every
+/// override-keyed entry here.
 ///
-/// `inputs_gen` is bumped on `HwTable`/`CostTable` *content* change
-/// (ADR-023 L616). ICE state is NOT in
-/// `inputs_gen` — the read-time mask touches only intents whose cached
-/// `A` intersects the masked cell.
+/// `inputs_gen` is **derived** from [`SolveInputs::inputs_gen`] at poll
+/// time (ADR-023 L616). ICE state is NOT in `inputs_gen` — the
+/// read-time mask touches only intents whose cached `A` intersects the
+/// masked cell.
 #[derive(Debug, Default)]
 pub struct SolveCache {
-    inputs_gen: AtomicU64,
-    entries: DashMap<(u64, u64), (u64, u64, SolveMemo)>,
+    entries: DashMap<(u64, u64), (u64, u64, SolveFullResult)>,
 }
 
 impl SolveCache {
-    /// Bump the fleet-wide solve-input generation. Call on
-    /// `HwTable`/`CostTable` refresh and `SlaConfig` reload.
-    pub fn bump_inputs_gen(&self) {
-        self.inputs_gen.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn inputs_gen(&self) -> u64 {
-        self.inputs_gen.load(Ordering::Relaxed)
-    }
-
     /// Read the memo for `(model_key_hash, override_hash)` if BOTH the
-    /// current `inputs_gen` and `fit_content_hash` match the stored
-    /// values, or compute via `f(prev_a)` and overwrite. `prev_a` is
-    /// the prior entry's `A'` (Schmitt history), empty on first sight.
+    /// passed `inputs_gen` and `fit_content_hash` match the stored
+    /// values, or compute via `f(prev_a)` and overwrite. Returns
+    /// `(result, was_miss)`: `was_miss` gates ALL post-memo metric
+    /// emits so cache-hits on `BestEffort` don't re-emit
+    /// `_infeasible_total` per-poll. The full [`SolveFullResult`] is
+    /// memoized — `BestEffort` is cached too, so a key whose every
+    /// tier is infeasible doesn't re-solve every poll. `prev_a` is the
+    /// prior entry's Feasible `A'` (Schmitt history); BestEffort or
+    /// first-seen → ∅.
     pub fn get_or_insert_with(
         &self,
         model_key_hash: u64,
         override_hash: u64,
+        inputs_gen: u64,
         fit_content_hash: u64,
-        f: impl FnOnce(&HashSet<Cell>) -> Option<SolveMemo>,
-    ) -> Option<SolveMemo> {
-        let g = self.inputs_gen();
+        f: impl FnOnce(&HashSet<Cell>) -> SolveFullResult,
+    ) -> (SolveFullResult, bool) {
         let key = (model_key_hash, override_hash);
         // Copy out under guard (DashMap shard non-reentrant), then
         // decide: hit iff BOTH stored gen AND fit_content_hash match;
         // either drift → stored A' is prev_a for the recompute.
         let prior = self.entries.get(&key).map(|e| e.clone());
-        if let Some((stored_g, stored_fh, memo)) = &prior
-            && *stored_g == g
+        if let Some((stored_g, stored_fh, r)) = &prior
+            && *stored_g == inputs_gen
             && *stored_fh == fit_content_hash
         {
-            return Some(memo.clone());
+            return (r.clone(), false);
         }
-        let prev_a: HashSet<Cell> = prior
-            .map(|(_, _, m)| m.a.cells.into_iter().collect())
-            .unwrap_or_default();
-        let memo = f(&prev_a)?;
+        let prev_a: HashSet<Cell> = match &prior {
+            Some((_, _, SolveFullResult::Feasible(m))) => m.a.cells.iter().cloned().collect(),
+            _ => HashSet::new(),
+        };
+        let r = f(&prev_a);
         self.entries
-            .insert(key, (g, fit_content_hash, memo.clone()));
-        Some(memo)
+            .insert(key, (inputs_gen, fit_content_hash, r.clone()));
+        (r, true)
     }
 
     pub fn len(&self) -> usize {
@@ -1716,6 +1757,7 @@ mod tests {
             &cfg,
             &h_set(),
             &HashSet::new(),
+            true,
         );
         let SolveFullResult::Feasible(memo) = r else {
             panic!("Feasible expected")
@@ -1778,6 +1820,7 @@ mod tests {
             &cfg,
             &h_set(),
             &HashSet::new(),
+            true,
         ) else {
             panic!()
         };
@@ -1790,6 +1833,7 @@ mod tests {
             &cfg,
             &h_set(),
             &prev,
+            true,
         ) else {
             panic!()
         };
@@ -1834,6 +1878,7 @@ mod tests {
             &cfg,
             &hs,
             &prev,
+            true,
         ) else {
             panic!("Feasible expected")
         };
@@ -1911,6 +1956,7 @@ mod tests {
             &cfg,
             &hs,
             &HashSet::new(),
+            true,
         ) else {
             panic!()
         };
@@ -1974,6 +2020,7 @@ mod tests {
             &cfg_hw(),
             &h_set(),
             &HashSet::new(),
+            true,
         ) else {
             panic!()
         };
@@ -2053,7 +2100,7 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         let go = |prev: &HashSet<Cell>| {
             calls.set(calls.get() + 1);
-            match solve_full(
+            solve_full(
                 &fit,
                 &[t("normal", 1200.0)],
                 &hw_three(),
@@ -2062,27 +2109,31 @@ mod tests {
                 &cfg_hw(),
                 &h_set(),
                 prev,
-            ) {
-                SolveFullResult::Feasible(m) => Some(m),
-                _ => None,
-            }
+                true,
+            )
         };
-        let m1 = cache.get_or_insert_with(mk, 0, fh, go).unwrap();
-        let m1b = cache.get_or_insert_with(mk, 0, fh, go).unwrap();
-        assert_eq!(calls.get(), 1, "second call hits memo");
-        assert_eq!(m1.a.cells, m1b.a.cells);
+        let cells = |r: &SolveFullResult| match r {
+            SolveFullResult::Feasible(m) => m.a.cells.clone(),
+            _ => panic!("fixture feasible"),
+        };
+        let g0 = 100;
+        let (r1, miss1) = cache.get_or_insert_with(mk, 0, g0, fh, go);
+        assert!(miss1);
+        let (r1b, miss1b) = cache.get_or_insert_with(mk, 0, g0, fh, go);
+        assert!(!miss1b, "second call hits memo");
+        assert_eq!(calls.get(), 1);
+        assert_eq!(cells(&r1), cells(&r1b));
         // Different override_hash → miss (separate slot).
-        cache.get_or_insert_with(mk, 7, fh, go).unwrap();
+        let (_, miss2) = cache.get_or_insert_with(mk, 7, g0, fh, go);
+        assert!(miss2);
         assert_eq!(calls.get(), 2);
         assert_eq!(cache.len(), 2);
-        // bump_inputs_gen → miss; prev_a from old entry.
-        cache.bump_inputs_gen();
-        cache
-            .get_or_insert_with(mk, 0, fh, |p| {
-                assert_eq!(p.len(), m1.a.cells.len(), "prev_a comes from old-gen entry");
-                go(p)
-            })
-            .unwrap();
+        // Different inputs_gen → miss; prev_a from old entry.
+        let (_, miss3) = cache.get_or_insert_with(mk, 0, g0 + 1, fh, |p| {
+            assert_eq!(p.len(), cells(&r1).len(), "prev_a comes from old-gen entry");
+            go(p)
+        });
+        assert!(miss3);
         assert_eq!(calls.get(), 3);
         // Regression (merged_bug_026): refit changes fit_content_hash
         // but model_key is unchanged → miss (recompute) BUT same slot
@@ -2093,16 +2144,14 @@ mod tests {
         let fh2 = fit_content_hash(&refit);
         assert_ne!(fh, fh2, "refit changes content hash");
         assert_eq!(model_key_hash(&refit.key), mk, "model_key invariant");
-        cache
-            .get_or_insert_with(mk, 0, fh2, |p| {
-                assert_eq!(
-                    p.len(),
-                    m1.a.cells.len(),
-                    "prev_a from prior fit_content_hash entry — hysteresis survives refit"
-                );
-                go(p)
-            })
-            .unwrap();
+        cache.get_or_insert_with(mk, 0, g0 + 1, fh2, |p| {
+            assert_eq!(
+                p.len(),
+                cells(&r1).len(),
+                "prev_a from prior fit_content_hash entry — hysteresis survives refit"
+            );
+            go(p)
+        });
         assert_eq!(calls.get(), 4);
         assert_eq!(
             cache.len(),
@@ -2110,8 +2159,28 @@ mod tests {
             "refit overwrites in place — no orphaned entry"
         );
         // Same fh2 again → hit.
-        cache.get_or_insert_with(mk, 0, fh2, go).unwrap();
+        let (_, miss5) = cache.get_or_insert_with(mk, 0, g0 + 1, fh2, go);
+        assert!(!miss5);
         assert_eq!(calls.get(), 4);
+        // Regression (merged_bug_001): BestEffort is memoized too. A
+        // closure returning BestEffort is inserted; the next call hits.
+        let be = |_: &HashSet<Cell>| SolveFullResult::BestEffort {
+            c: 1,
+            mem_bytes: 0,
+            disk_bytes: 0,
+            cells: vec![],
+            why: InfeasibleReason::DiskCeiling,
+        };
+        let (_, m) = cache.get_or_insert_with(99, 0, g0, fh, be);
+        assert!(m, "first BestEffort is a miss");
+        let (r, m) = cache.get_or_insert_with(99, 0, g0, fh, |_| panic!("hit"));
+        assert!(!m, "second BestEffort hits memo — not re-solved per poll");
+        assert!(matches!(r, SolveFullResult::BestEffort { .. }));
+        // prev_a for a key whose last solve was BestEffort is ∅.
+        cache.get_or_insert_with(99, 0, g0 + 1, fh, |p| {
+            assert!(p.is_empty(), "BestEffort prior → prev_a = ∅");
+            be(p)
+        });
     }
 
     #[test]
@@ -2130,6 +2199,7 @@ mod tests {
             &cfg_hw(),
             &h_set(),
             &HashSet::new(),
+            true,
         );
         let SolveFullResult::BestEffort {
             disk_bytes, why, ..
@@ -2159,7 +2229,7 @@ mod tests {
             cfg.hw_cost_tolerance = tau;
             match solve_full(
                 &fit, &[t("x", p90)], &hw_three(), &CostTable::default(),
-                &ceil(), &cfg, &h_set(), &HashSet::new(),
+                &ceil(), &cfg, &h_set(), &HashSet::new(), true,
             ) {
                 SolveFullResult::Feasible(memo) => {
                     prop_assert!(!memo.a.cells.is_empty(), "A' ≠ ∅");
@@ -2291,6 +2361,7 @@ mod tests {
             &cfg_hw(),
             &h_set(),
             &HashSet::new(),
+            true,
         );
         let SolveFullResult::BestEffort { why, .. } = r else {
             panic!("λ-gated spot + OD menu-unfit → BestEffort, got {r:?}")
@@ -2310,6 +2381,7 @@ mod tests {
             &cfg_hw(),
             &h_set(),
             &HashSet::new(),
+            true,
         );
         let SolveFullResult::BestEffort { why, .. } = r else {
             panic!("S=1e6 → BestEffort")

@@ -173,20 +173,16 @@ async fn main() -> anyhow::Result<()> {
                 rio_scheduler::sla::cost::CostTable::seeded(&sla_cluster)
             }),
     ));
-    // Shared with the actor (via DagActorPlumbing) so the cost-side
-    // pollers can bump `inputs_gen` on a CostTable write — without this
-    // the actor sees the new price/λ with the OLD inputs_gen (≤60s
-    // window), violating r[sched.sla.hw-class.epsilon-explore+2].
-    let solve_cache = std::sync::Arc::new(rio_scheduler::sla::solve::SolveCache::default());
     // λ refresh + sweep + persist run regardless of `hw_cost_source`
     // (the controller appends `interrupt_samples` even under Static).
+    // `inputs_gen` is derived from the table at poll time — pollers
+    // just write; nobody bumps.
     rio_common::task::spawn_monitored(
         "sla-interrupt-housekeeping",
         rio_scheduler::sla::cost::interrupt_housekeeping(
             SchedulerDb::new(pool.clone()),
             leader.clone(),
             std::sync::Arc::clone(&cost_table),
-            std::sync::Arc::clone(&solve_cache),
             shutdown.clone(),
         ),
     );
@@ -203,7 +199,6 @@ async fn main() -> anyhow::Result<()> {
                 SchedulerDb::new(pool.clone()),
                 leader.clone(),
                 std::sync::Arc::clone(&cost_table),
-                std::sync::Arc::clone(&solve_cache),
                 shutdown.clone(),
             ),
         );
@@ -232,7 +227,6 @@ async fn main() -> anyhow::Result<()> {
             service_signer: service_signer.map(Arc::new),
             leader: leader.clone(),
             cost_table,
-            solve_cache,
             shutdown: shutdown.clone(),
         },
     );

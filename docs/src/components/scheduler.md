@@ -772,8 +772,10 @@ pins `h_explore ~ Unif(H\A)` (or `H\{argmin_H price}` on cache-miss
 or A=H), restricts the solve to `(h_explore,*)`, and emits
 `A' ⊆ {h_explore}×{spot,od}`. The draw is OUTSIDE the memoization and
 deterministic in `(drv_hash, inputs_gen)` — stable across controller
-polls, re-rolled on `inputs_gen` bump. The cached A is never
-overwritten by an exploration result.
+polls, re-rolled when `inputs_gen` changes. `inputs_gen` is derived
+from the `(HwTable, CostTable)` solve-relevant projection at poll
+time; no caller bumps. The cached A is never overwritten by an
+exploration result.
 
 r[sched.sla.hw-class.ice-mask]
 ICE state is a read-time mask: the memo holds the full-H solve and is

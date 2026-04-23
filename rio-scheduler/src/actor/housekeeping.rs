@@ -70,8 +70,8 @@ impl DagActor {
     /// handle_tick so the every-tick housekeeping stays readable.
     ///
     /// `pub(super)` for the `sla_contract` actor-boundary tests, which
-    /// drive this directly to assert the `hw_changed` →
-    /// `bump_inputs_gen` gate without going through `handle_tick`'s
+    /// drive this directly to assert the derived-`inputs_gen` stability
+    /// across no-op refreshes without going through `handle_tick`'s
     /// leader check and orphan-cancel side-effects.
     pub(super) async fn maybe_refresh_estimator(&mut self) {
         self.tick_count = self.tick_count.wrapping_add(1);
@@ -94,27 +94,16 @@ impl DagActor {
         // (pname, system, tenant) keys. Log-and-keep-stale on PG
         // failure; the cache holds the previous fit. The tier ladder
         // feeds the Schmitt-trigger reassignment inside refit.
-        // `on_evict` propagates LRU eviction to `solve_cache` so the
-        // memo's bound (|live keys| × |overrides|) actually holds.
-        let solve_cache = Arc::clone(&self.solve_cache);
+        // `on_evict` is the shared `on_fit_evicted` so the memo's
+        // bound (|live keys| × |overrides|) actually holds. ADR-023
+        // L616: `HwTable` is a shared solve input; `inputs_gen` is
+        // derived from it at poll time — nobody bumps.
         match self
             .sla_estimator
-            .refresh(&self.db, &self.sla_tiers, |k| {
-                solve_cache.remove_model_key(crate::sla::solve::model_key_hash(k))
-            })
+            .refresh(&self.db, &self.sla_tiers, |k| self.on_fit_evicted(k))
             .await
         {
-            Ok((n, hw_changed)) => {
-                debug!(keys_refit = n, hw_changed, "sla estimator refreshed");
-                // ADR-023 L616: HwTable is a shared solve input. Bump on
-                // CONTENT change only — an unconditional bump re-rolls
-                // ε_h every 60s (selector-drift reap before Karpenter
-                // provisions). CostTable bumps live in
-                // `spot_price_poller` / `interrupt_housekeeping`.
-                if hw_changed {
-                    self.solve_cache.bump_inputs_gen();
-                }
-            }
+            Ok(n) => debug!(keys_refit = n, "sla estimator refreshed"),
             Err(e) => {
                 warn!(error = %e, "sla estimator refresh failed; keeping previous fits");
             }

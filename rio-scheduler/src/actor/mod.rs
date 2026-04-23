@@ -309,10 +309,10 @@ pub struct DagActor {
     /// Per-key admissible-set memo. Keyed on `(model_key_hash,
     /// override_hash)`; `(inputs_gen, fit_content_hash)` are staleness
     /// fields, so most `compute_spawn_intents` ticks are pure cache
-    /// hits (ADR-023 L616). `bump_inputs_gen()` callers:
-    /// `maybe_refresh_estimator` (iff `HwTable` content-hash changed),
-    /// `spot_price_poller` (after `CostTable` price fold),
-    /// `interrupt_housekeeping` (after λ refresh, iff new rows).
+    /// hits (ADR-023 L616). `inputs_gen` is **derived** from the
+    /// `(HwTable, CostTable)` solve-relevant projection at poll time
+    /// via [`crate::sla::solve::SolveInputs::inputs_gen`] — nobody bumps; the
+    /// pollers just write to the tables.
     pub(crate) solve_cache: Arc<crate::sla::solve::SolveCache>,
     /// Tick counter for periodic tasks that run less often than every
     /// Tick (e.g., estimator refresh every ~60s with a 10s tick interval).
@@ -537,7 +537,7 @@ impl DagActor {
             cost_table: plumbing.cost_table,
             ice: Arc::new(crate::sla::cost::IceBackoff::new(max_lead_time)),
             dispatched_cells: dashmap::DashMap::new(),
-            solve_cache: plumbing.solve_cache,
+            solve_cache: Arc::default(),
             tick_count: 0,
             backpressure_active: Arc::new(AtomicBool::new(false)),
             leader: plumbing.leader,

@@ -944,7 +944,7 @@ async fn solve_intent_for_clamps_at_resource_floor() {
     // returns probe-default (typically a few GiB) — the clamp raises both.
     actor.test_inject_ready_with_floor("a", "x86_64-linux", 32 << 30, 50 << 30);
     let state = actor.dag.node("a").unwrap();
-    let intent = actor.solve_intent_for(state);
+    let intent = solve_intent(&actor, state);
     assert!(
         intent.mem_bytes >= 32 << 30,
         "D4: solve_intent_for clamps mem at floor (got {})",
@@ -959,7 +959,7 @@ async fn solve_intent_for_clamps_at_resource_floor() {
     // floor=zero (cold start) → solve returns its own value unchanged.
     actor.test_inject_ready_with_floor("b", "x86_64-linux", 0, 0);
     let state = actor.dag.node("b").unwrap();
-    let intent_b = actor.solve_intent_for(state);
+    let intent_b = solve_intent(&actor, state);
     assert!(intent_b.mem_bytes < 32 << 30, "control: floor=0 → no clamp");
 }
 
@@ -1015,7 +1015,7 @@ async fn solve_intent_for_clamps_at_ceil() {
     });
     actor.test_inject_ready("d", Some("big"), "x86_64-linux", false);
     actor.dag.node_mut("d").unwrap().enable_parallel_building = Some(false);
-    let intent = actor.solve_intent_for(actor.dag.node("d").unwrap());
+    let intent = solve_intent(&actor, actor.dag.node("d").unwrap());
     assert!(
         intent.disk_bytes <= max_disk,
         "serial branch: disk {} clamped to max_disk {}",
@@ -1032,7 +1032,7 @@ async fn solve_intent_for_clamps_at_ceil() {
             mem_bytes: Some((max_mem + (64 << 30)) as i64),
             ..Default::default()
         }]);
-    let intent = actor.solve_intent_for(actor.dag.node("d").unwrap());
+    let intent = solve_intent(&actor, actor.dag.node("d").unwrap());
     assert!(
         intent.mem_bytes <= max_mem,
         "forced_mem overlay: mem {} clamped to max_mem {}",
@@ -1052,7 +1052,7 @@ async fn solve_intent_for_clamps_at_ceil() {
             cores: Some(f64::from(max_cores) + 50.0),
             ..Default::default()
         }]);
-    let intent = actor.solve_intent_for(actor.dag.node("d").unwrap());
+    let intent = solve_intent(&actor, actor.dag.node("d").unwrap());
     assert!(
         intent.cores <= max_cores,
         "forced_cores override: cores {} clamped to max_cores {}",
@@ -1097,7 +1097,7 @@ async fn solve_intent_for_clamps_at_ceil() {
         is_fod: false,
     });
     actor.test_inject_ready("w", Some("wide"), "x86_64-linux", false);
-    let intent = actor.solve_intent_for(actor.dag.node("w").unwrap());
+    let intent = solve_intent(&actor, actor.dag.node("w").unwrap());
     assert!(
         intent.cores <= max_cores,
         "explore-frozen st.max_c: cores {} clamped to max_cores {}",
@@ -1150,7 +1150,7 @@ async fn solve_intent_for_probe_fit_uses_probe_deadline() {
         is_fod: false,
     });
     actor.test_inject_ready("p", Some("exploring"), "x86_64-linux", false);
-    let intent = actor.solve_intent_for(actor.dag.node("p").unwrap());
+    let intent = solve_intent(&actor, actor.dag.node("p").unwrap());
     assert_eq!(
         intent.deadline_secs, 3600,
         "Probe fit → probe.deadline_secs, not 86400 (∞→u32::MAX→cap)"
@@ -1209,7 +1209,7 @@ async fn solve_intent_for_subsecond_fit_floored_at_probe_deadline() {
         is_fod: false,
     });
     actor.test_inject_ready("t", Some("trivial"), "x86_64-linux", false);
-    let intent = actor.solve_intent_for(actor.dag.node("t").unwrap());
+    let intent = solve_intent(&actor, actor.dag.node("t").unwrap());
     assert_eq!(
         intent.deadline_secs, 3600,
         "sub-second fit floored at probe.deadline_secs (got {})",
@@ -1244,7 +1244,7 @@ async fn solve_intent_for_feature_probe_deadline() {
         },
     );
     actor.test_inject_ready_with_features("k", Some("vm-test"), "x86_64-linux", &["kvm"]);
-    let intent = actor.solve_intent_for(actor.dag.node("k").unwrap());
+    let intent = solve_intent(&actor, actor.dag.node("k").unwrap());
     assert_eq!(
         intent.deadline_secs, 7200,
         "feature_probes.kvm.deadline_secs (not the default probe's 3600)"

@@ -86,10 +86,10 @@ async fn contract_selector_stability() -> TestResult {
     actor.sla_config.hw_explore_epsilon = 0.2;
     seed_fit(&actor, "test-pkg");
 
-    // Warm-up: first refresh loads PG → hw table populated. Bumps once
-    // (empty→populated is a content change); capture g0 AFTER.
+    // Warm-up: first refresh loads PG → hw table populated.
+    // empty→populated is a solve-relevant change; capture g0 AFTER.
     refresh_cycle(&mut actor).await;
-    let g0 = actor.solve_cache.inputs_gen();
+    let g0 = actor.solve_inputs().2;
 
     for i in 0..10 {
         actor.test_inject_ready(&format!("d{i}"), Some("test-pkg"), "x86_64-linux", false);
@@ -111,17 +111,17 @@ async fn contract_selector_stability() -> TestResult {
         );
     }
     assert_eq!(
-        actor.solve_cache.inputs_gen(),
+        actor.solve_inputs().2,
         g0,
         "compute_spawn_intents is read-only on inputs_gen"
     );
 
-    // ── (1b) no-op refresh → hw_changed=false → no bump → still same ──
+    // ── (1b) no-op refresh → solve_relevant_hash same → still g0 ──────
     refresh_cycle(&mut actor).await;
     assert_eq!(
-        actor.solve_cache.inputs_gen(),
+        actor.solve_inputs().2,
         g0,
-        "no-op maybe_refresh_estimator must NOT bump inputs_gen (hw_changed gate)"
+        "no-op maybe_refresh_estimator must NOT change derived inputs_gen"
     );
     let after_noop = affinity_map(&actor);
     assert_eq!(
@@ -129,24 +129,73 @@ async fn contract_selector_stability() -> TestResult {
         "selectors stable across no-op refresh — the controller sees the same fingerprint"
     );
 
-    // ── (1c) hw_perf row inserted → hw_changed=true → bump ────────────
+    // ── (1c) cross 2→3 trust threshold → trust bool flips → ≠ g0 ──────
+    // intel-9 starts at 2 pods (untrusted); +1 row crosses HW_MIN_PODS.
+    // Factor stays [1.0;K] (1 tenant < FLEET_MEDIAN_MIN_TENANTS), but
+    // `pod_ids >= HW_MIN_PODS` flips false→true — solve-relevant.
+    for p in 0..2 {
+        sqlx::query(
+            "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) \
+             VALUES ('intel-9', $1, '{\"alu\":1.0}')",
+        )
+        .bind(format!("pod-intel-9-{p}"))
+        .execute(&db.pool)
+        .await?;
+    }
+    refresh_cycle(&mut actor).await;
+    assert_eq!(
+        actor.solve_inputs().2,
+        g0,
+        "intel-9 at 2 pods: untrusted → bool stays false → unchanged"
+    );
     sqlx::query(
         "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) \
-         VALUES ('intel-7', 'pod-new', '{\"alu\":1.4}')",
+         VALUES ('intel-9', 'pod-intel-9-2', '{\"alu\":1.0}')",
+    )
+    .execute(&db.pool)
+    .await?;
+    refresh_cycle(&mut actor).await;
+    let g1 = actor.solve_inputs().2;
+    assert_ne!(
+        g1, g0,
+        "2→3 crosses HW_MIN_PODS → trust bool flips → derived inputs_gen changes"
+    );
+    let at_g1 = affinity_map(&actor);
+    assert_eq!(affinity_map(&actor), at_g1, "deterministic at new gen");
+
+    // ── (1d) pod_ids 3→4 within trusted, factor unchanged → UNCHANGED ──
+    // merged_bug_011: old `content_hash` hashed raw `pod_ids`; this
+    // would have changed g1 every 60s in steady state.
+    sqlx::query(
+        "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) \
+         VALUES ('intel-7', 'pod-intel-7-3', '{\"alu\":1.0}')",
     )
     .execute(&db.pool)
     .await?;
     refresh_cycle(&mut actor).await;
     assert_eq!(
-        actor.solve_cache.inputs_gen(),
-        g0 + 1,
-        "hw_perf content change → inputs_gen bumped exactly once"
+        actor.solve_inputs().2,
+        g1,
+        "pod_ids 3→4, trust bool stays true, factor unchanged → inputs_gen UNCHANGED"
     );
-    // Selectors MAY differ at the new generation (don't assert they do
-    // — ε_h re-roll is permitted, not required), but the new generation
-    // is itself deterministic.
-    let at_g1 = affinity_map(&actor);
-    assert_eq!(affinity_map(&actor), at_g1, "deterministic at new gen");
+    assert_eq!(
+        affinity_map(&actor),
+        at_g1,
+        "selectors unchanged — no ε_h re-roll on pod_ids monotone bump"
+    );
+
+    // ── (1e) stale_clamp flip → CostTable solve-relevant → ≠ g1 ───────
+    // bug_026: `apply_stale_clamp` flipped without bump; derived
+    // inputs_gen reflects it with no caller action.
+    actor
+        .cost_table
+        .write()
+        .apply_stale_clamp(crate::sla::cost::STALE_CLAMP_AFTER_SECS + 1.0);
+    let g2 = actor.solve_inputs().2;
+    assert_ne!(
+        g2, g1,
+        "stale_clamp false→true → derived inputs_gen changes"
+    );
     Ok(())
 }
 
@@ -164,7 +213,6 @@ async fn contract_selector_stability() -> TestResult {
 // r[verify sched.sla.hw-class.admissible-set]
 #[tokio::test]
 async fn contract_solve_cache_bounded_by_live_fits() {
-    use crate::sla::solve::model_key_hash;
     const CAP: usize = 5;
     const CHURN: usize = 20;
 
@@ -188,16 +236,15 @@ async fn contract_solve_cache_bounded_by_live_fits() {
         .sla_estimator
         .seed_hw(crate::sla::hw::HwTable::from_map(m));
 
-    // Churn fits via the SAME `on_evict` closure as
-    // `maybe_refresh_estimator` (housekeeping.rs) — `seed()` is a
-    // no-op on_evict, which is exactly the r2 bug shape.
-    let solve_cache = std::sync::Arc::clone(&actor.solve_cache);
+    // Churn fits via the shared `on_fit_evicted` (same body
+    // `maybe_refresh_estimator` + `SlaEvict` use). `seed()` is a no-op
+    // on_evict, which is exactly the r2 bug shape.
     for i in 0..CHURN {
         let pname = format!("pkg{i}");
         let fit = make_fit(&pname);
-        actor.sla_estimator.insert(&fit.key.clone(), fit, |k| {
-            solve_cache.remove_model_key(model_key_hash(k))
-        });
+        actor
+            .sla_estimator
+            .insert(&fit.key.clone(), fit, |k| actor.on_fit_evicted(k));
         actor.test_inject_ready(&format!("d{i}"), Some(&pname), "x86_64-linux", false);
     }
 
@@ -214,6 +261,23 @@ async fn contract_solve_cache_bounded_by_live_fits() {
         "solve_cache.len()={} > live_fit_count()={} — on_evict hook not propagating",
         actor.solve_cache.len(),
         live
+    );
+
+    // bug_024: explicit `SlaEvict` (operator `rio-cli sla reset`)
+    // propagates via the SAME `on_fit_evicted` — orphaned Schmitt
+    // `prev_a` would otherwise survive reset. Evict every live key;
+    // solve_cache must drain to 0.
+    let before = actor.solve_cache.len();
+    assert!(before > 0, "precondition: memo populated");
+    for i in (CHURN - CAP)..CHURN {
+        let key = make_fit(&format!("pkg{i}")).key;
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        actor.handle_admin(crate::actor::command::AdminQuery::SlaEvict { key, reply: tx });
+    }
+    assert_eq!(
+        actor.solve_cache.len(),
+        0,
+        "SlaEvict must propagate via on_fit_evicted — memo drains"
     );
 }
 

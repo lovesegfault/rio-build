@@ -568,12 +568,10 @@ impl SlaEstimator {
 
     /// Pull samples completed since the last tick, refit each touched
     /// key from its `ring_buffer` most-recent rows, swap into the cache.
-    /// Returns `(n_refit, hw_table_changed)`: `hw_table_changed` is true
-    /// iff the [`hw::HwTable`] reload produced a content-hash different
-    /// from the previous snapshot — caller bumps
-    /// [`solve::SolveCache::bump_inputs_gen`] only then (an
-    /// unconditional bump re-rolls ε_h every 60s, so explore Jobs are
-    /// reaped before Karpenter provisions).
+    /// Returns the number of keys refit. The [`hw::HwTable`] reload's
+    /// effect on `inputs_gen` is **derived** at poll time via
+    /// [`solve::SolveInputs::inputs_gen`] — nobody bumps; this function just
+    /// writes to the table.
     ///
     /// The incremental query and the per-key reads are separate round-
     /// trips: incremental tells us *which* keys moved (cheap, indexed
@@ -591,7 +589,7 @@ impl SlaEstimator {
         db: &SchedulerDb,
         tiers: &[solve::Tier],
         on_evict: impl Fn(&types::ModelKey),
-    ) -> anyhow::Result<(usize, bool)> {
+    ) -> anyhow::Result<usize> {
         // Override snapshot first: cheap (operator-written, tens of
         // rows) and independent of the sample refit, so a PG blip on
         // the heavier incremental query below still leaves the override
@@ -604,13 +602,11 @@ impl SlaEstimator {
         // Hw factor table: same cheap-and-independent treatment as
         // overrides (a few dozen rows from a view). Failure → keep
         // previous; an empty table is factor=1.0 everywhere.
-        let hw_before = self.hw.read().content_hash();
         match hw::HwTable::load(db).await {
             Ok(t) => self.apply_hw(t),
             Err(e) => tracing::warn!(error = %e, "sla hw-table refresh failed; keeping previous"),
         }
         let hw_snapshot = self.hw.read().clone();
-        let hw_changed = hw_snapshot.content_hash() != hw_before;
         let priors_snapshot = self.priors.read().clone();
 
         let since = *self.last_tick.read();
@@ -789,7 +785,7 @@ impl SlaEstimator {
         self.priors.write().fleet =
             prior::fleet_median(&coupled, FLEET_MEDIAN_MIN_KEYS, FLEET_MEDIAN_MIN_TENANTS);
 
-        Ok((touched.len(), hw_changed))
+        Ok(touched.len())
     }
 }
 
