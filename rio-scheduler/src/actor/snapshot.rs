@@ -77,7 +77,7 @@ fn passes_intent_filter(
 /// to the scheduler until the builder reports it on completion). The
 /// ref↔wall skew (factor ∈ [0.7, 1.4] across hw classes) is the
 /// `eta_error` term the §13b lead-time DDSketch closed-loop absorbs;
-/// for §13a the controller filters `eta_seconds > 0` so only the
+/// for §13a the controller filters on `ready` so only the
 /// `eta < max_lead` gate is sensitive to it.
 ///
 /// `Assigned` (dispatched, not yet acked → no `running_since`) is
@@ -445,7 +445,7 @@ impl DagActor {
         // `lead_time_seed[h,cap]` — the controller-side DDSketch (B7)
         // isn't running yet (ADR L675). Empty seed map ⇒ max_lead=0 ⇒
         // pass disabled (every eta ≥ 0 fails the gate; controller
-        // filters `eta_seconds > 0` regardless).
+        // filters on `ready` regardless).
         let max_lead = self
             .sla_config
             .lead_time_seed
@@ -512,9 +512,12 @@ impl DagActor {
         // low-priority work (large→small can't overflow; small→large
         // can). With forecast intents tail-sorted, a `[..headroom]`
         // truncation drops forecast first — Ready pods matter more.
+        // Keys on `ready` (not `eta_seconds == 0.0`): a forecast
+        // intent with overdue deps clamps to eta=0.0 but is NOT Ready
+        // (bug_030).
         intents.sort_unstable_by(|(pa, ia), (pb, ib)| {
-            (ib.eta_seconds == 0.0, *pb)
-                .partial_cmp(&(ia.eta_seconds == 0.0, *pa))
+            (ib.ready, *pb)
+                .partial_cmp(&(ia.ready, *pa))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 

@@ -50,10 +50,9 @@ use super::job::{
 use super::pod::{self, UpstreamAddrs};
 use crate::error::{Error, Result};
 use crate::reconcilers::admin_call;
-use crate::reconcilers::node_informer::HwClass;
 use crate::reconcilers::{Ctx, KubeErrorExt, require_namespace};
 use rio_crds::pool::{ExecutorKind, Pool};
-use rio_proto::types::{NodeSelectorTerm, SpawnIntent};
+use rio_proto::types::SpawnIntent;
 
 /// Pod-template annotation carrying `SpawnIntent.intent_id`. Read by
 /// the builder via downward-API → `RIO_INTENT_ID` → heartbeat.
@@ -108,14 +107,17 @@ pub(super) fn ephemeral_deadline(intent: &SpawnIntent) -> i64 {
     i64::from(intent.deadline_secs).max(180)
 }
 
-/// `hw_class` strings the `HwClassSampled` RPC keys on, recovered from
-/// one intent's allowed-set `A`. Each term encodes one `(h, cap)` cell;
-/// the same `h` may appear under both spot and on-demand —
-/// [`HwSampledCache::fetch`] dedupes across the whole tick.
-pub(super) fn hw_classes_in(terms: &[NodeSelectorTerm]) -> impl Iterator<Item = String> + '_ {
-    terms
-        .iter()
-        .map(|t| HwClass::from_selector_term(t).as_string())
+/// `hw_class` strings the `HwClassSampled` RPC keys on for one
+/// intent's allowed-set `A`. The scheduler emits `hw_class_names[i]`
+/// alongside `node_affinity[i]` (one `$h` per `(h, cap)` cell), so
+/// this is a straight read — no label-reconstruction (bug_061: the
+/// previous `HwClass::from_selector_term` reverse-engineered `$h` from
+/// a hardcoded 4-label tuple, which was wrong for any operator whose
+/// `[sla.hw_classes.$h].labels` schema differed). The same `h` may
+/// appear under both spot and on-demand — [`HwSampledCache::fetch`]
+/// dedupes across the whole tick.
+pub(super) fn hw_classes_in(intent: &SpawnIntent) -> impl Iterator<Item = String> + '_ {
+    intent.hw_class_names.iter().cloned()
 }
 
 /// Per-tick `HwClassSampled` snapshot: `h → distinct pod_id` from the
@@ -214,27 +216,23 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                 (Vec::new(), Some(e.to_string()))
             }
         };
-    // ADR-023 §13a ship-standalone gate: forecast intents (`eta > 0` —
+    // ADR-023 §13a ship-standalone gate: forecast intents (`!ready` —
     // deps not yet built) flow through `GetSpawnIntents` so the §13b
     // `nodeclaim_pool` reconciler can pre-provision, but until that
     // reconciler exists they MUST NOT spawn Jobs (the pod would
     // heartbeat, get no assignment for `eta_seconds`, then idle-exit).
     // Filtered here so `queued`/reap/ack all see one consistent set.
     // §13b removes this — `placeable` from the NodeClaim FFD sim
-    // becomes the gate instead.
-    intents.retain(|i| i.eta_seconds == 0.0);
+    // becomes the gate instead. Keys on the explicit `ready` bit, NOT
+    // `eta_seconds == 0.0`: a forecast intent with overdue deps clamps
+    // to eta=0.0 and would otherwise pass as Ready (bug_030).
+    intents.retain(|i| i.ready);
     let queued = intents.len().min(u32::MAX as usize) as u32;
 
     // ---- HwClassSampled (per-tick, one RPC for the union of A's) ----
     // r[impl ctrl.pool.hw-bench-needed]
-    let hw_sampled = HwSampledCache::fetch(
-        ctx,
-        intents
-            .iter()
-            .flat_map(|i| hw_classes_in(&i.node_affinity))
-            .collect(),
-    )
-    .await;
+    let hw_sampled =
+        HwSampledCache::fetch(ctx, intents.iter().flat_map(hw_classes_in).collect()).await;
 
     // ---- Count active Jobs for this pool ----
     // ORDERING (I-183): list AFTER the queued poll. The reap step
@@ -682,7 +680,7 @@ pub(super) fn build_job(
     // kube-scheduler bind, so the create-time check is over the whole
     // `A` — over-benches at most until every `h ∈ A` reaches the floor.
     let bench_needed = intent.mem_bytes >= hw_bench_mem_floor
-        && hw_sampled.any_under_threshold(hw_classes_in(&intent.node_affinity));
+        && hw_sampled.any_under_threshold(hw_classes_in(intent));
     // Stamp `rio.build/intent-id` on the pod template so the builder
     // reads it via downward-API → `RIO_INTENT_ID` → heartbeat →
     // scheduler matches the pod to its pre-computed assignment.
@@ -987,7 +985,7 @@ mod tests {
     /// `spec.template`.
     #[test]
     fn build_job_stamps_selector_fingerprint() {
-        use rio_proto::types::NodeSelectorRequirement;
+        use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm};
         let term = |kv: &[(&str, &str)]| NodeSelectorTerm {
             match_expressions: kv
                 .iter()

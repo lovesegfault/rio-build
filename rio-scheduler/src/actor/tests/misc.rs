@@ -1552,9 +1552,11 @@ async fn forecast_frontier_one_layer_only() {
         !by_id.contains_key("d"),
         "d NOT forecast: dep e is Ready (not Running)"
     );
+    assert!(!b.ready, "forecast ⇒ ready=false");
     // e is Ready → emitted at eta=0 (the Ready loop, not forecast).
     assert_eq!(by_id["e"].eta_seconds, 0.0, "Ready ⇒ eta=0");
-    // Ready-before-forecast in the sort: e (eta=0) precedes b (eta>0)
+    assert!(by_id["e"].ready, "Ready loop ⇒ ready=true");
+    // Ready-before-forecast in the sort: e (ready) precedes b (forecast)
     // regardless of priority (both default 0 here).
     let pos_e = snap
         .intents
@@ -1639,8 +1641,8 @@ async fn forecast_tenant_ceiling_subtracts_ready_first() {
     }
 
     let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
-    let n_forecast = snap.intents.iter().filter(|i| i.eta_seconds > 0.0).count();
-    let n_ready = snap.intents.iter().filter(|i| i.eta_seconds == 0.0).count();
+    let n_forecast = snap.intents.iter().filter(|i| !i.ready).count();
+    let n_ready = snap.intents.iter().filter(|i| i.ready).count();
     assert_eq!(n_ready, 3, "Ready unaffected by ceiling");
     assert_eq!(
         n_forecast, 0,
@@ -1661,7 +1663,7 @@ async fn forecast_tenant_ceiling_subtracts_ready_first() {
         actor.test_set_running_eta(&dep, 50.0, 10, 4);
     }
     let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
-    let n_forecast = snap.intents.iter().filter(|i| i.eta_seconds > 0.0).count();
+    let n_forecast = snap.intents.iter().filter(|i| !i.ready).count();
     assert_eq!(
         n_forecast, 2,
         "budget 20−12=8 admits exactly 2×4-core forecast intents"
@@ -1684,10 +1686,69 @@ async fn forecast_disabled_on_empty_lead_time_seed() {
 
     let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
     assert!(
-        snap.intents.iter().all(|i| i.eta_seconds == 0.0),
+        snap.intents.iter().all(|i| i.ready),
         "no forecast when lead_time_seed empty"
     );
     assert!(!snap.intents.iter().any(|i| i.intent_id == "b"));
+}
+
+/// bug_030 regression: a forecast intent whose dep's
+/// `T(c) − elapsed` clamps to 0.0 (overdue) MUST still carry
+/// `ready=false` and sort AFTER Ready intents. The previous
+/// `eta_seconds == 0.0` discriminator collided with this case — the
+/// controller's §13a filter would spawn a Job for a Queued drv whose
+/// dep hasn't actually finished, and the scheduler's sort would
+/// interleave it with genuine Ready work.
+#[tokio::test]
+async fn forecast_overdue_dep_is_not_ready() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_forecast(db.pool.clone(), 200.0, 2_000);
+
+    // a: T=50, elapsed=80 → eta clamped to 0.0 (overdue). b depends
+    // on a → forecast with eta=0.0 but NOT Ready (a is still Running).
+    // r: genuinely Ready.
+    actor.test_inject_at("a", "x86_64-linux", DerivationStatus::Running);
+    actor.test_inject_at("b", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_edge("b", "a");
+    actor.test_set_running_eta("a", 50.0, 80, 4);
+    actor.test_inject_ready("r", None, "x86_64-linux", false);
+
+    let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
+    let by_id: std::collections::HashMap<_, _> = snap
+        .intents
+        .iter()
+        .map(|i| (i.intent_id.as_str(), i))
+        .collect();
+
+    let b = by_id.get("b").expect("b emitted as forecast");
+    assert!(
+        b.eta_seconds >= 0.0 && b.eta_seconds < 2.0,
+        "b.eta clamped to ~0.0 (overdue dep), got {}",
+        b.eta_seconds
+    );
+    assert!(
+        !b.ready,
+        "b.ready=false despite eta=0.0 — forecast loop, dep still Running"
+    );
+    assert!(by_id["r"].ready, "r genuinely Ready");
+
+    // Sort order: r (ready=true) precedes b (ready=false), even though
+    // both have eta_seconds==0.0. Under the old `eta == 0.0` comparator
+    // their relative order was priority-only (tie → HashMap-random).
+    let pos_r = snap
+        .intents
+        .iter()
+        .position(|i| i.intent_id == "r")
+        .unwrap();
+    let pos_b = snap
+        .intents
+        .iter()
+        .position(|i| i.intent_id == "b")
+        .unwrap();
+    assert!(
+        pos_r < pos_b,
+        "Ready sorts before forecast even when both eta=0.0"
+    );
 }
 
 /// End-to-end actor path: merge → Ready → intent shows up; dispatch →

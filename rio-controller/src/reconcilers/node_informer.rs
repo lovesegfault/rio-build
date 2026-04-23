@@ -3,8 +3,12 @@
 //! ADR-023 §Hardware heterogeneity: builders are air-gapped from the
 //! apiserver, so they report `spec.nodeName` (downward API) and the
 //! controller joins to Node labels server-side when ingesting build
-//! completion samples. `hw_class = "{manufacturer}-{generation}-
-//! {storage}-{band}"` from Karpenter-provisioned + rio.build labels.
+//! completion samples. `hw_class` is the operator's
+//! `[sla.hw_classes.$h]` key whose label conjunction matches the
+//! Node — fetched once via [`HwClassConfig::load`] (`GetHwClassConfig`
+//! RPC) so the controller stamps the SAME `$h` string the scheduler's
+//! `solve_intent_for` keys on, not a hardcoded 4-label reconstruction
+//! that breaks the moment an operator's label schema differs (bug_061).
 //!
 //! Node-gone-at-ingest → [`NodeLabelCache::hw_class_of`] returns
 //! `None` and the sample's `hw_class` stays NULL. This is expected
@@ -21,10 +25,10 @@
 //! # Why not `reflector::store()`
 //!
 //! The reflector store caches full `Node` objects (status, conditions,
-//! images list — kilobytes each). We need four label strings. A
-//! hand-rolled `HashMap<String, HwClass>` is the lightweight version.
+//! images list — kilobytes each). We need the labels map only. A
+//! hand-rolled `HashMap<String, NodeMeta>` is the lightweight version.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,50 +43,132 @@ use tracing::{debug, info, warn};
 use crate::reconcilers::{AdminClient, admin_call};
 
 /// Pod annotation the [`run_pod_annotator`] watcher stamps with the
-/// node's [`HwClass::as_string`]. Builder reads it via downward-API
-/// (`RIO_HW_CLASS`) to key its `hw_perf_samples` insert.
+/// node's matched `hw_class` (the operator's `[sla.hw_classes.$h]`
+/// key). Builder reads it via downward-API (`RIO_HW_CLASS`) to key its
+/// `hw_perf_samples` insert.
 pub const ANNOT_HW_CLASS: &str = "rio.build/hw-class";
 
-/// Karpenter-set: `aws`, `intel`, `amd`. Unknown if label absent
-/// (non-Karpenter node, or Karpenter < v0.33).
-const LABEL_MANUFACTURER: &str = "karpenter.k8s.aws/instance-cpu-manufacturer";
-/// Karpenter-set: instance generation number as string (`"7"` for
-/// c7/m7/r7, etc.).
-const LABEL_GENERATION: &str = "karpenter.k8s.aws/instance-generation";
-/// rio-set via EC2NodeClass `spec.tags` → Karpenter propagates to
-/// Node labels. `ebs` (gp3 root) or `nvme` (instance-store).
-const LABEL_STORAGE: &str = "rio.build/storage";
-/// rio-set via NodePool `template.metadata.labels` (helm
-/// `builderBands[].name`). `hi` / `mid` / `lo`. The scheduler keys its
-/// per-band cost solve on THIS, not on `instance-generation` — bands
-/// are non-disjoint by generation since helm `mid` spans `["6","7"]`.
-const LABEL_HW_BAND: &str = "rio.build/hw-band";
-
-/// `karpenter.sh/capacity-type` — `spot` or `on-demand`. Cached so the
-/// spot-interrupt watcher can skip on-demand nodes without re-fetching.
+/// `karpenter.sh/capacity-type` — `spot` or `on-demand`. Read from the
+/// cached labels so the spot-interrupt watcher can skip on-demand nodes
+/// without re-fetching.
 const LABEL_CAPACITY_TYPE: &str = "karpenter.sh/capacity-type";
 
-/// Labels that determine build-performance equivalence class +
-/// provisioning band. Formatted as
-/// `"{manufacturer}-{generation}-{storage}-{band}"` for the
-/// completion-sample `hw_class` column. `band` is the NodePool's
-/// `rio.build/hw-band` — carried explicitly because bands are
-/// non-disjoint by generation (helm `mid` admits gen 6+7), so the
-/// scheduler cannot recover band from the generation digit.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HwClass {
-    pub manufacturer: String,
-    pub generation: String,
-    pub storage: String,
-    pub band: String,
+/// Operator-configured hw-class definitions, fetched once via
+/// `GetHwClassConfig`. Shared (`Arc`) between [`NodeLabelCache`] and
+/// the [`load`](Self::load) task. The match is lazy
+/// ([`NodeLabelCache::hw_class_of`] etc. call [`Self::match_node`] on
+/// each lookup) so config arriving AFTER nodes are cached still
+/// resolves correctly, and a Static-mode deploy (`hw_classes = {}`)
+/// degrades to `hw_class = None` everywhere — annotator skips,
+/// λ-samples skip, same as the pre-§13a behavior.
+///
+/// Stored as a sorted `Vec` so [`Self::match_node`] is deterministic
+/// when a Node satisfies two overlapping conjunctions (lexicographic
+/// `$h` wins).
+#[derive(Clone, Default)]
+pub struct HwClassConfig(Arc<RwLock<Vec<HwClassDef>>>);
+
+/// One `[sla.hw_classes.$h]` entry: the `$h` name + its ANDed label
+/// conjunction.
+type HwClassDef = (String, Vec<(String, String)>);
+
+impl HwClassConfig {
+    /// First `$h` (lexicographic) whose every `(k, v)` is satisfied by
+    /// `labels`. `None` if no conjunction matches OR config is empty
+    /// (not yet loaded / Static-mode).
+    pub fn match_node(&self, labels: &BTreeMap<String, String>) -> Option<String> {
+        let cfg = self.0.read();
+        for (h, conj) in cfg.iter() {
+            if conj
+                .iter()
+                .all(|(k, v)| labels.get(k).is_some_and(|nv| nv == v))
+            {
+                // rio-store rejects hw_class > MAX_HW_CLASS_LEN. The
+                // operator's `$h` is the value written to
+                // `hw_perf_samples.hw_class`; a config change that
+                // exceeds the limit would silently break the builder's
+                // AppendHwPerfSample. Fail fast in tests.
+                debug_assert!(
+                    h.len() <= rio_common::limits::MAX_HW_CLASS_LEN,
+                    "hw_class {h:?} exceeds MAX_HW_CLASS_LEN"
+                );
+                return Some(h.clone());
+            }
+        }
+        None
+    }
+
+    /// Replace the config wholesale from a `GetHwClassConfigResponse`.
+    /// Sorted by `$h` for deterministic [`Self::match_node`] on overlap.
+    fn set(&self, hw_classes: HashMap<String, rio_proto::types::HwClassLabels>) {
+        let mut v: Vec<_> = hw_classes
+            .into_iter()
+            .map(|(h, def)| {
+                let conj = def.labels.into_iter().map(|l| (l.key, l.value)).collect();
+                (h, conj)
+            })
+            .collect();
+        v.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        *self.0.write() = v;
+    }
+
+    /// Fetch `GetHwClassConfig` with bounded backoff (5 attempts, 1→16s).
+    /// Returns once populated OR after the final attempt fails — callers
+    /// already hold a balanced channel from `connect_forever`, so the
+    /// scheduler is reachable; failures here are leader-election /
+    /// service-gate transients. Unpopulated → [`Self::match_node`]
+    /// returns `None` everywhere (degraded, not broken: annotator skips,
+    /// λ-samples skip, `hw-bench-needed` keys on `intent.hw_class_names`
+    /// which the scheduler populates independently).
+    pub async fn load(&self, admin: &mut AdminClient) {
+        let mut delay = Duration::from_secs(1);
+        for attempt in 1..=5 {
+            match admin_call(admin.get_hw_class_config(())).await {
+                Ok(r) => {
+                    let hw_classes = r.into_inner().hw_classes;
+                    info!(n = hw_classes.len(), "GetHwClassConfig loaded");
+                    self.set(hw_classes);
+                    return;
+                }
+                Err(e) => {
+                    warn!(attempt, error = %e, "GetHwClassConfig failed; retrying");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(16));
+                }
+            }
+        }
+        warn!(
+            "GetHwClassConfig: gave up after 5 attempts; hw_class will \
+             stay None until controller restart (annotator/λ degraded)"
+        );
+    }
+
+    /// Test-only constructor from `(h, [(k, v), …])` literals.
+    #[cfg(test)]
+    pub fn from_literals(defs: &[(&str, &[(&str, &str)])]) -> Self {
+        let mut v: Vec<_> = defs
+            .iter()
+            .map(|(h, conj)| {
+                let c = conj
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect();
+                ((*h).to_string(), c)
+            })
+            .collect();
+        v.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        Self(Arc::new(RwLock::new(v)))
+    }
 }
 
-/// Per-node cache value: `HwClass` + the bits the spot-interrupt
-/// watcher needs (capacity type, creation epoch for node-seconds).
+/// Per-node cache value: full label map (matched lazily against
+/// [`HwClassConfig`]) + the spot-exposure cursor.
 #[derive(Debug, Clone)]
 struct NodeMeta {
-    hw: HwClass,
-    capacity_type: Option<String>,
+    /// All Node labels. [`HwClassConfig::match_node`] reads these on
+    /// each lookup — config arriving after the node was cached still
+    /// resolves. `capacity_type` is `labels.get(LABEL_CAPACITY_TYPE)`.
+    labels: BTreeMap<String, String>,
     /// Epoch of the last exposure flush for this node (initialised to
     /// `metadata.creationTimestamp` on first sight). [`NodeLabelCache::spot_exposure`]
     /// and [`NodeLabelCache::drain_live_spot_exposure`] return the
@@ -91,90 +177,49 @@ struct NodeMeta {
     last_exposure_at: Option<f64>,
 }
 
-impl HwClass {
-    /// `"{manufacturer}-{generation}-{storage}-{band}"`, e.g.
-    /// `"aws-7-ebs-mid"`.
-    pub fn as_string(&self) -> String {
-        let s = format!(
-            "{}-{}-{}-{}",
-            self.manufacturer, self.generation, self.storage, self.band
-        );
-        // rio-store rejects hw_class > MAX_HW_CLASS_LEN. Segments come
-        // from node labels (controller-stamped); a future change that
-        // produces longer strings would silently break the builder's
-        // AppendHwPerfSample. Fail fast in tests.
-        debug_assert!(
-            s.len() <= rio_common::limits::MAX_HW_CLASS_LEN,
-            "hw_class {s:?} exceeds MAX_HW_CLASS_LEN"
-        );
-        s
-    }
-
-    /// Extract from a Node's labels. Missing labels default to
-    /// `"unknown"` (manufacturer/generation/band) or `"ebs"` (storage —
-    /// the conservative default; nvme is opt-in via EC2NodeClass).
-    fn from_node(node: &Node) -> Self {
-        let labels = node.metadata.labels.as_ref();
-        let get = |k: &str| labels.and_then(|l| l.get(k)).cloned();
-        Self {
-            manufacturer: get(LABEL_MANUFACTURER).unwrap_or_else(|| "unknown".into()),
-            generation: get(LABEL_GENERATION).unwrap_or_else(|| "unknown".into()),
-            storage: get(LABEL_STORAGE).unwrap_or_else(|| "ebs".into()),
-            band: get(LABEL_HW_BAND).unwrap_or_else(|| "unknown".into()),
-        }
-    }
-
-    /// Recover the `hw_class` string from one `SpawnIntent.node_affinity`
-    /// term. The scheduler's `cells_to_selector_terms` emits each `(h,
-    /// cap)` cell as the operator-configured `[sla.hw_classes.$h].labels`
-    /// conjunction + `karpenter.sh/capacity-type`. For the
-    /// `HwClassSampled` gate to be useful, those configured labels MUST
-    /// be the same {manufacturer, generation, storage, band} tuple
-    /// `Self::from_node` reads — otherwise the controller's
-    /// reconstructed string here would not match what the builder writes
-    /// to `hw_perf_samples.hw_class` and the `<3` check would query a
-    /// non-existent key. The coupling is enforced by helm rendering both
-    /// from the same `builderBands`/`hwClasses` block.
-    ///
-    /// Missing labels default identically to `Self::from_node` so a
-    /// term targeting only a subset (e.g. no `rio.build/storage` key →
-    /// pod free to land on either) reconstructs the same string the
-    /// `from_node` post-bind path will produce on the `ebs` half. The
-    /// `<3` check is conservative under this collapse — a missing
-    /// dimension over-benches, never under-benches.
-    pub fn from_selector_term(term: &rio_proto::types::NodeSelectorTerm) -> Self {
-        let get = |k: &str| {
-            term.match_expressions
-                .iter()
-                .find(|r| r.key == k && r.operator == "In")
-                .and_then(|r| r.values.first())
-                .cloned()
-        };
-        Self {
-            manufacturer: get(LABEL_MANUFACTURER).unwrap_or_else(|| "unknown".into()),
-            generation: get(LABEL_GENERATION).unwrap_or_else(|| "unknown".into()),
-            storage: get(LABEL_STORAGE).unwrap_or_else(|| "ebs".into()),
-            band: get(LABEL_HW_BAND).unwrap_or_else(|| "unknown".into()),
-        }
+impl NodeMeta {
+    fn is_spot(&self) -> bool {
+        self.labels.get(LABEL_CAPACITY_TYPE).map(String::as_str) == Some("spot")
     }
 }
 
-/// Node-name → `HwClass` cache. Cheap to clone (`Arc`); share one
-/// instance between the informer task and consumers.
+/// Node-name → labels cache + the [`HwClassConfig`] those labels are
+/// matched against. Cheap to clone (`Arc` × 2); share one instance
+/// between the informer task and consumers.
 #[derive(Clone, Default)]
-pub struct NodeLabelCache(Arc<RwLock<HashMap<String, NodeMeta>>>);
+pub struct NodeLabelCache {
+    nodes: Arc<RwLock<HashMap<String, NodeMeta>>>,
+    config: HwClassConfig,
+}
 
 impl NodeLabelCache {
-    /// Formatted `hw_class` string for `node_name`, or `None` if the
-    /// node is not (or no longer) in the cache.
+    /// Construct with a pre-populated [`HwClassConfig`]. `main.rs`
+    /// loads the config once (retry-backoff) before spawning the
+    /// informer/annotator tasks so the first watch relist already
+    /// resolves correctly; lazy match means a late-loading config
+    /// would also work, but loading-first avoids a window of
+    /// `hw_class = None` λ-samples on cold start.
+    pub fn with_config(config: HwClassConfig) -> Self {
+        Self {
+            nodes: Default::default(),
+            config,
+        }
+    }
+
+    /// Operator's `[sla.hw_classes.$h]` key matching `node_name`'s
+    /// labels, or `None` if the node is not (or no longer) cached, no
+    /// `$h` matches, or config is empty (Static-mode / not yet loaded).
     pub fn hw_class_of(&self, node_name: &str) -> Option<String> {
-        self.0.read().get(node_name).map(|m| m.hw.as_string())
+        let g = self.nodes.read();
+        self.config.match_node(&g.get(node_name)?.labels)
     }
 
     /// `Some((hw_class, node_seconds_since_last_flush))` for
-    /// `node_name` IF it's a spot node with a creation timestamp.
-    /// Feeds the exposure half of λ\[h\] — on-demand nodes contribute
-    /// neither numerator nor denominator (their λ is 0 by definition).
+    /// `node_name` IF it's a spot node with a creation timestamp AND
+    /// matches a configured `$h`. Feeds the exposure half of λ\[h\] —
+    /// on-demand nodes contribute neither numerator nor denominator
+    /// (their λ is 0 by definition); unmatched nodes (Static-mode,
+    /// non-builder NodePool) have no `$h` to key on.
     ///
     /// Returns the slice since the last
     /// [`Self::drain_live_spot_exposure`] (or since creation if never
@@ -182,13 +227,14 @@ impl NodeLabelCache {
     /// not the full lifetime — the periodic flush has already banked
     /// the rest.
     pub fn spot_exposure(&self, node_name: &str, now_epoch: f64) -> Option<(String, f64)> {
-        let g = self.0.read();
+        let g = self.nodes.read();
         let m = g.get(node_name)?;
-        if m.capacity_type.as_deref() != Some("spot") {
+        if !m.is_spot() {
             return None;
         }
+        let hw = self.config.match_node(&m.labels)?;
         let secs = (now_epoch - m.last_exposure_at?).max(0.0);
-        Some((m.hw.as_string(), secs))
+        Some((hw, secs))
     }
 
     /// For every live spot node, sum `now - last_exposure_at` per
@@ -206,9 +252,9 @@ impl NodeLabelCache {
     /// bias direction this fix exists to eliminate.
     pub fn drain_live_spot_exposure(&self, now_epoch: f64) -> Vec<(String, f64)> {
         let mut by_hw: HashMap<String, f64> = HashMap::new();
-        let mut g = self.0.write();
+        let mut g = self.nodes.write();
         for m in g.values_mut() {
-            if m.capacity_type.as_deref() != Some("spot") {
+            if !m.is_spot() {
                 continue;
             }
             let Some(last) = m.last_exposure_at else {
@@ -216,8 +262,10 @@ impl NodeLabelCache {
             };
             let secs = (now_epoch - last).max(0.0);
             m.last_exposure_at = Some(now_epoch);
-            if secs > 0.0 {
-                *by_hw.entry(m.hw.as_string()).or_default() += secs;
+            if secs > 0.0
+                && let Some(hw) = self.config.match_node(&m.labels)
+            {
+                *by_hw.entry(hw).or_default() += secs;
             }
         }
         by_hw.into_iter().collect()
@@ -243,14 +291,16 @@ impl NodeLabelCache {
         // exposure sums into λ's denominator, so aggregation is
         // lossless (bug_057).
         let mut by_hw: HashMap<String, f64> = HashMap::new();
-        self.0.write().retain(|name, m| {
+        let config = &self.config;
+        self.nodes.write().retain(|name, m| {
             if seen.contains(name) {
                 return true;
             }
-            if m.capacity_type.as_deref() == Some("spot")
+            if m.is_spot()
                 && let Some(last) = m.last_exposure_at
+                && let Some(hw) = config.match_node(&m.labels)
             {
-                *by_hw.entry(m.hw.as_string()).or_default() += (now_epoch - last).max(0.0);
+                *by_hw.entry(hw).or_default() += (now_epoch - last).max(0.0);
             }
             false
         });
@@ -260,25 +310,24 @@ impl NodeLabelCache {
     /// Current cache size. For the `rio_controller_node_cache_size`
     /// gauge and tests.
     pub fn len(&self) -> usize {
-        self.0.read().len()
+        self.nodes.read().len()
     }
 
     /// `len() == 0`. Clippy `len_without_is_empty`.
     pub fn is_empty(&self) -> bool {
-        self.0.read().is_empty()
+        self.nodes.read().is_empty()
     }
 
     fn apply(&self, node: &Node) {
         let Some(name) = node.metadata.name.clone() else {
             return;
         };
-        let labels = node.metadata.labels.as_ref();
         let created_at = node
             .metadata
             .creation_timestamp
             .as_ref()
             .map(|t| t.0.as_second() as f64);
-        let mut g = self.0.write();
+        let mut g = self.nodes.write();
         // Preserve last_exposure_at across re-apply (watch relist,
         // label-change Modify) so the periodic flush doesn't re-count
         // the already-banked slice. New entry → seed from created_at.
@@ -286,8 +335,7 @@ impl NodeLabelCache {
         g.insert(
             name,
             NodeMeta {
-                hw: HwClass::from_node(node),
-                capacity_type: labels.and_then(|l| l.get(LABEL_CAPACITY_TYPE)).cloned(),
+                labels: node.metadata.labels.clone().unwrap_or_default(),
                 last_exposure_at,
             },
         );
@@ -297,7 +345,7 @@ impl NodeLabelCache {
         node.metadata
             .name
             .as_ref()
-            .and_then(|n| self.0.write().remove(n))
+            .and_then(|n| self.nodes.write().remove(n))
     }
 }
 
@@ -619,7 +667,6 @@ fn hw_class_patch_target(pod: &Pod, cache: &NodeLabelCache) -> Option<(String, S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     fn node(name: &str, labels: &[(&str, &str)]) -> Node {
         let mut n = Node::default();
@@ -633,70 +680,99 @@ mod tests {
         n
     }
 
+    /// Two-class config keyed on `rio.build/hw-band` only — covers the
+    /// "operator's label schema is arbitrary" case (bug_061: a single
+    /// non-Karpenter label, NOT the hardcoded 4-tuple).
+    fn band_config() -> HwClassConfig {
+        HwClassConfig::from_literals(&[
+            ("intel-7", &[("rio.build/hw-band", "7")]),
+            ("intel-6", &[("rio.build/hw-band", "6")]),
+        ])
+    }
+
+    fn band_cache() -> NodeLabelCache {
+        NodeLabelCache::with_config(band_config())
+    }
+
     #[test]
-    fn hw_class_of_returns_formatted() {
-        let cache = NodeLabelCache::default();
+    fn hw_class_of_matches_operator_config() {
+        let cache = band_cache();
         cache.apply(&node(
             "ip-10-0-1-5",
-            &[
-                (LABEL_MANUFACTURER, "aws"),
-                (LABEL_GENERATION, "7"),
-                (LABEL_STORAGE, "ebs"),
-                (LABEL_HW_BAND, "mid"),
-            ],
+            &[("rio.build/hw-band", "7"), ("unrelated", "x")],
         ));
-        assert_eq!(
-            cache.hw_class_of("ip-10-0-1-5"),
-            Some("aws-7-ebs-mid".into())
-        );
+        assert_eq!(cache.hw_class_of("ip-10-0-1-5"), Some("intel-7".into()));
         assert_eq!(cache.hw_class_of("missing"), None);
     }
 
+    /// bug_061 contract: the matched value IS the operator's `$h` key,
+    /// not a controller-side `"{mfg}-{gen}-{storage}-{band}"`
+    /// reconstruction. A node satisfying a multi-label conjunction
+    /// returns the `$h` string as-is; a node missing one label of the
+    /// conjunction returns `None` (no `"unknown"` fill-in).
     #[test]
-    fn hw_class_defaults_on_missing_labels() {
-        let cache = NodeLabelCache::default();
-        // No labels at all → all defaults.
-        cache.apply(&node("bare", &[]));
-        assert_eq!(
-            cache.hw_class_of("bare"),
-            Some("unknown-unknown-ebs-unknown".into())
-        );
-        // Partial: only manufacturer set.
-        cache.apply(&node("partial", &[(LABEL_MANUFACTURER, "intel")]));
-        assert_eq!(
-            cache.hw_class_of("partial"),
-            Some("intel-unknown-ebs-unknown".into())
-        );
-    }
-
-    /// Regression: helm `mid` admits gen 6+7, so a c6id node provisioned
-    /// by the mid NodePool has `instance-generation: 6` AND
-    /// `rio.build/hw-band: mid`. The hw_class string carries the band
-    /// label so `interrupt_samples` rows from this node aggregate under
-    /// the correct hw_class key — parsing the generation digit alone
-    /// would mis-bucket it.
-    #[test]
-    fn hw_class_carries_band_label_not_just_generation() {
-        let cache = NodeLabelCache::default();
-        cache.apply(&node(
-            "c6id-via-mid",
+    fn hw_class_is_operator_key_not_reconstruction() {
+        let cfg = HwClassConfig::from_literals(&[(
+            "amd-nvme-mid",
             &[
-                (LABEL_MANUFACTURER, "amd"),
-                (LABEL_GENERATION, "6"),
-                (LABEL_STORAGE, "nvme"),
-                (LABEL_HW_BAND, "mid"),
+                ("karpenter.k8s.aws/instance-cpu-manufacturer", "amd"),
+                ("rio.build/storage", "nvme"),
+            ],
+        )]);
+        let cache = NodeLabelCache::with_config(cfg);
+        cache.apply(&node(
+            "full",
+            &[
+                ("karpenter.k8s.aws/instance-cpu-manufacturer", "amd"),
+                ("rio.build/storage", "nvme"),
+                ("karpenter.k8s.aws/instance-generation", "6"),
             ],
         ));
-        assert_eq!(
-            cache.hw_class_of("c6id-via-mid"),
-            Some("amd-6-nvme-mid".into())
+        assert_eq!(cache.hw_class_of("full"), Some("amd-nvme-mid".into()));
+        // Partial match (one label of the conjunction missing) → None.
+        cache.apply(&node(
+            "partial",
+            &[("karpenter.k8s.aws/instance-cpu-manufacturer", "amd")],
+        ));
+        assert_eq!(cache.hw_class_of("partial"), None);
+    }
+
+    /// Unloaded / Static-mode config → `hw_class_of` returns `None`
+    /// (annotator skips, λ-samples skip — degraded, not broken). Late
+    /// config load resolves already-cached nodes (lazy match).
+    #[test]
+    fn hw_class_none_until_config_loaded_then_lazy_match() {
+        let cache = NodeLabelCache::default();
+        cache.apply(&node("n", &[("rio.build/hw-band", "7")]));
+        assert_eq!(cache.hw_class_of("n"), None, "config empty → no match");
+        // Config arrives: already-cached node now resolves.
+        cache.config.set(
+            [(
+                "intel-7".into(),
+                rio_proto::types::HwClassLabels {
+                    labels: vec![rio_proto::types::NodeLabelMatch {
+                        key: "rio.build/hw-band".into(),
+                        value: "7".into(),
+                    }],
+                },
+            )]
+            .into(),
         );
+        assert_eq!(cache.hw_class_of("n"), Some("intel-7".into()));
+    }
+
+    /// Overlapping conjunctions → deterministic (lexicographic `$h`).
+    #[test]
+    fn match_node_deterministic_on_overlap() {
+        let cfg = HwClassConfig::from_literals(&[("zz", &[("k", "v")]), ("aa", &[("k", "v")])]);
+        let labels: BTreeMap<_, _> = [("k".into(), "v".into())].into();
+        assert_eq!(cfg.match_node(&labels), Some("aa".into()));
     }
 
     #[test]
     fn delete_evicts_entry() {
-        let cache = NodeLabelCache::default();
-        let n = node("ip-10-0-1-5", &[(LABEL_STORAGE, "nvme")]);
+        let cache = band_cache();
+        let n = node("ip-10-0-1-5", &[("rio.build/hw-band", "7")]);
         cache.apply(&n);
         assert_eq!(cache.len(), 1);
         cache.delete(&n);
@@ -708,32 +784,42 @@ mod tests {
     fn spot_exposure_gates_on_capacity_type() {
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
         use k8s_openapi::jiff::Timestamp;
-        let cache = NodeLabelCache::default();
+        let cache = band_cache();
         let mut spot = node(
             "spot-n",
-            &[(LABEL_CAPACITY_TYPE, "spot"), (LABEL_GENERATION, "7")],
+            &[(LABEL_CAPACITY_TYPE, "spot"), ("rio.build/hw-band", "7")],
         );
         spot.metadata.creation_timestamp = Some(Time(Timestamp::from_second(1000).unwrap()));
         cache.apply(&spot);
-        let mut od = node("od-n", &[(LABEL_CAPACITY_TYPE, "on-demand")]);
+        let mut od = node(
+            "od-n",
+            &[
+                (LABEL_CAPACITY_TYPE, "on-demand"),
+                ("rio.build/hw-band", "7"),
+            ],
+        );
         od.metadata.creation_timestamp = Some(Time(Timestamp::from_second(1000).unwrap()));
         cache.apply(&od);
         // Spot node → exposure with hw_class + uptime.
         let (hw, secs) = cache.spot_exposure("spot-n", 1100.0).unwrap();
-        assert_eq!(hw, "unknown-7-ebs-unknown");
+        assert_eq!(hw, "intel-7");
         assert!((secs - 100.0).abs() < 1e-6);
         // On-demand → no exposure (λ=0 by definition).
         assert!(cache.spot_exposure("od-n", 1100.0).is_none());
         // Unknown node → None.
         assert!(cache.spot_exposure("missing", 1100.0).is_none());
+        // Spot but no matching $h (config empty) → None (no key for λ).
+        let bare = NodeLabelCache::default();
+        bare.apply(&spot);
+        assert!(bare.spot_exposure("spot-n", 1100.0).is_none());
     }
 
-    fn spot_node(name: &str, gen_: &str, created: i64) -> Node {
+    fn spot_node(name: &str, band: &str, created: i64) -> Node {
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
         use k8s_openapi::jiff::Timestamp;
         let mut n = node(
             name,
-            &[(LABEL_CAPACITY_TYPE, "spot"), (LABEL_GENERATION, gen_)],
+            &[(LABEL_CAPACITY_TYPE, "spot"), ("rio.build/hw-band", band)],
         );
         n.metadata.creation_timestamp = Some(Time(Timestamp::from_second(created).unwrap()));
         n
@@ -745,7 +831,7 @@ mod tests {
     /// Delete-arm `spot_exposure` then sees only the residual.
     #[test]
     fn drain_live_spot_exposure_banks_incremental_deltas() {
-        let cache = NodeLabelCache::default();
+        let cache = band_cache();
         cache.apply(&spot_node("a", "7", 1000));
         cache.apply(&spot_node("b", "7", 1000));
         cache.apply(&spot_node("c", "6", 1020));
@@ -754,28 +840,16 @@ mod tests {
         od.metadata.creation_timestamp = spot_node("x", "7", 1000).metadata.creation_timestamp;
         cache.apply(&od);
 
-        // First drain at t=1060: a+b → 2×60=120s for gen-7, c → 40s.
+        // First drain at t=1060: a+b → 2×60=120s for intel-7, c → 40s.
         let mut d = cache.drain_live_spot_exposure(1060.0);
         d.sort_by(|a, b| a.0.cmp(&b.0));
-        assert_eq!(
-            d,
-            vec![
-                ("unknown-6-ebs-unknown".into(), 40.0),
-                ("unknown-7-ebs-unknown".into(), 120.0),
-            ]
-        );
+        assert_eq!(d, vec![("intel-6".into(), 40.0), ("intel-7".into(), 120.0)]);
 
         // Second drain at t=1120: deltas only (60s each), not
         // cumulative-from-created.
         let mut d = cache.drain_live_spot_exposure(1120.0);
         d.sort_by(|a, b| a.0.cmp(&b.0));
-        assert_eq!(
-            d,
-            vec![
-                ("unknown-6-ebs-unknown".into(), 60.0),
-                ("unknown-7-ebs-unknown".into(), 120.0),
-            ]
-        );
+        assert_eq!(d, vec![("intel-6".into(), 60.0), ("intel-7".into(), 120.0)]);
 
         // Re-apply (watch relist / label Modify) MUST preserve
         // last_exposure_at — no double-count of the banked slice.
@@ -795,7 +869,7 @@ mod tests {
     /// `drain_live_spot_exposure` phantom node-seconds.
     #[test]
     fn prune_absent_evicts_nodes_missing_from_relist() {
-        let cache = NodeLabelCache::default();
+        let cache = band_cache();
         cache.apply(&spot_node("a", "7", 1000));
         cache.apply(&spot_node("b", "7", 1000));
         cache.apply(&spot_node("b2", "7", 1000));
@@ -817,7 +891,7 @@ mod tests {
         let evicted = cache.prune_absent(&seen, 1090.0);
         assert_eq!(
             evicted,
-            vec![("unknown-7-ebs-unknown".into(), 60.0)],
+            vec![("intel-7".into(), 60.0)],
             "two same-hw_class spot nodes → ONE aggregated entry (Σsecs)"
         );
         assert_eq!(cache.len(), 2);
@@ -829,13 +903,7 @@ mod tests {
         // no phantom 60s from b/b2.
         let mut d = cache.drain_live_spot_exposure(1120.0);
         d.sort_by(|a, b| a.0.cmp(&b.0));
-        assert_eq!(
-            d,
-            vec![
-                ("unknown-6-ebs-unknown".into(), 60.0),
-                ("unknown-7-ebs-unknown".into(), 60.0),
-            ]
-        );
+        assert_eq!(d, vec![("intel-6".into(), 60.0), ("intel-7".into(), 60.0)]);
     }
 
     fn pod(name: &str, ns: &str, node: Option<&str>, annots: &[(&str, &str)]) -> Pod {
@@ -861,24 +929,20 @@ mod tests {
 
     #[test]
     fn patch_target_stamps_once() {
-        let cache = NodeLabelCache::default();
-        cache.apply(&node("ip-10-0-1-5", &[(LABEL_STORAGE, "nvme")]));
+        let cache = band_cache();
+        cache.apply(&node("ip-10-0-1-5", &[("rio.build/hw-band", "7")]));
         // Scheduled, not yet annotated → stamp.
         let p = pod("rb-abc", "rio", Some("ip-10-0-1-5"), &[]);
         assert_eq!(
             hw_class_patch_target(&p, &cache),
-            Some((
-                "rb-abc".into(),
-                "rio".into(),
-                "unknown-unknown-nvme-unknown".into()
-            ))
+            Some(("rb-abc".into(), "rio".into(), "intel-7".into()))
         );
         // Already annotated → skip (sticky).
         let p = pod(
             "rb-abc",
             "rio",
             Some("ip-10-0-1-5"),
-            &[(ANNOT_HW_CLASS, "unknown-unknown-nvme-unknown")],
+            &[(ANNOT_HW_CLASS, "intel-7")],
         );
         assert_eq!(hw_class_patch_target(&p, &cache), None);
         // Pending (no nodeName yet) → skip.
@@ -887,23 +951,22 @@ mod tests {
         // Node not in cache (informer race / non-Karpenter) → skip.
         let p = pod("rb-unk", "rio", Some("ip-10-0-9-9"), &[]);
         assert_eq!(hw_class_patch_target(&p, &cache), None);
+        // Cached node but no $h matches (e.g. non-builder NodePool, or
+        // config not yet loaded) → skip — don't stamp a bogus value.
+        cache.apply(&node("nomatch", &[("rio.build/hw-band", "9")]));
+        let p = pod("rb-nm", "rio", Some("nomatch"), &[]);
+        assert_eq!(hw_class_patch_target(&p, &cache), None);
     }
 
     #[test]
     fn apply_upserts_on_label_change() {
-        let cache = NodeLabelCache::default();
-        cache.apply(&node("n", &[(LABEL_STORAGE, "ebs")]));
-        assert_eq!(
-            cache.hw_class_of("n"),
-            Some("unknown-unknown-ebs-unknown".into())
-        );
+        let cache = band_cache();
+        cache.apply(&node("n", &[("rio.build/hw-band", "6")]));
+        assert_eq!(cache.hw_class_of("n"), Some("intel-6".into()));
         // Relabel (e.g., operator manually patched) → Modify event →
         // apply() again → cache reflects new value.
-        cache.apply(&node("n", &[(LABEL_STORAGE, "nvme")]));
-        assert_eq!(
-            cache.hw_class_of("n"),
-            Some("unknown-unknown-nvme-unknown".into())
-        );
+        cache.apply(&node("n", &[("rio.build/hw-band", "7")]));
+        assert_eq!(cache.hw_class_of("n"), Some("intel-7".into()));
         assert_eq!(cache.len(), 1, "upsert, not duplicate");
     }
 }

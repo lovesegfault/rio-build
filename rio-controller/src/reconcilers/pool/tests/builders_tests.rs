@@ -524,15 +524,12 @@ fn job_pod_overlays_volume_mounted() {
 const GIB: u64 = 1 << 30;
 
 /// One `(h, cap)` cell as the scheduler's `cells_to_selector_terms`
-/// would emit it for a `[sla.hw_classes.$h]` config that uses the
-/// canonical 4-label tuple `node_informer::HwClass` reads.
-fn affinity_term(
-    manufacturer: &str,
-    generation: &str,
-    storage: &str,
-    band: &str,
-    cap: &str,
-) -> rio_proto::types::NodeSelectorTerm {
+/// would emit it: an arbitrary `[sla.hw_classes.$h].labels` conjunction
+/// + `karpenter.sh/capacity-type`. The controller no longer parses the
+/// label keys (bug_061 — `SpawnIntent.hw_class_names` carries `$h`
+/// directly), so a single-label conjunction is sufficient for the
+/// affinity-stamping path.
+fn affinity_term(band: &str, cap: &str) -> rio_proto::types::NodeSelectorTerm {
     use rio_proto::types::NodeSelectorRequirement;
     let req = |k: &str, v: &str| NodeSelectorRequirement {
         key: k.into(),
@@ -541,9 +538,6 @@ fn affinity_term(
     };
     rio_proto::types::NodeSelectorTerm {
         match_expressions: vec![
-            req("karpenter.k8s.aws/instance-cpu-manufacturer", manufacturer),
-            req("karpenter.k8s.aws/instance-generation", generation),
-            req("rio.build/storage", storage),
             req("rio.build/hw-band", band),
             req("karpenter.sh/capacity-type", cap),
         ],
@@ -581,8 +575,8 @@ fn pod_gets_node_affinity_from_intent() {
         cores: 4,
         mem_bytes: 8 * GIB,
         node_affinity: vec![
-            affinity_term("intel", "8", "ebs", "hi", "spot"),
-            affinity_term("intel", "8", "ebs", "hi", "on-demand"),
+            affinity_term("hi", "spot"),
+            affinity_term("hi", "on-demand"),
         ],
         ..Default::default()
     };
@@ -604,7 +598,7 @@ fn pod_gets_node_affinity_from_intent() {
         .expect("requiredDuringScheduling… set from intent.node_affinity");
     assert_eq!(terms.len(), 2, "one k8s term per (h, cap) cell");
     let exprs = terms[0].match_expressions.as_ref().unwrap();
-    assert_eq!(exprs.len(), 5, "h-label conjunction + capacity-type");
+    assert_eq!(exprs.len(), 2, "h-label conjunction + capacity-type");
     let cap = exprs
         .iter()
         .find(|r| r.key == "karpenter.sh/capacity-type")
@@ -638,13 +632,19 @@ fn pod_gets_node_affinity_from_intent() {
 #[test]
 fn pod_gets_hw_bench_needed_when_any_h_undersampled() {
     use std::collections::HashMap;
-    let intent = |mem_bytes: u64, terms: Vec<rio_proto::types::NodeSelectorTerm>| {
-        rio_proto::types::SpawnIntent {
-            intent_id: "abc".into(),
-            mem_bytes,
-            node_affinity: terms,
-            ..Default::default()
-        }
+    let intent = |mem_bytes: u64, hw_class_names: Vec<String>| rio_proto::types::SpawnIntent {
+        intent_id: "abc".into(),
+        mem_bytes,
+        // node_affinity is parallel to hw_class_names but the
+        // hw-bench-needed gate reads only the latter (bug_061: no
+        // label reconstruction). One placeholder term per `$h` so the
+        // affinity-stamp path stays exercised.
+        node_affinity: hw_class_names
+            .iter()
+            .map(|_| affinity_term("x", "spot"))
+            .collect(),
+        hw_class_names,
+        ..Default::default()
     };
     let bench_ann = |job: &k8s_openapi::api::batch::v1::Job| {
         job.spec
@@ -654,17 +654,14 @@ fn pod_gets_hw_bench_needed_when_any_h_undersampled() {
             .and_then(|a| a.get(jobs::HW_BENCH_NEEDED_ANNOTATION))
             .cloned()
     };
-    // hw_classes_in reconstructs via HwClass::from_selector_term →
-    // `"{manufacturer}-{generation}-{storage}-{band}"`.
+    // hw_classes_in reads `intent.hw_class_names` directly — the
+    // operator's `$h` keys, not a derived 4-tuple string.
     let cache = jobs::HwSampledCache::from_map(HashMap::from([
-        ("intel-8-ebs-hi".into(), 1u32),  // undersampled
-        ("intel-7-ebs-mid".into(), 5u32), // trusted
+        ("intel-8-hi".into(), 1u32),  // undersampled
+        ("intel-7-mid".into(), 5u32), // trusted
     ]));
-    let a_mixed = vec![
-        affinity_term("intel", "7", "ebs", "mid", "spot"),
-        affinity_term("intel", "8", "ebs", "hi", "spot"),
-    ];
-    let a_trusted = vec![affinity_term("intel", "7", "ebs", "mid", "on-demand")];
+    let a_mixed = vec!["intel-7-mid".into(), "intel-8-hi".into()];
+    let a_trusted = vec!["intel-7-mid".into()];
 
     // (a) mem ≥ floor ∧ any h<3 → true.
     let job = build_job_with(&intent(16 * GIB, a_mixed.clone()), &cache, 8 * GIB);
@@ -711,13 +708,18 @@ fn pod_gets_hw_bench_needed_when_any_h_undersampled() {
     assert_eq!(bench_ann(&job).as_deref(), Some("true"));
 }
 
-/// ADR-023 §13a ship-standalone gate: `eta_seconds > 0` (forecast)
-/// intents are dropped before any Job-create / reap / ack so a
-/// not-yet-Ready drv never spawns a pod that idles for `eta_seconds`
-/// then exits. The gate is on the FULL `intents` vec (not just the
-/// spawn slice) so `queued`/`reap_excess_pending` see one consistent
-/// set. §13b removes this — `placeable` from the NodeClaim FFD sim
-/// becomes the gate instead.
+/// ADR-023 §13a ship-standalone gate: forecast (`!ready`) intents are
+/// dropped before any Job-create / reap / ack so a not-yet-Ready drv
+/// never spawns a pod that idles for `eta_seconds` then exits. The
+/// gate is on the FULL `intents` vec (not just the spawn slice) so
+/// `queued`/`reap_excess_pending` see one consistent set. §13b removes
+/// this — `placeable` from the NodeClaim FFD sim becomes the gate
+/// instead.
+///
+/// bug_030: keys on the explicit `ready` field, NOT
+/// `eta_seconds == 0.0`. The third intent below has overdue deps
+/// (`eta_seconds` clamped to 0.0) but `ready=false` — it MUST be
+/// filtered out.
 #[test]
 fn forecast_intents_filtered_in_13a() {
     // Unit-level: the `retain` is one line; assert directly on the
@@ -728,29 +730,32 @@ fn forecast_intents_filtered_in_13a() {
     let intents = [
         rio_proto::types::SpawnIntent {
             intent_id: "ready".into(),
+            ready: true,
             eta_seconds: 0.0,
-            node_affinity: vec![affinity_term("intel", "7", "ebs", "mid", "spot")],
+            hw_class_names: vec!["intel-7-mid".into()],
             ..Default::default()
         },
         rio_proto::types::SpawnIntent {
             intent_id: "forecast".into(),
+            ready: false,
             eta_seconds: 42.5,
-            node_affinity: vec![affinity_term("amd", "9", "nvme", "hi", "spot")],
+            hw_class_names: vec!["amd-9-hi".into()],
+            ..Default::default()
+        },
+        rio_proto::types::SpawnIntent {
+            intent_id: "overdue".into(),
+            ready: false,
+            eta_seconds: 0.0, // clamped — would pass `eta == 0.0`
+            hw_class_names: vec!["amd-9-hi".into()],
             ..Default::default()
         },
     ];
     let mut filtered: Vec<_> = intents.to_vec();
-    filtered.retain(|i| i.eta_seconds == 0.0);
+    filtered.retain(|i| i.ready);
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].intent_id, "ready");
-    let hs: std::collections::HashSet<_> = filtered
-        .iter()
-        .flat_map(|i| jobs::hw_classes_in(&i.node_affinity))
-        .collect();
-    assert_eq!(
-        hs,
-        std::collections::HashSet::from(["intel-7-ebs-mid".into()])
-    );
+    let hs: std::collections::HashSet<_> = filtered.iter().flat_map(jobs::hw_classes_in).collect();
+    assert_eq!(hs, std::collections::HashSet::from(["intel-7-mid".into()]));
 }
 
 // r[verify ctrl.pool.hw-class-annotation]

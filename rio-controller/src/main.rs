@@ -288,10 +288,17 @@ async fn main() -> anyhow::Result<()> {
     // Caches Node labels → hw_class string for completion-ingest
     // join (ADR-023). Builders report spec.nodeName (downward API);
     // controller joins server-side because builders are air-gapped
-    // from apiserver.
+    // from apiserver. `hw_class` is the operator's `[sla.hw_classes.$h]`
+    // key matched against Node labels (NOT a hardcoded reconstruction;
+    // bug_061), so fetch the scheduler's config once before spawning
+    // the informer/annotator. `connect_forever` already established
+    // the channel; `load` retries 5× with backoff for leader-election
+    // transients then degrades to empty (annotator/λ skip).
     // TODO: clone node_cache into the completion-ingest consumer
     // once that lands; until then this populates but nobody reads.
-    let node_cache = NodeLabelCache::default();
+    let hw_config = node_informer::HwClassConfig::default();
+    hw_config.load(&mut admin.clone()).await;
+    let node_cache = NodeLabelCache::with_config(hw_config);
     rio_common::task::spawn_monitored(
         "node-informer",
         node_informer::run(
