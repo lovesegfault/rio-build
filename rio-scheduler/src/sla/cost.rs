@@ -7,10 +7,11 @@
 //!   `DescribeSpotPriceHistory`) and persisted to `sla_ema_state` so a
 //!   restart doesn't re-warm. `expected_cost` turns a candidate
 //!   `(band, cap, c*, T(c*))` into a comparable scalar for the softmax.
-//! - λ\[h\]: per-hw-band Poisson interrupt rate. Computed from
-//!   `interrupt_samples` (controller-appended) as
-//!   `EMA(Σinterrupts) / EMA(Σnode-seconds)` with 24h halflife;
-//!   decays toward [`LAMBDA_SEED`] when exposure dries up.
+//! - λ\[h\]: per-hw-band Poisson interrupt rate. Gamma-Poisson partial
+//!   pooling over `interrupt_samples` (controller-appended): the seed
+//!   acts as a prior with weight `n_λ = 1day · max(1, node_count_ema)`
+//!   so a single interrupt doesn't spike λ, and exiled-spot decay
+//!   collapses to the seed rather than freezing at the spike.
 //!
 //! [`IceBackoff`] is the in-process insufficient-capacity ladder: a
 //! `(band, cap)` that left a pod Pending past the Pending-watch window
@@ -93,7 +94,7 @@ pub enum HwCostSource {
 /// halves are independently EMA-decayed. Used for λ\[h\] (interrupts ÷
 /// node-seconds) so a burst of node churn doesn't spike λ — the
 /// denominator absorbs it.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct RatioEma {
     pub numerator: f64,
     pub denominator: f64,
@@ -130,11 +131,51 @@ impl RatioEma {
     }
 }
 
-/// Seed λ (interrupts/sec) when no exposure has been observed. ~1/3h —
+/// Seed λ (interrupts/sec) — the Gamma-Poisson prior mean. ~1/3h:
 /// AWS's published spot-interruption frequency floor for the deepest
-/// pools is "<5%/hr"; 1/3h is a conservative middle until self-
-/// calibration kicks in.
+/// pools is "<5%/hr"; 1/3h is a conservative middle. With pooling the
+/// seed contributes ~50% at one wall-clock day of exposure regardless
+/// of fleet size.
 pub const LAMBDA_SEED: f64 = 1.0 / (3.0 * 3600.0);
+
+/// Gamma-Poisson prior pseudo-exposure unit: one day of node-seconds.
+/// `n_λ = N_LAMBDA_DAY_SECS · max(1, node_count_ema)` — see
+/// [`lambda_hat`].
+const N_LAMBDA_DAY_SECS: f64 = 86400.0;
+
+/// Spot-price poller tick. 10min — well under the AWS API rate limits;
+/// the 3h price halflife smooths sub-tick granularity.
+pub const POLL_INTERVAL_SECS: u64 = 600;
+
+/// `_hw_cost_stale_seconds` threshold past which [`CostTable::price`]
+/// clamps to seed and `_hw_cost_fallback_total{reason="stale"}` fires.
+/// 6× the poll interval = 1h: enough to absorb a few transient AWS
+/// failures, short enough that a wedged poller doesn't drive the solve
+/// off month-old prices.
+pub const STALE_CLAMP_AFTER_SECS: f64 = 6.0 * POLL_INTERVAL_SECS as f64;
+
+// r[impl sched.sla.hw-class.lambda-gamma-poisson]
+/// Gamma-Poisson partial-pooling λ estimate. The seed acts as a prior
+/// with pseudo-exposure `n_λ = 1day · max(1, node_count_ema)`:
+///
+/// ```text
+/// λ̂ = (EMA(interrupts) + n_λ·seed) / (EMA(exposure) + n_λ)
+/// ```
+///
+/// The `max(1, ·)` floor keeps the prior from vanishing when spot is
+/// exiled and `node_count → 0` — without it λ̂ freezes at the spike that
+/// caused the exile. Replaces the linear-decay-to-seed-after-48h design,
+/// which under persistent capacity stress had a ~48h limit cycle (spike
+/// → exile → exposure→0 → decay → re-admit → spike).
+pub fn lambda_hat(
+    ema_interrupts: f64,
+    ema_exposure_secs: f64,
+    ema_node_count: f64,
+    lambda_seed: f64,
+) -> f64 {
+    let n_lambda = N_LAMBDA_DAY_SECS * ema_node_count.max(1.0);
+    (ema_interrupts + n_lambda * lambda_seed) / (ema_exposure_secs + n_lambda)
+}
 
 /// Seed `$/vCPU·hr` per band, on-demand. Roughly c6a/c7a/c8g list
 /// price ÷ vCPU. Ratios are what matter (softmax normalizes); absolute
@@ -152,25 +193,21 @@ const SPOT_HALFLIFE_SECS: f64 = 3.0 * 3600.0;
 
 /// λ\[h\] EMA halflife. 24h: spot interruption rates move on a daily
 /// cadence (capacity rebalancing); a 3h halflife would chase noise.
+/// Same halflife for the `node_count_ema` that scales the prior.
 const LAMBDA_HALFLIFE_SECS: f64 = 24.0 * 3600.0;
-
-/// After this many seconds of zero exposure, λ\[h\] linearly blends back
-/// toward [`LAMBDA_SEED`]. ADR-023: a band that hasn't been scheduled
-/// in two days shouldn't carry a stale λ from a since-resolved
-/// capacity crunch.
-const LAMBDA_DECAY_TO_SEED_AFTER_SECS: f64 = 48.0 * 3600.0;
 
 /// ICE-backoff TTL. A `(band, cap)` that left a pod Pending past the
 /// Pending-watch window is fleet-wide infeasible for this long. Short
 /// — capacity recovers in minutes; the ladder re-probes.
 const ICE_TTL: Duration = Duration::from_secs(60);
 
-/// EMA-smoothed `$/vCPU·hr` with its own last-update timestamp.
-/// Per-key timestamp (mirroring [`RatioEma`]) so a `(band, cap)` absent
-/// from a partial `poll_spot_once` observation keeps its OWN decay
-/// reference — a single global timestamp under-decays absent keys when
-/// the global stamp moves forward.
-#[derive(Debug, Clone, Copy)]
+/// EMA-smoothed scalar with its own last-update timestamp. Used for
+/// `$/vCPU·hr` and per-band `node_count`. Per-key timestamp (mirroring
+/// [`RatioEma`]) so a key absent from a partial observation keeps its
+/// OWN decay reference — a single global timestamp under-decays absent
+/// keys when the global stamp moves forward. Serde-derives so the whole
+/// struct round-trips a `jsonb` column without per-field plumbing.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct PriceEma {
     pub value: f64,
     /// Unix-epoch seconds of last update. `0.0` ⇒ seed (first fold gets
@@ -178,14 +215,58 @@ pub struct PriceEma {
     pub updated_at: f64,
 }
 
-/// Per-`(band, cap)` `$/vCPU·hr` + per-band λ. Cheap to clone (two
+impl PriceEma {
+    /// Fold one sample at wall-clock `now` with `halflife_secs`. Same
+    /// `0.5^(Δt/H)` decay as [`RatioEma::update`]; `updated_at = 0.0`
+    /// is treated as "no prior" so the first fold takes the sample
+    /// verbatim.
+    pub fn update(&mut self, sample: f64, now: f64, halflife_secs: f64) {
+        let dt = (now - self.updated_at).max(0.0);
+        let decay = if self.updated_at == 0.0 {
+            0.0
+        } else {
+            0.5f64.powf(dt / halflife_secs)
+        };
+        self.value = self.value * decay + sample * (1.0 - decay);
+        self.updated_at = now;
+    }
+}
+
+/// Static `$/vCPU·hr` seed for `(band, cap)`. Backstop for
+/// [`CostTable::price`] (missing key, or stale-clamped).
+fn seed_price(band: Band, cap: Cap) -> f64 {
+    let od = ON_DEMAND_SEED
+        .iter()
+        .find(|(b, _)| *b == band)
+        .map(|(_, p)| *p)
+        .unwrap_or(0.043);
+    match cap {
+        Cap::OnDemand => od,
+        Cap::Spot => od * SPOT_SEED_DISCOUNT,
+    }
+}
+
+/// Per-`(band, cap)` `$/vCPU·hr` + per-band λ. Cheap to clone (three
 /// small maps); the solve takes a snapshot by value.
 #[derive(Debug, Clone)]
 pub struct CostTable {
     /// EMA-smoothed `$/vCPU·hr`. Missing key → seed.
     price: HashMap<(Band, Cap), PriceEma>,
-    /// Per-band interrupt-rate EMA.
+    /// Per-band interrupt-rate EMA. `numerator` = Σ interrupts,
+    /// `denominator` = Σ exposure-secs (24h halflife). Read via
+    /// [`lambda_hat`], not as a bare ratio.
     lambda: HashMap<Band, RatioEma>,
+    /// Per-band 24h-EMA of live spot-node count. The `n_λ` scaler in
+    /// [`lambda_hat`]: keeps the prior's relative weight ~constant at
+    /// "one day of fleet exposure" regardless of fleet size. Derived
+    /// from `interrupt_samples` exposure rows in
+    /// [`CostTable::refresh_lambda`] as `Σ exposure_secs / Δt`.
+    node_count: HashMap<Band, PriceEma>,
+    /// `price_updated_at() > 6 × pollInterval` ago. Set by
+    /// [`CostTable::apply_stale_clamp`] each tick; while true,
+    /// [`CostTable::price`] returns the static seed so a wedged poller
+    /// can't drive the solve off month-old data.
+    stale_clamp: bool,
     /// `sla_ema_state.cluster` / `interrupt_samples.cluster` scope
     /// (ADR-023 §2.13). Set by [`CostTable::load`]; empty for the
     /// single-cluster default. Carried on the struct so
@@ -217,6 +298,8 @@ impl Default for CostTable {
         Self {
             price,
             lambda: HashMap::new(),
+            node_count: HashMap::new(),
+            stale_clamp: false,
             cluster: String::new(),
         }
     }
@@ -224,38 +307,27 @@ impl Default for CostTable {
 
 impl CostTable {
     /// `$/vCPU·hr` for `(band, cap)`. Seed-backed — never `None`.
+    /// Clamps to seed while [`Self::apply_stale_clamp`] has the
+    /// stale-clamp latched.
     pub fn price(&self, band: Band, cap: Cap) -> f64 {
+        if self.stale_clamp {
+            return seed_price(band, cap);
+        }
         self.price
             .get(&(band, cap))
             .map(|p| p.value)
-            .unwrap_or_else(|| {
-                let od = ON_DEMAND_SEED
-                    .iter()
-                    .find(|(b, _)| *b == band)
-                    .map(|(_, p)| *p)
-                    .unwrap_or(0.043);
-                match cap {
-                    Cap::OnDemand => od,
-                    Cap::Spot => od * SPOT_SEED_DISCOUNT,
-                }
-            })
+            .unwrap_or_else(|| seed_price(band, cap))
     }
 
-    /// Per-band Poisson interrupt rate (events/sec). Decays toward
-    /// [`LAMBDA_SEED`] after 48h of no exposure: `λ = (1-α)·λ_ema +
-    /// α·seed` where `α = min(1, (now - updated_at) / 48h)`.
+    /// Per-band Poisson interrupt rate (events/sec) via [`lambda_hat`].
+    /// `(EMA(interrupts) + n_λ·seed) / (EMA(exposure) + n_λ)` with
+    /// `n_λ = 1day · max(1, node_count_ema)`. Returns [`LAMBDA_SEED`]
+    /// for a band with no observations (default RatioEma + node_count=0
+    /// reduces exactly).
     pub fn lambda_band(&self, band: Band) -> f64 {
-        self.lambda_band_at(band, now_epoch())
-    }
-
-    fn lambda_band_at(&self, band: Band, now: f64) -> f64 {
-        let Some(ema) = self.lambda.get(&band) else {
-            return LAMBDA_SEED;
-        };
-        let raw = ema.value_or(LAMBDA_SEED);
-        let stale = (now - ema.updated_at).max(0.0);
-        let alpha = (stale / LAMBDA_DECAY_TO_SEED_AFTER_SECS).min(1.0);
-        (1.0 - alpha) * raw + alpha * LAMBDA_SEED
+        let ema = self.lambda.get(&band).copied().unwrap_or_default();
+        let nc = self.node_count.get(&band).map(|p| p.value).unwrap_or(0.0);
+        lambda_hat(ema.numerator, ema.denominator, nc, LAMBDA_SEED)
     }
 
     /// `E[cost]` for a candidate: `price · c* · E[wall] / 3600` where
@@ -292,6 +364,19 @@ impl CostTable {
             cluster: cluster.to_owned(),
             ..Self::default()
         }
+    }
+
+    /// Recompute the stale-clamp latch from the price timestamps.
+    /// Returns `true` while the clamp is engaged. Level-triggered: each
+    /// call while stale increments `_hw_cost_fallback_total{reason=
+    /// "stale"}` so the rate surfaces in alerting.
+    pub fn apply_stale_clamp(&mut self, now: f64) -> bool {
+        let stale = now - self.price_updated_at();
+        self.stale_clamp = stale > STALE_CLAMP_AFTER_SECS;
+        if self.stale_clamp {
+            super::metrics::hw_cost_fallback("stale");
+        }
+        self.stale_clamp
     }
 
     /// Unix-epoch seconds of the most-recently-updated price key. Feeds
@@ -346,6 +431,16 @@ impl CostTable {
                         updated_at: at,
                     },
                 );
+            } else if let Some(rest) = key.strip_prefix("node_count:")
+                && let Some(b) = parse_band(rest)
+            {
+                t.node_count.insert(
+                    b,
+                    PriceEma {
+                        value,
+                        updated_at: at,
+                    },
+                );
             }
         }
         Ok(t)
@@ -387,6 +482,19 @@ impl CostTable {
             .execute(db.pool())
             .await?;
         }
+        for (&b, nc) in &self.node_count {
+            sqlx::query(
+                "INSERT INTO sla_ema_state (cluster, key, value, updated_at) \
+                 VALUES ($1, $2, $3, to_timestamp($4)) \
+                 ON CONFLICT (cluster, key) DO UPDATE SET value = $3, updated_at = to_timestamp($4)",
+            )
+            .bind(&self.cluster)
+            .bind(format!("node_count:{}", b.label()))
+            .bind(nc.value)
+            .bind(nc.updated_at)
+            .execute(db.pool())
+            .await?;
+        }
         Ok(())
     }
 
@@ -423,6 +531,7 @@ impl CostTable {
             .values()
             .map(|e| e.updated_at)
             .fold(0.0, f64::max);
+        let prev_hwm = hwm;
         let mut per_band: HashMap<Band, (f64, f64)> = HashMap::new();
         for (hw_class, kind, sum, max_at) in rows {
             hwm = hwm.max(max_at);
@@ -436,11 +545,23 @@ impl CostTable {
                 _ => {}
             }
         }
+        // Per-band node_count = Σ exposure_secs / Δt over the batch
+        // window (each `kind='exposure'` row is "node-seconds accrued
+        // since last flush", so the sum ÷ wall-window is mean live
+        // nodes). Skip when `prev_hwm == 0` — first refresh has no
+        // window baseline, and a `Δt` from epoch would zero the count.
+        let dt = hwm - prev_hwm;
         for (band, (n, d)) in per_band {
             self.lambda
                 .entry(band)
                 .or_default()
                 .update(n, d, hwm, LAMBDA_HALFLIFE_SECS);
+            if prev_hwm > 0.0 && dt > 0.0 {
+                self.node_count
+                    .entry(band)
+                    .or_default()
+                    .update(d / dt, hwm, LAMBDA_HALFLIFE_SECS);
+            }
         }
         Ok(())
     }
@@ -453,23 +574,10 @@ impl CostTable {
     /// the last (partial) fold.
     pub fn fold_prices(&mut self, obs: &HashMap<(Band, Cap), f64>, now: f64) {
         for (&k, &v) in obs {
-            let prev = self.price.get(&k).copied().unwrap_or(PriceEma {
-                value: v,
-                updated_at: 0.0,
-            });
-            let dt = (now - prev.updated_at).max(0.0);
-            let decay = if prev.updated_at == 0.0 {
-                0.0
-            } else {
-                0.5f64.powf(dt / SPOT_HALFLIFE_SECS)
-            };
-            self.price.insert(
-                k,
-                PriceEma {
-                    value: prev.value * decay + v * (1.0 - decay),
-                    updated_at: now,
-                },
-            );
+            self.price
+                .entry(k)
+                .or_default()
+                .update(v, now, SPOT_HALFLIFE_SECS);
         }
     }
 
@@ -491,6 +599,8 @@ impl CostTable {
                 })
                 .collect(),
             lambda,
+            node_count: HashMap::new(),
+            stale_clamp: false,
             cluster: String::new(),
         }
     }
@@ -500,6 +610,12 @@ impl CostTable {
     pub fn set_price(&mut self, band: Band, cap: Cap, value: f64, updated_at: f64) {
         self.price
             .insert((band, cap), PriceEma { value, updated_at });
+    }
+
+    /// Test setter: per-band node-count EMA.
+    #[cfg(test)]
+    pub fn set_node_count(&mut self, band: Band, value: f64, updated_at: f64) {
+        self.node_count.insert(band, PriceEma { value, updated_at });
     }
 }
 
@@ -685,7 +801,7 @@ pub async fn spot_price_poller(
     } else {
         None
     };
-    let mut tick = tokio::time::interval(Duration::from_secs(600));
+    let mut tick = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut was_leader = false;
     loop {
@@ -694,7 +810,8 @@ pub async fn spot_price_poller(
             _ = shutdown.cancelled() => return,
             _ = tick.tick() => {},
         }
-        if !poller_tick_prelude(&mut was_leader, leader.is_leader(), &cost, &db).await {
+        if !poller_tick_prelude(&mut was_leader, leader.is_leader(), &cost, &db, now_epoch()).await
+        {
             continue;
         }
         // Snapshot → mutate → swap: parking_lot guards aren't Send, so
@@ -717,9 +834,12 @@ pub async fn spot_price_poller(
         if let Err(e) = snap.persist(&db).await {
             tracing::warn!(error = %e, "cost-table persist failed");
         }
+        // Re-evaluate stale-clamp on the post-fold timestamps and
+        // re-emit the gauge so the leader's view doesn't lag one tick.
+        let now = now_epoch();
+        snap.apply_stale_clamp(now);
+        super::metrics::hw_cost_stale_seconds(now - snap.price_updated_at());
         *cost.write() = snap;
-        // Re-emit post-swap so the leader's gauge doesn't lag one tick.
-        super::metrics::hw_cost_stale_seconds(now_epoch() - cost.read().price_updated_at());
     }
 }
 
@@ -759,8 +879,9 @@ pub(crate) async fn poller_tick_prelude(
     is_leader: bool,
     cost: &std::sync::Arc<parking_lot::RwLock<CostTable>>,
     db: &SchedulerDb,
+    now: f64,
 ) -> bool {
-    super::metrics::hw_cost_stale_seconds(now_epoch() - cost.read().price_updated_at());
+    super::metrics::hw_cost_stale_seconds(now - cost.read().price_updated_at());
     if !is_leader {
         *was_leader = false;
         return false;
@@ -769,7 +890,12 @@ pub(crate) async fn poller_tick_prelude(
     if !*was_leader {
         let cluster = cost.read().cluster().to_owned();
         match CostTable::load(db, &cluster).await {
-            Ok(fresh) => {
+            Ok(mut fresh) => {
+                // Reloaded EMA may itself be stale (previous leader
+                // wedged before failover) — evaluate clamp on the
+                // resumed timestamps so the FIRST solve under new
+                // leadership doesn't trust a dead snapshot.
+                fresh.apply_stale_clamp(now);
                 *cost.write() = fresh;
                 *was_leader = true;
             }
@@ -951,26 +1077,49 @@ mod tests {
         assert!(e.value_or(0.0) > 0.1);
     }
 
+    // r[verify sched.sla.hw-class.lambda-gamma-poisson]
     #[test]
-    fn lambda_decays_to_seed_after_48h() {
+    fn lambda_gamma_poisson_pools_toward_seed() {
+        // 1 interrupt over 1h exposure, 1-node fleet, seed=1e-5/s.
+        // n_λ = 86400·max(1,1) = 86400.
+        // λ̂ = (1 + 86400·1e-5) / (3600 + 86400) = 1.864 / 90000 ≈ 2.071e-5.
+        // Bare ratio is 1/3600 ≈ 2.78e-4 — pooling pulls it 13× toward
+        // the seed instead of letting one event spike the band.
+        let l = lambda_hat(1.0, 3600.0, 1.0, 1e-5);
+        let want = (1.0 + 86400.0 * 1e-5) / (3600.0 + 86400.0);
+        assert!((l - want).abs() < 1e-12, "{l}");
+        assert!((l - 2.071e-5).abs() / 2.071e-5 < 0.01);
+        assert!(l < 1.0 / 3600.0, "pooled below the bare ratio");
+    }
+
+    #[test]
+    fn lambda_seed_floor_when_spot_exiled() {
+        // node_count_ema=0 → max(1,0)=1 → n_λ=86400. With 0 interrupts,
+        // 0 exposure: λ̂ = (0 + 86400·seed) / (0 + 86400) = seed. The
+        // floor is what keeps λ̂ from freezing at the spike when exile
+        // drives node_count → 0.
+        let l = lambda_hat(0.0, 0.0, 0.0, 1e-5);
+        assert!((l - 1e-5).abs() < 1e-12);
+        // Same floor at the CostTable level (no entries → seed).
+        assert!((CostTable::default().lambda_band(Band::Mid) - LAMBDA_SEED).abs() < 1e-12);
+    }
+
+    #[test]
+    fn lambda_band_uses_node_count_scaler() {
+        // 100-node fleet: n_λ = 86400·100 = 8.64e6. Prior swamps a
+        // single interrupt over 1h — λ̂ ≈ seed (within 0.05%).
         let mut t = CostTable::default();
         t.lambda.insert(
             Band::Mid,
             RatioEma {
-                numerator: 100.0,
-                denominator: 100.0, // λ=1.0 — absurdly high
+                numerator: 1.0,
+                denominator: 3600.0,
                 updated_at: 1000.0,
             },
         );
-        // At updated_at: raw λ.
-        assert!((t.lambda_band_at(Band::Mid, 1000.0) - 1.0).abs() < 1e-9);
-        // 48h later: fully blended to seed.
-        let later = 1000.0 + LAMBDA_DECAY_TO_SEED_AFTER_SECS;
-        assert!((t.lambda_band_at(Band::Mid, later) - LAMBDA_SEED).abs() < 1e-9);
-        // Halfway: midpoint.
-        let mid = 1000.0 + LAMBDA_DECAY_TO_SEED_AFTER_SECS / 2.0;
-        let v = t.lambda_band_at(Band::Mid, mid);
-        assert!(v > LAMBDA_SEED && v < 1.0);
+        t.set_node_count(Band::Mid, 100.0, 1000.0);
+        let l = t.lambda_band(Band::Mid);
+        assert!((l - LAMBDA_SEED).abs() / LAMBDA_SEED < 1e-3, "{l}");
     }
 
     #[test]
@@ -1117,6 +1266,102 @@ mod tests {
         );
     }
 
+    /// Full EMA-state (price + λ num/den + node_count) round-trips PG
+    /// so a lease failover resumes the smoothed values rather than
+    /// resetting to seed. ADR-023 §Cost-model "persisted to PG each
+    /// tick".
+    #[tokio::test]
+    async fn ema_state_round_trips_pg() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        let mut t = CostTable::seeded("c");
+        t.set_price(Band::Mid, Cap::Spot, 0.0123, 7000.0);
+        t.lambda.insert(
+            Band::Mid,
+            RatioEma {
+                numerator: 3.0,
+                denominator: 9000.0,
+                updated_at: 7100.0,
+            },
+        );
+        t.set_node_count(Band::Mid, 12.5, 7100.0);
+        t.persist(&sdb).await.unwrap();
+
+        let r = CostTable::load(&sdb, "c").await.unwrap();
+        assert!((r.price(Band::Mid, Cap::Spot) - 0.0123).abs() < 1e-9);
+        let l = r.lambda.get(&Band::Mid).unwrap();
+        assert!((l.numerator - 3.0).abs() < 1e-9);
+        assert!((l.denominator - 9000.0).abs() < 1e-9);
+        assert!((l.updated_at - 7100.0).abs() < 1.0);
+        let nc = r.node_count.get(&Band::Mid).unwrap();
+        assert!((nc.value - 12.5).abs() < 1e-9);
+        assert!((nc.updated_at - 7100.0).abs() < 1.0);
+        // λ̂ recomputed identically from the round-tripped state.
+        assert!((r.lambda_band(Band::Mid) - t.lambda_band(Band::Mid)).abs() < 1e-12);
+    }
+
+    /// `> 6 × pollInterval` stale → `price()` clamps to the static seed
+    /// and `_hw_cost_fallback_total{reason="stale"}` fires. Fresh →
+    /// clamp clears and `price()` reads through.
+    #[test]
+    fn stale_price_clamps_to_seed_and_emits_fallback() {
+        let mut t = CostTable::seeded("c");
+        t.set_price(Band::Hi, Cap::Spot, 0.5, 1000.0);
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        let _g = metrics::set_default_local_recorder(&rec);
+
+        // Stale: now − updated_at = 7200 > 3600.
+        assert!(t.apply_stale_clamp(1000.0 + STALE_CLAMP_AFTER_SECS + 1.0));
+        assert!(
+            (t.price(Band::Hi, Cap::Spot) - seed_price(Band::Hi, Cap::Spot)).abs() < 1e-9,
+            "clamped → seed, not 0.5"
+        );
+        let fired = snap.snapshot().into_vec().iter().any(|(ck, _, _, _)| {
+            ck.key().name() == "rio_scheduler_sla_hw_cost_fallback_total"
+                && ck.key().labels().any(|l| l.value() == "stale")
+        });
+        assert!(fired, "fallback_total{{reason=stale}} must increment");
+
+        // Fresh: clamp clears; price() reads through.
+        t.set_price(Band::Hi, Cap::Spot, 0.5, 9000.0);
+        assert!(!t.apply_stale_clamp(9000.0 + 60.0));
+        assert!((t.price(Band::Hi, Cap::Spot) - 0.5).abs() < 1e-9);
+    }
+
+    /// `refresh_lambda` derives `node_count_ema = Σ exposure / Δt` over
+    /// the batch window. First refresh has no baseline (`prev_hwm=0`)
+    /// → skipped; second refresh computes `120s / 60s = 2 nodes`.
+    #[tokio::test]
+    async fn refresh_lambda_derives_node_count_from_exposure() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        sqlx::query(
+            "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, at) VALUES \
+             ('c', 'aws-8-nvme-hi', 'exposure', 60, to_timestamp(1000))",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let mut t = CostTable::seeded("c");
+        t.refresh_lambda(&sdb).await.unwrap();
+        assert!(t.node_count.is_empty(), "first refresh: no baseline");
+
+        sqlx::query(
+            "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, at) VALUES \
+             ('c', 'aws-8-nvme-hi', 'exposure', 120, to_timestamp(1060))",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        t.refresh_lambda(&sdb).await.unwrap();
+        let nc = t.node_count.get(&Band::Hi).unwrap().value;
+        assert!(
+            (nc - 2.0).abs() < 1e-9,
+            "120 node-secs / 60s window = 2; got {nc}"
+        );
+    }
+
     /// Regression: a single global `price_updated_at` advanced after
     /// folding only keys present in `obs`; a band absent from a partial
     /// obs kept its stale value but its decay reference moved forward
@@ -1127,6 +1372,8 @@ mod tests {
         let mut t = CostTable {
             price: HashMap::new(),
             lambda: HashMap::new(),
+            node_count: HashMap::new(),
+            stale_clamp: false,
             cluster: String::new(),
         };
         let mut obs = HashMap::new();
@@ -1181,7 +1428,7 @@ mod tests {
         let mut was_leader = false;
         let proceed = {
             let _g = metrics::set_default_local_recorder(&rec);
-            poller_tick_prelude(&mut was_leader, false, &cost, &sdb).await
+            poller_tick_prelude(&mut was_leader, false, &cost, &sdb, 6100.0).await
         };
         assert!(!proceed);
         let saw_gauge = snapshotter
@@ -1194,7 +1441,7 @@ mod tests {
         assert!((cost.read().price(Band::Hi, Cap::Spot) - 0.02).abs() < 1e-9);
 
         // (b) false→true edge: reloads from PG, returns true.
-        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &sdb).await;
+        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &sdb, 6100.0).await;
         assert!(proceed);
         assert!(was_leader);
         assert!(
@@ -1205,7 +1452,7 @@ mod tests {
         // Subsequent leader tick: no reload (would clobber in-flight
         // mutation if it did).
         cost.write().set_price(Band::Hi, Cap::Spot, 0.09, 6000.0);
-        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &sdb).await;
+        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &sdb, 6100.0).await;
         assert!(proceed);
         assert!((cost.read().price(Band::Hi, Cap::Spot) - 0.09).abs() < 1e-9);
     }
@@ -1241,7 +1488,7 @@ mod tests {
         let bad_db = SchedulerDb::new(bad.pool.clone());
 
         let mut was_leader = false;
-        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &bad_db).await;
+        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &bad_db, 6100.0).await;
         assert!(
             !proceed,
             "load() Err → tick body skipped (no persist of stale snapshot)"
@@ -1256,7 +1503,7 @@ mod tests {
         );
 
         // Retry with a working DB: reload succeeds, latches, proceeds.
-        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &sdb).await;
+        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &sdb, 6100.0).await;
         assert!(proceed, "retry with working DB → proceed");
         assert!(was_leader, "retry success → latched");
         assert!(

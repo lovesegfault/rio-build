@@ -1409,15 +1409,18 @@ mod tests {
     fn spot_infeasible_when_p_gt_half() {
         // λ huge ⇒ p(cap_c) > 0.5 for every band ⇒ spot rejected,
         // on-demand survives. Fix temp=0 (greedy) so the pick is
-        // deterministic.
+        // deterministic. Gamma-Poisson pooling means a single 1/1
+        // ratio is pulled to ~seed; the data must show "many
+        // interrupts over little exposure" to overwhelm the n_λ
+        // prior (≈ 1e6/86400 ≈ 11.6/s).
         let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
         let mut lambda = HashMap::new();
         for b in Band::ALL {
             lambda.insert(
                 b,
                 super::super::cost::RatioEma {
-                    numerator: 1.0,
-                    denominator: 1.0, // λ=1/s — absurd
+                    numerator: 1e6,
+                    denominator: 1.0,
                     updated_at: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()

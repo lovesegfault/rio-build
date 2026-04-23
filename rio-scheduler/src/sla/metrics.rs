@@ -82,9 +82,9 @@ pub fn describe_all() {
     describe_counter!(
         "rio_scheduler_sla_hw_cost_fallback_total",
         "cost-poller fell back from a live spot-price source. Labeled \
-         `reason` ∈ {api_error, empty_history, parse}. Distinct from \
-         `_hw_cost_stale_seconds` (which measures age, not the \
-         fallback event)."
+         `reason` ∈ {api_error, empty_history, parse, stale}. `stale`: \
+         `_hw_cost_stale_seconds > 6 × pollInterval` → price() clamped \
+         to the helm seed."
     );
     describe_counter!(
         "rio_scheduler_sla_resize_retry_total",
