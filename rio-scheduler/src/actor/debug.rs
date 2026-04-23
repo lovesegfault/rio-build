@@ -386,6 +386,52 @@ impl DagActor {
         });
     }
 
+    /// Inject a derivation directly at the given `status`. Same row
+    /// defaults as [`Self::test_inject_ready`]; bypasses transition
+    /// validation. For DAG-shape tests (forecast frontier, dep walks)
+    /// that need Queued/Running nodes without merge+dispatch.
+    pub(crate) fn test_inject_at(&mut self, hash: &str, system: &str, status: DerivationStatus) {
+        let state = crate::state::DerivationState::from_recovery_row(
+            crate::db::RecoveryDerivationRow::test_default(hash, system),
+            status,
+        )
+        .expect("test_drv_path generates valid StorePath");
+        self.dag.insert_recovered_node(state);
+        self.dag
+            .node_mut(hash)
+            .expect("just inserted")
+            .probed_generation = 1;
+    }
+
+    /// Add a DAG edge: `parent` depends on `child`.
+    pub(crate) fn test_inject_edge(&mut self, parent: &str, child: &str) {
+        self.dag.insert_recovered_edge(parent.into(), child.into());
+    }
+
+    /// Set up a Running dep for forecast-ETA tests: `last_intent.
+    /// predicted.wall_secs = t_ref` and `running_since = now -
+    /// elapsed_secs`. `cores` is the dispatched core count
+    /// (`SolvedIntent.cores`). The drv MUST already be in the DAG.
+    pub(crate) fn test_set_running_eta(
+        &mut self,
+        hash: &str,
+        t_ref_secs: f64,
+        elapsed_secs: u64,
+        cores: u32,
+    ) {
+        let state = self.dag.node_mut(hash).expect("node exists");
+        state.set_status_for_test(DerivationStatus::Running);
+        state.running_since = Some(backdate(elapsed_secs));
+        state.sched.last_intent = Some(crate::state::SolvedIntent {
+            cores,
+            predicted: Some(crate::sla::solve::SlaPrediction {
+                wall_secs: Some(t_ref_secs),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
+
     /// Inject a Ready non-FOD with a given `resource_floor.{mem,disk}_bytes`.
     /// For the D4 solve_intent_for-clamps-at-floor test — bypasses the
     /// disconnect→`bump_floor_or_count` dance.

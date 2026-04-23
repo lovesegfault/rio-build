@@ -1483,6 +1483,213 @@ async fn compute_spawn_intents_priority_sorted() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// §13b forecast frontier (A10)
+// ---------------------------------------------------------------------------
+
+/// Bare actor with `[sla].lead_time_seed` populated so the forecast
+/// pass is reachable (`max_lead > 0`). Ceilings/probe from
+/// [`test_sla_config`] so unfitted drvs solve to `probe.cpu = 4`
+/// cores.
+fn bare_actor_forecast(pool: sqlx::PgPool, max_lead: f64, max_forecast_cores: u32) -> DagActor {
+    use crate::sla::config::CapacityType;
+    let mut sla = test_sla_config();
+    sla.lead_time_seed
+        .insert(("intel-7".into(), CapacityType::Spot), max_lead);
+    sla.max_forecast_cores_per_tenant = max_forecast_cores;
+    bare_actor_cfg(
+        pool,
+        DagActorConfig {
+            sla,
+            ..Default::default()
+        },
+    )
+}
+
+/// ADR-023 §Forecast: forecast frontier is exactly one DAG layer. A
+/// Queued drv whose every incomplete dep is Running with `ETA <
+/// max_h lead_time` emits a forecast intent; a Queued drv with a
+/// Queued dep does NOT (no progress-grounded ETA — propagating
+/// `ETA(B)=ETA(A)+T(B)` would compound σ_resid per hop and admit
+/// trivial-drv fanout chains).
+// r[verify sched.sla.forecast.one-layer]
+#[tokio::test]
+async fn forecast_frontier_one_layer_only() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_forecast(db.pool.clone(), 45.0, 2_000);
+
+    // DAG: a(Running, T=100, elapsed=70 → eta=30) → b(Queued) → c(Queued)
+    // lead_time=45. b is forecast (30 < 45). c is NOT (b is Queued,
+    // not Running). Also d(Queued) ← e(Ready): e is not Running →
+    // d not forecast.
+    actor.test_inject_at("a", "x86_64-linux", DerivationStatus::Running);
+    actor.test_inject_at("b", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_at("c", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_at("d", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_at("e", "x86_64-linux", DerivationStatus::Ready);
+    actor.test_inject_edge("b", "a");
+    actor.test_inject_edge("c", "b");
+    actor.test_inject_edge("d", "e");
+    actor.test_set_running_eta("a", 100.0, 70, 8);
+
+    let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
+    let by_id: std::collections::HashMap<_, _> = snap
+        .intents
+        .iter()
+        .map(|i| (i.intent_id.as_str(), i))
+        .collect();
+
+    let b = by_id
+        .get("b")
+        .expect("b is forecast (dep Running, eta<lead)");
+    assert!(
+        (b.eta_seconds - 30.0).abs() < 2.0,
+        "b.eta = T(c)-elapsed = 100-70 = 30, got {}",
+        b.eta_seconds
+    );
+    assert!(!by_id.contains_key("c"), "c NOT forecast: dep b is Queued");
+    assert!(
+        !by_id.contains_key("d"),
+        "d NOT forecast: dep e is Ready (not Running)"
+    );
+    // e is Ready → emitted at eta=0 (the Ready loop, not forecast).
+    assert_eq!(by_id["e"].eta_seconds, 0.0, "Ready ⇒ eta=0");
+    // Ready-before-forecast in the sort: e (eta=0) precedes b (eta>0)
+    // regardless of priority (both default 0 here).
+    let pos_e = snap
+        .intents
+        .iter()
+        .position(|i| i.intent_id == "e")
+        .unwrap();
+    let pos_b = snap
+        .intents
+        .iter()
+        .position(|i| i.intent_id == "b")
+        .unwrap();
+    assert!(pos_e < pos_b, "Ready sorts before forecast");
+}
+
+/// Panel-13 S1 fix: ETA is REMAINING, not total. `T(c) − elapsed`,
+/// clamped at 0. Regression: an early draft used `predicted.wall_secs`
+/// directly → forecast pods spawned `T(c)` early, idling for `elapsed`
+/// before the dep completed.
+// r[verify sched.sla.forecast.one-layer]
+#[tokio::test]
+async fn eta_is_remaining_not_total() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_forecast(db.pool.clone(), 200.0, 2_000);
+
+    // a: T=100, elapsed=40 → eta=60. b: max-across-deps with c
+    // (T=50, elapsed=80 → eta=0, clamped). d: dep elapsed > T → 0.
+    actor.test_inject_at("a", "x86_64-linux", DerivationStatus::Running);
+    actor.test_inject_at("c", "x86_64-linux", DerivationStatus::Running);
+    actor.test_inject_at("b", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_at("d", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_edge("b", "a");
+    actor.test_inject_edge("b", "c");
+    actor.test_inject_edge("d", "c");
+    actor.test_set_running_eta("a", 100.0, 40, 8);
+    actor.test_set_running_eta("c", 50.0, 80, 4);
+
+    let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
+    let by_id: std::collections::HashMap<_, _> = snap
+        .intents
+        .iter()
+        .map(|i| (i.intent_id.as_str(), i))
+        .collect();
+
+    let b = by_id["b"];
+    assert!(
+        (b.eta_seconds - 60.0).abs() < 2.0,
+        "b.eta = max(100-40, max(0, 50-80)) = max(60, 0) = 60, got {}",
+        b.eta_seconds
+    );
+    assert!(b.eta_seconds < 100.0, "remaining, NOT total T(c)");
+    let d = by_id["d"];
+    assert!(
+        d.eta_seconds >= 0.0 && d.eta_seconds < 2.0,
+        "d.eta clamped at 0 (elapsed > T), got {}",
+        d.eta_seconds
+    );
+}
+
+/// §Threat-model gap (d): `max_forecast_cores_per_tenant` debited by
+/// Ready cores BEFORE forecast intents are admitted. A tenant whose
+/// Ready frontier already consumes ≥ the cap emits zero forecast
+/// intents — its layer-2 fanout cannot capture shared `maxFleetCores`
+/// ahead of other tenants' Ready work.
+// r[verify sched.sla.forecast.tenant-ceiling]
+#[tokio::test]
+async fn forecast_tenant_ceiling_subtracts_ready_first() {
+    let db = TestDb::new(&MIGRATOR).await;
+    // probe.cpu=4 → every unfitted intent is 4 cores. cap=10 cores.
+    let mut actor = bare_actor_forecast(db.pool.clone(), 200.0, 10);
+
+    // 3 Ready (Σ 12 cores) + 5 Queued forecast-candidates (each dep
+    // Running, eta<lead). budget = 10 − 12 = −2 → no forecast.
+    for r in ["r0", "r1", "r2"] {
+        actor.test_inject_ready(r, None, "x86_64-linux", false);
+    }
+    for q in ["q0", "q1", "q2", "q3", "q4"] {
+        let dep = format!("{q}dep");
+        actor.test_inject_at(&dep, "x86_64-linux", DerivationStatus::Running);
+        actor.test_inject_at(q, "x86_64-linux", DerivationStatus::Queued);
+        actor.test_inject_edge(q, &dep);
+        actor.test_set_running_eta(&dep, 50.0, 10, 4);
+    }
+
+    let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
+    let n_forecast = snap.intents.iter().filter(|i| i.eta_seconds > 0.0).count();
+    let n_ready = snap.intents.iter().filter(|i| i.eta_seconds == 0.0).count();
+    assert_eq!(n_ready, 3, "Ready unaffected by ceiling");
+    assert_eq!(
+        n_forecast, 0,
+        "Ready Σ12 > cap 10 → forecast budget exhausted before pass runs"
+    );
+
+    // Same shape with cap=20: budget = 20 − 12 = 8 → 2 forecast
+    // intents (2×4=8) admitted, 3rd (4 > 0) rejected.
+    let mut actor = bare_actor_forecast(db.pool.clone(), 200.0, 20);
+    for r in ["r0", "r1", "r2"] {
+        actor.test_inject_ready(r, None, "x86_64-linux", false);
+    }
+    for q in ["q0", "q1", "q2", "q3", "q4"] {
+        let dep = format!("{q}dep");
+        actor.test_inject_at(&dep, "x86_64-linux", DerivationStatus::Running);
+        actor.test_inject_at(q, "x86_64-linux", DerivationStatus::Queued);
+        actor.test_inject_edge(q, &dep);
+        actor.test_set_running_eta(&dep, 50.0, 10, 4);
+    }
+    let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
+    let n_forecast = snap.intents.iter().filter(|i| i.eta_seconds > 0.0).count();
+    assert_eq!(
+        n_forecast, 2,
+        "budget 20−12=8 admits exactly 2×4-core forecast intents"
+    );
+}
+
+/// `lead_time_seed` empty → `max_lead = 0` → forecast pass disabled.
+/// Static-mode (no `[sla].hw_classes`, no §13b controller) deploys
+/// stay on the v1.0 Ready-only path.
+// r[verify sched.sla.forecast.one-layer]
+#[tokio::test]
+async fn forecast_disabled_on_empty_lead_time_seed() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_sla(db.pool.clone()); // lead_time_seed = {}
+
+    actor.test_inject_at("a", "x86_64-linux", DerivationStatus::Running);
+    actor.test_inject_at("b", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_edge("b", "a");
+    actor.test_set_running_eta("a", 100.0, 70, 8);
+
+    let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
+    assert!(
+        snap.intents.iter().all(|i| i.eta_seconds == 0.0),
+        "no forecast when lead_time_seed empty"
+    );
+    assert!(!snap.intents.iter().any(|i| i.intent_id == "b"));
+}
+
 /// End-to-end actor path: merge → Ready → intent shows up; dispatch →
 /// Assigned → intent drops (only Ready emits intents). Also covers
 /// `solve_intent_for`'s `deadline_secs` clamp:

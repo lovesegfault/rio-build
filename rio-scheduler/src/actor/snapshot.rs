@@ -43,6 +43,64 @@ fn term_to_cell(
     Some((h.0.clone(), cap))
 }
 
+/// Request-side filter shared by the Ready and forecast passes of
+/// [`DagActor::compute_spawn_intents`]: kind (ADR-019 boundary),
+/// per-arch systems intersection (I-107/I-143), I-176/I-181 feature
+/// subset + ∅-guard.
+fn passes_intent_filter(
+    state: &crate::state::DerivationState,
+    kind: rio_proto::types::ExecutorKind,
+    req: &SpawnIntentsRequest,
+) -> bool {
+    if req.kind.is_some_and(|k| k != kind) {
+        return false;
+    }
+    if !req.systems.is_empty() && !req.systems.iter().any(|s| s == &state.system) {
+        return false;
+    }
+    if let Some(pf) = req.features.as_deref() {
+        if !pf.is_empty() && state.required_features.is_empty() {
+            return false;
+        }
+        if !state.required_features.iter().all(|f| pf.contains(f)) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Progress-grounded ETA (seconds) for a running dependency.
+///
+/// `T(c) − elapsed`, clamped at 0 (panel-13 S1). `T(c)` is the
+/// dispatch-time `SlaPrediction::wall_secs` — *reference-seconds*
+/// (the fit ingests hw-normalized samples and `h_placed` is unknown
+/// to the scheduler until the builder reports it on completion). The
+/// ref↔wall skew (factor ∈ [0.7, 1.4] across hw classes) is the
+/// `eta_error` term the §13b lead-time DDSketch closed-loop absorbs;
+/// for §13a the controller filters `eta_seconds > 0` so only the
+/// `eta < max_lead` gate is sensitive to it.
+///
+/// `Assigned` (dispatched, not yet acked → no `running_since`) is
+/// treated as `elapsed = 0`. `None` for any branch where
+/// `solve_intent_for` produced no fitted-curve prediction (probe /
+/// override / cold-start) — a dep without `T(c)` has no
+/// progress-grounded ETA, same exclusion as §Forecast's "Queued dep
+/// has no progress-grounded ETA".
+fn running_dep_eta(dep: &crate::state::DerivationState) -> Option<f64> {
+    let t = dep
+        .sched
+        .last_intent
+        .as_ref()?
+        .predicted
+        .as_ref()?
+        .wall_secs?;
+    let elapsed = dep
+        .running_since
+        .map(|r| r.elapsed().as_secs_f64())
+        .unwrap_or(0.0);
+    Some((t - elapsed).max(0.0))
+}
+
 impl DagActor {
     /// Dispatch a read-only [`AdminQuery`].
     pub(super) fn handle_admin(&self, q: AdminQuery) {
@@ -237,6 +295,61 @@ impl DagActor {
         let mut intents = Vec::new();
         let mut queued_by_system: HashMap<String, u64> = HashMap::new();
         let probe_gate = self.store_client.is_some();
+        // r[impl sched.sla.forecast.tenant-ceiling]
+        // §Threat-model gap (d): per-tenant `max_forecast_cores_per_
+        // tenant` budget, debited by Ready cores BEFORE the forecast
+        // pass runs. Keyed on `attributed_tenant` (Option<Uuid> —
+        // `None` for orphaned/recovered nodes; bucketed together so
+        // they're capped, not exempt).
+        let mut tenant_forecast_budget: HashMap<Option<Uuid>, i64> = HashMap::new();
+        let cap = i64::from(self.sla_config.max_forecast_cores_per_tenant);
+
+        // SpawnIntent constructor shared by Ready + forecast passes.
+        // The HMAC token's expiry is `deadline + eta + 5min` so a
+        // forecast-spawned pod's token covers its boot horizon.
+        let to_proto = |drv_hash: &str,
+                        state: &crate::state::DerivationState,
+                        intent: &SolvedIntent,
+                        eta_seconds: f64|
+         -> rio_proto::types::SpawnIntent {
+            let kind = crate::state::kind_for_drv(state.is_fixed_output);
+            // r[impl sec.executor.identity-token+2]
+            let executor_token = self
+                .hmac_signer
+                .as_ref()
+                .map(|s| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    s.sign(&rio_auth::hmac::ExecutorClaims {
+                        intent_id: drv_hash.to_string(),
+                        kind: kind.into(),
+                        expiry_unix: now
+                            .saturating_add(u64::from(intent.deadline_secs))
+                            .saturating_add(eta_seconds as u64)
+                            .saturating_add(300),
+                    })
+                })
+                .unwrap_or_default();
+            rio_proto::types::SpawnIntent {
+                intent_id: drv_hash.to_string(),
+                cores: intent.cores,
+                mem_bytes: intent.mem_bytes,
+                disk_bytes: intent.disk_bytes,
+                // Compat (proto field 5): controller derives the
+                // single-cell selector from `node_affinity[0]` until
+                // A18; scheduler-side stays empty.
+                node_selector: HashMap::new(),
+                kind: kind.into(),
+                system: state.system.clone(),
+                required_features: state.required_features.clone(),
+                deadline_secs: intent.deadline_secs,
+                executor_token,
+                node_affinity: intent.node_affinity.clone(),
+                eta_seconds,
+            }
+        };
 
         for (drv_hash, state) in self.dag.iter_nodes() {
             if state.status() != DerivationStatus::Ready {
@@ -267,36 +380,23 @@ impl DagActor {
 
             let kind = crate::state::kind_for_drv(state.is_fixed_output);
             // r[impl sched.admin.spawn-intents.feature-filter]
-            // ── request filter ────────────────────────────────────
             // kind: Unknown (None) = unfiltered. Otherwise must match
             // — the ADR-019 airgap boundary (FOD ⇔ Fetcher) means a
             // Builder pool never sees a Fetcher intent and vice-versa.
-            if req.kind.is_some_and(|k| k != kind) {
-                continue;
-            }
             // systems: empty = unfiltered. I-107/I-143 per-arch
             // intersection so an x86-64 pool doesn't spawn for an
-            // aarch64-only backlog.
-            if !req.systems.is_empty() && !req.systems.iter().any(|s| s == &state.system) {
-                continue;
-            }
-            // features: I-176 subset check + I-181 ∅-guard. `None` =
-            // unfiltered (CLI, status display). `Some([])` = a
-            // featureless pool — only emits intents with empty
-            // `required_features`. `Some(pf)` with `pf ≠ ∅` = a
-            // feature-gated pool — emits intents whose
-            // `required_features ⊆ pf` AND `required_features ≠ ∅`
+            // aarch64-only backlog. features: I-176 subset check +
+            // I-181 ∅-guard. `None` = unfiltered (CLI, status
+            // display). `Some([])` = featureless pool — only emits
+            // intents with empty `required_features`. `Some(pf)` with
+            // `pf ≠ ∅` = feature-gated pool — emits intents whose
+            // `required_features ⊆ pf ∧ required_features ≠ ∅`
             // (∅-feature work belongs to the featureless pool;
             // dispatch's overflow walk tries cheapest first, so a
             // kvm builder spawned for ∅-feature work would idle until
             // activeDeadlineSeconds).
-            if let Some(pf) = req.features.as_deref() {
-                if !pf.is_empty() && state.required_features.is_empty() {
-                    continue;
-                }
-                if !state.required_features.iter().all(|f| pf.contains(f)) {
-                    continue;
-                }
+            if !passes_intent_filter(state, kind, req) {
+                continue;
             }
 
             // r[impl sched.sla.intent-from-solve]
@@ -308,67 +408,107 @@ impl DagActor {
             // before the pod heartbeats, the match misses and dispatch
             // falls through to pick-from-queue.
             let intent = self.solve_intent_for(state);
+            // gap (d): debit Ready cores from the tenant's forecast
+            // budget. A negative balance is fine — the forecast pass
+            // checks `> cores`, not `>= 0`.
+            let tenant = state.attributed_tenant(&self.builds);
+            *tenant_forecast_budget.entry(tenant).or_insert(cap) -= i64::from(intent.cores);
             // ADR-023 §13a affinity is deterministic (memoized) — no
             // selector-pin needed; the controller's `reap_stale_for_
             // intents` sees the SAME fingerprint across re-polls until
-            // `inputs_gen` bumps or the ICE mask changes.
-            let node_affinity = intent.node_affinity;
-            // r[impl sec.executor.identity-token+2]
-            // Sign per-intent so the spawned pod can prove on
-            // BuildExecution/Heartbeat that it was spawned for THIS
-            // intent. Expiry: deadline + 5-min grace (the pod's
-            // `activeDeadlineSeconds` is the upper bound; a token
-            // outliving the pod is harmless). Empty when no HMAC key
-            // is configured (dev mode → scheduler verify is permissive).
-            let executor_token = self
-                .hmac_signer
-                .as_ref()
-                .map(|s| {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    s.sign(&rio_auth::hmac::ExecutorClaims {
-                        intent_id: drv_hash.to_string(),
-                        kind: kind.into(),
-                        expiry_unix: now
-                            .saturating_add(u64::from(intent.deadline_secs))
-                            .saturating_add(300),
-                    })
-                })
-                .unwrap_or_default();
+            // `inputs_gen` bumps or the ICE mask changes. eta=0 ⇔
+            // Ready.
             intents.push((
                 state.sched.priority,
-                rio_proto::types::SpawnIntent {
-                    intent_id: drv_hash.to_string(),
-                    cores: intent.cores,
-                    mem_bytes: intent.mem_bytes,
-                    disk_bytes: intent.disk_bytes,
-                    // Compat (proto field 5): controller derives the
-                    // single-cell selector from `node_affinity[0]` until
-                    // A18; scheduler-side stays empty.
-                    node_selector: HashMap::new(),
-                    kind: kind.into(),
-                    system: state.system.clone(),
-                    required_features: state.required_features.clone(),
-                    deadline_secs: intent.deadline_secs,
-                    executor_token,
-                    node_affinity,
-                    // §13b forecast horizon — A10. 0.0 ⇔ Ready.
-                    eta_seconds: 0.0,
-                },
+                to_proto(drv_hash, state, &intent, 0.0),
             ));
         }
 
-        // Priority-sort (critical-path first): `dag.iter_nodes()` is
-        // HashMap-order, but the controller truncates to `[..headroom]`
-        // under `maxConcurrent`. Unsorted, a high-priority large drv
-        // past the prefix gets no pod and fails resource-fit on the
-        // small ones spawned for low-priority work (large→small can't
-        // overflow; small→large can). Descending so the prefix is the
-        // work whose pods matter most.
-        intents.sort_unstable_by(|(a, _), (b, _)| {
-            b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+        // r[impl sched.sla.forecast.one-layer]
+        // ── §13b forecast frontier ────────────────────────────────
+        // One DAG layer: a Queued drv whose every incomplete dep is
+        // Assigned|Running with `ETA < max_h lead_time[h,cap]`. ETA is
+        // max-across-deps of `T(c) − elapsed` ([`running_dep_eta`]).
+        // The 1-layer cutoff is structural, not perf: a Queued dep has
+        // no progress-grounded ETA, propagating `ETA(B)=ETA(A)+T(B)`
+        // compounds σ_resid per hop, and trivial-drv chains would fan
+        // out to thousands of intents (ADR-023 §Forecast memo).
+        //
+        // §13a: `lead_time` is the operator-supplied
+        // `lead_time_seed[h,cap]` — the controller-side DDSketch (B7)
+        // isn't running yet (ADR L675). Empty seed map ⇒ max_lead=0 ⇒
+        // pass disabled (every eta ≥ 0 fails the gate; controller
+        // filters `eta_seconds > 0` regardless).
+        let max_lead = self
+            .sla_config
+            .lead_time_seed
+            .values()
+            .copied()
+            .fold(0.0, f64::max);
+        if max_lead > 0.0 {
+            'q: for (drv_hash, state) in self.dag.iter_nodes() {
+                if state.status() != DerivationStatus::Queued {
+                    continue;
+                }
+                let kind = crate::state::kind_for_drv(state.is_fixed_output);
+                if !passes_intent_filter(state, kind, req) {
+                    continue;
+                }
+                // 1-layer check: every incomplete dep is Assigned|
+                // Running with a fitted-curve ETA. Any Queued/Ready/
+                // Substituting/Created/unfitted dep → not
+                // forecastable. `had_incomplete` guards the
+                // (degenerate) all-deps-satisfied case — that drv
+                // belongs to the Ready loop, not here.
+                let mut eta = 0.0f64;
+                let mut had_incomplete = false;
+                for dep_hash in self.dag.get_children(drv_hash) {
+                    let Some(dep) = self.dag.node(&dep_hash) else {
+                        continue 'q;
+                    };
+                    match dep.status() {
+                        DerivationStatus::Completed | DerivationStatus::Skipped => {}
+                        DerivationStatus::Running | DerivationStatus::Assigned => {
+                            had_incomplete = true;
+                            let Some(d) = running_dep_eta(dep) else {
+                                continue 'q;
+                            };
+                            eta = eta.max(d);
+                        }
+                        _ => continue 'q,
+                    }
+                }
+                if !had_incomplete || eta >= max_lead {
+                    continue;
+                }
+                let intent = self.solve_intent_for(state);
+                let budget = tenant_forecast_budget
+                    .entry(state.attributed_tenant(&self.builds))
+                    .or_insert(cap);
+                if i64::from(intent.cores) > *budget {
+                    continue;
+                }
+                *budget -= i64::from(intent.cores);
+                intents.push((
+                    state.sched.priority,
+                    to_proto(drv_hash, state, &intent, eta),
+                ));
+            }
+        }
+
+        // (Ready, priority)-sort, both descending: `dag.iter_nodes()`
+        // is HashMap-order, but the controller truncates to
+        // `[..headroom]` under `maxConcurrent` and §13b @alg-pool's
+        // FFD pass walks Ready-before-forecast. Unsorted, a
+        // high-priority large drv past the prefix gets no pod and
+        // fails resource-fit on the small ones spawned for
+        // low-priority work (large→small can't overflow; small→large
+        // can). With forecast intents tail-sorted, a `[..headroom]`
+        // truncation drops forecast first — Ready pods matter more.
+        intents.sort_unstable_by(|(pa, ia), (pb, ib)| {
+            (ib.eta_seconds == 0.0, *pb)
+                .partial_cmp(&(ia.eta_seconds == 0.0, *pa))
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         SpawnIntentsSnapshot {
