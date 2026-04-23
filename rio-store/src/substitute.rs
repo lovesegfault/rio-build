@@ -250,12 +250,12 @@ enum ProbeOutcome {
 /// (`"Wed, 21 Oct 2026 07:28:00 GMT"`). Returns the raw duration —
 /// NO clamping; the caller's deadline budget decides whether to honor
 /// it (`r[store.substitute.probe-429-retry]`).
-fn parse_retry_after(r: &reqwest::Response) -> Option<Duration> {
-    let s = r
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?;
+///
+/// Takes `&HeaderMap` (not `&reqwest::Response`) so the HTTP-date
+/// branch is unit-testable without a live socket — see
+/// `parse_retry_after_http_date`.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let s = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
     if let Ok(secs) = s.parse::<u64>() {
         return Some(Duration::from_secs(secs));
     }
@@ -822,7 +822,7 @@ impl Substituter {
         // (250ms→16s, ~32s total) absorbs short Retry-Afters; long
         // ones fall through to the next dispatch-time probe pass.
         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = parse_retry_after(&resp);
+            let retry_after = parse_retry_after(resp.headers());
             debug!(upstream = %base, ?retry_after, "narinfo GET 429");
             metrics::counter!(
                 "rio_store_substitute_probe_ratelimited_total",
@@ -1077,7 +1077,7 @@ impl Substituter {
             )
             .increment(1);
             return Err(SubstituteError::Busy {
-                retry_after: parse_retry_after(&resp),
+                retry_after: parse_retry_after(resp.headers()),
             });
         }
         if !resp.status().is_success() {
@@ -1369,7 +1369,7 @@ impl Substituter {
                     }
                     Ok(r) if is_not_found(r.status()) => {}
                     Ok(r) if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
-                        let retry_after = parse_retry_after(&r);
+                        let retry_after = parse_retry_after(r.headers());
                         debug!(upstream = %base, ?retry_after, "HEAD probe 429");
                         metrics::counter!(
                             "rio_store_substitute_probe_ratelimited_total",
@@ -2755,8 +2755,11 @@ mod tests {
         let elapsed = t0.elapsed();
 
         assert_eq!(available.len(), 5, "HTTP-date Retry-After → retried to Hit");
-        // ~3s minus parse/round-trip slack; assert ≥1s proves the
-        // HTTP-date branch was taken (vs the 1s default for None).
+        // Smoke only: ≥1s does NOT distinguish a parsed HTTP-date
+        // (~2-3s) from the None-default 1s floor — both satisfy the
+        // gate. The HTTP-date parse branch is proven directly by
+        // `parse_retry_after_http_date` below; this test covers the
+        // end-to-end retry wiring.
         assert!(
             elapsed >= Duration::from_secs(1),
             "must sleep per HTTP-date Retry-After; elapsed={elapsed:?}"
@@ -2768,6 +2771,49 @@ mod tests {
             10,
             "first pass (5×429) + retry pass (5×200)"
         );
+    }
+
+    // r[verify store.substitute.probe-429-retry]
+    /// Direct unit test of [`parse_retry_after`]'s HTTP-date branch.
+    /// The integration test above (`check_available_429_http_date`)
+    /// can't tell a parsed ~2 s from the None-default 1 s floor via
+    /// `elapsed >= 1 s`; this asserts the parse itself returns a
+    /// duration that could ONLY have come from the HTTP-date arm.
+    #[test]
+    fn parse_retry_after_http_date() {
+        let when = std::time::SystemTime::now() + Duration::from_secs(4);
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            httpdate::fmt_http_date(when).try_into().unwrap(),
+        );
+        let got = parse_retry_after(&h).expect("HTTP-date must parse");
+        // `fmt_http_date` truncates sub-second, so a +4 s target can
+        // format to as little as +3.001 s ahead. ≥3 s still rules out
+        // both delta-seconds (the header is non-numeric) and the
+        // None-default (which would be `None`, not `Some(1s)`).
+        assert!(
+            got >= Duration::from_secs(3) && got <= Duration::from_secs(5),
+            "HTTP-date 4 s ahead → ~3-4 s; got {got:?}"
+        );
+    }
+
+    /// Delta-seconds form: `Retry-After: 7` → exactly 7 s.
+    #[test]
+    fn parse_retry_after_delta_seconds() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(reqwest::header::RETRY_AFTER, "7".try_into().unwrap());
+        assert_eq!(parse_retry_after(&h), Some(Duration::from_secs(7)));
+    }
+
+    /// Absent / malformed header → `None` (caller falls back to its
+    /// own default floor, NOT zero).
+    #[test]
+    fn parse_retry_after_absent_or_garbage() {
+        assert_eq!(parse_retry_after(&reqwest::header::HeaderMap::new()), None);
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(reqwest::header::RETRY_AFTER, "soon".try_into().unwrap());
+        assert_eq!(parse_retry_after(&h), None);
     }
 
     // r[verify store.substitute.probe-429-retry]
