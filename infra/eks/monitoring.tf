@@ -31,6 +31,13 @@ resource "helm_release" "kube_prometheus_stack" {
       name  = "crds.upgradeJob.enabled"
       value = "true"
     },
+    # --server-side apply over CRDs first installed via the chart's
+    # crds/ dir (client-side, helm field-manager) hits field-manager
+    # conflicts. --force-conflicts takes ownership.
+    {
+      name  = "crds.upgradeJob.forceConflicts"
+      value = "true"
+    },
     # hostNetwork: EKS API server can't route to overlay pod IPs for
     # admission webhooks (kube-prometheus-stack-admission). The
     # operator pod serves the webhook; hostNetwork puts it on a node
