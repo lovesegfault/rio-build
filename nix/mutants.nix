@@ -48,9 +48,21 @@ let
       pname,
       mutantsArgs,
       assertCaught ? false,
+      # Full sweep's baseline runs the WHOLE workspace's tests
+      # (golden_conformance, postgres, ssh-daemon). Smoke is
+      # scoped to one package and skips all that.
+      withWorkspaceTestDeps ? true,
     }:
     pkgs.stdenv.mkDerivation (
       sysCrateEnv.allEnv
+      // lib.optionalAttrs withWorkspaceTestDeps {
+        PG_BIN = "${pkgs.postgresql_18}/bin";
+        inherit (goldenTestEnv)
+          RIO_GOLDEN_TEST_PATH
+          RIO_GOLDEN_CA_PATH
+          RIO_GOLDEN_FORCE_HERMETIC
+          ;
+      }
       // {
         inherit pname version;
 
@@ -67,21 +79,23 @@ let
           lockFile = ../Cargo.lock;
         };
 
-        nativeBuildInputs = with pkgs; [
-          rustStable
-          rustPlatformStable.cargoSetupHook
-          cargo-mutants
-          cargo-nextest
-          jq
-          pkg-config
-          protobuf
-          cmake
-          # Test-time deps (baseline run hits the whole workspace).
-          # Same set as crateChecks' runtimeTestInputs.
-          nixPkg
-          openssh
-          postgresql_18
-        ];
+        nativeBuildInputs =
+          with pkgs;
+          [
+            rustStable
+            rustPlatformStable.cargoSetupHook
+            cargo-mutants
+            cargo-nextest
+            jq
+            pkg-config
+            protobuf
+            cmake
+          ]
+          ++ lib.optionals withWorkspaceTestDeps [
+            nixPkg
+            openssh
+            postgresql_18
+          ];
 
         buildInputs =
           with pkgs;
@@ -99,16 +113,6 @@ let
 
         PROTOC = "${pkgs.protobuf}/bin/protoc";
         LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-        PG_BIN = "${pkgs.postgresql_18}/bin";
-        # Golden fixture paths — the baseline run hits
-        # golden_conformance (workspace-wide). `inherit` from
-        # the shared goldenTestEnv attrset so new golden
-        # fixture vars propagate here automatically.
-        inherit (goldenTestEnv)
-          RIO_GOLDEN_TEST_PATH
-          RIO_GOLDEN_CA_PATH
-          RIO_GOLDEN_FORCE_HERMETIC
-          ;
         NEXTEST_HIDE_PROGRESS_BAR = "1";
 
         # `--in-place`: mutate the unpacked source in $PWD
@@ -207,6 +211,7 @@ let
       "30"
     ];
     assertCaught = true;
+    withWorkspaceTestDeps = false;
   };
 
   # Post-run report validator on the FULL mutants output. NOT a
