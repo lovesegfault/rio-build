@@ -297,6 +297,15 @@ pub struct DagActor {
     /// per-dispatch read-time mask (`A \ masked`) is applied in
     /// `solve_intent_for` AFTER reading the memo, so unmasking is free.
     pub(crate) ice: Arc<crate::sla::cost::IceBackoff>,
+    /// §13a interim ICE-clear path: `solve_intent_for` records the
+    /// first cell of `A' \ masked` per drv; the registration edge in
+    /// `handle_heartbeat` looks it up and `ice.clear()`s (heartbeat ⇒
+    /// pod scheduled ⇒ node existed ⇒ cell had capacity). Removed on
+    /// that edge or executor disconnect. §13b's
+    /// `AckSpawnedIntents.registered_cells` (NodeClaim watcher)
+    /// supersedes this once wired. DashMap: `solve_intent_for` is
+    /// `&self`.
+    pub(crate) dispatched_cells: dashmap::DashMap<DrvHash, crate::sla::config::Cell>,
     /// Per-key admissible-set memo. Keyed on `(model_key_hash,
     /// override_hash)`; `(inputs_gen, fit_content_hash)` are staleness
     /// fields, so most `compute_spawn_intents` ticks are pure cache
@@ -527,6 +536,7 @@ impl DagActor {
             sla_config: cfg.sla,
             cost_table: plumbing.cost_table,
             ice: Arc::new(crate::sla::cost::IceBackoff::new(max_lead_time)),
+            dispatched_cells: dashmap::DashMap::new(),
             solve_cache: plumbing.solve_cache,
             tick_count: 0,
             backpressure_active: Arc::new(AtomicBool::new(false)),
@@ -578,6 +588,10 @@ impl DagActor {
         // `ReportExecutorTermination` from the previous gen spuriously
         // bump `resource_floor` on a drv this generation never assigned.
         self.recently_disconnected.clear();
+        // `dispatched_cells` is keyed on the previous generation's drv
+        // hashes; a stale entry would let a heartbeat for a re-spawned
+        // pod clear the wrong cell.
+        self.dispatched_cells.clear();
         // Deliberately retained across generations:
         // - `executors`: live connections, not persisted (doc above).
         // - `ice`: cluster-level cell-backoff signal, 60s TTL self-heals.
@@ -753,11 +767,16 @@ impl DagActor {
                 ActorCommand::AckSpawnedIntents {
                     spawned,
                     unfulfillable_cells,
+                    registered_cells,
                 } => {
                     // r[impl sched.lease.standby-drops-writes] —
                     // ICE state is lease-holder only.
                     if self.leader.is_leader() {
-                        self.handle_ack_spawned_intents(&spawned, &unfulfillable_cells);
+                        self.handle_ack_spawned_intents(
+                            &spawned,
+                            &unfulfillable_cells,
+                            &registered_cells,
+                        );
                     }
                 }
                 ActorCommand::PrefetchComplete {

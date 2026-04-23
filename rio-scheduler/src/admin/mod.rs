@@ -676,6 +676,7 @@ impl AdminService for AdminServiceImpl {
             .send_unchecked(ActorCommand::AckSpawnedIntents {
                 spawned: req.spawned,
                 unfulfillable_cells: req.unfulfillable_cells,
+                registered_cells: req.registered_cells,
             })
             .await
             .map_err(|e| Status::internal(e.to_string()))?;

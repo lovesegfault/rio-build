@@ -377,6 +377,14 @@ impl DagActor {
             .remove(executor_id)
             .expect("checked get() above");
 
+        // §13a interim ICE-clear bookkeeping: drop the entry so a
+        // never-registered pod's stale cell can't be cleared by a
+        // later heartbeat for the same drv on a different cell.
+        // Disconnect itself is NOT a success signal — no `ice.clear`.
+        if let Some(intent) = &worker.auth_intent {
+            self.dispatched_cells.remove(intent.as_str());
+        }
+
         // Only decrement if worker was fully registered (stream + heartbeat).
         // Otherwise the gauge goes negative for workers that connected a stream
         // but never sent a heartbeat (increment fires on full registration only).
@@ -1090,12 +1098,26 @@ impl DagActor {
         let became_idle = !had_capacity && worker.has_capacity();
 
         if !was_registered && worker.is_registered() {
+            let auth_intent = worker.auth_intent.clone();
             info!(executor_id = %executor_id, "worker fully registered (heartbeat + stream)");
             metrics::gauge!("rio_scheduler_workers_active").increment(1.0);
             // Same hook as handle_worker_connected: whichever of
             // (stream, heartbeat) arrives SECOND triggers the warm-
             // gate initial prefetch. dual-register step 3.
             self.on_worker_registered(executor_id);
+            // r[impl sched.sla.hw-class.ice-mask]
+            // §13a interim ICE clear: heartbeat ⇒ pod scheduled ⇒
+            // node existed ⇒ the cell this pod was spawned for had
+            // capacity. `auth_intent` is the token-attested drv hash
+            // (immutable, NOT the dispatch-downgradeable `intent_id`);
+            // `dispatched_cells` was populated at `solve_intent_for`
+            // time. §13b's `AckSpawnedIntents.registered_cells`
+            // (NodeClaim watcher) supersedes once wired.
+            if let Some(intent) = auth_intent
+                && let Some((_, cell)) = self.dispatched_cells.remove(intent.as_str())
+            {
+                self.ice.clear(&cell);
+            }
         }
 
         (confirmed_phantoms, became_idle)

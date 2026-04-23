@@ -1652,7 +1652,7 @@ async fn ice_mask_is_read_time() {
 
     // Mask one cell from A' via the controller's unfulfillable report.
     let masked: crate::sla::config::Cell = ("intel-6".into(), CapacityType::Spot);
-    actor.handle_ack_spawned_intents(&[], &["intel-6:spot".into()]);
+    actor.handle_ack_spawned_intents(&[], &["intel-6:spot".into()], &[]);
     assert!(actor.ice.is_masked(&masked));
 
     // Read-time mask: the next dispatch returns A \ {masked} WITHOUT
@@ -1701,6 +1701,64 @@ async fn ice_mask_is_read_time() {
         !intent4.node_affinity.is_empty(),
         "all-masked → still emit A (best-effort reserved for envelope-infeasibility)"
     );
+}
+
+/// Regression: `ice.clear()` was wired to the Pending ack (`spawned`),
+/// not the success edge (`registered_cells`). The all-masked fallback
+/// re-emits the masked cell at `node_affinity[0]`, so each tick did
+/// `clear(C)` then `mark(C)` — `step` never climbed past 0, defeating
+/// backoff doubling. Now `spawned` is informational-only; only
+/// `registered_cells` (or first heartbeat) clears.
+// r[verify sched.sla.hw-class.ice-mask]
+#[tokio::test]
+async fn ice_step_doubles_across_mark_without_clear() {
+    use crate::sla::config::CapacityType;
+    use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm, SpawnIntent};
+    let db = TestDb::new(&MIGRATOR).await;
+    let actor = bare_actor_hw(db.pool.clone());
+    let cell: crate::sla::config::Cell = ("intel-6".into(), CapacityType::Spot);
+
+    // The controller's ack echoes back the intent it spawned a Job
+    // for. Under the all-masked fallback, `node_affinity[0]` IS the
+    // masked cell — exactly what the old `term_to_cell` clear-loop
+    // would have parsed back out and cleared.
+    let spawned = SpawnIntent {
+        node_affinity: vec![NodeSelectorTerm {
+            match_expressions: vec![
+                NodeSelectorRequirement {
+                    key: "rio.build/hw-class".into(),
+                    operator: "In".into(),
+                    values: vec!["intel-6".into()],
+                },
+                NodeSelectorRequirement {
+                    key: "karpenter.sh/capacity-type".into(),
+                    operator: "In".into(),
+                    values: vec!["spot".into()],
+                },
+            ],
+        }],
+        ..Default::default()
+    };
+
+    // Three ticks of {spawned for cell, unfulfillable=cell, no
+    // Registered signal}: step must climb 0→1→2. Old code: each tick
+    // cleared (from `spawned`) before marking → step stuck at 0.
+    for _ in 0..3 {
+        actor.handle_ack_spawned_intents(
+            std::slice::from_ref(&spawned),
+            &["intel-6:spot".into()],
+            &[],
+        );
+    }
+    assert_eq!(
+        actor.ice.step(&cell),
+        Some(2),
+        "spawned-ack must NOT clear; backoff doubles across consecutive marks"
+    );
+
+    // `registered_cells` IS the success signal → resets.
+    actor.handle_ack_spawned_intents(&[], &[], &["intel-6:spot".into()]);
+    assert_eq!(actor.ice.step(&cell), None, "registered_cells clears");
 }
 
 /// `r[sched.sla.hw-class.epsilon-explore]`: ε_h draw is a pure

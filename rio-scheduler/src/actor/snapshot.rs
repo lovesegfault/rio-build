@@ -14,35 +14,6 @@ use super::{
     SpawnIntentsSnapshot, command,
 };
 
-/// Recover `(h, cap)` from a `NodeSelectorTerm` by matching its label
-/// conjunction (sans `karpenter.sh/capacity-type`) against `hw_classes`.
-/// `None` for terms that don't correspond to a configured class.
-fn term_to_cell(
-    term: &rio_proto::types::NodeSelectorTerm,
-    hw_classes: &HashMap<String, crate::sla::config::HwClassDef>,
-) -> Option<crate::sla::config::Cell> {
-    let cap = term
-        .match_expressions
-        .iter()
-        .find(|r| r.key == "karpenter.sh/capacity-type")
-        .and_then(|r| r.values.first())
-        .and_then(|v| crate::sla::config::CapacityType::parse(v))?;
-    let labels: std::collections::HashSet<(&str, &str)> = term
-        .match_expressions
-        .iter()
-        .filter(|r| r.key != "karpenter.sh/capacity-type")
-        .filter_map(|r| Some((r.key.as_str(), r.values.first()?.as_str())))
-        .collect();
-    let h = hw_classes.iter().find(|(_, def)| {
-        def.labels.len() == labels.len()
-            && def
-                .labels
-                .iter()
-                .all(|l| labels.contains(&(l.key.as_str(), l.value.as_str())))
-    })?;
-    Some((h.0.clone(), cap))
-}
-
 /// Request-side filter shared by the Ready and forecast passes of
 /// [`DagActor::compute_spawn_intents`]: kind (ADR-019 boundary),
 /// per-arch systems intersection (I-107/I-143), I-176/I-181 feature
@@ -529,27 +500,31 @@ impl DagActor {
         }
     }
 
-    /// Process the controller's spawn ack: `spawned` cells that
-    /// reached `Registered=True` reset their ICE backoff;
-    /// `unfulfillable_cells` (`"h:cap"` strings — NodeClaim
-    /// `Launched=False` or `Registered` timeout) are ICE-marked with
-    /// exponential backoff. ADR-023 §Capacity backoff: the *scheduler*
-    /// owns ICE state (in-memory, lease-holder only); the controller
-    /// reports, the scheduler decides.
+    /// Process the controller's spawn ack. `registered_cells`
+    /// (`"h:cap"` strings — NodeClaim `Registered=True` edges) reset
+    /// ICE backoff; `unfulfillable_cells` (NodeClaim `Launched=False`
+    /// or `Registered` timeout) are ICE-marked with exponential
+    /// backoff. `spawned` is informational-only — "Pending Job
+    /// created" is NOT a success signal (clearing on it defeats
+    /// backoff doubling: the all-masked fallback re-emits the masked
+    /// cell at `[0]`, so each tick would `clear(C)` then `mark(C)` and
+    /// `step` never climbed past 0). ADR-023 §Capacity backoff: the
+    /// *scheduler* owns ICE state (in-memory, lease-holder only); the
+    /// controller reports, the scheduler decides.
+    ///
+    /// Until §13b A18 populates `registered_cells`, the §13a interim
+    /// success signal is first-heartbeat — see `handle_heartbeat`'s
+    /// registration edge.
     // r[impl sched.sla.hw-class.ice-mask]
     pub(super) fn handle_ack_spawned_intents(
         &self,
         spawned: &[rio_proto::types::SpawnIntent],
         unfulfillable_cells: &[String],
+        registered_cells: &[String],
     ) {
-        // Success path: each spawned intent's bound cells reset
-        // backoff. The intent's `node_affinity` carries the cells the
-        // controller picked from; the FIRST term is what the NodeClaim
-        // was created for (controller routes to one cell per intent).
-        for i in spawned {
-            if let Some(term) = i.node_affinity.first()
-                && let Some(cell) = term_to_cell(term, &self.sla_config.hw_classes)
-            {
+        let _ = spawned;
+        for s in registered_cells {
+            if let Some(cell) = crate::sla::config::parse_cell(s) {
                 self.ice.clear(&cell);
             }
         }
@@ -785,6 +760,19 @@ impl DagActor {
                 } else {
                     cells
                 };
+                // §13a interim ICE-clear bookkeeping: record the cell
+                // this intent's pod will be created for so the
+                // registration edge in `handle_heartbeat` can
+                // `ice.clear()` it. `cells[0]` is what the controller
+                // routes to (one NodeClaim per intent, first term).
+                // Idempotent — same drv → same cell given fixed
+                // `(inputs_gen, ice)`; an inputs_gen bump between
+                // emit and heartbeat may clear the wrong cell, which
+                // the §13b `registered_cells` path fixes.
+                if let Some(cell) = cells.first() {
+                    self.dispatched_cells
+                        .insert(state.drv_hash.clone(), cell.clone());
+                }
                 let (terms, names) =
                     solve::cells_to_selector_terms(&cells, &self.sla_config.hw_classes);
                 (

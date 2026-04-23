@@ -650,11 +650,21 @@ impl IceBackoff {
         );
     }
 
-    /// Reset `cell`'s backoff (first success after a mark). The
-    /// controller calls this via `AckSpawnedIntents` when a NodeClaim
-    /// for `cell` reaches `Registered=True`.
+    /// Reset `cell`'s backoff (first success after a mark). Called via
+    /// `AckSpawnedIntents.registered_cells` (controller's NodeClaim
+    /// `Registered=True` edge — §13b) or on first heartbeat for a pod
+    /// spawned on `cell` (§13a interim path; heartbeat ⇒ pod scheduled
+    /// ⇒ node existed). NEVER from `spawned` (Pending ack) — that's
+    /// the wrong edge and defeats backoff doubling.
     pub fn clear(&self, cell: &Cell) {
         self.cells.remove(cell);
+    }
+
+    /// Current backoff step for `cell` (number of consecutive marks
+    /// since the last clear), or `None` if never marked / cleared. For
+    /// tests and the §13a contract assertion.
+    pub fn step(&self, cell: &Cell) -> Option<u32> {
+        self.cells.get(cell).map(|s| s.step)
     }
 
     /// Whether `cell` is currently masked. Expired entries are NOT

@@ -248,6 +248,12 @@ pub enum ActorCommand {
         /// ICE-infeasible on a backoff ladder. Consumed by B11; until
         /// then the actor handler accepts and ignores it.
         unfulfillable_cells: Vec<String>,
+        /// §13b: cells for which a NodeClaim reached
+        /// `Registered=True` this tick — the success signal that
+        /// resets ICE backoff. `vec![]` until the controller's
+        /// NodeClaim watcher (A18) populates it; the §13a interim
+        /// clear path is first-heartbeat instead.
+        registered_cells: Vec<String>,
     },
 
     /// A worker ACKed its initial `PrefetchHint` with `PrefetchComplete`.
