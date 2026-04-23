@@ -149,3 +149,8 @@ variable "ecr_credential_provider_vendor_hash" {
   description = "ecr-credential-provider Go vendor hash (consumed by nix/nixos-node/, not terraform)."
   type        = string
 }
+
+variable "gateway_api_crds_hash" {
+  description = "Gateway API CRD bundle hash (consumed by nix/cilium-render.nix, not terraform)."
+  type        = string
+}

@@ -543,10 +543,10 @@ impl Substituter {
 
         let start = Instant::now();
         let tenant_label = tenant_id.to_string();
-        // Track 429 across the iteration: only fail with `Busy` if NO
-        // upstream had the path. This mirrors the HEAD-probe semantics
-        // (`probe_one`): a tenant with [rate-limited-A, healthy-B]
-        // configured should hit B, not propagate A's 429.
+        // Track 429 across the iteration: only fail with `RateLimited`
+        // if NO upstream had the path. This mirrors the HEAD-probe
+        // semantics (`probe_one`): a tenant with [rate-limited-A,
+        // healthy-B] configured should hit B, not propagate A's 429.
         let mut any_429: Option<Option<Duration>> = None;
         for upstream in &upstreams {
             match self

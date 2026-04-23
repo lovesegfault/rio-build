@@ -997,7 +997,7 @@
           # --------------------------------------------------------------
           #
           # Runs golden_conformance against 4 daemon variants: pinned Nix,
-          # nixpkgs nix_2_28, nixVersions.unstable, lix. Weekly cron
+          # nixpkgs nix_2_28, nixVersions.git, lix. Weekly cron
           # invokes `nix build .#golden-matrix`. NOT a check — packages
           # tier so `nix flake check` doesn't pull the extra daemons.
           goldenMatrix = import ./nix/golden-matrix.nix {

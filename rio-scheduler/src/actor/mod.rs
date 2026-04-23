@@ -125,8 +125,7 @@ pub const SUBSTITUTE_FETCH_BACKOFF: rio_common::backoff::Backoff = rio_common::b
 /// Max attempts per path for the detached substitute fetch. With
 /// [`SUBSTITUTE_FETCH_BACKOFF`]: 250ms→500ms→1s→2s→4s→8s→16s ≈ 31.75 s
 /// total retry budget per path (7 backoffs between 8 attempts; the loop
-/// breaks before the final sleep — the 30 s `cap` limits the 7th
-/// backoff to 16 s, not 32 s) before demoting to cache-miss. Raised
+/// breaks before the final sleep) before demoting to cache-miss. Raised
 /// 5→8 alongside `r[store.substitute.admission]`: the store now queues
 /// up to `SUBSTITUTE_ADMISSION_WAIT` (25 s) before returning
 /// `RESOURCE_EXHAUSTED`, so each attempt is itself a 25 s server-side

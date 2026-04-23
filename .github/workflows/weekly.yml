@@ -30,9 +30,10 @@ jobs:
       - uses: ./.github/actions/setup-nix
       - name: Build golden matrix
         run: |
-          # All four daemons (pinned, nix_2_28, nixVersions.unstable,
-          # lix) come from the locked nixpkgs — bump nixpkgs to test
-          # newer unstable/lix. Dev+CI use the same locked nixpkgs.
+          # All four daemons (pinned, nix_2_28, nixVersions.git, lix)
+          # come from the locked nixpkgs — the weekly cron tests the
+          # locked nixpkgs; bump nixpkgs separately to test newer
+          # versions. Dev+CI use the same locked nixpkgs.
           nix build .#golden-matrix --print-build-logs
       - uses: ./.github/actions/niks3-push
         if: always() && !cancelled()

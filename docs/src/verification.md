@@ -15,10 +15,10 @@ Per-push CI runs conformance tests against the single Nix version pinned in `fla
 |---------|--------|-------|
 | `nix-pinned` | `inputs.nix` (2.34.x) | Same as per-push CI — sanity row |
 | `nix-stable` | `pkgs.nixVersions.nix_2_28` | Oldest CppNix nixpkgs still ships |
-| `nix-unstable` | `pkgs.nixVersions.unstable` | Surfaces breakage early |
+| `nix-unstable` | `pkgs.nixVersions.git` | Surfaces breakage early |
 | `lix` | `pkgs.lix` | Fork — diverges on feature set, version string, opcode additions; policy-frozen at protocol 1.35 = `MIN_CLIENT_VERSION` floor coverage |
 
-All four daemons come from the pinned nixpkgs (no separate flake inputs), so the weekly cron bumps nixpkgs to test newer nix-unstable/lix.
+All four daemons come from the pinned nixpkgs (no separate flake inputs), so the weekly cron tests the locked nixpkgs; bump nixpkgs separately to test newer versions.
 
 Test harness reads `RIO_GOLDEN_DAEMON_BIN` (absolute daemon path) and `RIO_GOLDEN_DAEMON_VARIANT` (skip-list key). Per-variant skips live in `rio-gateway/tests/golden/daemon.rs::VARIANT_SKIP` — each row is `(variant, test_name, reason)`. The `reason` field is load-bearing: it documents WHY so the skip can be removed once upstream converges.
 
