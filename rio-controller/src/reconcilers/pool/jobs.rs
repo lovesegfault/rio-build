@@ -32,7 +32,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{PodSpec, ResourceRequirements};
+use k8s_openapi::api::core::v1::{Pod, PodSpec, ResourceRequirements};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Api, DeleteParams, ListParams};
@@ -107,6 +107,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     let ns = require_namespace(pool)?;
     let name = pool.name_any();
     let jobs_api: Api<Job> = Api::namespaced(ctx.client.clone(), &ns);
+    let pods_api: Api<Pod> = Api::namespaced(ctx.client.clone(), &ns);
     // The no-`.metadata.uid` error only happens on a CR not read from
     // the apiserver — tests that construct one in memory forget this;
     // production reconcile always has it.
@@ -282,7 +283,15 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // I-183: spawn-only is half a control loop. `None` when scheduler
     // unreachable: reap is fail-CLOSED (spawn is fail-open).
     let queued_known = scheduler_err.is_none().then_some(queued);
-    reap_excess_pending(&jobs_api, &jobs.items, &reaped, queued_known, &name).await;
+    reap_excess_pending(
+        &jobs_api,
+        &pods_api,
+        &jobs.items,
+        &reaped,
+        queued_known,
+        &name,
+    )
+    .await;
 
     // ---- Reap orphan Running ----
     // I-165: a builder stuck in D-state (FUSE wait, OOM-loop) can't

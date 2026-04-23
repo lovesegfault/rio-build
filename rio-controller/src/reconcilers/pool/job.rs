@@ -210,7 +210,7 @@ pub(super) fn job_census(jobs: &[Job]) -> JobCensus {
 /// scheduler and may receive an assignment any millisecond. `ready ==
 /// 0` means the container has NOT started: never heartbeated, never
 /// dispatched, deleting it loses nothing. This is the reap-safety
-/// boundary for `r[ctrl.ephemeral.reap-excess-pending+2]`.
+/// boundary for `r[ctrl.ephemeral.reap-excess-pending+3]`.
 ///
 /// `None` status (Job controller hasn't reconciled yet → pod not
 /// created) is treated as Pending. That's the safe direction: a Job
@@ -263,10 +263,34 @@ pub(super) const ORPHAN_REAP_GRACE: Duration = Duration::from_secs(300);
 /// requeue tick of grace makes the false-positive window negligible
 /// without materially delaying the I-183 reap (the bug is Jobs sitting
 /// for an HOUR; 10s grace is noise).
+///
+/// NOTE: this is age-from-**creation**. A cold-start Job that takes
+/// 50s for Karpenter to provision a node is past this grace the moment
+/// its pod starts — that's the case [`any_live_running_pod`] covers.
 pub(super) const REAP_PENDING_GRACE: Duration = Duration::from_secs(10);
 
+/// Live (non-informer) check: any pod of `job_name` in `phase==Running`?
+///
+/// `JobStatus.ready` (the snapshot the Pending-reap selects on) lags
+/// the actual pod phase by kubelet→apiserver→Job-controller→informer;
+/// after a Karpenter cold start the pod can be Running and assigned
+/// while the snapshot still says `ready==0`. A live `pods.list` here
+/// closes the gap for the rare excess-reap candidate.
+///
+/// `Err` → fail-closed: caller skips the delete (next tick will see
+/// `ready>0` and the Job leaves the Pending set anyway).
+async fn any_live_running_pod(pods_api: &Api<Pod>, job_name: &str) -> kube::Result<bool> {
+    let list = pods_api
+        .list(&ListParams::default().labels(&format!("job-name={job_name}")))
+        .await?;
+    Ok(list
+        .items
+        .iter()
+        .any(|p| p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running")))
+}
+
 /// Pending Jobs in excess of `queued`, oldest-first — RESIDUAL
-/// fallback for `r[ctrl.ephemeral.reap-excess-pending+2]` after
+/// fallback for `r[ctrl.ephemeral.reap-excess-pending+3]` after
 /// `reap_stale_for_intents`' orphan-pending arm has already reaped by
 /// intent-membership.
 ///
@@ -328,7 +352,7 @@ pub(super) fn select_excess_pending<'a>(
     pending
 }
 
-// r[impl ctrl.ephemeral.reap-excess-pending+2]
+// r[impl ctrl.ephemeral.reap-excess-pending+3]
 /// Delete Pending Jobs in excess of `queued`. Shared by the
 /// builder and fetcher pool reconcilers (both had the spawn-only
 /// pattern before I-183; both now reap).
@@ -348,6 +372,7 @@ pub(super) fn select_excess_pending<'a>(
 /// Returns the count actually deleted (for the reconcile summary log).
 pub(super) async fn reap_excess_pending(
     jobs_api: &Api<Job>,
+    pods_api: &Api<Pod>,
     jobs: &[Job],
     reaped: &HashSet<String>,
     queued: Option<u32>,
@@ -367,6 +392,30 @@ pub(super) async fn reap_excess_pending(
     let mut reaped = 0u32;
     for job in excess {
         let job_name = job.metadata.name.as_deref().unwrap_or("<unnamed>");
+        // Live phase re-check: `select_excess_pending` keys on the
+        // informer-cached `JobStatus.ready==0`, which lags
+        // `Pod.status.phase` by kubelet→Job-controller→informer. After
+        // a Karpenter cold start the pod may already be Running and
+        // hold an assignment (scheduler `queued` dropped on assign,
+        // which is why we're here). Fail-closed on lookup error — next
+        // tick's snapshot will see `ready>0`.
+        match any_live_running_pod(pods_api, job_name).await {
+            Ok(true) => {
+                debug!(
+                    pool, job = %job_name,
+                    "skipping reap: pod is live Running (informer-cached Job.status.ready lags)"
+                );
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(
+                    pool, job = %job_name, error = %e,
+                    "skipping reap: live pod-phase check failed (fail-closed)"
+                );
+                continue;
+            }
+        }
         // Foreground: the Job stays (with deletionTimestamp) until its
         // pod is gone, so the Job controller gets to remove the pod's
         // `batch.kubernetes.io/job-tracking` finalizer. Background
@@ -1348,7 +1397,7 @@ mod tests {
 
     const NO_GRACE: Duration = Duration::ZERO;
 
-    // r[verify ctrl.ephemeral.reap-excess-pending+2]
+    // r[verify ctrl.ephemeral.reap-excess-pending+3]
     /// I-183 scenario A: 3 Pending Jobs for class=medium, queued=1 →
     /// reap the 2 oldest, keep the 1 newest. The newest is closest to
     /// scheduling; the oldest has waited longest for a node Karpenter
@@ -1375,7 +1424,7 @@ mod tests {
         assert_eq!(select_excess_pending(&jobs, &none, 0, NO_GRACE).len(), 3);
     }
 
-    // r[verify ctrl.ephemeral.reap-excess-pending+2]
+    // r[verify ctrl.ephemeral.reap-excess-pending+3]
     /// I-183 scenario B: 1 Pending + 2 Running, queued=0 → reap the
     /// 1 Pending only. Running Jobs are NOT touched — they may hold
     /// assignments; scheduler's cancel-on-disconnect handles those.
@@ -1396,7 +1445,7 @@ mod tests {
         );
     }
 
-    // r[verify ctrl.ephemeral.reap-excess-pending+2]
+    // r[verify ctrl.ephemeral.reap-excess-pending+3]
     /// Grace window: a Job younger than `min_age` is excluded even if
     /// `ready=0`. `JobStatus.ready` is set asynchronously by the K8s
     /// Job controller; a freshly-started container may already hold an
@@ -1426,7 +1475,7 @@ mod tests {
         );
     }
 
-    // r[verify ctrl.ephemeral.reap-excess-pending+2]
+    // r[verify ctrl.ephemeral.reap-excess-pending+3]
     /// bug_015: `reap_stale_for_intents` foreground-deletes orphan D
     /// (younger), but the unfiltered snapshot still counts it as
     /// Pending → `pending=2 > queued=1` → oldest-first deletes WANTED

@@ -13,8 +13,9 @@
 use std::collections::{BTreeMap, HashSet};
 
 use k8s_openapi::api::batch::v1::{Job, JobStatus};
+use k8s_openapi::api::core::v1::{Pod, PodStatus};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
-use kube::api::{Api, ObjectMeta};
+use kube::api::{Api, ObjectList, ObjectMeta};
 
 use crate::fixtures::{ApiServerVerifier, Scenario};
 use crate::reconcilers::pool::job::{
@@ -181,7 +182,36 @@ fn pending_job(name: &str, ready: i32, age_s: i64) -> Job {
     }
 }
 
-// r[verify ctrl.ephemeral.reap-excess-pending+2]
+/// Mock response for the live `pods.list(job-name=...)` re-check
+/// inside `reap_excess_pending`. `phase=None` covers Pending /
+/// ContainerCreating; `phase=Some("Running")` triggers the skip.
+fn pod_list_scenario(job: &'static str, phase: Option<&str>) -> Scenario {
+    let pod = phase.map(|p| Pod {
+        metadata: ObjectMeta {
+            name: Some(format!("{job}-abcde")),
+            ..Default::default()
+        },
+        status: Some(PodStatus {
+            phase: Some(p.into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    Scenario {
+        method: http::Method::GET,
+        path_contains: "/namespaces/rio/pods",
+        body_contains: None,
+        status: 200,
+        body_json: serde_json::to_string(&ObjectList::<Pod> {
+            items: pod.into_iter().collect(),
+            metadata: Default::default(),
+            types: Default::default(),
+        })
+        .unwrap(),
+    }
+}
+
+// r[verify ctrl.ephemeral.reap-excess-pending+3]
 /// I-183: `reap_excess_pending` issues DELETE for the oldest excess
 /// Pending Jobs, increments the metric, and warn+continues on a 404
 /// (already gone — concurrent reconcile or TTL).
@@ -196,7 +226,8 @@ async fn reap_excess_pending_deletes_oldest_and_counts() {
     let _g = metrics::set_default_local_recorder(&recorder);
 
     let (client, verifier) = ApiServerVerifier::new();
-    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+    let jobs_api: Api<Job> = Api::namespaced(client.clone(), "rio");
+    let pods_api: Api<Pod> = Api::namespaced(client, "rio");
 
     // newest is 15s — past REAP_PENDING_GRACE (10s) so all 3 pending
     // are eligible by age; the count-vs-queued is what's under test.
@@ -207,10 +238,12 @@ async fn reap_excess_pending_deletes_oldest_and_counts() {
         pending_job("rio-builder-med-mid", 0, 45),
     ];
 
-    // Expect DELETE oldest, then mid (oldest-first sort). 404 on the
+    // Expect: live pod-list (none) → DELETE oldest, live pod-list
+    // (Pending pod) → DELETE mid (oldest-first sort). 404 on the
     // first proves warn+continue (still proceeds to delete the second
     // and still counts only the successful one).
     let guard = verifier.run(vec![
+        pod_list_scenario("rio-builder-med-oldest", None),
         Scenario::k8s_error(
             http::Method::DELETE,
             "/namespaces/rio/jobs/rio-builder-med-oldest",
@@ -218,6 +251,7 @@ async fn reap_excess_pending_deletes_oldest_and_counts() {
             "NotFound",
             "jobs.batch \"rio-builder-med-oldest\" not found",
         ),
+        pod_list_scenario("rio-builder-med-mid", Some("Pending")),
         Scenario {
             method: http::Method::DELETE,
             path_contains: "/namespaces/rio/jobs/rio-builder-med-mid",
@@ -230,7 +264,15 @@ async fn reap_excess_pending_deletes_oldest_and_counts() {
         },
     ]);
 
-    let reaped = reap_excess_pending(&jobs_api, &jobs, &HashSet::new(), Some(1), "med-pool").await;
+    let reaped = reap_excess_pending(
+        &jobs_api,
+        &pods_api,
+        &jobs,
+        &HashSet::new(),
+        Some(1),
+        "med-pool",
+    )
+    .await;
     guard.verified().await;
 
     assert_eq!(reaped, 1, "404 not counted; one successful delete");
@@ -599,14 +641,15 @@ async fn spawn_for_each_acks_spawned_only() {
     guard.verified().await;
 }
 
-// r[verify ctrl.ephemeral.reap-excess-pending+2]
+// r[verify ctrl.ephemeral.reap-excess-pending+3]
 /// `pending <= queued` → no DELETE calls; `queued = None` (scheduler
 /// unreachable) → no DELETE calls. The verifier's empty scenario list
 /// asserts zero apiserver requests in both cases.
 #[tokio::test]
 async fn reap_excess_pending_noop_when_covered_or_unknown() {
     let (client, verifier) = ApiServerVerifier::new();
-    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+    let jobs_api: Api<Job> = Api::namespaced(client.clone(), "rio");
+    let pods_api: Api<Pod> = Api::namespaced(client, "rio");
 
     let jobs = vec![
         pending_job("a", 0, 30),
@@ -617,17 +660,53 @@ async fn reap_excess_pending_noop_when_covered_or_unknown() {
     let guard = verifier.run(vec![]);
     // pending=2, queued=2 → covered.
     assert_eq!(
-        reap_excess_pending(&jobs_api, &jobs, &none, Some(2), "p").await,
+        reap_excess_pending(&jobs_api, &pods_api, &jobs, &none, Some(2), "p").await,
         0
     );
     // queued=None → fail-closed (scheduler unreachable; spawn treats
     // as 0 fail-open, reap MUST NOT — would nuke every Pending Job
     // on a scheduler restart).
     assert_eq!(
-        reap_excess_pending(&jobs_api, &jobs, &none, None, "p").await,
+        reap_excess_pending(&jobs_api, &pods_api, &jobs, &none, None, "p").await,
         0
     );
     guard.verified().await;
+}
+
+// r[verify ctrl.ephemeral.reap-excess-pending+3]
+/// Cold-start race: snapshot says `JobStatus.ready==0` (informer lag)
+/// but the live pod-phase re-check sees `Running` → DELETE is skipped.
+/// Also covers fail-closed on lookup error: a 500 on the pod-list →
+/// skip with warn, no DELETE. The verifier's strict sequence (two
+/// pod-list GETs, zero DELETEs) proves both.
+#[tokio::test]
+async fn reap_excess_pending_skips_live_running_pod() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let jobs_api: Api<Job> = Api::namespaced(client.clone(), "rio");
+    let pods_api: Api<Pod> = Api::namespaced(client, "rio");
+
+    // Both past REAP_PENDING_GRACE; queued=0 → both selected as
+    // excess, oldest-first.
+    let jobs = vec![
+        pending_job("rio-builder-x86-64-coldstart", 0, 50),
+        pending_job("rio-builder-x86-64-listfail", 0, 30),
+    ];
+
+    let guard = verifier.run(vec![
+        pod_list_scenario("rio-builder-x86-64-coldstart", Some("Running")),
+        Scenario::k8s_error(
+            http::Method::GET,
+            "/namespaces/rio/pods",
+            500,
+            "InternalError",
+            "etcd unavailable",
+        ),
+    ]);
+
+    let reaped =
+        reap_excess_pending(&jobs_api, &pods_api, &jobs, &HashSet::new(), Some(0), "p").await;
+    guard.verified().await;
+    assert_eq!(reaped, 0, "Running pod and list-error both skip DELETE");
 }
 
 // r[verify ctrl.pool.reconcile]
@@ -684,7 +763,7 @@ fn headroom_recompute_never_exceeds_ceiling() {
     assert_eq!(c.headroom(None, 0), usize::MAX, "uncapped");
 }
 
-// r[verify ctrl.ephemeral.reap-excess-pending+2]
+// r[verify ctrl.ephemeral.reap-excess-pending+3]
 /// `reap_stale_for_intents` reaps Pending Jobs whose intent left the
 /// set (orphan-by-intent). Before, only `select_excess_pending`'s
 /// oldest-first reap caught these, so [A,B,C,D]→[A,B] reaped jA,jB

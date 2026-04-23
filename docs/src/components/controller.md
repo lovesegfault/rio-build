@@ -87,7 +87,7 @@ excess-Pending reap (`r[ctrl.ephemeral.reap-excess-pending]`) and the
 orphan-Running reap. `ttlSecondsAfterFinished` reaps Completed/Failed
 Jobs; ownerRef GC handles pool-delete cleanup.
 
-r[ctrl.ephemeral.reap-excess-pending+2]
+r[ctrl.ephemeral.reap-excess-pending+3]
 When the per-class queued count drops below the count of Pending-phase
 Jobs for that class, the controller MUST delete the excess Pending Jobs
 (orphan-by-intent first; residual excess oldest-first). Running Jobs are not touched — those have or may
@@ -98,7 +98,12 @@ scheduled, or is scheduled but the container has not started — either
 way it has never connected to the scheduler and never received an
 assignment, so deletion loses no work. Jobs younger than one requeue
 tick (10s) are excluded — `JobStatus.ready` is set asynchronously by
-the K8s Job controller and can lag a freshly-started container. The
+the K8s Job controller and can lag a freshly-started container. Before
+issuing each DELETE the controller MUST re-check `Pod.status.phase`
+via a live (non-informer) lookup and skip the Job if any pod is
+`Running`: after a Karpenter cold start the 10s creation-age grace is
+already exhausted when the pod first runs, and the scheduler's `queued`
+count drops on assignment before `JobStatus.ready` propagates. The
 reap is **skipped entirely** when the queued poll failed (scheduler
 unreachable): spawn treats that as `queued=0` (fail-open: don't
 spawn); reap MUST treat it as unknown (fail-closed: don't delete).
