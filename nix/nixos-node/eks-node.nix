@@ -308,13 +308,16 @@ in
               pkgs.writeShellScript "seed-warm" ''
                 set -u
                 ${lib.concatMapStringsSep "\n" (seed: ''
-                  # --local: containerd 2.x transfer-API path drops --label and
-                  # handles multi-manifest ref.name annotations differently;
-                  # --local forces the legacy client-side path which honours
-                  # both (PLAN-PREBAKE Q1/Q6). Seed-import failure is degraded-
-                  # but-functional, so log-warn rather than fail-hard — a
-                  # corrupt seed shouldn't take the node out of the pool.
-                  ${ctr} image import --local ${seed} \
+                  # Transfer-API import (no --local): mkSeed gzips the OCI
+                  # tar (mask store-path string scanning), and --local
+                  # rejects gzip ("invalid tar header"). The original Q1/Q6
+                  # rationales for --local no longer apply — seeds are
+                  # single-manifest and the pin label is applied separately
+                  # below (same shape as the pause-image import). Seed-
+                  # import failure is degraded-but-functional, so log-warn
+                  # rather than fail-hard — a corrupt seed shouldn't take
+                  # the node out of the pool.
+                  ${ctr} image import ${seed} \
                     || echo "<4>rio: seed import ${seed} failed; first-pod pull will be cold" >&2
                 '') cfg.seedImages}
                 # Pin every seed.local/… ref just imported. The label stops
