@@ -152,6 +152,7 @@ impl HwTable {
     /// All output dimensions clamped to `[FLOOR, CEIL]` — the
     /// chokepoint clamp the old `load()` did, now post-aggregation so
     /// MAD-reject sees raw values.
+    // r[impl sched.sla.threat.hw-median-of-medians]
     pub fn aggregate(rows: &[HwPerfSampleRow]) -> HashMap<String, HwFactor> {
         // hw_class → submitting_tenant → Vec<[f64;K]>
         let mut by_class: HashMap<String, HashMap<Option<String>, Vec<[f64; K]>>> = HashMap::new();
@@ -400,6 +401,7 @@ mod tests {
     /// N. Row-median would be dragged to the attacker's value;
     /// median-of-medians stays at the honest cluster.
     #[test]
+    // r[verify sched.sla.threat.hw-median-of-medians]
     fn hw_factor_median_of_medians_resists_single_tenant() {
         let mut rows = Vec::new();
         // 4 honest tenants, 1 pod each, alu ∈ [1.45, 1.55].

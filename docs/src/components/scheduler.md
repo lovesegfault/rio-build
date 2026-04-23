@@ -821,6 +821,13 @@ All read-path AdminService SLA RPCs (`SlaStatus` / `SlaExplain` /
 `ListPoisoned`) MUST gate on `ensure_service_caller`, not only
 `ensure_leader` (§Threat-model gap a).
 
+r[sched.sla.threat.hw-median-of-medians]
+`HwTable` aggregation MUST be median-of-medians: per-tenant median
+(with 3·1.4826·MAD reject) then median across tenants.
+`hw_perf_samples.submitting_tenant` is the grouping column;
+`FLEET_MEDIAN_MIN_TENANTS = 5` so two colluding tenants cannot
+capture the cross-tenant median (§Threat-model gap b).
+
 r[sched.sla.threat.corpus-clamp]
 `ImportSlaCorpus` / `sla.seedCorpus` MUST reject entries with
 non-finite or out-of-range params: `ref_factor_vec` per-dim
