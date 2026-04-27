@@ -420,6 +420,7 @@ impl DagActor {
             .copied()
             .fold(0.0, f64::max);
         if max_lead > 0.0 {
+            let mut forecast = Vec::new();
             'q: for (drv_hash, state) in self.dag.iter_nodes() {
                 if state.status() != DerivationStatus::Queued {
                     continue;
@@ -456,6 +457,25 @@ impl DagActor {
                     continue;
                 }
                 let intent = self.solve_intent_for(state, &hw, &cost, inputs_gen);
+                forecast.push((drv_hash, state, intent, eta));
+            }
+            // bug_025: collect → sort → gate. The budget check at this
+            // point used to run INSIDE the `'q` loop, i.e. greedy
+            // first-fit in `HashMap::iter()` order — same DAG state
+            // produced a different admitted subset across restarts, and
+            // the post-loop sort can't resurrect what was already
+            // dropped. Sort key is `(priority, c*) desc` — the same key
+            // §13b @alg-pool's FFD pass walks, so the admitted subset
+            // is what FFD wanted first — with `drv_hash` asc as the
+            // deterministic tiebreak.
+            forecast.sort_unstable_by(|(ha, sa, ia, _), (hb, sb, ib, _)| {
+                sb.sched
+                    .priority
+                    .total_cmp(&sa.sched.priority)
+                    .then(ib.cores.cmp(&ia.cores))
+                    .then(ha.cmp(hb))
+            });
+            for (drv_hash, state, intent, eta) in forecast {
                 let budget = tenant_forecast_budget
                     .entry(state.attributed_tenant(&self.builds))
                     .or_insert(cap);

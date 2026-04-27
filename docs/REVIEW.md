@@ -77,3 +77,25 @@ that asserts each `Label` variant is reachable AND the converse (any
 `{non-target}` reject → never `{target}`). Emit-site existence tests
 (r2 CR-2) don't catch "fires when it shouldn't"; the fixture table
 does.
+
+## HashMap iteration order as a stable choice
+
+A `for (k, v) in hashmap { if cond { continue/break/return } }` where
+**which element is seen first** changes the output is a finding. The
+loop is making a decision (admission, selection, truncation) that
+depends on `HashMap::iter()` order — undefined and unstable across
+restarts/rehashes.
+
+**Why:** r5 bug_025's forecast budget gate ran greedy first-fit during
+`dag.iter_nodes()` (HashMap-backed): same DAG state → different
+admitted subset across restarts → §13b NodeClaim FFD never saw the
+dropped large drv. A post-loop sort can't resurrect what the in-loop
+gate already dropped. Same shape recurred in `reap_excess_pending`
+ordering and ε_h `pool.choose()` over unsorted `h_all`
+(snapshot.rs:728-729 fixed with explicit sort).
+
+**Structural close:** collect → sort by a deterministic key → decide.
+The sort key SHOULD match the downstream consumer's order (here: §13b
+FFD's `(priority, c*) desc`) so the admitted subset is what the
+consumer wanted first. Add a stable tiebreak (e.g. `drv_hash` asc) so
+ties don't re-introduce nondeterminism.

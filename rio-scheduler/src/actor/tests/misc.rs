@@ -1682,6 +1682,67 @@ async fn forecast_tenant_ceiling_subtracts_ready_first() {
     );
 }
 
+/// bug_025: forecast budget gate is collect → sort → gate, NOT greedy
+/// first-fit in `HashMap::iter()` order. Same DAG state must produce
+/// the same admitted subset regardless of insertion order; the sort key
+/// `(priority, c*) desc, drv_hash asc` means the high-priority drv is
+/// always admitted and ties resolve by `drv_hash`.
+///
+/// All drvs solve to `probe.cpu = 4` cores (unfitted), so the `c*`
+/// term is degenerate here — priority + `drv_hash` tiebreak are what's
+/// exercised. cap=8 admits exactly two of three.
+// r[verify sched.sla.forecast.tenant-ceiling]
+#[tokio::test]
+async fn forecast_budget_deterministic() {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // Build the SAME 3-drv forecast frontier twice with different
+    // insertion orders. `iter_nodes()` is HashMap-backed → order is
+    // undefined; the assertion is that the admitted subset is
+    // identical regardless.
+    let build = |order: &[&str]| {
+        let mut actor = bare_actor_forecast(db.pool.clone(), 200.0, 8);
+        actor.test_inject_at("dep", "x86_64-linux", DerivationStatus::Running);
+        actor.test_set_running_eta("dep", 100.0, 70, 8);
+        for &h in order {
+            actor.test_inject_at(h, "x86_64-linux", DerivationStatus::Queued);
+            actor.test_inject_edge(h, "dep");
+        }
+        actor.test_set_priority("fa", 1000.0);
+        actor.test_set_priority("fb", 10.0);
+        actor.test_set_priority("fc", 10.0);
+        actor
+    };
+
+    let admitted = |actor: &DagActor| -> Vec<String> {
+        let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
+        let mut v: Vec<_> = snap
+            .intents
+            .into_iter()
+            .filter(|i| i.ready == Some(false))
+            .map(|i| i.intent_id)
+            .collect();
+        v.sort();
+        v
+    };
+
+    let a1 = admitted(&build(&["fa", "fb", "fc"]));
+    let a2 = admitted(&build(&["fc", "fb", "fa"]));
+
+    // High-priority `fa` always admitted; between `fb`/`fc` (tied
+    // priority + cores), drv_hash asc → `fb`. cap=8, 2×4 cores → `fc`
+    // dropped.
+    assert_eq!(
+        a1,
+        vec!["fa", "fb"],
+        "prio sort admits fa; drv_hash tiebreak admits fb"
+    );
+    assert_eq!(
+        a1, a2,
+        "admitted subset deterministic across DAG insertion order"
+    );
+}
+
 /// `lead_time_seed` empty → `max_lead = 0` → forecast pass disabled.
 /// Static-mode (no `[sla].hw_classes`, no §13b controller) deploys
 /// stay on the v1.0 Ready-only path.
