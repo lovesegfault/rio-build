@@ -679,6 +679,78 @@ async fn contract_metrics_once_per_miss_static_mode() {
     );
 }
 
+/// **R7B1 / bug 035** — under `hw_cost_source=None` (helm default), the
+/// `infeasible_static_fh` debounce was recorded BEFORE `intent_for`'s
+/// hints early-returns. A serial drv (`enable_parallel_building =
+/// Some(false)`) and its non-serial sibling at the same `(pname,
+/// system, tenant)` reach the debounce with identical `(mkh, ovr, fh)`;
+/// if `dag.iter_nodes()` (HashMap order) yields the serial drv first it
+/// burns the slot then early-returns without emitting → sibling
+/// suppressed → metric flat zero.
+///
+/// Different `DrvHash` values → different SipHash placements →
+/// different iteration order in one process. At least one `k` yields 0
+/// at 4ef92abf. After R7B1 (`intent_for` returns `IntentDecision`;
+/// record AFTER the early-returns) every `k` yields exactly 1.
+#[tokio::test]
+async fn contract_infeasible_static_hints_independent() {
+    use crate::sla::metrics::infeasible_counts;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    // S=2000 > p90=1200 → solve_mvp BestEffort → classify_ceiling =
+    // SerialFloor. Shared by both drvs (same `(pname, system, tenant)`
+    // → same `(mkh, ovr, fh)`).
+    let mut fit = make_fit("synth-hint");
+    fit.fit = crate::sla::types::DurationFit::Amdahl {
+        s: crate::sla::types::RefSeconds(2000.0),
+        p: crate::sla::types::RefSeconds(0.0),
+    };
+
+    for k in 0..8 {
+        let mut actor = bare_actor_cfg(
+            db.pool.clone(),
+            DagActorConfig {
+                sla: test_sla_config(),
+                ..Default::default()
+            },
+        );
+        actor.sla_tiers = actor.sla_config.solve_tiers();
+        actor.sla_ceilings = actor.sla_config.ceilings();
+        assert!(
+            actor.sla_config.hw_cost_source.is_none(),
+            "precondition: hw-agnostic mode (helm default)"
+        );
+        actor.sla_estimator.seed(fit.clone());
+
+        let ser = format!("d-ser-{k:02x}");
+        let par = format!("d-par-{k:02x}");
+        actor.test_inject_ready(&ser, Some("synth-hint"), "x86_64-linux", false);
+        actor
+            .dag
+            .node_mut(&ser)
+            .unwrap()
+            .enable_parallel_building = Some(false);
+        actor.test_inject_ready(&par, Some("synth-hint"), "x86_64-linux", false);
+
+        let rec = DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        let _g = metrics::set_default_local_recorder(&rec);
+
+        let _ = actor.compute_spawn_intents(&Default::default());
+        let m = infeasible_counts(&snap);
+        assert_eq!(
+            m.get("serial_floor").copied().unwrap_or(0),
+            1,
+            "k={k}: `_infeasible_total{{serial_floor}}` must fire \
+             exactly once regardless of which drv `iter_nodes()` \
+             yields first — was 0 (serial drv burned the \
+             `infeasible_static_fh` slot then early-returned at \
+             solve.rs `enable_parallel_building` without emitting; \
+             sibling suppressed) before R7B1"
+        );
+    }
+}
+
 /// **§Fourth-strike Option 2 falsification** — `h_explore` is pinned
 /// in `MemoEntry.pinned_explore`, decoupled from `inputs_gen`. With
 /// Option 1 (quantize) in place, steady-state `inputs_gen` doesn't
