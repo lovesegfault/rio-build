@@ -5,6 +5,46 @@ a shape, the bugs it produced, and the structural close. When a diff
 matches the shape, the reviewer checks the close was applied or that
 the author explicitly opted out (with the threat-model clause named).
 
+## Nth-strike type-check
+
+**Nth-strike (N≥3) on the same invariant ⟹ restructure so the
+invariant is compiler-checked, NOT add a review rule.** Review rules
+catch first-strike; by third strike the rule existed, was followed,
+and still broke.
+
+**Why:** five of ten r6 bugs were second-order regressions in r5's own
+fixes. Each fix was reviewed against the rule it was closing; none
+re-enumerated adjacent invariants the change perturbed. r6 bug_012:
+R5B8's plan listed pre-/post-filter `n_eff` consumers; the dispatch
+gates appeared in NEITHER list. r6 bug_021: R5B6's `cap_c.max(1.0)`
+floor carried a "spot-only" comment at solve.rs:837-840; the
+implication for `all(λ-adjacent)` over a mixed-cap vec was not drawn.
+r6 bugs 004+011: r5-validation closed Opt2's success over-stickiness;
+failure over-stickiness (infeasible/ICE) was not modeled. The review
+rule was correct AND followed AND insufficient — the invariant lives
+in too many heads.
+
+**Structural close — template by strike cluster:**
+
+- **Newtype split** (r6 bug_012 → `RingNEff`/`FitDf`): two readers
+  want different semantics from one field → split into two
+  newtype-wrapped fields so mixing is a type error. The next reader
+  cannot re-conflate.
+- **Extract function + sum-type return** (r6 bugs 004+011 →
+  `resolve_h_explore` → `HExploreOutcome`): a state-machine open-coded
+  across N locations with implicit ordering dependencies → one
+  function whose return enum names every outcome. Unit tests pin each
+  transition; the caller is a `match` with no `_` arm.
+- **Partition at type level** (r6 bug_021 → `spot_rejects` /
+  `od_rejects`): a predicate semantically defined over a subset reads
+  a mixed collection → partition the collection at the source so the
+  predicate's input IS the subset. A future change to the other
+  partition's reachable variants cannot break it.
+
+A new review rule MAY accompany the type-check (so first-strike on a
+*different* invariant is caught) — but the type-check is the close,
+not the rule.
+
 ## Granularity coupling
 
 Converting `T` → `Option<T>` (or `[T; K]` → `[Option<T>; K]`, or any
@@ -46,6 +86,42 @@ fit is suspect. r5 bug_023: `n_eff`/`n_distinct_c`/`sum_w` were
 computed on the full ring but `als_fit`/`sigma_resid` ran on the
 `idx`-filtered subset, so `z_q()` overstated df → under-widened CI →
 `c*` undersized (anti-conservative).
+
+**Parallel maps at different key granularity.** Two maps that
+debounce/memoize the same logical event MUST share the same key tuple,
+OR the coarser map's predicate is provably invariant under the dropped
+dimensions — invariance stated at the declaration AND asserted by a
+test `pred(k, finer1) == pred(k, finer2)`. r6 bug_003:
+`infeasible_static_fh` was added (R5B3) keyed `mkh`-only with an
+*untested* invariance comment at solve.rs:1072-1074, alongside its
+sibling `MemoEntry.last_infeasible_fh` keyed `(mkh, ovr)`. The dropped
+dimension `override_.tier` changes the debounced predicate (emit
+decision) without changing the coarser key → two overrides on one
+`mkh` race for one suppress slot.
+
+## Semantic field change
+
+Changing a stored field's **semantics**, **key granularity**, or
+**reachable-value-set**: the commit body states `rg -c <field>` total;
+each hit is classified `{wants-old, wants-new, indifferent}`; the
+reviewer checks Σ classifications == total. When ≥1 reader wants-old
+AND ≥1 reader wants-new ⟹ MUST split into two fields (newtype) —
+comment-lists don't survive the next change.
+
+**Why:** r6 bug_012: R5B8 changed `FittedParams.n_eff` from pre-filter
+(ring cardinality) to post-filter (`z_q` df). The plan's
+consumer-enumeration comments at ingest.rs:197-201/243-248 listed
+pre-filter consumers and post-filter consumers — and missed the two
+dispatch gates at snapshot.rs:778 + solve.rs:413, which appear in
+NEITHER list and want pre-filter. `rg -c n_eff` was ≈49 hits / 11
+files; the commit body listed ~14. The Σ-check would have surfaced the
+gap as 35 unclassified hits.
+
+**Structural close:** the Σ-check catches "missed a reader"; the
+`{wants-old, wants-new}` partition catches "readers disagree". When
+they disagree, the field split (`RingNEff` / `FitDf`) makes the
+disagreement a type — every future reader picks one explicitly, and
+`rg n_eff` no longer matches both populations.
 
 ## Witness-flag completeness
 
@@ -99,6 +175,17 @@ The sort key SHOULD match the downstream consumer's order (here: §13b
 FFD's `(priority, c*) desc`) so the admitted subset is what the
 consumer wanted first. Add a stable tiebreak (e.g. `drv_hash` asc) so
 ties don't re-introduce nondeterminism.
+
+The rule applies to **writes** as well as gates: a `HashMap::iter()`
+loop where which-element-first determines what's *written to a shared
+slot* is the same finding. r6 bug_004: `pinned_explore` is stored at
+`(mkh, ovr)` granularity but its initial value was `pool.choose(&mut
+rng)` with `rng` seeded from per-loop-element `drv_hash` — whichever
+heads-drv `dag.iter_nodes()` reached first wrote the shared slot. Same
+DAG, different process restart → different first-writer → different
+pin → ε_h Job churn. Close: seed the *value* from the *storage key*
+(`mkh ^ ovr`), so the write is a pure function of the slot it writes
+to.
 
 ## Stability tests perturb within the noise band
 

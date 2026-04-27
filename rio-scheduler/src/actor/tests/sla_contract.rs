@@ -1019,6 +1019,105 @@ async fn contract_pinned_explore_routes_around_ice() {
     );
 }
 
+/// **R6B5 / bug_004** — `pinned_explore` is independent of which drv
+/// writes it first. The pin is stored at `(mkh, ovr)` granularity;
+/// its VALUE must be a pure function of `(mkh, ovr, pool)`. Pre-R6B5
+/// the value was `pool.choose(&mut per-drv-rng)` — whichever heads-drv
+/// `dag.iter_nodes()` (HashMap, RandomState) reached first seeded the
+/// shared slot from its OWN `drv_hash`. Two scheduler replicas (or one
+/// across a restart) with the same `(mkh, ovr)` but different
+/// drv-hash populations would pin different `h_explore` →
+/// `reap_stale_for_intents` churns the explore Job on every leader
+/// flip. REVIEW.md §HashMap-iteration-order, write-side.
+///
+/// Actor-boundary mirror of `explore::resolve_pool_permutation_
+/// independent` (which proves `resolve_h_explore` itself is
+/// pool-order-independent): two independent actor instances, DISJOINT
+/// drv-hash sets, ONE shared `(mkh, ovr)` (same pname/system/tenant,
+/// no override), ε=1.0 → both `compute_spawn_intents` runs MUST
+/// commit identical `pinned_explore` for that key. NOT "different DAG
+/// insertion orders on one actor" — `dag.nodes` is HashMap with
+/// per-process RandomState, so insertion order is irrelevant and that
+/// test would be vacuous. Two actors = two RandomStates = the real
+/// nondeterminism axis.
+// r[verify sched.sla.hw-class.epsilon-explore+4]
+#[tokio::test]
+async fn contract_pinned_explore_first_writer_independent() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mkh = crate::sla::solve::model_key_hash(&make_fit("test-pkg").key);
+
+    // Two independent actors: each its own DagActor (own `dag` HashMap
+    // with own RandomState, own `solve_cache`). Both share pname
+    // "test-pkg" → same `mkh`; `ovr=0` (no override). Drv-hash sets
+    // are disjoint AND multi-element so the per-actor first-writer is
+    // (a) different across actors and (b) iteration-order-dependent
+    // within each.
+    let mut a = bare_actor_hw(db.pool.clone());
+    let mut b = bare_actor_hw(db.pool.clone());
+    a.sla_config.hw_explore_epsilon = 1.0;
+    b.sla_config.hw_explore_epsilon = 1.0;
+    for i in 0..5 {
+        a.test_inject_ready(
+            &format!("drv-a-{i:02}"),
+            Some("test-pkg"),
+            "x86_64-linux",
+            false,
+        );
+        b.test_inject_ready(
+            &format!("drv-b-{i:02}"),
+            Some("test-pkg"),
+            "x86_64-linux",
+            false,
+        );
+    }
+
+    // One controller poll each → ε=1.0 → every drv hits the explore
+    // branch; the first to reach `update_entry` writes the pin.
+    let _ = a.compute_spawn_intents(&Default::default());
+    let _ = b.compute_spawn_intents(&Default::default());
+
+    let pin_a = a
+        .solve_cache
+        .peek_entry(mkh, 0)
+        .expect("actor a: ε=1.0 + |H|>1 → explore reached → MemoEntry exists")
+        .pinned_explore;
+    let pin_b = b
+        .solve_cache
+        .peek_entry(mkh, 0)
+        .expect("actor b: MemoEntry exists")
+        .pinned_explore;
+    assert!(
+        pin_a.is_some(),
+        "precondition: pool=H\\A non-empty → pin written"
+    );
+    assert_eq!(
+        pin_a, pin_b,
+        "two actors, disjoint drv-hash sets, same (mkh,ovr) → \
+         `pinned_explore` MUST be identical. Pre-R6B5 the pin VALUE was \
+         seeded from per-drv `drv_hash` → first-writer-dependent → \
+         got a={pin_a:?} b={pin_b:?}. Post-R6B5 seed is `mkh ^ ovr` → \
+         pure function of the storage key."
+    );
+
+    // And the emitted `h_explore` (observable on the wire) agrees:
+    // every intent's `hw_class_names` is `{pin}` for both actors.
+    let h_of = |actor: &DagActor| -> std::collections::BTreeSet<String> {
+        actor
+            .compute_spawn_intents(&Default::default())
+            .intents
+            .into_iter()
+            .flat_map(|i| i.hw_class_names)
+            .collect()
+    };
+    assert_eq!(
+        h_of(&a),
+        h_of(&b),
+        "wire-visible `hw_class_names` agree across actors — the \
+         controller's `reap_stale_for_intents` sees the same fingerprint \
+         regardless of which replica answered"
+    );
+}
+
 /// **R6B6 / bug 021** — `InterruptRunaway` is reachable from
 /// `solve_full` at the actor boundary. Pre-fix: `classify_best_effort`
 /// reads ONE mixed-cap `rejects` vec; `cap_c.max(1.0)` (R5B6) means OD
