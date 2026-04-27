@@ -330,6 +330,11 @@ fn load_key(path: Option<&std::path::Path>) -> Result<Option<Vec<u8>>, HmacError
     // stripping only \n would leave \r in the key → scheduler and
     // store key mismatch → all uploads rejected with opaque
     // InvalidSignature.
+    //
+    // Every consumer of the key file MUST mirror this trim. The
+    // dashboard njs (nix/docker.nix dashboardServiceTokenJs) does so
+    // at the byte level; nix/tests/lib/hmac-keys.nix appends a LF to
+    // the fixture so any consumer that doesn't fails CI.
     let key = key
         .strip_suffix(b"\r\n")
         .or_else(|| key.strip_suffix(b"\n"))

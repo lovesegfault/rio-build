@@ -325,7 +325,20 @@ let
     // rejected and the request fails closed (PermissionDenied).
     let key;
     try {
-      key = fs.readFileSync('/etc/rio/hmac/service-hmac.key');
+      const raw = fs.readFileSync('/etc/rio/hmac/service-hmac.key');
+      // Mirror rio-auth load_key EXACTLY: strip one trailing CRLF or
+      // LF at the byte level so a Secret created with `echo` (no -n)
+      // or a YAML `|` block scalar still verifies. NOT .toString()
+      // .replace() — the key is raw `openssl rand 32` bytes; a UTF-8
+      // round-trip would corrupt it. lib/hmac-keys.nix appends LF to
+      // the test fixture so vm-dashboard-k3s breaks if this drifts.
+      let n = raw.length;
+      if (n >= 2 && raw[n - 2] === 0x0d && raw[n - 1] === 0x0a) {
+        n -= 2;
+      } else if (n >= 1 && raw[n - 1] === 0x0a) {
+        n -= 1;
+      }
+      key = raw.slice(0, n);
     } catch (e) {
       key = Buffer.from("");
     }
