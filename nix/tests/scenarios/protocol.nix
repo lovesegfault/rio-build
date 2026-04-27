@@ -23,6 +23,12 @@
   common,
   fixture,
   cold ? false,
+  # Exercise `r[gw.conn.exit-status]`: client has nix-output-monitor +
+  # ControlMaster ssh config; subtest asserts `nom build` exits within
+  # the timeout (vs hanging until ControlPersist) and gateway-side
+  # `connections_active` returns to 0. Only the CppNix warm variant
+  # opts in — Lix's nom compatibility isn't load-bearing for this fix.
+  withNomExitTest ? false,
   nameSuffix ? "",
 }:
 let
@@ -241,6 +247,56 @@ let
             "rio_scheduler_cache_hits_total", 1.0,
             labels='{source="existing"}',
         )
+
+    ${pkgs.lib.optionalString withNomExitTest nomExitScript}
+  '';
+
+  # ── nom-exit / SSH connection teardown ────────────────────────────────
+  #
+  # Client ssh_config has ControlMaster auto + ControlPersist 600 (via
+  # default.nix extraClientModules). Without the gateway sending
+  # `exit-status` (RFC 4254 §6.10), openssh's foreground client process
+  # never returns to nix → nix blocks in pipe-read → `nom build` hangs.
+  # Without `disconnect()` on last-channel-close, the TCP socket stays
+  # ESTABLISHED until inactivity_timeout (3600s).
+  nomExitScript = ''
+    with subtest("nom build exits under ControlMaster (gateway sends exit-status)"):
+        # Same trivial drv as above — already cached, so this is a fast
+        # round-trip. nom wraps `nix build` (new CLI), so `-f` not the
+        # nix-build positional. timeout 60s: a hang would hit 124.
+        # client.execute (not .succeed): the test driver runs under
+        # `set -e`, so a nonzero from `timeout` would short-circuit
+        # before we could inspect the code.
+        rc, out = client.execute(
+            f"timeout 60 nom build --no-link --store '{store_url}' "
+            "-f ${trivialDrv} --arg busybox "
+            "'(builtins.storePath ${common.busybox})' 2>&1"
+        )
+        assert rc == 0, (
+            f"nom build exited {rc} (124=timeout → gateway likely "
+            f"missing exit-status; see r[gw.conn.exit-status]). out: {out}"
+        )
+
+    with subtest("gateway connection closed after last channel (disconnect)"):
+        # The mux daemon may still hold the TCP open for ControlPersist
+        # client-side, but the gateway should have sent SSH_MSG_DISCONNECT
+        # → server-side connections_active drops to 0 promptly. Scrape on
+        # the gateway node (has curl; client may not).
+        ${gatewayHost}.wait_until_succeeds(
+            "curl -fsS http://localhost:9090/metrics | "
+            "grep -qx 'rio_gateway_connections_active 0'",
+            timeout=15,
+        )
+
+    with subtest("rejected exec exits promptly (exit-status on failure path)"):
+        # `ssh gateway echo` is rejected (gateway only accepts
+        # `nix-daemon --stdio`). Pre-fix this hung under ControlMaster.
+        # Expect: nonzero, fast. 124 = timeout = fail.
+        rc, _ = client.execute(
+            "timeout 30 ssh ${gatewayHost} echo hi 2>&1"
+        )
+        assert rc != 124, "rejected exec timed out (no exit-status on reject path)"
+        assert rc != 0, f"rejected exec unexpectedly succeeded (rc={rc})"
   '';
 in
 pkgs.testers.runNixOSTest {

@@ -563,6 +563,17 @@ r[gw.conn.exec-request]
 
 The gateway matches the **suffix** of the second-to-last whitespace-separated argument (`ends_with("nix-daemon")`) and requires the last argument to be exactly `--stdio`. This allows clients that send a full store path (e.g., `/nix/store/...-nix-2.20.0/bin/nix-daemon --stdio`) to connect successfully.
 
+r[gw.conn.exit-status]
+When the protocol handler returns, the gateway MUST send `exit-status`
+(RFC 4254 §6.10) on the channel before `eof`/`close`; openssh under
+`ControlMaster` waits for `exit-status` before its foreground process
+returns to the parent (nix), so omitting it leaves `nom build` hung
+until `ControlPersist` expires. A rejected `exec_request` MUST send
+`channel_failure` followed by `exit-status 1` + `eof` + `close` for the
+same reason. When the last channel on a connection closes, the gateway
+MUST send `SSH_MSG_DISCONNECT` so the TCP socket closes promptly
+instead of waiting for `inactivity_timeout`.
+
 r[gw.conn.session-error-visible]
 Any error propagated from an SSH handler method (via `?`) is logged at
 `error!` and increments `rio_gateway_errors_total{type="session"}`. The

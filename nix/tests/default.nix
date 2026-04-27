@@ -217,10 +217,29 @@ in
   #   Gates Phase-2 boot-path changes (initrd-networkd, UKI, perlless).
   vm-nixos-node = import ./nixos-node.nix { inherit pkgs; };
 
+  # r[verify gw.conn.exit-status]
+  #   nom-exit subtest: client ssh_config has ControlMaster auto +
+  #   ControlPersist 600. `timeout 60 nom build` must exit 0 (gateway
+  #   sends exit-status before eof); `connections_active` must return
+  #   to 0 within 15s (gateway disconnects on last-channel-close);
+  #   `ssh gateway echo` (rejected exec) must exit ≠124.
   vm-protocol-warm-standalone = protocol {
     inherit pkgs common;
-    fixture = standalone { };
+    fixture = standalone {
+      extraClientModules = [
+        {
+          environment.systemPackages = [ pkgs.nix-output-monitor ];
+          programs.ssh.extraConfig = ''
+            Host *
+              ControlMaster auto
+              ControlPath /tmp/cm-%C
+              ControlPersist 600
+          '';
+        }
+      ];
+    };
     cold = false;
+    withNomExitTest = true;
   };
 
   # r[verify gw.compat.version-range+2]

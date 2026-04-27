@@ -18,9 +18,9 @@ use rio_common::signal::Token as CancellationToken;
 use rio_common::tenant::{NameError, NormalizedName};
 use rio_proto::SchedulerServiceClient;
 use rio_proto::StoreServiceClient;
-use russh::ChannelId;
 use russh::keys::PublicKey;
 use russh::server::{Auth, Handler, Msg, Session};
+use russh::{ChannelId, Disconnect};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::OwnedSemaphorePermit;
 use tonic::transport::Channel;
@@ -122,6 +122,24 @@ impl Drop for ChannelSession {
         // after a dead protocol task. Avoids gauge leak on abnormal paths.
         metrics::gauge!("rio_gateway_channels_active").decrement(1.0);
     }
+}
+
+// r[impl gw.conn.exit-status]
+/// Reject an exec request and tear the channel down so the client `ssh`
+/// process exits. `channel_failure` alone leaves the channel open;
+/// openssh under ControlMaster waits for `exit-status` before its
+/// foreground process returns. Send failure (so the client knows exec
+/// was refused), then `exit-status 1` + `eof` + `close` so `ssh gw foo`
+/// exits 1 instead of hanging until ControlPersist.
+fn reject_exec(
+    session: &mut Session,
+    channel: ChannelId,
+) -> Result<(), <ConnectionHandler as Handler>::Error> {
+    session.channel_failure(channel)?;
+    session.exit_status_request(channel, 1)?;
+    session.eof(channel)?;
+    session.close(channel)?;
+    Ok(())
 }
 
 /// Per-connection handler that manages SSH channels.
@@ -625,8 +643,7 @@ impl Handler for ConnectionHandler {
     ) -> Result<(), Self::Error> {
         let Ok(command) = String::from_utf8(data.to_vec()) else {
             warn!(channel = ?channel_id, "rejecting exec request: command is not valid UTF-8");
-            session.channel_failure(channel_id)?;
-            return Ok(());
+            return reject_exec(session, channel_id);
         };
         info!(channel = ?channel_id, command = %command, "exec request");
 
@@ -636,8 +653,7 @@ impl Handler for ConnectionHandler {
             && args[args.len() - 1] == "--stdio";
         if !is_nix_daemon {
             warn!(command = %command, "rejecting non-nix-daemon exec request");
-            session.channel_failure(channel_id)?;
-            return Ok(());
+            return reject_exec(session, channel_id);
         }
 
         // r[impl gw.conn.channel-limit+2]
@@ -655,8 +671,7 @@ impl Handler for ConnectionHandler {
                 "rejecting exec request: per-connection channel limit reached"
             );
             metrics::counter!("rio_gateway_errors_total", "type" => "channel_limit").increment(1);
-            session.channel_failure(channel_id)?;
-            return Ok(());
+            return reject_exec(session, channel_id);
         }
 
         session.channel_success(channel_id)?;
@@ -755,6 +770,17 @@ impl Handler for ConnectionHandler {
                     }
                 }
             }
+            // r[impl gw.conn.exit-status]
+            // RFC 4254 §6.10: send `exit-status` BEFORE eof/close. Without
+            // it, openssh's foreground client process (under ControlMaster)
+            // never returns to nix → nix blocks in pipe-read → `nom build`
+            // hangs until ControlPersist expires. Unconditionally 0: the
+            // wire-level `BuildResult` already conveys per-build success/
+            // failure to the nix client; the ssh exit code only signals
+            // "the daemon session ended", which it did.
+            if handle.exit_status_request(channel_id, 0).await.is_err() {
+                warn!(channel = ?channel_id, "failed to send exit-status to SSH client");
+            }
             if let Err(e) = handle.eof(channel_id).await {
                 warn!(channel = ?channel_id, error = ?e, "failed to send EOF to SSH client");
             }
@@ -820,11 +846,22 @@ impl Handler for ConnectionHandler {
     async fn channel_close(
         &mut self,
         channel: ChannelId,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
         debug!(channel = ?channel, "SSH channel closed");
         // Gauge decrement handled by ChannelSession::Drop.
         self.sessions.remove(&channel);
+        // r[impl gw.conn.exit-status]
+        // Last channel gone → disconnect the SSH connection. Without
+        // this, the TCP socket stays ESTABLISHED until either the
+        // client's ControlPersist or our `inactivity_timeout` (3600s)
+        // fires — `connections_active=1, channels_active=0` for up to
+        // an hour per client. A subsequent ssh-ng op re-handshakes;
+        // ControlMaster reuse is traded for prompt server-side cleanup.
+        if self.sessions.is_empty() {
+            debug!("last channel closed; disconnecting SSH connection");
+            session.disconnect(Disconnect::ByApplication, "last channel closed", "")?;
+        }
         Ok(())
     }
 }
