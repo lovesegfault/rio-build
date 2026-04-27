@@ -1,7 +1,7 @@
 # ADR-022 Implementation Plan — castore-FUSE lazy store + per-AZ S3 Express chunk cache
 
 **Status:** sequencing only — design is [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) + [Design Overview](./022-design-overview.md) + ADR-023.
-**Plan-number range:** P0541–P0588 (gaps at 0542/0547/0558/0561/0587 are abandoned numbers; P0556 abandoned 2026-04-23 — do not reuse).
+**Plan-number range:** P0541–P0589 (gaps at 0542/0547/0558/0561/0587 are abandoned numbers; P0556 abandoned 2026-04-23 — do not reuse).
 **Clean-cutover constraint:** no FUSE fallback flag, no `RIO_STORE_BACKEND` selector. P0560 deletes the old FUSE module wholesale.
 **Cross-region forward-compat:** object store (S3/GCS) is authoritative for bytes; S3 Express One Zone is a per-AZ read-through cache; PG is single-region. Nothing here precludes cross-region deployment (object-store-authoritative, cache tier stateless) but it is not implemented. No DRA. **Express AZ-ID availability constrains region/AZ choice** — see [Design Overview §9](./022-design-overview.md).
 **Migration-number range:** `054_*` (last shipped: `053_build_logs_first_line.sql`).
@@ -136,7 +136,10 @@ P0567 rio-mountd DaemonSet (fd-handoff + BACKING_OPEN broker + Promote + cache o
    │                                                                                            │
 P0588 WorkAssignment.input_roots (proto field 3 + dispatch.rs populate) ◄─(P0572)
    │                                                                                            │
-P0559 castore_fuse/{tree,open,circuit}.rs ◄─(P0550, P0567, P0568, P0572, P0573, P0577, P0588)
+P0589 AssignmentClaims.{role,tenant_id,input_closure_digest} + dispatch ◄─(P0544, P0588)
+   │   (sequenced before P0573/P0586/P0560/P0584 — all read these claim fields)
+   │                                                                                            │
+P0559 castore_fuse/{tree,open,circuit}.rs ◄─(P0550, P0567, P0568, P0570, P0572, P0573, P0577, P0588)
    │
 P0571 mountd-owned cache LRU + per-build staging ◄─(P0559, P0567)
    │
@@ -247,7 +250,7 @@ Each as an independent `subtests=[...]` entry (failures isolate). `# r[verify bu
 **Crate:** `rio-nix` · **Deps:** P0544, P0545 · **Complexity:** MED
 | File | Change |
 |---|---|
-| `rio-nix/src/nar.rs` | `pub fn nar_ls<R: Read>(r) -> Result<Vec<NarLsEntry>>` — sibling to `parse()` (~line 238); **single forward pass, no `Seek`, bounded memory regardless of NAR size.** Maintains a running byte counter for `nar_offset`; for `Regular`, records the offset after the `"contents"` length-prefix, then streams the `size` bytes through `blake3::Hasher` in 64 KiB blocks (bytes touched once, never buffered whole). `NarLsEntry { …, file_digest: [u8;32] }`. `// r[impl store.index.nar-ls-offset]` `// r[impl store.index.file-digest]` `// r[impl store.index.nar-ls-streaming]` |
+| `rio-nix/src/nar/` | `pub fn nar_ls<R: Read>(r) -> Result<Vec<NarLsEntry>>` — sibling to `parse()`; **single forward pass, no `Seek`, bounded memory regardless of NAR size.** Maintains a running byte counter for `nar_offset`; for `Regular`, records the offset after the `"contents"` length-prefix, then streams the `size` bytes through `blake3::Hasher` in 64 KiB blocks (bytes touched once, never buffered whole). `NarLsEntry { …, file_digest: [u8;32] }`. `// r[impl store.index.nar-ls-offset]` `// r[impl store.index.file-digest]` `// r[impl store.index.nar-ls-streaming]` |
 | `rio-nix/fuzz/fuzz_targets/nar_ls.rs` + `Cargo.toml` + `nix/fuzz.nix` | new — includes a >4 GiB synthetic NAR via `io::repeat()` slices to assert no buffering |
 | tests | proptest: `serialize(tree)` → `nar_ls` → `&nar[off..off+size] == content` AND `file_digest == blake3(content)`; explicit test with reader wrapper that panics on `seek()`. `// r[verify ...]` |
 
@@ -280,7 +283,7 @@ Hoist `StoreClients` + `fetch_chunks_parallel` from `rio-builder/src/fuse/fetch/
 |---|---|
 | `rio-proto/proto/types.proto` | `NarIndexEntry { …; bytes dir_digest = 8; }` (populated when `kind==DIR`; blake3 of canonical Directory encoding); `NarIndex { …; bytes root_digest = 2; }` |
 | `rio-proto/proto/castore.proto` | new — vendor snix [`castore.proto`](https://git.snix.dev/snix/snix/raw/branch/canon/snix/castore/protos/castore.proto) (MIT): `message Directory { repeated DirectoryEntry directories; repeated FileEntry files; repeated SymlinkEntry symlinks; }` with `FileEntry{name, digest, size, executable}`, `DirectoryEntry{name, digest, size}`, `SymlinkEntry{name, target}`. **Pin canonical encoding rule** in a doc-comment: fields sorted by `name` (bytes-lex), no unknown fields, prost's default field-order encode. **snix issue #111**: prost determinism is not formally guaranteed across versions — add a golden-bytes test that fails loudly on encoder drift. `// r[impl store.castore.canonical-encoding]` |
-| `rio-nix/src/nar.rs` | `nar_ls` second pass (bottom-up over the entry list, deepest-first): for each `kind==DIR`, build `Directory{…}` from immediate children's `file_digest`/`dir_digest`/`target`, encode, `dir_digest = blake3(encoded)`. `root_digest` = top dir's `dir_digest`. ~50 LoC. `// r[impl store.index.dir-digest]` |
+| `rio-nix/src/nar/` | `nar_ls` second pass (bottom-up over the entry list, deepest-first): for each `kind==DIR`, build `Directory{…}` from immediate children's `file_digest`/`dir_digest`/`target`, encode, `dir_digest = blake3(encoded)`. `root_digest` = top dir's `dir_digest`. ~50 LoC. `// r[impl store.index.dir-digest]` |
 | `migrations/054_nar_index.sql` (P0551 — same migration) | `+ ALTER TABLE nar_index ADD COLUMN root_node bytea;` (encoded `oneof{dir_digest, FileEntry, SymlinkEntry}` — what P0588's dispatch query reads). `CREATE TABLE directories (digest bytea PRIMARY KEY, body bytea NOT NULL, refcount integer NOT NULL DEFAULT 0); CREATE TABLE directory_tenants (digest bytea NOT NULL REFERENCES directories(digest) ON DELETE CASCADE, tenant_id uuid NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE, PRIMARY KEY (digest, tenant_id)); CREATE INDEX directory_tenants_tenant_idx ON directory_tenants (tenant_id, digest);` **`file_blobs` is a junction, not a refcounted singleton** — one row per (file_digest, containing-manifest), so GC of any one referrer cannot dangle the lookup: `CREATE TABLE file_blobs (digest bytea NOT NULL, store_path_hash bytea NOT NULL REFERENCES manifests(store_path_hash) ON DELETE CASCADE, nar_offset bigint NOT NULL, PRIMARY KEY (digest, store_path_hash)); CREATE INDEX file_blobs_digest_idx ON file_blobs (digest); CREATE TABLE file_blob_tenants (digest bytea NOT NULL, tenant_id uuid NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE, PRIMARY KEY (digest, tenant_id)); CREATE INDEX file_blob_tenants_tenant_idx ON file_blob_tenants (tenant_id, digest);` |
 | `rio-store/src/nar_index.rs` (P0552) | after `set_nar_index`: write `root_node` column. `INSERT INTO directories … ON CONFLICT (digest) DO UPDATE SET refcount = directories.refcount + 1` (UNNEST, **sorted** input per `r[store.chunk.refcount-txn]`); `INSERT INTO directory_tenants (digest, $tenant_id) ON CONFLICT DO NOTHING`. `INSERT INTO file_blobs (digest, store_path_hash, nar_offset) … ON CONFLICT DO NOTHING` (sorted UNNEST); `INSERT INTO file_blob_tenants (digest, $tenant_id) ON CONFLICT DO NOTHING`. `// r[impl store.castore.gc]` `// r[impl store.castore.tenant-scope]` |
 | `rio-store/src/gc/sweep.rs` (existing sweep) | in the per-manifest sweep txn, before `DELETE narinfo` cascades: decode the dying `nar_index.entries`, `UPDATE directories SET refcount=refcount-1 WHERE digest=ANY($sorted)`; `DELETE FROM directories WHERE digest=ANY($zeros)` (no S3 object → hard-delete; junction rows go via `ON DELETE CASCADE`). `file_blobs` rows for the dying manifest cascade-delete via the `manifests` FK — **no repoint needed; surviving referrers' rows remain**. After cascade: `DELETE FROM file_blob_tenants ft WHERE ft.digest = ANY($dying_file_digests) AND NOT EXISTS (SELECT 1 FROM file_blobs fb WHERE fb.digest = ft.digest)`. |
@@ -413,23 +416,11 @@ Hoist `StoreClients` + `fetch_chunks_parallel` from `rio-builder/src/fuse/fetch/
 **Note for P0566/P0582:** depend on this for the `chunk_list: &[ChunkRef]` signature simplification; sequence after P0583 if not already merged.
 **Exit:** `/nixbuild --checks` green; `tracey query rule store.inline.threshold` reports no-such-rule.
 
-### P0589 — `AssignmentClaims.{role, tenant_id, input_closure_digest}` + dispatch populate
-**Crate:** `rio-auth, rio-scheduler` · **Deps:** P0544, P0588 · **Complexity:** LOW
-
-Adds the three claim fields that P0573 (`tenant_id` for castore tenant-scoping), P0586 (`role`, `input_closure_digest` for `validate_begin`), and P0584 (`role` for the PutPath gate) all read. Sequenced *before* all of them so each compiles against a complete `AssignmentClaims`.
-
-| File | Change |
-|---|---|
-| `rio-auth/src/hmac.rs` | add three fields to `AssignmentClaims`: `role: TokenRole` (enum `Builder`/`Gateway`/`Admin`; serde-tagged), `tenant_id: Uuid` (what P0573/P0577's castore RPC tenant-scoping reads from HMAC callers), `input_closure_digest: [u8; 32]` (blake3 over the sorted transitive-input-closure store-path strings, newline-joined — the §6.3 server-side refscan candidate-set attestation) |
-| `rio-scheduler/src/dispatch.rs` | token issuance for builder assignments sets `role: TokenRole::Builder`, `tenant_id` from the derivation's tenant, and `input_closure_digest: blake3(sorted(input_closure).join("\n"))` — the closure is already computed at dispatch for `WorkAssignment.input_roots` (P0588), so this is one extra hash over data in hand. The same sorted closure is sent in `WorkAssignment` so the builder can echo it as `Begin.input_closure` without recomputing the BFS. Gateway/admin token issuance sets `role` accordingly with `input_closure_digest = [0;32]`. |
-| `docs/src/security.md` | bump `r[common.hmac.claims]`: enumerate the eight fields (`executor_id, drv_hash, expected_outputs, is_ca, expiry_unix, role, tenant_id, input_closure_digest`) and drop "exactly five" |
-**Exit:** `/nixbuild --checks` green.
-
 ### P0584 — builder-chunked-only auth gate
 **Crate:** `rio-store` · **Deps:** P0586, P0589 · **Complexity:** LOW
 | File | Change |
 |---|---|
-| `rio-store/src/grpc/put_path.rs` | at the existing token-verify step: if `claims.role == Builder`, return `Status::permission_denied("builders must use PutPathChunked; PutPath is gateway/admin-only")` before any buffering. Same gate in `put_path_batch.rs`. `// r[impl store.put.builder-chunked-only]` |
+| `rio-store/src/grpc/put_path/mod.rs` | at the existing token-verify step: if `claims.role == Builder`, return `Status::permission_denied("builders must use PutPathChunked; PutPath is gateway/admin-only")` before any buffering. Same gate in `put_path_batch.rs`. `// r[impl store.put.builder-chunked-only]` |
 | tests | unit: builder-role token → `PutPath` returns `PERMISSION_DENIED`; gateway-role token → `PutPath` proceeds; builder-role token → `PutPathChunked` proceeds. `// r[verify store.put.builder-chunked-only]` |
 **Exit:** `/nixbuild --checks` green.
 
@@ -480,8 +471,20 @@ The builder's mount-time DAG prefetch (P0559) needs each input store path's `roo
 | `docs/src/components/scheduler.md` | `r[sched.dispatch.input-roots]` col-0 spec text: "WorkAssignment MUST carry `(store_path, root_node)` for every closure input the build is authorized to read; the builder presents this as the FUSE root's children and as the `GetDirectory` request seed." |
 | tests | unit: `compute_work_assignment` populates `input_roots` for a 3-path closure (dir, regular-file root, symlink root). `// r[verify sched.dispatch.input-roots]` |
 
+### P0589 — `AssignmentClaims.{role, tenant_id, input_closure_digest}` + dispatch populate
+**Crate:** `rio-auth, rio-scheduler` · **Deps:** P0544, P0588 · **Complexity:** LOW
+
+Adds the three claim fields that P0573 (`tenant_id` for castore tenant-scoping), P0586 (`role`, `input_closure_digest` for `validate_begin`), and P0584 (`role` for the PutPath gate) all read. Sequenced *before* all of them so each compiles against a complete `AssignmentClaims`.
+
+| File | Change |
+|---|---|
+| `rio-auth/src/hmac.rs` | add three fields to `AssignmentClaims`: `role: TokenRole` (enum `Builder`/`Gateway`/`Admin`; serde-tagged), `tenant_id: Uuid` (what P0573/P0577's castore RPC tenant-scoping reads from HMAC callers), `input_closure_digest: [u8; 32]` (blake3 over the sorted transitive-input-closure store-path strings, newline-joined — the §6.3 server-side refscan candidate-set attestation) |
+| `rio-scheduler/src/dispatch.rs` | token issuance for builder assignments sets `role: TokenRole::Builder`, `tenant_id` from the derivation's tenant, and `input_closure_digest: blake3(sorted(input_closure).join("\n"))` — the closure is already computed at dispatch for `WorkAssignment.input_roots` (P0588), so this is one extra hash over data in hand. The same sorted closure is sent in `WorkAssignment` so the builder can echo it as `Begin.input_closure` without recomputing the BFS. Gateway/admin token issuance sets `role` accordingly with `input_closure_digest = [0;32]`. |
+| `docs/src/security.md` | bump `r[common.hmac.claims]`: enumerate the eight fields (`executor_id, drv_hash, expected_outputs, is_ca, expiry_unix, role, tenant_id, input_closure_digest`) and drop "exactly five" |
+**Exit:** `/nixbuild --checks` green.
+
 ### P0559 — `castore_fuse/{tree,open,circuit}.rs`
-**Crate:** `rio-builder` · **Deps:** P0550, P0567, P0568, P0572, P0573, P0577, P0588 · **Complexity:** MED (~650 LoC)
+**Crate:** `rio-builder` · **Deps:** P0550, P0567, P0568, P0570, P0572, P0573, P0577, P0588 · **Complexity:** MED (~650 LoC)
 | File | Change |
 |---|---|
 | `rio-builder/src/castore_fuse/tree.rs` | new — DAG prefetch + inode model (ADR §2.2-2.3). `pub async fn build_tree(store: &StoreClient, roots: &[(StorePath, RootNode)]) -> Result<InoMap>` where `RootNode ∈ {Dir(dir_digest), File(file_digest, size, exec), Symlink(target)}` (from `WorkAssignment.input_roots`, P0588). One **`GetDirectory(recursive=true)`** call seeded with all `Dir` roots' digests in field 3 (multi-root; I-110 lesson) — wrapped in `timeout(dag_prefetch_timeout)` (config, default 30 s) → infra-retry on expiry; insert each streamed body into `dirs: HashMap<[u8;32], Directory>` (deduped by digest). Build `inodes: HashMap<u64, Node>` where `Node ∈ {File{file_digest,size,exec}, Dir{dir_digest}, Symlink{target}}` and `ino = h(file_digest ‖ exec) / h(dir_digest) / h("l" ‖ target)` per ADR §2.3: low 63 bits of blake3 with bit 63 set. `FUSE_ROOT_ID` (=1) is synthetic — its `readdir` enumerates `roots` by store-path basename. `pub fn lookup(&self, parent_ino, name: &[u8]) -> Option<(u64, FileAttr)>` reads parent's `Directory` body, finds child by name. `pub fn attr(&self, ino) -> FileAttr` (mode `0o40555/0o100555/0o100444/0o120777`, mtime=1, uid/gid=0). `// r[impl builder.fs.{castore-dag-source,castore-inode-digest}]` |
@@ -491,7 +494,7 @@ The builder's mount-time DAG prefetch (P0559) needs each input store path's `roo
 | `rio-builder/src/lib.rs` | `+ rio_builder_castore_fuse_{lookup,readdir}_total` (cold-metadata counter); `+ rio_builder_castore_fuse_open_mode_total{mode}`; `+ rio_builder_castore_fuse_open_case_total{case}`; `+ rio_builder_castore_fuse_chunk_source_total{src}` (I-056). |
 | `rio-builder/src/castore_fuse/circuit.rs` | port of `fuse/circuit.rs` — breaker around `fetch_chunks_parallel`. `// r[impl builder.fs.fetch-circuit]` |
 | `rio-builder/src/castore_fuse/mod.rs` | `pub mod tree; pub mod open; pub mod circuit; pub mod mount;` |
-| `rio-builder/src/lib.rs` | `pub mod castore_fuse;` + register `rio_builder_castore_fuse_{upcalls_total{op},open_seconds,fetch_bytes_total{hit},integrity_fail_total,eio_total}`. `// r[impl obs.metric.castore-fuse]` |
+| `rio-builder/src/lib.rs` | `pub mod castore_fuse;` + register `rio_builder_castore_fuse_{upcalls_total{op},open_seconds,fetch_bytes_total{hit},integrity_fail_total,eio_total}` + `rio_builder_castore_dag_prefetch_seconds` (overview §14). `// r[impl obs.metric.castore-fuse]` |
 | tests | unit: `tree.lookup(ROOT, basename)` round-trip; per-digest ino — two paths same content → same ino; `readdirplus` returns children with `Duration::MAX` ttl. `// r[verify builder.fs.{digest-fuse-open,castore-inode-digest,castore-cache-config}]` |
 
 **Mode summary:** lookup/getattr/readdir/readlink → in-memory DAG, `Duration::MAX` ttl, dcache absorbs repeats. open() cache hit → passthrough (zero further upcalls). Cache miss ≤ threshold → fetch-whole then passthrough. Cache miss > threshold → P0575 streaming during fill, then next open is passthrough. The FUSE `read` op is reachable only in the streaming window.
@@ -532,7 +535,7 @@ The unprivileged builder cannot (a) open `/dev/fuse`, (b) call `FUSE_DEV_IOC_BAC
 **Exit:** `/nixbuild --checks` green.
 
 ### P0560 — [ATOMIC] castore-FUSE lower cutover: mount + DELETE old-FUSE + fixture kernel + VM test  ★ HARD CUTOVER
-**Crate:** `rio-builder, nix` · **Deps:** P0576, P0557, P0559, P0567, P0571, P0575 · **Complexity:** HIGH (two-part atomic)
+**Crate:** `rio-builder, nix` · **Deps:** P0576, P0557, P0559, P0567, P0571, P0575, P0589 · **Complexity:** HIGH (two-part atomic)
 
 **One worktree, one PR, one `/nixbuild --checks` gate.** §A alone breaks every existing VM test (fixtures lack `kernel.nix`; existing scenarios assert old-FUSE metrics); §B alone has nothing to test.
 
@@ -650,11 +653,11 @@ The unprivileged builder cannot (a) open `/dev/fuse`, (b) call `FUSE_DEV_IOC_BAC
 ## Phase 7 — delta-sync + chunked upload (U5; serialised after P0573 — note P0572/P0573 are now Phase-1/2 critical-path for P0559)
 
 ### P0573 — DirectoryService RPC surface
-**Crate:** `rio-proto, rio-store` · **Deps:** P0572 · **Complexity:** MED
+**Crate:** `rio-proto, rio-store` · **Deps:** P0572, P0589 · **Complexity:** MED
 | File | Change |
 |---|---|
 | `rio-proto/proto/store.proto` | `rpc GetDirectory(GetDirectoryRequest) returns (stream Directory)` — `GetDirectoryRequest { oneof by_what { bytes digest = 1; } bool recursive = 2; repeated bytes digests = 3; }`. `recursive=false` returns the single body; `recursive=true` server-side-BFS streams the whole subtree (snix's `DirectoryService.Get` semantics — first messages are the roots, subsequent are children deduped by digest). Field 3 is the **rio multi-root extension**: the BFS frontier is seeded from `{digest} ∪ digests`, deduped across all roots — the builder sends all closure `dir_digest` roots in one call (1 RPC / ~33 PG round-trips for chromium-scale, vs 357 RPCs / ~1000 PG round-trips per-root; **I-110 lesson**). snix clients omit field 3 (proto3 unknown-field) and stay wire-compatible. `rpc HasDirectories(HasDirectoriesRequest) returns (HasBitmap)`; `rpc HasBlobs(HasBlobsRequest) returns (HasBitmap)` — both batch (`repeated bytes digests = 1`; `HasBitmap { bytes bitmap = 1; }` one bit per request index, LSB-first within each byte). `// r[impl store.castore.directory-rpc]` |
-| `rio-store/src/grpc/directory.rs` | new — all queries **tenant-scoped via junction** (`r[store.castore.tenant-scope]`): `get_directory(digest, recursive)`: `SELECT body FROM directories d JOIN directory_tenants t USING(digest) WHERE d.digest=$1 AND t.tenant_id=$2` (NotFound otherwise — body leaks child names/digests). For `recursive=true`: BFS frontier in batches of ≤256 (`WHERE d.digest=ANY($batch)`), yield each body, decode its `DirectoryEntry` children into next frontier, **dedup via `HashSet<[u8;32]>`** (shared subtrees sent once), stop at empty frontier. `has_directories(digests)` / `has_blobs(file_digests)`: junction-JOIN → bitmap. `tenant_id` from JWT `Claims.sub` **or** the HMAC assignment-token's `tenant_id` claim (`r[common.hmac.claims]` — P0584 adds the field; the builder presents an HMAC token, not a JWT); fail-closed `UNAUTHENTICATED` if neither present. |
+| `rio-store/src/grpc/directory.rs` | new — all queries **tenant-scoped via junction** (`r[store.castore.tenant-scope]`): `get_directory(digest, recursive)`: `SELECT body FROM directories d JOIN directory_tenants t USING(digest) WHERE d.digest=$1 AND t.tenant_id=$2` (NotFound otherwise — body leaks child names/digests). For `recursive=true`: BFS frontier in batches of ≤256 (`WHERE d.digest=ANY($batch)`), yield each body, decode its `DirectoryEntry` children into next frontier, **dedup via `HashSet<[u8;32]>`** (shared subtrees sent once), stop at empty frontier. `has_directories(digests)` / `has_blobs(file_digests)`: junction-JOIN → bitmap. `tenant_id` from JWT `Claims.sub` **or** the HMAC assignment-token's `tenant_id` claim (`r[common.hmac.claims]` — P0589 adds the field; the builder presents an HMAC token, not a JWT); fail-closed `UNAUTHENTICATED` if neither present. |
 | `migrations/054_nar_index.sql` (via P0572) | `file_blobs`/`file_blob_tenants` tables are CREATED in P0572's migration row (see above) — `file_blobs` is a `(digest, store_path_hash)` junction with FK→`manifests` `ON DELETE CASCADE`, populated in P0572's bottom-up pass via sorted-UNNEST insert + tenant-junction insert. **GIN-on-`nar_index.entries` is not viable**: `entries` is BYTEA (encoded proto), not JSONB, so a GIN expression index would require a proto-decoding `IMMUTABLE` PG function tied to the wire format (versioning hazard). The junction is the derived index for `HasBlobs` AND carries the `(store_path_hash, nar_offset)` coords P0574's `dag_sync` and P0570/P0577's `StatBlob`/`ReadBlob` key on. |
 | `rio-store/src/lib.rs` | `rio_store_directory_{get_seconds,has_batch_size}` |
 | tests | ephemeral PG: PutPath nested tree as tenant-A → `GetDirectory(root_digest)` returns correct children; `HasDirectories([root, unknown])` → `[1,0]` bitmap. **Cross-tenant denial**: tenant-B `HasDirectories([root])` → `[0]`; tenant-B `GetDirectory(root)` → NotFound; tenant-B `ReadBlob(file_digest)` → NotFound. `// r[verify store.castore.{directory-rpc,tenant-scope}]` |
@@ -764,14 +767,14 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 |---|---|---|---|
 | `store.backend.tiered-get-fallback` | components/store.md | tiered.rs `get()` (P0548) | vm-store-tiered `cold-miss-fallback` (P0555) |
 | `store.backend.tiered-put-remote-first` | components/store.md | tiered.rs `put()` (P0548) | vm-store-tiered `put-remote-only` (P0555) |
-| `store.put.builder-chunked-only` | components/store.md | grpc/put_path.rs token-role gate (P0584) | unit (P0584) |
-| `store.index.nar-ls-offset` | components/store.md | rio-nix/nar.rs (P0546) | proptest in nar.rs (P0546) |
-| `store.index.file-digest` | components/store.md | rio-nix/nar.rs (P0546) | proptest in nar.rs (P0546) |
+| `store.put.builder-chunked-only` | components/store.md | grpc/put_path/mod.rs token-role gate (P0584) | unit (P0584) |
+| `store.index.nar-ls-offset` | components/store.md | rio-nix/nar/ (P0546) | proptest in nar/ (P0546) |
+| `store.index.file-digest` | components/store.md | rio-nix/nar/ (P0546) | proptest in nar/ (P0546) |
 | `store.index.table-cascade` | components/store.md | metadata/queries.rs (P0551) | rio-store/tests/nar_index.rs (P0552) |
 | `store.index.non-authoritative` | components/store.md | nar_index.rs `compute()` (P0552) | rio-store/tests/nar_index.rs (P0552) |
 | `store.index.sync-on-miss` | components/store.md | nar_index.rs (P0552) | rio-store/tests/nar_index.rs (P0552) |
 | `store.index.putpath-bg-warm` | components/store.md | nar_index.rs `indexer_loop` (P0552) | vm-castore-e2e `cold-read` (P0560§B) |
-| `store.index.putpath-eager` | components/store.md | put_path.rs (P0557) | vm-protocol-warm (P0557) |
+| `store.index.putpath-eager` | components/store.md | put_path/ (P0557) | vm-protocol-warm (P0557) |
 | `store.index.rpc` | components/store.md | grpc/mod.rs (P0552) | rio-store/tests/nar_index.rs (P0552) |
 | `builder.fs.castore-stack` | decisions/022 §2.1 | castore_fuse/mount.rs (P0560§A) | vm-castore-e2e `cold-read` (P0560§B) |
 | `builder.fs.castore-dag-source` | decisions/022 §2.2 | castore_fuse/tree.rs (P0559) | vm-castore-e2e (P0560§B) |
@@ -790,13 +793,13 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 | `builder.fs.shared-backing-cache` | decisions/022 §2.6 | castore_fuse/open.rs (P0559+P0571) | vm-castore-e2e `cross-build-dedup` (P0560§B) |
 | `builder.fs.streaming-open` | components/builder.md | castore_fuse/open.rs (P0575) | vm-castore-e2e `cold-read` <50ms (P0560§B) |
 | `builder.fs.streaming-open-threshold` | decisions/022 §2.8 | config.rs (P0575) | vm-castore-e2e `cold-read` (P0560§B) |
-| `store.index.dir-digest` | components/store.md | rio-nix/nar.rs (P0572) | proptest (P0572) |
+| `store.index.dir-digest` | components/store.md | rio-nix/nar/ (P0572) | proptest (P0572) |
 | `store.castore.canonical-encoding` | decisions/022-design-overview §8 | rio-proto/castore.proto (P0572) | golden-bytes (P0572) |
 | `store.castore.directory-rpc` | decisions/022-design-overview §8 | rio-store/grpc/directory.rs (P0573) | unit (P0573) |
 | `store.castore.blob-read` | decisions/022-design-overview §8 | rio-store/grpc/directory.rs (P0577) | unit (P0577) |
 | `store.castore.gc` | components/store.md | rio-store/nar_index.rs + gc/sweep.rs (P0572) | rio-store/tests/gc.rs (P0572) |
 | `store.castore.tenant-scope` | components/store.md | rio-store/grpc/directory.rs (P0573+P0577) | unit cross-tenant-probe (P0573) |
-| `store.index.nar-ls-streaming` | components/store.md | rio-nix/nar.rs (P0546) | unit panic-on-seek (P0546) |
+| `store.index.nar-ls-streaming` | components/store.md | rio-nix/nar/ (P0546) | unit panic-on-seek (P0546) |
 | `gw.substitute.dag-delta-sync` | components/gateway.md | rio-gateway/substitute/dag_sync.rs (P0574) | vm-dag-delta-sync (P0574) |
 | `builder.result.input-eio-is-infra` | components/builder.md | executor/mod.rs (P0560§A, ported) | vm-castore-e2e `eio-on-fetch-fail` (P0560§B) |
 | `builder.mountd.fuse-handoff` | decisions/022-design-overview §11 | bin/rio-mountd.rs (P0567) | vm-castore-e2e `cold-read` (P0560§B) |
@@ -818,7 +821,7 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 | `store.compat.runtime-toggle` | components/store.md | config.rs (P0579) | unit + vm-store-compat `compat-off-no-narinfo` (P0566+P0580) |
 | `store.compat.nar-on-put` | components/store.md | compat/writer.rs (P0566) | unit (P0566) |
 | `store.compat.narinfo-on-put` | components/store.md | compat/writer.rs (P0566) | unit (P0566) |
-| `store.compat.write-after-commit` | components/store.md | grpc/put_path.rs (P0566) | unit (P0566) |
+| `store.compat.write-after-commit` | components/store.md | grpc/put_path/ (P0566) | unit (P0566) |
 | `store.compat.stock-nix-substitute` | components/store.md | (verify-only) | vm-store-compat `stock-nix-substitute` (P0580) |
 | `store.compat.gc-coupled` | components/store.md | gc/sweep.rs (P0581) | rio-store/tests/gc.rs (P0581) |
 | `obs.metric.compat` | observability.md | rio-store/lib.rs (P0566) | vm-store-compat (P0580) |
@@ -841,7 +844,7 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 | `builder.upload.chunked-manifest` | decisions/022 §6.1 | rio-builder/upload.rs (P0586) | vm-put-path-chunked (P0586) |
 
 (`composefs-stack`/`userxattr-mount`/`stub-isize`/`metacopy-xattr-shape`/`composefs-encode`/`erofs-handoff` retired; `castore-{stack,dag-source,inode-digest,cache-config}`/`fuse-handoff` added.) P0560 DELETES legacy `r[builder.fuse.*]`; P0562 audits via `tracey query uncovered | grep -E 'castore|tiered|index|digest-fuse|compat'` → empty.
-`config.styx` `test_include`: P0544 verifies `rio-nix/src/nar.rs` and `rio-builder/src/castore_fuse/` are in scope (or adds them).
+`config.styx` `test_include`: P0544 verifies `rio-nix/src/nar/` and `rio-builder/src/castore_fuse/` are in scope (or adds them).
 
 ---
 
@@ -862,7 +865,7 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 |---|---|---|
 | `rio-store/src/backend.rs` → `backend/{mod.rs,tiered.rs}` | P0548 (`git mv backend.rs backend/mod.rs` + add `tiered.rs`), P0549 | P0548 → P0549 (dep edge) |
 | `rio-store/src/grpc/mod.rs` | P0552, P0557 | P0552 → P0557 (dep edge) |
-| `rio-store/src/grpc/put_path/` | P0566, P0557, P0583, P0584 | P0583 (size-branch removal) first; P0584 (token-role gate, top of handler) independent of P0566/P0557 (append after `complete_manifest`) — P0557 rebases on P0566 |
+| `rio-store/src/grpc/put_path/` | P0566, P0557, P0583, P0584 | P0583 (size-branch removal) first; P0584 (token-role gate, top of handler) independent of P0566/P0557 (append after `complete_manifest`) — P0557 rebases on P0566; P0566 deps include P0583 (jsonl encodes this) |
 | `rio-store/src/grpc/get_path.rs` | P0583 only | — |
 | `rio-store/src/metadata/{inline.rs,chunked.rs,mod.rs}` | P0583 only | — |
 | `rio-store/src/nar_index.rs` | P0552 (create), P0572 (directories insert), P0557 (eager) | P0552 → P0572 → P0557 |
@@ -884,7 +887,10 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 | `rio-proto/proto/store.proto` | P0568, P0570, P0573, P0577, P0586 | append-only RPC additions; no ordering constraint |
 | `rio-builder/src/upload.rs` | P0586 only (rewrite) | — |
 | `rio-store/src/grpc/chunk.rs` | P0568, P0586 | P0568 → P0586 (HasChunks appended) |
-| `rio-nix/src/nar.rs` | P0546, P0572 | P0546 → P0572 (second pass in same fn) |
+| `rio-nix/src/nar/` | P0546, P0572 | P0546 → P0572 (second pass in same fn) |
+| `rio-auth/src/hmac.rs` | P0589 only | — |
+| `rio-scheduler/src/actor/dispatch.rs` | P0588, P0589 | P0588 → P0589 |
+| `docs/src/security.md` | P0544, P0589 | P0544 → P0589 (`r[common.hmac.claims]` text) |
 | `rio-store/src/grpc/directory.rs` | P0573 (create), P0570 (StatBlob), P0577 (ReadBlob) | P0573 → P0570/P0577 |
 | `rio-gateway/src/substitute/` | P0574 only | — |
 | `infra/helm/rio-build/templates/mountd-ds.yaml` | P0567 (create), P0564 (wire values) | P0567 → P0564 |
