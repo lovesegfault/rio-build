@@ -1633,14 +1633,40 @@ async fn spawn_intent_from_sla_estimator() {
 /// controller marks the cell ICE; the read-time mask drops it from
 /// `node_affinity` WITHOUT re-solving (memo unchanged); a successful
 /// spawn ack clears the cell and the next dispatch sees it again.
+///
+/// R5B2: `_hw_ladder_exhausted_total` is gated on the ICE-edge
+/// (`MemoEntry.ice_exhausted` rising), NOT on `was_miss`. ICE state is
+/// read-time — explicitly NOT in `inputs_gen` — so `was_miss` is the
+/// wrong granularity. Masking happens AFTER poll 1 here so `was_miss`
+/// (true on poll 1) and all-masked (poll 4) are decoupled; the metric
+/// must fire exactly once, on poll 4, and NOT on poll 5 (still
+/// exhausted, no edge).
 // r[verify sched.sla.hw-class.ice-mask]
 #[tokio::test]
 async fn ice_mask_is_read_time() {
     use crate::sla::config::CapacityType;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    const LADDER: &str = "rio_scheduler_sla_hw_ladder_exhausted_total";
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     actor.test_inject_ready("d", Some("test-pkg"), "x86_64-linux", false);
 
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let _g = metrics::set_default_local_recorder(&rec);
+    let ladder = |s: &metrics_util::debugging::Snapshotter| -> u64 {
+        s.snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(ck, ..)| ck.key().name() == LADDER)
+            .map(|(.., v)| match v {
+                DebugValue::Counter(c) => c,
+                _ => 0,
+            })
+            .sum()
+    };
+
+    // ── poll 1: was_miss=true, ICE clear → no ladder emit ──────────────
     // Precondition: solve_full fires, affinity over A' populated.
     let (hw, cost, g0) = actor.solve_inputs();
     let intent = actor.solve_intent_for(actor.dag.node("d").unwrap(), &hw, &cost, g0);
@@ -1649,14 +1675,19 @@ async fn ice_mask_is_read_time() {
         "precondition: solve_full path active"
     );
     let n0 = intent.node_affinity.len();
+    assert_eq!(
+        ladder(&snap),
+        0,
+        "poll 1: was_miss=true but ICE clear → ladder MUST NOT fire \
+         (was_miss is the wrong gate)"
+    );
 
     // Mask one cell from A' via the controller's unfulfillable report.
     let masked: crate::sla::config::Cell = ("intel-6".into(), CapacityType::Spot);
     actor.handle_ack_spawned_intents(&[], &["intel-6:spot".into()], &[]);
     assert!(actor.ice.is_masked(&masked));
 
-    // Read-time mask: the next dispatch returns A \ {masked} WITHOUT
-    // touching the memo (deterministic — same inputs_gen).
+    // ── poll 2: read-time mask, A\{masked}, not exhausted ──────────────
     let intent2 = actor.solve_intent_for(actor.dag.node("d").unwrap(), &hw, &cost, g0);
     assert_eq!(actor.solve_inputs().2, g0, "ICE state is NOT in inputs_gen");
     let intel6_spot = |t: &rio_proto::types::NodeSelectorTerm| {
@@ -1674,9 +1705,9 @@ async fn ice_mask_is_read_time() {
         );
         assert_eq!(intent2.node_affinity.len(), n0 - 1);
     }
+    assert_eq!(ladder(&snap), 0, "poll 2: partial mask → no ladder");
 
-    // Clear (success report): unmasking is free — the SAME memo is
-    // read, full A' returns.
+    // ── poll 3: clear → full A' returns from memo ──────────────────────
     actor.ice.clear(&masked);
     let intent3 = actor.solve_intent_for(actor.dag.node("d").unwrap(), &hw, &cost, g0);
     assert_eq!(
@@ -1684,9 +1715,12 @@ async fn ice_mask_is_read_time() {
         n0,
         "memo never overwritten — unmask restores full A'"
     );
+    assert_eq!(ladder(&snap), 0, "poll 3: clear → no ladder");
 
-    // All-of-H masked → §Capacity backoff exit (b): falls back to A
-    // (not empty affinity) and emits capacity_exhausted.
+    // ── poll 4: all-of-H masked → §Capacity backoff exit (b): falls
+    // back to A (not empty affinity) and emits ladder_exhausted on the
+    // RISING edge. `was_miss=false` here (memo hit at g0); the
+    // `was_miss && exhausted` gate would have been silent.
     for h in actor.sla_config.hw_classes.keys() {
         for cap in CapacityType::ALL {
             actor.ice.mark(&(h.clone(), cap));
@@ -1696,6 +1730,20 @@ async fn ice_mask_is_read_time() {
     assert!(
         !intent4.node_affinity.is_empty(),
         "all-masked → still emit A (best-effort reserved for envelope-infeasibility)"
+    );
+    assert_eq!(
+        ladder(&snap),
+        1,
+        "poll 4: ICE-edge `false→true` → ladder fires exactly once \
+         (bug_006: `was_miss`-gated would be 0 here since miss was poll 1)"
+    );
+
+    // ── poll 5: still all-masked → NO re-emit (no edge) ────────────────
+    let _ = actor.solve_intent_for(actor.dag.node("d").unwrap(), &hw, &cost, g0);
+    assert_eq!(
+        ladder(&snap),
+        0,
+        "poll 5: still exhausted, prev=true → no edge → no re-emit"
     );
 }
 

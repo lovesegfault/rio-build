@@ -340,10 +340,12 @@ pub fn intent_for(
     cfg: &SlaConfig,
     tiers: &[Tier],
     ceil: &Ceilings,
-    // `true` when the hw-aware path already emitted (`BestEffort.why` at
-    // the dispatch wrapper) and this call is the fallback sizing only —
-    // prevents double-counting `infeasible_total` when `solve_full`
-    // and `solve_mvp` agree the drv is BestEffort.
+    // `true` when the hw-aware path already emitted (`BestEffort.why`
+    // at the dispatch wrapper — double-count) OR the caller's
+    // once-per-`(mkh, fit_content_hash)` anchor says this fit was
+    // already counted. NOT `was_miss`-derived: drvs on the hw-agnostic
+    // path (static-mode / FOD / featured / serial) never reach the memo
+    // and would be permanently suppressed.
     suppress_infeasible_metric: bool,
 ) -> (u32, u64, u64) {
     // Feature-aware probe + headroom-scaled mem hoisted ONCE so every
@@ -1001,20 +1003,49 @@ impl SolveInputs<'_> {
     }
 }
 
-/// Per-key solve memo. Keyed on `(model_key_hash, override_hash)` —
-/// logical identity, NOT the fit content — so each `(pname, system,
-/// tenant, override)` owns exactly one slot. The stored
-/// `(inputs_gen, fit_content_hash)` are checked as staleness fields:
-/// a mismatch on EITHER means the shared inputs changed or the fit was
-/// refitted, and the stored entry's Feasible `a.cells` becomes the
-/// Schmitt `prev_a` for the recompute (which then overwrites in place).
+/// One [`SolveCache`] slot. Named struct (not a positional tuple) so
+/// the per-key debounce bits added across rounds don't become a
+/// swap-prone `(u64, u64, _, bool, Option<u64>, …)`. The debounce
+/// fields **survive a staleness miss** (carried forward from the prior
+/// entry in [`SolveCache::get_or_insert_with`]): they track per-key
+/// edges, not per-`inputs_gen` epochs, and would otherwise reset on
+/// every memo invalidation — re-introducing the per-miss over-emit the
+/// `was_miss` gate exists to prevent.
+#[derive(Debug, Clone)]
+pub struct MemoEntry {
+    pub inputs_gen: u64,
+    pub fit_content_hash: u64,
+    pub result: SolveFullResult,
+    /// R5B2: rising-edge debounce for `_hw_ladder_exhausted_total`.
+    /// "Was the LAST poll's `A \ masked` empty AND `ice.exhausted(H)`?"
+    /// — emit on the `false→true` edge. ICE state is read-time (NOT in
+    /// `inputs_gen`), so `was_miss` is the wrong gate; this is.
+    pub ice_exhausted: bool,
+    /// R5B3: once-per-`fit_content_hash` anchor for `_infeasible_total`
+    /// on the `intent_for` fallback. Static-mode / FOD / featured /
+    /// serial drvs have NO `was_miss` (they never reach the memo), and
+    /// drvs that DO reach it always have `hw_emitted=true` on the
+    /// fallback today — so this field is the with-memo half of the
+    /// anchor; the no-memo half is [`SolveCache::infeasible_static_seen`].
+    pub last_infeasible_fh: Option<u64>,
+}
+
+/// Per-key solve memo. Nested `mkh → (ovr → MemoEntry)` — logical
+/// identity, NOT the fit content — so each `(pname, system, tenant,
+/// override)` owns exactly one slot and [`Self::remove_model_key`] is
+/// O(1). The stored `(inputs_gen, fit_content_hash)` are staleness
+/// fields: a mismatch on EITHER means the shared inputs changed or the
+/// fit was refitted, and the stored entry's Feasible `a.cells` becomes
+/// the Schmitt `prev_a` for the recompute (which overwrites in place).
 ///
 /// Keying on content (`fit_content_hash`) would orphan the prior entry
 /// on every refit — unbounded growth AND `prev_a = ∅` (hysteresis
 /// lost). Cache size is bounded by `|SlaEstimator live keys| ×
 /// |distinct overrides|` — `DagActor::on_fit_evicted` calls
 /// [`SolveCache::remove_model_key`] so an eviction there drops every
-/// override-keyed entry here.
+/// override-keyed entry here AND the [`MemoEntry`] debounce bits AND
+/// the no-memo `infeasible_static_fh` row in one O(1) remove. No
+/// parallel maps to forget to register.
 ///
 /// `inputs_gen` is **derived** from [`SolveInputs::inputs_gen`] at poll
 /// time (ADR-023 L616). ICE state is NOT in `inputs_gen` — the
@@ -1022,64 +1053,130 @@ impl SolveInputs<'_> {
 /// masked cell.
 #[derive(Debug, Default)]
 pub struct SolveCache {
-    entries: DashMap<(u64, u64), (u64, u64, SolveFullResult)>,
+    entries: DashMap<u64, HashMap<u64, MemoEntry>>,
+    /// R5B3 no-memo half: `mkh → last fit_content_hash` for which
+    /// `intent_for`'s `_infeasible_total` was emitted. Drvs that
+    /// pre-gate fail (`hw_cost_source=None` / `hw_classes={}` / FOD /
+    /// featured / serial / forced-tier override) never call
+    /// [`Self::get_or_insert_with`], so [`MemoEntry::last_infeasible_fh`]
+    /// can't anchor them; THIS does. Keyed `mkh` only — overrides that
+    /// reach `intent_for`'s emit (tier-pin without `forced_cores`)
+    /// share one `fh` per fit, so per-override granularity adds nothing.
+    /// Swept by [`Self::remove_model_key`].
+    infeasible_static_fh: DashMap<u64, u64>,
 }
 
 impl SolveCache {
-    /// Read the memo for `(model_key_hash, override_hash)` if BOTH the
-    /// passed `inputs_gen` and `fit_content_hash` match the stored
-    /// values, or compute via `f(prev_a)` and overwrite. Returns
-    /// `(result, was_miss)`: `was_miss` gates ALL post-memo metric
-    /// emits so cache-hits on `BestEffort` don't re-emit
-    /// `_infeasible_total` per-poll. The full [`SolveFullResult`] is
-    /// memoized — `BestEffort` is cached too, so a key whose every
-    /// tier is infeasible doesn't re-solve every poll. `prev_a` is the
-    /// prior entry's Feasible `A'` (Schmitt history); BestEffort or
-    /// first-seen → ∅.
+    /// Read the memo for `(mkh, ovr)` if BOTH the passed `inputs_gen`
+    /// and `fit_content_hash` match the stored values, or compute via
+    /// `f(prev_a)` and overwrite. Returns `(entry-clone, was_miss)`:
+    /// `was_miss` gates the post-memo metric emits whose inputs ARE in
+    /// `inputs_gen` (`BestEffort.why`, `_hw_cost_unknown`); the
+    /// returned entry's debounce fields gate the ones whose inputs are
+    /// NOT (`ice_exhausted`, `last_infeasible_fh`). The full
+    /// [`SolveFullResult`] is memoized — `BestEffort` is cached too, so
+    /// a key whose every tier is infeasible doesn't re-solve every
+    /// poll. `prev_a` is the prior entry's Feasible `A'` (Schmitt
+    /// history); BestEffort or first-seen → ∅. On miss, the prior
+    /// entry's debounce fields are **carried forward** (per-key, not
+    /// per-epoch).
     pub fn get_or_insert_with(
         &self,
-        model_key_hash: u64,
-        override_hash: u64,
+        mkh: u64,
+        ovr: u64,
         inputs_gen: u64,
         fit_content_hash: u64,
         f: impl FnOnce(&HashSet<Cell>) -> SolveFullResult,
-    ) -> (SolveFullResult, bool) {
-        let key = (model_key_hash, override_hash);
+    ) -> (MemoEntry, bool) {
         // Copy out under guard (DashMap shard non-reentrant), then
         // decide: hit iff BOTH stored gen AND fit_content_hash match;
         // either drift → stored A' is prev_a for the recompute.
-        let prior = self.entries.get(&key).map(|e| e.clone());
-        if let Some((stored_g, stored_fh, r)) = &prior
-            && *stored_g == inputs_gen
-            && *stored_fh == fit_content_hash
+        let prior = self
+            .entries
+            .get(&mkh)
+            .and_then(|inner| inner.get(&ovr).cloned());
+        if let Some(e) = &prior
+            && e.inputs_gen == inputs_gen
+            && e.fit_content_hash == fit_content_hash
         {
-            return (r.clone(), false);
+            return (e.clone(), false);
         }
         let prev_a: HashSet<Cell> = match &prior {
-            Some((_, _, SolveFullResult::Feasible(m))) => m.a.cells.iter().cloned().collect(),
+            Some(MemoEntry {
+                result: SolveFullResult::Feasible(m),
+                ..
+            }) => m.a.cells.iter().cloned().collect(),
             _ => HashSet::new(),
         };
-        let r = f(&prev_a);
+        let entry = MemoEntry {
+            inputs_gen,
+            fit_content_hash,
+            result: f(&prev_a),
+            // Per-key debounce survives invalidation: an `inputs_gen`
+            // bump or refit is NOT an ICE-edge nor a fresh-infeasible
+            // event by itself.
+            ice_exhausted: prior.as_ref().is_some_and(|p| p.ice_exhausted),
+            last_infeasible_fh: prior.as_ref().and_then(|p| p.last_infeasible_fh),
+        };
         self.entries
-            .insert(key, (inputs_gen, fit_content_hash, r.clone()));
-        (r, true)
+            .entry(mkh)
+            .or_default()
+            .insert(ovr, entry.clone());
+        (entry, true)
     }
 
+    /// Mutate the `(mkh, ovr)` entry's debounce fields in place.
+    /// Idempotent write on the emit path — same class as the memo fill,
+    /// not a behavioural side-effect; `contract_selector_stability`
+    /// permits these alongside the once-per-miss emits.
+    pub fn update_entry(&self, mkh: u64, ovr: u64, f: impl FnOnce(&mut MemoEntry)) {
+        if let Some(mut inner) = self.entries.get_mut(&mkh)
+            && let Some(e) = inner.get_mut(&ovr)
+        {
+            f(e);
+        }
+    }
+
+    /// R5B3 no-memo anchor: returns `true` (suppress) if `mkh`'s
+    /// last-recorded `fit_content_hash` equals `fh`; otherwise records
+    /// `fh` and returns `false` (emit). Safe to record on a
+    /// non-emitting call: `intent_for` is deterministic in `fh`, so if
+    /// it didn't emit at `fh` once it never will.
+    pub fn infeasible_static_seen(&self, mkh: u64, fh: u64) -> bool {
+        use dashmap::Entry;
+        match self.infeasible_static_fh.entry(mkh) {
+            Entry::Occupied(e) if *e.get() == fh => true,
+            Entry::Occupied(mut e) => {
+                *e.get_mut() = fh;
+                false
+            }
+            Entry::Vacant(e) => {
+                e.insert(fh);
+                false
+            }
+        }
+    }
+
+    /// Σ inner-map lengths. Test/status only.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.iter().map(|e| e.len()).sum()
     }
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    /// Drop every entry keyed on `mkh` (across all override hashes).
-    /// Wired as the `SlaEstimator` LRU's `on_evict` hook so this map's
-    /// cardinality is bounded by the LRU's live set — without this an
-    /// evicted fit's entry is orphaned forever (`solve_intent_for`
-    /// short-circuits on `fit.as_ref()?` before reaching
-    /// [`Self::get_or_insert_with`], so nothing ever overwrites it).
+    /// Drop every entry keyed on `mkh` (across all override hashes) and
+    /// the no-memo `infeasible_static_fh` row. Wired as the
+    /// `SlaEstimator` LRU's `on_evict` hook so this map's cardinality
+    /// is bounded by the LRU's live set — without this an evicted fit's
+    /// entry is orphaned forever (`solve_intent_for` short-circuits on
+    /// `fit.as_ref()?` before reaching [`Self::get_or_insert_with`], so
+    /// nothing ever overwrites it). O(1): nested keying makes this a
+    /// single shard remove (was O(n) `retain` with the flat composite
+    /// key).
     pub fn remove_model_key(&self, mkh: u64) {
-        self.entries.retain(|(mk, _), _| *mk != mkh);
+        self.entries.remove(&mkh);
+        self.infeasible_static_fh.remove(&mkh);
     }
 }
 
@@ -2229,21 +2326,35 @@ mod tests {
         let g0 = 100;
         let (r1, miss1) = cache.get_or_insert_with(mk, 0, g0, fh, go);
         assert!(miss1);
+        assert!(!r1.ice_exhausted, "fresh entry: ice_exhausted=false");
+        assert_eq!(r1.last_infeasible_fh, None, "fresh entry: anchor unset");
         let (r1b, miss1b) = cache.get_or_insert_with(mk, 0, g0, fh, go);
         assert!(!miss1b, "second call hits memo");
         assert_eq!(calls.get(), 1);
-        assert_eq!(cells(&r1), cells(&r1b));
-        // Different override_hash → miss (separate slot).
+        assert_eq!(cells(&r1.result), cells(&r1b.result));
+        // Different override_hash → miss (separate slot, same outer mkh).
         let (_, miss2) = cache.get_or_insert_with(mk, 7, g0, fh, go);
         assert!(miss2);
         assert_eq!(calls.get(), 2);
-        assert_eq!(cache.len(), 2);
-        // Different inputs_gen → miss; prev_a from old entry.
-        let (_, miss3) = cache.get_or_insert_with(mk, 0, g0 + 1, fh, |p| {
-            assert_eq!(p.len(), cells(&r1).len(), "prev_a comes from old-gen entry");
+        assert_eq!(cache.len(), 2, "len() sums inner maps: 1 mkh × 2 ovr");
+        // R5B2: debounce bit written via update_entry survives a
+        // staleness miss (per-key, not per-epoch).
+        cache.update_entry(mk, 0, |e| e.ice_exhausted = true);
+        // Different inputs_gen → miss; prev_a from old entry; debounce
+        // carried forward.
+        let (e3, miss3) = cache.get_or_insert_with(mk, 0, g0 + 1, fh, |p| {
+            assert_eq!(
+                p.len(),
+                cells(&r1.result).len(),
+                "prev_a comes from old-gen entry"
+            );
             go(p)
         });
         assert!(miss3);
+        assert!(
+            e3.ice_exhausted,
+            "ice_exhausted carried across inputs_gen miss — per-key, not per-epoch"
+        );
         assert_eq!(calls.get(), 3);
         // Regression (merged_bug_026): refit changes fit_content_hash
         // but model_key is unchanged → miss (recompute) BUT same slot
@@ -2257,7 +2368,7 @@ mod tests {
         cache.get_or_insert_with(mk, 0, g0 + 1, fh2, |p| {
             assert_eq!(
                 p.len(),
-                cells(&r1).len(),
+                cells(&r1.result).len(),
                 "prev_a from prior fit_content_hash entry — hysteresis survives refit"
             );
             go(p)
@@ -2272,6 +2383,11 @@ mod tests {
         let (_, miss5) = cache.get_or_insert_with(mk, 0, g0 + 1, fh2, go);
         assert!(!miss5);
         assert_eq!(calls.get(), 4);
+        // bug_004: remove_model_key drops every override for `mk` in
+        // O(1) (nested keying); separate mkh untouched.
+        let (_, _) = cache.get_or_insert_with(99, 0, g0, fh, go);
+        cache.remove_model_key(mk);
+        assert_eq!(cache.len(), 1, "both (mk,0) and (mk,7) gone; (99,0) stays");
         // Regression (merged_bug_001): BestEffort is memoized too. A
         // closure returning BestEffort is inserted; the next call hits.
         let be = |_: &HashSet<Cell>| SolveFullResult::BestEffort {
@@ -2281,16 +2397,23 @@ mod tests {
             cells: vec![],
             why: InfeasibleReason::DiskCeiling,
         };
+        cache.remove_model_key(99);
         let (_, m) = cache.get_or_insert_with(99, 0, g0, fh, be);
         assert!(m, "first BestEffort is a miss");
         let (r, m) = cache.get_or_insert_with(99, 0, g0, fh, |_| panic!("hit"));
         assert!(!m, "second BestEffort hits memo — not re-solved per poll");
-        assert!(matches!(r, SolveFullResult::BestEffort { .. }));
+        assert!(matches!(r.result, SolveFullResult::BestEffort { .. }));
         // prev_a for a key whose last solve was BestEffort is ∅.
         cache.get_or_insert_with(99, 0, g0 + 1, fh, |p| {
             assert!(p.is_empty(), "BestEffort prior → prev_a = ∅");
             be(p)
         });
+        // R5B3: infeasible_static_seen swept by remove_model_key.
+        assert!(!cache.infeasible_static_seen(mk, fh), "first: emit");
+        assert!(cache.infeasible_static_seen(mk, fh), "same fh: suppress");
+        assert!(!cache.infeasible_static_seen(mk, fh2), "refit: re-arm");
+        cache.remove_model_key(mk);
+        assert!(!cache.infeasible_static_seen(mk, fh2), "swept");
     }
 
     /// bug_012: `hw_factor_for` reads `fit.hw_bias[h]`; `fit_content_hash`

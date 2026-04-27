@@ -654,12 +654,10 @@ impl DagActor {
     /// memo's `|live keys| × |overrides|` bound holds AND an operator
     /// `rio-cli sla reset` doesn't leave a Schmitt `prev_a` alive.
     ///
-    /// **Known-weak:** convention, not type-checked. A future third
-    /// paired map can still forget to register itself here. Reduces N
-    /// "remember to propagate" sites to 1, which is strictly better; a
-    /// stronger close (e.g. a `PairedWith<SlaEstimator>` marker trait
-    /// whose impls this iterates) is deferred until a third paired map
-    /// actually appears.
+    /// One body, two callers; the [`crate::sla::solve::SolveCache`]
+    /// nested keying makes this a single O(1) remove that auto-sweeps
+    /// the per-override `MemoEntry` debounce bits AND the no-memo
+    /// `infeasible_static_fh` row — no parallel maps to register here.
     pub(crate) fn on_fit_evicted(&self, k: &crate::sla::types::ModelKey) {
         self.solve_cache
             .remove_model_key(crate::sla::solve::model_key_hash(k));
@@ -748,15 +746,22 @@ impl DagActor {
         let mut h_all: Vec<_> = self.sla_config.hw_classes.keys().cloned().collect();
         h_all.sort_unstable();
         // `was_miss`: first time this `(model_key, inputs_gen)` was
-        // solved. Gates ALL post-memo metric emits — `BestEffort.why`,
-        // `ladder_exhausted`, `intent_for`'s infeasible — so cache-hits
-        // don't re-emit per poll. `false` for drvs that never enter the
-        // hw-aware path (FOD/featured/serial), which suppresses their
-        // unmemoized per-poll `intent_for` infeasible emit. `hw_emitted`
-        // tracks "hw-aware arm already emitted" for the double-count
-        // suppress.
+        // solved. Gates the post-memo metric emits whose inputs ARE in
+        // `inputs_gen` — `BestEffort.why`, ε_h's `_hw_cost_unknown` — so
+        // cache-hits don't re-emit per poll. NOT a valid gate for emits
+        // depending on read-time state (`ice.masked_cells()`) or for
+        // drvs that never enter the hw-aware path (FOD/featured/serial/
+        // static-mode); those use `memo_entry`'s debounce fields /
+        // `infeasible_static_fh` instead. `hw_emitted` tracks "hw-aware
+        // arm already emitted" for the double-count suppress.
         let mut was_miss = false;
         let mut hw_emitted = false;
+        // `(mkh, ovr, entry-clone)` when the memo was reached. `Some`
+        // iff `full`'s closure ran past `get_or_insert_with` — i.e. the
+        // hw-aware gate held AND the fit passed the n_eff/span/!Probe
+        // gate. Read for the debounce-prev values; written back via
+        // `update_entry` on edge.
+        let mut memo_entry: Option<(u64, u64, solve::MemoEntry)> = None;
         let full = (self.sla_config.hw_cost_source.is_some()
             && !h_all.is_empty()
             && !hw.is_empty()
@@ -780,10 +785,14 @@ impl DagActor {
             // Memo: keyed on (model_key_hash, override_hash); hit iff
             // (inputs_gen, fit_content_hash) both match. The ε_h draw
             // and ICE mask are applied AFTER reading the memo — never
-            // overwriting it. `was_miss` gates every post-memo emit.
-            let (result, miss) = self.solve_cache.get_or_insert_with(
-                solve::model_key_hash(&f.key),
-                solve::override_hash(override_.as_ref()),
+            // overwriting `result`. `was_miss` gates the
+            // memo-input-dependent emits; `entry`'s debounce fields
+            // gate the read-time-state ones.
+            let mkh = solve::model_key_hash(&f.key);
+            let ovr = solve::override_hash(override_.as_ref());
+            let (entry, miss) = self.solve_cache.get_or_insert_with(
+                mkh,
+                ovr,
                 inputs_gen,
                 solve::fit_content_hash(f),
                 |prev_a| {
@@ -801,6 +810,8 @@ impl DagActor {
                 },
             );
             was_miss = miss;
+            let result = entry.result.clone();
+            memo_entry = Some((mkh, ovr, entry));
             let memo = match result {
                 solve::SolveFullResult::Feasible(m) => Some(m),
                 solve::SolveFullResult::BestEffort { why, .. } => {
@@ -896,16 +907,38 @@ impl DagActor {
                     .filter(|c| !masked.contains(c))
                     .cloned()
                     .collect();
+                // R5B2: ICE-edge debounce. `was_miss` is the wrong
+                // gate — `ice.masked_cells()` is read-time state,
+                // explicitly NOT in `inputs_gen` (see
+                // `SolveInputs::inputs_gen` doc). ICE marks accumulate
+                // on controller-tick cadence (~5s); under
+                // `hwCostSource: static`, `inputs_gen` may never change
+                // → metric silent. Track the conjunction `A\masked = ∅
+                // ∧ ice.exhausted(H)` per memo-key and emit on its
+                // rising edge. The conjunction (not `cells.is_empty()`
+                // alone): A-unmask ≠ exhaustion-clear; the original
+                // `if was_miss && exhausted` gated the conjunction, the
+                // debounce must track the same predicate. `memo_entry`
+                // is always Some here (this arm is only reachable past
+                // `get_or_insert_with`).
+                let (mkh, ovr, prev) = memo_entry
+                    .as_ref()
+                    .expect("full=Some ⇒ get_or_insert_with ran");
+                let now_exh = cells.is_empty() && self.ice.exhausted(&h_all);
+                if now_exh && !prev.ice_exhausted {
+                    ::metrics::counter!(
+                        "rio_scheduler_sla_hw_ladder_exhausted_total",
+                        "tenant" => tenant.clone(),
+                        "exit" => "all_masked",
+                    )
+                    .increment(1);
+                    solve::InfeasibleReason::CapacityExhausted.emit(&tenant);
+                }
+                if now_exh != prev.ice_exhausted {
+                    self.solve_cache
+                        .update_entry(*mkh, *ovr, |e| e.ice_exhausted = now_exh);
+                }
                 let cells = if cells.is_empty() {
-                    if was_miss && self.ice.exhausted(&h_all) {
-                        ::metrics::counter!(
-                            "rio_scheduler_sla_hw_ladder_exhausted_total",
-                            "tenant" => tenant.clone(),
-                            "exit" => "all_masked",
-                        )
-                        .increment(1);
-                        solve::InfeasibleReason::CapacityExhausted.emit(&tenant);
-                    }
                     memo.a.cells
                 } else {
                     cells
@@ -929,6 +962,39 @@ impl DagActor {
                 )
             }
             None => {
+                // R5B3: `intent_for` fallback's `_infeasible_total`
+                // anchor. `was_miss` was the wrong gate: drvs that
+                // never reach the memo (`hw_cost_source=None` /
+                // `hw_classes={}` / FOD / featured / serial / forced-
+                // tier) have `was_miss=false` initial → suppressed
+                // forever; under helm-default `hwCostSource: ""` that's
+                // EVERY drv → metric flat zero. New anchor is once-per-
+                // `(mkh, fit_content_hash)`: refit re-arms; stable
+                // across polls. With-memo path (currently always
+                // `hw_emitted=true` here, so the `last_infeasible_fh`
+                // check is shadowed but architecturally placed) uses
+                // the entry; no-memo path uses `infeasible_static_fh`.
+                // No fit → `intent_for` early-returns before its emit,
+                // so `suppress` is irrelevant; pass `true`.
+                let suppress = hw_emitted
+                    || match &memo_entry {
+                        Some((mkh, ovr, e)) => {
+                            let fh = e.fit_content_hash;
+                            let seen = e.last_infeasible_fh == Some(fh);
+                            if !seen {
+                                self.solve_cache.update_entry(*mkh, *ovr, |e| {
+                                    e.last_infeasible_fh = Some(fh);
+                                });
+                            }
+                            seen
+                        }
+                        None => fit.as_ref().is_none_or(|f| {
+                            self.solve_cache.infeasible_static_seen(
+                                solve::model_key_hash(&f.key),
+                                solve::fit_content_hash(f),
+                            )
+                        }),
+                    };
                 let (c, m, d) = solve::intent_for(
                     fit.as_ref(),
                     &hints,
@@ -936,12 +1002,7 @@ impl DagActor {
                     &self.sla_config,
                     &self.sla_tiers,
                     &self.sla_ceilings,
-                    // Suppress when hw-aware already emitted OR this is
-                    // a memo hit (per-poll re-emit) OR the hw-aware
-                    // path was never entered (`was_miss=false` initial)
-                    // — those drvs (FOD/featured/serial) have no memo,
-                    // so once-per-gen has no anchor; per-poll noise.
-                    hw_emitted || !was_miss,
+                    suppress,
                 );
                 (c, m, d, Vec::new(), Vec::new(), None)
             }

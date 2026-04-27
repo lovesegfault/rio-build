@@ -462,10 +462,10 @@ async fn contract_metrics_once_per_miss() {
     // ── (b) ladder exhausted via all-ICE-masked ───────────────────────
     // Feasible solve, but every (h, cap) cell ICE-masked → A\masked = ∅
     // → `ladder_exhausted_total{exit=all_masked}` +
-    // `infeasible_total{reason=capacity_exhausted}`. Both gated on
-    // `was_miss`; the ICE mask is read-time (NOT in `inputs_gen`), so
-    // poll 2+ are memo hits → `was_miss=false` → no re-emit. The
-    // `test-pkg` fit from `bare_actor_hw` is feasible.
+    // `infeasible_total{reason=capacity_exhausted}`. Both gated on the
+    // `MemoEntry.ice_exhausted` rising edge (R5B2); poll 1 is the
+    // false→true edge → emit; polls 2+ stay true → no edge → silent.
+    // The `test-pkg` fit from `bare_actor_hw` is feasible.
     for h in ["intel-6", "intel-7", "intel-8"] {
         for cap in CapacityType::ALL {
             actor.ice.mark(&(h.into(), cap));
@@ -486,21 +486,24 @@ async fn contract_metrics_once_per_miss() {
     assert_eq!(
         d.get(LADDER).copied().unwrap_or(0),
         1,
-        "`_hw_ladder_exhausted_total` must fire once per miss, not once \
-         per poll — was OUTSIDE the memo closure pre-r3 (snapshot.rs \
-         emit-site 1 in the validator's BLOCKED finding)"
+        "`_hw_ladder_exhausted_total` must fire once on the ICE-edge \
+         (false→true), not once per poll"
     );
     assert_eq!(
         d.get(INFEASIBLE).copied().unwrap_or(0),
         1,
         "`CapacityExhausted.emit()` paired with ladder_exhausted must \
-         also fire once per miss"
+         also fire once on the ICE-edge"
     );
 
-    // ── (c) inputs_gen change → fresh miss → +1 each ──────────────────
+    // ── (c) inputs_gen change → fresh miss → `was_miss`-gated emits +1 ─
     // `apply_stale_clamp` flips a CostTable solve-relevant field →
     // derived `inputs_gen` changes → next poll is a miss for both
-    // model_keys.
+    // model_keys. `BestEffort.why` is `was_miss`-gated → re-emits.
+    // R5B2: `ladder_exhausted` is now ICE-edge-gated, NOT `was_miss`-
+    // gated — `MemoEntry.ice_exhausted` is per-key (carried across the
+    // staleness miss), and the ICE state hasn't changed → no edge → no
+    // re-emit. `CapacityExhausted` is paired with it, so also silent.
     let g_before = actor.solve_inputs().2;
     actor
         .cost_table
@@ -512,15 +515,18 @@ async fn contract_metrics_once_per_miss() {
     let d = counter_map(&snap);
     assert_eq!(
         d.get(LADDER).copied().unwrap_or(0),
-        1,
-        "fresh inputs_gen → fresh miss → ladder +1"
+        0,
+        "ICE-edge-gated: inputs_gen change is NOT an ICE edge → ladder \
+         does NOT re-emit (R5B2: was_miss is the wrong gate for \
+         read-time state)"
     );
-    // Both `disk-hog` (BestEffort) and `test-pkg` (CapacityExhausted)
-    // re-emit at the new gen.
+    // `disk-hog` (BestEffort.why, was_miss-gated) re-emits; `test-pkg`
+    // (CapacityExhausted, ICE-edge-gated) does NOT.
     assert_eq!(
         d.get(INFEASIBLE).copied().unwrap_or(0),
-        2,
-        "fresh inputs_gen → fresh miss → infeasible +1 per model_key"
+        1,
+        "fresh inputs_gen → BestEffort.why re-emits (was_miss-gated); \
+         CapacityExhausted does NOT (ICE-edge-gated)"
     );
 
     // ── (d) re-poll at the new gen → no further emits ─────────────────
@@ -537,5 +543,110 @@ async fn contract_metrics_once_per_miss() {
         d.get(INFEASIBLE).copied().unwrap_or(0),
         0,
         "memo hit at new gen"
+    );
+}
+
+/// **R5B3 / merged_bug_008** — `intent_for`'s `_infeasible_total` emit
+/// was unreachable under `hwCostSource: ""` (the helm default): the
+/// hw-aware gate is `false`, so `was_miss` stays `false` initial →
+/// `suppress = !was_miss = true` → metric flat zero. The fix gives the
+/// hw-agnostic path its OWN once-per-`(mkh, fit_content_hash)` anchor
+/// (`SolveCache::infeasible_static_fh`): emit once, suppress repeat
+/// polls, re-arm on refit, sweep on `on_fit_evicted`.
+#[tokio::test]
+async fn contract_metrics_once_per_miss_static_mode() {
+    const POLLS: usize = 8;
+    const INFEASIBLE: &str = "rio_scheduler_sla_infeasible_total";
+
+    let db = TestDb::new(&MIGRATOR).await;
+    // `test_sla_config()`: hw_cost_source=None, hw_classes={} — the
+    // hw-aware gate at solve_intent_for is structurally false. Tier
+    // p90=1200.
+    let mut actor = bare_actor_cfg(
+        db.pool.clone(),
+        DagActorConfig {
+            sla: test_sla_config(),
+            ..Default::default()
+        },
+    );
+    actor.sla_tiers = actor.sla_config.solve_tiers();
+    actor.sla_ceilings = actor.sla_config.ceilings();
+    assert!(
+        actor.sla_config.hw_cost_source.is_none() && actor.sla_config.hw_classes.is_empty(),
+        "precondition: hw-agnostic mode (helm default)"
+    );
+
+    // S=2000 > p90 bound=1200: T(c)≥S ∀c → solve_mvp BestEffort →
+    // classify_ceiling=SerialFloor. n_eff/span force the solve branch
+    // (not explore).
+    let mut fit = make_fit("synth-serial");
+    fit.fit = crate::sla::types::DurationFit::Amdahl {
+        s: crate::sla::types::RefSeconds(2000.0),
+        p: crate::sla::types::RefSeconds(0.0),
+    };
+    actor.sla_estimator.seed(fit);
+    actor.test_inject_ready("d-ser", Some("synth-serial"), "x86_64-linux", false);
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let _g = metrics::set_default_local_recorder(&rec);
+
+    // ── 8× poll at fixed fit → exactly 1 emit ─────────────────────────
+    for _ in 0..POLLS {
+        let _ = actor.compute_spawn_intents(&Default::default());
+    }
+    let d = counter_map(&snap);
+    assert_eq!(
+        d.get(INFEASIBLE).copied().unwrap_or(0),
+        1,
+        "`_infeasible_total{{serial_floor}}` must fire exactly once \
+         across {POLLS}× poll under hw_cost_source=None — was 0 \
+         (suppressed forever via `!was_miss`) before R5B3; would be \
+         {POLLS} (per-poll noise) without the `infeasible_static_fh` \
+         anchor"
+    );
+
+    // ── refit (fit_content_hash changes) → re-arm → +1 ────────────────
+    let mut refit = make_fit("synth-serial");
+    refit.fit = crate::sla::types::DurationFit::Amdahl {
+        s: crate::sla::types::RefSeconds(2500.0),
+        p: crate::sla::types::RefSeconds(0.0),
+    };
+    actor.sla_estimator.seed(refit);
+    for _ in 0..POLLS {
+        let _ = actor.compute_spawn_intents(&Default::default());
+    }
+    let d = counter_map(&snap);
+    assert_eq!(
+        d.get(INFEASIBLE).copied().unwrap_or(0),
+        1,
+        "refit changes fit_content_hash → anchor re-arms → exactly 1 \
+         more emit across {POLLS}× poll"
+    );
+
+    // ── on_fit_evicted sweeps the anchor → re-arm ─────────────────────
+    actor.on_fit_evicted(&crate::sla::types::ModelKey {
+        pname: "synth-serial".into(),
+        system: "x86_64-linux".into(),
+        tenant: String::new(),
+    });
+    // Re-seed the SAME fit (same fh as last poll): anchor gone → emits
+    // once again. Without the `remove_model_key` sweep of
+    // `infeasible_static_fh`, this would be 0 (orphaned suppress).
+    let mut refit = make_fit("synth-serial");
+    refit.fit = crate::sla::types::DurationFit::Amdahl {
+        s: crate::sla::types::RefSeconds(2500.0),
+        p: crate::sla::types::RefSeconds(0.0),
+    };
+    actor.sla_estimator.seed(refit);
+    for _ in 0..POLLS {
+        let _ = actor.compute_spawn_intents(&Default::default());
+    }
+    let d = counter_map(&snap);
+    assert_eq!(
+        d.get(INFEASIBLE).copied().unwrap_or(0),
+        1,
+        "on_fit_evicted sweeps infeasible_static_fh → same-fh re-seed \
+         emits once (not orphan-suppressed)"
     );
 }
