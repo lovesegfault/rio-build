@@ -50,7 +50,7 @@ pub fn next(fit: Option<&FittedParams>, cfg: &SlaConfig, hints: &DrvHints) -> Ex
     // `MemFit::Coupled.at()` is the regression line (~p50), not a
     // quantile. `.max(probe shape)` guards the Independent{p90:0}
     // sentinel (no prior sample).
-    let h = headroom(f.n_eff);
+    let h = headroom(f.n_eff_ring);
     let mem_for = move |c: f64| {
         MemBytes(
             mem_for(c)
@@ -143,7 +143,9 @@ mod tests {
     use super::*;
     use crate::sla::config::ProbeShape;
     use crate::sla::solve::Tier;
-    use crate::sla::types::{DurationFit, ExploreState, MemFit, ModelKey, WallSeconds};
+    use crate::sla::types::{
+        DurationFit, ExploreState, FitDf, MemFit, ModelKey, RingNEff, WallSeconds,
+    };
 
     fn cfg() -> SlaConfig {
         SlaConfig {
@@ -180,7 +182,8 @@ mod tests {
             disk_p90: None,
             sigma_resid: 0.2,
             log_residuals: Vec::new(),
-            n_eff: 1.0,
+            n_eff_ring: RingNEff(1.0),
+            fit_df: FitDf(1.0),
             n_distinct_c: 1,
             sum_w: 1.0,
             span: 1.0,
@@ -347,7 +350,7 @@ mod tests {
         };
         let d = next(Some(&f), &cfg(), &DrvHints::default());
         assert_eq!(d.c.0, 16.0);
-        let want = ((80u64 << 30) as f64 * headroom(f.n_eff)) as u64;
+        let want = ((80u64 << 30) as f64 * headroom(f.n_eff_ring)) as u64;
         assert_eq!(d.mem.0, want, "fit mem × headroom, not probe shape");
         // Independent{p90:0} sentinel → probe shape wins via .max().
         let f = fit(st(32.0, 32.0, 1, false, 200.0));

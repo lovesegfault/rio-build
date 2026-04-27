@@ -114,7 +114,7 @@ pub fn explain(
         .collect();
 
     let cap_c = fit.fit.p_bar().0.min(fit.fit.c_opt().0).min(ceil.max_cores);
-    let h = headroom(fit.n_eff);
+    let h = headroom(fit.n_eff_ring);
     let disk = fit.disk_p90.map(|d| d.0).unwrap_or(ceil.default_disk);
 
     let mut candidates = Vec::with_capacity(walk.len());
@@ -194,7 +194,10 @@ fn summarize_fit(f: &FittedParams) -> String {
             format!("M=p90 {:.1}Gi", p90.0 as f64 / (1u64 << 30) as f64)
         }
     };
-    format!("{head} σ={:.3} n_eff={:.1} | {mem}", f.sigma_resid, f.n_eff)
+    format!(
+        "{head} σ={:.3} n_eff_ring={:.1} fit_df={:.1} | {mem}",
+        f.sigma_resid, f.n_eff_ring.0, f.fit_df.0
+    )
 }
 
 #[cfg(test)]
@@ -225,7 +228,8 @@ mod tests {
             disk_p90: Some(DiskBytes(10 << 30)),
             sigma_resid: 0.1,
             log_residuals: Vec::new(),
-            n_eff: 1e6,
+            n_eff_ring: RingNEff(1e6),
+            fit_df: FitDf(1e6),
             n_distinct_c: 1_000_000,
             sum_w: 1e6,
             span: 8.0,

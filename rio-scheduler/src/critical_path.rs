@@ -215,8 +215,8 @@ mod tests {
     use super::*;
     use crate::dag::DerivationDag;
     use crate::sla::types::{
-        DurationFit, ExploreState, FittedParams, MemBytes, MemFit, RawCores, RefSeconds,
-        WallSeconds,
+        DurationFit, ExploreState, FitDf, FittedParams, MemBytes, MemFit, RawCores, RefSeconds,
+        RingNEff, WallSeconds,
     };
     use crate::state::DerivationStatus;
     use rio_test_support::fixtures::{make_derivation_node, make_edge};
@@ -255,7 +255,8 @@ mod tests {
             disk_p90: None,
             sigma_resid: 0.0,
             log_residuals: vec![],
-            n_eff: 5.0,
+            n_eff_ring: RingNEff(5.0),
+            fit_df: FitDf(5.0),
             n_distinct_c: 5,
             sum_w: 10.0,
             span: 1.0,

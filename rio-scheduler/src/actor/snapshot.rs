@@ -775,11 +775,12 @@ impl DagActor {
         .then_some(())
         .and_then(|()| {
             let f = fit.as_ref()?;
-            if f.n_eff < 3.0
-                || (f.span < 4.0
-                    && !crate::sla::explore::frozen(&f.explore, self.sla_ceilings.max_cores))
-                || matches!(f.fit, crate::sla::types::DurationFit::Probe)
-            {
+            // R6B4: `!Probe ⟹ n_eff_ring≥3 ∧ span≥4` (ingest.rs:310
+            // sets `Probe` iff either fails) — the dropped `n_eff` /
+            // `span||frozen` clauses were redundant pre-r5-R5B8 and
+            // WRONG after it (read post-filter `fit_df=2` and rejected
+            // a valid Capped fit).
+            if matches!(f.fit, crate::sla::types::DurationFit::Probe) {
                 return None;
             }
             // Memo: keyed on (model_key_hash, override_hash); hit iff

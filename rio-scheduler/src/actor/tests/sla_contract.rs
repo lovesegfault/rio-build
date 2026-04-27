@@ -839,7 +839,8 @@ async fn contract_dispatch_accepts_2row_postfilter_fit() {
         p: crate::sla::types::RefSeconds(2000.0),
         p_bar: crate::sla::types::RawCores(8.0),
     };
-    fit.n_eff = 2.0;
+    fit.n_eff_ring = crate::sla::types::RingNEff(5.0);
+    fit.fit_df = crate::sla::types::FitDf(2.0);
     fit.n_distinct_c = 2;
     fit.sum_w = 2.0;
     fit.span = 8.0;

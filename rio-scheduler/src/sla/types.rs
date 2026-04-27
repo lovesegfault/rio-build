@@ -8,6 +8,22 @@ newtype!(pub WallSeconds(f64): Display, Add, Sub, Mul<f64>, Div<f64>, Ord);
 newtype!(pub MemBytes(u64): Display, Add, Ord);
 newtype!(pub DiskBytes(u64): Display, Add, Ord);
 
+/// Pre-p̄-filter Kish effective sample count over the FULL anchor ring.
+/// Gates `als_fit` / `fit_memory` / partial-pool / `headroom()` — all
+/// of which run on, or describe confidence in, the unfiltered ring.
+/// Distinct newtype from [`FitDf`] so a reader cannot silently get the
+/// other (R6B4 / bug_012: dispatch gates read the post-filter value
+/// after r5 R5B8 changed which one was stored).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct RingNEff(pub f64);
+
+/// Post-p̄-filter Kish effective sample count over the row subset
+/// `als_fit` / `sigma_resid` / `log_residuals` actually fitted on.
+/// Feeds `z_q` (degrees of freedom), the CI debounce, and `is_outlier`
+/// — all of which reason about the FITTED row set.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct FitDf(pub f64);
+
 // r[impl sched.sla.model-key-tenant-scoped]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ModelKey {
@@ -131,7 +147,10 @@ pub struct FittedParams {
     /// fit's residual distribution without re-reading the ring. ≤32
     /// entries (ring-buffer cap), so the per-key cache cost is bounded.
     pub log_residuals: Vec<f64>,
-    pub n_eff: f64,
+    /// Pre-filter ring cardinality. See [`RingNEff`].
+    pub n_eff_ring: RingNEff,
+    /// Post-filter degrees-of-freedom. See [`FitDf`].
+    pub fit_df: FitDf,
     /// Count of distinct `cpu_limit` values in the ring (=
     /// [`super::ingest::AnchorRing::n_distinct_c`]). Feeds the
     /// [`super::fit::z_q`] degrees-of-freedom: post-convergence `n_eff`
@@ -182,14 +201,14 @@ pub struct FittedParams {
 
 impl FittedParams {
     /// Student-t prediction-interval factor at quantile `q` for THIS
-    /// fit's `(n_eff, n_distinct_c, n_par, Σw)`. Computed once per
+    /// fit's `(fit_df, n_distinct_c, n_par, Σw)`. Computed once per
     /// `(fit, q)` and threaded through [`super::quantile::quantile`] —
     /// cheap (one `inverse_cdf`) but constant across bisection steps so
     /// callers should hoist it.
     pub fn z_q(&self, q: f64) -> f64 {
         super::fit::z_q(
             q,
-            self.n_eff,
+            self.fit_df,
             self.n_distinct_c,
             self.fit.n_par(),
             self.sum_w,

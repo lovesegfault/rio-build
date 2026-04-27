@@ -44,7 +44,8 @@ fn mk_fit(s: f64, p: f64, q: f64, sigma: f64) -> FittedParams {
         disk_p90: Some(DiskBytes(10 << 30)),
         sigma_resid: sigma,
         log_residuals: Vec::new(),
-        n_eff: 1e6,
+        n_eff_ring: RingNEff(1e6),
+        fit_df: FitDf(1e6),
         n_distinct_c: 1_000_000,
         sum_w: 1e6,
         span: 8.0,
@@ -109,7 +110,7 @@ proptest! {
     // r[verify sched.sla.headroom-confidence-scaled]
     #[test]
     fn headroom_monotone_decreasing_in_n(n in 1.0..100f64) {
-        prop_assert!(headroom(n) >= headroom(n + 1.0));
+        prop_assert!(headroom(RingNEff(n)) >= headroom(RingNEff(n + 1.0)));
     }
 
     /// If `solve_mvp` returns `Feasible{c*}` for tier `p90`, then the model's predicted

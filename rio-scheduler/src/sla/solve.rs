@@ -177,7 +177,7 @@ impl InfeasibleReason {
 /// ICE state this fn doesn't see).
 pub fn classify_ceiling(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> InfeasibleReason {
     let cap_c = fit.fit.p_bar().0.min(fit.fit.c_opt().0).min(ceil.max_cores);
-    let h = headroom(fit.n_eff);
+    let h = headroom(fit.n_eff_ring);
     if fit.disk_p90.is_some_and(|d| d.0 > ceil.max_disk) {
         return InfeasibleReason::DiskCeiling;
     }
@@ -362,7 +362,7 @@ pub fn intent_for(
         .unwrap_or(&cfg.probe);
     let probe_mem = (probe.cpu * probe.mem_per_core as f64 + probe.mem_base as f64) as u64;
     let fit_mem_at =
-        |c: f64| fit.map(|f| (f.mem.at(RawCores(c)).0 as f64 * headroom(f.n_eff)) as u64);
+        |c: f64| fit.map(|f| (f.mem.at(RawCores(c)).0 as f64 * headroom(f.n_eff_ring)) as u64);
     // disk_p90 is core-independent (r[sched.sla.disk-scalar]); resolve
     // and clamp once so every early-return branch is self-consistent
     // for `explain.rs`. The `solve_intent_for` chokepoint applies the
@@ -409,19 +409,14 @@ pub fn intent_for(
         return (1, mem, fit_disk);
     }
     let fit = match fit {
-        Some(f)
-            if f.n_eff >= 3.0
-                && (f.span >= 4.0 || explore::frozen(&f.explore, ceil.max_cores))
-                // `ingest::refit` sets `fit=Probe` whenever `span<4`,
-                // independent of `frozen()`; without this filter the
-                // `n_eff≥3 ∧ span<4 ∧ frozen` region (reachable via
-                // the `min_c<=1` wall clause) hands a Probe fit to
-                // `solve_mvp` → `t_at=∞` → cap_c=max_cores instead of
-                // explore's `max_c`.
-                && !matches!(f.fit, DurationFit::Probe) =>
-        {
-            f
-        }
+        // R6B4: `!Probe ⟹ n_eff_ring≥3 ∧ span≥4` (one-directional —
+        // ingest.rs:310 sets `fit=Probe` iff `n_eff_ring<3 ∨ span<4`),
+        // so the dropped `n_eff` / `span||frozen` clauses were
+        // redundant pre-r5-R5B8 and WRONG after it (read post-filter
+        // `fit_df` with pre-filter calibration). The `frozen ∧ span<4`
+        // region they admitted is `Probe` anyway (refit's gate doesn't
+        // consult `frozen()`), so this is no behaviour loss.
+        Some(f) if !matches!(f.fit, DurationFit::Probe) => f,
         _ => {
             // Explore ladder: saturation-gated ×4/÷2 from cfg.probe.
             let d = explore::next(fit, cfg, hints);
@@ -585,7 +580,7 @@ pub fn solve_mvp(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> SolveRe
         "solve_mvp called with DurationFit::Probe — gate must filter"
     );
     let cap_c = fit.fit.p_bar().0.min(fit.fit.c_opt().0).min(ceil.max_cores);
-    let h = headroom(fit.n_eff);
+    let h = headroom(fit.n_eff_ring);
     let disk = fit.disk_p90.map(|d| d.0).unwrap_or(ceil.default_disk);
 
     for tier in tiers {
@@ -716,7 +711,7 @@ fn evaluate_cell(
         "cap_c floor dropped — CLoExceedsCap is no longer spot-only"
     );
     let factor = hw_factor_for(fit, hw, h);
-    let hr = headroom(fit.n_eff);
+    let hr = headroom(fit.n_eff_ring);
     let disk = fit.disk_p90.map(|d| d.0).unwrap_or(ceil.default_disk);
     let cell = (h.clone(), cap);
     let lambda = match cap {
@@ -845,7 +840,7 @@ pub fn solve_full(
         .min(fit.fit.c_opt().0)
         .min(ceil.max_cores)
         .max(1.0);
-    let hr = headroom(fit.n_eff);
+    let hr = headroom(fit.n_eff_ring);
     let disk = fit.disk_p90.map(|d| d.0).unwrap_or(ceil.default_disk);
     let tau = cfg.hw_cost_tolerance;
     let k = 2.0;
@@ -1218,7 +1213,11 @@ pub fn fit_content_hash(fit: &FittedParams) -> u64 {
         q,
         fit.fit.p_bar().0,
         fit.sigma_resid,
-        fit.n_eff,
+        // R6B4: `fit_df` (post-filter) — it's what `z_q()` reads, so
+        // a fit_df-only change IS a solve-relevant change. `n_eff_ring`
+        // doesn't move without `fit_df` also moving (the unfiltered
+        // ring is a superset).
+        fit.fit_df.0,
         fit.sum_w,
     ] {
         x.to_bits().hash(&mut h);
@@ -1338,7 +1337,8 @@ mod tests {
             // expectations below (which use 1.2816/2.3263) hold. Tests
             // that exercise small-n widening or headroom set these
             // explicitly.
-            n_eff: 1e6,
+            n_eff_ring: RingNEff(1e6),
+            fit_df: FitDf(1e6),
             n_distinct_c: 1_000_000,
             sum_w: 1e6,
             span: 8.0,
@@ -1707,7 +1707,7 @@ mod tests {
         // st.max_c=2 when frozen.
         let mut f = mk_fit(0.0, 0.0, 0.0, f64::INFINITY, 0.2);
         f.fit = DurationFit::Probe;
-        f.n_eff = 3.0;
+        f.n_eff_ring = RingNEff(3.0);
         f.span = 2.0;
         f.explore = ExploreState {
             distinct_c: 2,
@@ -1759,7 +1759,7 @@ mod tests {
         };
         let (c, m, d) = intent(Some(&fit), &hints);
         assert_eq!(c, 1);
-        let want = ((2u64 << 30) as f64 * headroom(fit.n_eff)) as u64;
+        let want = ((2u64 << 30) as f64 * headroom(fit.n_eff_ring)) as u64;
         assert_eq!(m, want, "MemFit.at(1) × headroom(n_eff), not probe_mem");
         assert_eq!(d, 10 << 30, "fit.disk_p90, not default_disk");
         // No fit → probe defaults.
@@ -1779,14 +1779,14 @@ mod tests {
             b: 0.3,
             r1: 0.9,
         };
-        fit.n_eff = 3.0;
+        fit.n_eff_ring = RingNEff(3.0);
         let hints = DrvHints {
             enable_parallel_building: Some(false),
             ..Default::default()
         };
         let (_, m, _) = intent(Some(&fit), &hints);
         let raw = 21.5f64.exp() as u64;
-        let want = (raw as f64 * headroom(3.0)) as u64;
+        let want = (raw as f64 * headroom(RingNEff(3.0))) as u64;
         assert_eq!(m, want);
         assert!(m > raw * 3 / 2, "headroom(3.0)≈1.65 must inflate raw");
     }
@@ -1813,7 +1813,7 @@ mod tests {
         );
         assert_eq!(c, 12);
         let raw = fit.mem.at(RawCores(12.0)).0;
-        assert_eq!(m, (raw as f64 * headroom(fit.n_eff)) as u64);
+        assert_eq!(m, (raw as f64 * headroom(fit.n_eff_ring)) as u64);
         assert!(m > raw, "must include headroom factor");
     }
     #[test]
@@ -1869,12 +1869,13 @@ mod tests {
             intent(None, &DrvHints::default()),
             (4, 8 << 30, ceil().default_disk)
         );
-        // n_eff < 3 → still explore path. mk_fit's explore state is
-        // min=4/max=32 → frozen() = true (span 8) → solve gate would
-        // pass if n_eff≥3; below that, explore::next walks the ladder
-        // from the fit's existing range.
+        // Probe → still explore path (R6B4: gate is `!Probe` only;
+        // ingest sets `Probe` iff n_eff_ring<3 ∨ span<4). mk_fit's
+        // explore state is min=4/max=32 → frozen() = true (span 8) →
+        // explore::next walks the ladder from the fit's existing range.
         let mut fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
-        fit.n_eff = 2.0;
+        fit.fit = DurationFit::Probe;
+        fit.n_eff_ring = RingNEff(2.0);
         let (c, _, _) = intent(Some(&fit), &DrvHints::default());
         assert!(c >= 4, "explore ladder ≥ probe.cpu, got {c}");
     }
@@ -1921,9 +1922,10 @@ mod tests {
             },
         );
         assert!(d <= max, "serial: disk {d} > max_disk {max}");
-        // explore ladder (n_eff < 3 with a fit).
+        // explore ladder (Probe fit — R6B4: gate is `!Probe` only).
         let mut explore_fit = fit.clone();
-        explore_fit.n_eff = 2.0;
+        explore_fit.fit = DurationFit::Probe;
+        explore_fit.n_eff_ring = RingNEff(2.0);
         let (_, _, d) = intent(Some(&explore_fit), &DrvHints::default());
         assert!(d <= max, "explore: disk {d} > max_disk {max}");
     }

@@ -15,8 +15,8 @@ use super::hw::{HwTable, K};
 use super::prior::{FitParams, PriorSources, partial_pool, prior_for};
 use super::solve::Tier;
 use super::types::{
-    DiskBytes, DurationFit, ExploreState, FittedParams, MemBytes, MemFit, ModelKey, RawCores,
-    RefSeconds, WallSeconds,
+    DiskBytes, DurationFit, ExploreState, FitDf, FittedParams, MemBytes, MemFit, ModelKey,
+    RawCores, RefSeconds, RingNEff, WallSeconds,
 };
 use crate::db::BuildSampleRow;
 
@@ -194,12 +194,16 @@ pub fn refit(
     // read for weighting (only for the CI-debounce floor below).
     let ring = AnchorRing::from_rows(fit_rows.len(), &fit_rows, &vdists);
     let w: Vec<f64> = ring.weighted_rows().map(|(_, _, w)| w).collect();
-    // Pre-filter n_eff: gates `als_fit`, `fit_memory`, and the
-    // partial-pool blend — all of which run on the unfiltered ring. The
-    // POST-filter values stored on FittedParams (and fed to the CI
-    // debounce / `is_outlier` / `z_q`) are computed below after the
-    // `idx`/p̄ collinearity drop.
-    let n_eff = kish_n_eff(&w);
+    // Pre-filter ring n_eff: gates `als_fit`, `fit_memory`, the
+    // partial-pool blend, and `headroom()` — all of which run on the
+    // unfiltered ring. The dispatch gates at snapshot.rs:778 +
+    // solve.rs:413 do NOT read this directly: they gate on `!Probe`,
+    // and the als-gate below (`n_eff_ring < 3.0 || span < 4.0` →
+    // `Probe`) is what actually enforces ring cardinality. The
+    // POST-filter `fit_df` (for `z_q` / CI debounce / `is_outlier`) is
+    // computed below after the `idx`/p̄ collinearity drop. Distinct
+    // newtypes so a reader cannot get the other (R6B4 / bug_012).
+    let n_eff_ring = RingNEff(kish_n_eff(&w));
 
     let cs: Vec<f64> = fit_rows
         .iter()
@@ -242,11 +246,13 @@ pub fn refit(
     let w_f: Vec<f64> = idx.iter().map(|&i| w[i]).collect();
     // z_q inputs MUST describe the post-filter row set: `als_fit`,
     // `sigma_resid`, `log_residuals`, and the bootstrap CI all run on
-    // `(cs_f, w_f)`, so the df/Σw that `z_q()` reads (types.rs:185) must
-    // be stated at the same granularity. Pre-filter `n_eff` above is kept
-    // for `fit_memory` / partial-pool / the als gate (which run on the
-    // unfiltered ring). See docs/REVIEW.md §Granularity-coupling.
-    let n_eff_f = kish_n_eff(&w_f);
+    // `(cs_f, w_f)`, so the df/Σw that `z_q()` reads must be stated at
+    // the same granularity. Distinct newtype from `n_eff_ring` above.
+    // The dispatch gates at snapshot.rs:778 + solve.rs:413 do NOT read
+    // this — they gate on `!Probe` only (R6B4: `!Probe ⟹
+    // n_eff_ring≥3 ∧ span≥4` from the als-gate below). See
+    // docs/REVIEW.md §Granularity-coupling.
+    let fit_df = FitDf(kish_n_eff(&w_f));
     let sum_w_f: f64 = w_f.iter().sum();
     let n_distinct_c_f = cs_f
         .iter()
@@ -275,7 +281,7 @@ pub fn refit(
         max / min
     };
     let gate = StageGate {
-        n_eff,
+        n_eff: n_eff_ring.0,
         span,
         p_bar,
         prev_usl: matches!(prev.map(|p| &p.fit), Some(DurationFit::Usl { .. })),
@@ -300,10 +306,10 @@ pub fn refit(
     // drop can leave 2 post-filter rows (kept.len()≥2 above), which is
     // sufficient for the 2-param Capped/Amdahl fit. `z_q()` (fit.rs:37)
     // floors df at 3 as the backstop for the stored post-filter
-    // `n_eff_f`/`n_distinct_c_f`, so a 2-row post-filter fit gets the
+    // `fit_df`/`n_distinct_c_f`, so a 2-row post-filter fit gets the
     // widest (most conservative) prediction interval rather than being
     // rejected outright.
-    let (mut fit, sigma, alpha) = if n_eff < 3.0 || span < 4.0 {
+    let (mut fit, sigma, alpha) = if n_eff_ring.0 < 3.0 || span < 4.0 {
         (DurationFit::Probe, 0.2, alpha_prior)
     } else {
         let (f, s, a, rounds) =
@@ -315,6 +321,10 @@ pub fn refit(
             )
             .increment(1);
         }
+        // R6B4 tripwire: `als_fit` must never return Probe on the
+        // ≥3∧≥4× branch — if a future early-return does, the dispatch
+        // gates' `!Probe ⟹ n_eff_ring≥3 ∧ span≥4` invariant breaks.
+        debug_assert!(!matches!(f, DurationFit::Probe));
         (f, s, a)
     };
     // Reference-seconds at the converged α — feeds hw_bias / residuals /
@@ -322,7 +332,7 @@ pub fn refit(
     let scale = |i: usize| alpha::dot(alpha, factors[i].unwrap_or([1.0; K]));
     let ts: Vec<f64> = (0..walls.len()).map(|i| walls[i] * scale(i)).collect();
     let ts_f: Vec<f64> = idx.iter().map(|&i| ts[i]).collect();
-    let (mut mem, weak) = fit_memory(&cs, &ms, &w, n_eff);
+    let (mut mem, weak) = fit_memory(&cs, &ms, &w, n_eff_ring.0);
     if weak {
         ::metrics::counter!(
             "rio_scheduler_sla_mem_fit_weak_total",
@@ -342,7 +352,7 @@ pub fn refit(
     let prior_source = theta_prior.map(|(theta_prior, prov)| {
         if !matches!(fit, DurationFit::Probe) {
             let theta_pname = extract_fit_params(&fit, &mem, alpha);
-            let pooled = partial_pool(&theta_pname, n_eff, &theta_prior, PARTIAL_POOL_N0);
+            let pooled = partial_pool(&theta_pname, n_eff_ring.0, &theta_prior, PARTIAL_POOL_N0);
             apply_pooled(&mut fit, &mut mem, &pooled);
         }
         prov
@@ -389,7 +399,7 @@ pub fn refit(
     // or it's been long enough. Probe fits skip CI entirely (no T_min).
     let (ci, ci_at) = if matches!(fit, DurationFit::Probe) {
         (None, None)
-    } else if should_recompute_ci(prev, &fit, n_eff_f, now) {
+    } else if should_recompute_ci(prev, &fit, fit_df, now) {
         let ws: Vec<WeightedSample> = cs_f
             .iter()
             .zip(&ts_f)
@@ -423,7 +433,8 @@ pub fn refit(
         disk_p90,
         sigma_resid: sigma,
         log_residuals,
-        n_eff: n_eff_f,
+        n_eff_ring,
+        fit_df,
         n_distinct_c: n_distinct_c_f,
         sum_w: sum_w_f,
         span,
@@ -549,7 +560,7 @@ pub fn is_outlier(
     fit: &FittedParams,
     dt_poll: f64,
 ) -> bool {
-    if fit.n_eff < 5.0 || fit.log_residuals.is_empty() {
+    if fit.fit_df.0 < 5.0 || fit.log_residuals.is_empty() {
         return false;
     }
     let predicted = fit.fit.t_at(RawCores(sample_c)).0;
@@ -640,7 +651,7 @@ fn median(v: &[f64]) -> f64 {
 pub(super) fn should_recompute_ci(
     prev: Option<&FittedParams>,
     new_fit: &DurationFit,
-    new_n_eff: f64,
+    new_fit_df: FitDf,
     now: f64,
 ) -> bool {
     let Some(prev) = prev else { return true };
@@ -655,7 +666,7 @@ pub(super) fn should_recompute_ci(
     let Some((plo, phi)) = prev.t_min_ci else {
         return true;
     };
-    if prev.n_eff > 0.0 && (prev.n_eff - new_n_eff).abs() / prev.n_eff > 0.5 {
+    if prev.fit_df.0 > 0.0 && (prev.fit_df.0 - new_fit_df.0).abs() / prev.fit_df.0 > 0.5 {
         return true;
     }
     let width = phi.0 - plo.0;
@@ -725,7 +736,8 @@ fn probe_only(key: &ModelKey, last: Option<&BuildSampleRow>) -> FittedParams {
             .map(|b| DiskBytes(b as u64)),
         sigma_resid: 0.2,
         log_residuals: Vec::new(),
-        n_eff: 0.0,
+        n_eff_ring: RingNEff(0.0),
+        fit_df: FitDf(0.0),
         n_distinct_c: 0,
         sum_w: 0.0,
         span: 1.0,
@@ -834,7 +846,7 @@ mod tests {
             .collect();
         let f = r(&rows);
         assert!(matches!(f.fit, DurationFit::Amdahl { .. }), "{:?}", f.fit);
-        assert!(f.n_eff > 4.9, "n_eff={}", f.n_eff);
+        assert!(f.n_eff_ring.0 > 4.9, "n_eff_ring={:?}", f.n_eff_ring);
         assert!(f.span >= 16.0, "span={}", f.span);
         assert_eq!(f.explore.distinct_c, 5);
         assert!(f.explore.saturated, "util 0.5 > 0.4 gate");
@@ -880,7 +892,8 @@ mod tests {
     fn refit_empty_is_probe() {
         let f = r(&[]);
         assert!(matches!(f.fit, DurationFit::Probe));
-        assert_eq!(f.n_eff, 0.0);
+        assert_eq!(f.n_eff_ring, RingNEff(0.0));
+        assert_eq!(f.fit_df, FitDf(0.0));
         assert_eq!(f.explore.distinct_c, 0);
     }
 
@@ -1209,7 +1222,7 @@ mod tests {
         );
     }
 
-    fn prev_with_ci(t_min: f64, lo: f64, hi: f64, n_eff: f64, at: f64) -> FittedParams {
+    fn prev_with_ci(t_min: f64, lo: f64, hi: f64, fit_df: f64, at: f64) -> FittedParams {
         FittedParams {
             key: key(),
             fit: DurationFit::Amdahl {
@@ -1220,9 +1233,10 @@ mod tests {
             disk_p90: None,
             sigma_resid: 0.1,
             log_residuals: Vec::new(),
-            n_eff,
+            n_eff_ring: RingNEff(fit_df),
+            fit_df: FitDf(fit_df),
             n_distinct_c: 5,
-            sum_w: n_eff,
+            sum_w: fit_df,
             span: 8.0,
             explore: ExploreState {
                 distinct_c: 3,
@@ -1250,9 +1264,19 @@ mod tests {
         // prev CI computed at t=1000, now=1020 → elapsed=20s < 30s → skip
         // even though ΔT_min=400 > width/2=50.
         let prev = prev_with_ci(100.0, 50.0, 150.0, 5.0, 1000.0);
-        assert!(!should_recompute_ci(Some(&prev), &new_fit, 5.0, 1020.0));
+        assert!(!should_recompute_ci(
+            Some(&prev),
+            &new_fit,
+            FitDf(5.0),
+            1020.0
+        ));
         // Same prev, now=1040 → elapsed=40s > 30s → ΔT_min trigger fires.
-        assert!(should_recompute_ci(Some(&prev), &new_fit, 5.0, 1040.0));
+        assert!(should_recompute_ci(
+            Some(&prev),
+            &new_fit,
+            FitDf(5.0),
+            1040.0
+        ));
     }
 
     #[test]
@@ -1261,11 +1285,21 @@ mod tests {
             s: RefSeconds(100.0),
             p: RefSeconds(0.0),
         };
-        // ΔT_min=0, but n_eff 5→12 (>50% jump) → recompute.
+        // ΔT_min=0, but fit_df 5→12 (>50% jump) → recompute.
         let prev = prev_with_ci(100.0, 50.0, 150.0, 5.0, 1000.0);
-        assert!(should_recompute_ci(Some(&prev), &new_fit, 12.0, 1040.0));
-        // n_eff 5→6 (<50%) and ΔT_min=0 → keep.
-        assert!(!should_recompute_ci(Some(&prev), &new_fit, 6.0, 1040.0));
+        assert!(should_recompute_ci(
+            Some(&prev),
+            &new_fit,
+            FitDf(12.0),
+            1040.0
+        ));
+        // fit_df 5→6 (<50%) and ΔT_min=0 → keep.
+        assert!(!should_recompute_ci(
+            Some(&prev),
+            &new_fit,
+            FitDf(6.0),
+            1040.0
+        ));
     }
 
     // ─── Task 5.1: MAD outlier rejection ─────────────────────────────────
@@ -1289,7 +1323,7 @@ mod tests {
     #[test]
     fn mad_flags_10x_at_neff_6() {
         let fit = outlier_fit();
-        assert!(fit.n_eff >= 5.0, "precondition: n_eff={}", fit.n_eff);
+        assert!(fit.fit_df.0 >= 5.0, "precondition: fit_df={:?}", fit.fit_df);
         assert!(!fit.log_residuals.is_empty());
         let pred = fit.fit.t_at(RawCores(8.0)).0;
         // 10× predicted → ln(10)≈2.3 absolute log-resid. 5% noise gives
@@ -1309,14 +1343,14 @@ mod tests {
     #[test]
     fn mad_gated_below_neff_5() {
         let mut fit = outlier_fit();
-        fit.n_eff = 4.0;
+        fit.fit_df = FitDf(4.0);
         let pred = fit.fit.t_at(RawCores(8.0)).0;
         assert!(
             !is_outlier(pred * 10.0, pred * 10.0, 8.0, &fit, 1.0),
-            "n_eff=4 → never flag"
+            "fit_df=4 → never flag"
         );
-        // No residuals (Probe fit) → never flag regardless of n_eff.
-        fit.n_eff = 10.0;
+        // No residuals (Probe fit) → never flag regardless of fit_df.
+        fit.fit_df = FitDf(10.0);
         fit.log_residuals.clear();
         assert!(!is_outlier(pred * 10.0, pred * 10.0, 8.0, &fit, 1.0));
     }
@@ -1332,7 +1366,7 @@ mod tests {
             .collect();
         let fit = r(&rows);
         assert!(fit.sigma_resid < 1e-3, "perfect fit");
-        assert!(fit.n_eff >= 5.0, "n_eff={}", fit.n_eff);
+        assert!(fit.fit_df.0 >= 5.0, "fit_df={:?}", fit.fit_df);
         let pred = fit.fit.t_at(RawCores(8.0)).0; // ≈ 280
         // ln(1.3)≈0.26 < 0.44 → kept; ln(2)≈0.69 > 0.44 → flagged.
         assert!(!is_outlier(pred * 1.3, pred * 1.3, 8.0, &fit, 28.0));
@@ -1387,12 +1421,12 @@ mod tests {
             s: RefSeconds(100.0),
             p: RefSeconds(0.0),
         };
-        assert!(should_recompute_ci(None, &f, 5.0, 1000.0));
+        assert!(should_recompute_ci(None, &f, FitDf(5.0), 1000.0));
         // prev exists but bootstrap has never run → recompute.
         let mut prev = prev_with_ci(100.0, 50.0, 150.0, 5.0, 1000.0);
         prev.t_min_ci = None;
         prev.ci_computed_at = None;
-        assert!(should_recompute_ci(Some(&prev), &f, 5.0, 1000.0));
+        assert!(should_recompute_ci(Some(&prev), &f, FitDf(5.0), 1000.0));
     }
 
     #[test]
@@ -1407,11 +1441,11 @@ mod tests {
         let mut prev = prev_with_ci(100.0, 50.0, 150.0, 6.0, 100.0);
         prev.t_min_ci = None;
         assert!(
-            !should_recompute_ci(Some(&prev), &f, 6.0, 101.0),
+            !should_recompute_ci(Some(&prev), &f, FitDf(6.0), 101.0),
             "within 30s floor"
         );
         assert!(
-            should_recompute_ci(Some(&prev), &f, 6.0, 200.0),
+            should_recompute_ci(Some(&prev), &f, FitDf(6.0), 200.0),
             "past floor"
         );
     }
@@ -1447,7 +1481,7 @@ mod tests {
             default_tier_target: 300.0,
         };
         let fit = r_prior(&rows, &priors);
-        assert!(fit.n_eff >= 5.0);
+        assert!(fit.fit_df.0 >= 5.0);
         let med = median(&fit.log_residuals);
         assert!(
             med.abs() > 0.05,
@@ -1631,9 +1665,14 @@ mod tests {
         let f = r(&rows);
         assert_eq!(f.n_distinct_c, 3, "post-filter distinct c, NOT 8");
         assert!(
-            f.n_eff > 2.5 && f.n_eff < 3.5,
-            "post-filter n_eff≈3 NOT 8; got {}",
-            f.n_eff
+            f.fit_df.0 > 2.5 && f.fit_df.0 < 3.5,
+            "post-filter fit_df≈3 NOT 8; got {:?}",
+            f.fit_df
+        );
+        assert!(
+            f.n_eff_ring.0 > 7.5,
+            "pre-filter n_eff_ring≈8; got {:?}",
+            f.n_eff_ring
         );
         assert!(
             f.sum_w > 2.0 && f.sum_w < 3.0,

@@ -99,7 +99,10 @@ pub(super) fn status_from_fit(
         mem_p90_bytes: mem_p90,
         disk_p90_bytes: f.disk_p90.map(|d| d.0),
         sigma_resid: f.sigma_resid,
-        n_eff: f.n_eff,
+        // proto field stays scalar; report ring n_eff (the operator-
+        // facing "how many samples does this key have"). `fit_df` is
+        // surfaced via `sla explain`'s `fit_summary`.
+        n_eff: f.n_eff_ring.0,
         span: f.span,
         tier: f.tier.clone(),
         active_override: active_override.map(row_to_proto),
@@ -134,7 +137,7 @@ pub(super) fn explain_to_proto(r: &ExplainResult) -> SlaExplainResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sla::types::{ExploreState, ModelKey, RefSeconds, WallSeconds};
+    use crate::sla::types::{ExploreState, FitDf, ModelKey, RefSeconds, RingNEff, WallSeconds};
 
     fn amdahl_coupled() -> FittedParams {
         FittedParams {
@@ -155,7 +158,8 @@ mod tests {
             disk_p90: None,
             sigma_resid: 0.1,
             log_residuals: vec![],
-            n_eff: 8.0,
+            n_eff_ring: RingNEff(8.0),
+            fit_df: FitDf(8.0),
             n_distinct_c: 5,
             sum_w: 10.0,
             span: 8.0,

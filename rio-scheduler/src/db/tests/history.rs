@@ -303,7 +303,7 @@ async fn test_sla_estimator_incremental_refresh() -> anyhow::Result<()> {
         tenant: "t".into(),
     };
     let f = est.cached(&key).expect("cached after refresh");
-    assert!(f.n_eff > 4.9, "n_eff={}", f.n_eff);
+    assert!(f.n_eff_ring.0 > 4.9, "n_eff_ring={:?}", f.n_eff_ring);
     assert!(f.span >= 16.0, "span={} (64/4)", f.span);
     assert!(
         matches!(f.fit, DurationFit::Amdahl { .. }),
@@ -608,8 +608,8 @@ async fn test_refresh_outlier_gate_normalizes_hw_class() -> anyhow::Result<()> {
     use crate::sla::{
         SlaEstimator,
         types::{
-            DurationFit, ExploreState, FittedParams, MemBytes, MemFit, ModelKey, RawCores,
-            RefSeconds, WallSeconds,
+            DurationFit, ExploreState, FitDf, FittedParams, MemBytes, MemFit, ModelKey, RawCores,
+            RefSeconds, RingNEff, WallSeconds,
         },
     };
 
@@ -660,7 +660,8 @@ async fn test_refresh_outlier_gate_normalizes_hw_class() -> anyhow::Result<()> {
         disk_p90: None,
         sigma_resid: 0.02,
         log_residuals: vec![0.02, -0.02, 0.02, -0.02, 0.02],
-        n_eff: 8.0,
+        n_eff_ring: RingNEff(8.0),
+        fit_df: FitDf(8.0),
         n_distinct_c: 5,
         sum_w: 10.0,
         span: 16.0,

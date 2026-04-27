@@ -1,7 +1,7 @@
 use nalgebra::{DMatrix, DVector};
 use statrs::distribution::{ContinuousCDF, StudentsT};
 
-use super::types::{DurationFit, MemBytes, MemFit, RawCores, RefSeconds};
+use super::types::{DurationFit, FitDf, MemBytes, MemFit, RawCores, RefSeconds, RingNEff};
 
 // r[impl sched.sla.hw-class.sample-weight-ordinal]
 // r[impl sched.sla.fit-nnls]  (weights are part of the fit contract)
@@ -33,8 +33,8 @@ pub fn sample_weight(ordinal_age: u32, vdist: u32) -> f64 {
 ///
 /// `sum_w` is `Σw_i` over the ring — NOT `n_eff` (they coincide only
 /// under uniform unit weights).
-pub fn z_q(q: f64, n_eff: f64, n_distinct_c: u32, n_par: u32, sum_w: f64) -> f64 {
-    let df = (n_eff.min(f64::from(n_distinct_c)) - f64::from(n_par)).max(3.0);
+pub fn z_q(q: f64, fit_df: FitDf, n_distinct_c: u32, n_par: u32, sum_w: f64) -> f64 {
+    let df = (fit_df.0.min(f64::from(n_distinct_c)) - f64::from(n_par)).max(3.0);
     let t = StudentsT::new(0.0, 1.0, df).expect("df ≥ 3").inverse_cdf(q);
     t * (1.0 + 1.0 / sum_w.max(1.0)).sqrt()
 }
@@ -262,8 +262,8 @@ pub fn fit_duration_staged(
 }
 
 // r[impl sched.sla.headroom-confidence-scaled]
-pub fn headroom(n_eff: f64) -> f64 {
-    1.25 + 0.7 / n_eff.max(1.0).sqrt()
+pub fn headroom(n_eff: RingNEff) -> f64 {
+    1.25 + 0.7 / n_eff.0.max(1.0).sqrt()
 }
 
 /// Closed-form weighted least squares for `y = a + b·x`. Returns `(a, b, σ)` where σ is
@@ -465,16 +465,16 @@ mod tests {
     // r[verify sched.sla.hw-class.zq-inflation]
     #[test]
     fn z_q_widens_at_low_neff() {
-        // n_eff=3, n_distinct_c=3, n_par=2, sum_w=2.5.
+        // fit_df=3, n_distinct_c=3, n_par=2, sum_w=2.5.
         // df = max(3, min(3,3)-2) = 3; t_{0.9,3}=1.638; ×√(1+1/2.5)=1.937.
-        let z = z_q(0.9, 3.0, 3, 2, 2.5);
+        let z = z_q(0.9, FitDf(3.0), 3, 2, 2.5);
         assert!((z - 1.937).abs() < 0.01, "z={z}");
     }
 
     #[test]
     fn z_q_asymptotes_to_ppf() {
-        // Large n_eff, n_distinct_c, sum_w → Φ⁻¹(0.9)=1.2816.
-        let z = z_q(0.9, 1e6, 1_000_000, 2, 1e6);
+        // Large fit_df, n_distinct_c, sum_w → Φ⁻¹(0.9)=1.2816.
+        let z = z_q(0.9, FitDf(1e6), 1_000_000, 2, 1e6);
         assert!((z - 1.2816).abs() < 0.001, "z={z}");
     }
 
@@ -486,15 +486,15 @@ mod tests {
         // n_eff. This is the case anchor-slots prevent from being
         // worse: without anchors n_distinct_c→1 and df floors at 3
         // forever.
-        let z_bound = z_q(0.9, 20.0, 3, 2, 18.0);
-        let z_unbound = z_q(0.9, 20.0, 20, 2, 18.0);
+        let z_bound = z_q(0.9, FitDf(20.0), 3, 2, 18.0);
+        let z_unbound = z_q(0.9, FitDf(20.0), 20, 2, 18.0);
         assert!(z_bound > z_unbound + 0.2, "{z_bound} vs {z_unbound}");
     }
 
     #[test]
     fn z_q_sum_w_floored_at_1() {
         // sum_w<1 (heavily decayed ring) must not blow up √(1+1/Σw).
-        let z = z_q(0.9, 5.0, 5, 2, 0.0);
+        let z = z_q(0.9, FitDf(5.0), 5, 2, 0.0);
         assert!(z.is_finite() && z > 0.0);
     }
 
@@ -658,17 +658,17 @@ mod tests {
 
     #[test]
     fn headroom_at_1() {
-        assert!((headroom(1.0) - 1.95).abs() < 1e-6);
+        assert!((headroom(RingNEff(1.0)) - 1.95).abs() < 1e-6);
     }
 
     #[test]
     fn headroom_at_100() {
-        assert!((headroom(100.0) - 1.32).abs() < 1e-2);
+        assert!((headroom(RingNEff(100.0)) - 1.32).abs() < 1e-2);
     }
 
     #[test]
     fn headroom_clamps_below_1() {
-        assert_eq!(headroom(0.1), headroom(1.0));
+        assert_eq!(headroom(RingNEff(0.1)), headroom(RingNEff(1.0)));
     }
 
     // r[verify sched.sla.mem-coupled]

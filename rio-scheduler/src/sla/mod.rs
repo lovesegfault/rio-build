@@ -356,7 +356,7 @@ impl SlaEstimator {
             .iter()
             .filter(|(t, _)| tenant.is_none_or(|want| *t == want))
             .flat_map(|(_, lru)| lru.iter().map(|(_, f)| f))
-            .filter(|f| f.n_eff >= f64::from(min_n))
+            .filter(|f| f.n_eff_ring.0 >= f64::from(min_n))
             .filter_map(|f| {
                 let (s, p, q) = f.fit.spq();
                 if !s.is_finite() {
@@ -380,11 +380,12 @@ impl SlaEstimator {
                     p_bar: if p_bar.is_finite() { p_bar } else { 0.0 },
                     a,
                     b,
-                    n: f.n_eff as u32,
-                    // v2: f64 n_eff (the partial-pool weight). `version`/
-                    // `alpha` are §13a fields populated by A13's
-                    // per-hw_class residual computation.
-                    n_eff: f.n_eff,
+                    n: f.n_eff_ring.0 as u32,
+                    // v2: f64 n_eff (RingNEff — the partial-pool
+                    // weight). `version`/`alpha` are §13a fields
+                    // populated by A13's per-hw_class residual
+                    // computation.
+                    n_eff: f.n_eff_ring.0,
                     version: String::new(),
                     alpha: vec![],
                 })
@@ -802,8 +803,8 @@ impl SlaEstimator {
 mod tests {
     use super::*;
     use types::{
-        DurationFit, ExploreState, FittedParams, MemBytes, MemFit, ModelKey, RawCores, RefSeconds,
-        WallSeconds,
+        DurationFit, ExploreState, FitDf, FittedParams, MemBytes, MemFit, ModelKey, RawCores,
+        RefSeconds, RingNEff, WallSeconds,
     };
 
     fn cfg() -> config::SlaConfig {
@@ -848,7 +849,8 @@ mod tests {
             disk_p90: None,
             sigma_resid: 0.1,
             log_residuals: vec![],
-            n_eff,
+            n_eff_ring: RingNEff(n_eff),
+            fit_df: FitDf(n_eff),
             n_distinct_c: 5,
             sum_w: n_eff,
             span: 8.0,

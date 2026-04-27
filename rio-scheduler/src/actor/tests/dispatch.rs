@@ -1576,7 +1576,8 @@ async fn spawn_intent_from_sla_estimator() {
         // Asymptotic-n so z_q ≈ Φ⁻¹(0.9)=1.2816 and the closed-form
         // β math in the comment above holds; this test is about
         // SpawnIntent wiring, not small-n widening.
-        n_eff: 1e6,
+        n_eff_ring: RingNEff(1e6),
+        fit_df: FitDf(1e6),
         n_distinct_c: 1_000_000,
         sum_w: 1e6,
         span: 8.0,
@@ -2169,7 +2170,8 @@ async fn work_assignment_carries_sla_cores() {
         disk_p90: Some(DiskBytes(10 << 30)),
         sigma_resid: 0.1,
         log_residuals: Vec::new(),
-        n_eff: 10.0,
+        n_eff_ring: RingNEff(10.0),
+        fit_df: FitDf(10.0),
         n_distinct_c: 5,
         sum_w: 10.0,
         span: 8.0,
@@ -2253,7 +2255,8 @@ async fn solve_intent_deadline_denormalized_to_slowest_hw() {
         disk_p90: Some(DiskBytes(10 << 30)),
         sigma_resid: 0.0,
         log_residuals: Vec::new(),
-        n_eff: 10.0,
+        n_eff_ring: RingNEff(10.0),
+        fit_df: FitDf(10.0),
         n_distinct_c: 5,
         sum_w: 10.0,
         span: 8.0,
