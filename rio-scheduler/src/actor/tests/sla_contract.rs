@@ -67,7 +67,7 @@ async fn refresh_cycle(actor: &mut DagActor) {
     }
 }
 
-/// **Selector stability** (`r[sched.sla.hw-class.epsilon-explore+3]`):
+/// **Selector stability** (`r[sched.sla.hw-class.epsilon-explore+4]`):
 /// `SpawnIntent.node_affinity` is a pure function of `(drv_hash,
 /// inputs_gen)` — N controller polls with no input change return
 /// identical selectors for every intent, AND a no-op
@@ -78,7 +78,7 @@ async fn refresh_cycle(actor: &mut DagActor) {
 /// Would have caught r1 bug_049 (per-call `rand::rng()` re-roll →
 /// selector-drift reap churn) AND r2 merged_bug_028 (unconditional
 /// bump every 60s → ε_h re-rolls before Karpenter provisions).
-// r[verify sched.sla.hw-class.epsilon-explore+3]
+// r[verify sched.sla.hw-class.epsilon-explore+4]
 #[tokio::test]
 async fn contract_selector_stability() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -698,7 +698,7 @@ async fn contract_metrics_once_per_miss_static_mode() {
 /// Would have caught: r1 bug_049, r2 mb_028, r3 mb_011, r3 bug_026,
 /// r3 bug_009, r5 mb_018 (the ε_h half — Option 1 covers the
 /// memo-thrash half).
-// r[verify sched.sla.hw-class.epsilon-explore+3]
+// r[verify sched.sla.hw-class.epsilon-explore+4]
 #[tokio::test]
 async fn contract_h_explore_stable_across_inputs_gen_churn() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -890,7 +890,7 @@ async fn contract_dispatch_accepts_2row_postfilter_fit() {
 /// h_all, h0 ∉ in_a={}), uses `h0` again → stuck-same. Post-fix:
 /// `resolve_h_explore` rotates on `Miss` → poll 1 commits
 /// `next=h1≠h0`, poll 2 tries `h1`, rotates to `h0` → alternates.
-// r[verify sched.sla.hw-class.epsilon-explore+3]
+// r[verify sched.sla.hw-class.epsilon-explore+4]
 #[tokio::test]
 async fn contract_pinned_explore_releases_on_infeasible() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -955,7 +955,7 @@ async fn contract_pinned_explore_releases_on_infeasible() {
 /// This test pins `h0`, masks both `(h0,*)` cells, then asserts the
 /// emitted `hw_class_names` are NOT exclusively `{h0}` — at least one
 /// cell from the unrestricted memo is offered.
-// r[verify sched.sla.hw-class.epsilon-explore+3]
+// r[verify sched.sla.hw-class.epsilon-explore+4]
 #[tokio::test]
 async fn contract_pinned_explore_routes_around_ice() {
     use crate::sla::config::CapacityType;
@@ -980,7 +980,7 @@ async fn contract_pinned_explore_routes_around_ice() {
     actor.sla_config.hw_explore_epsilon = 0.0;
     let in_a = h_of(&actor.solve_intent_for(state, &hw, &cost, ig));
     assert!(
-        in_a.len() >= 1 && !in_a.iter().all(|h| *h == h0),
+        !in_a.is_empty() && !in_a.iter().all(|h| *h == h0),
         "precondition: unrestricted A has at least one h ≠ {h0} \
          (otherwise the route-around has nowhere to go); A={in_a:?}"
     );

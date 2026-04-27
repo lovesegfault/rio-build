@@ -676,7 +676,7 @@ impl DagActor {
     /// for override/probe/explore branches — it routes through
     /// [`solve::intent_for`] (hw-agnostic `solve_mvp`) and returns an
     /// empty affinity.
-    // r[impl sched.sla.hw-class.epsilon-explore+3]
+    // r[impl sched.sla.hw-class.epsilon-explore+4]
     // r[impl sched.sla.hw-class.ice-mask]
     #[tracing::instrument(
         level = "debug",
@@ -829,19 +829,13 @@ impl DagActor {
             // to `(h_explore, *)`, and emit ITS A' if feasible. The
             // cached memo's `A` is read but never overwritten.
             //
-            // §Fourth-strike Option 2: the draw is a **pure function
-            // of `drv_hash`** for the coin, and `h_explore` itself is
-            // **pinned in the MemoEntry** — carried across `inputs_gen`
-            // churn, cleared when the pinned class graduates into A or
-            // is removed from `h_all`. `inputs_gen` now governs ONLY
-            // memo staleness, not selector identity: the next
-            // `solve_relevant_hash` projection bug becomes a perf
-            // regression instead of a selector-churn outage
-            // (`reap_stale_for_intents` reaping an explore Job
-            // mid-provisioning on a tails coin). Option 1 (quantize)
-            // makes `inputs_gen` quiet in steady state; this makes ε_h
-            // structurally indifferent to it — neither alone closes
-            // both invariants.
+            // §Fifth-strike: the pin lifecycle (draw, persist,
+            // release) is owned by `explore::resolve_h_explore` — see
+            // its doc for the full state machine. The per-drv `rng`
+            // here governs ONLY the coin (which drvs explore); the pin
+            // VALUE is seeded from `mkh ^ ovr` inside that function so
+            // it's iteration-order-independent (bug_004) and shared by
+            // every same-key drv.
             use rand::{RngExt as _, SeedableRng};
             let seed = {
                 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -851,20 +845,11 @@ impl DagActor {
             };
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
             if h_all.len() > 1 && rng.random::<f64>() < self.sla_config.hw_explore_epsilon {
-                use rand::seq::IndexedRandom;
+                use crate::sla::explore::{HExploreCtx, HExploreOutcome, resolve_h_explore};
                 let in_a: std::collections::HashSet<_> = memo
                     .as_ref()
                     .map(|m| m.a.cells.iter().map(|(h, _)| h.clone()).collect())
                     .unwrap_or_default();
-                // Graduation filter: a pinned class that has entered A
-                // (exploration succeeded — `hw_bias` learned, wins on
-                // merit) or been removed from config releases the pin
-                // so the next hit re-draws from H\A. Without this, hot
-                // pnames that never LRU-evict explore exactly one
-                // class per process lifetime and starve `hw_bias` of
-                // new-class samples. Zero extra state — `in_a` is
-                // already computed.
-                let prev_pin = prev_pin.filter(|h| h_all.contains(h) && !in_a.contains(h));
                 // Cache miss (in_a=∅) or A=H: H\A would be H or ∅ —
                 // either way ε_h would re-select the price-dominant
                 // cell. Draw from H \ {argmin price} instead so the
@@ -878,35 +863,50 @@ impl DagActor {
                 } else {
                     h_all.iter().filter(|h| !in_a.contains(*h)).collect()
                 };
-                let h_explore = prev_pin.or_else(|| pool.choose(&mut rng).map(|&h| h.clone()));
-                // Idempotent memo write — same class as the
-                // `update_entry` for `ice_exhausted`; only on edge.
-                if let Some((_, _, prev)) = &memo_entry
-                    && prev.pinned_explore != h_explore
-                {
-                    self.solve_cache
-                        .update_entry(mkh, ovr, |e| e.pinned_explore = h_explore.clone());
-                }
-                if let Some(h_explore) = &h_explore {
-                    tracing::Span::current().record("hw_explore", h_explore.as_str());
-                    if let solve::SolveFullResult::Feasible(m) = solve::solve_full(
+                let masked = self.ice.masked_cells();
+                let ctx = HExploreCtx {
+                    h_all: &h_all,
+                    in_a: &in_a,
+                    pool: &pool,
+                    masked: &masked,
+                };
+                let outcome = resolve_h_explore(prev_pin, mkh, ovr, &ctx, |h| {
+                    tracing::Span::current().record("hw_explore", h.as_str());
+                    solve::solve_full(
                         f,
                         &self.sla_tiers,
                         hw,
                         cost,
                         &self.sla_ceilings,
                         &self.sla_config,
-                        std::slice::from_ref(h_explore),
+                        std::slice::from_ref(h),
                         &std::collections::HashSet::new(),
                         // Unmemoized — gate `_hw_cost_unknown_total`
-                        // on the unrestricted memo's `was_miss` so it
-                        // fires once per (key, inputs_gen).
+                        // on the unrestricted memo's `was_miss` so
+                        // it fires once per (key, inputs_gen).
                         was_miss,
-                    ) {
-                        return Some((m, h_all.clone()));
+                    )
+                });
+                // Idempotent memo write — same class as the
+                // `update_entry` for `ice_exhausted`; only on edge.
+                let commit = |pin: &Option<String>| {
+                    if let Some((_, _, prev)) = &memo_entry
+                        && prev.pinned_explore != *pin
+                    {
+                        self.solve_cache
+                            .update_entry(mkh, ovr, |e| e.pinned_explore = pin.clone());
                     }
-                    // h_explore infeasible at every tier → abandon the
-                    // draw and fall through to the unrestricted memo.
+                };
+                match outcome {
+                    HExploreOutcome::Hit(hit) => {
+                        commit(&Some(hit.pin));
+                        return Some((hit.memo, h_all.clone()));
+                    }
+                    HExploreOutcome::Miss { next } => {
+                        commit(&next);
+                        // Fall through to the unrestricted memo. `next`
+                        // gets its one solve on the NEXT ε_h hit.
+                    }
                 }
             }
             memo.map(|m| (m, h_all.clone()))
@@ -1014,8 +1014,10 @@ impl DagActor {
                             seen
                         }
                         None => fit.as_ref().is_none_or(|f| {
+                            let ovr = solve::override_hash(override_.as_ref());
                             self.solve_cache.infeasible_static_seen(
                                 solve::model_key_hash(&f.key),
+                                ovr,
                                 solve::fit_content_hash(f),
                             )
                         }),

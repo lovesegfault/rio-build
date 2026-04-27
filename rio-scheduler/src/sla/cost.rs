@@ -853,7 +853,7 @@ pub async fn spot_price_poller(
         }
         ::metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds")
             .set(now - cost.read().price_updated_at());
-        // r[impl sched.sla.hw-class.epsilon-explore+3]
+        // r[impl sched.sla.hw-class.epsilon-explore+4]
         // Price is a solve input — the next poll's derived
         // `SolveInputs::inputs_gen` reflects the new table.
     }

@@ -10,10 +10,127 @@
 //!
 //! [`Tier::binding_bound`]: super::solve::Tier::binding_bound
 
-use super::config::SlaConfig;
+use super::config::{Cell, HwClassName, SlaConfig};
 use super::fit::headroom;
-use super::solve::DrvHints;
+use super::solve::{DrvHints, SolveFullResult, SolveMemo};
 use super::types::{DiskBytes, FittedParams, MemBytes, RawCores};
+use std::collections::HashSet;
+
+/// Per-tick hw-class landscape snapshot for ε_h exploration. Groups
+/// the inputs that are **read-only borrows of the same poll's state**
+/// — semantically distinct from the per-key `(prev, mkh, ovr)` and the
+/// `try_solve` effect. Built in `solve_intent_for`'s ε_h block (per
+/// memo-key — `in_a`/`pool` depend on the unrestricted memo's A);
+/// `h_all` and `masked` are tick-wide.
+pub struct HExploreCtx<'a> {
+    pub h_all: &'a [HwClassName],
+    pub in_a: &'a HashSet<HwClassName>,
+    pub pool: &'a [&'a HwClassName],
+    pub masked: &'a HashSet<Cell>,
+}
+
+/// `resolve_h_explore` Feasible-and-usable result. Caller commits
+/// `pinned_explore = Some(hit.pin)` and emits `hit.memo`'s A'.
+pub struct HExploreHit {
+    pub pin: HwClassName,
+    pub memo: SolveMemo,
+}
+
+/// ε_h pin state-transition outcome. Sum type — NOT `(Option, Option)`
+/// — so the "Feasible-but-committed-nothing" / "Miss-but-returned-a-
+/// memo" states are unrepresentable.
+pub enum HExploreOutcome {
+    /// `try_solve(h)` was [`SolveFullResult::Feasible`] AND not every
+    /// cell of its A' is in `masked`. Caller commits
+    /// `pinned_explore = Some(hit.pin)` and emits `hit.memo`'s A'.
+    Hit(HExploreHit),
+    /// Pre-solve release (`prev ∈ in_a` or `prev ∉ h_all`) re-drew, OR
+    /// post-solve release (infeasible / all-masked) ROTATED to the next
+    /// candidate. Caller commits `pinned_explore = next` and falls
+    /// through to the unrestricted memo. `next` is NOT solved this tick
+    /// — next tick's `prev = next` gets its one solve. `None` ⇔ pool
+    /// empty (pre-solve) or `pool \ {h_tried}` empty (post-solve).
+    Miss { next: Option<HwClassName> },
+}
+
+/// ε_h pin state transition (§Fifth-strike extraction). Draw seeded
+/// from `mkh ^ ovr` — `ovr = 0` common-case → seed = `mkh`;
+/// well-distributed; XOR collisions across distinct `(mkh, ovr)` only
+/// affect initial-draw coincidence, not storage. Iteration-order-
+/// independent: `pool` slice order does not affect the chosen `h`
+/// (`choose` indexes by `pin_rng`, and `pin_rng` is a function of the
+/// storage key alone).
+///
+/// **Deterministic, not pure**: the function is deterministic in
+/// `(prev, mkh, ovr, h_all, in_a, pool, masked, try_solve-result)`;
+/// it is NOT pure in the first seven (the eighth — `try_solve`'s
+/// return — is a load-bearing input). [`FnOnce`] is the type-level
+/// proof of "at most one solve per ε_h hit": the post-solve release
+/// path CANNOT retry this call (the closure is consumed).
+///
+/// Release semantics:
+/// - **Pre-solve** (`prev ∈ in_a`, `prev ∉ h_all`, or `prev = None`):
+///   re-draw from `pool`, THEN the one `try_solve` on the redrawn h.
+/// - **Post-solve** (`try_solve` infeasible, OR Feasible-but-all-
+///   masked): NO retry this call. Rotate: `next = pool.iter()
+///   .filter(|x| **x != h_tried).choose(&mut pin_rng)`. `pool \
+///   {h_tried} = ∅` → `next = None`.
+///
+/// Within one tick, multiple drvs sharing `(mkh, ovr)` may each call
+/// `try_solve` on the same `h` if it never commits (all see `prev =
+/// None` → same seed → same `h`). The first to reach `update_entry`
+/// commits the rotated `next`; subsequent same-tick drvs see `prev =
+/// next`. Bounded N× cost, deterministic, no correctness impact.
+// r[impl sched.sla.hw-class.epsilon-explore+4]
+pub fn resolve_h_explore(
+    prev: Option<HwClassName>,
+    mkh: u64,
+    ovr: u64,
+    ctx: &HExploreCtx<'_>,
+    try_solve: impl FnOnce(&HwClassName) -> SolveFullResult,
+) -> HExploreOutcome {
+    use rand::SeedableRng;
+    use rand::seq::IndexedRandom;
+    let mut pin_rng = rand::rngs::StdRng::seed_from_u64(mkh ^ ovr);
+    // `IndexedRandom::choose` is position-based; sort so slice order
+    // (caller's `h_all.iter().filter(..)` order, or HashMap-derived
+    // order in a future caller) does NOT leak into the pin value.
+    // |pool| ≤ |H| (config-bounded, typically <10).
+    let mut pool: Vec<&HwClassName> = ctx.pool.to_vec();
+    pool.sort_unstable();
+    // Pre-solve release: prev still valid iff Some(h) ∧ h ∈ h_all ∧
+    // h ∉ in_a. Any other state (None / graduated / config-removed)
+    // re-draws from pool BEFORE the one solve.
+    let h_to_try = match prev.filter(|h| ctx.h_all.contains(h) && !ctx.in_a.contains(h)) {
+        Some(h) => h,
+        None => match pool.choose(&mut pin_rng) {
+            Some(&h) => h.clone(),
+            None => return HExploreOutcome::Miss { next: None },
+        },
+    };
+    match try_solve(&h_to_try) {
+        SolveFullResult::Feasible(m) if !m.a.cells.iter().all(|c| ctx.masked.contains(c)) => {
+            HExploreOutcome::Hit(HExploreHit {
+                pin: h_to_try,
+                memo: m,
+            })
+        }
+        // Infeasible OR Feasible-but-all-masked: try_solve consumed →
+        // no retry. Post-solve release: rotate to a DIFFERENT pool
+        // element (same pin_rng, so the same `(mkh, ovr)`
+        // deterministically rotates to the same `next`). pool \
+        // {h_to_try} = ∅ → next = None.
+        _ => HExploreOutcome::Miss {
+            next: pool
+                .iter()
+                .filter(|&&x| *x != h_to_try)
+                .copied()
+                .collect::<Vec<_>>()
+                .choose(&mut pin_rng)
+                .map(|&h| h.clone()),
+        },
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ExploreDecision {
@@ -141,11 +258,199 @@ fn tier_target(fit: &FittedParams, cfg: &SlaConfig) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sla::config::ProbeShape;
-    use crate::sla::solve::Tier;
+    use crate::sla::config::{CapacityType, ProbeShape};
+    use crate::sla::solve::{AdmissibleSet, InfeasibleReason, Tier};
     use crate::sla::types::{
         DurationFit, ExploreState, FitDf, MemFit, ModelKey, RingNEff, WallSeconds,
     };
+
+    // ─── resolve_h_explore unit tests ────────────────────────────────────
+
+    fn h(s: &str) -> HwClassName {
+        s.to_string()
+    }
+
+    fn ctx<'a>(
+        h_all: &'a [HwClassName],
+        in_a: &'a HashSet<HwClassName>,
+        pool: &'a [&'a HwClassName],
+        masked: &'a HashSet<Cell>,
+    ) -> HExploreCtx<'a> {
+        HExploreCtx {
+            h_all,
+            in_a,
+            pool,
+            masked,
+        }
+    }
+
+    fn feasible(cells: Vec<Cell>) -> SolveFullResult {
+        SolveFullResult::Feasible(SolveMemo {
+            a: AdmissibleSet {
+                cells,
+                c_star: 4,
+                mem_bytes: 0,
+                disk_bytes: 0,
+            },
+            all_candidates: Vec::new(),
+            tier: "normal".into(),
+        })
+    }
+
+    fn besteffort() -> SolveFullResult {
+        SolveFullResult::BestEffort {
+            c: 1,
+            mem_bytes: 0,
+            disk_bytes: 0,
+            cells: Vec::new(),
+            why: InfeasibleReason::SerialFloor,
+        }
+    }
+
+    /// Records `try_solve`'s argument (the chosen `h_to_try`) and
+    /// returns `result`. For asserting on which h was picked.
+    fn recording(
+        result: SolveFullResult,
+    ) -> (
+        std::rc::Rc<std::cell::Cell<Option<HwClassName>>>,
+        impl FnOnce(&HwClassName) -> SolveFullResult,
+    ) {
+        let slot = std::rc::Rc::new(std::cell::Cell::new(None));
+        let s = slot.clone();
+        (slot, move |h: &HwClassName| {
+            s.set(Some(h.clone()));
+            result
+        })
+    }
+
+    /// **bug_004 falsification** — pin VALUE seeded from `mkh ^ ovr`,
+    /// independent of `pool` slice order. Same `(prev=None, mkh, ovr)`
+    /// with `pool=[a,b,c]` vs `pool=[c,a,b]` MUST pick the same h.
+    /// Pre-R6B5 the value was `pool.choose(&mut per-drv-rng)` —
+    /// HashMap iteration order leaked into the pin.
+    #[test]
+    fn resolve_pool_permutation_independent() {
+        let h_all = [h("a"), h("b"), h("c")];
+        let in_a = HashSet::new();
+        let masked = HashSet::new();
+        let p1 = [&h_all[0], &h_all[1], &h_all[2]];
+        let p2 = [&h_all[2], &h_all[0], &h_all[1]];
+        for (mkh, ovr) in [(7u64, 0u64), (0xdead_beef, 0), (42, 1234)] {
+            let (rec1, ts1) = recording(feasible(vec![(h("a"), CapacityType::Spot)]));
+            let (rec2, ts2) = recording(feasible(vec![(h("a"), CapacityType::Spot)]));
+            let _ = resolve_h_explore(None, mkh, ovr, &ctx(&h_all, &in_a, &p1, &masked), ts1);
+            let _ = resolve_h_explore(None, mkh, ovr, &ctx(&h_all, &in_a, &p2, &masked), ts2);
+            assert_eq!(
+                rec1.take(),
+                rec2.take(),
+                "pool order [a,b,c] vs [c,a,b] picked different h at \
+                 (mkh={mkh:#x}, ovr={ovr}) — pin VALUE must be \
+                 iteration-order-independent (bug_004)"
+            );
+        }
+    }
+
+    /// **mb_011-A** — `try_solve` infeasible → `Miss{next}` where
+    /// `next ∈ pool \ {h_tried}`. NOT stuck on the infeasible h.
+    #[test]
+    fn resolve_besteffort_rotates() {
+        let h_all = [h("h1"), h("h2")];
+        let in_a = HashSet::new();
+        let masked = HashSet::new();
+        let pool = [&h_all[0], &h_all[1]];
+        let (rec, ts) = recording(besteffort());
+        let out = resolve_h_explore(None, 99, 0, &ctx(&h_all, &in_a, &pool, &masked), ts);
+        let h_tried = rec.take().expect("try_solve called");
+        match out {
+            HExploreOutcome::Miss { next: Some(n) } => {
+                assert_ne!(
+                    n, h_tried,
+                    "infeasible → rotate to pool\\{{h_tried}}; got next={n} == h_tried"
+                );
+                assert!(pool.contains(&&n), "rotated next ∈ pool");
+            }
+            HExploreOutcome::Miss { next: None } => {
+                panic!("pool.len()=2 → pool\\{{h_tried}} non-empty → next=Some")
+            }
+            HExploreOutcome::Hit(_) => panic!("BestEffort → Miss, not Hit"),
+        }
+    }
+
+    /// **mb_011-B** — Feasible but every cell ICE-masked → `Miss`.
+    /// Caller routes around via the unrestricted memo instead of
+    /// emitting known-unfulfillable cells.
+    #[test]
+    fn resolve_all_masked_is_miss() {
+        let h_all = [h("h1"), h("h2")];
+        let in_a = HashSet::new();
+        let c1: Cell = (h("h1"), CapacityType::Spot);
+        let c2: Cell = (h("h1"), CapacityType::Od);
+        let masked: HashSet<Cell> = [c1.clone(), c2.clone()].into();
+        let pool = [&h_all[0], &h_all[1]];
+        // Force `prev=Some(h1)` so try_solve targets h1 (whose cells
+        // are masked) regardless of which the seed would draw.
+        let out = resolve_h_explore(
+            Some(h("h1")),
+            0,
+            0,
+            &ctx(&h_all, &in_a, &pool, &masked),
+            |_| feasible(vec![c1.clone(), c2.clone()]),
+        );
+        match out {
+            HExploreOutcome::Miss { next } => {
+                assert_eq!(
+                    next.as_deref(),
+                    Some("h2"),
+                    "all-masked → rotate to pool\\{{h1}} = {{h2}}"
+                );
+            }
+            HExploreOutcome::Hit(_) => {
+                panic!("Feasible-but-all-masked → Miss (route around), not Hit")
+            }
+        }
+        // Control: one cell unmasked → Hit.
+        let masked: HashSet<Cell> = [c1.clone()].into();
+        let out = resolve_h_explore(
+            Some(h("h1")),
+            0,
+            0,
+            &ctx(&h_all, &in_a, &pool, &masked),
+            |_| feasible(vec![c1.clone(), c2.clone()]),
+        );
+        assert!(
+            matches!(out, HExploreOutcome::Hit(_)),
+            "one unmasked cell → Hit"
+        );
+    }
+
+    /// Singleton pool, infeasible → `Miss{next: None}`. Exhausted —
+    /// caller commits `pinned_explore = None` so the next ε_h hit
+    /// re-evaluates pool from scratch.
+    #[test]
+    fn resolve_singleton_pool_exhausted() {
+        let h_all = [h("only")];
+        let in_a = HashSet::new();
+        let masked = HashSet::new();
+        let pool = [&h_all[0]];
+        let out = resolve_h_explore(None, 5, 0, &ctx(&h_all, &in_a, &pool, &masked), |_| {
+            besteffort()
+        });
+        match out {
+            HExploreOutcome::Miss { next: None } => {}
+            HExploreOutcome::Miss { next: Some(n) } => {
+                panic!("pool\\{{only}}=∅ → next=None; got Some({n})")
+            }
+            HExploreOutcome::Hit(_) => panic!("BestEffort → Miss"),
+        }
+        // And empty pool (prev=None) → Miss{None} without calling
+        // try_solve at all.
+        let (rec, ts) = recording(feasible(vec![]));
+        let out = resolve_h_explore(None, 5, 0, &ctx(&h_all, &in_a, &[], &masked), ts);
+        assert!(matches!(out, HExploreOutcome::Miss { next: None }));
+        assert!(rec.take().is_none(), "empty pool → try_solve not called");
+    }
+
+    // ─── Algorithm-2 ladder tests ────────────────────────────────────────
 
     fn cfg() -> SlaConfig {
         SlaConfig {

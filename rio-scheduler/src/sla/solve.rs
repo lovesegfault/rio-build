@@ -1023,15 +1023,13 @@ pub struct MemoEntry {
     /// fallback today — so this field is the with-memo half of the
     /// anchor; the no-memo half is [`SolveCache::infeasible_static_seen`].
     pub last_infeasible_fh: Option<u64>,
-    /// §Fourth-strike Option 2: ε_h's `h_explore` pin, **decoupled from
-    /// `inputs_gen`**. Drawn once at first ε_h hit for `(mkh, ovr)`,
-    /// carried across staleness misses (like `prev_a`), cleared when the
-    /// pinned class graduates into A or is removed from `h_all`. The ε_h
-    /// seed is now `hash(drv_hash)` ONLY — `inputs_gen` governs memo
-    /// staleness, not selector identity, so the next `solve_relevant_hash`
-    /// projection bug is a perf regression instead of a selector-churn
-    /// outage (`reap_stale_for_intents` reaping an explore Job mid-
-    /// provisioning).
+    /// §Fifth-strike: ε_h's `h_explore` pin, **decoupled from
+    /// `inputs_gen`**. Lifecycle owned by [`super::explore::resolve_h_explore`]
+    /// — the ε_h coin is `hash(drv_hash)`-seeded (which drvs explore);
+    /// the pin VALUE is `mkh ^ ovr`-seeded (iteration-order-
+    /// independent). Carried across staleness misses (like `prev_a`),
+    /// released on graduation into A, removal from `h_all`, OR
+    /// `solve_full({h})` infeasible / fully ICE-masked.
     pub pinned_explore: Option<HwClassName>,
 }
 
@@ -1059,16 +1057,16 @@ pub struct MemoEntry {
 #[derive(Debug, Default)]
 pub struct SolveCache {
     entries: DashMap<u64, HashMap<u64, MemoEntry>>,
-    /// R5B3 no-memo half: `mkh → last fit_content_hash` for which
-    /// `intent_for`'s `_infeasible_total` was emitted. Drvs that
+    /// R5B3 no-memo half: `mkh → ovr → last fit_content_hash` for
+    /// which `intent_for`'s `_infeasible_total` was emitted. Drvs that
     /// pre-gate fail (`hw_cost_source=None` / `hw_classes={}` / FOD /
     /// featured / serial / forced-tier override) never call
     /// [`Self::get_or_insert_with`], so [`MemoEntry::last_infeasible_fh`]
-    /// can't anchor them; THIS does. Keyed `mkh` only — overrides that
-    /// reach `intent_for`'s emit (tier-pin without `forced_cores`)
-    /// share one `fh` per fit, so per-override granularity adds nothing.
-    /// Swept by [`Self::remove_model_key`].
-    infeasible_static_fh: DashMap<u64, u64>,
+    /// can't anchor them; THIS does. Keyed `(mkh, ovr)` — same shape
+    /// as `entries` — because `intent_for`'s emit decision depends on
+    /// `override_.tier`, which is NOT in `fh` (bug_003). Swept by
+    /// [`Self::remove_model_key`] (drops the inner map; O(1)).
+    infeasible_static_fh: DashMap<u64, HashMap<u64, u64>>,
 }
 
 impl SolveCache {
@@ -1145,14 +1143,19 @@ impl SolveCache {
         }
     }
 
-    /// R5B3 no-memo anchor: returns `true` (suppress) if `mkh`'s
-    /// last-recorded `fit_content_hash` equals `fh`; otherwise records
-    /// `fh` and returns `false` (emit). Safe to record on a
-    /// non-emitting call: `intent_for` is deterministic in `fh`, so if
-    /// it didn't emit at `fh` once it never will.
-    pub fn infeasible_static_seen(&self, mkh: u64, fh: u64) -> bool {
-        use dashmap::Entry;
-        match self.infeasible_static_fh.entry(mkh) {
+    /// R5B3 no-memo anchor: returns `true` (suppress) if `(mkh,
+    /// ovr)`'s last-recorded `fit_content_hash` equals `fh`; otherwise
+    /// records `fh` and returns `false` (emit). Keyed `(mkh, ovr)` —
+    /// `intent_for`'s emit at L454-461 is gated on `tiers.iter()
+    /// .any(|t| t.p*.is_some())` which `override_.tier` filters at
+    /// L440-445, so the same `fh` may emit under one override and not
+    /// another (bug_003: the with-memo sibling
+    /// [`MemoEntry::last_infeasible_fh`] was already `(mkh, ovr)`-
+    /// keyed for exactly this reason).
+    pub fn infeasible_static_seen(&self, mkh: u64, ovr: u64, fh: u64) -> bool {
+        use std::collections::hash_map::Entry;
+        let mut inner = self.infeasible_static_fh.entry(mkh).or_default();
+        match inner.entry(ovr) {
             Entry::Occupied(e) if *e.get() == fh => true,
             Entry::Occupied(mut e) => {
                 *e.get_mut() = fh;
@@ -2444,11 +2447,19 @@ mod tests {
             be(p)
         });
         // R5B3: infeasible_static_seen swept by remove_model_key.
-        assert!(!cache.infeasible_static_seen(mk, fh), "first: emit");
-        assert!(cache.infeasible_static_seen(mk, fh), "same fh: suppress");
-        assert!(!cache.infeasible_static_seen(mk, fh2), "refit: re-arm");
+        assert!(!cache.infeasible_static_seen(mk, 0, fh), "first: emit");
+        assert!(cache.infeasible_static_seen(mk, 0, fh), "same fh: suppress");
+        assert!(!cache.infeasible_static_seen(mk, 0, fh2), "refit: re-arm");
+        // bug_003: same (mkh, fh) under a DIFFERENT ovr is fresh —
+        // `intent_for`'s emit decision depends on `override_.tier`.
+        assert!(!cache.infeasible_static_seen(mk, 7, fh2), "fresh ovr: emit");
+        assert!(
+            cache.infeasible_static_seen(mk, 7, fh2),
+            "same ovr: suppress"
+        );
         cache.remove_model_key(mk);
-        assert!(!cache.infeasible_static_seen(mk, fh2), "swept");
+        assert!(!cache.infeasible_static_seen(mk, 0, fh2), "swept");
+        assert!(!cache.infeasible_static_seen(mk, 7, fh2), "all ovr swept");
     }
 
     /// bug_012: `hw_factor_for` reads `fit.hw_bias[h]`; `fit_content_hash`
