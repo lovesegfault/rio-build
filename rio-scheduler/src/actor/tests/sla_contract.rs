@@ -809,3 +809,65 @@ async fn contract_h_explore_stable_across_inputs_gen_churn() {
         "re-drawn pin is stable"
     );
 }
+
+/// **R6B4 / bug_012** — `FittedParams.n_eff` was changed to the
+/// post-p̄-filter value (correct for `z_q`), but the dispatch gates at
+/// `snapshot.rs:778` + `solve.rs:413` still test `< 3.0` with
+/// PRE-filter calibration. A Capped fit with 5 ring samples but only 2
+/// surviving the p̄ collinearity drop is a VALID fit (the comment at
+/// ingest.rs:299-305 says so explicitly: "a 2-row post-filter fit gets
+/// the widest prediction interval rather than being rejected outright")
+/// — yet both gates reject it and dispatch at explore-ladder size.
+///
+/// This test seeds exactly that fit and asserts the actor dispatches
+/// via `solve_full` (`node_affinity` non-empty) at `c* ≤ p̄`, NOT via
+/// `explore::next` at `max_c`. Red on e23e1d1f: `n_eff=2.0 < 3.0` →
+/// gate rejects → explore returns `max_c=32`, `node_affinity=[]`.
+#[tokio::test]
+async fn contract_dispatch_accepts_2row_postfilter_fit() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+
+    // Capped fit, p̄=8: ring had 5 samples at c∈{4,8,16,32,32} (pre-
+    // filter n_eff≈5, span=8), p̄ filter kept only c≤8 → 2 post-filter
+    // rows → stored `n_eff` is the post-filter `2.0`. ExploreState
+    // `max_c=32, min_c=4` so `frozen()` (span≥4) → explore would
+    // dispatch at 32.
+    let mut fit = make_fit("capped-2row");
+    fit.fit = crate::sla::types::DurationFit::Capped {
+        s: crate::sla::types::RefSeconds(30.0),
+        p: crate::sla::types::RefSeconds(2000.0),
+        p_bar: crate::sla::types::RawCores(8.0),
+    };
+    fit.n_eff = 2.0;
+    fit.n_distinct_c = 2;
+    fit.sum_w = 2.0;
+    fit.span = 8.0;
+    fit.explore = crate::sla::types::ExploreState {
+        distinct_c: 5,
+        min_c: crate::sla::types::RawCores(4.0),
+        max_c: crate::sla::types::RawCores(32.0),
+        saturated: false,
+        last_wall: crate::sla::types::WallSeconds(280.0),
+    };
+    actor.sla_estimator.seed(fit);
+    actor.test_inject_ready("d-2row", Some("capped-2row"), "x86_64-linux", false);
+
+    let state = actor.dag.node("d-2row").unwrap();
+    let (hw, cost, ig) = actor.solve_inputs();
+    let intent = actor.solve_intent_for(state, &hw, &cost, ig);
+
+    assert!(
+        !intent.node_affinity.is_empty(),
+        "Capped fit with 2 post-filter rows MUST reach `solve_full` \
+         (non-Probe ⟹ n_eff_ring≥3 ∧ span≥4 already held at \
+         ingest.rs:306). Got node_affinity=[] → snapshot.rs gate \
+         rejected on post-filter n_eff and fell through to intent_for."
+    );
+    assert!(
+        intent.cores <= 8,
+        "fit-derived dispatch MUST respect p̄=8; got cores={} — \
+         explore-ladder dispatched at max_c instead of c*≤p̄",
+        intent.cores
+    );
+}
