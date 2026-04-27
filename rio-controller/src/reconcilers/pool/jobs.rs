@@ -73,15 +73,6 @@ pub(crate) const INTENT_SELECTOR_ANNOTATION: &str = "rio.build/intent-selector";
 /// (annotation absent → skip K=3, only the scalar `alu` probe runs).
 pub(crate) const HW_BENCH_NEEDED_ANNOTATION: &str = "rio.build/hw-bench-needed";
 
-/// `cross_tenant_median`'s per-dim `min_tenants` gate floor — the
-/// bench-needed gate over-benches at most until every `(h, d)` pair
-/// reaches this many distinct tenants. bug_013: counting pods (or
-/// tenants per-row) let one tenant writing K=3 to a foreign hw_class
-/// satisfy the threshold and capture that class's membw/ioseq median.
-/// `HwTable::factor` ignores under-threshold dims so duplicate benches
-/// before then are harmless.
-pub(crate) const HW_BENCH_SAMPLE_THRESHOLD: u32 = 3;
-
 /// Log + scratch budget. nix `build-dir` lands in the overlay emptyDir
 /// (nix ≥2.30 default = stateDir/builds), but stdout/stderr capture and
 /// the daemon's own state live outside. 1 GiB headroom.
@@ -124,6 +115,7 @@ pub(super) fn hw_classes_in(intent: &SpawnIntent) -> impl Iterator<Item = String
 }
 
 /// Per-tick `HwClassSampled` snapshot: `h → [distinct-tenant; K]`
+/// plus the scheduler's `trust_threshold` (= `FLEET_MEDIAN_MIN_TENANTS`)
 /// from the scheduler's `HwTable` (~60s stale at worst). One RPC per
 /// pool-reconcile tick covers every intent — the request is the union
 /// of `hw_classes_in` over all intents this tick.
@@ -135,7 +127,16 @@ pub(super) fn hw_classes_in(intent: &SpawnIntent) -> impl Iterator<Item = String
 /// mem-floor gate keeps STREAM's ~4.6 GiB working set off small pods
 /// regardless.
 #[derive(Default)]
-pub(crate) struct HwSampledCache(HashMap<String, rio_proto::types::HwDimCounts>);
+pub(crate) struct HwSampledCache {
+    sampled: HashMap<String, rio_proto::types::HwDimCounts>,
+    /// `cross_tenant_median`'s per-dim `min_tenants` gate floor — the
+    /// scheduler's `FLEET_MEDIAN_MIN_TENANTS`, carried in the response
+    /// so unit, granularity, AND value share one source of truth.
+    /// merged_bug_001: a controller-side hardcoded `3` left a 3..5
+    /// dead band where the controller stopped K=3-benching but the
+    /// scheduler still pinned `factor=[1.0;K]` — calibration deadlock.
+    trust_threshold: u32,
+}
 
 impl HwSampledCache {
     /// One `HwClassSampled` RPC for the given (deduped) classes.
@@ -152,7 +153,18 @@ impl HwSampledCache {
         ))
         .await
         {
-            Ok(r) => Self(r.into_inner().sampled_count),
+            Ok(r) => {
+                let r = r.into_inner();
+                Self {
+                    sampled: r.sampled_count,
+                    // Field absent ⇒ old-scheduler skew. Fall back to
+                    // the new-scheduler value (5): over-benches the
+                    // 3..5 band rather than reintroducing the deadlock.
+                    // `HwTable::factor` ignores under-threshold dims so
+                    // duplicate benches before then are harmless.
+                    trust_threshold: r.trust_threshold.unwrap_or(5),
+                }
+            }
             Err(e) => {
                 warn!(error = %e, "HwClassSampled poll failed; treating all as undersampled");
                 Self::default()
@@ -160,35 +172,38 @@ impl HwSampledCache {
         }
     }
 
-    /// `∃ h ∈ A, ∃ d ∈ K : tenants_with_dim(h, d) <
-    /// HW_BENCH_SAMPLE_THRESHOLD`. `A = ∅` (no `node_affinity`) is
-    /// vacuously false — the actual `h` is unknown until
-    /// kube-scheduler bind, so the create-time check cannot be
-    /// applied; the builder still runs the scalar `alu` probe.
-    /// Unknown `h` (or empty `per_dim` — proto default) reads as
-    /// under-threshold. bug_013: the per-dim quantifier mirrors
-    /// `cross_tenant_median`'s gate so honest pods K=3-bench until
-    /// EVERY dim has ≥3 tenants, denying single-tenant capture.
+    /// `∃ h ∈ A, ∃ d ∈ K : tenants_with_dim(h, d) < trust_threshold`.
+    /// `A = ∅` (no `node_affinity`) is vacuously false — the actual
+    /// `h` is unknown until kube-scheduler bind, so the create-time
+    /// check cannot be applied; the builder still runs the scalar
+    /// `alu` probe. Unknown `h` (or empty `per_dim` — proto default)
+    /// reads as under-threshold. bug_013: the per-dim quantifier
+    /// mirrors `cross_tenant_median`'s gate so honest pods K=3-bench
+    /// until EVERY dim has ≥`trust_threshold` tenants, denying
+    /// single-tenant capture.
     pub(crate) fn any_under_threshold<I>(&self, a: I) -> bool
     where
         I: IntoIterator<Item = String>,
     {
         a.into_iter().any(|h| {
-            self.0
+            self.sampled
                 .get(&h)
                 .filter(|c| !c.per_dim.is_empty())
-                .is_none_or(|c| c.per_dim.iter().any(|&n| n < HW_BENCH_SAMPLE_THRESHOLD))
+                .is_none_or(|c| c.per_dim.iter().any(|&n| n < self.trust_threshold))
         })
     }
 
-    /// Test-only constructor: per-hw_class K=3 distinct-tenant counts.
+    /// Test-only constructor: per-hw_class K=3 distinct-tenant counts
+    /// + the threshold to compare against.
     #[cfg(test)]
-    pub(crate) fn from_map(m: HashMap<String, [u32; 3]>) -> Self {
-        Self(
-            m.into_iter()
+    pub(crate) fn from_parts(m: HashMap<String, [u32; 3]>, trust_threshold: u32) -> Self {
+        Self {
+            sampled: m
+                .into_iter()
                 .map(|(h, n)| (h, rio_proto::types::HwDimCounts { per_dim: n.into() }))
                 .collect(),
-        )
+            trust_threshold,
+        }
     }
 }
 
@@ -251,7 +266,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     let queued = intents.len().min(u32::MAX as usize) as u32;
 
     // ---- HwClassSampled (per-tick, one RPC for the union of A's) ----
-    // r[impl ctrl.pool.hw-bench-needed]
+    // r[impl ctrl.pool.hw-bench-needed+2]
     let hw_sampled =
         HwSampledCache::fetch(ctx, intents.iter().flat_map(hw_classes_in).collect()).await;
 
@@ -740,7 +755,7 @@ pub(super) fn build_job(
         ephemeral_deadline(intent),
         pod_spec,
     );
-    // r[impl ctrl.pool.hw-bench-needed]
+    // r[impl ctrl.pool.hw-bench-needed+2]
     // ADR-023 §13a bench gate: (a) `mem ≥ hw_bench_mem_floor` so
     // STREAM's ~4.6 GiB working set cannot OOM a `preferLocalBuild`/
     // fetcher pod; AND (b) any `h ∈ A` is under the `hw_perf_factors`
@@ -825,7 +840,7 @@ fn apply_intent_resources(pod_spec: &mut PodSpec, pool: &Pool, i: &SpawnIntent) 
         "RIO_DAEMON_TIMEOUT_SECS",
         &worker_timeout.to_string(),
     ));
-    // r[impl ctrl.pool.hw-bench-needed]
+    // r[impl ctrl.pool.hw-bench-needed+2]
     // Downward-API env var for `rio.build/hw-bench-needed`. The
     // annotation is stamped at pod-CREATE time by `build_job` (above on
     // the call stack), so the env-var form's resolve-once-at-container-

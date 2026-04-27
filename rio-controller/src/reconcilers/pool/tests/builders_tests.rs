@@ -624,9 +624,9 @@ fn pod_gets_node_affinity_from_intent() {
     );
 }
 
-// r[verify ctrl.pool.hw-bench-needed]
+// r[verify ctrl.pool.hw-bench-needed+2]
 /// `rio.build/hw-bench-needed` is `"true"` iff `mem_bytes ≥ floor`
-/// AND any `h ∈ A` has `< 3` distinct pod_id benches per
+/// AND any `h ∈ A` has `< trust_threshold` distinct tenants per
 /// `HwClassSampled`. Exposed to the builder as `RIO_HW_BENCH_NEEDED`
 /// via a downward-API env (annotation is create-time, so no
 /// `run_pod_annotator` race).
@@ -658,15 +658,18 @@ fn pod_gets_hw_bench_needed_when_any_h_undersampled() {
     // hw_classes_in reads `intent.hw_class_names` directly — the
     // operator's `$h` keys, not a derived 4-tuple string. bug_013:
     // counts are per-dim distinct-tenant; `intel-8-hi` has 5 alu
-    // tenants but 1 membw/ioseq → still undersampled (∃d < 3).
-    let cache = jobs::HwSampledCache::from_map(HashMap::from([
-        ("intel-8-hi".into(), [5u32, 1, 1]), // undersampled (membw/ioseq)
-        ("intel-7-mid".into(), [5u32, 5, 5]), // trusted in all K dims
-    ]));
+    // tenants but 1 membw/ioseq → still undersampled (∃d < threshold).
+    let cache = jobs::HwSampledCache::from_parts(
+        HashMap::from([
+            ("intel-8-hi".into(), [5u32, 1, 1]), // undersampled (membw/ioseq)
+            ("intel-7-mid".into(), [5u32, 5, 5]), // trusted in all K dims
+        ]),
+        5,
+    );
     let a_mixed = vec!["intel-7-mid".into(), "intel-8-hi".into()];
     let a_trusted = vec!["intel-7-mid".into()];
 
-    // (a) mem ≥ floor ∧ any h<3 → true.
+    // (a) mem ≥ floor ∧ any h<threshold → true.
     let job = build_job_with(&intent(16 * GIB, a_mixed.clone()), &cache, 8 * GIB);
     assert_eq!(bench_ann(&job).as_deref(), Some("true"));
     // Downward-API env wired (resolved by kubelet from the annotation).
@@ -693,7 +696,7 @@ fn pod_gets_hw_bench_needed_when_any_h_undersampled() {
     let job = build_job_with(&intent(4 * GIB, a_mixed.clone()), &cache, 8 * GIB);
     assert_eq!(bench_ann(&job).as_deref(), Some("false"));
 
-    // (c) all h ≥ 3 → false (no need to re-bench trusted classes).
+    // (c) all h ≥ threshold → false (no need to re-bench trusted classes).
     let job = build_job_with(&intent(16 * GIB, a_trusted), &cache, 8 * GIB);
     assert_eq!(bench_ann(&job).as_deref(), Some("false"));
 
@@ -709,6 +712,43 @@ fn pod_gets_hw_bench_needed_when_any_h_undersampled() {
         8 * GIB,
     );
     assert_eq!(bench_ann(&job).as_deref(), Some("true"));
+}
+
+// r[verify ctrl.pool.hw-bench-needed+2]
+/// merged_bug_001: `any_under_threshold` compares against
+/// `HwClassSampledResponse.trust_threshold` (the scheduler's
+/// `FLEET_MEDIAN_MIN_TENANTS`), NOT a controller-side hardcoded `3`.
+/// `[3,3,3]` at `threshold=5` is undersampled — exactly the 3..5 dead
+/// band that deadlocked calibration. Field-absent (old-scheduler skew)
+/// falls back to `5`, so the dead band is closed in either direction.
+#[test]
+fn any_under_threshold_uses_response_value() {
+    use std::collections::HashMap;
+    let m = |per_dim: [u32; 3]| HashMap::from([("h".to_string(), per_dim)]);
+    let a = || std::iter::once("h".to_string());
+
+    // (a) [3,3,3] at threshold=5 → true (the merged_bug_001 dead band).
+    assert!(jobs::HwSampledCache::from_parts(m([3, 3, 3]), 5).any_under_threshold(a()));
+    // (b) [5,5,5] at threshold=5 → false (every dim satisfied).
+    assert!(!jobs::HwSampledCache::from_parts(m([5, 5, 5]), 5).any_under_threshold(a()));
+    // (c) [4,5,5] at threshold=5 → true (per-dim quantifier; bug_013).
+    assert!(jobs::HwSampledCache::from_parts(m([4, 5, 5]), 5).any_under_threshold(a()));
+    // (d) Field-absent skew: `unwrap_or(5)` → [3,3,3] still undersampled.
+    //     The `fetch` path applies the fallback; assert via a raw
+    //     proto response so the `Option<u32>` → `u32` mapping is
+    //     covered, not just the post-unwrap arithmetic.
+    let resp = rio_proto::types::HwClassSampledResponse {
+        sampled_count: m([3, 3, 3])
+            .into_iter()
+            .map(|(h, n)| (h, rio_proto::types::HwDimCounts { per_dim: n.into() }))
+            .collect(),
+        trust_threshold: None,
+    };
+    let cache = jobs::HwSampledCache::from_parts(
+        HashMap::from([("h".to_string(), [3, 3, 3])]),
+        resp.trust_threshold.unwrap_or(5),
+    );
+    assert!(cache.any_under_threshold(a()));
 }
 
 /// ADR-023 §13a ship-standalone gate: forecast (`!ready`) intents are

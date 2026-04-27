@@ -743,7 +743,14 @@ impl AdminService for AdminServiceImpl {
             .into_iter()
             .map(|(h, n)| (h, rio_proto::types::HwDimCounts { per_dim: n.into() }))
             .collect();
-        Ok(Response::new(HwClassSampledResponse { sampled_count }))
+        Ok(Response::new(HwClassSampledResponse {
+            sampled_count,
+            // merged_bug_001: single source of truth — the controller's
+            // bench-needed gate compares against THIS, not a duplicated
+            // constant. r3 R3B5 reconciled unit+granularity but left
+            // value at 3; the scheduler's gate is 5.
+            trust_threshold: Some(crate::sla::FLEET_MEDIAN_MIN_TENANTS as u32),
+        }))
     }
 
     /// ADR-023 §13a: read-only dump of `[sla.hw_classes]` (h → label

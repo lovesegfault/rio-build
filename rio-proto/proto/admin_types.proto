@@ -586,10 +586,18 @@ message HwClassSampledResponse {
   // tenants) per-row reopens the per-dim capture threat — one tenant
   // spawning 3 pods writing K=3 to a foreign hw_class would mark
   // `bench_needed=false` there and become the sole `Some(membw)`
-  // contributor. The threshold mirrors `FLEET_MEDIAN_MIN_TENANTS`'s
-  // unit (tenants) and granularity (per-dim). Controller checks
-  // `∃h ∃d: per_dim[d] < 3`.
+  // contributor. Controller checks `∃h ∃d: per_dim[d] < trust_threshold`.
   map<string, HwDimCounts> sampled_count = 1;
+  // The scheduler's `FLEET_MEDIAN_MIN_TENANTS` gate value — same unit
+  // (tenants), granularity (per-dim), AND value as the
+  // `cross_tenant_median` floor that decides whether `factor[d]` is
+  // trusted. merged_bug_001: a controller-side hardcoded `3` left a
+  // 3..5 dead band where the controller stopped K=3-benching but the
+  // scheduler still pinned `factor=[1.0;K]` — calibration deadlock.
+  // `optional` so old-scheduler/new-controller skew is detectable
+  // (proto3 default `0` would make `n < 0` always false → never bench);
+  // controller falls back to the new-scheduler value on absence.
+  optional uint32 trust_threshold = 2;
 }
 
 // ───────────────────────────────────────────────────────────────────────────

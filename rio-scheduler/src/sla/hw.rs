@@ -136,9 +136,11 @@ impl HwTable {
     /// Per-dimension distinct-tenant count for `hw_class`: how many
     /// `submitting_tenant` buckets contributed ≥1 `Some(d)` row.
     /// `[0; K]` for an unknown class. For the `HwClassSampled`
-    /// handler — the controller's `bench_needed = ∃d: count[d] < 3`
-    /// mirrors `cross_tenant_median`'s per-dim `min_tenants` gate
-    /// (bug_013: same unit, same granularity).
+    /// handler — the controller's `bench_needed = ∃d: count[d] <
+    /// trust_threshold` mirrors `cross_tenant_median`'s per-dim
+    /// `min_tenants` gate (bug_013: same unit, same granularity;
+    /// merged_bug_001: same VALUE — `trust_threshold` is
+    /// `FLEET_MEDIAN_MIN_TENANTS` shipped over the wire).
     pub fn distinct_tenants_per_dim(&self, hw_class: &str) -> [u32; K] {
         self.factors
             .get(hw_class)

@@ -138,7 +138,11 @@ const FLEET_MEDIAN_MIN_KEYS: usize = 50;
 /// tenant's median — not a fleet aggregate. Below this fall through to
 /// [`prior::PriorSource::Operator`]. ADR-023 §Threat-model gap (b)
 /// raised 2→5: with 2 tenants the "fleet median" IS one of them.
-pub(super) const FLEET_MEDIAN_MIN_TENANTS: usize = 5;
+/// `pub(crate)` so the [`crate::admin`] `HwClassSampled` handler can
+/// emit it as `trust_threshold` — the controller's bench-needed gate
+/// must compare against THIS value, not a duplicated constant
+/// (merged_bug_001: a controller-side `3` left a 3..5 dead band).
+pub(crate) const FLEET_MEDIAN_MIN_TENANTS: usize = 5;
 
 /// Cache of per-`ModelKey` [`FittedParams`](types::FittedParams). The
 /// dispatch path reads via [`Self::cached`] (lock-free clone of one

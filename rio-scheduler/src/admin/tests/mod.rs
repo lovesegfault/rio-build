@@ -485,6 +485,29 @@ async fn read_path_rpcs_require_service_token() {
     );
 }
 
+/// merged_bug_001: `HwClassSampledResponse.trust_threshold` is the
+/// scheduler's `FLEET_MEDIAN_MIN_TENANTS` — single source of truth so
+/// the controller's bench-needed gate compares against the SAME value
+/// `cross_tenant_median` gates on. r3 R3B5 reconciled unit+granularity
+/// but left the controller-side constant at `3` (vs `5` here),
+/// deadlocking calibration in the 3..5 band. The
+/// `fleet_median_min_tenants_is_5` tripwire (sla/hw.rs) guards the
+/// value; this guards the wiring.
+#[tokio::test]
+async fn bench_threshold_is_fleet_min_tenants() -> anyhow::Result<()> {
+    let (svc, _actor, _task, _db) = setup_svc_default().await;
+    let resp = svc
+        .hw_class_sampled(Request::new(HwClassSampledRequest::default()))
+        .await?
+        .into_inner();
+    assert_eq!(
+        resp.trust_threshold,
+        Some(crate::sla::FLEET_MEDIAN_MIN_TENANTS as u32),
+        "HwClassSampled.trust_threshold must emit FLEET_MEDIAN_MIN_TENANTS"
+    );
+    Ok(())
+}
+
 /// Exhaustive gate-coverage: every `AdminService` RPC is in exactly one
 /// of [`SERVICE_GATED`] / [`UNGATED_PUBLIC`], and no `UNGATED_PUBLIC`
 /// response type transitively contains a credential-shaped field.
