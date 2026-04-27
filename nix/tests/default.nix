@@ -245,6 +245,7 @@ let
   composefs-spike-scale = import ./scenarios/composefs-spike-scale.nix;
   composefs-spike-stream = import ./scenarios/composefs-spike-stream.nix;
   composefs-spike-priv = import ./scenarios/composefs-spike-priv.nix;
+  spike-fuse-negdentry = import ./scenarios/spike-fuse-negdentry.nix;
 in
 {
   # ── nixos-node AMI bootstrap (mocked IMDS, no AWS) ────────────────────
@@ -264,6 +265,7 @@ in
   vm-composefs-spike-scale = composefs-spike-scale { inherit pkgs rio-workspace; };
   vm-composefs-spike-stream = composefs-spike-stream { inherit pkgs rio-workspace; };
   vm-composefs-spike-priv = composefs-spike-priv { inherit pkgs rio-workspace; };
+  vm-spike-fuse-negdentry = spike-fuse-negdentry { inherit pkgs rio-workspace; };
 
   # r[verify gw.conn.exit-status]
   #   nom-exit subtest: client ssh_config has ControlMaster auto +
