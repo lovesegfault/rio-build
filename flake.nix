@@ -964,6 +964,7 @@
                 "vm-composefs-spike-scale"
                 "vm-composefs-spike-stream"
                 "vm-composefs-spike-priv"
+                "vm-spike-fuse-negdentry"
                 # Lix client variant: rio-side coverage is identical to
                 # vm-protocol-warm-standalone (only the client differs,
                 # and the client isn't instrumented). Excluding keeps

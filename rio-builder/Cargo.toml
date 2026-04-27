@@ -24,6 +24,10 @@ path = "src/bin/spike_mountd.rs"
 name = "spike_stream_fuse"
 path = "src/bin/spike_stream_fuse.rs"
 
+[[bin]]
+name = "spike_negdentry_fuse"
+path = "src/bin/spike_negdentry_fuse.rs"
+
 [features]
 # RIO_BUILDER_SCRIPT fixture intercept (sla-sizing VM scenario): skips
 # the daemon lifecycle and reports scripted (wall, peak_mem, peak_cpu,

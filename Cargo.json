@@ -20630,6 +20630,10 @@
           "path": "src/bin/spike_mountd.rs"
         },
         {
+          "name": "spike_negdentry_fuse",
+          "path": "src/bin/spike_negdentry_fuse.rs"
+        },
+        {
           "name": "spike_stream_fuse",
           "path": "src/bin/spike_stream_fuse.rs"
         }
