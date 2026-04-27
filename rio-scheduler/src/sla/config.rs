@@ -455,6 +455,17 @@ impl SlaConfig {
                 "sla.referenceHwClass={ref_h} not in sla.hwClasses"
             );
         }
+        for ((h, cap), v) in &self.lead_time_seed {
+            anyhow::ensure!(
+                self.hw_classes.contains_key(h),
+                "sla.leadTimeSeed key {h:?} not in sla.hwClasses"
+            );
+            anyhow::ensure!(
+                v.is_finite() && *v > 0.0 && *v <= self.max_lead_time,
+                "sla.leadTimeSeed[{h}:{cap:?}] = {v} must be in (0, maxLeadTime={}]",
+                self.max_lead_time
+            );
+        }
         self.probe.validate("sla.probe", hi)?;
         for (feat, p) in &self.feature_probes {
             p.validate(&format!("sla.feature_probes[{feat}]"), hi)?;
