@@ -832,4 +832,53 @@ mod tests {
     fn fleet_median_min_tenants_is_5() {
         assert_eq!(crate::sla::FLEET_MEDIAN_MIN_TENANTS, 5);
     }
+
+    /// bug_009: `tenants_with_dim` MUST be the post-MAD-reject
+    /// population — the same vector `cross_tenant_median`'s
+    /// `min_tenants` gate reads. Divergent tenant t4's only
+    /// `Some(membw)` row is MAD-rejected for an alu outlier; its
+    /// tenant-median is `[Some, None, None]`. Pre-fix `aggregate`
+    /// counted raw rows (`any(|r| r[membw].is_some())` → true via the
+    /// rejected row) and reported `tenants_with_dim[membw]==5`; the
+    /// scheduler's gate saw `xs.len()==4<5` → calibration deadlock.
+    #[test]
+    // r[verify sched.sla.threat.hw-median-of-medians]
+    fn cross_tenant_median_count_is_post_mad() {
+        let row_k = |pod: &str, tenant: &str, f: [Option<f64>; K]| HwPerfSampleRow {
+            hw_class: "h".into(),
+            pod_id: pod.into(),
+            submitting_tenant: Some(tenant.into()),
+            factor: f,
+        };
+        let mut rows = Vec::new();
+        // 4 honest tenants: 1 K=3 row each at the reference cluster.
+        for t in 0..4 {
+            rows.push(row_k(
+                &format!("p{t}"),
+                &format!("t{t}"),
+                s([1.0, 1.0, 1.0]),
+            ));
+        }
+        // Divergent tenant t4: 2 alu-only rows clustered at ~1.0 + 1
+        // K=3 row with alu=10·med. MAD: med[alu]=1.0, mad[alu]=0.02,
+        // threshold≈0.089 → the K=3 row is rejected; kept rows are
+        // alu-only → t4's tenant-median = [Some(1.0), None, None].
+        rows.push(row_k("p4a", "t4", [Some(0.98), None, None]));
+        rows.push(row_k("p4b", "t4", [Some(1.0), None, None]));
+        rows.push(row_k("p4c", "t4", [Some(10.0), Some(2.0), Some(2.0)]));
+
+        let agg = HwTable::aggregate(&rows);
+        assert_eq!(
+            agg["h"].tenants_with_dim[1], 4,
+            "membw: t4's only Some(membw) row was MAD-rejected → t4 \
+             contributes None → 4 tenants, not 5 (count == gate population)"
+        );
+        assert_eq!(
+            agg["h"].tenants_with_dim[2], 4,
+            "ioseq: same row carried the only Some(ioseq) for t4"
+        );
+        assert_eq!(agg["h"].tenants_with_dim[0], 5, "alu: all 5 contribute");
+        // Gate sees the same 4: factor[membw] pinned at 1.0.
+        assert_eq!(agg["h"].factor[1], 1.0, "membw: 4 < min_tenants=5 → gated");
+    }
 }
