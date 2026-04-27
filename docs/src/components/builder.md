@@ -111,6 +111,18 @@ The FUSE daemon is implemented using the `fuser` crate and runs as part of the b
 r[builder.fuse.listxattr-empty]
 `listxattr` on a FUSE-served store path MUST return an empty list (not an error) when queried with a non-zero buffer; replying with a `fuse_getxattr_out{size:0}` struct to a non-zero-buffer query trips the kernel's `fuse_verify_xattr_list` zero-length-name check and surfaces as `-EIO` to the caller (e.g., Python's `shutil.copy2`).
 
+r[builder.fs.listxattr-size-branch]
+The castore-FUSE `listxattr` handler MUST branch on the request size: `size==0` → `reply.size(0)`; `size>0` → `reply.data(&[])`. Same kernel constraint as `r[builder.fuse.listxattr-empty]` (which is removed when P0560 deletes the legacy `fuse/` module); restated here so the lesson survives the cutover.
+
+r[builder.mountd.build-id-validated]
+`rio-mountd` MUST reject `Mount{build_id}` unless `build_id` matches `^[A-Za-z0-9_-]{1,64}$`, and MUST construct all per-build filesystem paths via `openat()` against pre-opened `/var/rio/{castore,staging}` base dirfds with `O_NOFOLLOW` — never by string interpolation. mountd runs as root with init-ns `CAP_SYS_ADMIN`; an unvalidated `build_id` would let a sandbox-escaped build mount/rmdir/`rm -rf` arbitrary host paths.
+
+r[builder.mountd.uid-bound]
+`rio-mountd` MUST allow at most one live UDS connection per `SO_PEERCRED.uid`. With k8s userns, each pod has a distinct host-uid range; binding per-uid (not per-gid) prevents a sandbox-escaped build A from opening a fresh connection and issuing `Mount`/teardown for build B's `build_id`.
+
+r[builder.mountd.staging-quota]
+`rio-mountd` MUST track `staged_bytes` per connection and reject `Promote`/`PromoteChunks` with `TooLarge` once accepting the request would exceed `staging_quota_bytes`. The builder-side self-tracking is best-effort eviction; mountd is the enforcement boundary against a compromised builder filling the node-shared `/var/rio/staging` hostPath.
+
 r[builder.fuse.circuit-breaker+3]
 The FUSE fetch path has a circuit breaker. Two trip conditions (EITHER
 opens the circuit): (a) `threshold` (default 5) consecutive fetch
@@ -294,12 +306,10 @@ Derivations may produce multiple outputs (e.g., `out`, `dev`, `lib`). After a bu
 5. **Register**: Register each output path's NAR hash, NAR size, references, and deriver with rio-store. Signatures are sent empty --- output signing is done store-side (see [store signing](store.md#signing)).
 
 r[builder.upload.references-scanned]
-Before the retry loop, `upload_output` performs a **pre-scan pass**: a single extra disk read through `RefScanSink` only (no hash, no network). The NAR is dumped via `dump_path_streaming` into the scanner, which finds every candidate hash part embedded anywhere in the stream (including inside binaries, RPATH strings, symlink targets, directory names). The candidate set is the **transitive input closure** ∪ `drv.outputs()`: every path reachable via BFS over store references from the derivation's inputs, plus all of this derivation's own outputs (for self-references and cross-output references). This matches Nix's `computeFSClosure` (`derivation-building-goal.cc:444,450` / `derivation-builder.cc:1335-1344`). A build can legitimately embed any transitively-reachable path --- e.g. `hello-2.12.2` references `glibc`, which is not a direct input but arrives via `closure(stdenv)`. The resolved reference list is **sorted** (affects the narinfo signature fingerprint --- must be deterministic).
+Reference scanning is one of four sinks driven by the **single fused walk** of `r[builder.upload.fused-walk]` (ADR-022 §6.1): each output regular file is read once, in canonical NAR-entry order, and the bytes feed FastCDC chunking, whole-file blake3, the SHA-256-over-NAR-framing accumulator, and `RefScanSink` in lockstep — no separate pre-scan disk read. The scanner finds every candidate hash part embedded anywhere in the stream (including inside binaries, RPATH strings, symlink targets, directory names). The candidate set is the **transitive input closure** ∪ `drv.outputs()`: every path reachable via BFS over store references from the derivation's inputs, plus all of this derivation's own outputs (for self-references and cross-output references). This matches Nix's `computeFSClosure` (`derivation-building-goal.cc:444,450` / `derivation-builder.cc:1335-1344`). A build can legitimately embed any transitively-reachable path --- e.g. `hello-2.12.2` references `glibc`, which is not a direct input but arrives via `closure(stdenv)`. The resolved reference list is **sorted** (affects the narinfo signature fingerprint --- must be deterministic). Retries do NOT re-scan (the scan result is deterministic). The Boyer-Moore skip-scan over the restricted nixbase32 alphabet does ~memcpy speed on binary sections (skips ~31/32 bytes).
 
 r[builder.upload.deriver-populated]
 `PathInfo.deriver` is set to the `.drv` store path of the derivation that produced this output. The deriver is the same for all outputs of a multi-output derivation.
-
-> **Pre-scan cost:** the scan is a separate disk read before the first upload attempt. Retries do NOT re-scan (the scan result is deterministic). The Boyer-Moore skip-scan over the restricted nixbase32 alphabet does ~memcpy speed on binary sections (skips ~31/32 bytes); a 4 GiB output adds ~4s wall time on NVMe. If this becomes measurable, the escape hatch is a trailer-refs protocol extension (send refs in `PutPathTrailer` instead of the first `PathInfo` message) --- deferred to a later phase.
 
 r[builder.upload.batch+2]
 For **multi-output derivations (≥2 outputs)**, all outputs stream serially on one `PutPathChunked` RPC; the store commits them in ONE database transaction. If any output fails validation, zero outputs are registered --- atomic per `r[store.atomic.multi-output]`. All per-output prep (path parse, reference scan) is done BEFORE the first byte is sent, so a local prep failure on output *k* cannot leave outputs 0..k-1 committed. The RPC's stream timeout scales with output count (`GRPC_STREAM_TIMEOUT × N`, capped at `MAX_BATCH_OUTPUTS`); retries up to `MAX_UPLOAD_RETRIES` on transient errors. All outputs go through the client-chunked path; the size-based fallback to independent calls was removed with the inline-storage path in ADR-022 (P0583), and server-side-chunking `PutPath`/`PutPathBatch` reject builder-role tokens per `r[store.put.builder-chunked-only]`.

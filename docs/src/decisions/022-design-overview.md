@@ -29,7 +29,7 @@ On the store side, ADR-022 introduces the **NAR index** (per-file `{path, size, 
 
 ## 3. Architecture
 
-```
+```text
 ┌──────────────────────────── builder pod (unprivileged) ────────────────────────────┐
 │                                                                                    │
 │  build sandbox sees /nix/store as:                                                 │
@@ -117,7 +117,7 @@ The index is computed eagerly during `PutPath` from the NAR stream (`nar_ls` + p
 
 r[store.index.rpc]
 
-`GetNarIndex(nar_hash) → NarIndex` exposes this index. The builder does not fetch it at mount time — the Directory DAG (§8) carries everything `lookup`/`getattr`/`readdir`/`readlink` need. The `file_blobs` table (P0572's derived `file_digest → (nar_hash, nar_offset)` index) is consulted **server-side** by `ReadBlob`/`StatBlob` (§6) at `open()` time; the builder never holds chunk coordinates client-side.
+`GetNarIndex(nar_hash) → NarIndex` exposes this index. The builder does not fetch it at mount time — the Directory DAG (§8) carries everything `lookup`/`getattr`/`readdir`/`readlink` need. The `file_blobs` junction (P0572's derived `(file_digest, store_path_hash) → nar_offset` index, FK→`manifests` `ON DELETE CASCADE` so it cannot dangle after GC) is consulted **server-side** by `ReadBlob`/`StatBlob` (§6) at `open()` time; the builder never holds chunk coordinates client-side.
 
 ## 6. Builder-side data path: castore-FUSE `open()`
 
@@ -263,9 +263,9 @@ r[builder.mountd.backing-broker]
 
 r[builder.mountd.concurrency]
 
-`Promote` runs on `spawn_blocking` bounded by `Semaphore(num_cpus)`; `PromoteChunks` (≤64 per batch) runs inline. All other request handlers are non-blocking. Per-conn state is `Send + Sync` and replies are `seq`-correlated, so out-of-order completion is well-defined.
+`Promote` and `PromoteChunks` (≤64 per batch, ≤16 MiB I/O) both run on `spawn_blocking` bounded by `Semaphore(num_cpus)`; replies correlate via `seq`. `BackingOpen`/`BackingClose` are answered inline (sub-ms). Per-conn state is `Send + Sync` and replies are `seq`-correlated, so out-of-order completion is well-defined.
 
-`rio-mountd` holds, per build, the UDS connection, a dup of that build's `/dev/fuse` fd, and the staging dirfds; ~250 LoC. Requests carry a `seq: u32` echoed in replies (so `spawn_blocking` `Promote` can reply out-of-order); errors are typed (`DigestMismatch`/`NotRegular`/`TooLarge` are build-fatal, `Retryable(..)` is infra-retry). The UDS socket is mode 0660 group `rio-builder`; mountd checks `SO_PEERCRED.gid` and rejects others. It is a strictly smaller privileged surface than the pre-ADR-022 model, where the builder pod itself held `CAP_SYS_ADMIN`. The brokered `BACKING_OPEN` registers an fd the builder already holds (conn-scoped, depth-0-only); `Promote` is the integrity boundary for the shared cache.
+`rio-mountd` holds, per build, the UDS connection, a dup of that build's `/dev/fuse` fd, the staging dirfds, and a `staged_bytes` counter; ~250 LoC. Requests carry a `seq: u32` echoed in replies (so `spawn_blocking` `Promote`/`PromoteChunks` can reply out-of-order); errors are typed (`DigestMismatch`/`NotRegular`/`TooLarge`/`BadBuildId` are build-fatal, `Retryable(..)` is infra-retry). The UDS socket is mode 0660 group `rio-builder`; mountd checks `SO_PEERCRED.gid` and rejects others. **`build_id` is validated as `^[A-Za-z0-9_-]{1,64}$`** (`r[builder.mountd.build-id-validated]`) and per-build paths are constructed via `openat(base_dirfd, build_id, O_NOFOLLOW)` against pre-opened `/var/rio/{castore,staging}` base dirfds — never string-interpolated. **One live connection per `SO_PEERCRED.uid`** (`r[builder.mountd.uid-bound]`): k8s userns maps each pod to a distinct host-uid range, so a sandbox-escaped build cannot open a second connection and act on another build's `build_id`. **Staging quota is mountd-enforced** (`r[builder.mountd.staging-quota]`): `Promote`/`PromoteChunks` reject `TooLarge` once `conn.staged_bytes` would exceed `staging_quota_bytes`. It is a strictly smaller privileged surface than the pre-ADR-022 model, where the builder pod itself held `CAP_SYS_ADMIN`. The brokered `BACKING_OPEN` registers an fd the builder already holds (conn-scoped, depth-0-only); `Promote` is the integrity boundary for the shared cache.
 
 ## 12. Integrity
 
@@ -347,7 +347,8 @@ The `r[...]` markers introduced by ADR-022 across the design book are the spec-t
 |---|---|
 | Mount stack | `builder.fs.castore-stack` · `builder.fs.castore-dag-source` · `builder.fs.castore-inode-digest` · `builder.fs.castore-cache-config` · `builder.fs.fd-handoff-ordering` · `builder.overlay.castore-lower` |
 | castore-FUSE | `builder.fs.digest-fuse-open` · `builder.fs.passthrough-on-hit` · `builder.fs.passthrough-stack-depth` · `builder.fs.file-digest-integrity` · `builder.fs.fetch-circuit` · `builder.fs.shared-backing-cache` · `builder.fs.node-digest-cache` · `builder.fs.node-chunk-cache` · `builder.fs.streaming-open` · `builder.fs.streaming-open-threshold` |
-| Privilege | `builder.mountd.fuse-handoff` · `builder.mountd.backing-broker` · `builder.mountd.promote-verified` · `builder.mountd.orphan-scan` · `builder.mountd.concurrency` |
+| Privilege | `builder.mountd.fuse-handoff` · `builder.mountd.backing-broker` · `builder.mountd.promote-verified` · `builder.mountd.orphan-scan` · `builder.mountd.concurrency` · `builder.mountd.build-id-validated` · `builder.mountd.uid-bound` · `builder.mountd.staging-quota` · `sec.boundary.mountd` |
+| FUSE handler quirks | `builder.fs.listxattr-size-branch` |
 | Result classification | `builder.result.input-eio-is-infra` · `builder.fs.parity` |
 | Dispatch | `sched.dispatch.input-roots` |
 | NAR index | `store.index.file-digest` · `store.index.nar-ls-offset` · `store.index.nar-ls-streaming` · `store.index.table-cascade` · `store.index.non-authoritative` · `store.index.sync-on-miss` · `store.index.putpath-eager` · `store.index.putpath-bg-warm` · `store.index.rpc` |
