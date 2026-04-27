@@ -163,7 +163,7 @@ P0574 gateway substituter: Directory-DAG delta-sync client  ★ U5 LANDS
 |---|---|
 | P0549 blob-API → P0566 | `ChunkBackend` trait today is `[u8;32]`-addressed only (`rio-store/src/backend.rs`; P0548 splits this into `backend/{mod,tiered}.rs`). `{h}.narinfo` / `nar/{h}.nar.zst` / `nix-cache-info` need string-keyed `put_blob/get_blob/delete_blob`. |
 | P0576 (kernel.nix sentinel) → P0560 | Test-VM kernel must have the same `extraStructuredConfig` as the AMI. `kernel.nix` MUST be a standalone NixOS module importable by `nix/tests/fixtures/`. |
-| P0550 fetch.rs hoist → P0559 | `rio-builder/src/fuse/fetch.rs:20,32-33` import `fuser::Errno`, `super::NixStoreFs`, `super::cache`. **NOT a pure `git mv`** — hoist `StoreClients` + `fetch_chunks_parallel` core to `store_fetch.rs`; leave FUSE-typed wrappers in `fuse/fetch.rs` *temporarily* (P0560 deletes them with the rest of `fuse/`). ~150 LoC of actual refactor, not zero. |
+| P0550 fetch.rs hoist → P0559 | `rio-builder/src/fuse/fetch/mod.rs` import `fuser::Errno`, `super::NixStoreFs`, `super::cache`. **NOT a pure `git mv`** — hoist `StoreClients` + `fetch_chunks_parallel` core to `store_fetch.rs`; leave FUSE-typed wrappers in `fuse/fetch.rs` *temporarily* (P0560 deletes them with the rest of `fuse/`). ~150 LoC of actual refactor, not zero. |
 | P0544 spec-scaffold → everything with `r[impl …]` | `tracey-validate` in the checks gate fails on dangling `r[impl X]` where `r[X]` has no spec text. Markers must be on `sprint-1` before any code phase merges. |
 | P0548 → P0553 | Terraform may land first, but the helm flip to `kind: tiered` MUST NOT — `TieredChunkBackend` semantics (S3-sync put, FS write-through on get) are what make the cache tier safe to enable. |
 | P0541 → P0567 minimal | Builder can't open `/dev/fuse` unprivileged and `BACKING_OPEN` needs init-ns `CAP_SYS_ADMIN`. `rio-mountd` opens `/dev/fuse`, mounts the FUSE at `/var/rio/castore/{build_id}`, SCM_RIGHTS the fd. Builder serves castore-FUSE on it, then mounts overlay itself in its userns (`userxattr,lowerdir=<castore_mnt>`). |
@@ -213,13 +213,13 @@ Each as an independent `subtests=[...]` entry (failures isolate). `# r[verify bu
 **Crate:** `docs` · **Deps:** none · **Complexity:** LOW
 | File | Change |
 |---|---|
-| `docs/src/decisions/022-lazy-store-fs-erofs-vs-riofs.md` | merge `adr-022` (refocused §2 Design / §3 Alternatives). Carries the §2 + §6 markers: `r[builder.fs.{castore-stack, castore-dag-source, castore-inode-digest, castore-cache-config, fd-handoff-ordering, digest-fuse-open, passthrough-on-hit, passthrough-stack-depth, shared-backing-cache, file-digest-integrity, node-chunk-cache, streaming-open-threshold}]` + `r[builder.mountd.{promote-verified, orphan-scan}]` + 7 §6 chunked-upload markers. |
-| `docs/src/decisions/022-design-overview.md` | merge `adr-022`. Canonical design reference. Carries `r[builder.overlay.castore-lower]`, `r[builder.fs.parity]`, `r[builder.result.input-eio-is-infra]`, `r[builder.mountd.{backing-broker,concurrency}]`, `r[obs.metric.{castore-fuse,mountd}]`. |
+| `docs/src/decisions/022-lazy-store-fs-erofs-vs-riofs.md` | merge `adr-022` (refocused §2 Design / §3 Alternatives). Carries the §2 + §6 markers: `r[builder.fs.{castore-stack, castore-dag-source, castore-inode-digest, castore-cache-config, fd-handoff-ordering, digest-fuse-open, passthrough-on-hit, passthrough-stack-depth, shared-backing-cache, file-digest-integrity, node-chunk-cache, streaming-open-threshold}]` + `r[builder.mountd.{promote-verified, orphan-scan}]` + the §6 chunked-upload markers (full list in tracey inventory below). |
+| `docs/src/decisions/022-design-overview.md` | merge `adr-022`. Canonical design reference. Carries `r[builder.overlay.castore-lower]`, `r[builder.fs.parity]`, `r[builder.result.input-eio-is-infra]`, `r[builder.mountd.{fuse-handoff,backing-broker,concurrency}]`, `r[obs.metric.{castore-fuse,mountd}]`. |
 | `docs/src/decisions/023-tiered-chunk-backend.md` | new — object store (S3 today; GCS-ready via `ObjectStoreBackend` trait) is authoritative for bytes; **one S3 Express One Zone directory bucket per AZ** is a disposable read-through cache. Both tiers are `S3ChunkBackend` instances; `put` = remote only (S3-standard); `get` = local → remote fallback + write-through; Express fills via read-through only. PG `chunk_refs` is single-writer arbiter (single-region). **No DRA.** Forward-compat for cross-region: cache tier is stateless and metadata-agnostic; object-store cross-region replication + a globally-consistent metadata store would suffice, but neither is in scope here. Explicitly states: any single cache-tier-AZ outage = that AZ's replicas cold-read from S3 standard, not service outage; rollback `kind=s3` is instant + lossless. Records FSx-for-Lustre as the considered alternative. Carries `r[infra.express.cache-tier]`. |
 | `docs/src/components/store.md` | append §"NAR index" (incl. `file_digest`) + §"Tiered chunk backend" + §"BlobService" + §"Binary-cache compatibility layer" (`r[store.compat.*]`) |
 | `docs/src/components/builder.md` | **rewrite** §"FUSE Store" → §"castore-FUSE lower" + §"open() handler" + §"rio-mountd" (delete pre-ADR-022 whole-path FUSE description) |
 | `docs/src/components/gateway.md` | append `r[gw.substitute.dag-delta-sync]` spec text |
-| `docs/src/security.md` | bump `r[sec.pod.fuse-device-plugin]` (`/dev/fuse` now via mountd fd-handoff, not base_runtime_spec); bump `r[common.hmac.claims]` (add `role`+`tenant_id`); add §Boundary-4 `r[sec.boundary.mountd]` (mountd threat surface: build_id traversal, disk-fill, cross-build interference, fd smuggling — and mitigations); rewrite §Known-Limitations #2/#3 (executors no longer hold `CAP_SYS_ADMIN`); update §Read-authorization (castore surface IS tenant-scoped); add `HasChunks` to §Cross-Tenant Chunk Probing |
+| `docs/src/security.md` | bump `r[sec.pod.fuse-device-plugin]` (`/dev/fuse` now via mountd fd-handoff, not base_runtime_spec); bump `r[common.hmac.claims]` (add `role`+`tenant_id`+`input_closure_digest`); add §Boundary-4 `r[sec.boundary.mountd]` (mountd threat surface: build_id traversal, disk-fill, cross-build interference, fd smuggling — and mitigations); rewrite §Known-Limitations #2/#3 (executors no longer hold `CAP_SYS_ADMIN`); update §Read-authorization (castore surface IS tenant-scoped); add `HasChunks` to §Cross-Tenant Chunk Probing |
 | `docs/src/multi-tenancy.md` | append `directory_tenants` / `file_blob_tenants` rows to the tenant-scoping table |
 | `docs/src/deployment.md` | append `r[infra.node.kernel-fuse-passthrough]` spec text |
 | `docs/src/observability.md` | append metric rows |
@@ -231,7 +231,7 @@ Each as an independent `subtests=[...]` entry (failures isolate). `# r[verify bu
 
 ---
 
-## Phase 1 — Primitives (≤7-way parallel; all dep on P0544)
+## Phase 1 — Primitives (≤8-way parallel; all dep on P0544)
 
 ### P0545 — proto: NarIndex with `file_digest`
 **Crate:** `rio-proto` · **Deps:** P0544 · **Complexity:** LOW
@@ -269,7 +269,7 @@ Extend `ChunkBackend` with string-keyed `put_blob/get_blob/delete_blob` for P056
 
 ### P0550 — fetch.rs core hoist (NOT a pure mv)
 **Crate:** `rio-builder` · **Deps:** P0544 · **Complexity:** MED
-Hoist `StoreClients` + `fetch_chunks_parallel` from `rio-builder/src/fuse/fetch.rs` (which imports `fuser::Errno`, `super::NixStoreFs`) to `rio-builder/src/store_fetch.rs`; leave old-FUSE-typed wrappers in `fuse/fetch.rs` until P0560 deletes them. ~150 LoC actual refactor. **Exit:** `/nixbuild --checks` green; existing FUSE VM tests unchanged.
+Hoist `StoreClients` + `fetch_chunks_parallel` from `rio-builder/src/fuse/fetch/` (which imports `fuser::Errno`, `super::NixStoreFs`) to `rio-builder/src/store_fetch.rs`; leave old-FUSE-typed wrappers in `fuse/fetch.rs` until P0560 deletes them. ~150 LoC actual refactor. **Exit:** `/nixbuild --checks` green; existing FUSE VM tests unchanged.
 
 ### P0572 — Directory merkle layer: `dir_digest`/`root_digest` + `directories` table
 **Crate:** `rio-proto, rio-nix, rio-store` · **Deps:** P0545, P0546, P0551, P0552 · **Complexity:** LOW (~50 LoC compute + table)
@@ -283,7 +283,7 @@ Hoist `StoreClients` + `fetch_chunks_parallel` from `rio-builder/src/fuse/fetch.
 | `rio-nix/src/nar.rs` | `nar_ls` second pass (bottom-up over the entry list, deepest-first): for each `kind==DIR`, build `Directory{…}` from immediate children's `file_digest`/`dir_digest`/`target`, encode, `dir_digest = blake3(encoded)`. `root_digest` = top dir's `dir_digest`. ~50 LoC. `// r[impl store.index.dir-digest]` |
 | `migrations/054_nar_index.sql` (P0551 — same migration) | `+ ALTER TABLE nar_index ADD COLUMN root_node bytea;` (encoded `oneof{dir_digest, FileEntry, SymlinkEntry}` — what P0588's dispatch query reads). `CREATE TABLE directories (digest bytea PRIMARY KEY, body bytea NOT NULL, refcount integer NOT NULL DEFAULT 0); CREATE TABLE directory_tenants (digest bytea NOT NULL REFERENCES directories(digest) ON DELETE CASCADE, tenant_id uuid NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE, PRIMARY KEY (digest, tenant_id)); CREATE INDEX directory_tenants_tenant_idx ON directory_tenants (tenant_id, digest);` **`file_blobs` is a junction, not a refcounted singleton** — one row per (file_digest, containing-manifest), so GC of any one referrer cannot dangle the lookup: `CREATE TABLE file_blobs (digest bytea NOT NULL, store_path_hash bytea NOT NULL REFERENCES manifests(store_path_hash) ON DELETE CASCADE, nar_offset bigint NOT NULL, PRIMARY KEY (digest, store_path_hash)); CREATE INDEX file_blobs_digest_idx ON file_blobs (digest); CREATE TABLE file_blob_tenants (digest bytea NOT NULL, tenant_id uuid NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE, PRIMARY KEY (digest, tenant_id)); CREATE INDEX file_blob_tenants_tenant_idx ON file_blob_tenants (tenant_id, digest);` |
 | `rio-store/src/nar_index.rs` (P0552) | after `set_nar_index`: write `root_node` column. `INSERT INTO directories … ON CONFLICT (digest) DO UPDATE SET refcount = directories.refcount + 1` (UNNEST, **sorted** input per `r[store.chunk.refcount-txn]`); `INSERT INTO directory_tenants (digest, $tenant_id) ON CONFLICT DO NOTHING`. `INSERT INTO file_blobs (digest, store_path_hash, nar_offset) … ON CONFLICT DO NOTHING` (sorted UNNEST); `INSERT INTO file_blob_tenants (digest, $tenant_id) ON CONFLICT DO NOTHING`. `// r[impl store.castore.gc]` `// r[impl store.castore.tenant-scope]` |
-| `rio-store/src/gc.rs` (existing sweep) | in the per-manifest sweep txn, before `DELETE narinfo` cascades: decode the dying `nar_index.entries`, `UPDATE directories SET refcount=refcount-1 WHERE digest=ANY($sorted)`; `DELETE FROM directories WHERE digest=ANY($zeros)` (no S3 object → hard-delete; junction rows go via `ON DELETE CASCADE`). `file_blobs` rows for the dying manifest cascade-delete via the `manifests` FK — **no repoint needed; surviving referrers' rows remain**. After cascade: `DELETE FROM file_blob_tenants ft WHERE ft.digest = ANY($dying_file_digests) AND NOT EXISTS (SELECT 1 FROM file_blobs fb WHERE fb.digest = ft.digest)`. |
+| `rio-store/src/gc/sweep.rs` (existing sweep) | in the per-manifest sweep txn, before `DELETE narinfo` cascades: decode the dying `nar_index.entries`, `UPDATE directories SET refcount=refcount-1 WHERE digest=ANY($sorted)`; `DELETE FROM directories WHERE digest=ANY($zeros)` (no S3 object → hard-delete; junction rows go via `ON DELETE CASCADE`). `file_blobs` rows for the dying manifest cascade-delete via the `manifests` FK — **no repoint needed; surviving referrers' rows remain**. After cascade: `DELETE FROM file_blob_tenants ft WHERE ft.digest = ANY($dying_file_digests) AND NOT EXISTS (SELECT 1 FROM file_blobs fb WHERE fb.digest = ft.digest)`. |
 | tests | proptest: `serialize(tree)` → `nar_ls` → re-derive `dir_digest` from children == stored value. snix-interop golden: known tree → `root_digest` matches snix's `tvix-store import` output (fixture bytes pinned). **GC**: PutPath A and B sharing a subtree → `directories.refcount==2` for the shared digest → GC A → `refcount==1` → GC B → row gone. **file_blobs survives first-referrer GC**: PutPath A and B sharing a regular file (same `file_digest`) → 2 `file_blobs` rows → GC A → `ReadBlob(file_digest)` still resolves via B's row → GC B → no rows + `file_blob_tenants` row gone. `// r[verify store.index.dir-digest]` `// r[verify store.castore.{canonical-encoding,gc}]` |
 
 **Load-bearing for the mount path** as of ADR-022 §2.2: P0559's castore-FUSE serves the Directory DAG directly (`lookup`/`readdir` from `Directory` bodies); the builder cannot mount without it. Also enables U5 (snix `castore.proto` interop + `root_digest` as a closure-level cache key + the DAG that P0574 walks). Measured 12.1% dir-sharing on chromium (~90% empty dirs).
@@ -371,7 +371,7 @@ Hoist `StoreClients` + `fetch_chunks_parallel` from `rio-builder/src/fuse/fetch.
 | File | Change |
 |---|---|
 | `rio-store/src/compat/writer.rs` | new — `async fn write(&self, path_info: &PathInfo, chunk_list: &[ChunkRef]) -> Result<(), CompatError>`. Reassemble NAR bytes via `ChunkCache::get` over the just-written chunks (moka-hot). Stream through `async-compression` zstd encoder while computing `sha256(compressed)`. `put_blob("nar/{file_hash}.nar.zst", body)`. Render narinfo via the existing `rio-nix::narinfo::render` (same one the HTTP server uses) **with** `FileHash`/`FileSize`/`Compression` populated; `put_blob("{store_path_hash}.narinfo", body)`. On first-ever write, `put_blob("nix-cache-info", "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n")` if absent. `// r[impl store.compat.{nar-on-put,narinfo-on-put}]` `// r[impl obs.metric.compat]` |
-| `rio-store/src/grpc/put_path.rs` | after the PG-commit (status flips `'uploading'`→`'complete'`), if `cfg.binary_cache_compat.enabled`: `compat_writer.write(...).await` — failure logged + `rio_store_compat_write_failures_total` inc, **does not** fail the RPC. `// r[impl store.compat.write-after-commit]` |
+| `rio-store/src/grpc/put_path/mod.rs` | after the PG-commit (status flips `'uploading'`→`'complete'`), if `cfg.binary_cache_compat.enabled`: `compat_writer.write(...).await` — failure logged + `rio_store_compat_write_failures_total` inc, **does not** fail the RPC. `// r[impl store.compat.write-after-commit]` |
 | `rio-store/src/lib.rs` | `pub mod compat;` + `rio_store_compat_write_seconds{result}` histogram + `rio_store_compat_write_failures_total` counter |
 | tests | unit: PutPath a 2-chunk path with compat ON → in-memory S3 backend has `{hash}.narinfo` and `nar/{filehash}.nar.zst`; round-trip narinfo via `rio-nix::narinfo::parse`; decompressed NAR sha256 == `nar_hash`. compat OFF → neither object present. `// r[verify store.compat.{nar-on-put,narinfo-on-put,write-after-commit,runtime-toggle}]` |
 
@@ -385,7 +385,7 @@ Hoist `StoreClients` + `fetch_chunks_parallel` from `rio-builder/src/fuse/fetch.
 **Crate:** `rio-store` · **Deps:** P0551, P0566 · **Complexity:** LOW
 | File | Change |
 |---|---|
-| `rio-store/src/gc.rs` | per-manifest sweep txn already enqueues chunk keys to `pending_s3_deletes`; extend to also enqueue `{store_path_hash}.narinfo` and `nar/{file_hash}.nar.zst` (file_hash read from the dying narinfo row's `compat_file_hash` column). Runs regardless of current `enabled` value — past compat writes are GC'd even if compat is now OFF. `// r[impl store.compat.gc-coupled]` |
+| `rio-store/src/gc/sweep.rs` | per-manifest sweep txn already enqueues chunk keys to `pending_s3_deletes`; extend to also enqueue `{store_path_hash}.narinfo` and `nar/{file_hash}.nar.zst` (file_hash read from the dying narinfo row's `compat_file_hash` column). Runs regardless of current `enabled` value — past compat writes are GC'd even if compat is now OFF. `// r[impl store.compat.gc-coupled]` |
 | `migrations/054_nar_index.sql` (P0551 — same migration) | `+ ALTER TABLE narinfo ADD COLUMN compat_file_hash bytea;` (nullable; populated by P0566 on successful compat write) |
 | tests | GC a path with compat objects → both keys appear in `pending_s3_deletes`. `// r[verify store.compat.gc-coupled]` |
 
@@ -401,7 +401,7 @@ Hoist `StoreClients` + `fetch_chunks_parallel` from `rio-builder/src/fuse/fetch.
 |---|---|
 | `rio-store/src/cas.rs` | delete `INLINE_THRESHOLD` const |
 | `rio-store/src/manifest.rs` | delete `ManifestKind::Inline` variant; `ManifestKind` collapses to a single chunk-list shape (or is replaced by the bare `Vec<ChunkRef>`/`ChunkManifest` type — implementer's call) |
-| `rio-store/src/grpc/put_path.rs` | remove the `nar_len < INLINE_THRESHOLD` size-branch; every NAR goes through `put_chunked`. A NAR shorter than `CHUNK_MIN` yields a single chunk equal to the input (FastCDC behavior — no special-case needed) |
+| `rio-store/src/grpc/put_path/mod.rs` | remove the `nar_len < INLINE_THRESHOLD` size-branch; every NAR goes through `put_chunked`. A NAR shorter than `CHUNK_MIN` yields a single chunk equal to the input (FastCDC behavior — no special-case needed) |
 | `rio-store/src/grpc/get_path.rs` | remove the `ManifestKind::Inline` arm; `chunk_cache` is now required (drop the `Option<>` wrapper and the `failed_precondition("inline-only")` guard) |
 | `rio-store/src/grpc/put_path_batch.rs` | drop the `INLINE_THRESHOLD` size-gate + `FailedPrecondition` fallback; batch handler chunks every output |
 | `rio-store/src/grpc/chunk.rs` | drop the `Option<Arc<ChunkCache>>` wrapper + `require_cache()` guard (backend always present) |
@@ -455,7 +455,7 @@ Adds the three claim fields that P0573 (`tenant_id` for castore tenant-scoping),
 **Crate:** `rio-store` · **Deps:** P0551, P0552 · **Complexity:** LOW
 | File | Change |
 |---|---|
-| `rio-store/src/grpc/put_path.rs` (~431, after `cas::put_chunked` Ok) | `if let Ok(permit) = index_sem.clone().try_acquire_owned() { tokio::spawn(async move { let _p = permit; nar_index::compute_from_bytes(pool, &nar_bytes, store_path).await }) }` — eager only if a permit is *immediately* free; otherwise leave for `indexer_loop` (≤5 s pickup). NAR bytes passed as `Arc<Vec<u8>>`. `index_sem` sized by config `nar_index_concurrency` (default 4). `// r[impl store.index.putpath-eager]` |
+| `rio-store/src/grpc/put_path/mod.rs` (after `cas::put_chunked` Ok) | `if let Ok(permit) = index_sem.clone().try_acquire_owned() { tokio::spawn(async move { let _p = permit; nar_index::compute_from_bytes(pool, &nar_bytes, store_path).await }) }` — eager only if a permit is *immediately* free; otherwise leave for `indexer_loop` (≤5 s pickup). NAR bytes passed as `Arc<Vec<u8>>`. `index_sem` sized by config `nar_index_concurrency` (default 4). `// r[impl store.index.putpath-eager]` |
 | `rio-store/src/grpc/put_path_batch.rs` | same gate |
 | `rio-store/src/nar_index.rs` | `compute_from_bytes(pool, &[u8], path)` — `Cursor::new(bytes)` → `nar_ls` → `set_nar_index`. Reuses RAM, no chunk fetch. |
 | `rio-store/src/config.rs` | `+ nar_index_concurrency: usize` (default 4) |
@@ -491,7 +491,7 @@ The builder's mount-time DAG prefetch (P0559) needs each input store path's `roo
 | `rio-builder/src/lib.rs` | `+ rio_builder_castore_fuse_{lookup,readdir}_total` (cold-metadata counter); `+ rio_builder_castore_fuse_open_mode_total{mode}`; `+ rio_builder_castore_fuse_open_case_total{case}`; `+ rio_builder_castore_fuse_chunk_source_total{src}` (I-056). |
 | `rio-builder/src/castore_fuse/circuit.rs` | port of `fuse/circuit.rs` — breaker around `fetch_chunks_parallel`. `// r[impl builder.fs.fetch-circuit]` |
 | `rio-builder/src/castore_fuse/mod.rs` | `pub mod tree; pub mod open; pub mod circuit; pub mod mount;` |
-| `rio-builder/src/lib.rs` | `pub mod castore_fuse;` + `rio_builder_castore_fuse_{open_seconds,fetch_bytes_total{hit},integrity_fail_total,eio_total}`. `// r[impl obs.metric.castore-fuse]` |
+| `rio-builder/src/lib.rs` | `pub mod castore_fuse;` + register `rio_builder_castore_fuse_{upcalls_total{op},open_seconds,fetch_bytes_total{hit},integrity_fail_total,eio_total}`. `// r[impl obs.metric.castore-fuse]` |
 | tests | unit: `tree.lookup(ROOT, basename)` round-trip; per-digest ino — two paths same content → same ino; `readdirplus` returns children with `Duration::MAX` ttl. `// r[verify builder.fs.{digest-fuse-open,castore-inode-digest,castore-cache-config}]` |
 
 **Mode summary:** lookup/getattr/readdir/readlink → in-memory DAG, `Duration::MAX` ttl, dcache absorbs repeats. open() cache hit → passthrough (zero further upcalls). Cache miss ≤ threshold → fetch-whole then passthrough. Cache miss > threshold → P0575 streaming during fill, then next open is passthrough. The FUSE `read` op is reachable only in the streaming window.
@@ -553,10 +553,10 @@ The unprivileged builder cannot (a) open `/dev/fuse`, (b) call `FUSE_DEV_IOC_BAC
 | `rio-builder/src/fuse/ops.rs` | old-FUSE `Filesystem` impl — castore-FUSE (P0559) serves the DAG with content-addressed inodes, not path-granular NAR materialization | 786 |
 | `rio-builder/src/fuse/cache.rs` | `Cache`, `JitClass`, `known_inputs`/`register_inputs` — the in-memory DAG IS the allowlist | 1356 |
 | `rio-builder/src/fuse/mod.rs` (most) | `mount_fuse_background`, `FuseMount`, `NixStoreFs`. **`ensure_fusectl_mounted` and Drop fusectl-abort are KEPT** (moved to `castore_fuse/mod.rs` — same I-165 abort discipline) | ~450 |
-| `rio-builder/src/fuse/{inode.rs,lookup.rs}` | inode bookkeeping + name lookup — castore_fuse/tree.rs replaces with content-addressed inos | 254+91 |
+| `rio-builder/src/fuse/{inode.rs,attr.rs}` | inode bookkeeping + attr/lookup ops — castore_fuse/tree.rs replaces with content-addressed inos | 254+91 |
 | `rio-builder/src/fuse/circuit.rs` | **PORTED** to `castore_fuse/circuit.rs` (P0559) | (moved) |
 | `rio-builder/src/fuse/read.rs` | passthrough fd registration — page cache via overlay | (whole file) |
-| `rio-builder/src/fuse/fetch.rs` old-FUSE wrappers | `ensure_cached`, `prefetch_path_blocking` — P0550 hoisted keepers | ~1700 residual |
+| `rio-builder/src/fuse/fetch/` old-FUSE wrappers | `ensure_cached`, `prefetch_path_blocking` — P0550 hoisted keepers | ~1700 residual |
 | `rio-builder/src/executor/mod.rs` `RIO_BUILDER_JIT_FETCH` block | I-043 escape hatch — old-FUSE-specific | ~40 |
 | spec markers | `r[builder.fuse.{jit-lookup,jit-register,lookup-caches+2,fetch-chunk-fanout,fetch-bounded-memory}]`. `r[builder.result.input-enoent-is-infra+2]` REWORDED → `input-eio-is-infra`. | docs |
 | `infra/helm/rio-build/templates/karpenter.yaml` `rio-builder-{fuse,kvm}` NodeOverlays | **DROPPED** — both existed to advertise `smarter-devices/*` capacity. fuse: rio-mountd fd-passes. kvm: hostPath + `nodeSelector{rio.build/kvm}` (the metal NodePool already labels+taints; capacity is unbounded so no overlay needed). | helm |
@@ -571,7 +571,7 @@ The unprivileged builder cannot (a) open `/dev/fuse`, (b) call `FUSE_DEV_IOC_BAC
 | File | Change |
 |---|---|
 | `nix/tests/fixtures/k3s-prod-parity.nix` | unconditionally `imports = [ ../../nixos-node/kernel.nix ]`; deploy `rio-mountd` DS in-cluster; hostPath `/var/rio/{castore,cache,chunks,staging}` |
-| `nix/tests/scenarios/castore-e2e.nix` | fixture `{storeReplicas=1;}`. `cold-read`: build drv that `dd bs=4k count=1` from a 100 MB input → assert `castore_fuse_open_seconds_count > 0` AND `dd` output correct AND streaming mode hit (>threshold). `warm-read`: second `dd` same file → `open_seconds_count` unchanged AND **`castore_fuse_read_upcalls_total` unchanged** (passthrough — no read upcalls). `passthrough-small`: `dd` a 1 MiB input twice → both opens reply passthrough; assert `read_upcalls_total == 0` across both. `cross-build-dedup`: two drvs with one shared input file → second build's `fetch_bytes_total{hit="node_ssd"} > 0`. `inode-dedup`: two store paths sharing one file by content → `stat -c %i` returns the same inode for both paths; only one `open()` upcall. `eio-on-fetch-fail`: stop rio-store mid-open → opener sees `EIO` (not hang) within `jit_fetch_timeout` + `is_input_materialization_failure` classifies as infra-retry. `integrity-fail`: corrupt one chunk in the store backend → opener sees `EIO` + `integrity_fail_total == 1`. `stat-dcache-absorbed`: `find /nix/store -type f -printf '%s\n'` once → `castore_fuse_lookup_total == N`; second `find` → `lookup_total` unchanged (`Duration::MAX` ttl). `cross-build-dedup-streaming`: launch two builds **concurrently** sharing one >threshold input → assert build-B's `chunk_source_total{src="remote"}` × `FASTCDC_MAX` < input size (most chunks came from `/var/rio/chunks/`). `mountd-restart`: kill mountd mid-build, assert orphan-scan reaps `castore/`+`staging/` on restart and next build succeeds. `cache-readonly`: from inside the build sandbox, `open("/var/rio/cache/ab/test", O_WRONLY\|O_CREAT)` → `EACCES`. |
+| `nix/tests/scenarios/castore-e2e.nix` | fixture `{storeReplicas=1;}`. `cold-read`: build drv that `dd bs=4k count=1` from a 100 MB input → assert `castore_fuse_open_seconds_count > 0` AND `dd` output correct AND streaming mode hit (>threshold). `warm-read`: second `dd` same file → `open_seconds_count` unchanged AND **`rio_builder_castore_fuse_upcalls_total{op="read"}` unchanged** (passthrough — no read upcalls). `passthrough-small`: `dd` a 1 MiB input twice → both opens reply passthrough; assert `upcalls_total{op="read"} == 0` across both. `cross-build-dedup`: two drvs with one shared input file → second build's `fetch_bytes_total{hit="node_ssd"} > 0`. `inode-dedup`: two store paths sharing one file by content → `stat -c %i` returns the same inode for both paths; only one `open()` upcall. `eio-on-fetch-fail`: stop rio-store mid-open → opener sees `EIO` (not hang) within `jit_fetch_timeout` + `is_input_materialization_failure` classifies as infra-retry. `integrity-fail`: corrupt one chunk in the store backend → opener sees `EIO` + `integrity_fail_total == 1`. `stat-dcache-absorbed`: `find /nix/store -type f -printf '%s\n'` once → `rio_builder_castore_fuse_upcalls_total{op="lookup"} == N`; second `find` → unchanged (`Duration::MAX` ttl). `shutil-copy2`: `python3 -c 'import shutil; shutil.copy2("<input>", "<upper>")'` → succeeds (exercises `listxattr` size>0 path; `r[builder.fs.listxattr-size-branch]`). `cross-build-dedup-streaming`: launch two builds **concurrently** sharing one >threshold input → assert build-B's `chunk_source_total{src="remote"}` × `FASTCDC_MAX` < input size (most chunks came from `/var/rio/chunks/`). `mountd-restart`: kill mountd mid-build, assert orphan-scan reaps `castore/`+`staging/` on restart and next build succeeds. `cache-readonly`: from inside the build sandbox, `open("/var/rio/cache/ab/test", O_WRONLY\|O_CREAT)` → `EACCES`. |
 | `nix/tests/scenarios/{lifecycle,protocol,gc,...}.nix` | **sweep:** delete every old-FUSE-specific assertion (`fuse_cache_hits`, `/var/rio/fuse-store`). **Drop all `smarter-devices/*` from worker pod fixtures** — fuse via rio-mountd fd-pass, kvm via hostPath. |
 | `nix/tests/default.nix` | `# r[verify builder.fs.{castore-stack,castore-dag-source,castore-inode-digest,castore-cache-config,fd-handoff-ordering,digest-fuse-open,shared-backing-cache,file-digest-integrity,node-digest-cache,streaming-open-threshold}]` `# r[verify builder.overlay.castore-lower]` `# r[verify builder.result.input-eio-is-infra]` `# r[verify builder.mountd.fuse-handoff]` `# r[verify obs.metric.castore-fuse]` at `subtests=[...]`; `cp -a` of an input file succeeds (xattr ops). Spike harness `nix/tests/{scenarios/composefs-spike-{stream,priv}.nix, lib/spike_stage.py, lib/chromium-tree.tsv.zst}` kept as regression guards (stream + priv subtests apply to §2; the core/scale spikes are §3-only and may be dropped); `timeout=1800` |
 
@@ -597,7 +597,7 @@ The unprivileged builder cannot (a) open `/dev/fuse`, (b) call `FUSE_DEV_IOC_BAC
 **Crate:** `infra` · **Deps:** P0544, P0548, P0559 · **Complexity:** LOW
 | File | Change |
 |---|---|
-| `infra/helm/rio-build/dashboards/castore-fuse.json` | panels: `castore_fuse_open_seconds` p50/p99, `castore_fuse_lookup_total` rate (cold-metadata pressure), `fetch_bytes_total` rate by `hit` label, `objects_cache_bytes` per node, `integrity_fail_total`, `nar_index_compute_seconds` |
+| `infra/helm/rio-build/dashboards/castore-fuse.json` | panels: `rio_builder_castore_fuse_open_seconds` p50/p99, `rio_builder_castore_fuse_upcalls_total{op="lookup"}` rate (cold-metadata pressure), `fetch_bytes_total` rate by `hit` label, `objects_cache_bytes` per node, `integrity_fail_total`, `nar_index_compute_seconds` |
 | `infra/helm/rio-build/templates/prometheusrule.yaml` | `RioBuilderDigestFuseStall`: `increase(open_seconds_count[2m]) == 0 AND increase(open_seconds_sum[2m]) > 0 for 60s` (opens started but none completed). `RioBuilderIntegrityFail`: `increase(integrity_fail_total[5m]) > 0`. `RioStoreNarIndexBacklog`: `nar_index_pending > 1000 for 10m`. |
 | `xtask/src/regen/grafana.rs` | include dashboard |
 
@@ -625,7 +625,7 @@ The unprivileged builder cannot (a) open `/dev/fuse`, (b) call `FUSE_DEV_IOC_BAC
 |---|---|
 | `docs/src/runbooks/tiered-cache-cutover.md` | new — flip `store.chunkBackend.kind=tiered`; rollback `kind=s3` |
 | `docs/src/runbooks/mountd-crash-loop.md` | symptom: `kube_pod_container_status_restarts_total{container="rio-mountd"}` rising + node's builds `EIO`. Action: `kubectl logs -p`; if persistent, cordon node, drain builders, capture `/var/rio/{cache,staging}` listing. |
-| `docs/src/runbooks/promote-reject-nonzero.md` | symptom: `rio_mountd_promote_reject_total{reason="mismatch"} > 0` — a builder presented bytes that don't hash to the claimed digest (rio-store corruption or compromised builder). Action: identify `build_id` from mountd log; check `rio_store_integrity_fail_total`; if store clean, treat the builder pod as suspect — cordon node, preserve staging dir for forensics. |
+| `docs/src/runbooks/promote-reject-nonzero.md` | symptom: `rio_mountd_promote_reject_total{reason="mismatch"} > 0` — a builder presented bytes that don't hash to the claimed digest (rio-store corruption or compromised builder). Action: identify `build_id` from mountd log; check `rio_store_narhash_mismatch_total`; if store clean, treat the builder pod as suspect — cordon node, preserve staging dir for forensics. |
 | `docs/src/runbooks/single-node-builds-slow.md` | triage tree: (1) `open_mode_total{mode="passthrough"} == 0` → kernel/init negotiation failed, check `dmesg`; (2) `promote_inflight` pegged → Promote backlog, check `cache_free_bytes`; (3) `mountd_request_seconds{op="backing_open"}` p99 > 1 ms → mountd CPU-starved; (4) else → upstream (`fetch_bytes_total{hit="remote"}` rate vs `rio_store_*`). |
 | `docs/src/runbooks/castore-fuse-cutover.md` | (1) ensure cache-tier flip done; (2) `xtask k8s eks down && up` from a P0562-green commit (greenfield — `nar_index` + `directories` populate from scratch via PutPath eager + indexer_loop); (3) `xtask stress chromium`; (4) compare `fetch_bytes_total{hit="remote"}` — expect ≥10× reduction vs whole-NAR baseline on builds that touch <10% of files; expect `objects_cache_hit_ratio` climbing on repeat builds; (5) rollback = `down && up` from pre-P0560 commit |
 
@@ -675,7 +675,7 @@ Completes the snix-compatible castore surface: a client holding only a `file_dig
 **Exit:** `/nixbuild --checks` green.
 
 ### P0586 — `PutPathChunked`: builder-side fused walk + `HasChunks` + pipelined sync narhash verify
-**Crate:** `rio-store, rio-builder, rio-proto` · **Deps:** P0551, P0572, P0573, P0577 · **Complexity:** MED
+**Crate:** `rio-store, rio-builder, rio-proto` · **Deps:** P0551, P0572, P0573, P0577 · **Complexity:** HIGH
 
 Moves chunking to the builder; rio-store's per-stream working set drops from `nar_size` bytes to one ≤256 KiB chunk in flight. Closes `TODO(P0433)` (refs forced into separate pre-pass) and `TODO(P0434)` (manifest-first upload). Design at [§6](./022-lazy-store-fs-erofs-vs-riofs.md#6-extension-chunked-output-upload-putpathchunked).
 
@@ -742,7 +742,7 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 {"plan":557,"title":"PutPath eager nar_index compute (try_acquire-gated; no encode)","deps":[551,552],"crate":"rio-store","priority":80,"status":"UNIMPL","complexity":"LOW","note":"nar_ls+blake3 while NAR in RAM; no S3 artifact"}
 {"plan":567,"title":"rio-mountd DaemonSet (fuse-fd-handoff + BACKING_OPEN broker + Promote/PromoteChunks verify-copy + cache+chunks ownership + build_id validation + per-uid conn binding + staging quota + metrics)","deps":[576,578],"crate":"rio-builder,infra","priority":80,"status":"UNIMPL","complexity":"MED","note":"~250 LoC (no erofs/losetup); tokio async per-conn; Promote+PromoteChunks both on spawn_blocking+Semaphore; build_id ^[A-Za-z0-9_-]{1,64}$; openat(base_dirfd) not string-concat; one conn per peer_uid; mountd-side staging_quota enforcement"}
 {"plan":588,"title":"WorkAssignment.input_roots: scheduler→builder root_node transport (proto field 3 + dispatch.rs populate from nar_index.root_node)","deps":[572],"crate":"rio-proto,rio-scheduler","priority":85,"status":"UNIMPL","complexity":"LOW","note":"~40 LoC; r[sched.dispatch.input-roots]; unblocks P0559 mount-time DAG prefetch"}
-{"plan":559,"title":"castore_fuse/{tree,open,circuit}.rs (Directory-DAG tree; per-digest inodes; Duration::MAX ttl + READDIRPLUS/CACHE_DIR/CACHE_SYMLINKS/PARALLEL_DIROPS; FOPEN_PASSTHROUGH on cache-hit via mountd broker)","deps":[550,567,568,572,573,577,588],"crate":"rio-builder","priority":80,"status":"UNIMPL","complexity":"MED","note":"~650 LoC; snix-style; open() resolves chunk-coords server-side via ReadBlob/StatBlob (no client DigestResolver); passthrough is steady-state, read-upcall only during P0575 fill window"}
+{"plan":559,"title":"castore_fuse/{tree,open,circuit}.rs (Directory-DAG tree; per-digest inodes; Duration::MAX ttl + READDIRPLUS/CACHE_DIR/CACHE_SYMLINKS/PARALLEL_DIROPS; FOPEN_PASSTHROUGH on cache-hit via mountd broker)","deps":[550,567,568,570,572,573,577,588],"crate":"rio-builder","priority":80,"status":"UNIMPL","complexity":"MED","note":"~650 LoC; snix-style; open() resolves chunk-coords server-side via ReadBlob/StatBlob (no client DigestResolver); passthrough is steady-state, read-upcall only during P0575 fill window"}
 {"plan":571,"title":"mountd-owned /var/rio/cache LRU sweep + per-build staging + cache-hit metrics","deps":[559,567],"crate":"rio-builder,infra","priority":80,"status":"UNIMPL","complexity":"LOW","note":"cache is mountd-owned readonly (HOLE fix); flock orphan detection. cluster-wide shared-FS cache REJECTED — builder air-gap"}
 {"plan":575,"title":"streaming open() for files > STREAM_THRESHOLD (StatBlob → ChunkMeta[]; during-fill KEEP_CACHE; priority-bump read; Promote on completion)","deps":[559,570,571],"crate":"rio-builder","priority":80,"status":"UNIMPL","complexity":"LOW","note":"~80 LoC; spike 15a9db79 proves no mode-flip; chunk list from StatBlob (P0570), no client resolver; unit-level exit via tests/stream.rs"}
 {"plan":560,"title":"[ATOMIC] castore-FUSE cutover: §A mount+overlay+DELETE old-FUSE (~-4600 LoC) §B fixture kernel + vm:castore-e2e + spike-regression cherry-pick","deps":[576,557,559,567,571,575,589],"crate":"rio-builder,nix","priority":80,"status":"UNIMPL","complexity":"HIGH","note":"hard cutover; one worktree, one PR, one checks gate; P0556 dep dropped (abandoned); needs P0589 so builder HMAC tokens carry tenant_id at cutover"}
@@ -791,19 +791,20 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 | `builder.fs.streaming-open` | components/builder.md | castore_fuse/open.rs (P0575) | vm-castore-e2e `cold-read` <50ms (P0560§B) |
 | `builder.fs.streaming-open-threshold` | decisions/022 §2.8 | config.rs (P0575) | vm-castore-e2e `cold-read` (P0560§B) |
 | `store.index.dir-digest` | components/store.md | rio-nix/nar.rs (P0572) | proptest (P0572) |
-| `store.castore.canonical-encoding` | components/store.md | rio-proto/castore.proto (P0572) | golden-bytes (P0572) |
-| `store.castore.directory-rpc` | components/store.md | rio-store/grpc/directory.rs (P0573) | unit (P0573) |
-| `store.castore.blob-read` | components/store.md | rio-store/grpc/directory.rs (P0577) | unit (P0577) |
-| `store.castore.gc` | components/store.md | rio-store/nar_index.rs + gc.rs (P0572) | rio-store/tests/gc.rs (P0572) |
+| `store.castore.canonical-encoding` | decisions/022-design-overview §8 | rio-proto/castore.proto (P0572) | golden-bytes (P0572) |
+| `store.castore.directory-rpc` | decisions/022-design-overview §8 | rio-store/grpc/directory.rs (P0573) | unit (P0573) |
+| `store.castore.blob-read` | decisions/022-design-overview §8 | rio-store/grpc/directory.rs (P0577) | unit (P0577) |
+| `store.castore.gc` | components/store.md | rio-store/nar_index.rs + gc/sweep.rs (P0572) | rio-store/tests/gc.rs (P0572) |
 | `store.castore.tenant-scope` | components/store.md | rio-store/grpc/directory.rs (P0573+P0577) | unit cross-tenant-probe (P0573) |
 | `store.index.nar-ls-streaming` | components/store.md | rio-nix/nar.rs (P0546) | unit panic-on-seek (P0546) |
 | `gw.substitute.dag-delta-sync` | components/gateway.md | rio-gateway/substitute/dag_sync.rs (P0574) | vm-dag-delta-sync (P0574) |
 | `builder.result.input-eio-is-infra` | components/builder.md | executor/mod.rs (P0560§A, ported) | vm-castore-e2e `eio-on-fetch-fail` (P0560§B) |
-| `builder.mountd.fuse-handoff` | components/builder.md | bin/rio-mountd.rs (P0567) | vm-castore-e2e `cold-read` (P0560§B) |
-| `builder.mountd.backing-broker` | components/builder.md | bin/rio-mountd.rs (P0567) | composefs-spike-priv `passthrough-under-overlay` (P0578) |
+| `builder.mountd.fuse-handoff` | decisions/022-design-overview §11 | bin/rio-mountd.rs (P0567) | vm-castore-e2e `cold-read` (P0560§B) |
+| `builder.mountd.backing-broker` | decisions/022-design-overview §11 | bin/rio-mountd.rs (P0567) | composefs-spike-priv `passthrough-under-overlay` (P0578) |
 | `builder.mountd.promote-verified` | decisions/022 §2.6 | bin/rio-mountd.rs (P0567) | composefs-spike-priv `passthrough-under-overlay` (P0578) + vm-castore-e2e `integrity-fail` (P0560§B) |
 | `builder.mountd.orphan-scan` | decisions/022 §2.5 | bin/rio-mountd.rs (P0567) | vm-castore-e2e `mountd-restart` (P0560§B) |
-| `builder.mountd.concurrency` | components/builder.md | bin/rio-mountd.rs (P0567) | composefs-spike-priv (vi) (P0578) |
+| `builder.mountd.concurrency` | decisions/022-design-overview §11 | bin/rio-mountd.rs (P0567) | composefs-spike-priv (vi) (P0578) |
+| `sec.boundary.mountd` | security.md | bin/rio-mountd.rs (P0567) | composefs-spike-priv `build-id-traversal-reject`+`second-conn-same-uid` (P0578) |
 | `builder.mountd.build-id-validated` | components/builder.md | bin/rio-mountd.rs (P0567) | composefs-spike-priv `build-id-traversal-reject` (P0578) |
 | `builder.mountd.uid-bound` | components/builder.md | bin/rio-mountd.rs (P0567) | composefs-spike-priv `second-conn-same-uid` (P0578) |
 | `builder.mountd.staging-quota` | components/builder.md | bin/rio-mountd.rs (P0567) | composefs-spike-priv `staging-quota` (P0578) |
@@ -818,7 +819,7 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 | `store.compat.narinfo-on-put` | components/store.md | compat/writer.rs (P0566) | unit (P0566) |
 | `store.compat.write-after-commit` | components/store.md | grpc/put_path.rs (P0566) | unit (P0566) |
 | `store.compat.stock-nix-substitute` | components/store.md | (verify-only) | vm-store-compat `stock-nix-substitute` (P0580) |
-| `store.compat.gc-coupled` | components/store.md | gc.rs (P0581) | rio-store/tests/gc.rs (P0581) |
+| `store.compat.gc-coupled` | components/store.md | gc/sweep.rs (P0581) | rio-store/tests/gc.rs (P0581) |
 | `obs.metric.compat` | observability.md | rio-store/lib.rs (P0566) | vm-store-compat (P0580) |
 | `obs.metric.chunk-backend-tiered` | observability.md | rio-store/lib.rs (P0548) | vm-store-tiered (P0555) |
 | `obs.metric.castore-fuse` | observability.md | rio-builder/lib.rs (P0559) | vm-castore-e2e (P0560§B) |
@@ -860,7 +861,7 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 |---|---|---|
 | `rio-store/src/backend.rs` → `backend/{mod.rs,tiered.rs}` | P0548 (`git mv backend.rs backend/mod.rs` + add `tiered.rs`), P0549 | P0548 → P0549 (dep edge) |
 | `rio-store/src/grpc/mod.rs` | P0552, P0557 | P0552 → P0557 (dep edge) |
-| `rio-store/src/grpc/put_path.rs` | P0566, P0557, P0583, P0584 | P0583 (size-branch removal) first; P0584 (token-role gate, top of handler) independent of P0566/P0557 (append after `complete_manifest`) — P0557 rebases on P0566 |
+| `rio-store/src/grpc/put_path/` | P0566, P0557, P0583, P0584 | P0583 (size-branch removal) first; P0584 (token-role gate, top of handler) independent of P0566/P0557 (append after `complete_manifest`) — P0557 rebases on P0566 |
 | `rio-store/src/grpc/get_path.rs` | P0583 only | — |
 | `rio-store/src/metadata/{inline.rs,chunked.rs,mod.rs}` | P0583 only | — |
 | `rio-store/src/nar_index.rs` | P0552 (create), P0572 (directories insert), P0557 (eager) | P0552 → P0572 → P0557 |
@@ -879,7 +880,7 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 | `nix/nixos-node/eks-node.nix` | P0564, P0571 | distinct hunks (drop smarter-device-manager static-pod vs tmpfiles) |
 | `migrations/054_nar_index.sql` | P0551, P0572, P0581, P0583, P0586 | P0551 → P0572 → P0581 → P0583 → P0586; same migration file (greenfield); **NOT added to `PINNED` until P0586** (`migration_checksums_frozen` would fail every intermediate plan otherwise) |
 | `rio-proto/proto/types.proto` | P0545, P0572 | P0545 → P0572 (append fields 7, 8) |
-| `rio-proto/proto/store.proto` | P0568, P0573, P0577, P0586 | append-only RPC additions; no ordering constraint |
+| `rio-proto/proto/store.proto` | P0568, P0570, P0573, P0577, P0586 | append-only RPC additions; no ordering constraint |
 | `rio-builder/src/upload.rs` | P0586 only (rewrite) | — |
 | `rio-store/src/grpc/chunk.rs` | P0568, P0586 | P0568 → P0586 (HasChunks appended) |
 | `rio-nix/src/nar.rs` | P0546, P0572 | P0546 → P0572 (second pass in same fn) |
@@ -897,7 +898,7 @@ git -C ../main/.claude/worktrees/agent-acf26042 log --oneline -3
 nix build .#checks.x86_64-linux.vm-composefs-spike-priv  # P0541
 
 # Phase 0 measurement
-nix develop -c cargo xtask measure v4-v11-v12 --closure chromium
+nix develop -c cargo xtask measure v12 --closure chromium
 
 # Phase 3 cache-tier flip (FIRST SHIPPED VALUE)
 nix develop -c cargo xtask k8s -p eks tofu apply -target=aws_s3_directory_bucket.cache
@@ -927,4 +928,3 @@ helm upgrade rio infra/helm/rio-build --reuse-values --set store.chunkBackend.ki
 - **Kernel `BACKING_OPEN` `d_is_reg` relaxation** — [`backing.c:105-108`](https://github.com/torvalds/linux/blob/master/fs/fuse/backing.c) rejects block-device fds. If lifted upstream, `ublk`-per-giant becomes a viable shared-verified-partial primitive (still needs chunk-addressed verify underneath, but would let B passthrough A's in-progress fill).
 - **fs-verity on the backing cache** — would give kernel-side integrity for warm passthrough reads from `/var/rio/cache/`. The cache is already real ext4/xfs hostPath; mountd would `FS_IOC_ENABLE_VERITY` after the `Promote` rename so passthrough reads are kernel-verified. Followup after P0562.
 - **Cross-region deployment** — globally-consistent metadata store, object-store cross-region replication, per-region cache tiers. This plan ensures forward-compat (object-store-authoritative, cache tier stateless) but does not implement it.
-- **Upload-path chunk-granular dedup (`PutPathChunked`)** — sequenced as P0586.

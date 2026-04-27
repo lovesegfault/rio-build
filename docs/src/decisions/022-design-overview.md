@@ -136,9 +136,7 @@ The handler negotiates `FUSE_PASSTHROUGH` at `init` (`max_stack_depth = 1`). `FU
 
 The FUSE `read` op exists only for case (3)'s window; in steady state every open is passthrough and the handler is a broker, not a server.
 
-r[builder.fs.shared-backing-cache]
 r[builder.fs.node-digest-cache]
-r[builder.mountd.promote-verified]
 
 The FUSE **mount point** is per-build (`/var/rio/castore/{build_id}/`) so one build's mount namespace never exposes another's. The **backing cache** (`/var/rio/cache/`) is node-shared SSD, **owned by `rio-mountd` and read-only to builder pods**. Builders fetch into a per-build **staging dir** (`/var/rio/staging/{build_id}/`, builder-writable); after verify they send `Promote{digest}` to mountd, which stream-copies from staging into a fresh mountd-owned cache file while re-hashing, and renames into place only on `blake3 == digest`. The copy is the integrity boundary — the cache inode is one mountd created and verified; a sandbox-escaped build cannot poison it.
 
