@@ -136,10 +136,17 @@ let
   # different realization than the one currently in the store
   # (ci-failure-patterns.md "IFD × non-determinism"). Format matches
   # HmacSigner::sign: base64url_nopad(json) "." base64url_nopad(tag).
+  # The decoded key is byte-trimmed for trailing CRLF/LF — mirrors
+  # rio_auth::hmac::load_key (the verifier's loader); hmac-keys.nix
+  # appends LF as a tripwire so a non-trimming signer fails CI.
   signServiceToken = pkgs.writeScript "sign-service-token-lifecycle" ''
     #!${pkgs.python3}/bin/python3
     import base64, hashlib, hmac, json, sys, time
     key = base64.b64decode(sys.stdin.read().strip())
+    for suf in (b"\r\n", b"\n"):
+        if key.endswith(suf):
+            key = key[: -len(suf)]
+            break
     claims = json.dumps(
         {"caller": "rio-cli", "expiry_unix": int(time.time()) + 3600},
         separators=(",", ":"),
