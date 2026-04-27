@@ -985,50 +985,50 @@ impl DagActor {
                 )
             }
             None => {
-                // R5B3: `intent_for` fallback's `_infeasible_total`
-                // anchor. `was_miss` was the wrong gate: drvs that
-                // never reach the memo (`hw_cost_source=None` /
-                // `hw_classes={}` / FOD / featured / serial / forced-
-                // tier) have `was_miss=false` initial → suppressed
-                // forever; under helm-default `hwCostSource: ""` that's
-                // EVERY drv → metric flat zero. New anchor is once-per-
-                // `(mkh, fit_content_hash)`: refit re-arms; stable
-                // across polls. With-memo path (currently always
-                // `hw_emitted=true` here, so the `last_infeasible_fh`
-                // check is shadowed but architecturally placed) uses
-                // the entry; no-memo path uses `infeasible_static_fh`.
-                // No fit → `intent_for` early-returns before its emit,
-                // so `suppress` is irrelevant; pass `true`.
-                let suppress = hw_emitted
-                    || match &memo_entry {
-                        Some((mkh, ovr, e)) => {
-                            let fh = e.fit_content_hash;
-                            let seen = e.last_infeasible_fh == Some(fh);
-                            if !seen {
-                                self.solve_cache.update_entry(*mkh, *ovr, |e| {
-                                    e.last_infeasible_fh = Some(fh);
-                                });
-                            }
-                            seen
-                        }
-                        None => fit.as_ref().is_none_or(|f| {
-                            let ovr = solve::override_hash(override_.as_ref());
-                            self.solve_cache.infeasible_static_seen(
-                                solve::model_key_hash(&f.key),
-                                ovr,
-                                solve::fit_content_hash(f),
-                            )
-                        }),
-                    };
-                let (c, m, d) = solve::intent_for(
+                let solve::IntentDecision {
+                    cores: c,
+                    mem: m,
+                    disk: d,
+                    infeasible,
+                } = solve::intent_for(
                     fit.as_ref(),
                     &hints,
                     override_.as_ref(),
                     &self.sla_config,
                     &self.sla_tiers,
                     &self.sla_ceilings,
-                    suppress,
                 );
+                // R5B3/R7B1: `intent_for` fallback's `_infeasible_total`
+                // anchor. `intent_for` is pure — `infeasible.is_some()`
+                // iff execution reached past every hints/override/
+                // explore early-return, so the debounce records iff the
+                // emit WOULD fire (bug 035: recording before the call
+                // let a serial drv burn the slot then early-return).
+                // `hw_emitted` stays load-bearing: with-memo BestEffort
+                // emits at :821 and falls through to here, so the
+                // `Some(..)` memo_entry arm is structurally unreachable
+                // (`memo_entry.is_some() ⟹ hw_emitted`) — that
+                // debounce lives at :821, not here (the prior
+                // `last_infeasible_fh` check was shadowed but
+                // architecturally placed; collapsed). No-memo anchor is
+                // once-per-`(mkh, ovr, fit_content_hash)` via
+                // `infeasible_static_fh`: refit re-arms; stable across
+                // polls.
+                if let Some(reason) = infeasible
+                    && !hw_emitted
+                {
+                    let ovr = solve::override_hash(override_.as_ref());
+                    let seen = fit.as_ref().is_some_and(|f| {
+                        self.solve_cache.infeasible_static_seen(
+                            solve::model_key_hash(&f.key),
+                            ovr,
+                            solve::fit_content_hash(f),
+                        )
+                    });
+                    if !seen {
+                        reason.emit(&tenant);
+                    }
+                }
                 (c, m, d, Vec::new(), Vec::new(), None)
             }
         };

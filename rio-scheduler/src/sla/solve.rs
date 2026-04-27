@@ -340,14 +340,7 @@ pub fn intent_for(
     cfg: &SlaConfig,
     tiers: &[Tier],
     ceil: &Ceilings,
-    // `true` when the hw-aware path already emitted (`BestEffort.why`
-    // at the dispatch wrapper — double-count) OR the caller's
-    // once-per-`(mkh, fit_content_hash)` anchor says this fit was
-    // already counted. NOT `was_miss`-derived: drvs on the hw-agnostic
-    // path (static-mode / FOD / featured / serial) never reach the memo
-    // and would be permanently suppressed.
-    suppress_infeasible_metric: bool,
-) -> (u32, u64, u64) {
+) -> IntentDecision {
     // Feature-aware probe + headroom-scaled mem hoisted ONCE so every
     // early-return branch reads the same definitions as `solve_mvp` /
     // `solve_full` / `explore::next`. Before, the forced_cores /
@@ -383,7 +376,12 @@ pub fn intent_for(
         let mem = o
             .forced_mem
             .unwrap_or_else(|| fit_mem_at(c).unwrap_or(probe_mem));
-        return (cores, mem, fit_disk);
+        return IntentDecision {
+            cores,
+            mem,
+            disk: fit_disk,
+            infeasible: None,
+        };
     }
     // Drv hints pin ONLY cores; mem/disk fall back to the fit when
     // available. `resource_floor` is per-drv_hash, so a new version of
@@ -402,11 +400,21 @@ pub fn intent_for(
             .and_then(|f| f.disk_p90)
             .map_or(LOCAL_DISK_BYTES, |d| d.0)
             .min(ceil.max_disk);
-        return (LOCAL_CORES, forced_mem.unwrap_or(LOCAL_MEM_BYTES), disk);
+        return IntentDecision {
+            cores: LOCAL_CORES,
+            mem: forced_mem.unwrap_or(LOCAL_MEM_BYTES),
+            disk,
+            infeasible: None,
+        };
     }
     if hints.enable_parallel_building == Some(false) {
         let mem = forced_mem.or_else(|| fit_mem_at(1.0)).unwrap_or(probe_mem);
-        return (1, mem, fit_disk);
+        return IntentDecision {
+            cores: 1,
+            mem,
+            disk: fit_disk,
+            infeasible: None,
+        };
     }
     let fit = match fit {
         // R6B4: `!Probe ⟹ n_eff_ring≥3 ∧ span≥4` (one-directional —
@@ -421,11 +429,12 @@ pub fn intent_for(
             // Explore ladder: saturation-gated ×4/÷2 from cfg.probe.
             let d = explore::next(fit, cfg, hints);
             let mem = forced_mem.unwrap_or(d.mem.0);
-            return (
-                (d.c.0.ceil() as u32).max(1),
+            return IntentDecision {
+                cores: (d.c.0.ceil() as u32).max(1),
                 mem,
-                d.disk.0.min(ceil.max_disk),
-            );
+                disk: d.disk.0.min(ceil.max_disk),
+                infeasible: None,
+            };
         }
     };
     // tier override: solve against ONLY that tier's bounds. An unknown
@@ -443,22 +452,42 @@ pub fn intent_for(
     // Infeasible-at-any-tier — the operator-facing alerting hook
     // (observability.md). Gated on "≥1 tier had bounds": a pure
     // best-effort ladder (`tiers=[{p*:None}]`) or an empty ladder
-    // (unknown pinned-tier override) is not an exhaust event. Emitted
-    // HERE (the actual sizing decision-point for the non-hw-cost path)
-    // so `solve_mvp` stays pure for tier-name lookup callers.
-    if !suppress_infeasible_metric
-        && matches!(r, SolveResult::BestEffort { .. })
+    // (unknown pinned-tier override) is not an exhaust event. R7B1:
+    // returned (NOT emitted) so the caller's debounce records iff
+    // execution reached past every early-return above — a future
+    // early-return cannot reintroduce the bug 035 record-before-emit
+    // gap. `intent_for` is now pure.
+    let infeasible = (matches!(r, SolveResult::BestEffort { .. })
         && tiers
             .iter()
-            .any(|t| t.p50.is_some() || t.p90.is_some() || t.p99.is_some())
-    {
-        classify_ceiling(fit, tiers, ceil).emit(&fit.key.tenant);
-    }
+            .any(|t| t.p50.is_some() || t.p90.is_some() || t.p99.is_some()))
+    .then(|| classify_ceiling(fit, tiers, ceil));
     // ceil + clamp ≥1: solve_mvp's c_star is already ≥1.0 but
     // BestEffort.c can be fractional below 1 for degenerate fits.
     let cores = (r.cores().0.ceil() as u32).max(1);
     let mem = forced_mem.unwrap_or(r.mem().0);
-    (cores, mem, r.disk().0)
+    IntentDecision {
+        cores,
+        mem,
+        disk: r.disk().0,
+        infeasible,
+    }
+}
+
+/// [`intent_for`]'s result. Named struct (NOT a 4-tuple) because
+/// `mem`/`disk` are both `u64` — swap-silent across the ~16 callers.
+///
+/// `infeasible = Some(reason)` iff execution reached the post-
+/// `solve_mvp` BestEffort fallthrough with ≥1 bounded tier — i.e. the
+/// hw-agnostic path's `_infeasible_total{reason}` would fire. Every
+/// hints/override/explore early-return yields `None`. The caller owns
+/// debounce + `.emit()`; `intent_for` is pure (R7B1 / bug 035).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntentDecision {
+    pub cores: u32,
+    pub mem: u64,
+    pub disk: u64,
+    pub infeasible: Option<InfeasibleReason>,
 }
 
 // r[impl sched.sla.tier-envelope]
@@ -1609,15 +1638,10 @@ mod tests {
     // ─── intent_for branching ───────────────────────────────────────
 
     fn intent(fit: Option<&FittedParams>, hints: &DrvHints) -> (u32, u64, u64) {
-        intent_for(
-            fit,
-            hints,
-            None,
-            &cfg(),
-            &[t("normal", 1200.0)],
-            &ceil(),
-            false,
-        )
+        let IntentDecision {
+            cores, mem, disk, ..
+        } = intent_for(fit, hints, None, &cfg(), &[t("normal", 1200.0)], &ceil());
+        (cores, mem, disk)
     }
 
     // r[verify sched.sla.override-precedence]
@@ -1630,17 +1654,16 @@ mod tests {
             forced_mem: Some(32 << 30),
             ..Default::default()
         };
-        let (c, m, _) = intent_for(
+        let IntentDecision { cores, mem, .. } = intent_for(
             Some(&fit),
             &DrvHints::default(),
             Some(&o),
             &cfg(),
             &[t("normal", 1200.0)],
             &ceil(),
-            false,
         );
-        assert_eq!(c, 12);
-        assert_eq!(m, 32 << 30);
+        assert_eq!(cores, 12);
+        assert_eq!(mem, 32 << 30);
     }
     #[test]
     fn override_beats_prefer_local() {
@@ -1649,7 +1672,7 @@ mod tests {
             forced_cores: Some(12.0),
             ..Default::default()
         };
-        let (c, _, _) = intent_for(
+        let IntentDecision { cores, .. } = intent_for(
             None,
             &DrvHints {
                 prefer_local_build: Some(true),
@@ -1659,9 +1682,8 @@ mod tests {
             &cfg(),
             &[],
             &ceil(),
-            false,
         );
-        assert_eq!(c, 12);
+        assert_eq!(cores, 12);
     }
     #[test]
     fn override_tier_filters_solve_ladder() {
@@ -1681,9 +1703,8 @@ mod tests {
                 &cfg(),
                 &tiers,
                 &ceil(),
-                false,
             )
-            .0
+            .cores
         };
         let unpinned = intent_for(
             Some(&fit),
@@ -1692,9 +1713,8 @@ mod tests {
             &cfg(),
             &tiers,
             &ceil(),
-            false,
         )
-        .0;
+        .cores;
         assert_eq!(unpinned, 9);
         assert_eq!(with("slow"), 2, "pinned tier=slow skips fast");
         assert_eq!(with("fast"), 9);
@@ -1708,29 +1728,21 @@ mod tests {
             forced_mem: Some(64 << 30),
             ..Default::default()
         };
-        let (c, m, _) = intent_for(
+        let IntentDecision { cores, mem, .. } = intent_for(
             Some(&fit),
             &DrvHints::default(),
             Some(&o),
             &cfg(),
             &[t("normal", 1200.0)],
             &ceil(),
-            false,
         );
-        assert_eq!(c, 2, "cores still solved");
-        assert_eq!(m, 64 << 30, "mem forced");
+        assert_eq!(cores, 2, "cores still solved");
+        assert_eq!(mem, 64 << 30, "mem forced");
         // Also applies on the explore path (no fit).
-        let (c, m, _) = intent_for(
-            None,
-            &DrvHints::default(),
-            Some(&o),
-            &cfg(),
-            &[],
-            &ceil(),
-            false,
-        );
-        assert_eq!(c, 4, "probe.cpu");
-        assert_eq!(m, 64 << 30);
+        let IntentDecision { cores, mem, .. } =
+            intent_for(None, &DrvHints::default(), Some(&o), &cfg(), &[], &ceil());
+        assert_eq!(cores, 4, "probe.cpu");
+        assert_eq!(mem, 64 << 30);
     }
 
     // r[verify sched.sla.explore-freeze]
@@ -1752,17 +1764,16 @@ mod tests {
             last_wall: WallSeconds(100.0),
         };
         assert!(explore::frozen(&f.explore, 64.0), "precondition: frozen");
-        let (c, _, _) = intent_for(
+        let IntentDecision { cores, .. } = intent_for(
             Some(&f),
             &DrvHints::default(),
             None,
             &cfg(),
             &[t("normal", 1200.0)],
             &ceil(),
-            false,
         );
         assert_eq!(
-            c, 2,
+            cores, 2,
             "Probe fit (frozen, span<4) routes to explore → max_c=2, NOT max_cores=64"
         );
     }
@@ -1837,19 +1848,18 @@ mod tests {
             forced_cores: Some(12.0),
             ..Default::default()
         };
-        let (c, m, _) = intent_for(
+        let IntentDecision { cores, mem, .. } = intent_for(
             Some(&fit),
             &DrvHints::default(),
             Some(&o),
             &cfg(),
             &[],
             &ceil(),
-            false,
         );
-        assert_eq!(c, 12);
+        assert_eq!(cores, 12);
         let raw = fit.mem.at(RawCores(12.0)).0;
-        assert_eq!(m, (raw as f64 * headroom(fit.n_eff_ring)) as u64);
-        assert!(m > raw, "must include headroom factor");
+        assert_eq!(mem, (raw as f64 * headroom(fit.n_eff_ring)) as u64);
+        assert!(mem > raw, "must include headroom factor");
     }
     #[test]
     fn intent_for_probe_mem_honors_feature_probes() {
@@ -1871,10 +1881,10 @@ mod tests {
             required_features: vec!["kvm".into()],
             ..Default::default()
         };
-        let (c, m, _) = intent_for(None, &hints, None, &cfg, &[], &ceil(), false);
-        assert_eq!(c, 1);
+        let IntentDecision { cores, mem, .. } = intent_for(None, &hints, None, &cfg, &[], &ceil());
+        assert_eq!(cores, 1);
         // 4×2Gi + 16Gi = 24Gi (kvm probe), NOT 4×1Gi + 4Gi = 8Gi (default).
-        assert_eq!(m, 24 << 30, "feature_probes[kvm], not cfg.probe");
+        assert_eq!(mem, 24 << 30, "feature_probes[kvm], not cfg.probe");
     }
     #[test]
     fn serial_honors_forced_mem() {
@@ -1885,17 +1895,21 @@ mod tests {
             forced_mem: Some(64 << 30),
             ..Default::default()
         };
-        let go = |hints| intent_for(None, &hints, Some(&o), &cfg(), &[], &ceil(), false);
-        let (c, m, _) = go(DrvHints {
+        let go = |hints| intent_for(None, &hints, Some(&o), &cfg(), &[], &ceil());
+        let IntentDecision { cores, mem, .. } = go(DrvHints {
             enable_parallel_building: Some(false),
             ..Default::default()
         });
-        assert_eq!((c, m), (1, 64 << 30), "serial: cores pinned, mem forced");
-        let (c, m, _) = go(DrvHints {
+        assert_eq!(
+            (cores, mem),
+            (1, 64 << 30),
+            "serial: cores pinned, mem forced"
+        );
+        let IntentDecision { cores, mem, .. } = go(DrvHints {
             prefer_local_build: Some(true),
             ..Default::default()
         });
-        assert_eq!((c, m), (1, 64 << 30), "prefer_local: mem forced");
+        assert_eq!((cores, mem), (1, 64 << 30), "prefer_local: mem forced");
     }
     #[test]
     fn intent_for_cold_start_is_probe() {
@@ -1929,14 +1943,13 @@ mod tests {
             forced_cores: Some(12.0),
             ..Default::default()
         };
-        let (_, _, d) = intent_for(
+        let IntentDecision { disk: d, .. } = intent_for(
             Some(&fit),
             &DrvHints::default(),
             Some(&o),
             &cfg(),
             &[],
             &ceil(),
-            false,
         );
         assert!(d <= max, "forced_cores: disk {d} > max_disk {max}");
         // prefer_local_build.
@@ -2593,40 +2606,35 @@ mod tests {
     }
 
     #[test]
-    fn intent_for_emits_serial_floor_on_all_bounded_infeasible() {
-        let rec = metrics_util::debugging::DebuggingRecorder::new();
-        let snapshotter = rec.snapshotter();
-        metrics::with_local_recorder(&rec, || {
-            // T(c) ≫ 10 for all c ≤ 64: S=1e6. n_eff/span force the
-            // solve branch (not explore). S alone breaches the bound
-            // → classify_ceiling = SerialFloor (not the legacy
-            // catch-all `ceiling_exhausted`).
-            let fit = mk_fit(1e6, 0.0, 0.0, f64::INFINITY, 0.1);
-            intent_for(
-                Some(&fit),
-                &DrvHints::default(),
-                None,
-                &cfg(),
-                &[t("normal", 10.0)],
-                &ceil(),
-                false,
-            );
-        });
-        let m = infeasible_counts(&snapshotter);
-        for r in InfeasibleReason::ALL {
-            let want = u64::from(r == InfeasibleReason::SerialFloor);
-            assert_eq!(m.get(r.as_str()).copied().unwrap_or(0), want, "{r:?}");
-        }
+    fn intent_for_reports_serial_floor_on_all_bounded_infeasible() {
+        // T(c) ≫ 10 for all c ≤ 64: S=1e6. n_eff/span force the solve
+        // branch (not explore). S alone breaches the bound →
+        // classify_ceiling = SerialFloor (not the legacy catch-all
+        // `ceiling_exhausted`).
+        let fit = mk_fit(1e6, 0.0, 0.0, f64::INFINITY, 0.1);
+        let d = intent_for(
+            Some(&fit),
+            &DrvHints::default(),
+            None,
+            &cfg(),
+            &[t("normal", 10.0)],
+            &ceil(),
+        );
+        assert_eq!(d.infeasible, Some(InfeasibleReason::SerialFloor));
     }
 
-    /// `suppress_infeasible_metric` swallows the emit when the
-    /// hw-aware path already counted this drv via `BestEffort.why`.
+    /// R7B1: `intent_for` is pure — it returns the [`InfeasibleReason`]
+    /// for the caller's debounce to emit, never `.emit()`s itself. The
+    /// hints early-returns (`prefer_local_build`,
+    /// `enable_parallel_building`) yield `infeasible=None` so a serial
+    /// drv cannot burn the caller's debounce slot for a non-serial
+    /// sibling at the same `(mkh, ovr)` (bug 035).
     #[test]
-    fn intent_for_suppress_gates_emit() {
+    fn intent_for_is_pure_and_hints_yield_none() {
         let rec = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = rec.snapshotter();
-        metrics::with_local_recorder(&rec, || {
-            let fit = mk_fit(1e6, 0.0, 0.0, f64::INFINITY, 0.1);
+        let fit = mk_fit(1e6, 0.0, 0.0, f64::INFINITY, 0.1);
+        let d = metrics::with_local_recorder(&rec, || {
             intent_for(
                 Some(&fit),
                 &DrvHints::default(),
@@ -2634,12 +2642,37 @@ mod tests {
                 &cfg(),
                 &[t("normal", 10.0)],
                 &ceil(),
-                true,
-            );
+            )
         });
+        assert_eq!(d.infeasible, Some(InfeasibleReason::SerialFloor));
         let m = infeasible_counts(&snapshotter);
         for r in InfeasibleReason::ALL {
-            assert_eq!(m.get(r.as_str()).copied().unwrap_or(0), 0, "{r:?}");
+            assert_eq!(
+                m.get(r.as_str()).copied().unwrap_or(0),
+                0,
+                "{r:?}: intent_for is pure (caller owns .emit())"
+            );
+        }
+        // Hints early-returns → `infeasible=None` (the bug 035 close).
+        for hints in [
+            DrvHints {
+                enable_parallel_building: Some(false),
+                ..Default::default()
+            },
+            DrvHints {
+                prefer_local_build: Some(true),
+                ..Default::default()
+            },
+        ] {
+            let d = intent_for(
+                Some(&fit),
+                &hints,
+                None,
+                &cfg(),
+                &[t("normal", 10.0)],
+                &ceil(),
+            );
+            assert_eq!(d.infeasible, None, "{hints:?}");
         }
     }
 
@@ -3020,44 +3053,29 @@ mod tests {
     }
 
     #[test]
-    fn intent_for_no_emit_on_best_effort_tier() {
-        let rec = metrics_util::debugging::DebuggingRecorder::new();
-        let snapshotter = rec.snapshotter();
-        metrics::with_local_recorder(&rec, || {
-            let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
-            let unbounded = Tier {
-                name: "be".into(),
-                p50: None,
-                p90: None,
-                p99: None,
-            };
-            // Unbounded tier returns Feasible at cap_c (solve_envelope's
-            // no-bounds arm), so no BestEffort fallthrough.
-            intent_for(
-                Some(&fit),
-                &DrvHints::default(),
-                None,
-                &cfg(),
-                &[unbounded],
-                &ceil(),
-                false,
-            );
-            // Empty ladder (unknown pinned-tier) → BestEffort but NOT
-            // an exhaust event.
-            intent_for(
-                Some(&fit),
-                &DrvHints::default(),
-                None,
-                &cfg(),
-                &[],
-                &ceil(),
-                false,
-            );
-        });
-        let m = infeasible_counts(&snapshotter);
-        for r in InfeasibleReason::ALL {
-            assert_eq!(m.get(r.as_str()).copied().unwrap_or(0), 0, "{r:?}");
-        }
+    fn intent_for_no_infeasible_on_best_effort_tier() {
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        let unbounded = Tier {
+            name: "be".into(),
+            p50: None,
+            p90: None,
+            p99: None,
+        };
+        // Unbounded tier returns Feasible at cap_c (solve_envelope's
+        // no-bounds arm), so no BestEffort fallthrough.
+        let d = intent_for(
+            Some(&fit),
+            &DrvHints::default(),
+            None,
+            &cfg(),
+            &[unbounded],
+            &ceil(),
+        );
+        assert_eq!(d.infeasible, None, "unbounded tier");
+        // Empty ladder (unknown pinned-tier) → BestEffort but NOT an
+        // exhaust event.
+        let d = intent_for(Some(&fit), &DrvHints::default(), None, &cfg(), &[], &ceil());
+        assert_eq!(d.infeasible, None, "empty ladder");
     }
 
     #[test]

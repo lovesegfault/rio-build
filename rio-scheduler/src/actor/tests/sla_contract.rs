@@ -725,11 +725,7 @@ async fn contract_infeasible_static_hints_independent() {
         let ser = format!("d-ser-{k:02x}");
         let par = format!("d-par-{k:02x}");
         actor.test_inject_ready(&ser, Some("synth-hint"), "x86_64-linux", false);
-        actor
-            .dag
-            .node_mut(&ser)
-            .unwrap()
-            .enable_parallel_building = Some(false);
+        actor.dag.node_mut(&ser).unwrap().enable_parallel_building = Some(false);
         actor.test_inject_ready(&par, Some("synth-hint"), "x86_64-linux", false);
 
         let rec = DebuggingRecorder::new();
