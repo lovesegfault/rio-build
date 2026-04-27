@@ -296,6 +296,22 @@ mod tests {
     use super::super::solve::InfeasibleReason;
     use super::*;
 
+    /// `infeasible_counts` projects `(reason, tenant)` snapshot entries
+    /// to `reason` only — duplicate keys must SUM, not last-write-win.
+    /// bug 034: the `.filter_map().collect::<HashMap>()` form overwrote,
+    /// so two tenants emitting the same reason read as 1
+    /// (nondeterministic which tenant's count) instead of 2.
+    #[test]
+    fn infeasible_counts_sums_across_tenant() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        metrics::with_local_recorder(&rec, || {
+            InfeasibleReason::SerialFloor.emit("a");
+            InfeasibleReason::SerialFloor.emit("b");
+        });
+        assert_eq!(infeasible_counts(&snap)["serial_floor"], 2);
+    }
+
     /// ADR-023 §Observability pins exactly these six `reason` label
     /// values, in this order. The enum's `ALL` is the contract.
     #[test]
