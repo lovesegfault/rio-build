@@ -118,7 +118,10 @@ r[builder.mountd.build-id-validated]
 `rio-mountd` MUST reject `Mount{build_id}` unless `build_id` matches `^[A-Za-z0-9_-]{1,64}$`, and MUST construct all per-build filesystem paths via `openat()` against pre-opened `/var/rio/{castore,staging}` base dirfds with `O_NOFOLLOW` — never by string interpolation. mountd runs as root with init-ns `CAP_SYS_ADMIN`; an unvalidated `build_id` would let a sandbox-escaped build mount/rmdir/`rm -rf` arbitrary host paths.
 
 r[builder.mountd.uid-bound]
-`rio-mountd` MUST allow at most one live UDS connection per `SO_PEERCRED.uid`. With k8s userns, each pod has a distinct host-uid range; binding per-uid (not per-gid) prevents a sandbox-escaped build A from opening a fresh connection and issuing `Mount`/teardown for build B's `build_id`.
+`rio-mountd` MUST allow at most one live UDS connection per `SO_PEERCRED.uid`. With k8s userns, each pod has a distinct host-uid range; binding per-uid (not per-gid) prevents a sandbox-escaped build from opening a *second* connection.
+
+r[builder.mountd.build-id-unique]
+`rio-mountd` MUST reject `Mount{build_id}` with `DuplicateBuildId` if any live connection already holds that `build_id`. uid-bound alone does not prevent a compromised builder from using its *own first* `Mount` to claim a co-tenant's `build_id` (enumerable via `ls /var/rio/castore/`); the process-wide uniqueness check makes this an explicit security boundary, not an incidental `mkdirat EEXIST`.
 
 r[builder.mountd.staging-quota]
 `rio-mountd` MUST set an XFS project quota of `staging_quota_bytes` on `/var/rio/staging/{build_id}` at `mkdirat` time (`ioctl(FS_IOC_FSSETXATTR, {fsx_projid=hash(build_id), fsx_xflags|=PROJINHERIT})` then `Q_XSETQLIM`). The kernel enforces `ENOSPC` on the builder's `write(2)` once the staging dir reaches the limit; mountd does not need to observe writes. The builder-side self-tracking is best-effort early eviction. `Promote`/`PromoteChunks` additionally reject `TooLarge` for individual files exceeding `RIO_MOUNTD_MAX_PROMOTE_BYTES` / `FASTCDC_MAX_BYTES` respectively.
