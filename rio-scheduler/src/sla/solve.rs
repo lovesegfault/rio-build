@@ -117,7 +117,7 @@ impl SolveResult {
 /// into the four specific ceilings + `interrupt_runaway` so the alert
 /// names which dimension is binding. [`classify_ceiling`] computes the
 /// split for the [`solve_mvp`] BestEffort fallthrough.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InfeasibleReason {
     /// `S ≥ bound` at the loosest tier — even infinite cores can't help.
     SerialFloor,
@@ -758,24 +758,35 @@ fn evaluate_cell(
 }
 
 /// Fold per-cell rejections into the single [`InfeasibleReason`] label
-/// for `BestEffort.why`. `InterruptRunaway` iff **every** reject is
+/// for `BestEffort.why`. Rejections are **partitioned by capacity type
+/// at the source** ([`solve_full`] pushes to `spot_rejects` /
+/// `od_rejects` separately) so the spot-only `InterruptRunaway`
+/// predicate reads ONLY the population it's defined over — a future
+/// change to which [`CellReject`] variants OD can produce cannot break
+/// it (r6 bug 021: `cap_c.max(1.0)` made OD never λ-adjacent →
+/// `all(λ-adjacent)` over the mixed-cap vec was structurally always
+/// false → variant unreachable; fourth strike).
+///
+/// `InterruptRunaway` iff **every spot cell** rejected on
 /// `LambdaGate | CLoExceedsCap` — both are spot-only (OD has λ=0,
-/// `c_lo=1`, and [`solve_full`] floors `cap_c ≥ 1`), so a non-empty
-/// rejects vec containing only those means λ is the sole binding
-/// constraint. Any `Envelope | Mem | Disk | Menu` reject is a
-/// constraint that binds OD too; defer to [`classify_ceiling`] to name
-/// which static ceiling.
+/// `c_lo=1`, [`solve_full`] floors `cap_c ≥ 1`). OD may have failed
+/// for an unrelated reason; that reason is reported via
+/// [`classify_ceiling`] in the fallthrough. `od` is otherwise unread
+/// here — it's accepted so the call site can't accidentally pass spot
+/// rejects to a future OD-aware arm without the signature noticing.
 pub fn classify_best_effort(
-    rejects: &[(Cell, CellReject)],
+    spot: &[CellReject],
+    od: &[CellReject],
     fit: &FittedParams,
     tiers: &[Tier],
     ceil: &Ceilings,
 ) -> InfeasibleReason {
+    let _ = od;
     // Exhaustive match, NO `_` arm — a 7th `CellReject` variant is a
     // compile error here. `matches!()` desugars to `_ => false` and is
     // NOT compiler-checked (r5 merged_bug_014).
-    if !rejects.is_empty()
-        && rejects.iter().all(|(_, r)| match r {
+    if !spot.is_empty()
+        && spot.iter().all(|r| match r {
             CellReject::LambdaGate | CellReject::CLoExceedsCap => true,
             CellReject::EnvelopeInfeasible
             | CellReject::MemCeiling
@@ -832,7 +843,12 @@ pub fn solve_full(
     // `.max(1.0)` floor: `c_opt = √(p/q) < 1` (negative-scaling) or
     // `p̄ < 1` (idle-heavy) would otherwise make OD's `c_lo=1 > cap_c`
     // → `CLoExceedsCap` → `InterruptRunaway` mislabel. With the floor,
-    // [`CellReject::CLoExceedsCap`] is structurally spot-only.
+    // [`CellReject::CLoExceedsCap`] is structurally spot-only — and
+    // since `LambdaGate` is `if cap == Spot` only, OD can NEVER produce
+    // a λ-adjacent reject. That implication is now structural:
+    // `classify_best_effort` reads `spot_rejects` only for the
+    // `InterruptRunaway` predicate, so a future change to OD's
+    // reachable variants cannot affect it (r6 bug 021).
     let cap_c = fit
         .fit
         .p_bar()
@@ -844,18 +860,21 @@ pub fn solve_full(
     let disk = fit.disk_p90.map(|d| d.0).unwrap_or(ceil.default_disk);
     let tau = cfg.hw_cost_tolerance;
     let k = 2.0;
-    // Per-cell rejections accumulated across all tiers, folded by
-    // `classify_best_effort` at the BestEffort fallthrough. Making
-    // rejection a value (not control flow) means a new gate adds a
-    // `CellReject` variant and the classifier's match exhaustiveness
-    // catches it — the witness-flag approach instrumented 2/5 paths.
-    let mut rejects: Vec<(Cell, CellReject)> = Vec::new();
+    // Per-cell rejections accumulated across all tiers, partitioned by
+    // capacity type and folded by `classify_best_effort` at the
+    // BestEffort fallthrough. Making rejection a value (not control
+    // flow) means a new gate adds a `CellReject` variant and the
+    // classifier's match exhaustiveness catches it — the witness-flag
+    // approach instrumented 2/5 paths. The cap partition makes the
+    // spot-only `InterruptRunaway` predicate structurally independent
+    // of which variants OD can produce (r6 bug 021).
+    let mut spot_rejects: Vec<CellReject> = Vec::new();
+    let mut od_rejects: Vec<CellReject> = Vec::new();
 
     for tier in tiers {
         let mut candidates: Vec<Candidate> = Vec::with_capacity(h_set.len() * 2);
         for h in h_set {
             for cap in CapacityType::ALL {
-                let cell = (h.clone(), cap);
                 match evaluate_cell(fit, tier, hw, cost, ceil, h, cap, cap_c) {
                     Ok(c) => candidates.push(c),
                     Err(r) => {
@@ -872,7 +891,10 @@ pub fn solve_full(
                             )
                             .increment(1);
                         }
-                        rejects.push((cell, r));
+                        match cap {
+                            CapacityType::Spot => spot_rejects.push(r),
+                            CapacityType::Od => od_rejects.push(r),
+                        }
                     }
                 }
             }
@@ -949,7 +971,7 @@ pub fn solve_full(
         .flat_map(|h| CapacityType::ALL.map(|c| (h.clone(), c)))
         .collect();
     let mem = ((fit.mem.at(RawCores(cap_c)).0 as f64 * hr) as u64).min(ceil.max_mem);
-    let why = classify_best_effort(&rejects, fit, tiers, ceil);
+    let why = classify_best_effort(&spot_rejects, &od_rejects, fit, tiers, ceil);
     SolveFullResult::BestEffort {
         c: (cap_c.ceil() as u32).max(1),
         mem_bytes: mem,
@@ -2622,13 +2644,15 @@ mod tests {
     }
 
     /// λ gates every spot cell + OD price-infeasible (menu has no
-    /// fitting type) → `BestEffort`, but `why` is **NOT**
-    /// `InterruptRunaway`: OD's `MenuNoFit` reject is a non-λ
-    /// constraint, so [`classify_best_effort`] defers to
-    /// `classify_ceiling`. Regression for r2 bug_039's witness flags
-    /// which set `λ-gated ∧ ¬envelope-gated` here and mislabelled it.
-    /// `InterruptRunaway` is reachable only when **every** reject is
-    /// `LambdaGate | CLoExceedsCap` — see `classify_best_effort_fixtures`.
+    /// fitting type) → `BestEffort` with `why == InterruptRunaway`.
+    /// **This IS the unit-level reachability proof** for the variant:
+    /// `solve_full` partitions rejects by cap, `classify_best_effort`
+    /// reads spot-only for the λ predicate, so OD's `MenuNoFit` cannot
+    /// poison `all(λ-adjacent)`. Pre-R6B6 the mixed-cap `all()` was
+    /// structurally always-false (OD never λ-adjacent after the
+    /// `cap_c.max(1.0)` floor) → returned `CoreCeiling`; r6 bug 021.
+    ///
+    /// Contract-layer mirror: `contract_interrupt_runaway_reachable`.
     #[test]
     fn solve_full_besteffort_why_interrupt_runaway() {
         use super::super::cost::{InstanceType, RatioEma};
@@ -2676,21 +2700,37 @@ mod tests {
         let SolveFullResult::BestEffort { why, .. } = r else {
             panic!("λ-gated spot + OD menu-unfit → BestEffort, got {r:?}")
         };
-        // rejects = {LambdaGate ×3 (spot), MenuNoFit ×3 (OD)} → not
-        // all-λ → classify_ceiling. Envelope is feasible at p90=300 +
-        // mem under ceiling → CoreCeiling (the (Some, _) catch-all).
-        assert_ne!(why, InfeasibleReason::InterruptRunaway);
-        assert_eq!(why, InfeasibleReason::CoreCeiling);
+        // spot_rejects = {LambdaGate ×3}, od_rejects = {MenuNoFit ×3}.
+        // spot.all(λ-adjacent) = true → InterruptRunaway. OD's
+        // unrelated MenuNoFit is reported separately (classify_ceiling
+        // would say CoreCeiling, but spot's λ is the binding label).
+        assert_eq!(why, InfeasibleReason::InterruptRunaway);
 
-        // Counter-case: S=1e6 → envelope infeasible at cap_c for OD too
-        // (`solve_envelope → None` → EnvelopeInfeasible) → not all-λ →
-        // `classify_ceiling` → SerialFloor.
+        // Converse: spot rejects on a NON-λ reason → never
+        // InterruptRunaway. λ_hat ≈ (0 + 86400·seed)/(1e12 + 86400)
+        // ≈ 8e-12/s → p(cap_c)=1-e^{-8e-12·1e6}≈8e-6 < 0.5 → spot
+        // passes the λ gate; S=1e6 → solve_envelope → None → spot AND
+        // OD both EnvelopeInfeasible → spot.all(λ-adjacent)=false →
+        // classify_ceiling → SerialFloor.
+        let calm: HashMap<_, _> = h_set()
+            .into_iter()
+            .map(|h| {
+                (
+                    h,
+                    RatioEma {
+                        numerator: 0.0,
+                        denominator: 1e12,
+                        updated_at: 0.0,
+                    },
+                )
+            })
+            .collect();
         let fit = mk_fit(1e6, 0.0, 0.0, f64::INFINITY, 0.1);
         let r = solve_full(
             &fit,
             &[t("normal", 300.0)],
             &hw_three(),
-            &cost,
+            &CostTable::from_parts(HashMap::new(), calm),
             &ceil(),
             &cfg_hw(),
             &h_set(),
@@ -2756,94 +2796,182 @@ mod tests {
         );
     }
 
-    /// Table-driven [`classify_best_effort`] coverage: one fixture per
-    /// reachable [`InfeasibleReason`] variant + the converse (any
-    /// non-λ reject present → never `InterruptRunaway`). Tests the
-    /// classification logic directly — emit-site existence (r2 CR-2's
-    /// `SLA_LABELED_METRICS`) doesn't catch "fires when it shouldn't".
+    /// Table-driven [`classify_best_effort`] coverage. Each fixture row
+    /// is a `(spot, od)` pair mirroring what [`solve_full`] actually
+    /// produces (the cap-partition is at the source; r6 bug 021), plus
+    /// the `(fit, tiers)` that drive `classify_ceiling` on the
+    /// fallthrough. The final assertion is the registered≠emitted close
+    /// at the classification layer: every [`InfeasibleReason`] variant
+    /// reachable via [`classify_best_effort`] / its sibling
+    /// `CapacityExhausted` emit appears in `expected` for at least one
+    /// fixture row.
     #[test]
     fn classify_best_effort_fixtures() {
         use CellReject::*;
         use InfeasibleReason as R;
-        let dc = |rs: &[CellReject]| -> Vec<(Cell, CellReject)> {
-            rs.iter()
-                .map(|&r| (("h".into(), CapacityType::Spot), r))
-                .collect()
-        };
-        // S=1e6 → classify_ceiling = SerialFloor (the fallthrough when
-        // rejects has any non-λ entry).
-        let fit_serial = mk_fit(1e6, 0.0, 0.0, f64::INFINITY, 0.1);
-        let tier = [t("x", 10.0)];
-        const FIXTURES: &[(&[CellReject], InfeasibleReason)] = &[
-            // All λ-adjacent → InterruptRunaway. OD structurally cannot
-            // produce these (λ=0, c_lo=1).
-            (&[LambdaGate], R::InterruptRunaway),
-            (&[CLoExceedsCap], R::InterruptRunaway),
+        type Row = (
+            &'static [CellReject], // spot
+            &'static [CellReject], // od
+            fn() -> FittedParams,
+            f64, // tier p90
+            InfeasibleReason,
+        );
+        // Fits driving each `classify_ceiling` arm.
+        fn f_serial() -> FittedParams {
+            mk_fit(1e6, 0.0, 0.0, f64::INFINITY, 0.1)
+        }
+        fn f_disk() -> FittedParams {
+            let mut f = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+            f.disk_p90 = Some(DiskBytes(300 << 30));
+            f
+        }
+        fn f_mem() -> FittedParams {
+            let mut f = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+            f.mem = MemFit::Independent {
+                p90: MemBytes(512 << 30),
+            };
+            f
+        }
+        fn f_core() -> FittedParams {
+            mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1)
+        }
+        const FIXTURES: &[Row] = &[
+            // ── InterruptRunaway: spot all λ-adjacent. od is whatever
+            // OD failed on — irrelevant to the spot-only predicate.
             (
-                &[LambdaGate, CLoExceedsCap, LambdaGate],
+                &[LambdaGate],
+                &[MenuNoFit],
+                f_serial,
+                10.0,
                 R::InterruptRunaway,
             ),
-            // ANY non-λ reject → classify_ceiling (here SerialFloor).
-            // r2's witness flags missed CLoExceedsCap, MemCeiling,
-            // DiskCeiling, MenuNoFit — all four mislabelled as
-            // InterruptRunaway.
-            (&[LambdaGate, EnvelopeInfeasible], R::SerialFloor),
-            (&[LambdaGate, MemCeiling], R::SerialFloor),
-            (&[LambdaGate, DiskCeiling], R::SerialFloor),
-            (&[LambdaGate, MenuNoFit], R::SerialFloor),
-            (&[EnvelopeInfeasible, MemCeiling], R::SerialFloor),
-            // Empty → not InterruptRunaway (all() is vacuously true,
-            // but the !is_empty() guard prevents it).
-            (&[], R::SerialFloor),
+            (
+                &[CLoExceedsCap],
+                &[EnvelopeInfeasible],
+                f_serial,
+                10.0,
+                R::InterruptRunaway,
+            ),
+            (
+                &[LambdaGate, CLoExceedsCap, LambdaGate],
+                &[MenuNoFit, EnvelopeInfeasible, MemCeiling],
+                f_serial,
+                10.0,
+                R::InterruptRunaway,
+            ),
+            // od λ-adjacent (structurally impossible from solve_full,
+            // but classify_best_effort must not read it).
+            (
+                &[LambdaGate],
+                &[LambdaGate],
+                f_serial,
+                10.0,
+                R::InterruptRunaway,
+            ),
+            // ── ANY spot non-λ reject → classify_ceiling. r2's witness
+            // flags missed MemCeiling, DiskCeiling, MenuNoFit — all
+            // mislabelled as InterruptRunaway.
+            (
+                &[LambdaGate, EnvelopeInfeasible],
+                &[EnvelopeInfeasible],
+                f_serial,
+                10.0,
+                R::SerialFloor,
+            ),
+            (
+                &[LambdaGate, MemCeiling],
+                &[MemCeiling],
+                f_serial,
+                10.0,
+                R::SerialFloor,
+            ),
+            (
+                &[LambdaGate, DiskCeiling],
+                &[DiskCeiling],
+                f_serial,
+                10.0,
+                R::SerialFloor,
+            ),
+            (
+                &[LambdaGate, MenuNoFit],
+                &[MenuNoFit],
+                f_serial,
+                10.0,
+                R::SerialFloor,
+            ),
+            (
+                &[EnvelopeInfeasible, MemCeiling],
+                &[EnvelopeInfeasible],
+                f_serial,
+                10.0,
+                R::SerialFloor,
+            ),
+            // ── spot empty → not InterruptRunaway (all() vacuously
+            // true; !is_empty() guard prevents it). solve_full produces
+            // this when h_set=[] (ε_h singleton already-graduated edge).
+            (&[], &[], f_serial, 10.0, R::SerialFloor),
+            (&[], &[MenuNoFit], f_serial, 10.0, R::SerialFloor),
+            // ── classify_ceiling fallthrough variants (varying fit;
+            // spot has ≥1 non-λ so InterruptRunaway is off the table).
+            (
+                &[DiskCeiling],
+                &[DiskCeiling],
+                f_disk,
+                1200.0,
+                R::DiskCeiling,
+            ),
+            (&[MemCeiling], &[MemCeiling], f_mem, 1200.0, R::MemCeiling),
+            (
+                &[EnvelopeInfeasible],
+                &[EnvelopeInfeasible],
+                f_core,
+                1200.0,
+                R::CoreCeiling,
+            ),
         ];
-        for (rejects, want) in FIXTURES {
-            let got = classify_best_effort(&dc(rejects), &fit_serial, &tier, &ceil());
-            assert_eq!(got, *want, "rejects={rejects:?}");
+        for (spot, od, fit, p90, want) in FIXTURES {
+            let got = classify_best_effort(spot, od, &fit(), &[t("x", *p90)], &ceil());
+            assert_eq!(got, *want, "spot={spot:?} od={od:?}");
         }
-        // Converse: any of these in rejects → NEVER InterruptRunaway,
-        // regardless of how many λ-gates accompany it.
+        // Converse: any non-λ in SPOT → NEVER InterruptRunaway,
+        // regardless of how many λ-gates accompany it. A non-λ in OD
+        // alone does NOT poison (covered by row 0 above).
         for poison in [EnvelopeInfeasible, MemCeiling, DiskCeiling, MenuNoFit] {
             let got = classify_best_effort(
-                &dc(&[LambdaGate, LambdaGate, poison, CLoExceedsCap]),
-                &fit_serial,
-                &tier,
+                &[LambdaGate, LambdaGate, poison, CLoExceedsCap],
+                &[MenuNoFit],
+                &f_serial(),
+                &[t("x", 10.0)],
                 &ceil(),
             );
             assert_ne!(
                 got,
                 R::InterruptRunaway,
-                "{poison:?} present → never InterruptRunaway"
+                "{poison:?} in spot → never InterruptRunaway"
             );
         }
-        // Reachability of every classify_ceiling fallthrough variant
-        // through classify_best_effort (varying fit/ceil, fixed
-        // non-λ reject vec). CapacityExhausted is ICE-mask only, not
-        // reachable here.
-        let non_lambda = dc(&[LambdaGate, DiskCeiling]);
-        let mut fit_disk = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
-        fit_disk.disk_p90 = Some(DiskBytes(300 << 30));
-        assert_eq!(
-            classify_best_effort(&non_lambda, &fit_disk, &[t("x", 1200.0)], &ceil()),
-            R::DiskCeiling
-        );
-        let mut fit_mem = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
-        fit_mem.mem = MemFit::Independent {
-            p90: MemBytes(512 << 30),
-        };
-        assert_eq!(
-            classify_best_effort(&non_lambda, &fit_mem, &[t("x", 1200.0)], &ceil()),
-            R::MemCeiling
-        );
-        let fit_core = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
-        assert_eq!(
-            classify_best_effort(&non_lambda, &fit_core, &[t("x", 1200.0)], &ceil()),
-            R::CoreCeiling
-        );
+        // ── Registered≠emitted close at the classification layer:
+        // every `InfeasibleReason` variant appears in `expected` for at
+        // least one fixture row. `CapacityExhausted` is ICE-mask-only
+        // (emitted at snapshot.rs, not via classify_best_effort) — its
+        // reachability is asserted by `contract_metrics_once_per_miss`
+        // step (b); listed here so a new variant fails this loop.
+        let mut covered: std::collections::HashSet<InfeasibleReason> =
+            FIXTURES.iter().map(|r| r.4).collect();
+        covered.insert(R::CapacityExhausted);
+        for r in InfeasibleReason::ALL {
+            assert!(
+                covered.contains(&r),
+                "InfeasibleReason::{r:?} has no fixture row — add one or \
+                 the variant is unreachable (r6 bug 021: registered ≠ emitted)"
+            );
+        }
         // r5 merged_bug_014: c_opt=√(p/q)=0.5 (negative-scaling). Before
         // the `cap_c.max(1.0)` floor, cap_c=0.5 → OD's c_lo=1 > cap_c →
         // every cell `CLoExceedsCap` → all-λ → InterruptRunaway
         // mislabel. With the floor, cap_c=1.0 → OD falls through to
-        // `EnvelopeInfeasible` → `classify_ceiling` → CoreCeiling.
+        // `EnvelopeInfeasible`; spot at λ=seed also EnvelopeInfeasible
+        // (not λ-gated) → spot.all(λ-adjacent)=false → CoreCeiling.
         let fit_negscale = mk_fit(2.0, 1.0, 4.0, 64.0, 0.1);
         assert_eq!(fit_negscale.fit.c_opt().0, 0.5);
         let r = solve_full(
@@ -2863,7 +2991,7 @@ mod tests {
         assert_ne!(
             why,
             R::InterruptRunaway,
-            "cap_c floor: OD never CLoExceedsCap"
+            "cap_c floor: λ=seed → spot not λ-gated → not InterruptRunaway"
         );
         assert_eq!(why, R::CoreCeiling);
     }
