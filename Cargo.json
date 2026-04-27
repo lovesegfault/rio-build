@@ -31686,6 +31686,10 @@
           "packageId": "rio-crds"
         },
         {
+          "name": "rio-proto",
+          "packageId": "rio-proto"
+        },
+        {
           "name": "rio-scheduler",
           "packageId": "rio-scheduler"
         },

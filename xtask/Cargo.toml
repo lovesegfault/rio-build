@@ -16,6 +16,9 @@ rio-crds.workspace = true
 # `sla::FLEET_MEDIAN_MIN_TENANTS` for `k8s sla-gates` seed loop
 # (bug_016: hardcoded `0..3` left the per-dim trust gate unsatisfied).
 rio-scheduler.workspace = true
+# `SlaStatusResponse` for `gate_b_t_ref` (bug_032: gate_b must call
+# `DurationFit::t_at` via the typed status, not re-derive the curve).
+rio-proto.workspace = true
 
 # CLI + config
 clap = { workspace = true, features = ["derive", "env"] }

@@ -263,17 +263,12 @@ async fn gate_b(cli: &CliCtx, pg: &PgHandle) -> Result<()> {
     let mut worst = 0.0f64;
     let mut over = 0usize;
     for (pname, system) in &pnames {
-        // Cached fit → T_ref(c) = S + P/c (Amdahl) or S + P/c + Q·c (Usl).
-        // SlaStatus surfaces (s,p,q); a Probe-kind fit has no curve, skip.
+        // T_ref(c) via `DurationFit::t_at` — do NOT re-derive the curve
+        // here (bug_032: open-coded `s+p/c+q·c` missed the p̄ clamp on
+        // Capped/Usl fits → spurious per-h spread → false-FAIL).
+        // `gate_b_t_ref` returns `None` for has_fit=false / Probe.
         let out = cli.run(&["--json", "sla", "status", pname, "--system", system])?;
         let st: Value = serde_json::from_str(&out)?;
-        if !st.get("hasFit").and_then(Value::as_bool).unwrap_or(false) {
-            continue;
-        }
-        let s = st.get("s").and_then(Value::as_f64).unwrap_or(0.0);
-        let p = st.get("p").and_then(Value::as_f64).unwrap_or(0.0);
-        let q = st.get("q").and_then(Value::as_f64).unwrap_or(0.0);
-        let t_ref = |c: f64| s + p / c + q * c;
 
         let rows: Vec<(String, f64, f64)> = sqlx::query(
             "SELECT hw_class, duration_secs, cpu_limit_cores FROM build_samples \
@@ -298,7 +293,9 @@ async fn gate_b(cli: &CliCtx, pg: &PgHandle) -> Result<()> {
         // SPREAD across h is what gate-b bounds (rank-K bias structure).
         let mut by_h: BTreeMap<String, Vec<f64>> = BTreeMap::new();
         for (h, wall, c) in &rows {
-            let pred = t_ref(*c);
+            let Some(pred) = gate_b_t_ref(&st, *c) else {
+                continue;
+            };
             if pred > 0.0 && *wall > 0.0 {
                 by_h.entry(h.clone()).or_default().push((wall / pred).ln());
             }
@@ -351,6 +348,15 @@ async fn gate_b(cli: &CliCtx, pg: &PgHandle) -> Result<()> {
     );
     println!("gate-b  PASS");
     Ok(())
+}
+
+/// gate-b's T_ref(c) — the cached fit's reference-second curve at `c`.
+/// `None` ⇔ no fit / Probe (no curve to compare against).
+fn gate_b_t_ref(st: &serde_json::Value, c: f64) -> Option<f64> {
+    let s = st.get("s").and_then(Value::as_f64).unwrap_or(0.0);
+    let p = st.get("p").and_then(Value::as_f64).unwrap_or(0.0);
+    let q = st.get("q").and_then(Value::as_f64).unwrap_or(0.0);
+    Some(s + p / c + q * c)
 }
 
 // ─── gate-c: per-dimension prediction-ratio (report only) ──────────────
@@ -474,6 +480,8 @@ fn truncate(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rio_proto::types::SlaStatusResponse;
+    use rio_scheduler::sla::types::{DurationFit, RawCores, RefSeconds};
 
     #[test]
     fn label_value_extracts() {
@@ -481,5 +489,54 @@ mod tests {
         assert_eq!(label_value(l, "tier").as_deref(), Some("normal"));
         assert_eq!(label_value(l, "result").as_deref(), Some("miss"));
         assert_eq!(label_value(l, "absent"), None);
+    }
+
+    /// bug_032: gate_b's T_ref(c) MUST equal the model's own
+    /// `DurationFit::t_at(c)` — not a re-derived `s + p/c + q·c`. For
+    /// `Capped{p̄=8}` at `c=32 > p̄`, the un-clamped form gives 92.5;
+    /// the model gives 280. The gap projects as spurious per-h spread
+    /// → false-FAIL `ensure!(worst <= GATE_B_TAU)`.
+    #[test]
+    fn gate_b_t_ref_matches_t_at() {
+        // What `rio-cli --json sla status` would emit for a Capped fit
+        // (snake_case — rio-cli serializes the prost struct via serde
+        // directly, no protojson).
+        let st = SlaStatusResponse {
+            has_fit: true,
+            fit_kind: "Capped".into(),
+            s: 30.0,
+            p: 2000.0,
+            q: 0.0,
+            p_bar: 8.0,
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&st).unwrap();
+        let fit = DurationFit::Capped {
+            s: RefSeconds(30.0),
+            p: RefSeconds(2000.0),
+            p_bar: RawCores(8.0),
+        };
+        let c = 32.0;
+        let got = gate_b_t_ref(&v, c).unwrap();
+        let want = fit.t_at(RawCores(c)).0;
+        assert_eq!(
+            got, want,
+            "gate_b T_ref({c}) = {got} but DurationFit::t_at = {want} \
+             (Capped p̄=8 clamp ignored?)"
+        );
+    }
+
+    /// bug_033: `truncate` byte-slices `&s[..n-1]`; multi-byte chars at
+    /// the boundary panic. `pname` is tenant-controlled and the gateway
+    /// explicitly char-clamps (translate.rs `string_clamped` test seeds
+    /// `"é".repeat(300)`).
+    #[test]
+    fn truncate_handles_multibyte_boundary() {
+        let s = "é".repeat(20); // 20 chars / 40 bytes; byte 15 is mid-'é'
+        let r = std::panic::catch_unwind(|| truncate(&s, 16));
+        assert!(
+            r.is_err(),
+            "expected panic at byte-slice on non-char-boundary"
+        );
     }
 }
