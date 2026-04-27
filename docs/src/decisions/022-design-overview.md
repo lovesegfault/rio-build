@@ -77,11 +77,17 @@ r[builder.fs.castore-stack]
 
 The builder assembles `/nix/store` from two layers per build:
 
-1. **castore-FUSE** — a `fuser` filesystem mounted at `/var/rio/castore/{build_id}/` serving the closure's Directory DAG (§8). `lookup`/`getattr`/`readdir`/`readlink` are answered from an in-heap `HashMap<u64, Node>` keyed by content-derived inode (`r[builder.fs.castore-inode-digest]`); `open()` resolves `ino → file_digest` and brokers a passthrough fd from the node-SSD backing cache. The tree is immutable for the mount's lifetime, so every reply carries `ttl: Duration::MAX` and `init` advertises `FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO | FUSE_PARALLEL_DIROPS | FUSE_CACHE_SYMLINKS` (`r[builder.fs.castore-cache-config]`).
+1. **castore-FUSE** — a `fuser` filesystem mounted at `/var/rio/castore/{build_id}/` serving the closure's Directory DAG (§8). `lookup`/`getattr`/`readdir`/`readlink` are answered from an in-heap `HashMap<u64, Node>` keyed by content-derived inode (`r[builder.fs.castore-inode-digest]`); `open()` resolves `ino → file_digest` and brokers a passthrough fd from the node-SSD backing cache. The tree is immutable for the mount's lifetime, so every reply carries `ttl: Duration::MAX` and `init` advertises `FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO | FUSE_PARALLEL_DIROPS | FUSE_CACHE_SYMLINKS` (`r[builder.fs.castore-cache-config]`). The mount-time DAG prefetch is wrapped in `timeout(dag_prefetch_timeout)` (default 30 s); expiry is an infra-retry, not a build failure.
+
+r[builder.overlay.castore-lower]
 
 2. **overlayfs** — a single **RW** mount with `upperdir=<ssd>/nix/store, workdir=<ssd>/work, userxattr, lowerdir=<castore_mnt>`; the merged dir is bind-mounted at the build's `/nix/store`. **Build outputs and the synthesized `db.sqlite` land in the upper** — same shape as the pre-ADR-022 mount; P0560 swaps only what the lower serves.
 
 The synthetic root (`FUSE_ROOT_ID`) is `/nix/store` itself; its children are the closure's store-path basenames mapping to each path's `root_digest`. Everything below is content-addressed.
+
+r[builder.fs.parity]
+
+The post-cutover `/nix/store` MUST be behaviourally indistinguishable from the pre-ADR-022 FUSE for every input-path read the Nix sandbox issues — same bytes, same `st_mode`/`st_size`/`st_mtime`, same symlink targets, same ENOENT for paths outside the closure. The cutover gate is the `vm-castore-e2e` parity subtest passing on every existing protocol/scheduling scenario.
 
 ### Per-syscall resolution
 
@@ -107,28 +113,25 @@ r[store.index.putpath-eager]
 r[store.index.non-authoritative]
 r[store.index.nar-ls-streaming]
 
-The index is computed eagerly during `PutPath` from the NAR stream (`nar_ls` + per-file blake3 in a single forward `Read` pass — no `Seek`, bounded memory regardless of NAR size), and persisted to the `nar_index` table keyed by `nar_hash`. It is **derived, non-authoritative** state: if a row is missing, `GetNarIndex` recomputes it synchronously from the stored NAR and writes it back. There is no separate artifact in object storage — the index is regenerable from the NAR.
+The index is computed eagerly during `PutPath` from the NAR stream (`nar_ls` + per-file blake3 in a single forward `Read` pass — no `Seek`, bounded memory regardless of NAR size), and persisted to the `nar_index` table keyed by `store_path_hash` (one row per manifest). It is **derived, non-authoritative** state: if a row is missing, `GetNarIndex` recomputes it synchronously from the stored NAR and writes it back. There is no separate artifact in object storage — the index is regenerable from the NAR.
 
 r[store.index.rpc]
 
-`GetNarIndex(nar_hash) → NarIndex` exposes this index. The builder no longer fetches it at mount time — the Directory DAG (§8) carries everything `lookup`/`getattr`/`readdir`/`readlink` need. `NarIndex` is consulted at `open()` time (via the `DigestResolver`, §6) to map `file_digest → (nar_hash, nar_offset) → chunk-range`, and by `ReadBlob` server-side.
+`GetNarIndex(nar_hash) → NarIndex` exposes this index. The builder does not fetch it at mount time — the Directory DAG (§8) carries everything `lookup`/`getattr`/`readdir`/`readlink` need. The `file_blobs` table (P0572's derived `file_digest → (nar_hash, nar_offset)` index) is consulted **server-side** by `ReadBlob`/`StatBlob` (§6) at `open()` time; the builder never holds chunk coordinates client-side.
 
 ## 6. Builder-side data path: castore-FUSE `open()`
 
 r[builder.fs.digest-fuse-open]
 
-The castore-FUSE handler serves the full tree from the in-heap Directory DAG (cold `lookup`/`readdir`/`readlink`, §4) and brokers data on `open()`. It holds:
-
-- A `HashMap<u64, Node>` keyed by content-derived inode, populated at mount from `GetDirectory(root_digest, recursive=true)` per store path (`r[builder.fs.castore-dag-source]`). `lookup(parent_ino, name)` reads the parent's `Directory` body and returns the child's content-derived inode. Any name outside the prefetched DAG → `ENOENT` (declared-input allowlist).
-- A `DigestResolver` mapping `file_digest → (nar_hash, nar_offset, size) → chunk-range` for fetch.
+The castore-FUSE handler serves the full tree from the in-heap Directory DAG (cold `lookup`/`readdir`/`readlink`, §4) and brokers data on `open()`. Its state is a `HashMap<u64, Node>` keyed by content-derived inode, populated at mount from one `GetDirectory(recursive=true)` call seeded with all closure `dir_digest` roots (`r[builder.fs.castore-dag-source]`). `lookup(parent_ino, name)` reads the parent's `Directory` body and returns the child's content-derived inode. Any name outside the prefetched DAG → `ENOENT` (declared-input allowlist).
 
 r[builder.fs.passthrough-on-hit]
 
 The handler negotiates `FUSE_PASSTHROUGH` at `init` (`max_stack_depth = 1`). `FUSE_DEV_IOC_BACKING_OPEN` requires init-ns `CAP_SYS_ADMIN` ([`backing.c:91-93`](https://github.com/torvalds/linux/blob/master/fs/fuse/backing.c)), so the ioctl is brokered by `rio-mountd` (§11), which kept a `dup()` of this build's `/dev/fuse` fd. On `open(ino → file_digest)`:
 
 1. **Cache hit** at `/var/rio/cache/ab/<digest>`: send `cache_fd` to `rio-mountd` over the UDS → receive `backing_id`; reply `FOPEN_PASSTHROUGH | backing_id`. All `read`/`mmap` on this open go kernel → backing file; the handler sees nothing further until `release` (which sends `BackingClose{id}` to mountd).
-2. **Cache miss, `size ≤ STREAM_THRESHOLD`**: fetch into `staging/{build_id}/<digest>.partial` verifying each chunk on arrival, whole-file blake3 verify, `Promote{digest}` → mountd verify-copies into cache → as (1).
-3. **Cache miss, `size > STREAM_THRESHOLD`**: streaming path (§7). The fill task sources each chunk from `/var/rio/chunks/` (mountd-owned, RO) first; misses go to `GetChunks` and are written into `.partial` + `staging/chunks/`, with digests batched into `PromoteChunks` (assembly proceeds from own staging; the batch is for other builds). Concurrent builds **share progress at chunk granularity** — no leader/follower, no sentinel. On completion: whole-file verify, rename `.partial → <hex>`, `Promote{digest}`. Next `open` hits (1).
+2. **Cache miss, `size ≤ STREAM_THRESHOLD`**: `ReadBlob(file_digest)` (`r[store.castore.blob-read]`) streams bytes directly into `staging/{build_id}/<digest>.partial`, whole-file blake3 verify, `Promote{digest}` → mountd verify-copies into cache → as (1).
+3. **Cache miss, `size > STREAM_THRESHOLD`**: streaming path (§7). `StatBlob(file_digest, send_chunks=true)` (`r[store.castore.blob-stat]`) returns the `ChunkMeta[]` list; the fill task sources each chunk from `/var/rio/chunks/` (mountd-owned, RO) first; misses go to `GetChunks` and are written into `.partial` + `staging/chunks/`, with digests batched into `PromoteChunks` (assembly proceeds from own staging; the batch is for other builds). Concurrent builds **share progress at chunk granularity** — no leader/follower, no sentinel. On completion: whole-file verify, rename `.partial → <hex>`, `Promote{digest}`. Next `open` hits (1).
 4. Within-build `.partial` orphan (unheld `flock`) → unlink + retry.
 
 The FUSE `read` op exists only for case (3)'s window; in steady state every open is passthrough and the handler is a broker, not a server.
@@ -142,10 +145,6 @@ The FUSE **mount point** is per-build (`/var/rio/castore/{build_id}/`) so one bu
 r[builder.fs.node-chunk-cache]
 
 For files > `STREAM_THRESHOLD`, mountd also owns `/var/rio/chunks/ab/<chunk_blake3>`: the streaming fill task `open()`s here before `GetChunks`, writes misses into its own staging, and batches `PromoteChunks{[digest]}` for other builds' benefit (assembly never blocks on it). Chunks are independently content-addressed, so mountd's verify is context-free — concurrent builds share progress at chunk granularity without coordination. The second build to open `libLLVM.so` reads its chunks from local SSD even while the first is mid-fill. Eviction is mountd's LRU sweep over both cache and chunks under disk-pressure watermark.
-
-r[builder.fs.digest-resolve]
-
-The `DigestResolver` is built once per build from `(NarIndex, ChunkList)` for each store path in the closure. For a `file_digest`, it returns the `(nar_hash, byte-range)` where that file's content lives in some NAR, then `partition_point` on that NAR's chunk-size cumsum yields the exact chunk slice to fetch. When the same `file_digest` appears under multiple NARs (the dedup case), any occurrence is valid; the resolver picks the one with the smallest enclosing chunk range.
 
 ## 7. Streaming open
 
@@ -169,7 +168,7 @@ r[store.castore.directory-rpc]
 r[store.castore.blob-read]
 r[gw.substitute.dag-delta-sync]
 
-The castore RPC surface is `GetDirectory(digest, recursive) → stream<Directory>`, `HasDirectories([digest]) → bitmap`, `HasBlobs([file_digest]) → bitmap`, and `ReadBlob(file_digest) → stream<bytes>`. `GetDirectory` with `recursive=true` BFS-walks the subtree server-side and streams every `Directory` body in one RPC, deduped on digest. `ReadBlob` resolves `file_digest → (nar_hash, nar_offset)` via the `file_blobs` table and streams the file content sliced from the underlying chunks — a snix-compatible client can substitute from rio-store holding only digests, without knowing rio's chunk layout. A delta-sync client (gateway substituter, inter-region replicator) syncing a closure to a target that already holds most of it:
+The castore RPC surface is `GetDirectory(digest, recursive) → stream<Directory>`, `HasDirectories([digest]) → bitmap`, `HasBlobs([file_digest]) → bitmap`, and `ReadBlob(file_digest) → stream<bytes>`. `GetDirectory` with `recursive=true` BFS-walks the subtree server-side and streams every `Directory` body in one RPC, deduped on digest. `ReadBlob` resolves `file_digest → (nar_hash, nar_offset)` via the `file_blobs` table and streams the file content sliced from the underlying chunks — a snix-shaped client can substitute from rio-store holding only digests, without knowing rio's chunk layout. A delta-sync client (gateway substituter, inter-region replicator) syncing a closure to a target that already holds most of it:
 
 1. Sends `HasDirectories([root_digest, ...])` for the closure's roots.
 2. For each `false`, fetches the `Directory`, recurses into child `dir_digest`s with another `HasDirectories` batch.
@@ -258,6 +257,14 @@ The builder pod runs unprivileged with no device mounts. `/dev/fuse` is not open
 
 **Ordering is load-bearing:** the castore-FUSE server must be answering before step 3. overlayfs probes the lower's root at `mount(2)`; an unserved FUSE there deadlocks the mount syscall.
 
+r[builder.mountd.backing-broker]
+
+`BackingOpen{}`/`BackingClose{id}` are the only ioctl-brokering requests: the fd travels in the frame's `SCM_RIGHTS` cmsg, never in the bincode body; mountd issues `FUSE_DEV_IOC_BACKING_OPEN` against its kept `/dev/fuse` dup and replies the conn-scoped `backing_id`.
+
+r[builder.mountd.concurrency]
+
+`Promote` runs on `spawn_blocking` bounded by `Semaphore(num_cpus)`; `PromoteChunks` (≤64 per batch) runs inline. All other request handlers are non-blocking. Per-conn state is `Send + Sync` and replies are `seq`-correlated, so out-of-order completion is well-defined.
+
 `rio-mountd` holds, per build, the UDS connection, a dup of that build's `/dev/fuse` fd, and the staging dirfds; ~250 LoC. Requests carry a `seq: u32` echoed in replies (so `spawn_blocking` `Promote` can reply out-of-order); errors are typed (`DigestMismatch`/`NotRegular`/`TooLarge` are build-fatal, `Retryable(..)` is infra-retry). The UDS socket is mode 0660 group `rio-builder`; mountd checks `SO_PEERCRED.gid` and rejects others. It is a strictly smaller privileged surface than the pre-ADR-022 model, where the builder pod itself held `CAP_SYS_ADMIN`. The brokered `BACKING_OPEN` registers an fd the builder already holds (conn-scoped, depth-0-only); `Promote` is the integrity boundary for the shared cache.
 
 ## 12. Integrity
@@ -285,6 +292,11 @@ fs-verity is **not** used. FUSE's fs-verity support (kernel ≥6.10, [`9fe2a036`
 | PostgreSQL unavailable | n/a | rio-store gRPC + HTTP surfaces fail (no manifests, no narinfo). With `binary_cache_compat` enabled, clients substitute directly from `s3://bucket` (stock-Nix path); with it disabled, nothing substitutes until PG recovers. |
 | compat S3 write fails post-commit | n/a | `PutPath` succeeds; `rio_store_compat_write_failures_total` increments; reconciler picks the path up on its next sweep |
 | builder pod OOM-kill mid-fill | `staging/<digest>.partial` left with no `flock` holder | mountd reaps the staging dir on UDS close. A retry within the same build finds `.partial` with no lock holder → unlinks → restarts fill. |
+| `GetDirectory(recursive)` slow / rio-store unreachable at mount | builder blocks before overlay mount | `dag_prefetch_timeout` (default 30 s) → infra-retry; the build never started, no partial state. |
+
+r[builder.result.input-eio-is-infra]
+
+Any `EIO` surfaced to the build sandbox from the castore-FUSE lower (fetch timeout, integrity mismatch, mountd UDS expiry) MUST classify the build as `InfrastructureFailure` — the build is re-queued to a fresh pod, never poisoned. A genuine build failure cannot manifest as `EIO` on an input read.
 
 r[builder.fs.fetch-circuit]
 
@@ -292,22 +304,23 @@ A circuit breaker on the castore-FUSE fetch path trips on sustained rio-store un
 
 ## 14. Observability
 
-r[obs.metric.digest-fuse]
+r[obs.metric.castore-fuse]
+r[obs.metric.mountd]
 r[obs.metric.chunk-backend-tiered]
 r[obs.metric.compat]
 
 | Metric | Meaning |
 |---|---|
-| `rio_builder_digest_fuse_open_seconds` (histogram) | wall-clock from `open()` upcall to reply, labeled `{hit="node_ssd"\|"remote", streamed="0"\|"1"}` |
-| `rio_builder_digest_fuse_fetch_bytes_total` | bytes fetched from rio-store on behalf of castore-FUSE, labeled `{hit}` |
-| `rio_builder_digest_fuse_upcalls_total` | FUSE upcalls by `{op="lookup"\|"getattr"\|"readdir"\|"readlink"\|"open"\|"read"}` |
+| `rio_builder_castore_fuse_open_seconds` (histogram) | wall-clock from `open()` upcall to reply, labeled `{hit="node_ssd"\|"remote", streamed="0"\|"1"}` |
+| `rio_builder_castore_fuse_fetch_bytes_total` | bytes fetched from rio-store on behalf of castore-FUSE, labeled `{hit}` |
+| `rio_builder_castore_fuse_upcalls_total` | FUSE upcalls by `{op="lookup"\|"getattr"\|"readdir"\|"readlink"\|"open"\|"read"}` |
 | `rio_builder_castore_dag_prefetch_seconds` | `GetDirectory(recursive)` wall-clock per build |
 | `rio_store_tiered_local_hit_ratio` | Express-tier hits ÷ total `get()` per replica |
 | `rio_store_compat_write_seconds` (histogram) | wall-clock for the post-commit narinfo+NAR S3 write, labeled `{result="ok"\|"err"}` |
 | `rio_store_compat_write_failures_total` | compat writes that failed post-commit (reconciler backlog) |
 | `rio_store_nar_index_compute_seconds` | `nar_ls` + blake3 pass duration at PutPath |
-| `rio_builder_digest_fuse_open_mode_total` | per-`open()` reply, labeled `{mode="passthrough"\|"keep_cache"}` — passthrough-not-negotiated visible as `passthrough`=0 |
-| `rio_builder_digest_fuse_open_case_total` | per-`open()` decision, labeled `{case="hit"\|"miss_small"\|"miss_stream"\|"wait_fetching"}` |
+| `rio_builder_castore_fuse_open_mode_total` | per-`open()` reply, labeled `{mode="passthrough"\|"keep_cache"}` — passthrough-not-negotiated visible as `passthrough`=0 |
+| `rio_builder_castore_fuse_open_case_total` | per-`open()` decision, labeled `{case="hit"\|"miss_small"\|"miss_stream"\|"wait_fetching"}` |
 | `rio_mountd_request_seconds` (histogram) | UDS request latency, labeled `{op="mount"\|"backing_open"\|"backing_close"\|"promote_chunks"\|"promote"}` |
 | `rio_mountd_promote_bytes_total` | bytes copied into cache by `Promote` |
 | `rio_mountd_promote_reject_total` | rejected promotes, labeled `{reason="mismatch"\|"not-regular"\|"too-large"\|"race-timeout"}` |
@@ -328,19 +341,19 @@ r[infra.node.kernel-fuse-passthrough]
 
 ## 16. Normative requirements index
 
-The `r[...]` markers appearing in this document and in [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) are the spec-traceability anchors for `tracey`. Each has exactly one `// r[impl ...]` site and at least one `# r[verify ...]` site; `tracey query rule <id>` lists them.
+The `r[...]` markers introduced by ADR-022 across the design book are the spec-traceability anchors for `tracey`. Each has exactly one `// r[impl ...]` site and at least one `# r[verify ...]` site; `tracey query rule <id>` lists them. The implementation-plan tracey inventory names the defining file per marker.
 
 | Domain | Markers |
 |---|---|
 | Mount stack | `builder.fs.castore-stack` · `builder.fs.castore-dag-source` · `builder.fs.castore-inode-digest` · `builder.fs.castore-cache-config` · `builder.fs.fd-handoff-ordering` · `builder.overlay.castore-lower` |
-| castore-FUSE | `builder.fs.digest-fuse-open` · `builder.fs.passthrough-on-hit` · `builder.fs.passthrough-stack-depth` · `builder.fs.digest-resolve` · `builder.fs.file-digest-integrity` · `builder.fs.fetch-circuit` · `builder.fs.shared-backing-cache` · `builder.fs.node-digest-cache` · `builder.fs.node-chunk-cache` · `builder.fs.streaming-open` · `builder.fs.streaming-open-threshold` |
+| castore-FUSE | `builder.fs.digest-fuse-open` · `builder.fs.passthrough-on-hit` · `builder.fs.passthrough-stack-depth` · `builder.fs.file-digest-integrity` · `builder.fs.fetch-circuit` · `builder.fs.shared-backing-cache` · `builder.fs.node-digest-cache` · `builder.fs.node-chunk-cache` · `builder.fs.streaming-open` · `builder.fs.streaming-open-threshold` |
 | Privilege | `builder.mountd.fuse-handoff` · `builder.mountd.backing-broker` · `builder.mountd.promote-verified` · `builder.mountd.orphan-scan` · `builder.mountd.concurrency` |
 | Result classification | `builder.result.input-eio-is-infra` · `builder.fs.parity` |
+| Dispatch | `sched.dispatch.input-roots` |
 | NAR index | `store.index.file-digest` · `store.index.nar-ls-offset` · `store.index.nar-ls-streaming` · `store.index.table-cascade` · `store.index.non-authoritative` · `store.index.sync-on-miss` · `store.index.putpath-eager` · `store.index.putpath-bg-warm` · `store.index.rpc` |
-| Directory DAG | `store.index.dir-digest` · `store.castore.canonical-encoding` · `store.castore.directory-rpc` · `store.castore.blob-read` · `store.castore.gc` · `store.castore.tenant-scope` · `gw.substitute.dag-delta-sync` |
+| Directory DAG | `store.index.dir-digest` · `store.castore.canonical-encoding` · `store.castore.directory-rpc` · `store.castore.blob-read` · `store.castore.blob-stat` · `store.castore.gc` · `store.castore.tenant-scope` · `gw.substitute.dag-delta-sync` |
 | Tiered backend | `store.backend.tiered-get-fallback` · `store.backend.tiered-put-remote-first` · `infra.express.cache-tier` · `infra.express.bounded-eviction` |
-| Transport | `store.chunk.batched-stream` · `proto.chunk.bytes-zerocopy` · `store.chunk.tonic-tuned` · `builder.fetch.batched-stream` |
 | Platform | `infra.node.kernel-fuse-passthrough` |
-| Observability | `obs.metric.digest-fuse` · `obs.metric.mountd` · `obs.metric.chunk-backend-tiered` · `obs.metric.express-eviction` · `obs.metric.compat` |
+| Observability | `obs.metric.castore-fuse` · `obs.metric.mountd` · `obs.metric.chunk-backend-tiered` · `obs.metric.express-eviction` · `obs.metric.compat` |
 | Binary-cache compat | `store.compat.runtime-toggle` · `store.compat.nar-on-put` · `store.compat.narinfo-on-put` · `store.compat.write-after-commit` · `store.compat.stock-nix-substitute` · `store.compat.gc-coupled` |
-| Chunked upload (§6) | `store.put.chunked` · `builder.upload.fused-walk` · `builder.upload.chunked-manifest` · `store.chunk.has-chunks-durable` · `store.chunk.self-verify` · `store.put.narhash-async` · `store.put.narhash-quarantine` · `store.put.builder-chunked-only` |
+| Chunked upload (§6) | `store.put.chunked` · `builder.upload.fused-walk` · `builder.upload.chunked-manifest` · `store.chunk.has-chunks-durable` · `store.chunk.durable-flag` · `store.chunk.self-verify` · `store.put.narhash-async` · `store.put.narhash-quarantine` · `store.put.builder-chunked-only` |
