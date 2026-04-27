@@ -949,6 +949,114 @@ mod tests {
         );
     }
 
+    /// Tripwire: every map-keyed `SlaConfig` field whose key-space is
+    /// drawn from another field (today: `hw_classes`) MUST be
+    /// cross-field-checked by [`SlaConfig::validate`]. The exhaustive
+    /// destructure below names EVERY field with NO `..` rest pattern,
+    /// so adding a field to `SlaConfig` is a compile error here until
+    /// it is classified. r2 bug_038 (`hw_classes` charset) and r6
+    /// bug_019 (`lead_time_seed` membership/range) are the same
+    /// "trusted-but-fallible source" gap; this test makes a third
+    /// instance a build break instead of a round-7 finding.
+    #[test]
+    fn validate_covers_every_map_key() {
+        let cfg = base();
+        // Exhaustive destructure — NO `..`. Adding a field = compile
+        // error here. Per-field comment classifies the key-space:
+        //   (universe)  the field IS the reference set; nothing to check
+        //   (free)      key-space is open (feature names, file paths) —
+        //               no cross-field membership to enforce
+        //   (cell)      key ⊇ HwClassName → MUST be ∈ hw_classes;
+        //               assertion below
+        //   (scalar)    not a map
+        let SlaConfig {
+            tiers: _,                             // (scalar) Vec<Tier>; per-tier validate()
+            default_tier: _,                      // (scalar) checked ∈ tiers
+            probe: _,                             // (scalar) ProbeShape::validate
+            feature_probes: _,                    // (free)   key = requiredSystemFeatures string
+            max_cores: _,                         // (scalar)
+            max_mem: _,                           // (scalar)
+            max_disk: _,                          // (scalar)
+            default_disk: _,                      // (scalar)
+            ring_buffer: _,                       // (scalar)
+            seed_corpus: _,                       // (scalar) Option<PathBuf>
+            hw_cost_source: _,                    // (scalar)
+            hw_classes: _,                        // (universe) the reference set itself
+            hw_cost_tolerance: _,                 // (scalar)
+            hw_explore_epsilon: _,                // (scalar)
+            hw_bench_mem_floor: _,                // (scalar)
+            lead_time_seed,        // (cell)   key.0 MUST ∈ hw_classes — asserted below
+            max_fleet_cores: _,    // (scalar)
+            ladder_budget: _,      // (scalar)
+            reference_hw_class: _, // (scalar) Option<HwClassName>; checked ∈ hw_classes
+            max_forecast_cores_per_tenant: _, // (scalar)
+            max_keys_per_tenant: _, // (scalar)
+            max_lead_time: _,      // (scalar)
+            max_consolidation_time: _, // (scalar)
+            consolidate_explore_epsilon: _, // (scalar)
+            max_node_claims_per_cell_per_tick: _, // (scalar)
+            node_class_ref: _,     // (scalar) Option<String>; k8s-side ref, not ours
+            cluster: _,            // (scalar)
+        } = cfg;
+        // Silence unused-binding on the one (cell) field we kept by
+        // name; the destructure itself is the load-bearing part.
+        let _ = lead_time_seed;
+
+        // ---- (cell) lead_time_seed: key.0 ∈ hw_classes ----
+        // base() has hw_classes = {} so any key is "nonexistent".
+        let mut bad_key = base();
+        bad_key
+            .lead_time_seed
+            .insert(("nonexistent".into(), CapacityType::Od), 30.0);
+        let err = bad_key
+            .validate()
+            .expect_err("lead_time_seed key 'nonexistent' ∉ hw_classes must be rejected");
+        assert!(
+            err.to_string().contains("nonexistent"),
+            "error should name the bad key: {err}"
+        );
+
+        // ---- (cell) lead_time_seed: value range ----
+        // Give the key a real hw_class so only the VALUE is wrong.
+        let with_h = || {
+            let mut c = base();
+            c.hw_classes.insert(
+                "intel-7".into(),
+                HwClassDef {
+                    labels: vec![NodeLabelMatch {
+                        key: "rio.build/hw-class".into(),
+                        value: "intel-7".into(),
+                    }],
+                },
+            );
+            c.hw_cost_source = Some(crate::sla::cost::HwCostSource::Static);
+            c
+        };
+        // Non-finite.
+        let mut bad_val = with_h();
+        bad_val
+            .lead_time_seed
+            .insert(("intel-7".into(), CapacityType::Spot), f64::NAN);
+        assert!(
+            bad_val.validate().is_err(),
+            "non-finite lead_time_seed value must be rejected"
+        );
+        // > max_lead_time (default 600.0).
+        let mut bad_val = with_h();
+        bad_val
+            .lead_time_seed
+            .insert(("intel-7".into(), CapacityType::Spot), 6000.0);
+        assert!(
+            bad_val.validate().is_err(),
+            "lead_time_seed value > max_lead_time must be rejected"
+        );
+        // Positive control: valid key + valid value passes.
+        let mut ok = with_h();
+        ok.lead_time_seed
+            .insert(("intel-7".into(), CapacityType::Spot), 30.0);
+        ok.validate().expect("valid lead_time_seed should pass");
+    }
+
     #[test]
     fn cell_key_serde_roundtrip() {
         let mut cfg = base();
