@@ -320,6 +320,7 @@ pub(super) async fn compute_input_closure(
 
     // BFS by layer. One BatchQueryPathInfo per layer (I-110); layer
     // count is typically 5-15 (dep depth).
+    let mut layer_idx = 0u32;
     while !frontier.is_empty() {
         // Dedupe against closure BEFORE issuing RPCs.
         let batch: Vec<String> = std::mem::take(&mut frontier)
@@ -336,8 +337,18 @@ pub(super) async fn compute_input_closure(
         // ValidatedPathInfo (kept for the caller — I-106) or None on
         // not-found. References for the next layer come from
         // info.references.
+        let layer_start = std::time::Instant::now();
+        let n_paths = batch.len();
         let results: Vec<(String, Option<ValidatedPathInfo>)> =
             query_layer(store_client, batch).await?;
+        tracing::debug!(
+            layer = layer_idx,
+            n_paths,
+            elapsed = ?layer_start.elapsed(),
+            closure_size = closure.len(),
+            "compute_input_closure: BFS layer complete"
+        );
+        layer_idx += 1;
 
         // Add found paths to closure, collect their refs for next layer.
         for (path, info) in results {

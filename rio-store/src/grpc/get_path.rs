@@ -193,9 +193,11 @@ impl StoreServiceImpl {
         // substituter ingests via the same write-ahead path as PutPath,
         // so the `get_manifest` below picks up the freshly-ingested
         // NAR with no extra plumbing.
+        let lookup_start = std::time::Instant::now();
         let local = metadata::query_path_info(&self.pool, &req.store_path)
             .await
             .map_err(|e| metadata_status("GetPath: query_path_info", e))?;
+        let local_hit = local.is_some();
         let info = match local {
             Some(i) => {
                 // r[impl store.substitute.tenant-sig-visibility+2]
@@ -222,6 +224,15 @@ impl StoreServiceImpl {
                 .await?
                 .ok_or_else(|| Status::not_found(format!("path not found: {}", req.store_path)))?,
         };
+        let lookup_elapsed = lookup_start.elapsed();
+        if lookup_elapsed > std::time::Duration::from_secs(1) {
+            warn!(
+                store_path = %req.store_path,
+                local_hit,
+                elapsed = ?lookup_elapsed,
+                "GetPath: slow narinfo lookup (>1s; substitute path if local_hit=false)"
+            );
+        }
 
         // `None` here is defense-in-depth for a race where query_path_info
         // found the narinfo but get_manifest doesn't. Both filter on
@@ -272,6 +283,7 @@ impl StoreServiceImpl {
 
         let expected_hash = info.nar_hash;
         let expected_size = info.nar_size;
+        let store_path = info.store_path.to_string();
         let start = std::time::Instant::now();
         // Clone for the spawned task. Arc-clone is cheap; the cache
         // itself (moka + DashMap) is shared.
@@ -406,6 +418,9 @@ impl StoreServiceImpl {
                 .is_err()
             {
                 warn!(
+                    store_path = %store_path,
+                    nar_size = expected_size,
+                    elapsed = ?start.elapsed(),
                     timeout = ?rio_common::grpc::GRPC_STREAM_TIMEOUT,
                     "GetPath streaming task timed out"
                 );

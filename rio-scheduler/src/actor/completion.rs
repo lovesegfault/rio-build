@@ -2280,6 +2280,7 @@ impl DagActor {
             executor_id = %executor_id,
             infra_retry_count = state.retry.infra_count,
             exempt_from_cap,
+            error_msg,
             "infrastructure failure — retry without poison count"
         );
         self.requeue_after_retry(drv_hash).await;

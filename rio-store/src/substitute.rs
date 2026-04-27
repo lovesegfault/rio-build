@@ -518,9 +518,12 @@ impl Substituter {
         progress: Option<&SubstProgressFn>,
     ) -> Result<Option<ValidatedPathInfo>, SubstituteError> {
         let key = (tenant_id, store_path.to_string());
+        let singleflight_start = std::time::Instant::now();
+        let was_leader = std::sync::atomic::AtomicBool::new(false);
         let cached = self
             .inflight
             .try_get_with(key, async {
+                was_leader.store(true, std::sync::atomic::Ordering::Relaxed);
                 // Cheap no-work checks BEFORE the admission permit. A
                 // tenant with no upstreams (the common case) must get
                 // an immediate `Ok(None)`, not queue behind saturated
@@ -571,6 +574,16 @@ impl Substituter {
                 }
                 (*e).clone()
             })?;
+        let elapsed = singleflight_start.elapsed();
+        if elapsed > std::time::Duration::from_secs(5) {
+            tracing::warn!(
+                store_path,
+                tenant_id = %tenant_id,
+                was_leader = was_leader.load(std::sync::atomic::Ordering::Relaxed),
+                elapsed = ?elapsed,
+                "try_substitute: slow singleflight (>5s; was_leader=false means waited on another caller)"
+            );
+        }
         Ok(cached.map(|arc| (*arc).clone()))
     }
 

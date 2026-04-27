@@ -1051,6 +1051,8 @@ async fn resolve_inputs(
         .iter()
         .map(|(p, n)| (p.clone(), n.clone()))
         .collect();
+    let n_input_drvs = input_drv_specs.len();
+    let fetch_drvs_start = std::time::Instant::now();
     let fetched: Vec<Vec<String>> = stream::iter(input_drv_specs)
         .map(|(path, names)| {
             let mut client = store_client.clone();
@@ -1094,6 +1096,11 @@ async fn resolve_inputs(
         .buffer_unordered(MAX_PARALLEL_FETCHES)
         .try_collect()
         .await?;
+    tracing::debug!(
+        n_input_drvs,
+        elapsed = ?fetch_drvs_start.elapsed(),
+        "resolve_inputs: fetched all input .drv files"
+    );
     // Defense: filter empty paths. A floating-CA input derivation's .drv
     // file has `out.path() == ""` (the path is unknown until the build
     // runs). If the scheduler dispatched us WITHOUT resolving inputDrvs

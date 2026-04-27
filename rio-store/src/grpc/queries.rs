@@ -192,6 +192,8 @@ impl StoreServiceImpl {
 
         self.validate_path_batch(&req.store_paths)?;
 
+        let n_paths = req.store_paths.len();
+        let start = std::time::Instant::now();
         let entries = metadata::query_path_info_batch(&self.pool, &req.store_paths)
             .await
             .map_err(|e| metadata_status("BatchQueryPathInfo: query_path_info_batch", e))?
@@ -201,6 +203,7 @@ impl StoreServiceImpl {
                 info: info.map(Into::into),
             })
             .collect();
+        tracing::debug!(n_paths, elapsed = ?start.elapsed(), "BatchQueryPathInfo");
 
         Ok(Response::new(BatchQueryPathInfoResponse { entries }))
     }
