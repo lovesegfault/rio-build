@@ -1165,6 +1165,16 @@ impl SolveCache {
         }
     }
 
+    /// Read-only clone of the `(mkh, ovr)` entry. Contract-test helper
+    /// — `pinned_explore` is otherwise only observable via the emitted
+    /// `node_affinity`, which is empty on the BestEffort fall-through.
+    #[cfg(test)]
+    pub fn peek_entry(&self, mkh: u64, ovr: u64) -> Option<MemoEntry> {
+        self.entries
+            .get(&mkh)
+            .and_then(|inner| inner.get(&ovr).cloned())
+    }
+
     /// Σ inner-map lengths. Test/status only.
     pub fn len(&self) -> usize {
         self.entries.iter().map(|e| e.len()).sum()

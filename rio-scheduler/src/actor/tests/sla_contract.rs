@@ -872,3 +872,149 @@ async fn contract_dispatch_accepts_2row_postfilter_fit() {
         intent.cores
     );
 }
+
+/// **R6B5 / merged_bug_011-A** — `pinned_explore` releases on
+/// infeasible. Pre-fix: the pin is committed at :886-888 BEFORE the
+/// `solve_full([h])` feasibility check at :891, and the graduation
+/// filter at :867 only releases on `h ∈ A` or `h ∉ h_all` — neither
+/// holds for an envelope-infeasible `h` (it's never in A by
+/// definition). So a `BestEffort` draw is permanently pinned: every
+/// subsequent ε_h hit reads `prev_pin = Some(h_dead)`, re-tries
+/// `solve_full([h_dead])`, gets `BestEffort` again, falls through.
+///
+/// This test forces every `solve_full` to `BestEffort` (S=2000 >
+/// p90=1200 → SerialFloor at every cell) so `pool = H\{cheapest}` (2
+/// elements) and EVERY ε_h draw is infeasible. Tick once → record
+/// `pinned_explore`; tick again → assert it CHANGED. Pre-fix: poll 1
+/// commits `h0`, poll 2 reads `prev_pin=h0`, filter passes (h0 ∈
+/// h_all, h0 ∉ in_a={}), uses `h0` again → stuck-same. Post-fix:
+/// `resolve_h_explore` rotates on `Miss` → poll 1 commits
+/// `next=h1≠h0`, poll 2 tries `h1`, rotates to `h0` → alternates.
+// r[verify sched.sla.hw-class.epsilon-explore+3]
+#[tokio::test]
+async fn contract_pinned_explore_releases_on_infeasible() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    actor.sla_config.hw_explore_epsilon = 1.0;
+    // S=2000 > p90=1200 → T(c)≥S ∀c → every cell rejected on serial
+    // floor → `solve_full` is `BestEffort` for the unrestricted memo
+    // AND for every restricted `[h_explore]` solve.
+    let mut fit = make_fit("infeasible");
+    fit.fit = crate::sla::types::DurationFit::Amdahl {
+        s: crate::sla::types::RefSeconds(2000.0),
+        p: crate::sla::types::RefSeconds(0.0),
+    };
+    let mkh = crate::sla::solve::model_key_hash(&fit.key);
+    actor.sla_estimator.seed(fit);
+    actor.test_inject_ready("d-inf", Some("infeasible"), "x86_64-linux", false);
+    let state = actor.dag.node("d-inf").unwrap();
+
+    let (hw, cost, ig) = actor.solve_inputs();
+    let _ = actor.solve_intent_for(state, &hw, &cost, ig);
+    let p1 = actor
+        .solve_cache
+        .peek_entry(mkh, 0)
+        .expect("ε_h block reached → MemoEntry exists")
+        .pinned_explore;
+    assert!(
+        p1.is_some(),
+        "precondition: ε=1.0 + |H|>1 + BestEffort memo → in_a={{}} → \
+         pool=H\\{{cheapest}} (2 elements) → pin written"
+    );
+
+    let _ = actor.solve_intent_for(state, &hw, &cost, ig);
+    let p2 = actor.solve_cache.peek_entry(mkh, 0).unwrap().pinned_explore;
+    assert_ne!(
+        p1, p2,
+        "infeasible `h_explore` MUST release the pin (rotate to \
+         pool\\{{h_tried}}), not stick. Pre-R6B5: pin committed at \
+         :886-888 BEFORE feasibility check → poll 2 reads prev_pin={p1:?}, \
+         graduation filter passes (∈h_all ∧ ∉in_a={{}}), re-tries same h."
+    );
+    // Three more ticks: pin keeps rotating (never stuck on any one
+    // infeasible h). With pool.len()=2 it alternates p1↔p2.
+    let mut prev = p2;
+    for _ in 0..3 {
+        let _ = actor.solve_intent_for(state, &hw, &cost, ig);
+        let cur = actor.solve_cache.peek_entry(mkh, 0).unwrap().pinned_explore;
+        assert_ne!(cur, prev, "rotation continues — never stuck");
+        prev = cur;
+    }
+}
+
+/// **R6B5 / merged_bug_011-B** — pinned `h_explore` fully ICE-masked
+/// routes around via the unrestricted memo. Pre-fix: `solve_full([h])`
+/// is `Feasible` → early-return at :905 binds `memo` to the ≤2-cell
+/// explore result. The masked-filter at :927-933 reduces it to `[]`;
+/// the all-masked fallback at :966-969 returns `memo.a.cells` — which
+/// is STILL the masked `{h_explore}` cells, not the unrestricted A.
+/// The drv emits `node_affinity` over known-unfulfillable cells while
+/// the unrestricted A (cached in `solve_cache[mkh][ovr].result`) sits
+/// unused. No `_hw_ladder_exhausted_total` (only 2/|H×2| masked).
+///
+/// This test pins `h0`, masks both `(h0,*)` cells, then asserts the
+/// emitted `hw_class_names` are NOT exclusively `{h0}` — at least one
+/// cell from the unrestricted memo is offered.
+// r[verify sched.sla.hw-class.epsilon-explore+3]
+#[tokio::test]
+async fn contract_pinned_explore_routes_around_ice() {
+    use crate::sla::config::CapacityType;
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    actor.sla_config.hw_explore_epsilon = 1.0;
+    actor.test_inject_ready("d-ice", Some("test-pkg"), "x86_64-linux", false);
+    let state = actor.dag.node("d-ice").unwrap();
+
+    let h_of = |intent: &crate::state::SolvedIntent| -> std::collections::BTreeSet<String> {
+        intent.hw_class_names.iter().cloned().collect()
+    };
+
+    // Poll 1: ε=1.0 → explore branch fires, pins h0, emits `{h0}`.
+    let (hw, cost, ig) = actor.solve_inputs();
+    let h0_set = h_of(&actor.solve_intent_for(state, &hw, &cost, ig));
+    assert_eq!(h0_set.len(), 1, "ε=1.0 explore → A' ⊆ {{h_explore}}×{{*}}");
+    let h0 = h0_set.into_iter().next().unwrap();
+    // Unrestricted A (ε=0 read of the memo) — what the fallback SHOULD
+    // route to. The memo is already filled; ε=0 skips the explore
+    // block and returns it directly.
+    actor.sla_config.hw_explore_epsilon = 0.0;
+    let in_a = h_of(&actor.solve_intent_for(state, &hw, &cost, ig));
+    assert!(
+        in_a.len() >= 1 && !in_a.iter().all(|h| *h == h0),
+        "precondition: unrestricted A has at least one h ≠ {h0} \
+         (otherwise the route-around has nowhere to go); A={in_a:?}"
+    );
+    actor.sla_config.hw_explore_epsilon = 1.0;
+
+    // Mask both (h0,*) cells — the controller's `unfulfillable_cells`
+    // ack path.
+    for cap in CapacityType::ALL {
+        actor.ice.mark(&(h0.clone(), cap));
+    }
+    assert!(
+        actor
+            .ice
+            .masked_cells()
+            .contains(&(h0.clone(), CapacityType::Spot))
+            && actor
+                .ice
+                .masked_cells()
+                .contains(&(h0.clone(), CapacityType::Od)),
+        "precondition: both (h0,*) ICE-masked"
+    );
+
+    // Poll 2: pin=h0, solve_full([h0]) Feasible, but both cells masked.
+    let emitted = h_of(&actor.solve_intent_for(state, &hw, &cost, ig));
+    assert!(
+        emitted.iter().any(|h| *h != h0),
+        "pinned `{h0}` fully ICE-masked → MUST route around via the \
+         unrestricted memo. Got hw_class_names={emitted:?} — all `{h0}` \
+         (the masked cells). Pre-R6B5: early-return at :905 binds `memo` \
+         to the 2-cell explore result; all-masked fallback at :966 \
+         re-emits those masked cells instead of the cached unrestricted A."
+    );
+    assert!(
+        emitted.iter().all(|h| in_a.contains(h)),
+        "routed-around cells ⊆ unrestricted A; got {emitted:?}, A={in_a:?}"
+    );
+}
