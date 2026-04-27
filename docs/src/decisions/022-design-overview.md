@@ -356,4 +356,4 @@ The `r[...]` markers introduced by ADR-022 across the design book are the spec-t
 | Platform | `infra.node.kernel-fuse-passthrough` |
 | Observability | `obs.metric.castore-fuse` · `obs.metric.mountd` · `obs.metric.chunk-backend-tiered` · `obs.metric.express-eviction` · `obs.metric.compat` |
 | Binary-cache compat | `store.compat.runtime-toggle` · `store.compat.nar-on-put` · `store.compat.narinfo-on-put` · `store.compat.write-after-commit` · `store.compat.stock-nix-substitute` · `store.compat.gc-coupled` |
-| Chunked upload (§6) | `store.put.chunked` · `builder.upload.fused-walk` · `builder.upload.chunked-manifest` · `store.chunk.has-chunks-durable` · `store.chunk.durable-flag` · `store.chunk.self-verify` · `store.put.narhash-sync` · `store.put.builder-chunked-only` |
+| Chunked upload (§6) | `store.put.chunked` · `store.put.chunked-wire` · `store.put.chunked-bounds` · `builder.upload.fused-walk` · `builder.upload.chunked-manifest` · `store.chunk.has-chunks-durable` · `store.chunk.durable-flag` · `store.chunk.self-verify` · `store.put.narhash-sync` · `store.put.chunked-ca` · `store.put.builder-chunked-only` |
