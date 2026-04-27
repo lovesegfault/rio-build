@@ -133,10 +133,17 @@ pub const GRPC_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
 /// prefetch or proto decode).
 pub const H2_INITIAL_STREAM_WINDOW: u32 = 1024 * 1024;
 
-/// Initial h2 connection-level window (16 MiB). Shared across all
-/// streams on the connection; sized so a handful of concurrent
-/// GB-scale `GetPath` streams don't head-of-line block each other.
-pub const H2_INITIAL_CONN_WINDOW: u32 = 16 * 1024 * 1024;
+/// Initial h2 connection-level window (64 MiB). Shared across all
+/// streams on the connection; must exceed peak-concurrent-streams ×
+/// [`H2_INITIAL_STREAM_WINDOW`] or the conn window depletes and ALL
+/// streams (including small unary RPCs) throttle to the rate of conn
+/// `WINDOW_UPDATE` releases. Builder peak is `MAX_PARALLEL_FETCHES`
+/// (16) + prefetch sem (8) = 24 streams × 1 MiB = 24 MiB; the previous
+/// 16 MiB cap caused 29 s conn-update gaps under nix-bench
+/// large-shallow → `BatchQueryPathInfo` 30 s timeouts (h2 frame trace:
+/// stream 91 response dribbled at ~10 KB/s). 64 MiB gives ~2.5×
+/// headroom over current peak. Goes away with ADR-022.
+pub const H2_INITIAL_CONN_WINDOW: u32 = 64 * 1024 * 1024;
 
 /// Default max gRPC message size: 256 MiB.
 ///
