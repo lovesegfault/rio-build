@@ -121,7 +121,13 @@ r[builder.mountd.uid-bound]
 `rio-mountd` MUST allow at most one live UDS connection per `SO_PEERCRED.uid`. With k8s userns, each pod has a distinct host-uid range; binding per-uid (not per-gid) prevents a sandbox-escaped build A from opening a fresh connection and issuing `Mount`/teardown for build B's `build_id`.
 
 r[builder.mountd.staging-quota]
-`rio-mountd` MUST track `staged_bytes` per connection and reject `Promote`/`PromoteChunks` with `TooLarge` once accepting the request would exceed `staging_quota_bytes`. The builder-side self-tracking is best-effort eviction; mountd is the enforcement boundary against a compromised builder filling the node-shared `/var/rio/staging` hostPath.
+`rio-mountd` MUST set an XFS project quota of `staging_quota_bytes` on `/var/rio/staging/{build_id}` at `mkdirat` time (`ioctl(FS_IOC_FSSETXATTR, {fsx_projid=hash(build_id), fsx_xflags|=PROJINHERIT})` then `Q_XSETQLIM`). The kernel enforces `ENOSPC` on the builder's `write(2)` once the staging dir reaches the limit; mountd does not need to observe writes. The builder-side self-tracking is best-effort early eviction. `Promote`/`PromoteChunks` additionally reject `TooLarge` for individual files exceeding `RIO_MOUNTD_MAX_PROMOTE_BYTES` / `FASTCDC_MAX_BYTES` respectively.
+
+r[builder.mountd.promote-bounded-copy]
+`rio-mountd` MUST copy at most `fstat(src).st_size` bytes during `Promote`/`PromoteChunks` and reject with `DigestMismatch` if `read()` returns data beyond `st_size`. The source fd is on a builder-uid-owned file the builder can `write(2)`-append to concurrently; without a byte cap the copy loop streams unbounded growth into mountd-owned `cache/ab/<hex>.promoting` before the digest check fires.
+
+r[builder.mountd.one-mount]
+`rio-mountd` MUST reject a second `Mount{}` on a connection that has already received one (`Err(AlreadyMounted)`). Per-conn state holds exactly one `(kept_fuse_fd, staging_dirfd, …)` tuple; a second `Mount` would leak the prior fuse mount and staging dir until mountd restart.
 
 r[builder.fuse.circuit-breaker+3]
 The FUSE fetch path has a circuit breaker. Two trip conditions (EITHER
