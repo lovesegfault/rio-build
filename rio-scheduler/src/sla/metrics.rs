@@ -168,54 +168,66 @@ pub fn score_completion(
     }
 }
 
-/// `(counter-name → Σ label-variants)` from ONE drained snapshot.
+/// `(key → Σ counters)` from ONE drained snapshot, summing over every
+/// label dimension NOT in the key. `name_filter=""` admits all
+/// counters; `group_label=None` keys by metric name, `Some(label)` by
+/// that label's value (entries lacking the label group under `""`).
 ///
 /// `Snapshotter::snapshot` **drains** (counters swap to 0 — the handle
 /// is an `Arc<AtomicU64>` cloned from the registry, so the swap zeros
 /// the shared atomic). Never call it twice expecting cumulative values;
-/// always capture once and assert against the capture. See
-/// [`infeasible_counts`] for the per-`reason`-label variant.
+/// always capture once and assert against the capture. Calling this in
+/// a `for r in ALL` loop reading one key per call is `(N-1)/N`-vacuous
+/// (iteration 0 drains; 1..N read zeros). bug 022.
+///
+/// The `*m.entry(k).or_default() += c` fold is load-bearing: a
+/// `.collect::<HashMap>()` over projected `(key, count)` pairs
+/// last-write-wins on duplicate keys (bug 034 — `infeasible_counts`
+/// dropped one tenant's count on the floor).
 #[cfg(test)]
-pub fn counter_map(
+pub fn counter_map_by(
     snap: &metrics_util::debugging::Snapshotter,
+    name_filter: &str,
+    group_label: Option<&str>,
 ) -> std::collections::BTreeMap<String, u64> {
     use metrics_util::debugging::DebugValue;
     let mut m = std::collections::BTreeMap::new();
     for (ck, _, _, v) in snap.snapshot().into_vec() {
-        if let DebugValue::Counter(c) = v {
-            *m.entry(ck.key().name().to_owned()).or_default() += c;
+        let DebugValue::Counter(c) = v else { continue };
+        let k = ck.key();
+        if !name_filter.is_empty() && k.name() != name_filter {
+            continue;
         }
+        let key = match group_label {
+            None => k.name().to_owned(),
+            Some(label) => k
+                .labels()
+                .find(|l| l.key() == label)
+                .map(|l| l.value().to_owned())
+                .unwrap_or_default(),
+        };
+        *m.entry(key).or_default() += c;
     }
     m
 }
 
-/// `(reason → count)` for `rio_scheduler_sla_infeasible_total` from ONE
-/// drained snapshot. Same drain caveat as [`counter_map`] — calling
-/// this in a `for r in ALL` loop and reading one reason per call is
-/// 5/6-vacuous (iteration 0 drains; 1..N read zeros). bug 022.
+/// `(counter-name → Σ label-variants)` — see [`counter_map_by`] for
+/// the drain caveat and fold semantics.
+#[cfg(test)]
+pub fn counter_map(
+    snap: &metrics_util::debugging::Snapshotter,
+) -> std::collections::BTreeMap<String, u64> {
+    counter_map_by(snap, "", None)
+}
+
+/// `(reason → Σ tenants)` for `rio_scheduler_sla_infeasible_total` —
+/// see [`counter_map_by`] for the drain caveat and fold semantics.
 #[cfg(test)]
 pub fn infeasible_counts(
     snap: &metrics_util::debugging::Snapshotter,
 ) -> std::collections::HashMap<String, u64> {
-    use metrics_util::debugging::DebugValue;
-    snap.snapshot()
-        .into_vec()
+    counter_map_by(snap, "rio_scheduler_sla_infeasible_total", Some("reason"))
         .into_iter()
-        .filter_map(|(ck, _, _, v)| {
-            let k = ck.key();
-            (k.name() == "rio_scheduler_sla_infeasible_total").then(|| {
-                let reason = k
-                    .labels()
-                    .find(|l| l.key() == "reason")
-                    .map(|l| l.value().to_owned())
-                    .unwrap_or_default();
-                let c = match v {
-                    DebugValue::Counter(c) => c,
-                    _ => 0,
-                };
-                (reason, c)
-            })
-        })
         .collect()
 }
 
