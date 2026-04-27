@@ -521,6 +521,17 @@ CREATE INDEX idx_pending_s3_deletes_drain
     WHERE attempts < 10;
 ```
 
+## Castore RPC surface (ADR-022)
+
+r[store.castore.blob-stat]
+`StatBlob(file_digest, send_chunks=true)` returns the `ChunkMeta[]` (digest, size) list spanning that file's bytes, resolved server-side via `file_blobs` → manifest chunk-cumsum. snix `BlobService.Stat` wire-compatible. The builder's castore-FUSE `open()` calls this for files above the streaming threshold.
+
+r[store.castore.tenant-scope]
+`GetDirectory`/`HasDirectories`/`HasBlobs`/`ReadBlob`/`StatBlob` MUST be tenant-scoped: queries join `directory_tenants`/`file_blob_tenants` on the caller's `tenant_id` (from JWT `Claims.sub` or HMAC `AssignmentClaims.tenant_id`, `r[common.hmac.claims]`) and return NotFound for digests the caller's tenant has not produced. Directory bodies leak child names/digests — cross-tenant exposure here is a confidentiality issue, unlike the chunk-level surface (see [security.md §Cross-Tenant Chunk Probing](../security.md#cross-tenant-chunk-probing)).
+
+r[store.castore.gc]
+`directories` rows are refcounted (one increment per referencing manifest). `file_blobs` is a `(digest, store_path_hash)` junction with `ON DELETE CASCADE` from `manifests` — GC of one referrer cascade-deletes its rows, surviving referrers' rows remain, so `ReadBlob`/`StatBlob` never resolve to a dead manifest. After cascade, `file_blob_tenants` rows for digests with zero remaining `file_blobs` rows are deleted in the same sweep transaction.
+
 ## Design References (no code dependencies)
 
 - tvix `castore` protobuf definitions (MIT-licensed): inform our CAS gRPC API design

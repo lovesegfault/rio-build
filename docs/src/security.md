@@ -44,12 +44,12 @@ r[sec.transport.cilium-wireguard]
 All pod-to-pod traffic is encrypted by Cilium's WireGuard transparent encryption (`encryption.type: wireguard` in the Cilium helm values). Encryption is at the overlay layer (Geneve-encapsulated, ChaCha20-Poly1305) — rio components run plaintext gRPC servers and clients with no TLS configuration. There is no per-service certificate identity; component identity for reachability is the pod's Cilium security identity (derived from k8s labels), enforced by CiliumNetworkPolicy. There is no application-level certificate to rotate or expire.
 
 r[common.hmac.claims]
-The scheduler signs **assignment tokens** (HMAC-SHA256) when dispatching work. Token format is `base64url(json(AssignmentClaims)).base64url(hmac_sha256(key, claims_json))`. `AssignmentClaims` has exactly five fields: `executor_id` (string, audit only — the store doesn't know which executor is calling), `drv_hash` (string, ties token to a specific build), `expected_outputs` (list of store paths, the authorization check), `is_ca` (bool, skips the membership check for floating-CA derivations whose output paths are computed post-build), `expiry_unix` (u64 Unix seconds, replay prevention).
+The scheduler signs **assignment tokens** (HMAC-SHA256) when dispatching work. Token format is `base64url(json(AssignmentClaims)).base64url(hmac_sha256(key, claims_json))`. `AssignmentClaims` has the fields: `executor_id` (string, audit only — the store doesn't know which executor is calling), `drv_hash` (string, ties token to a specific build), `expected_outputs` (list of store paths, the authorization check), `is_ca` (bool, skips the membership check for floating-CA derivations whose output paths are computed post-build), `expiry_unix` (u64 Unix seconds, replay prevention), `role` (`Builder`/`Gateway`/`Admin` — `r[store.put.builder-chunked-only]` rejects `PutPath`/`PutPathBatch` for `Builder`), `tenant_id` (uuid — what `r[store.castore.tenant-scope]` reads from HMAC callers for `GetDirectory`/`ReadBlob`/`StatBlob`/`HasBlobs` scoping), `input_closure_digest` (32-byte blake3 over the sorted transitive-input-closure store-path strings — attests the `r[store.put.refs-sync]` refscan candidate set the builder echoes in `Begin.input_closure`).
   - Executors present the assignment token in the `x-rio-assignment-token` gRPC metadata header when calling `PutPath` on the store. The store verifies the token signature, checks `now < expiry_unix`, and rejects with `PERMISSION_DENIED` if the uploaded `store_path ∉ expected_outputs`.
   - This prevents a compromised executor from writing to store paths it was never assigned to build.
   - Token lifetime is scoped to the build assignment; tokens expire after a configurable TTL (default: 2× the build timeout).
   - The signing key is a shared HMAC secret between the scheduler and store, stored as a Kubernetes Secret (recommend KMS/Vault for production).
-  - **Read authorization:** Executors call `GetPath` and `QueryPathInfo` on the store for FUSE cache fetches. Read access is gated by CiliumNetworkPolicy (only labeled executor pods can reach `rio-store:9002`); any reachable executor can read any store path. This is acceptable because: (a) store paths are content-addressed and immutable, (b) executors need access to shared paths (glibc, coreutils) regardless of tenant, (c) output isolation is enforced at the scheduling level (executors only build what they are assigned). For deployments requiring strict tenant read isolation, a future enhancement could add tenant-scoped read tokens.
+  - **Read authorization:** the **castore RPC surface** (`GetDirectory`/`HasDirectories`/`HasBlobs`/`ReadBlob`/`StatBlob`, ADR-022) IS tenant-scoped: queries join `directory_tenants`/`file_blob_tenants` on `AssignmentClaims.tenant_id` and return NotFound for digests the caller's tenant has not produced (`r[store.castore.tenant-scope]`). The legacy `GetPath`/`QueryPathInfo` surface remains gated only by CiliumNetworkPolicy (any reachable executor can read any store path) — acceptable because store paths are content-addressed and immutable, executors need shared paths (glibc, coreutils) regardless of tenant, and output isolation is enforced at scheduling.
 
 r[sec.executor.identity-token+2]
 The scheduler signs **executor-identity tokens** (`ExecutorClaims { intent_id, kind, expiry_unix }`, same HMAC envelope as `AssignmentClaims`, same key) per `SpawnIntent`. The controller passes the token through verbatim as the `RIO_EXECUTOR_TOKEN` pod env var. Builders MUST present it as `x-rio-executor-token` metadata on `BuildExecution` open and every `Heartbeat`. When the HMAC key is configured, the scheduler MUST reject ExecutorService calls without a valid token, MUST reject a heartbeat whose body `intent_id` OR `kind` differs from the token's, MUST reject a heartbeat whose token-attested `intent_id` differs from the target executor's stored `auth_intent` (set at connect, immutable — prevents a compromised pod A heartbeating as B with A's own intent), and MUST reject a `BuildExecution` reconnect whose token `intent_id` differs from the executor's stored `auth_intent` or whose existing stream is still live. The `BuildExecution` handler MUST learn the actor's accept/reject decision before spawning the stream-reader task (a body-supplied `executor_id` is otherwise unbound — `ExecutorClaims` cannot carry it because the scheduler signs before the controller picks a pod name). This binds a stream to the intent AND kind its pod was spawned for: a compromised builder holds a token for ITS OWN intent+kind only and cannot hijack another executor's `stream_tx` (and thereby its `WorkAssignment.assignment_token`), forge `ProcessCompletion` for another executor's build, mutate another executor's heartbeat-driven state, nor self-promote `kind` to receive work routed past its CiliumNetworkPolicy airgap boundary.
@@ -78,24 +78,34 @@ The `privileged: true` escape hatch (for clusters whose containerd lacks
 containers cannot be user-namespaced.
 
 r[sec.pod.fuse-device-plugin]
-<!-- rule-id is historical; mechanism is base_runtime_spec since ADR-021 §7 -->
-Executor pods MUST NOT obtain `/dev/fuse` via a hostPath volume — the kernel
-rejects idmap mounts on device nodes (ADR-012 Phase 1a spike finding), so
-hostPath is incompatible with `hostUsers: false`. The device node is
-delivered by containerd's `base_runtime_spec` declaring `/dev/{fuse,kvm}`
-in OCI `linux.devices` (`nix/base-runtime-spec.nix`) — runc `mknod`s them
-inside the container's `/dev` with container-namespace uid/gid, so no
-idmap-mount rejection. Every pod on a configured node gets `/dev/fuse`;
-`/dev/kvm` is host-conditional — containerd's `ExecStartPre` picks the
-`withKvm` spec variant iff `test -c /dev/kvm` succeeds on the host and
-symlinks it to `/run/base-runtime-spec.json`, so non-`.metal` pods don't
-see a dead device node. No extended resource is requested and no device
-plugin runs. kvm pods route to `.metal` via the `rio.build/kvm`
-nodeSelector (`r[ctrl.pool.kvm-device]`). `privileged: true`
-remains an escape
-hatch for clusters whose containerd lacks `base_runtime_spec` device
-injection; it falls back to the hostPath mechanism and MUST NOT be the
-production default.
+<!-- rule-id is historical; mechanism is rio-mountd fd-handoff since ADR-022 §2.5 -->
+Executor pods MUST NOT obtain `/dev/fuse` via a hostPath volume or
+containerd `base_runtime_spec` device injection. `/dev/fuse` is opened
+**by `rio-mountd`** (a node-level DaemonSet, hostPID, init-ns
+`CAP_SYS_ADMIN`) and the fd is passed to the unprivileged builder via
+`SCM_RIGHTS` over a UDS (`r[builder.mountd.fuse-handoff]`). The builder
+pod has zero device exposure and no `CAP_SYS_ADMIN`. `/dev/kvm` is
+host-conditional — kvm-pool builds receive it via hostPath CharDevice +
+`extra-sandbox-paths`, routed to `.metal` via the `rio.build/kvm`
+nodeSelector (`r[ctrl.pool.kvm-device]`). No device plugin runs.
+
+### Boundary 4: Builder → rio-mountd (UDS)
+
+r[sec.boundary.mountd]
+`rio-mountd` is a privileged component reachable from untrusted builders
+over a hostPath UDS. Auth: `SO_PEERCRED.gid == rio-builder` admits the
+connection; `SO_PEERCRED.uid` binds it (one live conn per uid;
+`r[builder.mountd.uid-bound]`). Threats and mitigations: **path traversal**
+— `Mount{build_id}` validated `^[A-Za-z0-9_-]{1,64}$` and all per-build
+paths via `openat(base_dirfd, …, O_NOFOLLOW)`
+(`r[builder.mountd.build-id-validated]`); **node-disk fill** — mountd
+enforces `staging_quota_bytes` per connection
+(`r[builder.mountd.staging-quota]`); **cross-build interference** — staging
+dirs mode 0700 owned by the connecting uid; **cache poisoning** —
+`Promote`/`PromoteChunks` blake3-verify before writing the mountd-owned
+read-only cache (`r[builder.mountd.promote-verified]`); **fd smuggling** —
+`BACKING_OPEN` ioctl rejects depth>0 backing and `backing_id` is
+conn-scoped.
 
 r[sec.psa.control-plane-restricted]
 
@@ -227,7 +237,7 @@ A gateway-generated SSH host private key MUST be written with mode `0600` (owner
 
 ### Cross-Tenant Chunk Probing
 
-- **Threat**: `FindMissingChunks` can reveal whether another tenant has built a specific package.
+- **Threat**: `FindMissingChunks`/`HasChunks` can reveal whether another tenant has built a specific package (chunk-level probing). `HasBlobs`/`HasDirectories` are tenant-scoped per `r[store.castore.tenant-scope]` and do NOT have this exposure.
 - **Mitigation**: Per-tenant chunk scoping (at the cost of dedup) or accept the risk. See [Multi-Tenancy](multi-tenancy.md#findmissingchunks-scoping).
 
 ## Ephemeral Builders
@@ -266,10 +276,10 @@ heartbeat) plus one reconciler tick (~10s).
 
 1. **The Nix sandbox is NOT a security boundary.** It prevents builds from accessing undeclared inputs (purity) but does not prevent a determined attacker from escaping. For multi-tenant deployments, the security boundary is the executor pod + node isolation.
 
-2. **Executors require `CAP_SYS_ADMIN`.** This capability enables mount namespace manipulation, which is powerful. `seccompProfile: RuntimeDefault` blocks ~40 syscalls (`kexec_load`, `open_by_handle_at`, etc.), but `CAP_SYS_ADMIN` still grants significant host access. The Localhost seccomp profile (`r[builder.seccomp.localhost-profile]`) additionally blocks `ptrace`/`bpf`/`setns`/`process_vm_*` — production deployments should set `PoolSpec.seccompProfile: {type: Localhost, localhostProfile: operator/rio-builder.json}` (the chart default). Dedicated node pools with taints are essential. **Mitigation (K8s 1.33+):** Executor pods must set `hostUsers: false` to enable user namespace isolation. With user namespaces, `CAP_SYS_ADMIN` applies only within the user namespace, not on the host --- the attacker gains capabilities within a namespace that maps to unprivileged host UIDs, significantly reducing the blast radius. See [ADR-012](./decisions/012-privileged-builder-pods.md#kubernetes-user-namespace-isolation).
+2. **`rio-mountd` requires init-ns `CAP_SYS_ADMIN`.** Post-ADR-022, executor pods themselves are unprivileged (`hostUsers: false`, no `CAP_SYS_ADMIN`, no device mounts). The privilege moves to a single node-level `rio-mountd` DaemonSet that opens `/dev/fuse`, brokers `FUSE_DEV_IOC_BACKING_OPEN`, and verify-copies into the shared cache; see Boundary 4. The builder mounts overlay inside its own userns via `userxattr`. `seccompProfile: RuntimeDefault` blocks ~40 syscalls (`kexec_load`, `open_by_handle_at`, etc.), but `CAP_SYS_ADMIN` still grants significant host access. The Localhost seccomp profile (`r[builder.seccomp.localhost-profile]`) additionally blocks `ptrace`/`bpf`/`setns`/`process_vm_*` — production deployments should set `PoolSpec.seccompProfile: {type: Localhost, localhostProfile: operator/rio-builder.json}` (the chart default). Dedicated node pools with taints are essential. **Mitigation (K8s 1.33+):** Executor pods must set `hostUsers: false` to enable user namespace isolation. With user namespaces, `CAP_SYS_ADMIN` applies only within the user namespace, not on the host --- the attacker gains capabilities within a namespace that maps to unprivileged host UIDs, significantly reducing the blast radius. See [ADR-012](./decisions/012-privileged-builder-pods.md#kubernetes-user-namespace-isolation).
 
-3. **`CAP_SYS_ADMIN` is held throughout build execution.** The executor cannot drop `CAP_SYS_ADMIN` between overlay setup and build completion because the Nix sandbox itself requires mount namespace manipulation. A sandbox escape gives the attacker `CAP_SYS_ADMIN` capabilities within the user namespace (see mitigation in #2). Additional mitigations: RuntimeDefault or Localhost seccomp (`r[builder.seccomp.localhost-profile]`), dedicated node pools, and NetworkPolicy. Future work: explore splitting the executor into a privileged setup process and an unprivileged build supervisor.
+3. **The Nix sandbox requires mount-namespace manipulation.** The builder mounts overlay inside its own user namespace via `userxattr` (no host capability needed). A sandbox escape lands inside the builder's userns with no host `CAP_SYS_ADMIN`; the attacker's reach is the rio-store gRPC egress (assignment-token-scoped) and the rio-mountd UDS (Boundary 4). Additional mitigations: RuntimeDefault or Localhost seccomp (`r[builder.seccomp.localhost-profile]`), dedicated node pools, and NetworkPolicy.
 
-4. **Cross-tenant chunk deduplication leaks build activity.** A tenant can probe `FindMissingChunks` to determine whether another tenant has built a specific package. Mitigation: scope `FindMissingChunks` per tenant (at the cost of dedup savings) or accept the risk with documentation.
+4. **Cross-tenant chunk deduplication leaks build activity.** A tenant can probe `FindMissingChunks`/`HasChunks` to determine whether another tenant has built a specific package. The castore surface (`HasBlobs`/`HasDirectories`/`GetDirectory`/`ReadBlob`/`StatBlob`) IS tenant-scoped via `r[store.castore.tenant-scope]` and does not have this exposure; the chunk-level surface remains a documented accepted risk. Mitigation: scope chunk presence per tenant (at the cost of dedup savings) or accept the risk with documentation.
 
 5. **Fixed-output derivations (FODs) need network access.** FOD builds (fetchurl, fetchgit) require egress to the internet, which conflicts with the builder airgap. FODs route to dedicated fetcher pods with open egress; the hash check is the integrity boundary (see [FOD Network Isolation](#fod-network-isolation)).
