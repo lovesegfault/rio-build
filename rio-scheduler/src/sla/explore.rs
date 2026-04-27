@@ -423,6 +423,94 @@ mod tests {
         );
     }
 
+    /// **mb_001 trajectory falsification (R7B0)** — `Miss^n` rotation
+    /// MUST cover the full pool within `|pool|` consecutive misses.
+    /// Pre-R7B0: rotation `pool.iter().filter(|x|x≠h).choose(pin_rng)`
+    /// with `pin_rng` fresh-seeded each call AND not consumed on the
+    /// `Some(h)=>h` arm → constant index `k` into `sorted(pool\{h})`
+    /// → range `{p_k,p_{k+1}}` → 2-cycle attractor. r6's rotation
+    /// tests use `|pool|=2` (where 2-cycle = full coverage); this
+    /// drives `|pool|=5` so the 2-cycle is observable.
+    #[test]
+    fn resolve_miss_trajectory_covers_pool() {
+        let h_all = [h("p0"), h("p1"), h("p2"), h("p3"), h("p4"), h("p5")];
+        let in_a = HashSet::new();
+        let masked = HashSet::new();
+        // |pool| = 5 (excludes p0 = the cheapest). All-infeasible
+        // (besteffort()) → every iteration is a Miss → rotation.
+        let pool = [&h_all[1], &h_all[2], &h_all[3], &h_all[4], &h_all[5]];
+        let want: HashSet<HwClassName> = pool.iter().map(|h| (**h).clone()).collect();
+        let cx = ctx(&h_all, &in_a, &pool, &masked);
+
+        // (a) stable pool, prev=None: drive 2·|pool| misses, collect
+        // every h_tried. Round-robin covers pool in exactly |pool|
+        // steps; pre-R7B0 |seen|≤4 (iter-0's seeded draw contributes
+        // ≤2 + steady-state 2-cycle ≤2) → fails the equality.
+        let mut seen = HashSet::new();
+        let mut prev = None;
+        for _ in 0..10 {
+            let (rec, ts) = recording(besteffort());
+            let HExploreOutcome::Miss { next } = resolve_h_explore(prev, 7, 0, &cx, ts) else {
+                panic!("besteffort → Miss")
+            };
+            seen.insert(rec.take().expect("try_solve called"));
+            prev = next;
+        }
+        assert_eq!(
+            seen,
+            want,
+            "Miss^{{2·|pool|}} trajectory MUST visit every pool element \
+             (round-robin). Pre-R7B0: pin_rng fresh-seeded + unconsumed \
+             on Some(h)=>h → .choose() returns constant k → 2-cycle → \
+             |seen|={}/5",
+            seen.len()
+        );
+
+        // (b) prev ∈ h_all ∧ ∉ pool (the cheapest-excluded one):
+        // pre-R7B0 filter `h ∈ h_all ∧ h ∉ in_a` ACCEPTS `p0` (in_a=∅)
+        // → h_to_try=p0 ∉ pool → rotation .position() would miss. The
+        // R7B0 filter `h ∈ pool` rejects → redraw from pool → joins
+        // the round-robin cycle in ≤1 step.
+        let mut seen = HashSet::new();
+        let mut prev = Some(h("p0"));
+        for _ in 0..10 {
+            let (rec, ts) = recording(besteffort());
+            let HExploreOutcome::Miss { next } = resolve_h_explore(prev, 7, 0, &cx, ts) else {
+                panic!("besteffort → Miss")
+            };
+            seen.insert(rec.take().expect("try_solve called"));
+            prev = next;
+        }
+        assert!(
+            seen.is_superset(&want),
+            "off-pool prev rejoins round-robin in ≤1 step → 2·|pool| \
+             misses cover pool; got seen={seen:?}"
+        );
+    }
+
+    /// **R7B0 filter** — `prev ∈ h_all ∧ ∉ pool` (e.g. became the
+    /// cheapest, so excluded from `pool=H\{cheapest}`) MUST be
+    /// rejected pre-solve and redrawn from `pool`. Pre-R7B0 filter
+    /// `h ∈ h_all ∧ h ∉ in_a` accepts `h_off` (in_a=∅) → `h_to_try
+    /// = h_off ∉ pool`.
+    #[test]
+    fn resolve_filter_rejects_off_pool_prev() {
+        let h_all = [h("p0"), h("p1"), h("p2")];
+        let in_a = HashSet::new();
+        let masked = HashSet::new();
+        // pool excludes p0 (the cheapest).
+        let pool = [&h_all[1], &h_all[2]];
+        let (rec, ts) = recording(besteffort());
+        let _ = resolve_h_explore(Some(h("p0")), 7, 0, &ctx(&h_all, &in_a, &pool, &masked), ts);
+        let tried = rec.take().expect("try_solve called");
+        assert!(
+            pool.iter().any(|p| **p == tried),
+            "prev=p0 ∈ h_all ∧ ∉ pool → filter MUST reject and redraw \
+             from pool; got h_tried={tried} (NOT in pool={{p1,p2}})"
+        );
+        assert_ne!(tried, h("p0"));
+    }
+
     /// Singleton pool, infeasible → `Miss{next: None}`. Exhausted —
     /// caller commits `pinned_explore = None` so the next ε_h hit
     /// re-evaluates pool from scratch.
