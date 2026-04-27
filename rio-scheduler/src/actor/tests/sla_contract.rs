@@ -17,6 +17,11 @@
 //! [`DagActor::handle_ack_spawned_intents`], and the housekeeping
 //! [`DagActor::maybe_refresh_estimator`] wiring. They would have
 //! caught all three round-2 bugs and the round-1 bugs they shadow.
+//!
+//! Determinism of the forecast budget gate (r5 bug_025) is asserted
+//! at the same actor boundary by `forecast_budget_deterministic` in
+//! `misc.rs` — kept there because it needs the forecast-frontier
+//! fixture, but it is a contract test in the same sense.
 
 use super::*;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
@@ -24,9 +29,18 @@ use std::collections::BTreeMap;
 
 /// The three counters `solve_intent_for` may emit. After §Third-strike
 /// and arm-on-ack, `compute_spawn_intents` is **side-effect-free except
-/// idempotent memo fill and once-per-miss emits of these** — every other
+/// idempotent memo fill and debounced emits of these** — every other
 /// counter write is a regression of merged_bug_001 / the validator's
 /// r3 BLOCKED finding (per-poll over-emission).
+///
+/// The debounce gate is **per-counter**, not uniformly `was_miss`:
+/// `_hw_cost_unknown` and `_infeasible{BestEffort.why}` are
+/// `was_miss`-gated (memo inputs); `_hw_ladder_exhausted` and
+/// `_infeasible{CapacityExhausted}` are ICE-edge-gated per R5B2
+/// (read-time state, NOT in `inputs_gen`); `_infeasible` on the
+/// hw-agnostic path is `fit_content_hash`-anchored per R5B3. Each gate
+/// bounds the counter to ≤1 per `model_key` per edge — the (1a) `≤
+/// |Ready drvs|` assertion holds for all of them.
 const ONCE_PER_MISS: &[&str] = &[
     "rio_scheduler_sla_infeasible_total",
     "rio_scheduler_sla_hw_ladder_exhausted_total",
@@ -123,13 +137,13 @@ async fn contract_selector_stability() -> TestResult {
     }
 
     // ── (1a) 8× poll, no state change → identical selectors ────────────
-    // Side-effect-free except idempotent memo + once-per-miss emits:
+    // Side-effect-free except idempotent memo + debounced emits:
     // capture the full counter map before/after; ONLY the three
     // `ONCE_PER_MISS` counters may have moved, and each by ≤ |Ready
-    // drvs| (the first-miss bound — 10 drvs share 1 model_key, so the
-    // actual bound is 1; ≤10 is the loose form that survives fixture
-    // reshuffles). Any other counter delta is a per-poll side effect
-    // the validator's r3 BLOCKED finding flagged.
+    // drvs| (the per-key debounce bound — 10 drvs share 1 model_key,
+    // so the actual bound is 1; ≤10 is the loose form that survives
+    // fixture reshuffles). Any other counter delta is a per-poll side
+    // effect the validator's r3 BLOCKED finding flagged.
     let rec = DebuggingRecorder::new();
     let snap = rec.snapshotter();
     let polls: Vec<_> = {
@@ -145,12 +159,13 @@ async fn contract_selector_stability() -> TestResult {
             ONCE_PER_MISS.contains(&name.as_str()),
             "8× no-change poll moved counter `{name}` (0→{post}) — \
              compute_spawn_intents must be side-effect-free except \
-             once-per-miss emits of {ONCE_PER_MISS:?}"
+             debounced emits of {ONCE_PER_MISS:?}"
         );
         assert!(
             post <= polls[0].len() as u64,
-            "`{name}` moved by {post} > |Ready drvs|={} — once-per-miss \
-             bound violated (per-poll over-emission; merged_bug_001 shape)",
+            "`{name}` moved by {post} > |Ready drvs|={} — per-key \
+             debounce bound violated (per-poll over-emission; \
+             merged_bug_001 shape)",
             polls[0].len()
         );
     }
@@ -544,6 +559,31 @@ async fn contract_metrics_once_per_miss() {
         d.get(INFEASIBLE).copied().unwrap_or(0),
         0,
         "memo hit at new gen"
+    );
+
+    // ── (e) bug_012: refit changing ONLY `hw_bias` → fresh miss ───────
+    // `fit_content_hash` is the per-key staleness field; R5B4 added
+    // `hw_bias` to it (was correctness-by-coincidence via `sum_w`).
+    // Re-seed `disk-hog` with every solve-input field IDENTICAL except
+    // `hw_bias["intel-7"]=1.2` → `fit_content_hash` differs → memo
+    // miss at unchanged `inputs_gen` → `was_miss`-gated `BestEffort.why`
+    // re-emits exactly once. Unit-level `fit_content_hash_covers_hw_bias`
+    // proves the hash differs; THIS proves the actor honours it as a
+    // staleness field (would have caught r5 bug_012 at the boundary).
+    let mut fit = make_fit("disk-hog");
+    fit.disk_p90 = Some(crate::sla::types::DiskBytes(300 << 30));
+    fit.hw_bias.insert("intel-7".into(), 1.2);
+    actor.sla_estimator.seed(fit);
+    for _ in 0..POLLS {
+        let _ = actor.compute_spawn_intents(&Default::default());
+    }
+    let d = counter_map(&snap);
+    assert_eq!(
+        d.get(INFEASIBLE).copied().unwrap_or(0),
+        1,
+        "hw_bias-only refit → fit_content_hash changes → was_miss → \
+         BestEffort.why re-emits once (bug_012: omitting hw_bias from \
+         the hash would leave this at 0 — stale memo served forever)"
     );
 }
 

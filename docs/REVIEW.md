@@ -99,3 +99,31 @@ The sort key SHOULD match the downstream consumer's order (here: §13b
 FFD's `(priority, c*) desc`) so the admitted subset is what the
 consumer wanted first. Add a stable tiebreak (e.g. `drv_hash` asc) so
 ties don't re-introduce nondeterminism.
+
+## Stability tests perturb within the noise band
+
+Every `solve_relevant_hash` / `inputs_gen` stability assertion MUST
+perturb inputs within the documented noise band — `alu ±20%` (bench
+reproducibility), λ exposure +600s at steady rate (EMA state diverges,
+quotient converges), price ±1% (spot tick) — NOT bit-identical
+re-inserts. Seed ≥`FLEET_MEDIAN_MIN_TENANTS` distinct
+`submitting_tenant` rows first, or the per-dim trust gate pins
+`factor=[1.0;K]` and the perturbation is a no-op regardless of what
+the hash covers.
+
+**Why:** r5 merged_bug_018: `solve_relevant_hash` hashed bit-exact f64
+EMA *state* (diverging `(num,den)` sums, raw bench medians) instead of
+the converging *signal* `solve_full` reads. The contract test
+`inputs_gen_stable_across_noop_refresh` re-inserted `'{"alu":1.4}'`
+bit-identical to its seed, so the diverging-state hash didn't move
+either — the test passed against the bug it existed to catch. The fix
+quantizes (`(lambda_for·1e6).round()`, `(factor·100).round()`,
+`(price·1e4).round()`); the test now inserts `1.401` (same bucket as
+`1.4`, different bits) and asserts UNCHANGED, then `1.5` (different
+bucket) and asserts CHANGED.
+
+**Structural close:** a stability test is "noise → no change; signal →
+change". Bit-identical re-insert exercises neither — it's "nothing →
+no change", which any hash satisfies. The noise half MUST use a value
+that differs in storage representation but lands in the same quantum;
+the signal half MUST cross a quantum boundary.
