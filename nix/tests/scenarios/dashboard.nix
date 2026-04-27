@@ -88,6 +88,26 @@
           timeout=60,
       )
 
+  # ── (3b) service-token via nginx: njs HMAC verifies ──────────────
+  # ListPoisoned is r[sched.sla.threat.read-path-auth]-gated: the
+  # scheduler verifies the njs-minted x-rio-service-token (docker.nix
+  # dashboardServiceTokenJs). The key fixture (lib/hmac-keys.nix)
+  # appends a trailing LF, so any consumer that doesn't byte-trim it
+  # (mirroring rio-auth load_key) computes a divergent HMAC and every
+  # gated RPC returns PermissionDenied (Trailers-Only, first byte
+  # 0x80 not 0x00). ClusterStatus/GetBuildLogs above are NOT gated,
+  # so they can't witness a bad token; this subtest is the tripwire.
+  with subtest("service-token via nginx: njs HMAC verifies on gated RPC"):
+      k3s_server.wait_until_succeeds(
+          "printf '\\x00\\x00\\x00\\x00\\x00' | "
+          "curl -sf -X POST http://localhost:18081/rio.admin.AdminService/ListPoisoned "
+          "-H 'content-type: application/grpc-web+proto' "
+          "-H 'x-grpc-web: 1' "
+          "--data-binary @- "
+          "| ${pkgs.xxd}/bin/xxd | head -1 | grep -q '^00000000: 00'",
+          timeout=60,
+      )
+
   # ── (4) gRPC-Web server-streaming THROUGH nginx ──────────────────
   # THE proxy_buffering-off proof. GetBuildLogs with a nonexistent
   # drv_path → scheduler sends zero log lines + trailer frame
