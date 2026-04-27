@@ -117,7 +117,10 @@ store) set `runAsNonRoot: true`, `capabilities.drop: [ALL]`,
 mount, no raw-socket requirements — `restricted` is the correct floor. The
 executor namespaces (`rio-builders`, `rio-fetchers`) stay at `privileged`
 per [ADR-019](./decisions/019-builder-fetcher-split.md); they need
-`CAP_SYS_ADMIN` for FUSE.
+`CAP_SYS_ADMIN` for the build sandbox's mount namespace and overlay. (FUSE
+no longer requires it pod-side: with ADR-022, `/dev/fuse` is opened by
+`rio-mountd` and handed off via fd-passing — see
+`r[builder.mountd.fuse-handoff]`.)
 
 r[sec.image.control-plane-minimal]
 
