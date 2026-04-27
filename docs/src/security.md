@@ -256,8 +256,17 @@ Nix sandbox is still a purity boundary, not a security boundary. A
 malicious derivation can still attempt sandbox escape and gain
 `CAP_SYS_ADMIN` within the pod. The one-shot model limits the BLAST
 RADIUS of such an escape — the attacker is confined to one pod with no
-persistent state to poison and no cached inputs from other tenants to
-exfiltrate.
+persistent state to poison. **Cross-tenant cache read is in scope:** with
+ADR-022, `/var/rio/cache/` and `/var/rio/chunks/` are *node-shared* and
+mounted RO into every builder pod ([ADR-022 §2.6](./decisions/022-lazy-store-fs-erofs-vs-riofs.md)); a
+sandbox-escaped build can read any file/chunk a co-tenant build on the
+same node has fetched. This is accepted: the cache holds substitutable
+content (everything in it was fetched from rio-store, which the attacker's
+own builds can also query); the alternative — per-tenant cache
+partitioning — sacrifices the structural cross-build dedup that is
+ADR-022's primary win. Tenants requiring confidential inputs against
+co-tenants on shared nodes need a dedicated node pool (taint/toleration),
+not cache isolation.
 
 **Recommended combination** for untrusted multi-tenant:
 
