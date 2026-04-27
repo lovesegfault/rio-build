@@ -676,7 +676,7 @@ impl DagActor {
     /// for override/probe/explore branches — it routes through
     /// [`solve::intent_for`] (hw-agnostic `solve_mvp`) and returns an
     /// empty affinity.
-    // r[impl sched.sla.hw-class.epsilon-explore+4]
+    // r[impl sched.sla.hw-class.epsilon-explore+5]
     // r[impl sched.sla.hw-class.ice-mask]
     #[tracing::instrument(
         level = "debug",
@@ -865,8 +865,6 @@ impl DagActor {
                 };
                 let masked = self.ice.masked_cells();
                 let ctx = HExploreCtx {
-                    h_all: &h_all,
-                    in_a: &in_a,
                     pool: &pool,
                     masked: &masked,
                 };

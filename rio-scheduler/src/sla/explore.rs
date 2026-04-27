@@ -16,15 +16,14 @@ use super::solve::{DrvHints, SolveFullResult, SolveMemo};
 use super::types::{DiskBytes, FittedParams, MemBytes, RawCores};
 use std::collections::HashSet;
 
-/// Per-tick hw-class landscape snapshot for ε_h exploration. Groups
-/// the inputs that are **read-only borrows of the same poll's state**
-/// — semantically distinct from the per-key `(prev, mkh, ovr)` and the
-/// `try_solve` effect. Built in `solve_intent_for`'s ε_h block (per
-/// memo-key — `in_a`/`pool` depend on the unrestricted memo's A);
-/// `h_all` and `masked` are tick-wide.
+/// Per-tick `{pool, masked}` snapshot for ε_h exploration. Groups the
+/// inputs that are **read-only borrows of the same poll's state** —
+/// semantically distinct from the per-key `(prev, mkh, ovr)` and the
+/// `try_solve` effect. Built in `solve_intent_for`'s ε_h block: `pool`
+/// per memo-key (depends on the unrestricted memo's A and `cheapest`);
+/// `masked` tick-wide. The prev-validity filter tests `∈ pool` only —
+/// `h_all`/`in_a` are subsumed (`pool ⊆ h_all\in_a\{cheapest}`).
 pub struct HExploreCtx<'a> {
-    pub h_all: &'a [HwClassName],
-    pub in_a: &'a HashSet<HwClassName>,
     pub pool: &'a [&'a HwClassName],
     pub masked: &'a HashSet<Cell>,
 }
@@ -44,12 +43,12 @@ pub enum HExploreOutcome {
     /// cell of its A' is in `masked`. Caller commits
     /// `pinned_explore = Some(hit.pin)` and emits `hit.memo`'s A'.
     Hit(HExploreHit),
-    /// Pre-solve release (`prev ∈ in_a` or `prev ∉ h_all`) re-drew, OR
-    /// post-solve release (infeasible / all-masked) ROTATED to the next
+    /// Pre-solve release (`prev ∉ pool`) re-drew, OR post-solve
+    /// release (infeasible / all-masked) round-robin'd to the next
     /// candidate. Caller commits `pinned_explore = next` and falls
-    /// through to the unrestricted memo. `next` is NOT solved this tick
-    /// — next tick's `prev = next` gets its one solve. `None` ⇔ pool
-    /// empty (pre-solve) or `pool \ {h_tried}` empty (post-solve).
+    /// through to the unrestricted memo. `next` is NOT solved this
+    /// tick — next tick's `prev = next` gets its one solve. `None` ⇔
+    /// pool empty.
     Miss { next: Option<HwClassName> },
 }
 
@@ -69,19 +68,23 @@ pub enum HExploreOutcome {
 /// path CANNOT retry this call (the closure is consumed).
 ///
 /// Release semantics:
-/// - **Pre-solve** (`prev ∈ in_a`, `prev ∉ h_all`, or `prev = None`):
-///   re-draw from `pool`, THEN the one `try_solve` on the redrawn h.
+/// - **Pre-solve** (`prev ∉ pool`, or `prev = None`): re-draw from
+///   `pool` via `pin_rng`, THEN the one `try_solve` on the redrawn h.
+///   `pool ⊆ h_all\in_a\{cheapest}`, so this subsumes graduated /
+///   config-removed / became-cheapest.
 /// - **Post-solve** (`try_solve` infeasible, OR Feasible-but-all-
-///   masked): NO retry this call. Rotate: `next = pool.iter()
-///   .filter(|x| **x != h_tried).choose(&mut pin_rng)`. `pool \
-///   {h_tried} = ∅` → `next = None`.
+///   masked): NO retry this call. Round-robin over `sorted(pool)`:
+///   `next = pool[(idx_of(h_tried)+1) % |pool|]`. Covers every pool
+///   element in `|pool|` consecutive misses while pool composition
+///   stable; on pool change, prev re-validated `∈ pool` (≤1 re-draw
+///   transition). `|pool|=1` → fixed point, `|pool|=0` → `None`.
 ///
 /// Within one tick, multiple drvs sharing `(mkh, ovr)` may each call
 /// `try_solve` on the same `h` if it never commits (all see `prev =
 /// None` → same seed → same `h`). The first to reach `update_entry`
 /// commits the rotated `next`; subsequent same-tick drvs see `prev =
 /// next`. Bounded N× cost, deterministic, no correctness impact.
-// r[impl sched.sla.hw-class.epsilon-explore+4]
+// r[impl sched.sla.hw-class.epsilon-explore+5]
 pub fn resolve_h_explore(
     prev: Option<HwClassName>,
     mkh: u64,
@@ -98,10 +101,12 @@ pub fn resolve_h_explore(
     // |pool| ≤ |H| (config-bounded, typically <10).
     let mut pool: Vec<&HwClassName> = ctx.pool.to_vec();
     pool.sort_unstable();
-    // Pre-solve release: prev still valid iff Some(h) ∧ h ∈ h_all ∧
-    // h ∉ in_a. Any other state (None / graduated / config-removed)
-    // re-draws from pool BEFORE the one solve.
-    let h_to_try = match prev.filter(|h| ctx.h_all.contains(h) && !ctx.in_a.contains(h)) {
+    // Pre-solve release: prev still valid iff Some(h) ∧ h ∈ pool.
+    // `pool ⊆ h_all\in_a\{cheapest}` so this subsumes the prior
+    // `∈ h_all ∧ ∉ in_a` filter AND rejects became-cheapest. With
+    // this, `h_to_try ∈ pool` by construction (round-robin's
+    // .position() relies on it).
+    let h_to_try = match prev.filter(|h| pool.iter().any(|p| **p == *h)) {
         Some(h) => h,
         None => match pool.choose(&mut pin_rng) {
             Some(&h) => h.clone(),
@@ -116,19 +121,19 @@ pub fn resolve_h_explore(
             })
         }
         // Infeasible OR Feasible-but-all-masked: try_solve consumed →
-        // no retry. Post-solve release: rotate to a DIFFERENT pool
-        // element (same pin_rng, so the same `(mkh, ovr)`
-        // deterministically rotates to the same `next`). pool \
-        // {h_to_try} = ∅ → next = None.
-        _ => HExploreOutcome::Miss {
-            next: pool
+        // no retry. Post-solve release: round-robin over sorted(pool);
+        // covers pool in |pool| consecutive misses while pool stable.
+        // Pool changes (in_a/cheapest update): prev re-validated
+        // ∈ pool, ≤1 re-draw transition. |pool|=1 → fixed point.
+        _ => {
+            let idx = pool
                 .iter()
-                .filter(|&&x| *x != h_to_try)
-                .copied()
-                .collect::<Vec<_>>()
-                .choose(&mut pin_rng)
-                .map(|&h| h.clone()),
-        },
+                .position(|h| **h == h_to_try)
+                .expect("h_to_try ∈ pool by filter above");
+            HExploreOutcome::Miss {
+                next: Some((*pool[(idx + 1) % pool.len()]).clone()),
+            }
+        }
     }
 }
 
@@ -270,18 +275,8 @@ mod tests {
         s.to_string()
     }
 
-    fn ctx<'a>(
-        h_all: &'a [HwClassName],
-        in_a: &'a HashSet<HwClassName>,
-        pool: &'a [&'a HwClassName],
-        masked: &'a HashSet<Cell>,
-    ) -> HExploreCtx<'a> {
-        HExploreCtx {
-            h_all,
-            in_a,
-            pool,
-            masked,
-        }
+    fn ctx<'a>(pool: &'a [&'a HwClassName], masked: &'a HashSet<Cell>) -> HExploreCtx<'a> {
+        HExploreCtx { pool, masked }
     }
 
     fn feasible(cells: Vec<Cell>) -> SolveFullResult {
@@ -331,15 +326,14 @@ mod tests {
     #[test]
     fn resolve_pool_permutation_independent() {
         let h_all = [h("a"), h("b"), h("c")];
-        let in_a = HashSet::new();
         let masked = HashSet::new();
         let p1 = [&h_all[0], &h_all[1], &h_all[2]];
         let p2 = [&h_all[2], &h_all[0], &h_all[1]];
         for (mkh, ovr) in [(7u64, 0u64), (0xdead_beef, 0), (42, 1234)] {
             let (rec1, ts1) = recording(feasible(vec![(h("a"), CapacityType::Spot)]));
             let (rec2, ts2) = recording(feasible(vec![(h("a"), CapacityType::Spot)]));
-            let _ = resolve_h_explore(None, mkh, ovr, &ctx(&h_all, &in_a, &p1, &masked), ts1);
-            let _ = resolve_h_explore(None, mkh, ovr, &ctx(&h_all, &in_a, &p2, &masked), ts2);
+            let _ = resolve_h_explore(None, mkh, ovr, &ctx(&p1, &masked), ts1);
+            let _ = resolve_h_explore(None, mkh, ovr, &ctx(&p2, &masked), ts2);
             assert_eq!(
                 rec1.take(),
                 rec2.take(),
@@ -352,14 +346,15 @@ mod tests {
 
     /// **mb_011-A** — `try_solve` infeasible → `Miss{next}` where
     /// `next ∈ pool \ {h_tried}`. NOT stuck on the infeasible h.
+    /// `|pool|=3` so a 2-cycle does NOT trivially satisfy `next ≠
+    /// h_tried` (mb_001's degenerate-domain shape).
     #[test]
     fn resolve_besteffort_rotates() {
-        let h_all = [h("h1"), h("h2")];
-        let in_a = HashSet::new();
+        let h_all = [h("h1"), h("h2"), h("h3")];
         let masked = HashSet::new();
-        let pool = [&h_all[0], &h_all[1]];
+        let pool = [&h_all[0], &h_all[1], &h_all[2]];
         let (rec, ts) = recording(besteffort());
-        let out = resolve_h_explore(None, 99, 0, &ctx(&h_all, &in_a, &pool, &masked), ts);
+        let out = resolve_h_explore(None, 99, 0, &ctx(&pool, &masked), ts);
         let h_tried = rec.take().expect("try_solve called");
         match out {
             HExploreOutcome::Miss { next: Some(n) } => {
@@ -370,7 +365,7 @@ mod tests {
                 assert!(pool.contains(&&n), "rotated next ∈ pool");
             }
             HExploreOutcome::Miss { next: None } => {
-                panic!("pool.len()=2 → pool\\{{h_tried}} non-empty → next=Some")
+                panic!("pool.len()=3 → pool\\{{h_tried}} non-empty → next=Some")
             }
             HExploreOutcome::Hit(_) => panic!("BestEffort → Miss, not Hit"),
         }
@@ -382,20 +377,15 @@ mod tests {
     #[test]
     fn resolve_all_masked_is_miss() {
         let h_all = [h("h1"), h("h2")];
-        let in_a = HashSet::new();
         let c1: Cell = (h("h1"), CapacityType::Spot);
         let c2: Cell = (h("h1"), CapacityType::Od);
         let masked: HashSet<Cell> = [c1.clone(), c2.clone()].into();
         let pool = [&h_all[0], &h_all[1]];
         // Force `prev=Some(h1)` so try_solve targets h1 (whose cells
         // are masked) regardless of which the seed would draw.
-        let out = resolve_h_explore(
-            Some(h("h1")),
-            0,
-            0,
-            &ctx(&h_all, &in_a, &pool, &masked),
-            |_| feasible(vec![c1.clone(), c2.clone()]),
-        );
+        let out = resolve_h_explore(Some(h("h1")), 0, 0, &ctx(&pool, &masked), |_| {
+            feasible(vec![c1.clone(), c2.clone()])
+        });
         match out {
             HExploreOutcome::Miss { next } => {
                 assert_eq!(
@@ -410,13 +400,9 @@ mod tests {
         }
         // Control: one cell unmasked → Hit.
         let masked: HashSet<Cell> = [c1.clone()].into();
-        let out = resolve_h_explore(
-            Some(h("h1")),
-            0,
-            0,
-            &ctx(&h_all, &in_a, &pool, &masked),
-            |_| feasible(vec![c1.clone(), c2.clone()]),
-        );
+        let out = resolve_h_explore(Some(h("h1")), 0, 0, &ctx(&pool, &masked), |_| {
+            feasible(vec![c1.clone(), c2.clone()])
+        });
         assert!(
             matches!(out, HExploreOutcome::Hit(_)),
             "one unmasked cell → Hit"
@@ -434,13 +420,12 @@ mod tests {
     #[test]
     fn resolve_miss_trajectory_covers_pool() {
         let h_all = [h("p0"), h("p1"), h("p2"), h("p3"), h("p4"), h("p5")];
-        let in_a = HashSet::new();
         let masked = HashSet::new();
         // |pool| = 5 (excludes p0 = the cheapest). All-infeasible
         // (besteffort()) → every iteration is a Miss → rotation.
         let pool = [&h_all[1], &h_all[2], &h_all[3], &h_all[4], &h_all[5]];
         let want: HashSet<HwClassName> = pool.iter().map(|h| (**h).clone()).collect();
-        let cx = ctx(&h_all, &in_a, &pool, &masked);
+        let cx = ctx(&pool, &masked);
 
         // (a) stable pool, prev=None: drive 2·|pool| misses, collect
         // every h_tried. Round-robin covers pool in exactly |pool|
@@ -496,12 +481,11 @@ mod tests {
     #[test]
     fn resolve_filter_rejects_off_pool_prev() {
         let h_all = [h("p0"), h("p1"), h("p2")];
-        let in_a = HashSet::new();
         let masked = HashSet::new();
         // pool excludes p0 (the cheapest).
         let pool = [&h_all[1], &h_all[2]];
         let (rec, ts) = recording(besteffort());
-        let _ = resolve_h_explore(Some(h("p0")), 7, 0, &ctx(&h_all, &in_a, &pool, &masked), ts);
+        let _ = resolve_h_explore(Some(h("p0")), 7, 0, &ctx(&pool, &masked), ts);
         let tried = rec.take().expect("try_solve called");
         assert!(
             pool.iter().any(|p| **p == tried),
@@ -511,29 +495,29 @@ mod tests {
         assert_ne!(tried, h("p0"));
     }
 
-    /// Singleton pool, infeasible → `Miss{next: None}`. Exhausted —
-    /// caller commits `pinned_explore = None` so the next ε_h hit
-    /// re-evaluates pool from scratch.
+    /// Singleton pool, infeasible → `Miss{next: Some(only)}` (round-
+    /// robin fixed point). Equivalent to `None` since the pre-solve
+    /// filter re-validates `∈ pool` next call and the singleton is
+    /// the only redraw candidate anyway.
     #[test]
     fn resolve_singleton_pool_exhausted() {
         let h_all = [h("only")];
-        let in_a = HashSet::new();
         let masked = HashSet::new();
         let pool = [&h_all[0]];
-        let out = resolve_h_explore(None, 5, 0, &ctx(&h_all, &in_a, &pool, &masked), |_| {
-            besteffort()
-        });
+        let out = resolve_h_explore(None, 5, 0, &ctx(&pool, &masked), |_| besteffort());
         match out {
-            HExploreOutcome::Miss { next: None } => {}
             HExploreOutcome::Miss { next: Some(n) } => {
-                panic!("pool\\{{only}}=∅ → next=None; got Some({n})")
+                assert_eq!(n, h("only"), "|pool|=1 round-robin → fixed point");
+            }
+            HExploreOutcome::Miss { next: None } => {
+                panic!("|pool|=1 → next=Some(only) fixed point; got None")
             }
             HExploreOutcome::Hit(_) => panic!("BestEffort → Miss"),
         }
         // And empty pool (prev=None) → Miss{None} without calling
         // try_solve at all.
         let (rec, ts) = recording(feasible(vec![]));
-        let out = resolve_h_explore(None, 5, 0, &ctx(&h_all, &in_a, &[], &masked), ts);
+        let out = resolve_h_explore(None, 5, 0, &ctx(&[], &masked), ts);
         assert!(matches!(out, HExploreOutcome::Miss { next: None }));
         assert!(rec.take().is_none(), "empty pool → try_solve not called");
     }
