@@ -352,11 +352,21 @@ async fn gate_b(cli: &CliCtx, pg: &PgHandle) -> Result<()> {
 
 /// gate-b's T_ref(c) — the cached fit's reference-second curve at `c`.
 /// `None` ⇔ no fit / Probe (no curve to compare against).
+///
+/// Goes through the typed `SlaStatusResponse` →
+/// [`duration_fit_from_status`] → `DurationFit::t_at` so the curve has
+/// ONE source. Do NOT re-derive `s + p/c + q·c` here — bug_032: that
+/// form misses the p̄ clamp on Capped/Usl, under-predicts at `c > p̄`
+/// by `c/p̄`, and projects as spurious per-h spread → false-FAIL.
+///
+/// [`duration_fit_from_status`]: rio_scheduler::admin::duration_fit_from_status
 fn gate_b_t_ref(st: &serde_json::Value, c: f64) -> Option<f64> {
-    let s = st.get("s").and_then(Value::as_f64).unwrap_or(0.0);
-    let p = st.get("p").and_then(Value::as_f64).unwrap_or(0.0);
-    let q = st.get("q").and_then(Value::as_f64).unwrap_or(0.0);
-    Some(s + p / c + q * c)
+    use rio_scheduler::sla::types::RawCores;
+    let st: rio_proto::types::SlaStatusResponse = serde_json::from_value(st.clone()).ok()?;
+    if !st.has_fit {
+        return None;
+    }
+    rio_scheduler::admin::duration_fit_from_status(&st).map(|f| f.t_at(RawCores(c)).0)
 }
 
 // ─── gate-c: per-dimension prediction-ratio (report only) ──────────────
@@ -470,10 +480,14 @@ fn label_value(labels: &str, key: &str) -> Option<String> {
 }
 
 fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
+    // bug_033: char-count, not byte-slice — `pname` is tenant-controlled
+    // and the gateway char-clamps, so multi-byte reaches here. Byte-
+    // slice at a non-char-boundary panics. (Column alignment is already
+    // approximate for multi-byte since `{:<32}` pads by bytes.)
+    if s.chars().count() <= n {
         s.to_owned()
     } else {
-        format!("{}…", &s[..n - 1])
+        format!("{}…", s.chars().take(n - 1).collect::<String>())
     }
 }
 
@@ -534,9 +548,11 @@ mod tests {
     fn truncate_handles_multibyte_boundary() {
         let s = "é".repeat(20); // 20 chars / 40 bytes; byte 15 is mid-'é'
         let r = std::panic::catch_unwind(|| truncate(&s, 16));
-        assert!(
-            r.is_err(),
-            "expected panic at byte-slice on non-char-boundary"
-        );
+        let out = r.expect("truncate must not panic on multi-byte input");
+        // 15 'é' + '…' = 16 chars.
+        assert_eq!(out.chars().count(), 16);
+        assert!(out.ends_with('…'));
+        // ASCII path unchanged.
+        assert_eq!(truncate("hello", 32), "hello");
     }
 }

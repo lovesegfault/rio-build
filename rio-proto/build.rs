@@ -33,9 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "ListUpstreamsResponse",
         "DebugExecutorState",
         "DebugListExecutorsResponse",
-        "SlaOverride",
         "ListSlaOverridesResponse",
-        "SlaStatusResponse",
         "SlaCandidateRow",
         "SlaExplainResponse",
     ] {
@@ -44,7 +42,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SeedCorpus/SeedEntry: Serialize + Deserialize so rio-cli can write
     // a typed corpus to disk and read it back for `import-corpus`
     // without depending on rio-scheduler's `prior::SeedCorpus`.
-    for ty in ["SeedCorpus", "SeedEntry"] {
+    // SlaStatusResponse (+ nested SlaOverride): Deserialize so xtask
+    // gate_b can parse `rio-cli --json sla status` output back into the
+    // typed struct and reach `DurationFit::t_at` via
+    // `duration_fit_from_status` instead of re-deriving the curve
+    // (bug_032).
+    for ty in [
+        "SeedCorpus",
+        "SeedEntry",
+        "SlaStatusResponse",
+        "SlaOverride",
+    ] {
         b = b.type_attribute(
             format!("rio.types.{ty}"),
             "#[derive(serde::Serialize, serde::Deserialize)]",

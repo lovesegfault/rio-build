@@ -72,6 +72,7 @@ mod spawn_intents;
 mod tenants;
 
 pub use gc::spawn_store_size_refresh;
+pub use sla::duration_fit_from_status;
 
 pub struct AdminServiceImpl {
     /// Shared with `SchedulerGrpc` — same Arc, same DashMap.

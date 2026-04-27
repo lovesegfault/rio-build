@@ -33,7 +33,7 @@ pub struct ModelKey {
 }
 
 /// One code path, progressively unfrozen columns. ADR-023 §2.4 Model staging.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DurationFit {
     Probe,
     Amdahl {

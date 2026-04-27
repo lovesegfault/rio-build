@@ -7,7 +7,7 @@ use rio_proto::types::{SlaCandidateRow, SlaExplainResponse, SlaOverride, SlaStat
 
 use crate::db::SlaOverrideRow;
 use crate::sla::explain::ExplainResult;
-use crate::sla::types::{DurationFit, FittedParams, MemFit, RawCores};
+use crate::sla::types::{DurationFit, FittedParams, MemFit, RawCores, RefSeconds};
 
 /// proto → row. `id`/`created_at` are server-assigned; ignore the
 /// request's values.
@@ -113,6 +113,45 @@ pub(super) fn status_from_fit(
     }
 }
 
+/// `SlaStatusResponse` → `DurationFit`. Inverse of `status_from_fit`'s
+/// fit projection (mem/disk/stats fields ignored). `None` for `Probe`
+/// (no curve) so callers can `let Some(fit) = … else { skip }`.
+///
+/// Cross-crate consumers (xtask gate_b, dashboard) reconstruct the
+/// typed fit via this then call `fit.t_at(c)` — do NOT re-derive
+/// `s + p/c [+ q·c]` (bug_032: misses the p̄ clamp on Capped/Usl).
+///
+/// Panics on an unknown `fit_kind` so a new [`DurationFit`] variant
+/// compile-errors at `status_from_fit` AND fails here — both
+/// directions forced.
+pub fn duration_fit_from_status(r: &SlaStatusResponse) -> Option<DurationFit> {
+    // 0.0 sentinel ⇔ ∞ (status_from_fit:97 — protojson can't encode ∞).
+    let p_bar = if r.p_bar > 0.0 {
+        RawCores(r.p_bar)
+    } else {
+        RawCores(f64::INFINITY)
+    };
+    match r.fit_kind.as_str() {
+        "Probe" => None,
+        "Amdahl" => Some(DurationFit::Amdahl {
+            s: RefSeconds(r.s),
+            p: RefSeconds(r.p),
+        }),
+        "Capped" => Some(DurationFit::Capped {
+            s: RefSeconds(r.s),
+            p: RefSeconds(r.p),
+            p_bar,
+        }),
+        "Usl" => Some(DurationFit::Usl {
+            s: RefSeconds(r.s),
+            p: RefSeconds(r.p),
+            q: r.q,
+            p_bar,
+        }),
+        other => panic!("unknown fit_kind {other:?}; update duration_fit_from_status"),
+    }
+}
+
 /// [`ExplainResult`] → proto. The CLI renders the candidate table; the
 /// dashboard (phase-8) gets the same shape over gRPC-Web.
 pub(super) fn explain_to_proto(r: &ExplainResult) -> SlaExplainResponse {
@@ -137,7 +176,7 @@ pub(super) fn explain_to_proto(r: &ExplainResult) -> SlaExplainResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sla::types::{ExploreState, FitDf, ModelKey, RefSeconds, RingNEff, WallSeconds};
+    use crate::sla::types::{ExploreState, FitDf, ModelKey, RingNEff, WallSeconds};
 
     fn amdahl_coupled() -> FittedParams {
         FittedParams {
@@ -219,6 +258,73 @@ mod tests {
         assert_eq!(r.fit_kind, "Probe");
         assert_eq!(r.s, 0.0, "Probe spq() s=∞ → 0.0 sentinel");
         assert_eq!(r.p_bar, 0.0, "p̄=∞ → 0.0 sentinel (same convention)");
+    }
+
+    /// `duration_fit_from_status ∘ status_from_fit = id` on the fit
+    /// projection (for non-Probe; Probe → None). Pins both the variant
+    /// AND `t_at` at c below+above p̄=8 so the clamp direction is locked
+    /// independently of which variant happened to round-trip.
+    #[test]
+    fn duration_fit_from_status_inverts_status_from_fit() {
+        // Compile-time tripwire: a new DurationFit variant breaks this
+        // match → forces a fixture below + a `status_from_fit` arm.
+        fn _exhaustive(f: &DurationFit) {
+            match f {
+                DurationFit::Probe
+                | DurationFit::Amdahl { .. }
+                | DurationFit::Capped { .. }
+                | DurationFit::Usl { .. } => (),
+            }
+        }
+        let fixtures = [
+            DurationFit::Amdahl {
+                s: RefSeconds(30.0),
+                p: RefSeconds(2000.0),
+            },
+            DurationFit::Capped {
+                s: RefSeconds(30.0),
+                p: RefSeconds(2000.0),
+                p_bar: RawCores(8.0),
+            },
+            DurationFit::Usl {
+                s: RefSeconds(30.0),
+                p: RefSeconds(2000.0),
+                q: 0.5,
+                p_bar: RawCores(8.0),
+            },
+        ];
+        for fit in &fixtures {
+            let fp = FittedParams {
+                fit: fit.clone(),
+                ..amdahl_coupled()
+            };
+            let st = status_from_fit(Some(&fp), None);
+            let rt = duration_fit_from_status(&st).expect("non-Probe → Some");
+            // Variant identity (Amdahl's p̄=∞ round-trips via the 0.0
+            // sentinel, so structural eq holds for Capped/Usl; Amdahl
+            // discards p̄ on the way out so eq holds there too).
+            match fit {
+                DurationFit::Amdahl { .. } => assert!(matches!(rt, DurationFit::Amdahl { .. })),
+                DurationFit::Capped { .. } => assert!(matches!(rt, DurationFit::Capped { .. })),
+                DurationFit::Usl { .. } => assert!(matches!(rt, DurationFit::Usl { .. })),
+                DurationFit::Probe => unreachable!(),
+            }
+            // t_at at c below + above p̄=8 — pins the clamp.
+            for c in [4.0, 32.0] {
+                assert_eq!(
+                    rt.t_at(RawCores(c)),
+                    fit.t_at(RawCores(c)),
+                    "round-trip t_at({c}) for {fit:?}"
+                );
+            }
+        }
+        // Probe → None (gate_b structurally skips; previously the
+        // open-coded form computed t_ref ≡ 0 → division blowup).
+        let fp = FittedParams {
+            fit: DurationFit::Probe,
+            ..amdahl_coupled()
+        };
+        assert!(duration_fit_from_status(&status_from_fit(Some(&fp), None)).is_none());
     }
 
     /// Finite p̄ (Capped) + Coupled → mem evaluated at p̄, not sentineled.
