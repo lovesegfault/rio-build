@@ -16,7 +16,7 @@ Device exposure: `/dev/fuse` reaches the builder via `rio-mountd` fd-handoff (§
 
 ## 1. Problem statement
 
-The pre-ADR-022 builder presents `/nix/store` via a FUSE filesystem (`rio-builder/src/fuse/`) that JIT-fetches whole store paths on first access. This is correct but has two structural costs:
+The pre-ADR-022 builder presents `/nix/store` via a FUSE filesystem (`rio-builder/src/fuse/`) that JIT-fetches whole store paths on first access. This is correct but has three structural costs:
 
 1. **Fetch is path-granular.** `lookup` of a top-level basename materializes the entire store-path tree before returning. Touching one 4 KB header in a 1 GB output fetches 1 GB.
 2. **Warm-but-partial files still upcall.** FUSE passthrough binds one backing fd at `open()`. A 200 MB `libLLVM.so` with 4 MB of hot `.rodata` either upcalls on every read until the whole file is materialized, or blocks `open()` for ~1.3 s fetching it whole. The kernel page cache cannot serve a warm range of a partially-fetched file without crossing to userspace.
@@ -60,13 +60,13 @@ At mount time the builder holds the closure's set of input store paths and each 
 
 The synthetic root (`FUSE_ROOT_ID`, `/nix/store`) is the only node not in the DAG — its children are the closure's store-path basenames, each mapping to that path's `root_digest` (or `file_digest`/symlink-target if the store path itself is a regular file or symlink). `readdir` of the root enumerates the closure; `lookup(ROOT, basename)` returns the path's content-derived inode (§2.3).
 
-`NarIndex` is not fetched at mount — the Directory DAG carries everything `lookup`/`getattr`/`readdir`/`readlink` need (`{name, digest, size, executable}` per `FileNode`; `{name, target}` per `SymlinkNode`). At `open()`, chunk coordinates are resolved **server-side**: ≤ `STREAM_THRESHOLD` files call `ReadBlob(file_digest)` (`r[store.castore.blob-read]`) which streams bytes directly; > threshold call `StatBlob(file_digest, send_chunks=true)` (`r[store.castore.blob-stat]`) for the `ChunkMeta[]` list, then check the node chunk-cache and `GetChunks` misses. Both RPCs key on `file_digest` alone — no client-side resolver, no per-path `NarIndex`/`ChunkList` prefetch.
+`NarIndex` is not fetched at mount — the Directory DAG carries everything `lookup`/`getattr`/`readdir`/`readlink` need (`{name, digest, size, executable}` per `FileEntry`; `{name, target}` per `SymlinkEntry`). At `open()`, chunk coordinates are resolved **server-side**: ≤ `STREAM_THRESHOLD` files call `ReadBlob(file_digest)` (`r[store.castore.blob-read]`) which streams bytes directly; > threshold call `StatBlob(file_digest, send_chunks=true)` (`r[store.castore.blob-stat]`) for the `ChunkMeta[]` list, then check the node chunk-cache and `GetChunks` misses. Both RPCs key on `file_digest` alone — no client-side resolver, no per-path `NarIndex`/`ChunkList` prefetch.
 
 ### 2.3 Inode model — content-addressed
 
 r[builder.fs.castore-inode-digest]
 
-Inode numbers are derived from content, not path: `ino(FileNode) = h(file_digest ‖ executable)`; `ino(DirectoryNode) = h(dir_digest)`; `ino(SymlinkNode) = h("l" ‖ target)`, where `h` is the low 63 bits of blake3 with bit 63 set (so `ino ≥ 2`, never colliding with `FUSE_ROOT_ID = 1`). Two regular files anywhere in the closure with the same bytes **and the same executable bit** get the **same FUSE inode** — the kernel's icache holds one `struct inode`, one `open()` upcall fetches it once, and one `BACKING_OPEN` binds it to one page-cache. Two directories with identical `dir_digest` get the same inode and the **same dcache subtree** — `lookup(ino, name)` is answered from one `Directory` body regardless of which store path led there.
+Inode numbers are derived from content, not path: `ino(FileEntry) = h(file_digest ‖ executable)`; `ino(DirectoryEntry) = h(dir_digest)`; `ino(SymlinkEntry) = h("l" ‖ target)`, where `h` is the low 63 bits of blake3 with bit 63 set (so `ino ≥ 2`, never colliding with `FUSE_ROOT_ID = 1`). Two regular files anywhere in the closure with the same bytes **and the same executable bit** get the **same FUSE inode** — the kernel's icache holds one `struct inode`, one `open()` upcall fetches it once, and one `BACKING_OPEN` binds it to one page-cache. Two directories with identical `dir_digest` get the same inode and the **same dcache subtree** — `lookup(ino, name)` is answered from one `Directory` body regardless of which store path led there.
 
 The executable bit is part of the inode key because `i_mode` is per-inode in VFS — two paths sharing an inode share `st_mode`, so same-bytes/different-exec must be distinct inodes. This costs nothing for fetch or page-cache dedup: both inodes' `open()` resolve to the same `cache/ab/<file_digest>` backing file (the cache is keyed by `file_digest` alone), so one fetch and one page-cache entry serve both. Only the kernel `struct inode` is duplicated.
 
@@ -83,7 +83,7 @@ The tree is immutable for the mount's lifetime, so every cache TTL is infinite a
 | `ReplyEntry`/`ReplyAttr` ttl | `Duration::MAX` | Kernel never re-validates a positive dentry or attr. Kernel saturates the value via `timespec64_to_jiffies → MAX_SEC_IN_JIFFIES`; no overflow. |
 | `init` capabilities | `FUSE_DO_READDIRPLUS \| FUSE_READDIRPLUS_AUTO \| FUSE_PARALLEL_DIROPS \| FUSE_CACHE_SYMLINKS` | `readdirplus` pre-populates dcache so a subsequent `stat` of every entry is 0-upcall; `PARALLEL_DIROPS` removes the per-inode mutex on concurrent lookups; `CACHE_SYMLINKS` makes `readlink` once-ever per target. |
 | `opendir` reply flags | `FOPEN_CACHE_DIR \| FOPEN_KEEP_CACHE` | Kernel caches dirent pages; second `readdir` of the same dir is 0-upcall. |
-| Negative reply | plain `reply.error(ENOENT)` | FUSE-layer negative caching (`ino=0` in `ReplyEntry`) is unreliable — `fuse_dentry_revalidate` invalidates negatives unconditionally ([`dir.c`](https://github.com/torvalds/linux/blob/master/fs/fuse/dir.c)). overlay's own dcache caches the lower-miss instead (observed in I-043), so configure-probes for absent headers upcall once. |
+| Negative reply | `reply.entry(&Duration::MAX, &FileAttr{ino: 0, ..}, 0)` | Caches the negative at the FUSE layer — `fuse_lookup_name` treats `nodeid=0` as "*same as -ENOENT, but with valid timeout*" ([`dir.c`](https://github.com/torvalds/linux/blob/master/fs/fuse/dir.c)); revalidate's `!inode → invalid` is inside the timeout-expired/`LOOKUP_EXCL\|REVAL\|RENAME_TARGET` branch, so with `ttl=MAX` and a plain `stat()` it stays valid. Under §2.1's overlay this is moot — overlay's own dcache caches lower-miss for either reply form (I-043, [`vm-spike-fuse-negdentry`](../../nix/tests/scenarios/spike-fuse-negdentry.nix)). The handler uses `ino=0` for bare-mount correctness. |
 
 overlayfs delegates dentry revalidation to the lower's `d_op->d_revalidate` ([`ovl_revalidate_real`](https://github.com/torvalds/linux/blob/master/fs/overlayfs/super.c)), so FUSE's `entry_timeout` is what overlay consults — infinite TTL means overlay's dentries never re-ask FUSE. Slab cost for ~35k cached `dentry`+`inode` is ~28 MB; shrinkable under memory pressure (re-upcalls if evicted, harmless on multi-GB builder pods).
 
@@ -221,7 +221,7 @@ Three other approaches were evaluated in depth and set aside. None is retained a
 
 Primary:
 - [snix castore data model](https://snix.dev/docs/components/castore/data-model/) + [`snix/castore/src/fs/mod.rs`](https://git.snix.dev/snix/snix/raw/branch/canon/snix/castore/src/fs/mod.rs) — the §2 model and its FUSE caching configuration
-- [`snix/castore/protos/castore.proto`](https://git.snix.dev/snix/snix/raw/branch/canon/snix/castore/protos/castore.proto) — `Directory`/`FileNode`/`DirectoryNode`/`SymlinkNode` (vendored as `rio-proto/proto/castore.proto`)
+- [`snix/castore/protos/castore.proto`](https://git.snix.dev/snix/snix/raw/branch/canon/snix/castore/protos/castore.proto) — `Directory`/`FileEntry`/`DirectoryEntry`/`SymlinkEntry` (vendored as `rio-proto/proto/castore.proto`)
 - [`fs/fuse/dir.c` `fuse_dentry_revalidate`](https://github.com/torvalds/linux/blob/master/fs/fuse/dir.c) — negative-dentry behavior
 - [`fs/overlayfs/super.c` `ovl_revalidate_real`](https://github.com/torvalds/linux/blob/master/fs/overlayfs/super.c) — overlay delegates revalidation to lower
 - [`fs/fuse/backing.c`](https://github.com/torvalds/linux/blob/master/fs/fuse/backing.c), [`fs/fuse/passthrough.c`](https://github.com/torvalds/linux/blob/master/fs/fuse/passthrough.c) — `BACKING_OPEN` cap check + `read_iter` no-connected-check
@@ -253,7 +253,7 @@ builder ──gRPC──▶ rio-store ──verify blake3──▶ S3 PutObject 
    └── air-gapped: never reaches S3, S3 Express, or any network endpoint other than rio-store
 ```
 
-**This does not widen the builder trust boundary or the cache-tier surface.** The builder's only network egress remains rio-store gRPC — the air-gap invariant is unchanged. S3 standard and S3 Express are reached **exclusively by rio-store**, exactly as in `PutPath` today; the difference is internal to rio-store: it S3-writes each verified chunk on arrival instead of accumulating the full NAR in a `Vec<u8>` first. rio-mountd is uninvolved; the per-AZ Express cache stays unreachable from the builder — chunks reach it only via rio-store's serve-side `TieredChunkBackend.get` read-through, not on `put` ([Design Overview §9](./022-design-overview.md)). The §2.7 rejection of a builder-writable shared FS stands unchanged.
+**This does not widen the builder trust boundary or the cache-tier surface.** The builder's only network egress remains rio-store gRPC — the air-gap invariant is unchanged. S3 standard and S3 Express are reached **exclusively by rio-store**, exactly as in `PutPath` today; the difference is internal to rio-store: it S3-writes each verified chunk on arrival instead of accumulating the full NAR in a `Vec<u8>` first. rio-mountd is uninvolved; the per-AZ Express cache stays unreachable from the builder — chunks reach it only via rio-store's serve-side `TieredChunkBackend.get` read-through, not on `put` ([Design Overview §9](./022-design-overview.md)). The §2.8 rejection of a builder-writable shared FS stands unchanged.
 
 ### 6.1 Builder-side fused walk
 
@@ -285,7 +285,7 @@ r[store.put.narhash-async]
 
 The builder is untrusted (`r[builder.upload.references-scanned]` context: outputs are adversary-controlled bytes); rio-store signs `narinfo`. The `nar_hash` in `Begin` is therefore **claimed**, not attested. On commit, rio-store records `nar_hash_verified = false` and enqueues a background job that NAR-serializes the path from CAS chunks (via `chunk_manifest` + `Directory` tree — same machinery as `ReadBlob`, `r[store.castore.blob-read]`), computes SHA-256, and compares. The verify reads chunks from S3 (standard or Express) — never from the builder — so the wire cost stays missing-chunks-only.
 
-The path is **immediately usable for chunk-addressed reads**: §2's digest-FUSE, `ReadBlob`, and delta-sync (`r[gw.substitute.dag-delta-sync]`) key on `file_digest`/`chunk_digest`, which are self-certifying. Only the legacy binary-cache surface (`narinfo` + NAR fetch) depends on `nar_hash`; serving a `narinfo` for an unverified path **blocks on the verify job** (or returns 404, configuration-dependent).
+The path is **immediately usable for chunk-addressed reads**: §2's castore-FUSE, `ReadBlob`, and delta-sync (`r[gw.substitute.dag-delta-sync]`) key on `file_digest`/`chunk_digest`, which are self-certifying. Only the legacy binary-cache surface (`narinfo` + NAR fetch) depends on `nar_hash`; serving a `narinfo` for an unverified path **blocks on the verify job** (or returns 404, configuration-dependent).
 
 r[store.put.narhash-quarantine]
 
