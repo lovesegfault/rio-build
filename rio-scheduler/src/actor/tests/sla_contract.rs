@@ -1,8 +1,9 @@
 //! CR-1 actor-boundary state-machine contract tests.
 //!
 //! Round 1 fixed primitives so they *can* satisfy a stated invariant
-//! (ε_h seed = `hash(drv) ^ inputs_gen`; SolveCache keyed on
-//! `model_key_hash`; `IceBackoff::clear` resets on success). Round 2
+//! (ε_h seed = `hash(drv)` + `MemoEntry.pinned_explore`; SolveCache
+//! keyed on `model_key_hash`; `IceBackoff::clear` resets on success).
+//! Round 2
 //! found every production caller violated the precondition that makes
 //! the invariant hold (`inputs_gen` bumped unconditionally every 60s;
 //! no LRU→SolveCache eviction; `clear()` wired to Pending not
@@ -65,7 +66,7 @@ async fn refresh_cycle(actor: &mut DagActor) {
     }
 }
 
-/// **Selector stability** (`r[sched.sla.hw-class.epsilon-explore+2]`):
+/// **Selector stability** (`r[sched.sla.hw-class.epsilon-explore+3]`):
 /// `SpawnIntent.node_affinity` is a pure function of `(drv_hash,
 /// inputs_gen)` — N controller polls with no input change return
 /// identical selectors for every intent, AND a no-op
@@ -76,7 +77,7 @@ async fn refresh_cycle(actor: &mut DagActor) {
 /// Would have caught r1 bug_049 (per-call `rand::rng()` re-roll →
 /// selector-drift reap churn) AND r2 merged_bug_028 (unconditional
 /// bump every 60s → ε_h re-rolls before Karpenter provisions).
-// r[verify sched.sla.hw-class.epsilon-explore+2]
+// r[verify sched.sla.hw-class.epsilon-explore+3]
 #[tokio::test]
 async fn contract_selector_stability() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -648,5 +649,136 @@ async fn contract_metrics_once_per_miss_static_mode() {
         1,
         "on_fit_evicted sweeps infeasible_static_fh → same-fh re-seed \
          emits once (not orphan-suppressed)"
+    );
+}
+
+/// **§Fourth-strike Option 2 falsification** — `h_explore` is pinned
+/// in `MemoEntry.pinned_explore`, decoupled from `inputs_gen`. With
+/// Option 1 (quantize) in place, steady-state `inputs_gen` doesn't
+/// churn → the pin-survives-churn property is **unfalsifiable** unless
+/// the test FORCES `inputs_gen` to change via a non-noise path.
+/// `apply_stale_clamp` flips a CostTable solve-relevant bool — same
+/// mechanism the (1e) step of `contract_selector_stability` uses.
+///
+/// (a) ε_h forced (ε=1.0) → poll → capture `h_explore`. Force
+///     `inputs_gen` change. Re-poll → assert `h_explore` IDENTICAL.
+///     This is the property Option 2 exists to guarantee and the seed
+///     `^ inputs_gen` term broke.
+/// (b) Graduation: bump `factor[h_explore]` so it dominates → enters
+///     A. Re-poll → graduation filter `!in_a.contains(h)` clears the
+///     pin → `h_explore` re-drawn from `H\A`, MUST differ.
+///
+/// Would have caught: r1 bug_049, r2 mb_028, r3 mb_011, r3 bug_026,
+/// r3 bug_009, r5 mb_018 (the ε_h half — Option 1 covers the
+/// memo-thrash half).
+// r[verify sched.sla.hw-class.epsilon-explore+3]
+#[tokio::test]
+async fn contract_h_explore_stable_across_inputs_gen_churn() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    // ε=1.0: every drv hits the explore branch — the seeded coin is
+    // `hash(drv_hash)` only, so the SAME drv hits or misses
+    // consistently regardless of `inputs_gen`.
+    actor.sla_config.hw_explore_epsilon = 1.0;
+    actor.test_inject_ready("d-pin", Some("test-pkg"), "x86_64-linux", false);
+    let state = actor.dag.node("d-pin").unwrap();
+
+    // Distinct hw_class names from one solve — for an ε_h hit this is
+    // `{h_explore}` (1 element); for the unrestricted memo it's `A`.
+    let h_of = |intent: &crate::state::SolvedIntent| -> std::collections::BTreeSet<String> {
+        intent.hw_class_names.iter().cloned().collect()
+    };
+
+    // ── (a) pin survives `inputs_gen` churn ───────────────────────────
+    let (hw, cost, g0) = actor.solve_inputs();
+    let h0 = h_of(&actor.solve_intent_for(state, &hw, &cost, g0));
+    assert_eq!(
+        h0.len(),
+        1,
+        "ε=1.0 + |H|>1 → explore branch fires; A' ⊆ {{h_explore}}×{{spot,od}}"
+    );
+    let h0 = h0.into_iter().next().unwrap();
+    // Force `inputs_gen` change via stale_clamp flip — a real
+    // CostTable solve-relevant bool, NOT a synthetic `g0+1`. This is
+    // the path Option 1's quantization does NOT smooth (it's a
+    // discrete flip), so the test exercises Option 2 even with
+    // Option 1 in place.
+    actor
+        .cost_table
+        .write()
+        .apply_stale_clamp(crate::sla::cost::STALE_CLAMP_AFTER_SECS + 1.0);
+    let (hw, cost, g1) = actor.solve_inputs();
+    assert_ne!(g1, g0, "stale_clamp flip → derived inputs_gen changes");
+    let h1 = h_of(&actor.solve_intent_for(state, &hw, &cost, g1));
+    assert_eq!(
+        h1.into_iter().next().as_deref(),
+        Some(h0.as_str()),
+        "Option 2: `h_explore` pinned in MemoEntry — IDENTICAL across \
+         `inputs_gen` churn. Pre-Opt2 the seed `^ inputs_gen` term \
+         re-rolled the draw here, and `reap_stale_for_intents` would \
+         reap the explore Job mid-provisioning."
+    );
+    // Re-poll at g1 → still h0 (determinism + pin both hold).
+    for _ in 0..3 {
+        assert_eq!(
+            h_of(&actor.solve_intent_for(state, &hw, &cost, g1))
+                .into_iter()
+                .next()
+                .as_deref(),
+            Some(h0.as_str()),
+        );
+    }
+
+    // ── (b) graduation: pinned class enters A → pin clears ────────────
+    // Bump factor[h0] → 100× faster → h0 dominates 𝔼[cost] → A
+    // contains h0 (and only h0 — others are 100× more expensive,
+    // far outside τ). The graduation filter `!in_a.contains(h)`
+    // clears the pin; the next ε_h hit re-draws from H\A. Since
+    // A={h0}, pool = H\{h0} → new draw MUST differ from h0. The pin
+    // naturally carries forward across the seed_hw `inputs_gen` bump
+    // (Option 2 just demonstrated in (a)); no manual reseeding.
+    let mut m = std::collections::HashMap::new();
+    for h in actor.sla_config.hw_classes.keys() {
+        m.insert(h.clone(), if *h == h0 { 100.0 } else { 1.0 });
+    }
+    actor
+        .sla_estimator
+        .seed_hw(crate::sla::hw::HwTable::from_map(m));
+    let (hw, cost, g2) = actor.solve_inputs();
+    assert_ne!(g2, g1, "factor change → derived inputs_gen changes");
+    // Precondition: ε=0 poll at g2 fills the memo with the new A
+    // (pin h0 carried forward through the staleness miss; ε=0 means
+    // the explore branch is skipped so `hw_class_names` IS A).
+    actor.sla_config.hw_explore_epsilon = 0.0;
+    let in_a = h_of(&actor.solve_intent_for(state, &hw, &cost, g2));
+    assert!(
+        in_a.contains(&h0),
+        "precondition: factor[{h0}]=100 → {h0} ∈ A; A={in_a:?}"
+    );
+    // ε=1.0 poll at g2 (memo hit): reads carried-forward pin=h0,
+    // computes in_a from the memoized A (includes h0) → filter clears
+    // → re-draw from H\A.
+    actor.sla_config.hw_explore_epsilon = 1.0;
+    let h2 = h_of(&actor.solve_intent_for(state, &hw, &cost, g2));
+    let h2 = h2.into_iter().next().expect("ε=1.0 hit");
+    assert_ne!(
+        h2, h0,
+        "graduation filter: pinned `{h0}` ∈ A → pin clears → re-drawn \
+         from H\\A; got `{h2}`. Without the `!in_a.contains(h)` release \
+         valve, hot pnames would explore exactly one class per process \
+         lifetime."
+    );
+    assert!(
+        !in_a.contains(&h2) || in_a.len() == actor.sla_config.hw_classes.len(),
+        "re-drawn `{h2}` ∈ H\\A (or A=H → H\\{{cheapest}})"
+    );
+    // Re-draw is the new pin: stable on next poll.
+    assert_eq!(
+        h_of(&actor.solve_intent_for(state, &hw, &cost, g2))
+            .into_iter()
+            .next()
+            .as_deref(),
+        Some(h2.as_str()),
+        "re-drawn pin is stable"
     );
 }

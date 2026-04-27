@@ -766,16 +766,19 @@ type-fit at c*, cost-at-c* ≤ (1+τ)·𝔼^min, and capacity-ratio
 `c*_{h,cap} ≥ c*/k` (default k=2). The argmax cell survives all three
 checks so `A' ≠ ∅` provably.
 
-r[sched.sla.hw-class.epsilon-explore+2]
+r[sched.sla.hw-class.epsilon-explore+3]
 With probability `sla.hwExploreEpsilon` per intent, the scheduler
 pins `h_explore ~ Unif(H\A)` (or `H\{argmin_H price}` on cache-miss
 or A=H), restricts the solve to `(h_explore,*)`, and emits
-`A' ⊆ {h_explore}×{spot,od}`. The draw is OUTSIDE the memoization and
-deterministic in `(drv_hash, inputs_gen)` — stable across controller
-polls, re-rolled when `inputs_gen` changes. `inputs_gen` is derived
-from the `(HwTable, CostTable)` solve-relevant projection at poll
-time; no caller bumps. The cached A is never overwritten by an
-exploration result.
+`A' ⊆ {h_explore}×{spot,od}`. The coin is OUTSIDE the memoization and
+deterministic in `drv_hash`; the drawn `h_explore` is stored in the
+SolveCache `MemoEntry.pinned_explore` and **carried across memo
+invalidation** — `inputs_gen` governs memo staleness only, not
+selector identity. The pin is cleared (re-drawn from `H\A` on the
+next ε_h hit) when the pinned class graduates into A or is removed
+from `h_all`. `inputs_gen` is derived from the `(HwTable, CostTable)`
+solve-relevant projection at poll time; no caller bumps. The cached A
+is never overwritten by an exploration result.
 
 r[sched.sla.hw-class.ice-mask]
 ICE state is a read-time mask: the memo holds the full-H solve and is

@@ -1805,11 +1805,12 @@ async fn ice_step_doubles_across_mark_without_clear() {
     assert_eq!(actor.ice.step(&cell), None, "registered_cells clears");
 }
 
-/// `r[sched.sla.hw-class.epsilon-explore]`: ε_h draw is a pure
-/// function of `(drv_hash, inputs_gen)`, pins `h_explore ∈ H\A` (or
-/// `H\{argmin price}` on miss / A=H), and the resulting affinity is
+/// `r[sched.sla.hw-class.epsilon-explore]`: ε_h coin is a pure
+/// function of `drv_hash`; `h_explore ∈ H\A` (or `H\{argmin price}`
+/// on miss / A=H) is pinned in `MemoEntry.pinned_explore` and carried
+/// across `inputs_gen` churn. The resulting affinity is
 /// `⊆ {h_explore}×{spot,od}`. The memo is never overwritten.
-// r[verify sched.sla.hw-class.epsilon-explore+2]
+// r[verify sched.sla.hw-class.epsilon-explore+3]
 #[tokio::test]
 async fn epsilon_h_draws_outside_a() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1847,9 +1848,13 @@ async fn epsilon_h_draws_outside_a() {
             "ε_h draw is deterministic for fixed (drv_hash, inputs_gen)"
         );
     }
-    // Different inputs_gen → re-roll permitted (the seed changes).
-    // Derived design: pass `g0+1` directly — equivalent to a real
-    // hw/cost solve-relevant change.
+    // Different inputs_gen → §Fourth-strike Option 2: ε_h pin is
+    // carried across the staleness miss; seed no longer XORs
+    // `inputs_gen`. Pass `g0+1` directly — equivalent to a real
+    // hw/cost solve-relevant change. The Opt2-falsification contract
+    // test asserts identity across REAL `inputs_gen` churn; this just
+    // re-asserts determinism at the new gen (which it would have been
+    // even pre-Opt2).
     let g1 = g0.wrapping_add(1);
     let after_bump = actor.solve_intent_for(actor.dag.node("d").unwrap(), &hw, &cost, g1);
     for _ in 0..10 {
@@ -3682,7 +3687,7 @@ async fn solve_cache_evicted_with_lru() {
 /// the converging *signal* solve reads — quantize. This asserts the
 /// projection's stability under noise-band perturbation, NOT just
 /// bit-identical re-inserts.
-// r[verify sched.sla.hw-class.epsilon-explore+2]
+// r[verify sched.sla.hw-class.epsilon-explore+3]
 #[tokio::test]
 async fn inputs_gen_stable_across_noop_refresh() -> TestResult {
     use crate::sla::solve::SolveInputs;

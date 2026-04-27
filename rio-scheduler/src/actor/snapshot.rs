@@ -676,7 +676,7 @@ impl DagActor {
     /// for override/probe/explore branches — it routes through
     /// [`solve::intent_for`] (hw-agnostic `solve_mvp`) and returns an
     /// empty affinity.
-    // r[impl sched.sla.hw-class.epsilon-explore+2]
+    // r[impl sched.sla.hw-class.epsilon-explore+3]
     // r[impl sched.sla.hw-class.ice-mask]
     #[tracing::instrument(
         level = "debug",
@@ -742,7 +742,7 @@ impl DagActor {
         //
         // Sorted: ε_h's seeded `pool.choose()` indexes into this Vec,
         // so HashMap iteration order would otherwise leak into the
-        // "pure function of (drv_hash, inputs_gen)" contract.
+        // "pure function of drv_hash" contract.
         let mut h_all: Vec<_> = self.sla_config.hw_classes.keys().cloned().collect();
         h_all.sort_unstable();
         // `was_miss`: first time this `(model_key, inputs_gen)` was
@@ -811,6 +811,7 @@ impl DagActor {
             );
             was_miss = miss;
             let result = entry.result.clone();
+            let prev_pin = entry.pinned_explore.clone();
             memo_entry = Some((mkh, ovr, entry));
             let memo = match result {
                 solve::SolveFullResult::Feasible(m) => Some(m),
@@ -827,20 +828,25 @@ impl DagActor {
             // to `(h_explore, *)`, and emit ITS A' if feasible. The
             // cached memo's `A` is read but never overwritten.
             //
-            // The draw is a **pure function of (drv_hash,
-            // inputs_gen)** — stable across every controller poll at
-            // the same `inputs_gen`. `compute_spawn_intents` must be
-            // deterministic given (DAG state, fit cache, inputs_gen)
-            // or `reap_stale_for_intents` reaps an explore Job the
-            // next tick on a tails coin (selector-drift churn). ε_h
-            // re-rolls when `inputs_gen` changes, which is already the
-            // legitimate "selector may drift" signal.
+            // §Fourth-strike Option 2: the draw is a **pure function
+            // of `drv_hash`** for the coin, and `h_explore` itself is
+            // **pinned in the MemoEntry** — carried across `inputs_gen`
+            // churn, cleared when the pinned class graduates into A or
+            // is removed from `h_all`. `inputs_gen` now governs ONLY
+            // memo staleness, not selector identity: the next
+            // `solve_relevant_hash` projection bug becomes a perf
+            // regression instead of a selector-churn outage
+            // (`reap_stale_for_intents` reaping an explore Job
+            // mid-provisioning on a tails coin). Option 1 (quantize)
+            // makes `inputs_gen` quiet in steady state; this makes ε_h
+            // structurally indifferent to it — neither alone closes
+            // both invariants.
             use rand::{RngExt as _, SeedableRng};
             let seed = {
                 use std::hash::{DefaultHasher, Hash, Hasher};
                 let mut h = DefaultHasher::new();
                 state.drv_hash.as_str().hash(&mut h);
-                h.finish() ^ inputs_gen
+                h.finish()
             };
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
             if h_all.len() > 1 && rng.random::<f64>() < self.sla_config.hw_explore_epsilon {
@@ -849,6 +855,15 @@ impl DagActor {
                     .as_ref()
                     .map(|m| m.a.cells.iter().map(|(h, _)| h.clone()).collect())
                     .unwrap_or_default();
+                // Graduation filter: a pinned class that has entered A
+                // (exploration succeeded — `hw_bias` learned, wins on
+                // merit) or been removed from config releases the pin
+                // so the next hit re-draws from H\A. Without this, hot
+                // pnames that never LRU-evict explore exactly one
+                // class per process lifetime and starve `hw_bias` of
+                // new-class samples. Zero extra state — `in_a` is
+                // already computed.
+                let prev_pin = prev_pin.filter(|h| h_all.contains(h) && !in_a.contains(h));
                 // Cache miss (in_a=∅) or A=H: H\A would be H or ∅ —
                 // either way ε_h would re-select the price-dominant
                 // cell. Draw from H \ {argmin price} instead so the
@@ -862,7 +877,16 @@ impl DagActor {
                 } else {
                     h_all.iter().filter(|h| !in_a.contains(*h)).collect()
                 };
-                if let Some(&h_explore) = pool.choose(&mut rng) {
+                let h_explore = prev_pin.or_else(|| pool.choose(&mut rng).map(|&h| h.clone()));
+                // Idempotent memo write — same class as the
+                // `update_entry` for `ice_exhausted`; only on edge.
+                if let Some((_, _, prev)) = &memo_entry
+                    && prev.pinned_explore != h_explore
+                {
+                    self.solve_cache
+                        .update_entry(mkh, ovr, |e| e.pinned_explore = h_explore.clone());
+                }
+                if let Some(h_explore) = &h_explore {
                     tracing::Span::current().record("hw_explore", h_explore.as_str());
                     if let solve::SolveFullResult::Feasible(m) = solve::solve_full(
                         f,

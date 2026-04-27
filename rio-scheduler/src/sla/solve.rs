@@ -1028,6 +1028,16 @@ pub struct MemoEntry {
     /// fallback today — so this field is the with-memo half of the
     /// anchor; the no-memo half is [`SolveCache::infeasible_static_seen`].
     pub last_infeasible_fh: Option<u64>,
+    /// §Fourth-strike Option 2: ε_h's `h_explore` pin, **decoupled from
+    /// `inputs_gen`**. Drawn once at first ε_h hit for `(mkh, ovr)`,
+    /// carried across staleness misses (like `prev_a`), cleared when the
+    /// pinned class graduates into A or is removed from `h_all`. The ε_h
+    /// seed is now `hash(drv_hash)` ONLY — `inputs_gen` governs memo
+    /// staleness, not selector identity, so the next `solve_relevant_hash`
+    /// projection bug is a perf regression instead of a selector-churn
+    /// outage (`reap_stale_for_intents` reaping an explore Job mid-
+    /// provisioning).
+    pub pinned_explore: Option<HwClassName>,
 }
 
 /// Per-key solve memo. Nested `mkh → (ovr → MemoEntry)` — logical
@@ -1112,11 +1122,14 @@ impl SolveCache {
             inputs_gen,
             fit_content_hash,
             result: f(&prev_a),
-            // Per-key debounce survives invalidation: an `inputs_gen`
-            // bump or refit is NOT an ICE-edge nor a fresh-infeasible
-            // event by itself.
+            // Per-key debounce + ε_h pin survive invalidation: an
+            // `inputs_gen` bump or refit is NOT an ICE-edge, NOT a
+            // fresh-infeasible event, and NOT a "selector may drift"
+            // signal by itself. `pinned_explore`'s release valve is the
+            // graduation filter at the ε_h block, not memo staleness.
             ice_exhausted: prior.as_ref().is_some_and(|p| p.ice_exhausted),
             last_infeasible_fh: prior.as_ref().and_then(|p| p.last_infeasible_fh),
+            pinned_explore: prior.as_ref().and_then(|p| p.pinned_explore.clone()),
         };
         self.entries
             .entry(mkh)
@@ -2328,6 +2341,7 @@ mod tests {
         assert!(miss1);
         assert!(!r1.ice_exhausted, "fresh entry: ice_exhausted=false");
         assert_eq!(r1.last_infeasible_fh, None, "fresh entry: anchor unset");
+        assert_eq!(r1.pinned_explore, None, "fresh entry: ε_h pin unset");
         let (r1b, miss1b) = cache.get_or_insert_with(mk, 0, g0, fh, go);
         assert!(!miss1b, "second call hits memo");
         assert_eq!(calls.get(), 1);
@@ -2337,9 +2351,12 @@ mod tests {
         assert!(miss2);
         assert_eq!(calls.get(), 2);
         assert_eq!(cache.len(), 2, "len() sums inner maps: 1 mkh × 2 ovr");
-        // R5B2: debounce bit written via update_entry survives a
-        // staleness miss (per-key, not per-epoch).
-        cache.update_entry(mk, 0, |e| e.ice_exhausted = true);
+        // R5B2 + Opt2: debounce bit + ε_h pin written via update_entry
+        // survive a staleness miss (per-key, not per-epoch).
+        cache.update_entry(mk, 0, |e| {
+            e.ice_exhausted = true;
+            e.pinned_explore = Some("intel-7".into());
+        });
         // Different inputs_gen → miss; prev_a from old entry; debounce
         // carried forward.
         let (e3, miss3) = cache.get_or_insert_with(mk, 0, g0 + 1, fh, |p| {
@@ -2354,6 +2371,12 @@ mod tests {
         assert!(
             e3.ice_exhausted,
             "ice_exhausted carried across inputs_gen miss — per-key, not per-epoch"
+        );
+        assert_eq!(
+            e3.pinned_explore.as_deref(),
+            Some("intel-7"),
+            "pinned_explore carried across inputs_gen miss — ε_h decoupled \
+             from inputs_gen (§Fourth-strike Option 2)"
         );
         assert_eq!(calls.get(), 3);
         // Regression (merged_bug_026): refit changes fit_content_hash
