@@ -38,6 +38,15 @@ behaviour as the feature.
 - [ ] Every content-hash / `solve_relevant_hash` that covers the
       field: does it hash the per-axis trust booleans?
 
+The same rule applies to **row-subset filters**: any filter that
+produces a row subset (`idx`, `retain`, the `p_bar` collinearity drop
+at ingest.rs `cs_f`/`w_f`) creates a granularity axis. Every aggregate
+computed *before* the filter and stored as describing the *post-filter*
+fit is suspect. r5 bug_023: `n_eff`/`n_distinct_c`/`sum_w` were
+computed on the full ring but `als_fit`/`sigma_resid` ran on the
+`idx`-filtered subset, so `z_q()` overstated df → under-widened CI →
+`c*` undersized (anti-conservative).
+
 ## Witness-flag completeness
 
 A `for { if X { continue } if Y { continue } … }` loop where the

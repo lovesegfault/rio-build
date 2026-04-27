@@ -4,7 +4,7 @@
 //! touched key on each refresh tick; the fit itself is pure (no DB, no I/O)
 //! so it can be unit-tested against synthetic rows.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::alpha;
 use super::bootstrap::{WeightedSample, t_min_ci};
@@ -194,9 +194,12 @@ pub fn refit(
     // read for weighting (only for the CI-debounce floor below).
     let ring = AnchorRing::from_rows(fit_rows.len(), &fit_rows, &vdists);
     let w: Vec<f64> = ring.weighted_rows().map(|(_, _, w)| w).collect();
+    // Pre-filter n_eff: gates `als_fit`, `fit_memory`, and the
+    // partial-pool blend — all of which run on the unfiltered ring. The
+    // POST-filter values stored on FittedParams (and fed to the CI
+    // debounce / `is_outlier` / `z_q`) are computed below after the
+    // `idx`/p̄ collinearity drop.
     let n_eff = kish_n_eff(&w);
-    let sum_w: f64 = w.iter().sum();
-    let n_distinct_c = ring.n_distinct_c();
 
     let cs: Vec<f64> = fit_rows
         .iter()
@@ -237,6 +240,19 @@ pub fn refit(
     let walls_f: Vec<f64> = idx.iter().map(|&i| walls[i]).collect();
     let factors_f: Vec<_> = idx.iter().map(|&i| factors[i]).collect();
     let w_f: Vec<f64> = idx.iter().map(|&i| w[i]).collect();
+    // z_q inputs MUST describe the post-filter row set: `als_fit`,
+    // `sigma_resid`, `log_residuals`, and the bootstrap CI all run on
+    // `(cs_f, w_f)`, so the df/Σw that `z_q()` reads (types.rs:185) must
+    // be stated at the same granularity. Pre-filter `n_eff` above is kept
+    // for `fit_memory` / partial-pool / the als gate (which run on the
+    // unfiltered ring). See docs/REVIEW.md §Granularity-coupling.
+    let n_eff_f = kish_n_eff(&w_f);
+    let sum_w_f: f64 = w_f.iter().sum();
+    let n_distinct_c_f = cs_f
+        .iter()
+        .map(|c| c.round() as u32)
+        .collect::<BTreeSet<_>>()
+        .len() as u32;
 
     // ExploreState reads only current-version (vdist==0) cpu_limits — the
     // explore ladder shouldn't count probes from a prior version toward
@@ -279,6 +295,14 @@ pub fn refit(
     // 1): the pre-ALS behaviour. The I/O-saturation `ioseq` seed (ADR
     // L547 first arm) is Task A9 once `io_bytes` lands in
     // BuildSampleRow; until then the prior chain bottoms out at UNIFORM.
+    //
+    // The n_eff gate is intentionally PRE-filter: the p̄ collinearity
+    // drop can leave 2 post-filter rows (kept.len()≥2 above), which is
+    // sufficient for the 2-param Capped/Amdahl fit. `z_q()` (fit.rs:37)
+    // floors df at 3 as the backstop for the stored post-filter
+    // `n_eff_f`/`n_distinct_c_f`, so a 2-row post-filter fit gets the
+    // widest (most conservative) prediction interval rather than being
+    // rejected outright.
     let (mut fit, sigma, alpha) = if n_eff < 3.0 || span < 4.0 {
         (DurationFit::Probe, 0.2, alpha_prior)
     } else {
@@ -365,7 +389,7 @@ pub fn refit(
     // or it's been long enough. Probe fits skip CI entirely (no T_min).
     let (ci, ci_at) = if matches!(fit, DurationFit::Probe) {
         (None, None)
-    } else if should_recompute_ci(prev, &fit, n_eff, now) {
+    } else if should_recompute_ci(prev, &fit, n_eff_f, now) {
         let ws: Vec<WeightedSample> = cs_f
             .iter()
             .zip(&ts_f)
@@ -399,9 +423,9 @@ pub fn refit(
         disk_p90,
         sigma_resid: sigma,
         log_residuals,
-        n_eff,
-        n_distinct_c,
-        sum_w,
+        n_eff: n_eff_f,
+        n_distinct_c: n_distinct_c_f,
+        sum_w: sum_w_f,
         span,
         explore,
         t_min_ci: ci,
@@ -1585,5 +1609,36 @@ mod tests {
         // 1/5=0.2: ages 4..=0 → 0.5^{0.2,0.15,0.1,0.05,0} =
         // {0.871,0.901,0.933,0.966,1.0}; all > 0.2 so floor inert.
         assert!(f.sum_w > 4.5 && f.sum_w < 5.0, "Σw={}", f.sum_w);
+    }
+
+    #[test]
+    fn z_q_inputs_post_filter() {
+        // r[verify sched.sla.hw-class.zq-inflation]
+        // 8 samples at c={2,4,8,16,32,64,128,256} with workload p̄≈12:
+        // c≤12 saturated (peak=avg=c), c>12 unsaturated (peak=avg=12).
+        // observed_p_bar → ~12, so the collinearity filter keeps only
+        // c∈{2,4,8}. Stored z_q inputs MUST describe that 3-row subset
+        // — NOT the 8-row pre-filter ring (bug_023: anti-conservative
+        // df overstated → z_q under-widened).
+        let cs = [2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0];
+        let rows: Vec<_> = cs
+            .into_iter()
+            .map(|c: f64| {
+                let p = c.min(12.0);
+                row_util(c, 30.0 + 240.0 / p, p, p)
+            })
+            .collect();
+        let f = r(&rows);
+        assert_eq!(f.n_distinct_c, 3, "post-filter distinct c, NOT 8");
+        assert!(
+            f.n_eff > 2.5 && f.n_eff < 3.5,
+            "post-filter n_eff≈3 NOT 8; got {}",
+            f.n_eff
+        );
+        assert!(
+            f.sum_w > 2.0 && f.sum_w < 3.0,
+            "post-filter Σw over 3 rows NOT 8; got {}",
+            f.sum_w
+        );
     }
 }
