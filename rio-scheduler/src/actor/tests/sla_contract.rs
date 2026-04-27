@@ -1018,3 +1018,90 @@ async fn contract_pinned_explore_routes_around_ice() {
         "routed-around cells ⊆ unrestricted A; got {emitted:?}, A={in_a:?}"
     );
 }
+
+/// **R6B6 / bug 021** — `InterruptRunaway` is reachable from
+/// `solve_full` at the actor boundary. Pre-fix: `classify_best_effort`
+/// reads ONE mixed-cap `rejects` vec; `cap_c.max(1.0)` (R5B6) means OD
+/// can NEVER produce `LambdaGate | CLoExceedsCap`, so `all(λ-adjacent)`
+/// over the mixed vec is structurally always-false → falls through to
+/// `classify_ceiling` → emits `core_ceiling` instead.
+///
+/// This test sets λ runaway (every spot cell `LambdaGate`) + OD
+/// `MenuNoFit` (the unrelated config-drift reason OD failed) → the
+/// semantic case observability.md:156 documents. Red on 6eab30da:
+/// `infeasible_counts["interrupt_runaway"] == 0`, `core_ceiling == 1`.
+#[tokio::test]
+async fn contract_interrupt_runaway_reachable() {
+    use crate::sla::config::CapacityType;
+    use crate::sla::cost::{InstanceType, RatioEma};
+    use crate::sla::metrics::infeasible_counts;
+    use crate::sla::solve::InfeasibleReason;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    actor.sla_config.hw_explore_epsilon = 0.0;
+
+    // λ_hat ≈ (1e6 + 86400·seed)/(1 + 86400) ≈ 11.6/s. make_fit's S=30
+    // → T(cap_c) ≥ 30 → p(cap_c) = 1-e^{-11.6·30} ≈ 1.0 > 0.5 →
+    // every (h, Spot) cell LambdaGate.
+    // OD: λ=0, c_lo=1, envelope feasible (S=30 vs p90=1200), mem 6GiB
+    // < ceil 256GiB, but menu's only type has mem_bytes=1 < 6GiB →
+    // smallest_fitting → None → every (h, Od) cell MenuNoFit.
+    {
+        let mut ct = actor.cost_table.write();
+        *ct = crate::sla::cost::CostTable::from_parts(
+            std::collections::HashMap::new(),
+            ["intel-6", "intel-7", "intel-8"]
+                .into_iter()
+                .map(|h| {
+                    (
+                        h.into(),
+                        RatioEma {
+                            numerator: 1e6,
+                            denominator: 1.0,
+                            updated_at: 0.0,
+                        },
+                    )
+                })
+                .collect(),
+        );
+        for h in ["intel-6", "intel-7", "intel-8"] {
+            ct.set_menu(
+                (h.into(), CapacityType::Od),
+                vec![InstanceType {
+                    name: "unfit".into(),
+                    cores: 256,
+                    mem_bytes: 1,
+                    price_per_vcpu_hr: 0.05,
+                }],
+            );
+        }
+    }
+    actor.test_inject_ready("d-runaway", Some("test-pkg"), "x86_64-linux", false);
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let _g = metrics::set_default_local_recorder(&rec);
+
+    let _ = actor.compute_spawn_intents(&Default::default());
+    let m = infeasible_counts(&snap);
+    assert_eq!(
+        m.get(InfeasibleReason::InterruptRunaway.as_str())
+            .copied()
+            .unwrap_or(0),
+        1,
+        "λ runaway (every spot LambdaGate) + OD MenuNoFit → \
+         `why == InterruptRunaway`. Pre-R6B6: classify_best_effort's \
+         `all(λ-adjacent)` reads mixed-cap rejects; OD's MenuNoFit \
+         poisons it → classify_ceiling → CoreCeiling. Got {m:?}"
+    );
+    assert_eq!(
+        m.get(InfeasibleReason::CoreCeiling.as_str())
+            .copied()
+            .unwrap_or(0),
+        0,
+        "OD's MenuNoFit is reported via classify_ceiling SEPARATELY (it \
+         isn't here — envelope feasible + mem under ceil → CoreCeiling \
+         is the wrong label for 'spot λ-gated'). Got {m:?}"
+    );
+}
