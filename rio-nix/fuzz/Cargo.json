@@ -571,194 +571,6 @@
         "Russell Cohen <rcoh@amazon.com>"
       ]
     },
-    "axum": {
-      "crateName": "axum",
-      "version": "0.8.9",
-      "edition": "2021",
-      "sha256": "146df5x8dhczm1sp939gr3839220wl6rxc1k65bzc450z72ridii",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "axum-core",
-          "packageId": "axum-core"
-        },
-        {
-          "name": "bytes",
-          "packageId": "bytes"
-        },
-        {
-          "name": "form_urlencoded",
-          "packageId": "form_urlencoded"
-        },
-        {
-          "name": "futures-util",
-          "packageId": "futures-util"
-        },
-        {
-          "name": "http",
-          "packageId": "http 1.4.0"
-        },
-        {
-          "name": "http-body",
-          "packageId": "http-body 1.0.1"
-        },
-        {
-          "name": "http-body-util",
-          "packageId": "http-body-util"
-        },
-        {
-          "name": "hyper",
-          "packageId": "hyper"
-        },
-        {
-          "name": "hyper-util",
-          "packageId": "hyper-util"
-        },
-        {
-          "name": "itoa",
-          "packageId": "itoa"
-        },
-        {
-          "name": "matchit",
-          "packageId": "matchit"
-        },
-        {
-          "name": "memchr",
-          "packageId": "memchr"
-        },
-        {
-          "name": "mime",
-          "packageId": "mime"
-        },
-        {
-          "name": "percent-encoding",
-          "packageId": "percent-encoding"
-        },
-        {
-          "name": "pin-project-lite",
-          "packageId": "pin-project-lite"
-        },
-        {
-          "name": "serde_core",
-          "packageId": "serde_core"
-        },
-        {
-          "name": "serde_json",
-          "packageId": "serde_json"
-        },
-        {
-          "name": "serde_path_to_error",
-          "packageId": "serde_path_to_error"
-        },
-        {
-          "name": "serde_urlencoded",
-          "packageId": "serde_urlencoded"
-        },
-        {
-          "name": "sync_wrapper",
-          "packageId": "sync_wrapper"
-        },
-        {
-          "name": "tokio",
-          "packageId": "tokio",
-          "rename": "tokio"
-        },
-        {
-          "name": "tower",
-          "packageId": "tower"
-        },
-        {
-          "name": "tower-layer",
-          "packageId": "tower-layer"
-        },
-        {
-          "name": "tower-service",
-          "packageId": "tower-service"
-        },
-        {
-          "name": "tracing",
-          "packageId": "tracing"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "default",
-        "form",
-        "http1",
-        "json",
-        "matched-path",
-        "original-uri",
-        "query",
-        "tokio",
-        "tower-log",
-        "tracing"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ]
-    },
-    "axum-core": {
-      "crateName": "axum-core",
-      "version": "0.5.6",
-      "edition": "2021",
-      "sha256": "1lcjhxysnbc64rh21ag9m9fpiryd1iwcdh9mwxz1yadiswqqziq8",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "bytes",
-          "packageId": "bytes"
-        },
-        {
-          "name": "futures-core",
-          "packageId": "futures-core"
-        },
-        {
-          "name": "http",
-          "packageId": "http 1.4.0"
-        },
-        {
-          "name": "http-body",
-          "packageId": "http-body 1.0.1"
-        },
-        {
-          "name": "http-body-util",
-          "packageId": "http-body-util"
-        },
-        {
-          "name": "mime",
-          "packageId": "mime"
-        },
-        {
-          "name": "pin-project-lite",
-          "packageId": "pin-project-lite"
-        },
-        {
-          "name": "sync_wrapper",
-          "packageId": "sync_wrapper"
-        },
-        {
-          "name": "tower-layer",
-          "packageId": "tower-layer"
-        },
-        {
-          "name": "tower-service",
-          "packageId": "tower-service"
-        },
-        {
-          "name": "tracing",
-          "packageId": "tracing"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "tracing"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ]
-    },
     "backon": {
       "crateName": "backon",
       "version": "1.6.0",
@@ -794,24 +606,6 @@
       ],
       "libCrateTypes": [
         "lib"
-      ]
-    },
-    "base16ct": {
-      "crateName": "base16ct",
-      "version": "0.2.0",
-      "edition": "2021",
-      "sha256": "1kylrjhdzk7qpknrvlphw8ywdnvvg39dizw9622w3wk5xba04zsc",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "alloc"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "RustCrypto Developers"
       ]
     },
     "base64": {
@@ -5767,24 +5561,6 @@
         "Eliza Weisman <eliza@buoyant.io>"
       ]
     },
-    "matchit": {
-      "crateName": "matchit",
-      "version": "0.8.4",
-      "edition": "2021",
-      "sha256": "1hzl48fwq1cn5dvshfly6vzkzqhfihya65zpj7nz7lfx82mgzqa7",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "default"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Ibraheem Ahmed <ibraheem@ibraheem.ca>"
-      ]
-    },
     "md-5": {
       "crateName": "md-5",
       "version": "0.10.6",
@@ -8807,58 +8583,6 @@
         "bluss"
       ]
     },
-    "sec1": {
-      "crateName": "sec1",
-      "version": "0.7.3",
-      "edition": "2021",
-      "sha256": "1p273j8c87pid6a1iyyc7vxbvifrw55wbxgr0dh3l8vnbxb7msfk",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "base16ct",
-          "packageId": "base16ct"
-        },
-        {
-          "name": "der",
-          "packageId": "der"
-        },
-        {
-          "name": "generic-array",
-          "packageId": "generic-array"
-        },
-        {
-          "name": "pkcs8",
-          "packageId": "pkcs8"
-        },
-        {
-          "name": "subtle",
-          "packageId": "subtle"
-        },
-        {
-          "name": "zeroize",
-          "packageId": "zeroize"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "alloc",
-        "default",
-        "der",
-        "pem",
-        "pkcs8",
-        "point",
-        "std",
-        "subtle",
-        "zeroize"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "RustCrypto Developers"
-      ]
-    },
     "secrecy": {
       "crateName": "secrecy",
       "version": "0.10.3",
@@ -9166,36 +8890,6 @@
       ],
       "authors": [
         "Erick Tryzelaar <erick.tryzelaar@gmail.com>",
-        "David Tolnay <dtolnay@gmail.com>"
-      ]
-    },
-    "serde_path_to_error": {
-      "crateName": "serde_path_to_error",
-      "version": "0.1.20",
-      "edition": "2021",
-      "sha256": "0mxls44p2ycmnxh03zpnlxxygq42w61ws7ir7r0ba6rp5s1gza8h",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "itoa",
-          "packageId": "itoa"
-        },
-        {
-          "name": "serde",
-          "packageId": "serde",
-          "target": "cfg(any())"
-        },
-        {
-          "name": "serde_core",
-          "packageId": "serde_core"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
         "David Tolnay <dtolnay@gmail.com>"
       ]
     },
@@ -13586,18 +13280,6 @@
           "packageId": "aws-smithy-types"
         },
         {
-          "name": "axum",
-          "packageId": "axum"
-        },
-        {
-          "name": "axum-core",
-          "packageId": "axum-core"
-        },
-        {
-          "name": "base16ct",
-          "packageId": "base16ct"
-        },
-        {
           "name": "base64",
           "packageId": "base64"
         },
@@ -13911,10 +13593,6 @@
         {
           "name": "scopeguard",
           "packageId": "scopeguard"
-        },
-        {
-          "name": "sec1",
-          "packageId": "sec1"
         },
         {
           "name": "serde",

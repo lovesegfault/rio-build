@@ -13,6 +13,9 @@ publish = false
 # override default-features.
 rio-test-support = { path = "../rio-test-support", default-features = false }
 rio-crds.workspace = true
+# `sla::FLEET_MEDIAN_MIN_TENANTS` for `k8s sla-gates` seed loop
+# (bug_016: hardcoded `0..3` left the per-dim trust gate unsatisfied).
+rio-scheduler.workspace = true
 
 # CLI + config
 clap = { workspace = true, features = ["derive", "env"] }

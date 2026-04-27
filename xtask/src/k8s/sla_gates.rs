@@ -116,16 +116,21 @@ async fn gate_a(cli: &CliCtx, pg: &PgHandle) -> Result<()> {
             .execute(&pg.pool)
             .await?;
         cli.run(&["sla", "reset", GATE_A_PNAME])?;
-        // ≥3 distinct pod_ids per h so HwTable.aggregate admits each.
+        // ≥FLEET_MEDIAN_MIN_TENANTS distinct submitting_tenant per h
+        // so cross_tenant_median admits each (per-dim trust gate pins
+        // factor=[1.0;K] otherwise — REVIEW.md §Stability-tests).
+        // bug_016: const-ref so a future gate change is a compile
+        // error here, not a silent rank-0 α-ALS false-FAIL.
         for (h, f) in &hw {
-            for i in 0..3 {
+            for i in 0..rio_scheduler::sla::FLEET_MEDIAN_MIN_TENANTS {
                 sqlx::query(
-                    "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) \
-                     VALUES ($1, $2, jsonb_build_object('alu',$3::float8,'membw',$4::float8,'ioseq',$5::float8)) \
+                    "INSERT INTO hw_perf_samples (hw_class, pod_id, factor, submitting_tenant) \
+                     VALUES ($1, $2, jsonb_build_object('alu',$3::float8,'membw',$4::float8,'ioseq',$5::float8), $6) \
                      ON CONFLICT (hw_class, pod_id) DO UPDATE SET factor = EXCLUDED.factor",
                 )
                 .bind(h).bind(format!("xtask-gate-a-{h}-{i}"))
                 .bind(f[0]).bind(f[1]).bind(f[2])
+                .bind(format!("xtask-t{i}"))
                 .execute(&pg.pool).await?;
             }
         }

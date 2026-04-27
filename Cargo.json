@@ -30725,18 +30725,6 @@
           "packageId": "aws-smithy-types"
         },
         {
-          "name": "axum",
-          "packageId": "axum"
-        },
-        {
-          "name": "axum-core",
-          "packageId": "axum-core"
-        },
-        {
-          "name": "base16ct",
-          "packageId": "base16ct 0.2.0"
-        },
-        {
           "name": "base64",
           "packageId": "base64"
         },
@@ -31050,10 +31038,6 @@
         {
           "name": "scopeguard",
           "packageId": "scopeguard"
-        },
-        {
-          "name": "sec1",
-          "packageId": "sec1 0.7.3"
         },
         {
           "name": "serde",
@@ -31700,6 +31684,10 @@
         {
           "name": "rio-crds",
           "packageId": "rio-crds"
+        },
+        {
+          "name": "rio-scheduler",
+          "packageId": "rio-scheduler"
         },
         {
           "name": "rio-test-support",
