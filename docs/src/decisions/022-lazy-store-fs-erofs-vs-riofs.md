@@ -281,7 +281,8 @@ r[store.put.chunked-wire]
 Begin{ hmac_token, deriver,
        outputs:     repeated { store_path, nar_hash, nar_size, refs, root_node, chunk_manifest },
        directories: repeated Directory,       // bodies for every dir_digest reachable from any root_node, deduped
-       novel:       repeated chunk_digest }   // exactly the digests the builder will send as Chunk frames
+       novel:         repeated chunk_digest,     // exactly the digests the builder will send as Chunk frames
+       input_closure: repeated StorePath }       // refscan candidate set; attested via claims.input_closure_digest
 … Chunk{digest, bytes}  // zero or more, each digest ∈ Begin.novel
 ```
 
@@ -289,7 +290,7 @@ Begin{ hmac_token, deriver,
 
 r[store.put.chunked-bounds]
 
-`Begin` is validated **before** any placeholder claim, S3 write, or verify-driver spawn; violations return `INVALID_ARGUMENT`. The HMAC assignment token is verified (`r[store.hmac.san-bypass]`) and `hash_part(Begin.deriver) == claims.drv_hash` is enforced. Per output: `store_path ∈ claims.expected_outputs` (non-CA), `nar_size ≤ MAX_NAR_SIZE`, `len(refs) ≤ MAX_REFERENCES`, `len(chunk_manifest) ≤ MAX_CHUNKS`, and per regular file in the output's tree the contiguous `chunk_manifest` run sums to `FileEntry.size`. `len(Begin.directories) ≤ MAX_DIR_NODES`. Every `Directory` body's digest is recomputed server-side as `blake3(canonical-encode(body))`; every `dir_digest` reachable from any `root_node` MUST be present in `Begin.directories` under the recomputed digest — `root_node` is therefore attested, not claimed. `novel ⊆ ∪ outputs[i].chunk_manifest.digest` and `Σ_outputs Σ chunk_manifest.len ≤ len(outputs) × MAX_NAR_SIZE`. The deduped-fetch byte total (`Σ len` over manifest entries with `digest ∉ novel`) is acquired against the existing `nar_bytes_budget` semaphore before the verify driver spawns.
+`Begin` is validated **before** any placeholder claim, S3 write, or verify-driver spawn; violations return `INVALID_ARGUMENT`. The HMAC assignment token is verified (`r[store.hmac.san-bypass]`); `hash_part(Begin.deriver) == claims.drv_hash` and `blake3(sorted(Begin.input_closure)) == claims.input_closure_digest` are enforced. Per output: `store_path ∈ claims.expected_outputs` (non-CA), `nar_size ≤ MAX_NAR_SIZE`, `len(refs) ≤ MAX_REFERENCES`, `len(chunk_manifest) ≤ MAX_CHUNKS`, and per regular file in the output's tree the contiguous `chunk_manifest` run sums to `FileEntry.size`. `len(Begin.directories) ≤ MAX_DIR_NODES`. Every `Directory` body's digest is recomputed server-side as `blake3(canonical-encode(body))`; every `dir_digest` reachable from any `root_node` MUST be present in `Begin.directories` under the recomputed digest — `root_node` is therefore attested, not claimed. `novel ⊆ ∪ outputs[i].chunk_manifest.digest` and `Σ_outputs Σ chunk_manifest.len ≤ len(outputs) × MAX_NAR_SIZE`. The deduped-fetch byte total (`Σ len` over manifest entries with `digest ∉ novel`) is acquired against the existing `nar_bytes_budget` semaphore before the verify driver spawns.
 
 r[store.chunk.self-verify]
 
@@ -313,12 +314,16 @@ After §6.2 validation passes, the handler spawns one verify driver per output t
 
 Upload and verify overlap: deduped-chunk fetches run while novel chunks are still streaming, so wall-clock added is approximately `max(0, deduped_fetch_time − upload_time)` rather than `Σ nar_size / sha256_throughput`.
 
-On client stream end the receive loop drops `tx_map`; any verify driver parked on an unsent novel digest observes `Canceled`. Per output, the verdict is **match** (`sha256 == outputs[i].nar_hash`), **mismatch**, **incomplete** (a `Canceled` rx — declared-novel chunk never sent), or **unavailable** (a `cas::get` error — transient S3 fault or a deduped chunk GC'd between the builder's `HasChunks` and now).
+r[store.put.refs-sync]
+
+The verify driver feeds the same chunk bodies through a `RefScanSink` alongside the SHA-256 accumulator. The candidate set is `Begin.input_closure ∪ claims.expected_outputs` — the `r[builder.upload.references-scanned]` definition, attested by the scheduler via `claims.input_closure_digest` rather than computed builder-side. Only raw file bytes are scanned (NAR framing is not fed to the scanner), matching `dump_path_streaming`'s behavior. At verdict time, per output, `sorted(scanned_refs) == outputs[i].refs` is part of the match condition. The scanner is the existing `rio_nix::refscan` Boyer-Moore implementation; on bytes already in hand for SHA-256 it adds approximately memcpy-rate CPU.
+
+On client stream end the receive loop drops `tx_map`; any verify driver parked on an unsent novel digest observes `Canceled`. Per output, the verdict is **match** (`sha256 == outputs[i].nar_hash` AND `sorted(scanned_refs) == outputs[i].refs`), **mismatch** (either condition fails), **incomplete** (a `Canceled` rx — declared-novel chunk never sent), or **unavailable** (a `cas::get` error — transient S3 fault or a deduped chunk GC'd between the builder's `HasChunks` and now).
 
 | Outcome (any output) | Status | Side effects |
 |---|---|---|
 | all match | commit | §6.2 single-transaction commit |
-| any mismatch | `FAILED_PRECONDITION` | `rio_store_narhash_mismatch_total++`; structured-log `{store_path, drv_path, builder_pod, claimed, computed}`; placeholders deleted via `PlaceholderGuard` reap |
+| any mismatch | `FAILED_PRECONDITION` | `rio_store_narhash_mismatch_total++` or `rio_store_refs_mismatch_total++`; structured-log `{store_path, drv_path, builder_pod, claimed, computed}`; placeholders deleted via `PlaceholderGuard` reap |
 | any incomplete | `FAILED_PRECONDITION` | `rio_store_putpath_incomplete_total++`; placeholders reaped |
 | any unavailable, no mismatch | `UNAVAILABLE` | `rio_store_putpath_verify_unavailable_total++`; placeholders reaped; builder retries per `r[builder.upload.retry]` |
 
@@ -328,7 +333,7 @@ r[store.put.chunked-ca]
 
 **CA outputs** (`claims.is_ca = true`): the §6.2 placeholder is **not** claimed at `Begin` — this is how `PutPathChunked` honors `r[sec.authz.ca-path-derived+2]` ("CA-path recompute MUST run BEFORE the `'uploading'` placeholder is claimed") without buffering. Receive and verify proceed identically; on all-match, the store recomputes each output's CA path from the **server-computed** `nar_hash` via `make_fixed_output(name, computed_nar_hash, recursive=true, refs)`, asserts it equals `outputs[i].store_path` (else `PERMISSION_DENIED` — the builder lied about either `nar_hash` or `store_path`), and then performs the §6.2 single-transaction commit, claiming and completing each manifest row in the same transaction. Idempotent if a row is already `'complete'`. Chunk protection during the upload window is `r[store.chunk.grace-ttl]` alone, identical to the non-CA mismatch path; CA uploads are not long enough for that to matter.
 
-`'complete'` therefore uniformly implies `nar_hash` is store-verified, across both `PutPath` and `PutPathChunked`. There is no `'quarantined'` state, no `nar_hash_verified` column, no verify-worker queue, no narinfo serving gate.
+`'complete'` therefore uniformly implies both `nar_hash` and `references` are store-verified, across both `PutPath` and `PutPathChunked` — the entire ed25519 narinfo fingerprint (`r[store.sig.fingerprint]`) is independently attested by rio-store. There is no `'quarantined'` state, no `nar_hash_verified` column, no verify-worker queue, no narinfo serving gate.
 
 **Considered and rejected:** async verify with a `'complete' && !verified` window (same total S3 reads and SHA-256 CPU, just time-shifted; the only beneficiary of early commit is scheduler dispatch a few seconds sooner, while every consumer of manifest status would have to know which RPC produced the row — complexity not paid for); trusting builder `nar_hash` outright, with or without an ephemeral per-pod signature (rio-store's narinfo signature would attest a value computed by a process whose address space an adversary-controlled build could plausibly influence); local-disk spool before S3 write (preserves the incidental "S3 write ⟹ nar_hash verified" ordering of buffered `PutPath`, but adds a per-replica capacity limit and a disk round-trip per novel chunk for hygiene that orphan-GC already provides); routing `is_ca` uploads to legacy `PutPath` (re-admits the whole-NAR buffer for exactly the floating-CA case, and requires a hole in `r[store.put.builder-chunked-only]`); dropping `nar_hash` from the manifest entirely (breaks substitution by stock Nix clients — a non-goal to break).
 
