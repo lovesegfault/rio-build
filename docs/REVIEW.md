@@ -34,12 +34,30 @@ in too many heads.
   `resolve_h_explore` → `HExploreOutcome`): a state-machine open-coded
   across N locations with implicit ordering dependencies → one
   function whose return enum names every outcome. Unit tests pin each
-  transition; the caller is a `match` with no `_` arm.
+  transition; the caller is a `match` with no `_` arm. The sum-type
+  pins ONE transition. If the invariant is over a **trajectory**
+  (rotation covers a set, retry-ladder terminates, backoff is
+  monotone), the unit test MUST drive ≥N transitions and assert the
+  trajectory property directly — `seen == pool`,
+  `attempts.is_sorted()`, `Σ ≤ budget`. A single-transition test
+  (`next ≠ prev`) at the degenerate domain size (`|pool|=2`,
+  `retries=1`) is the §Stability-tests vacuity shape: it passes
+  against every non-identity function. r7 mb_001:
+  `resolve_besteffort_rotates` asserted `next ≠ h_tried` at
+  `|pool|=2`; the 2-cycle bug satisfies it.
 - **Partition at type level** (r6 bug_021 → `spot_rejects` /
   `od_rejects`): a predicate semantically defined over a subset reads
   a mixed collection → partition the collection at the source so the
   predicate's input IS the subset. A future change to the other
   partition's reachable variants cannot break it.
+- **Canonicalize** (r7 bugs 032+034): ≥2 open-coded copies of one
+  transform (fold, model curve, hash, rotation) → callers get a
+  `pub fn`, not a recipe. Reviewer asks: does an existing fn do this?
+  r7 bug_034: `counter_map` existed; fresh `.collect()` written
+  anyway. r7 bug_032: `DurationFit::t_at` existed; gate_b open-coded
+  `s+p/c+q·c`. Directive becomes "call X", not "implement X-shaped
+  thing" — deletes the degree of freedom (seed-consumption,
+  fold-vs-collect, clamp-or-not) the recipe could get wrong.
 
 A new review rule MAY accompany the type-check (so first-strike on a
 *different* invariant is caught) — but the type-check is the close,
@@ -214,3 +232,24 @@ change". Bit-identical re-insert exercises neither — it's "nothing →
 no change", which any hash satisfies. The noise half MUST use a value
 that differs in storage representation but lands in the same quantum;
 the signal half MUST cross a quantum boundary.
+
+## Model-formula reimplementation
+
+Any consumer that evaluates `T(c)`, `M(c)`, or another `sla::types`
+model curve MUST call the canonical method (`DurationFit::t_at`,
+`MemFit::at`). Open-coding `s + p/c [+ q·c]` outside `types.rs` is a
+finding. Cross-crate Rust consumers reconstruct via
+`duration_fit_from_status(&SlaStatusResponse)` and call the method.
+
+**Exception:** test/harness fixtures that SEED synthetic data with a
+known curve are stating ground truth, not measuring against the model
+— open-coding there is fine.
+
+**Non-Rust measure-sites** (Python/TS) cannot call `t_at`; the first
+such site is a finding to add a `t_ref_at` field to
+`SlaStatusResponse`, NOT to open-code.
+
+**Why:** r7 bug_032: gate_b open-coded the un-clamped Amdahl form;
+`DurationFit::t_at` clamps `c.min(p̄)` for Capped/Usl. For samples at
+`c > p̄` the open-coded formula under-predicts by `c/p̄`, projecting
+as spurious per-h spread → false-FAIL of the §13a GO gate.
