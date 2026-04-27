@@ -355,35 +355,43 @@ impl CostTable {
     /// (the derived `inputs_gen`). Includes `stale_clamp` — a clamp
     /// flip changes `price()` from EMA→seed without ANY caller action.
     ///
-    /// `price`/`node_count` hash **`.value` only** — NOT the whole
-    /// [`PriceEma`], whose `updated_at` is a timestamp, not a solve
-    /// input; hashing it would re-roll ε_h on every persist. `lambda`
-    /// hashes `(numerator, denominator)` (what [`lambda_hat`] reads).
-    /// All `f64` via `.to_bits()` since `f64: !Hash`; safe because the
-    /// EMA fold is deterministic — same inputs → bit-identical, no NaN.
+    /// **Hashes quantized accessor output, NOT raw state** (merged_bug_018).
+    /// `(num, den)` are diverging EMA sums; the quotient
+    /// [`Self::lambda_for`] returns is the converging Gamma-Poisson
+    /// estimate solve actually reads. Quanta are ≤ τ/10 of the solve
+    /// tolerance so steady-state noise (spot ±1%, exposure tick) lands
+    /// in one bucket → `inputs_gen` stable. Within a bucket `c*`/τ-
+    /// membership MAY differ by one step (`ceil`/threshold are
+    /// discontinuous) — bounded one-tick staleness, NOT a guarantee
+    /// that bucket-equal ⇒ solve-output-equal.
+    ///
+    /// - λ: `(lambda_for(k)·1e6).round()` — 1µ-interrupt/s buckets;
+    ///   λ∈\[1e-5, 1e-3\] typical → 10..1000.
+    /// - price: `(value·1e4).round()` — $1e-4/vCPU·hr buckets; spot
+    ///   ~$0.01-0.10 → 0.1-1% relative.
+    /// - `node_count` NOT hashed — enters solve only via
+    ///   [`Self::lambda_for`]'s prior weight, already captured above.
+    /// - `cells` menu kept bit-exact: instance-type set is discrete
+    ///   (catalog updates, not noise).
+    ///
     /// Sorted by key so iteration order is irrelevant.
     pub fn solve_relevant_hash(&self) -> u64 {
         use std::hash::{DefaultHasher, Hash, Hasher};
         let mut h = DefaultHasher::new();
+        // Preserved: quantized `v.value` below is raw EMA; `price()`
+        // returns the seed when clamped, so the bool stays solve-relevant.
         self.stale_clamp.hash(&mut h);
         let mut price: Vec<_> = self.price.iter().collect();
         price.sort_by_key(|(k, _)| cell_label(k));
         for (k, v) in price {
             cell_label(k).hash(&mut h);
-            v.value.to_bits().hash(&mut h);
+            ((v.value * 1e4).round() as i64).hash(&mut h);
         }
-        let mut lambda: Vec<_> = self.lambda.iter().collect();
-        lambda.sort_by_key(|(k, _)| (*k).clone());
-        for (k, v) in lambda {
+        let mut lambda: Vec<_> = self.lambda.keys().collect();
+        lambda.sort();
+        for k in lambda {
             k.hash(&mut h);
-            v.numerator.to_bits().hash(&mut h);
-            v.denominator.to_bits().hash(&mut h);
-        }
-        let mut nc: Vec<_> = self.node_count.iter().collect();
-        nc.sort_by_key(|(k, _)| (*k).clone());
-        for (k, v) in nc {
-            k.hash(&mut h);
-            v.value.to_bits().hash(&mut h);
+            ((self.lambda_for(k) * 1e6).round() as i64).hash(&mut h);
         }
         let mut cells: Vec<_> = self.cells.iter().collect();
         cells.sort_by_key(|(k, _)| cell_label(k));

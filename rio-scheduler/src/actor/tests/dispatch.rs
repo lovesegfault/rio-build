@@ -3629,7 +3629,11 @@ async fn solve_cache_evicted_with_lru() {
 /// unconditional every 60s, so ε_h re-rolled before Karpenter could
 /// provision an explore node. Third-strike redesign: `inputs_gen` is
 /// **derived** from `(HwTable, CostTable)` solve-relevant projection;
-/// nobody bumps. This asserts the projection's stability properties.
+/// nobody bumps. merged_bug_018 / fourth-strike Option 1: that
+/// projection hashed bit-exact f64 EMA *state* (diverging) instead of
+/// the converging *signal* solve reads — quantize. This asserts the
+/// projection's stability under noise-band perturbation, NOT just
+/// bit-identical re-inserts.
 // r[verify sched.sla.hw-class.epsilon-explore+2]
 #[tokio::test]
 async fn inputs_gen_stable_across_noop_refresh() -> TestResult {
@@ -3637,53 +3641,113 @@ async fn inputs_gen_stable_across_noop_refresh() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let sdb = SchedulerDb::new(db.pool.clone());
     let est = crate::sla::SlaEstimator::for_test(&test_hw_sla_config());
-    let cost = crate::sla::cost::CostTable::default();
-    let derive = |est: &crate::sla::SlaEstimator| {
+    let mut cost = crate::sla::cost::CostTable::default();
+    let derive = |est: &crate::sla::SlaEstimator, cost: &crate::sla::cost::CostTable| {
         SolveInputs {
             hw: &est.hw_table(),
-            cost: &cost,
+            cost,
         }
         .inputs_gen()
+    };
+    let seed_hw = |pod: String, tenant: String, alu: f64| {
+        sqlx::query(
+            "INSERT INTO hw_perf_samples \
+             (hw_class, pod_id, submitting_tenant, factor) \
+             VALUES ('intel-7', $1, $2, jsonb_build_object('alu', $3::float8))",
+        )
+        .bind(pod)
+        .bind(tenant)
+        .bind(alu)
+        .execute(&db.pool)
     };
 
     // 10 refreshes, no hw_perf rows → solve_relevant_hash unchanged →
     // derived inputs_gen identical.
-    let g0 = derive(&est);
+    let g0 = derive(&est, &cost);
     for _ in 0..10 {
         est.refresh(&sdb, &[], |_| {}).await?;
     }
-    assert_eq!(derive(&est), g0, "no-op refresh → inputs_gen stable");
+    assert_eq!(derive(&est, &cost), g0, "no-op refresh → inputs_gen stable");
 
-    // 3 rows for one class → pod_ids 0→3 crosses HW_MIN_PODS → trust
-    // bool flips → inputs_gen changes.
-    for p in ["a", "b", "c"] {
-        sqlx::query(
-            "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) \
-             VALUES ('intel-7', $1, '{\"alu\":1.4}')",
-        )
-        .bind(format!("pod-{p}"))
-        .execute(&db.pool)
-        .await?;
+    // PREFIX: ≥FLEET_MEDIAN_MIN_TENANTS (5) distinct submitting_tenant
+    // rows — else hw.rs cross_tenant_median pins factor=[1.0;K] and the
+    // noise-band assertions below are vacuous. pod_ids 0→5 crosses
+    // HW_MIN_PODS → trust bool flips → key enters hash → inputs_gen
+    // changes. factor[0] = median(5× 1.4) = 1.4 → bucket 140.
+    for i in 0..5 {
+        seed_hw(format!("pod-{i}"), format!("t{i}"), 1.4).await?;
     }
     est.refresh(&sdb, &[], |_| {}).await?;
-    let g1 = derive(&est);
-    assert_ne!(g1, g0, "0→3 pods crosses trust threshold → derived change");
+    let g1 = derive(&est, &cost);
+    assert_ne!(g1, g0, "0→5 pods crosses trust threshold → derived change");
 
-    // merged_bug_011 regression: pod_ids 3→4, factor unchanged → trust
-    // bool stays true, factor[K] post-clamp identical → inputs_gen
-    // UNCHANGED. The old `content_hash` hashed raw `pod_ids` and would
-    // have changed here.
-    sqlx::query(
-        "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) \
-         VALUES ('intel-7', 'pod-d', '{\"alu\":1.4}')",
-    )
-    .execute(&db.pool)
-    .await?;
+    // merged_bug_011 regression: pod_ids 5→6, factor bit-identical →
+    // inputs_gen UNCHANGED. The old `content_hash` hashed raw `pod_ids`
+    // and would have changed here.
+    seed_hw("pod-x".into(), "t0".into(), 1.4).await?;
     est.refresh(&sdb, &[], |_| {}).await?;
     assert_eq!(
-        derive(&est),
+        derive(&est, &cost),
         g1,
-        "pod_ids 3→4 within trusted, factor unchanged → inputs_gen UNCHANGED"
+        "pod_ids 5→6 within trusted, factor unchanged → inputs_gen UNCHANGED"
+    );
+
+    // (a) merged_bug_018: 5 NEW tenants at alu=1.401 (NOT bit-identical)
+    // → median of 10 tenant-medians = xs[5] = 1.401. Bit-exact hash
+    // would change; quantized (1.401·100).round()=140=(1.4·100).round()
+    // → UNCHANGED. This is the noise-band assertion the prior test
+    // (bit-identical 1.4 re-insert) missed.
+    for i in 5..10 {
+        seed_hw(format!("pod-{i}"), format!("t{i}"), 1.401).await?;
+    }
+    est.refresh(&sdb, &[], |_| {}).await?;
+    assert_eq!(
+        derive(&est, &cost),
+        g1,
+        "factor 1.4→1.401 within 1% bucket → inputs_gen UNCHANGED"
+    );
+
+    // (b) cost-side: λ hashed as the converging `lambda_for` quotient,
+    // NOT diverging (num, den) sums. Steady 600s exposure with
+    // interrupts at LAMBDA_SEED rate → λ̂ stays exactly SEED (the
+    // Gamma-Poisson `(a·s + b·s)/(a+b)=s` identity) regardless of how
+    // (num, den, node_count) grow per tick. First tick adds the λ key
+    // → new baseline g2; second tick → (num,den) bit-change, λ̂ doesn't.
+    let seed_tick = |at: f64| {
+        sqlx::query(
+            "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, at) \
+             VALUES ('', 'intel-7', 'exposure', 600, to_timestamp($1)), \
+                    ('', 'intel-7', 'interrupt', $2, to_timestamp($1))",
+        )
+        .bind(at)
+        .bind(600.0 * crate::sla::cost::LAMBDA_SEED)
+        .execute(&db.pool)
+    };
+    seed_tick(1000.0).await?;
+    cost.refresh_lambda(&sdb).await?;
+    let g2 = derive(&est, &cost);
+    assert_ne!(g2, g1, "λ key entered → cost-side hash changes");
+    seed_tick(1600.0).await?;
+    cost.refresh_lambda(&sdb).await?;
+    assert_eq!(
+        derive(&est, &cost),
+        g2,
+        "steady refresh_lambda → λ̂ converges, (num,den) diverge → UNCHANGED"
+    );
+
+    // (c) Real change: factor moves >1% (out of bucket). Clear and
+    // re-seed 5 tenants at alu=1.5 → bucket 150 ≠ 140 → CHANGED.
+    sqlx::query("DELETE FROM hw_perf_samples")
+        .execute(&db.pool)
+        .await?;
+    for i in 0..5 {
+        seed_hw(format!("pod-c{i}"), format!("t{i}"), 1.5).await?;
+    }
+    est.refresh(&sdb, &[], |_| {}).await?;
+    assert_ne!(
+        derive(&est, &cost),
+        g2,
+        "factor 1.401→1.5 crosses 1% bucket → inputs_gen CHANGED"
     );
     Ok(())
 }

@@ -182,6 +182,15 @@ impl HwTable {
     /// row), so hashing the raw count would re-roll ε_h ~every 60s in
     /// steady state — the same selector-drift reap r1/r2 each fixed.
     ///
+    /// **Hashes quantized accessor output, NOT raw state** (merged_bug_018):
+    /// `factor[d]` is a re-derived median over noisy ±20% bench rows;
+    /// hashed at 1% buckets (`(clamp(x)·100).round()`). Quantum is ≤
+    /// τ/10 of the τ=15% solve tolerance so steady-state bench noise
+    /// lands in one bucket → `inputs_gen` stable. Within a bucket
+    /// `c*`/τ-membership MAY differ by one step (`ceil`/threshold are
+    /// discontinuous) — bounded one-tick staleness, NOT a guarantee
+    /// that bucket-equal ⇒ solve-output-equal.
+    ///
     /// Feeds [`super::solve::SolveInputs::inputs_gen`] (the derived
     /// `inputs_gen`). Sorted by key so iteration order is irrelevant.
     /// Untrusted (`pod_ids < HW_MIN_PODS`) entries are filtered — they
@@ -201,8 +210,7 @@ impl HwTable {
         for k in keys {
             k.hash(&mut h);
             for d in self.factors[k].factor {
-                d.clamp(HW_FACTOR_SANITY_FLOOR, HW_FACTOR_SANITY_CEIL)
-                    .to_bits()
+                ((d.clamp(HW_FACTOR_SANITY_FLOOR, HW_FACTOR_SANITY_CEIL) * 100.0).round() as i64)
                     .hash(&mut h);
             }
         }

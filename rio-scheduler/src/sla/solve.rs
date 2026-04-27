@@ -1125,6 +1125,16 @@ pub fn fit_content_hash(fit: &FittedParams) -> u64 {
     for a in fit.alpha {
         a.to_bits().hash(&mut h);
     }
+    // bug_012: `hw_factor_for` reads `fit.hw_bias[h]`; omitting it here
+    // was correctness-by-coincidence (sum_w usually changes when hw_bias
+    // does). NOT quantized — fit_content_hash is per-key staleness, and
+    // an hw_bias-only refit is rare and a real solve-input change.
+    let mut bias: Vec<_> = fit.hw_bias.iter().collect();
+    bias.sort_unstable_by_key(|(k, _)| k.as_str());
+    for (k, v) in bias {
+        k.hash(&mut h);
+        v.to_bits().hash(&mut h);
+    }
     h.finish()
 }
 
@@ -2281,6 +2291,28 @@ mod tests {
             assert!(p.is_empty(), "BestEffort prior → prev_a = ∅");
             be(p)
         });
+    }
+
+    /// bug_012: `hw_factor_for` reads `fit.hw_bias[h]`; `fit_content_hash`
+    /// must cover it. Previously correctness-by-coincidence (sum_w usually
+    /// changes when hw_bias does).
+    #[test]
+    fn fit_content_hash_covers_hw_bias() {
+        let mut a = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        a.hw_bias.insert("B".into(), 1.33);
+        let mut b = a.clone();
+        b.hw_bias.insert("B".into(), 1.20);
+        assert_ne!(
+            fit_content_hash(&a),
+            fit_content_hash(&b),
+            "hw_bias change → fit_content_hash changes"
+        );
+        // Order-independence: HashMap iteration order doesn't churn the hash.
+        let mut c = a.clone();
+        c.hw_bias.insert("A".into(), 0.9);
+        let mut d = a.clone();
+        d.hw_bias = [("A".into(), 0.9), ("B".into(), 1.33)].into();
+        assert_eq!(fit_content_hash(&c), fit_content_hash(&d));
     }
 
     #[test]
