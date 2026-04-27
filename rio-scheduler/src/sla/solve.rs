@@ -2526,45 +2526,25 @@ mod tests {
 
     // ─── infeasible_total emission ──────────────────────────────────
 
-    fn infeasible_count(snap: &metrics_util::debugging::Snapshotter, reason: &str) -> u64 {
-        use metrics_util::debugging::DebugValue;
-        snap.snapshot()
-            .into_vec()
-            .into_iter()
-            .find_map(|(ck, _, _, v)| {
-                let k = ck.key();
-                (k.name() == "rio_scheduler_sla_infeasible_total"
-                    && k.labels()
-                        .any(|l| l.key() == "reason" && l.value() == reason))
-                .then_some(match v {
-                    DebugValue::Counter(c) => c,
-                    _ => 0,
-                })
-            })
-            .unwrap_or(0)
-    }
+    use crate::sla::metrics::infeasible_counts;
 
-    /// bug 022 falsification: `infeasible_count` calls `snap.snapshot()`
-    /// which **drains** every counter (sla_contract.rs:50-53 documents
-    /// the footgun). Reading reason A first must NOT zero reason B —
-    /// otherwise the `for r in ALL { assert_eq!(.., 0) }` loops below
-    /// are vacuous past iteration 0.
+    /// bug 022: `Snapshotter::snapshot` **drains** every counter, so a
+    /// per-reason helper that snapshots on each call makes the `for r
+    /// in ALL { assert_eq!(.., 0) }` loops below 5/6-vacuous.
+    /// [`infeasible_counts`] drains ONCE and returns all reasons —
+    /// reading A and B from the same capture sees both.
     #[test]
-    fn infeasible_count_drains_is_a_bug() {
+    fn infeasible_counts_reads_all_once() {
         let rec = metrics_util::debugging::DebuggingRecorder::new();
         let snap = rec.snapshotter();
         metrics::with_local_recorder(&rec, || {
             InfeasibleReason::CoreCeiling.emit("x");
+            InfeasibleReason::InterruptRunaway.emit("x");
         });
-        // Read a DIFFERENT reason first.
-        let _ = infeasible_count(&snap, InfeasibleReason::InterruptRunaway.as_str());
-        // CoreCeiling was emitted; this MUST still read 1.
-        assert_eq!(
-            infeasible_count(&snap, InfeasibleReason::CoreCeiling.as_str()),
-            1,
-            "infeasible_count drained CoreCeiling as a side-effect of \
-             reading InterruptRunaway — sequential calls are vacuous"
-        );
+        let m = infeasible_counts(&snap);
+        assert_eq!(m.get("core_ceiling").copied().unwrap_or(0), 1);
+        assert_eq!(m.get("interrupt_runaway").copied().unwrap_or(0), 1);
+        assert_eq!(m.get("serial_floor").copied().unwrap_or(0), 0);
     }
 
     #[test]
@@ -2587,8 +2567,11 @@ mod tests {
                 false,
             );
         });
-        assert_eq!(infeasible_count(&snapshotter, "serial_floor"), 1);
-        assert_eq!(infeasible_count(&snapshotter, "core_ceiling"), 0);
+        let m = infeasible_counts(&snapshotter);
+        for r in InfeasibleReason::ALL {
+            let want = u64::from(r == InfeasibleReason::SerialFloor);
+            assert_eq!(m.get(r.as_str()).copied().unwrap_or(0), want, "{r:?}");
+        }
     }
 
     /// `suppress_infeasible_metric` swallows the emit when the
@@ -2609,8 +2592,9 @@ mod tests {
                 true,
             );
         });
+        let m = infeasible_counts(&snapshotter);
         for r in InfeasibleReason::ALL {
-            assert_eq!(infeasible_count(&snapshotter, r.as_str()), 0);
+            assert_eq!(m.get(r.as_str()).copied().unwrap_or(0), 0, "{r:?}");
         }
     }
 
@@ -2874,11 +2858,12 @@ mod tests {
             let r = solve_mvp(&fit, &[t("normal", 10.0)], &ceil());
             assert!(matches!(r, SolveResult::BestEffort { .. }));
         });
+        let m = infeasible_counts(&snapshotter);
         for r in InfeasibleReason::ALL {
             assert_eq!(
-                infeasible_count(&snapshotter, r.as_str()),
+                m.get(r.as_str()).copied().unwrap_or(0),
                 0,
-                "solve_mvp must not emit; callers do at the decision-point"
+                "{r:?}: solve_mvp must not emit; callers do at the decision-point"
             );
         }
     }
@@ -2918,8 +2903,9 @@ mod tests {
                 false,
             );
         });
+        let m = infeasible_counts(&snapshotter);
         for r in InfeasibleReason::ALL {
-            assert_eq!(infeasible_count(&snapshotter, r.as_str()), 0);
+            assert_eq!(m.get(r.as_str()).copied().unwrap_or(0), 0, "{r:?}");
         }
     }
 

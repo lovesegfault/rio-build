@@ -24,7 +24,8 @@
 //! fixture, but it is a contract test in the same sense.
 
 use super::*;
-use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+use crate::sla::metrics::counter_map;
+use metrics_util::debugging::DebuggingRecorder;
 use std::collections::BTreeMap;
 
 /// The three counters `solve_intent_for` may emit. After §Third-strike
@@ -46,20 +47,6 @@ const ONCE_PER_MISS: &[&str] = &[
     "rio_scheduler_sla_hw_ladder_exhausted_total",
     "rio_scheduler_sla_hw_cost_unknown_total",
 ];
-
-/// `(counter-name → Σ label-variants)` from ONE drained snapshot.
-/// `Snapshotter::snapshot` **drains** (counters swap to 0) — never call
-/// it twice expecting cumulative values; always diff against a single
-/// `counter_map` capture.
-fn counter_map(snap: &Snapshotter) -> BTreeMap<String, u64> {
-    let mut m = BTreeMap::new();
-    for (ck, _, _, v) in snap.snapshot().into_vec() {
-        if let DebugValue::Counter(c) = v {
-            *m.entry(ck.key().name().to_owned()).or_default() += c;
-        }
-    }
-    m
-}
 
 /// `(intent_id → node_affinity)` from one `compute_spawn_intents` poll.
 /// `BTreeMap` so equality is order-insensitive on intent_id.

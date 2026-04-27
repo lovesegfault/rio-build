@@ -168,6 +168,57 @@ pub fn score_completion(
     }
 }
 
+/// `(counter-name → Σ label-variants)` from ONE drained snapshot.
+///
+/// `Snapshotter::snapshot` **drains** (counters swap to 0 — the handle
+/// is an `Arc<AtomicU64>` cloned from the registry, so the swap zeros
+/// the shared atomic). Never call it twice expecting cumulative values;
+/// always capture once and assert against the capture. See
+/// [`infeasible_counts`] for the per-`reason`-label variant.
+#[cfg(test)]
+pub fn counter_map(
+    snap: &metrics_util::debugging::Snapshotter,
+) -> std::collections::BTreeMap<String, u64> {
+    use metrics_util::debugging::DebugValue;
+    let mut m = std::collections::BTreeMap::new();
+    for (ck, _, _, v) in snap.snapshot().into_vec() {
+        if let DebugValue::Counter(c) = v {
+            *m.entry(ck.key().name().to_owned()).or_default() += c;
+        }
+    }
+    m
+}
+
+/// `(reason → count)` for `rio_scheduler_sla_infeasible_total` from ONE
+/// drained snapshot. Same drain caveat as [`counter_map`] — calling
+/// this in a `for r in ALL` loop and reading one reason per call is
+/// 5/6-vacuous (iteration 0 drains; 1..N read zeros). bug 022.
+#[cfg(test)]
+pub fn infeasible_counts(
+    snap: &metrics_util::debugging::Snapshotter,
+) -> std::collections::HashMap<String, u64> {
+    use metrics_util::debugging::DebugValue;
+    snap.snapshot()
+        .into_vec()
+        .into_iter()
+        .filter_map(|(ck, _, _, v)| {
+            let k = ck.key();
+            (k.name() == "rio_scheduler_sla_infeasible_total").then(|| {
+                let reason = k
+                    .labels()
+                    .find(|l| l.key() == "reason")
+                    .map(|l| l.value().to_owned())
+                    .unwrap_or_default();
+                let c = match v {
+                    DebugValue::Counter(c) => c,
+                    _ => 0,
+                };
+                (reason, c)
+            })
+        })
+        .collect()
+}
+
 /// Every `rio_scheduler_sla_*` metric name. Single source of truth for
 /// the [`tests::registered_and_emitted_are_consistent`] guard — adding
 /// a metric means adding it here AND to [`describe_all`] AND wiring an
