@@ -69,7 +69,9 @@ Result<Ok, RejectReason>` where `RejectReason` is an exhaustive enum
 with one variant per gate. The loop becomes `match evaluate_one(...) {
 Ok(x) => oks.push(x), Err(r) => rejects.push(r) }`; the post-loop fold
 is a `fn classify(rejects: &[RejectReason]) -> Label`. A new gate = new
-variant = `classify`'s match is non-exhaustive = compile error. Pair
+variant = `classify`'s match is non-exhaustive = compile error.
+**`matches!()` is NOT compiler-checked** — it desugars to `_ => false`.
+Use an explicit `match` with no `_` arm. Pair
 with a table-driven test (`const FIXTURES: &[(&[RejectReason], Label)]`)
 that asserts each `Label` variant is reachable AND the converse (any
 `{non-target}` reject → never `{target}`). Emit-site existence tests

@@ -214,8 +214,9 @@ pub enum CellReject {
     /// Spot only: `p(cap_c) > 0.5` — the geometric retry tail blows
     /// every quantile. OD has λ=0 so cannot produce this.
     LambdaGate,
-    /// `c_λ > cap_c` — λ forces minimum cores past the cap. OD has
-    /// `c_lo = 1` so cannot produce this when `cap_c ≥ 1`.
+    /// Spot only: `c_λ > cap_c` — λ forces minimum cores past the cap.
+    /// OD has `c_lo = 1` and [`solve_full`] floors `cap_c ≥ 1`, so OD
+    /// structurally cannot produce this.
     CLoExceedsCap,
     /// `solve_envelope → None` — the SLA bound is infeasible at every
     /// `c ∈ [c_lo, cap_c]`, λ aside.
@@ -708,6 +709,10 @@ fn evaluate_cell(
     cap: CapacityType,
     cap_c: f64,
 ) -> Result<Candidate, CellReject> {
+    debug_assert!(
+        cap_c >= 1.0,
+        "cap_c floor dropped — CLoExceedsCap is no longer spot-only"
+    );
     let factor = hw_factor_for(fit, hw, h);
     let hr = headroom(fit.n_eff);
     let disk = fit.disk_p90.map(|d| d.0).unwrap_or(ceil.default_disk);
@@ -758,29 +763,28 @@ fn evaluate_cell(
 /// Fold per-cell rejections into the single [`InfeasibleReason`] label
 /// for `BestEffort.why`. `InterruptRunaway` iff **every** reject is
 /// `LambdaGate | CLoExceedsCap` — both are spot-only (OD has λ=0,
-/// `c_lo=1`), so a non-empty rejects vec containing only those means λ
-/// is the sole binding constraint. Any `Envelope | Mem | Disk | Menu`
-/// reject is a constraint that binds OD too; defer to
-/// [`classify_ceiling`] to name which static ceiling.
-///
-/// In practice [`solve_full`] always evaluates OD alongside spot, so
-/// this returns `InterruptRunaway` from `solve_full` only if every OD
-/// cell produced an `Ok` candidate at some tier (which means a tighter
-/// tier returned `Feasible` and we never reached the fallthrough) — the
-/// label is reachable from synthetic reject vecs but not from a
-/// `BestEffort` fallthrough with `CapacityType::ALL`. That is the
-/// correct semantics: λ is never the *sole* reason `BestEffort` fired
-/// when OD was also rejected.
+/// `c_lo=1`, and [`solve_full`] floors `cap_c ≥ 1`), so a non-empty
+/// rejects vec containing only those means λ is the sole binding
+/// constraint. Any `Envelope | Mem | Disk | Menu` reject is a
+/// constraint that binds OD too; defer to [`classify_ceiling`] to name
+/// which static ceiling.
 pub fn classify_best_effort(
     rejects: &[(Cell, CellReject)],
     fit: &FittedParams,
     tiers: &[Tier],
     ceil: &Ceilings,
 ) -> InfeasibleReason {
+    // Exhaustive match, NO `_` arm — a 7th `CellReject` variant is a
+    // compile error here. `matches!()` desugars to `_ => false` and is
+    // NOT compiler-checked (r5 merged_bug_014).
     if !rejects.is_empty()
-        && rejects
-            .iter()
-            .all(|(_, r)| matches!(r, CellReject::LambdaGate | CellReject::CLoExceedsCap))
+        && rejects.iter().all(|(_, r)| match r {
+            CellReject::LambdaGate | CellReject::CLoExceedsCap => true,
+            CellReject::EnvelopeInfeasible
+            | CellReject::MemCeiling
+            | CellReject::DiskCeiling
+            | CellReject::MenuNoFit => false,
+        })
     {
         InfeasibleReason::InterruptRunaway
     } else {
@@ -828,7 +832,17 @@ pub fn solve_full(
         !matches!(fit.fit, DurationFit::Probe),
         "solve_full called with DurationFit::Probe — gate must filter"
     );
-    let cap_c = fit.fit.p_bar().0.min(fit.fit.c_opt().0).min(ceil.max_cores);
+    // `.max(1.0)` floor: `c_opt = √(p/q) < 1` (negative-scaling) or
+    // `p̄ < 1` (idle-heavy) would otherwise make OD's `c_lo=1 > cap_c`
+    // → `CLoExceedsCap` → `InterruptRunaway` mislabel. With the floor,
+    // [`CellReject::CLoExceedsCap`] is structurally spot-only.
+    let cap_c = fit
+        .fit
+        .p_bar()
+        .0
+        .min(fit.fit.c_opt().0)
+        .min(ceil.max_cores)
+        .max(1.0);
     let hr = headroom(fit.n_eff);
     let disk = fit.disk_p90.map(|d| d.0).unwrap_or(ceil.default_disk);
     let tau = cfg.hw_cost_tolerance;
@@ -2617,6 +2631,33 @@ mod tests {
             classify_best_effort(&non_lambda, &fit_core, &[t("x", 1200.0)], &ceil()),
             R::CoreCeiling
         );
+        // r5 merged_bug_014: c_opt=√(p/q)=0.5 (negative-scaling). Before
+        // the `cap_c.max(1.0)` floor, cap_c=0.5 → OD's c_lo=1 > cap_c →
+        // every cell `CLoExceedsCap` → all-λ → InterruptRunaway
+        // mislabel. With the floor, cap_c=1.0 → OD falls through to
+        // `EnvelopeInfeasible` → `classify_ceiling` → CoreCeiling.
+        let fit_negscale = mk_fit(2.0, 1.0, 4.0, 64.0, 0.1);
+        assert_eq!(fit_negscale.fit.c_opt().0, 0.5);
+        let r = solve_full(
+            &fit_negscale,
+            &[t("x", 4.0)],
+            &hw_three(),
+            &CostTable::default(),
+            &ceil(),
+            &cfg_hw(),
+            &["intel-6".into()],
+            &HashSet::new(),
+            true,
+        );
+        let SolveFullResult::BestEffort { why, .. } = r else {
+            panic!("c_opt=0.5 → BestEffort, got {r:?}")
+        };
+        assert_ne!(
+            why,
+            R::InterruptRunaway,
+            "cap_c floor: OD never CLoExceedsCap"
+        );
+        assert_eq!(why, R::CoreCeiling);
     }
 
     /// `solve_mvp` is pure: emission is at the sizing decision-point
