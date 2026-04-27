@@ -2544,6 +2544,29 @@ mod tests {
             .unwrap_or(0)
     }
 
+    /// bug 022 falsification: `infeasible_count` calls `snap.snapshot()`
+    /// which **drains** every counter (sla_contract.rs:50-53 documents
+    /// the footgun). Reading reason A first must NOT zero reason B —
+    /// otherwise the `for r in ALL { assert_eq!(.., 0) }` loops below
+    /// are vacuous past iteration 0.
+    #[test]
+    fn infeasible_count_drains_is_a_bug() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        metrics::with_local_recorder(&rec, || {
+            InfeasibleReason::CoreCeiling.emit("x");
+        });
+        // Read a DIFFERENT reason first.
+        let _ = infeasible_count(&snap, InfeasibleReason::InterruptRunaway.as_str());
+        // CoreCeiling was emitted; this MUST still read 1.
+        assert_eq!(
+            infeasible_count(&snap, InfeasibleReason::CoreCeiling.as_str()),
+            1,
+            "infeasible_count drained CoreCeiling as a side-effect of \
+             reading InterruptRunaway — sequential calls are vacuous"
+        );
+    }
+
     #[test]
     fn intent_for_emits_serial_floor_on_all_bounded_infeasible() {
         let rec = metrics_util::debugging::DebuggingRecorder::new();
