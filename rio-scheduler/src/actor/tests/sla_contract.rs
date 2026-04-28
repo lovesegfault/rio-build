@@ -1065,6 +1065,242 @@ async fn contract_h_explore_schmitt_carries_prev_a() {
     );
 }
 
+/// **R17B0 / bug_001** — `Miss` reached via Feasible-all-masked at
+/// `|pool|=1` discards the fresh A'. explore.rs:153's `_ =>` arm caught
+/// BOTH `Feasible(m)`-all-masked (has `m.a.cells`) AND `BestEffort` (no
+/// A'), dropping `m`; snapshot.rs's `next==prev_pin` reconstruction
+/// committed the STALE `prev_explore_a` the solve was CALLED with.
+///
+/// 6-poll falsification (τ=0.15 → τ_enter=1.15, τ_stay=1.195;
+/// `|pool|={h_exp}`):
+/// 1. od/spot=1.14 → `Hit{spot,od}`. Stored prev_a={spot,od}.
+/// 2. ICE-mask both (h_exp,*); od/spot=1.20 > τ_stay → restricted solve
+///    `Feasible{spot}`, all-masked → `Miss`. **Fresh A'={spot}**.
+///    Intent falls through to unrestricted memo (h_main present).
+/// 3. clear ICE; od/spot=1.18 (deadband) → **1 term**. **Red @
+///    36804895**: `Miss` carried only `next`; `next==prev_pin` →
+///    committed stale `{spot,od}` from poll 1 → od τ_stay → 2 terms.
+/// 4. od/spot=1.14 → `Hit{spot,od}`. Re-seeds prev_a={spot,od}.
+/// 5. h_exp menu → no-fit (cores=0) → restricted `BestEffort` →
+///    `Miss`. Singleton → **preserve** prev_a={spot,od}.
+/// 6. restore menu; od/spot=1.16 (deadband) → **2 terms**. Regression
+///    guard for the OTHER `Miss` arm: BestEffort-at-singleton must
+///    preserve, not clear (clear → od τ_enter → 1.16>1.15 → 1 term).
+// r[verify sched.sla.hw-class.admissible-set]
+#[tokio::test]
+async fn contract_h_explore_schmitt_across_ice_mask() {
+    use crate::sla::config::CapacityType;
+    use crate::sla::cost::{CostTable, InstanceType, RatioEma};
+    use crate::sla::solve::{self, SolveFullResult};
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    let h_main: String = "intel-8".into();
+    let h_exp: String = "intel-6".into();
+    actor
+        .sla_config
+        .hw_classes
+        .retain(|k, _| *k == h_main || *k == h_exp);
+    actor.sla_config.hw_explore_epsilon = 1.0;
+    actor.sla_config.hw_cost_tolerance = 0.15;
+    let tau = actor.sla_config.hw_cost_tolerance;
+    actor.test_inject_ready("d-schmitt-ice", Some("test-pkg"), "x86_64-linux", false);
+    let fit = make_fit("test-pkg");
+
+    let it = |p: f64| InstanceType {
+        name: "t".into(),
+        cores: 256,
+        mem_bytes: 256 << 30,
+        price_per_vcpu_hr: p,
+    };
+    // `cores=0` → `smallest_fitting` returns None for any c≥1 → cell
+    // rejected on capacity → restricted `solve_full([h_exp])` BestEffort.
+    let it_nofit = || InstanceType {
+        name: "t".into(),
+        cores: 0,
+        mem_bytes: 0,
+        price_per_vcpu_hr: 1.0,
+    };
+    let set_ratio = |a: &DagActor, od_over_spot: f64, exp_feasible: bool| {
+        let mut ct = a.cost_table.write();
+        *ct = CostTable::from_parts(
+            std::collections::HashMap::new(),
+            [(
+                h_exp.clone(),
+                RatioEma {
+                    numerator: 0.0,
+                    denominator: 1e15,
+                    updated_at: 0.0,
+                },
+            )]
+            .into(),
+        );
+        ct.set_menu((h_main.clone(), CapacityType::Spot), vec![it(0.001)]);
+        ct.set_menu((h_main.clone(), CapacityType::Od), vec![it(0.001)]);
+        if exp_feasible {
+            ct.set_menu((h_exp.clone(), CapacityType::Spot), vec![it(1.0)]);
+            ct.set_menu((h_exp.clone(), CapacityType::Od), vec![it(od_over_spot)]);
+        } else {
+            ct.set_menu((h_exp.clone(), CapacityType::Spot), vec![it_nofit()]);
+            ct.set_menu((h_exp.clone(), CapacityType::Od), vec![it_nofit()]);
+        }
+    };
+    let sla_tiers = actor.sla_tiers.clone();
+    let sla_ceilings = actor.sla_ceilings.clone();
+    let sla_config = actor.sla_config.clone();
+    let e_ratio = |hw: &crate::sla::hw::HwTable, cost: &CostTable| -> f64 {
+        let SolveFullResult::Feasible(m) = solve::solve_full(
+            &fit,
+            &sla_tiers,
+            hw,
+            cost,
+            &sla_ceilings,
+            &sla_config,
+            std::slice::from_ref(&h_exp),
+            &std::collections::HashSet::new(),
+            true,
+        ) else {
+            panic!("h_exp restricted solve must be feasible")
+        };
+        let e = |cap| {
+            m.all_candidates
+                .iter()
+                .find(|c| c.cell.1 == cap)
+                .unwrap_or_else(|| panic!("({h_exp},{cap:?}) candidate present"))
+                .e_cost_upper
+        };
+        e(CapacityType::Od) / e(CapacityType::Spot)
+    };
+
+    let state = actor.dag.node("d-schmitt-ice").unwrap();
+    let cell_spot: crate::sla::config::Cell = (h_exp.clone(), CapacityType::Spot);
+    let cell_od: crate::sla::config::Cell = (h_exp.clone(), CapacityType::Od);
+
+    // ── poll 1: od/spot=1.14 ≤ τ_enter → Hit, 2 terms ────────────────
+    set_ratio(&actor, 1.14, true);
+    let (hw, cost, g0) = actor.solve_inputs();
+    let r = e_ratio(&hw, &cost);
+    assert!(r <= 1.0 + tau, "fixture: e_od/e_spot={r:.4} ≤ τ_enter");
+    assert_eq!(
+        actor
+            .solve_intent_for(state, &hw, &cost, g0)
+            .node_affinity
+            .len(),
+        2,
+        "poll 1: od/spot=1.14 → Hit{{spot,od}} (h_exp pinned); prev_a={{spot,od}}"
+    );
+
+    // ── poll 2: ICE-mask (h_exp,*); od/spot=1.20 → Miss-Feasible ─────
+    actor.ice.mark(&cell_spot);
+    actor.ice.mark(&cell_od);
+    assert!(
+        actor.ice.masked_cells().contains(&cell_spot)
+            && actor.ice.masked_cells().contains(&cell_od),
+        "precondition: both (h_exp,*) ICE-masked"
+    );
+    set_ratio(&actor, 1.20, true);
+    let (hw, cost, g1) = actor.solve_inputs();
+    assert_ne!(g1, g0, "menu change → inputs_gen bump");
+    let r = e_ratio(&hw, &cost);
+    assert!(r > 1.0 + 1.3 * tau, "fixture: e_od/e_spot={r:.4} > τ_stay");
+    let intent = actor.solve_intent_for(state, &hw, &cost, g1);
+    assert!(
+        intent.hw_class_names.contains(&h_main),
+        "poll 2: Feasible{{spot}} all-masked → Miss → fall through to \
+         unrestricted memo; h_main present. Got hw={:?}",
+        intent.hw_class_names
+    );
+
+    // ── poll 3: clear ICE; od/spot=1.18 (deadband) → 1 term ──────────
+    // **bug_001 falsification.**
+    actor.ice.clear(&cell_spot);
+    actor.ice.clear(&cell_od);
+    assert!(actor.ice.masked_cells().is_empty(), "ICE cleared");
+    set_ratio(&actor, 1.18, true);
+    let (hw, cost, g2) = actor.solve_inputs();
+    assert_ne!(g2, g1);
+    let r = e_ratio(&hw, &cost);
+    assert!(
+        r > 1.0 + tau && r <= 1.0 + 1.3 * tau,
+        "fixture: e_od/e_spot={r:.4} ∈ deadband"
+    );
+    assert_eq!(
+        actor
+            .solve_intent_for(state, &hw, &cost, g2)
+            .node_affinity
+            .len(),
+        1,
+        "poll 3: od/spot=1.18 in deadband; prev_a={{spot}} from poll 2's \
+         Feasible-all-masked Miss → od τ_enter=1.15 → 1.18>1.15 → 1 term. \
+         bug_001 @ 36804895: `_ =>` arm dropped `m.a.cells`; \
+         `next==prev_pin` committed STALE {{spot,od}} from poll 1 → od \
+         τ_stay=1.195 → 2 terms."
+    );
+
+    // ── poll 4: od/spot=1.14 → Hit, 2 terms; re-seed prev_a ──────────
+    set_ratio(&actor, 1.14, true);
+    let (hw, cost, g3) = actor.solve_inputs();
+    assert_ne!(g3, g2);
+    assert_eq!(
+        actor
+            .solve_intent_for(state, &hw, &cost, g3)
+            .node_affinity
+            .len(),
+        2,
+        "poll 4: od/spot=1.14 → Hit{{spot,od}}; prev_a={{spot,od}}"
+    );
+
+    // ── poll 5: h_exp menu no-fit → BestEffort → Miss-preserve ───────
+    set_ratio(&actor, 1.14, false);
+    let (hw, cost, g4) = actor.solve_inputs();
+    assert_ne!(g4, g3);
+    assert!(
+        matches!(
+            solve::solve_full(
+                &fit,
+                &sla_tiers,
+                &hw,
+                &cost,
+                &sla_ceilings,
+                &sla_config,
+                std::slice::from_ref(&h_exp),
+                &std::collections::HashSet::new(),
+                true,
+            ),
+            SolveFullResult::BestEffort { .. }
+        ),
+        "fixture: cores=0 menu → restricted solve_full([h_exp]) BestEffort"
+    );
+    let intent = actor.solve_intent_for(state, &hw, &cost, g4);
+    assert!(
+        intent.hw_class_names.contains(&h_main),
+        "poll 5: BestEffort → Miss → fall through; h_main present"
+    );
+
+    // ── poll 6: restore; od/spot=1.16 (deadband) → 2 terms ───────────
+    // Regression guard for the BestEffort `Miss` arm: singleton →
+    // preserve prev_a={spot,od} from poll 4; clear → od τ_enter → 1.
+    set_ratio(&actor, 1.16, true);
+    let (hw, cost, g5) = actor.solve_inputs();
+    assert_ne!(g5, g4);
+    let r = e_ratio(&hw, &cost);
+    assert!(
+        r > 1.0 + tau && r <= 1.0 + 1.3 * tau,
+        "fixture: e_od/e_spot={r:.4} ∈ deadband"
+    );
+    assert_eq!(
+        actor
+            .solve_intent_for(state, &hw, &cost, g5)
+            .node_affinity
+            .len(),
+        2,
+        "poll 6: od/spot=1.16 in deadband; prev_a={{spot,od}} preserved \
+         across poll 5's BestEffort-Miss (singleton) → od τ_stay → 2 terms. \
+         Regression guard: a `Miss`-BestEffort arm that CLEARS prev_a → od \
+         τ_enter → 1.16>1.15 → 1 term."
+    );
+}
+
 /// **R6B4 / bug_012** — `FittedParams.n_eff` was changed to the
 /// post-p̄-filter value (correct for `z_q`), but the dispatch gates at
 /// `snapshot.rs:778` + `solve.rs:413` still test `< 3.0` with
