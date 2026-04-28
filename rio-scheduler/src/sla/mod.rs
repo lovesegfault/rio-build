@@ -382,12 +382,10 @@ impl SlaEstimator {
                     b,
                     n: f.n_eff_ring.0 as u32,
                     // v2: f64 n_eff (RingNEff — the partial-pool
-                    // weight). `version`/`alpha` are §13a fields
-                    // populated by A13's per-hw_class residual
-                    // computation.
+                    // weight) + the K=3 α simplex from als_fit.
                     n_eff: f.n_eff_ring.0,
                     version: String::new(),
-                    alpha: vec![],
+                    alpha: f.alpha.to_vec(),
                 })
             })
             .collect();
@@ -1043,7 +1041,7 @@ mod tests {
         }
     }
 
-    /// bug_013: `export_corpus` hardcoded `alpha: vec![]` though
+    /// bug_013: `export_corpus` hardcoded an empty `alpha` though
     /// `f.alpha` is in scope; gate_a's `ensure!(alpha.len() == 3)`
     /// against this output structurally cannot PASS. Producer↔consumer
     /// round-trip: a cached fit at a known α exports that α verbatim.

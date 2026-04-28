@@ -658,9 +658,9 @@ message SeedEntry {
   double p_bar = 7;
   double a = 8;
   double b = 9;
-  // §13a: per-hw_class residual-bias vector (same index order as
-  // `ref_factor_vec`). #[serde(default)] on the Rust side so v1 JSON
-  // (no alpha) imports as empty.
+  // §13a: K=3 hardware mixture α ∈ Δ² (alu, membw, ioseq) from
+  // als_fit. #[serde(default)] on the Rust side so v1 JSON (no alpha)
+  // imports as empty.
   repeated double alpha = 10;
   // Effective sample count behind this fit. v1 carried `n: u32`
   // (truncated); v2 carries the f64 the partial-pool weighting

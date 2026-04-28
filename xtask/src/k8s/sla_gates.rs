@@ -28,6 +28,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::ValueEnum;
+use rio_proto::types::SlaStatusResponse;
+use rio_scheduler::sla::types::ModelKey;
 use serde_json::Value;
 use sqlx::Row;
 
@@ -161,10 +163,13 @@ async fn gate_a(cli: &CliCtx, pg: &PgHandle) -> Result<()> {
     // One estimator refresh: SlaStatus.hasFit flips true once the
     // refit picked up the rows. ESTIMATOR_REFRESH_EVERY × tickInterval
     // is ≤60s on every deploy profile.
+    let key = ModelKey {
+        pname: GATE_A_PNAME.into(),
+        system: "x86_64-linux".into(),
+        tenant: String::new(),
+    };
     ui::poll("estimator refit", Duration::from_secs(5), 24, || async {
-        let out = cli.run(&["--json", "sla", "status", GATE_A_PNAME])?;
-        let v: Value = serde_json::from_str(&out)?;
-        Ok(gate_a_has_fit(&v).then_some(()))
+        Ok(sla_status_typed(cli, &key)?.has_fit.then_some(()))
     })
     .await?;
 
@@ -232,16 +237,19 @@ async fn gate_a(cli: &CliCtx, pg: &PgHandle) -> Result<()> {
 async fn gate_b(cli: &CliCtx, pg: &PgHandle) -> Result<()> {
     // Candidate pnames: ≥5 samples over ≥3 distinct hw_classes in the
     // last 7d (same window HwTable reads). Exclude gate-a's synthetic.
-    let pnames: Vec<(String, String)> = sqlx::query(
-        "SELECT pname, system FROM build_samples \
+    // mb_001: per-tenant — `SlaEstimator::cached` is exact-match on the
+    // full ModelKey (r[sched.sla.model-key-tenant-scoped]); a (pname,
+    // system) GROUP BY against a per-tenant fit cache vacuously misses.
+    let pnames: Vec<(String, String, String)> = sqlx::query(
+        "SELECT pname, system, tenant FROM build_samples \
            WHERE completed_at > now() - interval '7 days' \
              AND hw_class IS NOT NULL AND NOT outlier_excluded \
              AND pname NOT LIKE 'xtask-%' \
-         GROUP BY pname, system \
+         GROUP BY pname, system, tenant \
            HAVING count(*) >= 5 AND count(DISTINCT hw_class) >= 3 \
          ORDER BY count(*) DESC LIMIT 50",
     )
-    .map(|r: sqlx::postgres::PgRow| (r.get("pname"), r.get("system")))
+    .map(|r: sqlx::postgres::PgRow| (r.get("pname"), r.get("system"), r.get("tenant")))
     .fetch_all(&pg.pool)
     .await?;
 
@@ -259,22 +267,28 @@ async fn gate_b(cli: &CliCtx, pg: &PgHandle) -> Result<()> {
     );
     let mut worst = 0.0f64;
     let mut over = 0usize;
-    for (pname, system) in &pnames {
+    let mut n_evaluated = 0usize;
+    for (pname, system, tenant) in &pnames {
+        let key = ModelKey {
+            pname: pname.clone(),
+            system: system.clone(),
+            tenant: tenant.clone(),
+        };
         // T_ref(c) via `DurationFit::t_at` — do NOT re-derive the curve
         // here (bug_032: open-coded `s+p/c+q·c` missed the p̄ clamp on
         // Capped/Usl fits → spurious per-h spread → false-FAIL).
         // `gate_b_t_ref` returns `None` for has_fit=false / Probe.
-        let out = cli.run(&["--json", "sla", "status", pname, "--system", system])?;
-        let st: Value = serde_json::from_str(&out)?;
+        let st = sla_status_typed(cli, &key)?;
 
         let rows: Vec<(String, f64, f64)> = sqlx::query(
             "SELECT hw_class, duration_secs, cpu_limit_cores FROM build_samples \
-               WHERE pname=$1 AND system=$2 AND hw_class IS NOT NULL \
+               WHERE pname=$1 AND system=$2 AND tenant=$3 AND hw_class IS NOT NULL \
                  AND cpu_limit_cores IS NOT NULL AND NOT outlier_excluded \
                  AND completed_at > now() - interval '7 days'",
         )
         .bind(pname)
         .bind(system)
+        .bind(tenant)
         .map(|r: sqlx::postgres::PgRow| {
             (
                 r.get("hw_class"),
@@ -308,6 +322,7 @@ async fn gate_b(cli: &CliCtx, pg: &PgHandle) -> Result<()> {
         if medians.len() < 3 {
             continue;
         }
+        n_evaluated += 1;
         let lo = medians
             .iter()
             .map(|(_, m)| *m)
@@ -335,7 +350,7 @@ async fn gate_b(cli: &CliCtx, pg: &PgHandle) -> Result<()> {
             if spread > GATE_B_TAU { "*" } else { " " }
         );
     }
-    gate_b_verdict(worst, pnames.len())?;
+    gate_b_verdict(worst, pnames.len(), n_evaluated)?;
     println!(
         "\n  worst spread = {worst:.4}  (τ={GATE_B_TAU}, {over}/{} over)",
         pnames.len()
@@ -344,20 +359,46 @@ async fn gate_b(cli: &CliCtx, pg: &PgHandle) -> Result<()> {
     Ok(())
 }
 
+/// `rio-cli --json sla status <pname> --system <s> --tenant <t>` →
+/// typed `SlaStatusResponse`. Taking the full [`ModelKey`] forces every
+/// caller to bind the `tenant` axis (mb_001: gate_b queried `(pname,
+/// system)` cross-tenant but `cached()` is per-tenant exact-match →
+/// vacuous miss on multi-tenant prod). Typed return makes field access
+/// a compile error on rename (bug_011: untyped camelCase `.get(...)`).
+fn sla_status_typed(cli: &CliCtx, key: &ModelKey) -> Result<SlaStatusResponse> {
+    let out = cli.run(&[
+        "--json",
+        "sla",
+        "status",
+        &key.pname,
+        "--system",
+        &key.system,
+        "--tenant",
+        &key.tenant,
+    ])?;
+    Ok(serde_json::from_str::<SlaStatusResponse>(&out)?)
+}
+
 /// gate-a poll predicate: parse `rio-cli --json sla status` output and
 /// read `has_fit`. Extracted so the snake_case parse path is unit-
 /// testable against a `serde_json::to_value(SlaStatusResponse{..})`
-/// fixture (bug_011: was `v.get("hasFit")` — protojson camelCase, but
-/// rio-cli emits plain serde snake_case).
+/// fixture (bug_011: was an untyped camelCase key lookup — protojson
+/// shape, but rio-cli emits plain serde snake_case). Same parse path as
+/// [`sla_status_typed`]; production callers go through that.
+#[cfg(test)]
 fn gate_a_has_fit(v: &Value) -> bool {
-    v.get("hasFit").and_then(Value::as_bool).unwrap_or(false)
+    serde_json::from_value::<SlaStatusResponse>(v.clone())
+        .map(|s| s.has_fit)
+        .unwrap_or(false)
 }
 
 /// gate-b PASS/FAIL gate. Extracted so the vacuous-PASS case (mb_001:
 /// candidates exist but none evaluable → `worst` stays at its initial
 /// `0.0` → `ensure!(0.0 ≤ τ)` succeeds) is unit-testable.
-fn gate_b_verdict(worst: f64, n_candidates: usize) -> Result<()> {
-    let _ = n_candidates;
+fn gate_b_verdict(worst: f64, n_candidates: usize, n_evaluated: usize) -> Result<()> {
+    if n_evaluated == 0 {
+        bail!("gate-b: {n_candidates} candidates but none evaluable — check tenant scoping");
+    }
     ensure!(
         worst <= GATE_B_TAU,
         "gate-b FAIL: worst per-hw_class bias spread {worst:.4} > τ={GATE_B_TAU}"
@@ -368,20 +409,19 @@ fn gate_b_verdict(worst: f64, n_candidates: usize) -> Result<()> {
 /// gate-b's T_ref(c) — the cached fit's reference-second curve at `c`.
 /// `None` ⇔ no fit / Probe (no curve to compare against).
 ///
-/// Goes through the typed `SlaStatusResponse` →
-/// [`duration_fit_from_status`] → `DurationFit::t_at` so the curve has
-/// ONE source. Do NOT re-derive `s + p/c + q·c` here — bug_032: that
-/// form misses the p̄ clamp on Capped/Usl, under-predicts at `c > p̄`
-/// by `c/p̄`, and projects as spurious per-h spread → false-FAIL.
+/// Goes through [`duration_fit_from_status`] → `DurationFit::t_at` so
+/// the curve has ONE source. Do NOT re-derive `s + p/c + q·c` here —
+/// bug_032: that form misses the p̄ clamp on Capped/Usl, under-predicts
+/// at `c > p̄` by `c/p̄`, and projects as spurious per-h spread →
+/// false-FAIL.
 ///
 /// [`duration_fit_from_status`]: rio_scheduler::admin::duration_fit_from_status
-fn gate_b_t_ref(st: &serde_json::Value, c: f64) -> Option<f64> {
+fn gate_b_t_ref(st: &SlaStatusResponse, c: f64) -> Option<f64> {
     use rio_scheduler::sla::types::RawCores;
-    let st: rio_proto::types::SlaStatusResponse = serde_json::from_value(st.clone()).ok()?;
     if !st.has_fit {
         return None;
     }
-    rio_scheduler::admin::duration_fit_from_status(&st).map(|f| f.t_at(RawCores(c)).0)
+    rio_scheduler::admin::duration_fit_from_status(st).map(|f| f.t_at(RawCores(c)).0)
 }
 
 // ─── gate-c: per-dimension prediction-ratio (report only) ──────────────
@@ -509,7 +549,6 @@ fn truncate(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rio_proto::types::SlaStatusResponse;
     use rio_scheduler::sla::types::{DurationFit, RawCores, RefSeconds};
 
     #[test]
@@ -539,14 +578,13 @@ mod tests {
             p_bar: 8.0,
             ..Default::default()
         };
-        let v = serde_json::to_value(&st).unwrap();
         let fit = DurationFit::Capped {
             s: RefSeconds(30.0),
             p: RefSeconds(2000.0),
             p_bar: RawCores(8.0),
         };
         let c = 32.0;
-        let got = gate_b_t_ref(&v, c).unwrap();
+        let got = gate_b_t_ref(&st, c).unwrap();
         let want = fit.t_at(RawCores(c)).0;
         assert_eq!(
             got, want,
@@ -555,7 +593,7 @@ mod tests {
         );
     }
 
-    /// bug_011: gate_a polled `v.get("hasFit")` (camelCase / protojson),
+    /// bug_011: gate_a polled camelCase `hasFit` (protojson shape),
     /// but rio-cli serializes the prost struct via plain serde —
     /// snake_case `"has_fit"`. The lookup is always `None` → 120s
     /// timeout regardless of estimator state.
@@ -582,13 +620,13 @@ mod tests {
     #[test]
     fn gate_b_bails_on_zero_evaluated() {
         assert!(
-            gate_b_verdict(0.0, 50).is_err(),
+            gate_b_verdict(0.0, 50, 0).is_err(),
             "50 candidates, 0 evaluated, worst=0.0 must bail (vacuous PASS)"
         );
         // Real PASS unchanged.
-        assert!(gate_b_verdict(0.2, 50).is_ok());
+        assert!(gate_b_verdict(0.2, 50, 50).is_ok());
         // Real FAIL unchanged.
-        assert!(gate_b_verdict(0.5, 50).is_err());
+        assert!(gate_b_verdict(0.5, 50, 50).is_err());
     }
 
     /// bug_033: `truncate` byte-slices `&s[..n-1]`; multi-byte chars at

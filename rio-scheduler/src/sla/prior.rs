@@ -85,7 +85,8 @@ pub struct SeedEntry {
     /// v2-proto-shaped JSON (carries `n_eff` only) still parses.
     #[serde(default)]
     pub n: u32,
-    /// §13a per-hw_class residual-bias vector. v2; empty on v1 import.
+    /// §13a K=3 hardware mixture α ∈ Δ² (alu, membw, ioseq) from
+    /// als_fit. v2; empty on v1 import.
     #[serde(default)]
     pub alpha: Vec<f64>,
     /// Effective sample count (the f64 the partial-pool weighting uses).
