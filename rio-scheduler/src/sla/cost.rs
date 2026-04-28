@@ -1349,6 +1349,57 @@ mod tests {
         assert!((r.lambda_for("intel-7") - t.lambda_for("intel-7")).abs() < 1e-12);
     }
 
+    /// bug_034: under `hwCostSource: static` the documented contract is
+    /// "seeds only", but `load()` hydrated `price:*` rows from PG
+    /// unconditionally and `persist()` re-upserted them every 10min, so
+    /// a Spot→Static config switch served months-old EMA prices forever.
+    /// The contract is now enforced at the read site (`price()`) AND at
+    /// `load`/`persist` so leftover rows are inert and age out.
+    #[tokio::test]
+    async fn static_mode_ignores_pg_price_rows() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        // Leftover row from a prior Spot run.
+        sqlx::query(
+            "INSERT INTO sla_ema_state (cluster, key, value, updated_at) \
+             VALUES ('test-cluster', 'price:h0:spot', 0.041, to_timestamp(1000))",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let mut t = CostTable::load(&sdb, "test-cluster", Some(HwCostSource::Static))
+            .await
+            .unwrap();
+        let cell: Cell = ("h0".into(), CapacityType::Spot);
+        let seed = seed_price(CapacityType::Spot);
+        assert!(
+            (t.price(&cell) - seed).abs() < 1e-9,
+            "Static mode must return the seed, NOT the stale PG row 0.041; got {}",
+            t.price(&cell)
+        );
+        assert!(
+            (t.price(&cell) - 0.041).abs() > 1e-3,
+            "Static mode must NOT return the leftover PG price"
+        );
+
+        // persist() under Static must not re-upsert price rows even if
+        // something wrote to `self.price` in-mem (defense-in-depth on
+        // top of the load-skip — interrupt_housekeeping persists every
+        // 10min regardless of source).
+        t.set_price("h1", CapacityType::Spot, 0.099, 2000.0);
+        t.persist(&sdb).await.unwrap();
+        let n: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM sla_ema_state WHERE key LIKE 'price:%'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            n, 1,
+            "persist() under Static skips price rows; only the original leftover row remains"
+        );
+    }
+
     /// `> 6 × pollInterval` stale → `price()` clamps to the static seed
     /// and `_hw_cost_fallback_total{reason="stale"}` fires. Fresh →
     /// clamp clears and `price()` reads through.
