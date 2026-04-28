@@ -530,6 +530,12 @@ karpenter:
   dataVolumeIops: 16000
   dataVolumeThroughputMiBps: 1000
 
+  # AWS bare-metal instance-size suffixes, c/m/r gen6+. Single source
+  # for the metal/virtualized partition (I-205). New `metal-*` size →
+  # add HERE only; templates/karpenter.yaml injects `instance-size In`
+  # on rio-metal pools and `NotIn` on every other pool from this list.
+  metalSizes: [metal, metal-16xl, metal-24xl, metal-32xl, metal-48xl]
+
   # ADR-023 phase-13: 12 builder NodePools — `rio-builder-{hi,mid,lo}-
   # {ebs,nvme}-{x86,aarch64}` — plus metal/fetcher/general. Each carries
   # a static `rio.build/hw-band` label and an `instance-generation In
@@ -600,12 +606,8 @@ karpenter:
         - key: karpenter.k8s.aws/instance-generation
           operator: Gt
           values: ["5"]
-        # instance-size=metal* covers metal, metal-24xl, metal-48xl
-        # across c/m/r gen6+ (incl. Graviton c7g.metal). Karpenter's
-        # well-known label — no instance-type enumeration needed.
-        - key: karpenter.k8s.aws/instance-size
-          operator: In
-          values: [metal, metal-24xl, metal-48xl]
+        # instance-size partition injected template-side from
+        # `karpenter.metalSizes` (I-205) — see templates/karpenter.yaml.
         - key: karpenter.sh/capacity-type
           operator: In
           values: [on-demand]

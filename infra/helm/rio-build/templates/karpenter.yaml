@@ -151,13 +151,14 @@ spec:
         # this filter Karpenter's bin-pack can pick e.g. m6idn.metal (it
         # satisfies category+generation+local-nvme) → CreateFleet rejects
         # with UnfulfillableCapacity. Metal is served by the dedicated
-        # rio-builder-metal pool (rio-metal NodeClass, BIOS AMI). The list
-        # mirrors that pool's `instance-size In` set so the two partition
-        # the size space. arm64 .metal does boot UEFI, but metal belongs
-        # to the kvm pool regardless — keep the band pools virtualized-only.
+        # rio-builder-metal pool (rio-metal NodeClass, BIOS AMI). List is
+        # `$.Values.karpenter.metalSizes`; metal pool's In is the SAME
+        # list (template-injected below), partition structural. arm64
+        # .metal does boot UEFI, but metal belongs to the kvm pool
+        # regardless — keep the band pools virtualized-only.
         - key: karpenter.k8s.aws/instance-size
           operator: NotIn
-          values: [metal, metal-24xl, metal-48xl]
+          values: {{ toJson $k.metalSizes }}
         {{- if $stor.nvme }}
         - key: karpenter.k8s.aws/instance-local-nvme
           operator: Gt
@@ -199,6 +200,17 @@ spec:
       {{- end }}
       requirements:
         {{- toYaml .requirements | nindent 8 }}
+        # I-205 template-side guard: any pool NOT on rio-metal gets the
+        # metal exclusion; rio-metal gets the In side. Both reference
+        # `$.Values.karpenter.metalSizes` — single source, structural
+        # partition. Don't open-code instance-size in `requirements:`.
+        - key: karpenter.k8s.aws/instance-size
+        {{- if eq (.nodeClass | default "rio-default") "rio-metal" }}
+          operator: In
+        {{- else }}
+          operator: NotIn
+        {{- end }}
+          values: {{ toJson $k.metalSizes }}
   limits:
     cpu: {{ .limits.cpu }}
   disruption:
