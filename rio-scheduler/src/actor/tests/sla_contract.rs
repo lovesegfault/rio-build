@@ -2002,3 +2002,73 @@ async fn contract_forced_mem_only_override_is_hw_agnostic() {
          internally; the post-hoc overlay is deleted). max_mem={max_mem}"
     );
 }
+
+/// **bug_035** — `_hw_cost_unknown_total` fires once per `(key,
+/// inputs_gen)` epoch, NOT twice on the memo-miss tick when ε_h hits.
+/// The unrestricted `solve_full(.., &h_all, .., true)` already covers
+/// `tiers × h_all × {spot,od}`; the restricted `solve_full(.., {h}, ..)`
+/// iterates a strict subset, so its `emit_metrics` is unconditionally
+/// redundant. Pre-fix: `was_miss` (true on the miss tick) gates the
+/// restricted emit → 2× over `(h_explore, *)` MenuNoFit cells.
+///
+/// `|h_all|=3`, `|tiers|=1`, h0/h1 feasible, h2 NON-empty menu but no
+/// fitting type → in_a={h0,h1} → pool={h2} (singleton, deterministic).
+/// ε=1.0 forces the explore branch. Expect 2 (one tier × {spot,od});
+/// pre-fix: 4.
+#[tokio::test]
+async fn contract_hw_cost_unknown_once_per_epoch() {
+    use crate::sla::config::CapacityType;
+    use crate::sla::cost::InstanceType;
+    const HW_COST_UNKNOWN: &str = "rio_scheduler_sla_hw_cost_unknown_total";
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    actor.sla_config.hw_explore_epsilon = 1.0;
+    assert_eq!(actor.sla_tiers.len(), 1, "fixture: |tiers|=1");
+    assert_eq!(actor.sla_config.hw_classes.len(), 3, "fixture: |h_all|=3");
+
+    let it_fit = || InstanceType {
+        name: "fit".into(),
+        cores: 256,
+        mem_bytes: 256 << 30,
+        price_per_vcpu_hr: 0.05,
+    };
+    // Non-empty menu but no fitting type: `make_fit("test-pkg")` mem is
+    // Independent{p90: 6 GiB} → `smallest_fitting(.., c*, 6 GiB)` with
+    // `mem_bytes=1 GiB` → None → MenuNoFit (NOT empty-menu EMA fallback).
+    let it_nofit = || InstanceType {
+        name: "nofit".into(),
+        cores: 2,
+        mem_bytes: 1 << 30,
+        price_per_vcpu_hr: 0.05,
+    };
+    {
+        let mut ct = actor.cost_table.write();
+        for h in ["intel-6", "intel-7"] {
+            for cap in CapacityType::ALL {
+                ct.set_menu((h.into(), cap), vec![it_fit()]);
+            }
+        }
+        for cap in CapacityType::ALL {
+            ct.set_menu(("intel-8".into(), cap), vec![it_nofit()]);
+        }
+    }
+    actor.test_inject_ready("d-nofit", Some("test-pkg"), "x86_64-linux", false);
+    let state = actor.dag.node("d-nofit").unwrap();
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let _g = metrics::set_default_local_recorder(&rec);
+
+    let (hw, cost, ig) = actor.solve_inputs();
+    let _ = actor.solve_intent_for(state, &hw, &cost, ig);
+    let d = counter_map(&snap);
+    assert_eq!(
+        d.get(HW_COST_UNKNOWN).copied().unwrap_or(0),
+        2,
+        "`_hw_cost_unknown_total` fires once per MenuNoFit cell per \
+         (key, inputs_gen): 1 tier × {{spot,od}} on intel-8 = 2. Pre-fix \
+         the ε_h restricted solve re-emits over `{{h}} ⊆ h_all` on the \
+         miss tick → 4. Got {d:?}"
+    );
+}

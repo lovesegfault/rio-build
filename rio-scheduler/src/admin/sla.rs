@@ -327,6 +327,15 @@ mod tests {
         assert!(duration_fit_from_status(&status_from_fit(Some(&fp), None)).is_none());
     }
 
+    /// `duration_fit_from_status` is total on `status_from_fit`'s output
+    /// range — the `fit=None` arm (`has_fit=false`, `fit_kind=""`)
+    /// returns `None`, not panic. bug_008: pre-fix the `""` hits the
+    /// `other => panic!` arm.
+    #[test]
+    fn duration_fit_from_status_total_on_status_from_fit_range() {
+        assert!(duration_fit_from_status(&status_from_fit(None, None)).is_none());
+    }
+
     /// Finite p̄ (Capped) + Coupled → mem evaluated at p̄, not sentineled.
     #[test]
     fn status_from_fit_capped_coupled_evaluates_at_p_bar() {

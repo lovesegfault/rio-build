@@ -376,6 +376,89 @@ mod tests {
         }
     }
 
+    /// bug_032: `AlsRounds` disambiguates "converged on round 4" from
+    /// "cap hit" — both previously returned `5`. The
+    /// `als_recovers_true_alpha` fixture (clean Amdahl, 4 well-spread
+    /// factor vectors) is proven-converging; an alternating-vertex
+    /// fixture with ±20% wall noise drives oscillation toward the cap.
+    #[test]
+    fn als_rounds_disambiguates_converged_from_cap() {
+        // ── Converged: reuse the `als_recovers_true_alpha` fixture ────────
+        let cs: Vec<f64> = (1..=5)
+            .map(|i| f64::from(i) * 4.0)
+            .cycle()
+            .take(20)
+            .collect();
+        let factors: Vec<[f64; K]> = [
+            [1.0, 1.0, 1.0],
+            [2.0, 0.5, 1.0],
+            [0.5, 2.0, 1.0],
+            [1.0, 1.0, 2.0],
+        ]
+        .into_iter()
+        .cycle()
+        .take(20)
+        .collect();
+        let true_alpha = [0.2, 0.5, 0.3];
+        let mut walls = Vec::new();
+        let mut hf = Vec::new();
+        for (i, &c) in cs.iter().enumerate() {
+            let f = factors[i % 4];
+            let scale: f64 = true_alpha.iter().zip(f).map(|(a, x)| a * x).sum();
+            walls.push((30.0 + 2000.0 / c) / scale);
+            hf.push(Some(f));
+        }
+        let w = vec![1.0; cs.len()];
+        let gate = StageGate {
+            n_eff: 20.0,
+            span: 16.0,
+            p_bar: f64::INFINITY,
+            prev_usl: false,
+        };
+        let (_, _, _, rounds) = als_fit(&cs, &walls, &hf, &w, &gate, UNIFORM);
+        assert!(
+            matches!(rounds, AlsRounds::Converged(_)),
+            "clean-Amdahl fixture converges <{ALS_MAX_ROUNDS} rounds; got {rounds:?}"
+        );
+        // ── CapHit: alternating-vertex factors + ±20% wall noise so α
+        // oscillates between simplex vertices across rounds ─────────────────
+        let cs6: Vec<f64> = vec![4.0, 8.0, 16.0, 4.0, 8.0, 16.0];
+        let hf6: Vec<Option<[f64; K]>> = vec![
+            Some([3.0, 0.3, 0.3]),
+            Some([0.3, 3.0, 0.3]),
+            Some([3.0, 0.3, 0.3]),
+            Some([0.3, 3.0, 0.3]),
+            Some([3.0, 0.3, 0.3]),
+            Some([0.3, 3.0, 0.3]),
+        ];
+        let noise = [1.2, 0.8, 1.2, 0.8, 1.2, 0.8];
+        let walls6: Vec<f64> = cs6
+            .iter()
+            .zip(noise)
+            .map(|(c, n)| (30.0 + 2000.0 / c) * n)
+            .collect();
+        let w6 = vec![1.0; 6];
+        let gate6 = StageGate {
+            n_eff: 6.0,
+            span: 4.0,
+            p_bar: f64::INFINITY,
+            prev_usl: false,
+        };
+        let (_, _, _, rounds6) = als_fit(&cs6, &walls6, &hf6, &w6, &gate6, UNIFORM);
+        // The proptest at :433 already drives both arms across its 128
+        // cases; this fixture targets the boundary directly. If
+        // LAMBDA_RIDGE damps oscillation enough that this converges,
+        // exhaustiveness is the floor.
+        match rounds6 {
+            AlsRounds::Converged(_) | AlsRounds::CapHit => (),
+        }
+        assert!(
+            matches!(rounds6, AlsRounds::CapHit),
+            "alternating-vertex + ±20% noise hits the {ALS_MAX_ROUNDS}-round \
+             cap; got {rounds6:?}"
+        );
+    }
+
     /// All-unbench'd rows (factors=None): α stays at prior, fit equals
     /// plain `fit_duration_staged` on raw wall — the pre-ALS behaviour.
     #[test]
