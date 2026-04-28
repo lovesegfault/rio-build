@@ -22,7 +22,7 @@ use std::collections::HashSet;
 /// `try_solve` effect. Built in `solve_intent_for`'s ε_h block: `pool`
 /// per memo-key (depends on the unrestricted memo's A and `cheapest`);
 /// `masked` tick-wide. The prev-validity filter tests `∈ pool` only —
-/// `h_all`/`in_a` are subsumed (`pool ⊆ h_all\in_a\{cheapest}`).
+/// `h_all`/`in_a` are subsumed (`pool` = output of [`h_explore_pool`]).
 pub struct HExploreCtx<'a> {
     pub pool: &'a [&'a HwClassName],
     pub masked: &'a HashSet<Cell>,
@@ -68,8 +68,11 @@ pub fn h_explore_pool<'a>(
     in_a: &HashSet<HwClassName>,
     cheapest: Option<&HwClassName>,
 ) -> Vec<&'a HwClassName> {
-    let _ = (h_all, in_a, cheapest);
-    todo!("R8B0 red-first")
+    if in_a.is_empty() || in_a.len() == h_all.len() {
+        h_all.iter().filter(|h| Some(*h) != cheapest).collect()
+    } else {
+        h_all.iter().filter(|h| !in_a.contains(*h)).collect()
+    }
 }
 
 /// ε_h pin state transition (§Fifth-strike extraction). Draw seeded
@@ -90,8 +93,9 @@ pub fn h_explore_pool<'a>(
 /// Release semantics:
 /// - **Pre-solve** (`prev ∉ pool`, or `prev = None`): re-draw from
 ///   `pool` via `pin_rng`, THEN the one `try_solve` on the redrawn h.
-///   `pool ⊆ h_all\in_a\{cheapest}`, so this subsumes graduated /
-///   config-removed / became-cheapest.
+///   `pool` = output of [`h_explore_pool`], so this subsumes
+///   graduated / config-removed (always) and became-cheapest
+///   (fallback mode only).
 /// - **Post-solve** (`try_solve` infeasible, OR Feasible-but-all-
 ///   masked): NO retry this call. Round-robin over `sorted(pool)`:
 ///   `next = pool[(idx_of(h_tried)+1) % |pool|]`. Covers every pool
@@ -104,7 +108,7 @@ pub fn h_explore_pool<'a>(
 /// None` → same seed → same `h`). The first to reach `update_entry`
 /// commits the rotated `next`; subsequent same-tick drvs see `prev =
 /// next`. Bounded N× cost, deterministic, no correctness impact.
-// r[impl sched.sla.hw-class.epsilon-explore+5]
+// r[impl sched.sla.hw-class.epsilon-explore+6]
 pub fn resolve_h_explore(
     prev: Option<HwClassName>,
     mkh: u64,
@@ -122,10 +126,11 @@ pub fn resolve_h_explore(
     let mut pool: Vec<&HwClassName> = ctx.pool.to_vec();
     pool.sort_unstable();
     // Pre-solve release: prev still valid iff Some(h) ∧ h ∈ pool.
-    // `pool ⊆ h_all\in_a\{cheapest}` so this subsumes the prior
-    // `∈ h_all ∧ ∉ in_a` filter AND rejects became-cheapest. With
-    // this, `h_to_try ∈ pool` by construction (round-robin's
-    // .position() relies on it).
+    // `pool` = output of `h_explore_pool` so this subsumes the prior
+    // `∈ h_all ∧ ∉ in_a` filter AND rejects became-cheapest in
+    // fallback mode (normal mode `cheapest ∉ A` may be ∈ pool — see
+    // `h_explore_pool` doc). With this, `h_to_try ∈ pool` by
+    // construction (round-robin's .position() relies on it).
     let h_to_try = match prev.filter(|h| pool.iter().any(|p| **p == *h)) {
         Some(h) => h,
         None => match pool.choose(&mut pin_rng) {
@@ -304,7 +309,7 @@ mod tests {
     /// doc-contract. Normal mode (`0<|A|<|H|`) is `H\A` — cheapest may
     /// be ∈ pool when `cheapest ∉ A` (case 1). Fallback (`|A|∈{0,|H|}`)
     /// is `H\{cheapest}` (cases 2+3). Pre-R8B0 the doc-contract claimed
-    /// `pool ⊆ h_all\in_a\{cheapest}` unconditionally; the caller's
+    /// pool was always a subset of `h_all\in_a\{cheapest}`; the caller's
     /// else-branch built `H\A` — case 1's `{A,C,D}` ⊄ `{C,D}`.
     #[test]
     fn h_explore_pool_matches_doc() {

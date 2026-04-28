@@ -67,7 +67,7 @@ async fn refresh_cycle(actor: &mut DagActor) {
     }
 }
 
-/// **Selector stability** (`r[sched.sla.hw-class.epsilon-explore+5]`):
+/// **Selector stability** (`r[sched.sla.hw-class.epsilon-explore+6]`):
 /// `SpawnIntent.node_affinity` is a pure function of `(drv_hash,
 /// inputs_gen)` — N controller polls with no input change return
 /// identical selectors for every intent, AND a no-op
@@ -78,7 +78,7 @@ async fn refresh_cycle(actor: &mut DagActor) {
 /// Would have caught r1 bug_049 (per-call `rand::rng()` re-roll →
 /// selector-drift reap churn) AND r2 merged_bug_028 (unconditional
 /// bump every 60s → ε_h re-rolls before Karpenter provisions).
-// r[verify sched.sla.hw-class.epsilon-explore+5]
+// r[verify sched.sla.hw-class.epsilon-explore+6]
 #[tokio::test]
 async fn contract_selector_stability() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -766,7 +766,7 @@ async fn contract_infeasible_static_hints_independent() {
 /// Would have caught: r1 bug_049, r2 mb_028, r3 mb_011, r3 bug_026,
 /// r3 bug_009, r5 mb_018 (the ε_h half — Option 1 covers the
 /// memo-thrash half).
-// r[verify sched.sla.hw-class.epsilon-explore+5]
+// r[verify sched.sla.hw-class.epsilon-explore+6]
 #[tokio::test]
 async fn contract_h_explore_stable_across_inputs_gen_churn() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -958,7 +958,7 @@ async fn contract_dispatch_accepts_2row_postfilter_fit() {
 /// h_all, h0 ∉ in_a={}), uses `h0` again → stuck-same. Post-fix:
 /// `resolve_h_explore` rotates on `Miss` → poll 1 commits
 /// `next=h1≠h0`, poll 2 tries `h1`, rotates to `h0` → alternates.
-// r[verify sched.sla.hw-class.epsilon-explore+5]
+// r[verify sched.sla.hw-class.epsilon-explore+6]
 #[tokio::test]
 async fn contract_pinned_explore_releases_on_infeasible() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1017,7 +1017,7 @@ async fn contract_pinned_explore_releases_on_infeasible() {
 /// assert every pool element appears in `pinned_explore`. Pre-R7B0:
 /// rotation `.choose(&mut pin_rng)` with pin_rng fresh-seeded +
 /// unconsumed on `Some(h)=>h` → 2-cycle → one of the 3 starved.
-// r[verify sched.sla.hw-class.epsilon-explore+5]
+// r[verify sched.sla.hw-class.epsilon-explore+6]
 #[tokio::test]
 async fn contract_pinned_explore_covers_pool() {
     use crate::sla::config::{HwClassDef, NodeLabelMatch};
@@ -1091,7 +1091,7 @@ async fn contract_pinned_explore_covers_pool() {
 /// This test pins `h0`, masks both `(h0,*)` cells, then asserts the
 /// emitted `hw_class_names` are NOT exclusively `{h0}` — at least one
 /// cell from the unrestricted memo is offered.
-// r[verify sched.sla.hw-class.epsilon-explore+5]
+// r[verify sched.sla.hw-class.epsilon-explore+6]
 #[tokio::test]
 async fn contract_pinned_explore_routes_around_ice() {
     use crate::sla::config::CapacityType;
@@ -1176,7 +1176,7 @@ async fn contract_pinned_explore_routes_around_ice() {
 /// per-process RandomState, so insertion order is irrelevant and that
 /// test would be vacuous. Two actors = two RandomStates = the real
 /// nondeterminism axis.
-// r[verify sched.sla.hw-class.epsilon-explore+5]
+// r[verify sched.sla.hw-class.epsilon-explore+6]
 #[tokio::test]
 async fn contract_pinned_explore_first_writer_independent() {
     let db = TestDb::new(&MIGRATOR).await;

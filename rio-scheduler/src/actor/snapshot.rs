@@ -676,7 +676,7 @@ impl DagActor {
     /// for override/probe/explore branches — it routes through
     /// [`solve::intent_for`] (hw-agnostic `solve_mvp`) and returns an
     /// empty affinity.
-    // r[impl sched.sla.hw-class.epsilon-explore+5]
+    // r[impl sched.sla.hw-class.epsilon-explore+6]
     // r[impl sched.sla.hw-class.ice-mask]
     #[tracing::instrument(
         level = "debug",
@@ -845,24 +845,15 @@ impl DagActor {
             };
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
             if h_all.len() > 1 && rng.random::<f64>() < self.sla_config.hw_explore_epsilon {
-                use crate::sla::explore::{HExploreCtx, HExploreOutcome, resolve_h_explore};
+                use crate::sla::explore::{
+                    HExploreCtx, HExploreOutcome, h_explore_pool, resolve_h_explore,
+                };
                 let in_a: std::collections::HashSet<_> = memo
                     .as_ref()
                     .map(|m| m.a.cells.iter().map(|(h, _)| h.clone()).collect())
                     .unwrap_or_default();
-                // Cache miss (in_a=∅) or A=H: H\A would be H or ∅ —
-                // either way ε_h would re-select the price-dominant
-                // cell. Draw from H \ {argmin price} instead so the
-                // pin still explores (ADR-023 L748).
-                let pool: Vec<_> = if in_a.is_empty() || in_a.len() == h_all.len() {
-                    let cheapest = cost.cheapest_h(&h_all);
-                    h_all
-                        .iter()
-                        .filter(|h| Some(*h) != cheapest.as_ref())
-                        .collect()
-                } else {
-                    h_all.iter().filter(|h| !in_a.contains(*h)).collect()
-                };
+                let cheapest = cost.cheapest_h(&h_all);
+                let pool = h_explore_pool(&h_all, &in_a, cheapest.as_ref());
                 let masked = self.ice.masked_cells();
                 let ctx = HExploreCtx {
                     pool: &pool,

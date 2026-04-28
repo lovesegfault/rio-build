@@ -1811,7 +1811,7 @@ async fn ice_step_doubles_across_mark_without_clear() {
 /// on miss / A=H) is pinned in `MemoEntry.pinned_explore` and carried
 /// across `inputs_gen` churn. The resulting affinity is
 /// `⊆ {h_explore}×{spot,od}`. The memo is never overwritten.
-// r[verify sched.sla.hw-class.epsilon-explore+5]
+// r[verify sched.sla.hw-class.epsilon-explore+6]
 #[tokio::test]
 async fn epsilon_h_draws_outside_a() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -3690,7 +3690,7 @@ async fn solve_cache_evicted_with_lru() {
 /// the converging *signal* solve reads — quantize. This asserts the
 /// projection's stability under noise-band perturbation, NOT just
 /// bit-identical re-inserts.
-// r[verify sched.sla.hw-class.epsilon-explore+5]
+// r[verify sched.sla.hw-class.epsilon-explore+6]
 #[tokio::test]
 async fn inputs_gen_stable_across_noop_refresh() -> TestResult {
     use crate::sla::solve::SolveInputs;

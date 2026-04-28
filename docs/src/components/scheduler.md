@@ -766,7 +766,7 @@ type-fit at c*, cost-at-c* ≤ (1+τ)·𝔼^min, and capacity-ratio
 `c*_{h,cap} ≥ c*/k` (default k=2). The argmax cell survives all three
 checks so `A' ≠ ∅` provably.
 
-r[sched.sla.hw-class.epsilon-explore+5]
+r[sched.sla.hw-class.epsilon-explore+6]
 With probability `sla.hwExploreEpsilon` per intent, the scheduler
 pins `h_explore ~ Unif(H\A)` (or `H\{argmin_H price}` on cache-miss
 or A=H), restricts the solve to `(h_explore,*)`, and emits
@@ -778,7 +778,8 @@ The drawn `h_explore` is stored in the SolveCache
 `MemoEntry.pinned_explore` and **carried across memo invalidation** —
 `inputs_gen` governs memo staleness only, not selector identity. The
 pin is released when the pinned class graduates into A, is removed
-from `h_all`, becomes the cheapest, or `solve_full({h})` is
+from `h_all`, becomes the cheapest (fallback pool only — normal mode
+`H\A` may include cheapest when cheapest ∉ A), or `solve_full({h})` is
 `BestEffort` / its A' is fully ICE-masked. Release rotates round-robin
 over `sorted(pool)`: `next = pool[(idx_of(h)+1) mod |pool|]` — covers
 every pool element within `|pool|` consecutive misses; deterministic
