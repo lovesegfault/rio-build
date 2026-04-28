@@ -1043,6 +1043,25 @@ mod tests {
         }
     }
 
+    /// bug_013: `export_corpus` hardcoded `alpha: vec![]` though
+    /// `f.alpha` is in scope; gate_a's `ensure!(alpha.len() == 3)`
+    /// against this output structurally cannot PASS. Producer↔consumer
+    /// round-trip: a cached fit at a known α exports that α verbatim.
+    #[test]
+    fn export_corpus_carries_alpha() {
+        let src = SlaEstimator::for_test(&cfg());
+        let mut f = fitted("gate-a-probe", 5.0);
+        f.alpha = [0.7, 0.2, 0.1];
+        src.seed(f);
+        let entries = src.export_corpus(None, 1).entries;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].alpha,
+            vec![0.7, 0.2, 0.1],
+            "export_corpus must carry FittedParams.alpha (K=3 simplex), not vec![]"
+        );
+    }
+
     #[test]
     fn ref_estimate_probe_is_none_not_infinity() {
         let est = SlaEstimator::for_test(&cfg());

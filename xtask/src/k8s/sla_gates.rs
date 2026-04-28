@@ -164,10 +164,7 @@ async fn gate_a(cli: &CliCtx, pg: &PgHandle) -> Result<()> {
     ui::poll("estimator refit", Duration::from_secs(5), 24, || async {
         let out = cli.run(&["--json", "sla", "status", GATE_A_PNAME])?;
         let v: Value = serde_json::from_str(&out)?;
-        Ok(v.get("hasFit")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            .then_some(()))
+        Ok(gate_a_has_fit(&v).then_some(()))
     })
     .await?;
 
@@ -338,15 +335,33 @@ async fn gate_b(cli: &CliCtx, pg: &PgHandle) -> Result<()> {
             if spread > GATE_B_TAU { "*" } else { " " }
         );
     }
+    gate_b_verdict(worst, pnames.len())?;
     println!(
         "\n  worst spread = {worst:.4}  (τ={GATE_B_TAU}, {over}/{} over)",
         pnames.len()
     );
+    println!("gate-b  PASS");
+    Ok(())
+}
+
+/// gate-a poll predicate: parse `rio-cli --json sla status` output and
+/// read `has_fit`. Extracted so the snake_case parse path is unit-
+/// testable against a `serde_json::to_value(SlaStatusResponse{..})`
+/// fixture (bug_011: was `v.get("hasFit")` — protojson camelCase, but
+/// rio-cli emits plain serde snake_case).
+fn gate_a_has_fit(v: &Value) -> bool {
+    v.get("hasFit").and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// gate-b PASS/FAIL gate. Extracted so the vacuous-PASS case (mb_001:
+/// candidates exist but none evaluable → `worst` stays at its initial
+/// `0.0` → `ensure!(0.0 ≤ τ)` succeeds) is unit-testable.
+fn gate_b_verdict(worst: f64, n_candidates: usize) -> Result<()> {
+    let _ = n_candidates;
     ensure!(
         worst <= GATE_B_TAU,
         "gate-b FAIL: worst per-hw_class bias spread {worst:.4} > τ={GATE_B_TAU}"
     );
-    println!("gate-b  PASS");
     Ok(())
 }
 
@@ -538,6 +553,42 @@ mod tests {
             "gate_b T_ref({c}) = {got} but DurationFit::t_at = {want} \
              (Capped p̄=8 clamp ignored?)"
         );
+    }
+
+    /// bug_011: gate_a polled `v.get("hasFit")` (camelCase / protojson),
+    /// but rio-cli serializes the prost struct via plain serde —
+    /// snake_case `"has_fit"`. The lookup is always `None` → 120s
+    /// timeout regardless of estimator state.
+    #[test]
+    fn gate_a_poll_reads_snake_case() {
+        let st = SlaStatusResponse {
+            has_fit: true,
+            ..Default::default()
+        };
+        // Exactly what `rio-cli --json sla status` emits.
+        let v = serde_json::to_value(&st).unwrap();
+        assert!(
+            gate_a_has_fit(&v),
+            "gate_a must read snake_case `has_fit` from rio-cli output; got {v}"
+        );
+    }
+
+    /// mb_001: gate_b vacuously PASSes when every candidate falls
+    /// through (tenant mismatch → `has_fit=false` → `medians.len()<3`
+    /// → `continue` for all 50). `worst` stays at its initial `0.0`,
+    /// `ensure!(0.0 ≤ 0.35)` succeeds. "candidates but none evaluable"
+    /// is the same situation as `pnames.is_empty()` one step later and
+    /// must `bail!`, not PASS.
+    #[test]
+    fn gate_b_bails_on_zero_evaluated() {
+        assert!(
+            gate_b_verdict(0.0, 50).is_err(),
+            "50 candidates, 0 evaluated, worst=0.0 must bail (vacuous PASS)"
+        );
+        // Real PASS unchanged.
+        assert!(gate_b_verdict(0.2, 50).is_ok());
+        // Real FAIL unchanged.
+        assert!(gate_b_verdict(0.5, 50).is_err());
     }
 
     /// bug_033: `truncate` byte-slices `&s[..n-1]`; multi-byte chars at
