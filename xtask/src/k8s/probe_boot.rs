@@ -80,6 +80,14 @@ pub async fn run() -> Result<()> {
 
     ensure_shim_nodepool(&kube, node_class).await?;
 
+    // Snapshot all NodePools' template-labels + template-requirements so
+    // each hw-class can be resolved to the NodePool that would actually
+    // serve it. The hw-class's `labels` are NODE labels a NodePool STAMPS
+    // (template.metadata.labels), not instance-type selectors — putting
+    // them in `requirements` constrains nothing and Karpenter picks the
+    // cheapest instance (t3.nano) which then can't register.
+    let pool_templates = list_pool_templates(&kube).await?;
+
     let claims = nodeclaim_api(&kube);
     let nodes: Api<Node> = Api::all(kube.clone());
     let mut created: Vec<String> = Vec::new();
@@ -102,7 +110,14 @@ pub async fn run() -> Result<()> {
         let mut last_claim: Option<String> = None;
         for (i, cell) in cells.iter().enumerate() {
             let def = &sla.hw_classes[&cell.0];
-            let nc = mk_probe_nodeclaim(cell, def, node_class);
+            let pool = resolve_pool(&pool_templates, &cell.0, def)?;
+            info!(
+                "  [{}] resolved NodePool={}, requirements=[{}]",
+                cell_key(cell),
+                pool.name,
+                fmt_requirements(&pool.requirements),
+            );
+            let nc = mk_probe_nodeclaim(cell, pool, node_class);
             let start = jiff::Timestamp::now();
             let obj = claims
                 .create(&PostParams::default(), &nc)
@@ -391,33 +406,149 @@ fn cell_key((h, c): &Cell) -> String {
     format!("{h}:{cap}")
 }
 
+/// One NodePool's template surface, extracted for the hw-class →
+/// NodePool resolver.
+#[derive(Debug, Clone)]
+struct PoolTemplate {
+    name: String,
+    /// `spec.template.metadata.labels` — labels Karpenter STAMPS onto
+    /// nodes this pool launches (e.g. `rio.build/hw-band`,
+    /// `rio.build/storage`). These are what hw-class `labels` match.
+    stamps: BTreeMap<String, String>,
+    /// `spec.template.spec.requirements` — instance-type selectors
+    /// (e.g. `instance-category In [c,m,r]`). These are what a
+    /// NodeClaim needs to actually constrain the launch.
+    requirements: Vec<Value>,
+}
+
+/// List every NodePool's template-labels + template-requirements.
+/// Sorted by name so [`resolve_pool`] picks deterministically when
+/// multiple pools stamp the same labels (e.g. x86 + arm64 variants of
+/// the same band/storage).
+async fn list_pool_templates(client: &kube::Client) -> Result<Vec<PoolTemplate>> {
+    let pools = nodepool_api(client);
+    let mut out: Vec<PoolTemplate> = pools
+        .list(&ListParams::default())
+        .await
+        .context("list NodePools (Karpenter CRD installed?)")?
+        .into_iter()
+        .filter_map(|np| {
+            let name = np.metadata.name?;
+            let stamps = np
+                .data
+                .pointer("/spec/template/metadata/labels")
+                .and_then(Value::as_object)
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let requirements = np
+                .data
+                .pointer("/spec/template/spec/requirements")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            Some(PoolTemplate {
+                name,
+                stamps,
+                requirements,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// Find the NodePool whose `template.metadata.labels` ⊇ the hw-class's
+/// `labels` (every `{key,value}` in `def.labels` is stamped by the
+/// pool). The match is on STAMPED labels because that's what an
+/// hw-class is: "a node carrying these labels". The matched pool's
+/// `template.spec.requirements` are the instance-type constraints a
+/// probe NodeClaim must carry to launch that hardware.
+///
+/// First match by sorted name — when both `…-arm64` and `…-x86`
+/// variants stamp the same band/storage labels, this picks one
+/// deterministically (the pool's own `kubernetes.io/arch` requirement
+/// then constrains the launch).
+fn resolve_pool<'a>(
+    pools: &'a [PoolTemplate],
+    h: &str,
+    def: &HwClassDef,
+) -> Result<&'a PoolTemplate> {
+    pools
+        .iter()
+        .find(|p| {
+            def.labels
+                .iter()
+                .all(|m| p.stamps.get(&m.key).map(String::as_str) == Some(&m.value))
+        })
+        .with_context(|| {
+            let labels: Vec<String> = def
+                .labels
+                .iter()
+                .map(|m| format!("{}={}", m.key, m.value))
+                .collect();
+            format!(
+                "hw-class {h:?} labels {labels:?} match no NodePool's template.metadata.labels — \
+                 check that scheduler.sla.hwClasses keys on labels a builder NodePool actually \
+                 stamps (e.g. rio.build/hw-band, rio.build/storage)"
+            )
+        })
+}
+
+/// Compact one-line summary of a requirements array for the resolver
+/// log line: `instance-category In [c,m,r], instance-generation In [6], …`.
+fn fmt_requirements(reqs: &[Value]) -> String {
+    reqs.iter()
+        .filter_map(|r| {
+            let key = r.get("key")?.as_str()?;
+            let key = key.rsplit_once('/').map_or(key, |(_, k)| k);
+            let op = r.get("operator")?.as_str()?;
+            let vals: Vec<&str> = r
+                .get("values")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            Some(format!("{key} {op} [{}]", vals.join(",")))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Build a naked probe NodeClaim mirroring what the §13b controller
 /// will emit: `karpenter.sh/nodepool` shim label + `rio.build/*`
-/// labels, EC2NodeClass ref, hw-class label conjunction + capacity-type
-/// requirement, NO `ownerReferences`. `generateName` so re-runs don't
-/// conflict.
-fn mk_probe_nodeclaim(cell: &Cell, def: &HwClassDef, node_class: &str) -> DynamicObject {
+/// labels, EC2NodeClass ref, the resolved NodePool's instance-type
+/// requirements + capacity-type narrowing, NO `ownerReferences`.
+/// `generateName` so re-runs don't conflict.
+///
+/// `metadata.labels` carries the matched NodePool's template-labels
+/// (so the launched Node has `rio.build/hw-band`/`storage` and
+/// assertion 4 checks something real) plus the shim/probe/hw-class
+/// markers.
+fn mk_probe_nodeclaim(cell: &Cell, pool: &PoolTemplate, node_class: &str) -> DynamicObject {
     let (h, cap) = cell;
-    let mut reqs: Vec<Value> = def
-        .labels
-        .iter()
-        .map(|m| json!({"key": m.key, "operator": "In", "values": [m.value]}))
-        .collect();
+    let mut reqs = pool.requirements.clone();
+    // The NodePool's own capacity-type req is `In [spot, on-demand]`;
+    // requirements AND, so appending the cell's narrows correctly.
     reqs.push(json!({
         "key": "karpenter.sh/capacity-type",
         "operator": "In",
         "values": [cap.label()],
     }));
+    let mut labels = pool.stamps.clone();
+    labels.insert("karpenter.sh/nodepool".into(), SHIM_NODEPOOL.into());
+    labels.insert(PROBE_LABEL.into(), "true".into());
+    labels.insert("rio.build/hw-class".into(), h.clone());
     serde_json::from_value(json!({
         "apiVersion": "karpenter.sh/v1",
         "kind": "NodeClaim",
         "metadata": {
             "generateName": format!("rio-probe-{h}-{}-", cap.label()),
-            "labels": {
-                "karpenter.sh/nodepool": SHIM_NODEPOOL,
-                PROBE_LABEL: "true",
-                "rio.build/hw-class": h,
-            },
+            "labels": labels,
         },
         "spec": {
             "nodeClassRef": {
@@ -433,8 +564,11 @@ fn mk_probe_nodeclaim(cell: &Cell, def: &HwClassDef, node_class: &str) -> Dynami
 
 /// Poll `name` until `.status.conditions[type=cond].status == "True"`.
 /// Returns the matching condition object (so callers read
-/// `lastTransitionTime`). Surfaces the blocking condition's `reason`
-/// while waiting.
+/// `lastTransitionTime`). Surfaces the SPECIFIC waited-on condition's
+/// `reason` (falling back to `Launched`'s reason pre-launch) plus the
+/// chosen instance-type once Launched, so the operator sees e.g.
+/// `NodeNotFound` / `t3.nano` immediately instead of after a 300s
+/// timeout.
 async fn wait_condition(
     api: &Api<DynamicObject>,
     name: &str,
@@ -456,20 +590,29 @@ async fn wait_condition(
             {
                 return Ok(Some(c));
             }
-            // Surface the first non-True condition's reason so the
-            // operator sees ICE / AMINotFound / Unschedulable without
-            // a separate `kubectl describe`.
-            if let Some(reason) = nc
-                .data
-                .pointer("/status/conditions")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .find(|c| c.get("status").and_then(Value::as_str) != Some("True"))
-                .and_then(|c| c.get("reason").and_then(Value::as_str))
-            {
-                info!("  {name}: waiting ({reason})");
-            }
+            // Reason for the SPECIFIC condition we're waiting on (not
+            // "first non-True", which previously surfaced
+            // `Initialized`'s `AwaitingReconciliation` while
+            // `Registered`'s actual reason was `NodeNotFound`). If the
+            // waited-on condition isn't posted yet, fall back to
+            // `Launched` — that's where ICE / AMINotFound /
+            // UnfulfillableCapacity live pre-launch.
+            let reason = find_condition(&nc, cond)
+                .or_else(|| find_condition(&nc, "Launched"))
+                .and_then(|c| c.get("reason").and_then(Value::as_str).map(str::to_string))
+                .unwrap_or_else(|| "Pending".into());
+            // Karpenter writes the picked instance type to the
+            // NodeClaim's labels at Launched=True — surface it so a
+            // bad pick (t3.nano) is visible on the first poll, not
+            // after the 300s timeout.
+            let inst = nc
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("node.kubernetes.io/instance-type"))
+                .map(|t| format!(", instance-type={t}"))
+                .unwrap_or_default();
+            info!("  {name}: waiting ({reason}{inst})");
             Ok(None)
         },
     )
@@ -505,16 +648,116 @@ mod tests {
     use super::*;
     use rio_scheduler::sla::config::NodeLabelMatch;
 
+    fn mk_pool(name: &str, stamps: &[(&str, &str)], reqs: Value) -> PoolTemplate {
+        PoolTemplate {
+            name: name.into(),
+            stamps: stamps
+                .iter()
+                .map(|(k, v)| ((*k).into(), (*v).into()))
+                .collect(),
+            requirements: reqs.as_array().cloned().unwrap_or_default(),
+        }
+    }
+
+    fn hw_class(labels: &[(&str, &str)]) -> HwClassDef {
+        HwClassDef {
+            labels: labels
+                .iter()
+                .map(|(k, v)| NodeLabelMatch {
+                    key: (*k).into(),
+                    value: (*v).into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn resolve_pool_matches_stamped_labels() {
+        // Two pools: one stamps {hw-band:lo, storage:ebs} with real
+        // instance-type reqs; one stamps {hw-band:hi}. gen6-ebs-lo's
+        // hw-class labels must resolve to the first.
+        let pools = vec![
+            mk_pool(
+                "rio-builder-hi-nvme-x86",
+                &[("rio.build/hw-band", "hi"), ("rio.build/storage", "nvme")],
+                json!([{"key": "karpenter.k8s.aws/instance-generation",
+                        "operator": "In", "values": ["7"]}]),
+            ),
+            mk_pool(
+                "rio-builder-lo-ebs-x86",
+                &[
+                    ("rio.build/hw-band", "lo"),
+                    ("rio.build/storage", "ebs"),
+                    ("rio.build/node-role", "builder"),
+                ],
+                json!([
+                    {"key": "karpenter.k8s.aws/instance-category",
+                     "operator": "In", "values": ["c","m","r"]},
+                    {"key": "karpenter.k8s.aws/instance-generation",
+                     "operator": "In", "values": ["6"]},
+                ]),
+            ),
+        ];
+        let def = hw_class(&[("rio.build/hw-band", "lo"), ("rio.build/storage", "ebs")]);
+        let p = resolve_pool(&pools, "gen6-ebs-lo", &def).unwrap();
+        assert_eq!(p.name, "rio-builder-lo-ebs-x86");
+        assert_eq!(p.requirements.len(), 2);
+        // Superset OK: pool stamps node-role too, hw-class doesn't ask.
+        assert_eq!(p.stamps.len(), 3);
+
+        // Unmatched hw-class bails with the actionable message.
+        let bad = hw_class(&[("rio.build/hw-band", "mid")]);
+        let err = resolve_pool(&pools, "mid-ebs", &bad)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mid-ebs"), "{err}");
+        assert!(
+            err.contains("match no NodePool's template.metadata.labels"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn resolve_pool_deterministic_on_tie() {
+        // x86 and arm64 variants stamp identical band/storage labels.
+        // Input is deliberately unsorted; resolver must pick by name.
+        let mut pools = vec![
+            mk_pool(
+                "rio-builder-lo-ebs-x86",
+                &[("rio.build/hw-band", "lo"), ("rio.build/storage", "ebs")],
+                json!([{"key": "kubernetes.io/arch", "operator": "In",
+                        "values": ["amd64"]}]),
+            ),
+            mk_pool(
+                "rio-builder-lo-ebs-arm64",
+                &[("rio.build/hw-band", "lo"), ("rio.build/storage", "ebs")],
+                json!([{"key": "kubernetes.io/arch", "operator": "In",
+                        "values": ["arm64"]}]),
+            ),
+        ];
+        pools.sort_by(|a, b| a.name.cmp(&b.name));
+        let def = hw_class(&[("rio.build/hw-band", "lo"), ("rio.build/storage", "ebs")]);
+        let p = resolve_pool(&pools, "gen6-ebs-lo", &def).unwrap();
+        assert_eq!(p.name, "rio-builder-lo-ebs-arm64");
+    }
+
     #[test]
     fn probe_nodeclaim_shape() {
-        let def = HwClassDef {
-            labels: vec![NodeLabelMatch {
-                key: "rio.build/hw-band".into(),
-                value: "gen7".into(),
-            }],
-        };
-        let cell = ("gen7-nvme".into(), CapacityType::Spot);
-        let nc = mk_probe_nodeclaim(&cell, &def, "rio-nvme");
+        let pool = mk_pool(
+            "rio-builder-lo-ebs-x86",
+            &[
+                ("rio.build/hw-band", "lo"),
+                ("rio.build/storage", "ebs"),
+                ("rio.build/node-role", "builder"),
+            ],
+            json!([
+                {"key": "karpenter.k8s.aws/instance-category",
+                 "operator": "In", "values": ["c","m","r"]},
+                {"key": "kubernetes.io/arch", "operator": "In", "values": ["amd64"]},
+            ]),
+        );
+        let cell = ("gen6-ebs-lo".into(), CapacityType::Spot);
+        let nc = mk_probe_nodeclaim(&cell, &pool, "rio-nvme");
         let v = serde_json::to_value(&nc).unwrap();
 
         // Assertion 1 prerequisite: no ownerReferences emitted.
@@ -537,9 +780,30 @@ mod tests {
             .and_then(Value::as_str),
             Some("true")
         );
-        // Capacity-type requirement carries Karpenter's label value
-        // ("spot"/"on-demand"), not the serde enum variant.
+        // Matched NodePool's template-labels propagated so the Node
+        // carries rio.build/hw-band and assertion 4 checks reality.
+        assert_eq!(
+            v.pointer("/metadata/labels/rio.build~1hw-band")
+                .and_then(Value::as_str),
+            Some("lo")
+        );
+        // Requirements are the NodePool's instance-type filters, NOT
+        // rio.build/* node-label matches (the bug: those constrain
+        // nothing → t3.nano).
         let reqs = v.pointer("/spec/requirements").unwrap().as_array().unwrap();
+        assert!(
+            reqs.iter()
+                .any(|r| r["key"] == "karpenter.k8s.aws/instance-category"
+                    && r["values"].as_array().unwrap().len() == 3),
+            "{reqs:?}"
+        );
+        assert!(
+            !reqs
+                .iter()
+                .any(|r| r["key"].as_str().unwrap_or("").starts_with("rio.build/")),
+            "rio.build/* labels are stamps, not requirements: {reqs:?}"
+        );
+        // Capacity-type narrowing appended (Karpenter's label value).
         assert!(
             reqs.iter()
                 .any(|r| r["key"] == "karpenter.sh/capacity-type" && r["values"][0] == "spot")
