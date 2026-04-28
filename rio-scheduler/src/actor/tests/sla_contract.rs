@@ -410,6 +410,60 @@ async fn contract_ice_step_doubles_then_clears_on_registered() {
     );
 }
 
+/// **Ack records the FULL A'** (`r[sched.sla.hw-class.ice-mask]`): a
+/// `SpawnIntent` whose `node_affinity` is an OR over `|A'|>1` cells must
+/// arm `dispatched_cells` with the FULL parallel `(hw_class_names,
+/// node_affinity)` vec, not `cells[0]`. The pod may land on `cells[i≠0]`;
+/// the heartbeat-edge consumer needs the whole set to decide whether the
+/// signal is unambiguous (bug_030).
+// r[verify sched.sla.hw-class.ice-mask]
+#[tokio::test]
+async fn contract_ack_spawned_records_full_a_prime() {
+    use crate::sla::config::{CapacityType, Cell};
+    use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm, SpawnIntent};
+    let db = TestDb::new(&MIGRATOR).await;
+    let actor = bare_actor_hw(db.pool.clone());
+
+    let term = |h: &str, cap: &str| NodeSelectorTerm {
+        match_expressions: vec![
+            NodeSelectorRequirement {
+                key: "rio.build/hw-class".into(),
+                operator: "In".into(),
+                values: vec![h.into()],
+            },
+            NodeSelectorRequirement {
+                key: "karpenter.sh/capacity-type".into(),
+                operator: "In".into(),
+                values: vec![cap.into()],
+            },
+        ],
+    };
+    let intent = SpawnIntent {
+        intent_id: "d".into(),
+        hw_class_names: vec!["h0".into(), "h1".into()],
+        node_affinity: vec![term("h0", "spot"), term("h1", "spot")],
+        ..Default::default()
+    };
+
+    actor.handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[]);
+
+    let got: std::collections::HashSet<Cell> = actor
+        .dispatched_cells
+        .get("d")
+        .expect("ack arms dispatched_cells")
+        .iter()
+        .cloned()
+        .collect();
+    assert_eq!(got.len(), 2, "full A' recorded, not just cells[0]");
+    let want: std::collections::HashSet<Cell> = [
+        ("h0".into(), CapacityType::Spot),
+        ("h1".into(), CapacityType::Spot),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(got, want);
+}
+
 /// **Metrics once per miss** (`r[sched.sla.hw-class.admissible-set]`):
 /// the three `solve_intent_for` counter emits are gated on `was_miss` —
 /// N polls at fixed `(model_key, inputs_gen)` increment by exactly 1

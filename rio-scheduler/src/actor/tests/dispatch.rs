@@ -1806,6 +1806,85 @@ async fn ice_step_doubles_across_mark_without_clear() {
     assert_eq!(actor.ice.step(&cell), None, "registered_cells clears");
 }
 
+/// Regression (bug_030): the §13a interim heartbeat ICE-clear used
+/// `cells[0]`, but a pod's `nodeAffinity` is an OR over A' — kube-
+/// scheduler may bind it to `cells[i≠0]`. A heartbeat proves only
+/// "∃ cell ∈ A' with capacity"; for `|A'|>1` it identifies none, so
+/// clearing `cells[0]` defeats backoff doubling (same wrong-edge shape
+/// as `ice_step_doubles_across_mark_without_clear`). Now: heartbeat
+/// clears iff `|A'|==1`; `registered_cells` is the per-cell signal.
+// r[verify sched.sla.hw-class.ice-mask]
+#[tokio::test]
+async fn ice_step_doubles_across_heartbeat_at_multi_cell() {
+    use crate::sla::config::CapacityType;
+    use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm, SpawnIntent};
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    let h0: crate::sla::config::Cell = ("h0".into(), CapacityType::Spot);
+
+    let term = |h: &str| NodeSelectorTerm {
+        match_expressions: vec![
+            NodeSelectorRequirement {
+                key: "rio.build/hw-class".into(),
+                operator: "In".into(),
+                values: vec![h.into()],
+            },
+            NodeSelectorRequirement {
+                key: "karpenter.sh/capacity-type".into(),
+                operator: "In".into(),
+                values: vec!["spot".into()],
+            },
+        ],
+    };
+    // Seed `dispatched_cells["d"]` via the realistic ack path with
+    // |A'|=2. At ad5d288e this records only `(h0,spot)`.
+    let spawned = SpawnIntent {
+        intent_id: "d".into(),
+        hw_class_names: vec!["h0".into(), "h1".into()],
+        node_affinity: vec![term("h0"), term("h1")],
+        ..Default::default()
+    };
+    actor.handle_ack_spawned_intents(std::slice::from_ref(&spawned), &[], &[]);
+
+    actor.ice.mark(&h0);
+    assert_eq!(actor.ice.step(&h0), Some(0), "precondition: marked");
+
+    // Heartbeat-edge for "d": connect with auth_intent + first heartbeat
+    // → registration edge fires → §13a ICE-clear path runs.
+    let (tx, _rx) = mpsc::channel(8);
+    let _ = actor.handle_worker_connected(
+        &"w-d".into(),
+        tx,
+        next_stream_epoch_for("w-d"),
+        Some("d".into()),
+    );
+    actor.handle_heartbeat(HeartbeatPayload {
+        executor_id: "w-d".into(),
+        systems: vec!["x86_64-linux".into()],
+        supported_features: vec![],
+        running_build: None,
+        resources: None,
+        store_degraded: false,
+        draining: false,
+        kind: rio_proto::types::ExecutorKind::Builder,
+        intent_id: Some("d".into()),
+    });
+
+    // |A'|=2 ⇒ heartbeat identifies no specific cell ⇒ NO clear.
+    // At ad5d288e: `cells[0]=(h0,spot)` was cleared → step lost → fails.
+    assert_eq!(
+        actor.ice.step(&h0),
+        Some(0),
+        "|A'|>1: heartbeat must NOT clear cells[0]; backoff state preserved"
+    );
+    actor.ice.mark(&h0);
+    assert_eq!(
+        actor.ice.step(&h0),
+        Some(1),
+        "doubling intact across multi-cell heartbeat"
+    );
+}
+
 /// `r[sched.sla.hw-class.epsilon-explore]`: ε_h coin is a pure
 /// function of `drv_hash`; `h_explore ∈ H\A` (or `H\{argmin price}`
 /// on miss / A=H) is pinned in `MemoEntry.pinned_explore` and carried
