@@ -298,17 +298,20 @@ pub struct DagActor {
     /// `solve_intent_for` AFTER reading the memo, so unmasking is free.
     pub(crate) ice: Arc<crate::sla::cost::IceBackoff>,
     /// §13a interim ICE-clear path: `handle_ack_spawned_intents`
-    /// records the first cell of the controller-acked `SpawnIntent`
-    /// per drv (arm-on-**ack**, not arm-on-emit — `solve_intent_for`
-    /// is read-only so dashboard/CLI polls don't leak entries); the
-    /// registration edge in `handle_heartbeat` looks it up and
-    /// `ice.clear()`s (heartbeat ⇒ pod scheduled ⇒ node existed ⇒
-    /// cell had capacity). Removed on that edge, executor disconnect,
-    /// or the `handle_tick` DAG-state sweep (cancel/substitute/
-    /// terminal). §13b's `AckSpawnedIntents.registered_cells`
-    /// (NodeClaim watcher) supersedes this once wired. DashMap:
-    /// `handle_ack_spawned_intents` is `&self`.
-    pub(crate) dispatched_cells: dashmap::DashMap<DrvHash, crate::sla::config::Cell>,
+    /// records the FULL A' cell-set of the controller-acked
+    /// `SpawnIntent` per drv (arm-on-**ack**, not arm-on-emit —
+    /// `solve_intent_for` is read-only so dashboard/CLI polls don't
+    /// leak entries); the registration edge in `handle_heartbeat`
+    /// looks it up and `ice.clear()`s **iff `len()==1`** (heartbeat ⇒
+    /// pod scheduled ⇒ ∃ cell ∈ A' with capacity; for `|A'|>1` it
+    /// identifies none — bug_030). Removed on that edge, executor
+    /// disconnect, or the `handle_tick` DAG-state sweep (cancel/
+    /// substitute/terminal). §13b's `AckSpawnedIntents.registered_
+    /// cells` (NodeClaim watcher) supersedes this once wired.
+    /// DashMap: `handle_ack_spawned_intents` is `&self`. SmallVec:
+    /// `|A'| ≤ |tiers|×2` (4 typical), so inline.
+    pub(crate) dispatched_cells:
+        dashmap::DashMap<DrvHash, smallvec::SmallVec<[crate::sla::config::Cell; 4]>>,
     /// Per-key admissible-set memo. Keyed on `(model_key_hash,
     /// override_hash)`; `(inputs_gen, fit_content_hash)` are staleness
     /// fields, so most `compute_spawn_intents` ticks are pure cache

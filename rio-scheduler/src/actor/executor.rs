@@ -1107,17 +1107,22 @@ impl DagActor {
             self.on_worker_registered(executor_id);
             // r[impl sched.sla.hw-class.ice-mask]
             // §13a interim ICE clear: heartbeat ⇒ pod scheduled ⇒
-            // node existed ⇒ the cell this pod was spawned for had
-            // capacity. `auth_intent` is the token-attested drv hash
-            // (immutable, NOT the dispatch-downgradeable `intent_id`);
-            // `dispatched_cells` was armed at `handle_ack_spawned_
-            // intents` (arm-on-ack — emit path is read-only). §13b's
-            // `AckSpawnedIntents.registered_cells` (NodeClaim watcher)
-            // supersedes once wired.
+            // ∃ cell ∈ A' with capacity. |A'|=1 ⇒ that cell — clear
+            // it. |A'|>1 ⇒ heartbeat identifies none (the pod's
+            // affinity is OR-of-A'; kube-scheduler picked SOME term);
+            // over-clear defeats `ice_step_doubles` (bug_030).
+            // `registered_cells` (A18 NodeClaim watcher) is the
+            // per-cell signal. `auth_intent` is the token-attested
+            // drv hash (immutable, NOT the dispatch-downgradeable
+            // `intent_id`); `dispatched_cells` was armed at
+            // `handle_ack_spawned_intents` (arm-on-ack — emit path is
+            // read-only). **DELETE this block at A18**
+            // (`registered_cells` covers |A'|=1 too).
             if let Some(intent) = auth_intent
-                && let Some((_, cell)) = self.dispatched_cells.remove(intent.as_str())
+                && let Some((_, cells)) = self.dispatched_cells.remove(intent.as_str())
+                && let [cell] = cells.as_slice()
             {
-                self.ice.clear(&cell);
+                self.ice.clear(cell);
             }
         }
 

@@ -21542,6 +21542,10 @@
           "packageId": "sha2 0.11.0"
         },
         {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        },
+        {
           "name": "sqlx",
           "packageId": "sqlx"
         },

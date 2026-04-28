@@ -460,7 +460,11 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                 // §13b NodeClaim watcher (A18) populates both: cells
                 // with `Registered=True` edges → `registered_cells`
                 // (ICE clear); `Launched=False` / Registered timeout
-                // → `unfulfillable_cells` (ICE mark).
+                // → `unfulfillable_cells` (ICE mark). **A18 must wire
+                // `registered_cells` AND `unfulfillable_cells`
+                // together** — mark-without-clear climbs backoff
+                // unbounded for |A'|>1 intents (heartbeat-clear is
+                // |A'|=1-only post-r19).
                 unfulfillable_cells: vec![],
                 registered_cells: vec![],
             },

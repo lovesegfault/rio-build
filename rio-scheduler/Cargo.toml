@@ -96,6 +96,8 @@ aws-config = { workspace = true }
 zstd = { workspace = true }
 # phase2b: log ring buffer written from BuildExecution recv tasks
 dashmap = { workspace = true }
+# §13a `dispatched_cells: SmallVec<[Cell;4]>` — full A' (bug_030).
+smallvec = { workspace = true }
 serde = { workspace = true }
 # ADR-023 phase-11: SeedCorpus JSON load/import (sla::prior).
 serde_json = { workspace = true }

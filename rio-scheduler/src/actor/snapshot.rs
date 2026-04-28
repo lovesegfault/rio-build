@@ -600,26 +600,32 @@ impl DagActor {
         unfulfillable_cells: &[String],
         registered_cells: &[String],
     ) {
-        // Arm-on-ack: recover `cells[0]` from the wire form. `h` is
-        // `hw_class_names[0]` (parallel to `node_affinity[0]` by
-        // construction in `cells_to_selector_terms`); `cap` is the
-        // `karpenter.sh/capacity-type` requirement's value. hw-agnostic
-        // intents (empty `node_affinity`) skip — no cell to arm.
+        // Arm-on-ack: recover the FULL `cells` vec from the parallel
+        // `(hw_class_names, node_affinity)` wire form
+        // (`cells_to_selector_terms` emits one term per cell). `cap` is
+        // the `karpenter.sh/capacity-type` requirement's value.
+        // hw-agnostic intents (empty `node_affinity`) skip — no cell
+        // to arm. Recording only `cells[0]` (bug_030) is the §1-of-N
+        // approximation: the pod's affinity is OR-of-A', so the
+        // heartbeat-edge consumer needs the whole set.
         for i in spawned {
-            let cell = i.hw_class_names.first().and_then(|h| {
-                let cap = i
-                    .node_affinity
-                    .first()?
-                    .match_expressions
-                    .iter()
-                    .find(|r| r.key == "karpenter.sh/capacity-type")?
-                    .values
-                    .first()?;
-                Some((h.clone(), crate::sla::config::CapacityType::parse(cap)?))
-            });
-            if let Some(cell) = cell {
+            let cells: smallvec::SmallVec<[crate::sla::config::Cell; 4]> = i
+                .hw_class_names
+                .iter()
+                .zip(&i.node_affinity)
+                .filter_map(|(h, t)| {
+                    let cap = t
+                        .match_expressions
+                        .iter()
+                        .find(|r| r.key == "karpenter.sh/capacity-type")?
+                        .values
+                        .first()?;
+                    Some((h.clone(), crate::sla::config::CapacityType::parse(cap)?))
+                })
+                .collect();
+            if !cells.is_empty() {
                 self.dispatched_cells
-                    .insert(i.intent_id.as_str().into(), cell);
+                    .insert(i.intent_id.as_str().into(), cells);
             }
         }
         for s in registered_cells {

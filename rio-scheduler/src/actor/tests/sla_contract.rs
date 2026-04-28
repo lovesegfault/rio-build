@@ -394,11 +394,16 @@ async fn contract_ice_step_doubles_then_clears_on_registered() {
         "spawned-ack must NOT clear; backoff doubles across consecutive marks"
     );
     // Arm-on-ack: the spawned echo populates `dispatched_cells` with
-    // the cell recovered from `(hw_class_names[0], node_affinity[0])`
-    // — `cells[0]` round-trips through the wire.
+    // the FULL `cells` vec recovered from the parallel
+    // `(hw_class_names, node_affinity)` wire form — single-cell case
+    // round-trips as a 1-vec.
     assert_eq!(
-        actor.dispatched_cells.get("d0").as_deref(),
-        Some(&(intent.hw_class_names[0].clone(), CapacityType::Spot)),
+        actor
+            .dispatched_cells
+            .get("d0")
+            .as_deref()
+            .map(|v| v.as_slice()),
+        Some(&[(intent.hw_class_names[0].clone(), CapacityType::Spot)][..]),
         "spawned-ack arms dispatched_cells from the wire form"
     );
 
