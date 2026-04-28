@@ -419,19 +419,20 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         },
     )
     .await;
-    // Ack to the scheduler so it arms the Pending-watch (ICE-backoff)
-    // timer for intents that have a Pending Job — both newly spawned
-    // AND already-Pending-before-this-tick. The latter covers scheduler
-    // restart: `pending_intents` is in-memory, so without re-ack a
-    // pre-restart Pending Job under deterministic softmax (same
-    // selector → no reap → no respawn → no fresh ack) never re-arms.
-    // Scheduler-side `or_insert` makes re-ack of a live timer a no-op.
+    // Ack to the scheduler so it records `dispatched_cells` for intents
+    // that have a Pending Job — both newly spawned AND already-Pending-
+    // before-this-tick. The latter covers scheduler restart:
+    // `dispatched_cells` is in-memory, so without re-ack a pre-restart
+    // Pending Job (deterministic affinity → no reap → no respawn → no
+    // fresh ack) never re-arms the §13a heartbeat-edge ICE clear.
+    // Scheduler-side `.insert()` overwrites — harmless: deterministic
+    // affinity → identical SmallVec contents → overwrite is
+    // idempotent-in-effect.
     //
     // Chain `spawned`, NOT `to_spawn_intents`: an intent whose create
     // hit `SpawnOutcome::Failed` (apiserver 5xx, quota 403, webhook
-    // reject) has no Job behind it, so acking it would arm the ICE
-    // timer for a Job that will never heartbeat → false ICE on the
-    // `(band, cap)` cell after `hw_fallback_after_secs`.
+    // reject) has no Job behind it; acking it would leak a
+    // `dispatched_cells` entry until the housekeeping DAG-state sweep.
     let pending_job_names: HashSet<String> = jobs
         .items
         .iter()
@@ -471,7 +472,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         ))
         .await
         {
-            warn!(pool = %name, error = %e, "ack_spawned_intents failed; ICE-timer not armed this tick");
+            warn!(pool = %name, error = %e, "ack_spawned_intents failed; dispatched_cells not armed this tick");
         }
     }
 

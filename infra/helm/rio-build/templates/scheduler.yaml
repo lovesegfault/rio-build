@@ -66,7 +66,8 @@ spec:
           {{- if $s.sla.allowReferenceChange }}
           # DESTRUCTIVE one-shot: M_058 reference_hw_class guard. Set
           # for ONE rollout after changing referenceHwClass, then unset
-          # — leaving it set means every restart re-TRUNCATEs.
+          # — leaving it set means a FUTURE referenceHwClass change
+          # silently TRUNCATEs instead of failing closed.
           args: ["--allow-reference-change"]
           {{- end }}
           ports:

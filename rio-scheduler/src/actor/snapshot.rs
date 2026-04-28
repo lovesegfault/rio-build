@@ -310,9 +310,10 @@ impl DagActor {
                 cores: intent.cores,
                 mem_bytes: intent.mem_bytes,
                 disk_bytes: intent.disk_bytes,
-                // Compat (proto field 5): controller derives the
-                // single-cell selector from `node_affinity[0]` until
-                // A18; scheduler-side stays empty.
+                // Compat (proto field 5): controller stamps the full
+                // `node_affinity` term-list onto `pod.spec.affinity.
+                // nodeAffinity.required…` (r[ctrl.pool.node-affinity-
+                // from-intent]); scheduler-side stays empty.
                 node_selector: HashMap::new(),
                 kind: kind.into(),
                 system: state.system.clone(),
@@ -992,8 +993,8 @@ impl DagActor {
                 // also poll this), and budget-reject / cancel /
                 // substitute / never-Ready forecast drvs would all leak.
                 // Armed on the controller's ack instead
-                // (`handle_ack_spawned_intents`); `cells[0]` round-trips
-                // via `(hw_class_names[0], node_affinity[0].cap-type)`.
+                // (`handle_ack_spawned_intents`); each `cells[i]` round-
+                // trips via `(hw_class_names[i], node_affinity[i].cap-type)`.
                 let (terms, names) =
                     solve::cells_to_selector_terms(&cells, &self.sla_config.hw_classes);
                 (

@@ -108,6 +108,46 @@ range — including the `None`/default/sentinel arm. r19 bug_008:
 `status_from_fit(None, ..)` → `fit_kind=""` → panic. The existing
 round-trip test only exercised `Some(&fp)`.
 
+**(2) truth-source is code, not another comment.** When the close is
+"doc A contradicts doc B → sync A to B", the verification is: locate
+the `r[impl …]` site (or the function body in the crate the claim's
+SUBJECT names) and confirm the comment matches what that code DOES —
+read-and-compare, not `rg`. When both sides are `.rs`: `//`/`///`
+lines are never the truth-source. r21 bug_004: r19 synced
+derivation.rs to snapshot.rs's comment; both were wrong —
+jobs.rs:868-886 stamps the full list onto
+`pod.spec.affinity.nodeAffinity.required…` and never touches
+nodeSelector. A doc-to-doc sync propagates the lie.
+
+**Planner-stated invariants are unverified.** A bound/invariant
+written into a fix directive (e.g. "SmallVec inline 4 covers
+`|tiers|×2`") is a CLAIM until grounded against the producing code.
+r21 mb_003: r19 plan directive stated `|A'| ≤ |tiers|×2`;
+solve.rs:903-906 builds candidates `for tier { for h { for cap }}`
+with per-tier early-return → bound is `|H|×2`. The directive's bound
+was copied into mod.rs:312 verbatim. Close: directive bounds cite the
+producing line.
+
+**(4) edit-adjacency.** When a close edits file F at line L, the
+§SCC(4) `rg <deleted-mechanism>` MUST cover F entire (not just the
+edited fn), and at minimum L±50. r21 bug_018: r19 R19B1 edited
+jobs.rs:460-465 (A18 note); the stale `pending_intents`/`or_insert`/
+`hw_fallback` block at :422-434 — 30 lines above — was untouched. The
+done-gate `rg` was scoped to `rio-scheduler/`; the controller-side
+comment was invisible.
+
+## Partition-single-source
+
+A "list X mirrors list Y so they partition the space" comment over two
+open-coded YAML/const lists is a finding. The mirror is doc-stated,
+not structural; one side drifts. r21 mb_002: karpenter.yaml `NotIn
+[metal,…]` claimed to mirror values.yaml metal-pool `In […]`; both
+hand-maintained, both missing `metal-{16,32}xl`, AND a sibling
+template-loop 14 lines below had NEITHER. Close: single-source the
+list (`values.yaml` key / helm helper / Rust `const`); both sides
+reference it; template-side injection by a discriminating field (here:
+`nodeClass`) so new entries get the partition structurally.
+
 ## Granularity coupling
 
 Converting `T` → `Option<T>` (or `[T; K]` → `[Option<T>; K]`, or any

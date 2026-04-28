@@ -309,7 +309,8 @@ pub struct DagActor {
     /// substitute/terminal). §13b's `AckSpawnedIntents.registered_
     /// cells` (NodeClaim watcher) supersedes this once wired.
     /// DashMap: `handle_ack_spawned_intents` is `&self`. SmallVec:
-    /// `|A'| ≤ |tiers|×2` (4 typical), so inline.
+    /// `|A'| ≤ |H|×|CapacityType::ALL|` (= |H|×2; 4 typical at 2
+    /// hw_classes; spills at |H|≥3).
     pub(crate) dispatched_cells:
         dashmap::DashMap<DrvHash, smallvec::SmallVec<[crate::sla::config::Cell; 4]>>,
     /// Per-key admissible-set memo. Keyed on `(model_key_hash,
