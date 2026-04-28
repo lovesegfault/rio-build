@@ -14,11 +14,13 @@
 //!    Registered, assert no `Disrupting`/`DisruptionReason`).
 //!
 //! Output: per-cell boot seconds + a YAML block ready for
-//! `infra/helm/rio-build/values/prod.yaml` `sla.leadTimeSeed:`.
+//! `infra/helm/rio-build/values.yaml` `sla.leadTimeSeed:`.
 //!
-//! EKS-only, operator-run; NOT a CI test. The shim NodePool itself is
-//! created by B3 — assertions 2/5 pass trivially today but are real
-//! checks so a B3 misconfiguration surfaces here.
+//! EKS-only, operator-run; NOT a CI test. The shim NodePool is
+//! pre-created here (idempotent) so the probe is runnable before B3
+//! helm-manages it — without it, Karpenter parks naked NodeClaims at
+//! `AwaitingReconciliation` because the `karpenter.sh/nodepool` label
+//! references a NodePool that doesn't exist.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -31,14 +33,15 @@ use rio_scheduler::sla::config::{CapacityType, Cell, HwClassDef, SlaConfig};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
-use crate::k8s::status::nodeclaim_api;
+use crate::k8s::status::{nodeclaim_api, nodepool_api};
 use crate::k8s::{NS, client as kube};
 use crate::ui;
 
 /// `karpenter.sh/nodepool` value the controller stamps (ADR-023 §13b
-/// `r[ctrl.nodeclaim.shim-nodepool]`). The NodePool object itself lands
-/// in B3; the label is stamped now so assertion 4 has something to
-/// propagate and assertion 2 has a stable selector.
+/// `r[ctrl.nodeclaim.shim-nodepool]`). The probe ensures the NodePool
+/// object exists (`ensure_shim_nodepool`) before stamping the label —
+/// Karpenter refuses to reconcile a NodeClaim whose nodepool label
+/// points at a missing NodePool. B3 will helm-manage the same object.
 const SHIM_NODEPOOL: &str = "rio-nodeclaim-shim";
 
 /// `metadata.labels` key marking a probe-boot NodeClaim. Lets cleanup
@@ -75,6 +78,8 @@ pub async fn run() -> Result<()> {
         CapacityType::ALL.len(),
     );
 
+    ensure_shim_nodepool(&kube, node_class).await?;
+
     let claims = nodeclaim_api(&kube);
     let nodes: Api<Node> = Api::all(kube.clone());
     let mut created: Vec<String> = Vec::new();
@@ -86,6 +91,13 @@ pub async fn run() -> Result<()> {
         // Drive every cell to Registered, collecting boot times. The
         // last cell's claim is held for assertions 4+5 instead of being
         // deleted in-loop.
+        //
+        // Serial (one NodeClaim at a time, ≤300s each) is intentional
+        // for first-run: 12 simultaneous claims would race spot ICE
+        // retry across cells and pile up CreateFleet quota. A
+        // `--parallel` flag for re-runs is a follow-up.
+        // TODO: `--parallel` re-probe — fan out cells via join_all once
+        // the first serial run has populated leadTimeSeed.
         let last = cells.len() - 1;
         let mut last_claim: Option<String> = None;
         for (i, cell) in cells.iter().enumerate() {
@@ -265,6 +277,76 @@ pub async fn run() -> Result<()> {
     result?;
     print_seeds(&seeds);
     Ok(())
+}
+
+/// Idempotently ensure the §13b shim NodePool exists. Karpenter refuses
+/// to reconcile a NodeClaim whose `karpenter.sh/nodepool` label points
+/// at a missing NodePool — the claim sits at `AwaitingReconciliation`
+/// forever. The probe stamps that label, so it must pre-create the pool.
+///
+/// The shim is inert: `limits.cpu=0` means it never provisions on its
+/// own (assertion 2), `budgets:[{nodes:"0"}]` means it never disrupts
+/// (assertion 5), `expireAfter: Never` means probe nodes aren't
+/// drift-churned. NOT deleted on exit — B3 helm-manages the same object
+/// later, and `cpu:0` makes it harmless to leave.
+async fn ensure_shim_nodepool(client: &kube::Client, node_class: &str) -> Result<()> {
+    let pools = nodepool_api(client);
+    if pools.get_opt(SHIM_NODEPOOL).await?.is_some() {
+        info!("{SHIM_NODEPOOL} already present (B3 helm-managed?)");
+        return Ok(());
+    }
+    let np = mk_shim_nodepool(node_class);
+    pools
+        .create(&PostParams::default(), &np)
+        .await
+        .with_context(|| {
+            format!(
+                "create NodePool {SHIM_NODEPOOL}; check Karpenter CRDs are installed \
+                 (`kubectl get crd nodepools.karpenter.sh`)"
+            )
+        })?;
+    info!("ensured {SHIM_NODEPOOL} NodePool (limits.cpu=0, budgets=0)");
+    Ok(())
+}
+
+/// §13b shim NodePool spec. Field shapes mirror the working NodePools in
+/// `infra/helm/rio-build/templates/karpenter.yaml`. `requirements` needs
+/// at least one entry (Karpenter v1 CRD validation); `kubernetes.io/os
+/// In [linux]` is the no-op choice — the NodeClaim's own requirements
+/// drive actual instance selection.
+fn mk_shim_nodepool(node_class: &str) -> DynamicObject {
+    serde_json::from_value(json!({
+        "apiVersion": "karpenter.sh/v1",
+        "kind": "NodePool",
+        "metadata": {
+            "name": SHIM_NODEPOOL,
+            "labels": {PROBE_LABEL: "true"},
+        },
+        "spec": {
+            "limits": {"cpu": "0"},
+            "disruption": {
+                "budgets": [{"nodes": "0"}],
+                "consolidationPolicy": "WhenEmpty",
+                "consolidateAfter": "Never",
+            },
+            "template": {
+                "spec": {
+                    "nodeClassRef": {
+                        "group": "karpenter.k8s.aws",
+                        "kind": "EC2NodeClass",
+                        "name": node_class,
+                    },
+                    "requirements": [{
+                        "key": "kubernetes.io/os",
+                        "operator": "In",
+                        "values": ["linux"],
+                    }],
+                    "expireAfter": "Never",
+                },
+            },
+        },
+    }))
+    .expect("static NodePool json")
 }
 
 /// Read the live `[sla]` table from the `rio-scheduler-config`
@@ -465,6 +547,43 @@ mod tests {
         assert_eq!(
             v.pointer("/spec/nodeClassRef/name").and_then(Value::as_str),
             Some("rio-nvme")
+        );
+    }
+
+    #[test]
+    fn shim_nodepool_shape() {
+        let np = mk_shim_nodepool("rio-default");
+        let v = serde_json::to_value(&np).unwrap();
+        assert_eq!(
+            v.pointer("/metadata/name").and_then(Value::as_str),
+            Some(SHIM_NODEPOOL)
+        );
+        // Assertion 2 prerequisite: cpu=0 so the shim never provisions.
+        assert_eq!(
+            v.pointer("/spec/limits/cpu").and_then(Value::as_str),
+            Some("0")
+        );
+        // Assertion 5 prerequisite: budgets nodes=0 so it never disrupts.
+        assert_eq!(
+            v.pointer("/spec/disruption/budgets/0/nodes")
+                .and_then(Value::as_str),
+            Some("0")
+        );
+        // CRD requires ≥1 requirement; use the linux no-op.
+        assert_eq!(
+            v.pointer("/spec/template/spec/requirements/0/key")
+                .and_then(Value::as_str),
+            Some("kubernetes.io/os")
+        );
+        assert_eq!(
+            v.pointer("/spec/template/spec/nodeClassRef/name")
+                .and_then(Value::as_str),
+            Some("rio-default")
+        );
+        assert_eq!(
+            v.pointer("/spec/template/spec/expireAfter")
+                .and_then(Value::as_str),
+            Some("Never")
         );
     }
 

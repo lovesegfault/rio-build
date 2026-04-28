@@ -721,6 +721,13 @@ pub(super) fn nodeclaim_api(client: &k::Client) -> Api<DynamicObject> {
     Api::all_with(client.clone(), &ar)
 }
 
+/// Karpenter NodePool CRD via the dynamic API. Cluster-scoped.
+pub(super) fn nodepool_api(client: &k::Client) -> Api<DynamicObject> {
+    let gvk = GroupVersionKind::gvk("karpenter.sh", "v1", "NodePool");
+    let ar = ApiResource::from_gvk(&gvk);
+    Api::all_with(client.clone(), &ar)
+}
+
 async fn list_pools(client: &k::Client, ns: &str) -> Result<Vec<PlStatus>> {
     let api: Api<Pool> = Api::namespaced(client.clone(), ns);
     let mut out: Vec<_> = api
