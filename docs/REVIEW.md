@@ -34,8 +34,16 @@ in too many heads.
   `resolve_h_explore` → `HExploreOutcome`): a state-machine open-coded
   across N locations with implicit ordering dependencies → one
   function whose return enum names every outcome. Unit tests pin each
-  transition; the caller is a `match` with no `_` arm. The sum-type
-  pins ONE transition. If the invariant is over a **trajectory**
+  transition; the caller is a `match` with no `_` arm. When the
+  extracted function's state grows a second field with the same
+  lifecycle (r8: `pinned_explore_a` alongside `pinned_explore`),
+  **bundle them** (`struct Pin{h, prev_a}`) and make the function
+  `Pin → Pin`. A sibling field whose transition lives at the CALLER
+  while the original's lives in the extracted fn is the r17 bug_001
+  shape: the sum-type return describes one field's transitions and the
+  caller reconstructs the other's from it — lossily, because the
+  sum-type wasn't designed to carry the second field's inputs. The
+  sum-type pins ONE transition. If the invariant is over a **trajectory**
   (rotation covers a set, retry-ladder terminates, backoff is
   monotone), the unit test MUST drive ≥N transitions and assert the
   trajectory property directly — `seen == pool`,
@@ -74,10 +82,13 @@ not the rule.
 
 ## Structural-close-completion
 
-A §Nth-strike structural close is **four parts**: (1) behavior fix;
+A §Nth-strike structural close is **five parts**: (1) behavior fix;
 (2) doc/spec sync; (3) sibling sweep — `rg <pattern>` for the
 open-coded shape in the same crate; (4) dead-code sweep — `rg <field>`
-for state the close obsoleted. **Every batch directive ends with a
+for state the close obsoleted; (5) **arm-coverage** — when the close
+touches a sum-type's producer or consumer, the falsifying test drives
+**every arm** at least once. Done-gate form: `rg '<Variant>'
+<test_file>` ≥ 1 per variant. **Every batch directive ends with a
 `Done-gate:` line listing the literal `rg` commands** that verify
 (3)+(4); reviewer runs them.
 
@@ -86,7 +97,9 @@ for state the close obsoleted. **Every batch directive ends with a
 bug_011 = (3) failure: R7B3 §Canonicalize migrated gate_b to typed
 parse, missed gate_a in the same file. r8 mb_005 = (4) failure: R7B1
 collapsed the read site, left the field declaration + carry-forward +
-4 doc comments.
+4 doc comments. r17 bug_001 = (5) failure: R8B1's 4-poll test
+exercised `Hit` 4×, `Miss` 0×; the `Miss` arm's `prev_a` commit was
+wrong from the commit it shipped in.
 
 ## Granularity coupling
 

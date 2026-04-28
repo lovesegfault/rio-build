@@ -1075,10 +1075,9 @@ pub struct MemoEntry {
     /// released on graduation into A, removal from `h_all`, OR
     /// `solve_full({h})` infeasible / fully ICE-masked.
     pub pinned_explore: Option<HwClassName>,
-    /// R8B1: prior ε_h restricted solve's `A'.cells` — the Schmitt
-    /// `prev_a` for the NEXT restricted solve. Carried across staleness
-    /// with `pinned_explore`; cleared when the pin rotates to a new `h`
-    /// (its first solve uses τ_enter, correctly). Without this the
+    /// Prior ε_h restricted solve's `A'.cells` — the `prev_a` half of
+    /// [`super::explore::HExplorePin`]; transition owned by
+    /// [`super::explore::resolve_h_explore`]. Without this the
     /// restricted solve always passes `prev_a=∅` → heads-drvs lose the
     /// deadband → `(h_explore, od)` flips at the `[1+τ, 1+1.3τ]`
     /// boundary on every `inputs_gen` epoch (bug_014).

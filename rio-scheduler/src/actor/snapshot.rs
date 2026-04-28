@@ -812,7 +812,6 @@ impl DagActor {
             );
             was_miss = miss;
             let result = entry.result.clone();
-            let prev_pin = entry.pinned_explore.clone();
             memo_entry = Some((mkh, ovr, entry));
             let memo = match result {
                 solve::SolveFullResult::Feasible(m) => Some(m),
@@ -846,7 +845,7 @@ impl DagActor {
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
             if h_all.len() > 1 && rng.random::<f64>() < self.sla_config.hw_explore_epsilon {
                 use crate::sla::explore::{
-                    HExploreCtx, HExploreOutcome, h_explore_pool, resolve_h_explore,
+                    HExploreCtx, HExploreOutcome, HExplorePin, h_explore_pool, resolve_h_explore,
                 };
                 let in_a: std::collections::HashSet<_> = memo
                     .as_ref()
@@ -859,16 +858,17 @@ impl DagActor {
                     pool: &pool,
                     masked: &masked,
                 };
-                // R8B1: Schmitt `prev_a` for the restricted solve. The
-                // unrestricted memo's `prev_a` can't help (`h_explore ∈
-                // H\A` so `(h_explore,*)` is never in it); the prior
-                // RESTRICTED A' is per-key state with the same
-                // lifetime as `pinned_explore`, carried alongside it.
-                let prev_explore_a = memo_entry
+                // `(pinned_explore, pinned_explore_a)` → one
+                // `HExplorePin`; transition owned by `resolve_h_explore`
+                // — see [`HExplorePin`] doc.
+                let prev = memo_entry
                     .as_ref()
-                    .map(|(_, _, e)| e.pinned_explore_a.clone())
+                    .map(|(_, _, e)| HExplorePin {
+                        h: e.pinned_explore.clone(),
+                        prev_a: e.pinned_explore_a.clone(),
+                    })
                     .unwrap_or_default();
-                let outcome = resolve_h_explore(prev_pin.clone(), mkh, ovr, &ctx, |h| {
+                let outcome = resolve_h_explore(prev, mkh, ovr, &ctx, |h, prev_a| {
                     tracing::Span::current().record("hw_explore", h.as_str());
                     solve::solve_full(
                         f,
@@ -878,7 +878,7 @@ impl DagActor {
                         &self.sla_ceilings,
                         &self.sla_config,
                         std::slice::from_ref(h),
-                        &prev_explore_a,
+                        prev_a,
                         // Unmemoized — gate `_hw_cost_unknown_total`
                         // on the unrestricted memo's `was_miss` so
                         // it fires once per (key, inputs_gen).
@@ -886,46 +886,28 @@ impl DagActor {
                     )
                 });
                 // Idempotent memo write — same class as the
-                // `update_entry` for `ice_exhausted`. Guard widened to
-                // EITHER edge: `pin` change OR `cells` change. Hit at a
-                // stable pin (the steady-state path) has fresh `cells`
-                // every epoch; without the `|| cells` arm those never
-                // refresh and `prev_explore_a` lags one Hit (Claim C).
-                // `memo_entry` is an OWNED clone (solve.rs `.cloned()`
-                // drops the DashMap guard) — no re-entrancy.
-                let commit = |pin: &Option<String>,
-                              cells: std::collections::HashSet<crate::sla::config::Cell>| {
+                // `update_entry` for `ice_exhausted`. Guard on EITHER
+                // half of the pin changing. `memo_entry` is an OWNED
+                // clone (solve.rs `.cloned()` drops the DashMap guard)
+                // — no re-entrancy.
+                let commit = |pin: &HExplorePin| {
                     if let Some((_, _, prev)) = &memo_entry
-                        && (prev.pinned_explore != *pin || prev.pinned_explore_a != cells)
+                        && (prev.pinned_explore != pin.h || prev.pinned_explore_a != pin.prev_a)
                     {
                         self.solve_cache.update_entry(mkh, ovr, |e| {
-                            e.pinned_explore = pin.clone();
-                            e.pinned_explore_a = cells;
+                            e.pinned_explore = pin.h.clone();
+                            e.pinned_explore_a = pin.prev_a.clone();
                         });
                     }
                 };
                 match outcome {
-                    HExploreOutcome::Hit(hit) => {
-                        commit(
-                            &Some(hit.pin.clone()),
-                            hit.memo.a.cells.iter().cloned().collect(),
-                        );
-                        return Some((hit.memo, h_all.clone()));
+                    HExploreOutcome::Hit { memo, pin } => {
+                        commit(&pin);
+                        return Some((memo, h_all.clone()));
                     }
-                    HExploreOutcome::Miss { next } => {
-                        // Singleton fixed-point (next==prev_pin)
-                        // preserves prev_a via guard no-op (both args
-                        // equal stored). Rotation (next≠prev_pin)
-                        // clears it: new h's first solve uses τ_enter.
-                        commit(
-                            &next,
-                            if next.as_deref() == prev_pin.as_deref() {
-                                prev_explore_a
-                            } else {
-                                std::collections::HashSet::new()
-                            },
-                        );
-                        // Fall through to the unrestricted memo. `next`
+                    HExploreOutcome::Miss { pin } => {
+                        commit(&pin);
+                        // Fall through to the unrestricted memo. `pin.h`
                         // gets its one solve on the NEXT ε_h hit.
                     }
                 }
