@@ -146,6 +146,18 @@ spec:
         - key: karpenter.sh/capacity-type
           operator: In
           values: [spot, on-demand]
+        # I-205: x86_64 .metal SKUs boot legacy-bios ONLY; both rio-default
+        # and rio-nvme NodeClasses select the UEFI AMI for amd64. Without
+        # this filter Karpenter's bin-pack can pick e.g. m6idn.metal (it
+        # satisfies category+generation+local-nvme) → CreateFleet rejects
+        # with UnfulfillableCapacity. Metal is served by the dedicated
+        # rio-builder-metal pool (rio-metal NodeClass, BIOS AMI). The list
+        # mirrors that pool's `instance-size In` set so the two partition
+        # the size space. arm64 .metal does boot UEFI, but metal belongs
+        # to the kvm pool regardless — keep the band pools virtualized-only.
+        - key: karpenter.k8s.aws/instance-size
+          operator: NotIn
+          values: [metal, metal-24xl, metal-48xl]
         {{- if $stor.nvme }}
         - key: karpenter.k8s.aws/instance-local-nvme
           operator: Gt
