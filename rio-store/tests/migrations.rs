@@ -207,6 +207,7 @@ fn migration_checksums_frozen() {
         (56, "b456694bdc1a9b6dbc5cb36025ec198e389b77960ce783ed0afd276ff37476ad632c6c468826239316624433de4e8672"),
         (57, "6c626a27371ef3f46b23a2cfcdcd0052f487c1a90cbd6cade384ad7dda48e71835f94d40b718354ef0c2b46c1c1bae92"),
         (58, "3e2f05cc03b48c2e82bbaa8dc3b36fe89260c12bb9a5f921acac104dc2b9772e8f4c3b9a0ba9867599ec6901e20984d7"),
+        (59, "b6c1260819a0892cb5cf0cefc5c9345bf387994f644ce55da9ca145860d1b545be029e1d1d7910fbc364d279d69a0e7a"),
     ];
 
     let pinned: std::collections::HashMap<i64, &str> = PINNED.iter().copied().collect();
@@ -337,11 +338,19 @@ fn every_table_is_queried() {
 
     // Tables intentionally present in the schema with zero `.rs`
     // references. Each entry MUST carry a rationale.
-    const ALLOW_DEAD: &[(&str, &str)] = &[(
-        "hw_cost_factors",
-        "ADR-023 chose sla_ema_state instead; DROP TABLE deferred to a \
-         follow-up migration (042 is frozen)",
-    )];
+    const ALLOW_DEAD: &[(&str, &str)] = &[
+        (
+            "hw_cost_factors",
+            "ADR-023 chose sla_ema_state instead; DROP TABLE deferred to a \
+             follow-up migration (042 is frozen)",
+        ),
+        (
+            "nodeclaim_cell_state",
+            "ADR-023 §13b: read/written by rio-controller's nodeclaim_pool \
+             reconciler — controller is not in this test's PG-query corpus \
+             (store/scheduler/xtask only)",
+        ),
+    ];
 
     // ── Live-table set: CREATE/ALTER add, DROP removes, in version
     // order. `MIGRATOR.iter()` already yields by ascending version

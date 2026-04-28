@@ -923,6 +923,29 @@ pub const M_057: () = ();
 /// rare, operator-intended, destructive operation.
 pub const M_058: () = ();
 
+/// `migrations/059_nodeclaim_cell_state.sql`
+///
+/// ADR-023 §13b @alg-pool: per-`(hw_class, capacity_type)` DDSketch
+/// state for the `nodeclaim_pool` reconciler's lead-time forecast.
+/// `z_sketch_*` is the demand-to-Registered lead time; `boot_sketch_*`
+/// is Launch→Registered alone (the Karpenter+kubelet overhead the
+/// reconciler can't compress). Active/shadow pairs let the reconciler
+/// rotate at `sketch_epoch` without losing the warm quantile during
+/// the cold-start window. Sketches are `sketches-ddsketch` serialized
+/// via bincode v2 — `bytea` not `jsonb` because DDSketch's bucket
+/// array is dense-packed integers (~1KiB binary vs ~8KiB JSON at the
+/// 2048-bucket config).
+///
+/// `idle_gap_events` (jsonb) is the consolidator's recent reap log —
+/// small (capped ring), read-rarely, schema-evolving; jsonb avoids a
+/// second migration when the event shape changes.
+///
+/// Read/written by **rio-controller** only — the schema-liveness
+/// guard's corpus is store/scheduler/xtask, so this table is
+/// `ALLOW_DEAD`-listed in `rio-store/tests/migrations.rs` until the
+/// corpus grows or the persist moves behind a store RPC.
+pub const M_059: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql
