@@ -878,6 +878,193 @@ async fn contract_h_explore_stable_across_inputs_gen_churn() {
     );
 }
 
+/// **R8B1 / bug_014** — ε_h restricted `solve_full` passed `prev_a=∅`,
+/// so heads-drvs lost the Schmitt deadband: every cell got `τ_enter`
+/// only. `(h_explore, od)` flipped at the `[1+τ, 1+1.3τ]` boundary on
+/// every `inputs_gen` epoch → `selector_fingerprint` drift → reap churn.
+///
+/// 4-poll falsification (τ=0.15 → τ_enter=1.15, τ_stay=1.195):
+/// 1. od/spot=1.14 → 2 terms ({spot,od}); writes pinned_explore_a.
+/// 2. od/spot=1.16 (deadband) → STILL 2 terms. **Red @ 4434b117**:
+///    `prev_a=∅` → τ_enter applies → 1.16>1.15 → 1 term.
+/// 3. od/spot=1.20 → 1 term ({spot}).
+/// 4. od/spot=1.18 (deadband) → STILL 1 term. **Red against the
+///    broken-guard variant** (`prev.pinned_explore != *pin` only):
+///    poll-3's Hit had pin unchanged → no write → stale prev_a={spot,od}
+///    from poll 1 → od τ_stay=1.195 → 2 terms. The widened guard
+///    `|| prev.pinned_explore_a != cells` makes poll 3 write {spot}.
+// r[verify sched.sla.hw-class.admissible-set]
+#[tokio::test]
+async fn contract_h_explore_schmitt_carries_prev_a() {
+    use crate::sla::config::CapacityType;
+    use crate::sla::cost::{CostTable, InstanceType, RatioEma};
+    use crate::sla::solve::{self, SolveFullResult};
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    // 2-hw_class fixture: h_main cheap (price 0.001) → unrestricted A =
+    // {h_main}; h_exp dear (price 1.0) → ∉ A → ε_h pool = H\A = {h_exp}
+    // (single element). resolve_h_explore deterministically pins h_exp
+    // every poll (mkh^ovr-seeded; pool size 1).
+    let h_main: String = "intel-8".into();
+    let h_exp: String = "intel-6".into();
+    actor
+        .sla_config
+        .hw_classes
+        .retain(|k, _| *k == h_main || *k == h_exp);
+    // ε=1.0 → drv_hash-seeded coin (snapshot.rs:840-846) always heads.
+    actor.sla_config.hw_explore_epsilon = 1.0;
+    // τ=0.15 explicit (cfg_hw parity): deadband (1.15, 1.195].
+    actor.sla_config.hw_cost_tolerance = 0.15;
+    let tau = actor.sla_config.hw_cost_tolerance;
+    actor.test_inject_ready("d-schmitt", Some("test-pkg"), "x86_64-linux", false);
+    let fit = make_fit("test-pkg");
+
+    let it = |p: f64| InstanceType {
+        name: "t".into(),
+        cores: 256,
+        mem_bytes: 256 << 30,
+        price_per_vcpu_hr: p,
+    };
+    // Per-poll cost table: λ_spot(h_exp)→0 via huge denominator so
+    // e_od/e_spot == price_od/price_spot (no `1/(1-p)` retry-factor
+    // skew on spot). h_main priced 0.001 so it dominates the
+    // unrestricted e_min by ~1000× → h_exp ∉ A. Menu price change
+    // hashes into solve_relevant_hash → inputs_gen bumps each poll.
+    let set_ratio = |a: &DagActor, od_over_spot: f64| {
+        let mut ct = a.cost_table.write();
+        *ct = CostTable::from_parts(
+            std::collections::HashMap::new(),
+            [(
+                h_exp.clone(),
+                RatioEma {
+                    numerator: 0.0,
+                    denominator: 1e15,
+                    updated_at: 0.0,
+                },
+            )]
+            .into(),
+        );
+        ct.set_menu((h_main.clone(), CapacityType::Spot), vec![it(0.001)]);
+        ct.set_menu((h_main.clone(), CapacityType::Od), vec![it(0.001)]);
+        ct.set_menu((h_exp.clone(), CapacityType::Spot), vec![it(1.0)]);
+        ct.set_menu((h_exp.clone(), CapacityType::Od), vec![it(od_over_spot)]);
+    };
+    // Fixture-sanity (per solve.rs:2167-2173): compute e_od/e_spot
+    // from solve_full's all_candidates so a mis-tuned fixture (e.g.
+    // λ-skew creeping back in) fails LOUDLY here, not silently green.
+    let sla_tiers = actor.sla_tiers.clone();
+    let sla_ceilings = actor.sla_ceilings.clone();
+    let sla_config = actor.sla_config.clone();
+    let e_ratio = |hw: &crate::sla::hw::HwTable, cost: &CostTable| -> f64 {
+        let SolveFullResult::Feasible(m) = solve::solve_full(
+            &fit,
+            &sla_tiers,
+            hw,
+            cost,
+            &sla_ceilings,
+            &sla_config,
+            std::slice::from_ref(&h_exp),
+            &std::collections::HashSet::new(),
+            true,
+        ) else {
+            panic!("h_exp restricted solve must be feasible")
+        };
+        let e = |cap| {
+            m.all_candidates
+                .iter()
+                .find(|c| c.cell.1 == cap)
+                .unwrap_or_else(|| panic!("({h_exp},{cap:?}) candidate present"))
+                .e_cost_upper
+        };
+        e(CapacityType::Od) / e(CapacityType::Spot)
+    };
+
+    let state = actor.dag.node("d-schmitt").unwrap();
+
+    // ── poll 1: od/spot=1.14 ≤ τ_enter → 2 terms ({spot,od}) ─────────
+    set_ratio(&actor, 1.14);
+    let (hw, cost, g0) = actor.solve_inputs();
+    let r = e_ratio(&hw, &cost);
+    assert!(
+        r <= 1.0 + tau,
+        "fixture: e_od/e_spot={r:.4} ≤ τ_enter={:.3} (od IN fresh)",
+        1.0 + tau
+    );
+    assert_eq!(
+        actor
+            .solve_intent_for(state, &hw, &cost, g0)
+            .node_affinity
+            .len(),
+        2,
+        "poll 1: od/spot=1.14 ≤ τ_enter → restricted A'={{spot,od}} (h_exp pinned)"
+    );
+
+    // ── poll 2: od/spot=1.16 (deadband) → STILL 2 terms ──────────────
+    set_ratio(&actor, 1.16);
+    let (hw, cost, g1) = actor.solve_inputs();
+    assert_ne!(g1, g0, "menu price change → inputs_gen bump");
+    let r = e_ratio(&hw, &cost);
+    assert!(
+        r > 1.0 + tau && r <= 1.0 + 1.3 * tau,
+        "fixture: e_od/e_spot={r:.4} ∈ ({:.3}, {:.3}] deadband",
+        1.0 + tau,
+        1.0 + 1.3 * tau
+    );
+    assert_eq!(
+        actor
+            .solve_intent_for(state, &hw, &cost, g1)
+            .node_affinity
+            .len(),
+        2,
+        "poll 2: od/spot=1.16 in deadband; prev_a={{spot,od}} from poll 1 → \
+         od τ_stay=1.195 → 2 terms. bug_014 @ 4434b117: snapshot.rs passed \
+         prev_a=∅ → τ_enter=1.15 → 1.16>1.15 → 1 term."
+    );
+
+    // ── poll 3: od/spot=1.20 > τ_stay → 1 term ({spot}) ──────────────
+    set_ratio(&actor, 1.20);
+    let (hw, cost, g2) = actor.solve_inputs();
+    assert_ne!(g2, g1);
+    let r = e_ratio(&hw, &cost);
+    assert!(
+        r > 1.0 + 1.3 * tau,
+        "fixture: e_od/e_spot={r:.4} > τ_stay={:.3} (od OUT even via prev_a)",
+        1.0 + 1.3 * tau
+    );
+    assert_eq!(
+        actor
+            .solve_intent_for(state, &hw, &cost, g2)
+            .node_affinity
+            .len(),
+        1,
+        "poll 3: od/spot=1.20 > τ_stay → restricted A'={{spot}}"
+    );
+
+    // ── poll 4: od/spot=1.18 (deadband) → STILL 1 term ───────────────
+    set_ratio(&actor, 1.18);
+    let (hw, cost, g3) = actor.solve_inputs();
+    assert_ne!(g3, g2);
+    let r = e_ratio(&hw, &cost);
+    assert!(
+        r > 1.0 + tau && r <= 1.0 + 1.3 * tau,
+        "fixture: e_od/e_spot={r:.4} ∈ ({:.3}, {:.3}] deadband",
+        1.0 + tau,
+        1.0 + 1.3 * tau
+    );
+    assert_eq!(
+        actor
+            .solve_intent_for(state, &hw, &cost, g3)
+            .node_affinity
+            .len(),
+        1,
+        "poll 4: od/spot=1.18 in deadband; prev_a={{spot}} from poll 3 → od \
+         τ_enter=1.15 → 1 term. Broken-guard variant (`prev.pinned_explore \
+         != *pin` only) would skip poll-3's write → stale prev_a={{spot,od}} \
+         from poll 1 → od τ_stay=1.195 → 2 terms."
+    );
+}
+
 /// **R6B4 / bug_012** — `FittedParams.n_eff` was changed to the
 /// post-p̄-filter value (correct for `z_q`), but the dispatch gates at
 /// `snapshot.rs:778` + `solve.rs:413` still test `< 3.0` with
