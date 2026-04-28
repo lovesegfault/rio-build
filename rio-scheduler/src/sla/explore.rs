@@ -52,6 +52,26 @@ pub enum HExploreOutcome {
     Miss { next: Option<HwClassName> },
 }
 
+/// ε_h candidate pool (§Seventh-strike extraction). `0 < |A| < |H|`
+/// (normal mode) → `H\A`: cheapest may be ∈ pool when `cheapest ∉ A` —
+/// valid explore target since the unrestricted solve picks from A, not
+/// from `cheapest`. `|A| ∈ {0, |H|}` (degenerate fallback) →
+/// `H\{cheapest}`: cache-miss or A=H, where `H\A` would be H or ∅ and
+/// ε_h would re-select the price-dominant cell (ADR-023 L748).
+///
+/// The **else-branch pool is cheapest-independent** (stable under
+/// spot-price flap); the fallback-branch pool varies with `cheapest` —
+/// [`resolve_h_explore`]'s `h ∈ pool` prev-filter absorbs that as
+/// ≤1 redraw.
+pub fn h_explore_pool<'a>(
+    h_all: &'a [HwClassName],
+    in_a: &HashSet<HwClassName>,
+    cheapest: Option<&HwClassName>,
+) -> Vec<&'a HwClassName> {
+    let _ = (h_all, in_a, cheapest);
+    todo!("R8B0 red-first")
+}
+
 /// ε_h pin state transition (§Fifth-strike extraction). Draw seeded
 /// from `mkh ^ ovr` — `ovr = 0` common-case → seed = `mkh`;
 /// well-distributed; XOR collisions across distinct `(mkh, ovr)` only
@@ -277,6 +297,46 @@ mod tests {
 
     fn ctx<'a>(pool: &'a [&'a HwClassName], masked: &'a HashSet<Cell>) -> HExploreCtx<'a> {
         HExploreCtx { pool, masked }
+    }
+
+    /// **bug_003 falsification (R8B0)** — `h_explore_pool` is the ONE
+    /// constructor of `HExploreCtx.pool`; its semantics are the
+    /// doc-contract. Normal mode (`0<|A|<|H|`) is `H\A` — cheapest may
+    /// be ∈ pool when `cheapest ∉ A` (case 1). Fallback (`|A|∈{0,|H|}`)
+    /// is `H\{cheapest}` (cases 2+3). Pre-R8B0 the doc-contract claimed
+    /// `pool ⊆ h_all\in_a\{cheapest}` unconditionally; the caller's
+    /// else-branch built `H\A` — case 1's `{A,C,D}` ⊄ `{C,D}`.
+    #[test]
+    fn h_explore_pool_matches_doc() {
+        let h_all = [h("A"), h("B"), h("C"), h("D")];
+        let set = |hs: &[&HwClassName]| hs.iter().map(|h| (**h).clone()).collect::<HashSet<_>>();
+        // (1) normal mode, cheapest ∉ A: pool = H\A = {A,C,D}.
+        // bug_003: cheapest=A IS in the pool — the else-branch is
+        // cheapest-independent. Doc/spec must match this, not the
+        // other way round (exploring `cheapest ∉ A` is valid).
+        let in_a: HashSet<_> = [h("B")].into();
+        let pool = h_explore_pool(&h_all, &in_a, Some(&h("A")));
+        assert_eq!(
+            set(&pool),
+            [h("A"), h("C"), h("D")].into(),
+            "normal mode (0<|A|<|H|): pool = H\\A; cheapest ∉ A → \
+             cheapest ∈ pool (bug_003 — doc claimed ⊆ H\\A\\{{cheapest}})"
+        );
+        // (2) fallback, in_a=∅ (cache miss): pool = H\{cheapest}.
+        let pool = h_explore_pool(&h_all, &HashSet::new(), Some(&h("A")));
+        assert_eq!(
+            set(&pool),
+            [h("B"), h("C"), h("D")].into(),
+            "fallback (|A|=0): pool = H\\{{cheapest}}"
+        );
+        // (3) fallback, A=H: pool = H\{cheapest}.
+        let in_a: HashSet<_> = h_all.iter().cloned().collect();
+        let pool = h_explore_pool(&h_all, &in_a, Some(&h("A")));
+        assert_eq!(
+            set(&pool),
+            [h("B"), h("C"), h("D")].into(),
+            "fallback (A=H): pool = H\\{{cheapest}}"
+        );
     }
 
     fn feasible(cells: Vec<Cell>) -> SolveFullResult {
