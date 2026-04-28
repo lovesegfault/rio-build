@@ -166,12 +166,16 @@ async fn main() -> anyhow::Result<()> {
     // before cfg.sla is moved into DagActorConfig below.
     let sla_for_admin = std::sync::Arc::new(cfg.sla.clone());
     let cost_table = std::sync::Arc::new(parking_lot::RwLock::new(
-        rio_scheduler::sla::cost::CostTable::load(&SchedulerDb::new(pool.clone()), &sla_cluster)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "cost-table load failed; starting from seeds");
-                rio_scheduler::sla::cost::CostTable::seeded(&sla_cluster)
-            }),
+        rio_scheduler::sla::cost::CostTable::load(
+            &SchedulerDb::new(pool.clone()),
+            &sla_cluster,
+            hw_cost_source,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "cost-table load failed; starting from seeds");
+            rio_scheduler::sla::cost::CostTable::seeded(&sla_cluster, hw_cost_source)
+        }),
     ));
     // λ refresh + sweep + persist run regardless of `hw_cost_source`
     // (the controller appends `interrupt_samples` even under Static).
