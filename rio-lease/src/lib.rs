@@ -54,7 +54,28 @@ use kube::api::{Api, Patch, PatchParams};
 use tracing::{debug, info, warn};
 
 mod election;
-use election::{ElectionResult, LeaderElection};
+pub use election::{Decision, ElectionResult, LeaderElection, Observed, decide};
+
+/// Callbacks fired on lease acquire/lose transitions.
+///
+/// `run_lease_loop` calls these synchronously from the renewal tick.
+/// **They MUST NOT block** — a blocked hook stalls the renewal tick,
+/// the lease expires, and another replica acquires (dual-leader). Spawn
+/// a task if you need async work (e.g. notifying an actor channel).
+///
+/// Per-component metrics (`rio_{scheduler,controller}_lease_*_total`)
+/// are emitted from the hook impl, not from `run_lease_loop`, so each
+/// consumer names them per the `rio_{component}_` convention.
+pub trait LeaseHooks: Clone + Send + 'static {
+    /// Called once per standby→leader transition, AFTER
+    /// [`LeaderState::on_acquire`] has incremented generation and set
+    /// `is_leader=true`.
+    fn on_acquire(&self);
+    /// Called once per leader→standby transition (explicit lose OR local
+    /// self-fence), AFTER [`LeaderState::on_lose`] has cleared `is_leader`
+    /// and `recovery_complete`.
+    fn on_lose(&self);
+}
 
 /// Lease TTL. After this much time without renewal, another
 /// replica can acquire.
@@ -255,9 +276,10 @@ impl LeaderState {
         self.generation.fetch_max(target, Ordering::Release)
     }
 
-    /// Construct from pre-existing shared Arcs (test fixtures that need
-    /// to drive the flags from outside the lease loop).
-    #[cfg(test)]
+    /// Construct from pre-existing shared Arcs. Test fixtures that need
+    /// to drive the flags from outside the lease loop (e.g. rio-scheduler's
+    /// actor recovery tests). Not `#[cfg(test)]`: cross-crate test callers
+    /// compile this crate without `--cfg test`.
     pub fn from_parts(
         generation: Arc<AtomicU64>,
         is_leader: Arc<AtomicBool>,
@@ -367,13 +389,13 @@ impl LeaderState {
 /// which is exactly the desired behavior for "this replica's K8s
 /// connectivity is broken."
 ///
-/// `actor`: handle to fire-and-forget `LeaderAcquired`. Cloned
-/// into the task. No reply channel — recovery is the actor's
-/// concern, the lease loop only signals the transition.
-pub async fn run_lease_loop(
+/// `hooks`: per-component callbacks (metrics + actor notification).
+/// Called synchronously on the transition edge — see [`LeaseHooks`]
+/// for the non-blocking constraint.
+pub async fn run_lease_loop<H: LeaseHooks>(
     cfg: LeaseConfig,
     state: LeaderState,
-    actor: crate::actor::ActorHandle,
+    hooks: H,
     shutdown: rio_common::signal::Token,
 ) {
     // kube client from in-cluster config. If this fails (not in
@@ -480,13 +502,6 @@ pub async fn run_lease_loop(
                         holder = %cfg.holder_id,
                         "acquired leadership"
                     );
-                    // Counter for VM test observability: vm-phase3a's
-                    // lease smoke test polls this to confirm the
-                    // lease loop actually acquired (vs silently
-                    // failing kube-client init and running standby
-                    // forever). The info! log has the same signal
-                    // but metrics are less brittle for VM grep.
-                    metrics::counter!("rio_scheduler_lease_acquired_total").increment(1);
 
                     // r[impl sched.lease.deletion-cost]
                     // Annotate our own Pod with pod-deletion-cost=1.
@@ -507,34 +522,18 @@ pub async fn run_lease_loop(
                     );
 
                     // r[impl sched.lease.non-blocking-acquire]
-                    // Fire-and-forget LeaderAcquired. The actor
-                    // runs recovery then sets recovery_complete.
-                    // send_unchecked bypasses backpressure — this
-                    // is a control message, not work submission.
-                    // Spawn the send so we don't block the lease
-                    // loop on actor backpressure (shouldn't happen
-                    // — channel capacity is 10k — but defensive).
+                    // Fire the per-component on-acquire hook
+                    // (metrics + actor notification). The hook MUST
+                    // NOT block — see LeaseHooks doc.
                     //
-                    // NON-BLOCKING IS LOAD-BEARING: if we awaited
-                    // a reply from recovery, a slow recovery (>15s
-                    // for a large DAG) would stall the renewal
-                    // tick → lease expires → another replica
-                    // acquires → dual-leader. fire-and-forget +
-                    // separate recovery_complete flag lets the
-                    // loop keep renewing regardless.
-                    let actor_clone = actor.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = actor_clone
-                            .send_unchecked(crate::actor::ActorCommand::LeaderAcquired)
-                            .await
-                        {
-                            // Actor dead. We're holding the lease
-                            // but can't dispatch. Not much to do —
-                            // the process is probably crashing.
-                            tracing::error!(error = %e,
-                                "failed to send LeaderAcquired (actor dead?)");
-                        }
-                    });
+                    // NON-BLOCKING IS LOAD-BEARING: if a hook
+                    // awaited recovery, a slow recovery (>15s for a
+                    // large DAG) would stall the renewal tick →
+                    // lease expires → another replica acquires →
+                    // dual-leader. Hooks spawn; the separate
+                    // recovery_complete flag lets the loop keep
+                    // renewing regardless.
+                    hooks.on_acquire();
                 } else if !now_leading && was_leading {
                     // ---- Lose transition ----
                     // Someone else acquired (we couldn't renew in
@@ -548,28 +547,16 @@ pub async fn run_lease_loop(
                         holder = %cfg.holder_id,
                         "lost leadership (another replica acquired)"
                     );
-                    metrics::counter!("rio_scheduler_lease_lost_total").increment(1);
 
                     // r[impl sched.lease.standby-tick-noop]
-                    // Symmetric with LeaderAcquired above: tell the
-                    // actor to drop its stale builds/dag and zero
-                    // leader-only gauges. Same fire-and-forget spawn
-                    // pattern — lease loop MUST NOT block on actor
-                    // backpressure (channel capacity is 10k, but
-                    // defensive). is_leader is already false (above)
-                    // so handle_tick early-returns regardless; this
-                    // just stops the standby holding the prior DAG
-                    // in memory and exporting frozen gauges.
-                    let actor_clone = actor.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = actor_clone
-                            .send_unchecked(crate::actor::ActorCommand::LeaderLost)
-                            .await
-                        {
-                            tracing::error!(error = %e,
-                                "failed to send LeaderLost (actor dead?)");
-                        }
-                    });
+                    // Symmetric with on_acquire above: fire the
+                    // per-component on-lose hook (metrics + actor
+                    // notification). Same non-blocking constraint.
+                    // is_leader is already false (above) so the
+                    // consumer's tick early-returns regardless;
+                    // this just lets it drop stale state and zero
+                    // leader-only gauges.
+                    hooks.on_lose();
 
                     // Clear deletion cost — we're standby now, K8s
                     // should prefer to kill us over the new leader.
@@ -622,19 +609,9 @@ pub async fn run_lease_loop(
                     &mut owe_cost_clear,
                     last_successful_renew,
                 ) {
-                    // Self-fence is a lose-transition: same LeaderLost
-                    // notification as the explicit lose arm above.
-                    // Spawned for the same non-blocking-lease reason.
-                    let actor_clone = actor.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = actor_clone
-                            .send_unchecked(crate::actor::ActorCommand::LeaderLost)
-                            .await
-                        {
-                            tracing::error!(error = %e,
-                                "failed to send LeaderLost (actor dead?)");
-                        }
-                    });
+                    // Self-fence is a lose-transition: same on-lose
+                    // hook as the explicit lose arm above.
+                    hooks.on_lose();
                 }
             }
         }
@@ -691,7 +668,6 @@ fn maybe_self_fence(
             "LOCAL SELF-FENCE: no successful renew in > LEASE_TTL, stepping down locally"
         );
         state.on_lose();
-        metrics::counter!("rio_scheduler_lease_lost_total").increment(1);
         *was_leading = false;
         // No spawn_patch_deletion_cost here: can't reach apiserver.
         // Record the debt so the FIRST reachable round-trip in

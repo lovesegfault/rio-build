@@ -9,6 +9,7 @@
     "rio-controller": "rio-controller",
     "rio-crds": "rio-crds",
     "rio-gateway": "rio-gateway",
+    "rio-lease": "rio-lease",
     "rio-nix": "rio-nix",
     "rio-proto": "rio-proto",
     "rio-scheduler": "rio-scheduler",
@@ -21217,6 +21218,73 @@
         "Rio Contributors"
       ]
     },
+    "rio-lease": {
+      "crateName": "rio-lease",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "rio-lease"
+      },
+      "dependencies": [
+        {
+          "name": "k8s-openapi",
+          "packageId": "k8s-openapi"
+        },
+        {
+          "name": "kube",
+          "packageId": "kube"
+        },
+        {
+          "name": "parking_lot",
+          "packageId": "parking_lot"
+        },
+        {
+          "name": "rio-common",
+          "packageId": "rio-common"
+        },
+        {
+          "name": "rio-crds",
+          "packageId": "rio-crds"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        },
+        {
+          "name": "uuid",
+          "packageId": "uuid"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
+        }
+      ],
+      "devDependencies": [
+        {
+          "name": "figment",
+          "packageId": "figment"
+        },
+        {
+          "name": "http",
+          "packageId": "http 1.4.0"
+        },
+        {
+          "name": "rio-test-support",
+          "packageId": "rio-test-support"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
     "rio-nix": {
       "crateName": "rio-nix",
       "version": "0.1.0",
@@ -21516,6 +21584,10 @@
         {
           "name": "rio-crds",
           "packageId": "rio-crds"
+        },
+        {
+          "name": "rio-lease",
+          "packageId": "rio-lease"
         },
         {
           "name": "rio-nix",

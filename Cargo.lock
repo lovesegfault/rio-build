@@ -6663,6 +6663,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "rio-lease"
+version = "0.1.0"
+dependencies = [
+ "figment",
+ "http 1.4.0",
+ "k8s-openapi",
+ "kube",
+ "parking_lot",
+ "rio-common",
+ "rio-crds",
+ "rio-test-support",
+ "tokio",
+ "tracing",
+ "uuid",
+ "workspace-hack",
+]
+
+[[package]]
 name = "rio-nix"
 version = "0.1.0"
 dependencies = [
@@ -6745,6 +6763,7 @@ dependencies = [
  "rio-auth",
  "rio-common",
  "rio-crds",
+ "rio-lease",
  "rio-nix",
  "rio-proto",
  "rio-store",

@@ -5,6 +5,7 @@ members = [
   "rio-common",
   "rio-controller",
   "rio-gateway",
+  "rio-lease",
   "rio-nix",
   "rio-proto",
   "rio-scheduler",
@@ -38,6 +39,7 @@ rio-scheduler = { path = "rio-scheduler" }
 rio-store = { path = "rio-store", default-features = false }
 rio-test-support = { path = "rio-test-support" }
 rio-crds = { path = "rio-crds" }
+rio-lease = { path = "rio-lease" }
 
 # Byte buffers
 bytes = "1"

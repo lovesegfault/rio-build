@@ -68,6 +68,7 @@ specs (
           rio-builder/src/**/*.rs
           rio-controller/src/**/*.rs
           rio-crds/src/**/*.rs
+          rio-lease/src/**/*.rs
           rio-nix/src/**/*.rs
           rio-proto/src/**/*.rs
           rio-common/src/**/*.rs

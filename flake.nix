@@ -232,6 +232,7 @@
             rio-controller = ./rio-controller;
             rio-crds = ./rio-crds;
             rio-gateway = ./rio-gateway;
+            rio-lease = ./rio-lease;
             rio-nix = pkgs.lib.fileset.unions [
               ./rio-nix/src
               ./rio-nix/Cargo.toml

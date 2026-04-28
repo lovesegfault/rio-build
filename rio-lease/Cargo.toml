@@ -1,0 +1,40 @@
+[package]
+name = "rio-lease"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Kubernetes Lease-based leader election for rio-build components"
+
+# Extracted from rio-scheduler/src/lease/ so the controller (ADR-023 B6)
+# can reuse the same election + LeaderState machinery. Scheduler-specific
+# wiring (ActorCommand::LeaderAcquired/Lost, rio_scheduler_* metrics)
+# stays in rio-scheduler via the `LeaseHooks` callback trait.
+
+[dependencies]
+# coordination.k8s.io/v1 Lease + Pod (deletion-cost annotation patch).
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+# KubeErrorExt::is_conflict for the election 409 branches.
+rio-crds = { workspace = true }
+# rio_common::signal::Token (CancellationToken alias) for the loop's
+# shutdown gate.
+rio-common = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+# `became_leader_at` RwLock<Option<Instant>> — Instant is 16B, not atomic.
+parking_lot = { workspace = true }
+# HOSTNAME-unset fallback in LeaseConfig::from_parts.
+uuid = { workspace = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+# ApiServerVerifier mock for the I/O-shell + hung-apiserver tests.
+rio-test-support = { workspace = true }
+# from_parts_reads_all_three uses figment::Jail to serialize HOSTNAME
+# env mutation across parallel tests.
+figment = { workspace = true }
+# election.rs mock-apiserver scenarios need http::Method.
+http = { workspace = true }

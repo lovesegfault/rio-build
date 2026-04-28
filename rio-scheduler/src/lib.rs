@@ -28,7 +28,9 @@ pub mod db;
 pub(crate) mod domain;
 pub mod event_log;
 pub mod grpc;
-pub mod lease;
+/// Re-export so existing `crate::lease::{LeaderState, LeaseConfig,
+/// run_lease_loop}` paths keep working after the B1 extraction.
+pub use rio_lease as lease;
 pub mod logs;
 pub(crate) mod queue;
 pub mod sla;

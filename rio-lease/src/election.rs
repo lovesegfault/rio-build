@@ -39,7 +39,7 @@ use tracing::debug;
 
 /// Result of one `try_acquire_or_renew()` call.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum ElectionResult {
+pub enum ElectionResult {
     /// We hold the lease (acquired or renewed this tick).
     Leading,
     /// Someone else holds it and our observed-record clock hasn't
@@ -62,7 +62,7 @@ pub(super) enum ElectionResult {
 
 /// What `decide()` wants the I/O shell to do next.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum Decision {
+pub enum Decision {
     /// We're the current holder — update `renew_time` only.
     Renew,
     /// Holder is stale or absent — take over. Sets `acquire_time`,
@@ -84,7 +84,7 @@ pub(super) enum Decision {
 /// unchanged — a standby watching only those would see a live
 /// leader as frozen and steal it after ttl.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Observed {
+pub struct Observed {
     resource_version: String,
     at: Instant,
 }
@@ -100,7 +100,7 @@ pub(super) struct Observed {
 /// than as `&Lease` because the caller already has both and we
 /// don't want decide() coupled to the full k8s type (simpler
 /// table tests).
-pub(super) fn decide(
+pub fn decide(
     holder: Option<&str>,
     resource_version: &str,
     observed: &mut Option<Observed>,
@@ -153,7 +153,7 @@ pub(super) fn decide(
     }
 }
 
-pub(super) struct LeaderElection {
+pub struct LeaderElection {
     api: Api<Lease>,
     lease_name: String,
     holder_id: String,
@@ -162,7 +162,7 @@ pub(super) struct LeaderElection {
 }
 
 impl LeaderElection {
-    pub(super) fn new(
+    pub fn new(
         client: kube::Client,
         namespace: &str,
         lease_name: String,
@@ -185,7 +185,7 @@ impl LeaderElection {
     /// handled internally — they're expected racing outcomes, not
     /// errors. The caller retries on `Err` without flipping
     /// `is_leader`; see `run_lease_loop`'s error arm.
-    pub(super) async fn try_acquire_or_renew(&mut self) -> Result<ElectionResult, kube::Error> {
+    pub async fn try_acquire_or_renew(&mut self) -> Result<ElectionResult, kube::Error> {
         // 1. GET. 404 → create and done.
         let lease = match self.api.get_opt(&self.lease_name).await? {
             Some(l) => l,
@@ -228,7 +228,7 @@ impl LeaderElection {
     /// 409 on the replace() → someone already stole it → we're
     /// already not the leader → success from our perspective.
     /// Only propagates if the GET itself fails.
-    pub(super) async fn step_down(&self) -> Result<(), kube::Error> {
+    pub async fn step_down(&self) -> Result<(), kube::Error> {
         let Some(mut lease) = self.api.get_opt(&self.lease_name).await? else {
             return Ok(());
         };
