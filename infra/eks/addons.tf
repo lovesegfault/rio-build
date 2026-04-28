@@ -71,7 +71,21 @@ resource "helm_release" "cilium" {
       # mode (ipam.mode=eni) is IPv4-ONLY per upstream docs; this
       # cluster is ip_family=ipv6 (immutable), so ENI mode is not an
       # option. Overlay encap is kernel-level Geneve — not a userspace
-      # proxy hop. MTU auto-derived from node ENI (9001 → ~8871 pod).
+      # proxy hop.
+      #
+      # MTU is pinned, NOT auto-derived. With routingMode=tunnel +
+      # encryption.type=wireguard, cilium auto-detect subtracts wg
+      # overhead for cilium_wg0 but does NOT subtract it for
+      # cilium_geneve/cilium_host — geneve ends up larger than wg0 and
+      # every full-size pod packet drops at wg0 egress (IPv6 no-frag).
+      # ss signature on rio-store: cwnd:2 ssthresh:2, 15-20%
+      # bytes_retrans, rehash in the hundreds → ~1 MB/s GetPath. Pinning
+      # to (ENI MTU − wg overhead) makes cilium derive geneve/host/route
+      # from a value that already fits through wg0. 8921 = 9001 − 80:
+      # REQUIRES every Karpenter node on the MTUBytes=9001 AMI
+      # (eks-node.nix linkConfig). Rolling cilium with this value while
+      # any node's ENI is still 1500 black-holes that node.
+      MTU = 8921
       ipam = {
         mode = "cluster-pool"
         operator = {

@@ -234,7 +234,21 @@ in
           IPv6DuplicateAddressDetection = 0;
         };
         # Cluster is ip_family=ipv6. Do NOT use RequiredFamilyForOnline=ipv4.
-        linkConfig.RequiredForOnline = "routable";
+        linkConfig = {
+          RequiredForOnline = "routable";
+          # AWS VPC supports 9001-byte jumbo end-to-end; AL2023 picks this
+          # up via DHCPv4 option 26, but on ipv6_native subnets there is
+          # no DHCPv4 lease and the VPC RA MTU option does not reliably
+          # apply before cilium-agent's auto-detect runs. Without this the
+          # ENI stays at 1500 → cilium derives cilium_wg0=1420 but leaves
+          # cilium_geneve=cilium_host=1500 → every full-size pod packet is
+          # dropped at wg0 egress → TCP cwnd:2 → ~1 MB/s GetPath ceiling
+          # (misdiagnosed twice as h2-level: c987e564, 43714578). The
+          # explicit cilium MTU in addons.tf is the structural fix for the
+          # geneve>wg0 inversion; this brings the underlay to jumbo so the
+          # eventual pod-MTU bump has headroom.
+          MTUBytes = 9001;
+        };
         dhcpV4Config.UseRoutes = true;
         dhcpV6Config = {
           UseDelegatedPrefix = false;

@@ -170,6 +170,13 @@ pkgs.runCommand "cilium-rendered"
       --set routingMode=tunnel \
       --set tunnelProtocol=geneve \
       --set underlayProtocol=ipv6 \
+      `# geneve+wireguard: auto-detect leaves cilium_geneve at native` \
+      `# MTU but cilium_wg0 at native-80 → full-size pod packets drop` \
+      `# at wg0 egress. Pin to native-80 so geneve/host derive from a` \
+      `# value that fits through wg0. addons.tf uses 8921 (jumbo); the` \
+      `# test-driver vlan is vde_switch with a 1514-byte frame cap, so` \
+      `# eth1 stays at 1500 and this is 1500-80.` \
+      --set MTU=1420 \
       > all.yaml
 
     yq 'select(${split.kindIs split.rbacKinds})' all.yaml > $out/01-cilium-rbac.yaml
