@@ -1763,3 +1763,133 @@ async fn contract_interrupt_runaway_reachable() {
          is the wrong label for 'spot λ-gated'). Got {m:?}"
     );
 }
+
+/// **R19B0 / bug_001** — `compute_spawn_intents` output order is
+/// deterministic across `(ready, priority)` ties. The outer
+/// `sort_unstable_by` at snapshot.rs:~505 keys on `(ready, prio)` only;
+/// equal-prio intents (sourced from HashMap-order `dag.iter_nodes()`)
+/// fall through to `Equal` and `sort_unstable_by` does NOT preserve
+/// input order on ties → two scheduler replicas (or one across a
+/// restart) emit the same drvs in DIFFERENT order → controller's
+/// `.take(headroom)` truncates a different subset. Separately, the
+/// forecast pass's bug_025 `(prio, c*, hash)` key is destroyed by the
+/// re-sort. REVIEW.md §HashMap-iteration: tiebreak `(cores desc,
+/// intent_id asc)`.
+///
+/// TWO-ACTOR pattern (mirrors
+/// [`contract_pinned_explore_first_writer_independent`]): NOT
+/// same-actor re-insert — `dag.nodes` is std HashMap with per-process
+/// RandomState, so re-inserting the same keys on ONE actor lands in
+/// the same buckets → same iter order → vacuous. Two actors = two
+/// RandomStates = the real nondeterminism axis.
+#[tokio::test]
+async fn contract_spawn_intents_order_deterministic_across_ties() {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // Per-pname forced_cores so each drv solves to a DISTINCT `cores`
+    // (override path → hw-agnostic `intent_for`; deterministic, no
+    // ε_h). All at `priority=5.0` → the old `(ready, prio)` key
+    // returns Equal for every pair within a `ready` partition.
+    let overrides = [
+        ("p32", 32.0),
+        ("p16", 16.0),
+        ("p04", 4.0),
+        ("p08", 8.0),
+        ("p02", 2.0),
+    ]
+    .into_iter()
+    .map(|(pn, c)| crate::db::SlaOverrideRow {
+        pname: pn.into(),
+        cores: Some(c),
+        ..Default::default()
+    })
+    .collect::<Vec<_>>();
+
+    let build = || {
+        use crate::sla::config::CapacityType;
+        let mut sla = test_sla_config();
+        sla.lead_time_seed
+            .insert(("intel-7".into(), CapacityType::Spot), 200.0);
+        sla.max_forecast_cores_per_tenant = 2_000;
+        let mut actor = bare_actor_cfg(
+            db.pool.clone(),
+            DagActorConfig {
+                sla,
+                ..Default::default()
+            },
+        );
+        actor.sla_estimator.seed_overrides(overrides.clone());
+        // 3 Ready, all priority=5.0, cores={32,4,16}. Hash strings
+        // chosen so `intent_id asc` ≠ `cores desc` (proves the
+        // tiebreak is cores-first, not just intent_id).
+        for (h, pn) in [("r-a", "p32"), ("r-b", "p04"), ("r-c", "p16")] {
+            actor.test_inject_ready(h, Some(pn), "x86_64-linux", false);
+            actor.test_set_priority(h, 5.0);
+        }
+        // 2 forecast (Queued, dep on Running with eta≈30s <
+        // max_lead=200), priority=5.0, cores={8,2}.
+        actor.test_inject_at("dep", "x86_64-linux", DerivationStatus::Running);
+        actor.test_set_running_eta("dep", 100.0, 70, 8);
+        for (h, pn) in [("f-a", "p08"), ("f-b", "p02")] {
+            actor.test_inject_ready(h, Some(pn), "x86_64-linux", false);
+            actor
+                .dag
+                .node_mut(h)
+                .unwrap()
+                .set_status_for_test(DerivationStatus::Queued);
+            actor.test_inject_edge(h, "dep");
+            actor.test_set_priority(h, 5.0);
+        }
+        actor
+    };
+
+    let order = |actor: &DagActor| -> Vec<(String, bool, u32)> {
+        actor
+            .compute_spawn_intents(&Default::default())
+            .intents
+            .into_iter()
+            .map(|i| (i.intent_id, i.ready.unwrap_or(true), i.cores))
+            .collect()
+    };
+
+    let a = order(&build());
+    let b = order(&build());
+
+    // (a) determinism: two independent actors (own RandomState each)
+    // emit identical intent_id order. At ad5d288e: tied-prio Ready
+    // entries iter differently across the two HashMaps → fails.
+    assert_eq!(
+        a, b,
+        "two actors, identical drv set, all priority=5.0 → output \
+         order MUST be identical. Pre-R19B0 the outer sort has no \
+         tiebreak past (ready, prio) → HashMap order leaks → \
+         a={a:?} b={b:?}"
+    );
+
+    // (b) within ready=false: forecast pass's `(prio, c*, hash)` key
+    // survives the outer re-sort → cores desc.
+    let forecast: Vec<_> = a.iter().filter(|(_, r, _)| !r).collect();
+    assert_eq!(
+        forecast.iter().map(|(_, _, c)| *c).collect::<Vec<_>>(),
+        vec![8, 2],
+        "forecast partition: cores desc (bug_025 key preserved); got {forecast:?}"
+    );
+
+    // (c) within ready=true: cores desc, intent_id asc.
+    let ready: Vec<_> = a.iter().filter(|(_, r, _)| *r).collect();
+    assert_eq!(
+        ready
+            .iter()
+            .map(|(id, _, c)| (id.as_str(), *c))
+            .collect::<Vec<_>>(),
+        vec![("r-a", 32), ("r-c", 16), ("r-b", 4)],
+        "Ready partition: cores desc (r-a=32, r-c=16, r-b=4); got {ready:?}"
+    );
+
+    // Ready before forecast (the existing `ready desc` head key).
+    assert!(
+        a.iter().position(|(_, r, _)| !r).unwrap_or(a.len())
+            > a.iter().rposition(|(_, r, _)| *r).unwrap_or(0),
+        "all Ready intents precede all forecast intents; got {a:?}"
+    );
+}
