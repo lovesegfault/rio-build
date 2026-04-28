@@ -100,6 +100,7 @@ spec:
   tags:
     karpenter.sh/discovery: {{ $k.clusterName }}
 {{- end }}
+{{- if not $k.nodeclaimPool.enabled }}
 {{- /* ADR-023 phase-13: 12 builder NodePools = band × storage × arch.
        Each carries rio.build/hw-band + rio.build/storage labels and an
        instance-generation In [...] requirement; each admits both spot
@@ -177,6 +178,38 @@ spec:
     consolidateAfter: 10m
 {{- end }}
 {{- end }}
+{{- end }}
+{{- else }}
+---
+# §13b shim — Karpenter sees this NodePool, never provisions from it
+# (cpu:0). rio-controller's `nodeclaim_pool` reconciler creates
+# NodeClaims directly with `karpenter.sh/nodepool: rio-nodeclaim-shim`.
+# Replaces the 12 band×storage×arch pools when `nodeclaimPool.enabled`.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: rio-nodeclaim-shim
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: rio-default
+      requirements:
+        - key: kubernetes.io/os
+          operator: In
+          values: [linux]
+      expireAfter: Never
+  limits:
+    cpu: "0"
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: Never
+    budgets:
+      - nodes: "0"
 {{- end }}
 {{- range $k.nodePools }}
 ---

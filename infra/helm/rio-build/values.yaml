@@ -556,6 +556,13 @@ gateway:
 # tofu outputs.
 karpenter:
   enabled: false
+  # §13b Part-B mode. When true: band×storage×arch builder NodePools
+  # replaced by single `rio-nodeclaim-shim`; rio-controller provisions
+  # NodeClaims directly. **Set true only after B12 lands** (jobs.rs
+  # `placeable`-gate). Breaks `xtask k8s probe-boot` (resolver reads
+  # the 12 pools).
+  nodeclaimPool:
+    enabled: false
   clusterName: ""   # from tofu output cluster_name
   nodeRoleName: ""  # from tofu output karpenter_node_role_name
   # ADR-021: NixOS node AMI (full cutover — no Bottlerocket). The
