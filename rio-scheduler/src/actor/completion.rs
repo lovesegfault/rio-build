@@ -1616,8 +1616,8 @@ impl DagActor {
                         // the true curve and inflates the fitted serial
                         // fraction, so record `min(assigned, cgroup)`.
                         // Fallback to whichever is present when one is
-                        // missing (recovery / Static-mode → no intent;
-                        // old executor → no cgroup).
+                        // missing (recovery → no intent; old executor →
+                        // no cgroup).
                         cpu_limit_cores: {
                             let assigned =
                                 state.sched.last_intent.as_ref().map(|i| f64::from(i.cores));

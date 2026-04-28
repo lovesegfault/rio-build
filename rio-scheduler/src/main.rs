@@ -157,8 +157,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ADR-023 phase-13: hw-band cost table. PG-backed (sla_ema_state)
     // so a restart doesn't re-warm; lease-gated poller below keeps it
-    // fresh on the leader. With `[sla].hw_cost_source` unset the
-    // default seeds are used and the poller only runs the λ refresh.
+    // fresh on the leader.
     let hw_cost_source = cfg.sla.hw_cost_source;
     let sla_cluster = cfg.sla.cluster.clone();
     // r[sched.sla.threat.corpus-clamp+2]: AdminServiceImpl needs the
@@ -196,12 +195,9 @@ async fn main() -> anyhow::Result<()> {
         ),
     );
     // Spot-price poller (and the staleness gauge / clamp it owns) are
-    // Spot-only — under Static/None there is no live source to be
-    // "stale relative to".
-    if matches!(
-        hw_cost_source,
-        Some(rio_scheduler::sla::cost::HwCostSource::Spot)
-    ) {
+    // Spot-only — under Static there is no live source to be "stale
+    // relative to".
+    if matches!(hw_cost_source, rio_scheduler::sla::cost::HwCostSource::Spot) {
         rio_common::task::spawn_monitored(
             "sla-cost-poller",
             rio_scheduler::sla::cost::spot_price_poller(

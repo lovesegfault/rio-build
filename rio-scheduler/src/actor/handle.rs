@@ -43,7 +43,7 @@ pub struct DebugExecutorInfo {
     pub draining: bool,
     pub store_degraded: bool,
     /// `r[sec.executor.identity-token]`: HMAC-attested SpawnIntent id
-    /// the executor is bound to. `None` for static-mode pods or after
+    /// the executor is bound to. `None` for hw-agnostic pods or after
     /// the not-Ready→None downgrade. Exposed for the heartbeat-spoof
     /// guard's regression test.
     pub intent_id: Option<String>,

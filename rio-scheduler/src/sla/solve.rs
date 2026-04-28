@@ -116,7 +116,7 @@ impl SolveResult {
 /// ADR-023 §Observability splits the legacy `ceiling_exhausted` reason
 /// into the four specific ceilings + `interrupt_runaway` so the alert
 /// names which dimension is binding. [`classify_ceiling`] computes the
-/// split for the [`solve_mvp`] BestEffort fallthrough.
+/// split for the [`solve_tier`] BestEffort fallthrough.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InfeasibleReason {
     /// `S ≥ bound` at the loosest tier — even infinite cores can't help.
@@ -170,8 +170,8 @@ impl InfeasibleReason {
 }
 
 /// Which of the four ceiling reasons bound at the loosest bounded tier
-/// when [`solve_mvp`] / [`solve_full`] fell through to `BestEffort`.
-/// Mirrors `solve_mvp`'s per-tier reject gates so the metric label
+/// when [`solve_tier`] / [`solve_full`] fell through to `BestEffort`.
+/// Mirrors `solve_tier`'s per-tier reject gates so the metric label
 /// matches what `sla explain` shows. `InterruptRunaway` /
 /// `CapacityExhausted` are gated separately by callers (those need λ /
 /// ICE state this fn doesn't see).
@@ -181,7 +181,7 @@ pub fn classify_ceiling(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> 
     if fit.disk_p90.is_some_and(|d| d.0 > ceil.max_disk) {
         return InfeasibleReason::DiskCeiling;
     }
-    // Loosest bounded tier — the last one solve_mvp's reject-not-clamp
+    // Loosest bounded tier — the last one solve_tier's reject-not-clamp
     // loop tried. `unreachable` arm: callers gate on ≥1 bounded tier.
     let Some(tier) = tiers.iter().rev().find(|t| t.binding_bound().is_some()) else {
         return InfeasibleReason::CoreCeiling;
@@ -193,7 +193,7 @@ pub fn classify_ceiling(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> 
             InfeasibleReason::MemCeiling
         }
         // Envelope feasible AND mem under ceiling at the loosest tier
-        // yet solve_mvp returned BestEffort — only reachable if a
+        // yet solve_tier returned BestEffort — only reachable if a
         // tighter tier's feasible c* tripped mem and the loosest one
         // didn't (shouldn't happen with tiers sorted tight→loose).
         (Some(_), _) => InfeasibleReason::CoreCeiling,
@@ -309,7 +309,7 @@ pub struct DrvHints {
 }
 
 /// Per-derivation `(cores, mem, disk)` for a [`SpawnIntent`]. Wraps
-/// [`solve_mvp`] with the cold-start / drv-hint branching that the
+/// [`solve_tier`] with the cold-start / drv-hint branching that the
 /// snapshot path and dispatch's resource-fit filter both need, so the
 /// two cannot diverge.
 ///
@@ -319,7 +319,7 @@ pub struct DrvHints {
 ///   mem/disk still come from the per-key fit when available).
 /// - No fit / `n_eff < 3` / `span < 4 ∧ !frozen` → [`explore::next`]
 ///   drives the saturation-gated ×4/÷2 ladder from `cfg.probe`.
-/// - Otherwise → `solve_mvp` against `tiers` / `ceil`.
+/// - Otherwise → `solve_tier` against `tiers` / `ceil`.
 ///
 /// Cores are `ceil`-ed to a whole-core `u32` (k8s `resources.requests`
 /// granularity); mem/disk are byte-exact (controller rounds at the pod
@@ -342,7 +342,7 @@ pub fn intent_for(
     ceil: &Ceilings,
 ) -> IntentDecision {
     // Feature-aware probe + headroom-scaled mem hoisted ONCE so every
-    // early-return branch reads the same definitions as `solve_mvp` /
+    // early-return branch reads the same definitions as `solve_tier` /
     // `solve_full` / `explore::next`. Before, the forced_cores /
     // serial branches read `f.mem.at(c)` raw (no `× headroom(n_eff)` —
     // breaking r[sched.sla.headroom-confidence-scaled]) and `probe_mem`
@@ -448,7 +448,7 @@ pub fn intent_for(
         }
         None => tiers,
     };
-    let r = solve_mvp(fit, tiers, ceil);
+    let r = solve_tier(fit, tiers, ceil);
     // Infeasible-at-any-tier — the operator-facing alerting hook
     // (observability.md). Gated on "≥1 tier had bounds": a pure
     // best-effort ladder (`tiers=[{p*:None}]`) or an empty ladder
@@ -462,7 +462,7 @@ pub fn intent_for(
             .iter()
             .any(|t| t.p50.is_some() || t.p90.is_some() || t.p99.is_some()))
     .then(|| classify_ceiling(fit, tiers, ceil));
-    // ceil + clamp ≥1: solve_mvp's c_star is already ≥1.0 but
+    // ceil + clamp ≥1: solve_tier's c_star is already ≥1.0 but
     // BestEffort.c can be fractional below 1 for degenerate fits.
     let cores = (r.cores().0.ceil() as u32).max(1);
     let mem = forced_mem.unwrap_or(r.mem().0);
@@ -478,7 +478,7 @@ pub fn intent_for(
 /// `mem`/`disk` are both `u64` — swap-silent across the ~16 callers.
 ///
 /// `infeasible = Some(reason)` iff execution reached the post-
-/// `solve_mvp` BestEffort fallthrough with ≥1 bounded tier — i.e. the
+/// `solve_tier` BestEffort fallthrough with ≥1 bounded tier — i.e. the
 /// hw-agnostic path's `_infeasible_total{reason}` would fire. Every
 /// hints/override/explore early-return yields `None`. The caller owns
 /// debounce + `.emit()`; `intent_for` is pure (R7B1 / bug 035).
@@ -516,7 +516,7 @@ pub fn solve_envelope(
         .collect();
     if bounds.is_empty() {
         // No-bounds tier: max useful cores. Returning `c_lo` (=1 in
-        // `solve_mvp`) made the post-loop `BestEffort` arm unreachable
+        // `solve_tier`) made the post-loop `BestEffort` arm unreachable
         // under helm-default `tiers=[..., {best-effort}]` and dispatched
         // chromium-class builds at 1 core → 24h-deadline-loop.
         return Some(RawCores(cap_c));
@@ -568,7 +568,7 @@ pub fn solve_envelope(
 
 /// [`solve_envelope`] wrapper for [`super::explain::explain`]: returns
 /// `(c_star, reason)` where `reason` is a `binding_constraint` string.
-/// Mirrors `solve_mvp`'s per-tier outcome so the explain table can't
+/// Mirrors `solve_tier`'s per-tier outcome so the explain table can't
 /// drift from what dispatch actually did.
 ///
 /// `(Some(c), "-")` → feasible at `c`; `(Some(cap_c), "no-bounds")` →
@@ -590,7 +590,7 @@ pub fn explain_envelope(
             // Distinguish "serial floor breaches the bound" from the
             // general "envelope rejected at cap_c" so `sla explain`
             // points the operator at S vs the tier targets. S is
-            // hw_factor=1 / lambda=0 here (matches solve_mvp).
+            // hw_factor=1 / lambda=0 here (matches solve_tier).
             let (s, _, _) = fit.fit.spq();
             if tier.binding_bound().is_some_and(|b| s >= b) {
                 (None, "serial-floor")
@@ -603,10 +603,10 @@ pub fn explain_envelope(
 
 // r[impl sched.sla.solve-citardauq]
 // r[impl sched.sla.solve-reject-not-clamp]
-pub fn solve_mvp(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> SolveResult {
+pub fn solve_tier(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> SolveResult {
     debug_assert!(
         !matches!(fit.fit, DurationFit::Probe),
-        "solve_mvp called with DurationFit::Probe — gate must filter"
+        "solve_tier called with DurationFit::Probe — gate must filter"
     );
     let cap_c = fit.fit.p_bar().0.min(fit.fit.c_opt().0).min(ceil.max_cores);
     let h = headroom(fit.n_eff_ring);
@@ -636,13 +636,13 @@ pub fn solve_mvp(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> SolveRe
     }
     // Pure: callers emit `rio_scheduler_sla_infeasible_total{reason=…}`
     // at the sizing decision-point — same convention as `best_effort`'s
-    // doc below. `solve_mvp` is also called for tier-NAME lookup
+    // doc below. `solve_tier` is also called for tier-NAME lookup
     // (`solve_intent_for`'s predicted block) where the metric must not
     // fire; emitting here double-counted infeasible drvs.
     best_effort(fit, cap_c, h, disk, ceil)
 }
 
-/// `BestEffort` constructor shared by [`solve_mvp`] / [`solve_full`]:
+/// `BestEffort` constructor shared by [`solve_tier`] / [`solve_full`]:
 /// returns the clamped fallback shape. Callers emit the appropriate
 /// `rio_scheduler_sla_infeasible_total{reason=…}` (ceiling vs capacity)
 /// before calling — the gate differs between mvp/full.
@@ -1468,7 +1468,7 @@ mod tests {
     fn envelope_degenerates_to_amdahl_at_q0() {
         let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
         let SolveResult::Feasible { c_star, tier, .. } =
-            solve_mvp(&fit, &[t("t0", 300.0)], &ceil())
+            solve_tier(&fit, &[t("t0", 300.0)], &ceil())
         else {
             panic!()
         };
@@ -1481,7 +1481,7 @@ mod tests {
         // r[verify sched.sla.solve-reject-not-clamp]
         let fit = mk_fit(30.0, 100.0, 0.0, 4.0, 0.1); // p̄=4 caps it
         let SolveResult::Feasible { tier, .. } =
-            solve_mvp(&fit, &[t("t0", 60.0), t("t1", 600.0)], &ceil())
+            solve_tier(&fit, &[t("t0", 60.0), t("t1", 600.0)], &ceil())
         else {
             panic!()
         };
@@ -1493,7 +1493,7 @@ mod tests {
         // at cap_c=min(p̄,c_opt,max_cores)=20, NOT min(p̄,max_cores)=64
         // (T(20)≈230s vs T(64)≈381s — past c_opt is slower AND wider).
         let fit = mk_fit(30.0, 2000.0, 5.0, f64::INFINITY, 0.1);
-        let SolveResult::BestEffort { c, .. } = solve_mvp(&fit, &[t("t0", 50.0)], &ceil()) else {
+        let SolveResult::BestEffort { c, .. } = solve_tier(&fit, &[t("t0", 50.0)], &ceil()) else {
             panic!()
         };
         assert_eq!(c.0, 20.0, "BestEffort caps at c_opt, not max_cores");
@@ -1505,7 +1505,7 @@ mod tests {
         // ephemeral-storage request → permanently-Pending pod.
         let mut fit = mk_fit(400.0, 100.0, 0.0, f64::INFINITY, 0.1);
         fit.disk_p90 = Some(DiskBytes(300 << 30)); // > ceil.max_disk=200Gi
-        let SolveResult::BestEffort { disk, .. } = solve_mvp(&fit, &[t("t0", 300.0)], &ceil())
+        let SolveResult::BestEffort { disk, .. } = solve_tier(&fit, &[t("t0", 300.0)], &ceil())
         else {
             panic!()
         };
@@ -1632,7 +1632,7 @@ mod tests {
         // S=400 > target → infeasible
         let fit = mk_fit(400.0, 100.0, 0.0, f64::INFINITY, 0.1);
         assert!(matches!(
-            solve_mvp(&fit, &[t("t0", 300.0)], &ceil()),
+            solve_tier(&fit, &[t("t0", 300.0)], &ceil()),
             SolveResult::BestEffort { .. }
         ));
     }
@@ -1751,7 +1751,7 @@ mod tests {
     #[test]
     fn intent_for_probe_fit_frozen_at_floor_routes_to_explore() {
         // n_eff≥3 ∧ span<4 ∧ frozen (via min_c<=1 wall clause): the
-        // gate used to admit this Probe fit to solve_mvp → t_at=∞ →
+        // gate used to admit this Probe fit to solve_tier → t_at=∞ →
         // cap_c=max_cores=64. The explore arm correctly returns
         // st.max_c=2 when frozen.
         let mut f = mk_fit(0.0, 0.0, 0.0, f64::INFINITY, 0.2);
@@ -1819,7 +1819,7 @@ mod tests {
     fn intent_for_serial_applies_headroom_on_coupled_fit() {
         // MemFit::Coupled.at() is the regression line (~p50), NOT a
         // quantile. The serial early-return must scale by
-        // headroom(n_eff) just like solve_mvp does. Regression: it
+        // headroom(n_eff) just like solve_tier does. Regression: it
         // returned the raw fit → under-provision → OOM.
         let mut fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
         fit.mem = MemFit::Coupled {
@@ -2075,7 +2075,7 @@ mod tests {
         // Schmitt: a cell at e=1.18·e_min is OUT fresh (τ=0.15) but IN
         // when prev_a contains it (τ_exit=0.195). Construct such a
         // cell via a price bump on intel-6.
-        let mut cost = CostTable::default();
+        let mut cost = CostTable::seeded("", super::super::cost::HwCostSource::Spot);
         cost.set_price(
             "intel-6",
             CapacityType::Spot,
@@ -2138,7 +2138,7 @@ mod tests {
         // e_cost ratio ≈ 2.16. Price intel-6 at 0.545× to land at
         // ≈1.17·e_min (mid-band). intel-8 stays at seed → e_min.
         let seed = super::super::cost::ON_DEMAND_SEED * 0.35;
-        let mut cost = CostTable::default();
+        let mut cost = CostTable::seeded("", super::super::cost::HwCostSource::Spot);
         cost.set_price("intel-8", CapacityType::Spot, seed, 1e9);
         cost.set_price("intel-6", CapacityType::Spot, seed * 0.545, 1e9);
         let SolveFullResult::Feasible(memo) = solve_full(
@@ -2213,7 +2213,7 @@ mod tests {
         let fit = mk_fit(5.0, 2000.0, 0.0, f64::INFINITY, 0.1);
         let mut cfg = cfg_hw();
         cfg.hw_cost_tolerance = 0.5;
-        let mut cost = CostTable::default();
+        let mut cost = CostTable::seeded("", super::super::cost::HwCostSource::Spot);
         for cap in CapacityType::ALL {
             cost.set_price("intel-6", cap, 0.009, 1e9);
             cost.set_price("intel-8", cap, 0.043, 1e9);
@@ -3041,17 +3041,17 @@ mod tests {
         assert_eq!(why, R::CoreCeiling);
     }
 
-    /// `solve_mvp` is pure: emission is at the sizing decision-point
+    /// `solve_tier` is pure: emission is at the sizing decision-point
     /// (`intent_for` / `solve_full`), not inside the solve. Regression
-    /// for `solve_intent_for`'s predicted-block re-calling `solve_mvp`
+    /// for `solve_intent_for`'s predicted-block re-calling `solve_tier`
     /// for tier-name lookup and double-counting infeasible drvs.
     #[test]
-    fn solve_mvp_is_pure() {
+    fn solve_tier_is_pure() {
         let rec = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = rec.snapshotter();
         metrics::with_local_recorder(&rec, || {
             let fit = mk_fit(1e6, 0.0, 0.0, f64::INFINITY, 0.1);
-            let r = solve_mvp(&fit, &[t("normal", 10.0)], &ceil());
+            let r = solve_tier(&fit, &[t("normal", 10.0)], &ceil());
             assert!(matches!(r, SolveResult::BestEffort { .. }));
         });
         let m = infeasible_counts(&snapshotter);
@@ -3059,7 +3059,7 @@ mod tests {
             assert_eq!(
                 m.get(r.as_str()).copied().unwrap_or(0),
                 0,
-                "{r:?}: solve_mvp must not emit; callers do at the decision-point"
+                "{r:?}: solve_tier must not emit; callers do at the decision-point"
             );
         }
     }
@@ -3096,7 +3096,7 @@ mod tests {
         let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
         let (c, _, d) = intent(Some(&fit), &DrvHints::default());
         // Against p90=1200: c*≈1.95 → ceil 2.
-        assert_eq!(c, 2, "ceil(solve_mvp.c_star)");
+        assert_eq!(c, 2, "ceil(solve_tier.c_star)");
         assert_eq!(d, 10 << 30, "disk_p90 from fit");
     }
 }

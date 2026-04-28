@@ -411,7 +411,7 @@ fn print_seeds(seeds: &BTreeMap<String, f64>) {
         println!("{cell:<32} {boot:>10.1}");
     }
     println!(
-        "\n# paste into infra/helm/rio-build/values/prod.yaml under scheduler.sla:\nleadTimeSeed:"
+        "\n# paste into infra/helm/rio-build/values.yaml scheduler.sla.leadTimeSeed:\nleadTimeSeed:"
     );
     for (cell, boot) in seeds {
         println!("  {cell:?}: {boot:.1}");

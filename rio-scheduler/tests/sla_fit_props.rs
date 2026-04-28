@@ -1,12 +1,12 @@
 //! Property invariants on ADR-023 SLA fit/solve.
 //!
-//! These pin structural properties of `T(c)`, `headroom`, and `solve_mvp` that
+//! These pin structural properties of `T(c)`, `headroom`, and `solve_tier` that
 //! must hold for *all* parameter values, independent of the unit-test point
 //! samples in `sla::{fit,solve}::tests`.
 
 use proptest::prelude::*;
 use rio_scheduler::sla::fit::headroom;
-use rio_scheduler::sla::solve::{Ceilings, SolveResult, Tier, solve_mvp};
+use rio_scheduler::sla::solve::{Ceilings, SolveResult, Tier, solve_tier};
 use rio_scheduler::sla::types::*;
 
 fn ceil() -> Ceilings {
@@ -85,7 +85,7 @@ proptest! {
         prop_assert!(xs.windows(2).all(|w| w[0] >= w[1] - 1e-6));
     }
 
-    /// `solve_mvp` rejects (does not clamp) `c* > cap_c`, and `cap_c ≤ max_cores`,
+    /// `solve_tier` rejects (does not clamp) `c* > cap_c`, and `cap_c ≤ max_cores`,
     /// so any `Feasible` result has `c* ≤ max_cores`.
     // r[verify sched.sla.solve-citardauq]
     #[test]
@@ -96,7 +96,7 @@ proptest! {
         p90 in 60.0..3600f64,
     ) {
         let fit = mk_fit(s, p, 0.0, sigma);
-        let r = solve_mvp(
+        let r = solve_tier(
             &fit,
             &[Tier { name: "t".into(), p50: None, p90: Some(p90), p99: None }],
             &ceil(),
@@ -113,7 +113,7 @@ proptest! {
         prop_assert!(headroom(RingNEff(n)) >= headroom(RingNEff(n + 1.0)));
     }
 
-    /// If `solve_mvp` returns `Feasible{c*}` for tier `p90`, then the model's predicted
+    /// If `solve_tier` returns `Feasible{c*}` for tier `p90`, then the model's predicted
     /// p90 at `c*` — i.e. `T(c*) · exp(z₉₀ · σ)` — actually meets the tier (1% fp slack).
     #[test]
     fn solve_feasible_actually_meets_tier(
@@ -123,7 +123,7 @@ proptest! {
         p90 in 120.0..3600f64,
     ) {
         let fit = mk_fit(s, p, 0.0, sigma);
-        if let SolveResult::Feasible { c_star, .. } = solve_mvp(
+        if let SolveResult::Feasible { c_star, .. } = solve_tier(
             &fit,
             &[Tier { name: "t".into(), p50: None, p90: Some(p90), p99: None }],
             &ceil(),

@@ -641,14 +641,14 @@ async fn contract_metrics_once_per_miss() {
 /// (`SolveCache::infeasible_static_fh`): emit once, suppress repeat
 /// polls, re-arm on refit, sweep on `on_fit_evicted`.
 #[tokio::test]
-async fn contract_metrics_once_per_miss_static_mode() {
+async fn contract_metrics_once_per_miss_hw_agnostic() {
     const POLLS: usize = 8;
     const INFEASIBLE: &str = "rio_scheduler_sla_infeasible_total";
 
     let db = TestDb::new(&MIGRATOR).await;
-    // `test_sla_config()`: hw_cost_source=None, hw_classes={} — the
-    // hw-aware gate at solve_intent_for is structurally false. Tier
-    // p90=1200.
+    // `test_sla_config()` with no hw-factor table seeded — the
+    // `!hw.is_empty()` gate at solve_intent_for is false → hw-agnostic
+    // intent_for path. Tier p90=1200.
     let mut actor = bare_actor_cfg(
         db.pool.clone(),
         DagActorConfig {
@@ -658,12 +658,8 @@ async fn contract_metrics_once_per_miss_static_mode() {
     );
     actor.sla_tiers = actor.sla_config.solve_tiers();
     actor.sla_ceilings = actor.sla_config.ceilings();
-    assert!(
-        actor.sla_config.hw_cost_source.is_none() && actor.sla_config.hw_classes.is_empty(),
-        "precondition: hw-agnostic mode (helm default)"
-    );
 
-    // S=2000 > p90 bound=1200: T(c)≥S ∀c → solve_mvp BestEffort →
+    // S=2000 > p90 bound=1200: T(c)≥S ∀c → solve_tier BestEffort →
     // classify_ceiling=SerialFloor. n_eff/span force the solve branch
     // (not explore).
     let mut fit = make_fit("synth-serial");
@@ -756,7 +752,7 @@ async fn contract_infeasible_static_hints_independent() {
     use crate::sla::metrics::infeasible_counts;
 
     let db = TestDb::new(&MIGRATOR).await;
-    // S=2000 > p90=1200 → solve_mvp BestEffort → classify_ceiling =
+    // S=2000 > p90=1200 → solve_tier BestEffort → classify_ceiling =
     // SerialFloor. Shared by both drvs (same `(pname, system, tenant)`
     // → same `(mkh, ovr, fh)`).
     let mut fit = make_fit("synth-hint");
@@ -775,10 +771,8 @@ async fn contract_infeasible_static_hints_independent() {
         );
         actor.sla_tiers = actor.sla_config.solve_tiers();
         actor.sla_ceilings = actor.sla_config.ceilings();
-        assert!(
-            actor.sla_config.hw_cost_source.is_none(),
-            "precondition: hw-agnostic mode (helm default)"
-        );
+        // hw-factor table unseeded → `!hw.is_empty()` gate false →
+        // hw-agnostic intent_for path.
         actor.sla_estimator.seed(fit.clone());
 
         let ser = format!("d-ser-{k:02x}");

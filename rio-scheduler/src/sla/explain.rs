@@ -1,6 +1,6 @@
 //! `rio-cli sla explain` — per-derivation solve trace.
 //!
-//! [`explain`] re-runs the [`super::solve::solve_mvp`] tier walk in
+//! [`explain`] re-runs the [`super::solve::solve_tier`] tier walk in
 //! dry-run mode, recording every `continue` reason instead of returning
 //! on the first feasible tier. The CLI renders the result as a
 //! candidate table so an operator can see *why* a key landed where it
@@ -47,7 +47,7 @@ pub struct ExplainResult {
 
 /// Re-run the tier walk for `key`, recording every reject reason.
 ///
-/// Mirrors [`super::solve::solve_mvp`] gate-for-gate so the table the
+/// Mirrors [`super::solve::solve_tier`] gate-for-gate so the table the
 /// operator sees matches what dispatch did. Drift between the two is a
 /// bug — both consume the same `tiers`/`ceil`/`fit` inputs.
 ///
@@ -127,7 +127,7 @@ pub fn explain(
             binding_constraint: "-".into(),
             feasible: false,
         };
-        // Delegate to the same `solve_envelope` `solve_mvp` calls so the
+        // Delegate to the same `solve_envelope` `solve_tier` calls so the
         // two cannot drift. `explain_envelope` already handles no-bounds
         // (→ cap_c, feasible) and the cap_c ceiling (→ None) so the
         // separate `c_star > cap_c` core-ceiling check is gone.
@@ -314,11 +314,11 @@ mod tests {
     }
 
     #[test]
-    fn explain_matches_solve_mvp_on_chart_defaults() {
+    fn explain_matches_solve_tier_on_chart_defaults() {
         // helm-default-shaped ladder: a bounded `normal` tier and a
         // no-bounds `best-effort` tier. A fit infeasible at `normal`
         // (S=400 > p90=300) must show `best-effort` as FEASIBLE at
-        // cap_c — that's what `solve_mvp` dispatches it at. Before the
+        // cap_c — that's what `solve_tier` dispatches it at. Before the
         // `explain_envelope` delegation, the stale p90-only citardauq
         // here marked `best-effort` as `binding_constraint="p90"` /
         // `feasible=false`, contradicting dispatch.
@@ -342,11 +342,11 @@ mod tests {
         assert!(r.candidates[1].feasible, "no-bounds tier always feasible");
         assert_eq!(r.candidates[1].c_star, Some(64.0), "cap_c, not c_lo");
         assert_eq!(r.candidates[1].binding_constraint, "no-bounds");
-        // And the bounded tier agrees with solve_mvp's reject.
+        // And the bounded tier agrees with solve_tier's reject.
         assert!(!r.candidates[0].feasible);
-        // Cross-check first-feasible: explain and solve_mvp pick the
+        // Cross-check first-feasible: explain and solve_tier pick the
         // same tier.
-        let solve::SolveResult::Feasible { tier, .. } = solve::solve_mvp(&fit, &tiers, &ceil())
+        let solve::SolveResult::Feasible { tier, .. } = solve::solve_tier(&fit, &tiers, &ceil())
         else {
             panic!()
         };

@@ -1748,8 +1748,8 @@ async fn forecast_budget_deterministic() {
 }
 
 /// `lead_time_seed` empty → `max_lead = 0` → forecast pass disabled.
-/// Static-mode (no `[sla].hw_classes`, no §13b controller) deploys
-/// stay on the v1.0 Ready-only path.
+/// Deploys without `xtask k8s probe-boot` seeding stay on the v1.0
+/// Ready-only path.
 // r[verify sched.sla.forecast.one-layer]
 #[tokio::test]
 async fn forecast_disabled_on_empty_lead_time_seed() {

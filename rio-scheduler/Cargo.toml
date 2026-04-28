@@ -133,7 +133,7 @@ tracing-test = { workspace = true }
 # default-features off: we don't need the `async-timeout` feature
 # (tokio::test handles that), saving the futures-timer dep.
 rstest = { workspace = true }
-# ADR-023: property invariants on T(c) monotonicity + solve_mvp bounds
+# ADR-023: property invariants on T(c) monotonicity + solve_tier bounds
 # (tests/sla_fit_props.rs).
 proptest = { workspace = true }
 # admin/tests/mod.rs::admin_rpc_gate_coverage parses admin.proto via

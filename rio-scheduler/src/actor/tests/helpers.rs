@@ -882,8 +882,8 @@ pub(crate) fn bare_actor_sla(pool: sqlx::PgPool) -> DagActor {
 pub(crate) fn test_hw_sla_config() -> crate::sla::config::SlaConfig {
     use crate::sla::config::{HwClassDef, NodeLabelMatch};
     let mut cfg = test_sla_config();
-    cfg.hw_cost_source = Some(crate::sla::cost::HwCostSource::Static);
     cfg.hw_explore_epsilon = 0.0;
+    cfg.hw_classes.clear();
     for h in ["intel-6", "intel-7", "intel-8"] {
         cfg.hw_classes.insert(
             h.into(),
@@ -968,6 +968,10 @@ pub(crate) fn bare_actor_hw(pool: sqlx::PgPool) -> DagActor {
             ..Default::default()
         },
     );
+    // `set_price` no longer upgrades source; tests that probe per-h
+    // price discrimination need a Spot-sourced table.
+    *actor.cost_table.write() =
+        crate::sla::cost::CostTable::seeded("", crate::sla::cost::HwCostSource::Spot);
     actor.sla_tiers = actor.sla_config.solve_tiers();
     actor.sla_ceilings = actor.sla_config.ceilings();
     let mut m = std::collections::HashMap::new();

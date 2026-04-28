@@ -53,7 +53,7 @@
 # convergence subtest therefore asserts the SAMPLES landed (proving the
 # fixture intercept + completion → build_samples wiring), and asserts
 # the SlaEstimator refit produced span≥4 by querying PG; it does NOT
-# assert that the 4th dispatch's SpawnIntent matched solve_mvp — that
+# assert that the 4th dispatch's SpawnIntent matched solve_tier — that
 # requires the k3s fixture (controller spawns per-intent pods). Tracked
 # as a follow-up once a k3s sla-sizing variant lands.
 {

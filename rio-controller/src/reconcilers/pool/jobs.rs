@@ -141,7 +141,7 @@ pub(crate) struct HwSampledCache {
 impl HwSampledCache {
     /// One `HwClassSampled` RPC for the given (deduped) classes.
     /// Empty input → empty cache (no RPC) so non-hw-targeted ticks
-    /// (Static-mode, FOD-only, fetcher pools) cost nothing.
+    /// (FOD-only, fetcher pools) cost nothing.
     pub(crate) async fn fetch(ctx: &Ctx, hw_classes: HashSet<String>) -> Self {
         if hw_classes.is_empty() {
             return Self::default();
@@ -557,7 +557,7 @@ async fn queued_for_pool(
 ///
 /// The §13a scheduler emits `node_selector: {}` (snapshot.rs:350), so
 /// the legacy arm only fires on pre-§13a intents and on the
-/// `node_affinity = []` Static-mode/FOD/feature-gated path.
+/// `node_affinity = []` FOD/feature-gated/cold-hw-table path.
 fn selector_fingerprint(intent: &SpawnIntent) -> String {
     if !intent.node_affinity.is_empty() {
         let mut terms: Vec<String> = intent

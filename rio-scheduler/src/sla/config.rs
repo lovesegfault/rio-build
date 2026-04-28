@@ -161,15 +161,12 @@ pub struct SlaConfig {
     /// starts empty (still fillable via `ImportSlaCorpus`).
     #[serde(default)]
     pub seed_corpus: Option<PathBuf>,
-    /// Phase-13 hw-band cost source. `None` → cost-ranking disabled
-    /// (`solve_full` falls back to `solve_mvp`'s band-agnostic path).
-    /// `Some(Static)` → seed prices only; `Some(Spot)` → live EC2
-    /// spot-price poll (lease-gated).
-    #[serde(default)]
-    pub hw_cost_source: Option<super::cost::HwCostSource>,
-    /// h → node-label conjunction. Empty = static-mode (admissible-set
-    /// solve unreachable, every dispatch falls through to MVP solve).
-    #[serde(default)]
+    /// Phase-13 hw-band cost source. `Static` → seed prices only;
+    /// `Spot` → live EC2 spot-price poll (lease-gated; IRSA
+    /// `ec2:DescribeSpotPriceHistory` on the scheduler SA).
+    pub hw_cost_source: super::cost::HwCostSource,
+    /// h → node-label conjunction. MANDATORY (ADR-023 §13a). Non-empty
+    /// — checked by [`SlaConfig::validate`].
     pub hw_classes: HashMap<HwClassName, HwClassDef>,
     /// Admissible-set cost slack: a `(h, cap)` cell within
     /// `(1 + hw_cost_tolerance)` × min-cost stays admissible. Range
@@ -197,9 +194,8 @@ pub struct SlaConfig {
     /// hw-class whose bench result anchors the ref-second normalization.
     /// Immutable across restarts unless `--allow-reference-change` is
     /// passed — see [`super::check_reference_epoch`]. MUST appear in
-    /// `hw_classes` when set.
-    #[serde(default)]
-    pub reference_hw_class: Option<HwClassName>,
+    /// `hw_classes`.
+    pub reference_hw_class: HwClassName,
     /// §Threat-model gap (d): per-tenant cap on forecast cores so one
     /// tenant's DAG can't crowd out the fleet forecast.
     #[serde(default = "default_max_forecast_cores_per_tenant")]
@@ -363,15 +359,23 @@ impl SlaConfig {
             default_disk: 2 << 30,
             ring_buffer: default_ring_buffer(),
             seed_corpus: None,
-            hw_cost_source: None,
-            hw_classes: HashMap::new(),
+            hw_cost_source: super::cost::HwCostSource::Static,
+            hw_classes: HashMap::from([(
+                "test-hw".into(),
+                HwClassDef {
+                    labels: vec![NodeLabelMatch {
+                        key: "rio.build/hw-class".into(),
+                        value: "test-hw".into(),
+                    }],
+                },
+            )]),
             hw_cost_tolerance: default_hw_cost_tolerance(),
             hw_explore_epsilon: default_hw_explore_epsilon(),
             hw_bench_mem_floor: default_hw_bench_mem_floor(),
             lead_time_seed: HashMap::new(),
             max_fleet_cores: default_max_fleet_cores(),
             ladder_budget: default_ladder_budget(),
-            reference_hw_class: None,
+            reference_hw_class: "test-hw".into(),
             max_forecast_cores_per_tenant: default_max_forecast_cores_per_tenant(),
             max_keys_per_tenant: default_max_keys_per_tenant(),
             max_lead_time: default_max_lead_time(),
@@ -440,21 +444,15 @@ impl SlaConfig {
                 "sla.hwClasses[{h}].labels must be non-empty"
             );
         }
-        // §13a admissible-set solve gates on `hw_cost_source.is_some()`;
-        // a populated `hw_classes` with no cost source silently falls
-        // through to MVP solve. Reject the inconsistent state so
-        // "static-mode" means exactly `hwClasses: {}`.
         anyhow::ensure!(
-            self.hw_classes.is_empty() || self.hw_cost_source.is_some(),
-            "sla.hwClasses populated but sla.hwCostSource unset; §13a admissible-set \
-             solve will not engage — set hwCostSource or clear hwClasses for static-mode"
+            !self.hw_classes.is_empty(),
+            "sla.hwClasses is mandatory (ADR-023 §13a; populate scheduler.sla.hwClasses in helm values)"
         );
-        if let Some(ref_h) = &self.reference_hw_class {
-            anyhow::ensure!(
-                self.hw_classes.contains_key(ref_h),
-                "sla.referenceHwClass={ref_h} not in sla.hwClasses"
-            );
-        }
+        anyhow::ensure!(
+            self.hw_classes.contains_key(&self.reference_hw_class),
+            "sla.referenceHwClass={} not in sla.hwClasses",
+            self.reference_hw_class
+        );
         for ((h, cap), v) in &self.lead_time_seed {
             anyhow::ensure!(
                 self.hw_classes.contains_key(h),
@@ -474,7 +472,7 @@ impl SlaConfig {
     }
 
     /// Tiers sorted tightest-first (lowest target wins; a tier with no
-    /// targets sorts last). [`super::solve::solve_mvp`] iterates in
+    /// targets sorts last). [`super::solve::solve_tier`] iterates in
     /// order and returns the first feasible tier, so tightest-first
     /// means a build that CAN hit `fast` does, instead of settling for
     /// `normal`.
@@ -491,7 +489,7 @@ impl SlaConfig {
         tiers
     }
 
-    /// Hard ceilings for [`super::solve::solve_mvp`].
+    /// Hard ceilings for [`super::solve::solve_tier`].
     pub fn ceilings(&self) -> Ceilings {
         Ceilings {
             max_cores: self.max_cores,
@@ -767,7 +765,6 @@ mod tests {
     #[test]
     fn validate_rejects_hw_class_dot() {
         let mut cfg = base();
-        cfg.hw_cost_source = Some(super::super::cost::HwCostSource::Static);
         cfg.hw_classes.insert(
             "c7a.xlarge".into(),
             HwClassDef {
@@ -783,7 +780,7 @@ mod tests {
             "{err}"
         );
         // Positive control: dash-separated key passes.
-        cfg.hw_classes.clear();
+        cfg.hw_classes.remove("c7a.xlarge");
         cfg.hw_classes.insert(
             "c7a-xlarge".into(),
             HwClassDef {
@@ -798,31 +795,14 @@ mod tests {
 
     // r[verify sched.sla.hw-class.config]
     #[test]
-    fn rejects_hw_classes_without_cost_source() {
+    fn rejects_empty_hw_classes() {
         let mut cfg = base();
-        cfg.hw_classes.insert(
-            "intel-7-ebs".into(),
-            HwClassDef {
-                labels: vec![NodeLabelMatch {
-                    key: "k".into(),
-                    value: "v".into(),
-                }],
-            },
-        );
-        // hw_classes populated, hw_cost_source None → §13a silently
-        // unreachable; validate() must reject.
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("hwCostSource"), "{err}");
-        assert!(err.contains("static-mode"), "{err}");
-        // With a cost source the same config is valid.
-        cfg.hw_cost_source = Some(super::super::cost::HwCostSource::Static);
-        cfg.reference_hw_class = Some("intel-7-ebs".into());
+        // Populated (from test_default) → valid.
         cfg.validate().unwrap();
-        // Empty hw_classes + no cost source = static-mode, valid.
+        // Empty → ADR-023 §13a is mandatory; validate() must reject.
         cfg.hw_classes.clear();
-        cfg.hw_cost_source = None;
-        cfg.reference_hw_class = None;
-        cfg.validate().unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("hwClasses is mandatory"), "{err}");
     }
 
     #[test]
@@ -848,7 +828,7 @@ mod tests {
     #[test]
     fn rejects_reference_not_in_hw_classes() {
         let mut cfg = base();
-        cfg.reference_hw_class = Some("nope".into());
+        cfg.reference_hw_class = "nope".into();
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("not in sla.hwClasses"), "{err}");
     }
@@ -857,9 +837,9 @@ mod tests {
     fn rejects_empty_hw_class_labels() {
         let mut cfg = base();
         cfg.hw_classes
-            .insert("h".into(), HwClassDef { labels: vec![] });
+            .insert("test-hw".into(), HwClassDef { labels: vec![] });
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("hwClasses[h].labels"), "{err}");
+        assert!(err.contains("hwClasses[test-hw].labels"), "{err}");
     }
 
     #[test]
@@ -999,7 +979,7 @@ mod tests {
             lead_time_seed,        // (cell)   key.0 MUST ∈ hw_classes — asserted below
             max_fleet_cores: _,    // (scalar)
             ladder_budget: _,      // (scalar)
-            reference_hw_class: _, // (scalar) Option<HwClassName>; checked ∈ hw_classes
+            reference_hw_class: _, // (scalar) HwClassName; checked ∈ hw_classes
             max_forecast_cores_per_tenant: _, // (scalar)
             max_keys_per_tenant: _, // (scalar)
             max_lead_time: _,      // (scalar)
@@ -1014,7 +994,6 @@ mod tests {
         let _ = lead_time_seed;
 
         // ---- (cell) lead_time_seed: key.0 ∈ hw_classes ----
-        // base() has hw_classes = {} so any key is "nonexistent".
         let mut bad_key = base();
         bad_key
             .lead_time_seed
@@ -1040,7 +1019,6 @@ mod tests {
                     }],
                 },
             );
-            c.hw_cost_source = Some(crate::sla::cost::HwCostSource::Static);
             c
         };
         // Non-finite.

@@ -1536,7 +1536,7 @@ async fn substitute_complete_inline_probes_dependents() -> TestResult {
 }
 
 /// `compute_spawn_intents` emits one SpawnIntent per Ready derivation,
-/// with `intent_id == drv_hash` and `cores ≈ solve_mvp(c_star)` for a
+/// with `intent_id == drv_hash` and `cores ≈ solve_tier(c_star)` for a
 /// fitted key. Unfitted keys (no SlaEstimator entry) get probe defaults.
 // r[verify sched.sla.intent-from-solve]
 #[tokio::test]
@@ -1545,7 +1545,7 @@ async fn spawn_intent_from_sla_estimator() {
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_sla(db.pool.clone());
     // Seed a single tier so the test exercises the Feasible path the way
-    // a configured deploy would (empty ladder → solve_mvp BestEffort at
+    // a configured deploy would (empty ladder → solve_tier BestEffort at
     // p̄ capped at max_cores).
     actor.sla_tiers = vec![solve::Tier {
         name: "normal".into(),
@@ -1618,7 +1618,7 @@ async fn spawn_intent_from_sla_estimator() {
         .expect("intent_id == drv_hash");
     assert_eq!(
         fitted.cores, 2,
-        "solve_mvp c_star ≈ 1.95 → ceil 2 (got {})",
+        "solve_tier c_star ≈ 1.95 → ceil 2 (got {})",
         fitted.cores
     );
     assert_eq!(fitted.disk_bytes, 10 << 30, "disk_p90 from fit");
@@ -2100,31 +2100,6 @@ async fn spawn_intent_node_affinity_from_solve_full() {
     assert_eq!(
         fitted.node_affinity, fitted2.node_affinity,
         "deterministic — memoized"
-    );
-
-    // Gate: hw_cost_source unset → solve_full skipped even with hw table.
-    actor.sla_config.hw_cost_source = None;
-    let snap = actor.compute_spawn_intents(&Default::default());
-    let fitted = snap
-        .intents
-        .iter()
-        .find(|i| i.intent_id == "fitted")
-        .unwrap();
-    assert!(
-        fitted.node_affinity.is_empty(),
-        "hw_cost_source=None → hw-agnostic"
-    );
-    actor.sla_config.hw_cost_source = Some(crate::sla::cost::HwCostSource::Static);
-    // Gate: hw_classes empty → static-mode, solve_full unreachable.
-    actor.sla_config.hw_classes.clear();
-    let snap = actor.compute_spawn_intents(&Default::default());
-    assert!(
-        snap.intents
-            .iter()
-            .find(|i| i.intent_id == "fitted")
-            .unwrap()
-            .node_affinity
-            .is_empty()
     );
 }
 

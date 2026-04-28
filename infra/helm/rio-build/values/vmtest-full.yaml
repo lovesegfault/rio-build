@@ -94,6 +94,14 @@ scheduler:
     maxMem: 2147483648         # 2 GiB
     maxDisk: 6442450944        # 6 GiB
     defaultDisk: 2147483648    # 2 GiB
+    # k3s VM has no Karpenter labels — key on hostname so the agent
+    # node matches. hwCostSource=static (no IRSA in VM).
+    hwClasses:
+      vmtest:
+        labels:
+          - {key: kubernetes.io/hostname, value: agent}
+    hwCostSource: static
+    referenceHwClass: vmtest
 
 gateway:
   enabled: true

@@ -33,7 +33,7 @@ pub async fn check_reference_epoch(
     allow_reference_change: bool,
 ) -> anyhow::Result<()> {
     let cluster = cfg.cluster.as_str();
-    let want = cfg.reference_hw_class.as_deref();
+    let want = cfg.reference_hw_class.as_str();
     let row: Option<(Option<String>, i64)> =
         sqlx::query_as("SELECT reference_hw_class, epoch FROM sla_config_epoch WHERE cluster = $1")
             .bind(cluster)
@@ -51,10 +51,15 @@ pub async fn check_reference_epoch(
             .bind(want)
             .execute(db.pool())
             .await?;
-            tracing::info!(cluster, reference_hw_class = ?want, epoch = 0, "sla reference epoch initialised");
+            tracing::info!(
+                cluster,
+                reference_hw_class = want,
+                epoch = 0,
+                "sla reference epoch initialised"
+            );
             Ok(())
         }
-        Some((prev, _)) if prev.as_deref() == want => Ok(()),
+        Some((prev, _)) if prev.as_deref() == Some(want) => Ok(()),
         Some((prev, _)) if !allow_reference_change => anyhow::bail!(
             "sla.referenceHwClass changed {prev:?}→{want:?}; pass --allow-reference-change \
              to reset ref-second state (build_samples, sla_ema_state, hw_perf_samples) \

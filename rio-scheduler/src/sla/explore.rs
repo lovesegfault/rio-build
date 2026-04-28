@@ -1,7 +1,7 @@
 //! Algorithm 2 (ADR-023 §3.2): saturation-gated exploration.
 //!
 //! Drives the cold-start probe ladder before a key has enough span/n_eff
-//! for `solve_mvp`. Walks `c` away from `cfg.probe.cpu` — ×4 up while
+//! for `solve_tier`. Walks `c` away from `cfg.probe.cpu` — ×4 up while
 //! the last build saturated AND missed its tier's SLA target
 //! ([`Tier::binding_bound`]), ÷2 down otherwise — until the observed
 //! `[min_c, max_c]` span reaches 4× (the fit gate), or hits a wall
@@ -238,7 +238,7 @@ pub struct ExploreDecision {
 /// probe shape (or a feature-specific override). `fit=Some` with the
 /// ladder still walking → ×4 / ÷2 from the explore state. Ladder
 /// frozen → re-emit `max_c` (the solve gate in `intent_for` will pick
-/// `solve_mvp` instead, but a frozen-yet-immature fit — e.g. n_eff<3
+/// `solve_tier` instead, but a frozen-yet-immature fit — e.g. n_eff<3
 /// after a version bump — falls through here and should hold position).
 // r[impl sched.sla.explore-saturation-gate]
 // r[impl sched.sla.explore-x4-first-bump]
@@ -834,7 +834,7 @@ mod tests {
         // probe.cpu == max_cores: first sample lands min=max=64,
         // distinct_c=1. Without the `distinct_c >= 2` guard this is
         // frozen → re-emit 64 forever (the ceiling case never self-
-        // heals: solve_mvp's BestEffort fallback also returns
+        // heals: solve_tier's BestEffort fallback also returns
         // cap_c=max_cores for Probe fits, so span never widens).
         let f = fit(st(64.0, 64.0, 1, false, 100.0));
         assert_eq!(

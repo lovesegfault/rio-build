@@ -357,7 +357,7 @@ scheduler:
   # seconds, sizes in bytes (the Rust SlaConfig deserializer is plain
   # serde — no humantime/bytesize).
   #
-  # tiers: ladder of SLA targets. solve_mvp picks the TIGHTEST feasible
+  # tiers: ladder of SLA targets. solve_tier picks the TIGHTEST feasible
   #   tier (sorted by p50→p90→p99); a tier with no targets is best-effort.
   # probe: cold-start sizing for never-seen (pname,system,tenant). cpu
   #   MUST be in [4, maxCores/4] — validated at scheduler boot.
@@ -367,10 +367,18 @@ scheduler:
   #   want a high mem floor regardless of cores).
   # max{Cores,Mem,Disk}: hard reject ceilings — solve does NOT clamp.
   #   maxCores < 1024 (PriorityClass bucket range).
-  # hwClasses: h → node-label conjunction. Empty = static-mode (admissible-
-  #   set solve unreachable). referenceHwClass anchors ref-second
-  #   normalization — set per deployment, immutable across reloads
-  #   without --allow-reference-change.
+  # hwClasses: h → node-label conjunction. MANDATORY (ADR-023 §13a) — keys
+  #   match `<gen>-<storage>-<band>`; labels are what Karpenter NodePools
+  #   stamp at templates/karpenter.yaml:125-126. 6 = full {hi,mid,lo} ×
+  #   {nvme,ebs} cross-product (arch handled per-pool, not per-hw-class).
+  # referenceHwClass: anchors ref-second normalization — IMMUTABLE across
+  #   reloads without --allow-reference-change. gen7-ebs-mid chosen as the
+  #   broadest us-east-2 quota (gen-7 c/m/r, no nvme constraint).
+  # hwCostSource: "spot" = live DescribeSpotPriceHistory poll (lease-gated;
+  #   IRSA `ec2:DescribeSpotPriceHistory` on the scheduler SA). "static" =
+  #   fixed spot<od / hi>mid>lo seed ratios (cost.rs) — degrades cost
+  #   ranking.
+  # leadTimeSeed: populated by `xtask k8s probe-boot` AFTER first deploy.
   sla:
     tiers:
       - {name: normal, p50: 120, p90: 300, p99: 1200}
@@ -391,17 +399,39 @@ scheduler:
     maxLeadTime: 600
     consolidateExploreEpsilon: 0.02
     maxNodeClaimsPerCellPerTick: 8
-    # referenceHwClass set per deployment; hwClasses populated below
-    hwClasses: {}
-    # §13a master gate: "spot" (live EC2 poll) or "static" (seed
-    # prices). Empty = admissible-set solve disabled. validate()
-    # rejects hwClasses-populated + hwCostSource-empty.
-    hwCostSource: ""
+    hwClasses:
+      gen8-nvme-hi:
+        labels:
+          - {key: rio.build/hw-band, value: hi}
+          - {key: rio.build/storage, value: nvme}
+      gen8-ebs-hi:
+        labels:
+          - {key: rio.build/hw-band, value: hi}
+          - {key: rio.build/storage, value: ebs}
+      gen7-nvme-mid:
+        labels:
+          - {key: rio.build/hw-band, value: mid}
+          - {key: rio.build/storage, value: nvme}
+      gen7-ebs-mid:
+        labels:
+          - {key: rio.build/hw-band, value: mid}
+          - {key: rio.build/storage, value: ebs}
+      gen6-nvme-lo:
+        labels:
+          - {key: rio.build/hw-band, value: lo}
+          - {key: rio.build/storage, value: nvme}
+      gen6-ebs-lo:
+        labels:
+          - {key: rio.build/hw-band, value: lo}
+          - {key: rio.build/storage, value: ebs}
+    hwCostSource: spot
+    referenceHwClass: gen7-ebs-mid
+    nodeClassRef: rio-default
+    leadTimeSeed: {}  # populated by `xtask k8s probe-boot` after first deploy
     # DESTRUCTIVE one-shot: pass --allow-reference-change for ONE
     # rollout when changing referenceHwClass (resets ref-second state),
     # then revert to false.
     allowReferenceChange: false
-    leadTimeSeed: {}
   resources:
     requests: {cpu: 500m, memory: 512Mi}
     # 1M-node DAG merge ≈ ~1GB (DerivationState + cycle-check color map +

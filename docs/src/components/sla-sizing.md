@@ -56,7 +56,7 @@ r[sched.sla.intent-from-solve]
 
 The scheduler exposes one `SpawnIntent{intent_id, cores, mem, disk}` per
 queued derivation (FOD and non-FOD) in `GetSpawnIntents`. `cores` is
-`ceil(solve_mvp(c_star))` for fitted keys, probe defaults otherwise;
+`ceil(solve_tier(c_star))` for fitted keys, probe defaults otherwise;
 `prefer_local_build` / `enable_parallel_building=false` pin `cores=1`.
 
 r[sched.admin.spawn-intents.feature-filter]

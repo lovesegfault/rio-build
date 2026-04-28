@@ -58,9 +58,8 @@ const LABEL_CAPACITY_TYPE: &str = "karpenter.sh/capacity-type";
 /// the [`load`](Self::load) task. The match is lazy
 /// ([`NodeLabelCache::hw_class_of`] etc. call [`Self::match_node`] on
 /// each lookup) so config arriving AFTER nodes are cached still
-/// resolves correctly, and a Static-mode deploy (`hw_classes = {}`)
-/// degrades to `hw_class = None` everywhere — annotator skips,
-/// λ-samples skip, same as the pre-§13a behavior.
+/// resolves correctly; before load completes `hw_class = None`
+/// everywhere — annotator skips, λ-samples skip.
 ///
 /// Stored as a sorted `Vec` so [`Self::match_node`] is deterministic
 /// when a Node satisfies two overlapping conjunctions (lexicographic
@@ -75,7 +74,7 @@ type HwClassDef = (String, Vec<(String, String)>);
 impl HwClassConfig {
     /// First `$h` (lexicographic) whose every `(k, v)` is satisfied by
     /// `labels`. `None` if no conjunction matches OR config is empty
-    /// (not yet loaded / Static-mode).
+    /// (not yet loaded).
     pub fn match_node(&self, labels: &BTreeMap<String, String>) -> Option<String> {
         let cfg = self.0.read();
         for (h, conj) in cfg.iter() {
@@ -210,7 +209,7 @@ impl NodeLabelCache {
 
     /// Operator's `[sla.hw_classes.$h]` key matching `node_name`'s
     /// labels, or `None` if the node is not (or no longer) cached, no
-    /// `$h` matches, or config is empty (Static-mode / not yet loaded).
+    /// `$h` matches, or config is not yet loaded.
     pub fn hw_class_of(&self, node_name: &str) -> Option<String> {
         let g = self.nodes.read();
         self.config.match_node(&g.get(node_name)?.labels)
@@ -220,8 +219,8 @@ impl NodeLabelCache {
     /// `node_name` IF it's a spot node with a creation timestamp AND
     /// matches a configured `$h`. Feeds the exposure half of λ\[h\] —
     /// on-demand nodes contribute neither numerator nor denominator
-    /// (their λ is 0 by definition); unmatched nodes (Static-mode,
-    /// non-builder NodePool) have no `$h` to key on.
+    /// (their λ is 0 by definition); unmatched nodes (non-builder
+    /// NodePool) have no `$h` to key on.
     ///
     /// Returns the slice since the last
     /// [`Self::drain_live_spot_exposure`] (or since creation if never
@@ -739,9 +738,9 @@ mod tests {
         assert_eq!(cache.hw_class_of("partial"), None);
     }
 
-    /// Unloaded / Static-mode config → `hw_class_of` returns `None`
-    /// (annotator skips, λ-samples skip — degraded, not broken). Late
-    /// config load resolves already-cached nodes (lazy match).
+    /// Unloaded config → `hw_class_of` returns `None` (annotator
+    /// skips, λ-samples skip — degraded, not broken). Late config load
+    /// resolves already-cached nodes (lazy match).
     #[test]
     fn hw_class_none_until_config_loaded_then_lazy_match() {
         let cache = NodeLabelCache::default();

@@ -88,6 +88,7 @@ let
         max_mem = 274877906944
         max_disk = 214748364800
         default_disk = 21474836480
+        reference_hw_class = "intel-7-ebs-mid"
 
         [[sla.tiers]]
         name = "normal"
@@ -154,6 +155,8 @@ let
       extraConfig = ''
         [sla]
         default_tier = "normal"
+        hw_cost_source = "static"
+        reference_hw_class = "vmtest"
         max_cores = 16
         max_mem = 2147483648
         max_disk = 6442450944
@@ -166,6 +169,9 @@ let
         cpu = 4
         mem_per_core = 134217728
         mem_base = 268435456
+
+        [sla.hw_classes.vmtest]
+        labels = [{ key = "rio.build/hw-class", value = "vmtest" }]
       '';
     };
     extraStoreConfig = {

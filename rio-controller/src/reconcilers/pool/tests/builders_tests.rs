@@ -607,7 +607,7 @@ fn pod_gets_node_affinity_from_intent() {
     assert_eq!(cap.operator, "In");
     assert_eq!(cap.values.as_deref(), Some(["spot".to_string()].as_slice()));
 
-    // Empty node_affinity → no affinity stamped (Static-mode/FOD path).
+    // Empty node_affinity → no affinity stamped (FOD/cold-hw-table path).
     let cold = rio_proto::types::SpawnIntent {
         intent_id: "abc".into(),
         ..Default::default()

@@ -20,7 +20,7 @@ async fn check_reference_epoch_guards_across_restarts() -> anyhow::Result<()> {
 
     let mut cfg = SlaConfig::test_default();
     cfg.cluster = "us-east-2".into();
-    cfg.reference_hw_class = Some("intel-8-nvme".into());
+    cfg.reference_hw_class = "intel-8-nvme".into();
 
     // Boot 1: no row → record at epoch 0.
     crate::sla::check_reference_epoch(&db, &cfg, false).await?;
@@ -56,7 +56,7 @@ async fn check_reference_epoch_guards_across_restarts() -> anyhow::Result<()> {
     .await?;
 
     // Boot 3, changed ref, no flag: error.
-    cfg.reference_hw_class = Some("amd-8-nvme".into());
+    cfg.reference_hw_class = "amd-8-nvme".into();
     let err = crate::sla::check_reference_epoch(&db, &cfg, false)
         .await
         .unwrap_err()

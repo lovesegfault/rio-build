@@ -45,7 +45,7 @@ pub struct InstanceType {
 }
 
 /// Where `$/vCPU·hr` numbers come from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HwCostSource {
     /// Live `DescribeSpotPriceHistory` poll (IRSA). Spot prices EMA'd;
@@ -58,6 +58,7 @@ pub enum HwCostSource {
     /// [`CostTable::load`]/[`CostTable::persist`] skip `price:*` under
     /// non-Spot so leftover rows from a Spot run are inert and age
     /// out).
+    #[default]
     Static,
 }
 
@@ -251,10 +252,8 @@ pub struct CostTable {
     /// [`CostTable::load`] / [`CostTable::persist`] can enforce the
     /// "[`HwCostSource::Static`] = seeds only" contract at the read
     /// site rather than relying on the absence of
-    /// [`spot_price_poller`] (bug_034). `None` ⇔ `[sla]` block
-    /// absent (admissible-set solve unreachable; `price()` still
-    /// returns seeds).
-    source: Option<HwCostSource>,
+    /// [`spot_price_poller`] (bug_034).
+    source: HwCostSource,
 }
 
 impl CostTable {
@@ -264,7 +263,7 @@ impl CostTable {
     /// poller-absence — bug_034). Under `Spot`, clamps to seed while
     /// [`Self::apply_stale_clamp`] has the stale-clamp latched.
     pub fn price(&self, cell: &Cell) -> f64 {
-        if self.source != Some(HwCostSource::Spot) {
+        if self.source != HwCostSource::Spot {
             return seed_price(cell.1);
         }
         if self.stale_clamp {
@@ -327,7 +326,7 @@ impl CostTable {
     /// Seed-backed table scoped to `cluster` under `source`. Use
     /// instead of [`Default`] when the load fallback needs the
     /// cluster/source carried forward to `persist`.
-    pub fn seeded(cluster: &str, source: Option<HwCostSource>) -> Self {
+    pub fn seeded(cluster: &str, source: HwCostSource) -> Self {
         Self {
             cluster: cluster.to_owned(),
             source,
@@ -370,7 +369,7 @@ impl CostTable {
     /// poller's leader-edge reload re-`load()`s under the same source
     /// (the §Static "seeds only" contract is enforced at the read
     /// site — bug_034).
-    pub fn source(&self) -> Option<HwCostSource> {
+    pub fn source(&self) -> HwCostSource {
         self.source
     }
 
@@ -438,7 +437,7 @@ impl CostTable {
     pub async fn load(
         db: &SchedulerDb,
         cluster: &str,
-        source: Option<HwCostSource>,
+        source: HwCostSource,
     ) -> anyhow::Result<Self> {
         type Row = (String, f64, Option<f64>, Option<f64>, f64);
         let mut t = Self::seeded(cluster, source);
@@ -458,7 +457,7 @@ impl CostTable {
                 // `price()` accessor — under non-Spot the map MUST be
                 // empty so the hash matches a seed-only deployment. Do
                 // not remove independently of the `price()` read-gate.
-                if source == Some(HwCostSource::Spot) {
+                if source == HwCostSource::Spot {
                     t.price.insert(
                         cell,
                         PriceEma {
@@ -496,7 +495,7 @@ impl CostTable {
         // skipping the price upsert means leftover Spot-era rows age
         // out instead of being refreshed every 10min by
         // `interrupt_housekeeping` (bug_034).
-        if self.source == Some(HwCostSource::Spot) {
+        if self.source == HwCostSource::Spot {
             for (cell, p) in &self.price {
                 // `to_timestamp($4)` (data-time), NOT `now()`: a tick where
                 // `poll_spot_once` failed must not advance the persisted
@@ -655,19 +654,18 @@ impl CostTable {
                 })
                 .collect(),
             lambda,
-            source: Some(HwCostSource::Spot),
+            source: HwCostSource::Spot,
             ..Self::default()
         }
     }
 
-    /// Test setter: insert a price with an explicit `updated_at`.
-    /// Upgrades `source` `None → Spot` so the value is observable
-    /// through [`Self::price`] (which read-gates to seed under
-    /// non-Spot — bug_034); leaves an explicit `Some(Static)` alone so
-    /// `static_mode_ignores_pg_price_rows` can probe the persist-gate.
+    /// Test setter: insert a price with an explicit `updated_at`. Does
+    /// NOT touch `source` — under [`HwCostSource::Static`] the value is
+    /// invisible through [`Self::price`] (which read-gates to seed —
+    /// bug_034); construct via [`Self::seeded`]`(_, Spot)` or
+    /// [`Self::from_parts`] for an observable price.
     #[cfg(test)]
     pub fn set_price(&mut self, h: &str, cap: CapacityType, value: f64, updated_at: f64) {
-        self.source.get_or_insert(HwCostSource::Spot);
         self.price
             .insert((h.to_owned(), cap), PriceEma { value, updated_at });
     }
@@ -843,7 +841,7 @@ impl IceBackoff {
 /// exports the staleness gauge.
 ///
 /// Spot-only — `main.rs` spawns this only under `hw_cost_source =
-/// Some(Spot)`. λ refresh / sweep / persist / leader-edge reload live
+/// Spot`. λ refresh / sweep / persist / leader-edge reload live
 /// in [`interrupt_housekeeping`] (which runs unconditionally and is the
 /// SOLE owner of `was_leader` writes — see `poller_tick_prelude`).
 /// This poller reads the shared `was_leader` and skips exactly one body
@@ -1310,7 +1308,7 @@ mod tests {
 
         // Cluster A writes price=0.5 for (intel-8, Spot) and an
         // interrupt row.
-        let mut a = CostTable::seeded("us-east-1", Some(HwCostSource::Spot));
+        let mut a = CostTable::seeded("us-east-1", HwCostSource::Spot);
         a.set_price("intel-8", CapacityType::Spot, 0.5, 1000.0);
         a.persist(&sdb).await.unwrap();
         sqlx::query(
@@ -1324,7 +1322,7 @@ mod tests {
 
         // Cluster B loads → sees seeds (NOT A's 0.5), and refresh_lambda
         // sees no rows.
-        let mut b = CostTable::load(&sdb, "eu-west-2", Some(HwCostSource::Spot))
+        let mut b = CostTable::load(&sdb, "eu-west-2", HwCostSource::Spot)
             .await
             .unwrap();
         assert!((b.price(&cell) - 0.5).abs() > 1e-3, "B leaked A's price");
@@ -1332,12 +1330,12 @@ mod tests {
         assert!(b.lambda.is_empty(), "B leaked A's interrupt rows");
 
         // Cluster A reload roundtrips its own price.
-        let a2 = CostTable::load(&sdb, "us-east-1", Some(HwCostSource::Spot))
+        let a2 = CostTable::load(&sdb, "us-east-1", HwCostSource::Spot)
             .await
             .unwrap();
         assert!((a2.price(&cell) - 0.5).abs() < 1e-9);
         // And sees its own interrupt rows.
-        let mut a3 = CostTable::seeded("us-east-1", Some(HwCostSource::Spot));
+        let mut a3 = CostTable::seeded("us-east-1", HwCostSource::Spot);
         a3.refresh_lambda(&sdb).await.unwrap();
         assert!(a3.lambda.contains_key("intel-8"));
 
@@ -1345,7 +1343,7 @@ mod tests {
         // (cluster, key) — no overwrite).
         b.set_price("intel-8", CapacityType::Spot, 0.01, 2000.0);
         b.persist(&sdb).await.unwrap();
-        let a4 = CostTable::load(&sdb, "us-east-1", Some(HwCostSource::Spot))
+        let a4 = CostTable::load(&sdb, "us-east-1", HwCostSource::Spot)
             .await
             .unwrap();
         assert!((a4.price(&cell) - 0.5).abs() < 1e-9);
@@ -1359,10 +1357,10 @@ mod tests {
     async fn persist_preserves_price_updated_at() {
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
         let sdb = SchedulerDb::new(db.pool.clone());
-        let mut t = CostTable::seeded("c", Some(HwCostSource::Spot));
+        let mut t = CostTable::seeded("c", HwCostSource::Spot);
         t.set_price("h", CapacityType::Spot, 0.5, 1000.0);
         t.persist(&sdb).await.unwrap();
-        let r = CostTable::load(&sdb, "c", Some(HwCostSource::Spot))
+        let r = CostTable::load(&sdb, "c", HwCostSource::Spot)
             .await
             .unwrap();
         let at = r
@@ -1384,7 +1382,7 @@ mod tests {
     async fn ema_state_round_trips_pg() {
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
         let sdb = SchedulerDb::new(db.pool.clone());
-        let mut t = CostTable::seeded("c", Some(HwCostSource::Spot));
+        let mut t = CostTable::seeded("c", HwCostSource::Spot);
         let cell = ("intel-7".into(), CapacityType::Spot);
         t.set_price("intel-7", CapacityType::Spot, 0.0123, 7000.0);
         t.lambda.insert(
@@ -1398,7 +1396,7 @@ mod tests {
         t.set_node_count("intel-7", 12.5, 7100.0);
         t.persist(&sdb).await.unwrap();
 
-        let r = CostTable::load(&sdb, "c", Some(HwCostSource::Spot))
+        let r = CostTable::load(&sdb, "c", HwCostSource::Spot)
             .await
             .unwrap();
         assert!((r.price(&cell) - 0.0123).abs() < 1e-9);
@@ -1420,7 +1418,7 @@ mod tests {
     /// The contract is now enforced at the read site (`price()`) AND at
     /// `load`/`persist` so leftover rows are inert and age out.
     #[tokio::test]
-    async fn static_mode_ignores_pg_price_rows() {
+    async fn static_source_ignores_pg_price_rows() {
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
         let sdb = SchedulerDb::new(db.pool.clone());
         // Leftover row from a prior Spot run.
@@ -1432,19 +1430,19 @@ mod tests {
         .await
         .unwrap();
 
-        let mut t = CostTable::load(&sdb, "test-cluster", Some(HwCostSource::Static))
+        let mut t = CostTable::load(&sdb, "test-cluster", HwCostSource::Static)
             .await
             .unwrap();
         let cell: Cell = ("h0".into(), CapacityType::Spot);
         let seed = seed_price(CapacityType::Spot);
         assert!(
             (t.price(&cell) - seed).abs() < 1e-9,
-            "Static mode must return the seed, NOT the stale PG row 0.041; got {}",
+            "Static source must return the seed, NOT the stale PG row 0.041; got {}",
             t.price(&cell)
         );
         assert!(
             (t.price(&cell) - 0.041).abs() > 1e-3,
-            "Static mode must NOT return the leftover PG price"
+            "Static source must NOT return the leftover PG price"
         );
 
         // persist() under Static must not re-upsert price rows even if
@@ -1469,7 +1467,7 @@ mod tests {
     /// clamp clears and `price()` reads through.
     #[test]
     fn stale_price_clamps_to_seed_and_emits_fallback() {
-        let mut t = CostTable::seeded("c", Some(HwCostSource::Spot));
+        let mut t = CostTable::seeded("c", HwCostSource::Spot);
         let cell = ("h".into(), CapacityType::Spot);
         t.set_price("h", CapacityType::Spot, 0.5, 1000.0);
         let rec = metrics_util::debugging::DebuggingRecorder::new();
@@ -1504,7 +1502,7 @@ mod tests {
         let rec = metrics_util::debugging::DebuggingRecorder::new();
         let snap = rec.snapshotter();
         let _g = metrics::set_default_local_recorder(&rec);
-        let mut t = CostTable::seeded("c", Some(HwCostSource::Spot));
+        let mut t = CostTable::seeded("c", HwCostSource::Spot);
         let cell = ("h".to_owned(), CapacityType::Spot);
 
         // One call per arm. Ok(non-empty) folds and emits nothing;
@@ -1554,7 +1552,7 @@ mod tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        let mut t = CostTable::seeded("c", None);
+        let mut t = CostTable::seeded("c", HwCostSource::Static);
         t.refresh_lambda(&sdb).await.unwrap();
         assert!(t.node_count.is_empty(), "first refresh: no baseline");
 
@@ -1580,7 +1578,7 @@ mod tests {
     /// value's decay `dt = now − that value's last-update`.
     #[test]
     fn fold_prices_partial_obs_decays_per_key() {
-        let mut t = CostTable::seeded("c", Some(HwCostSource::Spot));
+        let mut t = CostTable::seeded("c", HwCostSource::Spot);
         let h1: Cell = ("h1".into(), CapacityType::Spot);
         let h2: Cell = ("h2".into(), CapacityType::Spot);
         let mut obs = HashMap::new();
@@ -1611,7 +1609,7 @@ mod tests {
     /// `interrupt_housekeeping`-only edge-reload primitive — `source`
     /// read from the in-mem table, no gauge emit, no
     /// `apply_stale_clamp`. Under
-    /// `hw_cost_source ∈ {Static, None}` the spot poller doesn't spawn,
+    /// `hw_cost_source = Static` the spot poller doesn't spawn,
     /// so the gauge / clamp (now inline in `spot_price_poller`) never
     /// fire. This test guards against re-adding Spot logic to the
     /// prelude (which runs unconditionally → 56-year false positive).
@@ -1621,7 +1619,10 @@ mod tests {
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
         let sdb = SchedulerDb::new(db.pool.clone());
         // No price keys → price_updated_at()=0 → "56 years stale".
-        let cost = Arc::new(parking_lot::RwLock::new(CostTable::seeded("c", None)));
+        let cost = Arc::new(parking_lot::RwLock::new(CostTable::seeded(
+            "c",
+            HwCostSource::Static,
+        )));
 
         let rec = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = rec.snapshotter();
@@ -1677,12 +1678,12 @@ mod tests {
 
         let cell = ("h".into(), CapacityType::Spot);
         // Seed PG with the previous leader's evolved state.
-        let mut prev = CostTable::seeded("c", Some(HwCostSource::Spot));
+        let mut prev = CostTable::seeded("c", HwCostSource::Spot);
         prev.set_price("h", CapacityType::Spot, 0.08, 5000.0);
         prev.persist(&sdb).await.unwrap();
 
         // This replica's stale in-mem startup snapshot.
-        let mut mine = CostTable::seeded("c", Some(HwCostSource::Spot));
+        let mut mine = CostTable::seeded("c", HwCostSource::Spot);
         mine.set_price("h", CapacityType::Spot, 0.02, 100.0);
         let cost = Arc::new(parking_lot::RwLock::new(mine));
 
@@ -1732,12 +1733,12 @@ mod tests {
 
         let cell = ("h".into(), CapacityType::Spot);
         // Seed PG with the previous leader's evolved state.
-        let mut prev = CostTable::seeded("c", Some(HwCostSource::Spot));
+        let mut prev = CostTable::seeded("c", HwCostSource::Spot);
         prev.set_price("h", CapacityType::Spot, 0.08, 5000.0);
         prev.persist(&sdb).await.unwrap();
 
         // This replica's stale in-mem startup snapshot.
-        let mut mine = CostTable::seeded("c", Some(HwCostSource::Spot));
+        let mut mine = CostTable::seeded("c", HwCostSource::Spot);
         mine.set_price("h", CapacityType::Spot, 0.02, 100.0);
         let cost = Arc::new(parking_lot::RwLock::new(mine));
 
@@ -1796,7 +1797,7 @@ mod tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        let mut t = CostTable::seeded("c", None);
+        let mut t = CostTable::seeded("c", HwCostSource::Static);
         t.refresh_lambda(&sdb).await.unwrap();
         let hwm = t.lambda["aws-8-nvme-hi"].updated_at;
         assert_eq!(hwm, 1500.0, "HWM must be MAX(at), got {hwm}");

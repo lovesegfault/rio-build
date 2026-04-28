@@ -680,13 +680,12 @@ impl DagActor {
     /// population) and dispatch's resource-fit filter so the controller
     /// spawns and the scheduler accepts the SAME shape.
     ///
-    /// When `[sla].hw_cost_source` is set, `[sla].hw_classes` is
-    /// non-empty, AND the hw-factor table is populated, the fitted-key
-    /// branch routes through the memoized [`solve::solve_full`]
+    /// When the hw-factor table is populated, the fitted-key branch
+    /// routes through the memoized [`solve::solve_full`]
     /// (admissible-set), draws ε_h, applies the read-time ICE mask,
     /// and returns `nodeAffinity` over `A' \ masked`. Otherwise — or
     /// for override/probe/explore branches — it routes through
-    /// [`solve::intent_for`] (hw-agnostic `solve_mvp`) and returns an
+    /// [`solve::intent_for`] (hw-agnostic `solve_tier`) and returns an
     /// empty affinity.
     // r[impl sched.sla.hw-class.epsilon-explore+6]
     // r[impl sched.sla.hw-class.ice-mask]
@@ -734,10 +733,10 @@ impl DagActor {
         };
 
         // r[impl sched.sla.hw-class.admissible-set]
-        // solve_full path: gated on hw_cost_source set ∧ hw_classes
-        // non-empty ∧ hw-factor table populated ∧ a usable fit (same
-        // n_eff/span gate as intent_for's solve branch — probe/explore
-        // stay on the hw-agnostic path). ANY override field
+        // solve_full path: gated on hw-factor table populated (runtime —
+        // bench cold = hw-agnostic) ∧ a usable fit (same n_eff/span gate
+        // as intent_for's solve branch — probe/explore stay on the
+        // hw-agnostic path). ANY override field
         // (`forced_cores`/`forced_mem`/`tier`) also gates it off:
         // solve_full doesn't take `override_`, so those fall through to
         // `intent_for` which honors all three. (bug_033: `forced_mem`
@@ -764,7 +763,7 @@ impl DagActor {
         // cache-hits don't re-emit per poll. NOT a valid gate for emits
         // depending on read-time state (`ice.masked_cells()`) or for
         // drvs that never enter the hw-aware path (FOD/featured/serial/
-        // static-mode); those use `memo_entry`'s debounce fields /
+        // cold-hw-table); those use `memo_entry`'s debounce fields /
         // `infeasible_static_fh` instead. `hw_emitted` tracks "hw-aware
         // arm already emitted" for the double-count suppress.
         let mut was_miss = false;
@@ -775,9 +774,7 @@ impl DagActor {
         // gate. Read for the debounce-prev values; written back via
         // `update_entry` on edge.
         let mut memo_entry: Option<(u64, u64, solve::MemoEntry)> = None;
-        let full = (self.sla_config.hw_cost_source.is_some()
-            && !h_all.is_empty()
-            && !hw.is_empty()
+        let full = (!hw.is_empty()
             && override_.as_ref().is_none_or(|o| {
                 o.forced_cores.is_none() && o.tier.is_none() && o.forced_mem.is_none()
             })
@@ -1059,7 +1056,7 @@ impl DagActor {
         // `bump_floor_or_count` double `floor.mem`; the next solve
         // returns at least that. Ceiling: `intent_for`'s early-return
         // branches (forced/serial/local/explore) pass fit-derived /
-        // override bytes through unclamped, so the `solve_mvp` /
+        // override bytes through unclamped, so the `solve_tier` /
         // `solve_full` BestEffort clamp doesn't cover them — a
         // `disk_p90` (or `--mem` / `--cores`) above a
         // tightened `max_disk`/`max_mem`/`max_cores` would otherwise
@@ -1157,11 +1154,11 @@ impl DagActor {
                             .and_then(solve::Tier::binding_bound),
                     )
                 } else {
-                    // hw-agnostic arm ⇒ re-run `solve_mvp` (pure) for
+                    // hw-agnostic arm ⇒ re-run `solve_tier` (pure) for
                     // the tier name. The admissible-set arm carries
                     // `full_tier` directly so this only fires when
                     // gates routed away from solve_full.
-                    match solve::solve_mvp(f, tiers, &self.sla_ceilings) {
+                    match solve::solve_tier(f, tiers, &self.sla_ceilings) {
                         solve::SolveResult::Feasible { tier, .. } => (
                             Some(tier.clone()),
                             self.sla_tiers
