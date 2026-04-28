@@ -14,6 +14,7 @@ pub mod client;
 pub(crate) mod eks;
 mod k3s;
 mod phases;
+mod probe_boot;
 pub mod provider;
 pub(crate) mod qa;
 pub mod shared;
@@ -363,6 +364,15 @@ pub enum K8sCmd {
         #[arg(long, value_enum)]
         gate: sla_gates::Gate,
     },
+    /// ADR-023 §13b prerequisite: single-obs `leadTimeSeed` per
+    /// `sla.hwClasses × {spot,od}` cell + 5 Karpenter-conformance
+    /// assertions (naked NodeClaim launches; shim NodePool never
+    /// provisions; Registered.lastTransitionTime populated;
+    /// `karpenter.sh/nodepool` label survives to Node;
+    /// `budgets:nodes:"0"` blocks drift). EKS-only, operator-run; NOT
+    /// a CI test. Output: per-cell boot seconds + paste-ready
+    /// `sla.leadTimeSeed:` YAML block.
+    ProbeBoot,
     /// Rotate `rio-general` Karpenter nodes onto the current AMI.
     /// EKS-only. The rio-general NodePool has `budgets:0/Drifted`, so
     /// AMI changes leave its NodeClaims at `Drifted=True` indefinitely
@@ -505,6 +515,15 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             }
         }
         K8sCmd::SlaGates { gate } => sla_gates::run(gate).await,
+        K8sCmd::ProbeBoot => {
+            if !matches!(kind, ProviderKind::Eks) {
+                bail!(
+                    "`probe-boot` is EKS-only (live Karpenter NodeClaim conformance, \
+                     ADR-023 §13b); pass -p eks"
+                );
+            }
+            probe_boot::run().await
+        }
         K8sCmd::RotateGeneral => {
             if !matches!(kind, ProviderKind::Eks) {
                 bail!("`rotate-general` is EKS-only (Karpenter NodeClaims); pass -p eks");
