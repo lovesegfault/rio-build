@@ -1067,13 +1067,6 @@ pub struct MemoEntry {
     /// — emit on the `false→true` edge. ICE state is read-time (NOT in
     /// `inputs_gen`), so `was_miss` is the wrong gate; this is.
     pub ice_exhausted: bool,
-    /// R5B3: once-per-`fit_content_hash` anchor for `_infeasible_total`
-    /// on the `intent_for` fallback. Static-mode / FOD / featured /
-    /// serial drvs have NO `was_miss` (they never reach the memo), and
-    /// drvs that DO reach it always have `hw_emitted=true` on the
-    /// fallback today — so this field is the with-memo half of the
-    /// anchor; the no-memo half is [`SolveCache::infeasible_static_seen`].
-    pub last_infeasible_fh: Option<u64>,
     /// §Fifth-strike: ε_h's `h_explore` pin, **decoupled from
     /// `inputs_gen`**. Lifecycle owned by [`super::explore::resolve_h_explore`]
     /// — the ε_h coin is `hash(drv_hash)`-seeded (which drvs explore);
@@ -1082,6 +1075,14 @@ pub struct MemoEntry {
     /// released on graduation into A, removal from `h_all`, OR
     /// `solve_full({h})` infeasible / fully ICE-masked.
     pub pinned_explore: Option<HwClassName>,
+    /// R8B1: prior ε_h restricted solve's `A'.cells` — the Schmitt
+    /// `prev_a` for the NEXT restricted solve. Carried across staleness
+    /// with `pinned_explore`; cleared when the pin rotates to a new `h`
+    /// (its first solve uses τ_enter, correctly). Without this the
+    /// restricted solve always passes `prev_a=∅` → heads-drvs lose the
+    /// deadband → `(h_explore, od)` flips at the `[1+τ, 1+1.3τ]`
+    /// boundary on every `inputs_gen` epoch (bug_014).
+    pub pinned_explore_a: HashSet<Cell>,
 }
 
 /// Per-key solve memo. Nested `mkh → (ovr → MemoEntry)` — logical
@@ -1112,8 +1113,8 @@ pub struct SolveCache {
     /// which `intent_for`'s `_infeasible_total` was emitted. Drvs that
     /// pre-gate fail (`hw_cost_source=None` / `hw_classes={}` / FOD /
     /// featured / serial / forced-tier override) never call
-    /// [`Self::get_or_insert_with`], so [`MemoEntry::last_infeasible_fh`]
-    /// can't anchor them; THIS does. Keyed `(mkh, ovr)` — same shape
+    /// [`Self::get_or_insert_with`], so `was_miss` can't anchor them;
+    /// THIS does. Keyed `(mkh, ovr)` — same shape
     /// as `entries` — because `intent_for`'s emit decision depends on
     /// `override_.tier`, which is NOT in `fh` (bug_003). Swept by
     /// [`Self::remove_model_key`] (drops the inner map; O(1)).
@@ -1127,7 +1128,7 @@ impl SolveCache {
     /// `was_miss` gates the post-memo metric emits whose inputs ARE in
     /// `inputs_gen` (`BestEffort.why`, `_hw_cost_unknown`); the
     /// returned entry's debounce fields gate the ones whose inputs are
-    /// NOT (`ice_exhausted`, `last_infeasible_fh`). The full
+    /// NOT (`ice_exhausted`). The full
     /// [`SolveFullResult`] is memoized — `BestEffort` is cached too, so
     /// a key whose every tier is infeasible doesn't re-solve every
     /// poll. `prev_a` is the prior entry's Feasible `A'` (Schmitt
@@ -1172,8 +1173,11 @@ impl SolveCache {
             // signal by itself. `pinned_explore`'s release valve is the
             // graduation filter at the ε_h block, not memo staleness.
             ice_exhausted: prior.as_ref().is_some_and(|p| p.ice_exhausted),
-            last_infeasible_fh: prior.as_ref().and_then(|p| p.last_infeasible_fh),
             pinned_explore: prior.as_ref().and_then(|p| p.pinned_explore.clone()),
+            pinned_explore_a: prior
+                .as_ref()
+                .map(|p| p.pinned_explore_a.clone())
+                .unwrap_or_default(),
         };
         self.entries
             .entry(mkh)
@@ -1200,9 +1204,8 @@ impl SolveCache {
     /// `intent_for`'s emit at L454-461 is gated on `tiers.iter()
     /// .any(|t| t.p*.is_some())` which `override_.tier` filters at
     /// L440-445, so the same `fh` may emit under one override and not
-    /// another (bug_003: the with-memo sibling
-    /// [`MemoEntry::last_infeasible_fh`] was already `(mkh, ovr)`-
-    /// keyed for exactly this reason).
+    /// another (bug_003: the with-memo sibling `was_miss` was already
+    /// `(mkh, ovr)`-keyed for exactly this reason).
     pub fn infeasible_static_seen(&self, mkh: u64, ovr: u64, fh: u64) -> bool {
         use std::collections::hash_map::Entry;
         let mut inner = self.infeasible_static_fh.entry(mkh).or_default();
@@ -2390,8 +2393,11 @@ mod tests {
         let (r1, miss1) = cache.get_or_insert_with(mk, 0, g0, fh, go);
         assert!(miss1);
         assert!(!r1.ice_exhausted, "fresh entry: ice_exhausted=false");
-        assert_eq!(r1.last_infeasible_fh, None, "fresh entry: anchor unset");
         assert_eq!(r1.pinned_explore, None, "fresh entry: ε_h pin unset");
+        assert!(
+            r1.pinned_explore_a.is_empty(),
+            "fresh entry: ε_h prev_a empty"
+        );
         let (r1b, miss1b) = cache.get_or_insert_with(mk, 0, g0, fh, go);
         assert!(!miss1b, "second call hits memo");
         assert_eq!(calls.get(), 1);
@@ -2406,6 +2412,7 @@ mod tests {
         cache.update_entry(mk, 0, |e| {
             e.ice_exhausted = true;
             e.pinned_explore = Some("intel-7".into());
+            e.pinned_explore_a = [("intel-7".into(), CapacityType::Spot)].into();
         });
         // Different inputs_gen → miss; prev_a from old entry; debounce
         // carried forward.
@@ -2427,6 +2434,12 @@ mod tests {
             Some("intel-7"),
             "pinned_explore carried across inputs_gen miss — ε_h decoupled \
              from inputs_gen (§Fourth-strike Option 2)"
+        );
+        assert_eq!(
+            e3.pinned_explore_a,
+            [("intel-7".into(), CapacityType::Spot)].into(),
+            "pinned_explore_a carried across inputs_gen miss — restricted \
+             solve's Schmitt prev_a survives (R8B1)"
         );
         assert_eq!(calls.get(), 3);
         // Regression (merged_bug_026): refit changes fit_content_hash

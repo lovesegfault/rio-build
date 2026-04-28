@@ -859,7 +859,16 @@ impl DagActor {
                     pool: &pool,
                     masked: &masked,
                 };
-                let outcome = resolve_h_explore(prev_pin, mkh, ovr, &ctx, |h| {
+                // R8B1: Schmitt `prev_a` for the restricted solve. The
+                // unrestricted memo's `prev_a` can't help (`h_explore ∈
+                // H\A` so `(h_explore,*)` is never in it); the prior
+                // RESTRICTED A' is per-key state with the same
+                // lifetime as `pinned_explore`, carried alongside it.
+                let prev_explore_a = memo_entry
+                    .as_ref()
+                    .map(|(_, _, e)| e.pinned_explore_a.clone())
+                    .unwrap_or_default();
+                let outcome = resolve_h_explore(prev_pin.clone(), mkh, ovr, &ctx, |h| {
                     tracing::Span::current().record("hw_explore", h.as_str());
                     solve::solve_full(
                         f,
@@ -869,7 +878,7 @@ impl DagActor {
                         &self.sla_ceilings,
                         &self.sla_config,
                         std::slice::from_ref(h),
-                        &std::collections::HashSet::new(),
+                        &prev_explore_a,
                         // Unmemoized — gate `_hw_cost_unknown_total`
                         // on the unrestricted memo's `was_miss` so
                         // it fires once per (key, inputs_gen).
@@ -877,22 +886,45 @@ impl DagActor {
                     )
                 });
                 // Idempotent memo write — same class as the
-                // `update_entry` for `ice_exhausted`; only on edge.
-                let commit = |pin: &Option<String>| {
+                // `update_entry` for `ice_exhausted`. Guard widened to
+                // EITHER edge: `pin` change OR `cells` change. Hit at a
+                // stable pin (the steady-state path) has fresh `cells`
+                // every epoch; without the `|| cells` arm those never
+                // refresh and `prev_explore_a` lags one Hit (Claim C).
+                // `memo_entry` is an OWNED clone (solve.rs `.cloned()`
+                // drops the DashMap guard) — no re-entrancy.
+                let commit = |pin: &Option<String>,
+                              cells: std::collections::HashSet<crate::sla::config::Cell>| {
                     if let Some((_, _, prev)) = &memo_entry
-                        && prev.pinned_explore != *pin
+                        && (prev.pinned_explore != *pin || prev.pinned_explore_a != cells)
                     {
-                        self.solve_cache
-                            .update_entry(mkh, ovr, |e| e.pinned_explore = pin.clone());
+                        self.solve_cache.update_entry(mkh, ovr, |e| {
+                            e.pinned_explore = pin.clone();
+                            e.pinned_explore_a = cells;
+                        });
                     }
                 };
                 match outcome {
                     HExploreOutcome::Hit(hit) => {
-                        commit(&Some(hit.pin));
+                        commit(
+                            &Some(hit.pin.clone()),
+                            hit.memo.a.cells.iter().cloned().collect(),
+                        );
                         return Some((hit.memo, h_all.clone()));
                     }
                     HExploreOutcome::Miss { next } => {
-                        commit(&next);
+                        // Singleton fixed-point (next==prev_pin)
+                        // preserves prev_a via guard no-op (both args
+                        // equal stored). Rotation (next≠prev_pin)
+                        // clears it: new h's first solve uses τ_enter.
+                        commit(
+                            &next,
+                            if next.as_deref() == prev_pin.as_deref() {
+                                prev_explore_a
+                            } else {
+                                std::collections::HashSet::new()
+                            },
+                        );
                         // Fall through to the unrestricted memo. `next`
                         // gets its one solve on the NEXT ε_h hit.
                     }
@@ -998,10 +1030,9 @@ impl DagActor {
                 // `hw_emitted` stays load-bearing: with-memo BestEffort
                 // emits at :821 and falls through to here, so the
                 // `Some(..)` memo_entry arm is structurally unreachable
-                // (`memo_entry.is_some() ⟹ hw_emitted`) — that
-                // debounce lives at :821, not here (the prior
-                // `last_infeasible_fh` check was shadowed but
-                // architecturally placed; collapsed). No-memo anchor is
+                // (`memo_entry.is_some() ⟹ hw_emitted`) — with-memo
+                // debounce lives at :821 via `was_miss`; no-memo via
+                // `infeasible_static_fh`. No-memo anchor is
                 // once-per-`(mkh, ovr, fit_content_hash)` via
                 // `infeasible_static_fh`: refit re-arms; stable across
                 // polls.
