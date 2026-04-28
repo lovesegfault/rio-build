@@ -584,6 +584,40 @@ mod tests {
         assert_eq!(HwTable::default().min_factor(UNIFORM), 1.0);
     }
 
+    /// bug_012: `min_factor(UNIFORM)` is the simplex CENTROID, not the
+    /// minimum. `dot(α, f)` is linear in α over Δ² so `min_α dot(α, f)
+    /// = min_d f[d]` (vertex). The backstop's "worst-case across all
+    /// pnames" denorm needs the vertex bound; the centroid is
+    /// anti-conservative — under-budgets vertex-α builds on anisotropic
+    /// hw → premature cancel → poison.
+    #[test]
+    fn min_factor_any_alpha_is_simplex_min() {
+        let mut m = HashMap::new();
+        m.insert("slow".into(), [0.25, 2.0, 2.0]);
+        m.insert("ref".into(), [1.0, 1.0, 1.0]);
+        let t = HwTable::from_factors(m);
+        // (1) The gap: simplex-min finds the 0.25 vertex; centroid
+        // averages it away. dot(UNIFORM, [0.25,2,2]) = 1.417,
+        // dot(UNIFORM, [1,1,1]) = 1.0 → min_factor(UNIFORM) = 1.0.
+        assert_eq!(t.min_factor_any_alpha(), 0.25);
+        assert_eq!(t.min_factor(UNIFORM), 1.0);
+        // (2) Lower-bound invariant: min_factor_any_alpha() ≤
+        // min_factor(α) for any α on the simplex (vertex ≤ any convex
+        // combination). Unconditional because both sides clamp per
+        // dot()'s [FLOOR, CEIL].
+        for alpha in [[1.0, 0.0, 0.0], UNIFORM, [0.0, 0.0, 1.0]] {
+            assert!(
+                t.min_factor_any_alpha() <= t.min_factor(alpha),
+                "min_factor_any_alpha()={} > min_factor({alpha:?})={}",
+                t.min_factor_any_alpha(),
+                t.min_factor(alpha),
+            );
+        }
+        // (3) Empty-table parity with min_factor: 1.0 (no trusted
+        // classes → reference timeline).
+        assert_eq!(HwTable::default().min_factor_any_alpha(), 1.0);
+    }
+
     /// `normalize` and `factor` clamp to `[FLOOR, CEIL]` so a single
     /// poisoned `hw_perf_samples` row can't blow T(c) fitting up by
     /// orders of magnitude. The store's `AppendHwPerfSample` already
