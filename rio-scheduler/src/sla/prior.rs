@@ -724,7 +724,7 @@ mod tests {
         }
     }
 
-    // r[verify sched.sla.hw-class.alpha-als]
+    // r[verify sched.sla.hw-class.alpha-als+2]
     /// ADR L547: fleet-median α is per-dimension marginal median across
     /// fitted pnames (same machinery as the M(c) prior), re-projected
     /// onto Δ². Median-of-tenant-medians: 2 tenants × 3 keys each;

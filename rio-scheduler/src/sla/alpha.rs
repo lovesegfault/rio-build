@@ -13,9 +13,10 @@
 //! [`fit_alpha`] (simplex-projected gradient descent on the
 //! c-residualized speedup `T_ref(c)/wall ≈ α·factor`). The alternation is
 //! heuristic — neither block is closed-form descent on a single
-//! objective — so it is hard-capped at 5 rounds; non-convergence is
-//! emitted as `rio_scheduler_sla_als_round_cap_hit_total` and is a
-//! §Phasing-13a empirical gate.
+//! objective — so it is hard-capped at [`ALS_MAX_ROUNDS`];
+//! non-convergence is emitted as
+//! `rio_scheduler_sla_als_round_cap_hit_total` and is a §Phasing-13a
+//! empirical gate.
 
 use super::fit::{StageGate, fit_duration_staged};
 use super::hw::{HW_FACTOR_SANITY_CEIL, HW_FACTOR_SANITY_FLOOR, K};
@@ -68,10 +69,19 @@ pub struct AlphaSample {
 /// contributes ≤ `0.2 · ‖α−prior‖ ≤ 0.2`.
 pub const LAMBDA_RIDGE: f64 = 0.1;
 
-/// Max ALS rounds (ADR-023 L555).
-pub const ALS_MAX_ROUNDS: u8 = 5;
-/// ALS convergence threshold on `‖Δα‖₁` (ADR-023 L555).
-pub const ALS_DELTA_TOL: f64 = 1e-2;
+/// Max ALS rounds. ADR-023 L555 specced 5; raised after gate-a showed
+/// c↔h-correlated designs (each `c` on exactly one `h`) are
+/// ill-conditioned for block-CD — the per-round contraction is ~0.95 so
+/// recovery to gate-a's |α̂−α|<0.05 needs ~65 rounds. Well-crossed
+/// designs still converge in 2-3. Per-round cost is one 2-col NNLS +
+/// one K=3 PGD (<100µs); the cap is the worst-case budget — `CapHit`
+/// emits `_als_round_cap_hit_total` per §Phasing-13a.
+pub const ALS_MAX_ROUNDS: u8 = 100;
+/// ALS convergence threshold on `‖Δα‖₁`. ADR-023 L555 specced 10⁻²;
+/// tightened because under c↔h confound the ~0.95 contraction means
+/// `‖Δα‖₁<10⁻²` triggers at α-error ≈ 0.01/(1−0.95) = 0.2 — well short
+/// of gate-a's 0.05.
+pub const ALS_DELTA_TOL: f64 = 1e-3;
 
 /// [`als_fit`] termination reason. Type-checked so the
 /// `_als_round_cap_hit_total` emit cannot conflate "converged on the
@@ -139,7 +149,7 @@ fn rank_gate(samples: &[AlphaSample]) -> bool {
     false
 }
 
-// r[impl sched.sla.hw-class.alpha-als]
+// r[impl sched.sla.hw-class.alpha-als+2]
 /// Simplex-constrained weighted LS via projected gradient descent:
 ///
 /// `min_{α∈Δ} Σ w_i (α·factor_i − y_i)² + λ‖α−α_prior‖²`
@@ -185,7 +195,7 @@ pub fn fit_alpha(samples: &[AlphaSample], prior: Alpha, lambda_ridge: f64) -> Al
     alpha
 }
 
-// r[impl sched.sla.hw-class.alpha-als]
+// r[impl sched.sla.hw-class.alpha-als+2]
 /// Bounded ALS: alternate `(NNLS on wall·(α·factor[h]))` ↔ `(fit_alpha on
 /// T_ref(c)/wall)` until `‖Δα‖₁ < 10⁻²` or [`ALS_MAX_ROUNDS`].
 ///
@@ -238,7 +248,16 @@ pub fn als_fit(
                 })
             })
             .collect();
-        let next = fit_alpha(&samples, prior, LAMBDA_RIDGE);
+        // Ridge toward the CURRENT iterate, not `prior`: ridging toward
+        // `prior` every round means the data-only fixed point is NOT a
+        // fixed point of the ALS map (fit_alpha pulls it ~2% toward
+        // prior); under c↔h confound that perturbation feeds back via
+        // Step A's S-estimate and the iteration spirals to a spurious
+        // attractor (gate-a: truth [1,0,0] → [0.65,0.24,0.11]). With the
+        // ridge anchored at `alpha` it becomes a per-round trust-region
+        // damper — the data-only optimum IS a fixed point — and round 0
+        // still ridges toward `prior` since `alpha` starts there.
+        let next = fit_alpha(&samples, alpha, LAMBDA_RIDGE);
         let delta: f64 = next.iter().zip(alpha).map(|(n, a)| (n - a).abs()).sum();
         alpha = next;
         if delta < ALS_DELTA_TOL {
@@ -282,7 +301,7 @@ mod tests {
         assert!((p[0] - 0.2).abs() < 1e-12 && (p[2] - 0.5).abs() < 1e-12);
     }
 
-    // r[verify sched.sla.hw-class.alpha-als]
+    // r[verify sched.sla.hw-class.alpha-als+2]
     #[test]
     fn alpha_recovers_pure_alu() {
         // 4 hw_classes with linearly-independent factor vecs; pname is
@@ -299,7 +318,7 @@ mod tests {
         assert!(alpha[1] < 0.05 && alpha[2] < 0.05, "α = {alpha:?}");
     }
 
-    // r[verify sched.sla.hw-class.alpha-als]
+    // r[verify sched.sla.hw-class.alpha-als+2]
     #[test]
     fn alpha_stays_at_prior_below_rank_gate() {
         let prior = [0.6, 0.3, 0.1];
@@ -339,7 +358,7 @@ mod tests {
         assert!((dot([0.2, 0.3, 0.5], [1.7; K]) - 1.7).abs() < 1e-12);
     }
 
-    // r[verify sched.sla.hw-class.alpha-als]
+    // r[verify sched.sla.hw-class.alpha-als+2]
     #[test]
     fn als_converges_within_5_rounds() {
         // True T_ref(c) = 30 + 2000/c on 4 hw_classes; table-driven over
@@ -471,6 +490,55 @@ mod tests {
         }
     }
 
+    // r[verify sched.sla.hw-class.alpha-als+2]
+    /// gate-a (xtask/src/k8s/sla_gates.rs) in-process: 3 hw_classes,
+    /// 6 samples, c↔h fully correlated (each c on exactly one h),
+    /// truth α=[1,0,0]. Regression: with the Step-B ridge anchored at
+    /// `prior` instead of the current iterate, the data optimum is NOT
+    /// a fixed point of the ALS map — fit_alpha pulls truth ~2% toward
+    /// UNIFORM, the perturbation feeds back via Step A's S-estimate
+    /// (α-err → ts-bias → S-under → resid-bias → more α-err), and the
+    /// iteration converges to a spurious attractor at α≈[0.46,0.37,0.17]
+    /// from ANY starting point including truth itself.
+    #[test]
+    fn gate_a_recovery_repro() {
+        let truth: [f64; 3] = [1.0, 0.0, 0.0];
+        let hw: [[f64; 3]; 3] = [[1.0, 0.6, 1.4], [1.6, 1.3, 0.7], [2.4, 0.8, 1.1]];
+        // c↔h pairing: each h gets two c-values, no overlap.
+        let probe: [(f64, usize); 6] = [
+            (4.0, 0),
+            (8.0, 0),
+            (12.0, 1),
+            (16.0, 1),
+            (32.0, 2),
+            (64.0, 2),
+        ];
+        let (mut cs, mut walls, mut factors) = (vec![], vec![], vec![]);
+        for &(c, hi) in &probe {
+            let f = hw[hi];
+            let speedup: f64 = truth.iter().zip(f).map(|(a, k)| a * k).sum();
+            cs.push(c);
+            walls.push((30.0 + 2000.0 / c) / speedup);
+            factors.push(Some(f));
+        }
+        let w = vec![1.0; 6];
+        // ingest.rs:283 with gate-a's rows: n_eff=6 (uniform w), span=64/4,
+        // p_bar=∞ (no peak_cpu_cores seeded → no unsat row), prev_usl=false.
+        let gate = StageGate {
+            n_eff: 6.0,
+            span: 16.0,
+            p_bar: f64::INFINITY,
+            prev_usl: false,
+        };
+        let (fit, _, alpha, rounds) = als_fit(&cs, &walls, &factors, &w, &gate, UNIFORM);
+        assert!(
+            (alpha[0] - 1.0).abs() < 0.05,
+            "α[0]={} (full α={alpha:?}, fit={fit:?}, rounds={rounds:?})",
+            alpha[0]
+        );
+        assert!(alpha[1] < 0.05 && alpha[2] < 0.05, "α={alpha:?}");
+    }
+
     /// All-unbench'd rows (factors=None): α stays at prior, fit equals
     /// plain `fit_duration_staged` on raw wall — the pre-ALS behaviour.
     #[test]
@@ -506,7 +574,7 @@ mod tests {
             prop_assert!(on_simplex(simplex_project([a, b, c])));
         }
 
-        // r[verify sched.sla.hw-class.alpha-als]
+        // r[verify sched.sla.hw-class.alpha-als+2]
         #[test]
         fn als_fit_alpha_on_simplex(
             seeds in prop::collection::vec((1u8..5, 0.5f64..3.0, 0.5f64..3.0, 0.5f64..3.0), 4..16),

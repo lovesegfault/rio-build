@@ -753,10 +753,15 @@ STREAM-triad, `ioseq` O_DIRECT) at init when the
 appended to `hw_perf_samples(hw_class, pod_id, factor jsonb,
 submitting_tenant)`.
 
-r[sched.sla.hw-class.alpha-als]
+r[sched.sla.hw-class.alpha-als+2]
 Per-pname mixture α∈Δ^{K-1} is fitted via bounded heuristic
 alternation: NNLS on `wall·(α·factor[h])` ↔ simplex-LS on
-`exp(-ε̂)≈α·factor[h]`, ≤5 rounds, terminating at ‖Δα‖₁<10⁻².
+`exp(-ε̂)≈α·factor[h]` ridged toward the previous iterate, ≤100
+rounds, terminating at ‖Δα‖₁<10⁻³. The simplex-LS ridge MUST be
+anchored at the current iterate (NOT `α_prior`): under c↔h-correlated
+designs a fixed prior-ridge makes the data optimum a non-fixed-point
+of the ALS map and the iteration converges to a spurious attractor
+(§Phasing-13a gate-a).
 
 r[sched.sla.hw-class.admissible-set]
 The admissible set is `A = {(h,cap): 𝔼[cost]^upper ≤ (1+τ)·𝔼^min}`

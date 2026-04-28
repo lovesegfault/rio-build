@@ -295,7 +295,7 @@ pub fn refit(
     let alpha_prior = theta_prior
         .as_ref()
         .map_or(alpha::UNIFORM, |(p, _)| p.alpha);
-    // r[impl sched.sla.hw-class.alpha-als]
+    // r[impl sched.sla.hw-class.alpha-als+2]
     // When the rank gate never passes — single hw_class, all-NULL, or
     // isotropic factors — als_fit returns (fit_duration_staged, prior,
     // 1): the pre-ALS behaviour. The I/O-saturation `ioseq` seed (ADR
@@ -346,9 +346,11 @@ pub fn refit(
     // explore path doesn't read the curve anyway). Non-Probe fits get
     // their (S,P,Q,a,b) blended toward the prior — at n_eff=3 it's a
     // 50/50 mix; by n_eff≈30 the prior is <10% and effectively gone.
-    // α is NOT re-blended here: `als_fit`'s ridge already pools toward
-    // `α_prior` and its output respects the simplex constraint, which a
-    // post-hoc linear blend would not.
+    // α is NOT re-blended here: `als_fit` warm-starts at `α_prior` (so a
+    // rank-gated / under-determined design returns it unchanged) and its
+    // output respects the simplex constraint, which a post-hoc linear
+    // blend would not. The per-round ridge is toward the previous
+    // iterate (NOT `α_prior`) — see `r[sched.sla.hw-class.alpha-als+2]`.
     let prior_source = theta_prior.map(|(theta_prior, prov)| {
         if !matches!(fit, DurationFit::Probe) {
             let theta_pname = extract_fit_params(&fit, &mem, alpha);
