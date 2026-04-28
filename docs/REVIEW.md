@@ -58,10 +58,35 @@ in too many heads.
   `s+p/c+q·c`. Directive becomes "call X", not "implement X-shaped
   thing" — deletes the degree of freedom (seed-consumption,
   fold-vs-collect, clamp-or-not) the recipe could get wrong.
+- **Precondition → postcondition** (r8 bug_003 → `h_explore_pool`): a
+  function with a documented precondition that callers must maintain
+  ("`x ⊆ S`", "sorted", "non-empty") is a finding when the only caller
+  doesn't maintain it. Close: the function that DOCUMENTS the
+  precondition also CONSTRUCTS its input — `pub fn build_x() -> X`;
+  caller passes `build_x()`. Precondition becomes postcondition; a
+  future caller cannot construct an input the doc doesn't describe.
+  r8 bug_003: `resolve_h_explore` claimed `pool ⊆ H\A\{cheapest}` at
+  three doc sites; the caller's else-branch built `H\A`.
 
 A new review rule MAY accompany the type-check (so first-strike on a
 *different* invariant is caught) — but the type-check is the close,
 not the rule.
+
+## Structural-close-completion
+
+A §Nth-strike structural close is **four parts**: (1) behavior fix;
+(2) doc/spec sync; (3) sibling sweep — `rg <pattern>` for the
+open-coded shape in the same crate; (4) dead-code sweep — `rg <field>`
+for state the close obsoleted. **Every batch directive ends with a
+`Done-gate:` line listing the literal `rg` commands** that verify
+(3)+(4); reviewer runs them.
+
+**Why:** r7 delivered (1) at 4/4 and (2-4) at 3/4 each. r8 bug_003 =
+(2) failure: R7B0 added doc/spec claims the code never delivered. r8
+bug_011 = (3) failure: R7B3 §Canonicalize migrated gate_b to typed
+parse, missed gate_a in the same file. r8 mb_005 = (4) failure: R7B1
+collapsed the read site, left the field declaration + carry-forward +
+4 doc comments.
 
 ## Granularity coupling
 
@@ -116,6 +141,14 @@ sibling `MemoEntry.last_infeasible_fh` keyed `(mkh, ovr)`. The dropped
 dimension `override_.tier` changes the debounced predicate (emit
 decision) without changing the coarser key → two overrides on one
 `mkh` race for one suppress slot.
+
+**Model-key axes in cross-crate consumers.** A function that queries
+by a subset of `ModelKey`'s axes (e.g. `(pname, system)` without
+`tenant`) and then looks up a per-ModelKey cache is a finding. Close:
+the helper takes `&ModelKey` so the call site must bind every axis.
+r8 mb_001: gate_b's candidate SQL grouped `(pname, system)`; `sla
+status` defaulted `tenant=""`; `cached()` is per-tenant exact-match →
+every candidate `has_fit=false` → vacuous PASS on multi-tenant prod.
 
 ## Semantic field change
 
@@ -253,3 +286,22 @@ such site is a finding to add a `t_ref_at` field to
 `DurationFit::t_at` clamps `c.min(p̄)` for Capped/Usl. For samples at
 `c > p̄` the open-coded formula under-predicts by `c/p̄`, projecting
 as spurious per-h spread → false-FAIL of the §13a GO gate.
+
+## Simplex-bound
+
+A "worst-case across all pnames" denorm using `f(UNIFORM)` where `f`
+is linear in `α ∈ Δ^{K-1}` is a finding — `min_α f(α)` is at a vertex,
+not the centroid. `min_α dot(α, v) = min_d v[d]`; `max_α dot(α, v) =
+max_d v[d]`. (Generalizes — non-normative: min of concave / max of
+convex over Δ is at a vertex.)
+
+**Why:** r8 bug_012: `housekeeping::tick_scan_dag`'s backstop denormed
+ref-seconds via `est / min_factor(UNIFORM)`. `dot(α, f[h])` is linear
+in α, so `min_factor(UNIFORM) ≥ min_h min_d f[h][d]` — under-budgets
+vertex-α builds on anisotropic hw by up to `mean(f)/min(f)` →
+premature cancel → poison loop.
+
+**Structural close:** add `min_factor_any_alpha() = min_h min_d
+f[h][d]` (the true simplex-min, hoisted constant) and call it. The
+per-key `min_factor(f.alpha)` is correct as-is — it has the actual α;
+only the "any pname" bound needs the vertex.
