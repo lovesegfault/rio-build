@@ -278,16 +278,17 @@ impl DagActor {
         // is wall. Worker hw_class is unknown here (only CompletionReport
         // carries it) → divide by slowest factor so the backstop never
         // fires before worst-case wall completion. Same pattern as
-        // snapshot.rs deadline derivation. min_factor() is clamped at
-        // HW_FACTOR_SANITY_FLOOR (sla/hw.rs) so division is safe; one
-        // read-lock per tick (hoisted out of the per-node loop). α is
-        // per-pname, but this loop covers all nodes; UNIFORM is the
-        // simplex-centroid worst-case proxy (Task A9: per-key α once
-        // est_duration carries the fitted α alongside t_min).
-        let min_hw = self
-            .sla_estimator
-            .hw_table()
-            .min_factor(crate::sla::alpha::UNIFORM);
+        // snapshot.rs deadline derivation. min_factor_any_alpha() is
+        // clamped at HW_FACTOR_SANITY_FLOOR (sla/hw.rs) so division is
+        // safe; one read-lock per tick (hoisted out of the per-node
+        // loop). α is per-pname, but this loop covers all nodes;
+        // simplex-minimum (vertex) worst-case: `min_α dot(α,f) =
+        // min_d f[d]` so any pname's `min_factor(α) ≥
+        // min_factor_any_alpha()`. Anti-conservative centroid
+        // (bug_012) under-budgets vertex-α builds on anisotropic hw →
+        // premature cancel → poison. (Task A9: per-key α once
+        // est_duration carries the fitted α alongside t_min.)
+        let min_hw = self.sla_estimator.hw_table().min_factor_any_alpha();
 
         for (drv_hash, state) in self.dag.iter_nodes() {
             if state.status() == DerivationStatus::Poisoned

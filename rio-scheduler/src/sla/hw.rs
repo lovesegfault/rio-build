@@ -185,6 +185,27 @@ impl HwTable {
             .max(HW_FACTOR_SANITY_FLOOR)
     }
 
+    /// Smallest single-dimension factor across all trusted classes:
+    /// `min_h min_d factor[h][d]`. Since `dot(α, f)` is linear in α
+    /// over the simplex, `min_{α∈Δ} dot(α, f[h]) = min_d f[h][d]`
+    /// (vertex), so this is the worst-case `min_factor(α)` over ALL
+    /// pnames — a conservative hoisted-constant bound for backstop
+    /// denorm where the per-key α is unavailable. NOT the centroid
+    /// `min_factor(UNIFORM)`, which is anti-conservative (bug_012).
+    /// Clamped per [`super::alpha::dot`]'s `[FLOOR, CEIL]` so
+    /// `min_factor_any_alpha() ≤ min_factor(α)` is unconditional.
+    pub fn min_factor_any_alpha(&self) -> f64 {
+        let v = self
+            .iter()
+            .flat_map(|(_, f)| f.iter().copied())
+            .fold(f64::INFINITY, f64::min);
+        if v.is_finite() {
+            v.clamp(HW_FACTOR_SANITY_FLOOR, HW_FACTOR_SANITY_CEIL)
+        } else {
+            1.0
+        }
+    }
+
     /// Stable hash of the **solve-relevant projection**: per entry,
     /// `(hw_class, factor[K].map(clamp), pod_ids >= HW_MIN_PODS)` —
     /// exactly what [`Self::factor`] / [`Self::iter`] / [`Self::len`]
