@@ -501,13 +501,18 @@ impl DagActor {
         // truncation drops forecast first — Ready pods matter more.
         // Keys on `ready` (not `eta_seconds == 0.0`): a forecast
         // intent with overdue deps clamps to eta=0.0 but is NOT Ready
-        // (bug_030).
+        // (bug_030). Tiebreak `(cores desc, intent_id asc)` —
+        // superset of the forecast sort at :471-477 so its order
+        // survives within `ready=false`; per REVIEW.md
+        // §HashMap-iteration.
         intents.sort_unstable_by(|(pa, ia), (pb, ib)| {
             // `unwrap_or(true)`: a pre-§13a sender omits field 13;
             // pre-§13a only emitted Ready-loop intents (bug_001).
             (ib.ready.unwrap_or(true), *pb)
                 .partial_cmp(&(ia.ready.unwrap_or(true), *pa))
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then(ib.cores.cmp(&ia.cores))
+                .then_with(|| ia.intent_id.cmp(&ib.intent_id))
         });
 
         SpawnIntentsSnapshot {
