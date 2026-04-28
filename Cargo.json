@@ -495,7 +495,7 @@
       "dependencies": [
         {
           "name": "windows-sys",
-          "packageId": "windows-sys 0.60.2",
+          "packageId": "windows-sys 0.61.2",
           "target": "cfg(windows)"
         }
       ],
@@ -523,7 +523,7 @@
         },
         {
           "name": "windows-sys",
-          "packageId": "windows-sys 0.60.2",
+          "packageId": "windows-sys 0.61.2",
           "target": "cfg(windows)"
         }
       ],
@@ -3378,6 +3378,65 @@
       ],
       "authors": [
         "RustCrypto Developers"
+      ]
+    },
+    "bincode": {
+      "crateName": "bincode",
+      "version": "2.0.1",
+      "edition": "2021",
+      "sha256": "0h5pxp3dqkigjwy926a03sl69n9wv7aq4142a20kw9lhn3bzbsin",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bincode_derive",
+          "packageId": "bincode_derive"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "unty",
+          "packageId": "unty"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc",
+        "bincode_derive",
+        "default",
+        "derive",
+        "serde",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Ty Overby <ty@pre-alpha.com>",
+        "Zoey Riordan <zoey@dos.cafe>",
+        "Victor Koenders <bincode@trangar.com>"
+      ]
+    },
+    "bincode_derive": {
+      "crateName": "bincode_derive",
+      "version": "2.0.1",
+      "edition": "2021",
+      "sha256": "029wmh26hq3hhs1gq629y0frn2pkl7ld061rk23fji8g8jd715dz",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "virtue",
+          "packageId": "virtue"
+        }
+      ],
+      "procMacro": true,
+      "authors": [
+        "Zoey Riordan <zoey@dos.cafe>",
+        "Victor Koenders <bincode@trangar.com>"
       ]
     },
     "bit-set": {
@@ -6915,7 +6974,7 @@
         },
         {
           "name": "windows-sys",
-          "packageId": "windows-sys 0.60.2",
+          "packageId": "windows-sys 0.61.2",
           "target": "cfg(windows)"
         }
       ],
@@ -12656,7 +12715,7 @@
         },
         {
           "name": "socket2",
-          "packageId": "socket2 0.5.10"
+          "packageId": "socket2 0.6.3"
         },
         {
           "name": "tokio",
@@ -13635,7 +13694,7 @@
         },
         {
           "name": "windows-sys",
-          "packageId": "windows-sys 0.60.2",
+          "packageId": "windows-sys 0.61.2",
           "target": "cfg(windows)"
         }
       ],
@@ -16074,7 +16133,7 @@
       "dependencies": [
         {
           "name": "windows-sys",
-          "packageId": "windows-sys 0.60.2",
+          "packageId": "windows-sys 0.61.2",
           "rename": "windows",
           "target": "cfg(windows)"
         }
@@ -19076,7 +19135,7 @@
         },
         {
           "name": "socket2",
-          "packageId": "socket2 0.5.10",
+          "packageId": "socket2 0.6.3",
           "target": "cfg(not(all(target_family = \"wasm\", target_os = \"unknown\")))"
         },
         {
@@ -19210,7 +19269,7 @@
         },
         {
           "name": "socket2",
-          "packageId": "socket2 0.5.10",
+          "packageId": "socket2 0.6.3",
           "target": "cfg(not(all(target_family = \"wasm\", target_os = \"unknown\")))"
         },
         {
@@ -20895,6 +20954,10 @@
           "packageId": "anyhow"
         },
         {
+          "name": "bincode",
+          "packageId": "bincode"
+        },
+        {
           "name": "clap",
           "packageId": "clap"
         },
@@ -20935,6 +20998,10 @@
           "packageId": "rio-crds"
         },
         {
+          "name": "rio-lease",
+          "packageId": "rio-lease"
+        },
+        {
           "name": "rio-proto",
           "packageId": "rio-proto"
         },
@@ -20949,6 +21016,10 @@
         {
           "name": "serde_yml",
           "packageId": "serde_yml"
+        },
+        {
+          "name": "sketches-ddsketch",
+          "packageId": "sketches-ddsketch"
         },
         {
           "name": "thiserror",
@@ -22880,7 +22951,7 @@
         },
         {
           "name": "windows-sys",
-          "packageId": "windows-sys 0.60.2",
+          "packageId": "windows-sys 0.61.2",
           "target": "cfg(windows)"
         }
       ],
@@ -23102,7 +23173,7 @@
         },
         {
           "name": "windows-sys",
-          "packageId": "windows-sys 0.60.2",
+          "packageId": "windows-sys 0.61.2",
           "target": "cfg(windows)"
         }
       ],
@@ -24594,6 +24665,17 @@
       "source": {
         "type": "crates-io"
       },
+      "dependencies": [
+        {
+          "name": "serde",
+          "packageId": "serde",
+          "rename": "serde"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "serde",
+        "use_serde"
+      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -24694,7 +24776,7 @@
         },
         {
           "name": "windows-sys",
-          "packageId": "windows-sys 0.60.2",
+          "packageId": "windows-sys 0.61.2",
           "target": "cfg(windows)"
         }
       ],
@@ -26191,7 +26273,7 @@
         },
         {
           "name": "windows-sys",
-          "packageId": "windows-sys 0.60.2",
+          "packageId": "windows-sys 0.61.2",
           "target": "cfg(windows)"
         }
       ],
@@ -28379,6 +28461,21 @@
         "Brian Smith <brian@briansmith.org>"
       ]
     },
+    "unty": {
+      "crateName": "unty",
+      "version": "0.0.4",
+      "edition": "2021",
+      "sha256": "1blhyv01qiv5sb72sal3xa1l8nzck3answawxkkiw3fd2x1phjbd",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Victor Koenders <bincode@trang.ar>"
+      ]
+    },
     "url": {
       "crateName": "url",
       "version": "2.5.8",
@@ -28558,6 +28655,18 @@
       ],
       "authors": [
         "Sergio Benitez <sb@sergio.bz>"
+      ]
+    },
+    "virtue": {
+      "crateName": "virtue",
+      "version": "0.0.18",
+      "edition": "2021",
+      "sha256": "1cgp79pzzs117kjlc3jnnkixbyaqri12j40mx2an41qhrymv27h5",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
       ]
     },
     "vsimd": {
@@ -29276,7 +29385,7 @@
       "dependencies": [
         {
           "name": "windows-sys",
-          "packageId": "windows-sys 0.60.2",
+          "packageId": "windows-sys 0.61.2",
           "target": "cfg(windows)"
         }
       ],
@@ -29688,19 +29797,8 @@
         "Win32_Foundation",
         "Win32_Networking",
         "Win32_Networking_WinSock",
-        "Win32_Security",
-        "Win32_Security_Cryptography",
-        "Win32_Storage",
-        "Win32_Storage_FileSystem",
         "Win32_System",
-        "Win32_System_Console",
-        "Win32_System_Diagnostics",
-        "Win32_System_Diagnostics_Debug",
         "Win32_System_IO",
-        "Win32_System_SystemInformation",
-        "Win32_System_Threading",
-        "Win32_System_Time",
-        "Win32_System_WindowsProgramming",
         "default"
       ],
       "libCrateTypes": [
@@ -29746,6 +29844,8 @@
         "Win32_System",
         "Win32_System_Com",
         "Win32_System_Console",
+        "Win32_System_Diagnostics",
+        "Win32_System_Diagnostics_Debug",
         "Win32_System_IO",
         "Win32_System_LibraryLoader",
         "Win32_System_Memory",
@@ -29753,6 +29853,7 @@
         "Win32_System_SystemInformation",
         "Win32_System_SystemServices",
         "Win32_System_Threading",
+        "Win32_System_Time",
         "Win32_System_WindowsProgramming",
         "Win32_UI",
         "Win32_UI_Input",
@@ -31138,6 +31239,10 @@
         {
           "name": "signature",
           "packageId": "signature 2.2.0"
+        },
+        {
+          "name": "sketches-ddsketch",
+          "packageId": "sketches-ddsketch"
         },
         {
           "name": "slab",

@@ -137,6 +137,13 @@ lru = "0.16"
 # Short on-stack vecs (ADR-023 §13a `dispatched_cells` A' set, |A'|≤4
 # typical). Already transitive via tokio/dashmap (zero lockfile churn).
 smallvec = "1"
+# DDSketch lead-time/boot quantiles (ADR-023 §13b @alg-pool); persisted
+# to PG as bytea via bincode. `use_serde`: the sketch itself impls
+# Serialize so the on-the-wire shape is the crate's, not ours.
+sketches-ddsketch = { version = "0.3", features = ["use_serde"] }
+# DDSketch persist encoding. v2 (NOT v1): explicit `config::standard()`
+# at the callsite — no ambient bincode::Options state.
+bincode = { version = "2", features = ["serde"] }
 
 # Per-tenant rate limiting (phase4b gateway). DefaultKeyedRateLimiter
 # keyed on tenant_name (bounded keyspace — authorized_keys comment is

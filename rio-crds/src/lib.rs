@@ -23,6 +23,7 @@
 //! `rio-kube` micro-crate for ~30 lines.
 
 pub mod componentscaler;
+pub mod karpenter;
 pub mod pool;
 
 // ----- kube::Error classification helpers ---------------------------
@@ -86,6 +87,16 @@ impl<T> KubeResultExt<T> for Result<T, kube::Error> {
 //
 // `pub(crate)`: used by CRD modules via
 // `#[schemars(schema_with = "crate::any_object_array")]`.
+
+/// Schema for a single `Option<K8sType>` field (ResourceRequirements,
+/// `BTreeMap<String, Quantity>`). Preserve-unknown object.
+pub(crate) fn any_object(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "object",
+        "nullable": true,
+        "x-kubernetes-preserve-unknown-fields": true,
+    })
+}
 
 /// Schema for `Vec<K8sType>` or `Option<Vec<K8sType>>` fields
 /// (tolerations, conditions). Array of preserve-unknown objects.

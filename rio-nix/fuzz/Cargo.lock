@@ -2970,6 +2970,9 @@ name = "sketches-ddsketch"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c6f73aeb92d671e0cc4dca167e59b2deb6387c375391bc99ee743f326994a2b"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "slab"
@@ -4350,6 +4353,7 @@ dependencies = [
  "sha1 0.10.6",
  "sha2 0.10.9",
  "signature",
+ "sketches-ddsketch",
  "slab",
  "smallvec",
  "spin",

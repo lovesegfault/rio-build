@@ -22,6 +22,7 @@ path = "src/bin/crdgen.rs"
 rio-auth = { workspace = true }
 rio-common = { workspace = true }
 rio-crds = { workspace = true }
+rio-lease = { workspace = true }
 rio-proto = { workspace = true }
 
 # --- Kubernetes ---
@@ -44,6 +45,13 @@ serde_yml = { workspace = true }
 # --- Observability ---
 tracing = { workspace = true }
 metrics = { workspace = true }
+
+# --- ADR-023 §13b nodeclaim_pool ---
+# DDSketch lead-time/boot quantiles, persisted to nodeclaim_cell_state
+# via bincode bytea (migration 059). rio-lease (above) for the leader-
+# elected reconcile loop.
+sketches-ddsketch = { workspace = true }
+bincode = { workspace = true }
 
 # --- Misc ---
 anyhow = { workspace = true }
