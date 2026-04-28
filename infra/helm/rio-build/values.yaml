@@ -447,7 +447,31 @@ scheduler:
     hwCostSource: spot
     referenceHwClass: mid-ebs-x86
     nodeClassRef: rio-default
-    leadTimeSeed: {}  # populated by `xtask k8s probe-boot` after first deploy
+    leadTimeSeed:
+      "hi-ebs-arm:od": 17.0
+      "hi-ebs-arm:spot": 18.0
+      "hi-ebs-x86:od": 16.0
+      "hi-ebs-x86:spot": 17.0
+      "hi-nvme-arm:od": 17.0
+      "hi-nvme-arm:spot": 17.0
+      "hi-nvme-x86:od": 18.0
+      "hi-nvme-x86:spot": 18.0
+      "lo-ebs-arm:od": 20.0
+      "lo-ebs-arm:spot": 19.0
+      "lo-ebs-x86:od": 17.0
+      "lo-ebs-x86:spot": 18.0
+      "lo-nvme-arm:od": 21.0
+      "lo-nvme-arm:spot": 21.0
+      "lo-nvme-x86:od": 18.0
+      "lo-nvme-x86:spot": 21.0
+      "mid-ebs-arm:od": 20.0
+      "mid-ebs-arm:spot": 20.0
+      "mid-ebs-x86:od": 18.0
+      "mid-ebs-x86:spot": 18.0
+      "mid-nvme-arm:od": 20.0
+      "mid-nvme-arm:spot": 19.0
+      "mid-nvme-x86:od": 18.0
+      "mid-nvme-x86:spot": 18.0
     # DESTRUCTIVE one-shot: pass --allow-reference-change for ONE
     # rollout when changing referenceHwClass (resets ref-second state),
     # then revert to false.
