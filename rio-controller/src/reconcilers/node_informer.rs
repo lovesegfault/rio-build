@@ -493,7 +493,7 @@ const POOL_LABEL: &str = "rio.build/pool";
 /// hw_class stays at `factor=1.0` until ≥3 pods report. The volume
 /// (NOT env-var) form means a late stamp still reaches a running pod.
 ///
-/// TODO: gate the stamp on `EXISTS(SELECT 1 FROM hw_perf_factors WHERE
+/// TODO: gate the stamp on `EXISTS(SELECT 1 FROM hw_perf_samples WHERE
 /// hw_class=$1)` so well-sampled classes skip the ~5s bench. Deferred:
 /// rio-controller has NO PG access today (apiserver-only — every other
 /// reconciler talks to the scheduler/store via gRPC, never PG

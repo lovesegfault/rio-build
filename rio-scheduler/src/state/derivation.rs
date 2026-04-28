@@ -503,9 +503,10 @@ pub struct SolvedIntent {
     pub predicted: Option<crate::sla::solve::SlaPrediction>,
     /// ADR-023 §13a OR-of-ANDs `(h, cap)` targeting when `solve_full`
     /// ran; empty for the hw-agnostic path. The legacy single-cell
-    /// `node_selector` map is gone — `compute_spawn_intents` derives
-    /// the proto's compat `node_selector` field from `node_affinity[0]`
-    /// until A18 lands.
+    /// `node_selector` map is gone — `compute_spawn_intents` leaves the
+    /// proto's compat `node_selector` field empty; the controller
+    /// derives the single-cell selector from `node_affinity[0]` until
+    /// A18 lands.
     pub node_affinity: Vec<rio_proto::types::NodeSelectorTerm>,
     /// Operator's `[sla.hw_classes.$h]` keys parallel to
     /// `node_affinity` — `hw_class_names[i]` is the `h` whose label

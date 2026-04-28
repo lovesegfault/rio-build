@@ -314,7 +314,7 @@ pub fn refit(
     } else {
         let (f, s, a, rounds) =
             alpha::als_fit(&cs_f, &walls_f, &factors_f, &w_f, &gate, alpha_prior);
-        if rounds == alpha::ALS_MAX_ROUNDS {
+        if matches!(rounds, alpha::AlsRounds::CapHit) {
             ::metrics::counter!(
                 "rio_scheduler_sla_als_round_cap_hit_total",
                 "tenant" => key.tenant.clone()

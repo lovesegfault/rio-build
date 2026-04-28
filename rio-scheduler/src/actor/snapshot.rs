@@ -891,10 +891,14 @@ impl DagActor {
                         &self.sla_config,
                         std::slice::from_ref(h),
                         prev_a,
-                        // Unmemoized — gate `_hw_cost_unknown_total`
-                        // on the unrestricted memo's `was_miss` so
-                        // it fires once per (key, inputs_gen).
-                        was_miss,
+                        // Unmemoized — `_hw_cost_unknown_total` already
+                        // emitted for the full `h_all × cap` space by
+                        // the unrestricted solve at :809; `{h} ⊆ h_all`
+                        // so emitting here double-counts. (`was_miss`
+                        // was the previous guard; it correctly
+                        // suppressed cache-HIT polls but permitted a 2×
+                        // emit on the miss poll itself.)
+                        false,
                     )
                 });
                 // Idempotent memo write — same class as the

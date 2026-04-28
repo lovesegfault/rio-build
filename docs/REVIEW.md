@@ -101,6 +101,13 @@ collapsed the read site, left the field declaration + carry-forward +
 exercised `Hit` 4×, `Miss` 0×; the `Miss` arm's `prev_a` commit was
 wrong from the commit it shipped in.
 
+When the close adds a canonical `from_X(to_X(v))` pair (§Canonicalize
+/ §Model-formula), the round-trip test MUST cover `to_X`'s full output
+range — including the `None`/default/sentinel arm. r19 bug_008:
+`duration_fit_from_status` documented as "inverse of `status_from_fit`";
+`status_from_fit(None, ..)` → `fit_kind=""` → panic. The existing
+round-trip test only exercised `Some(&fp)`.
+
 ## Granularity coupling
 
 Converting `T` → `Option<T>` (or `[T; K]` → `[Option<T>; K]`, or any
@@ -187,6 +194,29 @@ they disagree, the field split (`RingNEff` / `FitDf`) makes the
 disagreement a type — every future reader picks one explicitly, and
 `rg n_eff` no longer matches both populations.
 
+## Mode-invariant
+
+A "mode X ⇒ behavior Y only" doc-contract enforced by the ABSENCE of a
+writer is a finding. The contract must be checked at the READ site
+(`if mode != X { return invariant_value }`), not by hoping no other
+code path writes. r19 bug_034: `Static` = "seeds only" was true only
+because `spot_price_poller` didn't run; `CostTable::load` (PG hydrate)
+and `persist` (10-min refresh) both ran unconditionally, so a
+Spot→Static config switch silently served months-old EMA prices
+forever. Close: the type that owns the read knows the mode.
+
+## Override-coherence
+
+**Grep-hook:** a field overwrite on a solve/fit return struct AFTER
+the call, where a comment says "solve doesn't see X" / "X is overlaid
+here", is a finding. **Why:** dimensions are coupled in this codebase:
+`(mem ↔ node_affinity via menu-fit)`, `(cores ↔ tier via c*)`.
+Overlaying ONE post-hoc creates an internally-inconsistent intent. r19
+bug_033: `forced_mem` overlaid AFTER `solve_full` returned
+`node_affinity` menu-checked at fit-mem → pod `requests.memory=200Gi`
+with affinity over cells topping at 96Gi. Close: thread the override
+INTO the solve, OR route to the override-aware path (the gate).
+
 ## Witness-flag completeness
 
 A `for { if X { continue } if Y { continue } … }` loop where the
@@ -218,6 +248,14 @@ that asserts each `Label` variant is reachable AND the converse (any
 (r2 CR-2) don't catch "fires when it shouldn't"; the fixture table
 does.
 
+**1-of-N approximation.** Recording `vec.first()` of an N-set into a
+slot whose later consumer assumes "the one" is a finding when N>1 is
+reachable. The comment will say "the X" — singular — revealing the
+|N|=1 mental model. r19 bug_030: `dispatched_cells` stored `cells[0]`;
+the pod's affinity is OR-of-N; comment said "the cell this pod was
+spawned for". Close: store the full set; the consumer either gates on
+`len()==1` or gets the actual element from a precise signal.
+
 ## HashMap iteration order as a stable choice
 
 A `for (k, v) in hashmap { if cond { continue/break/return } }` where
@@ -238,7 +276,13 @@ ordering and ε_h `pool.choose()` over unsorted `h_all`
 The sort key SHOULD match the downstream consumer's order (here: §13b
 FFD's `(priority, c*) desc`) so the admitted subset is what the
 consumer wanted first. Add a stable tiebreak (e.g. `drv_hash` asc) so
-ties don't re-introduce nondeterminism.
+ties don't re-introduce nondeterminism. When the close adds a
+deterministic key to one sort, the §SCC(3) sibling-sweep is `rg
+'sort.*_by'` over the same `Vec` — a downstream re-sort with a
+non-superset key destroys the upstream's tiebreak. r19 bug_001:
+bug_025's forecast sort got `(prio, c*, hash)`; the outer `(ready,
+prio)` re-sort 30 lines below discards `(c*, hash)`. Close: the
+downstream sort key is a SUPERSET of the upstream's.
 
 The rule applies to **writes** as well as gates: a `HashMap::iter()`
 loop where which-element-first determines what's *written to a shared

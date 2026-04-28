@@ -762,8 +762,8 @@ pub(super) fn build_job(
     // r[impl ctrl.pool.hw-bench-needed+2]
     // ADR-023 §13a bench gate: (a) `mem ≥ hw_bench_mem_floor` so
     // STREAM's ~4.6 GiB working set cannot OOM a `preferLocalBuild`/
-    // fetcher pod; AND (b) any `h ∈ A` is under the `hw_perf_factors`
-    // 3-distinct-pod_id trust floor. The actual `h` is fixed only at
+    // fetcher pod; AND (b) any `h ∈ A` has < `trust_threshold` distinct
+    // tenants in some K=3 dimension. The actual `h` is fixed only at
     // kube-scheduler bind, so the create-time check is over the whole
     // `A` — over-benches at most until every `h ∈ A` reaches the floor.
     let bench_needed = intent.mem_bytes >= hw_bench_mem_floor

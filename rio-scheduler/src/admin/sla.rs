@@ -114,8 +114,9 @@ pub(super) fn status_from_fit(
 }
 
 /// `SlaStatusResponse` → `DurationFit`. Inverse of `status_from_fit`'s
-/// fit projection (mem/disk/stats fields ignored). `None` for `Probe`
-/// (no curve) so callers can `let Some(fit) = … else { skip }`.
+/// fit projection (mem/disk/stats fields ignored). `None` for
+/// `has_fit=false` (no cached fit) and `Probe` (no curve) so callers
+/// can `let Some(fit) = … else { skip }`.
 ///
 /// Cross-crate consumers (xtask gate_b, dashboard) reconstruct the
 /// typed fit via this then call `fit.t_at(c)` — do NOT re-derive
@@ -125,6 +126,9 @@ pub(super) fn status_from_fit(
 /// compile-errors at `status_from_fit` AND fails here — both
 /// directions forced.
 pub fn duration_fit_from_status(r: &SlaStatusResponse) -> Option<DurationFit> {
+    if !r.has_fit {
+        return None;
+    }
     // 0.0 sentinel ⇔ ∞ (status_from_fit:97 — protojson can't encode ∞).
     let p_bar = if r.p_bar > 0.0 {
         RawCores(r.p_bar)
