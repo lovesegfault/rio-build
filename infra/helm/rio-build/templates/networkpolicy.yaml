@@ -189,6 +189,34 @@ spec:
             k8s:io.kubernetes.pod.namespace: {{ $ns.store.name }}
             k8s:app.kubernetes.io/name: rio-store
       toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
+{{- if .Values.packedScheduler.enabled }}
+---
+# rio-packed second kube-scheduler egress: DNS + kube-apiserver only
+# (mirrors rio-controller-egress — its sole upstream is the k8s API
+# for pod/node watch + binding write). Same `host`/`remote-node`
+# fallback for k3s/embedded-apiserver topologies.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: rio-packed-scheduler-egress
+  namespace: {{ $ns.system.name }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: rio-packed-scheduler
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s:k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - {port: "53", protocol: UDP}
+            - {port: "53", protocol: TCP}
+    - toEntities: [kube-apiserver, host, remote-node]
+{{- end }}
 ---
 # Scheduler ingress: gRPC from rio components + health/metrics from
 # host (kubelet probes, Prometheus). `host`/`remote-node` entities

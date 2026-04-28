@@ -1,0 +1,24 @@
+# ADR-023 §13b: 10 PriorityClasses for the c*-bucket → kube-scheduler
+# priority mapping. The Pool reconciler stamps `priorityClassName:
+# rio-builder-prio-⌊log₂ c*⌋` on each builder Job's pod spec (B12);
+# rio-packed (the second kube-scheduler, MostAllocated scoring) sorts
+# its queue by this so high-core builds bind first → fewer fragmented
+# nodes.
+#
+# preemptionPolicy: Never — these classes order the SCHEDULING queue
+# only; a high-c* build never evicts a running low-c* build (eviction
+# would waste in-flight work). globalDefault: false so non-rio pods
+# keep the cluster default.
+{{- range $i := until 10 }}
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: rio-builder-prio-{{ $i }}
+  labels:
+    {{- include "rio.labels" (dict "root" $ "name" (printf "rio-builder-prio-%d" $i) "component" "scheduler") | nindent 4 }}
+value: {{ $i }}
+globalDefault: false
+preemptionPolicy: Never
+description: "ADR-023 c*-bucket {{ $i }} (c* in [2^{{ $i }}, 2^{{ add $i 1 }}))"
+{{- end }}

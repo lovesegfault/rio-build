@@ -30,6 +30,11 @@ externalSecrets:
 karpenter:
   enabled: false
 
+# registry.k8s.io/kube-scheduler isn't preloaded into the airgapped
+# k3s image set. PriorityClasses still render (no image dep).
+packedScheduler:
+  enabled: false
+
 # phase4c: needs kube-router/Calico enforcement pre-check.
 networkPolicy:
   enabled: false

@@ -193,6 +193,32 @@ controller:
     limits: {memory: 1Gi}
 
 # ──────────────────────────────────────────────────────────────────────────
+# rio-packed — second kube-scheduler (ADR-023 §13b)
+# ──────────────────────────────────────────────────────────────────────────
+# Upstream registry.k8s.io/kube-scheduler with a `MostAllocated`
+# NodeResourcesFit scoring profile under `schedulerName: rio-packed`.
+# Builder Jobs set `spec.schedulerName: rio-packed` (B12) so the
+# default kube-scheduler ignores them; this instance bin-packs onto the
+# fewest nodes so the nodeclaim_pool FFD simulation and Karpenter's
+# consolidation see tight residuals. replicas=2, leader-elects on its
+# own Lease (rio-packed in rio-system).
+#
+# Disabled in airgapped vmtest profiles (registry.k8s.io image isn't
+# preloaded). The 10 PriorityClasses (templates/priorityclass.yaml)
+# render unconditionally — they're referenced by builder pods regardless.
+packedScheduler:
+  enabled: true
+  # Upstream kube-scheduler image. Digest-pinned (03-digest-pin policy:
+  # floating third-party tag → ImagePullBackOff on upstream churn). Tag
+  # tracks nix/pins.nix `kubernetes_version` so scheduler-API skew stays
+  # within the supported ±1 minor; set by `xtask k8s up` from the tofu
+  # `kubernetes_version` output (xtask resolves the digest).
+  image: registry.k8s.io/kube-scheduler:v1.35.0@sha256:0ab622491a82532e01876d55e365c08c5bac01bcd5444a8ed58c1127ab47819f
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {memory: 256Mi}
+
+# ──────────────────────────────────────────────────────────────────────────
 # rio-store
 # ──────────────────────────────────────────────────────────────────────────
 # PG + S3/inline chunk storage. replicas=1: stateless at runtime but
