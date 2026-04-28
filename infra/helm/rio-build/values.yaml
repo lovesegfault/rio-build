@@ -451,7 +451,7 @@ scheduler:
     # DESTRUCTIVE one-shot: pass --allow-reference-change for ONE
     # rollout when changing referenceHwClass (resets ref-second state),
     # then revert to false.
-    allowReferenceChange: false
+    allowReferenceChange: true
   resources:
     requests: {cpu: 500m, memory: 512Mi}
     # 1M-node DAG merge ≈ ~1GB (DerivationState + cycle-check color map +
