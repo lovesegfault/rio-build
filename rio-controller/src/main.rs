@@ -22,6 +22,9 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use rio_controller::reconcilers::node_informer::NodeLabelCache;
+use rio_controller::reconcilers::nodeclaim_pool::{
+    self, ControllerLeaseHooks, NodeClaimPoolConfig, NodeClaimPoolReconciler,
+};
 use rio_controller::reconcilers::nodepoolbudget::NodePoolBudgetConfig;
 use rio_controller::reconcilers::{
     AdminClient, Ctx, componentscaler, node_informer, nodepoolbudget, pool,
@@ -62,6 +65,11 @@ struct Config {
     /// reconciler not spawned. Env: `RIO_NODEPOOL_BUDGET__CPU_MILLICORES`
     /// / `__SELECTOR`.
     nodepool_budget: NodePoolBudgetConfig,
+    /// ADR-023 §13b NodeClaim pool reconciler. `enabled = false` =
+    /// reconciler not spawned (legacy 12-NodePool mode). Env:
+    /// `RIO_NODECLAIM_POOL__ENABLED` / `__DATABASE_URL` / `__LEASE_NAME`
+    /// / `__NODE_CLASS_REF` / `__MAX_FLEET_CORES` / etc.
+    nodeclaim_pool: NodeClaimPoolConfig,
     /// HMAC key for minting `x-rio-service-token` on AdminService
     /// calls. SAME file as the gateway/scheduler/store
     /// `service_hmac_key_path` (one shared `rio-service-hmac` Secret).
@@ -91,6 +99,7 @@ impl Default for Config {
             // thousand paths. Lower values are fine for VM tests.
             gc_interval_hours: 24,
             nodepool_budget: NodePoolBudgetConfig::default(),
+            nodeclaim_pool: NodeClaimPoolConfig::default(),
             service_hmac_key_path: None,
             // 8 GiB: matches `rio_scheduler::sla::config::
             // default_hw_bench_mem_floor`. STREAM triad's 3×4×LLC
@@ -123,6 +132,17 @@ impl rio_common::config::ValidateConfig for Config {
     fn validate(&self) -> anyhow::Result<()> {
         self.scheduler
             .ensure_required("scheduler.addr", "controller")?;
+        if self.nodeclaim_pool.enabled {
+            rio_common::config::ensure_required(
+                &self.nodeclaim_pool.database_url,
+                "nodeclaim_pool.database_url",
+                "controller",
+            )?;
+            anyhow::ensure!(
+                self.nodeclaim_pool.max_fleet_cores > 0,
+                "nodeclaim_pool.max_fleet_cores must be > 0 when enabled"
+            );
+        }
         Ok(())
     }
 }
@@ -358,6 +378,64 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // ---- NodeClaim pool (ADR-023 §13b) ----
+    // Gated on `nodeclaim_pool.enabled`. Lease-elected: only the leader
+    // replica reconciles. Lease + PG connect run AFTER the scheduler
+    // `connect_forever` above so the table is migrated by the time
+    // `CellSketches::load` reads it (scheduler/store own the migrator).
+    // r[impl ctrl.nodeclaim.shim-nodepool]
+    if cfg.nodeclaim_pool.enabled {
+        let lease_cfg = rio_lease::LeaseConfig::from_parts(
+            cfg.nodeclaim_pool.lease_name.clone(),
+            cfg.nodeclaim_pool.lease_namespace.clone(),
+        );
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let leader = match &lease_cfg {
+            Some(lc) => {
+                info!(
+                    lease = %lc.lease_name, namespace = %lc.namespace, holder = %lc.holder_id,
+                    "nodeclaim_pool lease election enabled"
+                );
+                rio_lease::LeaderState::pending(Arc::clone(&generation))
+            }
+            None => {
+                info!("nodeclaim_pool lease_name unset; running as sole leader (non-K8s mode)");
+                rio_lease::LeaderState::always_leader(Arc::clone(&generation))
+            }
+        };
+        // Controller has no recovery step — flip recovery_complete now
+        // so `leader_for()` consumers (none yet) see a coherent state.
+        leader.set_recovery_complete();
+
+        if let Some(lease_cfg) = lease_cfg {
+            rio_common::task::spawn_monitored(
+                "nodeclaim-pool-lease",
+                rio_lease::run_lease_loop(
+                    lease_cfg,
+                    leader.clone(),
+                    ControllerLeaseHooks,
+                    shutdown.clone(),
+                ),
+            );
+        }
+
+        if let Some(pg) =
+            nodeclaim_pool::connect_pg(&cfg.nodeclaim_pool.database_url, &shutdown).await
+        {
+            let reconciler = NodeClaimPoolReconciler::new(
+                client.clone(),
+                admin.clone(),
+                pg,
+                leader,
+                cfg.nodeclaim_pool.clone(),
+            )
+            .await;
+            rio_common::task::spawn_monitored("nodeclaim-pool", reconciler.run(shutdown.clone()));
+        }
+    } else {
+        info!("nodeclaim_pool reconciler disabled (legacy NodePool mode)");
+    }
+
     // ---- NodePool budget ----
     // Gated on cpu_millicores > 0 (same opt-in pattern as gc-cron).
     // Disabled = NodePool limits stay helm-managed.
@@ -403,6 +481,10 @@ mod tests {
             d.nodepool_budget.cpu_millicores, 0,
             "NodePool budget disabled by default"
         );
+        assert!(
+            !d.nodeclaim_pool.enabled,
+            "nodeclaim_pool disabled by default"
+        );
     }
 
     #[test]
@@ -444,6 +526,23 @@ mod tests {
         cfg.scheduler.addr = "http://localhost:9000".into();
         cfg.store.addr = "http://localhost:9001".into();
         cfg
+    }
+
+    #[test]
+    fn config_rejects_nodeclaim_pool_without_db() {
+        let mut cfg = test_valid_config();
+        cfg.nodeclaim_pool.enabled = true;
+        cfg.nodeclaim_pool.database_url = String::new();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("nodeclaim_pool.database_url"), "{err}");
+    }
+
+    #[test]
+    fn config_accepts_nodeclaim_pool_with_db() {
+        let mut cfg = test_valid_config();
+        cfg.nodeclaim_pool.enabled = true;
+        cfg.nodeclaim_pool.database_url = "postgres://localhost/rio".into();
+        cfg.validate().expect("enabled + db url passes");
     }
 
     #[test]

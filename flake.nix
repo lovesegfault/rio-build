@@ -505,6 +505,7 @@
                   "rio-scheduler"
                   "rio-builder"
                   "rio-gateway"
+                  "rio-controller"
                   "rio-test-support"
                 ];
               in
@@ -528,6 +529,7 @@
                     "rio-scheduler"
                     "rio-builder"
                     "rio-gateway"
+                    "rio-controller"
                     "rio-test-support"
                   ]
                 )

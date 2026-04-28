@@ -429,9 +429,24 @@ let
       };
     rio-gateway = withMigrations;
 
+    # withMigrations: nodeclaim_pool/sketch.rs uses sqlx::query!
+    # (offline cache + CARGO stub) and lib.rs's #[cfg(test)] MIGRATOR
+    # uses sqlx::migrate!("../migrations"). withSeccompProfiles:
     # include_str!("../../../../../nix/nixos-node/seccomp/...") in
     # pool tests — compile-time file read crossing crate boundary.
-    rio-controller = withSeccompProfiles;
+    rio-controller =
+      attrs:
+      let
+        base = withMigrations attrs;
+        seccomp = withSeccompProfiles attrs;
+      in
+      base
+      // {
+        postUnpack = ''
+          ${base.postUnpack}
+          ${seccomp.postUnpack}
+        '';
+      };
 
     # build.rs compiles libFuzzer's C++ via the `cc` crate. stdenv's
     # g++ (NOT clang — see below) plus -fsanitize=address so the C++

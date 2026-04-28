@@ -61,7 +61,7 @@
         if git diff --cached --name-only -- '*.rs' \
            | xargs -r grep -l 'query!\|query_as!\|query_scalar!' \
            | grep -q .; then
-          SQLX_OFFLINE=true cargo check --quiet -p rio-scheduler -p rio-store \
+          SQLX_OFFLINE=true cargo check --quiet -p rio-scheduler -p rio-store -p rio-controller \
             || { echo 'sqlx query cache stale — run `cargo xtask regen sqlx`'; exit 1; }
         fi
       ''

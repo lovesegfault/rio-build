@@ -21022,6 +21022,10 @@
           "packageId": "sketches-ddsketch"
         },
         {
+          "name": "sqlx",
+          "packageId": "sqlx"
+        },
+        {
           "name": "thiserror",
           "packageId": "thiserror 2.0.18"
         },

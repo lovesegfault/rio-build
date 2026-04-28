@@ -46,6 +46,13 @@ pub(crate) mod error;
 pub(crate) mod fixtures;
 pub mod reconcilers;
 
+/// Embedded migrator for `nodeclaim_pool::sketch` PG tests. Same
+/// `migrations/` dir as rio-store/rio-scheduler — controller doesn't run
+/// this in `main()` (store/scheduler own startup migration), only the
+/// `TestDb::new(&MIGRATOR)` fixtures do.
+#[cfg(test)]
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
+
 /// Histogram bucket boundaries for controller reconcile latency (seconds).
 ///
 /// Reconciles are mostly K8s API round-trips — expect 10–500ms normally,
@@ -139,5 +146,14 @@ pub fn describe_metrics() {
     describe_gauge!(
         "rio_controller_nodepool_budget_headroom_millicores",
         "Shared headroom (budget − used). 0 = frozen (no new node provisioning on governed pools)."
+    );
+    describe_counter!(
+        "rio_controller_lease_acquired_total",
+        "nodeclaim_pool lease acquire transitions. >1 over a short window = leadership churn \
+         (check apiserver health / pod restarts)."
+    );
+    describe_counter!(
+        "rio_controller_lease_lost_total",
+        "nodeclaim_pool lease lose transitions (explicit lose or local self-fence)."
     );
 }

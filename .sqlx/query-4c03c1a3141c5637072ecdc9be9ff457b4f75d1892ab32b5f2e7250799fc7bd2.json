@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO nodeclaim_cell_state\n                       (hw_class, capacity_type,\n                        z_sketch_active, z_sketch_shadow,\n                        boot_sketch_active, boot_sketch_shadow,\n                        sketch_epoch, lead_time_q, idle_gap_events)\n                   VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7), $8, $9)\n                   ON CONFLICT (hw_class, capacity_type) DO UPDATE SET\n                       z_sketch_active   = EXCLUDED.z_sketch_active,\n                       z_sketch_shadow   = EXCLUDED.z_sketch_shadow,\n                       boot_sketch_active = EXCLUDED.boot_sketch_active,\n                       boot_sketch_shadow = EXCLUDED.boot_sketch_shadow,\n                       sketch_epoch      = EXCLUDED.sketch_epoch,\n                       lead_time_q       = EXCLUDED.lead_time_q,\n                       idle_gap_events   = EXCLUDED.idle_gap_events",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Bytea",
+        "Bytea",
+        "Bytea",
+        "Bytea",
+        "Float8",
+        "Float8",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4c03c1a3141c5637072ecdc9be9ff457b4f75d1892ab32b5f2e7250799fc7bd2"
+}

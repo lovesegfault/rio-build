@@ -1,0 +1,68 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT hw_class, capacity_type,\n                      z_sketch_active, z_sketch_shadow,\n                      boot_sketch_active, boot_sketch_shadow,\n                      EXTRACT(EPOCH FROM sketch_epoch)::float8 AS \"sketch_epoch_secs!\",\n                      lead_time_q, idle_gap_events\n               FROM nodeclaim_cell_state",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "hw_class",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "capacity_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "z_sketch_active",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 3,
+        "name": "z_sketch_shadow",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 4,
+        "name": "boot_sketch_active",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 5,
+        "name": "boot_sketch_shadow",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 6,
+        "name": "sketch_epoch_secs!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 7,
+        "name": "lead_time_q",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 8,
+        "name": "idle_gap_events",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      null,
+      false,
+      false
+    ]
+  },
+  "hash": "29a76ef20d43d15ae9b784a42de546278003a947075582ab302301787107cc18"
+}
