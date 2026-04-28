@@ -736,11 +736,12 @@ impl DagActor {
         // solve_full path: gated on hw_cost_source set ∧ hw_classes
         // non-empty ∧ hw-factor table populated ∧ a usable fit (same
         // n_eff/span gate as intent_for's solve branch — probe/explore
-        // stay on the hw-agnostic path). A `forced_cores` OR `tier`
-        // override also gates it off: solve_full doesn't take
-        // `override_`, so those fall through to `intent_for` which
-        // honors both. `forced_mem` is overlaid below regardless of
-        // arm.
+        // stay on the hw-agnostic path). ANY override field
+        // (`forced_cores`/`forced_mem`/`tier`) also gates it off:
+        // solve_full doesn't take `override_`, so those fall through to
+        // `intent_for` which honors all three. (bug_033: `forced_mem`
+        // was previously overlaid post-solve → affinity menu-checked at
+        // fit-mem, request at forced-mem → permanently-Pending pod.)
         //
         // FOD / required_features / serial drvs MUST stay hw-agnostic:
         // the `rio-fetcher` and `rio-builder-metal` NodePools carry no
@@ -776,9 +777,9 @@ impl DagActor {
         let full = (self.sla_config.hw_cost_source.is_some()
             && !h_all.is_empty()
             && !hw.is_empty()
-            && override_
-                .as_ref()
-                .is_none_or(|o| o.forced_cores.is_none() && o.tier.is_none())
+            && override_.as_ref().is_none_or(|o| {
+                o.forced_cores.is_none() && o.tier.is_none() && o.forced_mem.is_none()
+            })
             && hints.prefer_local_build != Some(true)
             && hints.enable_parallel_building != Some(false)
             && !state.is_fixed_output
@@ -1047,20 +1048,15 @@ impl DagActor {
                 (c, m, d, Vec::new(), Vec::new(), None)
             }
         };
-        // `forced_mem` overlays whichever arm fired — `intent_for`
-        // already applies it internally so this is a no-op there;
-        // `solve_full` doesn't see `override_`, so without this a
-        // `--mem`-only override is dead under `hwCostSource`.
-        let mem = override_.as_ref().and_then(|o| o.forced_mem).unwrap_or(mem);
         // r[impl sched.sla.reactive-floor+2]
         // D4: floor AND ceiling at the single post-solve chokepoint.
         // Floor: a derivation that OOM'd at its solved mem had
         // `bump_floor_or_count` double `floor.mem`; the next solve
         // returns at least that. Ceiling: `intent_for`'s early-return
-        // branches (forced/serial/local/explore) and the `forced_mem`
-        // overlay above pass fit-derived bytes through unclamped, so
-        // the `solve_mvp`/`solve_full` BestEffort clamp doesn't cover
-        // them — a `disk_p90` (or `--mem` / `--cores`) above a
+        // branches (forced/serial/local/explore) pass fit-derived /
+        // override bytes through unclamped, so the `solve_mvp` /
+        // `solve_full` BestEffort clamp doesn't cover them — a
+        // `disk_p90` (or `--mem` / `--cores`) above a
         // tightened `max_disk`/`max_mem`/`max_cores` would otherwise
         // spawn a permanently-Pending pod. `bump_floor_or_count`
         // already caps `floor` at `ceil` (floor.rs), so

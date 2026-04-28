@@ -90,8 +90,9 @@ pub fn explain(
     }
 
     // `forced_mem` is hoisted so it shows in EVERY branch below
-    // (mirrors `intent_for` at solve.rs — that hoist was a prior
-    // bug-fix never ported here).
+    // (mirrors `intent_for` at solve.rs). Display-only: explain has no
+    // menu-fit, so this stays correct after bug_033 deleted the
+    // post-solve overlay in `solve_intent_for`.
     let forced_mem = override_.and_then(|o| o.forced_mem);
     let fmt_mem = |m: u64| format!("forced mem={:.1}Gi", m as f64 / (1u64 << 30) as f64);
 

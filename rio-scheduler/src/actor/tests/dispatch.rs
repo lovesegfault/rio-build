@@ -2201,8 +2201,9 @@ async fn solve_full_gate_skips_fod_kvm_serial_and_override() {
         "tier override gates solve_full off"
     );
 
-    // `mem`-only override → solve_full RUNS (affinity populated), mem
-    // overlaid post-solve.
+    // `mem`-only override → solve_full SKIPPED (bug_033: any override
+    // field routes hw-agnostic intent_for; the post-solve overlay is
+    // gone), mem honored by intent_for.
     actor
         .sla_estimator
         .seed_overrides(vec![crate::db::SlaOverrideRow {
@@ -2213,14 +2214,10 @@ async fn solve_full_gate_skips_fod_kvm_serial_and_override() {
     let snap = actor.compute_spawn_intents(&Default::default());
     let base = snap.intents.iter().find(|i| i.intent_id == "base").unwrap();
     assert!(
-        !base.node_affinity.is_empty(),
-        "mem-only override does NOT gate solve_full off"
+        base.node_affinity.is_empty(),
+        "mem-only override gates solve_full off (bug_033)"
     );
-    assert_eq!(
-        base.mem_bytes,
-        32 << 30,
-        "forced_mem overlays solve_full result"
-    );
+    assert_eq!(base.mem_bytes, 32 << 30, "forced_mem honored by intent_for");
 }
 
 /// SLA mode: `try_dispatch_one` writes `solve_intent_for().0` to

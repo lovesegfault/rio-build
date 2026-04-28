@@ -4,9 +4,11 @@
 //! tier / `cores` / `mem`. NULL `system`/`tenant` are wildcards.
 //! [`resolve`] picks the most-specific matching row;
 //! [`super::solve::intent_for`] consults the result BEFORE the
-//! fit/explore branch — `forced_cores` short-circuits the model;
-//! `forced_mem` overrides mem in any branch; `tier` filters the
-//! solve ladder.
+//! fit/explore branch. All three (`forced_cores`/`forced_mem`/`tier`)
+//! route the hw-agnostic `intent_for` path: the operator pinned a value
+//! → bypass the menu-fit solve. (bug_033: a `forced_mem` larger than
+//! every admitted cell's menu-max would otherwise emit a
+//! permanently-Pending pod.)
 
 use crate::db::SlaOverrideRow;
 
