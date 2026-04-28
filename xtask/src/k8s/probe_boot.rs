@@ -22,7 +22,7 @@
 //! `AwaitingReconciliation` because the `karpenter.sh/nodepool` label
 //! references a NodePool that doesn't exist.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use ::kube::api::{Api, DeleteParams, ListParams, PostParams};
@@ -72,7 +72,7 @@ pub async fn run() -> Result<()> {
     );
     let node_class = sla.node_class_ref.as_deref().unwrap_or("rio-default");
     info!(
-        "probing {} cell(s) ({} hw-class × {} capacity-type), nodeClassRef={node_class}",
+        "{} cell(s) ({} hw-class × {} capacity-type), nodeClassRef={node_class}",
         cells.len(),
         sla.hw_classes.len(),
         CapacityType::ALL.len(),
@@ -88,16 +88,35 @@ pub async fn run() -> Result<()> {
     // cheapest instance (t3.nano) which then can't register.
     let pool_templates = list_pool_templates(&kube).await?;
 
+    // Expand cells × matching-NodePools so each arch is probed
+    // separately. Previously `resolve_pool` picked the first name-sorted
+    // match (always `*-aarch64`), so x86 boot times were never measured
+    // and we had no data on whether arch affects boot.
+    let mut probes: Vec<(Cell, &PoolTemplate, String)> = Vec::new();
+    let mut arches: BTreeSet<String> = BTreeSet::new();
+    for cell in &cells {
+        let def = &sla.hw_classes[&cell.0];
+        for pool in resolve_pools(&pool_templates, &cell.0, def)? {
+            let arch = pool_arch(pool);
+            arches.insert(arch.clone());
+            probes.push((cell.clone(), pool, arch));
+        }
+    }
+    info!(
+        "probing {} cell(s) × {} arch(es) = {} NodeClaims",
+        cells.len(),
+        arches.len(),
+        probes.len(),
+    );
+
     let claims = nodeclaim_api(&kube);
     let nodes: Api<Node> = Api::all(kube.clone());
     let mut created: Vec<String> = Vec::new();
-    // Keyed by `"h:cap"` (cell_key) so iteration order is stable and
-    // matches the `[sla.lead_time_seed]` serde shape directly.
-    let mut seeds: BTreeMap<String, f64> = BTreeMap::new();
+    let mut results: Vec<ProbeResult> = Vec::new();
 
     let result: Result<()> = async {
-        // Drive every cell to Registered, collecting boot times. The
-        // last cell's claim is held for assertions 4+5 instead of being
+        // Drive every (cell, pool) to Registered, collecting boot times.
+        // The last claim is held for assertions 4+5 instead of being
         // deleted in-loop.
         //
         // Serial (one NodeClaim at a time, ≤300s each) is intentional
@@ -106,14 +125,12 @@ pub async fn run() -> Result<()> {
         // `--parallel` flag for re-runs is a follow-up.
         // TODO: `--parallel` re-probe — fan out cells via join_all once
         // the first serial run has populated leadTimeSeed.
-        let last = cells.len() - 1;
+        let last = probes.len() - 1;
         let mut last_claim: Option<String> = None;
-        for (i, cell) in cells.iter().enumerate() {
-            let def = &sla.hw_classes[&cell.0];
-            let pool = resolve_pool(&pool_templates, &cell.0, def)?;
+        for (i, (cell, pool, arch)) in probes.iter().enumerate() {
+            let key = format!("{}:{arch}", cell_key(cell));
             info!(
-                "  [{}] resolved NodePool={}, requirements=[{}]",
-                cell_key(cell),
+                "  [{key}] resolved NodePool={}, requirements=[{}]",
                 pool.name,
                 fmt_requirements(&pool.requirements),
             );
@@ -133,7 +150,7 @@ pub async fn run() -> Result<()> {
                 .clone()
                 .context("apiserver returned NodeClaim without metadata.name")?;
             created.push(name.clone());
-            info!("  [{}] created NodeClaim {name}", cell_key(cell));
+            info!("  [{key}] created NodeClaim {name}");
 
             let reg = wait_condition(&claims, &name, "Registered", REGISTER_TIMEOUT)
                 .await
@@ -165,8 +182,6 @@ pub async fn run() -> Result<()> {
                 "assertion 3 FAIL: Registered.lastTransitionTime={ltt} predates probe \
                  creation ({start}) — clock skew or stale condition?"
             );
-            seeds.insert(cell_key(cell), boot);
-            info!("  [{}] Registered in {boot:.1}s", cell_key(cell));
 
             // ── assertion 1: naked NodeClaim launched ──────────────
             // Re-read post-Registered: Karpenter never adds an
@@ -174,6 +189,22 @@ pub async fn run() -> Result<()> {
             // appeared, Karpenter adopted it under a real NodePool —
             // §13b's lifecycle model (rio owns deletion) is broken.
             let live = claims.get(&name).await?;
+            let instance_type = live
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("node.kubernetes.io/instance-type"))
+                .cloned()
+                .unwrap_or_else(|| "?".into());
+            results.push(ProbeResult {
+                hw_class: cell.0.clone(),
+                cap: cell.1,
+                arch: arch.clone(),
+                pool: pool.name.clone(),
+                instance_type,
+                boot_secs: boot,
+            });
+            info!("  [{key}] Registered in {boot:.1}s");
             let owners = live.metadata.owner_references.unwrap_or_default();
             ensure!(
                 owners.is_empty(),
@@ -290,8 +321,19 @@ pub async fn run() -> Result<()> {
     }
 
     result?;
-    print_seeds(&seeds);
+    print_results(&mut results);
     Ok(())
+}
+
+/// One (hw_class, cap, arch) probe observation.
+#[derive(Debug)]
+struct ProbeResult {
+    hw_class: String,
+    cap: CapacityType,
+    arch: String,
+    pool: String,
+    instance_type: String,
+    boot_secs: f64,
 }
 
 /// Idempotently ensure the §13b shim NodePool exists. Karpenter refuses
@@ -422,7 +464,7 @@ struct PoolTemplate {
 }
 
 /// List every NodePool's template-labels + template-requirements.
-/// Sorted by name so [`resolve_pool`] picks deterministically when
+/// Sorted by name so [`resolve_pools`] returns a stable order when
 /// multiple pools stamp the same labels (e.g. x86 + arm64 variants of
 /// the same band/storage).
 async fn list_pool_templates(client: &kube::Client) -> Result<Vec<PoolTemplate>> {
@@ -461,41 +503,62 @@ async fn list_pool_templates(client: &kube::Client) -> Result<Vec<PoolTemplate>>
     Ok(out)
 }
 
-/// Find the NodePool whose `template.metadata.labels` ⊇ the hw-class's
-/// `labels` (every `{key,value}` in `def.labels` is stamped by the
-/// pool). The match is on STAMPED labels because that's what an
-/// hw-class is: "a node carrying these labels". The matched pool's
+/// Find ALL NodePools whose `template.metadata.labels` ⊇ the
+/// hw-class's `labels` (every `{key,value}` in `def.labels` is stamped
+/// by the pool). The match is on STAMPED labels because that's what an
+/// hw-class is: "a node carrying these labels". Each matched pool's
 /// `template.spec.requirements` are the instance-type constraints a
 /// probe NodeClaim must carry to launch that hardware.
 ///
-/// First match by sorted name — when both `…-arm64` and `…-x86`
-/// variants stamp the same band/storage labels, this picks one
-/// deterministically (the pool's own `kubernetes.io/arch` requirement
-/// then constrains the launch).
-fn resolve_pool<'a>(
+/// Returns every match (sorted by name via [`list_pool_templates`]) so
+/// both `…-aarch64` and `…-x86` variants of the same band/storage get
+/// probed — arch may affect boot time and the previous first-match-only
+/// behaviour silently picked `…-aarch64` (alphabetical) and never
+/// measured x86.
+fn resolve_pools<'a>(
     pools: &'a [PoolTemplate],
     h: &str,
     def: &HwClassDef,
-) -> Result<&'a PoolTemplate> {
-    pools
+) -> Result<Vec<&'a PoolTemplate>> {
+    let matched: Vec<&PoolTemplate> = pools
         .iter()
-        .find(|p| {
+        .filter(|p| {
             def.labels
                 .iter()
                 .all(|m| p.stamps.get(&m.key).map(String::as_str) == Some(&m.value))
         })
-        .with_context(|| {
-            let labels: Vec<String> = def
-                .labels
-                .iter()
-                .map(|m| format!("{}={}", m.key, m.value))
-                .collect();
-            format!(
-                "hw-class {h:?} labels {labels:?} match no NodePool's template.metadata.labels — \
-                 check that scheduler.sla.hwClasses keys on labels a builder NodePool actually \
-                 stamps (e.g. rio.build/hw-band, rio.build/storage)"
-            )
+        .collect();
+    if matched.is_empty() {
+        let labels: Vec<String> = def
+            .labels
+            .iter()
+            .map(|m| format!("{}={}", m.key, m.value))
+            .collect();
+        bail!(
+            "hw-class {h:?} labels {labels:?} match no NodePool's template.metadata.labels — \
+             check that scheduler.sla.hwClasses keys on labels a builder NodePool actually \
+             stamps (e.g. rio.build/hw-band, rio.build/storage)"
+        );
+    }
+    Ok(matched)
+}
+
+/// Extract arch from a NodePool: prefer the `kubernetes.io/arch In
+/// [...]` requirement value (what Karpenter actually constrains on),
+/// fall back to the pool-name suffix (`-aarch64` / `-x86`), else `?`.
+fn pool_arch(pool: &PoolTemplate) -> String {
+    pool.requirements
+        .iter()
+        .find(|r| r.get("key").and_then(Value::as_str) == Some("kubernetes.io/arch"))
+        .and_then(|r| r.get("values")?.as_array()?.first()?.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            ["aarch64", "x86"]
+                .into_iter()
+                .find(|a| pool.name.ends_with(&format!("-{a}")))
+                .map(str::to_string)
         })
+        .unwrap_or_else(|| "?".into())
 }
 
 /// Compact one-line summary of a requirements array for the resolver
@@ -628,18 +691,54 @@ fn find_condition(nc: &DynamicObject, cond: &str) -> Option<Value> {
         .cloned()
 }
 
-fn print_seeds(seeds: &BTreeMap<String, f64>) {
+fn print_results(results: &mut [ProbeResult]) {
+    results.sort_by(|a, b| {
+        (&a.hw_class, a.cap.label(), &a.arch).cmp(&(&b.hw_class, b.cap.label(), &b.arch))
+    });
+
     println!("\nall 5 conformance assertions PASS\n");
-    println!("{:<32} {:>10}", "cell", "boot_secs");
-    println!("{:-<32} {:->10}", "", "");
-    for (cell, boot) in seeds {
-        println!("{cell:<32} {boot:>10.1}");
+    println!(
+        "{:<18} {:<5} {:<8} {:<28} {:<16} {:>10}",
+        "hw-class", "cap", "arch", "pool", "instance-type", "boot-secs"
+    );
+    println!(
+        "{:-<18} {:-<5} {:-<8} {:-<28} {:-<16} {:->10}",
+        "", "", "", "", "", ""
+    );
+    for r in results.iter() {
+        println!(
+            "{:<18} {:<5} {:<8} {:<28} {:<16} {:>10.1}",
+            r.hw_class,
+            r.cap.label(),
+            r.arch,
+            r.pool,
+            r.instance_type,
+            r.boot_secs,
+        );
+    }
+
+    // leadTimeSeed: max boot across arches per cell. Conservative —
+    // Part-B's NodeClaim provisioning should budget for the slower
+    // arch. Per-arch breakdown follows for operator visibility; not
+    // consumed by config (schema question under investigation).
+    let mut seeds: BTreeMap<String, f64> = BTreeMap::new();
+    for r in results.iter() {
+        let key = cell_key(&(r.hw_class.clone(), r.cap));
+        let slot = seeds.entry(key).or_insert(0.0);
+        *slot = slot.max(r.boot_secs);
     }
     println!(
-        "\n# paste into infra/helm/rio-build/values.yaml scheduler.sla.leadTimeSeed:\nleadTimeSeed:"
+        "\n# paste into infra/helm/rio-build/values.yaml scheduler.sla.leadTimeSeed:\n\
+         # max across arches; per-arch breakdown below.\n\
+         leadTimeSeed:"
     );
-    for (cell, boot) in seeds {
+    for (cell, boot) in &seeds {
         println!("  {cell:?}: {boot:.1}");
+    }
+    println!("# per-arch breakdown:");
+    for r in results.iter() {
+        let key = cell_key(&(r.hw_class.clone(), r.cap));
+        println!("#   \"{key}:{}\": {:.1}", r.arch, r.boot_secs);
     }
 }
 
@@ -672,10 +771,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_pool_matches_stamped_labels() {
+    fn resolve_pools_matches_stamped_labels() {
         // Two pools: one stamps {hw-band:lo, storage:ebs} with real
         // instance-type reqs; one stamps {hw-band:hi}. gen6-ebs-lo's
-        // hw-class labels must resolve to the first.
+        // hw-class labels must resolve to the first only.
         let pools = vec![
             mk_pool(
                 "rio-builder-hi-nvme-x86",
@@ -699,15 +798,16 @@ mod tests {
             ),
         ];
         let def = hw_class(&[("rio.build/hw-band", "lo"), ("rio.build/storage", "ebs")]);
-        let p = resolve_pool(&pools, "gen6-ebs-lo", &def).unwrap();
-        assert_eq!(p.name, "rio-builder-lo-ebs-x86");
-        assert_eq!(p.requirements.len(), 2);
+        let ps = resolve_pools(&pools, "gen6-ebs-lo", &def).unwrap();
+        assert_eq!(ps.len(), 1);
+        assert_eq!(ps[0].name, "rio-builder-lo-ebs-x86");
+        assert_eq!(ps[0].requirements.len(), 2);
         // Superset OK: pool stamps node-role too, hw-class doesn't ask.
-        assert_eq!(p.stamps.len(), 3);
+        assert_eq!(ps[0].stamps.len(), 3);
 
         // Unmatched hw-class bails with the actionable message.
         let bad = hw_class(&[("rio.build/hw-band", "mid")]);
-        let err = resolve_pool(&pools, "mid-ebs", &bad)
+        let err = resolve_pools(&pools, "mid-ebs", &bad)
             .unwrap_err()
             .to_string();
         assert!(err.contains("mid-ebs"), "{err}");
@@ -718,9 +818,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_pool_deterministic_on_tie() {
+    fn resolve_pools_returns_all_matches() {
         // x86 and arm64 variants stamp identical band/storage labels.
-        // Input is deliberately unsorted; resolver must pick by name.
+        // Resolver must return BOTH (sorted), and pool_arch must
+        // identify each.
         let mut pools = vec![
             mk_pool(
                 "rio-builder-lo-ebs-x86",
@@ -729,7 +830,7 @@ mod tests {
                         "values": ["amd64"]}]),
             ),
             mk_pool(
-                "rio-builder-lo-ebs-arm64",
+                "rio-builder-lo-ebs-aarch64",
                 &[("rio.build/hw-band", "lo"), ("rio.build/storage", "ebs")],
                 json!([{"key": "kubernetes.io/arch", "operator": "In",
                         "values": ["arm64"]}]),
@@ -737,8 +838,66 @@ mod tests {
         ];
         pools.sort_by(|a, b| a.name.cmp(&b.name));
         let def = hw_class(&[("rio.build/hw-band", "lo"), ("rio.build/storage", "ebs")]);
-        let p = resolve_pool(&pools, "gen6-ebs-lo", &def).unwrap();
-        assert_eq!(p.name, "rio-builder-lo-ebs-arm64");
+        let ps = resolve_pools(&pools, "gen6-ebs-lo", &def).unwrap();
+        assert_eq!(
+            ps.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["rio-builder-lo-ebs-aarch64", "rio-builder-lo-ebs-x86"]
+        );
+        assert_eq!(pool_arch(ps[0]), "arm64");
+        assert_eq!(pool_arch(ps[1]), "amd64");
+    }
+
+    #[test]
+    fn pool_arch_fallback_to_name_suffix() {
+        // No kubernetes.io/arch req → fall back to name suffix.
+        let p = mk_pool(
+            "rio-builder-lo-ebs-aarch64",
+            &[],
+            json!([{"key": "karpenter.k8s.aws/instance-category",
+                    "operator": "In", "values": ["c"]}]),
+        );
+        assert_eq!(pool_arch(&p), "aarch64");
+        let p = mk_pool("rio-builder-lo-ebs-x86", &[], json!([]));
+        assert_eq!(pool_arch(&p), "x86");
+        // Neither → "?".
+        let p = mk_pool("rio-nodeclaim-shim", &[], json!([]));
+        assert_eq!(pool_arch(&p), "?");
+    }
+
+    #[test]
+    fn print_results_seeds_max_across_arches() {
+        // Two arches for one cell; leadTimeSeed must use the max.
+        let mut rs = vec![
+            ProbeResult {
+                hw_class: "lo".into(),
+                cap: CapacityType::Spot,
+                arch: "amd64".into(),
+                pool: "p-x86".into(),
+                instance_type: "c6a.large".into(),
+                boot_secs: 80.0,
+            },
+            ProbeResult {
+                hw_class: "lo".into(),
+                cap: CapacityType::Spot,
+                arch: "arm64".into(),
+                pool: "p-aarch64".into(),
+                instance_type: "c6g.large".into(),
+                boot_secs: 95.0,
+            },
+        ];
+        // Sort order: (hw_class, cap, arch) — amd64 before arm64.
+        rs.sort_by(|a, b| {
+            (&a.hw_class, a.cap.label(), &a.arch).cmp(&(&b.hw_class, b.cap.label(), &b.arch))
+        });
+        assert_eq!(rs[0].arch, "amd64");
+        // Max-across-arches reduction (mirrors print_results body).
+        let mut seeds: BTreeMap<String, f64> = BTreeMap::new();
+        for r in &rs {
+            let key = cell_key(&(r.hw_class.clone(), r.cap));
+            let slot = seeds.entry(key).or_insert(0.0);
+            *slot = slot.max(r.boot_secs);
+        }
+        assert_eq!(seeds["lo:spot"], 95.0);
     }
 
     #[test]
