@@ -1952,3 +1952,53 @@ async fn contract_spawn_intents_order_deterministic_across_ties() {
         "all Ready intents precede all forecast intents; got {a:?}"
     );
 }
+
+/// **R19B2 / bug 033** — a `forced_mem`-only override (`--mem 200G`, no
+/// `--cores`/`--tier`) MUST route the hw-agnostic `intent_for` arm,
+/// same as `forced_cores`/`tier`. Pre-fix: the gate at snapshot.rs:770
+/// excluded `forced_cores`/`tier` only → `--mem`-only entered
+/// `solve_full`, which menu-fits cells against fit-derived mem (~6GiB),
+/// then `forced_mem=200GiB` was overlaid post-match at :1043 →
+/// `node_affinity` over cells checked at 6GiB, `mem_bytes=200GiB` →
+/// permanently-Pending pod when no admitted cell's menu reaches 200GiB.
+///
+/// Post-fix: `forced_mem` joins the gate → `node_affinity` empty
+/// (hw-agnostic) and `mem_bytes` is the forced value clamped at
+/// `max_mem`. `intent_for` honors `forced_mem` internally; the post-hoc
+/// overlay is deleted as unreachable.
+#[tokio::test]
+async fn contract_forced_mem_only_override_is_hw_agnostic() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    // bare_actor_hw: hwCostSource=Static, 3 hw_classes, populated hw
+    // table, fitted "test-pkg" (mem.p90=6GiB) — solve_full reachable.
+    actor.test_inject_ready("d-mem-ovr", Some("test-pkg"), "x86_64-linux", false);
+    // `--mem 200G` only: no cores, no tier.
+    actor
+        .sla_estimator
+        .seed_overrides(vec![crate::db::SlaOverrideRow {
+            pname: "test-pkg".into(),
+            mem_bytes: Some(200 << 30),
+            ..Default::default()
+        }]);
+
+    let state = actor.dag.node("d-mem-ovr").unwrap();
+    let (hw, cost, ig) = actor.solve_inputs();
+    let intent = actor.solve_intent_for(state, &hw, &cost, ig);
+
+    let max_mem = actor.sla_ceilings.max_mem;
+    assert!(
+        intent.node_affinity.is_empty(),
+        "forced_mem-only override MUST gate solve_full off (hw-agnostic \
+         intent_for arm). Got node_affinity={:?} → entered solve_full; \
+         affinity menu-checked at fit-mem≈6GiB, request at 200GiB → \
+         pod permanently Pending when admitted cells' menus < 200GiB.",
+        intent.node_affinity
+    );
+    assert_eq!(
+        intent.mem_bytes,
+        (200u64 << 30).min(max_mem),
+        "forced_mem MUST reach the intent (intent_for honors it \
+         internally; the post-hoc overlay is deleted). max_mem={max_mem}"
+    );
+}
