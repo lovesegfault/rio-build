@@ -368,12 +368,18 @@ scheduler:
   # max{Cores,Mem,Disk}: hard reject ceilings — solve does NOT clamp.
   #   maxCores < 1024 (PriorityClass bucket range).
   # hwClasses: h → node-label conjunction. MANDATORY (ADR-023 §13a) — keys
-  #   match `<gen>-<storage>-<band>`; labels are what Karpenter NodePools
-  #   stamp at templates/karpenter.yaml:125-126. 6 = full {hi,mid,lo} ×
-  #   {nvme,ebs} cross-product (arch handled per-pool, not per-hw-class).
+  #   match `<band>-<storage>-<arch>`; labels are what Karpenter NodePools
+  #   stamp at templates/karpenter.yaml:123-127. 12 = band × storage × arch.
+  #   arch in the label-match isolates per-arch hw_perf factor / cost /
+  #   lead-time (Option B per ADR-023 hw-class arch design): the 6-class
+  #   shape blended Graviton+x86 bench rows into one HwTable.factor[h] and
+  #   one CostTable menu per cell. Karpenter NodePools stamp
+  #   kubernetes.io/arch as a template label, so each hw-class now resolves
+  #   to exactly one NodePool.
   # referenceHwClass: anchors ref-second normalization — IMMUTABLE across
-  #   reloads without --allow-reference-change. gen7-ebs-mid chosen as the
-  #   broadest us-east-2 quota (gen-7 c/m/r, no nvme constraint).
+  #   reloads without --allow-reference-change. mid-ebs-x86 chosen as the
+  #   broadest us-east-2 quota (gen-6/7 c/m/r, no nvme constraint, x86 is
+  #   the dominant build-traffic arch).
   # hwCostSource: "spot" = live DescribeSpotPriceHistory poll (lease-gated;
   #   IRSA `ec2:DescribeSpotPriceHistory` on the scheduler SA). "static" =
   #   fixed spot<od / hi>mid>lo seed ratios (cost.rs) — degrades cost
@@ -400,32 +406,20 @@ scheduler:
     consolidateExploreEpsilon: 0.02
     maxNodeClaimsPerCellPerTick: 8
     hwClasses:
-      gen8-nvme-hi:
-        labels:
-          - {key: rio.build/hw-band, value: hi}
-          - {key: rio.build/storage, value: nvme}
-      gen8-ebs-hi:
-        labels:
-          - {key: rio.build/hw-band, value: hi}
-          - {key: rio.build/storage, value: ebs}
-      gen7-nvme-mid:
-        labels:
-          - {key: rio.build/hw-band, value: mid}
-          - {key: rio.build/storage, value: nvme}
-      gen7-ebs-mid:
-        labels:
-          - {key: rio.build/hw-band, value: mid}
-          - {key: rio.build/storage, value: ebs}
-      gen6-nvme-lo:
-        labels:
-          - {key: rio.build/hw-band, value: lo}
-          - {key: rio.build/storage, value: nvme}
-      gen6-ebs-lo:
-        labels:
-          - {key: rio.build/hw-band, value: lo}
-          - {key: rio.build/storage, value: ebs}
+      hi-nvme-x86:  {labels: [{key: rio.build/hw-band, value: hi},  {key: rio.build/storage, value: nvme}, {key: kubernetes.io/arch, value: amd64}]}
+      hi-nvme-arm:  {labels: [{key: rio.build/hw-band, value: hi},  {key: rio.build/storage, value: nvme}, {key: kubernetes.io/arch, value: arm64}]}
+      hi-ebs-x86:   {labels: [{key: rio.build/hw-band, value: hi},  {key: rio.build/storage, value: ebs},  {key: kubernetes.io/arch, value: amd64}]}
+      hi-ebs-arm:   {labels: [{key: rio.build/hw-band, value: hi},  {key: rio.build/storage, value: ebs},  {key: kubernetes.io/arch, value: arm64}]}
+      mid-nvme-x86: {labels: [{key: rio.build/hw-band, value: mid}, {key: rio.build/storage, value: nvme}, {key: kubernetes.io/arch, value: amd64}]}
+      mid-nvme-arm: {labels: [{key: rio.build/hw-band, value: mid}, {key: rio.build/storage, value: nvme}, {key: kubernetes.io/arch, value: arm64}]}
+      mid-ebs-x86:  {labels: [{key: rio.build/hw-band, value: mid}, {key: rio.build/storage, value: ebs},  {key: kubernetes.io/arch, value: amd64}]}
+      mid-ebs-arm:  {labels: [{key: rio.build/hw-band, value: mid}, {key: rio.build/storage, value: ebs},  {key: kubernetes.io/arch, value: arm64}]}
+      lo-nvme-x86:  {labels: [{key: rio.build/hw-band, value: lo},  {key: rio.build/storage, value: nvme}, {key: kubernetes.io/arch, value: amd64}]}
+      lo-nvme-arm:  {labels: [{key: rio.build/hw-band, value: lo},  {key: rio.build/storage, value: nvme}, {key: kubernetes.io/arch, value: arm64}]}
+      lo-ebs-x86:   {labels: [{key: rio.build/hw-band, value: lo},  {key: rio.build/storage, value: ebs},  {key: kubernetes.io/arch, value: amd64}]}
+      lo-ebs-arm:   {labels: [{key: rio.build/hw-band, value: lo},  {key: rio.build/storage, value: ebs},  {key: kubernetes.io/arch, value: arm64}]}
     hwCostSource: spot
-    referenceHwClass: gen7-ebs-mid
+    referenceHwClass: mid-ebs-x86
     nodeClassRef: rio-default
     leadTimeSeed: {}  # populated by `xtask k8s probe-boot` after first deploy
     # DESTRUCTIVE one-shot: pass --allow-reference-change for ONE

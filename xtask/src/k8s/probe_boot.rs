@@ -717,10 +717,10 @@ fn print_results(results: &mut [ProbeResult]) {
         );
     }
 
-    // leadTimeSeed: max boot across arches per cell. Conservative —
-    // Part-B's NodeClaim provisioning should budget for the slower
-    // arch. Per-arch breakdown follows for operator visibility; not
-    // consumed by config (schema question under investigation).
+    // leadTimeSeed: max boot per cell. With arch in the hw-class label
+    // conjunction (12 keys), resolve_pools() returns a single pool per
+    // hw-class and the max-fold here is the identity. Kept as a
+    // structural guard for future multi-match conjunctions.
     let mut seeds: BTreeMap<String, f64> = BTreeMap::new();
     for r in results.iter() {
         let key = cell_key(&(r.hw_class.clone(), r.cap));
@@ -729,13 +729,13 @@ fn print_results(results: &mut [ProbeResult]) {
     }
     println!(
         "\n# paste into infra/helm/rio-build/values.yaml scheduler.sla.leadTimeSeed:\n\
-         # max across arches; per-arch breakdown below.\n\
+         # with arch in hw-class, each cell resolves one pool (24 entries).\n\
          leadTimeSeed:"
     );
     for (cell, boot) in &seeds {
         println!("  {cell:?}: {boot:.1}");
     }
-    println!("# per-arch breakdown:");
+    println!("# per-pool breakdown:");
     for r in results.iter() {
         let key = cell_key(&(r.hw_class.clone(), r.cap));
         println!("#   \"{key}:{}\": {:.1}", r.arch, r.boot_secs);

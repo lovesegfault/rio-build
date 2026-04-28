@@ -124,6 +124,12 @@ spec:
         rio.build/node-role: builder
         rio.build/hw-band: {{ $band.name }}
         rio.build/storage: {{ $stor.name }}
+        # kubelet sets kubernetes.io/arch on the Node regardless, but
+        # hw-class resolution (probe-boot resolve_pools, scheduler
+        # cells_to_selector_terms) matches against template.metadata.labels
+        # — so stamp it explicitly to make each 12-key hw-class resolve to
+        # exactly one NodePool.
+        kubernetes.io/arch: {{ $arch.k8s }}
     spec:
       nodeClassRef:
         group: karpenter.k8s.aws
