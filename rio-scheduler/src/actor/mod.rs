@@ -782,6 +782,7 @@ impl DagActor {
                     spawned,
                     unfulfillable_cells,
                     registered_cells,
+                    observed_instance_types,
                 } => {
                     // r[impl sched.lease.standby-drops-writes] —
                     // ICE state is lease-holder only.
@@ -790,6 +791,7 @@ impl DagActor {
                             &spawned,
                             &unfulfillable_cells,
                             &registered_cells,
+                            &observed_instance_types,
                         );
                     }
                 }

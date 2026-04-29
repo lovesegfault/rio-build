@@ -386,6 +386,7 @@ async fn contract_ice_step_doubles_then_clears_on_registered() {
             std::slice::from_ref(&intent),
             &["intel-6:spot".into()],
             &[],
+            &[],
         );
     }
     assert_eq!(
@@ -407,12 +408,62 @@ async fn contract_ice_step_doubles_then_clears_on_registered() {
         "spawned-ack arms dispatched_cells from the wire form"
     );
 
-    actor.handle_ack_spawned_intents(&[], &[], &["intel-6:spot".into()]);
+    actor.handle_ack_spawned_intents(&[], &[], &["intel-6:spot".into()], &[]);
     assert_eq!(
         actor.ice.step(&cell),
         None,
         "registered_cells is the success edge → clears"
     );
+}
+
+/// **R24B7 B2 — fold + wire-format**: `observed_instance_types` in the
+/// controller's `Cell::to_string` `"h:od"` form folds into
+/// `CostTable.cells`. Pins the wire-format round-trip (B6a
+/// `"on-demand"` vs `"od"` lesson — controller emits `"od"`, scheduler
+/// `parse_cell` accepts both). The `ActorCommand::AckSpawnedIntents`
+/// match arm at `actor/mod.rs` is exhaustive (no `..`), so dropping
+/// the field there is a compile error; this asserts the
+/// `handle_ack_spawned_intents` body actually folds it.
+// r[verify sched.sla.cost-instance-type-feedback]
+#[tokio::test]
+async fn ack_observed_instance_types_folds_into_cost_table() {
+    use crate::sla::config::CapacityType;
+    use rio_proto::types::ObservedInstanceType;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let actor = bare_actor_hw(db.pool.clone());
+
+    let spot: crate::sla::config::Cell = ("mid-ebs-x86".into(), CapacityType::Spot);
+    let od: crate::sla::config::Cell = ("mid-ebs-x86".into(), CapacityType::Od);
+    assert!(actor.cost_table.read().menu(&spot).is_empty());
+
+    // Controller's `Cell::to_string` form: `"h:spot"` / `"h:od"`
+    // (sketch.rs:90 via `as_str()`).
+    actor.handle_ack_spawned_intents(
+        &[],
+        &[],
+        &[],
+        &[
+            ObservedInstanceType {
+                cell: "mid-ebs-x86:spot".into(),
+                instance_type: "c7i.8xlarge".into(),
+                cores: 32,
+                mem_bytes: 64 << 30,
+            },
+            ObservedInstanceType {
+                cell: "mid-ebs-x86:od".into(),
+                instance_type: "m7i.8xlarge".into(),
+                cores: 32,
+                mem_bytes: 128 << 30,
+            },
+        ],
+    );
+
+    let ct = actor.cost_table.read();
+    assert_eq!(ct.menu(&spot).len(), 1);
+    assert_eq!(ct.menu(&spot)[0].name, "c7i.8xlarge");
+    assert_eq!(ct.menu(&spot)[0].cores, 32);
+    assert_eq!(ct.menu(&od).len(), 1, "controller 'od' form parses");
 }
 
 /// **Ack records the FULL A'** (`r[sched.sla.hw-class.ice-mask]`): a
@@ -450,7 +501,7 @@ async fn contract_ack_spawned_records_full_a_prime() {
         ..Default::default()
     };
 
-    actor.handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[]);
+    actor.handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[]);
 
     let got: std::collections::HashSet<Cell> = actor
         .dispatched_cells

@@ -666,6 +666,7 @@ impl DagActor {
         spawned: &[rio_proto::types::SpawnIntent],
         unfulfillable_cells: &[String],
         registered_cells: &[String],
+        observed_instance_types: &[rio_proto::types::ObservedInstanceType],
     ) {
         // Arm-on-ack: recover the FULL `cells` vec from the parallel
         // `(hw_class_names, node_affinity)` wire form
@@ -704,6 +705,18 @@ impl DagActor {
             if let Some(cell) = crate::sla::config::parse_cell(s) {
                 self.ice.mark(&cell);
             }
+        }
+        if !observed_instance_types.is_empty() {
+            self.cost_table.write().observe_instance_types(
+                observed_instance_types.iter().filter_map(|o| {
+                    Some((
+                        crate::sla::config::parse_cell(&o.cell)?,
+                        o.instance_type.clone(),
+                        o.cores,
+                        o.mem_bytes,
+                    ))
+                }),
+            );
         }
     }
 

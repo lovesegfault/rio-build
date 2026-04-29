@@ -258,6 +258,11 @@ pub enum ActorCommand {
         /// NodeClaim watcher (A18) populates it; the §13a interim
         /// clear path is first-heartbeat instead.
         registered_cells: Vec<String>,
+        /// `r[sched.sla.cost-instance-type-feedback]`: per-cell
+        /// instance types Karpenter resolved this tick. Folded into
+        /// `CostTable.cells` so `spot_price_poller` knows what to
+        /// price. Edge-detected per NodeClaim (controller-side).
+        observed_instance_types: Vec<rio_proto::types::ObservedInstanceType>,
     },
 
     /// A worker ACKed its initial `PrefetchHint` with `PrefetchComplete`.

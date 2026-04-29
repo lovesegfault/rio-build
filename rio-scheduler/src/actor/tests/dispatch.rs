@@ -1685,7 +1685,7 @@ async fn ice_mask_is_read_time() {
 
     // Mask one cell from A' via the controller's unfulfillable report.
     let masked: crate::sla::config::Cell = ("intel-6".into(), CapacityType::Spot);
-    actor.handle_ack_spawned_intents(&[], &["intel-6:spot".into()], &[]);
+    actor.handle_ack_spawned_intents(&[], &["intel-6:spot".into()], &[], &[]);
     assert!(actor.ice.is_masked(&masked));
 
     // ── poll 2: read-time mask, A\{masked}, not exhausted ──────────────
@@ -1793,6 +1793,7 @@ async fn ice_step_doubles_across_mark_without_clear() {
             std::slice::from_ref(&spawned),
             &["intel-6:spot".into()],
             &[],
+            &[],
         );
     }
     assert_eq!(
@@ -1802,7 +1803,7 @@ async fn ice_step_doubles_across_mark_without_clear() {
     );
 
     // `registered_cells` IS the success signal → resets.
-    actor.handle_ack_spawned_intents(&[], &[], &["intel-6:spot".into()]);
+    actor.handle_ack_spawned_intents(&[], &[], &["intel-6:spot".into()], &[]);
     assert_eq!(actor.ice.step(&cell), None, "registered_cells clears");
 }
 
@@ -1844,7 +1845,7 @@ async fn ice_step_doubles_across_heartbeat_at_multi_cell() {
         node_affinity: vec![term("h0"), term("h1")],
         ..Default::default()
     };
-    actor.handle_ack_spawned_intents(std::slice::from_ref(&spawned), &[], &[]);
+    actor.handle_ack_spawned_intents(std::slice::from_ref(&spawned), &[], &[], &[]);
 
     actor.ice.mark(&h0);
     assert_eq!(actor.ice.step(&h0), Some(0), "precondition: marked");
