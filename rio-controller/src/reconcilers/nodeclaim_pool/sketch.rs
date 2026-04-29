@@ -139,22 +139,20 @@ impl Default for CellState {
 
 impl CellState {
     /// `lead_time_q`-quantile of the `z` sketch — the provisioning
-    /// lead-time. Reads `z_active` first; falls back to `z_shadow` when
-    /// active is empty (immediately post-rotation, before the first new
-    /// sample lands) so the warm quantile isn't lost. Both empty → 0
-    /// (cold start; [`CellSketches::seed`] overlays).
+    /// lead-time. Sparse-active gate via `quantile_with_shadow`: a
+    /// post-rotation active with fewer than `⌈1/(1−q)⌉` samples falls
+    /// back to `z_shadow` so the warm quantile isn't lost. Both empty
+    /// → 0 (cold start; [`CellSketches::seed`] overlays).
     pub fn lead_time(&self) -> f64 {
-        quantile_or(&self.z_active, self.lead_time_q)
-            .or_else(|| quantile_or(&self.z_shadow, self.lead_time_q))
-            .unwrap_or(0.0)
+        quantile_with_shadow(&self.z_active, &self.z_shadow, self.lead_time_q).unwrap_or(0.0)
     }
 
     /// Median raw boot time (`q_0.5(boot)`). B10's `consolidate_after`
     /// floor (`q_0.5/2`) and break-even RHS (`cores/q_0.5`) both read
-    /// this. Shadow fallback as for [`lead_time`](Self::lead_time);
+    /// this. Sparse-active gate via `quantile_with_shadow`; both
     /// empty → `None` (caller supplies seed).
     pub fn boot_median(&self) -> Option<f64> {
-        quantile_or(&self.boot_active, 0.5).or_else(|| quantile_or(&self.boot_shadow, 0.5))
+        quantile_with_shadow(&self.boot_active, &self.boot_shadow, 0.5)
     }
 
     /// ICE/boot-failure timeout for this cell. Below
@@ -165,24 +163,17 @@ impl CellState {
     /// way so a lucky fast-boot streak can't shrink the timeout below
     /// the operator's floor.
     ///
-    /// Shadow fallback as for [`lead_time`](Self::lead_time):
-    /// post-rotation, `boot_active` is empty (or sparse) and shadow
-    /// holds the learned tail. The active read is gated on its OWN
-    /// count — `quantile_or` returns Some on any non-empty sketch, so a
-    /// post-rotation `active.count()=5` would otherwise win with
-    /// max-of-5 noise instead of shadow's 200-sample q99.
+    /// Sparse-active gate via `quantile_with_shadow` (the `min_n`
+    /// formula yields 100 at q=0.99, matching the per-read intent of
+    /// `ICE_REAL_THRESHOLD`; the explicit sum-gate here additionally
+    /// holds the seed floor until *combined* count reaches 100).
     pub fn ice_timeout(&self, seed: f64) -> f64 {
         let floor = 2.0 * seed;
         if self.boot_active.count() + self.boot_shadow.count() < ICE_REAL_THRESHOLD {
             return floor;
         }
-        let q = if self.boot_active.count() >= ICE_REAL_THRESHOLD {
-            quantile_or(&self.boot_active, 0.99)
-        } else {
-            None
-        }
-        .or_else(|| quantile_or(&self.boot_shadow, 0.99));
-        q.map_or(floor, |q| q.max(floor))
+        quantile_with_shadow(&self.boot_active, &self.boot_shadow, 0.99)
+            .map_or(floor, |q| q.max(floor))
     }
 
     /// Record one observed `boot` (Registered.transition − created)
@@ -236,6 +227,30 @@ impl CellState {
 /// which callers don't emit).
 fn quantile_or(s: &DDSketch, q: f64) -> Option<f64> {
     s.quantile(q).ok().flatten()
+}
+
+/// Shared sparse-active gate for the active/shadow sketch pairs.
+/// `quantile_or` returns `Some` on any non-empty sketch, so without a
+/// count gate a post-rotation `active.count()=1..min_n` wins with
+/// noise instead of `shadow`'s learned distribution. `min_n` is
+/// derived from `q` as `⌈1/(1−q)⌉` (≥2): a `q`-quantile needs roughly
+/// that many samples before the tail estimate is meaningful — 2 at
+/// q=0.5, 10 at q=0.9, 100 at q=0.99 (matching `N_SEED` /
+/// `ICE_REAL_THRESHOLD`). Final `.or_else(active)` so a
+/// sparse-active-only cell (shadow empty too) still returns its own
+/// estimate rather than `None`.
+fn quantile_with_shadow(active: &DDSketch, shadow: &DDSketch, q: f64) -> Option<f64> {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "q ∈ [0.5, 0.99] (schmitt_adjust clamp + literal callers) → 1/(1−q) ∈ [2, 100]"
+    )]
+    let min_n = ((1.0 / (1.0 - q)).ceil() as usize).max(2);
+    (active.count() >= min_n)
+        .then(|| quantile_or(active, q))
+        .flatten()
+        .or_else(|| quantile_or(shadow, q))
+        .or_else(|| quantile_or(active, q))
 }
 
 /// All cells. `HashMap` keyed by [`Cell`]; `len()` ≈ |hw_classes| × 2
@@ -758,6 +773,61 @@ mod tests {
         assert!(
             t >= 60.0,
             "post-rotate sparse-active t={t} (was max-of-5 noise, not shadow q99)"
+        );
+    }
+
+    /// mb_026: `lead_time` and `boot_median` need the same sparse-active
+    /// gate `ice_timeout` got — `quantile_or` returns Some on any
+    /// non-empty sketch, so without the gate a 1-5-sample post-rotation
+    /// active wins over shadow's 200-sample distribution. `min_n` scales
+    /// with `q` (≈⌈1/(1−q)⌉): 10 at q=0.9, 2 at q=0.5.
+    #[test]
+    fn lead_time_boot_median_shadow_fallback_on_sparse_active() {
+        let mut s = CellState::default();
+        for k in 0..200u32 {
+            s.record(20.0 + f64::from(k % 50), 0.0);
+        }
+        // Shadow learned values (uniform 20..69): q0.9 ≈ 64, median ≈ 44.
+        let learned_lead = s.lead_time();
+        let learned_median = s.boot_median().unwrap();
+        assert!(learned_lead >= 60.0, "pre-rotate q0.9={learned_lead}");
+        assert!(learned_median >= 40.0, "pre-rotate median={learned_median}");
+
+        let t0 = SystemTime::UNIX_EPOCH;
+        s.epoch = t0;
+        s.maybe_rotate(
+            t0 + Duration::from_secs(7 * 3600),
+            Duration::from_secs(6 * 3600),
+        );
+
+        // Single low post-rotation sample: count=1 < min_n for both
+        // quantiles → both fall back to shadow.
+        s.record(15.0, 0.0);
+        let lt = s.lead_time();
+        let bm = s.boot_median().unwrap();
+        assert!(
+            lt >= 60.0,
+            "lead_time sparse-active (count=1<10): {lt} (should be shadow's q0.9, not 15)"
+        );
+        assert!(
+            bm >= 40.0,
+            "boot_median sparse-active (count=1<2): {bm} (should be shadow's median, not 15)"
+        );
+
+        // 4 more (count=5): still <10 for lead_time (q=0.9) but ≥2 for
+        // boot_median (q=0.5) → boot_median legitimately reads active.
+        for _ in 0..4 {
+            s.record(15.0, 0.0);
+        }
+        let lt = s.lead_time();
+        assert!(
+            lt >= 60.0,
+            "lead_time at count=5<10: {lt} (should still be shadow's q0.9)"
+        );
+        let bm = s.boot_median().unwrap();
+        assert!(
+            (14.0..=16.0).contains(&bm),
+            "boot_median at count=5>=2: {bm} (5-sample median is a real central tendency)"
         );
     }
 
