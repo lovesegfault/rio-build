@@ -775,9 +775,7 @@ impl DagActor {
         // `update_entry` on edge.
         let mut memo_entry: Option<(u64, u64, solve::MemoEntry)> = None;
         let full = (!hw.is_empty()
-            && override_.as_ref().is_none_or(|o| {
-                o.forced_cores.is_none() && o.tier.is_none() && o.forced_mem.is_none()
-            })
+            && override_.as_ref().is_none_or(|o| !o.bypasses_solve_full())
             && hints.prefer_local_build != Some(true)
             && hints.enable_parallel_building != Some(false)
             && !state.is_fixed_output
@@ -984,6 +982,29 @@ impl DagActor {
                     memo.a.cells
                 } else {
                     cells
+                };
+                // Capacity-type pin: filter A' to the operator's cap.
+                // If A' ∩ {cap} = ∅ (solve admitted only the OTHER cap
+                // — e.g. spot-only on cost), fall back to
+                // `all_candidates` ∩ {cap}: every (h, cap) solve_full
+                // evaluated, feasible or not. Honors the pin even when
+                // it conflicts with the cost-optimal set; c*/mem/disk
+                // stay at A's argmin (approximate but operator-
+                // intentional).
+                let cells = match override_.as_ref().and_then(|o| o.capacity) {
+                    Some(cap) => {
+                        let pinned: Vec<_> = cells.into_iter().filter(|(_, c)| *c == cap).collect();
+                        if pinned.is_empty() {
+                            memo.all_candidates
+                                .iter()
+                                .filter(|c| c.cell.1 == cap)
+                                .map(|c| c.cell.clone())
+                                .collect()
+                        } else {
+                            pinned
+                        }
+                    }
+                    None => cells,
                 };
                 // `dispatched_cells` is NOT armed here — that's a state
                 // write on the emit path (dashboard/CLI/ComponentScaler

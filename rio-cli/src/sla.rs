@@ -34,6 +34,22 @@ pub enum SlaCmd {
         /// Forced memory. Accepts `8Gi`, `512Mi`, or raw bytes.
         #[arg(long)]
         mem: Option<String>,
+        /// Ad-hoc p50 target (e.g. `5m`, `300s`). Any of --p50/--p90/
+        /// --p99 set → solve runs against a one-off tier built from
+        /// these instead of the config ladder.
+        #[arg(long, value_parser = parse_secs)]
+        p50: Option<f64>,
+        /// Ad-hoc p90 target (e.g. `20m`).
+        #[arg(long, value_parser = parse_secs)]
+        p90: Option<f64>,
+        /// Ad-hoc p99 target (e.g. `1h`).
+        #[arg(long, value_parser = parse_secs)]
+        p99: Option<f64>,
+        /// Pin `karpenter.sh/capacity-type`: `spot` or `on-demand`.
+        /// Filters the admissible set; does not bypass the hw-aware
+        /// solve.
+        #[arg(long, value_parser = ["spot", "on-demand"])]
+        capacity: Option<String>,
         /// Expiry as a duration from now (e.g. `2h`, `7d`). Unset =
         /// never expires.
         #[arg(long)]
@@ -107,6 +123,10 @@ pub(crate) async fn run(
             tier,
             cores,
             mem,
+            p50,
+            p90,
+            p99,
+            capacity,
             ttl,
         } => {
             let mem_bytes = mem.as_deref().map(parse_bytes).transpose()?;
@@ -119,6 +139,10 @@ pub(crate) async fn run(
                     tier,
                     cores,
                     mem_bytes,
+                    p50_secs: p50,
+                    p90_secs: p90,
+                    p99_secs: p99,
+                    capacity_type: capacity,
                     expires_at_epoch,
                     // Audit stamp. Best-effort — empty if $USER unset.
                     created_by: std::env::var("USER").ok(),
@@ -149,12 +173,12 @@ pub(crate) async fn run(
                 return Ok(());
             }
             println!(
-                "{:<6} {:<24} {:<16} {:<12} {:<8} {:<8} {:<10}",
-                "ID", "PNAME", "SYSTEM", "TENANT", "TIER", "CORES", "MEM"
+                "{:<6} {:<24} {:<16} {:<12} {:<8} {:<8} {:<8} {:<10} {:<10}",
+                "ID", "PNAME", "SYSTEM", "TENANT", "TIER", "CORES", "MEM", "P90", "CAP"
             );
             for o in &resp.overrides {
                 println!(
-                    "{:<6} {:<24} {:<16} {:<12} {:<8} {:<8} {:<10}",
+                    "{:<6} {:<24} {:<16} {:<12} {:<8} {:<8} {:<8} {:<10} {:<10}",
                     o.id,
                     o.pname,
                     o.system.as_deref().unwrap_or("*"),
@@ -162,6 +186,8 @@ pub(crate) async fn run(
                     o.tier.as_deref().unwrap_or("-"),
                     o.cores.map(|c| format!("{c}")).unwrap_or("-".into()),
                     o.mem_bytes.map(fmt_bytes).unwrap_or("-".into()),
+                    fmt_secs_opt(o.p90_secs.or(o.p50_secs).or(o.p99_secs)),
+                    o.capacity_type.as_deref().unwrap_or("-"),
                 );
             }
             Ok(())
@@ -404,6 +430,30 @@ fn parse_bytes(s: &str) -> anyhow::Result<i64> {
     Ok(n * mult)
 }
 
+/// Parse `5m` / `300s` / `2h` / `300` → seconds (f64). Bare number =
+/// seconds. Shared by `--p50/--p90/--p99`.
+fn parse_secs(s: &str) -> Result<f64, String> {
+    let s = s.trim();
+    let (num, mult) = if let Some(n) = s.strip_suffix('d') {
+        (n, 86400.0)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3600.0)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60.0)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1.0)
+    } else {
+        (s, 1.0)
+    };
+    let n: f64 = num
+        .parse()
+        .map_err(|_| format!("invalid duration {s:?}: expected e.g. 5m, 300s, 2h"))?;
+    if !n.is_finite() || n <= 0.0 {
+        return Err(format!("duration must be finite and positive, got {s:?}"));
+    }
+    Ok(n * mult)
+}
+
 /// Parse `2h` / `7d` / `30m` → Unix-epoch seconds at now()+ttl.
 fn parse_ttl(s: &str) -> anyhow::Result<f64> {
     let s = s.trim();
@@ -467,6 +517,16 @@ mod tests {
         // Tripwire documenting WHY direct cast is wrong.
         assert_eq!(fmt_bytes(u64::MAX as i64), "-1");
         assert_eq!(fmt_bytes(-1), "-1");
+    }
+    #[test]
+    fn parse_secs_suffixes() {
+        assert_eq!(parse_secs("5m").unwrap(), 300.0);
+        assert_eq!(parse_secs("300s").unwrap(), 300.0);
+        assert_eq!(parse_secs("2h").unwrap(), 7200.0);
+        assert_eq!(parse_secs("300").unwrap(), 300.0);
+        assert!(parse_secs("0").is_err());
+        assert!(parse_secs("-5m").is_err());
+        assert!(parse_secs("foo").is_err());
     }
     #[test]
     fn parse_ttl_suffixes() {

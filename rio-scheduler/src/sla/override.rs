@@ -12,17 +12,40 @@
 
 use crate::db::SlaOverrideRow;
 
+use super::config::CapacityType;
 use super::types::ModelKey;
 
 /// Resolved override for one [`ModelKey`]. All fields `Option`: a row
 /// may force only a tier (solve still runs against that tier's targets)
 /// OR only `cores` (solve bypassed) OR only `mem` (solve runs for
-/// cores, mem is forced), in any combination.
+/// cores, mem is forced), in any combination. `p*_secs` build a one-off
+/// tier (config ladder ignored); `capacity` filters the admissible set
+/// post-solve and is the ONLY field that does NOT bypass `solve_full`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ResolvedTarget {
     pub tier: Option<String>,
     pub forced_cores: Option<f64>,
     pub forced_mem: Option<u64>,
+    pub p50_secs: Option<f64>,
+    pub p90_secs: Option<f64>,
+    pub p99_secs: Option<f64>,
+    pub capacity: Option<CapacityType>,
+}
+
+impl ResolvedTarget {
+    /// True iff any field that routes the hw-agnostic [`intent_for`]
+    /// path is set. `capacity` is excluded — it filters `solve_full`'s
+    /// cells post-memo and must NOT gate the hw-aware path off.
+    ///
+    /// [`intent_for`]: super::solve::intent_for
+    pub fn bypasses_solve_full(&self) -> bool {
+        self.forced_cores.is_some()
+            || self.tier.is_some()
+            || self.forced_mem.is_some()
+            || self.p50_secs.is_some()
+            || self.p90_secs.is_some()
+            || self.p99_secs.is_some()
+    }
 }
 
 impl From<&SlaOverrideRow> for ResolvedTarget {
@@ -34,6 +57,12 @@ impl From<&SlaOverrideRow> for ResolvedTarget {
             // is a config error, clamp to 0 rather than panic in the
             // dispatch path.
             forced_mem: r.mem_bytes.map(|b| b.max(0) as u64),
+            p50_secs: r.p50_secs,
+            p90_secs: r.p90_secs,
+            p99_secs: r.p99_secs,
+            // Unparseable cap (operator typo via raw SQL) → drop silently;
+            // the CLI already constrains to spot|on-demand.
+            capacity: r.capacity_type.as_deref().and_then(CapacityType::parse),
         }
     }
 }
@@ -197,6 +226,34 @@ mod tests {
     #[test]
     fn empty_overrides_is_none() {
         assert!(resolve(&key("hello", "x", "t"), &[]).is_none());
+    }
+
+    #[test]
+    fn resolve_carries_p_targets_and_capacity() {
+        let row = SlaOverrideRow {
+            pname: "hello".into(),
+            p90_secs: Some(600.0),
+            capacity_type: Some("on-demand".into()),
+            ..Default::default()
+        };
+        let r = resolve(&key("hello", "x", "t"), std::slice::from_ref(&row)).unwrap();
+        assert_eq!(r.p90_secs, Some(600.0));
+        assert_eq!(r.p50_secs, None);
+        assert_eq!(r.capacity, Some(CapacityType::Od));
+        // p* gates solve_full off; capacity alone does NOT.
+        assert!(r.bypasses_solve_full());
+        let cap_only = ResolvedTarget {
+            capacity: Some(CapacityType::Spot),
+            ..Default::default()
+        };
+        assert!(!cap_only.bypasses_solve_full());
+        // Unparseable cap → dropped, not propagated as garbage.
+        let bad = SlaOverrideRow {
+            pname: "hello".into(),
+            capacity_type: Some("preemptible".into()),
+            ..Default::default()
+        };
+        assert_eq!(ResolvedTarget::from(&bad).capacity, None);
     }
 
     #[test]

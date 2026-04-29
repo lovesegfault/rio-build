@@ -732,7 +732,6 @@ message SlaOverride {
   // cores, mem is forced), in any combination.
   optional string tier = 6;
   reserved 7, 8, 9, 12;
-  reserved "p50_secs", "p90_secs", "p99_secs", "capacity_type";
   optional double cores = 10;
   optional int64 mem_bytes = 11;
   // Unix epoch seconds. Unset = never expires. Expired rows are
@@ -740,6 +739,18 @@ message SlaOverride {
   optional double expires_at_epoch = 13;
   double created_at_epoch = 14;
   optional string created_by = 15;
+  // Ad-hoc tier targets (wall-seconds). Any of p50/p90/p99 set →
+  // solve runs against a one-off tier built from these (config tier
+  // ladder ignored). Mutually independent of `tier` (named tier wins
+  // if both set — `tier` is the more specific operator intent).
+  // Fields 7/8/9 stay reserved (shipped on wire with prior semantics).
+  optional double p50_secs = 16;
+  optional double p90_secs = 17;
+  optional double p99_secs = 18;
+  // `karpenter.sh/capacity-type` pin: "spot" | "on-demand". Filters
+  // the admissible set to this cap only; does NOT bypass the
+  // hw-aware solve (unlike cores/mem/tier). Field 12 stays reserved.
+  optional string capacity_type = 19;
 }
 
 message SetSlaOverrideRequest {

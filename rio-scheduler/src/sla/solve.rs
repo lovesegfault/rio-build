@@ -440,13 +440,26 @@ pub fn intent_for(
     // tier override: solve against ONLY that tier's bounds. An unknown
     // name yields an empty ladder → BestEffort (operator error surfaces
     // via `sla explain`, not a silent fallback to the default ladder).
+    // p*_secs override: build a one-off tier from the operator's
+    // targets — config ladder ignored entirely. Named `tier` wins if
+    // both are set (more specific operator intent).
     let pinned: Vec<Tier>;
-    let tiers = match override_.and_then(|o| o.tier.as_deref()) {
-        Some(name) => {
+    let tiers = match override_ {
+        Some(o) if o.tier.is_some() => {
+            let name = o.tier.as_deref().unwrap();
             pinned = tiers.iter().filter(|t| t.name == name).cloned().collect();
             &pinned
         }
-        None => tiers,
+        Some(o) if o.p50_secs.is_some() || o.p90_secs.is_some() || o.p99_secs.is_some() => {
+            pinned = vec![Tier {
+                name: "override".into(),
+                p50: o.p50_secs,
+                p90: o.p90_secs,
+                p99: o.p99_secs,
+            }];
+            &pinned
+        }
+        _ => tiers,
     };
     let r = solve_tier(fit, tiers, ceil);
     // Infeasible-at-any-tier — the operator-facing alerting hook
@@ -1320,6 +1333,10 @@ pub fn override_hash(o: Option<&ResolvedTarget>) -> u64 {
     o.forced_cores.map(f64::to_bits).hash(&mut h);
     o.forced_mem.hash(&mut h);
     o.tier.hash(&mut h);
+    o.p50_secs.map(f64::to_bits).hash(&mut h);
+    o.p90_secs.map(f64::to_bits).hash(&mut h);
+    o.p99_secs.map(f64::to_bits).hash(&mut h);
+    o.capacity.hash(&mut h);
     h.finish()
 }
 
@@ -1721,6 +1738,46 @@ mod tests {
         assert_eq!(with("slow"), 2, "pinned tier=slow skips fast");
         assert_eq!(with("fast"), 9);
         assert_eq!(with("nope"), 64, "unknown tier → BestEffort cap_c");
+    }
+    #[test]
+    fn override_p_target_forces_adhoc_tier() {
+        // Against config [fast(p90=300), slow(p90=1200)] this fit lands
+        // on fast at c≈9. With p90_secs=1200 pinned, the config ladder
+        // is replaced by a one-off Tier{p90:1200} → c≈2. With
+        // p90_secs=300 → c≈9. Named `tier` beats p*_secs if both set.
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        let cfg_tiers = [t("fast", 300.0), t("slow", 1200.0)];
+        let with_p90 = |p90: f64| {
+            intent_for(
+                Some(&fit),
+                &DrvHints::default(),
+                Some(&ResolvedTarget {
+                    p90_secs: Some(p90),
+                    ..Default::default()
+                }),
+                &cfg(),
+                &cfg_tiers,
+                &ceil(),
+            )
+            .cores
+        };
+        assert_eq!(with_p90(1200.0), 2, "ad-hoc p90=1200 → solve as slow");
+        assert_eq!(with_p90(300.0), 9, "ad-hoc p90=300 → solve as fast");
+        // tier name wins over p*_secs.
+        let both = intent_for(
+            Some(&fit),
+            &DrvHints::default(),
+            Some(&ResolvedTarget {
+                tier: Some("slow".into()),
+                p90_secs: Some(300.0),
+                ..Default::default()
+            }),
+            &cfg(),
+            &cfg_tiers,
+            &ceil(),
+        )
+        .cores;
+        assert_eq!(both, 2, "named tier beats p*_secs");
     }
     #[test]
     fn override_mem_applies_without_cores() {
