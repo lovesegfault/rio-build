@@ -156,4 +156,12 @@ pub fn describe_metrics() {
         "rio_controller_lease_lost_total",
         "nodeclaim_pool lease lose transitions (explicit lose or local self-fence)."
     );
+    describe_counter!(
+        "rio_controller_placement_sim_mismatch_total",
+        "nodeclaim_pool cover_deficit anomalies by `reason` × `cell`. \
+         reason=menu_gap: an unplaced intent's max(c,M,D) exceeds every \
+         instance_menu entry for its cell — config-load asserts the menu \
+         covers (maxCores,maxMem,maxDisk), so a non-zero rate means the \
+         scheduler is emitting out-of-spec sizing or the menu drifted."
+    );
 }

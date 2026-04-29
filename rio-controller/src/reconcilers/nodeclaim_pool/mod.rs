@@ -26,24 +26,27 @@
 //! releases) and allows `replicas: 2` for HA without double-provisioning.
 
 mod consolidate;
+mod cover;
 mod ffd;
 mod health;
 pub mod sketch;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use kube::api::{Api, ListParams};
+use kube::api::{Api, ListParams, PostParams};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument, warn};
 
 use rio_crds::karpenter::NodeClaim;
 use rio_lease::LeaderState;
-use rio_proto::types::{GetSpawnIntentsRequest, GetSpawnIntentsResponse};
+use rio_proto::types::{GetSpawnIntentsRequest, GetSpawnIntentsResponse, SpawnIntent};
 
+use crate::reconcilers::node_informer::HwClassConfig;
 use crate::reconcilers::{AdminClient, admin_call};
 
 pub use consolidate::IdleGapEvent;
+pub use cover::{InstanceType, NODEPOOL_LABEL, SHIM_NODEPOOL};
 pub use ffd::{CAPACITY_TYPE_LABEL, HW_CLASS_LABEL, LiveNode, Placement, a_open, cells_of};
 pub use sketch::{CapacityType, Cell, CellSketches, CellState};
 
@@ -100,6 +103,53 @@ pub struct NodeClaimPoolConfig {
     /// `xtask k8s probe-boot`. Seeds the DDSketch on cold start.
     /// Helm: `sla.leadTimeSeed`.
     pub lead_time_seed: HashMap<String, f64>,
+    /// `(hw_class:cap)` → instance-shape menu for §13b anchor+bulk
+    /// selection. Helm: `sla.instanceMenu`. The controller does NOT
+    /// run the scheduler's live spot-price poll; `price_per_vcpu_hr`
+    /// is the static seed (relative ranking only). Validated when
+    /// `enabled` (every cell's max menu entry covers
+    /// `(maxCores,maxMem,maxDisk)` so the
+    /// `placement_sim_mismatch_total{reason=menu_gap}` path is
+    /// prod-unreachable).
+    pub instance_menu: HashMap<String, Vec<InstanceType>>,
+}
+
+impl NodeClaimPoolConfig {
+    /// Menu for `cell` (empty if unconfigured — caller emits the
+    /// `menu_gap` metric).
+    pub fn menu(&self, cell: &Cell) -> &[InstanceType] {
+        self.instance_menu
+            .get(&cell.to_string())
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Min `price_per_vcpu_hr` across `cell`'s menu — what
+    /// `cover::assign_to_cells` ranks cheapest-open by. `f64::MAX`
+    /// for an unconfigured cell so it's never picked over a configured
+    /// one.
+    pub fn cell_price(&self, cell: &Cell) -> f64 {
+        self.menu(cell)
+            .iter()
+            .map(|t| t.price_per_vcpu_hr)
+            .min_by(f64::total_cmp)
+            .unwrap_or(f64::MAX)
+    }
+
+    /// All configured cells (parsed from `instance_menu` keys), for
+    /// round-robin iteration. Malformed keys are skipped + warned.
+    pub fn all_cells(&self) -> Vec<Cell> {
+        self.instance_menu
+            .keys()
+            .filter_map(|k| {
+                let c = Cell::parse(k);
+                if c.is_none() {
+                    warn!(key = %k, "instance_menu key not parseable as h:cap; skipping");
+                }
+                c
+            })
+            .collect()
+    }
 }
 
 impl Default for NodeClaimPoolConfig {
@@ -119,6 +169,7 @@ impl Default for NodeClaimPoolConfig {
             max_lead_time: 600.0,
             max_consolidation_time: None,
             lead_time_seed: HashMap::new(),
+            instance_menu: HashMap::new(),
         }
     }
 }
@@ -147,12 +198,18 @@ pub struct NodeClaimPoolReconciler {
     pg: sqlx::PgPool,
     leader: LeaderState,
     cfg: NodeClaimPoolConfig,
+    /// `[sla.hw_classes.$h]` → label conjunction, fetched via
+    /// `GetHwClassConfig` in main.rs and shared with the
+    /// `node_informer`. `cover_deficit` reads
+    /// [`HwClassConfig::labels_for`] to build NodeClaim
+    /// `spec.requirements`.
+    hw_config: HwClassConfig,
     sketches: CellSketches,
     /// Count of consecutive ticks where `GetSpawnIntents` returned ⊥
     /// (RPC error). Saturates at `u8::MAX`; reset on first success.
     consecutive_bot_ticks: u8,
     /// Monotonic tick counter for `cover_deficit`'s rotating-start
-    /// round-robin (B8).
+    /// round-robin.
     tick_counter: u64,
 }
 
@@ -166,6 +223,7 @@ impl NodeClaimPoolReconciler {
         pg: sqlx::PgPool,
         leader: LeaderState,
         cfg: NodeClaimPoolConfig,
+        hw_config: HwClassConfig,
     ) -> Self {
         // Load persisted sketches; fall back to empty on error (a fresh
         // table is the cold-start case anyway). B9's `seed()` will
@@ -187,6 +245,7 @@ impl NodeClaimPoolReconciler {
             pg,
             leader,
             cfg,
+            hw_config,
             sketches,
             consecutive_bot_ticks: 0,
             tick_counter: 0,
@@ -326,17 +385,113 @@ impl NodeClaimPoolReconciler {
     }
 
     /// §13b anchor+bulk deficit cover.
-    // TODO(B8): full implementation. Skeleton returns empty so the
-    // persist/consolidate path exercises end-to-end without creating
-    // NodeClaims until B8+B12 land together.
+    ///
+    /// 1. Group `unplaced` by cheapest cell in each intent's `A_open`
+    ///    (`cover::assign_to_cells`). hw-agnostic intents (empty
+    ///    `A_open`) drop out — the legacy `Pool` reconciler covers
+    ///    those.
+    /// 2. Round-robin `cfg.all_cells()` from `tick_counter` so no cell
+    ///    starves under sustained pressure.
+    /// 3. Per cell with deficit (∉ `ice_masked`): pick anchor =
+    ///    smallest fitting `max_U(c*,M,D)`, bulk = cheapest meeting
+    ///    `median_U(M/c*)`; mint `N = min(need, per_tick_cap,
+    ///    budget_fit)` NodeClaims (1×anchor + (N−1)×bulk).
+    /// 4. `budget = max_fleet_cores − Σ live.allocatable.cpu −
+    ///    created_this_tick`. The sum covers both Registered AND
+    ///    in-flight claims so a slow-to-register burst doesn't
+    ///    double-provision next tick.
+    ///
+    /// `Api::create` failures are warned + skipped (next tick retries);
+    /// the method only propagates errors that would make the tick
+    /// non-progressing.
+    // r[impl ctrl.nodeclaim.anchor-bulk]
     async fn cover_deficit(
         &self,
-        unplaced: &[rio_proto::types::SpawnIntent],
+        unplaced: &[SpawnIntent],
         live: &[ffd::LiveNode],
         ice_masked: &[String],
     ) -> anyhow::Result<CoverResult> {
-        let _ = (unplaced, live, ice_masked, &self.cfg);
-        Ok(CoverResult::default())
+        if unplaced.is_empty() {
+            return Ok(CoverResult::default());
+        }
+        let ice: HashSet<Cell> = ice_masked.iter().filter_map(|s| Cell::parse(s)).collect();
+        let live_cores: u32 = live.iter().map(|n| n.allocatable.0).sum();
+        let mut created_cores = 0u32;
+
+        let by_cell = cover::assign_to_cells(unplaced, &self.sketches, |c| self.cfg.cell_price(c));
+        let order = cover::cells_round_robin(self.cfg.all_cells(), self.tick_counter);
+
+        let mut created = Vec::new();
+        for cell in &order {
+            if ice.contains(cell) {
+                continue;
+            }
+            let Some(u) = by_cell.get(cell) else {
+                continue;
+            };
+            let menu = self.cfg.menu(cell);
+            let (max_c, max_m, max_d) = u.iter().fold((0, 0, 0), |(c, m, d), i| {
+                (c.max(i.cores), m.max(i.mem_bytes), d.max(i.disk_bytes))
+            });
+            let Some(anchor) = cover::pick_anchor(menu, max_c, max_m, max_d) else {
+                metrics::counter!(
+                    "rio_controller_placement_sim_mismatch_total",
+                    "reason" => "menu_gap",
+                    "cell" => cell.to_string(),
+                )
+                .increment(1);
+                continue;
+            };
+            let med_ratio = cover::median(
+                u.iter()
+                    .filter(|i| i.cores > 0)
+                    .map(|i| i.mem_bytes as f64 / f64::from(i.cores))
+                    .collect(),
+            );
+            let bulk = cover::pick_bulk(menu, med_ratio, anchor);
+            let sum_c: u32 = u.iter().map(|i| i.cores).sum();
+            let budget = self
+                .cfg
+                .max_fleet_cores
+                .saturating_sub(live_cores)
+                .saturating_sub(created_cores);
+            let n = cover::claim_count(
+                sum_c,
+                anchor.cores,
+                bulk.cores,
+                self.cfg.max_node_claims_per_cell_per_tick,
+                budget,
+            );
+            if n == 0 {
+                debug!(%cell, budget, anchor = anchor.cores, "fleet-core budget exhausted");
+                continue;
+            }
+            let Some(hw_labels) = self.hw_config.labels_for(&cell.0) else {
+                warn!(hw_class = %cell.0, "no hw-class labels (GetHwClassConfig not loaded?); skipping");
+                continue;
+            };
+            for k in 0..n {
+                let shape = if k == 0 { anchor } else { bulk };
+                let nc = cover::build_nodeclaim(cell, shape, &hw_labels, &self.cfg.node_class_ref);
+                match self.nodeclaims.create(&PostParams::default(), &nc).await {
+                    Ok(out) => {
+                        let name = out.metadata.name.unwrap_or_default();
+                        debug!(%cell, %name, cores = shape.cores, "NodeClaim created");
+                        created.push(name);
+                    }
+                    Err(e) => {
+                        warn!(%cell, error = %e, "NodeClaim create failed; skipping");
+                    }
+                }
+            }
+            created_cores += anchor.cores + (n - 1) * bulk.cores;
+        }
+        // TODO(B11): populate `ice_cells` from this tick's
+        // `Launched=False` / Registered-timeout observations.
+        Ok(CoverResult {
+            created,
+            ice_cells: Vec::new(),
+        })
     }
 
     /// Report cells where NodeClaim creation hit ICE (Launched=False or
@@ -412,5 +567,66 @@ mod tests {
         let r = CoverResult::default();
         assert!(r.created.is_empty());
         assert!(r.ice_cells.is_empty());
+    }
+
+    type MenuLit = (u32, u64, u64, f64);
+    fn cfg_with_menu(menus: &[(&str, &[MenuLit])]) -> NodeClaimPoolConfig {
+        let instance_menu = menus
+            .iter()
+            .map(|(k, m)| {
+                let v = m
+                    .iter()
+                    .map(|&(cores, mem, disk, p)| InstanceType {
+                        cores,
+                        mem_bytes: mem,
+                        disk_bytes: disk,
+                        price_per_vcpu_hr: p,
+                    })
+                    .collect();
+                ((*k).to_string(), v)
+            })
+            .collect();
+        NodeClaimPoolConfig {
+            instance_menu,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn config_menu_and_cell_price() {
+        const GI: u64 = 1 << 30;
+        let cfg = cfg_with_menu(&[
+            (
+                "h1:spot",
+                &[(4, 16 * GI, 100 * GI, 0.04), (8, 32 * GI, 100 * GI, 0.03)],
+            ),
+            ("h2:od", &[(16, 64 * GI, 200 * GI, 0.10)]),
+        ]);
+        let h1 = Cell("h1".into(), CapacityType::Spot);
+        let h2 = Cell("h2".into(), CapacityType::OnDemand);
+        assert_eq!(cfg.menu(&h1).len(), 2);
+        assert_eq!(cfg.menu(&h2).len(), 1);
+        assert!(
+            cfg.menu(&Cell("nope".into(), CapacityType::Spot))
+                .is_empty()
+        );
+        // cell_price = min over menu.
+        assert!((cfg.cell_price(&h1) - 0.03).abs() < 1e-12);
+        assert!((cfg.cell_price(&h2) - 0.10).abs() < 1e-12);
+        // Unconfigured cell → MAX so it's never cheapest.
+        assert_eq!(
+            cfg.cell_price(&Cell("x".into(), CapacityType::Spot)),
+            f64::MAX
+        );
+        // all_cells parses keys; sort for stable assert.
+        let mut cells = cfg.all_cells();
+        cells.sort();
+        assert_eq!(cells, vec![h1, h2]);
+    }
+
+    #[test]
+    fn config_all_cells_skips_malformed() {
+        let cfg = cfg_with_menu(&[("good:spot", &[(4, 1, 1, 0.04)]), ("bad-key", &[])]);
+        assert_eq!(cfg.all_cells().len(), 1);
     }
 }

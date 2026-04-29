@@ -99,6 +99,17 @@ impl HwClassConfig {
         None
     }
 
+    /// `[sla.hw_classes.$h].labels` for `h` — the conjunction the
+    /// scheduler's `cells_to_selector_terms` would emit. `None` if `h`
+    /// is unknown OR config not yet loaded. The §13b `cover_deficit`
+    /// reads this to build NodeClaim `spec.requirements`.
+    pub fn labels_for(&self, h: &str) -> Option<Vec<(String, String)>> {
+        let cfg = self.0.read();
+        cfg.iter()
+            .find(|(name, _)| name == h)
+            .map(|(_, conj)| conj.clone())
+    }
+
     /// Replace the config wholesale from a `GetHwClassConfigResponse`.
     /// Sorted by `$h` for deterministic [`Self::match_node`] on overlap.
     fn set(&self, hw_classes: HashMap<String, rio_proto::types::HwClassLabels>) {
@@ -693,6 +704,18 @@ mod tests {
 
     fn band_cache() -> NodeLabelCache {
         NodeLabelCache::with_config(band_config())
+    }
+
+    #[test]
+    fn labels_for_returns_conjunction() {
+        let cfg = band_config();
+        assert_eq!(
+            cfg.labels_for("intel-7"),
+            Some(vec![("rio.build/hw-band".into(), "7".into())])
+        );
+        assert_eq!(cfg.labels_for("nope"), None);
+        // Empty (not yet loaded) → None for any h.
+        assert_eq!(HwClassConfig::default().labels_for("intel-7"), None);
     }
 
     #[test]

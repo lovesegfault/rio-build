@@ -29,7 +29,7 @@ const SKETCH_VERSION: u32 = 1;
 
 /// Spot vs on-demand. The migration's CHECK constraint pins the wire
 /// strings; [`as_str`](Self::as_str) is the single mapping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum CapacityType {
     Spot,
     OnDemand,
@@ -56,8 +56,9 @@ impl CapacityType {
 }
 
 /// `(hw_class, capacity_type)` cell key. `hw_class` is the operator's
-/// `[sla.hw_classes.$h]` key (e.g. `"mid-ebs-x86"`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// `[sla.hw_classes.$h]` key (e.g. `"mid-ebs-x86"`). `Ord` for
+/// deterministic round-robin iteration in `cover_deficit`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Cell(pub String, pub CapacityType);
 
 impl Cell {

@@ -318,7 +318,7 @@ async fn main() -> anyhow::Result<()> {
     // once that lands; until then this populates but nobody reads.
     let hw_config = node_informer::HwClassConfig::default();
     hw_config.load(&mut admin.clone()).await;
-    let node_cache = NodeLabelCache::with_config(hw_config);
+    let node_cache = NodeLabelCache::with_config(hw_config.clone());
     rio_common::task::spawn_monitored(
         "node-informer",
         node_informer::run(
@@ -428,6 +428,7 @@ async fn main() -> anyhow::Result<()> {
                 pg,
                 leader,
                 cfg.nodeclaim_pool.clone(),
+                hw_config.clone(),
             )
             .await;
             rio_common::task::spawn_monitored("nodeclaim-pool", reconciler.run(shutdown.clone()));
