@@ -28,6 +28,28 @@ pub const CAPACITY_TYPE_LABEL: &str = "karpenter.sh/capacity-type";
 /// scheduler's `[sla.hw_classes]` map.
 pub const HW_CLASS_LABEL: &str = "rio.build/hw-class";
 
+/// `kubernetes.io/arch` — `amd64`/`arm64`. Each `[sla.hw_classes.$h]`
+/// conjunction carries this (12-class prod config); [`system_to_arch`]
+/// maps `intent.system` to the same vocabulary so hw-agnostic intents
+/// (cold-start `fit=None` → `hw_class_names=[]`) can FFD-place on any
+/// matching-arch node and `cover_deficit` can target the reference
+/// cell.
+pub const ARCH_LABEL: &str = "kubernetes.io/arch";
+
+/// Map a single nix `system` (e.g. `"x86_64-linux"`) to its
+/// `kubernetes.io/arch` label value. `None` for empty/`builtin`/
+/// unknown — caller treats hw-agnostic intent with unmappable system
+/// as undroppable (no cell can host it). Same arch table as
+/// `pool::pod::nix_systems_to_k8s_arch` (I-098); single-string here
+/// because `SpawnIntent.system` is scalar.
+pub fn system_to_arch(system: &str) -> Option<&'static str> {
+    match system.split_once('-').map_or(system, |(a, _)| a) {
+        "x86_64" | "i686" => Some("amd64"),
+        "aarch64" | "armv7l" | "armv6l" => Some("arm64"),
+        _ => None,
+    }
+}
+
 /// View of one owned NodeClaim for FFD + consolidation. Built from the
 /// typed `NodeClaim` (B4) so condition/allocatable/label parsing lives
 /// in one `From` impl.
@@ -201,10 +223,16 @@ pub type Placement = (SpawnIntent, String, bool);
 /// **A_open**: a Ready intent's admissible cells are its full
 /// `cells_of` set. A forecast intent's are filtered to
 /// `eta_seconds < lead_time[cell]` — only place on cells that will be
-/// up before the intent's deps complete. Empty `A_open` (hw-agnostic
-/// intent, or all cells too slow) → unplaced.
+/// up before the intent's deps complete. Empty `A_open` from
+/// `hw_class_names=[]` (cold-start `fit=None`) is the **hw-agnostic**
+/// case: eligible on ANY node whose hw-class arch matches
+/// `system_to_arch(intent.system)` — so the placeable-gate works for
+/// unfitted drvs once `cover_deficit` has provisioned a reference-cell
+/// node. Empty `A_open` from lead-time gating (all cells too slow) →
+/// unplaced.
 ///
-/// **Bin-select**: among `live` nodes whose `cell ∈ A_open` AND whose
+/// **Bin-select**: among `live` nodes whose `cell ∈ A_open` (or whose
+/// arch matches, for hw-agnostic intents) AND whose
 /// running `free` covers `(cores, mem, disk)`, pick MostAllocated:
 /// max `(allocatable − free + cores) / allocatable` on the cpu axis.
 /// `free` is the running tally (decremented per placement) so the
@@ -215,6 +243,7 @@ pub fn simulate(
     intents: &[SpawnIntent],
     live: &[LiveNode],
     sketches: &CellSketches,
+    hw_arch: impl Fn(&str, &str) -> bool,
 ) -> (Vec<Placement>, Vec<SpawnIntent>) {
     // Running free per node. Cell-less nodes excluded up front: no
     // intent can match them, and excluding here keeps the score loop's
@@ -235,9 +264,24 @@ pub fn simulate(
     let mut unplaced = Vec::new();
     for i in sorted {
         let open = a_open(&i, sketches);
+        // hw-agnostic (`hw_class_names=[]`): eligible on any node
+        // whose hw-class `kubernetes.io/arch` matches `intent.system`.
+        // `arch.is_none()` (unmappable system) → no node matches.
+        // Distinguished from "all cells lead-time-gated" (non-empty
+        // `hw_class_names`, empty `open`) which stays cell-gated and
+        // falls through to unplaced.
+        let agnostic_arch = i
+            .hw_class_names
+            .is_empty()
+            .then(|| system_to_arch(&i.system))
+            .flatten();
         let best = live
             .iter()
-            .filter(|n| n.cell.as_ref().is_some_and(|c| open.contains(c)))
+            .filter(|n| {
+                n.cell.as_ref().is_some_and(|c| {
+                    open.contains(c) || agnostic_arch.is_some_and(|a| hw_arch(&c.0, a))
+                })
+            })
             .filter(|n| {
                 free.get(n.name.as_str())
                     .is_some_and(|f| f.0 >= i.cores && f.1 >= i.mem_bytes && f.2 >= i.disk_bytes)
@@ -534,6 +578,12 @@ pub(crate) mod tests {
         &p.iter().find(|(i, _, _)| i.intent_id == id).unwrap().1
     }
 
+    /// `hw_arch` stub: every hw-class matches every arch (tests that
+    /// don't exercise the hw-agnostic path don't care).
+    fn any_arch(_h: &str, _a: &str) -> bool {
+        true
+    }
+
     // --- LiveNode parsing ----------------------------------------------
 
     #[test]
@@ -735,7 +785,7 @@ pub(crate) mod tests {
             intent("a", 4, GI, &[("h", CapacityType::Spot)]),
             intent("b", 2, GI, &[("h", CapacityType::Spot)]),
         ];
-        let (p, u) = simulate(&intents, &[], &CellSketches::default());
+        let (p, u) = simulate(&intents, &[], &CellSketches::default(), any_arch);
         assert!(p.is_empty());
         assert_eq!(u.len(), 2);
     }
@@ -762,7 +812,7 @@ pub(crate) mod tests {
             forecast(intent("forecast-8c", 8, GI, &[h]), 10.0),
             intent("ready-6c", 6, GI, &[h]),
         ];
-        let (p, u) = simulate(&intents, &nodes, &sk);
+        let (p, u) = simulate(&intents, &nodes, &sk, any_arch);
         assert_eq!(p.len(), 2);
         assert_eq!(u.len(), 1);
         assert_eq!(u[0].intent_id, "forecast-8c");
@@ -784,7 +834,7 @@ pub(crate) mod tests {
         a.requested = (4, 0, 0);
         let b = node("B", "h", CapacityType::Spot, 12, 64 * GI, 100 * GI);
         let intents = [intent("x", 4, GI, &[("h", CapacityType::Spot)])];
-        let (p, u) = simulate(&intents, &[a, b], &CellSketches::default());
+        let (p, u) = simulate(&intents, &[a, b], &CellSketches::default(), any_arch);
         assert!(u.is_empty());
         assert_eq!(placed_on(&p, "x"), "A");
     }
@@ -804,7 +854,7 @@ pub(crate) mod tests {
             intent("i2", 3, GI, &[("h", CapacityType::Spot)]),
             intent("i3", 3, GI, &[("h", CapacityType::Spot)]),
         ];
-        let (p, u) = simulate(&intents, &nodes, &CellSketches::default());
+        let (p, u) = simulate(&intents, &nodes, &CellSketches::default(), any_arch);
         assert!(u.is_empty());
         assert_eq!(placed_on(&p, "i1"), "B");
         assert_eq!(placed_on(&p, "i2"), "B");
@@ -837,7 +887,7 @@ pub(crate) mod tests {
         );
         // A_open directly: only h2.
         assert_eq!(a_open(&i, &sk), vec![Cell("h2".into(), CapacityType::Spot)]);
-        let (p, u) = simulate(&[i], &nodes, &sk);
+        let (p, u) = simulate(&[i], &nodes, &sk, any_arch);
         assert!(u.is_empty());
         assert_eq!(placed_on(&p, "fc"), "n-h2");
         // Ready intent on the same cells ignores lead_time.
@@ -854,12 +904,12 @@ pub(crate) mod tests {
     fn ffd_affinity_mismatch_unplaced() {
         let nodes = [node("n", "h1", CapacityType::Spot, 8, 64 * GI, 100 * GI)];
         let intents = [intent("x", 4, GI, &[("h2", CapacityType::Spot)])];
-        let (p, u) = simulate(&intents, &nodes, &CellSketches::default());
+        let (p, u) = simulate(&intents, &nodes, &CellSketches::default(), any_arch);
         assert!(p.is_empty());
         assert_eq!(u.len(), 1);
         // Same hw, wrong cap → also mismatch.
         let intents = [intent("y", 4, GI, &[("h1", CapacityType::OnDemand)])];
-        let (p, u) = simulate(&intents, &nodes, &CellSketches::default());
+        let (p, u) = simulate(&intents, &nodes, &CellSketches::default(), any_arch);
         assert!(p.is_empty());
         assert_eq!(u.len(), 1);
     }
@@ -869,26 +919,65 @@ pub(crate) mod tests {
         let mut n = node("n", "h", CapacityType::Spot, 8, 64 * GI, 100 * GI);
         n.cell = None;
         let intents = [intent("x", 4, GI, &[("h", CapacityType::Spot)])];
-        let (p, u) = simulate(&intents, &[n], &CellSketches::default());
+        let (p, u) = simulate(&intents, &[n], &CellSketches::default(), any_arch);
+        assert!(p.is_empty());
+        assert_eq!(u.len(), 1);
+    }
+
+    /// Cold-start `fit=None` → `hw_class_names=[]`. Places on any
+    /// node whose hw-class arch matches `system_to_arch(intent.system)`.
+    /// Unmappable system → unplaced. Arch mismatch → unplaced.
+    #[test]
+    fn ffd_hw_agnostic_intent_places_by_arch() {
+        let nodes = [
+            node("nx", "h-x86", CapacityType::Spot, 8, 64 * GI, 100 * GI),
+            node("na", "h-arm", CapacityType::Spot, 8, 64 * GI, 100 * GI),
+        ];
+        let hw_arch = |h: &str, a: &str| match h {
+            "h-x86" => a == "amd64",
+            "h-arm" => a == "arm64",
+            _ => false,
+        };
+        let agn = |id: &str, sys: &str| SpawnIntent {
+            intent_id: id.into(),
+            cores: 4,
+            mem_bytes: GI,
+            disk_bytes: GI,
+            system: sys.into(),
+            ready: Some(true),
+            ..Default::default()
+        };
+        let intents = [
+            agn("x", "x86_64-linux"),
+            agn("a", "aarch64-linux"),
+            agn("u", ""), // unmappable → unplaced
+        ];
+        let (p, u) = simulate(&intents, &nodes, &CellSketches::default(), hw_arch);
+        assert_eq!(p.len(), 2);
+        assert_eq!(placed_on(&p, "x"), "nx");
+        assert_eq!(placed_on(&p, "a"), "na");
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].intent_id, "u");
+        // No matching-arch node → unplaced (cover_deficit provisions).
+        let (p, u) = simulate(
+            &[agn("x2", "x86_64-linux")],
+            &nodes[1..],
+            &CellSketches::default(),
+            hw_arch,
+        );
         assert!(p.is_empty());
         assert_eq!(u.len(), 1);
     }
 
     #[test]
-    fn ffd_hw_agnostic_intent_unplaced() {
-        // Empty node_affinity → cells_of empty → A_open empty → no
-        // node matches. cover_deficit (B8) handles these via the
-        // legacy path / hw-agnostic NodeClass.
-        let nodes = [node("n", "h", CapacityType::Spot, 8, 64 * GI, 100 * GI)];
-        let i = SpawnIntent {
-            intent_id: "agn".into(),
-            cores: 4,
-            ready: Some(true),
-            ..Default::default()
-        };
-        let (p, u) = simulate(&[i], &nodes, &CellSketches::default());
-        assert!(p.is_empty());
-        assert_eq!(u.len(), 1);
+    fn system_to_arch_mapping() {
+        assert_eq!(system_to_arch("x86_64-linux"), Some("amd64"));
+        assert_eq!(system_to_arch("i686-linux"), Some("amd64"));
+        assert_eq!(system_to_arch("aarch64-linux"), Some("arm64"));
+        assert_eq!(system_to_arch("armv7l-linux"), Some("arm64"));
+        assert_eq!(system_to_arch("builtin"), None);
+        assert_eq!(system_to_arch(""), None);
+        assert_eq!(system_to_arch("riscv64-linux"), None);
     }
 
     #[test]
@@ -896,7 +985,7 @@ pub(crate) mod tests {
         let mut n = node("n", "h", CapacityType::Spot, 8, 64 * GI, 100 * GI);
         n.registered = false;
         let intents = [intent("x", 4, GI, &[("h", CapacityType::Spot)])];
-        let (p, _) = simulate(&intents, &[n], &CellSketches::default());
+        let (p, _) = simulate(&intents, &[n], &CellSketches::default(), any_arch);
         assert_eq!(p.len(), 1);
         assert!(p[0].2, "in_flight = !registered");
     }
@@ -916,7 +1005,7 @@ pub(crate) mod tests {
         let intents: Vec<_> = (0..20)
             .map(|k| intent(&format!("i{k}"), 3, 4 * GI, &[h]))
             .collect();
-        let (p, u) = simulate(&intents, &nodes, &CellSketches::default());
+        let (p, u) = simulate(&intents, &nodes, &CellSketches::default(), any_arch);
         assert_eq!(p.len() + u.len(), 20);
         for n in &nodes {
             let (c, m, d) = p
@@ -949,7 +1038,7 @@ pub(crate) mod tests {
             intent("zz", 4, GI, &[("h", CapacityType::Spot)]),
             intent("aa", 4, GI, &[("h", CapacityType::Spot)]),
         ];
-        let (p, u) = simulate(&intents, &nodes, &CellSketches::default());
+        let (p, u) = simulate(&intents, &nodes, &CellSketches::default(), any_arch);
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].0.intent_id, "aa", "intent_id asc tiebreak");
         assert_eq!(u[0].intent_id, "zz");

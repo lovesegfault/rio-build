@@ -50,7 +50,10 @@ use crate::reconcilers::{AdminClient, admin_call};
 
 pub use consolidate::{HOLD_OPEN_ANNOTATION, IdleGapEvent};
 pub use cover::{InstanceType, NODEPOOL_LABEL, SHIM_NODEPOOL};
-pub use ffd::{CAPACITY_TYPE_LABEL, HW_CLASS_LABEL, LiveNode, Placement, a_open, cells_of};
+pub use ffd::{
+    ARCH_LABEL, CAPACITY_TYPE_LABEL, HW_CLASS_LABEL, LiveNode, Placement, a_open, cells_of,
+    system_to_arch,
+};
 pub use sketch::{CapacityType, Cell, CellSketches, CellState};
 
 /// Reconcile interval. Matches the Pool reconciler's `GetSpawnIntents`
@@ -182,6 +185,13 @@ pub struct NodeClaimPoolConfig {
     /// `EC2NodeClass` name stamped on every created NodeClaim's
     /// `spec.nodeClassRef.name`. Helm: `sla.nodeClassRef`.
     pub node_class_ref: String,
+    /// `[sla].referenceHwClass` — the cold-start fallback cell for
+    /// hw-agnostic intents (`fit=None` → `hw_class_names=[]`). See
+    /// [`Self::fallback_cell`]. Helm: `sla.referenceHwClass` (same key
+    /// the scheduler reads for ref-second normalization, so the
+    /// controller's cold-start probes land on the normalization
+    /// anchor).
+    pub reference_hw_class: String,
     /// §13b deficit-cover budget cap (sum of `allocatable.cpu` across
     /// all owned NodeClaims, Registered + in-flight). Helm:
     /// `sla.maxFleetCores`.
@@ -246,6 +256,31 @@ impl NodeClaimPoolConfig {
             .unwrap_or(0.0)
     }
 
+    /// Cold-start fallback cell for an hw-agnostic intent
+    /// (`hw_class_names=[]`, i.e. `fit=None`): the
+    /// `(referenceHwClass, Spot)` cell when its `kubernetes.io/arch`
+    /// label matches `intent.system` (or is absent — arch-agnostic
+    /// hw-class), else the cheapest [`Self::cell_price`] cell whose
+    /// hw-class arch matches. `None` ⇔ `system` unmappable OR no
+    /// configured cell hosts that arch (caller emits
+    /// `rio_controller_nodeclaim_intent_dropped_total
+    /// {reason=no_menu_for_arch}`).
+    ///
+    /// Spot capacity-type only: cold-start probes are uniform
+    /// `probe.cpu`-shaped and bounded by `max_node_claims_per_cell_per_
+    /// tick`; on-demand fallback would defeat the §13b cost model.
+    pub fn fallback_cell(&self, i: &SpawnIntent, hw: &HwClassConfig) -> Option<Cell> {
+        let arch = ffd::system_to_arch(&i.system)?;
+        let ref_cell = Cell(self.reference_hw_class.clone(), CapacityType::Spot);
+        if hw.matches_arch(&ref_cell.0, arch) && !self.menu(&ref_cell).is_empty() {
+            return Some(ref_cell);
+        }
+        self.all_cells()
+            .into_iter()
+            .filter(|c| hw.matches_arch(&c.0, arch))
+            .min_by(|a, b| self.cell_price(a).total_cmp(&self.cell_price(b)))
+    }
+
     /// All configured cells (parsed from `instance_menu` keys), for
     /// round-robin iteration. Malformed keys are skipped + warned.
     pub fn all_cells(&self) -> Vec<Cell> {
@@ -271,6 +306,7 @@ impl Default for NodeClaimPoolConfig {
             lease_namespace: None,
             // Matches helm `sla.nodeClassRef` default.
             node_class_ref: "rio-default".into(),
+            reference_hw_class: String::new(),
             // Matches helm `sla.maxFleetCores` / `maxNodeClaimsPerCellPerTick`
             // / `maxLeadTime` defaults. Validated in main.rs only when
             // `enabled` so unit tests don't need to populate these.
@@ -465,7 +501,10 @@ impl NodeClaimPoolReconciler {
             Duration::from_secs(self.cfg.sketch_halflife_secs),
         );
 
-        let (placeable, unplaced) = ffd::simulate(&intents.intents, &live, &self.sketches);
+        let (placeable, unplaced) =
+            ffd::simulate(&intents.intents, &live, &self.sketches, |h, a| {
+                self.hw_config.matches_arch(h, a)
+            });
         debug!(
             placeable = placeable.len(),
             unplaced = unplaced.len(),
@@ -578,7 +617,12 @@ impl NodeClaimPoolReconciler {
         }
         // Σ unplaced cores per cheapest-A_open cell — same assignment
         // cover_deficit uses, so the gauge equals cover's per-cell input.
-        let by_cell = cover::assign_to_cells(unplaced, &self.sketches, |c| self.cfg.cell_price(c));
+        let (by_cell, _) = cover::assign_to_cells(
+            unplaced,
+            &self.sketches,
+            |c| self.cfg.cell_price(c),
+            |i| self.cfg.fallback_cell(i, &self.hw_config),
+        );
         for cell in self.cfg.all_cells() {
             let label = cell.to_string();
             let (reg, inf) = by_state.get(&cell).copied().unwrap_or((0, 0));
@@ -627,9 +671,12 @@ impl NodeClaimPoolReconciler {
     /// §13b anchor+bulk deficit cover.
     ///
     /// 1. Group `unplaced` by cheapest cell in each intent's `A_open`
-    ///    (`cover::assign_to_cells`). hw-agnostic intents (empty
-    ///    `A_open`) drop out — the legacy `Pool` reconciler covers
-    ///    those.
+    ///    (`cover::assign_to_cells`). hw-agnostic intents
+    ///    (`hw_class_names=[]`, cold-start `fit=None`) route to
+    ///    [`NodeClaimPoolConfig::fallback_cell`] — the
+    ///    `(referenceHwClass, Spot)` cell of `intent.system`'s arch —
+    ///    so the spawn-intent fan-out scenario provisions on the
+    ///    reference cell and FFD drains it as nodes register.
     /// 2. Round-robin `cfg.all_cells()` from `tick_counter` so no cell
     ///    starves under sustained pressure.
     /// 3. Per cell with deficit (∉ `ice_masked`): pick anchor =
@@ -658,7 +705,19 @@ impl NodeClaimPoolReconciler {
         let live_cores: u32 = live.iter().map(|n| n.allocatable.0).sum();
         let mut created_cores = 0u32;
 
-        let by_cell = cover::assign_to_cells(unplaced, &self.sketches, |c| self.cfg.cell_price(c));
+        let (by_cell, dropped) = cover::assign_to_cells(
+            unplaced,
+            &self.sketches,
+            |c| self.cfg.cell_price(c),
+            |i| self.cfg.fallback_cell(i, &self.hw_config),
+        );
+        if dropped > 0 {
+            metrics::counter!(
+                "rio_controller_nodeclaim_intent_dropped_total",
+                "reason" => "no_menu_for_arch",
+            )
+            .increment(dropped);
+        }
         let order = cover::cells_round_robin(self.cfg.all_cells(), self.tick_counter);
 
         let mut created = Vec::new();
@@ -806,8 +865,59 @@ mod tests {
         assert!(d.database_url.is_empty());
         assert!(d.lease_name.is_none());
         assert_eq!(d.node_class_ref, "rio-default");
+        assert!(d.reference_hw_class.is_empty());
         assert_eq!(d.max_fleet_cores, 10_000);
         assert_eq!(d.max_node_claims_per_cell_per_tick, 8);
+    }
+
+    /// `fallback_cell`: prefers `(reference_hw_class, Spot)` when its
+    /// arch matches; else cheapest configured cell of matching arch;
+    /// else `None`. Arch-agnostic hw-class (no `kubernetes.io/arch`
+    /// label) matches any arch.
+    #[test]
+    fn fallback_cell_reference_then_cheapest_by_arch() {
+        const GI: u64 = 1 << 30;
+        let mut cfg = cfg_with_menu(&[
+            ("mid-ebs-x86:spot", &[(8, 32 * GI, 100 * GI, 0.04)]),
+            ("lo-ebs-arm:spot", &[(4, 16 * GI, 100 * GI, 0.02)]),
+            ("hi-ebs-arm:spot", &[(8, 32 * GI, 100 * GI, 0.06)]),
+        ]);
+        cfg.reference_hw_class = "mid-ebs-x86".into();
+        let hw = HwClassConfig::from_literals(&[
+            ("mid-ebs-x86", &[(ARCH_LABEL, "amd64")]),
+            ("lo-ebs-arm", &[(ARCH_LABEL, "arm64")]),
+            ("hi-ebs-arm", &[(ARCH_LABEL, "arm64")]),
+        ]);
+        let i = |sys: &str| SpawnIntent {
+            system: sys.into(),
+            ..Default::default()
+        };
+        // x86 → reference cell (arch matches).
+        assert_eq!(
+            cfg.fallback_cell(&i("x86_64-linux"), &hw),
+            Some(Cell("mid-ebs-x86".into(), CapacityType::Spot))
+        );
+        // aarch64 → reference is amd64, so cheapest arm cell wins.
+        assert_eq!(
+            cfg.fallback_cell(&i("aarch64-linux"), &hw),
+            Some(Cell("lo-ebs-arm".into(), CapacityType::Spot))
+        );
+        // Unmappable system → None.
+        assert_eq!(cfg.fallback_cell(&i("builtin"), &hw), None);
+        assert_eq!(cfg.fallback_cell(&i(""), &hw), None);
+        // No matching-arch cell configured → None.
+        let cfg2 = cfg_with_menu(&[("mid-ebs-x86:spot", &[(8, 32 * GI, 100 * GI, 0.04)])]);
+        assert_eq!(cfg2.fallback_cell(&i("aarch64-linux"), &hw), None);
+        // Arch-agnostic reference (no arch label) matches any system —
+        // the kwok `vmtest` fixture case.
+        let mut cfg3 = cfg_with_menu(&[("vmtest:spot", &[(16, 4 * GI, 20 * GI, 0.01)])]);
+        cfg3.reference_hw_class = "vmtest".into();
+        let hw3 =
+            HwClassConfig::from_literals(&[("vmtest", &[("kubernetes.io/hostname", "agent")])]);
+        assert_eq!(
+            cfg3.fallback_cell(&i("x86_64-linux"), &hw3),
+            Some(Cell("vmtest".into(), CapacityType::Spot))
+        );
     }
 
     /// `ControllerLeaseHooks` is the no-state metrics-only impl. Prove

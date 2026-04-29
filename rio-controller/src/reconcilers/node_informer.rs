@@ -110,6 +110,21 @@ impl HwClassConfig {
             .map(|(_, conj)| conj.clone())
     }
 
+    /// Whether `h`'s `kubernetes.io/arch` label equals `arch`, OR is
+    /// absent (an arch-agnostic hw-class matches any arch). `false` if
+    /// `h` is unknown / config not yet loaded. §13b cold-start fallback
+    /// (`NodeClaimPoolConfig::fallback_cell`) uses this to pick a
+    /// reference cell for hw-agnostic intents by `intent.system`.
+    pub fn matches_arch(&self, h: &str, arch: &str) -> bool {
+        let cfg = self.0.read();
+        let Some((_, conj)) = cfg.iter().find(|(name, _)| name == h) else {
+            return false;
+        };
+        conj.iter()
+            .find(|(k, _)| k == crate::reconcilers::nodeclaim_pool::ARCH_LABEL)
+            .is_none_or(|(_, v)| v == arch)
+    }
+
     /// Replace the config wholesale from a `GetHwClassConfigResponse`.
     /// Sorted by `$h` for deterministic [`Self::match_node`] on overlap.
     fn set(&self, hw_classes: HashMap<String, rio_proto::types::HwClassLabels>) {
@@ -704,6 +719,25 @@ mod tests {
 
     fn band_cache() -> NodeLabelCache {
         NodeLabelCache::with_config(band_config())
+    }
+
+    #[test]
+    fn matches_arch_absent_label_is_agnostic() {
+        use crate::reconcilers::nodeclaim_pool::ARCH_LABEL;
+        let cfg = HwClassConfig::from_literals(&[
+            ("x86", &[(ARCH_LABEL, "amd64"), ("k", "v")]),
+            ("arm", &[(ARCH_LABEL, "arm64")]),
+            ("agnostic", &[("k", "v")]),
+        ]);
+        assert!(cfg.matches_arch("x86", "amd64"));
+        assert!(!cfg.matches_arch("x86", "arm64"));
+        assert!(cfg.matches_arch("arm", "arm64"));
+        // No arch label → matches any.
+        assert!(cfg.matches_arch("agnostic", "amd64"));
+        assert!(cfg.matches_arch("agnostic", "arm64"));
+        // Unknown h → false.
+        assert!(!cfg.matches_arch("nope", "amd64"));
+        assert!(!HwClassConfig::default().matches_arch("x86", "amd64"));
     }
 
     #[test]

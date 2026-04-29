@@ -61,10 +61,16 @@ pub struct InstanceType {
 }
 
 /// Group `unplaced` by the cheapest cell in each intent's `A_open`.
-/// Intents with empty `A_open` (hw-agnostic, or every cell's lead-time
-/// shorter than `eta_seconds`) are dropped — `cover_deficit` can't
-/// target a cell-less intent and the legacy `Pool` reconciler picks
-/// those up.
+///
+/// Intents with empty `A_open` from `hw_class_names=[]` (cold-start
+/// `fit=None`) are routed via `fallback(i)` — typically the
+/// `referenceHwClass` cell of `intent.system`'s arch (see
+/// [`super::NodeClaimPoolConfig::fallback_cell`]). Intents with empty
+/// `A_open` from lead-time gating (every cell's lead-time shorter than
+/// `eta_seconds`) are dropped without fallback — they're forecast-only
+/// and a later tick re-evaluates. `fallback → None` (no configured cell
+/// matches arch) increments the returned dropped count; caller emits
+/// `rio_controller_nodeclaim_intent_dropped_total{reason=no_menu_for_arch}`.
 ///
 /// `BTreeMap` so iteration order is deterministic (round-robin
 /// rotation acts on a sorted universe; flapping order would defeat the
@@ -73,19 +79,32 @@ pub fn assign_to_cells<'a>(
     unplaced: &'a [SpawnIntent],
     sketches: &CellSketches,
     cell_price: impl Fn(&Cell) -> f64,
-) -> BTreeMap<Cell, Vec<&'a SpawnIntent>> {
+    fallback: impl Fn(&SpawnIntent) -> Option<Cell>,
+) -> (BTreeMap<Cell, Vec<&'a SpawnIntent>>, u64) {
     let mut by_cell: BTreeMap<Cell, Vec<&SpawnIntent>> = BTreeMap::new();
+    let mut dropped = 0u64;
     for i in unplaced {
         let open = a_open(i, sketches);
-        let Some(cheapest) = open
+        let cheapest = open
             .into_iter()
             .min_by(|a, b| cell_price(a).total_cmp(&cell_price(b)))
-        else {
-            continue;
-        };
+            .or_else(|| {
+                if !i.hw_class_names.is_empty() {
+                    // Non-empty hw_class_names + empty A_open ⇔
+                    // forecast intent lead-time-gated on every cell.
+                    // No fallback — next tick re-evaluates.
+                    return None;
+                }
+                let c = fallback(i);
+                if c.is_none() {
+                    dropped += 1;
+                }
+                c
+            });
+        let Some(cheapest) = cheapest else { continue };
         by_cell.entry(cheapest).or_default().push(i);
     }
-    by_cell
+    (by_cell, dropped)
 }
 
 /// Deterministic round-robin: sorted cell universe rotated by
@@ -405,20 +424,11 @@ mod tests {
     fn assign_unplaced_picks_cheapest_open() {
         let h1 = ("h1", CapacityType::Spot);
         let h2 = ("h2", CapacityType::Spot);
-        let unplaced = [
-            intent("a", 4, GI, &[h1, h2]),
-            intent("b", 2, GI, &[h2]),
-            // hw-agnostic (empty cells) → dropped.
-            SpawnIntent {
-                intent_id: "agn".into(),
-                cores: 4,
-                ready: Some(true),
-                ..Default::default()
-            },
-        ];
+        let unplaced = [intent("a", 4, GI, &[h1, h2]), intent("b", 2, GI, &[h2])];
         // h1 cheaper.
         let price = |c: &Cell| if c.0 == "h1" { 0.03 } else { 0.05 };
-        let by = assign_to_cells(&unplaced, &CellSketches::default(), price);
+        let (by, d) = assign_to_cells(&unplaced, &CellSketches::default(), price, |_| None);
+        assert_eq!(d, 0);
         assert_eq!(by.len(), 2);
         let h1k = Cell("h1".into(), CapacityType::Spot);
         let h2k = Cell("h2".into(), CapacityType::Spot);
@@ -428,9 +438,53 @@ mod tests {
         assert_eq!(by[&h2k][0].intent_id, "b", "b only opens h2");
     }
 
+    /// Cold-start: `hw_class_names=[]` → routed via `fallback`.
+    /// `fallback → None` → counted in `dropped`. Forecast intent with
+    /// non-empty `hw_class_names` but lead-time-gated A_open → NOT
+    /// fallback-routed, NOT counted (next tick re-evaluates).
+    #[test]
+    fn assign_hw_agnostic_uses_fallback() {
+        let ref_cell = Cell("ref".into(), CapacityType::Spot);
+        let unplaced = [
+            // hw-agnostic, x86 → fallback gives ref cell.
+            SpawnIntent {
+                intent_id: "agn-x".into(),
+                cores: 4,
+                system: "x86_64-linux".into(),
+                ready: Some(true),
+                ..Default::default()
+            },
+            // hw-agnostic, unmappable → fallback None → dropped.
+            SpawnIntent {
+                intent_id: "agn-u".into(),
+                cores: 4,
+                ready: Some(true),
+                ..Default::default()
+            },
+            // Non-empty hw_class_names + forecast + eta>lead_time →
+            // A_open empty → NOT fallback-routed (silently skipped).
+            {
+                let mut i = intent("fc", 4, GI, &[("h1", CapacityType::Spot)]);
+                i.ready = Some(false);
+                i.eta_seconds = 999.0;
+                i
+            },
+        ];
+        let fallback = |i: &SpawnIntent| {
+            (i.system == "x86_64-linux").then(|| Cell("ref".into(), CapacityType::Spot))
+        };
+        let (by, d) = assign_to_cells(&unplaced, &CellSketches::default(), |_| 0.0, fallback);
+        assert_eq!(d, 1, "agn-u dropped");
+        assert_eq!(by.len(), 1);
+        assert_eq!(by[&ref_cell].len(), 1);
+        assert_eq!(by[&ref_cell][0].intent_id, "agn-x");
+    }
+
     #[test]
     fn assign_empty_unplaced_empty_output() {
-        assert!(assign_to_cells(&[], &CellSketches::default(), |_| 0.0).is_empty());
+        let (by, d) = assign_to_cells(&[], &CellSketches::default(), |_| 0.0, |_| None);
+        assert!(by.is_empty());
+        assert_eq!(d, 0);
     }
 
     // --- median --------------------------------------------------------

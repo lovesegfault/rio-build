@@ -179,6 +179,15 @@ pub fn describe_metrics() {
          scheduler-reported hung node."
     );
     describe_counter!(
+        "rio_controller_nodeclaim_intent_dropped_total",
+        "nodeclaim_pool cover_deficit hw-agnostic intents dropped by `reason`. \
+         reason=no_menu_for_arch: intent.system maps to an arch with no \
+         configured instance_menu cell (and referenceHwClass mismatches) — \
+         the cold-start fallback could not target ANY cell. Non-zero on a \
+         dual-arch cluster = a hwClasses/instanceMenu key-set is missing \
+         one arch."
+    );
+    describe_counter!(
         "rio_controller_nodeclaim_created_total",
         "nodeclaim_pool NodeClaim Api::create successes by `cell` × `shape`. \
          shape=anchor: smallest type fitting max_U(c*,M,D); shape=bulk: cheapest \
