@@ -1,3 +1,33 @@
+{{- /* Named template so the ConfigMap body and the checksum annotation
+       hash the SAME rendered string. bug_022: hashing a hand-maintained
+       list of input keys (`.scheduler.sla`, `.karpenter.nodeclaimPool`)
+       missed `poolDefaults.fuseCacheBytes` + `karpenter.metalSizes` —
+       the ConfigMap re-rendered, the (subPath-mounted) pod did not roll.
+       `define` must be at top level (not inside `if`). */}}
+{{- define "rio.controllerToml" -}}
+{{- with .Values.scheduler.sla -}}
+[nodeclaim_pool]
+lease_name = {{ $.Values.karpenter.nodeclaimPool.leaseName | default "rio-controller-nodeclaim-pool" | quote }}
+node_class_ref = {{ .nodeClassRef | default "rio-default" | quote }}
+reference_hw_class = {{ .referenceHwClass | quote }}
+max_fleet_cores = {{ int64 .maxFleetCores }}
+max_node_claims_per_cell_per_tick = {{ int64 .maxNodeClaimsPerCellPerTick }}
+max_lead_time = {{ printf "%.1f" (float64 .maxLeadTime) }}
+max_node_cores = {{ int64 .maxCores }}
+fuse_cache_bytes = {{ int64 $.Values.poolDefaults.fuseCacheBytes }}
+metal_sizes = {{ toJson $.Values.karpenter.metalSizes }}
+{{- with .maxConsolidationTime }}
+max_consolidation_time = {{ printf "%.1f" (float64 .) }}
+{{- end }}
+{{- with .leadTimeSeed }}
+
+[nodeclaim_pool.lead_time_seed]
+{{- range $cell, $v := . }}
+{{ $cell | quote }} = {{ printf "%.1f" (float64 $v) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- if .Values.controller.enabled }}
 {{- $c := .Values.controller -}}
 apiVersion: apps/v1
@@ -22,10 +52,10 @@ spec:
         {{- include "rio.labels" (dict "root" . "name" "rio-controller" "component" "controller") | nindent 8 }}
       annotations:
         # Controller reads /etc/rio/controller.toml once at boot; subPath
-        # mounts don't live-update. Roll on any nodeclaim_pool-relevant
-        # values change ([sla] table is the source for lead_time_seed and
-        # the shared scalar caps).
-        checksum/controller-toml: {{ list (toJson .Values.scheduler.sla) (toJson .Values.karpenter.nodeclaimPool) | join "" | sha256sum }}
+        # mounts don't live-update. Hash the RENDERED body (not a key
+        # list — that drifts) so any input that lands in the TOML rolls
+        # the pod. helm/16-controller-checksum-covers-toml.sh enforces.
+        checksum/controller-toml: {{ include "rio.controllerToml" . | sha256sum }}
     spec:
       serviceAccountName: rio-controller
       {{- if .Values.karpenter.enabled }}
@@ -144,26 +174,5 @@ metadata:
     {{- include "rio.labels" (dict "root" . "name" "rio-controller" "component" "controller") | nindent 4 }}
 data:
   controller.toml: |
-    {{- with .Values.scheduler.sla }}
-    [nodeclaim_pool]
-    lease_name = {{ $.Values.karpenter.nodeclaimPool.leaseName | default "rio-controller-nodeclaim-pool" | quote }}
-    node_class_ref = {{ .nodeClassRef | default "rio-default" | quote }}
-    reference_hw_class = {{ .referenceHwClass | quote }}
-    max_fleet_cores = {{ int64 .maxFleetCores }}
-    max_node_claims_per_cell_per_tick = {{ int64 .maxNodeClaimsPerCellPerTick }}
-    max_lead_time = {{ printf "%.1f" (float64 .maxLeadTime) }}
-    max_node_cores = {{ int64 .maxCores }}
-    fuse_cache_bytes = {{ int64 $.Values.poolDefaults.fuseCacheBytes }}
-    metal_sizes = {{ toJson $.Values.karpenter.metalSizes }}
-    {{- with .maxConsolidationTime }}
-    max_consolidation_time = {{ printf "%.1f" (float64 .) }}
-    {{- end }}
-    {{- with .leadTimeSeed }}
-
-    [nodeclaim_pool.lead_time_seed]
-    {{- range $cell, $v := . }}
-    {{ $cell | quote }} = {{ printf "%.1f" (float64 $v) }}
-    {{- end }}
-    {{- end }}
-    {{- end }}
+    {{- include "rio.controllerToml" . | nindent 4 }}
 {{- end }}
