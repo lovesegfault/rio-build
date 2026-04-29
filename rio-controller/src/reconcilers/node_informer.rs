@@ -70,12 +70,14 @@ pub struct HwClassConfig(Arc<RwLock<Vec<HwClassDef>>>);
 
 /// One `[sla.hw_classes.$h]` entry: the `$h` name + its ANDed label
 /// conjunction + Karpenter instance-type requirements + EC2NodeClass
-/// name.
+/// name + per-class `(max_cores, max_mem)` capacity ceilings.
 type HwClassDef = (
     String,
     Vec<(String, String)>,
     Vec<rio_proto::types::NodeSelectorRequirement>,
     String,
+    u32,
+    u64,
 );
 
 impl HwClassConfig {
@@ -84,7 +86,7 @@ impl HwClassConfig {
     /// (not yet loaded).
     pub fn match_node(&self, labels: &BTreeMap<String, String>) -> Option<String> {
         let cfg = self.0.read();
-        for (h, conj, _, _) in cfg.iter() {
+        for (h, conj, ..) in cfg.iter() {
             if conj
                 .iter()
                 .all(|(k, v)| labels.get(k).is_some_and(|nv| nv == v))
@@ -115,8 +117,8 @@ impl HwClassConfig {
     pub fn labels_for(&self, h: &str) -> Option<Vec<(String, String)>> {
         let cfg = self.0.read();
         cfg.iter()
-            .find(|(name, _, _, _)| name == h)
-            .map(|(_, conj, _, _)| conj.clone())
+            .find(|(name, ..)| name == h)
+            .map(|(_, conj, ..)| conj.clone())
     }
 
     /// `[sla.hw_classes.$h].requirements` for `h` — the Karpenter
@@ -130,8 +132,8 @@ impl HwClassConfig {
     ) -> Option<Vec<rio_proto::types::NodeSelectorRequirement>> {
         let cfg = self.0.read();
         cfg.iter()
-            .find(|(name, _, _, _)| name == h)
-            .map(|(_, _, reqs, _)| reqs.clone())
+            .find(|(name, ..)| name == h)
+            .map(|(_, _, reqs, ..)| reqs.clone())
     }
 
     /// `[sla.hw_classes.$h].node_class` for `h` — the EC2NodeClass
@@ -140,14 +142,29 @@ impl HwClassConfig {
     pub fn node_class_for(&self, h: &str) -> Option<String> {
         let cfg = self.0.read();
         cfg.iter()
-            .find(|(name, _, _, _)| name == h)
-            .map(|(_, _, _, nc)| nc.clone())
+            .find(|(name, ..)| name == h)
+            .map(|(_, _, _, nc, ..)| nc.clone())
+    }
+
+    /// `[sla.hw_classes.$h].{max_cores, max_mem}` for `h` — the
+    /// per-class capacity ceilings. `None` if `h` is unknown, config
+    /// not yet loaded, OR the loaded entry's ceilings are zero (proto
+    /// default — pre-R26 scheduler that doesn't ship them). The §13b
+    /// `cover_deficit` builds per-cell `SizingCfg` with
+    /// `min(per_class, global)` so claims chunk at the class's actual
+    /// instance-type ceiling instead of the global cap.
+    pub fn ceilings_for(&self, h: &str) -> Option<(u32, u64)> {
+        let cfg = self.0.read();
+        cfg.iter()
+            .find(|(name, ..)| name == h)
+            .map(|&(_, _, _, _, mc, mm)| (mc, mm))
+            .filter(|&(mc, mm)| mc > 0 && mm > 0)
     }
 
     /// All loaded hw-class names (sorted). §13b's `all_cells` derives
     /// the cell universe from this × `{spot, od}`.
     pub fn names(&self) -> Vec<String> {
-        self.0.read().iter().map(|(h, _, _, _)| h.clone()).collect()
+        self.0.read().iter().map(|(h, ..)| h.clone()).collect()
     }
 
     /// Whether `h`'s `kubernetes.io/arch` label equals `arch`, OR is
@@ -157,7 +174,7 @@ impl HwClassConfig {
     /// reference cell for hw-agnostic intents by `intent.system`.
     pub fn matches_arch(&self, h: &str, arch: &str) -> bool {
         let cfg = self.0.read();
-        let Some((_, conj, _, _)) = cfg.iter().find(|(name, _, _, _)| name == h) else {
+        let Some((_, conj, ..)) = cfg.iter().find(|(name, ..)| name == h) else {
             return false;
         };
         conj.iter()
@@ -172,7 +189,14 @@ impl HwClassConfig {
             .into_iter()
             .map(|(h, def)| {
                 let conj = def.labels.into_iter().map(|l| (l.key, l.value)).collect();
-                (h, conj, def.requirements, def.node_class)
+                (
+                    h,
+                    conj,
+                    def.requirements,
+                    def.node_class,
+                    def.max_cores,
+                    def.max_mem,
+                )
             })
             .collect();
         v.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -218,7 +242,9 @@ impl HwClassConfig {
     }
 
     /// Test-only constructor from `(h, [(k, v), …])` literals
-    /// (requirements default empty, node_class `"rio-default"`).
+    /// (requirements default empty, node_class `"rio-default"`,
+    /// ceilings `(0, 0)` so [`Self::ceilings_for`] returns `None` →
+    /// callers fall back to global caps).
     #[cfg(test)]
     pub fn from_literals(defs: &[(&str, &[(&str, &str)])]) -> Self {
         let mut v: Vec<_> = defs
@@ -228,7 +254,7 @@ impl HwClassConfig {
                     .iter()
                     .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                     .collect();
-                ((*h).to_string(), c, vec![], "rio-default".to_string())
+                ((*h).to_string(), c, vec![], "rio-default".to_string(), 0, 0)
             })
             .collect();
         v.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -1111,11 +1137,38 @@ mod tests {
                     }],
                     requirements: vec![],
                     node_class: "rio-default".into(),
+                    max_cores: 64,
+                    max_mem: 256 << 30,
                 },
             )]
             .into(),
         );
         assert_eq!(cache.hw_class_of("n"), Some("intel-7".into()));
+        assert_eq!(cache.config.ceilings_for("intel-7"), Some((64, 256 << 30)));
+    }
+
+    /// `ceilings_for`: per-class capacity ceilings; `None` for unknown
+    /// `h` or zero values (proto default → pre-R26 scheduler).
+    #[test]
+    fn ceilings_for_filters_zero_and_unknown() {
+        let cfg = HwClassConfig::default();
+        cfg.set(
+            [
+                (
+                    "arm".into(),
+                    rio_proto::types::HwClassLabels {
+                        max_cores: 64,
+                        max_mem: 128 << 30,
+                        ..Default::default()
+                    },
+                ),
+                ("old".into(), rio_proto::types::HwClassLabels::default()),
+            ]
+            .into(),
+        );
+        assert_eq!(cfg.ceilings_for("arm"), Some((64, 128 << 30)));
+        assert_eq!(cfg.ceilings_for("old"), None, "zero ceilings → None");
+        assert_eq!(cfg.ceilings_for("nope"), None, "unknown → None");
     }
 
     /// Overlapping conjunctions → deterministic (lexicographic `$h`).

@@ -933,9 +933,19 @@ impl NodeClaimPoolReconciler {
             let Some(u) = by_cell.get(cell) else {
                 continue;
             };
+            // Per-class ceilings (e.g. arm-only pool topping at 64c)
+            // bound each claim so Karpenter's instance-type discovery
+            // for THIS hw-class can fulfill it. Global caps still
+            // apply (a misconfigured per-class > global is clamped).
+            // `ceilings_for=None` (config not yet loaded, or pre-R26
+            // scheduler) → global only.
+            let (cls_c, cls_m) = self
+                .hw_config
+                .ceilings_for(&cell.0)
+                .unwrap_or((self.cfg.max_node_cores, self.cfg.max_node_mem));
             let scfg = cover::SizingCfg {
-                max_node_cores: self.cfg.max_node_cores,
-                max_node_mem: self.cfg.max_node_mem,
+                max_node_cores: cls_c.min(self.cfg.max_node_cores),
+                max_node_mem: cls_m.min(self.cfg.max_node_mem),
                 max_node_disk: self.cfg.max_node_disk,
                 per_tick_cap: self.cfg.max_node_claims_per_cell_per_tick,
                 budget: self

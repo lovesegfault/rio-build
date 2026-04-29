@@ -662,6 +662,14 @@ message HwClassLabels {
   // get instanceStorePolicy:RAID0 (rio-nvme) and metal gets the BIOS
   // AMI (rio-metal).
   string node_class = 3;
+  // Per-class capacity ceilings (`HwClassDef.max_cores/max_mem`).
+  // Scheduler-side: `evaluate_cell` ClassCeiling rejects `c* > h.max`.
+  // Controller-side: `cover_deficit` builds per-cell SizingCfg with
+  // `min(per_class, global)` so claims chunk at the class's actual
+  // instance-type ceiling (e.g. arm-only pool topping at 64c) instead
+  // of the global cap.
+  uint32 max_cores = 4;
+  uint64 max_mem = 5;
 }
 message GetHwClassConfigResponse {
   // h → `[sla.hw_classes.$h].labels`. The controller matches a Node's

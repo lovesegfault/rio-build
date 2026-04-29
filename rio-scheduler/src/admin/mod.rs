@@ -801,6 +801,8 @@ impl AdminService for AdminServiceImpl {
                         labels,
                         requirements,
                         node_class: def.node_class.clone(),
+                        max_cores: def.max_cores,
+                        max_mem: def.max_mem,
                     },
                 )
             })
