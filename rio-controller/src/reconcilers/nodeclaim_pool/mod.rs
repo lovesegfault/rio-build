@@ -397,9 +397,12 @@ impl NodeClaimPoolReconciler {
                 continue;
             }
             self.tick_counter = self.tick_counter.wrapping_add(1);
+            let started = std::time::Instant::now();
             if let Err(e) = self.reconcile_once().await {
                 warn!(error = %e, "nodeclaim_pool tick failed");
             }
+            metrics::histogram!("rio_controller_nodeclaim_tick_duration_seconds")
+                .record(started.elapsed().as_secs_f64());
         }
         info!("nodeclaim_pool reconciler stopped");
     }
@@ -443,10 +446,13 @@ impl NodeClaimPoolReconciler {
         // r[ctrl.nodeclaim.lead-time-ddsketch]: record boot times on
         // Registered=True edges, then rotate any cells past halflife.
         // `registered_cells` feeds `report_unfulfillable`'s ICE-clear.
-        // TODO(B14): per-cell `schmitt_adjust` once forecast hit-ratio
-        // is observable (needs rio-packed pod placement — wired in B12
-        // — accumulating enough samples to compare against FFD's
-        // prediction; the metric emission lives with B14).
+        // TODO: wire `CellState::schmitt_adjust` once a true forecast
+        // hit-ratio is computable — needs cross-tick tracking of
+        // "forecast intent placed on in-flight claim → did claim
+        // register before intent's deps completed". The
+        // `ffd_placeable_intents{state}` gauge below exposes the
+        // single-tick proxy (registered/(registered+inflight)) so the
+        // operator can observe the input now.
         let registered_cells = self
             .sketches
             .observe_registered(&live, &mut self.recorded_boot);
@@ -462,6 +468,7 @@ impl NodeClaimPoolReconciler {
             live = live.len(),
             "FFD simulation"
         );
+        self.emit_tick_gauges(&live, &placeable, &unplaced);
         // r[impl ctrl.nodeclaim.placeable-gate]
         // Publish `intent_id`s FFD-placed on a `Registered=True` node
         // (`in_flight == false`). The `pool/jobs` reconciler retains
@@ -540,6 +547,66 @@ impl NodeClaimPoolReconciler {
             .await?;
         self.sketches.persist(&self.pg).await?;
         Ok(())
+    }
+
+    /// Per-tick `r[obs.metric.controller]` gauges. Iterates
+    /// `cfg.all_cells()` (NOT just cells observed in `live`/`unplaced`)
+    /// so every (h,cap) timeseries is emitted every tick — Prometheus
+    /// gauge semantics: a cell that drained to 0 reads as 0, not
+    /// stale-at-last-nonzero.
+    fn emit_tick_gauges(
+        &self,
+        live: &[ffd::LiveNode],
+        placeable: &[ffd::Placement],
+        unplaced: &[SpawnIntent],
+    ) {
+        use std::collections::BTreeMap;
+        // (registered, inflight) per cell.
+        let mut by_state: BTreeMap<Cell, (u64, u64)> = BTreeMap::new();
+        for n in live {
+            let Some(c) = n.cell.clone() else { continue };
+            let e = by_state.entry(c).or_default();
+            if n.registered {
+                e.0 += 1;
+            } else {
+                e.1 += 1;
+            }
+        }
+        // Σ unplaced cores per cheapest-A_open cell — same assignment
+        // cover_deficit uses, so the gauge equals cover's per-cell input.
+        let by_cell = cover::assign_to_cells(unplaced, &self.sketches, |c| self.cfg.cell_price(c));
+        for cell in self.cfg.all_cells() {
+            let label = cell.to_string();
+            let (reg, inf) = by_state.get(&cell).copied().unwrap_or((0, 0));
+            metrics::gauge!("rio_controller_nodeclaim_live",
+                "cell" => label.clone(), "state" => "registered")
+            .set(reg as f64);
+            metrics::gauge!("rio_controller_nodeclaim_live",
+                "cell" => label.clone(), "state" => "inflight")
+            .set(inf as f64);
+            let unplaced_cores: u32 = by_cell
+                .get(&cell)
+                .map(|v| v.iter().map(|i| i.cores).sum())
+                .unwrap_or(0);
+            metrics::gauge!("rio_controller_ffd_unplaced_cores", "cell" => label.clone())
+                .set(f64::from(unplaced_cores));
+            metrics::gauge!("rio_controller_nodeclaim_lead_time_seconds", "cell" => label)
+                .set(self.sketches.lead_time(&cell));
+        }
+        // Placeable split: NOT per-cell (an intent may target multiple
+        // cells; the placement node's cell would mislead). The single
+        // `state=registered|inflight` split is the warm-hit proxy.
+        let (on_reg, on_inf) =
+            placeable.iter().fold(
+                (0u64, 0u64),
+                |(r, i), (_, _, inf)| {
+                    if *inf { (r, i + 1) } else { (r + 1, i) }
+                },
+            );
+        metrics::gauge!("rio_controller_ffd_placeable_intents", "state" => "registered")
+            .set(on_reg as f64);
+        metrics::gauge!("rio_controller_ffd_placeable_intents", "state" => "inflight")
+            .set(on_inf as f64);
     }
 
     /// List NodeClaims this reconciler owns (label-selected). Typed
@@ -640,12 +707,22 @@ impl NodeClaimPoolReconciler {
                 continue;
             };
             for k in 0..n {
-                let shape = if k == 0 { anchor } else { bulk };
+                let (shape, shape_label) = if k == 0 {
+                    (anchor, "anchor")
+                } else {
+                    (bulk, "bulk")
+                };
                 let nc = cover::build_nodeclaim(cell, shape, &hw_labels, &self.cfg.node_class_ref);
                 match self.nodeclaims.create(&PostParams::default(), &nc).await {
                     Ok(out) => {
                         let name = out.metadata.name.unwrap_or_default();
                         debug!(%cell, %name, cores = shape.cores, "NodeClaim created");
+                        metrics::counter!(
+                            "rio_controller_nodeclaim_created_total",
+                            "cell" => cell.to_string(),
+                            "shape" => shape_label,
+                        )
+                        .increment(1);
                         created.push(name);
                     }
                     Err(e) => {

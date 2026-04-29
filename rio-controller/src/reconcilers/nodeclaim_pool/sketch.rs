@@ -264,6 +264,11 @@ impl CellSketches {
                 s.boot_active.add(seed);
             }
             debug!(%cell, seed, "seeded empty cell sketch");
+            metrics::counter!(
+                "rio_controller_ddsketch_seed_fallback_total",
+                "cell" => cell.to_string(),
+            )
+            .increment(1);
         }
     }
 

@@ -274,6 +274,13 @@ r[obs.metric.controller]
 | `rio_controller_component_scaler_observed_load` | Gauge | ComponentScaler max of pg-pool utilization and substitute-admission utilization across `loadEndpoint` pods at the last tick (labelled by `cs=ns/name`). |
 | `rio_controller_placement_sim_mismatch_total` | Counter | nodeclaim_pool `cover_deficit` anomalies (labeled by `reason` × `cell`). `reason=menu_gap`: no `instance_menu` entry covers an unplaced intent's `max(c,M,D)` — config-load asserts the menu covers `(maxCores,maxMem,maxDisk)`, so non-zero ⇒ scheduler emitting out-of-spec sizing or menu drift. |
 | `rio_controller_nodeclaim_reaped_total` | Counter | nodeclaim_pool NodeClaim deletions (labeled by `reason` × `cell`). `reason=idle`: NA-consolidate break-even; `reason=ice`: `Launched=False` past timeout; `reason=boot-timeout`: `Launched=True ∧ Registered=False` past timeout; `reason=dead`: scheduler-reported hung node. |
+| `rio_controller_nodeclaim_created_total` | Counter | nodeclaim_pool NodeClaim `Api::create` successes (labeled by `cell` × `shape`). `shape=anchor`: smallest type fitting `max_U(c*,M,D)`; `shape=bulk`: cheapest \$/core type meeting `median_U(M/c*)`. `Σrate(created) − Σrate(reaped)` over a window ≈ fleet growth. |
+| `rio_controller_nodeclaim_tick_duration_seconds` | Histogram | nodeclaim_pool `reconcile_once` latency. Recorded on success and error (⊥-tick, apiserver 5xx). p99 approaching `ADMIN_RPC_TIMEOUT` (5s) = scheduler stalled; approaching `TICK` interval = reconciler can't keep up. |
+| `rio_controller_nodeclaim_live` | Gauge | Owned NodeClaims at the last tick (labeled by `cell` × `state`). `state=registered`: `Registered=True` (FFD-placeable); `state=inflight`: created but not yet Registered. `inflight` stuck high → check `reaped_total{reason=ice\|boot-timeout}`. |
+| `rio_controller_ffd_unplaced_cores` | Gauge | `Σ SpawnIntent.cores` per `cell` left unplaced by FFD at the last tick. `cover_deficit`'s per-cell input. Non-zero with `created_total` flat = `max_fleet_cores` or per-tick cap throttling. |
+| `rio_controller_ffd_placeable_intents` | Gauge | SpawnIntents FFD-placed at the last tick (labeled by `state`). `state=registered` ⇒ on a `Registered=True` claim (Jobs created this tick); `state=inflight` ⇒ on a not-yet-Registered claim (held by placeable-gate). `registered/(registered+inflight)` is the forecast warm-hit proxy. |
+| `rio_controller_nodeclaim_lead_time_seconds` | Gauge | Per-`cell` provisioning lead-time: `lead_time_q`-quantile of the `z=boot−eta_error` DDSketch. What `cover_deficit` provisions ahead by. Stuck at the seed value = no `Registered=True` transitions recorded yet. |
+| `rio_controller_ddsketch_seed_fallback_total` | Counter | Per-`cell` seed injections at `CellSketches::seed()`. Once per cold-start cell whose `z_active` was empty after PG load. >1 over controller lifetime = sketch persist failing. |
 
 ### Histogram Buckets
 
@@ -284,6 +291,7 @@ r[obs.metric.controller]
 | `rio_scheduler_build_duration_seconds`, `rio_builder_build_duration_seconds` | `[1, 5, 15, 30, 60, 120, 300, 600, 1800, 3600, 7200]` |
 | `rio_scheduler_critical_path_accuracy` | `[0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0, 5.0]` (ratio: actual/estimated; 1.0 = perfect) |
 | `rio_controller_reconcile_duration_seconds` | `[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]` |
+| `rio_controller_nodeclaim_tick_duration_seconds` | `[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0]` |
 | `rio_scheduler_dispatch_wait_seconds` | `[0.1, 0.5, 1, 5, 10, 30, 60, 120, 180, 300, 600]` (ephemeral builders: dominated by node-provision) |
 | `rio_scheduler_build_graph_edges` | `[100, 500, 1000, 5000, 10000, 20000]` (count) |
 | `rio_builder_upload_references_count` | `[1, 5, 10, 25, 50, 100, 250, 500]` (count) |

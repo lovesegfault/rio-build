@@ -54,12 +54,16 @@ pub struct LiveNode {
     pub allocatable: (u32, u64, u64),
     /// `(cores, mem_bytes, disk_bytes)` already requested by pods on
     /// the backing Node. `From<NodeClaim>` sets this to `(0,0,0)`.
-    // TODO(B14): populate from `Σ Pod.spec.containers[].resources.
-    // requests` over `spec.nodeName == self.node_name`. B12 routes
-    // builder pods via `schedulerName: rio-packed` so they land on
-    // these claims now; until the sum is wired `free()` on a Registered
-    // node over-reports by whatever's already bound. Tracked with the
-    // B14 `placement_sim_mismatch_total` metric so drift is observable.
+    // TODO: populate from `Σ Pod.spec.containers[].resources.requests`
+    // over `spec.nodeName == self.node_name` (needs a pod-by-node
+    // informer cache; the apiserver list-per-tick is too chatty at
+    // ~10s × N_nodes). B12 routes builder pods via `schedulerName:
+    // rio-packed` so they land on these claims now; until the sum is
+    // wired `free()` on a Registered node over-reports by whatever's
+    // already bound. Drift is observable as
+    // `placement_sim_mismatch_total{reason=menu_gap}` staying zero
+    // while `ffd_unplaced_cores` is high with `nodeclaim_live
+    // {state=registered}` non-zero.
     pub requested: (u32, u64, u64),
     /// `metadata.creationTimestamp` as unix-epoch seconds. `None` only
     /// on a just-`create()`d object before the apiserver round-trip.

@@ -61,15 +61,30 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 /// that for a 10s top bucket.
 const RECONCILE_DURATION_BUCKETS: &[f64] = &[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
 
+/// Histogram bucket boundaries for nodeclaim_pool tick duration (seconds).
+///
+/// One tick = list NodeClaims + GetSpawnIntents RPC + FFD-sim + create/
+/// delete + PG persist. Dominated by apiserver round-trips (×2-10) and
+/// the admin-RPC bound; FFD/anchor-bulk are µs. Low end at 50ms (one
+/// list + one persist), top at 30s (well past the 5s `ADMIN_RPC_TIMEOUT`
+/// + apiserver tail under load) so the ⊥-tick latency floor is visible.
+const NODECLAIM_TICK_BUCKETS: &[f64] = &[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0];
+
 /// Per-crate histogram bucket overrides, passed to
 /// `rio_common::server::bootstrap` → `init_metrics`. Every
 /// `describe_histogram!` in this crate must have an entry here OR be in
 /// the `DEFAULT_BUCKETS_OK` exemption list (`tests/metrics_registered.rs`);
 /// histograms not listed fall through to the global `[0.005..10.0]` default.
-pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[(
-    "rio_controller_reconcile_duration_seconds",
-    RECONCILE_DURATION_BUCKETS,
-)];
+pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
+    (
+        "rio_controller_reconcile_duration_seconds",
+        RECONCILE_DURATION_BUCKETS,
+    ),
+    (
+        "rio_controller_nodeclaim_tick_duration_seconds",
+        NODECLAIM_TICK_BUCKETS,
+    ),
+];
 
 /// Register `# HELP` descriptions for all controller metrics.
 ///
@@ -162,5 +177,51 @@ pub fn describe_metrics() {
          Launched=False past timeout; reason=boot-timeout: \
          Launched=True ∧ Registered=False past timeout; reason=dead: \
          scheduler-reported hung node."
+    );
+    describe_counter!(
+        "rio_controller_nodeclaim_created_total",
+        "nodeclaim_pool NodeClaim Api::create successes by `cell` × `shape`. \
+         shape=anchor: smallest type fitting max_U(c*,M,D); shape=bulk: cheapest \
+         $/core type meeting median_U(M/c*). Σrate(created) − Σrate(reaped) over a \
+         window ≈ fleet growth; sustained created with zero placeable_intents = \
+         FFD/kube-scheduler-packed mismatch."
+    );
+    describe_histogram!(
+        "rio_controller_nodeclaim_tick_duration_seconds",
+        "nodeclaim_pool reconcile_once latency. Recorded on success AND error \
+         (⊥-tick, apiserver 5xx). p99 approaching ADMIN_RPC_TIMEOUT (5s) = scheduler \
+         stalled; approaching tick interval = reconciler can't keep up."
+    );
+    describe_gauge!(
+        "rio_controller_nodeclaim_live",
+        "Owned NodeClaims at the last tick by `cell` × `state`. \
+         state=registered: Registered=True (FFD-placeable); state=inflight: \
+         created but not yet Registered. Σ(registered) ≈ warm capacity; \
+         inflight stuck high = check reaped_total{reason=ice|boot-timeout}."
+    );
+    describe_gauge!(
+        "rio_controller_ffd_unplaced_cores",
+        "Σ SpawnIntent.cores per `cell` left unplaced by the FFD simulation \
+         at the last tick. cover_deficit's per-cell input. Non-zero with \
+         created_total flat = max_fleet_cores or per-tick cap throttling."
+    );
+    describe_gauge!(
+        "rio_controller_ffd_placeable_intents",
+        "SpawnIntents FFD-placed at the last tick by `state`. state=registered: \
+         on a Registered=True NodeClaim (Jobs created this tick); state=inflight: \
+         on a not-yet-Registered claim (held by placeable-gate). Ratio \
+         registered/(registered+inflight) is the forecast warm-hit proxy."
+    );
+    describe_gauge!(
+        "rio_controller_nodeclaim_lead_time_seconds",
+        "Per-`cell` provisioning lead-time: lead_time_q-quantile of the z=boot−eta_error \
+         DDSketch. What cover_deficit provisions ahead by. Stuck at the seed value = \
+         no Registered=True transitions recorded yet (check seed_fallback_total)."
+    );
+    describe_counter!(
+        "rio_controller_ddsketch_seed_fallback_total",
+        "Per-`cell` seed injections at CellSketches::seed(). Incremented once per \
+         cold-start cell whose z_active sketch was empty after PG load. >1 over \
+         controller lifetime = sketch persist failing (check tick errors)."
     );
 }
