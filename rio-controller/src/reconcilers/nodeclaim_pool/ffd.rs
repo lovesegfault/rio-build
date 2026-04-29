@@ -41,19 +41,10 @@ pub const INSTANCE_TYPE_LABEL: &str = "node.kubernetes.io/instance-type";
 /// cell.
 pub const ARCH_LABEL: &str = "kubernetes.io/arch";
 
-/// Map a single nix `system` (e.g. `"x86_64-linux"`) to its
-/// `kubernetes.io/arch` label value. `None` for empty/`builtin`/
-/// unknown — caller treats hw-agnostic intent with unmappable system
-/// as undroppable (no cell can host it). Same arch table as
-/// `pool::pod::nix_systems_to_k8s_arch` (I-098); single-string here
-/// because `SpawnIntent.system` is scalar.
-pub fn system_to_arch(system: &str) -> Option<&'static str> {
-    match system.split_once('-').map_or(system, |(a, _)| a) {
-        "x86_64" | "i686" => Some("amd64"),
-        "aarch64" | "armv7l" | "armv6l" => Some("arm64"),
-        _ => None,
-    }
-}
+/// Re-export of [`rio_common::k8s::system_to_k8s_arch`] under the
+/// pre-existing local name. Shared with the scheduler's bypass-path
+/// `--capacity` arch-match so both sides use the same table.
+pub use rio_common::k8s::system_to_k8s_arch as system_to_arch;
 
 /// View of one owned NodeClaim for FFD + consolidation. Built from the
 /// typed `NodeClaim` (B4) so condition/allocatable/label parsing lives
@@ -1149,17 +1140,6 @@ pub(crate) mod tests {
         );
         assert!(p.is_empty());
         assert_eq!(u.len(), 1);
-    }
-
-    #[test]
-    fn system_to_arch_mapping() {
-        assert_eq!(system_to_arch("x86_64-linux"), Some("amd64"));
-        assert_eq!(system_to_arch("i686-linux"), Some("amd64"));
-        assert_eq!(system_to_arch("aarch64-linux"), Some("arm64"));
-        assert_eq!(system_to_arch("armv7l-linux"), Some("arm64"));
-        assert_eq!(system_to_arch("builtin"), None);
-        assert_eq!(system_to_arch(""), None);
-        assert_eq!(system_to_arch("riscv64-linux"), None);
     }
 
     #[test]

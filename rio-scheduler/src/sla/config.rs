@@ -361,7 +361,38 @@ impl ProbeShape {
     }
 }
 
+/// `kubernetes.io/arch` — the well-known node label every kubelet
+/// registers. Used by [`SlaConfig::reference_hw_class_for_system`] to
+/// arch-match an `HwClassDef`'s labels against `SpawnIntent.system`.
+pub const ARCH_LABEL: &str = "kubernetes.io/arch";
+
 impl SlaConfig {
+    /// `reference_hw_class` if its `kubernetes.io/arch` label matches
+    /// `system`'s arch (or is absent — arch-agnostic class), else the
+    /// first (sorted) `hw_classes` entry that matches. `None` ⇔
+    /// `system` unmappable OR no configured class hosts that arch.
+    /// Mirrors the controller's `NodeClaimPoolConfig::fallback_cell`
+    /// candidate logic so the scheduler's bypass-path `--capacity` cell
+    /// (snapshot.rs) and the controller's cold-start fallback agree on
+    /// which class an arch routes to.
+    pub fn reference_hw_class_for_system(&self, system: &str) -> Option<&str> {
+        let arch = rio_common::k8s::system_to_k8s_arch(system)?;
+        let matches = |h: &str| {
+            self.hw_classes.get(h).is_some_and(|d| {
+                d.labels
+                    .iter()
+                    .find(|l| l.key == ARCH_LABEL)
+                    .is_none_or(|l| l.value == arch)
+            })
+        };
+        if matches(&self.reference_hw_class) {
+            return Some(&self.reference_hw_class);
+        }
+        let mut hs: Vec<&str> = self.hw_classes.keys().map(String::as_str).collect();
+        hs.sort_unstable();
+        hs.into_iter().find(|h| matches(h))
+    }
+
     /// Upper bound for time-domain seed-corpus parameters (S, P, Q) in
     /// reference-seconds, for `r[sched.sla.threat.corpus-clamp]`. Not a
     /// real timeout — a "this is pathological" gate. `P` is the 1-core
@@ -1107,6 +1138,40 @@ mod tests {
     /// destructure below names EVERY field with NO `..` rest pattern,
     /// so adding a field to `SlaConfig` is a compile error here until
     /// it is classified. r2 bug_038 (`hw_classes` charset) and r6
+    /// bug_039: `reference_hw_class_for_system` arch-matches so the
+    /// bypass-path `--capacity` cell doesn't emit `arch In [amd64]` for
+    /// an aarch64 build. Mirrors controller `fallback_cell` candidate
+    /// logic.
+    #[test]
+    fn reference_hw_class_for_system_arch_matches() {
+        let mut cfg = base();
+        cfg.hw_classes = HashMap::from([
+            ("mid-x86".into(), test_def(ARCH_LABEL, "amd64")),
+            ("mid-arm".into(), test_def(ARCH_LABEL, "arm64")),
+            ("agnostic".into(), test_def("rio.build/hw-band", "mid")),
+        ]);
+        cfg.reference_hw_class = "mid-x86".into();
+        // x86_64 → reference matches.
+        assert_eq!(
+            cfg.reference_hw_class_for_system("x86_64-linux"),
+            Some("mid-x86")
+        );
+        // aarch64 → reference is amd64, fall through to first arch-match
+        // (sorted: agnostic has no arch label → matches anything).
+        assert_eq!(
+            cfg.reference_hw_class_for_system("aarch64-linux"),
+            Some("agnostic")
+        );
+        // Drop agnostic → mid-arm wins.
+        cfg.hw_classes.remove("agnostic");
+        assert_eq!(
+            cfg.reference_hw_class_for_system("aarch64-linux"),
+            Some("mid-arm")
+        );
+        // Unmappable system → None.
+        assert_eq!(cfg.reference_hw_class_for_system("riscv64-linux"), None);
+    }
+
     /// bug_019 (`lead_time_seed` membership/range) are the same
     /// "trusted-but-fallible source" gap; this test makes a third
     /// instance a build break instead of a round-7 finding.

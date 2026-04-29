@@ -7,6 +7,7 @@
 pub mod backoff;
 pub mod config;
 pub mod grpc;
+pub mod k8s;
 pub mod limits;
 #[cfg(feature = "postgres")]
 pub mod migrate;

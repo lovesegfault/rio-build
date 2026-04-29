@@ -1205,10 +1205,23 @@ impl DagActor {
                 // so the controller derives the pinned cell instead of
                 // falling back. No `o.capacity` → empty as before.
                 let (terms, names) = match override_.as_ref().and_then(|o| o.capacity) {
-                    Some(cap) => solve::cells_to_selector_terms(
-                        &[(self.sla_config.reference_hw_class.clone(), cap)],
-                        &self.sla_config.hw_classes,
-                    ),
+                    Some(cap) => {
+                        // bug_039: `reference_hw_class` may have a
+                        // `kubernetes.io/arch` label that doesn't match
+                        // `state.system` — emitting it would AND the
+                        // pod's `nodeSelector.arch=arm64` with
+                        // `nodeAffinity arch In [amd64]` → permanently
+                        // Pending. Arch-match like the controller's
+                        // `fallback_cell` does.
+                        let h = self
+                            .sla_config
+                            .reference_hw_class_for_system(&state.system)
+                            .map_or_else(
+                                || self.sla_config.reference_hw_class.clone(),
+                                ToOwned::to_owned,
+                            );
+                        solve::cells_to_selector_terms(&[(h, cap)], &self.sla_config.hw_classes)
+                    }
                     None => (Vec::new(), Vec::new()),
                 };
                 (c, m, d, terms, names, None)
