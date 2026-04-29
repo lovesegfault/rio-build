@@ -20,32 +20,37 @@ use super::{
 
 /// §13b hung-node detector (`r[sched.admin.hung-node-detector]`).
 ///
-/// Groups executors by `node_name`; flags a node when
-/// `stale ≥ max(3, ⌈0.5·occ⌉)` AND those stale executors span ≥2
-/// tenants. The tenant criterion discriminates a hung NODE (kubelet/
-/// EBS/kernel — every tenant's builds stall) from a single tenant's
-/// pathological build hanging its own pods. Idle stale executors
-/// (`running_build = None`) count toward `stale`/`occ` but not
-/// `tenants` — an all-idle hung node fails the tenant gate, which is
-/// fine: no work is stuck there, and `consolidate::reap_idle` covers
-/// it once Karpenter posts `Empty=True`.
+/// Groups executors by node; flags a node when `stale ≥ max(2,
+/// ⌈0.5·occ⌉)` AND those stale executors span ≥2 tenants. The tenant
+/// criterion discriminates a hung NODE (kubelet/EBS/kernel — every
+/// tenant's builds stall) from a single tenant's pathological build
+/// hanging its own pods. Idle executors (`running_build = None`) are
+/// skipped: they have no drv to attribute and structurally cannot be
+/// node-attributed (`authoritative_node` is keyed by spawn-intent, and
+/// an idle pod still holds its node so `consolidate::reap_idle` won't
+/// cover it either — but no work is stuck there).
 ///
 /// `node_of` resolves the kube-authoritative `spec.nodeName` for an
-/// executor's running drv via the controller-reported
-/// `authoritative_node` map — NEVER any worker-supplied value (worker
-/// is NOT trusted; a forged node_name in the heartbeat would let two
-/// colluding tenants reap an arbitrary NodeClaim, or a single
-/// compromised worker spam fresh heartbeats to suppress detection of a
-/// genuinely-hung node). Executors lacking an `authoritative_node`
-/// entry (controller-lag, Ack channel down, idle) are skipped — fail-
-/// safe. Free function so the test supplies `tenant_of`/`node_of`
-/// closures without seeding `dag` + `builds` + `authoritative_node`.
-// r[impl sched.admin.hung-node-detector+2]
+/// executor's HMAC-attested **`auth_intent`** (the pod's spawn-time
+/// `INTENT_ID_ANNOTATION`, set once at connect, never mutated by
+/// heartbeat) via the controller-reported `authoritative_node` map —
+/// NEVER any worker-supplied or worker-influenceable value. Keying on
+/// `running_build` would be wrong: it diverges from `auth_intent` under
+/// dispatch fall-through, and `reconcile_running_build`'s `(None,
+/// Some(hb))` arm sets it from the heartbeat unconditionally, so a
+/// compromised worker could heartbeat `running_build=D` for a victim
+/// node's drv to inflate `occ` and suppress detection. Executors
+/// lacking an `authoritative_node` entry (controller-lag, Ack channel
+/// down) are skipped — fail-safe — and counted in
+/// `rio_scheduler_hung_detect_skipped_no_authoritative_total`. Free
+/// function so the test supplies `tenant_of`/`node_of` closures
+/// without seeding `dag` + `builds` + `authoritative_node`.
+// r[impl sched.admin.hung-node-detector+3]
 pub(super) fn detect_hung_nodes(
     executors: &HashMap<ExecutorId, ExecutorState>,
     now: Instant,
     tenant_of: impl Fn(&DrvHash) -> Option<Uuid>,
-    node_of: impl Fn(&DrvHash) -> Option<String>,
+    node_of: impl Fn(&str) -> Option<String>,
 ) -> Vec<String> {
     #[derive(Default)]
     struct Agg {
@@ -58,13 +63,17 @@ pub(super) fn detect_hung_nodes(
     let mut skipped_no_node = 0u64;
     for w in executors.values() {
         let Some(h) = w.running_build.as_ref() else {
-            // Idle executor — no drv to attribute, no tenant. Can't
-            // contribute to the ≥2-tenant gate, so skipping is
-            // equivalent to the previous `node_name=None → ungrouped`
-            // semantics for idle workers.
+            // Idle — no drv, no tenant, no contribution. The
+            // `auth_intent` let-else below stays SECOND so an idle
+            // executor with a binding still doesn't inflate `occ`.
             continue;
         };
-        let Some(node) = node_of(h) else {
+        let Some(auth) = w.auth_intent.as_deref() else {
+            // Recovery-reconciled / pre-ADR-023 pod with no
+            // intent annotation — same fail-safe skip as no-binding.
+            continue;
+        };
+        let Some(node) = node_of(auth) else {
             skipped_no_node += 1;
             continue;
         };
@@ -83,7 +92,7 @@ pub(super) fn detect_hung_nodes(
     }
     let mut hung: Vec<String> = by_node
         .into_iter()
-        .filter(|(_, a)| a.stale >= 3.max(a.occ.div_ceil(2)) && a.tenants.len() >= 2)
+        .filter(|(_, a)| a.stale >= 2.max(a.occ.div_ceil(2)) && a.tenants.len() >= 2)
         .map(|(n, _)| n)
         .collect();
     hung.sort();

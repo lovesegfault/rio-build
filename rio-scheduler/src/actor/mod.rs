@@ -248,7 +248,7 @@ pub struct DagActor {
     /// `detect_hung_nodes` groups by this instead of any worker-supplied
     /// value — worker is NOT trusted (a forged node_name in the
     /// heartbeat would let two colluding tenants reap an arbitrary
-    /// NodeClaim, `r[sched.admin.hung-node-detector+2]`). Full set
+    /// NodeClaim, `r[sched.admin.hung-node-detector+3]`). Full set
     /// every controller tick; swept on Tick to drop entries for drvs
     /// no longer in the DAG.
     pub(crate) authoritative_node: HashMap<DrvHash, String>,

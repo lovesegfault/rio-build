@@ -400,7 +400,7 @@ message HeartbeatRequest {
   // empty → None.
   string intent_id = 13;
   // Field 14 was `node_name` (R24B6b) — removed: worker-supplied
-  // node identity is untrusted (r[sched.admin.hung-node-detector+2]
+  // node identity is untrusted (r[sched.admin.hung-node-detector+3]
   // threat model). The controller now reports the kube-authoritative
   // binding via `AckSpawnedIntentsRequest.bound_intents`.
   reserved 14;

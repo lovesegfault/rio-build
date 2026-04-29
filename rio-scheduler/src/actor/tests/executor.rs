@@ -792,13 +792,14 @@ async fn credit_heartbeats_for_stall_preserves_liveness_order() -> TestResult {
 }
 
 /// `r[sched.admin.hung-node-detector]`: a node is flagged when
-/// `stale ≥ max(3, ⌈occ/2⌉)` AND those stale executors span ≥2
+/// `stale ≥ max(2, ⌈occ/2⌉)` AND those stale executors span ≥2
 /// tenants. The tenant gate discriminates a hung NODE from one
 /// tenant's bad build; the quorum gate covers transient one-off
-/// timeouts. Grouping is by the controller-reported `node_of` map
-/// (kube-authoritative), NEVER any worker-supplied value — the worker
-/// is NOT trusted (`r[sched.admin.hung-node-detector+2]`).
-// r[verify sched.admin.hung-node-detector+2]
+/// timeouts. Grouping is by the controller-reported `node_of(auth_
+/// intent)` (kube-authoritative + HMAC-attested key), NEVER any
+/// worker-supplied or worker-influenceable value — the worker is NOT
+/// trusted (`r[sched.admin.hung-node-detector+3]`).
+// r[verify sched.admin.hung-node-detector+3]
 #[test]
 fn detect_hung_nodes_quorum_and_tenant_gate() {
     use crate::actor::debug::backdate;
@@ -814,48 +815,60 @@ fn detect_hung_nodes_quorum_and_tenant_gate() {
         Some('2') => Some(t2),
         _ => None,
     };
-    // Controller-reported drv→node binding. Encodes node in the drv
-    // suffix so the test data is self-describing (e.g. "1-a-A"→nodeA).
-    let node_of = |h: &DrvHash| h.as_str().rsplit_once('-').map(|(_, n)| format!("node{n}"));
+    // Controller-reported auth_intent→node binding. Encodes node in
+    // the suffix so the test data is self-describing (e.g.
+    // auth_intent "i-A0"→nodeA). `node_of` is keyed on `auth_intent`,
+    // NOT `running_build` — see `_suppression_vector_closed` below for
+    // why that matters.
+    let node_of = |a: &str| {
+        a.strip_prefix("i-")
+            .and_then(|s| s.chars().next())
+            .map(|c| format!("node{c}"))
+    };
     let stale = HEARTBEAT_TIMEOUT_SECS + 5;
-    let mk = |secs_ago: u64, drv: Option<&str>| {
+    let mk = |secs_ago: u64, drv: Option<&str>, auth: Option<&str>| {
         let mut w = ExecutorState::new("w".into());
         w.last_heartbeat = backdate(secs_ago);
         w.running_build = drv.map(DrvHash::from);
+        w.auth_intent = auth.map(String::from);
         w
     };
     let mut ex: HashMap<ExecutorId, ExecutorState> = HashMap::new();
     let mut put = |id: &str, w: ExecutorState| ex.insert(id.into(), w);
 
-    // nodeA: occ=5, 4 stale (3×t1 + 1×t2), 1 live → max(3,⌈5/2⌉)=3;
+    // nodeA: occ=5, 4 stale (3×t1 + 1×t2), 1 live → max(2,⌈5/2⌉)=3;
     // 4≥3 ∧ tenants={t1,t2} → HUNG.
-    put("a1", mk(stale, Some("1-a-A")));
-    put("a2", mk(stale, Some("1-b-A")));
-    put("a3", mk(stale, Some("1-c-A")));
-    put("a4", mk(stale, Some("2-a-A")));
-    put("a5", mk(1, Some("1-d-A")));
+    put("a1", mk(stale, Some("1-a"), Some("i-A0")));
+    put("a2", mk(stale, Some("1-b"), Some("i-A1")));
+    put("a3", mk(stale, Some("1-c"), Some("i-A2")));
+    put("a4", mk(stale, Some("2-a"), Some("i-A3")));
+    put("a5", mk(1, Some("1-d"), Some("i-A4")));
     // nodeB: occ=3 busy, 3 stale ALL t1 → tenants={t1} → NOT hung
     // (tenant gate — could be t1's build, not the node). The 4th
-    // (idle, no drv) is skipped — no node attribution without a drv.
-    put("b1", mk(stale, Some("1-e-B")));
-    put("b2", mk(stale, Some("1-f-B")));
-    put("b3", mk(stale, Some("1-g-B")));
-    put("b4", mk(1, None));
-    // nodeC: occ=2 busy, 2 stale (t1+t2) → 2 < max(3,⌈2/2⌉)=3 → NOT
-    // hung (quorum gate — minority stall could be transient).
-    put("c1", mk(stale, Some("1-h-C")));
-    put("c2", mk(stale, Some("2-b-C")));
-    put("c3", mk(1, None));
-    // nodeD: occ=8 busy, 4 stale (2+2 tenants) → max(3,⌈8/2⌉)=4; 4≥4
-    // → HUNG. Exercises the ⌈occ/2⌉ arm dominating the floor of 3.
+    // (idle, no drv) is skipped — `running_build` let-else fires
+    // BEFORE `auth_intent`, so even with a binding it doesn't
+    // contribute to occ.
+    put("b1", mk(stale, Some("1-e"), Some("i-B0")));
+    put("b2", mk(stale, Some("1-f"), Some("i-B1")));
+    put("b3", mk(stale, Some("1-g"), Some("i-B2")));
+    put("b4", mk(1, None, Some("i-B3")));
+    // nodeD: occ=8 busy, 4 stale (2+2 tenants) → max(2,⌈8/2⌉)=4; 4≥4
+    // → HUNG. Exercises the ⌈occ/2⌉ arm dominating the floor.
     for i in 0..4 {
         put(
             &format!("d{i}"),
-            mk(stale, Some(if i < 2 { "1-d-D" } else { "2-d-D" })),
+            mk(
+                stale,
+                Some(if i < 2 { "1-d" } else { "2-d" }),
+                Some(&format!("i-D{i}")),
+            ),
         );
     }
     for i in 4..8 {
-        put(&format!("d{i}"), mk(1, Some("1-live-D")));
+        put(
+            &format!("d{i}"),
+            mk(1, Some("1-l"), Some(&format!("i-D{i}"))),
+        );
     }
 
     assert_eq!(
@@ -864,15 +877,18 @@ fn detect_hung_nodes_quorum_and_tenant_gate() {
     );
 }
 
-/// Security: executors whose drv has no controller-reported
-/// `authoritative_node` entry are skipped (fail-safe). A worker can no
-/// longer supply its own node identity — `HeartbeatRequest.node_name`
-/// is gone — so the only attack surface left is "controller never
-/// reports the binding", which degrades to "detector doesn't fire for
-/// that executor" rather than "worker forges a victim node". The
-/// counter surfaces the skip for diagnostics.
+/// bug_001: with the floor at 2 (was 3), a node with exactly 2 busy
+/// stale executors across 2 tenants IS detected — `2 ≥ max(2,⌈2/2⌉)=2
+/// ∧ |tenants|=2`. This is the steady-state shape "burst completes,
+/// most executors go idle, then the node wedges" that the old 3-floor
+/// could never detect (`stale ≤ occ ≤ 2 < 3`). The trade-off: a
+/// healthy 2-pod node with a correlated >30s heartbeat miss (network
+/// blip) is also flagged — accepted, since the alternative is "2-pod
+/// hung node never detectable" and `dead_reap_cap` bounds the blast.
+/// The idle executor (`running_build = None`, `auth_intent` set) is
+/// skipped — locks the let-else ordering (idle gate FIRST).
 #[test]
-fn detect_hung_nodes_skips_without_authoritative_binding() {
+fn detect_hung_nodes_2_busy_2_tenants_detected() {
     use crate::actor::debug::backdate;
     use crate::actor::snapshot::detect_hung_nodes;
     use crate::state::{DrvHash, ExecutorId, ExecutorState, HEARTBEAT_TIMEOUT_SECS};
@@ -888,21 +904,161 @@ fn detect_hung_nodes_skips_without_authoritative_binding() {
             Some(t2)
         }
     };
+    let node_of = |a: &str| a.strip_prefix("i-C").map(|_| "nodeC".to_string());
+    let stale = HEARTBEAT_TIMEOUT_SECS + 5;
+    let mk = |secs_ago: u64, drv: Option<&str>, auth: &str| {
+        let mut w = ExecutorState::new("w".into());
+        w.last_heartbeat = backdate(secs_ago);
+        w.running_build = drv.map(DrvHash::from);
+        w.auth_intent = Some(auth.into());
+        w
+    };
+    let ex: HashMap<ExecutorId, ExecutorState> = [
+        ("c1".into(), mk(stale, Some("1-h"), "i-C0")),
+        ("c2".into(), mk(stale, Some("2-b"), "i-C1")),
+        // Idle: skipped before `auth_intent` is read; occ stays 2.
+        ("c3".into(), mk(stale, None, "i-C2")),
+    ]
+    .into();
+
+    assert_eq!(
+        detect_hung_nodes(&ex, Instant::now(), tenant_of, node_of),
+        vec!["nodeC"]
+    );
+}
+
+/// mb_022: `node_of` is keyed on HMAC-attested `auth_intent`, NOT
+/// worker-influenceable `running_build`. The suppression attack: a
+/// compromised idle worker heartbeats `running_build=D` for a victim
+/// node N's drv → `reconcile_running_build` sets it unconditionally →
+/// if `node_of` keyed on `running_build`, the attacker's fresh
+/// heartbeat would inflate N's `occ` and break the `stale ≥ ⌈occ/2⌉`
+/// gate. Keying on `auth_intent` (the attacker's OWN pod identity, on
+/// node M≠N) makes the attacker contribute to M, not N.
+#[test]
+fn detect_hung_nodes_suppression_vector_closed() {
+    use crate::actor::debug::backdate;
+    use crate::actor::snapshot::detect_hung_nodes;
+    use crate::state::{DrvHash, ExecutorId, ExecutorState, HEARTBEAT_TIMEOUT_SECS};
+    use std::collections::HashMap;
+    use std::time::Instant;
+    use uuid::Uuid;
+
+    let (t1, t2) = (Uuid::new_v4(), Uuid::new_v4());
+    let tenant_of = |h: &DrvHash| {
+        if h.as_str().starts_with('1') {
+            Some(t1)
+        } else {
+            Some(t2)
+        }
+    };
+    // authoritative_node maps auth_intent → node. Victim N's pods are
+    // i-N*; attacker's pods are i-M*.
+    let node_of = |a: &str| match a.chars().nth(2) {
+        Some('N') => Some("N".to_string()),
+        Some('M') => Some("M".to_string()),
+        _ => None,
+    };
+    let stale = HEARTBEAT_TIMEOUT_SECS + 5;
+    let mk = |secs_ago: u64, drv: &str, auth: &str| {
+        let mut w = ExecutorState::new("w".into());
+        w.last_heartbeat = backdate(secs_ago);
+        w.running_build = Some(drv.into());
+        w.auth_intent = Some(auth.into());
+        w
+    };
+    let mut ex: HashMap<ExecutorId, ExecutorState> = HashMap::new();
+    // Victim N: 3 stale across 2 tenants → baseline: occ=3, stale=3,
+    // max(2,⌈3/2⌉)=2, |tenants|=2 → HUNG.
+    ex.insert("n1".into(), mk(stale, "1-a", "i-N0"));
+    ex.insert("n2".into(), mk(stale, "1-b", "i-N1"));
+    ex.insert("n3".into(), mk(stale, "2-a", "i-N2"));
+    // Attacker on M: 4 fresh-hb workers, each with `running_build` set
+    // to one of N's drvs (forged via heartbeat). Under `running_build`
+    // keying these would group under N, inflating occ to 7 →
+    // threshold=4 > stale=3 → suppressed. Under `auth_intent` keying
+    // they group under M (their own pod's node) → N unchanged.
+    for i in 0..4 {
+        ex.insert(
+            format!("m{i}").into(),
+            // running_build forged to N's drv; auth_intent is M's own.
+            mk(1, "1-a", &format!("i-M{i}")),
+        );
+    }
+
+    assert_eq!(
+        detect_hung_nodes(&ex, Instant::now(), tenant_of, node_of),
+        vec!["N"],
+        "attacker's running_build forge must not suppress N's detection"
+    );
+}
+
+/// Security: executors whose `auth_intent` has no controller-reported
+/// `authoritative_node` entry are skipped (fail-safe). A worker can no
+/// longer supply its own node identity — `HeartbeatRequest.node_name`
+/// is gone — so the only attack surface left is "controller never
+/// reports the binding", which degrades to "detector doesn't fire for
+/// that executor" rather than "worker forges a victim node". The
+/// counter surfaces the skip for diagnostics.
+#[test]
+fn detect_hung_nodes_skips_without_authoritative_binding() {
+    use crate::actor::debug::backdate;
+    use crate::actor::snapshot::detect_hung_nodes;
+    use crate::state::{DrvHash, ExecutorId, ExecutorState, HEARTBEAT_TIMEOUT_SECS};
+    use std::collections::HashMap;
+    use std::time::Instant;
+    use uuid::Uuid;
+
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snap = recorder.snapshotter();
+    let _g = ::metrics::set_default_local_recorder(&recorder);
+
+    let (t1, t2) = (Uuid::new_v4(), Uuid::new_v4());
+    let tenant_of = |h: &DrvHash| {
+        if h.as_str().starts_with('1') {
+            Some(t1)
+        } else {
+            Some(t2)
+        }
+    };
     // Controller has reported NO bindings (Ack channel down /
-    // controller restart). Under the pre-R25B1 worker-supplied path,
-    // 4 stale across 2 tenants would flag whatever node_name the
-    // workers sent. Under the authoritative path, all 4 are skipped.
-    let node_of = |_: &DrvHash| None::<String>;
+    // controller restart). All 4 reach `node_of` (auth_intent set) and
+    // are SKIPPED + counted.
+    let node_of = |_: &str| None::<String>;
     let stale = HEARTBEAT_TIMEOUT_SECS + 5;
     let mut ex: HashMap<ExecutorId, ExecutorState> = HashMap::new();
-    for (id, drv) in [("a1", "1-a"), ("a2", "1-b"), ("a3", "2-a"), ("a4", "2-b")] {
+    for (id, drv, auth) in [
+        ("a1", "1-a", "i-a1"),
+        ("a2", "1-b", "i-a2"),
+        ("a3", "2-a", "i-a3"),
+        ("a4", "2-b", "i-a4"),
+    ] {
         let mut w = ExecutorState::new(id.into());
         w.last_heartbeat = backdate(stale);
         w.running_build = Some(drv.into());
+        w.auth_intent = Some(auth.into());
         ex.insert(id.into(), w);
     }
 
     assert!(detect_hung_nodes(&ex, Instant::now(), tenant_of, node_of).is_empty());
+    // Structurally prove the `node_of(auth)=None → skipped++` arm was
+    // reached (vs. silently short-circuiting earlier on auth_intent=None
+    // — the §SCC(5) vacuity this assertion prevents).
+    let skipped = snap
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .find_map(|(k, _, _, v)| {
+            (k.key().name() == "rio_scheduler_hung_detect_skipped_no_authoritative_total")
+                .then_some(v)
+        });
+    assert!(
+        matches!(
+            skipped,
+            Some(metrics_util::debugging::DebugValue::Counter(4))
+        ),
+        "all 4 must reach the node_of(auth)=None arm and be counted"
+    );
 }
 
 /// `hung_nodes` repeats across ticks past `dead_reap_cap` (mb_001a).
@@ -910,7 +1066,7 @@ fn detect_hung_nodes_skips_without_authoritative_binding() {
 /// so on the next tick `detect_hung_nodes` returns nothing — a one-shot
 /// signal would drop N−cap nodes. The map carries each entry for
 /// `HUNG_NODE_REPEAT_TTL` since last (re-)detected.
-// r[verify sched.admin.hung-node-detector+2]
+// r[verify sched.admin.hung-node-detector+3]
 #[tokio::test]
 async fn hung_nodes_repeats_across_ticks_past_cap() {
     use crate::actor::debug::backdate;
@@ -962,6 +1118,42 @@ async fn hung_nodes_repeats_across_ticks_past_cap() {
     assert!(
         actor.hung_nodes.contains_key("nA"),
         "re-detect refreshes timestamp"
+    );
+}
+
+/// bug_024: a node that RECOVERS from a transient stall must be pruned
+/// at TTL even when it still has bound pods (`authoritative_node`
+/// contains it). The dropped `live.contains(n)` arm would have kept it
+/// indefinitely — `tick_check_heartbeats` removed the stale executors
+/// so re-detect never refreshes `last`, and a healthy node legitimately
+/// has bound pods → `live.contains(n)` true forever → controller reaps
+/// a healthy mid-build node.
+#[tokio::test]
+async fn hung_nodes_prunes_recovered_past_ttl() {
+    use crate::actor::debug::backdate;
+    use crate::actor::housekeeping::HUNG_NODE_REPEAT_TTL;
+    use std::time::Instant;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor(db.pool.clone());
+    let now = Instant::now();
+
+    // n1 was detected at t=-130s (past TTL); the node has since
+    // recovered. Its pods are still bound (controller-reported).
+    actor
+        .hung_nodes
+        .insert("n1".into(), backdate(HUNG_NODE_REPEAT_TTL.as_secs() + 10));
+    actor
+        .authoritative_node
+        .insert("drv-on-n1".into(), "n1".into());
+
+    // No stale executors → detect_hung_nodes returns []. With the old
+    // `live.contains(n) || TTL` retain, n1 would survive (live=true).
+    // TTL-only: pruned.
+    actor.tick_hung_nodes(now);
+    assert!(
+        actor.hung_nodes.is_empty(),
+        "recovered node past TTL must be pruned even with bound pods"
     );
 }
 

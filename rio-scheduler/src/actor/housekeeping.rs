@@ -159,11 +159,12 @@ impl DagActor {
         // hung_nodes after it (or on-demand at the controller's 10s poll)
         // would always see zero stale entries.
         self.tick_hung_nodes(now);
-        // Sweep authoritative_node entries whose drv left the DAG
-        // (Built / cancelled / poisoned). The controller ships the
-        // full bound set every tick so this only matters for the
-        // window between a drv terminating and the controller's pod
-        // informer seeing the pod delete, but it bounds the map.
+        // Sweep authoritative_node entries whose spawn-drv left the
+        // DAG. The map is keyed by `auth_intent` (the pod's spawn-time
+        // intent), so a pod whose spawn-drv left while it runs a
+        // fall-through drv is briefly swept here and re-added next
+        // controller Ack (full set every ~10s) — fail-safe gap, only
+        // skips that executor from `detect_hung_nodes` for one tick.
         self.authoritative_node
             .retain(|h, _| self.dag.node(h).is_some());
         self.tick_check_heartbeats(now).await;
@@ -264,30 +265,33 @@ impl DagActor {
     /// executors are gone after `tick_check_heartbeats` so re-detect
     /// alone won't repeat; instead, `.insert(n, now)` (refreshing on
     /// re-detect, not `.entry().or_insert()` which would freeze at
-    /// first-detect and TTL out a still-hung node) and retain entries
-    /// while the node still has bound pods (per controller-reported
-    /// `authoritative_node`) OR is within [`HUNG_NODE_REPEAT_TTL`] of
-    /// last detect — once the controller reaps the NodeClaim its bound
-    /// pods drain, the node leaves `authoritative_node`, and TTL alone
-    /// holds the entry briefly so the controller's confirming poll
-    /// still sees it.
+    /// first-detect) and retain entries within [`HUNG_NODE_REPEAT_TTL`]
+    /// of last detect.
+    ///
+    /// TTL is the SOLE retain mechanism. The K>12×cap simultaneously-
+    /// hung tail is accepted: kubelet-dead → Karpenter's NotReady drift
+    /// reaps within ~5min anyway; kubelet-alive at that scale ⇒ a
+    /// shared-service failure (control plane, EBS region) where reaping
+    /// NodeClaims won't help. The previous `live.contains(n)` arm
+    /// (r25-A8) covered that tail but never released a RECOVERED node
+    /// — a transient stall past `HEARTBEAT_TIMEOUT_SECS` would leave
+    /// `n` in `dead_nodes` indefinitely (executors removed → no
+    /// re-detect → `last` frozen; bound pods on a healthy `n` keep
+    /// `live.contains(n)` true forever) and the controller would reap a
+    /// healthy mid-build node. The recovered-node false-positive is
+    /// destructive; the K>12×cap false-negative is bounded and
+    /// backstopped.
     pub(crate) fn tick_hung_nodes(&mut self, now: Instant) {
         for n in snapshot::detect_hung_nodes(
             &self.executors,
             now,
             |h| self.dag.node(h)?.attributed_tenant(&self.builds),
-            |h| self.authoritative_node.get(h).cloned(),
+            |auth| self.authoritative_node.get(auth).cloned(),
         ) {
             self.hung_nodes.insert(n, now);
         }
-        let live: std::collections::HashSet<&str> = self
-            .authoritative_node
-            .values()
-            .map(String::as_str)
-            .collect();
-        self.hung_nodes.retain(|n, last| {
-            live.contains(n.as_str()) || now.duration_since(*last) < HUNG_NODE_REPEAT_TTL
-        });
+        self.hung_nodes
+            .retain(|_, last| now.duration_since(*last) < HUNG_NODE_REPEAT_TTL);
     }
 
     /// Scan workers for heartbeat timeouts; disconnect any that have

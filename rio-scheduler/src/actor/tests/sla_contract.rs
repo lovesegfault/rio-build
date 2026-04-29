@@ -469,7 +469,7 @@ async fn ack_observed_instance_types_folds_into_cost_table() {
 }
 
 /// **`bound_intents` round-trips into `authoritative_node`**
-/// (`r[sched.admin.hung-node-detector+2]`). Exercises the
+/// (`r[sched.admin.hung-node-detector+3]`). Exercises the
 /// `handle_ack_spawned_intents` body so a forgotten destructure or
 /// wire-field rename surfaces here, not as a silently-empty
 /// `authoritative_node` (the B6a wire-format-mismatch lesson). The

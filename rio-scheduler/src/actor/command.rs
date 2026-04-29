@@ -259,7 +259,7 @@ pub enum ActorCommand {
         /// `CostTable.cells` so `spot_price_poller` knows what to
         /// price. Edge-detected per NodeClaim (controller-side).
         observed_instance_types: Vec<rio_proto::types::ObservedInstanceType>,
-        /// `r[sched.admin.hung-node-detector+2]`: kube-authoritative
+        /// `r[sched.admin.hung-node-detector+3]`: kube-authoritative
         /// `intent_id → spec.nodeName` from the controller's pod
         /// informer. Replaces worker-supplied node_name (untrusted).
         bound_intents: Vec<rio_proto::types::BoundIntent>,
