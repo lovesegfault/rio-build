@@ -19,10 +19,12 @@ use super::NodeClaimPoolConfig;
 use super::ffd::{LiveNode, Placement};
 use super::sketch::{Cell, CellSketches};
 
-/// Hold-open ε annotation key. A node carrying this stays alive until
-/// `max_consolidation_time` regardless of the NA break-even — used when
-/// the reconciler observes the FFD-reserved set drop 1→0 (pure-NA would
-/// delete immediately on the lull; ε keeps one warm slot).
+/// Hold-open annotation key. Operator-settable: a NodeClaim carrying
+/// `rio.build/hold-open=true` uses `max_consolidation_time` as its idle
+/// threshold instead of the NA break-even. Set via `kubectl annotate
+/// nodeclaim <n> rio.build/hold-open=true` for debugging or to keep one
+/// warm slot through a known lull. The reconciler does NOT set it
+/// automatically.
 pub const HOLD_OPEN_ANNOTATION: &str = "rio.build/hold-open";
 
 /// Ring-buffer cap for `CellState.idle_gap_events`. NA hazard reads the
@@ -43,39 +45,20 @@ pub struct IdleGapEvent {
     pub censored: bool,
 }
 
-/// Nelson-Aalen cumulative hazard `H(t)` over right-censored `events`.
-/// `H(t) = Σ_{t_i ≤ t, uncensored} 1/n_i` where `n_i` is the at-risk
-/// count at `t_i` (events with `gap_secs ≥ t_i`, censored or not).
-/// Censored events contribute to at-risk but NOT to the hazard step.
-/// Empty / all-censored → 0.
-pub fn na_hazard(events: &[IdleGapEvent], t: f64) -> f64 {
-    let mut sorted: Vec<&IdleGapEvent> = events.iter().collect();
-    sorted.sort_by(|a, b| a.gap_secs.total_cmp(&b.gap_secs));
-    let mut h = 0.0;
-    let mut at_risk = sorted.len();
-    for e in sorted {
-        if e.gap_secs > t {
-            break;
-        }
-        if !e.censored && at_risk > 0 {
-            h += 1.0 / at_risk as f64;
-        }
-        at_risk -= 1;
-    }
-    h
-}
-
-/// Instantaneous hazard `λ(t) ≈ (H(t+dt) − H(t)) / dt`.
-fn na_lambda(events: &[IdleGapEvent], t: f64, dt: f64) -> f64 {
-    (na_hazard(events, t + dt) - na_hazard(events, t)) / dt
-}
-
 /// First `t` at which `λ(t)·E[c_fit] ≤ cores/boot_median` — the
 /// break-even where keeping the node idle costs more than the expected
 /// boot-avoided. Floored at `boot_median/2` per
 /// `r[ctrl.nodeclaim.consolidate-na]`; ceiling at `max` (default
-/// `2×max(uncensored gap)`). 1s scan step: idle thresholds are
-/// O(seconds) and the loop runs once per idle node per 10s tick.
+/// `2×max(uncensored gap)`).
+///
+/// `λ(t)` is a windowed rate over `[t, t+w)` with `w = boot_median/2`
+/// (≥5s): `uncensored_hits_in_window / (w · n_at_risk(t))`. A
+/// finite-difference of `H(t)` over a fixed 1s grid degenerates to
+/// zero whenever no event lands in `(t, t+1]`, so the scan would
+/// return at the floor on any sparse/non-integer event distribution
+/// regardless of arrival rate. The windowed form is non-zero as long
+/// as any uncensored event falls within `boot_median/2` of `t`. Step
+/// `w/2` keeps overlapping coverage.
 // r[impl ctrl.nodeclaim.consolidate-na]
 pub fn consolidate_after(
     events: &[IdleGapEvent],
@@ -96,13 +79,21 @@ pub fn consolidate_after(
             .map(|e| e.gap_secs)
             .fold(floor, f64::max)
     });
-    let dt = 1.0;
+    let w = floor.max(5.0);
+    let lambda_at = |t: f64| {
+        let n_at_risk = events.iter().filter(|e| e.gap_secs >= t).count().max(1) as f64;
+        let hits = events
+            .iter()
+            .filter(|e| !e.censored && e.gap_secs >= t && e.gap_secs < t + w)
+            .count() as f64;
+        hits / (w * n_at_risk)
+    };
     let mut t = floor;
     while t < max_t {
-        if na_lambda(events, t, dt) * e_fitting_cores <= rhs {
+        if lambda_at(t) * e_fitting_cores <= rhs {
             return t.max(floor);
         }
-        t += dt;
+        t += w / 2.0;
     }
     max_t
 }
@@ -156,8 +147,13 @@ pub async fn reap_idle(
         if !n.registered || reserved.contains(n.name.as_str()) {
             continue;
         }
-        let Some(idle) = n.idle_secs(now_secs) else {
-            // Empty=False (busy per Karpenter) — not reapable.
+        // Busy = Karpenter Empty=False, OR PodRequestedCache saw a
+        // binding before Karpenter flipped the condition (the same
+        // race `observe_idle_to_busy` guards). Without the
+        // `requested.0==0` check, a tight-fit node whose pod just
+        // bound (so `free()=0` → not in `reserved`) but whose Empty
+        // condition is stale/unwritten can be reaped mid-build.
+        let Some(idle) = n.idle_secs(now_secs).filter(|_| n.requested.0 == 0) else {
             continue;
         };
         let boot_median = sketches
@@ -220,7 +216,7 @@ pub async fn reap_idle(
 ///
 /// Called from `reconcile_once` after `list_live_nodeclaims` (so
 /// `requested` is populated) and before `reap_idle`. Without this every
-/// `IdleGapEvent` is censored → `na_hazard=0` → `consolidate_after =
+/// `IdleGapEvent` is censored → `λ(t)=0` → `consolidate_after =
 /// boot_median/2` floor regardless of arrival rate.
 pub fn observe_idle_to_busy(
     live: &[LiveNode],
@@ -265,27 +261,22 @@ mod tests {
         }
     }
 
-    /// NA cumulative hazard with right-censoring. Events: gap=5
-    /// (uncensored), gap=10 (uncensored), gap=15 (censored). At-risk
-    /// counts: 3 at t=5, 2 at t=10, 1 at t=15.
-    /// H(7) = 1/3 (only t=5 ≤ 7). H(12) = 1/3 + 1/2. H(20) = 1/3+1/2
-    /// (t=15 censored: at-risk drops but no hazard step).
+    /// Censoring distinction in `consolidate_after`'s windowed λ:
+    /// censored events count toward at-risk but NOT hits. With
+    /// `[5.0u, 10.0u, 15.0c]`, w=floor=5, t=5: at-risk=3, hits=1
+    /// (event 5.0 in [5,10)) → λ=1/15. With all-censored → λ=0
+    /// everywhere → returns floor.
     #[test]
-    fn nelson_aalen_hazard_with_censoring() {
+    fn censored_events_at_risk_only() {
+        // boot_median=10 → floor=w=5. node=8 → rhs=0.8.
+        // [5u,10u,15c]: t=5: at-risk=3, hits=1 (5.0∈[5,10))
+        // → λ=1/(5·3)≈0.067. λ·E_fit must exceed rhs to keep:
+        // E_fit=100 → 6.67 > 0.8 → continues past floor.
         let evs = [ev(5.0, false), ev(10.0, false), ev(15.0, true)];
-        assert!((na_hazard(&evs, 7.0) - 1.0 / 3.0).abs() < 1e-9);
-        assert!((na_hazard(&evs, 12.0) - (1.0 / 3.0 + 1.0 / 2.0)).abs() < 1e-9);
-        assert!(
-            (na_hazard(&evs, 20.0) - (1.0 / 3.0 + 1.0 / 2.0)).abs() < 1e-9,
-            "censored event no hazard step"
-        );
-        assert_eq!(na_hazard(&evs, 2.0), 0.0, "before first event");
-        assert_eq!(na_hazard(&[], 100.0), 0.0, "empty");
-        // All-censored → 0.
-        assert_eq!(na_hazard(&[ev(5.0, true), ev(10.0, true)], 100.0), 0.0);
-        // Unsorted input handled (sorted internally).
-        let unsorted = [ev(10.0, false), ev(5.0, false), ev(15.0, true)];
-        assert!((na_hazard(&unsorted, 12.0) - (1.0 / 3.0 + 1.0 / 2.0)).abs() < 1e-9);
+        assert!(consolidate_after(&evs, 100.0, 8, 10.0, None) > 5.0);
+        // All-censored → λ=0 (hits=0) → floor.
+        let cens = [ev(5.0, true), ev(10.0, true), ev(15.0, true)];
+        assert_eq!(consolidate_after(&cens, 100.0, 8, 10.0, None), 5.0);
     }
 
     /// r[ctrl.nodeclaim.consolidate-na]: floor = q_0.5(boot)/2. With
@@ -303,28 +294,67 @@ mod tests {
         assert_eq!(t2, 50.0, "max ceiling");
     }
 
-    /// 192c node, mean fitting c_arr=4, λ≈0.1/s. RHS = 192/40 = 4.8.
-    /// 0.1·4 = 0.4 < 4.8 → break-even at floor → delete.
+    /// 192c node, mean fitting c_arr=4, dense arrivals at 21..30.
+    /// w=20 → λ(20) = 10/(20·10) = 0.05. RHS = 192/40 = 4.8.
+    /// 0.05·4 = 0.2 < 4.8 → break-even at floor → delete.
     #[test]
     fn keep_condition_uses_fitting_core_expectation() {
-        // 10 events at gap=10 → at t=floor=20, all events ≤20 →
-        // H(20)=Σ1/n_i (n_i=10..1); H(21) same → λ(20)=0 over dt=1
-        // window. So actually need events spread around floor. Use a
-        // mix so λ at floor is computable.
-        // Simpler: events at 21..30 → at t=20 H=0; at t=21 H=1/10 →
-        // λ(20)≈0.1.
         let evs: Vec<_> = (21..=30).map(|k| ev(f64::from(k), false)).collect();
-        let lambda = na_lambda(&evs, 20.0, 1.0);
-        assert!((lambda - 0.1).abs() < 1e-9, "λ(20)={lambda}");
-        // E[c_fit]=4, node=192, boot=40: 0.1·4=0.4 < 192/40=4.8 →
-        // immediate break-even at floor=20.
+        // E[c_fit]=4, node=192, boot=40: λ·E ≪ rhs → floor.
         let t = consolidate_after(&evs, 4.0, 192, 40.0, None);
         assert_eq!(t, 20.0);
-        // Same events, E[c_fit]=100, node=8: 0.1·100=10 > 8/40=0.2 →
-        // keep past floor; break-even when λ drops (after last event
-        // at t=30, λ=0).
+        // Same events, E[c_fit]=100, node=8: λ(20)·100 = 5 >
+        // 8/40=0.2 → keep past floor; break-even after the cluster.
         let t2 = consolidate_after(&evs, 100.0, 8, 40.0, Some(100.0));
         assert!(t2 >= 30.0, "kept while λ·E > rhs; t2={t2}");
+    }
+
+    /// Regression for the 1s-finite-difference degeneracy: sparse
+    /// non-integer events. The old `(H(t+1)-H(t))/1.0` form was zero
+    /// at t=20 (no event in (20,21]) so the scan returned floor=20.0
+    /// regardless of arrival rate. Windowed estimator with w=20
+    /// sees event 25.3 in [20,40) → λ>0 → scan proceeds past floor.
+    #[test]
+    fn consolidate_after_sparse_events_nondegenerate() {
+        let evs = [ev(25.3, false), ev(47.1, false), ev(80.9, false)];
+        // E[c_fit]=100, node=8, boot=40: rhs=0.2. λ(20)=1/(20·3)≈0.017,
+        // λ·E≈1.67 > 0.2 → does NOT return at floor.
+        let t = consolidate_after(&evs, 100.0, 8, 40.0, None);
+        assert!(
+            t > 20.0,
+            "sparse events should not collapse to floor; got {t}"
+        );
+        // Sanity: with E[c_fit]=0 (no demand), break-even at floor.
+        assert_eq!(consolidate_after(&evs, 0.0, 8, 40.0, None), 20.0);
+    }
+
+    /// `reap_idle`'s busy predicate matches `observe_idle_to_busy`:
+    /// `requested.0 > 0` is busy even when Karpenter hasn't yet
+    /// written `Empty=False`. A node with a freshly-bound pod
+    /// (requested>0, Empty unwritten → idle_secs falls back to
+    /// since-Registered) MUST NOT be reapable.
+    #[test]
+    fn reap_idle_skips_nonzero_requested() {
+        let mut n = with_conds(
+            node("bound", "h", CapacityType::Spot, 8, 0, 0),
+            &[("Registered", "True", 1000.0)],
+        );
+        // No Empty condition → idle_secs = now − Registered.
+        assert_eq!(n.idle_secs(1012.0), Some(12.0));
+        // But a pod is bound (requested > 0) → reap_idle's filter
+        // treats this as busy.
+        n.requested = (8, 0, 0);
+        assert_eq!(
+            n.idle_secs(1012.0).filter(|_| n.requested.0 == 0),
+            None,
+            "requested>0 → not reapable even with idle_secs.is_some()"
+        );
+        // Same node with requested=0 → idle, reapable.
+        n.requested = (0, 0, 0);
+        assert_eq!(
+            n.idle_secs(1012.0).filter(|_| n.requested.0 == 0),
+            Some(12.0)
+        );
     }
 
     #[test]
