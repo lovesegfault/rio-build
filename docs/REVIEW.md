@@ -91,6 +91,19 @@ in too many heads.
   ship (the predicate permits same-k for multiple i; sort-desc fails
   because production FFD sorts by *cores*, so a mem-outlier with low
   cores lands last on a core-exhausted bin).
+- **Delete the reimplementation** (r26 mb_002 → `cover::sizing` STRIKE-4):
+  by N=4 the abstraction boundary is wrong. r25's STRIKE-3 close put
+  `sizing` behind an FFD-oracle TEST and an `ffd_packs` IMPL predicate
+  that reimplemented `simulate`'s sort+score; the reimplementation
+  dropped the `ready` axis. The oracle proptest hardcoded
+  `ready=Some(true)` so it never saw the divergence. Close: when the
+  test oracle IS a production fn, the impl predicate IS that fn —
+  delete the reimplementation and call the production code path
+  directly (`ffd::sim_packs` builds synthetic LiveNodes and calls
+  `ffd::simulate`). There is no second code path to diverge. The
+  proptest must vary every input the production fn's behavior depends
+  on (here: `ready`, `intent_id` tiebreak — see §Stability-tests
+  "oracle proptest must vary every behavior-relevant input").
 
 A new review rule MAY accompany the type-check (so first-strike on a
 *different* invariant is caught) — but the type-check is the close,
@@ -179,6 +192,17 @@ it caught both major design errors before dispatch — `cover::sizing`
 core-only `n` over-asks on mem (the inverse of under-asks), and
 dropping `MenuNoFit` removes the only per-cell capacity gate (the fix
 replaced a bad SOURCE with no gate instead of a configured gate).
+
+**Applies at IMPL-verifier and integration too.** r26: 5/9
+r25-regressions are §one-step-removed at IMPL stage — per-batch
+verifiers used "refute the original claim" not the inverse-case
+checklist (r25-bug_039's `None`-arm was even noted MINOR), and
+integration-time amendments (r25-A8 `live.contains` →
+r26-bug_024) got no verify at all. Close: (1) per-batch IMPL-verifier
+prompts include the (a)/(b)/(c) checklist above; (2) any logic
+introduced at integration — conflict resolution that isn't a pure
+merge, deferred amendments — is enumerated in the integration report
+and gets its own verify-r{N}-integration agent before gate.
 
 ## Partition-single-source
 
@@ -479,6 +503,15 @@ touched. Close: the test reads `p` from each side's PRODUCTION source;
 if those sources can't be exercised in a unit test, that IS the signal
 to single-source.
 
+**Oracle proptest must vary every behavior-relevant input.** r26
+mb_002: `sizing_random_intents_ffd_oracle` calls production
+`ffd::simulate` as oracle but every fixture had `ready=Some(true)` —
+the one input axis the impl-under-test diverged on. An oracle proptest
+is vacuous on any input the generator doesn't vary. Done-gate: for
+each input field of the oracle fn that affects its output, the
+generator varies it; the test's doc lists which fields are
+deliberately fixed and why.
+
 ## Model-formula reimplementation
 
 Any consumer that evaluates `T(c)`, `M(c)`, or another `sla::types`
@@ -566,6 +599,16 @@ controller". The controller already has the kube-authoritative
 in `AckSpawnedIntents` instead of trusting the worker. Done-gate: `rg
 <new-field> rio-auth/src/hmac.rs` — if it's not in claims, the
 reviewer asks "what destructive action reads this?"
+
+**Indirection key matters too.** r26 mb_022: R25B1 made the
+`authoritative_node` map's VALUE controller-authoritative, but
+`node_of(running_build)` keyed the lookup on a worker-mutable field —
+`reconcile_running_build`'s `(None, Some(hb))` arm sets
+`running_build` from the heartbeat unconditionally. A
+controller-authoritative `map[K]=V` is only as trusted as `K`. For
+destructive cross-tenant actions, the lookup key must be HMAC-attested
+(`auth_intent`, set once from token, never mutated by heartbeat) or
+kube-sourced.
 
 ## Simplex-bound
 
