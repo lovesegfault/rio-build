@@ -150,9 +150,19 @@ impl DagActor {
         // tick_check_heartbeats removes stale executors, so computing
         // hung_nodes after it (or on-demand at the controller's 10s poll)
         // would always see zero stale entries.
-        self.hung_nodes = snapshot::detect_hung_nodes(&self.executors, now, |h| {
-            self.dag.node(h)?.attributed_tenant(&self.builds)
-        });
+        self.hung_nodes = snapshot::detect_hung_nodes(
+            &self.executors,
+            now,
+            |h| self.dag.node(h)?.attributed_tenant(&self.builds),
+            |h| self.authoritative_node.get(h).cloned(),
+        );
+        // Sweep authoritative_node entries whose drv left the DAG
+        // (Built / cancelled / poisoned). The controller ships the
+        // full bound set every tick so this only matters for the
+        // window between a drv terminating and the controller's pod
+        // informer seeing the pod delete, but it bounds the map.
+        self.authoritative_node
+            .retain(|h, _| self.dag.node(h).is_some());
         self.tick_check_heartbeats(now).await;
         self.tick_sweep_recently_disconnected(now);
 

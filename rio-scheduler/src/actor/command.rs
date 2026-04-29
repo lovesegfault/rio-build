@@ -61,10 +61,6 @@ pub struct HeartbeatPayload {
     /// intent_id, falling through to pick-from-queue if no match
     /// (e.g., scheduler restarted between spawn and heartbeat).
     pub intent_id: Option<String>,
-    /// k8s `spec.nodeName` (proto field 14, downward-API). `None` =
-    /// proto empty-string (non-k8s builder). Stored on ExecutorState
-    /// for `detect_hung_nodes`.
-    pub node_name: Option<String>,
 }
 
 /// Request payload for [`ActorCommand::MergeDag`].
@@ -263,6 +259,10 @@ pub enum ActorCommand {
         /// `CostTable.cells` so `spot_price_poller` knows what to
         /// price. Edge-detected per NodeClaim (controller-side).
         observed_instance_types: Vec<rio_proto::types::ObservedInstanceType>,
+        /// `r[sched.admin.hung-node-detector+2]`: kube-authoritative
+        /// `intent_id → spec.nodeName` from the controller's pod
+        /// informer. Replaces worker-supplied node_name (untrusted).
+        bound_intents: Vec<rio_proto::types::BoundIntent>,
     },
 
     /// A worker ACKed its initial `PrefetchHint` with `PrefetchComplete`.

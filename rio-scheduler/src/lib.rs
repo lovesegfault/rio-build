@@ -175,6 +175,13 @@ pub fn describe_metrics() {
         "Orphan-terminal derivations rows deleted by the periodic Tick sweep (I-169.2)"
     );
     describe_counter!(
+        "rio_scheduler_hung_detect_skipped_no_authoritative_total",
+        "Busy executors skipped by detect_hung_nodes because no controller-reported \
+         spec.nodeName binding exists yet (controller-lag or AckSpawnedIntents \
+         channel down). Sustained nonzero with hung nodes un-reaped → check \
+         rio-controller nodeclaim_pool reconcile loop."
+    );
+    describe_counter!(
         "rio_scheduler_resource_floor_bumps_total",
         "resource_floor doublings on explicit resource-exhaustion signals (D4, labeled \
          reason=oom_killed|disk_pressure|cgroup_oom|timeout|deadline_exceeded). Reactive \

@@ -236,6 +236,15 @@ pub struct DagActor {
     /// `GetSpawnIntents` poll reads this cache; computing on-demand
     /// would always see an already-cleaned `executors` map.
     hung_nodes: Vec<String>,
+    /// Kube-authoritative `drv_hash → spec.nodeName` from the
+    /// controller's pod informer (`AckSpawnedIntents.bound_intents`).
+    /// `detect_hung_nodes` groups by this instead of any worker-supplied
+    /// value — worker is NOT trusted (a forged node_name in the
+    /// heartbeat would let two colluding tenants reap an arbitrary
+    /// NodeClaim, `r[sched.admin.hung-node-detector+2]`). Full set
+    /// every controller tick; swept on Tick to drop entries for drvs
+    /// no longer in the DAG.
+    authoritative_node: HashMap<DrvHash, String>,
     /// Executors that disconnected mid-build, awaiting the controller's
     /// `ReportExecutorTermination` (k8s OOMKilled/Evicted reason).
     /// `(drv_hash, inserted_at)` — captured before
@@ -314,7 +323,7 @@ pub struct DagActor {
     /// disconnect, or the `handle_tick` DAG-state sweep (cancel/
     /// substitute/terminal). §13b's `AckSpawnedIntents.registered_
     /// cells` (NodeClaim watcher) supersedes this once wired.
-    /// DashMap: `handle_ack_spawned_intents` is `&self`. SmallVec:
+    /// DashMap: read from `&self` `handle_heartbeat`. SmallVec:
     /// `|A'| ≤ |H|×|CapacityType::ALL|` (= |H|×2; 4 typical at 2
     /// hw_classes; spills at |H|≥3).
     pub(crate) dispatched_cells:
@@ -534,6 +543,7 @@ impl DagActor {
             log_buffers: plumbing.log_buffers,
             executors: HashMap::new(),
             hung_nodes: Vec::new(),
+            authoritative_node: HashMap::new(),
             recently_disconnected: HashMap::new(),
             retry_policy: cfg.retry_policy,
             poison_config: cfg.poison,
@@ -606,6 +616,12 @@ impl DagActor {
         // hashes; a stale entry would let a heartbeat for a re-spawned
         // pod clear the wrong cell.
         self.dispatched_cells.clear();
+        // Snapshot of THIS generation's pod bindings (controller-
+        // reported). Stale entries would let `detect_hung_nodes`
+        // misattribute a re-dispatched drv to a previous-generation
+        // node. Empty `dead_nodes` is fail-closed (no reap).
+        self.hung_nodes.clear();
+        self.authoritative_node.clear();
         // Deliberately retained across generations:
         // - `executors`: live connections, not persisted (doc above).
         // - `ice`: cluster-level cell-backoff signal, 60s TTL self-heals.
@@ -783,6 +799,7 @@ impl DagActor {
                     unfulfillable_cells,
                     registered_cells,
                     observed_instance_types,
+                    bound_intents,
                 } => {
                     // r[impl sched.lease.standby-drops-writes] —
                     // ICE state is lease-holder only.
@@ -792,6 +809,7 @@ impl DagActor {
                             &unfulfillable_cells,
                             &registered_cells,
                             &observed_instance_types,
+                            &bound_intents,
                         );
                     }
                 }

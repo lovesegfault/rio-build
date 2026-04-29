@@ -387,6 +387,7 @@ async fn contract_ice_step_doubles_then_clears_on_registered() {
             &["intel-6:spot".into()],
             &[],
             &[],
+            &[],
         );
     }
     assert_eq!(
@@ -408,7 +409,7 @@ async fn contract_ice_step_doubles_then_clears_on_registered() {
         "spawned-ack arms dispatched_cells from the wire form"
     );
 
-    actor.handle_ack_spawned_intents(&[], &[], &["intel-6:spot".into()], &[]);
+    actor.handle_ack_spawned_intents(&[], &[], &["intel-6:spot".into()], &[], &[]);
     assert_eq!(
         actor.ice.step(&cell),
         None,
@@ -431,7 +432,7 @@ async fn ack_observed_instance_types_folds_into_cost_table() {
     use rio_proto::types::ObservedInstanceType;
 
     let db = TestDb::new(&MIGRATOR).await;
-    let actor = bare_actor_hw(db.pool.clone());
+    let mut actor = bare_actor_hw(db.pool.clone());
 
     let spot: crate::sla::config::Cell = ("mid-ebs-x86".into(), CapacityType::Spot);
     let od: crate::sla::config::Cell = ("mid-ebs-x86".into(), CapacityType::Od);
@@ -457,6 +458,7 @@ async fn ack_observed_instance_types_folds_into_cost_table() {
                 mem_bytes: 128 << 30,
             },
         ],
+        &[],
     );
 
     let ct = actor.cost_table.read();
@@ -464,6 +466,48 @@ async fn ack_observed_instance_types_folds_into_cost_table() {
     assert_eq!(ct.menu(&spot)[0].name, "c7i.8xlarge");
     assert_eq!(ct.menu(&spot)[0].cores, 32);
     assert_eq!(ct.menu(&od).len(), 1, "controller 'od' form parses");
+}
+
+/// **`bound_intents` round-trips into `authoritative_node`**
+/// (`r[sched.admin.hung-node-detector+2]`). Exercises the
+/// `handle_ack_spawned_intents` body so a forgotten destructure or
+/// wire-field rename surfaces here, not as a silently-empty
+/// `authoritative_node` (the B6a wire-format-mismatch lesson). The
+/// `intent_id` is the controller's `INTENT_ID_ANNOTATION` value
+/// (= drv_hash); `node_name` is kube `spec.nodeName`.
+#[tokio::test]
+async fn ack_bound_intents_populates_authoritative_node() {
+    use rio_proto::types::BoundIntent;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    assert!(actor.authoritative_node.is_empty());
+
+    actor.handle_ack_spawned_intents(
+        &[],
+        &[],
+        &[],
+        &[],
+        &[
+            BoundIntent {
+                intent_id: "abc123".into(),
+                node_name: "ip-10-0-1-5.ec2.internal".into(),
+            },
+            BoundIntent {
+                intent_id: "def456".into(),
+                node_name: "ip-10-0-1-6.ec2.internal".into(),
+            },
+        ],
+    );
+
+    assert_eq!(
+        actor
+            .authoritative_node
+            .get(&crate::state::DrvHash::from("abc123"))
+            .map(String::as_str),
+        Some("ip-10-0-1-5.ec2.internal")
+    );
+    assert_eq!(actor.authoritative_node.len(), 2);
 }
 
 /// **Ack records the FULL A'** (`r[sched.sla.hw-class.ice-mask]`): a
@@ -478,7 +522,7 @@ async fn contract_ack_spawned_records_full_a_prime() {
     use crate::sla::config::{CapacityType, Cell};
     use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm, SpawnIntent};
     let db = TestDb::new(&MIGRATOR).await;
-    let actor = bare_actor_hw(db.pool.clone());
+    let mut actor = bare_actor_hw(db.pool.clone());
 
     let term = |h: &str, cap: &str| NodeSelectorTerm {
         match_expressions: vec![
@@ -501,7 +545,7 @@ async fn contract_ack_spawned_records_full_a_prime() {
         ..Default::default()
     };
 
-    actor.handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[]);
+    actor.handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[]);
 
     let got: std::collections::HashSet<Cell> = actor
         .dispatched_cells

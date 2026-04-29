@@ -795,8 +795,10 @@ async fn credit_heartbeats_for_stall_preserves_liveness_order() -> TestResult {
 /// `stale ≥ max(3, ⌈occ/2⌉)` AND those stale executors span ≥2
 /// tenants. The tenant gate discriminates a hung NODE from one
 /// tenant's bad build; the quorum gate covers transient one-off
-/// timeouts.
-// r[verify sched.admin.hung-node-detector]
+/// timeouts. Grouping is by the controller-reported `node_of` map
+/// (kube-authoritative), NEVER any worker-supplied value — the worker
+/// is NOT trusted (`r[sched.admin.hung-node-detector+2]`).
+// r[verify sched.admin.hung-node-detector+2]
 #[test]
 fn detect_hung_nodes_quorum_and_tenant_gate() {
     use crate::actor::debug::backdate;
@@ -812,10 +814,12 @@ fn detect_hung_nodes_quorum_and_tenant_gate() {
         Some('2') => Some(t2),
         _ => None,
     };
+    // Controller-reported drv→node binding. Encodes node in the drv
+    // suffix so the test data is self-describing (e.g. "1-a-A"→nodeA).
+    let node_of = |h: &DrvHash| h.as_str().rsplit_once('-').map(|(_, n)| format!("node{n}"));
     let stale = HEARTBEAT_TIMEOUT_SECS + 5;
-    let mk = |node: &str, secs_ago: u64, drv: Option<&str>| {
+    let mk = |secs_ago: u64, drv: Option<&str>| {
         let mut w = ExecutorState::new("w".into());
-        w.node_name = Some(node.into());
         w.last_heartbeat = backdate(secs_ago);
         w.running_build = drv.map(DrvHash::from);
         w
@@ -825,43 +829,80 @@ fn detect_hung_nodes_quorum_and_tenant_gate() {
 
     // nodeA: occ=5, 4 stale (3×t1 + 1×t2), 1 live → max(3,⌈5/2⌉)=3;
     // 4≥3 ∧ tenants={t1,t2} → HUNG.
-    put("a1", mk("nodeA", stale, Some("1-a")));
-    put("a2", mk("nodeA", stale, Some("1-b")));
-    put("a3", mk("nodeA", stale, Some("1-c")));
-    put("a4", mk("nodeA", stale, Some("2-a")));
-    put("a5", mk("nodeA", 1, Some("1-d")));
-    // nodeB: occ=4, 3 stale ALL t1 → tenants={t1} → NOT hung
-    // (tenant gate — could be t1's build, not the node).
-    put("b1", mk("nodeB", stale, Some("1-e")));
-    put("b2", mk("nodeB", stale, Some("1-f")));
-    put("b3", mk("nodeB", stale, Some("1-g")));
-    put("b4", mk("nodeB", 1, None));
-    // nodeC: occ=3, 2 stale (t1+t2) → 2 < max(3,⌈3/2⌉)=3 → NOT hung
-    // (quorum gate — minority stall could be transient).
-    put("c1", mk("nodeC", stale, Some("1-h")));
-    put("c2", mk("nodeC", stale, Some("2-b")));
-    put("c3", mk("nodeC", 1, None));
-    // nodeD: occ=8, 4 stale (2+2 tenants) → max(3,⌈8/2⌉)=4; 4≥4 → HUNG.
-    // Exercises the ⌈occ/2⌉ arm dominating the floor of 3.
+    put("a1", mk(stale, Some("1-a-A")));
+    put("a2", mk(stale, Some("1-b-A")));
+    put("a3", mk(stale, Some("1-c-A")));
+    put("a4", mk(stale, Some("2-a-A")));
+    put("a5", mk(1, Some("1-d-A")));
+    // nodeB: occ=3 busy, 3 stale ALL t1 → tenants={t1} → NOT hung
+    // (tenant gate — could be t1's build, not the node). The 4th
+    // (idle, no drv) is skipped — no node attribution without a drv.
+    put("b1", mk(stale, Some("1-e-B")));
+    put("b2", mk(stale, Some("1-f-B")));
+    put("b3", mk(stale, Some("1-g-B")));
+    put("b4", mk(1, None));
+    // nodeC: occ=2 busy, 2 stale (t1+t2) → 2 < max(3,⌈2/2⌉)=3 → NOT
+    // hung (quorum gate — minority stall could be transient).
+    put("c1", mk(stale, Some("1-h-C")));
+    put("c2", mk(stale, Some("2-b-C")));
+    put("c3", mk(1, None));
+    // nodeD: occ=8 busy, 4 stale (2+2 tenants) → max(3,⌈8/2⌉)=4; 4≥4
+    // → HUNG. Exercises the ⌈occ/2⌉ arm dominating the floor of 3.
     for i in 0..4 {
         put(
             &format!("d{i}"),
-            mk("nodeD", stale, Some(if i < 2 { "1-d" } else { "2-d" })),
+            mk(stale, Some(if i < 2 { "1-d-D" } else { "2-d-D" })),
         );
     }
     for i in 4..8 {
-        put(&format!("d{i}"), mk("nodeD", 1, None));
+        put(&format!("d{i}"), mk(1, Some("1-live-D")));
     }
-    // ungrouped (node_name=None): stale but never flagged.
-    let mut ung = ExecutorState::new("u1".into());
-    ung.last_heartbeat = backdate(stale);
-    ung.running_build = Some("1-u".into());
-    ex.insert("u1".into(), ung);
 
     assert_eq!(
-        detect_hung_nodes(&ex, Instant::now(), tenant_of),
+        detect_hung_nodes(&ex, Instant::now(), tenant_of, node_of),
         vec!["nodeA", "nodeD"]
     );
+}
+
+/// Security: executors whose drv has no controller-reported
+/// `authoritative_node` entry are skipped (fail-safe). A worker can no
+/// longer supply its own node identity — `HeartbeatRequest.node_name`
+/// is gone — so the only attack surface left is "controller never
+/// reports the binding", which degrades to "detector doesn't fire for
+/// that executor" rather than "worker forges a victim node". The
+/// counter surfaces the skip for diagnostics.
+#[test]
+fn detect_hung_nodes_skips_without_authoritative_binding() {
+    use crate::actor::debug::backdate;
+    use crate::actor::snapshot::detect_hung_nodes;
+    use crate::state::{DrvHash, ExecutorId, ExecutorState, HEARTBEAT_TIMEOUT_SECS};
+    use std::collections::HashMap;
+    use std::time::Instant;
+    use uuid::Uuid;
+
+    let (t1, t2) = (Uuid::new_v4(), Uuid::new_v4());
+    let tenant_of = |h: &DrvHash| {
+        if h.as_str().starts_with('1') {
+            Some(t1)
+        } else {
+            Some(t2)
+        }
+    };
+    // Controller has reported NO bindings (Ack channel down /
+    // controller restart). Under the pre-R25B1 worker-supplied path,
+    // 4 stale across 2 tenants would flag whatever node_name the
+    // workers sent. Under the authoritative path, all 4 are skipped.
+    let node_of = |_: &DrvHash| None::<String>;
+    let stale = HEARTBEAT_TIMEOUT_SECS + 5;
+    let mut ex: HashMap<ExecutorId, ExecutorState> = HashMap::new();
+    for (id, drv) in [("a1", "1-a"), ("a2", "1-b"), ("a3", "2-a"), ("a4", "2-b")] {
+        let mut w = ExecutorState::new(id.into());
+        w.last_heartbeat = backdate(stale);
+        w.running_build = Some(drv.into());
+        ex.insert(id.into(), w);
+    }
+
+    assert!(detect_hung_nodes(&ex, Instant::now(), tenant_of, node_of).is_empty());
 }
 
 // ===========================================================================

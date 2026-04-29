@@ -30,13 +30,22 @@ use super::{
 /// fine: no work is stuck there, and `consolidate::reap_idle` covers
 /// it once Karpenter posts `Empty=True`.
 ///
-/// Free function over the inputs (not `&self`) so the test can supply
-/// a `tenant_of` closure without seeding `dag` + `builds`.
-// r[impl sched.admin.hung-node-detector]
+/// `node_of` resolves the kube-authoritative `spec.nodeName` for an
+/// executor's running drv via the controller-reported
+/// `authoritative_node` map — NEVER any worker-supplied value (worker
+/// is NOT trusted; a forged node_name in the heartbeat would let two
+/// colluding tenants reap an arbitrary NodeClaim, or a single
+/// compromised worker spam fresh heartbeats to suppress detection of a
+/// genuinely-hung node). Executors lacking an `authoritative_node`
+/// entry (controller-lag, Ack channel down, idle) are skipped — fail-
+/// safe. Free function so the test supplies `tenant_of`/`node_of`
+/// closures without seeding `dag` + `builds` + `authoritative_node`.
+// r[impl sched.admin.hung-node-detector+2]
 pub(super) fn detect_hung_nodes(
     executors: &HashMap<ExecutorId, ExecutorState>,
     now: Instant,
     tenant_of: impl Fn(&DrvHash) -> Option<Uuid>,
+    node_of: impl Fn(&DrvHash) -> Option<String>,
 ) -> Vec<String> {
     #[derive(Default)]
     struct Agg {
@@ -45,24 +54,37 @@ pub(super) fn detect_hung_nodes(
         tenants: HashSet<Uuid>,
     }
     let timeout = Duration::from_secs(HEARTBEAT_TIMEOUT_SECS);
-    let mut by_node: HashMap<&str, Agg> = HashMap::new();
+    let mut by_node: HashMap<String, Agg> = HashMap::new();
+    let mut skipped_no_node = 0u64;
     for w in executors.values() {
-        let Some(node) = w.node_name.as_deref() else {
+        let Some(h) = w.running_build.as_ref() else {
+            // Idle executor — no drv to attribute, no tenant. Can't
+            // contribute to the ≥2-tenant gate, so skipping is
+            // equivalent to the previous `node_name=None → ungrouped`
+            // semantics for idle workers.
+            continue;
+        };
+        let Some(node) = node_of(h) else {
+            skipped_no_node += 1;
             continue;
         };
         let agg = by_node.entry(node).or_default();
         agg.occ += 1;
         if now.duration_since(w.last_heartbeat) > timeout {
             agg.stale += 1;
-            if let Some(t) = w.running_build.as_ref().and_then(&tenant_of) {
+            if let Some(t) = tenant_of(h) {
                 agg.tenants.insert(t);
             }
         }
     }
+    if skipped_no_node > 0 {
+        ::metrics::counter!("rio_scheduler_hung_detect_skipped_no_authoritative_total")
+            .increment(skipped_no_node);
+    }
     let mut hung: Vec<String> = by_node
         .into_iter()
         .filter(|(_, a)| a.stale >= 3.max(a.occ.div_ceil(2)) && a.tenants.len() >= 2)
-        .map(|(n, _)| n.to_string())
+        .map(|(n, _)| n)
         .collect();
     hung.sort();
     hung
@@ -662,12 +684,21 @@ impl DagActor {
     /// registration edge.
     // r[impl sched.sla.hw-class.ice-mask]
     pub(super) fn handle_ack_spawned_intents(
-        &self,
+        &mut self,
         spawned: &[rio_proto::types::SpawnIntent],
         unfulfillable_cells: &[String],
         registered_cells: &[String],
         observed_instance_types: &[rio_proto::types::ObservedInstanceType],
+        bound_intents: &[rio_proto::types::BoundIntent],
     ) {
+        // Kube-authoritative `intent_id (== drv_hash) → spec.nodeName`.
+        // The controller ships the FULL set every tick, so overwrite-
+        // insert is correct (no stale entries from a missed delete);
+        // `handle_tick` sweeps entries whose drv left the DAG.
+        for b in bound_intents {
+            self.authoritative_node
+                .insert(b.intent_id.as_str().into(), b.node_name.clone());
+        }
         // Arm-on-ack: recover the FULL `cells` vec from the parallel
         // `(hw_class_names, node_affinity)` wire form
         // (`cells_to_selector_terms` emits one term per cell). `cap` is

@@ -708,6 +708,7 @@ impl AdminService for AdminServiceImpl {
                 unfulfillable_cells: req.unfulfillable_cells,
                 registered_cells: req.registered_cells,
                 observed_instance_types: req.observed_instance_types,
+                bound_intents: req.bound_intents,
             })
             .await
             .map_err(|e| Status::internal(e.to_string()))?;

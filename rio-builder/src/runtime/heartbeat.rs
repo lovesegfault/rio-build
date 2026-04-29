@@ -51,7 +51,6 @@ pub async fn build_heartbeat_request(
     systems: &[String],
     features: &[String],
     intent_id: &str,
-    node_name: &str,
     slot: &BuildSlot,
     resources: &ResourceSnapshotHandle,
     store_degraded: bool,
@@ -91,9 +90,6 @@ pub async fn build_heartbeat_request(
         // (downward-API pod annotation). Empty = Static-sized pod;
         // scheduler maps to None and falls through to pick-from-queue.
         intent_id: intent_id.to_string(),
-        // k8s `spec.nodeName` from `RIO_NODE_NAME` downward-API. Feeds
-        // the scheduler's hung-node detector. Empty outside k8s.
-        node_name: node_name.to_string(),
     }
 }
 
@@ -105,7 +101,6 @@ pub(super) struct HeartbeatCtx {
     pub(super) systems: Vec<String>,
     pub(super) features: Vec<String>,
     pub(super) intent_id: String,
-    pub(super) node_name: String,
     pub(super) executor_token: String,
     pub(super) slot: Arc<BuildSlot>,
     pub(super) ready: Arc<std::sync::atomic::AtomicBool>,
@@ -129,7 +124,6 @@ pub(super) fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> 
         systems,
         features,
         intent_id,
-        node_name,
         executor_token,
         slot,
         ready,
@@ -155,7 +149,6 @@ pub(super) fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> 
                 &systems,
                 &features,
                 &intent_id,
-                &node_name,
                 &slot,
                 &resources,
                 circuit.is_open(),

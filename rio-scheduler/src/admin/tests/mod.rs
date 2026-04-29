@@ -350,6 +350,7 @@ async fn mutating_rpcs_require_service_token() {
             unfulfillable_cells: vec![],
             registered_cells: vec![],
             observed_instance_types: vec![],
+            bound_intents: vec![],
         }))
     );
     assert_gated!(
