@@ -229,12 +229,14 @@ pub struct CostTable {
     /// from `interrupt_samples` exposure rows in
     /// [`CostTable::refresh_lambda`] as `Σ exposure_secs / Δt`.
     node_count: HashMap<HwClassName, PriceEma>,
-    /// Per-cell instance-type menu, sorted by `cores` asc. Seeded from
-    /// helm `sla.hwClasses[*].menu` (Part-B); the poller refreshes
-    /// `price_per_vcpu_hr` in-place. Empty ⇔ [`Self::smallest_fitting`]
-    /// degrades to the per-cell EMA scalar (one synthetic "fits-all"
-    /// type) so the admissible-set solve produces candidates before
-    /// menu population is wired.
+    /// Per-cell instance-type menu, sorted by `cores` asc. Populated by
+    /// controller-observed instance-type feedback (TODO R24B7:
+    /// `nodeclaim_pool` reports `node.kubernetes.io/instance-type` per
+    /// resolved cell via `AckSpawnedIntents`). Empty until first
+    /// observations land — [`Self::smallest_fitting`] degrades to the
+    /// per-cell EMA scalar (one synthetic "fits-all" type) so the
+    /// admissible-set solve produces candidates, and the stale-seconds
+    /// gauge is suppressed (poller no-ops on empty menu by design).
     cells: HashMap<Cell, Vec<InstanceType>>,
     /// `price_updated_at() > 6 × pollInterval` ago. Set by
     /// [`CostTable::apply_stale_clamp`] each tick; while true,
@@ -874,8 +876,14 @@ pub async fn spot_price_poller(
         // Pre-leader-gate emit: per-replica gauge — observability.md
         // documents "climbs on standby" as the failover-health signal.
         // Spot-only (this poller doesn't spawn under Static/None).
-        ::metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds")
-            .set(now - cost.read().price_updated_at());
+        // Suppressed while `cells` is unpopulated: `price_updated_at`
+        // folds empty→0.0, so an unsuppressed `now − 0` would emit
+        // ~1.77e9 and fire `RioSlaHwCostStale` permanently on a healthy
+        // poller that simply has no menu to query yet.
+        let updated = cost.read().price_updated_at();
+        if updated > 0.0 {
+            ::metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds").set(now - updated);
+        }
         if !leader.is_leader() {
             continue;
         }
@@ -900,8 +908,10 @@ pub async fn spot_price_poller(
             fold_spot_poll(&mut g, result, now);
             g.apply_stale_clamp(now);
         }
-        ::metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds")
-            .set(now - cost.read().price_updated_at());
+        let updated = cost.read().price_updated_at();
+        if updated > 0.0 {
+            ::metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds").set(now - updated);
+        }
         // r[impl sched.sla.hw-class.epsilon-explore+6]
         // Price is a solve input — the next poll's derived
         // `SolveInputs::inputs_gen` reflects the new table.
