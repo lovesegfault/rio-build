@@ -519,6 +519,14 @@ Builder pods MUST set `priorityClassName=rio-builder-prio-{⌊log₂c*⌋}`
 `preemptionPolicy:Never`) and `schedulerName=rio-packed`. Config-load
 asserts `maxCores < 1024`.
 
+r[ctrl.nodeclaim.placeable-gate]
+When `nodeclaim_pool.enabled`, the Pool reconciler creates Jobs only
+for intents the nodeclaim_pool reconciler's last FFD simulation placed
+on a `Registered=True` NodeClaim. The §13a `ready` retain is replaced;
+Job count is bounded by Registered-node capacity, not Ready-set size.
+An unarmed gate (no FFD tick yet) is fail-closed for both spawn and
+reap.
+
 ## Build CRD (removed)
 
 The `Build` CRD (`rio.build/v1alpha1 Build`) was removed in P0294. It was an

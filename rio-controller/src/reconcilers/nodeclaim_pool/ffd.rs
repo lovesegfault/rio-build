@@ -54,13 +54,13 @@ pub struct LiveNode {
     /// cores: `7910m` → 7, matching `SpawnIntent.cores`' unit.
     pub allocatable: (u32, u64, u64),
     /// `(cores, mem_bytes, disk_bytes)` already requested by pods on
-    /// the backing Node. `From<NodeClaim>` sets this to `(0,0,0)`:
-    /// before B12 routes builder pods via `schedulerName: rio-packed`,
-    /// no pods land on these claims, so zero is exact.
-    // TODO(B12): populate from `Σ Pod.spec.containers[].resources.
-    // requests` over `spec.nodeName == self.node_name` once rio-packed
-    // routes pods here. Until then `free()` on a Registered node
-    // over-reports by whatever the legacy path (if co-scheduled) placed.
+    /// the backing Node. `From<NodeClaim>` sets this to `(0,0,0)`.
+    // TODO(B14): populate from `Σ Pod.spec.containers[].resources.
+    // requests` over `spec.nodeName == self.node_name`. B12 routes
+    // builder pods via `schedulerName: rio-packed` so they land on
+    // these claims now; until the sum is wired `free()` on a Registered
+    // node over-reports by whatever's already bound. Tracked with the
+    // B14 `placement_sim_mismatch_total` metric so drift is observable.
     pub requested: (u32, u64, u64),
     /// `metadata.creationTimestamp` as unix-epoch seconds. `None` only
     /// on a just-`create()`d object before the apiserver round-trip.

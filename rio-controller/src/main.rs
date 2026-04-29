@@ -261,6 +261,20 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // ---- Context ----
+    // Placeable-gate channel: created here (before Ctx) so the receiver
+    // is in `Ctx` for the Pool reconciler and the sender is passed to
+    // `NodeClaimPoolReconciler::new` below. When disabled, no channel —
+    // `PlaceableGate::disabled()` makes `jobs.rs` fall back to the §13a
+    // `ready` gate. The `_tx` binding keeps the sender alive across the
+    // disabled/PG-connect-failed paths so the gate stays unarmed (not
+    // closed); `placeable_tx.take()` hands it to the reconciler when
+    // enabled.
+    let (mut placeable_tx, placeable) = if cfg.nodeclaim_pool.enabled {
+        let (tx, gate) = nodeclaim_pool::placeable_channel();
+        (Some(tx), gate)
+    } else {
+        (None, nodeclaim_pool::PlaceableGate::disabled())
+    };
     let ctx = Arc::new(Ctx {
         client: client.clone(),
         admin: admin.clone(),
@@ -271,6 +285,7 @@ async fn main() -> anyhow::Result<()> {
         error_counts: Default::default(),
         scaler: Default::default(),
         hw_bench_mem_floor: cfg.hw_bench_mem_floor,
+        placeable,
     });
 
     // ---- Reconcilers ----
@@ -429,6 +444,9 @@ async fn main() -> anyhow::Result<()> {
                 leader,
                 cfg.nodeclaim_pool.clone(),
                 hw_config.clone(),
+                placeable_tx
+                    .take()
+                    .expect("placeable_tx Some iff nodeclaim_pool.enabled"),
             )
             .await;
             rio_common::task::spawn_monitored("nodeclaim-pool", reconciler.run(shutdown.clone()));

@@ -152,6 +152,12 @@ pub struct Ctx {
     /// `sla.hwBenchMemFloor`); duplicated here so the controller stays
     /// PG-/scheduler-config-free.
     pub hw_bench_mem_floor: u64,
+    /// ADR-023 §13b: `intent_id` set FFD-placed on a `Registered=True`
+    /// NodeClaim, published per-tick by [`nodeclaim_pool`]. The
+    /// `pool/jobs` reconciler retains only these — see
+    /// [`nodeclaim_pool::PlaceableGate`]. `disabled()` when
+    /// `nodeclaim_pool.enabled = false` (legacy 12-NodePool mode).
+    pub placeable: nodeclaim_pool::PlaceableGate,
 }
 
 /// ComponentScaler reconciler state.

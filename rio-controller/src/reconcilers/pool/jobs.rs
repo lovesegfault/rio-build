@@ -87,6 +87,31 @@ const OVERLAY_HEADROOM: f64 = 1.5;
 /// `handle_timeout_failure` cap-check) before K8s SIGKILLs.
 const WORKER_DEADLINE_SLACK_SECS: i64 = 90;
 
+/// `schedulerName` set on builder pods when `nodeclaim_pool.enabled`.
+/// The helm-deployed second kube-scheduler (B2, MostAllocated scoring)
+/// is the only scheduler watching this name; the default kube-scheduler
+/// ignores rio-packed pods entirely.
+pub(crate) const RIO_PACKED_SCHEDULER: &str = "rio-packed";
+
+/// `priorityClassName` prefix; suffix is [`priority_bucket`]. B2 renders
+/// 10 fixed PriorityClasses `rio-builder-prio-{0..9}` with
+/// `preemptionPolicy: Never` so a high-bucket pod sorts ahead in
+/// rio-packed's queue without evicting a running low-bucket build.
+pub(crate) const PRIORITY_CLASS_PREFIX: &str = "rio-builder-prio-";
+
+/// ADR-023 §13b priority bucket: `⌊log₂ c*⌋` clamped to `[0, 9]`. The
+/// scheduler's `SlaConfig::validate` asserts `maxCores < 1024 = 2¹⁰` so
+/// the clamp is reachable only via that config's ceiling, not normal
+/// solves. `cores = 0` (proto default; FOD/unfitted intents may emit
+/// it) → bucket 0. Larger builds sort first in rio-packed's active
+/// queue so the FFD sim's largest-first packing is honoured at bind
+/// time — the keystone that makes [`super::super::nodeclaim_pool::
+/// PlaceableGate`]'s prediction self-fulfilling.
+// r[impl ctrl.nodeclaim.priority-bucket]
+pub(super) fn priority_bucket(cores: u32) -> u32 {
+    cores.checked_ilog2().unwrap_or(0).min(9)
+}
+
 /// `activeDeadlineSeconds` for an ephemeral Job: `intent.
 /// deadline_secs` verbatim. The scheduler computes it per-derivation
 /// (D7: `wall_p99 × 5` for fitted, `[sla].probe.deadline_secs` for
@@ -246,23 +271,38 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                 (Vec::new(), Some(e.to_string()))
             }
         };
-    // ADR-023 §13a ship-standalone gate: forecast intents (`!ready` —
+    // r[impl ctrl.nodeclaim.placeable-gate]
+    // ADR-023 §13b placeable gate: when `nodeclaim_pool.enabled`, the
+    // §13a `ready` retain below is REPLACED. Jobs spawn only for
+    // intents the nodeclaim_pool reconciler's last FFD sim placed on a
+    // `Registered=True` NodeClaim — structurally closes the spawn-
+    // intent fan-out (1226 Ready intents would otherwise mint 1226
+    // Pending Jobs, each a Karpenter provisioning request). The
+    // controller now knows what's placeable; the scheduler-side cap
+    // that DESIGN.md rejected (it couldn't see node state) is resolved
+    // here. `reap_stale_for_intents` below sees this same placeable
+    // subset (NOT the full intent set): a Pending Job for an intent
+    // that fell out of placeable is by definition unschedulable on any
+    // Registered node and is correctly orphan-reaped.
+    //
+    // `gate_armed = false` ⇔ enabled but no FFD tick has published yet
+    // (first ~10s after start, or a standby replica). Treated like
+    // `scheduler_err` for `queued_known` so reap stays fail-closed.
+    //
+    // §13a ship-standalone gate (the `else` arm) still applies when
+    // `nodeclaim_pool.enabled = false`: forecast intents (`!ready` —
     // deps not yet built) flow through `GetSpawnIntents` so the §13b
-    // `nodeclaim_pool` reconciler can pre-provision, but until that
-    // reconciler exists they MUST NOT spawn Jobs (the pod would
-    // heartbeat, get no assignment for `eta_seconds`, then idle-exit).
-    // Filtered here so `queued`/reap/ack all see one consistent set.
-    // §13b removes this — `placeable` from the NodeClaim FFD sim
-    // becomes the gate instead. Keys on the explicit `ready` bit, NOT
-    // `eta_seconds == 0.0`: a forecast intent with overdue deps clamps
-    // to eta=0.0 and would otherwise pass as Ready (bug_030).
-    // `unwrap_or(true)`: field 13 is `optional`, so a pre-§13a
-    // scheduler's absent field decodes as `None`. Pre-§13a only ever
-    // emitted Ready-loop intents, so absent ⇒ Ready is provably the
-    // old behaviour; `unwrap_or(false)` would drop everything during a
-    // new-controller/old-scheduler skew window (bug_001). Pinned by
-    // `tests/roundtrip.rs::spawn_intent_ready_absent_is_legacy_ready`.
-    intents.retain(|i| i.ready.unwrap_or(true));
+    // reconciler can pre-provision, but in legacy mode they MUST NOT
+    // spawn Jobs (the pod would heartbeat, get no assignment for
+    // `eta_seconds`, then idle-exit). Keys on the explicit `ready`
+    // bit, NOT `eta_seconds == 0.0` (bug_030); `unwrap_or(true)` for
+    // pre-§13a scheduler skew (bug_001).
+    let gate_armed = if ctx.placeable.enabled() {
+        ctx.placeable.retain(&mut intents)
+    } else {
+        intents.retain(|i| i.ready.unwrap_or(true));
+        true
+    };
     let queued = intents.len().min(u32::MAX as usize) as u32;
 
     // ---- HwClassSampled (per-tick, one RPC for the union of A's) ----
@@ -415,6 +455,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                 executor_tokens.get(&intent.intent_id).map(String::as_str),
                 &hw_sampled,
                 ctx.hw_bench_mem_floor,
+                ctx.placeable.enabled(),
             )
         },
     )
@@ -478,8 +519,9 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
 
     // ---- Reap excess Pending ----
     // I-183: spawn-only is half a control loop. `None` when scheduler
-    // unreachable: reap is fail-CLOSED (spawn is fail-open).
-    let queued_known = scheduler_err.is_none().then_some(queued);
+    // unreachable OR placeable-gate unarmed: reap is fail-CLOSED (spawn
+    // is fail-open).
+    let queued_known = (scheduler_err.is_none() && gate_armed).then_some(queued);
     reap_excess_pending(
         &jobs_api,
         &pods_api,
@@ -727,6 +769,7 @@ pub(super) fn build_job(
     executor_token: Option<&str>,
     hw_sampled: &HwSampledCache,
     hw_bench_mem_floor: u64,
+    nodeclaim_pool_enabled: bool,
 ) -> Result<Job> {
     let pool_name = pool.name_any();
     // Suffix derives from `intent_id` so a re-polled still-Ready
@@ -736,6 +779,23 @@ pub(super) fn build_job(
     let job_name = pod::job_name(&pool_name, pool.spec.kind, &suffix);
     let mut pod_spec = pod::build_executor_pod_spec(pool, scheduler, store);
     apply_intent_resources(&mut pod_spec, pool, intent);
+    // r[impl ctrl.nodeclaim.priority-bucket]
+    // §13b: route via the second kube-scheduler so MostAllocated bin-
+    // packing matches `ffd::simulate`'s prediction, and bucket by
+    // `⌊log₂ c*⌋` so largest-first holds at bind. Builder-only: fetcher
+    // pods land on the dedicated `rio.build/node-role=fetcher` pool
+    // (the placeable gate doesn't cover FOD nodes), so leaving them on
+    // the default scheduler keeps both reconcilers' invariants intact.
+    // Gated on `nodeclaim_pool.enabled` so legacy 12-NodePool mode
+    // still uses the default scheduler (rio-packed isn't deployed
+    // there).
+    if nodeclaim_pool_enabled && pool.spec.kind == ExecutorKind::Builder {
+        pod_spec.scheduler_name = Some(RIO_PACKED_SCHEDULER.into());
+        pod_spec.priority_class_name = Some(format!(
+            "{PRIORITY_CLASS_PREFIX}{}",
+            priority_bucket(intent.cores)
+        ));
+    }
     // r[impl sec.executor.identity-token+2]
     // Pass the scheduler-signed token (from `MintExecutorTokens`, NOT
     // `SpawnIntent`) through verbatim so the builder presents it on
@@ -914,9 +974,14 @@ mod tests {
     }
 
     /// `build_job` wrapper for tests that don't exercise the §13a
-    /// hw-bench gate. Empty cache + 0 floor → `bench_needed = false`
-    /// (vacuous on `A = ∅`).
+    /// hw-bench gate or §13b rio-packed routing. Empty cache + 0 floor
+    /// → `bench_needed = false` (vacuous on `A = ∅`);
+    /// `nodeclaim_pool_enabled = false` → no schedulerName/priorityClass.
     fn job(pool: &Pool, i: &SpawnIntent) -> Job {
+        job_gated(pool, i, false)
+    }
+
+    fn job_gated(pool: &Pool, i: &SpawnIntent, nodeclaim_pool_enabled: bool) -> Job {
         build_job(
             pool,
             crate::fixtures::oref(pool),
@@ -926,6 +991,7 @@ mod tests {
             None,
             &HwSampledCache::default(),
             0,
+            nodeclaim_pool_enabled,
         )
         .unwrap()
     }
@@ -1377,5 +1443,167 @@ mod tests {
                  kubelet evicts before any volume cap fires"
             );
         }
+    }
+
+    // r[verify ctrl.nodeclaim.priority-bucket]
+    /// `⌊log₂ c*⌋` clamped `[0, 9]`. The clamp is reachable only at the
+    /// `SlaConfig` ceiling (`maxCores < 1024`); `cores = 0` (proto
+    /// default) maps to bucket 0, not panic.
+    #[test]
+    fn priority_bucket_log2_floor() {
+        for (cores, want) in [
+            (0, 0),
+            (1, 0),
+            (2, 1),
+            (3, 1),
+            (4, 2),
+            (17, 4),
+            (511, 8),
+            (512, 9),
+            (1023, 9),
+            (u32::MAX, 9),
+        ] {
+            assert_eq!(priority_bucket(cores), want, "cores={cores}");
+        }
+    }
+
+    // r[verify ctrl.nodeclaim.priority-bucket]
+    /// `nodeclaim_pool.enabled` ⇒ builder pods get `schedulerName:
+    /// rio-packed` + `priorityClassName: rio-builder-prio-{⌊log₂ c*⌋}`.
+    /// Disabled ⇒ neither (legacy mode uses default scheduler).
+    /// Fetcher pods NEVER get them (placeable gate doesn't cover the
+    /// dedicated fetcher pool).
+    #[test]
+    fn build_job_stamps_rio_packed_and_priority_when_enabled() {
+        let i = SpawnIntent {
+            intent_id: "abc".into(),
+            cores: 17,
+            ..Default::default()
+        };
+        let builder = test_pool("p", ExecutorKind::Builder);
+        let pod = |j: &Job| j.spec.as_ref().unwrap().template.spec.clone().unwrap();
+
+        let on = pod(&job_gated(&builder, &i, true));
+        assert_eq!(on.scheduler_name.as_deref(), Some(RIO_PACKED_SCHEDULER));
+        assert_eq!(
+            on.priority_class_name.as_deref(),
+            Some("rio-builder-prio-4"),
+            "⌊log₂ 17⌋ = 4"
+        );
+
+        let off = pod(&job_gated(&builder, &i, false));
+        assert_eq!(
+            off.scheduler_name, None,
+            "legacy mode → default kube-scheduler"
+        );
+        assert_eq!(off.priority_class_name, None);
+
+        let fetcher = test_pool("f", ExecutorKind::Fetcher);
+        let f = pod(&job_gated(&fetcher, &i, true));
+        assert_eq!(
+            f.scheduler_name, None,
+            "fetcher pods stay on default scheduler even when enabled"
+        );
+        assert_eq!(f.priority_class_name, None);
+    }
+
+    // r[verify ctrl.nodeclaim.placeable-gate]
+    /// `PlaceableGate::retain` filters to the FFD-placed-on-Registered
+    /// set; disabled gate is a no-op; unarmed gate clears + returns
+    /// `false` so `queued_known = None` (fail-closed reap).
+    #[test]
+    fn placeable_gate_retain_semantics() {
+        use crate::reconcilers::nodeclaim_pool::PlaceableGate;
+        let mk = |ids: &[&str]| -> Vec<SpawnIntent> { ids.iter().map(|i| intent(i)).collect() };
+
+        // Disabled → no-op, armed=true.
+        let mut v = mk(&["a", "b", "c"]);
+        assert!(PlaceableGate::disabled().retain(&mut v));
+        assert_eq!(v.len(), 3);
+        assert!(!PlaceableGate::disabled().enabled());
+
+        // Armed → filter to set, armed=true.
+        let gate = PlaceableGate::from_ids(["a", "c", "z"]);
+        assert!(gate.enabled());
+        let mut v = mk(&["a", "b", "c"]);
+        assert!(gate.retain(&mut v));
+        let ids: Vec<&str> = v.iter().map(|i| i.intent_id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "c"]);
+
+        // Unarmed → clear, armed=false.
+        let gate = PlaceableGate::unarmed();
+        assert!(gate.enabled());
+        let mut v = mk(&["a", "b"]);
+        assert!(!gate.retain(&mut v), "unarmed → false (fail-closed reap)");
+        assert!(v.is_empty());
+    }
+
+    // r[verify ctrl.nodeclaim.placeable-gate]
+    /// The spawn-intent fan-out close in unit-test form: 1226 Ready
+    /// intents, FFD placed 9 on Registered nodes → only 9 survive the
+    /// gate. Pre-B12 (`ready` retain) all 1226 would mint Pending Jobs;
+    /// post-B12 the Job count is bounded by Registered-node capacity.
+    #[test]
+    fn placeable_gate_bounds_spawn_intent_fan_out() {
+        use crate::reconcilers::nodeclaim_pool::PlaceableGate;
+        let mut intents: Vec<SpawnIntent> = (0..1226)
+            .map(|k| SpawnIntent {
+                intent_id: format!("i{k:04}"),
+                ready: Some(true),
+                ..Default::default()
+            })
+            .collect();
+        // FFD placed 9 on Registered nodes (arbitrary subset).
+        let placed = [
+            "i0000", "i0042", "i0137", "i0511", "i0512", "i0777", "i0999", "i1000", "i1225",
+        ];
+        let gate = PlaceableGate::from_ids(placed);
+        assert!(gate.retain(&mut intents));
+        assert_eq!(
+            intents.len(),
+            placed.len(),
+            "1226 Ready intents → {} placeable Jobs (bounded by Registered-node \
+             capacity, not Ready-set size)",
+            placed.len()
+        );
+        let survived: HashSet<&str> = intents.iter().map(|i| i.intent_id.as_str()).collect();
+        for id in placed {
+            assert!(survived.contains(id), "{id} survived");
+        }
+    }
+
+    /// `placeable_channel()` end-to-end: publish from the producer side
+    /// (what `reconcile_once` does after `ffd::simulate`) filtering
+    /// `in_flight = false`, then read via the gate. Proves the
+    /// `Placement → intent_id` projection and the `Registered`-only
+    /// filter are wired the same way at both ends.
+    #[test]
+    fn placeable_channel_publish_filters_in_flight() {
+        use crate::reconcilers::nodeclaim_pool::{Placement, placeable_channel};
+        let (tx, gate) = placeable_channel();
+        // Unarmed until first publish.
+        let mut v = vec![intent("x")];
+        assert!(!gate.retain(&mut v));
+
+        let placeable: Vec<Placement> = vec![
+            (intent("on-reg"), "n1".into(), false),
+            (intent("on-inflight"), "n2".into(), true),
+            (intent("on-reg-2"), "n3".into(), false),
+        ];
+        let on_registered: HashSet<String> = placeable
+            .iter()
+            .filter(|(_, _, in_flight)| !in_flight)
+            .map(|(i, _, _)| i.intent_id.clone())
+            .collect();
+        tx.send_replace(Some(std::sync::Arc::new(on_registered)));
+
+        let mut v = vec![intent("on-reg"), intent("on-inflight"), intent("on-reg-2")];
+        assert!(gate.retain(&mut v));
+        let ids: Vec<&str> = v.iter().map(|i| i.intent_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["on-reg", "on-reg-2"],
+            "in-flight placements excluded from Job-create"
+        );
     }
 }

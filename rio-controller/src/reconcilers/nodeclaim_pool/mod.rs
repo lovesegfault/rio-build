@@ -32,6 +32,7 @@ mod health;
 pub mod sketch;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use kube::api::{Api, ListParams, PostParams};
@@ -76,6 +77,87 @@ fn now_epoch() -> f64 {
 /// `create()` time so `list_live_nodeclaims` and the consolidator never
 /// touch claims from the rio-general / fetcher pools.
 pub const OWNER_LABEL: &str = "rio.build/nodeclaim-pool=builder";
+
+/// `intent_id` set FFD-placed on a `Registered=True` NodeClaim. `None`
+/// = no FFD tick has published yet (first ~10s after start, or standby
+/// replica whose lease-gated reconciler never runs).
+type PlaceableSet = Option<Arc<HashSet<String>>>;
+
+/// Receiver-side of the placeable-gate channel, held in [`super::Ctx`]
+/// so the `pool/jobs` reconciler can read it. ADR-023 §13b: Jobs spawn
+/// only for intents the FFD sim placed on a Registered node —
+/// structurally closes the spawn-intent fan-out (1226 Ready intents →
+/// 1226 Pending Jobs → Karpenter thrash) that the §13a
+/// `intents.retain(|i| i.ready)` gate could not.
+///
+/// `watch` semantics: the Pool reconciler reads the latest snapshot
+/// each tick (no event-per-publish; staleness bounded by the 10s tick
+/// cadence on both sides). `Arc<HashSet>` so `borrow().clone()` is O(1).
+#[derive(Clone)]
+pub struct PlaceableGate(Option<tokio::sync::watch::Receiver<PlaceableSet>>);
+
+impl PlaceableGate {
+    /// Disabled gate (`nodeclaim_pool.enabled = false`). [`Self::retain`]
+    /// is a no-op; the legacy `ready` gate in `jobs.rs` applies instead.
+    pub fn disabled() -> Self {
+        Self(None)
+    }
+
+    /// `nodeclaim_pool.enabled`. Drives `schedulerName: rio-packed` +
+    /// `priorityClassName` stamping in `build_job` AND switches `jobs.rs`
+    /// from the §13a `ready` gate to the §13b placeable gate.
+    pub fn enabled(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Retain only intents whose `intent_id` is in the last-published
+    /// placeable set. Returns whether the gate is **armed** (a value has
+    /// been published, OR the gate is disabled). `false` ⇔ enabled but
+    /// no FFD tick has run yet — caller treats `queued` as unknown so
+    /// `reap_excess_pending` stays fail-closed (a standby replica whose
+    /// lease-gated reconciler never publishes would otherwise see
+    /// `queued=0` and reap the leader's Pending Jobs).
+    // r[impl ctrl.nodeclaim.placeable-gate]
+    pub fn retain(&self, intents: &mut Vec<SpawnIntent>) -> bool {
+        let Some(rx) = &self.0 else {
+            return true;
+        };
+        match rx.borrow().clone() {
+            Some(set) => {
+                intents.retain(|i| set.contains(&i.intent_id));
+                true
+            }
+            None => {
+                intents.clear();
+                false
+            }
+        }
+    }
+
+    /// Test-only: enabled gate seeded with `ids` (armed).
+    #[cfg(test)]
+    pub fn from_ids<I: IntoIterator<Item = &'static str>>(ids: I) -> Self {
+        let set: HashSet<String> = ids.into_iter().map(str::to_owned).collect();
+        let (_tx, rx) = tokio::sync::watch::channel(Some(Arc::new(set)));
+        Self(Some(rx))
+    }
+
+    /// Test-only: enabled but unarmed (no publish yet).
+    #[cfg(test)]
+    pub fn unarmed() -> Self {
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        Self(Some(rx))
+    }
+}
+
+/// Construct a placeable-gate channel pair. The sender is held by
+/// [`NodeClaimPoolReconciler`]; the receiver wraps into [`PlaceableGate`]
+/// in `Ctx`. Initial value `None` (unarmed) so the first Pool-reconcile
+/// tick before the first FFD tick is fail-closed.
+pub fn placeable_channel() -> (tokio::sync::watch::Sender<PlaceableSet>, PlaceableGate) {
+    let (tx, rx) = tokio::sync::watch::channel(None);
+    (tx, PlaceableGate(Some(rx)))
+}
 
 /// Figment-loaded config (`RIO_NODECLAIM_POOL__*`). `enabled = false` →
 /// reconciler not spawned (legacy 12-NodePool mode; gate in main.rs).
@@ -229,6 +311,10 @@ pub struct NodeClaimPoolReconciler {
     /// [`HwClassConfig::labels_for`] to build NodeClaim
     /// `spec.requirements`.
     hw_config: HwClassConfig,
+    /// Publish side of [`PlaceableGate`]. Written once per successful
+    /// FFD tick with the `intent_id`s placed on `Registered=True`
+    /// nodes; the `pool/jobs` reconciler reads it via `Ctx.placeable`.
+    placeable_tx: tokio::sync::watch::Sender<PlaceableSet>,
     sketches: CellSketches,
     /// NodeClaim names whose `Registered=True` boot time has already
     /// been recorded into `sketches`. Edge-detector state for
@@ -255,6 +341,7 @@ impl NodeClaimPoolReconciler {
         leader: LeaderState,
         cfg: NodeClaimPoolConfig,
         hw_config: HwClassConfig,
+        placeable_tx: tokio::sync::watch::Sender<PlaceableSet>,
     ) -> Self {
         // Load persisted sketches; fall back to empty on error (a fresh
         // table is the cold-start case anyway). `seed()` overlays
@@ -278,6 +365,7 @@ impl NodeClaimPoolReconciler {
             leader,
             cfg,
             hw_config,
+            placeable_tx,
             sketches,
             recorded_boot: HashSet::new(),
             consecutive_bot_ticks: 0,
@@ -355,9 +443,10 @@ impl NodeClaimPoolReconciler {
         // r[ctrl.nodeclaim.lead-time-ddsketch]: record boot times on
         // Registered=True edges, then rotate any cells past halflife.
         // `registered_cells` feeds `report_unfulfillable`'s ICE-clear.
-        // TODO(B12): per-cell `schmitt_adjust` once forecast hit-ratio
-        // is observable (needs rio-packed pod placement to compare
-        // against FFD's prediction).
+        // TODO(B14): per-cell `schmitt_adjust` once forecast hit-ratio
+        // is observable (needs rio-packed pod placement — wired in B12
+        // — accumulating enough samples to compare against FFD's
+        // prediction; the metric emission lives with B14).
         let registered_cells = self
             .sketches
             .observe_registered(&live, &mut self.recorded_boot);
@@ -367,15 +456,27 @@ impl NodeClaimPoolReconciler {
         );
 
         let (placeable, unplaced) = ffd::simulate(&intents.intents, &live, &self.sketches);
-        // TODO(B12): pod.rs `schedulerName=rio-packed` + priorityClassName
-        // wiring; until then `placeable` is observability only — the legacy
-        // Pool reconciler still spawns the actual Jobs.
         debug!(
             placeable = placeable.len(),
             unplaced = unplaced.len(),
             live = live.len(),
             "FFD simulation"
         );
+        // r[impl ctrl.nodeclaim.placeable-gate]
+        // Publish `intent_id`s FFD-placed on a `Registered=True` node
+        // (`in_flight == false`). The `pool/jobs` reconciler retains
+        // only these — Jobs are NOT created for intents placed on
+        // in-flight claims (the pod would sit Pending until the claim
+        // registers; `cover_deficit` already provisioned for them, so
+        // the next tick after Registered picks them up). `send_replace`:
+        // dropped receivers (controller shutdown) are not an error.
+        let on_registered: HashSet<String> = placeable
+            .iter()
+            .filter(|(_, _, in_flight)| !in_flight)
+            .map(|(i, _, _)| i.intent_id.clone())
+            .collect();
+        self.placeable_tx
+            .send_replace(Some(Arc::new(on_registered)));
 
         let now = now_epoch();
         // Reap unhealthy/ICE BEFORE cover_deficit so cells that just
@@ -560,9 +661,10 @@ impl NodeClaimPoolReconciler {
     /// Report this tick's ICE-hit cells (`unfulfillable_cells`) and
     /// `Registered=True` edges (`registered_cells`) to the scheduler
     /// via `AckSpawnedIntents`. The scheduler's ICE backoff ladder
-    /// marks/clears each. `spawned` is empty: the legacy `Pool`
-    /// reconciler still owns Job-creation acks until B12 routes pods
-    /// here. RPC failure is warned + dropped (next tick retries; the
+    /// marks/clears each. `spawned` is empty: the `Pool` reconciler
+    /// owns Job-creation acks (it creates the Jobs; this reconciler
+    /// only gates which intents are eligible via [`PlaceableGate`]).
+    /// RPC failure is warned + dropped (next tick retries; the
     /// scheduler also has its first-heartbeat clear path).
     async fn report_unfulfillable(
         &self,
