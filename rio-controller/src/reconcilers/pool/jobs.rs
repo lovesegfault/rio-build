@@ -502,6 +502,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                 executor_tokens.get(&intent.intent_id).map(String::as_str),
                 &hw_sampled,
                 ctx.hw_bench_mem_floor,
+                ctx.placeable.is_some(),
             )
         },
     )
@@ -815,6 +816,7 @@ pub(super) fn build_job(
     executor_token: Option<&str>,
     hw_sampled: &HwSampledCache,
     hw_bench_mem_floor: u64,
+    gate_active: bool,
 ) -> Result<Job> {
     let pool_name = pool.name_any();
     // Suffix derives from `intent_id` so a re-polled still-Ready
@@ -827,11 +829,13 @@ pub(super) fn build_job(
     // r[impl ctrl.nodeclaim.priority-bucket]
     // §13b: route via the second kube-scheduler so MostAllocated bin-
     // packing matches `ffd::simulate`'s prediction, and bucket by
-    // `⌊log₂ c*⌋` so largest-first holds at bind. Builder-only: fetcher
-    // pods land on the dedicated `rio.build/node-role=fetcher` pool
-    // (the placeable gate doesn't cover FOD nodes), so leaving them on
-    // the default scheduler keeps both reconcilers' invariants intact.
-    if pool.spec.kind == ExecutorKind::Builder {
+    // `⌊log₂ c*⌋` so largest-first holds at bind. Builder-only AND
+    // gate-active only: fetcher pods land on the dedicated
+    // `rio.build/node-role=fetcher` pool (the placeable gate doesn't
+    // cover FOD nodes); when `gate_active=false` (NodeClaim CRD
+    // absent — k3s VM tests without Karpenter) `kube-build-scheduler`
+    // isn't deployed, so the pod would sit Pending forever.
+    if gate_active && pool.spec.kind == ExecutorKind::Builder {
         pod_spec.scheduler_name = Some(KUBE_BUILD_SCHEDULER.into());
         pod_spec.priority_class_name = Some(format!(
             "{PRIORITY_CLASS_PREFIX}{}",
@@ -1026,6 +1030,7 @@ mod tests {
             None,
             &HwSampledCache::default(),
             0,
+            true,
         )
         .unwrap()
     }

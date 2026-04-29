@@ -559,6 +559,7 @@ fn build_job_with(
         None,
         hw_sampled,
         floor,
+        true,
     )
     .unwrap()
 }
