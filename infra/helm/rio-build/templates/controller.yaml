@@ -20,6 +20,12 @@ spec:
     metadata:
       labels:
         {{- include "rio.labels" (dict "root" . "name" "rio-controller" "component" "controller") | nindent 8 }}
+      annotations:
+        # Controller reads /etc/rio/controller.toml once at boot; subPath
+        # mounts don't live-update. Roll on any nodeclaim_pool-relevant
+        # values change ([sla] table is the source for instance_menu/
+        # lead_time_seed and the shared scalar caps).
+        checksum/controller-toml: {{ list (toJson .Values.scheduler.sla) (toJson .Values.karpenter.nodeclaimPool) | join "" | sha256sum }}
     spec:
       serviceAccountName: rio-controller
       {{- if .Values.karpenter.enabled }}
@@ -75,11 +81,35 @@ spec:
             - name: RIO_HW_BENCH_MEM_FLOOR
               value: {{ int64 .hwBenchMemFloor | quote }}
             {{- end }}
+            {{- if .Values.karpenter.nodeclaimPool.enabled }}
+            # database_url stays env (Secret-sourced; never lands in the
+            # ConfigMap-rendered TOML). lease_namespace via downward API
+            # so the chart isn't namespace-pinned.
+            - name: RIO_NODECLAIM_POOL__DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: rio-postgres
+                  key: url
+            - name: RIO_NODECLAIM_POOL__LEASE_NAMESPACE
+              valueFrom:
+                fieldRef: {fieldPath: metadata.namespace}
+            {{- end }}
             {{- with $c.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           volumeMounts:
             {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "serviceHmac")) | nindent 12 }}
+            # rio_common::config::load reads /etc/rio/controller.toml. The
+            # ConfigMap carries [nodeclaim_pool] (instance_menu/
+            # lead_time_seed are nested map/seq — figment's Env provider
+            # only yields strings, so they MUST come from TOML). subPath:
+            # serviceHmac mounts at /etc/rio/service-hmac; whole-dir CM
+            # mount would shadow it. checksum annotation rolls the pod on
+            # CM change.
+            - name: config
+              mountPath: /etc/rio/controller.toml
+              subPath: controller.toml
+              readOnly: true
           # /healthz: unconditional 200 (process alive + tokio
           # responsive) — bound BEFORE connect_forever so liveness
           # passes during scheduler cold-start. /readyz: 503 until
@@ -96,4 +126,54 @@ spec:
             {{- toYaml $c.resources | nindent 12 }}
       volumes:
         {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "serviceHmac")) | nindent 8 }}
+        - name: config
+          configMap:
+            name: rio-controller-config
+---
+# Mounted at /etc/rio/controller.toml. figment merges this UNDER env (RIO_*
+# wins for scalars). The [nodeclaim_pool] table is the ONLY way to
+# populate instance_menu / lead_time_seed: figment's Env provider yields
+# bare strings, so a `HashMap<String, Vec<InstanceType>>` field cannot
+# load from `RIO_NODECLAIM_POOL__INSTANCE_MENU`. Scalars duplicate the
+# scheduler's `[sla]` rendering (single source: `.Values.scheduler.sla`)
+# so the controller's deficit-cover caps and the scheduler's solve_intent
+# ceilings never diverge. database_url stays env (Secret-sourced).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rio-controller-config
+  namespace: {{ .Values.namespaces.system.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-controller" "component" "controller") | nindent 4 }}
+data:
+  controller.toml: |
+    {{- with .Values.scheduler.sla }}
+    [nodeclaim_pool]
+    enabled = {{ $.Values.karpenter.nodeclaimPool.enabled }}
+    lease_name = {{ $.Values.karpenter.nodeclaimPool.leaseName | default "rio-controller-nodeclaim-pool" | quote }}
+    node_class_ref = {{ .nodeClassRef | default "rio-default" | quote }}
+    max_fleet_cores = {{ int64 .maxFleetCores }}
+    max_node_claims_per_cell_per_tick = {{ int64 .maxNodeClaimsPerCellPerTick }}
+    max_lead_time = {{ printf "%.1f" (float64 .maxLeadTime) }}
+    {{- with .maxConsolidationTime }}
+    max_consolidation_time = {{ printf "%.1f" (float64 .) }}
+    {{- end }}
+    {{- with .leadTimeSeed }}
+
+    [nodeclaim_pool.lead_time_seed]
+    {{- range $cell, $v := . }}
+    {{ $cell | quote }} = {{ printf "%.1f" (float64 $v) }}
+    {{- end }}
+    {{- end }}
+    {{- range $cell, $menu := .instanceMenu }}
+    {{- range $menu }}
+
+    [[nodeclaim_pool.instance_menu.{{ $cell | quote }}]]
+    cores = {{ int64 .cores }}
+    mem_bytes = {{ int64 .memBytes }}
+    disk_bytes = {{ int64 .diskBytes }}
+    price_per_vcpu_hr = {{ printf "%v" (float64 .pricePerVcpuHr) }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
 {{- end }}

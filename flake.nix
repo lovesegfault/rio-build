@@ -944,15 +944,15 @@
           # gating gap; remove the entry (NOT the test) once the gap is
           # closed.
           vmTestsManual = [
-            # ADR-023 §13b kwok fixture: rio-controller CrashLoopBackOff
-            # because `NodeClaimPoolConfig.instance_menu` (HashMap<String,
-            # Vec<InstanceType>>) cannot load via figment's `Env` provider
-            # (Env yields strings only — see rio-common/src/config.rs
-            # `comma_vec` rationale). The same gap blocks the EKS deploy
-            # path (helm `controller.yaml` has no first-class
-            # nodeclaim_pool config). Promote to `checks` once the
-            # controller reads instance_menu from a ConfigMap-mounted
-            # TOML or a `json_from_str` deserialize_with bridge lands.
+            # ADR-023 §13b kwok fixture: config loading + lease RBAC fixed
+            # (B16 — controller boots, reconciler ticks, FFD sees
+            # unplaced=4). NEW gating gap: cover_deficit emits created=0
+            # — assign_to_cells groups by cheapest A_open cell but the
+            # scheduler-emitted SpawnIntent.hw_class_names doesn't
+            # intersect `vmtest:spot` (`by_cell.get` returns None on the
+            # only instance_menu key). Promote to `checks` once the
+            # scheduler-side cell emission is verified to include the
+            # vmtest hw_class under the deep-merged 13-hwClass config.
             "vm-sla-sizing-kwok"
           ];
 

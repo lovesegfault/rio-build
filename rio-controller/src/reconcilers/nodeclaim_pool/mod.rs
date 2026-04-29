@@ -159,8 +159,12 @@ pub fn placeable_channel() -> (tokio::sync::watch::Sender<PlaceableSet>, Placeab
     (tx, PlaceableGate(Some(rx)))
 }
 
-/// Figment-loaded config (`RIO_NODECLAIM_POOL__*`). `enabled = false` →
-/// reconciler not spawned (legacy 12-NodePool mode; gate in main.rs).
+/// Figment-loaded config. Scalars via `RIO_NODECLAIM_POOL__*` env;
+/// `instance_menu` / `lead_time_seed` via the `[nodeclaim_pool]` table
+/// in `/etc/rio/controller.toml` (helm `rio-controller-config`
+/// ConfigMap) — figment's Env provider yields bare strings, so nested
+/// map/seq fields cannot load from env. `enabled = false` → reconciler
+/// not spawned (legacy 12-NodePool mode; gate in main.rs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NodeClaimPoolConfig {

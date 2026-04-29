@@ -154,6 +154,39 @@ subjects:
   - kind: ServiceAccount
     name: rio-controller
     namespace: {{ $ns }}
+---
+# nodeclaim_pool lease (ADR-023 §13b): same in-house rio_lease library
+# as the scheduler — GET/CREATE/UPDATE on one Lease in rio-system.
+# Unconditional (not nodeclaimPool.enabled-gated): the Role is inert
+# when the reconciler doesn't spawn, and gating it means a flip to
+# enabled=true silently 403s instead of provisioning.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rio-controller-lease
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-controller" "component" "controller") | nindent 4 }}
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, create, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rio-controller-lease
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-controller" "component" "controller") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rio-controller-lease
+subjects:
+  - kind: ServiceAccount
+    name: rio-controller
+    namespace: {{ $ns }}
 {{- end }}
 
 {{- if .Values.scheduler.enabled }}

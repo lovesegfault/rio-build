@@ -41,7 +41,8 @@ const NODE_CLASS_GROUP: &str = "karpenter.k8s.aws";
 const NODE_CLASS_KIND: &str = "EC2NodeClass";
 
 /// One instance shape in a cell's menu. Helm-populated
-/// (`RIO_NODECLAIM_POOL__INSTANCE_MENU`): the controller doesn't run
+/// (`[nodeclaim_pool.instance_menu]` in the ConfigMap-mounted
+/// `controller.toml`): the controller doesn't run
 /// the scheduler's live `DescribeSpotPriceHistory` poll, so
 /// `price_per_vcpu_hr` is the static seed — sufficient for the
 /// "cheapest \$/core" bulk pick (the relative ranking is what matters,

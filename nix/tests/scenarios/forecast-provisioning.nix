@@ -4,8 +4,9 @@
 #   - NodeClaim CRD admission accepts cover::build_nodeclaim's shape
 #     (nodeClassRef required-fields, requirements[].operator enum)
 #   - controller RBAC sufficient for nodeclaims:{list,create,delete}
-#   - figment env-loading of RIO_NODECLAIM_POOL__INSTANCE_MENU (nested
-#     map-of-struct-list — the only deep-JSON env path in the controller)
+#   - figment loading of [nodeclaim_pool.instance_menu] from the
+#     ConfigMap-mounted controller.toml (nested map-of-struct-list —
+#     cannot load via Env provider; the helm ConfigMap is the only path)
 #   - LiveNode::from parses real apiserver-round-tripped status
 #     (lastTransitionTime as RFC3339, allocatable as Quantity strings)
 #   - rio-packed second kube-scheduler Deployment runs + builder Jobs
@@ -54,7 +55,7 @@ pkgs.testers.runNixOSTest {
         timeout=120,
     )
     k3s_server.wait_until_succeeds(
-        "k3s kubectl -n ${ns} rollout status deploy/kube-scheduler-rio-packed "
+        "k3s kubectl -n ${ns} rollout status deploy/rio-packed-scheduler "
         "--timeout=60s",
         timeout=120,
     )

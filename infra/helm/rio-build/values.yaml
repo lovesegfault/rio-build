@@ -438,6 +438,12 @@ scheduler:
     hwCostSource: spot
     referenceHwClass: mid-ebs-x86
     nodeClassRef: rio-default
+    # §13b instance-shape menu per `(hw_class:cap)` cell. Rendered into
+    # the controller's `[nodeclaim_pool.instance_menu]` TOML (NOT env —
+    # nested map-of-list can't load via figment Env). Each entry:
+    # {cores, memBytes, diskBytes, pricePerVcpuHr}. Empty default keeps
+    # the reconciler inert until xtask populates it.
+    instanceMenu: {}
     leadTimeSeed:
       "hi-ebs-arm:od": 17.0
       "hi-ebs-arm:spot": 18.0
@@ -578,6 +584,7 @@ karpenter:
   # the 12 pools).
   nodeclaimPool:
     enabled: false
+    leaseName: rio-controller-nodeclaim-pool
   clusterName: ""   # from tofu output cluster_name
   nodeRoleName: ""  # from tofu output karpenter_node_role_name
   # ADR-021: NixOS node AMI (full cutover — no Bottlerocket). The

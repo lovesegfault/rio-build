@@ -741,12 +741,14 @@ in
   # `vm-sla-sizing-*` variant — sla-sizing.nix is standalone-tied;
   # this is k3s+kubectl-only).
   #
-  # `controller.extraEnv` injects the `RIO_NODECLAIM_POOL__*` config
-  # directly: helm doesn't yet have first-class chart values for the
-  # nested instance_menu (the EKS deploy passes it via xtask). One
-  # `vmtest:spot` cell with one menu entry covering vmtest-full's
-  # max_cores=16 / max_mem=2Gi keeps `placement_sim_mismatch_total
-  # {reason=menu_gap}` unreachable.
+  # nodeclaim_pool config flows through the chart's first-class values:
+  # `karpenter.nodeclaimPool.enabled` + `scheduler.sla.{instanceMenu,
+  # leadTimeSeed,maxFleetCores,...}` render into the rio-controller-config
+  # ConfigMap's `[nodeclaim_pool]` TOML table (instance_menu is a nested
+  # map-of-list — figment's Env provider only yields strings, so the
+  # ConfigMap mount is the ONLY load path). One `vmtest:spot` cell with
+  # one menu entry covering vmtest-full's max_cores=16 / max_mem=2Gi
+  # keeps `placement_sim_mismatch_total{reason=menu_gap}` unreachable.
   #
   # r[verify ctrl.nodeclaim.ffd-sim]
   # r[verify ctrl.nodeclaim.shim-nodepool]
@@ -760,31 +762,30 @@ in
       extraManifests = kwok.manifests;
       extraValuesTyped = {
         "packedScheduler.enabled" = true;
+        "karpenter.nodeclaimPool.enabled" = true;
       };
       extraValues = {
         "packedScheduler.image" = kwok.kubeSchedulerRef;
       };
       extraValuesFiles = [
-        # nodeclaim_pool config + a single `vmtest` hw-class so
-        # `cells_of(SpawnIntent)` is non-empty (the scheduler's
-        # `[sla.hw_classes.vmtest]` from vmtest-full.yaml emits one
-        # node_affinity term per intent). figment's Env provider parses
-        # values as TOML — nested map/seq use TOML inline-table syntax
-        # (`{k = v}` / `[{...}]`), NOT JSON (`{"k": v}`). Colon in the
-        # `vmtest:spot` cell key needs TOML key-quoting.
+        # `[sla]` overrides (vmtest-full.yaml's hwClasses.vmtest already
+        # populates `cells_of(SpawnIntent)`). max_fleet_cores capped at
+        # 64 so a runaway tick can't request more than the KWOK fixture
+        # synthesizes. Colon in `vmtest:spot` cell key needs YAML
+        # key-quoting.
         (pkgs.writeText "kwok-nodeclaim-pool.yaml" ''
-          controller:
-            extraEnv:
-              - {name: RIO_NODECLAIM_POOL__ENABLED, value: "true"}
-              - {name: RIO_NODECLAIM_POOL__DATABASE_URL, value: "postgresql://postgres:rio@rio-postgresql.rio-store:5432/rio"}
-              - {name: RIO_NODECLAIM_POOL__LEASE_NAME, value: "rio-controller-nodeclaim-pool"}
-              - {name: RIO_NODECLAIM_POOL__NODE_CLASS_REF, value: "rio-default"}
-              - {name: RIO_NODECLAIM_POOL__MAX_FLEET_CORES, value: "64"}
-              - {name: RIO_NODECLAIM_POOL__MAX_NODE_CLAIMS_PER_CELL_PER_TICK, value: "4"}
-              - name: RIO_NODECLAIM_POOL__LEAD_TIME_SEED
-                value: '{ "vmtest:spot" = 5.0 }'
-              - name: RIO_NODECLAIM_POOL__INSTANCE_MENU
-                value: '{ "vmtest:spot" = [{ instance_type = "kwok.2xlarge", cores = 16, mem_bytes = 4294967296, disk_bytes = 21474836480, price_per_vcpu_hr = 0.01 }] }'
+          scheduler:
+            sla:
+              maxFleetCores: 64
+              maxNodeClaimsPerCellPerTick: 4
+              leadTimeSeed:
+                "vmtest:spot": 5.0
+              instanceMenu:
+                "vmtest:spot":
+                  - cores: 16
+                    memBytes: 4294967296
+                    diskBytes: 21474836480
+                    pricePerVcpuHr: 0.01
         '')
       ];
     };
