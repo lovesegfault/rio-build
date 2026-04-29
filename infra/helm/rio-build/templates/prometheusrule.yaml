@@ -66,7 +66,10 @@ spec:
         # kube-scheduler ignores kube-build-scheduler pods so they stay
         # Pending forever — page-worthy.
         - alert: KubeBuildSchedulerPendingStuck
-          expr: scheduler_pending_pods{queue="active",profile="kube-build-scheduler"} > 0
+          # Upstream `scheduler_pending_pods` is labeled by `queue` only
+          # (process-global SchedulingQueue, not per-profile). Select by
+          # the ServiceMonitor's `job` label instead.
+          expr: scheduler_pending_pods{queue="active",job="kube-build-scheduler"} > 0
           for: 60s
           labels:
             severity: warning
@@ -149,7 +152,10 @@ spec:
         # concurrently means an AZ/quota/AMI-tag problem and the
         # admissible-set is shrinking toward `_hw_ladder_exhausted`.
         - alert: RioNodeclaimPoolIceMaskedHigh
-          expr: count(sum by (cell) (rate(rio_controller_nodeclaim_reaped_total{reason="ice"}[5m])) > 0) >= 3
+          # Both ICE-mask paths feed `report_unfulfillable`: `classify`
+          # emits reason=ice; `detect_vanished` (Karpenter ~1s GC outpaces
+          # the 10s tick) emits reason=vanished. Match both.
+          expr: count(sum by (cell) (rate(rio_controller_nodeclaim_reaped_total{reason=~"ice|vanished"}[5m])) > 0) >= 3
           for: 5m
           labels:
             severity: warning
@@ -161,24 +167,27 @@ spec:
               controller logs for InsufficientInstanceCapacity / quota,
               and `rio_scheduler_sla_hw_ladder_exhausted_total`.
 
-        # ADR-023 §13b: a cell has in-flight NodeClaims (created, not
-        # Registered) for >90s — ~3× the probe-boot leadTimeSeed (17-21s).
-        # Either Launched=False (ICE — see reaped{reason=ice}) or
-        # Launched=True but kubelet never joined (AMI/nodeadm/CNI break).
-        # Registered nodes are the FFD-placeable set; stuck inflight =
-        # builder Jobs gate-starved.
+        # ADR-023 §13b: oldest in-flight NodeClaim (created, not
+        # Registered) is >90s — ~3× the probe-boot leadTimeSeed (17-21s).
+        # Keys on per-cell max age, NOT count: under sustained scale-up
+        # the inflight count never touches 0 even when every individual
+        # claim registers in ~18s, so a count-based `for: 90s` fires on
+        # every healthy burst. Either Launched=False (ICE — see
+        # reaped{reason=ice|vanished}) or Launched=True but kubelet never
+        # joined (AMI/nodeadm/CNI break).
         - alert: RioNodeclaimPoolStuckPending
-          expr: rio_controller_nodeclaim_live{state="inflight"} > 0
-          for: 90s
+          expr: rio_controller_nodeclaim_inflight_age_max_seconds > 90
+          for: 30s
           labels:
             severity: warning
           annotations:
             summary: "NodeClaim stuck pre-Registered ({{`{{ $labels.cell }}`}})"
             description: >-
-              cell={{`{{ $labels.cell }}`}} has {{`{{ $value | humanize }}`}}
-              NodeClaim(s) in-flight for >90s (~3× leadTimeSeed). Check
+              cell={{`{{ $labels.cell }}`}} has a NodeClaim
+              {{`{{ $value | humanizeDuration }}`}} past creation without
+              Registered=True (~3× leadTimeSeed is ~60s). Check
               `kubectl get nodeclaims` Launched/Registered conditions and
-              rio_controller_nodeclaim_reaped_total{reason=ice|boot-timeout}.
+              rio_controller_nodeclaim_reaped_total{reason=ice|boot-timeout|vanished}.
 
         # Forward-compat: rio_store_putpath_retries_total lands in P0539d.
         # Until then this expr evaluates empty (no series) → never fires.

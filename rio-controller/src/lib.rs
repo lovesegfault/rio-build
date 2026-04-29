@@ -200,6 +200,13 @@ pub fn describe_metrics() {
          inflight stuck high = check reaped_total{reason=ice|boot-timeout}."
     );
     describe_gauge!(
+        "rio_controller_nodeclaim_inflight_age_max_seconds",
+        "Oldest in-flight NodeClaim per `cell` (now − metadata.creationTimestamp; \
+         0 when none in-flight). The per-claim age the StuckPending alert keys on \
+         — the inflight count never touches 0 under sustained scale-up, so \
+         count-based `for: 90s` fires on healthy bursts."
+    );
+    describe_gauge!(
         "rio_controller_ffd_unplaced_cores",
         "Σ SpawnIntent.cores per `cell` left unplaced by the FFD simulation \
          at the last tick. cover_deficit's per-cell input. Non-zero with \

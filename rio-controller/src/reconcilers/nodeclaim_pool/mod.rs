@@ -523,7 +523,7 @@ impl NodeClaimPoolReconciler {
             live = live.len(),
             "FFD simulation"
         );
-        self.emit_tick_gauges(&live, &placeable, &unplaced);
+        self.emit_tick_gauges(&live, &placeable, &unplaced, now);
         // r[impl ctrl.nodeclaim.placeable-gate]
         // Publish `intent_id`s FFD-placed on a `Registered=True` node
         // (`in_flight == false`). The `pool/jobs` reconciler retains
@@ -620,10 +620,11 @@ impl NodeClaimPoolReconciler {
         live: &[ffd::LiveNode],
         placeable: &[ffd::Placement],
         unplaced: &[SpawnIntent],
+        now_secs: f64,
     ) {
         use std::collections::BTreeMap;
-        // (registered, inflight) per cell.
-        let mut by_state: BTreeMap<Cell, (u64, u64)> = BTreeMap::new();
+        // (registered, inflight, max-inflight-age) per cell.
+        let mut by_state: BTreeMap<Cell, (u64, u64, f64)> = BTreeMap::new();
         for n in live {
             let Some(c) = n.cell.clone() else { continue };
             let e = by_state.entry(c).or_default();
@@ -631,6 +632,7 @@ impl NodeClaimPoolReconciler {
                 e.0 += 1;
             } else {
                 e.1 += 1;
+                e.2 = e.2.max(n.age_secs(now_secs).unwrap_or(0.0));
             }
         }
         // Σ unplaced cores per cheapest-A_open cell — same assignment
@@ -646,13 +648,16 @@ impl NodeClaimPoolReconciler {
         );
         for cell in self.cfg.all_cells(&self.hw_config) {
             let label = cell.to_string();
-            let (reg, inf) = by_state.get(&cell).copied().unwrap_or((0, 0));
+            let (reg, inf, age) = by_state.get(&cell).copied().unwrap_or((0, 0, 0.0));
             metrics::gauge!("rio_controller_nodeclaim_live",
                 "cell" => label.clone(), "state" => "registered")
             .set(reg as f64);
             metrics::gauge!("rio_controller_nodeclaim_live",
                 "cell" => label.clone(), "state" => "inflight")
             .set(inf as f64);
+            metrics::gauge!("rio_controller_nodeclaim_inflight_age_max_seconds",
+                "cell" => label.clone())
+            .set(age);
             let unplaced_cores: u32 = by_cell
                 .get(&cell)
                 .map(|v| v.iter().map(|i| i.cores).sum())

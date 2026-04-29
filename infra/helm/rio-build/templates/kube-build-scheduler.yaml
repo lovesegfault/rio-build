@@ -88,6 +88,13 @@ spec:
             - kube-scheduler
             - --config=/etc/kubernetes/config.yaml
             - --v=2
+            # Prometheus scrapes /metrics with its own SA token, not a
+            # SubjectAccessReview-authorized identity. always-allow makes
+            # the path bypass the kube-scheduler's delegated authorizer.
+            - --authorization-always-allow-paths=/metrics
+          ports:
+            - name: https-metrics
+              containerPort: 10259
           livenessProbe:
             httpGet:
               path: /healthz
@@ -111,4 +118,46 @@ spec:
         - name: config
           configMap:
             name: kube-build-scheduler-config
+{{- if .Values.monitoring.enabled }}
+---
+# Headless metrics Service + ServiceMonitor so Prometheus scrapes :10259.
+# Without this, `scheduler_pending_pods{job="kube-build-scheduler"}` does
+# not exist and `KubeBuildSchedulerPendingStuck` can never fire.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-build-scheduler-metrics
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "kube-build-scheduler" "component" "scheduler") | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "rio.selectorLabels" "kube-build-scheduler" | nindent 4 }}
+  ports:
+    - name: https-metrics
+      port: 10259
+      targetPort: https-metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kube-build-scheduler
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "kube-build-scheduler" "component" "scheduler") | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "rio.selectorLabels" "kube-build-scheduler" | nindent 6 }}
+  endpoints:
+    - port: https-metrics
+      scheme: https
+      interval: {{ .Values.monitoring.scrapeInterval }}
+      # kube-scheduler serves a self-signed cert on :10259. The scrape is
+      # cluster-internal over Cilium-encrypted overlay; cert validation
+      # adds nothing.
+      tlsConfig:
+        insecureSkipVerify: true
+{{- end }}
 {{- end }}
