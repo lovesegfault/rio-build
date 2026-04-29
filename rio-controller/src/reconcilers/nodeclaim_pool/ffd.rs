@@ -82,10 +82,8 @@ pub struct LiveNode {
     // ~10s × N_nodes). B12 routes builder pods via `schedulerName:
     // rio-packed` so they land on these claims now; until the sum is
     // wired `free()` on a Registered node over-reports by whatever's
-    // already bound. Drift is observable as
-    // `placement_sim_mismatch_total{reason=menu_gap}` staying zero
-    // while `ffd_unplaced_cores` is high with `nodeclaim_live
-    // {state=registered}` non-zero.
+    // already bound. Drift is observable as `ffd_unplaced_cores` high
+    // with `nodeclaim_live{state=registered}` non-zero.
     pub requested: (u32, u64, u64),
     /// `metadata.creationTimestamp` as unix-epoch seconds. `None` only
     /// on a just-`create()`d object before the apiserver round-trip.
@@ -131,6 +129,19 @@ impl LiveNode {
             .iter()
             .find(|c| c.type_ == type_)
             .map(|c| (c.status.as_str(), time_secs(&c.last_transition_time)))
+    }
+
+    /// `reason` for condition `type_`. `None` ⇔ condition absent.
+    /// `health::classify` reads `Launched`'s reason to fire ICE
+    /// immediately on a terminal launch failure (Karpenter GCs the
+    /// claim ~1s after posting `LaunchFailed`, so the timeout-based
+    /// path never observes it).
+    pub fn cond_reason(&self, type_: &str) -> Option<&str> {
+        self.status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == type_)
+            .map(|c| c.reason.as_str())
     }
 
     /// Seconds since `metadata.creationTimestamp`. `None` if creation
@@ -514,15 +525,24 @@ pub(crate) mod tests {
 
     /// Set `(type, status, lastTransitionTime)` conditions on `n.status`.
     /// Built via JSON: `Condition` has non-Default `last_transition_time`.
-    pub(crate) fn with_conds(mut n: LiveNode, conds: &[(&str, &str, f64)]) -> LiveNode {
+    pub(crate) fn with_conds(n: LiveNode, conds: &[(&str, &str, f64)]) -> LiveNode {
+        let with_reason: Vec<_> = conds.iter().map(|&(ty, st, t)| (ty, st, t, "")).collect();
+        with_conds_reason(n, &with_reason)
+    }
+
+    /// As [`with_conds`] plus `reason` per condition (4th tuple field).
+    pub(crate) fn with_conds_reason(
+        mut n: LiveNode,
+        conds: &[(&str, &str, f64, &str)],
+    ) -> LiveNode {
         let cs: Vec<_> = conds
             .iter()
-            .map(|(ty, st, t)| {
+            .map(|(ty, st, t, reason)| {
                 serde_json::json!({
                     "type": ty, "status": st,
                     "lastTransitionTime": format!("1970-01-01T{:02}:{:02}:{:02}Z",
                         (*t as u64) / 3600, ((*t as u64) % 3600) / 60, (*t as u64) % 60),
-                    "reason": "", "message": "",
+                    "reason": reason, "message": "",
                 })
             })
             .collect();

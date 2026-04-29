@@ -163,36 +163,27 @@ pub fn describe_metrics() {
         "nodeclaim_pool lease lose transitions (explicit lose or local self-fence)."
     );
     describe_counter!(
-        "rio_controller_placement_sim_mismatch_total",
-        "nodeclaim_pool cover_deficit anomalies by `reason` × `cell`. \
-         reason=menu_gap: an unplaced intent's max(c,M,D) exceeds every \
-         instance_menu entry for its cell — config-load asserts the menu \
-         covers (maxCores,maxMem,maxDisk), so a non-zero rate means the \
-         scheduler is emitting out-of-spec sizing or the menu drifted."
-    );
-    describe_counter!(
         "rio_controller_nodeclaim_reaped_total",
         "nodeclaim_pool NodeClaim deletions by `reason` × `cell`. \
          reason=idle: NA-consolidate break-even; reason=ice: \
-         Launched=False past timeout; reason=boot-timeout: \
-         Launched=True ∧ Registered=False past timeout; reason=dead: \
-         scheduler-reported hung node."
+         Launched=False (timeout or terminal LaunchFailed reason); \
+         reason=boot-timeout: Launched=True ∧ Registered=False past \
+         timeout; reason=dead: scheduler-reported hung node; \
+         reason=vanished: in-flight claim Karpenter-GC'd between ticks."
     );
     describe_counter!(
         "rio_controller_nodeclaim_intent_dropped_total",
         "nodeclaim_pool cover_deficit hw-agnostic intents dropped by `reason`. \
          reason=no_menu_for_arch: intent.system maps to an arch with no \
-         configured instance_menu cell (and referenceHwClass mismatches) — \
+         configured hw-class (and referenceHwClass mismatches) — \
          the cold-start fallback could not target ANY cell. Non-zero on a \
-         dual-arch cluster = a hwClasses/instanceMenu key-set is missing \
-         one arch."
+         dual-arch cluster = a hwClasses key-set is missing one arch."
     );
     describe_counter!(
         "rio_controller_nodeclaim_created_total",
-        "nodeclaim_pool NodeClaim Api::create successes by `cell` × `shape`. \
-         shape=anchor: smallest type fitting max_U(c*,M,D); shape=bulk: cheapest \
-         $/core type meeting median_U(M/c*). Σrate(created) − Σrate(reaped) over a \
-         window ≈ fleet growth; sustained created with zero placeable_intents = \
+        "nodeclaim_pool NodeClaim Api::create successes by `cell`. \
+         Σrate(created) − Σrate(reaped) over a window ≈ fleet growth; \
+         sustained created with zero placeable_intents = \
          FFD/kube-scheduler-packed mismatch."
     );
     describe_histogram!(

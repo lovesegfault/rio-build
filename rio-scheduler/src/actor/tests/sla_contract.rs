@@ -1509,6 +1509,7 @@ async fn contract_pinned_explore_covers_pool() {
                 key: "rio.build/hw-class".into(),
                 value: "intel-9".into(),
             }],
+            ..Default::default()
         },
     );
     let m: std::collections::HashMap<_, _> = ["intel-6", "intel-7", "intel-8", "intel-9"]

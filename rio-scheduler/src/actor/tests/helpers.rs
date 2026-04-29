@@ -892,6 +892,7 @@ pub(crate) fn test_hw_sla_config() -> crate::sla::config::SlaConfig {
                     key: "rio.build/hw-class".into(),
                     value: h.into(),
                 }],
+                ..Default::default()
             },
         );
     }

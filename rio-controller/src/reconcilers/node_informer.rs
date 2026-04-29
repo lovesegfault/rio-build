@@ -68,8 +68,12 @@ const LABEL_CAPACITY_TYPE: &str = "karpenter.sh/capacity-type";
 pub struct HwClassConfig(Arc<RwLock<Vec<HwClassDef>>>);
 
 /// One `[sla.hw_classes.$h]` entry: the `$h` name + its ANDed label
-/// conjunction.
-type HwClassDef = (String, Vec<(String, String)>);
+/// conjunction + Karpenter instance-type requirements.
+type HwClassDef = (
+    String,
+    Vec<(String, String)>,
+    Vec<rio_proto::types::NodeSelectorRequirement>,
+);
 
 impl HwClassConfig {
     /// First `$h` (lexicographic) whose every `(k, v)` is satisfied by
@@ -77,7 +81,7 @@ impl HwClassConfig {
     /// (not yet loaded).
     pub fn match_node(&self, labels: &BTreeMap<String, String>) -> Option<String> {
         let cfg = self.0.read();
-        for (h, conj) in cfg.iter() {
+        for (h, conj, _) in cfg.iter() {
             if conj
                 .iter()
                 .all(|(k, v)| labels.get(k).is_some_and(|nv| nv == v))
@@ -102,12 +106,35 @@ impl HwClassConfig {
     /// `[sla.hw_classes.$h].labels` for `h` — the conjunction the
     /// scheduler's `cells_to_selector_terms` would emit. `None` if `h`
     /// is unknown OR config not yet loaded. The §13b `cover_deficit`
-    /// reads this to build NodeClaim `spec.requirements`.
+    /// stamps these on NodeClaim `metadata.labels` so the launched
+    /// Node carries `rio.build/hw-band`/`storage` (these are NOT
+    /// instance-type properties — see [`Self::requirements_for`]).
     pub fn labels_for(&self, h: &str) -> Option<Vec<(String, String)>> {
         let cfg = self.0.read();
         cfg.iter()
-            .find(|(name, _)| name == h)
-            .map(|(_, conj)| conj.clone())
+            .find(|(name, _, _)| name == h)
+            .map(|(_, conj, _)| conj.clone())
+    }
+
+    /// `[sla.hw_classes.$h].requirements` for `h` — the Karpenter
+    /// instance-type selectors (`karpenter.k8s.aws/instance-generation
+    /// In [7]`, `kubernetes.io/arch In [amd64]`, etc.). `None` if `h`
+    /// is unknown OR config not yet loaded. The §13b `cover_deficit`
+    /// reads this to build NodeClaim `spec.requirements`.
+    pub fn requirements_for(
+        &self,
+        h: &str,
+    ) -> Option<Vec<rio_proto::types::NodeSelectorRequirement>> {
+        let cfg = self.0.read();
+        cfg.iter()
+            .find(|(name, _, _)| name == h)
+            .map(|(_, _, reqs)| reqs.clone())
+    }
+
+    /// All loaded hw-class names (sorted). §13b's `all_cells` derives
+    /// the cell universe from this × `{spot, od}`.
+    pub fn names(&self) -> Vec<String> {
+        self.0.read().iter().map(|(h, _, _)| h.clone()).collect()
     }
 
     /// Whether `h`'s `kubernetes.io/arch` label equals `arch`, OR is
@@ -117,7 +144,7 @@ impl HwClassConfig {
     /// reference cell for hw-agnostic intents by `intent.system`.
     pub fn matches_arch(&self, h: &str, arch: &str) -> bool {
         let cfg = self.0.read();
-        let Some((_, conj)) = cfg.iter().find(|(name, _)| name == h) else {
+        let Some((_, conj, _)) = cfg.iter().find(|(name, _, _)| name == h) else {
             return false;
         };
         conj.iter()
@@ -132,7 +159,7 @@ impl HwClassConfig {
             .into_iter()
             .map(|(h, def)| {
                 let conj = def.labels.into_iter().map(|l| (l.key, l.value)).collect();
-                (h, conj)
+                (h, conj, def.requirements)
             })
             .collect();
         v.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -170,7 +197,8 @@ impl HwClassConfig {
         );
     }
 
-    /// Test-only constructor from `(h, [(k, v), …])` literals.
+    /// Test-only constructor from `(h, [(k, v), …])` literals
+    /// (requirements default empty).
     #[cfg(test)]
     pub fn from_literals(defs: &[(&str, &[(&str, &str)])]) -> Self {
         let mut v: Vec<_> = defs
@@ -180,7 +208,7 @@ impl HwClassConfig {
                     .iter()
                     .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                     .collect();
-                ((*h).to_string(), c)
+                ((*h).to_string(), c, vec![])
             })
             .collect();
         v.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -812,6 +840,7 @@ mod tests {
                         key: "rio.build/hw-band".into(),
                         value: "7".into(),
                     }],
+                    requirements: vec![],
                 },
             )]
             .into(),

@@ -156,6 +156,8 @@ data:
     max_fleet_cores = {{ int64 .maxFleetCores }}
     max_node_claims_per_cell_per_tick = {{ int64 .maxNodeClaimsPerCellPerTick }}
     max_lead_time = {{ printf "%.1f" (float64 .maxLeadTime) }}
+    max_node_cores = {{ int64 .maxCores }}
+    metal_sizes = {{ toJson $.Values.karpenter.metalSizes }}
     {{- with .maxConsolidationTime }}
     max_consolidation_time = {{ printf "%.1f" (float64 .) }}
     {{- end }}
@@ -164,16 +166,6 @@ data:
     [nodeclaim_pool.lead_time_seed]
     {{- range $cell, $v := . }}
     {{ $cell | quote }} = {{ printf "%.1f" (float64 $v) }}
-    {{- end }}
-    {{- end }}
-    {{- range $cell, $menu := .instanceMenu }}
-    {{- range $menu }}
-
-    [[nodeclaim_pool.instance_menu.{{ $cell | quote }}]]
-    cores = {{ int64 .cores }}
-    mem_bytes = {{ int64 .memBytes }}
-    disk_bytes = {{ int64 .diskBytes }}
-    price_per_vcpu_hr = {{ printf "%v" (float64 .pricePerVcpuHr) }}
     {{- end }}
     {{- end }}
     {{- end }}

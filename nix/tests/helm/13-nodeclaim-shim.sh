@@ -44,11 +44,14 @@ for p in rio-fetcher rio-general rio-builder-metal; do
   }
 done
 
-# ── enabled=false (default): 12 band pools render, shim absent.
+# ── enabled=false: 12 band pools render, shim absent. The chart
+# default is now enabled=true (9e5b267b); set explicitly so the
+# legacy-mode branch stays exercised.
 off=$TMPDIR/shim-off.yaml
-helm template rio . "${karp_args[@]}" >"$off"
+helm template rio . "${karp_args[@]}" \
+  --set karpenter.nodeclaimPool.enabled=false >"$off"
 
-n=$(pools_of "$off" | grep -Ec '^rio-builder-(hi|mid|lo)-(ebs|nvme)-(x86|aarch64)$')
+n=$(pools_of "$off" | grep -Ec '^rio-builder-(hi|mid|lo)-(ebs|nvme)-(x86|aarch64)$' || true)
 test "$n" -eq 12 || {
   echo "FAIL: default render expected 12 band×storage×arch pools, got $n:" >&2
   pools_of "$off" >&2

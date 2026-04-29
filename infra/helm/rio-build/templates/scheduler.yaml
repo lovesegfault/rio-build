@@ -227,6 +227,11 @@ data:
       { key = {{ .key | quote }}, value = {{ .value | quote }} },
       {{- end }}
     ]
+    requirements = [
+      {{- range $def.requirements }}
+      { key = {{ .key | quote }}, operator = {{ .operator | quote }}, values = {{ toJson .values }} },
+      {{- end }}
+    ]
     {{- end }}
 
     [sla.probe]

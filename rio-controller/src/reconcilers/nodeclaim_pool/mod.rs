@@ -49,7 +49,7 @@ use crate::reconcilers::node_informer::HwClassConfig;
 use crate::reconcilers::{AdminClient, admin_call};
 
 pub use consolidate::{HOLD_OPEN_ANNOTATION, IdleGapEvent};
-pub use cover::{InstanceType, NODEPOOL_LABEL, SHIM_NODEPOOL};
+pub use cover::{NODEPOOL_LABEL, SHIM_NODEPOOL};
 pub use ffd::{
     ARCH_LABEL, CAPACITY_TYPE_LABEL, HW_CLASS_LABEL, LiveNode, Placement, a_open, cells_of,
     system_to_arch,
@@ -214,39 +214,19 @@ pub struct NodeClaimPoolConfig {
     /// `2×halflife` a sample has aged out entirely. Helm: not surfaced;
     /// 6h default per ADR §13b.
     pub sketch_halflife_secs: u64,
-    /// `(hw_class:cap)` → instance-shape menu for §13b anchor+bulk
-    /// selection. Helm: `sla.instanceMenu`. The controller does NOT
-    /// run the scheduler's live spot-price poll; `price_per_vcpu_hr`
-    /// is the static seed (relative ranking only). Validated when
-    /// `enabled` (every cell's max menu entry covers
-    /// `(maxCores,maxMem,maxDisk)` so the
-    /// `placement_sim_mismatch_total{reason=menu_gap}` path is
-    /// prod-unreachable).
-    pub instance_menu: HashMap<String, Vec<InstanceType>>,
+    /// Per-NodeClaim `resources.requests.cpu` ceiling. `cover_deficit`
+    /// chunks a cell's `Σcores` deficit into ⌈Σ/this⌉ claims. Helm:
+    /// `sla.maxCores` (the same ceiling the scheduler caps individual
+    /// intents at, so a single intent always fits one claim).
+    pub max_node_cores: u32,
+    /// `karpenter.k8s.aws/instance-size NotIn` values appended to
+    /// every NodeClaim's `spec.requirements` — the metal partition
+    /// (I-205). Helm: `karpenter.metalSizes`. Empty (kwok/vmtest) → no
+    /// instance-size requirement emitted.
+    pub metal_sizes: Vec<String>,
 }
 
 impl NodeClaimPoolConfig {
-    /// Menu for `cell` (empty if unconfigured — caller emits the
-    /// `menu_gap` metric).
-    pub fn menu(&self, cell: &Cell) -> &[InstanceType] {
-        self.instance_menu
-            .get(&cell.to_string())
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
-    }
-
-    /// Min `price_per_vcpu_hr` across `cell`'s menu — what
-    /// `cover::assign_to_cells` ranks cheapest-open by. `f64::MAX`
-    /// for an unconfigured cell so it's never picked over a configured
-    /// one.
-    pub fn cell_price(&self, cell: &Cell) -> f64 {
-        self.menu(cell)
-            .iter()
-            .map(|t| t.price_per_vcpu_hr)
-            .min_by(f64::total_cmp)
-            .unwrap_or(f64::MAX)
-    }
-
     /// `lead_time_seed[cell]` (seconds). 0 for unconfigured cells —
     /// callers use this as a floor so 0 degenerates to "no floor".
     pub fn seed_for(&self, cell: &Cell) -> f64 {
@@ -260,9 +240,9 @@ impl NodeClaimPoolConfig {
     /// (`hw_class_names=[]`, i.e. `fit=None`): the
     /// `(referenceHwClass, Spot)` cell when its `kubernetes.io/arch`
     /// label matches `intent.system` (or is absent — arch-agnostic
-    /// hw-class), else the cheapest [`Self::cell_price`] cell whose
-    /// hw-class arch matches. `None` ⇔ `system` unmappable OR no
-    /// configured cell hosts that arch (caller emits
+    /// hw-class), else the first (sorted) hw-class whose arch matches.
+    /// `None` ⇔ `system` unmappable OR no configured hw-class hosts
+    /// that arch (caller emits
     /// `rio_controller_nodeclaim_intent_dropped_total
     /// {reason=no_menu_for_arch}`).
     ///
@@ -271,27 +251,24 @@ impl NodeClaimPoolConfig {
     /// tick`; on-demand fallback would defeat the §13b cost model.
     pub fn fallback_cell(&self, i: &SpawnIntent, hw: &HwClassConfig) -> Option<Cell> {
         let arch = ffd::system_to_arch(&i.system)?;
-        let ref_cell = Cell(self.reference_hw_class.clone(), CapacityType::Spot);
-        if hw.matches_arch(&ref_cell.0, arch) && !self.menu(&ref_cell).is_empty() {
-            return Some(ref_cell);
+        if hw.matches_arch(&self.reference_hw_class, arch) {
+            return Some(Cell(self.reference_hw_class.clone(), CapacityType::Spot));
         }
-        self.all_cells()
+        hw.names()
             .into_iter()
-            .filter(|c| hw.matches_arch(&c.0, arch))
-            .min_by(|a, b| self.cell_price(a).total_cmp(&self.cell_price(b)))
+            .find(|h| hw.matches_arch(h, arch))
+            .map(|h| Cell(h, CapacityType::Spot))
     }
 
-    /// All configured cells (parsed from `instance_menu` keys), for
-    /// round-robin iteration. Malformed keys are skipped + warned.
-    pub fn all_cells(&self) -> Vec<Cell> {
-        self.instance_menu
-            .keys()
-            .filter_map(|k| {
-                let c = Cell::parse(k);
-                if c.is_none() {
-                    warn!(key = %k, "instance_menu key not parseable as h:cap; skipping");
-                }
-                c
+    /// All configured cells (`hw_classes × {spot, od}`), for
+    /// round-robin iteration and per-cell gauges. Derived from the
+    /// loaded [`HwClassConfig`] (not from `lead_time_seed` keys —
+    /// those may be a subset).
+    pub fn all_cells(&self, hw: &HwClassConfig) -> Vec<Cell> {
+        hw.names()
+            .into_iter()
+            .flat_map(|h| {
+                [CapacityType::Spot, CapacityType::OnDemand].map(move |c| Cell(h.clone(), c))
             })
             .collect()
     }
@@ -316,7 +293,9 @@ impl Default for NodeClaimPoolConfig {
             max_consolidation_time: None,
             lead_time_seed: HashMap::new(),
             sketch_halflife_secs: 6 * 3600,
-            instance_menu: HashMap::new(),
+            // Matches helm `sla.maxCores` default (64).
+            max_node_cores: 64,
+            metal_sizes: Vec::new(),
         }
     }
 }
@@ -362,6 +341,15 @@ pub struct NodeClaimPoolReconciler {
     /// tick. In-memory only — a restart re-records the live set's boot
     /// times once (a few duplicate samples in a DDSketch is harmless).
     recorded_boot: HashSet<String>,
+    /// `name → cell` for NodeClaims `cover_deficit` created and that
+    /// haven't yet appeared `Registered`/reaped. Next-tick diff against
+    /// `live`: a name in here but absent from `live` ⇒ Karpenter GC'd
+    /// it (`Launched=False reason=LaunchFailed/InsufficientCapacity` →
+    /// delete in ~1s, faster than the 10s tick). [`health::classify`]'s
+    /// `Launched=False > timeout` never fires for those — the claim is
+    /// gone before it's observed. ICE-masked via
+    /// [`health::detect_vanished`].
+    inflight_created: HashMap<String, Cell>,
     /// Count of consecutive ticks where `GetSpawnIntents` returned ⊥
     /// (RPC error). Saturates at `u8::MAX`; reset on first success.
     consecutive_bot_ticks: u8,
@@ -408,6 +396,7 @@ impl NodeClaimPoolReconciler {
             placeable_tx,
             sketches,
             recorded_boot: HashSet::new(),
+            inflight_created: HashMap::new(),
             consecutive_bot_ticks: 0,
             tick_counter: 0,
         }
@@ -531,8 +520,12 @@ impl NodeClaimPoolReconciler {
         let now = now_epoch();
         // Reap unhealthy/ICE BEFORE cover_deficit so cells that just
         // hit ICE this tick are masked in the same tick's cover (don't
-        // immediately re-create what we just deleted).
-        let ice_cells = health::reap_unhealthy(
+        // immediately re-create what we just deleted). `reap_unhealthy`
+        // catches `Launched=False reason=LaunchFailed` claims still IN
+        // `live`; `detect_vanished` catches claims Karpenter already
+        // GC'd between ticks (the ~1s GC < 10s tick race the live
+        // Part-B finding hit).
+        let mut ice_cells = health::reap_unhealthy(
             &self.nodeclaims,
             &live,
             &intents.dead_nodes,
@@ -541,11 +534,13 @@ impl NodeClaimPoolReconciler {
             now,
         )
         .await?;
+        ice_cells.extend(health::detect_vanished(&mut self.inflight_created, &live));
         let mut masked: Vec<String> = intents.ice_masked_cells.clone();
         masked.extend(ice_cells.iter().map(Cell::to_string));
 
         let cover = self.cover_deficit(&unplaced, &live, &masked).await?;
         debug!(created = cover.created.len(), "deficit cover");
+        self.inflight_created.extend(cover.created.iter().cloned());
         self.report_unfulfillable(&ice_cells, &registered_cells)
             .await?;
 
@@ -617,13 +612,16 @@ impl NodeClaimPoolReconciler {
         }
         // Σ unplaced cores per cheapest-A_open cell — same assignment
         // cover_deficit uses, so the gauge equals cover's per-cell input.
+        // No mask: the gauge shows raw demand; ICE-masking is a cover
+        // policy, not a demand metric.
         let (by_cell, _) = cover::assign_to_cells(
             unplaced,
             &self.sketches,
-            |c| self.cfg.cell_price(c),
+            &HashSet::new(),
+            cover::cell_rank,
             |i| self.cfg.fallback_cell(i, &self.hw_config),
         );
-        for cell in self.cfg.all_cells() {
+        for cell in self.cfg.all_cells(&self.hw_config) {
             let label = cell.to_string();
             let (reg, inf) = by_state.get(&cell).copied().unwrap_or((0, 0));
             metrics::gauge!("rio_controller_nodeclaim_live",
@@ -668,21 +666,20 @@ impl NodeClaimPoolReconciler {
         Ok(list.items.into_iter().map(ffd::LiveNode::from).collect())
     }
 
-    /// §13b anchor+bulk deficit cover.
+    /// §13b deficit cover.
     ///
     /// 1. Group `unplaced` by cheapest cell in each intent's `A_open`
-    ///    (`cover::assign_to_cells`). hw-agnostic intents
-    ///    (`hw_class_names=[]`, cold-start `fit=None`) route to
-    ///    [`NodeClaimPoolConfig::fallback_cell`] — the
-    ///    `(referenceHwClass, Spot)` cell of `intent.system`'s arch —
-    ///    so the spawn-intent fan-out scenario provisions on the
-    ///    reference cell and FFD drains it as nodes register.
+    ///    (`cover::assign_to_cells`). ICE-masked cells are filtered
+    ///    from `A_open` so an intent fails over to its OD variant.
+    ///    hw-agnostic intents (`hw_class_names=[]`, cold-start
+    ///    `fit=None`) route to [`NodeClaimPoolConfig::fallback_cell`].
     /// 2. Round-robin `cfg.all_cells()` from `tick_counter` so no cell
     ///    starves under sustained pressure.
-    /// 3. Per cell with deficit (∉ `ice_masked`): pick anchor =
-    ///    smallest fitting `max_U(c*,M,D)`, bulk = cheapest meeting
-    ///    `median_U(M/c*)`; mint `N = min(need, per_tick_cap,
-    ///    budget_fit)` NodeClaims (1×anchor + (N−1)×bulk).
+    /// 3. Per cell with deficit: sum `(Σc, Σm, max d)` over the cell's
+    ///    intents; mint `N = min(⌈Σc/max_node_cores⌉, per_tick_cap,
+    ///    budget_fit)` NodeClaims, each requesting `(chunk, Σm/N,
+    ///    max d)`. Karpenter resolves each against the hw-class's
+    ///    `requirements` to pick the instance type.
     /// 4. `budget = max_fleet_cores − Σ live.allocatable.cpu −
     ///    created_this_tick`. The sum covers both Registered AND
     ///    in-flight claims so a slow-to-register burst doesn't
@@ -705,12 +702,10 @@ impl NodeClaimPoolReconciler {
         let live_cores: u32 = live.iter().map(|n| n.allocatable.0).sum();
         let mut created_cores = 0u32;
 
-        let (by_cell, dropped) = cover::assign_to_cells(
-            unplaced,
-            &self.sketches,
-            |c| self.cfg.cell_price(c),
-            |i| self.cfg.fallback_cell(i, &self.hw_config),
-        );
+        let (by_cell, dropped) =
+            cover::assign_to_cells(unplaced, &self.sketches, &ice, cover::cell_rank, |i| {
+                self.cfg.fallback_cell(i, &self.hw_config)
+            });
         if dropped > 0 {
             metrics::counter!(
                 "rio_controller_nodeclaim_intent_dropped_total",
@@ -718,7 +713,8 @@ impl NodeClaimPoolReconciler {
             )
             .increment(dropped);
         }
-        let order = cover::cells_round_robin(self.cfg.all_cells(), self.tick_counter);
+        let order =
+            cover::cells_round_robin(self.cfg.all_cells(&self.hw_config), self.tick_counter);
 
         let mut created = Vec::new();
         for cell in &order {
@@ -728,72 +724,57 @@ impl NodeClaimPoolReconciler {
             let Some(u) = by_cell.get(cell) else {
                 continue;
             };
-            let menu = self.cfg.menu(cell);
-            let (max_c, max_m, max_d) = u.iter().fold((0, 0, 0), |(c, m, d), i| {
-                (c.max(i.cores), m.max(i.mem_bytes), d.max(i.disk_bytes))
-            });
-            let Some(anchor) = cover::pick_anchor(menu, max_c, max_m, max_d) else {
-                metrics::counter!(
-                    "rio_controller_placement_sim_mismatch_total",
-                    "reason" => "menu_gap",
-                    "cell" => cell.to_string(),
-                )
-                .increment(1);
-                continue;
-            };
-            let med_ratio = cover::median(
-                u.iter()
-                    .filter(|i| i.cores > 0)
-                    .map(|i| i.mem_bytes as f64 / f64::from(i.cores))
-                    .collect(),
-            );
-            let bulk = cover::pick_bulk(menu, med_ratio, anchor);
-            let sum_c: u32 = u.iter().map(|i| i.cores).sum();
+            let (sum_c, sum_m, max_d) = cover::sum_deficit(u);
             let budget = self
                 .cfg
                 .max_fleet_cores
                 .saturating_sub(live_cores)
                 .saturating_sub(created_cores);
-            let n = cover::claim_count(
+            let (n, chunk) = cover::claim_count(
                 sum_c,
-                anchor.cores,
-                bulk.cores,
+                self.cfg.max_node_cores,
                 self.cfg.max_node_claims_per_cell_per_tick,
                 budget,
             );
             if n == 0 {
-                debug!(%cell, budget, anchor = anchor.cores, "fleet-core budget exhausted");
+                debug!(%cell, budget, sum_c, "fleet-core budget exhausted");
                 continue;
             }
             let Some(hw_labels) = self.hw_config.labels_for(&cell.0) else {
                 warn!(hw_class = %cell.0, "no hw-class labels (GetHwClassConfig not loaded?); skipping");
                 continue;
             };
-            for k in 0..n {
-                let (shape, shape_label) = if k == 0 {
-                    (anchor, "anchor")
-                } else {
-                    (bulk, "bulk")
-                };
-                let nc = cover::build_nodeclaim(cell, shape, &hw_labels, &self.cfg.node_class_ref);
+            let hw_reqs = self.hw_config.requirements_for(&cell.0).unwrap_or_default();
+            // Per-claim mem: Σm spread evenly. max_d as-is (each pod's
+            // disk allocates independently, so the claim need only fit
+            // the largest).
+            let mem_per = sum_m / u64::from(n);
+            for _ in 0..n {
+                let nc = cover::build_nodeclaim(
+                    cell,
+                    (chunk, mem_per, max_d),
+                    &hw_labels,
+                    &hw_reqs,
+                    &self.cfg.metal_sizes,
+                    &self.cfg.node_class_ref,
+                );
                 match self.nodeclaims.create(&PostParams::default(), &nc).await {
                     Ok(out) => {
                         let name = out.metadata.name.unwrap_or_default();
-                        debug!(%cell, %name, cores = shape.cores, "NodeClaim created");
+                        debug!(%cell, %name, cores = chunk, "NodeClaim created");
                         metrics::counter!(
                             "rio_controller_nodeclaim_created_total",
                             "cell" => cell.to_string(),
-                            "shape" => shape_label,
                         )
                         .increment(1);
-                        created.push(name);
+                        created.push((name, cell.clone()));
                     }
                     Err(e) => {
                         warn!(%cell, error = %e, "NodeClaim create failed; skipping");
                     }
                 }
             }
-            created_cores += anchor.cores + (n - 1) * bulk.cores;
+            created_cores += n * chunk;
         }
         Ok(CoverResult { created })
     }
@@ -829,8 +810,11 @@ impl NodeClaimPoolReconciler {
 /// Result of one [`NodeClaimPoolReconciler::cover_deficit`] tick.
 #[derive(Debug, Default)]
 pub(crate) struct CoverResult {
-    /// NodeClaim names created this tick.
-    pub created: Vec<String>,
+    /// `(name, cell)` for NodeClaims created this tick. Fed into
+    /// `inflight_created` so next tick's [`health::detect_vanished`]
+    /// can ICE-mask cells whose claims Karpenter GC'd before we
+    /// observed them.
+    pub created: Vec<(String, Cell)>,
 }
 
 /// Connect the reconciler's PG pool. Separate from the scheduler/store
@@ -871,18 +855,15 @@ mod tests {
     }
 
     /// `fallback_cell`: prefers `(reference_hw_class, Spot)` when its
-    /// arch matches; else cheapest configured cell of matching arch;
+    /// arch matches; else first (sorted) hw-class of matching arch;
     /// else `None`. Arch-agnostic hw-class (no `kubernetes.io/arch`
     /// label) matches any arch.
     #[test]
-    fn fallback_cell_reference_then_cheapest_by_arch() {
-        const GI: u64 = 1 << 30;
-        let mut cfg = cfg_with_menu(&[
-            ("mid-ebs-x86:spot", &[(8, 32 * GI, 100 * GI, 0.04)]),
-            ("lo-ebs-arm:spot", &[(4, 16 * GI, 100 * GI, 0.02)]),
-            ("hi-ebs-arm:spot", &[(8, 32 * GI, 100 * GI, 0.06)]),
-        ]);
-        cfg.reference_hw_class = "mid-ebs-x86".into();
+    fn fallback_cell_reference_then_first_by_arch() {
+        let cfg = NodeClaimPoolConfig {
+            reference_hw_class: "mid-ebs-x86".into(),
+            ..Default::default()
+        };
         let hw = HwClassConfig::from_literals(&[
             ("mid-ebs-x86", &[(ARCH_LABEL, "amd64")]),
             ("lo-ebs-arm", &[(ARCH_LABEL, "arm64")]),
@@ -897,21 +878,23 @@ mod tests {
             cfg.fallback_cell(&i("x86_64-linux"), &hw),
             Some(Cell("mid-ebs-x86".into(), CapacityType::Spot))
         );
-        // aarch64 → reference is amd64, so cheapest arm cell wins.
+        // aarch64 → reference is amd64; first sorted arm cell wins.
         assert_eq!(
             cfg.fallback_cell(&i("aarch64-linux"), &hw),
-            Some(Cell("lo-ebs-arm".into(), CapacityType::Spot))
+            Some(Cell("hi-ebs-arm".into(), CapacityType::Spot))
         );
         // Unmappable system → None.
         assert_eq!(cfg.fallback_cell(&i("builtin"), &hw), None);
         assert_eq!(cfg.fallback_cell(&i(""), &hw), None);
-        // No matching-arch cell configured → None.
-        let cfg2 = cfg_with_menu(&[("mid-ebs-x86:spot", &[(8, 32 * GI, 100 * GI, 0.04)])]);
-        assert_eq!(cfg2.fallback_cell(&i("aarch64-linux"), &hw), None);
+        // No matching-arch hw-class loaded → None.
+        let hw2 = HwClassConfig::from_literals(&[("mid-ebs-x86", &[(ARCH_LABEL, "amd64")])]);
+        assert_eq!(cfg.fallback_cell(&i("aarch64-linux"), &hw2), None);
         // Arch-agnostic reference (no arch label) matches any system —
         // the kwok `vmtest` fixture case.
-        let mut cfg3 = cfg_with_menu(&[("vmtest:spot", &[(16, 4 * GI, 20 * GI, 0.01)])]);
-        cfg3.reference_hw_class = "vmtest".into();
+        let cfg3 = NodeClaimPoolConfig {
+            reference_hw_class: "vmtest".into(),
+            ..Default::default()
+        };
         let hw3 =
             HwClassConfig::from_literals(&[("vmtest", &[("kubernetes.io/hostname", "agent")])]);
         assert_eq!(
@@ -937,64 +920,25 @@ mod tests {
         assert!(r.created.is_empty());
     }
 
-    type MenuLit = (u32, u64, u64, f64);
-    fn cfg_with_menu(menus: &[(&str, &[MenuLit])]) -> NodeClaimPoolConfig {
-        let instance_menu = menus
-            .iter()
-            .map(|(k, m)| {
-                let v = m
-                    .iter()
-                    .map(|&(cores, mem, disk, p)| InstanceType {
-                        cores,
-                        mem_bytes: mem,
-                        disk_bytes: disk,
-                        price_per_vcpu_hr: p,
-                    })
-                    .collect();
-                ((*k).to_string(), v)
-            })
-            .collect();
-        NodeClaimPoolConfig {
-            instance_menu,
-            ..Default::default()
-        }
-    }
-
+    /// `all_cells` = hw-class names × {spot, od}.
     #[test]
-    fn config_menu_and_cell_price() {
-        const GI: u64 = 1 << 30;
-        let cfg = cfg_with_menu(&[
-            (
-                "h1:spot",
-                &[(4, 16 * GI, 100 * GI, 0.04), (8, 32 * GI, 100 * GI, 0.03)],
-            ),
-            ("h2:od", &[(16, 64 * GI, 200 * GI, 0.10)]),
+    fn all_cells_derives_from_hw_config() {
+        let cfg = NodeClaimPoolConfig::default();
+        let hw = HwClassConfig::from_literals(&[
+            ("h1", &[(ARCH_LABEL, "amd64")]),
+            ("h2", &[(ARCH_LABEL, "arm64")]),
         ]);
-        let h1 = Cell("h1".into(), CapacityType::Spot);
-        let h2 = Cell("h2".into(), CapacityType::OnDemand);
-        assert_eq!(cfg.menu(&h1).len(), 2);
-        assert_eq!(cfg.menu(&h2).len(), 1);
-        assert!(
-            cfg.menu(&Cell("nope".into(), CapacityType::Spot))
-                .is_empty()
-        );
-        // cell_price = min over menu.
-        assert!((cfg.cell_price(&h1) - 0.03).abs() < 1e-12);
-        assert!((cfg.cell_price(&h2) - 0.10).abs() < 1e-12);
-        // Unconfigured cell → MAX so it's never cheapest.
-        assert_eq!(
-            cfg.cell_price(&Cell("x".into(), CapacityType::Spot)),
-            f64::MAX
-        );
-        // all_cells parses keys; sort for stable assert.
-        let mut cells = cfg.all_cells();
+        let mut cells = cfg.all_cells(&hw);
         cells.sort();
-        assert_eq!(cells, vec![h1, h2]);
-    }
-
-    #[test]
-    fn config_all_cells_skips_malformed() {
-        let cfg = cfg_with_menu(&[("good:spot", &[(4, 1, 1, 0.04)]), ("bad-key", &[])]);
-        assert_eq!(cfg.all_cells().len(), 1);
+        assert_eq!(
+            cells,
+            vec![
+                Cell("h1".into(), CapacityType::Spot),
+                Cell("h1".into(), CapacityType::OnDemand),
+                Cell("h2".into(), CapacityType::Spot),
+                Cell("h2".into(), CapacityType::OnDemand),
+            ]
+        );
+        assert!(cfg.all_cells(&HwClassConfig::default()).is_empty());
     }
 }

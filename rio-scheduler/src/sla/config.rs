@@ -12,13 +12,38 @@ use serde::{Deserialize, Serialize};
 use super::solve::{Ceilings, Tier};
 
 // r[impl sched.sla.hw-class.config]
-/// One hw-class: a node-label conjunction. Labels are ANDed within a
-/// class; classes are OR'd across the `hw_classes` map when serialized
-/// to `nodeSelectorTerms`.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+/// One hw-class: a node-label conjunction (STAMPED on Nodes) plus the
+/// Karpenter instance-type requirements that PROVISION that hardware.
+/// Labels are ANDed within a class; classes are OR'd across the
+/// `hw_classes` map when serialized to `nodeSelectorTerms`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HwClassDef {
+    /// `key=value` Node labels stamped post-launch (e.g.
+    /// `rio.build/hw-band=mid`). Pod `nodeAffinity` matches these.
     pub labels: Vec<NodeLabelMatch>,
+    /// Karpenter `spec.requirements` for NodeClaims targeting this
+    /// hw-class — `karpenter.k8s.aws/instance-generation In [7]`,
+    /// `kubernetes.io/arch In [amd64]`, etc. These are instance-TYPE
+    /// properties Karpenter's discovery knows; `rio.build/*` labels
+    /// are NOT (they're stamped on Nodes after launch). Putting a
+    /// `rio.build/*` key here matches 0 instance types →
+    /// `InsufficientCapacityError` → claim GC'd ~1s later.
+    #[serde(default)]
+    pub requirements: Vec<NodeSelectorReq>,
+}
+
+/// `{key, operator, values}` — same shape as k8s
+/// `NodeSelectorRequirement` / Karpenter's requirement entry. Local
+/// struct so the TOML field names are stable (`key`/`operator`/
+/// `values`) and `deny_unknown_fields` applies.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NodeSelectorReq {
+    pub key: String,
+    pub operator: String,
+    #[serde(default)]
+    pub values: Vec<String>,
 }
 
 /// Single `key=value` node-label match.
@@ -367,6 +392,11 @@ impl SlaConfig {
                         key: "rio.build/hw-class".into(),
                         value: "test-hw".into(),
                     }],
+                    requirements: vec![NodeSelectorReq {
+                        key: "kubernetes.io/os".into(),
+                        operator: "In".into(),
+                        values: vec!["linux".into()],
+                    }],
                 },
             )]),
             hw_cost_tolerance: default_hw_cost_tolerance(),
@@ -443,6 +473,22 @@ impl SlaConfig {
                 !def.labels.is_empty(),
                 "sla.hwClasses[{h}].labels must be non-empty"
             );
+            anyhow::ensure!(
+                !def.requirements.is_empty(),
+                "sla.hwClasses[{h}].requirements must be non-empty \
+                 (Karpenter instance-type selectors, e.g. \
+                 karpenter.k8s.aws/instance-generation In [7])"
+            );
+            for r in &def.requirements {
+                anyhow::ensure!(
+                    !r.key.starts_with("rio.build/"),
+                    "sla.hwClasses[{h}].requirements key {:?} is a Node-stamp \
+                     label, not an instance-type property — Karpenter's \
+                     discovery doesn't know it (matches 0 types). Put it in \
+                     `labels` instead.",
+                    r.key
+                );
+            }
         }
         anyhow::ensure!(
             !self.hw_classes.is_empty(),
@@ -503,6 +549,16 @@ impl SlaConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal valid `requirements` for test fixtures (validate()
+    /// requires non-empty + no `rio.build/*`).
+    fn test_req() -> Vec<NodeSelectorReq> {
+        vec![NodeSelectorReq {
+            key: "kubernetes.io/os".into(),
+            operator: "In".into(),
+            values: vec!["linux".into()],
+        }]
+    }
 
     fn base() -> SlaConfig {
         SlaConfig {
@@ -738,6 +794,9 @@ mod tests {
               { key = "karpenter.k8s.aws/instance-generation", value = "8" },
               { key = "rio.build/storage", value = "nvme" },
             ]
+            requirements = [
+              { key = "karpenter.k8s.aws/instance-generation", operator = "In", values = ["8"] },
+            ]
             [lead_time_seed]
             "intel-8-nvme:spot" = 45.0
             "intel-8-nvme:od" = 38.0
@@ -772,6 +831,7 @@ mod tests {
                     key: "k".into(),
                     value: "v".into(),
                 }],
+                requirements: test_req(),
             },
         );
         let err = cfg.validate().unwrap_err().to_string();
@@ -788,6 +848,7 @@ mod tests {
                     key: "k".into(),
                     value: "v".into(),
                 }],
+                requirements: test_req(),
             },
         );
         cfg.validate().unwrap();
@@ -837,9 +898,39 @@ mod tests {
     fn rejects_empty_hw_class_labels() {
         let mut cfg = base();
         cfg.hw_classes
-            .insert("test-hw".into(), HwClassDef { labels: vec![] });
+            .insert("test-hw".into(), HwClassDef::default());
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("hwClasses[test-hw].labels"), "{err}");
+    }
+
+    /// `requirements` must be non-empty AND no `rio.build/*` keys
+    /// (those are Node-stamps, invisible to Karpenter instance-type
+    /// discovery — putting one here matched 0 types live and looped
+    /// the controller).
+    #[test]
+    fn rejects_hw_class_requirements_shape() {
+        let mut cfg = base();
+        cfg.hw_classes
+            .get_mut("test-hw")
+            .unwrap()
+            .requirements
+            .clear();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("requirements must be non-empty"), "{err}");
+
+        let mut cfg = base();
+        cfg.hw_classes
+            .get_mut("test-hw")
+            .unwrap()
+            .requirements
+            .push(NodeSelectorReq {
+                key: "rio.build/hw-band".into(),
+                operator: "In".into(),
+                values: vec!["mid".into()],
+            });
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("rio.build/hw-band"), "{err}");
+        assert!(err.contains("Node-stamp"), "{err}");
     }
 
     #[test]
@@ -1017,6 +1108,7 @@ mod tests {
                         key: "rio.build/hw-class".into(),
                         value: "intel-7".into(),
                     }],
+                    requirements: test_req(),
                 },
             );
             c

@@ -2005,6 +2005,7 @@ mod tests {
                         key: "rio.build/hw-class".into(),
                         value: h,
                     }],
+                    ..Default::default()
                 },
             );
         }

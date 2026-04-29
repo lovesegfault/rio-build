@@ -1,26 +1,25 @@
-//! §13b anchor+bulk deficit cover.
+//! §13b deficit cover.
 //!
 //! Per `r[ctrl.nodeclaim.anchor-bulk]`: for each `(h,cap)` cell with
-//! unplaced demand, mint `1×anchor` (smallest type fitting
-//! `max_U(c*,M,D)`) plus `⌈(Σc* − anchor.cores)/bulk.cores⌉ × bulk`
-//! (cheapest \$/core type meeting `median_U(M/c*)`), capped at
+//! unplaced demand, mint NodeClaims requesting the cell's summed
+//! `(Σc*, ΣM, max D)` (chunked at `maxNodeCores` per claim), capped at
 //! `sla.maxNodeClaimsPerCellPerTick` and the `sla.maxFleetCores`
-//! budget. Cells iterate round-robin from a rotating start so no cell
-//! starves under sustained pressure.
+//! budget. Karpenter resolves each claim's `resources.requests`
+//! against the hw-class's `requirements` (instance-type properties) to
+//! pick the actual instance type. Cells iterate round-robin from a
+//! rotating start so no cell starves under sustained pressure.
 //!
-//! This module is the pure-compute half: cell assignment, anchor/bulk
-//! selection, claim-count math, and NodeClaim spec construction. The
-//! `Api::create` side-effect lives in
-//! [`super::NodeClaimPoolReconciler::cover_deficit`].
+//! This module is the pure-compute half: cell assignment, claim-count
+//! math, and NodeClaim spec construction. The `Api::create` side-effect
+//! lives in [`super::NodeClaimPoolReconciler::cover_deficit`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use k8s_openapi::api::core::v1::ResourceRequirements;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::api::ObjectMeta;
 use rio_crds::karpenter::{NodeClaim, NodeClaimSpec, NodeClassRef, NodeSelectorRequirementWithMin};
-use rio_proto::types::SpawnIntent;
-use serde::{Deserialize, Serialize};
+use rio_proto::types::{NodeSelectorRequirement, SpawnIntent};
 
 use super::ffd::{CAPACITY_TYPE_LABEL, HW_CLASS_LABEL, a_open};
 use super::sketch::{CapacityType, Cell, CellSketches};
@@ -40,25 +39,12 @@ pub const SHIM_NODEPOOL: &str = "rio-nodeclaim-shim";
 const NODE_CLASS_GROUP: &str = "karpenter.k8s.aws";
 const NODE_CLASS_KIND: &str = "EC2NodeClass";
 
-/// One instance shape in a cell's menu. Helm-populated
-/// (`[nodeclaim_pool.instance_menu]` in the ConfigMap-mounted
-/// `controller.toml`): the controller doesn't run
-/// the scheduler's live `DescribeSpotPriceHistory` poll, so
-/// `price_per_vcpu_hr` is the static seed — sufficient for the
-/// "cheapest \$/core" bulk pick (the relative ranking is what matters,
-/// not absolute price).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct InstanceType {
-    /// vCPU count. Unit-consistent with `SpawnIntent.cores` (whole
-    /// cores).
-    pub cores: u32,
-    /// RAM bytes.
-    pub mem_bytes: u64,
-    /// Ephemeral-storage bytes (instance-store + root EBS).
-    pub disk_bytes: u64,
-    /// Static seed `$/vCPU·hr`. Ranks bulk candidates; never billed.
-    pub price_per_vcpu_hr: f64,
-}
+/// `karpenter.k8s.aws/instance-size` requirement key — the
+/// metal-partition `NotIn` side. Same list as the shim NodePool's
+/// template requirement (`karpenter.metalSizes`); appended here so a
+/// rio-minted NodeClaim never resolves to `*.metal` (those belong to
+/// the dedicated `rio-builder-metal` pool, BIOS AMI).
+pub const INSTANCE_SIZE_LABEL: &str = "karpenter.k8s.aws/instance-size";
 
 /// Group `unplaced` by the cheapest cell in each intent's `A_open`.
 ///
@@ -72,12 +58,19 @@ pub struct InstanceType {
 /// matches arch) increments the returned dropped count; caller emits
 /// `rio_controller_nodeclaim_intent_dropped_total{reason=no_menu_for_arch}`.
 ///
+/// `masked` cells (ICE-hit this tick or scheduler-reported
+/// `ice_masked_cells`) are filtered from each intent's `A_open` BEFORE
+/// the cheapest-pick — so an intent whose `A_open = [(h,spot),(h,od)]`
+/// fails over to `(h,od)` when spot is ICE-masked instead of being
+/// assigned to a cell `cover_deficit` then skips.
+///
 /// `BTreeMap` so iteration order is deterministic (round-robin
 /// rotation acts on a sorted universe; flapping order would defeat the
 /// no-starvation guarantee).
 pub fn assign_to_cells<'a>(
     unplaced: &'a [SpawnIntent],
     sketches: &CellSketches,
+    masked: &HashSet<Cell>,
     cell_price: impl Fn(&Cell) -> f64,
     fallback: impl Fn(&SpawnIntent) -> Option<Cell>,
 ) -> (BTreeMap<Cell, Vec<&'a SpawnIntent>>, u64) {
@@ -87,6 +80,7 @@ pub fn assign_to_cells<'a>(
         let open = a_open(i, sketches);
         let cheapest = open
             .into_iter()
+            .filter(|c| !masked.contains(c))
             .min_by(|a, b| cell_price(a).total_cmp(&cell_price(b)))
             .or_else(|| {
                 if !i.hw_class_names.is_empty() {
@@ -107,6 +101,23 @@ pub fn assign_to_cells<'a>(
     (by_cell, dropped)
 }
 
+/// Cell ranking for [`assign_to_cells`]' cheapest-open pick: spot
+/// before on-demand (always cheaper), then alphabetical hw-class
+/// (stable tie-break). The scheduler's per-intent `dispatched_cells`
+/// already encodes its CostTable ranking, so this is only the
+/// disambiguator when an intent's `A_open` has multiple unmasked cells.
+pub fn cell_rank(c: &Cell) -> f64 {
+    let cap = match c.1 {
+        CapacityType::Spot => 0.0,
+        CapacityType::OnDemand => 1.0,
+    };
+    // Stable hash of hw-class name → fractional tiebreak in [0,1).
+    let h: u64 =
+        c.0.bytes()
+            .fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(b)));
+    cap + (h as f64 / u64::MAX as f64) * 0.5
+}
+
 /// Deterministic round-robin: sorted cell universe rotated by
 /// `tick % len`. With per-tick budget caps, a fixed iteration order
 /// would let early cells absorb the budget every tick and starve late
@@ -121,87 +132,61 @@ pub fn cells_round_robin(mut cells: Vec<Cell>, tick: u64) -> Vec<Cell> {
     cells
 }
 
-/// Smallest (by `price_per_vcpu_hr`, then `cores`) menu entry covering
-/// `(c, m, d)`. `None` ⇔ no entry fits — the menu-gap base case
-/// (config-load asserts `max_menu ≥ (maxCores,maxMem,maxDisk)` so
-/// prod-unreachable; surfaced as
-/// `rio_controller_placement_sim_mismatch_total{reason="menu_gap"}`).
-pub fn pick_anchor(menu: &[InstanceType], c: u32, m: u64, d: u64) -> Option<&InstanceType> {
-    menu.iter()
-        .filter(|t| t.cores >= c && t.mem_bytes >= m && t.disk_bytes >= d)
-        .min_by(|a, b| {
-            a.price_per_vcpu_hr
-                .total_cmp(&b.price_per_vcpu_hr)
-                .then(a.cores.cmp(&b.cores))
-        })
+/// Per-cell `(Σcores, Σmem, max disk)` over `u`. `max` for disk: each
+/// pod gets its own ephemeral-storage allocation, so the claim only
+/// needs to fit the largest single intent's disk; cores/mem stack.
+pub fn sum_deficit(u: &[&SpawnIntent]) -> (u32, u64, u64) {
+    u.iter().fold((0, 0, 0), |(c, m, d), i| {
+        (c + i.cores, m + i.mem_bytes, d.max(i.disk_bytes))
+    })
 }
 
-/// Cheapest \$/core menu entry whose `mem/cores` ratio ≥ `med_ratio`
-/// (so a node-full of median-shaped intents fits on memory). Falls
-/// back to `anchor` when nothing meets the ratio (degenerate menu).
-pub fn pick_bulk<'a>(
-    menu: &'a [InstanceType],
-    med_ratio: f64,
-    anchor: &'a InstanceType,
-) -> &'a InstanceType {
-    menu.iter()
-        .filter(|t| t.cores > 0 && (t.mem_bytes as f64 / f64::from(t.cores)) >= med_ratio)
-        .min_by(|a, b| {
-            a.price_per_vcpu_hr
-                .total_cmp(&b.price_per_vcpu_hr)
-                .then(a.cores.cmp(&b.cores))
-        })
-        .unwrap_or(anchor)
-}
-
-/// `N = min(need, per_tick_cap, budget_fit)` where
-/// `need = 1 + ⌈(Σc − anchor)/bulk⌉` and
-/// `budget_fit = 1 + ⌊(budget − anchor)/bulk⌋`.
-/// `0` when the budget can't cover even the anchor (`budget <
-/// anchor.cores`). Integer math throughout — `bulk.cores ≥ 1` by menu
-/// construction.
-pub fn claim_count(sum_c: u32, anchor_c: u32, bulk_c: u32, per_tick_cap: u32, budget: u32) -> u32 {
-    if budget < anchor_c {
-        return 0;
+/// `N = min(⌈Σc / chunk⌉, per_tick_cap, ⌊budget / chunk⌋)` claims to
+/// mint for a cell, where `chunk = min(Σc, max_node_cores)`. Returns
+/// `(n, chunk)` — each claim requests `chunk` cores. `(0, _)` when the
+/// budget is exhausted.
+pub fn claim_count(sum_c: u32, max_node_cores: u32, per_tick_cap: u32, budget: u32) -> (u32, u32) {
+    let chunk = sum_c.min(max_node_cores).max(1);
+    if budget < chunk {
+        return (0, chunk);
     }
-    let bulk_c = bulk_c.max(1);
-    let need = 1 + sum_c.saturating_sub(anchor_c).div_ceil(bulk_c);
-    let budget_fit = 1 + (budget - anchor_c) / bulk_c;
-    need.min(per_tick_cap).min(budget_fit)
+    let need = sum_c.div_ceil(chunk);
+    let budget_fit = budget / chunk;
+    (need.min(per_tick_cap).min(budget_fit), chunk)
 }
 
-/// Median of `xs`. Empty → 0 (so `pick_bulk`'s ratio gate degenerates
-/// to "any type passes"). Even-length → lower-middle (no fp-mean —
-/// the value feeds a `≥` gate so either middle is fine; lower keeps
-/// the gate looser).
-pub fn median(mut xs: Vec<f64>) -> f64 {
-    if xs.is_empty() {
-        return 0.0;
-    }
-    xs.sort_by(f64::total_cmp);
-    xs[(xs.len() - 1) / 2]
-}
-
-/// Build a NodeClaim for `cell` requesting `it`'s `(cores, mem, disk)`.
+/// Build a NodeClaim for `cell` requesting `(cores, mem, disk)`.
 ///
 /// - `metadata.generateName`: `rio-nc-<h>-<cap>-` (k8s appends 5
 ///   random chars). NodeClaims aren't idempotent-named — each tick's
 ///   cover may legitimately create another for the same cell.
-/// - `metadata.labels`: [`HW_CLASS_LABEL`] + [`CAPACITY_TYPE_LABEL`]
-///   (so [`super::ffd::LiveNode::from`] recovers `cell` next tick),
-///   [`NODEPOOL_LABEL`] = [`SHIM_NODEPOOL`] (Karpenter state-tracking),
-///   and the [`super::OWNER_LABEL`] selector.
-/// - `spec.requirements`: the cell's hw-class label conjunction (the
-///   same `(k, In, [v])` shape `cells_to_selector_terms` emits) AND
-///   `karpenter.sh/capacity-type In [<cap>]`. Karpenter resolves to
-///   the smallest fitting instance type within that conjunction.
-/// - `spec.resources.requests`: `{cpu, memory, ephemeral-storage}` =
-///   `it`. Karpenter uses these as the floor for instance-type
-///   selection; `spec.requirements` constrains the family.
+/// - `metadata.labels`: the hw-class's full `[sla.hw_classes.$h]`
+///   label conjunction (so the launched Node carries
+///   `rio.build/hw-band` / `rio.build/storage` exactly as the legacy
+///   NodePool template stamped — these are NODE labels, not
+///   instance-type properties) PLUS [`HW_CLASS_LABEL`] +
+///   [`CAPACITY_TYPE_LABEL`] (so [`super::ffd::LiveNode::from`]
+///   recovers `cell` next tick), [`NODEPOOL_LABEL`] =
+///   [`SHIM_NODEPOOL`] (Karpenter state-tracking), and the
+///   [`super::OWNER_LABEL`] selector.
+/// - `spec.requirements`: ONLY labels Karpenter's instance-type
+///   discovery knows — the hw-class's `requirements`
+///   (`karpenter.k8s.aws/instance-generation In [7]`,
+///   `kubernetes.io/arch In [amd64]`, …), `karpenter.sh/capacity-type
+///   In [<cap>]`, and `karpenter.k8s.aws/instance-size NotIn
+///   <metal_sizes>`. Putting `rio.build/*` here matches 0 instance
+///   types → Karpenter posts `Launched=False
+///   reason=InsufficientCapacity` and GCs the claim ~1s later (the
+///   live B8 finding).
+/// - `spec.resources.requests`: `{cpu, memory, ephemeral-storage}`.
+///   Karpenter uses these as the floor for instance-type selection;
+///   `spec.requirements` constrains the family.
 pub fn build_nodeclaim(
     cell: &Cell,
-    it: &InstanceType,
+    req: (u32, u64, u64),
     hw_labels: &[(String, String)],
+    hw_requirements: &[NodeSelectorRequirement],
+    metal_sizes: &[String],
     node_class_ref: &str,
 ) -> NodeClaim {
     let cap_label = match cell.1 {
@@ -211,35 +196,39 @@ pub fn build_nodeclaim(
     let (owner_k, owner_v) = super::OWNER_LABEL
         .split_once('=')
         .expect("OWNER_LABEL is k=v");
-    let labels: BTreeMap<String, String> = [
+    // hw_labels (rio.build/hw-band, rio.build/storage,
+    // kubernetes.io/arch, …) are STAMPED onto the Node via
+    // metadata.labels — Karpenter copies NodeClaim labels to the
+    // launched Node. The legacy NodePool template did this; B3 deleted
+    // those NodePools, so the controller must stamp directly.
+    let mut labels: BTreeMap<String, String> = hw_labels.iter().cloned().collect();
+    labels.extend([
         (HW_CLASS_LABEL.into(), cell.0.clone()),
         (CAPACITY_TYPE_LABEL.into(), cap_label.into()),
         (NODEPOOL_LABEL.into(), SHIM_NODEPOOL.into()),
         (owner_k.into(), owner_v.into()),
-    ]
-    .into();
-    let mut requirements: Vec<NodeSelectorRequirementWithMin> = hw_labels
-        .iter()
-        .map(|(k, v)| NodeSelectorRequirementWithMin {
-            key: k.clone(),
-            operator: "In".into(),
-            values: vec![v.clone()],
-            min_values: None,
-        })
-        .collect();
-    requirements.push(NodeSelectorRequirementWithMin {
-        key: CAPACITY_TYPE_LABEL.into(),
-        operator: "In".into(),
-        values: vec![cap_label.into()],
+    ]);
+    let mk_req = |key: &str, op: &str, values: Vec<String>| NodeSelectorRequirementWithMin {
+        key: key.into(),
+        operator: op.into(),
+        values,
         min_values: None,
-    });
+    };
+    // requirements: ONLY instance-type-discovery labels. The hw-class's
+    // `requirements` field carries karpenter.k8s.aws/* + arch
+    // (validated by SlaConfig::validate to exclude rio.build/*).
+    let mut requirements: Vec<_> = hw_requirements
+        .iter()
+        .map(|r| mk_req(&r.key, &r.operator, r.values.clone()))
+        .collect();
+    requirements.push(mk_req(CAPACITY_TYPE_LABEL, "In", vec![cap_label.into()]));
+    if !metal_sizes.is_empty() {
+        requirements.push(mk_req(INSTANCE_SIZE_LABEL, "NotIn", metal_sizes.to_vec()));
+    }
     let requests: BTreeMap<String, Quantity> = [
-        ("cpu".into(), Quantity(it.cores.to_string())),
-        ("memory".into(), Quantity(it.mem_bytes.to_string())),
-        (
-            "ephemeral-storage".into(),
-            Quantity(it.disk_bytes.to_string()),
-        ),
+        ("cpu".into(), Quantity(req.0.to_string())),
+        ("memory".into(), Quantity(req.1.to_string())),
+        ("ephemeral-storage".into(), Quantity(req.2.to_string())),
     ]
     .into();
     NodeClaim {
@@ -271,15 +260,6 @@ mod tests {
 
     const GI: u64 = 1 << 30;
 
-    fn it(cores: u32, mem_gib: u64, disk_gib: u64, p: f64) -> InstanceType {
-        InstanceType {
-            cores,
-            mem_bytes: mem_gib * GI,
-            disk_bytes: disk_gib * GI,
-            price_per_vcpu_hr: p,
-        }
-    }
-
     fn intent(id: &str, cores: u32, mem: u64, cells: &[(&str, CapacityType)]) -> SpawnIntent {
         let (hw_class_names, node_affinity) = cells
             .iter()
@@ -310,79 +290,33 @@ mod tests {
         }
     }
 
-    // --- anchor / bulk -------------------------------------------------
-
-    /// r[ctrl.nodeclaim.anchor-bulk]: anchor = smallest type fitting
-    /// `max_U(c*,M,D)`. U = {(32,64G), (4,8G)}; menu = {xl(4c,16G),
-    /// 8xl(32c,128G)}. max_U = (32,64G) → only 8xl fits → anchor=8xl.
-    // r[verify ctrl.nodeclaim.anchor-bulk]
-    #[test]
-    fn anchor_is_smallest_fitting_max_u() {
-        let menu = [it(4, 16, 100, 0.04), it(32, 128, 200, 0.05)];
-        let a = pick_anchor(&menu, 32, 64 * GI, GI).expect("8xl fits");
-        assert_eq!(a.cores, 32);
-        // Both fit → cheapest wins (then smallest on tie).
-        let a2 = pick_anchor(&menu, 4, 8 * GI, GI).unwrap();
-        assert_eq!(a2.cores, 4, "xl is cheaper");
-        // Equal price → smallest cores tiebreak.
-        let menu2 = [it(8, 32, 100, 0.04), it(4, 16, 100, 0.04)];
-        assert_eq!(pick_anchor(&menu2, 2, GI, GI).unwrap().cores, 4);
-    }
-
-    /// `|U|=1`, no fitting type → `None` (caller emits
-    /// `placement_sim_mismatch_total{reason=menu_gap}`).
-    #[test]
-    fn menu_gap_base_case_surfaces_mismatch_metric() {
-        let menu = [it(4, 16, 100, 0.04), it(8, 32, 100, 0.04)];
-        assert!(pick_anchor(&menu, 64, GI, GI).is_none(), "cores gap");
-        assert!(pick_anchor(&menu, 4, 256 * GI, GI).is_none(), "mem gap");
-        assert!(pick_anchor(&menu, 4, GI, 999 * GI).is_none(), "disk gap");
-        assert!(pick_anchor(&[], 1, 1, 1).is_none(), "empty menu");
-    }
-
-    /// bulk = cheapest \$/core meeting `median_U(M/c*)`. menu has a
-    /// cheap-but-mem-thin type and a pricier mem-fat type; med_ratio
-    /// excludes the thin one.
-    #[test]
-    fn bulk_meets_median_mem_ratio() {
-        let anchor = it(32, 128, 200, 0.05);
-        // thin: 2G/core; fat: 8G/core.
-        let menu = [
-            it(16, 32, 100, 0.03),
-            it(16, 128, 100, 0.04),
-            anchor.clone(),
-        ];
-        // med_ratio = 4G/core → thin (2G/core) excluded; fat is cheapest
-        // remaining.
-        let b = pick_bulk(&menu, 4.0 * GI as f64, &anchor);
-        assert_eq!(b.mem_bytes, 128 * GI);
-        // med_ratio = 1G/core → thin passes and is cheapest.
-        let b2 = pick_bulk(&menu, GI as f64, &anchor);
-        assert_eq!(b2.mem_bytes, 32 * GI);
-        // Nothing meets ratio → falls back to anchor.
-        let b3 = pick_bulk(&menu, 999.0 * GI as f64, &anchor);
-        assert_eq!(b3.cores, 32);
-    }
-
     // --- claim_count ---------------------------------------------------
 
-    /// budget=40, anchor=32c, bulk=16c, per_tick=8, Σc=100.
-    /// need = 1+⌈68/16⌉ = 6; budget_fit = 1+⌊8/16⌋ = 1. → N=1.
+    /// Σc=100, max_node=32, per_tick=8, budget=200.
+    /// chunk=32; need=⌈100/32⌉=4; budget_fit=⌊200/32⌋=6 → N=4.
     #[test]
     fn n_respects_budget_and_per_tick_cap() {
-        assert_eq!(claim_count(100, 32, 16, 8, 40), 1, "budget binds");
-        // budget=200 → budget_fit=1+⌊168/16⌋=11; per_tick=8 binds → 6? no:
-        // need=6, per_tick=8, budget_fit=11 → N=6 (need binds).
-        assert_eq!(claim_count(100, 32, 16, 8, 200), 6, "need binds");
-        // per_tick=3 binds.
-        assert_eq!(claim_count(100, 32, 16, 3, 200), 3, "per_tick binds");
-        // budget < anchor → 0.
-        assert_eq!(claim_count(100, 32, 16, 8, 16), 0, "can't afford anchor");
-        // Σc ≤ anchor → need=1 (anchor only).
-        assert_eq!(claim_count(20, 32, 16, 8, 200), 1, "anchor covers Σc");
-        // bulk=0 guard (menu shouldn't emit, but div-by-0 panics):
-        // bulk_c.max(1) → need=1+68=69, budget_fit=1+168 → per_tick=8.
-        assert_eq!(claim_count(100, 32, 0, 8, 200), 8);
+        assert_eq!(claim_count(100, 32, 8, 200), (4, 32), "need binds");
+        // budget=40 → budget_fit=1 → N=1.
+        assert_eq!(claim_count(100, 32, 8, 40), (1, 32), "budget binds");
+        // per_tick=2 binds.
+        assert_eq!(claim_count(100, 32, 2, 200), (2, 32), "per_tick binds");
+        // budget < chunk → 0.
+        assert_eq!(claim_count(100, 32, 8, 16), (0, 32), "can't afford chunk");
+        // Σc < max_node → chunk=Σc, N=1.
+        assert_eq!(claim_count(20, 64, 8, 200), (1, 20), "Σc < max_node");
+        // Σc=0 → chunk=1 (max(1) guard), need=0.
+        assert_eq!(claim_count(0, 32, 8, 200), (0, 1));
+    }
+
+    #[test]
+    fn sum_deficit_sums_cores_mem_max_disk() {
+        let a = intent("a", 4, 8 * GI, &[]);
+        let mut b = intent("b", 8, 16 * GI, &[]);
+        b.disk_bytes = 50 * GI;
+        let s = sum_deficit(&[&a, &b]);
+        assert_eq!(s, (12, 24 * GI, 50 * GI));
+        assert_eq!(sum_deficit(&[]), (0, 0, 0));
     }
 
     // --- round-robin ---------------------------------------------------
@@ -427,7 +361,8 @@ mod tests {
         let unplaced = [intent("a", 4, GI, &[h1, h2]), intent("b", 2, GI, &[h2])];
         // h1 cheaper.
         let price = |c: &Cell| if c.0 == "h1" { 0.03 } else { 0.05 };
-        let (by, d) = assign_to_cells(&unplaced, &CellSketches::default(), price, |_| None);
+        let none = HashSet::new();
+        let (by, d) = assign_to_cells(&unplaced, &CellSketches::default(), &none, price, |_| None);
         assert_eq!(d, 0);
         assert_eq!(by.len(), 2);
         let h1k = Cell("h1".into(), CapacityType::Spot);
@@ -436,6 +371,50 @@ mod tests {
         assert_eq!(by[&h1k][0].intent_id, "a", "a's cheapest-open is h1");
         assert_eq!(by[&h2k].len(), 1);
         assert_eq!(by[&h2k][0].intent_id, "b", "b only opens h2");
+    }
+
+    /// ICE-masked spot cell → intent with `A_open=[spot,od]` fails
+    /// over to od (cheapest UNmasked). Prevents the "assigned to
+    /// masked cell → cover_deficit skips → intent stranded" hole.
+    #[test]
+    fn assign_masked_cell_fails_over_to_od() {
+        let cells = [("h", CapacityType::Spot), ("h", CapacityType::OnDemand)];
+        let unplaced = [intent("x", 4, GI, &cells)];
+        let spot = Cell("h".into(), CapacityType::Spot);
+        let od = Cell("h".into(), CapacityType::OnDemand);
+        // No mask → spot (cell_rank: spot < od).
+        let (by, _) = assign_to_cells(
+            &unplaced,
+            &CellSketches::default(),
+            &HashSet::new(),
+            cell_rank,
+            |_| None,
+        );
+        assert_eq!(by[&spot].len(), 1);
+        // spot ICE-masked → od.
+        let masked: HashSet<Cell> = [spot.clone()].into();
+        let (by, d) = assign_to_cells(
+            &unplaced,
+            &CellSketches::default(),
+            &masked,
+            cell_rank,
+            |_| None,
+        );
+        assert_eq!(d, 0);
+        assert!(!by.contains_key(&spot));
+        assert_eq!(by[&od].len(), 1);
+        // Both masked → A_open empties; non-empty hw_class_names ⇒ NOT
+        // fallback-routed (next tick re-evaluates).
+        let masked: HashSet<Cell> = [spot, od].into();
+        let (by, d) = assign_to_cells(
+            &unplaced,
+            &CellSketches::default(),
+            &masked,
+            cell_rank,
+            |_| None,
+        );
+        assert!(by.is_empty());
+        assert_eq!(d, 0);
     }
 
     /// Cold-start: `hw_class_names=[]` → routed via `fallback`.
@@ -473,7 +452,13 @@ mod tests {
         let fallback = |i: &SpawnIntent| {
             (i.system == "x86_64-linux").then(|| Cell("ref".into(), CapacityType::Spot))
         };
-        let (by, d) = assign_to_cells(&unplaced, &CellSketches::default(), |_| 0.0, fallback);
+        let (by, d) = assign_to_cells(
+            &unplaced,
+            &CellSketches::default(),
+            &HashSet::new(),
+            |_| 0.0,
+            fallback,
+        );
         assert_eq!(d, 1, "agn-u dropped");
         assert_eq!(by.len(), 1);
         assert_eq!(by[&ref_cell].len(), 1);
@@ -482,36 +467,66 @@ mod tests {
 
     #[test]
     fn assign_empty_unplaced_empty_output() {
-        let (by, d) = assign_to_cells(&[], &CellSketches::default(), |_| 0.0, |_| None);
+        let (by, d) = assign_to_cells(
+            &[],
+            &CellSketches::default(),
+            &HashSet::new(),
+            |_| 0.0,
+            |_| None,
+        );
         assert!(by.is_empty());
         assert_eq!(d, 0);
     }
 
-    // --- median --------------------------------------------------------
-
     #[test]
-    fn median_edge_cases() {
-        assert_eq!(median(vec![]), 0.0);
-        assert_eq!(median(vec![5.0]), 5.0);
-        assert_eq!(median(vec![3.0, 1.0, 2.0]), 2.0);
-        // Even-length → lower-middle.
-        assert_eq!(median(vec![4.0, 1.0, 3.0, 2.0]), 2.0);
+    fn cell_rank_spot_before_od() {
+        let s = Cell("h".into(), CapacityType::Spot);
+        let o = Cell("h".into(), CapacityType::OnDemand);
+        assert!(cell_rank(&s) < cell_rank(&o));
+        // Same cap → deterministic on name (any order, but stable).
+        let a = Cell("a".into(), CapacityType::Spot);
+        let b = Cell("b".into(), CapacityType::Spot);
+        assert_ne!(cell_rank(&a), cell_rank(&b));
     }
 
     // --- build_nodeclaim -----------------------------------------------
 
-    /// Asserts the full wire shape: generateName, labels (hw-class +
-    /// cap-type + shim-nodepool + owner), nodeClassRef, requirements
-    /// (hw-label conjunction AND capacity-type), resources.requests.
+    /// Asserts the full wire shape: generateName, labels (hw-class
+    /// CONJUNCTION stamps + hw-class/cap-type/shim-nodepool/owner),
+    /// nodeClassRef, requirements (hw_requirements + capacity-type +
+    /// metal-NotIn ONLY — no `rio.build/*`), resources.requests.
     #[test]
     fn build_nodeclaim_spec_shape() {
         let cell = Cell("mid-ebs-x86".into(), CapacityType::Spot);
-        let shape = it(8, 32, 100, 0.04);
+        // Live B8 finding: hw_labels are the [sla.hw_classes] STAMPS
+        // (rio.build/* + arch). These go in metadata.labels, NOT
+        // spec.requirements.
         let hw_labels = vec![
+            ("rio.build/hw-band".into(), "mid".into()),
+            ("rio.build/storage".into(), "ebs".into()),
             ("kubernetes.io/arch".into(), "amd64".into()),
-            ("karpenter.k8s.aws/instance-category".into(), "m".into()),
         ];
-        let nc = build_nodeclaim(&cell, &shape, &hw_labels, "rio-default");
+        let hw_reqs = vec![
+            NodeSelectorRequirement {
+                key: "karpenter.k8s.aws/instance-generation".into(),
+                operator: "In".into(),
+                values: vec!["6".into(), "7".into()],
+            },
+            NodeSelectorRequirement {
+                key: "kubernetes.io/arch".into(),
+                operator: "In".into(),
+                values: vec!["amd64".into()],
+            },
+        ];
+        let metal = vec!["metal".into(), "metal-24xl".into()];
+        let nc = build_nodeclaim(
+            &cell,
+            (8, 32 * GI, 100 * GI),
+            &hw_labels,
+            &hw_reqs,
+            &metal,
+            "rio-default",
+        );
 
         let meta = &nc.metadata;
         assert_eq!(
@@ -523,26 +538,47 @@ mod tests {
         assert_eq!(labels[CAPACITY_TYPE_LABEL], "spot");
         assert_eq!(labels[NODEPOOL_LABEL], SHIM_NODEPOOL);
         assert_eq!(labels["rio.build/nodeclaim-pool"], "builder");
+        // hw-class conjunction stamped onto Node (legacy NodePool
+        // template behaviour, now controller's responsibility post-B3).
+        assert_eq!(labels["rio.build/hw-band"], "mid");
+        assert_eq!(labels["rio.build/storage"], "ebs");
+        assert_eq!(labels["kubernetes.io/arch"], "amd64");
 
         let spec = &nc.spec;
         assert_eq!(spec.node_class_ref.name, "rio-default");
         assert_eq!(spec.node_class_ref.group, "karpenter.k8s.aws");
         assert_eq!(spec.node_class_ref.kind, "EC2NodeClass");
-        // 2 hw-labels + 1 capacity-type.
-        assert_eq!(spec.requirements.len(), 3);
+        // 2 hw-reqs + capacity-type + instance-size NotIn. NO
+        // rio.build/* — those match 0 instance types and trigger
+        // Karpenter ICE-GC.
+        assert_eq!(spec.requirements.len(), 4);
+        assert!(
+            !spec
+                .requirements
+                .iter()
+                .any(|r| r.key.starts_with("rio.build/")),
+            "rio.build/* are stamps not instance-type properties: {:?}",
+            spec.requirements
+        );
+        let gen_req = spec
+            .requirements
+            .iter()
+            .find(|r| r.key == "karpenter.k8s.aws/instance-generation")
+            .unwrap();
+        assert_eq!(gen_req.values, vec!["6", "7"]);
         let cap_req = spec
             .requirements
             .iter()
             .find(|r| r.key == CAPACITY_TYPE_LABEL)
             .unwrap();
         assert_eq!(cap_req.values, vec!["spot"]);
-        let arch_req = spec
+        let size_req = spec
             .requirements
             .iter()
-            .find(|r| r.key == "kubernetes.io/arch")
+            .find(|r| r.key == INSTANCE_SIZE_LABEL)
             .unwrap();
-        assert_eq!(arch_req.operator, "In");
-        assert_eq!(arch_req.values, vec!["amd64"]);
+        assert_eq!(size_req.operator, "NotIn");
+        assert_eq!(size_req.values, vec!["metal", "metal-24xl"]);
 
         let req = spec.resources.as_ref().unwrap().requests.as_ref().unwrap();
         assert_eq!(req["cpu"], Quantity("8".into()));
@@ -550,10 +586,12 @@ mod tests {
         assert_eq!(req["ephemeral-storage"], Quantity((100 * GI).to_string()));
     }
 
+    /// Empty hw_requirements + empty metal_sizes (kwok/vmtest) → only
+    /// capacity-type requirement (Karpenter v1 CRD requires ≥1).
     #[test]
     fn build_nodeclaim_on_demand_label_form() {
         let cell = Cell("h".into(), CapacityType::OnDemand);
-        let nc = build_nodeclaim(&cell, &it(4, 8, 50, 0.1), &[], "x");
+        let nc = build_nodeclaim(&cell, (4, 8 * GI, 50 * GI), &[], &[], &[], "x");
         // Karpenter label form is "on-demand", NOT the PG/helm "od".
         assert_eq!(
             nc.metadata.labels.as_ref().unwrap()[CAPACITY_TYPE_LABEL],
@@ -562,5 +600,8 @@ mod tests {
         // generateName uses the PG/helm form (DNS-safe, matches
         // `Cell::to_string`).
         assert_eq!(nc.metadata.generate_name.as_deref(), Some("rio-nc-h-od-"));
+        // hw_reqs=[] + metal=[] → only capacity-type req.
+        assert_eq!(nc.spec.requirements.len(), 1);
+        assert_eq!(nc.spec.requirements[0].key, CAPACITY_TYPE_LABEL);
     }
 }

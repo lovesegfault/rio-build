@@ -107,6 +107,7 @@ repeated ExecutorInfo executors = 1;
 repeated ExecutorRejection rejections = 14;
 repeated NodeLabelMatch labels = 1;
 repeated NodeSelectorRequirement match_expressions = 1;
+repeated NodeSelectorRequirement requirements = 2;
 repeated NodeSelectorTerm node_affinity = 11;
 repeated PoisonedDerivation derivations = 1;
 repeated SeedEntry entries = 3;

@@ -500,15 +500,11 @@ mod tests {
         enabled = true
         node_class_ref = "rio-default"
         max_fleet_cores = 64
+        max_node_cores = 16
+        metal_sizes = ["metal", "metal-24xl"]
 
         [nodeclaim_pool.lead_time_seed]
         "vmtest:spot" = 5.0
-
-        [[nodeclaim_pool.instance_menu."vmtest:spot"]]
-        cores = 16
-        mem_bytes = 4294967296
-        disk_bytes = 21474836480
-        price_per_vcpu_hr = 0.01
         "#,
         |cfg: Config| {
             assert_eq!(cfg.gc_interval_hours, 0);
@@ -517,14 +513,12 @@ mod tests {
             // rio-controller-config ConfigMap renders.
             assert!(cfg.nodeclaim_pool.enabled);
             assert_eq!(cfg.nodeclaim_pool.max_fleet_cores, 64);
+            assert_eq!(cfg.nodeclaim_pool.max_node_cores, 16);
+            assert_eq!(cfg.nodeclaim_pool.metal_sizes, vec!["metal", "metal-24xl"]);
             assert_eq!(
                 cfg.nodeclaim_pool.lead_time_seed.get("vmtest:spot"),
                 Some(&5.0)
             );
-            let menu = &cfg.nodeclaim_pool.instance_menu["vmtest:spot"];
-            assert_eq!(menu.len(), 1);
-            assert_eq!(menu[0].cores, 16);
-            assert_eq!(menu[0].mem_bytes, 4_294_967_296);
         }
     );
 

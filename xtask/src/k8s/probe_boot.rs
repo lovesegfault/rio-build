@@ -767,6 +767,7 @@ mod tests {
                     value: (*v).into(),
                 })
                 .collect(),
+            requirements: vec![],
         }
     }
 

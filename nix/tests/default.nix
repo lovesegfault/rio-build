@@ -742,16 +742,13 @@ in
   # this is k3s+kubectl-only).
   #
   # nodeclaim_pool config flows through the chart's first-class values:
-  # `karpenter.nodeclaimPool.enabled` + `scheduler.sla.{instanceMenu,
+  # `karpenter.nodeclaimPool.enabled` + `scheduler.sla.{hwClasses,
   # leadTimeSeed,maxFleetCores,...}` render into the rio-controller-config
-  # ConfigMap's `[nodeclaim_pool]` TOML table (instance_menu is a nested
-  # map-of-list — figment's Env provider only yields strings, so the
-  # ConfigMap mount is the ONLY load path). The 12 prod hwClasses + 24-cell
-  # instanceMenu/leadTimeSeed are per-subkey-nulled in the fixture overlay
-  # so hwClasses / instanceMenu / leadTimeSeed key-sets all = {vmtest}; one
-  # `vmtest:spot` menu entry covering vmtest-full's max_cores=16 /
-  # max_mem=2Gi keeps `placement_sim_mismatch_total{reason=menu_gap}`
-  # unreachable.
+  # ConfigMap's `[nodeclaim_pool]` TOML table (lead_time_seed is a nested
+  # map — figment's Env provider only yields strings, so the ConfigMap
+  # mount is the ONLY load path). The 12 prod hwClasses + 24-cell
+  # leadTimeSeed are per-subkey-nulled in the fixture overlay so hwClasses
+  # / leadTimeSeed key-sets all = {vmtest}.
   #
   # r[verify ctrl.nodeclaim.ffd-sim]
   # r[verify ctrl.nodeclaim.shim-nodepool]
@@ -773,7 +770,7 @@ in
       extraValuesFiles =
         let
           # B16: Helm deep-merges values.yaml's 12 hwClasses + 24-cell
-          # instanceMenu/leadTimeSeed with vmtest-full.yaml's `vmtest`,
+          # leadTimeSeed with vmtest-full.yaml's `vmtest`,
           # giving 13 hwClasses. The scheduler's solve_full draws
           # SpawnIntent.hw_class_names from that 13-set excluding
           # `vmtest`; `assign_to_cells` then never produces a
@@ -808,9 +805,9 @@ in
         in
         [
           # `[sla]` vmtest-only. Per-subkey nulls wipe the 12 prod
-          # hwClasses + 24 prod instanceMenu/leadTimeSeed cells from
-          # chart defaults so instanceMenu / leadTimeSeed / hwClasses
-          # key-sets all = {vmtest}. max_fleet_cores capped at 64 so a
+          # hwClasses + 24 prod leadTimeSeed cells from chart defaults
+          # so leadTimeSeed / hwClasses key-sets all = {vmtest}.
+          # max_fleet_cores capped at 64 so a
           # runaway tick can't request more than the KWOK fixture
           # synthesizes. Colon in `vmtest:spot` cell key needs YAML
           # key-quoting.
@@ -824,17 +821,12 @@ in
                   vmtest:
                     labels:
                       - {key: rio.build/vmtest, value: "true"}
+                    requirements:
+                      - {key: kubernetes.io/os, operator: In, values: [linux]}
                 referenceHwClass: vmtest
                 leadTimeSeed:
             ${nullKeys "      " prodCells}
                   "vmtest:spot": 5.0
-                instanceMenu:
-            ${nullKeys "      " prodCells}
-                  "vmtest:spot":
-                    - cores: 16
-                      memBytes: 4294967296
-                      diskBytes: 21474836480
-                      pricePerVcpuHr: 0.01
           '')
         ];
     };

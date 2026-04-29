@@ -615,9 +615,14 @@ message NodeLabelMatch {
   string key = 1;
   string value = 2;
 }
-// One hw-class definition: an ANDed label conjunction.
+// One hw-class definition: an ANDed label conjunction (stamped on
+// Nodes) plus the Karpenter instance-type requirements that PROVISION
+// that hardware. `labels` are post-launch Node stamps (rio.build/*);
+// `requirements` are what Karpenter's instance-type discovery resolves
+// against (karpenter.k8s.aws/*, kubernetes.io/arch).
 message HwClassLabels {
   repeated NodeLabelMatch labels = 1;
+  repeated NodeSelectorRequirement requirements = 2;
 }
 message GetHwClassConfigResponse {
   // h → `[sla.hw_classes.$h].labels`. The controller matches a Node's

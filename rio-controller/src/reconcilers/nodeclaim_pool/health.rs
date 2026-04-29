@@ -18,7 +18,7 @@
 //! Dead reaping is capped at `min(3, ⌈5%·|live|⌉)` per tick — a false-
 //! positive scheduler signal can't drain the fleet in one tick.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use kube::Api;
 use kube::api::DeleteParams;
@@ -28,6 +28,18 @@ use tracing::{debug, warn};
 use super::NodeClaimPoolConfig;
 use super::ffd::LiveNode;
 use super::sketch::{Cell, CellSketches};
+
+/// `Launched=False` `reason` values Karpenter posts before GCing a
+/// claim it can't fulfil. Distinct from a slow-but-progressing launch
+/// (e.g. `Pending`/`AwaitingReconciliation`): on these, Karpenter
+/// deletes ~1s later, so the `age > timeout` gate never fires —
+/// `classify` short-circuits to `Ice` on observing the reason.
+const LAUNCH_FAILED_REASONS: &[&str] = &[
+    "LaunchFailed",
+    "InsufficientCapacity",
+    "InsufficientCapacityError",
+    "NodeClassNotReady",
+];
 
 /// Per-tick dead-node reap cap: `min(3, ⌈5%·|live|⌉)`. ICE/boot-timeout
 /// reaps are NOT capped — those NodeClaims have no backing capacity.
@@ -85,6 +97,18 @@ pub fn classify(
         if n.registered {
             continue;
         }
+        // Terminal launch-failure reason → ICE NOW (no timeout wait).
+        // Karpenter GCs the claim ~1s after posting these; the age
+        // gate below (~2×seed ≈ 30-90s) would never observe it. The
+        // reason check is the only window where the claim is still in
+        // `live` with the failure visible.
+        if let Some(("False", _)) = n.cond("Launched")
+            && n.cond_reason("Launched")
+                .is_some_and(|r| LAUNCH_FAILED_REASONS.contains(&r))
+        {
+            out.push((i, ReapReason::Ice));
+            continue;
+        }
         // In-flight: check ICE / boot-timeout.
         let Some(age) = n.age_secs(now_secs) else {
             continue;
@@ -107,6 +131,42 @@ pub fn classify(
         }
     }
     out
+}
+
+/// ICE detection for claims Karpenter GC'd between ticks. `inflight`
+/// holds `(name, cell)` for everything `cover_deficit` created and
+/// hasn't yet observed Registered/reaped. Any name absent from `live`
+/// was deleted by Karpenter (the controller never deletes its own
+/// in-flight claims) ⇒ the cell is unfulfillable. Names PRESENT in
+/// `live` are pruned (still in flight or registered — `classify` /
+/// `observe_registered` handle them).
+///
+/// This is the structural fix for the live B11 finding: Karpenter's
+/// `Launched=False reason=LaunchFailed` → GC happens in ~1s, faster
+/// than the 10s tick, so neither `classify`'s timeout path NOR its
+/// reason short-circuit ever sees the claim. Tick-over-tick absence
+/// detection is the only signal that survives.
+pub fn detect_vanished(inflight: &mut HashMap<String, Cell>, live: &[LiveNode]) -> Vec<Cell> {
+    let live_names: HashSet<&str> = live.iter().map(|n| n.name.as_str()).collect();
+    let mut ice = Vec::new();
+    inflight.retain(|name, cell| {
+        if live_names.contains(name.as_str()) {
+            // Still in flight (or Registered) — drop from tracking;
+            // `classify` / `observe_registered` own it now.
+            false
+        } else {
+            warn!(%name, %cell, "in-flight NodeClaim vanished (Karpenter GC); ICE-masking cell");
+            metrics::counter!(
+                "rio_controller_nodeclaim_reaped_total",
+                "reason" => "vanished",
+                "cell" => cell.to_string(),
+            )
+            .increment(1);
+            ice.push(cell.clone());
+            false
+        }
+    });
+    ice
 }
 
 /// Reap unhealthy/ICE-stuck NodeClaims. Returns the set of cells hit
@@ -159,7 +219,7 @@ pub async fn reap_unhealthy(
 
 #[cfg(test)]
 mod tests {
-    use super::super::ffd::tests::{node, with_conds};
+    use super::super::ffd::tests::{node, with_conds, with_conds_reason};
     use super::super::sketch::CapacityType;
     use super::*;
 
@@ -168,6 +228,50 @@ mod tests {
             lead_time_seed: [(format!("{h}:spot"), seed)].into(),
             ..Default::default()
         }
+    }
+
+    /// `Launched=False reason=LaunchFailed` → ICE immediately, even
+    /// well under timeout. Karpenter GCs the claim ~1s after posting
+    /// this; the timeout-based path never observes it. Live B11
+    /// finding: 0 instance types matched `rio.build/*` requirements →
+    /// `InsufficientCapacityError` → GC'd ~1s later → controller
+    /// re-created every tick.
+    #[test]
+    fn ice_immediate_on_launch_failed_reason() {
+        let cfg = cfg_seeded("h", 45.0);
+        let sk = CellSketches::default();
+        let mut ice = with_conds_reason(
+            node("ice", "h", CapacityType::Spot, 8, 0, 0),
+            &[("Launched", "False", 1001.0, "LaunchFailed")],
+        );
+        ice.registered = false;
+        // age=2s ≪ 2×45=90s timeout → reason short-circuit fires anyway.
+        let r = classify(&[ice], &HashSet::new(), &sk, &cfg, 1002.0);
+        assert_eq!(r, vec![(0, ReapReason::Ice)]);
+        // Non-terminal reason (e.g. empty / Pending) at age=2s → healthy
+        // (still in timeout window).
+        let mut pending = with_conds_reason(
+            node("p", "h", CapacityType::Spot, 8, 0, 0),
+            &[("Launched", "False", 1001.0, "Pending")],
+        );
+        pending.registered = false;
+        assert!(classify(&[pending], &HashSet::new(), &sk, &cfg, 1002.0).is_empty());
+    }
+
+    /// `detect_vanished`: in-flight claim absent from `live` → cell
+    /// ICE'd + entry removed. Present → entry removed (handed off to
+    /// classify), no ICE.
+    #[test]
+    fn detect_vanished_masks_gcd_claims() {
+        let h = Cell("h".into(), CapacityType::Spot);
+        let mut inflight: HashMap<String, Cell> =
+            [("nc-gone".into(), h.clone()), ("nc-live".into(), h.clone())].into();
+        let live = [node("nc-live", "h", CapacityType::Spot, 8, 0, 0)];
+        let ice = detect_vanished(&mut inflight, &live);
+        assert_eq!(ice, vec![h]);
+        assert!(inflight.is_empty(), "both entries pruned");
+        // Second call: nothing tracked → no ICE (idempotent).
+        assert!(detect_vanished(&mut inflight, &live).is_empty());
     }
 
     /// `Launched=False` past `2×seed` → ICE. Under timeout → healthy.

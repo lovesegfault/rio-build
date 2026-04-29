@@ -783,7 +783,22 @@ impl AdminService for AdminServiceImpl {
                         value: l.value.clone(),
                     })
                     .collect();
-                (h.clone(), rio_proto::types::HwClassLabels { labels })
+                let requirements = def
+                    .requirements
+                    .iter()
+                    .map(|r| rio_proto::types::NodeSelectorRequirement {
+                        key: r.key.clone(),
+                        operator: r.operator.clone(),
+                        values: r.values.clone(),
+                    })
+                    .collect();
+                (
+                    h.clone(),
+                    rio_proto::types::HwClassLabels {
+                        labels,
+                        requirements,
+                    },
+                )
             })
             .collect();
         Ok(Response::new(GetHwClassConfigResponse { hw_classes }))
