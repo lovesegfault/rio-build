@@ -58,23 +58,25 @@ spec:
               idle for 5m. Check system/kind routing and ghost-executor
               accumulation.
 
-        # ADR-023 §13b: rio-packed second kube-scheduler. Builder pods
-        # set `schedulerName: rio-packed`; if THIS scheduler's active
-        # queue is non-empty for 60s, builder pods are stuck Pending
-        # (rio-packed crashlooped, RBAC drift, or NodeClaim deficit
-        # cover stalled). The default kube-scheduler ignores rio-packed
-        # pods so they stay Pending forever — page-worthy.
-        - alert: RioPackedSchedulerPendingStuck
-          expr: scheduler_pending_pods{queue="active",profile="rio-packed"} > 0
+        # ADR-023 §13b: kube-build-scheduler second kube-scheduler.
+        # Builder pods set `schedulerName: kube-build-scheduler`; if
+        # THIS scheduler's active queue is non-empty for 60s, builder
+        # pods are stuck Pending (kube-build-scheduler crashlooped,
+        # RBAC drift, or NodeClaim deficit cover stalled). The default
+        # kube-scheduler ignores kube-build-scheduler pods so they stay
+        # Pending forever — page-worthy.
+        - alert: KubeBuildSchedulerPendingStuck
+          expr: scheduler_pending_pods{queue="active",profile="kube-build-scheduler"} > 0
           for: 60s
           labels:
             severity: warning
           annotations:
-            summary: rio-packed scheduler has pods stuck Pending
+            summary: kube-build-scheduler has pods stuck Pending
             description: >-
               {{`{{ $value | humanize }}`}} builder pod(s) are in the
-              rio-packed active queue for >60s. Check rio-packed-scheduler
-              pod health and nodeclaim_pool reconciler deficit cover.
+              kube-build-scheduler active queue for >60s. Check
+              kube-build-scheduler pod health and nodeclaim_pool
+              reconciler deficit cover.
 
         # Forward-compat: rio_store_putpath_retries_total lands in P0539d.
         # Until then this expr evaluates empty (no series) → never fires.

@@ -238,42 +238,42 @@ subjects:
     namespace: {{ $ns }}
 {{- end }}
 
-{{- if .Values.packedScheduler.enabled }}
+{{- if .Values.buildScheduler.enabled }}
 ---
-# rio-packed second kube-scheduler RBAC (ADR-023 §13b). Upstream
-# `system:kube-scheduler` + `system:volume-scheduler` ClusterRoles
-# cover pods/bindings/nodes/PV/PVC/CSI; bind the rio-packed SA to
-# both. Second-scheduler SAs aren't auto-bound (only the User
-# `system:kube-scheduler` is) — without these the pod 403s on every
-# watch.
+# kube-build-scheduler second kube-scheduler RBAC (ADR-023 §13b).
+# Upstream `system:kube-scheduler` + `system:volume-scheduler`
+# ClusterRoles cover pods/bindings/nodes/PV/PVC/CSI; bind the
+# kube-build-scheduler SA to both. Second-scheduler SAs aren't
+# auto-bound (only the User `system:kube-scheduler` is) — without
+# these the pod 403s on every watch.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: rio-packed-scheduler
+  name: kube-build-scheduler
   labels:
-    {{- include "rio.labels" (dict "root" . "name" "rio-packed-scheduler" "component" "scheduler") | nindent 4 }}
+    {{- include "rio.labels" (dict "root" . "name" "kube-build-scheduler" "component" "scheduler") | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: system:kube-scheduler
 subjects:
   - kind: ServiceAccount
-    name: rio-packed-scheduler
+    name: kube-build-scheduler
     namespace: {{ $ns }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: rio-packed-volume-scheduler
+  name: kube-build-volume-scheduler
   labels:
-    {{- include "rio.labels" (dict "root" . "name" "rio-packed-scheduler" "component" "scheduler") | nindent 4 }}
+    {{- include "rio.labels" (dict "root" . "name" "kube-build-scheduler" "component" "scheduler") | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: system:volume-scheduler
 subjects:
   - kind: ServiceAccount
-    name: rio-packed-scheduler
+    name: kube-build-scheduler
     namespace: {{ $ns }}
 ---
 # kube-scheduler reads kube-system/extension-apiserver-authentication
@@ -283,52 +283,52 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: rio-packed-auth-reader
+  name: kube-build-scheduler-auth-reader
   namespace: kube-system
   labels:
-    {{- include "rio.labels" (dict "root" . "name" "rio-packed-scheduler" "component" "scheduler") | nindent 4 }}
+    {{- include "rio.labels" (dict "root" . "name" "kube-build-scheduler" "component" "scheduler") | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: extension-apiserver-authentication-reader
 subjects:
   - kind: ServiceAccount
-    name: rio-packed-scheduler
+    name: kube-build-scheduler
     namespace: {{ $ns }}
 ---
-# Own Lease (`rio-packed` in {{ $ns }}). system:kube-scheduler only
-# grants leases on resourceNames=[kube-scheduler] in kube-system; the
-# KubeSchedulerConfiguration points leaderElection at {{ $ns }}/
-# rio-packed instead so the two schedulers never contend.
+# Own Lease (`kube-build-scheduler` in {{ $ns }}). system:kube-scheduler
+# only grants leases on resourceNames=[kube-scheduler] in kube-system;
+# the KubeSchedulerConfiguration points leaderElection at {{ $ns }}/
+# kube-build-scheduler instead so the two schedulers never contend.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: rio-packed-lease
+  name: kube-build-scheduler-lease
   namespace: {{ $ns }}
   labels:
-    {{- include "rio.labels" (dict "root" . "name" "rio-packed-scheduler" "component" "scheduler") | nindent 4 }}
+    {{- include "rio.labels" (dict "root" . "name" "kube-build-scheduler" "component" "scheduler") | nindent 4 }}
 rules:
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
     verbs: [create]
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
-    resourceNames: [rio-packed]
+    resourceNames: [kube-build-scheduler]
     verbs: [get, update]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: rio-packed-lease
+  name: kube-build-scheduler-lease
   namespace: {{ $ns }}
   labels:
-    {{- include "rio.labels" (dict "root" . "name" "rio-packed-scheduler" "component" "scheduler") | nindent 4 }}
+    {{- include "rio.labels" (dict "root" . "name" "kube-build-scheduler" "component" "scheduler") | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: rio-packed-lease
+  name: kube-build-scheduler-lease
 subjects:
   - kind: ServiceAccount
-    name: rio-packed-scheduler
+    name: kube-build-scheduler
     namespace: {{ $ns }}
 {{- end }}

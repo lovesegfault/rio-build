@@ -80,7 +80,7 @@ pub struct LiveNode {
     // over `spec.nodeName == self.node_name` (needs a pod-by-node
     // informer cache; the apiserver list-per-tick is too chatty at
     // ~10s × N_nodes). B12 routes builder pods via `schedulerName:
-    // rio-packed` so they land on these claims now; until the sum is
+    // kube-build-scheduler` so they land on these claims now; until the sum is
     // wired `free()` on a Registered node over-reports by whatever's
     // already bound. Drift is observable as `ffd_unplaced_cores` high
     // with `nodeclaim_live{state=registered}` non-zero.

@@ -184,20 +184,21 @@ controller:
     limits: {memory: 1Gi}
 
 # ──────────────────────────────────────────────────────────────────────────
-# rio-packed — second kube-scheduler (ADR-023 §13b)
+# kube-build-scheduler — second kube-scheduler (ADR-023 §13b)
 # ──────────────────────────────────────────────────────────────────────────
 # Upstream registry.k8s.io/kube-scheduler with a `MostAllocated`
-# NodeResourcesFit scoring profile under `schedulerName: rio-packed`.
-# Builder Jobs set `spec.schedulerName: rio-packed` (B12) so the
-# default kube-scheduler ignores them; this instance bin-packs onto the
-# fewest nodes so the nodeclaim_pool FFD simulation and Karpenter's
-# consolidation see tight residuals. replicas=2, leader-elects on its
-# own Lease (rio-packed in rio-system).
+# NodeResourcesFit scoring profile under `schedulerName:
+# kube-build-scheduler`. Builder Jobs set `spec.schedulerName:
+# kube-build-scheduler` (B12) so the default kube-scheduler ignores
+# them; this instance bin-packs onto the fewest nodes so the
+# nodeclaim_pool FFD simulation and Karpenter's consolidation see tight
+# residuals. replicas=2, leader-elects on its own Lease
+# (kube-build-scheduler in rio-system).
 #
 # Disabled in airgapped vmtest profiles (registry.k8s.io image isn't
 # preloaded). The 10 PriorityClasses (templates/priorityclass.yaml)
 # render unconditionally — they're referenced by builder pods regardless.
-packedScheduler:
+buildScheduler:
   enabled: true
   # Upstream kube-scheduler image. Digest-pinned (03-digest-pin policy:
   # floating third-party tag → ImagePullBackOff on upstream churn). Tag

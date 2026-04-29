@@ -9,7 +9,7 @@
 #     cannot load via Env provider; the helm ConfigMap is the only path)
 #   - LiveNode::from parses real apiserver-round-tripped status
 #     (lastTransitionTime as RFC3339, allocatable as Quantity strings)
-#   - rio-packed second kube-scheduler Deployment runs + builder Jobs
+#   - kube-build-scheduler second kube-scheduler Deployment runs + builder Jobs
 #     get schedulerName/priorityClassName per r[ctrl.nodeclaim.
 #     priority-bucket]
 #   - r[ctrl.nodeclaim.shim-nodepool]: created NodeClaims carry
@@ -48,14 +48,14 @@ pkgs.testers.runNixOSTest {
 
     import json as _json
 
-    # ── kwok-controller + rio-packed scheduler up ────────────────────
+    # ── kwok-controller + kube-build-scheduler up ────────────────────
     k3s_server.wait_until_succeeds(
         "k3s kubectl -n kube-system rollout status deploy/kwok-controller "
         "--timeout=60s",
         timeout=120,
     )
     k3s_server.wait_until_succeeds(
-        "k3s kubectl -n ${ns} rollout status deploy/rio-packed-scheduler "
+        "k3s kubectl -n ${ns} rollout status deploy/kube-build-scheduler "
         "--timeout=60s",
         timeout=120,
     )
@@ -119,19 +119,19 @@ pkgs.testers.runNixOSTest {
     )
     assert alloc.strip(), f"status.allocatable.cpu unpopulated: {alloc!r}"
 
-    # ── builder Job stamped schedulerName=rio-packed ─────────────────
+    # ── builder Job stamped schedulerName=kube-build-scheduler ───────
     # PlaceableGate publishes after a Registered claim appears; next
-    # Pool-reconciler tick spawns Jobs with rio-packed +
+    # Pool-reconciler tick spawns Jobs with kube-build-scheduler +
     # priorityClassName per r[ctrl.nodeclaim.priority-bucket].
     wait_worker_pod(pool="x86-64", ns="${nsBuilders}", timeout=120)
-    with subtest("builder pod has schedulerName=rio-packed + priorityClass"):
+    with subtest("builder pod has schedulerName=kube-build-scheduler + priorityClass"):
         pod = k3s_server.succeed(
             "k3s kubectl -n ${nsBuilders} get pods -l rio.build/pool=x86-64 "
             "-o jsonpath='{.items[0].spec.schedulerName} "
             "{.items[0].spec.priorityClassName}'"
         ).strip()
         sched, _, prio = pod.partition(" ")
-        assert sched == "rio-packed", f"schedulerName={sched!r}"
+        assert sched == "kube-build-scheduler", f"schedulerName={sched!r}"
         assert prio.startswith("rio-build-"), f"priorityClassName={prio!r}"
 
     # ── B14 metric pipeline emitted ──────────────────────────────────

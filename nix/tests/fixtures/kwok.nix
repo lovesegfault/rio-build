@@ -13,9 +13,9 @@
 # DDSketch, `placeable` publishes.
 #
 # `kube-scheduler` (matching the `pins.nix` minor) is preloaded so
-# `packedScheduler.enabled=true` renders a working second-scheduler
+# `buildScheduler.enabled=true` renders a working second-scheduler
 # Deployment — the `forecast-provisioning` subtest asserts builder
-# pods get `schedulerName: rio-packed` per `r[ctrl.nodeclaim.
+# pods get `schedulerName: kube-build-scheduler` per `r[ctrl.nodeclaim.
 # priority-bucket]`.
 { pkgs }:
 let
@@ -35,8 +35,8 @@ let
   };
 
   # Upstream kube-scheduler matching `pins.kubernetes_version`. The
-  # rio-packed Deployment (templates/kube-scheduler-packed.yaml)
-  # `image:` is set via `packedScheduler.image` in extraValues by the
+  # kube-build-scheduler Deployment (templates/kube-build-scheduler.yaml)
+  # `image:` is set via `buildScheduler.image` in extraValues by the
   # consumer. v1.35.x latest patch — k3s-full pins the SAME minor so
   # API surface matches.
   kubeSchedulerImage = pkgs.dockerTools.pullImage {
@@ -301,8 +301,8 @@ in
     kubeSchedulerImage
   ];
 
-  # Tag the chart's `packedScheduler.image` should be set to. Exposed
-  # so default.nix can wire `extraValues."packedScheduler.image"`
+  # Tag the chart's `buildScheduler.image` should be set to. Exposed
+  # so default.nix can wire `extraValues."buildScheduler.image"`
   # without hardcoding the tag in two places.
   kubeSchedulerRef = "registry.k8s.io/kube-scheduler:v1.35.4";
 

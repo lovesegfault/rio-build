@@ -90,20 +90,20 @@ const WORKER_DEADLINE_SLACK_SECS: i64 = 90;
 /// `schedulerName` set on builder pods when `nodeclaim_pool.enabled`.
 /// The helm-deployed second kube-scheduler (B2, MostAllocated scoring)
 /// is the only scheduler watching this name; the default kube-scheduler
-/// ignores rio-packed pods entirely.
-pub(crate) const RIO_PACKED_SCHEDULER: &str = "rio-packed";
+/// ignores kube-build-scheduler pods entirely.
+pub(crate) const KUBE_BUILD_SCHEDULER: &str = "kube-build-scheduler";
 
 /// `priorityClassName` prefix; suffix is [`priority_bucket`]. B2 renders
 /// 10 fixed PriorityClasses `rio-builder-prio-{0..9}` with
 /// `preemptionPolicy: Never` so a high-bucket pod sorts ahead in
-/// rio-packed's queue without evicting a running low-bucket build.
+/// kube-build-scheduler's queue without evicting a running low-bucket build.
 pub(crate) const PRIORITY_CLASS_PREFIX: &str = "rio-builder-prio-";
 
 /// ADR-023 §13b priority bucket: `⌊log₂ c*⌋` clamped to `[0, 9]`. The
 /// scheduler's `SlaConfig::validate` asserts `maxCores < 1024 = 2¹⁰` so
 /// the clamp is reachable only via that config's ceiling, not normal
 /// solves. `cores = 0` (proto default; FOD/unfitted intents may emit
-/// it) → bucket 0. Larger builds sort first in rio-packed's active
+/// it) → bucket 0. Larger builds sort first in kube-build-scheduler's active
 /// queue so the FFD sim's largest-first packing is honoured at bind
 /// time — the keystone that makes [`super::super::nodeclaim_pool::
 /// PlaceableGate`]'s prediction self-fulfilling.
@@ -787,10 +787,10 @@ pub(super) fn build_job(
     // (the placeable gate doesn't cover FOD nodes), so leaving them on
     // the default scheduler keeps both reconcilers' invariants intact.
     // Gated on `nodeclaim_pool.enabled` so legacy 12-NodePool mode
-    // still uses the default scheduler (rio-packed isn't deployed
-    // there).
+    // still uses the default scheduler (kube-build-scheduler isn't
+    // deployed there).
     if nodeclaim_pool_enabled && pool.spec.kind == ExecutorKind::Builder {
-        pod_spec.scheduler_name = Some(RIO_PACKED_SCHEDULER.into());
+        pod_spec.scheduler_name = Some(KUBE_BUILD_SCHEDULER.into());
         pod_spec.priority_class_name = Some(format!(
             "{PRIORITY_CLASS_PREFIX}{}",
             priority_bucket(intent.cores)
@@ -974,7 +974,7 @@ mod tests {
     }
 
     /// `build_job` wrapper for tests that don't exercise the §13a
-    /// hw-bench gate or §13b rio-packed routing. Empty cache + 0 floor
+    /// hw-bench gate or §13b kube-build-scheduler routing. Empty cache + 0 floor
     /// → `bench_needed = false` (vacuous on `A = ∅`);
     /// `nodeclaim_pool_enabled = false` → no schedulerName/priorityClass.
     fn job(pool: &Pool, i: &SpawnIntent) -> Job {
@@ -1469,12 +1469,12 @@ mod tests {
 
     // r[verify ctrl.nodeclaim.priority-bucket]
     /// `nodeclaim_pool.enabled` ⇒ builder pods get `schedulerName:
-    /// rio-packed` + `priorityClassName: rio-builder-prio-{⌊log₂ c*⌋}`.
+    /// kube-build-scheduler` + `priorityClassName: rio-builder-prio-{⌊log₂ c*⌋}`.
     /// Disabled ⇒ neither (legacy mode uses default scheduler).
     /// Fetcher pods NEVER get them (placeable gate doesn't cover the
     /// dedicated fetcher pool).
     #[test]
-    fn build_job_stamps_rio_packed_and_priority_when_enabled() {
+    fn build_job_stamps_kube_build_scheduler_and_priority_when_enabled() {
         let i = SpawnIntent {
             intent_id: "abc".into(),
             cores: 17,
@@ -1484,7 +1484,7 @@ mod tests {
         let pod = |j: &Job| j.spec.as_ref().unwrap().template.spec.clone().unwrap();
 
         let on = pod(&job_gated(&builder, &i, true));
-        assert_eq!(on.scheduler_name.as_deref(), Some(RIO_PACKED_SCHEDULER));
+        assert_eq!(on.scheduler_name.as_deref(), Some(KUBE_BUILD_SCHEDULER));
         assert_eq!(
             on.priority_class_name.as_deref(),
             Some("rio-builder-prio-4"),

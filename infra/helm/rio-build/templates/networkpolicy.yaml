@@ -204,23 +204,23 @@ spec:
             k8s:app.kubernetes.io/name: postgresql
       toPorts: [{ports: [{port: "5432", protocol: TCP}]}]
     {{- end }}
-{{- if .Values.packedScheduler.enabled }}
+{{- if .Values.buildScheduler.enabled }}
 ---
-# rio-packed second kube-scheduler egress: DNS + kube-apiserver only
-# (mirrors rio-controller-egress — its sole upstream is the k8s API
+# kube-build-scheduler second kube-scheduler egress: DNS + kube-apiserver
+# only (mirrors rio-controller-egress — its sole upstream is the k8s API
 # for pod/node watch + binding write). Same `host`/`remote-node`
 # fallback for k3s/embedded-apiserver topologies.
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
-  name: rio-packed-scheduler-egress
+  name: kube-build-scheduler-egress
   namespace: {{ $ns.system.name }}
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
   endpointSelector:
     matchLabels:
-      app.kubernetes.io/name: rio-packed-scheduler
+      app.kubernetes.io/name: kube-build-scheduler
   egress:
     - toEndpoints:
         - matchLabels:

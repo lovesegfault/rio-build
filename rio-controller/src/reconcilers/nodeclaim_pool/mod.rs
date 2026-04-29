@@ -106,7 +106,7 @@ impl PlaceableGate {
         Self(None)
     }
 
-    /// `nodeclaim_pool.enabled`. Drives `schedulerName: rio-packed` +
+    /// `nodeclaim_pool.enabled`. Drives `schedulerName: kube-build-scheduler` +
     /// `priorityClassName` stamping in `build_job` AND switches `jobs.rs`
     /// from the §13a `ready` gate to the §13b placeable gate.
     pub fn enabled(&self) -> bool {

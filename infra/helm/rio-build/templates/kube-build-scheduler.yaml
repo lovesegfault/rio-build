@@ -1,12 +1,12 @@
-{{- define "rio.packedSchedulerConfig" -}}
+{{- define "rio.buildSchedulerConfig" -}}
 apiVersion: kubescheduler.config.k8s.io/v1
 kind: KubeSchedulerConfiguration
 leaderElection:
   leaderElect: true
-  resourceName: rio-packed
+  resourceName: kube-build-scheduler
   resourceNamespace: {{ .Values.namespaces.system.name }}
 profiles:
-  - schedulerName: rio-packed
+  - schedulerName: kube-build-scheduler
     pluginConfig:
       - name: NodeResourcesFit
         args:
@@ -16,61 +16,62 @@ profiles:
               - name: cpu
                 weight: 1
 {{- end }}
-{{- if .Values.packedScheduler.enabled }}
+{{- if .Values.buildScheduler.enabled }}
 {{- $ns := .Values.namespaces.system.name -}}
 # ADR-023 §13b: second kube-scheduler instance with `schedulerName:
-# rio-packed` and MostAllocated scoring. Builder pods set
-# `spec.schedulerName: rio-packed` (B12) so the default kube-scheduler
-# ignores them; this instance bin-packs onto the fewest nodes (vs the
-# default LeastAllocated spread) so the nodeclaim_pool reconciler's FFD
-# simulation (B7) and Karpenter's consolidation see tight residuals.
+# kube-build-scheduler` and MostAllocated scoring. Builder pods set
+# `spec.schedulerName: kube-build-scheduler` (B12) so the default
+# kube-scheduler ignores them; this instance bin-packs onto the fewest
+# nodes (vs the default LeastAllocated spread) so the nodeclaim_pool
+# reconciler's FFD simulation (B7) and Karpenter's consolidation see
+# tight residuals.
 #
-# Leader-elects on its OWN Lease (`rio-packed` in {{ $ns }}, NOT the
-# cluster-default `kube-scheduler` lease in kube-system) so two
+# Leader-elects on its OWN Lease (`kube-build-scheduler` in {{ $ns }},
+# NOT the cluster-default `kube-scheduler` lease in kube-system) so two
 # replicas active/standby without contending with the cluster's primary
 # scheduler.
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: rio-packed-scheduler-config
+  name: kube-build-scheduler-config
   namespace: {{ $ns }}
   labels:
-    {{- include "rio.labels" (dict "root" . "name" "rio-packed-scheduler" "component" "scheduler") | nindent 4 }}
+    {{- include "rio.labels" (dict "root" . "name" "kube-build-scheduler" "component" "scheduler") | nindent 4 }}
 data:
   config.yaml: |
-    {{- include "rio.packedSchedulerConfig" . | nindent 4 }}
+    {{- include "rio.buildSchedulerConfig" . | nindent 4 }}
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: rio-packed-scheduler
+  name: kube-build-scheduler
   namespace: {{ $ns }}
   labels:
-    {{- include "rio.labels" (dict "root" . "name" "rio-packed-scheduler" "component" "scheduler") | nindent 4 }}
+    {{- include "rio.labels" (dict "root" . "name" "kube-build-scheduler" "component" "scheduler") | nindent 4 }}
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: rio-packed-scheduler
+  name: kube-build-scheduler
   namespace: {{ $ns }}
   labels:
-    {{- include "rio.labels" (dict "root" . "name" "rio-packed-scheduler" "component" "scheduler") | nindent 4 }}
+    {{- include "rio.labels" (dict "root" . "name" "kube-build-scheduler" "component" "scheduler") | nindent 4 }}
 spec:
   replicas: 2
   selector:
     matchLabels:
-      {{- include "rio.selectorLabels" "rio-packed-scheduler" | nindent 6 }}
+      {{- include "rio.selectorLabels" "kube-build-scheduler" | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "rio.labels" (dict "root" . "name" "rio-packed-scheduler" "component" "scheduler") | nindent 8 }}
+        {{- include "rio.labels" (dict "root" . "name" "kube-build-scheduler" "component" "scheduler") | nindent 8 }}
       annotations:
         # ConfigMap edits don't restart pods on their own — checksum the
         # rendered config so a scoringStrategy change rolls the Deployment.
-        checksum/config: {{ include "rio.packedSchedulerConfig" . | sha256sum }}
+        checksum/config: {{ include "rio.buildSchedulerConfig" . | sha256sum }}
     spec:
-      serviceAccountName: rio-packed-scheduler
+      serviceAccountName: kube-build-scheduler
       {{- if .Values.karpenter.enabled }}
       nodeSelector:
         rio.build/node-role: general
@@ -80,7 +81,7 @@ spec:
         - name: kube-scheduler
           # Upstream image, digest-pinned (03-digest-pin); tag tracks the
           # EKS control-plane minor so scheduler-API skew stays within ±1.
-          image: {{ required "packedScheduler.enabled requires .Values.packedScheduler.image" .Values.packedScheduler.image }}
+          image: {{ required "buildScheduler.enabled requires .Values.buildScheduler.image" .Values.buildScheduler.image }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
           {{- include "rio.containerSecurityContext" . | nindent 10 }}
           command:
@@ -105,9 +106,9 @@ spec:
               mountPath: /etc/kubernetes
               readOnly: true
           resources:
-            {{- toYaml .Values.packedScheduler.resources | nindent 12 }}
+            {{- toYaml .Values.buildScheduler.resources | nindent 12 }}
       volumes:
         - name: config
           configMap:
-            name: rio-packed-scheduler-config
+            name: kube-build-scheduler-config
 {{- end }}

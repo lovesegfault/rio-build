@@ -1,7 +1,7 @@
 # ADR-023 §13b: 10 PriorityClasses for the c*-bucket → kube-scheduler
 # priority mapping. The Pool reconciler stamps `priorityClassName:
 # rio-builder-prio-⌊log₂ c*⌋` on each builder Job's pod spec (B12);
-# rio-packed (the second kube-scheduler, MostAllocated scoring) sorts
+# kube-build-scheduler (the second kube-scheduler, MostAllocated scoring) sorts
 # its queue by this so high-core builds bind first → fewer fragmented
 # nodes.
 #

@@ -458,7 +458,7 @@ The per-tick NodeClaim-pool reconcile simulates placement via
 first-fit-decreasing — intents sorted `(eta=0, c*)` descending (Ready
 before forecast, large before small), bin-select `MostAllocated` on
 the `allocatable` divisor — so the deficit is the unplaced residual
-and matches the `schedulerName: rio-packed` instance.
+and matches the `schedulerName: kube-build-scheduler` instance.
 
 r[ctrl.nodeclaim.anchor-bulk]
 Unplaced intents per `(h,cap)` cell are covered by `1×anchor`
@@ -498,7 +498,7 @@ directly (`rio-nvme` / `rio-default` by storage); rio owns deletion.
 r[ctrl.nodeclaim.priority-bucket]
 Builder pods MUST set `priorityClassName=rio-builder-prio-{⌊log₂c*⌋}`
 (10 fixed PriorityClasses, buckets 0–9, `globalDefault:false`,
-`preemptionPolicy:Never`) and `schedulerName=rio-packed`. Config-load
+`preemptionPolicy:Never`) and `schedulerName=kube-build-scheduler`. Config-load
 asserts `maxCores < 1024`.
 
 r[ctrl.nodeclaim.placeable-gate]

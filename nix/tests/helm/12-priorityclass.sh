@@ -1,6 +1,6 @@
 # ADR-023 §13b: 10 PriorityClasses (rio-builder-prio-{0..9}) render
-# unconditionally with preemptionPolicy=Never; rio-packed scheduler
-# Deployment + RBAC render under packedScheduler.enabled (default on).
+# unconditionally with preemptionPolicy=Never; kube-build-scheduler
+# Deployment + RBAC render under buildScheduler.enabled (default on).
 
 out=$TMPDIR/prio.yaml
 helm template rio . --set global.image.tag=test >"$out"
@@ -21,19 +21,19 @@ test "$n" -eq 10 || {
   exit 1
 }
 
-# rio-packed: Deployment with schedulerName profile + MostAllocated in
+# kube-build-scheduler: Deployment with schedulerName profile + MostAllocated in
 # the ConfigMap, plus the two system:* ClusterRoleBindings.
-yq -N 'select(.kind=="Deployment" and .metadata.name=="rio-packed-scheduler")' "$out" \
+yq -N 'select(.kind=="Deployment" and .metadata.name=="kube-build-scheduler")' "$out" \
   | grep -q 'kube-scheduler' || {
-  echo "FAIL: rio-packed-scheduler Deployment missing" >&2
+  echo "FAIL: kube-build-scheduler Deployment missing" >&2
   exit 1
 }
-yq -N 'select(.kind=="ConfigMap" and .metadata.name=="rio-packed-scheduler-config") | .data["config.yaml"]' "$out" \
+yq -N 'select(.kind=="ConfigMap" and .metadata.name=="kube-build-scheduler-config") | .data["config.yaml"]' "$out" \
   | grep -q 'type: MostAllocated' || {
   echo "FAIL: KubeSchedulerConfiguration missing MostAllocated scoring" >&2
   exit 1
 }
-for crb in rio-packed-scheduler rio-packed-volume-scheduler; do
+for crb in kube-build-scheduler kube-build-volume-scheduler; do
   yq -N "select(.kind==\"ClusterRoleBinding\" and .metadata.name==\"$crb\")" "$out" \
     | grep -q 'kind: ClusterRoleBinding' || {
     echo "FAIL: ClusterRoleBinding $crb missing" >&2
@@ -41,12 +41,12 @@ for crb in rio-packed-scheduler rio-packed-volume-scheduler; do
   }
 done
 
-# vmtest-full disables packedScheduler (airgap); PriorityClasses still render.
+# vmtest-full disables buildScheduler (airgap); PriorityClasses still render.
 out2=$TMPDIR/prio-vmtest.yaml
 helm template rio . -f values/vmtest-full.yaml >"$out2"
-yq -N 'select(.kind=="Deployment" and .metadata.name=="rio-packed-scheduler")' "$out2" \
+yq -N 'select(.kind=="Deployment" and .metadata.name=="kube-build-scheduler")' "$out2" \
   | grep -q . && {
-  echo "FAIL: vmtest-full should not render rio-packed-scheduler Deployment" >&2
+  echo "FAIL: vmtest-full should not render kube-build-scheduler Deployment" >&2
   exit 1
 }
 n=$(yq -N 'select(.kind=="PriorityClass")' "$out2" | grep -c '^kind:')

@@ -733,9 +733,9 @@ in
   # First test running rio-controller with `nodeclaim_pool.enabled =
   # true`. Karpenter is faked: KWOK Stage rules progress NodeClaim
   # status (Launched→Registered, populate allocatable from
-  # spec.resources.requests). The kube-scheduler-packed Deployment runs
+  # spec.resources.requests). The kube-build-scheduler Deployment runs
   # for real (registry.k8s.io/kube-scheduler preloaded) so builder
-  # Jobs' `schedulerName: rio-packed` resolves.
+  # Jobs' `schedulerName: kube-build-scheduler` resolves.
   #
   # Distinct runNixOSTest name `rio-forecast-provisioning` (NOT a
   # `vm-sla-sizing-*` variant — sla-sizing.nix is standalone-tied;
@@ -761,11 +761,11 @@ in
       extraImages = kwok.airgapImages;
       extraManifests = kwok.manifests;
       extraValuesTyped = {
-        "packedScheduler.enabled" = true;
+        "buildScheduler.enabled" = true;
         "karpenter.nodeclaimPool.enabled" = true;
       };
       extraValues = {
-        "packedScheduler.image" = kwok.kubeSchedulerRef;
+        "buildScheduler.image" = kwok.kubeSchedulerRef;
       };
       extraValuesFiles =
         let
