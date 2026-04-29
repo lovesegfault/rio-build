@@ -946,21 +946,7 @@
           # tracked elsewhere. Each entry MUST have a comment naming the
           # gating gap; remove the entry (NOT the test) once the gap is
           # closed.
-          vmTestsManual = [
-            # ADR-023 §13b kwok fixture: B16 closed (instanceMenu /
-            # hwClasses / leadTimeSeed key-sets aligned to {vmtest} via
-            # per-subkey null overlay; controller boots, reconciler
-            # ticks, FFD sees unplaced=4). NEW gating gap: cover_deficit
-            # still emits created=0 — cold-start fanout drvs have no
-            # build_samples history → DurationFit::Probe →
-            # snapshot.rs:793 returns None from the hw-aware arm →
-            # SpawnIntent.hw_class_names=[] → cells_of() empty →
-            # assign_to_cells drops every intent. Promote to `checks`
-            # once the scheduler emits a non-empty hw_class_names for
-            # Probe-fit intents (or the reconciler covers hw-agnostic
-            # unplaced via a fallback cell).
-            "vm-sla-sizing-kwok"
-          ];
+          vmTestsManual = [ ];
 
           # Coverage-mode VM tests. Not in `checks` (too slow for flake
           # check) — exposed as packages.cov-vm-<scenario> for manual runs

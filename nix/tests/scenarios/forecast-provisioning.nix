@@ -64,6 +64,20 @@ pkgs.testers.runNixOSTest {
     k3s_server.wait_until_succeeds(
         "k3s kubectl get crd nodeclaims.karpenter.sh", timeout=60
     )
+    # KWOK's StagesManager runs RESTMapper discovery once on Stage-CR
+    # add; the k3s deploy-controller starts kwok-controller alongside
+    # the karpenter CRDs, so the karpenter.sh apigroup commonly isn't
+    # served yet → `failed to get gvk for gvr` and the NodeClaim
+    # resourceRef is dropped permanently. Restart now that the CRD is
+    # established so discovery resolves.
+    k3s_server.succeed(
+        "k3s kubectl -n kube-system rollout restart deploy/kwok-controller"
+    )
+    k3s_server.wait_until_succeeds(
+        "k3s kubectl -n kube-system rollout status deploy/kwok-controller "
+        "--timeout=60s",
+        timeout=90,
+    )
 
     # ── submit a build → scheduler emits SpawnIntents ────────────────
     # 4-leaf fanout: enough to produce ≥1 unplaced intent (zero
@@ -106,18 +120,73 @@ pkgs.testers.runNixOSTest {
     # ── KWOK Stage progresses NodeClaim → Registered=True ────────────
     # 2s Launched + 3s Registered delays; allow a few KWOK reconcile
     # ticks. Structural: Registered cond present + status.allocatable
-    # populated (LiveNode::from input).
-    k3s_server.wait_until_succeeds(
-        "k3s kubectl get nodeclaims -l rio.build/nodeclaim-pool=builder "
-        "-o jsonpath='{.items[*].status.conditions[?(@.type==\"Registered\")].status}' "
-        "| grep -q True",
-        timeout=60,
-    )
+    # populated (LiveNode::from input). On timeout dump kwok-controller
+    # logs — KWOK swallows gojq selector / template errors at info
+    # level, so a regressed Stage rule looks like silence otherwise.
+    try:
+        k3s_server.wait_until_succeeds(
+            "k3s kubectl get nodeclaims -l rio.build/nodeclaim-pool=builder "
+            "-o jsonpath='{.items[*].status.conditions[?(@.type==\"Registered\")].status}' "
+            "| grep -q True",
+            timeout=60,
+        )
+    except Exception:
+        print("=== NodeClaim never Registered — kwok Stage rule did not fire ===")
+        print(k3s_server.execute(
+            "k3s kubectl get nodeclaims -o yaml; "
+            "k3s kubectl get stages.kwok.x-k8s.io -o yaml; "
+            "k3s kubectl -n kube-system logs deploy/kwok-controller --tail=200"
+        )[1])
+        raise
     alloc = k3s_server.succeed(
         "k3s kubectl get nodeclaims -l rio.build/nodeclaim-pool=builder "
         "-o jsonpath='{.items[0].status.allocatable.cpu}'"
     )
     assert alloc.strip(), f"status.allocatable.cpu unpopulated: {alloc!r}"
+
+    # ── fake Node from NodeClaim (KWOK Stage cannot create CRs) ──────
+    # Karpenter copies NodeClaim.metadata.labels onto the launched Node;
+    # KWOK only patches the NodeClaim, so apply that Node manually with
+    # `kwok.x-k8s.io/node=fake` so KWOK manages it as a fake kubelet
+    # (Ready=True via the upstream `node-initialize` Stage, then
+    # `pod-ready` for anything kube-build-scheduler binds there).
+    # status.allocatable is seeded so the upstream Stage echoes it back
+    # as `.status.allocatable` and kube-scheduler admits the builder
+    # pod's resource requests.
+    nc0 = _json.loads(k3s_server.succeed(
+        "k3s kubectl get nodeclaims -l rio.build/nodeclaim-pool=builder "
+        "-o json"
+    ))["items"][0]
+    fake_node = {
+        "apiVersion": "v1",
+        "kind": "Node",
+        "metadata": {
+            "name": nc0["status"]["nodeName"],
+            "labels": {
+                **nc0["metadata"]["labels"],
+                "kubernetes.io/hostname": nc0["status"]["nodeName"],
+                "kubernetes.io/os": "linux",
+                "kubernetes.io/arch": "amd64",
+                "type": "kwok",
+            },
+            "annotations": {"kwok.x-k8s.io/node": "fake"},
+        },
+        "status": {
+            "allocatable": nc0["status"]["allocatable"],
+            "capacity": nc0["status"]["capacity"],
+        },
+    }
+    k3s_server.succeed(
+        "k3s kubectl apply -f - <<'EOF'\n"
+        + _json.dumps(fake_node)
+        + "\nEOF"
+    )
+    k3s_server.wait_until_succeeds(
+        f"k3s kubectl get node {nc0['status']['nodeName']} "
+        "-o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' "
+        "| grep -q True",
+        timeout=60,
+    )
 
     # ── builder Job stamped schedulerName=kube-build-scheduler ───────
     # PlaceableGate publishes after a Registered claim appears; next
@@ -132,7 +201,7 @@ pkgs.testers.runNixOSTest {
         ).strip()
         sched, _, prio = pod.partition(" ")
         assert sched == "kube-build-scheduler", f"schedulerName={sched!r}"
-        assert prio.startswith("rio-build-"), f"priorityClassName={prio!r}"
+        assert prio.startswith("rio-builder-prio-"), f"priorityClassName={prio!r}"
 
     # ── B14 metric pipeline emitted ──────────────────────────────────
     with subtest("nodeclaim_pool metrics emitted"):

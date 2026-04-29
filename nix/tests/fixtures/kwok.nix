@@ -127,25 +127,77 @@ let
           requirements: []
   '';
 
-  # KWOK in-cluster Deployment + RBAC + Stage CRD + the two Stage rules
-  # that fake Karpenter. KWOK's `--manage-nodes-with-annotation-
-  # selector=` (empty) means it manages ZERO Nodes — we don't want fake
-  # kubelets here (the k3s-agent is real); we only want the Stage
-  # engine driving NodeClaim status. `--enable-crds=Stage` opts into
-  # the Stage CRD watch.
+  # Upstream KWOK fast Node/Pod stages. With `--enable-crds=Stage`
+  # KWOK reads Stage CRs from the apiserver and does NOT load its
+  # compiled-in defaults (cmd/root.go only seeds defaults when the
+  # Stage CRD watch is off). The forecast-provisioning scenario
+  # creates a fake Node from each NodeClaim; without these stages KWOK
+  # would never set `Ready=True` on it nor `phase=Running` on pods
+  # bound there, so `wait_worker_pod` would hang.
+  kwokDefaultStages = pkgs.runCommand "kwok-default-stages.yaml" { } ''
+    for f in ${
+      pkgs.fetchurl {
+        url = "https://raw.githubusercontent.com/kubernetes-sigs/kwok/v0.7.0/kustomize/stage/node/fast/node-initialize.yaml";
+        sha256 = "1jy517kszipq4m0q6s878zlm3v7bbizdsmq146lw3vjii1pjpg13";
+      }
+    } ${
+      pkgs.fetchurl {
+        url = "https://raw.githubusercontent.com/kubernetes-sigs/kwok/v0.7.0/kustomize/stage/pod/fast/pod-ready.yaml";
+        sha256 = "15sr1hlyfw6r64w3h4zbdiy5khx7c05wjgnnnkxzf0v4p64x0pg6";
+      }
+    } ${
+      pkgs.fetchurl {
+        url = "https://raw.githubusercontent.com/kubernetes-sigs/kwok/v0.7.0/kustomize/stage/pod/fast/pod-complete.yaml";
+        sha256 = "1cikhnkf7r3r3rzn3b68rz7wyhr6g32dzc23iiyvvaqrfich1f46";
+      }
+    } ${
+      pkgs.fetchurl {
+        url = "https://raw.githubusercontent.com/kubernetes-sigs/kwok/v0.7.0/kustomize/stage/pod/fast/pod-delete.yaml";
+        sha256 = "0wvi5pyxr8ngvgb6jhmgmvwpypk66d7p40sx8pswabbsaimdwpjs";
+      }
+    }; do
+      cat "$f"; printf '\n---\n'
+    done > $out
+  '';
+
+  # KWOK in-cluster Deployment + RBAC + Stage CRD + the Stage rules
+  # that fake Karpenter. `--manage-nodes-with-annotation-selector=
+  # kwok.x-k8s.io/node=fake` scopes KWOK's fake-kubelet to ONLY the
+  # synthetic Nodes the test scenario creates from each Registered
+  # NodeClaim — the real k3s-agent (no annotation) is left alone.
+  # `--enable-crds=Stage` opts into the Stage CRD watch; KWOK's
+  # `startStageController` falls through to the generic dynamic-client
+  # path for any `resourceRef.kind` other than Node/Pod, so the
+  # NodeClaim stages run via an unstructured informer.
   #
-  # Stage `nodeclaim-launched`: at age≥2s, no Launched cond yet → set
-  # `status.{capacity,allocatable}` = `spec.resources.requests` (so
-  # `LiveNode::from` reads the cores/mem/disk the controller asked
-  # for) + Launched=True. Stage `nodeclaim-registered`: at age≥5s,
-  # Launched=True ∧ no Registered cond → Registered=True +
-  # `status.nodeName` (synthetic; no real Node — `boot_secs()` only
-  # reads the condition's lastTransitionTime). 5s−0s = boot_secs ≈ 5s
-  # → DDSketch records ~5, lead_time gauge ~5 once one claim cycles.
+  # Stage chain on `karpenter.sh/v1` NodeClaim. Two non-obvious bits:
+  #   - `resourceRef.apiGroup` is fed to `schema.ParseGroupVersion` by
+  #     KWOK's `initStageController`; without a `/` the WHOLE string
+  #     becomes the version (Group=""), so the value MUST be
+  #     `karpenter.sh/v1` despite the field name.
+  #   - selector keys are gojq (itchyny/gojq via `MatchExpression.key`);
+  #     the array filter is `.[] | select(.type == "X")`, NOT
+  #     `.[type="X"]`.
+  #   nodeclaim-launched   2s: no Launched cond → Launched=True +
+  #     `status.{capacity,allocatable}` = `spec.resources.requests`
+  #     (so `LiveNode::from` reads the cores/mem the controller asked
+  #     for) + `status.providerID` so the claim looks Karpenter-real.
+  #   nodeclaim-registered 3s after: Launched=True ∧ no Registered →
+  #     Registered=True + `status.nodeName=kwok-<nc>`. 5s−0s ≈
+  #     boot_secs → DDSketch records ~5, lead_time gauge ~5 once one
+  #     claim cycles.
+  #   nodeclaim-initialized 2s after: Registered=True → Initialized=
+  #     True. `LiveNode` doesn't read it but `kubectl get nodeclaim`'s
+  #     READY column does (operator-debugging realism).
+  #
+  # Stage CANNOT create a Node (`StageNext` only patches/deletes the
+  # target); the test scenario kubectl-applies a fake Node carrying the
+  # NodeClaim's `metadata.labels` after observing Registered=True.
+  #
   # k3s's deploy-controller uses sigs.k8s.io/yaml — strict on flow-map
-  # values containing `[` / `"` (they start a sequence / quoted scalar
-  # mid-flow). Block-style throughout, with the JSONPath-ish Stage
-  # selector keys explicitly single-quoted.
+  # values containing `[` / `"`. Block-style throughout; the gojq
+  # selector keys are single-quoted so the embedded `|` and `"` parse
+  # as scalar.
   kwokManifests = pkgs.writeText "kwok-deploy.yaml" ''
     apiVersion: apiextensions.k8s.io/v1
     kind: CustomResourceDefinition
@@ -185,7 +237,7 @@ let
         resources: ["nodeclaims", "nodeclaims/status"]
         verbs: ["get", "list", "watch", "update", "patch"]
       - apiGroups: [""]
-        resources: ["nodes", "nodes/status", "pods", "pods/status"]
+        resources: ["nodes", "nodes/status", "pods", "pods/status", "events"]
         verbs: ["get", "list", "watch", "update", "patch", "create", "delete"]
       - apiGroups: ["coordination.k8s.io"]
         resources: ["leases"]
@@ -235,25 +287,27 @@ let
       name: nodeclaim-launched
     spec:
       resourceRef:
-        apiGroup: karpenter.sh
+        apiGroup: karpenter.sh/v1
         kind: NodeClaim
-        version: v1
       selector:
         matchExpressions:
-          - key: '.status.conditions.[type="Launched"]'
+          - key: '.status.conditions.[] | select(.type == "Launched")'
             operator: DoesNotExist
       delay:
         durationMilliseconds: 2000
       next:
         statusTemplate: |
+          providerID: 'kwok://kwok/kwok-{{ .metadata.name }}'
           capacity:
             cpu: '{{ index .spec.resources.requests "cpu" }}'
             memory: '{{ index .spec.resources.requests "memory" }}'
             ephemeral-storage: '{{ index .spec.resources.requests "ephemeral-storage" }}'
+            pods: '110'
           allocatable:
             cpu: '{{ index .spec.resources.requests "cpu" }}'
             memory: '{{ index .spec.resources.requests "memory" }}'
             ephemeral-storage: '{{ index .spec.resources.requests "ephemeral-storage" }}'
+            pods: '110'
           conditions:
             - type: Launched
               status: "True"
@@ -267,15 +321,14 @@ let
       name: nodeclaim-registered
     spec:
       resourceRef:
-        apiGroup: karpenter.sh
+        apiGroup: karpenter.sh/v1
         kind: NodeClaim
-        version: v1
       selector:
         matchExpressions:
-          - key: '.status.conditions.[type="Launched"].status'
+          - key: '.status.conditions.[] | select(.type == "Launched") | .status'
             operator: In
             values: ["True"]
-          - key: '.status.conditions.[type="Registered"]'
+          - key: '.status.conditions.[] | select(.type == "Registered")'
             operator: DoesNotExist
       delay:
         durationMilliseconds: 3000
@@ -289,6 +342,42 @@ let
               message: ""
               lastTransitionTime: '{{ (index .status.conditions 0).lastTransitionTime }}'
             - type: Registered
+              status: "True"
+              reason: KWOK
+              message: ""
+              lastTransitionTime: '{{ Now }}'
+    ---
+    apiVersion: kwok.x-k8s.io/v1alpha1
+    kind: Stage
+    metadata:
+      name: nodeclaim-initialized
+    spec:
+      resourceRef:
+        apiGroup: karpenter.sh/v1
+        kind: NodeClaim
+      selector:
+        matchExpressions:
+          - key: '.status.conditions.[] | select(.type == "Registered") | .status'
+            operator: In
+            values: ["True"]
+          - key: '.status.conditions.[] | select(.type == "Initialized")'
+            operator: DoesNotExist
+      delay:
+        durationMilliseconds: 2000
+      next:
+        statusTemplate: |
+          conditions:
+            - type: Launched
+              status: "True"
+              reason: KWOK
+              message: ""
+              lastTransitionTime: '{{ (index .status.conditions 0).lastTransitionTime }}'
+            - type: Registered
+              status: "True"
+              reason: KWOK
+              message: ""
+              lastTransitionTime: '{{ (index .status.conditions 1).lastTransitionTime }}'
+            - type: Initialized
               status: "True"
               reason: KWOK
               message: ""
@@ -316,5 +405,6 @@ in
     "00b-karpenter-crds".source = karpenterCRDs;
     "00c-ec2nodeclass-stub".source = ec2NodeClassStub;
     "00d-kwok".source = kwokManifests;
+    "00e-kwok-default-stages".source = kwokDefaultStages;
   };
 }
