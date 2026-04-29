@@ -4,9 +4,9 @@
 #   - NodeClaim CRD admission accepts cover::build_nodeclaim's shape
 #     (nodeClassRef required-fields, requirements[].operator enum)
 #   - controller RBAC sufficient for nodeclaims:{list,create,delete}
-#   - figment loading of [nodeclaim_pool.instance_menu] from the
-#     ConfigMap-mounted controller.toml (nested map-of-struct-list —
-#     cannot load via Env provider; the helm ConfigMap is the only path)
+#   - figment loading of [nodeclaim_pool.lead_time_seed] from the
+#     ConfigMap-mounted controller.toml (nested map — cannot load via
+#     Env provider; the helm ConfigMap is the only path)
 #   - LiveNode::from parses real apiserver-round-tripped status
 #     (lastTransitionTime as RFC3339, allocatable as Quantity strings)
 #   - kube-build-scheduler second kube-scheduler Deployment runs + builder Jobs

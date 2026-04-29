@@ -78,6 +78,64 @@ spec:
               kube-build-scheduler pod health and nodeclaim_pool
               reconciler deficit cover.
 
+        # ADR-023 §Observability: prediction_ratio = actual/predicted
+        # (dim=wall|mem; 1.0=perfect). Sustained p50 outside [0.5, 2.0]
+        # means the model is systematically off by 2× — fits are stale,
+        # hw_perf_factors drifted, or a hot pname's curve regressed.
+        # `sla explain <pname>` to inspect; `sla reset <pname>` to refit.
+        - alert: RioSlaPredictionDrift
+          expr: |
+            histogram_quantile(0.5, sum by (le, dim) (rate(rio_scheduler_sla_prediction_ratio_bucket[15m]))) > 2.0
+              or
+            histogram_quantile(0.5, sum by (le, dim) (rate(rio_scheduler_sla_prediction_ratio_bucket[15m]))) < 0.5
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "SLA prediction p50 off by >2× ({{`{{ $labels.dim }}`}})"
+            description: >-
+              rio_scheduler_sla_prediction_ratio p50 for dim={{`{{ $labels.dim }}`}}
+              is {{`{{ $value | humanize }}`}} (1.0=perfect). Model is
+              systematically over/under-predicting. Run `rio-cli sla status`
+              and `sla explain` on the top pnames; `sla reset` to refit.
+
+        # ADR-023 §13b: ≥3 distinct cells reaping for `reason=ice`
+        # (Launched=False — InsufficientCapacity / quota / unfulfillable
+        # instance-type). One cell ICE is routine spot churn; ≥3
+        # concurrently means an AZ/quota/AMI-tag problem and the
+        # admissible-set is shrinking toward `_hw_ladder_exhausted`.
+        - alert: RioNodeclaimPoolIceMaskedHigh
+          expr: count(sum by (cell) (rate(rio_controller_nodeclaim_reaped_total{reason="ice"}[5m])) > 0) >= 3
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "≥3 hw-class cells ICE-masked"
+            description: >-
+              {{`{{ $value | humanize }}`}} (hw_class,cap) cells are
+              reaping NodeClaims for reason=ice. Check Karpenter
+              controller logs for InsufficientInstanceCapacity / quota,
+              and `rio_scheduler_sla_hw_ladder_exhausted_total`.
+
+        # ADR-023 §13b: a cell has in-flight NodeClaims (created, not
+        # Registered) for >90s — ~3× the probe-boot leadTimeSeed (17-21s).
+        # Either Launched=False (ICE — see reaped{reason=ice}) or
+        # Launched=True but kubelet never joined (AMI/nodeadm/CNI break).
+        # Registered nodes are the FFD-placeable set; stuck inflight =
+        # builder Jobs gate-starved.
+        - alert: RioNodeclaimPoolStuckPending
+          expr: rio_controller_nodeclaim_live{state="inflight"} > 0
+          for: 90s
+          labels:
+            severity: warning
+          annotations:
+            summary: "NodeClaim stuck pre-Registered ({{`{{ $labels.cell }}`}})"
+            description: >-
+              cell={{`{{ $labels.cell }}`}} has {{`{{ $value | humanize }}`}}
+              NodeClaim(s) in-flight for >90s (~3× leadTimeSeed). Check
+              `kubectl get nodeclaims` Launched/Registered conditions and
+              rio_controller_nodeclaim_reaped_total{reason=ice|boot-timeout}.
+
         # Forward-compat: rio_store_putpath_retries_total lands in P0539d.
         # Until then this expr evaluates empty (no series) → never fires.
         # >10/s sustained means S3/PG backpressure or the chunk-dedup

@@ -18,16 +18,14 @@
 //!
 //! Probe NodeClaims are built from `HwClassDef.requirements` (the same
 //! `[sla.hw_classes.$h].requirements` that `cover_deficit` reads) — NOT
-//! from NodePool templates. With `nodeclaimPool.enabled=true` the 12
-//! band-loop NodePools no longer exist; the hw-class config is the
-//! single source of truth for instance-type constraints in both
-//! provisioning modes.
+//! from NodePool templates. The hw-class config is the single source of
+//! truth for instance-type constraints.
 //!
 //! EKS-only, operator-run; NOT a CI test. The shim NodePool is
-//! pre-created here (idempotent) so the probe is runnable before B3
-//! helm-manages it — without it, Karpenter parks naked NodeClaims at
-//! `AwaitingReconciliation` because the `karpenter.sh/nodepool` label
-//! references a NodePool that doesn't exist.
+//! pre-created here (idempotent) so the probe is runnable before the
+//! first `helm install` — without it, Karpenter parks naked NodeClaims
+//! at `AwaitingReconciliation` because the `karpenter.sh/nodepool`
+//! label references a NodePool that doesn't exist.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -48,7 +46,8 @@ use crate::ui;
 /// `r[ctrl.nodeclaim.shim-nodepool]`). The probe ensures the NodePool
 /// object exists (`ensure_shim_nodepool`) before stamping the label —
 /// Karpenter refuses to reconcile a NodeClaim whose nodepool label
-/// points at a missing NodePool. B3 will helm-manage the same object.
+/// points at a missing NodePool. helm renders the same object on
+/// deploy; this is a pre-first-deploy bootstrap.
 const SHIM_NODEPOOL: &str = "rio-nodeclaim-shim";
 
 /// `metadata.labels` key marking a probe-boot NodeClaim. Lets cleanup
@@ -336,12 +335,12 @@ struct ProbeResult {
 /// The shim is inert: `limits.cpu=0` means it never provisions on its
 /// own (assertion 2), `budgets:[{nodes:"0"}]` means it never disrupts
 /// (assertion 5), `expireAfter: Never` means probe nodes aren't
-/// drift-churned. NOT deleted on exit — B3 helm-manages the same object
-/// later, and `cpu:0` makes it harmless to leave.
+/// drift-churned. NOT deleted on exit — helm renders the same object on
+/// deploy, and `cpu:0` makes it harmless to leave.
 async fn ensure_shim_nodepool(client: &kube::Client, node_class: &str) -> Result<()> {
     let pools = nodepool_api(client);
     if pools.get_opt(SHIM_NODEPOOL).await?.is_some() {
-        info!("{SHIM_NODEPOOL} already present (B3 helm-managed?)");
+        info!("{SHIM_NODEPOOL} already present (helm-managed?)");
         return Ok(());
     }
     let np = mk_shim_nodepool(node_class);

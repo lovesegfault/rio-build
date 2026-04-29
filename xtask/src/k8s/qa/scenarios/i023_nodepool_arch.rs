@@ -43,8 +43,8 @@ impl Scenario for NodepoolArch {
             Err(_) => return Ok(Verdict::Skip("no Karpenter NodePool CRD (k3s?)".into())),
         };
 
-        // Arch-agnostic by design (multi-arch images).
-        const ARCH_AGNOSTIC: &[&str] = &["rio-general", "rio-builder-metal"];
+        // Arch-agnostic by design (multi-arch images / never provisions).
+        const ARCH_AGNOSTIC: &[&str] = &["rio-general", "rio-builder-metal", "rio-nodeclaim-shim"];
 
         let missing: Vec<_> = pools
             .lines()

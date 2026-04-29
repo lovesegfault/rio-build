@@ -100,90 +100,10 @@ spec:
   tags:
     karpenter.sh/discovery: {{ $k.clusterName }}
 {{- end }}
-{{- if not $k.nodeclaimPool.enabled }}
-{{- /* ADR-023 phase-13: 12 builder NodePools = band × storage × arch.
-       Each carries rio.build/hw-band + rio.build/storage labels and an
-       instance-generation In [...] requirement; each admits both spot
-       AND on-demand (the scheduler's per-(band,cap) solve picks via
-       karpenter.sh/capacity-type nodeSelector on the pod). */ -}}
-{{- range $band := $k.builderBands }}
-{{- range $stor := $k.builderStorages }}
-{{- range $arch := $k.builderArchs }}
 ---
-apiVersion: karpenter.sh/v1
-kind: NodePool
-metadata:
-  name: rio-builder-{{ $band.name }}-{{ $stor.name }}-{{ $arch.name }}
-  labels:
-    app.kubernetes.io/part-of: rio-build
-spec:
-  weight: 50
-  template:
-    metadata:
-      labels:
-        rio.build/node-role: builder
-        rio.build/hw-band: {{ $band.name }}
-        rio.build/storage: {{ $stor.name }}
-        # kubelet sets kubernetes.io/arch on the Node regardless, but
-        # hw-class resolution (probe-boot resolve_pools, scheduler
-        # cells_to_selector_terms) matches against template.metadata.labels
-        # — so stamp it explicitly to make each 12-key hw-class resolve to
-        # exactly one NodePool.
-        kubernetes.io/arch: {{ $arch.k8s }}
-    spec:
-      nodeClassRef:
-        group: karpenter.k8s.aws
-        kind: EC2NodeClass
-        name: {{ $stor.nodeClass }}
-      taints:
-        - key: rio.build/builder
-          value: "true"
-          effect: NoSchedule
-      requirements:
-        - key: karpenter.k8s.aws/instance-category
-          operator: In
-          values: [c, m, r]
-        - key: karpenter.k8s.aws/instance-generation
-          operator: In
-          values: {{ $band.generations | toJson }}
-        - key: kubernetes.io/arch
-          operator: In
-          values: [{{ $arch.k8s }}]
-        - key: karpenter.sh/capacity-type
-          operator: In
-          values: [spot, on-demand]
-        # I-205: x86_64 .metal SKUs boot legacy-bios ONLY; both rio-default
-        # and rio-nvme NodeClasses select the UEFI AMI for amd64. Without
-        # this filter Karpenter's bin-pack can pick e.g. m6idn.metal (it
-        # satisfies category+generation+local-nvme) → CreateFleet rejects
-        # with UnfulfillableCapacity. Metal is served by the dedicated
-        # rio-builder-metal pool (rio-metal NodeClass, BIOS AMI). List is
-        # `$.Values.karpenter.metalSizes`; metal pool's In is the SAME
-        # list (template-injected below), partition structural. arm64
-        # .metal does boot UEFI, but metal belongs to the kvm pool
-        # regardless — keep the band pools virtualized-only.
-        - key: karpenter.k8s.aws/instance-size
-          operator: NotIn
-          values: {{ toJson $k.metalSizes }}
-        {{- if $stor.nvme }}
-        - key: karpenter.k8s.aws/instance-local-nvme
-          operator: Gt
-          values: ["0"]
-        {{- end }}
-  limits:
-    cpu: {{ $k.builderPoolCpuLimit }}
-  disruption:
-    consolidationPolicy: WhenEmpty
-    consolidateAfter: 10m
-{{- end }}
-{{- end }}
-{{- end }}
-{{- else }}
----
-# §13b shim — Karpenter sees this NodePool, never provisions from it
-# (cpu:0). rio-controller's `nodeclaim_pool` reconciler creates
+# ADR-023 §13b shim — Karpenter sees this NodePool, never provisions
+# from it (cpu:0). rio-controller's `nodeclaim_pool` reconciler creates
 # NodeClaims directly with `karpenter.sh/nodepool: rio-nodeclaim-shim`.
-# Replaces the 12 band×storage×arch pools when `nodeclaimPool.enabled`.
 apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
@@ -215,7 +135,6 @@ spec:
     consolidateAfter: Never
     budgets:
       - nodes: "0"
-{{- end }}
 {{- range $k.nodePools }}
 ---
 apiVersion: karpenter.sh/v1

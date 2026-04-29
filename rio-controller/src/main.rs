@@ -124,17 +124,15 @@ impl rio_common::config::ValidateConfig for Config {
     fn validate(&self) -> anyhow::Result<()> {
         self.scheduler
             .ensure_required("scheduler.addr", "controller")?;
-        if self.nodeclaim_pool.enabled {
-            rio_common::config::ensure_required(
-                &self.nodeclaim_pool.database_url,
-                "nodeclaim_pool.database_url",
-                "controller",
-            )?;
-            anyhow::ensure!(
-                self.nodeclaim_pool.max_fleet_cores > 0,
-                "nodeclaim_pool.max_fleet_cores must be > 0 when enabled"
-            );
-        }
+        rio_common::config::ensure_required(
+            &self.nodeclaim_pool.database_url,
+            "nodeclaim_pool.database_url",
+            "controller",
+        )?;
+        anyhow::ensure!(
+            self.nodeclaim_pool.max_fleet_cores > 0,
+            "nodeclaim_pool.max_fleet_cores must be > 0"
+        );
         Ok(())
     }
 }
@@ -255,18 +253,12 @@ async fn main() -> anyhow::Result<()> {
     // ---- Context ----
     // Placeable-gate channel: created here (before Ctx) so the receiver
     // is in `Ctx` for the Pool reconciler and the sender is passed to
-    // `NodeClaimPoolReconciler::new` below. When disabled, no channel —
-    // `PlaceableGate::disabled()` makes `jobs.rs` fall back to the §13a
-    // `ready` gate. The `_tx` binding keeps the sender alive across the
-    // disabled/PG-connect-failed paths so the gate stays unarmed (not
-    // closed); `placeable_tx.take()` hands it to the reconciler when
-    // enabled.
-    let (mut placeable_tx, placeable) = if cfg.nodeclaim_pool.enabled {
-        let (tx, gate) = nodeclaim_pool::placeable_channel();
-        (Some(tx), gate)
-    } else {
-        (None, nodeclaim_pool::PlaceableGate::disabled())
-    };
+    // `NodeClaimPoolReconciler::new` below. The `Option` keeps the
+    // sender alive across the PG-connect-failed path so the gate stays
+    // unarmed (not closed); `placeable_tx.take()` hands it to the
+    // reconciler on success.
+    let (placeable_tx, placeable) = nodeclaim_pool::placeable_channel();
+    let mut placeable_tx = Some(placeable_tx);
     let ctx = Arc::new(Ctx {
         client: client.clone(),
         admin: admin.clone(),
@@ -386,12 +378,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ---- NodeClaim pool (ADR-023 §13b) ----
-    // Gated on `nodeclaim_pool.enabled`. Lease-elected: only the leader
-    // replica reconciles. Lease + PG connect run AFTER the scheduler
-    // `connect_forever` above so the table is migrated by the time
-    // `CellSketches::load` reads it (scheduler/store own the migrator).
+    // Lease-elected: only the leader replica reconciles. Lease + PG
+    // connect run AFTER the scheduler `connect_forever` above so the
+    // table is migrated by the time `CellSketches::load` reads it
+    // (scheduler/store own the migrator).
     // r[impl ctrl.nodeclaim.shim-nodepool]
-    if cfg.nodeclaim_pool.enabled {
+    {
         let lease_cfg = rio_lease::LeaseConfig::from_parts(
             cfg.nodeclaim_pool.lease_name.clone(),
             cfg.nodeclaim_pool.lease_namespace.clone(),
@@ -436,15 +428,11 @@ async fn main() -> anyhow::Result<()> {
                 leader,
                 cfg.nodeclaim_pool.clone(),
                 hw_config.clone(),
-                placeable_tx
-                    .take()
-                    .expect("placeable_tx Some iff nodeclaim_pool.enabled"),
+                placeable_tx.take().expect("placeable_tx not yet taken"),
             )
             .await;
             rio_common::task::spawn_monitored("nodeclaim-pool", reconciler.run(shutdown.clone()));
         }
-    } else {
-        info!("nodeclaim_pool reconciler disabled (legacy NodePool mode)");
     }
 
     info!("controller running");
@@ -476,10 +464,7 @@ mod tests {
         assert_eq!(d.common.metrics_addr.to_string(), "[::]:9094");
         assert_eq!(d.health_addr.to_string(), "[::]:9194");
         assert_eq!(d.gc_interval_hours, 24, "GC cron defaults to daily");
-        assert!(
-            !d.nodeclaim_pool.enabled,
-            "nodeclaim_pool disabled by default"
-        );
+        assert_eq!(d.nodeclaim_pool.max_fleet_cores, 10_000);
     }
 
     #[test]
@@ -497,7 +482,6 @@ mod tests {
         gc_interval_hours = 0
 
         [nodeclaim_pool]
-        enabled = true
         node_class_ref = "rio-default"
         max_fleet_cores = 64
         max_node_cores = 16
@@ -511,7 +495,6 @@ mod tests {
             // B16: nested map/seq fields load from TOML (NOT env — figment
             // Env yields bare strings). This is the same shape helm's
             // rio-controller-config ConfigMap renders.
-            assert!(cfg.nodeclaim_pool.enabled);
             assert_eq!(cfg.nodeclaim_pool.max_fleet_cores, 64);
             assert_eq!(cfg.nodeclaim_pool.max_node_cores, 16);
             assert_eq!(cfg.nodeclaim_pool.metal_sizes, vec!["metal", "metal-24xl"]);
@@ -541,24 +524,16 @@ mod tests {
         let mut cfg = Config::default();
         cfg.scheduler.addr = "http://localhost:9000".into();
         cfg.store.addr = "http://localhost:9001".into();
+        cfg.nodeclaim_pool.database_url = "postgres://localhost/rio".into();
         cfg
     }
 
     #[test]
     fn config_rejects_nodeclaim_pool_without_db() {
         let mut cfg = test_valid_config();
-        cfg.nodeclaim_pool.enabled = true;
         cfg.nodeclaim_pool.database_url = String::new();
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("nodeclaim_pool.database_url"), "{err}");
-    }
-
-    #[test]
-    fn config_accepts_nodeclaim_pool_with_db() {
-        let mut cfg = test_valid_config();
-        cfg.nodeclaim_pool.enabled = true;
-        cfg.nodeclaim_pool.database_url = "postgres://localhost/rio".into();
-        cfg.validate().expect("enabled + db url passes");
     }
 
     #[test]

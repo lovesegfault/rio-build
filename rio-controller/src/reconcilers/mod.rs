@@ -154,8 +154,7 @@ pub struct Ctx {
     /// ADR-023 §13b: `intent_id` set FFD-placed on a `Registered=True`
     /// NodeClaim, published per-tick by [`nodeclaim_pool`]. The
     /// `pool/jobs` reconciler retains only these — see
-    /// [`nodeclaim_pool::PlaceableGate`]. `disabled()` when
-    /// `nodeclaim_pool.enabled = false` (legacy 12-NodePool mode).
+    /// [`nodeclaim_pool::PlaceableGate`].
     pub placeable: nodeclaim_pool::PlaceableGate,
 }
 

@@ -107,35 +107,19 @@ type PlaceableSet = Option<Arc<HashSet<String>>>;
 /// each tick (no event-per-publish; staleness bounded by the 10s tick
 /// cadence on both sides). `Arc<HashSet>` so `borrow().clone()` is O(1).
 #[derive(Clone)]
-pub struct PlaceableGate(Option<tokio::sync::watch::Receiver<PlaceableSet>>);
+pub struct PlaceableGate(tokio::sync::watch::Receiver<PlaceableSet>);
 
 impl PlaceableGate {
-    /// Disabled gate (`nodeclaim_pool.enabled = false`). [`Self::retain`]
-    /// is a no-op; the legacy `ready` gate in `jobs.rs` applies instead.
-    pub fn disabled() -> Self {
-        Self(None)
-    }
-
-    /// `nodeclaim_pool.enabled`. Drives `schedulerName: kube-build-scheduler` +
-    /// `priorityClassName` stamping in `build_job` AND switches `jobs.rs`
-    /// from the §13a `ready` gate to the §13b placeable gate.
-    pub fn enabled(&self) -> bool {
-        self.0.is_some()
-    }
-
     /// Retain only intents whose `intent_id` is in the last-published
     /// placeable set. Returns whether the gate is **armed** (a value has
-    /// been published, OR the gate is disabled). `false` ⇔ enabled but
-    /// no FFD tick has run yet — caller treats `queued` as unknown so
-    /// `reap_excess_pending` stays fail-closed (a standby replica whose
-    /// lease-gated reconciler never publishes would otherwise see
-    /// `queued=0` and reap the leader's Pending Jobs).
+    /// been published). `false` ⇔ no FFD tick has run yet — caller
+    /// treats `queued` as unknown so `reap_excess_pending` stays
+    /// fail-closed (a standby replica whose lease-gated reconciler never
+    /// publishes would otherwise see `queued=0` and reap the leader's
+    /// Pending Jobs).
     // r[impl ctrl.nodeclaim.placeable-gate]
     pub fn retain(&self, intents: &mut Vec<SpawnIntent>) -> bool {
-        let Some(rx) = &self.0 else {
-            return true;
-        };
-        match rx.borrow().clone() {
+        match self.0.borrow().clone() {
             Some(set) => {
                 intents.retain(|i| set.contains(&i.intent_id));
                 true
@@ -147,19 +131,19 @@ impl PlaceableGate {
         }
     }
 
-    /// Test-only: enabled gate seeded with `ids` (armed).
+    /// Test-only: gate seeded with `ids` (armed).
     #[cfg(test)]
     pub fn from_ids<I: IntoIterator<Item = &'static str>>(ids: I) -> Self {
         let set: HashSet<String> = ids.into_iter().map(str::to_owned).collect();
         let (_tx, rx) = tokio::sync::watch::channel(Some(Arc::new(set)));
-        Self(Some(rx))
+        Self(rx)
     }
 
-    /// Test-only: enabled but unarmed (no publish yet).
+    /// Test-only: unarmed (no publish yet).
     #[cfg(test)]
     pub fn unarmed() -> Self {
         let (_tx, rx) = tokio::sync::watch::channel(None);
-        Self(Some(rx))
+        Self(rx)
     }
 }
 
@@ -169,23 +153,20 @@ impl PlaceableGate {
 /// tick before the first FFD tick is fail-closed.
 pub fn placeable_channel() -> (tokio::sync::watch::Sender<PlaceableSet>, PlaceableGate) {
     let (tx, rx) = tokio::sync::watch::channel(None);
-    (tx, PlaceableGate(Some(rx)))
+    (tx, PlaceableGate(rx))
 }
 
 /// Figment-loaded config. Scalars via `RIO_NODECLAIM_POOL__*` env;
-/// `instance_menu` / `lead_time_seed` via the `[nodeclaim_pool]` table
-/// in `/etc/rio/controller.toml` (helm `rio-controller-config`
-/// ConfigMap) — figment's Env provider yields bare strings, so nested
-/// map/seq fields cannot load from env. `enabled = false` → reconciler
-/// not spawned (legacy 12-NodePool mode; gate in main.rs).
+/// `lead_time_seed` via the `[nodeclaim_pool]` table in
+/// `/etc/rio/controller.toml` (helm `rio-controller-config` ConfigMap) —
+/// figment's Env provider yields bare strings, so nested map fields
+/// cannot load from env.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NodeClaimPoolConfig {
-    /// Master gate. Mirrors helm `karpenter.nodeclaimPool.enabled`.
-    pub enabled: bool,
     /// PostgreSQL URL for [`CellSketches`] persist/load. Same DB as
-    /// store/scheduler (migration 059 lives there). Required when
-    /// `enabled` — controller doesn't otherwise hold a PG handle.
+    /// store/scheduler (migration 059 lives there). Required —
+    /// controller doesn't otherwise hold a PG handle.
     pub database_url: String,
     /// Lease object name for leader election. `None` → non-K8s mode
     /// (always-leader, see [`rio_lease::LeaseConfig::from_parts`]).
@@ -296,7 +277,6 @@ impl NodeClaimPoolConfig {
 impl Default for NodeClaimPoolConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             database_url: String::new(),
             lease_name: None,
             lease_namespace: None,
@@ -304,8 +284,7 @@ impl Default for NodeClaimPoolConfig {
             node_class_ref: "rio-default".into(),
             reference_hw_class: String::new(),
             // Matches helm `sla.maxFleetCores` / `maxNodeClaimsPerCellPerTick`
-            // / `maxLeadTime` defaults. Validated in main.rs only when
-            // `enabled` so unit tests don't need to populate these.
+            // / `maxLeadTime` defaults.
             max_fleet_cores: 10_000,
             max_node_claims_per_cell_per_tick: 8,
             max_lead_time: 600.0,
@@ -868,9 +847,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_default_disabled() {
+    fn config_default() {
         let d = NodeClaimPoolConfig::default();
-        assert!(!d.enabled, "enabled=false → reconciler not spawned");
         assert!(d.database_url.is_empty());
         assert!(d.lease_name.is_none());
         assert_eq!(d.node_class_ref, "rio-default");

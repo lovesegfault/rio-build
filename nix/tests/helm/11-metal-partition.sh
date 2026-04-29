@@ -3,9 +3,6 @@
 # `instance-size NotIn metalSizes` requirement, and rio-builder-metal's
 # `instance-size In` MUST be the SAME list. Single source is
 # `.Values.karpenter.metalSizes`; both sides are template-injected.
-#
-# At 2ad753db this fails twice: rio-fetcher/rio-general have NO
-# instance-size requirement; the band-loop NotIn lacks metal-{16,32}xl.
 
 karp=$TMPDIR/karp-metal.yaml
 helm template rio . \
@@ -44,8 +41,6 @@ done < <(yq -N 'select(.kind=="NodePool"
 [ "$fail" = 0 ] || exit 1
 
 # rio-builder-metal's In == any uefi pool's NotIn (same list, partition).
-# rio-fetcher is the comparison target — exists in BOTH the band-loop
-# world (`nodeclaimPool.enabled=false`) and the shim world (`=true`).
 metal_in=$(yq -N 'select(.kind=="NodePool" and .metadata.name=="rio-builder-metal")
                   | .spec.template.spec.requirements[]
                   | select(.key=="karpenter.k8s.aws/instance-size" and .operator=="In")

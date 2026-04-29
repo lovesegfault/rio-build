@@ -730,20 +730,19 @@ in
   # min=1 max=4 keeps the scale-up provable inside the 2-node VM's
   # pod budget.
   # ADR-023 §13b nodeclaim_pool reconciler under KWOK fake-Karpenter.
-  # First test running rio-controller with `nodeclaim_pool.enabled =
-  # true`. Karpenter is faked: KWOK Stage rules progress NodeClaim
-  # status (Launched→Registered, populate allocatable from
-  # spec.resources.requests). The kube-build-scheduler Deployment runs
-  # for real (registry.k8s.io/kube-scheduler preloaded) so builder
-  # Jobs' `schedulerName: kube-build-scheduler` resolves.
+  # Karpenter is faked: KWOK Stage rules progress NodeClaim status
+  # (Launched→Registered, populate allocatable from spec.resources.
+  # requests). The kube-build-scheduler Deployment runs for real
+  # (registry.k8s.io/kube-scheduler preloaded) so builder Jobs'
+  # `schedulerName: kube-build-scheduler` resolves.
   #
   # Distinct runNixOSTest name `rio-forecast-provisioning` (NOT a
   # `vm-sla-sizing-*` variant — sla-sizing.nix is standalone-tied;
   # this is k3s+kubectl-only).
   #
   # nodeclaim_pool config flows through the chart's first-class values:
-  # `karpenter.nodeclaimPool.enabled` + `scheduler.sla.{hwClasses,
-  # leadTimeSeed,maxFleetCores,...}` render into the rio-controller-config
+  # `scheduler.sla.{hwClasses,leadTimeSeed,maxFleetCores,...}`
+  # render into the rio-controller-config
   # ConfigMap's `[nodeclaim_pool]` TOML table (lead_time_seed is a nested
   # map — figment's Env provider only yields strings, so the ConfigMap
   # mount is the ONLY load path). The 12 prod hwClasses + 24-cell
@@ -762,7 +761,6 @@ in
       extraManifests = kwok.manifests;
       extraValuesTyped = {
         "buildScheduler.enabled" = true;
-        "karpenter.nodeclaimPool.enabled" = true;
       };
       extraValues = {
         "buildScheduler.image" = kwok.kubeSchedulerRef;

@@ -674,13 +674,7 @@ gateway:
 # tofu outputs.
 karpenter:
   enabled: false
-  # §13b Part-B mode. When true: band×storage×arch builder NodePools
-  # replaced by single `rio-nodeclaim-shim`; rio-controller provisions
-  # NodeClaims directly. **Set true only after B12 lands** (jobs.rs
-  # `placeable`-gate). Breaks `xtask k8s probe-boot` (resolver reads
-  # the 12 pools).
   nodeclaimPool:
-    enabled: true
     leaseName: rio-controller-nodeclaim-pool
   clusterName: ""   # from tofu output cluster_name
   nodeRoleName: ""  # from tofu output karpenter_node_role_name
@@ -717,42 +711,6 @@ karpenter:
   # on rio-metal pools and `NotIn` on every other pool from this list.
   metalSizes: [metal, metal-16xl, metal-24xl, metal-32xl, metal-48xl]
 
-  # ADR-023 phase-13: 12 builder NodePools — `rio-builder-{hi,mid,lo}-
-  # {ebs,nvme}-{x86,aarch64}` — plus metal/fetcher/general. Each carries
-  # a static `rio.build/hw-band` label and an `instance-generation In
-  # [...]` requirement (hi=gen8, mid=gen7, lo=gen6); each admits BOTH
-  # `capacity-type In [spot, on-demand]` so the scheduler's per-(band,
-  # cap) solve selects via `karpenter.sh/capacity-type` nodeSelector.
-  #
-  # `weight` is uniform within a `(storage, arch)` pair: the SCHEDULER
-  # picks the band (cost-softmax), not Karpenter. Karpenter only
-  # disambiguates when a pod has no `rio.build/hw-band` selector
-  # (probe path / `[sla].hw_cost_source` unset) — it then prefers
-  # whichever is cheapest at the time.
-  #
-  # `builderBands` is the cartesian source; templates/karpenter.yaml
-  # ranges over `band × storage × arch` and emits one NodePool each.
-  # Adding a band = one entry here (requirements/common labels live in
-  # the template).
-  builderBands:
-    - {name: hi, generations: ["8"]}
-    # mid spans 6+7: gen-7 amd64 c/m/r have no `d` (local-NVMe) variants
-    # in us-east-2, so mid-nvme-x86 would resolve empty on ["7"] alone.
-    # arm64 has c7gd/m7gd; amd64 falls back to c6id/m6id. hw_perf_factors
-    # normalizes per instance-type, so the band label stays a coarse grouping.
-    - {name: mid, generations: ["6", "7"]}
-    - {name: lo, generations: ["6"]}
-  builderStorages:
-    - {name: ebs, nodeClass: rio-default, nvme: false}
-    - {name: nvme, nodeClass: rio-nvme, nvme: true}
-  builderArchs:
-    - {name: x86, k8s: amd64}
-    - {name: aarch64, k8s: arm64}
-  # Per-pool vCPU limit. 12 pools × 8000 = 96000 vCPU ceiling (vs
-  # 40000 under the old preferred+fallback split) — the shared
-  # nodepool-budget reconciler caps the SUM, so this is per-cell
-  # headroom not aggregate.
-  builderPoolCpuLimit: 8000
   nodePools:
     # Builder metal: bare-metal instances expose /dev/kvm (nested virt)
     # for nixos-test / qemu-kvm derivations (requiredSystemFeatures =

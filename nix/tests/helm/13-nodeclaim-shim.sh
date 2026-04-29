@@ -1,9 +1,8 @@
-# ADR-023 §13b: `karpenter.nodeclaimPool.enabled` flips the 12
-# band×storage×arch builder NodePools to a single `rio-nodeclaim-shim`
+# ADR-023 §13b: builder NodePools are a single `rio-nodeclaim-shim`
 # (limits.cpu: "0", budgets[0].nodes: "0") that Karpenter sees but never
 # provisions from — rio-controller creates NodeClaims directly. The
 # `nodePools` list (rio-fetcher / rio-general / rio-builder-metal) is
-# unaffected either way.
+# unaffected.
 
 karp_args=(
   --set karpenter.enabled=true
@@ -16,10 +15,8 @@ karp_args=(
 
 pools_of() { yq -N 'select(.kind=="NodePool") | .metadata.name' "$1" | sort; }
 
-# ── enabled=true: shim present (cpu:"0"), zero band pools, nodePools list intact.
 on=$TMPDIR/shim-on.yaml
-helm template rio . "${karp_args[@]}" \
-  --set karpenter.nodeclaimPool.enabled=true >"$on"
+helm template rio . "${karp_args[@]}" >"$on"
 
 test "$(yq -N 'select(.kind=="NodePool" and .metadata.name=="rio-nodeclaim-shim")
                | .spec.limits.cpu' "$on")" = 0 || {
@@ -33,31 +30,13 @@ test "$(yq -N 'select(.kind=="NodePool" and .metadata.name=="rio-nodeclaim-shim"
 }
 n=$(pools_of "$on" | grep -Ec '^rio-builder-(hi|mid|lo)-' || true)
 test "$n" -eq 0 || {
-  echo "FAIL: nodeclaimPool.enabled=true rendered $n band×storage×arch pools:" >&2
+  echo "FAIL: rendered $n band×storage×arch pools (band-loop should be deleted):" >&2
   pools_of "$on" | grep -E '^rio-builder-(hi|mid|lo)-' >&2
   exit 1
 }
 for p in rio-fetcher rio-general rio-builder-metal; do
   pools_of "$on" | grep -qx "$p" || {
-    echo "FAIL: nodeclaimPool.enabled=true dropped NodePool $p" >&2
+    echo "FAIL: dropped NodePool $p" >&2
     exit 1
   }
 done
-
-# ── enabled=false: 12 band pools render, shim absent. The chart
-# default is now enabled=true (9e5b267b); set explicitly so the
-# legacy-mode branch stays exercised.
-off=$TMPDIR/shim-off.yaml
-helm template rio . "${karp_args[@]}" \
-  --set karpenter.nodeclaimPool.enabled=false >"$off"
-
-n=$(pools_of "$off" | grep -Ec '^rio-builder-(hi|mid|lo)-(ebs|nvme)-(x86|aarch64)$' || true)
-test "$n" -eq 12 || {
-  echo "FAIL: default render expected 12 band×storage×arch pools, got $n:" >&2
-  pools_of "$off" >&2
-  exit 1
-}
-! pools_of "$off" | grep -qx rio-nodeclaim-shim || {
-  echo "FAIL: default render includes rio-nodeclaim-shim (should be gated off)" >&2
-  exit 1
-}
