@@ -1198,15 +1198,22 @@ async fn poll_spot_once(
 ) -> anyhow::Result<HashMap<Cell, f64>> {
     use aws_sdk_ec2::types::InstanceType as Ec2InstanceType;
 
-    // instance-type → (h, vCPU). Spot only — on-demand is seed-backed.
-    let h_of: HashMap<String, (HwClassName, f64)> = cells
-        .iter()
-        .filter(|((_, c), _)| *c == CapacityType::Spot)
-        .flat_map(|((h, _), m)| {
-            m.iter()
-                .map(|it| (it.name.clone(), (h.clone(), f64::from(it.cores))))
-        })
-        .collect();
+    // instance-type → [(h, vCPU)]. Multi-valued: under R24B7
+    // autodiscovery the same type appears in ≥2 cells whenever their
+    // `requirements` overlap (e.g. `lo-* ⊂ mid-*` in the prod 12-class
+    // config). A single-valued map would non-deterministically starve
+    // one cell of all price observations for the shared type.
+    let mut h_of: HashMap<String, Vec<(HwClassName, f64)>> = HashMap::new();
+    for ((h, c), m) in cells {
+        if *c != CapacityType::Spot {
+            continue;
+        }
+        for it in m {
+            h_of.entry(it.name.clone())
+                .or_default()
+                .push((h.clone(), f64::from(it.cores)));
+        }
+    }
     if h_of.is_empty() {
         return Ok(HashMap::new());
     }
@@ -1232,7 +1239,7 @@ async fn poll_spot_once(
             let Some(t) = row.instance_type().map(|t| t.as_str()) else {
                 continue;
             };
-            let Some((h, vcpu)) = h_of.get(t).filter(|(_, v)| *v > 0.0) else {
+            let Some(hs) = h_of.get(t) else {
                 continue;
             };
             let Some(price) = row.spot_price().and_then(|p| p.parse::<f64>().ok()) else {
@@ -1243,7 +1250,9 @@ async fn poll_spot_once(
                 .increment(1);
                 continue;
             };
-            per_h.entry(h.clone()).or_default().push(price / vcpu);
+            for (h, vcpu) in hs.iter().filter(|(_, v)| *v > 0.0) {
+                per_h.entry(h.clone()).or_default().push(price / vcpu);
+            }
         }
     }
 
@@ -1476,6 +1485,50 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// bug_007: an instance type observed in ≥2 cells' menus must
+    /// contribute to BOTH cells' price observations. With the old
+    /// `HashMap<String, (h, vcpu)>` index the second cell's entry
+    /// overwrote the first (HashMap-iteration-order winner). The prod
+    /// 12-class config guarantees overlap (`lo-* ⊂ mid-*` requirements),
+    /// so once both observe a gen-6 type one cell is starved.
+    #[tokio::test]
+    async fn poll_spot_once_shared_type_feeds_both_cells() {
+        use aws_sdk_ec2::types::SpotPrice;
+        use aws_smithy_mocks::{RuleMode, mock, mock_client};
+        type Ec2 = aws_sdk_ec2::Client;
+
+        let history = mock!(Ec2::describe_spot_price_history).then_output(move || {
+            aws_sdk_ec2::operation::describe_spot_price_history::DescribeSpotPriceHistoryOutput::builder()
+                .spot_price_history(
+                    SpotPrice::builder()
+                        .instance_type("c6i.4xlarge".into())
+                        .spot_price("0.3200")
+                        .build(),
+                )
+                .build()
+        });
+        let client = mock_client!(aws_sdk_ec2, RuleMode::MatchAny, &[&history]);
+
+        let mut cells: HashMap<Cell, Vec<InstanceType>> = HashMap::new();
+        let shared = it("c6i.4xlarge", 16, 32, 0.0);
+        cells.insert(
+            ("lo-ebs-x86".into(), CapacityType::Spot),
+            vec![shared.clone()],
+        );
+        cells.insert(("mid-ebs-x86".into(), CapacityType::Spot), vec![shared]);
+
+        let obs = poll_spot_once(&client, &cells).await.unwrap();
+        assert_eq!(
+            obs.len(),
+            2,
+            "shared instance type must feed BOTH cells, got: {:?}",
+            obs.keys().collect::<Vec<_>>()
+        );
+        let want = 0.32 / 16.0;
+        assert!((obs[&("lo-ebs-x86".into(), CapacityType::Spot)] - want).abs() < 1e-9);
+        assert!((obs[&("mid-ebs-x86".into(), CapacityType::Spot)] - want).abs() < 1e-9);
     }
 
     /// `persist`/`load`/`refresh_lambda` are cluster-scoped: two
