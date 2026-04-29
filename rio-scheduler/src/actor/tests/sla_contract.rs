@@ -1073,8 +1073,8 @@ async fn contract_h_explore_schmitt_carries_prev_a() {
     // skew on spot). h_main priced 0.001 so it dominates the
     // unrestricted e_min by ~1000× → h_exp ∉ A. Per-cell price change
     // hashes into solve_relevant_hash → inputs_gen bumps each poll.
-    // Menu empty → `smallest_fitting` degrades to `price(cell)` (no
-    // capacity-reject in this fixture).
+    // Per-class ceilings = global ceil (no capacity-reject in this
+    // fixture).
     let set_ratio = |a: &DagActor, od_over_spot: f64| {
         let mut ct = a.cost_table.write();
         *ct = CostTable::from_parts(
@@ -1236,8 +1236,9 @@ async fn contract_h_explore_schmitt_carries_prev_a() {
 #[tokio::test]
 async fn contract_h_explore_schmitt_across_ice_mask() {
     use crate::sla::config::CapacityType;
-    use crate::sla::cost::{CostTable, InstanceType, RatioEma};
+    use crate::sla::cost::{CostTable, RatioEma};
     use crate::sla::solve::{self, SolveFullResult};
+    use std::cell::Cell as StdCell;
 
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_hw(db.pool.clone());
@@ -1253,22 +1254,24 @@ async fn contract_h_explore_schmitt_across_ice_mask() {
     actor.test_inject_ready("d-schmitt-ice", Some("test-pkg"), "x86_64-linux", false);
     let fit = make_fit("test-pkg");
 
-    // `cores=0` → `smallest_fitting` returns None for any c≥1 → cell
-    // rejected on capacity → restricted `solve_full([h_exp])` BestEffort.
-    let it_nofit = || InstanceType {
-        name: "t".into(),
-        cores: 0,
-        mem_bytes: 0,
-        price_per_vcpu_hr: 1.0,
-        last_observed: std::time::SystemTime::UNIX_EPOCH,
-    };
-    let set_ratio = |a: &DagActor, od_over_spot: f64, exp_feasible: bool| {
+    // Per-poll inputs_gen bump scaffolding: each `set_ratio` call
+    // increments a counter folded into the spot price so the hash
+    // changes even when `od_over_spot` repeats across polls (poll 4→5).
+    // Step ≥1e-4 so `solve_relevant_hash`'s `(v*1e4).round()`
+    // quantization sees it.
+    let poll_n = StdCell::new(0u32);
+    let set_ratio = |a: &DagActor, od_over_spot: f64| {
+        let n = poll_n.get();
+        poll_n.set(n + 1);
         let mut ct = a.cost_table.write();
         *ct = CostTable::from_parts(
             [
                 ((h_main.clone(), CapacityType::Spot), 0.001),
                 ((h_main.clone(), CapacityType::Od), 0.001),
-                ((h_exp.clone(), CapacityType::Spot), 1.0),
+                (
+                    (h_exp.clone(), CapacityType::Spot),
+                    1.0 + f64::from(n) * 1e-3,
+                ),
                 ((h_exp.clone(), CapacityType::Od), od_over_spot),
             ]
             .into(),
@@ -1282,17 +1285,12 @@ async fn contract_h_explore_schmitt_across_ice_mask() {
             )]
             .into(),
         );
-        // exp_feasible=false: non-empty menu with no-fit type →
-        // `smallest_fitting → None` → capacity-reject (price ignored).
-        // exp_feasible=true: empty menu → `Some(price(cell))`.
-        if !exp_feasible {
-            ct.set_menu((h_exp.clone(), CapacityType::Spot), vec![it_nofit()]);
-            ct.set_menu((h_exp.clone(), CapacityType::Od), vec![it_nofit()]);
-        }
     };
     let sla_tiers = actor.sla_tiers.clone();
     let sla_ceilings = actor.sla_ceilings.clone();
-    let sla_config = actor.sla_config.clone();
+    // Cloned with the un-clamped h_exp ceiling — `e_ratio` is only
+    // called for `exp_feasible=true` polls so this snapshot suffices.
+    let sla_config_feasible = actor.sla_config.clone();
     let e_ratio = |hw: &crate::sla::hw::HwTable, cost: &CostTable| -> f64 {
         let SolveFullResult::Feasible(m) = solve::solve_full(
             &fit,
@@ -1300,7 +1298,7 @@ async fn contract_h_explore_schmitt_across_ice_mask() {
             hw,
             cost,
             &sla_ceilings,
-            &sla_config,
+            &sla_config_feasible,
             std::slice::from_ref(&h_exp),
             &std::collections::HashSet::new(),
             true,
@@ -1322,7 +1320,7 @@ async fn contract_h_explore_schmitt_across_ice_mask() {
     let cell_od: crate::sla::config::Cell = (h_exp.clone(), CapacityType::Od);
 
     // ── poll 1: od/spot=1.14 ≤ τ_enter → Hit, 2 terms ────────────────
-    set_ratio(&actor, 1.14, true);
+    set_ratio(&actor, 1.14);
     let (hw, cost, g0) = actor.solve_inputs();
     let r = e_ratio(&hw, &cost);
     assert!(r <= 1.0 + tau, "fixture: e_od/e_spot={r:.4} ≤ τ_enter");
@@ -1343,7 +1341,7 @@ async fn contract_h_explore_schmitt_across_ice_mask() {
             && actor.ice.masked_cells().contains(&cell_od),
         "precondition: both (h_exp,*) ICE-masked"
     );
-    set_ratio(&actor, 1.20, true);
+    set_ratio(&actor, 1.20);
     let (hw, cost, g1) = actor.solve_inputs();
     assert_ne!(g1, g0, "menu change → inputs_gen bump");
     let r = e_ratio(&hw, &cost);
@@ -1361,7 +1359,7 @@ async fn contract_h_explore_schmitt_across_ice_mask() {
     actor.ice.clear(&cell_spot);
     actor.ice.clear(&cell_od);
     assert!(actor.ice.masked_cells().is_empty(), "ICE cleared");
-    set_ratio(&actor, 1.18, true);
+    set_ratio(&actor, 1.18);
     let (hw, cost, g2) = actor.solve_inputs();
     assert_ne!(g2, g1);
     let r = e_ratio(&hw, &cost);
@@ -1383,7 +1381,7 @@ async fn contract_h_explore_schmitt_across_ice_mask() {
     );
 
     // ── poll 4: od/spot=1.14 → Hit, 2 terms; re-seed prev_a ──────────
-    set_ratio(&actor, 1.14, true);
+    set_ratio(&actor, 1.14);
     let (hw, cost, g3) = actor.solve_inputs();
     assert_ne!(g3, g2);
     assert_eq!(
@@ -1395,8 +1393,14 @@ async fn contract_h_explore_schmitt_across_ice_mask() {
         "poll 4: od/spot=1.14 → Hit{{spot,od}}; prev_a={{spot,od}}"
     );
 
-    // ── poll 5: h_exp menu no-fit → BestEffort → Miss-preserve ───────
-    set_ratio(&actor, 1.14, false);
+    // ── poll 5: h_exp class-ceiling → BestEffort → Miss-preserve ─────
+    // Clamp h_exp's per-class ceiling so evaluate_cell returns
+    // ClassCeiling for any (c*≥1, mem≥1). The observed-menu sample no
+    // longer gates capacity (bug_033). `solve_intent_for` reads
+    // `actor.sla_config` live.
+    actor.sla_config.hw_classes.get_mut(&h_exp).unwrap().max_mem = 1;
+    let state = actor.dag.node("d-schmitt-ice").unwrap();
+    set_ratio(&actor, 1.14);
     let (hw, cost, g4) = actor.solve_inputs();
     assert_ne!(g4, g3);
     assert!(
@@ -1407,14 +1411,14 @@ async fn contract_h_explore_schmitt_across_ice_mask() {
                 &hw,
                 &cost,
                 &sla_ceilings,
-                &sla_config,
+                &actor.sla_config,
                 std::slice::from_ref(&h_exp),
                 &std::collections::HashSet::new(),
                 true,
             ),
             SolveFullResult::BestEffort { .. }
         ),
-        "fixture: cores=0 menu → restricted solve_full([h_exp]) BestEffort"
+        "fixture: h_exp.max_mem=1 → restricted solve_full([h_exp]) BestEffort"
     );
     let intent = actor.solve_intent_for(state, &hw, &cost, g4);
     assert!(
@@ -1425,7 +1429,9 @@ async fn contract_h_explore_schmitt_across_ice_mask() {
     // ── poll 6: restore; od/spot=1.16 (deadband) → 2 terms ───────────
     // Regression guard for the BestEffort `Miss` arm: singleton →
     // preserve prev_a={spot,od} from poll 4; clear → od τ_enter → 1.
-    set_ratio(&actor, 1.16, true);
+    actor.sla_config.hw_classes.get_mut(&h_exp).unwrap().max_mem = 256 << 30;
+    let state = actor.dag.node("d-schmitt-ice").unwrap();
+    set_ratio(&actor, 1.16);
     let (hw, cost, g5) = actor.solve_inputs();
     assert_ne!(g5, g4);
     let r = e_ratio(&hw, &cost);
@@ -1649,6 +1655,8 @@ async fn contract_pinned_explore_covers_pool() {
                 key: "rio.build/hw-class".into(),
                 value: "intel-9".into(),
             }],
+            max_cores: actor.sla_config.max_cores as u32,
+            max_mem: actor.sla_config.max_mem,
             ..Default::default()
         },
     );
@@ -1879,13 +1887,12 @@ async fn contract_pinned_explore_first_writer_independent() {
 /// `classify_ceiling` → emits `core_ceiling` instead.
 ///
 /// This test sets λ runaway (every spot cell `LambdaGate`) + OD
-/// `MenuNoFit` (the unrelated config-drift reason OD failed) → the
+/// `ClassCeiling` (the unrelated config-drift reason OD failed) → the
 /// semantic case observability.md:156 documents. Red on 6eab30da:
 /// `infeasible_counts["interrupt_runaway"] == 0`, `core_ceiling == 1`.
 #[tokio::test]
 async fn contract_interrupt_runaway_reachable() {
-    use crate::sla::config::CapacityType;
-    use crate::sla::cost::{InstanceType, RatioEma};
+    use crate::sla::cost::RatioEma;
     use crate::sla::metrics::infeasible_counts;
     use crate::sla::solve::InfeasibleReason;
 
@@ -1897,8 +1904,9 @@ async fn contract_interrupt_runaway_reachable() {
     // → T(cap_c) ≥ 30 → p(cap_c) = 1-e^{-11.6·30} ≈ 1.0 > 0.5 →
     // every (h, Spot) cell LambdaGate.
     // OD: λ=0, c_lo=1, envelope feasible (S=30 vs p90=1200), mem 6GiB
-    // < ceil 256GiB, but menu's only type has mem_bytes=1 < 6GiB →
-    // smallest_fitting → None → every (h, Od) cell MenuNoFit.
+    // < global ceil 256GiB, but per-class max_mem=1 → ClassCeiling
+    // (the configured per-class catalog ceiling; observed-menu sample
+    // no longer gates capacity).
     {
         let mut ct = actor.cost_table.write();
         *ct = crate::sla::cost::CostTable::from_parts(
@@ -1917,18 +1925,9 @@ async fn contract_interrupt_runaway_reachable() {
                 })
                 .collect(),
         );
-        for h in ["intel-6", "intel-7", "intel-8"] {
-            ct.set_menu(
-                (h.into(), CapacityType::Od),
-                vec![InstanceType {
-                    name: "unfit".into(),
-                    cores: 256,
-                    mem_bytes: 1,
-                    price_per_vcpu_hr: 0.05,
-                    last_observed: std::time::SystemTime::UNIX_EPOCH,
-                }],
-            );
-        }
+    }
+    for h in ["intel-6", "intel-7", "intel-8"] {
+        actor.sla_config.hw_classes.get_mut(h).unwrap().max_mem = 1;
     }
     actor.test_inject_ready("d-runaway", Some("test-pkg"), "x86_64-linux", false);
 
@@ -1943,9 +1942,9 @@ async fn contract_interrupt_runaway_reachable() {
             .copied()
             .unwrap_or(0),
         1,
-        "λ runaway (every spot LambdaGate) + OD MenuNoFit → \
+        "λ runaway (every spot LambdaGate) + OD ClassCeiling → \
          `why == InterruptRunaway`. Pre-R6B6: classify_best_effort's \
-         `all(λ-adjacent)` reads mixed-cap rejects; OD's MenuNoFit \
+         `all(λ-adjacent)` reads mixed-cap rejects; OD's ClassCeiling \
          poisons it → classify_ceiling → CoreCeiling. Got {m:?}"
     );
     assert_eq!(
@@ -1953,8 +1952,8 @@ async fn contract_interrupt_runaway_reachable() {
             .copied()
             .unwrap_or(0),
         0,
-        "OD's MenuNoFit is reported via classify_ceiling SEPARATELY (it \
-         isn't here — envelope feasible + mem under ceil → CoreCeiling \
+        "OD's ClassCeiling is reported via classify_ceiling SEPARATELY (it \
+         isn't here — envelope feasible + mem under global ceil → CoreCeiling \
          is the wrong label for 'spot λ-gated'). Got {m:?}"
     );
 }
@@ -2145,16 +2144,13 @@ async fn contract_forced_mem_only_override_is_hw_agnostic() {
 /// `tiers × h_all × {spot,od}`; the restricted `solve_full(.., {h}, ..)`
 /// iterates a strict subset, so its `emit_metrics` is unconditionally
 /// redundant. Pre-fix: `was_miss` (true on the miss tick) gates the
-/// restricted emit → 2× over `(h_explore, *)` MenuNoFit cells.
+/// restricted emit → 2× over `(h_explore, *)` ClassCeiling cells.
 ///
-/// `|h_all|=3`, `|tiers|=1`, h0/h1 feasible, h2 NON-empty menu but no
-/// fitting type → in_a={h0,h1} → pool={h2} (singleton, deterministic).
-/// ε=1.0 forces the explore branch. Expect 2 (one tier × {spot,od});
-/// pre-fix: 4.
+/// `|h_all|=3`, `|tiers|=1`, h0/h1 feasible, h2 per-class max_mem=1GiB
+/// → in_a={h0,h1} → pool={h2} (singleton, deterministic). ε=1.0 forces
+/// the explore branch. Expect 2 (one tier × {spot,od}); pre-fix: 4.
 #[tokio::test]
 async fn contract_hw_cost_unknown_once_per_epoch() {
-    use crate::sla::config::CapacityType;
-    use crate::sla::cost::InstanceType;
     const HW_COST_UNKNOWN: &str = "rio_scheduler_sla_hw_cost_unknown_total";
 
     let db = TestDb::new(&MIGRATOR).await;
@@ -2162,35 +2158,15 @@ async fn contract_hw_cost_unknown_once_per_epoch() {
     actor.sla_config.hw_explore_epsilon = 1.0;
     assert_eq!(actor.sla_tiers.len(), 1, "fixture: |tiers|=1");
     assert_eq!(actor.sla_config.hw_classes.len(), 3, "fixture: |h_all|=3");
-
-    let it_fit = || InstanceType {
-        name: "fit".into(),
-        cores: 256,
-        mem_bytes: 256 << 30,
-        price_per_vcpu_hr: 0.05,
-        last_observed: std::time::SystemTime::UNIX_EPOCH,
-    };
-    // Non-empty menu but no fitting type: `make_fit("test-pkg")` mem is
-    // Independent{p90: 6 GiB} → `smallest_fitting(.., c*, 6 GiB)` with
-    // `mem_bytes=1 GiB` → None → MenuNoFit (NOT empty-menu EMA fallback).
-    let it_nofit = || InstanceType {
-        name: "nofit".into(),
-        cores: 2,
-        mem_bytes: 1 << 30,
-        price_per_vcpu_hr: 0.05,
-        last_observed: std::time::SystemTime::UNIX_EPOCH,
-    };
-    {
-        let mut ct = actor.cost_table.write();
-        for h in ["intel-6", "intel-7"] {
-            for cap in CapacityType::ALL {
-                ct.set_menu((h.into(), cap), vec![it_fit()]);
-            }
-        }
-        for cap in CapacityType::ALL {
-            ct.set_menu(("intel-8".into(), cap), vec![it_nofit()]);
-        }
-    }
+    // intel-8 only: per-class max_mem=1GiB → make_fit("test-pkg")
+    // mem (Independent{p90: 6 GiB}) > 1GiB → ClassCeiling. The
+    // observed-menu sample no longer gates capacity (bug_033).
+    actor
+        .sla_config
+        .hw_classes
+        .get_mut("intel-8")
+        .unwrap()
+        .max_mem = 1 << 30;
     actor.test_inject_ready("d-nofit", Some("test-pkg"), "x86_64-linux", false);
     let state = actor.dag.node("d-nofit").unwrap();
 
@@ -2204,7 +2180,7 @@ async fn contract_hw_cost_unknown_once_per_epoch() {
     assert_eq!(
         d.get(HW_COST_UNKNOWN).copied().unwrap_or(0),
         2,
-        "`_hw_cost_unknown_total` fires once per MenuNoFit cell per \
+        "`_hw_cost_unknown_total` fires once per ClassCeiling cell per \
          (key, inputs_gen): 1 tier × {{spot,od}} on intel-8 = 2. Pre-fix \
          the ε_h restricted solve re-emits over `{{h}} ⊆ h_all` on the \
          miss tick → 4. Got {d:?}"

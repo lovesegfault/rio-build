@@ -207,7 +207,7 @@ pub fn classify_ceiling(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> 
 ///
 /// Replaces the open-coded `any_lambda_gated` / `any_envelope_gated`
 /// witness flags, which instrumented 2 of 5 `continue` paths and
-/// mislabelled `DiskCeiling` / `MemCeiling` / `MenuNoFit` rejects as
+/// mislabelled `DiskCeiling` / `MemCeiling` / `ClassCeiling` rejects as
 /// `InterruptRunaway` (r3 merged_bug_019).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CellReject {
@@ -225,10 +225,14 @@ pub enum CellReject {
     MemCeiling,
     /// `disk_p90 > sla.maxDisk` (c-independent).
     DiskCeiling,
-    /// Cost menu has no instance type fitting `(c*, mem)` — config
-    /// drift, not a fit constraint. Emitted as
-    /// `_hw_cost_unknown_total` by the caller.
-    MenuNoFit,
+    /// `c* > hwClasses[h].max_cores` or `mem > hwClasses[h].max_mem` —
+    /// the configured per-class catalog ceiling (what Karpenter is
+    /// PERMITTED to launch for this class, as distinct from
+    /// `CostTable.cells` which is what it has been OBSERVED launching).
+    /// Emitted as `_hw_cost_unknown_total` by the caller. Replaces the
+    /// pre-R24B7 menu-fit gate whose source (the autodiscovered observed
+    /// menu) is a self-reinforcing sample, not a ceiling.
+    ClassCeiling,
 }
 
 /// One feasible `(h, cap)` cell from [`solve_full`]'s inner loop.
@@ -723,7 +727,7 @@ fn hw_factor_for(fit: &FittedParams, hw: &HwTable, h: &str) -> f64 {
 /// Evaluate one `(h, cap)` cell against `tier`: λ-gate, envelope,
 /// mem/disk ceilings, and menu-fit, in that order. **Pure** — no
 /// metric emits, no logging; the caller emits `_hw_cost_unknown_total`
-/// on `Err(MenuNoFit)`. The body is exactly the per-cell loop iteration
+/// on `Err(ClassCeiling)`. The body is exactly the per-cell loop iteration
 /// of [`solve_full`], lifted so each `continue` becomes a typed
 /// `Err(CellReject)` value the post-loop fold can reason over.
 #[allow(clippy::too_many_arguments)]
@@ -733,6 +737,7 @@ fn evaluate_cell(
     hw: &HwTable,
     cost: &CostTable,
     ceil: &Ceilings,
+    class_max: (u32, u64),
     h: &HwClassName,
     cap: CapacityType,
     cap_c: f64,
@@ -776,9 +781,10 @@ fn evaluate_cell(
     if mem > ceil.max_mem {
         return Err(CellReject::MemCeiling);
     }
-    let Some(price) = cost.smallest_fitting(&cell, c_star, mem) else {
-        return Err(CellReject::MenuNoFit);
-    };
+    if c_star > class_max.0 || mem > class_max.1 {
+        return Err(CellReject::ClassCeiling);
+    }
+    let price = cost.price(&cell);
     Ok(Candidate {
         cell,
         c_star,
@@ -822,7 +828,7 @@ pub fn classify_best_effort(
             CellReject::EnvelopeInfeasible
             | CellReject::MemCeiling
             | CellReject::DiskCeiling
-            | CellReject::MenuNoFit => false,
+            | CellReject::ClassCeiling => false,
         })
     {
         InfeasibleReason::InterruptRunaway
@@ -837,7 +843,7 @@ pub fn classify_best_effort(
 ///
 /// For each tier (tightest-first), enumerate `(h, cap) ∈ h_set ×
 /// {spot, od}`: gate spot on `p(C) ≤ 0.5`; bisect c* satisfying the
-/// envelope; gate on mem ceiling and `smallest_fitting`; compute
+/// envelope; gate on mem and per-class ceilings; compute
 /// `E[cost]^upper`. If ≥1 candidate survives, build the admissible
 /// set with Schmitt deadband (`τ_enter=τ`, `τ_exit=1.3τ`), take
 /// `c* = max_A c*_{h,cap}`, then re-filter `A` by fit-at-c*,
@@ -902,11 +908,18 @@ pub fn solve_full(
     let mut spot_rejects: Vec<CellReject> = Vec::new();
     let mut od_rejects: Vec<CellReject> = Vec::new();
 
+    let class_max_of = |h: &str| {
+        cfg.hw_classes
+            .get(h)
+            .map(|d| (d.max_cores, d.max_mem))
+            .unwrap_or((u32::MAX, u64::MAX))
+    };
     for tier in tiers {
         let mut candidates: Vec<Candidate> = Vec::with_capacity(h_set.len() * 2);
         for h in h_set {
+            let class_max = class_max_of(h);
             for cap in CapacityType::ALL {
-                match evaluate_cell(fit, tier, hw, cost, ceil, h, cap, cap_c) {
+                match evaluate_cell(fit, tier, hw, cost, ceil, class_max, h, cap, cap_c) {
                     Ok(c) => candidates.push(c),
                     Err(r) => {
                         // Gated on `emit_metrics` (the memo's
@@ -915,7 +928,7 @@ pub fn solve_full(
                         // right cardinality for a config-drift signal.
                         // Kept here, not in `evaluate_cell`, so that
                         // function stays pure.
-                        if emit_metrics && r == CellReject::MenuNoFit {
+                        if emit_metrics && r == CellReject::ClassCeiling {
                             ::metrics::counter!(
                                 "rio_scheduler_sla_hw_cost_unknown_total",
                                 "tenant" => fit.key.tenant.clone()
@@ -955,26 +968,24 @@ pub fn solve_full(
         // c* = max over A — SLA-correct on the slowest h ∈ A.
         let c_star = in_a.iter().map(|c| c.c_star).max().expect("e_min ∈ A");
         let mem = (fit.mem.at(RawCores(f64::from(c_star))).0 as f64 * hr) as u64;
-        // Re-filter at c*: type-fit, cost-at-c* ≤ thresh(cell)·E_min,
-        // and capacity-ratio c*_{h,cap} ≥ c*/k. The argmax cell has
-        // c*_{h,cap} = c*, e_cost(c*) = e_cost_upper, and was admitted
-        // by smallest_fitting at its own c* ≤ c* — but a larger
-        // shared c* MAY exceed its menu, so the argmax-survives proof
+        // Re-filter at c*: class-ceiling, cost-at-c* ≤ thresh(cell) ·
+        // E_min, and capacity-ratio c*_{h,cap} ≥ c*/k. The argmax cell
+        // has c*_{h,cap} = c*, e_cost(c*) = e_cost_upper, and was
+        // admitted at its own c* ≤ c* — but a larger shared c* MAY
+        // exceed its class ceiling, so the argmax-survives proof
         // relies on the e_cost(c*) check using the candidate's OWN
-        // factor/lambda (it does), the menu degrading to EMA when
-        // empty, AND on this cost check using the SAME per-cell
-        // threshold as admission. The non-empty guarantee is
-        // `debug_assert`ed.
+        // factor/lambda (it does) AND on this cost check using the
+        // SAME per-cell threshold as admission. The non-empty
+        // guarantee is `debug_assert`ed.
         let cells: Vec<Cell> = in_a
             .iter()
             .filter(|c| {
+                let cm = class_max_of(&c.cell.0);
                 f64::from(c.c_star) >= f64::from(c_star) / k
-                    && cost
-                        .smallest_fitting(&c.cell, c_star, mem)
-                        .is_some_and(|price| {
-                            e_cost_upper(fit, c_star, c.factor, c.lambda, price)
-                                <= thresh(&c.cell) * e_min
-                        })
+                    && c_star <= cm.0
+                    && mem <= cm.1
+                    && e_cost_upper(fit, c_star, c.factor, c.lambda, cost.price(&c.cell))
+                        <= thresh(&c.cell) * e_min
             })
             .map(|c| c.cell.clone())
             .collect();
@@ -2042,6 +2053,10 @@ mod tests {
     }
 
     fn cfg_hw() -> SlaConfig {
+        cfg_hw_max(64, 256 << 30)
+    }
+
+    fn cfg_hw_max(max_cores: u32, max_mem: u64) -> SlaConfig {
         let mut c = cfg();
         for h in h_set() {
             c.hw_classes.insert(
@@ -2051,6 +2066,8 @@ mod tests {
                         key: "rio.build/hw-class".into(),
                         value: h,
                     }],
+                    max_cores,
+                    max_mem,
                     ..Default::default()
                 },
             );
@@ -2735,19 +2752,81 @@ mod tests {
         }
     }
 
-    /// λ gates every spot cell + OD price-infeasible (menu has no
-    /// fitting type) → `BestEffort` with `why == InterruptRunaway`.
-    /// **This IS the unit-level reachability proof** for the variant:
-    /// `solve_full` partitions rejects by cap, `classify_best_effort`
-    /// reads spot-only for the λ predicate, so OD's `MenuNoFit` cannot
-    /// poison `all(λ-adjacent)`. Pre-R6B6 the mixed-cap `all()` was
+    /// bug_033: the autodiscovered observed-menu sample is NOT a
+    /// capacity gate. A cell whose first observation is a 7-core type
+    /// must NOT reject c*=32 — Karpenter's `requirements` permit
+    /// larger; the menu is what it has *observed* launching, not a
+    /// ceiling on what it *can*. The configured per-class
+    /// `HwClassDef.max_cores` is the gate.
+    #[test]
+    fn observed_menu_does_not_capacity_reject_class_ceiling_does() {
+        let mut cost = CostTable::seeded("c", super::super::cost::HwCostSource::Static);
+        // Observed menu: only a 2-core type (e.g., m7i.large from a
+        // first cold-start probe).
+        cost.set_menu(
+            ("intel-7".into(), CapacityType::Spot),
+            vec![super::super::cost::InstanceType {
+                name: "m7i.large".into(),
+                cores: 2,
+                mem_bytes: 8 << 30,
+                price_per_vcpu_hr: 0.05,
+                last_observed: std::time::SystemTime::UNIX_EPOCH,
+            }],
+        );
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        let hw = hw_three();
+
+        // class_max = global ceil → menu sample does NOT reject.
+        let r = evaluate_cell(
+            &fit,
+            &t("normal", 300.0),
+            &hw,
+            &cost,
+            &ceil(),
+            (64, 256 << 30),
+            &"intel-7".into(),
+            CapacityType::Spot,
+            64.0,
+        );
+        assert!(
+            r.is_ok(),
+            "observed 7-core menu with class_max=64 must NOT capacity-reject; got {r:?}"
+        );
+
+        let c_star = r.as_ref().unwrap().c_star;
+        assert!(
+            c_star > 2,
+            "fixture: c_star={c_star} above observed-menu max"
+        );
+
+        // class_max < c_star (configured catalog ceiling) → ClassCeiling.
+        let r = evaluate_cell(
+            &fit,
+            &t("normal", 300.0),
+            &hw,
+            &cost,
+            &ceil(),
+            (c_star - 1, 256 << 30),
+            &"intel-7".into(),
+            CapacityType::Spot,
+            64.0,
+        );
+        assert_eq!(r.err(), Some(CellReject::ClassCeiling));
+    }
+
+    /// λ gates every spot cell + OD class-ceiling-reject → `BestEffort`
+    /// with `why == InterruptRunaway`. **This IS the unit-level
+    /// reachability proof** for the variant: `solve_full` partitions
+    /// rejects by cap, `classify_best_effort` reads spot-only for the
+    /// λ predicate, so OD's `ClassCeiling` cannot poison
+    /// `all(λ-adjacent)`. Pre-R6B6 the mixed-cap `all()` was
     /// structurally always-false (OD never λ-adjacent after the
     /// `cap_c.max(1.0)` floor) → returned `CoreCeiling`; r6 bug 021.
     ///
     /// Contract-layer mirror: `contract_interrupt_runaway_reachable`.
     #[test]
     fn solve_full_besteffort_why_interrupt_runaway() {
-        use super::super::cost::{InstanceType, RatioEma};
+        use super::super::cost::RatioEma;
         // λ ≈ 1e6 / (1 + 86400) ≈ 11.6/s — `p(cap_c) > 0.5` for any
         // T(cap_c) > 0.06s. mk_fit's S=30s alone guarantees that.
         let runaway: HashMap<_, _> = h_set()
@@ -2763,39 +2842,29 @@ mod tests {
                 )
             })
             .collect();
-        let mut cost = CostTable::from_parts(HashMap::new(), runaway);
-        // OD: envelope feasible (c*≈4-9 against p90=300), but the only
-        // menu type is 2-core → `smallest_fitting → None` → MenuNoFit.
-        for h in h_set() {
-            cost.set_menu(
-                (h, CapacityType::Od),
-                vec![InstanceType {
-                    name: "tiny".into(),
-                    cores: 2,
-                    mem_bytes: 256 << 30,
-                    price_per_vcpu_hr: 0.05,
-                    last_observed: std::time::SystemTime::UNIX_EPOCH,
-                }],
-            );
-        }
+        let cost = CostTable::from_parts(HashMap::new(), runaway);
         let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        // OD: envelope feasible (c*≈4-9 against p90=300), but
+        // class.max_cores=2 → ClassCeiling (the configured per-class
+        // catalog ceiling, NOT the observed-menu sample which is no
+        // longer a gate).
         let r = solve_full(
             &fit,
             &[t("normal", 300.0)],
             &hw_three(),
             &cost,
             &ceil(),
-            &cfg_hw(),
+            &cfg_hw_max(2, 256 << 30),
             &h_set(),
             &HashSet::new(),
             true,
         );
         let SolveFullResult::BestEffort { why, .. } = r else {
-            panic!("λ-gated spot + OD menu-unfit → BestEffort, got {r:?}")
+            panic!("λ-gated spot + OD class-ceiling → BestEffort, got {r:?}")
         };
-        // spot_rejects = {LambdaGate ×3}, od_rejects = {MenuNoFit ×3}.
+        // spot_rejects = {LambdaGate ×3}, od_rejects = {ClassCeiling ×3}.
         // spot.all(λ-adjacent) = true → InterruptRunaway. OD's
-        // unrelated MenuNoFit is reported separately (classify_ceiling
+        // unrelated ClassCeiling is reported separately (classify_ceiling
         // would say CoreCeiling, but spot's λ is the binding label).
         assert_eq!(why, InfeasibleReason::InterruptRunaway);
 
@@ -2933,7 +3002,7 @@ mod tests {
             // OD failed on — irrelevant to the spot-only predicate.
             (
                 &[LambdaGate],
-                &[MenuNoFit],
+                &[ClassCeiling],
                 f_serial,
                 10.0,
                 R::InterruptRunaway,
@@ -2947,7 +3016,7 @@ mod tests {
             ),
             (
                 &[LambdaGate, CLoExceedsCap, LambdaGate],
-                &[MenuNoFit, EnvelopeInfeasible, MemCeiling],
+                &[ClassCeiling, EnvelopeInfeasible, MemCeiling],
                 f_serial,
                 10.0,
                 R::InterruptRunaway,
@@ -2962,7 +3031,7 @@ mod tests {
                 R::InterruptRunaway,
             ),
             // ── ANY spot non-λ reject → classify_ceiling. r2's witness
-            // flags missed MemCeiling, DiskCeiling, MenuNoFit — all
+            // flags missed MemCeiling, DiskCeiling, ClassCeiling — all
             // mislabelled as InterruptRunaway.
             (
                 &[LambdaGate, EnvelopeInfeasible],
@@ -2986,8 +3055,8 @@ mod tests {
                 R::SerialFloor,
             ),
             (
-                &[LambdaGate, MenuNoFit],
-                &[MenuNoFit],
+                &[LambdaGate, ClassCeiling],
+                &[ClassCeiling],
                 f_serial,
                 10.0,
                 R::SerialFloor,
@@ -3003,7 +3072,7 @@ mod tests {
             // true; !is_empty() guard prevents it). solve_full produces
             // this when h_set=[] (ε_h singleton already-graduated edge).
             (&[], &[], f_serial, 10.0, R::SerialFloor),
-            (&[], &[MenuNoFit], f_serial, 10.0, R::SerialFloor),
+            (&[], &[ClassCeiling], f_serial, 10.0, R::SerialFloor),
             // ── classify_ceiling fallthrough variants (varying fit;
             // spot has ≥1 non-λ so InterruptRunaway is off the table).
             (
@@ -3029,10 +3098,10 @@ mod tests {
         // Converse: any non-λ in SPOT → NEVER InterruptRunaway,
         // regardless of how many λ-gates accompany it. A non-λ in OD
         // alone does NOT poison (covered by row 0 above).
-        for poison in [EnvelopeInfeasible, MemCeiling, DiskCeiling, MenuNoFit] {
+        for poison in [EnvelopeInfeasible, MemCeiling, DiskCeiling, ClassCeiling] {
             let got = classify_best_effort(
                 &[LambdaGate, LambdaGate, poison, CLoExceedsCap],
-                &[MenuNoFit],
+                &[ClassCeiling],
                 &f_serial(),
                 &[t("x", 10.0)],
                 &ceil(),

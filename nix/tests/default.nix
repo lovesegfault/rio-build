@@ -105,14 +105,20 @@ let
         labels = [{ key = "rio.build/hw-class", value = "intel-6-ebs-lo" }]
         requirements = [{ key = "kubernetes.io/os", operator = "In", values = ["linux"] }]
         node_class = "rio-default"
+        max_cores = 64
+        max_mem = 17179869184
         [sla.hw_classes.intel-7-ebs-mid]
         labels = [{ key = "rio.build/hw-class", value = "intel-7-ebs-mid" }]
         requirements = [{ key = "kubernetes.io/os", operator = "In", values = ["linux"] }]
         node_class = "rio-default"
+        max_cores = 64
+        max_mem = 17179869184
         [sla.hw_classes.intel-8-nvme-hi]
         labels = [{ key = "rio.build/hw-class", value = "intel-8-nvme-hi" }]
         requirements = [{ key = "kubernetes.io/os", operator = "In", values = ["linux"] }]
         node_class = "rio-default"
+        max_cores = 64
+        max_mem = 17179869184
       '';
     };
     extraPackages = [
@@ -182,6 +188,8 @@ let
         labels = [{ key = "rio.build/hw-class", value = "vmtest" }]
         requirements = [{ key = "kubernetes.io/os", operator = "In", values = ["linux"] }]
         node_class = "rio-default"
+        max_cores = 16
+        max_mem = 2147483648
       '';
     };
     extraStoreConfig = {
@@ -826,6 +834,8 @@ in
             ${nullKeys "      " prodHw}
                   vmtest:
                     nodeClass: rio-default
+                    maxCores: 16
+                    maxMem: 2147483648
                     labels:
                       - {key: rio.build/vmtest, value: "true"}
                     requirements:

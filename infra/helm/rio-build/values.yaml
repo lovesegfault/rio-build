@@ -428,6 +428,16 @@ scheduler:
     # band-loop NodePool template selected this by `$stor`; with that
     # template deleted (B3) the per-class nodeClass is the only place
     # the EC2NodeClass selection lives.
+    #
+    # maxCores/maxMem are the per-class CONFIGURED catalog ceilings —
+    # what the `requirements` permit Karpenter to launch (as distinct
+    # from the autodiscovered `CostTable.cells` menu, which is what it
+    # has been observed launching). `evaluate_cell` rejects c* above
+    # these as `ClassCeiling`; the global `sla.maxCores`/`maxMem` are
+    # the union ceiling. Unset → template defaults to the global
+    # ceiling (every class permits up to global). Set a tighter
+    # per-class value (e.g. an arm-only pool that tops at 64c) to keep
+    # the solve from routing 128c demand there.
     hwClasses:
       hi-nvme-x86:
         nodeClass: rio-nvme

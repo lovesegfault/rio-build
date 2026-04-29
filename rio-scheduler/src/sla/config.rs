@@ -40,6 +40,18 @@ pub struct HwClassDef {
     /// volume.
     #[serde(default)]
     pub node_class: String,
+    /// Per-class capacity ceiling for `evaluate_cell`'s
+    /// `ClassCeiling` gate — the configured catalog of what this
+    /// hw-class's `requirements` *permit* Karpenter to launch, as
+    /// distinct from `CostTable.cells` (what it has *observed*
+    /// launching, which is a self-reinforcing sample). A `c*` above
+    /// this is rejected for THIS class only; the global `[sla].maxCores`
+    /// is the union ceiling. `0` rejected by `validate()`.
+    #[serde(default)]
+    pub max_cores: u32,
+    /// Per-class memory ceiling — see [`Self::max_cores`].
+    #[serde(default)]
+    pub max_mem: u64,
 }
 
 /// `{key, operator, values}` — same shape as k8s
@@ -404,6 +416,8 @@ impl SlaConfig {
                         values: vec!["linux".into()],
                     }],
                     node_class: "rio-default".into(),
+                    max_cores: 16,
+                    max_mem: 2 << 30,
                 },
             )]),
             hw_cost_tolerance: default_hw_cost_tolerance(),
@@ -489,6 +503,18 @@ impl SlaConfig {
                 !def.node_class.is_empty(),
                 "sla.hwClasses[{h}].node_class must name an EC2NodeClass \
                  (rio-default / rio-nvme / rio-metal)"
+            );
+            anyhow::ensure!(
+                def.max_cores > 0 && f64::from(def.max_cores) <= self.max_cores,
+                "sla.hwClasses[{h}].max_cores must be in [1, sla.maxCores={}], got {}",
+                self.max_cores,
+                def.max_cores
+            );
+            anyhow::ensure!(
+                def.max_mem > 0 && def.max_mem <= self.max_mem,
+                "sla.hwClasses[{h}].max_mem must be in [1, sla.maxMem={}], got {}",
+                self.max_mem,
+                def.max_mem
             );
             for r in &def.requirements {
                 anyhow::ensure!(
@@ -580,6 +606,8 @@ mod tests {
             }],
             requirements: test_req(),
             node_class: "rio-default".into(),
+            max_cores: 64,
+            max_mem: 256 << 30,
         }
     }
 
@@ -821,6 +849,8 @@ mod tests {
               { key = "karpenter.k8s.aws/instance-generation", operator = "In", values = ["8"] },
             ]
             node_class = "rio-nvme"
+            max_cores = 64
+            max_mem = 1
             [lead_time_seed]
             "intel-8-nvme:spot" = 45.0
             "intel-8-nvme:od" = 38.0
@@ -951,6 +981,27 @@ mod tests {
             err.contains("node_class must name an EC2NodeClass"),
             "{err}"
         );
+
+        // Per-class ceilings: 0 rejected; > global rejected; = global ok.
+        for (mc, mm, expect) in [
+            (0, 1, Some("max_cores must be in [1")),
+            (64, 0, Some("max_mem must be in [1")),
+            (65, 1, Some("max_cores must be in [1, sla.maxCores=64]")),
+            (64, (256u64 << 30) + 1, Some("max_mem must be in [1")),
+            (64, 256 << 30, None),
+        ] {
+            let mut cfg = base();
+            let def = cfg.hw_classes.get_mut("test-hw").unwrap();
+            def.max_cores = mc;
+            def.max_mem = mm;
+            match (expect, cfg.validate()) {
+                (Some(want), Err(e)) => {
+                    assert!(e.to_string().contains(want), "({mc},{mm}): {e}")
+                }
+                (None, Ok(())) => {}
+                (e, r) => panic!("({mc},{mm}): expect {e:?}, got {r:?}"),
+            }
+        }
     }
 
     #[test]

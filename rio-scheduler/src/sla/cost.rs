@@ -6,9 +6,9 @@
 //!   instance-type [`menu`](CostTable::menu). Populated by
 //!   [`spot_price_poller`] (lease-gated, 10min tick, 3h-halflife EMA
 //!   over `DescribeSpotPriceHistory`) and persisted to `sla_ema_state`
-//!   so a restart doesn't re-warm. `smallest_fitting` resolves the
-//!   `price_per_vcpu_hr` of what Karpenter would actually launch for
-//!   a given `(c*, M(c*))`.
+//!   so a restart doesn't re-warm. The menu drives `poll_spot_once`'s
+//!   AWS query only; per-class capacity ceilings live in
+//!   `HwClassDef.max_{cores,mem}` (configured catalog).
 //! - λ\[h\]: per-hw-class Poisson interrupt rate. Gamma-Poisson partial
 //!   pooling over `interrupt_samples` (controller-appended): the seed
 //!   acts as a prior with weight `n_λ = 1day · max(1, node_count_ema)`
@@ -33,12 +33,13 @@ use crate::lease::LeaderState;
 
 use super::config::{CapacityType, Cell, HwClassName, cell_label, parse_cell};
 
-/// One instance type in a cell's menu. `cores`/`mem_bytes` gate
-/// [`CostTable::smallest_fitting`]'s capacity-reject; `name`+`cores`
-/// drive `poll_spot_once`'s per-type AWS query and `$/vCPU` divisor.
-/// `price_per_vcpu_hr` is seed-only (the per-cell EMA in
-/// [`CostTable::price`] is what `smallest_fitting` returns); kept for
-/// `set_menu` test ergonomics.
+/// One instance type in a cell's menu. `name`+`cores` drive
+/// `poll_spot_once`'s per-type AWS query and `$/vCPU` divisor.
+/// `mem_bytes` is informational (from controller observation);
+/// `price_per_vcpu_hr` is seed-only — the per-cell EMA in
+/// [`CostTable::price`] is what `evaluate_cell` reads. The menu is NOT
+/// a capacity gate (it's a sample of what Karpenter has launched, not
+/// a ceiling on what it can — see `HwClassDef.max_{cores,mem}`).
 #[derive(Debug, Clone)]
 pub struct InstanceType {
     pub name: String,
@@ -245,11 +246,10 @@ pub struct CostTable {
     /// `node.kubernetes.io/instance-type` via `AckSpawnedIntents`;
     /// [`Self::observe_instance_types`] folds it here. Persisted to
     /// `sla_observed_instance_types` (mig 060) so leader restart keeps
-    /// the menu. Empty until first observations land —
-    /// [`Self::smallest_fitting`] degrades to the per-cell EMA scalar
-    /// (one synthetic "fits-all" type) so the admissible-set solve
-    /// produces candidates, and the stale-seconds gauge is suppressed
-    /// (poller no-ops on empty menu by design).
+    /// the menu. Empty until first observations land — the menu drives
+    /// `poll_spot_once`'s AWS query only (NOT a capacity gate; per-class
+    /// ceilings are `HwClassDef.max_{cores,mem}`), and the stale-seconds
+    /// gauge is suppressed (poller no-ops on empty menu by design).
     cells: HashMap<Cell, Vec<InstanceType>>,
     /// `price_updated_at() > 6 × pollInterval` ago. Set by
     /// [`CostTable::apply_stale_clamp`] each tick; while true,
@@ -305,24 +305,6 @@ impl CostTable {
     /// before Part-B menu population.
     pub fn menu(&self, cell: &Cell) -> &[InstanceType] {
         self.cells.get(cell).map(Vec::as_slice).unwrap_or(&[])
-    }
-
-    /// [`Self::price`] for `cell` if the smallest menu type fitting
-    /// `(c, mem)` exists — i.e., what Karpenter would actually launch
-    /// (ADR-023 L624). `None` ⇔ menu non-empty AND no type fits
-    /// (cell rejected on capacity). Empty menu ⇔ degrade to the
-    /// per-cell EMA scalar (one synthetic fits-all type).
-    ///
-    /// The menu gates capacity-rejection only; the returned price is
-    /// the per-cell EMA, NOT a per-type field — `fold_spot_poll` writes
-    /// `self.price[cell]` only, so a per-type price would be frozen at
-    /// seed forever (R24B7 B1).
-    pub fn smallest_fitting(&self, cell: &Cell, c: u32, mem: u64) -> Option<f64> {
-        let menu = self.menu(cell);
-        if !menu.is_empty() && !menu.iter().any(|t| t.cores >= c && t.mem_bytes >= mem) {
-            return None;
-        }
-        Some(self.price(cell))
     }
 
     /// Cheapest hw_class by `(h, Spot)` price. For the ε_h `A=H`
@@ -393,8 +375,8 @@ impl CostTable {
 
     /// Stable hash of the **solve-relevant projection**: every field
     /// [`super::solve::solve_full`] reads through [`Self::price`] /
-    /// [`Self::lambda_for`] / [`Self::smallest_fitting`] /
-    /// [`Self::cheapest_h`]. Feeds [`super::solve::SolveInputs::inputs_gen`]
+    /// [`Self::lambda_for`] / [`Self::cheapest_h`]. Feeds
+    /// [`super::solve::SolveInputs::inputs_gen`]
     /// (the derived `inputs_gen`). Includes `stale_clamp` — a clamp
     /// flip changes `price()` from EMA→seed without ANY caller action.
     ///
@@ -436,16 +418,13 @@ impl CostTable {
             k.hash(&mut h);
             ((self.lambda_for(k) * 1e6).round() as i64).hash(&mut h);
         }
-        let mut cells: Vec<_> = self.cells.iter().collect();
-        cells.sort_by_key(|(k, _)| cell_label(k));
-        for (k, menu) in cells {
-            cell_label(k).hash(&mut h);
-            for t in menu {
-                t.cores.hash(&mut h);
-                t.mem_bytes.hash(&mut h);
-                t.price_per_vcpu_hr.to_bits().hash(&mut h);
-            }
-        }
+        // `self.cells` deliberately NOT hashed: the autodiscovered menu
+        // feeds `poll_spot_once` only and does not affect
+        // `evaluate_cell` output (per-class capacity is
+        // `HwClassDef.max_{cores,mem}`, configured). Hashing it would
+        // bump `inputs_gen` on every controller-observed type and
+        // invalidate every key's solve memo for no solve-relevant
+        // change.
         h.finish()
     }
 
@@ -762,10 +741,9 @@ impl CostTable {
     /// into the per-cell menu. Union-only: a `(cell, name)` already
     /// present has its `last_observed` refreshed (NOT skipped — the
     /// persist writes data-time, so the dedup-hit path must touch it).
-    /// New entries seed `price_per_vcpu_hr` (never read by
-    /// [`Self::smallest_fitting`]; harmless). Re-sorts each touched
-    /// menu by `(cores, mem_bytes)` so [`Self::smallest_fitting`]'s
-    /// "first fit = smallest fit" holds.
+    /// New entries seed `price_per_vcpu_hr` (informational only — the
+    /// menu drives `poll_spot_once`, not `evaluate_cell`). Re-sorts
+    /// each touched menu by `(cores, mem_bytes)` for stable iteration.
     // r[impl sched.sla.cost-instance-type-feedback]
     pub fn observe_instance_types(
         &mut self,
@@ -1347,35 +1325,6 @@ mod tests {
             price_per_vcpu_hr: p,
             last_observed: SystemTime::UNIX_EPOCH,
         }
-    }
-
-    #[test]
-    fn smallest_fitting_gates_capacity_only() {
-        let mut t = CostTable::seeded("", HwCostSource::Spot);
-        let cell = ("h".into(), CapacityType::Spot);
-        t.set_price("h", CapacityType::Spot, 0.033, 1000.0);
-        t.set_menu(
-            cell.clone(),
-            vec![
-                it("c.large", 2, 4, 0.04),
-                it("c.xlarge", 4, 8, 0.04),
-                it("c.4xlarge", 16, 32, 0.038),
-            ],
-        );
-        // (c=3, mem=6Gi) → xlarge fits → per-CELL EMA price (NOT
-        // per-type 0.04 — `fold_spot_poll` writes self.price only, so
-        // per-type is frozen at seed; R24B7 B1).
-        assert_eq!(t.smallest_fitting(&cell, 3, 6 << 30), Some(0.033));
-        // (c=12) → 4xlarge fits → same per-cell price.
-        assert_eq!(t.smallest_fitting(&cell, 12, 0), Some(0.033));
-        // (c=32) → no fit (menu non-empty) → capacity-rejected.
-        assert_eq!(t.smallest_fitting(&cell, 32, 0), None);
-        // Empty menu cell → degrades to per-cell price (seed here).
-        let other = ("h2".into(), CapacityType::Spot);
-        assert_eq!(
-            t.smallest_fitting(&other, 32, 0),
-            Some(seed_price(CapacityType::Spot))
-        );
     }
 
     #[test]

@@ -230,6 +230,8 @@ data:
       {{- end }}
     ]
     node_class = {{ required (printf "scheduler.sla.hwClasses.%s.nodeClass is mandatory (rio-default / rio-nvme / rio-metal)" $h) $def.nodeClass | quote }}
+    max_cores = {{ $def.maxCores | default $.Values.scheduler.sla.maxCores | int64 }}
+    max_mem = {{ $def.maxMem | default $.Values.scheduler.sla.maxMem | int64 }}
     {{- end }}
 
     [sla.probe]

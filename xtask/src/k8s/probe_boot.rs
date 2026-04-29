@@ -678,6 +678,8 @@ mod tests {
                 .collect(),
             requirements,
             node_class: "rio-default".into(),
+            max_cores: 64,
+            max_mem: 256 << 30,
         }
     }
 
