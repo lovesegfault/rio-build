@@ -946,6 +946,22 @@ pub const M_058: () = ();
 /// corpus grows or the persist moves behind a store RPC.
 pub const M_059: () = ();
 
+/// `migrations/060_sla_observed_instance_types.sql`
+///
+/// ADR-023 §13a R24B7: per-cell instance-type menu, populated by
+/// controller-observed `node.kubernetes.io/instance-type` feedback via
+/// `AckSpawnedIntents` (option-i autodiscovery — observing what
+/// Karpenter resolves rather than reimplementing its label-derivation).
+/// `last_observed` is the most recent time the controller reported this
+/// `(cell, type)` pair; written from `InstanceType.last_observed`
+/// (data-time, NOT `now()`) so a future eviction sweep has a real
+/// recency signal. `cores`/`mem_bytes` are kubelet allocatable (the
+/// bin-pack view), not nominal — ~3% systematic under-count, uniform
+/// across cells so cost ranking is unaffected.
+///
+/// Read/written by **rio-scheduler** only (`CostTable::load`/`persist`).
+pub const M_060: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

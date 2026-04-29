@@ -2774,6 +2774,7 @@ mod tests {
                     cores: 2,
                     mem_bytes: 256 << 30,
                     price_per_vcpu_hr: 0.05,
+                    last_observed: std::time::SystemTime::UNIX_EPOCH,
                 }],
             );
         }

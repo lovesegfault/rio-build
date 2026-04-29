@@ -23,7 +23,7 @@
 //! never overwritten; each dispatch computes `A \ ice_masked`.
 
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -33,15 +33,24 @@ use crate::lease::LeaderState;
 
 use super::config::{CapacityType, Cell, HwClassName, cell_label, parse_cell};
 
-/// One instance type in a cell's menu. `price_per_vcpu_hr` is the
-/// EMA-smoothed `$/vCPU·hr` (or seed); `cores`/`mem_bytes` gate
-/// `smallest_fitting`.
+/// One instance type in a cell's menu. `cores`/`mem_bytes` gate
+/// [`CostTable::smallest_fitting`]'s capacity-reject; `name`+`cores`
+/// drive [`poll_spot_once`]'s per-type AWS query and `$/vCPU` divisor.
+/// `price_per_vcpu_hr` is seed-only (the per-cell EMA in
+/// [`CostTable::price`] is what `smallest_fitting` returns); kept for
+/// [`CostTable::set_menu`] test ergonomics.
 #[derive(Debug, Clone)]
 pub struct InstanceType {
     pub name: String,
     pub cores: u32,
     pub mem_bytes: u64,
     pub price_per_vcpu_hr: f64,
+    /// Most recent controller observation. Persisted to
+    /// `sla_observed_instance_types.last_observed` (data-time, NOT
+    /// `now()` at persist) so a future eviction sweep has a real
+    /// recency signal — `persist()` loops the full in-memory menu every
+    /// 10min, so writing `now()` would refresh every row forever.
+    pub last_observed: SystemTime,
 }
 
 /// Where `$/vCPU·hr` numbers come from.
@@ -230,13 +239,17 @@ pub struct CostTable {
     /// [`CostTable::refresh_lambda`] as `Σ exposure_secs / Δt`.
     node_count: HashMap<HwClassName, PriceEma>,
     /// Per-cell instance-type menu, sorted by `cores` asc. Populated by
-    /// controller-observed instance-type feedback (TODO R24B7:
-    /// `nodeclaim_pool` reports `node.kubernetes.io/instance-type` per
-    /// resolved cell via `AckSpawnedIntents`). Empty until first
-    /// observations land — [`Self::smallest_fitting`] degrades to the
-    /// per-cell EMA scalar (one synthetic "fits-all" type) so the
-    /// admissible-set solve produces candidates, and the stale-seconds
-    /// gauge is suppressed (poller no-ops on empty menu by design).
+    /// controller-observed instance-type feedback
+    /// (`r[sched.sla.cost-instance-type-feedback]`): `nodeclaim_pool`
+    /// reports each resolved NodeClaim's
+    /// `node.kubernetes.io/instance-type` via `AckSpawnedIntents`;
+    /// [`Self::observe_instance_types`] folds it here. Persisted to
+    /// `sla_observed_instance_types` (mig 060) so leader restart keeps
+    /// the menu. Empty until first observations land —
+    /// [`Self::smallest_fitting`] degrades to the per-cell EMA scalar
+    /// (one synthetic "fits-all" type) so the admissible-set solve
+    /// produces candidates, and the stale-seconds gauge is suppressed
+    /// (poller no-ops on empty menu by design).
     cells: HashMap<Cell, Vec<InstanceType>>,
     /// `price_updated_at() > 6 × pollInterval` ago. Set by
     /// [`CostTable::apply_stale_clamp`] each tick; while true,
@@ -294,19 +307,22 @@ impl CostTable {
         self.cells.get(cell).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// `price_per_vcpu_hr` of the smallest instance type in `cell`
-    /// fitting `(c, mem)` — i.e., what Karpenter would actually launch
+    /// [`Self::price`] for `cell` if the smallest menu type fitting
+    /// `(c, mem)` exists — i.e., what Karpenter would actually launch
     /// (ADR-023 L624). `None` ⇔ menu non-empty AND no type fits
     /// (cell rejected on capacity). Empty menu ⇔ degrade to the
     /// per-cell EMA scalar (one synthetic fits-all type).
+    ///
+    /// The menu gates capacity-rejection only; the returned price is
+    /// the per-cell EMA, NOT a per-type field — `fold_spot_poll` writes
+    /// `self.price[cell]` only, so a per-type price would be frozen at
+    /// seed forever (R24B7 B1).
     pub fn smallest_fitting(&self, cell: &Cell, c: u32, mem: u64) -> Option<f64> {
         let menu = self.menu(cell);
-        if menu.is_empty() {
-            return Some(self.price(cell));
+        if !menu.is_empty() && !menu.iter().any(|t| t.cores >= c && t.mem_bytes >= mem) {
+            return None;
         }
-        menu.iter()
-            .find(|t| t.cores >= c && t.mem_bytes >= mem)
-            .map(|t| t.price_per_vcpu_hr)
+        Some(self.price(cell))
     }
 
     /// Cheapest hw_class by `(h, Spot)` price. For the ε_h `A=H`
@@ -487,6 +503,29 @@ impl CostTable {
                 );
             }
         }
+        let observed: Vec<(String, String, String, i32, i64, f64)> = sqlx::query_as(
+            "SELECT hw_class, capacity_type, instance_type, cores, mem_bytes, \
+             EXTRACT(EPOCH FROM last_observed)::float8 \
+             FROM sla_observed_instance_types WHERE cluster = $1",
+        )
+        .bind(cluster)
+        .fetch_all(db.pool())
+        .await?;
+        for (h, cap, name, cores, mem_bytes, at) in observed {
+            let Some(cap) = CapacityType::parse(&cap) else {
+                continue;
+            };
+            t.cells.entry((h, cap)).or_default().push(InstanceType {
+                name,
+                cores: cores.max(0) as u32,
+                mem_bytes: mem_bytes.max(0) as u64,
+                price_per_vcpu_hr: seed_price(cap),
+                last_observed: SystemTime::UNIX_EPOCH + Duration::from_secs_f64(at.max(0.0)),
+            });
+        }
+        for m in t.cells.values_mut() {
+            m.sort_by_key(|it| (it.cores, it.mem_bytes));
+        }
         Ok(t)
     }
 
@@ -544,6 +583,39 @@ impl CostTable {
             .bind(nc.updated_at)
             .execute(db.pool())
             .await?;
+        }
+        // Unconditional w.r.t. `self.source`: instance types are
+        // observed regardless of Spot/Static. `last_observed` is
+        // data-time (`InstanceType.last_observed`), NOT `now()` — see
+        // the field doc for why.
+        for ((h, cap), menu) in &self.cells {
+            for t in menu {
+                let at = t
+                    .last_observed
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                sqlx::query(
+                    "INSERT INTO sla_observed_instance_types \
+                     (cluster, hw_class, capacity_type, instance_type, cores, mem_bytes, last_observed) \
+                     VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7)) \
+                     ON CONFLICT (cluster, hw_class, capacity_type, instance_type) DO UPDATE SET \
+                     cores = EXCLUDED.cores, mem_bytes = EXCLUDED.mem_bytes, \
+                     last_observed = EXCLUDED.last_observed",
+                )
+                .bind(&self.cluster)
+                .bind(h)
+                .bind(match cap {
+                    CapacityType::Spot => "spot",
+                    CapacityType::Od => "od",
+                })
+                .bind(&t.name)
+                .bind(i32::try_from(t.cores).unwrap_or(i32::MAX))
+                .bind(i64::try_from(t.mem_bytes).unwrap_or(i64::MAX))
+                .bind(at)
+                .execute(db.pool())
+                .await?;
+            }
         }
         Ok(())
     }
@@ -684,6 +756,43 @@ impl CostTable {
     pub fn set_menu(&mut self, cell: Cell, mut menu: Vec<InstanceType>) {
         menu.sort_by_key(|t| t.cores);
         self.cells.insert(cell, menu);
+    }
+
+    /// Fold controller-observed `(cell, instance_type, cores, mem)`
+    /// into the per-cell menu. Union-only: a `(cell, name)` already
+    /// present has its `last_observed` refreshed (NOT skipped — the
+    /// persist writes data-time, so the dedup-hit path must touch it).
+    /// New entries seed `price_per_vcpu_hr` (never read by
+    /// [`Self::smallest_fitting`]; harmless). Re-sorts each touched
+    /// menu by `(cores, mem_bytes)` so [`Self::smallest_fitting`]'s
+    /// "first fit = smallest fit" holds.
+    // r[impl sched.sla.cost-instance-type-feedback]
+    pub fn observe_instance_types(
+        &mut self,
+        obs: impl IntoIterator<Item = (Cell, String, u32, u64)>,
+    ) {
+        let now = SystemTime::now();
+        let mut touched: HashSet<Cell> = HashSet::new();
+        for (cell, name, cores, mem_bytes) in obs {
+            let menu = self.cells.entry(cell.clone()).or_default();
+            if let Some(t) = menu.iter_mut().find(|t| t.name == name) {
+                t.last_observed = now;
+                continue;
+            }
+            menu.push(InstanceType {
+                name,
+                cores,
+                mem_bytes,
+                price_per_vcpu_hr: seed_price(cell.1),
+                last_observed: now,
+            });
+            touched.insert(cell);
+        }
+        for cell in touched {
+            if let Some(m) = self.cells.get_mut(&cell) {
+                m.sort_by_key(|t| (t.cores, t.mem_bytes));
+            }
+        }
     }
 }
 
@@ -1218,13 +1327,15 @@ mod tests {
             cores,
             mem_bytes: mem_gib << 30,
             price_per_vcpu_hr: p,
+            last_observed: SystemTime::UNIX_EPOCH,
         }
     }
 
     #[test]
-    fn smallest_fitting_is_first_menu_match() {
-        let mut t = CostTable::default();
+    fn smallest_fitting_gates_capacity_only() {
+        let mut t = CostTable::seeded("", HwCostSource::Spot);
         let cell = ("h".into(), CapacityType::Spot);
+        t.set_price("h", CapacityType::Spot, 0.033, 1000.0);
         t.set_menu(
             cell.clone(),
             vec![
@@ -1233,18 +1344,79 @@ mod tests {
                 it("c.4xlarge", 16, 32, 0.038),
             ],
         );
-        // (c=3, mem=6Gi) → first fit is xlarge.
-        assert_eq!(t.smallest_fitting(&cell, 3, 6 << 30), Some(0.04));
-        // (c=12) → 4xlarge.
-        assert_eq!(t.smallest_fitting(&cell, 12, 0), Some(0.038));
-        // (c=32) → no fit (menu non-empty).
+        // (c=3, mem=6Gi) → xlarge fits → per-CELL EMA price (NOT
+        // per-type 0.04 — `fold_spot_poll` writes self.price only, so
+        // per-type is frozen at seed; R24B7 B1).
+        assert_eq!(t.smallest_fitting(&cell, 3, 6 << 30), Some(0.033));
+        // (c=12) → 4xlarge fits → same per-cell price.
+        assert_eq!(t.smallest_fitting(&cell, 12, 0), Some(0.033));
+        // (c=32) → no fit (menu non-empty) → capacity-rejected.
         assert_eq!(t.smallest_fitting(&cell, 32, 0), None);
-        // Empty menu cell → degrades to EMA price (seed here).
+        // Empty menu cell → degrades to per-cell price (seed here).
         let other = ("h2".into(), CapacityType::Spot);
         assert_eq!(
             t.smallest_fitting(&other, 32, 0),
             Some(seed_price(CapacityType::Spot))
         );
+    }
+
+    #[test]
+    fn observe_instance_types_populates_menu_and_dedups() {
+        let mut t = CostTable::default();
+        let cell: Cell = ("mid-ebs-x86".into(), CapacityType::Spot);
+        t.observe_instance_types([
+            (cell.clone(), "m7i.8xlarge".into(), 32, 128 << 30),
+            (cell.clone(), "c7i.8xlarge".into(), 32, 64 << 30),
+            (cell.clone(), "c7i.8xlarge".into(), 32, 64 << 30),
+        ]);
+        let menu = t.menu(&cell);
+        assert_eq!(menu.len(), 2, "dedup by name");
+        // Sorted by (cores, mem) — c7i (64G) before m7i (128G).
+        assert_eq!(menu[0].name, "c7i.8xlarge");
+        assert_eq!(menu[1].name, "m7i.8xlarge");
+        assert!(menu[0].last_observed > SystemTime::UNIX_EPOCH);
+        // Dedup-hit refreshes last_observed (NOT skipped).
+        let before = menu[0].last_observed;
+        std::thread::sleep(Duration::from_millis(2));
+        t.observe_instance_types([(cell.clone(), "c7i.8xlarge".into(), 32, 64 << 30)]);
+        assert!(t.menu(&cell)[0].last_observed > before);
+    }
+
+    // r[verify sched.sla.cost-instance-type-feedback]
+    #[tokio::test]
+    async fn observed_types_persist_load_round_trip() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        let cell: Cell = ("mid-ebs-x86".into(), CapacityType::Spot);
+
+        let mut a = CostTable::seeded("us-east-1", HwCostSource::Spot);
+        a.observe_instance_types([
+            (cell.clone(), "c7i.8xlarge".into(), 32, 64 << 30),
+            (cell.clone(), "m7i.8xlarge".into(), 32, 128 << 30),
+        ]);
+        a.persist(&sdb).await.unwrap();
+
+        // Fresh load (Spot) → menu repopulated, sorted.
+        let a2 = CostTable::load(&sdb, "us-east-1", HwCostSource::Spot)
+            .await
+            .unwrap();
+        let menu = a2.menu(&cell);
+        assert_eq!(menu.len(), 2);
+        assert_eq!(menu[0].name, "c7i.8xlarge");
+        assert_eq!(menu[0].cores, 32);
+        assert_eq!(menu[1].mem_bytes, 128 << 30);
+
+        // Load under non-Spot ALSO sees the menu (source-independent).
+        let a3 = CostTable::load(&sdb, "us-east-1", HwCostSource::Static)
+            .await
+            .unwrap();
+        assert_eq!(a3.menu(&cell).len(), 2);
+
+        // Cluster-scoped: B sees nothing.
+        let b = CostTable::load(&sdb, "eu-west-2", HwCostSource::Spot)
+            .await
+            .unwrap();
+        assert!(b.menu(&cell).is_empty());
     }
 
     /// `poll_spot_once`: per-h median of `price/vCPU` over the returned

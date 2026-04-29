@@ -950,7 +950,7 @@ async fn contract_h_explore_stable_across_inputs_gen_churn() {
 #[tokio::test]
 async fn contract_h_explore_schmitt_carries_prev_a() {
     use crate::sla::config::CapacityType;
-    use crate::sla::cost::{CostTable, InstanceType, RatioEma};
+    use crate::sla::cost::{CostTable, RatioEma};
     use crate::sla::solve::{self, SolveFullResult};
 
     let db = TestDb::new(&MIGRATOR).await;
@@ -973,21 +973,23 @@ async fn contract_h_explore_schmitt_carries_prev_a() {
     actor.test_inject_ready("d-schmitt", Some("test-pkg"), "x86_64-linux", false);
     let fit = make_fit("test-pkg");
 
-    let it = |p: f64| InstanceType {
-        name: "t".into(),
-        cores: 256,
-        mem_bytes: 256 << 30,
-        price_per_vcpu_hr: p,
-    };
     // Per-poll cost table: λ_spot(h_exp)→0 via huge denominator so
     // e_od/e_spot == price_od/price_spot (no `1/(1-p)` retry-factor
     // skew on spot). h_main priced 0.001 so it dominates the
-    // unrestricted e_min by ~1000× → h_exp ∉ A. Menu price change
+    // unrestricted e_min by ~1000× → h_exp ∉ A. Per-cell price change
     // hashes into solve_relevant_hash → inputs_gen bumps each poll.
+    // Menu empty → `smallest_fitting` degrades to `price(cell)` (no
+    // capacity-reject in this fixture).
     let set_ratio = |a: &DagActor, od_over_spot: f64| {
         let mut ct = a.cost_table.write();
         *ct = CostTable::from_parts(
-            std::collections::HashMap::new(),
+            [
+                ((h_main.clone(), CapacityType::Spot), 0.001),
+                ((h_main.clone(), CapacityType::Od), 0.001),
+                ((h_exp.clone(), CapacityType::Spot), 1.0),
+                ((h_exp.clone(), CapacityType::Od), od_over_spot),
+            ]
+            .into(),
             [(
                 h_exp.clone(),
                 RatioEma {
@@ -998,10 +1000,6 @@ async fn contract_h_explore_schmitt_carries_prev_a() {
             )]
             .into(),
         );
-        ct.set_menu((h_main.clone(), CapacityType::Spot), vec![it(0.001)]);
-        ct.set_menu((h_main.clone(), CapacityType::Od), vec![it(0.001)]);
-        ct.set_menu((h_exp.clone(), CapacityType::Spot), vec![it(1.0)]);
-        ct.set_menu((h_exp.clone(), CapacityType::Od), vec![it(od_over_spot)]);
     };
     // Fixture-sanity (per solve.rs:2167-2173): compute e_od/e_spot
     // from solve_full's all_candidates so a mis-tuned fixture (e.g.
@@ -1160,12 +1158,6 @@ async fn contract_h_explore_schmitt_across_ice_mask() {
     actor.test_inject_ready("d-schmitt-ice", Some("test-pkg"), "x86_64-linux", false);
     let fit = make_fit("test-pkg");
 
-    let it = |p: f64| InstanceType {
-        name: "t".into(),
-        cores: 256,
-        mem_bytes: 256 << 30,
-        price_per_vcpu_hr: p,
-    };
     // `cores=0` → `smallest_fitting` returns None for any c≥1 → cell
     // rejected on capacity → restricted `solve_full([h_exp])` BestEffort.
     let it_nofit = || InstanceType {
@@ -1173,11 +1165,18 @@ async fn contract_h_explore_schmitt_across_ice_mask() {
         cores: 0,
         mem_bytes: 0,
         price_per_vcpu_hr: 1.0,
+        last_observed: std::time::SystemTime::UNIX_EPOCH,
     };
     let set_ratio = |a: &DagActor, od_over_spot: f64, exp_feasible: bool| {
         let mut ct = a.cost_table.write();
         *ct = CostTable::from_parts(
-            std::collections::HashMap::new(),
+            [
+                ((h_main.clone(), CapacityType::Spot), 0.001),
+                ((h_main.clone(), CapacityType::Od), 0.001),
+                ((h_exp.clone(), CapacityType::Spot), 1.0),
+                ((h_exp.clone(), CapacityType::Od), od_over_spot),
+            ]
+            .into(),
             [(
                 h_exp.clone(),
                 RatioEma {
@@ -1188,12 +1187,10 @@ async fn contract_h_explore_schmitt_across_ice_mask() {
             )]
             .into(),
         );
-        ct.set_menu((h_main.clone(), CapacityType::Spot), vec![it(0.001)]);
-        ct.set_menu((h_main.clone(), CapacityType::Od), vec![it(0.001)]);
-        if exp_feasible {
-            ct.set_menu((h_exp.clone(), CapacityType::Spot), vec![it(1.0)]);
-            ct.set_menu((h_exp.clone(), CapacityType::Od), vec![it(od_over_spot)]);
-        } else {
+        // exp_feasible=false: non-empty menu with no-fit type →
+        // `smallest_fitting → None` → capacity-reject (price ignored).
+        // exp_feasible=true: empty menu → `Some(price(cell))`.
+        if !exp_feasible {
             ct.set_menu((h_exp.clone(), CapacityType::Spot), vec![it_nofit()]);
             ct.set_menu((h_exp.clone(), CapacityType::Od), vec![it_nofit()]);
         }
@@ -1833,6 +1830,7 @@ async fn contract_interrupt_runaway_reachable() {
                     cores: 256,
                     mem_bytes: 1,
                     price_per_vcpu_hr: 0.05,
+                    last_observed: std::time::SystemTime::UNIX_EPOCH,
                 }],
             );
         }
@@ -2075,6 +2073,7 @@ async fn contract_hw_cost_unknown_once_per_epoch() {
         cores: 256,
         mem_bytes: 256 << 30,
         price_per_vcpu_hr: 0.05,
+        last_observed: std::time::SystemTime::UNIX_EPOCH,
     };
     // Non-empty menu but no fitting type: `make_fit("test-pkg")` mem is
     // Independent{p90: 6 GiB} → `smallest_fitting(.., c*, 6 GiB)` with
@@ -2084,6 +2083,7 @@ async fn contract_hw_cost_unknown_once_per_epoch() {
         cores: 2,
         mem_bytes: 1 << 30,
         price_per_vcpu_hr: 0.05,
+        last_observed: std::time::SystemTime::UNIX_EPOCH,
     };
     {
         let mut ct = actor.cost_table.write();
