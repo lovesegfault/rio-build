@@ -57,11 +57,14 @@ impl CapacityType {
         }
     }
 
-    /// Inverse of [`as_str`](Self::as_str).
+    /// Inverse of [`as_str`](Self::as_str). Also accepts the
+    /// scheduler's `cell_label()` form (`"on-demand"`) and the bare
+    /// Karpenter label form so [`Cell::parse`] round-trips
+    /// `ice_masked_cells` from `GetSpawnIntents`.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "spot" => Some(Self::Spot),
-            "od" => Some(Self::OnDemand),
+            "od" | "on-demand" => Some(Self::OnDemand),
             _ => None,
         }
     }
@@ -476,7 +479,11 @@ mod tests {
         for ct in [CapacityType::Spot, CapacityType::OnDemand] {
             assert_eq!(CapacityType::parse(ct.as_str()), Some(ct));
         }
-        assert_eq!(CapacityType::parse("on-demand"), None);
+        // Scheduler `cell_label()` form — `ice_masked_cells` round-trip.
+        assert_eq!(
+            CapacityType::parse("on-demand"),
+            Some(CapacityType::OnDemand)
+        );
         assert_eq!(CapacityType::parse(""), None);
     }
 
