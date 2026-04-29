@@ -233,6 +233,7 @@ async fn main() -> anyhow::Result<()> {
     // edge-reload owner); the spot poller reads it to skip one body on
     // the false→true edge so its first fold lands post-reload.
     let cost_was_leader = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cost_reload_notify = std::sync::Arc::new(tokio::sync::Notify::new());
     rio_common::task::spawn_monitored(
         "sla-interrupt-housekeeping",
         rio_scheduler::sla::cost::interrupt_housekeeping(
@@ -240,6 +241,7 @@ async fn main() -> anyhow::Result<()> {
             leader.clone(),
             std::sync::Arc::clone(&cost_table),
             std::sync::Arc::clone(&cost_was_leader),
+            std::sync::Arc::clone(&cost_reload_notify),
             shutdown.clone(),
         ),
     );
@@ -281,6 +283,8 @@ async fn main() -> anyhow::Result<()> {
             service_signer: service_signer.map(Arc::new),
             leader: leader.clone(),
             cost_table,
+            cost_was_leader,
+            cost_reload_notify,
             shutdown: shutdown.clone(),
         },
     );

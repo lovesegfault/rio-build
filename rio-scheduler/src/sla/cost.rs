@@ -996,9 +996,11 @@ pub async fn spot_price_poller(
         // parking_lot guards aren't Send → clone the menu out, await the
         // AWS call, then mutate under a brief sync lock. Field-disjoint
         // in steady-state: `fold_spot_poll` touches only `price`;
-        // `interrupt_housekeeping` writes only `lambda`/`node_count`.
-        // Edge-reload is owned by interrupt_housekeeping; this poller
-        // skips one body on the edge so the disjointness holds there too.
+        // `interrupt_housekeeping` writes only `lambda`/`node_count`;
+        // the actor's `handle_ack_spawned_intents` writes only `cells`.
+        // Edge-reload is owned by interrupt_housekeeping; both other
+        // writers gate on `was_leader` so the disjointness holds across
+        // the lease-acquire reload too.
         let cells = cost.read().cells.clone();
         let result = poll_spot_once(&ec2, &cells).await;
         let now = now_epoch();
@@ -1038,6 +1040,7 @@ pub async fn interrupt_housekeeping(
     leader: LeaderState,
     cost: std::sync::Arc<parking_lot::RwLock<CostTable>>,
     was_leader: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    notify: std::sync::Arc<tokio::sync::Notify>,
     shutdown: rio_common::signal::Token,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
@@ -1047,6 +1050,12 @@ pub async fn interrupt_housekeeping(
             biased;
             _ = shutdown.cancelled() => return,
             _ = tick.tick() => {},
+            // `handle_leader_acquired` nudges so the edge-reload (and
+            // the `was_leader` false→true store that gates the actor's
+            // `observe_instance_types` write) happens promptly after
+            // lease win, not at the next 600s tick. `notified()` is
+            // permit-based — a notify before this await is not lost.
+            _ = notify.notified() => {},
         }
         if !poller_tick_prelude(&was_leader, leader.is_leader(), &cost, &db).await {
             continue;

@@ -510,6 +510,47 @@ async fn ack_bound_intents_populates_authoritative_node() {
     assert_eq!(actor.authoritative_node.len(), 2);
 }
 
+/// `observe_instance_types` is gated on the shared `cost_was_leader`
+/// latch (the `interrupt_housekeeping` edge-reload owner). Before the
+/// reload, writes to `cost_table` would be clobbered by `*cost.write()
+/// = CostTable::load(...)` — and the controller's `observe_registered`
+/// is edge-detected, so a clobbered observation isn't re-sent.
+// r[verify sched.sla.cost-instance-type-feedback]
+#[tokio::test]
+async fn ack_observed_instance_types_gated_on_cost_was_leader() {
+    use rio_proto::types::ObservedInstanceType;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    let spot: crate::sla::config::Cell =
+        ("mid-ebs-x86".into(), crate::sla::config::CapacityType::Spot);
+
+    let observed = [ObservedInstanceType {
+        cell: "mid-ebs-x86:spot".into(),
+        instance_type: "c7i.8xlarge".into(),
+        cores: 32,
+        mem_bytes: 64 << 30,
+    }];
+
+    // Pre-reload (was_leader=false): write is dropped.
+    actor
+        .cost_was_leader
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    actor.handle_ack_spawned_intents(&[], &[], &[], &observed, &[]);
+    assert!(
+        actor.cost_table.read().menu(&spot).is_empty(),
+        "observation must NOT land on pre-reload table"
+    );
+
+    // Post-reload (was_leader=true via interrupt_housekeeping's
+    // poller_tick_prelude Ok-arm): write applies.
+    actor
+        .cost_was_leader
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    actor.handle_ack_spawned_intents(&[], &[], &[], &observed, &[]);
+    assert_eq!(actor.cost_table.read().menu(&spot).len(), 1);
+}
+
 /// **Ack records the FULL A'** (`r[sched.sla.hw-class.ice-mask]`): a
 /// `SpawnIntent` whose `node_affinity` is an OR over `|A'|>1` cells must
 /// arm `dispatched_cells` with the FULL parallel `(hw_class_names,

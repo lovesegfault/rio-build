@@ -307,6 +307,14 @@ pub struct DagActor {
     /// `solve_full` always has a comparable scalar even before the
     /// first poll.
     pub(crate) cost_table: Arc<parking_lot::RwLock<crate::sla::cost::CostTable>>,
+    /// Shared edge-reload latch — see [`DagActorPlumbing::cost_was_leader`].
+    /// `handle_ack_spawned_intents` gates its `cost_table.write()` on
+    /// this so observations don't land on the pre-reload table and get
+    /// clobbered by `interrupt_housekeeping`'s `*cost = load()`.
+    pub(crate) cost_was_leader: Arc<AtomicBool>,
+    /// `interrupt_housekeeping` wake-up — see
+    /// [`DagActorPlumbing::cost_reload_notify`].
+    cost_reload_notify: Arc<tokio::sync::Notify>,
     /// In-process insufficient-capacity mask. `handle_ack_spawned_intents`
     /// marks cells the controller reported `unfulfillable`; the
     /// per-dispatch read-time mask (`A \ masked`) is applied in
@@ -559,6 +567,8 @@ impl DagActor {
             sla_ceilings: cfg.sla.ceilings(),
             sla_config: cfg.sla,
             cost_table: plumbing.cost_table,
+            cost_was_leader: plumbing.cost_was_leader,
+            cost_reload_notify: plumbing.cost_reload_notify,
             ice: Arc::new(crate::sla::cost::IceBackoff::new(max_lead_time)),
             dispatched_cells: dashmap::DashMap::new(),
             solve_cache: Arc::default(),

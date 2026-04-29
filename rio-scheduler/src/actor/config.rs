@@ -99,6 +99,21 @@ pub struct DagActorPlumbing {
     /// `spot_price_poller`; the actor reads a snapshot per
     /// `solve_intent_for`. Default → seed prices.
     pub cost_table: Arc<parking_lot::RwLock<crate::sla::cost::CostTable>>,
+    /// Shared edge-reload latch. Written ONLY by
+    /// [`interrupt_housekeeping`](crate::sla::cost::interrupt_housekeeping)
+    /// (the single edge-reload owner); read by `spot_price_poller` AND
+    /// the actor's `handle_ack_spawned_intents` so neither writes the
+    /// pre-reload `cost_table` and gets clobbered by `*cost.write() =
+    /// CostTable::load(...)`.
+    pub cost_was_leader: Arc<std::sync::atomic::AtomicBool>,
+    /// Nudge `interrupt_housekeeping` to run its edge-reload promptly
+    /// instead of waiting up to `POLL_INTERVAL_SECS` (600s). The
+    /// actor's `handle_leader_acquired` calls `notify_one()` so the
+    /// `cost_was_leader` false→true edge happens within ~0s of lease
+    /// win, not ~600s — shrinking the window where `cost_was_leader`-
+    /// gated writers (this actor's `observe_instance_types`) drop
+    /// observations.
+    pub cost_reload_notify: Arc<tokio::sync::Notify>,
     /// Shutdown token. The run loop `select!`s on `cancelled()` with
     /// `biased` ordering so SIGTERM drains workers immediately.
     pub shutdown: rio_common::signal::Token,
@@ -125,6 +140,8 @@ impl Default for DagActorPlumbing {
             service_signer: None,
             leader: LeaderState::default(),
             cost_table: Arc::default(),
+            cost_was_leader: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            cost_reload_notify: Arc::default(),
             shutdown: rio_common::signal::Token::new(),
             #[cfg(test)]
             recovery_toctou_gate: None,

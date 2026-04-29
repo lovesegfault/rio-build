@@ -737,7 +737,22 @@ impl DagActor {
                 self.ice.mark(&cell);
             }
         }
-        if !observed_instance_types.is_empty() {
+        // Third writer to `cost_table` (after `fold_spot_poll`→price
+        // and `interrupt_housekeeping`→λ/node_count). Gate on the
+        // shared edge-reload latch like `spot_price_poller` does:
+        // before `interrupt_housekeeping` has run the lease-acquire
+        // `*cost.write() = CostTable::load(...)`, writes here would
+        // land on the pre-reload table and be clobbered. The
+        // controller's `observe_registered` is edge-detected +
+        // recency-gated, so a clobbered observation isn't re-sent
+        // until another NodeClaim of that type registers.
+        // `handle_leader_acquired` notifies `interrupt_housekeeping`
+        // so this gate is open within ~0s of lease win, not ≤600s.
+        if !observed_instance_types.is_empty()
+            && self
+                .cost_was_leader
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
             self.cost_table.write().observe_instance_types(
                 observed_instance_types.iter().filter_map(|o| {
                     Some((

@@ -722,6 +722,17 @@ impl DagActor {
     }
 
     pub(super) async fn handle_leader_acquired(&mut self) {
+        // Nudge `interrupt_housekeeping` so its lease-acquire
+        // edge-reload of `cost_table` (and the `cost_was_leader`
+        // false→true store) runs promptly. Without this, the gate on
+        // `handle_ack_spawned_intents`' `observe_instance_types` write
+        // stays closed for up to 600s (the housekeeping tick) and the
+        // controller's edge-detected instance-type observations during
+        // that window are dropped. `Notify::notified()` is
+        // permit-based, so this fire-and-forget won't be lost if
+        // housekeeping isn't yet at its select.
+        self.cost_reload_notify.notify_one();
+
         // Snapshot generation BEFORE recovery. If the lease flaps
         // (lose→reacquire) while recover_from_pg() is running, the
         // lease loop will fetch_add again AND will have cleared
