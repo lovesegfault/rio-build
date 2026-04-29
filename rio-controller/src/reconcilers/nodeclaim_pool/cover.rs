@@ -39,6 +39,13 @@ pub const SHIM_NODEPOOL: &str = "rio-nodeclaim-shim";
 const NODE_CLASS_GROUP: &str = "karpenter.k8s.aws";
 const NODE_CLASS_KIND: &str = "EC2NodeClass";
 
+/// NodeClaim annotation carrying the per-cell `min(eta_seconds)` over
+/// the deficit intents that triggered the claim — the soonest demand
+/// the claim must meet. [`super::sketch::CellSketches::observe_registered`]
+/// reads this on `Registered=True` so `z = boot − eta` is the real
+/// z-correction, not `boot − 0`.
+pub const FORECAST_ETA_ANNOTATION: &str = "rio.build/forecast-eta-secs";
+
 /// `karpenter.k8s.aws/instance-size` requirement key — the
 /// metal-partition `NotIn` side. Same list as the shim NodePool's
 /// template requirement (`karpenter.metalSizes`); appended here so a
@@ -132,25 +139,29 @@ pub fn cells_round_robin(mut cells: Vec<Cell>, tick: u64) -> Vec<Cell> {
     cells
 }
 
-/// Per-cell `(Σcores, Σmem, max disk_bytes, max headroom)` over `u`.
-/// `max` for disk: each pod gets its own ephemeral-storage allocation,
-/// so the claim only needs to fit the largest single intent; cores/mem
-/// stack. `max` for headroom: the claim's disk floor must cover the
-/// widest cushion any assigned intent will request. Returns the RAW
-/// `disk_bytes` max — the caller maps it through
+/// Per-cell `(Σcores, Σmem, max disk_bytes, max headroom, min
+/// eta_seconds)` over `u`. `max` for disk: each pod gets its own
+/// ephemeral-storage allocation, so the claim only needs to fit the
+/// largest single intent; cores/mem stack. `max` for headroom: the
+/// claim's disk floor must cover the widest cushion any assigned intent
+/// will request. `min` for eta: the binding constraint is the soonest
+/// demand the claim must meet (stamped as [`FORECAST_ETA_ANNOTATION`]).
+/// Returns the RAW `disk_bytes` max — the caller maps it through
 /// [`crate::reconcilers::pool::jobs::pod_ephemeral_request`] before
 /// stamping the NodeClaim, so the claim's floor matches what the pod
 /// will actually request (`headroom×` + fuse-cache + log).
-pub fn sum_deficit(u: &[&SpawnIntent]) -> (u32, u64, u64, f64) {
+pub fn sum_deficit(u: &[&SpawnIntent]) -> (u32, u64, u64, f64, f64) {
     use crate::reconcilers::pool::jobs::intent_headroom;
-    u.iter().fold((0, 0, 0, 0.0), |(c, m, d, h), i| {
-        (
-            c + i.cores,
-            m + i.mem_bytes,
-            d.max(i.disk_bytes),
-            h.max(intent_headroom(i)),
-        )
-    })
+    u.iter()
+        .fold((0, 0, 0, 0.0, f64::MAX), |(c, m, d, h, e), i| {
+            (
+                c + i.cores,
+                m + i.mem_bytes,
+                d.max(i.disk_bytes),
+                h.max(intent_headroom(i)),
+                e.min(i.eta_seconds),
+            )
+        })
 }
 
 /// `N = min(⌈Σc / chunk⌉, per_tick_cap, ⌊budget / chunk⌋)` claims to
@@ -198,6 +209,7 @@ pub fn claim_count(sum_c: u32, max_node_cores: u32, per_tick_cap: u32, budget: u
 pub fn build_nodeclaim(
     cell: &Cell,
     req: (u32, u64, u64),
+    forecast_eta_secs: f64,
     hw_labels: &[(String, String)],
     hw_requirements: &[NodeSelectorRequirement],
     metal_sizes: &[String],
@@ -247,10 +259,22 @@ pub fn build_nodeclaim(
         ("ephemeral-storage".into(), Quantity(req.2.to_string())),
     ]
     .into();
+    // Stamp the forecast eta when finite and >0 (Ready intents have
+    // eta=0; an all-Ready cell needs no z-correction). `f64::MAX`
+    // (empty deficit fold identity) is also skipped.
+    let annotations = (forecast_eta_secs > 0.0 && forecast_eta_secs.is_finite()).then(|| {
+        [(
+            FORECAST_ETA_ANNOTATION.into(),
+            forecast_eta_secs.to_string(),
+        )]
+        .into_iter()
+        .collect()
+    });
     NodeClaim {
         metadata: ObjectMeta {
             generate_name: Some(format!("rio-nc-{}-{}-", cell.0, cell.1.as_str())),
             labels: Some(labels),
+            annotations,
             ..Default::default()
         },
         spec: NodeClaimSpec {
@@ -326,15 +350,20 @@ mod tests {
     }
 
     #[test]
-    fn sum_deficit_sums_cores_mem_max_disk() {
+    fn sum_deficit_sums_cores_mem_max_disk_min_eta() {
         let mut a = intent("a", 4, 8 * GI, &[]);
         a.disk_headroom_factor = Some(1.8);
+        a.eta_seconds = 30.0;
         let mut b = intent("b", 8, 16 * GI, &[]);
         b.disk_bytes = 50 * GI;
         b.disk_headroom_factor = Some(1.3);
+        b.eta_seconds = 10.0;
         let s = sum_deficit(&[&a, &b]);
-        assert_eq!(s, (12, 24 * GI, 50 * GI, 1.8));
-        assert_eq!(sum_deficit(&[]), (0, 0, 0, 0.0));
+        assert_eq!(s, (12, 24 * GI, 50 * GI, 1.8, 10.0));
+        // Empty → (0,0,0,0.0,MAX) — caller's `> 0.0 && is_finite` gate skips.
+        let (c, m, d, h, e) = sum_deficit(&[]);
+        assert_eq!((c, m, d, h), (0, 0, 0, 0.0));
+        assert_eq!(e, f64::MAX);
         // Absent factor → 1.5 fallback contributes to the max.
         let c = intent("c", 1, GI, &[]);
         assert_eq!(sum_deficit(&[&c, &b]).3, 1.5);
@@ -543,6 +572,7 @@ mod tests {
         let nc = build_nodeclaim(
             &cell,
             (8, 32 * GI, 100 * GI),
+            25.0,
             &hw_labels,
             &hw_reqs,
             &metal,
@@ -550,6 +580,11 @@ mod tests {
         );
 
         let meta = &nc.metadata;
+        // F7: forecast eta stamped as annotation.
+        assert_eq!(
+            meta.annotations.as_ref().unwrap()[FORECAST_ETA_ANNOTATION],
+            "25"
+        );
         assert_eq!(
             meta.generate_name.as_deref(),
             Some("rio-nc-mid-ebs-x86-spot-")
@@ -616,7 +651,9 @@ mod tests {
     #[test]
     fn build_nodeclaim_on_demand_label_form() {
         let cell = Cell("h".into(), CapacityType::OnDemand);
-        let nc = build_nodeclaim(&cell, (4, 8 * GI, 50 * GI), &[], &[], &[], "x");
+        let nc = build_nodeclaim(&cell, (4, 8 * GI, 50 * GI), 0.0, &[], &[], &[], "x");
+        // eta=0 (all-Ready cell) → no annotation.
+        assert!(nc.metadata.annotations.is_none());
         // Karpenter label form is "on-demand", NOT the PG/helm "od".
         assert_eq!(
             nc.metadata.labels.as_ref().unwrap()[CAPACITY_TYPE_LABEL],

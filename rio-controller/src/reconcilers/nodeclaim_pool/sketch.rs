@@ -162,9 +162,10 @@ impl CellState {
     }
 
     /// Record one observed `boot` (Registered.transition − created)
-    /// with forecast `eta_error` (predicted − actual ETA; 0 until B12
-    /// threads per-intent ETA through to the NodeClaim).
-    /// `z = boot − eta_error` per `r[ctrl.nodeclaim.lead-time-ddsketch]`.
+    /// with the forecast `eta_error` the claim was provisioned for
+    /// (`FORECAST_ETA_ANNOTATION`, per-cell `min(eta_seconds)` at
+    /// create time). `z = boot − eta_error` per
+    /// `r[ctrl.nodeclaim.lead-time-ddsketch]`.
     pub fn record(&mut self, boot: f64, eta_error: f64) {
         self.z_active.add(boot - eta_error);
         self.boot_active.add(boot);
@@ -295,9 +296,15 @@ impl CellSketches {
             let (Some(cell), Some(boot)) = (n.cell.as_ref(), n.boot_secs()) else {
                 continue;
             };
-            // TODO(B12): thread per-intent eta through to the NodeClaim
-            // (annotation) so eta_error is real; until then `z = boot`.
-            self.cell_mut(cell).record(boot, 0.0);
+            // `z = boot − eta` per `r[ctrl.nodeclaim.lead-time-ddsketch]`.
+            // `eta` is the per-cell `min(eta_seconds)` `cover_deficit`
+            // stamped at create time; absent (Ready-only cell, or
+            // pre-F7 claim) → 0 → `z = boot`.
+            let eta = n
+                .annotation(super::cover::FORECAST_ETA_ANNOTATION)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            self.cell_mut(cell).record(boot, eta);
             recorded.insert(n.name.clone());
             registered_cells.push(cell.clone());
         }
@@ -681,6 +688,49 @@ mod tests {
         assert_eq!(sk.get(&cell).unwrap().boot_active.count(), 2, "no new edge");
         assert!(!recorded.contains("a"), "pruned");
         assert_eq!(recorded.len(), 1);
+    }
+
+    /// F7: NodeClaim annotated `rio.build/forecast-eta-secs=30` with
+    /// boot=45 → `z = boot − eta = 15` recorded (not 45). Annotation
+    /// absent/unparseable → eta=0 (z = boot).
+    #[test]
+    fn observe_registered_reads_forecast_eta_annotation() {
+        use super::super::cover::FORECAST_ETA_ANNOTATION;
+        use super::super::ffd::tests::{node, with_conds};
+        let mut sk = CellSketches::default();
+        let mut recorded = HashSet::new();
+        let cell = Cell("h".into(), CapacityType::Spot);
+
+        let mut a = with_conds(
+            node("a", "h", CapacityType::Spot, 8, 0, 0),
+            &[("Registered", "True", 1045.0)],
+        );
+        a.annotations
+            .insert(FORECAST_ETA_ANNOTATION.into(), "30".into());
+        // boot = 1045 − 1000 = 45; eta = 30; z = 15.
+        sk.observe_registered(&[a], &mut recorded);
+        let s = sk.get(&cell).unwrap();
+        let z = s.z_active.quantile(0.5).unwrap().unwrap();
+        assert!((z - 15.0).abs() < 1.0, "z = boot − eta = 15, got {z}");
+        let b = s.boot_active.quantile(0.5).unwrap().unwrap();
+        assert!((b - 45.0).abs() < 1.0, "raw boot = 45, got {b}");
+
+        // No annotation → eta=0 → z=boot.
+        let mut sk2 = CellSketches::default();
+        let mut rec2 = HashSet::new();
+        let n = with_conds(
+            node("n", "h", CapacityType::Spot, 8, 0, 0),
+            &[("Registered", "True", 1045.0)],
+        );
+        sk2.observe_registered(&[n], &mut rec2);
+        let z2 = sk2
+            .get(&cell)
+            .unwrap()
+            .z_active
+            .quantile(0.5)
+            .unwrap()
+            .unwrap();
+        assert!((z2 - 45.0).abs() < 1.0, "no annotation → z=boot, got {z2}");
     }
 
     /// PG round-trip: persist two cells, load, compare quantiles +

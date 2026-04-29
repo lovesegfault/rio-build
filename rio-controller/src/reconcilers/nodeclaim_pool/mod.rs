@@ -741,7 +741,7 @@ impl NodeClaimPoolReconciler {
             let Some(u) = by_cell.get(cell) else {
                 continue;
             };
-            let (sum_c, sum_m, max_d, max_h) = cover::sum_deficit(u);
+            let (sum_c, sum_m, max_d, max_h, min_eta) = cover::sum_deficit(u);
             let budget = self
                 .cfg
                 .max_fleet_cores
@@ -777,6 +777,7 @@ impl NodeClaimPoolReconciler {
                 let nc = cover::build_nodeclaim(
                     cell,
                     (chunk, mem_per, disk_per),
+                    min_eta,
                     &hw_labels,
                     &hw_reqs,
                     &self.cfg.metal_sizes,
