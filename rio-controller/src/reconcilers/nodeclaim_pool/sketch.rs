@@ -158,18 +158,31 @@ impl CellState {
     }
 
     /// ICE/boot-failure timeout for this cell. Below
-    /// `ICE_REAL_THRESHOLD` real samples, `2×seed` (the seed is the
-    /// operator's `xtask k8s probe-boot` measurement; doubling it is the
-    /// conservative wait). At ≥100 samples, `q_0.99(boot)` — the
-    /// observed tail. Floored at `2×seed` either way so a lucky
-    /// fast-boot streak can't shrink the timeout below the operator's
-    /// floor.
+    /// `ICE_REAL_THRESHOLD` total samples (active+shadow), `2×seed`
+    /// (the seed is the operator's `xtask k8s probe-boot` measurement;
+    /// doubling it is the conservative wait). At ≥100 samples,
+    /// `q_0.99(boot)` — the observed tail. Floored at `2×seed` either
+    /// way so a lucky fast-boot streak can't shrink the timeout below
+    /// the operator's floor.
+    ///
+    /// Shadow fallback as for [`lead_time`](Self::lead_time):
+    /// post-rotation, `boot_active` is empty (or sparse) and shadow
+    /// holds the learned tail. The active read is gated on its OWN
+    /// count — `quantile_or` returns Some on any non-empty sketch, so a
+    /// post-rotation `active.count()=5` would otherwise win with
+    /// max-of-5 noise instead of shadow's 200-sample q99.
     pub fn ice_timeout(&self, seed: f64) -> f64 {
         let floor = 2.0 * seed;
-        if self.boot_active.count() < ICE_REAL_THRESHOLD {
+        if self.boot_active.count() + self.boot_shadow.count() < ICE_REAL_THRESHOLD {
             return floor;
         }
-        quantile_or(&self.boot_active, 0.99).map_or(floor, |q| q.max(floor))
+        let q = if self.boot_active.count() >= ICE_REAL_THRESHOLD {
+            quantile_or(&self.boot_active, 0.99)
+        } else {
+            None
+        }
+        .or_else(|| quantile_or(&self.boot_shadow, 0.99));
+        q.map_or(floor, |q| q.max(floor))
     }
 
     /// Record one observed `boot` (Registered.transition − created)
@@ -703,6 +716,49 @@ mod tests {
         // Seed=10 → floor=20 < q_0.99≈40 → returns ≈40.
         let t = s.ice_timeout(10.0);
         assert!((38.0..=42.0).contains(&t), "q_0.99 path t={t}");
+    }
+
+    /// `ice_timeout` shadow fallback: post-rotation, the learned q99
+    /// (now in `boot_shadow`) must still be used. Without the fallback,
+    /// `boot_active.count()=0<100` collapses to `2×seed` and a NodeClaim
+    /// at age=45s (within the learned 60s tail) is falsely reaped.
+    /// A2-amend: with a few low post-rotation samples in `active`, the
+    /// active read must NOT win — `quantile_or` returns Some on any
+    /// non-empty sketch, so `active.count()<100` must skip it entirely.
+    #[test]
+    fn ice_timeout_shadow_fallback_post_rotate() {
+        let mut s = CellState::default();
+        // Spread 200 samples so q99 is well above the seed floor.
+        for k in 0..200u32 {
+            s.record(20.0 + f64::from(k % 50), 0.0);
+        }
+        let learned = s.ice_timeout(10.0);
+        assert!(learned >= 60.0, "pre-rotate learned q99 = {learned}");
+
+        let t0 = SystemTime::UNIX_EPOCH;
+        s.epoch = t0;
+        s.maybe_rotate(
+            t0 + Duration::from_secs(7 * 3600),
+            Duration::from_secs(6 * 3600),
+        );
+        assert_eq!(s.boot_active.count(), 0);
+        assert_eq!(s.boot_shadow.count(), 200);
+
+        // Immediately post-rotation, active is empty: shadow's q99 must
+        // be used (NOT 2×seed=20).
+        let t = s.ice_timeout(10.0);
+        assert!(t >= 60.0, "post-rotate empty-active t={t} (was 2×seed)");
+
+        // A few low post-rotation samples in active (count<100): the
+        // active read must NOT win — gate on active.count()≥THRESHOLD.
+        for _ in 0..5 {
+            s.record(15.0, 0.0);
+        }
+        let t = s.ice_timeout(10.0);
+        assert!(
+            t >= 60.0,
+            "post-rotate sparse-active t={t} (was max-of-5 noise, not shadow q99)"
+        );
     }
 
     /// Edge detection: each `Registered=True` LiveNode records once;
