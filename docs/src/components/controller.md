@@ -32,7 +32,7 @@ spec:
   seccompProfile:                              # SeccompProfileKind?, optional — CEL-forbidden for Fetcher
     type: Localhost                            #   RuntimeDefault | Localhost | Unconfined
     localhostProfile: operator/rio-builder.json#   required iff type=Localhost (r[ctrl.crd.seccomp-cel])
-  fuseCacheBytes: 53687091200                  # u64?, optional — emptyDir sizeLimit + ephemeral-storage; per-kind default 8Gi/4Gi
+  fuseCacheBytes: 53687091200                  # u64?, optional — Fetcher-only (REJECTED for Builder; Builder reads `[nodeclaim_pool].fuse_cache_bytes`). emptyDir sizeLimit + ephemeral-storage; default 4Gi
   # NOT CRD fields: resources (per-pod cpu/mem/disk come from the
   # scheduler's per-drv SpawnIntent — ADR-023); securityContext (caps
   # hardcoded in build_executor_pod_spec()); topologySpread (one-shot
@@ -572,7 +572,7 @@ The controller MUST reject `Pool` specs with `hostNetwork: true` and `privileged
 r[ctrl.event.spec-degrade]
 The Pool reconciler MUST emit a `Warning`-type Kubernetes Event for every spec field the builder silently degrades. CEL validation rejects NEW specs with invalid combinations; existing specs applied before the CEL rule landed are defensively corrected at pod-template time (e.g., `hostUsers` suppressed for `hostNetwork: true`). Without a Warning event, the operator has no signal that their spec is stale — `kubectl get pool -o yaml` shows the original value; the pod template shows the corrected value. The Warning names the field, the spec value, and the remediation.
 
-The FUSE cache emptyDir `sizeLimit` is `PoolSpec.fuseCacheBytes` (default `BUILDER_FUSE_CACHE_BYTES` = 8Gi / `FETCHER_FUSE_CACHE_BYTES` = 4Gi; helm `poolDefaults.fuseCacheBytes` overrides to 50Gi in prod). The same value is added to the container's `ephemeral-storage` request/limit so the two cannot drift. Pods are one-shot so the cache never outlives one build's input closure.
+The FUSE cache emptyDir `sizeLimit` for **Builder** pools is single-sourced from `[nodeclaim_pool].fuse_cache_bytes` (controller.toml; helm `poolDefaults.fuseCacheBytes`, 50Gi in prod) so FFD/cover/stamp agree — `PoolSpec.fuseCacheBytes` is rejected for Builder kind. **Fetcher** pools may set `PoolSpec.fuseCacheBytes` (default `FETCHER_FUSE_CACHE_BYTES` = 4Gi). The same value is added to the container's `ephemeral-storage` request/limit so the two cannot drift. Pods are one-shot so the cache never outlives one build's input closure.
 
 ## Pool Finalizer
 
