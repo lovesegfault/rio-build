@@ -147,6 +147,10 @@ metadata:
   labels:
     {{- include "rio.labels" (dict "root" . "name" "kube-build-scheduler" "component" "scheduler") | nindent 4 }}
 spec:
+  # Without jobLabel, prometheus-operator defaults `job` to the Service
+  # name (`kube-build-scheduler-metrics`), which the alert expr's
+  # `job="kube-build-scheduler"` selector wouldn't match.
+  jobLabel: app.kubernetes.io/name
   selector:
     matchLabels:
       {{- include "rio.selectorLabels" "kube-build-scheduler" | nindent 6 }}
