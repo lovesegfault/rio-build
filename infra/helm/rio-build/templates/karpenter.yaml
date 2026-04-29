@@ -201,6 +201,12 @@ spec:
         - key: kubernetes.io/os
           operator: In
           values: [linux]
+        # I-205 partition (matches every other rio-default pool). Academic
+        # since `limits.cpu: 0` means this pool never provisions, but
+        # keeps the partition invariant universal across all uefi pools.
+        - key: karpenter.k8s.aws/instance-size
+          operator: NotIn
+          values: {{ toJson $k.metalSizes }}
       expireAfter: Never
   limits:
     cpu: "0"
