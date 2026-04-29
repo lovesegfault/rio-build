@@ -291,6 +291,7 @@ const SERVICE_GATED: &[&str] = &[
     "ListSlaOverrides",
     "SlaStatus",
     "SlaExplain",
+    "GetSlaDefaults",
     "ExportSlaCorpus",
     "HwClassSampled",
     "GetHwClassConfig",
@@ -463,6 +464,7 @@ async fn read_path_rpcs_require_service_token() {
         "SlaExplain",
         svc.sla_explain(Request::new(SlaExplainRequest::default()))
     );
+    assert_gated!("GetSlaDefaults", svc.get_sla_defaults(Request::new(())));
     assert_gated!(
         "ExportSlaCorpus",
         svc.export_sla_corpus(Request::new(ExportSlaCorpusRequest::default()))

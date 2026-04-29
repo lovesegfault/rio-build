@@ -36,6 +36,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "ListSlaOverridesResponse",
         "SlaCandidateRow",
         "SlaExplainResponse",
+        "SlaDefaultsResponse",
+        "SlaTier",
+        "SlaProbeShape",
     ] {
         b = b.type_attribute(format!("rio.types.{ty}"), "#[derive(serde::Serialize)]");
     }

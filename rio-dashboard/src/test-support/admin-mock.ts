@@ -79,6 +79,7 @@ export const adminMock = {
   resetSlaModel: vi.fn(),
   slaStatus: vi.fn(),
   slaExplain: vi.fn(),
+  getSlaDefaults: vi.fn(),
   exportSlaCorpus: vi.fn(),
   importSlaCorpus: vi.fn(),
   appendInterruptSample: vi.fn(),

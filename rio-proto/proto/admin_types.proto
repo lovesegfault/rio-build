@@ -834,6 +834,39 @@ message SlaExplainResponse {
   repeated SlaCandidateRow candidates = 4;
 }
 
+// One configured tier from `[sla].tiers`. Unset bound = no constraint at
+// that quantile.
+message SlaTier {
+  string name = 1;
+  optional double p50_secs = 2;
+  optional double p90_secs = 3;
+  optional double p99_secs = 4;
+}
+
+// `[sla].probe` cold-start shape.
+message SlaProbeShape {
+  double cores = 1;
+  uint64 mem_per_core_bytes = 2;
+  uint64 mem_base_bytes = 3;
+  uint32 deadline_secs = 4;
+}
+
+// Active `[sla]` config — feeds `rio-cli sla defaults`. Static config;
+// no per-key state. `hw_classes` is names-only (the full label/
+// requirement schema is on `GetHwClassConfig`).
+message SlaDefaultsResponse {
+  // Tightest-first (same order `solve_tier` walks).
+  repeated SlaTier tiers = 1;
+  string default_tier = 2;
+  SlaProbeShape probe = 3;
+  uint32 max_cores = 4;
+  uint64 max_mem_bytes = 5;
+  uint64 max_disk_bytes = 6;
+  // Configured hw-class names (keys of `[sla].hw_classes`).
+  repeated string hw_classes = 7;
+  string reference_hw_class = 8;
+}
+
 message ExportSlaCorpusRequest {
   // Restrict to one tenant's fits. Unset = all tenants.
   optional string tenant = 1;

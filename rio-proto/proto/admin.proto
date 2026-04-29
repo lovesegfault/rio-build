@@ -154,6 +154,12 @@ service AdminService {
   // feasible at c*=6". Same ~60s tick staleness as SlaStatus.
   rpc SlaExplain(rio.types.SlaExplainRequest) returns (rio.types.SlaExplainResponse);
 
+  // Dump the active `[sla]` config (tier ladder, probe shape, ceilings,
+  // hw-class names). Static config — no actor round-trip. Feeds
+  // `rio-cli sla defaults` so the operator can see what tier names /
+  // probe shapes are in effect without reading scheduler.toml off the pod.
+  rpc GetSlaDefaults(google.protobuf.Empty) returns (rio.types.SlaDefaultsResponse);
+
   // Dump every cached fit with n_eff ≥ min_n as a portable JSON corpus
   // (one (s,p,q,p_bar,a,b,n) tuple per (pname,system)). `rio-cli sla
   // export-corpus` writes this to a file; `import-corpus` on a fresh

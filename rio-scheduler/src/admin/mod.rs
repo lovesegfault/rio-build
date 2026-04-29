@@ -38,8 +38,8 @@ use rio_proto::types::{
     ListExecutorsResponse, ListPoisonedResponse, ListSlaOverridesRequest, ListSlaOverridesResponse,
     ListTenantsResponse, MintExecutorTokensRequest, MintExecutorTokensResponse, PoisonedDerivation,
     ReportExecutorTerminationRequest, ReportExecutorTerminationResponse, ResetSlaModelRequest,
-    SetSlaOverrideRequest, SlaExplainRequest, SlaExplainResponse, SlaOverride, SlaStatusRequest,
-    SlaStatusResponse, TerminationReason,
+    SetSlaOverrideRequest, SlaDefaultsResponse, SlaExplainRequest, SlaExplainResponse, SlaOverride,
+    SlaStatusRequest, SlaStatusResponse, TerminationReason,
 };
 use uuid::Uuid;
 
@@ -1014,6 +1014,18 @@ impl AdminService for AdminServiceImpl {
         })
         .await?;
         Ok(Response::new(sla::explain_to_proto(&result)))
+    }
+
+    #[instrument(skip(self, request), fields(rpc = "GetSlaDefaults"))]
+    async fn get_sla_defaults(
+        &self,
+        request: Request<()>,
+    ) -> Result<Response<SlaDefaultsResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        // r[impl sched.sla.threat.read-path-auth]
+        self.ensure_service_caller(request.metadata(), &["rio-cli"])?;
+        self.ensure_leader()?;
+        Ok(Response::new(sla::defaults_from_config(&self.sla_config)))
     }
 
     #[instrument(skip(self, request), fields(rpc = "ExportSlaCorpus"))]

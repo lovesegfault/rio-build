@@ -237,6 +237,32 @@ async fn gc_drains_stream_to_completion() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sla_defaults_prints_tier_ladder() -> anyhow::Result<()> {
+    let (_admin, addr, _handle) = spawn_mock_admin().await?;
+
+    // MockAdmin returns SlaDefaultsResponse::default() — empty tiers,
+    // empty hw_classes. The CLI must still exit 0 and print the section
+    // labels (no bail). The real-scheduler shape (tier names in the
+    // table) is asserted in cli.nix.
+    let (status, stdout, stderr) = run_cli(&addr, &["sla", "defaults"]);
+    assert!(status.success(), "sla defaults: {stderr}");
+    for label in ["Tiers:", "Ceilings:", "HwClasses:"] {
+        assert!(
+            stdout.contains(label),
+            "sla defaults missing {label}:\n{stdout}"
+        );
+    }
+
+    // --json round-trips the proto shape.
+    let (status, stdout, stderr) = run_cli(&addr, &["sla", "defaults", "--json"]);
+    assert!(status.success(), "sla defaults --json: {stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout)?;
+    assert!(v.get("tiers").is_some_and(|t| t.is_array()));
+    assert!(v.get("default_tier").is_some());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn connect_failure_errors_cleanly() -> anyhow::Result<()> {
     // Port 1 is never listened on — connect_channel should fail fast
     // (rio-proto has a 10s CONNECT_TIMEOUT, and TCP to :1 is refused

@@ -1,10 +1,7 @@
 //! `rio-cli sla` — ADR-023 operator overrides + model status.
 //!
-//! `override`/`reset`/`status`/`explain`/`export-corpus`/`import-corpus`
-//! call the phase-6/7/11 AdminService RPCs. `defaults` is local-only
-//! (prints the configured tier ladder via `SlaStatus` on an empty key —
-//! server returns `has_fit=false` but the CLI doesn't yet surface
-//! config; phase-7 wires `SlaConfig` proto).
+//! `override`/`reset`/`status`/`explain`/`defaults`/`export-corpus`/
+//! `import-corpus` call the phase-6/7/11 AdminService RPCs.
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
@@ -255,12 +252,47 @@ pub(crate) async fn run(
             Ok(())
         }
         SlaCmd::Defaults => {
-            // TODO: phase-7 — surface `[sla].tiers` / `probe` via a
-            // proto field on SlaStatusResponse or a dedicated RPC.
-            // Phase-6: print a pointer so the subcommand exists.
-            anyhow::bail!(
-                "not yet implemented (v1.1 phase 7); inspect scheduler.toml [sla] directly"
-            )
+            let resp =
+                crate::rpc("GetSlaDefaults", async || client.get_sla_defaults(()).await).await?;
+            if as_json {
+                return crate::json(&resp);
+            }
+            println!(
+                "Tiers:     (default = {}, tightest first)",
+                resp.default_tier
+            );
+            println!("{:<12} {:>10} {:>10} {:>10}", "NAME", "P50", "P90", "P99");
+            for t in &resp.tiers {
+                println!(
+                    "{:<12} {:>10} {:>10} {:>10}",
+                    t.name,
+                    fmt_secs_opt(t.p50_secs),
+                    fmt_secs_opt(t.p90_secs),
+                    fmt_secs_opt(t.p99_secs),
+                );
+            }
+            if let Some(p) = &resp.probe {
+                println!();
+                println!(
+                    "Probe:     cores={} mem_base={} mem/core={} deadline={}s",
+                    p.cores,
+                    fmt_bytes_u(p.mem_base_bytes),
+                    fmt_bytes_u(p.mem_per_core_bytes),
+                    p.deadline_secs,
+                );
+            }
+            println!(
+                "Ceilings:  max_cores={} max_mem={} max_disk={}",
+                resp.max_cores,
+                fmt_bytes_u(resp.max_mem_bytes),
+                fmt_bytes_u(resp.max_disk_bytes),
+            );
+            println!(
+                "HwClasses: {} (ref = {})",
+                resp.hw_classes.join(", "),
+                resp.reference_hw_class,
+            );
+            Ok(())
         }
         SlaCmd::Explain {
             pname,
@@ -394,6 +426,10 @@ fn parse_ttl(s: &str) -> anyhow::Result<f64> {
         .unwrap_or(Duration::ZERO)
         .as_secs_f64();
     Ok(now + (n * mult) as f64)
+}
+
+fn fmt_secs_opt(s: Option<f64>) -> String {
+    s.map(|s| format!("{s:.0}s")).unwrap_or_else(|| "-".into())
 }
 
 fn fmt_bytes_u(b: u64) -> String {

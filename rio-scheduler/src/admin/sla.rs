@@ -3,9 +3,13 @@
 
 use tonic::Status;
 
-use rio_proto::types::{SlaCandidateRow, SlaExplainResponse, SlaOverride, SlaStatusResponse};
+use rio_proto::types::{
+    SlaCandidateRow, SlaDefaultsResponse, SlaExplainResponse, SlaOverride, SlaProbeShape,
+    SlaStatusResponse, SlaTier,
+};
 
 use crate::db::SlaOverrideRow;
+use crate::sla::config::SlaConfig;
 use crate::sla::explain::ExplainResult;
 use crate::sla::types::{DurationFit, FittedParams, MemFit, RawCores, RefSeconds};
 
@@ -153,6 +157,40 @@ pub fn duration_fit_from_status(r: &SlaStatusResponse) -> Option<DurationFit> {
             p_bar,
         }),
         other => panic!("unknown fit_kind {other:?}; update duration_fit_from_status"),
+    }
+}
+
+/// `[sla]` config → `SlaDefaultsResponse`. Tiers are sorted
+/// tightest-first ([`SlaConfig::solve_tiers`]) so the CLI table matches
+/// the order `solve_tier` actually walks. `hw_classes` is sorted for
+/// stable output (HashMap iteration order otherwise).
+pub(super) fn defaults_from_config(cfg: &SlaConfig) -> SlaDefaultsResponse {
+    let tiers = cfg
+        .solve_tiers()
+        .into_iter()
+        .map(|t| SlaTier {
+            name: t.name,
+            p50_secs: t.p50,
+            p90_secs: t.p90,
+            p99_secs: t.p99,
+        })
+        .collect();
+    let mut hw_classes: Vec<_> = cfg.hw_classes.keys().cloned().collect();
+    hw_classes.sort_unstable();
+    SlaDefaultsResponse {
+        tiers,
+        default_tier: cfg.default_tier.clone(),
+        probe: Some(SlaProbeShape {
+            cores: cfg.probe.cpu,
+            mem_per_core_bytes: cfg.probe.mem_per_core,
+            mem_base_bytes: cfg.probe.mem_base,
+            deadline_secs: cfg.probe.deadline_secs,
+        }),
+        max_cores: cfg.max_cores as u32,
+        max_mem_bytes: cfg.max_mem,
+        max_disk_bytes: cfg.max_disk,
+        hw_classes,
+        reference_hw_class: cfg.reference_hw_class.clone(),
     }
 }
 
@@ -338,6 +376,37 @@ mod tests {
     #[test]
     fn duration_fit_from_status_total_on_status_from_fit_range() {
         assert!(duration_fit_from_status(&status_from_fit(None, None)).is_none());
+    }
+
+    #[test]
+    fn defaults_from_config_sorts_tiers_and_hw() {
+        use crate::sla::solve::Tier;
+        let mut cfg = SlaConfig::test_default();
+        cfg.tiers = vec![
+            Tier {
+                name: "slow".into(),
+                p50: None,
+                p90: Some(3600.0),
+                p99: None,
+            },
+            Tier {
+                name: "fast".into(),
+                p50: None,
+                p90: Some(300.0),
+                p99: None,
+            },
+        ];
+        let r = defaults_from_config(&cfg);
+        // Tightest-first (solve_tiers order), not TOML order.
+        assert_eq!(r.tiers[0].name, "fast");
+        assert_eq!(r.tiers[0].p90_secs, Some(300.0));
+        assert_eq!(r.tiers[1].name, "slow");
+        assert_eq!(r.default_tier, "normal");
+        assert_eq!(r.probe.as_ref().unwrap().cores, 4.0);
+        assert_eq!(r.max_cores, 16);
+        // hw_classes sorted + names-only.
+        assert_eq!(r.hw_classes, ["test-hw"]);
+        assert_eq!(r.reference_hw_class, "test-hw");
     }
 
     /// Finite p̄ (Capped) + Coupled → mem evaluated at p̄, not sentineled.
