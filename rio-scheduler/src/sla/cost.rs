@@ -396,8 +396,9 @@ impl CostTable {
     ///   ~$0.01-0.10 → 0.1-1% relative.
     /// - `node_count` NOT hashed — enters solve only via
     ///   [`Self::lambda_for`]'s prior weight, already captured above.
-    /// - `cells` menu kept bit-exact: instance-type set is discrete
-    ///   (catalog updates, not noise).
+    /// - `cells` NOT hashed — the observed-menu feeds `poll_spot_once`
+    ///   only; per-cell capacity gating is `HwClassDef.max_cores/mem`
+    ///   (config, hashed via `SlaConfig`'s own input-gen).
     ///
     /// Sorted by key so iteration order is irrelevant.
     pub fn solve_relevant_hash(&self) -> u64 {

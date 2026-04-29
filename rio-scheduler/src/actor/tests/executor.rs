@@ -910,7 +910,7 @@ fn detect_hung_nodes_skips_without_authoritative_binding() {
 /// so on the next tick `detect_hung_nodes` returns nothing — a one-shot
 /// signal would drop N−cap nodes. The map carries each entry for
 /// `HUNG_NODE_REPEAT_TTL` since last (re-)detected.
-// r[verify sched.admin.hung-node-detector]
+// r[verify sched.admin.hung-node-detector+2]
 #[tokio::test]
 async fn hung_nodes_repeats_across_ticks_past_cap() {
     use crate::actor::debug::backdate;
