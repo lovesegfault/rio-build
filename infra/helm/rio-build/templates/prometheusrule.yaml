@@ -99,6 +99,50 @@ spec:
               systematically over/under-predicting. Run `rio-cli sla status`
               and `sla explain` on the top pnames; `sla reset` to refit.
 
+        # ADR-023 §Observability: prior_divergence = fleet-median prior
+        # parameter ÷ operator-probe basis (labeled `param`). The gauge
+        # is set unconditionally every refit; outside [0.5, 2.0] the
+        # value is clamped to the band edge (prior.rs `clamp_field`), so
+        # ≥2.0 or ≤0.5 ⇔ clamped. Sustained clamp means the [sla].probe
+        # operator basis has drifted from what the fleet is actually
+        # building — re-probe or widen the band.
+        - alert: RioSlaPriorDivergenceClamped
+          expr: |
+            max by (param) (rio_scheduler_sla_prior_divergence) >= 2.0
+              or
+            min by (param) (rio_scheduler_sla_prior_divergence) <= 0.5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "SLA prior parameter clamped ({{`{{ $labels.param }}`}})"
+            description: >-
+              rio_scheduler_sla_prior_divergence{param={{`{{ $labels.param }}`}}}
+              is {{`{{ $value | humanize }}`}} (clamp band [0.5, 2.0]).
+              Fleet-median prior has diverged from the operator-probe
+              basis. Check `[sla].probe` config vs `rio-cli sla status`.
+
+        # ADR-023 §Observability: age of the hw-band $/vCPU·hr snapshot.
+        # Spot poller refreshes every 600s (cost.rs POLL_INTERVAL_SECS);
+        # at 6× (3600s) cost.rs itself clamps price_ratio to the helm
+        # seed and emits _hw_cost_fallback_total{reason=stale}. Alert at
+        # 3× (1800s) so the operator sees the poller failing BEFORE the
+        # cost-ranking degrades. Not emitted under hwCostSource=static
+        # (no live source) so this is a no-op in vmtest-full.
+        - alert: RioSlaHwCostStale
+          expr: rio_scheduler_sla_hw_cost_stale_seconds > 1800
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "SLA hw-cost snapshot stale >30m"
+            description: >-
+              hw-band $/vCPU·hr snapshot is
+              {{`{{ $value | humanizeDuration }}`}} old (poller tick=10m;
+              auto-clamp at 60m). Check scheduler leader-lease and
+              ec2:DescribeSpotPriceHistory IRSA; see
+              rio_scheduler_sla_hw_cost_fallback_total{reason}.
+
         # ADR-023 §13b: ≥3 distinct cells reaping for `reason=ice`
         # (Launched=False — InsufficientCapacity / quota / unfulfillable
         # instance-type). One cell ICE is routine spot churn; ≥3
