@@ -89,16 +89,44 @@ pub(crate) const BUILDER_FUSE_CACHE_BYTES: u64 = 8 * (1 << 30);
 /// inherits the helm `poolDefaults.fuseCacheBytes` 50Gi.
 pub(super) const FETCHER_FUSE_CACHE_BYTES: u64 = 4 * (1 << 30);
 
+/// Set once at boot from `[nodeclaim_pool].fuse_cache_bytes` so
+/// `fuse_cache_bytes()` for Builder pools, `intent_pod_footprint`'s
+/// callers in `nodeclaim_pool` (FFD,
+/// `cover_deficit`), and `apply_intent_resources` all read the SAME
+/// value (§Simulator-shares-accounting). A per-Pool override would
+/// make FFD predict a different ephemeral-storage footprint than the
+/// pod actually stamps.
+pub static BUILDER_FUSE_CACHE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
 /// Per-pool FUSE cache budget. Drives BOTH the `fuse-cache` emptyDir
 /// sizeLimit and the `ephemeral-storage` budget addend so they cannot
-/// drift. `PoolSpec.fuse_cache_bytes` overrides the per-kind default;
-/// helm-rendered Pools always set it (50Gi prod), so the consts above
-/// only apply to non-helm Pools (vm-netpol misplaced-builder, etc.).
+/// drift. Builder pools single-source from [`BUILDER_FUSE_CACHE`]
+/// (= `[nodeclaim_pool].fuse_cache_bytes`) so FFD/cover/stamp agree;
+/// `PoolSpec.fuse_cache_bytes` is rejected for Builder kind by
+/// [`reject_builder_fuse_cache_override`]. Fetcher pools may override
+/// per-pool — Fetcher doesn't go through `nodeclaim_pool`.
 pub(super) fn fuse_cache_bytes(pool: &Pool) -> u64 {
-    pool.spec.fuse_cache_bytes.unwrap_or(match pool.spec.kind {
-        ExecutorKind::Builder => BUILDER_FUSE_CACHE_BYTES,
-        ExecutorKind::Fetcher => FETCHER_FUSE_CACHE_BYTES,
-    })
+    match pool.spec.kind {
+        ExecutorKind::Builder => *BUILDER_FUSE_CACHE
+            .get()
+            .unwrap_or(&BUILDER_FUSE_CACHE_BYTES),
+        ExecutorKind::Fetcher => pool
+            .spec
+            .fuse_cache_bytes
+            .unwrap_or(FETCHER_FUSE_CACHE_BYTES),
+    }
+}
+
+/// Reject a Builder Pool that sets `spec.fuseCacheBytes` — Builder
+/// pools single-source from [`BUILDER_FUSE_CACHE`] so FFD/cover/stamp
+/// agree. Returns the pre-formatted condition message (for the Pool
+/// reconciler to surface as a status condition + warn).
+pub(crate) fn reject_builder_fuse_cache_override(pool: &Pool) -> Option<&'static str> {
+    (pool.spec.kind == ExecutorKind::Builder && pool.spec.fuse_cache_bytes.is_some()).then_some(
+        "Builder pools may not set spec.fuseCacheBytes; it is single-sourced \
+         from controller [nodeclaim_pool].fuse_cache_bytes so FFD/cover/stamp \
+         agree (§Simulator-shares-accounting). Remove the field.",
+    )
 }
 
 /// Upstream gRPC addresses injected into executor pod env: a

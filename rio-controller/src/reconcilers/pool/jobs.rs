@@ -1177,10 +1177,35 @@ mod tests {
             .and_then(|r| r.requests.as_ref())
             .unwrap();
         let q = |k: &str| req[k].0.parse::<u64>().unwrap();
-        let (fc, fm, fd) = intent_pod_footprint(&i, pod::fuse_cache_bytes(&pool));
+        // mb_035: the production input source for FFD/cover_deficit is
+        // `cfg.fuse_cache_bytes` (= `BUILDER_FUSE_CACHE`), NOT
+        // `pod::fuse_cache_bytes(&pool)` directly. Passing the latter to
+        // both sides was vacuous — it couldn't catch the two values
+        // diverging. With Builder pools single-sourced, both ARE the
+        // OnceLock; assert that's what the stamp side also reads.
+        let cfg_fuse = *pod::BUILDER_FUSE_CACHE
+            .get()
+            .unwrap_or(&pod::BUILDER_FUSE_CACHE_BYTES);
+        assert_eq!(
+            pod::fuse_cache_bytes(&pool),
+            cfg_fuse,
+            "Builder pool fuse_cache_bytes single-sourced from BUILDER_FUSE_CACHE"
+        );
+        let (fc, fm, fd) = intent_pod_footprint(&i, cfg_fuse);
         assert_eq!(q("cpu"), u64::from(fc));
         assert_eq!(q("memory"), fm);
         assert_eq!(q("ephemeral-storage"), fd);
+    }
+
+    #[test]
+    fn builder_pool_rejects_fuse_cache_override() {
+        let mut p = test_pool("p", ExecutorKind::Builder);
+        p.spec.fuse_cache_bytes = Some(100 * (1 << 30));
+        assert!(pod::reject_builder_fuse_cache_override(&p).is_some());
+        // Fetcher may override.
+        let mut f = test_pool("f", ExecutorKind::Fetcher);
+        f.spec.fuse_cache_bytes = Some(100 * (1 << 30));
+        assert!(pod::reject_builder_fuse_cache_override(&f).is_none());
     }
 
     /// `apply_intent_resources` injects `RIO_DAEMON_TIMEOUT_SECS =
@@ -1493,10 +1518,16 @@ mod tests {
     #[test]
     fn fuse_cache_budget_matches_sizelimit() {
         const GI: u64 = 1 << 30;
+        let builder_fuse = *pod::BUILDER_FUSE_CACHE
+            .get()
+            .unwrap_or(&pod::BUILDER_FUSE_CACHE_BYTES);
         for (kind, override_, expect) in [
-            (ExecutorKind::Builder, None, pod::BUILDER_FUSE_CACHE_BYTES),
+            (ExecutorKind::Builder, None, builder_fuse),
             (ExecutorKind::Fetcher, None, pod::FETCHER_FUSE_CACHE_BYTES),
-            (ExecutorKind::Builder, Some(4 * GI), 4 * GI),
+            // mb_035: Builder ignores PoolSpec override (single-sourced).
+            (ExecutorKind::Builder, Some(4 * GI), builder_fuse),
+            // Fetcher honours per-pool override.
+            (ExecutorKind::Fetcher, Some(6 * GI), 6 * GI),
         ] {
             let mut pool = test_pool("p", kind);
             pool.spec.fuse_cache_bytes = override_;

@@ -193,6 +193,9 @@ async fn warn_on_spec_degrades(pool: &Pool, ctx: &Ctx) {
 
 /// Normal reconcile: make the world match spec.
 async fn apply(pool: Arc<Pool>, ctx: Arc<Ctx>) -> Result<Action> {
+    if let Some(msg) = pod::reject_builder_fuse_cache_override(&pool) {
+        return Err(Error::InvalidSpec(msg.into()));
+    }
     warn_on_spec_degrades(&pool, &ctx).await;
     jobs::reconcile(&pool, &ctx).await
 }

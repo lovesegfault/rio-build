@@ -24,8 +24,13 @@ spec:
   {{- with $p.maxConcurrent }}
   maxConcurrent: {{ . }}
   {{- end }}
+  {{- /* Builder pools single-source fuseCacheBytes from controller
+         [nodeclaim_pool].fuse_cache_bytes so FFD/cover/stamp agree;
+         the controller rejects a Builder Pool that sets it. */}}
+  {{- if ne $p.kind "Builder" }}
   {{- with $p.fuseCacheBytes }}
   fuseCacheBytes: {{ int64 . }}
+  {{- end }}
   {{- end }}
   {{- /* hostUsers rendered for BOTH kinds — k3s containerd needs
          hostUsers:true (cgroup-chown gap); production EKS leaves it
