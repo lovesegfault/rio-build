@@ -231,4 +231,11 @@ pub fn describe_metrics() {
          cold-start cell whose z_active sketch was empty after PG load. >1 over \
          controller lifetime = sketch persist failing (check tick errors)."
     );
+    describe_gauge!(
+        "rio_controller_sketches_reload_pending",
+        "1 while the lease-acquire CellSketches reload from PG is pending (load() not \
+         yet succeeded since on_acquire); 0 once latched. While 1, persist() is gated \
+         off so a stale standby-startup snapshot doesn't overwrite the previous leader's \
+         PG rows. Stuck at 1 = PG unreachable from controller; reconcile runs degraded."
+    );
 }

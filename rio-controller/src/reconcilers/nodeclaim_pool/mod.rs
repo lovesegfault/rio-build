@@ -328,6 +328,12 @@ pub struct ControllerLeaseHooks {
     /// long-running standby that wins the lease doesn't `persist()`
     /// stale startup-time sketches over the previous leader's
     /// accumulated samples.
+    ///
+    /// **Latch-on-Ok-only** (mirrors `cost::poller_tick_prelude`): the
+    /// run loop reads this with `load()`, not `swap()`. On reload `Ok`
+    /// it stores `false`; on `Err` it leaves the flag set so the next
+    /// tick retries. While set, `persist()` is gated off (degraded
+    /// reconcile runs, stale-overwrite prevented).
     reload: Arc<std::sync::atomic::AtomicBool>,
     /// Set on `on_lose`; run loop `placeable_tx.send_replace(None)`
     /// so an ex-leader's `PlaceableGate` doesn't stay armed with a
@@ -456,6 +462,16 @@ impl NodeClaimPoolReconciler {
         }
     }
 
+    /// Lease-acquire reload still pending (PG `load()` not yet
+    /// succeeded since the last `on_acquire`). While true, the
+    /// in-memory `self.sketches` may be stale (a long-running standby's
+    /// startup snapshot, or `default()` if `new()` hit a PG outage) —
+    /// `persist()` is gated off so it doesn't overwrite the previous
+    /// leader's PG rows. Set false only on `CellSketches::load` Ok.
+    fn reload_pending(&self) -> bool {
+        self.hooks.reload.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Tick loop. Gated on [`LeaderState::is_leader`] — standby replicas
     /// (and the surge pod during a rolling upgrade) burn ticks as no-ops
     /// until they acquire. Stateful (`consecutive_bot_ticks`,
@@ -496,19 +512,39 @@ impl NodeClaimPoolReconciler {
             // and so `observe_registered`'s recency-gate sees an empty
             // `recorded_boot` (else days-old registrations mass-clear
             // the scheduler's IceBackoff).
-            if self
-                .hooks
-                .reload
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                if let Ok(s) = CellSketches::load(&self.pg).await {
-                    self.sketches = s;
-                    self.sketches.seed(&self.cfg.lead_time_seed);
+            //
+            // Latch-on-Ok-only: a transient PG error must NOT consume
+            // the one-shot flag. On `Err`, warn and fall through —
+            // `reconcile_once` runs degraded (in-memory sketches
+            // suffice for FFD/reap), `persist()` is gated off via
+            // `reload_pending()` so the stale state doesn't overwrite
+            // the previous leader's PG rows. The flag stays set; next
+            // tick retries the reload. Clears (recorded_boot etc.) go
+            // in the Ok-arm only — atomic edge: full reload or full
+            // retry.
+            if self.reload_pending() {
+                match CellSketches::load(&self.pg).await {
+                    Ok(s) => {
+                        self.sketches = s;
+                        self.sketches.seed(&self.cfg.lead_time_seed);
+                        self.recorded_boot.clear();
+                        self.prev_idle.clear();
+                        self.inflight_created.clear();
+                        self.hooks
+                            .reload
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "CellSketches reload on leader-acquire failed; \
+                             retrying next tick (persist gated)"
+                        );
+                    }
                 }
-                self.recorded_boot.clear();
-                self.prev_idle.clear();
-                self.inflight_created.clear();
             }
+            metrics::gauge!("rio_controller_sketches_reload_pending")
+                .set(if self.reload_pending() { 1.0 } else { 0.0 });
             self.tick_counter = self.tick_counter.wrapping_add(1);
             let started = std::time::Instant::now();
             if let Err(e) = self.reconcile_once().await {
@@ -675,7 +711,9 @@ impl NodeClaimPoolReconciler {
         )
         .await?;
 
-        self.sketches.persist(&self.pg).await?;
+        if !self.reload_pending() {
+            self.sketches.persist(&self.pg).await?;
+        }
         Ok(())
     }
 
@@ -712,7 +750,9 @@ impl NodeClaimPoolReconciler {
         // pre-outage value and `RioNodeclaimPoolStuckPending` reads
         // stale data exactly when the operator needs it.
         self.emit_live_gauges(&live, now);
-        self.sketches.persist(&self.pg).await?;
+        if !self.reload_pending() {
+            self.sketches.persist(&self.pg).await?;
+        }
         Ok(())
     }
 
@@ -1200,7 +1240,7 @@ mod tests {
     }
 
     /// `ControllerLeaseHooks` flags propagate via shared `Arc` — the
-    /// run loop's `swap(false)` sees the lease loop's clone's `store`.
+    /// run loop's `load()` sees the lease loop's clone's `store`.
     /// `Clone` (LeaseHooks bound) so it can be passed to both
     /// `run_lease_loop` and `NodeClaimPoolReconciler::new`.
     #[test]
@@ -1209,10 +1249,33 @@ mod tests {
         let h = ControllerLeaseHooks::default();
         let h2 = h.clone();
         rio_lease::LeaseHooks::on_acquire(&h2);
-        assert!(h.reload.swap(false, SeqCst), "reload set via clone");
+        assert!(h.reload.load(SeqCst), "reload set via clone");
+        h.reload.store(false, SeqCst);
         assert!(!h.lose.load(SeqCst));
         rio_lease::LeaseHooks::on_lose(&h2);
         assert!(h.lose.swap(false, SeqCst), "lose set via clone");
+    }
+
+    /// Latch-on-Ok-only reload semantics. The run loop's reload block
+    /// is inlined in `run()` (PG-coupled), so this test exercises the
+    /// invariant directly: after `on_acquire`, `reload_pending()` stays
+    /// true (gating `persist()`) until the run loop's Ok-arm explicitly
+    /// stores false. A `swap(false)` BEFORE the load would consume the
+    /// flag on a transient PG error and the next tick's stale
+    /// `persist()` would overwrite the previous leader's PG rows.
+    #[test]
+    fn reload_latch_on_ok_only_gates_persist() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let h = ControllerLeaseHooks::default();
+        rio_lease::LeaseHooks::on_acquire(&h);
+        // Tick 1: load() Err — flag stays set (NOT swap), persist gated.
+        assert!(h.reload.load(SeqCst), "tick1: reload still pending on Err");
+        // Tick 2: load() Err — same.
+        assert!(h.reload.load(SeqCst), "tick2: reload still pending on Err");
+        // Tick 3: load() Ok — Ok-arm stores false.
+        h.reload.store(false, SeqCst);
+        assert!(!h.reload.load(SeqCst), "tick3: latched on Ok");
+        // Done-gate: no `swap(false)` callsite remains in the run loop.
     }
 
     #[test]
