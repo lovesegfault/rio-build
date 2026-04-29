@@ -516,6 +516,14 @@ pub struct SolvedIntent {
     /// reverse-engineer `h` from a hardcoded label schema. Empty for
     /// the hw-agnostic path (same as `node_affinity`).
     pub hw_class_names: Vec<String>,
+    /// ADR-023 §sizing: `headroom(fit.n_eff_ring)` — the variance-aware
+    /// overlay-disk multiplier. Low `n_eff` (cold/noisy fit) → wide
+    /// cushion; high `n_eff` → tight. Carried through
+    /// `SpawnIntent.disk_headroom_factor` so the controller's
+    /// `pod_ephemeral_request` and the NodeClaim disk floor agree
+    /// without reimplementing the curve. Unfitted (probe/cold) → the
+    /// flat 1.5× fallback.
+    pub disk_headroom: f64,
 }
 
 /// Scheduling-hint sub-state of a [`DerivationState`].

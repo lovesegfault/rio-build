@@ -59,3 +59,27 @@ fn spawn_intent_ready_absent_is_legacy_ready() {
     explicit.retain(|i| i.ready.unwrap_or(true));
     assert!(explicit.is_empty());
 }
+
+/// `disk_headroom_factor` (field 15) absent on the wire — a pre-ADR-023
+/// §sizing scheduler — decodes as `None`, NOT `Some(0.0)`. The
+/// consumer (`pool::jobs::intent_headroom`) treats `None`/`0.0` as the
+/// flat 1.5× fallback; treating absence as a present 0.0 would zero
+/// the overlay sizeLimit. Consumer behaviour is unit-tested in
+/// `jobs::tests::disk_headroom_factor_widens_ephemeral_request`.
+#[test]
+fn spawn_intent_disk_headroom_absent_decodes_none() {
+    let legacy = SpawnIntent {
+        disk_headroom_factor: None,
+        ..Default::default()
+    };
+    let bytes = legacy.encode_to_vec();
+    // Tag 15 wire key is `(15 << 3) | 1` = 0x79 (fixed64 wire-type).
+    // Empty-default intent encodes zero bytes, so the contains check
+    // is exact (no string/varint payload to alias 0x79).
+    assert!(
+        !bytes.contains(&0x79),
+        "disk_headroom_factor=None must not emit tag 15; got {bytes:02x?}"
+    );
+    let decoded = SpawnIntent::decode(&*bytes).unwrap();
+    assert_eq!(decoded.disk_headroom_factor, None);
+}

@@ -53,6 +53,7 @@ fn spawn_intents_proto_roundtrip() {
                 eta_seconds: 0.0,
                 ready: Some(true),
                 hw_class_names: vec!["intel-8".into()],
+                disk_headroom_factor: Some(1.32),
             },
             rio_proto::types::SpawnIntent {
                 intent_id: "i-fod".into(),
@@ -68,6 +69,7 @@ fn spawn_intents_proto_roundtrip() {
                 eta_seconds: 42.5,
                 ready: Some(false),
                 hw_class_names: vec![],
+                disk_headroom_factor: None,
             },
         ],
         queued_by_system: [("x86_64-linux".into(), 4), ("aarch64-linux".into(), 1)].into(),

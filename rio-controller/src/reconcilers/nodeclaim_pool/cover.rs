@@ -132,16 +132,24 @@ pub fn cells_round_robin(mut cells: Vec<Cell>, tick: u64) -> Vec<Cell> {
     cells
 }
 
-/// Per-cell `(Σcores, Σmem, max disk_bytes)` over `u`. `max` for disk:
-/// each pod gets its own ephemeral-storage allocation, so the claim
-/// only needs to fit the largest single intent; cores/mem stack.
-/// Returns the RAW `disk_bytes` max — the caller maps it through
+/// Per-cell `(Σcores, Σmem, max disk_bytes, max headroom)` over `u`.
+/// `max` for disk: each pod gets its own ephemeral-storage allocation,
+/// so the claim only needs to fit the largest single intent; cores/mem
+/// stack. `max` for headroom: the claim's disk floor must cover the
+/// widest cushion any assigned intent will request. Returns the RAW
+/// `disk_bytes` max — the caller maps it through
 /// [`crate::reconcilers::pool::jobs::pod_ephemeral_request`] before
 /// stamping the NodeClaim, so the claim's floor matches what the pod
-/// will actually request (1.5× + fuse-cache + log).
-pub fn sum_deficit(u: &[&SpawnIntent]) -> (u32, u64, u64) {
-    u.iter().fold((0, 0, 0), |(c, m, d), i| {
-        (c + i.cores, m + i.mem_bytes, d.max(i.disk_bytes))
+/// will actually request (`headroom×` + fuse-cache + log).
+pub fn sum_deficit(u: &[&SpawnIntent]) -> (u32, u64, u64, f64) {
+    use crate::reconcilers::pool::jobs::intent_headroom;
+    u.iter().fold((0, 0, 0, 0.0), |(c, m, d, h), i| {
+        (
+            c + i.cores,
+            m + i.mem_bytes,
+            d.max(i.disk_bytes),
+            h.max(intent_headroom(i)),
+        )
     })
 }
 
@@ -319,12 +327,17 @@ mod tests {
 
     #[test]
     fn sum_deficit_sums_cores_mem_max_disk() {
-        let a = intent("a", 4, 8 * GI, &[]);
+        let mut a = intent("a", 4, 8 * GI, &[]);
+        a.disk_headroom_factor = Some(1.8);
         let mut b = intent("b", 8, 16 * GI, &[]);
         b.disk_bytes = 50 * GI;
+        b.disk_headroom_factor = Some(1.3);
         let s = sum_deficit(&[&a, &b]);
-        assert_eq!(s, (12, 24 * GI, 50 * GI));
-        assert_eq!(sum_deficit(&[]), (0, 0, 0));
+        assert_eq!(s, (12, 24 * GI, 50 * GI, 1.8));
+        assert_eq!(sum_deficit(&[]), (0, 0, 0, 0.0));
+        // Absent factor → 1.5 fallback contributes to the max.
+        let c = intent("c", 1, GI, &[]);
+        assert_eq!(sum_deficit(&[&c, &b]).3, 1.5);
     }
 
     // --- round-robin ---------------------------------------------------

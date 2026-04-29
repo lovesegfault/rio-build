@@ -323,6 +323,7 @@ impl DagActor {
                 eta_seconds,
                 ready: Some(ready),
                 hw_class_names: intent.hw_class_names.clone(),
+                disk_headroom_factor: Some(intent.disk_headroom),
             }
         };
 
@@ -1113,6 +1114,14 @@ impl DagActor {
             .find_map(|f| self.sla_config.feature_probes.get(f))
             .unwrap_or(&self.sla_config.probe)
             .deadline_secs;
+        // ADR-023 §sizing: variance-aware overlay-disk headroom. The
+        // curve lives in `sla::fit::headroom` (scheduler-only); the
+        // controller is a dumb consumer via
+        // `SpawnIntent.disk_headroom_factor`. Unfitted → flat 1.5×.
+        let disk_headroom = fit
+            .as_ref()
+            .map(|f| crate::sla::fit::headroom(f.n_eff_ring))
+            .unwrap_or(1.5);
         let computed = fit
             .as_ref()
             .filter(|f| !matches!(f.fit, crate::sla::types::DurationFit::Probe))
@@ -1205,6 +1214,7 @@ impl DagActor {
             predicted,
             node_affinity,
             hw_class_names,
+            disk_headroom,
         }
     }
 

@@ -15,8 +15,10 @@
 # Mirror jobs.rs constants. Drift here = test goes stale, but the
 # NodeClaim path now calls the SAME pod_ephemeral_request() so the
 # runtime coupling is structural; this check guards the static helm
-# default only.
-OVERLAY_HEADROOM_PCT=150   # ×1.5
+# default only. headroom(n_eff) is variance-aware (scheduler-side) and
+# bounded above by headroom(1.0) = 1.25 + 0.7 = 1.95; budget for the
+# worst case so a cold-key intent at max_disk still fits.
+OVERLAY_HEADROOM_PCT=195   # worst-case headroom(n_eff=1)
 LOG_BUDGET_BYTES=$((1 << 30))
 RESERVE_PCT=110            # ~10% kubelet reserve
 
@@ -36,8 +38,8 @@ need=$(( (max_disk * OVERLAY_HEADROOM_PCT / 100 + fuse + LOG_BUDGET_BYTES) \
 
 test "$vol_b" -ge "$need" || {
   echo "FAIL: karpenter.dataVolumeSize=$vol ($vol_b B) < required $need B" >&2
-  echo "  = (sla.maxDisk × 1.5 + poolDefaults.fuseCacheBytes + 1Gi) × 1.1" >&2
-  echo "  = ($max_disk × 1.5 + $fuse + $LOG_BUDGET_BYTES) × 1.1" >&2
+  echo "  = (sla.maxDisk × 1.95 + poolDefaults.fuseCacheBytes + 1Gi) × 1.1" >&2
+  echo "  = ($max_disk × 1.95 + $fuse + $LOG_BUDGET_BYTES) × 1.1" >&2
   exit 1
 }
 

@@ -723,7 +723,7 @@ impl NodeClaimPoolReconciler {
             let Some(u) = by_cell.get(cell) else {
                 continue;
             };
-            let (sum_c, sum_m, max_d) = cover::sum_deficit(u);
+            let (sum_c, sum_m, max_d, max_h) = cover::sum_deficit(u);
             let budget = self
                 .cfg
                 .max_fleet_cores
@@ -747,12 +747,14 @@ impl NodeClaimPoolReconciler {
             // Per-claim mem: Σm spread evenly. Disk: each pod allocates
             // ephemeral-storage independently, so the claim need only
             // fit the largest single pod — but the pod requests
-            // `pod_ephemeral_request(disk_bytes, fuse_cache)`
-            // (= 1.5×disk + fuse + log), NOT bare `disk_bytes`. B8
+            // `pod_ephemeral_request(disk_bytes, headroom, fuse_cache)`
+            // (= headroom×disk + fuse + log), NOT bare `disk_bytes`. B8
             // live: a 100Gi-disk intent's pod asked 201Gi on a node
-            // Karpenter sized for 100Gi → unschedulable.
+            // Karpenter sized for 100Gi → unschedulable. `max_h` is the
+            // widest headroom any cell intent carries so the claim
+            // covers the worst case.
             let mem_per = sum_m / u64::from(n);
-            let disk_per = pod_ephemeral_request(max_d, self.cfg.fuse_cache_bytes);
+            let disk_per = pod_ephemeral_request(max_d, max_h, self.cfg.fuse_cache_bytes);
             for _ in 0..n {
                 let nc = cover::build_nodeclaim(
                     cell,

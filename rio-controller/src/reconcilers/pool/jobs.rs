@@ -77,18 +77,31 @@ pub(crate) const HW_BENCH_NEEDED_ANNOTATION: &str = "rio.build/hw-bench-needed";
 /// (nix ≥2.30 default = stateDir/builds), but stdout/stderr capture and
 /// the daemon's own state live outside. 1 GiB headroom.
 const LOG_BUDGET_BYTES: u64 = 1 << 30;
-/// Overlay emptyDir sizeLimit headroom multiplier on `disk_bytes`.
-/// TODO(ADR-023 phase-2): replace with `headroom(n_eff)` from the SLA
-/// estimator (variance-aware). 1.5× is the phase-1 flat fallback.
-const OVERLAY_HEADROOM: f64 = 1.5;
+/// Overlay emptyDir sizeLimit headroom multiplier on `disk_bytes` when
+/// `SpawnIntent.disk_headroom_factor` is absent/zero (pre-ADR-023
+/// scheduler skew). The variance-aware `headroom(n_eff)` curve is
+/// computed scheduler-side and carried on the intent; this is the flat
+/// fallback only.
+pub(crate) const OVERLAY_HEADROOM_FALLBACK: f64 = 1.5;
+
+/// Resolve the overlay-disk headroom multiplier for an intent.
+/// `disk_headroom_factor` is `optional` on the wire so a pre-§sizing
+/// scheduler decodes as `None`; 0.0 (proto default for `double`) is
+/// also treated as absent.
+pub(crate) fn intent_headroom(i: &SpawnIntent) -> f64 {
+    i.disk_headroom_factor
+        .filter(|&h| h > 0.0)
+        .unwrap_or(OVERLAY_HEADROOM_FALLBACK)
+}
 
 /// Pod `ephemeral-storage` request/limit for an intent's `disk_bytes`
 /// plus a per-pool FUSE-cache budget.
 ///
-/// = `disk_bytes × OVERLAY_HEADROOM` (overlay emptyDir, prjquota fit ×
-/// variance cushion) + `fuse_cache_bytes` (input closure, the
-/// `fuse-cache` emptyDir sizeLimit) + [`LOG_BUDGET_BYTES`]
-/// (stdout/stderr capture + daemon state outside the overlay).
+/// = `disk_bytes × headroom` (overlay emptyDir, prjquota fit × the
+/// scheduler's variance-aware `headroom(n_eff)` cushion) +
+/// `fuse_cache_bytes` (input closure, the `fuse-cache` emptyDir
+/// sizeLimit) + [`LOG_BUDGET_BYTES`] (stdout/stderr capture + daemon
+/// state outside the overlay).
 ///
 /// Single source for THREE callers that must agree:
 /// - [`apply_intent_resources`] — the actual pod request/limit;
@@ -97,11 +110,11 @@ const OVERLAY_HEADROOM: f64 = 1.5;
 ///   raw `disk_bytes` here while the pod requested 1.5× + 50Gi + 1Gi
 ///   meant a 100Gi-intent pod asked 201Gi on a 189Gi-allocatable node);
 /// - helm-lint `14-disk-ceiling.sh` — `karpenter.dataVolumeSize` ≥
-///   `pod_ephemeral_request(sla.maxDisk, poolDefaults.fuseCacheBytes)`
-///   + kubelet reserve.
+///   `pod_ephemeral_request(sla.maxDisk, worst-case headroom,
+///   poolDefaults.fuseCacheBytes)` + kubelet reserve.
 // r[impl sched.sla.disk-reaches-ephemeral-storage]
-pub(crate) fn pod_ephemeral_request(disk_bytes: u64, fuse_cache_bytes: u64) -> u64 {
-    ((disk_bytes as f64 * OVERLAY_HEADROOM) as u64)
+pub(crate) fn pod_ephemeral_request(disk_bytes: u64, headroom: f64, fuse_cache_bytes: u64) -> u64 {
+    ((disk_bytes as f64 * headroom) as u64)
         .saturating_add(fuse_cache_bytes)
         .saturating_add(LOG_BUDGET_BYTES)
 }
@@ -865,19 +878,20 @@ pub(super) fn build_job(
 /// Quantities rendered as raw byte counts (no SI suffix): k8s parses
 /// bare integers as base-unit and they roundtrip exactly.
 ///
-/// `ephemeral-storage` = `disk_bytes × OVERLAY_HEADROOM` (overlay
-/// writes, from the SLA model's prjquota fit, plus the variance
-/// cushion) + the per-pool FUSE cache budget (input closure, NOT
-/// captured by `disk_p90`) + log/scratch headroom. BOTH addends are
-/// the SAME values that set the `overlays` / `fuse-cache` emptyDir
-/// sizeLimits, so kubelet's pod-level sum (writable-layer + logs +
-/// disk-backed emptyDirs) cannot exceed the limit before a volume-
-/// level limit fires. Budgeting bare `disk_bytes` (1.0×) here while
-/// the overlay sizeLimit is 1.5× made the headroom unreachable —
-/// pods evicted at ≈p90 instead of 1.5×p90.
+/// `ephemeral-storage` = `disk_bytes × headroom` (overlay writes, from
+/// the SLA model's prjquota fit, plus the scheduler-computed
+/// variance-aware cushion) + the per-pool FUSE cache budget (input
+/// closure, NOT captured by `disk_p90`) + log/scratch headroom. BOTH
+/// addends are the SAME values that set the `overlays` / `fuse-cache`
+/// emptyDir sizeLimits, so kubelet's pod-level sum (writable-layer +
+/// logs + disk-backed emptyDirs) cannot exceed the limit before a
+/// volume-level limit fires. Budgeting bare `disk_bytes` (1.0×) here
+/// while the overlay sizeLimit is `headroom×` made the headroom
+/// unreachable — pods evicted at ≈p90 instead of `headroom×p90`.
 fn apply_intent_resources(pod_spec: &mut PodSpec, pool: &Pool, i: &SpawnIntent) {
-    let overlay_limit = (i.disk_bytes as f64 * OVERLAY_HEADROOM) as u64;
-    let ephemeral = pod_ephemeral_request(i.disk_bytes, pod::fuse_cache_bytes(pool));
+    let headroom = intent_headroom(i);
+    let overlay_limit = (i.disk_bytes as f64 * headroom) as u64;
+    let ephemeral = pod_ephemeral_request(i.disk_bytes, headroom, pod::fuse_cache_bytes(pool));
     let map: BTreeMap<String, Quantity> = BTreeMap::from([
         ("cpu".into(), Quantity(i.cores.to_string())),
         ("memory".into(), Quantity(i.mem_bytes.to_string())),
@@ -1310,7 +1324,7 @@ mod tests {
         assert_eq!(
             req["ephemeral-storage"],
             Quantity(((60 + 8 + 1) * GI).to_string()),
-            "disk_bytes×OVERLAY_HEADROOM + BUILDER_FUSE_CACHE_BYTES + LOG_BUDGET_BYTES"
+            "disk_bytes×OVERLAY_HEADROOM_FALLBACK + BUILDER_FUSE_CACHE_BYTES + LOG_BUDGET_BYTES"
         );
         assert_eq!(
             res.limits.as_ref(),
@@ -1329,6 +1343,60 @@ mod tests {
             overlay.empty_dir.as_ref().unwrap().size_limit,
             Some(Quantity((60 * GI).to_string()))
         );
+    }
+
+    /// ADR-023 §sizing F5: a low-`n_eff` fit produces a wider
+    /// `disk_headroom_factor` than a high-`n_eff` fit, and that flows
+    /// through to a larger pod `ephemeral-storage` request + overlay
+    /// sizeLimit. `headroom(n)` = `1.25 + 0.7/√n` is monotone
+    /// decreasing in `n`, so cold/noisy keys get more cushion.
+    #[test]
+    fn disk_headroom_factor_widens_ephemeral_request() {
+        const GI: u64 = 1 << 30;
+        let pool = test_pool("p", ExecutorKind::Builder);
+        let mk = |h: Option<f64>| {
+            let i = SpawnIntent {
+                intent_id: "abc".into(),
+                disk_bytes: 40 * GI,
+                disk_headroom_factor: h,
+                ..Default::default()
+            };
+            let job = job(&pool, &i);
+            let pod_spec = job
+                .spec
+                .as_ref()
+                .and_then(|s| s.template.spec.as_ref())
+                .unwrap();
+            let eph: u64 = pod_spec.containers[0]
+                .resources
+                .as_ref()
+                .and_then(|r| r.limits.as_ref())
+                .map(|l| l["ephemeral-storage"].0.parse().unwrap())
+                .unwrap();
+            let overlay: u64 = pod_spec
+                .volumes
+                .as_ref()
+                .and_then(|v| v.iter().find(|v| v.name == "overlays"))
+                .and_then(|v| v.empty_dir.as_ref())
+                .and_then(|e| e.size_limit.as_ref())
+                .map(|q| q.0.parse().unwrap())
+                .unwrap();
+            (eph, overlay)
+        };
+        // headroom(100)≈1.32, headroom(3)≈1.65 — scheduler-side values.
+        let (eph_hi, ov_hi) = mk(Some(1.32));
+        let (eph_lo, ov_lo) = mk(Some(1.65));
+        assert!(
+            eph_lo > eph_hi && ov_lo > ov_hi,
+            "low-n_eff (h=1.65) must request MORE disk than high-n_eff \
+             (h=1.32); got eph {eph_lo} vs {eph_hi}, overlay {ov_lo} vs {ov_hi}"
+        );
+        // Absent → fallback 1.5×; 0.0 → also fallback (proto default).
+        let (eph_none, _) = mk(None);
+        let (eph_zero, _) = mk(Some(0.0));
+        let (eph_fb, _) = mk(Some(OVERLAY_HEADROOM_FALLBACK));
+        assert_eq!(eph_none, eph_fb, "None → fallback");
+        assert_eq!(eph_zero, eph_fb, "0.0 → fallback");
     }
 
     /// The `fuse-cache` emptyDir sizeLimit and the FUSE-cache addend in
@@ -1378,7 +1446,7 @@ mod tests {
                 .and_then(|r| r.limits.as_ref())
                 .map(|l| l["ephemeral-storage"].clone())
                 .unwrap();
-            let overlay_limit = ((5 * GI) as f64 * OVERLAY_HEADROOM) as u64;
+            let overlay_limit = ((5 * GI) as f64 * OVERLAY_HEADROOM_FALLBACK) as u64;
             assert_eq!(
                 eph,
                 Quantity((overlay_limit + expect + LOG_BUDGET_BYTES).to_string()),
@@ -1393,11 +1461,11 @@ mod tests {
     /// all disk-backed emptyDirs against the container limit and
     /// evicts when the sum exceeds it — independent of per-volume
     /// sizeLimit. If the container limit is smaller, the per-volume
-    /// caps are unreachable (the OVERLAY_HEADROOM cushion becomes
-    /// phantom; pods evict at ≈p90 instead of 1.5×p90).
+    /// caps are unreachable (the headroom cushion becomes phantom;
+    /// pods evict at ≈p90 instead of `headroom×p90`).
     ///
-    /// Invariant under future `OVERLAY_HEADROOM` changes (ADR-023
-    /// phase-2 will replace the constant with `headroom(n_eff)`).
+    /// Invariant under any `disk_headroom_factor` value (ADR-023
+    /// §sizing computes it scheduler-side as `headroom(n_eff)`).
     #[test]
     fn disk_backed_emptydir_sizelimits_fit_ephemeral_limit() {
         const GI: u64 = 1 << 30;

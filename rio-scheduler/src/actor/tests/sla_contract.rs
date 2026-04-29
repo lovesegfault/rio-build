@@ -1417,6 +1417,54 @@ async fn contract_dispatch_accepts_2row_postfilter_fit() {
     );
 }
 
+/// **F5** — `SolvedIntent.disk_headroom` carries the scheduler-side
+/// `headroom(fit.n_eff_ring)` curve so the controller's
+/// `pod_ephemeral_request` is variance-aware without reimplementing
+/// it. Low `n_eff` (cold/noisy fit) → wide cushion; high `n_eff` →
+/// tight; unfitted (no pname) → flat 1.5× fallback.
+#[tokio::test]
+async fn spawn_intent_carries_disk_headroom() {
+    use crate::sla::fit::headroom;
+    use crate::sla::types::RingNEff;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+
+    // Fitted, n_eff=100 → headroom≈1.32 (tight: model is confident).
+    let mut hi = make_fit("hi-neff");
+    hi.n_eff_ring = RingNEff(100.0);
+    actor.sla_estimator.seed(hi);
+    // Fitted, n_eff=3 → headroom≈1.65 (wide: model is noisy).
+    let mut lo = make_fit("lo-neff");
+    lo.n_eff_ring = RingNEff(3.0);
+    actor.sla_estimator.seed(lo);
+
+    actor.test_inject_ready("d-hi", Some("hi-neff"), "x86_64-linux", false);
+    actor.test_inject_ready("d-lo", Some("lo-neff"), "x86_64-linux", false);
+    actor.test_inject_ready("d-cold", None, "x86_64-linux", false);
+
+    let solve = |hash: &str| solve_intent(&actor, actor.dag.node(hash).unwrap()).disk_headroom;
+
+    let h_hi = solve("d-hi");
+    let h_lo = solve("d-lo");
+    let h_cold = solve("d-cold");
+
+    assert!(
+        (h_hi - headroom(RingNEff(100.0))).abs() < 1e-9,
+        "high-n_eff: want headroom(100)≈1.32, got {h_hi}"
+    );
+    assert!(
+        (h_lo - headroom(RingNEff(3.0))).abs() < 1e-9,
+        "low-n_eff: want headroom(3)≈1.65, got {h_lo}"
+    );
+    assert!(
+        h_lo > h_hi,
+        "low-n_eff fit MUST yield wider headroom than high-n_eff; \
+         got lo={h_lo} hi={h_hi}"
+    );
+    assert_eq!(h_cold, 1.5, "unfitted (no pname) → flat fallback");
+}
+
 /// **R6B5 / merged_bug_011-A** — `pinned_explore` releases on
 /// infeasible. Pre-fix: the pin is committed at :886-888 BEFORE the
 /// `solve_full([h])` feasibility check at :891, and the graduation

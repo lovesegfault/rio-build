@@ -78,6 +78,7 @@ optional double c_star = 2;
 optional double cores = 10;
 optional double cpu_limit_cores = 6;
 optional double cpu_seconds_total = 7;
+optional double disk_headroom_factor = 15;
 optional double expires_at_epoch = 13;
 optional double p50_secs = 16;
 optional double p50_secs = 2;

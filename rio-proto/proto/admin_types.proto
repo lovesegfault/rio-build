@@ -451,6 +451,13 @@ message SpawnIntent {
   // from a hardcoded label schema (bug_061). Empty under
   // hw_cost_source=None (same as `node_affinity`).
   repeated string hw_class_names = 14;
+  // ADR-023 §sizing: variance-aware overlay-disk headroom multiplier.
+  // Computed scheduler-side as `headroom(fit.n_eff_ring)` (fit.rs) so
+  // the controller stays a dumb consumer of the curve. `optional` so a
+  // pre-§sizing scheduler decodes as `None` and the controller falls
+  // back to the flat 1.5× constant. 0.0 is also treated as
+  // absent (proto default for `double`).
+  optional double disk_headroom_factor = 15;
 }
 
 // One conjunction of node-match requirements. Mirrors k8s core/v1
