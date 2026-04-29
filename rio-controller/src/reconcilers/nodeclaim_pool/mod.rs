@@ -15,7 +15,7 @@
 //! 3. Cover the unplaced deficit per `(hw_class, capacity_type)` cell
 //!    with 1×anchor + N×bulk NodeClaims, capped at
 //!    `max_node_claims_per_cell_per_tick` and `max_fleet_cores`.
-//! 4. Reap idle Registered claims via Nelson-Aalen break-even.
+//! 4. Reap idle Registered claims via windowed-rate break-even.
 //! 5. Reap unhealthy (scheduler-reported `dead_nodes`) and ICE-stuck
 //!    claims.
 //! 6. Persist `CellSketches` (DDSketch lead-time + idle-gap log) to PG.
@@ -119,7 +119,7 @@ impl PlaceableGate {
     /// fail-closed (a standby replica whose lease-gated reconciler never
     /// publishes would otherwise see `queued=0` and reap the leader's
     /// Pending Jobs).
-    // r[impl ctrl.nodeclaim.placeable-gate]
+    // r[impl ctrl.nodeclaim.placeable-gate+2]
     pub fn retain(&self, intents: &mut Vec<SpawnIntent>) -> bool {
         match self.0.borrow().clone() {
             Some(set) => {
@@ -607,7 +607,7 @@ impl NodeClaimPoolReconciler {
             "FFD simulation"
         );
         self.emit_tick_gauges(&live, &placeable, &unplaced, now);
-        // r[impl ctrl.nodeclaim.placeable-gate]
+        // r[impl ctrl.nodeclaim.placeable-gate+2]
         // Publish `intent_id`s FFD-placed on a `Registered=True` node
         // (`in_flight == false`). The `pool/jobs` reconciler retains
         // only these — Jobs are NOT created for intents placed on
@@ -809,7 +809,7 @@ impl NodeClaimPoolReconciler {
     /// `Api::create` failures are warned + skipped (next tick retries);
     /// the method only propagates errors that would make the tick
     /// non-progressing.
-    // r[impl ctrl.nodeclaim.anchor-bulk]
+    // r[impl ctrl.nodeclaim.anchor-bulk+2]
     async fn cover_deficit(
         &self,
         unplaced: &[SpawnIntent],
@@ -889,7 +889,7 @@ impl NodeClaimPoolReconciler {
             // 100Gi → unschedulable. `max_h` is the widest headroom any
             // cell intent carries so the claim covers the worst case.
             //
-            // r[ctrl.nodeclaim.anchor-bulk]: the FIRST claim is the
+            // r[ctrl.nodeclaim.anchor-bulk+2]: the FIRST claim is the
             // anchor at `(chunk, max_m, disk_per)` so the largest
             // single intent's mem is covered; bulk claims (k>0) use
             // `Σm/n`. Without the anchor, `[{32c,200Gi},{32c,2Gi}×7]`

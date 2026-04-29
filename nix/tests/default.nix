@@ -759,9 +759,9 @@ in
   #
   # r[verify ctrl.nodeclaim.ffd-sim]
   # r[verify ctrl.nodeclaim.shim-nodepool]
-  # r[verify ctrl.nodeclaim.anchor-bulk]
+  # r[verify ctrl.nodeclaim.anchor-bulk+2]
   # r[verify ctrl.nodeclaim.priority-bucket]
-  # r[verify ctrl.nodeclaim.placeable-gate]
+  # r[verify ctrl.nodeclaim.placeable-gate+2]
   vm-sla-sizing-kwok = forecast-provisioning {
     inherit pkgs common;
     fixture = k3sFull {

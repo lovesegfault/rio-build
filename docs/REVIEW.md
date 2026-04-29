@@ -202,6 +202,15 @@ dimension `override_.tier` changes the debounced predicate (emit
 decision) without changing the coarser key → two overrides on one
 `mkh` race for one suppress slot.
 
+**Per-item Vec → per-group RPC.** When a per-item Vec crosses an RPC
+and the consumer treats each entry as a per-group event, dedup at the
+SOURCE. r24 mb_076: `health::reap_unhealthy` pushed `cell` once per
+ICE'd NodeClaim (per-item); scheduler's `handle_ack_spawned_intents`
+looped calling `ice.mark()` per entry (treats as per-cell event). 8
+claims ICE → step 0→7 in one tick, skipping the documented `60s→120s→…`
+ladder. Close: `BTreeSet` collect at the producer; the consumer's loop
+is then per-group by construction.
+
 **Model-key axes in cross-crate consumers.** A function that queries
 by a subset of `ModelKey`'s axes (e.g. `(pname, system)` without
 `tenant`) and then looks up a per-ModelKey cache is a finding. Close:
@@ -245,6 +254,17 @@ and `persist` (10-min refresh) both ran unconditionally, so a
 Spot→Static config switch silently served months-old EMA prices
 forever. Close: the type that owns the read knows the mode.
 
+**Lease-transition edges.** Absence-of-a-writer also breaks on the
+X→¬X transition. r24 mb_061: `PlaceableGate` "unarmed on standby" was
+true for a FRESH standby (initial `None`) but not an EX-LEADER (still
+`Some(stale)`); `on_lose()` only emitted a metric. The ex-leader's
+un-gated Pool reconciler then ran `reap_excess_pending` against a
+frozen set and mass-deleted the new leader's Jobs. Close: the
+`on_acquire`/`on_lose` hooks list every piece of in-memory state and
+reset/reload each. Done-gate: a test that flips `is_leader()`
+true→false→true and asserts each state field is at its
+acquire-time/lose-time value.
+
 ## Override-coherence
 
 **Grep-hook:** a field overwrite on a solve/fit return struct AFTER
@@ -256,6 +276,17 @@ bug_033: `forced_mem` overlaid AFTER `solve_full` returned
 `node_affinity` menu-checked at fit-mem → pod `requests.memory=200Gi`
 with affinity over cells topping at 96Gi. Close: thread the override
 INTO the solve, OR route to the override-aware path (the gate).
+
+**F-tail cross-consumer sweep.** When N parallel batches each add an
+override field/gate, integration validation includes a cross-consumer
+sweep — per-batch tests verify their OWN consumer; the integration
+done-gate verifies the OTHERS. r24 mb_053: F2 added `p*_secs`/
+`capacity` to `ResolvedTarget`; the new ad-hoc-tier arm in `intent_for`
+read them; three sibling consumers (`explain`, SlaPrediction, the
+`Some(memo)` capacity arm) open-coding the same ResolvedTarget→tier
+projection did not. Close: per-batch verifier `rg <new-field>` over all
+consuming crates; the integration done-gate names one VM-test smoke per
+affected fixture path.
 
 ## Witness-flag completeness
 
@@ -363,6 +394,17 @@ no change", which any hash satisfies. The noise half MUST use a value
 that differs in storage representation but lands in the same quantum;
 the signal half MUST cross a quantum boundary.
 
+**Integer-grid alignment is vacuous.** A test of a windowed/stepped
+algorithm whose fixture is integer-aligned with the step grid passes
+against a degenerate finite-difference. r24 mb_065: `na_lambda(t,
+dt=1.0)` was `H(t+1)−H(t)`, non-zero only when an event lands in
+`(t,t+1]`; the test's `(21..=30).map(f64::from)` perfectly aligned
+every 1s window. With production floats `[25.3, 47.1, 80.9]` every
+window starting at `floor=20` was empty → `consolidate_after = floor`
+regardless of arrival rate. Close: stepped-algorithm tests use
+non-integer-aligned fixtures; the assertion is `> floor`, not `==
+expected`.
+
 ## Model-formula reimplementation
 
 Any consumer that evaluates `T(c)`, `M(c)`, or another `sla::types`
@@ -383,6 +425,36 @@ such site is a finding to add a `t_ref_at` field to
 `DurationFit::t_at` clamps `c.min(p̄)` for Capped/Usl. For samples at
 `c > p̄` the open-coded formula under-predicts by `c/p̄`, projecting
 as spurious per-h spread → false-FAIL of the §13a GO gate.
+
+## Simulator-shares-accounting
+
+A simulator that claims to "predict what scheduler X will do" MUST
+share X's accounting code, not reimplement it. r24 Cluster B:
+`ffd::simulate` (mod doc: "predicts what the real scheduler will do")
+fit-checked raw `i.disk_bytes` while `apply_intent_resources` stamped
+`pod_ephemeral_request(disk_bytes, headroom, fuse_cache)` — a unit
+mismatch across one normalization boundary. Four divergences in one
+round (raw disk, terminal-phase pods counted, intent's own bound pod
+blocks self, Fetcher gated on builder capacity) all stem from "FFD
+reimplements the pod-request triple". Close: extract
+`intent_pod_footprint(i) -> (cores, mem, ephemeral)`; FFD,
+`apply_intent_resources`, and `cover_deficit` all call it. Done-gate:
+`rg '<raw-field>' <simulator-file>` = 0 (simulator never reads raw)
+PLUS a round-trip test `parse(stamp(i)) == footprint(i)`.
+
+## Deletion-field-enumeration
+
+When deleting a template/loop that produced N output fields, the
+replacement carries an explicit checklist of all N. r24 mb_002: B3
+deleted the band-loop NodePool template (stamped: labels, node-role,
+hw-band/storage, **nodeClassRef-per-storage**, **taints**,
+requirements, instance-size partition). `cover::build_nodeclaim`
+carried 5 of 7; nodeClass and taints dropped. The replacement's
+doc-comment enumerated what WAS carried, not what the deleted template
+HAD — so the gap was invisible at review. Close: before deleting,
+`rg --context 3 <loop-body>` and list every output field; the
+replacement's doc-comment is THAT list with ✓/✗ per field. Done-gate:
+a unit test asserts every ✓ field on the replacement's output.
 
 ## Simplex-bound
 

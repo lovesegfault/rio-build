@@ -460,14 +460,14 @@ before forecast, large before small), bin-select `MostAllocated` on
 the `allocatable` divisor — so the deficit is the unplaced residual
 and matches the `schedulerName: kube-build-scheduler` instance.
 
-r[ctrl.nodeclaim.anchor-bulk]
-Unplaced intents per `(h,cap)` cell are covered by `1×anchor`
-(smallest type fitting `max_U(c*,M,D)`) plus
-`⌈(Σc* − anchor.cores)/bulk.cores⌉ × bulk` (cheapest \$/core type
-meeting `median_U(M/c*)`). NodeClaim creation is capped at
-`sla.maxNodeClaimsPerCellPerTick` and the `sla.maxFleetCores` budget;
-cells are iterated round-robin from a rotating start so no cell
-starves under sustained pressure.
+r[ctrl.nodeclaim.anchor-bulk+2]
+Unplaced intents per `(h,cap)` cell are covered by `1×anchor` at
+`(chunk, max_U M, max_U D_eph)` — `chunk = min(Σc*, maxCores)` already
+dominates `max_U c*`, so memory is the load-bearing anchor dimension —
+plus `⌈(Σc* − chunk)/chunk⌉ × bulk` at `(chunk, Σm/n, max_U D_eph)`.
+NodeClaim creation is capped at `sla.maxNodeClaimsPerCellPerTick` and
+the `sla.maxFleetCores` budget; cells are iterated round-robin from a
+rotating start so no cell starves under sustained pressure.
 
 r[ctrl.nodeclaim.lead-time-ddsketch]
 `lead_time[h,cap] = q_0.9(boot − eta_error)` is read from a sliding
@@ -478,14 +478,15 @@ the closed-loop `forecast_warm_hit_ratio` Schmitt widens/narrows the
 quantile by `Δq=0.02` per firing, capped at `q ≤ 0.99` and
 `lead_time ≤ sla.maxLeadTime`.
 
-r[ctrl.nodeclaim.consolidate-na]
+r[ctrl.nodeclaim.consolidate-na+2]
 An empty NodeClaim is kept while
 `λ(t)·𝔼[c_arrival·𝟙{c_arrival ≤ cores}] > cores/q_0.5(boot[h,cap])`.
-The hazard `λ(t)` is the Nelson–Aalen estimate over right-censored
-`idle_gap[h,cap]`; the fitting-core term is the current tick's
-per-cell mean over `intents` (defined as 0 when intents is ⊥ or
-empty). A floor `consolidate_after ≥ q_0.5(boot)/2` prevents a
-transient lull from collapsing to always-delete.
+`λ(t)` is the windowed empirical arrival rate over `[t, t+W)` (window
+`W = q_0.5(boot)/2 ≥ 5s`) on right-censored `idle_gap[h,cap]`; the
+fitting-core term is the current tick's per-cell mean over `intents`
+(defined as 0 when intents is ⊥ or empty). A floor
+`consolidate_after ≥ q_0.5(boot)/2` prevents a transient lull from
+collapsing to always-delete.
 
 r[ctrl.nodeclaim.shim-nodepool]
 A single shim NodePool (`limits:{cpu:0}`,
@@ -501,13 +502,16 @@ Builder pods MUST set `priorityClassName=rio-builder-prio-{⌊log₂c*⌋}`
 `preemptionPolicy:Never`) and `schedulerName=kube-build-scheduler`. Config-load
 asserts `maxCores < 1024`.
 
-r[ctrl.nodeclaim.placeable-gate]
-When `nodeclaim_pool.enabled`, the Pool reconciler creates Jobs only
-for intents the nodeclaim_pool reconciler's last FFD simulation placed
-on a `Registered=True` NodeClaim. The §13a `ready` retain is replaced;
-Job count is bounded by Registered-node capacity, not Ready-set size.
-An unarmed gate (no FFD tick yet) is fail-closed for both spawn and
-reap.
+r[ctrl.nodeclaim.placeable-gate+2]
+For Builder pools, the Pool reconciler creates Jobs only for intents
+the nodeclaim_pool reconciler's last FFD simulation placed on a
+`Registered=True` NodeClaim. The §13a `ready` retain is replaced; Job
+count is bounded by Registered-node capacity, not Ready-set size. An
+unarmed gate (no FFD tick yet) is fail-closed for both spawn and reap.
+The gate does NOT apply to Fetcher pools (they schedule onto the
+independent `rio-fetcher` NodePool) or when the NodeClaim CRD is
+absent (the controller probes at startup; absent ⇒ static-node
+cluster, gate is pass-through).
 
 ## Build CRD (removed)
 

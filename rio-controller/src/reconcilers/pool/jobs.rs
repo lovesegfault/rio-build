@@ -327,7 +327,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                 (Vec::new(), Some(e.to_string()))
             }
         };
-    // r[impl ctrl.nodeclaim.placeable-gate]
+    // r[impl ctrl.nodeclaim.placeable-gate+2]
     // ADR-023 §13b placeable gate: Builder Jobs spawn only for intents
     // the nodeclaim_pool reconciler's last FFD sim placed on a
     // `Registered=True` NodeClaim — structurally closes the spawn-
@@ -1627,7 +1627,7 @@ mod tests {
         assert_eq!(f.priority_class_name, None);
     }
 
-    // r[verify ctrl.nodeclaim.placeable-gate]
+    // r[verify ctrl.nodeclaim.placeable-gate+2]
     /// `PlaceableGate::retain` filters to the FFD-placed-on-Registered
     /// set; unarmed gate clears + returns `false` so `queued_known =
     /// None` (fail-closed reap).
@@ -1650,7 +1650,7 @@ mod tests {
         assert!(v.is_empty());
     }
 
-    // r[verify ctrl.nodeclaim.placeable-gate]
+    // r[verify ctrl.nodeclaim.placeable-gate+2]
     /// The spawn-intent fan-out close in unit-test form: 1226 Ready
     /// intents, FFD placed 9 on Registered nodes → only 9 survive the
     /// gate. Pre-B12 (`ready` retain) all 1226 would mint Pending Jobs;

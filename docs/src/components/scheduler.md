@@ -182,6 +182,9 @@ r[sched.admin.delete-tenant]
 r[sched.admin.spawn-intents]
 `AdminService.GetSpawnIntents` returns one `SpawnIntent` per Ready derivation, optionally filtered server-side by `{kind, systems, features}`. `intent_id == drv_hash`; `(cores, mem_bytes, disk_bytes, deadline_secs)` are computed by `solve_intent_for` so the controller spawns and the scheduler dispatches the SAME shape. `queued_by_system` carries the unfiltered per-system Ready breakdown (sum == `ClusterStatus.queued_derivations`) for the ComponentScaler's predictive signal.
 
+r[sched.admin.hung-node-detector]
+`GetSpawnIntents.dead_nodes` is populated from the executor heartbeat table: a Node is reported dead when ≥`max(3, ⌈0.5·occupancy⌉)` of its bound executors have stale heartbeats AND those executors span ≥2 distinct tenants. The two-tenant floor distinguishes a hung Node (kernel softlockup, EBS stall, OOM-killed kubelet) from one tenant's misbehaving build. The controller's `nodeclaim_pool::reap_unhealthy` consumes this as `ReapReason::Dead` — the only reap path for a `Registered=True` NodeClaim that is neither `Empty` nor in-flight.
+
 r[sched.dispatch.soft-features]
 The scheduler MUST strip every feature listed in `soft_features` (scheduler.toml) from each derivation's `requiredSystemFeatures` at DAG-insertion time, before any spawn-snapshot or dispatch decision reads it. nixpkgs convention treats `big-parallel` and `benchmark` as capability hints --- any builder qualifies --- unlike `kvm` / `nixos-test` which are hardware gates. Without stripping, a `{big-parallel}`-only derivation passes the `r[sched.admin.spawn-intents.feature-filter]` subset check against the kvm pool (the only pool advertising `big-parallel`) and fails it against every featureless pool, so the controller spawns `.metal` for firefox/chromium while regular builders sit idle (I-204). Empty `soft_features` (the default) preserves pre-I-204 behavior.
 

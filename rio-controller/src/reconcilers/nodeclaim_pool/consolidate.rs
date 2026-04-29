@@ -1,9 +1,10 @@
-//! Nelson-Aalen idle-node consolidation.
+//! Windowed-rate idle-node consolidation.
 //!
 //! Per `r[ctrl.nodeclaim.consolidate-na]`: an empty Registered NodeClaim
-//! is kept while `λ(t)·𝔼[c_arr·𝟙{≤cores}] > cores/q_0.5(boot)`; λ via
-//! Nelson-Aalen on right-censored `idle_gap` events. The first `t` at
-//! which the inequality flips false is `consolidate_after(t)` —
+//! is kept while `λ(t)·𝔼[c_arr·𝟙{≤cores}] > cores/q_0.5(boot)`; λ is
+//! the windowed empirical arrival rate over `[t, t+W)` on
+//! right-censored `idle_gap` events (W = `q_0.5(boot)/2`). The first
+//! `t` at which the inequality flips false is `consolidate_after(t)` —
 //! floored at `q_0.5(boot)/2` so a transient lull can't collapse to
 //! always-delete.
 
@@ -59,7 +60,7 @@ pub struct IdleGapEvent {
 /// regardless of arrival rate. The windowed form is non-zero as long
 /// as any uncensored event falls within `boot_median/2` of `t`. Step
 /// `w/2` keeps overlapping coverage.
-// r[impl ctrl.nodeclaim.consolidate-na]
+// r[impl ctrl.nodeclaim.consolidate-na+2]
 pub fn consolidate_after(
     events: &[IdleGapEvent],
     e_fitting_cores: f64,
@@ -279,9 +280,9 @@ mod tests {
         assert_eq!(consolidate_after(&cens, 100.0, 8, 10.0, None), 5.0);
     }
 
-    /// r[ctrl.nodeclaim.consolidate-na]: floor = q_0.5(boot)/2. With
+    /// r[ctrl.nodeclaim.consolidate-na+2]: floor = q_0.5(boot)/2. With
     /// no events (λ=0), break-even fires immediately → returns floor.
-    // r[verify ctrl.nodeclaim.consolidate-na]
+    // r[verify ctrl.nodeclaim.consolidate-na+2]
     #[test]
     fn consolidate_after_respects_floor() {
         // boot_median=40 → floor=20. λ=0 → immediate break-even → 20.
