@@ -648,7 +648,21 @@ impl NodeClaimPoolReconciler {
         let cover = self.cover_deficit(&unplaced, &live, &masked).await?;
         debug!(created = cover.created.len(), "deficit cover");
         self.inflight_created.extend(cover.created.iter().cloned());
-        self.report_unfulfillable(&ice_cells, &registered_cells, observed_types)
+        // Kube-authoritative `intent_id → spec.nodeName` for the
+        // scheduler's hung-node detector. Full set every tick (one
+        // entry per bound builder pod) so the scheduler's
+        // `authoritative_node` map stays current without delta
+        // tracking; cardinality is O(active builds).
+        let bound_intents = self
+            .pod_requested
+            .bound_intents()
+            .into_iter()
+            .map(|(intent_id, node_name)| rio_proto::types::BoundIntent {
+                intent_id,
+                node_name,
+            })
+            .collect();
+        self.report_unfulfillable(&ice_cells, &registered_cells, observed_types, bound_intents)
             .await?;
 
         consolidate::reap_idle(
@@ -938,8 +952,13 @@ impl NodeClaimPoolReconciler {
         ice_cells: &[Cell],
         registered_cells: &[Cell],
         observed_types: Vec<rio_proto::types::ObservedInstanceType>,
+        bound_intents: Vec<rio_proto::types::BoundIntent>,
     ) -> anyhow::Result<()> {
-        if ice_cells.is_empty() && registered_cells.is_empty() && observed_types.is_empty() {
+        if ice_cells.is_empty()
+            && registered_cells.is_empty()
+            && observed_types.is_empty()
+            && bound_intents.is_empty()
+        {
             return Ok(());
         }
         // BTreeSet dedup: `health::reap_unhealthy`/`detect_vanished`
@@ -960,6 +979,7 @@ impl NodeClaimPoolReconciler {
             unfulfillable_cells: dedup(ice_cells),
             registered_cells: dedup(registered_cells),
             observed_instance_types: observed_types,
+            bound_intents,
         };
         if let Err(e) = admin_call(self.admin.clone().ack_spawned_intents(req)).await {
             warn!(error = %e, "ack_spawned_intents (unfulfillable/registered) failed");
