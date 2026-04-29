@@ -75,6 +75,22 @@ in too many heads.
   future caller cannot construct an input the doc doesn't describe.
   r8 bug_003: `resolve_h_explore` claimed `pool ⊆ H\A\{cheapest}` at
   three doc sites; the caller's else-branch built `H\A`.
+- **Restructure inputs/outputs** (r25 mb_009 → `cover::sizing`):
+  STRIKE-3 on a fold-then-consume shape means the SIGNATURE is wrong,
+  not the body. `cover_deficit` read a `sum_deficit -> (Σc, Σm, max_m,
+  max_d, max_h, min_eta)` tuple then open-coded the per-claim loop;
+  three rounds, three "one tuple element computed/consumed wrong" bugs
+  (r24-mb_024 no anchor → R24B0b `max_m` anchor → r25-mb_009 anchor
+  breaks `max_m<mp` inverse + `max_d` doesn't stack). Close: replace
+  `(fold→tuple) + (loop over tuple)` with `(map→Vec<result>)` — the
+  intermediate is gone, so per-element bugs can't recur. The unit
+  invariant uses the production consumer as oracle (`ffd::simulate`
+  over the output asserts `unplaced.is_empty()`), NOT a hand-stated
+  predicate: r25's plan-validation proposed `∀i∃k:out[k]≥footprint(i)`
+  AND a sort-desc body; the FFD-oracle proptest refuted both before
+  ship (the predicate permits same-k for multiple i; sort-desc fails
+  because production FFD sorts by *cores*, so a mem-outlier with low
+  cores lands last on a core-exhausted bin).
 
 A new review rule MAY accompany the type-check (so first-strike on a
 *different* invariant is caught) — but the type-check is the close,
@@ -135,6 +151,34 @@ jobs.rs:460-465 (A18 note); the stale `pending_intents`/`or_insert`/
 `hw_fallback` block at :422-434 — 30 lines above — was untouched. The
 done-gate `rg` was scoped to `rio-scheduler/`; the controller-side
 comment was invisible.
+
+## Verifier-one-step-removed
+
+A verifier that confirms "the bughunter's claim X is refuted" can miss
+"the fix introduces X′ one step removed" — the inverse case, the next
+lifecycle phase, the sibling field, the second consumer.
+
+**Why:** r25: 8/12 r24-regressions were behavioral bugs *introduced
+by* r24's closes, each verified by a per-batch agent prompted to
+refute the original claim. mb_001a "fires once" is the inverse of
+"never fires"; mb_009 `max_m<mp` is the inverse of `max_m>mp`; mb_034
+retry-reuse is the next-phase of self-evict; bug_039 arch is the
+sibling-of capacity-type; bug_033 capacity-reject is the sibling-of
+price-return; bug_040 swap-order; bug_029 N+1th writer; bug_031
+wrong-predicate. r24's verifiers checked "is the diff what was asked"
+and "is the original claim refuted" — neither is "did we just create
+the same §-shape one step over".
+
+**Verifier prompt addendum:** after confirming the original claim, ask
+"does the fix introduce the SAME REVIEW.md §-pattern at: (a) the
+inverse input case, (b) the next lifecycle transition, (c) a sibling
+field/consumer of the changed one?" Each (a)/(b)/(c) gets one
+walked-through example, not a yes/no. r25's plan-validation added a
+dedicated one-step-removed checker alongside arch/correct/complete;
+it caught both major design errors before dispatch — `cover::sizing`
+core-only `n` over-asks on mem (the inverse of under-asks), and
+dropping `MenuNoFit` removes the only per-cell capacity gate (the fix
+replaced a bad SOURCE with no gate instead of a configured gate).
 
 ## Partition-single-source
 
@@ -264,6 +308,24 @@ frozen set and mass-deleted the new leader's Jobs. Close: the
 reset/reload each. Done-gate: a test that flips `is_leader()`
 true→false→true and asserts each state field is at its
 acquire-time/lose-time value.
+
+**Edge-reload latches on Ok only.** The reload pattern is `if
+flag.load() { match load() { Ok(s) => { state = s; flag.store(false)
+} Err => { warn; /* flag stays set; retry next tick */ } } }` — NOT
+`flag.swap(false)` before the load attempt. r25 bug_040: controller
+`reload.swap(false)` then `if let Ok` — `Err` is silently dropped,
+flag cleared, no retry, and the next tick `persist()`s the stale
+standby snapshot over the previous leader's accumulated state. The
+same PR's `poller_tick_prelude` (cost.rs) did it correctly with a
+regression test; the controller-side mirror 100 lines away did not. On
+`Err`, the tick body runs (degraded service beats no service —
+`continue` would halt provisioning entirely), but `persist()` is gated
+on `!flag.load()` so degraded-mode never overwrites PG. r25 bug_029:
+new `cost_table` writer added without joining the `was_leader`
+protocol — its writes during the acquire→reload window were clobbered.
+Done-gate for new shared-state writers: `rg` the state's edge-reload
+doc-comment for the writer enumeration; if the new writer isn't there,
+it doesn't participate.
 
 ## Override-coherence
 
@@ -405,6 +467,18 @@ regardless of arrival rate. Close: stepped-algorithm tests use
 non-integer-aligned fixtures; the assertion is `> floor`, not `==
 expected`.
 
+**Same-value-to-both-sides is vacuous.** A round-trip test
+`assert_eq!(f(x, p), g(x, p))` where the test PASSES the SAME `p` to
+both sides cannot detect input-source divergence — it verifies the
+formula, not that production callers agree on inputs. r25 mb_035:
+`footprint_matches_stamped_requests` called `intent_pod_footprint(&i,
+pod::fuse_cache_bytes(&pool))` and compared against the stamped pod
+(which also reads `pool`). Production FFD reads `cfg.fuse_cache_bytes`
+from controller.toml — a different config path that the test never
+touched. Close: the test reads `p` from each side's PRODUCTION source;
+if those sources can't be exercised in a unit test, that IS the signal
+to single-source.
+
 ## Model-formula reimplementation
 
 Any consumer that evaluates `T(c)`, `M(c)`, or another `sla::types`
@@ -442,6 +516,18 @@ reimplements the pod-request triple". Close: extract
 `rg '<raw-field>' <simulator-file>` = 0 (simulator never reads raw)
 PLUS a round-trip test `parse(stamp(i)) == footprint(i)`.
 
+**A free parameter defeats the share.** Extracting `f(x, p)` where
+production callers pass DIFFERENT `p` is the same divergence with
+extra ceremony. r25 mb_035: `intent_pod_footprint(i, fuse)` was the
+r24 close above; `apply_intent_resources` passed
+`pod::fuse_cache_bytes(pool)` (per-Pool CRD), FFD/cover passed
+`cfg.fuse_cache_bytes` (controller.toml scalar). The chart supports
+per-pool overrides; controller.toml doesn't see them. The
+`footprint_matches_stamped_requests` round-trip test passed because it
+substituted the SAME `fuse` into both sides — see §Stability-tests.
+Close: either `f(x)` (parameter resolved inside from a single source),
+OR a boot-time assertion that all production sources of `p` agree.
+
 ## Deletion-field-enumeration
 
 When deleting a template/loop that produced N output fields, the
@@ -455,6 +541,31 @@ HAD — so the gap was invisible at review. Close: before deleting,
 `rg --context 3 <loop-body>` and list every output field; the
 replacement's doc-comment is THAT list with ✓/✗ per field. Done-gate:
 a unit test asserts every ✓ field on the replacement's output.
+
+## Threat-model surface review
+
+Any new field crossing the worker→scheduler (or builder→scheduler)
+boundary MUST be checked against the "worker is NOT trusted" model
+BEFORE landing — specifically: is the field's value used in (a)
+authorization, (b) cross-tenant resource decisions, (c) destructive
+cluster actions? If yes to any, the value MUST come from the
+controller (kube-sourced) or be in the HMAC-signed `ExecutorClaims`,
+NOT from the worker's request payload.
+
+**Why:** r25 bug_021: R24B6b added `HeartbeatRequest.node_name` and
+`detect_hung_nodes` grouped by it → drives NodeClaim deletion
+(cross-tenant + destructive). Two colluding tenants could forge
+`node_name=<victim>` on ≥4 executors then go silent, causing the
+controller to delete the victim's NodeClaim and drain other tenants'
+in-flight builds. Neither implementer nor verifier checked the field
+against `ExecutorClaims`' "worker is NOT trusted" doc 50 lines away.
+
+**Close:** new worker-supplied fields default to "untrusted; route from
+controller". The controller already has the kube-authoritative
+`intent_id → spec.nodeName` binding via `PodRequestedCache`; ship that
+in `AckSpawnedIntents` instead of trusting the worker. Done-gate: `rg
+<new-field> rio-auth/src/hmac.rs` — if it's not in claims, the
+reviewer asks "what destructive action reads this?"
 
 ## Simplex-bound
 
