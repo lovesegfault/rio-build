@@ -40,7 +40,9 @@ use tracing::{debug, info, instrument, warn};
 
 use rio_crds::karpenter::NodeClaim;
 use rio_lease::LeaderState;
-use rio_proto::types::{GetSpawnIntentsRequest, GetSpawnIntentsResponse, SpawnIntent};
+use rio_proto::types::{
+    AckSpawnedIntentsRequest, GetSpawnIntentsRequest, GetSpawnIntentsResponse, SpawnIntent,
+};
 
 use crate::reconcilers::node_informer::HwClassConfig;
 use crate::reconcilers::{AdminClient, admin_call};
@@ -375,14 +377,27 @@ impl NodeClaimPoolReconciler {
             "FFD simulation"
         );
 
-        let cover = self
-            .cover_deficit(&unplaced, &live, &intents.ice_masked_cells)
-            .await?;
+        let now = now_epoch();
+        // Reap unhealthy/ICE BEFORE cover_deficit so cells that just
+        // hit ICE this tick are masked in the same tick's cover (don't
+        // immediately re-create what we just deleted).
+        let ice_cells = health::reap_unhealthy(
+            &self.nodeclaims,
+            &live,
+            &intents.dead_nodes,
+            &self.sketches,
+            &self.cfg,
+            now,
+        )
+        .await?;
+        let mut masked: Vec<String> = intents.ice_masked_cells.clone();
+        masked.extend(ice_cells.iter().map(Cell::to_string));
+
+        let cover = self.cover_deficit(&unplaced, &live, &masked).await?;
         debug!(created = cover.created.len(), "deficit cover");
-        self.report_unfulfillable(&cover.ice_cells, &registered_cells)
+        self.report_unfulfillable(&ice_cells, &registered_cells)
             .await?;
 
-        let now = now_epoch();
         consolidate::reap_idle(
             &self.nodeclaims,
             &live,
@@ -390,13 +405,6 @@ impl NodeClaimPoolReconciler {
             &mut self.sketches,
             &self.cfg,
             now,
-        )
-        .await?;
-        health::reap_unhealthy(
-            &self.nodeclaims,
-            &live,
-            &intents.dead_nodes,
-            &mut self.sketches,
         )
         .await?;
 
@@ -423,9 +431,12 @@ impl NodeClaimPoolReconciler {
             now,
         )
         .await?;
-        // No `dead_nodes` signal without the scheduler; B11's local
-        // ICE-timeout detection still runs on `live`.
-        health::reap_unhealthy(&self.nodeclaims, &live, &[], &mut self.sketches).await?;
+        // No `dead_nodes` signal without the scheduler; local
+        // ICE-timeout detection still runs on `live`. The returned
+        // ice_cells are dropped — `report_unfulfillable` needs the
+        // scheduler reachable.
+        health::reap_unhealthy(&self.nodeclaims, &live, &[], &self.sketches, &self.cfg, now)
+            .await?;
         self.sketches.persist(&self.pg).await?;
         Ok(())
     }
@@ -543,27 +554,32 @@ impl NodeClaimPoolReconciler {
             }
             created_cores += anchor.cores + (n - 1) * bulk.cores;
         }
-        // TODO(B11): populate `ice_cells` from this tick's
-        // `Launched=False` / Registered-timeout observations.
-        Ok(CoverResult {
-            created,
-            ice_cells: Vec::new(),
-        })
+        Ok(CoverResult { created })
     }
 
-    /// Report cells where NodeClaim creation hit ICE (Launched=False or
-    /// Registered timeout) back to the scheduler via
-    /// `AckSpawnedIntents.unfulfillable_cells`, and cells that
-    /// successfully registered via `registered_cells` (the ICE-clear
-    /// signal).
-    // TODO(B11): wire `AckSpawnedIntentsRequest`. No-op until B11
-    // populates `ice_cells`.
+    /// Report this tick's ICE-hit cells (`unfulfillable_cells`) and
+    /// `Registered=True` edges (`registered_cells`) to the scheduler
+    /// via `AckSpawnedIntents`. The scheduler's ICE backoff ladder
+    /// marks/clears each. `spawned` is empty: the legacy `Pool`
+    /// reconciler still owns Job-creation acks until B12 routes pods
+    /// here. RPC failure is warned + dropped (next tick retries; the
+    /// scheduler also has its first-heartbeat clear path).
     async fn report_unfulfillable(
         &self,
         ice_cells: &[Cell],
         registered_cells: &[Cell],
     ) -> anyhow::Result<()> {
-        let _ = (ice_cells, registered_cells);
+        if ice_cells.is_empty() && registered_cells.is_empty() {
+            return Ok(());
+        }
+        let req = AckSpawnedIntentsRequest {
+            spawned: vec![],
+            unfulfillable_cells: ice_cells.iter().map(Cell::to_string).collect(),
+            registered_cells: registered_cells.iter().map(Cell::to_string).collect(),
+        };
+        if let Err(e) = admin_call(self.admin.clone().ack_spawned_intents(req)).await {
+            warn!(error = %e, "ack_spawned_intents (unfulfillable/registered) failed");
+        }
         Ok(())
     }
 }
@@ -573,9 +589,6 @@ impl NodeClaimPoolReconciler {
 pub(crate) struct CoverResult {
     /// NodeClaim names created this tick.
     pub created: Vec<String>,
-    /// Cells where create hit ICE this tick (fed to
-    /// `report_unfulfillable`).
-    pub ice_cells: Vec<Cell>,
 }
 
 /// Connect the reconciler's PG pool. Separate from the scheduler/store
@@ -629,7 +642,6 @@ mod tests {
     fn cover_result_default_empty() {
         let r = CoverResult::default();
         assert!(r.created.is_empty());
-        assert!(r.ice_cells.is_empty());
     }
 
     type MenuLit = (u32, u64, u64, f64);
