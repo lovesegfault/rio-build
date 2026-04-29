@@ -155,6 +155,12 @@ impl CellSketches {
         self.cells.get(cell)
     }
 
+    /// Convenience: `cell`'s current provisioning lead-time (seconds).
+    /// Unknown cell → 0 (cold start; B9's seed overlays).
+    pub fn lead_time(&self, cell: &Cell) -> f64 {
+        self.get(cell).map_or(0.0, CellState::lead_time)
+    }
+
     /// Load all rows from `nodeclaim_cell_state`. Unknown sketch
     /// versions decode to an empty sketch (B9's seed overlays).
     /// Unknown `capacity_type` rows are skipped + warned (would

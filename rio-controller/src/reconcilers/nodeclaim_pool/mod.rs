@@ -44,7 +44,7 @@ use rio_proto::types::{GetSpawnIntentsRequest, GetSpawnIntentsResponse};
 use crate::reconcilers::{AdminClient, admin_call};
 
 pub use consolidate::IdleGapEvent;
-pub use ffd::{LiveNode, Placement};
+pub use ffd::{CAPACITY_TYPE_LABEL, HW_CLASS_LABEL, LiveNode, Placement, a_open, cells_of};
 pub use sketch::{CapacityType, Cell, CellSketches, CellState};
 
 /// Reconcile interval. Matches the Pool reconciler's `GetSpawnIntents`
