@@ -230,12 +230,19 @@ pub struct DagActor {
     log_buffers: Option<Arc<crate::logs::LogBuffers>>,
     /// Connected workers.
     executors: HashMap<ExecutorId, ExecutorState>,
-    /// Last [`detect_hung_nodes`](snapshot::detect_hung_nodes) result,
-    /// computed in `handle_tick` BEFORE `tick_check_heartbeats` (which
-    /// removes stale executors using the same predicate). The 10s
-    /// `GetSpawnIntents` poll reads this cache; computing on-demand
-    /// would always see an already-cleaned `executors` map.
-    hung_nodes: Vec<String>,
+    /// Hung-node names → last-detected-at, populated in `handle_tick`
+    /// BEFORE `tick_check_heartbeats` (which removes stale executors
+    /// using the same predicate). The controller's `dead_reap_cap`
+    /// rate-limits reaps, so a node must repeat across polls until the
+    /// controller gets to it — `tick_check_heartbeats` removes the
+    /// stale executors after detection, so a `Vec` recomputed each
+    /// tick would be a one-shot signal that drops N−cap nodes on AZ
+    /// outage. `handle_tick` `.insert(n, now)`s each (re-)detection
+    /// (refreshing the timestamp) and prunes entries no longer in
+    /// `authoritative_node` AND older than
+    /// [`housekeeping::HUNG_NODE_REPEAT_TTL`] since last detected.
+    /// `compute_spawn_intents` reads `keys()`.
+    pub(crate) hung_nodes: HashMap<String, Instant>,
     /// Kube-authoritative `drv_hash → spec.nodeName` from the
     /// controller's pod informer (`AckSpawnedIntents.bound_intents`).
     /// `detect_hung_nodes` groups by this instead of any worker-supplied
@@ -244,7 +251,7 @@ pub struct DagActor {
     /// NodeClaim, `r[sched.admin.hung-node-detector+2]`). Full set
     /// every controller tick; swept on Tick to drop entries for drvs
     /// no longer in the DAG.
-    authoritative_node: HashMap<DrvHash, String>,
+    pub(crate) authoritative_node: HashMap<DrvHash, String>,
     /// Executors that disconnected mid-build, awaiting the controller's
     /// `ReportExecutorTermination` (k8s OOMKilled/Evicted reason).
     /// `(drv_hash, inserted_at)` — captured before
@@ -550,7 +557,7 @@ impl DagActor {
             events: BuildEventBus::new(plumbing.event_persist_tx, plumbing.log_flush_tx),
             log_buffers: plumbing.log_buffers,
             executors: HashMap::new(),
-            hung_nodes: Vec::new(),
+            hung_nodes: HashMap::new(),
             authoritative_node: HashMap::new(),
             recently_disconnected: HashMap::new(),
             retry_policy: cfg.retry_policy,
@@ -612,26 +619,88 @@ impl DagActor {
     /// was a no-op after the lease acquired). Does NOT touch
     /// `self.executors` — those are live connections, not persisted.
     pub(super) fn clear_persisted_state(&mut self) {
-        self.dag = DerivationDag::new();
-        self.dag.set_soft_features(self.soft_features.clone());
-        self.ready_queue.clear();
-        self.builds.clear();
-        self.events.clear();
+        // Exhaustive destructure so adding a DagActor field is a
+        // compile error here until it's classified as cleared (bind +
+        // mutate below) or retained (`_`-bind). The §Lease-transition-
+        // edges shape — "field not in clear_persisted_state's
+        // enumeration" — recurred (mb_001b: hung_nodes; the same r25
+        // batch then added cost_was_leader/cost_reload_notify without
+        // listing them); a `_`-bind makes the retained-decision
+        // explicit and grep-able, not implicit-by-absence.
+        let Self {
+            dag,
+            ready_queue,
+            builds,
+            events,
+            recently_disconnected,
+            dispatched_cells,
+            hung_nodes,
+            authoritative_node,
+            // Retained: rationale below.
+            log_buffers: _,
+            executors: _,
+            retry_policy: _,
+            poison_config: _,
+            db: _,
+            store_client: _,
+            grpc_timeout: _,
+            substitute_sem: _,
+            cache_breaker: _,
+            sla_estimator: _,
+            sla_tiers: _,
+            sla_ceilings: _,
+            sla_config: _,
+            cost_table: _,
+            cost_was_leader: _,
+            cost_reload_notify: _,
+            ice: _,
+            solve_cache: _,
+            tick_count: _,
+            backpressure_active: _,
+            leader: _,
+            self_tx: _,
+            soft_features,
+            hmac_signer: _,
+            service_signer: _,
+            shutdown: _,
+            freeze_builders_since: _,
+            freeze_fetchers_since: _,
+            unroutable_warned: _,
+            dispatch_dirty: _,
+            probe_generation: _,
+            became_idle_inline_this_tick: _,
+            snapshot_tx: _,
+            #[cfg(test)]
+                recovery_toctou_gate: _,
+            #[cfg(test)]
+                test_counters: _,
+        } = self;
+        *dag = DerivationDag::new();
+        dag.set_soft_features(soft_features.clone());
+        ready_queue.clear();
+        builds.clear();
+        events.clear();
         // `recently_disconnected` is keyed by executor IDs from the
         // previous generation — a stale entry would let a
         // `ReportExecutorTermination` from the previous gen spuriously
         // bump `resource_floor` on a drv this generation never assigned.
-        self.recently_disconnected.clear();
+        recently_disconnected.clear();
         // `dispatched_cells` is keyed on the previous generation's drv
         // hashes; a stale entry would let a heartbeat for a re-spawned
         // pod clear the wrong cell.
-        self.dispatched_cells.clear();
+        dispatched_cells.clear();
+        // `hung_nodes` is a tick-derived snapshot of `executors`; stale
+        // once `executors` evolves. On lose→reacquire, a controller
+        // poll that lands before the first post-reacquire Tick would
+        // otherwise return the pre-lose set and `health::reap_unhealthy`
+        // could delete a recovered node. Empty `dead_nodes` is
+        // fail-closed (no reap).
+        hung_nodes.clear();
         // Snapshot of THIS generation's pod bindings (controller-
         // reported). Stale entries would let `detect_hung_nodes`
         // misattribute a re-dispatched drv to a previous-generation
-        // node. Empty `dead_nodes` is fail-closed (no reap).
-        self.hung_nodes.clear();
-        self.authoritative_node.clear();
+        // node.
+        authoritative_node.clear();
         // Deliberately retained across generations:
         // - `executors`: live connections, not persisted (doc above).
         // - `ice`: cluster-level cell-backoff signal, 60s TTL self-heals.
@@ -640,6 +709,10 @@ impl DagActor {
         // - `solve_cache`: bounded by `sla_estimator`'s live set via the
         //   `on_evict` hook; per-key Schmitt `prev_a` is generation-
         //   independent.
+        // - `cost_table`/`cost_was_leader`/`cost_reload_notify`:
+        //   shared with `interrupt_housekeeping` (the edge-reload
+        //   owner). The actor is a passive reader/gated-writer; the
+        //   lease-transition reload is housekeeping's job.
         // - `tick_count`: harmless counter.
     }
 

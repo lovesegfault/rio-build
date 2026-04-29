@@ -606,7 +606,7 @@ impl DagActor {
                 .iter()
                 .map(crate::sla::config::cell_label)
                 .collect(),
-            dead_nodes: self.hung_nodes.clone(),
+            dead_nodes: self.hung_nodes.keys().cloned().collect(),
         }
     }
 

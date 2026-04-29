@@ -1965,9 +1965,11 @@ async fn test_dispatch_wait_recorded_on_assignment() -> TestResult {
 // clear_persisted_state: per-generation maps
 // ---------------------------------------------------------------------------
 
-/// `clear_persisted_state` clears `recently_disconnected`
-/// (per-generation map). Same-process lose→reacquire would otherwise
-/// carry stale executor IDs into the new generation.
+/// `clear_persisted_state` clears every per-generation map. The
+/// destructure in the body makes a missed field a compile error; this
+/// test makes a new cleared-binding that forgets its `.clear()` a
+/// runtime error. Same-process lose→reacquire would otherwise carry
+/// stale state into the new generation.
 #[tokio::test]
 async fn clear_persisted_state_clears_per_generation_maps() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1977,12 +1979,26 @@ async fn clear_persisted_state_clears_per_generation_maps() {
         "stale-exec".into(),
         ("stale".into(), std::time::Instant::now()),
     );
+    actor
+        .hung_nodes
+        .insert("nA".into(), std::time::Instant::now());
+    actor
+        .authoritative_node
+        .insert("stale-drv".into(), "nA".into());
 
     actor.clear_persisted_state();
 
     assert!(
         actor.recently_disconnected.is_empty(),
         "recently_disconnected must be cleared on leader transition"
+    );
+    assert!(
+        actor.hung_nodes.is_empty(),
+        "hung_nodes (tick-derived) must be cleared on leader transition"
+    );
+    assert!(
+        actor.authoritative_node.is_empty(),
+        "authoritative_node (controller-reported per-generation) must be cleared"
     );
     // Regression: soft_features survives (existing :649 invariant).
     actor.test_inject_ready_with_features("ff", None, "x86_64-linux", &["big-parallel"]);

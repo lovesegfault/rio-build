@@ -20,6 +20,14 @@ use crate::state::{
 
 use super::{DagActor, snapshot};
 
+/// How long a hung-node entry stays in [`DagActor::hung_nodes`] after
+/// its last (re-)detection. The controller's `dead_reap_cap` is
+/// `min(3, ⌈5%·|live|⌉).max(1)` per 10s tick, so 120s gives ≥12
+/// controller ticks ≥ 4×cap drain time at cap=3. After
+/// `tick_check_heartbeats` the source executors are removed, so the
+/// entry won't be re-detected — this TTL is the repeat window.
+pub(super) const HUNG_NODE_REPEAT_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Backstop timeout floor: DEFAULT_DAEMON_TIMEOUT (the worker-side
 /// timeout). A build can't legitimately run longer than this — the
 /// worker would have killed the daemon already. The scheduler-side
@@ -150,12 +158,7 @@ impl DagActor {
         // tick_check_heartbeats removes stale executors, so computing
         // hung_nodes after it (or on-demand at the controller's 10s poll)
         // would always see zero stale entries.
-        self.hung_nodes = snapshot::detect_hung_nodes(
-            &self.executors,
-            now,
-            |h| self.dag.node(h)?.attributed_tenant(&self.builds),
-            |h| self.authoritative_node.get(h).cloned(),
-        );
+        self.tick_hung_nodes(now);
         // Sweep authoritative_node entries whose drv left the DAG
         // (Built / cancelled / poisoned). The controller ships the
         // full bound set every tick so this only matters for the
@@ -249,6 +252,42 @@ impl DagActor {
         for w in self.executors.values_mut() {
             w.last_heartbeat = (w.last_heartbeat + stall).min(now);
         }
+    }
+
+    /// Populate + prune `self.hung_nodes`. Called from `handle_tick`
+    /// BEFORE [`Self::tick_check_heartbeats`] (which removes the stale
+    /// executors the detector reads).
+    ///
+    /// The signal must REPEAT across controller polls until the
+    /// controller has reaped each node — `dead_reap_cap` rate-limits
+    /// reaps, so a one-shot signal drops N−cap nodes (mb_001a). The
+    /// executors are gone after `tick_check_heartbeats` so re-detect
+    /// alone won't repeat; instead, `.insert(n, now)` (refreshing on
+    /// re-detect, not `.entry().or_insert()` which would freeze at
+    /// first-detect and TTL out a still-hung node) and retain entries
+    /// while the node still has bound pods (per controller-reported
+    /// `authoritative_node`) OR is within [`HUNG_NODE_REPEAT_TTL`] of
+    /// last detect — once the controller reaps the NodeClaim its bound
+    /// pods drain, the node leaves `authoritative_node`, and TTL alone
+    /// holds the entry briefly so the controller's confirming poll
+    /// still sees it.
+    pub(crate) fn tick_hung_nodes(&mut self, now: Instant) {
+        for n in snapshot::detect_hung_nodes(
+            &self.executors,
+            now,
+            |h| self.dag.node(h)?.attributed_tenant(&self.builds),
+            |h| self.authoritative_node.get(h).cloned(),
+        ) {
+            self.hung_nodes.insert(n, now);
+        }
+        let live: std::collections::HashSet<&str> = self
+            .authoritative_node
+            .values()
+            .map(String::as_str)
+            .collect();
+        self.hung_nodes.retain(|n, last| {
+            live.contains(n.as_str()) || now.duration_since(*last) < HUNG_NODE_REPEAT_TTL
+        });
     }
 
     /// Scan workers for heartbeat timeouts; disconnect any that have
