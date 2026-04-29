@@ -14,7 +14,6 @@ pub mod componentscaler;
 pub mod gc_schedule;
 pub mod node_informer;
 pub mod nodeclaim_pool;
-pub mod nodepoolbudget;
 // WONTFIX: pub(crate) here ICEs stable rustdoc 1.94.1 ("no resolutions
 // for a doc link" — collect_intra_doc_links). Re-verified 2026-04: still
 // crashes the .#checks.*.doc build. Nightly is fine. Leaf binary; pub-ness

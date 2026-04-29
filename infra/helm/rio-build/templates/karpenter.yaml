@@ -116,7 +116,6 @@ metadata:
   name: rio-builder-{{ $band.name }}-{{ $stor.name }}-{{ $arch.name }}
   labels:
     app.kubernetes.io/part-of: rio-build
-    rio.build/karpenter-budget: shared
 spec:
   weight: 50
   template:
@@ -219,9 +218,6 @@ metadata:
   name: {{ .name }}
   labels:
     app.kubernetes.io/part-of: rio-build
-    {{- if .sharedBudget }}
-    rio.build/karpenter-budget: shared
-    {{- end }}
 spec:
   weight: {{ .weight }}
   template:

@@ -138,15 +138,6 @@ pub fn describe_metrics() {
          (labeled by pool). Non-zero rate = builders stuck unable to self-exit \
          (D-state FUSE wait, OOM-loop); investigate node/kernel health."
     );
-    describe_gauge!(
-        "rio_controller_nodepool_budget_used_millicores",
-        "Σ NodePool.status.resources.cpu across budget-governed pools. \
-         Approaching budget = expect freeze; well over = check why a pool overshot."
-    );
-    describe_gauge!(
-        "rio_controller_nodepool_budget_headroom_millicores",
-        "Shared headroom (budget − used). 0 = frozen (no new node provisioning on governed pools)."
-    );
     describe_counter!(
         "rio_controller_lease_acquired_total",
         "nodeclaim_pool lease acquire transitions. >1 over a short window = leadership churn \

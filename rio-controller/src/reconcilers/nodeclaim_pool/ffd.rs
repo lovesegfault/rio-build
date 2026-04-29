@@ -15,7 +15,6 @@ use rio_crds::karpenter::{NodeClaim, NodeClaimStatus};
 use rio_proto::types::SpawnIntent;
 
 use super::sketch::{CapacityType, Cell, CellSketches};
-use crate::reconcilers::nodepoolbudget::parse_cpu_millis;
 
 /// Karpenter's well-known capacity-type label key. Values: `"spot"` /
 /// `"on-demand"` (NOT the PG/helm `"od"` form — `cap_from_label`
@@ -327,6 +326,41 @@ fn parse_resources(m: &BTreeMap<String, Quantity>) -> (u32, u64, u64) {
     )
 }
 
+/// Parse a Kubernetes CPU Quantity string to millicores.
+/// `"64"` → 64000, `"64000m"` → 64000, `"1.5"` → 1500, `"1k"` →
+/// 1_000_000. Malformed → `warn!` + 0.
+///
+/// Handles all decimal-SI suffixes (`n`/`u`/`m`/`k`/`M`/`G`/`T`/`P`/
+/// `E`). apimachinery's `Quantity.String()` canonicalizes a DecimalSI
+/// value of exactly N×1000 cores as `"Nk"` (rule: largest suffix with
+/// no fractional digits) — Karpenter's `status.allocatable.cpu` is a
+/// `v1.ResourceList` Quantity, so a 1000-core node serializes as `"1k"`.
+/// Binary-SI (`Ki`/`Mi`) is unhandled — never emitted for CPU.
+pub(crate) fn parse_cpu_millis(q: &str) -> u64 {
+    // Suffix → multiplier (cores). Longest first so `"m"` doesn't
+    // shadow nothing-relevant here, but consistent with the idiom.
+    let (num, mult): (&str, f64) = [
+        ("n", 1e-9),
+        ("u", 1e-6),
+        ("m", 1e-3),
+        ("k", 1e3),
+        ("M", 1e6),
+        ("G", 1e9),
+        ("T", 1e12),
+        ("P", 1e15),
+        ("E", 1e18),
+    ]
+    .iter()
+    .find_map(|(s, m)| q.strip_suffix(*s).map(|n| (n, *m)))
+    .unwrap_or((q, 1.0));
+    num.parse::<f64>()
+        .map(|c| (c * mult * 1000.0).round() as u64)
+        .unwrap_or_else(|_| {
+            tracing::warn!(quantity = %q, "unparseable CPU Quantity; treating as 0");
+            0
+        })
+}
+
 /// Parse a Kubernetes memory/storage Quantity string to bytes.
 /// Handles binary-SI (`Ki`/`Mi`/`Gi`/`Ti`/`Pi`/`Ei`), decimal-SI
 /// (`k`/`K`/`M`/`G`/`T`/`P`/`E`), and bare numbers (incl.
@@ -630,6 +664,25 @@ pub(crate) mod tests {
         assert_eq!(parse_bytes(""), 0);
         assert_eq!(parse_bytes("garbage"), 0);
         assert_eq!(parse_bytes("Gi"), 0, "suffix-only → 0");
+    }
+
+    #[test]
+    fn parse_cpu_millis_forms() {
+        assert_eq!(parse_cpu_millis("64"), 64_000);
+        assert_eq!(parse_cpu_millis("136000m"), 136_000);
+        assert_eq!(parse_cpu_millis("1.5"), 1_500);
+        assert_eq!(parse_cpu_millis("0"), 0);
+        assert_eq!(parse_cpu_millis("0m"), 0);
+        assert_eq!(parse_cpu_millis("garbage"), 0);
+        assert_eq!(parse_cpu_millis(""), 0);
+        // Decimal-SI suffixes — apimachinery canonicalizes round
+        // multiples of 1000 to these. `"1k"` → 0 was the bug.
+        assert_eq!(parse_cpu_millis("1k"), 1_000_000);
+        assert_eq!(parse_cpu_millis("10k"), 10_000_000);
+        assert_eq!(parse_cpu_millis("2M"), 2_000_000_000);
+        assert_eq!(parse_cpu_millis("999"), 999_000); // just below k
+        assert_eq!(parse_cpu_millis("1500m"), 1_500); // m via table
+        assert_eq!(parse_cpu_millis("500u"), 1); // 0.5 millicore rounds
     }
 
     #[test]

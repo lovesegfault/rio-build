@@ -131,12 +131,6 @@ rules:
   - apiGroups: [batch]
     resources: [jobs]
     verbs: [get, list, watch, create, delete]
-  # NodePool budget reconciler (r[ctrl.nodepoolbudget]): list governed
-  # pools by label, read .status.resources.cpu, merge-patch
-  # .spec.limits.cpu. Cluster-scoped resource → ClusterRole rule.
-  - apiGroups: [karpenter.sh]
-    resources: [nodepools]
-    verbs: [get, list, watch, patch]
   # nodeclaim_pool reconciler (ADR-023 §13b, B6-B11): direct NodeClaim
   # create/delete for anchor+bulk deficit cover and unhealthy-node reap.
   # Karpenter still owns the Node lifecycle; controller only manages

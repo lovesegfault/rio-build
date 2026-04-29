@@ -451,24 +451,6 @@ at `rio-controller/src/reconcilers/gc_schedule.rs`; wired via
 No leader-gate: controller is single-replica by design; `replicas>1`
 misconfig is serialized by the store's `GC_LOCK_ID` advisory lock.
 
-## NodePool Shared Budget
-
-r[ctrl.nodepoolbudget]
-When `RIO_NODEPOOL_BUDGET__CPU_MILLICORES > 0`, the controller runs a
-NodePool budget reconciler: every 30s, list `karpenter.sh/v1` NodePools
-matching `RIO_NODEPOOL_BUDGET__SELECTOR` (default `rio.build/karpenter-
-budget=shared`), read each `status.resources.cpu`, compute `headroom =
-budget − Σused`, and merge-patch each `spec.limits.cpu = used +
-headroom`. This gives the governed pools a shared vCPU budget — any pool
-can absorb a burst up to the aggregate. Freeze-on-exhaustion: when
-`Σused ≥ budget`, headroom is 0 and each limit equals current usage
-(Karpenter stops provisioning; never `limit < used` so no forced
-scale-down). Fills the gap from kubernetes-sigs/karpenter#1747 (no
-native cross-pool limit). Metrics: `rio_controller_nodepool_budget_
-{used,headroom}_millicores`. Implementation at `rio-controller/src/
-reconcilers/nodepoolbudget.rs`; wired via `spawn_monitored
-("nodepool-budget", ...)` gated on `cpu_millicores > 0`.
-
 ## NodeClaim pool (ADR-023 §13b)
 
 r[ctrl.nodeclaim.ffd-sim]
