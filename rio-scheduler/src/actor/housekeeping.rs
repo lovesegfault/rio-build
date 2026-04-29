@@ -18,7 +18,7 @@ use crate::state::{
     BuildState, DerivationStatus, DrvHash, ExecutorId, HEARTBEAT_TIMEOUT_SECS, POISON_TTL,
 };
 
-use super::DagActor;
+use super::{DagActor, snapshot};
 
 /// Backstop timeout floor: DEFAULT_DAEMON_TIMEOUT (the worker-side
 /// timeout). A build can't legitimately run longer than this — the
@@ -145,6 +145,14 @@ impl DagActor {
         self.maybe_refresh_estimator().await;
 
         let now = Instant::now();
+        // detect_hung_nodes BEFORE tick_check_heartbeats: both use the
+        // same `now − last_heartbeat > HEARTBEAT_TIMEOUT_SECS` predicate;
+        // tick_check_heartbeats removes stale executors, so computing
+        // hung_nodes after it (or on-demand at the controller's 10s poll)
+        // would always see zero stale entries.
+        self.hung_nodes = snapshot::detect_hung_nodes(&self.executors, now, |h| {
+            self.dag.node(h)?.attributed_tenant(&self.builds)
+        });
         self.tick_check_heartbeats(now).await;
         self.tick_sweep_recently_disconnected(now);
 

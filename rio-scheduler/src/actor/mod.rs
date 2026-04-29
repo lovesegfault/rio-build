@@ -230,6 +230,12 @@ pub struct DagActor {
     log_buffers: Option<Arc<crate::logs::LogBuffers>>,
     /// Connected workers.
     executors: HashMap<ExecutorId, ExecutorState>,
+    /// Last [`detect_hung_nodes`](snapshot::detect_hung_nodes) result,
+    /// computed in `handle_tick` BEFORE `tick_check_heartbeats` (which
+    /// removes stale executors using the same predicate). The 10s
+    /// `GetSpawnIntents` poll reads this cache; computing on-demand
+    /// would always see an already-cleaned `executors` map.
+    hung_nodes: Vec<String>,
     /// Executors that disconnected mid-build, awaiting the controller's
     /// `ReportExecutorTermination` (k8s OOMKilled/Evicted reason).
     /// `(drv_hash, inserted_at)` — captured before
@@ -527,6 +533,7 @@ impl DagActor {
             events: BuildEventBus::new(plumbing.event_persist_tx, plumbing.log_flush_tx),
             log_buffers: plumbing.log_buffers,
             executors: HashMap::new(),
+            hung_nodes: Vec::new(),
             recently_disconnected: HashMap::new(),
             retry_policy: cfg.retry_policy,
             poison_config: cfg.poison,

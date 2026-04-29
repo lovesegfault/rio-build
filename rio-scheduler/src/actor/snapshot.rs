@@ -584,16 +584,8 @@ impl DagActor {
                 .iter()
                 .map(crate::sla::config::cell_label)
                 .collect(),
-            dead_nodes: self.detect_hung_nodes(),
+            dead_nodes: self.hung_nodes.clone(),
         }
-    }
-
-    /// [`detect_hung_nodes`] over the actor's live state. `pub(crate)`
-    /// for the bare-actor unit test (`tests/executor.rs`).
-    pub(crate) fn detect_hung_nodes(&self) -> Vec<String> {
-        detect_hung_nodes(&self.executors, Instant::now(), |h| {
-            self.dag.node(h)?.attributed_tenant(&self.builds)
-        })
     }
 
     /// Mint per-intent `ExecutorClaims` tokens for
