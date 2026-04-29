@@ -527,6 +527,7 @@ impl PodRequestedCache {
         ) {
             return self.delete(pod);
         }
+        let terminating = pod.metadata.deletion_timestamp.is_some();
         let Some(name) = pod.metadata.name.as_ref() else {
             return;
         };
@@ -551,7 +552,16 @@ impl PodRequestedCache {
             .entry(node.clone())
             .or_default()
             .insert(name.clone(), req);
-        if let Some(id) = intent_id {
+        // A terminating pod (deletionTimestamp set, phase still Running
+        // for the grace period) must not (re-)claim the binding — the
+        // retry's NEW pod may already hold it. Without this guard, a
+        // late kubelet MODIFIED for the old pod overwrites the fresh
+        // entry, then the (correctly pod-name-guarded) terminal-phase
+        // delete removes it — the §Verifier-one-step-removed sibling of
+        // mb_034's delete-guard. The `by_node` insert above stays
+        // unconditional: a terminating pod still holds node resources
+        // until gone.
+        if let Some(id) = intent_id.filter(|_| !terminating) {
             g.bound_intent.insert(id, (name.clone(), node.clone()));
         }
     }
@@ -1545,5 +1555,54 @@ mod tests {
         cache.apply(&with_intent("pod-b", "n2", "X".into()));
         cache.delete(&a);
         assert_eq!(cache.bound_intents().get("X"), Some(&"n2".into()));
+    }
+
+    /// bug_023: a late MODIFIED for a terminating pod-a (deletionTimestamp
+    /// set, phase still Running during grace) must not overwrite retry
+    /// pod-b's fresh binding. The mb_034 fix guarded `delete()` by
+    /// pod-name; `apply()` was the unguarded sibling. Without the
+    /// `!terminating` filter, step (3) clobbers the entry back to
+    /// `(pod-a,n1)`, then step (4)'s pod-a terminal-phase delete passes
+    /// its own guard and removes it — leaving X unindexed and FFD's
+    /// bound short-circuit blind to pod-b.
+    #[test]
+    fn apply_terminating_preserves_newer_binding() {
+        use crate::reconcilers::pool::jobs::INTENT_ID_ANNOTATION;
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        let cache = PodRequestedCache::default();
+        let with_intent = |name, node, id: &str| {
+            let mut p = pod_req(name, Some(node), "4", "8Gi", "10Gi");
+            p.metadata.annotations = Some([(INTENT_ID_ANNOTATION.into(), id.into())].into());
+            p
+        };
+        // (1) pod-a Running on n1.
+        let mut a = with_intent("pod-a", "n1", "X");
+        cache.apply(&a);
+        // (2) pod-b (retry) binds n2 → bound_intent[X]=(pod-b,n2).
+        cache.apply(&with_intent("pod-b", "n2", "X"));
+        // (3) Late MODIFIED for pod-a: deletionTimestamp set, phase
+        //     still Running (grace period). Must NOT clobber.
+        a.metadata.deletion_timestamp = Some(Time(k8s_openapi::jiff::Timestamp::now()));
+        cache.apply(&a);
+        assert_eq!(
+            cache.bound_intents().get("X"),
+            Some(&"n2".into()),
+            "terminating pod-a must not reclaim X from pod-b"
+        );
+        // (4) pod-a terminal phase → delete. Guard checks recorded pod
+        //     == "pod-a"; it's "pod-b" → no-op. X stays bound to n2.
+        a.status = Some(k8s_openapi::api::core::v1::PodStatus {
+            phase: Some("Failed".into()),
+            ..Default::default()
+        });
+        cache.apply(&a);
+        assert_eq!(cache.bound_intents().get("X"), Some(&"n2".into()));
+        // by_node still tracks pod-a's resources during grace (it holds
+        // node capacity until gone) — only the intent binding is gated.
+        assert_eq!(
+            cache.sum_for("n1"),
+            (0, 0, 0),
+            "post-terminal pod-a evicted"
+        );
     }
 }
