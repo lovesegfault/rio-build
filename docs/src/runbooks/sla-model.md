@@ -25,13 +25,13 @@ alerts that share the same `rio-cli sla` diagnostic surface.
 ## Step 1: Identify the offending pname
 
 `RioSlaPredictionDrift` is fleet-wide (labelled by `dim=wall|mem`, not by
-pname). Find which keys are driving it:
+pname — `rio_scheduler_sla_prediction_ratio` is a histogram, so there is
+no per-pname series to `topk` over). Find candidate keys via the CLI:
 
 ```bash
-# Top mispredictors over the alert window — actual/predicted ratio per key.
-kubectl -n rio-system exec deploy/rio-scheduler -- \
-  curl -s 'localhost:9091/api/v1/query?query=topk(10,abs(1-rio_scheduler_sla_prediction_ratio))' \
-  | jq '.data.result[] | {pname: .metric.pname, dim: .metric.dim, ratio: .value[1]}'
+# TODO(R24B6): rio-cli sla mispredictors --top 10
+# Until that lands, list active fits and inspect the high-traffic ones:
+rio-cli sla list | head -20
 ```
 
 For each suspect pname, dump the cached fit:
@@ -104,8 +104,10 @@ random seeds), pin it with `--cores` instead.
 
 ### hw bias / `hw_perf_factors` drift
 
-`prediction_ratio` skewed on one `hw_class` only (check the `hw_class` label
-on the topk query) → the per-hw normalization factor is stale. The
+`prediction_ratio` skewed on builds dispatched to one `hw_class` only (check
+`rio-cli sla status <pname>` for the dispatch-time hw assignment, or the
+build's structured log `hw_class` field) → the per-hw normalization factor
+is stale. The
 `hw_perf_samples` table is 7-day windowed; a hardware change takes up to a
 week to wash through. No per-pname fix — the fleet-median recomputes every
 estimator refresh tick (~60s). Cross-check
