@@ -318,6 +318,29 @@ pub fn simulate(
     (placeable, unplaced)
 }
 
+/// Per-cell `(on_registered, on_inflight)` placement count. The cell
+/// is the placed-on node's cell (not the intent's `A_open` — an intent
+/// may target multiple cells; the placement is on exactly one).
+/// Placements on nodes absent from `live` (race) or cell-less nodes are
+/// dropped. Feeds [`CellState::observe_hit_ratio`](super::sketch::
+/// CellState::observe_hit_ratio).
+pub fn per_cell_hit_ratio(placeable: &[Placement], live: &[LiveNode]) -> HashMap<Cell, (u64, u64)> {
+    let by_name: HashMap<&str, &LiveNode> = live.iter().map(|n| (n.name.as_str(), n)).collect();
+    let mut out: HashMap<Cell, (u64, u64)> = HashMap::new();
+    for (_, node, in_flight) in placeable {
+        let Some(cell) = by_name.get(node.as_str()).and_then(|n| n.cell.clone()) else {
+            continue;
+        };
+        let e = out.entry(cell).or_default();
+        if *in_flight {
+            e.1 += 1;
+        } else {
+            e.0 += 1;
+        }
+    }
+    out
+}
+
 /// Map `karpenter.sh/capacity-type` label values to [`CapacityType`].
 /// Distinct from [`CapacityType::parse`] which takes the PG/helm
 /// `"spot"`/`"od"` form (migration 059 CHECK constraint). Karpenter's
@@ -1041,6 +1064,34 @@ pub(crate) mod tests {
         // Exactly ⌊4/3⌋+⌊8/3⌋+⌊16/3⌋ = 1+2+5 = 8 place (FFD packs
         // largest-first, here uniform 3c so just bin-fills).
         assert_eq!(p.len(), 8);
+    }
+
+    /// F9: per-cell `(on_registered, on_inflight)` placement split.
+    /// Feeds `observe_hit_ratio` so `schmitt_adjust` widens
+    /// `lead_time_q` for cells where placements land mostly in-flight.
+    #[test]
+    fn per_cell_hit_ratio_splits_by_node_cell() {
+        let mut nodes = vec![
+            node("r1", "h1", CapacityType::Spot, 8, 0, 0),
+            node("r2", "h2", CapacityType::Spot, 8, 0, 0),
+            node("if", "h1", CapacityType::Spot, 8, 0, 0),
+        ];
+        nodes[2].registered = false;
+        let p = |n: &str, inf: bool| -> Placement { (SpawnIntent::default(), n.into(), inf) };
+        let placeable = vec![
+            p("r1", false),
+            p("r1", false),
+            p("if", true),
+            p("r2", false),
+            // Placement on a node not in `live` (race) → ignored.
+            p("gone", false),
+        ];
+        let by = per_cell_hit_ratio(&placeable, &nodes);
+        let h1 = Cell("h1".into(), CapacityType::Spot);
+        let h2 = Cell("h2".into(), CapacityType::Spot);
+        assert_eq!(by[&h1], (2, 1), "h1: 2 on r1 (reg) + 1 on if (inflight)");
+        assert_eq!(by[&h2], (1, 0));
+        assert_eq!(by.len(), 2);
     }
 
     #[test]

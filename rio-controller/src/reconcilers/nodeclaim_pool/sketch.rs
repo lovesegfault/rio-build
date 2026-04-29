@@ -108,6 +108,13 @@ pub struct CellState {
     pub epoch: SystemTime,
     /// Current `z` quantile (Schmitt-adjusted in B9).
     pub lead_time_q: f64,
+    /// EWMA(α=0.2) of the per-cell `on_registered/(on_registered+
+    /// on_inflight)` placement split — the warm-hit proxy
+    /// [`Self::schmitt_adjust`] reads. In-memory only (NOT a PG
+    /// column): restart-reset to 0.9 (= the Schmitt target, mid-zone
+    /// `[0.765,0.945]`) so cold-start is a no-op until real
+    /// observations move it.
+    pub forecast_hit_ewma: f64,
     /// Consolidator's recent idle-gap log (jsonb in PG; capped ring).
     pub idle_gap_events: Vec<IdleGapEvent>,
 }
@@ -121,6 +128,7 @@ impl Default for CellState {
             boot_shadow: DDSketch::new(Config::defaults()),
             epoch: SystemTime::now(),
             lead_time_q: 0.9,
+            forecast_hit_ewma: 0.9,
             idle_gap_events: Vec::new(),
         }
     }
@@ -192,6 +200,13 @@ impl CellState {
     /// doesn't ratchet to 0.99 forever); narrow when
     /// `hit_ratio > 1.05·target` (over-provisioning). The `[0.85,1.05]`
     /// dead zone prevents oscillation.
+    /// Fold one tick's per-cell `on_reg/(on_reg+on_inf)` into
+    /// [`Self::forecast_hit_ewma`] (α=0.2). `hit` is clamped to `[0,1]`
+    /// — a `0/0` cell is skipped by the caller.
+    pub fn observe_hit_ratio(&mut self, hit: f64) {
+        self.forecast_hit_ewma = 0.2 * hit.clamp(0.0, 1.0) + 0.8 * self.forecast_hit_ewma;
+    }
+
     pub fn schmitt_adjust(&mut self, hit_ratio: f64, target: f64, max_lead_time: f64) {
         if hit_ratio < 0.85 * target && self.lead_time() < max_lead_time {
             self.lead_time_q = (self.lead_time_q + 0.02).min(0.99);
@@ -355,6 +370,7 @@ impl CellSketches {
                 boot_shadow: decode_or_empty(r.boot_sketch_shadow.as_deref()),
                 epoch: SystemTime::UNIX_EPOCH + Duration::from_secs_f64(r.sketch_epoch_secs),
                 lead_time_q: r.lead_time_q,
+                forecast_hit_ewma: 0.9,
                 idle_gap_events: serde_json::from_value(r.idle_gap_events).unwrap_or_else(|e| {
                     warn!(error = %e, "idle_gap_events deserialize failed; resetting");
                     Vec::new()

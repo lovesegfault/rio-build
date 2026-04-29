@@ -493,13 +493,6 @@ impl NodeClaimPoolReconciler {
         // r[ctrl.nodeclaim.lead-time-ddsketch]: record boot times on
         // Registered=True edges, then rotate any cells past halflife.
         // `registered_cells` feeds `report_unfulfillable`'s ICE-clear.
-        // TODO: wire `CellState::schmitt_adjust` once a true forecast
-        // hit-ratio is computable — needs cross-tick tracking of
-        // "forecast intent placed on in-flight claim → did claim
-        // register before intent's deps completed". The
-        // `ffd_placeable_intents{state}` gauge below exposes the
-        // single-tick proxy (registered/(registered+inflight)) so the
-        // operator can observe the input now.
         let registered_cells = self
             .sketches
             .observe_registered(&live, &mut self.recorded_boot);
@@ -512,6 +505,18 @@ impl NodeClaimPoolReconciler {
             ffd::simulate(&intents.intents, &live, &self.sketches, |h, a| {
                 self.hw_config.matches_arch(h, a)
             });
+        // Schmitt-adjust `lead_time_q` from the per-cell EWMA of
+        // `on_reg/(on_reg+on_inf)` — the warm-hit proxy. A cell whose
+        // placements land mostly in-flight (low ratio) is
+        // under-provisioning → widen `q`; mostly registered → narrow.
+        // Cells with zero placements this tick are skipped (EWMA holds;
+        // Schmitt dead-zone absorbs the no-signal case).
+        for (cell, (reg, inf)) in ffd::per_cell_hit_ratio(&placeable, &live) {
+            let hit = reg as f64 / (reg + inf).max(1) as f64;
+            let s = self.sketches.cell_mut(&cell);
+            s.observe_hit_ratio(hit);
+            s.schmitt_adjust(s.forecast_hit_ewma, 0.9, self.cfg.max_lead_time);
+        }
         debug!(
             placeable = placeable.len(),
             unplaced = unplaced.len(),
