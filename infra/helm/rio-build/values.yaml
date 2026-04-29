@@ -696,7 +696,7 @@ karpenter:
   # `placeable`-gate). Breaks `xtask k8s probe-boot` (resolver reads
   # the 12 pools).
   nodeclaimPool:
-    enabled: false
+    enabled: true
     leaseName: rio-controller-nodeclaim-pool
   clusterName: ""   # from tofu output cluster_name
   nodeRoleName: ""  # from tofu output karpenter_node_role_name
