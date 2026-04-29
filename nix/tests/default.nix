@@ -103,10 +103,13 @@ let
 
         [sla.hw_classes.intel-6-ebs-lo]
         labels = [{ key = "rio.build/hw-class", value = "intel-6-ebs-lo" }]
+        requirements = [{ key = "kubernetes.io/os", operator = "In", values = ["linux"] }]
         [sla.hw_classes.intel-7-ebs-mid]
         labels = [{ key = "rio.build/hw-class", value = "intel-7-ebs-mid" }]
+        requirements = [{ key = "kubernetes.io/os", operator = "In", values = ["linux"] }]
         [sla.hw_classes.intel-8-nvme-hi]
         labels = [{ key = "rio.build/hw-class", value = "intel-8-nvme-hi" }]
+        requirements = [{ key = "kubernetes.io/os", operator = "In", values = ["linux"] }]
       '';
     };
     extraPackages = [
@@ -174,6 +177,7 @@ let
 
         [sla.hw_classes.vmtest]
         labels = [{ key = "rio.build/hw-class", value = "vmtest" }]
+        requirements = [{ key = "kubernetes.io/os", operator = "In", values = ["linux"] }]
       '';
     };
     extraStoreConfig = {
