@@ -549,6 +549,20 @@ message AckSpawnedIntentsRequest {
   // signal (bug_008). Empty until controller A18 wires the NodeClaim
   // watcher; interim clear path is first-heartbeat.
   repeated string registered_cells = 3;
+  // §13a R24B7 (`r[sched.sla.cost-instance-type-feedback]`):
+  // instance types Karpenter resolved for cells that registered this
+  // tick. Scheduler folds into `CostTable.cells` so `spot_price_poller`
+  // knows what to price. `cell` is "h:cap" (controller `Cell::Display`
+  // form, `"od"` not `"on-demand"`); cores/mem_bytes are kubelet
+  // allocatable. Edge-detected per NodeClaim — not full-set every tick.
+  repeated ObservedInstanceType observed_instance_types = 4;
+}
+
+message ObservedInstanceType {
+  string cell = 1;
+  string instance_type = 2;
+  uint32 cores = 3;
+  uint64 mem_bytes = 4;
 }
 
 // Mint per-intent `RIO_EXECUTOR_TOKEN`s for the controller's Job-spawn

@@ -570,8 +570,10 @@ impl NodeClaimPoolReconciler {
 
         // r[ctrl.nodeclaim.lead-time-ddsketch]: record boot times on
         // Registered=True edges, then rotate any cells past halflife.
-        // `registered_cells` feeds `report_unfulfillable`'s ICE-clear.
-        let registered_cells =
+        // `registered_cells` feeds `report_unfulfillable`'s ICE-clear;
+        // `observed_types` feeds the scheduler's `CostTable.cells`
+        // (R24B7 instance-type autodiscovery).
+        let (registered_cells, observed_types) =
             self.sketches
                 .observe_registered(&live, &mut self.recorded_boot, now);
         self.sketches.maybe_rotate_all(
@@ -646,7 +648,7 @@ impl NodeClaimPoolReconciler {
         let cover = self.cover_deficit(&unplaced, &live, &masked).await?;
         debug!(created = cover.created.len(), "deficit cover");
         self.inflight_created.extend(cover.created.iter().cloned());
-        self.report_unfulfillable(&ice_cells, &registered_cells)
+        self.report_unfulfillable(&ice_cells, &registered_cells, observed_types)
             .await?;
 
         consolidate::reap_idle(
@@ -935,8 +937,9 @@ impl NodeClaimPoolReconciler {
         &self,
         ice_cells: &[Cell],
         registered_cells: &[Cell],
+        observed_types: Vec<rio_proto::types::ObservedInstanceType>,
     ) -> anyhow::Result<()> {
-        if ice_cells.is_empty() && registered_cells.is_empty() {
+        if ice_cells.is_empty() && registered_cells.is_empty() && observed_types.is_empty() {
             return Ok(());
         }
         // BTreeSet dedup: `health::reap_unhealthy`/`detect_vanished`
@@ -956,6 +959,7 @@ impl NodeClaimPoolReconciler {
             spawned: vec![],
             unfulfillable_cells: dedup(ice_cells),
             registered_cells: dedup(registered_cells),
+            observed_instance_types: observed_types,
         };
         if let Err(e) = admin_call(self.admin.clone().ack_spawned_intents(req)).await {
             warn!(error = %e, "ack_spawned_intents (unfulfillable/registered) failed");

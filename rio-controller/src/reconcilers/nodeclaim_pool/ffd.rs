@@ -28,6 +28,11 @@ pub const CAPACITY_TYPE_LABEL: &str = "karpenter.sh/capacity-type";
 /// scheduler's `[sla.hw_classes]` map.
 pub const HW_CLASS_LABEL: &str = "rio.build/hw-class";
 
+/// `node.kubernetes.io/instance-type` — Karpenter writes this to
+/// `NodeClaim.metadata.labels` post-Launch (not just to the Node). See
+/// [`LiveNode::instance_type`].
+pub const INSTANCE_TYPE_LABEL: &str = "node.kubernetes.io/instance-type";
+
 /// `kubernetes.io/arch` — `amd64`/`arm64`. Each `[sla.hw_classes.$h]`
 /// conjunction carries this (12-class prod config); [`system_to_arch`]
 /// maps `intent.system` to the same vocabulary so hw-agnostic intents
@@ -70,6 +75,13 @@ pub struct LiveNode {
     /// leaked the [`OWNER_LABEL`](super::OWNER_LABEL)). FFD skips
     /// cell-less nodes — no intent's `A_open` can match `None`.
     pub cell: Option<Cell>,
+    /// `metadata.labels[node.kubernetes.io/instance-type]`. Karpenter
+    /// writes this post-Launch (when it resolves the bid to a concrete
+    /// type), so `None` pre-Launch — same timing as `cell`.
+    /// `observe_registered` ships `(cell, instance_type, allocatable)`
+    /// to the scheduler so `CostTable` learns which types each cell
+    /// actually resolves to (R24B7 option-i autodiscovery).
+    pub instance_type: Option<String>,
     /// `(cores, mem_bytes, disk_bytes)` from `status.allocatable`
     /// (preferred) or `status.capacity` (in-flight fallback). Whole
     /// cores: `7910m` → 7, matching `SpawnIntent.cores`' unit.
@@ -202,6 +214,11 @@ impl From<NodeClaim> for LiveNode {
             let cap = cap_from_label(l.get(CAPACITY_TYPE_LABEL)?)?;
             Some(Cell(h.clone(), cap))
         });
+        let instance_type = nc
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get(INSTANCE_TYPE_LABEL).cloned());
         // Prefer allocatable (kubelet-reported, post-reserved); fall
         // back to capacity (Karpenter's launch-time projection); fall
         // back to spec.resources.requests (what cover_deficit asked
@@ -220,6 +237,7 @@ impl From<NodeClaim> for LiveNode {
             node_name: status.node_name.clone(),
             registered,
             cell,
+            instance_type,
             allocatable,
             requested: (0, 0, 0),
             created_secs: nc.metadata.creation_timestamp.as_ref().map(time_secs),
@@ -587,6 +605,7 @@ pub(crate) mod tests {
             node_name: Some(format!("node-{name}")),
             registered: true,
             cell: Some(Cell(hw.into(), cap)),
+            instance_type: None,
             allocatable: (cores, mem, disk),
             requested: (0, 0, 0),
             created_secs: Some(1000.0),

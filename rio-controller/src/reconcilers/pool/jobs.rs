@@ -565,6 +565,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                 // |A'|=1-only post-r19).
                 unfulfillable_cells: vec![],
                 registered_cells: vec![],
+                observed_instance_types: vec![],
             },
         ))
         .await

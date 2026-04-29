@@ -296,18 +296,22 @@ impl CellSketches {
     /// reconciler's running set of NodeClaim names already counted —
     /// each claim contributes exactly one sample over its lifetime.
     /// Names no longer in `live` are pruned from `recorded` so the set
-    /// doesn't grow unbounded across NodeClaim churn. Returns the cells
-    /// that saw a registration this call (B11's `registered_cells`
-    /// ICE-clear signal).
+    /// doesn't grow unbounded across NodeClaim churn.
+    ///
+    /// Returns `(registered_cells, observed_types)`: cells that saw a
+    /// registration this call (B11's ICE-clear signal), and the
+    /// `(cell, instance_type, cores, mem)` evidence for the scheduler's
+    /// `CostTable.cells` (R24B7).
     pub fn observe_registered(
         &mut self,
         live: &[LiveNode],
         recorded: &mut HashSet<String>,
         now_secs: f64,
-    ) -> Vec<Cell> {
+    ) -> (Vec<Cell>, Vec<rio_proto::types::ObservedInstanceType>) {
         let live_names: HashSet<&str> = live.iter().map(|n| n.name.as_str()).collect();
         recorded.retain(|n| live_names.contains(n.as_str()));
         let mut registered_cells = Vec::new();
+        let mut observed = Vec::new();
         for n in live {
             if !n.registered || recorded.contains(&n.name) {
                 continue;
@@ -315,6 +319,18 @@ impl CellSketches {
             let (Some(cell), Some(boot)) = (n.cell.as_ref(), n.boot_secs()) else {
                 continue;
             };
+            // Instance-type capture BEFORE the recency-gate: a stale
+            // node's type is valid evidence regardless (only the
+            // ICE-clear signal is time-sensitive). Restart re-observes
+            // the live set once via cleared `recorded_boot`.
+            if let Some(it) = n.instance_type.as_deref() {
+                observed.push(rio_proto::types::ObservedInstanceType {
+                    cell: cell.to_string(),
+                    instance_type: it.to_owned(),
+                    cores: n.allocatable.0,
+                    mem_bytes: n.allocatable.1,
+                });
+            }
             // Recency-gate: only RECENT registrations are reported as
             // ICE-clear evidence. With `recorded_boot` empty after
             // restart/lease-acquire, days-old nodes would otherwise
@@ -341,7 +357,7 @@ impl CellSketches {
             recorded.insert(n.name.clone());
             registered_cells.push(cell.clone());
         }
-        registered_cells
+        (registered_cells, observed)
     }
 
     /// Rotate every cell whose epoch has aged past `halflife`.
@@ -712,14 +728,16 @@ mod tests {
         inflight.registered = false;
 
         // Tick 1: a (boot=42) + c (in-flight). a recorded; c not.
-        let cells = sk.observe_registered(&[reg("a", 42.0), inflight.clone()], &mut recorded, now);
+        let (cells, _) =
+            sk.observe_registered(&[reg("a", 42.0), inflight.clone()], &mut recorded, now);
         assert_eq!(cells, vec![cell.clone()]);
         assert_eq!(sk.get(&cell).unwrap().boot_active.count(), 1);
         assert!(recorded.contains("a"));
         assert!(!recorded.contains("c"));
 
         // Tick 2: a again + b (boot=50). Only b is a new edge.
-        let cells = sk.observe_registered(&[reg("a", 42.0), reg("b", 50.0)], &mut recorded, now);
+        let (cells, _) =
+            sk.observe_registered(&[reg("a", 42.0), reg("b", 50.0)], &mut recorded, now);
         assert_eq!(cells, vec![cell.clone()]);
         assert_eq!(sk.get(&cell).unwrap().boot_active.count(), 2);
         assert_eq!(recorded.len(), 2);
@@ -751,12 +769,58 @@ mod tests {
             node("stale", "h", CapacityType::Spot, 8, 0, 0),
             &[("Registered", "True", 1018.0)],
         );
-        let cells = sk.observe_registered(&[stale], &mut recorded, 10_000.0);
+        let (cells, _) = sk.observe_registered(&[stale], &mut recorded, 10_000.0);
         assert!(
             cells.is_empty(),
             "stale (now−reg_at=8982s ≫ 30s) NOT pushed as ICE-clear"
         );
         assert!(recorded.contains("stale"), "still recorded (no re-edge)");
+    }
+
+    /// R24B7: instance-type capture is edge-detected (one per
+    /// NodeClaim) and runs BEFORE the recency-gate, so a stale node's
+    /// type is still observed (only the ICE-clear is recency-gated).
+    #[test]
+    fn observe_registered_captures_instance_type() {
+        use super::super::ffd::tests::{node, with_conds};
+        let mut sk = CellSketches::default();
+        let mut recorded = HashSet::new();
+
+        let mut fresh = with_conds(
+            node("a", "h", CapacityType::Spot, 32, 64 << 30, 0),
+            &[("Registered", "True", 1042.0)],
+        );
+        fresh.instance_type = Some("c7i.8xlarge".into());
+        let mut stale = with_conds(
+            node("b", "h", CapacityType::Spot, 32, 128 << 30, 0),
+            &[("Registered", "True", 100.0)],
+        );
+        stale.instance_type = Some("m7i.8xlarge".into());
+        let mut typeless = with_conds(
+            node("c", "h", CapacityType::Spot, 8, 0, 0),
+            &[("Registered", "True", 1042.0)],
+        );
+        typeless.instance_type = None;
+
+        let (cells, observed) = sk.observe_registered(
+            &[fresh.clone(), stale.clone(), typeless],
+            &mut recorded,
+            1060.0,
+        );
+        // Recency-gate: a+c fresh (now−1042=18s<30s), b stale (960s).
+        assert_eq!(cells.len(), 2);
+        // BUT both a+b's types observed (capture before gate). c
+        // typeless → skipped.
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].cell, "h:spot");
+        assert_eq!(observed[0].instance_type, "c7i.8xlarge");
+        assert_eq!(observed[0].cores, 32);
+        assert_eq!(observed[0].mem_bytes, 64 << 30);
+        assert_eq!(observed[1].instance_type, "m7i.8xlarge");
+
+        // Tick 2: a again → no re-edge, no observation.
+        let (_, observed2) = sk.observe_registered(&[fresh], &mut recorded, 1070.0);
+        assert!(observed2.is_empty(), "edge-detected: no re-observe");
     }
 
     /// F7: NodeClaim annotated `rio.build/forecast-eta-secs=30` with
