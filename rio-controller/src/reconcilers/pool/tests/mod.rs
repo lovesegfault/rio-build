@@ -61,7 +61,7 @@ pub(crate) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
         error_counts: Default::default(),
         scaler: Default::default(),
         hw_bench_mem_floor: 8 * (1 << 30),
-        placeable: crate::reconcilers::nodeclaim_pool::PlaceableGate::unarmed(),
+        placeable: Some(crate::reconcilers::nodeclaim_pool::PlaceableGate::unarmed()),
     })
 }
 

@@ -103,12 +103,16 @@ pub(crate) fn intent_headroom(i: &SpawnIntent) -> f64 {
 /// sizeLimit) + [`LOG_BUDGET_BYTES`] (stdout/stderr capture + daemon
 /// state outside the overlay).
 ///
-/// Single source for THREE callers that must agree:
+/// Single source for FOUR callers that must agree (all via
+/// [`intent_pod_footprint`] or this fn directly):
 /// - [`apply_intent_resources`] — the actual pod request/limit;
+/// - [`crate::reconcilers::nodeclaim_pool::ffd::simulate`] — the FFD
+///   sim's fit-check decrement (raw `disk_bytes` here while the pod
+///   requests 1.5× + 50Gi + 1Gi meant FFD over-places ~50× on the
+///   disk axis);
 /// - [`crate::reconcilers::nodeclaim_pool`]'s `cover_deficit` — the
 ///   NodeClaim `resources.requests.ephemeral-storage` floor (B8 live:
-///   raw `disk_bytes` here while the pod requested 1.5× + 50Gi + 1Gi
-///   meant a 100Gi-intent pod asked 201Gi on a 189Gi-allocatable node);
+///   a 100Gi-intent pod asked 201Gi on a 189Gi-allocatable node);
 /// - helm-lint `14-disk-ceiling.sh` — `karpenter.dataVolumeSize` ≥
 ///   `pod_ephemeral_request(sla.maxDisk, worst-case headroom,
 ///   poolDefaults.fuseCacheBytes)` + kubelet reserve.
@@ -117,6 +121,20 @@ pub(crate) fn pod_ephemeral_request(disk_bytes: u64, headroom: f64, fuse_cache_b
     ((disk_bytes as f64 * headroom) as u64)
         .saturating_add(fuse_cache_bytes)
         .saturating_add(LOG_BUDGET_BYTES)
+}
+
+/// `(cores, mem, ephemeral-storage)` triple a pod for `i` will
+/// actually request — the SHARED accounting [`apply_intent_resources`]
+/// stamps and [`crate::reconcilers::nodeclaim_pool::ffd::simulate`]
+/// fit-checks. FFD's contract is "predicts what kube-scheduler will
+/// do"; the only way that holds is for both sides to compute the same
+/// triple from the same fn (§Simulator-shares-accounting).
+pub(crate) fn intent_pod_footprint(i: &SpawnIntent, fuse_cache_bytes: u64) -> (u32, u64, u64) {
+    (
+        i.cores,
+        i.mem_bytes,
+        pod_ephemeral_request(i.disk_bytes, intent_headroom(i), fuse_cache_bytes),
+    )
 }
 
 /// Margin between the worker's `daemon_timeout` and K8s
@@ -310,22 +328,28 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
             }
         };
     // r[impl ctrl.nodeclaim.placeable-gate]
-    // ADR-023 §13b placeable gate: Jobs spawn only for intents the
-    // nodeclaim_pool reconciler's last FFD sim placed on a
+    // ADR-023 §13b placeable gate: Builder Jobs spawn only for intents
+    // the nodeclaim_pool reconciler's last FFD sim placed on a
     // `Registered=True` NodeClaim — structurally closes the spawn-
     // intent fan-out (1226 Ready intents would otherwise mint 1226
     // Pending Jobs, each a Karpenter provisioning request). The
     // controller now knows what's placeable; the scheduler-side cap
     // that DESIGN.md rejected (it couldn't see node state) is resolved
-    // here. `reap_stale_for_intents` below sees this same placeable
-    // subset (NOT the full intent set): a Pending Job for an intent
-    // that fell out of placeable is by definition unschedulable on any
-    // Registered node and is correctly orphan-reaped.
+    // here.
     //
-    // `gate_armed = false` ⇔ no FFD tick has published yet (first ~10s
-    // after start, or a standby replica). Treated like `scheduler_err`
-    // for `queued_known` so reap stays fail-closed.
-    let gate_armed = ctx.placeable.retain(&mut intents);
+    // Builder-only: Fetcher pods land on the helm `rio-fetcher`
+    // NodePool; the FFD sim's `OWNER_LABEL` selector covers builder
+    // NodeClaims only, so gating Fetcher spawn on it stalls FODs until
+    // a builder node boots. `Ctx.placeable = None` ⇔ NodeClaim CRD
+    // absent (k3s VM tests without Karpenter) — the gate is
+    // structurally a no-op there. `gate_armed = false` ⇔ the gate is
+    // present but no FFD tick has published yet (first ~10s after
+    // start, or a standby replica); treated like `scheduler_err` for
+    // `queued_known` so reap stays fail-closed.
+    let gate_armed = match (&ctx.placeable, pool.spec.kind) {
+        (Some(g), ExecutorKind::Builder) => g.retain(&mut intents),
+        _ => true,
+    };
     let queued = intents.len().min(u32::MAX as usize) as u32;
 
     // ---- HwClassSampled (per-tick, one RPC for the union of A's) ----
@@ -1102,6 +1126,41 @@ mod tests {
         };
         assert_eq!(ephemeral_deadline(&i), 240);
         assert_eq!(ephemeral_deadline(&intent("abc")), 180, "0 → 180s floor");
+    }
+
+    /// §Simulator-shares-accounting: the `(c,m,d)` triple
+    /// `apply_intent_resources` stamps on `pod.resources.requests`
+    /// MUST equal `intent_pod_footprint(i, fuse)` — the same triple
+    /// FFD fit-checks against. A 5th FFD-divergence (raw disk_bytes,
+    /// missing headroom, …) would surface here as the executable
+    /// guarantee, not as accounting drift in production.
+    #[test]
+    fn footprint_matches_stamped_requests() {
+        let pool = test_pool("p", ExecutorKind::Builder);
+        let i = SpawnIntent {
+            intent_id: "x".into(),
+            cores: 8,
+            mem_bytes: 16 * (1 << 30),
+            disk_bytes: 40 * (1 << 30),
+            disk_headroom_factor: Some(1.7),
+            ..Default::default()
+        };
+        let j = job(&pool, &i);
+        let spec = j
+            .spec
+            .as_ref()
+            .and_then(|s| s.template.spec.as_ref())
+            .unwrap();
+        let req = spec.containers[0]
+            .resources
+            .as_ref()
+            .and_then(|r| r.requests.as_ref())
+            .unwrap();
+        let q = |k: &str| req[k].0.parse::<u64>().unwrap();
+        let (fc, fm, fd) = intent_pod_footprint(&i, pod::fuse_cache_bytes(&pool));
+        assert_eq!(q("cpu"), u64::from(fc));
+        assert_eq!(q("memory"), fm);
+        assert_eq!(q("ephemeral-storage"), fd);
     }
 
     /// `apply_intent_resources` injects `RIO_DAEMON_TIMEOUT_SECS =

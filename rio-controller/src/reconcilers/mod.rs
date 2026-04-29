@@ -154,8 +154,10 @@ pub struct Ctx {
     /// ADR-023 §13b: `intent_id` set FFD-placed on a `Registered=True`
     /// NodeClaim, published per-tick by [`nodeclaim_pool`]. The
     /// `pool/jobs` reconciler retains only these — see
-    /// [`nodeclaim_pool::PlaceableGate`].
-    pub placeable: nodeclaim_pool::PlaceableGate,
+    /// [`nodeclaim_pool::PlaceableGate`]. `None` ⇔ NodeClaim CRD
+    /// absent (k3s VM tests without Karpenter) — the gate is a
+    /// pass-through and the nodeclaim_pool reconciler is not spawned.
+    pub placeable: Option<nodeclaim_pool::PlaceableGate>,
 }
 
 /// ComponentScaler reconciler state.

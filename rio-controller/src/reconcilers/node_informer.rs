@@ -429,6 +429,18 @@ impl NodeLabelCache {
 /// is `O(pods_on_node)`, not `O(all_pods)`.
 type NodePodRequests = HashMap<String, (u32, u64, u64)>;
 
+/// [`PodRequestedCache`] inner: per-node pod requests + the
+/// `intent_id → node_name` index for FFD's already-bound short-circuit.
+#[derive(Default)]
+struct PodRequestedInner {
+    by_node: HashMap<String, NodePodRequests>,
+    /// Bound pods carrying `INTENT_ID_ANNOTATION`. FFD short-circuits
+    /// an intent that's already bound to a node directly into
+    /// `placeable` (no fit-check) — its own pod's `(c,m,d)` is in
+    /// `sum_for(node)` so a fit-check would double-count and evict it.
+    bound_intent: HashMap<String, String>,
+}
+
 /// `spec.nodeName` → Σ pod `resources.requests` cache for the §13b FFD
 /// sim's `LiveNode.requested`. Hand-rolled (NOT `reflector::store`) for
 /// the same reason as [`NodeLabelCache`]: a full-object Pod reflector
@@ -440,7 +452,7 @@ type NodePodRequests = HashMap<String, (u32, u64, u64)>;
 /// Cheap to clone (`Arc`); share one instance between the watcher task
 /// and the `NodeClaimPoolReconciler`.
 #[derive(Clone, Default)]
-pub struct PodRequestedCache(Arc<RwLock<HashMap<String, NodePodRequests>>>);
+pub struct PodRequestedCache(Arc<RwLock<PodRequestedInner>>);
 
 impl PodRequestedCache {
     /// `Σ (cores, mem, disk)` over pods bound to `node_name`. `(0,0,0)`
@@ -448,46 +460,84 @@ impl PodRequestedCache {
     /// caught up).
     pub fn sum_for(&self, node_name: &str) -> (u32, u64, u64) {
         let g = self.0.read();
-        g.get(node_name).map_or((0, 0, 0), |pods| {
+        g.by_node.get(node_name).map_or((0, 0, 0), |pods| {
             pods.values().fold((0, 0, 0), |(c, m, d), &(pc, pm, pd)| {
                 (c + pc, m + pm, d + pd)
             })
         })
     }
 
+    /// `intent_id → node_name` for bound pods carrying
+    /// `INTENT_ID_ANNOTATION`. FFD short-circuits already-bound
+    /// intents to `placeable` instead of fit-checking them (which
+    /// would double-count their own pod's reservation against them).
+    pub fn bound_intents(&self) -> HashMap<String, String> {
+        self.0.read().bound_intent.clone()
+    }
+
     /// Upsert `pod`'s requests under its `spec.nodeName`. Pending pods
     /// (no `nodeName`) are ignored — they haven't reserved capacity on
-    /// any node. A `nodeName` change (rare; binding is normally
-    /// immutable, but a relist after delete+recreate of a same-named
-    /// pod would look like one) evicts the old-node entry first.
+    /// any node. Terminal-phase pods (`Succeeded`/`Failed`) are evicted
+    /// — kube-scheduler's NodeResourcesFit excludes them; with
+    /// `JOB_TTL_SECS=600s` they'd otherwise inflate `sum_for` for ~60
+    /// FFD ticks per build completion. A `nodeName` change (rare;
+    /// binding is normally immutable, but a relist after
+    /// delete+recreate of a same-named pod would look like one) evicts
+    /// the old-node entry first.
     fn apply(&self, pod: &Pod) {
+        if matches!(
+            pod.status.as_ref().and_then(|s| s.phase.as_deref()),
+            Some("Succeeded" | "Failed")
+        ) {
+            return self.delete(pod);
+        }
         let Some(name) = pod.metadata.name.as_ref() else {
             return;
         };
         let Some(node) = pod.spec.as_ref().and_then(|s| s.node_name.as_ref()) else {
             return;
         };
+        let intent_id = pod
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(crate::reconcilers::pool::jobs::INTENT_ID_ANNOTATION))
+            .cloned();
         let req = pod_requests(pod);
         let mut g = self.0.write();
         // Evict from any other node first (nodeName change / stale).
-        for (n, pods) in g.iter_mut() {
+        for (n, pods) in g.by_node.iter_mut() {
             if n != node {
                 pods.remove(name);
             }
         }
-        g.entry(node.clone()).or_default().insert(name.clone(), req);
+        g.by_node
+            .entry(node.clone())
+            .or_default()
+            .insert(name.clone(), req);
+        if let Some(id) = intent_id {
+            g.bound_intent.insert(id, node.clone());
+        }
     }
 
-    /// Evict `pod` from its node's entry. Node entries are NOT
-    /// garbage-collected when they empty — node count is bounded and
-    /// the empty `HashMap` is ~48 bytes.
+    /// Evict `pod` from its node's entry and the bound-intent index.
+    /// Node entries are NOT garbage-collected when they empty — node
+    /// count is bounded and the empty `HashMap` is ~48 bytes.
     fn delete(&self, pod: &Pod) {
         let Some(name) = pod.metadata.name.as_ref() else {
             return;
         };
+        let intent_id = pod
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(crate::reconcilers::pool::jobs::INTENT_ID_ANNOTATION));
         let mut g = self.0.write();
-        for pods in g.values_mut() {
+        for pods in g.by_node.values_mut() {
             pods.remove(name);
+        }
+        if let Some(id) = intent_id {
+            g.bound_intent.remove(id);
         }
     }
 
@@ -500,9 +550,19 @@ impl PodRequestedCache {
     /// over-provisions.
     fn prune_absent(&self, seen: &HashSet<String>) {
         let mut g = self.0.write();
-        for pods in g.values_mut() {
+        for pods in g.by_node.values_mut() {
             pods.retain(|name, _| seen.contains(name));
         }
+        // bound_intent values are node names, not pod names — but a
+        // pod-name prune means the binding is gone too. Prune intents
+        // whose bound node has no pods left after the by_node retain.
+        let alive: HashSet<String> = g
+            .by_node
+            .iter()
+            .filter(|(_, pods)| !pods.is_empty())
+            .map(|(n, _)| n.clone())
+            .collect();
+        g.bound_intent.retain(|_, node| alive.contains(node));
     }
 }
 
@@ -1329,5 +1389,60 @@ mod tests {
         cache.apply(&node("n", &[("rio.build/hw-band", "7")]));
         assert_eq!(cache.hw_class_of("n"), Some("intel-7".into()));
         assert_eq!(cache.len(), 1, "upsert, not duplicate");
+    }
+
+    fn pod_phase(mut p: Pod, phase: &str) -> Pod {
+        p.status = Some(k8s_openapi::api::core::v1::PodStatus {
+            phase: Some(phase.into()),
+            ..Default::default()
+        });
+        p
+    }
+
+    /// mb_019(B): Succeeded/Failed pods are evicted (kube-scheduler's
+    /// NodeResourcesFit excludes terminal-phase pods; with
+    /// `JOB_TTL_SECS=600s` they'd otherwise inflate `sum_for` for ~60
+    /// FFD ticks per build completion → FFD under-places →
+    /// cover_deficit mints redundant NodeClaims).
+    #[test]
+    fn pod_requested_excludes_terminal_phases() {
+        let cache = PodRequestedCache::default();
+        let p = pod_req("p", Some("n1"), "4", "8Gi", "10Gi");
+        cache.apply(&p);
+        let gi = 1u64 << 30;
+        assert_eq!(cache.sum_for("n1"), (4, 8 * gi, 10 * gi));
+        // phase=Succeeded → evicted (kube-scheduler NodeResourcesFit
+        // would also exclude it).
+        cache.apply(&pod_phase(p, "Succeeded"));
+        assert_eq!(cache.sum_for("n1"), (0, 0, 0), "Succeeded → evicted");
+        // Failed too.
+        let f = pod_phase(pod_req("f", Some("n1"), "2", "4Gi", "5Gi"), "Failed");
+        cache.apply(&f);
+        assert_eq!(cache.sum_for("n1"), (0, 0, 0), "Failed → not counted");
+        // Running stays.
+        let r = pod_phase(pod_req("r", Some("n1"), "2", "4Gi", "5Gi"), "Running");
+        cache.apply(&r);
+        assert_eq!(cache.sum_for("n1"), (2, 4 * gi, 5 * gi));
+    }
+
+    /// bug_069: a bound pod's intent_id → node_name is indexed so FFD
+    /// can short-circuit it directly to `placeable` (its own pod's
+    /// (c,m,d) is in `sum_for(node)`; fit-checking would double-count
+    /// and evict it → orphan-reap loop).
+    #[test]
+    fn pod_requested_indexes_bound_intent() {
+        use crate::reconcilers::pool::jobs::INTENT_ID_ANNOTATION;
+        let cache = PodRequestedCache::default();
+        let mut p = pod_req("rb-x", Some("n1"), "4", "8Gi", "10Gi");
+        p.metadata.annotations = Some([(INTENT_ID_ANNOTATION.into(), "abc".into())].into());
+        cache.apply(&p);
+        assert_eq!(cache.bound_intents().get("abc"), Some(&"n1".into()));
+        // Succeeded → evicted from index too.
+        cache.apply(&pod_phase(p.clone(), "Succeeded"));
+        assert!(cache.bound_intents().is_empty());
+        // delete() also evicts.
+        cache.apply(&p);
+        cache.delete(&p);
+        assert!(cache.bound_intents().is_empty());
     }
 }

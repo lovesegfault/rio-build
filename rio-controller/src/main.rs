@@ -253,12 +253,19 @@ async fn main() -> anyhow::Result<()> {
     // ---- Context ----
     // Placeable-gate channel: created here (before Ctx) so the receiver
     // is in `Ctx` for the Pool reconciler and the sender is passed to
-    // `NodeClaimPoolReconciler::new` below. The `Option` keeps the
+    // `NodeClaimPoolReconciler::new` below. The Option<tx> keeps the
     // sender alive across the PG-connect-failed path so the gate stays
     // unarmed (not closed); `placeable_tx.take()` hands it to the
-    // reconciler on success.
-    let (placeable_tx, placeable) = nodeclaim_pool::placeable_channel();
-    let mut placeable_tx = Some(placeable_tx);
+    // reconciler on success. `Ctx.placeable = None` ⇔ NodeClaim CRD
+    // absent (k3s VM tests without Karpenter) — the gate is a
+    // pass-through and the nodeclaim_pool reconciler is not spawned.
+    let nodeclaim_crd = nodeclaim_pool::nodeclaim_crd_present(&client).await;
+    let (mut placeable_tx, placeable) = if nodeclaim_crd {
+        let (tx, rx) = nodeclaim_pool::placeable_channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let ctx = Arc::new(Ctx {
         client: client.clone(),
         admin: admin.clone(),
@@ -395,7 +402,7 @@ async fn main() -> anyhow::Result<()> {
     // table is migrated by the time `CellSketches::load` reads it
     // (scheduler/store own the migrator).
     // r[impl ctrl.nodeclaim.shim-nodepool]
-    {
+    if nodeclaim_crd {
         let lease_cfg = rio_lease::LeaseConfig::from_parts(
             cfg.nodeclaim_pool.lease_name.clone(),
             cfg.nodeclaim_pool.lease_namespace.clone(),

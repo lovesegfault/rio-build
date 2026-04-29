@@ -242,20 +242,36 @@ pub type Placement = (SpawnIntent, String, bool);
 /// node. Empty `A_open` from lead-time gating (all cells too slow) →
 /// unplaced.
 ///
+/// **Already-bound short-circuit**: an intent in `bound`
+/// (PodRequestedCache saw its pod with `spec.nodeName` set) goes
+/// directly into `placeable` keyed to its actual node — no fit-check.
+/// Its own pod's `(c,m,d)` is already in `free()`'s `requested` term;
+/// fit-checking would double-count and evict it (then orphan-reap the
+/// progressing-ContainerCreating pod). When the bound node isn't in
+/// `live` (NodeClaim deleted; race), the intent falls through to the
+/// regular fit-check.
+///
 /// **Bin-select**: among `live` nodes whose `cell ∈ A_open` (or whose
-/// arch matches, for hw-agnostic intents) AND whose
-/// running `free` covers `(cores, mem, disk)`, pick MostAllocated:
+/// arch matches, for hw-agnostic intents) AND whose running `free`
+/// covers [`crate::reconcilers::pool::jobs::intent_pod_footprint`]'s
+/// `(cores, mem, ephemeral)` triple, pick MostAllocated:
 /// max `(allocatable − free + cores) / allocatable` on the cpu axis.
-/// `free` is the running tally (decremented per placement) so the
-/// score sees prior placements within this tick — matching
-/// kube-scheduler-packed's per-pod scoring on the live node state.
+/// `free` is the running tally (decremented per placement by the same
+/// footprint triple) so the score sees prior placements within this
+/// tick — matching kube-scheduler-packed's per-pod scoring on the
+/// live node state. The shared footprint fn is the
+/// §Simulator-shares-accounting guarantee — FFD compares against the
+/// SAME `(c,m,d)` the pod will request, not raw `disk_bytes`.
 // r[impl ctrl.nodeclaim.ffd-sim]
 pub fn simulate(
     intents: &[SpawnIntent],
     live: &[LiveNode],
     sketches: &CellSketches,
+    bound: &HashMap<String, String>,
+    fuse_cache_bytes: u64,
     hw_arch: impl Fn(&str, &str) -> bool,
 ) -> (Vec<Placement>, Vec<SpawnIntent>) {
+    use crate::reconcilers::pool::jobs::intent_pod_footprint;
     // Running free per node. Cell-less nodes excluded up front: no
     // intent can match them, and excluding here keeps the score loop's
     // `cell.unwrap` infallible.
@@ -271,9 +287,30 @@ pub fn simulate(
         k(b).cmp(&k(a)).then_with(|| a.intent_id.cmp(&b.intent_id))
     });
 
+    // Map node_name → (registered, in `live`) for the bound short-
+    // circuit. `live` is keyed by NodeClaim name; bound is by Node
+    // name (`spec.nodeName`).
+    let by_node_name: HashMap<&str, (bool, &str)> = live
+        .iter()
+        .filter_map(|n| {
+            n.node_name
+                .as_deref()
+                .map(|nn| (nn, (n.registered, n.name.as_str())))
+        })
+        .collect();
     let mut placeable = Vec::with_capacity(sorted.len());
     let mut unplaced = Vec::new();
     for i in sorted {
+        // Already bound → straight to placeable (no fit-check, no
+        // free() decrement — its slot is already counted in
+        // `requested`).
+        if let Some(node) = bound.get(&i.intent_id)
+            && let Some(&(registered, nc_name)) = by_node_name.get(node.as_str())
+        {
+            placeable.push((i, nc_name.to_string(), !registered));
+            continue;
+        }
+        let (ic, im, id) = intent_pod_footprint(&i, fuse_cache_bytes);
         let open = a_open(&i, sketches);
         // hw-agnostic (`hw_class_names=[]`): eligible on any node
         // whose hw-class `kubernetes.io/arch` matches `intent.system`.
@@ -295,7 +332,7 @@ pub fn simulate(
             })
             .filter(|n| {
                 free.get(n.name.as_str())
-                    .is_some_and(|f| f.0 >= i.cores && f.1 >= i.mem_bytes && f.2 >= i.disk_bytes)
+                    .is_some_and(|f| f.0 >= ic && f.1 >= im && f.2 >= id)
             })
             .max_by(|a, b| {
                 // MostAllocated on cpu: highest post-placement
@@ -306,16 +343,16 @@ pub fn simulate(
                 let score = |n: &LiveNode| -> f64 {
                     let f = free[n.name.as_str()];
                     let alloc = n.allocatable.0.max(1);
-                    f64::from(alloc - f.0 + i.cores) / f64::from(alloc)
+                    f64::from(alloc - f.0 + ic) / f64::from(alloc)
                 };
                 score(a).total_cmp(&score(b))
             });
         match best {
             Some(n) => {
                 let f = free.get_mut(n.name.as_str()).expect("filtered above");
-                f.0 -= i.cores;
-                f.1 -= i.mem_bytes;
-                f.2 -= i.disk_bytes;
+                f.0 -= ic;
+                f.1 -= im;
+                f.2 -= id;
                 placeable.push((i, n.name.clone(), !n.registered));
             }
             None => unplaced.push(i),
@@ -627,6 +664,30 @@ pub(crate) mod tests {
         true
     }
 
+    /// `simulate` with `bound`/`fuse_cache_bytes` defaulted (no
+    /// already-bound short-circuit; `fuse=0` so footprint disk ==
+    /// `disk_bytes×headroom + LOG_BUDGET` ≈ raw `disk_bytes` for tests
+    /// that don't exercise the disk axis). Tests that DO care call
+    /// `simulate` directly.
+    fn sim(intents: &[SpawnIntent], live: &[LiveNode]) -> (Vec<Placement>, Vec<SpawnIntent>) {
+        simulate(
+            intents,
+            live,
+            &CellSketches::default(),
+            &HashMap::new(),
+            0,
+            any_arch,
+        )
+    }
+
+    fn sim_sk(
+        intents: &[SpawnIntent],
+        live: &[LiveNode],
+        sk: &CellSketches,
+    ) -> (Vec<Placement>, Vec<SpawnIntent>) {
+        simulate(intents, live, sk, &HashMap::new(), 0, any_arch)
+    }
+
     // --- LiveNode parsing ----------------------------------------------
 
     #[test]
@@ -865,7 +926,7 @@ pub(crate) mod tests {
             intent("a", 4, GI, &[("h", CapacityType::Spot)]),
             intent("b", 2, GI, &[("h", CapacityType::Spot)]),
         ];
-        let (p, u) = simulate(&intents, &[], &CellSketches::default(), any_arch);
+        let (p, u) = sim(&intents, &[]);
         assert!(p.is_empty());
         assert_eq!(u.len(), 2);
     }
@@ -892,7 +953,7 @@ pub(crate) mod tests {
             forecast(intent("forecast-8c", 8, GI, &[h]), 10.0),
             intent("ready-6c", 6, GI, &[h]),
         ];
-        let (p, u) = simulate(&intents, &nodes, &sk, any_arch);
+        let (p, u) = sim_sk(&intents, &nodes, &sk);
         assert_eq!(p.len(), 2);
         assert_eq!(u.len(), 1);
         assert_eq!(u[0].intent_id, "forecast-8c");
@@ -914,7 +975,7 @@ pub(crate) mod tests {
         a.requested = (4, 0, 0);
         let b = node("B", "h", CapacityType::Spot, 12, 64 * GI, 100 * GI);
         let intents = [intent("x", 4, GI, &[("h", CapacityType::Spot)])];
-        let (p, u) = simulate(&intents, &[a, b], &CellSketches::default(), any_arch);
+        let (p, u) = sim(&intents, &[a, b]);
         assert!(u.is_empty());
         assert_eq!(placed_on(&p, "x"), "A");
     }
@@ -934,7 +995,7 @@ pub(crate) mod tests {
             intent("i2", 3, GI, &[("h", CapacityType::Spot)]),
             intent("i3", 3, GI, &[("h", CapacityType::Spot)]),
         ];
-        let (p, u) = simulate(&intents, &nodes, &CellSketches::default(), any_arch);
+        let (p, u) = sim(&intents, &nodes);
         assert!(u.is_empty());
         assert_eq!(placed_on(&p, "i1"), "B");
         assert_eq!(placed_on(&p, "i2"), "B");
@@ -967,7 +1028,7 @@ pub(crate) mod tests {
         );
         // A_open directly: only h2.
         assert_eq!(a_open(&i, &sk), vec![Cell("h2".into(), CapacityType::Spot)]);
-        let (p, u) = simulate(&[i], &nodes, &sk, any_arch);
+        let (p, u) = sim_sk(&[i], &nodes, &sk);
         assert!(u.is_empty());
         assert_eq!(placed_on(&p, "fc"), "n-h2");
         // Ready intent on the same cells ignores lead_time.
@@ -984,12 +1045,12 @@ pub(crate) mod tests {
     fn ffd_affinity_mismatch_unplaced() {
         let nodes = [node("n", "h1", CapacityType::Spot, 8, 64 * GI, 100 * GI)];
         let intents = [intent("x", 4, GI, &[("h2", CapacityType::Spot)])];
-        let (p, u) = simulate(&intents, &nodes, &CellSketches::default(), any_arch);
+        let (p, u) = sim(&intents, &nodes);
         assert!(p.is_empty());
         assert_eq!(u.len(), 1);
         // Same hw, wrong cap → also mismatch.
         let intents = [intent("y", 4, GI, &[("h1", CapacityType::OnDemand)])];
-        let (p, u) = simulate(&intents, &nodes, &CellSketches::default(), any_arch);
+        let (p, u) = sim(&intents, &nodes);
         assert!(p.is_empty());
         assert_eq!(u.len(), 1);
     }
@@ -999,7 +1060,7 @@ pub(crate) mod tests {
         let mut n = node("n", "h", CapacityType::Spot, 8, 64 * GI, 100 * GI);
         n.cell = None;
         let intents = [intent("x", 4, GI, &[("h", CapacityType::Spot)])];
-        let (p, u) = simulate(&intents, &[n], &CellSketches::default(), any_arch);
+        let (p, u) = sim(&intents, &[n]);
         assert!(p.is_empty());
         assert_eq!(u.len(), 1);
     }
@@ -1032,7 +1093,15 @@ pub(crate) mod tests {
             agn("a", "aarch64-linux"),
             agn("u", ""), // unmappable → unplaced
         ];
-        let (p, u) = simulate(&intents, &nodes, &CellSketches::default(), hw_arch);
+        let none = HashMap::new();
+        let (p, u) = simulate(
+            &intents,
+            &nodes,
+            &CellSketches::default(),
+            &none,
+            0,
+            hw_arch,
+        );
         assert_eq!(p.len(), 2);
         assert_eq!(placed_on(&p, "x"), "nx");
         assert_eq!(placed_on(&p, "a"), "na");
@@ -1043,6 +1112,8 @@ pub(crate) mod tests {
             &[agn("x2", "x86_64-linux")],
             &nodes[1..],
             &CellSketches::default(),
+            &none,
+            0,
             hw_arch,
         );
         assert!(p.is_empty());
@@ -1065,9 +1136,90 @@ pub(crate) mod tests {
         let mut n = node("n", "h", CapacityType::Spot, 8, 64 * GI, 100 * GI);
         n.registered = false;
         let intents = [intent("x", 4, GI, &[("h", CapacityType::Spot)])];
-        let (p, _) = simulate(&intents, &[n], &CellSketches::default(), any_arch);
+        let (p, _) = sim(&intents, &[n]);
         assert_eq!(p.len(), 1);
         assert!(p[0].2, "in_flight = !registered");
+    }
+
+    /// mb_019(A): FFD compares against the SAME `(c,m,d)` triple the
+    /// pod will request — `intent_pod_footprint` (= `disk×headroom +
+    /// fuse + log`), NOT raw `disk_bytes`. Node 200Gi free; 4 intents
+    /// each `disk_bytes=1Gi headroom=1.5` with `fuse=50Gi` → footprint
+    /// ≈52.5Gi each → only 3 fit. With raw `disk_bytes` FFD would pack
+    /// all 4 (decrementing 1Gi each); kube-scheduler binds 3, the 4th
+    /// sits Pending with no covering NodeClaim.
+    #[test]
+    fn ffd_disk_uses_pod_footprint() {
+        let n = node("n", "h", CapacityType::Spot, 32, 64 * GI, 200 * GI);
+        let intents: Vec<_> = (0..4)
+            .map(|k| {
+                let mut i = intent(&format!("i{k}"), 4, GI, &[("h", CapacityType::Spot)]);
+                i.disk_bytes = GI;
+                i.disk_headroom_factor = Some(1.5);
+                i
+            })
+            .collect();
+        let fuse = 50 * GI;
+        let (p, u) = simulate(
+            &intents,
+            &[n],
+            &CellSketches::default(),
+            &HashMap::new(),
+            fuse,
+            any_arch,
+        );
+        // footprint = 1×1.5 + 50 + 1 (log) = 52.5Gi → ⌊200/52.5⌋ = 3.
+        assert_eq!(
+            p.len(),
+            3,
+            "footprint-based fit (was 4 with raw disk_bytes)"
+        );
+        assert_eq!(u.len(), 1);
+    }
+
+    /// bug_069: an intent already bound (PodRequestedCache saw its pod
+    /// with `spec.nodeName`) short-circuits to `placeable` with NO
+    /// fit-check. Its own pod's (32c) is in `requested` so `free.0=0`;
+    /// fit-checking would evict it → orphan-reap loop on the
+    /// progressing-ContainerCreating pod.
+    #[test]
+    fn ffd_short_circuits_bound_intent() {
+        // Tight-fit: 32c node, intent X=32c, X's pod already bound
+        // (requested.0=32 → free.0=0).
+        let mut n = node("nc", "h", CapacityType::Spot, 32, 64 * GI, 200 * GI);
+        n.node_name = Some("ip-10-0-1-5".into());
+        n.requested = (32, 32 * GI, 100 * GI);
+        let x = intent("X", 32, 32 * GI, &[("h", CapacityType::Spot)]);
+        // Without bound short-circuit: free.0=0 < 32 → unplaced.
+        let (p, u) = sim(std::slice::from_ref(&x), std::slice::from_ref(&n));
+        assert!(p.is_empty(), "without bound: tight-fit evicted by own pod");
+        assert_eq!(u.len(), 1);
+        // With bound={X→ip-10-0-1-5}: short-circuit to placeable.
+        let bound: HashMap<String, String> = [("X".into(), "ip-10-0-1-5".into())].into();
+        let (p, u) = simulate(
+            std::slice::from_ref(&x),
+            std::slice::from_ref(&n),
+            &CellSketches::default(),
+            &bound,
+            0,
+            any_arch,
+        );
+        assert_eq!(p.len(), 1, "bound intent placeable on its actual node");
+        assert_eq!(p[0].1, "nc");
+        assert!(!p[0].2, "registered node → in_flight=false");
+        assert!(u.is_empty());
+        // Bound to a node not in `live` (NodeClaim deleted; race) →
+        // falls through to fit-check → unplaced.
+        let stale: HashMap<String, String> = [("X".into(), "ip-gone".into())].into();
+        let (p, _) = simulate(
+            std::slice::from_ref(&x),
+            std::slice::from_ref(&n),
+            &CellSketches::default(),
+            &stale,
+            0,
+            any_arch,
+        );
+        assert!(p.is_empty(), "stale bound → falls through to fit-check");
     }
 
     /// FFD never overcommits any node on any axis. Deterministic
@@ -1085,7 +1237,7 @@ pub(crate) mod tests {
         let intents: Vec<_> = (0..20)
             .map(|k| intent(&format!("i{k}"), 3, 4 * GI, &[h]))
             .collect();
-        let (p, u) = simulate(&intents, &nodes, &CellSketches::default(), any_arch);
+        let (p, u) = sim(&intents, &nodes);
         assert_eq!(p.len() + u.len(), 20);
         for n in &nodes {
             let (c, m, d) = p
@@ -1146,7 +1298,7 @@ pub(crate) mod tests {
             intent("zz", 4, GI, &[("h", CapacityType::Spot)]),
             intent("aa", 4, GI, &[("h", CapacityType::Spot)]),
         ];
-        let (p, u) = simulate(&intents, &nodes, &CellSketches::default(), any_arch);
+        let (p, u) = sim(&intents, &nodes);
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].0.intent_id, "aa", "intent_id asc tiebreak");
         assert_eq!(u[0].intent_id, "zz");

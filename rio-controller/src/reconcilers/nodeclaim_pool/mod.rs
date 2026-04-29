@@ -475,10 +475,17 @@ impl NodeClaimPoolReconciler {
         // ⊥ on scheduler unreachable: warn + count, don't propagate.
         // `admin_call` bounds at ADMIN_RPC_TIMEOUT so a stalled
         // scheduler doesn't wedge the tick.
+        // Builder-only: this reconciler manages builder NodeClaims
+        // (`OWNER_LABEL`); FOD intents land on the helm `rio-fetcher`
+        // NodePool. Including FODs would over-reserve builder capacity
+        // in FFD and mint builder NodeClaims for fetcher demand.
         let intents: Option<GetSpawnIntentsResponse> = match admin_call(
             self.admin
                 .clone()
-                .get_spawn_intents(GetSpawnIntentsRequest::default()),
+                .get_spawn_intents(GetSpawnIntentsRequest {
+                    kind: Some(rio_proto::types::ExecutorKind::Builder.into()),
+                    ..Default::default()
+                }),
         )
         .await
         {
@@ -516,10 +523,15 @@ impl NodeClaimPoolReconciler {
             Duration::from_secs(self.cfg.sketch_halflife_secs),
         );
 
-        let (placeable, unplaced) =
-            ffd::simulate(&intents.intents, &live, &self.sketches, |h, a| {
-                self.hw_config.matches_arch(h, a)
-            });
+        let bound = self.pod_requested.bound_intents();
+        let (placeable, unplaced) = ffd::simulate(
+            &intents.intents,
+            &live,
+            &self.sketches,
+            &bound,
+            self.cfg.fuse_cache_bytes,
+            |h, a| self.hw_config.matches_arch(h, a),
+        );
         // Schmitt-adjust `lead_time_q` from the per-cell EWMA of
         // `on_reg/(on_reg+on_inf)` — the warm-hit proxy. A cell whose
         // placements land mostly in-flight (low ratio) is
@@ -880,6 +892,31 @@ impl NodeClaimPoolReconciler {
             warn!(error = %e, "ack_spawned_intents (unfulfillable/registered) failed");
         }
         Ok(())
+    }
+}
+
+/// Probe whether the NodeClaim CRD is installed. k3s VM tests without
+/// Karpenter have no `nodeclaims.karpenter.sh` resource —
+/// `list_live_nodeclaims` would 404 every tick, `placeable_tx` would
+/// never publish, and the gate's `None` arm would `intents.clear()`
+/// every Builder pool reconcile (no Jobs spawn). Main.rs uses this to
+/// set `Ctx.placeable = None` (gate pass-through) and skip spawning
+/// the reconciler entirely. `false` ONLY on a 404; transient errors
+/// return `true` so the reconciler retries normally.
+pub async fn nodeclaim_crd_present(kube: &kube::Client) -> bool {
+    let api: Api<NodeClaim> = Api::all(kube.clone());
+    match api
+        .list_metadata(&kube::api::ListParams::default().limit(1))
+        .await
+    {
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            warn!(
+                "NodeClaim CRD absent (k3s without Karpenter?) — \
+                 nodeclaim_pool disabled, PlaceableGate pass-through"
+            );
+            false
+        }
+        _ => true,
     }
 }
 
