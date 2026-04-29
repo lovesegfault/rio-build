@@ -24,11 +24,10 @@
 //!
 //! # Leader gating
 //!
-//! Per controller.md, rio-controller is single-replica by design
-//! (no leader election). `replicas > 1` is an operator misconfig.
-//! No `is_leader` gate here — there's no leader to check. If
-//! someone DOES run two replicas, both will trigger GC; the
-//! store's `GC_LOCK_ID` advisory lock serializes them (second
+//! Per controller.md, rio-controller is single-replica. Only the
+//! `nodeclaim_pool` reconciler is lease-gated (rolling-upgrade surge
+//! safety); this cron is NOT — `replicas > 1` would mean both fire.
+//! The store's `GC_LOCK_ID` advisory lock serializes them (second
 //! caller gets "already running"), so the blast radius is wasted
 //! RPCs, not double-sweep.
 

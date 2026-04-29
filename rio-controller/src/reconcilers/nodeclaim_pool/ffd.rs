@@ -156,6 +156,18 @@ impl LiveNode {
         }
     }
 
+    /// `Registered.lastTransitionTime` epoch-secs. `Some` only when
+    /// `Registered=True`. NOT [`Self::boot_secs`] (which is the
+    /// `Registered − created` DURATION) — `observe_registered`'s
+    /// recency-gate needs `now − registered_at`, so a 5-day-old node
+    /// with 18s boot must NOT pass the "recent edge" check.
+    pub fn registered_at_secs(&self) -> Option<f64> {
+        match self.cond("Registered")? {
+            ("True", t) => Some(t),
+            _ => None,
+        }
+    }
+
     /// Seconds since the node became idle (Karpenter's `Empty=True`
     /// transition). Falls back to `Registered=True` transition when
     /// `Empty` is absent — a node with no pod ever scheduled has been

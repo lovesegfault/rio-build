@@ -23,7 +23,7 @@ use tracing::{info, warn};
 
 use rio_controller::reconcilers::node_informer::NodeLabelCache;
 use rio_controller::reconcilers::nodeclaim_pool::{
-    self, ControllerLeaseHooks, NodeClaimPoolConfig, NodeClaimPoolReconciler,
+    self, ControllerLeaseHooks, NodeClaimPoolConfig,
 };
 use rio_controller::reconcilers::{AdminClient, Ctx, componentscaler, node_informer, pool};
 use rio_controller::spawn_controller;
@@ -254,9 +254,9 @@ async fn main() -> anyhow::Result<()> {
     // Placeable-gate channel: created here (before Ctx) so the receiver
     // is in `Ctx` for the Pool reconciler and the sender is passed to
     // `NodeClaimPoolReconciler::new` below. The Option<tx> keeps the
-    // sender alive across the PG-connect-failed path so the gate stays
-    // unarmed (not closed); `placeable_tx.take()` hands it to the
-    // reconciler on success. `Ctx.placeable = None` ⇔ NodeClaim CRD
+    // sender alive while connect_pg retries (in spawn_monitored below)
+    // so the gate stays unarmed (not closed); `placeable_tx.take()`
+    // hands it to the reconciler. `Ctx.placeable = None` ⇔ NodeClaim CRD
     // absent (k3s VM tests without Karpenter) — the gate is a
     // pass-through and the nodeclaim_pool reconciler is not spawned.
     let nodeclaim_crd = nodeclaim_pool::nodeclaim_crd_present(&client).await;
@@ -373,9 +373,10 @@ async fn main() -> anyhow::Result<()> {
     // will break too); don't also spawn a cron that will never
     // connect. Both gates log so the absence is diagnosable.
     //
-    // No leader-gate: controller is single-replica by design
-    // (controller.md — no leader election). If replicas>1 by
-    // misconfig, the store's GC_LOCK_ID advisory lock serializes
+    // No leader-gate: controller is single-replica (only the
+    // nodeclaim_pool reconciler is lease-gated, for rolling-upgrade
+    // surge safety). If replicas>1 by misconfig, the store's
+    // GC_LOCK_ID advisory lock serializes
     // concurrent TriggerGC calls (see gc_schedule module doc).
     if cfg.gc_interval_hours > 0 && !cfg.store.addr.is_empty() {
         let gc_tick = std::time::Duration::from_secs(cfg.gc_interval_hours * 3600);
@@ -425,34 +426,42 @@ async fn main() -> anyhow::Result<()> {
         // so `leader_for()` consumers (none yet) see a coherent state.
         leader.set_recovery_complete();
 
+        let hooks = ControllerLeaseHooks::default();
         if let Some(lease_cfg) = lease_cfg {
             rio_common::task::spawn_monitored(
                 "nodeclaim-pool-lease",
                 rio_lease::run_lease_loop(
                     lease_cfg,
                     leader.clone(),
-                    ControllerLeaseHooks,
+                    hooks.clone(),
                     shutdown.clone(),
                 ),
             );
         }
 
-        if let Some(pg) =
-            nodeclaim_pool::connect_pg(&cfg.nodeclaim_pool.database_url, &shutdown).await
-        {
-            let reconciler = NodeClaimPoolReconciler::new(
+        // `connect_pg` wraps `connect_forever` (returns `None` only on
+        // shutdown). `spawn_monitored` so a PG outage at boot doesn't
+        // block `tokio::join!` below — the Pool/ComponentScaler
+        // reconcilers run with the gate UNARMED
+        // (`PlaceableGate::retain` returns false → fail-closed) until
+        // PG connects and the reconciler publishes. Named `async fn`
+        // (not an `async move` block) because of rustc's HRTB Send
+        // check on nested `async ||` borrows — see `run_nodeclaim_pool`
+        // doc.
+        rio_common::task::spawn_monitored(
+            "nodeclaim-pool",
+            nodeclaim_pool::run_nodeclaim_pool(
                 client.clone(),
                 admin.clone(),
-                pg,
                 leader,
+                hooks,
                 cfg.nodeclaim_pool.clone(),
                 hw_config.clone(),
                 pod_requested,
                 placeable_tx.take().expect("placeable_tx not yet taken"),
-            )
-            .await;
-            rio_common::task::spawn_monitored("nodeclaim-pool", reconciler.run(shutdown.clone()));
-        }
+                shutdown.clone(),
+            ),
+        );
     }
 
     info!("controller running");

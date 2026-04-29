@@ -38,10 +38,12 @@ metadata:
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-controller" "component" "controller") | nindent 4 }}
 spec:
-  # HARD replicas=1. NOT leader-elected. Two controllers fight — both
-  # spawn Jobs for the same queue depth, doubling pods. kube-runtime
-  # handles concurrent reconcile within one process but not across
-  # processes. 30s reschedule gap during pod restart is acceptable.
+  # HARD replicas=1. Only the nodeclaim_pool reconciler is
+  # lease-gated (rolling-upgrade surge safety); the Pool reconciler
+  # and gc_schedule are NOT — two replicas double-spawn Jobs.
+  # kube-runtime handles concurrent reconcile within one process but
+  # not across processes. 30s reschedule gap during pod restart is
+  # acceptable.
   replicas: 1
   selector:
     matchLabels:

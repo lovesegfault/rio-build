@@ -300,6 +300,7 @@ impl CellSketches {
         &mut self,
         live: &[LiveNode],
         recorded: &mut HashSet<String>,
+        now_secs: f64,
     ) -> Vec<Cell> {
         let live_names: HashSet<&str> = live.iter().map(|n| n.name.as_str()).collect();
         recorded.retain(|n| live_names.contains(n.as_str()));
@@ -311,6 +312,20 @@ impl CellSketches {
             let (Some(cell), Some(boot)) = (n.cell.as_ref(), n.boot_secs()) else {
                 continue;
             };
+            // Recency-gate: only RECENT registrations are reported as
+            // ICE-clear evidence. With `recorded_boot` empty after
+            // restart/lease-acquire, days-old nodes would otherwise
+            // mass-clear the scheduler's accumulated IceBackoff.
+            // `registered_at_secs` (NOT `boot_secs` — that's the
+            // DURATION; a 5-day-old node with 18s boot would pass).
+            // Stale → record-only (so it doesn't re-edge later) +
+            // skip the cell push.
+            if n.registered_at_secs()
+                .is_some_and(|t| now_secs - t > 3.0 * super::TICK.as_secs_f64())
+            {
+                recorded.insert(n.name.clone());
+                continue;
+            }
             // `z = boot − eta` per `r[ctrl.nodeclaim.lead-time-ddsketch]`.
             // `eta` is the per-cell `min(eta_seconds)` `cover_deficit`
             // stamped at create time; absent (Ready-only cell, or
@@ -677,6 +692,9 @@ mod tests {
         let mut recorded = HashSet::new();
         let cell = Cell("h".into(), CapacityType::Spot);
 
+        // now=1060: Registered.transition at 1042..1050 → recency
+        // (now − reg_at < 30s) passes for all.
+        let now = 1060.0;
         let reg = |name: &str, boot: f64| {
             with_conds(
                 node(name, "h", CapacityType::Spot, 8, 0, 0),
@@ -687,23 +705,51 @@ mod tests {
         inflight.registered = false;
 
         // Tick 1: a (boot=42) + c (in-flight). a recorded; c not.
-        let cells = sk.observe_registered(&[reg("a", 42.0), inflight.clone()], &mut recorded);
+        let cells = sk.observe_registered(&[reg("a", 42.0), inflight.clone()], &mut recorded, now);
         assert_eq!(cells, vec![cell.clone()]);
         assert_eq!(sk.get(&cell).unwrap().boot_active.count(), 1);
         assert!(recorded.contains("a"));
         assert!(!recorded.contains("c"));
 
         // Tick 2: a again + b (boot=50). Only b is a new edge.
-        let cells = sk.observe_registered(&[reg("a", 42.0), reg("b", 50.0)], &mut recorded);
+        let cells = sk.observe_registered(&[reg("a", 42.0), reg("b", 50.0)], &mut recorded, now);
         assert_eq!(cells, vec![cell.clone()]);
         assert_eq!(sk.get(&cell).unwrap().boot_active.count(), 2);
         assert_eq!(recorded.len(), 2);
 
         // Tick 3: only b. a pruned from `recorded`.
-        sk.observe_registered(&[reg("b", 50.0)], &mut recorded);
+        sk.observe_registered(&[reg("b", 50.0)], &mut recorded, now);
         assert_eq!(sk.get(&cell).unwrap().boot_active.count(), 2, "no new edge");
         assert!(!recorded.contains("a"), "pruned");
         assert_eq!(recorded.len(), 1);
+    }
+
+    /// mb_076 recency-gate: a node registered hours ago (e.g.
+    /// `recorded_boot` empty after restart/lease-acquire) is
+    /// recorded-only — its cell is NOT pushed (else it would
+    /// mass-clear the scheduler's IceBackoff). Uses `now −
+    /// registered_at`, NOT `boot_secs()` (boot DURATION; a 5-day-old
+    /// node with 18s boot would wrongly pass).
+    #[test]
+    fn observe_registered_recency_gates_stale() {
+        use super::super::ffd::tests::{node, with_conds};
+        let mut sk = CellSketches::default();
+        let mut recorded = HashSet::new();
+        // Registered at t=100; boot_secs() = 100 − 1000(created)? No —
+        // created defaults to 1000.0 in `node()` so boot=−900, which
+        // boot_secs would return as Some(−900). But registered_at=100.
+        // Use plausible: created=1000 (node() default), Registered at
+        // 1018 (boot=18s), now=10000 (hours later).
+        let stale = with_conds(
+            node("stale", "h", CapacityType::Spot, 8, 0, 0),
+            &[("Registered", "True", 1018.0)],
+        );
+        let cells = sk.observe_registered(&[stale], &mut recorded, 10_000.0);
+        assert!(
+            cells.is_empty(),
+            "stale (now−reg_at=8982s ≫ 30s) NOT pushed as ICE-clear"
+        );
+        assert!(recorded.contains("stale"), "still recorded (no re-edge)");
     }
 
     /// F7: NodeClaim annotated `rio.build/forecast-eta-secs=30` with
@@ -724,7 +770,7 @@ mod tests {
         a.annotations
             .insert(FORECAST_ETA_ANNOTATION.into(), "30".into());
         // boot = 1045 − 1000 = 45; eta = 30; z = 15.
-        sk.observe_registered(&[a], &mut recorded);
+        sk.observe_registered(&[a], &mut recorded, 1060.0);
         let s = sk.get(&cell).unwrap();
         let z = s.z_active.quantile(0.5).unwrap().unwrap();
         assert!((z - 15.0).abs() < 1.0, "z = boot − eta = 15, got {z}");
@@ -738,7 +784,7 @@ mod tests {
             node("n", "h", CapacityType::Spot, 8, 0, 0),
             &[("Registered", "True", 1045.0)],
         );
-        sk2.observe_registered(&[n], &mut rec2);
+        sk2.observe_registered(&[n], &mut rec2, 1060.0);
         let z2 = sk2
             .get(&cell)
             .unwrap()

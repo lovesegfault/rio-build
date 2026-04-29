@@ -21,9 +21,11 @@
 //! 6. Persist `CellSketches` (DDSketch lead-time + idle-gap log) to PG.
 //!
 //! Lease-gated: only the leader replica runs `reconcile_once`. The
-//! controller was historically single-replica, but the lease loop makes
-//! rolling upgrades safe (the surge replica idles until the old one
-//! releases) and allows `replicas: 2` for HA without double-provisioning.
+//! lease makes rolling-upgrade surge safe for THIS reconciler — the
+//! surge replica idles until the old one releases. Controller stays
+//! `replicas: 1` (the Pool reconciler and gc_schedule are NOT
+//! lease-gated; two replicas would double-spawn Jobs — see
+//! controller.yaml `replicas: 1` rationale).
 
 mod consolidate;
 mod cover;
@@ -60,7 +62,7 @@ pub use sketch::{CapacityType, Cell, CellSketches, CellState};
 /// Reconcile interval. Matches the Pool reconciler's `GetSpawnIntents`
 /// poll cadence so the scheduler's `compute_spawn_intents` snapshot is
 /// no staler here than in the legacy spawn path.
-const TICK: Duration = Duration::from_secs(10);
+pub(crate) const TICK: Duration = Duration::from_secs(10);
 
 /// Consecutive ⊥ ticks (scheduler unreachable / `Unavailable`) before
 /// the loop drops into consolidate-only. ADR §13b: don't grow the fleet
@@ -315,18 +317,32 @@ impl Default for NodeClaimPoolConfig {
     }
 }
 
-/// Per-component lease hooks. The reconciler has no actor channel — the
-/// tick loop polls [`LeaderState::is_leader`] directly — so the hooks
-/// only emit `rio_controller_lease_*_total` per the
-/// `rio_{component}_` naming rule (see [`rio_lease::LeaseHooks`] doc).
-#[derive(Clone)]
-pub struct ControllerLeaseHooks;
+/// Per-component lease hooks. `LeaseHooks: Clone + Send + Sync` and
+/// methods are sync, so transition work that needs `&mut self`/
+/// `.await` (reload sketches, unarm gate) flows via `Arc<AtomicBool>`
+/// flags the run loop checks at the top of each tick.
+#[derive(Clone, Default)]
+pub struct ControllerLeaseHooks {
+    /// Set on `on_acquire`; run loop reloads `CellSketches` from PG
+    /// and clears `recorded_boot`/`prev_idle`/`inflight_created` so a
+    /// long-running standby that wins the lease doesn't `persist()`
+    /// stale startup-time sketches over the previous leader's
+    /// accumulated samples.
+    reload: Arc<std::sync::atomic::AtomicBool>,
+    /// Set on `on_lose`; run loop `placeable_tx.send_replace(None)`
+    /// so an ex-leader's `PlaceableGate` doesn't stay armed with a
+    /// stale set (whose stale `queued` would `reap_excess_pending` the
+    /// new leader's Jobs).
+    lose: Arc<std::sync::atomic::AtomicBool>,
+}
 
 impl rio_lease::LeaseHooks for ControllerLeaseHooks {
     fn on_acquire(&self) {
+        self.reload.store(true, std::sync::atomic::Ordering::SeqCst);
         metrics::counter!("rio_controller_lease_acquired_total").increment(1);
     }
     fn on_lose(&self) {
+        self.lose.store(true, std::sync::atomic::Ordering::SeqCst);
         metrics::counter!("rio_controller_lease_lost_total").increment(1);
     }
 }
@@ -354,12 +370,19 @@ pub struct NodeClaimPoolReconciler {
     /// FFD tick with the `intent_id`s placed on `Registered=True`
     /// nodes; the `pool/jobs` reconciler reads it via `Ctx.placeable`.
     placeable_tx: tokio::sync::watch::Sender<PlaceableSet>,
+    /// Lease-transition flags from [`ControllerLeaseHooks`]. Checked
+    /// at the top of each run-loop tick so acquire/lose edges do real
+    /// state work (`LeaseHooks` methods are sync; can't `.await`).
+    hooks: ControllerLeaseHooks,
     sketches: CellSketches,
     /// NodeClaim names whose `Registered=True` boot time has already
     /// been recorded into `sketches`. Edge-detector state for
     /// [`CellSketches::observe_registered`]; pruned to live names each
-    /// tick. In-memory only — a restart re-records the live set's boot
-    /// times once (a few duplicate samples in a DDSketch is harmless).
+    /// tick. In-memory only — `observe_registered`'s recency-gate
+    /// (`now − Registered.transition < 3×TICK`) means a restart
+    /// re-records ONLY recently-registered nodes; stale registrations
+    /// are recorded-only (so they don't re-edge later) without pushing
+    /// the cell to `report_unfulfillable`'s ICE-clear.
     recorded_boot: HashSet<String>,
     /// `name → idle_secs` from the previous tick. Edge-detector state
     /// for [`consolidate::observe_idle_to_busy`]: a node idle last tick
@@ -393,6 +416,7 @@ impl NodeClaimPoolReconciler {
         admin: AdminClient,
         pg: sqlx::PgPool,
         leader: LeaderState,
+        hooks: ControllerLeaseHooks,
         cfg: NodeClaimPoolConfig,
         hw_config: HwClassConfig,
         pod_requested: PodRequestedCache,
@@ -422,6 +446,7 @@ impl NodeClaimPoolReconciler {
             hw_config,
             pod_requested,
             placeable_tx,
+            hooks,
             sketches,
             recorded_boot: HashSet::new(),
             prev_idle: HashMap::new(),
@@ -449,9 +474,40 @@ impl NodeClaimPoolReconciler {
                 _ = shutdown.cancelled() => break,
                 _ = interval.tick() => {}
             }
+            // Lease-loss edge: unarm the gate so an ex-leader's stale
+            // set doesn't drive `reap_excess_pending` against the new
+            // leader's Jobs. Checked BEFORE `is_leader()` so it fires
+            // on the same tick as the loss.
+            if self
+                .hooks
+                .lose
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.placeable_tx.send_replace(None);
+            }
             if !self.leader.is_leader() {
                 debug!("standby; skipping nodeclaim_pool tick");
                 continue;
+            }
+            // Lease-acquire edge: reload sketches from PG and clear
+            // edge-detector state so a long-running standby that wins
+            // the lease doesn't `persist()` stale startup-time
+            // sketches over the previous leader's accumulated samples,
+            // and so `observe_registered`'s recency-gate sees an empty
+            // `recorded_boot` (else days-old registrations mass-clear
+            // the scheduler's IceBackoff).
+            if self
+                .hooks
+                .reload
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                if let Ok(s) = CellSketches::load(&self.pg).await {
+                    self.sketches = s;
+                    self.sketches.seed(&self.cfg.lead_time_seed);
+                }
+                self.recorded_boot.clear();
+                self.prev_idle.clear();
+                self.inflight_created.clear();
             }
             self.tick_counter = self.tick_counter.wrapping_add(1);
             let started = std::time::Instant::now();
@@ -515,9 +571,9 @@ impl NodeClaimPoolReconciler {
         // r[ctrl.nodeclaim.lead-time-ddsketch]: record boot times on
         // Registered=True edges, then rotate any cells past halflife.
         // `registered_cells` feeds `report_unfulfillable`'s ICE-clear.
-        let registered_cells = self
-            .sketches
-            .observe_registered(&live, &mut self.recorded_boot);
+        let registered_cells =
+            self.sketches
+                .observe_registered(&live, &mut self.recorded_boot, now);
         self.sketches.maybe_rotate_all(
             std::time::SystemTime::now(),
             Duration::from_secs(self.cfg.sketch_halflife_secs),
@@ -883,10 +939,23 @@ impl NodeClaimPoolReconciler {
         if ice_cells.is_empty() && registered_cells.is_empty() {
             return Ok(());
         }
+        // BTreeSet dedup: `health::reap_unhealthy`/`detect_vanished`
+        // push one entry per ICE'd CLAIM (up to 8/cell/tick); the
+        // scheduler loops `mark()` per entry so duplicates would jump
+        // step 0→7 (TTL 60s→600s) on a single transient dip. Same for
+        // `registered_cells` (1 per registered CLAIM → multiple
+        // `clear()` calls is harmless but wasteful).
+        let dedup = |cs: &[Cell]| -> Vec<String> {
+            cs.iter()
+                .map(Cell::to_string)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
         let req = AckSpawnedIntentsRequest {
             spawned: vec![],
-            unfulfillable_cells: ice_cells.iter().map(Cell::to_string).collect(),
-            registered_cells: registered_cells.iter().map(Cell::to_string).collect(),
+            unfulfillable_cells: dedup(ice_cells),
+            registered_cells: dedup(registered_cells),
         };
         if let Err(e) = admin_call(self.admin.clone().ack_spawned_intents(req)).await {
             warn!(error = %e, "ack_spawned_intents (unfulfillable/registered) failed");
@@ -936,19 +1005,75 @@ pub(crate) struct CoverResult {
 /// reaches `CellSketches::load` (controller's `connect_forever` to the
 /// scheduler in main.rs already orders that). Max 4 connections: persist
 /// is one upsert per cell per 10s tick.
-pub async fn connect_pg(
+/// `connect_pg` + `NodeClaimPoolReconciler::{new, run}` as a single
+/// `async fn`. Standalone (not an `async move` block in main.rs)
+/// because `connect_forever`'s inner `async ||` closure plus a
+/// borrowed param inside a nested `async move` block trips rustc's
+/// HRTB Send check (rust-lang/rust issue 102211 family); a named
+/// `async fn` desugars without the higher-ranked lifetime.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_nodeclaim_pool(
+    kube: kube::Client,
+    admin: AdminClient,
+    leader: LeaderState,
+    hooks: ControllerLeaseHooks,
+    cfg: NodeClaimPoolConfig,
+    hw_config: HwClassConfig,
+    pod_requested: PodRequestedCache,
+    placeable_tx: tokio::sync::watch::Sender<PlaceableSet>,
+    shutdown: rio_common::signal::Token,
+) {
+    let Some(pg) = connect_pg(&cfg.database_url, &shutdown).await else {
+        return;
+    };
+    NodeClaimPoolReconciler::new(
+        kube,
+        admin,
+        pg,
+        leader,
+        hooks,
+        cfg,
+        hw_config,
+        pod_requested,
+        placeable_tx,
+    )
+    .await
+    .run(shutdown)
+    .await;
+}
+
+async fn connect_pg(
     database_url: &str,
     shutdown: &rio_common::signal::Token,
 ) -> Option<sqlx::PgPool> {
-    rio_proto::client::connect_forever(shutdown, async || {
-        sqlx::postgres::PgPoolOptions::new()
+    // Hand-rolled retry (NOT `connect_forever`): the `async ||` form
+    // trips rustc's HRTB Send check when the caller is itself spawned
+    // via `spawn_monitored` (rust-lang/rust issue 102211 family).
+    // Same 1→2→4→8→16s-steady backoff schedule.
+    let mut delay = Duration::from_secs(1);
+    loop {
+        let try_connect = sqlx::postgres::PgPoolOptions::new()
             .max_connections(4)
             .min_connections(1)
             .idle_timeout(Duration::from_secs(60))
-            .connect(database_url)
-            .await
-    })
-    .await
+            .connect(database_url);
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return None,
+            r = try_connect => match r {
+                Ok(pg) => return Some(pg),
+                Err(e) => {
+                    warn!(error = %e, "PG connect failed; retrying");
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => return None,
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    delay = (delay * 2).min(Duration::from_secs(16));
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1032,15 +1157,20 @@ mod tests {
         );
     }
 
-    /// `ControllerLeaseHooks` is the no-state metrics-only impl. Prove
-    /// it's `Clone` (LeaseHooks bound) and the calls don't panic — the
-    /// metrics emission is asserted in the VM lease test, not here.
+    /// `ControllerLeaseHooks` flags propagate via shared `Arc` — the
+    /// run loop's `swap(false)` sees the lease loop's clone's `store`.
+    /// `Clone` (LeaseHooks bound) so it can be passed to both
+    /// `run_lease_loop` and `NodeClaimPoolReconciler::new`.
     #[test]
-    fn lease_hooks_clone_and_fire() {
-        let h = ControllerLeaseHooks;
+    fn lease_hooks_flags_propagate_via_clone() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let h = ControllerLeaseHooks::default();
         let h2 = h.clone();
         rio_lease::LeaseHooks::on_acquire(&h2);
+        assert!(h.reload.swap(false, SeqCst), "reload set via clone");
+        assert!(!h.lose.load(SeqCst));
         rio_lease::LeaseHooks::on_lose(&h2);
+        assert!(h.lose.swap(false, SeqCst), "lose set via clone");
     }
 
     #[test]

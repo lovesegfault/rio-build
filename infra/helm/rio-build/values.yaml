@@ -140,10 +140,10 @@ monitoring:
 # rio-controller
 # ──────────────────────────────────────────────────────────────────────────
 # K8s operator. Watches Pool CRDs, spawns one Job per
-# build/FOD. HARD replicas=1: NOT leader-elected. Two controllers fight —
-# both create Jobs for the same queue depth, doubling spawn. kube-runtime
-# handles concurrent reconcile within one process but not across processes.
-# 30s reschedule gap during pod restart is acceptable.
+# build/FOD. HARD replicas=1: only the nodeclaim_pool reconciler is
+# lease-gated (rolling-upgrade surge safety); the Pool reconciler is
+# NOT — two replicas double-spawn Jobs. 30s reschedule gap during pod
+# restart is acceptable.
 controller:
   enabled: true
   image: rio-controller
