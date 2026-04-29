@@ -4,8 +4,8 @@
 use tonic::Status;
 
 use rio_proto::types::{
-    SlaCandidateRow, SlaDefaultsResponse, SlaExplainResponse, SlaOverride, SlaProbeShape,
-    SlaStatusResponse, SlaTier,
+    GetSlaMispredictorsResponse, SlaCandidateRow, SlaDefaultsResponse, SlaExplainResponse,
+    SlaMispredictorEntry, SlaOverride, SlaProbeShape, SlaStatusResponse, SlaTier,
 };
 
 use crate::db::SlaOverrideRow;
@@ -198,6 +198,25 @@ pub(super) fn defaults_from_config(cfg: &SlaConfig) -> SlaDefaultsResponse {
         max_disk_bytes: cfg.max_disk,
         hw_classes,
         reference_hw_class: cfg.reference_hw_class.clone(),
+    }
+}
+
+/// `MispredictorEntry` list → proto. Order is already
+/// `|1 − ratio|`-descending from [`crate::sla::SlaEstimator::top_mispredictors`].
+pub(super) fn mispredictors_to_proto(
+    entries: Vec<crate::sla::metrics::MispredictorEntry>,
+) -> GetSlaMispredictorsResponse {
+    GetSlaMispredictorsResponse {
+        entries: entries
+            .into_iter()
+            .map(|(k, dim, ratio)| SlaMispredictorEntry {
+                pname: k.pname,
+                system: k.system,
+                tenant: k.tenant,
+                dim: dim.to_string(),
+                ratio,
+            })
+            .collect(),
     }
 }
 

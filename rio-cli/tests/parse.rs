@@ -192,6 +192,9 @@ fn per_subcommand_help_renders() {
 #[case::pool_describe(&["pool", "describe", "my-pool"], true)]
 #[case::pool_describe_missing_name(&["pool", "describe"], false)]
 #[case::pool_bare(&["pool"], false)]
+// sla mispredictors: --top optional with default.
+#[case::sla_mispredictors_default(&["sla", "mispredictors"], true)]
+#[case::sla_mispredictors_top(&["sla", "mispredictors", "--top", "20"], true)]
 // upstream: nested. list/add/remove all need --tenant; add/remove need --url.
 #[case::upstream_list(&["upstream", "list", "--tenant", "t1"], true)]
 #[case::upstream_list_no_tenant(&["upstream", "list"], false)]

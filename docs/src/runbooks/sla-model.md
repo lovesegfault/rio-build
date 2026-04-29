@@ -29,10 +29,19 @@ pname — `rio_scheduler_sla_prediction_ratio` is a histogram, so there is
 no per-pname series to `topk` over). Find candidate keys via the CLI:
 
 ```bash
-# TODO(R24B6): rio-cli sla mispredictors --top 10
-# Until that lands, list active fits and inspect the high-traffic ones:
-rio-cli sla list | head -20
+rio-cli sla mispredictors --top 10
 ```
+
+```text
+PNAME                    SYSTEM         TENANT       DIM    RATIO
+chromium                 x86_64-linux   acme        wall    2.841
+llvm                     aarch64-linux  acme         mem    0.312
+…
+```
+
+The ring is in-memory (this leader's tenure only) and fills as builds
+with a fitted curve complete. If empty, fall back to `rio-cli sla list`
+and inspect high-traffic keys manually.
 
 For each suspect pname, dump the cached fit:
 

@@ -119,6 +119,67 @@ pub struct CompletionScore {
     pub envelope: Option<(String, &'static str, &'static str)>,
 }
 
+/// One observed `(key, dim, ratio)` for `GetSlaMispredictors`.
+pub type MispredictorEntry = (super::types::ModelKey, &'static str, f64);
+
+/// Bounded ring of recent prediction-ratio observations. The
+/// `sla_prediction_ratio` histogram is `dim`-only (cardinality), so the
+/// `RioSlaPredictionDrift` runbook cannot name a pname from Prometheus.
+/// This is the per-key surface — in-memory, this leader's tenure only,
+/// capped at `cap` entries (oldest dropped). [`Self::top_n`] dedups by
+/// `(key, dim)` keeping the most recent observation, then sorts by
+/// `|1 − ratio|` descending.
+#[derive(Debug)]
+pub struct MispredictorTracker {
+    ring: parking_lot::Mutex<std::collections::VecDeque<MispredictorEntry>>,
+    cap: usize,
+}
+
+impl MispredictorTracker {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            ring: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(cap)),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Push the score's per-dim ratios. `None` ratios (probe-path /
+    /// `actual_mem=0`) are skipped — same gate as the histogram emit.
+    pub fn record(&self, key: &super::types::ModelKey, score: &CompletionScore) {
+        let mut ring = self.ring.lock();
+        for (dim, r) in [("wall", score.ratio_wall), ("mem", score.ratio_mem)] {
+            if let Some(r) = r {
+                if ring.len() >= self.cap {
+                    ring.pop_front();
+                }
+                ring.push_back((key.clone(), dim, r));
+            }
+        }
+    }
+
+    /// Snapshot, dedup by `(key, dim)` keeping the MOST RECENT (later
+    /// ring entries overwrite earlier), sort by `|1 − ratio|` desc,
+    /// truncate to `n`.
+    pub fn top_n(&self, n: usize) -> Vec<MispredictorEntry> {
+        use std::collections::HashMap;
+        let ring = self.ring.lock();
+        let mut latest: HashMap<(super::types::ModelKey, &'static str), f64> = HashMap::new();
+        for (k, dim, r) in ring.iter() {
+            latest.insert((k.clone(), *dim), *r);
+        }
+        let mut v: Vec<MispredictorEntry> =
+            latest.into_iter().map(|((k, d), r)| (k, d, r)).collect();
+        v.sort_by(|a, b| {
+            (b.2 - 1.0)
+                .abs()
+                .total_cmp(&(a.2 - 1.0).abs())
+                .then_with(|| a.0.pname.cmp(&b.0.pname))
+        });
+        v.truncate(n);
+        v
+    }
+}
+
 /// Score one completion against its dispatch-time prediction.
 ///
 /// `actual_mem=0` ("poller didn't fire") is treated as no-signal — a
@@ -658,5 +719,74 @@ mod tests {
         // Same wall on slow hw (factor=1.0) at p90=40s → miss.
         let s2 = score_completion(50.0, 1.0, 1 << 30, &pred(100.0, 2 << 30, "normal", 40.0));
         assert_eq!(s2.envelope, Some(("normal".into(), "miss", "wall")));
+    }
+
+    fn mk(p: &str) -> crate::sla::types::ModelKey {
+        crate::sla::types::ModelKey {
+            pname: p.into(),
+            system: "x86_64-linux".into(),
+            tenant: String::new(),
+        }
+    }
+
+    #[test]
+    fn mispredictor_tracker_dedup_sort_cap() {
+        let t = MispredictorTracker::new(4);
+        // Two observations for "a" wall — most recent (3.0) wins.
+        t.record(
+            &mk("a"),
+            &CompletionScore {
+                ratio_wall: Some(1.5),
+                ratio_mem: None,
+                envelope: None,
+            },
+        );
+        t.record(
+            &mk("a"),
+            &CompletionScore {
+                ratio_wall: Some(3.0),
+                ratio_mem: None,
+                envelope: None,
+            },
+        );
+        // "b" with both dims; mem ratio close to 1.
+        t.record(
+            &mk("b"),
+            &CompletionScore {
+                ratio_wall: Some(0.8),
+                ratio_mem: Some(1.05),
+                envelope: None,
+            },
+        );
+        let top = t.top_n(10);
+        // 3 distinct (key, dim) entries; sorted by |1-r| desc:
+        // a/wall=3.0 (|2.0|), b/wall=0.8 (|0.2|), b/mem=1.05 (|0.05|).
+        assert_eq!(top.len(), 3);
+        assert_eq!(
+            (top[0].0.pname.as_str(), top[0].1, top[0].2),
+            ("a", "wall", 3.0)
+        );
+        assert_eq!((top[1].0.pname.as_str(), top[1].1), ("b", "wall"));
+        assert_eq!((top[2].0.pname.as_str(), top[2].1), ("b", "mem"));
+        // top_n(1) truncates.
+        assert_eq!(t.top_n(1).len(), 1);
+        // Ring cap: 4 entries already; one more push pops the oldest
+        // (a/wall=1.5, which is already shadowed by 3.0 — no behavior
+        // change). Push 3 more "c" observations to evict a's 3.0.
+        for _ in 0..3 {
+            t.record(
+                &mk("c"),
+                &CompletionScore {
+                    ratio_wall: Some(1.0),
+                    ratio_mem: None,
+                    envelope: None,
+                },
+            );
+        }
+        let top2 = t.top_n(10);
+        assert!(
+            !top2.iter().any(|(k, _, _)| k.pname == "a"),
+            "ring cap evicted a: got {top2:?}"
+        );
     }
 }

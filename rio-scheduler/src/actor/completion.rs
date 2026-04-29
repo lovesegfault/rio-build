@@ -1692,6 +1692,7 @@ impl DagActor {
                             peak_memory_bytes,
                             pred,
                         );
+                        self.sla_estimator.record_misprediction(&key, &score);
                         if let Some(r) = score.ratio_wall {
                             ::metrics::histogram!(
                                 "rio_scheduler_sla_prediction_ratio",

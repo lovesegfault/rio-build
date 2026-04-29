@@ -39,6 +39,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "SlaDefaultsResponse",
         "SlaTier",
         "SlaProbeShape",
+        "GetSlaMispredictorsResponse",
+        "SlaMispredictorEntry",
     ] {
         b = b.type_attribute(format!("rio.types.{ty}"), "#[derive(serde::Serialize)]");
     }

@@ -474,6 +474,13 @@ pub enum AdminQuery {
         key: crate::sla::types::ModelKey,
         reply: oneshot::Sender<crate::sla::explain::ExplainResult>,
     },
+    /// `AdminService.GetSlaMispredictors`: top-`n` recent `|1 − ratio|`
+    /// observations from the in-memory ring. Reply is the deduped +
+    /// sorted entry list; the RPC handler projects to proto.
+    SlaMispredictors {
+        top_n: u32,
+        reply: oneshot::Sender<Vec<crate::sla::metrics::MispredictorEntry>>,
+    },
     /// `AdminService.ExportSlaCorpus`: dump every cached fit with
     /// `n_eff ≥ min_n` (optionally tenant-filtered) as a portable seed
     /// corpus. Reply is the corpus struct; the RPC handler serializes.
@@ -654,6 +661,7 @@ impl AdminQuery {
             Self::SlaStatus { .. } => "SlaStatus",
             Self::SlaEvict { .. } => "SlaEvict",
             Self::SlaExplain { .. } => "SlaExplain",
+            Self::SlaMispredictors { .. } => "SlaMispredictors",
             Self::SlaExportCorpus { .. } => "SlaExportCorpus",
             Self::SlaHwSampled { .. } => "SlaHwSampled",
             Self::SlaImportCorpus { .. } => "SlaImportCorpus",

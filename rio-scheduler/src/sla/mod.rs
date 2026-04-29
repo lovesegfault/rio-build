@@ -211,6 +211,13 @@ pub struct SlaEstimator {
     cluster: String,
     last_tick: RwLock<f64>,
     ring_buffer: u32,
+    /// Recent per-`(ModelKey, dim)` prediction-ratio observations for
+    /// `GetSlaMispredictors`. The histogram metric is `dim`-only
+    /// (cardinality), so this is the per-key surface the
+    /// `RioSlaPredictionDrift` runbook needs to name a candidate
+    /// pname. In-memory ring (this leader's tenure only); cap is fixed
+    /// — it's a diagnostic surface, not a model input.
+    mispredictors: metrics::MispredictorTracker,
 }
 
 impl SlaEstimator {
@@ -264,7 +271,21 @@ impl SlaEstimator {
             cluster: cfg.cluster.clone(),
             last_tick: RwLock::new(0.0),
             ring_buffer: cfg.ring_buffer,
+            mispredictors: metrics::MispredictorTracker::new(1024),
         }
+    }
+
+    /// Push one completion's prediction ratios into the mispredictor
+    /// ring (for `GetSlaMispredictors`). Same gates as the histogram
+    /// emit — `None` ratios skipped.
+    pub fn record_misprediction(&self, key: &types::ModelKey, score: &metrics::CompletionScore) {
+        self.mispredictors.record(key, score);
+    }
+
+    /// Snapshot the top-`n` `|1 − ratio|` recent observations, deduped
+    /// by `(key, dim)`.
+    pub fn top_mispredictors(&self, n: usize) -> Vec<metrics::MispredictorEntry> {
+        self.mispredictors.top_n(n)
     }
 
     /// Swap in a freshly-loaded hw table, plus the per-populated-load

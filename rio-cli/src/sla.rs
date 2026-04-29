@@ -10,8 +10,9 @@ use clap::Subcommand;
 
 use crate::AdminClient;
 use rio_proto::types::{
-    ExportSlaCorpusRequest, ImportSlaCorpusRequest, ListSlaOverridesRequest, ResetSlaModelRequest,
-    SetSlaOverrideRequest, SlaExplainRequest, SlaOverride, SlaStatusRequest,
+    ExportSlaCorpusRequest, GetSlaMispredictorsRequest, ImportSlaCorpusRequest,
+    ListSlaOverridesRequest, ResetSlaModelRequest, SetSlaOverrideRequest, SlaExplainRequest,
+    SlaOverride, SlaStatusRequest,
 };
 
 #[derive(Subcommand, Clone)]
@@ -81,6 +82,15 @@ pub enum SlaCmd {
     },
     /// Print the configured tier ladder + probe shape.
     Defaults,
+    /// Top-`|1 − ratio|` recent prediction-ratio observations per
+    /// `(pname, system, tenant, dim)`. The `sla_prediction_ratio`
+    /// histogram is `dim`-only — this is the per-key surface for the
+    /// `RioSlaPredictionDrift` runbook's "name a candidate pname"
+    /// step. In-memory ring; reflects this leader's tenure only.
+    Mispredictors {
+        #[arg(long, default_value = "10")]
+        top: u32,
+    },
     /// Per-derivation solve trace: re-runs the tier walk in dry-run
     /// mode and prints a candidate table showing why each tier was
     /// accepted or rejected.
@@ -318,6 +328,37 @@ pub(crate) async fn run(
                 resp.hw_classes.join(", "),
                 resp.reference_hw_class,
             );
+            Ok(())
+        }
+        SlaCmd::Mispredictors { top } => {
+            let resp = crate::rpc("GetSlaMispredictors", async || {
+                client
+                    .get_sla_mispredictors(GetSlaMispredictorsRequest { top_n: top })
+                    .await
+            })
+            .await?;
+            if as_json {
+                return crate::json(&resp);
+            }
+            if resp.entries.is_empty() {
+                println!("(no observations — ring fills as builds with a fitted curve complete)");
+                return Ok(());
+            }
+            println!(
+                "{:<24} {:<14} {:<10} {:>5} {:>8}",
+                "PNAME", "SYSTEM", "TENANT", "DIM", "RATIO"
+            );
+            for e in &resp.entries {
+                println!(
+                    "{:<24} {:<14} {:<10} {:>5} {:>8.3}",
+                    e.pname,
+                    e.system,
+                    if e.tenant.is_empty() { "-" } else { &e.tenant },
+                    e.dim,
+                    e.ratio,
+                );
+            }
+            println!("\n>1 = under-predicted (actual > predicted); <1 = over-predicted.");
             Ok(())
         }
         SlaCmd::Explain {

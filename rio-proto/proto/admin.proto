@@ -160,6 +160,15 @@ service AdminService {
   // probe shapes are in effect without reading scheduler.toml off the pod.
   rpc GetSlaDefaults(google.protobuf.Empty) returns (rio.types.SlaDefaultsResponse);
 
+  // Top-|1-ratio| recent prediction-ratio observations per (pname,
+  // system, tenant, dim). The `sla_prediction_ratio` histogram is
+  // dim-only — this is the per-key surface the `RioSlaPredictionDrift`
+  // runbook needs to name a candidate pname. In-memory ring (bounded
+  // by `[sla].mispredictor_ring_capacity`); reflects this leader's
+  // tenure only.
+  rpc GetSlaMispredictors(rio.types.GetSlaMispredictorsRequest)
+      returns (rio.types.GetSlaMispredictorsResponse);
+
   // Dump every cached fit with n_eff ≥ min_n as a portable JSON corpus
   // (one (s,p,q,p_bar,a,b,n) tuple per (pname,system)). `rio-cli sla
   // export-corpus` writes this to a file; `import-corpus` on a fresh

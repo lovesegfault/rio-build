@@ -31,7 +31,8 @@ use rio_proto::types::{
     CreateTenantRequest, CreateTenantResponse, DebugExecutorState, DebugListExecutorsResponse,
     DeleteTenantRequest, DeleteTenantResponse, DrainExecutorRequest, DrainExecutorResponse,
     ExportSlaCorpusRequest, ExportSlaCorpusResponse, GcProgress, GcRequest, GetBuildGraphRequest,
-    GetBuildGraphResponse, GetBuildLogsRequest, GetHwClassConfigResponse, GetSpawnIntentsRequest,
+    GetBuildGraphResponse, GetBuildLogsRequest, GetHwClassConfigResponse,
+    GetSlaMispredictorsRequest, GetSlaMispredictorsResponse, GetSpawnIntentsRequest,
     GetSpawnIntentsResponse, HwClassSampledRequest, HwClassSampledResponse, ImportSlaCorpusRequest,
     ImportSlaCorpusResponse, InjectBuildSampleRequest, InspectBuildDagRequest,
     InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse, ListExecutorsRequest,
@@ -1027,6 +1028,27 @@ impl AdminService for AdminServiceImpl {
         self.ensure_service_caller(request.metadata(), &["rio-cli"])?;
         self.ensure_leader()?;
         Ok(Response::new(sla::defaults_from_config(&self.sla_config)))
+    }
+
+    #[instrument(skip(self, request), fields(rpc = "GetSlaMispredictors"))]
+    async fn get_sla_mispredictors(
+        &self,
+        request: Request<GetSlaMispredictorsRequest>,
+    ) -> Result<Response<GetSlaMispredictorsResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        // r[impl sched.sla.threat.read-path-auth]
+        self.ensure_service_caller(request.metadata(), &["rio-cli"])?;
+        self.ensure_leader()?;
+        self.check_actor_alive()?;
+        let r = request.into_inner();
+        let entries = query_actor(&self.actor, |reply| {
+            ActorCommand::Admin(AdminQuery::SlaMispredictors {
+                top_n: r.top_n,
+                reply,
+            })
+        })
+        .await?;
+        Ok(Response::new(sla::mispredictors_to_proto(entries)))
     }
 
     #[instrument(skip(self, request), fields(rpc = "ExportSlaCorpus"))]

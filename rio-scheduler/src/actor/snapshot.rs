@@ -125,6 +125,10 @@ impl DagActor {
                     override_.as_ref(),
                 ));
             }
+            AdminQuery::SlaMispredictors { top_n, reply } => {
+                let n = if top_n == 0 { 10 } else { top_n as usize };
+                let _ = reply.send(self.sla_estimator.top_mispredictors(n));
+            }
             AdminQuery::SlaExportCorpus {
                 tenant,
                 min_n,
