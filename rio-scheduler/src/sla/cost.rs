@@ -35,10 +35,10 @@ use super::config::{CapacityType, Cell, HwClassName, cell_label, parse_cell};
 
 /// One instance type in a cell's menu. `cores`/`mem_bytes` gate
 /// [`CostTable::smallest_fitting`]'s capacity-reject; `name`+`cores`
-/// drive [`poll_spot_once`]'s per-type AWS query and `$/vCPU` divisor.
+/// drive `poll_spot_once`'s per-type AWS query and `$/vCPU` divisor.
 /// `price_per_vcpu_hr` is seed-only (the per-cell EMA in
 /// [`CostTable::price`] is what `smallest_fitting` returns); kept for
-/// [`CostTable::set_menu`] test ergonomics.
+/// `set_menu` test ergonomics.
 #[derive(Debug, Clone)]
 pub struct InstanceType {
     pub name: String,

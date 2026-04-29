@@ -823,6 +823,16 @@ The per-class spot-interrupt rate estimate is
 `λ̂[h] = (EMA(interrupts) + n_λ·λ_seed) / (EMA(exposure) + n_λ)` with
 `n_λ = 1day · max(1, EMA_24h(node_count_{h,spot}))`.
 
+r[sched.sla.cost-instance-type-feedback]
+The per-cell instance-type menu (`CostTable.cells`) is populated by
+controller-observed feedback: `nodeclaim_pool` reports each resolved
+NodeClaim's `node.kubernetes.io/instance-type` (with kubelet
+`allocatable.{cores,mem}`) via `AckSpawnedIntents.observed_instance_
+types`; the scheduler folds these into the menu (union-only, persisted
+to `sla_observed_instance_types`). The menu drives `spot_price_poller`'s
+per-type AWS query and gates `smallest_fitting`'s capacity-reject; the
+returned price is the per-cell EMA, not a per-type field.
+
 r[sched.sla.forecast.one-layer]
 `compute_spawn_intents` walks the Ready frontier AND a forecast
 frontier of `Queued` derivations whose every incomplete dependency is
