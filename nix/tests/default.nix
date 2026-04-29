@@ -823,7 +823,7 @@ in
             ${nullKeys "      " prodHw}
                   vmtest:
                     labels:
-                      - {key: kubernetes.io/hostname, value: agent}
+                      - {key: rio.build/vmtest, value: "true"}
                 referenceHwClass: vmtest
                 leadTimeSeed:
             ${nullKeys "      " prodCells}

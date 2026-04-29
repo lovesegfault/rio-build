@@ -99,12 +99,14 @@ scheduler:
     maxMem: 2147483648         # 2 GiB
     maxDisk: 6442450944        # 6 GiB
     defaultDisk: 2147483648    # 2 GiB
-    # k3s VM has no Karpenter labels — key on hostname so the agent
-    # node matches. hwCostSource=static (no IRSA in VM).
+    # k3s VM has no Karpenter labels. NodeClaim CRD CEL rejects
+    # `kubernetes.io/hostname` in spec.requirements ("label is
+    # restricted") — use a rio.build/ key the k3s-agent kubelet
+    # registers via --node-label. hwCostSource=static (no IRSA in VM).
     hwClasses:
       vmtest:
         labels:
-          - {key: kubernetes.io/hostname, value: agent}
+          - {key: rio.build/vmtest, value: "true"}
     hwCostSource: static
     referenceHwClass: vmtest
 

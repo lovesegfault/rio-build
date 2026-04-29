@@ -687,6 +687,13 @@ let
         extraFlags = [
           "--node-ip"
           config.networking.primaryIPv6Address
+          # vmtest-full.yaml's `[sla.hw_classes.vmtest]` label
+          # conjunction. NodeClaim CRD CEL rejects
+          # `kubernetes.io/hostname` in spec.requirements, so the
+          # hwClass keys on this label and node_informer's match_node
+          # classifies the real agent via it.
+          "--node-label"
+          "rio.build/vmtest=true"
         ];
       };
 
