@@ -8,7 +8,7 @@
 //! Karpenter+kubelet overhead floor). Active/shadow rotation gives a
 //! sliding window without losing the warm quantile during cold-start.
 //!
-//! Persisted as version-tagged bincode `bytea` (DDSketch's bucket array
+//! Persisted as version-tagged postcard `bytea` (DDSketch's bucket array
 //! is dense-packed integers; ~1KiB binary vs ~8KiB JSON) per
 //! `r[ctrl.nodeclaim.lead-time-ddsketch]`. The reconciler loads on
 //! construct, persists every tick.
@@ -23,7 +23,7 @@ use tracing::{debug, warn};
 use super::consolidate::IdleGapEvent;
 use super::ffd::LiveNode;
 
-/// bincode encoding version tag (4 LE bytes prefix). Bump on any
+/// postcard encoding version tag (4 LE bytes prefix). Bump on any
 /// `sketches-ddsketch` serde-shape change; [`decode_versioned`] returns
 /// `None` on mismatch and the caller falls back to seed.
 const SKETCH_VERSION: u32 = 1;
@@ -398,27 +398,22 @@ impl CellSketches {
     }
 }
 
-/// `[SKETCH_VERSION le-u32][bincode(DDSketch)]`. `unwrap`: DDSketch's
+/// `[SKETCH_VERSION le-u32][postcard(DDSketch)]`. `unwrap`: DDSketch's
 /// derived `Serialize` is infallible into `Vec<u8>`.
 pub fn encode_versioned(s: &DDSketch) -> Vec<u8> {
     let mut buf = SKETCH_VERSION.to_le_bytes().to_vec();
-    buf.extend(
-        bincode::serde::encode_to_vec(s, bincode::config::standard())
-            .expect("DDSketch serialize is infallible"),
-    );
+    buf.extend(postcard::to_stdvec(s).expect("DDSketch serialize is infallible"));
     buf
 }
 
 /// Inverse of [`encode_versioned`]. `None` on short input, version
-/// mismatch, or bincode error — caller falls back to seed/empty.
+/// mismatch, or postcard error — caller falls back to seed/empty.
 pub fn decode_versioned(bytes: &[u8]) -> Option<DDSketch> {
     let tag: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
     if u32::from_le_bytes(tag) != SKETCH_VERSION {
         return None;
     }
-    bincode::serde::decode_from_slice(&bytes[4..], bincode::config::standard())
-        .ok()
-        .map(|(s, _)| s)
+    postcard::from_bytes(&bytes[4..]).ok()
 }
 
 /// `decode_versioned` with `None`-column / decode-failure both mapping
@@ -474,7 +469,7 @@ mod tests {
         let rt = back.quantile(0.9).unwrap().unwrap();
         assert!(
             (orig - rt).abs() < 1e-9,
-            "bincode round-trip should be exact (got {orig} vs {rt})"
+            "postcard round-trip should be exact (got {orig} vs {rt})"
         );
     }
 

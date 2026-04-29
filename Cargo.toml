@@ -138,12 +138,12 @@ lru = "0.16"
 # typical). Already transitive via tokio/dashmap (zero lockfile churn).
 smallvec = "1"
 # DDSketch lead-time/boot quantiles (ADR-023 §13b @alg-pool); persisted
-# to PG as bytea via bincode. `use_serde`: the sketch itself impls
+# to PG as bytea via postcard. `use_serde`: the sketch itself impls
 # Serialize so the on-the-wire shape is the crate's, not ours.
 sketches-ddsketch = { version = "0.3", features = ["use_serde"] }
-# DDSketch persist encoding. v2 (NOT v1): explicit `config::standard()`
-# at the callsite — no ambient bincode::Options state.
-bincode = { version = "2", features = ["serde"] }
+# DDSketch persist encoding. postcard (no_std serde wire format,
+# varint-packed); replaces bincode 2.x (RUSTSEC-2025-0141 unmaintained).
+postcard = { version = "1", features = ["use-std"] }
 
 # Per-tenant rate limiting (phase4b gateway). DefaultKeyedRateLimiter
 # keyed on tenant_name (bounded keyspace — authorized_keys comment is
