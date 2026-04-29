@@ -746,9 +746,12 @@ in
   # leadTimeSeed,maxFleetCores,...}` render into the rio-controller-config
   # ConfigMap's `[nodeclaim_pool]` TOML table (instance_menu is a nested
   # map-of-list — figment's Env provider only yields strings, so the
-  # ConfigMap mount is the ONLY load path). One `vmtest:spot` cell with
-  # one menu entry covering vmtest-full's max_cores=16 / max_mem=2Gi
-  # keeps `placement_sim_mismatch_total{reason=menu_gap}` unreachable.
+  # ConfigMap mount is the ONLY load path). The 12 prod hwClasses + 24-cell
+  # instanceMenu/leadTimeSeed are per-subkey-nulled in the fixture overlay
+  # so hwClasses / instanceMenu / leadTimeSeed key-sets all = {vmtest}; one
+  # `vmtest:spot` menu entry covering vmtest-full's max_cores=16 /
+  # max_mem=2Gi keeps `placement_sim_mismatch_total{reason=menu_gap}`
+  # unreachable.
   #
   # r[verify ctrl.nodeclaim.ffd-sim]
   # r[verify ctrl.nodeclaim.shim-nodepool]
@@ -767,27 +770,73 @@ in
       extraValues = {
         "packedScheduler.image" = kwok.kubeSchedulerRef;
       };
-      extraValuesFiles = [
-        # `[sla]` overrides (vmtest-full.yaml's hwClasses.vmtest already
-        # populates `cells_of(SpawnIntent)`). max_fleet_cores capped at
-        # 64 so a runaway tick can't request more than the KWOK fixture
-        # synthesizes. Colon in `vmtest:spot` cell key needs YAML
-        # key-quoting.
-        (pkgs.writeText "kwok-nodeclaim-pool.yaml" ''
-          scheduler:
-            sla:
-              maxFleetCores: 64
-              maxNodeClaimsPerCellPerTick: 4
-              leadTimeSeed:
-                "vmtest:spot": 5.0
-              instanceMenu:
-                "vmtest:spot":
-                  - cores: 16
-                    memBytes: 4294967296
-                    diskBytes: 21474836480
-                    pricePerVcpuHr: 0.01
-        '')
-      ];
+      extraValuesFiles =
+        let
+          # B16: Helm deep-merges values.yaml's 12 hwClasses + 24-cell
+          # instanceMenu/leadTimeSeed with vmtest-full.yaml's `vmtest`,
+          # giving 13 hwClasses. The scheduler's solve_full draws
+          # SpawnIntent.hw_class_names from that 13-set excluding
+          # `vmtest`; `assign_to_cells` then never produces a
+          # `vmtest:spot` key and cover_deficit emits created=0. Helm
+          # only honours `null` deletion against CHART values.yaml (not
+          # prior `-f` files), so a whole-map `hwClasses: null` in one
+          # file followed by `hwClasses: {vmtest:...}` in the next
+          # coalesces to `{vmtest:...}` user-side then deep-merges back
+          # to 13 against chart defaults. Per-subkey nulls are the only
+          # way to delete chart-default map entries while keeping
+          # `vmtest` — generated here so the prod hwClass list stays
+          # single-sourced.
+          prodHw = [
+            "hi-nvme-x86"
+            "hi-nvme-arm"
+            "hi-ebs-x86"
+            "hi-ebs-arm"
+            "mid-nvme-x86"
+            "mid-nvme-arm"
+            "mid-ebs-x86"
+            "mid-ebs-arm"
+            "lo-nvme-x86"
+            "lo-nvme-arm"
+            "lo-ebs-x86"
+            "lo-ebs-arm"
+          ];
+          prodCells = pkgs.lib.concatMap (h: [
+            "${h}:spot"
+            "${h}:od"
+          ]) prodHw;
+          nullKeys = indent: ks: pkgs.lib.concatMapStringsSep "\n" (k: "${indent}\"${k}\": null") ks;
+        in
+        [
+          # `[sla]` vmtest-only. Per-subkey nulls wipe the 12 prod
+          # hwClasses + 24 prod instanceMenu/leadTimeSeed cells from
+          # chart defaults so instanceMenu / leadTimeSeed / hwClasses
+          # key-sets all = {vmtest}. max_fleet_cores capped at 64 so a
+          # runaway tick can't request more than the KWOK fixture
+          # synthesizes. Colon in `vmtest:spot` cell key needs YAML
+          # key-quoting.
+          (pkgs.writeText "kwok-nodeclaim-pool.yaml" ''
+            scheduler:
+              sla:
+                maxFleetCores: 64
+                maxNodeClaimsPerCellPerTick: 4
+                hwClasses:
+            ${nullKeys "      " prodHw}
+                  vmtest:
+                    labels:
+                      - {key: kubernetes.io/hostname, value: agent}
+                referenceHwClass: vmtest
+                leadTimeSeed:
+            ${nullKeys "      " prodCells}
+                  "vmtest:spot": 5.0
+                instanceMenu:
+            ${nullKeys "      " prodCells}
+                  "vmtest:spot":
+                    - cores: 16
+                      memBytes: 4294967296
+                      diskBytes: 21474836480
+                      pricePerVcpuHr: 0.01
+          '')
+        ];
     };
   };
 

@@ -900,6 +900,9 @@
                 # Same 2-node k3s fixture + bootstrap Job backoff.
                 # Asserts PSA-restricted — NOT in vmTestsCov (see removeAttrs below).
                 vm-lifecycle-prod-parity-k3s = 8;
+                # k3s base fixture + KWOK Stage rules faking Karpenter.
+                # §13b nodeclaim_pool reconciler e2e.
+                vm-sla-sizing-kwok = 8;
               };
             in
             # Dead-entry guard: every cpuHints key must name a real test.
@@ -944,15 +947,18 @@
           # gating gap; remove the entry (NOT the test) once the gap is
           # closed.
           vmTestsManual = [
-            # ADR-023 §13b kwok fixture: config loading + lease RBAC fixed
-            # (B16 — controller boots, reconciler ticks, FFD sees
-            # unplaced=4). NEW gating gap: cover_deficit emits created=0
-            # — assign_to_cells groups by cheapest A_open cell but the
-            # scheduler-emitted SpawnIntent.hw_class_names doesn't
-            # intersect `vmtest:spot` (`by_cell.get` returns None on the
-            # only instance_menu key). Promote to `checks` once the
-            # scheduler-side cell emission is verified to include the
-            # vmtest hw_class under the deep-merged 13-hwClass config.
+            # ADR-023 §13b kwok fixture: B16 closed (instanceMenu /
+            # hwClasses / leadTimeSeed key-sets aligned to {vmtest} via
+            # per-subkey null overlay; controller boots, reconciler
+            # ticks, FFD sees unplaced=4). NEW gating gap: cover_deficit
+            # still emits created=0 — cold-start fanout drvs have no
+            # build_samples history → DurationFit::Probe →
+            # snapshot.rs:793 returns None from the hw-aware arm →
+            # SpawnIntent.hw_class_names=[] → cells_of() empty →
+            # assign_to_cells drops every intent. Promote to `checks`
+            # once the scheduler emits a non-empty hw_class_names for
+            # Probe-fit intents (or the reconciler covers hw-agnostic
+            # unplaced via a fallback cell).
             "vm-sla-sizing-kwok"
           ];
 

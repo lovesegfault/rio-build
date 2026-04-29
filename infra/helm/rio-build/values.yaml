@@ -441,9 +441,122 @@ scheduler:
     # §13b instance-shape menu per `(hw_class:cap)` cell. Rendered into
     # the controller's `[nodeclaim_pool.instance_menu]` TOML (NOT env —
     # nested map-of-list can't load via figment Env). Each entry:
-    # {cores, memBytes, diskBytes, pricePerVcpuHr}. Empty default keeps
-    # the reconciler inert until xtask populates it.
-    instanceMenu: {}
+    # {cores, memBytes, diskBytes, pricePerVcpuHr}.
+    #
+    # Per-cell instance-type menu for §13b NodeClaim cover_deficit.
+    # Anchor = smallest fitting; bulk = mem-per-core ≥ median demand.
+    # Hand-curated; refresh when AWS adds gen-9.
+    #
+    # 24 cells = 12 hwClasses × {spot,od}. Each cell has 3 shapes:
+    #   large    (2c,  c-family mem 4 GiB)   — anchor for small intents
+    #   2xlarge  (8c,  m-family mem 32 GiB)  — bulk at 4 GiB/core
+    #   16xlarge (64c, m-family mem 256 GiB) — covers maxCores/maxMem
+    # diskBytes: ebs cells = 500 GiB (NodeClass blockDeviceMappings);
+    # nvme cells = instance-store floor (under-stated so the Karpenter-
+    # resolved type actually provides ≥ the request). pricePerVcpuHr is a
+    # static seed — relative ranking only (cover.rs::cell_price reads
+    # this, NOT the scheduler CostTable). Ranking: lo<mid<hi, arm<x86,
+    # ebs<nvme, spot≈0.35×od.
+    instanceMenu:
+      # ── hi (gen-8) ───────────────────────────────────────────────────
+      "hi-ebs-x86:spot":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 536870912000,  pricePerVcpuHr: 0.0196}  # c8a.large
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 536870912000,  pricePerVcpuHr: 0.0225}  # m8a.2xlarge
+        - {cores: 64, memBytes: 274877906944, diskBytes: 536870912000,  pricePerVcpuHr: 0.0225}  # m8a.16xlarge
+      "hi-ebs-x86:od":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 536870912000,  pricePerVcpuHr: 0.0560}
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 536870912000,  pricePerVcpuHr: 0.0644}
+        - {cores: 64, memBytes: 274877906944, diskBytes: 536870912000,  pricePerVcpuHr: 0.0644}
+      "hi-ebs-arm:spot":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 536870912000,  pricePerVcpuHr: 0.0157}  # c8g.large
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 536870912000,  pricePerVcpuHr: 0.0180}  # m8g.2xlarge
+        - {cores: 64, memBytes: 274877906944, diskBytes: 536870912000,  pricePerVcpuHr: 0.0180}  # m8g.16xlarge
+      "hi-ebs-arm:od":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 536870912000,  pricePerVcpuHr: 0.0448}
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 536870912000,  pricePerVcpuHr: 0.0515}
+        - {cores: 64, memBytes: 274877906944, diskBytes: 536870912000,  pricePerVcpuHr: 0.0515}
+      "hi-nvme-x86:spot":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 107374182400,  pricePerVcpuHr: 0.0231}  # c8id.large
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 483183820800,  pricePerVcpuHr: 0.0266}  # m8id.2xlarge
+        - {cores: 64, memBytes: 274877906944, diskBytes: 3865470566400, pricePerVcpuHr: 0.0266}  # m8id.16xlarge
+      "hi-nvme-x86:od":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 107374182400,  pricePerVcpuHr: 0.0661}
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 483183820800,  pricePerVcpuHr: 0.0760}
+        - {cores: 64, memBytes: 274877906944, diskBytes: 3865470566400, pricePerVcpuHr: 0.0760}
+      "hi-nvme-arm:spot":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 107374182400,  pricePerVcpuHr: 0.0185}  # c8gd.large
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 483183820800,  pricePerVcpuHr: 0.0213}  # m8gd.2xlarge
+        - {cores: 64, memBytes: 274877906944, diskBytes: 3865470566400, pricePerVcpuHr: 0.0213}  # m8gd.16xlarge
+      "hi-nvme-arm:od":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 107374182400,  pricePerVcpuHr: 0.0529}
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 483183820800,  pricePerVcpuHr: 0.0608}
+        - {cores: 64, memBytes: 274877906944, diskBytes: 3865470566400, pricePerVcpuHr: 0.0608}
+      # ── mid (gen-6/7) ────────────────────────────────────────────────
+      "mid-ebs-x86:spot":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 536870912000,  pricePerVcpuHr: 0.0168}  # c7a.large
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 536870912000,  pricePerVcpuHr: 0.0193}  # m7a.2xlarge
+        - {cores: 64, memBytes: 274877906944, diskBytes: 536870912000,  pricePerVcpuHr: 0.0193}  # m7a.16xlarge
+      "mid-ebs-x86:od":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 536870912000,  pricePerVcpuHr: 0.0480}
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 536870912000,  pricePerVcpuHr: 0.0552}
+        - {cores: 64, memBytes: 274877906944, diskBytes: 536870912000,  pricePerVcpuHr: 0.0552}
+      "mid-ebs-arm:spot":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 536870912000,  pricePerVcpuHr: 0.0134}  # c7g.large
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 536870912000,  pricePerVcpuHr: 0.0155}  # m7g.2xlarge
+        - {cores: 64, memBytes: 274877906944, diskBytes: 536870912000,  pricePerVcpuHr: 0.0155}  # m7g.16xlarge
+      "mid-ebs-arm:od":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 536870912000,  pricePerVcpuHr: 0.0384}
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 536870912000,  pricePerVcpuHr: 0.0442}
+        - {cores: 64, memBytes: 274877906944, diskBytes: 536870912000,  pricePerVcpuHr: 0.0442}
+      "mid-nvme-x86:spot":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 107374182400,  pricePerVcpuHr: 0.0198}  # c6id.large (gen-7 amd64 has no d-variant)
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 483183820800,  pricePerVcpuHr: 0.0228}  # m6id.2xlarge
+        - {cores: 64, memBytes: 274877906944, diskBytes: 3865470566400, pricePerVcpuHr: 0.0228}  # m6id.16xlarge
+      "mid-nvme-x86:od":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 107374182400,  pricePerVcpuHr: 0.0566}
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 483183820800,  pricePerVcpuHr: 0.0651}
+        - {cores: 64, memBytes: 274877906944, diskBytes: 3865470566400, pricePerVcpuHr: 0.0651}
+      "mid-nvme-arm:spot":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 107374182400,  pricePerVcpuHr: 0.0159}  # c7gd.large
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 483183820800,  pricePerVcpuHr: 0.0183}  # m7gd.2xlarge
+        - {cores: 64, memBytes: 274877906944, diskBytes: 3865470566400, pricePerVcpuHr: 0.0183}  # m7gd.16xlarge
+      "mid-nvme-arm:od":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 107374182400,  pricePerVcpuHr: 0.0453}
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 483183820800,  pricePerVcpuHr: 0.0521}
+        - {cores: 64, memBytes: 274877906944, diskBytes: 3865470566400, pricePerVcpuHr: 0.0521}
+      # ── lo (gen-6) ───────────────────────────────────────────────────
+      "lo-ebs-x86:spot":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 536870912000,  pricePerVcpuHr: 0.0140}  # c6a.large
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 536870912000,  pricePerVcpuHr: 0.0161}  # m6a.2xlarge
+        - {cores: 64, memBytes: 274877906944, diskBytes: 536870912000,  pricePerVcpuHr: 0.0161}  # m6a.16xlarge
+      "lo-ebs-x86:od":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 536870912000,  pricePerVcpuHr: 0.0400}
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 536870912000,  pricePerVcpuHr: 0.0460}
+        - {cores: 64, memBytes: 274877906944, diskBytes: 536870912000,  pricePerVcpuHr: 0.0460}
+      "lo-ebs-arm:spot":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 536870912000,  pricePerVcpuHr: 0.0112}  # c6g.large
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 536870912000,  pricePerVcpuHr: 0.0129}  # m6g.2xlarge
+        - {cores: 64, memBytes: 274877906944, diskBytes: 536870912000,  pricePerVcpuHr: 0.0129}  # m6g.16xlarge
+      "lo-ebs-arm:od":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 536870912000,  pricePerVcpuHr: 0.0320}
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 536870912000,  pricePerVcpuHr: 0.0368}
+        - {cores: 64, memBytes: 274877906944, diskBytes: 536870912000,  pricePerVcpuHr: 0.0368}
+      "lo-nvme-x86:spot":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 107374182400,  pricePerVcpuHr: 0.0165}  # c6id.large
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 483183820800,  pricePerVcpuHr: 0.0190}  # m6id.2xlarge
+        - {cores: 64, memBytes: 274877906944, diskBytes: 3865470566400, pricePerVcpuHr: 0.0190}  # m6id.16xlarge
+      "lo-nvme-x86:od":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 107374182400,  pricePerVcpuHr: 0.0472}
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 483183820800,  pricePerVcpuHr: 0.0543}
+        - {cores: 64, memBytes: 274877906944, diskBytes: 3865470566400, pricePerVcpuHr: 0.0543}
+      "lo-nvme-arm:spot":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 107374182400,  pricePerVcpuHr: 0.0132}  # c6gd.large
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 483183820800,  pricePerVcpuHr: 0.0152}  # m6gd.2xlarge
+        - {cores: 64, memBytes: 274877906944, diskBytes: 3865470566400, pricePerVcpuHr: 0.0152}  # m6gd.16xlarge
+      "lo-nvme-arm:od":
+        - {cores: 2,  memBytes: 4294967296,   diskBytes: 107374182400,  pricePerVcpuHr: 0.0378}
+        - {cores: 8,  memBytes: 34359738368,  diskBytes: 483183820800,  pricePerVcpuHr: 0.0434}
+        - {cores: 64, memBytes: 274877906944, diskBytes: 3865470566400, pricePerVcpuHr: 0.0434}
     leadTimeSeed:
       "hi-ebs-arm:od": 17.0
       "hi-ebs-arm:spot": 18.0
