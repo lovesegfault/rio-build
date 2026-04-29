@@ -164,4 +164,12 @@ pub fn describe_metrics() {
          covers (maxCores,maxMem,maxDisk), so a non-zero rate means the \
          scheduler is emitting out-of-spec sizing or the menu drifted."
     );
+    describe_counter!(
+        "rio_controller_nodeclaim_reaped_total",
+        "nodeclaim_pool NodeClaim deletions by `reason` × `cell`. \
+         reason=idle: NA-consolidate break-even; reason=ice: \
+         Launched=False past timeout; reason=boot-timeout: \
+         Launched=True ∧ Registered=False past timeout; reason=dead: \
+         scheduler-reported hung node."
+    );
 }

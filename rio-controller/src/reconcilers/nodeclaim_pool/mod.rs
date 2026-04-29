@@ -45,7 +45,7 @@ use rio_proto::types::{GetSpawnIntentsRequest, GetSpawnIntentsResponse, SpawnInt
 use crate::reconcilers::node_informer::HwClassConfig;
 use crate::reconcilers::{AdminClient, admin_call};
 
-pub use consolidate::IdleGapEvent;
+pub use consolidate::{HOLD_OPEN_ANNOTATION, IdleGapEvent};
 pub use cover::{InstanceType, NODEPOOL_LABEL, SHIM_NODEPOOL};
 pub use ffd::{CAPACITY_TYPE_LABEL, HW_CLASS_LABEL, LiveNode, Placement, a_open, cells_of};
 pub use sketch::{CapacityType, Cell, CellSketches, CellState};
@@ -60,6 +60,15 @@ const TICK: Duration = Duration::from_secs(10);
 /// on stale data, but DO keep reaping idle/unhealthy nodes — those reads
 /// are kube-only.
 const BOT_TICKS_BEFORE_CONSOLIDATE_ONLY: u8 = 5;
+
+/// Unix-epoch seconds `now()`. Condition `lastTransitionTime` and
+/// `creationTimestamp` are RFC3339; comparing in epoch-seconds keeps
+/// arithmetic in `f64` throughout.
+fn now_epoch() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}
 
 /// Label selector for NodeClaims this reconciler owns. Stamped at
 /// `create()` time so `list_live_nodeclaims` and the consolidator never
@@ -138,6 +147,15 @@ impl NodeClaimPoolConfig {
             .map(|t| t.price_per_vcpu_hr)
             .min_by(f64::total_cmp)
             .unwrap_or(f64::MAX)
+    }
+
+    /// `lead_time_seed[cell]` (seconds). 0 for unconfigured cells —
+    /// callers use this as a floor so 0 degenerates to "no floor".
+    pub fn seed_for(&self, cell: &Cell) -> f64 {
+        self.lead_time_seed
+            .get(&cell.to_string())
+            .copied()
+            .unwrap_or(0.0)
     }
 
     /// All configured cells (parsed from `instance_menu` keys), for
@@ -364,12 +382,14 @@ impl NodeClaimPoolReconciler {
         self.report_unfulfillable(&cover.ice_cells, &registered_cells)
             .await?;
 
+        let now = now_epoch();
         consolidate::reap_idle(
             &self.nodeclaims,
             &live,
             &placeable,
-            &self.sketches,
+            &mut self.sketches,
             &self.cfg,
+            now,
         )
         .await?;
         health::reap_unhealthy(
@@ -393,7 +413,16 @@ impl NodeClaimPoolReconciler {
             "consolidate-only (scheduler unreachable)"
         );
         let live = self.list_live_nodeclaims().await?;
-        consolidate::reap_idle(&self.nodeclaims, &live, &[], &self.sketches, &self.cfg).await?;
+        let now = now_epoch();
+        consolidate::reap_idle(
+            &self.nodeclaims,
+            &live,
+            &[],
+            &mut self.sketches,
+            &self.cfg,
+            now,
+        )
+        .await?;
         // No `dead_nodes` signal without the scheduler; B11's local
         // ICE-timeout detection still runs on `live`.
         health::reap_unhealthy(&self.nodeclaims, &live, &[], &mut self.sketches).await?;
