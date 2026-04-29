@@ -705,24 +705,26 @@ impl NodeClaimPoolReconciler {
         // scheduler reachable.
         health::reap_unhealthy(&self.nodeclaims, &live, &[], &self.sketches, &self.cfg, now)
             .await?;
+        // FFD-derived gauges (`ffd_unplaced_cores`, `ffd_placeable_intents`)
+        // need scheduler intents; live-derived gauges read only `live` +
+        // `now`, both available here. Without this call, a scheduler
+        // outage freezes `nodeclaim_inflight_age_max_seconds` at its
+        // pre-outage value and `RioNodeclaimPoolStuckPending` reads
+        // stale data exactly when the operator needs it.
+        self.emit_live_gauges(&live, now);
         self.sketches.persist(&self.pg).await?;
         Ok(())
     }
 
-    /// Per-tick `r[obs.metric.controller]` gauges. Iterates
-    /// `cfg.all_cells()` (NOT just cells observed in `live`/`unplaced`)
-    /// so every (h,cap) timeseries is emitted every tick — Prometheus
-    /// gauge semantics: a cell that drained to 0 reads as 0, not
-    /// stale-at-last-nonzero.
-    fn emit_tick_gauges(
-        &self,
-        live: &[ffd::LiveNode],
-        placeable: &[ffd::Placement],
-        unplaced: &[SpawnIntent],
-        now_secs: f64,
-    ) {
+    /// Per-cell gauges derived from `live` + `now` only (no scheduler
+    /// intents needed). Iterates `cfg.all_cells()` so every (h,cap)
+    /// timeseries is emitted every tick — Prometheus gauge semantics: a
+    /// cell that drained to 0 reads as 0, not stale-at-last-nonzero.
+    /// Called from BOTH `reconcile_once` (via `emit_tick_gauges`) and
+    /// `consolidate_only` so `RioNodeclaimPoolStuckPending` stays
+    /// accurate during scheduler outages.
+    fn emit_live_gauges(&self, live: &[ffd::LiveNode], now_secs: f64) {
         use std::collections::BTreeMap;
-        // (registered, inflight, max-inflight-age) per cell.
         let mut by_state: BTreeMap<Cell, (u64, u64, f64)> = BTreeMap::new();
         for n in live {
             let Some(c) = n.cell.clone() else { continue };
@@ -734,15 +736,6 @@ impl NodeClaimPoolReconciler {
                 e.2 = e.2.max(n.age_secs(now_secs).unwrap_or(0.0));
             }
         }
-        // Σ unplaced cores per cheapest-A_open cell — same assignment
-        // cover_deficit uses, so the gauge equals cover's per-cell input.
-        // No mask: the gauge shows raw demand; ICE-masking is a cover
-        // policy, not a demand metric.
-        let none = HashSet::new();
-        let (by_cell, _) =
-            cover::assign_to_cells(unplaced, &self.sketches, &none, cover::cell_rank, |i| {
-                self.cfg.fallback_cell(i, &self.hw_config, &none)
-            });
         for cell in self.cfg.all_cells(&self.hw_config) {
             let label = cell.to_string();
             let (reg, inf, age) = by_state.get(&cell).copied().unwrap_or((0, 0, 0.0));
@@ -755,14 +748,39 @@ impl NodeClaimPoolReconciler {
             metrics::gauge!("rio_controller_nodeclaim_inflight_age_max_seconds",
                 "cell" => label.clone())
             .set(age);
+            metrics::gauge!("rio_controller_nodeclaim_lead_time_seconds", "cell" => label)
+                .set(self.sketches.lead_time(&cell));
+        }
+    }
+
+    /// Per-tick `r[obs.metric.controller]` gauges: live-derived (via
+    /// [`Self::emit_live_gauges`]) plus FFD-derived (`ffd_unplaced_cores`,
+    /// `ffd_placeable_intents`) which need scheduler intents.
+    fn emit_tick_gauges(
+        &self,
+        live: &[ffd::LiveNode],
+        placeable: &[ffd::Placement],
+        unplaced: &[SpawnIntent],
+        now_secs: f64,
+    ) {
+        self.emit_live_gauges(live, now_secs);
+        // Σ unplaced cores per cheapest-A_open cell — same assignment
+        // cover_deficit uses, so the gauge equals cover's per-cell input.
+        // No mask: the gauge shows raw demand; ICE-masking is a cover
+        // policy, not a demand metric.
+        let none = HashSet::new();
+        let (by_cell, _) =
+            cover::assign_to_cells(unplaced, &self.sketches, &none, cover::cell_rank, |i| {
+                self.cfg.fallback_cell(i, &self.hw_config, &none)
+            });
+        for cell in self.cfg.all_cells(&self.hw_config) {
+            let label = cell.to_string();
             let unplaced_cores: u32 = by_cell
                 .get(&cell)
                 .map(|v| v.iter().map(|i| i.cores).sum())
                 .unwrap_or(0);
-            metrics::gauge!("rio_controller_ffd_unplaced_cores", "cell" => label.clone())
+            metrics::gauge!("rio_controller_ffd_unplaced_cores", "cell" => label)
                 .set(f64::from(unplaced_cores));
-            metrics::gauge!("rio_controller_nodeclaim_lead_time_seconds", "cell" => label)
-                .set(self.sketches.lead_time(&cell));
         }
         // Placeable split: NOT per-cell (an intent may target multiple
         // cells; the placement node's cell would mislead). The single
