@@ -1214,23 +1214,30 @@ impl DagActor {
                 // so the controller derives the pinned cell instead of
                 // falling back. No `o.capacity` → empty as before.
                 let (terms, names) = match override_.as_ref().and_then(|o| o.capacity) {
-                    Some(cap) => {
-                        // bug_039: `reference_hw_class` may have a
-                        // `kubernetes.io/arch` label that doesn't match
-                        // `state.system` — emitting it would AND the
-                        // pod's `nodeSelector.arch=arm64` with
-                        // `nodeAffinity arch In [amd64]` → permanently
-                        // Pending. Arch-match like the controller's
-                        // `fallback_cell` does.
-                        let h = self
-                            .sla_config
-                            .reference_hw_class_for_system(&state.system)
-                            .map_or_else(
-                                || self.sla_config.reference_hw_class.clone(),
-                                ToOwned::to_owned,
-                            );
-                        solve::cells_to_selector_terms(&[(h, cap)], &self.sla_config.hw_classes)
-                    }
+                    // bug_039: `reference_hw_class` may have a
+                    // `kubernetes.io/arch` label that doesn't match
+                    // `state.system` — emitting it would AND the pod's
+                    // `nodeSelector.arch=arm64` with `nodeAffinity arch
+                    // In [amd64]` → permanently Pending. Arch-match
+                    // like the controller's `fallback_cell` does. On
+                    // `None` (no class hosts this arch, or unmappable
+                    // system), emit empty so the controller's
+                    // `fallback_cell` reaches its OWN `None` →
+                    // `no_menu_for_arch` metric. Relies on `reference_
+                    // hw_class_for_system` and `fallback_cell` agreeing
+                    // on the arch-match set (both query `hw_classes`
+                    // with the same `ARCH_LABEL` predicate); falling
+                    // back to the un-arch-matched `reference_hw_class`
+                    // here would reproduce bug_039 on the `None` arm
+                    // and bypass the metric.
+                    Some(cap) => match self.sla_config.reference_hw_class_for_system(&state.system)
+                    {
+                        Some(h) => solve::cells_to_selector_terms(
+                            &[(h.to_owned(), cap)],
+                            &self.sla_config.hw_classes,
+                        ),
+                        None => (Vec::new(), Vec::new()),
+                    },
                     None => (Vec::new(), Vec::new()),
                 };
                 (c, m, d, terms, names, None)

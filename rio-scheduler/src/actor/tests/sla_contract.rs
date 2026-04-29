@@ -2179,6 +2179,58 @@ async fn contract_forced_mem_only_override_is_hw_agnostic() {
     );
 }
 
+/// **bug_008** — bypass-path `--capacity` with a system NO configured
+/// hw-class can host (`reference_hw_class_for_system → None`) MUST
+/// emit empty `(hw_class_names, node_affinity)` so the controller's
+/// `fallback_cell` reaches its OWN `None` → `no_menu_for_arch` metric.
+/// The bug_039 fix's `.map_or_else(|| reference_hw_class.clone(), ..)`
+/// fallback emitted the un-arch-matched reference into
+/// `cells_to_selector_terms`, producing `nodeAffinity arch In [wrong]`
+/// ANDed with the pod's nodeSelector — bug_039's permanently-Pending
+/// symptom one input-space step removed (§Verifier-one-step-removed).
+#[tokio::test]
+async fn contract_bypass_capacity_no_arch_match_emits_empty() {
+    use crate::sla::config::{ARCH_LABEL, NodeLabelMatch};
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    // Make every hw_class explicitly amd64 so the unmappable-system
+    // case (riscv64-linux → system_to_k8s_arch=None) AND the
+    // no-class-hosts-arch case both reduce to `None` here. Either
+    // branch of `reference_hw_class_for_system` returning `None` must
+    // emit empty.
+    for d in actor.sla_config.hw_classes.values_mut() {
+        d.labels.push(NodeLabelMatch {
+            key: ARCH_LABEL.into(),
+            value: "amd64".into(),
+        });
+    }
+    actor.test_inject_ready("d-rv", Some("test-pkg"), "riscv64-linux", false);
+    // `--cores=16` (bypass field) + `--capacity=on-demand`.
+    actor
+        .sla_estimator
+        .seed_overrides(vec![crate::db::SlaOverrideRow {
+            pname: "test-pkg".into(),
+            cores: Some(16.0),
+            capacity_type: Some("on-demand".into()),
+            ..Default::default()
+        }]);
+
+    let state = actor.dag.node("d-rv").unwrap();
+    let (hw, cost, ig) = actor.solve_inputs();
+    let intent = actor.solve_intent_for(state, &hw, &cost, ig);
+
+    assert!(
+        intent.hw_class_names.is_empty() && intent.node_affinity.is_empty(),
+        "no-arch-match MUST emit empty so controller fallback_cell hits \
+         no_menu_for_arch; got hw_class_names={:?} node_affinity={:?} — \
+         a non-empty result here means the un-arch-matched \
+         reference_hw_class was emitted (bug_039 on the None arm).",
+        intent.hw_class_names,
+        intent.node_affinity
+    );
+}
+
 /// **bug_035** — `_hw_cost_unknown_total` fires once per `(key,
 /// inputs_gen)` epoch, NOT twice on the memo-miss tick when ε_h hits.
 /// The unrestricted `solve_full(.., &h_all, .., true)` already covers
