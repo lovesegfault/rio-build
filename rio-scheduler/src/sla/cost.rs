@@ -951,6 +951,25 @@ impl IceBackoff {
 /// type, EMA-smooths into `cost`, re-evaluates the stale-clamp, and
 /// exports the staleness gauge.
 ///
+/// Emit `rio_scheduler_sla_hw_cost_stale_seconds` when there's
+/// something to be stale ABOUT. Suppressed while `cells` is empty (no
+/// menu yet → poller has nothing to query → not "stale", just cold).
+/// Once `cells` is non-empty, the gauge emits even when `price` is
+/// empty: that's exactly the "AWS API failing from cold start" case
+/// `RioSlaHwCostStale`'s runbook entry exists for ("check IRSA"). The
+/// previous gate `if updated > 0.0` checked `price` not `cells` —
+/// equivalent on the happy path, silently wrong when the menu populated
+/// but `DescribeSpotPriceHistory` is failing (bug_031).
+fn emit_stale_gauge(cost: &parking_lot::RwLock<CostTable>, now: f64) {
+    let (has_cells, updated) = {
+        let g = cost.read();
+        (!g.cells.is_empty(), g.price_updated_at())
+    };
+    if has_cells {
+        ::metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds").set(now - updated);
+    }
+}
+
 /// Spot-only — `main.rs` spawns this only under `hw_cost_source =
 /// Spot`. λ refresh / sweep / persist / leader-edge reload live
 /// in [`interrupt_housekeeping`] (which runs unconditionally and is the
@@ -985,14 +1004,7 @@ pub async fn spot_price_poller(
         // Pre-leader-gate emit: per-replica gauge — observability.md
         // documents "climbs on standby" as the failover-health signal.
         // Spot-only (this poller doesn't spawn under Static/None).
-        // Suppressed while `cells` is unpopulated: `price_updated_at`
-        // folds empty→0.0, so an unsuppressed `now − 0` would emit
-        // ~1.77e9 and fire `RioSlaHwCostStale` permanently on a healthy
-        // poller that simply has no menu to query yet.
-        let updated = cost.read().price_updated_at();
-        if updated > 0.0 {
-            ::metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds").set(now - updated);
-        }
+        emit_stale_gauge(&cost, now);
         if !leader.is_leader() {
             continue;
         }
@@ -1017,10 +1029,7 @@ pub async fn spot_price_poller(
             fold_spot_poll(&mut g, result, now);
             g.apply_stale_clamp(now);
         }
-        let updated = cost.read().price_updated_at();
-        if updated > 0.0 {
-            ::metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds").set(now - updated);
-        }
+        emit_stale_gauge(&cost, now);
         // r[impl sched.sla.hw-class.epsilon-explore+6]
         // Price is a solve input — the next poll's derived
         // `SolveInputs::inputs_gen` reflects the new table.
@@ -1695,6 +1704,74 @@ mod tests {
             n, 1,
             "persist() under Static skips price rows; only the original leftover row remains"
         );
+    }
+
+    /// bug_031: gauge gates on `cells` non-empty (the menu exists), NOT
+    /// on `price` non-empty. With IRSA broken from cold start, `cells`
+    /// populates via controller-observed feedback (AWS-independent) but
+    /// `price` stays empty — `RioSlaHwCostStale` (whose runbook says
+    /// "check IRSA") must fire. The previous `if updated > 0.0` gate
+    /// suppressed exactly the failure it was documented to surface.
+    #[test]
+    fn stale_gauge_gates_on_cells_not_price() {
+        use metrics_util::debugging::DebugValue;
+        let stale_seconds = |snap: &metrics_util::debugging::Snapshotter| {
+            snap.snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(ck, _, _, v)| {
+                    (ck.key().name() == "rio_scheduler_sla_hw_cost_stale_seconds").then_some(v)
+                })
+        };
+
+        let cost = parking_lot::RwLock::new(CostTable::seeded("c", HwCostSource::Spot));
+        // Cold start: cells empty, price empty → suppressed (no false
+        // positive while there's nothing to query).
+        {
+            let rec = metrics_util::debugging::DebuggingRecorder::new();
+            let snap = rec.snapshotter();
+            let _g = metrics::set_default_local_recorder(&rec);
+            emit_stale_gauge(&cost, 1_800_000_000.0);
+            assert!(stale_seconds(&snap).is_none(), "cells empty → suppressed");
+        }
+        // Menu populated (controller observed a type), price still empty
+        // (IRSA broken / API failing): gauge MUST emit `now − 0` so
+        // RioSlaHwCostStale fires. Pre-fix gate `if updated > 0.0`
+        // suppressed here.
+        cost.write().observe_instance_types([(
+            ("h".into(), CapacityType::Spot),
+            "c7i.4xlarge".into(),
+            16,
+            32 << 30,
+        )]);
+        {
+            let rec = metrics_util::debugging::DebuggingRecorder::new();
+            let snap = rec.snapshotter();
+            let _g = metrics::set_default_local_recorder(&rec);
+            emit_stale_gauge(&cost, 1_800_000_000.0);
+            match stale_seconds(&snap) {
+                Some(DebugValue::Gauge(v)) => assert!(
+                    v.into_inner() > 1e9,
+                    "cells non-empty + price empty → emit now−0 (huge), got {v:?}"
+                ),
+                other => panic!("expected gauge emitted, got {other:?}"),
+            }
+        }
+        // Happy path: price set → emits actual staleness.
+        cost.write()
+            .set_price("h", CapacityType::Spot, 0.02, 1_800_000_000.0 - 100.0);
+        {
+            let rec = metrics_util::debugging::DebuggingRecorder::new();
+            let snap = rec.snapshotter();
+            let _g = metrics::set_default_local_recorder(&rec);
+            emit_stale_gauge(&cost, 1_800_000_000.0);
+            match stale_seconds(&snap) {
+                Some(DebugValue::Gauge(v)) => {
+                    assert!((v.into_inner() - 100.0).abs() < 1e-6)
+                }
+                other => panic!("expected gauge ≈ 100s, got {other:?}"),
+            }
+        }
     }
 
     /// `> 6 × pollInterval` stale → `price()` clamps to the static seed
