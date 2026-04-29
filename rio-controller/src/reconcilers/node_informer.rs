@@ -40,6 +40,7 @@ use kube::{Api, Client};
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::reconcilers::nodeclaim_pool::ffd::{parse_bytes, parse_cpu_millis};
 use crate::reconcilers::{AdminClient, admin_call};
 
 /// Pod annotation the [`run_pod_annotator`] watcher stamps with the
@@ -408,6 +409,169 @@ impl NodeLabelCache {
             .name
             .as_ref()
             .and_then(|n| self.nodes.write().remove(n))
+    }
+}
+
+/// Per-pod `(cores, mem_bytes, disk_bytes)` request, keyed by
+/// `metadata.name`. One entry per node so [`PodRequestedCache::sum_for`]
+/// is `O(pods_on_node)`, not `O(all_pods)`.
+type NodePodRequests = HashMap<String, (u32, u64, u64)>;
+
+/// `spec.nodeName` → Σ pod `resources.requests` cache for the §13b FFD
+/// sim's `LiveNode.requested`. Hand-rolled (NOT `reflector::store`) for
+/// the same reason as [`NodeLabelCache`]: a full-object Pod reflector
+/// caches kilobytes (status, conditions, container statuses) per pod;
+/// we need three integers. Label-selected on `rio.build/pool` so the
+/// watch scope matches [`run_pod_annotator`]'s — only builder/fetcher
+/// pods, not the cluster's full pod set.
+///
+/// Cheap to clone (`Arc`); share one instance between the watcher task
+/// and the `NodeClaimPoolReconciler`.
+#[derive(Clone, Default)]
+pub struct PodRequestedCache(Arc<RwLock<HashMap<String, NodePodRequests>>>);
+
+impl PodRequestedCache {
+    /// `Σ (cores, mem, disk)` over pods bound to `node_name`. `(0,0,0)`
+    /// for an unknown node (no pods scheduled, or watcher not yet
+    /// caught up).
+    pub fn sum_for(&self, node_name: &str) -> (u32, u64, u64) {
+        let g = self.0.read();
+        g.get(node_name).map_or((0, 0, 0), |pods| {
+            pods.values().fold((0, 0, 0), |(c, m, d), &(pc, pm, pd)| {
+                (c + pc, m + pm, d + pd)
+            })
+        })
+    }
+
+    /// Upsert `pod`'s requests under its `spec.nodeName`. Pending pods
+    /// (no `nodeName`) are ignored — they haven't reserved capacity on
+    /// any node. A `nodeName` change (rare; binding is normally
+    /// immutable, but a relist after delete+recreate of a same-named
+    /// pod would look like one) evicts the old-node entry first.
+    fn apply(&self, pod: &Pod) {
+        let Some(name) = pod.metadata.name.as_ref() else {
+            return;
+        };
+        let Some(node) = pod.spec.as_ref().and_then(|s| s.node_name.as_ref()) else {
+            return;
+        };
+        let req = pod_requests(pod);
+        let mut g = self.0.write();
+        // Evict from any other node first (nodeName change / stale).
+        for (n, pods) in g.iter_mut() {
+            if n != node {
+                pods.remove(name);
+            }
+        }
+        g.entry(node.clone()).or_default().insert(name.clone(), req);
+    }
+
+    /// Evict `pod` from its node's entry. Node entries are NOT
+    /// garbage-collected when they empty — node count is bounded and
+    /// the empty `HashMap` is ~48 bytes.
+    fn delete(&self, pod: &Pod) {
+        let Some(name) = pod.metadata.name.as_ref() else {
+            return;
+        };
+        let mut g = self.0.write();
+        for pods in g.values_mut() {
+            pods.remove(name);
+        }
+    }
+
+    /// Evict every cached pod whose name is NOT in `seen`. Called on
+    /// `InitDone` after a watch-gap relist (mirrors
+    /// [`NodeLabelCache::prune_absent`]): the raw watcher synthesizes
+    /// no Delete for pods gone during the gap, so without this their
+    /// requests would inflate `sum_for` until controller restart —
+    /// `free()` under-reports → FFD under-places → `cover_deficit`
+    /// over-provisions.
+    fn prune_absent(&self, seen: &HashSet<String>) {
+        let mut g = self.0.write();
+        for pods in g.values_mut() {
+            pods.retain(|name, _| seen.contains(name));
+        }
+    }
+}
+
+/// `Σ containers[].resources.requests` as `(cores, mem, disk)`. Whole
+/// cores (truncated millicores) so the unit matches `SpawnIntent.cores`
+/// and `LiveNode.allocatable.0`. Missing keys → 0.
+fn pod_requests(pod: &Pod) -> (u32, u64, u64) {
+    let Some(spec) = pod.spec.as_ref() else {
+        return (0, 0, 0);
+    };
+    spec.containers.iter().fold((0, 0, 0), |(c, m, d), ctr| {
+        let q = |k: &str| {
+            ctr.resources
+                .as_ref()
+                .and_then(|r| r.requests.as_ref())
+                .and_then(|r| r.get(k))
+                .map(|q| q.0.as_str())
+        };
+        (
+            c + q("cpu").map_or(0, |s| (parse_cpu_millis(s) / 1000) as u32),
+            m + q("memory").map_or(0, parse_bytes),
+            d + q("ephemeral-storage").map_or(0, parse_bytes),
+        )
+    })
+}
+
+/// Pod-watcher: maintain [`PodRequestedCache`] from Applied/Deleted
+/// events on `rio.build/pool`-labelled pods. Same selector as
+/// [`run_pod_annotator`] so the apiserver watch scope is identical.
+///
+/// `spawn_monitored("pod-requested-cache", ...)` from main.rs. Same
+/// degraded-not-broken contract as [`run`]: if the watcher dies,
+/// `sum_for` returns stale/zero and `LiveNode::free()` over-reports —
+/// FFD double-places, `cover_deficit` under-provisions next tick.
+/// Observable as `ffd_unplaced_cores` low with builder pods Pending.
+pub async fn run_pod_requested_cache(
+    client: Client,
+    cache: PodRequestedCache,
+    shutdown: rio_common::signal::Token,
+) {
+    let pods: Api<Pod> = Api::all(client);
+    let cfg = watcher::Config::default().labels(POOL_LABEL);
+    let mut stream = watcher(pods, cfg).default_backoff().boxed();
+
+    // Names seen between Init and InitDone (relist prune; see
+    // `PodRequestedCache::prune_absent`).
+    let mut relist_seen: Option<HashSet<String>> = None;
+
+    info!("pod-requested cache started (label={POOL_LABEL})");
+
+    loop {
+        let event = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                debug!("pod-requested cache: shutdown");
+                return;
+            }
+            next = stream.next() => match next {
+                Some(Ok(ev)) => ev,
+                Some(Err(e)) => { warn!(error = %e, "pod-requested cache: stream error"); continue; }
+                None => { warn!("pod-requested cache: stream ended (unexpected)"); return; }
+            },
+        };
+        match event {
+            watcher::Event::Apply(pod) => cache.apply(&pod),
+            watcher::Event::InitApply(pod) => {
+                if let Some(seen) = relist_seen.as_mut()
+                    && let Some(name) = &pod.metadata.name
+                {
+                    seen.insert(name.clone());
+                }
+                cache.apply(&pod);
+            }
+            watcher::Event::Delete(pod) => cache.delete(&pod),
+            watcher::Event::Init => relist_seen = Some(HashSet::new()),
+            watcher::Event::InitDone => {
+                if let Some(seen) = relist_seen.take() {
+                    cache.prune_absent(&seen);
+                }
+            }
+        }
     }
 }
 
@@ -1069,6 +1233,77 @@ mod tests {
         cache.apply(&node("nomatch", &[("rio.build/hw-band", "9")]));
         let p = pod("rb-nm", "rio", Some("nomatch"), &[]);
         assert_eq!(hw_class_patch_target(&p, &cache), None);
+    }
+
+    fn pod_req(name: &str, node: Option<&str>, cpu: &str, mem: &str, disk: &str) -> Pod {
+        use k8s_openapi::api::core::v1::{Container, PodSpec, ResourceRequirements};
+        use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+        let mut p = Pod::default();
+        p.metadata.name = Some(name.into());
+        p.metadata.namespace = Some("rio".into());
+        p.spec = Some(PodSpec {
+            node_name: node.map(str::to_owned),
+            containers: vec![Container {
+                name: "c".into(),
+                resources: Some(ResourceRequirements {
+                    requests: Some(
+                        [
+                            ("cpu".into(), Quantity(cpu.into())),
+                            ("memory".into(), Quantity(mem.into())),
+                            ("ephemeral-storage".into(), Quantity(disk.into())),
+                        ]
+                        .into(),
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        p
+    }
+
+    /// F6: cache sums `Σ pod.resources.requests` per `spec.nodeName`;
+    /// delete drops the pod's contribution; pods with no `nodeName`
+    /// (Pending) contribute nothing.
+    #[test]
+    fn pod_requested_cache_sums_by_node() {
+        let cache = PodRequestedCache::default();
+        cache.apply(&pod_req("a", Some("n1"), "4", "8Gi", "10Gi"));
+        cache.apply(&pod_req("b", Some("n1"), "2", "4Gi", "5Gi"));
+        cache.apply(&pod_req("c", Some("n2"), "1500m", "2Gi", "1Gi"));
+        // Pending pod (no nodeName) → not tracked.
+        cache.apply(&pod_req("p", None, "8", "1Gi", "1Gi"));
+        let gi = 1u64 << 30;
+        assert_eq!(cache.sum_for("n1"), (6, 12 * gi, 15 * gi));
+        // 1500m → 1 whole core (truncated, matching SpawnIntent.cores unit).
+        assert_eq!(cache.sum_for("n2"), (1, 2 * gi, gi));
+        assert_eq!(cache.sum_for("unknown"), (0, 0, 0));
+        // Delete b → n1 drops to a's request.
+        cache.delete(&pod_req("b", Some("n1"), "2", "4Gi", "5Gi"));
+        assert_eq!(cache.sum_for("n1"), (4, 8 * gi, 10 * gi));
+        // Re-apply a (watch relist / Modify) → upsert, not double-count.
+        cache.apply(&pod_req("a", Some("n1"), "4", "8Gi", "10Gi"));
+        assert_eq!(cache.sum_for("n1"), (4, 8 * gi, 10 * gi));
+        // nodeName change (rare, but Modify with new node) → moves.
+        cache.apply(&pod_req("c", Some("n1"), "1500m", "2Gi", "1Gi"));
+        assert_eq!(cache.sum_for("n2"), (0, 0, 0));
+        assert_eq!(cache.sum_for("n1"), (5, 10 * gi, 11 * gi));
+    }
+
+    /// F6: relist gap — a pod deleted while the watch was disconnected
+    /// gets no Delete event; `prune_absent` evicts it on InitDone so
+    /// `sum_for` doesn't carry phantom requests.
+    #[test]
+    fn pod_requested_cache_prune_absent() {
+        let cache = PodRequestedCache::default();
+        cache.apply(&pod_req("a", Some("n1"), "4", "8Gi", "10Gi"));
+        cache.apply(&pod_req("b", Some("n1"), "2", "4Gi", "5Gi"));
+        // Relist saw only {a}.
+        let seen: HashSet<String> = ["a".into()].into();
+        cache.prune_absent(&seen);
+        let gi = 1u64 << 30;
+        assert_eq!(cache.sum_for("n1"), (4, 8 * gi, 10 * gi));
     }
 
     #[test]

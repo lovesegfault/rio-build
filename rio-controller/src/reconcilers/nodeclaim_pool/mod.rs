@@ -27,7 +27,7 @@
 
 mod consolidate;
 mod cover;
-mod ffd;
+pub(crate) mod ffd;
 mod health;
 pub mod sketch;
 
@@ -45,7 +45,7 @@ use rio_proto::types::{
     AckSpawnedIntentsRequest, GetSpawnIntentsRequest, GetSpawnIntentsResponse, SpawnIntent,
 };
 
-use crate::reconcilers::node_informer::HwClassConfig;
+use crate::reconcilers::node_informer::{HwClassConfig, PodRequestedCache};
 use crate::reconcilers::pool::jobs::pod_ephemeral_request;
 use crate::reconcilers::{AdminClient, admin_call};
 
@@ -329,6 +329,11 @@ pub struct NodeClaimPoolReconciler {
     /// [`HwClassConfig::labels_for`] to build NodeClaim
     /// `spec.requirements`.
     hw_config: HwClassConfig,
+    /// `spec.nodeName` → Σ pod requests, maintained by
+    /// `node_informer::run_pod_requested_cache`.
+    /// [`Self::list_live_nodeclaims`] post-fills `LiveNode.requested`
+    /// so `free()` reflects what's already bound.
+    pod_requested: PodRequestedCache,
     /// Publish side of [`PlaceableGate`]. Written once per successful
     /// FFD tick with the `intent_id`s placed on `Registered=True`
     /// nodes; the `pool/jobs` reconciler reads it via `Ctx.placeable`.
@@ -361,6 +366,7 @@ impl NodeClaimPoolReconciler {
     /// Construct + load persisted [`CellSketches`] from PG. Called once
     /// at startup AFTER PG connect; the loaded state survives controller
     /// restarts (rolling upgrade, OOM) so lead-time learning isn't reset.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         kube: kube::Client,
         admin: AdminClient,
@@ -368,6 +374,7 @@ impl NodeClaimPoolReconciler {
         leader: LeaderState,
         cfg: NodeClaimPoolConfig,
         hw_config: HwClassConfig,
+        pod_requested: PodRequestedCache,
         placeable_tx: tokio::sync::watch::Sender<PlaceableSet>,
     ) -> Self {
         // Load persisted sketches; fall back to empty on error (a fresh
@@ -392,6 +399,7 @@ impl NodeClaimPoolReconciler {
             leader,
             cfg,
             hw_config,
+            pod_requested,
             placeable_tx,
             sketches,
             recorded_boot: HashSet::new(),
@@ -662,7 +670,17 @@ impl NodeClaimPoolReconciler {
             .nodeclaims
             .list(&ListParams::default().labels(OWNER_LABEL))
             .await?;
-        Ok(list.items.into_iter().map(ffd::LiveNode::from).collect())
+        Ok(list
+            .items
+            .into_iter()
+            .map(|nc| {
+                let mut n = ffd::LiveNode::from(nc);
+                if let Some(node) = &n.node_name {
+                    n.requested = self.pod_requested.sum_for(node);
+                }
+                n
+            })
+            .collect())
     }
 
     /// §13b deficit cover.
