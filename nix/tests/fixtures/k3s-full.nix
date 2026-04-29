@@ -143,6 +143,12 @@ in
   # everything else uses the v6-direct path via the `client = client_v6`
   # alias in waitReady.
   withV4Nodes ? false,
+  # Additional `services.k3s.manifests` entries merged into the server
+  # node. Keys are filename-stems (k3s applies in byte-sort order). The
+  # kwok overlay (default.nix vm-sla-sizing-kwok) passes Karpenter CRDs
+  # + KWOK Stage rules here so the §13b nodeclaim_pool reconciler can
+  # be exercised without EC2.
+  extraManifests ? { },
 }:
 let
   ciliumRender = mkCiliumRender gatewayEnabled;
@@ -562,6 +568,9 @@ let
           # 01-: byte-sort places this AFTER 01-rio-rbac (which creates
           # the ${ns} Namespace) and BEFORE 02-rio-workloads.
           "01z-rio-hmac-secrets".source = hmacSecretsManifest;
+        }
+        // extraManifests
+        // {
           # CoreDNS dns64 + test-VM hostnames. k3s's bundled CoreDNS
           # mounts the optional `coredns-custom` ConfigMap at
           # /etc/coredns/custom/; the Corefile imports `*.override`

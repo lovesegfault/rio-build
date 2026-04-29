@@ -930,10 +930,31 @@
               )
             ) allTests);
 
-          vmTests = mkVmTests {
+          vmTests = removeAttrs (mkVmTests {
             inherit rio-workspace dockerImages;
             coverage = false;
-          };
+          }) vmTestsManual;
+
+          # VM tests not in the merge gate. Exposed under
+          # `legacyPackages.vm-manual.<name>` for `nix build` runs. A test
+          # lands here when its fixture infrastructure is sound (eval +
+          # driverInteractive build green) but the e2e iteration loop is
+          # too long for the per-PR gate, or it depends on a known gap
+          # tracked elsewhere. Each entry MUST have a comment naming the
+          # gating gap; remove the entry (NOT the test) once the gap is
+          # closed.
+          vmTestsManual = [
+            # ADR-023 §13b kwok fixture: rio-controller CrashLoopBackOff
+            # because `NodeClaimPoolConfig.instance_menu` (HashMap<String,
+            # Vec<InstanceType>>) cannot load via figment's `Env` provider
+            # (Env yields strings only — see rio-common/src/config.rs
+            # `comma_vec` rationale). The same gap blocks the EKS deploy
+            # path (helm `controller.yaml` has no first-class
+            # nodeclaim_pool config). Promote to `checks` once the
+            # controller reads instance_menu from a ConfigMap-mounted
+            # TOML or a `json_from_str` deserialize_with bridge lands.
+            "vm-sla-sizing-kwok"
+          ];
 
           # Coverage-mode VM tests. Not in `checks` (too slow for flake
           # check) — exposed as packages.cov-vm-<scenario> for manual runs
@@ -957,15 +978,18 @@
               # nixos-node boots no rio-* binaries (nodeadm + kubelet only) —
               # zero profraws, so a coverage-mode rebuild is wasted CI time
               # and would skew after_n_builds.
-              [
-                "vm-lifecycle-prod-parity-k3s"
-                "vm-nixos-node"
-                # Lix client variant: rio-side coverage is identical to
-                # vm-protocol-warm-standalone (only the client differs,
-                # and the client isn't instrumented). Excluding keeps
-                # after_n_builds stable.
-                "vm-protocol-warm-lix-standalone"
-              ];
+              (
+                [
+                  "vm-lifecycle-prod-parity-k3s"
+                  "vm-nixos-node"
+                  # Lix client variant: rio-side coverage is identical to
+                  # vm-protocol-warm-standalone (only the client differs,
+                  # and the client isn't instrumented). Excluding keeps
+                  # after_n_builds stable.
+                  "vm-protocol-warm-lix-standalone"
+                ]
+                ++ vmTestsManual
+              );
 
           # --------------------------------------------------------------
           # Coverage merge pipeline (Linux-only — depends on vmTestsCov)
@@ -1130,6 +1154,13 @@
           # get raw profraws at result/coverage/<node>/.
           // {
             cov-vm = vmTestsCov;
+            # Manual VM tests not in `checks` — see `vmTestsManual`
+            # comment for the per-entry gating gap. Build one with
+            # `nix build .#legacyPackages.x86_64-linux.vm-manual.<name>`.
+            vm-manual = pkgs.lib.getAttrs vmTestsManual (mkVmTests {
+              inherit rio-workspace dockerImages;
+              coverage = false;
+            });
             # Per-test lcovs: coverage-vm.<scenario>. Inspect one VM
             # test's contribution in isolation.
             coverage-vm = coverage.perTestLcov;

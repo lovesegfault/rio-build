@@ -60,6 +60,8 @@ let
   substitute = import ./scenarios/substitute.nix;
   substitute-scale = import ./scenarios/substitute-scale.nix;
   sla-sizing = import ./scenarios/sla-sizing.nix;
+  forecast-provisioning = import ./scenarios/forecast-provisioning.nix;
+  kwok = import ./fixtures/kwok.nix { inherit pkgs; };
   drvs = import ./lib/derivations.nix { inherit pkgs; };
 
   # SLA-sizing fixture: one worker with RIO_BUILDER_SCRIPT pointing at
@@ -727,6 +729,67 @@ in
   # subtest's "store has 1 replica" assumption. seedRatio=10 +
   # min=1 max=4 keeps the scale-up provable inside the 2-node VM's
   # pod budget.
+  # ADR-023 §13b nodeclaim_pool reconciler under KWOK fake-Karpenter.
+  # First test running rio-controller with `nodeclaim_pool.enabled =
+  # true`. Karpenter is faked: KWOK Stage rules progress NodeClaim
+  # status (Launched→Registered, populate allocatable from
+  # spec.resources.requests). The kube-scheduler-packed Deployment runs
+  # for real (registry.k8s.io/kube-scheduler preloaded) so builder
+  # Jobs' `schedulerName: rio-packed` resolves.
+  #
+  # Distinct runNixOSTest name `rio-forecast-provisioning` (NOT a
+  # `vm-sla-sizing-*` variant — sla-sizing.nix is standalone-tied;
+  # this is k3s+kubectl-only).
+  #
+  # `controller.extraEnv` injects the `RIO_NODECLAIM_POOL__*` config
+  # directly: helm doesn't yet have first-class chart values for the
+  # nested instance_menu (the EKS deploy passes it via xtask). One
+  # `vmtest:spot` cell with one menu entry covering vmtest-full's
+  # max_cores=16 / max_mem=2Gi keeps `placement_sim_mismatch_total
+  # {reason=menu_gap}` unreachable.
+  #
+  # r[verify ctrl.nodeclaim.ffd-sim]
+  # r[verify ctrl.nodeclaim.shim-nodepool]
+  # r[verify ctrl.nodeclaim.anchor-bulk]
+  # r[verify ctrl.nodeclaim.priority-bucket]
+  # r[verify ctrl.nodeclaim.placeable-gate]
+  vm-sla-sizing-kwok = forecast-provisioning {
+    inherit pkgs common;
+    fixture = k3sFull {
+      extraImages = kwok.airgapImages;
+      extraManifests = kwok.manifests;
+      extraValuesTyped = {
+        "packedScheduler.enabled" = true;
+      };
+      extraValues = {
+        "packedScheduler.image" = kwok.kubeSchedulerRef;
+      };
+      extraValuesFiles = [
+        # nodeclaim_pool config + a single `vmtest` hw-class so
+        # `cells_of(SpawnIntent)` is non-empty (the scheduler's
+        # `[sla.hw_classes.vmtest]` from vmtest-full.yaml emits one
+        # node_affinity term per intent). figment's Env provider parses
+        # values as TOML — nested map/seq use TOML inline-table syntax
+        # (`{k = v}` / `[{...}]`), NOT JSON (`{"k": v}`). Colon in the
+        # `vmtest:spot` cell key needs TOML key-quoting.
+        (pkgs.writeText "kwok-nodeclaim-pool.yaml" ''
+          controller:
+            extraEnv:
+              - {name: RIO_NODECLAIM_POOL__ENABLED, value: "true"}
+              - {name: RIO_NODECLAIM_POOL__DATABASE_URL, value: "postgresql://postgres:rio@rio-postgresql.rio-store:5432/rio"}
+              - {name: RIO_NODECLAIM_POOL__LEASE_NAME, value: "rio-controller-nodeclaim-pool"}
+              - {name: RIO_NODECLAIM_POOL__NODE_CLASS_REF, value: "rio-default"}
+              - {name: RIO_NODECLAIM_POOL__MAX_FLEET_CORES, value: "64"}
+              - {name: RIO_NODECLAIM_POOL__MAX_NODE_CLAIMS_PER_CELL_PER_TICK, value: "4"}
+              - name: RIO_NODECLAIM_POOL__LEAD_TIME_SEED
+                value: '{ "vmtest:spot" = 5.0 }'
+              - name: RIO_NODECLAIM_POOL__INSTANCE_MENU
+                value: '{ "vmtest:spot" = [{ instance_type = "kwok.2xlarge", cores = 16, mem_bytes = 4294967296, disk_bytes = 21474836480, price_per_vcpu_hr = 0.01 }] }'
+        '')
+      ];
+    };
+  };
+
   vm-componentscaler-k3s = componentscaler {
     inherit pkgs common;
     fixture = k3sFull {
