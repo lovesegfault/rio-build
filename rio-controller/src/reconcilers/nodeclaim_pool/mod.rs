@@ -48,7 +48,7 @@ use rio_proto::types::{
 };
 
 use crate::reconcilers::node_informer::{HwClassConfig, PodRequestedCache};
-use crate::reconcilers::pool::jobs::pod_ephemeral_request;
+use crate::reconcilers::pool;
 use crate::reconcilers::{AdminClient, admin_call};
 
 pub use consolidate::{HOLD_OPEN_ANNOTATION, IdleGapEvent};
@@ -215,17 +215,30 @@ pub struct NodeClaimPoolConfig {
     /// `sla.maxCores` (the same ceiling the scheduler caps individual
     /// intents at, so a single intent always fits one claim).
     pub max_node_cores: u32,
+    /// Per-NodeClaim `resources.requests.memory` ceiling. With
+    /// [`Self::max_node_cores`] / [`Self::max_node_disk`], the three
+    /// `claim_count` axes — `n = max(⌈Σ/max⌉)` so a mem-/disk-bound
+    /// deficit splits across enough claims that none exceeds the
+    /// NodePool's instance-type ceiling (else Karpenter posts
+    /// "filtered out all instance types" and the claim never resolves).
+    /// Helm: `sla.maxMem`.
+    pub max_node_mem: u64,
+    /// Per-NodeClaim `resources.requests.ephemeral-storage` ceiling.
+    /// Helm: derived from `karpenter.dataVolumeSize` × allocatable
+    /// fraction (kubelet reserve ≈10%). nvme cells get instance-store
+    /// (much larger) so this only binds ebs cells.
+    pub max_node_disk: u64,
     /// `karpenter.k8s.aws/instance-size NotIn` values appended to
     /// every NodeClaim's `spec.requirements` — the metal partition
     /// (I-205). Helm: `karpenter.metalSizes`. Empty (kwok/vmtest) → no
     /// instance-size requirement emitted.
     pub metal_sizes: Vec<String>,
     /// FUSE-cache budget added to every builder pod's
-    /// `ephemeral-storage` request (the `fuse-cache` emptyDir). The
-    /// NodeClaim's `resources.requests.ephemeral-storage` floor MUST
-    /// match what the pod will actually ask for via
-    /// `pool::jobs::pod_ephemeral_request`, so this mirrors the value
-    /// the `pool/jobs` reconciler reads from `PoolSpec.fuseCacheBytes`.
+    /// `ephemeral-storage` request (the `fuse-cache` emptyDir). Single
+    /// source for ALL Builder-pool callers via
+    /// [`pool::pod::BUILDER_FUSE_CACHE`] — the NodeClaim's
+    /// `ephemeral-storage` floor and the pod's actual request both read
+    /// this so FFD/cover/stamp agree (§Simulator-shares-accounting).
     /// Helm: `poolDefaults.fuseCacheBytes` (50Gi prod). Default is the
     /// CRD safe-minimum `pool::pod::BUILDER_FUSE_CACHE_BYTES` (8Gi).
     pub fuse_cache_bytes: u64,
@@ -309,10 +322,13 @@ impl Default for NodeClaimPoolConfig {
             // covers the ~18s real boot.
             default_lead_time_seed: 30.0,
             sketch_halflife_secs: 6 * 3600,
-            // Matches helm `sla.maxCores` default (64).
+            // Matches helm `sla.maxCores` / `sla.maxMem` defaults.
             max_node_cores: 64,
+            max_node_mem: 256 * (1 << 30),
+            // ≈ 500Gi `dataVolumeSize` × 90% allocatable.
+            max_node_disk: 450 * (1 << 30),
             metal_sizes: Vec::new(),
-            fuse_cache_bytes: crate::reconcilers::pool::pod::BUILDER_FUSE_CACHE_BYTES,
+            fuse_cache_bytes: pool::pod::BUILDER_FUSE_CACHE_BYTES,
         }
     }
 }
@@ -868,13 +884,12 @@ impl NodeClaimPoolReconciler {
     ///    `fit=None`) route to [`NodeClaimPoolConfig::fallback_cell`].
     /// 2. Round-robin `cfg.all_cells()` from `tick_counter` so no cell
     ///    starves under sustained pressure.
-    /// 3. Per cell with deficit: sum `(Σc, Σm, max m, max d)` over
-    ///    the cell's intents; mint `N = min(⌈Σc/max_node_cores⌉,
-    ///    per_tick_cap, budget_fit)` NodeClaims. The first (anchor)
-    ///    requests `(chunk, max m, max d)` so the largest single
-    ///    intent fits; the remaining N−1 (bulk) request `(chunk,
-    ///    Σm/N, max d)`. Karpenter resolves each against the
-    ///    hw-class's `requirements` to pick the instance type.
+    /// 3. Per cell with deficit: [`cover::sizing`] returns the per-claim
+    ///    `(c, m, d)` triples — `n = max(⌈Σ/max_node_*⌉)` across all
+    ///    three axes, each claim sized to `max(Σ/n, sorted_desc[k])` so
+    ///    the production FFD sim places every intent. Karpenter resolves
+    ///    each against the hw-class's `requirements` to pick the
+    ///    instance type.
     /// 4. `budget = max_fleet_cores − Σ live.allocatable.cpu −
     ///    created_this_tick`. The sum covers both Registered AND
     ///    in-flight claims so a slow-to-register burst doesn't
@@ -883,7 +898,6 @@ impl NodeClaimPoolReconciler {
     /// `Api::create` failures are warned + skipped (next tick retries);
     /// the method only propagates errors that would make the tick
     /// non-progressing.
-    // r[impl ctrl.nodeclaim.anchor-bulk+2]
     async fn cover_deficit(
         &self,
         unplaced: &[SpawnIntent],
@@ -919,20 +933,21 @@ impl NodeClaimPoolReconciler {
             let Some(u) = by_cell.get(cell) else {
                 continue;
             };
-            let (sum_c, sum_m, max_m, max_d, max_h, min_eta) = cover::sum_deficit(u);
-            let budget = self
-                .cfg
-                .max_fleet_cores
-                .saturating_sub(live_cores)
-                .saturating_sub(created_cores);
-            let (n, chunk) = cover::claim_count(
-                sum_c,
-                self.cfg.max_node_cores,
-                self.cfg.max_node_claims_per_cell_per_tick,
-                budget,
-            );
-            if n == 0 {
-                debug!(%cell, budget, sum_c, "fleet-core budget exhausted");
+            let scfg = cover::SizingCfg {
+                max_node_cores: self.cfg.max_node_cores,
+                max_node_mem: self.cfg.max_node_mem,
+                max_node_disk: self.cfg.max_node_disk,
+                per_tick_cap: self.cfg.max_node_claims_per_cell_per_tick,
+                budget: self
+                    .cfg
+                    .max_fleet_cores
+                    .saturating_sub(live_cores)
+                    .saturating_sub(created_cores),
+                fuse_cache_bytes: self.cfg.fuse_cache_bytes,
+            };
+            let (claims, min_eta) = cover::sizing(u, &scfg);
+            if claims.is_empty() {
+                debug!(%cell, budget = scfg.budget, "no claims (budget exhausted or empty)");
                 continue;
             }
             let Some(hw_labels) = self.hw_config.labels_for(&cell.0) else {
@@ -954,32 +969,12 @@ impl NodeClaimPoolReconciler {
             let cover_cfg = cover::CoverCfg {
                 metal_sizes: &self.cfg.metal_sizes,
             };
-            // Per-claim disk: each pod allocates ephemeral-storage
-            // independently, so the claim need only fit the largest
-            // single pod — but the pod requests `pod_ephemeral_request(
-            // disk_bytes, headroom, fuse_cache)` (= headroom×disk +
-            // fuse + log), NOT bare `disk_bytes`. B8 live: a 100Gi-disk
-            // intent's pod asked 201Gi on a node Karpenter sized for
-            // 100Gi → unschedulable. `max_h` is the widest headroom any
-            // cell intent carries so the claim covers the worst case.
-            //
-            // r[ctrl.nodeclaim.anchor-bulk+2]: the FIRST claim is the
-            // anchor at `(chunk, max_m, disk_per)` so the largest
-            // single intent's mem is covered; bulk claims (k>0) use
-            // `Σm/n`. Without the anchor, `[{32c,200Gi},{32c,2Gi}×7]`
-            // → 4×{64c,54Gi} and the 200Gi pod fits none. Cores need
-            // no separate anchor: every intent's cores ≤ max_node_cores
-            // = chunk, so chunk already covers max(c).
-            let mem_per = sum_m / u64::from(n);
-            let disk_per = pod_ephemeral_request(max_d, max_h, self.cfg.fuse_cache_bytes);
-            for k in 0..n {
-                let mem = if k == 0 { max_m } else { mem_per };
-                let nc =
-                    cover::build_nodeclaim(cell, (chunk, mem, disk_per), min_eta, &hw, &cover_cfg);
+            for &(c, m, d) in &claims {
+                let nc = cover::build_nodeclaim(cell, (c, m, d), min_eta, &hw, &cover_cfg);
                 match self.nodeclaims.create(&PostParams::default(), &nc).await {
                     Ok(out) => {
                         let name = out.metadata.name.unwrap_or_default();
-                        debug!(%cell, %name, cores = chunk, "NodeClaim created");
+                        debug!(%cell, %name, cores = c, "NodeClaim created");
                         metrics::counter!(
                             "rio_controller_nodeclaim_created_total",
                             "cell" => cell.to_string(),
@@ -991,8 +986,8 @@ impl NodeClaimPoolReconciler {
                         warn!(%cell, error = %e, "NodeClaim create failed; skipping");
                     }
                 }
+                created_cores += c;
             }
-            created_cores += n * chunk;
         }
         Ok(CoverResult { created })
     }

@@ -200,6 +200,21 @@ Usage:
   {{- include "rio.optBool" (list $ctx "hostUsers" $ctx.hostUsers) | nindent 2 }}
 $ctx is the map to hasKey against; $key the field name; $val the value.
 */}}
+{{/*
+k8s Quantity string ("500Gi" / "2Ti") → bytes. Minimal: only the
+Gi/Ti suffixes the chart uses (`karpenter.dataVolumeSize`). Unsuffixed
+values are passed through as-is.
+*/}}
+{{- define "rio.quantityBytes" -}}
+{{- if hasSuffix "Gi" . -}}
+{{- mul (trimSuffix "Gi" . | int64) 1073741824 -}}
+{{- else if hasSuffix "Ti" . -}}
+{{- mul (trimSuffix "Ti" . | int64) 1099511627776 -}}
+{{- else -}}
+{{- int64 . -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "rio.optBool" -}}
 {{- $ctx := index . 0 -}}
 {{- $key := index . 1 -}}

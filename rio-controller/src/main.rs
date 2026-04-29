@@ -259,6 +259,9 @@ async fn main() -> anyhow::Result<()> {
     // hands it to the reconciler. `Ctx.placeable = None` ⇔ NodeClaim CRD
     // absent (k3s VM tests without Karpenter) — the gate is a
     // pass-through and the nodeclaim_pool reconciler is not spawned.
+    pool::pod::BUILDER_FUSE_CACHE
+        .set(cfg.nodeclaim_pool.fuse_cache_bytes)
+        .ok();
     let nodeclaim_crd = nodeclaim_pool::nodeclaim_crd_present(&client).await;
     let (mut placeable_tx, placeable) = if nodeclaim_crd {
         let (tx, rx) = nodeclaim_pool::placeable_channel();
@@ -513,6 +516,8 @@ mod tests {
         [nodeclaim_pool]
         max_fleet_cores = 64
         max_node_cores = 16
+        max_node_mem = 17179869184
+        max_node_disk = 25769803776
         metal_sizes = ["metal", "metal-24xl"]
 
         [nodeclaim_pool.lead_time_seed]
@@ -525,6 +530,8 @@ mod tests {
             // rio-controller-config ConfigMap renders.
             assert_eq!(cfg.nodeclaim_pool.max_fleet_cores, 64);
             assert_eq!(cfg.nodeclaim_pool.max_node_cores, 16);
+            assert_eq!(cfg.nodeclaim_pool.max_node_mem, 17179869184);
+            assert_eq!(cfg.nodeclaim_pool.max_node_disk, 25769803776);
             assert_eq!(cfg.nodeclaim_pool.metal_sizes, vec!["metal", "metal-24xl"]);
             assert_eq!(cfg.nodeclaim_pool.default_lead_time_seed, 30.0);
             assert_eq!(

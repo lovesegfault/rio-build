@@ -460,13 +460,15 @@ before forecast, large before small), bin-select `MostAllocated` on
 the `allocatable` divisor — so the deficit is the unplaced residual
 and matches the `schedulerName: kube-build-scheduler` instance.
 
-r[ctrl.nodeclaim.anchor-bulk+2]
-Unplaced intents per `(h,cap)` cell are covered by `1×anchor` at
-`(chunk, max_U M, max_U D_eph)` — `chunk = min(Σc*, maxCores)` already
-dominates `max_U c*`, so memory is the load-bearing anchor dimension —
-plus `⌈(Σc* − chunk)/chunk⌉ × bulk` at `(chunk, Σm/n, max_U D_eph)`.
-NodeClaim creation is capped at `sla.maxNodeClaimsPerCellPerTick` and
-the `sla.maxFleetCores` budget; cells are iterated round-robin from a
+r[ctrl.nodeclaim.anchor-bulk+3]
+Unplaced intents per `(h,cap)` cell are covered by `n` uniform claims at
+`(max(⌈Σc*/n⌉, max_i c*), max(Σm/n, max_i m), max(Σd_eph/n, max_i d_eph))`,
+where `n` iterates upward from the 3-axis lower bound
+`max(⌈Σc*/maxCores⌉, ⌈Σm/maxMem⌉, ⌈Σd_eph/maxDisk⌉)` until the
+production FFD's MostAllocated-cpu placement order packs every intent
+(`Σ/n` is a bin-packing lower bound, not a guarantee). NodeClaim
+creation is capped at `sla.maxNodeClaimsPerCellPerTick` and the
+`sla.maxFleetCores` budget; cells are iterated round-robin from a
 rotating start so no cell starves under sustained pressure.
 
 r[ctrl.nodeclaim.lead-time-ddsketch]

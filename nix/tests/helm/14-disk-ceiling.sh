@@ -1,23 +1,18 @@
 # karpenter.dataVolumeSize MUST cover the largest pod ephemeral-storage
-# request a §13b NodeClaim can place. The pod-side formula
-# (pool/jobs.rs pod_ephemeral_request) is:
+# request a §13b NodeClaim can place — kube-scheduler's NodeResourcesFit
+# SUMS ephemeral-storage across bound pods (same as cpu/mem), so
+# `cover::sizing` chunks claims at `max_node_disk` ≈ 90% of
+# dataVolumeSize. This check guards only that ONE max-disk pod fits
+# (the runtime n-axis chunking in `claim_count` handles the multi-pod
+# case structurally). Per-pod formula (pool/jobs.rs pod_ephemeral_request):
 #   disk_bytes × OVERLAY_HEADROOM + fuse_cache_bytes + LOG_BUDGET_BYTES
-# and disk_bytes is clamped at sla.ceilings.maxDisk. kubelet additionally
-# reserves ~10% (eviction threshold + image cache) before allocatable.
-#
-# B8 live: dataVolumeSize=200Gi but a 100Gi-disk intent's pod requested
-# 100×1.5+50+1 = 201Gi → unschedulable on the 189Gi-allocatable node the
-# matching NodeClaim launched.
+# clamped at sla.ceilings.maxDisk. kubelet reserves ~10% before allocatable.
 #
 # nvme hw-classes are exempt (instance-store, not this EBS volume) — this
 # only guards the rio-default EC2NodeClass.
 
-# Mirror jobs.rs constants. Drift here = test goes stale, but the
-# NodeClaim path now calls the SAME pod_ephemeral_request() so the
-# runtime coupling is structural; this check guards the static helm
-# default only. headroom(n_eff) is variance-aware (scheduler-side) and
-# bounded above by headroom(1.0) = 1.25 + 0.7 = 1.95; budget for the
-# worst case so a cold-key intent at max_disk still fits.
+# Mirror jobs.rs constants. headroom(n_eff) is bounded above by
+# headroom(1.0) = 1.25 + 0.7 = 1.95.
 OVERLAY_HEADROOM_PCT=195   # worst-case headroom(n_eff=1)
 LOG_BUDGET_BYTES=$((1 << 30))
 RESERVE_PCT=110            # ~10% kubelet reserve
