@@ -187,24 +187,29 @@ pub fn cells_round_robin(mut cells: Vec<Cell>, tick: u64) -> Vec<Cell> {
     cells
 }
 
-/// Per-cell `(Σcores, Σmem, max disk_bytes, max headroom, min
-/// eta_seconds)` over `u`. `max` for disk: each pod gets its own
-/// ephemeral-storage allocation, so the claim only needs to fit the
-/// largest single intent; cores/mem stack. `max` for headroom: the
-/// claim's disk floor must cover the widest cushion any assigned intent
-/// will request. `min` for eta: the binding constraint is the soonest
-/// demand the claim must meet (stamped as [`FORECAST_ETA_ANNOTATION`]).
-/// Returns the RAW `disk_bytes` max — the caller maps it through
+/// Per-cell deficit aggregate over `u`: `(Σcores, Σmem, max mem, max
+/// disk_bytes, max headroom, min eta_seconds)`. `max mem`: the anchor
+/// claim must fit the largest single intent's mem (`r[ctrl.nodeclaim.
+/// anchor-bulk]` — bulk claims size to `Σm/n` which can fall below
+/// `max(m)` when one large intent groups with many small siblings).
+/// `max` for disk: each pod gets its own ephemeral-storage allocation,
+/// so the claim only needs to fit the largest single intent; cores/mem
+/// stack. `max` for headroom: the claim's disk floor must cover the
+/// widest cushion any assigned intent will request. `min` for eta: the
+/// binding constraint is the soonest demand the claim must meet
+/// (stamped as [`FORECAST_ETA_ANNOTATION`]). Returns the RAW
+/// `disk_bytes` max — the caller maps it through
 /// [`crate::reconcilers::pool::jobs::pod_ephemeral_request`] before
 /// stamping the NodeClaim, so the claim's floor matches what the pod
 /// will actually request (`headroom×` + fuse-cache + log).
-pub fn sum_deficit(u: &[&SpawnIntent]) -> (u32, u64, u64, f64, f64) {
+pub fn sum_deficit(u: &[&SpawnIntent]) -> (u32, u64, u64, u64, f64, f64) {
     use crate::reconcilers::pool::jobs::intent_headroom;
     u.iter()
-        .fold((0, 0, 0, 0.0, f64::MAX), |(c, m, d, h, e), i| {
+        .fold((0, 0, 0, 0, 0.0, f64::MAX), |(c, m, mm, d, h, e), i| {
             (
                 c + i.cores,
                 m + i.mem_bytes,
+                mm.max(i.mem_bytes),
                 d.max(i.disk_bytes),
                 h.max(intent_headroom(i)),
                 e.min(i.eta_seconds),
@@ -422,14 +427,40 @@ mod tests {
         b.disk_headroom_factor = Some(1.3);
         b.eta_seconds = 10.0;
         let s = sum_deficit(&[&a, &b]);
-        assert_eq!(s, (12, 24 * GI, 50 * GI, 1.8, 10.0));
-        // Empty → (0,0,0,0.0,MAX) — caller's `> 0.0 && is_finite` gate skips.
-        let (c, m, d, h, e) = sum_deficit(&[]);
-        assert_eq!((c, m, d, h), (0, 0, 0, 0.0));
+        assert_eq!(s, (12, 24 * GI, 16 * GI, 50 * GI, 1.8, 10.0));
+        // Empty → (0,0,0,0,0.0,MAX) — caller's `> 0.0 && is_finite` gate skips.
+        let (c, m, mm, d, h, e) = sum_deficit(&[]);
+        assert_eq!((c, m, mm, d, h), (0, 0, 0, 0, 0.0));
         assert_eq!(e, f64::MAX);
         // Absent factor → 1.5 fallback contributes to the max.
         let c = intent("c", 1, GI, &[]);
-        assert_eq!(sum_deficit(&[&c, &b]).3, 1.5);
+        assert_eq!(sum_deficit(&[&c, &b]).4, 1.5);
+    }
+
+    /// mb_024(1) anchor: `r[ctrl.nodeclaim.anchor-bulk]` says first
+    /// claim must fit `max_U(c*,M,D)`. With `[{32c,200Gi},{32c,2Gi}×7]`
+    /// and `max_node_cores=64`, `n=4` and `Σm/n≈54Gi` — bulk claims
+    /// alone wouldn't fit the 200Gi pod. The anchor (k==0) takes
+    /// `mem=max_m=200Gi`. Test asserts on `sum_deficit` only (the
+    /// anchor application is in `cover_deficit`'s loop body, exercised
+    /// via the kwok VM test).
+    #[test]
+    fn sum_deficit_max_mem_for_anchor() {
+        let big = intent("big", 32, 200 * GI, &[]);
+        let small: Vec<_> = (0..7)
+            .map(|i| intent(&format!("s{i}"), 32, 2 * GI, &[]))
+            .collect();
+        let mut u: Vec<&SpawnIntent> = vec![&big];
+        u.extend(small.iter());
+        let (sum_c, sum_m, max_m, ..) = sum_deficit(&u);
+        assert_eq!(sum_c, 256);
+        assert_eq!(sum_m, 214 * GI);
+        assert_eq!(max_m, 200 * GI, "anchor mem = largest single intent's mem");
+        // claim_count(256, 64, 8, big_budget) → (4, 64). Σm/n = 53.5Gi.
+        // Without anchor, no claim fits 200Gi.
+        let (n, _chunk) = claim_count(sum_c, 64, 8, 10_000);
+        assert_eq!(n, 4);
+        assert!(sum_m / u64::from(n) < max_m, "bulk mem_per < max_m");
     }
 
     // --- round-robin ---------------------------------------------------

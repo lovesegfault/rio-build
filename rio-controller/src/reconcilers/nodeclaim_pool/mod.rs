@@ -726,11 +726,13 @@ impl NodeClaimPoolReconciler {
     ///    `fit=None`) route to [`NodeClaimPoolConfig::fallback_cell`].
     /// 2. Round-robin `cfg.all_cells()` from `tick_counter` so no cell
     ///    starves under sustained pressure.
-    /// 3. Per cell with deficit: sum `(Σc, Σm, max d)` over the cell's
-    ///    intents; mint `N = min(⌈Σc/max_node_cores⌉, per_tick_cap,
-    ///    budget_fit)` NodeClaims, each requesting `(chunk, Σm/N,
-    ///    max d)`. Karpenter resolves each against the hw-class's
-    ///    `requirements` to pick the instance type.
+    /// 3. Per cell with deficit: sum `(Σc, Σm, max m, max d)` over
+    ///    the cell's intents; mint `N = min(⌈Σc/max_node_cores⌉,
+    ///    per_tick_cap, budget_fit)` NodeClaims. The first (anchor)
+    ///    requests `(chunk, max m, max d)` so the largest single
+    ///    intent fits; the remaining N−1 (bulk) request `(chunk,
+    ///    Σm/N, max d)`. Karpenter resolves each against the
+    ///    hw-class's `requirements` to pick the instance type.
     /// 4. `budget = max_fleet_cores − Σ live.allocatable.cpu −
     ///    created_this_tick`. The sum covers both Registered AND
     ///    in-flight claims so a slow-to-register burst doesn't
@@ -775,7 +777,7 @@ impl NodeClaimPoolReconciler {
             let Some(u) = by_cell.get(cell) else {
                 continue;
             };
-            let (sum_c, sum_m, max_d, max_h, min_eta) = cover::sum_deficit(u);
+            let (sum_c, sum_m, max_m, max_d, max_h, min_eta) = cover::sum_deficit(u);
             let budget = self
                 .cfg
                 .max_fleet_cores
@@ -810,25 +812,28 @@ impl NodeClaimPoolReconciler {
             let cover_cfg = cover::CoverCfg {
                 metal_sizes: &self.cfg.metal_sizes,
             };
-            // Per-claim mem: Σm spread evenly. Disk: each pod allocates
-            // ephemeral-storage independently, so the claim need only
-            // fit the largest single pod — but the pod requests
-            // `pod_ephemeral_request(disk_bytes, headroom, fuse_cache)`
-            // (= headroom×disk + fuse + log), NOT bare `disk_bytes`. B8
-            // live: a 100Gi-disk intent's pod asked 201Gi on a node
-            // Karpenter sized for 100Gi → unschedulable. `max_h` is the
-            // widest headroom any cell intent carries so the claim
-            // covers the worst case.
+            // Per-claim disk: each pod allocates ephemeral-storage
+            // independently, so the claim need only fit the largest
+            // single pod — but the pod requests `pod_ephemeral_request(
+            // disk_bytes, headroom, fuse_cache)` (= headroom×disk +
+            // fuse + log), NOT bare `disk_bytes`. B8 live: a 100Gi-disk
+            // intent's pod asked 201Gi on a node Karpenter sized for
+            // 100Gi → unschedulable. `max_h` is the widest headroom any
+            // cell intent carries so the claim covers the worst case.
+            //
+            // r[ctrl.nodeclaim.anchor-bulk]: the FIRST claim is the
+            // anchor at `(chunk, max_m, disk_per)` so the largest
+            // single intent's mem is covered; bulk claims (k>0) use
+            // `Σm/n`. Without the anchor, `[{32c,200Gi},{32c,2Gi}×7]`
+            // → 4×{64c,54Gi} and the 200Gi pod fits none. Cores need
+            // no separate anchor: every intent's cores ≤ max_node_cores
+            // = chunk, so chunk already covers max(c).
             let mem_per = sum_m / u64::from(n);
             let disk_per = pod_ephemeral_request(max_d, max_h, self.cfg.fuse_cache_bytes);
-            for _ in 0..n {
-                let nc = cover::build_nodeclaim(
-                    cell,
-                    (chunk, mem_per, disk_per),
-                    min_eta,
-                    &hw,
-                    &cover_cfg,
-                );
+            for k in 0..n {
+                let mem = if k == 0 { max_m } else { mem_per };
+                let nc =
+                    cover::build_nodeclaim(cell, (chunk, mem, disk_per), min_eta, &hw, &cover_cfg);
                 match self.nodeclaims.create(&PostParams::default(), &nc).await {
                     Ok(out) => {
                         let name = out.metadata.name.unwrap_or_default();
