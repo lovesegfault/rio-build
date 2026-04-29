@@ -1069,7 +1069,25 @@ impl DagActor {
                         reason.emit(&tenant);
                     }
                 }
-                (c, m, d, Vec::new(), Vec::new(), None)
+                // mb_053(a) / V-5: `--capacity` on the bypass path. The
+                // `Some(memo)` arm filters `cells` to `cap` post-memo,
+                // but ANY bypass field gates `full=None` and lands here
+                // with empty `(terms, names)`. Empty `hw_class_names` →
+                // controller's `cells_of` is empty → `fallback_cell`
+                // returns `(ref_h, Spot)` ignoring the pin → cover
+                // provisions spot, the cap-type term refuses spot, pod
+                // never schedules. Populate `(terms, names)` from
+                // `[(ref_h, cap)]` via the same `cells_to_selector_terms`
+                // so the controller derives the pinned cell instead of
+                // falling back. No `o.capacity` → empty as before.
+                let (terms, names) = match override_.as_ref().and_then(|o| o.capacity) {
+                    Some(cap) => solve::cells_to_selector_terms(
+                        &[(self.sla_config.reference_hw_class.clone(), cap)],
+                        &self.sla_config.hw_classes,
+                    ),
+                    None => (Vec::new(), Vec::new()),
+                };
+                (c, m, d, terms, names, None)
             }
         };
         // r[impl sched.sla.reactive-floor+2]
@@ -1165,37 +1183,40 @@ impl DagActor {
                 let no_tier = override_.as_ref().is_some_and(|o| o.forced_cores.is_some())
                     || hints.prefer_local_build == Some(true)
                     || hints.enable_parallel_building == Some(false);
-                let pinned = override_.as_ref().and_then(|o| o.tier.as_deref()).map(|n| {
-                    self.sla_tiers
+                // mb_053: project via the SAME `effective_tiers` as
+                // `intent_for` so a `--p*` override records the
+                // operator's target, not the config-ladder one (which
+                // emitted false `envelope_result_total{result=miss}`).
+                // `tier_target` reads from `tiers`, NOT `self.sla_tiers`,
+                // so the recorded bound is the one dispatch sized for.
+                let cow;
+                let tiers = match override_.as_ref() {
+                    Some(o) => {
+                        cow = o.effective_tiers(&self.sla_tiers);
+                        &*cow
+                    }
+                    None => &*self.sla_tiers,
+                };
+                let target = |name: &str| {
+                    tiers
                         .iter()
-                        .filter(|t| t.name == n)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                });
-                let tiers = pinned.as_deref().unwrap_or(&self.sla_tiers);
+                        .find(|t| t.name == name)
+                        .and_then(solve::Tier::binding_bound)
+                };
                 let (tier, tier_target) = if no_tier {
                     (None, None)
                 } else if let Some(tier) = full_tier.as_deref() {
-                    (
-                        Some(tier.to_owned()),
-                        self.sla_tiers
-                            .iter()
-                            .find(|t| t.name == tier)
-                            .and_then(solve::Tier::binding_bound),
-                    )
+                    (Some(tier.to_owned()), target(tier))
                 } else {
                     // hw-agnostic arm ⇒ re-run `solve_tier` (pure) for
                     // the tier name. The admissible-set arm carries
                     // `full_tier` directly so this only fires when
                     // gates routed away from solve_full.
                     match solve::solve_tier(f, tiers, &self.sla_ceilings) {
-                        solve::SolveResult::Feasible { tier, .. } => (
-                            Some(tier.clone()),
-                            self.sla_tiers
-                                .iter()
-                                .find(|t| t.name == tier)
-                                .and_then(solve::Tier::binding_bound),
-                        ),
+                        solve::SolveResult::Feasible { tier, .. } => {
+                            let t = target(&tier);
+                            (Some(tier.clone()), t)
+                        }
                         solve::SolveResult::BestEffort { .. } => (None, None),
                     }
                 };

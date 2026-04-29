@@ -89,30 +89,31 @@ pub fn explain(
         };
     }
 
-    // `forced_mem` is hoisted so it shows in EVERY branch below
-    // (mirrors `intent_for` at solve.rs). Display-only: explain has no
-    // menu-fit, so this stays correct after bug_033 deleted the
-    // post-solve overlay in `solve_intent_for`.
+    // Override summary + ladder via the single shared projections so
+    // explain shows EXACTLY what dispatch sized against (mb_053:
+    // `p*_secs`/`capacity` were ignored here → "Override: (none)"
+    // while dispatch used the ad-hoc tier).
+    let override_applied = override_.and_then(ResolvedTarget::describe);
     let forced_mem = override_.and_then(|o| o.forced_mem);
-    let fmt_mem = |m: u64| format!("forced mem={:.1}Gi", m as f64 / (1u64 << 30) as f64);
 
     let Some(fit) = fit else {
         return ExplainResult {
             key: key.clone(),
             fit_summary: "(no fit — cold-start probe)".into(),
             prior_source: "none".into(),
-            override_applied: forced_mem.map(fmt_mem),
+            override_applied,
             candidates: Vec::new(),
         };
     };
 
-    // tier-only override: filter the ladder to the pinned tier so the
-    // table answers "would this key hit the tier I asked for?"
-    let pinned = override_.and_then(|o| o.tier.as_deref());
-    let walk: Vec<&Tier> = tiers
-        .iter()
-        .filter(|t| pinned.is_none_or(|p| p == t.name))
-        .collect();
+    let cow;
+    let walk: &[Tier] = match override_ {
+        Some(o) => {
+            cow = o.effective_tiers(tiers);
+            &cow
+        }
+        None => tiers,
+    };
 
     let cap_c = fit.fit.p_bar().0.min(fit.fit.c_opt().0).min(ceil.max_cores);
     let h = headroom(fit.n_eff_ring);
@@ -161,19 +162,7 @@ pub fn explain(
             .prior_source
             .map(|p| p.as_str().to_string())
             .unwrap_or_else(|| "per-key".into()),
-        override_applied: match (pinned, forced_mem) {
-            (None, None) => None,
-            (tier, mem) => {
-                let mut parts = Vec::new();
-                if let Some(t) = tier {
-                    parts.push(format!("tier pinned to {t:?}"));
-                }
-                if let Some(m) = mem {
-                    parts.push(fmt_mem(m));
-                }
-                Some(parts.join(", "))
-            }
-        },
+        override_applied,
         candidates,
     }
 }

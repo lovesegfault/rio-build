@@ -437,29 +437,18 @@ pub fn intent_for(
             };
         }
     };
-    // tier override: solve against ONLY that tier's bounds. An unknown
-    // name yields an empty ladder → BestEffort (operator error surfaces
-    // via `sla explain`, not a silent fallback to the default ladder).
-    // p*_secs override: build a one-off tier from the operator's
-    // targets — config ladder ignored entirely. Named `tier` wins if
-    // both are set (more specific operator intent).
-    let pinned: Vec<Tier>;
+    // tier / p*_secs override: project the config ladder via the single
+    // shared `effective_tiers()` so explain + SlaPrediction agree
+    // (mb_053). An unknown named tier → empty ladder → BestEffort
+    // (operator error surfaces via `sla explain`, not a silent
+    // fallback to the default ladder).
+    let cow;
     let tiers = match override_ {
-        Some(o) if o.tier.is_some() => {
-            let name = o.tier.as_deref().unwrap();
-            pinned = tiers.iter().filter(|t| t.name == name).cloned().collect();
-            &pinned
+        Some(o) => {
+            cow = o.effective_tiers(tiers);
+            &*cow
         }
-        Some(o) if o.p50_secs.is_some() || o.p90_secs.is_some() || o.p99_secs.is_some() => {
-            pinned = vec![Tier {
-                name: "override".into(),
-                p50: o.p50_secs,
-                p90: o.p90_secs,
-                p99: o.p99_secs,
-            }];
-            &pinned
-        }
-        _ => tiers,
+        None => tiers,
     };
     let r = solve_tier(fit, tiers, ceil);
     // Infeasible-at-any-tier — the operator-facing alerting hook
