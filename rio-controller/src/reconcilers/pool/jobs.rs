@@ -81,6 +81,31 @@ const LOG_BUDGET_BYTES: u64 = 1 << 30;
 /// TODO(ADR-023 phase-2): replace with `headroom(n_eff)` from the SLA
 /// estimator (variance-aware). 1.5× is the phase-1 flat fallback.
 const OVERLAY_HEADROOM: f64 = 1.5;
+
+/// Pod `ephemeral-storage` request/limit for an intent's `disk_bytes`
+/// plus a per-pool FUSE-cache budget.
+///
+/// = `disk_bytes × OVERLAY_HEADROOM` (overlay emptyDir, prjquota fit ×
+/// variance cushion) + `fuse_cache_bytes` (input closure, the
+/// `fuse-cache` emptyDir sizeLimit) + [`LOG_BUDGET_BYTES`]
+/// (stdout/stderr capture + daemon state outside the overlay).
+///
+/// Single source for THREE callers that must agree:
+/// - [`apply_intent_resources`] — the actual pod request/limit;
+/// - [`crate::reconcilers::nodeclaim_pool`]'s `cover_deficit` — the
+///   NodeClaim `resources.requests.ephemeral-storage` floor (B8 live:
+///   raw `disk_bytes` here while the pod requested 1.5× + 50Gi + 1Gi
+///   meant a 100Gi-intent pod asked 201Gi on a 189Gi-allocatable node);
+/// - helm-lint `14-disk-ceiling.sh` — `karpenter.dataVolumeSize` ≥
+///   `pod_ephemeral_request(sla.maxDisk, poolDefaults.fuseCacheBytes)`
+///   + kubelet reserve.
+// r[impl sched.sla.disk-reaches-ephemeral-storage]
+pub(crate) fn pod_ephemeral_request(disk_bytes: u64, fuse_cache_bytes: u64) -> u64 {
+    ((disk_bytes as f64 * OVERLAY_HEADROOM) as u64)
+        .saturating_add(fuse_cache_bytes)
+        .saturating_add(LOG_BUDGET_BYTES)
+}
+
 /// Margin between the worker's `daemon_timeout` and K8s
 /// `activeDeadlineSeconds`, so the worker's `tokio::time::timeout`
 /// fires first and emits `CompletionReport{TimedOut}` (telemetry +
@@ -870,12 +895,9 @@ pub(super) fn build_job(
 /// level limit fires. Budgeting bare `disk_bytes` (1.0×) here while
 /// the overlay sizeLimit is 1.5× made the headroom unreachable —
 /// pods evicted at ≈p90 instead of 1.5×p90.
-// r[impl sched.sla.disk-reaches-ephemeral-storage]
 fn apply_intent_resources(pod_spec: &mut PodSpec, pool: &Pool, i: &SpawnIntent) {
     let overlay_limit = (i.disk_bytes as f64 * OVERLAY_HEADROOM) as u64;
-    let ephemeral = overlay_limit
-        .saturating_add(pod::fuse_cache_bytes(pool))
-        .saturating_add(LOG_BUDGET_BYTES);
+    let ephemeral = pod_ephemeral_request(i.disk_bytes, pod::fuse_cache_bytes(pool));
     let map: BTreeMap<String, Quantity> = BTreeMap::from([
         ("cpu".into(), Quantity(i.cores.to_string())),
         ("memory".into(), Quantity(i.mem_bytes.to_string())),

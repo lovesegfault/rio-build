@@ -46,6 +46,7 @@ use rio_proto::types::{
 };
 
 use crate::reconcilers::node_informer::HwClassConfig;
+use crate::reconcilers::pool::jobs::pod_ephemeral_request;
 use crate::reconcilers::{AdminClient, admin_call};
 
 pub use consolidate::{HOLD_OPEN_ANNOTATION, IdleGapEvent};
@@ -233,6 +234,15 @@ pub struct NodeClaimPoolConfig {
     /// (I-205). Helm: `karpenter.metalSizes`. Empty (kwok/vmtest) → no
     /// instance-size requirement emitted.
     pub metal_sizes: Vec<String>,
+    /// FUSE-cache budget added to every builder pod's
+    /// `ephemeral-storage` request (the `fuse-cache` emptyDir). The
+    /// NodeClaim's `resources.requests.ephemeral-storage` floor MUST
+    /// match what the pod will actually ask for via
+    /// `pool::jobs::pod_ephemeral_request`, so this mirrors the value
+    /// the `pool/jobs` reconciler reads from `PoolSpec.fuseCacheBytes`.
+    /// Helm: `poolDefaults.fuseCacheBytes` (50Gi prod). Default is the
+    /// CRD safe-minimum `pool::pod::BUILDER_FUSE_CACHE_BYTES` (8Gi).
+    pub fuse_cache_bytes: u64,
 }
 
 impl NodeClaimPoolConfig {
@@ -305,6 +315,7 @@ impl Default for NodeClaimPoolConfig {
             // Matches helm `sla.maxCores` default (64).
             max_node_cores: 64,
             metal_sizes: Vec::new(),
+            fuse_cache_bytes: crate::reconcilers::pool::pod::BUILDER_FUSE_CACHE_BYTES,
         }
     }
 }
@@ -754,14 +765,19 @@ impl NodeClaimPoolReconciler {
                 continue;
             };
             let hw_reqs = self.hw_config.requirements_for(&cell.0).unwrap_or_default();
-            // Per-claim mem: Σm spread evenly. max_d as-is (each pod's
-            // disk allocates independently, so the claim need only fit
-            // the largest).
+            // Per-claim mem: Σm spread evenly. Disk: each pod allocates
+            // ephemeral-storage independently, so the claim need only
+            // fit the largest single pod — but the pod requests
+            // `pod_ephemeral_request(disk_bytes, fuse_cache)`
+            // (= 1.5×disk + fuse + log), NOT bare `disk_bytes`. B8
+            // live: a 100Gi-disk intent's pod asked 201Gi on a node
+            // Karpenter sized for 100Gi → unschedulable.
             let mem_per = sum_m / u64::from(n);
+            let disk_per = pod_ephemeral_request(max_d, self.cfg.fuse_cache_bytes);
             for _ in 0..n {
                 let nc = cover::build_nodeclaim(
                     cell,
-                    (chunk, mem_per, max_d),
+                    (chunk, mem_per, disk_per),
                     &hw_labels,
                     &hw_reqs,
                     &self.cfg.metal_sizes,

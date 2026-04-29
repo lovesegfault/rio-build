@@ -82,7 +82,7 @@ const READ_ONLY_ROOT_MOUNTS: &[(&str, &str, Option<&str>, Option<&str>)] = &[
 /// nodes) so a Pool created via raw `kubectl apply` without
 /// `spec.fuseCacheBytes` schedules anywhere. Prod gets 50Gi via the
 /// helm chart's `poolDefaults.fuseCacheBytes`.
-pub(super) const BUILDER_FUSE_CACHE_BYTES: u64 = 8 * (1 << 30);
+pub(crate) const BUILDER_FUSE_CACHE_BYTES: u64 = 8 * (1 << 30);
 
 /// Default FUSE cache size for fetchers. FODs are typically small
 /// (source tarballs, git clones). Safe-minimum CRD default; prod

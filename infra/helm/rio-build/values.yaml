@@ -694,10 +694,15 @@ karpenter:
   # "use whatever was last tagged".
   amiTag: ""
   # Root volume (/dev/xvda — single root, NixOS doesn't split OS/data).
-  # boot.growPartition expands / to fill on first boot. xlarge requests
-  # 96Gi ephemeral-storage; kubelet reserves ~10% for eviction threshold
-  # + image cache, so the node needs headroom above the largest request.
-  dataVolumeSize: 200Gi
+  # boot.growPartition expands / to fill on first boot. MUST cover the
+  # largest pod ephemeral-storage request a NodeClaim can carry:
+  # pod_ephemeral_request(sla.maxDisk, poolDefaults.fuseCacheBytes)
+  #   = maxDisk × 1.5 + fuseCacheBytes + 1Gi
+  #   = 200×1.5 + 50 + 1 = 351Gi
+  # plus ~10% kubelet eviction-threshold/image-cache reserve. nvme
+  # hw-classes ignore this (instance-store provides ephemeral-storage).
+  # 14-disk-ceiling.sh asserts the inequality.
+  dataVolumeSize: 500Gi
   # gp3 provisioned IOPS+throughput (max for gp3). Build workloads are
   # IOPS-bound; baseline 3000 throttles -j32+. gp3 has no separate
   # provisioned-IOPS account quota — io1/io2 do (300k/100k → 18/6

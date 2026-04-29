@@ -132,9 +132,13 @@ pub fn cells_round_robin(mut cells: Vec<Cell>, tick: u64) -> Vec<Cell> {
     cells
 }
 
-/// Per-cell `(Σcores, Σmem, max disk)` over `u`. `max` for disk: each
-/// pod gets its own ephemeral-storage allocation, so the claim only
-/// needs to fit the largest single intent's disk; cores/mem stack.
+/// Per-cell `(Σcores, Σmem, max disk_bytes)` over `u`. `max` for disk:
+/// each pod gets its own ephemeral-storage allocation, so the claim
+/// only needs to fit the largest single intent; cores/mem stack.
+/// Returns the RAW `disk_bytes` max — the caller maps it through
+/// [`crate::reconcilers::pool::jobs::pod_ephemeral_request`] before
+/// stamping the NodeClaim, so the claim's floor matches what the pod
+/// will actually request (1.5× + fuse-cache + log).
 pub fn sum_deficit(u: &[&SpawnIntent]) -> (u32, u64, u64) {
     u.iter().fold((0, 0, 0), |(c, m, d), i| {
         (c + i.cores, m + i.mem_bytes, d.max(i.disk_bytes))
