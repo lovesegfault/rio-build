@@ -209,9 +209,6 @@ data:
     {{- end }}
     reference_hw_class = {{ required "scheduler.sla.referenceHwClass is mandatory (ADR-023 §13a)" .referenceHwClass | quote }}
     hw_cost_source = {{ required "scheduler.sla.hwCostSource is mandatory (ADR-023 §13a)" .hwCostSource | quote }}
-    {{- with .nodeClassRef }}
-    node_class_ref = {{ . | quote }}
-    {{- end }}
     {{- with .leadTimeSeed }}
 
     [sla.lead_time_seed]
@@ -232,6 +229,7 @@ data:
       { key = {{ .key | quote }}, operator = {{ .operator | quote }}, values = {{ toJson .values }} },
       {{- end }}
     ]
+    node_class = {{ required (printf "scheduler.sla.hwClasses.%s.nodeClass is mandatory (rio-default / rio-nvme / rio-metal)" $h) $def.nodeClass | quote }}
     {{- end }}
 
     [sla.probe]

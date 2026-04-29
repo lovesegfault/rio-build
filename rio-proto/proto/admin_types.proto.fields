@@ -179,6 +179,7 @@ string key = 1;
 string kind = 2;
 string mem_kind = 7;
 string name = 1;
+string node_class = 3;
 string operator = 2;
 string pname = 1;
 string pname = 1;

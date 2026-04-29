@@ -76,15 +76,21 @@ pub async fn run() -> Result<()> {
         "sla.hwClasses is empty — probe-boot needs at least one hw-class. \
          Populate `scheduler.sla.hwClasses` in the helm values and `up --deploy`."
     );
-    let node_class = sla.node_class_ref.as_deref().unwrap_or("rio-default");
     info!(
-        "{} cell(s) ({} hw-class × {} capacity-type), nodeClassRef={node_class}",
+        "{} cell(s) ({} hw-class × {} capacity-type)",
         cells.len(),
         sla.hw_classes.len(),
         CapacityType::ALL.len(),
     );
 
-    ensure_shim_nodepool(&kube, node_class).await?;
+    // Shim NodePool nodeClassRef is the reference hw-class's NodeClass
+    // (it never provisions; the choice only matters for CRD admission).
+    let shim_nc = sla
+        .hw_classes
+        .get(&sla.reference_hw_class)
+        .map(|d| d.node_class.as_str())
+        .unwrap_or("rio-default");
+    ensure_shim_nodepool(&kube, shim_nc).await?;
 
     // `instance-size NotIn [metal, …]` — same exclusion `cover_deficit`
     // appends. Read from the deployed controller config so the probe
@@ -122,10 +128,11 @@ pub async fn run() -> Result<()> {
             let arch = def_arch(def);
             let key = cell_key(cell);
             info!(
-                "  [{key}] arch={arch}, requirements=[{}]",
+                "  [{key}] arch={arch}, nodeClass={}, requirements=[{}]",
+                def.node_class,
                 fmt_requirements(&def.requirements),
             );
-            let nc = mk_probe_nodeclaim(cell, def, &metal_sizes, node_class);
+            let nc = mk_probe_nodeclaim(cell, def, &metal_sizes);
             let start = jiff::Timestamp::now();
             let obj = claims
                 .create(&PostParams::default(), &nc)
@@ -503,12 +510,7 @@ fn fmt_requirements(reqs: &[NodeSelectorReq]) -> String {
 /// real) plus the shim/probe/hw-class markers. `spec.requirements`
 /// carries ONLY instance-type-discovery labels — `def.requirements` is
 /// validated by `SlaConfig::validate` to exclude `rio.build/*`.
-fn mk_probe_nodeclaim(
-    cell: &Cell,
-    def: &HwClassDef,
-    metal_sizes: &[String],
-    node_class: &str,
-) -> DynamicObject {
+fn mk_probe_nodeclaim(cell: &Cell, def: &HwClassDef, metal_sizes: &[String]) -> DynamicObject {
     let (h, cap) = cell;
     let mut reqs: Vec<Value> = def
         .requirements
@@ -546,7 +548,7 @@ fn mk_probe_nodeclaim(
             "nodeClassRef": {
                 "group": "karpenter.k8s.aws",
                 "kind": "EC2NodeClass",
-                "name": node_class,
+                "name": def.node_class,
             },
             "requirements": reqs,
         },
@@ -675,6 +677,7 @@ mod tests {
                 })
                 .collect(),
             requirements,
+            node_class: "rio-default".into(),
         }
     }
 
@@ -711,9 +714,11 @@ mod tests {
                 req("kubernetes.io/arch", "In", &["amd64"]),
             ],
         );
+        let mut def = def;
+        def.node_class = "rio-nvme".into();
         let cell = ("lo-ebs-x86".into(), CapacityType::Spot);
         let metal = vec!["metal".into(), "metal-24xl".into()];
-        let nc = mk_probe_nodeclaim(&cell, &def, &metal, "rio-nvme");
+        let nc = mk_probe_nodeclaim(&cell, &def, &metal);
         let v = serde_json::to_value(&nc).unwrap();
 
         // Assertion 1 prerequisite: no ownerReferences emitted.
@@ -788,7 +793,7 @@ mod tests {
         );
 
         // Empty metal_sizes → no instance-size requirement.
-        let nc = mk_probe_nodeclaim(&cell, &def, &[], "rio-nvme");
+        let nc = mk_probe_nodeclaim(&cell, &def, &[]);
         let v = serde_json::to_value(&nc).unwrap();
         let reqs = v.pointer("/spec/requirements").unwrap().as_array().unwrap();
         assert!(

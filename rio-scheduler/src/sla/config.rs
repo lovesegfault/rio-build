@@ -31,6 +31,15 @@ pub struct HwClassDef {
     /// `InsufficientCapacityError` → claim GC'd ~1s later.
     #[serde(default)]
     pub requirements: Vec<NodeSelectorReq>,
+    /// `EC2NodeClass` name for NodeClaims targeting this hw-class
+    /// (`rio-default` / `rio-nvme` / `rio-metal`). Per-class because
+    /// the band-loop NodePool template this replaces selected the
+    /// nodeClass by `$stor` — nvme classes need
+    /// `instanceStorePolicy: RAID0` (only on `rio-nvme`); a single
+    /// scalar default would launch nvme builders on the EBS root
+    /// volume.
+    #[serde(default)]
+    pub node_class: String,
 }
 
 /// `{key, operator, values}` — same shape as k8s
@@ -243,9 +252,6 @@ pub struct SlaConfig {
     /// Part-B: per-tick NodeClaim creation throttle per cell.
     #[serde(default = "default_max_node_claims_per_cell_per_tick")]
     pub max_node_claims_per_cell_per_tick: u32,
-    /// Part-B: `EC2NodeClass` name the NodeClaim reconciler stamps.
-    #[serde(default)]
-    pub node_class_ref: Option<String>,
     /// Cluster identifier for `sla_ema_state` / `interrupt_samples`
     /// scoping. ADR-023 §2.13: under the global-DB topology multiple
     /// regions share one PG; without this every scheduler upserts the
@@ -397,6 +403,7 @@ impl SlaConfig {
                         operator: "In".into(),
                         values: vec!["linux".into()],
                     }],
+                    node_class: "rio-default".into(),
                 },
             )]),
             hw_cost_tolerance: default_hw_cost_tolerance(),
@@ -412,7 +419,6 @@ impl SlaConfig {
             max_consolidation_time: None,
             consolidate_explore_epsilon: default_consolidate_explore_epsilon(),
             max_node_claims_per_cell_per_tick: default_max_node_claims_per_cell_per_tick(),
-            node_class_ref: None,
             cluster: String::new(),
         }
     }
@@ -478,6 +484,11 @@ impl SlaConfig {
                 "sla.hwClasses[{h}].requirements must be non-empty \
                  (Karpenter instance-type selectors, e.g. \
                  karpenter.k8s.aws/instance-generation In [7])"
+            );
+            anyhow::ensure!(
+                !def.node_class.is_empty(),
+                "sla.hwClasses[{h}].node_class must name an EC2NodeClass \
+                 (rio-default / rio-nvme / rio-metal)"
             );
             for r in &def.requirements {
                 anyhow::ensure!(
@@ -558,6 +569,18 @@ mod tests {
             operator: "In".into(),
             values: vec!["linux".into()],
         }]
+    }
+
+    /// Minimal valid `HwClassDef` with a `(k,v)` label.
+    fn test_def(k: &str, v: &str) -> HwClassDef {
+        HwClassDef {
+            labels: vec![NodeLabelMatch {
+                key: k.into(),
+                value: v.into(),
+            }],
+            requirements: test_req(),
+            node_class: "rio-default".into(),
+        }
     }
 
     fn base() -> SlaConfig {
@@ -797,6 +820,7 @@ mod tests {
             requirements = [
               { key = "karpenter.k8s.aws/instance-generation", operator = "In", values = ["8"] },
             ]
+            node_class = "rio-nvme"
             [lead_time_seed]
             "intel-8-nvme:spot" = 45.0
             "intel-8-nvme:od" = 38.0
@@ -824,16 +848,8 @@ mod tests {
     #[test]
     fn validate_rejects_hw_class_dot() {
         let mut cfg = base();
-        cfg.hw_classes.insert(
-            "c7a.xlarge".into(),
-            HwClassDef {
-                labels: vec![NodeLabelMatch {
-                    key: "k".into(),
-                    value: "v".into(),
-                }],
-                requirements: test_req(),
-            },
-        );
+        cfg.hw_classes
+            .insert("c7a.xlarge".into(), test_def("k", "v"));
         let err = cfg.validate().unwrap_err().to_string();
         assert!(
             err.contains("c7a.xlarge") && err.contains("[a-z0-9-]"),
@@ -841,16 +857,8 @@ mod tests {
         );
         // Positive control: dash-separated key passes.
         cfg.hw_classes.remove("c7a.xlarge");
-        cfg.hw_classes.insert(
-            "c7a-xlarge".into(),
-            HwClassDef {
-                labels: vec![NodeLabelMatch {
-                    key: "k".into(),
-                    value: "v".into(),
-                }],
-                requirements: test_req(),
-            },
-        );
+        cfg.hw_classes
+            .insert("c7a-xlarge".into(), test_def("k", "v"));
         cfg.validate().unwrap();
     }
 
@@ -931,6 +939,18 @@ mod tests {
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("rio.build/hw-band"), "{err}");
         assert!(err.contains("Node-stamp"), "{err}");
+
+        let mut cfg = base();
+        cfg.hw_classes
+            .get_mut("test-hw")
+            .unwrap()
+            .node_class
+            .clear();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("node_class must name an EC2NodeClass"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -991,7 +1011,6 @@ mod tests {
             "max_consolidation_time",
             "consolidate_explore_epsilon",
             "max_node_claims_per_cell_per_tick",
-            "node_class_ref",
             "cluster",
         ];
         // Intentionally NOT helm-rendered (with rationale). Adding a
@@ -1077,7 +1096,6 @@ mod tests {
             max_consolidation_time: _, // (scalar)
             consolidate_explore_epsilon: _, // (scalar)
             max_node_claims_per_cell_per_tick: _, // (scalar)
-            node_class_ref: _,     // (scalar) Option<String>; k8s-side ref, not ours
             cluster: _,            // (scalar)
         } = cfg;
         // Silence unused-binding on the one (cell) field we kept by
@@ -1101,16 +1119,8 @@ mod tests {
         // Give the key a real hw_class so only the VALUE is wrong.
         let with_h = || {
             let mut c = base();
-            c.hw_classes.insert(
-                "intel-7".into(),
-                HwClassDef {
-                    labels: vec![NodeLabelMatch {
-                        key: "rio.build/hw-class".into(),
-                        value: "intel-7".into(),
-                    }],
-                    requirements: test_req(),
-                },
-            );
+            c.hw_classes
+                .insert("intel-7".into(), test_def("rio.build/hw-class", "intel-7"));
             c
         };
         // Non-finite.

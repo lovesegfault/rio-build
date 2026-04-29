@@ -191,11 +191,17 @@ impl From<NodeClaim> for LiveNode {
             Some(Cell(h.clone(), cap))
         });
         // Prefer allocatable (kubelet-reported, post-reserved); fall
-        // back to capacity (Karpenter's launch-time projection).
+        // back to capacity (Karpenter's launch-time projection); fall
+        // back to spec.resources.requests (what cover_deficit asked
+        // for) so a pre-Launch claim contributes to the
+        // `max_fleet_cores` budget instead of reading as 0 cores —
+        // otherwise the same deficit is re-minted each tick under
+        // Karpenter queue lag.
         let allocatable = status
             .allocatable
             .as_ref()
             .or(status.capacity.as_ref())
+            .or(nc.spec.resources.as_ref().and_then(|r| r.requests.as_ref()))
             .map_or((0, 0, 0), parse_resources);
         Self {
             name: nc.metadata.name.unwrap_or_default(),
@@ -701,6 +707,43 @@ pub(crate) mod tests {
         assert!(!live.registered, "no status → not registered");
         assert_eq!(live.cell, None, "no labels → no cell");
         assert_eq!(live.allocatable, (0, 0, 0));
+    }
+
+    /// mb_024(3): a pre-Launch NodeClaim (`status` absent — Karpenter
+    /// hasn't reconciled it yet) reads `allocatable` from
+    /// `spec.resources.requests` (what cover_deficit asked for), so the
+    /// `max_fleet_cores` budget covers it instead of re-minting the
+    /// same deficit each tick under Karpenter queue lag.
+    #[test]
+    fn live_node_spec_resources_fallback() {
+        use k8s_openapi::api::core::v1::ResourceRequirements;
+        use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+        let nc = NodeClaim {
+            metadata: kube::api::ObjectMeta {
+                name: Some("pre-launch".into()),
+                ..Default::default()
+            },
+            spec: rio_crds::karpenter::NodeClaimSpec {
+                resources: Some(ResourceRequirements {
+                    requests: Some(
+                        [
+                            ("cpu".into(), Quantity("32".into())),
+                            ("memory".into(), Quantity("64Gi".into())),
+                        ]
+                        .into(),
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            status: None,
+        };
+        let live: LiveNode = nc.into();
+        assert_eq!(
+            live.allocatable,
+            (32, 64 * GI, 0),
+            "pre-Launch claim contributes spec.requests to budget (was (0,0,0))"
+        );
     }
 
     #[test]

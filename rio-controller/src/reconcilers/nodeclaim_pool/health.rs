@@ -230,6 +230,31 @@ mod tests {
         }
     }
 
+    /// bug_040: a cell absent from `lead_time_seed` (a new hw-class
+    /// added without re-running `xtask k8s probe-boot`) gets
+    /// `default_lead_time_seed` (30s) → timeout `2×30=60s`, NOT
+    /// `2×0=0s`. With seed=0 a NodeClaim at age=10s would be reaped
+    /// before ~18s real boot completes; the cell could never accrue a
+    /// sample to escape the floor.
+    #[test]
+    fn unseeded_cell_timeout_nonzero() {
+        let cfg = NodeClaimPoolConfig {
+            lead_time_seed: HashMap::new(),
+            default_lead_time_seed: 30.0,
+            ..Default::default()
+        };
+        let sk = CellSketches::default();
+        let mut n = with_conds(
+            node("nc", "new-h", CapacityType::Spot, 8, 0, 0),
+            &[("Launched", "True", 1001.0)],
+        );
+        n.registered = false;
+        // age=10s; with seed=30 → timeout=60s → healthy. With the OLD
+        // seed=0 default → timeout=0 → reaped as BootTimeout here.
+        let r = classify(&[n], &HashSet::new(), &sk, &cfg, 1010.0);
+        assert!(r.is_empty(), "unseeded cell at age<2×default_seed: {r:?}");
+    }
+
     /// `Launched=False reason=LaunchFailed` → ICE immediately, even
     /// well under timeout. Karpenter GCs the claim ~1s after posting
     /// this; the timeout-based path never observes it. Live B11

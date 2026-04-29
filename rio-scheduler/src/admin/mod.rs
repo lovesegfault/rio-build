@@ -797,6 +797,7 @@ impl AdminService for AdminServiceImpl {
                     rio_proto::types::HwClassLabels {
                         labels,
                         requirements,
+                        node_class: def.node_class.clone(),
                     },
                 )
             })

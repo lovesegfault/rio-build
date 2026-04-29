@@ -8,8 +8,8 @@
 {{- with .Values.scheduler.sla -}}
 [nodeclaim_pool]
 lease_name = {{ $.Values.karpenter.nodeclaimPool.leaseName | default "rio-controller-nodeclaim-pool" | quote }}
-node_class_ref = {{ .nodeClassRef | default "rio-default" | quote }}
 reference_hw_class = {{ .referenceHwClass | quote }}
+default_lead_time_seed = {{ printf "%.1f" (float64 (default 30.0 .defaultLeadTimeSeed)) }}
 max_fleet_cores = {{ int64 .maxFleetCores }}
 max_node_claims_per_cell_per_tick = {{ int64 .maxNodeClaimsPerCellPerTick }}
 max_lead_time = {{ printf "%.1f" (float64 .maxLeadTime) }}

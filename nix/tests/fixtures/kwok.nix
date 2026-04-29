@@ -71,8 +71,9 @@ let
   '';
 
   # Stub `karpenter.k8s.aws/v1` EC2NodeClass CRD + a `rio-default`
-  # instance. `cover::build_nodeclaim` hardcodes `nodeClassRef.{group=
-  # karpenter.k8s.aws, kind=EC2NodeClass}`; the upstream NodeClaim
+  # instance. `cover::build_nodeclaim` sets `nodeClassRef.{group=
+  # karpenter.k8s.aws, kind=EC2NodeClass}` with name from the
+  # hw-class's `node_class`; the upstream NodeClaim
   # CRD's openAPIV3Schema marks all three nodeClassRef fields required
   # but does NOT cross-validate existence — so a never-reconciled stub
   # CRD + empty-spec CR satisfies admission. preserveUnknownFields via

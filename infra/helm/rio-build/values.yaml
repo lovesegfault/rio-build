@@ -423,8 +423,14 @@ scheduler:
     maxLeadTime: 600
     consolidateExploreEpsilon: 0.02
     maxNodeClaimsPerCellPerTick: 8
+    # nodeClass per hw-class: rio-nvme for nvme storage tiers (so
+    # instanceStorePolicy:RAID0 applies), rio-default for ebs. The
+    # band-loop NodePool template selected this by `$stor`; with that
+    # template deleted (B3) the per-class nodeClass is the only place
+    # the EC2NodeClass selection lives.
     hwClasses:
       hi-nvme-x86:
+        nodeClass: rio-nvme
         labels:
           - {key: rio.build/hw-band, value: hi}
           - {key: rio.build/storage, value: nvme}
@@ -435,6 +441,7 @@ scheduler:
           - {key: kubernetes.io/arch, operator: In, values: [amd64]}
           - {key: karpenter.k8s.aws/instance-local-nvme, operator: Gt, values: ["0"]}
       hi-nvme-arm:
+        nodeClass: rio-nvme
         labels:
           - {key: rio.build/hw-band, value: hi}
           - {key: rio.build/storage, value: nvme}
@@ -445,6 +452,7 @@ scheduler:
           - {key: kubernetes.io/arch, operator: In, values: [arm64]}
           - {key: karpenter.k8s.aws/instance-local-nvme, operator: Gt, values: ["0"]}
       hi-ebs-x86:
+        nodeClass: rio-default
         labels:
           - {key: rio.build/hw-band, value: hi}
           - {key: rio.build/storage, value: ebs}
@@ -454,6 +462,7 @@ scheduler:
           - {key: karpenter.k8s.aws/instance-generation, operator: In, values: ["8"]}
           - {key: kubernetes.io/arch, operator: In, values: [amd64]}
       hi-ebs-arm:
+        nodeClass: rio-default
         labels:
           - {key: rio.build/hw-band, value: hi}
           - {key: rio.build/storage, value: ebs}
@@ -463,6 +472,7 @@ scheduler:
           - {key: karpenter.k8s.aws/instance-generation, operator: In, values: ["8"]}
           - {key: kubernetes.io/arch, operator: In, values: [arm64]}
       mid-nvme-x86:
+        nodeClass: rio-nvme
         labels:
           - {key: rio.build/hw-band, value: mid}
           - {key: rio.build/storage, value: nvme}
@@ -473,6 +483,7 @@ scheduler:
           - {key: kubernetes.io/arch, operator: In, values: [amd64]}
           - {key: karpenter.k8s.aws/instance-local-nvme, operator: Gt, values: ["0"]}
       mid-nvme-arm:
+        nodeClass: rio-nvme
         labels:
           - {key: rio.build/hw-band, value: mid}
           - {key: rio.build/storage, value: nvme}
@@ -483,6 +494,7 @@ scheduler:
           - {key: kubernetes.io/arch, operator: In, values: [arm64]}
           - {key: karpenter.k8s.aws/instance-local-nvme, operator: Gt, values: ["0"]}
       mid-ebs-x86:
+        nodeClass: rio-default
         labels:
           - {key: rio.build/hw-band, value: mid}
           - {key: rio.build/storage, value: ebs}
@@ -492,6 +504,7 @@ scheduler:
           - {key: karpenter.k8s.aws/instance-generation, operator: In, values: ["6", "7"]}
           - {key: kubernetes.io/arch, operator: In, values: [amd64]}
       mid-ebs-arm:
+        nodeClass: rio-default
         labels:
           - {key: rio.build/hw-band, value: mid}
           - {key: rio.build/storage, value: ebs}
@@ -501,6 +514,7 @@ scheduler:
           - {key: karpenter.k8s.aws/instance-generation, operator: In, values: ["6", "7"]}
           - {key: kubernetes.io/arch, operator: In, values: [arm64]}
       lo-nvme-x86:
+        nodeClass: rio-nvme
         labels:
           - {key: rio.build/hw-band, value: lo}
           - {key: rio.build/storage, value: nvme}
@@ -511,6 +525,7 @@ scheduler:
           - {key: kubernetes.io/arch, operator: In, values: [amd64]}
           - {key: karpenter.k8s.aws/instance-local-nvme, operator: Gt, values: ["0"]}
       lo-nvme-arm:
+        nodeClass: rio-nvme
         labels:
           - {key: rio.build/hw-band, value: lo}
           - {key: rio.build/storage, value: nvme}
@@ -521,6 +536,7 @@ scheduler:
           - {key: kubernetes.io/arch, operator: In, values: [arm64]}
           - {key: karpenter.k8s.aws/instance-local-nvme, operator: Gt, values: ["0"]}
       lo-ebs-x86:
+        nodeClass: rio-default
         labels:
           - {key: rio.build/hw-band, value: lo}
           - {key: rio.build/storage, value: ebs}
@@ -530,6 +546,7 @@ scheduler:
           - {key: karpenter.k8s.aws/instance-generation, operator: In, values: ["6"]}
           - {key: kubernetes.io/arch, operator: In, values: [amd64]}
       lo-ebs-arm:
+        nodeClass: rio-default
         labels:
           - {key: rio.build/hw-band, value: lo}
           - {key: rio.build/storage, value: ebs}
@@ -540,7 +557,11 @@ scheduler:
           - {key: kubernetes.io/arch, operator: In, values: [arm64]}
     hwCostSource: spot
     referenceHwClass: mid-ebs-x86
-    nodeClassRef: rio-default
+    # Fallback for cells absent from leadTimeSeed (a new hw-class
+    # added without re-running `xtask k8s probe-boot`). Non-zero so
+    # health::classify's `2×seed` timeout covers ~18s real boot — a
+    # 0 default would reap every NodeClaim before it can register.
+    defaultLeadTimeSeed: 30.0
     leadTimeSeed:
       "hi-ebs-arm:od": 17.0
       "hi-ebs-arm:spot": 18.0

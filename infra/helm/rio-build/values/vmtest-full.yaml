@@ -105,6 +105,7 @@ scheduler:
     # registers via --node-label. hwCostSource=static (no IRSA in VM).
     hwClasses:
       vmtest:
+        nodeClass: rio-default
         labels:
           - {key: rio.build/vmtest, value: "true"}
         requirements:

@@ -495,7 +495,6 @@ mod tests {
         gc_interval_hours = 0
 
         [nodeclaim_pool]
-        node_class_ref = "rio-default"
         max_fleet_cores = 64
         max_node_cores = 16
         metal_sizes = ["metal", "metal-24xl"]
@@ -511,6 +510,7 @@ mod tests {
             assert_eq!(cfg.nodeclaim_pool.max_fleet_cores, 64);
             assert_eq!(cfg.nodeclaim_pool.max_node_cores, 16);
             assert_eq!(cfg.nodeclaim_pool.metal_sizes, vec!["metal", "metal-24xl"]);
+            assert_eq!(cfg.nodeclaim_pool.default_lead_time_seed, 30.0);
             assert_eq!(
                 cfg.nodeclaim_pool.lead_time_seed.get("vmtest:spot"),
                 Some(&5.0)

@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use k8s_openapi::api::core::v1::ResourceRequirements;
+use k8s_openapi::api::core::v1::{ResourceRequirements, Taint};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::api::ObjectMeta;
 use rio_crds::karpenter::{NodeClaim, NodeClaimSpec, NodeClassRef, NodeSelectorRequirementWithMin};
@@ -46,12 +46,56 @@ const NODE_CLASS_KIND: &str = "EC2NodeClass";
 /// z-correction, not `boot − 0`.
 pub const FORECAST_ETA_ANNOTATION: &str = "rio.build/forecast-eta-secs";
 
-/// `karpenter.k8s.aws/instance-size` requirement key — the
-/// metal-partition `NotIn` side. Same list as the shim NodePool's
-/// template requirement (`karpenter.metalSizes`); appended here so a
-/// rio-minted NodeClaim never resolves to `*.metal` (those belong to
-/// the dedicated `rio-builder-metal` pool, BIOS AMI).
+/// `karpenter.k8s.aws/instance-size` requirement key — the I-205
+/// metal-partition. Same list as the shim NodePool's template
+/// requirement (`karpenter.metalSizes`); the operator (`In`/`NotIn`)
+/// is gated on whether the hw-class's `node_class` is
+/// [`METAL_NODE_CLASS`], single-sourcing the predicate with helm
+/// `templates/karpenter.yaml`'s `nodePools` loop.
 pub const INSTANCE_SIZE_LABEL: &str = "karpenter.k8s.aws/instance-size";
+
+/// EC2NodeClass name that selects the BIOS AMI / metal partition. A
+/// hw-class with `node_class == METAL_NODE_CLASS` gets `instance-size
+/// In <metalSizes>`; every other class gets `NotIn`.
+pub const METAL_NODE_CLASS: &str = "rio-metal";
+
+/// The single builder-node taint. The band-loop NodePool template
+/// stamped `rio.build/builder=true:NoSchedule` so non-builder cluster
+/// pods (DaemonSets, monitoring) stay off builder nodes (ADR-019); B3
+/// deleted those NodePools. Karpenter does NOT merge a shim NodePool's
+/// `template.spec.taints` onto externally-created claims, so
+/// [`build_nodeclaim`] sets it on `NodeClaimSpec.taints` directly.
+/// Paired with helm `poolDefaults.tolerations`.
+fn builder_taint() -> Taint {
+    Taint {
+        key: "rio.build/builder".into(),
+        value: Some("true".into()),
+        effect: "NoSchedule".into(),
+        ..Default::default()
+    }
+}
+
+/// Per-hw-class context for [`build_nodeclaim`] — everything the
+/// `[sla.hw_classes.$h]` entry carries that the deleted band-loop
+/// NodePool template stamped. Bundled so [`build_nodeclaim`] is a pure
+/// projection of `(HwClassCtx, Cell, sizing)` with no controller-side
+/// defaults to forget.
+pub struct HwClassCtx {
+    /// EC2NodeClass name (`rio-default` / `rio-nvme` / `rio-metal`).
+    pub node_class: String,
+    /// `(k, v)` Node-stamp labels (`rio.build/hw-band` etc.).
+    pub labels: Vec<(String, String)>,
+    /// Karpenter instance-type `spec.requirements`.
+    pub requirements: Vec<NodeSelectorRequirement>,
+}
+
+/// Cluster-level [`build_nodeclaim`] config that doesn't vary per
+/// hw-class.
+pub struct CoverCfg<'a> {
+    /// I-205 metal `instance-size` partition list
+    /// (`karpenter.metalSizes`).
+    pub metal_sizes: &'a [String],
+}
 
 /// Group `unplaced` by the cheapest cell in each intent's `A_open`.
 ///
@@ -96,7 +140,11 @@ pub fn assign_to_cells<'a>(
                     // No fallback — next tick re-evaluates.
                     return None;
                 }
-                let c = fallback(i);
+                // Fallback is filtered through `masked` too: a masked
+                // `(referenceHwClass, spot)` would land in `by_cell`
+                // and then be `continue`d by the per-cell ICE skip —
+                // silently stranding cold-start probes.
+                let c = fallback(i).filter(|c| !masked.contains(c));
                 if c.is_none() {
                     dropped += 1;
                 }
@@ -194,15 +242,22 @@ pub fn claim_count(sum_c: u32, max_node_cores: u32, per_tick_cap: u32, budget: u
 ///   [`super::NODE_ROLE_LABEL`] = `builder` (builder pod affinity
 ///   requires it; the legacy band-loop NodePool stamped it), and the
 ///   [`super::OWNER_LABEL`] selector.
+/// - `spec.nodeClassRef`: the hw-class's EC2NodeClass — `rio-nvme` for
+///   nvme storage tiers (so `instanceStorePolicy: RAID0` applies),
+///   `rio-metal` for metal, `rio-default` otherwise. Per-class via
+///   [`HwClassCtx::node_class`].
 /// - `spec.requirements`: ONLY labels Karpenter's instance-type
 ///   discovery knows — the hw-class's `requirements`
 ///   (`karpenter.k8s.aws/instance-generation In [7]`,
 ///   `kubernetes.io/arch In [amd64]`, …), `karpenter.sh/capacity-type
-///   In [<cap>]`, and `karpenter.k8s.aws/instance-size NotIn
-///   <metal_sizes>`. Putting `rio.build/*` here matches 0 instance
-///   types → Karpenter posts `Launched=False
+///   In [<cap>]`, and `karpenter.k8s.aws/instance-size {In|NotIn}
+///   <metal_sizes>` (I-205 partition; operator gated on
+///   `hw.node_class == METAL_NODE_CLASS`). Putting `rio.build/*` here
+///   matches 0 instance types → Karpenter posts `Launched=False
 ///   reason=InsufficientCapacity` and GCs the claim ~1s later (the
 ///   live B8 finding).
+/// - `spec.taints`: the single [`builder_taint`] so non-builder
+///   cluster pods stay off rio-minted builder nodes (ADR-019).
 /// - `spec.resources.requests`: `{cpu, memory, ephemeral-storage}`.
 ///   Karpenter uses these as the floor for instance-type selection;
 ///   `spec.requirements` constrains the family.
@@ -210,10 +265,8 @@ pub fn build_nodeclaim(
     cell: &Cell,
     req: (u32, u64, u64),
     forecast_eta_secs: f64,
-    hw_labels: &[(String, String)],
-    hw_requirements: &[NodeSelectorRequirement],
-    metal_sizes: &[String],
-    node_class_ref: &str,
+    hw: &HwClassCtx,
+    cfg: &CoverCfg<'_>,
 ) -> NodeClaim {
     let cap_label = match cell.1 {
         CapacityType::Spot => "spot",
@@ -223,12 +276,12 @@ pub fn build_nodeclaim(
         .split_once('=')
         .expect("OWNER_LABEL is k=v");
     let (role_k, role_v) = super::NODE_ROLE_LABEL;
-    // hw_labels (rio.build/hw-band, rio.build/storage,
+    // hw.labels (rio.build/hw-band, rio.build/storage,
     // kubernetes.io/arch, …) are STAMPED onto the Node via
     // metadata.labels — Karpenter copies NodeClaim labels to the
     // launched Node. The legacy NodePool template did this; B3 deleted
     // those NodePools, so the controller must stamp directly.
-    let mut labels: BTreeMap<String, String> = hw_labels.iter().cloned().collect();
+    let mut labels: BTreeMap<String, String> = hw.labels.iter().cloned().collect();
     labels.extend([
         (HW_CLASS_LABEL.into(), cell.0.clone()),
         (CAPACITY_TYPE_LABEL.into(), cap_label.into()),
@@ -245,13 +298,22 @@ pub fn build_nodeclaim(
     // requirements: ONLY instance-type-discovery labels. The hw-class's
     // `requirements` field carries karpenter.k8s.aws/* + arch
     // (validated by SlaConfig::validate to exclude rio.build/*).
-    let mut requirements: Vec<_> = hw_requirements
+    let mut requirements: Vec<_> = hw
+        .requirements
         .iter()
         .map(|r| mk_req(&r.key, &r.operator, r.values.clone()))
         .collect();
     requirements.push(mk_req(CAPACITY_TYPE_LABEL, "In", vec![cap_label.into()]));
-    if !metal_sizes.is_empty() {
-        requirements.push(mk_req(INSTANCE_SIZE_LABEL, "NotIn", metal_sizes.to_vec()));
+    if !cfg.metal_sizes.is_empty() {
+        // I-205 partition: same predicate as helm
+        // `templates/karpenter.yaml`'s `nodePools` loop —
+        // metal-nodeClass gets the `In` side, everything else `NotIn`.
+        let op = if hw.node_class == METAL_NODE_CLASS {
+            "In"
+        } else {
+            "NotIn"
+        };
+        requirements.push(mk_req(INSTANCE_SIZE_LABEL, op, cfg.metal_sizes.to_vec()));
     }
     let requests: BTreeMap<String, Quantity> = [
         ("cpu".into(), Quantity(req.0.to_string())),
@@ -281,9 +343,10 @@ pub fn build_nodeclaim(
             node_class_ref: NodeClassRef {
                 group: NODE_CLASS_GROUP.into(),
                 kind: NODE_CLASS_KIND.into(),
-                name: node_class_ref.into(),
+                name: hw.node_class.clone(),
             },
             requirements,
+            taints: vec![builder_taint()],
             resources: Some(ResourceRequirements {
                 requests: Some(requests),
                 ..Default::default()
@@ -541,42 +604,49 @@ mod tests {
 
     // --- build_nodeclaim -----------------------------------------------
 
+    fn hw_ctx(node_class: &str) -> HwClassCtx {
+        HwClassCtx {
+            node_class: node_class.into(),
+            // Live B8 finding: labels are the [sla.hw_classes] STAMPS
+            // (rio.build/* + arch). These go in metadata.labels, NOT
+            // spec.requirements.
+            labels: vec![
+                ("rio.build/hw-band".into(), "mid".into()),
+                ("rio.build/storage".into(), "ebs".into()),
+                ("kubernetes.io/arch".into(), "amd64".into()),
+            ],
+            requirements: vec![
+                NodeSelectorRequirement {
+                    key: "karpenter.k8s.aws/instance-generation".into(),
+                    operator: "In".into(),
+                    values: vec!["6".into(), "7".into()],
+                },
+                NodeSelectorRequirement {
+                    key: "kubernetes.io/arch".into(),
+                    operator: "In".into(),
+                    values: vec!["amd64".into()],
+                },
+            ],
+        }
+    }
+
     /// Asserts the full wire shape: generateName, labels (hw-class
     /// CONJUNCTION stamps + hw-class/cap-type/shim-nodepool/owner),
-    /// nodeClassRef, requirements (hw_requirements + capacity-type +
-    /// metal-NotIn ONLY — no `rio.build/*`), resources.requests.
+    /// nodeClassRef (per-hw-class), taints (builder NoSchedule),
+    /// requirements (hw_requirements + capacity-type + metal-NotIn
+    /// ONLY — no `rio.build/*`), resources.requests.
     #[test]
     fn build_nodeclaim_spec_shape() {
         let cell = Cell("mid-ebs-x86".into(), CapacityType::Spot);
-        // Live B8 finding: hw_labels are the [sla.hw_classes] STAMPS
-        // (rio.build/* + arch). These go in metadata.labels, NOT
-        // spec.requirements.
-        let hw_labels = vec![
-            ("rio.build/hw-band".into(), "mid".into()),
-            ("rio.build/storage".into(), "ebs".into()),
-            ("kubernetes.io/arch".into(), "amd64".into()),
-        ];
-        let hw_reqs = vec![
-            NodeSelectorRequirement {
-                key: "karpenter.k8s.aws/instance-generation".into(),
-                operator: "In".into(),
-                values: vec!["6".into(), "7".into()],
-            },
-            NodeSelectorRequirement {
-                key: "kubernetes.io/arch".into(),
-                operator: "In".into(),
-                values: vec!["amd64".into()],
-            },
-        ];
         let metal = vec!["metal".into(), "metal-24xl".into()];
         let nc = build_nodeclaim(
             &cell,
             (8, 32 * GI, 100 * GI),
             25.0,
-            &hw_labels,
-            &hw_reqs,
-            &metal,
-            "rio-default",
+            &hw_ctx("rio-nvme"),
+            &CoverCfg {
+                metal_sizes: &metal,
+            },
         );
 
         let meta = &nc.metadata;
@@ -605,9 +675,17 @@ mod tests {
         assert_eq!(labels["kubernetes.io/arch"], "amd64");
 
         let spec = &nc.spec;
-        assert_eq!(spec.node_class_ref.name, "rio-default");
+        // mb_002: per-hw-class nodeClass (was scalar "rio-default";
+        // nvme classes need rio-nvme so instanceStorePolicy:RAID0
+        // applies).
+        assert_eq!(spec.node_class_ref.name, "rio-nvme");
         assert_eq!(spec.node_class_ref.group, "karpenter.k8s.aws");
         assert_eq!(spec.node_class_ref.kind, "EC2NodeClass");
+        // mb_002: builder taint stamped (band-loop NodePool template
+        // carried it; ADR-019 isolation).
+        assert_eq!(spec.taints, vec![builder_taint()]);
+        assert_eq!(spec.taints[0].key, "rio.build/builder");
+        assert_eq!(spec.taints[0].effect, "NoSchedule");
         // 2 hw-reqs + capacity-type + instance-size NotIn. NO
         // rio.build/* — those match 0 instance types and trigger
         // Karpenter ICE-GC.
@@ -651,7 +729,18 @@ mod tests {
     #[test]
     fn build_nodeclaim_on_demand_label_form() {
         let cell = Cell("h".into(), CapacityType::OnDemand);
-        let nc = build_nodeclaim(&cell, (4, 8 * GI, 50 * GI), 0.0, &[], &[], &[], "x");
+        let hw = HwClassCtx {
+            node_class: "x".into(),
+            labels: vec![],
+            requirements: vec![],
+        };
+        let nc = build_nodeclaim(
+            &cell,
+            (4, 8 * GI, 50 * GI),
+            0.0,
+            &hw,
+            &CoverCfg { metal_sizes: &[] },
+        );
         // eta=0 (all-Ready cell) → no annotation.
         assert!(nc.metadata.annotations.is_none());
         // Karpenter label form is "on-demand", NOT the PG/helm "od".
@@ -665,5 +754,60 @@ mod tests {
         // hw_reqs=[] + metal=[] → only capacity-type req.
         assert_eq!(nc.spec.requirements.len(), 1);
         assert_eq!(nc.spec.requirements[0].key, CAPACITY_TYPE_LABEL);
+    }
+
+    /// I-205 partition: `node_class == METAL_NODE_CLASS` →
+    /// `instance-size In <metalSizes>` (not NotIn). Single-sources
+    /// the predicate with helm `templates/karpenter.yaml`.
+    #[test]
+    fn build_nodeclaim_metal_nodeclass_gets_in_side() {
+        let cell = Cell("metal-x86".into(), CapacityType::OnDemand);
+        let metal = vec!["metal".into(), "metal-24xl".into()];
+        let nc = build_nodeclaim(
+            &cell,
+            (64, 256 * GI, 500 * GI),
+            0.0,
+            &hw_ctx(METAL_NODE_CLASS),
+            &CoverCfg {
+                metal_sizes: &metal,
+            },
+        );
+        let size_req = nc
+            .spec
+            .requirements
+            .iter()
+            .find(|r| r.key == INSTANCE_SIZE_LABEL)
+            .unwrap();
+        assert_eq!(size_req.operator, "In");
+        assert_eq!(size_req.values, vec!["metal", "metal-24xl"]);
+        assert_eq!(nc.spec.node_class_ref.name, METAL_NODE_CLASS);
+    }
+
+    /// mb_024(2): fallback path is filtered through `masked` —
+    /// hw-agnostic intent whose fallback cell is ICE-masked is
+    /// `dropped` (NOT routed to a cell `cover_deficit` then skips,
+    /// silently stranding cold-start probes).
+    #[test]
+    fn assign_fallback_filtered_by_masked() {
+        let unplaced = [SpawnIntent {
+            intent_id: "agn".into(),
+            cores: 4,
+            system: "x86_64-linux".into(),
+            ready: Some(true),
+            ..Default::default()
+        }];
+        let ref_cell = Cell("ref".into(), CapacityType::Spot);
+        let fallback = |_: &SpawnIntent| Some(ref_cell.clone());
+        // ref-spot ICE-masked → fallback filtered out → dropped.
+        let masked: HashSet<Cell> = [ref_cell.clone()].into();
+        let (by, d) = assign_to_cells(
+            &unplaced,
+            &CellSketches::default(),
+            &masked,
+            |_| 0.0,
+            fallback,
+        );
+        assert!(by.is_empty(), "masked fallback must not appear in by_cell");
+        assert_eq!(d, 1, "masked fallback counted in dropped");
     }
 }

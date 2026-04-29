@@ -14,14 +14,14 @@
 //!   `nodeName`, `providerID`, `capacity`/`allocatable` (FFD bin
 //!   sizing for in-flight claims)
 //!
-//! Karpenter spec fields we don't touch (taints, startupTaints,
-//! kubelet, expireAfter, …) are absorbed by `preserve-unknown-fields`
-//! on round-trip — this struct never `replace()`s a Karpenter-authored
+//! Karpenter spec fields we don't touch (startupTaints, kubelet,
+//! expireAfter, …) are absorbed by `preserve-unknown-fields` on
+//! round-trip — this struct never `replace()`s a Karpenter-authored
 //! claim, only `create()`s its own and `delete()`s by name.
 
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::core::v1::ResourceRequirements;
+use k8s_openapi::api::core::v1::{ResourceRequirements, Taint};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::CustomResource;
@@ -62,6 +62,16 @@ pub struct NodeClaimSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "crate::any_object")]
     pub resources: Option<ResourceRequirements>,
+
+    /// Node taints. The band-loop NodePool template stamped
+    /// `rio.build/builder=true:NoSchedule`; the reconciler sets it
+    /// here so non-builder cluster pods (DaemonSets, monitoring) stay
+    /// off rio-minted builder nodes. Karpenter does NOT merge a shim
+    /// NodePool's `template.spec.taints` onto externally-created
+    /// claims, so the taint must go on the NodeClaim spec directly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(schema_with = "crate::any_object_array")]
+    pub taints: Vec<Taint>,
 }
 
 /// Karpenter `spec.nodeClassRef`. All three fields are required by
@@ -187,10 +197,18 @@ mod tests {
                 min_values: Some(1),
             }],
             resources: None,
+            taints: vec![Taint {
+                key: "rio.build/builder".into(),
+                value: Some("true".into()),
+                effect: "NoSchedule".into(),
+                ..Default::default()
+            }],
         };
         let json = serde_json::to_string(&spec).unwrap();
         assert!(json.contains("\"nodeClassRef\""));
         assert!(json.contains("\"minValues\":1"));
+        assert!(json.contains("\"taints\""));
+        assert!(json.contains("\"NoSchedule\""));
         assert!(!json.contains("node_class_ref"));
         assert!(!json.contains("min_values"));
     }

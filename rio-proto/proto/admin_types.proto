@@ -630,6 +630,11 @@ message NodeLabelMatch {
 message HwClassLabels {
   repeated NodeLabelMatch labels = 1;
   repeated NodeSelectorRequirement requirements = 2;
+  // EC2NodeClass name for NodeClaims targeting this hw-class
+  // (rio-default / rio-nvme / rio-metal). Per-class so nvme classes
+  // get instanceStorePolicy:RAID0 (rio-nvme) and metal gets the BIOS
+  // AMI (rio-metal).
+  string node_class = 3;
 }
 message GetHwClassConfigResponse {
   // h → `[sla.hw_classes.$h].labels`. The controller matches a Node's

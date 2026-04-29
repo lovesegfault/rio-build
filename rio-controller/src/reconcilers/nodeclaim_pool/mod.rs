@@ -173,9 +173,6 @@ pub struct NodeClaimPoolConfig {
     pub lease_name: Option<String>,
     /// Lease namespace. `None` → in-cluster service-account mount.
     pub lease_namespace: Option<String>,
-    /// `EC2NodeClass` name stamped on every created NodeClaim's
-    /// `spec.nodeClassRef.name`. Helm: `sla.nodeClassRef`.
-    pub node_class_ref: String,
     /// `[sla].referenceHwClass` — the cold-start fallback cell for
     /// hw-agnostic intents (`fit=None` → `hw_class_names=[]`). See
     /// [`Self::fallback_cell`]. Helm: `sla.referenceHwClass` (same key
@@ -201,6 +198,12 @@ pub struct NodeClaimPoolConfig {
     /// `xtask k8s probe-boot`. Seeds the DDSketch on cold start.
     /// Helm: `sla.leadTimeSeed`.
     pub lead_time_seed: HashMap<String, f64>,
+    /// Seed lead-time (seconds) for cells absent from
+    /// [`Self::lead_time_seed`]. The seed feeds [`Self::seed_for`] —
+    /// `health::classify` uses it as a TIMEOUT, not just a floor, so
+    /// 0 would reap every NodeClaim before it can register (~18s
+    /// real boot). Helm: `sla.defaultLeadTimeSeed`.
+    pub default_lead_time_seed: f64,
     /// DDSketch active→shadow rotation interval (seconds). After
     /// `2×halflife` a sample has aged out entirely. Helm: not surfaced;
     /// 6h default per ADR §13b.
@@ -227,13 +230,17 @@ pub struct NodeClaimPoolConfig {
 }
 
 impl NodeClaimPoolConfig {
-    /// `lead_time_seed[cell]` (seconds). 0 for unconfigured cells —
-    /// callers use this as a floor so 0 degenerates to "no floor".
+    /// `lead_time_seed[cell]` (seconds), or
+    /// [`Self::default_lead_time_seed`] for cells absent from the map.
+    /// `health::classify` uses this as a TIMEOUT (`2×seed`), so the
+    /// default must be non-zero — a 0 default would reap every
+    /// NodeClaim of an unseeded cell at the next 10s tick (well before
+    /// ~18s real boot completes).
     pub fn seed_for(&self, cell: &Cell) -> f64 {
         self.lead_time_seed
             .get(&cell.to_string())
             .copied()
-            .unwrap_or(0.0)
+            .unwrap_or(self.default_lead_time_seed)
     }
 
     /// Cold-start fallback cell for an hw-agnostic intent
@@ -249,15 +256,22 @@ impl NodeClaimPoolConfig {
     /// Spot capacity-type only: cold-start probes are uniform
     /// `probe.cpu`-shaped and bounded by `max_node_claims_per_cell_per_
     /// tick`; on-demand fallback would defeat the §13b cost model.
-    pub fn fallback_cell(&self, i: &SpawnIntent, hw: &HwClassConfig) -> Option<Cell> {
+    /// `masked` cells are skipped — when `(referenceHwClass, spot)` is
+    /// ICE-masked, the next arch-matching cell is returned so
+    /// cold-start probes don't silently strand on a cell
+    /// `cover_deficit` then `continue`s.
+    pub fn fallback_cell(
+        &self,
+        i: &SpawnIntent,
+        hw: &HwClassConfig,
+        masked: &HashSet<Cell>,
+    ) -> Option<Cell> {
         let arch = ffd::system_to_arch(&i.system)?;
-        if hw.matches_arch(&self.reference_hw_class, arch) {
-            return Some(Cell(self.reference_hw_class.clone(), CapacityType::Spot));
-        }
-        hw.names()
-            .into_iter()
-            .find(|h| hw.matches_arch(h, arch))
-            .map(|h| Cell(h, CapacityType::Spot))
+        let candidate = |h: &str| {
+            let c = Cell(h.into(), CapacityType::Spot);
+            (hw.matches_arch(h, arch) && !masked.contains(&c)).then_some(c)
+        };
+        candidate(&self.reference_hw_class).or_else(|| hw.names().iter().find_map(|h| candidate(h)))
     }
 
     /// All configured cells (`hw_classes × {spot, od}`), for
@@ -280,8 +294,6 @@ impl Default for NodeClaimPoolConfig {
             database_url: String::new(),
             lease_name: None,
             lease_namespace: None,
-            // Matches helm `sla.nodeClassRef` default.
-            node_class_ref: "rio-default".into(),
             reference_hw_class: String::new(),
             // Matches helm `sla.maxFleetCores` / `maxNodeClaimsPerCellPerTick`
             // / `maxLeadTime` defaults.
@@ -290,6 +302,10 @@ impl Default for NodeClaimPoolConfig {
             max_lead_time: 600.0,
             max_consolidation_time: None,
             lead_time_seed: HashMap::new(),
+            // Matches helm `sla.defaultLeadTimeSeed` default. Non-zero
+            // so an unseeded cell's `health::classify` timeout (2×seed)
+            // covers the ~18s real boot.
+            default_lead_time_seed: 30.0,
             sketch_halflife_secs: 6 * 3600,
             // Matches helm `sla.maxCores` default (64).
             max_node_cores: 64,
@@ -422,7 +438,6 @@ impl NodeClaimPoolReconciler {
     /// inlined per `r[common.task.periodic-biased]`.
     pub async fn run(mut self, shutdown: rio_common::signal::Token) {
         info!(
-            node_class_ref = %self.cfg.node_class_ref,
             max_fleet_cores = self.cfg.max_fleet_cores,
             "nodeclaim_pool reconciler starting"
         );
@@ -639,13 +654,11 @@ impl NodeClaimPoolReconciler {
         // cover_deficit uses, so the gauge equals cover's per-cell input.
         // No mask: the gauge shows raw demand; ICE-masking is a cover
         // policy, not a demand metric.
-        let (by_cell, _) = cover::assign_to_cells(
-            unplaced,
-            &self.sketches,
-            &HashSet::new(),
-            cover::cell_rank,
-            |i| self.cfg.fallback_cell(i, &self.hw_config),
-        );
+        let none = HashSet::new();
+        let (by_cell, _) =
+            cover::assign_to_cells(unplaced, &self.sketches, &none, cover::cell_rank, |i| {
+                self.cfg.fallback_cell(i, &self.hw_config, &none)
+            });
         for cell in self.cfg.all_cells(&self.hw_config) {
             let label = cell.to_string();
             let (reg, inf, age) = by_state.get(&cell).copied().unwrap_or((0, 0, 0.0));
@@ -742,7 +755,7 @@ impl NodeClaimPoolReconciler {
 
         let (by_cell, dropped) =
             cover::assign_to_cells(unplaced, &self.sketches, &ice, cover::cell_rank, |i| {
-                self.cfg.fallback_cell(i, &self.hw_config)
+                self.cfg.fallback_cell(i, &self.hw_config, &ice)
             });
         if dropped > 0 {
             metrics::counter!(
@@ -782,7 +795,21 @@ impl NodeClaimPoolReconciler {
                 warn!(hw_class = %cell.0, "no hw-class labels (GetHwClassConfig not loaded?); skipping");
                 continue;
             };
-            let hw_reqs = self.hw_config.requirements_for(&cell.0).unwrap_or_default();
+            let hw = cover::HwClassCtx {
+                node_class: self
+                    .hw_config
+                    .node_class_for(&cell.0)
+                    .filter(|nc| !nc.is_empty())
+                    .unwrap_or_else(|| {
+                        warn!(hw_class = %cell.0, "node_class empty (GetHwClassConfig stale?); using rio-default");
+                        "rio-default".into()
+                    }),
+                labels: hw_labels,
+                requirements: self.hw_config.requirements_for(&cell.0).unwrap_or_default(),
+            };
+            let cover_cfg = cover::CoverCfg {
+                metal_sizes: &self.cfg.metal_sizes,
+            };
             // Per-claim mem: Σm spread evenly. Disk: each pod allocates
             // ephemeral-storage independently, so the claim need only
             // fit the largest single pod — but the pod requests
@@ -799,10 +826,8 @@ impl NodeClaimPoolReconciler {
                     cell,
                     (chunk, mem_per, disk_per),
                     min_eta,
-                    &hw_labels,
-                    &hw_reqs,
-                    &self.cfg.metal_sizes,
-                    &self.cfg.node_class_ref,
+                    &hw,
+                    &cover_cfg,
                 );
                 match self.nodeclaims.create(&PostParams::default(), &nc).await {
                     Ok(out) => {
@@ -893,10 +918,13 @@ mod tests {
         let d = NodeClaimPoolConfig::default();
         assert!(d.database_url.is_empty());
         assert!(d.lease_name.is_none());
-        assert_eq!(d.node_class_ref, "rio-default");
         assert!(d.reference_hw_class.is_empty());
         assert_eq!(d.max_fleet_cores, 10_000);
         assert_eq!(d.max_node_claims_per_cell_per_tick, 8);
+        // bug_040: non-zero default so an unseeded cell's
+        // health::classify timeout (2×seed) covers ~18s real boot.
+        assert_eq!(d.default_lead_time_seed, 30.0);
+        assert_eq!(d.seed_for(&Cell("nope".into(), CapacityType::Spot)), 30.0);
     }
 
     /// `fallback_cell`: prefers `(reference_hw_class, Spot)` when its
@@ -918,22 +946,36 @@ mod tests {
             system: sys.into(),
             ..Default::default()
         };
+        let none = HashSet::new();
         // x86 → reference cell (arch matches).
         assert_eq!(
-            cfg.fallback_cell(&i("x86_64-linux"), &hw),
+            cfg.fallback_cell(&i("x86_64-linux"), &hw, &none),
             Some(Cell("mid-ebs-x86".into(), CapacityType::Spot))
         );
         // aarch64 → reference is amd64; first sorted arm cell wins.
         assert_eq!(
-            cfg.fallback_cell(&i("aarch64-linux"), &hw),
+            cfg.fallback_cell(&i("aarch64-linux"), &hw, &none),
             Some(Cell("hi-ebs-arm".into(), CapacityType::Spot))
         );
         // Unmappable system → None.
-        assert_eq!(cfg.fallback_cell(&i("builtin"), &hw), None);
-        assert_eq!(cfg.fallback_cell(&i(""), &hw), None);
+        assert_eq!(cfg.fallback_cell(&i("builtin"), &hw, &none), None);
+        assert_eq!(cfg.fallback_cell(&i(""), &hw, &none), None);
         // No matching-arch hw-class loaded → None.
         let hw2 = HwClassConfig::from_literals(&[("mid-ebs-x86", &[(ARCH_LABEL, "amd64")])]);
-        assert_eq!(cfg.fallback_cell(&i("aarch64-linux"), &hw2), None);
+        assert_eq!(cfg.fallback_cell(&i("aarch64-linux"), &hw2, &none), None);
+        // mb_024(2): reference cell ICE-masked → next arch-matching
+        // cell instead of stranding the cold-start probe on a cell
+        // cover_deficit then `continue`s.
+        let masked: HashSet<Cell> = [Cell("mid-ebs-x86".into(), CapacityType::Spot)].into();
+        let hw_m = HwClassConfig::from_literals(&[
+            ("mid-ebs-x86", &[(ARCH_LABEL, "amd64")]),
+            ("lo-ebs-x86", &[(ARCH_LABEL, "amd64")]),
+        ]);
+        assert_eq!(
+            cfg.fallback_cell(&i("x86_64-linux"), &hw_m, &masked),
+            Some(Cell("lo-ebs-x86".into(), CapacityType::Spot)),
+            "masked reference fails over to next arch-match"
+        );
         // Arch-agnostic reference (no arch label) matches any system —
         // the kwok `vmtest` fixture case.
         let cfg3 = NodeClaimPoolConfig {
@@ -943,7 +985,7 @@ mod tests {
         let hw3 =
             HwClassConfig::from_literals(&[("vmtest", &[("kubernetes.io/hostname", "agent")])]);
         assert_eq!(
-            cfg3.fallback_cell(&i("x86_64-linux"), &hw3),
+            cfg3.fallback_cell(&i("x86_64-linux"), &hw3, &none),
             Some(Cell("vmtest".into(), CapacityType::Spot))
         );
     }
