@@ -3858,3 +3858,26 @@ async fn inputs_gen_stable_across_noop_refresh() -> TestResult {
     );
     Ok(())
 }
+
+/// `compute_spawn_intents` carries `IceBackoff::masked_cells()` in the
+/// snapshot. Pre-R24B6a `admin/spawn_intents.rs` hardcoded `vec![]`, so
+/// the controller's `cover_deficit` mask never received the scheduler's
+/// accumulated ladder and rediscovered ICE per cell on every controller
+/// restart (mb_001).
+#[tokio::test]
+async fn compute_spawn_intents_carries_ice_masked_cells() -> TestResult {
+    use crate::sla::config::CapacityType;
+    let db = TestDb::new(&MIGRATOR).await;
+    let actor = bare_actor_sla(db.pool.clone());
+    actor
+        .ice
+        .mark(&("hi-ebs-x86".to_string(), CapacityType::Spot));
+    let snap = actor.compute_spawn_intents(&Default::default());
+    assert!(
+        snap.ice_masked_cells
+            .contains(&"hi-ebs-x86:spot".to_string()),
+        "masked cell flows to snapshot via cell_label: got {:?}",
+        snap.ice_masked_cells
+    );
+    Ok(())
+}

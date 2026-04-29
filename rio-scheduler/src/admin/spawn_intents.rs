@@ -48,10 +48,11 @@ pub(super) async fn get_spawn_intents(
     Ok(GetSpawnIntentsResponse {
         intents: snap.intents,
         queued_by_system: snap.queued_by_system,
-        // §13b dead-node detector + ICE mask: populated by B11. Empty
-        // until the actor's `compute_spawn_intents` carries them.
+        // TODO R24B6b: `detect_hung_nodes()` requires `HeartbeatRequest.
+        // node_name` plumbing (executor.rs / build_types.proto carry
+        // none today). `ice_masked_cells` is populated above.
         dead_nodes: vec![],
-        ice_masked_cells: vec![],
+        ice_masked_cells: snap.ice_masked_cells,
     })
 }
 

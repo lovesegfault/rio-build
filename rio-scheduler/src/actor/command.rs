@@ -762,6 +762,13 @@ pub struct SpawnIntentsSnapshot {
     /// The ComponentScaler reads this for the predictive store-replica
     /// signal.
     pub queued_by_system: std::collections::HashMap<String, u64>,
+    /// `IceBackoff::masked_cells()` snapshot, formatted via
+    /// [`crate::sla::config::cell_label`]. The controller's
+    /// `cover_deficit` mask merges this with its own
+    /// `detect_vanished` set so a controller restart inherits the
+    /// scheduler's accumulated ladder instead of rediscovering ICE
+    /// per cell.
+    pub ice_masked_cells: Vec<String>,
 }
 
 /// Point-in-time cluster state counts for `AdminService.ClusterStatus`.

@@ -520,6 +520,12 @@ impl DagActor {
         SpawnIntentsSnapshot {
             intents: intents.into_iter().map(|(_, i)| i).collect(),
             queued_by_system,
+            ice_masked_cells: self
+                .ice
+                .masked_cells()
+                .iter()
+                .map(crate::sla::config::cell_label)
+                .collect(),
         }
     }
 
