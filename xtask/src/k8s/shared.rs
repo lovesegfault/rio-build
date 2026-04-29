@@ -606,6 +606,15 @@ pub async fn tunnel_grpc(
     let leader = ui::poll("scheduler lease holder", Duration::from_secs(2), 30, || {
         let c = client.clone();
         async move {
+            // Post-`--wipe` the Lease may name a deleted pod while NO
+            // scheduler pods exist yet (deploy preflight runs before
+            // helm install). Polling 30×2s for a leader that cannot
+            // appear just spams the log; bail so the caller's Err arm
+            // (status::gather records it; CliCtx callers surface it)
+            // engages immediately.
+            if kube::count_pods(&c, NS, "app.kubernetes.io/name=rio-scheduler").await? == 0 {
+                bail!("no rio-scheduler pods exist; skipping leader wait");
+            }
             match kube::scheduler_leader(&c, NS).await {
                 Ok(h) => Ok(Some(h)),
                 Err(e) => {
@@ -633,6 +642,43 @@ pub async fn tunnel_grpc(
     )
     .await?;
     Ok((sched, store))
+}
+
+/// Side-task that prints "helm waiting: rio-scheduler 0/2, …" every
+/// 15s while a `helm upgrade --wait` runs. helm's own `--wait` is
+/// silent until done; on a post-`--wipe` cold start that's 3-4min of
+/// nothing, which reads as a hang. Polls Deployments in `rio-system` +
+/// `rio-store` (the two namespaces with chart Deployments) and lists
+/// the not-yet-Ready ones. Aborted by the caller when helm exits.
+pub fn spawn_helm_wait_progress(client: &kube::Client) -> tokio::task::JoinHandle<()> {
+    let client = client.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(15));
+        // First tick fires immediately; skip it so the line only shows
+        // when helm has actually been waiting a beat.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let mut pending = Vec::new();
+            for ns in [NS, super::NS_STORE] {
+                for d in kube::list_deployment_status(&client, ns)
+                    .await
+                    .unwrap_or_default()
+                {
+                    if !d.ok {
+                        pending.push(format!("{} {}/{}", d.name, d.ready, d.want));
+                    }
+                }
+            }
+            if pending.is_empty() {
+                tracing::info!(
+                    "helm waiting: all Deployments Ready (hooks/Jobs may still be running)"
+                );
+            } else {
+                tracing::info!("helm waiting: {}", pending.join(", "));
+            }
+        }
+    })
 }
 
 #[cfg(test)]

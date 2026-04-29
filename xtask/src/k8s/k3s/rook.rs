@@ -34,7 +34,8 @@ pub async fn install() -> Result<()> {
         .create_namespace()
         .set("csi.enableRbdDriver", "false")
         .set("csi.enableCephfsDriver", "false")
-        .run()?;
+        .run()
+        .await?;
     kube::wait_rollout(
         &client,
         "rook-ceph",
@@ -47,7 +48,8 @@ pub async fn install() -> Result<()> {
     helm::Helm::upgrade_install("rook-ceph-cluster", &cl)
         .namespace("rook-ceph")
         .values("infra/helm/rook-dev-values.yaml")
-        .run()?;
+        .run()
+        .await?;
 
     // CephObjectStoreUser reconcile generates AccessKey/SecretKey.
     // Takes a while — mons+OSDs+RGW all have to be up first.

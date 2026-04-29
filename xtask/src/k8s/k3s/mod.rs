@@ -96,6 +96,7 @@ impl Provider for K3s {
                 .set("jwt.signingSeed", &jwt.seed)
                 .set("jwt.publicKey", &jwt.pubkey)
                 .run()
+                .await
         })
         .await?;
 

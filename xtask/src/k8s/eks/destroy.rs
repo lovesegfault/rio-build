@@ -166,21 +166,51 @@ pub(in crate::k8s) async fn uninstall_chart() -> Result<()> {
     })
     .await?;
 
+    // ── 1b. Kick off controller-created NodeClaim deletion ─────────
+    // rio-controller creates NodeClaims (labelled
+    // `rio.build/nodeclaim-pool`) against the chart's
+    // `rio-nodeclaim-shim` NodePool. helm uninstall removes that
+    // NodePool; Karpenter's termination reconciler then can't release
+    // `karpenter.sh/termination` on the controller's claims ("NodePool
+    // not found") → NodeClaim stuck → Node stuck → builder pods stuck
+    // → helm uninstall blocks. Delete the claims FIRST (--wait=false)
+    // so Karpenter drains them while the shim NodePool still exists.
+    // `destroy`'s step 4 / `wipe`'s `wait_rio_nodeclaims_gone` then
+    // waits for completion.
+    ui::step(
+        "delete controller-created NodeClaims (non-blocking)",
+        || {
+            k(&[
+                "delete",
+                "nodeclaims",
+                "-l",
+                "rio.build/nodeclaim-pool",
+                "--ignore-not-found",
+                "--wait=false",
+            ])
+        },
+    )
+    .await?;
+
     // ── 2. helm uninstall rio ──────────────────────────────────────
     // --wait so the chart's pre-delete hooks (none today, but future-
     // proof) and Karpenter NodePool removal land before we delete
     // NodeClaims. helm's --ignore-not-found makes this idempotent.
     ui::step("helm uninstall rio", || async {
         let sh = shell()?;
-        // Unreachable apiserver = cluster already gone. Tofu destroy
-        // will confirm. `sh::run`'s error chain doesn't carry stderr,
-        // so this MUST go through run_benign_if.
+        // Unreachable apiserver = cluster already gone. Timeout = a
+        // resource (typically a stuck NodeClaim/Node, see step 1b) is
+        // wedged on a finalizer; the namespace deletes + finalizer
+        // strip below clean that up regardless, so log and continue
+        // rather than abort the whole wipe/destroy. `sh::run`'s error
+        // chain doesn't carry full stderr, so this MUST go through
+        // run_benign_if.
         sh::run_benign_if(
             cmd!(
                 sh,
                 "helm uninstall rio -n {NS} --wait --timeout 10m --ignore-not-found"
             ),
-            |e| e.contains("Kubernetes cluster unreachable"),
+            |e| e.contains("Kubernetes cluster unreachable") || e.contains("timed out waiting"),
         )
         .await
     })

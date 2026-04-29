@@ -50,6 +50,22 @@ pub(super) async fn run(kind: ProviderKind) -> Result<()> {
     // helm uninstall so they're definitively orphaned).
     uninstall_chart().await?;
 
+    // ── 3b. Delete leader-election Leases ───────────────────────────
+    // helm uninstall removed the pods but Leases (created at runtime by
+    // rio-lease, not chart-owned) survive in rio-system and keep naming
+    // the now-deleted holder for `leaseDurationSeconds`. The deploy
+    // phase's preflight (`status::gather` → `tunnel_grpc`) then burns
+    // its full 30×2s poll budget on "lease holder X not found" before
+    // giving up. Deleting the Lease lets `scheduler_leader`'s "lease
+    // has no holder" path engage immediately. NotFound is benign (`k`).
+    ui::step("delete stale leader Leases", || async {
+        for lease in ["rio-scheduler-leader", "rio-controller-nodeclaim-pool"] {
+            k(&["-n", NS, "delete", "lease", lease, "--ignore-not-found"]).await?;
+        }
+        Ok(())
+    })
+    .await?;
+
     // ── 4. Wipe tenant keys ─────────────────────────────────────────
     // The only `rio-system` Secret we touch. The deploy phase recreates
     // it with just the operator's RIO_SSH_PUBKEY.

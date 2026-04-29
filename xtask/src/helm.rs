@@ -228,10 +228,14 @@ impl Helm {
         args
     }
 
-    pub fn run(self) -> Result<()> {
+    /// Async so a `--wait` doesn't block the tokio executor — callers
+    /// that want progress while helm waits (deploy's
+    /// `spawn_helm_wait_progress`) need the runtime free to drive the
+    /// side-task.
+    pub async fn run(self) -> Result<()> {
         let sh = shell()?;
         let args = self.into_args();
-        sh::run_sync(cmd!(sh, "helm {args...}"))
+        sh::run(cmd!(sh, "helm {args...}")).await
     }
 }
 

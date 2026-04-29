@@ -190,7 +190,11 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     }
 
     ui::step("helm upgrade rio", || async {
-        helm::Helm::upgrade_install("rio", "infra/helm/rio-build")
+        // helm --wait is silent for the full timeout; on a post-wipe
+        // cold start that's 3-4min of nothing. Side-task prints
+        // not-yet-Ready Deployments every 15s; aborted when helm exits.
+        let progress = shared::spawn_helm_wait_progress(&client);
+        let r = helm::Helm::upgrade_install("rio", "infra/helm/rio-build")
             .namespace(NS)
             .set("namespaces.create", "false")
             .set("global.image.registry", &ecr)
@@ -299,6 +303,9 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             // manually once nodes are up.
             .no_hooks(no_hooks)
             .run()
+            .await;
+        progress.abort();
+        r
     })
     .await?;
 

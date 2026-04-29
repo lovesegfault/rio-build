@@ -161,6 +161,18 @@ pub async fn gateway_lb_hostname(client: &Client, ns: &str) -> Result<String> {
         .context("rio-gateway Service has no LoadBalancer ingress yet (NLB provisioning?)")
 }
 
+/// Count pods in `ns` matching `label_selector`. Used by
+/// [`super::shared::tunnel_grpc`] to short-circuit the leader-wait
+/// poll when no scheduler pods exist (post-`--wipe`, pre-deploy).
+pub async fn count_pods(client: &Client, ns: &str, label_selector: &str) -> Result<usize> {
+    let api: Api<Pod> = Api::namespaced(client.clone(), ns);
+    Ok(api
+        .list(&ListParams::default().labels(label_selector))
+        .await?
+        .items
+        .len())
+}
+
 /// Find the scheduler leader pod from the Lease, verifying the holder
 /// is a live pod (Running, not Terminating). Bails with a descriptive
 /// reason when the lease points at a stale pod; callers that need to
