@@ -399,6 +399,14 @@ message HeartbeatRequest {
   // assignment; scheduler picks from queue as before). Scheduler maps
   // empty → None.
   string intent_id = 13;
+  // k8s `spec.nodeName` (downward-API → `RIO_NODE_NAME`). Feeds the
+  // scheduler's hung-node detector (r[sched.admin.hung-node-detector]):
+  // ≥max(3,⌈0.5·occ⌉) stale-heartbeat executors across ≥2 tenants on
+  // one Node → that Node is reported in `GetSpawnIntents.dead_nodes`
+  // for the controller's nodeclaim_pool reaper. Empty outside k8s
+  // (scheduler maps empty → None; node ungrouped). Wire-compatible
+  // (default empty — pre-R24B6b builders don't send it).
+  string node_name = 14;
 }
 
 message HeartbeatResponse {

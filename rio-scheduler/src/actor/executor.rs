@@ -1031,6 +1031,11 @@ impl DagActor {
         // activeDeadlineSeconds. After the downgrade it falls through
         // to pick-from-queue like a Static-sized pod.
         worker.intent_id = intent_id;
+        // node_name: overwrite-if-Some. `spec.nodeName` is immutable
+        // post-bind so a Some value never changes; the `or` keeps a
+        // recorded name across a heartbeat from a transiently-
+        // misconfigured builder that omits it.
+        worker.node_name = hb.node_name.or(worker.node_name.take());
         // kind: overwrite unconditionally. An executor that flips kind
         // mid-life is a misconfiguration, but the scheduler should
         // reflect the most recent heartbeat (not a stale default).

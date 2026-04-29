@@ -174,6 +174,13 @@ pub struct ExecutorState {
     /// entry — the token attests the intent, and the intent is the
     /// immutable identity key (`r[sec.executor.identity-token]`).
     pub auth_intent: Option<String>,
+    /// k8s `spec.nodeName` from `HeartbeatRequest.node_name` (downward-
+    /// API on the builder pod). `None` = no heartbeat yet, or non-k8s
+    /// builder (empty wire string). Feeds the actor's hung-node
+    /// detector (`r[sched.admin.hung-node-detector]`) — executors with
+    /// `node_name=None` are ungrouped (can't contribute to a per-node
+    /// stale-quorum).
+    pub node_name: Option<String>,
     /// Per-stream epoch tying `ExecutorDisconnected` to the specific
     /// `BuildExecution` stream that closed. Allocated by the gRPC
     /// handler on stream open (monotonic across the process) and
@@ -214,6 +221,7 @@ impl ExecutorState {
             phantom_suspect: None,
             intent_id: None,
             auth_intent: None,
+            node_name: None,
             stream_epoch: 0,
         }
     }

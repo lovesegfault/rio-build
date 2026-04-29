@@ -272,6 +272,7 @@ pub async fn setup(
         // move: setup() has no further use for features.
         features,
         intent_id: cfg.intent_id.clone(),
+        node_name: cfg.node_name.clone(),
         executor_token: cfg.executor_token.clone(),
         slot: Arc::clone(&slot),
         ready: Arc::clone(&ready),

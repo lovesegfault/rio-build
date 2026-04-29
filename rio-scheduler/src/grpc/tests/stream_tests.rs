@@ -59,12 +59,7 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
             executor_id: "e2e-worker".into(),
             kind: rio_proto::types::ExecutorKind::Builder as i32,
             systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            running_build: None,
-            resources: None,
-            store_degraded: false,
-            draining: false,
-            intent_id: String::new(),
+            ..Default::default()
         })
         .await
         .expect("heartbeat should succeed");

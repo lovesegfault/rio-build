@@ -1868,6 +1868,7 @@ async fn ice_step_doubles_across_heartbeat_at_multi_cell() {
         draining: false,
         kind: rio_proto::types::ExecutorKind::Builder,
         intent_id: Some("d".into()),
+        node_name: None,
     });
 
     // |A'|=2 ⇒ heartbeat identifies no specific cell ⇒ NO clear.
@@ -2380,6 +2381,7 @@ fn bare_connect_builder(
         draining: false,
         kind: rio_proto::types::ExecutorKind::Builder,
         intent_id: None,
+        node_name: None,
     });
     actor.handle_prefetch_complete(&id.into(), 0);
     rx

@@ -2252,6 +2252,7 @@ mod tests {
             &["x86_64-linux".into()],
             &features,
             "",
+            "",
             &slot,
             &ResourceSnapshotHandle::default(),
             store_degraded,

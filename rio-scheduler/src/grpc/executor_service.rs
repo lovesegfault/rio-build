@@ -443,6 +443,7 @@ impl ExecutorService for SchedulerGrpc {
             draining: req.draining,
             kind,
             intent_id,
+            node_name: (!req.node_name.is_empty()).then_some(req.node_name),
         });
 
         // Heartbeats bypass backpressure: dropping a heartbeat under load
