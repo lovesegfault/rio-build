@@ -3,16 +3,70 @@
 //! RPCs (ClusterStatus, GetSpawnIntents, InspectBuildDag,
 //! DebugListExecutors).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
-use crate::state::{BuildState, DerivationStatus, SolvedIntent};
+use crate::state::{
+    BuildState, DerivationStatus, DrvHash, ExecutorId, ExecutorState, HEARTBEAT_TIMEOUT_SECS,
+    SolvedIntent,
+};
 
 use super::{
     AdminQuery, ClusterSnapshot, DagActor, DebugExecutorInfo, SpawnIntentsRequest,
     SpawnIntentsSnapshot, command,
 };
+
+/// §13b hung-node detector (`r[sched.admin.hung-node-detector]`).
+///
+/// Groups executors by `node_name`; flags a node when
+/// `stale ≥ max(3, ⌈0.5·occ⌉)` AND those stale executors span ≥2
+/// tenants. The tenant criterion discriminates a hung NODE (kubelet/
+/// EBS/kernel — every tenant's builds stall) from a single tenant's
+/// pathological build hanging its own pods. Idle stale executors
+/// (`running_build = None`) count toward `stale`/`occ` but not
+/// `tenants` — an all-idle hung node fails the tenant gate, which is
+/// fine: no work is stuck there, and `consolidate::reap_idle` covers
+/// it once Karpenter posts `Empty=True`.
+///
+/// Free function over the inputs (not `&self`) so the test can supply
+/// a `tenant_of` closure without seeding `dag` + `builds`.
+// r[impl sched.admin.hung-node-detector]
+pub(super) fn detect_hung_nodes(
+    executors: &HashMap<ExecutorId, ExecutorState>,
+    now: Instant,
+    tenant_of: impl Fn(&DrvHash) -> Option<Uuid>,
+) -> Vec<String> {
+    #[derive(Default)]
+    struct Agg {
+        occ: u32,
+        stale: u32,
+        tenants: HashSet<Uuid>,
+    }
+    let timeout = Duration::from_secs(HEARTBEAT_TIMEOUT_SECS);
+    let mut by_node: HashMap<&str, Agg> = HashMap::new();
+    for w in executors.values() {
+        let Some(node) = w.node_name.as_deref() else {
+            continue;
+        };
+        let agg = by_node.entry(node).or_default();
+        agg.occ += 1;
+        if now.duration_since(w.last_heartbeat) > timeout {
+            agg.stale += 1;
+            if let Some(t) = w.running_build.as_ref().and_then(&tenant_of) {
+                agg.tenants.insert(t);
+            }
+        }
+    }
+    let mut hung: Vec<String> = by_node
+        .into_iter()
+        .filter(|(_, a)| a.stale >= 3.max(a.occ.div_ceil(2)) && a.tenants.len() >= 2)
+        .map(|(n, _)| n.to_string())
+        .collect();
+    hung.sort();
+    hung
+}
 
 /// Request-side filter shared by the Ready and forecast passes of
 /// [`DagActor::compute_spawn_intents`]: kind (ADR-019 boundary),
@@ -530,7 +584,16 @@ impl DagActor {
                 .iter()
                 .map(crate::sla::config::cell_label)
                 .collect(),
+            dead_nodes: self.detect_hung_nodes(),
         }
+    }
+
+    /// [`detect_hung_nodes`] over the actor's live state. `pub(crate)`
+    /// for the bare-actor unit test (`tests/executor.rs`).
+    pub(crate) fn detect_hung_nodes(&self) -> Vec<String> {
+        detect_hung_nodes(&self.executors, Instant::now(), |h| {
+            self.dag.node(h)?.attributed_tenant(&self.builds)
+        })
     }
 
     /// Mint per-intent `ExecutorClaims` tokens for

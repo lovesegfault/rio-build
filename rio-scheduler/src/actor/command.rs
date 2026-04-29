@@ -781,6 +781,11 @@ pub struct SpawnIntentsSnapshot {
     /// scheduler's accumulated ladder instead of rediscovering ICE
     /// per cell.
     pub ice_masked_cells: Vec<String>,
+    /// k8s `spec.nodeName`s the hung-node detector flagged
+    /// (`r[sched.admin.hung-node-detector]`). The controller's
+    /// `nodeclaim_pool::health` reaps the corresponding NodeClaim
+    /// (`ReapReason::Dead`, capped per tick).
+    pub dead_nodes: Vec<String>,
 }
 
 /// Point-in-time cluster state counts for `AdminService.ClusterStatus`.

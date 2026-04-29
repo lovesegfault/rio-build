@@ -48,10 +48,7 @@ pub(super) async fn get_spawn_intents(
     Ok(GetSpawnIntentsResponse {
         intents: snap.intents,
         queued_by_system: snap.queued_by_system,
-        // TODO R24B6b: `detect_hung_nodes()` requires `HeartbeatRequest.
-        // node_name` plumbing (executor.rs / build_types.proto carry
-        // none today). `ice_masked_cells` is populated above.
-        dead_nodes: vec![],
+        dead_nodes: snap.dead_nodes,
         ice_masked_cells: snap.ice_masked_cells,
     })
 }

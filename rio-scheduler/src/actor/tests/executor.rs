@@ -791,6 +791,79 @@ async fn credit_heartbeats_for_stall_preserves_liveness_order() -> TestResult {
     Ok(())
 }
 
+/// `r[sched.admin.hung-node-detector]`: a node is flagged when
+/// `stale ≥ max(3, ⌈occ/2⌉)` AND those stale executors span ≥2
+/// tenants. The tenant gate discriminates a hung NODE from one
+/// tenant's bad build; the quorum gate covers transient one-off
+/// timeouts.
+// r[verify sched.admin.hung-node-detector]
+#[test]
+fn detect_hung_nodes_quorum_and_tenant_gate() {
+    use crate::actor::debug::backdate;
+    use crate::actor::snapshot::detect_hung_nodes;
+    use crate::state::{DrvHash, ExecutorId, ExecutorState, HEARTBEAT_TIMEOUT_SECS};
+    use std::collections::HashMap;
+    use std::time::Instant;
+    use uuid::Uuid;
+
+    let (t1, t2) = (Uuid::new_v4(), Uuid::new_v4());
+    let tenant_of = |h: &DrvHash| match h.as_str().chars().next() {
+        Some('1') => Some(t1),
+        Some('2') => Some(t2),
+        _ => None,
+    };
+    let stale = HEARTBEAT_TIMEOUT_SECS + 5;
+    let mk = |node: &str, secs_ago: u64, drv: Option<&str>| {
+        let mut w = ExecutorState::new("w".into());
+        w.node_name = Some(node.into());
+        w.last_heartbeat = backdate(secs_ago);
+        w.running_build = drv.map(DrvHash::from);
+        w
+    };
+    let mut ex: HashMap<ExecutorId, ExecutorState> = HashMap::new();
+    let mut put = |id: &str, w: ExecutorState| ex.insert(id.into(), w);
+
+    // nodeA: occ=5, 4 stale (3×t1 + 1×t2), 1 live → max(3,⌈5/2⌉)=3;
+    // 4≥3 ∧ tenants={t1,t2} → HUNG.
+    put("a1", mk("nodeA", stale, Some("1-a")));
+    put("a2", mk("nodeA", stale, Some("1-b")));
+    put("a3", mk("nodeA", stale, Some("1-c")));
+    put("a4", mk("nodeA", stale, Some("2-a")));
+    put("a5", mk("nodeA", 1, Some("1-d")));
+    // nodeB: occ=4, 3 stale ALL t1 → tenants={t1} → NOT hung
+    // (tenant gate — could be t1's build, not the node).
+    put("b1", mk("nodeB", stale, Some("1-e")));
+    put("b2", mk("nodeB", stale, Some("1-f")));
+    put("b3", mk("nodeB", stale, Some("1-g")));
+    put("b4", mk("nodeB", 1, None));
+    // nodeC: occ=3, 2 stale (t1+t2) → 2 < max(3,⌈3/2⌉)=3 → NOT hung
+    // (quorum gate — minority stall could be transient).
+    put("c1", mk("nodeC", stale, Some("1-h")));
+    put("c2", mk("nodeC", stale, Some("2-b")));
+    put("c3", mk("nodeC", 1, None));
+    // nodeD: occ=8, 4 stale (2+2 tenants) → max(3,⌈8/2⌉)=4; 4≥4 → HUNG.
+    // Exercises the ⌈occ/2⌉ arm dominating the floor of 3.
+    for i in 0..4 {
+        put(
+            &format!("d{i}"),
+            mk("nodeD", stale, Some(if i < 2 { "1-d" } else { "2-d" })),
+        );
+    }
+    for i in 4..8 {
+        put(&format!("d{i}"), mk("nodeD", 1, None));
+    }
+    // ungrouped (node_name=None): stale but never flagged.
+    let mut ung = ExecutorState::new("u1".into());
+    ung.last_heartbeat = backdate(stale);
+    ung.running_build = Some("1-u".into());
+    ex.insert("u1".into(), ung);
+
+    assert_eq!(
+        detect_hung_nodes(&ex, Instant::now(), tenant_of),
+        vec!["nodeA", "nodeD"]
+    );
+}
+
 // ===========================================================================
 // Poison-TTL expiry (POISON_TTL is cfg(test)-shadowed to 100ms in state/mod.rs)
 // ===========================================================================
