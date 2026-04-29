@@ -189,6 +189,21 @@ spec:
             k8s:io.kubernetes.pod.namespace: {{ $ns.store.name }}
             k8s:app.kubernetes.io/name: rio-store
       toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
+    {{- if .Values.global.postgresCidr }}
+    # nodeclaim_pool reconciler persists DDSketch lead-time + idle-gap
+    # to PG (B5 `nodeclaim_lead_time` table). Mirrors the scheduler/
+    # store toCIDR rule.
+    - toCIDR:
+        - {{ .Values.global.postgresCidr | quote }}
+      toPorts: [{ports: [{port: "5432", protocol: TCP}]}]
+    {{- end }}
+    {{- if .Values.postgresql.enabled }}
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $ns.store.name }}
+            k8s:app.kubernetes.io/name: postgresql
+      toPorts: [{ports: [{port: "5432", protocol: TCP}]}]
+    {{- end }}
 {{- if .Values.packedScheduler.enabled }}
 ---
 # rio-packed second kube-scheduler egress: DNS + kube-apiserver only
