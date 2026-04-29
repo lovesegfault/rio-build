@@ -210,35 +210,44 @@ pub struct SizingCfg {
 ///
 /// `n` starts at `max(⌈Σc/max_c⌉, ⌈Σm/max_m⌉, ⌈Σd/max_d⌉)` (the
 /// 3-axis lower bound so no claim exceeds its per-NodeClaim cap) and
-/// iterates upward until [`ffd_packs`] confirms the production FFD's
-/// (cores,mem)-desc / MostAllocated-cpu placement order packs every
-/// footprint — `Σ/n` is a lower bound on bin-packing, not a guarantee.
-/// Upper bound `n = |u|` (one claim per intent). Then capped by
-/// `per_tick_cap` and `⌊budget/chunk⌋` (the cap may truncate; the
-/// remainder is re-seen next tick).
+/// iterates upward until [`ffd::sim_packs`](super::ffd::sim_packs) —
+/// the production [`ffd::simulate`](super::ffd::simulate) on `n`
+/// uniform synthetic claims — packs every intent. `Σ/n` is a lower
+/// bound on bin-packing, not a guarantee. Upper bound `n = |u|` (one
+/// claim per intent). Then capped by `per_tick_cap` and
+/// `⌊budget/chunk⌋` (the cap may truncate; the remainder is re-seen
+/// next tick).
 ///
 /// Each claim is uniformly `(max(⌈Σc/n⌉, max_i c), max(Σm/n, max_i m),
 /// max(Σd/n, max_i d))` — every intent fits every claim on every axis,
-/// and `Σ out ≥ Σ in`. The production FFD (sorts `(cores, mem)` desc,
-/// MostAllocated-cpu) is then guaranteed to pack at `n = |u|`;
-/// [`ffd_packs`] finds the smallest `n` where it does. Unit-tested via
-/// the production FFD sim as oracle (the §Simulator-shares-accounting
-/// executable guarantee).
+/// and `Σ out ≥ Σ in`. The production FFD is guaranteed to pack at
+/// `n = |u|`; [`ffd::sim_packs`](super::ffd::sim_packs) finds the
+/// smallest `n` where it does. STRIKE-4 close (r26 mb_002): the
+/// predicate IS production `simulate` — no reimplemented sort/score to
+/// diverge on. Unit-tested via the same call (the
+/// §Simulator-shares-accounting executable guarantee).
 // r[impl ctrl.nodeclaim.anchor-bulk+3]
-pub fn sizing(u: &[&SpawnIntent], cfg: &SizingCfg) -> (Vec<(u32, u64, u64)>, f64) {
+pub fn sizing(cell: &Cell, u: &[&SpawnIntent], cfg: &SizingCfg) -> (Vec<(u32, u64, u64)>, f64) {
     use crate::reconcilers::pool::jobs::intent_pod_footprint;
     if u.is_empty() {
         return (Vec::new(), f64::MAX);
     }
-    let foot: Vec<(u32, u64, u64)> = u
+    let (sum_c, sum_m, sum_d, max_c, max_m, max_d) = u
         .iter()
         .map(|i| intent_pod_footprint(i, cfg.fuse_cache_bytes))
-        .collect();
-    let (sum_c, sum_m, sum_d, max_c, max_m, max_d) = foot.iter().fold(
-        (0u32, 0u64, 0u64, 0u32, 0u64, 0u64),
-        |(c, m, d, mc, mm, md), &(ic, im, id)| {
-            (c + ic, m + im, d + id, mc.max(ic), mm.max(im), md.max(id))
-        },
+        .fold(
+            (0u32, 0u64, 0u64, 0u32, 0u64, 0u64),
+            |(c, m, d, mc, mm, md), (ic, im, id)| {
+                (c + ic, m + im, d + id, mc.max(ic), mm.max(im), md.max(id))
+            },
+        );
+    // Upstream invariant: `solve_intent_for` caps each intent's c* at
+    // `sla.maxCores` (= `cfg.max_node_cores`, single-sourced via helm),
+    // so `claim_at(n).0 = ⌈Σc/n⌉.max(max_c) ≤ max_node_cores` always.
+    debug_assert!(
+        max_c <= cfg.max_node_cores,
+        "intent cores {max_c} > max_node_cores {} — scheduler ClassCeiling/cap_c not gating?",
+        cfg.max_node_cores
     );
     let min_eta = u.iter().map(|i| i.eta_seconds).fold(f64::MAX, f64::min);
     let claim_at = |n: u32| {
@@ -251,7 +260,7 @@ pub fn sizing(u: &[&SpawnIntent], cfg: &SizingCfg) -> (Vec<(u32, u64, u64)>, f64
     let n_lo = claim_count((sum_c, sum_m, sum_d), cfg);
     let n_hi = u.len() as u32;
     let n_pack = (n_lo..=n_hi)
-        .find(|&n| ffd_packs(&foot, claim_at(n), n))
+        .find(|&n| super::ffd::sim_packs(cell, u, claim_at(n), n, cfg.fuse_cache_bytes))
         .unwrap_or(n_hi);
     let (chunk, mem, disk) = claim_at(n_pack);
     if cfg.budget < chunk {
@@ -271,36 +280,6 @@ pub fn claim_count(sum: (u32, u64, u64), cfg: &SizingCfg) -> u32 {
     let need_m = u32::try_from(sum_m.div_ceil(cfg.max_node_mem.max(1))).unwrap_or(u32::MAX);
     let need_d = u32::try_from(sum_d.div_ceil(cfg.max_node_disk.max(1))).unwrap_or(u32::MAX);
     need_c.max(need_m).max(need_d).max(1)
-}
-
-/// Does the production FFD's placement order (sort `(cores, mem)` desc,
-/// MostAllocated-cpu bin select) pack every `foot` into `n` uniform
-/// `bin`-sized bins? Mirrors [`super::ffd::simulate`]'s sort key and
-/// score so [`sizing`] produces what the real FFD will pack — the
-/// sizing/FFD round-trip the §Simulator-shares-accounting test asserts
-/// via the production sim.
-fn ffd_packs(foot: &[(u32, u64, u64)], bin: (u32, u64, u64), n: u32) -> bool {
-    let mut sorted: Vec<_> = foot.to_vec();
-    sorted.sort_by_key(|&(c, m, _)| std::cmp::Reverse((c, m)));
-    let alloc = bin.0.max(1);
-    let mut free = vec![bin; n as usize];
-    for &(c, m, d) in &sorted {
-        let Some((k, _)) = free
-            .iter()
-            .enumerate()
-            .filter(|&(_, &(fc, fm, fd))| fc >= c && fm >= m && fd >= d)
-            .max_by(|&(ka, _), &(kb, _)| {
-                let score = |k: usize| f64::from(alloc - free[k].0 + c) / f64::from(alloc);
-                score(ka).total_cmp(&score(kb))
-            })
-        else {
-            return false;
-        };
-        free[k].0 -= c;
-        free[k].1 -= m;
-        free[k].2 -= d;
-    }
-    true
 }
 
 /// Build a NodeClaim for `cell` requesting `(cores, mem, disk)`.
@@ -440,7 +419,13 @@ mod tests {
 
     const GI: u64 = 1 << 30;
 
-    fn intent(id: &str, cores: u32, mem: u64, cells: &[(&str, CapacityType)]) -> SpawnIntent {
+    fn intent(
+        id: &str,
+        cores: u32,
+        mem: u64,
+        cells: &[(&str, CapacityType)],
+        ready: Option<bool>,
+    ) -> SpawnIntent {
         let (hw_class_names, node_affinity) = cells
             .iter()
             .map(|(h, cap)| {
@@ -463,7 +448,7 @@ mod tests {
             cores,
             mem_bytes: mem,
             disk_bytes: GI,
-            ready: Some(true),
+            ready,
             hw_class_names,
             node_affinity,
             ..Default::default()
@@ -494,50 +479,52 @@ mod tests {
         assert_eq!(f(0, 0, 0, 32), 1, "empty floors at 1");
     }
 
+    fn h_spot() -> Cell {
+        Cell("h".into(), CapacityType::Spot)
+    }
+
     #[test]
     fn sizing_respects_budget_and_per_tick_cap() {
         let u: Vec<_> = (0..10)
-            .map(|k| intent_hd(&format!("i{k}"), 8, 8 * GI, 5 * GI))
+            .map(|k| intent_hd(&format!("i{k}"), 8, 8 * GI, 5 * GI, Some(true)))
             .collect();
         let refs: Vec<&SpawnIntent> = u.iter().collect();
-        // Σc=80, n_lo=⌈80/32⌉=3; ffd_packs finds n_pack=5 (disk-bound:
+        // Σc=80, n_lo=⌈80/32⌉=3; sim_packs finds n_pack=5 (disk-bound:
         // each pod's footprint.d = 5×1.5+50+1 ≈ 58.5Gi; 3 bins of
         // ⌈Σd/3⌉≈195Gi fit 3 each = 9 < 10).
-        let (c, _) = sizing(&refs, &cfg(32, 8, 200));
+        let (c, _) = sizing(&h_spot(), &refs, &cfg(32, 8, 200));
         assert_eq!(c.len(), 5, "n_pack binds");
-        let (c, _) = sizing(&refs, &cfg(32, 2, 200));
+        let (c, _) = sizing(&h_spot(), &refs, &cfg(32, 2, 200));
         assert_eq!(c.len(), 2, "per_tick binds");
         // chunk at n_pack=5 is ⌈80/5⌉.max(8)=16; budget=20 → ⌊20/16⌋=1.
-        let (c, _) = sizing(&refs, &cfg(32, 8, 20));
+        let (c, _) = sizing(&h_spot(), &refs, &cfg(32, 8, 20));
         assert_eq!(c.len(), 1, "budget binds");
-        let (c, _) = sizing(&refs, &cfg(32, 8, 10));
+        let (c, _) = sizing(&h_spot(), &refs, &cfg(32, 8, 10));
         assert!(c.is_empty(), "budget < chunk");
     }
 
     /// Oracle: feed `claims` back as synthetic LiveNodes to the
     /// production FFD sim and assert all `intents` place. The
     /// §Simulator-shares-accounting executable guarantee — sizing
-    /// produces what FFD can pack.
-    fn oracle_places_all(intents: &[SpawnIntent], claims: &[(u32, u64, u64)], fuse: u64) -> bool {
-        use super::super::ffd::tests::node;
-        let nodes: Vec<_> = claims
-            .iter()
-            .enumerate()
-            .map(|(k, &(c, m, d))| node(&format!("nc{k}"), "h", CapacityType::Spot, c, m, d))
-            .collect();
-        let (_, unplaced) = super::super::ffd::simulate(
-            intents,
-            &nodes,
-            &super::super::sketch::CellSketches::default(),
-            &std::collections::HashMap::new(),
-            fuse,
-            |_, _| true,
-        );
-        unplaced.is_empty()
+    /// produces what FFD can pack. Same synthetic-env construction as
+    /// [`super::super::ffd::sim_packs`] (the impl predicate) so the
+    /// test exercises EXACTLY what `sizing` checked. Uniform claims
+    /// only (sizing's output is `vec![bin; n]`).
+    fn oracle_places_all(
+        cell: &Cell,
+        intents: &[SpawnIntent],
+        claims: &[(u32, u64, u64)],
+        fuse: u64,
+    ) -> bool {
+        let refs: Vec<&SpawnIntent> = intents.iter().collect();
+        let Some(&bin) = claims.first() else {
+            return intents.is_empty();
+        };
+        super::super::ffd::sim_packs(cell, &refs, bin, claims.len() as u32, fuse)
     }
 
-    fn intent_hd(id: &str, cores: u32, mem: u64, disk: u64) -> SpawnIntent {
-        let mut i = intent(id, cores, mem, &[("h", CapacityType::Spot)]);
+    fn intent_hd(id: &str, cores: u32, mem: u64, disk: u64, ready: Option<bool>) -> SpawnIntent {
+        let mut i = intent(id, cores, mem, &[("h", CapacityType::Spot)], ready);
         i.disk_bytes = disk;
         i.disk_headroom_factor = Some(1.5);
         i
@@ -551,12 +538,16 @@ mod tests {
         let scfg = cfg(64, u32::MAX, u32::MAX);
         let check = |name: &str, intents: Vec<SpawnIntent>| {
             let refs: Vec<&SpawnIntent> = intents.iter().collect();
-            let (claims, _) = sizing(&refs, &scfg);
+            let (claims, _) = sizing(&h_spot(), &refs, &scfg);
             assert!(
-                oracle_places_all(&intents, &claims, scfg.fuse_cache_bytes),
+                oracle_places_all(&h_spot(), &intents, &claims, scfg.fuse_cache_bytes),
                 "{name}: FFD-oracle leaves unplaced; claims={claims:?}"
             );
-            for (k, &(_, m, d)) in claims.iter().enumerate() {
+            for (k, &(c, m, d)) in claims.iter().enumerate() {
+                assert!(
+                    c <= scfg.max_node_cores,
+                    "{name}: claim[{k}].cores {c} > cap"
+                );
                 assert!(m <= scfg.max_node_mem, "{name}: claim[{k}].mem {m} > cap");
                 assert!(d <= scfg.max_node_disk, "{name}: claim[{k}].disk {d} > cap");
             }
@@ -566,37 +557,72 @@ mod tests {
         check(
             "uniform-8",
             (0..8)
-                .map(|k| intent_hd(&format!("u{k}"), 2, 8 * GI, 10 * GI))
+                .map(|k| intent_hd(&format!("u{k}"), 2, 8 * GI, 10 * GI, Some(true)))
                 .collect(),
         );
         // mb_024(1) anchor: [{32c,200Gi},{32c,2Gi}×7].
-        let mut a: Vec<_> = vec![intent_hd("big", 32, 200 * GI, 5 * GI)];
-        a.extend((0..7).map(|k| intent_hd(&format!("s{k}"), 32, 2 * GI, 5 * GI)));
+        let mut a: Vec<_> = vec![intent_hd("big", 32, 200 * GI, 5 * GI, Some(true))];
+        a.extend((0..7).map(|k| intent_hd(&format!("s{k}"), 32, 2 * GI, 5 * GI, Some(true))));
         check("anchor", a);
         // B0-arch counter-ex: 2×200Gi + 8×10Gi — second 200Gi must
         // place (single-anchor would fail).
         let mut b: Vec<_> = (0..2)
-            .map(|k| intent_hd(&format!("b{k}"), 4, 200 * GI, 5 * GI))
+            .map(|k| intent_hd(&format!("b{k}"), 4, 200 * GI, 5 * GI, Some(true)))
             .collect();
-        b.extend((0..8).map(|k| intent_hd(&format!("t{k}"), 4, 10 * GI, 5 * GI)));
+        b.extend((0..8).map(|k| intent_hd(&format!("t{k}"), 4, 10 * GI, 5 * GI, Some(true))));
         check("two-outliers", b);
         // B0-inverse: 192×{1c,8Gi,2Gi} — Σm=1536Gi at 256Gi cap → n=6;
         // each claim's mem ≤ 256Gi.
         check(
             "mem-bound",
             (0..192)
-                .map(|k| intent_hd(&format!("m{k}"), 1, 8 * GI, 2 * GI))
+                .map(|k| intent_hd(&format!("m{k}"), 1, 8 * GI, 2 * GI, Some(true)))
                 .collect(),
         );
         // Empty.
-        let (c, e) = sizing(&[], &scfg);
+        let (c, e) = sizing(&h_spot(), &[], &scfg);
         assert!(c.is_empty());
         assert_eq!(e, f64::MAX);
     }
 
+    /// STRIKE-4 (r26 mb_002): mixed `ready` values. The pre-r26
+    /// open-coded predicate sorted `(c, m)` only; production
+    /// `simulate` sorts `(ready, c, m)` — under MostAllocated scoring
+    /// the orders pack differently. With `sim_packs` IS `simulate`,
+    /// sizing finds the `n` where production FFD packs.
+    #[test]
+    fn sizing_mixed_ready_ffd_oracle() {
+        // 2 ready 4c + 2 forecast 6c on 10c-cap nodes (low mem/disk so
+        // those axes don't bind). simulate's ready-first order at n=2
+        // places both 4c on one bin via MostAllocated, then a 6c on
+        // the other — second 6c stranded. cores-only sort would have
+        // packed at n=2. sim_packs (= simulate) finds n_pack > 2.
+        let mut u = vec![
+            intent_hd("r0", 4, GI, GI, Some(true)),
+            intent_hd("r1", 4, GI, GI, Some(true)),
+        ];
+        u.extend((0..2).map(|k| intent_hd(&format!("f{k}"), 6, GI, GI, Some(false))));
+        let scfg = SizingCfg {
+            max_node_cores: 10,
+            max_node_mem: 256 * GI,
+            max_node_disk: 450 * GI,
+            per_tick_cap: u32::MAX,
+            budget: u32::MAX,
+            fuse_cache_bytes: 50 * GI,
+        };
+        let refs: Vec<&SpawnIntent> = u.iter().collect();
+        let (claims, _) = sizing(&h_spot(), &refs, &scfg);
+        assert!(
+            oracle_places_all(&h_spot(), &u, &claims, scfg.fuse_cache_bytes),
+            "mixed-ready FFD-oracle leaves unplaced; claims={claims:?}"
+        );
+    }
+
     /// Hand-rolled property check (proptest-equivalent without the dep,
     /// matching `ffd::tests::ffd_never_overcommits`): 100 random intent
-    /// vecs, fixed-seed LCG so failures are reproducible.
+    /// vecs, fixed-seed LCG so failures are reproducible. `ready` is
+    /// varied — the input axis a reimplemented packing predicate would
+    /// diverge on.
     #[test]
     fn sizing_random_intents_ffd_oracle() {
         let scfg = cfg(64, u32::MAX, u32::MAX);
@@ -611,23 +637,29 @@ mod tests {
             let len = 1 + next(40) as usize;
             let intents: Vec<_> = (0..len)
                 .map(|k| {
+                    let ready = match next(3) {
+                        0 => Some(true),
+                        1 => Some(false),
+                        _ => None,
+                    };
                     intent_hd(
                         &format!("c{case}i{k}"),
                         1 + next(32) as u32,
                         (1 + next(128)) * GI,
                         (1 + next(80)) * GI,
+                        ready,
                     )
                 })
                 .collect();
             let refs: Vec<&SpawnIntent> = intents.iter().collect();
-            let (claims, _) = sizing(&refs, &scfg);
+            let (claims, _) = sizing(&h_spot(), &refs, &scfg);
             assert!(
-                oracle_places_all(&intents, &claims, scfg.fuse_cache_bytes),
+                oracle_places_all(&h_spot(), &intents, &claims, scfg.fuse_cache_bytes),
                 "case {case}: FFD leaves unplaced; len={len} claims={claims:?}"
             );
-            for &(_, m, d) in &claims {
+            for &(c, m, d) in &claims {
                 assert!(
-                    m <= scfg.max_node_mem && d <= scfg.max_node_disk,
+                    c <= scfg.max_node_cores && m <= scfg.max_node_mem && d <= scfg.max_node_disk,
                     "case {case}: cap"
                 );
             }
@@ -673,7 +705,10 @@ mod tests {
     fn assign_unplaced_picks_cheapest_open() {
         let h1 = ("h1", CapacityType::Spot);
         let h2 = ("h2", CapacityType::Spot);
-        let unplaced = [intent("a", 4, GI, &[h1, h2]), intent("b", 2, GI, &[h2])];
+        let unplaced = [
+            intent("a", 4, GI, &[h1, h2], Some(true)),
+            intent("b", 2, GI, &[h2], Some(true)),
+        ];
         // h1 cheaper.
         let price = |c: &Cell| if c.0 == "h1" { 0.03 } else { 0.05 };
         let none = HashSet::new();
@@ -694,7 +729,7 @@ mod tests {
     #[test]
     fn assign_masked_cell_fails_over_to_od() {
         let cells = [("h", CapacityType::Spot), ("h", CapacityType::OnDemand)];
-        let unplaced = [intent("x", 4, GI, &cells)];
+        let unplaced = [intent("x", 4, GI, &cells, Some(true))];
         let spot = Cell("h".into(), CapacityType::Spot);
         let od = Cell("h".into(), CapacityType::OnDemand);
         // No mask → spot (cell_rank: spot < od).
@@ -758,8 +793,7 @@ mod tests {
             // Non-empty hw_class_names + forecast + eta>lead_time →
             // A_open empty → NOT fallback-routed (silently skipped).
             {
-                let mut i = intent("fc", 4, GI, &[("h1", CapacityType::Spot)]);
-                i.ready = Some(false);
+                let mut i = intent("fc", 4, GI, &[("h1", CapacityType::Spot)], Some(false));
                 i.eta_seconds = 999.0;
                 i
             },

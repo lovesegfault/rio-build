@@ -382,6 +382,59 @@ pub fn simulate(
     (placeable, unplaced)
 }
 
+/// Does the production [`simulate`] pack every intent in `u` into `n`
+/// uniform `bin`-sized synthetic NodeClaims for `cell`? The predicate
+/// [`super::cover::sizing`] iterates upward on. STRIKE-4 close (r26
+/// mb_002): the predicate IS [`simulate`] — no second sort/score code
+/// path to diverge on.
+///
+/// `ready` affects `simulate`'s sort ORDER (load-bearing — the axis a
+/// reimplemented predicate would diverge on); `eta_seconds` is
+/// neutralized to `f64::MIN` so [`a_open`]'s `eta < lead_time` filter
+/// passes for every forecast intent regardless of
+/// `sketches.lead_time(cell)` — `assign_to_cells` already gated each
+/// intent's openness on `cell`, so the lead-time check is redundant in
+/// this synthetic env.
+pub(super) fn sim_packs(
+    cell: &Cell,
+    u: &[&SpawnIntent],
+    bin: (u32, u64, u64),
+    n: u32,
+    fuse_cache_bytes: u64,
+) -> bool {
+    let intents: Vec<SpawnIntent> = u
+        .iter()
+        .map(|i| SpawnIntent {
+            eta_seconds: f64::MIN,
+            ..(*i).clone()
+        })
+        .collect();
+    let nodes: Vec<LiveNode> = (0..n)
+        .map(|k| LiveNode {
+            name: format!("sim{k}"),
+            node_name: None,
+            registered: true,
+            cell: Some(cell.clone()),
+            instance_type: None,
+            allocatable: bin,
+            requested: (0, 0, 0),
+            created_secs: None,
+            annotations: BTreeMap::new(),
+            status: NodeClaimStatus::default(),
+        })
+        .collect();
+    simulate(
+        &intents,
+        &nodes,
+        &CellSketches::default(),
+        &HashMap::new(),
+        fuse_cache_bytes,
+        |_, _| true,
+    )
+    .1
+    .is_empty()
+}
+
 /// Per-cell `(on_registered, on_inflight)` placement count. The cell
 /// is the placed-on node's cell (not the intent's `A_open` — an intent
 /// may target multiple cells; the placement is on exactly one).

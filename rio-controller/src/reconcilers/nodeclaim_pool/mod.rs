@@ -945,7 +945,7 @@ impl NodeClaimPoolReconciler {
                     .saturating_sub(created_cores),
                 fuse_cache_bytes: self.cfg.fuse_cache_bytes,
             };
-            let (claims, min_eta) = cover::sizing(u, &scfg);
+            let (claims, min_eta) = cover::sizing(cell, u, &scfg);
             if claims.is_empty() {
                 debug!(%cell, budget = scfg.budget, "no claims (budget exhausted or empty)");
                 continue;
