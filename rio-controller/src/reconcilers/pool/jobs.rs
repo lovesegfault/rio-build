@@ -342,13 +342,22 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // NodeClaims only, so gating Fetcher spawn on it stalls FODs until
     // a builder node boots. `Ctx.placeable = None` ⇔ NodeClaim CRD
     // absent (k3s VM tests without Karpenter) — the gate is
-    // structurally a no-op there. `gate_armed = false` ⇔ the gate is
-    // present but no FFD tick has published yet (first ~10s after
-    // start, or a standby replica); treated like `scheduler_err` for
-    // `queued_known` so reap stays fail-closed.
+    // structurally a no-op there.
+    //
+    // `gate_armed` answers "is `queued` authoritative for
+    // `reap_excess_pending`?". When the gate exists (CRD present),
+    // queued is the FFD-filtered count (Builder) or the raw scheduler
+    // count (Fetcher) — both authoritative, reap active. When the gate
+    // is absent (CRD absent), `gate_armed=false` keeps reap fail-closed:
+    // pre-§13b semantics, where the unfiltered queued count alone is
+    // not safe to reap against (a Job in the post-completion
+    // `{succeeded:0,ready:0}` window before Job-controller sync looks
+    // pending; reap deletes it racing the job-tracking finalizer —
+    // ci-failure-patterns "job-tracking finalizer orphan").
     let gate_armed = match (&ctx.placeable, pool.spec.kind) {
         (Some(g), ExecutorKind::Builder) => g.retain(&mut intents),
-        _ => true,
+        (Some(_), _) => true,
+        (None, _) => false,
     };
     let queued = intents.len().min(u32::MAX as usize) as u32;
 
