@@ -107,6 +107,8 @@ scheduler:
       vmtest:
         labels:
           - {key: rio.build/vmtest, value: "true"}
+        requirements:
+          - {key: kubernetes.io/os, operator: In, values: [linux]}
     hwCostSource: static
     referenceHwClass: vmtest
 
