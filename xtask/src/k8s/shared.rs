@@ -596,14 +596,24 @@ pub async fn tunnel_grpc(
     store_port: u16,
 ) -> Result<((u16, ProcessGuard), (u16, ProcessGuard))> {
     let client = kube::client().await?;
-    // helm --wait returns when scheduler PODS are Ready, but leader-
-    // election runs in main() — there's a few-second window where the
-    // Lease has no holder. Poll until election settles. A stale holder
-    // (just-terminated old pod) falls through to the TCP-accept poll
-    // below, which times out at 20s; acceptable for a rare race.
+    // helm --wait returns when the NEW scheduler pods are Ready, but
+    // the Lease may still name the OLD pod (terminationGracePeriod;
+    // release is on the shutdown path). Port-forwarding to a
+    // Terminating pod succeeds AND passes the TCP-accept probe below
+    // — then dies mid-RPC, surfacing as `transport error` from
+    // rio-cli. `scheduler_leader` rejects non-live holders; surface
+    // the reason and keep polling until the new leader has acquired.
     let leader = ui::poll("scheduler lease holder", Duration::from_secs(2), 30, || {
         let c = client.clone();
-        async move { Ok(kube::scheduler_leader(&c, NS).await.ok()) }
+        async move {
+            match kube::scheduler_leader(&c, NS).await {
+                Ok(h) => Ok(Some(h)),
+                Err(e) => {
+                    tracing::info!("{e:#}");
+                    Ok(None)
+                }
+            }
+        }
     })
     .await?;
     let leader = format!("pod/{leader}");

@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment};
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{Namespace, Pod, Secret, Service};
@@ -161,14 +161,46 @@ pub async fn gateway_lb_hostname(client: &Client, ns: &str) -> Result<String> {
         .context("rio-gateway Service has no LoadBalancer ingress yet (NLB provisioning?)")
 }
 
-/// Find the scheduler leader pod from the Lease.
+/// Find the scheduler leader pod from the Lease, verifying the holder
+/// is a live pod (Running, not Terminating). Bails with a descriptive
+/// reason when the lease points at a stale pod; callers that need to
+/// wait out a failover wrap this in a poll loop and retry on Err
+/// ([`super::shared::tunnel_grpc`]).
+///
+/// During a rollout the Lease's `holderIdentity` keeps naming the OLD
+/// pod for up to `leaseDurationSeconds` after it enters
+/// terminationGracePeriod — release runs on the shutdown path, not in
+/// preStop. Port-forwarding to that pod succeeds AND accepts TCP, then
+/// dies mid-RPC: surfaced as a bare `transport error` from rio-cli the
+/// first time `qa --health` ran straight after `helm upgrade --wait`.
 pub async fn scheduler_leader(client: &Client, ns: &str) -> Result<String> {
-    let api: Api<Lease> = Api::namespaced(client.clone(), ns);
-    let lease = api.get("rio-scheduler-leader").await?;
-    lease
+    let leases: Api<Lease> = Api::namespaced(client.clone(), ns);
+    let holder = leases
+        .get("rio-scheduler-leader")
+        .await?
         .spec
         .and_then(|s| s.holder_identity)
-        .context("scheduler lease has no holder")
+        .context("scheduler lease has no holder")?;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
+    holder_live(&holder, pods.get_opt(&holder).await?)?;
+    Ok(holder)
+}
+
+/// Pod-liveness gate for [`scheduler_leader`]. Split out so the
+/// Terminating / not-Running / vanished branches are unit-testable
+/// without a kube client. Err message is what the poll loop logs.
+fn holder_live(holder: &str, pod: Option<Pod>) -> Result<()> {
+    let Some(pod) = pod else {
+        bail!("lease holder {holder} not found; waiting for new leader");
+    };
+    if pod.metadata.deletion_timestamp.is_some() {
+        bail!("lease holder {holder} is Terminating; waiting for new leader");
+    }
+    let phase = pod.status.and_then(|s| s.phase).unwrap_or_default();
+    if phase != "Running" {
+        bail!("lease holder {holder} phase={phase}; waiting for Running");
+    }
+    Ok(())
 }
 
 /// Rollout-restart a Deployment (patch restartedAt annotation).
@@ -443,6 +475,46 @@ mod tests {
             },
         );
         assert!(!ds_status(&d).ok);
+    }
+
+    fn pod(phase: &str, terminating: bool) -> Pod {
+        use k8s_openapi::api::core::v1::PodStatus;
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        let mut p = Pod::default();
+        if terminating {
+            // Any value — holder_live only checks is_some().
+            p.metadata.deletion_timestamp = Some(Time(jiff::Timestamp::now()));
+        }
+        p.status = Some(PodStatus {
+            phase: Some(phase.into()),
+            ..Default::default()
+        });
+        p
+    }
+
+    /// `qa --health` straight after `helm upgrade --wait`: the Lease
+    /// still names the old pod (terminationGracePeriod). Port-forward
+    /// to it succeeds, TCP-accept passes, then it dies mid-RPC.
+    /// `scheduler_leader` must reject it so the poll loop waits for
+    /// the new leader instead of tunneling into a dying pod.
+    #[test]
+    fn holder_live_rejects_terminating() {
+        let e = holder_live("old-sched-0", Some(pod("Running", true))).unwrap_err();
+        assert!(e.to_string().contains("Terminating"), "{e}");
+        assert!(e.to_string().contains("old-sched-0"), "{e}");
+    }
+
+    #[test]
+    fn holder_live_rejects_missing_and_not_running() {
+        let e = holder_live("gone", None).unwrap_err();
+        assert!(e.to_string().contains("not found"), "{e}");
+        let e = holder_live("p", Some(pod("Pending", false))).unwrap_err();
+        assert!(e.to_string().contains("phase=Pending"), "{e}");
+    }
+
+    #[test]
+    fn holder_live_accepts_running() {
+        holder_live("sched-0", Some(pod("Running", false))).unwrap();
     }
 
     #[test]

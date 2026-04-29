@@ -78,17 +78,19 @@ pub fn first_pod(ctx: &QaCtx, ns: &str, app: &str) -> Result<String> {
 /// Wait until the scheduler-leader pod name differs from `old_leader`
 /// (failover after a kill/restart). Returns the new leader name.
 ///
-/// `kube::scheduler_leader` returns Err("scheduler lease has no
-/// holder") during the brief window between the old holder's lease
-/// expiry and the standby acquiring it — that's "not yet", not a
-/// failure.
+/// Any [`QaCtx::scheduler_leader`] Err during the transition is
+/// transient by definition — no holder yet, holder Terminating, holder
+/// pod gone — so all Err arms retry. The only failure mode is the
+/// deadline elapsing.
 pub async fn wait_new_leader(ctx: &QaCtx, old_leader: &str, deadline: Duration) -> Result<String> {
     poll_until(deadline, Duration::from_secs(2), || async {
         match ctx.scheduler_leader().await {
             Ok(cur) if cur != old_leader && !cur.is_empty() => Ok(Some(cur)),
             Ok(_) => Ok(None),
-            Err(e) if format!("{e:#}").contains("lease has no holder") => Ok(None),
-            Err(e) => Err(e),
+            Err(e) => {
+                tracing::debug!("wait_new_leader: {e:#}");
+                Ok(None)
+            }
         }
     })
     .await?
