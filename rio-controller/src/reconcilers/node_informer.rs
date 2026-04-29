@@ -434,11 +434,16 @@ type NodePodRequests = HashMap<String, (u32, u64, u64)>;
 #[derive(Default)]
 struct PodRequestedInner {
     by_node: HashMap<String, NodePodRequests>,
-    /// Bound pods carrying `INTENT_ID_ANNOTATION`. FFD short-circuits
-    /// an intent that's already bound to a node directly into
-    /// `placeable` (no fit-check) — its own pod's `(c,m,d)` is in
-    /// `sum_for(node)` so a fit-check would double-count and evict it.
-    bound_intent: HashMap<String, String>,
+    /// Bound pods carrying `INTENT_ID_ANNOTATION`: `intent_id →
+    /// (pod_name, node_name)`. FFD short-circuits an already-bound
+    /// intent directly into `placeable` (no fit-check) — its own pod's
+    /// `(c,m,d)` is in `sum_for(node)` so a fit-check would
+    /// double-count and evict it. `pod_name` is in the value so
+    /// [`prune_absent`](Self::prune_absent) and
+    /// [`delete`](Self::delete) prune at per-pod granularity (not
+    /// per-node — a sibling pod surviving on the same node mustn't
+    /// keep a deleted pod's binding alive).
+    bound_intent: HashMap<String, (String, String)>,
 }
 
 /// `spec.nodeName` → Σ pod `resources.requests` cache for the §13b FFD
@@ -472,7 +477,12 @@ impl PodRequestedCache {
     /// intents to `placeable` instead of fit-checking them (which
     /// would double-count their own pod's reservation against them).
     pub fn bound_intents(&self) -> HashMap<String, String> {
-        self.0.read().bound_intent.clone()
+        self.0
+            .read()
+            .bound_intent
+            .iter()
+            .map(|(id, (_, node))| (id.clone(), node.clone()))
+            .collect()
     }
 
     /// Upsert `pod`'s requests under its `spec.nodeName`. Pending pods
@@ -516,7 +526,7 @@ impl PodRequestedCache {
             .or_default()
             .insert(name.clone(), req);
         if let Some(id) = intent_id {
-            g.bound_intent.insert(id, node.clone());
+            g.bound_intent.insert(id, (name.clone(), node.clone()));
         }
     }
 
@@ -536,7 +546,13 @@ impl PodRequestedCache {
         for pods in g.by_node.values_mut() {
             pods.remove(name);
         }
-        if let Some(id) = intent_id {
+        // Only evict the binding if THIS pod is the one recorded. A
+        // retry of the same drv (`intent_id == drv_hash`) may have
+        // already bound a NEW pod via [`apply`](Self::apply); a late
+        // delete for the old pod must not wipe the fresh entry.
+        if let Some(id) = intent_id
+            && g.bound_intent.get(id).map(|(p, _)| p.as_str()) == Some(name)
+        {
             g.bound_intent.remove(id);
         }
     }
@@ -553,16 +569,7 @@ impl PodRequestedCache {
         for pods in g.by_node.values_mut() {
             pods.retain(|name, _| seen.contains(name));
         }
-        // bound_intent values are node names, not pod names — but a
-        // pod-name prune means the binding is gone too. Prune intents
-        // whose bound node has no pods left after the by_node retain.
-        let alive: HashSet<String> = g
-            .by_node
-            .iter()
-            .filter(|(_, pods)| !pods.is_empty())
-            .map(|(n, _)| n.clone())
-            .collect();
-        g.bound_intent.retain(|_, node| alive.contains(node));
+        g.bound_intent.retain(|_, (pod, _)| seen.contains(pod));
     }
 }
 
@@ -1444,5 +1451,46 @@ mod tests {
         cache.apply(&p);
         cache.delete(&p);
         assert!(cache.bound_intents().is_empty());
+    }
+
+    /// mb_034: a per-pod entry was pruned at per-node granularity, so
+    /// pod-a (intent X) deleted during a watch-gap stayed in
+    /// `bound_intent` as long as a sibling pod-b survived on the same
+    /// node — FFD then short-circuited X's retry to a slot that's gone
+    /// from `sum_for`.
+    #[test]
+    fn prune_absent_evicts_stale_bound_intent_with_surviving_sibling() {
+        use crate::reconcilers::pool::jobs::INTENT_ID_ANNOTATION;
+        let cache = PodRequestedCache::default();
+        let with_intent = |name, id| {
+            let mut p = pod_req(name, Some("n1"), "4", "8Gi", "10Gi");
+            p.metadata.annotations = Some([(INTENT_ID_ANNOTATION.into(), id)].into());
+            p
+        };
+        cache.apply(&with_intent("pod-a", "X".into()));
+        cache.apply(&with_intent("pod-b", "Y".into()));
+        // Relist sees only pod-b (pod-a deleted during watch gap).
+        cache.prune_absent(&HashSet::from(["pod-b".into()]));
+        let b = cache.bound_intents();
+        assert_eq!(b.get("X"), None, "X's pod gone → binding pruned");
+        assert_eq!(b.get("Y"), Some(&"n1".into()), "sibling Y survives");
+    }
+
+    /// A1: late delete(pod-a) for intent X must not wipe a fresh
+    /// apply(pod-b, X, n2) — the retry's binding survives.
+    #[test]
+    fn delete_preserves_newer_binding_for_same_intent() {
+        use crate::reconcilers::pool::jobs::INTENT_ID_ANNOTATION;
+        let cache = PodRequestedCache::default();
+        let with_intent = |name, node, id| {
+            let mut p = pod_req(name, Some(node), "4", "8Gi", "10Gi");
+            p.metadata.annotations = Some([(INTENT_ID_ANNOTATION.into(), id)].into());
+            p
+        };
+        let a = with_intent("pod-a", "n1", "X".into());
+        cache.apply(&a);
+        cache.apply(&with_intent("pod-b", "n2", "X".into()));
+        cache.delete(&a);
+        assert_eq!(cache.bound_intents().get("X"), Some(&"n2".into()));
     }
 }
