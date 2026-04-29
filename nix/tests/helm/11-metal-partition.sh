@@ -43,14 +43,16 @@ done < <(yq -N 'select(.kind=="NodePool"
                 | .metadata.name' "$karp")
 [ "$fail" = 0 ] || exit 1
 
-# rio-builder-metal's In == a band-pool's NotIn (same list, partition).
+# rio-builder-metal's In == any uefi pool's NotIn (same list, partition).
+# rio-fetcher is the comparison target — exists in BOTH the band-loop
+# world (`nodeclaimPool.enabled=false`) and the shim world (`=true`).
 metal_in=$(yq -N 'select(.kind=="NodePool" and .metadata.name=="rio-builder-metal")
                   | .spec.template.spec.requirements[]
                   | select(.key=="karpenter.k8s.aws/instance-size" and .operator=="In")
                   | .values' -o=json "$karp" | jq -sc 'add // [] | sort')
-band_notin=$(notin_of rio-builder-hi-ebs-x86)
-test "$metal_in" = "$band_notin" || {
-  echo "FAIL: rio-builder-metal In ($metal_in) != band-pool NotIn ($band_notin) — partition not single-sourced" >&2
+uefi_notin=$(notin_of rio-fetcher)
+test "$metal_in" = "$uefi_notin" || {
+  echo "FAIL: rio-builder-metal In ($metal_in) != rio-fetcher NotIn ($uefi_notin) — partition not single-sourced" >&2
   exit 1
 }
 test "$metal_in" = "$want" || {
