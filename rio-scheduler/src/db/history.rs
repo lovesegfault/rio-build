@@ -229,17 +229,26 @@ impl SchedulerDb {
     }
 
     /// Per-key ring-buffer trim: delete all but the `keep_n` most-recent
-    /// rows for one `(pname, system, tenant)` key. Called from
+    /// rows for one `(pname, system, tenant)` key, **plus** the single
+    /// newest row at each distinct `round(cpu_limit_cores)`. Called from
     /// [`SlaEstimator::refresh`] after refit so the table holds at most
-    /// `ring_buffer` rows per key in steady state. Returns rows deleted.
+    /// `ring_buffer + n_distinct_c` rows per key in steady state.
+    /// Returns rows deleted.
     ///
-    /// `NOT IN (SELECT id … ORDER BY completed_at DESC LIMIT $4)` — both
-    /// the outer scan and the subselect's top-N are covered by
+    /// `rn_c > 1` is the anchor invariant — same one [`AnchorRing`]
+    /// enforces in-memory. Without it, heavy churn at the converged c*
+    /// pushes the lone widest-span explore row past `keep_n` and a
+    /// cold-leader refit sees `span=1.0` (the fit collapses to
+    /// flat-median). NULL `cpu_limit_cores` partition together: one
+    /// pre-telemetry row is anchored, the rest are recency-ranked.
+    ///
     /// `build_samples_key_idx` (migration 039: `(pname, system, tenant,
-    /// completed_at DESC)`). With ≤32 retained rows the subselect is an
-    /// index-only top-N; the outer DELETE walks the same range.
+    /// completed_at DESC)`) covers the CTE scan and the recency-partition
+    /// sort; the per-c partition is an in-memory sort over ≤`keep_n +
+    /// n_distinct_c` rows.
     ///
     /// [`SlaEstimator::refresh`]: crate::sla::SlaEstimator::refresh
+    /// [`AnchorRing`]: crate::sla::ingest::AnchorRing
     pub async fn trim_build_samples(
         &self,
         pname: &str,
@@ -247,22 +256,28 @@ impl SchedulerDb {
         tenant: &str,
         keep_n: u32,
     ) -> Result<u64, sqlx::Error> {
-        // `NOT outlier_excluded` on BOTH sides: outliers are
-        // fit-invisible (`read_build_samples_for_keys` filters them),
-        // so they must NOT occupy ring slots — otherwise an outlier
-        // burst displaces older good samples and the next refit sees a
-        // permanently thinned population. Outliers are reaped by the
-        // 30-day age sweep (`delete_samples_older_than`) instead,
-        // preserving the forensics intent of `mark_outliers_excluded`.
+        // `NOT outlier_excluded`: outliers are fit-invisible
+        // (`read_build_samples_for_keys` filters them), so they must
+        // NOT occupy ring slots — otherwise an outlier burst displaces
+        // older good samples and the next refit sees a permanently
+        // thinned population. Outliers are reaped by the 30-day age
+        // sweep (`delete_samples_older_than`) instead, preserving the
+        // forensics intent of `mark_outliers_excluded`.
         let r = sqlx::query!(
-            "DELETE FROM build_samples
-             WHERE pname = $1 AND system = $2 AND tenant = $3
-               AND NOT outlier_excluded
-               AND id NOT IN (
-                 SELECT id FROM build_samples
-                 WHERE pname = $1 AND system = $2 AND tenant = $3
-                   AND NOT outlier_excluded
-                 ORDER BY completed_at DESC LIMIT $4)",
+            r#"
+            WITH ranked AS (
+              SELECT id,
+                ROW_NUMBER() OVER
+                  (ORDER BY completed_at DESC) AS rn,
+                ROW_NUMBER() OVER
+                  (PARTITION BY round(cpu_limit_cores) ORDER BY completed_at DESC) AS rn_c
+              FROM build_samples
+              WHERE pname = $1 AND system = $2 AND tenant = $3
+                AND NOT outlier_excluded
+            )
+            DELETE FROM build_samples
+            WHERE id IN (SELECT id FROM ranked WHERE rn > $4 AND rn_c > 1)
+            "#,
             pname,
             system,
             tenant,
@@ -329,12 +344,13 @@ impl SchedulerDb {
     }
 
     /// Batch [`Self::trim_build_samples`]: delete all but the `keep_n`
-    /// most-recent NON-OUTLIER rows for every `(pname, system,
-    /// tenant)` in the parallel arrays, in a single round-trip. Returns
-    /// total rows deleted across all keys. Same window-function shape
-    /// as [`Self::read_build_samples_for_keys`] — including the `NOT
-    /// outlier_excluded` filter, so outliers don't occupy ring slots
-    /// (they're age-swept by `delete_samples_older_than` instead).
+    /// most-recent NON-OUTLIER rows — plus one anchor per distinct
+    /// `round(cpu_limit_cores)` — for every `(pname, system, tenant)`
+    /// in the parallel arrays, in a single round-trip. Returns total
+    /// rows deleted across all keys. Same dual-window shape as the
+    /// single-key variant; same `NOT outlier_excluded` filter so
+    /// outliers don't occupy ring slots (they're age-swept by
+    /// `delete_samples_older_than` instead).
     pub async fn trim_build_samples_batch(
         &self,
         pnames: &[String],
@@ -350,15 +366,20 @@ impl SchedulerDb {
         let r = sqlx::query!(
             r#"
             WITH ranked AS (
-              SELECT id, ROW_NUMBER() OVER
-                (PARTITION BY pname, system, tenant ORDER BY completed_at DESC) AS rn
+              SELECT id,
+                ROW_NUMBER() OVER
+                  (PARTITION BY pname, system, tenant
+                   ORDER BY completed_at DESC) AS rn,
+                ROW_NUMBER() OVER
+                  (PARTITION BY pname, system, tenant, round(cpu_limit_cores)
+                   ORDER BY completed_at DESC) AS rn_c
               FROM build_samples
               WHERE (pname, system, tenant) IN
                 (SELECT * FROM unnest($1::text[], $2::text[], $3::text[]))
                 AND NOT outlier_excluded
             )
             DELETE FROM build_samples
-            WHERE id IN (SELECT id FROM ranked WHERE rn > $4)
+            WHERE id IN (SELECT id FROM ranked WHERE rn > $4 AND rn_c > 1)
             "#,
             pnames,
             systems,

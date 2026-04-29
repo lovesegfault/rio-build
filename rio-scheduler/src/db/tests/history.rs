@@ -388,6 +388,93 @@ async fn test_trim_build_samples_keeps_newest_n() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// F10: trim must preserve at least one row per distinct `cpu_limit`
+/// per key (the anchor invariant — same one [`AnchorRing`] enforces
+/// in-memory). Heavy churn at the converged c* otherwise pushes the
+/// lone widest-span explore row past `keep_n` and a cold-leader refit
+/// sees `span=1.0`.
+///
+/// 100 rows at c=4 (newest) + 1 row at c=32 (oldest). Trim to 10:
+/// recency-only would delete 91 incl. the c=32 row; with anchor
+/// preservation the c=32 row survives (rn_c=1) and 11 rows remain.
+///
+/// [`AnchorRing`]: crate::sla::ingest::AnchorRing
+#[tokio::test]
+async fn test_trim_build_samples_preserves_cpu_limit_anchors() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    // i=0: the lone c=32 explore row (oldest). i=1..=100: churn at c=4.
+    for i in 0..=100 {
+        let c = if i == 0 { 32.0 } else { 4.0 };
+        sqlx::query(
+            "INSERT INTO build_samples
+               (pname, system, tenant, duration_secs, peak_memory_bytes,
+                cpu_limit_cores, completed_at)
+             VALUES ('p', 'x86_64-linux', 't', 1.0, 0, $1, to_timestamp($2))",
+        )
+        .bind(c)
+        .bind(i as f64)
+        .execute(&test_db.pool)
+        .await?;
+    }
+
+    // Single-key.
+    let deleted = db.trim_build_samples("p", "x86_64-linux", "t", 10).await?;
+    assert_eq!(deleted, 90, "101 rows → 10 newest c=4 + 1 c=32 anchor kept");
+
+    let survivors: Vec<f64> = sqlx::query_scalar(
+        "SELECT cpu_limit_cores FROM build_samples
+         WHERE pname = 'p' ORDER BY cpu_limit_cores",
+    )
+    .fetch_all(&test_db.pool)
+    .await?;
+    assert_eq!(survivors.len(), 11, "10 recency + 1 anchor");
+    assert!(
+        survivors.contains(&32.0),
+        "c=32 anchor must survive trim; got {survivors:?}"
+    );
+    assert_eq!(
+        survivors.iter().filter(|&&c| c == 4.0).count(),
+        10,
+        "exactly keep_n=10 rows at the dominant c"
+    );
+
+    // Idempotent.
+    assert_eq!(
+        db.trim_build_samples("p", "x86_64-linux", "t", 10).await?,
+        0
+    );
+
+    // Batch variant: separate key, same shape.
+    for i in 0..=100 {
+        let c = if i == 0 { 32.0 } else { 4.0 };
+        sqlx::query(
+            "INSERT INTO build_samples
+               (pname, system, tenant, duration_secs, peak_memory_bytes,
+                cpu_limit_cores, completed_at)
+             VALUES ('q', 'x86_64-linux', 't', 1.0, 0, $1, to_timestamp($2))",
+        )
+        .bind(c)
+        .bind(i as f64)
+        .execute(&test_db.pool)
+        .await?;
+    }
+    let deleted = db
+        .trim_build_samples_batch(&["q".into()], &["x86_64-linux".into()], &["t".into()], 10)
+        .await?;
+    assert_eq!(deleted, 90);
+    let q_anchors: Vec<f64> = sqlx::query_scalar(
+        "SELECT DISTINCT cpu_limit_cores FROM build_samples
+         WHERE pname = 'q' ORDER BY cpu_limit_cores",
+    )
+    .fetch_all(&test_db.pool)
+    .await?;
+    assert_eq!(q_anchors, vec![4.0, 32.0], "batch trim: c=32 anchor kept");
+
+    Ok(())
+}
+
 /// `read_build_samples_for_key` filters on `tenant` — same `(pname,
 /// system)` under two tenants are distinct ModelKeys (ADR-023: a
 /// tenant's curve must never be polluted by another tenant's samples).
