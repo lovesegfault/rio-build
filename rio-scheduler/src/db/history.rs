@@ -193,6 +193,12 @@ impl SchedulerDb {
     /// completed_at DESC)`). The index sort matches the inner `ORDER BY
     /// DESC LIMIT`, so this is an index-only top-N; the outer reverse is
     /// in-memory on ≤`limit` rows.
+    ///
+    /// `rn <= limit OR rn_c = 1` mirrors [`Self::trim_build_samples`]'s
+    /// dual window so an anchor row preserved past `limit` by recency is
+    /// still loaded — bug_029: trim kept the anchor at `rn=limit+1` but
+    /// the recency-only `LIMIT` here skipped it, so cold-leader refit
+    /// saw `span=1.0` and collapsed to flat-median.
     pub async fn read_build_samples_for_key(
         &self,
         pname: &str,
@@ -200,7 +206,7 @@ impl SchedulerDb {
         tenant: &str,
         limit: u32,
     ) -> Result<Vec<BuildSampleRow>, sqlx::Error> {
-        let mut rows = sqlx::query_as!(
+        sqlx::query_as!(
             BuildSampleRow,
             r#"
             SELECT id, pname, system, tenant, duration_secs, peak_memory_bytes,
@@ -209,11 +215,18 @@ impl SchedulerDb {
                    node_name, enable_parallel_building, enable_parallel_checking,
                    prefer_local_build, is_fixed_output,
                    EXTRACT(EPOCH FROM completed_at)::float8 AS "completed_at!"
-            FROM build_samples
-            WHERE pname = $1 AND system = $2 AND tenant = $3
-              AND NOT outlier_excluded
-            ORDER BY completed_at DESC
-            LIMIT $4
+            FROM (
+              SELECT *,
+                ROW_NUMBER() OVER (ORDER BY completed_at DESC) AS rn,
+                ROW_NUMBER() OVER
+                  (PARTITION BY round(cpu_limit_cores)
+                   ORDER BY completed_at DESC) AS rn_c
+              FROM build_samples
+              WHERE pname = $1 AND system = $2 AND tenant = $3
+                AND NOT outlier_excluded
+            ) t
+            WHERE rn <= $4 OR rn_c = 1
+            ORDER BY completed_at ASC
             "#,
             pname,
             system,
@@ -221,9 +234,7 @@ impl SchedulerDb {
             limit as i64,
         )
         .fetch_all(&self.pool)
-        .await?;
-        rows.reverse();
-        Ok(rows)
+        .await
     }
 
     /// Per-key ring-buffer trim: delete all but the `keep_n` most-recent
@@ -322,14 +333,19 @@ impl SchedulerDb {
                    prefer_local_build, is_fixed_output,
                    EXTRACT(EPOCH FROM completed_at)::float8 AS "completed_at!"
             FROM (
-              SELECT *, ROW_NUMBER() OVER
-                (PARTITION BY pname, system, tenant ORDER BY completed_at DESC) AS rn
+              SELECT *,
+                ROW_NUMBER() OVER
+                  (PARTITION BY pname, system, tenant
+                   ORDER BY completed_at DESC) AS rn,
+                ROW_NUMBER() OVER
+                  (PARTITION BY pname, system, tenant, round(cpu_limit_cores)
+                   ORDER BY completed_at DESC) AS rn_c
               FROM build_samples
               WHERE (pname, system, tenant) IN
                 (SELECT * FROM unnest($1::text[], $2::text[], $3::text[]))
                 AND NOT outlier_excluded
             ) t
-            WHERE rn <= $4
+            WHERE rn <= $4 OR rn_c = 1
             ORDER BY pname, system, tenant, completed_at ASC
             "#,
             pnames,

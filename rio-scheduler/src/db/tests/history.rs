@@ -446,6 +446,30 @@ async fn test_trim_build_samples_preserves_cpu_limit_anchors() -> anyhow::Result
         0
     );
 
+    // bug_029 round-trip: the trim's anchor invariant is only useful if
+    // the cold-leader READ honours it too. Both reads are called with
+    // the same `ring_buffer` value (sla/mod.rs); a recency-only `LIMIT
+    // n` / `WHERE rn <= n` returns the 10 c=4 rows and skips the c=32
+    // anchor at rn=11, so refit sees span=1.0 — exactly the failure the
+    // doc above says trim prevents. Asserting via the actual read fns
+    // (NOT raw SELECT) is the §SCC(5) arm-coverage gate.
+    let read_single = db
+        .read_build_samples_for_key("p", "x86_64-linux", "t", 10)
+        .await?;
+    assert!(
+        read_single.iter().any(|r| r.cpu_limit_cores == Some(32.0)),
+        "single-key read must return the c=32 anchor (got {} rows, all c=4)",
+        read_single.len()
+    );
+    let read_batch = db
+        .read_build_samples_for_keys(&["p".into()], &["x86_64-linux".into()], &["t".into()], 10)
+        .await?;
+    assert!(
+        read_batch.iter().any(|r| r.cpu_limit_cores == Some(32.0)),
+        "batch read must return the c=32 anchor (got {} rows, all c=4)",
+        read_batch.len()
+    );
+
     // Batch variant: separate key, same shape.
     for i in 0..=100 {
         let c = if i == 0 { 32.0 } else { 4.0 };
