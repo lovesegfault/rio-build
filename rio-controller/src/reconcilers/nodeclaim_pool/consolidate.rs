@@ -7,7 +7,7 @@
 //! floored at `q_0.5(boot)/2` so a transient lull can't collapse to
 //! always-delete.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use kube::Api;
 use kube::api::DeleteParams;
@@ -205,11 +205,50 @@ pub async fn reap_idle(
             Err(e) => warn!(name = %n.name, error = %e, "idle NodeClaim delete failed; skipping"),
         }
     }
-    // TODO(B12): record uncensored events on idle→busy edge once
-    // `requested` is populated from real pod placement; until then all
-    // recorded events are censored (na_hazard=0 → consolidate_after =
-    // floor = boot_median/2, the conservative wait).
     Ok(())
+}
+
+/// Edge-detect idle→busy transitions and record them as uncensored
+/// [`IdleGapEvent`]s. `prev_idle` is the reconciler's running
+/// `name → idle_secs` map from the previous tick; a node present there
+/// whose `idle_secs` is now `None` (Karpenter `Empty=False`) OR whose
+/// `requested.0 > 0` (PodRequestedCache saw a binding before Karpenter
+/// flipped the condition) had an arrival — record `{prev_idle[name],
+/// censored:false}` to its cell. `prev_idle` is then refreshed to
+/// `idle_secs(now)` for nodes still idle and pruned of names absent
+/// from `live` (reaped/gone — `reap_idle` records the censored event).
+///
+/// Called from `reconcile_once` after `list_live_nodeclaims` (so
+/// `requested` is populated) and before `reap_idle`. Without this every
+/// `IdleGapEvent` is censored → `na_hazard=0` → `consolidate_after =
+/// boot_median/2` floor regardless of arrival rate.
+pub fn observe_idle_to_busy(
+    live: &[LiveNode],
+    prev_idle: &mut HashMap<String, f64>,
+    sketches: &mut CellSketches,
+    now_secs: f64,
+) {
+    let live_names: HashSet<&str> = live.iter().map(|n| n.name.as_str()).collect();
+    prev_idle.retain(|name, _| live_names.contains(name.as_str()));
+    for n in live {
+        let idle = n.idle_secs(now_secs);
+        let busy = idle.is_none() || n.requested.0 > 0;
+        if busy {
+            if let (Some(&gap), Some(cell)) = (prev_idle.get(&n.name), n.cell.as_ref()) {
+                push_idle_gap(
+                    sketches,
+                    cell,
+                    IdleGapEvent {
+                        gap_secs: gap,
+                        censored: false,
+                    },
+                );
+            }
+            prev_idle.remove(&n.name);
+        } else if let Some(idle) = idle {
+            prev_idle.insert(n.name.clone(), idle);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -361,6 +400,50 @@ mod tests {
         // Reserved (in placeable) → skipped regardless of idle.
         let reserved: HashSet<&str> = ["idle"].into();
         assert!(reserved.contains(idle_node.name.as_str()));
+    }
+
+    /// F8: a node idle 40s last tick, busy this tick (`requested.0>0`)
+    /// → uncensored `IdleGapEvent{40.0,false}` recorded; `prev_idle`
+    /// updated for nodes that stay idle; nodes gone from `live` evicted
+    /// from `prev_idle`.
+    #[test]
+    fn observe_idle_to_busy_pushes_uncensored() {
+        let mut sk = CellSketches::default();
+        let cell = Cell("h".into(), CapacityType::Spot);
+        let mut prev_idle: HashMap<String, f64> = [("a".into(), 40.0), ("b".into(), 15.0)].into();
+
+        // Tick: a now busy (requested=4c), b still idle (Empty=True at
+        // 1100, requested=0), c is new (idle since registered=1042).
+        let mut a = with_conds(
+            node("a", "h", CapacityType::Spot, 8, 0, 0),
+            &[("Registered", "True", 1042.0), ("Empty", "False", 1150.0)],
+        );
+        a.requested = (4, 0, 0);
+        let b = with_conds(
+            node("b", "h", CapacityType::Spot, 8, 0, 0),
+            &[("Registered", "True", 1042.0), ("Empty", "True", 1100.0)],
+        );
+        let c = with_conds(
+            node("c", "h", CapacityType::Spot, 8, 0, 0),
+            &[("Registered", "True", 1042.0)],
+        );
+        observe_idle_to_busy(&[a, b, c], &mut prev_idle, &mut sk, 1160.0);
+
+        let evs = &sk.get(&cell).unwrap().idle_gap_events;
+        assert_eq!(evs.len(), 1, "only a's idle→busy edge recorded");
+        assert!((evs[0].gap_secs - 40.0).abs() < 1e-9);
+        assert!(!evs[0].censored, "uncensored");
+        // prev_idle: a evicted (busy), b updated to 60s, c added at 118s.
+        assert!(!prev_idle.contains_key("a"));
+        assert!((prev_idle["b"] - 60.0).abs() < 1e-9);
+        assert!((prev_idle["c"] - 118.0).abs() < 1e-9);
+
+        // Next tick: b reaped (gone from live). prev_idle prunes b
+        // without recording an uncensored event (reap_idle records the
+        // censored one).
+        observe_idle_to_busy(&[], &mut prev_idle, &mut sk, 1170.0);
+        assert!(prev_idle.is_empty());
+        assert_eq!(sk.get(&cell).unwrap().idle_gap_events.len(), 1);
     }
 
     /// Hold-open annotation → threshold = max_consolidation_time

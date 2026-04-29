@@ -345,6 +345,11 @@ pub struct NodeClaimPoolReconciler {
     /// tick. In-memory only — a restart re-records the live set's boot
     /// times once (a few duplicate samples in a DDSketch is harmless).
     recorded_boot: HashSet<String>,
+    /// `name → idle_secs` from the previous tick. Edge-detector state
+    /// for [`consolidate::observe_idle_to_busy`]: a node idle last tick
+    /// and busy this tick records an uncensored `IdleGapEvent`.
+    /// In-memory only — restart drops one tick's worth of edges.
+    prev_idle: HashMap<String, f64>,
     /// `name → cell` for NodeClaims `cover_deficit` created and that
     /// haven't yet appeared `Registered`/reaped. Next-tick diff against
     /// `live`: a name in here but absent from `live` ⇒ Karpenter GC'd
@@ -403,6 +408,7 @@ impl NodeClaimPoolReconciler {
             placeable_tx,
             sketches,
             recorded_boot: HashSet::new(),
+            prev_idle: HashMap::new(),
             inflight_created: HashMap::new(),
             consecutive_bot_ticks: 0,
             tick_counter: 0,
@@ -478,6 +484,11 @@ impl NodeClaimPoolReconciler {
         self.consecutive_bot_ticks = 0;
 
         let live = self.list_live_nodeclaims().await?;
+        let now = now_epoch();
+        // Uncensored idle→busy edges: AFTER `requested` is populated
+        // (list_live_nodeclaims), BEFORE reap_idle records the
+        // censored half.
+        consolidate::observe_idle_to_busy(&live, &mut self.prev_idle, &mut self.sketches, now);
 
         // r[ctrl.nodeclaim.lead-time-ddsketch]: record boot times on
         // Registered=True edges, then rotate any cells past halflife.
@@ -524,7 +535,6 @@ impl NodeClaimPoolReconciler {
         self.placeable_tx
             .send_replace(Some(Arc::new(on_registered)));
 
-        let now = now_epoch();
         // Reap unhealthy/ICE BEFORE cover_deficit so cells that just
         // hit ICE this tick are masked in the same tick's cover (don't
         // immediately re-create what we just deleted). `reap_unhealthy`
@@ -575,6 +585,7 @@ impl NodeClaimPoolReconciler {
         );
         let live = self.list_live_nodeclaims().await?;
         let now = now_epoch();
+        consolidate::observe_idle_to_busy(&live, &mut self.prev_idle, &mut self.sketches, now);
         consolidate::reap_idle(
             &self.nodeclaims,
             &live,
