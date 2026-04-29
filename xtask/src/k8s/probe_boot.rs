@@ -16,20 +16,27 @@
 //! Output: per-cell boot seconds + a YAML block ready for
 //! `infra/helm/rio-build/values.yaml` `sla.leadTimeSeed:`.
 //!
+//! Probe NodeClaims are built from `HwClassDef.requirements` (the same
+//! `[sla.hw_classes.$h].requirements` that `cover_deficit` reads) — NOT
+//! from NodePool templates. With `nodeclaimPool.enabled=true` the 12
+//! band-loop NodePools no longer exist; the hw-class config is the
+//! single source of truth for instance-type constraints in both
+//! provisioning modes.
+//!
 //! EKS-only, operator-run; NOT a CI test. The shim NodePool is
 //! pre-created here (idempotent) so the probe is runnable before B3
 //! helm-manages it — without it, Karpenter parks naked NodeClaims at
 //! `AwaitingReconciliation` because the `karpenter.sh/nodepool` label
 //! references a NodePool that doesn't exist.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use ::kube::api::{Api, DeleteParams, ListParams, PostParams};
 use ::kube::core::DynamicObject;
 use anyhow::{Context, Result, bail, ensure};
 use k8s_openapi::api::core::v1::{ConfigMap, Node};
-use rio_scheduler::sla::config::{CapacityType, Cell, HwClassDef, SlaConfig};
+use rio_scheduler::sla::config::{CapacityType, Cell, HwClassDef, NodeSelectorReq, SlaConfig};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
@@ -80,34 +87,10 @@ pub async fn run() -> Result<()> {
 
     ensure_shim_nodepool(&kube, node_class).await?;
 
-    // Snapshot all NodePools' template-labels + template-requirements so
-    // each hw-class can be resolved to the NodePool that would actually
-    // serve it. The hw-class's `labels` are NODE labels a NodePool STAMPS
-    // (template.metadata.labels), not instance-type selectors — putting
-    // them in `requirements` constrains nothing and Karpenter picks the
-    // cheapest instance (t3.nano) which then can't register.
-    let pool_templates = list_pool_templates(&kube).await?;
-
-    // Expand cells × matching-NodePools so each arch is probed
-    // separately. Previously `resolve_pool` picked the first name-sorted
-    // match (always `*-aarch64`), so x86 boot times were never measured
-    // and we had no data on whether arch affects boot.
-    let mut probes: Vec<(Cell, &PoolTemplate, String)> = Vec::new();
-    let mut arches: BTreeSet<String> = BTreeSet::new();
-    for cell in &cells {
-        let def = &sla.hw_classes[&cell.0];
-        for pool in resolve_pools(&pool_templates, &cell.0, def)? {
-            let arch = pool_arch(pool);
-            arches.insert(arch.clone());
-            probes.push((cell.clone(), pool, arch));
-        }
-    }
-    info!(
-        "probing {} cell(s) × {} arch(es) = {} NodeClaims",
-        cells.len(),
-        arches.len(),
-        probes.len(),
-    );
+    // `instance-size NotIn [metal, …]` — same exclusion `cover_deficit`
+    // appends. Read from the deployed controller config so the probe
+    // launches the same hardware the §13b controller will.
+    let metal_sizes = load_metal_sizes(&kube).await?;
 
     let claims = nodeclaim_api(&kube);
     let nodes: Api<Node> = Api::all(kube.clone());
@@ -115,8 +98,8 @@ pub async fn run() -> Result<()> {
     let mut results: Vec<ProbeResult> = Vec::new();
 
     let result: Result<()> = async {
-        // Drive every (cell, pool) to Registered, collecting boot times.
-        // The last claim is held for assertions 4+5 instead of being
+        // Drive every cell to Registered, collecting boot times. The
+        // last claim is held for assertions 4+5 instead of being
         // deleted in-loop.
         //
         // Serial (one NodeClaim at a time, ≤300s each) is intentional
@@ -125,16 +108,25 @@ pub async fn run() -> Result<()> {
         // `--parallel` flag for re-runs is a follow-up.
         // TODO: `--parallel` re-probe — fan out cells via join_all once
         // the first serial run has populated leadTimeSeed.
-        let last = probes.len() - 1;
+        let last = cells.len() - 1;
         let mut last_claim: Option<String> = None;
-        for (i, (cell, pool, arch)) in probes.iter().enumerate() {
-            let key = format!("{}:{arch}", cell_key(cell));
-            info!(
-                "  [{key}] resolved NodePool={}, requirements=[{}]",
-                pool.name,
-                fmt_requirements(&pool.requirements),
+        for (i, cell) in cells.iter().enumerate() {
+            let def = &sla.hw_classes[&cell.0];
+            ensure!(
+                !def.requirements.is_empty(),
+                "hw-class {:?} has no `requirements` — populate \
+                 `scheduler.sla.hwClasses.{}.requirements` (instance-category/\
+                 generation/arch) and `up --deploy`.",
+                cell.0,
+                cell.0,
             );
-            let nc = mk_probe_nodeclaim(cell, pool, node_class);
+            let arch = def_arch(def);
+            let key = cell_key(cell);
+            info!(
+                "  [{key}] arch={arch}, requirements=[{}]",
+                fmt_requirements(&def.requirements),
+            );
+            let nc = mk_probe_nodeclaim(cell, def, &metal_sizes, node_class);
             let start = jiff::Timestamp::now();
             let obj = claims
                 .create(&PostParams::default(), &nc)
@@ -199,8 +191,7 @@ pub async fn run() -> Result<()> {
             results.push(ProbeResult {
                 hw_class: cell.0.clone(),
                 cap: cell.1,
-                arch: arch.clone(),
-                pool: pool.name.clone(),
+                arch,
                 instance_type,
                 boot_secs: boot,
             });
@@ -325,13 +316,14 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-/// One (hw_class, cap, arch) probe observation.
+/// One (hw_class, cap) probe observation. `arch` is derived from the
+/// hw-class's `kubernetes.io/arch` requirement (display only — each
+/// hw-class IS one arch in the 12-class config).
 #[derive(Debug)]
 struct ProbeResult {
     hw_class: String,
     cap: CapacityType,
     arch: String,
-    pool: String,
     instance_type: String,
     boot_secs: f64,
 }
@@ -429,6 +421,35 @@ async fn load_sla_config(client: &kube::Client) -> Result<SlaConfig> {
         .context("deserialize [sla] as SlaConfig — schema drift between chart and rio-scheduler?")
 }
 
+/// Read `[nodeclaim_pool].metal_sizes` from the live
+/// `rio-controller-config` ConfigMap — the same list `cover_deficit`
+/// appends as `instance-size NotIn […]`. Missing ConfigMap / table /
+/// key → empty (no metal exclusion); the probe carries no resource
+/// requests, so Karpenter picks the smallest match anyway.
+async fn load_metal_sizes(client: &kube::Client) -> Result<Vec<String>> {
+    let api: Api<ConfigMap> = Api::namespaced(client.clone(), NS);
+    let Some(cm) = api.get_opt("rio-controller-config").await? else {
+        warn!("rio-controller-config ConfigMap absent — no metal-size exclusion");
+        return Ok(Vec::new());
+    };
+    let body = cm
+        .data
+        .and_then(|d| d.get("controller.toml").cloned())
+        .context("rio-controller-config missing key `controller.toml`")?;
+    let v: toml::Value = toml::from_str(&body)
+        .with_context(|| format!("parse controller.toml from ConfigMap:\n{body}"))?;
+    Ok(v.get("nodeclaim_pool")
+        .and_then(|t| t.get("metal_sizes"))
+        .and_then(toml::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 /// `hw_classes × {spot,od}`. Sorted so output is stable across runs.
 fn cells(sla: &SlaConfig) -> Vec<Cell> {
     let mut hs: Vec<_> = sla.hw_classes.keys().cloned().collect();
@@ -448,161 +469,70 @@ fn cell_key((h, c): &Cell) -> String {
     format!("{h}:{cap}")
 }
 
-/// One NodePool's template surface, extracted for the hw-class →
-/// NodePool resolver.
-#[derive(Debug, Clone)]
-struct PoolTemplate {
-    name: String,
-    /// `spec.template.metadata.labels` — labels Karpenter STAMPS onto
-    /// nodes this pool launches (e.g. `rio.build/hw-band`,
-    /// `rio.build/storage`). These are what hw-class `labels` match.
-    stamps: BTreeMap<String, String>,
-    /// `spec.template.spec.requirements` — instance-type selectors
-    /// (e.g. `instance-category In [c,m,r]`). These are what a
-    /// NodeClaim needs to actually constrain the launch.
-    requirements: Vec<Value>,
-}
-
-/// List every NodePool's template-labels + template-requirements.
-/// Sorted by name so [`resolve_pools`] returns a stable order when
-/// multiple pools stamp the same labels (e.g. x86 + arm64 variants of
-/// the same band/storage).
-async fn list_pool_templates(client: &kube::Client) -> Result<Vec<PoolTemplate>> {
-    let pools = nodepool_api(client);
-    let mut out: Vec<PoolTemplate> = pools
-        .list(&ListParams::default())
-        .await
-        .context("list NodePools (Karpenter CRD installed?)")?
-        .into_iter()
-        .filter_map(|np| {
-            let name = np.metadata.name?;
-            let stamps = np
-                .data
-                .pointer("/spec/template/metadata/labels")
-                .and_then(Value::as_object)
-                .map(|o| {
-                    o.iter()
-                        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let requirements = np
-                .data
-                .pointer("/spec/template/spec/requirements")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            Some(PoolTemplate {
-                name,
-                stamps,
-                requirements,
-            })
-        })
-        .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(out)
-}
-
-/// Find ALL NodePools whose `template.metadata.labels` ⊇ the
-/// hw-class's `labels` (every `{key,value}` in `def.labels` is stamped
-/// by the pool). The match is on STAMPED labels because that's what an
-/// hw-class is: "a node carrying these labels". Each matched pool's
-/// `template.spec.requirements` are the instance-type constraints a
-/// probe NodeClaim must carry to launch that hardware.
-///
-/// Returns every match (sorted by name via [`list_pool_templates`]) so
-/// both `…-aarch64` and `…-x86` variants of the same band/storage get
-/// probed — arch may affect boot time and the previous first-match-only
-/// behaviour silently picked `…-aarch64` (alphabetical) and never
-/// measured x86.
-fn resolve_pools<'a>(
-    pools: &'a [PoolTemplate],
-    h: &str,
-    def: &HwClassDef,
-) -> Result<Vec<&'a PoolTemplate>> {
-    let matched: Vec<&PoolTemplate> = pools
+/// Extract arch from an hw-class's `kubernetes.io/arch In […]`
+/// requirement (display only). `?` if absent — `SlaConfig::validate`
+/// doesn't mandate it, but every 12-class entry carries one.
+fn def_arch(def: &HwClassDef) -> String {
+    def.requirements
         .iter()
-        .filter(|p| {
-            def.labels
-                .iter()
-                .all(|m| p.stamps.get(&m.key).map(String::as_str) == Some(&m.value))
-        })
-        .collect();
-    if matched.is_empty() {
-        let labels: Vec<String> = def
-            .labels
-            .iter()
-            .map(|m| format!("{}={}", m.key, m.value))
-            .collect();
-        bail!(
-            "hw-class {h:?} labels {labels:?} match no NodePool's template.metadata.labels — \
-             check that scheduler.sla.hwClasses keys on labels a builder NodePool actually \
-             stamps (e.g. rio.build/hw-band, rio.build/storage)"
-        );
-    }
-    Ok(matched)
-}
-
-/// Extract arch from a NodePool: prefer the `kubernetes.io/arch In
-/// [...]` requirement value (what Karpenter actually constrains on),
-/// fall back to the pool-name suffix (`-aarch64` / `-x86`), else `?`.
-fn pool_arch(pool: &PoolTemplate) -> String {
-    pool.requirements
-        .iter()
-        .find(|r| r.get("key").and_then(Value::as_str) == Some("kubernetes.io/arch"))
-        .and_then(|r| r.get("values")?.as_array()?.first()?.as_str())
-        .map(str::to_string)
-        .or_else(|| {
-            ["aarch64", "x86"]
-                .into_iter()
-                .find(|a| pool.name.ends_with(&format!("-{a}")))
-                .map(str::to_string)
-        })
+        .find(|r| r.key == "kubernetes.io/arch")
+        .and_then(|r| r.values.first())
+        .cloned()
         .unwrap_or_else(|| "?".into())
 }
 
-/// Compact one-line summary of a requirements array for the resolver
+/// Compact one-line summary of a requirements array for the per-cell
 /// log line: `instance-category In [c,m,r], instance-generation In [6], …`.
-fn fmt_requirements(reqs: &[Value]) -> String {
+fn fmt_requirements(reqs: &[NodeSelectorReq]) -> String {
     reqs.iter()
-        .filter_map(|r| {
-            let key = r.get("key")?.as_str()?;
-            let key = key.rsplit_once('/').map_or(key, |(_, k)| k);
-            let op = r.get("operator")?.as_str()?;
-            let vals: Vec<&str> = r
-                .get("values")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .collect();
-            Some(format!("{key} {op} [{}]", vals.join(",")))
+        .map(|r| {
+            let key = r.key.rsplit_once('/').map_or(r.key.as_str(), |(_, k)| k);
+            format!("{key} {} [{}]", r.operator, r.values.join(","))
         })
         .collect::<Vec<_>>()
         .join(", ")
 }
 
 /// Build a naked probe NodeClaim mirroring what the §13b controller
-/// will emit: `karpenter.sh/nodepool` shim label + `rio.build/*`
-/// labels, EC2NodeClass ref, the resolved NodePool's instance-type
-/// requirements + capacity-type narrowing, NO `ownerReferences`.
-/// `generateName` so re-runs don't conflict.
+/// emits (`cover_deficit`'s `build_nodeclaim`): `karpenter.sh/nodepool`
+/// shim label + the hw-class's `labels`, EC2NodeClass ref, the
+/// hw-class's `requirements` + capacity-type + metal-size NotIn, NO
+/// `ownerReferences`. `generateName` so re-runs don't conflict.
 ///
-/// `metadata.labels` carries the matched NodePool's template-labels
-/// (so the launched Node has `rio.build/hw-band`/`storage` and
-/// assertion 4 checks something real) plus the shim/probe/hw-class
-/// markers.
-fn mk_probe_nodeclaim(cell: &Cell, pool: &PoolTemplate, node_class: &str) -> DynamicObject {
+/// `metadata.labels` carries `def.labels` (so the launched Node has
+/// `rio.build/hw-band`/`storage` and assertion 4 checks something
+/// real) plus the shim/probe/hw-class markers. `spec.requirements`
+/// carries ONLY instance-type-discovery labels — `def.requirements` is
+/// validated by `SlaConfig::validate` to exclude `rio.build/*`.
+fn mk_probe_nodeclaim(
+    cell: &Cell,
+    def: &HwClassDef,
+    metal_sizes: &[String],
+    node_class: &str,
+) -> DynamicObject {
     let (h, cap) = cell;
-    let mut reqs = pool.requirements.clone();
-    // The NodePool's own capacity-type req is `In [spot, on-demand]`;
-    // requirements AND, so appending the cell's narrows correctly.
+    let mut reqs: Vec<Value> = def
+        .requirements
+        .iter()
+        .map(|r| json!({"key": r.key, "operator": r.operator, "values": r.values}))
+        .collect();
     reqs.push(json!({
         "key": "karpenter.sh/capacity-type",
         "operator": "In",
         "values": [cap.label()],
     }));
-    let mut labels = pool.stamps.clone();
+    if !metal_sizes.is_empty() {
+        reqs.push(json!({
+            "key": "karpenter.k8s.aws/instance-size",
+            "operator": "NotIn",
+            "values": metal_sizes,
+        }));
+    }
+    let mut labels: BTreeMap<String, String> = def
+        .labels
+        .iter()
+        .map(|m| (m.key.clone(), m.value.clone()))
+        .collect();
     labels.insert("karpenter.sh/nodepool".into(), SHIM_NODEPOOL.into());
     labels.insert(PROBE_LABEL.into(), "true".into());
     labels.insert("rio.build/hw-class".into(), h.clone());
@@ -692,53 +622,34 @@ fn find_condition(nc: &DynamicObject, cond: &str) -> Option<Value> {
 }
 
 fn print_results(results: &mut [ProbeResult]) {
-    results.sort_by(|a, b| {
-        (&a.hw_class, a.cap.label(), &a.arch).cmp(&(&b.hw_class, b.cap.label(), &b.arch))
-    });
+    results.sort_by(|a, b| (&a.hw_class, a.cap.label()).cmp(&(&b.hw_class, b.cap.label())));
 
     println!("\nall 5 conformance assertions PASS\n");
     println!(
-        "{:<18} {:<5} {:<8} {:<28} {:<16} {:>10}",
-        "hw-class", "cap", "arch", "pool", "instance-type", "boot-secs"
+        "{:<18} {:<5} {:<8} {:<16} {:>10}",
+        "hw-class", "cap", "arch", "instance-type", "boot-secs"
     );
-    println!(
-        "{:-<18} {:-<5} {:-<8} {:-<28} {:-<16} {:->10}",
-        "", "", "", "", "", ""
-    );
+    println!("{:-<18} {:-<5} {:-<8} {:-<16} {:->10}", "", "", "", "", "");
     for r in results.iter() {
         println!(
-            "{:<18} {:<5} {:<8} {:<28} {:<16} {:>10.1}",
+            "{:<18} {:<5} {:<8} {:<16} {:>10.1}",
             r.hw_class,
             r.cap.label(),
             r.arch,
-            r.pool,
             r.instance_type,
             r.boot_secs,
         );
     }
 
-    // leadTimeSeed: max boot per cell. With arch in the hw-class label
-    // conjunction (12 keys), resolve_pools() returns a single pool per
-    // hw-class and the max-fold here is the identity. Kept as a
-    // structural guard for future multi-match conjunctions.
-    let mut seeds: BTreeMap<String, f64> = BTreeMap::new();
-    for r in results.iter() {
-        let key = cell_key(&(r.hw_class.clone(), r.cap));
-        let slot = seeds.entry(key).or_insert(0.0);
-        *slot = slot.max(r.boot_secs);
-    }
+    // leadTimeSeed keyed cleanly per (hw-class, cap) — one observation
+    // per cell, no per-arch fold needed (each hw-class IS one arch).
     println!(
         "\n# paste into infra/helm/rio-build/values.yaml scheduler.sla.leadTimeSeed:\n\
-         # with arch in hw-class, each cell resolves one pool (24 entries).\n\
          leadTimeSeed:"
     );
-    for (cell, boot) in &seeds {
-        println!("  {cell:?}: {boot:.1}");
-    }
-    println!("# per-pool breakdown:");
     for r in results.iter() {
         let key = cell_key(&(r.hw_class.clone(), r.cap));
-        println!("#   \"{key}:{}\": {:.1}", r.arch, r.boot_secs);
+        println!("  {key:?}: {:.1}", r.boot_secs);
     }
 }
 
@@ -747,18 +658,15 @@ mod tests {
     use super::*;
     use rio_scheduler::sla::config::NodeLabelMatch;
 
-    fn mk_pool(name: &str, stamps: &[(&str, &str)], reqs: Value) -> PoolTemplate {
-        PoolTemplate {
-            name: name.into(),
-            stamps: stamps
-                .iter()
-                .map(|(k, v)| ((*k).into(), (*v).into()))
-                .collect(),
-            requirements: reqs.as_array().cloned().unwrap_or_default(),
+    fn req(key: &str, op: &str, values: &[&str]) -> NodeSelectorReq {
+        NodeSelectorReq {
+            key: key.into(),
+            operator: op.into(),
+            values: values.iter().map(|s| (*s).into()).collect(),
         }
     }
 
-    fn hw_class(labels: &[(&str, &str)]) -> HwClassDef {
+    fn hw_class(labels: &[(&str, &str)], requirements: Vec<NodeSelectorReq>) -> HwClassDef {
         HwClassDef {
             labels: labels
                 .iter()
@@ -767,157 +675,46 @@ mod tests {
                     value: (*v).into(),
                 })
                 .collect(),
-            requirements: vec![],
+            requirements,
         }
     }
 
     #[test]
-    fn resolve_pools_matches_stamped_labels() {
-        // Two pools: one stamps {hw-band:lo, storage:ebs} with real
-        // instance-type reqs; one stamps {hw-band:hi}. gen6-ebs-lo's
-        // hw-class labels must resolve to the first only.
-        let pools = vec![
-            mk_pool(
-                "rio-builder-hi-nvme-x86",
-                &[("rio.build/hw-band", "hi"), ("rio.build/storage", "nvme")],
-                json!([{"key": "karpenter.k8s.aws/instance-generation",
-                        "operator": "In", "values": ["7"]}]),
-            ),
-            mk_pool(
-                "rio-builder-lo-ebs-x86",
-                &[
-                    ("rio.build/hw-band", "lo"),
-                    ("rio.build/storage", "ebs"),
-                    ("rio.build/node-role", "builder"),
-                ],
-                json!([
-                    {"key": "karpenter.k8s.aws/instance-category",
-                     "operator": "In", "values": ["c","m","r"]},
-                    {"key": "karpenter.k8s.aws/instance-generation",
-                     "operator": "In", "values": ["6"]},
-                ]),
-            ),
-        ];
-        let def = hw_class(&[("rio.build/hw-band", "lo"), ("rio.build/storage", "ebs")]);
-        let ps = resolve_pools(&pools, "gen6-ebs-lo", &def).unwrap();
-        assert_eq!(ps.len(), 1);
-        assert_eq!(ps[0].name, "rio-builder-lo-ebs-x86");
-        assert_eq!(ps[0].requirements.len(), 2);
-        // Superset OK: pool stamps node-role too, hw-class doesn't ask.
-        assert_eq!(ps[0].stamps.len(), 3);
-
-        // Unmatched hw-class bails with the actionable message.
-        let bad = hw_class(&[("rio.build/hw-band", "mid")]);
-        let err = resolve_pools(&pools, "mid-ebs", &bad)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("mid-ebs"), "{err}");
-        assert!(
-            err.contains("match no NodePool's template.metadata.labels"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn resolve_pools_returns_all_matches() {
-        // x86 and arm64 variants stamp identical band/storage labels.
-        // Resolver must return BOTH (sorted), and pool_arch must
-        // identify each.
-        let mut pools = vec![
-            mk_pool(
-                "rio-builder-lo-ebs-x86",
-                &[("rio.build/hw-band", "lo"), ("rio.build/storage", "ebs")],
-                json!([{"key": "kubernetes.io/arch", "operator": "In",
-                        "values": ["amd64"]}]),
-            ),
-            mk_pool(
-                "rio-builder-lo-ebs-aarch64",
-                &[("rio.build/hw-band", "lo"), ("rio.build/storage", "ebs")],
-                json!([{"key": "kubernetes.io/arch", "operator": "In",
-                        "values": ["arm64"]}]),
-            ),
-        ];
-        pools.sort_by(|a, b| a.name.cmp(&b.name));
-        let def = hw_class(&[("rio.build/hw-band", "lo"), ("rio.build/storage", "ebs")]);
-        let ps = resolve_pools(&pools, "gen6-ebs-lo", &def).unwrap();
-        assert_eq!(
-            ps.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
-            ["rio-builder-lo-ebs-aarch64", "rio-builder-lo-ebs-x86"]
-        );
-        assert_eq!(pool_arch(ps[0]), "arm64");
-        assert_eq!(pool_arch(ps[1]), "amd64");
-    }
-
-    #[test]
-    fn pool_arch_fallback_to_name_suffix() {
-        // No kubernetes.io/arch req → fall back to name suffix.
-        let p = mk_pool(
-            "rio-builder-lo-ebs-aarch64",
+    fn def_arch_reads_kubernetes_io_arch() {
+        let def = hw_class(
             &[],
-            json!([{"key": "karpenter.k8s.aws/instance-category",
-                    "operator": "In", "values": ["c"]}]),
+            vec![
+                req("karpenter.k8s.aws/instance-category", "In", &["c"]),
+                req("kubernetes.io/arch", "In", &["arm64"]),
+            ],
         );
-        assert_eq!(pool_arch(&p), "aarch64");
-        let p = mk_pool("rio-builder-lo-ebs-x86", &[], json!([]));
-        assert_eq!(pool_arch(&p), "x86");
-        // Neither → "?".
-        let p = mk_pool("rio-nodeclaim-shim", &[], json!([]));
-        assert_eq!(pool_arch(&p), "?");
-    }
-
-    #[test]
-    fn print_results_seeds_max_across_arches() {
-        // Two arches for one cell; leadTimeSeed must use the max.
-        let mut rs = vec![
-            ProbeResult {
-                hw_class: "lo".into(),
-                cap: CapacityType::Spot,
-                arch: "amd64".into(),
-                pool: "p-x86".into(),
-                instance_type: "c6a.large".into(),
-                boot_secs: 80.0,
-            },
-            ProbeResult {
-                hw_class: "lo".into(),
-                cap: CapacityType::Spot,
-                arch: "arm64".into(),
-                pool: "p-aarch64".into(),
-                instance_type: "c6g.large".into(),
-                boot_secs: 95.0,
-            },
-        ];
-        // Sort order: (hw_class, cap, arch) — amd64 before arm64.
-        rs.sort_by(|a, b| {
-            (&a.hw_class, a.cap.label(), &a.arch).cmp(&(&b.hw_class, b.cap.label(), &b.arch))
-        });
-        assert_eq!(rs[0].arch, "amd64");
-        // Max-across-arches reduction (mirrors print_results body).
-        let mut seeds: BTreeMap<String, f64> = BTreeMap::new();
-        for r in &rs {
-            let key = cell_key(&(r.hw_class.clone(), r.cap));
-            let slot = seeds.entry(key).or_insert(0.0);
-            *slot = slot.max(r.boot_secs);
-        }
-        assert_eq!(seeds["lo:spot"], 95.0);
+        assert_eq!(def_arch(&def), "arm64");
+        // No arch requirement → "?".
+        let def = hw_class(&[], vec![req("k", "In", &["v"])]);
+        assert_eq!(def_arch(&def), "?");
     }
 
     #[test]
     fn probe_nodeclaim_shape() {
-        let pool = mk_pool(
-            "rio-builder-lo-ebs-x86",
+        let def = hw_class(
             &[
                 ("rio.build/hw-band", "lo"),
                 ("rio.build/storage", "ebs"),
-                ("rio.build/node-role", "builder"),
+                ("kubernetes.io/arch", "amd64"),
             ],
-            json!([
-                {"key": "karpenter.k8s.aws/instance-category",
-                 "operator": "In", "values": ["c","m","r"]},
-                {"key": "kubernetes.io/arch", "operator": "In", "values": ["amd64"]},
-            ]),
+            vec![
+                req(
+                    "karpenter.k8s.aws/instance-category",
+                    "In",
+                    &["c", "m", "r"],
+                ),
+                req("karpenter.k8s.aws/instance-generation", "In", &["6"]),
+                req("kubernetes.io/arch", "In", &["amd64"]),
+            ],
         );
-        let cell = ("gen6-ebs-lo".into(), CapacityType::Spot);
-        let nc = mk_probe_nodeclaim(&cell, &pool, "rio-nvme");
+        let cell = ("lo-ebs-x86".into(), CapacityType::Spot);
+        let metal = vec!["metal".into(), "metal-24xl".into()];
+        let nc = mk_probe_nodeclaim(&cell, &def, &metal, "rio-nvme");
         let v = serde_json::to_value(&nc).unwrap();
 
         // Assertion 1 prerequisite: no ownerReferences emitted.
@@ -940,14 +737,14 @@ mod tests {
             .and_then(Value::as_str),
             Some("true")
         );
-        // Matched NodePool's template-labels propagated so the Node
-        // carries rio.build/hw-band and assertion 4 checks reality.
+        // hw-class def.labels propagated so the Node carries
+        // rio.build/hw-band and assertion 4 checks reality.
         assert_eq!(
             v.pointer("/metadata/labels/rio.build~1hw-band")
                 .and_then(Value::as_str),
             Some("lo")
         );
-        // Requirements are the NodePool's instance-type filters, NOT
+        // Requirements are the hw-class's instance-type filters, NOT
         // rio.build/* node-label matches (the bug: those constrain
         // nothing → t3.nano).
         let reqs = v.pointer("/spec/requirements").unwrap().as_array().unwrap();
@@ -955,6 +752,16 @@ mod tests {
             reqs.iter()
                 .any(|r| r["key"] == "karpenter.k8s.aws/instance-category"
                     && r["values"].as_array().unwrap().len() == 3),
+            "{reqs:?}"
+        );
+        assert!(
+            reqs.iter()
+                .any(|r| r["key"] == "karpenter.k8s.aws/instance-generation"),
+            "{reqs:?}"
+        );
+        assert!(
+            reqs.iter()
+                .any(|r| r["key"] == "kubernetes.io/arch" && r["values"][0] == "amd64"),
             "{reqs:?}"
         );
         assert!(
@@ -968,9 +775,28 @@ mod tests {
             reqs.iter()
                 .any(|r| r["key"] == "karpenter.sh/capacity-type" && r["values"][0] == "spot")
         );
+        // metal-size NotIn appended (same as cover_deficit).
+        assert!(
+            reqs.iter()
+                .any(|r| r["key"] == "karpenter.k8s.aws/instance-size"
+                    && r["operator"] == "NotIn"
+                    && r["values"].as_array().unwrap().len() == 2),
+            "{reqs:?}"
+        );
         assert_eq!(
             v.pointer("/spec/nodeClassRef/name").and_then(Value::as_str),
             Some("rio-nvme")
+        );
+
+        // Empty metal_sizes → no instance-size requirement.
+        let nc = mk_probe_nodeclaim(&cell, &def, &[], "rio-nvme");
+        let v = serde_json::to_value(&nc).unwrap();
+        let reqs = v.pointer("/spec/requirements").unwrap().as_array().unwrap();
+        assert!(
+            !reqs
+                .iter()
+                .any(|r| r["key"] == "karpenter.k8s.aws/instance-size"),
+            "{reqs:?}"
         );
     }
 
