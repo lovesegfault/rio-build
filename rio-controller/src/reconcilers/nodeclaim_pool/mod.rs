@@ -81,6 +81,15 @@ fn now_epoch() -> f64 {
 /// touch claims from the rio-general / fetcher pools.
 pub const OWNER_LABEL: &str = "rio.build/nodeclaim-pool=builder";
 
+/// `rio.build/node-role` label key/value stamped on every rio-minted
+/// builder NodeClaim. The legacy band-loop NodePool template stamped
+/// this; B3 deleted those NodePools, and builder pod affinity still
+/// requires `node-role In [builder]` (helm `builder.nodeSelector`), so
+/// `cover::build_nodeclaim` must stamp it directly. Fetcher nodes still
+/// come from the helm `rio-fetcher` NodePool template (which stamps
+/// `node-role: fetcher` itself) — this reconciler is builder-only.
+pub const NODE_ROLE_LABEL: (&str, &str) = ("rio.build/node-role", "builder");
+
 /// `intent_id` set FFD-placed on a `Registered=True` NodeClaim. `None`
 /// = no FFD tick has published yet (first ~10s after start, or standby
 /// replica whose lease-gated reconciler never runs).

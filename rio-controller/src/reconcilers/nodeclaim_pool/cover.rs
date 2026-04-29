@@ -167,7 +167,9 @@ pub fn claim_count(sum_c: u32, max_node_cores: u32, per_tick_cap: u32, budget: u
 ///   instance-type properties) PLUS [`HW_CLASS_LABEL`] +
 ///   [`CAPACITY_TYPE_LABEL`] (so [`super::ffd::LiveNode::from`]
 ///   recovers `cell` next tick), [`NODEPOOL_LABEL`] =
-///   [`SHIM_NODEPOOL`] (Karpenter state-tracking), and the
+///   [`SHIM_NODEPOOL`] (Karpenter state-tracking),
+///   [`super::NODE_ROLE_LABEL`] = `builder` (builder pod affinity
+///   requires it; the legacy band-loop NodePool stamped it), and the
 ///   [`super::OWNER_LABEL`] selector.
 /// - `spec.requirements`: ONLY labels Karpenter's instance-type
 ///   discovery knows — the hw-class's `requirements`
@@ -196,6 +198,7 @@ pub fn build_nodeclaim(
     let (owner_k, owner_v) = super::OWNER_LABEL
         .split_once('=')
         .expect("OWNER_LABEL is k=v");
+    let (role_k, role_v) = super::NODE_ROLE_LABEL;
     // hw_labels (rio.build/hw-band, rio.build/storage,
     // kubernetes.io/arch, …) are STAMPED onto the Node via
     // metadata.labels — Karpenter copies NodeClaim labels to the
@@ -206,6 +209,7 @@ pub fn build_nodeclaim(
         (HW_CLASS_LABEL.into(), cell.0.clone()),
         (CAPACITY_TYPE_LABEL.into(), cap_label.into()),
         (NODEPOOL_LABEL.into(), SHIM_NODEPOOL.into()),
+        (role_k.into(), role_v.into()),
         (owner_k.into(), owner_v.into()),
     ]);
     let mk_req = |key: &str, op: &str, values: Vec<String>| NodeSelectorRequirementWithMin {
@@ -538,6 +542,10 @@ mod tests {
         assert_eq!(labels[CAPACITY_TYPE_LABEL], "spot");
         assert_eq!(labels[NODEPOOL_LABEL], SHIM_NODEPOOL);
         assert_eq!(labels["rio.build/nodeclaim-pool"], "builder");
+        // Builder pod affinity requires `node-role In [builder]` — the
+        // legacy band-loop NodePool template stamped it; B3 deleted
+        // those, so cover must stamp it directly (live B8 finding).
+        assert_eq!(labels["rio.build/node-role"], "builder");
         // hw-class conjunction stamped onto Node (legacy NodePool
         // template behaviour, now controller's responsibility post-B3).
         assert_eq!(labels["rio.build/hw-band"], "mid");

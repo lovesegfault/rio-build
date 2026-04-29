@@ -5,7 +5,7 @@
 //! controller joins to Node labels server-side when ingesting build
 //! completion samples. `hw_class` is the operator's
 //! `[sla.hw_classes.$h]` key whose label conjunction matches the
-//! Node — fetched once via [`HwClassConfig::load`] (`GetHwClassConfig`
+//! Node — fetched via [`HwClassConfig::load`] (`GetHwClassConfig`
 //! RPC) so the controller stamps the SAME `$h` string the scheduler's
 //! `solve_intent_for` keys on, not a hardcoded 4-label reconstruction
 //! that breaks the moment an operator's label schema differs (bug_061).
@@ -180,7 +180,14 @@ impl HwClassConfig {
             match admin_call(admin.get_hw_class_config(())).await {
                 Ok(r) => {
                     let hw_classes = r.into_inner().hw_classes;
-                    info!(n = hw_classes.len(), "GetHwClassConfig loaded");
+                    let requirements_nonempty = hw_classes
+                        .values()
+                        .filter(|d| !d.requirements.is_empty())
+                        .count();
+                    info!(
+                        n = hw_classes.len(),
+                        requirements_nonempty, "GetHwClassConfig loaded"
+                    );
                     self.set(hw_classes);
                     return;
                 }
@@ -193,7 +200,7 @@ impl HwClassConfig {
         }
         warn!(
             "GetHwClassConfig: gave up after 5 attempts; hw_class will \
-             stay None until controller restart (annotator/λ degraded)"
+             stay None until next periodic refresh (annotator/λ degraded)"
         );
     }
 
@@ -434,6 +441,17 @@ pub async fn run(
     let mut flush = tokio::time::interval(Duration::from_secs(EXPOSURE_FLUSH_SECS));
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // HwClassConfig periodic refresh. main.rs calls `load()` once at
+    // startup, but if the scheduler is mid-rollout that can return
+    // empty `requirements` (live B11: cover_deficit emitted NodeClaims
+    // with only the capacity-type req → Karpenter picked arbitrary
+    // arch). `load()` already retry-backoffs internally, so a single
+    // call per tick suffices; the `Arc<RwLock>` inside `HwClassConfig`
+    // means downstream readers (`cover_deficit`, `match_node`) see the
+    // refreshed config without re-clone.
+    let mut hw_refresh = tokio::time::interval(Duration::from_secs(HW_CONFIG_REFRESH_SECS));
+    hw_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     // Names seen between Init and InitDone. `Some` only during a
     // relist; `None` during steady-state Apply/Delete.
     let mut relist_seen: Option<HashSet<String>> = None;
@@ -451,6 +469,10 @@ pub async fn run(
                 for (hw, secs) in cache.drain_live_spot_exposure(now_epoch()) {
                     report_exposure(&mut admin, hw, secs).await;
                 }
+                continue;
+            }
+            _ = hw_refresh.tick() => {
+                cache.config.load(&mut admin).await;
                 continue;
             }
             next = stream.next() => match next {
@@ -516,6 +538,10 @@ pub async fn run(
 /// Live spot-node exposure flush cadence (seconds). See
 /// [`NodeLabelCache::drain_live_spot_exposure`].
 const EXPOSURE_FLUSH_SECS: u64 = 60;
+
+/// `HwClassConfig::load` re-fetch cadence. Covers the scheduler-
+/// rollout race where the startup load got stale/empty `requirements`.
+const HW_CONFIG_REFRESH_SECS: u64 = 300;
 
 fn now_epoch() -> f64 {
     std::time::SystemTime::now()
