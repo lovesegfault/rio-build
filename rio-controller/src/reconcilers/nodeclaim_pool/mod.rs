@@ -103,6 +103,10 @@ pub struct NodeClaimPoolConfig {
     /// `xtask k8s probe-boot`. Seeds the DDSketch on cold start.
     /// Helm: `sla.leadTimeSeed`.
     pub lead_time_seed: HashMap<String, f64>,
+    /// DDSketch active→shadow rotation interval (seconds). After
+    /// `2×halflife` a sample has aged out entirely. Helm: not surfaced;
+    /// 6h default per ADR §13b.
+    pub sketch_halflife_secs: u64,
     /// `(hw_class:cap)` → instance-shape menu for §13b anchor+bulk
     /// selection. Helm: `sla.instanceMenu`. The controller does NOT
     /// run the scheduler's live spot-price poll; `price_per_vcpu_hr`
@@ -169,6 +173,7 @@ impl Default for NodeClaimPoolConfig {
             max_lead_time: 600.0,
             max_consolidation_time: None,
             lead_time_seed: HashMap::new(),
+            sketch_halflife_secs: 6 * 3600,
             instance_menu: HashMap::new(),
         }
     }
@@ -205,6 +210,12 @@ pub struct NodeClaimPoolReconciler {
     /// `spec.requirements`.
     hw_config: HwClassConfig,
     sketches: CellSketches,
+    /// NodeClaim names whose `Registered=True` boot time has already
+    /// been recorded into `sketches`. Edge-detector state for
+    /// [`CellSketches::observe_registered`]; pruned to live names each
+    /// tick. In-memory only — a restart re-records the live set's boot
+    /// times once (a few duplicate samples in a DDSketch is harmless).
+    recorded_boot: HashSet<String>,
     /// Count of consecutive ticks where `GetSpawnIntents` returned ⊥
     /// (RPC error). Saturates at `u8::MAX`; reset on first success.
     consecutive_bot_ticks: u8,
@@ -226,10 +237,10 @@ impl NodeClaimPoolReconciler {
         hw_config: HwClassConfig,
     ) -> Self {
         // Load persisted sketches; fall back to empty on error (a fresh
-        // table is the cold-start case anyway). B9's `seed()` will
-        // overlay `cfg.lead_time_seed` on top of any cells the load
-        // didn't populate.
-        let sketches = match CellSketches::load(&pg).await {
+        // table is the cold-start case anyway). `seed()` overlays
+        // `cfg.lead_time_seed` on top of any cells the load didn't
+        // populate.
+        let mut sketches = match CellSketches::load(&pg).await {
             Ok(s) => {
                 info!(cells = s.len(), "loaded nodeclaim_cell_state from PG");
                 s
@@ -239,6 +250,7 @@ impl NodeClaimPoolReconciler {
                 CellSketches::default()
             }
         };
+        sketches.seed(&cfg.lead_time_seed);
         Self {
             nodeclaims: Api::all(kube),
             admin,
@@ -247,6 +259,7 @@ impl NodeClaimPoolReconciler {
             cfg,
             hw_config,
             sketches,
+            recorded_boot: HashSet::new(),
             consecutive_bot_ticks: 0,
             tick_counter: 0,
         }
@@ -319,6 +332,20 @@ impl NodeClaimPoolReconciler {
 
         let live = self.list_live_nodeclaims().await?;
 
+        // r[ctrl.nodeclaim.lead-time-ddsketch]: record boot times on
+        // Registered=True edges, then rotate any cells past halflife.
+        // `registered_cells` feeds `report_unfulfillable`'s ICE-clear.
+        // TODO(B12): per-cell `schmitt_adjust` once forecast hit-ratio
+        // is observable (needs rio-packed pod placement to compare
+        // against FFD's prediction).
+        let registered_cells = self
+            .sketches
+            .observe_registered(&live, &mut self.recorded_boot);
+        self.sketches.maybe_rotate_all(
+            std::time::SystemTime::now(),
+            Duration::from_secs(self.cfg.sketch_halflife_secs),
+        );
+
         let (placeable, unplaced) = ffd::simulate(&intents.intents, &live, &self.sketches);
         // TODO(B12): pod.rs `schedulerName=rio-packed` + priorityClassName
         // wiring; until then `placeable` is observability only — the legacy
@@ -334,7 +361,8 @@ impl NodeClaimPoolReconciler {
             .cover_deficit(&unplaced, &live, &intents.ice_masked_cells)
             .await?;
         debug!(created = cover.created.len(), "deficit cover");
-        self.report_unfulfillable(&cover.ice_cells).await?;
+        self.report_unfulfillable(&cover.ice_cells, &registered_cells)
+            .await?;
 
         consolidate::reap_idle(
             &self.nodeclaims,
@@ -496,11 +524,17 @@ impl NodeClaimPoolReconciler {
 
     /// Report cells where NodeClaim creation hit ICE (Launched=False or
     /// Registered timeout) back to the scheduler via
-    /// `AckSpawnedIntents.unfulfillable_cells`.
-    // TODO(B11): wire `AckSpawnedIntentsRequest`. No-op until B8
+    /// `AckSpawnedIntents.unfulfillable_cells`, and cells that
+    /// successfully registered via `registered_cells` (the ICE-clear
+    /// signal).
+    // TODO(B11): wire `AckSpawnedIntentsRequest`. No-op until B11
     // populates `ice_cells`.
-    async fn report_unfulfillable(&self, ice_cells: &[Cell]) -> anyhow::Result<()> {
-        let _ = ice_cells;
+    async fn report_unfulfillable(
+        &self,
+        ice_cells: &[Cell],
+        registered_cells: &[Cell],
+    ) -> anyhow::Result<()> {
+        let _ = (ice_cells, registered_cells);
         Ok(())
     }
 }

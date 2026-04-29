@@ -13,19 +13,31 @@
 //! `r[ctrl.nodeclaim.lead-time-ddsketch]`. The reconciler loads on
 //! construct, persists every tick.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use sketches_ddsketch::{Config, DDSketch};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::consolidate::IdleGapEvent;
+use super::ffd::LiveNode;
 
 /// bincode encoding version tag (4 LE bytes prefix). Bump on any
 /// `sketches-ddsketch` serde-shape change; [`decode_versioned`] returns
 /// `None` on mismatch and the caller falls back to seed.
 const SKETCH_VERSION: u32 = 1;
+
+/// Synthetic seed sample count. `r[ctrl.nodeclaim.lead-time-ddsketch]`:
+/// `n_seed = 1/(1−q) = 10` at `q=0.9` — enough that
+/// `quantile(0.9)` returns the seed value, few enough that real
+/// observations dominate quickly.
+const N_SEED: usize = 10;
+
+/// `boot_active.count()` threshold below which [`CellState::ice_timeout`]
+/// uses `2×seed` instead of `q_0.99(boot)`. A 0.99-quantile on <100
+/// samples is noise; the seed floor is the conservative bound.
+const ICE_REAL_THRESHOLD: usize = 100;
 
 /// Spot vs on-demand. The migration's CHECK constraint pins the wire
 /// strings; [`as_str`](Self::as_str) is the single mapping.
@@ -115,16 +127,83 @@ impl Default for CellState {
 }
 
 impl CellState {
-    /// `q`-quantile of the active `z` sketch — the provisioning
-    /// lead-time. Empty sketch → 0 (cold start; B9's seed overlays).
-    // TODO(B9): Schmitt-adjust `lead_time_q`, `record()`, `maybe_rotate()`.
+    /// `lead_time_q`-quantile of the `z` sketch — the provisioning
+    /// lead-time. Reads `z_active` first; falls back to `z_shadow` when
+    /// active is empty (immediately post-rotation, before the first new
+    /// sample lands) so the warm quantile isn't lost. Both empty → 0
+    /// (cold start; [`CellSketches::seed`] overlays).
     pub fn lead_time(&self) -> f64 {
-        self.z_active
-            .quantile(self.lead_time_q)
-            .ok()
-            .flatten()
+        quantile_or(&self.z_active, self.lead_time_q)
+            .or_else(|| quantile_or(&self.z_shadow, self.lead_time_q))
             .unwrap_or(0.0)
     }
+
+    /// Median raw boot time (`q_0.5(boot)`). B10's `consolidate_after`
+    /// floor (`q_0.5/2`) and break-even RHS (`cores/q_0.5`) both read
+    /// this. Shadow fallback as for [`lead_time`](Self::lead_time);
+    /// empty → `None` (caller supplies seed).
+    pub fn boot_median(&self) -> Option<f64> {
+        quantile_or(&self.boot_active, 0.5).or_else(|| quantile_or(&self.boot_shadow, 0.5))
+    }
+
+    /// ICE/boot-failure timeout for this cell. Below
+    /// `ICE_REAL_THRESHOLD` real samples, `2×seed` (the seed is the
+    /// operator's `xtask k8s probe-boot` measurement; doubling it is the
+    /// conservative wait). At ≥100 samples, `q_0.99(boot)` — the
+    /// observed tail. Floored at `2×seed` either way so a lucky
+    /// fast-boot streak can't shrink the timeout below the operator's
+    /// floor.
+    pub fn ice_timeout(&self, seed: f64) -> f64 {
+        let floor = 2.0 * seed;
+        if self.boot_active.count() < ICE_REAL_THRESHOLD {
+            return floor;
+        }
+        quantile_or(&self.boot_active, 0.99).map_or(floor, |q| q.max(floor))
+    }
+
+    /// Record one observed `boot` (Registered.transition − created)
+    /// with forecast `eta_error` (predicted − actual ETA; 0 until B12
+    /// threads per-intent ETA through to the NodeClaim).
+    /// `z = boot − eta_error` per `r[ctrl.nodeclaim.lead-time-ddsketch]`.
+    pub fn record(&mut self, boot: f64, eta_error: f64) {
+        self.z_active.add(boot - eta_error);
+        self.boot_active.add(boot);
+    }
+
+    /// Active→shadow rotation when `now − epoch > halflife`. Gives a
+    /// sliding window: stale samples age out (after 2×halflife they're
+    /// gone entirely) without dropping the warm quantile (shadow holds
+    /// it while active refills).
+    pub fn maybe_rotate(&mut self, now: SystemTime, halflife: Duration) {
+        if now.duration_since(self.epoch).unwrap_or(Duration::ZERO) > halflife {
+            self.z_shadow =
+                std::mem::replace(&mut self.z_active, DDSketch::new(Config::defaults()));
+            self.boot_shadow =
+                std::mem::replace(&mut self.boot_active, DDSketch::new(Config::defaults()));
+            self.epoch = now;
+        }
+    }
+
+    /// Schmitt trigger on `forecast_warm_hit_ratio` per
+    /// `r[ctrl.nodeclaim.lead-time-ddsketch]`: widen `lead_time_q` by
+    /// `Δq=0.02` when `hit_ratio < 0.85·target` (under-provisioning;
+    /// gated on `lead_time < max_lead_time` so a permanently-slow cell
+    /// doesn't ratchet to 0.99 forever); narrow when
+    /// `hit_ratio > 1.05·target` (over-provisioning). The `[0.85,1.05]`
+    /// dead zone prevents oscillation.
+    pub fn schmitt_adjust(&mut self, hit_ratio: f64, target: f64, max_lead_time: f64) {
+        if hit_ratio < 0.85 * target && self.lead_time() < max_lead_time {
+            self.lead_time_q = (self.lead_time_q + 0.02).min(0.99);
+        } else if hit_ratio > 1.05 * target {
+            self.lead_time_q = (self.lead_time_q - 0.02).max(0.5);
+        }
+    }
+}
+
+/// `s.quantile(q)` flattened. `None` ⇔ empty sketch (or `q∉[0,1]`,
+/// which callers don't emit).
+fn quantile_or(s: &DDSketch, q: f64) -> Option<f64> {
+    s.quantile(q).ok().flatten()
 }
 
 /// All cells. `HashMap` keyed by [`Cell`]; `len()` ≈ |hw_classes| × 2
@@ -157,9 +236,74 @@ impl CellSketches {
     }
 
     /// Convenience: `cell`'s current provisioning lead-time (seconds).
-    /// Unknown cell → 0 (cold start; B9's seed overlays).
+    /// Unknown cell → 0 (cold start; [`seed`](Self::seed) overlays).
     pub fn lead_time(&self, cell: &Cell) -> f64 {
         self.get(cell).map_or(0.0, CellState::lead_time)
+    }
+
+    /// Overlay `sla.leadTimeSeed` onto cells whose active sketch is
+    /// empty: inject `N_SEED = 1/(1−q) = 10` copies of the seed into
+    /// `z_active` and `boot_active`. Idempotent (skips cells with
+    /// `count > 0`). Called once after [`load`](Self::load) so cold-start
+    /// `lead_time()` returns the operator's probe-boot measurement
+    /// instead of 0. Malformed seed keys (not `"h:cap"`) are skipped +
+    /// warned.
+    // r[impl ctrl.nodeclaim.lead-time-ddsketch]
+    pub fn seed(&mut self, lead_time_seed: &HashMap<String, f64>) {
+        for (key, &seed) in lead_time_seed {
+            let Some(cell) = Cell::parse(key) else {
+                warn!(%key, "lead_time_seed key not parseable as h:cap; skipping");
+                continue;
+            };
+            let s = self.cell_mut(&cell);
+            if s.z_active.count() > 0 {
+                continue;
+            }
+            for _ in 0..N_SEED {
+                s.z_active.add(seed);
+                s.boot_active.add(seed);
+            }
+            debug!(%cell, seed, "seeded empty cell sketch");
+        }
+    }
+
+    /// Edge-detect `Registered=True` transitions and record their
+    /// `boot_secs()` into the cell's sketches. `recorded` is the
+    /// reconciler's running set of NodeClaim names already counted —
+    /// each claim contributes exactly one sample over its lifetime.
+    /// Names no longer in `live` are pruned from `recorded` so the set
+    /// doesn't grow unbounded across NodeClaim churn. Returns the cells
+    /// that saw a registration this call (B11's `registered_cells`
+    /// ICE-clear signal).
+    pub fn observe_registered(
+        &mut self,
+        live: &[LiveNode],
+        recorded: &mut HashSet<String>,
+    ) -> Vec<Cell> {
+        let live_names: HashSet<&str> = live.iter().map(|n| n.name.as_str()).collect();
+        recorded.retain(|n| live_names.contains(n.as_str()));
+        let mut registered_cells = Vec::new();
+        for n in live {
+            if !n.registered || recorded.contains(&n.name) {
+                continue;
+            }
+            let (Some(cell), Some(boot)) = (n.cell.as_ref(), n.boot_secs()) else {
+                continue;
+            };
+            // TODO(B12): thread per-intent eta through to the NodeClaim
+            // (annotation) so eta_error is real; until then `z = boot`.
+            self.cell_mut(cell).record(boot, 0.0);
+            recorded.insert(n.name.clone());
+            registered_cells.push(cell.clone());
+        }
+        registered_cells
+    }
+
+    /// Rotate every cell whose epoch has aged past `halflife`.
+    pub fn maybe_rotate_all(&mut self, now: SystemTime, halflife: Duration) {
+        for s in self.cells.values_mut() {
+            s.maybe_rotate(now, halflife);
+        }
     }
 
     /// Load all rows from `nodeclaim_cell_state`. Unknown sketch
@@ -359,6 +503,184 @@ mod tests {
         assert!((s.lead_time_q - 0.9).abs() < 1e-12);
         assert_eq!(s.lead_time(), 0.0, "empty sketch → 0 lead time");
         assert!(s.idle_gap_events.is_empty());
+    }
+
+    /// `record(boot, eta_error)` feeds `z=boot−eta_error` and `boot`.
+    /// `lead_time()` reads `z_active`'s `lead_time_q`-quantile.
+    #[test]
+    fn record_and_lead_time_quantile() {
+        let mut s = CellState::default();
+        for boot in [40.0, 42.0, 44.0, 46.0, 48.0, 50.0, 52.0, 54.0, 56.0, 58.0] {
+            s.record(boot, 0.0);
+        }
+        assert_eq!(s.z_active.count(), 10);
+        assert_eq!(s.boot_active.count(), 10);
+        // q=0.9 over 40..58 step 2 ≈ 56 (within DDSketch rel-error).
+        let lt = s.lead_time();
+        assert!((54.0..=58.5).contains(&lt), "lead_time={lt}");
+        // boot_median ≈ 48.
+        let bm = s.boot_median().unwrap();
+        assert!((46.0..=50.0).contains(&bm), "boot_median={bm}");
+        // Non-zero eta_error: z = boot − eta_error.
+        let mut s2 = CellState::default();
+        s2.record(50.0, 10.0);
+        let z = s2.z_active.quantile(0.5).unwrap().unwrap();
+        assert!((z - 40.0).abs() < 1.0, "z=boot−eta_error, got {z}");
+    }
+
+    /// r[ctrl.nodeclaim.lead-time-ddsketch]: seed injects N_SEED copies
+    /// into empty cells only; `lead_time()` then returns ≈ seed value.
+    // r[verify ctrl.nodeclaim.lead-time-ddsketch]
+    #[test]
+    fn seed_fills_empty_cells_only() {
+        let mut sk = CellSketches::default();
+        let warm = Cell("warm".into(), CapacityType::Spot);
+        sk.cell_mut(&warm).record(100.0, 0.0);
+        let seeds: HashMap<String, f64> = [
+            ("cold:spot".into(), 45.0),
+            ("warm:spot".into(), 999.0),
+            ("malformed".into(), 1.0),
+        ]
+        .into();
+        sk.seed(&seeds);
+        let cold = Cell("cold".into(), CapacityType::Spot);
+        assert_eq!(sk.get(&cold).unwrap().z_active.count(), N_SEED);
+        let lt = sk.lead_time(&cold);
+        assert!((lt - 45.0).abs() / 45.0 < 0.02, "seed lead_time={lt}");
+        // Warm cell untouched (count still 1).
+        assert_eq!(sk.get(&warm).unwrap().z_active.count(), 1);
+        // Malformed key skipped.
+        assert!(
+            sk.get(&Cell("malformed".into(), CapacityType::Spot))
+                .is_none()
+        );
+        // Idempotent: second call doesn't double-seed.
+        sk.seed(&seeds);
+        assert_eq!(sk.get(&cold).unwrap().z_active.count(), N_SEED);
+    }
+
+    /// Active→shadow rotation on halflife expiry; `lead_time()` falls
+    /// back to shadow when active is empty post-rotation.
+    #[test]
+    fn sliding_pair_rotates_on_halflife() {
+        let t0 = SystemTime::UNIX_EPOCH;
+        let mut s = CellState {
+            epoch: t0,
+            ..Default::default()
+        };
+        for _ in 0..50 {
+            s.record(40.0, 0.0);
+        }
+        let halflife = Duration::from_secs(6 * 3600);
+        // Before halflife: no rotation.
+        s.maybe_rotate(t0 + Duration::from_secs(3600), halflife);
+        assert_eq!(s.z_active.count(), 50);
+        assert_eq!(s.z_shadow.count(), 0);
+        // After halflife: active → shadow, active fresh.
+        let t1 = t0 + Duration::from_secs(7 * 3600);
+        s.maybe_rotate(t1, halflife);
+        assert_eq!(s.z_active.count(), 0, "active reset");
+        assert_eq!(s.z_shadow.count(), 50, "old active → shadow");
+        assert_eq!(s.boot_active.count(), 0);
+        assert_eq!(s.boot_shadow.count(), 50);
+        assert_eq!(s.epoch, t1, "epoch advances");
+        // lead_time() falls back to shadow → still ≈40.
+        let lt = s.lead_time();
+        assert!((lt - 40.0).abs() / 40.0 < 0.02, "shadow fallback lt={lt}");
+        // Second rotate before next halflife: no-op.
+        s.maybe_rotate(t1 + Duration::from_secs(60), halflife);
+        assert_eq!(s.z_shadow.count(), 50);
+    }
+
+    /// Schmitt: `hit_ratio < 0.85·target` widens by 0.02 (capped 0.99,
+    /// gated on lead_time < max); `> 1.05·target` narrows (floor 0.5);
+    /// dead zone holds.
+    #[test]
+    fn lead_time_q_widens_on_low_hit_ratio() {
+        let mut s = CellState::default();
+        s.record(30.0, 0.0);
+        // 0.7 < 0.85·0.9=0.765 → widen 0.90→0.92.
+        s.schmitt_adjust(0.7, 0.9, 600.0);
+        assert!((s.lead_time_q - 0.92).abs() < 1e-9);
+        // 0.96 > 1.05·0.9=0.945 → narrow 0.92→0.90.
+        s.schmitt_adjust(0.96, 0.9, 600.0);
+        assert!((s.lead_time_q - 0.90).abs() < 1e-9);
+        // Dead zone: 0.88 ∈ [0.765, 0.945] → hold.
+        s.schmitt_adjust(0.88, 0.9, 600.0);
+        assert!((s.lead_time_q - 0.90).abs() < 1e-9);
+        // Widen capped at 0.99.
+        s.lead_time_q = 0.98;
+        s.schmitt_adjust(0.1, 0.9, 600.0);
+        assert!((s.lead_time_q - 0.99).abs() < 1e-9);
+        s.schmitt_adjust(0.1, 0.9, 600.0);
+        assert!((s.lead_time_q - 0.99).abs() < 1e-9, "stays at cap");
+        // Widen gated on lead_time < max: max=10 < lt≈30 → no widen.
+        let mut s2 = CellState::default();
+        s2.record(30.0, 0.0);
+        s2.schmitt_adjust(0.1, 0.9, 10.0);
+        assert!((s2.lead_time_q - 0.90).abs() < 1e-9, "max gate holds q");
+        // Narrow floored at 0.5.
+        s2.lead_time_q = 0.51;
+        s2.schmitt_adjust(0.99, 0.9, 600.0);
+        assert!((s2.lead_time_q - 0.50).abs() < 1e-9);
+    }
+
+    /// `ice_timeout`: <100 samples → 2×seed; ≥100 → q_0.99(boot)
+    /// floored at 2×seed.
+    #[test]
+    fn ice_timeout_uses_seed_floor_below_threshold() {
+        let mut s = CellState::default();
+        for _ in 0..50 {
+            s.record(40.0, 0.0);
+        }
+        assert_eq!(s.ice_timeout(45.0), 90.0, "n<100 → 2×seed");
+        for _ in 0..60 {
+            s.record(40.0, 0.0);
+        }
+        // n=110 ≥ 100; q_0.99 ≈ 40 < 2×45 → floor at 90.
+        assert_eq!(s.ice_timeout(45.0), 90.0, "floored at 2×seed");
+        // Seed=10 → floor=20 < q_0.99≈40 → returns ≈40.
+        let t = s.ice_timeout(10.0);
+        assert!((38.0..=42.0).contains(&t), "q_0.99 path t={t}");
+    }
+
+    /// Edge detection: each `Registered=True` LiveNode records once;
+    /// re-seeing it next tick doesn't re-record; pruned from `recorded`
+    /// when gone from `live`.
+    #[test]
+    fn observe_registered_edge_detection() {
+        use super::super::ffd::tests::{node, with_conds};
+        let mut sk = CellSketches::default();
+        let mut recorded = HashSet::new();
+        let cell = Cell("h".into(), CapacityType::Spot);
+
+        let reg = |name: &str, boot: f64| {
+            with_conds(
+                node(name, "h", CapacityType::Spot, 8, 0, 0),
+                &[("Registered", "True", 1000.0 + boot)],
+            )
+        };
+        let mut inflight = node("c", "h", CapacityType::Spot, 8, 0, 0);
+        inflight.registered = false;
+
+        // Tick 1: a (boot=42) + c (in-flight). a recorded; c not.
+        let cells = sk.observe_registered(&[reg("a", 42.0), inflight.clone()], &mut recorded);
+        assert_eq!(cells, vec![cell.clone()]);
+        assert_eq!(sk.get(&cell).unwrap().boot_active.count(), 1);
+        assert!(recorded.contains("a"));
+        assert!(!recorded.contains("c"));
+
+        // Tick 2: a again + b (boot=50). Only b is a new edge.
+        let cells = sk.observe_registered(&[reg("a", 42.0), reg("b", 50.0)], &mut recorded);
+        assert_eq!(cells, vec![cell.clone()]);
+        assert_eq!(sk.get(&cell).unwrap().boot_active.count(), 2);
+        assert_eq!(recorded.len(), 2);
+
+        // Tick 3: only b. a pruned from `recorded`.
+        sk.observe_registered(&[reg("b", 50.0)], &mut recorded);
+        assert_eq!(sk.get(&cell).unwrap().boot_active.count(), 2, "no new edge");
+        assert!(!recorded.contains("a"), "pruned");
+        assert_eq!(recorded.len(), 1);
     }
 
     /// PG round-trip: persist two cells, load, compare quantiles +

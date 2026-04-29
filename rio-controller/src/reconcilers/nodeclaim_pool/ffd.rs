@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use rio_crds::karpenter::{NodeClaim, NodeClaimStatus};
 use rio_proto::types::SpawnIntent;
 
@@ -61,9 +62,22 @@ pub struct LiveNode {
     // routes pods here. Until then `free()` on a Registered node
     // over-reports by whatever the legacy path (if co-scheduled) placed.
     pub requested: (u32, u64, u64),
+    /// `metadata.creationTimestamp` as unix-epoch seconds. `None` only
+    /// on a just-`create()`d object before the apiserver round-trip.
+    pub created_secs: Option<f64>,
+    /// `metadata.annotations`. B10's hold-open ε reads
+    /// `rio.build/hold-open`.
+    pub annotations: BTreeMap<String, String>,
     /// Full `status` for B10/B11's condition reads (idle-since,
     /// `Launched=False` ICE detection).
     pub status: NodeClaimStatus,
+}
+
+/// `metav1.Time` → unix-epoch seconds. kube 3.0 wraps `jiff::Timestamp`;
+/// integer seconds suffice for boot-time arithmetic (typical boot ≈
+/// 30–120s).
+fn time_secs(t: &Time) -> f64 {
+    t.0.as_second() as f64
 }
 
 impl LiveNode {
@@ -81,6 +95,56 @@ impl LiveNode {
         } else {
             self.allocatable
         }
+    }
+
+    /// `(status, last_transition_secs)` for condition `type_`. `None` ⇔
+    /// the condition isn't present (Karpenter writes `Launched`/
+    /// `Registered` lazily — absence ≠ `False`).
+    pub fn cond(&self, type_: &str) -> Option<(&str, f64)> {
+        self.status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == type_)
+            .map(|c| (c.status.as_str(), time_secs(&c.last_transition_time)))
+    }
+
+    /// Seconds since `metadata.creationTimestamp`. `None` if creation
+    /// time is absent (apiserver hasn't round-tripped yet).
+    pub fn age_secs(&self, now_secs: f64) -> Option<f64> {
+        self.created_secs.map(|c| now_secs - c)
+    }
+
+    /// `Registered.lastTransitionTime − creationTimestamp`: the
+    /// Karpenter+kubelet boot overhead. `Some` only when
+    /// `Registered=True`. The value B9's [`super::sketch::CellState::
+    /// record`] feeds into the `boot_active` DDSketch.
+    pub fn boot_secs(&self) -> Option<f64> {
+        let created = self.created_secs?;
+        match self.cond("Registered")? {
+            ("True", t) => Some(t - created),
+            _ => None,
+        }
+    }
+
+    /// Seconds since the node became idle (Karpenter's `Empty=True`
+    /// transition). Falls back to `Registered=True` transition when
+    /// `Empty` is absent — a node with no pod ever scheduled has been
+    /// idle since registration. `None` for in-flight claims.
+    pub fn idle_secs(&self, now_secs: f64) -> Option<f64> {
+        if !self.registered {
+            return None;
+        }
+        let since = match self.cond("Empty") {
+            Some(("True", t)) => t,
+            Some(_) => return None,
+            None => self.cond("Registered")?.1,
+        };
+        Some(now_secs - since)
+    }
+
+    /// Read `metadata.annotations[key]`.
+    pub fn annotation(&self, key: &str) -> Option<&str> {
+        self.annotations.get(key).map(String::as_str)
     }
 }
 
@@ -110,6 +174,8 @@ impl From<NodeClaim> for LiveNode {
             cell,
             allocatable,
             requested: (0, 0, 0),
+            created_secs: nc.metadata.creation_timestamp.as_ref().map(time_secs),
+            annotations: nc.metadata.annotations.unwrap_or_default(),
             status,
         }
     }
@@ -301,7 +367,7 @@ pub(crate) fn parse_bytes(q: &str) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm};
 
@@ -343,7 +409,14 @@ mod tests {
 
     /// LiveNode with `cell`, `allocatable` cores/mem/disk, registered.
     /// `requested` defaults 0.
-    fn node(name: &str, hw: &str, cap: CapacityType, cores: u32, mem: u64, disk: u64) -> LiveNode {
+    pub(crate) fn node(
+        name: &str,
+        hw: &str,
+        cap: CapacityType,
+        cores: u32,
+        mem: u64,
+        disk: u64,
+    ) -> LiveNode {
         LiveNode {
             name: name.into(),
             node_name: Some(format!("node-{name}")),
@@ -351,8 +424,28 @@ mod tests {
             cell: Some(Cell(hw.into(), cap)),
             allocatable: (cores, mem, disk),
             requested: (0, 0, 0),
+            created_secs: Some(1000.0),
+            annotations: BTreeMap::new(),
             status: NodeClaimStatus::default(),
         }
+    }
+
+    /// Set `(type, status, lastTransitionTime)` conditions on `n.status`.
+    /// Built via JSON: `Condition` has non-Default `last_transition_time`.
+    pub(crate) fn with_conds(mut n: LiveNode, conds: &[(&str, &str, f64)]) -> LiveNode {
+        let cs: Vec<_> = conds
+            .iter()
+            .map(|(ty, st, t)| {
+                serde_json::json!({
+                    "type": ty, "status": st,
+                    "lastTransitionTime": format!("1970-01-01T{:02}:{:02}:{:02}Z",
+                        (*t as u64) / 3600, ((*t as u64) % 3600) / 60, (*t as u64) % 60),
+                    "reason": "", "message": "",
+                })
+            })
+            .collect();
+        n.status.conditions = serde_json::from_value(serde_json::json!(cs)).unwrap();
+        n
     }
 
     /// SpawnIntent targeting `cells` (one affinity term per).
@@ -422,6 +515,51 @@ mod tests {
         let inflight: LiveNode = nc("b", false).into();
         assert!(!inflight.registered);
         assert!(inflight.node_name.is_none());
+    }
+
+    /// `cond()` reads `(status, lastTransitionTime)`; `boot_secs()` =
+    /// Registered.transition − created; `age_secs()` = now − created.
+    #[test]
+    fn live_node_cond_boot_age() {
+        let n = with_conds(
+            node("a", "h", CapacityType::Spot, 8, GI, GI),
+            &[("Launched", "True", 1010.0), ("Registered", "True", 1042.0)],
+        );
+        assert_eq!(n.cond("Launched"), Some(("True", 1010.0)));
+        assert_eq!(n.cond("Registered"), Some(("True", 1042.0)));
+        assert_eq!(n.cond("Drifted"), None);
+        assert_eq!(n.boot_secs(), Some(42.0));
+        assert_eq!(n.age_secs(1100.0), Some(100.0));
+        // Registered=False → no boot_secs.
+        let nf = with_conds(
+            node("b", "h", CapacityType::Spot, 8, GI, GI),
+            &[("Registered", "False", 1042.0)],
+        );
+        assert_eq!(nf.boot_secs(), None);
+        // No created_secs → no boot/age.
+        let mut nc = n.clone();
+        nc.created_secs = None;
+        assert_eq!(nc.boot_secs(), None);
+        assert_eq!(nc.age_secs(1100.0), None);
+    }
+
+    /// `idle_secs()`: Empty=True → since-transition; Empty=False →
+    /// None (busy); no Empty cond → since-Registered. In-flight → None.
+    #[test]
+    fn live_node_idle_secs() {
+        let base = node("a", "h", CapacityType::Spot, 8, GI, GI);
+        let empty = with_conds(
+            base.clone(),
+            &[("Registered", "True", 1042.0), ("Empty", "True", 1100.0)],
+        );
+        assert_eq!(empty.idle_secs(1160.0), Some(60.0));
+        let busy = with_conds(base.clone(), &[("Empty", "False", 1100.0)]);
+        assert_eq!(busy.idle_secs(1160.0), None);
+        let never_scheduled = with_conds(base.clone(), &[("Registered", "True", 1042.0)]);
+        assert_eq!(never_scheduled.idle_secs(1160.0), Some(118.0));
+        let mut inflight = base;
+        inflight.registered = false;
+        assert_eq!(inflight.idle_secs(1160.0), None);
     }
 
     #[test]
