@@ -84,6 +84,7 @@ pub(crate) const REASON_FETCHER_HOST_NETWORK_SUPPRESSED: &str = "FetcherHostNetw
 pub(crate) const REASON_FETCHER_SECCOMP_OVERRIDDEN: &str = "FetcherSeccompOverridden";
 pub(crate) const REASON_FETCHER_FUSE_TUNING_IGNORED: &str = "FetcherFuseTuningIgnored";
 pub(crate) const REASON_FETCHER_FEATURES_IGNORED: &str = "FetcherFeaturesIgnored";
+pub(crate) const REASON_BUILDER_FUSE_CACHE_IGNORED: &str = "BuilderFuseCacheBytesIgnored";
 
 /// One spec-degrade check. `applies` is a pure predicate over the
 /// spec; if true, a `Warning` event with `reason`/`note` is emitted.
@@ -163,6 +164,13 @@ pub(crate) const DEGRADE_CHECKS: &[DegradeCheck] = &[
         note: "kind=Fetcher ignores features — FODs route by \
                is_fixed_output alone. Drop features.",
     },
+    DegradeCheck {
+        applies: |s| s.kind == ExecutorKind::Builder && s.fuse_cache_bytes.is_some(),
+        reason: REASON_BUILDER_FUSE_CACHE_IGNORED,
+        note: "kind=Builder ignores fuseCacheBytes — Builder pools \
+               single-source from controller [nodeclaim_pool].fuse_cache_bytes \
+               so FFD/cover/stamp agree (mb_035). Drop fuseCacheBytes.",
+    },
 ];
 
 /// Emit Warning events for every spec field the builder will silently
@@ -193,9 +201,6 @@ async fn warn_on_spec_degrades(pool: &Pool, ctx: &Ctx) {
 
 /// Normal reconcile: make the world match spec.
 async fn apply(pool: Arc<Pool>, ctx: Arc<Ctx>) -> Result<Action> {
-    if let Some(msg) = pod::reject_builder_fuse_cache_override(&pool) {
-        return Err(Error::InvalidSpec(msg.into()));
-    }
     warn_on_spec_degrades(&pool, &ctx).await;
     jobs::reconcile(&pool, &ctx).await
 }

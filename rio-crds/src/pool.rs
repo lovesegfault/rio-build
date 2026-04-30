@@ -161,6 +161,13 @@ impl ExecutorKind {
         "kind=Fetcher forbids features — FODs route by is_fixed_output alone, not features (ADR-019)"
     )
 )]
+#[x_kube(
+    validation = Rule::new(
+        "self.kind != 'Builder' || !has(self.fuseCacheBytes)"
+    ).message(
+        "kind=Builder forbids fuseCacheBytes — Builder pools single-source from controller [nodeclaim_pool].fuse_cache_bytes so FFD/cover/stamp agree (mb_035)"
+    )
+)]
 pub struct PoolSpec {
     /// Builder or Fetcher. Required — there is no sensible default
     /// (the two have opposite network postures).
@@ -220,10 +227,11 @@ pub struct PoolSpec {
     /// `fuse-cache` emptyDir sizeLimit AND the matching addend to the
     /// container's `ephemeral-storage` request/limit (kubelet sums
     /// disk-backed emptyDirs against that limit, so the two MUST agree).
-    /// `None` = per-kind safe-minimum default (8Gi builder, 4Gi fetcher)
-    /// so non-helm Pools schedule on small-disk clusters. Helm prod
-    /// `poolDefaults.fuseCacheBytes` overrides upward (50Gi). Applies
-    /// to BOTH kinds — NOT CEL-gated for Fetcher.
+    /// Fetcher-only — Builder pools single-source from controller
+    /// `[nodeclaim_pool].fuse_cache_bytes` so FFD/cover/stamp agree
+    /// (mb_035); CEL rejects the field for Builder, and pre-CEL CRs are
+    /// ignored with a Warning event. `None` = 4Gi safe-minimum so
+    /// non-helm Fetcher Pools schedule on small-disk clusters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuse_cache_bytes: Option<u64>,
 
@@ -442,6 +450,16 @@ mod tests {
             assert!(json.contains(rule), "fetcher CEL rule missing: {rule}");
             assert!(json.contains(msg), "fetcher CEL rule has no message: {msg}");
         }
+        // mb_022: Builder fuseCacheBytes single-sourced from
+        // controller.toml so FFD/cover/stamp agree (mb_035).
+        assert!(
+            json.contains("self.kind != 'Builder' || !has(self.fuseCacheBytes)"),
+            "Builder fuseCacheBytes CEL rule missing"
+        );
+        assert!(
+            json.contains("kind=Builder forbids fuseCacheBytes"),
+            "Builder fuseCacheBytes CEL rule has no message"
+        );
         // r[verify ctrl.crd.seccomp-cel]
         // Nested KubeSchema CEL propagates.
         assert!(

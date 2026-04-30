@@ -284,10 +284,11 @@ async fn warn_fires_for_ephemeral_with_host_network() {
 #[tokio::test]
 async fn warn_fires_for_every_degrade_check() {
     use crate::reconcilers::pool::DEGRADE_CHECKS;
-    // Structural floor: 1 host-users + 5 Fetcher CEL rules. New CEL
-    // rules without a DegradeCheck entry trip this.
+    // Structural floor: 1 host-users + 5 Fetcher CEL rules + 1 Builder
+    // fuseCacheBytes. New CEL rules without a DegradeCheck entry trip
+    // this.
     assert!(
-        DEGRADE_CHECKS.len() >= 6,
+        DEGRADE_CHECKS.len() >= 7,
         "DEGRADE_CHECKS shrank below the count of silent overrides in \
          pod.rs::effective_* — every override needs a Warning entry"
     );
@@ -383,5 +384,47 @@ fn degrade_host_users_suppressed_builder_only() {
         (host_users.applies)(&builder),
         "HostUsersSuppressed fires for Builder (the pod.rs:327 suppression \
          it mirrors is on the Builder path)"
+    );
+}
+
+/// mb_022: Builder pools setting `fuseCacheBytes` is the
+/// `r[ctrl.event.spec-degrade]` shape (CEL at apply, Warning event for
+/// pre-CEL CRs), NOT `Err(InvalidSpec)` halting the whole reconcile.
+/// The field is ignored anyway (`pod::fuse_cache_bytes` reads
+/// `BUILDER_FUSE_CACHE` for Builder kind) — the hard-reject was purely
+/// punitive. This is the no-apiserver DEGRADE-path coverage; the CEL
+/// layer is asserted in `nix/tests/helm/18-builder-fuse-cache-cel.sh`.
+#[test]
+fn degrade_builder_fuse_cache_ignored() {
+    use crate::reconcilers::pool::{DEGRADE_CHECKS, REASON_BUILDER_FUSE_CACHE_IGNORED};
+    use rio_crds::pool::PoolSpec;
+
+    let check = DEGRADE_CHECKS
+        .iter()
+        .find(|c| c.reason == REASON_BUILDER_FUSE_CACHE_IGNORED)
+        .expect("BuilderFuseCacheIgnored entry present");
+
+    let builder = PoolSpec {
+        fuse_cache_bytes: Some(100 * (1 << 30)),
+        ..crate::fixtures::test_pool("b", ExecutorKind::Builder).spec
+    };
+    assert!(
+        (check.applies)(&builder),
+        "Builder with fuseCacheBytes set → Warning event (NOT hard-reject)"
+    );
+
+    let fetcher = PoolSpec {
+        fuse_cache_bytes: Some(100 * (1 << 30)),
+        ..crate::fixtures::test_pool("f", ExecutorKind::Fetcher).spec
+    };
+    assert!(
+        !(check.applies)(&fetcher),
+        "Fetcher may set fuseCacheBytes (per-pool override is supported)"
+    );
+
+    let builder_unset = crate::fixtures::test_pool("b2", ExecutorKind::Builder).spec;
+    assert!(
+        !(check.applies)(&builder_unset),
+        "Builder without fuseCacheBytes → no Warning"
     );
 }

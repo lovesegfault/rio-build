@@ -1197,15 +1197,28 @@ mod tests {
         assert_eq!(q("ephemeral-storage"), fd);
     }
 
+    /// mb_022: a Builder Pool that sets `fuseCacheBytes` (pre-CEL CR)
+    /// is silently ignored at the value-read site — `fuse_cache_bytes`
+    /// reads `BUILDER_FUSE_CACHE` regardless. The Warning event is
+    /// `DEGRADE_CHECKS::BuilderFuseCacheBytesIgnored` (covered in
+    /// `disruption_tests::degrade_builder_fuse_cache_ignored`); this
+    /// asserts the silent-ignore half.
     #[test]
-    fn builder_pool_rejects_fuse_cache_override() {
+    fn builder_pool_ignores_fuse_cache_override() {
         let mut p = test_pool("p", ExecutorKind::Builder);
         p.spec.fuse_cache_bytes = Some(100 * (1 << 30));
-        assert!(pod::reject_builder_fuse_cache_override(&p).is_some());
+        let cfg_fuse = *pod::BUILDER_FUSE_CACHE
+            .get()
+            .unwrap_or(&pod::BUILDER_FUSE_CACHE_BYTES);
+        assert_eq!(
+            pod::fuse_cache_bytes(&p),
+            cfg_fuse,
+            "Builder ignores spec.fuseCacheBytes — single-sourced from BUILDER_FUSE_CACHE"
+        );
         // Fetcher may override.
         let mut f = test_pool("f", ExecutorKind::Fetcher);
         f.spec.fuse_cache_bytes = Some(100 * (1 << 30));
-        assert!(pod::reject_builder_fuse_cache_override(&f).is_none());
+        assert_eq!(pod::fuse_cache_bytes(&f), 100 * (1 << 30));
     }
 
     /// `apply_intent_resources` injects `RIO_DAEMON_TIMEOUT_SECS =

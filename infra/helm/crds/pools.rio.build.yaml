@@ -57,10 +57,11 @@ spec:
                 description: "`fuse-cache` emptyDir sizeLimit AND the matching addend\
                   \ to the\ncontainer's `ephemeral-storage` request/limit (kubelet\
                   \ sums\ndisk-backed emptyDirs against that limit, so the two MUST\
-                  \ agree).\n`None` = per-kind safe-minimum default (8Gi builder,\
-                  \ 4Gi fetcher)\nso non-helm Pools schedule on small-disk clusters.\
-                  \ Helm prod\n`poolDefaults.fuseCacheBytes` overrides upward (50Gi).\
-                  \ Applies\nto BOTH kinds \u2014 NOT CEL-gated for Fetcher."
+                  \ agree).\nFetcher-only \u2014 Builder pools single-source from\
+                  \ controller\n`[nodeclaim_pool].fuse_cache_bytes` so FFD/cover/stamp\
+                  \ agree\n(mb_035); CEL rejects the field for Builder, and pre-CEL\
+                  \ CRs are\nignored with a Warning event. `None` = 4Gi safe-minimum\
+                  \ so\nnon-helm Fetcher Pools schedule on small-disk clusters."
                 format: uint64
                 minimum: 0.0
                 nullable: true
@@ -255,6 +256,10 @@ spec:
                 \ alone, not features (ADR-019)"
               rule: self.kind != 'Fetcher' || !has(self.features) || size(self.features)
                 == 0
+            - message: "kind=Builder forbids fuseCacheBytes \u2014 Builder pools single-source\
+                \ from controller [nodeclaim_pool].fuse_cache_bytes so FFD/cover/stamp\
+                \ agree (mb_035)"
+              rule: self.kind != 'Builder' || !has(self.fuseCacheBytes)
           status:
             description: "Pool status \u2014 reconciler writes, operators read.\n\n\
               `Default` because kube-rs initializes it to `None` \u2192\n`Some(default())`\
