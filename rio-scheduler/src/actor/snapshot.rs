@@ -9,8 +9,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::state::{
-    BuildState, DerivationStatus, DrvHash, ExecutorId, ExecutorState, HEARTBEAT_TIMEOUT_SECS,
-    SolvedIntent,
+    BuildState, DerivationStatus, ExecutorId, ExecutorState, HEARTBEAT_TIMEOUT_SECS, SolvedIntent,
 };
 
 use super::{
@@ -30,18 +29,21 @@ use super::{
 /// an idle pod still holds its node so `consolidate::reap_idle` won't
 /// cover it either — but no work is stuck there).
 ///
-/// `node_of` resolves the kube-authoritative `spec.nodeName` for an
-/// executor's HMAC-attested **`auth_intent`** (the pod's spawn-time
+/// `node_of` AND `tenant_of` both resolve from the executor's
+/// HMAC-attested **`auth_intent`** (the pod's spawn-time
 /// `INTENT_ID_ANNOTATION`, set once at connect, never mutated by
-/// heartbeat) via the controller-reported `authoritative_node` map —
-/// NEVER any worker-supplied or worker-influenceable value. Keying on
-/// `running_build` would be wrong: it diverges from `auth_intent` under
-/// dispatch fall-through, and `reconcile_running_build`'s `(None,
-/// Some(hb))` arm sets it from the heartbeat unconditionally, so a
-/// compromised worker could heartbeat `running_build=D` for a victim
-/// node's drv to inflate `occ` and suppress detection. Executors
-/// lacking an `authoritative_node` entry (controller-lag, Ack channel
-/// down) are skipped — fail-safe — and counted in
+/// heartbeat) — NEVER any worker-supplied or worker-influenceable
+/// value. Keying either on `running_build` would be wrong: it
+/// diverges from `auth_intent` under dispatch fall-through, and
+/// `reconcile_running_build`'s `(None, Some(hb))` arm sets it from
+/// the heartbeat unconditionally, so a compromised worker could
+/// heartbeat `running_build=D` for a victim node's drv to inflate
+/// `occ` (suppress detection) or for other tenants' drvs to forge
+/// `|tenants|≥2` (cause detection). `running_build` is read ONLY as
+/// `.is_none()` for the idle opt-out — forging `Some` opts the
+/// attacker IN to scrutiny; the value itself is never read.
+/// Executors lacking an `authoritative_node` entry (controller-lag,
+/// Ack channel down) are skipped — fail-safe — and counted in
 /// `rio_scheduler_hung_detect_skipped_no_authoritative_total`. Free
 /// function so the test supplies `tenant_of`/`node_of` closures
 /// without seeding `dag` + `builds` + `authoritative_node`.
@@ -49,7 +51,7 @@ use super::{
 pub(super) fn detect_hung_nodes(
     executors: &HashMap<ExecutorId, ExecutorState>,
     now: Instant,
-    tenant_of: impl Fn(&DrvHash) -> Option<Uuid>,
+    tenant_of: impl Fn(&str) -> Option<Uuid>,
     node_of: impl Fn(&str) -> Option<String>,
 ) -> Vec<String> {
     #[derive(Default)]
@@ -62,12 +64,11 @@ pub(super) fn detect_hung_nodes(
     let mut by_node: HashMap<String, Agg> = HashMap::new();
     let mut skipped_no_node = 0u64;
     for w in executors.values() {
-        let Some(h) = w.running_build.as_ref() else {
-            // Idle — no drv, no tenant, no contribution. The
-            // `auth_intent` let-else below stays SECOND so an idle
-            // executor with a binding still doesn't inflate `occ`.
+        if w.running_build.is_none() {
+            // Idle — no contribution. This check stays FIRST so an
+            // idle executor with a binding doesn't inflate `occ`.
             continue;
-        };
+        }
         let Some(auth) = w.auth_intent.as_deref() else {
             // Recovery-reconciled / pre-ADR-023 pod with no
             // intent annotation — same fail-safe skip as no-binding.
@@ -81,7 +82,7 @@ pub(super) fn detect_hung_nodes(
         agg.occ += 1;
         if now.duration_since(w.last_heartbeat) > timeout {
             agg.stale += 1;
-            if let Some(t) = tenant_of(h) {
+            if let Some(t) = tenant_of(auth) {
                 agg.tenants.insert(t);
             }
         }

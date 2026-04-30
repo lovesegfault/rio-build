@@ -285,7 +285,11 @@ impl DagActor {
         for n in snapshot::detect_hung_nodes(
             &self.executors,
             now,
-            |h| self.dag.node(h)?.attributed_tenant(&self.builds),
+            // None when the spawn-drv is terminal/swept from the DAG —
+            // fail-safe skip, mirrors `node_of` (`authoritative_node`
+            // is also swept on DAG-exit). The window is the
+            // DAG-prune race only.
+            |auth| self.dag.node(auth)?.attributed_tenant(&self.builds),
             |auth| self.authoritative_node.get(auth).cloned(),
         ) {
             self.hung_nodes.insert(n, now);
