@@ -288,13 +288,18 @@ impl CellSketches {
         self.get(cell).map_or(0.0, CellState::lead_time)
     }
 
-    /// Overlay `sla.leadTimeSeed` onto cells whose active sketch is
-    /// empty: inject `N_SEED = 1/(1−q) = 10` copies of the seed into
-    /// `z_active` and `boot_active`. Idempotent (skips cells with
-    /// `count > 0`). Called once after [`load`](Self::load) so cold-start
-    /// `lead_time()` returns the operator's probe-boot measurement
-    /// instead of 0. Malformed seed keys (not `"h:cap"`) are skipped +
-    /// warned.
+    /// Overlay `sla.leadTimeSeed` onto cells whose active AND shadow
+    /// sketches are empty: inject `N_SEED = 1/(1−q) = 10` copies of the
+    /// seed into `z_active` and `boot_active`. Idempotent. Called once
+    /// after [`load`](Self::load) so cold-start `lead_time()` returns
+    /// the operator's probe-boot measurement instead of 0.
+    ///
+    /// The shadow check matters for restart-after-rotation: `load()`
+    /// restores `z_shadow` from PG; injecting `N_SEED=10` into the
+    /// empty active would make `quantile_with_shadow` at q=0.9 see
+    /// `count=10 ≥ min_n=10` and return the seed, never consulting
+    /// shadow's learned distribution. Malformed seed keys (not
+    /// `"h:cap"`) are skipped + warned.
     // r[impl ctrl.nodeclaim.lead-time-ddsketch]
     pub fn seed(&mut self, lead_time_seed: &HashMap<String, f64>) {
         for (key, &seed) in lead_time_seed {
@@ -303,7 +308,7 @@ impl CellSketches {
                 continue;
             };
             let s = self.cell_mut(&cell);
-            if s.z_active.count() > 0 {
+            if s.z_active.count() > 0 || s.z_shadow.count() > 0 {
                 continue;
             }
             for _ in 0..N_SEED {
@@ -646,6 +651,50 @@ mod tests {
         // Idempotent: second call doesn't double-seed.
         sk.seed(&seeds);
         assert_eq!(sk.get(&cold).unwrap().z_active.count(), N_SEED);
+    }
+
+    /// mb_012: `seed()` skip-gate must check `z_shadow` too. After
+    /// rotation persisted (`z_active=∅, z_shadow=200`) then restart/
+    /// reload, `seed()` injecting `N_SEED=10` into active makes
+    /// `quantile_with_shadow` at q=0.9 see `count=10 ≥ min_n=10` →
+    /// returns the seed value, never consulting shadow's learned
+    /// distribution. The mb_026 sparse-active gate is defeated on the
+    /// canonical sparse-active-with-mature-shadow path it was meant to
+    /// cover.
+    #[test]
+    fn seed_preserves_shadow_after_rotation() {
+        let mut sk = CellSketches::default();
+        let cell = Cell("rotated".into(), CapacityType::Spot);
+        {
+            let s = sk.cell_mut(&cell);
+            for k in 0..200u32 {
+                s.record(20.0 + f64::from(k % 50), 0.0);
+            }
+            let t0 = SystemTime::UNIX_EPOCH;
+            s.epoch = t0;
+            s.maybe_rotate(
+                t0 + Duration::from_secs(7 * 3600),
+                Duration::from_secs(6 * 3600),
+            );
+            assert_eq!(s.z_active.count(), 0);
+            assert_eq!(s.z_shadow.count(), 200);
+        }
+        // This is the post-restart `load() → seed()` path: shadow holds
+        // the warm quantile; seeding active would mask it.
+        let seeds: HashMap<String, f64> = [("rotated:spot".into(), 5.0)].into();
+        sk.seed(&seeds);
+        let s = sk.get(&cell).unwrap();
+        assert_eq!(
+            s.z_active.count(),
+            0,
+            "seed() must NOT inject into active when shadow holds the warm \
+             quantile (would defeat quantile_with_shadow's min_n gate)"
+        );
+        let lt = sk.lead_time(&cell);
+        assert!(
+            lt >= 60.0,
+            "lead_time post-rotate-then-seed: {lt} (should be shadow's q0.9≈64, not seed=5)"
+        );
     }
 
     /// Active→shadow rotation on halflife expiry; `lead_time()` falls
