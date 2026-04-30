@@ -537,21 +537,53 @@ mod tests {
     /// Oracle: feed `claims` back as synthetic LiveNodes to the
     /// production FFD sim and assert all `intents` place. The
     /// §Simulator-shares-accounting executable guarantee — sizing
-    /// produces what FFD can pack. Same synthetic-env construction as
-    /// [`super::super::ffd::sim_packs`] (the impl predicate) so the
-    /// test exercises EXACTLY what `sizing` checked. Uniform claims
-    /// only (sizing's output is `vec![bin; n]`).
+    /// produces what FFD can pack.
+    ///
+    /// INDEPENDENT synthetic-env construction so a regression in
+    /// [`super::super::ffd::sim_packs`]'s env (the impl predicate's
+    /// `eta_seconds=f64::MIN` clone, `cell:Some` LiveNode literal,
+    /// `hw_arch=|_,_|true`) is detectable. NOT `sim_packs` itself —
+    /// `sizing()` already verified `sim_packs(.., n_pack)==true`, so
+    /// re-calling it is `f(x)==f(x)` (r27 bug_001). The two synthetic
+    /// envs share INTENT (neutralize lead-time gate, fully-registered
+    /// empty bins of the right cell) but diverge in CONSTRUCTION
+    /// (`ffd::tests::node` here sets `node_name=Some`, `created_secs`;
+    /// sim_packs's inline literal doesn't). Uniform claims only
+    /// (sizing's output is `vec![bin; n]`).
     fn oracle_places_all(
         cell: &Cell,
         intents: &[SpawnIntent],
         claims: &[(u32, u64, u64)],
         fuse: u64,
     ) -> bool {
-        let refs: Vec<&SpawnIntent> = intents.iter().collect();
+        use super::super::ffd;
         let Some(&bin) = claims.first() else {
             return intents.is_empty();
         };
-        super::super::ffd::sim_packs(cell, &refs, bin, claims.len() as u32, fuse)
+        // Same eta-neutralization as sim_packs (independently
+        // constructed): a_open's `eta < lead_time` filter would
+        // otherwise drop forecast intents against
+        // `CellSketches::default()`'s lead_time=0.
+        let neutralized: Vec<SpawnIntent> = intents
+            .iter()
+            .map(|i| SpawnIntent {
+                eta_seconds: f64::MIN,
+                ..i.clone()
+            })
+            .collect();
+        let nodes: Vec<_> = (0..claims.len())
+            .map(|k| ffd::tests::node(&format!("oracle{k}"), &cell.0, cell.1, bin.0, bin.1, bin.2))
+            .collect();
+        ffd::simulate(
+            &neutralized,
+            &nodes,
+            &CellSketches::default(),
+            &std::collections::HashMap::new(),
+            fuse,
+            |_, _| true,
+        )
+        .1
+        .is_empty()
     }
 
     fn intent_hd(id: &str, cores: u32, mem: u64, disk: u64, ready: Option<bool>) -> SpawnIntent {
