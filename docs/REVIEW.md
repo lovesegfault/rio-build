@@ -104,6 +104,23 @@ in too many heads.
   proptest must vary every input the production fn's behavior depends
   on (here: `ready`, `intent_id` tiebreak — see §Stability-tests
   "oracle proptest must vary every behavior-relevant input").
+- **Function becomes total** (r27 mb_006 → `cover::sizing` STRIKE-5):
+  by N=5 the recurring failure is the PRECONDITION ("every input ≤
+  cap"), not the body — different upstream paths (`--cores` override →
+  `fallback_cell` arch-only, `--capacity` `all_candidates` un-re-
+  filtered) keep delivering inputs that violate it under different caps
+  (r26's per-cell `min(class,global)` made `cap` smaller than the
+  `debug_assert` r25's A1 had calibrated for the global). Close: stop
+  relying on the precondition. The function partitions its input
+  (`fits` vs `over`), emits a metric+warn for `over`
+  (`intent_dropped_total{reason=exceeds_cell_cap}`), and operates on
+  `fits` only — total, never panics, and the "n=|u| packs" invariant
+  holds over `fits`. NOT a clamp: clamping the bin to `cap` while the
+  intent's pod still requests `>cap` mints a NodeClaim the pod can
+  never schedule onto — the validation's inverse-checker caught that
+  loop. Upstream still SHOULD deliver the invariant (per-cell ceiling
+  filter on producer paths) for correctness-of-intent; the function no
+  longer requires it for correctness-of-output.
 
 A new review rule MAY accompany the type-check (so first-strike on a
 *different* invariant is caught) — but the type-check is the close,
@@ -203,6 +220,20 @@ prompts include the (a)/(b)/(c) checklist above; (2) any logic
 introduced at integration — conflict resolution that isn't a pure
 merge, deferred amendments — is enumerated in the integration report
 and gets its own verify-r{N}-integration agent before gate.
+
+**Cross-batch invariant siblings.** r27: 5/5 r26-regressions are
+§one-step-removed shapes the IMPL-verifiers (with the (a)/(b)/(c)
+checklist) still missed. The pattern: the verifier probed THE FIX's
+inverse, not the fix's effect on a SIBLING CLOSE's invariant. r27
+mb_006 = r26-bug_020's per-cell cap broke r25-STRIKE-3's
+`debug_assert!(max_c≤cap)` (calibrated for the OLD global cap). r27
+bug_002 = r26-mb_022 re-keyed `node_of` to `auth_intent` but left
+`tenant_of` 8 lines later on the same `running_build` the doc-comment
+explains is wrong. Addendum to (c): when a batch changes a SHARED
+parameter (a cap, a key-granularity, a gate-semantics), the verifier's
+sibling-sweep extends to OTHER closes that documented an invariant on
+the OLD parameter — `rg <param>` over `debug_assert`/doc-comments
+across the crate, not just the close's own files.
 
 ## Partition-single-source
 
@@ -512,6 +543,18 @@ each input field of the oracle fn that affects its output, the
 generator varies it; the test's doc lists which fields are
 deliberately fixed and why.
 
+**Oracle ≠ impl-predicate.** r27 bug_001: r26's STRIKE-4 close routed
+the test oracle through `sim_packs` — the IMPL predicate. With
+unconstrained budget `sizing()` returns at the first `n` where
+`sim_packs(.., n)==true`, then `oracle_places_all` re-runs `sim_packs`
+on the same `(u, n)`: `f(x)==f(x)`. After "delete the
+reimplementation; production fn IS impl" the remaining degree of
+freedom is the synthetic ENV the predicate builds (LiveNodes, sketch
+state, eta-neutralization). Close: the oracle constructs that env
+INDEPENDENTLY (different code path, same intent — `ffd::tests::node`
++ direct `simulate`, not `sim_packs`). A regression in either env
+construction is then detectable by the other.
+
 ## Model-formula reimplementation
 
 Any consumer that evaluates `T(c)`, `M(c)`, or another `sla::types`
@@ -609,6 +652,18 @@ controller-authoritative `map[K]=V` is only as trusted as `K`. For
 destructive cross-tenant actions, the lookup key must be HMAC-attested
 (`auth_intent`, set once from token, never mutated by heartbeat) or
 kube-sourced.
+
+**Enumerate every field read at the boundary.** r27 bug_002: second
+consecutive round the indirection-key shape hit `detect_hung_nodes`
+(r26 `node_of`, r27 the sibling `tenant_of` 8 lines below the doc that
+explains why `running_build` is wrong). Hardening one read of an
+untrusted field is not the close; the close is that EVERY read in the
+boundary fn's body is enumerated as either (a) attested/authoritative
+key, or (b) opt-in-only — forging the value increases scrutiny on the
+forger (`.is_none()` gate, presence-check). Done-gate: `rg
+'<untrusted-field>' <fn-body>` with each match annotated. r27's:
+`running_build` in `detect_hung_nodes` matches only the `.is_none()`
+idle gate.
 
 ## Simplex-bound
 
