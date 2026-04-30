@@ -238,8 +238,7 @@ pub struct DagActor {
     /// stale executors after detection, so a `Vec` recomputed each
     /// tick would be a one-shot signal that drops N−cap nodes on AZ
     /// outage. `handle_tick` `.insert(n, now)`s each (re-)detection
-    /// (refreshing the timestamp) and prunes entries no longer in
-    /// `authoritative_node` AND older than
+    /// (refreshing the timestamp) and prunes entries older than
     /// [`housekeeping::HUNG_NODE_REPEAT_TTL`] since last detected.
     /// `compute_spawn_intents` reads `keys()`.
     pub(crate) hung_nodes: HashMap<String, Instant>,

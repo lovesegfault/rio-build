@@ -11,7 +11,7 @@
 //!   (AMI/network/nodeadm failure). Delete; the cell isn't ICE-masked
 //!   (capacity exists, the boot failed).
 //! - **Dead** (scheduler-reported `dead_nodes`): the §13b hung-node
-//!   detector — ≥max(3,⌈0.5·occ⌉) stale-heartbeat executors across ≥2
+//!   detector — ≥max(2,⌈0.5·occ⌉) stale-heartbeat executors across ≥2
 //!   tenants on one Node. Delete the NodeClaim (Karpenter handles
 //!   cordon+drain via finalizer).
 //!

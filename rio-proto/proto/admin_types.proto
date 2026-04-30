@@ -514,9 +514,9 @@ message GetSpawnIntentsResponse {
   // queue state.
   map<string, uint64> queued_by_system = 2;
   // §13b: scheduler-computed hung-node detector. A node enters this
-  // list when ≥max(3, ⌈0.5·occupancy⌉) executors across ≥2 distinct
+  // list when ≥max(2, ⌈0.5·occupancy⌉) executors across ≥2 distinct
   // tenants on that node have stale-heartbeat. Controller cordons +
-  // evicts. Empty until B11 wires the detector.
+  // evicts (`r[sched.admin.hung-node-detector+3]`).
   repeated string dead_nodes = 3;
   // §13b: per-cell ICE mask ("h:cap" strings) so the controller's
   // @alg-pool excludes the same cells the scheduler has marked
