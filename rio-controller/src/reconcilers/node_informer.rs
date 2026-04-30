@@ -184,7 +184,9 @@ impl HwClassConfig {
 
     /// Replace the config wholesale from a `GetHwClassConfigResponse`.
     /// Sorted by `$h` for deterministic [`Self::match_node`] on overlap.
-    fn set(&self, hw_classes: HashMap<String, rio_proto::types::HwClassLabels>) {
+    /// `pub(crate)` for tests that need per-class `max_cores`/`max_mem`
+    /// (which [`Self::from_literals`] doesn't carry).
+    pub(crate) fn set(&self, hw_classes: HashMap<String, rio_proto::types::HwClassLabels>) {
         let mut v: Vec<_> = hw_classes
             .into_iter()
             .map(|(h, def)| {

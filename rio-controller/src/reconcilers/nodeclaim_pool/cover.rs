@@ -232,7 +232,38 @@ pub fn sizing(cell: &Cell, u: &[&SpawnIntent], cfg: &SizingCfg) -> (Vec<(u32, u6
     if u.is_empty() {
         return (Vec::new(), f64::MAX);
     }
-    let (sum_c, sum_m, sum_d, max_c, max_m, max_d) = u
+    // STRIKE-5 (r27 mb_006): per-cell `cfg.max_node_*` (from
+    // `HwClassDef.max_cores`) means the upstream "≤ global cap"
+    // invariant is no longer "≤ per-cell cap". An over-cap intent has no
+    // valid claim of ANY n (its pod requests `intent_pod_footprint(i)`,
+    // not the claim's `(c,m,d)`); a clamped claim would just loop
+    // (mint→Pending→re-mint). Filter and DROP — `assign_to_cells`' next
+    // tick re-evaluates if the scheduler re-solves with the per-cell
+    // ceiling, otherwise the intent stays dropped here. The scheduler's
+    // `ClassCeiling` gate SHOULD have prevented this; the producer holes
+    // (override-bypass `fallback_cell`, `--capacity` `all_candidates`-
+    // fallback) are the r28 single-chokepoint candidate.
+    let (fits, over): (Vec<&SpawnIntent>, Vec<&SpawnIntent>) = u.iter().copied().partition(|i| {
+        let (ic, im, id) = intent_pod_footprint(i, cfg.fuse_cache_bytes);
+        ic <= cfg.max_node_cores && im <= cfg.max_node_mem && id <= cfg.max_node_disk
+    });
+    for i in &over {
+        let (ic, im, id) = intent_pod_footprint(i, cfg.fuse_cache_bytes);
+        tracing::warn!(
+            intent_id = %i.intent_id, cell = %cell, footprint = ?(ic, im, id),
+            cap = ?(cfg.max_node_cores, cfg.max_node_mem, cfg.max_node_disk),
+            "intent footprint exceeds per-cell cap — dropping (scheduler ClassCeiling not gating?)"
+        );
+        ::metrics::counter!(
+            "rio_controller_nodeclaim_intent_dropped_total",
+            "reason" => "exceeds_cell_cap",
+        )
+        .increment(1);
+    }
+    if fits.is_empty() {
+        return (Vec::new(), f64::MAX);
+    }
+    let (sum_c, sum_m, sum_d, max_c, max_m, max_d) = fits
         .iter()
         .map(|i| intent_pod_footprint(i, cfg.fuse_cache_bytes))
         .fold(
@@ -241,15 +272,7 @@ pub fn sizing(cell: &Cell, u: &[&SpawnIntent], cfg: &SizingCfg) -> (Vec<(u32, u6
                 (c + ic, m + im, d + id, mc.max(ic), mm.max(im), md.max(id))
             },
         );
-    // Upstream invariant: `solve_intent_for` caps each intent's c* at
-    // `sla.maxCores` (= `cfg.max_node_cores`, single-sourced via helm),
-    // so `claim_at(n).0 = ⌈Σc/n⌉.max(max_c) ≤ max_node_cores` always.
-    debug_assert!(
-        max_c <= cfg.max_node_cores,
-        "intent cores {max_c} > max_node_cores {} — scheduler ClassCeiling/cap_c not gating?",
-        cfg.max_node_cores
-    );
-    let min_eta = u.iter().map(|i| i.eta_seconds).fold(f64::MAX, f64::min);
+    let min_eta = fits.iter().map(|i| i.eta_seconds).fold(f64::MAX, f64::min);
     let claim_at = |n: u32| {
         (
             sum_c.div_ceil(n).max(max_c).max(1),
@@ -258,9 +281,17 @@ pub fn sizing(cell: &Cell, u: &[&SpawnIntent], cfg: &SizingCfg) -> (Vec<(u32, u6
         )
     };
     let n_lo = claim_count((sum_c, sum_m, sum_d), cfg);
-    let n_hi = u.len() as u32;
+    let n_hi = fits.len() as u32;
+    // After the over-cap filter, every footprint ≤ cap on every axis, so
+    // `claim_at(n_hi) = (max_c, max_m, max_d) ≤ cap` and `n_lo =
+    // ⌈Σ/cap⌉ ≤ ⌈Σ/max_axis⌉ ≤ |fits|`. The find-loop terminates at
+    // `n_hi` at the latest (one bin per intent trivially packs).
+    debug_assert!(
+        n_lo <= n_hi,
+        "n_lo {n_lo} > n_hi {n_hi} after over-cap filter"
+    );
     let n_pack = (n_lo..=n_hi)
-        .find(|&n| super::ffd::sim_packs(cell, u, claim_at(n), n, cfg.fuse_cache_bytes))
+        .find(|&n| super::ffd::sim_packs(cell, &fits, claim_at(n), n, cfg.fuse_cache_bytes))
         .unwrap_or(n_hi);
     let (chunk, mem, disk) = claim_at(n_pack);
     if cfg.budget < chunk {
@@ -616,6 +647,77 @@ mod tests {
             oracle_places_all(&h_spot(), &u, &claims, scfg.fuse_cache_bytes),
             "mixed-ready FFD-oracle leaves unplaced; claims={claims:?}"
         );
+    }
+
+    /// STRIKE-5 (r27 mb_006): per-cell `cfg.max_node_cores` (from
+    /// `HwClassDef.max_cores`) can be tighter than the GLOBAL cap the
+    /// scheduler's chokepoint clamps at. An over-cap intent has no valid
+    /// claim of any `n` (its pod requests `intent_pod_footprint(i)`, not
+    /// the claim's `(c,m,d)`); a clamped 32c claim would just loop
+    /// (mint→Pending→re-mint). `sizing()` filters and DROPS (with metric
+    /// + warn), sizing on the remainder.
+    #[test]
+    fn sizing_filters_intent_exceeding_per_cell_cap() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let scfg = cfg(32, u32::MAX, u32::MAX);
+        let dropped_count = |rec: &DebuggingRecorder| {
+            rec.snapshotter()
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(k, _, _, v)| {
+                    let key = k.key();
+                    (key.name() == "rio_controller_nodeclaim_intent_dropped_total"
+                        && key
+                            .labels()
+                            .any(|l| l.key() == "reason" && l.value() == "exceeds_cell_cap"))
+                    .then_some(v)
+                })
+        };
+        // All over → empty + metric.
+        {
+            let rec = DebuggingRecorder::new();
+            let _g = ::metrics::set_default_local_recorder(&rec);
+            let over = intent_hd("o", 48, 8 * GI, 5 * GI, Some(true));
+            let (claims, eta) = sizing(&h_spot(), &[&over], &scfg);
+            assert!(
+                claims.is_empty(),
+                "48c@cap=32 must drop, not clamp: {claims:?}"
+            );
+            assert_eq!(eta, f64::MAX, "all-dropped → no eta to forecast");
+            assert_eq!(dropped_count(&rec), Some(DebugValue::Counter(1)));
+        }
+        // Mixed → over filtered, fits sized normally, oracle places.
+        {
+            let rec = DebuggingRecorder::new();
+            let _g = ::metrics::set_default_local_recorder(&rec);
+            let over = intent_hd("o", 48, 8 * GI, 5 * GI, Some(true));
+            let f0 = intent_hd("f0", 16, 8 * GI, 5 * GI, Some(true));
+            let f1 = intent_hd("f1", 16, 8 * GI, 5 * GI, Some(true));
+            let u = [&over, &f0, &f1];
+            let (claims, _) = sizing(&h_spot(), &u, &scfg);
+            assert_eq!(claims.len(), 1, "Σc(fits)=32 at cap=32 → n=1");
+            assert_eq!(claims[0].0, 32);
+            assert!(
+                oracle_places_all(
+                    &h_spot(),
+                    &[f0.clone(), f1.clone()],
+                    &claims,
+                    scfg.fuse_cache_bytes
+                ),
+                "fits-only must pack"
+            );
+            assert_eq!(dropped_count(&rec), Some(DebugValue::Counter(1)));
+        }
+        // Mem axis over.
+        {
+            let rec = DebuggingRecorder::new();
+            let _g = ::metrics::set_default_local_recorder(&rec);
+            let over_m = intent_hd("om", 4, 512 * GI, 5 * GI, Some(true));
+            let (claims, _) = sizing(&h_spot(), &[&over_m], &scfg);
+            assert!(claims.is_empty(), "mem 512Gi@cap=256Gi must drop");
+            assert_eq!(dropped_count(&rec), Some(DebugValue::Counter(1)));
+        }
     }
 
     /// Hand-rolled property check (proptest-equivalent without the dep,

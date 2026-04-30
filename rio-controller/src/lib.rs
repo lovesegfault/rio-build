@@ -173,11 +173,16 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_controller_nodeclaim_intent_dropped_total",
-        "nodeclaim_pool cover_deficit hw-agnostic intents dropped by `reason`. \
-         reason=no_menu_for_arch: intent.system maps to an arch with no \
-         configured hw-class (and referenceHwClass mismatches) — \
-         the cold-start fallback could not target ANY cell. Non-zero on a \
-         dual-arch cluster = a hwClasses key-set is missing one arch."
+        "nodeclaim_pool cover_deficit intents dropped by `reason`. \
+         reason=no_menu_for_arch: hw-agnostic intent.system maps to an arch \
+         with no configured hw-class (and referenceHwClass mismatches) — the \
+         cold-start fallback could not target ANY cell. Non-zero on a \
+         dual-arch cluster = a hwClasses key-set is missing one arch. \
+         reason=exceeds_cell_cap: intent's pod footprint exceeds the assigned \
+         cell's per-class HwClassDef.max_cores/max_mem (or max_node_disk) — \
+         the scheduler's ClassCeiling gate didn't reject it (override-bypass \
+         producer hole). The intent has no valid claim of any n; sizing drops \
+         it instead of looping mint→Pending."
     );
     describe_counter!(
         "rio_controller_nodeclaim_created_total",

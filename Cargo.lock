@@ -6664,6 +6664,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "metrics",
+ "metrics-util",
  "parking_lot",
  "postcard",
  "prost",

@@ -262,9 +262,10 @@ impl NodeClaimPoolConfig {
     /// (`hw_class_names=[]`, i.e. `fit=None`): the
     /// `(referenceHwClass, Spot)` cell when its `kubernetes.io/arch`
     /// label matches `intent.system` (or is absent — arch-agnostic
-    /// hw-class), else the first (sorted) hw-class whose arch matches.
-    /// `None` ⇔ `system` unmappable OR no configured hw-class hosts
-    /// that arch (caller emits
+    /// hw-class) AND its per-class `max_cores`/`max_mem` host the
+    /// intent, else the first (sorted) hw-class satisfying both. `None`
+    /// ⇔ `system` unmappable OR no configured hw-class hosts that arch
+    /// at that size (caller emits
     /// `rio_controller_nodeclaim_intent_dropped_total
     /// {reason=no_menu_for_arch}`).
     ///
@@ -283,8 +284,20 @@ impl NodeClaimPoolConfig {
     ) -> Option<Cell> {
         let arch = ffd::system_to_arch(&i.system)?;
         let candidate = |h: &str| {
+            // Per-class ceiling filter: an hw-agnostic intent (override
+            // bypass-path with `--cores=N`) may carry `cores >
+            // class.max_cores`. Routing it to that cell would hit
+            // `cover::sizing`'s exceeds_cell_cap drop — better to find
+            // a cell that CAN host it (or `None` → caller's
+            // `no_menu_for_arch` metric, which is the right operator
+            // signal: "no class for this arch is big enough").
+            let (cls_c, cls_m) = hw.ceilings_for(h).unwrap_or((u32::MAX, u64::MAX));
             let c = Cell(h.into(), CapacityType::Spot);
-            (hw.matches_arch(h, arch) && !masked.contains(&c)).then_some(c)
+            (hw.matches_arch(h, arch)
+                && !masked.contains(&c)
+                && i.cores <= cls_c
+                && i.mem_bytes <= cls_m)
+                .then_some(c)
         };
         candidate(&self.reference_hw_class).or_else(|| hw.names().iter().find_map(|h| candidate(h)))
     }
@@ -1242,6 +1255,68 @@ mod tests {
             cfg3.fallback_cell(&i("x86_64-linux"), &hw3, &none),
             Some(Cell("vmtest".into(), CapacityType::Spot))
         );
+    }
+
+    /// r27 mb_006 producer-side: an hw-agnostic intent (override
+    /// bypass-path) with `cores > class.max_cores` must NOT route to
+    /// that cell — find a class that CAN host it, or `None` (caller's
+    /// `no_menu_for_arch` metric). Without this, `cover::sizing`'s
+    /// `exceeds_cell_cap` backstop drops it AFTER assignment; this
+    /// filter delivers the invariant upstream.
+    #[test]
+    fn fallback_cell_filters_by_per_class_ceilings() {
+        use rio_proto::types::{HwClassLabels, NodeLabelMatch};
+        let cfg = NodeClaimPoolConfig {
+            reference_hw_class: "lo-ebs-x86".into(),
+            ..Default::default()
+        };
+        let arch = |a: &str| NodeLabelMatch {
+            key: ARCH_LABEL.into(),
+            value: a.into(),
+        };
+        let hw = HwClassConfig::default();
+        hw.set(
+            [
+                (
+                    "lo-ebs-x86".into(),
+                    HwClassLabels {
+                        labels: vec![arch("amd64")],
+                        max_cores: 32,
+                        max_mem: 64 << 30,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "hi-ebs-x86".into(),
+                    HwClassLabels {
+                        labels: vec![arch("amd64")],
+                        max_cores: 128,
+                        max_mem: 256 << 30,
+                        ..Default::default()
+                    },
+                ),
+            ]
+            .into(),
+        );
+        let mk = |cores: u32| SpawnIntent {
+            system: "x86_64-linux".into(),
+            cores,
+            ..Default::default()
+        };
+        let none = HashSet::new();
+        // 16c fits reference (32c cap).
+        assert_eq!(
+            cfg.fallback_cell(&mk(16), &hw, &none),
+            Some(Cell("lo-ebs-x86".into(), CapacityType::Spot))
+        );
+        // 64c exceeds reference (32c) → fails over to hi (128c cap).
+        assert_eq!(
+            cfg.fallback_cell(&mk(64), &hw, &none),
+            Some(Cell("hi-ebs-x86".into(), CapacityType::Spot)),
+            "reference too small → next ceiling-fitting class"
+        );
+        // 256c exceeds ALL classes → None (no_menu_for_arch).
+        assert_eq!(cfg.fallback_cell(&mk(256), &hw, &none), None);
     }
 
     /// `ControllerLeaseHooks` flags propagate via shared `Arc` — the
