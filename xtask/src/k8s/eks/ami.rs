@@ -70,8 +70,8 @@ const ARM: Target = Target {
 };
 // I-205: AWS x86_64 .metal SKUs reject UEFI AMIs (every one is
 // SupportedBootModes=["legacy-bios"] per `aws ec2 describe-instance-
-// types`). The rio-builder-metal NodePool selects this via the
-// `rio-metal` EC2NodeClass.
+// types`). §13c: §13b metal NodeClaims (hwClasses with `nodeClass:
+// rio-metal`) select this via the `rio-metal` EC2NodeClass.
 const X86_BIOS: Target = Target {
     attr: "x86_64-bios",
     ec2_arch: ArchitectureValues::X8664,

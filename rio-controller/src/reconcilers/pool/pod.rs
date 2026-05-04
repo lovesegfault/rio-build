@@ -24,16 +24,16 @@ use rio_crds::pool::{ExecutorKind, Pool, PoolSpec, SeccompProfileKind};
 
 /// Nix `system-features` string that signals "this builder runs
 /// qemu-kvm". When present in `spec.features`, the pod gets the
-/// [`KVM_NODE_LABEL`] nodeSelector + toleration so it lands on the
-/// metal NodePool. `/dev/kvm` itself is injected by containerd
+/// [`KVM_NODE_LABEL`] nodeSelector + toleration so it lands on a §13b
+/// metal NodeClaim. `/dev/kvm` itself is injected by containerd
 /// `base_runtime_spec` on every node (`nix/base-runtime-spec.nix`);
 /// it ENXIOs on open() on non-`.metal` hosts, so the nodeSelector is
 /// what makes kvm builds work, not the device node's presence.
 pub(super) const KVM_FEATURE: &str = "kvm";
 
-/// Node label set on the metal NodePool (values.yaml `karpenter.
-/// nodePools[rio-builder-metal].labels`). Pairs with the same-key
-/// taint.
+/// Node label stamped on metal nodes (§13c: `scheduler.sla.hwClasses.
+/// metal-*.labels`, via `cover::build_nodeclaim`). Pairs with the
+/// same-key taint (`metal-*.taints`).
 const KVM_NODE_LABEL: &str = "rio.build/kvm";
 
 /// Pod label carrying the executor role. Scheduler routing, network

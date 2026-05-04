@@ -200,10 +200,10 @@ impl HwClassConfig {
     }
 
     /// `[sla.hw_classes.$h].capacity_types` for `h` as controller-side
-    /// [`CapacityType`]s. §13c: `all_cells`/`fallback_cell` iterate
-    /// THIS so an od-only class structurally never produces a
-    /// `(h, Spot)` cell. Unknown `h` / not loaded / empty (pre-§13c
-    /// scheduler) → ALL.
+    /// [`CapacityType`](crate::reconcilers::nodeclaim_pool::CapacityType)s.
+    /// §13c: `all_cells`/`fallback_cell` iterate THIS so an od-only
+    /// class structurally never produces a `(h, Spot)` cell. Unknown
+    /// `h` / not loaded / empty (pre-§13c scheduler) → ALL.
     pub fn capacity_types_for(
         &self,
         h: &str,

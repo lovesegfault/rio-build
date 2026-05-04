@@ -363,6 +363,15 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
 
     // ---- HwClassSampled (per-tick, one RPC for the union of A's) ----
     // r[impl ctrl.pool.hw-bench-needed+2]
+    //
+    // TODO: §13c §one-step-removed: kvm intents now carry
+    // `hw_class_names=[metal-*]` so a cold-start metal class triggers a
+    // STREAM bench on a `.metal` host (~$5-10/hr). That cost is not new
+    // (the static metal NodePool incurred it too), but the bench result
+    // matters less for od-only feature classes — the per-class pricing
+    // is almost flat. Add `HwClassDef.skip_bench: bool` (or gate on
+    // `!provides_features.is_empty()`) to skip the bench for classes
+    // where the cost ladder is cheaper to seed directly.
     let hw_sampled =
         HwSampledCache::fetch(ctx, intents.iter().flat_map(hw_classes_in).collect()).await;
 

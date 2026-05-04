@@ -916,7 +916,7 @@ impl DagActor {
         // they route to hwClasses with matching `provides_features` via
         // the bidirectional ∅-guard, so kvm intents get full SLA-solve
         // participation on metal cells instead of the static
-        // `rio-builder-metal` NodePool bypass. `h_all` is partitioned
+        // pre-§13c static metal NodePool bypass. `h_all` is partitioned
         // accordingly: a class providing `[kvm]` is excluded for
         // featureless intents (so metal doesn't absorb non-kvm), and a
         // class providing `[]` is excluded for kvm intents.

@@ -754,7 +754,7 @@ r[sched.sla.hwclass.provides]
 hw-class `h` can host. `solve_intent_for` partitions `h_all` by this
 before `solve_full` so feature-bearing intents (e.g. `kvm`) get full
 SLA-solve participation on the matching classes only. §13c: replaces the
-static `rio-builder-metal` NodePool bypass.
+pre-§13c static metal NodePool bypass.
 
 r[sched.sla.hwclass.provides.bidir]
 Feature-match is the bidirectional ∅-guard predicate

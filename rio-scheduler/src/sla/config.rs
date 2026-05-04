@@ -62,7 +62,7 @@ pub struct HwClassDef {
     /// [`features_compatible`] bidirectional ∅-guard routes intents:
     /// a class with `provides_features=["kvm"]` accepts ONLY kvm
     /// intents; an empty `provides_features` accepts ONLY featureless
-    /// intents. §13c: replaces the static `rio-builder-metal` NodePool
+    /// intents. §13c: replaces the pre-§13c static metal NodePool
     /// routing.
     #[serde(default)]
     pub provides_features: Vec<String>,
@@ -548,9 +548,10 @@ impl SlaConfig {
                 // §13c D10: FULL bidirectional features_compatible (NOT
                 // half-predicate `provides⊄required` — that misses
                 // `required=[kvm], provides=[]` because ∅⊆anything).
-                // Unknown class → `provides_for=[]` → only featureless
-                // intents pass; same backstop semantics as size (unknown
-                // → no per-class ceiling).
+                // Unknown class → no feature constraint (the
+                // `!contains_key` guard mirrors size's MAX backstop;
+                // calling `features_compatible(_, provides_for(unknown)=[])`
+                // would wrongly strip kvm intents on unknown classes).
                 let feat_ok = !self.hw_classes.contains_key(h)
                     || features_compatible(required_features, self.provides_for(h));
                 let ok = cores <= cc && mem <= cm && feat_ok;

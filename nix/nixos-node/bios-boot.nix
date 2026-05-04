@@ -5,8 +5,8 @@
 # Name=bare-metal,Values=true Name=processor-info.supported-
 # architecture,Values=x86_64 --query 'InstanceTypes[].SupportedBootModes'`
 # returns `["legacy-bios"]` for every entry. The UEFI/UKI AMI
-# (uki-boot.nix) made the rio-builder-metal NodePool unschedulable on x86
-# — Karpenter CreateFleet → InvalidParameterValue on every candidate,
+# (uki-boot.nix) made x86 metal NodeClaims unschedulable —
+# Karpenter CreateFleet → InvalidParameterValue on every candidate,
 # NodeClaims churned forever.
 #
 # This module is composed ONLY into `.#node-ami-x86_64-bios` (flake.nix

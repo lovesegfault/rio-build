@@ -740,8 +740,9 @@
               # bios variant swaps uki-boot.nix for bios-boot.nix and
               # registers boot_mode=legacy-bios; everything else is
               # identical so the rio-metal EC2NodeClass can select it for
-              # the rio-builder-metal NodePool while rio-default keeps
-              # the UEFI/UKI image for virtualized + arm64 .metal.
+              # §13b metal NodeClaims (§13c: hwClasses with nodeClass:
+              # rio-metal) while rio-default keeps the UEFI/UKI image for
+              # virtualized + arm64 .metal.
               efi ? true,
             }:
             (nixpkgs.lib.nixosSystem {

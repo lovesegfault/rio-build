@@ -512,8 +512,8 @@ r[ctrl.nodeclaim.taints.hwclass]
 `build_nodeclaim` sets `spec.taints` to the universal builder taint
 followed by `hwClasses[h].taints` (chain order: builder first). §13c:
 metal hwClasses carry `rio.build/kvm=true:NoSchedule` so only kvm-
-tolerating pods land on metal nodes — replacing the static
-`rio-builder-metal` NodePool's hardcoded taint.
+tolerating pods land on metal nodes — replacing the pre-§13c static
+metal NodePool's hardcoded taint.
 
 r[ctrl.nodeclaim.budget.per-class]
 `cover_deficit` clamps each cell's per-tick mint at
