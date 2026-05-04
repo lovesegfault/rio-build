@@ -1006,6 +1006,17 @@ impl NodeClaimPoolReconciler {
                     }),
                 labels: hw_labels,
                 requirements: self.hw_config.requirements_for(&cell.0).unwrap_or_default(),
+                taints: self
+                    .hw_config
+                    .taints_for(&cell.0)
+                    .into_iter()
+                    .map(|t| k8s_openapi::api::core::v1::Taint {
+                        key: t.key,
+                        value: (!t.value.is_empty()).then_some(t.value),
+                        effect: t.effect,
+                        ..Default::default()
+                    })
+                    .collect(),
             };
             let cover_cfg = cover::CoverCfg {
                 metal_sizes: &self.cfg.metal_sizes,

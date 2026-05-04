@@ -88,6 +88,10 @@ pub struct HwClassCtx {
     pub labels: Vec<(String, String)>,
     /// Karpenter instance-type `spec.requirements`.
     pub requirements: Vec<NodeSelectorRequirement>,
+    /// §13c: per-hw-class Node taints (chained after
+    /// [`builder_taint`]). e.g. metal classes carry
+    /// `rio.build/kvm=true:NoSchedule`.
+    pub taints: Vec<Taint>,
 }
 
 /// Cluster-level [`build_nodeclaim`] config that doesn't vary per
@@ -1006,7 +1010,20 @@ mod tests {
                     values: vec!["amd64".into()],
                 },
             ],
+            taints: vec![],
         }
+    }
+
+    /// Metal hw-class context with the §13c kvm taint.
+    fn hw_ctx_metal() -> HwClassCtx {
+        let mut ctx = hw_ctx(METAL_NODE_CLASS);
+        ctx.taints = vec![Taint {
+            key: "rio.build/kvm".into(),
+            value: Some("true".into()),
+            effect: "NoSchedule".into(),
+            ..Default::default()
+        }];
+        ctx
     }
 
     /// Asserts the full wire shape: generateName, labels (hw-class
@@ -1112,6 +1129,7 @@ mod tests {
             node_class: "x".into(),
             labels: vec![],
             requirements: vec![],
+            taints: vec![],
         };
         let nc = build_nodeclaim(
             &cell,

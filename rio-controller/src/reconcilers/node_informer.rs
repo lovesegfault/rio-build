@@ -66,19 +66,36 @@ const LABEL_CAPACITY_TYPE: &str = "karpenter.sh/capacity-type";
 /// when a Node satisfies two overlapping conjunctions (lexicographic
 /// `$h` wins).
 #[derive(Clone, Default)]
-pub struct HwClassConfig(Arc<RwLock<Vec<HwClassDef>>>);
+pub struct HwClassConfig(Arc<RwLock<Vec<HwClassResolved>>>);
 
-/// One `[sla.hw_classes.$h]` entry: the `$h` name + its ANDed label
-/// conjunction + Karpenter instance-type requirements + EC2NodeClass
-/// name + per-class `(max_cores, max_mem)` capacity ceilings.
-type HwClassDef = (
-    String,
-    Vec<(String, String)>,
-    Vec<rio_proto::types::NodeSelectorRequirement>,
-    String,
-    u32,
-    u64,
-);
+/// One resolved `[sla.hw_classes.$h]` entry. Named struct (was a
+/// 6-tuple pre-§13c; at 10 fields a tuple's positional accessors —
+/// `(_, _, _, nc, ..)` — are a destructure-site bug magnet).
+#[derive(Clone, Default)]
+pub(crate) struct HwClassResolved {
+    /// Operator's `$h` key.
+    pub name: String,
+    /// ANDed `(k, v)` Node-stamp labels.
+    pub labels: Vec<(String, String)>,
+    /// Karpenter instance-type `spec.requirements`.
+    pub requirements: Vec<rio_proto::types::NodeSelectorRequirement>,
+    /// EC2NodeClass name.
+    pub node_class: String,
+    /// Per-class capacity ceiling (cores).
+    pub max_cores: u32,
+    /// Per-class capacity ceiling (bytes).
+    pub max_mem: u64,
+    /// §13c: per-class Node taints.
+    pub taints: Vec<rio_proto::types::NodeTaint>,
+    /// §13c: `requiredSystemFeatures` this class hosts.
+    pub provides_features: Vec<String>,
+    /// §13c: per-class fleet-core sub-budget.
+    pub max_fleet_cores: Option<u32>,
+    /// §13c: capacity-types this class is permitted to provision
+    /// (Karpenter label form: `"spot"` / `"on-demand"`). Empty ⇔ not
+    /// shipped by scheduler ⇔ ALL.
+    pub capacity_types: Vec<String>,
+}
 
 impl HwClassConfig {
     /// First `$h` (lexicographic) whose every `(k, v)` is satisfied by
@@ -86,8 +103,8 @@ impl HwClassConfig {
     /// (not yet loaded).
     pub fn match_node(&self, labels: &BTreeMap<String, String>) -> Option<String> {
         let cfg = self.0.read();
-        for (h, conj, ..) in cfg.iter() {
-            if conj
+        for d in cfg.iter() {
+            if d.labels
                 .iter()
                 .all(|(k, v)| labels.get(k).is_some_and(|nv| nv == v))
             {
@@ -99,10 +116,11 @@ impl HwClassConfig {
                 // is the load-bearing check (bug_038); this is a
                 // belt-and-suspenders fail-fast in tests.
                 debug_assert!(
-                    rio_common::limits::is_hw_class_name(h),
-                    "hw_class {h:?} fails is_hw_class_name"
+                    rio_common::limits::is_hw_class_name(&d.name),
+                    "hw_class {:?} fails is_hw_class_name",
+                    d.name
                 );
-                return Some(h.clone());
+                return Some(d.name.clone());
             }
         }
         None
@@ -115,10 +133,15 @@ impl HwClassConfig {
     /// Node carries `rio.build/hw-band`/`storage` (these are NOT
     /// instance-type properties — see [`Self::requirements_for`]).
     pub fn labels_for(&self, h: &str) -> Option<Vec<(String, String)>> {
-        let cfg = self.0.read();
-        cfg.iter()
-            .find(|(name, ..)| name == h)
-            .map(|(_, conj, ..)| conj.clone())
+        self.find(h).map(|d| d.labels.clone())
+    }
+
+    /// Find the entry for `h` (under read lock). Internal — public
+    /// accessors clone out the field they need so the lock doesn't
+    /// escape.
+    fn find(&self, h: &str) -> Option<parking_lot::MappedRwLockReadGuard<'_, HwClassResolved>> {
+        parking_lot::RwLockReadGuard::try_map(self.0.read(), |cfg| cfg.iter().find(|d| d.name == h))
+            .ok()
     }
 
     /// `[sla.hw_classes.$h].requirements` for `h` — the Karpenter
@@ -130,20 +153,14 @@ impl HwClassConfig {
         &self,
         h: &str,
     ) -> Option<Vec<rio_proto::types::NodeSelectorRequirement>> {
-        let cfg = self.0.read();
-        cfg.iter()
-            .find(|(name, ..)| name == h)
-            .map(|(_, _, reqs, ..)| reqs.clone())
+        self.find(h).map(|d| d.requirements.clone())
     }
 
     /// `[sla.hw_classes.$h].node_class` for `h` — the EC2NodeClass
     /// name (`rio-default` / `rio-nvme` / `rio-metal`). `None` if `h`
     /// is unknown OR config not yet loaded.
     pub fn node_class_for(&self, h: &str) -> Option<String> {
-        let cfg = self.0.read();
-        cfg.iter()
-            .find(|(name, ..)| name == h)
-            .map(|(_, _, _, nc, ..)| nc.clone())
+        self.find(h).map(|d| d.node_class.clone())
     }
 
     /// `[sla.hw_classes.$h].{max_cores, max_mem}` for `h` — the
@@ -154,17 +171,59 @@ impl HwClassConfig {
     /// `min(per_class, global)` so claims chunk at the class's actual
     /// instance-type ceiling instead of the global cap.
     pub fn ceilings_for(&self, h: &str) -> Option<(u32, u64)> {
-        let cfg = self.0.read();
-        cfg.iter()
-            .find(|(name, ..)| name == h)
-            .map(|&(_, _, _, _, mc, mm)| (mc, mm))
+        self.find(h)
+            .map(|d| (d.max_cores, d.max_mem))
             .filter(|&(mc, mm)| mc > 0 && mm > 0)
     }
 
+    /// `[sla.hw_classes.$h].taints` for `h`. §13c `cover::build_nodeclaim`
+    /// chains these after `builder_taint()`. Unknown `h` / not loaded →
+    /// empty.
+    pub fn taints_for(&self, h: &str) -> Vec<rio_proto::types::NodeTaint> {
+        self.find(h).map(|d| d.taints.clone()).unwrap_or_default()
+    }
+
+    /// `[sla.hw_classes.$h].provides_features` for `h`. Unknown `h` /
+    /// not loaded → empty.
+    pub fn provides_for(&self, h: &str) -> Vec<String> {
+        self.find(h)
+            .map(|d| d.provides_features.clone())
+            .unwrap_or_default()
+    }
+
+    /// `[sla.hw_classes.$h].max_fleet_cores` for `h`. §13c
+    /// `cover_deficit` clamps this class's per-tick mint at
+    /// `min(global_remaining, cap − live_h − created_h)`. Unknown `h`
+    /// / not loaded / unset → `None` (global-only).
+    pub fn fleet_cap_for(&self, h: &str) -> Option<u32> {
+        self.find(h).and_then(|d| d.max_fleet_cores)
+    }
+
+    /// `[sla.hw_classes.$h].capacity_types` for `h` as controller-side
+    /// [`CapacityType`]s. §13c: `all_cells`/`fallback_cell` iterate
+    /// THIS so an od-only class structurally never produces a
+    /// `(h, Spot)` cell. Unknown `h` / not loaded / empty (pre-§13c
+    /// scheduler) → ALL.
+    pub fn capacity_types_for(
+        &self,
+        h: &str,
+    ) -> Vec<crate::reconcilers::nodeclaim_pool::CapacityType> {
+        use crate::reconcilers::nodeclaim_pool::CapacityType;
+        self.find(h)
+            .map(|d| {
+                d.capacity_types
+                    .iter()
+                    .filter_map(|s| CapacityType::parse(s))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec![CapacityType::Spot, CapacityType::OnDemand])
+    }
+
     /// All loaded hw-class names (sorted). §13b's `all_cells` derives
-    /// the cell universe from this × `{spot, od}`.
+    /// the cell universe from this × `capacity_types_for(h)`.
     pub fn names(&self) -> Vec<String> {
-        self.0.read().iter().map(|(h, ..)| h.clone()).collect()
+        self.0.read().iter().map(|d| d.name.clone()).collect()
     }
 
     /// Whether `h`'s `kubernetes.io/arch` label equals `arch`, OR is
@@ -173,11 +232,11 @@ impl HwClassConfig {
     /// (`NodeClaimPoolConfig::fallback_cell`) uses this to pick a
     /// reference cell for hw-agnostic intents by `intent.system`.
     pub fn matches_arch(&self, h: &str, arch: &str) -> bool {
-        let cfg = self.0.read();
-        let Some((_, conj, ..)) = cfg.iter().find(|(name, ..)| name == h) else {
+        let Some(d) = self.find(h) else {
             return false;
         };
-        conj.iter()
+        d.labels
+            .iter()
             .find(|(k, _)| k == crate::reconcilers::nodeclaim_pool::ARCH_LABEL)
             .is_none_or(|(_, v)| v == arch)
     }
@@ -189,19 +248,20 @@ impl HwClassConfig {
     pub(crate) fn set(&self, hw_classes: HashMap<String, rio_proto::types::HwClassLabels>) {
         let mut v: Vec<_> = hw_classes
             .into_iter()
-            .map(|(h, def)| {
-                let conj = def.labels.into_iter().map(|l| (l.key, l.value)).collect();
-                (
-                    h,
-                    conj,
-                    def.requirements,
-                    def.node_class,
-                    def.max_cores,
-                    def.max_mem,
-                )
+            .map(|(h, def)| HwClassResolved {
+                name: h,
+                labels: def.labels.into_iter().map(|l| (l.key, l.value)).collect(),
+                requirements: def.requirements,
+                node_class: def.node_class,
+                max_cores: def.max_cores,
+                max_mem: def.max_mem,
+                taints: def.taints,
+                provides_features: def.provides_features,
+                max_fleet_cores: def.max_fleet_cores,
+                capacity_types: def.capacity_types,
             })
             .collect();
-        v.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        v.sort_unstable_by(|a, b| a.name.cmp(&b.name));
         *self.0.write() = v;
     }
 
@@ -251,15 +311,17 @@ impl HwClassConfig {
     pub fn from_literals(defs: &[(&str, &[(&str, &str)])]) -> Self {
         let mut v: Vec<_> = defs
             .iter()
-            .map(|(h, conj)| {
-                let c = conj
+            .map(|(h, conj)| HwClassResolved {
+                name: (*h).to_string(),
+                labels: conj
                     .iter()
                     .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-                    .collect();
-                ((*h).to_string(), c, vec![], "rio-default".to_string(), 0, 0)
+                    .collect(),
+                node_class: "rio-default".to_string(),
+                ..Default::default()
             })
             .collect();
-        v.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        v.sort_unstable_by(|a, b| a.name.cmp(&b.name));
         Self(Arc::new(RwLock::new(v)))
     }
 }
@@ -1147,10 +1209,10 @@ mod tests {
                         key: "rio.build/hw-band".into(),
                         value: "7".into(),
                     }],
-                    requirements: vec![],
                     node_class: "rio-default".into(),
                     max_cores: 64,
                     max_mem: 256 << 30,
+                    ..Default::default()
                 },
             )]
             .into(),
