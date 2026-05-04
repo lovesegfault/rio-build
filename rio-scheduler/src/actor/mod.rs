@@ -329,7 +329,10 @@ pub struct DagActor {
     /// Shared between the tick `refresh()` (Schmitt-trigger reassign)
     /// and `solve_intent_for` so both see the SAME ladder.
     pub(crate) sla_tiers: Vec<crate::sla::solve::Tier>,
-    /// Hard ceilings from `cfg.sla.ceilings()`.
+    /// §13c-3: hard ceilings from `Ceilings::from_resolved(&cfg.sla,
+    /// cost_table.read().resolved_global())` — the boot-resolved
+    /// (catalog-derived under Spot) global, not the configured
+    /// `Option<>` override. Set once at spawn.
     pub(crate) sla_ceilings: crate::sla::solve::Ceilings,
     /// Full `[sla]` config — feeds [`crate::sla::explore::next`]'s
     /// probe shape and feature overrides.
@@ -576,6 +579,25 @@ impl DagActor {
         let mut dag = DerivationDag::new();
         dag.set_soft_features(cfg.soft_features.clone());
         let max_lead_time = cfg.sla.max_lead_time;
+        // §13c-3: in production, `main.rs` calls `set_resolved_global`
+        // before actor spawn (after `validate_resolved`). Test/non-K8s
+        // code that constructs the actor directly with a fresh
+        // `DagActorPlumbing::default()` cost_table → wire it up from
+        // `cfg.sla`'s `Some(...)` (test fixtures always set both).
+        // A half-set fixture is a fixture bug — `validate_shape()`
+        // rejects it.
+        {
+            let mut ct = plumbing.cost_table.write();
+            if !ct.has_resolved_global()
+                && let (Some(c), Some(m)) = (cfg.sla.max_cores, cfg.sla.max_mem)
+            {
+                ct.set_resolved_global((c as u32, m));
+            }
+        }
+        let sla_ceilings = crate::sla::solve::Ceilings::from_resolved(
+            &cfg.sla,
+            plumbing.cost_table.read().resolved_global(),
+        );
 
         Self {
             dag,
@@ -598,7 +620,7 @@ impl DagActor {
             cache_breaker: CacheCheckBreaker::default(),
             sla_estimator: crate::sla::SlaEstimator::new(&cfg.sla),
             sla_tiers: cfg.sla.solve_tiers(),
-            sla_ceilings: cfg.sla.ceilings(),
+            sla_ceilings,
             sla_config: cfg.sla,
             cost_table: plumbing.cost_table,
             cost_was_leader: plumbing.cost_was_leader,

@@ -209,7 +209,7 @@ async fn main() -> anyhow::Result<()> {
     // fresh on the leader.
     let hw_cost_source = cfg.sla.hw_cost_source;
     let sla_cluster = cfg.sla.cluster.clone();
-    // r[sched.sla.threat.corpus-clamp+2]: AdminServiceImpl needs the
+    // r[sched.sla.threat.corpus-clamp+3]: AdminServiceImpl needs the
     // [sla] block for ImportSlaCorpus param-range validation. Cloned
     // before cfg.sla is moved into DagActorConfig below.
     let sla_for_admin = std::sync::Arc::new(cfg.sla.clone());
@@ -260,6 +260,32 @@ async fn main() -> anyhow::Result<()> {
         );
         cost_table.write().set_catalog_ceilings(ceilings);
     }
+    // §13c-3: derive the effective global ceiling and run pass-2
+    // validation. UNCONDITIONAL — runs after the (Spot-only)
+    // `set_catalog_ceilings` block so the catalog is available; under
+    // Static, `validate_shape()` already required `Some(maxCores)` so
+    // this is a no-op resolve. The chicken-and-egg (Spot + transient
+    // AWS hiccup → empty catalog → boot fail / CrashLoopBackOff) is
+    // the explicit contract: an operator who left `maxCores=None`
+    // opted into auto-derived globals; if derivation can't happen,
+    // that's a config error, not a fallback.
+    // r[impl scheduler.sla.global.derive]
+    let (resolved_global, source) = {
+        let ct = cost_table.read();
+        cfg.sla.resolve_globals(ct.catalog_ceilings())?
+    };
+    {
+        let ct = cost_table.read();
+        cfg.sla
+            .validate_resolved(resolved_global, ct.catalog_ceilings(), source)?;
+    }
+    cost_table.write().set_resolved_global(resolved_global);
+    info!(
+        max_cores = resolved_global.0,
+        max_mem = resolved_global.1,
+        source,
+        "§13c-3 global ceiling resolved"
+    );
     // λ refresh + sweep + persist run regardless of `hw_cost_source`
     // (the controller appends `interrupt_samples` even under Static).
     // `inputs_gen` is derived from the table at poll time — pollers

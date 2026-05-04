@@ -11,6 +11,55 @@ use serde::{Deserialize, Serialize};
 
 use super::solve::{Ceilings, Tier};
 
+// §13c-3 constants: resolve clamps and threat-surface clamps.
+//
+// `MAX_*_HARD` are the THREAT-SURFACE clamps — they bound seed-corpus
+// imports (`build_timeout_ref`, `prior.rs` `e.a` ≤ ln(MAX_MEM_HARD))
+// regardless of catalog drift. They are NOT operator budgets.
+//
+// `MAX_*_GLOBAL` / `MIN_*` are the RESOLVE clamps for the
+// `[sla].maxCores`/`maxMem`-unset case under Spot:
+// `resolved = max(catalog).clamp(MIN_*, MAX_*_GLOBAL)`.
+
+/// PriorityClass bucket count (Part-B packs cores into `1..1024`
+/// PriorityClass values). Also the ref-secs scalar for
+/// [`build_timeout_ref`]. Hard structural bound — `validate_shape()`
+/// rejects any `maxCores ≥ 1024`.
+pub const MAX_CORES_HARD: f64 = 1024.0;
+/// Resolve clamp: `MAX_CORES_HARD − 1` because `validate_shape()` is a
+/// strict `< 1024`.
+pub const MAX_CORES_GLOBAL: f64 = MAX_CORES_HARD - 1.0;
+/// 32 TiB — ~1.3× the largest AWS instance (u-24tb1.metal is 24 TiB).
+/// Threat-surface clamp for seed-corpus `e.a = ln M(1)`.
+pub const MAX_MEM_HARD: u64 = 32 << 40;
+/// Resolve clamp; mem has no PriorityClass-style structural bound below
+/// the threat-surface ceiling.
+pub const MAX_MEM_GLOBAL: u64 = MAX_MEM_HARD;
+/// Resolve floor: from the [`SlaConfig::validate_shape`] doc-comment
+/// derivation `probe.cpu ≥ 4 ∧ probe.cpu ≤ max_cores/4 ⇒ max_cores ≥ 16`.
+pub const MIN_CORES: f64 = 16.0;
+/// Resolve floor; conservative — every probe shape's
+/// `mem_base + 4·mem_per_core` clears 1 GiB.
+pub const MIN_MEM: u64 = 1 << 30;
+
+/// Upper bound for time-domain seed-corpus parameters (S, P, Q) in
+/// reference-seconds, for `r[sched.sla.threat.corpus-clamp]`. Not a
+/// real timeout — a "this is pathological" gate. `P` is the 1-core
+/// parallel time (`T(1)·1` in the Amdahl basis) so it can legitimately
+/// be `wall × cores`; the bound is therefore `7d × MAX_CORES_HARD`
+/// (~620 Ms — well above any real seed but well below the `1e12` /
+/// `f64::MAX` an adversary would inject to NaN/Inf the solver).
+///
+/// §13c-3: was `7d × cfg.max_cores`; changed to a constant so the
+/// persisted seed corpus is decoupled from catalog drift on the cores
+/// axis (a restart that derives a smaller global must not reject the
+/// previously-loadable corpus). The mem-axis equivalent is
+/// `prior.rs`'s `e.a ≤ ln(MAX_MEM_HARD)`.
+// r[impl sched.sla.threat.corpus-clamp+3]
+pub fn build_timeout_ref() -> f64 {
+    7.0 * 86400.0 * MAX_CORES_HARD
+}
+
 // r[impl sched.sla.hw-class.config]
 /// One hw-class: a node-label conjunction (STAMPED on Nodes) plus the
 /// Karpenter instance-type requirements that PROVISION that hardware.
@@ -246,7 +295,7 @@ pub struct SlaConfig {
     /// pre-sorted anyway so the sort is belt-and-suspenders.
     pub tiers: Vec<Tier>,
     /// Tier name builds land in unless tenant overrides. MUST appear in
-    /// `tiers` — checked by [`SlaConfig::validate`].
+    /// `tiers` — checked by [`SlaConfig::validate_shape`].
     pub default_tier: String,
     /// Cold-start probe sizing for never-seen `ModelKey`s.
     pub probe: ProbeShape,
@@ -255,10 +304,23 @@ pub struct SlaConfig {
     /// fall back to `probe`.
     #[serde(default)]
     pub feature_probes: HashMap<String, ProbeShape>,
-    /// Hard cap on `c*` — solve REJECTS a tier whose `c*` exceeds this
-    /// (does not clamp). Also caps the explore halve/×4 walk.
-    pub max_cores: f64,
-    pub max_mem: u64,
+    /// §13c-3: optional hard cap on `c*` — solve REJECTS a tier whose
+    /// `c*` exceeds this (does not clamp). Also caps the explore
+    /// halve/×4 walk via [`Ceilings`].
+    ///
+    /// `None` (the default) under [`super::cost::HwCostSource::Spot`]
+    /// → derived at boot from the catalog max via
+    /// [`SlaConfig::resolve_globals`]. `None` under
+    /// [`super::cost::HwCostSource::Static`] → boot fail (no catalog
+    /// to derive from).
+    ///
+    /// serde derives default `None` for `Option<>` fields when the
+    /// key is absent — no `#[serde(default)]` needed; do NOT add one.
+    /// `deny_unknown_fields` only rejects EXTRA keys, not ABSENT ones.
+    // r[impl scheduler.sla.global.optional]
+    pub max_cores: Option<f64>,
+    /// §13c-3: optional global mem ceiling — see [`Self::max_cores`].
+    pub max_mem: Option<u64>,
     pub max_disk: u64,
     /// Disk request when no `disk_p90` sample exists yet.
     pub default_disk: u64,
@@ -277,11 +339,11 @@ pub struct SlaConfig {
     /// `ec2:DescribeSpotPriceHistory` on the scheduler SA).
     pub hw_cost_source: super::cost::HwCostSource,
     /// h → node-label conjunction. MANDATORY (ADR-023 §13a). Non-empty
-    /// — checked by [`SlaConfig::validate`].
+    /// — checked by [`SlaConfig::validate_shape`].
     pub hw_classes: HashMap<HwClassName, HwClassDef>,
     /// Admissible-set cost slack: a `(h, cap)` cell within
     /// `(1 + hw_cost_tolerance)` × min-cost stays admissible. Range
-    /// `[0, 0.5]` — checked by [`SlaConfig::validate`].
+    /// `[0, 0.5]` — checked by [`SlaConfig::validate_shape`].
     #[serde(default = "default_hw_cost_tolerance")]
     pub hw_cost_tolerance: f64,
     /// ε-greedy explore rate over the admissible set. Range `[0, 0.2]`.
@@ -408,7 +470,7 @@ impl ProbeShape {
     /// `label` names the config path (`"sla.probe"` /
     /// `"sla.feature_probes[kvm]"`) so the error message points the
     /// operator at the field. Validating here (not inline in
-    /// [`SlaConfig::validate`]) means a future ProbeShape field can't
+    /// [`SlaConfig::validate_shape`]) means a future ProbeShape field can't
     /// be half-validated — there is one method, called from every
     /// `[sla]` site that holds a `ProbeShape`.
     pub fn validate(&self, label: &str, max_cores: f64) -> anyhow::Result<()> {
@@ -488,10 +550,14 @@ impl SlaConfig {
     /// largest real instance type matching this class's `requirements`
     /// (derived at boot from `describe_instance_types`,
     /// [`super::catalog::derive_ceilings`]); the cfg override can only
-    /// *tighten* (`validate()` enforces `0 < n ≤ global`). Empty
-    /// `catalog` (static cost source / fetch failure) → global. The
-    /// global `as u32` cast is safe — `validate()` bounds
-    /// `0 < max_cores < 1024`.
+    /// *tighten* (`validate_resolved()` enforces `0 < n ≤ global`). Empty
+    /// `catalog` (static cost source / fetch failure) → global.
+    ///
+    /// §13c-3: `global` is the resolved global passed in by every
+    /// caller from `&CostTable::resolved_global()` — `SlaConfig` no
+    /// longer carries the *effective* global (only the *configured*
+    /// `Option<>` override). Separate-params (not `&CostTable`) keeps
+    /// `SlaConfig` free of a `CostTable` dependency.
     ///
     /// §Partition-single-source: every scheduler-side per-class ceiling
     /// check (`solve_full`, [`Self::reference_hw_class_for_system`],
@@ -499,11 +565,15 @@ impl SlaConfig {
     /// chokepoint [`Self::retain_hosting_classes`]) calls THIS.
     // r[impl scheduler.sla.ceiling.uncatalogued-fallback]
     // r[impl scheduler.sla.ceiling.config-tightens-only]
-    pub fn class_ceilings(&self, h: &str, catalog: &super::catalog::CatalogCeilings) -> (u32, u64) {
+    pub fn class_ceilings(
+        &self,
+        h: &str,
+        catalog: &super::catalog::CatalogCeilings,
+        global: (u32, u64),
+    ) -> (u32, u64) {
         let Some(d) = self.hw_classes.get(h) else {
             return (u32::MAX, u64::MAX);
         };
-        let global = (self.max_cores as u32, self.max_mem);
         let cat = catalog.get(h).copied().unwrap_or(global);
         let cfg = (
             d.max_cores.unwrap_or(global.0),
@@ -528,6 +598,7 @@ impl SlaConfig {
         mem: u64,
         features: &[String],
         catalog: &super::catalog::CatalogCeilings,
+        global: (u32, u64),
     ) -> Option<&str> {
         let arch = rio_common::k8s::system_to_k8s_arch(system)?;
         let matches = |h: &str| {
@@ -538,7 +609,7 @@ impl SlaConfig {
                     .is_none_or(|l| l.value == arch)
                     && features_compatible(features, &d.provides_features)
             }) && {
-                let (cc, cm) = self.class_ceilings(h, catalog);
+                let (cc, cm) = self.class_ceilings(h, catalog, global);
                 cores <= cc && mem <= cm
             }
         };
@@ -564,16 +635,17 @@ impl SlaConfig {
         &self,
         terms: Vec<rio_proto::types::NodeSelectorTerm>,
         names: Vec<String>,
-        cores: u32,
-        mem: u64,
+        demand: (u32, u64),
         required_features: &[String],
         catalog: &super::catalog::CatalogCeilings,
+        global: (u32, u64),
     ) -> (Vec<rio_proto::types::NodeSelectorTerm>, Vec<String>) {
+        let (cores, mem) = demand;
         terms
             .into_iter()
             .zip(names)
             .filter(|(_, h)| {
-                let (cc, cm) = self.class_ceilings(h, catalog);
+                let (cc, cm) = self.class_ceilings(h, catalog, global);
                 // §13c D10: FULL bidirectional features_compatible (NOT
                 // half-predicate `provides⊄required` — that misses
                 // `required=[kvm], provides=[]` because ∅⊆anything).
@@ -597,16 +669,54 @@ impl SlaConfig {
             .unzip()
     }
 
-    /// Upper bound for time-domain seed-corpus parameters (S, P, Q) in
-    /// reference-seconds, for `r[sched.sla.threat.corpus-clamp]`. Not a
-    /// real timeout — a "this is pathological" gate. `P` is the 1-core
-    /// parallel time (`T(1)·1` in the Amdahl basis) so it can legitimately
-    /// be `wall × cores`; the bound is therefore `7d × max_cores` (~38 Ms
-    /// at `max_cores=64`, well above any real seed but well below the
-    /// `1e12` / `f64::MAX` an adversary would inject to NaN/Inf the
-    /// solver).
-    pub fn build_timeout_ref(&self) -> f64 {
-        7.0 * 86400.0 * self.max_cores
+    /// §13c-3: resolve the effective global `(max_cores, max_mem)`
+    /// from the configured override and the boot-time catalog.
+    ///
+    /// - `Some(c)`/`Some(m)` → `(c as u32, m)` (already shape-validated
+    ///   by [`Self::validate_shape`]).
+    /// - `None` ∧ `Static` → ERROR (no catalog to derive from; also
+    ///   gated in [`Self::validate_shape`], so this is a backstop).
+    /// - `None` ∧ `Spot` ∧ empty catalog → ERROR with actionable text
+    ///   (the operator opted into discovery, discovery unavailable —
+    ///   this is a config error, not a fallback).
+    /// - `None` ∧ `Spot` ∧ non-empty catalog →
+    ///   `(max(catalog.cores).clamp(MIN_CORES, MAX_CORES_GLOBAL) as u32,
+    ///    max(catalog.mem).clamp(MIN_MEM, MAX_MEM_GLOBAL))`.
+    ///
+    /// Returns `(resolved_global, source)` where `source` is the
+    /// human-readable origin (`"sla.maxCores/maxMem"` / `"derived from
+    /// catalog max"`) for [`Self::validate_resolved`]'s error message.
+    // r[impl scheduler.sla.global.derive]
+    // r[impl scheduler.sla.global.spot-empty-fails]
+    pub fn resolve_globals(
+        &self,
+        catalog: &super::catalog::CatalogCeilings,
+    ) -> anyhow::Result<((u32, u64), &'static str)> {
+        if let (Some(c), Some(m)) = (self.max_cores, self.max_mem) {
+            return Ok(((c as u32, m), "sla.maxCores/maxMem"));
+        }
+        // Backstop: `validate_shape()` already rejects partial-Some and
+        // Static+None, but keep an actionable error here so a caller
+        // that skipped `validate_shape()` doesn't fall through into the
+        // catalog-derive arm with a half-set override.
+        anyhow::ensure!(
+            matches!(self.hw_cost_source, super::cost::HwCostSource::Spot),
+            "§13c-3: sla.maxCores/maxMem unset under hwCostSource=static. \
+             Static mode has no instance-type catalog to derive a global \
+             ceiling from; set sla.maxCores and sla.maxMem explicitly."
+        );
+        anyhow::ensure!(
+            !catalog.is_empty(),
+            "§13c-3: hwCostSource=spot but instance-type catalog fetch \
+             returned 0 types. Either: (a) check IRSA \
+             ec2:DescribeInstanceTypes permissions; (b) set sla.maxCores \
+             explicitly; (c) use hwCostSource=static."
+        );
+        let cat_c = catalog.values().map(|&(c, _)| c).max().unwrap_or(0);
+        let cat_m = catalog.values().map(|&(_, m)| m).max().unwrap_or(0);
+        let rc = (cat_c as f64).clamp(MIN_CORES, MAX_CORES_GLOBAL) as u32;
+        let rm = cat_m.clamp(MIN_MEM, MAX_MEM_GLOBAL);
+        Ok(((rc, rm), "derived from catalog max"))
     }
 
     /// Minimal `[sla]` block for tests and `Default for DagActorConfig`:
@@ -631,8 +741,8 @@ impl SlaConfig {
                 deadline_secs: default_probe_deadline_secs(),
             },
             feature_probes: HashMap::new(),
-            max_cores: 16.0,
-            max_mem: 2 << 30,
+            max_cores: Some(16.0),
+            max_mem: Some(2 << 30),
             max_disk: 6 << 30,
             default_disk: 2 << 30,
             ring_buffer: default_ring_buffer(),
@@ -677,18 +787,24 @@ impl SlaConfig {
         }
     }
 
-    /// Startup-time bounds checks. `&self` (not `&mut`) so it composes
+    /// §13c-3 pass-1 (config-load): every check that does NOT depend
+    /// on the resolved global. `&self` (not `&mut`) so it composes
     /// with [`rio_common::config::ValidateConfig::validate`]; sorting
     /// is provided separately by [`Self::solve_tiers`].
     ///
-    /// `probe.cpu ∈ [4, max_cores/4]`: gives the explore walk span≥4 on
-    /// both halve and ×4 sides. `max_cores < 1024` keeps the
-    /// PriorityClass-bucket index in range (Part-B packs cores into
-    /// `1..1024` PriorityClass values). The two together force
-    /// `max_cores ≥ 16` — VM-test pools satisfy this via
+    /// The static-requires-`Some` rule is pass-1 because the catalog
+    /// fetch (and hence pass-2) only runs under `Spot` — pass-2 never
+    /// executes under `Static`.
+    ///
+    /// `max_cores < 1024` keeps the PriorityClass-bucket index in
+    /// range (Part-B packs cores into `1..1024` PriorityClass values).
+    /// `probe.cpu ≥ 4` is the half of `probe.cpu ∈ [4, max_cores/4]`
+    /// that doesn't need the resolved global (the `≤ /4` half is
+    /// pass-2). The two together force `max_cores ≥ 16`
+    /// (= [`MIN_CORES`]) — VM-test pools satisfy this via
     /// [`Self::test_default`].
-    pub fn validate(&self) -> anyhow::Result<()> {
-        let hi = self.max_cores;
+    // r[impl scheduler.sla.global.static-requires-some]
+    pub fn validate_shape(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.tiers.iter().any(|t| t.name == self.default_tier),
             "sla.default_tier {:?} not in sla.tiers (known: {:?})",
@@ -698,16 +814,39 @@ impl SlaConfig {
         for t in &self.tiers {
             t.validate()?;
         }
-        anyhow::ensure!(
-            self.max_cores.is_finite() && self.max_cores > 0.0,
-            "sla.max_cores must be finite and positive, got {}",
-            self.max_cores
-        );
-        anyhow::ensure!(
-            self.max_cores < 1024.0,
-            "sla.maxCores < 1024 required (PriorityClass bucket range), got {}",
-            self.max_cores
-        );
+        // §13c-3: maxCores/maxMem are jointly Some or jointly None —
+        // a partial override is a config-shape error, not a derive
+        // input. Static mode requires Some (no catalog to derive from).
+        match (self.max_cores, self.max_mem) {
+            (Some(c), Some(m)) => {
+                anyhow::ensure!(
+                    c.is_finite() && c > 0.0,
+                    "sla.max_cores must be finite and positive, got {c}"
+                );
+                anyhow::ensure!(
+                    c < MAX_CORES_HARD,
+                    "sla.maxCores < {MAX_CORES_HARD} required \
+                     (PriorityClass bucket range), got {c}"
+                );
+                anyhow::ensure!(m > 0, "sla.max_mem must be positive, got {m}");
+            }
+            (None, None) => {
+                anyhow::ensure!(
+                    matches!(self.hw_cost_source, super::cost::HwCostSource::Spot),
+                    "§13c-3: sla.maxCores/maxMem unset under \
+                     hwCostSource=static. Static mode has no instance-type \
+                     catalog to derive a global ceiling from; set \
+                     sla.maxCores and sla.maxMem explicitly."
+                );
+            }
+            (Some(_), None) | (None, Some(_)) => anyhow::bail!(
+                "§13c-3: sla.maxCores and sla.maxMem must both be set or \
+                 both unset (got maxCores={:?}, maxMem={:?}); a partial \
+                 override would derive only one axis from the catalog.",
+                self.max_cores,
+                self.max_mem
+            ),
+        }
         anyhow::ensure!(
             (0.0..=0.5).contains(&self.hw_cost_tolerance),
             "sla.hwCostTolerance must be in [0, 0.5], got {}",
@@ -718,6 +857,32 @@ impl SlaConfig {
             "sla.hwExploreEpsilon must be in [0, 0.2], got {}",
             self.hw_explore_epsilon
         );
+        // The probe `≤ max_cores/4` half is pass-2 (needs the resolved
+        // global). The `≥ 4` and `deadline ≥ 180` halves are
+        // shape-checkable here so a bad probe fails fast at config
+        // load instead of post-AWS-call.
+        anyhow::ensure!(
+            self.probe.cpu >= 4.0,
+            "sla.probe.cpu must be ≥ 4 so both explore paths reach span≥4; got {}",
+            self.probe.cpu
+        );
+        anyhow::ensure!(
+            self.probe.deadline_secs >= 180,
+            "sla.probe.deadline_secs must be >= 180, got {}",
+            self.probe.deadline_secs
+        );
+        for (feat, p) in &self.feature_probes {
+            anyhow::ensure!(
+                p.cpu >= 4.0,
+                "sla.feature_probes[{feat}].cpu must be ≥ 4; got {}",
+                p.cpu
+            );
+            anyhow::ensure!(
+                p.deadline_secs >= 180,
+                "sla.feature_probes[{feat}].deadline_secs must be >= 180, got {}",
+                p.deadline_secs
+            );
+        }
         for (h, def) in &self.hw_classes {
             // bug_038: the charset constraint is enforced at every gRPC
             // sink (`AppendHwPerfSample`, `AppendInterruptSample`) but
@@ -746,23 +911,22 @@ impl SlaConfig {
             );
             // §13c-2 r[impl scheduler.sla.ceiling.config-tightens-only]:
             // a per-class ceiling is an OPTIONAL tightening override —
-            // unset → fall to catalog/global; set → must be ∈ (0, global].
+            // unset → fall to catalog/global. The `n > 0` half is
+            // shape; the `≤ global` half is pass-2.
             if let Some(n) = def.max_cores {
                 anyhow::ensure!(
-                    n > 0 && f64::from(n) <= self.max_cores,
-                    "sla.hwClasses[{h}].max_cores={n} not in [1, sla.maxCores={}]; \
-                     remove the per-class override (the boot-time catalog derives \
-                     the physical ceiling) or raise sla.maxCores",
-                    self.max_cores
+                    n > 0,
+                    "sla.hwClasses[{h}].max_cores={n} must be > 0; remove \
+                     the per-class override (the boot-time catalog derives \
+                     the physical ceiling)"
                 );
             }
             if let Some(n) = def.max_mem {
                 anyhow::ensure!(
-                    n > 0 && n <= self.max_mem,
-                    "sla.hwClasses[{h}].max_mem={n} not in [1, sla.maxMem={}]; \
-                     remove the per-class override (the boot-time catalog derives \
-                     the physical ceiling) or raise sla.maxMem",
-                    self.max_mem
+                    n > 0,
+                    "sla.hwClasses[{h}].max_mem={n} must be > 0; remove \
+                     the per-class override (the boot-time catalog derives \
+                     the physical ceiling)"
                 );
             }
             anyhow::ensure!(
@@ -802,9 +966,74 @@ impl SlaConfig {
                 self.max_lead_time
             );
         }
+        Ok(())
+    }
+
+    /// §13c-3 pass-2 (post-derive): every check that DOES depend on
+    /// the resolved global. Runs in `main.rs` after
+    /// [`Self::resolve_globals`] (so under `Spot` it surfaces ~30s
+    /// later than pass-1, after the catalog fetch). `source` names the
+    /// resolved-global origin (`"sla.maxCores/maxMem"` / `"derived
+    /// from catalog max"`) for the error message.
+    ///
+    /// `probe.cpu ≤ resolved/4`: gives the explore walk span≥4 on the
+    /// ×4 side. Per-class `Some(n) ≤ resolved`: a per-class override
+    /// is tightening-only.
+    ///
+    /// A per-class `Some(n)` that is `≤ resolved` but `> catalog[h]`
+    /// `warn!`s instead of erroring — the override has no effect (the
+    /// physical bound wins) and erroring would force the operator to
+    /// remove a config line they may want for documentation.
+    pub fn validate_resolved(
+        &self,
+        global: (u32, u64),
+        catalog: &super::catalog::CatalogCeilings,
+        source: &str,
+    ) -> anyhow::Result<()> {
+        let (gc, gm) = global;
+        let hi = gc as f64;
         self.probe.validate("sla.probe", hi)?;
         for (feat, p) in &self.feature_probes {
             p.validate(&format!("sla.feature_probes[{feat}]"), hi)?;
+        }
+        for (h, def) in &self.hw_classes {
+            if let Some(n) = def.max_cores {
+                anyhow::ensure!(
+                    n <= gc,
+                    "sla.hwClasses[{h}].max_cores={n} > resolved global \
+                     {gc}c ({source}); remove the per-class override or \
+                     raise the physical ceiling via Karpenter requirements"
+                );
+                if let Some(&(cc, _)) = catalog.get(h)
+                    && n > cc
+                {
+                    tracing::warn!(
+                        %h, override_cores = n, catalog_cores = cc,
+                        "sla.hwClasses max_cores override has no effect — \
+                         catalog ceiling for this class is lower (config \
+                         tightening-only); use Karpenter requirements to \
+                         raise the physical ceiling"
+                    );
+                }
+            }
+            if let Some(n) = def.max_mem {
+                anyhow::ensure!(
+                    n <= gm,
+                    "sla.hwClasses[{h}].max_mem={n} > resolved global \
+                     {gm} bytes ({source}); remove the per-class override \
+                     or raise the physical ceiling via Karpenter requirements"
+                );
+                if let Some(&(_, cm)) = catalog.get(h)
+                    && n > cm
+                {
+                    tracing::warn!(
+                        %h, override_mem = n, catalog_mem = cm,
+                        "sla.hwClasses max_mem override has no effect — \
+                         catalog ceiling for this class is lower (config \
+                         tightening-only); use Karpenter requirements"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -826,14 +1055,22 @@ impl SlaConfig {
         });
         tiers
     }
+}
 
-    /// Hard ceilings for [`super::solve::solve_tier`].
-    pub fn ceilings(&self) -> Ceilings {
-        Ceilings {
-            max_cores: self.max_cores,
-            max_mem: self.max_mem,
-            max_disk: self.max_disk,
-            default_disk: self.default_disk,
+impl Ceilings {
+    /// §13c-3: construct the actor-side ceiling carrier from the
+    /// boot-resolved global. Replaces the deleted `SlaConfig::ceilings()`
+    /// (which read the now-`Option<>` raw config field). The actor
+    /// constructs this once at spawn from
+    /// `cost_table.read().resolved_global()` so every solve consumer
+    /// sees the *effective* (catalog-derived under Spot) global, not
+    /// the *configured* `Option<>`.
+    pub fn from_resolved(cfg: &SlaConfig, resolved: (u32, u64)) -> Self {
+        Self {
+            max_cores: resolved.0 as f64,
+            max_mem: resolved.1,
+            max_disk: cfg.max_disk,
+            default_disk: cfg.default_disk,
         }
     }
 }
@@ -891,22 +1128,40 @@ mod tests {
                 mem_base: 4 << 30,
                 deadline_secs: default_probe_deadline_secs(),
             },
-            max_cores: 64.0,
-            max_mem: 256 << 30,
+            max_cores: Some(64.0),
+            max_mem: Some(256 << 30),
             max_disk: 200 << 30,
             default_disk: 20 << 30,
             ..SlaConfig::test_default()
         }
     }
 
+    /// `(global_cores, global_mem)` for `class_ceilings` etc. fixture
+    /// callers, derived from `base()`'s `Some(64)`/`Some(256GiB)`.
+    fn base_global() -> (u32, u64) {
+        (64, 256 << 30)
+    }
+
+    /// `validate_shape() ∘ validate_resolved()` against the configured
+    /// `Some(max_cores, max_mem)` (the pre-§13c-3 `validate()` shape,
+    /// kept so the existing test corpus exercises both passes).
+    fn validate_both(cfg: &SlaConfig) -> anyhow::Result<()> {
+        cfg.validate_shape()?;
+        let global = (
+            cfg.max_cores.expect("test fixture sets Some") as u32,
+            cfg.max_mem.expect("test fixture sets Some"),
+        );
+        cfg.validate_resolved(global, &Default::default(), "sla.maxCores/maxMem")
+    }
+
     #[test]
     fn rejects_probe_cpu_outside_span_range() {
         let mut cfg = base();
         cfg.probe.cpu = 32.0; // > max_cores/4 = 16
-        let err = cfg.validate().unwrap_err().to_string();
+        let err = validate_both(&cfg).unwrap_err().to_string();
         assert!(err.contains("sla.probe.cpu"), "{err}");
         cfg.probe.cpu = 2.0; // < 4
-        assert!(cfg.validate().is_err());
+        assert!(validate_both(&cfg).is_err());
     }
 
     #[test]
@@ -915,7 +1170,7 @@ mod tests {
         // Negative: `(d * 1000.0) as u64` would wrap to 0 → broken tier
         // sorts as "tightest" in solve_tiers().
         cfg.tiers[0].p90 = Some(-300.0);
-        let err = cfg.validate().unwrap_err().to_string();
+        let err = validate_both(&cfg).unwrap_err().to_string();
         assert!(
             err.contains("tiers[normal].p90") && err.contains("-300"),
             "{err}"
@@ -923,22 +1178,22 @@ mod tests {
         // NaN: same wrap, plus NaN poisons binding_bound() comparisons.
         cfg.tiers[0].p90 = None;
         cfg.tiers[0].p50 = Some(f64::NAN);
-        let err = cfg.validate().unwrap_err().to_string();
+        let err = validate_both(&cfg).unwrap_err().to_string();
         assert!(err.contains("tiers[normal].p50"), "{err}");
         // Zero: degenerate (no build can hit a 0s target).
         cfg.tiers[0].p50 = None;
         cfg.tiers[0].p99 = Some(0.0);
-        assert!(cfg.validate().is_err());
+        assert!(validate_both(&cfg).is_err());
         // Positive control.
         cfg.tiers[0].p99 = Some(300.0);
-        cfg.validate().unwrap();
+        validate_both(&cfg).unwrap();
     }
 
     #[test]
     fn rejects_unknown_default_tier() {
         let mut cfg = base();
         cfg.default_tier = "fast".into();
-        let err = cfg.validate().unwrap_err().to_string();
+        let err = validate_both(&cfg).unwrap_err().to_string();
         assert!(err.contains("not in sla.tiers"), "{err}");
     }
 
@@ -946,22 +1201,22 @@ mod tests {
     fn accepts_probe_cpu_at_bounds() {
         let mut cfg = base();
         cfg.probe.cpu = 4.0;
-        cfg.validate().unwrap();
+        validate_both(&cfg).unwrap();
         cfg.probe.cpu = 16.0; // = max_cores/4
-        cfg.validate().unwrap();
+        validate_both(&cfg).unwrap();
     }
 
     #[test]
     fn rejects_probe_deadline_under_180() {
         let mut cfg = base();
         cfg.probe.deadline_secs = 60;
-        let err = cfg.validate().unwrap_err().to_string();
+        let err = validate_both(&cfg).unwrap_err().to_string();
         assert!(
             err.contains("sla.probe.deadline_secs must be >= 180"),
             "{err}"
         );
         cfg.probe.deadline_secs = 180;
-        cfg.validate().unwrap();
+        validate_both(&cfg).unwrap();
 
         cfg.feature_probes.insert(
             "kvm".into(),
@@ -972,7 +1227,7 @@ mod tests {
                 deadline_secs: 120,
             },
         );
-        let err = cfg.validate().unwrap_err().to_string();
+        let err = validate_both(&cfg).unwrap_err().to_string();
         assert!(err.contains("feature_probes[kvm]"), "{err}");
     }
 
@@ -988,15 +1243,15 @@ mod tests {
                 deadline_secs: 3600,
             },
         );
-        let err = cfg.validate().unwrap_err().to_string();
+        let err = validate_both(&cfg).unwrap_err().to_string();
         assert!(
             err.contains("feature_probes[kvm].cpu") && err.contains("max_cores=64"),
             "{err}"
         );
         cfg.feature_probes.get_mut("kvm").unwrap().cpu = 2.0;
-        assert!(cfg.validate().is_err(), "<4 also rejected");
+        assert!(validate_both(&cfg).is_err(), "<4 also rejected");
         cfg.feature_probes.get_mut("kvm").unwrap().cpu = 16.0;
-        cfg.validate().unwrap();
+        validate_both(&cfg).unwrap();
     }
 
     #[test]
@@ -1034,7 +1289,7 @@ mod tests {
                 deadline_secs: 3600,
             },
         );
-        let err = cfg.validate().unwrap_err().to_string();
+        let err = validate_both(&cfg).unwrap_err().to_string();
         assert!(err.contains("feature_probes[kvm]"), "{err}");
         assert!(err.contains("[4, max_cores/4=16]"), "{err}");
     }
@@ -1083,7 +1338,8 @@ mod tests {
 
     #[test]
     fn ceilings_projection() {
-        let c = base().ceilings();
+        let cfg = base();
+        let c = Ceilings::from_resolved(&cfg, base_global());
         assert_eq!(c.max_cores, 64.0);
         assert_eq!(c.default_disk, 20 << 30);
     }
@@ -1133,7 +1389,7 @@ mod tests {
             sla.lead_time_seed[&("intel-8-nvme".into(), CapacityType::Od)],
             38.0
         );
-        sla.validate().unwrap();
+        validate_both(&sla).unwrap();
     }
 
     /// bug_038: `c7a.xlarge` (dot) booted cleanly, then every
@@ -1146,7 +1402,7 @@ mod tests {
         let mut cfg = base();
         cfg.hw_classes
             .insert("c7a.xlarge".into(), test_def("k", "v"));
-        let err = cfg.validate().unwrap_err().to_string();
+        let err = validate_both(&cfg).unwrap_err().to_string();
         assert!(
             err.contains("c7a.xlarge") && err.contains("[a-z0-9-]"),
             "{err}"
@@ -1155,7 +1411,7 @@ mod tests {
         cfg.hw_classes.remove("c7a.xlarge");
         cfg.hw_classes
             .insert("c7a-xlarge".into(), test_def("k", "v"));
-        cfg.validate().unwrap();
+        validate_both(&cfg).unwrap();
     }
 
     // r[verify sched.sla.hw-class.config]
@@ -1163,19 +1419,142 @@ mod tests {
     fn rejects_empty_hw_classes() {
         let mut cfg = base();
         // Populated (from test_default) → valid.
-        cfg.validate().unwrap();
+        validate_both(&cfg).unwrap();
         // Empty → ADR-023 §13a is mandatory; validate() must reject.
         cfg.hw_classes.clear();
-        let err = cfg.validate().unwrap_err().to_string();
+        let err = validate_both(&cfg).unwrap_err().to_string();
         assert!(err.contains("hwClasses is mandatory"), "{err}");
     }
 
     #[test]
     fn rejects_max_cores_ge_1024() {
         let mut cfg = base();
-        cfg.max_cores = 1024.0;
-        let err = cfg.validate().unwrap_err().to_string();
+        cfg.max_cores = Some(1024.0);
+        let err = validate_both(&cfg).unwrap_err().to_string();
         assert!(err.contains("maxCores < 1024"), "{err}");
+    }
+
+    /// §13c-3 RED-FIRST: `validate_shape()` accepts `None`/`None` under
+    /// Spot (catalog will derive at boot), rejects under Static (no
+    /// catalog), rejects partial-Some.
+    // r[verify scheduler.sla.global.optional]
+    // r[verify scheduler.sla.global.static-requires-some]
+    #[test]
+    fn validate_shape_optional_global() {
+        // None/None under Spot — accepted.
+        let mut cfg = base();
+        cfg.hw_cost_source = super::super::cost::HwCostSource::Spot;
+        cfg.max_cores = None;
+        cfg.max_mem = None;
+        cfg.validate_shape().expect("Spot + None/None is valid");
+
+        // None/None under Static — boot fail.
+        cfg.hw_cost_source = super::super::cost::HwCostSource::Static;
+        let err = cfg.validate_shape().unwrap_err().to_string();
+        assert!(err.contains("hwCostSource=static"), "{err}");
+        assert!(err.contains("set sla.maxCores"), "fix named: {err}");
+
+        // Partial Some — boot fail under either source.
+        cfg.hw_cost_source = super::super::cost::HwCostSource::Spot;
+        cfg.max_cores = Some(64.0);
+        cfg.max_mem = None;
+        let err = cfg.validate_shape().unwrap_err().to_string();
+        assert!(err.contains("both be set or both unset"), "{err}");
+        cfg.max_cores = None;
+        cfg.max_mem = Some(256 << 30);
+        assert!(
+            cfg.validate_shape().is_err(),
+            "partial Some(maxMem) rejected"
+        );
+    }
+
+    /// §13c-3 RED-FIRST: `resolve_globals()` derives the effective
+    /// global from the catalog when unset, clamps to `[MIN_*, MAX_*_GLOBAL]`,
+    /// boot-fails on Spot+empty-catalog+None, passes through `Some`.
+    // r[verify scheduler.sla.global.derive]
+    // r[verify scheduler.sla.global.spot-empty-fails]
+    #[test]
+    fn resolve_globals_derives_from_catalog() {
+        use super::super::catalog::CatalogCeilings;
+        let mut cfg = base();
+        cfg.hw_cost_source = super::super::cost::HwCostSource::Spot;
+        cfg.max_cores = None;
+        cfg.max_mem = None;
+
+        // Empty catalog + Spot + None → boot fail with actionable text.
+        let err = cfg
+            .resolve_globals(&CatalogCeilings::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("0 types"), "{err}");
+        assert!(err.contains("IRSA"), "{err}");
+        assert!(err.contains("hwCostSource=static"), "{err}");
+
+        // Non-empty catalog → max(catalog), clamped to MIN/MAX_GLOBAL.
+        let cat: CatalogCeilings = std::collections::HashMap::from([
+            ("h1".into(), (96u32, 768u64 << 30)),
+            ("h2".into(), (192u32, 1536u64 << 30)),
+        ]);
+        let ((c, m), src) = cfg.resolve_globals(&cat).unwrap();
+        assert_eq!((c, m), (192, 1536 << 30));
+        assert_eq!(src, "derived from catalog max");
+
+        // Catalog above MAX_CORES_GLOBAL → clamped.
+        let huge: CatalogCeilings =
+            std::collections::HashMap::from([("h1".into(), (2000u32, MAX_MEM_HARD * 2))]);
+        let ((c, m), _) = cfg.resolve_globals(&huge).unwrap();
+        assert_eq!(c, MAX_CORES_GLOBAL as u32);
+        assert_eq!(m, MAX_MEM_GLOBAL);
+
+        // Catalog below MIN_CORES → floored.
+        let tiny: CatalogCeilings =
+            std::collections::HashMap::from([("h1".into(), (4u32, 1u64 << 28))]);
+        let ((c, m), _) = cfg.resolve_globals(&tiny).unwrap();
+        assert_eq!(c, MIN_CORES as u32);
+        assert_eq!(m, MIN_MEM);
+
+        // Some → that value, source "sla.maxCores/maxMem".
+        cfg.max_cores = Some(128.0);
+        cfg.max_mem = Some(512 << 30);
+        let ((c, m), src) = cfg.resolve_globals(&cat).unwrap();
+        assert_eq!((c, m), (128, 512 << 30));
+        assert_eq!(src, "sla.maxCores/maxMem");
+
+        // Static + None → boot fail (backstop; validate_shape also rejects).
+        cfg.hw_cost_source = super::super::cost::HwCostSource::Static;
+        cfg.max_cores = None;
+        cfg.max_mem = None;
+        let err = cfg.resolve_globals(&cat).unwrap_err().to_string();
+        assert!(err.contains("hwCostSource=static"), "{err}");
+    }
+
+    /// §13c-3: `validate_resolved()` rejects per-class `Some(n) > global`
+    /// with a source-attributed message; passes per-class `Some(n) ≤ global`.
+    #[test]
+    fn validate_resolved_per_class_within_global() {
+        let mut cfg = base();
+        cfg.hw_classes.get_mut("test-hw").unwrap().max_cores = Some(300);
+        let err = cfg
+            .validate_resolved(
+                (200, 256 << 30),
+                &Default::default(),
+                "derived from catalog max",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("max_cores=300 > resolved global 200c"),
+            "{err}"
+        );
+        assert!(
+            err.contains("derived from catalog max"),
+            "source attributed: {err}"
+        );
+        assert!(err.contains("Karpenter requirements"), "fix named: {err}");
+
+        cfg.hw_classes.get_mut("test-hw").unwrap().max_cores = Some(100);
+        cfg.validate_resolved((200, 256 << 30), &Default::default(), "x")
+            .expect("per-class Some(100) ≤ global 200 passes");
     }
 
     #[test]
@@ -1183,18 +1562,18 @@ mod tests {
         for bad in [-0.01, 0.6, f64::NAN] {
             let mut cfg = base();
             cfg.hw_cost_tolerance = bad;
-            assert!(cfg.validate().is_err(), "{bad} should be rejected");
+            assert!(validate_both(&cfg).is_err(), "{bad} should be rejected");
         }
         let mut cfg = base();
         cfg.hw_explore_epsilon = 0.3;
-        assert!(cfg.validate().is_err());
+        assert!(validate_both(&cfg).is_err());
     }
 
     #[test]
     fn rejects_reference_not_in_hw_classes() {
         let mut cfg = base();
         cfg.reference_hw_class = "nope".into();
-        let err = cfg.validate().unwrap_err().to_string();
+        let err = validate_both(&cfg).unwrap_err().to_string();
         assert!(err.contains("not in sla.hwClasses"), "{err}");
     }
 
@@ -1203,7 +1582,7 @@ mod tests {
         let mut cfg = base();
         cfg.hw_classes
             .insert("test-hw".into(), HwClassDef::default());
-        let err = cfg.validate().unwrap_err().to_string();
+        let err = validate_both(&cfg).unwrap_err().to_string();
         assert!(err.contains("hwClasses[test-hw].labels"), "{err}");
     }
 
@@ -1219,7 +1598,7 @@ mod tests {
             .unwrap()
             .requirements
             .clear();
-        let err = cfg.validate().unwrap_err().to_string();
+        let err = validate_both(&cfg).unwrap_err().to_string();
         assert!(err.contains("requirements must be non-empty"), "{err}");
 
         let mut cfg = base();
@@ -1232,7 +1611,7 @@ mod tests {
                 operator: "In".into(),
                 values: vec!["mid".into()],
             });
-        let err = cfg.validate().unwrap_err().to_string();
+        let err = validate_both(&cfg).unwrap_err().to_string();
         assert!(err.contains("rio.build/hw-band"), "{err}");
         assert!(err.contains("Node-stamp"), "{err}");
 
@@ -1242,7 +1621,7 @@ mod tests {
             .unwrap()
             .node_class
             .clear();
-        let err = cfg.validate().unwrap_err().to_string();
+        let err = validate_both(&cfg).unwrap_err().to_string();
         assert!(
             err.contains("node_class must name an EC2NodeClass"),
             "{err}"
@@ -1255,14 +1634,18 @@ mod tests {
         // post-redirect — the catalog is boot-derived, so the fix is
         // "remove the override or raise global").
         for (mc, mm, expect) in [
-            (Some(0u32), Some(1u64), Some("max_cores=0 not in [1")),
-            (Some(64), Some(0), Some("max_mem=0 not in [1")),
+            (Some(0u32), Some(1u64), Some("max_cores=0 must be > 0")),
+            (Some(64), Some(0), Some("max_mem=0 must be > 0")),
             (
                 Some(65),
                 Some(1),
-                Some("max_cores=65 not in [1, sla.maxCores=64]"),
+                Some("max_cores=65 > resolved global 64c"),
             ),
-            (Some(64), Some((256u64 << 30) + 1), Some("max_mem=")),
+            (
+                Some(64),
+                Some((256u64 << 30) + 1),
+                Some("> resolved global"),
+            ),
             (Some(64), Some(256 << 30), None),
             (None, None, None),
             (None, Some(256 << 30), None),
@@ -1272,7 +1655,7 @@ mod tests {
             let def = cfg.hw_classes.get_mut("test-hw").unwrap();
             def.max_cores = mc;
             def.max_mem = mm;
-            match (expect, cfg.validate()) {
+            match (expect, validate_both(&cfg)) {
                 (Some(want), Err(e)) => {
                     assert!(e.to_string().contains(want), "({mc:?},{mm:?}): {e}")
                 }
@@ -1382,7 +1765,7 @@ mod tests {
 
     /// Tripwire: every map-keyed `SlaConfig` field whose key-space is
     /// drawn from another field (today: `hw_classes`) MUST be
-    /// cross-field-checked by [`SlaConfig::validate`]. The exhaustive
+    /// cross-field-checked by [`SlaConfig::validate_shape`]. The exhaustive
     /// destructure below names EVERY field with NO `..` rest pattern,
     /// so adding a field to `SlaConfig` is a compile error here until
     /// it is classified. r2 bug_038 (`hw_classes` charset) and r6
@@ -1401,24 +1784,52 @@ mod tests {
         cfg.reference_hw_class = "mid-x86".into();
         // x86_64 → reference matches.
         assert_eq!(
-            cfg.reference_hw_class_for_system("x86_64-linux", 1, 0, &[], &Default::default()),
+            cfg.reference_hw_class_for_system(
+                "x86_64-linux",
+                1,
+                0,
+                &[],
+                &Default::default(),
+                base_global()
+            ),
             Some("mid-x86")
         );
         // aarch64 → reference is amd64, fall through to first arch-match
         // (sorted: agnostic has no arch label → matches anything).
         assert_eq!(
-            cfg.reference_hw_class_for_system("aarch64-linux", 1, 0, &[], &Default::default()),
+            cfg.reference_hw_class_for_system(
+                "aarch64-linux",
+                1,
+                0,
+                &[],
+                &Default::default(),
+                base_global()
+            ),
             Some("agnostic")
         );
         // Drop agnostic → mid-arm wins.
         cfg.hw_classes.remove("agnostic");
         assert_eq!(
-            cfg.reference_hw_class_for_system("aarch64-linux", 1, 0, &[], &Default::default()),
+            cfg.reference_hw_class_for_system(
+                "aarch64-linux",
+                1,
+                0,
+                &[],
+                &Default::default(),
+                base_global()
+            ),
             Some("mid-arm")
         );
         // Unmappable system → None.
         assert_eq!(
-            cfg.reference_hw_class_for_system("riscv64-linux", 1, 0, &[], &Default::default()),
+            cfg.reference_hw_class_for_system(
+                "riscv64-linux",
+                1,
+                0,
+                &[],
+                &Default::default(),
+                base_global()
+            ),
             None
         );
     }
@@ -1441,18 +1852,39 @@ mod tests {
         let kvm = vec!["kvm".to_string()];
         // kvm intent → metal-x86 (only class with provides=[kvm]).
         assert_eq!(
-            cfg.reference_hw_class_for_system("x86_64-linux", 1, 0, &kvm, &Default::default()),
+            cfg.reference_hw_class_for_system(
+                "x86_64-linux",
+                1,
+                0,
+                &kvm,
+                &Default::default(),
+                base_global()
+            ),
             Some("metal-x86")
         );
         // non-kvm intent → std-x86; metal must NOT be picked
         // (∅-guard: required=[], provides=[kvm] → incompatible).
         assert_eq!(
-            cfg.reference_hw_class_for_system("x86_64-linux", 1, 0, &[], &Default::default()),
+            cfg.reference_hw_class_for_system(
+                "x86_64-linux",
+                1,
+                0,
+                &[],
+                &Default::default(),
+                base_global()
+            ),
             Some("std-x86")
         );
         // No metal class for arm + kvm intent → None.
         assert_eq!(
-            cfg.reference_hw_class_for_system("aarch64-linux", 1, 0, &kvm, &Default::default()),
+            cfg.reference_hw_class_for_system(
+                "aarch64-linux",
+                1,
+                0,
+                &kvm,
+                &Default::default(),
+                base_global()
+            ),
             None
         );
     }
@@ -1485,20 +1917,20 @@ mod tests {
         let (_, names) = cfg.retain_hosting_classes(
             vec![term("std"), term("metal")],
             vec!["std-x86".into(), "metal-x86".into()],
-            1,
-            0,
+            (1, 0),
             &kvm,
             &cat,
+            base_global(),
         );
         assert_eq!(names, vec!["metal-x86"], "std-x86 stripped for kvm intent");
         // non-kvm intent: metal-x86 (provides=[kvm]) MUST be stripped.
         let (_, names) = cfg.retain_hosting_classes(
             vec![term("std"), term("metal")],
             vec!["std-x86".into(), "metal-x86".into()],
-            1,
-            0,
+            (1, 0),
             &[],
             &cat,
+            base_global(),
         );
         assert_eq!(
             names,
@@ -1516,7 +1948,7 @@ mod tests {
         let cat = super::super::catalog::CatalogCeilings::new();
         let mut cfg = base();
         // global cap 256/256GiB so the per-class Some(128) isn't masked.
-        cfg.max_cores = 256.0;
+        cfg.max_cores = Some(256.0);
         let mut mid = test_def(ARCH_LABEL, "amd64");
         mid.max_cores = Some(32);
         let mut hi = test_def(ARCH_LABEL, "amd64");
@@ -1525,23 +1957,51 @@ mod tests {
         cfg.reference_hw_class = "mid".into();
         // 48 > mid.max_cores=32 → fall through to hi (128 ≥ 48).
         assert_eq!(
-            cfg.reference_hw_class_for_system("x86_64-linux", 48, 0, &[], &cat),
+            cfg.reference_hw_class_for_system(
+                "x86_64-linux",
+                48,
+                0,
+                &[],
+                &cat,
+                (256u32, 256u64 << 30)
+            ),
             Some("hi"),
             "mid.max_cores=32 cannot host 48; must pick hi"
         );
         // 16 ≤ 32 → reference still wins.
         assert_eq!(
-            cfg.reference_hw_class_for_system("x86_64-linux", 16, 0, &[], &cat),
+            cfg.reference_hw_class_for_system(
+                "x86_64-linux",
+                16,
+                0,
+                &[],
+                &cat,
+                (256u32, 256u64 << 30)
+            ),
             Some("mid")
         );
         // 200 > every class → None (controller no_hosting_class).
         assert_eq!(
-            cfg.reference_hw_class_for_system("x86_64-linux", 200, 0, &[], &cat),
+            cfg.reference_hw_class_for_system(
+                "x86_64-linux",
+                200,
+                0,
+                &[],
+                &cat,
+                (256u32, 256u64 << 30)
+            ),
             None
         );
         // mem dimension: hi.max_mem = test_def's 256GiB.
         assert_eq!(
-            cfg.reference_hw_class_for_system("x86_64-linux", 1, 512 << 30, &[], &cat),
+            cfg.reference_hw_class_for_system(
+                "x86_64-linux",
+                1,
+                512 << 30,
+                &[],
+                &cat,
+                (256u32, 256u64 << 30)
+            ),
             None,
             "no class hosts 512GiB mem"
         );
@@ -1555,7 +2015,7 @@ mod tests {
     fn retain_hosting_classes_filters_any_producer_leak() {
         let cat = super::super::catalog::CatalogCeilings::new();
         let mut cfg = base();
-        cfg.max_cores = 256.0;
+        cfg.max_cores = Some(256.0);
         let mut mid = test_def("rio.build/hw-class", "mid");
         mid.max_cores = Some(32);
         let mut hi = test_def("rio.build/hw-class", "hi");
@@ -1572,10 +2032,10 @@ mod tests {
         let (terms, names) = cfg.retain_hosting_classes(
             vec![term("mid"), term("hi"), term("mid")],
             vec!["mid".into(), "hi".into(), "mid".into()],
-            48,
-            0,
+            (48, 0),
             &[],
             &cat,
+            (256u32, 256u64 << 30),
         );
         assert_eq!(names, vec!["hi"], "mid (max_cores=32) stripped at 48");
         assert_eq!(terms.len(), 1, "terms parallel to names");
@@ -1584,15 +2044,21 @@ mod tests {
         let (_, names) = cfg.retain_hosting_classes(
             vec![term("ghost")],
             vec!["ghost".into()],
-            999,
-            u64::MAX,
+            (999, u64::MAX),
             &[],
             &cat,
+            (256u32, 256u64 << 30),
         );
         assert_eq!(names, vec!["ghost"], "unknown class = no per-class ceiling");
         // All stripped → both empty (controller fallback_cell path).
-        let (terms, names) =
-            cfg.retain_hosting_classes(vec![term("mid")], vec!["mid".into()], 48, 0, &[], &cat);
+        let (terms, names) = cfg.retain_hosting_classes(
+            vec![term("mid")],
+            vec!["mid".into()],
+            (48, 0),
+            &[],
+            &cat,
+            (256u32, 256u64 << 30),
+        );
         assert!(terms.is_empty() && names.is_empty());
     }
 
@@ -1604,8 +2070,8 @@ mod tests {
     #[test]
     fn class_ceilings_min_of_catalog_and_cfg() {
         let mut cfg = base();
-        cfg.max_cores = 192.0;
-        cfg.max_mem = 1024 << 30;
+        cfg.max_cores = Some(192.0);
+        cfg.max_mem = Some(1024 << 30);
         // h1: no cfg override (None/None).
         let mut h1 = test_def("k", "v");
         h1.max_cores = None;
@@ -1618,25 +2084,37 @@ mod tests {
 
         // No catalog: fall to global on both axes (h1) or cfg (h2 cores).
         let empty = super::super::catalog::CatalogCeilings::new();
-        assert_eq!(cfg.class_ceilings("h1", &empty), (192, 1024 << 30));
-        assert_eq!(cfg.class_ceilings("h2", &empty), (32, 1024 << 30));
+        assert_eq!(
+            cfg.class_ceilings("h1", &empty, (192u32, 1024u64 << 30)),
+            (192, 1024 << 30)
+        );
+        assert_eq!(
+            cfg.class_ceilings("h2", &empty, (192u32, 1024u64 << 30)),
+            (32, 1024 << 30)
+        );
         // Unknown class → (MAX, MAX) regardless of catalog.
-        assert_eq!(cfg.class_ceilings("ghost", &empty), (u32::MAX, u64::MAX));
+        assert_eq!(
+            cfg.class_ceilings("ghost", &empty, (192u32, 1024u64 << 30)),
+            (u32::MAX, u64::MAX)
+        );
 
         // Catalog says h1 tops at (96, 768GiB).
         let cat: super::super::catalog::CatalogCeilings =
             HashMap::from([("h1".into(), (96u32, 768u64 << 30))]);
         assert_eq!(
-            cfg.class_ceilings("h1", &cat),
+            cfg.class_ceilings("h1", &cat, (192u32, 1024u64 << 30)),
             (96, 768 << 30),
             "catalog physical bound applied"
         );
         // h2 not in catalog → catalog falls to global; cfg=Some(32) tightens.
-        assert_eq!(cfg.class_ceilings("h2", &cat), (32, 1024 << 30));
+        assert_eq!(
+            cfg.class_ceilings("h2", &cat, (192u32, 1024u64 << 30)),
+            (32, 1024 << 30)
+        );
         // cfg can tighten below catalog.
         cfg.hw_classes.get_mut("h1").unwrap().max_cores = Some(48);
         assert_eq!(
-            cfg.class_ceilings("h1", &cat),
+            cfg.class_ceilings("h1", &cat, (192u32, 1024u64 << 30)),
             (48, 768 << 30),
             "cfg=Some(48) tightens below catalog=96"
         );
@@ -1650,7 +2128,7 @@ mod tests {
         let huge: super::super::catalog::CatalogCeilings =
             HashMap::from([("h1".into(), (1000u32, 8u64 << 40))]);
         assert_eq!(
-            cfg.class_ceilings("h1", &huge),
+            cfg.class_ceilings("h1", &huge, (192u32, 1024u64 << 30)),
             (192, 1024 << 30),
             "catalog above global is clamped to global by cfg.unwrap_or(global)"
         );
@@ -1708,8 +2186,7 @@ mod tests {
         bad_key
             .lead_time_seed
             .insert(("nonexistent".into(), CapacityType::Od), 30.0);
-        let err = bad_key
-            .validate()
+        let err = validate_both(&bad_key)
             .expect_err("lead_time_seed key 'nonexistent' ∉ hw_classes must be rejected");
         assert!(
             err.to_string().contains("nonexistent"),
@@ -1730,7 +2207,7 @@ mod tests {
             .lead_time_seed
             .insert(("intel-7".into(), CapacityType::Spot), f64::NAN);
         assert!(
-            bad_val.validate().is_err(),
+            validate_both(&bad_val).is_err(),
             "non-finite lead_time_seed value must be rejected"
         );
         // > max_lead_time (default 600.0).
@@ -1739,14 +2216,14 @@ mod tests {
             .lead_time_seed
             .insert(("intel-7".into(), CapacityType::Spot), 6000.0);
         assert!(
-            bad_val.validate().is_err(),
+            validate_both(&bad_val).is_err(),
             "lead_time_seed value > max_lead_time must be rejected"
         );
         // Positive control: valid key + valid value passes.
         let mut ok = with_h();
         ok.lead_time_seed
             .insert(("intel-7".into(), CapacityType::Spot), 30.0);
-        ok.validate().expect("valid lead_time_seed should pass");
+        validate_both(&ok).expect("valid lead_time_seed should pass");
     }
 
     /// §13c T1b: bidirectional ∅-guard. Single canonical predicate for

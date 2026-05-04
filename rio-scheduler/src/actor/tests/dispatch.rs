@@ -3698,7 +3698,14 @@ async fn solve_cache_evicted_with_lru() {
         },
     );
     actor.sla_tiers = actor.sla_config.solve_tiers();
-    actor.sla_ceilings = actor.sla_config.ceilings();
+    actor.cost_table.write().set_resolved_global((
+        actor.sla_config.max_cores.unwrap() as u32,
+        actor.sla_config.max_mem.unwrap(),
+    ));
+    actor.sla_ceilings = crate::sla::solve::Ceilings::from_resolved(
+        &actor.sla_config,
+        actor.cost_table.read().resolved_global(),
+    );
     let mut m = std::collections::HashMap::new();
     m.insert("intel-6".into(), 1.0);
     m.insert("intel-7".into(), 1.4);

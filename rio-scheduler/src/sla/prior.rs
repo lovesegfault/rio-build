@@ -155,7 +155,7 @@ impl From<rio_proto::types::SeedCorpus> for SeedCorpus {
     }
 }
 
-// r[impl sched.sla.threat.corpus-clamp+2]
+// r[impl sched.sla.threat.corpus-clamp+3]
 /// Reject one entry whose params are non-finite or outside the
 /// `[sla]`-derived bounds. The seed table is operator-supplied (via
 /// `[sla].seedCorpus` file or `ImportSlaCorpus` RPC) and is exempt from
@@ -178,8 +178,21 @@ impl From<rio_proto::types::SeedCorpus> for SeedCorpus {
 /// Bounding these by local `cfg` would reject a valid corpus exported
 /// from a larger cluster (e.g. `Capped{p̄=90}` from `max_cores=128`
 /// fails on import to `max_cores=64`).
+///
+/// §13c-3: corpus clamps are CONSTANTS ([`build_timeout_ref`],
+/// [`MAX_MEM_HARD`]), decoupled from the catalog-derived global —
+/// which doesn't exist at corpus-load time (boot ordering is
+/// `CostTable::load → catalog fetch → resolve_globals`). Constants
+/// also close restart-shrink: a catalog that drops its largest type
+/// at boot N+1 must NOT reject the corpus that loaded cleanly at N.
+/// `cfg` is retained for signature stability (per-entry config
+/// validation may add a non-clamp dependency).
+///
+/// [`MAX_MEM_HARD`]: super::config::MAX_MEM_HARD
+/// [`build_timeout_ref`]: super::config::build_timeout_ref
 pub fn validate_seed_entry(e: &SeedEntry, cfg: &SlaConfig) -> Result<(), String> {
-    let bt_ref = cfg.build_timeout_ref();
+    let _ = cfg;
+    let bt_ref = super::config::build_timeout_ref();
     macro_rules! check {
         ($f:expr, $name:literal, $lo:expr, $hi:expr) => {
             if !$f.is_finite() || !($lo..=$hi).contains(&$f) {
@@ -198,10 +211,12 @@ pub fn validate_seed_entry(e: &SeedEntry, cfg: &SlaConfig) -> Result<(), String>
         return Err(format!("{}: p̄ non-finite", e.pname));
     }
     // `a`/`b` are `MemFit::Coupled` log-log params (`ln M = a + b·ln c`),
-    // NOT bytes. `a = ln M(1)` so `[0, ln(max_mem)]`; `b` is the slope
-    // and may be slightly negative on mem-independent workloads where
-    // the regression fits noise — |b|>2 means M ∝ c^±2, pathological.
-    check!(e.a, "a", 0.0, (cfg.max_mem as f64).ln());
+    // NOT bytes. `a = ln M(1)` so `[0, ln(MAX_MEM_HARD)]`; `b` is the
+    // slope and may be slightly negative on mem-independent workloads
+    // where the regression fits noise — |b|>2 means M ∝ c^±2,
+    // pathological. §13c-3: bound is the threat-surface constant, not
+    // the catalog-derived global (see header).
+    check!(e.a, "a", 0.0, (super::config::MAX_MEM_HARD as f64).ln());
     check!(e.b, "b", -2.0, 2.0);
     check!(e.n_eff, "n_eff", 0.0, 32.0);
     for (d, &x) in e.alpha.iter().enumerate() {
@@ -235,7 +250,7 @@ pub fn validate_corpus(c: &SeedCorpus, cfg: &SlaConfig) -> Result<(), String> {
 /// `AdminService.ImportSlaCorpus` at runtime) must construct one or
 /// the code doesn't compile; a future third ingress (e.g. a streaming
 /// `SyncSlaCorpus`) inherits the same guarantee.
-// r[impl sched.sla.threat.corpus-clamp+2]
+// r[impl sched.sla.threat.corpus-clamp+3]
 #[derive(Debug)]
 pub struct ValidatedSeedCorpus(SeedCorpus);
 
@@ -1074,8 +1089,8 @@ mod tests {
 
     fn vcfg() -> SlaConfig {
         SlaConfig {
-            max_cores: 64.0,
-            max_mem: 256 * GIB,
+            max_cores: Some(64.0),
+            max_mem: Some(256 * GIB),
             ..SlaConfig::test_default()
         }
     }
@@ -1097,7 +1112,7 @@ mod tests {
         }
     }
 
-    // r[verify sched.sla.threat.corpus-clamp+2]
+    // r[verify sched.sla.threat.corpus-clamp+3]
     #[test]
     fn validate_rejects_non_finite() {
         let cfg = vcfg();
@@ -1146,7 +1161,7 @@ mod tests {
         // p̄ is round-trip-only: finiteness checked, NOT bounded by the
         // importer's max_cores. A `Capped{p̄=90}` exported from a
         // max_cores=128 cluster must import cleanly to max_cores=64.
-        assert_eq!(cfg.max_cores, 64.0);
+        assert_eq!(cfg.max_cores, Some(64.0));
         let mut e = ok_entry();
         e.p_bar = 90.0;
         assert!(
@@ -1167,11 +1182,11 @@ mod tests {
         assert!(validate_seed_entry(&ok_entry(), &cfg).is_ok());
     }
 
-    // r[verify sched.sla.threat.corpus-clamp+2]
+    // r[verify sched.sla.threat.corpus-clamp+3]
     #[test]
     fn validate_clamps_ranges() {
         let cfg = vcfg();
-        let bt_ref = cfg.build_timeout_ref();
+        let bt_ref = super::super::config::build_timeout_ref();
         // S/P/Q ∈ [0, bt_ref]
         let mut e = ok_entry();
         e.s = bt_ref + 1.0;
@@ -1190,10 +1205,29 @@ mod tests {
         let mut e = ok_entry();
         e.n_eff = 33.0;
         assert!(validate_seed_entry(&e, &cfg).is_err(), "n_eff > 32");
-        // a ∈ [0, ln(max_mem)], b ∈ [-2, 2] (log-log domain, NOT bytes)
+        // a ∈ [0, ln(MAX_MEM_HARD)], b ∈ [-2, 2] (log-log domain, NOT bytes).
+        // §13c-3: the bound is the threat-surface CONSTANT, not the
+        // (now-Option<>) cfg.max_mem — see validate_seed_entry header.
         let mut e = ok_entry();
-        e.a = (cfg.max_mem as f64).ln() + 1.0;
-        assert!(validate_seed_entry(&e, &cfg).is_err(), "a > ln(max_mem)");
+        e.a = (super::super::config::MAX_MEM_HARD as f64).ln() + 1.0;
+        assert!(
+            validate_seed_entry(&e, &cfg).is_err(),
+            "a > ln(MAX_MEM_HARD)"
+        );
+        // §13c-3 RED-FIRST: a corpus whose `a` is within the
+        // threat-surface bound must load even when cfg.max_mem is None
+        // (catalog-derived global, which doesn't exist at corpus-load
+        // time). Pre-change this would have failed to compile (Option<>
+        // has no `.ln()`); post-change the bound is a constant.
+        let mut none_cfg = vcfg();
+        none_cfg.max_cores = None;
+        none_cfg.max_mem = None;
+        let mut e = ok_entry();
+        e.a = (super::super::config::MAX_MEM_HARD as f64).ln() - 0.1;
+        assert!(
+            validate_seed_entry(&e, &none_cfg).is_ok(),
+            "§13c-3: corpus clamp must not depend on resolved global"
+        );
         // α ∈ [0, 1]^K
         let mut e = ok_entry();
         e.alpha = vec![1.1];
@@ -1230,7 +1264,7 @@ mod tests {
         assert!(validate_corpus(&ok, &cfg).is_ok());
     }
 
-    // r[verify sched.sla.threat.corpus-clamp+2]
+    // r[verify sched.sla.threat.corpus-clamp+3]
     #[test]
     fn validate_accepts_v1_entry_defaults() {
         // v1 JSON has no version/alpha/n_eff/ref_factor_vec → all

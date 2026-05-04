@@ -61,7 +61,15 @@ pub(super) async fn setup_svc(
         // service_verifier=None → dev-mode pass-through. Tests that
         // exercise the gate construct svc with Some(verifier) below.
         None,
-        Arc::default(),
+        // §13c-3: in production, main.rs sets `resolved_global` before
+        // passing the cost_table to the admin svc. Test wires it up
+        // here from the test SlaConfig fixture (Some(16, 2GiB)).
+        std::sync::Arc::new(parking_lot::RwLock::new({
+            let mut t = crate::sla::cost::CostTable::default();
+            let g = crate::sla::config::SlaConfig::test_default();
+            t.set_resolved_global((g.max_cores.unwrap() as u32, g.max_mem.unwrap()));
+            t
+        })),
     );
     (svc, actor, task, db)
 }
@@ -535,10 +543,11 @@ async fn get_hw_class_config_ships_catalog_or_global_ceilings() -> anyhow::Resul
         .into_inner();
     let hc = &resp.hw_classes["test-hw"];
     assert_eq!(
-        hc.max_cores, g.max_cores as u32,
+        hc.max_cores,
+        g.max_cores.unwrap() as u32,
         "no catalog → global cores"
     );
-    assert_eq!(hc.max_mem, g.max_mem, "no catalog → global mem");
+    assert_eq!(hc.max_mem, g.max_mem.unwrap(), "no catalog → global mem");
     assert!(hc.max_cores > 0 && hc.max_mem > 0, "wire never zero");
     // Catalog says (8, 1GiB) — tighter than global (16, 2GiB). Wire MUST
     // carry the min.

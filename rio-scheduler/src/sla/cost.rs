@@ -277,6 +277,17 @@ pub struct CostTable {
     /// it across the lease-acquire reload via [`Self::carry_catalog`].
     /// Empty under [`HwCostSource::Static`] (no AWS API).
     catalog_ceilings: super::catalog::CatalogCeilings,
+    /// §13c-3: boot-resolved global `(max_cores, max_mem)` ceiling —
+    /// either the operator's `sla.maxCores`/`maxMem` or
+    /// `max(catalog).clamp(MIN_*, MAX_*_GLOBAL)` under Spot. Set
+    /// UNCONDITIONALLY by `main.rs` after the catalog fetch via
+    /// [`Self::set_resolved_global`], before actor spawn. Same
+    /// process-lifetime lifecycle as `catalog_ceilings` (NOT
+    /// persisted, NOT touched by [`Self::load`], preserved across
+    /// lease-acquire reload by [`Self::carry_catalog`]). `None` only
+    /// before boot wiring — read-before-set is a programmer error
+    /// (panics in [`Self::resolved_global`]).
+    resolved_global: Option<(u32, u64)>,
 }
 
 impl CostTable {
@@ -328,13 +339,46 @@ impl CostTable {
         self.catalog_ceilings = c;
     }
 
-    /// §13c-2: replace `self` with `fresh` while preserving the
-    /// process-lifetime `catalog_ceilings` (not in PG, not re-derived
-    /// on lease-acquire). Used by `poller_tick_prelude`'s
-    /// edge-reload — `*cost.write() = fresh` would otherwise wipe the
-    /// boot-derived catalog.
+    /// §13c-3: write the boot-resolved global ceiling. Called once
+    /// from `main.rs` after [`Self::set_catalog_ceilings`] (Spot) or
+    /// directly (Static), before actor spawn.
+    pub fn set_resolved_global(&mut self, g: (u32, u64)) {
+        self.resolved_global = Some(g);
+    }
+
+    /// §13c-3: the boot-resolved global. Panics on `None` — read
+    /// before `main.rs`'s boot-derive is a programmer error (every
+    /// production caller runs after actor spawn). Test code that
+    /// constructs a `CostTable` directly must call
+    /// [`Self::set_resolved_global`] first; `DagActor::new` does this
+    /// automatically from `cfg.sla` when the plumbing's table is
+    /// unset.
+    pub fn resolved_global(&self) -> (u32, u64) {
+        self.resolved_global.unwrap_or_else(|| {
+            panic!(
+                "§13c-3: CostTable.resolved_global read before \
+                 set_resolved_global; main.rs must call set_resolved_global \
+                 before actor spawn"
+            )
+        })
+    }
+
+    /// §13c-3: whether [`Self::set_resolved_global`] has run.
+    /// `DagActor::new` checks this to wire up tests/non-K8s spawns
+    /// that pass a fresh `CostTable` (production main.rs always sets
+    /// it before actor spawn).
+    pub fn has_resolved_global(&self) -> bool {
+        self.resolved_global.is_some()
+    }
+
+    /// §13c-2/§13c-3: replace `self` with `fresh` while preserving the
+    /// process-lifetime `catalog_ceilings` and `resolved_global` (not
+    /// in PG, not re-derived on lease-acquire). Used by
+    /// `poller_tick_prelude`'s edge-reload — `*cost.write() = fresh`
+    /// would otherwise wipe the boot-derived state.
     pub fn carry_catalog(&mut self, mut fresh: Self) {
         fresh.catalog_ceilings = std::mem::take(&mut self.catalog_ceilings);
+        fresh.resolved_global = self.resolved_global.take();
         *self = fresh;
     }
 
@@ -470,6 +514,14 @@ impl CostTable {
             k.hash(&mut h);
             v.hash(&mut h);
         }
+        // §13c-3: `resolved_global` IS hashed — it feeds
+        // `class_ceilings()` and `Ceilings::from_resolved()` →
+        // `evaluate_cell`'s ClassCeiling gate and the post-finalize
+        // chokepoint. Same lifecycle as `catalog_ceilings` (boot-only,
+        // `carry_catalog` preserved), so this term is free in the
+        // common case but catches a `carry_catalog` regression that
+        // would silently zero the global.
+        self.resolved_global.hash(&mut h);
         h.finish()
     }
 
@@ -734,7 +786,11 @@ impl CostTable {
 
     /// Test constructor. `source` is `Spot` so explicit `price` values
     /// pass through [`Self::price`] (the read-gate returns the seed
-    /// under non-Spot — bug_034).
+    /// under non-Spot — bug_034). §13c-3: `resolved_global` is preset
+    /// to `(64, 256GiB)` (the dominant test fixture global) so `*ct =
+    /// from_parts(...)` overwrites in test code don't have to re-set
+    /// it. Tests that need a different global call
+    /// [`Self::set_resolved_global`] after.
     #[cfg(test)]
     pub fn from_parts(price: HashMap<Cell, f64>, lambda: HashMap<HwClassName, RatioEma>) -> Self {
         let now = now_epoch();
@@ -753,6 +809,7 @@ impl CostTable {
                 .collect(),
             lambda,
             source: HwCostSource::Spot,
+            resolved_global: Some((64, 256 << 30)),
             ..Self::default()
         }
     }
@@ -1354,6 +1411,51 @@ mod tests {
         let no_carry = CostTable::seeded("us-east-1", HwCostSource::Spot);
         assert!(no_carry.catalog_ceilings().is_empty());
         assert_ne!(no_carry.solve_relevant_hash(), h_before);
+    }
+
+    /// §13c-3 RED-FIRST: `carry_catalog` preserves `resolved_global`
+    /// alongside `catalog_ceilings` — same process-lifetime lifecycle
+    /// (boot snapshot, NOT in PG, NOT re-derived on lease-acquire).
+    /// `solve_relevant_hash` includes it so a regression busts the
+    /// solve memo instead of silently zeroing the global.
+    // r[verify scheduler.sla.global.derive]
+    #[test]
+    fn carry_catalog_preserves_resolved_global() {
+        let mut a = CostTable::seeded("us-east-1", HwCostSource::Spot);
+        assert!(
+            !a.has_resolved_global(),
+            "seeded() starts with resolved_global=None — main.rs sets it post-derive"
+        );
+        a.set_resolved_global((192, 1536 << 30));
+        let h_before = a.solve_relevant_hash();
+
+        let fresh = CostTable::seeded("us-east-1", HwCostSource::Spot);
+        a.carry_catalog(fresh);
+
+        assert_eq!(
+            a.resolved_global(),
+            (192, 1536 << 30),
+            "resolved_global survives the lease-acquire reload"
+        );
+        assert_eq!(
+            a.solve_relevant_hash(),
+            h_before,
+            "solve_relevant_hash unchanged when resolved_global is carried"
+        );
+
+        // Inverse: hash CHANGES when the resolved global differs —
+        // catches a regression that drops the term from the hash.
+        let mut b = CostTable::seeded("us-east-1", HwCostSource::Spot);
+        b.set_resolved_global((64, 256 << 30));
+        assert_ne!(b.solve_relevant_hash(), h_before);
+    }
+
+    /// §13c-3: `resolved_global()` panics on read-before-set —
+    /// programmer error caught at the read site.
+    #[test]
+    #[should_panic(expected = "read before")]
+    fn resolved_global_panics_on_unset() {
+        CostTable::default().resolved_global();
     }
 
     #[test]

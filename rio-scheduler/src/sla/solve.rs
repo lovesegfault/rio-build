@@ -48,7 +48,7 @@ impl Tier {
     }
 
     /// Startup-time bounds checks. Called from
-    /// [`SlaConfig::validate`](super::config::SlaConfig::validate) so a
+    /// [`SlaConfig::validate_shape`](super::config::SlaConfig::validate_shape) so a
     /// negative/NaN bound fails loud at startup instead of wrapping to 0
     /// in `solve_tiers()`' `(d * 1000.0) as u64` sort key (which would
     /// silently sort the broken tier as "tightest").
@@ -431,7 +431,7 @@ pub fn intent_for(
         Some(f) if !matches!(f.fit, DurationFit::Probe) => f,
         _ => {
             // Explore ladder: saturation-gated ×4/÷2 from cfg.probe.
-            let d = explore::next(fit, cfg, hints);
+            let d = explore::next(fit, cfg, hints, ceil);
             let mem = forced_mem.unwrap_or(d.mem.0);
             return IntentDecision {
                 cores: (d.c.0.ceil() as u32).max(1),
@@ -913,7 +913,8 @@ pub fn solve_full(
     // chokepoint. §13c-2: `catalog_ceilings` rides on the same `cost`
     // snapshot the price/λ reads use, so all four sites see the same
     // per-tick map.
-    let class_max_of = |h: &str| cfg.class_ceilings(h, cost.catalog_ceilings());
+    let class_max_of =
+        |h: &str| cfg.class_ceilings(h, cost.catalog_ceilings(), cost.resolved_global());
     for tier in tiers {
         let mut candidates: Vec<Candidate> = Vec::with_capacity(h_set.len() * 2);
         for h in h_set {
@@ -1487,6 +1488,17 @@ mod tests {
             default_disk: 20 << 30,
         }
     }
+
+    /// §13c-3: `CostTable` with `resolved_global` pre-set to match
+    /// `cfg()`'s `Some(64, 256GiB)`. Test code that constructs a
+    /// `CostTable` directly (no `main.rs` boot wiring) must set the
+    /// resolved global or `class_max_of` panics.
+    fn ct() -> CostTable {
+        let mut t = CostTable::default();
+        t.set_resolved_global((64, 256 << 30));
+        t
+    }
+
     fn cfg() -> SlaConfig {
         SlaConfig {
             probe: super::super::config::ProbeShape {
@@ -1495,8 +1507,8 @@ mod tests {
                 mem_base: 4 << 30,
                 deadline_secs: 3600,
             },
-            max_cores: 64.0,
-            max_mem: 256 << 30,
+            max_cores: Some(64.0),
+            max_mem: Some(256 << 30),
             max_disk: 200 << 30,
             default_disk: 20 << 30,
             ..SlaConfig::test_default()
@@ -2110,7 +2122,7 @@ mod tests {
             &fit,
             &[t("normal", 300.0)],
             &hw_three(),
-            &CostTable::default(),
+            &ct(),
             &ceil(),
             &cfg,
             &h_set(),
@@ -2162,6 +2174,7 @@ mod tests {
         // when prev_a contains it (τ_exit=0.195). Construct such a
         // cell via a price bump on intel-6.
         let mut cost = CostTable::seeded("", super::super::cost::HwCostSource::Spot);
+        cost.set_resolved_global((64, 256 << 30));
         cost.set_price(
             "intel-6",
             CapacityType::Spot,
@@ -2225,6 +2238,7 @@ mod tests {
         // ≈1.17·e_min (mid-band). intel-8 stays at seed → e_min.
         let seed = super::super::cost::ON_DEMAND_SEED * 0.35;
         let mut cost = CostTable::seeded("", super::super::cost::HwCostSource::Spot);
+        cost.set_resolved_global((64, 256 << 30));
         cost.set_price("intel-8", CapacityType::Spot, seed, 1e9);
         cost.set_price("intel-6", CapacityType::Spot, seed * 0.545, 1e9);
         let SolveFullResult::Feasible(memo) = solve_full(
@@ -2300,6 +2314,7 @@ mod tests {
         let mut cfg = cfg_hw();
         cfg.hw_cost_tolerance = 0.5;
         let mut cost = CostTable::seeded("", super::super::cost::HwCostSource::Spot);
+        cost.set_resolved_global((64, 256 << 30));
         for cap in CapacityType::ALL {
             cost.set_price("intel-6", cap, 0.009, 1e9);
             cost.set_price("intel-8", cap, 0.043, 1e9);
@@ -2405,7 +2420,7 @@ mod tests {
             &fit,
             &[t("normal", 1200.0)],
             &hw_three(),
-            &CostTable::default(),
+            &ct(),
             &ceil(),
             &cfg,
             &h_set(),
@@ -2437,7 +2452,7 @@ mod tests {
             &fit,
             &[t("impossible", 0.001)],
             &hw_three(),
-            &CostTable::default(),
+            &ct(),
             &ceil(),
             &cfg,
             &h_set(),
@@ -2526,7 +2541,7 @@ mod tests {
                 &fit,
                 &[t("normal", 1200.0)],
                 &hw_three(),
-                &CostTable::default(),
+                &ct(),
                 &ceil(),
                 &cfg_hw(),
                 &h_set(),
@@ -2692,7 +2707,7 @@ mod tests {
             &fit,
             &[t("normal", 1200.0)],
             &hw_three(),
-            &CostTable::default(),
+            &ct(),
             &ceil(),
             &cfg_hw(),
             &h_set(),
@@ -2726,7 +2741,7 @@ mod tests {
             let mut cfg = cfg_hw();
             cfg.hw_cost_tolerance = tau;
             match solve_full(
-                &fit, &[t("x", p90)], &hw_three(), &CostTable::default(),
+                &fit, &[t("x", p90)], &hw_three(), &ct(),
                 &ceil(), &cfg, &h_set(), &HashSet::new(), true,
             ) {
                 SolveFullResult::Feasible(memo) => {
@@ -2847,6 +2862,7 @@ mod tests {
     #[test]
     fn observed_menu_does_not_capacity_reject_class_ceiling_does() {
         let mut cost = CostTable::seeded("c", super::super::cost::HwCostSource::Static);
+        cost.set_resolved_global((64, 256 << 30));
         // Observed menu: only a 2-core type (e.g., m7i.large from a
         // first cold-start probe).
         cost.set_menu(
@@ -3226,7 +3242,7 @@ mod tests {
             &fit_negscale,
             &[t("x", 4.0)],
             &hw_three(),
-            &CostTable::default(),
+            &ct(),
             &ceil(),
             &cfg_hw(),
             &["intel-6".into()],

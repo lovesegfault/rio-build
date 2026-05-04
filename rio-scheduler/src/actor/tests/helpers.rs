@@ -856,8 +856,8 @@ pub(crate) fn test_sla_config() -> crate::sla::config::SlaConfig {
             mem_base: 4 << 30,
             deadline_secs: 3600,
         },
-        max_cores: 64.0,
-        max_mem: 256 << 30,
+        max_cores: Some(64.0),
+        max_mem: Some(256 << 30),
         max_disk: 200 << 30,
         default_disk: 20 << 30,
         ..config::SlaConfig::test_default()
@@ -892,8 +892,8 @@ pub(crate) fn test_hw_sla_config() -> crate::sla::config::SlaConfig {
                     key: "rio.build/hw-class".into(),
                     value: h.into(),
                 }],
-                max_cores: Some(cfg.max_cores as u32),
-                max_mem: Some(cfg.max_mem),
+                max_cores: Some(cfg.max_cores.unwrap() as u32),
+                max_mem: Some(cfg.max_mem.unwrap()),
                 ..Default::default()
             },
         );
@@ -976,7 +976,14 @@ pub(crate) fn bare_actor_hw(pool: sqlx::PgPool) -> DagActor {
     *actor.cost_table.write() =
         crate::sla::cost::CostTable::seeded("", crate::sla::cost::HwCostSource::Spot);
     actor.sla_tiers = actor.sla_config.solve_tiers();
-    actor.sla_ceilings = actor.sla_config.ceilings();
+    actor.cost_table.write().set_resolved_global((
+        actor.sla_config.max_cores.unwrap() as u32,
+        actor.sla_config.max_mem.unwrap(),
+    ));
+    actor.sla_ceilings = crate::sla::solve::Ceilings::from_resolved(
+        &actor.sla_config,
+        actor.cost_table.read().resolved_global(),
+    );
     let mut m = std::collections::HashMap::new();
     m.insert("intel-6".into(), 1.0);
     m.insert("intel-7".into(), 1.4);

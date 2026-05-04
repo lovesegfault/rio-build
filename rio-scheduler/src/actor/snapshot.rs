@@ -1225,9 +1225,11 @@ impl DagActor {
                                 .iter()
                                 .filter(|c| c.cell.1 == cap)
                                 .filter(|c| {
-                                    let (cc, cm) = self
-                                        .sla_config
-                                        .class_ceilings(&c.cell.0, cost.catalog_ceilings());
+                                    let (cc, cm) = self.sla_config.class_ceilings(
+                                        &c.cell.0,
+                                        cost.catalog_ceilings(),
+                                        cost.resolved_global(),
+                                    );
                                     memo.a.c_star <= cc && memo.a.mem_bytes <= cm
                                 })
                                 .map(|c| c.cell.clone())
@@ -1337,6 +1339,7 @@ impl DagActor {
                         m.max(state.sched.resource_floor.mem_bytes),
                         &state.required_features,
                         cost.catalog_ceilings(),
+                        cost.resolved_global(),
                     ) {
                         Some(h) => solve::cells_to_selector_terms(
                             &[(h.to_owned(), cap)],
@@ -1379,10 +1382,10 @@ impl DagActor {
         let (node_affinity, hw_class_names) = self.sla_config.retain_hosting_classes(
             node_affinity,
             hw_class_names,
-            cores,
-            mem,
+            (cores, mem),
             &state.required_features,
             cost.catalog_ceilings(),
+            cost.resolved_global(),
         );
         // D7: deadline_secs. Fitted ⇒ `wall_p99 × 5` (p99 of the
         // log-normal `T(c)·exp(ε)` at the chosen cores, no retry tail

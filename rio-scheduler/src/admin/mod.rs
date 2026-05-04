@@ -782,10 +782,14 @@ impl AdminService for AdminServiceImpl {
         // map to under-sampled classes).
         self.ensure_service_caller(request.metadata(), &["rio-controller"])?;
         self.ensure_leader()?;
-        // Snapshot the catalog once for the whole iteration — avoids
-        // 2N lock acquisitions and a (theoretical) TOCTOU between the
-        // `.0` and `.1` reads if the lock ever races a `carry_catalog`.
-        let catalog = self.cost_table.read().catalog_ceilings().clone();
+        // Snapshot the catalog + resolved global once for the whole
+        // iteration — avoids 2N lock acquisitions and a (theoretical)
+        // TOCTOU between the `.0` and `.1` reads if the lock ever
+        // races a `carry_catalog`.
+        let (catalog, global) = {
+            let ct = self.cost_table.read();
+            (ct.catalog_ceilings().clone(), ct.resolved_global())
+        };
         let hw_classes = self
             .sla_config
             .hw_classes
@@ -829,8 +833,8 @@ impl AdminService for AdminServiceImpl {
                         // global=0 and `Some(0)` overrides; catalog
                         // ceilings are real instance shapes); the
                         // controller's `ceilings_for` `>0` filter survives.
-                        max_cores: self.sla_config.class_ceilings(h, &catalog).0,
-                        max_mem: self.sla_config.class_ceilings(h, &catalog).1,
+                        max_cores: self.sla_config.class_ceilings(h, &catalog, global).0,
+                        max_mem: self.sla_config.class_ceilings(h, &catalog, global).1,
                         taints,
                         provides_features: def.provides_features.clone(),
                         max_fleet_cores: def.max_fleet_cores,
@@ -843,7 +847,11 @@ impl AdminService for AdminServiceImpl {
                 )
             })
             .collect();
-        Ok(Response::new(GetHwClassConfigResponse { hw_classes }))
+        Ok(Response::new(GetHwClassConfigResponse {
+            hw_classes,
+            global_max_cores: global.0,
+            global_max_mem: global.1,
+        }))
     }
 
     /// Actor in-memory DAG snapshot for a build — the exact view
@@ -1067,7 +1075,15 @@ impl AdminService for AdminServiceImpl {
         // r[impl sched.sla.threat.read-path-auth]
         self.ensure_service_caller(request.metadata(), &["rio-cli"])?;
         self.ensure_leader()?;
-        Ok(Response::new(sla::defaults_from_config(&self.sla_config)))
+        // §13c-3: report the EFFECTIVE (boot-resolved, catalog-derived
+        // under Spot) global ceiling, not the configured `Option<>`
+        // override — the operator querying `GetSlaDefaults` wants to
+        // know what the solve actually caps at.
+        let resolved = self.cost_table.read().resolved_global();
+        Ok(Response::new(sla::defaults_from_config(
+            &self.sla_config,
+            resolved,
+        )))
     }
 
     #[instrument(skip(self, request), fields(rpc = "GetSlaMispredictors"))]
@@ -1141,7 +1157,7 @@ impl AdminService for AdminServiceImpl {
             _ => serde_json::from_str(&r.json)
                 .map_err(|e| Status::invalid_argument(format!("parse corpus json: {e}")))?,
         };
-        // r[impl sched.sla.threat.corpus-clamp+2]
+        // r[impl sched.sla.threat.corpus-clamp+3]
         // Gap (c): is_finite + range checks BEFORE the corpus reaches
         // the actor / priors.seed. The seed table bypasses
         // clamp_to_operator, so a single `s = 1e308` would otherwise

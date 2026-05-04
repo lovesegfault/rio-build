@@ -243,7 +243,12 @@ pub struct ExploreDecision {
 // r[impl sched.sla.explore-saturation-gate]
 // r[impl sched.sla.explore-x4-first-bump]
 // r[impl sched.sla.explore-freeze]
-pub fn next(fit: Option<&FittedParams>, cfg: &SlaConfig, hints: &DrvHints) -> ExploreDecision {
+pub fn next(
+    fit: Option<&FittedParams>,
+    cfg: &SlaConfig,
+    hints: &DrvHints,
+    ceil: &super::solve::Ceilings,
+) -> ExploreDecision {
     let probe = hints
         .required_features
         .iter()
@@ -276,13 +281,13 @@ pub fn next(fit: Option<&FittedParams>, cfg: &SlaConfig, hints: &DrvHints) -> Ex
     if st.max_c.0 <= 0.0 {
         return decision(probe.cpu, mem_for, disk);
     }
-    if frozen(st, cfg.max_cores) {
+    if frozen(st, ceil.max_cores) {
         return decision(st.max_c.0, mem_for, disk);
     }
     let target = tier_target(f, cfg);
     if st.saturated && st.last_wall.0 > target {
-        let c_up = (st.max_c.0 * 4.0).min(cfg.max_cores);
-        if st.distinct_c >= 3 && c_up >= cfg.max_cores {
+        let c_up = (st.max_c.0 * 4.0).min(ceil.max_cores);
+        if st.distinct_c >= 3 && c_up >= ceil.max_cores {
             ::metrics::counter!(
                 "rio_scheduler_sla_suspicious_scaling_total",
                 "tenant" => f.key.tenant.clone()
@@ -303,7 +308,7 @@ pub fn next(fit: Option<&FittedParams>, cfg: &SlaConfig, hints: &DrvHints) -> Ex
         let c = if c_down < st.min_c.0 {
             c_down
         } else {
-            (st.max_c.0 * 4.0).min(cfg.max_cores)
+            (st.max_c.0 * 4.0).min(ceil.max_cores)
         };
         decision(c, mem_for, disk)
     }
@@ -750,11 +755,23 @@ mod tests {
                 mem_base: 4 << 30,
                 deadline_secs: 3600,
             },
+            max_cores: Some(64.0),
+            max_mem: Some(256 << 30),
+            max_disk: 200 << 30,
+            default_disk: 20 << 30,
+            ..SlaConfig::test_default()
+        }
+    }
+
+    /// `Ceilings` matching `cfg()`'s configured `Some(64, 256GiB)` so
+    /// the explore-walk fixtures see the same effective global the
+    /// boot-resolved value would produce.
+    fn ceil() -> super::super::solve::Ceilings {
+        super::super::solve::Ceilings {
             max_cores: 64.0,
             max_mem: 256 << 30,
             max_disk: 200 << 30,
             default_disk: 20 << 30,
-            ..SlaConfig::test_default()
         }
     }
 
@@ -798,7 +815,7 @@ mod tests {
 
     #[test]
     fn empty_fit_returns_probe() {
-        let d = next(None, &cfg(), &DrvHints::default());
+        let d = next(None, &cfg(), &DrvHints::default(), &ceil());
         assert_eq!(d.c.0, 4.0);
         // mem = 4·2Gi + 4Gi = 12Gi
         assert_eq!(d.mem.0, 12 << 30);
@@ -810,7 +827,7 @@ mod tests {
     fn x4_bump_on_saturated_slow() {
         // One sample at c=4, saturated, wall=1500 > p90=1200 → bump to 16.
         let f = fit(st(4.0, 4.0, 1, true, 1500.0));
-        let d = next(Some(&f), &cfg(), &DrvHints::default());
+        let d = next(Some(&f), &cfg(), &DrvHints::default(), &ceil());
         assert_eq!(d.c.0, 16.0);
         // mem follows probe shape at the bumped c.
         assert_eq!(d.mem.0, 16 * (2 << 30) + (4 << 30));
@@ -821,11 +838,17 @@ mod tests {
     fn halve_on_unsaturated() {
         // c=8, NOT saturated → halve to 4.
         let f = fit(st(8.0, 8.0, 1, false, 1500.0));
-        assert_eq!(next(Some(&f), &cfg(), &DrvHints::default()).c.0, 4.0);
+        assert_eq!(
+            next(Some(&f), &cfg(), &DrvHints::default(), &ceil()).c.0,
+            4.0
+        );
         // Saturated but FAST (wall<p90) → also halve: it hit target with
         // headroom, so probe smaller to find the floor.
         let f = fit(st(8.0, 8.0, 1, true, 600.0));
-        assert_eq!(next(Some(&f), &cfg(), &DrvHints::default()).c.0, 4.0);
+        assert_eq!(
+            next(Some(&f), &cfg(), &DrvHints::default(), &ceil()).c.0,
+            4.0
+        );
     }
 
     // r[verify sched.sla.explore-freeze]
@@ -838,7 +861,7 @@ mod tests {
         // cap_c=max_cores for Probe fits, so span never widens).
         let f = fit(st(64.0, 64.0, 1, false, 100.0));
         assert_eq!(
-            next(Some(&f), &cfg(), &DrvHints::default()).c.0,
+            next(Some(&f), &cfg(), &DrvHints::default(), &ceil()).c.0,
             32.0,
             "single sample at ceiling → walk down, not freeze"
         );
@@ -847,14 +870,17 @@ mod tests {
         // but it's still 3 wasted builds.)
         let f = fit(st(1.0, 1.0, 1, true, 1500.0));
         assert_eq!(
-            next(Some(&f), &cfg(), &DrvHints::default()).c.0,
+            next(Some(&f), &cfg(), &DrvHints::default(), &ceil()).c.0,
             4.0,
             "single sample at floor → ×4, not freeze"
         );
         // Two distinct samples that reached the wall → freeze (the
         // ladder DID walk there).
         let f = fit(st(32.0, 64.0, 2, true, 1500.0));
-        assert_eq!(next(Some(&f), &cfg(), &DrvHints::default()).c.0, 64.0);
+        assert_eq!(
+            next(Some(&f), &cfg(), &DrvHints::default(), &ceil()).c.0,
+            64.0
+        );
     }
 
     // r[verify sched.sla.explore-freeze]
@@ -869,14 +895,14 @@ mod tests {
         // Ceiling, saturated+slow → ×4 clamps to 64 → step DOWN to 32.
         let f = fit(st(64.0, 64.0, 1, true, 1500.0));
         assert_eq!(
-            next(Some(&f), &cfg(), &DrvHints::default()).c.0,
+            next(Some(&f), &cfg(), &DrvHints::default(), &ceil()).c.0,
             32.0,
             "ceiling+saturated+slow: clamp ate ×4 → step ÷2 instead"
         );
         // Floor, unsaturated → ÷2 clamps to 1 → step UP to 4.
         let f = fit(st(1.0, 1.0, 1, false, 100.0));
         assert_eq!(
-            next(Some(&f), &cfg(), &DrvHints::default()).c.0,
+            next(Some(&f), &cfg(), &DrvHints::default(), &ceil()).c.0,
             4.0,
             "floor+unsaturated: clamp ate ÷2 → step ×4 instead"
         );
@@ -887,23 +913,35 @@ mod tests {
     fn freeze_at_span4() {
         // span = 16/4 = 4 → frozen, re-emit max_c.
         let f = fit(st(4.0, 16.0, 2, true, 1500.0));
-        assert_eq!(next(Some(&f), &cfg(), &DrvHints::default()).c.0, 16.0);
+        assert_eq!(
+            next(Some(&f), &cfg(), &DrvHints::default(), &ceil()).c.0,
+            16.0
+        );
         // min_c hit floor (after walking) → frozen.
         let f = fit(st(1.0, 2.0, 2, false, 100.0));
-        assert_eq!(next(Some(&f), &cfg(), &DrvHints::default()).c.0, 2.0);
+        assert_eq!(
+            next(Some(&f), &cfg(), &DrvHints::default(), &ceil()).c.0,
+            2.0
+        );
     }
 
     #[test]
     fn x4_clamps_at_max_cores() {
         // c=32, saturated+slow → ×4=128, clamped to 64.
         let f = fit(st(32.0, 32.0, 1, true, 1500.0));
-        assert_eq!(next(Some(&f), &cfg(), &DrvHints::default()).c.0, 64.0);
+        assert_eq!(
+            next(Some(&f), &cfg(), &DrvHints::default(), &ceil()).c.0,
+            64.0
+        );
     }
 
     #[test]
     fn halve_floors_at_1() {
         let f = fit(st(2.0, 3.0, 2, false, 100.0));
-        assert_eq!(next(Some(&f), &cfg(), &DrvHints::default()).c.0, 1.0);
+        assert_eq!(
+            next(Some(&f), &cfg(), &DrvHints::default(), &ceil()).c.0,
+            1.0
+        );
     }
 
     #[test]
@@ -911,7 +949,7 @@ mod tests {
         // disk_p90=None → cfg.default_disk.
         let f = fit(st(4.0, 4.0, 1, true, 1500.0));
         assert_eq!(
-            next(Some(&f), &cfg(), &DrvHints::default()).disk.0,
+            next(Some(&f), &cfg(), &DrvHints::default(), &ceil()).disk.0,
             20 << 30
         );
         // disk_p90=Some → that value, even mid-ladder. Core-independent
@@ -919,11 +957,14 @@ mod tests {
         let mut f = fit(st(4.0, 4.0, 1, true, 1500.0));
         f.disk_p90 = Some(DiskBytes(75 << 30));
         assert_eq!(
-            next(Some(&f), &cfg(), &DrvHints::default()).disk.0,
+            next(Some(&f), &cfg(), &DrvHints::default(), &ceil()).disk.0,
             75 << 30
         );
         // No fit → cfg.default_disk.
-        assert_eq!(next(None, &cfg(), &DrvHints::default()).disk.0, 20 << 30);
+        assert_eq!(
+            next(None, &cfg(), &DrvHints::default(), &ceil()).disk.0,
+            20 << 30
+        );
     }
 
     #[test]
@@ -936,13 +977,13 @@ mod tests {
         f.mem = MemFit::Independent {
             p90: MemBytes(80 << 30),
         };
-        let d = next(Some(&f), &cfg(), &DrvHints::default());
+        let d = next(Some(&f), &cfg(), &DrvHints::default(), &ceil());
         assert_eq!(d.c.0, 16.0);
         let want = ((80u64 << 30) as f64 * headroom(f.n_eff_ring)) as u64;
         assert_eq!(d.mem.0, want, "fit mem × headroom, not probe shape");
         // Independent{p90:0} sentinel → probe shape wins via .max().
         let f = fit(st(32.0, 32.0, 1, false, 200.0));
-        let d = next(Some(&f), &cfg(), &DrvHints::default());
+        let d = next(Some(&f), &cfg(), &DrvHints::default(), &ceil());
         assert_eq!(d.mem.0, 16 * (2 << 30) + (4 << 30));
     }
 
@@ -970,13 +1011,13 @@ mod tests {
         let mut f = fit(st(4.0, 4.0, 1, true, 1500.0));
         f.tier = Some("bulk".into());
         assert_eq!(
-            next(Some(&f), &c, &DrvHints::default()).c.0,
+            next(Some(&f), &c, &DrvHints::default(), &ceil()).c.0,
             2.0,
             "1500s met bulk's p50=7200 → halve, not ×4"
         );
         // Control: same fit on the p90-bounded tier still ×4's.
         f.tier = Some("normal".into());
-        assert_eq!(next(Some(&f), &c, &DrvHints::default()).c.0, 16.0);
+        assert_eq!(next(Some(&f), &c, &DrvHints::default(), &ceil()).c.0, 16.0);
     }
 
     #[test]
@@ -995,7 +1036,7 @@ mod tests {
             required_features: vec!["kvm".into()],
             ..Default::default()
         };
-        let d = next(None, &c, &hints);
+        let d = next(None, &c, &hints, &ceil());
         assert_eq!(d.c.0, 8.0);
         assert_eq!(d.mem.0, 8 * (4 << 30) + (16 << 30));
         // Feature not in feature_probes → fall back to default probe.
@@ -1003,6 +1044,37 @@ mod tests {
             required_features: vec!["big-parallel".into()],
             ..Default::default()
         };
-        assert_eq!(next(None, &c, &hints).c.0, 4.0);
+        assert_eq!(next(None, &c, &hints, &ceil()).c.0, 4.0);
+    }
+
+    /// §13c-3 RED-FIRST: the explore ladder caps at the RESOLVED
+    /// global (`ceil.max_cores` from `Ceilings::from_resolved`), NOT
+    /// the constant `MAX_CORES_HARD=1024`. Pre-change, `next()` read
+    /// `cfg.max_cores` directly (now `Option<>`); post-change every
+    /// ×4 step and `frozen()`'s wall clause read the boot-resolved
+    /// value. If the cap were the constant, a 192c catalog would let
+    /// the ladder step to 768c → `class_ceilings()` rejects → wasted
+    /// rung → `frozen()`'s wall clause never fires.
+    #[test]
+    fn ladder_caps_at_resolved_global_not_constant() {
+        let small_ceil = super::super::solve::Ceilings {
+            max_cores: 192.0,
+            ..ceil()
+        };
+        // Saturated, last_wall above target → ×4. Starting at max_c=64.
+        let f = fit(st(64.0, 64.0, 2, true, 9999.0));
+        let d = next(Some(&f), &cfg(), &DrvHints::default(), &small_ceil);
+        assert_eq!(
+            d.c.0, 192.0,
+            "×4 step must clamp at the RESOLVED global (192), not MAX_CORES_HARD"
+        );
+        // frozen() wall clause: max_c reaches the resolved global →
+        // ladder converges (does NOT keep stepping toward 1024).
+        let f = fit(st(48.0, 192.0, 2, true, 9999.0));
+        let d = next(Some(&f), &cfg(), &DrvHints::default(), &small_ceil);
+        assert_eq!(
+            d.c.0, 192.0,
+            "frozen at the resolved global wall — re-emit max_c, do not climb"
+        );
     }
 }

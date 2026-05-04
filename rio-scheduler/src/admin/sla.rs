@@ -171,7 +171,7 @@ pub fn duration_fit_from_status(r: &SlaStatusResponse) -> Option<DurationFit> {
 /// tightest-first ([`SlaConfig::solve_tiers`]) so the CLI table matches
 /// the order `solve_tier` actually walks. `hw_classes` is sorted for
 /// stable output (HashMap iteration order otherwise).
-pub(super) fn defaults_from_config(cfg: &SlaConfig) -> SlaDefaultsResponse {
+pub(super) fn defaults_from_config(cfg: &SlaConfig, resolved: (u32, u64)) -> SlaDefaultsResponse {
     let tiers = cfg
         .solve_tiers()
         .into_iter()
@@ -193,8 +193,8 @@ pub(super) fn defaults_from_config(cfg: &SlaConfig) -> SlaDefaultsResponse {
             mem_base_bytes: cfg.probe.mem_base,
             deadline_secs: cfg.probe.deadline_secs,
         }),
-        max_cores: cfg.max_cores as u32,
-        max_mem_bytes: cfg.max_mem,
+        max_cores: resolved.0,
+        max_mem_bytes: resolved.1,
         max_disk_bytes: cfg.max_disk,
         hw_classes,
         reference_hw_class: cfg.reference_hw_class.clone(),
@@ -422,7 +422,7 @@ mod tests {
                 p99: None,
             },
         ];
-        let r = defaults_from_config(&cfg);
+        let r = defaults_from_config(&cfg, (16, 2 << 30));
         // Tightest-first (solve_tiers order), not TOML order.
         assert_eq!(r.tiers[0].name, "fast");
         assert_eq!(r.tiers[0].p90_secs, Some(300.0));

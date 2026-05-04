@@ -700,6 +700,15 @@ message GetHwClassConfigResponse {
   // labels against each conjunction; first all-match wins. Empty when
   // `hw_cost_source=None` (static-mode).
   map<string, HwClassLabels> hw_classes = 1;
+  // §13c-3: scheduler's boot-resolved global ceiling
+  // (`sla.maxCores`/`maxMem`, or `max(catalog).clamp(MIN, MAX_GLOBAL)`
+  // under Spot). The controller's `cover_deficit` clamps per-claim
+  // requests at `min(per_class_ceiling, global)`. Proto3 zero-default →
+  // a controller against a pre-§13c-3 scheduler reads `0` →
+  // `HwClassConfig::global_ceilings()` returns `None` → cover skips
+  // the tick, fail-closed (same as a not-yet-loaded config).
+  uint32 global_max_cores = 2;
+  uint64 global_max_mem = 3;
 }
 
 // ───────────────────────────────────────────────────────────────────────────

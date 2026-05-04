@@ -1506,7 +1506,9 @@ async fn test_disk_pressure_report_climbs_ladder_no_poison() -> TestResult {
 /// I-213).
 #[tokio::test]
 async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
-    let max_mem = crate::sla::config::SlaConfig::test_default().max_mem;
+    let max_mem = crate::sla::config::SlaConfig::test_default()
+        .max_mem
+        .unwrap();
     use rio_proto::types::TerminationReason as R;
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
@@ -1722,7 +1724,9 @@ async fn cold_start_timeout_consumes_budget_then_cancels() -> TestResult {
 /// poisons` in completion.rs) both poison on attempt (max+1).
 #[tokio::test]
 async fn at_cap_cgroup_oom_single_counts_infra() -> TestResult {
-    let max_mem = crate::sla::config::SlaConfig::test_default().max_mem;
+    let max_mem = crate::sla::config::SlaConfig::test_default()
+        .max_mem
+        .unwrap();
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.retry_policy = crate::RetryPolicy {
@@ -1817,7 +1821,9 @@ async fn at_cap_cgroup_oom_single_counts_infra() -> TestResult {
 /// cycle 2 → count=2 → poison (NOT count=0 forever).
 #[tokio::test]
 async fn at_cap_cgroup_oom_window_reset_preserves_count() -> TestResult {
-    let max_mem = crate::sla::config::SlaConfig::test_default().max_mem;
+    let max_mem = crate::sla::config::SlaConfig::test_default()
+        .max_mem
+        .unwrap();
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.retry_policy = crate::RetryPolicy {
@@ -1904,7 +1910,9 @@ async fn at_cap_cgroup_oom_window_reset_preserves_count() -> TestResult {
 /// worker paths and so masked this.
 #[tokio::test]
 async fn controller_oom_at_ceiling_poisons() -> TestResult {
-    let max_mem = crate::sla::config::SlaConfig::test_default().max_mem;
+    let max_mem = crate::sla::config::SlaConfig::test_default()
+        .max_mem
+        .unwrap();
     use rio_proto::types::TerminationReason as R;
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {

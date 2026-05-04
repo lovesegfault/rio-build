@@ -294,7 +294,9 @@ impl rio_common::config::ValidateConfig for Config {
          every derivation poisons immediately)",
             cfg.poison.threshold
         );
-        cfg.sla.validate()?;
+        // §13c-3: pass-1 only — the catalog is fetched in main.rs
+        // AFTER config load; `validate_resolved()` runs there.
+        cfg.sla.validate_shape()?;
         Ok(())
     }
 }

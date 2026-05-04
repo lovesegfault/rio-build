@@ -107,7 +107,14 @@ async fn contract_selector_stability() -> TestResult {
         },
     );
     actor.sla_tiers = actor.sla_config.solve_tiers();
-    actor.sla_ceilings = actor.sla_config.ceilings();
+    actor.cost_table.write().set_resolved_global((
+        actor.sla_config.max_cores.unwrap() as u32,
+        actor.sla_config.max_mem.unwrap(),
+    ));
+    actor.sla_ceilings = crate::sla::solve::Ceilings::from_resolved(
+        &actor.sla_config,
+        actor.cost_table.read().resolved_global(),
+    );
     // ε_h > 0 so the explore branch is reachable — its determinism is
     // exactly what r1 bug_049 broke. ε=0 is the memo only (trivially
     // stable).
@@ -292,7 +299,14 @@ async fn contract_solve_cache_bounded_by_live_fits() {
         },
     );
     actor.sla_tiers = actor.sla_config.solve_tiers();
-    actor.sla_ceilings = actor.sla_config.ceilings();
+    actor.cost_table.write().set_resolved_global((
+        actor.sla_config.max_cores.unwrap() as u32,
+        actor.sla_config.max_mem.unwrap(),
+    ));
+    actor.sla_ceilings = crate::sla::solve::Ceilings::from_resolved(
+        &actor.sla_config,
+        actor.cost_table.read().resolved_global(),
+    );
     let mut m = std::collections::HashMap::new();
     m.insert("intel-6".into(), 1.0);
     m.insert("intel-7".into(), 1.4);
@@ -834,7 +848,14 @@ async fn contract_metrics_once_per_miss_hw_agnostic() {
         },
     );
     actor.sla_tiers = actor.sla_config.solve_tiers();
-    actor.sla_ceilings = actor.sla_config.ceilings();
+    actor.cost_table.write().set_resolved_global((
+        actor.sla_config.max_cores.unwrap() as u32,
+        actor.sla_config.max_mem.unwrap(),
+    ));
+    actor.sla_ceilings = crate::sla::solve::Ceilings::from_resolved(
+        &actor.sla_config,
+        actor.cost_table.read().resolved_global(),
+    );
 
     // S=2000 > p90 bound=1200: T(c)≥S ∀c → solve_tier BestEffort →
     // classify_ceiling=SerialFloor. n_eff/span force the solve branch
@@ -947,7 +968,14 @@ async fn contract_infeasible_static_hints_independent() {
             },
         );
         actor.sla_tiers = actor.sla_config.solve_tiers();
-        actor.sla_ceilings = actor.sla_config.ceilings();
+        actor.cost_table.write().set_resolved_global((
+            actor.sla_config.max_cores.unwrap() as u32,
+            actor.sla_config.max_mem.unwrap(),
+        ));
+        actor.sla_ceilings = crate::sla::solve::Ceilings::from_resolved(
+            &actor.sla_config,
+            actor.cost_table.read().resolved_global(),
+        );
         // hw-factor table unseeded → `!hw.is_empty()` gate false →
         // hw-agnostic intent_for path.
         actor.sla_estimator.seed(fit.clone());
@@ -1737,8 +1765,8 @@ async fn contract_pinned_explore_covers_pool() {
                 key: "rio.build/hw-class".into(),
                 value: "intel-9".into(),
             }],
-            max_cores: Some(actor.sla_config.max_cores as u32),
-            max_mem: Some(actor.sla_config.max_mem),
+            max_cores: Some(actor.sla_config.max_cores.unwrap() as u32),
+            max_mem: Some(actor.sla_config.max_mem.unwrap()),
             ..Default::default()
         },
     );
@@ -2474,7 +2502,11 @@ async fn contract_chokepoint_preserves_term_name_alignment() {
             &hw_label.values[0], name,
             "term/name misaligned post-chokepoint — zip would reconstruct wrong cells"
         );
-        let (cc, _) = actor.sla_config.class_ceilings(name, &Default::default());
+        let (cc, _) = actor.sla_config.class_ceilings(
+            name,
+            &Default::default(),
+            actor.cost_table.read().resolved_global(),
+        );
         assert!(
             intent.cores <= cc,
             "every surviving class must host cores={}; {name}.max_cores={cc}",
@@ -2505,8 +2537,8 @@ async fn contract_kvm_routes_via_provides_features() {
                 value: "metal-x86".into(),
             }],
             node_class: "rio-metal".into(),
-            max_cores: Some(actor.sla_config.max_cores as u32),
-            max_mem: Some(actor.sla_config.max_mem),
+            max_cores: Some(actor.sla_config.max_cores.unwrap() as u32),
+            max_mem: Some(actor.sla_config.max_mem.unwrap()),
             provides_features: vec!["kvm".into()],
             ..Default::default()
         },

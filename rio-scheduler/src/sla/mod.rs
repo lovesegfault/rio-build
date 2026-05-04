@@ -489,7 +489,7 @@ impl SlaEstimator {
             .entry(key.tenant.clone())
             .or_insert_with(|| LruCache::new(self.max_keys_per_tenant));
         let k = (key.pname.clone(), key.system.clone());
-        // r[impl sched.sla.threat.corpus-clamp+2]
+        // r[impl sched.sla.threat.corpus-clamp+3]
         // `LruCache::push` (unlike `put`) returns the EVICTED entry, so
         // an at-cap insert and an in-place overwrite are distinguishable
         // by `evicted_k != k`.
@@ -847,8 +847,8 @@ mod tests {
                 mem_base: 4 << 30,
                 deadline_secs: 3600,
             },
-            max_cores: 64.0,
-            max_mem: 256 << 30,
+            max_cores: Some(64.0),
+            max_mem: Some(256 << 30),
             max_disk: 200 << 30,
             default_disk: 20 << 30,
             ..config::SlaConfig::test_default()
