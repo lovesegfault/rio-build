@@ -773,6 +773,60 @@ controller's `all_cells`/`fallback_cell` iterate THIS, not
 generates a `(h, Spot)` cell — preventing the conflicting-requirements
 ICE loop a requirement-based exclusion would cause.
 
+### Catalog-derived per-class ceilings (ADR-023 §13c-2)
+
+Per-class `(max_cores, max_mem)` ceilings are derived **at scheduler
+boot** from the AWS instance-type catalog rather than hand-maintained
+config — the prior §13c-1 design's hand-pinned values drifted from what
+each class's `requirements` actually permit Karpenter to launch (the
+`cover::sizing` STRIKE rounds). Boot-time derivation removes the
+operator-side staleness step entirely: a `requirements` edit takes
+effect on the next rollout.
+
+r[scheduler.sla.ceiling.catalog-derived]
+The scheduler derives a per-hwClass catalog ceiling at boot by calling
+`describe_instance_types`, projecting each type onto Karpenter
+discovery labels (`instance-category`, `instance-generation`,
+`instance-size`, `kubernetes.io/arch`, `instance-local-nvme`,
+`instance-cpu-manufacturer`), evaluating each class's `requirements`
+against them (`In`/`NotIn`/`Gt`/`Lt`/`Exists`/`DoesNotExist`),
+synthesizing the metal `instance-size {In|NotIn} metalSizes`
+partition from `nodeClass == rio-metal` (mirroring the controller's
+`cover::build_nodeclaim`), and emitting the `(cores, mem)` of the
+**single largest-cores type** in the matched set — always a real
+shape, never an independent per-axis max (which would phantom a
+shape no real type satisfies and ICE-loop Karpenter). Spot cost
+source only; Static (vmtest) has no AWS API and yields an empty
+catalog. A class matching 0 types is omitted from the catalog (warn).
+
+r[scheduler.sla.ceiling.uncatalogued-fallback]
+A class with no catalog ceiling — Static cost source, fetch failure,
+or 0 matched types — falls to the global `sla.maxCores`/`maxMem`. The
+`rio_scheduler_sla_class_ceiling_uncatalogued{hw_class}` gauge is set
+to 1 for such a class on every solve tick. Falling to global
+**over-permits, never over-strips** — the bounded failure mode is a
+Karpenter ICE-backoff (no real type fits the over-permitted demand),
+caught by `cover::sizing`'s `exceeds_cell_cap` drop on the controller
+side.
+
+r[scheduler.sla.ceiling.config-tightens-only]
+`sla.hwClasses[h].maxCores`/`maxMem` are an OPTIONAL operator
+override that **tightens** below the catalog (or global, if
+uncatalogued). The effective per-class ceiling is `min(catalog_or_global,
+cfg_or_global)` per axis. `validate()` rejects `Some(0)` and any
+override above the global cap; `None` falls through. The global cap is
+the single hard operator-asserted bound — observed instance types from
+controller Acks are untrusted input bounded by `min(_, global)`.
+
+r[scheduler.sla.ceiling.controller-mirror]
+The scheduler ships the catalog ceiling — `min(catalog, cfg)`, each
+falling to global when absent — to the controller over
+`GetHwClassConfig`. The wire value is always nonzero (`validate()`
+rejects `global=0` and `Some(0)` overrides; catalog ceilings are real
+instance shapes); the controller's `ceilings_for` `>0` filter
+(pre-R26-scheduler back-compat) is preserved. Skew is bounded by the
+controller's 300s `HwClassConfig` refresh.
+
 r[sched.sla.hw-class.k3-bench]
 The builder supervisor runs a K=3 microbench (`alu`, `membw`
 STREAM-triad, `ioseq` O_DIRECT) at init when the
