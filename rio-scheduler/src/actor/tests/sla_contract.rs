@@ -2320,3 +2320,165 @@ async fn contract_hw_cost_unknown_once_per_epoch() {
          miss tick → 4. Got {d:?}"
     );
 }
+
+/// **bug_019 / STRIKE-6** — bypass-path `--capacity` + `--cores=48` on
+/// a system whose `reference_hw_class` has `max_cores=32` MUST emit a
+/// `hw_class_names` set whose every member's per-class ceiling hosts
+/// `(cores, mem)`. Pre-fix: `reference_hw_class_for_system` arch-matches
+/// only (no size args) → emits the 32-core reference class → controller
+/// `assign_to_cells` skips `fallback_cell` (non-empty `hw_class_names`)
+/// → `cover::sizing` `exceeds_cell_cap`-drops it forever. Post-fix:
+/// the producer size-filters AND the post-finalize chokepoint strips
+/// any unhosting class regardless of producer.
+#[tokio::test]
+async fn contract_bypass_capacity_oversized_cores_emits_hosting_class() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    // reference_hw_class=intel-6 with max_cores=32; intel-7/8 stay at
+    // the global 64. `--cores=48` fits intel-7/8, not intel-6.
+    actor.sla_config.reference_hw_class = "intel-6".into();
+    actor
+        .sla_config
+        .hw_classes
+        .get_mut("intel-6")
+        .unwrap()
+        .max_cores = 32;
+    assert_eq!(
+        actor.sla_ceilings.max_cores as u32, 64,
+        "fixture: global=64"
+    );
+
+    actor.test_inject_ready("d-big", Some("test-pkg"), "x86_64-linux", false);
+    actor
+        .sla_estimator
+        .seed_overrides(vec![crate::db::SlaOverrideRow {
+            pname: "test-pkg".into(),
+            cores: Some(48.0),
+            capacity_type: Some("on-demand".into()),
+            ..Default::default()
+        }]);
+
+    let state = actor.dag.node("d-big").unwrap();
+    let (hw, cost, ig) = actor.solve_inputs();
+    let intent = actor.solve_intent_for(state, &hw, &cost, ig);
+
+    assert_eq!(intent.cores, 48, "forced cores reach the intent");
+    assert!(
+        !intent.hw_class_names.iter().any(|h| h == "intel-6"),
+        "hw_class_names MUST NOT contain a class whose max_cores < cores. \
+         Got {:?} with cores={} — intel-6.max_cores=32 cannot host 48; \
+         controller would exceeds_cell_cap-drop forever (bug_019).",
+        intent.hw_class_names,
+        intent.cores
+    );
+    assert!(
+        !intent.hw_class_names.is_empty(),
+        "a hosting class exists (intel-7/8 max_cores=64 ≥ 48); the \
+         producer should pick one, not emit empty. Got {:?}",
+        intent.hw_class_names
+    );
+    assert_eq!(
+        intent.node_affinity.len(),
+        intent.hw_class_names.len(),
+        "terms and names stay parallel through the chokepoint"
+    );
+}
+
+/// **bug_019 §one-step-removed (a) inverse** — `--cores` larger than
+/// EVERY configured class's `max_cores` MUST emit empty
+/// `hw_class_names` so the controller's `fallback_cell` reaches its OWN
+/// `None` → `no_menu_for_arch`. Pre-fix: `reference_hw_class_for_system`
+/// returns the arch-matched reference regardless of size → non-empty →
+/// controller never reaches `fallback_cell` → `exceeds_cell_cap` loop
+/// instead of the operator-visible `no_menu_for_arch` signal.
+#[tokio::test]
+async fn contract_bypass_capacity_oversized_no_class_hosts_emits_empty() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    actor.sla_config.reference_hw_class = "intel-6".into();
+    // Every class capped at 32; global at 64. `--cores=48` fits global,
+    // fits NO per-class.
+    for d in actor.sla_config.hw_classes.values_mut() {
+        d.max_cores = 32;
+    }
+
+    actor.test_inject_ready("d-huge", Some("test-pkg"), "x86_64-linux", false);
+    actor
+        .sla_estimator
+        .seed_overrides(vec![crate::db::SlaOverrideRow {
+            pname: "test-pkg".into(),
+            cores: Some(48.0),
+            capacity_type: Some("on-demand".into()),
+            ..Default::default()
+        }]);
+
+    let state = actor.dag.node("d-huge").unwrap();
+    let (hw, cost, ig) = actor.solve_inputs();
+    let intent = actor.solve_intent_for(state, &hw, &cost, ig);
+
+    assert_eq!(intent.cores, 48);
+    assert!(
+        intent.hw_class_names.is_empty() && intent.node_affinity.is_empty(),
+        "no class hosts cores=48 (all max_cores=32) → MUST emit empty so \
+         controller fallback_cell hits no_menu_for_arch. Got names={:?} \
+         terms={:?} — non-empty here means exceeds_cell_cap loop instead \
+         of the operator-visible metric.",
+        intent.hw_class_names,
+        intent.node_affinity
+    );
+}
+
+/// **STRIKE-6 §one-step-removed (b) next-phase**: post-chokepoint
+/// `(node_affinity, hw_class_names)` round-trips through
+/// `handle_ack_spawned_intents`' `zip(hw_class_names, node_affinity)`
+/// cell-reconstruction. The chokepoint shrinks both in lockstep, so a
+/// shrunk pair must still be aligned — `names[i]` is the `h` whose
+/// label conjunction produced `terms[i]`.
+#[tokio::test]
+async fn contract_chokepoint_preserves_term_name_alignment() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    actor.sla_config.reference_hw_class = "intel-6".into();
+    // intel-6=32, intel-7=64, intel-8=64. cores=48 → intel-6 stripped.
+    actor
+        .sla_config
+        .hw_classes
+        .get_mut("intel-6")
+        .unwrap()
+        .max_cores = 32;
+
+    actor.test_inject_ready("d-align", Some("test-pkg"), "x86_64-linux", false);
+    actor
+        .sla_estimator
+        .seed_overrides(vec![crate::db::SlaOverrideRow {
+            pname: "test-pkg".into(),
+            cores: Some(48.0),
+            capacity_type: Some("on-demand".into()),
+            ..Default::default()
+        }]);
+
+    let state = actor.dag.node("d-align").unwrap();
+    let (hw, cost, ig) = actor.solve_inputs();
+    let intent = actor.solve_intent_for(state, &hw, &cost, ig);
+
+    // Every surviving `(term, name)` pair: the term's hw-class label
+    // value matches the name. This is the round-trip invariant
+    // `handle_ack_spawned_intents` relies on.
+    for (term, name) in intent.node_affinity.iter().zip(&intent.hw_class_names) {
+        let hw_label = term
+            .match_expressions
+            .iter()
+            .find(|r| r.key == "rio.build/hw-class")
+            .expect("every term has hw-class label");
+        assert_eq!(
+            &hw_label.values[0], name,
+            "term/name misaligned post-chokepoint — zip would reconstruct wrong cells"
+        );
+        let (cc, _) = actor.sla_config.class_ceilings(name);
+        assert!(
+            intent.cores <= cc,
+            "every surviving class must host cores={}; {name}.max_cores={cc}",
+            intent.cores
+        );
+    }
+}

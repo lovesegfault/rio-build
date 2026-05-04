@@ -1154,9 +1154,19 @@ impl DagActor {
                     Some(cap) => {
                         let pinned: Vec<_> = cells.into_iter().filter(|(_, c)| *c == cap).collect();
                         if pinned.is_empty() {
+                            // r27-A4 / STRIKE-6: `all_candidates` is
+                            // every cell whose OWN c* fit its class;
+                            // the SHARED `a.c_star` may not. Producer-
+                            // side filter via the canonical
+                            // `class_ceilings`; the post-finalize
+                            // chokepoint below is the backstop.
                             memo.all_candidates
                                 .iter()
                                 .filter(|c| c.cell.1 == cap)
+                                .filter(|c| {
+                                    let (cc, cm) = self.sla_config.class_ceilings(&c.cell.0);
+                                    memo.a.c_star <= cc && memo.a.mem_bytes <= cm
+                                })
                                 .map(|c| c.cell.clone())
                                 .collect()
                         } else {
@@ -1245,18 +1255,24 @@ impl DagActor {
                     // `nodeSelector.arch=arm64` with `nodeAffinity arch
                     // In [amd64]` → permanently Pending. Arch-match
                     // like the controller's `fallback_cell` does. On
-                    // `None` (no class hosts this arch, or unmappable
-                    // system), emit empty so the controller's
+                    // `None` (no class hosts this arch at this size, or
+                    // unmappable system), emit empty so the controller's
                     // `fallback_cell` reaches its OWN `None` →
                     // `no_menu_for_arch` metric. Relies on `reference_
                     // hw_class_for_system` and `fallback_cell` agreeing
-                    // on the arch-match set (both query `hw_classes`
-                    // with the same `ARCH_LABEL` predicate); falling
-                    // back to the un-arch-matched `reference_hw_class`
-                    // here would reproduce bug_039 on the `None` arm
-                    // and bypass the metric.
-                    Some(cap) => match self.sla_config.reference_hw_class_for_system(&state.system)
-                    {
+                    // on the arch-AND-SIZE match set (both query
+                    // `class_ceilings`/`ceilings_for` with the same
+                    // predicate); falling back to the un-matched
+                    // `reference_hw_class` here would reproduce bug_039
+                    // on the `None` arm and bypass the metric. Pass the
+                    // raw `(c, m.max(floor))` — producer-side filter is
+                    // correctness-of-intent; the post-finalize
+                    // chokepoint below catches the post-clamp delta.
+                    Some(cap) => match self.sla_config.reference_hw_class_for_system(
+                        &state.system,
+                        c,
+                        m.max(state.sched.resource_floor.mem_bytes),
+                    ) {
                         Some(h) => solve::cells_to_selector_terms(
                             &[(h.to_owned(), cap)],
                             &self.sla_config.hw_classes,
@@ -1288,6 +1304,16 @@ impl DagActor {
         let cores = cores.min(self.sla_ceilings.max_cores as u32).max(1);
         let mem = mem.max(floor.mem_bytes).min(self.sla_ceilings.max_mem);
         let disk = disk.max(floor.disk_bytes).min(self.sla_ceilings.max_disk);
+        // STRIKE-6 (r29 bug_019): single post-finalize chokepoint. Both
+        // arms above converge here with finalized `(cores, mem)`; this
+        // is downstream of every `hw_class_names` producer (the
+        // `solve_full` re-filter, the `all_candidates` capacity-
+        // fallback, the no-memo `reference_hw_class_for_system`). A 7th
+        // producer-hole would require a SpawnIntent construction site
+        // that bypasses `solve_intent_for` entirely.
+        let (node_affinity, hw_class_names) =
+            self.sla_config
+                .retain_hosting_classes(node_affinity, hw_class_names, cores, mem);
         // D7: deadline_secs. Fitted ⇒ `wall_p99 × 5` (p99 of the
         // log-normal `T(c)·exp(ε)` at the chosen cores, no retry tail
         // — k8s-kill-then-reactive-floor IS the retry). Unfitted

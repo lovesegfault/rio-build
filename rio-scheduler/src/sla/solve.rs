@@ -908,12 +908,10 @@ pub fn solve_full(
     let mut spot_rejects: Vec<CellReject> = Vec::new();
     let mut od_rejects: Vec<CellReject> = Vec::new();
 
-    let class_max_of = |h: &str| {
-        cfg.hw_classes
-            .get(h)
-            .map(|d| (d.max_cores, d.max_mem))
-            .unwrap_or((u32::MAX, u64::MAX))
-    };
+    // §Canonicalize: shared with `reference_hw_class_for_system`, the
+    // `all_candidates` capacity-fallback, and the post-finalize
+    // chokepoint.
+    let class_max_of = |h: &str| cfg.class_ceilings(h);
     for tier in tiers {
         let mut candidates: Vec<Candidate> = Vec::with_capacity(h_set.len() * 2);
         for h in h_set {

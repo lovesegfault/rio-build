@@ -239,10 +239,16 @@ pub fn sizing(cell: &Cell, u: &[&SpawnIntent], cfg: &SizingCfg) -> (Vec<(u32, u6
     // not the claim's `(c,m,d)`); a clamped claim would just loop
     // (mint→Pending→re-mint). Filter and DROP — `assign_to_cells`' next
     // tick re-evaluates if the scheduler re-solves with the per-cell
-    // ceiling, otherwise the intent stays dropped here. The scheduler's
-    // `ClassCeiling` gate SHOULD have prevented this; the producer holes
+    // ceiling, otherwise the intent stays dropped here.
+    //
+    // STRIKE-6 (r29 bug_019): the three scheduler-side producer holes
     // (override-bypass `fallback_cell`, `--capacity` `all_candidates`-
-    // fallback) are the r28 single-chokepoint candidate.
+    // fallback, no-memo `Some(cap)` `reference_hw_class_for_system`) are
+    // closed via the post-finalize chokepoint at
+    // `snapshot.rs::solve_intent_for` (`SlaConfig::retain_hosting_
+    // classes`). This backstop now fires only on version-skew
+    // (controller `hw_classes` ≠ scheduler's) or a producer bypassing
+    // `solve_intent_for` entirely.
     let (fits, over): (Vec<&SpawnIntent>, Vec<&SpawnIntent>) = u.iter().copied().partition(|i| {
         let (ic, im, id) = intent_pod_footprint(i, cfg.fuse_cache_bytes);
         ic <= cfg.max_node_cores && im <= cfg.max_node_mem && id <= cfg.max_node_disk

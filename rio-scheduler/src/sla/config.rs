@@ -367,15 +367,35 @@ impl ProbeShape {
 pub const ARCH_LABEL: &str = "kubernetes.io/arch";
 
 impl SlaConfig {
+    /// Per-class `(max_cores, max_mem)` from `hw_classes[h]`. Mirrors
+    /// the controller's `HwClassConfig::ceilings_for`. Unknown class →
+    /// `(u32::MAX, u64::MAX)` (no per-class ceiling — global only).
+    /// Disk has no per-class ceiling (global-only via `SlaCeilings`);
+    /// the chokepoint filters cores+mem only by design.
+    ///
+    /// §Partition-single-source: every scheduler-side per-class ceiling
+    /// check (`solve_full`, [`Self::reference_hw_class_for_system`],
+    /// the `all_candidates` capacity-fallback, the post-finalize
+    /// chokepoint [`Self::retain_hosting_classes`]) calls THIS.
+    pub fn class_ceilings(&self, h: &str) -> (u32, u64) {
+        self.hw_classes
+            .get(h)
+            .map_or((u32::MAX, u64::MAX), |d| (d.max_cores, d.max_mem))
+    }
+
     /// `reference_hw_class` if its `kubernetes.io/arch` label matches
-    /// `system`'s arch (or is absent — arch-agnostic class), else the
-    /// first (sorted) `hw_classes` entry that matches. `None` ⇔
-    /// `system` unmappable OR no configured class hosts that arch.
-    /// Mirrors the controller's `NodeClaimPoolConfig::fallback_cell`
-    /// candidate logic so the scheduler's bypass-path `--capacity` cell
-    /// (snapshot.rs) and the controller's cold-start fallback agree on
-    /// which class an arch routes to.
-    pub fn reference_hw_class_for_system(&self, system: &str) -> Option<&str> {
+    /// `system`'s arch (or is absent — arch-agnostic class) AND
+    /// [`Self::class_ceilings`] hosts `(cores, mem)`, else the first
+    /// (sorted) `hw_classes` entry that does. `None` ⇔ `system`
+    /// unmappable OR no configured class hosts that arch at that size —
+    /// caller emits empty `hw_class_names` so the controller's
+    /// `fallback_cell` reaches its OWN `None` → `no_menu_for_arch`.
+    pub fn reference_hw_class_for_system(
+        &self,
+        system: &str,
+        cores: u32,
+        mem: u64,
+    ) -> Option<&str> {
         let arch = rio_common::k8s::system_to_k8s_arch(system)?;
         let matches = |h: &str| {
             self.hw_classes.get(h).is_some_and(|d| {
@@ -383,7 +403,10 @@ impl SlaConfig {
                     .iter()
                     .find(|l| l.key == ARCH_LABEL)
                     .is_none_or(|l| l.value == arch)
-            })
+            }) && {
+                let (cc, cm) = self.class_ceilings(h);
+                cores <= cc && mem <= cm
+            }
         };
         if matches(&self.reference_hw_class) {
             return Some(&self.reference_hw_class);
@@ -391,6 +414,41 @@ impl SlaConfig {
         let mut hs: Vec<&str> = self.hw_classes.keys().map(String::as_str).collect();
         hs.sort_unstable();
         hs.into_iter().find(|h| matches(h))
+    }
+
+    /// STRIKE-6 (r29 bug_019): single post-finalize chokepoint. Every
+    /// `hw_class_names` producer in `solve_intent_for` lands here with
+    /// finalized `(cores, mem)`. A class whose [`Self::class_ceilings`]
+    /// `< (cores, mem)` would route the controller to a cell whose
+    /// `cover::sizing` `exceeds_cell_cap`-drops it forever (build never
+    /// provisions). The producer paths SHOULD have filtered
+    /// (correctness-of-intent: pick the right class, preserve operator's
+    /// cap-pin); this is the §"Function becomes total" backstop —
+    /// correctness-of-output regardless of correctness-of-producer.
+    /// Stripped classes are logged so a producer regression is visible.
+    pub fn retain_hosting_classes(
+        &self,
+        terms: Vec<rio_proto::types::NodeSelectorTerm>,
+        names: Vec<String>,
+        cores: u32,
+        mem: u64,
+    ) -> (Vec<rio_proto::types::NodeSelectorTerm>, Vec<String>) {
+        terms
+            .into_iter()
+            .zip(names)
+            .filter(|(_, h)| {
+                let (cc, cm) = self.class_ceilings(h);
+                let ok = cores <= cc && mem <= cm;
+                if !ok {
+                    tracing::warn!(
+                        %h, cores, mem, class_cap = ?(cc, cm),
+                        "hw_class stripped at post-finalize chokepoint — \
+                         producer-path size-filter regressed?"
+                    );
+                }
+                ok
+            })
+            .unzip()
     }
 
     /// Upper bound for time-domain seed-corpus parameters (S, P, Q) in
@@ -1140,8 +1198,8 @@ mod tests {
     /// it is classified. r2 bug_038 (`hw_classes` charset) and r6
     /// bug_039: `reference_hw_class_for_system` arch-matches so the
     /// bypass-path `--capacity` cell doesn't emit `arch In [amd64]` for
-    /// an aarch64 build. Mirrors controller `fallback_cell` candidate
-    /// logic.
+    /// an aarch64 build. `(1, 0)` = trivially-hosted on every class so
+    /// the size filter is a no-op for this arch-only test.
     #[test]
     fn reference_hw_class_for_system_arch_matches() {
         let mut cfg = base();
@@ -1153,23 +1211,102 @@ mod tests {
         cfg.reference_hw_class = "mid-x86".into();
         // x86_64 → reference matches.
         assert_eq!(
-            cfg.reference_hw_class_for_system("x86_64-linux"),
+            cfg.reference_hw_class_for_system("x86_64-linux", 1, 0),
             Some("mid-x86")
         );
         // aarch64 → reference is amd64, fall through to first arch-match
         // (sorted: agnostic has no arch label → matches anything).
         assert_eq!(
-            cfg.reference_hw_class_for_system("aarch64-linux"),
+            cfg.reference_hw_class_for_system("aarch64-linux", 1, 0),
             Some("agnostic")
         );
         // Drop agnostic → mid-arm wins.
         cfg.hw_classes.remove("agnostic");
         assert_eq!(
-            cfg.reference_hw_class_for_system("aarch64-linux"),
+            cfg.reference_hw_class_for_system("aarch64-linux", 1, 0),
             Some("mid-arm")
         );
         // Unmappable system → None.
-        assert_eq!(cfg.reference_hw_class_for_system("riscv64-linux"), None);
+        assert_eq!(
+            cfg.reference_hw_class_for_system("riscv64-linux", 1, 0),
+            None
+        );
+    }
+
+    /// bug_019 / STRIKE-6: `reference_hw_class_for_system` size-filters
+    /// via [`SlaConfig::class_ceilings`] so a `--cores=48` bypass-path
+    /// override picks a class that can HOST 48, not the arch-matched
+    /// reference whose `max_cores=32`.
+    #[test]
+    fn reference_hw_class_for_system_size_filters() {
+        let mut cfg = base();
+        let mut mid = test_def(ARCH_LABEL, "amd64");
+        mid.max_cores = 32;
+        let mut hi = test_def(ARCH_LABEL, "amd64");
+        hi.max_cores = 128;
+        cfg.hw_classes = HashMap::from([("mid".into(), mid), ("hi".into(), hi)]);
+        cfg.reference_hw_class = "mid".into();
+        // 48 > mid.max_cores=32 → fall through to hi (128 ≥ 48).
+        assert_eq!(
+            cfg.reference_hw_class_for_system("x86_64-linux", 48, 0),
+            Some("hi"),
+            "mid.max_cores=32 cannot host 48; must pick hi"
+        );
+        // 16 ≤ 32 → reference still wins.
+        assert_eq!(
+            cfg.reference_hw_class_for_system("x86_64-linux", 16, 0),
+            Some("mid")
+        );
+        // 256 > every class → None (controller no_menu_for_arch).
+        assert_eq!(
+            cfg.reference_hw_class_for_system("x86_64-linux", 256, 0),
+            None
+        );
+        // mem dimension: hi.max_mem = test_def's 256GiB.
+        assert_eq!(
+            cfg.reference_hw_class_for_system("x86_64-linux", 1, 512 << 30),
+            None,
+            "no class hosts 512GiB mem"
+        );
+    }
+
+    /// STRIKE-6 structural guarantee: [`SlaConfig::retain_hosting_classes`]
+    /// strips ANY `(term, name)` pair whose class can't host
+    /// `(cores, mem)`, regardless of which producer leaked it. Terms and
+    /// names stay parallel (lockstep zip).
+    #[test]
+    fn retain_hosting_classes_filters_any_producer_leak() {
+        let mut cfg = base();
+        let mut mid = test_def("rio.build/hw-class", "mid");
+        mid.max_cores = 32;
+        let mut hi = test_def("rio.build/hw-class", "hi");
+        hi.max_cores = 128;
+        cfg.hw_classes = HashMap::from([("mid".into(), mid), ("hi".into(), hi)]);
+        let term = |v: &str| rio_proto::types::NodeSelectorTerm {
+            match_expressions: vec![rio_proto::types::NodeSelectorRequirement {
+                key: "rio.build/hw-class".into(),
+                operator: "In".into(),
+                values: vec![v.into()],
+            }],
+        };
+        // Hand-construct a producer leak: mid can't host 48, hi can.
+        let (terms, names) = cfg.retain_hosting_classes(
+            vec![term("mid"), term("hi"), term("mid")],
+            vec!["mid".into(), "hi".into(), "mid".into()],
+            48,
+            0,
+        );
+        assert_eq!(names, vec!["hi"], "mid (max_cores=32) stripped at 48");
+        assert_eq!(terms.len(), 1, "terms parallel to names");
+        assert_eq!(terms[0].match_expressions[0].values[0], "hi");
+        // Unknown class → (MAX, MAX) → never stripped.
+        let (_, names) =
+            cfg.retain_hosting_classes(vec![term("ghost")], vec!["ghost".into()], 999, u64::MAX);
+        assert_eq!(names, vec!["ghost"], "unknown class = no per-class ceiling");
+        // All stripped → both empty (controller fallback_cell path).
+        let (terms, names) =
+            cfg.retain_hosting_classes(vec![term("mid")], vec!["mid".into()], 48, 0);
+        assert!(terms.is_empty() && names.is_empty());
     }
 
     /// bug_019 (`lead_time_seed` membership/range) are the same
