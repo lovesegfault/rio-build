@@ -163,13 +163,23 @@ impl HwClassConfig {
         self.find(h).map(|d| d.node_class.clone())
     }
 
-    /// `[sla.hw_classes.$h].{max_cores, max_mem}` for `h` — the
-    /// per-class capacity ceilings. `None` if `h` is unknown, config
-    /// not yet loaded, OR the loaded entry's ceilings are zero (proto
-    /// default — pre-R26 scheduler that doesn't ship them). The §13b
-    /// `cover_deficit` builds per-cell `SizingCfg` with
-    /// `min(per_class, global)` so claims chunk at the class's actual
-    /// instance-type ceiling instead of the global cap.
+    /// §13c-2: per-class catalog ceiling for `h` (the largest real
+    /// instance type matching `h`'s `requirements`, derived
+    /// scheduler-side at boot from `describe_instance_types` and
+    /// folded with any per-class config override before serialize —
+    /// `min(catalog, cfg)`, each falling to the global when absent).
+    /// `None` if `h` is unknown, config not yet loaded, OR the loaded
+    /// entry's ceilings are zero (proto default — pre-R26 scheduler
+    /// that doesn't ship them; the §13c-2 scheduler always ships
+    /// nonzero — `validate()` rejects global=0 and `Some(0)`
+    /// overrides). The §13b `cover_deficit` builds per-cell
+    /// `SizingCfg` with `min(per_class, global)` so claims chunk at
+    /// the class's actual instance-type ceiling instead of the global
+    /// cap. Skew window: scheduler→controller `GetHwClassConfig`
+    /// refreshes every 300s, so a freshly-booted scheduler's catalog
+    /// reaches here within one refresh; an uncatalogued class is
+    /// over-permitted to global in that window — bounded, self-heals.
+    // r[impl scheduler.sla.ceiling.controller-mirror]
     pub fn ceilings_for(&self, h: &str) -> Option<(u32, u64)> {
         self.find(h)
             .map(|d| (d.max_cores, d.max_mem))

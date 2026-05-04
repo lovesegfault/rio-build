@@ -345,9 +345,14 @@ impl Default for NodeClaimPoolConfig {
             // covers the ~18s real boot.
             default_lead_time_seed: 30.0,
             sketch_halflife_secs: 6 * 3600,
-            // Matches helm `sla.maxCores` / `sla.maxMem` defaults.
-            max_node_cores: 64,
-            max_node_mem: 256 * (1 << 30),
+            // §13c-2: Matches helm `sla.maxCores` / `sla.maxMem`
+            // global ceiling defaults. The per-class `ceilings_for(h)`
+            // (catalog-derived, shipped over `GetHwClassConfig`) is
+            // tighter when available; this is the uncatalogued
+            // fallback. Sized to clear the largest fleet type
+            // (192c metal-48xl, 1.5 TiB).
+            max_node_cores: 192,
+            max_node_mem: 1536 * (1 << 30),
             // ≈ 500Gi `dataVolumeSize` × 90% allocatable.
             max_node_disk: 450 * (1 << 30),
             metal_sizes: Vec::new(),

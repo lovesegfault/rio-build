@@ -179,7 +179,7 @@ pub fn describe_metrics() {
          max_cores/max_mem, or required_features unmatched (the hwClasses \
          key-set lacks a `provides_features` entry for it). \
          reason=exceeds_cell_cap: intent's pod footprint exceeds the assigned \
-         cell's per-class HwClassDef.max_cores/max_mem (or max_node_disk) — \
+         cell's per-class catalog ceiling (or max_node_disk) — \
          the scheduler's ClassCeiling gate didn't reject it (override-bypass \
          producer hole). The intent has no valid claim of any n; sizing drops \
          it instead of looping mint→Pending."

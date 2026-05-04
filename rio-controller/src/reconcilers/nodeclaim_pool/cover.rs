@@ -264,7 +264,9 @@ pub fn sizing(cell: &Cell, u: &[&SpawnIntent], cfg: &SizingCfg) -> (Vec<(u32, u6
         tracing::warn!(
             intent_id = %i.intent_id, cell = %cell, footprint = ?(ic, im, id),
             cap = ?(cfg.max_node_cores, cfg.max_node_mem, cfg.max_node_disk),
-            "intent footprint exceeds per-cell cap — dropping (scheduler ClassCeiling not gating?)"
+            "intent footprint exceeds per-cell cap — dropping (scheduler ClassCeiling \
+             not gating? scheduler-controller GetHwClassConfig skew up to 300s; \
+             uncatalogued class over-permitted to global until next refresh)"
         );
         ::metrics::counter!(
             "rio_controller_nodeclaim_intent_dropped_total",
@@ -731,8 +733,9 @@ mod tests {
         );
     }
 
-    /// STRIKE-5 (r27 mb_006): per-cell `cfg.max_node_cores` (from
-    /// `HwClassDef.max_cores`) can be tighter than the GLOBAL cap the
+    /// STRIKE-5 (r27 mb_006): per-cell `cfg.max_node_cores` (from §13c-2
+    /// catalog-derived `class_ceilings`, `min(catalog, HwClassDef.max_cores)`)
+    /// can be tighter than the GLOBAL cap the
     /// scheduler's chokepoint clamps at. An over-cap intent has no valid
     /// claim of any `n` (its pod requests `intent_pod_footprint(i)`, not
     /// the claim's `(c,m,d)`); a clamped 32c claim would just loop
