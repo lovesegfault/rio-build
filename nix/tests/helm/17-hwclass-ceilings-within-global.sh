@@ -22,7 +22,13 @@ check_render() {
   # axes are checked on their OWN line (the original fired only on
   # `/^max_mem = /` — leaked when only max_cores rendered). A block
   # with NEITHER is legal (catalog-derived).
+  # §13c-3: when sla.maxCores/maxMem are unset (the default — the
+  # scheduler derives them from the catalog at boot), the [sla] block
+  # has no max_cores/max_mem lines. Fall back to the hard constants
+  # (MAX_CORES_GLOBAL=1023, MAX_MEM_GLOBAL=32 TiB) so a per-class
+  # override is still range-checked against the structural ceiling.
   bad=$(awk '
+    BEGIN                      { gmc=1023; gmm=35184372088832 }
     /^\[sla\]$/                { in_sla=1; h="" }
     /^\[sla\./                 { in_sla=0; h="" }
     in_sla && /^max_cores = /  { gmc=$3+0 }
@@ -68,13 +74,28 @@ check_render prod \
 check_render vmtest-full -f values/vmtest-full.yaml
 # Range check: an explicit > global override MUST be flagged. Empty by
 # default; this proves the awk fires when a line IS rendered.
+# §13c-3: pin sla.maxCores so the awk has a global to compare against
+# (when sla.maxCores is unset the [sla] block has no max_cores line and
+# the awk falls to MAX_CORES_GLOBAL=1023 — only catches > 1023).
 ALLOW_OVERRIDES=1
 if check_render bad-override \
   --set karpenter.enabled=true --set karpenter.clusterName=ci \
   --set karpenter.nodeRoleName=ci-role --set karpenter.amiTag=test \
   --set postgresql.enabled=false \
+  --set scheduler.sla.maxCores=192 \
+  --set scheduler.sla.maxMem=1649267441664 \
   --set scheduler.sla.hwClasses.hi-ebs-x86.maxCores=999 2>/dev/null; then
   echo "FAIL: maxCores=999 (> global=192) not flagged — awk regression" >&2
+  exit 1
+fi
+# §13c-3: with no global set, the awk falls to the hard structural
+# constant MAX_CORES_GLOBAL=1023 — a per-class > 1023 must still flag.
+if check_render bad-override-hard \
+  --set karpenter.enabled=true --set karpenter.clusterName=ci \
+  --set karpenter.nodeRoleName=ci-role --set karpenter.amiTag=test \
+  --set postgresql.enabled=false \
+  --set scheduler.sla.hwClasses.hi-ebs-x86.maxCores=2000 2>/dev/null; then
+  echo "FAIL: maxCores=2000 (> MAX_CORES_GLOBAL=1023) not flagged" >&2
   exit 1
 fi
 ALLOW_OVERRIDES=0

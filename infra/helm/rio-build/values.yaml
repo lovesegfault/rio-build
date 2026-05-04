@@ -409,11 +409,18 @@ scheduler:
       - {name: best-effort}
     defaultTier: normal
     probe: {cpu: 16, memPerCore: 1073741824, memBase: 34359738368, deadlineSecs: 3600}
-    # §13c-2: global ceiling is the safety net for uncatalogued classes;
-    # per-class catalog ceilings (boot-derived) do the real bounding.
-    # Sized to clear the largest fleet type (192c metal-48xl, 1.5 TiB).
-    maxCores: 192
-    maxMem: 1649267441664      # 1.5 TiB
+    # §13c-3: global cores/mem ceiling. Unset (the default) → derived
+    # at boot from `describe_instance_types` ∩ requirements (Spot
+    # only). Set explicitly to cap below the largest catalog type, OR
+    # if hwCostSource=static (no catalog). The controller mirrors the
+    # resolved global over `GetHwClassConfig`.
+    #
+    # Risk note: default `probe.cpu=16` requires the resolved global
+    # ≥ 64 (the validate rule is `probe.cpu ≤ maxCores/4`). A
+    # deployment whose Karpenter requirements only match instances
+    # < 64c must EITHER set `probe.cpu ≤ 12` OR pin `maxCores`.
+    # maxCores: 192
+    # maxMem: 1649267441664    # 1.5 TiB
     maxDisk: 214748364800      # 200 GiB
     defaultDisk: 107374182400  # 100 GiB
     hwCostTolerance: 0.15

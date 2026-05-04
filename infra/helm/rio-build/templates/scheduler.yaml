@@ -190,8 +190,16 @@ data:
     [sla]
     cluster = {{ (.cluster | default $.Values.karpenter.clusterName | default "") | quote }}
     default_tier = {{ .defaultTier | quote }}
-    max_cores = {{ printf "%.1f" (float64 .maxCores) }}
-    max_mem = {{ int64 .maxMem }}
+    {{- /* §13c-3: maxCores/maxMem optional. Unset → scheduler derives
+           from `describe_instance_types` catalog at boot (Spot only;
+           static mode requires both). `with` skips the line on nil so
+           serde sees the key absent → Option::None. */ -}}
+    {{- with .maxCores }}
+    max_cores = {{ printf "%.1f" (float64 .) }}
+    {{- end }}
+    {{- with .maxMem }}
+    max_mem = {{ int64 . }}
+    {{- end }}
     max_disk = {{ int64 .maxDisk }}
     default_disk = {{ int64 .defaultDisk }}
     hw_cost_tolerance = {{ printf "%v" (float64 .hwCostTolerance) }}

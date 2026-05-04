@@ -13,8 +13,6 @@ default_lead_time_seed = {{ printf "%.1f" (float64 (default 30.0 .defaultLeadTim
 max_fleet_cores = {{ int64 .maxFleetCores }}
 max_node_claims_per_cell_per_tick = {{ int64 .maxNodeClaimsPerCellPerTick }}
 max_lead_time = {{ printf "%.1f" (float64 .maxLeadTime) }}
-max_node_cores = {{ int64 .maxCores }}
-max_node_mem = {{ int64 .maxMem }}
 {{- /* `dataVolumeSize` is a k8s Quantity ("500Gi"); approximate
        allocatable as 90% (kubelet eviction threshold + image cache). */}}
 max_node_disk = {{ mulf 0.9 (include "rio.quantityBytes" $.Values.karpenter.dataVolumeSize) | int64 }}
