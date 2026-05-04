@@ -121,6 +121,30 @@ in too many heads.
   loop. Upstream still SHOULD deliver the invariant (per-cell ceiling
   filter on producer paths) for correctness-of-intent; the function no
   longer requires it for correctness-of-output.
+- **Single emit-chokepoint** (r29 bug_019 → `solve_intent_for`
+  STRIKE-6): by N=6 on `cover::sizing` producer-holes (r24→r29),
+  STRIKE-5's "function becomes total" closed the CONSUMER (controller
+  drops, never panics) but producer paths kept emitting unhosted
+  classes — three known holes, each a separate `hw_class_names`
+  populator with its own arch-match-but-not-size-match bug. Close: the
+  SCHEDULER's emit becomes total. A single post-finalize chokepoint
+  (after `cores`/`mem` are clamped, before SpawnIntent construction)
+  filters `hw_class_names` to classes that host `(cores, mem)`.
+  Producer paths SHOULD still filter (correctness-of-intent: pick the
+  right class, preserve operator's cap-pin); the chokepoint guarantees
+  correctness-of-output regardless. The predicate is canonical
+  (`SlaConfig::class_ceilings`, mirrors controller
+  `HwClassConfig::ceilings_for`).
+- **Canonicalize load-sequence** (r29 bug_017 →
+  `CellSketches::load_seeded` STRIKE-3): three rounds (r26 mb_026 →
+  r27 mb_012 → r29) on `seed()`'s skip-gate vs `maybe_rotate_all`'s
+  next-tick. Each fix was a correct gate that the NEXT lifecycle
+  transition violated, because `load() + seed()` were composed at TWO
+  call sites with `maybe_rotate_all` only running in-tick.
+  §Precondition→postcondition close: `load_seeded(pg, seed, halflife)`
+  does `load → rotate → seed` in one body; bare `load()` becomes
+  module-private. Callers cannot construct an un-canonicalized
+  `CellSketches`.
 
 A new review rule MAY accompany the type-check (so first-strike on a
 *different* invariant is caught) — but the type-check is the close,
@@ -182,6 +206,17 @@ jobs.rs:460-465 (A18 note); the stale `pending_intents`/`or_insert`/
 done-gate `rg` was scoped to `rio-scheduler/`; the controller-side
 comment was invisible.
 
+**Cross-tier sweep.** r29: 3/3 §SCC doc-sweep nits (mb_002, mb_018,
+mb_020) are CROSS-TIER misses — r27's done-gates were `rg <pattern>
+<crate>/`. A behavior change visible to OPERATORS has sibling doc-sites
+at: Prometheus `describe_*!` HELP text (`<crate>/src/lib.rs`),
+`docs/src/observability.md` table row, `docs/src/components/*.md` spec
+marker, `infra/helm/**/*.yaml` template comments. None are "in the
+editing crate". **Done-gate addition:** when the close changes a metric
+semantics, a CRD constraint, or a spec'd algorithm, the (2)/(3) `rg`
+MUST cover `docs/src/ infra/helm/ rio-*/src/lib.rs` in addition to the
+editing crate. Shorthand: "operator-visible ⟹ cross-tier sweep".
+
 ## Verifier-one-step-removed
 
 A verifier that confirms "the bughunter's claim X is refuted" can miss
@@ -234,6 +269,18 @@ parameter (a cap, a key-granularity, a gate-semantics), the verifier's
 sibling-sweep extends to OTHER closes that documented an invariant on
 the OLD parameter — `rg <param>` over `debug_assert`/doc-comments
 across the crate, not just the close's own files.
+
+**Amendment-claims need code-verification.** r29 mb_012:
+r27-validation's A6 amendment wrote a one-liner closure-doc ("mirrors
+`node_of` — DAG-prune race only") that was structurally false from the
+moment it shipped — `node_of` reads an Ack-repopulated map, `tenant_of`
+reads a DAG-lifetime fn. The validator's amendment was a CLAIM, not
+code-verified per §SCC(2) "truth-source is code, not another comment".
+Plan-validation amendments that ADD a behavioral claim (a doc-comment
+stating an invariant) get the same §SCC(2) check — locate the two sides
+of the claimed equivalence and confirm they read the SAME source. "X
+mirrors Y" / "X agrees with Y" comments are §Partition-single-source
+findings unless X and Y literally share a fn call.
 
 ## Partition-single-source
 
