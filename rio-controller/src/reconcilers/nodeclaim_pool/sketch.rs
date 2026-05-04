@@ -290,9 +290,11 @@ impl CellSketches {
 
     /// Overlay `sla.leadTimeSeed` onto cells whose active AND shadow
     /// sketches are empty: inject `N_SEED = 1/(1−q) = 10` copies of the
-    /// seed into `z_active` and `boot_active`. Idempotent. Called once
-    /// after [`load`](Self::load) so cold-start `lead_time()` returns
-    /// the operator's probe-boot measurement instead of 0.
+    /// seed into `z_active` and `boot_active`. Idempotent. Called from
+    /// [`load_seeded`](Self::load_seeded) (after `maybe_rotate_all`, so
+    /// it sees post-rotation state) and on the constructor's `Err`-arm
+    /// `default()` — cold-start `lead_time()` returns the operator's
+    /// probe-boot measurement instead of 0.
     ///
     /// The shadow check matters for restart-after-rotation: `load()`
     /// restores `z_shadow` from PG; injecting `N_SEED=10` into the
@@ -410,8 +412,13 @@ impl CellSketches {
     /// chrono/time feature, and the codebase pattern is to keep
     /// timestamptz arithmetic PG-side (see `rio-scheduler/src/db/
     /// recovery.rs`).
+    ///
+    /// `pub(super)`: production callers MUST use [`Self::load_seeded`]
+    /// (the canonical `load → rotate → seed` sequence). Bare `load()`
+    /// is exposed only for the in-module PG round-trip test and as the
+    /// building block of `load_seeded`.
     // r[impl ctrl.nodeclaim.lead-time-ddsketch]
-    pub async fn load(pg: &sqlx::PgPool) -> sqlx::Result<Self> {
+    pub(super) async fn load(pg: &sqlx::PgPool) -> sqlx::Result<Self> {
         let rows = sqlx::query!(
             r#"SELECT hw_class, capacity_type,
                       z_sketch_active, z_sketch_shadow,
@@ -448,10 +455,35 @@ impl CellSketches {
         Ok(Self { cells })
     }
 
+    /// Canonical PG load: `load → maybe_rotate_all(now, halflife) →
+    /// seed(seed_map)`. STRIKE-3 close (bug_017): `seed()`'s "skip when
+    /// `z_shadow > 0`" precondition is correct for FRESH shadow; a
+    /// STALE-epoch shadow is discarded by the first tick's
+    /// `maybe_rotate_all` AFTER `seed()` already skipped — both empty,
+    /// `lead_time() = 0`. Rotating BEFORE `seed()` here means `seed()`
+    /// sees the same state production's first tick will: stale shadow
+    /// already discarded, fresh shadow preserved (rotate is a no-op
+    /// when `now − epoch < halflife`). For stale cells the first
+    /// in-tick `maybe_rotate_all` is a no-op (`epoch` was just reset);
+    /// fresh cells continue their own rotation schedule.
+    ///
+    /// Callers MUST use this; bare `load()` is `pub(super)`.
+    pub async fn load_seeded(
+        pg: &sqlx::PgPool,
+        lead_time_seed: &HashMap<String, f64>,
+        halflife: Duration,
+        now: SystemTime,
+    ) -> sqlx::Result<Self> {
+        let mut sk = Self::load(pg).await?;
+        sk.maybe_rotate_all(now, halflife);
+        sk.seed(lead_time_seed);
+        Ok(sk)
+    }
+
     /// Upsert every cell into `nodeclaim_cell_state`. One round-trip
     /// per cell — |cells| ≈ 24, tick = 10s, so ~2.4 qps; not worth a
     /// batch UNNEST yet. `sketch_epoch` written via `to_timestamp(f64)`
-    /// per the no-time-crate pattern (see [`load`](Self::load)).
+    /// per the no-time-crate pattern (see `load()`).
     pub async fn persist(&self, pg: &sqlx::PgPool) -> sqlx::Result<()> {
         for (cell, s) in &self.cells {
             let idle = serde_json::to_value(&s.idle_gap_events)
@@ -694,6 +726,109 @@ mod tests {
         assert!(
             lt >= 60.0,
             "lead_time post-rotate-then-seed: {lt} (should be shadow's q0.9≈64, not seed=5)"
+        );
+    }
+
+    /// bug_017 / STRIKE-3: PG load with `(z_active=∅, z_shadow>0,
+    /// epoch=stale)` under the OLD production order (`seed()` then
+    /// first-tick `maybe_rotate_all`) — `seed()` skips (`z_shadow>0`),
+    /// rotate discards shadow → both empty → `lead_time()=0`.
+    /// `load_seeded` canonicalizes `load → rotate → seed`: stale shadow
+    /// discarded BEFORE `seed()` runs, so `seed()` sees `(∅, ∅)` and
+    /// fills. This test mirrors `load_seeded`'s body in-memory (the
+    /// real fn is async+PG).
+    #[test]
+    fn load_seeded_stale_epoch_seeds_after_rotate() {
+        let halflife = Duration::from_secs(6 * 3600);
+        let mut sk = CellSketches::default();
+        let cell = Cell("stale".into(), CapacityType::Spot);
+        // Persisted state: z_active=∅, z_shadow=200 samples (q0.9≈64),
+        // epoch = UNIX_EPOCH+7h (stale: now − epoch ≫ halflife).
+        {
+            let s = sk.cell_mut(&cell);
+            for k in 0..200u32 {
+                s.record(20.0 + f64::from(k % 50), 0.0);
+            }
+            s.epoch = SystemTime::UNIX_EPOCH;
+            s.maybe_rotate(
+                SystemTime::UNIX_EPOCH + Duration::from_secs(7 * 3600),
+                halflife,
+            );
+            assert_eq!(s.z_active.count(), 0);
+            assert_eq!(s.z_shadow.count(), 200);
+        }
+        let seeds: HashMap<String, f64> = [("stale:spot".into(), 5.0)].into();
+
+        // load_seeded order: rotate THEN seed. Stale epoch → rotate
+        // discards shadow (z_shadow ← z_active(=∅)); seed() sees
+        // (∅, ∅) and injects N_SEED×5.0.
+        sk.maybe_rotate_all(SystemTime::now(), halflife);
+        sk.seed(&seeds);
+
+        let lt = sk.lead_time(&cell);
+        assert!(
+            lt > 0.0,
+            "lead_time after stale-epoch load→rotate→seed: {lt} \
+             (bug_017: pre-fix order left lt=0 — seed() skipped, then rotate emptied both)"
+        );
+        // The stale shadow's q0.9≈64 is intentionally DISCARDED (it's
+        // >halflife old); seed=5.0 is the floor — NOT 0, NOT shadow.
+        assert!(
+            (lt - 5.0).abs() / 5.0 < 0.02,
+            "lead_time={lt} — should be seed value 5.0 (stale shadow discarded), \
+             not shadow's q0.9≈64"
+        );
+
+        // §one-step-removed (b): the in-tick `maybe_rotate_all` at
+        // mod.rs:644 is now a no-op on tick 1 (epoch was just reset).
+        sk.maybe_rotate_all(SystemTime::now(), halflife);
+        let lt2 = sk.lead_time(&cell);
+        assert!(
+            (lt2 - 5.0).abs() / 5.0 < 0.02,
+            "first in-tick rotate must be no-op post-load_seeded; lt2={lt2}"
+        );
+    }
+
+    /// bug_017 inverse: `load_seeded` on a FRESH-epoch shadow
+    /// (`now − epoch < halflife`) — rotate is a no-op → shadow
+    /// preserved → `seed()` skips (`z_shadow>0`) → `lead_time()`
+    /// returns shadow's learned q0.9, NOT the seed. Pins that the
+    /// STRIKE-3 close doesn't regress the GOOD path mb_012 preserved.
+    #[test]
+    fn load_seeded_fresh_epoch_preserves_shadow() {
+        let halflife = Duration::from_secs(6 * 3600);
+        let now = SystemTime::now();
+        let mut sk = CellSketches::default();
+        let cell = Cell("fresh".into(), CapacityType::Spot);
+        // Persisted state: z_active=∅, z_shadow=200 samples (q0.9≈64),
+        // epoch = now − 1h (fresh: 1h < halflife=6h).
+        {
+            let s = sk.cell_mut(&cell);
+            for k in 0..200u32 {
+                s.z_shadow.add(20.0 + f64::from(k % 50));
+            }
+            s.epoch = now - Duration::from_secs(3600);
+            assert_eq!(s.z_active.count(), 0);
+            assert_eq!(s.z_shadow.count(), 200);
+        }
+        let seeds: HashMap<String, f64> = [("fresh:spot".into(), 5.0)].into();
+
+        // load_seeded order: rotate (no-op, epoch fresh) THEN seed
+        // (skips, z_shadow=200>0).
+        sk.maybe_rotate_all(now, halflife);
+        sk.seed(&seeds);
+
+        let s = sk.get(&cell).unwrap();
+        assert_eq!(s.z_shadow.count(), 200, "fresh-epoch rotate is no-op");
+        assert_eq!(
+            s.z_active.count(),
+            0,
+            "seed() skipped (z_shadow>0) — mb_012's intended behaviour preserved"
+        );
+        let lt = sk.lead_time(&cell);
+        assert!(
+            lt >= 60.0,
+            "lead_time={lt} — should be shadow's learned q0.9≈64, NOT seed=5.0"
         );
     }
 

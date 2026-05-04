@@ -458,20 +458,30 @@ impl NodeClaimPoolReconciler {
         placeable_tx: tokio::sync::watch::Sender<PlaceableSet>,
     ) -> Self {
         // Load persisted sketches; fall back to empty on error (a fresh
-        // table is the cold-start case anyway). `seed()` overlays
-        // `cfg.lead_time_seed` on top of any cells the load didn't
-        // populate.
-        let mut sketches = match CellSketches::load(&pg).await {
+        // table is the cold-start case anyway). `load_seeded` does
+        // `load → maybe_rotate_all → seed` so `seed()` sees
+        // post-rotation state (bug_017: a stale-epoch shadow that the
+        // first tick would discard is discarded BEFORE seed runs).
+        let halflife = Duration::from_secs(cfg.sketch_halflife_secs);
+        let sketches = match CellSketches::load_seeded(
+            &pg,
+            &cfg.lead_time_seed,
+            halflife,
+            std::time::SystemTime::now(),
+        )
+        .await
+        {
             Ok(s) => {
                 info!(cells = s.len(), "loaded nodeclaim_cell_state from PG");
                 s
             }
             Err(e) => {
                 warn!(error = %e, "nodeclaim_cell_state load failed; starting empty");
-                CellSketches::default()
+                let mut d = CellSketches::default();
+                d.seed(&cfg.lead_time_seed);
+                d
             }
         };
-        sketches.seed(&cfg.lead_time_seed);
         Self {
             nodeclaims: Api::all(kube),
             admin,
@@ -496,7 +506,7 @@ impl NodeClaimPoolReconciler {
     /// in-memory `self.sketches` may be stale (a long-running standby's
     /// startup snapshot, or `default()` if `new()` hit a PG outage) —
     /// `persist()` is gated off so it doesn't overwrite the previous
-    /// leader's PG rows. Set false only on `CellSketches::load` Ok.
+    /// leader's PG rows. Set false only on `CellSketches::load_seeded` Ok.
     fn reload_pending(&self) -> bool {
         self.hooks.reload.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -552,10 +562,17 @@ impl NodeClaimPoolReconciler {
             // in the Ok-arm only — atomic edge: full reload or full
             // retry.
             if self.reload_pending() {
-                match CellSketches::load(&self.pg).await {
+                let halflife = Duration::from_secs(self.cfg.sketch_halflife_secs);
+                match CellSketches::load_seeded(
+                    &self.pg,
+                    &self.cfg.lead_time_seed,
+                    halflife,
+                    std::time::SystemTime::now(),
+                )
+                .await
+                {
                     Ok(s) => {
                         self.sketches = s;
-                        self.sketches.seed(&self.cfg.lead_time_seed);
                         self.recorded_boot.clear();
                         self.prev_idle.clear();
                         self.inflight_created.clear();
@@ -1102,7 +1119,7 @@ pub(crate) struct CoverResult {
 /// Connect the reconciler's PG pool. Separate from the scheduler/store
 /// `init_db_pool` because the controller does NOT run migrations —
 /// store/scheduler own the migrator and run before this reconciler
-/// reaches `CellSketches::load` (controller's `connect_forever` to the
+/// reaches `CellSketches::load_seeded` (controller's `connect_forever` to the
 /// scheduler in main.rs already orders that). Max 4 connections: persist
 /// is one upsert per cell per 10s tick.
 /// `connect_pg` + `NodeClaimPoolReconciler::{new, run}` as a single

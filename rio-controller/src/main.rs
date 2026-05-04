@@ -403,7 +403,7 @@ async fn main() -> anyhow::Result<()> {
     // ---- NodeClaim pool (ADR-023 §13b) ----
     // Lease-elected: only the leader replica reconciles. Lease + PG
     // connect run AFTER the scheduler `connect_forever` above so the
-    // table is migrated by the time `CellSketches::load` reads it
+    // table is migrated by the time `CellSketches::load_seeded` reads it
     // (scheduler/store own the migrator).
     // r[impl ctrl.nodeclaim.shim-nodepool]
     if nodeclaim_crd {
