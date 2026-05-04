@@ -515,8 +515,7 @@ mod tests {
 
         [nodeclaim_pool]
         max_fleet_cores = 64
-        max_node_cores = 16
-        max_node_mem = 17179869184
+
         max_node_disk = 25769803776
         metal_sizes = ["metal", "metal-24xl"]
 
@@ -529,8 +528,7 @@ mod tests {
             // Env yields bare strings). This is the same shape helm's
             // rio-controller-config ConfigMap renders.
             assert_eq!(cfg.nodeclaim_pool.max_fleet_cores, 64);
-            assert_eq!(cfg.nodeclaim_pool.max_node_cores, 16);
-            assert_eq!(cfg.nodeclaim_pool.max_node_mem, 17179869184);
+
             assert_eq!(cfg.nodeclaim_pool.max_node_disk, 25769803776);
             assert_eq!(cfg.nodeclaim_pool.metal_sizes, vec!["metal", "metal-24xl"]);
             assert_eq!(cfg.nodeclaim_pool.default_lead_time_seed, 30.0);

@@ -210,19 +210,6 @@ pub struct NodeClaimPoolConfig {
     /// `2×halflife` a sample has aged out entirely. Helm: not surfaced;
     /// 6h default per ADR §13b.
     pub sketch_halflife_secs: u64,
-    /// Per-NodeClaim `resources.requests.cpu` ceiling. `cover_deficit`
-    /// chunks a cell's `Σcores` deficit into ⌈Σ/this⌉ claims. Helm:
-    /// `sla.maxCores` (the same ceiling the scheduler caps individual
-    /// intents at, so a single intent always fits one claim).
-    pub max_node_cores: u32,
-    /// Per-NodeClaim `resources.requests.memory` ceiling. With
-    /// [`Self::max_node_cores`] / [`Self::max_node_disk`], the three
-    /// `claim_count` axes — `n = max(⌈Σ/max⌉)` so a mem-/disk-bound
-    /// deficit splits across enough claims that none exceeds the
-    /// NodePool's instance-type ceiling (else Karpenter posts
-    /// "filtered out all instance types" and the claim never resolves).
-    /// Helm: `sla.maxMem`.
-    pub max_node_mem: u64,
     /// Per-NodeClaim `resources.requests.ephemeral-storage` ceiling.
     /// Helm: derived from `karpenter.dataVolumeSize` × allocatable
     /// fraction (kubelet reserve ≈10%). nvme cells get instance-store
@@ -345,14 +332,11 @@ impl Default for NodeClaimPoolConfig {
             // covers the ~18s real boot.
             default_lead_time_seed: 30.0,
             sketch_halflife_secs: 6 * 3600,
-            // §13c-2: Matches helm `sla.maxCores` / `sla.maxMem`
-            // global ceiling defaults. The per-class `ceilings_for(h)`
-            // (catalog-derived, shipped over `GetHwClassConfig`) is
-            // tighter when available; this is the uncatalogued
-            // fallback. Sized to clear the largest fleet type
-            // (192c metal-48xl, 1.5 TiB).
-            max_node_cores: 192,
-            max_node_mem: 1536 * (1 << 30),
+            // §13c-3: per-NodeClaim cores/mem ceilings come from the
+            // scheduler's resolved global over `GetHwClassConfig`
+            // (see `HwClassConfig::global_ceilings`); the controller
+            // is air-gapped and cannot self-derive. Disk is the only
+            // local ceiling (derived from `karpenter.dataVolumeSize`).
             // ≈ 500Gi `dataVolumeSize` × 90% allocatable.
             max_node_disk: 450 * (1 << 30),
             metal_sizes: Vec::new(),
@@ -952,6 +936,19 @@ impl NodeClaimPoolReconciler {
         if unplaced.is_empty() {
             return Ok(CoverResult::default());
         }
+        // §13c-3: the controller is air-gapped — the global per-claim
+        // cap comes ONLY from the scheduler's resolved global over
+        // `GetHwClassConfig`. `None` (not yet loaded, or pre-§13c-3
+        // scheduler whose proto field reads 0) → skip this tick,
+        // fail-closed. Self-heals within ≤300s (next `hw_refresh`).
+        // r[impl scheduler.sla.global.controller-mirror]
+        let Some((global_cores, global_mem)) = self.hw_config.global_ceilings() else {
+            warn!(
+                unplaced = unplaced.len(),
+                "§13c-3: GetHwClassConfig global ceilings not yet loaded;                  skipping cover this tick (self-heals on next 300s refresh)"
+            );
+            return Ok(CoverResult::default());
+        };
         let ice: HashSet<Cell> = ice_masked.iter().filter_map(|s| Cell::parse(s)).collect();
         let live_cores: u32 = live.iter().map(|n| n.allocatable.0).sum();
         let mut created_cores = 0u32;
@@ -990,10 +987,10 @@ impl NodeClaimPoolReconciler {
             let (cls_c, cls_m) = self
                 .hw_config
                 .ceilings_for(&cell.0)
-                .unwrap_or((self.cfg.max_node_cores, self.cfg.max_node_mem));
+                .unwrap_or((global_cores, global_mem));
             let scfg = cover::SizingCfg {
-                max_node_cores: cls_c.min(self.cfg.max_node_cores),
-                max_node_mem: cls_m.min(self.cfg.max_node_mem),
+                max_node_cores: cls_c.min(global_cores),
+                max_node_mem: cls_m.min(global_mem),
                 max_node_disk: self.cfg.max_node_disk,
                 per_tick_cap: self.cfg.max_node_claims_per_cell_per_tick,
                 budget: cover::class_budget(
@@ -1349,6 +1346,7 @@ mod tests {
                 ),
             ]
             .into(),
+            (192, 1536 << 30),
         );
         let mk = |cores: u32| SpawnIntent {
             system: "x86_64-linux".into(),
@@ -1472,6 +1470,7 @@ mod tests {
                 ),
             ]
             .into(),
+            (192, 1536 << 30),
         );
         let cfg = NodeClaimPoolConfig {
             reference_hw_class: "metal-x86".into(),

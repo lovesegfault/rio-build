@@ -66,7 +66,17 @@ const LABEL_CAPACITY_TYPE: &str = "karpenter.sh/capacity-type";
 /// when a Node satisfies two overlapping conjunctions (lexicographic
 /// `$h` wins).
 #[derive(Clone, Default)]
-pub struct HwClassConfig(Arc<RwLock<Vec<HwClassResolved>>>);
+pub struct HwClassConfig {
+    classes: Arc<RwLock<Vec<HwClassResolved>>>,
+    /// §13c-3: scheduler's boot-resolved global ceiling
+    /// `(max_cores, max_mem)`, shipped over `GetHwClassConfig`.
+    /// `None` until the first poll lands or against a pre-§13c-3
+    /// scheduler (proto zero-default → filtered out by [`Self::set`]'s
+    /// `>0` gate). The controller is air-gapped (no AWS API) so this
+    /// is the ONLY source for the global cap. Refreshed every 300s by
+    /// `hw_refresh`.
+    global: Arc<RwLock<Option<(u32, u64)>>>,
+}
 
 /// One resolved `[sla.hw_classes.$h]` entry. Named struct (was a
 /// 6-tuple pre-§13c; at 10 fields a tuple's positional accessors —
@@ -102,7 +112,7 @@ impl HwClassConfig {
     /// `labels`. `None` if no conjunction matches OR config is empty
     /// (not yet loaded).
     pub fn match_node(&self, labels: &BTreeMap<String, String>) -> Option<String> {
-        let cfg = self.0.read();
+        let cfg = self.classes.read();
         for d in cfg.iter() {
             if d.labels
                 .iter()
@@ -140,8 +150,10 @@ impl HwClassConfig {
     /// accessors clone out the field they need so the lock doesn't
     /// escape.
     fn find(&self, h: &str) -> Option<parking_lot::MappedRwLockReadGuard<'_, HwClassResolved>> {
-        parking_lot::RwLockReadGuard::try_map(self.0.read(), |cfg| cfg.iter().find(|d| d.name == h))
-            .ok()
+        parking_lot::RwLockReadGuard::try_map(self.classes.read(), |cfg| {
+            cfg.iter().find(|d| d.name == h)
+        })
+        .ok()
     }
 
     /// `[sla.hw_classes.$h].requirements` for `h` — the Karpenter
@@ -233,7 +245,7 @@ impl HwClassConfig {
     /// All loaded hw-class names (sorted). §13b's `all_cells` derives
     /// the cell universe from this × `capacity_types_for(h)`.
     pub fn names(&self) -> Vec<String> {
-        self.0.read().iter().map(|d| d.name.clone()).collect()
+        self.classes.read().iter().map(|d| d.name.clone()).collect()
     }
 
     /// Whether `h`'s `kubernetes.io/arch` label equals `arch`, OR is
@@ -255,7 +267,11 @@ impl HwClassConfig {
     /// Sorted by `$h` for deterministic [`Self::match_node`] on overlap.
     /// `pub(crate)` for tests that need per-class `max_cores`/`max_mem`
     /// (which [`Self::from_literals`] doesn't carry).
-    pub(crate) fn set(&self, hw_classes: HashMap<String, rio_proto::types::HwClassLabels>) {
+    pub(crate) fn set(
+        &self,
+        hw_classes: HashMap<String, rio_proto::types::HwClassLabels>,
+        global: (u32, u64),
+    ) {
         let mut v: Vec<_> = hw_classes
             .into_iter()
             .map(|(h, def)| HwClassResolved {
@@ -272,7 +288,22 @@ impl HwClassConfig {
             })
             .collect();
         v.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-        *self.0.write() = v;
+        *self.classes.write() = v;
+        // §13c-3: proto3 zero-default → filter so a pre-§13c-3
+        // scheduler (or a malformed response) yields `None`, not
+        // `Some((0, 0))` which would zero every claim's cap.
+        *self.global.write() = (global.0 > 0 && global.1 > 0).then_some(global);
+    }
+
+    /// §13c-3: scheduler's boot-resolved global ceiling. `None` until
+    /// the first `GetHwClassConfig` poll lands, or against a
+    /// pre-§13c-3 scheduler (proto zero-default → `set()` filters).
+    /// `cover_deficit` skips the tick on `None` — fail-closed; no
+    /// claims are minted with an unknown cap. Same skew semantics as
+    /// `ceilings_for=None` (≤300s, self-heals on next refresh).
+    // r[impl scheduler.sla.global.controller-mirror]
+    pub fn global_ceilings(&self) -> Option<(u32, u64)> {
+        *self.global.read()
     }
 
     /// Fetch `GetHwClassConfig` with bounded backoff (5 attempts, 1→16s).
@@ -288,16 +319,21 @@ impl HwClassConfig {
         for attempt in 1..=5 {
             match admin_call(admin.get_hw_class_config(())).await {
                 Ok(r) => {
-                    let hw_classes = r.into_inner().hw_classes;
+                    let r = r.into_inner();
+                    let global = (r.global_max_cores, r.global_max_mem);
+                    let hw_classes = r.hw_classes;
                     let requirements_nonempty = hw_classes
                         .values()
                         .filter(|d| !d.requirements.is_empty())
                         .count();
                     info!(
                         n = hw_classes.len(),
-                        requirements_nonempty, "GetHwClassConfig loaded"
+                        requirements_nonempty,
+                        global_max_cores = global.0,
+                        global_max_mem = global.1,
+                        "GetHwClassConfig loaded"
                     );
-                    self.set(hw_classes);
+                    self.set(hw_classes, global);
                     return;
                 }
                 Err(e) => {
@@ -332,7 +368,10 @@ impl HwClassConfig {
             })
             .collect();
         v.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-        Self(Arc::new(RwLock::new(v)))
+        Self {
+            classes: Arc::new(RwLock::new(v)),
+            global: Arc::default(),
+        }
     }
 }
 
@@ -1226,6 +1265,7 @@ mod tests {
                 },
             )]
             .into(),
+            (192, 1536 << 30),
         );
         assert_eq!(cache.hw_class_of("n"), Some("intel-7".into()));
         assert_eq!(cache.config.ceilings_for("intel-7"), Some((64, 256 << 30)));
@@ -1249,10 +1289,38 @@ mod tests {
                 ("old".into(), rio_proto::types::HwClassLabels::default()),
             ]
             .into(),
+            (192, 1536 << 30),
         );
         assert_eq!(cfg.ceilings_for("arm"), Some((64, 128 << 30)));
         assert_eq!(cfg.ceilings_for("old"), None, "zero ceilings → None");
         assert_eq!(cfg.ceilings_for("nope"), None, "unknown → None");
+    }
+
+    /// §13c-3 RED-FIRST: `global_ceilings()` returns the resolved
+    /// global from `set()`, `None` until set, `None` on the proto
+    /// zero-default (pre-§13c-3 scheduler).
+    // r[verify scheduler.sla.global.controller-mirror]
+    #[test]
+    fn global_ceilings_set_and_filter() {
+        let cfg = HwClassConfig::default();
+        assert_eq!(cfg.global_ceilings(), None, "before first poll → None");
+
+        cfg.set(Default::default(), (64, 256 << 30));
+        assert_eq!(
+            cfg.global_ceilings(),
+            Some((64, 256 << 30)),
+            "set() with non-zero global → Some"
+        );
+
+        // Pre-§13c-3 scheduler ships proto zero-default → filtered.
+        cfg.set(Default::default(), (0, 0));
+        assert_eq!(
+            cfg.global_ceilings(),
+            None,
+            "proto zero-default (old scheduler) → None"
+        );
+        cfg.set(Default::default(), (64, 0));
+        assert_eq!(cfg.global_ceilings(), None, "half-zero → None");
     }
 
     /// Overlapping conjunctions → deterministic (lexicographic `$h`).
