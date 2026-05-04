@@ -916,7 +916,13 @@ pub fn solve_full(
         let mut candidates: Vec<Candidate> = Vec::with_capacity(h_set.len() * 2);
         for h in h_set {
             let class_max = class_max_of(h);
-            for cap in CapacityType::ALL {
+            // r[impl sched.sla.hwclass.capacity-types]
+            // §13c D5: per-hwClass capacity-types so an od-only class
+            // (metal) structurally never produces a (h, Spot) cell —
+            // the requirement-based alternative would emit conflicting
+            // `In [spot]`+`In [on-demand]` → ICE → backoff-expire →
+            // re-mint → perpetual ICE loop.
+            for &cap in cfg.capacity_types_for(h) {
                 match evaluate_cell(fit, tier, hw, cost, ceil, class_max, h, cap, cap_c) {
                     Ok(c) => candidates.push(c),
                     Err(r) => {
@@ -1008,7 +1014,12 @@ pub fn solve_full(
     // per-cell loop knows whether λ or the envelope was binding.
     let cells: Vec<Cell> = h_set
         .iter()
-        .flat_map(|h| CapacityType::ALL.map(|c| (h.clone(), c)))
+        .flat_map(|h| {
+            cfg.capacity_types_for(h)
+                .iter()
+                .map(|&c| (h.clone(), c))
+                .collect::<Vec<_>>()
+        })
         .collect();
     let mem = ((fit.mem.at(RawCores(cap_c)).0 as f64 * hr) as u64).min(ceil.max_mem);
     let why = classify_best_effort(&spot_rejects, &od_rejects, fit, tiers, ceil);
@@ -1325,16 +1336,27 @@ pub fn fit_content_hash(fit: &FittedParams) -> u64 {
 }
 
 /// Stable hash of the solve-relevant override fields. `None` → 0.
-pub fn override_hash(o: Option<&ResolvedTarget>) -> u64 {
-    let Some(o) = o else { return 0 };
+pub fn override_hash(o: Option<&ResolvedTarget>, required_features: &[String]) -> u64 {
+    // §13c: required_features partitions h_all (T10), so it's a
+    // per-drv solve-input discriminator beyond ModelKey. Folded HERE
+    // (not into model_key_hash) because ModelKey keys the SLA fit
+    // table — splitting fits by feature would fragment the same
+    // pname's CPU/mem samples. The common case `(None, [])` keeps its
+    // stable `0` (test fixtures `peek_entry(mkh, 0)` rely on it).
+    if o.is_none() && required_features.is_empty() {
+        return 0;
+    }
     let mut h = std::hash::DefaultHasher::new();
-    o.forced_cores.map(f64::to_bits).hash(&mut h);
-    o.forced_mem.hash(&mut h);
-    o.tier.hash(&mut h);
-    o.p50_secs.map(f64::to_bits).hash(&mut h);
-    o.p90_secs.map(f64::to_bits).hash(&mut h);
-    o.p99_secs.map(f64::to_bits).hash(&mut h);
-    o.capacity.hash(&mut h);
+    required_features.hash(&mut h);
+    if let Some(o) = o {
+        o.forced_cores.map(f64::to_bits).hash(&mut h);
+        o.forced_mem.hash(&mut h);
+        o.tier.hash(&mut h);
+        o.p50_secs.map(f64::to_bits).hash(&mut h);
+        o.p90_secs.map(f64::to_bits).hash(&mut h);
+        o.p99_secs.map(f64::to_bits).hash(&mut h);
+        o.capacity.hash(&mut h);
+    }
     h.finish()
 }
 
@@ -2363,6 +2385,70 @@ mod tests {
             "spot must be rejected when p>0.5: A={:?}",
             memo.a.cells
         );
+    }
+
+    /// §13c T11: `solve_full` iterates `cfg.capacity_types_for(h)`, NOT
+    /// `CapacityType::ALL`. An od-only hw-class (metal) MUST NOT
+    /// produce `(h, Spot)` candidates — neither in the Feasible
+    /// admissible set nor in the BestEffort cell fallback.
+    // r[verify sched.sla.hwclass.capacity-types]
+    #[test]
+    fn solve_full_respects_per_class_capacity_types() {
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        let mut cfg = cfg_hw();
+        // intel-6 → od-only (metal-like).
+        cfg.hw_classes.get_mut("intel-6").unwrap().capacity_types = vec![CapacityType::Od];
+        // Feasible path: no (intel-6, Spot) in candidates.
+        let SolveFullResult::Feasible(memo) = solve_full(
+            &fit,
+            &[t("normal", 1200.0)],
+            &hw_three(),
+            &CostTable::default(),
+            &ceil(),
+            &cfg,
+            &h_set(),
+            &HashSet::new(),
+            true,
+        ) else {
+            panic!("expected Feasible")
+        };
+        assert!(
+            !memo
+                .all_candidates
+                .iter()
+                .any(|c| c.cell == ("intel-6".into(), CapacityType::Spot)),
+            "od-only class must not produce Spot candidate: {:?}",
+            memo.all_candidates
+                .iter()
+                .map(|c| &c.cell)
+                .collect::<Vec<_>>()
+        );
+        // intel-7/8 still produce both.
+        assert!(
+            memo.all_candidates
+                .iter()
+                .any(|c| c.cell == ("intel-7".into(), CapacityType::Spot))
+        );
+        // BestEffort path: tier impossibly tight → fallthrough cells
+        // honor capacity_types_for.
+        let SolveFullResult::BestEffort { cells, .. } = solve_full(
+            &fit,
+            &[t("impossible", 0.001)],
+            &hw_three(),
+            &CostTable::default(),
+            &ceil(),
+            &cfg,
+            &h_set(),
+            &HashSet::new(),
+            true,
+        ) else {
+            panic!("expected BestEffort")
+        };
+        assert!(
+            !cells.contains(&("intel-6".into(), CapacityType::Spot)),
+            "BestEffort fallback must not include (intel-6, Spot): {cells:?}"
+        );
+        assert!(cells.contains(&("intel-6".into(), CapacityType::Od)));
     }
 
     /// Regression: `hw_factor_for` returned `dot/bias` unclamped; with

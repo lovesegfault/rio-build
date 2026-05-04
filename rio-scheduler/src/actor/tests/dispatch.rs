@@ -2105,13 +2105,14 @@ async fn spawn_intent_node_affinity_from_solve_full() {
     );
 }
 
-/// `solve_full` gate predicates: each of FOD / `required_features` /
+/// `solve_full` gate predicates: each of FOD /
 /// `enableParallelBuilding=false` / `--tier` override falls through to
 /// the hw-agnostic `intent_for` path even with `hw_cost_source` set
-/// and a usable fit. The first three would otherwise emit hw-class
-/// affinity that no fetcher / metal NodePool carries → permanently
-/// Pending. `--mem`-only override does NOT gate it off — solve_full
-/// runs and the override overlays the result.
+/// and a usable fit. `required_features=["kvm"]` with NO hwClass
+/// providing kvm ALSO falls through (h_all empties under the §13c
+/// partition → `!h_all.is_empty()` gate fails). `--mem`-only override
+/// does NOT gate it off — solve_full runs and the override overlays
+/// the result.
 // r[verify sched.sla.hw-class.admissible-set]
 #[tokio::test]
 async fn solve_full_gate_skips_fod_kvm_serial_and_override() {
@@ -2150,7 +2151,11 @@ async fn solve_full_gate_skips_fod_kvm_serial_and_override() {
     );
     assert!(
         by_id("kvm").node_affinity.is_empty(),
-        "required_features must not get hw-class affinity (metal pool has none)"
+        "no hwClass provides kvm → h_all=∅ → hw-agnostic fallthrough"
+    );
+    assert!(
+        by_id("kvm").hw_class_names.is_empty(),
+        "no hwClass provides kvm → hw_class_names=∅"
     );
     let serial = by_id("serial");
     assert!(

@@ -2482,3 +2482,77 @@ async fn contract_chokepoint_preserves_term_name_alignment() {
         );
     }
 }
+
+/// **§13c T10**: `required_features` routes via `hwClass.provides_features`
+/// instead of the pre-§13c `state.required_features.is_empty()` bypass.
+/// kvm intent + `{metal-x86: provides=[kvm], intel-*: provides=[]}` ⇒
+/// `hw_class_names == ["metal-x86"]` only. Non-kvm intent ⇒ excludes
+/// metal (∅-guard). Pre-fix: kvm → `[]` (gate kicked it to hw-agnostic);
+/// non-kvm → ⊇ metal (no partition).
+// r[verify sched.sla.hwclass.provides]
+#[tokio::test]
+async fn contract_kvm_routes_via_provides_features() {
+    use crate::sla::config::{HwClassDef, NodeLabelMatch};
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    // Add a metal hwClass with provides=[kvm]. The 3 intel-* classes
+    // from bare_actor_hw have provides=[] (default).
+    actor.sla_config.hw_classes.insert(
+        "metal-x86".into(),
+        HwClassDef {
+            labels: vec![NodeLabelMatch {
+                key: "rio.build/hw-class".into(),
+                value: "metal-x86".into(),
+            }],
+            node_class: "rio-metal".into(),
+            max_cores: actor.sla_config.max_cores as u32,
+            max_mem: actor.sla_config.max_mem,
+            provides_features: vec!["kvm".into()],
+            ..Default::default()
+        },
+    );
+    // Seed metal in the hw table so factor lookup succeeds.
+    let m: std::collections::HashMap<_, _> = ["intel-6", "intel-7", "intel-8", "metal-x86"]
+        .into_iter()
+        .map(|h| (h.into(), 1.0))
+        .collect();
+    actor
+        .sla_estimator
+        .seed_hw(crate::sla::hw::HwTable::from_map(m));
+
+    actor.test_inject_ready_with_features("d-kvm", Some("test-pkg"), "x86_64-linux", &["kvm"]);
+    actor.test_inject_ready("d-nokvm", Some("test-pkg"), "x86_64-linux", false);
+
+    let snap = actor.compute_spawn_intents(&Default::default());
+    let by_id = |id: &str| -> &rio_proto::types::SpawnIntent {
+        snap.intents.iter().find(|i| i.intent_id == id).unwrap()
+    };
+
+    // kvm intent: hw_class_names == ["metal-x86"] ONLY.
+    let kvm_intent = by_id("d-kvm");
+    assert_eq!(
+        kvm_intent.hw_class_names,
+        vec!["metal-x86"],
+        "kvm intent must route to metal-x86 ONLY (provides=[kvm]); got {:?}",
+        kvm_intent.hw_class_names
+    );
+    assert!(
+        !kvm_intent.node_affinity.is_empty(),
+        "kvm intent gets full SLA-solve participation post-§13c"
+    );
+
+    // non-kvm intent: hw_class_names excludes metal (∅-guard).
+    let nokvm_intent = by_id("d-nokvm");
+    assert!(
+        !nokvm_intent
+            .hw_class_names
+            .contains(&"metal-x86".to_string()),
+        "non-kvm intent must exclude metal-x86 (∅-guard: required=[], \
+         provides=[kvm] → incompatible); got {:?}",
+        nokvm_intent.hw_class_names
+    );
+    assert!(
+        !nokvm_intent.hw_class_names.is_empty(),
+        "non-kvm intent still routes to intel-* classes"
+    );
+}

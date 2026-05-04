@@ -487,16 +487,19 @@ impl SlaConfig {
 
     /// `reference_hw_class` if its `kubernetes.io/arch` label matches
     /// `system`'s arch (or is absent — arch-agnostic class) AND
-    /// [`Self::class_ceilings`] hosts `(cores, mem)`, else the first
-    /// (sorted) `hw_classes` entry that does. `None` ⇔ `system`
-    /// unmappable OR no configured class hosts that arch at that size —
-    /// caller emits empty `hw_class_names` so the controller's
-    /// `fallback_cell` reaches its OWN `None` → `no_menu_for_arch`.
+    /// [`Self::class_ceilings`] hosts `(cores, mem)` AND
+    /// [`features_compatible`] holds for `(features, provides)`, else
+    /// the first (sorted) `hw_classes` entry that does. `None` ⇔
+    /// `system` unmappable OR no configured class hosts that arch at
+    /// that size with those features — caller emits empty
+    /// `hw_class_names` so the controller's `fallback_cell` reaches its
+    /// OWN `None` → `no_hosting_class`.
     pub fn reference_hw_class_for_system(
         &self,
         system: &str,
         cores: u32,
         mem: u64,
+        features: &[String],
     ) -> Option<&str> {
         let arch = rio_common::k8s::system_to_k8s_arch(system)?;
         let matches = |h: &str| {
@@ -505,6 +508,7 @@ impl SlaConfig {
                     .iter()
                     .find(|l| l.key == ARCH_LABEL)
                     .is_none_or(|l| l.value == arch)
+                    && features_compatible(features, &d.provides_features)
             }) && {
                 let (cc, cm) = self.class_ceilings(h);
                 cores <= cc && mem <= cm
@@ -534,18 +538,28 @@ impl SlaConfig {
         names: Vec<String>,
         cores: u32,
         mem: u64,
+        required_features: &[String],
     ) -> (Vec<rio_proto::types::NodeSelectorTerm>, Vec<String>) {
         terms
             .into_iter()
             .zip(names)
             .filter(|(_, h)| {
                 let (cc, cm) = self.class_ceilings(h);
-                let ok = cores <= cc && mem <= cm;
+                // §13c D10: FULL bidirectional features_compatible (NOT
+                // half-predicate `provides⊄required` — that misses
+                // `required=[kvm], provides=[]` because ∅⊆anything).
+                // Unknown class → `provides_for=[]` → only featureless
+                // intents pass; same backstop semantics as size (unknown
+                // → no per-class ceiling).
+                let feat_ok = !self.hw_classes.contains_key(h)
+                    || features_compatible(required_features, self.provides_for(h));
+                let ok = cores <= cc && mem <= cm && feat_ok;
                 if !ok {
                     tracing::warn!(
                         %h, cores, mem, class_cap = ?(cc, cm),
+                        ?required_features, provides = ?self.provides_for(h),
                         "hw_class stripped at post-finalize chokepoint — \
-                         producer-path size-filter regressed?"
+                         producer-path size/feature-filter regressed?"
                     );
                 }
                 ok
@@ -1334,25 +1348,106 @@ mod tests {
         cfg.reference_hw_class = "mid-x86".into();
         // x86_64 → reference matches.
         assert_eq!(
-            cfg.reference_hw_class_for_system("x86_64-linux", 1, 0),
+            cfg.reference_hw_class_for_system("x86_64-linux", 1, 0, &[]),
             Some("mid-x86")
         );
         // aarch64 → reference is amd64, fall through to first arch-match
         // (sorted: agnostic has no arch label → matches anything).
         assert_eq!(
-            cfg.reference_hw_class_for_system("aarch64-linux", 1, 0),
+            cfg.reference_hw_class_for_system("aarch64-linux", 1, 0, &[]),
             Some("agnostic")
         );
         // Drop agnostic → mid-arm wins.
         cfg.hw_classes.remove("agnostic");
         assert_eq!(
-            cfg.reference_hw_class_for_system("aarch64-linux", 1, 0),
+            cfg.reference_hw_class_for_system("aarch64-linux", 1, 0, &[]),
             Some("mid-arm")
         );
         // Unmappable system → None.
         assert_eq!(
-            cfg.reference_hw_class_for_system("riscv64-linux", 1, 0),
+            cfg.reference_hw_class_for_system("riscv64-linux", 1, 0, &[]),
             None
+        );
+    }
+
+    /// §13c T2: `reference_hw_class_for_system` feature-filters via
+    /// [`features_compatible`]. A `--capacity` bypass-path kvm intent
+    /// must pick a metal class; a non-kvm intent must NEVER pick metal.
+    // r[verify sched.sla.hwclass.provides]
+    #[test]
+    fn reference_hw_class_for_system_feature_filters() {
+        let mut cfg = base();
+        cfg.hw_classes = HashMap::from([
+            ("std-x86".into(), test_def(ARCH_LABEL, "amd64")),
+            (
+                "metal-x86".into(),
+                test_def_provides(ARCH_LABEL, "amd64", &["kvm"]),
+            ),
+        ]);
+        cfg.reference_hw_class = "std-x86".into();
+        let kvm = vec!["kvm".to_string()];
+        // kvm intent → metal-x86 (only class with provides=[kvm]).
+        assert_eq!(
+            cfg.reference_hw_class_for_system("x86_64-linux", 1, 0, &kvm),
+            Some("metal-x86")
+        );
+        // non-kvm intent → std-x86; metal must NOT be picked
+        // (∅-guard: required=[], provides=[kvm] → incompatible).
+        assert_eq!(
+            cfg.reference_hw_class_for_system("x86_64-linux", 1, 0, &[]),
+            Some("std-x86")
+        );
+        // No metal class for arm + kvm intent → None.
+        assert_eq!(
+            cfg.reference_hw_class_for_system("aarch64-linux", 1, 0, &kvm),
+            None
+        );
+    }
+
+    /// §13c T2/D10: `retain_hosting_classes` applies the FULL
+    /// bidirectional [`features_compatible`] predicate. Half-predicate
+    /// (`provides⊄required`) misses `required=[kvm], provides=[]`
+    /// (∅⊆anything) → std-x86 leaks → pod has kvm nodeSelector, node
+    /// lacks label → permanently Pending.
+    #[test]
+    fn retain_hosting_classes_feature_filters() {
+        let mut cfg = base();
+        cfg.hw_classes = HashMap::from([
+            ("std-x86".into(), test_def("rio.build/hw-class", "std")),
+            (
+                "metal-x86".into(),
+                test_def_provides("rio.build/hw-class", "metal", &["kvm"]),
+            ),
+        ]);
+        let term = |v: &str| rio_proto::types::NodeSelectorTerm {
+            match_expressions: vec![rio_proto::types::NodeSelectorRequirement {
+                key: "rio.build/hw-class".into(),
+                operator: "In".into(),
+                values: vec![v.into()],
+            }],
+        };
+        let kvm = vec!["kvm".to_string()];
+        // kvm intent: std-x86 (provides=[]) MUST be stripped; metal kept.
+        let (_, names) = cfg.retain_hosting_classes(
+            vec![term("std"), term("metal")],
+            vec!["std-x86".into(), "metal-x86".into()],
+            1,
+            0,
+            &kvm,
+        );
+        assert_eq!(names, vec!["metal-x86"], "std-x86 stripped for kvm intent");
+        // non-kvm intent: metal-x86 (provides=[kvm]) MUST be stripped.
+        let (_, names) = cfg.retain_hosting_classes(
+            vec![term("std"), term("metal")],
+            vec!["std-x86".into(), "metal-x86".into()],
+            1,
+            0,
+            &[],
+        );
+        assert_eq!(
+            names,
+            vec!["std-x86"],
+            "metal-x86 stripped for non-kvm intent"
         );
     }
 
@@ -1371,23 +1466,23 @@ mod tests {
         cfg.reference_hw_class = "mid".into();
         // 48 > mid.max_cores=32 → fall through to hi (128 ≥ 48).
         assert_eq!(
-            cfg.reference_hw_class_for_system("x86_64-linux", 48, 0),
+            cfg.reference_hw_class_for_system("x86_64-linux", 48, 0, &[]),
             Some("hi"),
             "mid.max_cores=32 cannot host 48; must pick hi"
         );
         // 16 ≤ 32 → reference still wins.
         assert_eq!(
-            cfg.reference_hw_class_for_system("x86_64-linux", 16, 0),
+            cfg.reference_hw_class_for_system("x86_64-linux", 16, 0, &[]),
             Some("mid")
         );
-        // 256 > every class → None (controller no_menu_for_arch).
+        // 256 > every class → None (controller no_hosting_class).
         assert_eq!(
-            cfg.reference_hw_class_for_system("x86_64-linux", 256, 0),
+            cfg.reference_hw_class_for_system("x86_64-linux", 256, 0, &[]),
             None
         );
         // mem dimension: hi.max_mem = test_def's 256GiB.
         assert_eq!(
-            cfg.reference_hw_class_for_system("x86_64-linux", 1, 512 << 30),
+            cfg.reference_hw_class_for_system("x86_64-linux", 1, 512 << 30, &[]),
             None,
             "no class hosts 512GiB mem"
         );
@@ -1418,17 +1513,23 @@ mod tests {
             vec!["mid".into(), "hi".into(), "mid".into()],
             48,
             0,
+            &[],
         );
         assert_eq!(names, vec!["hi"], "mid (max_cores=32) stripped at 48");
         assert_eq!(terms.len(), 1, "terms parallel to names");
         assert_eq!(terms[0].match_expressions[0].values[0], "hi");
         // Unknown class → (MAX, MAX) → never stripped.
-        let (_, names) =
-            cfg.retain_hosting_classes(vec![term("ghost")], vec!["ghost".into()], 999, u64::MAX);
+        let (_, names) = cfg.retain_hosting_classes(
+            vec![term("ghost")],
+            vec!["ghost".into()],
+            999,
+            u64::MAX,
+            &[],
+        );
         assert_eq!(names, vec!["ghost"], "unknown class = no per-class ceiling");
         // All stripped → both empty (controller fallback_cell path).
         let (terms, names) =
-            cfg.retain_hosting_classes(vec![term("mid")], vec!["mid".into()], 48, 0);
+            cfg.retain_hosting_classes(vec![term("mid")], vec!["mid".into()], 48, 0, &[]);
         assert!(terms.is_empty() && names.is_empty());
     }
 

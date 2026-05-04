@@ -749,6 +749,30 @@ node-label conjunction. A change to `sla.referenceHwClass` MUST be
 rejected at config-load unless `--allow-reference-change` is set
 (ref-second normalization is anchored on it).
 
+r[sched.sla.hwclass.provides]
+`sla.hwClasses[h].providesFeatures` lists `requiredSystemFeatures` that
+hw-class `h` can host. `solve_intent_for` partitions `h_all` by this
+before `solve_full` so feature-bearing intents (e.g. `kvm`) get full
+SLA-solve participation on the matching classes only. §13c: replaces the
+static `rio-builder-metal` NodePool bypass.
+
+r[sched.sla.hwclass.provides.bidir]
+Feature-match is the bidirectional ∅-guard predicate
+`features_compatible(required, provides)`: `required ⊆ provides` AND
+`required.is_empty() == provides.is_empty()`. The second clause prevents
+both leaks — a `provides=[kvm]` class rejects featureless intents (metal
+doesn't absorb non-kvm), and a `provides=[]` class rejects `[kvm]`
+intents (non-metal isn't picked for kvm). One canonical `pub fn`
+serves all callers (T2/T10/D10 chokepoint + worker `passes_intent_filter`).
+
+r[sched.sla.hwclass.capacity-types]
+`sla.hwClasses[h].capacityTypes` lists capacity-types `h` is permitted
+to provision (default `[spot, on-demand]`). `solve_full` and the
+controller's `all_cells`/`fallback_cell` iterate THIS, not
+`CapacityType::ALL`, so an od-only class (e.g. metal) structurally never
+generates a `(h, Spot)` cell — preventing the conflicting-requirements
+ICE loop a requirement-based exclusion would cause.
+
 r[sched.sla.hw-class.k3-bench]
 The builder supervisor runs a K=3 microbench (`alu`, `membw`
 STREAM-triad, `ioseq` O_DIRECT) at init when the

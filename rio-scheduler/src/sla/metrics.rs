@@ -37,6 +37,13 @@ pub fn describe_all() {
          constraint bound at the loosest tier (see InfeasibleReason)."
     );
     describe_counter!(
+        "rio_scheduler_unroutable_features_total",
+        "§13c: solve_intent_for found NO hwClass whose provides_features \
+         hosts the drv's required_features (labeled tenant, feature). \
+         The intent is unroutable until a `[sla.hw_classes.$h]` with \
+         matching providesFeatures is added."
+    );
+    describe_counter!(
         "rio_scheduler_sla_suspicious_scaling_total",
         "exploration froze at maxCores still saturated (labeled tenant). \
          The build wants more cores than the cluster offers."

@@ -115,10 +115,11 @@ fn passes_intent_filter(
         return false;
     }
     if let Some(pf) = req.features.as_deref() {
-        if !pf.is_empty() && state.required_features.is_empty() {
-            return false;
-        }
-        if !state.required_features.iter().all(|f| pf.contains(f)) {
+        // §13c: same canonical predicate as the hwClass routing
+        // (T2/T10/D10) so the worker filter and the scheduler's
+        // routing agree — drift here would route a kvm intent to a
+        // metal cell whose worker then rejects it.
+        if !crate::sla::config::features_compatible(&state.required_features, pf) {
             return false;
         }
     }
@@ -902,20 +903,58 @@ impl DagActor {
         // was previously overlaid post-solve → affinity menu-checked at
         // fit-mem, request at forced-mem → permanently-Pending pod.)
         //
-        // FOD / required_features / serial drvs MUST stay hw-agnostic:
-        // the `rio-fetcher` and `rio-builder-metal` NodePools carry no
-        // hw-class labels — affinity over `{hw-class:X}` matches zero
-        // templates and the pod is permanently Pending. Serial drvs
-        // additionally need `intent_for`'s 1-core pin
+        // FOD / serial drvs MUST stay hw-agnostic: `rio-fetcher`
+        // carries no hw-class labels — affinity over `{hw-class:X}`
+        // matches zero templates and the pod is permanently Pending.
+        // Serial drvs additionally need `intent_for`'s 1-core pin
         // (`r[sched.sla.intent-from-solve]`); solve_full ignores
         // `hints` and would multi-core a `enableParallelBuilding=false`
         // build.
         //
+        // r[impl sched.sla.hwclass.provides]
+        // §13c: `required_features` drvs are NO LONGER hw-agnostic —
+        // they route to hwClasses with matching `provides_features` via
+        // the bidirectional ∅-guard, so kvm intents get full SLA-solve
+        // participation on metal cells instead of the static
+        // `rio-builder-metal` NodePool bypass. `h_all` is partitioned
+        // accordingly: a class providing `[kvm]` is excluded for
+        // featureless intents (so metal doesn't absorb non-kvm), and a
+        // class providing `[]` is excluded for kvm intents.
+        //
         // Sorted: ε_h's seeded `pool.choose()` indexes into this Vec,
         // so HashMap iteration order would otherwise leak into the
         // "pure function of drv_hash" contract.
-        let mut h_all: Vec<_> = self.sla_config.hw_classes.keys().cloned().collect();
+        let mut h_all: Vec<_> = self
+            .sla_config
+            .hw_classes
+            .keys()
+            .filter(|h| {
+                crate::sla::config::features_compatible(
+                    &state.required_features,
+                    self.sla_config.provides_for(h),
+                )
+            })
+            .cloned()
+            .collect();
         h_all.sort_unstable();
+        // §one-step-removed inverse: `required_features` non-empty but
+        // NO hwClass provides them → unschedulable forever (silent).
+        // Surface it once per (tenant, feature) so the operator notices.
+        if h_all.is_empty() && !state.required_features.is_empty() {
+            for f in &state.required_features {
+                ::metrics::counter!(
+                    "rio_scheduler_unroutable_features_total",
+                    "tenant" => tenant.clone(),
+                    "feature" => f.clone(),
+                )
+                .increment(1);
+            }
+            tracing::warn!(
+                features = ?state.required_features,
+                "no hwClass provides required_features — intent unroutable; \
+                 add a `provides_features` entry to a `[sla.hw_classes.$h]`",
+            );
+        }
         // `was_miss`: first time this `(model_key, inputs_gen)` was
         // solved. Gates the post-memo metric emits whose inputs ARE in
         // `inputs_gen` — `BestEffort.why`, ε_h's `_hw_cost_unknown` — so
@@ -938,7 +977,7 @@ impl DagActor {
             && hints.prefer_local_build != Some(true)
             && hints.enable_parallel_building != Some(false)
             && !state.is_fixed_output
-            && state.required_features.is_empty())
+            && !h_all.is_empty())
         .then_some(())
         .and_then(|()| {
             let f = fit.as_ref()?;
@@ -956,8 +995,14 @@ impl DagActor {
             // overwriting `result`. `was_miss` gates the
             // memo-input-dependent emits; `entry`'s debounce fields
             // gate the read-time-state ones.
+            //
+            // §13c: `ovr` folds in `required_features` — h_all is now
+            // feature-partitioned, so the SAME ModelKey with DIFFERENT
+            // features gets a DIFFERENT h_all → different solve result.
+            // Without this, a kvm and non-kvm drv sharing pname would
+            // cache-hit on each other's (wrong-partition) memo.
             let mkh = solve::model_key_hash(&f.key);
-            let ovr = solve::override_hash(override_.as_ref());
+            let ovr = solve::override_hash(override_.as_ref(), &state.required_features);
             let (entry, miss) = self.solve_cache.get_or_insert_with(
                 mkh,
                 ovr,
@@ -1225,7 +1270,7 @@ impl DagActor {
                 if let Some(reason) = infeasible
                     && !hw_emitted
                 {
-                    let ovr = solve::override_hash(override_.as_ref());
+                    let ovr = solve::override_hash(override_.as_ref(), &state.required_features);
                     let seen = fit.as_ref().is_some_and(|f| {
                         self.solve_cache.infeasible_static_seen(
                             solve::model_key_hash(&f.key),
@@ -1272,6 +1317,7 @@ impl DagActor {
                         &state.system,
                         c,
                         m.max(state.sched.resource_floor.mem_bytes),
+                        &state.required_features,
                     ) {
                         Some(h) => solve::cells_to_selector_terms(
                             &[(h.to_owned(), cap)],
@@ -1311,9 +1357,13 @@ impl DagActor {
         // fallback, the no-memo `reference_hw_class_for_system`). A 7th
         // producer-hole would require a SpawnIntent construction site
         // that bypasses `solve_intent_for` entirely.
-        let (node_affinity, hw_class_names) =
-            self.sla_config
-                .retain_hosting_classes(node_affinity, hw_class_names, cores, mem);
+        let (node_affinity, hw_class_names) = self.sla_config.retain_hosting_classes(
+            node_affinity,
+            hw_class_names,
+            cores,
+            mem,
+            &state.required_features,
+        );
         // D7: deadline_secs. Fitted ⇒ `wall_p99 × 5` (p99 of the
         // log-normal `T(c)·exp(ε)` at the chosen cores, no retry tail
         // — k8s-kill-then-reactive-floor IS the retry). Unfitted
