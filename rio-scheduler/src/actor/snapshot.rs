@@ -9,11 +9,12 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::state::{
-    BuildState, DerivationStatus, ExecutorId, ExecutorState, HEARTBEAT_TIMEOUT_SECS, SolvedIntent,
+    BuildState, DerivationStatus, DrvHash, ExecutorId, ExecutorState, HEARTBEAT_TIMEOUT_SECS,
+    SolvedIntent,
 };
 
 use super::{
-    AdminQuery, ClusterSnapshot, DagActor, DebugExecutorInfo, SpawnIntentsRequest,
+    AdminQuery, AuthBinding, ClusterSnapshot, DagActor, DebugExecutorInfo, SpawnIntentsRequest,
     SpawnIntentsSnapshot, command,
 };
 
@@ -24,35 +25,33 @@ use super::{
 /// criterion discriminates a hung NODE (kubelet/EBS/kernel — every
 /// tenant's builds stall) from a single tenant's pathological build
 /// hanging its own pods. Idle executors (`running_build = None`) are
-/// skipped: they have no drv to attribute and structurally cannot be
-/// node-attributed (`authoritative_node` is keyed by spawn-intent, and
-/// an idle pod still holds its node so `consolidate::reap_idle` won't
-/// cover it either — but no work is stuck there).
+/// skipped by policy (no work is stuck there; §Threat-model opt-in —
+/// forging `Some` opts the attacker IN to scrutiny). They CAN be
+/// node-attributed (`auth_intent` is set at connect, never cleared on
+/// idle); the explicit early-return below is what excludes them.
 ///
-/// `node_of` AND `tenant_of` both resolve from the executor's
-/// HMAC-attested **`auth_intent`** (the pod's spawn-time
-/// `INTENT_ID_ANNOTATION`, set once at connect, never mutated by
-/// heartbeat) — NEVER any worker-supplied or worker-influenceable
-/// value. Keying either on `running_build` would be wrong: it
-/// diverges from `auth_intent` under dispatch fall-through, and
-/// `reconcile_running_build`'s `(None, Some(hb))` arm sets it from
-/// the heartbeat unconditionally, so a compromised worker could
+/// Both `node` AND `tenant` are read off the SAME `bindings` entry
+/// (`AuthBinding{node, tenant}` keyed on the executor's HMAC-attested
+/// **`auth_intent`** — the pod's spawn-time `INTENT_ID_ANNOTATION`,
+/// set once at connect, never mutated by heartbeat). They
+/// structurally cannot diverge: `tenant.is_some() ⟺ node-attributed`
+/// modulo the first-Ack-after-spawn window where the spawn-drv was
+/// already DAG-absent (mb_012). Keying on `running_build` would be
+/// wrong: it diverges from `auth_intent` under dispatch fall-through,
+/// and `reconcile_running_build`'s `(None, Some(hb))` arm sets it
+/// from the heartbeat unconditionally, so a compromised worker could
 /// heartbeat `running_build=D` for a victim node's drv to inflate
 /// `occ` (suppress detection) or for other tenants' drvs to forge
 /// `|tenants|≥2` (cause detection). `running_build` is read ONLY as
-/// `.is_none()` for the idle opt-out — forging `Some` opts the
-/// attacker IN to scrutiny; the value itself is never read.
-/// Executors lacking an `authoritative_node` entry (controller-lag,
+/// `.is_none()` for the idle opt-out; the value itself is never read.
+/// Executors lacking an `authoritative_binding` entry (controller-lag,
 /// Ack channel down) are skipped — fail-safe — and counted in
-/// `rio_scheduler_hung_detect_skipped_no_authoritative_total`. Free
-/// function so the test supplies `tenant_of`/`node_of` closures
-/// without seeding `dag` + `builds` + `authoritative_node`.
+/// `rio_scheduler_hung_detect_skipped_no_authoritative_total`.
 // r[impl sched.admin.hung-node-detector+3]
 pub(super) fn detect_hung_nodes(
     executors: &HashMap<ExecutorId, ExecutorState>,
+    bindings: &HashMap<DrvHash, AuthBinding>,
     now: Instant,
-    tenant_of: impl Fn(&str) -> Option<Uuid>,
-    node_of: impl Fn(&str) -> Option<String>,
 ) -> Vec<String> {
     #[derive(Default)]
     struct Agg {
@@ -74,15 +73,15 @@ pub(super) fn detect_hung_nodes(
             // intent annotation — same fail-safe skip as no-binding.
             continue;
         };
-        let Some(node) = node_of(auth) else {
+        let Some(b) = bindings.get(auth) else {
             skipped_no_node += 1;
             continue;
         };
-        let agg = by_node.entry(node).or_default();
+        let agg = by_node.entry(b.node.clone()).or_default();
         agg.occ += 1;
         if now.duration_since(w.last_heartbeat) > timeout {
             agg.stale += 1;
-            if let Some(t) = tenant_of(auth) {
+            if let Some(t) = b.tenant {
                 agg.tenants.insert(t);
             }
         }
@@ -701,13 +700,38 @@ impl DagActor {
         observed_instance_types: &[rio_proto::types::ObservedInstanceType],
         bound_intents: &[rio_proto::types::BoundIntent],
     ) {
-        // Kube-authoritative `intent_id (== drv_hash) → spec.nodeName`.
-        // The controller ships the FULL set every tick, so overwrite-
-        // insert is correct (no stale entries from a missed delete);
-        // `handle_tick` sweeps entries whose drv left the DAG.
-        for b in bound_intents {
-            self.authoritative_node
-                .insert(b.intent_id.as_str().into(), b.node_name.clone());
+        // Kube-authoritative `intent_id (== drv_hash) → (spec.nodeName,
+        // tenant)`. The nodeclaim_pool reconciler ships the FULL set
+        // every tick, so wholesale-rebuild is correct (entries for
+        // deleted pods drop naturally; no separate sweep). The per-pool
+        // reconciler (`pool/jobs.rs`) sends `bound_intents=[]` — it
+        // only arms `dispatched_cells` — so empty = "this Ack carries
+        // no binding snapshot" = no-op (mb_012/⛔2: an unconditional
+        // `mem::take` here would discard every captured `tenant` on
+        // every per-pool reconcile).
+        //
+        // `tenant` is captured from the DAG when present, else carried
+        // forward from the existing entry — once DAG-absent the last
+        // DAG-present value sticks. A fall-through executor's
+        // spawn-drv leaves the DAG but the Ack keeps shipping its
+        // `intent_id` while the pod lives.
+        if !bound_intents.is_empty() {
+            let prev = std::mem::take(&mut self.authoritative_binding);
+            for b in bound_intents {
+                let h: DrvHash = b.intent_id.as_str().into();
+                let tenant = self
+                    .dag
+                    .node(&h)
+                    .and_then(|n| n.attributed_tenant(&self.builds))
+                    .or_else(|| prev.get(&h).and_then(|p| p.tenant));
+                self.authoritative_binding.insert(
+                    h,
+                    AuthBinding {
+                        node: b.node_name.clone(),
+                        tenant,
+                    },
+                );
+            }
         }
         // Arm-on-ack: recover the FULL `cells` vec from the parallel
         // `(hw_class_names, node_affinity)` wire form

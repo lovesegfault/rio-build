@@ -159,14 +159,6 @@ impl DagActor {
         // hung_nodes after it (or on-demand at the controller's 10s poll)
         // would always see zero stale entries.
         self.tick_hung_nodes(now);
-        // Sweep authoritative_node entries whose spawn-drv left the
-        // DAG. The map is keyed by `auth_intent` (the pod's spawn-time
-        // intent), so a pod whose spawn-drv left while it runs a
-        // fall-through drv is briefly swept here and re-added next
-        // controller Ack (full set every ~10s) — fail-safe gap, only
-        // skips that executor from `detect_hung_nodes` for one tick.
-        self.authoritative_node
-            .retain(|h, _| self.dag.node(h).is_some());
         self.tick_check_heartbeats(now).await;
         self.tick_sweep_recently_disconnected(now);
 
@@ -282,16 +274,13 @@ impl DagActor {
     /// destructive; the K>12×cap false-negative is bounded and
     /// backstopped.
     pub(crate) fn tick_hung_nodes(&mut self, now: Instant) {
-        for n in snapshot::detect_hung_nodes(
-            &self.executors,
-            now,
-            // None when the spawn-drv is terminal/swept from the DAG —
-            // fail-safe skip, mirrors `node_of` (`authoritative_node`
-            // is also swept on DAG-exit). The window is the
-            // DAG-prune race only.
-            |auth| self.dag.node(auth)?.attributed_tenant(&self.builds),
-            |auth| self.authoritative_node.get(auth).cloned(),
-        ) {
+        // Both `node` and `tenant` are projections off the SAME
+        // `authoritative_binding` entry — structurally same source,
+        // single lifecycle (Ack-time wholesale-rebuild). `tenant=None`
+        // ⇔ the spawn-drv was already DAG-absent at FIRST Ack
+        // (controller-lag at spawn) — fail-safe, bounded to the first
+        // ~10s of pod life.
+        for n in snapshot::detect_hung_nodes(&self.executors, &self.authoritative_binding, now) {
             self.hung_nodes.insert(n, now);
         }
         self.hung_nodes

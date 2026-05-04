@@ -212,6 +212,17 @@ pub(crate) const BECAME_IDLE_INLINE_CAP: u32 = 4;
 /// advances rather than re-probing the head).
 pub(crate) const DISPATCH_PROBE_BATCH_CAP: usize = 2048;
 
+/// Entry in [`DagActor::authoritative_binding`]: kube-authoritative
+/// `spec.nodeName` from the controller's pod informer, plus the
+/// scheduler-side tenant attribution captured at Ack time. Bundled so
+/// `detect_hung_nodes` reads both off ONE map entry — `node` and
+/// `tenant` structurally cannot diverge (mb_012).
+#[derive(Debug, Clone)]
+pub(crate) struct AuthBinding {
+    pub node: String,
+    pub tenant: Option<Uuid>,
+}
+
 /// The DAG actor state.
 pub struct DagActor {
     /// The global derivation DAG.
@@ -242,15 +253,32 @@ pub struct DagActor {
     /// [`housekeeping::HUNG_NODE_REPEAT_TTL`] since last detected.
     /// `compute_spawn_intents` reads `keys()`.
     pub(crate) hung_nodes: HashMap<String, Instant>,
-    /// Kube-authoritative `drv_hash → spec.nodeName` from the
-    /// controller's pod informer (`AckSpawnedIntents.bound_intents`).
-    /// `detect_hung_nodes` groups by this instead of any worker-supplied
-    /// value — worker is NOT trusted (a forged node_name in the
-    /// heartbeat would let two colluding tenants reap an arbitrary
-    /// NodeClaim, `r[sched.admin.hung-node-detector+3]`). Full set
-    /// every controller tick; swept on Tick to drop entries for drvs
-    /// no longer in the DAG.
-    pub(crate) authoritative_node: HashMap<DrvHash, String>,
+    /// Kube-authoritative `drv_hash → (spec.nodeName, tenant)` from
+    /// the controller's pod informer (`AckSpawnedIntents.bound_intents`).
+    /// `detect_hung_nodes` reads BOTH `node` and `tenant` from this —
+    /// they structurally cannot diverge (mb_012; previously `tenant_of`
+    /// read `dag.node(auth)?..` which is `None` permanently once the
+    /// spawn-drv leaves the DAG, while `node_of` read this map → a
+    /// fall-through executor was counted in `occ`/`stale` but never
+    /// `tenants`). `node` is controller-authoritative; worker is NOT
+    /// trusted (a forged node_name in the heartbeat would let two
+    /// colluding tenants reap an arbitrary NodeClaim,
+    /// `r[sched.admin.hung-node-detector+3]`). `tenant` is captured
+    /// scheduler-side at Ack time from `dag.node(h)?.attributed_tenant()`
+    /// when DAG-present, else carried forward — once DAG-absent the
+    /// last DAG-present value sticks.
+    ///
+    /// Wholesale-rebuilt on Acks THAT CARRY `bound_intents` (~10s; the
+    /// nodeclaim_pool reconciler ships the full set) — entries for
+    /// deleted pods drop naturally; no separate sweep. The per-pool
+    /// reconciler sends `bound_intents=[]` (it only arms
+    /// `dispatched_cells`); empty = "this Ack carries no binding
+    /// snapshot" = no-op on this map. nodeclaim_pool with 0 bound pods
+    /// also sends `[]` (only the all-four-empty case is suppressed at
+    /// `report_unfulfillable`); that case is also no-op'd — bounded
+    /// stale entries until the next non-empty Ack, unread (no matching
+    /// executor once the pod is gone).
+    pub(crate) authoritative_binding: HashMap<DrvHash, AuthBinding>,
     /// Executors that disconnected mid-build, awaiting the controller's
     /// `ReportExecutorTermination` (k8s OOMKilled/Evicted reason).
     /// `(drv_hash, inserted_at)` — captured before
@@ -557,7 +585,7 @@ impl DagActor {
             log_buffers: plumbing.log_buffers,
             executors: HashMap::new(),
             hung_nodes: HashMap::new(),
-            authoritative_node: HashMap::new(),
+            authoritative_binding: HashMap::new(),
             recently_disconnected: HashMap::new(),
             retry_policy: cfg.retry_policy,
             poison_config: cfg.poison,
@@ -634,7 +662,7 @@ impl DagActor {
             recently_disconnected,
             dispatched_cells,
             hung_nodes,
-            authoritative_node,
+            authoritative_binding,
             // Retained: rationale below.
             log_buffers: _,
             executors: _,
@@ -699,7 +727,7 @@ impl DagActor {
         // reported). Stale entries would let `detect_hung_nodes`
         // misattribute a re-dispatched drv to a previous-generation
         // node.
-        authoritative_node.clear();
+        authoritative_binding.clear();
         // Deliberately retained across generations:
         // - `executors`: live connections, not persisted (doc above).
         // - `ice`: cluster-level cell-backoff signal, 60s TTL self-heals.

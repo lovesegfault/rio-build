@@ -1982,9 +1982,13 @@ async fn clear_persisted_state_clears_per_generation_maps() {
     actor
         .hung_nodes
         .insert("nA".into(), std::time::Instant::now());
-    actor
-        .authoritative_node
-        .insert("stale-drv".into(), "nA".into());
+    actor.authoritative_binding.insert(
+        "stale-drv".into(),
+        crate::actor::AuthBinding {
+            node: "nA".into(),
+            tenant: None,
+        },
+    );
 
     actor.clear_persisted_state();
 
@@ -1997,8 +2001,8 @@ async fn clear_persisted_state_clears_per_generation_maps() {
         "hung_nodes (tick-derived) must be cleared on leader transition"
     );
     assert!(
-        actor.authoritative_node.is_empty(),
-        "authoritative_node (controller-reported per-generation) must be cleared"
+        actor.authoritative_binding.is_empty(),
+        "authoritative_binding (controller-reported per-generation) must be cleared"
     );
     // Regression: soft_features survives (existing :649 invariant).
     actor.test_inject_ready_with_features("ff", None, "x86_64-linux", &["big-parallel"]);

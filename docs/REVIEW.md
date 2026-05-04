@@ -644,7 +644,7 @@ in `AckSpawnedIntents` instead of trusting the worker. Done-gate: `rg
 reviewer asks "what destructive action reads this?"
 
 **Indirection key matters too.** r26 mb_022: R25B1 made the
-`authoritative_node` map's VALUE controller-authoritative, but
+`authoritative_binding` map's VALUE controller-authoritative, but
 `node_of(running_build)` keyed the lookup on a worker-mutable field —
 `reconcile_running_build`'s `(None, Some(hb))` arm sets
 `running_build` from the heartbeat unconditionally. A

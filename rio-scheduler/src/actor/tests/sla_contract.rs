@@ -468,20 +468,33 @@ async fn ack_observed_instance_types_folds_into_cost_table() {
     assert_eq!(ct.menu(&od).len(), 1, "controller 'od' form parses");
 }
 
-/// **`bound_intents` round-trips into `authoritative_node`**
+/// **`bound_intents` round-trips into `authoritative_binding`**
 /// (`r[sched.admin.hung-node-detector+3]`). Exercises the
 /// `handle_ack_spawned_intents` body so a forgotten destructure or
 /// wire-field rename surfaces here, not as a silently-empty
-/// `authoritative_node` (the B6a wire-format-mismatch lesson). The
+/// `authoritative_binding` (the B6a wire-format-mismatch lesson). The
 /// `intent_id` is the controller's `INTENT_ID_ANNOTATION` value
 /// (= drv_hash); `node_name` is kube `spec.nodeName`.
+///
+/// Also pins the wholesale-rebuild invariant (mb_012): a NON-empty
+/// `bound_intents` is the authoritative snapshot — entries absent from
+/// it are dropped (replaces the old per-tick `.retain(dag.node…)`
+/// sweep). An EMPTY `bound_intents` is the per-pool reconciler's "no
+/// snapshot in this Ack" signal → no-op on the map.
 #[tokio::test]
-async fn ack_bound_intents_populates_authoritative_node() {
+async fn ack_bound_intents_populates_authoritative_binding() {
     use rio_proto::types::BoundIntent;
 
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_hw(db.pool.clone());
-    assert!(actor.authoritative_node.is_empty());
+    assert!(actor.authoritative_binding.is_empty());
+
+    let bi = |id: &str, node: &str| BoundIntent {
+        intent_id: id.into(),
+        node_name: node.into(),
+    };
+    let abc = crate::state::DrvHash::from("abc123");
+    let def = crate::state::DrvHash::from("def456");
 
     actor.handle_ack_spawned_intents(
         &[],
@@ -489,25 +502,53 @@ async fn ack_bound_intents_populates_authoritative_node() {
         &[],
         &[],
         &[
-            BoundIntent {
-                intent_id: "abc123".into(),
-                node_name: "ip-10-0-1-5.ec2.internal".into(),
-            },
-            BoundIntent {
-                intent_id: "def456".into(),
-                node_name: "ip-10-0-1-6.ec2.internal".into(),
-            },
+            bi("abc123", "ip-10-0-1-5.ec2.internal"),
+            bi("def456", "ip-10-0-1-6.ec2.internal"),
         ],
     );
 
     assert_eq!(
         actor
-            .authoritative_node
-            .get(&crate::state::DrvHash::from("abc123"))
-            .map(String::as_str),
+            .authoritative_binding
+            .get(&abc)
+            .map(|b| b.node.as_str()),
         Some("ip-10-0-1-5.ec2.internal")
     );
-    assert_eq!(actor.authoritative_node.len(), 2);
+    assert_eq!(actor.authoritative_binding.len(), 2);
+    // DAG empty in bare_actor_hw → tenant captured as None on first Ack.
+    assert!(
+        actor
+            .authoritative_binding
+            .get(&abc)
+            .unwrap()
+            .tenant
+            .is_none()
+    );
+
+    // Wholesale-rebuild: second Ack omitting `def456` → that entry
+    // dropped (the Ack IS the authoritative snapshot; deleted pods
+    // disappear from the controller's `PodRequestedCache`).
+    actor.handle_ack_spawned_intents(
+        &[],
+        &[],
+        &[],
+        &[],
+        &[bi("abc123", "ip-10-0-1-5.ec2.internal")],
+    );
+    assert_eq!(actor.authoritative_binding.len(), 1);
+    assert!(!actor.authoritative_binding.contains_key(&def));
+    assert!(actor.authoritative_binding.contains_key(&abc));
+
+    // Empty `bound_intents` = "this Ack carries no binding snapshot"
+    // (per-pool reconciler at pool/jobs.rs sends `vec![]`; the
+    // nodeclaim_pool reconciler owns the stream) → map unchanged.
+    actor.handle_ack_spawned_intents(&[], &[], &[], &[], &[]);
+    assert_eq!(
+        actor.authoritative_binding.len(),
+        1,
+        "empty bound_intents must be a no-op (per-pool ack), not a wipe"
+    );
+    assert!(actor.authoritative_binding.contains_key(&abc));
 }
 
 /// `observe_instance_types` is gated on the shared `cost_was_leader`

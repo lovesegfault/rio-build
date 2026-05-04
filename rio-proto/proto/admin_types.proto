@@ -559,7 +559,7 @@ message AckSpawnedIntentsRequest {
   // r[sched.admin.hung-node-detector+3]: kube-authoritative
   // `intent_id → spec.nodeName` from the controller's pod informer
   // (`PodRequestedCache.bound_intent`). Scheduler stores as
-  // `authoritative_node` and `detect_hung_nodes` groups by it instead
+  // `authoritative_binding` and `detect_hung_nodes` groups by it instead
   // of any worker-supplied value (worker is NOT trusted; a forged
   // node_name would let 2 colluding tenants reap an arbitrary
   // NodeClaim). Full set every tick — ~1 entry per active build.

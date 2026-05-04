@@ -733,7 +733,7 @@ impl NodeClaimPoolReconciler {
         // Kube-authoritative `intent_id → spec.nodeName` for the
         // scheduler's hung-node detector. Full set every tick (one
         // entry per bound builder pod) so the scheduler's
-        // `authoritative_node` map stays current without delta
+        // `authoritative_binding` map stays current without delta
         // tracking; cardinality is O(active builds).
         let bound_intents = self
             .pod_requested
