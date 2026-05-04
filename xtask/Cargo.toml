@@ -12,6 +12,10 @@ publish = false
 # path (not workspace = true) because workspace-inherited deps can't
 # override default-features.
 rio-test-support = { path = "../rio-test-support", default-features = false }
+# `k8s::{METAL_NODE_CLASS, metal_partition_op}` for `probe_boot` —
+# §Partition-single-source: probe and `cover::build_nodeclaim` share
+# the metal-partition predicate, not a doc-comment.
+rio-common.workspace = true
 rio-crds.workspace = true
 # `sla::FLEET_MEDIAN_MIN_TENANTS` for `k8s sla-gates` seed loop
 # (bug_016: hardcoded `0..3` left the per-dim trust gate unsatisfied).

@@ -34,6 +34,7 @@ use ::kube::api::{Api, DeleteParams, ListParams, PostParams};
 use ::kube::core::DynamicObject;
 use anyhow::{Context, Result, bail, ensure};
 use k8s_openapi::api::core::v1::{ConfigMap, Node};
+use rio_common::k8s::metal_partition_op;
 use rio_scheduler::sla::config::{CapacityType, Cell, HwClassDef, NodeSelectorReq, SlaConfig};
 use serde_json::{Value, json};
 use tracing::{info, warn};
@@ -76,11 +77,13 @@ pub async fn run() -> Result<()> {
         "sla.hwClasses is empty — probe-boot needs at least one hw-class. \
          Populate `scheduler.sla.hwClasses` in the helm values and `up --deploy`."
     );
+    // Cell count is NOT `hw_classes × {spot, od}` — `cells()` reads
+    // `[sla.hw_classes.$h].capacityTypes`, so an od-only class
+    // contributes one cell, not two.
     info!(
-        "{} cell(s) ({} hw-class × {} capacity-type)",
+        "{} cell(s) across {} hw-class(es)",
         cells.len(),
         sla.hw_classes.len(),
-        CapacityType::ALL.len(),
     );
 
     // Shim NodePool nodeClassRef is the reference hw-class's NodeClass
@@ -456,12 +459,20 @@ async fn load_metal_sizes(client: &kube::Client) -> Result<Vec<String>> {
         .unwrap_or_default())
 }
 
-/// `hw_classes × {spot,od}`. Sorted so output is stable across runs.
+/// `hw_classes × capacity_types_for(h)` — same `[sla.hw_classes.$h].
+/// capacityTypes` config the controller's `all_cells()` reads, so an
+/// od-only metal class never produces a phantom `(metal, Spot)` probe
+/// cell (§Mode-invariant). Sorted so output is stable across runs.
 fn cells(sla: &SlaConfig) -> Vec<Cell> {
     let mut hs: Vec<_> = sla.hw_classes.keys().cloned().collect();
     hs.sort();
     hs.into_iter()
-        .flat_map(|h| CapacityType::ALL.map(move |c| (h.clone(), c)))
+        .flat_map(|h| {
+            sla.capacity_types_for(&h)
+                .iter()
+                .map(move |&c| (h.clone(), c))
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 
@@ -499,11 +510,18 @@ fn fmt_requirements(reqs: &[NodeSelectorReq]) -> String {
         .join(", ")
 }
 
-/// Build a naked probe NodeClaim mirroring what the §13b controller
-/// emits (`cover_deficit`'s `build_nodeclaim`): `karpenter.sh/nodepool`
-/// shim label + the hw-class's `labels`, EC2NodeClass ref, the
-/// hw-class's `requirements` + capacity-type + metal-size NotIn, NO
+/// Build a naked probe NodeClaim with the same requirements predicate
+/// as the §13b controller (`cover_deficit`'s `build_nodeclaim`):
+/// `karpenter.sh/nodepool` shim label + the hw-class's `labels`,
+/// EC2NodeClass ref, the hw-class's `requirements` + capacity-type +
+/// the [`metal_partition_op`] `In`/`NotIn` instance-size partition, NO
 /// `ownerReferences`. `generateName` so re-runs don't conflict.
+///
+/// Probe-specific metadata (no owner-ref, no taints, generateName,
+/// PROBE_LABEL) deliberately diverges from production; the
+/// *requirements predicate* MUST NOT — it determines which instance
+/// type Karpenter resolves and therefore the boot time the operator
+/// pastes into `leadTimeSeed` (§Partition-single-source, bug_029).
 ///
 /// `metadata.labels` carries `def.labels` (so the launched Node has
 /// `rio.build/hw-band`/`storage` and assertion 4 checks something
@@ -523,9 +541,15 @@ fn mk_probe_nodeclaim(cell: &Cell, def: &HwClassDef, metal_sizes: &[String]) -> 
         "values": [cap.label()],
     }));
     if !metal_sizes.is_empty() {
+        // I-205 partition: same predicate as `cover::build_nodeclaim`
+        // and helm `templates/karpenter.yaml`'s `nodePools` loop —
+        // metal-nodeClass gets the `In` side, everything else `NotIn`.
+        // §Partition-single-source: the predicate is shared, not
+        // doc-comment-mirrored, so the probe NodeClaim's instance-type
+        // pool matches what production would mint for the same cell.
         reqs.push(json!({
             "key": "karpenter.k8s.aws/instance-size",
-            "operator": "NotIn",
+            "operator": metal_partition_op(&def.node_class),
             "values": metal_sizes,
         }));
     }
@@ -680,10 +704,11 @@ mod tests {
             node_class: "rio-default".into(),
             max_cores: Some(64),
             max_mem: Some(256 << 30),
-            taints: Vec::new(),
-            provides_features: Vec::new(),
-            max_fleet_cores: None,
-            capacity_types: CapacityType::ALL.to_vec(),
+            // `..Default` gives `capacity_types = [Spot, Od]` (the
+            // serde default), `taints/provides_features = []`,
+            // `max_fleet_cores = None`. Tests that exercise an
+            // od-only class override `capacity_types` explicitly.
+            ..HwClassDef::default()
         }
     }
 
@@ -844,6 +869,54 @@ mod tests {
             v.pointer("/spec/template/spec/expireAfter")
                 .and_then(Value::as_str),
             Some("Never")
+        );
+    }
+
+    /// bug_029: a metal-nodeClass hwClass MUST get the `In` side of the
+    /// instance-size partition, mirroring `cover::build_nodeclaim`. The
+    /// pre-fix probe always emitted `NotIn` → Karpenter resolved a
+    /// virtualized instance → operator pasted ~18s into `leadTimeSeed`
+    /// → `health::classify` reaped every real metal NodeClaim as
+    /// `BootTimeout` at 2×seed long before bare-metal kubelet
+    /// registration.
+    #[test]
+    fn mk_probe_nodeclaim_metal_gets_in_side() {
+        let mut def = hw_class(
+            &[("kubernetes.io/arch", "amd64")],
+            vec![req("kubernetes.io/arch", "In", &["amd64"])],
+        );
+        def.node_class = "rio-metal".into();
+        let cell = ("metal-x86".into(), CapacityType::Od);
+        let metal = vec!["metal".into(), "metal-24xl".into()];
+        let nc = mk_probe_nodeclaim(&cell, &def, &metal);
+        let v = serde_json::to_value(&nc).unwrap();
+        let reqs = v.pointer("/spec/requirements").unwrap().as_array().unwrap();
+        let size_req = reqs
+            .iter()
+            .find(|r| r["key"] == "karpenter.k8s.aws/instance-size")
+            .expect("instance-size requirement present when metal_sizes non-empty");
+        assert_eq!(
+            size_req["operator"], "In",
+            "metal nodeClass must get the `In` side of the metal partition: {reqs:?}"
+        );
+    }
+
+    /// bug_029: `cells()` must read `[sla.hw_classes.$h].capacity_types`
+    /// so an od-only metal class never produces a phantom `(metal, Spot)`
+    /// probe cell — the controller's `all_cells()` reads the same config
+    /// and structurally never generates that cell.
+    #[test]
+    fn cells_honors_capacity_types() {
+        let mut sla = SlaConfig::test_default();
+        sla.hw_classes.clear();
+        let mut def = hw_class(&[], vec![req("kubernetes.io/os", "In", &["linux"])]);
+        def.capacity_types = vec![CapacityType::Od];
+        sla.hw_classes.insert("metal-x86".into(), def);
+        let got = cells(&sla);
+        assert_eq!(
+            got,
+            vec![("metal-x86".into(), CapacityType::Od)],
+            "od-only class must yield only the (h, Od) cell, no phantom Spot"
         );
     }
 

@@ -31999,6 +31999,10 @@
           "packageId": "reqwest 0.13.2"
         },
         {
+          "name": "rio-common",
+          "packageId": "rio-common"
+        },
+        {
           "name": "rio-crds",
           "packageId": "rio-crds"
         },

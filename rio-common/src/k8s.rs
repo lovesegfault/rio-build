@@ -1,5 +1,31 @@
 //! k8s/nix interop helpers shared across the workspace.
 
+/// `EC2NodeClass` name whose hw-classes are partitioned to bare-metal
+/// instance sizes (the I-205 BIOS-AMI partition). Both
+/// `cover::build_nodeclaim` (controller), `catalog::derive_ceilings`
+/// (scheduler), and `probe_boot::mk_probe_nodeclaim` (xtask) gate
+/// `karpenter.k8s.aws/instance-size In/NotIn metalSizes` on
+/// `node_class == this` — see [`metal_partition_op`].
+pub const METAL_NODE_CLASS: &str = "rio-metal";
+
+/// The §13c metal-partition predicate. A hw-class with `node_class ==
+/// `[`METAL_NODE_CLASS`] gets the `In` side of the
+/// `karpenter.k8s.aws/instance-size` requirement; every other class
+/// gets `NotIn`. Total over the partition: there is no third side —
+/// the `metalSizes` list either selects (metal) or excludes (everything
+/// else). Adding a third partition (e.g. a separate large-metal class)
+/// requires a new return variant here, which forces every caller —
+/// `cover::build_nodeclaim`, `catalog::derive_ceilings`,
+/// `probe_boot::mk_probe_nodeclaim`, and helm
+/// `templates/karpenter.yaml`'s `nodePools` loop — to handle it.
+pub fn metal_partition_op(node_class: &str) -> &'static str {
+    if node_class == METAL_NODE_CLASS {
+        "In"
+    } else {
+        "NotIn"
+    }
+}
+
 /// Map a single nix `system` (e.g. `"x86_64-linux"`) to its
 /// `kubernetes.io/arch` label value. `None` for empty/`builtin`/
 /// unknown — caller treats an unmappable system as undroppable (no node
@@ -46,6 +72,14 @@ pub fn features_compatible(required: &[String], provides: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metal_partition_op_in_for_metal() {
+        assert_eq!(metal_partition_op("rio-metal"), "In");
+        assert_eq!(metal_partition_op("rio-default"), "NotIn");
+        assert_eq!(metal_partition_op("rio-nvme"), "NotIn");
+        assert_eq!(metal_partition_op(""), "NotIn");
+    }
 
     #[test]
     fn system_to_arch_mapping() {

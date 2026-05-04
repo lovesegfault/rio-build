@@ -39,6 +39,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use aws_sdk_ec2::types::{ArchitectureType, InstanceTypeInfo};
+use rio_common::k8s::metal_partition_op;
 use tracing::warn;
 
 use super::config::{HwClassDef, NodeSelectorReq};
@@ -49,11 +50,6 @@ use super::config::{HwClassDef, NodeSelectorReq};
 /// parameter to [`super::config::SlaConfig::class_ceilings`] — empty
 /// → the per-class ceiling falls to `cfg.unwrap_or(global)`.
 pub type CatalogCeilings = HashMap<String, (u32, u64)>;
-
-/// `EC2NodeClass` name whose hwClasses are partitioned to bare-metal
-/// instance sizes (kvm builds). Mirrors
-/// `rio_controller::reconcilers::nodeclaim_pool::cover::METAL_NODE_CLASS`.
-const METAL_NODE_CLASS: &str = "rio-metal";
 
 /// Karpenter well-known label keys derived per instance type. Values
 /// match the `karpenter.k8s.aws/*` labels Karpenter's discovery stamps
@@ -215,11 +211,9 @@ pub fn derive_ceilings(
     for (h, def) in hw_classes {
         let metal_req = (!metal_sizes.is_empty()).then(|| NodeSelectorReq {
             key: label::SIZE.into(),
-            operator: if def.node_class == METAL_NODE_CLASS {
-                "In".into()
-            } else {
-                "NotIn".into()
-            },
+            // §Partition-single-source: same predicate as
+            // `cover::build_nodeclaim` and `probe_boot::mk_probe_nodeclaim`.
+            operator: metal_partition_op(&def.node_class).into(),
             values: metal_sizes.to_vec(),
         });
         let best = catalog

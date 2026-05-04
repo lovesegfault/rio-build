@@ -362,6 +362,22 @@ list (`values.yaml` key / helm helper / Rust `const`); both sides
 reference it; template-side injection by a discriminating field (here:
 `nodeClass`) so new entries get the partition structurally.
 
+"Share a fn call" can mean sharing the *predicate*, not the whole
+construction. When two crates produce the same artifact shape (a
+NodeClaim) for different purposes (production vs probe), the metadata
+MAY differ — generateName, owner-ref, taints, probe labels are
+legitimately divergent — but the *requirements predicate* MUST NOT;
+it determines what Karpenter resolves and therefore the measurement
+the divergent path feeds back into the production path. r30 bug_029:
+`probe_boot::mk_probe_nodeclaim` hardcoded `instance-size NotIn`
+while `cover::build_nodeclaim` gated on `node_class == "rio-metal"` —
+the probe measured a virtualized boot, fed `leadTimeSeed`, and
+`health::classify` reaped every real metal NodeClaim as `BootTimeout`
+at 2×seed. r30 mb_018: `METAL_NODE_CLASS` open-coded in two crates
+with a "Mirrors" comment. Close: extract the predicate
+(`metal_partition_op` + `METAL_NODE_CLASS`) to `rio-common::k8s`;
+all three crates call it.
+
 ## Granularity coupling
 
 Converting `T` → `Option<T>` (or `[T; K]` → `[Option<T>; K]`, or any

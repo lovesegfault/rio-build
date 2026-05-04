@@ -19,6 +19,12 @@ use std::collections::{BTreeMap, HashSet};
 use k8s_openapi::api::core::v1::{ResourceRequirements, Taint};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::api::ObjectMeta;
+// `METAL_NODE_CLASS` and `metal_partition_op` live in `rio_common::k8s`
+// so the §13c metal-partition predicate is single-sourced across
+// scheduler, controller, and xtask (§Partition-single-source, mb_018).
+// `metal_partition_op(node_class)` returns `"In"` for the metal
+// nodeClass and `"NotIn"` for everything else — see [`build_nodeclaim`].
+use rio_common::k8s::metal_partition_op;
 use rio_crds::karpenter::{NodeClaim, NodeClaimSpec, NodeClassRef, NodeSelectorRequirementWithMin};
 use rio_proto::types::{NodeSelectorRequirement, SpawnIntent};
 
@@ -50,15 +56,11 @@ pub const FORECAST_ETA_ANNOTATION: &str = "rio.build/forecast-eta-secs";
 /// `karpenter.k8s.aws/instance-size` requirement key — the I-205
 /// metal-partition. Same list as the shim NodePool's template
 /// requirement (`karpenter.metalSizes`); the operator (`In`/`NotIn`)
-/// is gated on whether the hw-class's `node_class` is
-/// [`METAL_NODE_CLASS`], single-sourcing the predicate with helm
-/// `templates/karpenter.yaml`'s `nodePools` loop.
+/// is gated on [`metal_partition_op`] over the hw-class's
+/// `node_class`, single-sourcing the predicate with helm
+/// `templates/karpenter.yaml`'s `nodePools` loop, the scheduler's
+/// `derive_ceilings`, and xtask's `mk_probe_nodeclaim`.
 pub const INSTANCE_SIZE_LABEL: &str = "karpenter.k8s.aws/instance-size";
-
-/// EC2NodeClass name that selects the BIOS AMI / metal partition. A
-/// hw-class with `node_class == METAL_NODE_CLASS` gets `instance-size
-/// In <metalSizes>`; every other class gets `NotIn`.
-pub const METAL_NODE_CLASS: &str = "rio-metal";
 
 /// The single builder-node taint. The band-loop NodePool template
 /// stamped `rio.build/builder=true:NoSchedule` so non-builder cluster
@@ -439,14 +441,15 @@ pub fn build_nodeclaim(
     requirements.push(mk_req(CAPACITY_TYPE_LABEL, "In", vec![cap_label.into()]));
     if !cfg.metal_sizes.is_empty() {
         // I-205 partition: same predicate as helm
-        // `templates/karpenter.yaml`'s `nodePools` loop —
-        // metal-nodeClass gets the `In` side, everything else `NotIn`.
-        let op = if hw.node_class == METAL_NODE_CLASS {
-            "In"
-        } else {
-            "NotIn"
-        };
-        requirements.push(mk_req(INSTANCE_SIZE_LABEL, op, cfg.metal_sizes.to_vec()));
+        // `templates/karpenter.yaml`'s `nodePools` loop and
+        // `probe_boot::mk_probe_nodeclaim` — metal-nodeClass gets the
+        // `In` side, everything else `NotIn`. §Partition-single-source:
+        // the predicate is shared via `rio_common::k8s`.
+        requirements.push(mk_req(
+            INSTANCE_SIZE_LABEL,
+            metal_partition_op(&hw.node_class),
+            cfg.metal_sizes.to_vec(),
+        ));
     }
     let requests: BTreeMap<String, Quantity> = [
         ("cpu".into(), Quantity(req.0.to_string())),
@@ -498,6 +501,7 @@ pub fn build_nodeclaim(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rio_common::k8s::METAL_NODE_CLASS;
     use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm};
 
     const GI: u64 = 1 << 30;
