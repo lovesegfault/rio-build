@@ -28,8 +28,8 @@ use crate::sla::metrics::counter_map;
 use metrics_util::debugging::DebuggingRecorder;
 use std::collections::BTreeMap;
 
-/// The three counters `solve_intent_for` may emit. After §Third-strike
-/// and arm-on-ack, `compute_spawn_intents` is **side-effect-free except
+/// The counters `solve_intent_for` may emit. After §Third-strike and
+/// arm-on-ack, `compute_spawn_intents` is **side-effect-free except
 /// idempotent memo fill and debounced emits of these** — every other
 /// counter write is a regression of merged_bug_001 / the validator's
 /// r3 BLOCKED finding (per-poll over-emission).
@@ -39,13 +39,17 @@ use std::collections::BTreeMap;
 /// `was_miss`-gated (memo inputs); `_hw_ladder_exhausted` and
 /// `_infeasible{CapacityExhausted}` are ICE-edge-gated per R5B2
 /// (read-time state, NOT in `inputs_gen`); `_infeasible` on the
-/// hw-agnostic path is `fit_content_hash`-anchored per R5B3. Each gate
-/// bounds the counter to ≤1 per `model_key` per edge — the (1a) `≤
-/// |Ready drvs|` assertion holds for all of them.
+/// hw-agnostic path is `fit_content_hash`-anchored per R5B3;
+/// `_unroutable_features` is `unroutable_features_warned`-gated per
+/// mb_031 (set on `DagActor`, keyed `(tenant, required_features)` —
+/// fires before `was_miss` is even declared). Each gate bounds the
+/// counter to ≤1 per `model_key` per edge — the (1a) `≤ |Ready drvs|`
+/// assertion holds for all of them.
 const ONCE_PER_MISS: &[&str] = &[
     "rio_scheduler_sla_infeasible_total",
     "rio_scheduler_sla_hw_ladder_exhausted_total",
     "rio_scheduler_sla_hw_cost_unknown_total",
+    "rio_scheduler_unroutable_features_total",
 ];
 
 /// `(intent_id → node_affinity)` from one `compute_spawn_intents` poll.
@@ -129,13 +133,28 @@ async fn contract_selector_stability() -> TestResult {
     for i in 0..10 {
         actor.test_inject_ready(&format!("d{i}"), Some("test-pkg"), "x86_64-linux", false);
     }
+    // mb_031: two `required_features` drvs with no hosting class (no
+    // hwClass in `test_hw_sla_config` provides anything) so the (1a)
+    // side-effect-free assertion exercises the unroutable emit branch.
+    // Two with the SAME feature tuple → debounced bound is 1; per-poll
+    // emission is `2×8=16 > 12=|Ready drvs|`, so the loose-form bound
+    // catches a regression to per-poll without tightening the
+    // assertion shape.
+    for hash in ["d-featured-a", "d-featured-b"] {
+        actor.test_inject_ready_with_features(
+            hash,
+            Some("test-pkg"),
+            "x86_64-linux",
+            &["zz-no-hosting-class"],
+        );
+    }
 
     // ── (1a) 8× poll, no state change → identical selectors ────────────
     // Side-effect-free except idempotent memo + debounced emits:
-    // capture the full counter map before/after; ONLY the three
+    // capture the full counter map before/after; ONLY the
     // `ONCE_PER_MISS` counters may have moved, and each by ≤ |Ready
     // drvs| (the per-key debounce bound — 10 drvs share 1 model_key,
-    // so the actual bound is 1; ≤10 is the loose form that survives
+    // so the actual bound is 1; ≤12 is the loose form that survives
     // fixture reshuffles). Any other counter delta is a per-poll side
     // effect the validator's r3 BLOCKED finding flagged.
     let rec = DebuggingRecorder::new();
@@ -163,7 +182,7 @@ async fn contract_selector_stability() -> TestResult {
             polls[0].len()
         );
     }
-    assert_eq!(polls[0].len(), 10, "all 10 Ready drvs intent-eligible");
+    assert_eq!(polls[0].len(), 12, "all 12 Ready drvs intent-eligible");
     assert!(
         polls[0].values().any(|a| !a.is_empty()),
         "precondition: solve_full path active (hw table populated)"
@@ -2695,5 +2714,71 @@ async fn bypass_none_arm_fod_with_features_emits_empty() {
         "FOD intent must NOT emit hw_class_names — fetcher pool is \
          helm-managed, not cover-minted; got {:?}",
         intent.hw_class_names
+    );
+}
+
+/// **mb_031**: `rio_scheduler_unroutable_features_total` is debounced
+/// once per `(tenant, required_features)` and carries NO `feature`
+/// label. Both invariants closed in one test:
+///
+/// 1. **Bounded cardinality** — the `feature` label was tenant-
+///    controlled (verbatim `requiredSystemFeatures`, unclamped); a
+///    tenant submitting `["x-${uuid}"]` per drv mints unbounded
+///    Prometheus series on shared monitoring (REVIEW.md §Threat-model
+///    "unbounded-cardinality partition key"). Drop the label; keep
+///    `tenant` (bounded by `Claims.sub`).
+/// 2. **Once-per-edge debounce** — the doc-comment claims "Surface it
+///    once per (tenant, feature)" but the emit was per-drv per-poll
+///    (sat above `was_miss`, gated only on `h_all.is_empty()`). The
+///    debounce mirrors `dispatch.rs`'s `unroutable_warned` set.
+///
+/// Pre-fix this fails on BOTH assertions: `feature` label present, and
+/// counter = 2 after two polls.
+// r[verify sched.sla.hwclass.provides]
+#[tokio::test]
+async fn unroutable_features_debounced_no_feature_label() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    seed_fit(&actor, "test-pkg");
+    // No hwClass in `bare_actor_hw` provides "zz-unroutable" → `h_all`
+    // is empty for this drv → unroutable emit fires.
+    actor.test_inject_ready_with_features(
+        "d-unroutable",
+        Some("test-pkg"),
+        "x86_64-linux",
+        &["zz-unroutable"],
+    );
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    {
+        let _g = metrics::set_default_local_recorder(&rec);
+        // Two polls, no state change. The unroutable feature-tuple is
+        // identical both times → exactly one increment.
+        actor.compute_spawn_intents(&Default::default());
+        actor.compute_spawn_intents(&Default::default());
+    }
+
+    // No `feature` label: `counter_map_by(.., Some("feature"))` groups
+    // by the label's value (or `""` when absent). Pre-fix the key is
+    // `"zz-unroutable"`; post-fix it's `""` (label dropped).
+    let by_feature = crate::sla::metrics::counter_map_by(
+        &snap,
+        "rio_scheduler_unroutable_features_total",
+        Some("feature"),
+    );
+    assert!(
+        !by_feature.contains_key("zz-unroutable"),
+        "unroutable_features_total must NOT carry a `feature` label \
+         (tenant-controlled unbounded cardinality on shared monitoring); \
+         got keys {:?}",
+        by_feature.keys().collect::<Vec<_>>()
+    );
+    let total: u64 = by_feature.values().sum();
+    assert_eq!(
+        total, 1,
+        "unroutable_features_total must be debounced once per \
+         (tenant, required_features) edge, not per-drv per-poll; \
+         two polls → 1 increment, got {total}"
     );
 }

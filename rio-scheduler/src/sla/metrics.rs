@@ -39,9 +39,10 @@ pub fn describe_all() {
     describe_counter!(
         "rio_scheduler_unroutable_features_total",
         "§13c: solve_intent_for found NO hwClass whose provides_features \
-         hosts the drv's required_features (labeled tenant, feature). \
-         The intent is unroutable until a `[sla.hw_classes.$h]` with \
-         matching providesFeatures is added."
+         hosts the drv's required_features (labeled tenant). Debounced \
+         once per (tenant, required_features) edge. The intent is \
+         unroutable until a `[sla.hw_classes.$h]` with matching \
+         providesFeatures is added; the WARN names which features."
     );
     describe_counter!(
         "rio_scheduler_sla_suspicious_scaling_total",

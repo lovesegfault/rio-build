@@ -466,6 +466,22 @@ pub struct DagActor {
     /// re-armed when the system becomes routable again. Also the set
     /// the gauge zeroing loop iterates so stale labels don't persist.
     unroutable_warned: HashSet<String>,
+    /// `(tenant, required_features)` tuples already counted and WARNed
+    /// as unroutable in `solve_intent_for` (no hwClass `provides_features`
+    /// hosts the tuple). Debounces `rio_scheduler_unroutable_features_total`
+    /// and the companion `warn!` to once-per-edge — without it the emit
+    /// fires per-drv per-`GetSpawnIntents` poll (~hundreds/min), and is
+    /// also the only emit in `solve_intent_for` that sits BEFORE
+    /// `was_miss` is declared so none of the memo-anchored debounce
+    /// gates apply (mb_031). `Mutex` because `solve_intent_for` is
+    /// `&self`; the actor is single-threaded so contention is zero.
+    /// Bounded by distinct `(tenant, clamped_features)` tuples where
+    /// `clamped_features` is `requiredSystemFeatures` truncated to
+    /// 64 entries × 32 ASCII chars (the strings are tenant-controlled,
+    /// so an unclamped key would grow unbounded). The metric carries
+    /// only `tenant` (bounded by `Claims.sub`). Re-arms on pod restart
+    /// (config change rolls the pod via the scheduler.yaml checksum).
+    unroutable_features_warned: parking_lot::Mutex<HashSet<(String, Vec<String>)>>,
     /// Set by events that change dispatch eligibility (Heartbeat, drain).
     /// `handle_tick` consumes it: `if dirty { dispatch_ready(); dirty=false; }`.
     /// I-163: Heartbeat used to call `dispatch_ready` inline — at 290
@@ -639,6 +655,7 @@ impl DagActor {
             freeze_builders_since: None,
             freeze_fetchers_since: None,
             unroutable_warned: HashSet::new(),
+            unroutable_features_warned: parking_lot::Mutex::new(HashSet::new()),
             dispatch_dirty: false,
             probe_generation: 1,
             became_idle_inline_this_tick: 0,
@@ -715,6 +732,10 @@ impl DagActor {
             freeze_builders_since: _,
             freeze_fetchers_since: _,
             unroutable_warned: _,
+            // Retained: a leader transition doesn't change the SLA
+            // config; the operator already saw the WARN. Same rationale
+            // as `unroutable_warned` above.
+            unroutable_features_warned: _,
             dispatch_dirty: _,
             probe_generation: _,
             became_idle_inline_this_tick: _,

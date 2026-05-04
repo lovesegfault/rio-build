@@ -969,20 +969,51 @@ impl DagActor {
         h_all.sort_unstable();
         // §one-step-removed inverse: `required_features` non-empty but
         // NO hwClass provides them → unschedulable forever (silent).
-        // Surface it once per (tenant, feature) so the operator notices.
-        if h_all.is_empty() && !state.required_features.is_empty() {
-            for f in &state.required_features {
-                ::metrics::counter!(
-                    "rio_scheduler_unroutable_features_total",
-                    "tenant" => tenant.clone(),
-                    "feature" => f.clone(),
-                )
-                .increment(1);
-            }
+        // Surface it once per `(tenant, required_features)` edge so the
+        // operator notices without per-drv per-poll spam (this block
+        // sits BEFORE `was_miss` and never reaches the memo when
+        // `h_all=[]`, so none of the post-memo debounce gates apply —
+        // it has its own set on the actor; mb_031). Counter carries
+        // ONLY `tenant` (bounded by `Claims.sub`): the per-feature
+        // label was tenant-controlled (verbatim `requiredSystemFeatures`,
+        // unclamped) → unbounded Prometheus cardinality on shared
+        // monitoring (REVIEW.md §Threat-model). The unroutable feature
+        // strings still reach the operator via the structured-log
+        // `features` field below, which is rate-bounded by the same
+        // debounce edge.
+        // Clamp the debounce key to bound per-pod heap growth: the raw
+        // strings are tenant-controlled (`requiredSystemFeatures`,
+        // unclamped at translate.rs) — without a cap a slow-rate tenant
+        // submitting `["x-${uuid}"]` accumulates HashSet entries
+        // indefinitely across DAG/PG GC. 64 entries × 32 chars matches
+        // executor_service.rs's `MAX_HEARTBEAT_FEATURES`; collisions
+        // dedup at ASCII-truncate, which only over-debounces (fail-safe).
+        const MAX_KEY_FEATURES: usize = 64;
+        let key_features: Vec<String> = state
+            .required_features
+            .iter()
+            .take(MAX_KEY_FEATURES)
+            .map(|f| f.chars().filter(|c| c.is_ascii()).take(32).collect())
+            .collect();
+        if h_all.is_empty()
+            && !state.required_features.is_empty()
+            && self
+                .unroutable_features_warned
+                .lock()
+                .insert((tenant.clone(), key_features))
+        {
+            ::metrics::counter!(
+                "rio_scheduler_unroutable_features_total",
+                "tenant" => tenant.clone(),
+            )
+            .increment(1);
             tracing::warn!(
+                %tenant,
                 features = ?state.required_features,
-                "no hwClass provides required_features — intent unroutable; \
-                 add a `provides_features` entry to a `[sla.hw_classes.$h]`",
+                system = %state.system,
+                "no hwClass for this system provides required_features — \
+                 intent unroutable; add a `provides_features` entry to an \
+                 arch-compatible `[sla.hw_classes.$h]`",
             );
         }
         // `was_miss`: first time this `(model_key, inputs_gen)` was
