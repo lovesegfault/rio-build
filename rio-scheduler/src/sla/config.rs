@@ -16,7 +16,7 @@ use super::solve::{Ceilings, Tier};
 /// Karpenter instance-type requirements that PROVISION that hardware.
 /// Labels are ANDed within a class; classes are OR'd across the
 /// `hw_classes` map when serialized to `nodeSelectorTerms`.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HwClassDef {
     /// `key=value` Node labels stamped post-launch (e.g.
@@ -52,6 +52,73 @@ pub struct HwClassDef {
     /// Per-class memory ceiling — see [`Self::max_cores`].
     #[serde(default)]
     pub max_mem: u64,
+    /// Node taints applied to NodeClaims targeting this hw-class
+    /// (chained after the universal `rio.build/builder` taint).
+    /// `r[ctrl.nodeclaim.taints.hwclass]`: e.g. metal classes carry
+    /// `rio.build/kvm=true:NoSchedule` so non-kvm pods stay off.
+    #[serde(default)]
+    pub taints: Vec<NodeTaint>,
+    /// `requiredSystemFeatures` this hw-class can host. The
+    /// [`features_compatible`] bidirectional ∅-guard routes intents:
+    /// a class with `provides_features=["kvm"]` accepts ONLY kvm
+    /// intents; an empty `provides_features` accepts ONLY featureless
+    /// intents. §13c: replaces the static `rio-builder-metal` NodePool
+    /// routing.
+    #[serde(default)]
+    pub provides_features: Vec<String>,
+    /// Per-hw-class fleet-core sub-budget. The controller's
+    /// `cover_deficit` clamps this class's per-tick mint at
+    /// `min(global_remaining, max_fleet_cores − live_h − created_h)`
+    /// summed across capacity-types (per-hwClass, NOT per-Cell — a
+    /// per-Cell cap would let spot+od each hit it independently → 2×
+    /// $/hr exposure). `None` ⇒ global-only.
+    #[serde(default)]
+    pub max_fleet_cores: Option<u32>,
+    /// Capacity-types this hw-class is permitted to provision.
+    /// `r[sched.sla.hwclass.capacity-types]`: `solve_full` and the
+    /// controller's `all_cells`/`fallback_cell` iterate THIS, not
+    /// `CapacityType::ALL`, so an od-only class (e.g. metal) never
+    /// generates a `(h, Spot)` cell — structurally preventing the
+    /// conflicting-requirements ICE loop a requirement-based exclusion
+    /// would cause. Default `[Spot, Od]` (both).
+    #[serde(default = "default_capacity_types")]
+    pub capacity_types: Vec<CapacityType>,
+}
+
+fn default_capacity_types() -> Vec<CapacityType> {
+    CapacityType::ALL.to_vec()
+}
+
+/// Hand-rolled `Default` so `capacity_types` is `[Spot, Od]` (matching
+/// the serde default), NOT `vec![]`. A derived `Default` would give an
+/// empty Vec, which `validate()` rejects and would silently make every
+/// `..Default::default()` test fixture unprovisionable.
+impl Default for HwClassDef {
+    fn default() -> Self {
+        Self {
+            labels: Vec::new(),
+            requirements: Vec::new(),
+            node_class: String::new(),
+            max_cores: 0,
+            max_mem: 0,
+            taints: Vec::new(),
+            provides_features: Vec::new(),
+            max_fleet_cores: None,
+            capacity_types: default_capacity_types(),
+        }
+    }
+}
+
+/// `{key, value, effect}` Node taint. Same shape as k8s
+/// `core/v1.Taint` (minus `timeAdded`). Local struct so the TOML field
+/// names are stable and `deny_unknown_fields` applies.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NodeTaint {
+    pub key: String,
+    #[serde(default)]
+    pub value: String,
+    pub effect: String,
 }
 
 /// `{key, operator, values}` — same shape as k8s
@@ -366,7 +433,42 @@ impl ProbeShape {
 /// arch-match an `HwClassDef`'s labels against `SpawnIntent.system`.
 pub const ARCH_LABEL: &str = "kubernetes.io/arch";
 
+// r[impl sched.sla.hwclass.provides.bidir]
+/// Bidirectional ∅-guard feature-match predicate. Single source for
+/// the §13c/D3/D10/I-181 routing rule — open-coding this at ≥4 sites
+/// (T2/T10/D10 chokepoint + worker `passes_intent_filter`) lets them
+/// drift, and drift here is "kvm intent routed to non-kvm cell" or
+/// "metal node absorbs non-kvm build".
+///
+/// `true` iff every `required` feature is in `provides` AND
+/// `required.is_empty() == provides.is_empty()`. The second clause is
+/// the bidirectional guard: a class providing `[kvm]` rejects
+/// featureless intents (so metal doesn't absorb non-kvm); a class
+/// providing `[]` rejects `[kvm]` intents (so non-metal isn't picked
+/// for kvm — `[]⊆anything` would otherwise let it through). Subset (not
+/// equality) on the populated side keeps the door open for
+/// `provides=[kvm, big-parallel]` hosting `required=[kvm]`.
+pub fn features_compatible(required: &[String], provides: &[String]) -> bool {
+    required.iter().all(|f| provides.contains(f)) && required.is_empty() == provides.is_empty()
+}
+
 impl SlaConfig {
+    /// `[sla.hw_classes.$h].capacity_types`. Unknown `h` → `ALL` (no
+    /// restriction). §Mode-invariant: every cell-set generator
+    /// (`solve_full`, controller `all_cells`/`fallback_cell`) reads
+    /// THIS so an od-only class structurally never produces a
+    /// `(h, Spot)` cell.
+    pub fn capacity_types_for(&self, h: &str) -> &[CapacityType] {
+        self.hw_classes
+            .get(h)
+            .map_or(CapacityType::ALL.as_slice(), |d| &d.capacity_types)
+    }
+
+    /// `[sla.hw_classes.$h].provides_features`. Unknown `h` → `&[]`.
+    pub fn provides_for(&self, h: &str) -> &[String] {
+        self.hw_classes.get(h).map_or(&[], |d| &d.provides_features)
+    }
+
     /// Per-class `(max_cores, max_mem)` from `hw_classes[h]`. Mirrors
     /// the controller's `HwClassConfig::ceilings_for`. Unknown class →
     /// `(u32::MAX, u64::MAX)` (no per-class ceiling — global only).
@@ -507,6 +609,10 @@ impl SlaConfig {
                     node_class: "rio-default".into(),
                     max_cores: 16,
                     max_mem: 2 << 30,
+                    taints: vec![],
+                    provides_features: vec![],
+                    max_fleet_cores: None,
+                    capacity_types: default_capacity_types(),
                 },
             )]),
             hw_cost_tolerance: default_hw_cost_tolerance(),
@@ -605,6 +711,12 @@ impl SlaConfig {
                 self.max_mem,
                 def.max_mem
             );
+            anyhow::ensure!(
+                !def.capacity_types.is_empty(),
+                "sla.hwClasses[{h}].capacity_types must be non-empty \
+                 (default is [spot, on-demand]; explicit empty would make \
+                 the class unprovisionable)"
+            );
             for r in &def.requirements {
                 anyhow::ensure!(
                     !r.key.starts_with("rio.build/"),
@@ -697,7 +809,18 @@ mod tests {
             node_class: "rio-default".into(),
             max_cores: 64,
             max_mem: 256 << 30,
+            taints: vec![],
+            provides_features: vec![],
+            max_fleet_cores: None,
+            capacity_types: default_capacity_types(),
         }
+    }
+
+    /// `test_def` + `provides_features` — for §13c routing tests.
+    fn test_def_provides(k: &str, v: &str, provides: &[&str]) -> HwClassDef {
+        let mut d = test_def(k, v);
+        d.provides_features = provides.iter().map(|s| (*s).into()).collect();
+        d
     }
 
     fn base() -> SlaConfig {
@@ -1399,6 +1522,90 @@ mod tests {
         ok.lead_time_seed
             .insert(("intel-7".into(), CapacityType::Spot), 30.0);
         ok.validate().expect("valid lead_time_seed should pass");
+    }
+
+    /// §13c T1b: bidirectional ∅-guard. Single canonical predicate for
+    /// D3/D10/I-181 routing — open-coding at ≥4 sites lets them drift.
+    // r[verify sched.sla.hwclass.provides.bidir]
+    #[test]
+    fn features_compatible_bidirectional_guard() {
+        let s = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| (*s).into()).collect() };
+        // Both empty → compatible.
+        assert!(features_compatible(&[], &[]));
+        // Exact match → compatible.
+        assert!(features_compatible(&s(&["kvm"]), &s(&["kvm"])));
+        // required=[], provides=[kvm] → INcompatible (∅-guard: metal
+        // must not absorb non-kvm).
+        assert!(!features_compatible(&[], &s(&["kvm"])));
+        // required=[kvm], provides=[] → INcompatible (∅-guard: non-metal
+        // must not host kvm; []⊆anything would otherwise let it through).
+        assert!(!features_compatible(&s(&["kvm"]), &[]));
+        // Subset on populated side → compatible (provides=[kvm,bp]
+        // hosts required=[kvm]).
+        assert!(features_compatible(&s(&["kvm"]), &s(&["kvm", "bp"])));
+        // required ⊄ provides → incompatible.
+        assert!(!features_compatible(&s(&["kvm", "bp"]), &s(&["kvm"])));
+    }
+
+    /// §13c T1: new HwClassDef fields default correctly when absent
+    /// from TOML, and `capacity_types` accepts both `od` and
+    /// `on-demand` aliases.
+    #[test]
+    fn hwclassdef_new_fields_defaults_and_serde() {
+        // Absent → serde defaults: empty vecs, None, ALL capacity-types.
+        let d: HwClassDef = toml::from_str(
+            r#"
+            labels = [{key="k",value="v"}]
+            requirements = [{key="k",operator="In",values=["v"]}]
+            node_class = "rio-default"
+            max_cores = 1
+            max_mem = 1
+        "#,
+        )
+        .unwrap();
+        assert!(d.taints.is_empty());
+        assert!(d.provides_features.is_empty());
+        assert_eq!(d.max_fleet_cores, None);
+        assert_eq!(d.capacity_types, vec![CapacityType::Spot, CapacityType::Od]);
+        // Explicit od-only via Karpenter alias.
+        let d: HwClassDef = toml::from_str(
+            r#"
+            labels = [{key="k",value="v"}]
+            requirements = [{key="k",operator="In",values=["v"]}]
+            node_class = "rio-metal"
+            max_cores = 1
+            max_mem = 1
+            capacity_types = ["on-demand"]
+            provides_features = ["kvm"]
+            max_fleet_cores = 5000
+            taints = [{key="rio.build/kvm",value="true",effect="NoSchedule"}]
+        "#,
+        )
+        .unwrap();
+        assert_eq!(d.capacity_types, vec![CapacityType::Od]);
+        assert_eq!(d.provides_features, vec!["kvm"]);
+        assert_eq!(d.max_fleet_cores, Some(5000));
+        assert_eq!(d.taints[0].key, "rio.build/kvm");
+    }
+
+    /// §13c: `capacity_types_for` / `provides_for` accessors.
+    #[test]
+    fn capacity_types_for_and_provides_for() {
+        let mut cfg = base();
+        let mut metal = test_def(ARCH_LABEL, "amd64");
+        metal.capacity_types = vec![CapacityType::Od];
+        metal.provides_features = vec!["kvm".into()];
+        cfg.hw_classes.insert("metal-x86".into(), metal);
+        assert_eq!(cfg.capacity_types_for("metal-x86"), &[CapacityType::Od]);
+        assert_eq!(
+            cfg.capacity_types_for("test-hw"),
+            &[CapacityType::Spot, CapacityType::Od]
+        );
+        // Unknown → ALL (no restriction).
+        assert_eq!(cfg.capacity_types_for("nope"), CapacityType::ALL.as_slice());
+        assert_eq!(cfg.provides_for("metal-x86"), &["kvm".to_string()]);
+        assert!(cfg.provides_for("test-hw").is_empty());
+        assert!(cfg.provides_for("nope").is_empty());
     }
 
     #[test]

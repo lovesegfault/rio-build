@@ -670,6 +670,30 @@ message HwClassLabels {
   // of the global cap.
   uint32 max_cores = 4;
   uint64 max_mem = 5;
+  // §13c: per-hw-class Node taints (chained after the universal
+  // rio.build/builder taint). e.g. metal classes carry
+  // rio.build/kvm=true:NoSchedule.
+  repeated NodeTaint taints = 6;
+  // §13c: requiredSystemFeatures this hw-class can host. The
+  // bidirectional ∅-guard (`features_compatible`) routes intents.
+  repeated string provides_features = 7;
+  // §13c: per-hw-class fleet-core sub-budget. cover_deficit clamps this
+  // class's mint at min(global_remaining, max_fleet_cores − live_h −
+  // created_h) summed across capacity-types.
+  optional uint32 max_fleet_cores = 8;
+  // §13c: capacity-types this hw-class is permitted to provision
+  // (Karpenter label form: "spot" / "on-demand"). Empty ⇒ both
+  // (controller treats absent as ALL). solve_full and the controller's
+  // all_cells/fallback_cell iterate THIS so an od-only class never
+  // generates a (h, Spot) cell.
+  repeated string capacity_types = 9;
+}
+// §13c: `{key, value, effect}` Node taint. Mirrors
+// rio-scheduler/src/sla/config.rs::NodeTaint.
+message NodeTaint {
+  string key = 1;
+  string value = 2;
+  string effect = 3;
 }
 message GetHwClassConfigResponse {
   // h → `[sla.hw_classes.$h].labels`. The controller matches a Node's

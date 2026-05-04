@@ -795,6 +795,15 @@ impl AdminService for AdminServiceImpl {
                         values: r.values.clone(),
                     })
                     .collect();
+                let taints = def
+                    .taints
+                    .iter()
+                    .map(|t| rio_proto::types::NodeTaint {
+                        key: t.key.clone(),
+                        value: t.value.clone(),
+                        effect: t.effect.clone(),
+                    })
+                    .collect();
                 (
                     h.clone(),
                     rio_proto::types::HwClassLabels {
@@ -803,6 +812,14 @@ impl AdminService for AdminServiceImpl {
                         node_class: def.node_class.clone(),
                         max_cores: def.max_cores,
                         max_mem: def.max_mem,
+                        taints,
+                        provides_features: def.provides_features.clone(),
+                        max_fleet_cores: def.max_fleet_cores,
+                        capacity_types: def
+                            .capacity_types
+                            .iter()
+                            .map(|c| c.label().to_string())
+                            .collect(),
                     },
                 )
             })
