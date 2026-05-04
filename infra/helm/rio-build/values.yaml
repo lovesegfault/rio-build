@@ -416,7 +416,13 @@ scheduler:
     hwCostTolerance: 0.15
     hwExploreEpsilon: 0.02
     hwBenchMemFloor: 8589934592  # 8 GiB
-    maxFleetCores: 10000
+    # §13c D4a: pre-§13c the pre-§13c static metal NodePool's
+    # `limits:{cpu:10000}` was a SEPARATE budget from the §13b
+    # nodeclaim_pool `maxFleetCores`. Folding metal in adds its capacity
+    # to the global pool — bump by 10000 so non-metal keeps its
+    # pre-§13c floor. INVARIANT: Σ(metal-* maxFleetCores) ≤ 10000 (the
+    # bump amount) — see helm/13 assertion.
+    maxFleetCores: 20000
     ladderBudget: 600
     maxForecastCoresPerTenant: 2000
     maxKeysPerTenant: 50000
@@ -565,6 +571,53 @@ scheduler:
           - {key: karpenter.k8s.aws/instance-category, operator: In, values: [c, m, r]}
           - {key: karpenter.k8s.aws/instance-generation, operator: In, values: ["6"]}
           - {key: kubernetes.io/arch, operator: In, values: [arm64]}
+      # §13c: bare-metal hw-classes for kvm derivations (nixos-test /
+      # qemu-kvm builds, requiredSystemFeatures=["kvm"]). These replace
+      # the pre-§13c static metal NodePool — kvm intents now get
+      # full SLA-solve participation routed by `providesFeatures`.
+      # BIOS-AMI partition (instance-size In/NotIn) keys on
+      # `nodeClass: rio-metal` (cover.rs METAL_NODE_CLASS).
+      # On-demand only (`capacityTypes`): metal is expensive idle, spot
+      # interruption mid-VM-test wastes the whole build. The
+      # `rio.build/kvm` label feeds the pod nodeSelector; the matching
+      # taint keeps non-kvm pods off.
+      metal-x86:
+        nodeClass: rio-metal
+        labels:
+          - {key: rio.build/kvm, value: "true"}
+          - {key: kubernetes.io/arch, value: amd64}
+        requirements:
+          - {key: kubernetes.io/arch, operator: In, values: [amd64]}
+          - {key: karpenter.k8s.aws/instance-category, operator: In, values: [c, m, r]}
+          - {key: karpenter.k8s.aws/instance-generation, operator: Gt, values: ["5"]}
+          # NO capacity-type requirement — D5 makes it structural via
+          # capacityTypes (a requirement here would conflict with the
+          # cell-derived `In [spot]` on a (metal, spot) cell → ICE loop).
+        capacityTypes: [on-demand]
+        taints:
+          - {key: rio.build/kvm, value: "true", effect: NoSchedule}
+        providesFeatures: [kvm]
+        # §13c D4a: x86+arm Σ = 10000 (= the maxFleetCores bump amount).
+        maxFleetCores: 5000
+        # maxCores/maxMem default to global (sla.maxCores/maxMem).
+        # SlaConfig::validate() rejects per-class ceilings > global; the
+        # global cap bounds what any single build can request, so a
+        # higher metal ceiling has no operational effect — and helm/17
+        # asserts the constraint.
+      metal-arm:
+        nodeClass: rio-metal
+        labels:
+          - {key: rio.build/kvm, value: "true"}
+          - {key: kubernetes.io/arch, value: arm64}
+        requirements:
+          - {key: kubernetes.io/arch, operator: In, values: [arm64]}
+          - {key: karpenter.k8s.aws/instance-category, operator: In, values: [c, m, r]}
+          - {key: karpenter.k8s.aws/instance-generation, operator: Gt, values: ["5"]}
+        capacityTypes: [on-demand]
+        taints:
+          - {key: rio.build/kvm, value: "true", effect: NoSchedule}
+        providesFeatures: [kvm]
+        maxFleetCores: 5000
     hwCostSource: spot
     referenceHwClass: mid-ebs-x86
     # Fallback for cells absent from leadTimeSeed (a new hw-class
@@ -738,54 +791,16 @@ karpenter:
 
   # AWS bare-metal instance-size suffixes, c/m/r gen6+. Single source
   # for the metal/virtualized partition (I-205). New `metal-*` size →
-  # add HERE only; templates/karpenter.yaml injects `instance-size In`
-  # on rio-metal pools and `NotIn` on every other pool from this list.
+  # add HERE only; the controller's `nodeclaim_pool` reconciler reads
+  # this (`controller.toml [nodeclaim_pool] metal_sizes`) for
+  # `instance-size In/NotIn` on §13b NodeClaims, and
+  # templates/karpenter.yaml injects the same `NotIn` on every NodePool.
+  # §13c: kvm builds are now `metal-*` hwClasses (`scheduler.sla.
+  # hwClasses.metal-{x86,arm}`) routed by §13b — there is no static
+  # metal NodePool.
   metalSizes: [metal, metal-16xl, metal-24xl, metal-32xl, metal-48xl]
 
   nodePools:
-    # Builder metal: bare-metal instances expose /dev/kvm (nested virt)
-    # for nixos-test / qemu-kvm derivations (requiredSystemFeatures =
-    # ["kvm"]). Tainted rio.build/kvm so ONLY pools with features:[kvm]
-    # land here (controller appends the toleration — r[ctrl.pool.
-    # kvm-device]). Arch-agnostic: I-098's per-pod kubernetes.io/arch
-    # nodeSelector picks c7a.metal-48xl vs c7g.metal etc. Weight 1 +
-    # tight cpu limit + short consolidateAfter: metal is expensive
-    # (~$5-10/hr each), don't let Karpenter prefer it for non-kvm pods
-    # that happen to tolerate both taints, and reap aggressively.
-    - name: rio-builder-metal
-      weight: 1
-      # I-205: x86_64 .metal SKUs reject UEFI AMIs (legacy-bios only).
-      # rio-metal NodeClass selects node-ami-x86_64-bios for amd64 and
-      # the regular UEFI AMI for arm64. See templates/karpenter.yaml.
-      nodeClass: rio-metal
-      labels:
-        rio.build/node-role: builder
-        rio.build/kvm: "true"
-      taints:
-        - key: rio.build/builder
-          value: "true"
-          effect: NoSchedule
-        - key: rio.build/kvm
-          value: "true"
-          effect: NoSchedule
-      requirements:
-        - key: karpenter.k8s.aws/instance-category
-          operator: In
-          values: [c, m, r]
-        - key: karpenter.k8s.aws/instance-generation
-          operator: Gt
-          values: ["5"]
-        # instance-size partition injected template-side from
-        # `karpenter.metalSizes` (I-205) — see templates/karpenter.yaml.
-        - key: karpenter.sh/capacity-type
-          operator: In
-          values: [on-demand]
-      # ~52 metal hosts max at 192 vCPU each — the only fanout gate
-      # for kvm builders now that per-class maxConcurrent is gone.
-      # consolidateAfter:30s reaps idle metal fast.
-      limits: {cpu: 10000}
-      consolidateAfter: 30s
-
     # r[impl fetcher.node.dedicated]
     #
     # Fetcher: dedicated NodePool with rio.build/fetcher taint. Keeps

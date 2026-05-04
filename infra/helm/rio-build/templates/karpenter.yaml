@@ -23,12 +23,13 @@
 # fill the volume on first boot.
 #
 # I-205: x86_64 .metal SKUs are legacy-bios ONLY (zero support UEFI per
-# `aws ec2 describe-instance-types`), so the rio-builder-metal NodePool
-# can't use the UEFI/UKI AMI on x86. rio-metal selects the
-# `node-ami-x86_64-bios` variant for amd64 and the regular UEFI image
-# for arm64 (Graviton .metal requires UEFI). Spec is otherwise identical
-# to rio-default; only the rio-builder-metal NodePool references rio-metal,
-# virtualized pools stay on rio-default (UEFI/UKI).
+# `aws ec2 describe-instance-types`), so metal NodeClaims can't use the
+# UEFI/UKI AMI on x86. rio-metal selects the `node-ami-x86_64-bios`
+# variant for amd64 and the regular UEFI image for arm64 (Graviton
+# .metal requires UEFI). Spec is otherwise identical to rio-default;
+# §13c: only the §13b `metal-*` hwClasses reference rio-metal (via
+# `nodeClass: rio-metal`), virtualized pools stay on rio-default
+# (UEFI/UKI).
 {{- /* rio-nvme: instanceStorePolicy: RAID0 set so Karpenter's bin-pack
        sim sees the NVMe capacity (else only EBS root → 50Gi+ ephemeral
        requests look unschedulable at provisioning time). nodeadm does
@@ -160,16 +161,14 @@ spec:
       {{- end }}
       requirements:
         {{- toYaml .requirements | nindent 8 }}
-        # I-205 template-side guard: any pool NOT on rio-metal gets the
-        # metal exclusion; rio-metal gets the In side. Both reference
-        # `$.Values.karpenter.metalSizes` — single source, structural
-        # partition. Don't open-code instance-size in `requirements:`.
+        # I-205 template-side guard: every static NodePool gets the
+        # metal exclusion. §13c: there is no static metal NodePool —
+        # `metal-*` hwClasses get the `In` side from §13b
+        # `cover::build_nodeclaim`. Single source `$.Values.karpenter.
+        # metalSizes` (also `controller.toml metal_sizes`). Don't
+        # open-code instance-size in `requirements:`.
         - key: karpenter.k8s.aws/instance-size
-        {{- if eq (.nodeClass | default "rio-default") "rio-metal" }}
-          operator: In
-        {{- else }}
           operator: NotIn
-        {{- end }}
           values: {{ toJson $k.metalSizes }}
   limits:
     cpu: {{ .limits.cpu }}
@@ -178,7 +177,7 @@ spec:
     # node with a worker pod on it even if underutilized. 10m default:
     # ephemeral builds arrive in bursts; a node provisioned for one
     # stays warm for the next, avoiding ~90s cold-start churn per
-    # build. Metal pools override shorter (expensive idle).
+    # build.
     consolidationPolicy: WhenEmpty
     consolidateAfter: {{ .consolidateAfter | default "10m" }}
     {{- with .budgets }}

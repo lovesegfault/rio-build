@@ -232,6 +232,25 @@ data:
     node_class = {{ required (printf "scheduler.sla.hwClasses.%s.nodeClass is mandatory (rio-default / rio-nvme / rio-metal)" $h) $def.nodeClass | quote }}
     max_cores = {{ $def.maxCores | default $.Values.scheduler.sla.maxCores | int64 }}
     max_mem = {{ $def.maxMem | default $.Values.scheduler.sla.maxMem | int64 }}
+    {{- /* §13c: only emit when set — serde defaults are already
+           [Spot, Od] / [] / None; the helm/15 check covers the
+           required (non-default) keys. */}}
+    {{- with $def.taints }}
+    taints = [
+      {{- range . }}
+      { key = {{ .key | quote }}, value = {{ .value | quote }}, effect = {{ .effect | quote }} },
+      {{- end }}
+    ]
+    {{- end }}
+    {{- with $def.providesFeatures }}
+    provides_features = {{ toJson . }}
+    {{- end }}
+    {{- with $def.maxFleetCores }}
+    max_fleet_cores = {{ int64 . }}
+    {{- end }}
+    {{- with $def.capacityTypes }}
+    capacity_types = {{ toJson . }}
+    {{- end }}
     {{- end }}
 
     [sla.probe]
