@@ -812,6 +812,22 @@ impl DagActor {
     ) -> (crate::sla::hw::HwTable, crate::sla::cost::CostTable, u64) {
         let hw = self.sla_estimator.hw_table();
         let cost = self.cost_table.read().clone();
+        // §13c-2 r[impl scheduler.sla.ceiling.uncatalogued-fallback]:
+        // per-tick gauge — 1 for any class without a boot-derived
+        // catalog ceiling (Static cost source, fetch failure, or
+        // requirements that match 0 types). Such a class falls to the
+        // global ceiling. Emitted here (the per-tick boundary) so it
+        // tracks the live `cost.catalog_ceilings()` snapshot the solve
+        // reads, including across `carry_catalog` lease-acquire
+        // reloads.
+        for h in self.sla_config.hw_classes.keys() {
+            let v = u8::from(!cost.catalog_ceilings().contains_key(h));
+            ::metrics::gauge!(
+                "rio_scheduler_sla_class_ceiling_uncatalogued",
+                "hw_class" => h.clone()
+            )
+            .set(v);
+        }
         let inputs_gen = crate::sla::solve::SolveInputs {
             hw: &hw,
             cost: &cost,
@@ -1209,7 +1225,9 @@ impl DagActor {
                                 .iter()
                                 .filter(|c| c.cell.1 == cap)
                                 .filter(|c| {
-                                    let (cc, cm) = self.sla_config.class_ceilings(&c.cell.0);
+                                    let (cc, cm) = self
+                                        .sla_config
+                                        .class_ceilings(&c.cell.0, cost.catalog_ceilings());
                                     memo.a.c_star <= cc && memo.a.mem_bytes <= cm
                                 })
                                 .map(|c| c.cell.clone())
@@ -1318,6 +1336,7 @@ impl DagActor {
                         c,
                         m.max(state.sched.resource_floor.mem_bytes),
                         &state.required_features,
+                        cost.catalog_ceilings(),
                     ) {
                         Some(h) => solve::cells_to_selector_terms(
                             &[(h.to_owned(), cap)],
@@ -1363,6 +1382,7 @@ impl DagActor {
             cores,
             mem,
             &state.required_features,
+            cost.catalog_ceilings(),
         );
         // D7: deadline_secs. Fitted ⇒ `wall_p99 × 5` (p99 of the
         // log-normal `T(c)·exp(ε)` at the chosen cores, no retry tail

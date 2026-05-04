@@ -138,6 +138,13 @@ pub struct AdminServiceImpl {
     /// compromised builder could forge `interrupt_samples` to bias
     /// λ\[h\] or drain arbitrary executors. See `r[sec.authz.service-token]`.
     service_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
+    /// §13c-2: the same `Arc<RwLock<CostTable>>` `main.rs` shares with
+    /// the actor + cost pollers. `GetHwClassConfig` reads
+    /// `catalog_ceilings()` to fold `min(catalog, cfg)` before
+    /// serialize. Held directly (not via `query_actor`) so the RPC stays
+    /// actor-independent — a wedged actor doesn't block the controller's
+    /// 300s `HwClassConfig` refresh.
+    cost_table: Arc<parking_lot::RwLock<crate::sla::cost::CostTable>>,
 }
 
 impl AdminServiceImpl {
@@ -154,6 +161,7 @@ impl AdminServiceImpl {
         cluster: String,
         sla_config: Arc<crate::sla::config::SlaConfig>,
         service_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
+        cost_table: Arc<parking_lot::RwLock<crate::sla::cost::CostTable>>,
     ) -> Self {
         Self {
             log_buffers,
@@ -168,6 +176,7 @@ impl AdminServiceImpl {
             cluster,
             sla_config,
             service_verifier,
+            cost_table,
         }
     }
 
@@ -810,8 +819,20 @@ impl AdminService for AdminServiceImpl {
                         labels,
                         requirements,
                         node_class: def.node_class.clone(),
-                        max_cores: def.max_cores,
-                        max_mem: def.max_mem,
+                        // §13c-2 r[impl scheduler.sla.ceiling.controller-mirror]:
+                        // ship `min(catalog, cfg)` with each falling to
+                        // global. Wire stays nonzero (`validate()` rejects
+                        // global=0 and `Some(0)` overrides; catalog
+                        // ceilings are real instance shapes); the
+                        // controller's `ceilings_for` `>0` filter survives.
+                        max_cores: self
+                            .sla_config
+                            .class_ceilings(h, self.cost_table.read().catalog_ceilings())
+                            .0,
+                        max_mem: self
+                            .sla_config
+                            .class_ceilings(h, self.cost_table.read().catalog_ceilings())
+                            .1,
                         taints,
                         provides_features: def.provides_features.clone(),
                         max_fleet_cores: def.max_fleet_cores,

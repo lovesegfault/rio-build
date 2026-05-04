@@ -209,6 +209,11 @@ data:
     {{- end }}
     reference_hw_class = {{ required "scheduler.sla.referenceHwClass is mandatory (ADR-023 §13a)" .referenceHwClass | quote }}
     hw_cost_source = {{ required "scheduler.sla.hwCostSource is mandatory (ADR-023 §13a)" .hwCostSource | quote }}
+    {{- /* §13c-2: same metal partition list cover.rs reads via
+           controller.toml [nodeclaim_pool] metal_sizes. The scheduler
+           uses it to mirror cover's `instance-size {In|NotIn}` predicate
+           when deriving per-class catalog ceilings at boot. */}}
+    metal_sizes = {{ toJson $.Values.karpenter.metalSizes }}
     {{- with .leadTimeSeed }}
 
     [sla.lead_time_seed]
@@ -230,8 +235,17 @@ data:
       {{- end }}
     ]
     node_class = {{ required (printf "scheduler.sla.hwClasses.%s.nodeClass is mandatory (rio-default / rio-nvme / rio-metal)" $h) $def.nodeClass | quote }}
-    max_cores = {{ $def.maxCores | default $.Values.scheduler.sla.maxCores | int64 }}
-    max_mem = {{ $def.maxMem | default $.Values.scheduler.sla.maxMem | int64 }}
+    {{- /* §13c-2: per-class ceilings are an OPTIONAL operator override
+           on the boot-derived catalog ceiling. Emit only when explicitly
+           set — `with` skips on nil AND zero, so a YAML `maxCores: 0`
+           never reaches serde as `Some(0)` (which validate() rejects).
+           Unset → serde `None` → falls to catalog/global. */}}
+    {{- with $def.maxCores }}
+    max_cores = {{ int64 . }}
+    {{- end }}
+    {{- with $def.maxMem }}
+    max_mem = {{ int64 . }}
+    {{- end }}
     {{- /* §13c: only emit when set — serde defaults are already
            [Spot, Od] / [] / None; the helm/15 check covers the
            required (non-default) keys. */}}

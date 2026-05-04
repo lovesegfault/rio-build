@@ -892,8 +892,8 @@ pub(crate) fn test_hw_sla_config() -> crate::sla::config::SlaConfig {
                     key: "rio.build/hw-class".into(),
                     value: h.into(),
                 }],
-                max_cores: cfg.max_cores as u32,
-                max_mem: cfg.max_mem,
+                max_cores: Some(cfg.max_cores as u32),
+                max_mem: Some(cfg.max_mem),
                 ..Default::default()
             },
         );

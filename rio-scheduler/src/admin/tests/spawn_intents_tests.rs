@@ -33,6 +33,7 @@ async fn test_get_spawn_intents_reports_ready() -> anyhow::Result<()> {
         String::new(),
         Arc::new(crate::sla::config::SlaConfig::test_default()),
         None,
+        Arc::default(),
     );
 
     let mut fod = make_node("fod-a");
@@ -107,6 +108,7 @@ async fn test_mint_executor_tokens_signs_per_intent() -> anyhow::Result<()> {
         // covered by `read_path_rpcs_require_service_token`; this test
         // exercises the actor-side mint.
         None,
+        Arc::default(),
     );
 
     let mut fod = make_node("fod-a");

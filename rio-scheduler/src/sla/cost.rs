@@ -269,6 +269,14 @@ pub struct CostTable {
     /// site rather than relying on the absence of
     /// [`spot_price_poller`] (bug_034).
     source: HwCostSource,
+    /// §13c-2: per-hwClass `(max_cores, max_mem)` derived once at boot
+    /// from `describe_instance_types` ∩ `requirements`. NOT persisted
+    /// — process-lifetime, re-derived each restart so a `requirements`
+    /// edit takes effect on the next rollout. NOT touched by
+    /// [`Self::load`] (PG has no row); `poller_tick_prelude` carries
+    /// it across the lease-acquire reload via [`Self::carry_catalog`].
+    /// Empty under [`HwCostSource::Static`] (no AWS API).
+    catalog_ceilings: super::catalog::CatalogCeilings,
 }
 
 impl CostTable {
@@ -305,6 +313,29 @@ impl CostTable {
     /// before Part-B menu population.
     pub fn menu(&self, cell: &Cell) -> &[InstanceType] {
         self.cells.get(cell).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// §13c-2: per-hwClass catalog ceilings (`derive_ceilings` output).
+    /// Empty until `main.rs` boot fetch (Spot only). Threaded into
+    /// `class_ceilings()` via the per-tick `solve_inputs()` snapshot.
+    pub fn catalog_ceilings(&self) -> &super::catalog::CatalogCeilings {
+        &self.catalog_ceilings
+    }
+
+    /// §13c-2: write the boot-derived catalog ceilings. Called once
+    /// from `main.rs` after `fetch_catalog` + `derive_ceilings`.
+    pub fn set_catalog_ceilings(&mut self, c: super::catalog::CatalogCeilings) {
+        self.catalog_ceilings = c;
+    }
+
+    /// §13c-2: replace `self` with `fresh` while preserving the
+    /// process-lifetime `catalog_ceilings` (not in PG, not re-derived
+    /// on lease-acquire). Used by `poller_tick_prelude`'s
+    /// edge-reload — `*cost.write() = fresh` would otherwise wipe the
+    /// boot-derived catalog.
+    pub fn carry_catalog(&mut self, mut fresh: Self) {
+        fresh.catalog_ceilings = std::mem::take(&mut self.catalog_ceilings);
+        *self = fresh;
     }
 
     /// Cheapest hw_class by `(h, Spot)` price. For the ε_h `A=H`
@@ -422,10 +453,23 @@ impl CostTable {
         // `self.cells` deliberately NOT hashed: the autodiscovered menu
         // feeds `poll_spot_once` only and does not affect
         // `evaluate_cell` output (per-class capacity is
-        // `HwClassDef.max_{cores,mem}`, configured). Hashing it would
-        // bump `inputs_gen` on every controller-observed type and
-        // invalidate every key's solve memo for no solve-relevant
-        // change.
+        // `class_ceilings()` = `min(catalog_ceilings, HwClassDef.max_*)`).
+        // Hashing it would bump `inputs_gen` on every controller-
+        // observed type and invalidate every key's solve memo for no
+        // solve-relevant change.
+        //
+        // §13c-2: `catalog_ceilings` IS hashed — it feeds
+        // `class_ceilings()` → `evaluate_cell`'s `ClassCeiling` gate.
+        // It changes only at boot (and `carry_catalog` preserves it
+        // across lease-acquire), so this term costs nothing in the
+        // common case but catches a `carry_catalog` regression that
+        // would silently wipe the per-class bound.
+        let mut cat: Vec<_> = self.catalog_ceilings.iter().collect();
+        cat.sort();
+        for (k, v) in cat {
+            k.hash(&mut h);
+            v.hash(&mut h);
+        }
         h.finish()
     }
 
@@ -1163,7 +1207,11 @@ pub(crate) async fn poller_tick_prelude(
         };
         match CostTable::load(db, &cluster, source).await {
             Ok(fresh) => {
-                *cost.write() = fresh;
+                // §13c-2: carry the boot-derived catalog forward.
+                // `CostTable::load` doesn't touch it (not in PG); a
+                // bare `*cost.write() = fresh` would wipe it and every
+                // class would fall to global until the next restart.
+                cost.write().carry_catalog(fresh);
                 was_leader.store(true, Ordering::Relaxed);
             }
             Err(e) => {

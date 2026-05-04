@@ -112,6 +112,17 @@ pub fn describe_all() {
          tenant is exhausting the fit-cache cap; check for \
          random-pname submissions (`r[sched.sla.threat.corpus-clamp]`)."
     );
+    describe_gauge!(
+        "rio_scheduler_sla_class_ceiling_uncatalogued",
+        "§13c-2: 1 per hwClass with NO boot-derived catalog ceiling \
+         (labeled `hw_class`). Always 1 for every class under \
+         `hwCostSource: static` (no AWS API, expected). Under `spot` a \
+         persistent 1 ⇒ `describe_instance_types` failed at boot \
+         (check IRSA), or the class's `requirements` match 0 types in \
+         the deployment region (operator typo / AWS deprecation). \
+         Class falls to the global ceiling — over-permits, never \
+         over-strips."
+    );
 }
 
 /// Actual-vs-predicted score for one completion. Pure so the
@@ -322,6 +333,7 @@ pub const SLA_METRICS: &[&str] = &[
     "rio_scheduler_sla_hw_cost_fallback_total",
     "rio_scheduler_sla_als_round_cap_hit_total",
     "rio_scheduler_sla_keys_evicted_total",
+    "rio_scheduler_sla_class_ceiling_uncatalogued",
 ];
 
 /// Metrics with a closed-domain label whose VALUES are each a separate

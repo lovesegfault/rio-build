@@ -1480,7 +1480,7 @@ async fn contract_h_explore_schmitt_across_ice_mask() {
     // ClassCeiling for any (c*≥1, mem≥1). The observed-menu sample no
     // longer gates capacity (bug_033). `solve_intent_for` reads
     // `actor.sla_config` live.
-    actor.sla_config.hw_classes.get_mut(&h_exp).unwrap().max_mem = 1;
+    actor.sla_config.hw_classes.get_mut(&h_exp).unwrap().max_mem = Some(1);
     let state = actor.dag.node("d-schmitt-ice").unwrap();
     set_ratio(&actor, 1.14);
     let (hw, cost, g4) = actor.solve_inputs();
@@ -1511,7 +1511,7 @@ async fn contract_h_explore_schmitt_across_ice_mask() {
     // ── poll 6: restore; od/spot=1.16 (deadband) → 2 terms ───────────
     // Regression guard for the BestEffort `Miss` arm: singleton →
     // preserve prev_a={spot,od} from poll 4; clear → od τ_enter → 1.
-    actor.sla_config.hw_classes.get_mut(&h_exp).unwrap().max_mem = 256 << 30;
+    actor.sla_config.hw_classes.get_mut(&h_exp).unwrap().max_mem = Some(256 << 30);
     let state = actor.dag.node("d-schmitt-ice").unwrap();
     set_ratio(&actor, 1.16);
     let (hw, cost, g5) = actor.solve_inputs();
@@ -1737,8 +1737,8 @@ async fn contract_pinned_explore_covers_pool() {
                 key: "rio.build/hw-class".into(),
                 value: "intel-9".into(),
             }],
-            max_cores: actor.sla_config.max_cores as u32,
-            max_mem: actor.sla_config.max_mem,
+            max_cores: Some(actor.sla_config.max_cores as u32),
+            max_mem: Some(actor.sla_config.max_mem),
             ..Default::default()
         },
     );
@@ -2009,7 +2009,7 @@ async fn contract_interrupt_runaway_reachable() {
         );
     }
     for h in ["intel-6", "intel-7", "intel-8"] {
-        actor.sla_config.hw_classes.get_mut(h).unwrap().max_mem = 1;
+        actor.sla_config.hw_classes.get_mut(h).unwrap().max_mem = Some(1);
     }
     actor.test_inject_ready("d-runaway", Some("test-pkg"), "x86_64-linux", false);
 
@@ -2300,7 +2300,7 @@ async fn contract_hw_cost_unknown_once_per_epoch() {
         .hw_classes
         .get_mut("intel-8")
         .unwrap()
-        .max_mem = 1 << 30;
+        .max_mem = Some(1 << 30);
     actor.test_inject_ready("d-nofit", Some("test-pkg"), "x86_64-linux", false);
     let state = actor.dag.node("d-nofit").unwrap();
 
@@ -2342,7 +2342,7 @@ async fn contract_bypass_capacity_oversized_cores_emits_hosting_class() {
         .hw_classes
         .get_mut("intel-6")
         .unwrap()
-        .max_cores = 32;
+        .max_cores = Some(32);
     assert_eq!(
         actor.sla_ceilings.max_cores as u32, 64,
         "fixture: global=64"
@@ -2399,7 +2399,7 @@ async fn contract_bypass_capacity_oversized_no_class_hosts_emits_empty() {
     // Every class capped at 32; global at 64. `--cores=48` fits global,
     // fits NO per-class.
     for d in actor.sla_config.hw_classes.values_mut() {
-        d.max_cores = 32;
+        d.max_cores = Some(32);
     }
 
     actor.test_inject_ready("d-huge", Some("test-pkg"), "x86_64-linux", false);
@@ -2445,7 +2445,7 @@ async fn contract_chokepoint_preserves_term_name_alignment() {
         .hw_classes
         .get_mut("intel-6")
         .unwrap()
-        .max_cores = 32;
+        .max_cores = Some(32);
 
     actor.test_inject_ready("d-align", Some("test-pkg"), "x86_64-linux", false);
     actor
@@ -2474,7 +2474,7 @@ async fn contract_chokepoint_preserves_term_name_alignment() {
             &hw_label.values[0], name,
             "term/name misaligned post-chokepoint — zip would reconstruct wrong cells"
         );
-        let (cc, _) = actor.sla_config.class_ceilings(name);
+        let (cc, _) = actor.sla_config.class_ceilings(name, &Default::default());
         assert!(
             intent.cores <= cc,
             "every surviving class must host cores={}; {name}.max_cores={cc}",
@@ -2505,8 +2505,8 @@ async fn contract_kvm_routes_via_provides_features() {
                 value: "metal-x86".into(),
             }],
             node_class: "rio-metal".into(),
-            max_cores: actor.sla_config.max_cores as u32,
-            max_mem: actor.sla_config.max_mem,
+            max_cores: Some(actor.sla_config.max_cores as u32),
+            max_mem: Some(actor.sla_config.max_mem),
             provides_features: vec!["kvm".into()],
             ..Default::default()
         },

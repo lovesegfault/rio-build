@@ -104,6 +104,7 @@ pub async fn check_reference_epoch(
 
 pub mod alpha;
 pub mod bootstrap;
+pub mod catalog;
 pub mod config;
 pub mod cost;
 pub mod dip;

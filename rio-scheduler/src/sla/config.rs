@@ -40,18 +40,16 @@ pub struct HwClassDef {
     /// volume.
     #[serde(default)]
     pub node_class: String,
-    /// Per-class capacity ceiling for `evaluate_cell`'s
-    /// `ClassCeiling` gate — the configured catalog of what this
-    /// hw-class's `requirements` *permit* Karpenter to launch, as
-    /// distinct from `CostTable.cells` (what it has *observed*
-    /// launching, which is a self-reinforcing sample). A `c*` above
-    /// this is rejected for THIS class only; the global `[sla].maxCores`
-    /// is the union ceiling. `0` rejected by `validate()`.
-    #[serde(default)]
-    pub max_cores: u32,
-    /// Per-class memory ceiling — see [`Self::max_cores`].
-    #[serde(default)]
-    pub max_mem: u64,
+    /// §13c-2: optional **operator-tightening** override on the
+    /// per-class capacity ceiling. The *catalog* ceiling (largest real
+    /// instance type matching this class's `requirements`, derived at
+    /// boot via `describe_instance_types`) is the physical bound; this
+    /// can only TIGHTEN below it. `None` (the default) → catalog wins;
+    /// catalog absent (static cost source) → falls to `[sla].maxCores`.
+    /// `Some(0)` rejected by `validate()`; `None` falls to global.
+    pub max_cores: Option<u32>,
+    /// Per-class memory ceiling override — see [`Self::max_cores`].
+    pub max_mem: Option<u64>,
     /// Node taints applied to NodeClaims targeting this hw-class
     /// (chained after the universal `rio.build/builder` taint).
     /// `r[ctrl.nodeclaim.taints.hwclass]`: e.g. metal classes carry
@@ -99,8 +97,8 @@ impl Default for HwClassDef {
             labels: Vec::new(),
             requirements: Vec::new(),
             node_class: String::new(),
-            max_cores: 0,
-            max_mem: 0,
+            max_cores: None,
+            max_mem: None,
             taints: Vec::new(),
             provides_features: Vec::new(),
             max_fleet_cores: None,
@@ -340,6 +338,16 @@ pub struct SlaConfig {
     /// `DEFAULT ''` so greenfield deploys need no config.
     #[serde(default)]
     pub cluster: String,
+    /// §13c-2: AWS bare-metal `instance-size` suffixes, used by
+    /// [`super::catalog::derive_ceilings`] to synthesize the
+    /// `instance-size {In|NotIn}` partition the controller's
+    /// `cover::build_nodeclaim` applies (`nodeClass == rio-metal` →
+    /// `In`, else `NotIn`). MUST match `karpenter.metalSizes` /
+    /// `controller.toml [nodeclaim_pool] metal_sizes` — helm renders
+    /// all three from the one `karpenter.metalSizes` value. Empty →
+    /// no partition (vmtest, single-pool clusters).
+    #[serde(default)]
+    pub metal_sizes: Vec<String>,
 }
 
 fn default_hw_cost_tolerance() -> f64 {
@@ -475,14 +483,33 @@ impl SlaConfig {
     /// Disk has no per-class ceiling (global-only via `SlaCeilings`);
     /// the chokepoint filters cores+mem only by design.
     ///
+    /// §13c-2: each axis is `min(catalog, cfg)` with each falling to
+    /// the global ceiling when absent. The catalog ceiling is the
+    /// largest real instance type matching this class's `requirements`
+    /// (derived at boot from `describe_instance_types`,
+    /// [`super::catalog::derive_ceilings`]); the cfg override can only
+    /// *tighten* (`validate()` enforces `0 < n ≤ global`). Empty
+    /// `catalog` (static cost source / fetch failure) → global. The
+    /// global `as u32` cast is safe — `validate()` bounds
+    /// `0 < max_cores < 1024`.
+    ///
     /// §Partition-single-source: every scheduler-side per-class ceiling
     /// check (`solve_full`, [`Self::reference_hw_class_for_system`],
     /// the `all_candidates` capacity-fallback, the post-finalize
     /// chokepoint [`Self::retain_hosting_classes`]) calls THIS.
-    pub fn class_ceilings(&self, h: &str) -> (u32, u64) {
-        self.hw_classes
-            .get(h)
-            .map_or((u32::MAX, u64::MAX), |d| (d.max_cores, d.max_mem))
+    // r[impl scheduler.sla.ceiling.uncatalogued-fallback]
+    // r[impl scheduler.sla.ceiling.config-tightens-only]
+    pub fn class_ceilings(&self, h: &str, catalog: &super::catalog::CatalogCeilings) -> (u32, u64) {
+        let Some(d) = self.hw_classes.get(h) else {
+            return (u32::MAX, u64::MAX);
+        };
+        let global = (self.max_cores as u32, self.max_mem);
+        let cat = catalog.get(h).copied().unwrap_or(global);
+        let cfg = (
+            d.max_cores.unwrap_or(global.0),
+            d.max_mem.unwrap_or(global.1),
+        );
+        (cat.0.min(cfg.0), cat.1.min(cfg.1))
     }
 
     /// `reference_hw_class` if its `kubernetes.io/arch` label matches
@@ -500,6 +527,7 @@ impl SlaConfig {
         cores: u32,
         mem: u64,
         features: &[String],
+        catalog: &super::catalog::CatalogCeilings,
     ) -> Option<&str> {
         let arch = rio_common::k8s::system_to_k8s_arch(system)?;
         let matches = |h: &str| {
@@ -510,7 +538,7 @@ impl SlaConfig {
                     .is_none_or(|l| l.value == arch)
                     && features_compatible(features, &d.provides_features)
             }) && {
-                let (cc, cm) = self.class_ceilings(h);
+                let (cc, cm) = self.class_ceilings(h, catalog);
                 cores <= cc && mem <= cm
             }
         };
@@ -539,12 +567,13 @@ impl SlaConfig {
         cores: u32,
         mem: u64,
         required_features: &[String],
+        catalog: &super::catalog::CatalogCeilings,
     ) -> (Vec<rio_proto::types::NodeSelectorTerm>, Vec<String>) {
         terms
             .into_iter()
             .zip(names)
             .filter(|(_, h)| {
-                let (cc, cm) = self.class_ceilings(h);
+                let (cc, cm) = self.class_ceilings(h, catalog);
                 // §13c D10: FULL bidirectional features_compatible (NOT
                 // half-predicate `provides⊄required` — that misses
                 // `required=[kvm], provides=[]` because ∅⊆anything).
@@ -622,8 +651,8 @@ impl SlaConfig {
                         values: vec!["linux".into()],
                     }],
                     node_class: "rio-default".into(),
-                    max_cores: 16,
-                    max_mem: 2 << 30,
+                    max_cores: Some(16),
+                    max_mem: Some(2 << 30),
                     taints: vec![],
                     provides_features: vec![],
                     max_fleet_cores: None,
@@ -644,6 +673,7 @@ impl SlaConfig {
             consolidate_explore_epsilon: default_consolidate_explore_epsilon(),
             max_node_claims_per_cell_per_tick: default_max_node_claims_per_cell_per_tick(),
             cluster: String::new(),
+            metal_sizes: Vec::new(),
         }
     }
 
@@ -714,18 +744,27 @@ impl SlaConfig {
                 "sla.hwClasses[{h}].node_class must name an EC2NodeClass \
                  (rio-default / rio-nvme / rio-metal)"
             );
-            anyhow::ensure!(
-                def.max_cores > 0 && f64::from(def.max_cores) <= self.max_cores,
-                "sla.hwClasses[{h}].max_cores must be in [1, sla.maxCores={}], got {}",
-                self.max_cores,
-                def.max_cores
-            );
-            anyhow::ensure!(
-                def.max_mem > 0 && def.max_mem <= self.max_mem,
-                "sla.hwClasses[{h}].max_mem must be in [1, sla.maxMem={}], got {}",
-                self.max_mem,
-                def.max_mem
-            );
+            // §13c-2 r[impl scheduler.sla.ceiling.config-tightens-only]:
+            // a per-class ceiling is an OPTIONAL tightening override —
+            // unset → fall to catalog/global; set → must be ∈ (0, global].
+            if let Some(n) = def.max_cores {
+                anyhow::ensure!(
+                    n > 0 && f64::from(n) <= self.max_cores,
+                    "sla.hwClasses[{h}].max_cores={n} not in [1, sla.maxCores={}]; \
+                     remove the per-class override (the boot-time catalog derives \
+                     the physical ceiling) or raise sla.maxCores",
+                    self.max_cores
+                );
+            }
+            if let Some(n) = def.max_mem {
+                anyhow::ensure!(
+                    n > 0 && n <= self.max_mem,
+                    "sla.hwClasses[{h}].max_mem={n} not in [1, sla.maxMem={}]; \
+                     remove the per-class override (the boot-time catalog derives \
+                     the physical ceiling) or raise sla.maxMem",
+                    self.max_mem
+                );
+            }
             anyhow::ensure!(
                 !def.capacity_types.is_empty(),
                 "sla.hwClasses[{h}].capacity_types must be non-empty \
@@ -822,8 +861,8 @@ mod tests {
             }],
             requirements: test_req(),
             node_class: "rio-default".into(),
-            max_cores: 64,
-            max_mem: 256 << 30,
+            max_cores: Some(64),
+            max_mem: Some(256 << 30),
             taints: vec![],
             provides_features: vec![],
             max_fleet_cores: None,
@@ -1209,13 +1248,25 @@ mod tests {
             "{err}"
         );
 
-        // Per-class ceilings: 0 rejected; > global rejected; = global ok.
+        // §13c-2 r[verify scheduler.sla.ceiling.config-tightens-only]:
+        // per-class ceilings are an OPTIONAL tightening override.
+        // Some(0) and Some(>global) rejected; None always OK; Some(=global)
+        // OK. The error message names the fix (`xtask` doesn't apply here
+        // post-redirect — the catalog is boot-derived, so the fix is
+        // "remove the override or raise global").
         for (mc, mm, expect) in [
-            (0, 1, Some("max_cores must be in [1")),
-            (64, 0, Some("max_mem must be in [1")),
-            (65, 1, Some("max_cores must be in [1, sla.maxCores=64]")),
-            (64, (256u64 << 30) + 1, Some("max_mem must be in [1")),
-            (64, 256 << 30, None),
+            (Some(0u32), Some(1u64), Some("max_cores=0 not in [1")),
+            (Some(64), Some(0), Some("max_mem=0 not in [1")),
+            (
+                Some(65),
+                Some(1),
+                Some("max_cores=65 not in [1, sla.maxCores=64]"),
+            ),
+            (Some(64), Some((256u64 << 30) + 1), Some("max_mem=")),
+            (Some(64), Some(256 << 30), None),
+            (None, None, None),
+            (None, Some(256 << 30), None),
+            (Some(64), None, None),
         ] {
             let mut cfg = base();
             let def = cfg.hw_classes.get_mut("test-hw").unwrap();
@@ -1223,10 +1274,10 @@ mod tests {
             def.max_mem = mm;
             match (expect, cfg.validate()) {
                 (Some(want), Err(e)) => {
-                    assert!(e.to_string().contains(want), "({mc},{mm}): {e}")
+                    assert!(e.to_string().contains(want), "({mc:?},{mm:?}): {e}")
                 }
                 (None, Ok(())) => {}
-                (e, r) => panic!("({mc},{mm}): expect {e:?}, got {r:?}"),
+                (e, r) => panic!("({mc:?},{mm:?}): expect {e:?}, got {r:?}"),
             }
         }
     }
@@ -1290,6 +1341,7 @@ mod tests {
             "consolidate_explore_epsilon",
             "max_node_claims_per_cell_per_tick",
             "cluster",
+            "metal_sizes",
         ];
         // Intentionally NOT helm-rendered (with rationale). Adding a
         // field here requires justifying why operators never set it.
@@ -1349,24 +1401,24 @@ mod tests {
         cfg.reference_hw_class = "mid-x86".into();
         // x86_64 → reference matches.
         assert_eq!(
-            cfg.reference_hw_class_for_system("x86_64-linux", 1, 0, &[]),
+            cfg.reference_hw_class_for_system("x86_64-linux", 1, 0, &[], &Default::default()),
             Some("mid-x86")
         );
         // aarch64 → reference is amd64, fall through to first arch-match
         // (sorted: agnostic has no arch label → matches anything).
         assert_eq!(
-            cfg.reference_hw_class_for_system("aarch64-linux", 1, 0, &[]),
+            cfg.reference_hw_class_for_system("aarch64-linux", 1, 0, &[], &Default::default()),
             Some("agnostic")
         );
         // Drop agnostic → mid-arm wins.
         cfg.hw_classes.remove("agnostic");
         assert_eq!(
-            cfg.reference_hw_class_for_system("aarch64-linux", 1, 0, &[]),
+            cfg.reference_hw_class_for_system("aarch64-linux", 1, 0, &[], &Default::default()),
             Some("mid-arm")
         );
         // Unmappable system → None.
         assert_eq!(
-            cfg.reference_hw_class_for_system("riscv64-linux", 1, 0, &[]),
+            cfg.reference_hw_class_for_system("riscv64-linux", 1, 0, &[], &Default::default()),
             None
         );
     }
@@ -1389,18 +1441,18 @@ mod tests {
         let kvm = vec!["kvm".to_string()];
         // kvm intent → metal-x86 (only class with provides=[kvm]).
         assert_eq!(
-            cfg.reference_hw_class_for_system("x86_64-linux", 1, 0, &kvm),
+            cfg.reference_hw_class_for_system("x86_64-linux", 1, 0, &kvm, &Default::default()),
             Some("metal-x86")
         );
         // non-kvm intent → std-x86; metal must NOT be picked
         // (∅-guard: required=[], provides=[kvm] → incompatible).
         assert_eq!(
-            cfg.reference_hw_class_for_system("x86_64-linux", 1, 0, &[]),
+            cfg.reference_hw_class_for_system("x86_64-linux", 1, 0, &[], &Default::default()),
             Some("std-x86")
         );
         // No metal class for arm + kvm intent → None.
         assert_eq!(
-            cfg.reference_hw_class_for_system("aarch64-linux", 1, 0, &kvm),
+            cfg.reference_hw_class_for_system("aarch64-linux", 1, 0, &kvm, &Default::default()),
             None
         );
     }
@@ -1427,6 +1479,7 @@ mod tests {
                 values: vec![v.into()],
             }],
         };
+        let cat = super::super::catalog::CatalogCeilings::new();
         let kvm = vec!["kvm".to_string()];
         // kvm intent: std-x86 (provides=[]) MUST be stripped; metal kept.
         let (_, names) = cfg.retain_hosting_classes(
@@ -1435,6 +1488,7 @@ mod tests {
             1,
             0,
             &kvm,
+            &cat,
         );
         assert_eq!(names, vec!["metal-x86"], "std-x86 stripped for kvm intent");
         // non-kvm intent: metal-x86 (provides=[kvm]) MUST be stripped.
@@ -1444,6 +1498,7 @@ mod tests {
             1,
             0,
             &[],
+            &cat,
         );
         assert_eq!(
             names,
@@ -1458,32 +1513,35 @@ mod tests {
     /// reference whose `max_cores=32`.
     #[test]
     fn reference_hw_class_for_system_size_filters() {
+        let cat = super::super::catalog::CatalogCeilings::new();
         let mut cfg = base();
+        // global cap 256/256GiB so the per-class Some(128) isn't masked.
+        cfg.max_cores = 256.0;
         let mut mid = test_def(ARCH_LABEL, "amd64");
-        mid.max_cores = 32;
+        mid.max_cores = Some(32);
         let mut hi = test_def(ARCH_LABEL, "amd64");
-        hi.max_cores = 128;
+        hi.max_cores = Some(128);
         cfg.hw_classes = HashMap::from([("mid".into(), mid), ("hi".into(), hi)]);
         cfg.reference_hw_class = "mid".into();
         // 48 > mid.max_cores=32 → fall through to hi (128 ≥ 48).
         assert_eq!(
-            cfg.reference_hw_class_for_system("x86_64-linux", 48, 0, &[]),
+            cfg.reference_hw_class_for_system("x86_64-linux", 48, 0, &[], &cat),
             Some("hi"),
             "mid.max_cores=32 cannot host 48; must pick hi"
         );
         // 16 ≤ 32 → reference still wins.
         assert_eq!(
-            cfg.reference_hw_class_for_system("x86_64-linux", 16, 0, &[]),
+            cfg.reference_hw_class_for_system("x86_64-linux", 16, 0, &[], &cat),
             Some("mid")
         );
-        // 256 > every class → None (controller no_hosting_class).
+        // 200 > every class → None (controller no_hosting_class).
         assert_eq!(
-            cfg.reference_hw_class_for_system("x86_64-linux", 256, 0, &[]),
+            cfg.reference_hw_class_for_system("x86_64-linux", 200, 0, &[], &cat),
             None
         );
         // mem dimension: hi.max_mem = test_def's 256GiB.
         assert_eq!(
-            cfg.reference_hw_class_for_system("x86_64-linux", 1, 512 << 30, &[]),
+            cfg.reference_hw_class_for_system("x86_64-linux", 1, 512 << 30, &[], &cat),
             None,
             "no class hosts 512GiB mem"
         );
@@ -1495,11 +1553,13 @@ mod tests {
     /// names stay parallel (lockstep zip).
     #[test]
     fn retain_hosting_classes_filters_any_producer_leak() {
+        let cat = super::super::catalog::CatalogCeilings::new();
         let mut cfg = base();
+        cfg.max_cores = 256.0;
         let mut mid = test_def("rio.build/hw-class", "mid");
-        mid.max_cores = 32;
+        mid.max_cores = Some(32);
         let mut hi = test_def("rio.build/hw-class", "hi");
-        hi.max_cores = 128;
+        hi.max_cores = Some(128);
         cfg.hw_classes = HashMap::from([("mid".into(), mid), ("hi".into(), hi)]);
         let term = |v: &str| rio_proto::types::NodeSelectorTerm {
             match_expressions: vec![rio_proto::types::NodeSelectorRequirement {
@@ -1515,6 +1575,7 @@ mod tests {
             48,
             0,
             &[],
+            &cat,
         );
         assert_eq!(names, vec!["hi"], "mid (max_cores=32) stripped at 48");
         assert_eq!(terms.len(), 1, "terms parallel to names");
@@ -1526,12 +1587,59 @@ mod tests {
             999,
             u64::MAX,
             &[],
+            &cat,
         );
         assert_eq!(names, vec!["ghost"], "unknown class = no per-class ceiling");
         // All stripped → both empty (controller fallback_cell path).
         let (terms, names) =
-            cfg.retain_hosting_classes(vec![term("mid")], vec!["mid".into()], 48, 0, &[]);
+            cfg.retain_hosting_classes(vec![term("mid")], vec!["mid".into()], 48, 0, &[], &cat);
         assert!(terms.is_empty() && names.is_empty());
+    }
+
+    /// §13c-2 r[verify scheduler.sla.ceiling.uncatalogued-fallback]:
+    /// `class_ceilings` is `min(catalog_or_global, cfg_or_global)` per
+    /// axis. Catalog absent + cfg `None` → global. Catalog present →
+    /// physical bound. Cfg can only TIGHTEN below catalog.
+    /// r[verify scheduler.sla.ceiling.config-tightens-only]
+    #[test]
+    fn class_ceilings_min_of_catalog_and_cfg() {
+        let mut cfg = base();
+        cfg.max_cores = 192.0;
+        cfg.max_mem = 1024 << 30;
+        // h1: no cfg override (None/None).
+        let mut h1 = test_def("k", "v");
+        h1.max_cores = None;
+        h1.max_mem = None;
+        // h2: cfg tightens cores to 32.
+        let mut h2 = test_def("k", "v");
+        h2.max_cores = Some(32);
+        h2.max_mem = None;
+        cfg.hw_classes = HashMap::from([("h1".into(), h1), ("h2".into(), h2)]);
+
+        // No catalog: fall to global on both axes (h1) or cfg (h2 cores).
+        let empty = super::super::catalog::CatalogCeilings::new();
+        assert_eq!(cfg.class_ceilings("h1", &empty), (192, 1024 << 30));
+        assert_eq!(cfg.class_ceilings("h2", &empty), (32, 1024 << 30));
+        // Unknown class → (MAX, MAX) regardless of catalog.
+        assert_eq!(cfg.class_ceilings("ghost", &empty), (u32::MAX, u64::MAX));
+
+        // Catalog says h1 tops at (96, 768GiB).
+        let cat: super::super::catalog::CatalogCeilings =
+            HashMap::from([("h1".into(), (96u32, 768u64 << 30))]);
+        assert_eq!(
+            cfg.class_ceilings("h1", &cat),
+            (96, 768 << 30),
+            "catalog physical bound applied"
+        );
+        // h2 not in catalog → catalog falls to global; cfg=Some(32) tightens.
+        assert_eq!(cfg.class_ceilings("h2", &cat), (32, 1024 << 30));
+        // cfg can tighten below catalog.
+        cfg.hw_classes.get_mut("h1").unwrap().max_cores = Some(48);
+        assert_eq!(
+            cfg.class_ceilings("h1", &cat),
+            (48, 768 << 30),
+            "cfg=Some(48) tightens below catalog=96"
+        );
     }
 
     /// bug_019 (`lead_time_seed` membership/range) are the same
@@ -1575,6 +1683,7 @@ mod tests {
             consolidate_explore_epsilon: _, // (scalar)
             max_node_claims_per_cell_per_tick: _, // (scalar)
             cluster: _,            // (scalar)
+            metal_sizes: _,        // (free)   instance-size suffix strings
         } = cfg;
         // Silence unused-binding on the one (cell) field we kept by
         // name; the destructure itself is the load-bearing part.

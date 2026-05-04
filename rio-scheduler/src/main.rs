@@ -225,6 +225,41 @@ async fn main() -> anyhow::Result<()> {
             rio_scheduler::sla::cost::CostTable::seeded(&sla_cluster, hw_cost_source)
         }),
     ));
+    // §13c-2: catalog-derived per-hwClass ceilings, fetched once at boot.
+    // Spot-only — Static (vmtest) has no AWS API; ceilings fall to
+    // `cfg.unwrap_or(global)`. Time-bounded so a misconfigured IRSA
+    // doesn't hang boot — on timeout/error the ceilings fall to global
+    // and the `_class_ceiling_uncatalogued` gauge fires per class.
+    // r[impl scheduler.sla.ceiling.catalog-derived]
+    if matches!(hw_cost_source, rio_scheduler::sla::cost::HwCostSource::Spot) {
+        let ec2 = aws_sdk_ec2::Client::new(&aws_config::from_env().load().await);
+        let catalog = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            rio_scheduler::sla::catalog::fetch_catalog(&ec2),
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(_) => {
+                tracing::warn!(
+                    "§13c-2 instance-type catalog fetch timed out (30s); per-class \
+                    ceilings fall to sla.maxCores/maxMem"
+                );
+                Vec::new()
+            }
+        };
+        let ceilings = rio_scheduler::sla::catalog::derive_ceilings(
+            &catalog,
+            &cfg.sla.hw_classes,
+            &cfg.sla.metal_sizes,
+        );
+        info!(
+            classes = ceilings.len(),
+            total = cfg.sla.hw_classes.len(),
+            "§13c-2 catalog ceilings derived"
+        );
+        cost_table.write().set_catalog_ceilings(ceilings);
+    }
     // λ refresh + sweep + persist run regardless of `hw_cost_source`
     // (the controller appends `interrupt_samples` even under Static).
     // `inputs_gen` is derived from the table at poll time — pollers
@@ -282,7 +317,7 @@ async fn main() -> anyhow::Result<()> {
             hmac_signer,
             service_signer: service_signer.map(Arc::new),
             leader: leader.clone(),
-            cost_table,
+            cost_table: std::sync::Arc::clone(&cost_table),
             cost_was_leader,
             cost_reload_notify,
             shutdown: shutdown.clone(),
@@ -430,6 +465,7 @@ async fn main() -> anyhow::Result<()> {
         sla_cluster,
         sla_for_admin,
         service_verifier,
+        cost_table,
     );
 
     // Start periodic tick task. Actor-dead handling: try_send fails

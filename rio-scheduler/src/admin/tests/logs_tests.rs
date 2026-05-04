@@ -137,6 +137,7 @@ async fn get_build_logs_from_s3_fallback() -> anyhow::Result<()> {
         String::new(),
         Arc::new(crate::sla::config::SlaConfig::test_default()),
         None,
+        Arc::default(),
     );
 
     let resp = svc
@@ -379,6 +380,7 @@ async fn try_s3_short_circuits_on_since_ge_line_count() -> anyhow::Result<()> {
         String::new(),
         Arc::new(crate::sla::config::SlaConfig::test_default()),
         None,
+        Arc::default(),
     );
 
     let resp = svc

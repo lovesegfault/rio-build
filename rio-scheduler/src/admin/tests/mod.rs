@@ -61,6 +61,7 @@ pub(super) async fn setup_svc(
         // service_verifier=None → dev-mode pass-through. Tests that
         // exercise the gate construct svc with Some(verifier) below.
         None,
+        Arc::default(),
     );
     (svc, actor, task, db)
 }
@@ -232,6 +233,7 @@ async fn setup_svc_with_service_verifier() -> (
         String::new(),
         Arc::new(crate::sla::config::SlaConfig::test_default()),
         Some(verifier),
+        Arc::default(),
     );
     (svc, signer, task, db)
 }
@@ -514,6 +516,45 @@ async fn bench_threshold_is_fleet_min_tenants() -> anyhow::Result<()> {
         Some(crate::sla::FLEET_MEDIAN_MIN_TENANTS as u32),
         "HwClassSampled.trust_threshold must emit FLEET_MEDIAN_MIN_TENANTS"
     );
+    Ok(())
+}
+
+/// §13c-2 r[verify scheduler.sla.ceiling.controller-mirror]:
+/// `GetHwClassConfig` ships `min(catalog, cfg)` per axis, each falling
+/// to global when absent — the controller's `ceilings_for` reads it.
+/// Wire is never zero: with NO catalog (Static / empty) and NO cfg
+/// override, the wire carries the global ceiling, not 0.
+#[tokio::test]
+async fn get_hw_class_config_ships_catalog_or_global_ceilings() -> anyhow::Result<()> {
+    let (svc, _actor, _task, _db) = setup_svc_default().await;
+    let g = crate::sla::config::SlaConfig::test_default();
+    // No catalog set on the default cost_table → falls to global.
+    let resp = svc
+        .get_hw_class_config(Request::new(()))
+        .await?
+        .into_inner();
+    let hc = &resp.hw_classes["test-hw"];
+    assert_eq!(
+        hc.max_cores, g.max_cores as u32,
+        "no catalog → global cores"
+    );
+    assert_eq!(hc.max_mem, g.max_mem, "no catalog → global mem");
+    assert!(hc.max_cores > 0 && hc.max_mem > 0, "wire never zero");
+    // Catalog says (8, 1GiB) — tighter than global (16, 2GiB). Wire MUST
+    // carry the min.
+    svc.cost_table
+        .write()
+        .set_catalog_ceilings(std::collections::HashMap::from([(
+            "test-hw".to_owned(),
+            (8u32, 1u64 << 30),
+        )]));
+    let resp = svc
+        .get_hw_class_config(Request::new(()))
+        .await?
+        .into_inner();
+    let hc = &resp.hw_classes["test-hw"];
+    assert_eq!(hc.max_cores, 8, "catalog tightens below global");
+    assert_eq!(hc.max_mem, 1 << 30);
     Ok(())
 }
 

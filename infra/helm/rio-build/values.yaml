@@ -409,8 +409,11 @@ scheduler:
       - {name: best-effort}
     defaultTier: normal
     probe: {cpu: 16, memPerCore: 1073741824, memBase: 34359738368, deadlineSecs: 3600}
-    maxCores: 64
-    maxMem: 274877906944       # 256 GiB
+    # §13c-2: global ceiling is the safety net for uncatalogued classes;
+    # per-class catalog ceilings (boot-derived) do the real bounding.
+    # Sized to clear the largest fleet type (192c metal-48xl, 1.5 TiB).
+    maxCores: 192
+    maxMem: 1649267441664      # 1.5 TiB
     maxDisk: 214748364800      # 200 GiB
     defaultDisk: 107374182400  # 100 GiB
     hwCostTolerance: 0.15
@@ -435,15 +438,15 @@ scheduler:
     # template deleted (B3) the per-class nodeClass is the only place
     # the EC2NodeClass selection lives.
     #
-    # maxCores/maxMem are the per-class CONFIGURED catalog ceilings —
-    # what the `requirements` permit Karpenter to launch (as distinct
-    # from the autodiscovered `CostTable.cells` menu, which is what it
-    # has been observed launching). `evaluate_cell` rejects c* above
-    # these as `ClassCeiling`; the global `sla.maxCores`/`maxMem` are
-    # the union ceiling. Unset → template defaults to the global
-    # ceiling (every class permits up to global). Set a tighter
-    # per-class value (e.g. an arm-only pool that tops at 64c) to keep
-    # the solve from routing 128c demand there.
+    # §13c-2 per-class ceilings: NOT set here. The scheduler derives
+    # the physical `(maxCores, maxMem)` ceiling per class at boot from
+    # `describe_instance_types` ∩ `requirements` (the largest real type
+    # that matches). `maxCores`/`maxMem` may still be set as an OPTIONAL
+    # operator override that **tightens** below the catalog ceiling
+    # (e.g. an arm pool you want to cap at 64c for cost reasons) —
+    # `validate()` rejects `Some(0)` and any value > the global. Unset
+    # → catalog wins; catalog absent (static cost source / fetch
+    # failure) → global.
     hwClasses:
       hi-nvme-x86:
         nodeClass: rio-nvme
@@ -599,11 +602,10 @@ scheduler:
         providesFeatures: [kvm]
         # §13c D4a: x86+arm Σ = 10000 (= the maxFleetCores bump amount).
         maxFleetCores: 5000
-        # maxCores/maxMem default to global (sla.maxCores/maxMem).
-        # SlaConfig::validate() rejects per-class ceilings > global; the
-        # global cap bounds what any single build can request, so a
-        # higher metal ceiling has no operational effect — and helm/17
-        # asserts the constraint.
+        # maxCores/maxMem unset → §13c-2 catalog ceiling at boot
+        # (largest metal type matching `requirements` ∩ `metalSizes`).
+        # SlaConfig::validate() rejects per-class overrides > global;
+        # the global cap is the safety net — and helm/17 asserts it.
       metal-arm:
         nodeClass: rio-metal
         labels:

@@ -910,8 +910,10 @@ pub fn solve_full(
 
     // §Canonicalize: shared with `reference_hw_class_for_system`, the
     // `all_candidates` capacity-fallback, and the post-finalize
-    // chokepoint.
-    let class_max_of = |h: &str| cfg.class_ceilings(h);
+    // chokepoint. §13c-2: `catalog_ceilings` rides on the same `cost`
+    // snapshot the price/λ reads use, so all four sites see the same
+    // per-tick map.
+    let class_max_of = |h: &str| cfg.class_ceilings(h, cost.catalog_ceilings());
     for tier in tiers {
         let mut candidates: Vec<Candidate> = Vec::with_capacity(h_set.len() * 2);
         for h in h_set {
@@ -2086,8 +2088,8 @@ mod tests {
                         key: "rio.build/hw-class".into(),
                         value: h,
                     }],
-                    max_cores,
-                    max_mem,
+                    max_cores: Some(max_cores),
+                    max_mem: Some(max_mem),
                     ..Default::default()
                 },
             );
