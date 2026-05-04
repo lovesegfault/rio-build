@@ -171,7 +171,15 @@ pub fn requirements_match(
         let v = labels.get(r.key.as_str());
         match r.operator.as_str() {
             "In" => v.is_some_and(|v| r.values.iter().any(|x| x == v)),
-            "NotIn" => v.is_some_and(|v| !r.values.iter().any(|x| x == v)),
+            // k8s `NodeSelectorOperator`: an absent label MATCHES `NotIn`
+            // — the exact complement of `In` (which an absent label
+            // never satisfies). Reachable: `karpenter_labels` inserts
+            // `ARCH` and `CPU_MANUFACTURER` conditionally, so a `NotIn`
+            // requirement on either key sees `None` for unmappable arch
+            // / unreported manufacturer. `is_some_and` here under-
+            // matched (filtered an instance type Karpenter would
+            // launch) and silently diverged from the documented mirror.
+            "NotIn" => v.is_none_or(|v| !r.values.iter().any(|x| x == v)),
             "Exists" => v.is_some(),
             "DoesNotExist" => v.is_none(),
             "Gt" => num_cmp(v, &r.values).is_some_and(|(a, b)| a > b),
@@ -484,6 +492,40 @@ mod tests {
         // Multiple Gt values → ill-formed → no match.
         assert!(!requirements_match(
             &[req(label::GENERATION, "Gt", &["7", "6"])],
+            &labels
+        ));
+    }
+
+    /// k8s `corev1.NodeSelectorOperator` semantics (which the
+    /// doc-comment claims to mirror): an absent label MATCHES `NotIn`
+    /// — `NotIn` is the exact complement of `In`, and `In` on an absent
+    /// label is `false`. Reachable: `karpenter_labels` inserts `ARCH`
+    /// and `CPU_MANUFACTURER` conditionally, so a `NotIn` requirement
+    /// on either key sees `None` for unmappable arch / unreported
+    /// manufacturer. Pre-fix `is_some_and` returned `false` (under-
+    /// matched, fail-closed but diverged from the documented mirror).
+    #[test]
+    fn requirements_match_notin_absent_label() {
+        let labels = ce("c8gd.4xlarge", 16, 32, "arm64", 950).labels;
+        // `In` on an absent key → false (no match).
+        assert!(!requirements_match(
+            &[req("nonexistent", "In", &["x"])],
+            &labels
+        ));
+        // `NotIn` on an absent key → true (k8s: absent satisfies NotIn).
+        assert!(
+            requirements_match(&[req("nonexistent", "NotIn", &["x"])], &labels),
+            "NotIn must match an absent label key (k8s NodeSelectorOperator semantics)"
+        );
+        // `NotIn` on a present key still excludes when value ∈ set.
+        assert!(!requirements_match(
+            &[req(label::CATEGORY, "NotIn", &["c"])],
+            &labels
+        ));
+        // §one-step-removed inverse: `In` must NOT also be `is_none_or`
+        // — present-and-matching only.
+        assert!(requirements_match(
+            &[req(label::CATEGORY, "In", &["c"])],
             &labels
         ));
     }
