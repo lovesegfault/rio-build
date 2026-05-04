@@ -1,3 +1,137 @@
+{{- /* Named template so the ConfigMap body and the checksum annotation
+       hash the SAME rendered string. bug_021: the checksum hashed a
+       hand-maintained subtree list (`$s.softFeatures`, `$s.sla`) — §13c-2
+       added `metal_sizes = {{ toJson $.Values.karpenter.metalSizes }}` to
+       the body, but `karpenter.*` is outside `$s`, so a metalSizes bump
+       re-rendered the ConfigMap without rolling the (subPath-mounted,
+       read-once-at-boot) pod. Sibling of bug_022 / `rio.controllerToml`.
+       `define` must be at top level (not inside `if`).
+       helm/19-scheduler-checksum-covers-toml.sh enforces. */}}
+{{- define "rio.schedulerToml" -}}
+{{- $s := .Values.scheduler -}}
+{{- /* I-213: soft_features string array. */ -}}
+soft_features = [{{ range $i, $f := $s.softFeatures }}{{ if $i }}, {{ end }}{{ $f | quote }}{{ end }}]
+{{- /* ADR-023 [sla]: scalar block first, then nested tables, then
+       array-of-tables — TOML requires tables after the scalars of
+       their parent. p50/p90/p99 are optional per-tier. */ -}}
+{{- with required "scheduler.sla mandatory (ADR-023)" $s.sla }}
+[sla]
+cluster = {{ (.cluster | default $.Values.karpenter.clusterName | default "") | quote }}
+default_tier = {{ .defaultTier | quote }}
+{{- /* §13c-3: maxCores/maxMem optional. Unset → scheduler derives
+       from `describe_instance_types` catalog at boot (Spot only;
+       static mode requires both). `with` skips the line on nil so
+       serde sees the key absent → Option::None. */ -}}
+{{- with .maxCores }}
+max_cores = {{ printf "%.1f" (float64 .) }}
+{{- end }}
+{{- with .maxMem }}
+max_mem = {{ int64 . }}
+{{- end }}
+max_disk = {{ int64 .maxDisk }}
+default_disk = {{ int64 .defaultDisk }}
+hw_cost_tolerance = {{ printf "%v" (float64 .hwCostTolerance) }}
+hw_explore_epsilon = {{ printf "%v" (float64 .hwExploreEpsilon) }}
+hw_bench_mem_floor = {{ int64 .hwBenchMemFloor }}
+max_fleet_cores = {{ int64 .maxFleetCores }}
+ladder_budget = {{ printf "%.1f" (float64 .ladderBudget) }}
+max_forecast_cores_per_tenant = {{ int64 .maxForecastCoresPerTenant }}
+max_keys_per_tenant = {{ int64 .maxKeysPerTenant }}
+max_lead_time = {{ printf "%.1f" (float64 .maxLeadTime) }}
+consolidate_explore_epsilon = {{ printf "%v" (float64 .consolidateExploreEpsilon) }}
+max_node_claims_per_cell_per_tick = {{ int64 .maxNodeClaimsPerCellPerTick }}
+{{- with .maxConsolidationTime }}
+max_consolidation_time = {{ printf "%.1f" (float64 .) }}
+{{- end }}
+reference_hw_class = {{ required "scheduler.sla.referenceHwClass is mandatory (ADR-023 §13a)" .referenceHwClass | quote }}
+hw_cost_source = {{ required "scheduler.sla.hwCostSource is mandatory (ADR-023 §13a)" .hwCostSource | quote }}
+{{- /* §13c-2: same metal partition list cover.rs reads via
+       controller.toml [nodeclaim_pool] metal_sizes. The scheduler
+       uses it to mirror cover's `instance-size {In|NotIn}` predicate
+       when deriving per-class catalog ceilings at boot. */}}
+metal_sizes = {{ toJson $.Values.karpenter.metalSizes }}
+{{- with .leadTimeSeed }}
+
+[sla.lead_time_seed]
+{{- range $cell, $v := . }}
+{{ $cell | quote }} = {{ printf "%.1f" (float64 $v) }}
+{{- end }}
+{{- end }}
+{{- range $h, $def := .hwClasses }}
+
+[sla.hw_classes.{{ $h | quote }}]
+labels = [
+  {{- range $def.labels }}
+  { key = {{ .key | quote }}, value = {{ .value | quote }} },
+  {{- end }}
+]
+requirements = [
+  {{- range $def.requirements }}
+  { key = {{ .key | quote }}, operator = {{ .operator | quote }}, values = {{ toJson .values }} },
+  {{- end }}
+]
+node_class = {{ required (printf "scheduler.sla.hwClasses.%s.nodeClass is mandatory (rio-default / rio-nvme / rio-metal)" $h) $def.nodeClass | quote }}
+{{- /* §13c-2: per-class ceilings are an OPTIONAL operator override
+       on the boot-derived catalog ceiling. Emit only when explicitly
+       set — `with` skips on nil AND zero, so a YAML `maxCores: 0`
+       never reaches serde as `Some(0)` (which validate() rejects).
+       Unset → serde `None` → falls to catalog/global. */}}
+{{- with $def.maxCores }}
+max_cores = {{ int64 . }}
+{{- end }}
+{{- with $def.maxMem }}
+max_mem = {{ int64 . }}
+{{- end }}
+{{- /* §13c: only emit when set — serde defaults are already
+       [Spot, Od] / [] / None; the helm/15 check covers the
+       required (non-default) keys. */}}
+{{- with $def.taints }}
+taints = [
+  {{- range . }}
+  { key = {{ .key | quote }}, value = {{ .value | quote }}, effect = {{ .effect | quote }} },
+  {{- end }}
+]
+{{- end }}
+{{- with $def.providesFeatures }}
+provides_features = {{ toJson . }}
+{{- end }}
+{{- with $def.maxFleetCores }}
+max_fleet_cores = {{ int64 . }}
+{{- end }}
+{{- with $def.capacityTypes }}
+capacity_types = {{ toJson . }}
+{{- end }}
+{{- end }}
+
+[sla.probe]
+cpu = {{ printf "%.1f" (float64 .probe.cpu) }}
+mem_per_core = {{ int64 .probe.memPerCore }}
+mem_base = {{ int64 .probe.memBase }}
+deadline_secs = {{ int64 (default 3600 .probe.deadlineSecs) }}
+{{- range $feat, $p := .featureProbes }}
+
+[sla.feature_probes.{{ $feat | quote }}]
+cpu = {{ printf "%.1f" (float64 $p.cpu) }}
+mem_per_core = {{ int64 $p.memPerCore }}
+mem_base = {{ int64 $p.memBase }}
+deadline_secs = {{ int64 (default 3600 $p.deadlineSecs) }}
+{{- end }}
+{{- range .tiers }}
+
+[[sla.tiers]]
+name = {{ .name | quote }}
+{{- with .p50 }}
+p50 = {{ printf "%.1f" (float64 .) }}
+{{- end }}
+{{- with .p90 }}
+p90 = {{ printf "%.1f" (float64 .) }}
+{{- end }}
+{{- with .p99 }}
+p99 = {{ printf "%.1f" (float64 .) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- if .Values.scheduler.enabled }}
 {{- $s := .Values.scheduler -}}
 apiVersion: apps/v1
@@ -30,11 +164,11 @@ spec:
       labels:
         {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 8 }}
       annotations:
-        # Scheduler reads /etc/rio/scheduler.toml once at boot; kubelet
-        # CM-remount alone doesn't trigger reload. Roll on any
-        # ConfigMap-rendered field change (subPath mounts don't
-        # live-update either way).
-        checksum/scheduler-toml: {{ list (toJson $s.softFeatures) (toJson $s.sla) | join "" | sha256sum }}
+        # Scheduler reads /etc/rio/scheduler.toml once at boot; subPath
+        # mounts don't live-update. Hash the RENDERED body (not a key
+        # list — that drifts) so any input that lands in the TOML rolls
+        # the pod. helm/19-scheduler-checksum-covers-toml.sh enforces.
+        checksum/scheduler-toml: {{ include "rio.schedulerToml" . | sha256sum }}
     spec:
       serviceAccountName: rio-scheduler
       {{- if .Values.karpenter.enabled }}
@@ -181,126 +315,5 @@ metadata:
     {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 4 }}
 data:
   scheduler.toml: |
-    {{- /* I-213: soft_features string array. */}}
-    soft_features = [{{ range $i, $f := $s.softFeatures }}{{ if $i }}, {{ end }}{{ $f | quote }}{{ end }}]
-    {{- /* ADR-023 [sla]: scalar block first, then nested tables, then
-           array-of-tables — TOML requires tables after the scalars of
-           their parent. p50/p90/p99 are optional per-tier. */ -}}
-    {{- with required "scheduler.sla mandatory (ADR-023)" $s.sla }}
-    [sla]
-    cluster = {{ (.cluster | default $.Values.karpenter.clusterName | default "") | quote }}
-    default_tier = {{ .defaultTier | quote }}
-    {{- /* §13c-3: maxCores/maxMem optional. Unset → scheduler derives
-           from `describe_instance_types` catalog at boot (Spot only;
-           static mode requires both). `with` skips the line on nil so
-           serde sees the key absent → Option::None. */ -}}
-    {{- with .maxCores }}
-    max_cores = {{ printf "%.1f" (float64 .) }}
-    {{- end }}
-    {{- with .maxMem }}
-    max_mem = {{ int64 . }}
-    {{- end }}
-    max_disk = {{ int64 .maxDisk }}
-    default_disk = {{ int64 .defaultDisk }}
-    hw_cost_tolerance = {{ printf "%v" (float64 .hwCostTolerance) }}
-    hw_explore_epsilon = {{ printf "%v" (float64 .hwExploreEpsilon) }}
-    hw_bench_mem_floor = {{ int64 .hwBenchMemFloor }}
-    max_fleet_cores = {{ int64 .maxFleetCores }}
-    ladder_budget = {{ printf "%.1f" (float64 .ladderBudget) }}
-    max_forecast_cores_per_tenant = {{ int64 .maxForecastCoresPerTenant }}
-    max_keys_per_tenant = {{ int64 .maxKeysPerTenant }}
-    max_lead_time = {{ printf "%.1f" (float64 .maxLeadTime) }}
-    consolidate_explore_epsilon = {{ printf "%v" (float64 .consolidateExploreEpsilon) }}
-    max_node_claims_per_cell_per_tick = {{ int64 .maxNodeClaimsPerCellPerTick }}
-    {{- with .maxConsolidationTime }}
-    max_consolidation_time = {{ printf "%.1f" (float64 .) }}
-    {{- end }}
-    reference_hw_class = {{ required "scheduler.sla.referenceHwClass is mandatory (ADR-023 §13a)" .referenceHwClass | quote }}
-    hw_cost_source = {{ required "scheduler.sla.hwCostSource is mandatory (ADR-023 §13a)" .hwCostSource | quote }}
-    {{- /* §13c-2: same metal partition list cover.rs reads via
-           controller.toml [nodeclaim_pool] metal_sizes. The scheduler
-           uses it to mirror cover's `instance-size {In|NotIn}` predicate
-           when deriving per-class catalog ceilings at boot. */}}
-    metal_sizes = {{ toJson $.Values.karpenter.metalSizes }}
-    {{- with .leadTimeSeed }}
-
-    [sla.lead_time_seed]
-    {{- range $cell, $v := . }}
-    {{ $cell | quote }} = {{ printf "%.1f" (float64 $v) }}
-    {{- end }}
-    {{- end }}
-    {{- range $h, $def := .hwClasses }}
-
-    [sla.hw_classes.{{ $h | quote }}]
-    labels = [
-      {{- range $def.labels }}
-      { key = {{ .key | quote }}, value = {{ .value | quote }} },
-      {{- end }}
-    ]
-    requirements = [
-      {{- range $def.requirements }}
-      { key = {{ .key | quote }}, operator = {{ .operator | quote }}, values = {{ toJson .values }} },
-      {{- end }}
-    ]
-    node_class = {{ required (printf "scheduler.sla.hwClasses.%s.nodeClass is mandatory (rio-default / rio-nvme / rio-metal)" $h) $def.nodeClass | quote }}
-    {{- /* §13c-2: per-class ceilings are an OPTIONAL operator override
-           on the boot-derived catalog ceiling. Emit only when explicitly
-           set — `with` skips on nil AND zero, so a YAML `maxCores: 0`
-           never reaches serde as `Some(0)` (which validate() rejects).
-           Unset → serde `None` → falls to catalog/global. */}}
-    {{- with $def.maxCores }}
-    max_cores = {{ int64 . }}
-    {{- end }}
-    {{- with $def.maxMem }}
-    max_mem = {{ int64 . }}
-    {{- end }}
-    {{- /* §13c: only emit when set — serde defaults are already
-           [Spot, Od] / [] / None; the helm/15 check covers the
-           required (non-default) keys. */}}
-    {{- with $def.taints }}
-    taints = [
-      {{- range . }}
-      { key = {{ .key | quote }}, value = {{ .value | quote }}, effect = {{ .effect | quote }} },
-      {{- end }}
-    ]
-    {{- end }}
-    {{- with $def.providesFeatures }}
-    provides_features = {{ toJson . }}
-    {{- end }}
-    {{- with $def.maxFleetCores }}
-    max_fleet_cores = {{ int64 . }}
-    {{- end }}
-    {{- with $def.capacityTypes }}
-    capacity_types = {{ toJson . }}
-    {{- end }}
-    {{- end }}
-
-    [sla.probe]
-    cpu = {{ printf "%.1f" (float64 .probe.cpu) }}
-    mem_per_core = {{ int64 .probe.memPerCore }}
-    mem_base = {{ int64 .probe.memBase }}
-    deadline_secs = {{ int64 (default 3600 .probe.deadlineSecs) }}
-    {{- range $feat, $p := .featureProbes }}
-
-    [sla.feature_probes.{{ $feat | quote }}]
-    cpu = {{ printf "%.1f" (float64 $p.cpu) }}
-    mem_per_core = {{ int64 $p.memPerCore }}
-    mem_base = {{ int64 $p.memBase }}
-    deadline_secs = {{ int64 (default 3600 $p.deadlineSecs) }}
-    {{- end }}
-    {{- range .tiers }}
-
-    [[sla.tiers]]
-    name = {{ .name | quote }}
-    {{- with .p50 }}
-    p50 = {{ printf "%.1f" (float64 .) }}
-    {{- end }}
-    {{- with .p90 }}
-    p90 = {{ printf "%.1f" (float64 .) }}
-    {{- end }}
-    {{- with .p99 }}
-    p99 = {{ printf "%.1f" (float64 .) }}
-    {{- end }}
-    {{- end }}
-    {{- end }}
+    {{- include "rio.schedulerToml" . | nindent 4 }}
 {{- end }}
