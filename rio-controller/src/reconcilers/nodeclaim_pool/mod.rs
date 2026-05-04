@@ -261,19 +261,24 @@ impl NodeClaimPoolConfig {
 
     /// Cold-start fallback cell for an hw-agnostic intent
     /// (`hw_class_names=[]`, i.e. `fit=None`): the
-    /// `(referenceHwClass, Spot)` cell when its `kubernetes.io/arch`
-    /// label matches `intent.system` (or is absent — arch-agnostic
-    /// hw-class) AND its per-class `max_cores`/`max_mem` host the
-    /// intent, else the first (sorted) hw-class satisfying both. `None`
-    /// ⇔ `system` unmappable OR no configured hw-class hosts that arch
-    /// at that size (caller emits
+    /// `(referenceHwClass, <first cap>)` cell when its
+    /// `kubernetes.io/arch` label matches `intent.system` (or is absent
+    /// — arch-agnostic hw-class) AND its per-class `max_cores`/`max_mem`
+    /// host the intent, else the first (sorted) hw-class satisfying
+    /// both. `None` ⇔ `system` unmappable OR no configured hw-class
+    /// hosts that arch at that size (caller emits
     /// `rio_controller_nodeclaim_intent_dropped_total
-    /// {reason=no_menu_for_arch}`).
+    /// {reason=no_hosting_class}`).
     ///
-    /// Spot capacity-type only: cold-start probes are uniform
-    /// `probe.cpu`-shaped and bounded by `max_node_claims_per_cell_per_
-    /// tick`; on-demand fallback would defeat the §13b cost model.
-    /// `masked` cells are skipped — when `(referenceHwClass, spot)` is
+    /// Capacity-type is the FIRST listed for the class (Spot for
+    /// default classes — cold-start probes are uniform `probe.cpu`-
+    /// shaped and bounded by `max_node_claims_per_cell_per_tick`;
+    /// on-demand fallback would defeat the §13b cost model. OnDemand
+    /// for od-only classes like metal — §13c). No `provides_features`
+    /// filter here: post-§13c kvm intents always get
+    /// `hw_class_names=[metal-*]` from the scheduler so they never
+    /// reach fallback empty.
+    /// `masked` cells are skipped — when the reference cell is
     /// ICE-masked, the next arch-matching cell is returned so
     /// cold-start probes don't silently strand on a cell
     /// `cover_deficit` then `continue`s.
@@ -290,10 +295,11 @@ impl NodeClaimPoolConfig {
             // class.max_cores`. Routing it to that cell would hit
             // `cover::sizing`'s exceeds_cell_cap drop — better to find
             // a cell that CAN host it (or `None` → caller's
-            // `no_menu_for_arch` metric, which is the right operator
-            // signal: "no class for this arch is big enough").
+            // `no_hosting_class` metric, which is the right operator
+            // signal: "no class for this arch+size+feature").
             let (cls_c, cls_m) = hw.ceilings_for(h).unwrap_or((u32::MAX, u64::MAX));
-            let c = Cell(h.into(), CapacityType::Spot);
+            let cap = *hw.capacity_types_for(h).first()?;
+            let c = Cell(h.into(), cap);
             (hw.matches_arch(h, arch)
                 && !masked.contains(&c)
                 && i.cores <= cls_c
@@ -303,15 +309,18 @@ impl NodeClaimPoolConfig {
         candidate(&self.reference_hw_class).or_else(|| hw.names().iter().find_map(|h| candidate(h)))
     }
 
-    /// All configured cells (`hw_classes × {spot, od}`), for
-    /// round-robin iteration and per-cell gauges. Derived from the
-    /// loaded [`HwClassConfig`] (not from `lead_time_seed` keys —
-    /// those may be a subset).
+    /// All configured cells (`hw_classes[h] × capacity_types_for(h)`),
+    /// for round-robin iteration and per-cell gauges. §13c: per-hwClass
+    /// capacity-types so an od-only class structurally never produces a
+    /// `(h, Spot)` cell. Derived from the loaded [`HwClassConfig`] (not
+    /// from `lead_time_seed` keys — those may be a subset).
     pub fn all_cells(&self, hw: &HwClassConfig) -> Vec<Cell> {
         hw.names()
             .into_iter()
             .flat_map(|h| {
-                [CapacityType::Spot, CapacityType::OnDemand].map(move |c| Cell(h.clone(), c))
+                hw.capacity_types_for(&h)
+                    .into_iter()
+                    .map(move |c| Cell(h.clone(), c))
             })
             .collect()
     }
@@ -949,7 +958,7 @@ impl NodeClaimPoolReconciler {
         if dropped > 0 {
             metrics::counter!(
                 "rio_controller_nodeclaim_intent_dropped_total",
-                "reason" => "no_menu_for_arch",
+                "reason" => "no_hosting_class",
             )
             .increment(dropped);
         }
@@ -957,6 +966,9 @@ impl NodeClaimPoolReconciler {
             cover::cells_round_robin(self.cfg.all_cells(&self.hw_config), self.tick_counter);
 
         let mut created = Vec::new();
+        // §13c T8: per-hwClass cores minted THIS TICK, keyed by `cell.0`
+        // so spot+od share one cap (per-hwClass not per-Cell — D4).
+        let mut class_created: HashMap<String, u32> = HashMap::new();
         for cell in &order {
             if ice.contains(cell) {
                 continue;
@@ -979,11 +991,16 @@ impl NodeClaimPoolReconciler {
                 max_node_mem: cls_m.min(self.cfg.max_node_mem),
                 max_node_disk: self.cfg.max_node_disk,
                 per_tick_cap: self.cfg.max_node_claims_per_cell_per_tick,
-                budget: self
-                    .cfg
-                    .max_fleet_cores
-                    .saturating_sub(live_cores)
-                    .saturating_sub(created_cores),
+                budget: cover::class_budget(
+                    self.cfg
+                        .max_fleet_cores
+                        .saturating_sub(live_cores)
+                        .saturating_sub(created_cores),
+                    self.hw_config.fleet_cap_for(&cell.0),
+                    live,
+                    &cell.0,
+                    class_created.get(&cell.0).copied().unwrap_or(0),
+                ),
                 fuse_cache_bytes: self.cfg.fuse_cache_bytes,
             };
             let (claims, min_eta) = cover::sizing(cell, u, &scfg);
@@ -1039,6 +1056,7 @@ impl NodeClaimPoolReconciler {
                     }
                 }
                 created_cores += c;
+                *class_created.entry(cell.0.clone()).or_default() += c;
             }
         }
         Ok(CoverResult { created })
@@ -1289,7 +1307,7 @@ mod tests {
     /// r27 mb_006 producer-side: an hw-agnostic intent (override
     /// bypass-path) with `cores > class.max_cores` must NOT route to
     /// that cell — find a class that CAN host it, or `None` (caller's
-    /// `no_menu_for_arch` metric). Without this, `cover::sizing`'s
+    /// `no_hosting_class` metric). Without this, `cover::sizing`'s
     /// `exceeds_cell_cap` backstop drops it AFTER assignment; this
     /// filter delivers the invariant upstream.
     #[test]
@@ -1344,7 +1362,7 @@ mod tests {
             Some(Cell("hi-ebs-x86".into(), CapacityType::Spot)),
             "reference too small → next ceiling-fitting class"
         );
-        // 256c exceeds ALL classes → None (no_menu_for_arch).
+        // 256c exceeds ALL classes → None (no_hosting_class).
         assert_eq!(cfg.fallback_cell(&mk(256), &hw, &none), None);
     }
 
@@ -1393,7 +1411,7 @@ mod tests {
         assert!(r.created.is_empty());
     }
 
-    /// `all_cells` = hw-class names × {spot, od}.
+    /// `all_cells` = hw-class names × `capacity_types_for(h)`.
     #[test]
     fn all_cells_derives_from_hw_config() {
         let cfg = NodeClaimPoolConfig::default();
@@ -1413,5 +1431,68 @@ mod tests {
             ]
         );
         assert!(cfg.all_cells(&HwClassConfig::default()).is_empty());
+    }
+
+    /// §13c T9/T11: `all_cells` and `fallback_cell` honor per-hwClass
+    /// `capacity_types`. An od-only class (metal) MUST NOT produce a
+    /// `(h, Spot)` cell — the spot cell would carry a `cap-type In
+    /// [spot]` requirement (cell-derived) and Karpenter would
+    /// successfully provision a spot metal node, violating the cost
+    /// model.
+    #[test]
+    fn all_cells_and_fallback_honor_capacity_types() {
+        use rio_proto::types::{HwClassLabels, NodeLabelMatch};
+        let arch = |a: &str| NodeLabelMatch {
+            key: ARCH_LABEL.into(),
+            value: a.into(),
+        };
+        let hw = HwClassConfig::default();
+        hw.set(
+            [
+                (
+                    "metal-x86".into(),
+                    HwClassLabels {
+                        labels: vec![arch("amd64")],
+                        capacity_types: vec!["on-demand".into()],
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "std-x86".into(),
+                    HwClassLabels {
+                        labels: vec![arch("amd64")],
+                        // capacity_types empty (pre-§13c scheduler) → ALL.
+                        ..Default::default()
+                    },
+                ),
+            ]
+            .into(),
+        );
+        let cfg = NodeClaimPoolConfig {
+            reference_hw_class: "metal-x86".into(),
+            ..Default::default()
+        };
+        let mut cells = cfg.all_cells(&hw);
+        cells.sort();
+        assert_eq!(
+            cells,
+            vec![
+                Cell("metal-x86".into(), CapacityType::OnDemand),
+                Cell("std-x86".into(), CapacityType::Spot),
+                Cell("std-x86".into(), CapacityType::OnDemand),
+            ],
+            "od-only class must not produce a (h, Spot) cell"
+        );
+        // fallback_cell picks the first listed cap for the reference
+        // class — OnDemand for metal.
+        let i = SpawnIntent {
+            system: "x86_64-linux".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.fallback_cell(&i, &hw, &HashSet::new()),
+            Some(Cell("metal-x86".into(), CapacityType::OnDemand)),
+            "od-only reference → fallback picks OnDemand, not Spot"
+        );
     }
 }

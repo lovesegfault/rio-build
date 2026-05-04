@@ -508,6 +508,21 @@ Builder pods MUST set `priorityClassName=rio-builder-prio-{⌊log₂c*⌋}`
 `preemptionPolicy:Never`) and `schedulerName=kube-build-scheduler`. Config-load
 asserts `maxCores < 1024`.
 
+r[ctrl.nodeclaim.taints.hwclass]
+`build_nodeclaim` sets `spec.taints` to the universal builder taint
+followed by `hwClasses[h].taints` (chain order: builder first). §13c:
+metal hwClasses carry `rio.build/kvm=true:NoSchedule` so only kvm-
+tolerating pods land on metal nodes — replacing the static
+`rio-builder-metal` NodePool's hardcoded taint.
+
+r[ctrl.nodeclaim.budget.per-class]
+`cover_deficit` clamps each cell's per-tick mint at
+`min(global_remaining, hwClasses[cell.0].max_fleet_cores − class_live −
+class_created_this_tick)` where `class_live` and `class_created_this_tick`
+are summed across capacity-types (per-hwClass, NOT per-Cell — a per-Cell
+cap would let spot+od each hit it independently → 2× $/hr exposure).
+`max_fleet_cores=None` ⇒ global budget only.
+
 r[ctrl.nodeclaim.placeable-gate+2]
 For Builder pools, the Pool reconciler creates Jobs only for intents
 the nodeclaim_pool reconciler's last FFD simulation placed on a

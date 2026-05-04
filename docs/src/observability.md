@@ -282,6 +282,8 @@ r[obs.metric.controller]
 | `rio_controller_ffd_placeable_intents` | Gauge | SpawnIntents FFD-placed at the last tick (labeled by `state`). `state=registered` ⇒ on a `Registered=True` claim (Jobs created this tick); `state=inflight` ⇒ on a not-yet-Registered claim (held by placeable-gate). `registered/(registered+inflight)` is the forecast warm-hit proxy. |
 | `rio_controller_nodeclaim_lead_time_seconds` | Gauge | Per-`cell` provisioning lead-time: `lead_time_q`-quantile of the `z=boot−eta_error` DDSketch. What `cover_deficit` provisions ahead by. Stuck at the seed value = no `Registered=True` transitions recorded yet. |
 | `rio_controller_ddsketch_seed_fallback_total` | Counter | Per-`cell` seed injections at `CellSketches::seed()`. Once per cold-start cell whose `z_active` AND `z_shadow` were both empty after PG load. >1 over controller lifetime = sketch persist failing. |
+| `rio_controller_nodeclaim_intent_dropped_total` | Counter | nodeclaim_pool `cover_deficit` intents dropped by `reason`. `reason=no_hosting_class`: no configured hw-class can host the intent — wrong arch, footprint exceeds every arch-matching class's `max_cores`/`max_mem`, or `required_features` unmatched (no `provides_features` entry). `reason=exceeds_cell_cap`: intent's pod footprint exceeds the assigned cell's per-class ceiling (override-bypass producer hole). |
+| `rio_scheduler_unroutable_features_total` | Counter | §13c: `solve_intent_for` found NO hwClass whose `provides_features` hosts the drv's `required_features` (labeled `tenant`, `feature`). The intent is unroutable until a `[sla.hw_classes.$h]` with matching `providesFeatures` is added. |
 
 ### Histogram Buckets
 

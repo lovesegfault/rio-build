@@ -113,7 +113,7 @@ pub struct CoverCfg<'a> {
 /// and a later tick re-evaluates. `fallback → None` (no configured cell
 /// hosts that arch at that size) increments the returned dropped count;
 /// caller emits
-/// `rio_controller_nodeclaim_intent_dropped_total{reason=no_menu_for_arch}`.
+/// `rio_controller_nodeclaim_intent_dropped_total{reason=no_hosting_class}`.
 ///
 /// `masked` cells (ICE-hit this tick or scheduler-reported
 /// `ice_masked_cells`) are filtered from each intent's `A_open` BEFORE
@@ -313,6 +313,38 @@ pub fn sizing(cell: &Cell, u: &[&SpawnIntent], cfg: &SizingCfg) -> (Vec<(u32, u6
     (vec![(chunk, mem, disk); n as usize], min_eta)
 }
 
+// r[impl ctrl.nodeclaim.budget.per-class]
+/// §13c per-hw-class fleet-core sub-budget for `cover_deficit`'s
+/// per-Cell loop. `min(global_remaining, class_cap − class_live −
+/// class_created)` where:
+/// - `global_remaining = max_fleet_cores − Σ live.allocatable −
+///   Σ created_this_tick`
+/// - `class_cap` = `HwClassDef.max_fleet_cores` for `cell.0` (`None` ⇒
+///   global-only)
+/// - `class_live` = Σ `n.allocatable.0` over live nodes whose `n.cell`
+///   has `cell.0 == h` (sums spot+od — per-hwClass, NOT per-Cell)
+/// - `class_created` = `created_h[h]` — cores minted this tick for ANY
+///   `(h, *)` cell, accumulated across the per-Cell loop so spot's spend
+///   subtracts from od's budget (otherwise each cap-type hits cap
+///   independently → 2× $/hr exposure)
+pub fn class_budget(
+    global_remaining: u32,
+    class_cap: Option<u32>,
+    live: &[super::ffd::LiveNode],
+    h: &str,
+    class_created: u32,
+) -> u32 {
+    let class_remaining = class_cap.map_or(u32::MAX, |cap| {
+        let class_live: u32 = live
+            .iter()
+            .filter(|n| n.cell.as_ref().is_some_and(|c| c.0 == h))
+            .map(|n| n.allocatable.0)
+            .sum();
+        cap.saturating_sub(class_live.saturating_add(class_created))
+    });
+    global_remaining.min(class_remaining)
+}
+
 /// 3-axis `⌈Σ/max⌉` lower bound on `n` — the fewest claims such that
 /// no per-claim request exceeds `max_node_*`. NOT a packing guarantee
 /// (bin-packing's `Σ/cap` is a lower bound only); [`sizing`] iterates
@@ -445,7 +477,13 @@ pub fn build_nodeclaim(
                 name: hw.node_class.clone(),
             },
             requirements,
-            taints: vec![builder_taint()],
+            // r[impl ctrl.nodeclaim.taints.hwclass]
+            // §13c: per-hwClass taints chained after the universal
+            // builder taint. e.g. metal classes carry
+            // `rio.build/kvm=true:NoSchedule`.
+            taints: std::iter::once(builder_taint())
+                .chain(hw.taints.iter().cloned())
+                .collect(),
             resources: Some(ResourceRequirements {
                 requests: Some(requests),
                 ..Default::default()
@@ -1155,7 +1193,9 @@ mod tests {
 
     /// I-205 partition: `node_class == METAL_NODE_CLASS` →
     /// `instance-size In <metalSizes>` (not NotIn). Single-sources
-    /// the predicate with helm `templates/karpenter.yaml`.
+    /// the predicate with helm `templates/karpenter.yaml`. §13c T7:
+    /// metal hwClass taints chained after `builder_taint()`.
+    // r[verify ctrl.nodeclaim.taints.hwclass]
     #[test]
     fn build_nodeclaim_metal_nodeclass_gets_in_side() {
         let cell = Cell("metal-x86".into(), CapacityType::OnDemand);
@@ -1164,7 +1204,7 @@ mod tests {
             &cell,
             (64, 256 * GI, 500 * GI),
             0.0,
-            &hw_ctx(METAL_NODE_CLASS),
+            &hw_ctx_metal(),
             &CoverCfg {
                 metal_sizes: &metal,
             },
@@ -1178,6 +1218,83 @@ mod tests {
         assert_eq!(size_req.operator, "In");
         assert_eq!(size_req.values, vec!["metal", "metal-24xl"]);
         assert_eq!(nc.spec.node_class_ref.name, METAL_NODE_CLASS);
+        // §13c T7: metal hwClass taint chained after builder_taint().
+        assert_eq!(nc.spec.taints.len(), 2, "builder_taint + kvm taint");
+        assert_eq!(nc.spec.taints[0].key, "rio.build/builder");
+        assert_eq!(nc.spec.taints[1].key, "rio.build/kvm");
+        assert_eq!(nc.spec.taints[1].effect, "NoSchedule");
+        // §13c N2: (metal, od) capacity-type requirement is exactly one
+        // `In` (cell-derived; no hwClass-side requirement to conflict).
+        let cap_reqs: Vec<_> = nc
+            .spec
+            .requirements
+            .iter()
+            .filter(|r| r.key == CAPACITY_TYPE_LABEL)
+            .collect();
+        assert_eq!(cap_reqs.len(), 1, "exactly one capacity-type requirement");
+        assert_eq!(cap_reqs[0].operator, "In");
+        assert_eq!(cap_reqs[0].values, vec!["on-demand"]);
+
+        // Non-metal ctx → only builder_taint.
+        let nc_std = build_nodeclaim(
+            &Cell("mid-ebs-x86".into(), CapacityType::Spot),
+            (8, 32 * GI, 100 * GI),
+            0.0,
+            &hw_ctx("rio-default"),
+            &CoverCfg {
+                metal_sizes: &metal,
+            },
+        );
+        assert_eq!(nc_std.spec.taints.len(), 1);
+        assert_eq!(nc_std.spec.taints[0].key, "rio.build/builder");
+    }
+
+    /// §13c T8: per-hwClass fleet-core sub-budget. The class cap counts
+    /// live nodes summed across spot+od, AND cores already minted this
+    /// tick for ANY cell of the class (so spot's spend subtracts from
+    /// od's budget — per-hwClass not per-Cell, D4). `None` cap ⇒
+    /// global-only.
+    // r[verify ctrl.nodeclaim.budget.per-class]
+    #[test]
+    fn class_budget_sub_caps_per_hwclass() {
+        use super::super::ffd::LiveNode;
+        let live_node = |h: &str, cap: CapacityType, cores: u32| LiveNode {
+            name: format!("{h}-{}", cap.as_str()),
+            node_name: None,
+            registered: true,
+            cell: Some(Cell(h.into(), cap)),
+            instance_type: None,
+            allocatable: (cores, 0, 0),
+            requested: (0, 0, 0),
+            created_secs: Some(0.0),
+            annotations: Default::default(),
+            status: Default::default(),
+        };
+        // No class cap → global only.
+        assert_eq!(class_budget(100, None, &[], "metal", 0), 100);
+        // Class cap=50, no live, nothing created → min(100, 50) = 50.
+        assert_eq!(class_budget(100, Some(50), &[], "metal", 0), 50);
+        // Class cap < global remaining → class wins.
+        // live: metal-spot 8c + metal-od 16c → class_live=24 (sums caps).
+        let live = vec![
+            live_node("metal", CapacityType::Spot, 8),
+            live_node("metal", CapacityType::OnDemand, 16),
+            // Different hw-class — must NOT count.
+            live_node("std", CapacityType::Spot, 99),
+        ];
+        // 50 − 24 − 0 = 26 < global 100.
+        assert_eq!(class_budget(100, Some(50), &live, "metal", 0), 26);
+        // class_created accumulates: spot iteration minted 20 → od
+        // budget = 50 − 24 − 20 = 6.
+        assert_eq!(class_budget(100, Some(50), &live, "metal", 20), 6);
+        // Saturating: created exceeds cap → 0.
+        assert_eq!(class_budget(100, Some(50), &live, "metal", 999), 0);
+        // Global remaining < class budget → global wins.
+        assert_eq!(class_budget(5, Some(50), &live, "metal", 0), 5);
+        // Cell-less nodes don't count.
+        let mut nameless = live_node("metal", CapacityType::Spot, 999);
+        nameless.cell = None;
+        assert_eq!(class_budget(100, Some(50), &[nameless], "metal", 0), 50);
     }
 
     /// mb_024(2): fallback path is filtered through `masked` —

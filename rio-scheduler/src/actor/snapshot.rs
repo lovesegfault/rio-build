@@ -1303,7 +1303,7 @@ impl DagActor {
                     // `None` (no class hosts this arch at this size, or
                     // unmappable system), emit empty so the controller's
                     // `fallback_cell` reaches its OWN `None` →
-                    // `no_menu_for_arch` metric. Relies on `reference_
+                    // `no_hosting_class` metric. Relies on `reference_
                     // hw_class_for_system` and `fallback_cell` agreeing
                     // on the arch-AND-SIZE match set (both query
                     // `class_ceilings`/`ceilings_for` with the same

@@ -2223,7 +2223,7 @@ async fn contract_forced_mem_only_override_is_hw_agnostic() {
 /// **bug_008** — bypass-path `--capacity` with a system NO configured
 /// hw-class can host (`reference_hw_class_for_system → None`) MUST
 /// emit empty `(hw_class_names, node_affinity)` so the controller's
-/// `fallback_cell` reaches its OWN `None` → `no_menu_for_arch` metric.
+/// `fallback_cell` reaches its OWN `None` → `no_hosting_class` metric.
 /// The bug_039 fix's `.map_or_else(|| reference_hw_class.clone(), ..)`
 /// fallback emitted the un-arch-matched reference into
 /// `cells_to_selector_terms`, producing `nodeAffinity arch In [wrong]`
@@ -2264,7 +2264,7 @@ async fn contract_bypass_capacity_no_arch_match_emits_empty() {
     assert!(
         intent.hw_class_names.is_empty() && intent.node_affinity.is_empty(),
         "no-arch-match MUST emit empty so controller fallback_cell hits \
-         no_menu_for_arch; got hw_class_names={:?} node_affinity={:?} — \
+         no_hosting_class; got hw_class_names={:?} node_affinity={:?} — \
          a non-empty result here means the un-arch-matched \
          reference_hw_class was emitted (bug_039 on the None arm).",
         intent.hw_class_names,
@@ -2387,10 +2387,10 @@ async fn contract_bypass_capacity_oversized_cores_emits_hosting_class() {
 /// **bug_019 §one-step-removed (a) inverse** — `--cores` larger than
 /// EVERY configured class's `max_cores` MUST emit empty
 /// `hw_class_names` so the controller's `fallback_cell` reaches its OWN
-/// `None` → `no_menu_for_arch`. Pre-fix: `reference_hw_class_for_system`
+/// `None` → `no_hosting_class`. Pre-fix: `reference_hw_class_for_system`
 /// returns the arch-matched reference regardless of size → non-empty →
 /// controller never reaches `fallback_cell` → `exceeds_cell_cap` loop
-/// instead of the operator-visible `no_menu_for_arch` signal.
+/// instead of the operator-visible `no_hosting_class` signal.
 #[tokio::test]
 async fn contract_bypass_capacity_oversized_no_class_hosts_emits_empty() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -2420,7 +2420,7 @@ async fn contract_bypass_capacity_oversized_no_class_hosts_emits_empty() {
     assert!(
         intent.hw_class_names.is_empty() && intent.node_affinity.is_empty(),
         "no class hosts cores=48 (all max_cores=32) → MUST emit empty so \
-         controller fallback_cell hits no_menu_for_arch. Got names={:?} \
+         controller fallback_cell hits no_hosting_class. Got names={:?} \
          terms={:?} — non-empty here means exceeds_cell_cap loop instead \
          of the operator-visible metric.",
         intent.hw_class_names,
