@@ -1317,6 +1317,45 @@ async fn poll_spot_once(
 mod tests {
     use super::*;
 
+    // r[verify scheduler.sla.ceiling.catalog-derived]
+    /// `carry_catalog` preserves the boot-derived catalog across the
+    /// lease-acquire edge-reload (`*cost.write() = fresh` would
+    /// otherwise wipe it — it's not in PG and not re-derived).
+    #[test]
+    fn carry_catalog_preserves_boot_derivation() {
+        let mut a = CostTable::seeded("us-east-1", HwCostSource::Spot);
+        a.set_catalog_ceilings(std::collections::HashMap::from([
+            ("hi-nvme-x86".into(), (96u32, 768u64 << 30)),
+            ("metal-x86".into(), (192u32, 1536u64 << 30)),
+        ]));
+        let h_before = a.solve_relevant_hash();
+
+        let fresh = CostTable::seeded("us-east-1", HwCostSource::Spot);
+        a.carry_catalog(fresh);
+
+        assert_eq!(
+            a.catalog_ceilings().get("hi-nvme-x86"),
+            Some(&(96, 768 << 30)),
+            "boot catalog survives the lease-acquire reload"
+        );
+        assert_eq!(
+            a.catalog_ceilings().get("metal-x86"),
+            Some(&(192, 1536 << 30))
+        );
+        assert_eq!(
+            a.solve_relevant_hash(),
+            h_before,
+            "solve_relevant_hash unchanged when catalog is carried"
+        );
+
+        // Inverse: a fresh CostTable WITHOUT carry has empty catalog
+        // and a DIFFERENT hash — so a `carry_catalog` regression busts
+        // the solve memo instead of silently reusing a wrong solution.
+        let no_carry = CostTable::seeded("us-east-1", HwCostSource::Spot);
+        assert!(no_carry.catalog_ceilings().is_empty());
+        assert_ne!(no_carry.solve_relevant_hash(), h_before);
+    }
+
     #[test]
     fn ratio_ema_decays() {
         let mut e = RatioEma::default();

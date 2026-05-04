@@ -815,8 +815,10 @@ override that **tightens** below the catalog (or global, if
 uncatalogued). The effective per-class ceiling is `min(catalog_or_global,
 cfg_or_global)` per axis. `validate()` rejects `Some(0)` and any
 override above the global cap; `None` falls through. The global cap is
-the single hard operator-asserted bound — observed instance types from
-controller Acks are untrusted input bounded by `min(_, global)`.
+the single hard operator-asserted bound — the AWS `describe-instance-types`
+catalog is fallible input (region SKU list, IRSA-gated, no signature
+chain) bounded by `min(_, global)` so a buggy or hostile API response
+cannot raise the effective ceiling past what the operator budgeted.
 
 r[scheduler.sla.ceiling.controller-mirror]
 The scheduler ships the catalog ceiling — `min(catalog, cfg)`, each

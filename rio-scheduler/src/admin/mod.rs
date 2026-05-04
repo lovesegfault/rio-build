@@ -782,6 +782,10 @@ impl AdminService for AdminServiceImpl {
         // map to under-sampled classes).
         self.ensure_service_caller(request.metadata(), &["rio-controller"])?;
         self.ensure_leader()?;
+        // Snapshot the catalog once for the whole iteration — avoids
+        // 2N lock acquisitions and a (theoretical) TOCTOU between the
+        // `.0` and `.1` reads if the lock ever races a `carry_catalog`.
+        let catalog = self.cost_table.read().catalog_ceilings().clone();
         let hw_classes = self
             .sla_config
             .hw_classes
@@ -825,14 +829,8 @@ impl AdminService for AdminServiceImpl {
                         // global=0 and `Some(0)` overrides; catalog
                         // ceilings are real instance shapes); the
                         // controller's `ceilings_for` `>0` filter survives.
-                        max_cores: self
-                            .sla_config
-                            .class_ceilings(h, self.cost_table.read().catalog_ceilings())
-                            .0,
-                        max_mem: self
-                            .sla_config
-                            .class_ceilings(h, self.cost_table.read().catalog_ceilings())
-                            .1,
+                        max_cores: self.sla_config.class_ceilings(h, &catalog).0,
+                        max_mem: self.sla_config.class_ceilings(h, &catalog).1,
                         taints,
                         provides_features: def.provides_features.clone(),
                         max_fleet_cores: def.max_fleet_cores,

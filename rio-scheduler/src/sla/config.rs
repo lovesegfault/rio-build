@@ -1640,6 +1640,20 @@ mod tests {
             (48, 768 << 30),
             "cfg=Some(48) tightens below catalog=96"
         );
+
+        // r[verify scheduler.sla.ceiling.config-tightens-only]
+        // Threat surface: a malicious/buggy AWS API response with a
+        // catalog ceiling ABOVE global must NOT raise the effective
+        // ceiling. With cfg=None the formula's `cfg.unwrap_or(global)`
+        // arm is the operator-asserted bound; `min` clamps element-wise.
+        cfg.hw_classes.get_mut("h1").unwrap().max_cores = None;
+        let huge: super::super::catalog::CatalogCeilings =
+            HashMap::from([("h1".into(), (1000u32, 8u64 << 40))]);
+        assert_eq!(
+            cfg.class_ceilings("h1", &huge),
+            (192, 1024 << 30),
+            "catalog above global is clamped to global by cfg.unwrap_or(global)"
+        );
     }
 
     /// bug_019 (`lead_time_seed` membership/range) are the same
