@@ -4,13 +4,14 @@
 //! `t4g.medium` (Graviton) for an x86 pool. Karpenter family/category
 //! filters don't constrain arch.
 //!
-//! NOT every NodePool needs arch: `rio-general` and `rio-builder-metal`
+//! NOT every NodePool needs arch: `rio-general` and `rio-nodeclaim-shim`
 //! are intentionally arch-agnostic — control-plane images are multi-
 //! arch manifest lists (ECR `{sha}` → `{sha}-{amd64,arm64}`), so
 //! Graviton is a cost/availability optimization, not a correctness
-//! risk. Only the per-system builder/fetcher NodePools MUST carry
-//! arch (the Jobs they host are single-arch). Those are named
-//! `rio-{builder,fetcher}-{x86-64,aarch64}[-kvm]`.
+//! risk. Only the per-system fetcher NodePools MUST carry arch (the
+//! Jobs they host are single-arch). §13c: builder NodePools (incl.
+//! the static metal pool) are gone — §13b NodeClaims carry arch from
+//! the hwClass `requirements`.
 
 use std::time::Duration;
 
@@ -44,7 +45,7 @@ impl Scenario for NodepoolArch {
         };
 
         // Arch-agnostic by design (multi-arch images / never provisions).
-        const ARCH_AGNOSTIC: &[&str] = &["rio-general", "rio-builder-metal", "rio-nodeclaim-shim"];
+        const ARCH_AGNOSTIC: &[&str] = &["rio-general", "rio-nodeclaim-shim"];
 
         let missing: Vec<_> = pools
             .lines()

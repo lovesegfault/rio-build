@@ -1,8 +1,11 @@
-# I-205 metal/virtualized partition is structural: every NodePool that
-# resolves to a UEFI NodeClass (rio-default / rio-nvme) MUST carry an
-# `instance-size NotIn metalSizes` requirement, and rio-builder-metal's
-# `instance-size In` MUST be the SAME list. Single source is
-# `.Values.karpenter.metalSizes`; both sides are template-injected.
+# I-205 metal/virtualized partition is structural: every static NodePool
+# (UEFI NodeClass: rio-default / rio-nvme) MUST carry an
+# `instance-size NotIn metalSizes` requirement. §13c: there is no static
+# metal NodePool — `metal-*` hwClasses get the `In` side from §13b
+# `cover::build_nodeclaim`, which reads `controller.toml [nodeclaim_pool]
+# metal_sizes`. Single source is `.Values.karpenter.metalSizes`; both the
+# template-side NotIn AND the controller-side metal_sizes are injected
+# from it. This check asserts both stay in lockstep.
 
 karp=$TMPDIR/karp-metal.yaml
 helm template rio . \
@@ -24,8 +27,16 @@ notin_of() {
          | .values" -o=json "$karp" | jq -sc 'add // [] | sort'
 }
 
-# Every UEFI-NodeClass pool carries NotIn ⊇ want.
+# Every static NodePool carries NotIn ⊇ want (UEFI partition guard).
+# §13c: there should be NO NodePool referencing rio-metal anymore.
 fail=0
+metal_pools=$(yq -N 'select(.kind=="NodePool"
+                            and .spec.template.spec.nodeClassRef.name=="rio-metal")
+                     | .metadata.name' "$karp")
+if [ -n "$metal_pools" ]; then
+  echo "FAIL: NodePool(s) still reference rio-metal NodeClass (should be §13b-only): $metal_pools" >&2
+  fail=1
+fi
 while read -r pool; do
   got=$(notin_of "$pool")
   for sz in metal metal-16xl metal-24xl metal-32xl metal-48xl; do
@@ -34,23 +45,24 @@ while read -r pool; do
       fail=1
     }
   done
-done < <(yq -N 'select(.kind=="NodePool"
-                       and (.spec.template.spec.nodeClassRef.name=="rio-default"
-                            or .spec.template.spec.nodeClassRef.name=="rio-nvme"))
-                | .metadata.name' "$karp")
+done < <(yq -N 'select(.kind=="NodePool") | .metadata.name' "$karp")
 [ "$fail" = 0 ] || exit 1
 
-# rio-builder-metal's In == any uefi pool's NotIn (same list, partition).
-metal_in=$(yq -N 'select(.kind=="NodePool" and .metadata.name=="rio-builder-metal")
-                  | .spec.template.spec.requirements[]
-                  | select(.key=="karpenter.k8s.aws/instance-size" and .operator=="In")
-                  | .values' -o=json "$karp" | jq -sc 'add // [] | sort')
-uefi_notin=$(notin_of rio-fetcher)
-test "$metal_in" = "$uefi_notin" || {
-  echo "FAIL: rio-builder-metal In ($metal_in) != rio-fetcher NotIn ($uefi_notin) — partition not single-sourced" >&2
+# §13c In-side: controller.toml [nodeclaim_pool] metal_sizes ==
+# .Values.karpenter.metalSizes. The §13b `cover::build_nodeclaim` reads
+# this for the `instance-size In/NotIn` partition; if it drifts from the
+# NodePool NotIn list, a metal NodeClaim could resolve to a UEFI-pool
+# instance size or vice versa.
+ctrl_toml=$(yq -N 'select(.kind=="ConfigMap" and .metadata.name=="rio-controller-config")
+                   | .data."controller.toml"' "$karp")
+ctrl_metal=$(printf '%s\n' "$ctrl_toml" \
+  | grep '^metal_sizes' | sed 's/^metal_sizes = //' | jq -sc 'add // [] | sort')
+test "$ctrl_metal" = "$want" || {
+  echo "FAIL: controller.toml metal_sizes ($ctrl_metal) != karpenter.metalSizes ($want)" >&2
   exit 1
 }
-test "$metal_in" = "$want" || {
-  echo "FAIL: rio-builder-metal In ($metal_in) != $want" >&2
+uefi_notin=$(notin_of rio-fetcher)
+test "$ctrl_metal" = "$uefi_notin" || {
+  echo "FAIL: controller.toml metal_sizes ($ctrl_metal) != rio-fetcher NotIn ($uefi_notin) — partition not single-sourced" >&2
   exit 1
 }
