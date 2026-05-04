@@ -964,8 +964,10 @@ poolDefaults:
   image: rio-builder
   # 50Gi. Reconciler adds this verbatim to every worker pod's
   # ephemeral-storage request/limit AND the fuse-cache emptyDir
-  # sizeLimit. CRD-side default when unset is the safe minimum
-  # (8Gi/4Gi) so non-helm Pools schedule on small-disk nodes; prod
+  # sizeLimit. Builder pools ignore this (single-sourced from
+  # controller.toml [nodeclaim_pool].fuse_cache_bytes; CEL-rejected on
+  # the CRD). Fetcher controller-config fallback when unset is the safe
+  # minimum (4Gi) so non-helm Pools schedule on small-disk nodes; prod
   # overrides UP here.
   fuseCacheBytes: 53687091200
   # privileged:true is an ESCAPE HATCH for clusters whose containerd

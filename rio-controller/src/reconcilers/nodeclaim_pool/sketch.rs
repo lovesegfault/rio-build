@@ -34,9 +34,10 @@ const SKETCH_VERSION: u32 = 1;
 /// observations dominate quickly.
 const N_SEED: usize = 10;
 
-/// `boot_active.count()` threshold below which [`CellState::ice_timeout`]
-/// uses `2×seed` instead of `q_0.99(boot)`. A 0.99-quantile on <100
-/// samples is noise; the seed floor is the conservative bound.
+/// `boot_active + boot_shadow` count threshold below which
+/// [`CellState::ice_timeout`] uses `2×seed` instead of `q_0.99(boot)`.
+/// A 0.99-quantile on <100 samples is noise; the seed floor is the
+/// conservative bound.
 const ICE_REAL_THRESHOLD: usize = 100;
 
 /// Spot vs on-demand. The migration's CHECK constraint pins the wire

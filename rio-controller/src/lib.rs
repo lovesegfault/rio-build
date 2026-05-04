@@ -175,9 +175,9 @@ pub fn describe_metrics() {
         "rio_controller_nodeclaim_intent_dropped_total",
         "nodeclaim_pool cover_deficit intents dropped by `reason`. \
          reason=no_menu_for_arch: hw-agnostic intent.system maps to an arch \
-         with no configured hw-class (and referenceHwClass mismatches) — the \
-         cold-start fallback could not target ANY cell. Non-zero on a \
-         dual-arch cluster = a hwClasses key-set is missing one arch. \
+         with no configured hw-class large enough to host it — either the \
+         hwClasses key-set is missing that arch, OR every arch-matching \
+         class's max_cores/max_mem is below the intent's footprint. \
          reason=exceeds_cell_cap: intent's pod footprint exceeds the assigned \
          cell's per-class HwClassDef.max_cores/max_mem (or max_node_disk) — \
          the scheduler's ClassCeiling gate didn't reject it (override-bypass \
@@ -233,8 +233,9 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_controller_ddsketch_seed_fallback_total",
         "Per-`cell` seed injections at CellSketches::seed(). Incremented once per \
-         cold-start cell whose z_active sketch was empty after PG load. >1 over \
-         controller lifetime = sketch persist failing (check tick errors)."
+         cold-start cell whose z_active AND z_shadow sketches were both empty \
+         after PG load. >1 over controller lifetime = sketch persist failing \
+         (check tick errors)."
     );
     describe_gauge!(
         "rio_controller_sketches_reload_pending",

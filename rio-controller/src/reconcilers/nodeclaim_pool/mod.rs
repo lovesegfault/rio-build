@@ -240,7 +240,8 @@ pub struct NodeClaimPoolConfig {
     /// `ephemeral-storage` floor and the pod's actual request both read
     /// this so FFD/cover/stamp agree (§Simulator-shares-accounting).
     /// Helm: `poolDefaults.fuseCacheBytes` (50Gi prod). Default is the
-    /// CRD safe-minimum `pool::pod::BUILDER_FUSE_CACHE_BYTES` (8Gi).
+    /// controller-config fallback `pool::pod::BUILDER_FUSE_CACHE_BYTES`
+    /// (8Gi).
     pub fuse_cache_bytes: u64,
 }
 

@@ -78,10 +78,10 @@ const READ_ONLY_ROOT_MOUNTS: &[(&str, &str, Option<&str>, Option<&str>)] = &[
 /// evicts large-closure builds (chromium/LLVM-class) on the pod-level
 /// limit before the volume-level one fires.
 ///
-/// CRD-side default is the SAFE MINIMUM (fits ~21Gi-allocatable k3s
-/// nodes) so a Pool created via raw `kubectl apply` without
-/// `spec.fuseCacheBytes` schedules anywhere. Prod gets 50Gi via the
-/// helm chart's `poolDefaults.fuseCacheBytes`.
+/// SAFE-MINIMUM fallback when [`BUILDER_FUSE_CACHE`] is unset (fits
+/// ~21Gi-allocatable k3s nodes). Prod sets 50Gi via controller.toml
+/// `[nodeclaim_pool].fuse_cache_bytes`; the CRD field is CEL-rejected
+/// for Builder kind.
 pub(crate) const BUILDER_FUSE_CACHE_BYTES: u64 = 8 * (1 << 30);
 
 /// Default FUSE cache size for fetchers. FODs are typically small

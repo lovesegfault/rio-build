@@ -393,7 +393,7 @@ fn degrade_host_users_suppressed_builder_only() {
 /// The field is ignored anyway (`pod::fuse_cache_bytes` reads
 /// `BUILDER_FUSE_CACHE` for Builder kind) — the hard-reject was purely
 /// punitive. This is the no-apiserver DEGRADE-path coverage; the CEL
-/// layer is asserted in `nix/tests/helm/18-builder-fuse-cache-cel.sh`.
+/// rule itself is asserted in `rio-crds::pool::tests`.
 #[test]
 fn degrade_builder_fuse_cache_ignored() {
     use crate::reconcilers::pool::{DEGRADE_CHECKS, REASON_BUILDER_FUSE_CACHE_IGNORED};

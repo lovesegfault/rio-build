@@ -281,7 +281,7 @@ r[obs.metric.controller]
 | `rio_controller_ffd_unplaced_cores` | Gauge | `Σ SpawnIntent.cores` per `cell` left unplaced by FFD at the last tick. `cover_deficit`'s per-cell input. Non-zero with `created_total` flat = `max_fleet_cores` or per-tick cap throttling. |
 | `rio_controller_ffd_placeable_intents` | Gauge | SpawnIntents FFD-placed at the last tick (labeled by `state`). `state=registered` ⇒ on a `Registered=True` claim (Jobs created this tick); `state=inflight` ⇒ on a not-yet-Registered claim (held by placeable-gate). `registered/(registered+inflight)` is the forecast warm-hit proxy. |
 | `rio_controller_nodeclaim_lead_time_seconds` | Gauge | Per-`cell` provisioning lead-time: `lead_time_q`-quantile of the `z=boot−eta_error` DDSketch. What `cover_deficit` provisions ahead by. Stuck at the seed value = no `Registered=True` transitions recorded yet. |
-| `rio_controller_ddsketch_seed_fallback_total` | Counter | Per-`cell` seed injections at `CellSketches::seed()`. Once per cold-start cell whose `z_active` was empty after PG load. >1 over controller lifetime = sketch persist failing. |
+| `rio_controller_ddsketch_seed_fallback_total` | Counter | Per-`cell` seed injections at `CellSketches::seed()`. Once per cold-start cell whose `z_active` AND `z_shadow` were both empty after PG load. >1 over controller lifetime = sketch persist failing. |
 
 ### Histogram Buckets
 

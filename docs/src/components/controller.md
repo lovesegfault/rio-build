@@ -460,12 +460,16 @@ before forecast, large before small), bin-select `MostAllocated` on
 the `allocatable` divisor — so the deficit is the unplaced residual
 and matches the `schedulerName: kube-build-scheduler` instance.
 
-r[ctrl.nodeclaim.anchor-bulk+3]
-Unplaced intents per `(h,cap)` cell are covered by `n` uniform claims at
+r[ctrl.nodeclaim.anchor-bulk+4]
+Unplaced intents per `(h,cap)` cell whose pod footprint fits the cell's
+per-class `(max_cores, max_mem)` and global `max_disk` cap are covered
+by `n` uniform claims at
 `(max(⌈Σc*/n⌉, max_i c*), max(Σm/n, max_i m), max(Σd_eph/n, max_i d_eph))`,
 where `n` iterates upward from the 3-axis lower bound
 `max(⌈Σc*/maxCores⌉, ⌈Σm/maxMem⌉, ⌈Σd_eph/maxDisk⌉)` until the
-production FFD's MostAllocated-cpu placement order packs every intent
+production FFD's MostAllocated-cpu placement order packs every fitting
+intent; over-cap intents are dropped with
+`intent_dropped_total{reason=exceeds_cell_cap}`
 (`Σ/n` is a bin-packing lower bound, not a guarantee). NodeClaim
 creation is capped at `sla.maxNodeClaimsPerCellPerTick` and the
 `sla.maxFleetCores` budget; cells are iterated round-robin from a

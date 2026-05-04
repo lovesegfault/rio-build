@@ -26,7 +26,7 @@ spec:
   {{- end }}
   {{- /* Builder pools single-source fuseCacheBytes from controller
          [nodeclaim_pool].fuse_cache_bytes so FFD/cover/stamp agree;
-         the controller rejects a Builder Pool that sets it. */}}
+         CEL forbids it for Builder (pre-CEL CRs: ignored + Warning). */}}
   {{- if ne $p.kind "Builder" }}
   {{- with $p.fuseCacheBytes }}
   fuseCacheBytes: {{ int64 . }}
