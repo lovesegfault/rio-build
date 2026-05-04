@@ -680,6 +680,10 @@ mod tests {
             node_class: "rio-default".into(),
             max_cores: 64,
             max_mem: 256 << 30,
+            taints: Vec::new(),
+            provides_features: Vec::new(),
+            max_fleet_cores: None,
+            capacity_types: CapacityType::ALL.to_vec(),
         }
     }
 
