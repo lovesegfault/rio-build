@@ -33,6 +33,13 @@ use crate::lease::LeaderState;
 
 use super::config::{CapacityType, Cell, HwClassName, cell_label, parse_cell};
 
+/// §13c-3: the dominant test-fixture resolved global. `from_parts`
+/// presets [`CostTable::resolved_global`] to `Some(TEST_GLOBAL)` so test
+/// code that does `*ct = from_parts(...)` doesn't have to re-set; other
+/// fixtures `set_resolved_global(TEST_GLOBAL)` to match.
+#[cfg(test)]
+pub const TEST_GLOBAL: (u32, u64) = (64, 256 << 30);
+
 /// One instance type in a cell's menu. `name`+`cores` drive
 /// `poll_spot_once`'s per-type AWS query and `$/vCPU` divisor.
 /// `mem_bytes` is informational (from controller observation);
@@ -787,8 +794,8 @@ impl CostTable {
     /// Test constructor. `source` is `Spot` so explicit `price` values
     /// pass through [`Self::price`] (the read-gate returns the seed
     /// under non-Spot — bug_034). §13c-3: `resolved_global` is preset
-    /// to `(64, 256GiB)` (the dominant test fixture global) so `*ct =
-    /// from_parts(...)` overwrites in test code don't have to re-set
+    /// to [`TEST_GLOBAL`] so `*ct = from_parts(...)` overwrites in test
+    /// code don't have to re-set
     /// it. Tests that need a different global call
     /// [`Self::set_resolved_global`] after.
     #[cfg(test)]
@@ -809,7 +816,7 @@ impl CostTable {
                 .collect(),
             lambda,
             source: HwCostSource::Spot,
-            resolved_global: Some((64, 256 << 30)),
+            resolved_global: Some(TEST_GLOBAL),
             ..Self::default()
         }
     }
@@ -1446,7 +1453,7 @@ mod tests {
         // Inverse: hash CHANGES when the resolved global differs —
         // catches a regression that drops the term from the hash.
         let mut b = CostTable::seeded("us-east-1", HwCostSource::Spot);
-        b.set_resolved_global((64, 256 << 30));
+        b.set_resolved_global(TEST_GLOBAL);
         assert_ne!(b.solve_relevant_hash(), h_before);
     }
 

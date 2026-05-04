@@ -945,7 +945,8 @@ impl NodeClaimPoolReconciler {
         let Some((global_cores, global_mem)) = self.hw_config.global_ceilings() else {
             warn!(
                 unplaced = unplaced.len(),
-                "§13c-3: GetHwClassConfig global ceilings not yet loaded;                  skipping cover this tick (self-heals on next 300s refresh)"
+                "§13c-3: GetHwClassConfig global ceilings not yet loaded; \
+                 skipping cover this tick (self-heals on next 300s refresh)"
             );
             return Ok(CoverResult::default());
         };

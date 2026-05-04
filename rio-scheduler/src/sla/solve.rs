@@ -1495,7 +1495,7 @@ mod tests {
     /// resolved global or `class_max_of` panics.
     fn ct() -> CostTable {
         let mut t = CostTable::default();
-        t.set_resolved_global((64, 256 << 30));
+        t.set_resolved_global(crate::sla::cost::TEST_GLOBAL);
         t
     }
 
@@ -2087,7 +2087,10 @@ mod tests {
     }
 
     fn cfg_hw() -> SlaConfig {
-        cfg_hw_max(64, 256 << 30)
+        cfg_hw_max(
+            crate::sla::cost::TEST_GLOBAL.0,
+            crate::sla::cost::TEST_GLOBAL.1,
+        )
     }
 
     fn cfg_hw_max(max_cores: u32, max_mem: u64) -> SlaConfig {
@@ -2174,7 +2177,7 @@ mod tests {
         // when prev_a contains it (τ_exit=0.195). Construct such a
         // cell via a price bump on intel-6.
         let mut cost = CostTable::seeded("", super::super::cost::HwCostSource::Spot);
-        cost.set_resolved_global((64, 256 << 30));
+        cost.set_resolved_global(crate::sla::cost::TEST_GLOBAL);
         cost.set_price(
             "intel-6",
             CapacityType::Spot,
@@ -2238,7 +2241,7 @@ mod tests {
         // ≈1.17·e_min (mid-band). intel-8 stays at seed → e_min.
         let seed = super::super::cost::ON_DEMAND_SEED * 0.35;
         let mut cost = CostTable::seeded("", super::super::cost::HwCostSource::Spot);
-        cost.set_resolved_global((64, 256 << 30));
+        cost.set_resolved_global(crate::sla::cost::TEST_GLOBAL);
         cost.set_price("intel-8", CapacityType::Spot, seed, 1e9);
         cost.set_price("intel-6", CapacityType::Spot, seed * 0.545, 1e9);
         let SolveFullResult::Feasible(memo) = solve_full(
@@ -2314,7 +2317,7 @@ mod tests {
         let mut cfg = cfg_hw();
         cfg.hw_cost_tolerance = 0.5;
         let mut cost = CostTable::seeded("", super::super::cost::HwCostSource::Spot);
-        cost.set_resolved_global((64, 256 << 30));
+        cost.set_resolved_global(crate::sla::cost::TEST_GLOBAL);
         for cap in CapacityType::ALL {
             cost.set_price("intel-6", cap, 0.009, 1e9);
             cost.set_price("intel-8", cap, 0.043, 1e9);
@@ -2862,7 +2865,7 @@ mod tests {
     #[test]
     fn observed_menu_does_not_capacity_reject_class_ceiling_does() {
         let mut cost = CostTable::seeded("c", super::super::cost::HwCostSource::Static);
-        cost.set_resolved_global((64, 256 << 30));
+        cost.set_resolved_global(crate::sla::cost::TEST_GLOBAL);
         // Observed menu: only a 2-core type (e.g., m7i.large from a
         // first cold-start probe).
         cost.set_menu(
@@ -2885,7 +2888,7 @@ mod tests {
             &hw,
             &cost,
             &ceil(),
-            (64, 256 << 30),
+            crate::sla::cost::TEST_GLOBAL,
             &"intel-7".into(),
             CapacityType::Spot,
             64.0,
