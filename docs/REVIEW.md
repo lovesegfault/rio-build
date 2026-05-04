@@ -217,6 +217,33 @@ semantics, a CRD constraint, or a spec'd algorithm, the (2)/(3) `rg`
 MUST cover `docs/src/ infra/helm/ rio-*/src/lib.rs` in addition to the
 editing crate. Shorthand: "operator-visible ⟹ cross-tier sweep".
 
+**Cross-component checksum sweep.** r30 bug_021: helm/16 fixed
+`controller.yaml`'s pod-template checksum to hash the rendered TOML
+body (`rio.controllerToml`); `scheduler.yaml` — one file over, the
+same `subPath`-mounted read-once-at-boot config pattern — kept hashing
+a hand-maintained `(toJson $s.softFeatures) (toJson $s.sla)` subtree
+list. §13c-2 then added `metal_sizes = {{ toJson
+$.Values.karpenter.metalSizes }}` to BOTH bodies; the controller
+rolled, the scheduler didn't, and the two diverged on the metal
+partition predicate until a manual restart. The §SCC(3) sibling sweep
+on a helm checksum fix was scoped to the one `*.yaml` it edited.
+
+The (3) sweep for a checksum-coverage fix MUST cover **every
+deployment with a `checksum/*` pod-template annotation**, not just the
+component being fixed: `rg 'checksum/' infra/helm/rio-build/
+templates/`. For each hit, confirm the annotation hashes a named
+template `include` (the rendered body), not a hand-maintained list of
+input subtrees — a list silently goes stale the moment a key is added
+that reads outside the listed subtrees. **Done-gate addition:** when
+adding a key to a rendered config body (TOML, KubeSchedulerConfig,
+nginx conf, …), `rg <new helm value path>
+infra/helm/rio-build/templates/` MUST show it reachable from BOTH the
+ConfigMap `data:` block AND the consuming pod's `checksum/*`
+annotation — one render path, hashed once. Invariant: "every templated
+value reachable only through a rendered ConfigMap body is hashed by
+that ConfigMap's consumers' checksum annotation." (Env-set config rolls
+via the Deployment-spec hash and is out of scope.)
+
 ## Verifier-one-step-removed
 
 A verifier that confirms "the bughunter's claim X is refuted" can miss
