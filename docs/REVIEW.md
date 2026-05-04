@@ -309,6 +309,47 @@ of the claimed equivalence and confirm they read the SAME source. "X
 mirrors Y" / "X agrees with Y" comments are §Partition-single-source
 findings unless X and Y literally share a fn call.
 
+## Placement-supersets-provisioning
+
+When a control loop both *places* work (writing scheduling constraints
+onto a workload) and *provisions* capacity (creating resources that
+should host that workload), the provisioning decision MUST be a subset
+of placement-feasible resources. The constraint axes that placement
+enforces (arch, hardware features, size, capacity-type, taint
+tolerance, …) MUST be enumerated at a single producer chokepoint that
+filters the provisioning candidate set, AND at every consumer-side
+fallback path that handles the "constraint signal absent" case (e.g.
+empty hint == hw-agnostic).
+
+A placement constraint added without the corresponding provisioning
+filter is the **bootstrap deadlock** shape: the workload waits for a
+resource the provisioner will never mint. Symptoms: `Pending` workload
++ minted-but-incompatible resource; or no resource minted because the
+simulator believed an incompatible one would do.
+
+The chokepoint operates on the *typed parameter* form of each axis
+(e.g. `Vec<Cell>` not `Vec<NodeSelectorTerm>`) so a new axis is a
+signature change, not a data field the chokepoint silently ignores.
+A contract test enumerates the axis set and perturbs each — adding an
+axis without a row in the test means the chokepoint can't be verified
+to see it.
+
+The consumer backstop is REQUIRED, not optional defense-in-depth:
+"constraint signal absent" can be legitimate (no resource hosts the
+constraint), and the consumer must not treat it as unconstrained-
+agnostic. The bidirectional ∅-guard is the canonical form: a featured
+intent must NOT route to a featureless cell AND a featureless intent
+must NOT route to a featured cell.
+
+r30 §13d: 4/9 findings (mb_012, bug_042, bug_007, mb_033) are this
+shape on the scheduler→controller boundary. The §13c rewrite that
+deleted the static metal NodePool escape-hatch removed the safety net
+without making the constraint propagation total. STRIKE-7 close:
+`retain_hosting_cells` (was `retain_hosting_classes`) operates on
+`Vec<Cell>` and filters arch+features+size+capacity-type; the
+controller's `fallback_cell` and FFD `simulate` agnostic filter share
+`features_compatible` from `rio-common::k8s`.
+
 ## Partition-single-source
 
 A "list X mirrors list Y so they partition the space" comment over two

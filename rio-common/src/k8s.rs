@@ -16,6 +16,33 @@ pub fn system_to_k8s_arch(system: &str) -> Option<&'static str> {
     }
 }
 
+// r[impl sched.sla.hwclass.provides.bidir]
+/// Bidirectional ∅-guard feature-match predicate. Single source for
+/// the §13c/D3/D10/I-181 routing rule — open-coding this at ≥4 sites
+/// (scheduler `solve_intent_for` `h_all` partition, `retain_hosting_cells`
+/// chokepoint, controller `fallback_cell` / FFD `simulate` agnostic
+/// backstop, store worker `passes_intent_filter`) lets them drift, and
+/// drift here is "kvm intent routed to non-kvm cell" or "metal node
+/// absorbs non-kvm build".
+///
+/// `true` iff every `required` feature is in `provides` AND
+/// `required.is_empty() == provides.is_empty()`. The second clause is
+/// the bidirectional guard: a class providing `[kvm]` rejects
+/// featureless intents (so metal doesn't absorb non-kvm); a class
+/// providing `[]` rejects `[kvm]` intents (so non-metal isn't picked
+/// for kvm — `[]⊆anything` would otherwise let it through). Subset (not
+/// equality) on the populated side keeps the door open for
+/// `provides=[kvm, big-parallel]` hosting `required=[kvm]`.
+///
+/// §13d (r30 mb_012): moved from `rio-scheduler::sla::config` to
+/// `rio-common::k8s` so the controller's `nodeclaim_pool` consumer-side
+/// backstop (`fallback_cell`, FFD `simulate` agnostic filter) shares
+/// the same predicate as the scheduler's producer chokepoint —
+/// "placement ⊇ provisioning" requires both sides to agree.
+pub fn features_compatible(required: &[String], provides: &[String]) -> bool {
+    required.iter().all(|f| provides.contains(f)) && required.is_empty() == provides.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -29,5 +56,35 @@ mod tests {
         assert_eq!(system_to_k8s_arch("builtin"), None);
         assert_eq!(system_to_k8s_arch(""), None);
         assert_eq!(system_to_k8s_arch("riscv64-linux"), None);
+    }
+
+    /// §13c T1b: bidirectional ∅-guard. Single canonical predicate for
+    /// D3/D10/I-181 routing — open-coding at ≥4 sites lets them drift.
+    // r[verify sched.sla.hwclass.provides.bidir]
+    #[test]
+    fn features_compatible_bidirectional_guard() {
+        let s = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| (*s).into()).collect() };
+        // Both empty → compatible.
+        assert!(features_compatible(&[], &[]));
+        // Exact match → compatible.
+        assert!(features_compatible(&s(&["kvm"]), &s(&["kvm"])));
+        // required=[], provides=[kvm] → INcompatible (∅-guard: metal
+        // must not absorb non-kvm).
+        assert!(!features_compatible(&[], &s(&["kvm"])));
+        // required=[kvm], provides=[] → INcompatible (∅-guard: non-metal
+        // must not host kvm; []⊆anything would otherwise let it through).
+        assert!(!features_compatible(&s(&["kvm"]), &[]));
+        // Subset on populated side → compatible (provides=[kvm,bp]
+        // hosts required=[kvm]).
+        assert!(features_compatible(&s(&["kvm"]), &s(&["kvm", "bp"])));
+        // required ⊄ provides → incompatible.
+        assert!(!features_compatible(&s(&["kvm", "bp"]), &s(&["kvm"])));
+        // bug_007: nixos-test + kvm both required, class provides only
+        // kvm → unroutable. Surfaced metal `providesFeatures: [kvm]`
+        // missing `nixos-test`.
+        assert!(!features_compatible(
+            &s(&["kvm", "nixos-test"]),
+            &s(&["kvm"])
+        ));
     }
 }

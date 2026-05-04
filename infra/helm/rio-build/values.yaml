@@ -606,7 +606,14 @@ scheduler:
         capacityTypes: [on-demand]
         taints:
           - {key: rio.build/kvm, value: "true", effect: NoSchedule}
-        providesFeatures: [kvm]
+        # §13d (r30 bug_007): nixpkgs `nixosTest` derivations declare
+        # `requiredSystemFeatures = ["nixos-test", "kvm"]`. Both are
+        # hardware gates (not in `softFeatures`); `features_compatible`
+        # is subset-on-required, so a class providing only `[kvm]`
+        # rejects them and the ∅-guard rejects every non-metal class →
+        # `h_all=[]` → unroutable. The pre-§13c kvm Pool advertised
+        # `[kvm, nixos-test, big-parallel]`; §13c dropped `nixos-test`.
+        providesFeatures: [kvm, nixos-test]
         # §13c D4a: x86+arm Σ = 10000 (= the maxFleetCores bump amount).
         maxFleetCores: 5000
         # maxCores/maxMem unset → §13c-2 catalog ceiling at boot
@@ -625,7 +632,7 @@ scheduler:
         capacityTypes: [on-demand]
         taints:
           - {key: rio.build/kvm, value: "true", effect: NoSchedule}
-        providesFeatures: [kvm]
+        providesFeatures: [kvm, nixos-test]
         maxFleetCores: 5000
     hwCostSource: spot
     referenceHwClass: mid-ebs-x86

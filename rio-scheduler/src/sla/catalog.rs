@@ -8,7 +8,7 @@
 //!
 //! Deriving from `CostTable.cells` (Acked instance types) ratchets DOWN:
 //! Karpenter launches the cheapest type that fits → first 4c probe →
-//! `observed_max(h)=4` → `retain_hosting_classes` strips `h` for any
+//! `observed_max(h)=4` → `retain_hosting_cells` strips `h` for any
 //! `cores>4` → no large build routes there → no large node launches →
 //! never grows. The catalog is launch-independent and available at boot.
 //!

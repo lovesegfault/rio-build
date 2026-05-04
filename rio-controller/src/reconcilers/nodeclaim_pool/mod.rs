@@ -261,10 +261,24 @@ impl NodeClaimPoolConfig {
     /// default classes — cold-start probes are uniform `probe.cpu`-
     /// shaped and bounded by `max_node_claims_per_cell_per_tick`;
     /// on-demand fallback would defeat the §13b cost model. OnDemand
-    /// for od-only classes like metal — §13c). No `provides_features`
-    /// filter here: post-§13c kvm intents always get
-    /// `hw_class_names=[metal-*]` from the scheduler so they never
-    /// reach fallback empty.
+    /// for od-only classes like metal — §13c).
+    ///
+    /// §13d STRIKE-7 (r30 mb_012): `provides_features` IS filtered here.
+    /// The pre-r30 doc claimed "post-§13c kvm intents always get
+    /// `hw_class_names=[metal-*]` from the scheduler so they never reach
+    /// fallback empty" — that was wrong for the cold-start (`fit=None`)
+    /// path, which emitted `hw_class_names=[]` unconditionally; and a
+    /// featured intent CAN legitimately ship `[]` when no class hosts
+    /// it (`reference_hw_class_for_system` returns `None`). The
+    /// scheduler-side `None/None` arm now emits cells for featured
+    /// non-FOD intents (so this is mostly a backstop), but the consumer
+    /// MUST NOT treat a feature-carrying `[]` intent as
+    /// unconstrained-agnostic. Bidirectional ∅-guard
+    /// (`features_compatible`) also closes the inverse leak: a
+    /// featureless intent must NOT land on a kvm-tainted metal cell —
+    /// the metal node carries `rio.build/kvm:NoSchedule` and the
+    /// featureless pod has no toleration → wasted on-demand metal Node.
+    ///
     /// `masked` cells are skipped — when the reference cell is
     /// ICE-masked, the next arch-matching cell is returned so
     /// cold-start probes don't silently strand on a cell
@@ -290,8 +304,9 @@ impl NodeClaimPoolConfig {
             (hw.matches_arch(h, arch)
                 && !masked.contains(&c)
                 && i.cores <= cls_c
-                && i.mem_bytes <= cls_m)
-                .then_some(c)
+                && i.mem_bytes <= cls_m
+                && rio_common::k8s::features_compatible(&i.required_features, &hw.provides_for(h)))
+            .then_some(c)
         };
         candidate(&self.reference_hw_class).or_else(|| hw.names().iter().find_map(|h| candidate(h)))
     }
@@ -663,13 +678,22 @@ impl NodeClaimPoolReconciler {
         );
 
         let bound = self.pod_requested.bound_intents();
+        // §13d STRIKE-7 (mb_012): the agnostic-fallback admit predicate
+        // checks arch ∧ features. A `hw_class_names=[]` kvm intent must
+        // NOT FFD-place onto a non-metal node (deficit appears covered →
+        // no metal NodeClaim minted → kvm pod permanently Pending); a
+        // featureless intent must NOT land on a kvm-tainted metal node
+        // (pod has no toleration → wasted on-demand metal).
         let (placeable, unplaced) = ffd::simulate(
             &intents.intents,
             &live,
             &self.sketches,
             &bound,
             self.cfg.fuse_cache_bytes,
-            |h, a| self.hw_config.matches_arch(h, a),
+            |h, a, f| {
+                self.hw_config.matches_arch(h, a)
+                    && rio_common::k8s::features_compatible(f, &self.hw_config.provides_for(h))
+            },
         );
         // Schmitt-adjust `lead_time_q` from the per-cell EWMA of
         // `on_reg/(on_reg+on_inf)` — the warm-hit proxy. A cell whose
@@ -1368,6 +1392,145 @@ mod tests {
         );
         // 256c exceeds ALL classes → None (no_hosting_class).
         assert_eq!(cfg.fallback_cell(&mk(256), &hw, &none), None);
+    }
+
+    /// §13d STRIKE-7 (r30 mb_012): `fallback_cell` filters by
+    /// `provides_features`. The pre-r30 doc claimed kvm intents always
+    /// get `hw_class_names=[metal-*]` — false for cold-start
+    /// (`fit=None`). A cold-start kvm intent with `hw_class_names=[]`
+    /// must NOT fall back to the non-metal reference cell (the kvm
+    /// pod's `nodeSelector` would never match → permanently Pending).
+    /// Inverse (∅-guard): a featureless intent must NOT route to a
+    /// kvm-tainted metal cell (pod has no toleration → wasted on-demand
+    /// metal Node).
+    #[test]
+    fn fallback_cell_filters_by_provides_features() {
+        use rio_proto::types::{HwClassLabels, NodeLabelMatch};
+        let cfg = NodeClaimPoolConfig {
+            reference_hw_class: "mid-ebs-x86".into(),
+            ..Default::default()
+        };
+        let arch = |a: &str| NodeLabelMatch {
+            key: ARCH_LABEL.into(),
+            value: a.into(),
+        };
+        let hw = HwClassConfig::default();
+        hw.set(
+            [
+                (
+                    "mid-ebs-x86".into(),
+                    HwClassLabels {
+                        labels: vec![arch("amd64")],
+                        max_cores: 64,
+                        max_mem: 256 << 30,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "metal-x86".into(),
+                    HwClassLabels {
+                        labels: vec![arch("amd64")],
+                        max_cores: 64,
+                        max_mem: 256 << 30,
+                        provides_features: vec!["kvm".into()],
+                        capacity_types: vec!["od".into()],
+                        ..Default::default()
+                    },
+                ),
+            ]
+            .into(),
+            (192, 1536 << 30),
+        );
+        let mk = |features: &[&str]| SpawnIntent {
+            system: "x86_64-linux".into(),
+            cores: 4,
+            mem_bytes: 8 << 30,
+            required_features: features.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        };
+        let none = HashSet::new();
+        // kvm intent → metal cell, NOT the non-metal reference.
+        assert_eq!(
+            cfg.fallback_cell(&mk(&["kvm"]), &hw, &none),
+            Some(Cell("metal-x86".into(), CapacityType::OnDemand)),
+            "kvm intent must route to metal-x86, not the non-metal reference"
+        );
+        // featureless intent → reference cell, NOT metal (∅-guard).
+        assert_eq!(
+            cfg.fallback_cell(&mk(&[]), &hw, &none),
+            Some(Cell("mid-ebs-x86".into(), CapacityType::Spot)),
+            "featureless intent must NOT route to kvm-tainted metal"
+        );
+        // No class hosts the feature → None (no_hosting_class).
+        assert_eq!(
+            cfg.fallback_cell(&mk(&["nixos-test", "kvm"]), &hw, &none),
+            None,
+            "no class provides nixos-test+kvm → None → no_hosting_class metric"
+        );
+    }
+
+    /// §13d STRIKE-7 inverse-guard (r30 mb_012): a featureless intent
+    /// must NEVER fall back to a kvm-tainted metal cell, even when ALL
+    /// non-metal cells are ICE-masked. Stranding (return `None`) is
+    /// correct: the masked non-metal cells re-arm after backoff;
+    /// minting a metal node a featureless pod can't tolerate just burns
+    /// on-demand budget.
+    #[test]
+    fn fallback_cell_featureless_excludes_metal_even_when_others_masked() {
+        use rio_proto::types::{HwClassLabels, NodeLabelMatch};
+        let cfg = NodeClaimPoolConfig {
+            reference_hw_class: "mid-ebs-x86".into(),
+            ..Default::default()
+        };
+        let arch = |a: &str| NodeLabelMatch {
+            key: ARCH_LABEL.into(),
+            value: a.into(),
+        };
+        let hw = HwClassConfig::default();
+        hw.set(
+            [
+                (
+                    "mid-ebs-x86".into(),
+                    HwClassLabels {
+                        labels: vec![arch("amd64")],
+                        max_cores: 64,
+                        max_mem: 256 << 30,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "metal-x86".into(),
+                    HwClassLabels {
+                        labels: vec![arch("amd64")],
+                        max_cores: 64,
+                        max_mem: 256 << 30,
+                        provides_features: vec!["kvm".into()],
+                        capacity_types: vec!["od".into()],
+                        ..Default::default()
+                    },
+                ),
+            ]
+            .into(),
+            (192, 1536 << 30),
+        );
+        // Mask every non-metal cell.
+        let masked: HashSet<Cell> = [
+            Cell("mid-ebs-x86".into(), CapacityType::Spot),
+            Cell("mid-ebs-x86".into(), CapacityType::OnDemand),
+        ]
+        .into();
+        let i = SpawnIntent {
+            system: "x86_64-linux".into(),
+            cores: 4,
+            mem_bytes: 8 << 30,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.fallback_cell(&i, &hw, &masked),
+            None,
+            "featureless intent must strand on masked non-metal cells, \
+             not fall back to kvm-tainted metal"
+        );
     }
 
     /// `ControllerLeaseHooks` flags propagate via shared `Arc` — the

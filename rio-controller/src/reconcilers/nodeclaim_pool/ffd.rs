@@ -284,13 +284,22 @@ pub type Placement = (SpawnIntent, String, bool);
 /// §Simulator-shares-accounting guarantee — FFD compares against the
 /// SAME `(c,m,d)` the pod will request, not raw `disk_bytes`.
 // r[impl ctrl.nodeclaim.ffd-sim]
+/// `hw_admits(h, arch, required_features)` — agnostic-fallback gate.
+/// `arch` is the resolved `kubernetes.io/arch` value derived from
+/// `intent.system` (NOT re-derived inside the closure — `simulate`
+/// already resolves it once per intent). §13d STRIKE-7 (mb_012):
+/// `required_features` is included so the closure can check
+/// `features_compatible` — a `hw_class_names=[]` intent carrying
+/// `required_features=["kvm"]` must NOT FFD-place onto a non-metal
+/// node; the inverse (featureless intent onto kvm-tainted metal node)
+/// must NOT either.
 pub fn simulate(
     intents: &[SpawnIntent],
     live: &[LiveNode],
     sketches: &CellSketches,
     bound: &HashMap<String, String>,
     fuse_cache_bytes: u64,
-    hw_arch: impl Fn(&str, &str) -> bool,
+    hw_admits: impl Fn(&str, &str, &[String]) -> bool,
 ) -> (Vec<Placement>, Vec<SpawnIntent>) {
     use crate::reconcilers::pool::jobs::intent_pod_footprint;
     // Running free per node. Cell-less nodes excluded up front: no
@@ -334,11 +343,11 @@ pub fn simulate(
         let (ic, im, id) = intent_pod_footprint(&i, fuse_cache_bytes);
         let open = a_open(&i, sketches);
         // hw-agnostic (`hw_class_names=[]`): eligible on any node
-        // whose hw-class `kubernetes.io/arch` matches `intent.system`.
-        // `arch.is_none()` (unmappable system) → no node matches.
-        // Distinguished from "all cells lead-time-gated" (non-empty
-        // `hw_class_names`, empty `open`) which stays cell-gated and
-        // falls through to unplaced.
+        // whose hw-class admits the intent (arch + features — see
+        // `hw_admits` doc). `arch.is_none()` (unmappable system) → no
+        // node matches. Distinguished from "all cells lead-time-gated"
+        // (non-empty `hw_class_names`, empty `open`) which stays
+        // cell-gated and falls through to unplaced.
         let agnostic_arch = i
             .hw_class_names
             .is_empty()
@@ -348,7 +357,8 @@ pub fn simulate(
             .iter()
             .filter(|n| {
                 n.cell.as_ref().is_some_and(|c| {
-                    open.contains(c) || agnostic_arch.is_some_and(|a| hw_arch(&c.0, a))
+                    open.contains(c)
+                        || agnostic_arch.is_some_and(|a| hw_admits(&c.0, a, &i.required_features))
                 })
             })
             .filter(|n| {
@@ -429,7 +439,7 @@ pub(super) fn sim_packs(
         &CellSketches::default(),
         &HashMap::new(),
         fuse_cache_bytes,
-        |_, _| true,
+        |_, _, _| true,
     )
     .1
     .is_empty()
@@ -733,9 +743,9 @@ pub(crate) mod tests {
         &p.iter().find(|(i, _, _)| i.intent_id == id).unwrap().1
     }
 
-    /// `hw_arch` stub: every hw-class matches every arch (tests that
-    /// don't exercise the hw-agnostic path don't care).
-    fn any_arch(_h: &str, _a: &str) -> bool {
+    /// `hw_admits` stub: every hw-class admits every arch+features
+    /// (tests that don't exercise the hw-agnostic path don't care).
+    fn any_admit(_h: &str, _a: &str, _f: &[String]) -> bool {
         true
     }
 
@@ -751,7 +761,7 @@ pub(crate) mod tests {
             &CellSketches::default(),
             &HashMap::new(),
             0,
-            any_arch,
+            any_admit,
         )
     }
 
@@ -760,7 +770,7 @@ pub(crate) mod tests {
         live: &[LiveNode],
         sk: &CellSketches,
     ) -> (Vec<Placement>, Vec<SpawnIntent>) {
-        simulate(intents, live, sk, &HashMap::new(), 0, any_arch)
+        simulate(intents, live, sk, &HashMap::new(), 0, any_admit)
     }
 
     // --- LiveNode parsing ----------------------------------------------
@@ -1149,7 +1159,7 @@ pub(crate) mod tests {
             node("nx", "h-x86", CapacityType::Spot, 8, 64 * GI, 100 * GI),
             node("na", "h-arm", CapacityType::Spot, 8, 64 * GI, 100 * GI),
         ];
-        let hw_arch = |h: &str, a: &str| match h {
+        let hw_admits = |h: &str, a: &str, _f: &[String]| match h {
             "h-x86" => a == "amd64",
             "h-arm" => a == "arm64",
             _ => false,
@@ -1175,7 +1185,7 @@ pub(crate) mod tests {
             &CellSketches::default(),
             &none,
             0,
-            hw_arch,
+            hw_admits,
         );
         assert_eq!(p.len(), 2);
         assert_eq!(placed_on(&p, "x"), "nx");
@@ -1189,9 +1199,91 @@ pub(crate) mod tests {
             &CellSketches::default(),
             &none,
             0,
-            hw_arch,
+            hw_admits,
         );
         assert!(p.is_empty());
+        assert_eq!(u.len(), 1);
+    }
+
+    /// §13d STRIKE-7 (r30 mb_012): `simulate`'s agnostic path passes
+    /// `required_features` to `hw_admits`, so a `hw_class_names=[]`
+    /// kvm intent can NOT FFD-place onto a non-metal node and a
+    /// featureless intent can NOT land on kvm-tainted metal. Pre-fix
+    /// `simulate` only knew arch — a cold-start kvm intent FFD-placed
+    /// onto any amd64 node, the deficit appeared covered, no metal
+    /// NodeClaim minted, kvm pod permanently Pending.
+    #[test]
+    fn ffd_agnostic_intent_filtered_by_features() {
+        // One non-metal x86 node (provides=[]), one metal x86 node
+        // (provides=[kvm]).
+        let nodes = [
+            node("nstd", "std-x86", CapacityType::Spot, 8, 64 * GI, 100 * GI),
+            node(
+                "nmetal",
+                "metal-x86",
+                CapacityType::OnDemand,
+                8,
+                64 * GI,
+                100 * GI,
+            ),
+        ];
+        // hw_admits: arch matches everything (both x86); features gate.
+        let provides = |h: &str| -> Vec<String> {
+            if h == "metal-x86" {
+                vec!["kvm".into()]
+            } else {
+                vec![]
+            }
+        };
+        let hw_admits =
+            |h: &str, _a: &str, f: &[String]| rio_common::k8s::features_compatible(f, &provides(h));
+        let agn = |id: &str, features: &[&str]| SpawnIntent {
+            intent_id: id.into(),
+            cores: 4,
+            mem_bytes: GI,
+            disk_bytes: GI,
+            system: "x86_64-linux".into(),
+            required_features: features.iter().map(|s| (*s).to_string()).collect(),
+            ready: Some(true),
+            ..Default::default()
+        };
+        let none = HashMap::new();
+        // kvm intent → only the metal node admits it.
+        let (p, u) = simulate(
+            &[agn("kvm", &["kvm"])],
+            &nodes,
+            &CellSketches::default(),
+            &none,
+            0,
+            hw_admits,
+        );
+        assert_eq!(p.len(), 1, "kvm intent placed (on metal)");
+        assert_eq!(placed_on(&p, "kvm"), "nmetal");
+        assert!(u.is_empty());
+        // featureless intent → only the non-metal node admits it
+        // (∅-guard: provides=[kvm] rejects required=[]).
+        let (p, u) = simulate(
+            &[agn("plain", &[])],
+            &nodes,
+            &CellSketches::default(),
+            &none,
+            0,
+            hw_admits,
+        );
+        assert_eq!(p.len(), 1);
+        assert_eq!(placed_on(&p, "plain"), "nstd");
+        assert!(u.is_empty());
+        // kvm intent + only non-metal nodes → unplaced (cover_deficit
+        // mints metal). Pre-fix it FFD-placed onto std-x86 → no mint.
+        let (p, u) = simulate(
+            &[agn("kvm2", &["kvm"])],
+            &nodes[..1],
+            &CellSketches::default(),
+            &none,
+            0,
+            hw_admits,
+        );
+        assert!(p.is_empty(), "kvm intent must NOT place on non-metal node");
         assert_eq!(u.len(), 1);
     }
 
@@ -1230,7 +1322,7 @@ pub(crate) mod tests {
             &CellSketches::default(),
             &HashMap::new(),
             fuse,
-            any_arch,
+            any_admit,
         );
         // footprint = 1×1.5 + 50 + 1 (log) = 52.5Gi → ⌊200/52.5⌋ = 3.
         assert_eq!(
@@ -1266,7 +1358,7 @@ pub(crate) mod tests {
             &CellSketches::default(),
             &bound,
             0,
-            any_arch,
+            any_admit,
         );
         assert_eq!(p.len(), 1, "bound intent placeable on its actual node");
         assert_eq!(p[0].1, "nc");
@@ -1281,7 +1373,7 @@ pub(crate) mod tests {
             &CellSketches::default(),
             &stale,
             0,
-            any_arch,
+            any_admit,
         );
         assert!(p.is_empty(), "stale bound → falls through to fit-check");
     }

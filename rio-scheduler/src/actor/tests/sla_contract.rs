@@ -725,9 +725,10 @@ async fn contract_metrics_once_per_miss() {
         }
     }
     assert!(
-        actor
-            .ice
-            .exhausted(["intel-6", "intel-7", "intel-8"].map(String::from).iter()),
+        actor.ice.exhausted(
+            ["intel-6", "intel-7", "intel-8"].map(String::from).iter(),
+            |h| actor.sla_config.capacity_types_for(h).to_vec(),
+        ),
         "precondition: all H × cap masked"
     );
     actor.test_inject_ready("d-ice", Some("test-pkg"), "x86_64-linux", false);
@@ -2586,5 +2587,113 @@ async fn contract_kvm_routes_via_provides_features() {
     assert!(
         !nokvm_intent.hw_class_names.is_empty(),
         "non-kvm intent still routes to intel-* classes"
+    );
+}
+
+/// §13d STRIKE-7 (r30 mb_012): cold-start kvm intent (`fit=None`, no
+/// `--capacity` override, `required_features=["kvm"]`) must emit
+/// `hw_class_names != []` so the controller mints a metal NodeClaim.
+/// Pre-fix the bypass `None/None` arm returned `(Vec::new(), Vec::new())`
+/// unconditionally → controller's `fallback_cell` picked a non-metal
+/// reference cell → kvm pod (`nodeSelector: rio.build/kvm=true`)
+/// permanently Pending → no `build_sample` → `fit` stays `None` →
+/// hard bootstrap deadlock now that §13c deleted the static metal
+/// NodePool escape hatch.
+// r[verify sched.sla.hwclass.provides]
+#[tokio::test]
+async fn bypass_none_arm_featured_intent_emits_cells() {
+    use crate::sla::config::{ARCH_LABEL, HwClassDef, NodeLabelMatch};
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    actor.sla_config.hw_classes.insert(
+        "metal-x86".into(),
+        HwClassDef {
+            labels: vec![NodeLabelMatch {
+                key: ARCH_LABEL.into(),
+                value: "amd64".into(),
+            }],
+            node_class: "rio-metal".into(),
+            max_cores: Some(actor.sla_config.max_cores.unwrap() as u32),
+            max_mem: Some(actor.sla_config.max_mem.unwrap()),
+            provides_features: vec!["kvm".into()],
+            ..Default::default()
+        },
+    );
+    let m: std::collections::HashMap<_, _> = ["intel-6", "intel-7", "intel-8", "metal-x86"]
+        .into_iter()
+        .map(|h| (h.into(), 1.0))
+        .collect();
+    actor
+        .sla_estimator
+        .seed_hw(crate::sla::hw::HwTable::from_map(m));
+
+    // Cold-start: pname "cold-kvm" has no seeded fit → `fit=None` →
+    // bypass `None/None` arm.
+    actor.test_inject_ready_with_features("d-cold-kvm", Some("cold-kvm"), "x86_64-linux", &["kvm"]);
+    let snap = actor.compute_spawn_intents(&Default::default());
+    let intent = snap
+        .intents
+        .iter()
+        .find(|i| i.intent_id == "d-cold-kvm")
+        .expect("cold-start kvm intent emitted");
+    assert!(
+        !intent.hw_class_names.is_empty(),
+        "cold-start kvm intent must emit hw_class_names so the controller \
+         mints a metal NodeClaim — got [] (bootstrap deadlock)"
+    );
+    assert!(
+        intent.hw_class_names.iter().all(|h| h == "metal-x86"),
+        "cold-start kvm intent must route to metal-x86 ONLY; got {:?}",
+        intent.hw_class_names
+    );
+}
+
+/// §13d STRIKE-7 (r30 A9 / mb_012 inverse-guard): a fixed-output drv
+/// carrying `required_features` (a degenerate but possible builder
+/// declaration) must NOT get hw_class_names from the bypass `None/None`
+/// arm. FOD intents land on the helm-managed `rio-fetcher` NodePool —
+/// the `nodeclaim_pool` reconciler is hard-filtered to
+/// `kind: Builder` and never consumes them. Emitting metal cells for an
+/// FOD would over-reserve builder capacity in FFD and mint builder
+/// NodeClaims for fetcher demand. Gate is `!state.is_fixed_output`.
+#[tokio::test]
+async fn bypass_none_arm_fod_with_features_emits_empty() {
+    use crate::sla::config::{ARCH_LABEL, HwClassDef, NodeLabelMatch};
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    actor.sla_config.hw_classes.insert(
+        "metal-x86".into(),
+        HwClassDef {
+            labels: vec![NodeLabelMatch {
+                key: ARCH_LABEL.into(),
+                value: "amd64".into(),
+            }],
+            node_class: "rio-metal".into(),
+            max_cores: Some(actor.sla_config.max_cores.unwrap() as u32),
+            max_mem: Some(actor.sla_config.max_mem.unwrap()),
+            provides_features: vec!["kvm".into()],
+            ..Default::default()
+        },
+    );
+    // FOD with `required_features=["kvm"]` — degenerate but a tenant
+    // CAN declare it. Inject directly so `is_fixed_output=true` AND
+    // `required_features` are both set.
+    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+        pname: Some("cold-fod".into()),
+        is_fixed_output: true,
+        required_features: vec!["kvm".into()],
+        ..crate::db::RecoveryDerivationRow::test_default("d-cold-fod", "x86_64-linux")
+    });
+    let snap = actor.compute_spawn_intents(&Default::default());
+    let intent = snap
+        .intents
+        .iter()
+        .find(|i| i.intent_id == "d-cold-fod")
+        .expect("FOD intent emitted");
+    assert!(
+        intent.hw_class_names.is_empty(),
+        "FOD intent must NOT emit hw_class_names — fetcher pool is \
+         helm-managed, not cover-minted; got {:?}",
+        intent.hw_class_names
     );
 }

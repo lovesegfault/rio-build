@@ -55,8 +55,12 @@ for h in metal-x86 metal-arm; do
   test -n "$block" || { echo "FAIL: scheduler.toml missing hw_classes.$h" >&2; exit 1; }
   echo "$block" | grep -q 'node_class = "rio-metal"' || {
     echo "FAIL: $h node_class != rio-metal" >&2; exit 1; }
-  echo "$block" | grep -q 'provides_features = \["kvm"\]' || {
-    echo "FAIL: $h missing provides_features=[kvm]" >&2; exit 1; }
+  # §13d (r30 bug_007): nixos-test added — `requiredSystemFeatures =
+  # ["nixos-test", "kvm"]` is the standard nixpkgs `nixosTest` set.
+  # 18-metal-feature-routing.sh asserts the full superset; this is the
+  # rendering shape check (a JSON array literal).
+  echo "$block" | grep -q 'provides_features = \[.*"kvm".*\]' || {
+    echo "FAIL: $h missing provides_features ⊇ [kvm]" >&2; exit 1; }
   echo "$block" | grep -q 'capacity_types = \["on-demand"\]' || {
     echo "FAIL: $h missing capacity_types=[on-demand]" >&2; exit 1; }
   echo "$block" | grep -q 'taints = \[' || {

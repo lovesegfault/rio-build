@@ -1017,13 +1017,33 @@ impl IceBackoff {
         self.cells.iter().filter(|e| e.value().until > now).count()
     }
 
-    /// All `|H| × 2` cells currently masked → §Capacity backoff exit
+    /// All configured cells currently masked → §Capacity backoff exit
     /// (b). Caller emits `infeasible_total{reason=capacity_exhausted}`.
-    pub fn exhausted<'a>(&self, hw_classes: impl IntoIterator<Item = &'a HwClassName>) -> bool {
+    ///
+    /// §13d STRIKE-7 (mb_033): iterates `caps_for(h)` (the class's
+    /// configured `capacity_types`), NOT every variant. An od-only
+    /// metal class never produces a `(metal, Spot)` cell; that phantom
+    /// cell is never marked masked → `is_masked` returns false →
+    /// `exhausted()` never returns true even when every REAL metal
+    /// cell is ICE-masked → `_hw_ladder_exhausted_total{exit=
+    /// "all_masked"}` and `InfeasibleReason::CapacityExhausted` never
+    /// fire.
+    ///
+    /// `caps_for` returns `Vec` (not `&[CapacityType]`) for simpler
+    /// lifetime — the closure typically wraps
+    /// `SlaConfig::capacity_types_for` whose returned slice borrows
+    /// `&SlaConfig`, which the caller can't name as a generic lifetime
+    /// without a pinned-binding contortion. `Vec<CapacityType>` is two
+    /// `u8`s; the clone is free.
+    pub fn exhausted<'a>(
+        &self,
+        hw_classes: impl IntoIterator<Item = &'a HwClassName>,
+        caps_for: impl Fn(&str) -> Vec<CapacityType>,
+    ) -> bool {
         let mut any = false;
         for h in hw_classes {
             any = true;
-            for cap in CapacityType::ALL {
+            for cap in caps_for(h) {
                 if !self.is_masked(&(h.clone(), cap)) {
                     return false;
                 }
@@ -2379,22 +2399,62 @@ mod tests {
         assert_eq!(ice.cells.get(&cell).unwrap().step, 4);
     }
 
+    /// Both spot+od configured for every class — pre-§13c default.
+    fn both_caps(_: &str) -> Vec<CapacityType> {
+        vec![CapacityType::Spot, CapacityType::Od]
+    }
+
     #[test]
     fn ice_masked_cells_and_exhausted() {
         let ice = IceBackoff::default();
         let hs: Vec<HwClassName> = vec!["h1".into(), "h2".into()];
-        assert!(!ice.exhausted(&hs), "no cells masked");
+        assert!(!ice.exhausted(&hs, both_caps), "no cells masked");
         for h in &hs {
-            for c in CapacityType::ALL {
+            for c in [CapacityType::Spot, CapacityType::Od] {
                 ice.mark(&(h.clone(), c));
             }
         }
         assert_eq!(ice.masked_cells().len(), 4);
-        assert!(ice.exhausted(&hs));
+        assert!(ice.exhausted(&hs, both_caps));
         ice.clear(&("h1".into(), CapacityType::Od));
-        assert!(!ice.exhausted(&hs), "one cell clear → not exhausted");
+        assert!(
+            !ice.exhausted(&hs, both_caps),
+            "one cell clear → not exhausted"
+        );
         // Empty H → not exhausted (vacuously not "all of H masked").
-        assert!(!ice.exhausted(std::iter::empty::<&HwClassName>()));
+        assert!(!ice.exhausted(std::iter::empty::<&HwClassName>(), both_caps));
+    }
+
+    /// §13d STRIKE-7 (mb_033): `exhausted` iterates the configured
+    /// `capacity_types` for `h`, NOT every variant. An od-only metal
+    /// class never produces a `(metal, Spot)` cell → that phantom is
+    /// never marked → `is_masked` returns false → `exhausted` never
+    /// returns true even when every REAL metal cell is masked.
+    #[test]
+    fn ice_exhausted_iterates_configured_caps() {
+        let ice = IceBackoff::default();
+        let hs: Vec<HwClassName> = vec!["metal".into()];
+        // od-only metal class: caps_for returns only [Od].
+        let od_only = |_: &str| vec![CapacityType::Od];
+        // Mask only the configured (metal, Od) cell.
+        ice.mark(&("metal".into(), CapacityType::Od));
+        assert!(
+            ice.exhausted(&hs, od_only),
+            "od-only metal with (metal, Od) masked → exhausted; \
+             iterating every variant would never see (metal, Spot) marked"
+        );
+        // Per-class caps: h1 od-only, h2 both.
+        let hs2: Vec<HwClassName> = vec!["h1".into(), "h2".into()];
+        let caps = |h: &str| match h {
+            "h1" => vec![CapacityType::Od],
+            _ => both_caps(h),
+        };
+        let ice2 = IceBackoff::default();
+        ice2.mark(&("h1".into(), CapacityType::Od));
+        ice2.mark(&("h2".into(), CapacityType::Od));
+        assert!(!ice2.exhausted(&hs2, caps), "(h2, Spot) still clear");
+        ice2.mark(&("h2".into(), CapacityType::Spot));
+        assert!(ice2.exhausted(&hs2, caps));
     }
 
     #[test]

@@ -503,24 +503,13 @@ impl ProbeShape {
 /// arch-match an `HwClassDef`'s labels against `SpawnIntent.system`.
 pub const ARCH_LABEL: &str = "kubernetes.io/arch";
 
-// r[impl sched.sla.hwclass.provides.bidir]
-/// Bidirectional ∅-guard feature-match predicate. Single source for
-/// the §13c/D3/D10/I-181 routing rule — open-coding this at ≥4 sites
-/// (T2/T10/D10 chokepoint + worker `passes_intent_filter`) lets them
-/// drift, and drift here is "kvm intent routed to non-kvm cell" or
-/// "metal node absorbs non-kvm build".
-///
-/// `true` iff every `required` feature is in `provides` AND
-/// `required.is_empty() == provides.is_empty()`. The second clause is
-/// the bidirectional guard: a class providing `[kvm]` rejects
-/// featureless intents (so metal doesn't absorb non-kvm); a class
-/// providing `[]` rejects `[kvm]` intents (so non-metal isn't picked
-/// for kvm — `[]⊆anything` would otherwise let it through). Subset (not
-/// equality) on the populated side keeps the door open for
-/// `provides=[kvm, big-parallel]` hosting `required=[kvm]`.
-pub fn features_compatible(required: &[String], provides: &[String]) -> bool {
-    required.iter().all(|f| provides.contains(f)) && required.is_empty() == provides.is_empty()
-}
+/// §13d (r30 mb_012): canonical bidirectional ∅-guard moved to
+/// `rio_common::k8s` so the controller's consumer-side backstop
+/// (`fallback_cell`, FFD `simulate` agnostic filter) shares the same
+/// predicate as the scheduler's producer chokepoint. Re-exported here
+/// so existing scheduler callers stay unchanged. See the docstring on
+/// the canonical definition for the routing semantics.
+pub use rio_common::k8s::features_compatible;
 
 impl SlaConfig {
     /// `[sla.hw_classes.$h].capacity_types`. Unknown `h` → `ALL` (no
@@ -562,7 +551,7 @@ impl SlaConfig {
     /// §Partition-single-source: every scheduler-side per-class ceiling
     /// check (`solve_full`, [`Self::reference_hw_class_for_system`],
     /// the `all_candidates` capacity-fallback, the post-finalize
-    /// chokepoint [`Self::retain_hosting_classes`]) calls THIS.
+    /// chokepoint [`Self::retain_hosting_cells`]) calls THIS.
     // r[impl scheduler.sla.ceiling.uncatalogued-fallback]
     // r[impl scheduler.sla.ceiling.config-tightens-only]
     pub fn class_ceilings(
@@ -621,52 +610,104 @@ impl SlaConfig {
         hs.into_iter().find(|h| matches(h))
     }
 
-    /// STRIKE-6 (r29 bug_019): single post-finalize chokepoint. Every
+    /// STRIKE-7 (r30 §13d): single post-finalize chokepoint. Every
     /// `hw_class_names` producer in `solve_intent_for` lands here with
-    /// finalized `(cores, mem)`. A class whose [`Self::class_ceilings`]
-    /// `< (cores, mem)` would route the controller to a cell whose
-    /// `cover::sizing` `exceeds_cell_cap`-drops it forever (build never
-    /// provisions). The producer paths SHOULD have filtered
-    /// (correctness-of-intent: pick the right class, preserve operator's
-    /// cap-pin); this is the §"Function becomes total" backstop —
-    /// correctness-of-output regardless of correctness-of-producer.
-    /// Stripped classes are logged so a producer regression is visible.
-    pub fn retain_hosting_classes(
+    /// finalized `(cores, mem)` AND a `Vec<Cell>` (BEFORE
+    /// [`super::solve::cells_to_selector_terms`]) so every placement
+    /// constraint axis is a *typed parameter*, not data the chokepoint
+    /// silently drops by not looking. r29's STRIKE-6 chokepoint
+    /// operated on `(terms, names)` and filtered (size, features) —
+    /// bug_042 found arch missing, mb_033 found capacity-type missing,
+    /// two missing axes one round after it shipped. The `Vec<Cell>`
+    /// shape forces an r31 reviewer adding a 5th axis to change the
+    /// signature.
+    ///
+    /// Predicate is the conjunction of:
+    /// - **arch** — `kubernetes.io/arch` from `system_to_k8s_arch
+    ///   (system)` ⟺ `pod.rs::nix_systems_to_k8s_arch(systems)` writes
+    ///   `nodeSelector{kubernetes.io/arch}`. (bug_042)
+    /// - **features** — `features_compatible(required,
+    ///   provides_for(h))` ⟺ `wants_kvm(pool)` writes
+    ///   `nodeSelector{rio.build/kvm}` (`provides ∋ kvm ⟺ labels ∋
+    ///   {rio.build/kvm: true}`, helm-test-pinned). (mb_012)
+    /// - **size** — `(cores, mem) ≤ class_ceilings(h)` ⟺ pod
+    ///   requests ≤ Node allocatable. (r29 bug_019)
+    /// - **capacity-type** — `cap ∈ capacity_types_for(h)` ⟺
+    ///   `cells_to_selector_terms` writes `nodeAffinity
+    ///   {karpenter.sh/capacity-type In [cap]}`. (mb_033)
+    ///
+    /// A class whose ceiling/arch/cap can't host the build would route
+    /// the controller to a cell that mints a Node the pod's
+    /// `nodeSelector`/`nodeAffinity` can never bind to — permanently
+    /// Pending. The producer paths SHOULD have filtered
+    /// (correctness-of-intent); this is the §"Function becomes total"
+    /// backstop — correctness-of-output regardless of
+    /// correctness-of-producer. Stripped cells are `warn!`ed; with the
+    /// `h_all` arch-filter (snapshot.rs) a strip here is a producer
+    /// regression signal, not log spam.
+    pub fn retain_hosting_cells(
         &self,
-        terms: Vec<rio_proto::types::NodeSelectorTerm>,
-        names: Vec<String>,
+        cells: Vec<Cell>,
+        system: &str,
         demand: (u32, u64),
         required_features: &[String],
         catalog: &super::catalog::CatalogCeilings,
         global: (u32, u64),
-    ) -> (Vec<rio_proto::types::NodeSelectorTerm>, Vec<String>) {
+    ) -> Vec<Cell> {
         let (cores, mem) = demand;
-        terms
+        // bug_042: arch axis. `None` (unmappable / `builtin`) → arch is
+        // a no-op (everything kept) — mirrors `cells_to_selector_terms`
+        // dropping unknown classes and the controller's
+        // `system_to_arch(i.system).is_none()` returning no candidate.
+        let want_arch = rio_common::k8s::system_to_k8s_arch(system);
+        cells
             .into_iter()
-            .zip(names)
-            .filter(|(_, h)| {
-                let (cc, cm) = self.class_ceilings(h, catalog, global);
+            .filter(|(h, cap)| {
+                // Unknown class → no per-class constraint on ANY axis
+                // (mirrors `class_ceilings`' `(MAX, MAX)` backstop for
+                // size). `cells_to_selector_terms` already drops unknown
+                // classes from `(terms, names)` — this branch keeps the
+                // chokepoint a pass-through, not an arch/feature/cap
+                // gate it can't evaluate. Calling `features_compatible
+                // (_, provides_for(unknown)=[])` would wrongly strip
+                // kvm intents on unknown classes.
+                let Some(d) = self.hw_classes.get(h) else {
+                    return true;
+                };
+                // Arch: class label `kubernetes.io/arch` matches OR is
+                // absent (arch-agnostic class hosts any arch).
+                let arch_ok = want_arch.is_none_or(|a| {
+                    d.labels
+                        .iter()
+                        .find(|l| l.key == ARCH_LABEL)
+                        .is_none_or(|l| l.value == a)
+                });
                 // §13c D10: FULL bidirectional features_compatible (NOT
                 // half-predicate `provides⊄required` — that misses
                 // `required=[kvm], provides=[]` because ∅⊆anything).
-                // Unknown class → no feature constraint (the
-                // `!contains_key` guard mirrors size's MAX backstop;
-                // calling `features_compatible(_, provides_for(unknown)=[])`
-                // would wrongly strip kvm intents on unknown classes).
-                let feat_ok = !self.hw_classes.contains_key(h)
-                    || features_compatible(required_features, self.provides_for(h));
-                let ok = cores <= cc && mem <= cm && feat_ok;
+                let feat_ok = features_compatible(required_features, &d.provides_features);
+                // Size: per-class ceiling (catalog ∩ cfg ∩ global).
+                let (cc, cm) = self.class_ceilings(h, catalog, global);
+                let size_ok = cores <= cc && mem <= cm;
+                // Capacity-type: an od-only class structurally never
+                // hosts a `(h, Spot)` cell. The producer paths (`solve_
+                // full` over `cost.cells`, the `Some(cap)` bypass)
+                // SHOULD emit only configured caps — this is the
+                // backstop. (mb_033)
+                let cap_ok = d.capacity_types.contains(cap);
+                let ok = arch_ok && feat_ok && size_ok && cap_ok;
                 if !ok {
                     tracing::warn!(
-                        %h, cores, mem, class_cap = ?(cc, cm),
-                        ?required_features, provides = ?self.provides_for(h),
-                        "hw_class stripped at post-finalize chokepoint — \
-                         producer-path size/feature-filter regressed?"
+                        %h, ?cap, cores, mem, class_cap = ?(cc, cm),
+                        ?required_features, provides = ?d.provides_features,
+                        ?want_arch, arch_ok, feat_ok, size_ok, cap_ok,
+                        "hw_class cell stripped at post-finalize chokepoint — \
+                         producer-path arch/feature/size/cap-filter regressed?"
                     );
                 }
                 ok
             })
-            .unzip()
+            .collect()
     }
 
     /// §13c-3: resolve the effective global `(max_cores, max_mem)`
@@ -1889,13 +1930,19 @@ mod tests {
         );
     }
 
-    /// §13c T2/D10: `retain_hosting_classes` applies the FULL
+    /// `Vec<&str>` of the surviving hw-class names — for terse
+    /// `retain_hosting_cells` assertions.
+    fn names(cells: &[Cell]) -> Vec<&str> {
+        cells.iter().map(|(h, _)| h.as_str()).collect()
+    }
+
+    /// §13c T2/D10: `retain_hosting_cells` applies the FULL
     /// bidirectional [`features_compatible`] predicate. Half-predicate
     /// (`provides⊄required`) misses `required=[kvm], provides=[]`
     /// (∅⊆anything) → std-x86 leaks → pod has kvm nodeSelector, node
     /// lacks label → permanently Pending.
     #[test]
-    fn retain_hosting_classes_feature_filters() {
+    fn retain_hosting_cells_filters_features() {
         let mut cfg = base();
         cfg.hw_classes = HashMap::from([
             ("std-x86".into(), test_def("rio.build/hw-class", "std")),
@@ -1904,39 +1951,197 @@ mod tests {
                 test_def_provides("rio.build/hw-class", "metal", &["kvm"]),
             ),
         ]);
-        let term = |v: &str| rio_proto::types::NodeSelectorTerm {
-            match_expressions: vec![rio_proto::types::NodeSelectorRequirement {
-                key: "rio.build/hw-class".into(),
-                operator: "In".into(),
-                values: vec![v.into()],
-            }],
-        };
         let cat = super::super::catalog::CatalogCeilings::new();
         let kvm = vec!["kvm".to_string()];
+        let cells = || -> Vec<Cell> {
+            vec![
+                ("std-x86".into(), CapacityType::Od),
+                ("metal-x86".into(), CapacityType::Od),
+            ]
+        };
         // kvm intent: std-x86 (provides=[]) MUST be stripped; metal kept.
-        let (_, names) = cfg.retain_hosting_classes(
-            vec![term("std"), term("metal")],
-            vec!["std-x86".into(), "metal-x86".into()],
+        let kept =
+            cfg.retain_hosting_cells(cells(), "x86_64-linux", (1, 0), &kvm, &cat, base_global());
+        assert_eq!(
+            names(&kept),
+            vec!["metal-x86"],
+            "std-x86 stripped for kvm intent"
+        );
+        // non-kvm intent: metal-x86 (provides=[kvm]) MUST be stripped.
+        let kept =
+            cfg.retain_hosting_cells(cells(), "x86_64-linux", (1, 0), &[], &cat, base_global());
+        assert_eq!(
+            names(&kept),
+            vec!["std-x86"],
+            "metal-x86 stripped for non-kvm intent"
+        );
+    }
+
+    /// §13d STRIKE-7 (r30 bug_042): `retain_hosting_cells` arch-filters.
+    /// `h_all` is feature-partitioned only — a kvm `x86_64-linux` intent
+    /// gets `h_all=[metal-arm, metal-x86]` (both `provides=[kvm]`), and
+    /// neither `solve_full` nor the r29 STRIKE-6 chokepoint arch-filter,
+    /// so `hw_class_names` ships both archs to the controller. The pod's
+    /// `nodeSelector{kubernetes.io/arch}` makes placement correct, but
+    /// the controller's `cells_of(intent)` still mints a wrong-arch
+    /// NodeClaim that sits idle while the right-arch one is never minted.
+    // r[verify sched.sla.hwclass.provides]
+    #[test]
+    fn retain_hosting_cells_filters_arch() {
+        let mut cfg = base();
+        cfg.hw_classes = HashMap::from([
+            (
+                "metal-x86".into(),
+                test_def_provides(ARCH_LABEL, "amd64", &["kvm"]),
+            ),
+            (
+                "metal-arm".into(),
+                test_def_provides(ARCH_LABEL, "arm64", &["kvm"]),
+            ),
+            // arch-agnostic class (no kubernetes.io/arch label) — must
+            // NOT be stripped regardless of `system`.
+            (
+                "metal-any".into(),
+                test_def_provides("rio.build/hw-band", "metal", &["kvm"]),
+            ),
+        ]);
+        let cat = super::super::catalog::CatalogCeilings::new();
+        let kvm = vec!["kvm".to_string()];
+        let cells: Vec<Cell> = vec![
+            ("metal-x86".into(), CapacityType::Od),
+            ("metal-arm".into(), CapacityType::Od),
+            ("metal-any".into(), CapacityType::Od),
+        ];
+        // x86 intent → metal-arm stripped, metal-x86 + metal-any kept.
+        let kept = cfg.retain_hosting_cells(
+            cells.clone(),
+            "x86_64-linux",
             (1, 0),
             &kvm,
             &cat,
             base_global(),
         );
-        assert_eq!(names, vec!["metal-x86"], "std-x86 stripped for kvm intent");
-        // non-kvm intent: metal-x86 (provides=[kvm]) MUST be stripped.
-        let (_, names) = cfg.retain_hosting_classes(
-            vec![term("std"), term("metal")],
-            vec!["std-x86".into(), "metal-x86".into()],
+        let mut kept = names(&kept);
+        kept.sort_unstable();
+        assert_eq!(
+            kept,
+            vec!["metal-any", "metal-x86"],
+            "wrong-arch metal-arm stripped for x86_64-linux"
+        );
+        // arm intent → metal-x86 stripped.
+        let kept = cfg.retain_hosting_cells(
+            cells.clone(),
+            "aarch64-linux",
+            (1, 0),
+            &kvm,
+            &cat,
+            base_global(),
+        );
+        let mut kept = names(&kept);
+        kept.sort_unstable();
+        assert_eq!(
+            kept,
+            vec!["metal-any", "metal-arm"],
+            "wrong-arch metal-x86 stripped for aarch64-linux"
+        );
+        // unmappable system → arch axis is a no-op (everything kept).
+        let kept = cfg.retain_hosting_cells(cells, "builtin", (1, 0), &kvm, &cat, base_global());
+        assert_eq!(kept.len(), 3, "unmappable system → arch-agnostic");
+    }
+
+    /// §13d STRIKE-7 (r30 mb_033): `retain_hosting_cells` filters
+    /// `cap ∈ capacity_types_for(h)`. The bypass-path `Some(cap)` arm
+    /// (`reference_hw_class_for_system` doesn't take `cap`) and the
+    /// `all_candidates` capacity-fallback both can ship a `(h, cap)`
+    /// the class doesn't host. The controller's `cover_deficit`
+    /// iterates `all_cells()` (which yields only configured caps) so
+    /// `by_cell[(metal, Spot)]` is never visited — build hangs forever
+    /// with no NodeClaim, no metric, no warn.
+    #[test]
+    fn retain_hosting_cells_filters_capacity() {
+        let mut cfg = base();
+        let mut metal = test_def_provides(ARCH_LABEL, "amd64", &["kvm"]);
+        metal.capacity_types = vec![CapacityType::Od];
+        cfg.hw_classes = HashMap::from([("metal-x86".into(), metal)]);
+        let cat = super::super::catalog::CatalogCeilings::new();
+        let kvm = vec!["kvm".to_string()];
+        let cells: Vec<Cell> = vec![
+            ("metal-x86".into(), CapacityType::Spot),
+            ("metal-x86".into(), CapacityType::Od),
+        ];
+        let kept =
+            cfg.retain_hosting_cells(cells, "x86_64-linux", (1, 0), &kvm, &cat, base_global());
+        assert_eq!(
+            kept,
+            vec![("metal-x86".to_string(), CapacityType::Od)],
+            "phantom (metal-x86, Spot) stripped — class is od-only"
+        );
+        // Unknown class → no cap constraint (mirrors size's MAX backstop).
+        let kept = cfg.retain_hosting_cells(
+            vec![("ghost".into(), CapacityType::Spot)],
+            "x86_64-linux",
             (1, 0),
             &[],
             &cat,
             base_global(),
         );
-        assert_eq!(
-            names,
-            vec!["std-x86"],
-            "metal-x86 stripped for non-kvm intent"
-        );
+        assert_eq!(kept.len(), 1, "unknown class → no cap constraint");
+    }
+
+    /// §13d STRIKE-7 contract test: enumerate the placement-constraint
+    /// axes the chokepoint must filter on. Per-axis, perturb ONE cell
+    /// and assert it's stripped while the baseline cell survives.
+    /// Self-documenting list of axes — an r31 reviewer adding a 5th
+    /// axis MUST add a row here, or the chokepoint passes a constraint
+    /// it can't see.
+    #[test]
+    fn retain_hosting_cells_axis_enumeration() {
+        let mut cfg = base();
+        cfg.max_cores = Some(256.0);
+        // baseline: amd64 + kvm + 64-core + od-only.
+        let mut ok_def = test_def_provides(ARCH_LABEL, "amd64", &["kvm"]);
+        ok_def.max_cores = Some(64);
+        ok_def.capacity_types = vec![CapacityType::Od];
+        // size-perturbed: same arch/features/cap but max_cores=4.
+        let mut lo = ok_def.clone();
+        lo.max_cores = Some(4);
+        // arch-perturbed: arm64 instead of amd64.
+        let arm = test_def_provides(ARCH_LABEL, "arm64", &["kvm"]);
+        // features-perturbed: no provides_features.
+        let std = test_def(ARCH_LABEL, "amd64");
+        cfg.hw_classes = HashMap::from([
+            ("metal-x86".into(), ok_def),
+            ("lo-x86".into(), lo),
+            ("metal-arm".into(), arm),
+            ("std-x86".into(), std),
+        ]);
+        let cat = super::super::catalog::CatalogCeilings::new();
+        let global = (256u32, 256u64 << 30);
+        let ok: Cell = ("metal-x86".into(), CapacityType::Od);
+        // The axis ⨯ perturbed-cell list. Adding a 5th axis without a
+        // row here means the contract test can't verify the chokepoint
+        // sees it — RED-first the new axis.
+        let axes: &[(&str, Cell)] = &[
+            ("arch", ("metal-arm".into(), CapacityType::Od)),
+            ("features", ("std-x86".into(), CapacityType::Od)),
+            ("size", ("lo-x86".into(), CapacityType::Od)),
+            ("cap", ("metal-x86".into(), CapacityType::Spot)),
+        ];
+        for (axis, bad) in axes {
+            let kept = cfg.retain_hosting_cells(
+                vec![ok.clone(), bad.clone()],
+                "x86_64-linux",
+                (8, 0),
+                &["kvm".to_string()],
+                &cat,
+                global,
+            );
+            assert_eq!(
+                kept,
+                vec![ok.clone()],
+                "axis={axis}: bad cell {bad:?} not stripped"
+            );
+        }
     }
 
     /// bug_019 / STRIKE-6: `reference_hw_class_for_system` size-filters
@@ -2007,12 +2212,11 @@ mod tests {
         );
     }
 
-    /// STRIKE-6 structural guarantee: [`SlaConfig::retain_hosting_classes`]
-    /// strips ANY `(term, name)` pair whose class can't host
-    /// `(cores, mem)`, regardless of which producer leaked it. Terms and
-    /// names stay parallel (lockstep zip).
+    /// STRIKE-6 structural guarantee: [`SlaConfig::retain_hosting_cells`]
+    /// strips ANY cell whose class can't host `(cores, mem)`,
+    /// regardless of which producer leaked it.
     #[test]
-    fn retain_hosting_classes_filters_any_producer_leak() {
+    fn retain_hosting_cells_filters_any_producer_leak() {
         let cat = super::super::catalog::CatalogCeilings::new();
         let mut cfg = base();
         cfg.max_cores = Some(256.0);
@@ -2021,45 +2225,48 @@ mod tests {
         let mut hi = test_def("rio.build/hw-class", "hi");
         hi.max_cores = Some(128);
         cfg.hw_classes = HashMap::from([("mid".into(), mid), ("hi".into(), hi)]);
-        let term = |v: &str| rio_proto::types::NodeSelectorTerm {
-            match_expressions: vec![rio_proto::types::NodeSelectorRequirement {
-                key: "rio.build/hw-class".into(),
-                operator: "In".into(),
-                values: vec![v.into()],
-            }],
-        };
         // Hand-construct a producer leak: mid can't host 48, hi can.
-        let (terms, names) = cfg.retain_hosting_classes(
-            vec![term("mid"), term("hi"), term("mid")],
-            vec!["mid".into(), "hi".into(), "mid".into()],
+        let kept = cfg.retain_hosting_cells(
+            vec![
+                ("mid".into(), CapacityType::Od),
+                ("hi".into(), CapacityType::Od),
+                ("mid".into(), CapacityType::Spot),
+            ],
+            "x86_64-linux",
             (48, 0),
             &[],
             &cat,
             (256u32, 256u64 << 30),
         );
-        assert_eq!(names, vec!["hi"], "mid (max_cores=32) stripped at 48");
-        assert_eq!(terms.len(), 1, "terms parallel to names");
-        assert_eq!(terms[0].match_expressions[0].values[0], "hi");
+        assert_eq!(
+            names(&kept),
+            vec!["hi"],
+            "mid (max_cores=32) stripped at 48"
+        );
         // Unknown class → (MAX, MAX) → never stripped.
-        let (_, names) = cfg.retain_hosting_classes(
-            vec![term("ghost")],
-            vec!["ghost".into()],
+        let kept = cfg.retain_hosting_cells(
+            vec![("ghost".into(), CapacityType::Od)],
+            "x86_64-linux",
             (999, u64::MAX),
             &[],
             &cat,
             (256u32, 256u64 << 30),
         );
-        assert_eq!(names, vec!["ghost"], "unknown class = no per-class ceiling");
-        // All stripped → both empty (controller fallback_cell path).
-        let (terms, names) = cfg.retain_hosting_classes(
-            vec![term("mid")],
-            vec!["mid".into()],
+        assert_eq!(
+            names(&kept),
+            vec!["ghost"],
+            "unknown class = no per-class ceiling"
+        );
+        // All stripped → empty (controller fallback_cell path).
+        let kept = cfg.retain_hosting_cells(
+            vec![("mid".into(), CapacityType::Od)],
+            "x86_64-linux",
             (48, 0),
             &[],
             &cat,
             (256u32, 256u64 << 30),
         );
-        assert!(terms.is_empty() && names.is_empty());
+        assert!(kept.is_empty());
     }
 
     /// §13c-2 r[verify scheduler.sla.ceiling.uncatalogued-fallback]:
@@ -2224,29 +2431,6 @@ mod tests {
         ok.lead_time_seed
             .insert(("intel-7".into(), CapacityType::Spot), 30.0);
         validate_both(&ok).expect("valid lead_time_seed should pass");
-    }
-
-    /// §13c T1b: bidirectional ∅-guard. Single canonical predicate for
-    /// D3/D10/I-181 routing — open-coding at ≥4 sites lets them drift.
-    // r[verify sched.sla.hwclass.provides.bidir]
-    #[test]
-    fn features_compatible_bidirectional_guard() {
-        let s = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| (*s).into()).collect() };
-        // Both empty → compatible.
-        assert!(features_compatible(&[], &[]));
-        // Exact match → compatible.
-        assert!(features_compatible(&s(&["kvm"]), &s(&["kvm"])));
-        // required=[], provides=[kvm] → INcompatible (∅-guard: metal
-        // must not absorb non-kvm).
-        assert!(!features_compatible(&[], &s(&["kvm"])));
-        // required=[kvm], provides=[] → INcompatible (∅-guard: non-metal
-        // must not host kvm; []⊆anything would otherwise let it through).
-        assert!(!features_compatible(&s(&["kvm"]), &[]));
-        // Subset on populated side → compatible (provides=[kvm,bp]
-        // hosts required=[kvm]).
-        assert!(features_compatible(&s(&["kvm"]), &s(&["kvm", "bp"])));
-        // required ⊄ provides → incompatible.
-        assert!(!features_compatible(&s(&["kvm", "bp"]), &s(&["kvm"])));
     }
 
     /// §13c T1: new HwClassDef fields default correctly when absent

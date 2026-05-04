@@ -937,20 +937,34 @@ impl DagActor {
         // featureless intents (so metal doesn't absorb non-kvm), and a
         // class providing `[]` is excluded for kvm intents.
         //
+        // §13d STRIKE-7 (bug_042, A8): ALSO arch-filter — `h_all`
+        // feeds `solve_full`'s candidate set; a wrong-arch class gets a
+        // wasted `evaluate_cell` and (worse) leaks into `memo.a.cells`.
+        // The post-finalize `retain_hosting_cells` chokepoint also
+        // arch-filters, so a strip there is a *producer regression
+        // signal* — filtering here keeps the chokepoint a backstop, not
+        // a per-intent log-spam source.
+        //
         // Sorted: ε_h's seeded `pool.choose()` indexes into this Vec,
         // so HashMap iteration order would otherwise leak into the
         // "pure function of drv_hash" contract.
+        let want_arch = rio_common::k8s::system_to_k8s_arch(&state.system);
         let mut h_all: Vec<_> = self
             .sla_config
             .hw_classes
-            .keys()
-            .filter(|h| {
+            .iter()
+            .filter(|(_, d)| {
                 crate::sla::config::features_compatible(
                     &state.required_features,
-                    self.sla_config.provides_for(h),
-                )
+                    &d.provides_features,
+                ) && want_arch.is_none_or(|a| {
+                    d.labels
+                        .iter()
+                        .find(|l| l.key == crate::sla::config::ARCH_LABEL)
+                        .is_none_or(|l| l.value == a)
+                })
             })
-            .cloned()
+            .map(|(h, _)| h.clone())
             .collect();
         h_all.sort_unstable();
         // §one-step-removed inverse: `required_features` non-empty but
@@ -1147,7 +1161,7 @@ impl DagActor {
             memo.map(|m| (m, h_all.clone()))
         });
 
-        let (cores, mem, disk, node_affinity, hw_class_names, full_tier) = match full {
+        let (cores, mem, disk, cells, full_tier) = match full {
             Some((memo, h_all)) => {
                 tracing::Span::current()
                     .record("tier", memo.tier.as_str())
@@ -1184,7 +1198,10 @@ impl DagActor {
                 let (mkh, ovr, prev) = memo_entry
                     .as_ref()
                     .expect("full=Some ⇒ get_or_insert_with ran");
-                let now_exh = cells.is_empty() && self.ice.exhausted(&h_all);
+                let now_exh = cells.is_empty()
+                    && self
+                        .ice
+                        .exhausted(&h_all, |h| self.sla_config.capacity_types_for(h).to_vec());
                 if now_exh && !prev.ice_exhausted {
                     ::metrics::counter!(
                         "rio_scheduler_sla_hw_ladder_exhausted_total",
@@ -1247,14 +1264,11 @@ impl DagActor {
                 // Armed on the controller's ack instead
                 // (`handle_ack_spawned_intents`); each `cells[i]` round-
                 // trips via `(hw_class_names[i], node_affinity[i].cap-type)`.
-                let (terms, names) =
-                    solve::cells_to_selector_terms(&cells, &self.sla_config.hw_classes);
                 (
                     memo.a.c_star,
                     memo.a.mem_bytes,
                     memo.a.disk_bytes,
-                    terms,
-                    names,
+                    cells,
                     Some(memo.tier),
                 )
             }
@@ -1305,15 +1319,14 @@ impl DagActor {
                 // mb_053(a) / V-5: `--capacity` on the bypass path. The
                 // `Some(memo)` arm filters `cells` to `cap` post-memo,
                 // but ANY bypass field gates `full=None` and lands here
-                // with empty `(terms, names)`. Empty `hw_class_names` →
-                // controller's `cells_of` is empty → `fallback_cell`
-                // returns `(ref_h, Spot)` ignoring the pin → cover
-                // provisions spot, the cap-type term refuses spot, pod
-                // never schedules. Populate `(terms, names)` from
-                // `[(ref_h, cap)]` via the same `cells_to_selector_terms`
-                // so the controller derives the pinned cell instead of
-                // falling back. No `o.capacity` → empty as before.
-                let (terms, names) = match override_.as_ref().and_then(|o| o.capacity) {
+                // with empty cells. Empty `hw_class_names` → controller's
+                // `cells_of` is empty → `fallback_cell` returns
+                // `(ref_h, Spot)` ignoring the pin → cover provisions
+                // spot, the cap-type term refuses spot, pod never
+                // schedules. Populate cells from `[(ref_h, cap)]` so the
+                // controller derives the pinned cell instead of falling
+                // back.
+                let cells = match override_.as_ref().and_then(|o| o.capacity) {
                     // bug_039: `reference_hw_class` may have a
                     // `kubernetes.io/arch` label that doesn't match
                     // `state.system` — emitting it would AND the pod's
@@ -1323,16 +1336,10 @@ impl DagActor {
                     // `None` (no class hosts this arch at this size, or
                     // unmappable system), emit empty so the controller's
                     // `fallback_cell` reaches its OWN `None` →
-                    // `no_hosting_class` metric. Relies on `reference_
-                    // hw_class_for_system` and `fallback_cell` agreeing
-                    // on the arch-AND-SIZE match set (both query
-                    // `class_ceilings`/`ceilings_for` with the same
-                    // predicate); falling back to the un-matched
-                    // `reference_hw_class` here would reproduce bug_039
-                    // on the `None` arm and bypass the metric. Pass the
-                    // raw `(c, m.max(floor))` — producer-side filter is
-                    // correctness-of-intent; the post-finalize
-                    // chokepoint below catches the post-clamp delta.
+                    // `no_hosting_class` metric. Pass the raw
+                    // `(c, m.max(floor))` — producer-side filter is
+                    // correctness-of-intent; the post-finalize chokepoint
+                    // below catches the post-clamp delta.
                     Some(cap) => match self.sla_config.reference_hw_class_for_system(
                         &state.system,
                         c,
@@ -1341,15 +1348,47 @@ impl DagActor {
                         cost.catalog_ceilings(),
                         cost.resolved_global(),
                     ) {
-                        Some(h) => solve::cells_to_selector_terms(
-                            &[(h.to_owned(), cap)],
-                            &self.sla_config.hw_classes,
-                        ),
-                        None => (Vec::new(), Vec::new()),
+                        Some(h) => vec![(h.to_owned(), cap)],
+                        None => Vec::new(),
                     },
-                    None => (Vec::new(), Vec::new()),
+                    // §13d STRIKE-7 (mb_012, A9): cold-start featured
+                    // intent (`fit=None`, no override). Pre-fix this arm
+                    // returned `[]` → controller's `fallback_cell` /
+                    // FFD `agnostic_arch` picked a non-metal cell → kvm
+                    // pod (`nodeSelector: rio.build/kvm=true`)
+                    // permanently Pending → no `build_sample` → `fit`
+                    // stays `None` → bootstrap deadlock. Emit cells for
+                    // every configured cap of the reference class so
+                    // the controller minds the metal cell. Featureless
+                    // and FOD intents stay `[]`: featureless → genuinely
+                    // hw-agnostic (controller's `fallback_cell` arch-
+                    // matches); FOD → fetcher pool is helm-managed, not
+                    // cover-minted, so emitting builder cells over-
+                    // reserves builder capacity in FFD.
+                    None => {
+                        if !state.is_fixed_output && !state.required_features.is_empty() {
+                            self.sla_config
+                                .reference_hw_class_for_system(
+                                    &state.system,
+                                    c,
+                                    m.max(state.sched.resource_floor.mem_bytes),
+                                    &state.required_features,
+                                    cost.catalog_ceilings(),
+                                    cost.resolved_global(),
+                                )
+                                .map_or_else(Vec::new, |h| {
+                                    self.sla_config
+                                        .capacity_types_for(h)
+                                        .iter()
+                                        .map(|cap| (h.to_owned(), *cap))
+                                        .collect()
+                                })
+                        } else {
+                            Vec::new()
+                        }
+                    }
                 };
-                (c, m, d, terms, names, None)
+                (c, m, d, cells, None)
             }
         };
         // r[impl sched.sla.reactive-floor+2]
@@ -1372,21 +1411,26 @@ impl DagActor {
         let cores = cores.min(self.sla_ceilings.max_cores as u32).max(1);
         let mem = mem.max(floor.mem_bytes).min(self.sla_ceilings.max_mem);
         let disk = disk.max(floor.disk_bytes).min(self.sla_ceilings.max_disk);
-        // STRIKE-6 (r29 bug_019): single post-finalize chokepoint. Both
-        // arms above converge here with finalized `(cores, mem)`; this
-        // is downstream of every `hw_class_names` producer (the
-        // `solve_full` re-filter, the `all_candidates` capacity-
-        // fallback, the no-memo `reference_hw_class_for_system`). A 7th
-        // producer-hole would require a SpawnIntent construction site
-        // that bypasses `solve_intent_for` entirely.
-        let (node_affinity, hw_class_names) = self.sla_config.retain_hosting_classes(
-            node_affinity,
-            hw_class_names,
+        // STRIKE-7 (r30 §13d): single post-finalize chokepoint. Both
+        // arms above converge here with finalized `(cores, mem)` and a
+        // `Vec<Cell>` (BEFORE `cells_to_selector_terms` so the
+        // capacity-type axis is still typed input, not a string buried
+        // in a `NodeSelectorTerm`). This is downstream of every
+        // `hw_class_names` producer (the `solve_full` re-filter, the
+        // `all_candidates` capacity-fallback, the no-memo
+        // `reference_hw_class_for_system`). A new producer-hole would
+        // require a SpawnIntent construction site that bypasses
+        // `solve_intent_for` entirely.
+        let cells = self.sla_config.retain_hosting_cells(
+            cells,
+            &state.system,
             (cores, mem),
             &state.required_features,
             cost.catalog_ceilings(),
             cost.resolved_global(),
         );
+        let (node_affinity, hw_class_names) =
+            solve::cells_to_selector_terms(&cells, &self.sla_config.hw_classes);
         // D7: deadline_secs. Fitted ⇒ `wall_p99 × 5` (p99 of the
         // log-normal `T(c)·exp(ε)` at the chosen cores, no retry tail
         // — k8s-kill-then-reactive-floor IS the retry). Unfitted

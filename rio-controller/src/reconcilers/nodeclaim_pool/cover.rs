@@ -632,7 +632,7 @@ mod tests {
             &CellSketches::default(),
             &std::collections::HashMap::new(),
             fuse,
-            |_, _| true,
+            |_, _, _| true,
         )
         .1
         .is_empty()
