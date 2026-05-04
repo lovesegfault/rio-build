@@ -813,8 +813,9 @@ r[scheduler.sla.ceiling.config-tightens-only]
 `sla.hwClasses[h].maxCores`/`maxMem` are an OPTIONAL operator
 override that **tightens** below the catalog (or global, if
 uncatalogued). The effective per-class ceiling is `min(catalog_or_global,
-cfg_or_global)` per axis. `validate()` rejects `Some(0)` and any
-override above the global cap; `None` falls through. The global cap is
+cfg_or_global)` per axis. `validate_shape()` (config-load) rejects
+`Some(0)`; `validate_resolved()` (post-derive) rejects any override
+above the resolved global. `None` falls through. The global cap is
 the single hard operator-asserted bound — the AWS `describe-instance-types`
 catalog is fallible input (region SKU list, IRSA-gated, no signature
 chain) bounded by `min(_, global)` so a buggy or hostile API response
@@ -823,11 +824,60 @@ cannot raise the effective ceiling past what the operator budgeted.
 r[scheduler.sla.ceiling.controller-mirror]
 The scheduler ships the catalog ceiling — `min(catalog, cfg)`, each
 falling to global when absent — to the controller over
-`GetHwClassConfig`. The wire value is always nonzero (`validate()`
-rejects `global=0` and `Some(0)` overrides; catalog ceilings are real
-instance shapes); the controller's `ceilings_for` `>0` filter
+`GetHwClassConfig`. The wire value is always nonzero (`validate_shape()`
+rejects `Some(0)` overrides; catalog ceilings are real instance
+shapes); the controller's `ceilings_for` `>0` filter
 (pre-R26-scheduler back-compat) is preserved. Skew is bounded by the
 controller's 300s `HwClassConfig` refresh.
+
+r[scheduler.sla.global.optional]
+`sla.maxCores`/`maxMem` MAY be unset (the default). When unset under
+`Spot` cost source, the effective global ceiling is derived at boot
+from the catalog. When unset under `Static`, boot fails. The serde
+default for `Option<>` fields is `None` when the key is absent — no
+`#[serde(default)]` annotation is needed (or wanted: a redundant
+attribute would imply a non-trivial default).
+
+r[scheduler.sla.global.derive]
+The boot-derived effective global is
+`max(catalog ceilings).clamp(MIN_CORES, MAX_CORES_GLOBAL)` for cores
+and `max(catalog ceilings).clamp(MIN_MEM, MAX_MEM_GLOBAL)` for mem,
+where `MAX_CORES_GLOBAL = 1023` (PriorityClass bucket count − 1),
+`MAX_MEM_GLOBAL = 32 TiB`, `MIN_CORES = 16` (per
+`probe.cpu ∈ [4, max_cores/4]`), `MIN_MEM = 1 GiB`. The resolved
+global lives on `CostTable.resolved_global`, set unconditionally in
+`main.rs` after the catalog fetch, before actor spawn. Every consumer
+(`Ceilings::from_resolved`, `class_ceilings()`, `GetSlaDefaults`,
+`GetHwClassConfig`) reads from there; `carry_catalog` preserves it
+across the lease-acquire reload.
+
+r[scheduler.sla.global.static-requires-some]
+`hwCostSource=static` boot-fails when `sla.maxCores`/`maxMem` are
+unset — Static mode has no instance-type catalog to derive from. The
+check is in `validate_shape()` (config-load pass-1), not
+`validate_resolved()` (post-derive pass-2) because pass-2 only runs
+under `Spot`.
+
+r[scheduler.sla.global.spot-empty-fails]
+`hwCostSource=spot` + unset `maxCores`/`maxMem` + an empty catalog
+(IRSA failure, region with no matching SKUs, 30s fetch timeout) is a
+**boot failure** with an actionable error naming three fixes: (a)
+check IRSA `ec2:DescribeInstanceTypes` permissions; (b) set
+`sla.maxCores` explicitly; (c) use `hwCostSource=static`. The
+chicken-and-egg (transient AWS hiccup → CrashLoopBackOff) is the
+explicit contract: an operator who left `maxCores=None` opted into
+auto-derived globals; if derivation can't happen, that's a config
+error, not a fallback.
+
+r[scheduler.sla.global.controller-mirror]
+The controller is air-gapped (no AWS API) and cannot self-derive a
+global ceiling. The scheduler ships the resolved global over
+`GetHwClassConfig.global_max_cores`/`global_max_mem`. The controller's
+`HwClassConfig::global_ceilings()` returns `None` until the first
+poll lands or against a pre-§13c-3 scheduler (proto3 zero-default,
+filtered by the `>0` gate); `cover_deficit` skips the tick on `None`,
+fail-closed. Self-heals within ≤300s (next `hw_refresh`).
+`controller.toml` no longer carries `max_node_cores`/`max_node_mem`.
 
 r[sched.sla.hw-class.k3-bench]
 The builder supervisor runs a K=3 microbench (`alu`, `membw`
@@ -940,11 +990,18 @@ r[sched.sla.threat.hw-median-of-medians]
 `FLEET_MEDIAN_MIN_TENANTS = 5` so two colluding tenants cannot
 capture the cross-tenant median (§Threat-model gap b).
 
-r[sched.sla.threat.corpus-clamp+2]
+r[sched.sla.threat.corpus-clamp+3]
 `ImportSlaCorpus` / `sla.seedCorpus` MUST reject entries with
 non-finite or out-of-range params: `ref_factor_vec` per-dim
 `∈ [0.1,10]`, `Q ≥ 0`, `n_eff ≤ 32`, `S,P ∈ [0, buildTimeout_ref]`,
-`a ∈ [0, ln(sla.maxMem)]`, `b ∈ [-2, 2]` (§Threat-model gap c).
+`a ∈ [0, ln(MAX_MEM_HARD)]`, `b ∈ [-2, 2]` (§Threat-model gap c).
+§13c-3: `buildTimeout_ref = 7d × MAX_CORES_HARD` and the `a` upper
+bound are **constants** (`MAX_CORES_HARD = 1024`,
+`MAX_MEM_HARD = 32 TiB`), not catalog-derived — corpus validation
+runs before the catalog fetch and MUST NOT depend on the resolved
+global. A constant also closes restart-shrink: a catalog that drops
+its largest type at boot N+1 must not reject the corpus that loaded
+cleanly at N.
 
 ## Key Files
 

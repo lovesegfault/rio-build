@@ -466,11 +466,15 @@ per-class `(max_cores, max_mem)` and global `max_disk` cap are covered
 by `n` uniform claims at
 `(max(⌈Σc*/n⌉, max_i c*), max(Σm/n, max_i m), max(Σd_eph/n, max_i d_eph))`,
 where `n` iterates upward from the 3-axis lower bound
-`max(⌈Σc*/maxCores⌉, ⌈Σm/maxMem⌉, ⌈Σd_eph/maxDisk⌉)` until the
+`max(⌈Σc*/global_cores⌉, ⌈Σm/global_mem⌉, ⌈Σd_eph/maxDisk⌉)` until the
 production FFD's MostAllocated-cpu placement order packs every fitting
 intent; over-cap intents are dropped with
 `intent_dropped_total{reason=exceeds_cell_cap}`
-(`Σ/n` is a bin-packing lower bound, not a guarantee). NodeClaim
+(`Σ/n` is a bin-packing lower bound, not a guarantee). §13c-3:
+`global_cores`/`global_mem` are read from
+`HwClassConfig::global_ceilings()` (shipped over `GetHwClassConfig`,
+not `controller.toml`); `cover_deficit` skips the tick when the
+ceiling is not yet loaded (fail-closed, ≤300s self-heal). NodeClaim
 creation is capped at `sla.maxNodeClaimsPerCellPerTick` and the
 `sla.maxFleetCores` budget; cells are iterated round-robin from a
 rotating start so no cell starves under sustained pressure.
@@ -505,8 +509,9 @@ directly (`rio-nvme` / `rio-default` by storage); rio owns deletion.
 r[ctrl.nodeclaim.priority-bucket]
 Builder pods MUST set `priorityClassName=rio-builder-prio-{⌊log₂c*⌋}`
 (10 fixed PriorityClasses, buckets 0–9, `globalDefault:false`,
-`preemptionPolicy:Never`) and `schedulerName=kube-build-scheduler`. Config-load
-asserts `maxCores < 1024`.
+`preemptionPolicy:Never`) and `schedulerName=kube-build-scheduler`. The
+scheduler's `validate_shape()` asserts `maxCores < MAX_CORES_HARD = 1024`;
+the catalog-derived global is clamped at `MAX_CORES_GLOBAL = 1023`.
 
 r[ctrl.nodeclaim.taints.hwclass]
 `build_nodeclaim` sets `spec.taints` to the universal builder taint
