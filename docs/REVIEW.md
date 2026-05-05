@@ -309,6 +309,25 @@ of the claimed equivalence and confirm they read the SAME source. "X
 mirrors Y" / "X agrees with Y" comments are §Partition-single-source
 findings unless X and Y literally share a fn call.
 
+**Multi-axis-fn sibling axes are amends, not notes.** When a fix
+touches axis X of a function that partitions/filters on N axes (a
+`match` with N arms, a `&&` chain of N predicates, a 4-axis
+chokepoint), the verifier MUST treat unfixed sibling axes as amends.
+The shape: a fix that adds a guard to one arm of a `match` (or one
+clause of a conjunction) without an argument for why the sibling arms
+don't need the same guard is incomplete by default. r31 mb_023 (bypass
+`Some(cap)` arm missing `is_fixed_output` after r30 gave the `None`
+arm the gate) and r31 mb_001 (`HashSet` cardinality bound moved to the
+actor heap after r30 closed it at the metric) are both shapes the
+§one-step-removed (c) checker observed during r30 verify but recorded
+as notes — "narrow trigger, follow-up" — instead of escalating. Look
+for: sibling `match` arms, sibling iteration loops, sibling axis
+predicates. The hoist-the-guard pattern (mb_023) and the second-axis
+pattern (mb_001) are the same shape: the fix discharged one arm and
+the verifier treated "fixed axis X" as discharging "all axes."
+Escalate. The compiler-check template (per §Nth-strike): hoist the
+shared guard ABOVE the `match` so a future arm cannot bypass it.
+
 ## Placement-supersets-provisioning
 
 When a control loop both *places* work (writing scheduling constraints
@@ -349,6 +368,23 @@ without making the constraint propagation total. STRIKE-7 close:
 `Vec<Cell>` and filters arch+features+size+capacity-type; the
 controller's `fallback_cell` and FFD `simulate` agnostic filter share
 `features_compatible` from `rio-common::k8s`.
+
+**The Pool axis is independent of the cell axis.** The provisioning
+decision (mint a NodeClaim for an intent's cell) ⊇ the placement
+decision (some configured Pool spawns a Job for the intent). r30's
+`retain_hosting_cells` validates the *cell* axis (does some hwClass
+host this intent); r31 bug_019 found the *Pool* axis open (does some
+Pool consume this intent). The two axes are independent: a kvm intent
+has a valid cell (`metal-x86`) but no Pool unless the operator
+configures one. The §13d chokepoint structurally cannot catch this —
+it has no Pool parameter. The close: the provisioner must filter
+intents against the SAME Pool CRD source the placer
+(`pool/jobs.rs::queued_for_pool`) reads — a controller-side retain
+over `(pool.spec.systems, pool.spec.features)` per configured Builder
+Pool. The §13d residual that's truly uncatchable is operator
+overrides (a hand-written `--capacity`/`--cores` that targets a
+class no Pool covers); Pool-coverage gaps ARE catchable because
+both halves read the apiserver.
 
 ## Partition-single-source
 
