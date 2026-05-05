@@ -315,6 +315,17 @@ its toleration automatically. This covers fitted intents
 (`r[ctrl.pool.kvm-device+2]`) covers `hw_class_names=[]` cold-start
 intents.
 
+r[ctrl.pool.fetcher-affinity-from-intent]
+The fetcher pod's restrictive placement constraint MUST derive
+exclusively from `intent.hw_class_names` via `cells_to_selector_terms`
+(`r[ctrl.pool.node-affinity-from-intent]`) — never from a pool-static
+`nodeSelector`. Mirrors `r[ctrl.pool.kvm-device+2]` (the metal close,
+r33 bug_002): even a constraint that IS universal over the Pool's
+intents is deleted when redundant with the per-intent path, because two
+places that must agree eventually disagree. The pool-static fetcher
+toleration stays — permissive constraints over-firing are harmless and
+serve as the `hw_class_names=[]` cold-start fallback.
+
 r[ctrl.pool.hw-bench-needed+2]
 The pool reconciler MUST stamp `rio.build/hw-bench-needed` on the pod
 template at create time and expose it as `RIO_HW_BENCH_NEEDED` via a
@@ -608,14 +619,14 @@ CRDs use CEL validation rules (`x-kubernetes-validations`) for structural constr
 |---|---|---|
 | Pool | `size(self.systems) > 0` | A pool with no target systems accepts no work. |
 | Pool | `hostNetwork ⇒ privileged` | See `r[ctrl.crd.host-users-network-exclusive]`. |
-| Pool | `kind=Fetcher ⇒ features empty` | See `r[ctrl.crd.fetcher-no-features]`. |
+| Pool | `kind=Fetcher ⇒ features empty` | See `r[ctrl.crd.fetcher-no-features+2]`. |
 | SeccompProfileKind | type ∈ allowed; `Localhost ⇔ has(localhostProfile)` | See `r[ctrl.crd.seccomp-cel]`. |
 | ComponentScaler.Replicas | `self.min >= 0 && self.min <= self.max` | Clamp range must be non-empty and non-negative (`/scale` subresource rejects negative replicas). |
 | ComponentScaler.TargetRef | `self.kind == 'Deployment'` | Reconciler patches `apps/v1 deployments/scale` only. |
 | ComponentScaler.LoadThresholds | `0.0 < low < high <= 1.0` | Threshold ordering for ratio correction. |
 
-r[ctrl.crd.fetcher-no-features]
-The controller MUST reject `Pool` specs with `kind: Fetcher` and a non-empty `features` list. FODs route by `is_fixed_output` alone, not features (ADR-019). The reconciler forces `effective_features() == []` for Fetchers regardless (belt-and-suspenders for pre-CEL specs); without it, a non-empty `features` on a Fetcher pool hits the I-181 ∅-guard at scheduler `snapshot.rs` and filters out every featureless FOD --- the fetcher pool never spawns and all fetches stall silently. The single `effective_features` chokepoint ensures the spawn-decision query (`GetSpawnIntents.features`) and the spawned worker's `RIO_FEATURES` cannot diverge.
+r[ctrl.crd.fetcher-no-features+2]
+The controller's spawn-decision query and the spawned worker's `RIO_FEATURES` MUST advertise `[fetcher]` (and ONLY `[fetcher]`) for Fetcher-kind Pools, derived from `pool.spec.kind` at a single chokepoint (`effective_features(spec)`). The Pool's declared `spec.features` MUST stay empty for Fetchers — the CEL admission rule rejects a non-empty value, and `effective_features(spec)` ignores the field as a belt-and-suspenders for pre-CEL specs (a Fetcher Pool with declared `[kvm]` would otherwise hit the I-181 ∅-guard at scheduler `snapshot.rs` and filter out every `[fetcher]` FOD — the fetcher pool never spawns and all fetches stall silently). The override is a fail-safe, not a permission. The single chokepoint ensures the spawn-decision query (`GetSpawnIntents.features`) and the spawned worker's `RIO_FEATURES` cannot diverge.
 
 r[ctrl.crd.seccomp-cel]
 `SeccompProfileKind` is a struct (`{type, localhostProfile?}`), not a Rust enum: kube-core's structural-schema rewriter rejects oneOf-variant subschemas with non-identical shared properties, so the type/localhostProfile coupling is enforced by CEL instead of the Rust type system. Two rules: `self.type in ['RuntimeDefault', 'Localhost', 'Unconfined']`, and `self.type == 'Localhost' ? has(self.localhostProfile) : !has(self.localhostProfile)`. The struct mirrors `pod.spec.securityContext.seccompProfile` exactly so operators can copy-paste; nested `KubeSchema` carries the rules through into the `Pool` schema.

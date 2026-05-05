@@ -154,15 +154,20 @@ pub(crate) const DEGRADE_CHECKS: &[DegradeCheck] = &[
         note: "kind=Fetcher ignores fuseThreads/fusePassthrough — fetches \
                are network-bound, not FUSE-bound. Drop the FUSE tuning knobs.",
     },
-    // r[impl ctrl.crd.fetcher-no-features]
-    // ANY non-empty features (not just "kvm"): the I-181 ∅-guard at
-    // scheduler `snapshot.rs:221` filters featureless FODs whenever
-    // the pool's features list is non-empty, regardless of value.
+    // r[impl ctrl.crd.fetcher-no-features+2]
+    // ANY non-empty *declared* features: §13e derives `[fetcher]` from
+    // `kind`, ignoring `spec.features`. A non-empty declared value is
+    // operator confusion (pre-CEL spec or misconfig) — the controller
+    // will silently override it at the `effective_features` chokepoint.
+    // Predicate compares `spec.features` (the operator's declared
+    // config), NOT `effective_features` (which is now always
+    // `[fetcher]` for Fetchers and would make this fire on every
+    // legitimate fetcher Pool).
     DegradeCheck {
         applies: |s| is_fetcher_spec(s) && !s.features.is_empty(),
         reason: REASON_FETCHER_FEATURES_IGNORED,
-        note: "kind=Fetcher ignores features — FODs route by \
-               is_fixed_output alone. Drop features.",
+        note: "kind=Fetcher ignores spec.features — the controller \
+               derives [fetcher] from kind (§13e). Drop features.",
     },
     DegradeCheck {
         applies: |s| s.kind == ExecutorKind::Builder && s.fuse_cache_bytes.is_some(),

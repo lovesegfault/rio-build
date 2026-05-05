@@ -148,18 +148,22 @@ fn is_fetcher(pool: &Pool) -> bool {
     pool.spec.kind == ExecutorKind::Fetcher
 }
 
-/// FODs route by `is_fixed_output` alone, not features — fetchers
-/// always advertise empty. Single chokepoint so the spawn-decision
-/// query (`jobs::queued_for_pool`) and the spawned worker's
-/// `RIO_FEATURES` cannot diverge: a non-empty `features` on a Fetcher
-/// would otherwise hit the I-181 ∅-guard at scheduler
-/// `snapshot.rs:221` and filter out every featureless FOD → fetcher
-/// pool never spawns → all fetches stall silently.
-// r[impl ctrl.crd.fetcher-no-features]
+/// §13e: Fetcher Pools advertise `[fetcher]`, NOT empty. FODs route by
+/// `effective_features(state) = [fetcher]` at the scheduler chokepoint
+/// (`r[sched.sla.fod-feature-derivation]`); the I-181 ∅-guard requires
+/// the Pool's features to match. Divergence fails CLOSED — a bug that
+/// makes `effective_features(spec) ≠ [fetcher]` means the fetcher Pool
+/// never spawns (loud), not that FODs route to builder cells (silent).
+/// Single chokepoint so the spawn-decision query (`jobs::queued_for_pool`)
+/// and the spawned worker's `RIO_FEATURES` cannot diverge. The declared
+/// `spec.features` is ignored — the CEL admission rule rejects a
+/// non-empty value, and this override is the belt-and-suspenders for
+/// pre-CEL specs.
+// r[impl ctrl.crd.fetcher-no-features+2]
 #[inline]
 pub(super) fn effective_features(spec: &PoolSpec) -> Vec<String> {
     if spec.kind == ExecutorKind::Fetcher {
-        Vec::new()
+        vec![rio_common::k8s::FETCHER_FEATURE.to_string()]
     } else {
         spec.features.clone()
     }
@@ -1031,21 +1035,23 @@ mod tests {
     }
 
     // r[verify ctrl.pool.fetcher-hardening]
-    // r[verify ctrl.crd.fetcher-no-features]
-    /// `effective_features` is the single chokepoint: Fetcher → []
-    /// regardless of spec; Builder → verbatim. Both `RIO_FEATURES`
-    /// (worker capabilities) and `queued_for_pool` (spawn-decision
-    /// query) read it, so they cannot diverge. Before the chokepoint,
-    /// `poolDefaults.features:["kvm"]` deep-merged onto Fetcher entries
-    /// → I-181 ∅-guard filtered every featureless FOD → fetcher pool
-    /// never spawned.
+    // r[verify ctrl.crd.fetcher-no-features+2]
+    /// `effective_features` is the single chokepoint: Fetcher →
+    /// `[fetcher]` regardless of spec; Builder → verbatim. Both
+    /// `RIO_FEATURES` (worker capabilities) and `queued_for_pool`
+    /// (spawn-decision query) read it, so they cannot diverge. §13e
+    /// inverted the rule from `[]` → `[fetcher]` so the bidirectional
+    /// ∅-guard partitions FOD cells from builder cells; a Fetcher Pool
+    /// with a stale declared `["kvm"]` (pre-CEL spec) would otherwise
+    /// hit the I-181 ∅-guard and never spawn.
     #[test]
-    fn effective_features_empty_for_fetcher() {
+    fn effective_features_fetcher_for_fetcher() {
         let mut fetcher = crate::fixtures::test_pool("f", ExecutorKind::Fetcher);
         fetcher.spec.features = s(&["kvm", "big-parallel"]);
-        assert!(
-            effective_features(&fetcher.spec).is_empty(),
-            "Fetcher: features forced empty regardless of spec"
+        assert_eq!(
+            effective_features(&fetcher.spec),
+            vec![rio_common::k8s::FETCHER_FEATURE.to_string()],
+            "Fetcher Pools advertise [fetcher] regardless of declared features"
         );
 
         let mut builder = crate::fixtures::test_pool("b", ExecutorKind::Builder);
@@ -1074,8 +1080,8 @@ mod tests {
             .expect("RIO_FEATURES present");
         assert_eq!(
             rio_features.value.as_deref(),
-            Some(""),
-            "RIO_FEATURES empty for Fetcher (same chokepoint)"
+            Some(rio_common::k8s::FETCHER_FEATURE),
+            "RIO_FEATURES = [fetcher] for Fetcher (same chokepoint)"
         );
     }
 

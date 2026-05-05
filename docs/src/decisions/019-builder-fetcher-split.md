@@ -88,9 +88,9 @@ Rationale: fetchers face the open internet; the threat is a compromised upstream
 
 ### Node isolation
 
-r[fetcher.node.dedicated]
+r[fetcher.node.dedicated+2]
 
-A Karpenter NodePool (`rio-fetcher`) with taint `rio.build/fetcher=true:NoSchedule` and label `rio.build/node-role: fetcher`. `Pool` reconciler sets the matching toleration and nodeSelector. Builder NodePools keep their existing `rio.build/builder=true:NoSchedule` taint. Neither can land on the other's nodes.
+Fetcher pods land on dedicated nodes carrying the `rio.build/fetcher=true:NoSchedule` taint and `rio.build/fetcher: "true"` label (§13e: same key for taint and label, mirroring the metal `rio.build/kvm` pattern). The `Pool` reconciler derives the toleration from `taints_routing_to(FETCHER_TAINT_KEY)` (the same `[sla.hw_classes.$h].taints` map `cover::build_nodeclaim` reads). Restrictive placement is per-intent only — the FOD intent's `hw_class_names` ⊇ `{fetcher-*}` drives the pod's `nodeAffinity` via `cells_to_selector_terms`; there is NO pool-static `nodeSelector`. Builder NodeClaims keep their `rio.build/builder=true:NoSchedule` taint; fetcher NodeClaims get `rio.build/fetcher` instead — `cover::build_nodeclaim` branches on `provides_features ∋ fetcher`. Neither can land on the other's nodes.
 
 An attacker who escapes a fetcher pod lands on a node that runs only other fetchers. Lateral movement stays inside the hash-check boundary.
 

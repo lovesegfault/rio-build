@@ -153,12 +153,19 @@ impl ExecutorKind {
         "kind=Fetcher forbids FUSE tuning knobs — fetches are network-bound, not FUSE-bound"
     )
 )]
-// r[impl ctrl.crd.fetcher-no-features]
+// r[impl ctrl.crd.fetcher-no-features+2]
+// §13e: the CEL constraint `kind=Fetcher ⟹ spec.features empty` is
+// UNCHANGED post-§13e. The derived `[fetcher]` lives in the controller
+// (`effective_features(spec)`), not the spec — declaring it here would
+// be redundant and a second source of truth that could drift. The CEL
+// rule is the primary defense (rejects misconfigured specs at admission
+// time); the controller chokepoint is the belt-and-suspenders for
+// pre-CEL specs that the apiserver already accepted.
 #[x_kube(
     validation = Rule::new(
         "self.kind != 'Fetcher' || !has(self.features) || size(self.features) == 0"
     ).message(
-        "kind=Fetcher forbids features — FODs route by is_fixed_output alone, not features (ADR-019)"
+        "kind=Fetcher forbids spec.features — the controller derives [fetcher] from kind (§13e)"
     )
 )]
 #[x_kube(
@@ -432,10 +439,10 @@ mod tests {
                 "self.kind != 'Fetcher' || (!has(self.fuseThreads) && !has(self.fusePassthrough))",
                 "kind=Fetcher forbids FUSE tuning knobs",
             ),
-            // r[verify ctrl.crd.fetcher-no-features]
+            // r[verify ctrl.crd.fetcher-no-features+2]
             (
                 "self.kind != 'Fetcher' || !has(self.features) || size(self.features) == 0",
-                "kind=Fetcher forbids features",
+                "kind=Fetcher forbids spec.features",
             ),
         ];
         // Count guard: ties the assertion list to the actual rendered

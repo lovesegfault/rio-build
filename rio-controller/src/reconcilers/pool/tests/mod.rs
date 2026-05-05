@@ -103,12 +103,13 @@ fn fetcher_hardening_ignores_spec() {
         "spec hostUsers:true honored (k3s escape hatch)"
     );
     let env = spec.containers[0].env.as_ref().unwrap();
+    // §13e: FODs derive `[fetcher]` from kind, ignoring spec.features.
     assert_eq!(
         env.iter()
             .find(|e| e.name == "RIO_FEATURES")
             .and_then(|e| e.value.as_deref()),
-        Some(""),
-        "FODs ignore features"
+        Some(rio_common::k8s::FETCHER_FEATURE),
+        "FODs derive [fetcher] from kind, ignoring spec.features (§13e)"
     );
     let cp = sc.seccomp_profile.as_ref().unwrap();
     assert_eq!(cp.type_, "Localhost");
