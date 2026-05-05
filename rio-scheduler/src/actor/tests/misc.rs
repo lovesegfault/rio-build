@@ -1494,12 +1494,17 @@ async fn compute_spawn_intents_priority_sorted() {
 /// Bare actor with `[sla].lead_time_seed` populated so the forecast
 /// pass is reachable (`max_lead > 0`). Ceilings/probe from
 /// [`test_sla_config`] so unfitted drvs solve to `probe.cpu = 4`
-/// cores.
+/// cores. The seed is keyed on `test-hw` — the one configured hwClass
+/// — so the per-intent `max_lead_for` (r33 bug_007) sees a routable
+/// class. Pre-r33 the fixture used a key (`intel-7`) NOT in
+/// `hw_classes`; the global `max(values())` didn't care, but
+/// `validate_both` rejects that shape and `class_routes` (correctly)
+/// returns `false` for an unknown class.
 fn bare_actor_forecast(pool: sqlx::PgPool, max_lead: f64, max_forecast_cores: u32) -> DagActor {
     use crate::sla::config::CapacityType;
     let mut sla = test_sla_config();
     sla.lead_time_seed
-        .insert(("intel-7".into(), CapacityType::Spot), max_lead);
+        .insert(("test-hw".into(), CapacityType::Spot), max_lead);
     sla.max_forecast_cores_per_tenant = max_forecast_cores;
     bare_actor_cfg(
         pool,

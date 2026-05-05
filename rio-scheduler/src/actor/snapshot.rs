@@ -143,7 +143,14 @@ fn passes_intent_filter(
 /// override / cold-start) — a dep without `T(c)` has no
 /// progress-grounded ETA, same exclusion as §Forecast's "Queued dep
 /// has no progress-grounded ETA".
-fn running_dep_eta(dep: &crate::state::DerivationState) -> Option<f64> {
+/// Remaining ETA for a Running/Assigned dep at `now`. `now` is
+/// snapshotted ONCE at the top of [`DagActor::compute_spawn_intents`]'s
+/// forecast loop so every drv in one poll sees the SAME notion of
+/// elapsed — two drvs depping on the same Running node get IDENTICAL
+/// `eta`, not microsecond-jittered values that would break the
+/// `(prio, c*, eta, hash)` budget sort tiebreak's determinism (r33
+/// bug_007 added `eta` to the key; bug_025 requires it deterministic).
+fn running_dep_eta(dep: &crate::state::DerivationState, now: std::time::Instant) -> Option<f64> {
     let t = dep
         .sched
         .last_intent
@@ -153,7 +160,10 @@ fn running_dep_eta(dep: &crate::state::DerivationState) -> Option<f64> {
         .wall_secs?;
     let elapsed = dep
         .running_since
-        .map(|r| r.elapsed().as_secs_f64())
+        // `saturating_duration_since`: `running_since > now` is
+        // impossible in production (set on transition→Running, read
+        // later), but `0.0` is a safe clamp under test backdating.
+        .map(|r| now.saturating_duration_since(r).as_secs_f64())
         .unwrap_or(0.0);
     Some((t - elapsed).max(0.0))
 }
@@ -505,6 +515,16 @@ impl DagActor {
         // isn't running yet (ADR L675). Empty seed map ⇒ max_lead=0 ⇒
         // pass disabled (every eta ≥ 0 fails the gate; controller
         // filters on `ready` regardless).
+        //
+        // r33 bug_007 §Granularity-coupling: `max_lead` is the GLOBAL
+        // max — it gates the whole pass on/off. The per-intent
+        // admission gate is `max_lead_for(system, features)` (pre-
+        // solve, over the `class_routes`-admissible classes) and a
+        // post-solve mirror over `intent.hw_class_names` (the cells
+        // the controller's `a_open` actually evaluates). Pre-fix, the
+        // global max gated each intent: r31's metal `lead_time_seed=
+        // 600` raised the forecast horizon 30× for non-metal intents
+        // the controller would drop at its per-cell `a_open`.
         let max_lead = self
             .sla_config
             .lead_time_seed
@@ -513,6 +533,11 @@ impl DagActor {
             .fold(0.0, f64::max);
         if max_lead > 0.0 {
             let mut forecast = Vec::new();
+            // ONE `now` for the whole forecast pass: every dep's ETA
+            // is measured against the same instant so siblings sharing
+            // a Running dep get IDENTICAL `eta` (sort-key determinism;
+            // see [`running_dep_eta`]).
+            let now = std::time::Instant::now();
             'q: for (drv_hash, state) in self.dag.iter_nodes() {
                 if state.status() != DerivationStatus::Queued {
                     continue;
@@ -537,7 +562,7 @@ impl DagActor {
                         DerivationStatus::Completed | DerivationStatus::Skipped => {}
                         DerivationStatus::Running | DerivationStatus::Assigned => {
                             had_incomplete = true;
-                            let Some(d) = running_dep_eta(dep) else {
+                            let Some(d) = running_dep_eta(dep, now) else {
                                 continue 'q;
                             };
                             eta = eta.max(d);
@@ -545,10 +570,55 @@ impl DagActor {
                         _ => continue 'q,
                     }
                 }
-                if !had_incomplete || eta >= max_lead {
+                if !had_incomplete {
+                    continue;
+                }
+                // Pre-solve coarse gate (perf): horizon over the
+                // `class_routes`-admissible classes — saves the
+                // `solve_intent_for` call for an intent the controller
+                // would unconditionally drop. Over-approximates
+                // (compatible classes ⊇ actual cells; size ceiling
+                // unknown pre-solve); the post-solve gate catches the
+                // residual.
+                let intent_lead = self
+                    .sla_config
+                    .max_lead_for(&state.system, &state.required_features);
+                if eta >= intent_lead {
+                    ::metrics::counter!(
+                        "rio_scheduler_sla_forecast_dropped_total",
+                        "reason" => "lead_horizon",
+                    )
+                    .increment(1);
                     continue;
                 }
                 let intent = self.solve_intent_for(state, &hw, &cost, inputs_gen);
+                // Post-solve exact gate: mirror of the controller's
+                // `a_open` per-cell filter (`eta < lead_time(c)`),
+                // re-stated scheduler-side over the SOLVED
+                // `hw_class_names`. The pre-solve gate used the
+                // arch+features-routable superset; this is the cells
+                // `solve_intent_for` actually emitted (post tier walk,
+                // post ceiling). `hw_class_names = []` (hw-agnostic /
+                // featureless probe path) skips the gate — there is no
+                // per-cell lead to check; the controller's `a_open`
+                // short-circuits to `fallback_cell`.
+                if !intent.hw_class_names.is_empty() {
+                    let cell_lead = self
+                        .sla_config
+                        .lead_time_seed
+                        .iter()
+                        .filter(|((h, _), _)| intent.hw_class_names.contains(h))
+                        .map(|(_, &v)| v)
+                        .fold(0.0, f64::max);
+                    if eta >= cell_lead {
+                        ::metrics::counter!(
+                            "rio_scheduler_sla_forecast_dropped_total",
+                            "reason" => "lead_horizon",
+                        )
+                        .increment(1);
+                        continue;
+                    }
+                }
                 forecast.push((drv_hash, state, intent, eta));
             }
             // bug_025: collect → sort → gate. The budget check at this
@@ -558,13 +628,18 @@ impl DagActor {
             // the post-loop sort can't resurrect what was already
             // dropped. Sort key is `(priority, c*) desc` — the same key
             // §13b @alg-pool's FFD pass walks, so the admitted subset
-            // is what FFD wanted first — with `drv_hash` asc as the
-            // deterministic tiebreak.
-            forecast.sort_unstable_by(|(ha, sa, ia, _), (hb, sb, ib, _)| {
+            // is what FFD wanted first — then `eta` asc (r33 bug_007:
+            // under budget pressure, near-term actionable intents win
+            // over far-term ones the controller may still strip at its
+            // per-cell DDSketch quantile, which can drift below the
+            // operator seed) — then `drv_hash` asc as the deterministic
+            // tiebreak.
+            forecast.sort_unstable_by(|(ha, sa, ia, ea), (hb, sb, ib, eb)| {
                 sb.sched
                     .priority
                     .total_cmp(&sa.sched.priority)
                     .then(ib.cores.cmp(&ia.cores))
+                    .then(ea.total_cmp(eb))
                     .then(ha.cmp(hb))
             });
             for (drv_hash, state, intent, eta) in forecast {
@@ -572,6 +647,11 @@ impl DagActor {
                     .entry(state.attributed_tenant(&self.builds))
                     .or_insert(cap);
                 if i64::from(intent.cores) > *budget {
+                    ::metrics::counter!(
+                        "rio_scheduler_sla_forecast_dropped_total",
+                        "reason" => "tenant_budget",
+                    )
+                    .increment(1);
                     continue;
                 }
                 *budget -= i64::from(intent.cores);
@@ -593,10 +673,10 @@ impl DagActor {
         // truncation drops forecast first — Ready pods matter more.
         // Keys on `ready` (not `eta_seconds == 0.0`): a forecast
         // intent with overdue deps clamps to eta=0.0 but is NOT Ready
-        // (bug_030). Tiebreak `(cores desc, intent_id asc)` —
-        // superset of the forecast sort at :471-477 so its order
+        // (bug_030). Tiebreak `(cores desc, eta asc, intent_id asc)` —
+        // superset of the forecast sort above so its order
         // survives within `ready=false`; per REVIEW.md
-        // §HashMap-iteration.
+        // §HashMap-iteration. `eta` is a no-op for Ready (always 0.0).
         intents.sort_unstable_by(|(pa, ia), (pb, ib)| {
             // `unwrap_or(true)`: a pre-§13a sender omits field 13;
             // pre-§13a only emitted Ready-loop intents (bug_001).
@@ -604,6 +684,7 @@ impl DagActor {
                 .partial_cmp(&(ia.ready.unwrap_or(true), *pa))
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(ib.cores.cmp(&ia.cores))
+                .then(ia.eta_seconds.total_cmp(&ib.eta_seconds))
                 .then_with(|| ia.intent_id.cmp(&ib.intent_id))
         });
 
@@ -802,21 +883,27 @@ impl DagActor {
     }
 
     /// One snapshot of the **shared solve inputs** + the derived
-    /// `inputs_gen`. [`Self::compute_spawn_intents`] calls this ONCE at
-    /// the top and threads `(&hw, &cost, inputs_gen)` to every
-    /// [`Self::solve_intent_for`]; `try_dispatch_one` calls it once per
-    /// drv. See [`crate::sla::solve::SolveInputs`] for the "derived,
-    /// not bumped" rationale.
+    /// `inputs_gen`. Both consumers — [`Self::compute_spawn_intents`]
+    /// and `dispatch_ready` — call this ONCE at the top of their pass
+    /// and thread `(&hw, &cost, inputs_gen)` to every
+    /// [`Self::solve_intent_for`] (r33 bug_013 hoisted dispatch's
+    /// per-drv call). See [`crate::sla::solve::SolveInputs`] for the
+    /// "derived, not bumped" rationale.
     pub(crate) fn solve_inputs(
         &self,
     ) -> (crate::sla::hw::HwTable, crate::sla::cost::CostTable, u64) {
+        #[cfg(test)]
+        self.test_counters
+            .solve_inputs_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let hw = self.sla_estimator.hw_table();
         let cost = self.cost_table.read().clone();
         // §13c-2 r[impl scheduler.sla.ceiling.uncatalogued-fallback]:
         // per-tick gauge — 1 for any class without a boot-derived
         // catalog ceiling (Static cost source, fetch failure, or
         // requirements that match 0 types). Such a class falls to the
-        // global ceiling. Emitted here (the per-tick boundary) so it
+        // global ceiling. Emitted here (the once-per-pass boundary —
+        // both callers hoist this above their drain loop) so it
         // tracks the live `cost.catalog_ceilings()` snapshot the solve
         // reads, including across `carry_catalog` lease-acquire
         // reloads.

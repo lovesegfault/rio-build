@@ -583,6 +583,12 @@ pub(crate) struct TestCounters {
     /// batch variant). Asserts on the I-139 rule: a batched completion
     /// path must NOT touch the per-row helper.
     pub persist_status_calls: std::sync::atomic::AtomicU64,
+    /// Incremented on every `solve_inputs()` call. Asserts on the r33
+    /// bug_013 hoist: one `dispatch_ready` pass over N Ready drvs must
+    /// snapshot the solve inputs exactly ONCE, not once-per-drv (the
+    /// per-drv re-read is both the §13c-2 gauge spam and a TOCTOU at
+    /// the same `inputs_gen` if `spot_price_poller` writes mid-pass).
+    pub solve_inputs_calls: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(test)]
@@ -592,6 +598,7 @@ impl TestCounters {
         TestCountersSnapshot {
             dispatch_ready_calls: self.dispatch_ready_calls.load(SeqCst),
             persist_status_calls: self.persist_status_calls.load(SeqCst),
+            solve_inputs_calls: self.solve_inputs_calls.load(SeqCst),
             // Filled by the `DebugCmd::Counters` handler — `substitute_sem`
             // lives on `DagActor`, not here.
             substitute_sem_permits: 0,
@@ -608,6 +615,7 @@ impl TestCounters {
 pub struct TestCountersSnapshot {
     pub dispatch_ready_calls: u64,
     pub persist_status_calls: u64,
+    pub solve_inputs_calls: u64,
     /// `DagActor.substitute_sem.available_permits()` at snapshot time.
     /// Filled by the [`DebugCmd::Counters`] handler (not
     /// [`TestCounters::snapshot`] — the semaphore lives on the actor).

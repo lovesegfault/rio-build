@@ -2132,8 +2132,13 @@ async fn contract_spawn_intents_order_deterministic_across_ties() {
     let build = || {
         use crate::sla::config::CapacityType;
         let mut sla = test_sla_config();
+        // r33 bug_007: key the seed on `test-hw` (the configured class)
+        // so the per-intent `max_lead_for` admits the forecast intents.
+        // A key ∉ `hw_classes` is a config-validation error
+        // (`validate_both`) — pre-r33 the global `max(values())`
+        // didn't care, but `class_routes` correctly returns `false`.
         sla.lead_time_seed
-            .insert(("intel-7".into(), CapacityType::Spot), 200.0);
+            .insert(("test-hw".into(), CapacityType::Spot), 200.0);
         sla.max_forecast_cores_per_tenant = 2_000;
         let mut actor = bare_actor_cfg(
             db.pool.clone(),
@@ -2984,4 +2989,238 @@ async fn unroutable_features_warned_is_bounded() {
     // The LRU should be at exactly `cap` after `2 × cap` inserts of
     // distinct keys — eviction happened.
     assert_eq!(len, cap, "LRU should be at cap after over-insertion");
+}
+
+// ──────────────────────────────────────────────────────────────────
+// r33 B1 — bug_007 per-intent forecast horizon + bug_013 solve_inputs
+// hoist
+// ──────────────────────────────────────────────────────────────────
+
+/// Forecast actor with TWO hwClasses and a per-class `lead_time_seed`:
+/// `metal-x86` (kvm-providing, `od` lead=600s) and `mid-ebs-x86`
+/// (featureless, `spot` lead=18s). Reproduces the r33 bug_007
+/// shape — adding the metal seed raised the GLOBAL `max_lead` 30×.
+fn bare_actor_per_intent_lead(pool: sqlx::PgPool, max_forecast_cores: u32) -> DagActor {
+    use crate::sla::config::{ARCH_LABEL, CapacityType, HwClassDef, NodeLabelMatch};
+    let mut sla = test_sla_config();
+    sla.hw_classes.clear();
+    sla.hw_classes.insert(
+        "metal-x86".into(),
+        HwClassDef {
+            labels: vec![NodeLabelMatch {
+                key: ARCH_LABEL.into(),
+                value: "amd64".into(),
+            }],
+            max_cores: Some(64),
+            max_mem: Some(256 << 30),
+            provides_features: vec!["kvm".into()],
+            ..Default::default()
+        },
+    );
+    sla.hw_classes.insert(
+        "mid-ebs-x86".into(),
+        HwClassDef {
+            labels: vec![NodeLabelMatch {
+                key: ARCH_LABEL.into(),
+                value: "amd64".into(),
+            }],
+            max_cores: Some(64),
+            max_mem: Some(256 << 30),
+            ..Default::default()
+        },
+    );
+    sla.lead_time_seed
+        .insert(("metal-x86".into(), CapacityType::Od), 600.0);
+    sla.lead_time_seed
+        .insert(("mid-ebs-x86".into(), CapacityType::Spot), 18.0);
+    sla.max_forecast_cores_per_tenant = max_forecast_cores;
+    sla.reference_hw_class = "mid-ebs-x86".into();
+    bare_actor_cfg(
+        pool,
+        DagActorConfig {
+            sla,
+            ..Default::default()
+        },
+    )
+}
+
+/// **r33 bug_007 — pre-solve gate.** The forecast horizon is
+/// per-intent: `max(lead_time_seed[(h,cap)])` over hwClasses
+/// `class_routes` admits for `(system, features)` — NOT the global
+/// `max(values())`. r31 added `metal-{arm,x86}:od leadTimeSeed=600`,
+/// raising the global max 30×. A featureless drv with `eta∈(18, 600)`
+/// is admitted under the global max, runs `solve_intent_for`, debits
+/// the tenant budget — then the controller's per-cell `a_open` filter
+/// (`eta < lead_time(c)` ≈ 18s for non-metal cells) drops it with no
+/// fallback. With the per-intent horizon, the scheduler drops it
+/// pre-solve and emits `forecast_dropped_total{reason=lead_horizon}`.
+///
+/// Pre-fix: RED — drv `q-shallow` is admitted, no metric.
+// r[verify sched.sla.forecast.one-layer]
+#[tokio::test]
+async fn forecast_lead_horizon_per_intent() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_per_intent_lead(db.pool.clone(), 2_000);
+
+    // dep(Running, eta≈300) → q-shallow(Queued, featureless).
+    actor.test_inject_at("dep", "x86_64-linux", DerivationStatus::Running);
+    actor.test_inject_at("q-shallow", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_edge("q-shallow", "dep");
+    actor.test_set_running_eta("dep", 400.0, 100, 4); // eta = 400-100 = 300
+
+    let rec = DebuggingRecorder::new();
+    let snapr = rec.snapshotter();
+    let snap = {
+        let _g = metrics::set_default_local_recorder(&rec);
+        actor.compute_spawn_intents(&Default::default())
+    };
+
+    assert!(
+        !snap.intents.iter().any(|i| i.intent_id == "q-shallow"),
+        "featureless drv with eta=300 MUST NOT be admitted: its routable \
+         classes' lead is max(mid-ebs-x86:spot=18)=18 < 300; the metal \
+         class's seed=600 is for kvm intents only. Got intents: {:?}",
+        snap.intents
+            .iter()
+            .map(|i| &i.intent_id)
+            .collect::<Vec<_>>(),
+    );
+    let dropped = crate::sla::metrics::counter_map_by(
+        &snapr,
+        "rio_scheduler_sla_forecast_dropped_total",
+        Some("reason"),
+    );
+    assert_eq!(
+        dropped.get("lead_horizon"),
+        Some(&1),
+        "forecast_dropped_total{{reason=lead_horizon}} MUST be emitted at \
+         the pre-solve gate for the dropped intent; got {dropped:?}"
+    );
+}
+
+/// **r33 bug_007 — kvm intent KEEPS the metal lead.** The per-intent
+/// horizon over `class_routes`-admissible classes still yields the
+/// metal seed (600s) for kvm intents. `eta=300 < 600` → admitted.
+/// Pre-fix: GREEN (the global max already admitted it). This is the
+/// inverse — the per-intent gate must not over-fire.
+// r[verify sched.sla.forecast.one-layer]
+#[tokio::test]
+async fn forecast_kvm_intent_uses_metal_lead() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_per_intent_lead(db.pool.clone(), 2_000);
+
+    // dep(Running, eta≈300) → q-kvm(Queued, requires kvm).
+    actor.test_inject_at("dep", "x86_64-linux", DerivationStatus::Running);
+    actor.test_inject_at("q-kvm", "x86_64-linux", DerivationStatus::Queued);
+    actor.dag.node_mut("q-kvm").unwrap().required_features = vec!["kvm".into()];
+    actor.test_inject_edge("q-kvm", "dep");
+    actor.test_set_running_eta("dep", 400.0, 100, 4);
+
+    let snap = actor.compute_spawn_intents(&Default::default());
+    assert!(
+        snap.intents.iter().any(|i| i.intent_id == "q-kvm"),
+        "kvm drv with eta=300 MUST be admitted: its routable class \
+         (metal-x86:od) has lead=600 > 300. Got intents: {:?}",
+        snap.intents
+            .iter()
+            .map(|i| &i.intent_id)
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// **r33 bug_007 — budget drop is observable.** The per-tenant
+/// forecast budget `continue` was a silent drop — the operator never
+/// sees that the forecast pass burned a budget slot on an intent that
+/// then got bumped by a higher-priority sibling. Emit
+/// `forecast_dropped_total{reason=tenant_budget}` so the rate is
+/// visible.
+///
+/// Pre-fix: RED — no metric on the budget `continue`.
+// r[verify sched.sla.forecast.tenant-ceiling]
+#[tokio::test]
+async fn forecast_budget_drop_metric() {
+    let db = TestDb::new(&MIGRATOR).await;
+    // probe.cpu=4 cores per intent. Cap=4 → admits ONE forecast intent.
+    let mut actor = bare_actor_per_intent_lead(db.pool.clone(), 4);
+
+    // dep(Running, eta≈300) → {qa, qb} (Queued, kvm — high lead = 600).
+    actor.test_inject_at("dep", "x86_64-linux", DerivationStatus::Running);
+    for q in ["qa", "qb"] {
+        actor.test_inject_at(q, "x86_64-linux", DerivationStatus::Queued);
+        actor.dag.node_mut(q).unwrap().required_features = vec!["kvm".into()];
+        actor.test_inject_edge(q, "dep");
+    }
+    actor.test_set_running_eta("dep", 400.0, 100, 4);
+
+    let rec = DebuggingRecorder::new();
+    let snapr = rec.snapshotter();
+    let snap = {
+        let _g = metrics::set_default_local_recorder(&rec);
+        actor.compute_spawn_intents(&Default::default())
+    };
+
+    let forecast: Vec<_> = snap
+        .intents
+        .iter()
+        .filter(|i| i.ready == Some(false))
+        .collect();
+    assert_eq!(
+        forecast.len(),
+        1,
+        "budget=4, intents are 4 cores each → exactly one forecast intent \
+         admitted; got {} ({:?})",
+        forecast.len(),
+        forecast.iter().map(|i| &i.intent_id).collect::<Vec<_>>(),
+    );
+    let dropped = crate::sla::metrics::counter_map_by(
+        &snapr,
+        "rio_scheduler_sla_forecast_dropped_total",
+        Some("reason"),
+    );
+    assert_eq!(
+        dropped.get("tenant_budget"),
+        Some(&1),
+        "forecast_dropped_total{{reason=tenant_budget}} MUST be emitted at \
+         the budget continue; got {dropped:?}"
+    );
+}
+
+/// **r33 bug_013 — `solve_inputs()` hoisted to `dispatch_ready`.**
+/// `solve_inputs()` clones `HwTable` + `CostTable` and emits the
+/// §13c-2 `class_ceiling_uncatalogued` gauge once per hwClass. Pre-fix
+/// `try_dispatch_one` called it once per drv inside the drain loop —
+/// `O(|hw_classes| × |Ready|)` gauge sets per pass, plus a per-drv
+/// re-read TOCTOU (`compute_spawn_intents` was explicitly fixed for
+/// this; `try_dispatch_one` was the unswept sibling). Post-fix: ONE
+/// snapshot per `dispatch_ready` pass, threaded via `DispatchTickCtx`.
+///
+/// Pre-fix: RED — counter == 3 (one per Ready drv).
+#[tokio::test]
+async fn solve_inputs_called_once_per_dispatch_pass() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    // 3 Ready drvs, no executor — every drv is popped, solve_intent_for
+    // runs, then the placement defers it. `bare_actor_*` is a non-K8s
+    // actor: `LeaderState::default()` is `always_leader` (is_leader =
+    // recovery_complete = true), so `dispatch_ready`'s gates pass.
+    for d in ["d0", "d1", "d2"] {
+        actor.test_inject_ready(d, Some("test-pkg"), "x86_64-linux", false);
+        actor.push_ready(d.into());
+    }
+
+    let before = actor.test_counters.solve_inputs_calls.load(SeqCst);
+    actor.dispatch_ready().await;
+    let after = actor.test_counters.solve_inputs_calls.load(SeqCst);
+
+    assert_eq!(
+        after - before,
+        1,
+        "ONE `solve_inputs()` snapshot per `dispatch_ready` pass — the \
+         per-drv re-read is both the §13c-2 gauge spam (O(|hw_classes| × \
+         |Ready|)) and a latent TOCTOU at the same `inputs_gen` if \
+         `spot_price_poller` writes mid-pass. Got {} calls for 3 Ready \
+         drvs.",
+        after - before,
+    );
 }

@@ -124,6 +124,19 @@ pub fn describe_all() {
          Class falls to the global ceiling — over-permits, never \
          over-strips."
     );
+    describe_counter!(
+        "rio_scheduler_sla_forecast_dropped_total",
+        "§13b: forecast-pass intent dropped before emit. Labeled \
+         `reason` ∈ {lead_horizon, tenant_budget}. `lead_horizon`: ETA \
+         exceeds the per-intent forecast horizon (`max(lead_time_seed)` \
+         over routable hwClasses pre-solve, over `intent.hw_class_names` \
+         post-solve) — the controller's per-cell `a_open` would drop it; \
+         `tenant_budget`: `max_forecast_cores_per_tenant` exhausted by \
+         higher-priority intents this poll. Sustained `lead_horizon` ⇒ \
+         deps complete far ahead of any seed lead (saved work) OR a \
+         routable class's `lead_time_seed` is missing. Sustained \
+         `tenant_budget` ⇒ Ready frontier already saturates the cap."
+    );
 }
 
 /// Actual-vs-predicted score for one completion. Pure so the
@@ -335,6 +348,7 @@ pub const SLA_METRICS: &[&str] = &[
     "rio_scheduler_sla_als_round_cap_hit_total",
     "rio_scheduler_sla_keys_evicted_total",
     "rio_scheduler_sla_class_ceiling_uncatalogued",
+    "rio_scheduler_sla_forecast_dropped_total",
 ];
 
 /// Metrics with a closed-domain label whose VALUES are each a separate
@@ -381,6 +395,11 @@ pub const SLA_LABELED_METRICS: &[(&str, &str, &[&str])] = &[
         "rio_scheduler_sla_hw_ladder_exhausted_total",
         "exit",
         &["all_masked"],
+    ),
+    (
+        "rio_scheduler_sla_forecast_dropped_total",
+        "reason",
+        &["lead_horizon", "tenant_budget"],
     ),
 ];
 

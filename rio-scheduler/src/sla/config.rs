@@ -571,13 +571,62 @@ impl SlaConfig {
         (cat.0.min(cfg.0), cat.1.min(cfg.1))
     }
 
-    /// `reference_hw_class` if its `kubernetes.io/arch` label matches
-    /// `system`'s arch (or is absent — arch-agnostic class) AND
-    /// [`Self::class_ceilings`] hosts `(cores, mem)` AND
-    /// [`features_compatible`] holds for `(features, provides)`, else
-    /// the first (sorted) `hw_classes` entry that does. `None` ⇔
-    /// `system` unmappable OR no configured class hosts that arch at
-    /// that size with those features — caller emits empty
+    /// Arch + features routing predicate for hwClass `h`: the class's
+    /// `kubernetes.io/arch` label matches `system`'s arch (or is
+    /// absent — arch-agnostic class) AND [`features_compatible`] holds
+    /// for `(features, provides_features)`. `None` arch (unmappable
+    /// `system`, e.g. `builtin`) is a no-op on the arch axis —
+    /// arch-agnostic, may land anywhere; mirrors
+    /// [`Self::retain_hosting_cells`]' `want_arch.is_none_or(...)`.
+    ///
+    /// §Partition-single-source: this is the ONE predicate
+    /// [`Self::reference_hw_class_for_system`] (intent producer) and
+    /// [`Self::max_lead_for`] (forecast pre-solve gate) both call so
+    /// the scheduler-side forecast horizon CANNOT drift from the class
+    /// set the solve actually routes to (r33 bug_007 / A4). Size
+    /// ([`Self::class_ceilings`]) is deliberately NOT here — the
+    /// pre-solve gate has no `(cores, mem)` to check; the post-solve
+    /// gate over `intent.hw_class_names` catches the residual.
+    /// Unknown `h` ⇒ `false`.
+    pub fn class_routes(&self, h: &str, arch: Option<&str>, features: &[String]) -> bool {
+        self.hw_classes.get(h).is_some_and(|d| {
+            arch.is_none_or(|a| {
+                d.labels
+                    .iter()
+                    .find(|l| l.key == ARCH_LABEL)
+                    .is_none_or(|l| l.value == a)
+            }) && features_compatible(features, &d.provides_features)
+        })
+    }
+
+    /// Per-intent forecast horizon: `max(lead_time_seed[(h, cap)])`
+    /// over hwClasses [`Self::class_routes`] admits for `(system,
+    /// features)`. Mirrors the controller's `a_open` per-cell filter
+    /// (`eta < lead_time(c)`) so the scheduler's forecast pass doesn't
+    /// admit intents the controller would unconditionally drop —
+    /// pre-`r33 bug_007` the global `max(values)` raised the horizon
+    /// 30× when `metal-{x86,arm}:od` seed=600 was added, admitting
+    /// non-metal intents the controller's per-cell gate rejects.
+    ///
+    /// Empty seed map / no matching class ⇒ `0.0` (forecast disabled
+    /// for this intent — every `eta ≥ 0` fails the gate).
+    /// Arch-unmappable systems (`builtin`) are arch-agnostic via
+    /// [`Self::class_routes`], so they retain the pre-fix global-max
+    /// behaviour (size aside).
+    pub fn max_lead_for(&self, system: &str, features: &[String]) -> f64 {
+        let arch = rio_common::k8s::system_to_k8s_arch(system);
+        self.lead_time_seed
+            .iter()
+            .filter(|((h, _), _)| self.class_routes(h, arch, features))
+            .map(|(_, &v)| v)
+            .fold(0.0, f64::max)
+    }
+
+    /// `reference_hw_class` if [`Self::class_routes`] admits it for
+    /// `(system, features)` AND [`Self::class_ceilings`] hosts
+    /// `(cores, mem)`, else the first (sorted) `hw_classes` entry that
+    /// does. `None` ⇔ `system` unmappable OR no configured class hosts
+    /// that arch at that size with those features — caller emits empty
     /// `hw_class_names` so the controller's `fallback_cell` reaches its
     /// OWN `None` → `no_hosting_class`.
     pub fn reference_hw_class_for_system(
@@ -591,13 +640,7 @@ impl SlaConfig {
     ) -> Option<&str> {
         let arch = rio_common::k8s::system_to_k8s_arch(system)?;
         let matches = |h: &str| {
-            self.hw_classes.get(h).is_some_and(|d| {
-                d.labels
-                    .iter()
-                    .find(|l| l.key == ARCH_LABEL)
-                    .is_none_or(|l| l.value == arch)
-                    && features_compatible(features, &d.provides_features)
-            }) && {
+            self.class_routes(h, Some(arch), features) && {
                 let (cc, cm) = self.class_ceilings(h, catalog, global);
                 cores <= cc && mem <= cm
             }

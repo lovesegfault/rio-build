@@ -18,14 +18,24 @@ use super::DagActor;
 #[cfg(test)]
 use super::backdate;
 
-/// Per-dispatch-pass accumulators threaded through
-/// [`DagActor::try_dispatch_one`]. The drain loop in
+/// Per-dispatch-pass accumulators + the per-pass solve-input snapshot,
+/// threaded through [`DagActor::try_dispatch_one`]. The drain loop in
 /// [`DagActor::dispatch_ready`] previously closed over five outer
 /// `mut` locals; collecting them here lets the loop body extract as a
 /// method without 6-positional-`&mut` signatures.
-#[derive(Default)]
 struct DispatchTickCtx {
     // ── per-PASS (survive outer-loop iterations) ───────────────────
+    /// ONE snapshot of the shared solve inputs for the whole pass —
+    /// every drv `try_dispatch_one` solves sees the SAME `(hw, cost,
+    /// inputs_gen)`. Mirrors `compute_spawn_intents` (snapshot.rs's
+    /// `solve_inputs()` hoist, with the explicit TOCTOU rationale): a
+    /// per-drv re-read meant two drvs in one pass could see different
+    /// `cheapest_h` if `spot_price_poller` wrote between them. Also
+    /// caps the §13c-2 `class_ceiling_uncatalogued` gauge at one emit
+    /// per pass instead of `O(|hw_classes| × |Ready|)` (r33 bug_013).
+    hw: crate::sla::hw::HwTable,
+    cost: crate::sla::cost::CostTable,
+    inputs_gen: u64,
     /// Hashes the batch FOD pre-pass already checked (I-163).
     /// `try_dispatch_one` skips the per-FOD store RPC for these.
     batch_checked: HashSet<DrvHash>,
@@ -163,9 +173,22 @@ impl DagActor {
         // the same 211 paths was the ~150ms dominant cost of the
         // 169ms/Heartbeat that saturated the actor at medium-mixed-32x
         // scale.
+        let batch_checked = self.batch_probe_cached_ready().await;
+        // r33 bug_013: ONE solve-input snapshot for the WHOLE pass —
+        // hoisted here from `try_dispatch_one`'s per-drv body. After
+        // the batch store RPC so the snapshot is as fresh as the pass
+        // will get. See [`DispatchTickCtx`]'s field doc for the TOCTOU
+        // + gauge-spam rationale.
+        let (hw, cost, inputs_gen) = self.solve_inputs();
         let mut ctx = DispatchTickCtx {
-            batch_checked: self.batch_probe_cached_ready().await,
-            ..Default::default()
+            hw,
+            cost,
+            inputs_gen,
+            batch_checked,
+            n_assigned: 0,
+            deferred: Vec::new(),
+            kind_deferred: HashMap::new(),
+            unroutable_systems: HashMap::new(),
         };
         phase!("0-batch-ready-precheck");
 
@@ -258,10 +281,10 @@ impl DagActor {
         //
         // `want_kind`/`system` captured into locals so the `state`
         // borrow ends here — `node_mut` below needs exclusive access
-        // to `self.dag`. One `(hw, cost, inputs_gen)` snapshot per
-        // dispatch — same pattern as `compute_spawn_intents`.
-        let (hw, cost, inputs_gen) = self.solve_inputs();
-        let intent = self.solve_intent_for(state, &hw, &cost, inputs_gen);
+        // to `self.dag`. The `(hw, cost, inputs_gen)` snapshot is
+        // PER-PASS, threaded via `ctx` from `dispatch_ready` (r33
+        // bug_013) — same pattern as `compute_spawn_intents`.
+        let intent = self.solve_intent_for(state, &ctx.hw, &ctx.cost, ctx.inputs_gen);
         let want_kind = crate::state::kind_for_drv(state.is_fixed_output);
         let system = state.system.clone();
 
