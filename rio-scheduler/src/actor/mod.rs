@@ -173,6 +173,20 @@ pub const SUBSTITUTE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::f
 pub const SUBSTITUTE_REMINT_PATHS: usize = 50;
 pub const SUBSTITUTE_REMINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
+/// LRU cap for [`DagActor::unroutable_features_warned`] (mb_001). The
+/// key's second component is tenant-controlled `requiredSystemFeatures`;
+/// 1024 distinct `(tenant, features)` tuples is generous for legitimate
+/// misconfiguration (a tenant's drv-set has a small, repeated set of
+/// feature combinations) while bounding the actor heap to ~2 MiB worst
+/// case (1024 × ~2 KiB clamped key). Eviction re-arms the warn —
+/// fail-safe over-emit.
+pub(super) const UNROUTABLE_FEATURES_WARNED_CAP: usize = 1024;
+/// LRU cap for [`DagActor::cap_mismatch_warned`] (mb_003 / r31 A3).
+/// Key cardinality is `|tenants| × |overridden pnames| × |CapacityType|`
+/// — operator-configured overrides are sparse (a handful at a time) so
+/// 1024 is far above any legitimate steady-state.
+pub(super) const CAP_MISMATCH_WARNED_CAP: usize = 1024;
+
 /// Timeout for the merge-time `FindMissingPaths` only
 /// (`find_missing_with_breaker`). Separate from `grpc_timeout` (30s):
 /// with the store-side 4096-path truncation removed
@@ -475,13 +489,30 @@ pub struct DagActor {
     /// `was_miss` is declared so none of the memo-anchored debounce
     /// gates apply (mb_031). `Mutex` because `solve_intent_for` is
     /// `&self`; the actor is single-threaded so contention is zero.
-    /// Bounded by distinct `(tenant, clamped_features)` tuples where
-    /// `clamped_features` is `requiredSystemFeatures` truncated to
-    /// 64 entries × 32 ASCII chars (the strings are tenant-controlled,
-    /// so an unclamped key would grow unbounded). The metric carries
+    ///
+    /// `LruCache` capped at [`UNROUTABLE_FEATURES_WARNED_CAP`] (mb_001):
+    /// the key's second component is tenant-controlled
+    /// (`requiredSystemFeatures` verbatim from the drv), so a `HashSet`
+    /// — even with the per-entry 64×32 ASCII clamp — grows unbounded in
+    /// distinct keys (`["x-1"]`, `["x-2"]`, …). The clamp bounds bytes
+    /// per entry (~2 KiB); the LRU bounds entry COUNT. Eviction under
+    /// pressure re-arms the warn for the evicted key — fail-safe
+    /// over-emit, bounded by cap × eviction churn. The metric carries
     /// only `tenant` (bounded by `Claims.sub`). Re-arms on pod restart
     /// (config change rolls the pod via the scheduler.yaml checksum).
-    unroutable_features_warned: parking_lot::Mutex<HashSet<(String, Vec<String>)>>,
+    unroutable_features_warned: parking_lot::Mutex<lru::LruCache<(String, Vec<String>), ()>>,
+    /// `(tenant, pname, cap)` tuples already WARNed as a `--capacity`
+    /// override pin the reference class doesn't host (mb_003 / r31 A3).
+    /// The bypass-path `Some(cap)` arm in [`DagActor::bypass_cells`]
+    /// drops the cell when `cap ∉ capacity_types_for(h)` — without the
+    /// warn, the operator's pin is silently ignored for the override
+    /// TTL with no signal. Debounced once-per-edge so the per-drv
+    /// per-poll cadence doesn't flood. Same `LruCache` shape as
+    /// `unroutable_features_warned`: `pname` is tenant-controlled.
+    /// Retained across `clear_persisted_state` for the same reason
+    /// (override config doesn't change on leader transition).
+    cap_mismatch_warned:
+        parking_lot::Mutex<lru::LruCache<(String, String, crate::sla::config::CapacityType), ()>>,
     /// Set by events that change dispatch eligibility (Heartbeat, drain).
     /// `handle_tick` consumes it: `if dirty { dispatch_ready(); dirty=false; }`.
     /// I-163: Heartbeat used to call `dispatch_ready` inline — at 290
@@ -655,7 +686,12 @@ impl DagActor {
             freeze_builders_since: None,
             freeze_fetchers_since: None,
             unroutable_warned: HashSet::new(),
-            unroutable_features_warned: parking_lot::Mutex::new(HashSet::new()),
+            unroutable_features_warned: parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(UNROUTABLE_FEATURES_WARNED_CAP).unwrap(),
+            )),
+            cap_mismatch_warned: parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(CAP_MISMATCH_WARNED_CAP).unwrap(),
+            )),
             dispatch_dirty: false,
             probe_generation: 1,
             became_idle_inline_this_tick: 0,
@@ -732,10 +768,15 @@ impl DagActor {
             freeze_builders_since: _,
             freeze_fetchers_since: _,
             unroutable_warned: _,
-            // Retained: a leader transition doesn't change the SLA
-            // config; the operator already saw the WARN. Same rationale
-            // as `unroutable_warned` above.
+            // Retained: a leader transition doesn't change the SLA or
+            // override config; the operator already saw the WARN. The
+            // bound is the LRU cap (mb_001), not a `.retain()` —
+            // unlike `unroutable_warned`, whose key universe is
+            // operator-config-bounded `system` strings, these key on
+            // tenant-controlled fields with no equivalent bounded
+            // universe to retain against.
             unroutable_features_warned: _,
+            cap_mismatch_warned: _,
             dispatch_dirty: _,
             probe_generation: _,
             became_idle_inline_this_tick: _,

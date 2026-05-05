@@ -2782,3 +2782,206 @@ async fn unroutable_features_debounced_no_feature_label() {
          two polls → 1 increment, got {total}"
     );
 }
+
+/// **mb_023 (r31 B0)** — bypass-path `Some(cap)` arm: FOD with a
+/// `--capacity` override MUST emit empty `(hw_class_names,
+/// node_affinity)`. r30B0-A9 added `!is_fixed_output` to the `None`
+/// arm only; the `Some(cap)` sibling — touched in the same commit to
+/// add `&state.required_features` — was left unguarded
+/// (§Verifier-one-step-removed (c) "sibling consumer of the changed
+/// one"). Pre-fix: an FOD whose pname matches a `--capacity` override
+/// emits `[(reference_h, cap)]` → `cells_to_selector_terms` writes
+/// builder-cell `nodeAffinity` → `apply_intent_resources` stamps it
+/// onto the Fetcher pod unconditionally → Fetcher nodes carry only
+/// `node-role: fetcher` → permanently Pending. `retain_hosting_cells`
+/// CANNOT catch this — its 4 axes (arch/features/size/cap) have no
+/// `is_fixed_output` parameter and the cell IS hosted.
+///
+/// Also exercises the r31-A4 `debug_assert!` tripwire before
+/// `retain_hosting_cells`: a producer arm leaking FOD cells panics
+/// here before the wire-form assertion runs.
+#[tokio::test]
+async fn contract_fod_capacity_override_emits_no_cells() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    // Fetcher drv (`is_fod=true`) whose pname matches a `--capacity`
+    // override. The runbook documents `rio-cli sla override <pname>
+    // --capacity=on-demand` for spot-interruption skew — applying it
+    // to (or via wildcard over) an FOD pname is a documented operator
+    // action, not an edge case.
+    actor.test_inject_ready("d-fod-cap", Some("test-pkg"), "x86_64-linux", true);
+    actor
+        .sla_estimator
+        .seed_overrides(vec![crate::db::SlaOverrideRow {
+            pname: "test-pkg".into(),
+            capacity_type: Some("on-demand".into()),
+            ..Default::default()
+        }]);
+
+    let state = actor.dag.node("d-fod-cap").unwrap();
+    let (hw, cost, ig) = actor.solve_inputs();
+    let intent = actor.solve_intent_for(state, &hw, &cost, ig);
+
+    assert!(
+        intent.hw_class_names.is_empty() && intent.node_affinity.is_empty(),
+        "FOD with `--capacity` override MUST emit empty cells (mb_023): \
+         the rio-fetcher NodePool carries no hwClass labels — builder-\
+         cell nodeAffinity ANDed with the Fetcher pod's nodeSelector is \
+         permanently Pending. Got hw_class_names={:?} node_affinity={:?}",
+        intent.hw_class_names,
+        intent.node_affinity,
+    );
+}
+
+/// **mb_023 (r31 B0)** — `bypass_cells` FOD hoist sits ABOVE the
+/// `match cap`, so BOTH arms (and any future arm) inherit the gate.
+/// Asserts on `bypass_cells` directly so a future arm regressing the
+/// hoist is caught at the producer, not just by the chokepoint or the
+/// A4 tripwire.
+#[tokio::test]
+async fn bypass_cells_fod_emits_no_cells_regardless_of_cap() {
+    use crate::sla::config::CapacityType;
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    actor.test_inject_ready("d-fod", Some("test-pkg"), "x86_64-linux", true);
+
+    let state = actor.dag.node("d-fod").unwrap();
+    let (_, cost, _) = actor.solve_inputs();
+    for cap in [None, Some(CapacityType::Od), Some(CapacityType::Spot)] {
+        let cells = actor.bypass_cells(state, cap, 4, 4 << 30, &cost, "tenant-a");
+        assert!(
+            cells.is_empty(),
+            "FOD MUST produce zero bypass cells (mb_023) for cap={cap:?}; got {cells:?}",
+        );
+    }
+}
+
+/// **mb_003 (r31 B0)** — bypass-path `Some(cap)` arm gates `cap ∈
+/// capacity_types_for(h)`, mirroring the `None` arm. Pre-fix: an
+/// override pinning a cap the reference class doesn't host (e.g.
+/// `--capacity=spot` on an od-only reference class) emits
+/// `[(h, Spot)]` which `retain_hosting_cells` strips (`cap_ok=false`)
+/// → chokepoint `warn!("producer-path … regressed?")` per drv per
+/// poll for the override TTL — defeating the documented "strip = a
+/// producer regression signal, not log spam" contract at config.rs.
+///
+/// Asserts on `bypass_cells` directly (pre-chokepoint) — a
+/// `solve_intent_for` test would see `intent.hw_class_names == []`
+/// either way (the chokepoint already strips it), so it cannot be
+/// red-first for the producer fix (r31 A1, §Kani-extract-predicate).
+#[tokio::test]
+async fn bypass_cells_unhosted_cap_pin_drops_at_producer() {
+    use crate::sla::config::CapacityType;
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    // Make the reference class od-only so `Spot ∉ capacity_types_for(h)`.
+    actor.sla_config.reference_hw_class = "intel-6".into();
+    actor
+        .sla_config
+        .hw_classes
+        .get_mut("intel-6")
+        .unwrap()
+        .capacity_types = vec![CapacityType::Od];
+    actor.test_inject_ready("d-cap", Some("test-pkg"), "x86_64-linux", false);
+
+    let state = actor.dag.node("d-cap").unwrap();
+    let (_, cost, _) = actor.solve_inputs();
+
+    // Hosted cap (Od) passes the producer gate.
+    let hosted = actor.bypass_cells(state, Some(CapacityType::Od), 4, 4 << 30, &cost, "tenant-a");
+    assert_eq!(
+        hosted,
+        vec![("intel-6".to_owned(), CapacityType::Od)],
+        "hosted `--capacity` pin MUST emit the reference cell"
+    );
+    // Unhosted cap (Spot) drops at the producer — empty cells, NOT a
+    // chokepoint strip.
+    let dropped = actor.bypass_cells(
+        state,
+        Some(CapacityType::Spot),
+        4,
+        4 << 30,
+        &cost,
+        "tenant-a",
+    );
+    assert!(
+        dropped.is_empty(),
+        "`--capacity=spot` on an od-only reference class MUST drop the \
+         cell at the producer (mb_003), not at retain_hosting_cells — \
+         got {dropped:?}",
+    );
+}
+
+/// **mb_003 / r31 A3** — the producer-side `cap ∉ capacity_types_for(h)`
+/// drop is NOT silent: it fires a debounced `warn!` keyed
+/// `(tenant, pname, cap)` so the operator's ignored `--capacity` pin is
+/// observable. Without the warn, the override looks applied but every
+/// pod for the pname stalls at `fallback_cell` with no signal
+/// (§Diagnostic-blind-spots). Asserts the debounce keys the LRU once
+/// per `(tenant, pname, cap)` regardless of poll count.
+#[tokio::test]
+async fn bypass_cells_unhosted_cap_pin_warns_once() {
+    use crate::sla::config::CapacityType;
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    actor.sla_config.reference_hw_class = "intel-6".into();
+    actor
+        .sla_config
+        .hw_classes
+        .get_mut("intel-6")
+        .unwrap()
+        .capacity_types = vec![CapacityType::Od];
+    actor.test_inject_ready("d-cap-w", Some("test-pkg"), "x86_64-linux", false);
+
+    let state = actor.dag.node("d-cap-w").unwrap();
+    let (_, cost, _) = actor.solve_inputs();
+    assert_eq!(actor.cap_mismatch_warned.lock().len(), 0);
+    for _ in 0..8 {
+        let _ = actor.bypass_cells(
+            state,
+            Some(CapacityType::Spot),
+            4,
+            4 << 30,
+            &cost,
+            "tenant-a",
+        );
+    }
+    assert_eq!(
+        actor.cap_mismatch_warned.lock().len(),
+        1,
+        "cap-mismatch debounce MUST key once per (tenant, pname, cap) — \
+         8 polls × 1 key = 1 LRU entry (the warn fires on the first edge \
+         only)"
+    );
+}
+
+/// **mb_001 (r31 B0)** — `unroutable_features_warned` is bounded by
+/// `UNROUTABLE_FEATURES_WARNED_CAP` (LRU), not just per-entry
+/// byte-clamped. r30B2 (mb_031) clamped each entry to 64×32 ASCII
+/// (~2 KiB) and added a doc-comment naming `["x-${uuid}"]` as the
+/// closed threat — but `take(32)` on a 38-char UUID still leaves
+/// ~2^120 distinct values, and the `HashSet` had no entry-count bound.
+/// Pre-fix: `len() == 2000` (and `.put()` wouldn't compile on
+/// `HashSet`). Post-fix: `len() == cap`.
+#[tokio::test]
+async fn unroutable_features_warned_is_bounded() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let actor = bare_actor_hw(db.pool.clone());
+    let cap = crate::actor::UNROUTABLE_FEATURES_WARNED_CAP;
+    for i in 0..(2 * cap) {
+        actor
+            .unroutable_features_warned
+            .lock()
+            .put(("tenant-a".to_owned(), vec![format!("f{i}")]), ());
+    }
+    let len = actor.unroutable_features_warned.lock().len();
+    assert!(
+        len <= cap,
+        "unroutable_features_warned MUST be bounded by the LRU cap \
+         (mb_001): inserted {} distinct keys, expected ≤{cap}, got {len}",
+        2 * cap,
+    );
+    // The LRU should be at exactly `cap` after `2 × cap` inserts of
+    // distinct keys — eviction happened.
+    assert_eq!(len, cap, "LRU should be at cap after over-insertion");
+}

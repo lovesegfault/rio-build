@@ -642,9 +642,17 @@ impl SlaConfig {
     /// Pending. The producer paths SHOULD have filtered
     /// (correctness-of-intent); this is the §"Function becomes total"
     /// backstop — correctness-of-output regardless of
-    /// correctness-of-producer. Stripped cells are `warn!`ed; with the
-    /// `h_all` arch-filter (snapshot.rs) a strip here is a producer
-    /// regression signal, not log spam.
+    /// correctness-of-producer.
+    ///
+    /// Stripped cells are `warn!`ed. The producer paths filter on every
+    /// axis (arch via `h_all` / `reference_hw_class_for_system`,
+    /// features via `features_compatible`, size via `class_ceilings`,
+    /// capacity via `capacity_types_for` — `bypass_cells` `Some(cap)`
+    /// gates the operator's pin since r31 mb_003). A strip here is a
+    /// producer regression signal — the chokepoint SHOULD NOT be
+    /// reached. The known residual is the `Some(memo)` arm's
+    /// `all_candidates` capacity-fallback (memo-keyed, not per-poll —
+    /// low blast radius; r32 candidate).
     pub fn retain_hosting_cells(
         &self,
         cells: Vec<Cell>,
@@ -2050,13 +2058,14 @@ mod tests {
     }
 
     /// §13d STRIKE-7 (r30 mb_033): `retain_hosting_cells` filters
-    /// `cap ∈ capacity_types_for(h)`. The bypass-path `Some(cap)` arm
-    /// (`reference_hw_class_for_system` doesn't take `cap`) and the
-    /// `all_candidates` capacity-fallback both can ship a `(h, cap)`
-    /// the class doesn't host. The controller's `cover_deficit`
-    /// iterates `all_cells()` (which yields only configured caps) so
-    /// `by_cell[(metal, Spot)]` is never visited — build hangs forever
-    /// with no NodeClaim, no metric, no warn.
+    /// `cap ∈ capacity_types_for(h)`. Since r31 mb_003 the bypass-path
+    /// `Some(cap)` arm gates `cap ∈ capacity_types_for(h)` itself (the
+    /// chokepoint is now backstop-only there, not steady-state); the
+    /// remaining producer hole is the `all_candidates` capacity-fallback
+    /// (memo-keyed). A `(h, cap)` the class doesn't host would route the
+    /// controller's `cover_deficit` to a `by_cell[(metal, Spot)]` entry
+    /// `all_cells()` (configured caps only) never visits — build hangs
+    /// forever with no NodeClaim, no metric, no warn.
     #[test]
     fn retain_hosting_cells_filters_capacity() {
         let mut cfg = base();

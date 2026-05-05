@@ -981,13 +981,17 @@ impl DagActor {
         // strings still reach the operator via the structured-log
         // `features` field below, which is rate-bounded by the same
         // debounce edge.
-        // Clamp the debounce key to bound per-pod heap growth: the raw
-        // strings are tenant-controlled (`requiredSystemFeatures`,
-        // unclamped at translate.rs) — without a cap a slow-rate tenant
-        // submitting `["x-${uuid}"]` accumulates HashSet entries
-        // indefinitely across DAG/PG GC. 64 entries × 32 chars matches
+        // Clamp the debounce key to bound per-ENTRY heap growth: the
+        // raw strings are tenant-controlled (`requiredSystemFeatures`,
+        // unclamped at translate.rs); 64 entries × 32 chars matches
         // executor_service.rs's `MAX_HEARTBEAT_FEATURES`; collisions
-        // dedup at ASCII-truncate, which only over-debounces (fail-safe).
+        // dedup at ASCII-truncate, which only over-debounces
+        // (fail-safe). The entry COUNT is bounded by the LRU cap on the
+        // set itself (mb_001) — the clamp alone leaves the doc's own
+        // threat case `["x-${uuid}"]` open at the cardinality level.
+        // `.put()` returns `Some` iff the key was already present;
+        // `.is_none()` is the "first edge" predicate (mirrors
+        // `HashSet::insert`'s `true`-on-new).
         const MAX_KEY_FEATURES: usize = 64;
         let key_features: Vec<String> = state
             .required_features
@@ -1000,7 +1004,8 @@ impl DagActor {
             && self
                 .unroutable_features_warned
                 .lock()
-                .insert((tenant.clone(), key_features))
+                .put((tenant.clone(), key_features), ())
+                .is_none()
         {
             ::metrics::counter!(
                 "rio_scheduler_unroutable_features_total",
@@ -1347,78 +1352,14 @@ impl DagActor {
                         reason.emit(&tenant);
                     }
                 }
-                // mb_053(a) / V-5: `--capacity` on the bypass path. The
-                // `Some(memo)` arm filters `cells` to `cap` post-memo,
-                // but ANY bypass field gates `full=None` and lands here
-                // with empty cells. Empty `hw_class_names` → controller's
-                // `cells_of` is empty → `fallback_cell` returns
-                // `(ref_h, Spot)` ignoring the pin → cover provisions
-                // spot, the cap-type term refuses spot, pod never
-                // schedules. Populate cells from `[(ref_h, cap)]` so the
-                // controller derives the pinned cell instead of falling
-                // back.
-                let cells = match override_.as_ref().and_then(|o| o.capacity) {
-                    // bug_039: `reference_hw_class` may have a
-                    // `kubernetes.io/arch` label that doesn't match
-                    // `state.system` — emitting it would AND the pod's
-                    // `nodeSelector.arch=arm64` with `nodeAffinity arch
-                    // In [amd64]` → permanently Pending. Arch-match
-                    // like the controller's `fallback_cell` does. On
-                    // `None` (no class hosts this arch at this size, or
-                    // unmappable system), emit empty so the controller's
-                    // `fallback_cell` reaches its OWN `None` →
-                    // `no_hosting_class` metric. Pass the raw
-                    // `(c, m.max(floor))` — producer-side filter is
-                    // correctness-of-intent; the post-finalize chokepoint
-                    // below catches the post-clamp delta.
-                    Some(cap) => match self.sla_config.reference_hw_class_for_system(
-                        &state.system,
-                        c,
-                        m.max(state.sched.resource_floor.mem_bytes),
-                        &state.required_features,
-                        cost.catalog_ceilings(),
-                        cost.resolved_global(),
-                    ) {
-                        Some(h) => vec![(h.to_owned(), cap)],
-                        None => Vec::new(),
-                    },
-                    // §13d STRIKE-7 (mb_012, A9): cold-start featured
-                    // intent (`fit=None`, no override). Pre-fix this arm
-                    // returned `[]` → controller's `fallback_cell` /
-                    // FFD `agnostic_arch` picked a non-metal cell → kvm
-                    // pod (`nodeSelector: rio.build/kvm=true`)
-                    // permanently Pending → no `build_sample` → `fit`
-                    // stays `None` → bootstrap deadlock. Emit cells for
-                    // every configured cap of the reference class so
-                    // the controller minds the metal cell. Featureless
-                    // and FOD intents stay `[]`: featureless → genuinely
-                    // hw-agnostic (controller's `fallback_cell` arch-
-                    // matches); FOD → fetcher pool is helm-managed, not
-                    // cover-minted, so emitting builder cells over-
-                    // reserves builder capacity in FFD.
-                    None => {
-                        if !state.is_fixed_output && !state.required_features.is_empty() {
-                            self.sla_config
-                                .reference_hw_class_for_system(
-                                    &state.system,
-                                    c,
-                                    m.max(state.sched.resource_floor.mem_bytes),
-                                    &state.required_features,
-                                    cost.catalog_ceilings(),
-                                    cost.resolved_global(),
-                                )
-                                .map_or_else(Vec::new, |h| {
-                                    self.sla_config
-                                        .capacity_types_for(h)
-                                        .iter()
-                                        .map(|cap| (h.to_owned(), *cap))
-                                        .collect()
-                                })
-                        } else {
-                            Vec::new()
-                        }
-                    }
-                };
+                let cells = self.bypass_cells(
+                    state,
+                    override_.as_ref().and_then(|o| o.capacity),
+                    c,
+                    m,
+                    cost,
+                    &tenant,
+                );
                 (c, m, d, cells, None)
             }
         };
@@ -1442,6 +1383,21 @@ impl DagActor {
         let cores = cores.min(self.sla_ceilings.max_cores as u32).max(1);
         let mem = mem.max(floor.mem_bytes).min(self.sla_ceilings.max_mem);
         let disk = disk.max(floor.disk_bytes).min(self.sla_ceilings.max_disk);
+        // mb_023 (r31 A4): the `is_fixed_output ⟹ cells = []` invariant
+        // is enforced in two places — the `full` gate at :1040 (so FOD
+        // never enters `solve_full`, the `Some(memo)` arm is
+        // structurally unreachable) and the `bypass_cells` hoist (so
+        // FOD gets `[]` from the no-memo arm). This tripwire fires if a
+        // future producer arm bypasses both. `retain_hosting_cells` has
+        // no `is_fixed_output` axis (the chokepoint validates *cell
+        // hosting*, not *consumer kind*), so a producer leak here would
+        // pass the chokepoint and silently route FOD to a builder cell.
+        debug_assert!(
+            !state.is_fixed_output || cells.is_empty(),
+            "FOD must produce zero cells (mb_023): is_fixed_output=true \
+             but cells={cells:?} — a producer arm bypassed the FOD hoist \
+             in `bypass_cells` and the `!is_fixed_output` gate on `full`",
+        );
         // STRIKE-7 (r30 §13d): single post-finalize chokepoint. Both
         // arms above converge here with finalized `(cores, mem)` and a
         // `Vec<Cell>` (BEFORE `cells_to_selector_terms` so the
@@ -1449,8 +1405,8 @@ impl DagActor {
         // in a `NodeSelectorTerm`). This is downstream of every
         // `hw_class_names` producer (the `solve_full` re-filter, the
         // `all_candidates` capacity-fallback, the no-memo
-        // `reference_hw_class_for_system`). A new producer-hole would
-        // require a SpawnIntent construction site that bypasses
+        // `bypass_cells` reference-class lookup). A new producer-hole
+        // would require a SpawnIntent construction site that bypasses
         // `solve_intent_for` entirely.
         let cells = self.sla_config.retain_hosting_cells(
             cells,
@@ -1588,6 +1544,141 @@ impl DagActor {
             node_affinity,
             hw_class_names,
             disk_headroom,
+        }
+    }
+
+    /// Bypass-path (`full = None`, no memo) cells for the no-`solve_full`
+    /// arm of [`Self::solve_intent_for`]. Reached for FOD, serial,
+    /// override-bypass (`--cores`/`--mem`/`--tier`), `prefer_local`,
+    /// cold-start `fit=None`/`Probe`, and empty-`h_all` drvs.
+    ///
+    /// Extracted (`pub(super)`) so contract tests can assert the
+    /// pre-chokepoint cell set directly: the `cap ∉ capacity_types_for(h)`
+    /// gate (mb_003) is observationally indistinguishable from the
+    /// post-finalize `retain_hosting_cells` strip on `intent.hw_class_names`
+    /// — both produce `[]` — so a `solve_intent_for`-level test cannot
+    /// be red-first for the producer fix (r31 A1, §Kani-extract-predicate).
+    ///
+    /// FOD ⟹ `[]` regardless of arm (mb_023): the `rio-fetcher`
+    /// NodePool is helm-managed, not cover-minted (`apply_intent_resources`
+    /// stamps `node_affinity` unconditionally; a builder cell on a
+    /// fetcher pod's affinity matches zero fetcher templates →
+    /// permanently Pending). Hoisted ABOVE the `match` so a future arm
+    /// inherits the guard — r30B0-A9 added the gate to the `None` arm
+    /// only, leaving the `Some(cap)` sibling open
+    /// (§Verifier-one-step-removed (c)).
+    pub(super) fn bypass_cells(
+        &self,
+        state: &crate::state::DerivationState,
+        cap: Option<crate::sla::config::CapacityType>,
+        cores: u32,
+        mem: u64,
+        cost: &crate::sla::cost::CostTable,
+        tenant: &str,
+    ) -> Vec<crate::sla::config::Cell> {
+        if state.is_fixed_output {
+            return Vec::new();
+        }
+        let mem = mem.max(state.sched.resource_floor.mem_bytes);
+        // mb_053(a) / V-5: `--capacity` on the bypass path. The
+        // `Some(memo)` arm filters `cells` to `cap` post-memo, but ANY
+        // bypass field gates `full=None` and lands here with empty
+        // cells. Empty `hw_class_names` → controller's `cells_of` is
+        // empty → `fallback_cell` returns `(ref_h, Spot)` ignoring the
+        // pin → cover provisions spot, the cap-type term refuses spot,
+        // pod never schedules. Populate cells from `[(ref_h, cap)]` so
+        // the controller derives the pinned cell instead of falling
+        // back.
+        match cap {
+            // bug_039: `reference_hw_class` may have a
+            // `kubernetes.io/arch` label that doesn't match
+            // `state.system` — emitting it would AND the pod's
+            // `nodeSelector.arch=arm64` with `nodeAffinity arch In
+            // [amd64]` → permanently Pending. Arch-match like the
+            // controller's `fallback_cell` does. On `None` (no class
+            // hosts this arch at this size, or unmappable system), emit
+            // empty so the controller's `fallback_cell` reaches its OWN
+            // `None` → `no_hosting_class` metric. Pass the raw
+            // `(c, m.max(floor))` — producer-side filter is
+            // correctness-of-intent; the post-finalize chokepoint
+            // catches the post-clamp delta.
+            Some(cap) => match self.sla_config.reference_hw_class_for_system(
+                &state.system,
+                cores,
+                mem,
+                &state.required_features,
+                cost.catalog_ceilings(),
+                cost.resolved_global(),
+            ) {
+                // mb_003: gate `cap` on `capacity_types_for(h)`,
+                // mirroring the `None` arm. Without it, `--cores=16
+                // --capacity=spot` on a kvm pname emits `(metal-x86,
+                // Spot)` on an od-only class → `retain_hosting_cells`
+                // strips (`cap_ok=false`) → chokepoint `warn!` per drv
+                // per poll for the override TTL, defeating the
+                // "strip = regression" contract at config.rs.
+                Some(h) if self.sla_config.capacity_types_for(h).contains(&cap) => {
+                    vec![(h.to_owned(), cap)]
+                }
+                // r31 A3: the operator's `--capacity` pin names a cap
+                // the reference class doesn't host — silent drop is a
+                // diagnostic blind spot (the override looks applied but
+                // the pin is ignored). Debounced WARN names the fix.
+                Some(h) => {
+                    let pname = state.pname.clone().unwrap_or_default();
+                    if self
+                        .cap_mismatch_warned
+                        .lock()
+                        .put((tenant.to_owned(), pname, cap), ())
+                        .is_none()
+                    {
+                        let hosted = self.sla_config.capacity_types_for(h);
+                        tracing::warn!(
+                            %tenant,
+                            pname = state.pname.as_deref().unwrap_or(""),
+                            ?cap,
+                            h,
+                            ?hosted,
+                            "`--capacity` override pin not hosted by the \
+                             reference hwClass for this drv — pin ignored, \
+                             cells emitted empty; change the pin to a \
+                             hosted cap, or add the cap to the class's \
+                             `[sla.hw_classes.<h>].capacity_types`",
+                        );
+                    }
+                    Vec::new()
+                }
+                None => Vec::new(),
+            },
+            // §13d STRIKE-7 (mb_012, A9): cold-start featured intent
+            // (`fit=None`, no override). Pre-fix this arm returned `[]`
+            // → controller's `fallback_cell` / FFD `agnostic_arch`
+            // picked a non-metal cell → kvm pod (`nodeSelector:
+            // rio.build/kvm=true`) permanently Pending → no
+            // `build_sample` → `fit` stays `None` → bootstrap deadlock.
+            // Emit cells for every configured cap of the reference
+            // class so the controller minds the metal cell. Featureless
+            // intents stay `[]` (genuinely hw-agnostic; controller's
+            // `fallback_cell` arch-matches). FOD already returned
+            // above the match.
+            None if !state.required_features.is_empty() => self
+                .sla_config
+                .reference_hw_class_for_system(
+                    &state.system,
+                    cores,
+                    mem,
+                    &state.required_features,
+                    cost.catalog_ceilings(),
+                    cost.resolved_global(),
+                )
+                .map_or_else(Vec::new, |h| {
+                    self.sla_config
+                        .capacity_types_for(h)
+                        .iter()
+                        .map(|cap| (h.to_owned(), *cap))
+                        .collect()
+                }),
+            None => Vec::new(),
         }
     }
 
