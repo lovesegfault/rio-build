@@ -44,11 +44,11 @@ const POOLS_JSON: &str = r#"[
   {"name":"x86-64-fetcher","kind":"Fetcher",
    "systems":["x86_64-linux","i686-linux","builtin"],
    "privileged":null,"hostUsers":null,"seccompProfile":null,"tolerations":null,
-   "nodeSelector":{"rio.build/node-role":"fetcher","kubernetes.io/arch":"amd64"}},
+   "nodeSelector":null},
   {"name":"aarch64-fetcher","kind":"Fetcher",
    "systems":["aarch64-linux","builtin"],
    "privileged":null,"hostUsers":null,"seccompProfile":null,"tolerations":null,
-   "nodeSelector":{"rio.build/node-role":"fetcher","kubernetes.io/arch":"arm64"}}
+   "nodeSelector":null}
 ]"#;
 
 pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {

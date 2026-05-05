@@ -1044,20 +1044,25 @@ pools:
     kind: Fetcher
     # `builtin` so the spawn-signal intent is self-describing.
     systems: [x86_64-linux, i686-linux, builtin]
-    # null-clear so the reconciler injects the rio.build/fetcher default
-    # (poolDefaults carries the builder toleration; without this the
-    # fetcher pod selects fetcher nodes but tolerates only the builder
-    # taint → permanently Pending).
+    # null-clear so the reconciler injects the rio.build/fetcher
+    # toleration default (poolDefaults carries the builder toleration;
+    # without this the fetcher pod tolerates only the builder taint
+    # → never lands on a fetcher node).
     tolerations: null
-    nodeSelector:
-      rio.build/node-role: fetcher
-      kubernetes.io/arch: amd64
+    # §13e: null-clear so the inherited poolDefaults.nodeSelector
+    # (rio.build/node-role: builder) doesn't pin fetcher pods to
+    # builder nodes. Restrictive placement is per-intent only
+    # (cells_to_selector_terms reads intent.hw_class_names ⊇
+    # {fetcher-*}). Arch is also per-intent (hw.labels carries
+    # kubernetes.io/arch); the I-098 pool-static arch nodeSelector
+    # is the *builder* mechanism — see pod.rs `if !fetcher && ...`.
+    nodeSelector: null
   # Multi-arch: add per-arch entries (EKS deploy.rs does this via
   # --set-json pools):
   #   - {name: aarch64, kind: Builder, systems: [aarch64-linux]}
   #   - {name: aarch64-fetcher, kind: Fetcher,
   #      systems: [aarch64-linux, builtin], tolerations: null,
-  #      nodeSelector: {rio.build/node-role: fetcher, kubernetes.io/arch: arm64}}
+  #      nodeSelector: null}
 
 # Base for every Pool. The pool.yaml template deep-merges each
 # `pools[]` entry over this, so security posture (privileged/

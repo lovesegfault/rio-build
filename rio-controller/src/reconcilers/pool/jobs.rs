@@ -859,9 +859,12 @@ pub(super) fn build_job(
     // §13b: route via the second kube-scheduler so MostAllocated bin-
     // packing matches `ffd::simulate`'s prediction, and bucket by
     // `⌊log₂ c*⌋` so largest-first holds at bind. Builder-only AND
-    // gate-active only: fetcher pods land on the dedicated
-    // `rio.build/node-role=fetcher` pool (the placeable gate doesn't
-    // cover FOD nodes); when `gate_active=false` (NodeClaim CRD
+    // gate-active only. §13e: fetcher cells ARE NodeClaim-minted now
+    // (`rio.build/fetcher` taint+label, `nodeclaim_pool` covers Fetcher
+    // Pools post-B2.6), but the second-scheduler routing stays
+    // builder-only — fetcher pods are one-per-node by construction
+    // (`FETCHER_TAINT_KEY` taint + per-intent affinity) so MostAllocated
+    // bin-packing is moot. When `gate_active=false` (NodeClaim CRD
     // absent — k3s VM tests without Karpenter) `kube-build-scheduler`
     // isn't deployed, so the pod would sit Pending forever.
     if gate_active && pool.spec.kind == ExecutorKind::Builder {
