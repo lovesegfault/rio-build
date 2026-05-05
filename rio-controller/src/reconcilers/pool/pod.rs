@@ -1345,6 +1345,68 @@ mod tests {
         );
     }
 
+    /// §13e: the per-intent nodeAffinity from `cells_to_selector_terms`
+    /// is the SOLE restrictive placement mechanism for fetchers,
+    /// mirroring the r33 bug_002 close for kvm. The pool-static
+    /// `nodeSelector{rio.build/node-role:fetcher}` is deleted — it was
+    /// redundant (every FOD intent's `hw_class_names` includes a fetcher
+    /// cell, which encodes the same constraint), and per §13d's lesson
+    /// redundancy IS the bug: two places that must agree (pool-static +
+    /// per-intent) eventually disagree.
+    // r[verify ctrl.pool.fetcher-affinity-from-intent]
+    // r[verify fetcher.node.dedicated+2]
+    #[test]
+    fn fetcher_pod_no_pool_static_node_selector() {
+        use rio_proto::types::{HwClassLabels, NodeLabelMatch, NodeTaint};
+        let hw = HwClassConfig::default();
+        hw.set(
+            [(
+                "fetcher-x86".into(),
+                HwClassLabels {
+                    labels: vec![NodeLabelMatch {
+                        key: rio_common::k8s::FETCHER_TAINT_KEY.into(),
+                        value: "true".into(),
+                    }],
+                    taints: vec![NodeTaint {
+                        key: rio_common::k8s::FETCHER_TAINT_KEY.into(),
+                        value: "true".into(),
+                        effect: "NoSchedule".into(),
+                    }],
+                    provides_features: s(&[rio_common::k8s::FETCHER_FEATURE]),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            (192, 1536 << 30),
+        );
+        let p = crate::fixtures::test_pool("f", ExecutorKind::Fetcher);
+        let spec = build_executor_pod_spec(
+            &p,
+            &crate::fixtures::test_sched_addrs(),
+            &crate::fixtures::test_store_addrs(),
+            &hw,
+        );
+        // Structural invariant: no pool-static restrictive nodeSelector.
+        // The per-intent affinity is the ONLY restrictive mechanism.
+        assert!(
+            spec.node_selector
+                .as_ref()
+                .is_none_or(|ns| !ns.contains_key("rio.build/node-role")),
+            "no pool-static fetcher nodeSelector — per-intent affinity is the \
+             sole restrictive mechanism (§13e, r[ctrl.pool.fetcher-affinity-from-intent]); \
+             got {:?}",
+            spec.node_selector
+        );
+        // The permissive arm (toleration) still fires — derived from the
+        // SAME taints_routing_to map cover reads.
+        assert!(
+            spec.tolerations.as_ref().is_some_and(|t| t
+                .iter()
+                .any(|t| t.key.as_deref() == Some(rio_common::k8s::FETCHER_TAINT_KEY))),
+            "pool-static fetcher toleration still appended (permissive, safe)"
+        );
+    }
+
     /// Invariant: with `HwClassConfig::default()` (config not loaded)
     /// and `features=["kvm"]`, the literal `kvm=true:NoSchedule`
     /// toleration floor survives. Fail-OPEN — same contract `wants_metal`
