@@ -139,9 +139,10 @@ pub use rio_common::config::UpstreamAddrs;
 //
 // The builder/fetcher diff is small: fetchers force ADR-019 hardening
 // (read-only rootfs, never privileged, Localhost seccomp, dedicated
-// node placement, hostUsers:false default, no features) regardless of
-// spec. Each helper below returns the effective value for one
-// pod-spec field. Builder reads spec verbatim; Fetcher overrides.
+// node placement via per-intent affinity, hostUsers:false default,
+// derived `[fetcher]` features) regardless of spec. Each helper below
+// returns the effective value for one pod-spec field. Builder reads
+// spec verbatim; Fetcher overrides.
 
 #[inline]
 fn is_fetcher(pool: &Pool) -> bool {
@@ -209,33 +210,61 @@ fn effective_host_users(pool: &Pool) -> Option<bool> {
     }
 }
 
-/// ADR-019 §Node isolation: fetchers land on dedicated nodes via the
-/// `rio.build/fetcher=true:NoSchedule` taint + matching selector. If
-/// the operator supplies their own, honor those instead — lets them
-/// override for dev clusters without dedicated node pools.
-// r[impl fetcher.node.dedicated]
+// §13e: pool-static fetcher nodeSelector DELETED. The per-intent
+// affinity from `cells_to_selector_terms` (§13d) writes
+// `nodeAffinity{rio.build/fetcher}` from the intent's
+// `hw_class_names ∩ {fetcher-*}`. Same shape as the r33 bug_002 close
+// for kvm, but with the OPPOSITE universality argument: the fetcher
+// constraint IS universal over the fetcher Pool's intents (every FOD
+// requires a fetcher node, derived from `pool.spec.kind`, not
+// `pool.spec.features`) — yet it's still deleted because §13d's
+// lesson is "redundancy is the bug": two places that must agree
+// (pool-static + per-intent) eventually disagree.
+// r[impl fetcher.node.dedicated+2]
+// r[impl ctrl.pool.fetcher-affinity-from-intent]
 fn effective_node_selector(pool: &Pool) -> Option<BTreeMap<String, String>> {
-    if is_fetcher(pool) {
-        pool.spec.node_selector.clone().or_else(|| {
-            Some(BTreeMap::from([(
-                "rio.build/node-role".into(),
-                "fetcher".into(),
-            )]))
-        })
-    } else {
-        pool.spec.node_selector.clone()
+    pool.spec.node_selector.clone()
+}
+
+/// Maps a `NodeTaint` proto to a kube `Toleration`. Single source for
+/// metal AND fetcher arms of `effective_tolerations` — the §13d
+/// chokepoint for taint→toleration projection.
+fn taint_to_toleration(nt: rio_proto::types::NodeTaint) -> Toleration {
+    Toleration {
+        key: Some(nt.key),
+        operator: Some("Equal".into()),
+        value: Some(nt.value),
+        effect: Some(nt.effect),
+        ..Default::default()
     }
 }
 
-fn effective_tolerations(pool: &Pool) -> Option<Vec<Toleration>> {
+/// §13e (mirrors r33 bug_011 for metal): pool-static fetcher
+/// toleration reads `taints_routing_to(FETCHER_TAINT_KEY)` instead of
+/// hardcoding `value=true`/`effect=NoSchedule`, so a future second
+/// taint on a fetcher class (e.g. `rio.build/egress-only`) routes its
+/// toleration automatically. Permissive — over-fire is harmless, and
+/// it's the cold-start fallback for `hw_class_names=[]`.
+// r[impl ctrl.pool.intent-tolerations]
+fn effective_tolerations(pool: &Pool, hw: &HwClassConfig) -> Option<Vec<Toleration>> {
     if is_fetcher(pool) {
         pool.spec.tolerations.clone().or_else(|| {
-            Some(vec![Toleration {
-                key: Some("rio.build/fetcher".into()),
-                operator: Some("Exists".into()),
-                effect: Some("NoSchedule".into()),
-                ..Default::default()
-            }])
+            let taints = hw.taints_routing_to(rio_common::k8s::FETCHER_TAINT_KEY);
+            if taints.is_empty() {
+                // Cold-start: no fetcher hwClass loaded yet (or
+                // operator misconfig). Fall back to the literal taint
+                // so fetcher pods can still tolerate the static node
+                // taint during bootstrap. Mirrors `wants_metal`'s
+                // literal `kvm` floor — fail-OPEN.
+                Some(vec![Toleration {
+                    key: Some(rio_common::k8s::FETCHER_TAINT_KEY.into()),
+                    operator: Some("Exists".into()),
+                    effect: Some("NoSchedule".into()),
+                    ..Default::default()
+                }])
+            } else {
+                Some(taints.into_iter().map(taint_to_toleration).collect())
+            }
         })
     } else {
         pool.spec.tolerations.clone()
@@ -651,7 +680,7 @@ pub fn build_executor_pod_spec(
             if ns.is_empty() { None } else { Some(ns) }
         },
         tolerations: {
-            let mut t = effective_tolerations(pool).unwrap_or_default();
+            let mut t = effective_tolerations(pool, hw_config).unwrap_or_default();
             // r[impl ctrl.pool.kvm-device+2]
             // Metal NodeClaims are tainted (cover::build_nodeclaim reads
             // `[sla.hw_classes.$h].taints`) so non-kvm builders don't
@@ -668,13 +697,7 @@ pub fn build_executor_pod_spec(
                 let mut metal_tols: Vec<Toleration> = hw_config
                     .taints_routing_to(KVM_NODE_LABEL)
                     .into_iter()
-                    .map(|nt| Toleration {
-                        key: Some(nt.key),
-                        operator: Some("Equal".into()),
-                        value: Some(nt.value),
-                        effect: Some(nt.effect),
-                        ..Default::default()
-                    })
+                    .map(taint_to_toleration)
                     .collect();
                 let floor = Toleration {
                     key: Some(KVM_NODE_LABEL.into()),

@@ -139,19 +139,21 @@ fn fetcher_hardening_ignores_spec() {
         "Fetcher defaults hostUsers:false when spec is silent"
     );
 
-    // Default node placement targets the dedicated fetcher pool.
+    // §13e: the pool-static fetcher nodeSelector is DELETED — restrictive
+    // placement comes from per-intent affinity (`cells_to_selector_terms`).
+    // The pool-static toleration stays (permissive, cold-start fallback).
     pool.spec.node_selector = None;
     pool.spec.tolerations = None;
     let spec = test_pod_spec(&pool);
-    assert_eq!(
+    assert!(
         spec.node_selector
             .as_ref()
-            .unwrap()
-            .get("rio.build/node-role"),
-        Some(&"fetcher".into())
+            .is_none_or(|ns| !ns.contains_key("rio.build/node-role")),
+        "no pool-static fetcher nodeSelector post-§13e (got {:?})",
+        spec.node_selector
     );
     let tol = &spec.tolerations.as_ref().unwrap()[0];
-    assert_eq!(tol.key.as_deref(), Some("rio.build/fetcher"));
+    assert_eq!(tol.key.as_deref(), Some(rio_common::k8s::FETCHER_TAINT_KEY));
 }
 
 /// D3a: `app.kubernetes.io/component` label is `rio-{kind}` so the

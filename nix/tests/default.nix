@@ -1051,12 +1051,13 @@ in
   #   fetcher netns → rc==0 (toEntities:[world]:80 allow fires). Then
   #   IMDS → rc≠0 (host entity, NOT world → denied). The origin probe
   #   is the non-vacuous differentiator vs builder.
-  # r[verify fetcher.node.dedicated]
+  # r[verify fetcher.node.dedicated+2]
   #   fetcher-node-dedicated subtest: pod spec has the rio.build/
-  #   fetcher toleration + nodeSelector (reconciler defaults), and
-  #   actually scheduled on the labeled k3s-agent node. Karpenter
-  #   NodePool enforcement is EKS-only; this proves the params→
-  #   podspec chain.
+  #   fetcher toleration (reconciler default), and actually scheduled
+  #   on the labeled k3s-agent node. §13e: pool-static nodeSelector is
+  #   gone; the VM test still pins via the static k3s-agent label until
+  #   B3 wires per-intent affinity. Karpenter NodePool enforcement is
+  #   EKS-only; this proves the params→podspec chain.
   # r[verify fetcher.nixconf.hashed-mirrors]
   #   fod-dead-origin subtest: flat-hash FOD with a 404 origin URL
   #   builds via {mirror}/sha256/{hex}. nixConf.hashedMirrors below
