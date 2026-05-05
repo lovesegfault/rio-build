@@ -1053,11 +1053,27 @@ in
   #   is the non-vacuous differentiator vs builder.
   # r[verify fetcher.node.dedicated+2]
   #   fetcher-node-dedicated subtest: pod spec has the rio.build/
-  #   fetcher toleration (reconciler default), and actually scheduled
-  #   on the labeled k3s-agent node. §13e: pool-static nodeSelector is
-  #   gone; the VM test still pins via the static k3s-agent label until
-  #   B3 wires per-intent affinity. Karpenter NodePool enforcement is
-  #   EKS-only; this proves the params→podspec chain.
+  #   fetcher toleration (§13e cold-start fallback) and NO pool-static
+  #   nodeSelector for either rio.build/node-role (the pre-§13e key) or
+  #   rio.build/fetcher. Restrictive fetcher placement is per-intent
+  #   `intent.node_affinity` only, which is empty for builtin FODs in
+  #   this fixture (system="builtin" → no arch → no fetcher hwClass
+  #   match). Karpenter NodePool/NodeClaim enforcement is EKS-only.
+  # r[verify ctrl.pool.fetcher-affinity-from-intent]
+  #   fetcher-node-dedicated subtest: same assertion (`nodeSelector`
+  #   absent) — the pool-static fetcher nodeSelector deletion IS the
+  #   "affinity derives exclusively from intent" close. The positive
+  #   half (per-intent nodeAffinity present) is unit-tested in
+  #   `fetcher_pod_no_pool_static_node_selector` and contract-tested in
+  #   sla_contract.rs; this is the in-cluster shape check.
+  # r[verify sched.sla.fod-feature-derivation]
+  #   dispatch-fod+nonfod + fetcher-isolation subtests: FOD routes to
+  #   the kind=Fetcher pod (passes_intent_filter reads
+  #   effective_features(state)=[fetcher] for FODs and matches the
+  #   fetcher pool's req.features=[fetcher]); the consumer routes to the
+  #   builder pod. fetcher-isolation asserts the pod-level partition the
+  #   chokepoint produces: fetcher pod tolerates rio.build/fetcher and
+  #   NOT rio.build/kvm; builder pod tolerates NEITHER.
   # r[verify fetcher.nixconf.hashed-mirrors]
   #   fod-dead-origin subtest: flat-hash FOD with a 404 origin URL
   #   builds via {mirror}/sha256/{hex}. nixConf.hashedMirrors below

@@ -101,7 +101,7 @@ pub(super) fn detect_hung_nodes(
 
 /// §13e: derive a drv's effective feature set. FODs require `[fetcher]`
 /// regardless of `requiredSystemFeatures` (FODs SHOULD have empty
-/// declared features — `r[ctrl.crd.fetcher-no-features]` — but if a
+/// declared features — `r[ctrl.crd.fetcher-no-features+2]` — but if a
 /// misconfigured drv declares `[kvm]` we override it: a kvm FOD would
 /// route to a kvm node with no fetcher airgap, breaking ADR-019).
 /// Single chokepoint mirroring the controller's `effective_features

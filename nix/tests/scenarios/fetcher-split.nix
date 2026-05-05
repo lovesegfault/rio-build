@@ -13,9 +13,12 @@
 #   - nonpriv path enabled (vmtest-full-nonpriv.yaml overlay) — same as
 #     vm-security-nonpriv-k3s; /dev/fuse via k3s containerd
 #     base_runtime_spec (fixtures/k3s-full.nix containerdConfigTemplate)
-#   - k3s-agent labeled rio.build/node-role=fetcher at runtime so the
-#     reconciler's default nodeSelector matches (also exercises
-#     fetcher.node.dedicated — fetcher lands on agent, builder on server)
+#   - §13e: pool-static fetcher nodeSelector DELETED — restrictive
+#     placement is per-intent nodeAffinity from cells_to_selector_terms,
+#     which is empty for builtin FODs (system="builtin" → no arch). The
+#     fetcher pod has no positive placement constraint in k3s; the test
+#     shape-checks the toleration and the *absence* of a pool-static
+#     nodeSelector, plus the bidirectional taint partition.
 #
 # Egress-open proof — fetcher-egress allows toEntities:[world] on 80/443.
 # In an airgap VM there's no real public IP. The scenario uses the
@@ -95,16 +98,20 @@ pkgs.testers.runNixOSTest {
             "test -s /var/lib/kubelet/seccomp/operator/rio-builder.json"
         )
 
-    # ── Label k3s-agent as the dedicated fetcher node ─────────────────
-    # Reconciler defaults nodeSelector rio.build/node-role=fetcher
-    # (reconcilers/pool/mod.rs Fetcher arm). Without a matching node, the pod
-    # stays Pending forever. Labeling ONE node also makes the
-    # fetcher-node-dedicated subtest meaningful: fetcher lands on
-    # agent, builder (no nodeSelector in vmtest-full.yaml) lands
-    # wherever the scheduler puts it — builder CAN land on agent
-    # too. Shape-check the toleration instead of asserting different
-    # nodes.
-    kubectl("label node k3s-agent rio.build/node-role=fetcher --overwrite", ns="kube-system")
+    # ── Label k3s-agent as the (notional) dedicated fetcher node ──────
+    # §13e: pool-static nodeSelector rio.build/node-role=fetcher is
+    # DELETED (reconcilers/pool/pod.rs effective_node_selector). The
+    # restrictive constraint is now per-intent nodeAffinity from
+    # `cells_to_selector_terms` reading `intent.hw_class_names` — but
+    # builtin:fetchurl FODs have system="builtin" → arch=None →
+    # `reference_hw_class_for_system` returns None → `hw_class_names=[]`
+    # → no nodeAffinity. In k3s the fetcher pod has no positive
+    # placement constraint and lands wherever kube-scheduler puts it.
+    # The label below documents intent but is NOT load-bearing; the
+    # subtest shape-checks the toleration and the *absence* of the
+    # deleted pool-static nodeSelector. The full Karpenter affinity
+    # chain (NodeClaim with rio.build/fetcher label/taint) is EKS-only.
+    kubectl("label node k3s-agent rio.build/fetcher=true --overwrite", ns="kube-system")
 
     # ── "public" origin on upstream-v4:80 ─────────────────────────────
     # The v6-only fixture's upstream-v4 node is the prod-path egress
@@ -302,6 +309,11 @@ pkgs.testers.runNixOSTest {
     # allows it). Then the origin probe.
     builder_pod = wait_worker_pod()
     builder_vm, builder_pid = netns_handle(builder_pod, "${nsBuilders}")
+    # Snapshot for fetcher-isolation below — the one-shot pod is reaped
+    # before that subtest runs.
+    builder_pod_spec = _json.loads(
+        kubectl(f"get pod {builder_pod} -o json", ns="${nsBuilders}")
+    )["spec"]
     print(f"fetcher-split: fetcher={fetcher_pod} builder={builder_pod}")
     def builder_exec(cmd):
         return builder_vm.execute(f"nsenter -t {builder_pid} -n -- {cmd}")
@@ -323,33 +335,72 @@ pkgs.testers.runNixOSTest {
         print(f"builder-airgap PASS: [{origin_v6}]:80 blocked (rc={rc})")
 
     # ══════════════════════════════════════════════════════════════════
-    # fetcher-node-dedicated — toleration + nodeSelector wired
+    # fetcher-node-dedicated — §13e toleration + NO pool-static selector
     # ══════════════════════════════════════════════════════════════════
     # Full Karpenter NodePool isolation isn't testable in k3s (no
-    # Karpenter). Shape-check the pod spec: reconciler's default
-    # toleration + nodeSelector (reconcilers/pool/mod.rs Fetcher arm). The
-    # node-label above means the selector MATCHES → pod scheduled on
-    # k3s-agent. Proves the params→podspec chain; actual node-pool
-    # enforcement is EKS-only.
-    with subtest("fetcher-node-dedicated: toleration + selector present"):
+    # Karpenter, no NodeClaims). Shape-check the pod spec for the §13e
+    # invariants the reconciler enforces:
+    #   (a) toleration `rio.build/fetcher` present — the §13e cold-start
+    #       fallback (taints_routing_to(FETCHER_TAINT_KEY) → literal
+    #       floor when no fetcher hwClass is loaded) lets fetcher pods
+    #       tolerate the fetcher node taint.
+    #   (b) NO pool-static `nodeSelector` (the §13d/§13e lesson:
+    #       restrictive placement is per-intent only —
+    #       `r[ctrl.pool.fetcher-affinity-from-intent]`).
+    # Per-intent nodeAffinity isn't observable here: builtin FODs have
+    # system="builtin" → arch=None → `hw_class_names=[]` → no affinity.
+    # The Karpenter affinity chain (FOD intent → fetcher-* hwClass →
+    # NodeClaim with rio.build/fetcher label/taint) is EKS-only.
+    with subtest("fetcher-node-dedicated: toleration present, no pool-static selector"):
         spec = fetcher_pod_spec
         tols = spec.get("tolerations", [])
         assert any(t.get("key") == "rio.build/fetcher" for t in tols), (
             f"expected toleration key rio.build/fetcher, got {tols!r}"
         )
-        sel = spec.get("nodeSelector", {})
-        assert sel.get("rio.build/node-role") == "fetcher", (
-            f"expected nodeSelector rio.build/node-role=fetcher, got {sel!r}"
+        # §13e DELETED the pool-static nodeSelector. Both the old key
+        # (rio.build/node-role) and the new taint-key (rio.build/fetcher)
+        # must be ABSENT — the only restrictive placement is per-intent
+        # `intent.node_affinity` (which is empty for builtin FODs here).
+        sel = spec.get("nodeSelector") or {}
+        assert "rio.build/node-role" not in sel, (
+            f"pool-static nodeSelector rio.build/node-role still present "
+            f"(§13e deleted it): {sel!r}"
         )
-        # Actually-scheduled-on check: we labeled k3s-agent, so the
-        # fetcher pod MUST be there (only node matching the selector).
-        node = spec.get("nodeName")
-        assert node == "k3s-agent", (
-            f"fetcher pod on {node!r}, expected k3s-agent (only node "
-            f"with rio.build/node-role=fetcher label)"
+        assert "rio.build/fetcher" not in sel, (
+            f"pool-static nodeSelector rio.build/fetcher present — "
+            f"restrictive fetcher placement must be per-intent only: {sel!r}"
         )
-        print(f"fetcher-node-dedicated PASS: toleration+selector wired, "
-              f"pod on {node}")
+        print(f"fetcher-node-dedicated PASS: toleration wired, "
+              f"pool-static nodeSelector absent (sel={sel!r})")
+
+    # ══════════════════════════════════════════════════════════════════
+    # fetcher-isolation — bidirectional taint partition
+    # ══════════════════════════════════════════════════════════════════
+    # §13e closes the static rio-fetcher NodePool; the partition is now
+    # taint-based:
+    #   (a) fetcher pod tolerates `rio.build/fetcher` (above) and NOT
+    #       `rio.build/kvm` — fetchers never land on metal nodes.
+    #   (b) builder pod tolerates NEITHER `rio.build/fetcher` NOR
+    #       `rio.build/kvm` (this Pool is featureless) — builders never
+    #       land on fetcher nodes.
+    # Both are required for the airgap to hold: a builder on a fetcher
+    # node sees the fetcher node's open egress; an escaped fetcher on a
+    # builder node bypasses the dedicated-node containment boundary.
+    with subtest("fetcher-isolation: bidirectional taint partition"):
+        f_tols = fetcher_pod_spec.get("tolerations", [])
+        f_keys = {t.get("key") for t in f_tols if t.get("key")}
+        assert "rio.build/kvm" not in f_keys, (
+            f"fetcher pod tolerates rio.build/kvm — fetchers must not "
+            f"land on metal nodes: {f_tols!r}"
+        )
+        b_tols = builder_pod_spec.get("tolerations", [])
+        b_keys = {t.get("key") for t in b_tols if t.get("key")}
+        assert "rio.build/fetcher" not in b_keys, (
+            f"builder pod tolerates rio.build/fetcher — builders must not "
+            f"land on fetcher nodes (open egress): {b_tols!r}"
+        )
+        print(f"fetcher-isolation PASS: fetcher tolerations={f_keys!r}, "
+              f"builder tolerations={b_keys!r} — partition holds")
 
     with subtest("dispatch-fod+nonfod: FOD→fetcher, consumer→builder"):
         # Placement proof is structural: wait_worker_pod found
