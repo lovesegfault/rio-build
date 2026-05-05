@@ -269,6 +269,17 @@ async fn main() -> anyhow::Result<()> {
     } else {
         (None, None)
     };
+    // ---- HwClass config ----
+    // Loaded BEFORE `Ctx` so `pool/jobs::apply_intent_resources` and
+    // `pool/pod::wants_metal` derive tolerations from the same
+    // `[sla.hw_classes.$h]` map the scheduler routed against (r31
+    // bug_020). Also feeds the node-informer / annotator below and
+    // the nodeclaim_pool reconciler. `connect_forever` already
+    // established the channel; `load` retries 5× with backoff for
+    // leader-election transients then degrades to empty (annotator/λ
+    // skip; `wants_metal` falls back to the literal `kvm` feature).
+    let hw_config = node_informer::HwClassConfig::default();
+    hw_config.load(&mut admin.clone()).await;
     let ctx = Arc::new(Ctx {
         client: client.clone(),
         admin: admin.clone(),
@@ -280,6 +291,7 @@ async fn main() -> anyhow::Result<()> {
         scaler: Default::default(),
         hw_bench_mem_floor: cfg.hw_bench_mem_floor,
         placeable,
+        hw_config: hw_config.clone(),
     });
 
     // ---- Reconcilers ----
@@ -319,14 +331,9 @@ async fn main() -> anyhow::Result<()> {
     // controller joins server-side because builders are air-gapped
     // from apiserver. `hw_class` is the operator's `[sla.hw_classes.$h]`
     // key matched against Node labels (NOT a hardcoded reconstruction;
-    // bug_061), so fetch the scheduler's config once before spawning
-    // the informer/annotator. `connect_forever` already established
-    // the channel; `load` retries 5× with backoff for leader-election
-    // transients then degrades to empty (annotator/λ skip).
+    // bug_061). Reuses `hw_config` loaded above the `Ctx` block.
     // TODO: clone node_cache into the completion-ingest consumer
     // once that lands; until then this populates but nobody reads.
-    let hw_config = node_informer::HwClassConfig::default();
-    hw_config.load(&mut admin.clone()).await;
     let node_cache = NodeLabelCache::with_config(hw_config.clone());
     rio_common::task::spawn_monitored(
         "node-informer",

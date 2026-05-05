@@ -173,7 +173,12 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_controller_nodeclaim_intent_dropped_total",
-        "nodeclaim_pool cover_deficit intents dropped by `reason`. \
+        "nodeclaim_pool intents dropped by `reason`. \
+         reason=no_pool_covers: no configured Builder Pool admits the \
+         intent's (system, required_features) — the placer would never \
+         spawn a Job for it, so provisioning would mint a permanently-idle \
+         NodeClaim; add a Pool or remove the hwClass advertising the \
+         feature. \
          reason=no_hosting_class: no configured hw-class can host the \
          intent — wrong arch, footprint exceeds every arch-matching class's \
          max_cores/max_mem, or required_features unmatched (the hwClasses \

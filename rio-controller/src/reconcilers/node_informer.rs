@@ -213,6 +213,25 @@ impl HwClassConfig {
             .unwrap_or_default()
     }
 
+    /// Union of `provides_features` over hw-classes carrying a taint
+    /// with key `taint_key`. §Partition-single-source (r31 bug_020):
+    /// a Pool's pod must tolerate the taint iff *any* of the Pool's
+    /// `features` routes a drv to a tainted hw-class — that routing
+    /// keys on `features_compatible(required, provides_features)`, so
+    /// the toleration consumer (`pool/pod.rs::wants_metal`) reads the
+    /// same `provides_features` map. Adding a feature to a tainted
+    /// class's `providesFeatures` cannot re-break the toleration ⇔
+    /// routing equivalence — both sides read this. Unknown `taint_key`
+    /// / config not yet loaded → empty.
+    pub fn features_routing_to_taint(&self, taint_key: &str) -> std::collections::HashSet<String> {
+        self.classes
+            .read()
+            .iter()
+            .filter(|d| d.taints.iter().any(|t| t.key == taint_key))
+            .flat_map(|d| d.provides_features.iter().cloned())
+            .collect()
+    }
+
     /// `[sla.hw_classes.$h].max_fleet_cores` for `h`. §13c
     /// `cover_deficit` clamps this class's per-tick mint at
     /// `min(global_remaining, cap − live_h − created_h)`. Unknown `h`

@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument, warn};
 
 use rio_crds::karpenter::NodeClaim;
+use rio_crds::pool::{ExecutorKind, Pool};
 use rio_lease::LeaderState;
 use rio_proto::types::{
     AckSpawnedIntentsRequest, GetSpawnIntentsRequest, GetSpawnIntentsResponse, SpawnIntent,
@@ -77,6 +78,36 @@ fn now_epoch() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// `(systems, features)` extracted from a Builder Pool. The
+/// provisioner's coverage filter ([`pool_covers`]) checks intents
+/// against the union of these — the SAME `(systems, features)` pair
+/// the placer (`pool/jobs::queued_for_pool`) sends per-Pool to
+/// `GetSpawnIntents{filter_features: true}`.
+type PoolCoverage = (Vec<String>, Vec<String>);
+
+/// §13d Pool axis (r31 bug_019): does ANY configured Builder Pool
+/// place a Job for `intent`? Mirrors the scheduler's
+/// `passes_intent_filter` — `systems=[]` means no system filter (a
+/// Pool with no `systems` constraint accepts every arch), and
+/// `features` is checked via the SAME `features_compatible` predicate
+/// (`pool/jobs::queued_for_pool` sends `filter_features=true` per
+/// Pool). The `retain_hosting_cells` chokepoint validates the *cell*
+/// axis (some hwClass hosts the intent); this validates the *Pool*
+/// axis (some Pool consumes the intent). An intent that's
+/// cell-routable but Pool-uncovered would mint a NodeClaim that
+/// FFD-places (`reserved`) → `reap_idle` skips forever — a
+/// permanently-idle on-demand metal node with no Job ever spawned.
+///
+/// Extracted for unit testability — the predicate is pure and the
+/// failure mode (silent over-provisioning) doesn't surface in any
+/// fast test path.
+pub(super) fn pool_covers(intent: &SpawnIntent, coverage: &[PoolCoverage]) -> bool {
+    coverage.iter().any(|(systems, features)| {
+        (systems.is_empty() || systems.contains(&intent.system))
+            && rio_common::k8s::features_compatible(&intent.required_features, features)
+    })
 }
 
 /// Label selector for NodeClaims this reconciler owns. Stamped at
@@ -400,6 +431,15 @@ impl rio_lease::LeaseHooks for ControllerLeaseHooks {
 /// is `spawn_monitored` and never returns until shutdown.
 pub struct NodeClaimPoolReconciler {
     nodeclaims: Api<NodeClaim>,
+    /// Cluster-scoped `Pool` API for the §13d Pool-coverage filter
+    /// (r31 bug_019). `reconcile_once` lists per tick (cheap — Pools
+    /// are ~5 small objects) and drops intents no configured Builder
+    /// Pool will Job-place, BEFORE `ffd::simulate` so the FFD set,
+    /// the deficit, and the cover are all consistent. Fail-OPEN on
+    /// transient apiserver error: skipping the filter for one tick
+    /// over-provisions; an empty coverage set would drop EVERY intent
+    /// → ZERO Jobs.
+    pools: Api<Pool>,
     admin: AdminClient,
     pg: sqlx::PgPool,
     leader: LeaderState,
@@ -497,7 +537,8 @@ impl NodeClaimPoolReconciler {
             }
         };
         Self {
-            nodeclaims: Api::all(kube),
+            nodeclaims: Api::all(kube.clone()),
+            pools: Api::all(kube),
             admin,
             pg,
             leader,
@@ -648,7 +689,7 @@ impl NodeClaimPoolReconciler {
             }
         };
 
-        let Some(intents) = intents else {
+        let Some(mut intents) = intents else {
             self.consecutive_bot_ticks = self.consecutive_bot_ticks.saturating_add(1);
             if self.consecutive_bot_ticks >= BOT_TICKS_BEFORE_CONSOLIDATE_ONLY {
                 return self.consolidate_only().await;
@@ -656,6 +697,57 @@ impl NodeClaimPoolReconciler {
             return Ok(());
         };
         self.consecutive_bot_ticks = 0;
+
+        // §13d Pool axis (r31 bug_019): drop intents no configured
+        // Builder Pool will Job-place, BEFORE `ffd::simulate` so the
+        // FFD set, the deficit, and the cover are all consistent.
+        // The placer (`pool/jobs::queued_for_pool`) only spawns a Job
+        // for intents matched by some Pool's `(systems, features)`;
+        // provisioning for unplaceable intents mints a NodeClaim that
+        // FFD-places (→ `reserved`) → `reap_idle` skips it forever —
+        // a permanently-idle on-demand metal node. `retain_hosting_
+        // cells` validates the *cell* axis; this is the *Pool* axis.
+        // (Fetcher Pools are irrelevant: `kind: Builder` filter at the
+        // RPC.) `pools.list()` reads the apiserver, not a stale
+        // informer — a Pool created mid-tick is seen next tick; the
+        // retained intent re-appears next `GetSpawnIntents`.
+        //
+        // Fail-OPEN on transient apiserver error: skipping the filter
+        // for one tick over-provisions (the legit intents still get
+        // covered, plus possibly some uncoverable ones — same as
+        // pre-fix behavior). Treating an error as empty coverage would
+        // drop EVERY intent → ZERO Jobs (cluster stops building) — a
+        // strictly worse failure than the bug this fixes.
+        match self.pools.list(&Default::default()).await {
+            Ok(l) => {
+                let coverage: Vec<PoolCoverage> = l
+                    .items
+                    .iter()
+                    .filter(|p| p.spec.kind == ExecutorKind::Builder)
+                    .map(|p| (p.spec.systems.clone(), p.spec.features.clone()))
+                    .collect();
+                let before = intents.intents.len();
+                intents.intents.retain(|i| pool_covers(i, &coverage));
+                let dropped = before - intents.intents.len();
+                if dropped > 0 {
+                    metrics::counter!(
+                        "rio_controller_nodeclaim_intent_dropped_total",
+                        "reason" => "no_pool_covers",
+                    )
+                    .increment(dropped as u64);
+                    warn!(
+                        dropped,
+                        builder_pools = coverage.len(),
+                        "SpawnIntents dropped at provisioner — no configured Builder \
+                         Pool covers their (system, required_features); add a Pool or \
+                         remove the hwClass advertising the feature"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Pool list failed — coverage filter skipped this tick");
+            }
+        }
 
         let live = self.list_live_nodeclaims().await?;
         let now = now_epoch();
@@ -1662,5 +1754,63 @@ mod tests {
             Some(Cell("metal-x86".into(), CapacityType::OnDemand)),
             "od-only reference → fallback picks OnDemand, not Spot"
         );
+    }
+
+    /// §13d Pool axis (r31 bug_019): the provisioner's coverage filter
+    /// uses the SAME predicate as the placer — `systems` membership +
+    /// `features_compatible`. An intent the placer would never Job-place
+    /// must not be provisioned (mints a permanently-idle metal node).
+    #[test]
+    fn pool_covers_mirrors_placer_predicate() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let intent = |sys: &str, feats: &[&str]| SpawnIntent {
+            system: sys.into(),
+            required_features: s(feats),
+            ..Default::default()
+        };
+
+        // Default chart: only Builder Pool is `(systems=[x86_64-linux,
+        // i686-linux], features=[])`. A kvm intent has nowhere to go.
+        let default_chart: Vec<PoolCoverage> = vec![(s(&["x86_64-linux", "i686-linux"]), vec![])];
+        assert!(
+            !pool_covers(&intent("x86_64-linux", &["kvm"]), &default_chart),
+            "kvm intent uncovered when no kvm Pool configured (default chart) — pre-fix \
+             this minted a permanently-idle on-demand metal node"
+        );
+        assert!(
+            pool_covers(&intent("x86_64-linux", &[]), &default_chart),
+            "featureless x86 intent covered by featureless x86 Pool"
+        );
+        // arch axis: aarch64 intent with no aarch64 Pool.
+        assert!(
+            !pool_covers(&intent("aarch64-linux", &[]), &default_chart),
+            "aarch64 intent uncovered when only x86 Pools exist"
+        );
+
+        // EKS-shaped: kvm Pool added → kvm intent covered.
+        let eks: Vec<PoolCoverage> = vec![
+            (s(&["x86_64-linux", "i686-linux"]), vec![]),
+            (s(&["x86_64-linux"]), s(&["kvm", "nixos-test"])),
+            (s(&["aarch64-linux"]), vec![]),
+        ];
+        assert!(pool_covers(&intent("x86_64-linux", &["kvm"]), &eks));
+        assert!(pool_covers(&intent("aarch64-linux", &[]), &eks));
+        // Bidirectional ∅-guard: a featureless intent does NOT match
+        // the kvm Pool — but it matches the featureless x86 Pool.
+        assert!(pool_covers(&intent("x86_64-linux", &[]), &eks));
+
+        // `systems=[]` ⇔ no system filter (passes_intent_filter
+        // semantics: `req.systems.is_empty()` skips the check).
+        let agnostic: Vec<PoolCoverage> = vec![(vec![], vec![])];
+        assert!(
+            pool_covers(&intent("aarch64-linux", &[]), &agnostic),
+            "systems=[] Pool admits any arch"
+        );
+
+        // Empty coverage: no Builder Pools configured. Drops everything
+        // (fail-safe, not fail-open — the placer wouldn't spawn either).
+        // Distinct from a Pool *list* error, which fail-OPENs by
+        // skipping the retain entirely (see `reconcile_once`).
+        assert!(!pool_covers(&intent("x86_64-linux", &[]), &[]));
     }
 }

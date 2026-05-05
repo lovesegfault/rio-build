@@ -28,9 +28,15 @@ pub(crate) fn test_wp() -> Pool {
 }
 
 /// Shorthand for tests: builds the Job pod spec with default
-/// scheduler/store addrs.
+/// scheduler/store addrs and an empty `HwClassConfig` (`wants_metal`
+/// falls back to the literal `kvm` feature).
 pub(crate) fn test_pod_spec(pool: &Pool) -> PodSpec {
-    pod::build_executor_pod_spec(pool, &test_sched_addrs(), &test_store_addrs())
+    pod::build_executor_pod_spec(
+        pool,
+        &test_sched_addrs(),
+        &test_store_addrs(),
+        &crate::reconcilers::node_informer::HwClassConfig::default(),
+    )
 }
 
 /// Build a `Ctx` wired to the mock apiserver client.
@@ -62,6 +68,7 @@ pub(crate) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
         scaler: Default::default(),
         hw_bench_mem_floor: 8 * (1 << 30),
         placeable: Some(crate::reconcilers::nodeclaim_pool::PlaceableGate::unarmed()),
+        hw_config: crate::reconcilers::node_informer::HwClassConfig::default(),
     })
 }
 

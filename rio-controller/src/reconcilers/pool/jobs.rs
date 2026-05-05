@@ -32,7 +32,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{NodeAffinity, NodeSelector, Pod, PodSpec, ResourceRequirements};
+use k8s_openapi::api::core::v1::{
+    NodeAffinity, NodeSelector, Pod, PodSpec, ResourceRequirements, Toleration,
+};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Api, DeleteParams, ListParams};
@@ -50,6 +52,7 @@ use super::job::{
 use super::pod::{self, UpstreamAddrs};
 use crate::error::{Error, Result};
 use crate::reconcilers::admin_call;
+use crate::reconcilers::node_informer::HwClassConfig;
 use crate::reconcilers::{Ctx, KubeErrorExt, require_namespace};
 use rio_crds::pool::{ExecutorKind, Pool};
 use rio_proto::types::SpawnIntent;
@@ -516,6 +519,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                 oref.clone(),
                 &ctx.scheduler,
                 &ctx.store,
+                &ctx.hw_config,
                 intent,
                 executor_tokens.get(&intent.intent_id).map(String::as_str),
                 &hw_sampled,
@@ -836,6 +840,7 @@ pub(super) fn build_job(
     oref: OwnerReference,
     scheduler: &UpstreamAddrs,
     store: &UpstreamAddrs,
+    hw_config: &HwClassConfig,
     intent: &SpawnIntent,
     executor_token: Option<&str>,
     hw_sampled: &HwSampledCache,
@@ -848,8 +853,8 @@ pub(super) fn build_job(
     // NameCollision dedupes.
     let suffix = intent_suffix(&intent.intent_id);
     let job_name = pod::job_name(&pool_name, pool.spec.kind, &suffix);
-    let mut pod_spec = pod::build_executor_pod_spec(pool, scheduler, store);
-    apply_intent_resources(&mut pod_spec, pool, intent);
+    let mut pod_spec = pod::build_executor_pod_spec(pool, scheduler, store, hw_config);
+    apply_intent_resources(&mut pod_spec, pool, intent, hw_config);
     // r[impl ctrl.nodeclaim.priority-bucket]
     // §13b: route via the second kube-scheduler so MostAllocated bin-
     // packing matches `ffd::simulate`'s prediction, and bucket by
@@ -940,7 +945,12 @@ pub(super) fn build_job(
 /// volume-level limit fires. Budgeting bare `disk_bytes` (1.0×) here
 /// while the overlay sizeLimit is `headroom×` made the headroom
 /// unreachable — pods evicted at ≈p90 instead of `headroom×p90`.
-fn apply_intent_resources(pod_spec: &mut PodSpec, pool: &Pool, i: &SpawnIntent) {
+fn apply_intent_resources(
+    pod_spec: &mut PodSpec,
+    pool: &Pool,
+    i: &SpawnIntent,
+    hw: &HwClassConfig,
+) {
     let headroom = intent_headroom(i);
     let overlay_limit = (i.disk_bytes as f64 * headroom) as u64;
     let ephemeral = pod_ephemeral_request(i.disk_bytes, headroom, pod::fuse_cache_bytes(pool));
@@ -1015,6 +1025,43 @@ fn apply_intent_resources(pod_spec: &mut PodSpec, pool: &Pool, i: &SpawnIntent) 
         });
     }
 
+    // §13d toleration axis (r31 bug_020): the intent's `node_affinity`
+    // (stamped above) pins the pod to nodes carrying the hwClass
+    // labels — incl. taint-paired keys like `rio.build/kvm`. The
+    // affinity producer (scheduler `cells_to_selector_terms`) and the
+    // taint producer (`cover::build_nodeclaim`) both read
+    // `[sla.hw_classes.$h]`; this derives the matching tolerations
+    // from the SAME map (`HwClassConfig.taints_for(h)`) so a future
+    // tainted hwClass (gpu, secure-boot) routes its toleration
+    // automatically. (`pod::wants_metal` covers the pool-static path
+    // for `hw_class_names=[]` cold-start intents; this covers the
+    // intent-affinity path.) Append-dedup so the operator-set
+    // `rio.build/builder` toleration and the pool-static kvm
+    // toleration both survive without duplication.
+    let mut intent_tols: Vec<Toleration> = Vec::new();
+    for h in &i.hw_class_names {
+        for t in hw.taints_for(h) {
+            let tol = Toleration {
+                key: Some(t.key),
+                operator: Some("Equal".into()),
+                value: Some(t.value),
+                effect: Some(t.effect),
+                ..Default::default()
+            };
+            if !intent_tols.contains(&tol) {
+                intent_tols.push(tol);
+            }
+        }
+    }
+    if !intent_tols.is_empty() {
+        let pod_t = pod_spec.tolerations.get_or_insert_with(Vec::new);
+        for t in intent_tols {
+            if !pod_t.contains(&t) {
+                pod_t.push(t);
+            }
+        }
+    }
+
     // Overlay emptyDir sizeLimit — same `overlay_limit` used as the
     // overlay addend above so kubelet's pod-level sum cannot fire
     // before the volume cap.
@@ -1043,13 +1090,16 @@ mod tests {
 
     /// `build_job` wrapper for tests that don't exercise the §13a
     /// hw-bench gate. Empty cache + 0 floor → `bench_needed = false`
-    /// (vacuous on `A = ∅`).
+    /// (vacuous on `A = ∅`). Default `HwClassConfig` ⇔ `wants_metal`
+    /// falls back to the literal `kvm` feature and `apply_intent_
+    /// resources` adds no per-intent tolerations (`taints_for(h)` empty).
     fn job(pool: &Pool, i: &SpawnIntent) -> Job {
         build_job(
             pool,
             crate::fixtures::oref(pool),
             &test_sched_addrs(),
             &test_store_addrs(),
+            &HwClassConfig::default(),
             i,
             None,
             &HwSampledCache::default(),
@@ -1784,6 +1834,107 @@ mod tests {
             ids,
             vec!["on-reg", "on-reg-2"],
             "in-flight placements excluded from Job-create"
+        );
+    }
+
+    /// §13d toleration axis (r31 bug_020): `apply_intent_resources`
+    /// derives per-intent tolerations from `intent.hw_class_names ×
+    /// HwClassConfig.taints_for(h)` — the SAME `[sla.hw_classes.$h]`
+    /// map the scheduler used to compute `intent.node_affinity`.
+    /// Without this, an intent affinity-pinned to a kvm-tainted metal
+    /// node (via `node_affinity`) but spawned on a `features=[]` Pool
+    /// (`wants_metal=false`) sat permanently Pending — the affinity
+    /// passes only metal nodes but TaintToleration rejects them.
+    #[test]
+    fn intent_hw_class_names_derive_taint_tolerations() {
+        use rio_proto::types::{HwClassLabels, NodeTaint};
+        let kvm_taint = || NodeTaint {
+            key: "rio.build/kvm".into(),
+            value: "true".into(),
+            effect: "NoSchedule".into(),
+        };
+        let hw = HwClassConfig::default();
+        hw.set(
+            [
+                (
+                    "metal-x86".into(),
+                    HwClassLabels {
+                        taints: vec![kvm_taint()],
+                        ..Default::default()
+                    },
+                ),
+                ("mid-ebs-x86".into(), HwClassLabels::default()),
+            ]
+            .into(),
+            (192, 1536 << 30),
+        );
+
+        // Pool whose static features DON'T include kvm — `wants_metal`
+        // would not add the toleration. The intent is affinity-pinned
+        // to metal because the scheduler routed `["nixos-test"]` there.
+        let mut pool = test_pool("nt", ExecutorKind::Builder);
+        pool.spec.features = vec!["nixos-test".into()];
+        let mut spec = pod::build_executor_pod_spec(
+            &pool,
+            &test_sched_addrs(),
+            &test_store_addrs(),
+            &HwClassConfig::default(), // empty → wants_metal falls back to no-kvm
+        );
+        // Pre-condition: no kvm toleration from the pool-static path.
+        assert!(
+            spec.tolerations
+                .as_ref()
+                .is_none_or(|ts| !ts.iter().any(|t| t.key.as_deref() == Some("rio.build/kvm"))),
+            "precondition: pool-static path adds no kvm toleration"
+        );
+
+        let i = SpawnIntent {
+            intent_id: "abc".into(),
+            cores: 4,
+            mem_bytes: 8 << 30,
+            hw_class_names: vec!["metal-x86".into()],
+            ..Default::default()
+        };
+        apply_intent_resources(&mut spec, &pool, &i, &hw);
+        let tols = spec.tolerations.as_ref().expect("tolerations set");
+        let kvm = tols
+            .iter()
+            .find(|t| t.key.as_deref() == Some("rio.build/kvm"))
+            .expect("kvm toleration derived from intent.hw_class_names × taints_for");
+        assert_eq!(kvm.value.as_deref(), Some("true"));
+        assert_eq!(kvm.effect.as_deref(), Some("NoSchedule"));
+        assert_eq!(kvm.operator.as_deref(), Some("Equal"));
+
+        // Idempotent: re-applying must not duplicate the toleration
+        // (or the pool-static one, if both sources fire — `wants_metal`
+        // and the intent path).
+        apply_intent_resources(&mut spec, &pool, &i, &hw);
+        let n_kvm = spec
+            .tolerations
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|t| t.key.as_deref() == Some("rio.build/kvm"))
+            .count();
+        assert_eq!(n_kvm, 1, "toleration deduped on re-apply");
+
+        // Untainted hwClass → no extra toleration.
+        let mut spec2 = pod::build_executor_pod_spec(
+            &pool,
+            &test_sched_addrs(),
+            &test_store_addrs(),
+            &HwClassConfig::default(),
+        );
+        let before = spec2.tolerations.clone();
+        let i2 = SpawnIntent {
+            intent_id: "abc".into(),
+            hw_class_names: vec!["mid-ebs-x86".into()],
+            ..Default::default()
+        };
+        apply_intent_resources(&mut spec2, &pool, &i2, &hw);
+        assert_eq!(
+            spec2.tolerations, before,
+            "untainted hwClass → no per-intent toleration"
         );
     }
 }

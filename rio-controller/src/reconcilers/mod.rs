@@ -158,6 +158,17 @@ pub struct Ctx {
     /// absent (k3s VM tests without Karpenter) — the gate is a
     /// pass-through and the nodeclaim_pool reconciler is not spawned.
     pub placeable: Option<nodeclaim_pool::PlaceableGate>,
+    /// `[sla.hw_classes.$h]` config fetched via `GetHwClassConfig`.
+    /// §13d toleration axis (r31 bug_020): `pool/jobs::
+    /// apply_intent_resources` derives per-intent tolerations from
+    /// `intent.hw_class_names × taints_for(h)` so the toleration
+    /// follows the affinity (the scheduler stamped `node_affinity`
+    /// from the same hw-class config). `pool/pod::wants_metal` reads
+    /// the union of `provides_features` over kvm-tainted classes for
+    /// the `hw_class_names=[]` cold-start backstop. Same `Arc`-backed
+    /// instance shared with `node_informer::run` and the
+    /// nodeclaim_pool reconciler.
+    pub hw_config: node_informer::HwClassConfig,
 }
 
 /// ComponentScaler reconciler state.

@@ -276,7 +276,7 @@ async fn warn_fires_for_ephemeral_with_host_network() {
 /// `r[ctrl.event.spec-degrade]` says "every spec field the builder
 /// silently degrades" gets a Warning. Before the table-driven
 /// `DEGRADE_CHECKS`, only `hostNetwork && !privileged` was covered —
-/// the four Fetcher CEL rules and the non-CEL `wants_kvm` drop fired
+/// the four Fetcher CEL rules and the non-CEL `wants_metal` drop fired
 /// silent overrides in `pod.rs` with no `kubectl get events` signal.
 /// A pre-CEL `kind=Fetcher` Pool with `privileged:true` ran
 /// unprivileged with the operator none the wiser.

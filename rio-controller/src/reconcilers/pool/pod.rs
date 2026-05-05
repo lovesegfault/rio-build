@@ -22,6 +22,8 @@ use kube::ResourceExt;
 
 use rio_crds::pool::{ExecutorKind, Pool, PoolSpec, SeccompProfileKind};
 
+use crate::reconcilers::node_informer::HwClassConfig;
+
 /// Nix `system-features` string that signals "this builder runs
 /// qemu-kvm". When present in `spec.features`, the pod gets the
 /// [`KVM_NODE_LABEL`] nodeSelector + toleration so it lands on a §13b
@@ -29,11 +31,15 @@ use rio_crds::pool::{ExecutorKind, Pool, PoolSpec, SeccompProfileKind};
 /// `base_runtime_spec` on every node (`nix/base-runtime-spec.nix`);
 /// it ENXIOs on open() on non-`.metal` hosts, so the nodeSelector is
 /// what makes kvm builds work, not the device node's presence.
+/// `wants_metal` keeps it as the cold-start floor; the union of
+/// `provides_features` over kvm-tainted hw-classes (r31 bug_020)
+/// extends it.
 pub(super) const KVM_FEATURE: &str = "kvm";
 
 /// Node label stamped on metal nodes (§13c: `scheduler.sla.hwClasses.
 /// metal-*.labels`, via `cover::build_nodeclaim`). Pairs with the
-/// same-key taint (`metal-*.taints`).
+/// same-key taint (`metal-*.taints`); `wants_metal` keys the
+/// `provides_features` union on this taint key.
 const KVM_NODE_LABEL: &str = "rio.build/kvm";
 
 /// Pod label carrying the executor role. Scheduler routing, network
@@ -229,13 +235,32 @@ fn effective_tolerations(pool: &Pool) -> Option<Vec<Toleration>> {
     }
 }
 
-/// Pool advertises the `kvm` Nix system-feature → pod needs a host
-/// with working `/dev/kvm` (metal nodeSelector + toleration). FODs
-/// route by `is_fixed_output` alone, never by features, so fetchers
-/// never want kvm. See `r[ctrl.pool.kvm-device]`.
-#[inline]
-fn wants_kvm(pool: &Pool) -> bool {
-    !is_fetcher(pool) && pool.spec.features.iter().any(|f| f == KVM_FEATURE)
+/// Pool advertises a feature that routes drvs to a metal hw-class →
+/// pod needs the metal nodeSelector + toleration. FODs route by
+/// `is_fixed_output` alone, never by features, so fetchers never want
+/// metal. See `r[ctrl.pool.kvm-device]`.
+///
+/// §Partition-single-source (r31 bug_020): routing keys on
+/// `features_compatible(required, provides_features)`, so the
+/// toleration gate must read the SAME `provides_features` map. The
+/// hardcoded `f == "kvm"` check broke when bug_007 added
+/// `nixos-test` to metal `providesFeatures` — a Pool with
+/// `features: ["nixos-test"]` (no `"kvm"`) routed to metal but had
+/// no taint toleration, so its pods sat permanently Pending. The set
+/// is `{"kvm"} ∪ ⋃_{h: kvm-tainted} provides_features(h)`: the
+/// literal floor is fail-OPEN under a not-yet-loaded `hw_config`
+/// (otherwise every kvm Pool's pod would lose the metal nodeSelector
+/// in the cold-start window — strictly worse than the bug); the
+/// union extends it to whatever ELSE routes to a kvm-tainted class.
+fn wants_metal(pool: &Pool, hw: &HwClassConfig) -> bool {
+    if is_fetcher(pool) {
+        return false;
+    }
+    if pool.spec.features.iter().any(|f| f == KVM_FEATURE) {
+        return true;
+    }
+    let routable = hw.features_routing_to_taint(KVM_NODE_LABEL);
+    pool.spec.features.iter().any(|f| routable.contains(f))
 }
 
 /// Labels for Job + pod template. Includes the ADR-019
@@ -331,6 +356,7 @@ pub fn build_executor_pod_spec(
     pool: &Pool,
     scheduler: &UpstreamAddrs,
     store: &UpstreamAddrs,
+    hw_config: &HwClassConfig,
 ) -> PodSpec {
     // cgroup handling: we do NOT hostPath-mount /sys/fs/cgroup.
     // See builderpool/builders.rs pre-extraction commentary for the
@@ -557,12 +583,12 @@ pub fn build_executor_pod_spec(
                 ns.entry("kubernetes.io/arch".into()).or_insert(arch.into());
             }
             // r[impl ctrl.pool.kvm-device]
-            // features:[kvm] → land on the metal NodePool. Operator-set
-            // value wins (or_insert) so a non-Karpenter cluster with a
-            // different kvm-capable label can override. Unconditional
-            // wrt privileged: even a privileged pod needs a host that
-            // actually has /dev/kvm.
-            if wants_kvm(pool) {
+            // features route to a kvm-tainted hw-class → land on the
+            // metal NodePool. Operator-set value wins (or_insert) so a
+            // non-Karpenter cluster with a different kvm-capable label
+            // can override. Unconditional wrt privileged: even a
+            // privileged pod needs a host that actually has /dev/kvm.
+            if wants_metal(pool, hw_config) {
                 ns.entry(KVM_NODE_LABEL.into()).or_insert("true".into());
             }
             if ns.is_empty() { None } else { Some(ns) }
@@ -574,7 +600,7 @@ pub fn build_executor_pod_spec(
             // non-kvm builders don't bin-pack onto $$ metal. Append
             // (don't replace) — the operator-set rio.build/builder
             // toleration must survive.
-            if wants_kvm(pool) {
+            if wants_metal(pool, hw_config) {
                 t.push(Toleration {
                     key: Some(KVM_NODE_LABEL.into()),
                     operator: Some("Equal".into()),
@@ -1019,5 +1045,91 @@ mod tests {
             );
             Ok(())
         });
+    }
+
+    /// §13d toleration axis (r31 bug_020): `wants_metal` derives the
+    /// metal nodeSelector / toleration gate from the SAME
+    /// `provides_features` map the scheduler routes against. Pre-fix
+    /// the gate open-coded `f == "kvm"` — a Pool with
+    /// `features: ["nixos-test"]` (no `"kvm"`) routed to metal via
+    /// `features_compatible(["nixos-test"], ["kvm","nixos-test"])`
+    /// but had no kvm taint toleration → permanently Pending pods.
+    #[test]
+    fn wants_metal_keys_on_kvm_tainted_provides_features() {
+        use rio_proto::types::{HwClassLabels, NodeTaint};
+        let kvm_taint = || NodeTaint {
+            key: KVM_NODE_LABEL.into(),
+            value: "true".into(),
+            effect: "NoSchedule".into(),
+        };
+        let hw = HwClassConfig::default();
+        hw.set(
+            [
+                (
+                    "metal-x86".into(),
+                    HwClassLabels {
+                        taints: vec![kvm_taint()],
+                        provides_features: s(&["kvm", "nixos-test"]),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "mid-ebs-x86".into(),
+                    HwClassLabels {
+                        // No taint, no provides_features — can't
+                        // contribute to the routable set.
+                        ..Default::default()
+                    },
+                ),
+            ]
+            .into(),
+            (192, 1536 << 30),
+        );
+
+        let mut p = crate::fixtures::test_pool("nt", ExecutorKind::Builder);
+
+        // Pre-fix bug_020: this is the case that broke. Pool with only
+        // `nixos-test` (no `kvm`) routes to metal but the literal
+        // gate returned false → no toleration → permanently Pending.
+        p.spec.features = s(&["nixos-test"]);
+        assert!(
+            wants_metal(&p, &hw),
+            "Pool features routing to a kvm-tainted hwClass via \
+             provides_features must get the metal toleration"
+        );
+
+        // Literal `kvm` still works (and is the cold-start floor).
+        p.spec.features = s(&["kvm"]);
+        assert!(wants_metal(&p, &hw));
+
+        // Feature that routes to NO tainted class → no metal.
+        p.spec.features = s(&["big-parallel"]);
+        assert!(!wants_metal(&p, &hw));
+
+        // Fetcher never wants metal regardless of features.
+        let mut f = crate::fixtures::test_pool("f", ExecutorKind::Fetcher);
+        f.spec.features = s(&["kvm"]);
+        assert!(!wants_metal(&f, &hw));
+    }
+
+    /// `wants_metal` falls back to the literal `"kvm"` check under an
+    /// empty (not-yet-loaded) `HwClassConfig`. Fail-OPEN: degrading
+    /// `features:["kvm"]` Pools to no-metal-toleration on cold-start
+    /// (the entire load-failure window) would be strictly worse than
+    /// the bug — the pre-fix literal gate worked for `["kvm"]` always.
+    #[test]
+    fn wants_metal_falls_back_to_literal_kvm_when_config_unloaded() {
+        let hw = HwClassConfig::default();
+        let mut p = crate::fixtures::test_pool("k", ExecutorKind::Builder);
+        p.spec.features = s(&["kvm"]);
+        assert!(
+            wants_metal(&p, &hw),
+            "literal kvm floor survives empty HwClassConfig"
+        );
+        // The *extension* (nixos-test → metal) only works once
+        // hw_config is loaded — that's the degraded-but-not-regressed
+        // contract.
+        p.spec.features = s(&["nixos-test"]);
+        assert!(!wants_metal(&p, &hw));
     }
 }

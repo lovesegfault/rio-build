@@ -105,8 +105,8 @@ fn is_fetcher_spec(s: &rio_crds::pool::PoolSpec) -> bool {
 }
 
 /// One entry per silent override in `pod.rs::effective_*` /
-/// `wants_kvm`. Mirrors the CEL rules at `rio-crds/src/pool.rs:
-/// 121-155` plus the non-CEL `wants_kvm` drop.
+/// `wants_metal`. Mirrors the CEL rules at `rio-crds/src/pool.rs:
+/// 121-155` plus the non-CEL `wants_metal` drop.
 pub(crate) const DEGRADE_CHECKS: &[DegradeCheck] = &[
     // r[impl ctrl.crd.host-users-network-exclusive]
     // Builder-only: the pod.rs:327 suppression this mirrors only fires

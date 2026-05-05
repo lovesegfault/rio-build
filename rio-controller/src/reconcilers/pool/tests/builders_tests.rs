@@ -555,6 +555,7 @@ fn build_job_with(
         crate::fixtures::oref(&pool),
         &crate::fixtures::test_sched_addrs(),
         &crate::fixtures::test_store_addrs(),
+        &crate::reconcilers::node_informer::HwClassConfig::default(),
         intent,
         None,
         hw_sampled,
