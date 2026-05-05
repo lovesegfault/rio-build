@@ -17,9 +17,10 @@ override or reset.
 | `RioSlaPriorDivergenceClamped` | fleet-prior parameter clamped at band edge for 10m | [Prior divergence](#riosla-priordivergenceclamped) |
 | `RioSlaHwCostStale` | hw-band $/vCPU·hr snapshot >30m old | [Hw-cost stale](#riosla-hwcoststale) |
 | `RioNodeclaimPoolIceMaskedHigh` | ≥3 cells reaping NodeClaims for `reason=ice` | [Admissible set shrinking](#rionodeclaimpool-icemaskedhigh) |
-| `RioNodeclaimPoolStuckPending` | NodeClaim in-flight >3× cell lead-time (floor 90s, cap 30m) | [Provisioning stuck](#rionodeclaimpool-stuckpending) |
+| `RioNodeclaimPoolStuckPending` | NodeClaim in-flight >3× cell lead-time (floor 90s, cap 3×maxLeadTime) | [Provisioning stuck](#rionodeclaimpool-stuckpending) |
+| `RioNodeclaimPoolBootTimeoutLoop` | A cell is repeatedly minting and reaping NodeClaims for `reason=boot-timeout` | [Boot-timeout loop](#rionodeclaimpool-boottimeoutloop) |
 
-The first three are model-accuracy alerts; the last two are provisioning
+The first three are model-accuracy alerts; the last three are provisioning
 alerts that share the same `rio-cli sla` diagnostic surface.
 
 ## Step 1: Identify the offending pname
@@ -248,12 +249,35 @@ Karpenter controller logs and AWS quota; `rio-cli sla override <pname>
 
 NodeClaim created but not Registered for >3× the cell's lead-time gauge
 (`rio_controller_nodeclaim_lead_time_seconds{cell}`), clamped to a 90s floor /
-30m cap — ~90s for EBS cells (lead≈18s), ~30m for `metal-*` cells (lead=600s).
-The threshold sits above the controller's own 2×seed reap; a firing alert means
-the reaper failed, not just a slow boot. Either Launched=False (ICE — see above)
-or Launched=True but kubelet never joined (AMI / nodeadm / CNI break). Not
-model-related; `kubectl get nodeclaims -o wide` and inspect
-`Launched`/`Registered` conditions.
+3×maxLeadTime cap (default 1800s) — ~90s for EBS cells (lead≈18s), ~30m for
+`metal-*` cells (lead=600s, default `maxLeadTime`=600s). The threshold sits
+above the controller's own 2×seed reap; a firing alert means the reaper failed,
+not just a slow boot. Either Launched=False (ICE — see above) or Launched=True
+but kubelet never joined (AMI / nodeadm / CNI break). Not model-related;
+`kubectl get nodeclaims -o wide` and inspect `Launched`/`Registered` conditions.
+
+### RioNodeclaimPool BootTimeoutLoop
+
+A cell has reaped ≥2 NodeClaims with `reason=boot-timeout` in a 3×maxLeadTime
+window (default 1800s) for 5 minutes. `cover_deficit` mints a NodeClaim, kubelet
+never registers within the 2×seed boot timeout, `health::classify` reaps it
+(`ReapReason::BootTimeout` — NOT ICE-masked, since capacity exists and the
+*boot* failed), and `cover_deficit` re-mints. The loop is unbounded: each
+cycle holds an idle metal instance for `2×seed` (~20 min), with zero builds
+completing and the kvm/nixos-test queue growing.
+
+Distinct from `StuckPending` (which fires when the *reaper* fails) — this
+alert fires when the reaper succeeds repeatedly. The `>= 2` count gate
+distinguishes a one-off slow boot (1 reap, never fires) from a sustained
+loop; the 3×maxLeadTime window always spans at least one full reap cycle
+(`2×seed ≤ 2×maxLeadTime`).
+
+Likely causes: broken AMI image (post-release), nodeadm regression, EC2
+firmware update, NVMe reorder breaking instance-store mounts. Diagnose:
+`kubectl get nodeclaims -o wide`, then SSM/EC2-serial-console on a live
+in-flight claim before the reaper deletes it. Stop the burn:
+`kubectl scale --replicas=0 deploy/rio-controller` (the loop has no value),
+then fix the AMI and re-roll.
 
 ## Troubleshooting Matrix
 
