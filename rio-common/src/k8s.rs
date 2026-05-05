@@ -47,16 +47,18 @@ pub fn system_to_k8s_arch(system: &str) -> Option<&'static str> {
 /// the §13c/D3/D10/I-181 routing rule — open-coding this at ≥4 sites
 /// (scheduler `solve_intent_for` `h_all` partition, `retain_hosting_cells`
 /// chokepoint, controller `fallback_cell` / FFD `simulate` agnostic
-/// backstop, store worker `passes_intent_filter`) lets them drift, and
-/// drift here is "kvm intent routed to non-kvm cell" or "metal node
-/// absorbs non-kvm build".
+/// backstop, scheduler `compute_spawn_intents` request filter) lets
+/// them drift, and drift here is "kvm intent routed to non-kvm cell"
+/// or "metal node absorbs non-kvm build".
 ///
 /// `true` iff every `required` feature is in `provides` AND
 /// `required.is_empty() == provides.is_empty()`. The second clause is
 /// the bidirectional guard: a class providing `[kvm]` rejects
-/// featureless intents (so metal doesn't absorb non-kvm); a class
-/// providing `[]` rejects `[kvm]` intents (so non-metal isn't picked
-/// for kvm — `[]⊆anything` would otherwise let it through). Subset (not
+/// featureless intents (so metal doesn't absorb non-kvm — `[]⊆anything`
+/// is vacuously true, so the subset check alone would let it through);
+/// a class providing `[]` rejects `[kvm]` intents (so non-metal isn't
+/// picked for kvm — already rejected by the subset check, the ∅-guard
+/// is redundant in this direction). Subset (not
 /// equality) on the populated side keeps the door open for
 /// `provides=[kvm, big-parallel]` hosting `required=[kvm]`.
 ///
@@ -103,10 +105,11 @@ mod tests {
         // Exact match → compatible.
         assert!(features_compatible(&s(&["kvm"]), &s(&["kvm"])));
         // required=[], provides=[kvm] → INcompatible (∅-guard: metal
-        // must not absorb non-kvm).
+        // must not absorb non-kvm; []⊆anything is vacuously true so
+        // the subset check alone would let it through).
         assert!(!features_compatible(&[], &s(&["kvm"])));
-        // required=[kvm], provides=[] → INcompatible (∅-guard: non-metal
-        // must not host kvm; []⊆anything would otherwise let it through).
+        // required=[kvm], provides=[] → INcompatible (subset check:
+        // non-metal must not host kvm; ∅-guard redundant here).
         assert!(!features_compatible(&s(&["kvm"]), &[]));
         // Subset on populated side → compatible (provides=[kvm,bp]
         // hosts required=[kvm]).

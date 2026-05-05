@@ -86,84 +86,26 @@ fi
 # 3. `poolDefaults.tolerations ⊇ {rio.build/builder=true:NoSchedule}` —
 #    `cover.rs::builder_taint()` stamps this on every cover-minted Node;
 #    a Pool without the toleration permanently Pending. (mb_012 §2)
-# 4. Pools with `features ∋ kvm ⟹ tolerations ⊇ {rio.build/kvm=true:
-#    NoSchedule}` — metal Nodes carry the kvm taint. The default chart
-#    has no kvm pool; this guards overlays that add one. (mb_012 §2)
+# 4. Pools with `features ∋ kvm` get the `rio.build/kvm:NoSchedule`
+#    toleration auto-injected by the controller (`r[ctrl.pool.kvm-device]`,
+#    pod.rs `wants_kvm`); NOT chart-asserted. r31 bug_022: the prior §4
+#    `Pool.spec.tolerations` check tested a non-load-bearing path —
+#    production `deploy.rs::POOLS_JSON` ships kvm Pools without it and
+#    schedules fine via the auto-inject. Contrast §3: `effective_tolerations`
+#    does NOT auto-append `rio.build/builder`, so that one IS load-bearing.
 pool_check=$(yq -N 'select(.kind=="Pool") | {
   "name": .metadata.name,
   "kind": .spec.kind,
-  "features": (.spec.features // []),
   "builder_tol": ([.spec.tolerations[]?
-    | select(.key=="rio.build/builder" and .value=="true" and .effect=="NoSchedule")] | length),
-  "kvm_tol": ([.spec.tolerations[]?
-    | select(.key=="rio.build/kvm" and .value=="true" and .effect=="NoSchedule")] | length)
+    | select(.key=="rio.build/builder" and .value=="true" and .effect=="NoSchedule")] | length)
 }' -o=json "$render" | jq -r '
   if .kind == "Builder" and .builder_tol == 0 then
     "\(.name): Builder Pool missing rio.build/builder=true:NoSchedule toleration"
-  elif (.features | index("kvm")) and .kvm_tol == 0 then
-    "\(.name): kvm Pool missing rio.build/kvm=true:NoSchedule toleration"
   else empty end
 ')
 if [ -n "$pool_check" ]; then
   echo "FAIL (18-metal-feature-routing §pool toleration):" >&2
   echo "$pool_check" >&2
-  fail=1
-fi
-
-# 4b. Same kvm-Pool toleration check against an overlay that adds a
-#     kvm pool — the default chart has none, so 4 is vacuous without
-#     this. Reuses §4's predicate against a `--set-json pools=...`
-#     render.
-kvm_render=$TMPDIR/feature-routing-kvm.yaml
-helm template rio . \
-  --set karpenter.enabled=true \
-  --set karpenter.clusterName=ci \
-  --set karpenter.nodeRoleName=ci-role \
-  --set karpenter.amiTag=test \
-  --set global.image.tag=test \
-  --set postgresql.enabled=false \
-  --set poolDefaults.enabled=true \
-  --set-json 'pools=[{"name":"x86-64-kvm","kind":"Builder","systems":["x86_64-linux"],"features":["kvm"],"tolerations":[{"key":"rio.build/builder","operator":"Equal","value":"true","effect":"NoSchedule"},{"key":"rio.build/kvm","operator":"Equal","value":"true","effect":"NoSchedule"}]}]' \
-  >"$kvm_render"
-kvm_pool_check=$(yq -N 'select(.kind=="Pool") | {
-  "name": .metadata.name,
-  "features": (.spec.features // []),
-  "kvm_tol": ([.spec.tolerations[]?
-    | select(.key=="rio.build/kvm" and .value=="true" and .effect=="NoSchedule")] | length)
-}' -o=json "$kvm_render" | jq -r '
-  if (.features | index("kvm")) and .kvm_tol == 0 then
-    "\(.name): kvm Pool missing rio.build/kvm=true:NoSchedule toleration"
-  else empty end
-')
-if [ -n "$kvm_pool_check" ]; then
-  echo "FAIL (18-metal-feature-routing §kvm pool toleration overlay):" >&2
-  echo "$kvm_pool_check" >&2
-  fail=1
-fi
-# Negative: a kvm pool WITHOUT the toleration must trigger the predicate.
-kvm_neg_render=$TMPDIR/feature-routing-kvm-neg.yaml
-helm template rio . \
-  --set karpenter.enabled=true \
-  --set karpenter.clusterName=ci \
-  --set karpenter.nodeRoleName=ci-role \
-  --set karpenter.amiTag=test \
-  --set global.image.tag=test \
-  --set postgresql.enabled=false \
-  --set poolDefaults.enabled=true \
-  --set-json 'pools=[{"name":"x86-64-kvm-bad","kind":"Builder","systems":["x86_64-linux"],"features":["kvm"]}]' \
-  >"$kvm_neg_render"
-kvm_neg_check=$(yq -N 'select(.kind=="Pool") | {
-  "name": .metadata.name,
-  "features": (.spec.features // []),
-  "kvm_tol": ([.spec.tolerations[]?
-    | select(.key=="rio.build/kvm" and .value=="true" and .effect=="NoSchedule")] | length)
-}' -o=json "$kvm_neg_render" | jq -r '
-  if (.features | index("kvm")) and .kvm_tol == 0 then
-    "\(.name): kvm Pool missing rio.build/kvm=true:NoSchedule toleration"
-  else empty end
-')
-if [ -z "$kvm_neg_check" ]; then
-  echo "FAIL: §4 kvm-pool predicate is vacuous — a kvm pool without the toleration should be flagged" >&2
   fail=1
 fi
 
