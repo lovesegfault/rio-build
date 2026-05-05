@@ -162,7 +162,7 @@ fn is_fetcher(pool: &Pool) -> bool {
 /// pre-CEL specs.
 // r[impl ctrl.crd.fetcher-no-features+2]
 #[inline]
-pub(super) fn effective_features(spec: &PoolSpec) -> Vec<String> {
+pub(crate) fn effective_features(spec: &PoolSpec) -> Vec<String> {
     if spec.kind == ExecutorKind::Fetcher {
         vec![rio_common::k8s::FETCHER_FEATURE.to_string()]
     } else {

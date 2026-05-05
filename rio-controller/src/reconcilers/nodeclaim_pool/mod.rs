@@ -87,8 +87,8 @@ fn now_epoch() -> f64 {
 /// `GetSpawnIntents{filter_features: true}`.
 type PoolCoverage = (Vec<String>, Vec<String>);
 
-/// §13d Pool axis (r31 bug_019): does ANY configured Builder Pool
-/// place a Job for `intent`? Mirrors the scheduler's
+/// §13d Pool axis (r31 bug_019): does ANY configured Builder or Fetcher
+/// Pool place a Job for `intent`? Mirrors the scheduler's
 /// `passes_intent_filter` — `systems=[]` means no system filter (a
 /// Pool with no `systems` constraint accepts every arch), and
 /// `features` is checked via the SAME `features_compatible` predicate
@@ -99,6 +99,14 @@ type PoolCoverage = (Vec<String>, Vec<String>);
 /// cell-routable but Pool-uncovered would mint a NodeClaim that
 /// FFD-places (`reserved`) → `reap_idle` skips forever — a
 /// permanently-idle on-demand metal node with no Job ever spawned.
+///
+/// §13e: callers MUST build `coverage` from `effective_features(spec)`,
+/// not `spec.features` — a Fetcher Pool's declared features are `[]`
+/// (CEL-enforced) but its effective features are `[fetcher]`, and FOD
+/// intents carry `required_features=[fetcher]`. Building from
+/// `spec.features` would drop every FOD intent here (silent — the
+/// `no_pool_covers` warn fires, but FFD never sees the demand and no
+/// fetcher NodeClaim is minted).
 ///
 /// Extracted for unit testability — the predicate is pure and the
 /// failure mode (silent over-provisioning) doesn't surface in any
@@ -118,7 +126,7 @@ pub(super) fn pool_covers(intent: &SpawnIntent, coverage: &[PoolCoverage]) -> bo
 /// > ⚠ Note (§13e): the value `"builder"` is HISTORICAL — this is the
 /// > *reconciler-ownership* selector, not a role label. Post-§13e the
 /// > same reconciler owns fetcher NodeClaims too (it covers both
-/// > Builder and Fetcher Pools — see [`reconcile_once`]). Renaming the
+/// > Builder and Fetcher Pools — see `reconcile_once`). Renaming the
 /// > value to `"shim"` is a label-value migration that requires
 /// > `kubectl label nodeclaims rio.build/nodeclaim-pool- --all` on
 /// > deploy; deferred to a follow-up.
@@ -130,7 +138,7 @@ pub const OWNER_LABEL: &str = "rio.build/nodeclaim-pool=builder";
 /// requires `node-role In [builder]` (helm `builder.nodeSelector`), so
 /// `cover::build_nodeclaim` must stamp it directly. §13e: fetcher
 /// NodeClaims get `(rio.build/node-role, "fetcher")` instead —
-/// [`cover::build_nodeclaim`] branches on `provides_features ∋ fetcher`
+/// `cover::build_nodeclaim` branches on `provides_features ∋ fetcher`
 /// (the same map the scheduler routes against). The role label is for
 /// operator queries/dashboards only; the per-intent affinity matches
 /// `rio.build/fetcher` (the §13e taint+label key from `hw.labels`).
@@ -680,15 +688,20 @@ impl NodeClaimPoolReconciler {
         // ⊥ on scheduler unreachable: warn + count, don't propagate.
         // `admin_call` bounds at ADMIN_RPC_TIMEOUT so a stalled
         // scheduler doesn't wedge the tick.
-        // Builder-only: this reconciler manages builder NodeClaims
-        // (`OWNER_LABEL`); FOD intents land on the helm `rio-fetcher`
-        // NodePool. Including FODs would over-reserve builder capacity
-        // in FFD and mint builder NodeClaims for fetcher demand.
+        //
+        // §13e: NO `kind` filter. Pre-§13e this asked for Builder only —
+        // FOD intents landed on the static helm `rio-fetcher` NodePool
+        // and including them would over-reserve builder capacity in
+        // FFD. Both premises die in §13e: there is no static fetcher
+        // NodePool, and FOD intents carry distinct
+        // `hw_class_names=[fetcher-*]` so `ffd::simulate` partitions
+        // them into separate cells (Cell = (hw_class, capacity)) —
+        // builder and fetcher deficits never collide.
         let intents: Option<GetSpawnIntentsResponse> = match admin_call(
             self.admin
                 .clone()
                 .get_spawn_intents(GetSpawnIntentsRequest {
-                    kind: Some(rio_proto::types::ExecutorKind::Builder.into()),
+                    kind: None,
                     ..Default::default()
                 }),
         )
@@ -711,18 +724,28 @@ impl NodeClaimPoolReconciler {
         self.consecutive_bot_ticks = 0;
 
         // §13d Pool axis (r31 bug_019): drop intents no configured
-        // Builder Pool will Job-place, BEFORE `ffd::simulate` so the
-        // FFD set, the deficit, and the cover are all consistent.
-        // The placer (`pool/jobs::queued_for_pool`) only spawns a Job
-        // for intents matched by some Pool's `(systems, features)`;
+        // Pool will Job-place, BEFORE `ffd::simulate` so the FFD set,
+        // the deficit, and the cover are all consistent. The placer
+        // (`pool/jobs::queued_for_pool`) only spawns a Job for intents
+        // matched by some Pool's `(systems, effective_features)`;
         // provisioning for unplaceable intents mints a NodeClaim that
         // FFD-places (→ `reserved`) → `reap_idle` skips it forever —
         // a permanently-idle on-demand metal node. `retain_hosting_
         // cells` validates the *cell* axis; this is the *Pool* axis.
-        // (Fetcher Pools are irrelevant: `kind: Builder` filter at the
-        // RPC.) `pools.list()` reads the apiserver, not a stale
-        // informer — a Pool created mid-tick is seen next tick; the
-        // retained intent re-appears next `GetSpawnIntents`.
+        //
+        // §13e: covers Builder AND Fetcher Pools. The explicit
+        // allowlist (instead of dropping the filter entirely) means a
+        // future third `ExecutorKind` does NOT silently start minting
+        // NodeClaims — the exclusion stays a conscious code change.
+        // Coverage uses `effective_features(spec)` (the §13e chokepoint),
+        // NOT `spec.features` — a Fetcher Pool's `spec.features` is
+        // always `[]` (CEL-enforced) but its `effective_features` is
+        // `[fetcher]`, and the FOD intent's `required_features=[fetcher]`
+        // must match it through `pool_covers`'s `features_compatible`.
+        //
+        // `pools.list()` reads the apiserver, not a stale informer — a
+        // Pool created mid-tick is seen next tick; the retained intent
+        // re-appears next `GetSpawnIntents`.
         //
         // Fail-OPEN on transient apiserver error: skipping the filter
         // for one tick over-provisions (the legit intents still get
@@ -735,8 +758,15 @@ impl NodeClaimPoolReconciler {
                 let coverage: Vec<PoolCoverage> = l
                     .items
                     .iter()
-                    .filter(|p| p.spec.kind == ExecutorKind::Builder)
-                    .map(|p| (p.spec.systems.clone(), p.spec.features.clone()))
+                    .filter(|p| {
+                        matches!(p.spec.kind, ExecutorKind::Builder | ExecutorKind::Fetcher)
+                    })
+                    .map(|p| {
+                        (
+                            p.spec.systems.clone(),
+                            pool::pod::effective_features(&p.spec),
+                        )
+                    })
                     .collect();
                 let before = intents.intents.len();
                 intents.intents.retain(|i| pool_covers(i, &coverage));
@@ -749,10 +779,10 @@ impl NodeClaimPoolReconciler {
                     .increment(dropped as u64);
                     warn!(
                         dropped,
-                        builder_pools = coverage.len(),
-                        "SpawnIntents dropped at provisioner — no configured Builder \
-                         Pool covers their (system, required_features); add a Pool or \
-                         remove the hwClass advertising the feature"
+                        executor_pools = coverage.len(),
+                        "SpawnIntents dropped at provisioner — no configured Pool \
+                         (Builder or Fetcher) covers their (system, effective_features); \
+                         add a Pool or remove the hwClass advertising the feature"
                     );
                 }
             }
@@ -1830,5 +1860,37 @@ mod tests {
         // Distinct from a Pool *list* error, which fail-OPENs by
         // skipping the retain entirely (see `reconcile_once`).
         assert!(!pool_covers(&intent("x86_64-linux", &[]), &[]));
+
+        // §13e: a Fetcher Pool's coverage tuple uses
+        // `effective_features(spec)` (= [fetcher]), NOT spec.features
+        // (= []). FOD intents carry required_features=[fetcher].
+        // The bidirectional ∅-guard makes [fetcher] ⊄ [] strict —
+        // building coverage from spec.features would drop EVERY FOD
+        // intent here (no fetcher NodeClaim ever minted).
+        let fetcher_pool = crate::fixtures::test_pool("f", ExecutorKind::Fetcher);
+        let fetcher_coverage: Vec<PoolCoverage> = vec![(
+            fetcher_pool.spec.systems.clone(),
+            crate::reconcilers::pool::pod::effective_features(&fetcher_pool.spec),
+        )];
+        let fod = SpawnIntent {
+            system: fetcher_pool.spec.systems[0].clone(),
+            required_features: vec![rio_common::k8s::FETCHER_FEATURE.into()],
+            ..Default::default()
+        };
+        assert!(
+            pool_covers(&fod, &fetcher_coverage),
+            "FOD intent covered by Fetcher Pool via effective_features (§13e)"
+        );
+        // Cross-kind partition: FOD ⊄ builder pool, builder intent ⊄
+        // fetcher pool (the bidirectional ∅-guard).
+        assert!(
+            !pool_covers(&fod, &eks),
+            "FOD intent NOT covered by featureless builder Pool (∅-guard)"
+        );
+        let bld = intent(&fetcher_pool.spec.systems[0], &[]);
+        assert!(
+            !pool_covers(&bld, &fetcher_coverage),
+            "featureless builder intent NOT covered by Fetcher Pool (∅-guard)"
+        );
     }
 }

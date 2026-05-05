@@ -967,6 +967,61 @@ mod tests {
         assert_eq!(by[&h2k][0].intent_id, "b", "b only opens h2");
     }
 
+    /// §13e B2.6: a FOD intent (`hw_class_names=[fetcher-x86]`) and a
+    /// builder intent (`hw_class_names=[mid-ebs-x86]`) produce DISJOINT
+    /// cell deficits. The pre-§13e doc comment claimed including FODs
+    /// would "over-reserve builder capacity in FFD" — that concern was
+    /// specific to FOD intents with `hw_class_names=[]` (cold-start
+    /// fallback to a builder reference cell). Post-§13e FOD intents
+    /// carry `hw_class_names=[fetcher-*]` from the scheduler, so FFD's
+    /// `Cell = (hw_class, capacity)` keying partitions them strictly.
+    /// Removing the `kind: Builder` filter does NOT mix builder and
+    /// fetcher demand in the same cell.
+    #[test]
+    fn assign_fetcher_and_builder_intents_disjoint_cells() {
+        let fod = intent(
+            "fod-1",
+            2,
+            GI,
+            &[("fetcher-x86", CapacityType::Spot)],
+            Some(true),
+        );
+        let bld = intent(
+            "bld-1",
+            8,
+            32 * GI,
+            &[("mid-ebs-x86", CapacityType::Spot)],
+            Some(true),
+        );
+        let unplaced = [fod, bld];
+        let none = HashSet::new();
+        let (by, d) = assign_to_cells(
+            &unplaced,
+            &CellSketches::default(),
+            &none,
+            cell_rank,
+            |_| None,
+        );
+        assert_eq!(d, 0, "no fallback drops — both have hw_class_names");
+        let fcell = Cell("fetcher-x86".into(), CapacityType::Spot);
+        let bcell = Cell("mid-ebs-x86".into(), CapacityType::Spot);
+        assert_eq!(by.len(), 2, "exactly two disjoint cells");
+        assert_eq!(by[&fcell].len(), 1);
+        assert_eq!(by[&fcell][0].intent_id, "fod-1");
+        assert_eq!(by[&bcell].len(), 1);
+        assert_eq!(by[&bcell][0].intent_id, "bld-1");
+        // Structural: no cell hosts both kinds.
+        for (cell, intents) in &by {
+            let has_fod = intents.iter().any(|i| i.intent_id == "fod-1");
+            let has_bld = intents.iter().any(|i| i.intent_id == "bld-1");
+            assert!(
+                !(has_fod && has_bld),
+                "cell {cell:?} mixes builder and fetcher demand — \
+                 FFD partition violated"
+            );
+        }
+    }
+
     /// ICE-masked spot cell → intent with `A_open=[spot,od]` fails
     /// over to od (cheapest UNmasked). Prevents the "assigned to
     /// masked cell → cover_deficit skips → intent stranded" hole.
