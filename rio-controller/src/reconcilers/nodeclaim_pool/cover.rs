@@ -90,10 +90,19 @@ pub struct HwClassCtx {
     pub labels: Vec<(String, String)>,
     /// Karpenter instance-type `spec.requirements`.
     pub requirements: Vec<NodeSelectorRequirement>,
-    /// §13c: per-hw-class Node taints (chained after
-    /// [`builder_taint`]). e.g. metal classes carry
-    /// `rio.build/kvm=true:NoSchedule`.
+    /// §13c: per-hw-class Node taints. Builder cells: chained after
+    /// [`builder_taint`] (e.g. metal carries
+    /// `rio.build/kvm=true:NoSchedule`). Fetcher cells: used verbatim
+    /// — the hwClass already declares `rio.build/fetcher=true:NoSchedule`,
+    /// so the role taint and the hwClass taint collapse to ONE source.
     pub taints: Vec<Taint>,
+    /// §13e: `[sla.hw_classes.$h].provides_features`. Drives the
+    /// per-cell role stamp in [`build_nodeclaim`]: `∋ fetcher` →
+    /// `rio.build/node-role: fetcher` + no [`builder_taint`]; else
+    /// `builder` + [`builder_taint`]. Same map the scheduler routes
+    /// against (`features_compatible`), so the role partition cannot
+    /// drift from the routing partition.
+    pub provides_features: Vec<String>,
 }
 
 /// Cluster-level [`build_nodeclaim`] config that doesn't vary per
@@ -374,9 +383,11 @@ pub fn claim_count(sum: (u32, u64, u64), cfg: &SizingCfg) -> u32 {
 ///   [`CAPACITY_TYPE_LABEL`] (so [`super::ffd::LiveNode::from`]
 ///   recovers `cell` next tick), [`NODEPOOL_LABEL`] =
 ///   [`SHIM_NODEPOOL`] (Karpenter state-tracking),
-///   [`super::NODE_ROLE_LABEL`] = `builder` (builder pod affinity
-///   requires it; the legacy band-loop NodePool stamped it), and the
-///   [`super::OWNER_LABEL`] selector.
+///   `rio.build/node-role` = `builder` for builder cells (builder pod
+///   affinity requires it; the legacy band-loop NodePool stamped it)
+///   or `fetcher` for fetcher cells (§13e: branched on
+///   `provides_features ∋ fetcher`), and the [`super::OWNER_LABEL`]
+///   selector.
 /// - `spec.nodeClassRef`: the hw-class's EC2NodeClass — `rio-nvme` for
 ///   nvme storage tiers (so `instanceStorePolicy: RAID0` applies),
 ///   `rio-metal` for metal, `rio-default` otherwise. Per-class via
@@ -391,8 +402,13 @@ pub fn claim_count(sum: (u32, u64, u64), cfg: &SizingCfg) -> u32 {
 ///   matches 0 instance types → Karpenter posts `Launched=False
 ///   reason=InsufficientCapacity` and GCs the claim ~1s later (the
 ///   live B8 finding).
-/// - `spec.taints`: the single [`builder_taint`] so non-builder
-///   cluster pods stay off rio-minted builder nodes (ADR-019).
+/// - `spec.taints`: builder cells get [`builder_taint`] chained with
+///   the hwClass's per-class taints so non-builder cluster pods stay
+///   off rio-minted builder nodes (ADR-019). §13e: fetcher cells get
+///   `hw.taints` verbatim (the hwClass already carries
+///   `rio.build/fetcher=true:NoSchedule`) — appending [`builder_taint`]
+///   would deadlock the fetcher pod (its `effective_tolerations`
+///   tolerates only `rio.build/fetcher`).
 /// - `spec.resources.requests`: `{cpu, memory, ephemeral-storage}`.
 ///   Karpenter uses these as the floor for instance-type selection;
 ///   `spec.requirements` constrains the family.
@@ -410,7 +426,29 @@ pub fn build_nodeclaim(
     let (owner_k, owner_v) = super::OWNER_LABEL
         .split_once('=')
         .expect("OWNER_LABEL is k=v");
-    let (role_k, role_v) = super::NODE_ROLE_LABEL;
+    // §13e: derive the role taint+label from the hwClass instead of
+    // hardcoding builder. The bidirectional ∅-guard makes
+    // `provides_features ∋ fetcher ⟺ FOD-routable` a strict partition;
+    // the role stamp follows the same chokepoint. Without this, every
+    // NodeClaim minted for a `fetcher-*` cell would carry
+    // `rio.build/builder:NoSchedule` (un-tolerated by the fetcher pod)
+    // AND `rio.build/node-role: builder` (poisons every operator query
+    // filtering on node-role) — bootstrap deadlock.
+    //
+    // TODO: structural close — single-source ALL role taints/labels
+    // through hwClass config (drop `builder_taint()`/`NODE_ROLE_LABEL`
+    // hardcoding entirely). Requires a §SCC sweep across mid-*/large-*/
+    // metal-* hwClass entries to declare the builder taint+label
+    // explicitly. Out of scope for §13e.
+    let is_fetcher_cell = hw
+        .provides_features
+        .iter()
+        .any(|f| f == rio_common::k8s::FETCHER_FEATURE);
+    let (role_k, role_v) = if is_fetcher_cell {
+        ("rio.build/node-role", "fetcher")
+    } else {
+        super::NODE_ROLE_LABEL
+    };
     // hw.labels (rio.build/hw-band, rio.build/storage,
     // kubernetes.io/arch, …) are STAMPED onto the Node via
     // metadata.labels — Karpenter copies NodeClaim labels to the
@@ -486,9 +524,23 @@ pub fn build_nodeclaim(
             // §13c: per-hwClass taints chained after the universal
             // builder taint. e.g. metal classes carry
             // `rio.build/kvm=true:NoSchedule`.
-            taints: std::iter::once(builder_taint())
-                .chain(hw.taints.iter().cloned())
-                .collect(),
+            //
+            // §13e: stamp the role taint matching the cell's role.
+            // Fetcher cells: `hw.taints` already carries
+            // `rio.build/fetcher=true:NoSchedule` from the hwClass
+            // config — the role taint and the hwClass taint collapse
+            // to ONE source. Don't append `builder_taint()`; the
+            // fetcher pod's `effective_tolerations` returns ONLY
+            // `taints_routing_to(FETCHER_TAINT_KEY)` so a builder
+            // taint here would deadlock (the fetcher pod cannot bind
+            // to the fetcher node minted for it).
+            taints: if is_fetcher_cell {
+                hw.taints.clone()
+            } else {
+                std::iter::once(builder_taint())
+                    .chain(hw.taints.iter().cloned())
+                    .collect()
+            },
             resources: Some(ResourceRequirements {
                 requests: Some(requests),
                 ..Default::default()
@@ -1056,6 +1108,7 @@ mod tests {
                 },
             ],
             taints: vec![],
+            provides_features: vec![],
         }
     }
 
@@ -1068,7 +1121,33 @@ mod tests {
             effect: "NoSchedule".into(),
             ..Default::default()
         }];
+        ctx.provides_features = vec!["kvm".into(), "nixos-test".into()];
         ctx
+    }
+
+    /// §13e: fetcher hw-class context. `provides_features ∋ fetcher`
+    /// drives the per-cell role stamp; `taints` carries ONLY the
+    /// fetcher taint (the hwClass declares it).
+    fn hw_ctx_fetcher() -> HwClassCtx {
+        HwClassCtx {
+            node_class: "rio-default".into(),
+            labels: vec![
+                (rio_common::k8s::FETCHER_TAINT_KEY.into(), "true".into()),
+                ("kubernetes.io/arch".into(), "amd64".into()),
+            ],
+            requirements: vec![NodeSelectorRequirement {
+                key: "kubernetes.io/arch".into(),
+                operator: "In".into(),
+                values: vec!["amd64".into()],
+            }],
+            taints: vec![Taint {
+                key: rio_common::k8s::FETCHER_TAINT_KEY.into(),
+                value: Some("true".into()),
+                effect: "NoSchedule".into(),
+                ..Default::default()
+            }],
+            provides_features: vec![rio_common::k8s::FETCHER_FEATURE.into()],
+        }
     }
 
     /// Asserts the full wire shape: generateName, labels (hw-class
@@ -1175,6 +1254,7 @@ mod tests {
             labels: vec![],
             requirements: vec![],
             taints: vec![],
+            provides_features: vec![],
         };
         let nc = build_nodeclaim(
             &cell,
@@ -1254,6 +1334,57 @@ mod tests {
         );
         assert_eq!(nc_std.spec.taints.len(), 1);
         assert_eq!(nc_std.spec.taints[0].key, "rio.build/builder");
+    }
+
+    /// §13e: a `fetcher-*` cell mints a NodeClaim with the
+    /// `rio.build/fetcher` taint ONLY (no builder_taint), and stamps
+    /// `rio.build/node-role: fetcher`. Without this branch every
+    /// fetcher NodeClaim would carry BOTH taints — the fetcher pod
+    /// (which tolerates only `rio.build/fetcher`) could never bind to
+    /// the fetcher node minted for it. Bootstrap deadlock.
+    // r[verify ctrl.nodeclaim.taints.hwclass]
+    // r[verify fetcher.node.dedicated+2]
+    #[test]
+    fn build_nodeclaim_fetcher_cell_no_builder_taint() {
+        let cell = Cell("fetcher-x86".into(), CapacityType::Spot);
+        let nc = build_nodeclaim(
+            &cell,
+            (4, 8 * GI, 50 * GI),
+            0.0,
+            &hw_ctx_fetcher(),
+            &CoverCfg { metal_sizes: &[] },
+        );
+        // ONLY the fetcher taint — no builder_taint().
+        assert_eq!(
+            nc.spec.taints.len(),
+            1,
+            "fetcher cell mints exactly the hwClass fetcher taint, \
+             never builder_taint: {:?}",
+            nc.spec.taints
+        );
+        assert_eq!(nc.spec.taints[0].key, rio_common::k8s::FETCHER_TAINT_KEY);
+        assert_eq!(nc.spec.taints[0].effect, "NoSchedule");
+        assert!(
+            !nc.spec.taints.iter().any(|t| t.key == "rio.build/builder"),
+            "fetcher cell must NOT carry builder_taint (would deadlock \
+             the fetcher pod binding)"
+        );
+        // Role label is `fetcher`, not `builder`.
+        let labels = nc.metadata.labels.as_ref().unwrap();
+        assert_eq!(
+            labels["rio.build/node-role"], "fetcher",
+            "fetcher cell stamps rio.build/node-role: fetcher"
+        );
+        // hwClass label (the §13e taint+label key) survives the
+        // `extend` overwrite — `rio.build/fetcher` does NOT collide
+        // with `rio.build/node-role`. Per-intent affinity matches THIS.
+        assert_eq!(
+            labels[rio_common::k8s::FETCHER_TAINT_KEY],
+            "true",
+            "hwClass fetcher label stamped (per-intent affinity reads it)"
+        );
+        // Owner label is unchanged — same reconciler owns both kinds.
+        assert_eq!(labels["rio.build/nodeclaim-pool"], "builder");
     }
 
     /// §13c T8: per-hwClass fleet-core sub-budget. The class cap counts

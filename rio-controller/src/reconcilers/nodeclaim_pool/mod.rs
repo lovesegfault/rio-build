@@ -112,16 +112,28 @@ pub(super) fn pool_covers(intent: &SpawnIntent, coverage: &[PoolCoverage]) -> bo
 
 /// Label selector for NodeClaims this reconciler owns. Stamped at
 /// `create()` time so `list_live_nodeclaims` and the consolidator never
-/// touch claims from the rio-general / fetcher pools.
+/// touch claims from the rio-general NodePool (or any operator-managed
+/// NodePool).
+///
+/// > ⚠ Note (§13e): the value `"builder"` is HISTORICAL — this is the
+/// > *reconciler-ownership* selector, not a role label. Post-§13e the
+/// > same reconciler owns fetcher NodeClaims too (it covers both
+/// > Builder and Fetcher Pools — see [`reconcile_once`]). Renaming the
+/// > value to `"shim"` is a label-value migration that requires
+/// > `kubectl label nodeclaims rio.build/nodeclaim-pool- --all` on
+/// > deploy; deferred to a follow-up.
 pub const OWNER_LABEL: &str = "rio.build/nodeclaim-pool=builder";
 
 /// `rio.build/node-role` label key/value stamped on every rio-minted
-/// builder NodeClaim. The legacy band-loop NodePool template stamped
+/// **builder** NodeClaim. The legacy band-loop NodePool template stamped
 /// this; B3 deleted those NodePools, and builder pod affinity still
 /// requires `node-role In [builder]` (helm `builder.nodeSelector`), so
-/// `cover::build_nodeclaim` must stamp it directly. Fetcher nodes still
-/// come from the helm `rio-fetcher` NodePool template (which stamps
-/// `node-role: fetcher` itself) — this reconciler is builder-only.
+/// `cover::build_nodeclaim` must stamp it directly. §13e: fetcher
+/// NodeClaims get `(rio.build/node-role, "fetcher")` instead —
+/// [`cover::build_nodeclaim`] branches on `provides_features ∋ fetcher`
+/// (the same map the scheduler routes against). The role label is for
+/// operator queries/dashboards only; the per-intent affinity matches
+/// `rio.build/fetcher` (the §13e taint+label key from `hw.labels`).
 pub const NODE_ROLE_LABEL: (&str, &str) = ("rio.build/node-role", "builder");
 
 /// `intent_id` set FFD-placed on a `Registered=True` NodeClaim. `None`
@@ -1154,6 +1166,10 @@ impl NodeClaimPoolReconciler {
                         ..Default::default()
                     })
                     .collect(),
+                // §13e: cover::build_nodeclaim branches the role
+                // taint+label on `provides_features ∋ fetcher` —
+                // same map the scheduler routes against.
+                provides_features: self.hw_config.provides_for(&cell.0),
             };
             let cover_cfg = cover::CoverCfg {
                 metal_sizes: &self.cfg.metal_sizes,
