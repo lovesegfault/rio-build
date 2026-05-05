@@ -808,12 +808,21 @@ rec {
                 "  | grep -E '\"level\":\"(INFO|WARN|ERROR)\"' | tail -30"
             )[1])
             raise
-        name = k3s_server.succeed(
+        # Race: the pod can transition out of Running (build finished)
+        # between the wait above and a second `succeed()` re-query —
+        # exit-1 on the empty jsonpath. Use `execute()` and accept
+        # Succeeded too: by the time the wait returned, the pod existed
+        # and Ran; "no longer Running because it finished" is success
+        # for callers that just need a name to log/follow.
+        name = k3s_server.execute(
             f"k3s kubectl -n {ns} get pod -l rio.build/pool={pool} "
             "--field-selector=status.phase=Running "
-            "-o jsonpath='{.items[0].metadata.name}'"
-        ).strip()
-        assert name, f"no Running pod for rio.build/pool={pool} in ns={ns}"
+            "-o jsonpath='{.items[0].metadata.name}' 2>/dev/null || "
+            f"k3s kubectl -n {ns} get pod -l rio.build/pool={pool} "
+            "--sort-by=.metadata.creationTimestamp "
+            "-o jsonpath='{.items[-1].metadata.name}'"
+        )[1].strip()
+        assert name, f"no pod for rio.build/pool={pool} in ns={ns}"
         return name
 
     # ── Port-forward helpers ──────────────────────────────────────────
