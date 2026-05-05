@@ -320,6 +320,44 @@ rec {
           enable = true;
           storeAddr = "localhost:9002";
           inherit databaseUrl;
+          # `[sla]` is mandatory (ADR-023 §13a) — `validate_shape()`
+          # rejects an absent table at boot. The figment baseline
+          # (`SlaConfig::figment_baseline`, max_cores=None,
+          # hw_classes={}, hw_cost_source=static) is intentionally
+          # not bootable on its own: §13c-3 made `(None,None) ∧ static`
+          # a hard error so a helm chart that omits `sla.maxCores`
+          # under static fails loud instead of falling through to a
+          # phantom test default. Standalone VM-test fixtures that
+          # don't care about SLA still need a working scheduler, so
+          # supply the minimal-valid block here. The sla-sizing /
+          # scheduling fixtures override `extraConfig` with their own
+          # `[sla]` (the `//` below replaces this whole string).
+          # Mirrors `vmtest-full.yaml` / `schedulingFixture`.
+          extraConfig = ''
+            [sla]
+            default_tier = "normal"
+            hw_cost_source = "static"
+            reference_hw_class = "vmtest"
+            max_cores = 16
+            max_mem = 2147483648
+            max_disk = 6442450944
+            default_disk = 2147483648
+
+            [[sla.tiers]]
+            name = "normal"
+
+            [sla.probe]
+            cpu = 4
+            mem_per_core = 134217728
+            mem_base = 268435456
+
+            [sla.hw_classes.vmtest]
+            labels = [{ key = "rio.build/hw-class", value = "vmtest" }]
+            requirements = [{ key = "kubernetes.io/os", operator = "In", values = ["linux"] }]
+            node_class = "rio-default"
+            max_cores = 16
+            max_mem = 2147483648
+          '';
         }
         // extraSchedulerConfig;
         gateway = {

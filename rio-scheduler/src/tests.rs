@@ -175,6 +175,38 @@ fn sla_globals_unset_in_toml_extract_as_none() {
         .expect("merged config passes pass-1");
 }
 
+/// `Config::default()` ([`SlaConfig::figment_baseline`]) is
+/// intentionally NOT bootable on its own — `[sla]` is a mandatory
+/// table that every figment-loaded source (helm scheduler.toml,
+/// VM-test `extraSchedulerConfig.extraConfig`) must provide.
+///
+/// Tripwire for the figment-baseline drift class: pre-3c16e0806,
+/// `Config::default()` used [`SlaConfig::test_default`]
+/// (`max_cores: Some(16.0)`, `hw_classes: {test-hw}`), which let a
+/// TOML-less scheduler boot silently. That masked 8 standalone
+/// VM-test fixtures that never wired `extraSchedulerConfig.extraConfig`
+/// — the gap only surfaced when the baseline was correctly cleared.
+/// If this test ever flips to passing `validate()`, someone re-grew
+/// the baseline; revert that and fix the missing `[sla]` source
+/// instead. See `nix/tests/common.nix::mkControlNode` for the
+/// VM-test default.
+#[test]
+fn config_default_is_not_bootable_without_sla_source() {
+    use rio_common::config::ValidateConfig;
+    let mut cfg = Config::default();
+    // Satisfy the non-[sla] required fields so the assert isolates the
+    // [sla] check (these would otherwise trip first).
+    cfg.database_url = "postgres://test".into();
+    cfg.store.addr = "http://localhost:1".into();
+    let err = cfg
+        .validate()
+        .expect_err("Config::default() (figment baseline) must NOT validate");
+    assert!(
+        err.to_string().contains("hwCostSource=static"),
+        "must trip on the §13c-3 (None, None) ∧ Static guard; got: {err:#}"
+    );
+}
+
 /// Empty TOML → `#[serde(default)]` on Config + sub-struct
 /// defaults → identical to `Config::default()`. This is the
 /// "operator didn't configure it" case — existing deployments
