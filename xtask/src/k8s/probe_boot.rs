@@ -34,7 +34,7 @@ use ::kube::api::{Api, DeleteParams, ListParams, PostParams};
 use ::kube::core::DynamicObject;
 use anyhow::{Context, Result, bail, ensure};
 use k8s_openapi::api::core::v1::{ConfigMap, Node};
-use rio_common::k8s::metal_partition_op;
+use rio_common::k8s::{METAL_NODE_CLASS, metal_partition_op};
 use rio_scheduler::sla::config::{CapacityType, Cell, HwClassDef, NodeSelectorReq, SlaConfig};
 use serde_json::{Value, json};
 use tracing::{info, warn};
@@ -56,9 +56,22 @@ const SHIM_NODEPOOL: &str = "rio-nodeclaim-shim";
 /// and lets assertion 2 exclude our own naked claims.
 const PROBE_LABEL: &str = "rio.build/probe";
 
-/// Per-cell registration timeout. AMI boot + kubelet join is ~90s
-/// typical; 300s covers spot ICE retry + cold ENI attach.
-const REGISTER_TIMEOUT: Duration = Duration::from_secs(300);
+/// Per-cell registration timeout, partitioned on the same
+/// `node_class == METAL_NODE_CLASS` predicate as
+/// [`mk_probe_nodeclaim`]'s [`metal_partition_op`] call
+/// (§Partition-single-source, bug_018). r30 bug_029 made the probe
+/// LAUNCH the right hardware for metal cells; this makes the wait able
+/// to OBSERVE it. AWS bare-metal: physical alloc + BIOS POST +
+/// BMC/firmware init + NixOS BIOS-AMI boot ≈ 7–15 min. Virtualized:
+/// AMI boot + kubelet join is ~90s typical; 300s covers spot ICE retry
+/// + cold ENI attach.
+fn register_timeout(def: &HwClassDef) -> Duration {
+    if def.node_class == METAL_NODE_CLASS {
+        Duration::from_secs(1200)
+    } else {
+        Duration::from_secs(300)
+    }
+}
 
 /// Assertion 5 hold window. Karpenter's disruption controller ticks
 /// every 10s; 30s gives it three passes to mark `Disrupting` if the
@@ -110,10 +123,11 @@ pub async fn run() -> Result<()> {
         // last claim is held for assertions 4+5 instead of being
         // deleted in-loop.
         //
-        // Serial (one NodeClaim at a time, ≤300s each) is intentional
-        // for first-run: 12 simultaneous claims would race spot ICE
-        // retry across cells and pile up CreateFleet quota. A
-        // `--parallel` flag for re-runs is a follow-up.
+        // Serial (one NodeClaim at a time, `register_timeout(def)` each
+        // — 300s virtualized / 1200s metal) is intentional for
+        // first-run: 12 simultaneous claims would race spot ICE retry
+        // across cells and pile up CreateFleet quota. A `--parallel`
+        // flag for re-runs is a follow-up.
         // TODO: `--parallel` re-probe — fan out cells via join_all once
         // the first serial run has populated leadTimeSeed.
         let last = cells.len() - 1;
@@ -153,12 +167,13 @@ pub async fn run() -> Result<()> {
             created.push(name.clone());
             info!("  [{key}] created NodeClaim {name}");
 
-            let reg = wait_condition(&claims, &name, "Registered", REGISTER_TIMEOUT)
+            let timeout = register_timeout(def);
+            let reg = wait_condition(&claims, &name, "Registered", timeout)
                 .await
                 .with_context(|| {
                     format!(
                         "NodeClaim {name} never reached Registered=True within \
-                         {REGISTER_TIMEOUT:?}; `kubectl describe nodeclaim {name}` for the \
+                         {timeout:?}; `kubectl describe nodeclaim {name}` for the \
                          blocking condition"
                     )
                 })?;
@@ -320,8 +335,25 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    // bug_018: print collected results BEFORE propagating the error so
+    // a single-cell timeout (e.g. a misconfigured metal cell) doesn't
+    // discard every already-measured virtualized entry. The operator
+    // pastes the partial leadTimeSeed block and re-runs for the
+    // failed cell separately.
+    // TODO: per-cell error tolerance — collect (cell, error) and report
+    // all failures, don't abort on first. Needs the `last_claim` hold
+    // for assertions 4/5 to be decoupled from the loop's error path.
+    if let Err(e) = &result {
+        warn!("probe loop aborted: {e:#}");
+        if !results.is_empty() {
+            warn!(
+                "{} cell(s) measured before the failure — partial leadTimeSeed below",
+                results.len()
+            );
+        }
+    }
+    print_results(&mut results, result.is_ok());
     result?;
-    print_results(&mut results);
     Ok(())
 }
 
@@ -646,10 +678,21 @@ fn find_condition(nc: &DynamicObject, cond: &str) -> Option<Value> {
         .cloned()
 }
 
-fn print_results(results: &mut [ProbeResult]) {
+/// `complete=true` when the probe loop ran to completion (all 5
+/// assertions passed). Partial runs (bug_018) still print the
+/// collected `leadTimeSeed` block — the operator pastes what was
+/// measured and re-runs the failed cell separately.
+fn print_results(results: &mut [ProbeResult], complete: bool) {
+    if results.is_empty() {
+        return;
+    }
     results.sort_by(|a, b| (&a.hw_class, a.cap.label()).cmp(&(&b.hw_class, b.cap.label())));
 
-    println!("\nall 5 conformance assertions PASS\n");
+    if complete {
+        println!("\nall 5 conformance assertions PASS\n");
+    } else {
+        println!("\nPARTIAL — probe loop aborted; leadTimeSeed below covers only measured cells\n");
+    }
     println!(
         "{:<18} {:<5} {:<8} {:<16} {:>10}",
         "hw-class", "cap", "arch", "instance-type", "boot-secs"
@@ -870,6 +913,33 @@ mod tests {
                 .and_then(Value::as_str),
             Some("Never")
         );
+    }
+
+    /// bug_018: the registration wait MUST use the same `node_class`
+    /// partition predicate as `mk_probe_nodeclaim` (§Partition-single-
+    /// source). bug_029 made the probe LAUNCH metal; without a longer
+    /// metal timeout the wait can't OBSERVE it — the cell aborts at
+    /// 300s (virtualized budget) while bare-metal is still in BIOS POST.
+    /// Pre-fix: `REGISTER_TIMEOUT` was a 300s constant, no per-class
+    /// dispatch.
+    #[test]
+    fn register_timeout_is_per_node_class() {
+        let mut metal = hw_class(&[], vec![req("kubernetes.io/os", "In", &["linux"])]);
+        metal.node_class = METAL_NODE_CLASS.into();
+        assert_eq!(register_timeout(&metal), Duration::from_secs(1200));
+
+        let mut ebs = hw_class(&[], vec![req("kubernetes.io/os", "In", &["linux"])]);
+        ebs.node_class = "rio-default".into();
+        assert_eq!(register_timeout(&ebs), Duration::from_secs(300));
+
+        let mut nvme = hw_class(&[], vec![req("kubernetes.io/os", "In", &["linux"])]);
+        nvme.node_class = "rio-nvme".into();
+        assert_eq!(register_timeout(&nvme), Duration::from_secs(300));
+
+        // Same partition predicate as mk_probe_nodeclaim's
+        // metal_partition_op call: metal ⇔ In ⇔ 1200s.
+        assert_eq!(metal_partition_op(&metal.node_class), "In");
+        assert_eq!(metal_partition_op(&ebs.node_class), "NotIn");
     }
 
     /// bug_029: a metal-nodeClass hwClass MUST get the `In` side of the

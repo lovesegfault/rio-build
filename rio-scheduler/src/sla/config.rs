@@ -627,7 +627,7 @@ impl SlaConfig {
     ///   (system)` ⟺ `pod.rs::nix_systems_to_k8s_arch(systems)` writes
     ///   `nodeSelector{kubernetes.io/arch}`. (bug_042)
     /// - **features** — `features_compatible(required,
-    ///   provides_for(h))` ⟺ `wants_kvm(pool)` writes
+    ///   provides_for(h))` ⟺ `wants_metal(pool, hw)` writes
     ///   `nodeSelector{rio.build/kvm}` (`provides ∋ kvm ⟺ labels ∋
     ///   {rio.build/kvm: true}`, helm-test-pinned). (mb_012)
     /// - **size** — `(cores, mem) ≤ class_ceilings(h)` ⟺ pod
