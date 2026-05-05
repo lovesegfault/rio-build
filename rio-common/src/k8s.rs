@@ -26,6 +26,22 @@ pub fn metal_partition_op(node_class: &str) -> &'static str {
     }
 }
 
+/// The fetcher partition feature. Every FOD intent requires `[fetcher]`;
+/// every fetcher hwClass provides `[fetcher]`. The bidirectional ∅-guard
+/// in [`features_compatible`] makes this a strict partition: a featureless
+/// builder cannot route to a fetcher cell (`[] ⊆ [fetcher]` fails the
+/// ∅-guard), a FOD cannot route to a builder cell (`[fetcher] ⊆ []`
+/// fails the subset check). See `r[sched.sla.fod-feature-derivation]`.
+pub const FETCHER_FEATURE: &str = "fetcher";
+
+/// The fetcher node taint AND label key (one key for both, mirroring the
+/// metal pattern: `rio.build/kvm` is both `metal-*`'s taint key and label
+/// key). Pre-§13e the static `rio-fetcher` NodePool used a separate
+/// `rio.build/node-role: fetcher` label; §13e unified the key so
+/// `taints_routing_to(FETCHER_TAINT_KEY)` and `cells_to_selector_terms`
+/// read the SAME key from the hwClass config.
+pub const FETCHER_TAINT_KEY: &str = "rio.build/fetcher";
+
 /// Map a single nix `system` (e.g. `"x86_64-linux"`) to its
 /// `kubernetes.io/arch` label value. `None` for empty/`builtin`/
 /// unknown — caller treats an unmappable system as undroppable (no node
@@ -122,6 +138,32 @@ mod tests {
         assert!(!features_compatible(
             &s(&["kvm", "nixos-test"]),
             &s(&["kvm"])
+        ));
+    }
+
+    /// §13e: the fetcher partition is total under [`features_compatible`]'s
+    /// ∅-guard. Asserts the const value composes with the predicate the
+    /// way the scheduler/controller route on it: `[fetcher]` cannot land
+    /// on `[]` cells and `[]` cannot land on `[fetcher]` cells, so a FOD
+    /// always goes to a fetcher cell and a non-FOD never does. The
+    /// taint-key partition (`FETCHER_TAINT_KEY` vs `rio.build/kvm`) is
+    /// asserted at chart-render in `helm/20-fetcher-feature-routing.sh`.
+    #[test]
+    fn fetcher_partition_is_total() {
+        // Mirror the `s` helper convention from
+        // `features_compatible_bidirectional_guard` above.
+        let s = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| (*s).into()).collect() };
+        // The ∅-guard makes this a strict partition: featureless ⇎ [fetcher].
+        assert!(!features_compatible(&[], &s(&[FETCHER_FEATURE])));
+        assert!(!features_compatible(&s(&[FETCHER_FEATURE]), &[]));
+        assert!(features_compatible(
+            &s(&[FETCHER_FEATURE]),
+            &s(&[FETCHER_FEATURE])
+        ));
+        // FODs never need kvm, kvm builds never need fetcher.
+        assert!(!features_compatible(
+            &s(&[FETCHER_FEATURE]),
+            &s(&["kvm", "nixos-test"])
         ));
     }
 }
