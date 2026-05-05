@@ -99,6 +99,30 @@ pub(super) fn detect_hung_nodes(
     hung
 }
 
+/// §13e: derive a drv's effective feature set. FODs require `[fetcher]`
+/// regardless of `requiredSystemFeatures` (FODs SHOULD have empty
+/// declared features — `r[ctrl.crd.fetcher-no-features]` — but if a
+/// misconfigured drv declares `[kvm]` we override it: a kvm FOD would
+/// route to a kvm node with no fetcher airgap, breaking ADR-019).
+/// Single chokepoint mirroring the controller's `effective_features
+/// (spec)` so the spawn-decision query and the scheduler's intent
+/// features cannot diverge — divergence fails the I-181 ∅-guard CLOSED
+/// (no spawn, loud, not silent wrong-routing).
+///
+/// Every `required_features` consumer reachable from the spawn-intent
+/// path reads this. The only intentional bypass is
+/// `handle_inspect_build_dag`'s `required_features` field, which echoes
+/// the *declared* set for the operator (the derived set is a routing
+/// artifact, not what the tenant submitted).
+// r[impl sched.sla.fod-feature-derivation]
+fn effective_features(state: &crate::state::DerivationState) -> Vec<String> {
+    if state.is_fixed_output {
+        vec![rio_common::k8s::FETCHER_FEATURE.to_string()]
+    } else {
+        state.required_features.clone()
+    }
+}
+
 /// Request-side filter shared by the Ready and forecast passes of
 /// [`DagActor::compute_spawn_intents`]: kind (ADR-019 boundary),
 /// per-arch systems intersection (I-107/I-143), I-176/I-181 feature
@@ -118,8 +142,14 @@ fn passes_intent_filter(
         // §13c: same canonical predicate as the hwClass routing
         // (T2/T10/D10) so the worker filter and the scheduler's
         // routing agree — drift here would route a kvm intent to a
-        // metal cell whose worker then rejects it.
-        if !crate::sla::config::features_compatible(&state.required_features, pf) {
+        // metal cell whose worker then rejects it. §13e: reads the
+        // *effective* features (FOD ⟹ [fetcher]) so a fetcher-pool
+        // poll (`features: [fetcher]`) passes FODs through and a
+        // featureless builder pool rejects them — without this, B2's
+        // controller-side `effective_features(spec)` derives `[fetcher]`
+        // for the fetcher pool, the FOD's raw `required_features=[]`
+        // fails the ∅-guard, and FODs become unroutable.
+        if !crate::sla::config::features_compatible(&effective_features(state), pf) {
             return false;
         }
     }
@@ -417,7 +447,11 @@ impl DagActor {
                 node_selector: HashMap::new(),
                 kind: kind.into(),
                 system: state.system.clone(),
-                required_features: state.required_features.clone(),
+                // §13e: wire form carries the EFFECTIVE features so
+                // the controller's spawn-decision query and the
+                // scheduler agree on which Pool serves the intent
+                // (FOD ⟹ [fetcher] ⟹ fetcher Pool's effective set).
+                required_features: effective_features(state),
                 deadline_secs: intent.deadline_secs,
                 node_affinity: intent.node_affinity.clone(),
                 eta_seconds,
@@ -606,7 +640,7 @@ impl DagActor {
                 // residual.
                 let intent_lead = self
                     .sla_config
-                    .max_lead_for(&state.system, &state.required_features);
+                    .max_lead_for(&state.system, &effective_features(state));
                 if eta >= intent_lead {
                     if forecast_dropped_first(self, drv_hash, "lead_horizon") {
                         ::metrics::counter!(
@@ -1012,6 +1046,11 @@ impl DagActor {
             .attributed_tenant(&self.builds)
             .map(|u| u.to_string())
             .unwrap_or_default();
+        // §13e: bind the EFFECTIVE feature set once per call. Every
+        // routing read below (h_all partition, override_hash memo key,
+        // retain_hosting_cells, unroutable warn, DrvHints) uses this,
+        // not the raw declaration — see `effective_features`'s doc.
+        let feat = effective_features(state);
         let key = state.pname.as_deref().map(|p| ModelKey {
             pname: p.to_string(),
             system: state.system.clone(),
@@ -1026,7 +1065,7 @@ impl DagActor {
         let hints = solve::DrvHints {
             enable_parallel_building: state.enable_parallel_building,
             prefer_local_build: state.prefer_local_build,
-            required_features: state.required_features.clone(),
+            required_features: feat.clone(),
         };
 
         // r[impl sched.sla.hw-class.admissible-set]
@@ -1040,13 +1079,10 @@ impl DagActor {
         // was previously overlaid post-solve → affinity menu-checked at
         // fit-mem, request at forced-mem → permanently-Pending pod.)
         //
-        // FOD / serial drvs MUST stay hw-agnostic: `rio-fetcher`
-        // carries no hw-class labels — affinity over `{hw-class:X}`
-        // matches zero templates and the pod is permanently Pending.
-        // Serial drvs additionally need `intent_for`'s 1-core pin
-        // (`r[sched.sla.intent-from-solve]`); solve_full ignores
-        // `hints` and would multi-core a `enableParallelBuilding=false`
-        // build.
+        // Serial drvs MUST stay hw-agnostic: they need `intent_for`'s
+        // 1-core pin (`r[sched.sla.intent-from-solve]`); solve_full
+        // ignores `hints` and would multi-core a
+        // `enableParallelBuilding=false` build.
         //
         // r[impl sched.sla.hwclass.provides]
         // §13c: `required_features` drvs are NO LONGER hw-agnostic —
@@ -1057,6 +1093,14 @@ impl DagActor {
         // accordingly: a class providing `[kvm]` is excluded for
         // featureless intents (so metal doesn't absorb non-kvm), and a
         // class providing `[]` is excluded for kvm intents.
+        //
+        // §13e: FODs are no longer hw-agnostic either — `effective_
+        // features` projects `is_fixed_output` to `[fetcher]`, which
+        // partitions `h_all` to the `fetcher-*` classes via the same
+        // ∅-guard. They participate in solve_full like any featured
+        // intent (the cost model converges on the floor for the
+        // unsaturated CPU profile). The `rio-fetcher` static NodePool
+        // is no longer load-bearing for routing.
         //
         // §13d STRIKE-7 (bug_042, A8): ALSO arch-filter — `h_all`
         // feeds `solve_full`'s candidate set; a wrong-arch class gets a
@@ -1075,15 +1119,13 @@ impl DagActor {
             .hw_classes
             .iter()
             .filter(|(_, d)| {
-                crate::sla::config::features_compatible(
-                    &state.required_features,
-                    &d.provides_features,
-                ) && want_arch.is_none_or(|a| {
-                    d.labels
-                        .iter()
-                        .find(|l| l.key == crate::sla::config::ARCH_LABEL)
-                        .is_none_or(|l| l.value == a)
-                })
+                crate::sla::config::features_compatible(&feat, &d.provides_features)
+                    && want_arch.is_none_or(|a| {
+                        d.labels
+                            .iter()
+                            .find(|l| l.key == crate::sla::config::ARCH_LABEL)
+                            .is_none_or(|l| l.value == a)
+                    })
             })
             .map(|(h, _)| h.clone())
             .collect();
@@ -1114,14 +1156,13 @@ impl DagActor {
         // `.is_none()` is the "first edge" predicate (mirrors
         // `HashSet::insert`'s `true`-on-new).
         const MAX_KEY_FEATURES: usize = 64;
-        let key_features: Vec<String> = state
-            .required_features
+        let key_features: Vec<String> = feat
             .iter()
             .take(MAX_KEY_FEATURES)
             .map(|f| f.chars().filter(|c| c.is_ascii()).take(32).collect())
             .collect();
         if h_all.is_empty()
-            && !state.required_features.is_empty()
+            && !feat.is_empty()
             && self
                 .unroutable_features_warned
                 .lock()
@@ -1135,7 +1176,7 @@ impl DagActor {
             .increment(1);
             tracing::warn!(
                 %tenant,
-                features = ?state.required_features,
+                features = ?feat,
                 system = %state.system,
                 "no hwClass for this system provides required_features — \
                  intent unroutable; add a `provides_features` entry to an \
@@ -1147,8 +1188,8 @@ impl DagActor {
         // `inputs_gen` — `BestEffort.why`, ε_h's `_hw_cost_unknown` — so
         // cache-hits don't re-emit per poll. NOT a valid gate for emits
         // depending on read-time state (`ice.masked_cells()`) or for
-        // drvs that never enter the hw-aware path (FOD/featured/serial/
-        // cold-hw-table); those use `memo_entry`'s debounce fields /
+        // drvs that never enter the hw-aware path (serial/cold-hw-table/
+        // unroutable); those use `memo_entry`'s debounce fields /
         // `infeasible_static_fh` instead. `hw_emitted` tracks "hw-aware
         // arm already emitted" for the double-count suppress.
         let mut was_miss = false;
@@ -1159,11 +1200,15 @@ impl DagActor {
         // gate. Read for the debounce-prev values; written back via
         // `update_entry` on edge.
         let mut memo_entry: Option<(u64, u64, solve::MemoEntry)> = None;
+        // §13e D2: the pre-§13e `&& !state.is_fixed_output` gate is
+        // GONE — FODs route to fetcher cells via the `[fetcher]`
+        // partition of `h_all`, so they participate in solve_full like
+        // any featured intent. The cost model fits a flat elapsed/cores
+        // curve and converges on the floor.
         let full = (!hw.is_empty()
             && override_.as_ref().is_none_or(|o| !o.bypasses_solve_full())
             && hints.prefer_local_build != Some(true)
             && hints.enable_parallel_building != Some(false)
-            && !state.is_fixed_output
             && !h_all.is_empty())
         .then_some(())
         .and_then(|()| {
@@ -1188,8 +1233,11 @@ impl DagActor {
             // features gets a DIFFERENT h_all → different solve result.
             // Without this, a kvm and non-kvm drv sharing pname would
             // cache-hit on each other's (wrong-partition) memo.
+            // §13e: hashes the EFFECTIVE features so a FOD and a
+            // non-FOD sharing pname (degenerate but possible) memo
+            // separately.
             let mkh = solve::model_key_hash(&f.key);
-            let ovr = solve::override_hash(override_.as_ref(), &state.required_features);
+            let ovr = solve::override_hash(override_.as_ref(), &feat);
             let (entry, miss) = self.solve_cache.get_or_insert_with(
                 mkh,
                 ovr,
@@ -1461,7 +1509,7 @@ impl DagActor {
                 if let Some(reason) = infeasible
                     && !hw_emitted
                 {
-                    let ovr = solve::override_hash(override_.as_ref(), &state.required_features);
+                    let ovr = solve::override_hash(override_.as_ref(), &feat);
                     let seen = fit.as_ref().is_some_and(|f| {
                         self.solve_cache.infeasible_static_seen(
                             solve::model_key_hash(&f.key),
@@ -1504,20 +1552,24 @@ impl DagActor {
         let cores = cores.min(self.sla_ceilings.max_cores as u32).max(1);
         let mem = mem.max(floor.mem_bytes).min(self.sla_ceilings.max_mem);
         let disk = disk.max(floor.disk_bytes).min(self.sla_ceilings.max_disk);
-        // mb_023 (r31 A4): the `is_fixed_output ⟹ cells = []` invariant
-        // is enforced in two places — the `full` gate at :1040 (so FOD
-        // never enters `solve_full`, the `Some(memo)` arm is
-        // structurally unreachable) and the `bypass_cells` hoist (so
-        // FOD gets `[]` from the no-memo arm). This tripwire fires if a
-        // future producer arm bypasses both. `retain_hosting_cells` has
-        // no `is_fixed_output` axis (the chokepoint validates *cell
-        // hosting*, not *consumer kind*), so a producer leak here would
-        // pass the chokepoint and silently route FOD to a builder cell.
-        debug_assert!(
-            !state.is_fixed_output || cells.is_empty(),
-            "FOD must produce zero cells (mb_023): is_fixed_output=true \
-             but cells={cells:?} — a producer arm bypassed the FOD hoist \
-             in `bypass_cells` and the `!is_fixed_output` gate on `full`",
+        // §13e (was mb_023): `is_fixed_output ⟺ features ∋ fetcher` —
+        // the `effective_features` chokepoint projects the role
+        // discriminator onto the feature axis, so `retain_hosting_
+        // cells` validates cell hosting AND consumer kind through one
+        // predicate (the bidirectional ∅-guard: a `[fetcher]` intent
+        // only retains `provides ∋ fetcher` cells, and a featureless
+        // intent never sees them). A FOD whose effective features lack
+        // `fetcher`, or a non-FOD with `fetcher`, means a producer arm
+        // bypassed the chokepoint — that's the gap this tripwire
+        // closes (the pre-§13e mb_023 tripwire asserted `cells = []`
+        // for FODs; that invariant inverts now that FODs route).
+        debug_assert_eq!(
+            state.is_fixed_output,
+            feat.iter().any(|f| f == rio_common::k8s::FETCHER_FEATURE),
+            "FOD ⟺ features ∋ fetcher invariant broken (§13e, was mb_023): \
+             is_fixed_output={}, effective_features={feat:?} — a producer \
+             arm bypassed `effective_features`",
+            state.is_fixed_output,
         );
         // STRIKE-7 (r30 §13d): single post-finalize chokepoint. Both
         // arms above converge here with finalized `(cores, mem)` and a
@@ -1533,7 +1585,7 @@ impl DagActor {
             cells,
             &state.system,
             (cores, mem),
-            &state.required_features,
+            &feat,
             cost.catalog_ceilings(),
             cost.resolved_global(),
         );
@@ -1669,7 +1721,7 @@ impl DagActor {
     }
 
     /// Bypass-path (`full = None`, no memo) cells for the no-`solve_full`
-    /// arm of [`Self::solve_intent_for`]. Reached for FOD, serial,
+    /// arm of [`Self::solve_intent_for`]. Reached for serial,
     /// override-bypass (`--cores`/`--mem`/`--tier`), `prefer_local`,
     /// cold-start `fit=None`/`Probe`, and empty-`h_all` drvs.
     ///
@@ -1680,14 +1732,13 @@ impl DagActor {
     /// — both produce `[]` — so a `solve_intent_for`-level test cannot
     /// be red-first for the producer fix (r31 A1, §Kani-extract-predicate).
     ///
-    /// FOD ⟹ `[]` regardless of arm (mb_023): the `rio-fetcher`
-    /// NodePool is helm-managed, not cover-minted (`apply_intent_resources`
-    /// stamps `node_affinity` unconditionally; a builder cell on a
-    /// fetcher pod's affinity matches zero fetcher templates →
-    /// permanently Pending). Hoisted ABOVE the `match` so a future arm
-    /// inherits the guard — r30B0-A9 added the gate to the `None` arm
-    /// only, leaving the `Some(cap)` sibling open
-    /// (§Verifier-one-step-removed (c)).
+    /// §13e (was mb_023): the FOD hoist (`is_fixed_output ⟹ []`) is
+    /// GONE. FODs reach `bypass_cells` cold-start with
+    /// `effective_features = [fetcher]` and route to the `fetcher-*`
+    /// classes via `reference_hw_class_for_system` like any featured
+    /// intent. The static `rio-fetcher` NodePool is no longer
+    /// load-bearing; the controller mints `fetcher-*` NodeClaims from
+    /// the cells emitted here.
     pub(super) fn bypass_cells(
         &self,
         state: &crate::state::DerivationState,
@@ -1697,9 +1748,8 @@ impl DagActor {
         cost: &crate::sla::cost::CostTable,
         tenant: &str,
     ) -> Vec<crate::sla::config::Cell> {
-        if state.is_fixed_output {
-            return Vec::new();
-        }
+        // §13e: bind the EFFECTIVE feature set once. FOD ⟹ [fetcher].
+        let feat = effective_features(state);
         let mem = mem.max(state.sched.resource_floor.mem_bytes);
         // mb_053(a) / V-5: `--capacity` on the bypass path. The
         // `Some(memo)` arm filters `cells` to `cap` post-memo, but ANY
@@ -1727,7 +1777,7 @@ impl DagActor {
                 &state.system,
                 cores,
                 mem,
-                &state.required_features,
+                &feat,
                 cost.catalog_ceilings(),
                 cost.resolved_global(),
             ) {
@@ -1779,17 +1829,19 @@ impl DagActor {
             // nodeSelector deleted r33 bug_002) → no `build_sample` →
             // `fit` stays `None` → bootstrap deadlock.
             // Emit cells for every configured cap of the reference
-            // class so the controller minds the metal cell. Featureless
-            // intents stay `[]` (genuinely hw-agnostic; controller's
-            // `fallback_cell` arch-matches). FOD already returned
-            // above the match.
-            None if !state.required_features.is_empty() => self
+            // class so the controller mints the matching cell.
+            // Featureless intents stay `[]` (genuinely hw-agnostic;
+            // controller's `fallback_cell` arch-matches).
+            // §13e: `feat = [fetcher]` for FODs, so cold-start FODs
+            // land here and route to `fetcher-*` — the same
+            // chicken-egg fix as kvm-cold-start.
+            None if !feat.is_empty() => self
                 .sla_config
                 .reference_hw_class_for_system(
                     &state.system,
                     cores,
                     mem,
-                    &state.required_features,
+                    &feat,
                     cost.catalog_ceilings(),
                     cost.resolved_global(),
                 )

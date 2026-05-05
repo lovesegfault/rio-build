@@ -1810,6 +1810,15 @@ async fn contract_pinned_explore_covers_pool() {
     use crate::sla::config::{HwClassDef, NodeLabelMatch};
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_hw(db.pool.clone());
+    // §13e: drop the fixture's fetcher-* classes — this test counts
+    // ALL `cfg.hw_classes` (not the drv's `h_all`) for the `pool`
+    // precondition, and a featureless drv never routes to fetcher
+    // cells (∅-guard), so the count would diverge from the test's
+    // observed pin draws.
+    actor
+        .sla_config
+        .hw_classes
+        .retain(|h, _| !h.starts_with("fetcher-"));
     // 4th hw_class → |pool| = |H\{cheapest}| = 3. All hw factors = 1.0
     // so T(c)/factor = 2000 > p90=1200 at every cell → in_a = ∅ →
     // pool = H\{cheapest} (NOT H\A).
@@ -2378,6 +2387,13 @@ async fn contract_hw_cost_unknown_once_per_epoch() {
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     actor.sla_config.hw_explore_epsilon = 1.0;
+    // §13e: drop the fixture's fetcher-* classes — the precondition
+    // asserts on `cfg.hw_classes.len()` (not the drv's `h_all`); a
+    // featureless drv never routes to fetcher cells (∅-guard).
+    actor
+        .sla_config
+        .hw_classes
+        .retain(|h, _| !h.starts_with("fetcher-"));
     assert_eq!(actor.sla_tiers.len(), 1, "fixture: |tiers|=1");
     assert_eq!(actor.sla_config.hw_classes.len(), 3, "fixture: |h_all|=3");
     // intel-8 only: per-class max_mem=1GiB → make_fit("test-pkg")
@@ -2708,16 +2724,17 @@ async fn bypass_none_arm_featured_intent_emits_cells() {
     );
 }
 
-/// §13d STRIKE-7 (r30 A9 / mb_012 inverse-guard): a fixed-output drv
-/// carrying `required_features` (a degenerate but possible builder
-/// declaration) must NOT get hw_class_names from the bypass `None/None`
-/// arm. FOD intents land on the helm-managed `rio-fetcher` NodePool —
-/// the `nodeclaim_pool` reconciler is hard-filtered to
-/// `kind: Builder` and never consumes them. Emitting metal cells for an
-/// FOD would over-reserve builder capacity in FFD and mint builder
-/// NodeClaims for fetcher demand. Gate is `!state.is_fixed_output`.
+/// §13e (was §13d/r30 A9/mb_012): a fixed-output drv carrying
+/// declared `required_features` (a degenerate but possible builder
+/// declaration) routes to FETCHER cells, not the declared feature's
+/// class. `effective_features` overrides the declaration: a FOD
+/// declaring `[kvm]` would otherwise route to a kvm node with no
+/// fetcher airgap (`r[builder.netpol.airgap]`). Pre-§13e the
+/// `bypass_cells` FOD hoist returned `[]` and the static `rio-fetcher`
+/// NodePool's pod nodeSelector caught it; that hoist is GONE.
+// r[verify sched.sla.fod-feature-derivation]
 #[tokio::test]
-async fn bypass_none_arm_fod_with_features_emits_empty() {
+async fn bypass_none_arm_fod_with_features_routes_to_fetcher() {
     use crate::sla::config::{ARCH_LABEL, HwClassDef, NodeLabelMatch};
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_hw(db.pool.clone());
@@ -2751,10 +2768,24 @@ async fn bypass_none_arm_fod_with_features_emits_empty() {
         .find(|i| i.intent_id == "d-cold-fod")
         .expect("FOD intent emitted");
     assert!(
-        intent.hw_class_names.is_empty(),
-        "FOD intent must NOT emit hw_class_names — fetcher pool is \
-         helm-managed, not cover-minted; got {:?}",
+        intent
+            .hw_class_names
+            .iter()
+            .all(|h| h.starts_with("fetcher-")),
+        "FOD with declared [kvm] must route ONLY to fetcher cells \
+         (effective_features overrides the misconfig); got {:?}",
         intent.hw_class_names
+    );
+    assert!(
+        !intent.hw_class_names.is_empty(),
+        "FOD must route to fetcher cells, not stay hw-agnostic; got []",
+    );
+    // Wire form carries the EFFECTIVE features so the controller's
+    // spawn-decision query agrees on which Pool serves the intent.
+    assert_eq!(
+        intent.required_features,
+        vec!["fetcher".to_string()],
+        "wire SpawnIntent.required_features must be the derived set",
     );
 }
 
@@ -2824,25 +2855,19 @@ async fn unroutable_features_debounced_no_feature_label() {
     );
 }
 
-/// **mb_023 (r31 B0)** — bypass-path `Some(cap)` arm: FOD with a
-/// `--capacity` override MUST emit empty `(hw_class_names,
-/// node_affinity)`. r30B0-A9 added `!is_fixed_output` to the `None`
-/// arm only; the `Some(cap)` sibling — touched in the same commit to
-/// add `&state.required_features` — was left unguarded
-/// (§Verifier-one-step-removed (c) "sibling consumer of the changed
-/// one"). Pre-fix: an FOD whose pname matches a `--capacity` override
-/// emits `[(reference_h, cap)]` → `cells_to_selector_terms` writes
-/// builder-cell `nodeAffinity` → `apply_intent_resources` stamps it
-/// onto the Fetcher pod unconditionally → Fetcher nodes carry only
-/// `node-role: fetcher` → permanently Pending. `retain_hosting_cells`
-/// CANNOT catch this — its 4 axes (arch/features/size/cap) have no
-/// `is_fixed_output` parameter and the cell IS hosted.
+/// §13e (was mb_023/r31 B0) — bypass-path `Some(cap)` arm: FOD with a
+/// `--capacity` override routes to FETCHER cells (`effective_features
+/// = [fetcher]` ⟹ `reference_hw_class_for_system` finds `fetcher-*`).
+/// Pre-§13e the `bypass_cells` FOD hoist returned `[]` regardless of
+/// arm because the static `rio-fetcher` NodePool's pod nodeSelector
+/// caught FODs without per-intent affinity; that hoist is GONE.
 ///
-/// Also exercises the r31-A4 `debug_assert!` tripwire before
-/// `retain_hosting_cells`: a producer arm leaking FOD cells panics
-/// here before the wire-form assertion runs.
+/// Also exercises the §13e debug_assert tripwire (was r31-A4): the
+/// invariant inverted from `is_fixed_output ⟹ cells = []` to
+/// `is_fixed_output ⟺ effective_features ∋ fetcher`.
+// r[verify sched.sla.fod-feature-derivation]
 #[tokio::test]
-async fn contract_fod_capacity_override_emits_no_cells() {
+async fn contract_fod_capacity_override_routes_to_fetcher() {
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     // Fetcher drv (`is_fod=true`) whose pname matches a `--capacity`
@@ -2864,23 +2889,30 @@ async fn contract_fod_capacity_override_emits_no_cells() {
     let intent = actor.solve_intent_for(state, &hw, &cost, ig);
 
     assert!(
-        intent.hw_class_names.is_empty() && intent.node_affinity.is_empty(),
-        "FOD with `--capacity` override MUST emit empty cells (mb_023): \
-         the rio-fetcher NodePool carries no hwClass labels — builder-\
-         cell nodeAffinity ANDed with the Fetcher pod's nodeSelector is \
-         permanently Pending. Got hw_class_names={:?} node_affinity={:?}",
+        intent
+            .hw_class_names
+            .iter()
+            .all(|h| h.starts_with("fetcher-")),
+        "FOD with `--capacity` override must route ONLY to fetcher \
+         cells (§13e); got hw_class_names={:?} node_affinity={:?}",
         intent.hw_class_names,
         intent.node_affinity,
     );
+    assert!(
+        !intent.hw_class_names.is_empty(),
+        "FOD with `--capacity` override must route to fetcher cells, \
+         not stay hw-agnostic; got []",
+    );
 }
 
-/// **mb_023 (r31 B0)** — `bypass_cells` FOD hoist sits ABOVE the
-/// `match cap`, so BOTH arms (and any future arm) inherit the gate.
-/// Asserts on `bypass_cells` directly so a future arm regressing the
-/// hoist is caught at the producer, not just by the chokepoint or the
-/// A4 tripwire.
+/// §13e (was mb_023/r31 B0) — `bypass_cells` derives `effective_
+/// features` ABOVE the `match cap`, so BOTH arms (and any future arm)
+/// see `[fetcher]` for FODs. Asserts on `bypass_cells` directly so a
+/// future arm bypassing the chokepoint is caught at the producer, not
+/// just by the post-finalize chokepoint or the §13e tripwire.
+// r[verify sched.sla.fod-feature-derivation]
 #[tokio::test]
-async fn bypass_cells_fod_emits_no_cells_regardless_of_cap() {
+async fn bypass_cells_fod_routes_to_fetcher_regardless_of_cap() {
     use crate::sla::config::CapacityType;
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_hw(db.pool.clone());
@@ -2891,8 +2923,12 @@ async fn bypass_cells_fod_emits_no_cells_regardless_of_cap() {
     for cap in [None, Some(CapacityType::Od), Some(CapacityType::Spot)] {
         let cells = actor.bypass_cells(state, cap, 4, 4 << 30, &cost, "tenant-a");
         assert!(
-            cells.is_empty(),
-            "FOD MUST produce zero bypass cells (mb_023) for cap={cap:?}; got {cells:?}",
+            !cells.is_empty(),
+            "FOD must produce fetcher bypass cells (§13e) for cap={cap:?}; got []",
+        );
+        assert!(
+            cells.iter().all(|(h, _)| h.starts_with("fetcher-")),
+            "FOD bypass cells must be fetcher-* ONLY (§13e) for cap={cap:?}; got {cells:?}",
         );
     }
 }

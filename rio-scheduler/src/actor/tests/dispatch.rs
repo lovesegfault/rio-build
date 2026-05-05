@@ -1897,6 +1897,14 @@ async fn ice_step_doubles_across_heartbeat_at_multi_cell() {
 async fn epsilon_h_draws_outside_a() {
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_hw(db.pool.clone());
+    // §13e: drop the fixture's fetcher-* classes — this test asserts
+    // `in_a == cfg.hw_classes` (A=H under equal factors), but a
+    // featureless drv never routes to fetcher cells (∅-guard), so
+    // they would never appear in `in_a` even when admissible.
+    actor
+        .sla_config
+        .hw_classes
+        .retain(|h, _| !h.starts_with("fetcher-"));
     actor.test_inject_ready("d", Some("test-pkg"), "x86_64-linux", false);
 
     // Baseline at ε=0 (bare_actor_hw default) so the memo is the
@@ -2105,17 +2113,19 @@ async fn spawn_intent_node_affinity_from_solve_full() {
     );
 }
 
-/// `solve_full` gate predicates: each of FOD /
-/// `enableParallelBuilding=false` / `--tier` override falls through to
-/// the hw-agnostic `intent_for` path even with `hw_cost_source` set
-/// and a usable fit. `required_features=["kvm"]` with NO hwClass
-/// providing kvm ALSO falls through (h_all empties under the §13c
-/// partition → `!h_all.is_empty()` gate fails). `--mem`-only override
-/// does NOT gate it off — solve_full runs and the override overlays
-/// the result.
+/// `solve_full` gate predicates: each of `enableParallelBuilding=false`
+/// / `--tier` override falls through to the hw-agnostic `intent_for`
+/// path even with `hw_cost_source` set and a usable fit.
+/// `required_features=["kvm"]` with NO hwClass providing kvm ALSO falls
+/// through (h_all empties under the §13c partition →
+/// `!h_all.is_empty()` gate fails). `--mem`-only override does NOT gate
+/// it off — solve_full runs and the override overlays the result.
+/// §13e: FOD no longer falls through — `effective_features = [fetcher]`
+/// partitions `h_all` to `fetcher-*` and FOD participates in solve_full.
 // r[verify sched.sla.hw-class.admissible-set]
+// r[verify sched.sla.fod-feature-derivation]
 #[tokio::test]
-async fn solve_full_gate_skips_fod_kvm_serial_and_override() {
+async fn solve_full_gate_skips_kvm_serial_and_override() {
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     // Re-seed under pname "pkg" (bare_actor_hw seeds "test-pkg").
@@ -2125,7 +2135,7 @@ async fn solve_full_gate_skips_fod_kvm_serial_and_override() {
     // through solve_full so the negative assertions below are
     // meaningful.
     actor.test_inject_ready("base", Some("pkg"), "x86_64-linux", false);
-    // FOD with the same fitted pname.
+    // FOD with the same fitted pname — §13e: routes to fetcher-*.
     actor.test_inject_ready("fod", Some("pkg"), "x86_64-linux", true);
     // required_features non-empty (kvm pool).
     actor.test_inject_ready_with_features("kvm", Some("pkg"), "x86_64-linux", &["kvm"]);
@@ -2145,9 +2155,12 @@ async fn solve_full_gate_skips_fod_kvm_serial_and_override() {
         !by_id("base").node_affinity.is_empty(),
         "fixture sanity: baseline routes through solve_full"
     );
+    let fod = by_id("fod");
     assert!(
-        by_id("fod").node_affinity.is_empty(),
-        "FOD must not get hw-class affinity (fetcher NodePool has none)"
+        !fod.hw_class_names.is_empty()
+            && fod.hw_class_names.iter().all(|h| h.starts_with("fetcher-")),
+        "§13e: FOD routes through solve_full to fetcher-* cells; got {:?}",
+        fod.hw_class_names
     );
     assert!(
         by_id("kvm").node_affinity.is_empty(),
