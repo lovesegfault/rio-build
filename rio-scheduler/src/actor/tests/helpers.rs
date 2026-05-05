@@ -880,7 +880,7 @@ pub(crate) fn bare_actor_sla(pool: sqlx::PgPool) -> DagActor {
 /// admissible-set solve_full path is reachable. ε_h=0 so per-dispatch
 /// results are deterministic (set explicitly in ε_h tests).
 pub(crate) fn test_hw_sla_config() -> crate::sla::config::SlaConfig {
-    use crate::sla::config::{HwClassDef, NodeLabelMatch};
+    use crate::sla::config::{HwClassDef, NodeLabelMatch, NodeTaint};
     let mut cfg = test_sla_config();
     cfg.hw_explore_epsilon = 0.0;
     cfg.hw_classes.clear();
@@ -894,6 +894,38 @@ pub(crate) fn test_hw_sla_config() -> crate::sla::config::SlaConfig {
                 }],
                 max_cores: Some(cfg.max_cores.unwrap() as u32),
                 max_mem: Some(cfg.max_mem.unwrap()),
+                ..Default::default()
+            },
+        );
+    }
+    // §13e: fetcher hwClasses. FODs route here via
+    // `effective_features(state) = [fetcher]` — the bidirectional
+    // ∅-guard means featureless builders never see these (and FODs
+    // never see `intel-*`). Mirrors the helm `values.yaml` shape so
+    // the unit fixture and the deployed chart route identically.
+    for (h, arch) in [("fetcher-x86", "amd64"), ("fetcher-arm", "arm64")] {
+        cfg.hw_classes.insert(
+            h.into(),
+            HwClassDef {
+                labels: vec![
+                    NodeLabelMatch {
+                        key: rio_common::k8s::FETCHER_TAINT_KEY.into(),
+                        value: "true".into(),
+                    },
+                    NodeLabelMatch {
+                        key: crate::sla::config::ARCH_LABEL.into(),
+                        value: arch.into(),
+                    },
+                ],
+                node_class: "rio-default".into(),
+                max_cores: Some(cfg.max_cores.unwrap() as u32),
+                max_mem: Some(cfg.max_mem.unwrap()),
+                taints: vec![NodeTaint {
+                    key: rio_common::k8s::FETCHER_TAINT_KEY.into(),
+                    value: "true".into(),
+                    effect: "NoSchedule".into(),
+                }],
+                provides_features: vec![rio_common::k8s::FETCHER_FEATURE.into()],
                 ..Default::default()
             },
         );
