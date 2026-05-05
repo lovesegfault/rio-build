@@ -445,7 +445,7 @@ pub fn build_nodeclaim(
         .iter()
         .any(|f| f == rio_common::k8s::FETCHER_FEATURE);
     let (role_k, role_v) = if is_fetcher_cell {
-        ("rio.build/node-role", "fetcher")
+        (super::NODE_ROLE_LABEL.0, "fetcher")
     } else {
         super::NODE_ROLE_LABEL
     };
