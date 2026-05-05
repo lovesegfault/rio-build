@@ -1025,6 +1025,7 @@ fn apply_intent_resources(
         });
     }
 
+    // r[impl ctrl.pool.intent-tolerations]
     // §13d toleration axis (r31 bug_020): the intent's `node_affinity`
     // (stamped above) pins the pod to nodes carrying the hwClass
     // labels — incl. taint-paired keys like `rio.build/kvm`. The
@@ -1033,11 +1034,13 @@ fn apply_intent_resources(
     // `[sla.hw_classes.$h]`; this derives the matching tolerations
     // from the SAME map (`HwClassConfig.taints_for(h)`) so a future
     // tainted hwClass (gpu, secure-boot) routes its toleration
-    // automatically. (`pod::wants_metal` covers the pool-static path
-    // for `hw_class_names=[]` cold-start intents; this covers the
-    // intent-affinity path.) Append-dedup so the operator-set
-    // `rio.build/builder` toleration and the pool-static kvm
-    // toleration both survive without duplication.
+    // automatically. (`pod::wants_metal` covers the pool-static
+    // *toleration* path for `hw_class_names=[]` cold-start intents;
+    // this covers the intent-affinity path. There is no pool-static
+    // *nodeSelector* path — r33 bug_002 deleted it. Restrictive
+    // placement is `intent.node_affinity` only.) Append-dedup so the
+    // operator-set `rio.build/builder` toleration and the pool-static
+    // kvm toleration both survive without duplication.
     let mut intent_tols: Vec<Toleration> = Vec::new();
     for h in &i.hw_class_names {
         for t in hw.taints_for(h) {
@@ -1845,6 +1848,7 @@ mod tests {
     /// node (via `node_affinity`) but spawned on a `features=[]` Pool
     /// (`wants_metal=false`) sat permanently Pending — the affinity
     /// passes only metal nodes but TaintToleration rejects them.
+    // r[verify ctrl.pool.intent-tolerations]
     #[test]
     fn intent_hw_class_names_derive_taint_tolerations() {
         use rio_proto::types::{HwClassLabels, NodeTaint};
@@ -1874,11 +1878,20 @@ mod tests {
         // to metal because the scheduler routed `["nixos-test"]` there.
         let mut pool = test_pool("nt", ExecutorKind::Builder);
         pool.spec.features = vec!["nixos-test".into()];
-        let mut spec = pod::build_executor_pod_spec(
-            &pool,
-            &test_sched_addrs(),
-            &test_store_addrs(),
-            &HwClassConfig::default(), // empty → wants_metal falls back to no-kvm
+        // Pass the test `hw` directly (was `HwClassConfig::default()`,
+        // which masked the deleted pool-static nodeSelector). With the
+        // real config, `wants_metal` is false (`metal-x86` carries no
+        // `provides_features`) AND the structural invariant holds.
+        let mut spec =
+            pod::build_executor_pod_spec(&pool, &test_sched_addrs(), &test_store_addrs(), &hw);
+        // r33 bug_002 structural invariant: no pool-static kvm
+        // nodeSelector — the per-intent affinity is the ONLY restrictive
+        // mechanism.
+        assert!(
+            spec.node_selector
+                .as_ref()
+                .is_none_or(|ns| !ns.contains_key("rio.build/kvm")),
+            "structural invariant: no pool-static kvm nodeSelector"
         );
         // Pre-condition: no kvm toleration from the pool-static path.
         assert!(
@@ -1919,12 +1932,8 @@ mod tests {
         assert_eq!(n_kvm, 1, "toleration deduped on re-apply");
 
         // Untainted hwClass → no extra toleration.
-        let mut spec2 = pod::build_executor_pod_spec(
-            &pool,
-            &test_sched_addrs(),
-            &test_store_addrs(),
-            &HwClassConfig::default(),
-        );
+        let mut spec2 =
+            pod::build_executor_pod_spec(&pool, &test_sched_addrs(), &test_store_addrs(), &hw);
         let before = spec2.tolerations.clone();
         let i2 = SpawnIntent {
             intent_id: "abc".into(),

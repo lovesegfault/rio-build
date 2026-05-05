@@ -194,17 +194,30 @@ legitimately take 2h (LLVM, full NixOS closure from cold cache).
 Clusters with known-shorter builds set this lower so pool deletion
 doesn't stall on a stuck pod for 2h.
 
-r[ctrl.pool.kvm-device]
-When `PoolSpec.features` contains `"kvm"`, the controller MUST
-append `rio.build/kvm: "true"` to the pod's `nodeSelector` AND append a
-`rio.build/kvm=true:NoSchedule` toleration. containerd `base_runtime_spec`
-injects `/dev/kvm` into every pod's `/dev` (same mechanism as
-`r[sec.pod.fuse-device-plugin]`), but only EC2 `.metal` instance types
-expose host KVM (nested virt) — on non-metal the device node ENXIOs on
-open. The nodeSelector + toleration land kvm pods exclusively on the
-metal NodePool while non-kvm pods stay on the cheaper general builder
-NodePools. The nodeSelector + toleration are unconditional wrt
-`privileged` so privileged kvm pods still land on metal.
+r[ctrl.pool.kvm-device+2]
+When `PoolSpec.features` intersects the set of features that route to
+a kvm-tainted hw-class — `{"kvm"} ∪ ⋃_{h: kvm-tainted}
+provides_features(h)`, per `HwClassConfig::features_routing_to_taint`
+— the controller MUST append a toleration for every taint of every
+kvm-tainted hw-class (per `HwClassConfig::taints_routing_to`), with the
+literal `rio.build/kvm=true:NoSchedule` as the unloaded-config floor.
+The controller MUST NOT add a pool-static `rio.build/kvm` nodeSelector:
+the toleration is *permissive* (over-firing when the predicate
+mis-predicts is a harmless unused grant), but a nodeSelector is
+*restrictive* (over-firing removes nodes) and `pool.spec.features` is
+not a universal predicate over the Pool's intents — a feature shared by
+metal + non-metal hw-classes routes some intents to non-metal cells,
+where a pool-static nodeSelector would deadlock against the per-intent
+affinity. Restrictive metal placement is the per-intent `nodeAffinity`
+only (`r[ctrl.pool.node-affinity-from-intent]`); the toleration is the
+cold-start fallback for `hw_class_names=[]` intents whose per-intent
+toleration loop (`r[ctrl.pool.intent-tolerations]`) produces nothing.
+containerd `base_runtime_spec` injects `/dev/kvm` into every pod's
+`/dev` (same mechanism as `r[sec.pod.fuse-device-plugin]`), but only
+EC2 `.metal` instance types expose host KVM (nested virt) — on
+non-metal the device node ENXIOs on open. The toleration is
+unconditional wrt `privileged` so privileged kvm pods still tolerate
+the metal taint.
 
 ### Reconciler
 
@@ -284,6 +297,23 @@ requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms` to
 the proto terms (field-by-field copy). Empty `node_affinity` MUST leave
 `spec.affinity` unset so non-hw-targeted intents (Static-mode, FOD,
 feature-gated) bin-pack freely (I-090).
+
+r[ctrl.pool.intent-tolerations]
+For every `h ∈ SpawnIntent.hw_class_names` the pool reconciler MUST
+append a toleration for every taint in `[sla.hw_classes.$h].taints`
+(via `HwClassConfig::taints_for(h)`) — the same map
+`cover::build_nodeclaim` uses to taint Nodes — deduplicated against the
+pod's existing tolerations. The intent's `node_affinity`
+(`r[ctrl.pool.node-affinity-from-intent]`) pins the pod to nodes
+carrying the hw-class labels, including taint-paired keys; without the
+matching toleration the affinity-pinned pod is permanently Pending
+(`TaintToleration` rejects every node the affinity allows). Deriving
+tolerations from the same `[sla.hw_classes.$h]` source as the taint
+producer means a future tainted hw-class (`gpu`, `secure-boot`) routes
+its toleration automatically. This covers fitted intents
+(`hw_class_names ≠ []`); the pool-static toleration
+(`r[ctrl.pool.kvm-device+2]`) covers `hw_class_names=[]` cold-start
+intents.
 
 r[ctrl.pool.hw-bench-needed+2]
 The pool reconciler MUST stamp `rio.build/hw-bench-needed` on the pod

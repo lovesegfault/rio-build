@@ -90,12 +90,14 @@ idmap-mount rejection. Every pod on a configured node gets `/dev/fuse`;
 `withKvm` spec variant iff `test -c /dev/kvm` succeeds on the host and
 symlinks it to `/run/base-runtime-spec.json`, so non-`.metal` pods don't
 see a dead device node. No extended resource is requested and no device
-plugin runs. kvm pods route to `.metal` via the `rio.build/kvm`
-nodeSelector (`r[ctrl.pool.kvm-device]`). `privileged: true`
-remains an escape
-hatch for clusters whose containerd lacks `base_runtime_spec` device
-injection; it falls back to the hostPath mechanism and MUST NOT be the
-production default.
+plugin runs. kvm pods route to `.metal` via per-intent `nodeAffinity`
+(`r[ctrl.pool.node-affinity-from-intent]`) plus a pool-static
+`rio.build/kvm` toleration (`r[ctrl.pool.kvm-device+2]`) — never a
+pool-static nodeSelector, which would deadlock against the affinity on
+shared features. `privileged: true` remains an escape hatch for
+clusters whose containerd lacks `base_runtime_spec` device injection;
+it falls back to the hostPath mechanism and MUST NOT be the production
+default.
 
 r[sec.psa.control-plane-restricted]
 

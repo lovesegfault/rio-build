@@ -8,12 +8,14 @@
 # These are static config invariants no runtime chokepoint can catch:
 # `provides_features ∋ kvm` and `labels ∋ {rio.build/kvm: "true"}` are
 # sibling keys in the same TOML block with no structural coupling. The
-# pod's `nodeSelector{rio.build/kvm}` is satisfied IFF the metal class's
-# `labels` carries it; the kvm pod's toleration matches IFF the class's
-# `taints` carries it; the builder pod schedules onto the cover-minted
-# node IFF `poolDefaults.tolerations` ⊇ `cover.rs::builder_taint()`.
-# A typo in any one is a permanently-Pending pod with a `nodeSelector`
-# no Node satisfies.
+# per-intent nodeAffinity (`r[ctrl.pool.node-affinity-from-intent]`)
+# pins kvm pods to nodes carrying the metal class's `labels`; the kvm
+# pod's toleration matches IFF the class's `taints` carries it; the
+# builder pod schedules onto the cover-minted node IFF
+# `poolDefaults.tolerations` ⊇ `cover.rs::builder_taint()`. A typo in
+# any one is a permanently-Pending pod with an affinity no Node
+# satisfies. (r33 bug_002: the pool-static `nodeSelector{rio.build/kvm}`
+# was deleted — restrictive placement is per-intent affinity only.)
 
 # `poolDefaults.enabled=true` so the default `pools[]` list actually
 # renders Pool CRDs — they're gated off by default (the production
@@ -39,8 +41,9 @@ fail=0
 #    [kvm, nixos-test]`. Both are hardware gates (not `softFeatures`);
 #    metal is the only class hosting them. (bug_007)
 # 2. Every kvm-providing hwClass MUST carry `labels ∋ {rio.build/kvm:
-#    "true"}` (pod nodeSelector) AND `taints ∋ {key: rio.build/kvm,
-#    effect: NoSchedule}` (keeps non-kvm pods off). (mb_012 §1)
+#    "true"}` (per-intent nodeAffinity selector term) AND `taints ∋
+#    {key: rio.build/kvm, effect: NoSchedule}` (keeps non-kvm pods
+#    off). (mb_012 §1)
 #
 # awk: track which block (`labels = [` / `taints = [`) we are inside so
 # the same `key = "rio.build/kvm"` line can be classified as label vs
@@ -87,7 +90,7 @@ fi
 #    `cover.rs::builder_taint()` stamps this on every cover-minted Node;
 #    a Pool without the toleration permanently Pending. (mb_012 §2)
 # 4. Pools with `features ∋ kvm` get the `rio.build/kvm:NoSchedule`
-#    toleration auto-injected by the controller (`r[ctrl.pool.kvm-device]`,
+#    toleration auto-injected by the controller (`r[ctrl.pool.kvm-device+2]`,
 #    pod.rs `wants_metal`); NOT chart-asserted. r31 bug_022: the prior §4
 #    `Pool.spec.tolerations` check tested a non-load-bearing path —
 #    production `deploy.rs::POOLS_JSON` ships kvm Pools without it and
@@ -183,6 +186,90 @@ neg_seed_check=$(awk "$lead_time_seed_coverage_awk" "$neg_toml")
 if ! grep -q '^metal-noseed:od ' <<<"$neg_seed_check"; then
   echo "FAIL: §5 leadTimeSeed-coverage predicate is vacuous — a hwClass without a seed entry (metal-noseed:od) should be flagged. Got:" >&2
   echo "$neg_seed_check" >&2
+  fail=1
+fi
+
+# 6. §Permissive-restrictive asymmetry (r33 bug_002): the controller no
+#    longer applies a pool-static `nodeSelector{rio.build/kvm}` — the
+#    only restrictive metal placement is `intent.node_affinity`. That
+#    makes the deletion safe ONLY IF a feature provided by a kvm-tainted
+#    class is provided by NO untainted class. If both provide it, the
+#    scheduler may route an intent to the cheaper untainted cell and
+#    the pod is correct (no unwanted nodeSelector — the bug_002 fix).
+#    But the broadened `wants_metal` toleration over-fires for that
+#    Pool — harmless. The actually-dangerous shape (which the deleted
+#    nodeSelector used to silently guard against, by deadlocking) is an
+#    operator who EXPECTS metal placement for a shared feature: kvm
+#    gates `/dev/kvm` and only metal hosts have it, so a kvm Pool with
+#    a shared `nixos-test` could land an `nixos-test`-only intent on a
+#    non-metal node where the build crashloops on missing `/dev/kvm`.
+#    That's a config error, not a controller bug — surface it at
+#    chart-render. For each `f ∈ ⋃_{h: kvm-tainted} providesFeatures(h)`
+#    every hwClass with `f ∈ providesFeatures` MUST be kvm-tainted.
+#    Single-source the awk so the §6 positive and negative checks
+#    cannot drift (same lesson as §5's `lead_time_seed_coverage_awk`).
+metal_feature_exclusivity_awk='
+  /^\[sla\.hw_classes\./ {
+    h=$0; sub(/^\[sla\.hw_classes\."/,"",h); sub(/"\]$/,"",h)
+    cur=h; pf[cur]=""; tainted[cur]=0; sect=""
+  }
+  /^\[sla\./ && !/^\[sla\.hw_classes\./ { cur="" }
+  cur && /^provides_features = / { pf[cur]=$0; sub(/^provides_features = /,"",pf[cur]) }
+  cur && /^taints = \[/          { sect="taints" }
+  cur && /^labels = \[/          { sect="" }
+  cur && /^requirements = \[/    { sect="" }
+  cur && /^\]/                   { sect="" }
+  cur && sect=="taints" && /key = "rio\.build\/kvm"/ { tainted[cur]=1 }
+  END {
+    # Build the routable set: union of providesFeatures over tainted classes.
+    for (h in pf) {
+      if (!tainted[h]) continue
+      n = split(pf[h], a, /[",[:space:]]+/)
+      for (i = 1; i <= n; i++) {
+        f = a[i]; if (f == "" || f == "[" || f == "]") continue
+        routable[f] = 1
+      }
+    }
+    # Every untainted provider of a routable feature is the violation.
+    for (h in pf) {
+      if (tainted[h]) continue
+      n = split(pf[h], a, /[",[:space:]]+/)
+      for (i = 1; i <= n; i++) {
+        f = a[i]; if (f == "" || f == "[" || f == "]") continue
+        if (f in routable) printf "%s %s\n", f, h
+      }
+    }
+  }
+'
+exclusivity_check=$(awk "$metal_feature_exclusivity_awk" "$sched_toml")
+if [ -n "$exclusivity_check" ]; then
+  echo "FAIL (18-metal-feature-routing §6 metal-feature-exclusivity):" >&2
+  echo "$exclusivity_check" | while read -r f h; do
+    echo "  feature \"$f\" is provided by both a kvm-tainted class AND untainted \"$h\" — pool-static metal placement was deleted (r33 bug_002), so a kvm Pool with this feature lands intents on $h where /dev/kvm ENXIOs. Remove $f from one side." >&2
+  done
+  fail=1
+fi
+# Negative: §6 must FAIL when a routable feature is shared with an
+# untainted class. Add a non-metal class providing nixos-test (which
+# the chart's metal classes also provide).
+exclusivity_neg_render=$TMPDIR/feature-routing-shared.yaml
+helm template rio . \
+  --set karpenter.enabled=true \
+  --set karpenter.clusterName=ci \
+  --set karpenter.nodeRoleName=ci-role \
+  --set karpenter.amiTag=test \
+  --set global.image.tag=test \
+  --set postgresql.enabled=false \
+  --set poolDefaults.enabled=true \
+  --set-json 'scheduler.sla.hwClasses.shared-nontainted={"nodeClass":"rio-default","capacityTypes":["spot"],"providesFeatures":["nixos-test"],"requirements":[{"key":"kubernetes.io/arch","operator":"In","values":["amd64"]}]}' \
+  >"$exclusivity_neg_render"
+exclusivity_neg_toml=$TMPDIR/sched-shared.toml
+yq -N 'select(.kind=="ConfigMap" and .metadata.name=="rio-scheduler-config")
+       | .data."scheduler.toml"' "$exclusivity_neg_render" >"$exclusivity_neg_toml"
+exclusivity_neg=$(awk "$metal_feature_exclusivity_awk" "$exclusivity_neg_toml")
+if ! grep -q '^nixos-test shared-nontainted$' <<<"$exclusivity_neg"; then
+  echo "FAIL: §6 metal-feature-exclusivity predicate is vacuous — a routable feature shared with an untainted class (nixos-test/shared-nontainted) should be flagged. Got:" >&2
+  echo "$exclusivity_neg" >&2
   fail=1
 fi
 

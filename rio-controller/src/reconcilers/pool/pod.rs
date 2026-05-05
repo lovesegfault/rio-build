@@ -26,20 +26,23 @@ use crate::reconcilers::node_informer::HwClassConfig;
 
 /// Nix `system-features` string that signals "this builder runs
 /// qemu-kvm". When present in `spec.features`, the pod gets the
-/// [`KVM_NODE_LABEL`] nodeSelector + toleration so it lands on a §13b
-/// metal NodeClaim. `/dev/kvm` itself is injected by containerd
-/// `base_runtime_spec` on every node (`nix/base-runtime-spec.nix`);
-/// it ENXIOs on open() on non-`.metal` hosts, so the nodeSelector is
-/// what makes kvm builds work, not the device node's presence.
-/// `wants_metal` keeps it as the cold-start floor; the union of
-/// `provides_features` over kvm-tainted hw-classes (r31 bug_020)
-/// extends it.
+/// pool-static [`KVM_NODE_LABEL`] *toleration* (permissive — allows it
+/// onto a §13b metal NodeClaim). `/dev/kvm` itself is injected by
+/// containerd `base_runtime_spec` on every node
+/// (`nix/base-runtime-spec.nix`); it ENXIOs on open() on non-`.metal`
+/// hosts. *Restrictive* placement (binding the pod TO a metal node) is
+/// the per-intent `node_affinity` carrying the metal class's labels
+/// (`r[ctrl.pool.node-affinity-from-intent]`) — never a pool-static
+/// `nodeSelector` (r33 bug_002). `wants_metal` keeps the literal `kvm`
+/// as the cold-start floor; the union of `provides_features` over
+/// kvm-tainted hw-classes (r31 bug_020) extends it.
 pub(super) const KVM_FEATURE: &str = "kvm";
 
-/// Node label stamped on metal nodes (§13c: `scheduler.sla.hwClasses.
-/// metal-*.labels`, via `cover::build_nodeclaim`). Pairs with the
-/// same-key taint (`metal-*.taints`); `wants_metal` keys the
-/// `provides_features` union on this taint key.
+/// Node label/taint key stamped on metal nodes (§13c:
+/// `scheduler.sla.hwClasses.metal-*.{labels,taints}`, via
+/// `cover::build_nodeclaim`). `wants_metal` keys the
+/// `provides_features` union on this *taint* key; `taints_routing_to`
+/// keys the toleration set on it.
 const KVM_NODE_LABEL: &str = "rio.build/kvm";
 
 /// Pod label carrying the executor role. Scheduler routing, network
@@ -236,9 +239,21 @@ fn effective_tolerations(pool: &Pool) -> Option<Vec<Toleration>> {
 }
 
 /// Pool advertises a feature that routes drvs to a metal hw-class →
-/// pod needs the metal nodeSelector + toleration. FODs route by
+/// pod needs the metal *toleration* (permissive). FODs route by
 /// `is_fixed_output` alone, never by features, so fetchers never want
-/// metal. See `r[ctrl.pool.kvm-device]`.
+/// metal. See `r[ctrl.pool.kvm-device+2]`.
+///
+/// **§Permissive-restrictive asymmetry (r33 bug_002):** this predicate
+/// gates the toleration only, never a `nodeSelector`. A pool-static
+/// nodeSelector is a *restrictive* constraint that must be UNIVERSAL
+/// over the Pool's intents — but `wants_metal` keys on
+/// `pool.spec.features`, which is *existential* (some intent from this
+/// Pool may need metal). When a feature is shared by metal + non-metal
+/// classes, an intent legitimately routes to the non-metal cell and the
+/// pool-static nodeSelector contradicts the per-intent affinity →
+/// permanent Pending + `reap_idle` mint→reap loop. Restrictive
+/// placement is `intent.node_affinity` only — the same source `cover`
+/// reads, so they cannot drift.
 ///
 /// §Partition-single-source (r31 bug_020): routing keys on
 /// `features_compatible(required, provides_features)`, so the
@@ -249,7 +264,7 @@ fn effective_tolerations(pool: &Pool) -> Option<Vec<Toleration>> {
 /// no taint toleration, so its pods sat permanently Pending. The set
 /// is `{"kvm"} ∪ ⋃_{h: kvm-tainted} provides_features(h)`: the
 /// literal floor is fail-OPEN under a not-yet-loaded `hw_config`
-/// (otherwise every kvm Pool's pod would lose the metal nodeSelector
+/// (otherwise every kvm Pool's pod would lose the metal toleration
 /// in the cold-start window — strictly worse than the bug); the
 /// union extends it to whatever ELSE routes to a kvm-tainted class.
 fn wants_metal(pool: &Pool, hw: &HwClassConfig) -> bool {
@@ -579,35 +594,99 @@ pub fn build_executor_pod_spec(
             // Builder-only: fetchers run `builtin` (arch-agnostic) and
             // benefit from cheaper Graviton; rio-builder's startup arch
             // check is the safety net for builders that slip through.
+            //
+            // Why is THIS pool-static restrictive constraint safe and
+            // a kvm one was not (r33 bug_002)? Because
+            // `nix_systems_to_k8s_arch` returns `Some` iff ALL of
+            // `pool.spec.systems` map to one host arch — the constraint
+            // is UNIVERSAL over the Pool's intents (every drv this Pool
+            // services is for that arch). `pool.spec.features` is
+            // existential, not universal: an intent may need only one
+            // of the Pool's features and that one feature may route to
+            // a non-metal class. Don't generalize this pattern to a
+            // feature-gated nodeSelector — it's the §Permissive-
+            // restrictive asymmetry.
             if !fetcher && let Some(arch) = nix_systems_to_k8s_arch(&pool.spec.systems) {
                 ns.entry("kubernetes.io/arch".into()).or_insert(arch.into());
             }
-            // r[impl ctrl.pool.kvm-device]
-            // features route to a kvm-tainted hw-class → land on the
-            // metal NodePool. Operator-set value wins (or_insert) so a
-            // non-Karpenter cluster with a different kvm-capable label
-            // can override. Unconditional wrt privileged: even a
-            // privileged pod needs a host that actually has /dev/kvm.
-            if wants_metal(pool, hw_config) {
-                ns.entry(KVM_NODE_LABEL.into()).or_insert("true".into());
-            }
+            // No pool-static kvm nodeSelector (r33 bug_002). kvm
+            // placement is per-intent only: `intent.node_affinity`
+            // (`jobs.rs::apply_intent_resources`,
+            // `r[ctrl.pool.node-affinity-from-intent]`) carries the
+            // metal `def.labels` (incl. `rio.build/kvm`) for fitted
+            // intents; `fallback_cell` (`nodeclaim_pool/mod.rs`) is
+            // feature- AND ceiling-aware so the cold-start
+            // `hw_class_names=[]` case mints a metal cell when one can
+            // host the intent — and returns `None` (caller emits
+            // `no_hosting_class`) when none can. A pool-static
+            // `nodeSelector{rio.build/kvm}` gated on `pool.spec.features`
+            // is a SECOND opinion that contradicts the intent's affinity
+            // whenever a routable feature is shared by metal + non-metal
+            // hwClasses: scheduler routes to the cheaper non-metal cell,
+            // cover mints a non-metal node, the nodeSelector excludes it
+            // → permanent Pending + `reap_idle` mint→reap loop.
+            //
+            // Cost of the deletion: a featured `hw_class_names=[]`
+            // cold-start pod has no per-intent affinity to bind it to
+            // metal. Two triggers, both operator-attributable:
+            // (a) over-ask — `--cores=N` exceeds every per-class
+            //     ceiling, `reference_hw_class_for_system` and
+            //     `fallback_cell` both return `None` → no cell minted →
+            //     pod Pending, `no_hosting_class` warns;
+            // (b) feature with zero providing classes — `fallback_cell`'s
+            //     `features_compatible` filter returns `None` → same
+            //     `no_hosting_class` warn → no node minted → pod Pending.
+            // Without the deleted nodeSelector a stray non-metal node
+            // (minted for OTHER intents) could host the pod, which then
+            // fails on missing `/dev/kvm` → CrashLoopBackOff (not
+            // Pending). Same operator root cause, different `kubectl get
+            // pods` shape — both observable, both surfaced by
+            // `unroutable_features_total` / `no_hosting_class`. Strictly
+            // better than the silent mint→reap deadlock the nodeSelector
+            // caused.
             if ns.is_empty() { None } else { Some(ns) }
         },
         tolerations: {
             let mut t = effective_tolerations(pool).unwrap_or_default();
-            // r[impl ctrl.pool.kvm-device]
-            // Metal NodePool is tainted rio.build/kvm=true:NoSchedule so
-            // non-kvm builders don't bin-pack onto $$ metal. Append
-            // (don't replace) — the operator-set rio.build/builder
-            // toleration must survive.
+            // r[impl ctrl.pool.kvm-device+2]
+            // Metal NodeClaims are tainted (cover::build_nodeclaim reads
+            // `[sla.hw_classes.$h].taints`) so non-kvm builders don't
+            // bin-pack onto $$ metal. Permissive — over-firing when
+            // `wants_metal` mis-predicts is harmless (an unused
+            // toleration). Cold-start fallback for `hw_class_names=[]`
+            // intents whose per-intent toleration loop produced nothing.
+            // Derive the taint set from the SAME map `cover` reads
+            // (r33 bug_011); literal kvm floor is fail-OPEN under
+            // unloaded config (mirrors `wants_metal`'s literal `"kvm"`
+            // floor). Append-dedup so the operator-set
+            // `rio.build/builder` toleration survives.
             if wants_metal(pool, hw_config) {
-                t.push(Toleration {
+                let mut metal_tols: Vec<Toleration> = hw_config
+                    .taints_routing_to(KVM_NODE_LABEL)
+                    .into_iter()
+                    .map(|nt| Toleration {
+                        key: Some(nt.key),
+                        operator: Some("Equal".into()),
+                        value: Some(nt.value),
+                        effect: Some(nt.effect),
+                        ..Default::default()
+                    })
+                    .collect();
+                let floor = Toleration {
                     key: Some(KVM_NODE_LABEL.into()),
                     operator: Some("Equal".into()),
                     value: Some("true".into()),
                     effect: Some("NoSchedule".into()),
                     ..Default::default()
-                });
+                };
+                if !metal_tols.contains(&floor) {
+                    metal_tols.push(floor);
+                }
+                for tol in metal_tols {
+                    if !t.contains(&tol) {
+                        t.push(tol);
+                    }
+                }
             }
             if t.is_empty() { None } else { Some(t) }
         },
@@ -814,9 +893,12 @@ fn build_executor_container(
 
         // /dev/{fuse,kvm} arrive via containerd base_runtime_spec on
         // every pod (nix/base-runtime-spec.nix) — no extended-resource
-        // request. kvm placement is the nodeSelector + toleration above
-        // (r[ctrl.pool.kvm-device]). resources are stamped per-intent
-        // by `jobs::apply_intent_resources` AFTER this builder runs.
+        // request. kvm placement is the per-intent nodeAffinity
+        // (r[ctrl.pool.node-affinity-from-intent]) plus the pool-static
+        // toleration above (r[ctrl.pool.kvm-device+2]) — never a
+        // pool-static nodeSelector (r33 bug_002). resources are stamped
+        // per-intent by `jobs::apply_intent_resources` AFTER this
+        // builder runs.
         resources: None,
 
         ports: Some(vec![
@@ -1131,5 +1213,154 @@ mod tests {
         // contract.
         p.spec.features = s(&["nixos-test"]);
         assert!(!wants_metal(&p, &hw));
+    }
+
+    /// §Permissive-restrictive asymmetry (r33 bug_002): when a feature
+    /// is shared by metal AND non-metal hwClasses, the per-intent
+    /// affinity may legitimately route to the non-metal cell.
+    /// A pool-static `nodeSelector{rio.build/kvm}` would CONTRADICT
+    /// that affinity → permanent Pending + `reap_idle` mint→reap loop.
+    /// Restrictive constraints must derive from `intent.hw_class_names`
+    /// (the same source `cover` reads), never from `pool.spec.features`.
+    // r[verify ctrl.pool.kvm-device+2]
+    #[test]
+    fn wants_metal_does_not_force_node_selector_on_shared_feature() {
+        use rio_proto::types::{HwClassLabels, NodeTaint};
+        let kvm_taint = || NodeTaint {
+            key: KVM_NODE_LABEL.into(),
+            value: "true".into(),
+            effect: "NoSchedule".into(),
+        };
+        let hw = HwClassConfig::default();
+        hw.set(
+            [
+                (
+                    "metal-x86".into(),
+                    HwClassLabels {
+                        taints: vec![kvm_taint()],
+                        provides_features: s(&["kvm", "nixos-test"]),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    // The shared-feature case: a NON-metal class also
+                    // provides nixos-test. The scheduler may route an
+                    // intent here → cover mints a non-metal node.
+                    "mid-ebs-x86".into(),
+                    HwClassLabels {
+                        provides_features: s(&["nixos-test"]),
+                        ..Default::default()
+                    },
+                ),
+            ]
+            .into(),
+            (192, 1536 << 30),
+        );
+
+        let mut p = crate::fixtures::test_pool("nt", ExecutorKind::Builder);
+        p.spec.features = s(&["nixos-test"]);
+        assert!(wants_metal(&p, &hw), "predicate fires (permissive arm)");
+
+        let spec = build_executor_pod_spec(
+            &p,
+            &crate::fixtures::test_sched_addrs(),
+            &crate::fixtures::test_store_addrs(),
+            &hw,
+        );
+        // Structural invariant: no pool-static restrictive nodeSelector.
+        // The per-intent affinity is the ONLY restrictive mechanism.
+        assert!(
+            spec.node_selector
+                .as_ref()
+                .is_none_or(|ns| !ns.contains_key(KVM_NODE_LABEL)),
+            "pool-static path must NOT force a kvm nodeSelector — it \
+             contradicts the per-intent affinity on shared features"
+        );
+        // The permissive arm (toleration) still fires.
+        assert!(
+            spec.tolerations
+                .as_ref()
+                .is_some_and(|t| t.iter().any(|t| t.key.as_deref() == Some(KVM_NODE_LABEL))),
+            "pool-static toleration still appended (permissive, safe)"
+        );
+    }
+
+    /// §Partition-single-source (r33 bug_011): the pool-static
+    /// toleration set derives from `taints_routing_to(KVM_NODE_LABEL)`
+    /// — the same `[sla.hw_classes.$h].taints` map `cover` reads — so
+    /// a metal class growing a second taint (e.g. `rio.build/secure-boot`)
+    /// gets its toleration automatically. Pre-fix the pool-static arm
+    /// hardcoded `kvm=true:NoSchedule`, leaving the cold-start
+    /// `hw_class_names=[]` pod unable to tolerate the second taint →
+    /// permanently Pending.
+    // r[verify ctrl.pool.kvm-device+2]
+    #[test]
+    fn wants_metal_toleration_derives_from_taints_routing_to() {
+        use rio_proto::types::{HwClassLabels, NodeTaint};
+        let hw = HwClassConfig::default();
+        hw.set(
+            [(
+                "metal-x86".into(),
+                HwClassLabels {
+                    taints: vec![
+                        NodeTaint {
+                            key: KVM_NODE_LABEL.into(),
+                            value: "true".into(),
+                            effect: "NoSchedule".into(),
+                        },
+                        NodeTaint {
+                            key: "rio.build/secure-boot".into(),
+                            value: "true".into(),
+                            effect: "NoSchedule".into(),
+                        },
+                    ],
+                    provides_features: s(&["kvm"]),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            (192, 1536 << 30),
+        );
+
+        let mut p = crate::fixtures::test_pool("k", ExecutorKind::Builder);
+        p.spec.features = s(&["kvm"]);
+        let spec = build_executor_pod_spec(
+            &p,
+            &crate::fixtures::test_sched_addrs(),
+            &crate::fixtures::test_store_addrs(),
+            &hw,
+        );
+        let tols = spec.tolerations.as_ref().expect("tolerations set");
+        let has = |k: &str| tols.iter().any(|t| t.key.as_deref() == Some(k));
+        assert!(has(KVM_NODE_LABEL), "kvm toleration");
+        assert!(
+            has("rio.build/secure-boot"),
+            "second taint's toleration derived from taints_routing_to"
+        );
+    }
+
+    /// Invariant: with `HwClassConfig::default()` (config not loaded)
+    /// and `features=["kvm"]`, the literal `kvm=true:NoSchedule`
+    /// toleration floor survives. Fail-OPEN — same contract `wants_metal`
+    /// keeps for the predicate.
+    // r[verify ctrl.pool.kvm-device+2]
+    #[test]
+    fn wants_metal_toleration_floor_when_hw_unloaded() {
+        let hw = HwClassConfig::default();
+        let mut p = crate::fixtures::test_pool("k", ExecutorKind::Builder);
+        p.spec.features = s(&["kvm"]);
+        let spec = build_executor_pod_spec(
+            &p,
+            &crate::fixtures::test_sched_addrs(),
+            &crate::fixtures::test_store_addrs(),
+            &hw,
+        );
+        let tols = spec.tolerations.as_ref().expect("tolerations set");
+        let kvm = tols
+            .iter()
+            .find(|t| t.key.as_deref() == Some(KVM_NODE_LABEL))
+            .expect("literal kvm toleration floor under unloaded config");
+        assert_eq!(kvm.value.as_deref(), Some("true"));
+        assert_eq!(kvm.effect.as_deref(), Some("NoSchedule"));
     }
 }

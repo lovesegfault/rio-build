@@ -20,9 +20,9 @@ use crate::{git, helm, tofu, ui};
 
 /// `pools[]` (helm list — replaced wholesale, hence one const).
 /// Per-arch general builder pools, per-arch kvm builder pools (NixOS
-/// VM tests; the controller derives the metal nodeSelector +
-/// `rio.build/kvm` toleration from `features:[kvm]` —
-/// `r[ctrl.pool.kvm-device]`), and per-arch fetcher pools.
+/// VM tests; the controller derives the `rio.build/kvm` toleration
+/// from `features:[kvm]`; metal placement is per-intent `nodeAffinity`
+/// — `r[ctrl.pool.kvm-device+2]`), and per-arch fetcher pools.
 ///
 /// Per-pod (cores, mem, disk) come from the scheduler's per-drv
 /// SpawnIntent (ADR-023) — there is NO per-pool resources knob.

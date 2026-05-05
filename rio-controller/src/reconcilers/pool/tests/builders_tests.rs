@@ -289,30 +289,43 @@ fn job_pod_no_fuse_hostpath_when_unprivileged() {
     );
 }
 
-// r[verify ctrl.pool.kvm-device]
+// r[verify ctrl.pool.kvm-device+2]
 #[test]
-fn job_pod_kvm_feature_adds_nodeselector_toleration() {
+fn job_pod_kvm_feature_adds_toleration() {
     // Fixture wp has features=["kvm"]. The controller derives the
-    // metal-NodePool scheduling constraints from that one feature
-    // string — operator doesn't set them explicitly (mirrors I-098's
-    // arch derivation from systems). /dev/kvm itself arrives via
-    // containerd base_runtime_spec on every pod; the nodeSelector is
-    // what makes it functional (only .metal hosts have working KVM).
+    // permissive metal toleration from that one feature string —
+    // operator doesn't set it explicitly (mirrors I-098's arch
+    // derivation from systems). /dev/kvm itself arrives via containerd
+    // base_runtime_spec on every pod; the per-intent nodeAffinity
+    // (`r[ctrl.pool.node-affinity-from-intent]`) is what places the
+    // pod on a host with working KVM.
     let wp = test_wp();
     assert!(wp.spec.features.iter().any(|f| f == "kvm"), "precondition");
     let pod = test_pod_spec(&wp);
 
-    // rio.build/kvm=true nodeSelector — lands on the metal NodePool.
-    // The I-098 arch selector survives alongside.
-    let ns = pod.node_selector.as_ref().expect("nodeSelector set");
-    assert_eq!(ns.get("rio.build/kvm").map(String::as_str), Some("true"));
+    // r33 bug_002 structural invariant: the pool-static path is
+    // permissive-only. A pool-static `nodeSelector{rio.build/kvm}`
+    // contradicts the per-intent affinity whenever a feature is shared
+    // by metal + non-metal hwClasses → mint→reap deadlock.
+    assert!(
+        pod.node_selector
+            .as_ref()
+            .is_none_or(|ns| !ns.contains_key("rio.build/kvm")),
+        "pool-static kvm nodeSelector deleted — restrictive placement \
+         derives from intent.hw_class_names only"
+    );
+    // The I-098 arch selector survives — that one is universal over the
+    // pool's intents (Pool is single-arch by construction).
     assert_eq!(
-        ns.get("kubernetes.io/arch").map(String::as_str),
+        pod.node_selector
+            .as_ref()
+            .and_then(|ns| ns.get("kubernetes.io/arch"))
+            .map(String::as_str),
         Some("amd64"),
         "arch selector preserved"
     );
 
-    // rio.build/kvm toleration appended (metal NodePool is tainted).
+    // rio.build/kvm toleration appended (metal NodeClaim is tainted).
     let tols = pod.tolerations.as_ref().expect("tolerations set");
     let kvm_tol = tols
         .iter()
@@ -322,13 +335,14 @@ fn job_pod_kvm_feature_adds_nodeselector_toleration() {
     assert_eq!(kvm_tol.effect.as_deref(), Some("NoSchedule"));
 }
 
-// r[verify ctrl.pool.kvm-device]
+// r[verify ctrl.pool.kvm-device+2]
 #[test]
 fn job_pod_no_kvm_feature_no_kvm_wiring() {
     // The CONDITIONAL is the load-bearing part: a non-kvm pool must
-    // NOT select rio.build/kvm (would Pending forever — only the
-    // metal NodePool carries that label) and must NOT tolerate the
-    // metal taint (would bin-pack cheap builds onto $$ metal).
+    // NOT tolerate the metal taint (would bin-pack cheap builds onto
+    // $$ metal). The nodeSelector absence is now unconditional (r33
+    // bug_002), but assert it here too — a regression that re-adds it
+    // for the *non*-kvm case would be the worst form of the bug.
     let mut wp = test_wp();
     wp.spec.features = vec!["big-parallel".into()];
     let pod = test_pod_spec(&wp);
@@ -347,23 +361,29 @@ fn job_pod_no_kvm_feature_no_kvm_wiring() {
     );
 }
 
-// r[verify ctrl.pool.kvm-device]
+// r[verify ctrl.pool.kvm-device+2]
 #[test]
-fn job_pod_kvm_privileged_keeps_selector() {
+fn job_pod_kvm_privileged_keeps_toleration() {
     // Privileged escape hatch still needs a host that HAS working
-    // /dev/kvm — nodeSelector + toleration are unconditional wrt
-    // privileged.
+    // /dev/kvm — the toleration (and the per-intent affinity) are
+    // unconditional wrt privileged. Pre-r33, this asserted the deleted
+    // pool-static nodeSelector; the toleration is what's left of the
+    // pool-static path.
     let mut wp = test_wp();
     wp.spec.privileged = Some(true);
     let pod = test_pod_spec(&wp);
 
-    assert_eq!(
+    assert!(
+        pod.tolerations
+            .as_ref()
+            .is_some_and(|t| t.iter().any(|t| t.key.as_deref() == Some("rio.build/kvm"))),
+        "privileged still gets the metal toleration"
+    );
+    assert!(
         pod.node_selector
             .as_ref()
-            .and_then(|ns| ns.get("rio.build/kvm"))
-            .map(String::as_str),
-        Some("true"),
-        "privileged still needs metal placement"
+            .is_none_or(|ns| !ns.contains_key("rio.build/kvm")),
+        "no pool-static kvm nodeSelector regardless of privileged"
     );
 }
 

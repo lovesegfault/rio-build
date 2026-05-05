@@ -386,6 +386,38 @@ overrides (a hand-written `--capacity`/`--cores` that targets a
 class no Pool covers); Pool-coverage gaps ARE catchable because
 both halves read the apiserver.
 
+## Permissive-restrictive asymmetry
+
+When a single predicate gates BOTH a *restrictive* constraint
+(nodeSelector, nodeAffinity, ResourceQuota — narrows the candidate
+set) AND a *permissive* constraint (toleration, PriorityClass
+preemption — widens the candidate set), they have OPPOSITE failure
+modes under predicate drift. Over-firing a permissive constraint is
+harmless (an unused grant). Over-firing a restrictive constraint
+REMOVES candidates and can deadlock against a sibling restrictive
+constraint derived from a different predicate.
+
+(Caveat: this asymmetry holds for *placement* constraints, where the
+unit of failure is "no candidate left." For *authorization*
+constraints — RBAC allow rules, capability grants, network egress —
+the polarity inverts: over-firing the permissive side IS the bug
+(privilege escalation). Don't generalize this section to auth.)
+
+Broadening a shared predicate to fix the permissive arm's under-fire
+(the r31 bug_020 close) silently introduces the restrictive arm's
+over-fire (r33 bug_002). The closes are NOT symmetric: a restrictive
+constraint must be UNIVERSAL over the population it applies to (every
+workload from this Pool routes to a node satisfying the constraint),
+while a permissive one need only be EXISTENTIAL (some workload from
+this Pool may route to a node requiring the toleration).
+
+The structural test: when a control loop adds two constraints from one
+predicate, ask "if this predicate is wrong, what happens to each
+constraint?" If one removes candidates that another constraint already
+requires, split the predicates — or derive the restrictive one from
+the same data the provisioner reads (the
+§Placement-supersets-provisioning chokepoint).
+
 ## Partition-single-source
 
 A "list X mirrors list Y so they partition the space" comment over two

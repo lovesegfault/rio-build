@@ -232,6 +232,32 @@ impl HwClassConfig {
             .collect()
     }
 
+    /// Dedup'd union of `taints` over hw-classes carrying a taint with
+    /// key `taint_key` — the dual of [`Self::features_routing_to_taint`].
+    /// §Partition-single-source (r33 bug_011): the pool-static
+    /// toleration consumer (`pool/pod.rs`) reads this so a future second
+    /// taint on a metal class (e.g. `rio.build/secure-boot`) routes its
+    /// toleration automatically — same `[sla.hw_classes.$h].taints` map
+    /// `cover::build_nodeclaim` reads to taint Nodes. Unknown
+    /// `taint_key` / config not yet loaded → empty (caller falls back
+    /// to the literal floor, mirroring `wants_metal`'s fail-OPEN).
+    pub fn taints_routing_to(&self, taint_key: &str) -> Vec<rio_proto::types::NodeTaint> {
+        let mut out: Vec<rio_proto::types::NodeTaint> = Vec::new();
+        for d in self
+            .classes
+            .read()
+            .iter()
+            .filter(|d| d.taints.iter().any(|t| t.key == taint_key))
+        {
+            for t in &d.taints {
+                if !out.contains(t) {
+                    out.push(t.clone());
+                }
+            }
+        }
+        out
+    }
+
     /// `[sla.hw_classes.$h].max_fleet_cores` for `h`. §13c
     /// `cover_deficit` clamps this class's per-tick mint at
     /// `min(global_remaining, cap − live_h − created_h)`. Unknown `h`
