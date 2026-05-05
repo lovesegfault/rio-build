@@ -500,6 +500,26 @@ impl DagActor {
             ));
         }
 
+        // r34 bug_018 STRIKE-3: debounce gate for
+        // `forecast_dropped_total` — `true` once per `(drv_hash,
+        // reason)` edge per LRU residency. The forecast loop runs per
+        // `compute_spawn_intents` call (~3 callers per scheduler
+        // tick); without this gate the counter reads
+        // `(poll_rate)×(stuck drvs)` not `(drop events)`, violating
+        // the `ONCE_PER_MISS` contract. Same `LruCache` shape as
+        // `unroutable_features_warned` / `cap_mismatch_warned`. The
+        // `counter!` stays at each emit site (not folded into the
+        // closure) so the `"reason" => "<literal>"` pairs remain
+        // statically scannable by `labeled_metric_values_have_emit_
+        // sites`.
+        let forecast_dropped_first = |actor: &Self, drv_hash: &str, reason: &'static str| -> bool {
+            actor
+                .forecast_dropped_warned
+                .lock()
+                .put((drv_hash.to_owned(), reason), ())
+                .is_none()
+        };
+
         // r[impl sched.sla.forecast.one-layer]
         // ── §13b forecast frontier ────────────────────────────────
         // One DAG layer: a Queued drv whose every incomplete dep is
@@ -510,11 +530,15 @@ impl DagActor {
         // compounds σ_resid per hop, and trivial-drv chains would fan
         // out to thousands of intents (ADR-023 §Forecast memo).
         //
-        // §13a: `lead_time` is the operator-supplied
-        // `lead_time_seed[h,cap]` — the controller-side DDSketch (B7)
-        // isn't running yet (ADR L675). Empty seed map ⇒ max_lead=0 ⇒
-        // pass disabled (every eta ≥ 0 fails the gate; controller
-        // filters on `ready` regardless).
+        // §13a/§13b: `lead_time` is the operator-supplied
+        // `lead_time_seed[h,cap]`. The controller-side DDSketch
+        // (`CellSketches`, §13b) IS running, but
+        // `AckSpawnedIntentsRequest` has no per-cell `lead_time`
+        // return channel — the scheduler stays on the static seed
+        // (`max_lead_for`'s "Seed-based approximation" caveat). Empty
+        // seed map ⇒ max_lead=0 ⇒ pass disabled (every eta ≥ 0 fails
+        // the gate; controller filters on `ready` regardless).
+        // (r34 merged_bug_006)
         //
         // r33 bug_007 §Granularity-coupling: `max_lead` is the GLOBAL
         // max — it gates the whole pass on/off. The per-intent
@@ -584,23 +608,29 @@ impl DagActor {
                     .sla_config
                     .max_lead_for(&state.system, &state.required_features);
                 if eta >= intent_lead {
-                    ::metrics::counter!(
-                        "rio_scheduler_sla_forecast_dropped_total",
-                        "reason" => "lead_horizon",
-                    )
-                    .increment(1);
+                    if forecast_dropped_first(self, drv_hash, "lead_horizon") {
+                        ::metrics::counter!(
+                            "rio_scheduler_sla_forecast_dropped_total",
+                            "reason" => "lead_horizon",
+                        )
+                        .increment(1);
+                    }
                     continue;
                 }
                 let intent = self.solve_intent_for(state, &hw, &cost, inputs_gen);
-                // Post-solve exact gate: mirror of the controller's
-                // `a_open` per-cell filter (`eta < lead_time(c)`),
-                // re-stated scheduler-side over the SOLVED
-                // `hw_class_names`. The pre-solve gate used the
-                // arch+features-routable superset; this is the cells
-                // `solve_intent_for` actually emitted (post tier walk,
-                // post ceiling). `hw_class_names = []` (hw-agnostic /
-                // featureless probe path) skips the gate — there is no
-                // per-cell lead to check; the controller's `a_open`
+                // Post-solve exact gate: seed-based approximation of
+                // the controller's `a_open` per-cell filter
+                // (`eta < lead_time(c)`), re-stated scheduler-side
+                // over the SOLVED `hw_class_names` (r34 merged_bug_006:
+                // the controller reads its learned per-cell DDSketch
+                // quantile, which has no return channel here — see
+                // [`crate::sla::config::SlaConfig::max_lead_for`]).
+                // The pre-solve gate used the arch+features-routable
+                // superset; this is the cells `solve_intent_for`
+                // actually emitted (post tier walk, post ceiling).
+                // `hw_class_names = []` (hw-agnostic / featureless
+                // probe path) skips the gate — there is no per-cell
+                // lead to check; the controller's `a_open`
                 // short-circuits to `fallback_cell`.
                 if !intent.hw_class_names.is_empty() {
                     let cell_lead = self
@@ -611,11 +641,13 @@ impl DagActor {
                         .map(|(_, &v)| v)
                         .fold(0.0, f64::max);
                     if eta >= cell_lead {
-                        ::metrics::counter!(
-                            "rio_scheduler_sla_forecast_dropped_total",
-                            "reason" => "lead_horizon",
-                        )
-                        .increment(1);
+                        if forecast_dropped_first(self, drv_hash, "lead_horizon") {
+                            ::metrics::counter!(
+                                "rio_scheduler_sla_forecast_dropped_total",
+                                "reason" => "lead_horizon",
+                            )
+                            .increment(1);
+                        }
                         continue;
                     }
                 }
@@ -647,11 +679,13 @@ impl DagActor {
                     .entry(state.attributed_tenant(&self.builds))
                     .or_insert(cap);
                 if i64::from(intent.cores) > *budget {
-                    ::metrics::counter!(
-                        "rio_scheduler_sla_forecast_dropped_total",
-                        "reason" => "tenant_budget",
-                    )
-                    .increment(1);
+                    if forecast_dropped_first(self, drv_hash, "tenant_budget") {
+                        ::metrics::counter!(
+                            "rio_scheduler_sla_forecast_dropped_total",
+                            "reason" => "tenant_budget",
+                        )
+                        .increment(1);
+                    }
                     continue;
                 }
                 *budget -= i64::from(intent.cores);

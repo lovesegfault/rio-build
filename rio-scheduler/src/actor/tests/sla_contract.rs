@@ -42,7 +42,9 @@ use std::collections::BTreeMap;
 /// hw-agnostic path is `fit_content_hash`-anchored per R5B3;
 /// `_unroutable_features` is `unroutable_features_warned`-gated per
 /// mb_031 (set on `DagActor`, keyed `(tenant, required_features)` —
-/// fires before `was_miss` is even declared). Each gate bounds the
+/// fires before `was_miss` is even declared); `_forecast_dropped` is
+/// `forecast_dropped_warned`-gated per r34 bug_018 (keyed
+/// `(drv_hash, reason)` on `DagActor`). Each gate bounds the
 /// counter to ≤1 per `model_key` per edge — the (1a) `≤ |Ready drvs|`
 /// assertion holds for all of them.
 const ONCE_PER_MISS: &[&str] = &[
@@ -50,6 +52,7 @@ const ONCE_PER_MISS: &[&str] = &[
     "rio_scheduler_sla_hw_ladder_exhausted_total",
     "rio_scheduler_sla_hw_cost_unknown_total",
     "rio_scheduler_unroutable_features_total",
+    "rio_scheduler_sla_forecast_dropped_total",
 ];
 
 /// `(intent_id → node_affinity)` from one `compute_spawn_intents` poll.
@@ -148,6 +151,25 @@ async fn contract_selector_stability() -> TestResult {
             &["zz-no-hosting-class"],
         );
     }
+    // r34 bug_018: drive the forecast loop. The forecast block in
+    // `compute_spawn_intents` is gated on `if max_lead > 0.0`;
+    // test_hw_sla_config() has empty lead_time_seed so the block is
+    // skipped. Seed one entry to enable the pass; value 100.0 < eta=300
+    // so the pre-solve `eta >= intent_lead` gate fires lead_horizon.
+    // q-stuck never reaches forecast.push so polls[0].len() stays at
+    // the Ready count.
+    actor.sla_config.lead_time_seed.insert(
+        ("intel-6".into(), crate::sla::config::CapacityType::Od),
+        100.0,
+    );
+    // Without a Queued drv with a Running dep, the `'q:` Queued loop
+    // never iterates — the (1a) assertion is vacuous against any
+    // forecast-loop emit. The debounce bounds it to ≤1 per (drv_hash,
+    // reason); per-poll emission would read 8 (one per poll).
+    actor.test_inject_at("dep-running", "x86_64-linux", DerivationStatus::Running);
+    actor.test_inject_at("q-stuck", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_edge("q-stuck", "dep-running");
+    actor.test_set_running_eta("dep-running", 400.0, 100, 4); // eta=300
 
     // ── (1a) 8× poll, no state change → identical selectors ────────────
     // Side-effect-free except idempotent memo + debounced emits:
@@ -183,6 +205,19 @@ async fn contract_selector_stability() -> TestResult {
         );
     }
     assert_eq!(polls[0].len(), 12, "all 12 Ready drvs intent-eligible");
+    // r34 bug_018: per-poll forecast emit assertion. `q-stuck` is the
+    // ONLY Queued+Running pair; the debounce bounds the counter to 1.
+    // Per-poll emission reads 8 — the loose ≤12 bound above would
+    // pass it (a §Stability-tests vacuity gap). Tighten exactly.
+    assert_eq!(
+        after
+            .get("rio_scheduler_sla_forecast_dropped_total")
+            .copied()
+            .unwrap_or(0),
+        1,
+        "forecast_dropped_total MUST be debounced once-per-(drv,reason) — \
+         per-poll emission reads 8× for one stuck Queued drv (r34 bug_018)"
+    );
     assert!(
         polls[0].values().any(|a| !a.is_empty()),
         "precondition: solve_full path active (hw table populated)"

@@ -186,6 +186,21 @@ pub(super) const UNROUTABLE_FEATURES_WARNED_CAP: usize = 1024;
 /// — operator-configured overrides are sparse (a handful at a time) so
 /// 1024 is far above any legitimate steady-state.
 pub(super) const CAP_MISMATCH_WARNED_CAP: usize = 1024;
+/// LRU cap for [`DagActor::forecast_dropped_warned`] (r34 bug_018).
+/// Key cardinality is `|Queued-with-incomplete-deps drvs| × |reason|`
+/// (reason ∈ {lead_horizon, tenant_budget}, |reason| = 2). Bounded by
+/// the DAG width; 4096 covers the largest observed Queued frontier
+/// (e.g. nixpkgs-cross release closures). Eviction re-arms the warn —
+/// fail-safe over-emit, bounded by cap × eviction churn.
+///
+/// STRIKE-3 on the ONCE_PER_MISS contract (merged_bug_001/r3-BLOCKED →
+/// `unroutable_features_warned` → `cap_mismatch_warned` → this). r35
+/// tripwire: a 4th `Mutex<LruCache>` debounce field warrants a
+/// `DebouncedCounter<K>` newtype that enforces the gate at the type
+/// level (so `.increment(key)` cannot bypass it) plus a lint-test
+/// asserting no raw `::metrics::counter!` appears in
+/// `compute_spawn_intents`.
+pub(super) const FORECAST_DROPPED_WARNED_CAP: usize = 4096;
 
 /// Timeout for the merge-time `FindMissingPaths` only
 /// (`find_missing_with_breaker`). Separate from `grpc_timeout` (30s):
@@ -513,6 +528,19 @@ pub struct DagActor {
     /// (override config doesn't change on leader transition).
     cap_mismatch_warned:
         parking_lot::Mutex<lru::LruCache<(String, String, crate::sla::config::CapacityType), ()>>,
+    /// `(drv_hash, reason)` pairs already counted in
+    /// `forecast_dropped_total` (r34 bug_018). The forecast loop in
+    /// `compute_spawn_intents` runs once per poll; without a debounce
+    /// a Queued drv with a slow Running dep increments the counter on
+    /// every controller poll + scheduler tick + dashboard refresh —
+    /// `(poll_rate)×(stuck drvs)`, not `(drop events)`. Debounced
+    /// once-per-edge so the metric means "unique drop events" as
+    /// documented in [`crate::sla::metrics::describe_all`]. Same
+    /// `LruCache` shape as `unroutable_features_warned` /
+    /// `cap_mismatch_warned`. Re-arms on eviction (fail-safe over-emit)
+    /// and on pod restart. Retained across `clear_persisted_state` —
+    /// the drv set doesn't change on leader transition.
+    forecast_dropped_warned: parking_lot::Mutex<lru::LruCache<(String, &'static str), ()>>,
     /// Set by events that change dispatch eligibility (Heartbeat, drain).
     /// `handle_tick` consumes it: `if dirty { dispatch_ready(); dirty=false; }`.
     /// I-163: Heartbeat used to call `dispatch_ready` inline — at 290
@@ -700,6 +728,9 @@ impl DagActor {
             cap_mismatch_warned: parking_lot::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(CAP_MISMATCH_WARNED_CAP).unwrap(),
             )),
+            forecast_dropped_warned: parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(FORECAST_DROPPED_WARNED_CAP).unwrap(),
+            )),
             dispatch_dirty: false,
             probe_generation: 1,
             became_idle_inline_this_tick: 0,
@@ -785,6 +816,11 @@ impl DagActor {
             // universe to retain against.
             unroutable_features_warned: _,
             cap_mismatch_warned: _,
+            // Retained: same rationale as the two siblings above. The
+            // key universe (`drv_hash` × `reason`) is the live DAG —
+            // it doesn't change on leader transition. The bound is the
+            // LRU cap (r34 bug_018), not a `.retain()`.
+            forecast_dropped_warned: _,
             dispatch_dirty: _,
             probe_generation: _,
             became_idle_inline_this_tick: _,

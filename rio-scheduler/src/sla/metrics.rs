@@ -126,11 +126,17 @@ pub fn describe_all() {
     );
     describe_counter!(
         "rio_scheduler_sla_forecast_dropped_total",
-        "§13b: forecast-pass intent dropped before emit. Labeled \
+        "§13b: forecast-pass intent dropped before emit (unique drop \
+         events — debounced once per `(drv_hash, reason)` per LRU \
+         residency, r34 bug_018). Labeled \
          `reason` ∈ {lead_horizon, tenant_budget}. `lead_horizon`: ETA \
          exceeds the per-intent forecast horizon (`max(lead_time_seed)` \
          over routable hwClasses pre-solve, over `intent.hw_class_names` \
-         post-solve) — the controller's per-cell `a_open` would drop it; \
+         post-solve) — the scheduler's seed-based approximation of the \
+         controller's `a_open` would drop it (r34 merged_bug_006: the \
+         controller reads a learned per-cell DDSketch quantile with no \
+         return channel to the scheduler, so when learned drifts above \
+         the seed this over-counts); \
          `tenant_budget`: `max_forecast_cores_per_tenant` exhausted by \
          higher-priority intents this poll. Sustained `lead_horizon` ⇒ \
          deps complete far ahead of any seed lead (saved work) OR a \

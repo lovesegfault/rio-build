@@ -601,12 +601,23 @@ impl SlaConfig {
 
     /// Per-intent forecast horizon: `max(lead_time_seed[(h, cap)])`
     /// over hwClasses [`Self::class_routes`] admits for `(system,
-    /// features)`. Mirrors the controller's `a_open` per-cell filter
-    /// (`eta < lead_time(c)`) so the scheduler's forecast pass doesn't
-    /// admit intents the controller would unconditionally drop —
+    /// features)`. **Seed-based approximation** of the controller's
+    /// `a_open` per-cell filter (`eta < lead_time(c)`): the controller
+    /// reads its learned per-cell DDSketch quantile (`CellSketches::
+    /// lead_time`, §13b), which has no return channel to the scheduler
+    /// (`AckSpawnedIntentsRequest` carries `registered_cells` and
+    /// `unfulfillable_cells` but not the gauge). When learned drifts
+    /// **above** the seed (e.g. metal boots slower than `probe-boot`'s
+    /// one-shot measurement), this gate over-drops forecast intents
+    /// the controller would have pre-warmed for — bounded loss of
+    /// pre-warm latency, not correctness. The inverse (learned <
+    /// seed) is acknowledged at the budget-gate sort (snapshot.rs).
+    /// Avoids admitting intents the controller would unconditionally
+    /// drop —
     /// pre-`r33 bug_007` the global `max(values)` raised the horizon
     /// 30× when `metal-{x86,arm}:od` seed=600 was added, admitting
     /// non-metal intents the controller's per-cell gate rejects.
+    /// (r34 merged_bug_006)
     ///
     /// Empty seed map / no matching class ⇒ `0.0` (forecast disabled
     /// for this intent — every `eta ≥ 0` fails the gate).
