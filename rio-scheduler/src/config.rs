@@ -80,11 +80,15 @@ pub(super) struct Config {
     /// table in scheduler.toml. Env: `RIO_DASHBOARD__*`.
     pub(super) dashboard: DashboardConfig,
     /// ADR-023 SLA-driven sizing. `[sla]` table in scheduler.toml —
-    /// mandatory (helm always renders it; absent → figment falls back
-    /// to [`rio_scheduler::sla::config::SlaConfig::test_default`] via
-    /// `Default for Config`). No env override — structured config
-    /// only. Validated via
-    /// [`rio_scheduler::sla::config::SlaConfig::validate`].
+    /// mandatory (helm always renders it). No env override — structured
+    /// config only. The figment baseline (`Default for Config`) is
+    /// [`rio_scheduler::sla::config::SlaConfig::figment_baseline`],
+    /// which leaves `maxCores`/`maxMem`/`hwClasses` empty so a TOML
+    /// that omits them is read as "unset" — figment merges per-key,
+    /// so a populated baseline would mask the §13c-3 catalog derive.
+    /// Validated via
+    /// [`rio_scheduler::sla::config::SlaConfig::validate_shape`] +
+    /// [`rio_scheduler::sla::config::SlaConfig::validate_resolved`].
     pub(super) sla: rio_scheduler::sla::config::SlaConfig,
     /// Permit a `[sla].reference_hw_class` change vs the value
     /// persisted in `sla_config_epoch` (M_058). DESTRUCTIVE — resets
@@ -142,7 +146,7 @@ impl Default for Config {
             retry: rio_scheduler::RetryPolicy::default(),
             substitute_max_concurrent: default_substitute_concurrency(),
             dashboard: DashboardConfig::default(),
-            sla: rio_scheduler::sla::config::SlaConfig::test_default(),
+            sla: rio_scheduler::sla::config::SlaConfig::figment_baseline(),
             allow_reference_change: false,
         }
     }

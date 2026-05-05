@@ -98,6 +98,83 @@ fn soft_features_load_from_toml() {
     assert_eq!(cfg.soft_features, ["big-parallel", "benchmark"]);
 }
 
+/// §13c-3 regression: `[sla].max_cores`/`max_mem` absent from TOML
+/// MUST extract as `None`, and the figment baseline MUST NOT inject a
+/// phantom `test-hw` class.
+///
+/// Before this fix, `Config::default()` used [`SlaConfig::test_default`]
+/// (`max_cores: Some(16.0)`, `hw_classes: {test-hw}`) as the figment
+/// baseline. Figment merges per-key — a TOML that omits
+/// `[sla].max_cores` keeps the baseline's `Some(16.0)`, so
+/// [`SlaConfig::resolve_globals`] short-circuits BEFORE the §13c-2
+/// catalog derive ever runs. With `probe.cpu = 16` (the chart default)
+/// and a resolved global of 16, [`SlaConfig::validate_resolved`]
+/// rejects (`probe.cpu ≤ maxCores/4 = 4`) and the scheduler
+/// crash-loops at boot. The phantom `test-hw` (matching every node via
+/// `kubernetes.io/os In [linux]`) also leaked into production
+/// `hw_classes`.
+#[test]
+fn sla_globals_unset_in_toml_extract_as_none() {
+    use figment::providers::{Format, Toml};
+    // Mirror the helm-rendered shape: `[sla]` present, full hwClasses
+    // and probe set, `max_cores`/`max_mem` deliberately ABSENT (the
+    // §13c-3 default — derive from catalog at boot under spot).
+    let toml = r#"
+        [sla]
+        cluster = "test"
+        default_tier = "normal"
+        max_disk = 214748364800
+        default_disk = 107374182400
+        reference_hw_class = "lo-ebs-x86"
+        hw_cost_source = "spot"
+
+        [sla.probe]
+        cpu = 16.0
+        mem_per_core = 1073741824
+        mem_base = 34359738368
+        deadline_secs = 3600
+
+        [sla.hw_classes."lo-ebs-x86"]
+        labels = [{ key = "kubernetes.io/arch", value = "amd64" }]
+        requirements = [{ key = "kubernetes.io/arch", operator = "In", values = ["amd64"] }]
+        node_class = "rio-default"
+
+        [[sla.tiers]]
+        name = "normal"
+    "#;
+    let cfg: Config =
+        figment::Figment::from(figment::providers::Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .expect("toml parses into Config");
+    assert_eq!(
+        cfg.sla.max_cores, None,
+        "max_cores absent from TOML must extract as None (§13c-3 \
+         catalog-derive contract); a populated figment baseline masks it"
+    );
+    assert_eq!(
+        cfg.sla.max_mem, None,
+        "max_mem absent from TOML must extract as None"
+    );
+    assert!(
+        !cfg.sla.hw_classes.contains_key("test-hw"),
+        "the figment baseline must not inject a phantom test-hw class \
+         alongside the operator's hwClasses (figment deep-merges hashmaps)"
+    );
+    assert_eq!(
+        cfg.sla.hw_classes.len(),
+        1,
+        "exactly the operator-declared hwClasses should survive merge: {:?}",
+        cfg.sla.hw_classes.keys().collect::<Vec<_>>()
+    );
+    // The merged config passes pass-1 validation (hwClasses non-empty,
+    // referenceHwClass present) — proving the operator's TOML, not the
+    // baseline, is what reaches `validate_shape()`.
+    cfg.sla
+        .validate_shape()
+        .expect("merged config passes pass-1");
+}
+
 /// Empty TOML → `#[serde(default)]` on Config + sub-struct
 /// defaults → identical to `Config::default()`. This is the
 /// "operator didn't configure it" case — existing deployments
@@ -149,9 +226,17 @@ fn cli_args_parse_help() {
 /// we want to test. Fill the required fields with placeholders; the
 /// returned config passes validation as-is (the "happy path" baseline
 /// that each rejection test mutates).
+///
+/// Use [`SlaConfig::test_default`] (NOT the figment baseline) for
+/// `sla`: `validate()` calls `validate_shape()`, which requires a
+/// non-empty `hw_classes`. `Config::default()` deliberately leaves
+/// `hw_classes` empty so figment doesn't merge a phantom `test-hw`
+/// over the operator's TOML — see
+/// [`SlaConfig::figment_baseline`](rio_scheduler::sla::config::SlaConfig::figment_baseline).
 fn test_valid_config() -> Config {
     let mut cfg = Config {
         database_url: "postgres://localhost/test".into(),
+        sla: rio_scheduler::sla::config::SlaConfig::test_default(),
         ..Config::default()
     };
     cfg.store.addr = "http://store:9002".into();

@@ -891,6 +891,48 @@ impl SlaConfig {
         }
     }
 
+    /// Figment baseline for `rio-scheduler::config::Config::default()`.
+    ///
+    /// The binary's `Config::default()` is the figment layer that the
+    /// helm-rendered `scheduler.toml` is merged ONTO. Figment merges
+    /// per-key (not per-table), so a field set here is what the running
+    /// process sees whenever the operator's TOML omits that key.
+    ///
+    /// That means this baseline MUST NOT pre-populate fields whose
+    /// *absence* is the operator's deliberate choice:
+    ///
+    /// - `max_cores` / `max_mem`: §13c-3 contract — `None` under
+    ///   `hwCostSource=spot` means "derive from the EC2 instance-type
+    ///   catalog at boot". A `Some(16.0)` baseline (the
+    ///   [`Self::test_default`] value) survives a TOML that omits
+    ///   `[sla].maxCores` and short-circuits
+    ///   [`Self::resolve_globals`] BEFORE the catalog derive runs —
+    ///   the resolved global pins to 16, `probe.cpu=16` then fails
+    ///   `validate_resolved` (`probe.cpu ≤ maxCores/4 = 4`), and the
+    ///   scheduler crash-loops at boot.
+    /// - `hw_classes`: figment deep-merges hashmaps. A `test-hw` entry
+    ///   here persists alongside the operator's classes; with
+    ///   `requirements = [kubernetes.io/os In [linux]]` it is a
+    ///   match-everything phantom class the solver would route to.
+    ///
+    /// Everything else inherits from [`Self::test_default`]: those
+    /// fields are either always rendered by the chart (so the baseline
+    /// never wins) or non-`Option` scalars whose value is benign.
+    ///
+    /// This is NOT a usable config on its own — `[sla]` is mandatory
+    /// (the chart always renders it). A deployment that omits the table
+    /// fails [`Self::validate_shape`] at boot (`hw_classes` empty,
+    /// `reference_hw_class` not in `hw_classes`). Tests that need a
+    /// usable config without a TOML use [`Self::test_default`].
+    pub fn figment_baseline() -> Self {
+        Self {
+            max_cores: None,
+            max_mem: None,
+            hw_classes: HashMap::new(),
+            ..Self::test_default()
+        }
+    }
+
     /// §13c-3 pass-1 (config-load): every check that does NOT depend
     /// on the resolved global. `&self` (not `&mut`) so it composes
     /// with [`rio_common::config::ValidateConfig::validate`]; sorting
