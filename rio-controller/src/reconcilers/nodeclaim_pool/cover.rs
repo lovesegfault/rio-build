@@ -1398,7 +1398,7 @@ mod tests {
     /// (which tolerates only `rio.build/fetcher`) could never bind to
     /// the fetcher node minted for it. Bootstrap deadlock.
     // r[verify ctrl.nodeclaim.taints.hwclass]
-    // r[verify fetcher.node.dedicated+2]
+    // r[verify fetcher.node.dedicated+3]
     #[test]
     fn build_nodeclaim_fetcher_cell_no_builder_taint() {
         let cell = Cell("fetcher-x86".into(), CapacityType::Spot);

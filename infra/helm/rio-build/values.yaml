@@ -1025,9 +1025,12 @@ pools:
     tolerations: null
     # §13e: null-clear so the inherited poolDefaults.nodeSelector
     # (rio.build/node-role: builder) doesn't pin fetcher pods to
-    # builder nodes. Restrictive placement is per-intent only
-    # (cells_to_selector_terms reads intent.hw_class_names ⊇
-    # {fetcher-*}). Arch is also per-intent (hw.labels carries
+    # builder nodes — and so the reconciler injects the pool-static
+    # {rio.build/fetcher: true} default (§13e B4: load-bearing for
+    # builtin FODs whose hw_class_names=[] yields no per-intent
+    # affinity). Per-intent affinity (cells_to_selector_terms reads
+    # intent.hw_class_names ⊇ {fetcher-*}) composes for arch-typed
+    # FODs. Arch is also per-intent (hw.labels carries
     # kubernetes.io/arch); the I-098 pool-static arch nodeSelector
     # is the *builder* mechanism — see pod.rs `if !fetcher && ...`.
     nodeSelector: null

@@ -90,7 +90,7 @@ Two layers, chained:
 
 The chain: build submitted → scheduler dispatches → controller creates a Job → pod Pending (no builder node exists) → Karpenter provisions a node → pod Running. Cold start from zero: ~50-80s. `consolidationPolicy: WhenEmpty` means Karpenter never evicts a builder mid-build — only consolidates after the Job has exited.
 
-Three static NodePools: `rio-nodeclaim-shim` (`limits.cpu:0` — Karpenter sees it but never provisions; `rio-controller`'s nodeclaim_pool reconciler creates NodeClaims directly per ADR-023 §13b/§13c), `rio-fetcher` (FOD-only executors), `rio-general` (untainted, for future gateway/scheduler HPA overflow). Three EC2NodeClasses: `rio-default` (UEFI/UKI), `rio-nvme` (UEFI/UKI + RAID0 instance store), `rio-metal` (BIOS for x86 `.metal`, UEFI for arm64 `.metal` — KVM builds). Builder hardware classes (incl. metal) live in `infra/helm/rio-build/values.yaml` under `scheduler.sla.hwClasses`; static NodePools under `karpenter.nodePools`.
+Two static NodePools: `rio-nodeclaim-shim` (`limits.cpu:0` — Karpenter sees it but never provisions; `rio-controller`'s nodeclaim_pool reconciler creates NodeClaims directly per ADR-023 §13b/§13c — for both builders AND fetchers since §13e), `rio-general` (untainted, for future gateway/scheduler HPA overflow). Three EC2NodeClasses: `rio-default` (UEFI/UKI), `rio-nvme` (UEFI/UKI + RAID0 instance store), `rio-metal` (BIOS for x86 `.metal`, UEFI for arm64 `.metal` — KVM builds). Builder and fetcher hardware classes (incl. metal) live in `infra/helm/rio-build/values.yaml` under `scheduler.sla.hwClasses`; static NodePools under `karpenter.nodePools`.
 
 ## Cost (us-east-2, on-demand)
 

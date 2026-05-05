@@ -224,8 +224,8 @@ the metal taint.
 r[ctrl.pool.reconcile]
 One reconciler handles both kinds. Each tick: poll `GetSpawnIntents{kind=spec.kind, systems, features}` → spawn one Job per intent (resources stamped from the intent) up to `spec.maxConcurrent` → reap excess Pending / orphan Running → patch `.status`. Finalizer-wrapped; ownerRef GC handles Job cleanup on Pool delete.
 
-r[ctrl.pool.fetcher-hardening]
-For `kind=Fetcher`, `executor_params` MUST apply ADR-019 hardening regardless of spec: `readOnlyRootFilesystem: true`, `seccompProfile: Localhost operator/rio-fetcher.json`, `hostUsers: false`, `privileged: false`, default `node-role: fetcher` selector + `rio.build/fetcher:NoSchedule` toleration, `terminationGracePeriodSeconds: 600`. CRD CEL rejects fetcher specs that set the overridden fields at admission time; the reconciler override is belt-and-suspenders for pre-CEL specs the apiserver already accepted.
+r[ctrl.pool.fetcher-hardening+2]
+For `kind=Fetcher`, `executor_params` MUST apply ADR-019 hardening regardless of spec: `readOnlyRootFilesystem: true`, `seccompProfile: Localhost operator/rio-fetcher.json`, `hostUsers: false`, `privileged: false`, default `rio.build/fetcher: true` nodeSelector (§13e key, restored in B4) + `rio.build/fetcher:NoSchedule` toleration, `terminationGracePeriodSeconds: 600`. CRD CEL rejects fetcher specs that set the overridden fields at admission time; the reconciler override is belt-and-suspenders for pre-CEL specs the apiserver already accepted.
 
 r[ctrl.pool.fetcher-spawn-builtin]
 For `kind=Fetcher` pools, `spec.systems` SHOULD include `"builtin"` so `system="builtin"` FODs are counted in the spawn signal. Every executor unconditionally advertises `"builtin"` (`r[sched.dispatch.fod-builtin-any-arch]`); omitting it from the spawn signal would stall a cold-store bootstrap.
@@ -315,16 +315,25 @@ its toleration automatically. This covers fitted intents
 (`r[ctrl.pool.kvm-device+2]`) covers `hw_class_names=[]` cold-start
 intents.
 
-r[ctrl.pool.fetcher-affinity-from-intent]
-The fetcher pod's restrictive placement constraint MUST derive
-exclusively from `intent.hw_class_names` via `cells_to_selector_terms`
-(`r[ctrl.pool.node-affinity-from-intent]`) — never from a pool-static
-`nodeSelector`. Mirrors `r[ctrl.pool.kvm-device+2]` (the metal close,
-r33 bug_002): even a constraint that IS universal over the Pool's
-intents is deleted when redundant with the per-intent path, because two
-places that must agree eventually disagree. The pool-static fetcher
-toleration stays — permissive constraints over-firing are harmless and
-serve as the `hw_class_names=[]` cold-start fallback.
+r[ctrl.pool.fetcher-affinity-from-intent+2]
+The fetcher pod's restrictive placement constraint MUST be the union of
+the per-intent `nodeAffinity` derived from `intent.hw_class_names` via
+`cells_to_selector_terms` (`r[ctrl.pool.node-affinity-from-intent]`) AND
+the pool-static `nodeSelector{rio.build/fetcher: true}` (§13e B4). The
+two cannot drift: the pool-static constraint keys on `pool.spec.kind ==
+Fetcher` (a Pool-level invariant), and the per-intent affinity
+(`intent.hw_class_names ∩ {fetcher-*}`) is a PROJECTION of that
+invariant, not an independent opinion of it. This is NOT the
+`r[ctrl.pool.kvm-device+2]`/r33-bug_002 redundancy anti-pattern: the kvm
+nodeSelector keyed on `pool.spec.features` (existential — an intent may
+need only one feature, which routes to a non-metal class), so the two
+places COULD disagree. Here they cannot. The pool-static constraint is
+load-bearing for `system="builtin"` FODs whose `hw_class_names` is
+empty (no arch → no cells → no per-intent affinity); without it, a
+`builtins.fetchurl` pod has only the toleration and can schedule onto
+any untainted node. The pool-static fetcher toleration also stays —
+permissive constraints over-firing are harmless and serve as the
+`hw_class_names=[]` cold-start fallback.
 
 r[ctrl.pool.hw-bench-needed+2]
 The pool reconciler MUST stamp `rio.build/hw-bench-needed` on the pod
@@ -569,16 +578,21 @@ are summed across capacity-types (per-hwClass, NOT per-Cell — a per-Cell
 cap would let spot+od each hit it independently → 2× $/hr exposure).
 `max_fleet_cores=None` ⇒ global budget only.
 
-r[ctrl.nodeclaim.placeable-gate+2]
+r[ctrl.nodeclaim.placeable-gate+3]
 For Builder pools, the Pool reconciler creates Jobs only for intents
 the nodeclaim_pool reconciler's last FFD simulation placed on a
 `Registered=True` NodeClaim. The §13a `ready` retain is replaced; Job
 count is bounded by Registered-node capacity, not Ready-set size. An
 unarmed gate (no FFD tick yet) is fail-closed for both spawn and reap.
-The gate does NOT apply to Fetcher pools (they schedule onto the
-independent `rio-fetcher` NodePool) or when the NodeClaim CRD is
-absent (the controller probes at startup; absent ⇒ static-node
-cluster, gate is pass-through).
+The gate does NOT apply to Fetcher pools — fetcher NodeClaims are minted
+by the same `cover_deficit` (§13e: the FFD simulation covers Builder and
+Fetcher Pools), so the placeable set DOES contain fetcher intent IDs, but
+the Builder-only retain is kept: fetcher fan-out is bounded by
+`spec.maxConcurrent` and a fetcher pod is cheap (1 core), so there is no
+1226-Pending-Jobs problem for the gate to solve. Extending the retain to
+Fetcher pools is a follow-up. The gate also does NOT apply when the
+NodeClaim CRD is absent (the controller probes at startup; absent ⇒
+static-node cluster, gate is pass-through).
 
 ## Build CRD (removed)
 

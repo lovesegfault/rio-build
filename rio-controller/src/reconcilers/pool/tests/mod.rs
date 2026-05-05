@@ -72,7 +72,7 @@ pub(crate) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
     })
 }
 
-// r[verify ctrl.pool.fetcher-hardening]
+// r[verify ctrl.pool.fetcher-hardening+2]
 /// D3 belt-and-suspenders behind the CEL admission gate: a
 /// `Pool{kind=Fetcher}` whose spec slips past CEL with
 /// `seccompProfile: Unconfined` and `hostUsers: true` STILL

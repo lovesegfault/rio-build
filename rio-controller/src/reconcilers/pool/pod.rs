@@ -210,20 +210,38 @@ fn effective_host_users(pool: &Pool) -> Option<bool> {
     }
 }
 
-// §13e: pool-static fetcher nodeSelector DELETED. The per-intent
-// affinity from `cells_to_selector_terms` (§13d) writes
-// `nodeAffinity{rio.build/fetcher}` from the intent's
-// `hw_class_names ∩ {fetcher-*}`. Same shape as the r33 bug_002 close
-// for kvm, but with the OPPOSITE universality argument: the fetcher
-// constraint IS universal over the fetcher Pool's intents (every FOD
-// requires a fetcher node, derived from `pool.spec.kind`, not
-// `pool.spec.features`) — yet it's still deleted because §13d's
-// lesson is "redundancy is the bug": two places that must agree
-// (pool-static + per-intent) eventually disagree.
-// r[impl fetcher.node.dedicated+2]
-// r[impl ctrl.pool.fetcher-affinity-from-intent]
+/// §13e: pool-static fetcher nodeSelector RESTORED (B4, post-B2.3 deletion).
+///
+/// The §13d "redundancy is the bug" lesson over-applied: it warned against
+/// a pool-static restrictive constraint that CAN diverge from the per-intent
+/// affinity (the kvm nodeSelector keyed on `pool.spec.features`, while the
+/// per-intent affinity keys on `intent.hw_class_names ∩ {metal-*}`; those
+/// CAN disagree for a multi-feature Pool). The fetcher nodeSelector keys on
+/// `pool.spec.kind == Fetcher` — a Pool-level invariant that the per-intent
+/// affinity (`intent.hw_class_names ∩ {fetcher-*}`) is a PROJECTION of, not
+/// an INDEPENDENT opinion of. They agree by construction. The pool-static
+/// constraint is needed for `system="builtin"` FODs whose `hw_class_names`
+/// is empty (no arch → no cells → no per-intent affinity) — without it,
+/// a `builtins.fetchurl` pod can schedule onto any untainted node.
+///
+/// Uses the §13e taint-key (`FETCHER_TAINT_KEY = rio.build/fetcher`), NOT
+/// the deleted `rio.build/node-role` convention — `cover::build_nodeclaim`
+/// stamps `FETCHER_TAINT_KEY` as both label AND taint on fetcher
+/// NodeClaims, so the selector and the node label come from the same
+/// constant and cannot drift.
+// r[impl fetcher.node.dedicated+3]
+// r[impl ctrl.pool.fetcher-affinity-from-intent+2]
 fn effective_node_selector(pool: &Pool) -> Option<BTreeMap<String, String>> {
-    pool.spec.node_selector.clone()
+    if is_fetcher(pool) {
+        pool.spec.node_selector.clone().or_else(|| {
+            Some(BTreeMap::from([(
+                rio_common::k8s::FETCHER_TAINT_KEY.into(),
+                "true".into(),
+            )]))
+        })
+    } else {
+        pool.spec.node_selector.clone()
+    }
 }
 
 /// Maps a `NodeTaint` proto to a kube `Toleration`. Single source for
@@ -399,7 +417,7 @@ pub fn job_name(pool_name: &str, role: ExecutorKind, suffix: &str) -> String {
 }
 
 /// The Job pod spec — shared by both pool kinds.
-// r[impl ctrl.pool.fetcher-hardening]
+// r[impl ctrl.pool.fetcher-hardening+2]
 pub fn build_executor_pod_spec(
     pool: &Pool,
     scheduler: &UpstreamAddrs,
@@ -1057,7 +1075,7 @@ mod tests {
         assert_eq!(nix_systems_to_k8s_arch(&[]), None);
     }
 
-    // r[verify ctrl.pool.fetcher-hardening]
+    // r[verify ctrl.pool.fetcher-hardening+2]
     // r[verify ctrl.crd.fetcher-no-features+2]
     /// `effective_features` is the single chokepoint: Fetcher →
     /// `[fetcher]` regardless of spec; Builder → verbatim. Both
@@ -1368,18 +1386,17 @@ mod tests {
         );
     }
 
-    /// §13e: the per-intent nodeAffinity from `cells_to_selector_terms`
-    /// is the SOLE restrictive placement mechanism for fetchers,
-    /// mirroring the r33 bug_002 close for kvm. The pool-static
-    /// `nodeSelector{rio.build/node-role:fetcher}` is deleted — it was
-    /// redundant (every FOD intent's `hw_class_names` includes a fetcher
-    /// cell, which encodes the same constraint), and per §13d's lesson
-    /// redundancy IS the bug: two places that must agree (pool-static +
-    /// per-intent) eventually disagree.
-    // r[verify ctrl.pool.fetcher-affinity-from-intent]
-    // r[verify fetcher.node.dedicated+2]
+    /// §13e B4: the per-intent nodeAffinity from `cells_to_selector_terms`
+    /// composes with the pool-static `nodeSelector{rio.build/fetcher: true}`
+    /// (restored in B4 after the B2.3 deletion). The OLD convention's key
+    /// `rio.build/node-role` MUST stay absent — only the §13e taint-key
+    /// (`FETCHER_TAINT_KEY`) is wired to NodeClaim labels via
+    /// `cover::build_nodeclaim`; a `node-role` selector would never match
+    /// any node.
+    // r[verify ctrl.pool.fetcher-affinity-from-intent+2]
+    // r[verify fetcher.node.dedicated+3]
     #[test]
-    fn fetcher_pod_no_pool_static_node_selector() {
+    fn fetcher_pod_no_legacy_node_role_selector() {
         use rio_proto::types::{HwClassLabels, NodeLabelMatch, NodeTaint};
         let hw = HwClassConfig::default();
         hw.set(
@@ -1409,15 +1426,15 @@ mod tests {
             &crate::fixtures::test_store_addrs(),
             &hw,
         );
-        // Structural invariant: no pool-static restrictive nodeSelector.
-        // The per-intent affinity is the ONLY restrictive mechanism.
+        // Structural invariant: the deleted `rio.build/node-role`
+        // convention does not reappear. Pool-static placement uses
+        // the §13e taint-key only.
         assert!(
             spec.node_selector
                 .as_ref()
                 .is_none_or(|ns| !ns.contains_key("rio.build/node-role")),
-            "no pool-static fetcher nodeSelector — per-intent affinity is the \
-             sole restrictive mechanism (§13e, r[ctrl.pool.fetcher-affinity-from-intent]); \
-             got {:?}",
+            "deleted rio.build/node-role convention must not reappear in the \
+             fetcher nodeSelector (§13e); got {:?}",
             spec.node_selector
         );
         // The permissive arm (toleration) still fires — derived from the
@@ -1427,6 +1444,83 @@ mod tests {
                 .iter()
                 .any(|t| t.key.as_deref() == Some(rio_common::k8s::FETCHER_TAINT_KEY))),
             "pool-static fetcher toleration still appended (permissive, safe)"
+        );
+    }
+
+    /// §13e B4: a `system="builtin"` FOD (e.g., `builtins.fetchurl`) has
+    /// `hw_class_names=[]` — `system_to_k8s_arch("builtin")` returns
+    /// `None`, `reference_hw_class_for_system` early-returns, `bypass_cells`
+    /// falls into `[]`, so the intent ships with no per-intent
+    /// `nodeAffinity`. The pool-static `nodeSelector{rio.build/fetcher:
+    /// true}` is the SOLE restrictive placement for this case. Without
+    /// it, a builtin FOD pod has only the toleration and can schedule
+    /// onto any untainted node (e.g., `rio-general` control-plane) —
+    /// defense-in-depth weakening (CNP holds) + control-plane resource
+    /// contention.
+    ///
+    /// The pod is built with no intent (cold-start / builtin FOD path) —
+    /// `build_executor_pod_spec` does not see a per-intent affinity, so
+    /// the only restrictive placement it CAN stamp is the pool-static
+    /// nodeSelector.
+    // r[verify ctrl.pool.fetcher-affinity-from-intent+2]
+    // r[verify fetcher.node.dedicated+3]
+    #[test]
+    fn builtin_fod_pod_has_pool_static_fetcher_node_selector() {
+        // Default (unloaded) hwClass config — the cold-start path:
+        // there is no fetcher hwClass to derive an affinity from.
+        let hw = HwClassConfig::default();
+        let p = crate::fixtures::test_pool("f", ExecutorKind::Fetcher);
+        let spec = build_executor_pod_spec(
+            &p,
+            &crate::fixtures::test_sched_addrs(),
+            &crate::fixtures::test_store_addrs(),
+            &hw,
+        );
+        let ns = spec
+            .node_selector
+            .expect("fetcher pod must have a nodeSelector");
+        assert_eq!(
+            ns.get(rio_common::k8s::FETCHER_TAINT_KEY)
+                .map(String::as_str),
+            Some("true"),
+            "fetcher pod must have pool-static rio.build/fetcher nodeSelector — \
+             the per-intent affinity is empty for system=builtin FODs"
+        );
+        // The deleted node-role convention must not have come back along.
+        assert!(
+            !ns.contains_key("rio.build/node-role"),
+            "deleted rio.build/node-role convention must not reappear: {ns:?}"
+        );
+    }
+
+    /// §13e B4: an operator-supplied `pool.spec.node_selector` overrides
+    /// the pool-static fetcher default — `effective_node_selector` is
+    /// `or_else`, not `or_insert`. (Same shape as `effective_tolerations`.)
+    #[test]
+    fn fetcher_pod_spec_node_selector_overrides_pool_static_default() {
+        let hw = HwClassConfig::default();
+        let mut p = crate::fixtures::test_pool("f", ExecutorKind::Fetcher);
+        p.spec.node_selector = Some(BTreeMap::from([(
+            "topology.kubernetes.io/zone".into(),
+            "us-east-2a".into(),
+        )]));
+        let spec = build_executor_pod_spec(
+            &p,
+            &crate::fixtures::test_sched_addrs(),
+            &crate::fixtures::test_store_addrs(),
+            &hw,
+        );
+        let ns = spec
+            .node_selector
+            .expect("operator-supplied nodeSelector must survive");
+        assert_eq!(
+            ns.get("topology.kubernetes.io/zone").map(String::as_str),
+            Some("us-east-2a")
+        );
+        assert!(
+            !ns.contains_key(rio_common::k8s::FETCHER_TAINT_KEY),
+            "operator-supplied nodeSelector replaces (not merges with) the \
+             pool-static default: {ns:?}"
         );
     }
 

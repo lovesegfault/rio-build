@@ -335,7 +335,7 @@ pkgs.testers.runNixOSTest {
         print(f"builder-airgap PASS: [{origin_v6}]:80 blocked (rc={rc})")
 
     # ══════════════════════════════════════════════════════════════════
-    # fetcher-node-dedicated — §13e toleration + NO pool-static selector
+    # fetcher-node-dedicated — §13e toleration + pool-static selector
     # ══════════════════════════════════════════════════════════════════
     # Full Karpenter NodePool isolation isn't testable in k3s (no
     # Karpenter, no NodeClaims). Shape-check the pod spec for the §13e
@@ -344,34 +344,35 @@ pkgs.testers.runNixOSTest {
     #       fallback (taints_routing_to(FETCHER_TAINT_KEY) → literal
     #       floor when no fetcher hwClass is loaded) lets fetcher pods
     #       tolerate the fetcher node taint.
-    #   (b) NO pool-static `nodeSelector` (the §13d/§13e lesson:
-    #       restrictive placement is per-intent only —
-    #       `r[ctrl.pool.fetcher-affinity-from-intent]`).
-    # Per-intent nodeAffinity isn't observable here: builtin FODs have
-    # system="builtin" → arch=None → `hw_class_names=[]` → no affinity.
+    #   (b) pool-static `nodeSelector{rio.build/fetcher: true}` present
+    #       (§13e B4 restore — `r[ctrl.pool.fetcher-affinity-from-intent+2]`).
+    #       Builtin FODs have system="builtin" → arch=None →
+    #       `hw_class_names=[]` → no per-intent affinity, so the
+    #       pool-static selector is the SOLE restrictive constraint.
+    #   (c) the deleted `rio.build/node-role` convention must NOT
+    #       reappear — only the §13e taint-key is wired to NodeClaim
+    #       labels.
     # The Karpenter affinity chain (FOD intent → fetcher-* hwClass →
     # NodeClaim with rio.build/fetcher label/taint) is EKS-only.
-    with subtest("fetcher-node-dedicated: toleration present, no pool-static selector"):
+    with subtest("fetcher-node-dedicated: toleration + pool-static fetcher selector"):
         spec = fetcher_pod_spec
         tols = spec.get("tolerations", [])
         assert any(t.get("key") == "rio.build/fetcher" for t in tols), (
             f"expected toleration key rio.build/fetcher, got {tols!r}"
         )
-        # §13e DELETED the pool-static nodeSelector. Both the old key
-        # (rio.build/node-role) and the new taint-key (rio.build/fetcher)
-        # must be ABSENT — the only restrictive placement is per-intent
-        # `intent.node_affinity` (which is empty for builtin FODs here).
         sel = spec.get("nodeSelector") or {}
+        # §13e B4 restored the pool-static nodeSelector with the new
+        # taint-key. It is the sole restrictive constraint for builtin
+        # FODs (no arch → no per-intent affinity).
+        assert sel.get("rio.build/fetcher") == "true", (
+            f"fetcher pod must have pool-static rio.build/fetcher "
+            f"nodeSelector (§13e B4): {sel!r}"
+        )
         assert "rio.build/node-role" not in sel, (
-            f"pool-static nodeSelector rio.build/node-role still present "
-            f"(§13e deleted it): {sel!r}"
+            f"deleted rio.build/node-role convention must not reappear: {sel!r}"
         )
-        assert "rio.build/fetcher" not in sel, (
-            f"pool-static nodeSelector rio.build/fetcher present — "
-            f"restrictive fetcher placement must be per-intent only: {sel!r}"
-        )
-        print(f"fetcher-node-dedicated PASS: toleration wired, "
-              f"pool-static nodeSelector absent (sel={sel!r})")
+        print(f"fetcher-node-dedicated PASS: toleration + pool-static "
+              f"selector wired (sel={sel!r})")
 
     # ══════════════════════════════════════════════════════════════════
     # fetcher-isolation — bidirectional taint partition

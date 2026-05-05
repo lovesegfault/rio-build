@@ -39,7 +39,7 @@ Split the single worker type into two distinct executor kinds with separate CRDs
 
 A `Pool{kind=Builder}` lives in `rio-builders`. The reconciler spawns one-shot rio-builder Jobs up to `spec.maxConcurrent` against `GetSpawnIntents{kind=Builder}` (see `r[ctrl.pool.ephemeral]`) and labels pods `rio.build/role: builder`.
 
-A `Pool{kind=Fetcher}` lives in `rio-fetchers`. The reconciler spawns one-shot fetcher Jobs up to `spec.maxConcurrent` against `GetSpawnIntents{kind=Fetcher}`, labels pods `rio.build/role: fetcher`, and forces ADR-019 hardening (`r[ctrl.pool.fetcher-hardening]`).
+A `Pool{kind=Fetcher}` lives in `rio-fetchers`. The reconciler spawns one-shot fetcher Jobs up to `spec.maxConcurrent` against `GetSpawnIntents{kind=Fetcher}`, labels pods `rio.build/role: fetcher`, and forces ADR-019 hardening (`r[ctrl.pool.fetcher-hardening+2]`).
 
 ### Scheduler routing
 
@@ -88,9 +88,9 @@ Rationale: fetchers face the open internet; the threat is a compromised upstream
 
 ### Node isolation
 
-r[fetcher.node.dedicated+2]
+r[fetcher.node.dedicated+3]
 
-Fetcher pods land on dedicated nodes carrying the `rio.build/fetcher=true:NoSchedule` taint and `rio.build/fetcher: "true"` label (§13e: same key for taint and label, mirroring the metal `rio.build/kvm` pattern). The `Pool` reconciler derives the toleration from `taints_routing_to(FETCHER_TAINT_KEY)` (the same `[sla.hw_classes.$h].taints` map `cover::build_nodeclaim` reads). Restrictive placement is per-intent only — the FOD intent's `hw_class_names` ⊇ `{fetcher-*}` drives the pod's `nodeAffinity` via `cells_to_selector_terms`; there is NO pool-static `nodeSelector`. Builder NodeClaims keep their `rio.build/builder=true:NoSchedule` taint; fetcher NodeClaims get `rio.build/fetcher` instead — `cover::build_nodeclaim` branches on `provides_features ∋ fetcher`. Neither can land on the other's nodes.
+Fetcher pods land on dedicated nodes carrying the `rio.build/fetcher=true:NoSchedule` taint and `rio.build/fetcher: "true"` label (§13e: same key for taint and label, mirroring the metal `rio.build/kvm` pattern). The `Pool` reconciler derives the toleration from `taints_routing_to(FETCHER_TAINT_KEY)` (the same `[sla.hw_classes.$h].taints` map `cover::build_nodeclaim` reads). Restrictive placement is the union of two constraints that agree by construction: the FOD intent's `hw_class_names` ⊇ `{fetcher-*}` drives the pod's per-intent `nodeAffinity` via `cells_to_selector_terms`, AND the pool-static `nodeSelector{rio.build/fetcher: true}` (§13e B4) keys on `pool.spec.kind == Fetcher` — the per-intent affinity is a projection of the pool-level invariant, not an independent opinion of it. For `system="builtin"` FODs whose `hw_class_names` is empty (no arch → no cells → no per-intent affinity), the pool-static `nodeSelector{rio.build/fetcher: true}` is the sole restrictive constraint. Builder NodeClaims keep their `rio.build/builder=true:NoSchedule` taint; fetcher NodeClaims get `rio.build/fetcher` instead — `cover::build_nodeclaim` branches on `provides_features ∋ fetcher`. Neither can land on the other's nodes.
 
 An attacker who escapes a fetcher pod lands on a node that runs only other fetchers. Lateral movement stays inside the hash-check boundary.
 

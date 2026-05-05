@@ -769,7 +769,7 @@ in
   # r[verify ctrl.nodeclaim.shim-nodepool]
   # r[verify ctrl.nodeclaim.anchor-bulk+4]
   # r[verify ctrl.nodeclaim.priority-bucket]
-  # r[verify ctrl.nodeclaim.placeable-gate+2]
+  # r[verify ctrl.nodeclaim.placeable-gate+3]
   vm-sla-sizing-kwok = forecast-provisioning {
     inherit pkgs common;
     fixture = k3sFull {
@@ -1051,21 +1051,23 @@ in
   #   fetcher netns → rc==0 (toEntities:[world]:80 allow fires). Then
   #   IMDS → rc≠0 (host entity, NOT world → denied). The origin probe
   #   is the non-vacuous differentiator vs builder.
-  # r[verify fetcher.node.dedicated+2]
+  # r[verify fetcher.node.dedicated+3]
   #   fetcher-node-dedicated subtest: pod spec has the rio.build/
-  #   fetcher toleration (§13e cold-start fallback) and NO pool-static
-  #   nodeSelector for either rio.build/node-role (the pre-§13e key) or
-  #   rio.build/fetcher. Restrictive fetcher placement is per-intent
-  #   `intent.node_affinity` only, which is empty for builtin FODs in
-  #   this fixture (system="builtin" → no arch → no fetcher hwClass
-  #   match). Karpenter NodePool/NodeClaim enforcement is EKS-only.
-  # r[verify ctrl.pool.fetcher-affinity-from-intent]
-  #   fetcher-node-dedicated subtest: same assertion (`nodeSelector`
-  #   absent) — the pool-static fetcher nodeSelector deletion IS the
-  #   "affinity derives exclusively from intent" close. The positive
-  #   half (per-intent nodeAffinity present) is unit-tested in
-  #   `fetcher_pod_no_pool_static_node_selector` and contract-tested in
-  #   sla_contract.rs; this is the in-cluster shape check.
+  #   fetcher toleration (§13e cold-start fallback) AND the pool-static
+  #   nodeSelector{rio.build/fetcher: true} (§13e B4) — the sole
+  #   restrictive constraint for builtin FODs (system="builtin" → no
+  #   arch → no fetcher hwClass match → no per-intent nodeAffinity).
+  #   The deleted rio.build/node-role convention must NOT reappear.
+  #   Karpenter NodePool/NodeClaim enforcement is EKS-only.
+  # r[verify ctrl.pool.fetcher-affinity-from-intent+2]
+  #   fetcher-node-dedicated subtest: same shape check — pool-static
+  #   nodeSelector present (the §13e B4 restore: it keys on
+  #   pool.spec.kind, a Pool-level invariant the per-intent affinity is
+  #   a projection of, so the two cannot drift). The positive half
+  #   (per-intent nodeAffinity present for arch-typed FODs) is
+  #   unit-tested in `builtin_fod_pod_has_pool_static_fetcher_node_selector`
+  #   / `fetcher_pod_no_legacy_node_role_selector` and contract-tested
+  #   in sla_contract.rs; this is the in-cluster shape check.
   # r[verify sched.sla.fod-feature-derivation]
   #   dispatch-fod+nonfod + fetcher-isolation subtests: FOD routes to
   #   the kind=Fetcher pod (passes_intent_filter reads

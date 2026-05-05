@@ -19,7 +19,7 @@ See [ADR-019](../decisions/019-builder-fetcher-split.md) for the full rationale 
 | Workload | Regular derivations | Fixed-output derivations only |
 | Network | Airgapped (`r[builder.netpol.airgap]`) | Egress open via Cilium `world` entity (`r[fetcher.netpol.egress-open]`) |
 | Seccomp | Standard builder profile | Stricter (`r[fetcher.sandbox.strict-seccomp]`) |
-| Node pool | `rio.build/builder` taint | Dedicated `rio.build/fetcher` taint (`r[fetcher.node.dedicated+2]`) |
+| Node pool | `rio.build/builder` taint | Dedicated `rio.build/fetcher` taint (`r[fetcher.node.dedicated+3]`) |
 | Rootfs | Writable | `readOnlyRootFilesystem: true` |
 | CRD | `Pool{kind=Builder}` | `Pool{kind=Fetcher}` (ADR-019 hardening forced) |
 | Namespace | `rio-builders` | `rio-fetchers` |
@@ -44,9 +44,9 @@ The ADR-019–defined markers for this component live in [ADR-019](../decisions/
 
 - `r[fetcher.netpol.egress-open]` — NetworkPolicy: `toEntities: [world]` on 80/443
 - `r[fetcher.sandbox.strict-seccomp]` — stricter seccomp (deny ptrace/bpf/setns/keyctl), readOnlyRootFilesystem
-- `r[fetcher.node.dedicated+2]` — dedicated nodes carrying the `rio.build/fetcher` taint+label, minted per-intent through the NodeClaim shim (§13e)
+- `r[fetcher.node.dedicated+3]` — dedicated nodes carrying the `rio.build/fetcher` taint+label, minted per-intent through the NodeClaim shim (§13e)
 - `r[ctrl.pool.reconcile]` --- Pool CRD reconciler (kind=Fetcher arm)
-- `r[ctrl.pool.fetcher-hardening]` --- ADR-019 hardening forced regardless of spec
+- `r[ctrl.pool.fetcher-hardening+2]` --- ADR-019 hardening forced regardless of spec
 - `r[ctrl.pool.fetcher-spawn-builtin]` --- spawn signal counts `builtin` FODs
 - `r[sched.dispatch.fod-to-fetcher]` — scheduler hard-filter routes FODs here
 - `r[sched.dispatch.fod-builtin-any-arch]` — `system="builtin"` FOD eligible on any fetcher

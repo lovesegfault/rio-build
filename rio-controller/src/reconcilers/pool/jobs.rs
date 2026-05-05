@@ -330,7 +330,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                 (Vec::new(), Some(e.to_string()))
             }
         };
-    // r[impl ctrl.nodeclaim.placeable-gate+2]
+    // r[impl ctrl.nodeclaim.placeable-gate+3]
     // ADR-023 §13b placeable gate: Builder Jobs spawn only for intents
     // the nodeclaim_pool reconciler's last FFD sim placed on a
     // `Registered=True` NodeClaim — structurally closes the spawn-
@@ -340,12 +340,18 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // that DESIGN.md rejected (it couldn't see node state) is resolved
     // here.
     //
-    // Builder-only: Fetcher pods land on the helm `rio-fetcher`
-    // NodePool; the FFD sim's `OWNER_LABEL` selector covers builder
-    // NodeClaims only, so gating Fetcher spawn on it stalls FODs until
-    // a builder node boots. `Ctx.placeable = None` ⇔ NodeClaim CRD
-    // absent (k3s VM tests without Karpenter) — the gate is
-    // structurally a no-op there.
+    // Builder-only retain: §13e (B2.6) made `nodeclaim_pool` cover
+    // Fetcher Pools too — `reconcile_once` polls intents with no `kind`
+    // filter and `cover_deficit` mints fetcher NodeClaims, so the
+    // placeable set DOES include fetcher intent IDs and gating fetcher
+    // spawn on it would NOT stall (the pre-§13e rationale died with the
+    // static `rio-fetcher` NodePool). The Builder-only retain is kept
+    // because fetcher fan-out is already bounded by `spec.maxConcurrent`
+    // and a fetcher pod is cheap (1 core, ~640Mi) — there is no
+    // 1226-Pending-Jobs problem for the gate to solve. Extending the
+    // retain to Fetcher pools is a follow-up. `Ctx.placeable = None` ⇔
+    // NodeClaim CRD absent (k3s VM tests without Karpenter) — the gate
+    // is structurally a no-op there.
     //
     // `gate_armed` answers "is `queued` authoritative for
     // `reap_excess_pending`?". When the gate exists (CRD present),
@@ -1751,7 +1757,7 @@ mod tests {
         assert_eq!(f.priority_class_name, None);
     }
 
-    // r[verify ctrl.nodeclaim.placeable-gate+2]
+    // r[verify ctrl.nodeclaim.placeable-gate+3]
     /// `PlaceableGate::retain` filters to the FFD-placed-on-Registered
     /// set; unarmed gate clears + returns `false` so `queued_known =
     /// None` (fail-closed reap).
@@ -1774,7 +1780,7 @@ mod tests {
         assert!(v.is_empty());
     }
 
-    // r[verify ctrl.nodeclaim.placeable-gate+2]
+    // r[verify ctrl.nodeclaim.placeable-gate+3]
     /// The spawn-intent fan-out close in unit-test form: 1226 Ready
     /// intents, FFD placed 9 on Registered nodes → only 9 survive the
     /// gate. Pre-B12 (`ready` retain) all 1226 would mint Pending Jobs;
