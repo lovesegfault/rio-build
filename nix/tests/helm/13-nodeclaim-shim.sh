@@ -2,8 +2,8 @@
 # (limits.cpu: "0", budgets[0].nodes: "0") that Karpenter sees but never
 # provisions from — rio-controller creates NodeClaims directly. §13c:
 # pre-§13c static metal NodePool deleted — kvm builds are `metal-*` hwClasses.
-# The remaining `nodePools` list (rio-fetcher / rio-general) is
-# unaffected.
+# §13e: static fetcher NodePool deleted — FODs are `fetcher-*` hwClasses.
+# The only remaining static NodePool is `rio-general` (control-plane).
 
 karp_args=(
   --set karpenter.enabled=true
@@ -35,12 +35,20 @@ test "$n" -eq 0 || {
   pools_of "$on" | grep -E '^rio-builder-' >&2
   exit 1
 }
-for p in rio-fetcher rio-general; do
+for p in rio-general; do
   pools_of "$on" | grep -qx "$p" || {
     echo "FAIL: dropped NodePool $p" >&2
     exit 1
   }
 done
+# §13e: rio-fetcher must NOT render — fetcher capacity is now NodeClaim-
+# managed via `fetcher-*` hwClasses. If it reappears, the static
+# NodePool's `limits:{cpu:5000}` and the per-class `maxFleetCores`
+# DOUBLE the fetcher fanout budget.
+if pools_of "$on" | grep -qx rio-fetcher; then
+  echo "FAIL: static rio-fetcher NodePool re-rendered (deleted in §13e)" >&2
+  exit 1
+fi
 
 # §13c: rendered scheduler.toml has metal hwClasses with nodeClass
 # rio-metal, providesFeatures=[kvm], capacityTypes=[on-demand].
@@ -69,11 +77,16 @@ for h in metal-x86 metal-arm; do
     echo "FAIL: $h missing rio.build/kvm taint" >&2; exit 1; }
 done
 
-# §13c D4a invariant: Σ hwClasses[nodeClass==rio-metal].max_fleet_cores
-# ≤ (sla.maxFleetCores − 10000). The pre-§13c static metal NodePool's
-# `limits:{cpu:10000}` was a SEPARATE budget; folding metal in adds its
-# capacity to the global pool. Bump global by 10000 and cap Σ(metal) at
-# 10000 so non-metal keeps its pre-§13c floor.
+# §13c D4a + §13e fleet-budget invariant. Each fold of a static
+# NodePool into NodeClaim-managed hwClasses adds that pool's
+# `limits.cpu` to the shared `sla.maxFleetCores`; the per-class
+# `maxFleetCores` caps mean the new classes can't crowd out the rest.
+#   §13c: metal `limits:{cpu:10000}` → bump 10000, cap Σ(metal) ≤ 10000.
+#   §13e: fetcher `limits:{cpu:5000}` → fetcher hwClasses cap at 5000
+#         each (Σ=10000) → bump 10000, cap Σ(fetcher) ≤ 10000.
+# Combined: Σ(metal) + Σ(fetcher) ≤ maxFleetCores − 10000, where the
+# 10000 RHS slack is the pre-§13c floor for non-metal non-fetcher
+# (general builder) classes.
 global_fc=$(printf '%s\n' "$sched_toml" | awk '
   /^\[sla\]/ { in_sla=1 }
   /^\[sla\./ { in_sla=0 }
@@ -85,13 +98,31 @@ metal_sum=$(printf '%s\n' "$sched_toml" | awk '
   is_metal && /^max_fleet_cores = / { sum+=$3 }
   END { print sum+0 }
 ')
+fetcher_sum=$(printf '%s\n' "$sched_toml" | awk '
+  /^\[sla\.hw_classes\./ { h=$0; sub(/.*"/,"",h); sub(/".*/,"",h); is_fetcher=0 }
+  h && /^provides_features = \[.*"fetcher".*\]/ { is_fetcher=1 }
+  is_fetcher && /^max_fleet_cores = / { sum+=$3 }
+  END { print sum+0 }
+')
+test "$metal_sum" -le 10000 || {
+  echo "FAIL: Σ metal max_fleet_cores ($metal_sum) > 10000 (D4a cap)" >&2
+  exit 1
+}
+test "$fetcher_sum" -le 10000 || {
+  echo "FAIL: Σ fetcher max_fleet_cores ($fetcher_sum) > 10000 (§13e cap)" >&2
+  exit 1
+}
 floor=$((global_fc - 10000))
-test "$metal_sum" -le "$floor" || {
-  echo "FAIL: Σ metal max_fleet_cores ($metal_sum) > maxFleetCores−10000 ($floor)" >&2
-  echo "  D4a: non-metal would lose its pre-§13c 10000 floor" >&2
+test "$((metal_sum + fetcher_sum))" -le "$floor" || {
+  echo "FAIL: Σ(metal)+Σ(fetcher) ($metal_sum+$fetcher_sum=$((metal_sum + fetcher_sum))) > maxFleetCores−10000 ($floor)" >&2
+  echo "  general-builder classes would lose their pre-§13c 10000 floor" >&2
   exit 1
 }
 test "$metal_sum" -gt 0 || {
   echo "FAIL: Σ metal max_fleet_cores is 0 — metal hwClasses missing maxFleetCores" >&2
+  exit 1
+}
+test "$fetcher_sum" -gt 0 || {
+  echo "FAIL: Σ fetcher max_fleet_cores is 0 — fetcher hwClasses missing maxFleetCores" >&2
   exit 1
 }

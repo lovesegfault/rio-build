@@ -164,9 +164,13 @@ spec:
         # I-205 template-side guard: every static NodePool gets the
         # metal exclusion. §13c: there is no static metal NodePool —
         # `metal-*` hwClasses get the `In` side from §13b
-        # `cover::build_nodeclaim`. Single source `$.Values.karpenter.
-        # metalSizes` (also `controller.toml metal_sizes`). Don't
-        # open-code instance-size in `requirements:`.
+        # `cover::build_nodeclaim`. §13e: there is no static fetcher
+        # NodePool either — `fetcher-*` hwClasses route through
+        # rio-nodeclaim-shim. The only static NodePool is rio-general
+        # (control-plane); the exclusion stops Karpenter from picking a
+        # .metal instance for a system pod. Single source
+        # `$.Values.karpenter.metalSizes` (also `controller.toml
+        # metal_sizes`). Don't open-code instance-size in `requirements:`.
         - key: karpenter.k8s.aws/instance-size
           operator: NotIn
           values: {{ toJson $k.metalSizes }}

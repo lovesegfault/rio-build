@@ -61,8 +61,12 @@ test "$ctrl_metal" = "$want" || {
   echo "FAIL: controller.toml metal_sizes ($ctrl_metal) != karpenter.metalSizes ($want)" >&2
   exit 1
 }
-uefi_notin=$(notin_of rio-fetcher)
+# §13e: rio-fetcher NodePool deleted; rio-general is the only static
+# NodePool left to spot-check the lockstep between
+# `.Values.karpenter.metalSizes` (template-side NotIn) and
+# `controller.toml metal_sizes` (controller-side In/NotIn).
+uefi_notin=$(notin_of rio-general)
 test "$ctrl_metal" = "$uefi_notin" || {
-  echo "FAIL: controller.toml metal_sizes ($ctrl_metal) != rio-fetcher NotIn ($uefi_notin) — partition not single-sourced" >&2
+  echo "FAIL: controller.toml metal_sizes ($ctrl_metal) != rio-general NotIn ($uefi_notin) — partition not single-sourced" >&2
   exit 1
 }
