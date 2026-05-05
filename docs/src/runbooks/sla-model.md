@@ -17,7 +17,7 @@ override or reset.
 | `RioSlaPriorDivergenceClamped` | fleet-prior parameter clamped at band edge for 10m | [Prior divergence](#riosla-priordivergenceclamped) |
 | `RioSlaHwCostStale` | hw-band $/vCPU·hr snapshot >30m old | [Hw-cost stale](#riosla-hwcoststale) |
 | `RioNodeclaimPoolIceMaskedHigh` | ≥3 cells reaping NodeClaims for `reason=ice` | [Admissible set shrinking](#rionodeclaimpool-icemaskedhigh) |
-| `RioNodeclaimPoolStuckPending` | NodeClaim in-flight >90s | [Provisioning stuck](#rionodeclaimpool-stuckpending) |
+| `RioNodeclaimPoolStuckPending` | NodeClaim in-flight >3× cell lead-time (floor 90s, cap 30m) | [Provisioning stuck](#rionodeclaimpool-stuckpending) |
 
 The first three are model-accuracy alerts; the last two are provisioning
 alerts that share the same `rio-cli sla` diagnostic surface.
@@ -246,10 +246,14 @@ Karpenter controller logs and AWS quota; `rio-cli sla override <pname>
 
 ### RioNodeclaimPool StuckPending
 
-NodeClaim created but not Registered for >90s (~3× boot lead-time seed).
-Either Launched=False (ICE — see above) or Launched=True but kubelet never
-joined (AMI / nodeadm / CNI break). Not model-related; `kubectl get nodeclaims
--o wide` and inspect `Launched`/`Registered` conditions.
+NodeClaim created but not Registered for >3× the cell's lead-time gauge
+(`rio_controller_nodeclaim_lead_time_seconds{cell}`), clamped to a 90s floor /
+30m cap — ~90s for EBS cells (lead≈18s), ~30m for `metal-*` cells (lead=600s).
+The threshold sits above the controller's own 2×seed reap; a firing alert means
+the reaper failed, not just a slow boot. Either Launched=False (ICE — see above)
+or Launched=True but kubelet never joined (AMI / nodeadm / CNI break). Not
+model-related; `kubectl get nodeclaims -o wide` and inspect
+`Launched`/`Registered` conditions.
 
 ## Troubleshooting Matrix
 

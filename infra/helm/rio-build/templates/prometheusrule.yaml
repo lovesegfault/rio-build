@@ -167,16 +167,32 @@ spec:
               controller logs for InsufficientInstanceCapacity / quota,
               and `rio_scheduler_sla_hw_ladder_exhausted_total`.
 
-        # ADR-023 §13b: oldest in-flight NodeClaim (created, not
-        # Registered) is >90s — ~3× the probe-boot leadTimeSeed (17-21s).
+        # ADR-023 §13b/§13c: oldest in-flight NodeClaim (created, not
+        # Registered) older than 3× the cell's expected boot time.
+        # Per-cell threshold (r33 bug_001): a single hardcoded `> 90`
+        # was calibrated for the EBS band (leadTimeSeed 17-21s) and
+        # false-fires for the entire 7-15min metal boot once §13c adds
+        # `metal-*:od` leadTimeSeed=600. Both gauges are emitted with
+        # `cell` from the same loop in `emit_live_gauges`
+        # (rio-controller nodeclaim_pool/mod.rs), so the join cannot
+        # drop a series. `clamp(.., 90, 1800)`: the 90s floor preserves
+        # the EBS band's behaviour (lead≈18s → 3×=54s would false-fire
+        # on autoscaler queueing tail) AND covers the unseeded cell
+        # where lead reads 0 (3×0=0 → 90); the 1800s cap stops an
+        # absurd seed from disarming the alert. Sits above the
+        # controller's own 2×seed reap timeout (health.rs) — a healthy
+        # boot or a successful reap clears the gauge before the alert
+        # window; a firing alert means the reaper itself failed.
         # Keys on per-cell max age, NOT count: under sustained scale-up
         # the inflight count never touches 0 even when every individual
-        # claim registers in ~18s, so a count-based `for: 90s` fires on
+        # claim registers in ~18s, so a count-based `for` fires on
         # every healthy burst. Either Launched=False (ICE — see
         # reaped{reason=ice|vanished}) or Launched=True but kubelet never
         # joined (AMI/nodeadm/CNI break).
         - alert: RioNodeclaimPoolStuckPending
-          expr: rio_controller_nodeclaim_inflight_age_max_seconds > 90
+          expr: |
+            rio_controller_nodeclaim_inflight_age_max_seconds
+              > clamp(3 * rio_controller_nodeclaim_lead_time_seconds, 90, 1800)
           for: 30s
           labels:
             severity: warning
@@ -185,8 +201,9 @@ spec:
             description: >-
               cell={{`{{ $labels.cell }}`}} has a NodeClaim
               {{`{{ $value | humanizeDuration }}`}} past creation without
-              Registered=True (~3× leadTimeSeed is ~60s). Check
-              `kubectl get nodeclaims` Launched/Registered conditions and
+              Registered=True (threshold: 3× the cell's lead-time gauge,
+              floor 90s, cap 30m). Check `kubectl get nodeclaims`
+              Launched/Registered conditions and
               rio_controller_nodeclaim_reaped_total{reason=ice|boot-timeout|vanished}.
 
         # Forward-compat: rio_store_putpath_retries_total lands in P0539d.

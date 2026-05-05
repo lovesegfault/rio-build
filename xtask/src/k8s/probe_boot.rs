@@ -306,29 +306,44 @@ pub async fn run() -> Result<()> {
     // a shim leak. Our own probes carry `rio.build/probe=true`; any
     // shim-labelled claim WITHOUT it is one Karpenter created on the
     // shim's behalf — `limits:{cpu:0}` should make that impossible.
-    let shim_leaks: Vec<String> = claims
-        .list(&ListParams::default().labels(&format!(
-            "karpenter.sh/nodepool={SHIM_NODEPOOL},{PROBE_LABEL}!=true"
-        )))
-        .await?
-        .into_iter()
-        .filter(|nc| {
-            find_condition(nc, "Launched")
-                .is_some_and(|c| c.get("status").and_then(Value::as_str) == Some("True"))
-        })
-        .filter_map(|nc| nc.metadata.name)
-        .collect();
-    ensure!(
-        shim_leaks.is_empty(),
-        "assertion 2 FAIL: shim NodePool {SHIM_NODEPOOL} provisioned NodeClaim(s) \
-         {shim_leaks:?} (Launched=True). The shim MUST have `limits:{{cpu:0}}` so it \
-         never provisions — fix `infra/helm/rio-build/templates/karpenter.yaml` and \
-         redeploy."
-    );
+    //
+    // bug_009: collect into its own `Result` instead of `?`-propagating
+    // from `run()`. Both error paths here — a transient apiserver error
+    // on `list()` and a real shim leak from `ensure!` — must still
+    // reach the cleanup loop and `print_results` below; otherwise a
+    // 20+min probe run discards every collected `leadTimeSeed` entry
+    // AND orphans the probe NodeClaims. The bug_018 partial-results
+    // invariant ("any failure path still prints what was collected")
+    // only held for the inner block's `result`; this restores it for
+    // assertion 2.
+    let assertion2: Result<()> = async {
+        let shim_leaks: Vec<String> = claims
+            .list(&ListParams::default().labels(&format!(
+                "karpenter.sh/nodepool={SHIM_NODEPOOL},{PROBE_LABEL}!=true"
+            )))
+            .await?
+            .into_iter()
+            .filter(|nc| {
+                find_condition(nc, "Launched")
+                    .is_some_and(|c| c.get("status").and_then(Value::as_str) == Some("True"))
+            })
+            .filter_map(|nc| nc.metadata.name)
+            .collect();
+        ensure!(
+            shim_leaks.is_empty(),
+            "assertion 2 FAIL: shim NodePool {SHIM_NODEPOOL} provisioned NodeClaim(s) \
+             {shim_leaks:?} (Launched=True). The shim MUST have `limits:{{cpu:0}}` so it \
+             never provisions — fix `infra/helm/rio-build/templates/karpenter.yaml` and \
+             redeploy."
+        );
+        Ok(())
+    }
+    .await;
 
     // Best-effort cleanup of anything still around (mid-loop bail,
     // delete race). Operator can also `kubectl delete nodeclaims -l
-    // rio.build/probe=true`.
+    // rio.build/probe=true`. Reached unconditionally — both `result`
+    // and `assertion2` are deferred until after this loop (bug_009).
     for name in &created {
         if let Err(e) = claims.delete(name, &DeleteParams::default()).await {
             warn!("cleanup: delete NodeClaim {name}: {e}");
@@ -339,7 +354,9 @@ pub async fn run() -> Result<()> {
     // a single-cell timeout (e.g. a misconfigured metal cell) doesn't
     // discard every already-measured virtualized entry. The operator
     // pastes the partial leadTimeSeed block and re-runs for the
-    // failed cell separately.
+    // failed cell separately. bug_009: `assertion2` is part of the
+    // overall outcome now — `print_results` marks the run incomplete
+    // if EITHER the inner loop or assertion 2 failed.
     // TODO: per-cell error tolerance — collect (cell, error) and report
     // all failures, don't abort on first. Needs the `last_claim` hold
     // for assertions 4/5 to be decoupled from the loop's error path.
@@ -352,8 +369,12 @@ pub async fn run() -> Result<()> {
             );
         }
     }
-    print_results(&mut results, result.is_ok());
+    if let Err(e) = &assertion2 {
+        warn!("assertion 2: {e:#}");
+    }
+    print_results(&mut results, result.is_ok() && assertion2.is_ok());
     result?;
+    assertion2?;
     Ok(())
 }
 

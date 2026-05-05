@@ -673,7 +673,11 @@ scheduler:
       # `health::classify`'s `2×seed` reap timeout (1200s) covers AWS
       # .metal POST + firmware + kubelet boot. Observed metal boot is
       # typically 7–15 min; if 1200s proves too tight raise `maxLeadTime`
-      # first (it caps the seed). (bug_015)
+      # first (it caps the seed). When raising past 900s, also raise the
+      # `RioNodeclaimPoolStuckPending` alert's `clamp` ceiling
+      # (prometheusrule.yaml) — the alert must fire AFTER the reaper
+      # would have acted (`clamp` cap >= 2×maxLeadTime). (bug_015,
+      # bug_001)
       "metal-arm:od": 600.0
       "metal-x86:od": 600.0
     # DESTRUCTIVE one-shot: pass --allow-reference-change for ONE
