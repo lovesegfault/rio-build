@@ -2953,6 +2953,88 @@ async fn bypass_cells_unhosted_cap_pin_drops_at_producer() {
     );
 }
 
+/// §13e: a FOD intent must route to fetcher cells, NOT be hw-agnostic.
+/// Pre-§13e: `bypass_cells` returned `[]` for FODs (no per-intent
+/// affinity → static `rio-fetcher` NodePool's pod nodeSelector caught
+/// them). Post-§13e: FOD's `effective_features = [fetcher]` →
+/// `class_routes` admits `fetcher-{x86,arm}` → `retain_hosting_cells`
+/// keeps them → `cells_to_selector_terms` writes the per-intent
+/// `nodeAffinity{rio.build/fetcher}`.
+///
+/// `pname=None` → no fit → exercises `bypass_cells` (cold-start path).
+// r[verify sched.sla.fod-feature-derivation]
+#[tokio::test]
+async fn fod_intent_routes_to_fetcher_cell() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    actor.test_inject_ready("fod-1", None, "x86_64-linux", true);
+    let intents = actor.compute_spawn_intents(&Default::default()).intents;
+    let fod = intents
+        .iter()
+        .find(|i| i.intent_id == "fod-1")
+        .expect("FOD intent must be emitted");
+    assert!(
+        fod.hw_class_names.iter().any(|h| h.starts_with("fetcher-")),
+        "FOD must route to a fetcher cell; got hw_class_names={:?}",
+        fod.hw_class_names
+    );
+    assert!(
+        fod.hw_class_names.iter().all(|h| h.starts_with("fetcher-")),
+        "FOD must route ONLY to fetcher cells; got hw_class_names={:?}",
+        fod.hw_class_names
+    );
+}
+
+/// §13e: a FOD intent with a seeded cost-table fit must still route to
+/// fetcher cells via `solve_full` (not just the `bypass_cells`
+/// cold-start path). Pre-§13e the `!is_fixed_output` gate kept FODs
+/// out of `solve_full` entirely.
+// r[verify sched.sla.fod-feature-derivation]
+#[tokio::test]
+async fn fod_intent_with_fit_routes_to_fetcher_cell() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    // `bare_actor_hw` seeds a "test-pkg" Amdahl fit; the FOD shares it
+    // (lookup is by `ModelKey {pname, system, tenant}`, not `is_fod`).
+    actor.test_inject_ready("fod-2", Some("test-pkg"), "x86_64-linux", true);
+    let intents = actor.compute_spawn_intents(&Default::default()).intents;
+    let fod = intents
+        .iter()
+        .find(|i| i.intent_id == "fod-2")
+        .expect("FOD intent must be emitted");
+    assert!(
+        fod.hw_class_names.iter().any(|h| h.starts_with("fetcher-")),
+        "FOD with fit must route to a fetcher cell; got hw_class_names={:?}",
+        fod.hw_class_names
+    );
+    assert!(
+        fod.hw_class_names.iter().all(|h| h.starts_with("fetcher-")),
+        "FOD with fit must route ONLY to fetcher cells; got hw_class_names={:?}",
+        fod.hw_class_names
+    );
+}
+
+/// §13e inverse: a non-FOD builder intent must NOT route to fetcher
+/// cells. The bidirectional ∅-guard makes this structural:
+/// `[] ⊆ [fetcher]` fails `required.is_empty() == provides.is_empty()`.
+// r[verify sched.sla.fod-feature-derivation]
+#[tokio::test]
+async fn builder_intent_does_not_route_to_fetcher_cell() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    actor.test_inject_ready("build-1", Some("test-pkg"), "x86_64-linux", false);
+    let intents = actor.compute_spawn_intents(&Default::default()).intents;
+    let bld = intents
+        .iter()
+        .find(|i| i.intent_id == "build-1")
+        .expect("builder intent must be emitted");
+    assert!(
+        !bld.hw_class_names.iter().any(|h| h.starts_with("fetcher-")),
+        "builder must NOT route to a fetcher cell; got hw_class_names={:?}",
+        bld.hw_class_names
+    );
+}
+
 /// **mb_003 / r31 A3** — the producer-side `cap ∉ capacity_types_for(h)`
 /// drop is NOT silent: it fires a debounced `warn!` keyed
 /// `(tenant, pname, cap)` so the operator's ignored `--capacity` pin is
