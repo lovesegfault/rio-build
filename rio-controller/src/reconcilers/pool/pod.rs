@@ -290,9 +290,11 @@ fn effective_tolerations(pool: &Pool, hw: &HwClassConfig) -> Option<Vec<Tolerati
 }
 
 /// Pool advertises a feature that routes drvs to a metal hw-class →
-/// pod needs the metal *toleration* (permissive). FODs route by
-/// `is_fixed_output` alone, never by features, so fetchers never want
-/// metal. See `r[ctrl.pool.kvm-device+2]`.
+/// pod needs the metal *toleration* (permissive). Fetcher Pools'
+/// `effective_features` is forced to `[fetcher]`
+/// (`r[ctrl.crd.fetcher-no-features+2]`, §13e) — never `kvm` — so the
+/// metal-routing predicate can never fire for them; short-circuit on
+/// `is_fetcher`. See `r[ctrl.pool.kvm-device+2]`.
 ///
 /// **§Permissive-restrictive asymmetry (r33 bug_002):** this predicate
 /// gates the toleration only, never a `nodeSelector`. A pool-static

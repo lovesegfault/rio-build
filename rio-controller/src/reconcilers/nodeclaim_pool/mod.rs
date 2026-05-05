@@ -701,7 +701,6 @@ impl NodeClaimPoolReconciler {
             self.admin
                 .clone()
                 .get_spawn_intents(GetSpawnIntentsRequest {
-                    kind: None,
                     ..Default::default()
                 }),
         )

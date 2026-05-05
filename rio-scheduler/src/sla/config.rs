@@ -454,9 +454,9 @@ pub struct ProbeShape {
     pub cpu: f64,
     pub mem_per_core: u64,
     pub mem_base: u64,
-    /// `activeDeadlineSeconds` for unfitted (probe/explore) builds —
-    /// D7 in the legacy-sizer removal: fitted keys derive a deadline
-    /// from `wall_p99`, unfitted ones fall back to this.
+    /// `activeDeadlineSeconds` for unfitted (probe/explore) builds.
+    /// Fitted keys derive a deadline from `wall_p99`; unfitted ones
+    /// fall back to this.
     #[serde(default = "default_probe_deadline_secs")]
     pub deadline_secs: u32,
 }

@@ -124,9 +124,20 @@ fn effective_features(state: &crate::state::DerivationState) -> Vec<String> {
 }
 
 /// Request-side filter shared by the Ready and forecast passes of
-/// [`DagActor::compute_spawn_intents`]: kind (ADR-019 boundary),
-/// per-arch systems intersection (I-107/I-143), I-176/I-181 feature
-/// subset + ∅-guard.
+/// [`DagActor::compute_spawn_intents`]: kind, per-arch systems
+/// intersection (I-107/I-143), I-176/I-181 feature subset + ∅-guard.
+///
+/// Axis ownership (post-§13e): the ADR-019 FOD↔Fetcher airgap is
+/// enforced here by the **features** clause via the
+/// `effective_features` chokepoint (`is_fixed_output ⟹ [fetcher]`).
+/// The **kind** clause is NOT the spawn-side airgap — it stays because
+/// (a) the CLI/dashboard "all Builder intents" query sets `kind` with
+/// `features: None`, and (b) `kind` is the *dispatch-time* airgap
+/// (`assignment.rs::hard_filter` reads *declared*, not effective,
+/// features). For the controller's `queued_for_pool` poll — which
+/// always sets both `kind` and `features = effective_features(spec)` —
+/// the kind clause is informationally redundant with the features
+/// axis.
 fn passes_intent_filter(
     state: &crate::state::DerivationState,
     kind: rio_proto::types::ExecutorKind,
