@@ -1809,16 +1809,11 @@ async fn contract_pinned_explore_releases_on_infeasible() {
 async fn contract_pinned_explore_covers_pool() {
     use crate::sla::config::{HwClassDef, NodeLabelMatch};
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_hw(db.pool.clone());
-    // §13e: drop the fixture's fetcher-* classes — this test counts
-    // ALL `cfg.hw_classes` (not the drv's `h_all`) for the `pool`
-    // precondition, and a featureless drv never routes to fetcher
-    // cells (∅-guard), so the count would diverge from the test's
-    // observed pin draws.
-    actor
-        .sla_config
-        .hw_classes
-        .retain(|h, _| !h.starts_with("fetcher-"));
+    // Builders-only fixture: the `pool` precondition counts ALL
+    // `cfg.hw_classes`, but a featureless drv never pins to fetcher
+    // cells (∅-guard) — fetcher-* would inflate `want_pool` past what
+    // the rotation can actually draw.
+    let mut actor = bare_actor_hw_builders_only(db.pool.clone());
     // 4th hw_class → |pool| = |H\{cheapest}| = 3. All hw factors = 1.0
     // so T(c)/factor = 2000 > p90=1200 at every cell → in_a = ∅ →
     // pool = H\{cheapest} (NOT H\A).
@@ -2385,15 +2380,13 @@ async fn contract_hw_cost_unknown_once_per_epoch() {
     const HW_COST_UNKNOWN: &str = "rio_scheduler_sla_hw_cost_unknown_total";
 
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_hw(db.pool.clone());
+    // Builders-only fixture: the precondition asserts
+    // `cfg.hw_classes.len()==3` and the metric count derives from
+    // `|h_all|`; a featureless drv never routes to fetcher cells
+    // (∅-guard), so fetcher-* would inflate the count without any
+    // ClassCeiling cell appearing for them.
+    let mut actor = bare_actor_hw_builders_only(db.pool.clone());
     actor.sla_config.hw_explore_epsilon = 1.0;
-    // §13e: drop the fixture's fetcher-* classes — the precondition
-    // asserts on `cfg.hw_classes.len()` (not the drv's `h_all`); a
-    // featureless drv never routes to fetcher cells (∅-guard).
-    actor
-        .sla_config
-        .hw_classes
-        .retain(|h, _| !h.starts_with("fetcher-"));
     assert_eq!(actor.sla_tiers.len(), 1, "fixture: |tiers|=1");
     assert_eq!(actor.sla_config.hw_classes.len(), 3, "fixture: |h_all|=3");
     // intel-8 only: per-class max_mem=1GiB → make_fit("test-pkg")

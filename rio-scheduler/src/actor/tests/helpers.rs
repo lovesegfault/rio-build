@@ -876,11 +876,21 @@ pub(crate) fn bare_actor_sla(pool: sqlx::PgPool) -> DagActor {
     )
 }
 
-/// `[sla]` config with 3 hw_classes + `hw_cost_source=Static` so the
-/// admissible-set solve_full path is reachable. ε_h=0 so per-dispatch
-/// results are deterministic (set explicitly in ε_h tests).
-pub(crate) fn test_hw_sla_config() -> crate::sla::config::SlaConfig {
-    use crate::sla::config::{HwClassDef, NodeLabelMatch, NodeTaint};
+/// 3-class builders-only `[sla]` config: `intel-6/7/8`, no
+/// `fetcher-*`. ε_h=0 so per-dispatch results are deterministic
+/// (set explicitly in ε_h tests).
+///
+/// **Why a separate fixture exists (§13e cleanup):** several tests
+/// assert on `cfg.hw_classes` cardinality or pinned-explore pool
+/// counts (e.g. `assert_eq!(h_all.len(), 3)`). Featureless drvs never
+/// route to `fetcher-*` cells (∅-guard), so any non-builder class in
+/// the fixture inflates `h_all` without ever appearing in a solve —
+/// the assertion goes red without a routing change. Building this
+/// fixture SMALL — instead of filtering [`test_hw_sla_config`] down by
+/// prefix — means the next class added there (e.g. a `metal-*` band
+/// from the helm chart) stays out of these tests automatically.
+pub(crate) fn test_hw_sla_config_builders_only() -> crate::sla::config::SlaConfig {
+    use crate::sla::config::{HwClassDef, NodeLabelMatch};
     let mut cfg = test_sla_config();
     cfg.hw_explore_epsilon = 0.0;
     cfg.hw_classes.clear();
@@ -898,6 +908,15 @@ pub(crate) fn test_hw_sla_config() -> crate::sla::config::SlaConfig {
             },
         );
     }
+    cfg
+}
+
+/// `[sla]` config with 3 builder + 2 fetcher hw_classes +
+/// `hw_cost_source=Static` so the admissible-set solve_full path is
+/// reachable. Builds on [`test_hw_sla_config_builders_only`].
+pub(crate) fn test_hw_sla_config() -> crate::sla::config::SlaConfig {
+    use crate::sla::config::{HwClassDef, NodeLabelMatch, NodeTaint};
+    let mut cfg = test_hw_sla_config_builders_only();
     // §13e: fetcher hwClasses. FODs route here via
     // `effective_features(state) = [fetcher]` — the bidirectional
     // ∅-guard means featureless builders never see these (and FODs
@@ -992,17 +1011,13 @@ pub(crate) fn solve_intent(
     actor.solve_intent_for(state, &hw, &cost, ig)
 }
 
-/// Bare (unspawned) actor with [`test_hw_sla_config`] + populated
-/// 3-class hw table + one fitted key `"test-pkg"`. For
-/// admissible-set / ε_h / ICE-mask tests.
-pub(crate) fn bare_actor_hw(pool: sqlx::PgPool) -> DagActor {
-    let mut actor = bare_actor_cfg(
-        pool,
-        DagActorConfig {
-            sla: test_hw_sla_config(),
-            ..Default::default()
-        },
-    );
+/// Shared post-config actor seeding for [`bare_actor_hw`] /
+/// [`bare_actor_hw_builders_only`]: Spot-sourced cost table, resolved
+/// ceilings, builder hw factors (`intel-6/7/8`), one fitted key
+/// `"test-pkg"`. The hw-factor map covers builders only — fetcher
+/// classes (when present in `sla_config`) have no fit key and are
+/// excluded by the ∅-guard regardless.
+fn seed_hw_actor(mut actor: DagActor) -> DagActor {
     // `set_price` no longer upgrades source; tests that probe per-h
     // price discrimination need a Spot-sourced table.
     *actor.cost_table.write() =
@@ -1025,6 +1040,33 @@ pub(crate) fn bare_actor_hw(pool: sqlx::PgPool) -> DagActor {
         .seed_hw(crate::sla::hw::HwTable::from_map(m));
     seed_fit(&actor, "test-pkg");
     actor
+}
+
+/// Bare (unspawned) actor with [`test_hw_sla_config`] (3 builder + 2
+/// fetcher classes) + populated builder hw table + one fitted key
+/// `"test-pkg"`. For admissible-set / ε_h / ICE-mask tests.
+pub(crate) fn bare_actor_hw(pool: sqlx::PgPool) -> DagActor {
+    seed_hw_actor(bare_actor_cfg(
+        pool,
+        DagActorConfig {
+            sla: test_hw_sla_config(),
+            ..Default::default()
+        },
+    ))
+}
+
+/// [`bare_actor_hw`] with [`test_hw_sla_config_builders_only`]'s
+/// 3-class fixture — no `fetcher-*`. For tests that assert on
+/// `cfg.hw_classes` cardinality or pinned-explore pool counts; see the
+/// fixture's doc for why these need a builders-only set.
+pub(crate) fn bare_actor_hw_builders_only(pool: sqlx::PgPool) -> DagActor {
+    seed_hw_actor(bare_actor_cfg(
+        pool,
+        DagActorConfig {
+            sla: test_hw_sla_config_builders_only(),
+            ..Default::default()
+        },
+    ))
 }
 
 /// Bootstrap PG + spawned actor with the realistic-ceiling `[sla]`

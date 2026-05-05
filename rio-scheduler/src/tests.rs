@@ -193,10 +193,12 @@ fn sla_globals_unset_in_toml_extract_as_none() {
 #[test]
 fn config_default_is_not_bootable_without_sla_source() {
     use rio_common::config::ValidateConfig;
-    let mut cfg = Config::default();
     // Satisfy the non-[sla] required fields so the assert isolates the
     // [sla] check (these would otherwise trip first).
-    cfg.database_url = "postgres://test".into();
+    let mut cfg = Config {
+        database_url: "postgres://test".into(),
+        ..Config::default()
+    };
     cfg.store.addr = "http://localhost:1".into();
     let err = cfg
         .validate()

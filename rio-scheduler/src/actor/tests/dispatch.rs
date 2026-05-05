@@ -1896,15 +1896,11 @@ async fn ice_step_doubles_across_heartbeat_at_multi_cell() {
 #[tokio::test]
 async fn epsilon_h_draws_outside_a() {
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_hw(db.pool.clone());
-    // §13e: drop the fixture's fetcher-* classes — this test asserts
-    // `in_a == cfg.hw_classes` (A=H under equal factors), but a
-    // featureless drv never routes to fetcher cells (∅-guard), so
-    // they would never appear in `in_a` even when admissible.
-    actor
-        .sla_config
-        .hw_classes
-        .retain(|h, _| !h.starts_with("fetcher-"));
+    // Builders-only fixture: this test compares `in_a` (drv-routable
+    // classes) against `h_all = cfg.hw_classes`. Featureless drvs
+    // never route to fetcher cells (∅-guard), so fetcher-* in `h_all`
+    // would make `in_a ⊊ h_all` trivially true.
+    let mut actor = bare_actor_hw_builders_only(db.pool.clone());
     actor.test_inject_ready("d", Some("test-pkg"), "x86_64-linux", false);
 
     // Baseline at ε=0 (bare_actor_hw default) so the memo is the
