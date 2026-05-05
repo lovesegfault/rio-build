@@ -1211,7 +1211,7 @@ pub(crate) mod tests {
     /// featureless intent can NOT land on kvm-tainted metal. Pre-fix
     /// `simulate` only knew arch — a cold-start kvm intent FFD-placed
     /// onto any amd64 node, the deficit appeared covered, no metal
-    /// NodeClaim minted, kvm pod permanently Pending.
+    /// NodeClaim minted, kvm pod CrashLoopBackOff on ENXIO `/dev/kvm`.
     #[test]
     fn ffd_agnostic_intent_filtered_by_features() {
         // One non-metal x86 node (provides=[]), one metal x86 node

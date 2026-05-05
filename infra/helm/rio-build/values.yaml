@@ -589,8 +589,10 @@ scheduler:
       # `nodeClass: rio-metal` (cover.rs METAL_NODE_CLASS).
       # On-demand only (`capacityTypes`): metal is expensive idle, spot
       # interruption mid-VM-test wastes the whole build. The
-      # `rio.build/kvm` label feeds the pod nodeSelector; the matching
-      # taint keeps non-kvm pods off.
+      # `rio.build/kvm` label is stamped onto the Node and matched by
+      # the per-intent pod nodeAffinity (r33 bug_002: pool-static
+      # nodeSelector deleted); the matching taint keeps non-kvm pods
+      # off.
       metal-x86:
         nodeClass: rio-metal
         labels:

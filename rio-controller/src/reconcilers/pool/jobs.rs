@@ -1881,17 +1881,22 @@ mod tests {
         // Pass the test `hw` directly (was `HwClassConfig::default()`,
         // which masked the deleted pool-static nodeSelector). With the
         // real config, `wants_metal` is false (`metal-x86` carries no
-        // `provides_features`) AND the structural invariant holds.
+        // `provides_features`) AND the precondition holds.
         let mut spec =
             pod::build_executor_pod_spec(&pool, &test_sched_addrs(), &test_store_addrs(), &hw);
-        // r33 bug_002 structural invariant: no pool-static kvm
-        // nodeSelector — the per-intent affinity is the ONLY restrictive
-        // mechanism.
+        // Pre-condition (r34 bug_002): `wants_metal=false` in this
+        // fixture (`metal-x86` carries no `provides_features`), so the
+        // pool-static path adds neither nodeSelector nor toleration —
+        // the per-intent toleration tested below is the only source.
+        // The r33 bug_002 structural invariant (no pool-static kvm
+        // nodeSelector under `wants_metal=true`) is the LOAD-BEARING
+        // test at pod.rs::wants_metal_does_not_force_node_selector_on_
+        // shared_feature.
         assert!(
             spec.node_selector
                 .as_ref()
                 .is_none_or(|ns| !ns.contains_key("rio.build/kvm")),
-            "structural invariant: no pool-static kvm nodeSelector"
+            "precondition: pool-static path adds no kvm nodeSelector"
         );
         // Pre-condition: no kvm toleration from the pool-static path.
         assert!(

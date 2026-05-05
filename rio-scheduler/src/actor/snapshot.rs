@@ -1774,9 +1774,10 @@ impl DagActor {
             // §13d STRIKE-7 (mb_012, A9): cold-start featured intent
             // (`fit=None`, no override). Pre-fix this arm returned `[]`
             // → controller's `fallback_cell` / FFD `agnostic_arch`
-            // picked a non-metal cell → kvm pod (`nodeSelector:
-            // rio.build/kvm=true`) permanently Pending → no
-            // `build_sample` → `fit` stays `None` → bootstrap deadlock.
+            // picked a non-metal cell → kvm pod CrashLoopBackOff on
+            // ENXIO `/dev/kvm` (no metal node minted; pool-static
+            // nodeSelector deleted r33 bug_002) → no `build_sample` →
+            // `fit` stays `None` → bootstrap deadlock.
             // Emit cells for every configured cap of the reference
             // class so the controller minds the metal cell. Featureless
             // intents stay `[]` (genuinely hw-agnostic; controller's

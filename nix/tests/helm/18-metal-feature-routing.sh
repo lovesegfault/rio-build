@@ -61,7 +61,7 @@ metal_check=$(awk '
     }
   }
   /^\[sla\.hw_classes\./ {
-    flush(); h=$0; sub(/.*"/,"",h); sub(/".*/,"",h)
+    flush(); h=$0; sub(/^\[sla\.hw_classes\."/,"",h); sub(/"\]$/,"",h)
     nc=""; pf=""; haslbl=0; hastaint=0; sect=""
   }
   /^\[sla\./ && !/^\[sla\.hw_classes\./ { flush(); h="" }
@@ -129,9 +129,10 @@ fi
 #
 #    Two-pass via END so the check is order-independent of where
 #    `[sla.lead_time_seed]` renders relative to `[sla.hw_classes.*]`.
-#    `h` extraction: anchored prefix/suffix sub (not the §1/§2 greedy
-#    `sub(/.*"/,…)` which collapses to `]` — §1 doesn't print `h` so it
-#    never noticed; §5 uses `h` as the seed-map key).
+#    `h` extraction: anchored prefix/suffix sub. §1/§2/§5/§6 all use
+#    this form; the greedy `sub(/.*"/,…)` collapses `h` to `]` (the
+#    bug never surfaced because flush() only printfs `h` on a
+#    violation, and the default chart passes — fixed r34 bug_014).
 lead_time_seed_coverage_awk='
   function flush() {
     if (h == "") return

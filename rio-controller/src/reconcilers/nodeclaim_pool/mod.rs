@@ -773,7 +773,8 @@ impl NodeClaimPoolReconciler {
         // §13d STRIKE-7 (mb_012): the agnostic-fallback admit predicate
         // checks arch ∧ features. A `hw_class_names=[]` kvm intent must
         // NOT FFD-place onto a non-metal node (deficit appears covered →
-        // no metal NodeClaim minted → kvm pod permanently Pending); a
+        // no metal NodeClaim minted → kvm pod CrashLoopBackOff on ENXIO
+        // `/dev/kvm`; pool-static nodeSelector deleted r33 bug_002); a
         // featureless intent must NOT land on a kvm-tainted metal node
         // (pod has no toleration → wasted on-demand metal).
         let (placeable, unplaced) = ffd::simulate(
@@ -1491,7 +1492,8 @@ mod tests {
     /// get `hw_class_names=[metal-*]` — false for cold-start
     /// (`fit=None`). A cold-start kvm intent with `hw_class_names=[]`
     /// must NOT fall back to the non-metal reference cell (the kvm
-    /// pod's `nodeSelector` would never match → permanently Pending).
+    /// pod CrashLoopBackOffs on ENXIO `/dev/kvm`; pool-static
+    /// nodeSelector deleted r33 bug_002).
     /// Inverse (∅-guard): a featureless intent must NOT route to a
     /// kvm-tainted metal cell (pod has no toleration → wasted on-demand
     /// metal Node).

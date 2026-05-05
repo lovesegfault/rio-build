@@ -372,7 +372,7 @@ pub async fn run() -> Result<()> {
     if let Err(e) = &assertion2 {
         warn!("assertion 2: {e:#}");
     }
-    print_results(&mut results, result.is_ok() && assertion2.is_ok());
+    print_results(&mut results, result.is_ok(), assertion2.is_ok());
     result?;
     assertion2?;
     Ok(())
@@ -699,20 +699,30 @@ fn find_condition(nc: &DynamicObject, cond: &str) -> Option<Value> {
         .cloned()
 }
 
-/// `complete=true` when the probe loop ran to completion (all 5
-/// assertions passed). Partial runs (bug_018) still print the
-/// collected `leadTimeSeed` block — the operator pastes what was
-/// measured and re-runs the failed cell separately.
-fn print_results(results: &mut [ProbeResult], complete: bool) {
+/// `loop_ok=true` when the probe loop measured every cell (all
+/// per-cell assertions passed). `assertion2_ok=true` when the post-
+/// loop shim-leak conformance check passed. Partial loop runs
+/// (bug_018) and assertion-2-only failures (bug_009/r34 bug_021) both
+/// still print the collected `leadTimeSeed` block — the operator
+/// pastes what was measured (assertion-2-only: re-running adds
+/// nothing; loop abort: re-run the failed cell separately).
+fn print_results(results: &mut [ProbeResult], loop_ok: bool, assertion2_ok: bool) {
     if results.is_empty() {
         return;
     }
     results.sort_by(|a, b| (&a.hw_class, a.cap.label()).cmp(&(&b.hw_class, b.cap.label())));
 
-    if complete {
-        println!("\nall 5 conformance assertions PASS\n");
-    } else {
-        println!("\nPARTIAL — probe loop aborted; leadTimeSeed below covers only measured cells\n");
+    match (loop_ok, assertion2_ok) {
+        (true, true) => println!("\nall 5 conformance assertions PASS\n"),
+        (true, false) => println!(
+            "\nINCOMPLETE — assertion 2 (shim leak) FAILED; \
+             leadTimeSeed below is COMPLETE (all cells measured) — \
+             do NOT re-run, fix the shim NodePool\n"
+        ),
+        (false, _) => println!(
+            "\nPARTIAL — probe loop aborted; \
+             leadTimeSeed below covers only measured cells\n"
+        ),
     }
     println!(
         "{:<18} {:<5} {:<8} {:<16} {:>10}",

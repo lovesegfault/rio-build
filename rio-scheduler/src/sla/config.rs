@@ -681,9 +681,10 @@ impl SlaConfig {
     ///   (system)` ⟺ `pod.rs::nix_systems_to_k8s_arch(systems)` writes
     ///   `nodeSelector{kubernetes.io/arch}`. (bug_042)
     /// - **features** — `features_compatible(required,
-    ///   provides_for(h))` ⟺ `wants_metal(pool, hw)` writes
-    ///   `nodeSelector{rio.build/kvm}` (`provides ∋ kvm ⟺ labels ∋
-    ///   {rio.build/kvm: true}`, helm-test-pinned). (mb_012)
+    ///   provides_for(h))` ⟺ `cells_to_selector_terms` writes
+    ///   `nodeAffinity{rio.build/kvm}` (`provides ∋ kvm ⟺ labels ∋
+    ///   {rio.build/kvm: true}`, helm-test-pinned; pool-static
+    ///   nodeSelector deleted r33 bug_002). (mb_012, r34 mb_004)
     /// - **size** — `(cores, mem) ≤ class_ceilings(h)` ⟺ pod
     ///   requests ≤ Node allocatable. (r29 bug_019)
     /// - **capacity-type** — `cap ∈ capacity_types_for(h)` ⟺
@@ -2001,8 +2002,9 @@ mod tests {
     /// §13c T2/D10: `retain_hosting_cells` applies the FULL
     /// bidirectional [`features_compatible`] predicate. Half-predicate
     /// (`provides⊄required`) misses `required=[kvm], provides=[]`
-    /// (∅⊆anything) → std-x86 leaks → pod has kvm nodeSelector, node
-    /// lacks label → permanently Pending.
+    /// (∅⊆anything) → std-x86 leaks → kvm pod CrashLoopBackOff on
+    /// ENXIO `/dev/kvm` (no metal node minted; pool-static nodeSelector
+    /// deleted r33 bug_002).
     #[test]
     fn retain_hosting_cells_filters_features() {
         let mut cfg = base();

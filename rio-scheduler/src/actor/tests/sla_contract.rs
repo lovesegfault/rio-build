@@ -2654,8 +2654,9 @@ async fn contract_kvm_routes_via_provides_features() {
 /// `hw_class_names != []` so the controller mints a metal NodeClaim.
 /// Pre-fix the bypass `None/None` arm returned `(Vec::new(), Vec::new())`
 /// unconditionally → controller's `fallback_cell` picked a non-metal
-/// reference cell → kvm pod (`nodeSelector: rio.build/kvm=true`)
-/// permanently Pending → no `build_sample` → `fit` stays `None` →
+/// reference cell → kvm pod CrashLoopBackOff on ENXIO `/dev/kvm`
+/// (no metal node minted; pool-static nodeSelector deleted r33
+/// bug_002) → no `build_sample` → `fit` stays `None` →
 /// hard bootstrap deadlock now that §13c deleted the static metal
 /// NodePool escape hatch.
 // r[verify sched.sla.hwclass.provides]

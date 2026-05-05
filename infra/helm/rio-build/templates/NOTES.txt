@@ -12,7 +12,7 @@ rio-build installed to namespace {{ .Values.namespaces.system.name }}.
 Builder pods get /dev/{fuse,kvm} injected by containerd's
 `base_runtime_spec` (OCI `linux.devices` — runc mknods inside the
 container's /dev). No device plugin runs; no extended resource is
-requested. kvm pods route to .metal via nodeSelector.
+requested. kvm pods route to .metal via per-intent nodeAffinity.
 
 Prerequisite:
   • Node containerd configured with `base_runtime_spec` declaring
