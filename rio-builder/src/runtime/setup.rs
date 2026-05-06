@@ -8,9 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use tokio::sync::{Notify, Semaphore, mpsc, watch};
-use tracing::info;
+use tracing::{info, warn};
 
-use rio_proto::types::ExecutorMessage;
+use rio_proto::types::{ExecutorKind, ExecutorMessage};
 
 use super::heartbeat::{HeartbeatCtx, spawn_heartbeat};
 use super::prefetch::PrefetchDeps;
@@ -40,6 +40,7 @@ pub async fn setup(
     shutdown: rio_common::signal::Token,
 ) -> anyhow::Result<Option<BuilderRuntime>> {
     let (executor_id, systems, features) = resolve_executor_identity(
+        cfg.executor_kind,
         std::mem::take(&mut cfg.executor_id),
         std::mem::take(&mut cfg.systems),
         std::mem::take(&mut cfg.features),
@@ -365,7 +366,14 @@ pub async fn setup(
 /// Errors if executor_id is empty AND gethostname() fails — two workers
 /// with the same ID would steal each other's builds via heartbeat
 /// merging, so we fail hard rather than silently colliding on "unknown".
+///
+/// `kind` enforces the §13e biconditional (`Fetcher ⟺ [fetcher]`) at
+/// the heartbeat boundary, mirroring the controller's
+/// `effective_features(spec)` chokepoint — see
+/// `rio-controller/src/reconcilers/pool/pod.rs` and
+/// `r[ctrl.crd.fetcher-no-features]`.
 pub(super) fn resolve_executor_identity(
+    kind: ExecutorKind,
     executor_id: String,
     systems: Vec<String>,
     features: Vec<String>,
@@ -409,11 +417,43 @@ pub(super) fn resolve_executor_identity(
     if !systems.iter().any(|s| s == "builtin") {
         systems.push("builtin".to_string());
     }
-    // features: no auto-detect. Empty is valid (worker supports no
-    // special features). Operator sets these explicitly in the CRD
-    // — auto-detecting "kvm" by checking /dev/kvm exists would be
-    // surprising (worker on a kvm-capable host but operator wants
-    // to reserve it for other work).
+    // features: §13e biconditional `Fetcher ⟺ [fetcher]` enforced at
+    // the heartbeat boundary — the same `effective_features(spec)`
+    // chokepoint the controller applies when injecting `RIO_FEATURES`
+    // (rio-controller/src/reconcilers/pool/pod.rs). The controller's
+    // injection covers k8s-spawned pods; this covers every OTHER
+    // deployment path (NixOS module, manual env, future operators)
+    // where `RIO_EXECUTOR_KIND=fetcher` is set without `RIO_FEATURES`.
+    // Without it the heartbeat advertises `supported_features=[]`,
+    // the scheduler's `rejection_reason` reads the FOD's derived
+    // `effective_features=[fetcher]`, `[fetcher] ⊄ []` → permanent
+    // `feature-missing` → cold builds stall silently at the FOD leaves.
+    //
+    // The override is unconditional (matches the controller's): a
+    // fetcher declaring `[kvm]` would otherwise advertise a feature it
+    // can't honor (fetcher pods have no /dev/kvm) AND drop the routing
+    // tag FODs match on. Warn so a misconfigured operator gets a log
+    // line, not silence.
+    //
+    // Builder kind: declared verbatim, no auto-detect. Empty is valid
+    // (worker supports no special features). Operator sets these
+    // explicitly in the CRD — auto-detecting "kvm" by checking
+    // /dev/kvm exists would be surprising (worker on a kvm-capable
+    // host but operator wants to reserve it for other work).
+    let fetcher_only = vec![rio_common::k8s::FETCHER_FEATURE.to_string()];
+    let features = if kind == ExecutorKind::Fetcher {
+        if features != fetcher_only && !features.is_empty() {
+            warn!(
+                declared = ?features,
+                "fetcher executor declared non-[fetcher] features; \
+                 overriding to [fetcher] (§13e biconditional — fetchers \
+                 advertise the routing tag and nothing else)"
+            );
+        }
+        fetcher_only
+    } else {
+        features
+    };
 
     Ok((executor_id, systems, features))
 }

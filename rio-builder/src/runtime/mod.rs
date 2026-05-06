@@ -36,7 +36,7 @@ use crate::cgroup::ResourceSnapshotHandle;
 #[cfg(test)]
 use {
     prefetch::PREFETCH_WARM_SIZE_CAP_BYTES, rio_proto::types::PrefetchHint,
-    setup::validate_host_arch, tokio::sync::Semaphore,
+    setup::resolve_executor_identity, setup::validate_host_arch, tokio::sync::Semaphore,
 };
 
 use std::path::PathBuf;
@@ -1200,6 +1200,74 @@ mod tests {
         // builtin-only Fetcher (the common `builtins.fetchurl` case): no
         // constraint — arch-agnostic, intentionally cheap Gravitons.
         assert!(validate_host_arch(Fetcher, &s(&["builtin"]), "aarch64-linux").is_ok());
+    }
+
+    /// §13e biconditional `Fetcher ⟺ [fetcher]` enforced at the
+    /// builder's identity-resolution chokepoint. Mirrors the
+    /// controller's `effective_features(spec)` — see
+    /// `effective_features_fetcher_for_fetcher` in
+    /// `rio-controller/src/reconcilers/pool/pod.rs`.
+    ///
+    /// The controller's `RIO_FEATURES` injection covers k8s-spawned
+    /// pods. THIS chokepoint covers every other deployment path
+    /// (NixOS module, manual env, future operators). A fetcher
+    /// advertising `[]` would `feature-missing`-reject every FOD —
+    /// the scheduler's `rejection_reason` reads the FOD's derived
+    /// `effective_features=[fetcher]` and `[fetcher] ⊄ []`. The
+    /// `vm-protocol-cold-standalone` regression that motivated this:
+    /// `RIO_EXECUTOR_KIND=fetcher` set, `RIO_FEATURES` unset, FOD
+    /// permanently undispatched, test timed out at 500s.
+    #[test]
+    fn resolve_executor_identity_fetcher_features_biconditional() {
+        use rio_proto::types::ExecutorKind::{Builder, Fetcher};
+        let s = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        let f = rio_common::k8s::FETCHER_FEATURE.to_string();
+
+        // Fetcher with no declared features: derives [fetcher].
+        // (Pre-fix: stayed [], fetcher's heartbeat advertised
+        // supported_features=[], every FOD permanently feature-missing.)
+        let (_, _, feats) =
+            resolve_executor_identity(Fetcher, "f".into(), s(&["builtin"]), vec![]).unwrap();
+        assert_eq!(
+            feats,
+            vec![f.clone()],
+            "Fetcher + RIO_FEATURES unset → [fetcher]"
+        );
+
+        // Fetcher with declared [fetcher]: idempotent (controller path).
+        let (_, _, feats) =
+            resolve_executor_identity(Fetcher, "f".into(), s(&["builtin"]), vec![f.clone()])
+                .unwrap();
+        assert_eq!(feats, vec![f.clone()], "Fetcher + [fetcher] → [fetcher]");
+
+        // Fetcher with stale declared [kvm]: overridden (mirrors
+        // controller's belt-and-suspenders for pre-CEL specs).
+        let (_, _, feats) =
+            resolve_executor_identity(Fetcher, "f".into(), s(&["builtin"]), s(&["kvm"])).unwrap();
+        assert_eq!(
+            feats,
+            vec![f.clone()],
+            "Fetcher + [kvm] → overridden to [fetcher]"
+        );
+
+        // Builder: declared verbatim, no auto-derive.
+        let (_, _, feats) = resolve_executor_identity(
+            Builder,
+            "b".into(),
+            s(&["x86_64-linux"]),
+            s(&["kvm", "big-parallel"]),
+        )
+        .unwrap();
+        assert_eq!(
+            feats,
+            s(&["kvm", "big-parallel"]),
+            "Builder: features verbatim"
+        );
+
+        // Builder with no features: stays empty (the common case).
+        let (_, _, feats) =
+            resolve_executor_identity(Builder, "b".into(), s(&["x86_64-linux"]), vec![]).unwrap();
+        assert!(feats.is_empty(), "Builder + no features → []");
     }
 
     // -----------------------------------------------------------------------
