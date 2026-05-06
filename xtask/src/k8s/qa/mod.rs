@@ -164,7 +164,8 @@ pub enum Isolation {
     /// checks (e.g., "tenant A can't read tenant B's outputs") use 2+.
     Tenant { count: usize },
     /// Mutates cluster. Phase 2; concurrent with other Exclusives iff
-    /// `mutates` is disjoint.
+    /// the combined read/write sets don't conflict — see
+    /// [`Scenario::reads`] for the reader/writer model.
     Exclusive { mutates: &'static [Component] },
 }
 
@@ -182,6 +183,28 @@ pub struct ScenarioMeta {
 #[async_trait]
 pub trait Scenario: Send + Sync {
     fn meta(&self) -> ScenarioMeta;
+
+    /// Components this scenario *depends on* without mutating. The
+    /// `mutates` set on `Isolation::Exclusive` is the WRITE set; this is
+    /// the READ set. The phase-2 greedy scheduler must not run a
+    /// scenario whose read set intersects another in-flight scenario's
+    /// write set (and vice versa) — reader/writer semantics. Read-read
+    /// overlap is fine.
+    ///
+    /// Defaults to `[Scheduler]`: almost every scenario submits a build
+    /// (or scrapes scheduler metrics), and a build submission during a
+    /// concurrent leader kill (e.g. i024) yields a false-positive
+    /// "scheduler actor is unavailable" error — the actor exited
+    /// gracefully during drain, it didn't panic. Override to `&[]` for
+    /// scenarios that genuinely never touch the scheduler (PG-only
+    /// invariant checks, gateway key reloads, controller CR probes).
+    ///
+    /// Only consulted for `Exclusive` scenarios (phase 2); phase-1
+    /// `Shared`/`Tenant` scenarios run before any Exclusive starts.
+    fn reads(&self) -> &'static [Component] {
+        &[Component::Scheduler]
+    }
+
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict>;
 }
 

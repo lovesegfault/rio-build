@@ -3,11 +3,24 @@
 //! Phase 1: `Shared` + `Tenant` concurrently. Shared is unbounded;
 //! Tenant is bounded by the tenant-pool semaphore (`acquire(count)`).
 //!
-//! Phase 2: `Exclusive`, greedy-scheduled by disjoint `mutates`. A
-//! scenario is runnable when none of its components are held by an
-//! in-flight Exclusive. Re-scan on every completion.
+//! Phase 2: `Exclusive`, greedy-scheduled with reader/writer semantics
+//! over `Component`s. Each scenario declares a write set
+//! (`Isolation::Exclusive { mutates }`) and a read set
+//! (`Scenario::reads`, default `[Scheduler]`). A scenario is runnable
+//! when its writes don't overlap any in-flight read or write, and its
+//! reads don't overlap any in-flight write. Read-read overlap is
+//! allowed. Re-scan on every completion.
+//!
+//! The read set exists because `mutates` only captures destruction:
+//! i024 kills the scheduler leader (`mutates: [Scheduler, FetcherPool]`)
+//! while i039 (`mutates: [Store]`) and i040 (`mutates: [S3, Postgres]`)
+//! had disjoint write sets and ran concurrently — but both *submit*
+//! builds, so they hit the leader transition and saw a false-positive
+//! "scheduler actor is unavailable (panicked or exited)". A read
+//! dependency on `Scheduler` serializes them with i024 without
+//! over-claiming a write.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -138,7 +151,63 @@ async fn run_phase1(
     collect(set).await
 }
 
-/// Greedy disjoint-mutates scheduler. Each Exclusive gets ONE tenant
+/// Reader/writer locks over `Component`s held by in-flight phase-2
+/// scenarios. Standard rwlock semantics: many readers OR one writer per
+/// component. A scenario `mutates: X` is the writer; a scenario
+/// `reads: X` (without also mutating X) is a reader.
+///
+/// Reads are reference-counted because two readers of the same
+/// component may overlap (e.g. i039 and i040 both `reads: [Scheduler]`,
+/// disjoint writes); a `HashSet` would drop the read hold as soon as
+/// the *first* of them finished and let a writer in under the second.
+#[derive(Default)]
+struct ComponentLocks {
+    /// Write-held. At most one in-flight writer per component, so a
+    /// set suffices.
+    mutated: HashSet<Component>,
+    /// Read-held → reader count.
+    read: HashMap<Component, usize>,
+}
+
+impl ComponentLocks {
+    /// Acquire if no conflict; on success record the holds and return
+    /// `true`. On conflict no state changes and returns `false`.
+    fn try_acquire(&mut self, mutates: &[Component], reads: &[Component]) -> bool {
+        // W-W: another in-flight scenario is writing the same component.
+        if mutates.iter().any(|c| self.mutated.contains(c)) {
+            return false;
+        }
+        // R-W: this scenario reads a component another is writing.
+        if reads.iter().any(|c| self.mutated.contains(c)) {
+            return false;
+        }
+        // W-R: this scenario writes a component another is reading.
+        if mutates.iter().any(|c| self.read.contains_key(c)) {
+            return false;
+        }
+        self.mutated.extend(mutates.iter().copied());
+        for c in reads {
+            *self.read.entry(*c).or_default() += 1;
+        }
+        true
+    }
+
+    fn release(&mut self, mutates: &[Component], reads: &[Component]) {
+        for c in mutates {
+            self.mutated.remove(c);
+        }
+        for c in reads {
+            if let Some(n) = self.read.get_mut(c) {
+                *n -= 1;
+                if *n == 0 {
+                    self.read.remove(c);
+                }
+            }
+        }
+    }
+}
+
+/// Greedy reader/writer scheduler. Each Exclusive gets ONE tenant
 /// from the pool — phase 1 has drained so the pool is full; pool size
 /// (default 8) ≥ max concurrent Exclusives (~3-4 by component-disjoint
 /// distribution), so `acquire(1)` never blocks in practice. Scenarios
@@ -151,8 +220,9 @@ async fn run_phase2(
     pool: &Arc<TenantPool>,
 ) -> Vec<Outcome> {
     let mut pending: VecDeque<_> = scenarios.into_iter().collect();
-    let mut held: HashSet<Component> = HashSet::new();
-    let mut set: JoinSet<(Outcome, &'static [Component])> = JoinSet::new();
+    let mut locks = ComponentLocks::default();
+    type Held = (&'static [Component], &'static [Component]);
+    let mut set: JoinSet<(Outcome, Held)> = JoinSet::new();
     let mut out = Vec::new();
 
     loop {
@@ -163,8 +233,8 @@ async fn run_phase2(
             let Isolation::Exclusive { mutates } = meta.isolation else {
                 unreachable!("phase 2 is exclusive-only")
             };
-            if mutates.iter().all(|c| !held.contains(c)) {
-                held.extend(mutates.iter().copied());
+            let reads = pending[i].reads();
+            if locks.try_acquire(mutates, reads) {
                 let s = pending.remove(i).expect("i < len");
                 let kube = kube.clone();
                 let cli = cli.clone();
@@ -175,19 +245,17 @@ async fn run_phase2(
                     let tenants = lease.tenants().to_vec();
                     let o = exec(s, &meta, kube, cli, pg, tenants).await;
                     lease.release().await;
-                    (o, mutates)
+                    (o, (mutates, reads))
                 });
             } else {
                 i += 1;
             }
         }
-        // Drain one completion, release its components, re-scan.
+        // Drain one completion, release its locks, re-scan.
         match set.join_next().await {
             Some(res) => {
-                let (o, mutates) = res.expect("scenario task panicked");
-                for c in mutates {
-                    held.remove(c);
-                }
+                let (o, (mutates, reads)) = res.expect("scenario task panicked");
+                locks.release(mutates, reads);
                 out.push(o);
             }
             None => break,
@@ -260,6 +328,175 @@ fn report(outcomes: &[Outcome]) {
         match o.verdict {
             Verdict::Fail(_) => warn!("{line}"),
             _ => info!("{line}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::k8s::qa::Component as C;
+    use crate::k8s::qa::scenarios::ALL;
+
+    fn find(id: &str) -> &'static dyn Scenario {
+        *ALL.iter()
+            .find(|s| s.meta().id == id)
+            .unwrap_or_else(|| panic!("scenario {id} not in ALL"))
+    }
+
+    fn mutates(s: &'static dyn Scenario) -> &'static [Component] {
+        match s.meta().isolation {
+            Isolation::Exclusive { mutates } => mutates,
+            other => panic!("{} is {other:?}, expected Exclusive", s.meta().id),
+        }
+    }
+
+    #[test]
+    fn write_write_conflict_blocks() {
+        let mut l = ComponentLocks::default();
+        assert!(l.try_acquire(&[C::Scheduler], &[]));
+        assert!(!l.try_acquire(&[C::Scheduler], &[]));
+    }
+
+    #[test]
+    fn read_write_conflict_blocks_in_both_directions() {
+        // Writer in flight, reader must wait.
+        let mut l = ComponentLocks::default();
+        assert!(l.try_acquire(&[C::Scheduler], &[]));
+        assert!(!l.try_acquire(&[C::Store], &[C::Scheduler]));
+
+        // Reader in flight, writer must wait.
+        let mut l = ComponentLocks::default();
+        assert!(l.try_acquire(&[C::Store], &[C::Scheduler]));
+        assert!(!l.try_acquire(&[C::Scheduler], &[]));
+    }
+
+    #[test]
+    fn read_read_overlap_allowed() {
+        // Two scenarios with disjoint writes both reading Scheduler can
+        // run concurrently — read-read is not a conflict.
+        let mut l = ComponentLocks::default();
+        assert!(l.try_acquire(&[C::Store], &[C::Scheduler]));
+        assert!(l.try_acquire(&[C::S3, C::Postgres], &[C::Scheduler]));
+    }
+
+    #[test]
+    fn read_count_releases_correctly() {
+        // Two readers; releasing one must NOT unblock a writer.
+        let mut l = ComponentLocks::default();
+        assert!(l.try_acquire(&[C::Store], &[C::Scheduler]));
+        assert!(l.try_acquire(&[C::S3], &[C::Scheduler]));
+        assert!(!l.try_acquire(&[C::Scheduler], &[]));
+        l.release(&[C::Store], &[C::Scheduler]);
+        assert!(!l.try_acquire(&[C::Scheduler], &[]));
+        l.release(&[C::S3], &[C::Scheduler]);
+        assert!(l.try_acquire(&[C::Scheduler], &[]));
+    }
+
+    #[test]
+    fn try_acquire_failure_has_no_side_effects() {
+        // A failed acquire must leave the locks untouched — a partial
+        // acquire (e.g. recording the writes but bailing on the read
+        // check) would leak a hold and deadlock the greedy loop.
+        let mut l = ComponentLocks::default();
+        assert!(l.try_acquire(&[C::Store], &[C::Scheduler]));
+        // Conflicts on Scheduler (R-W); also names Postgres, which must
+        // stay free afterwards.
+        assert!(!l.try_acquire(&[C::Scheduler, C::Postgres], &[]));
+        assert!(l.try_acquire(&[C::Postgres], &[]));
+    }
+
+    /// The cluster-A regression this module fixes: i024 kills the
+    /// scheduler leader (`mutates: [Scheduler, FetcherPool]`); i039
+    /// (`mutates: [Store]`) and i040 (`mutates: [S3, Postgres]`) have
+    /// disjoint write sets but both submit builds, so they read
+    /// `Scheduler`. Pre-fix the greedy scheduler ran all three at
+    /// once → false-positive "scheduler actor is unavailable" from a
+    /// graceful drain, not a panic.
+    #[test]
+    fn i024_serializes_with_build_submitting_scenarios() {
+        let i024 = find("i024-restart-drains-fods");
+        let i039 = find("i039-store-kill-survives");
+        let i040 = find("i040-chunk-verify");
+
+        let mut l = ComponentLocks::default();
+        assert!(l.try_acquire(mutates(i024), i024.reads()));
+        assert!(
+            !l.try_acquire(mutates(i039), i039.reads()),
+            "i039 submits a build → must not run while i024 is killing the leader"
+        );
+        assert!(
+            !l.try_acquire(mutates(i040), i040.reads()),
+            "i040 submits a build → must not run while i024 is killing the leader"
+        );
+
+        // After i024 releases, both become runnable (and CAN run with
+        // each other — disjoint writes, read-read on Scheduler).
+        l.release(mutates(i024), i024.reads());
+        assert!(l.try_acquire(mutates(i039), i039.reads()));
+        assert!(l.try_acquire(mutates(i040), i040.reads()));
+    }
+
+    /// Concurrency must not regress: i024 should still be able to run
+    /// alongside scenarios that genuinely never touch the scheduler.
+    #[test]
+    fn i024_concurrent_with_no_scheduler_dependency() {
+        let i024 = find("i024-restart-drains-fods");
+
+        for other_id in [
+            "i048a-stale-realisation",         // PG-only LEFT JOIN probe
+            "i109-authorized-keys-hot-reload", // gateway secret reload
+            "i201-stranded-chunks",            // PG↔S3 sample
+            "i207-stale-uploading",            // PG-only invariant
+            "i086-reconcile-error-loud",       // controller CR probe
+        ] {
+            let other = find(other_id);
+            assert_eq!(
+                other.reads(),
+                &[] as &[Component],
+                "{other_id} has no scheduler dependency and should override reads() to []"
+            );
+            let mut l = ComponentLocks::default();
+            assert!(l.try_acquire(mutates(i024), i024.reads()));
+            assert!(
+                l.try_acquire(mutates(other), other.reads()),
+                "{other_id} must remain runnable while i024 holds Scheduler"
+            );
+        }
+    }
+
+    /// Every Exclusive scenario that submits a build (calls
+    /// `nix_build*via_gateway*`) must keep the default
+    /// `reads() = [Scheduler]`. This is a coarse structural check, not
+    /// a substitute for review, but it catches "added a build to an
+    /// existing scenario without revisiting its reads() override".
+    #[test]
+    fn build_submitting_exclusives_read_scheduler() {
+        // Source-grep would be brittle; instead enumerate the known
+        // build-submitting Exclusives and assert on each. Keep this
+        // list in sync with `nix_build*via_gateway*` callsites in
+        // `scenarios/`.
+        let build_submitters = [
+            "i024-restart-drains-fods",
+            "i033-zombie-executors",
+            "i039-store-kill-survives",
+            "i040-chunk-verify",
+            "i046-drain-reaches-leader",
+            "i047-missing-input-redispatch",
+            "i048c-blackhole-self-test",
+            "i058-recovery-transitions",
+            "i064-gateway-drain",
+            "i183-pending-reaped",
+            "i208-floor-hydrated",
+            "i209-assignment-terminal",
+        ];
+        for id in build_submitters {
+            let s = find(id);
+            assert!(
+                s.reads().contains(&C::Scheduler),
+                "{id} submits a build but reads() doesn't include Scheduler — \
+                 it would race a concurrent leader kill"
+            );
         }
     }
 }

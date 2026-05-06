@@ -48,6 +48,13 @@ impl Scenario for ReconcileErrorLoud {
         }
     }
 
+    /// Applies a Pool CR + scrapes the *controller's* metrics endpoint
+    /// — never submits a build. Safe to run concurrently with a
+    /// scheduler leader kill.
+    fn reads(&self) -> &'static [Component] {
+        &[]
+    }
+
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
         let ctrl = first_pod(ctx, NS_SYSTEM, "rio-controller")?;
         let before = super::common::scrape_controller(ctx)

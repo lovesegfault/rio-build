@@ -33,6 +33,13 @@ impl Scenario for StrandedChunks {
         }
     }
 
+    /// PG sample → S3 HeadObject probe — never submits a build, never
+    /// touches the scheduler. Safe to run concurrently with a leader
+    /// kill.
+    fn reads(&self) -> &'static [Component] {
+        &[]
+    }
+
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
         // Bucket name from tofu output (EKS only — k3s uses an
         // in-cluster MinIO whose creds aren't on the operator's box).

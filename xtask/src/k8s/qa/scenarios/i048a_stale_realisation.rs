@@ -32,6 +32,12 @@ impl Scenario for StaleRealisation {
         }
     }
 
+    /// PG-only LEFT JOIN probe — never submits a build, never touches
+    /// the scheduler. Safe to run concurrently with a leader kill.
+    fn reads(&self) -> &'static [Component] {
+        &[]
+    }
+
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
         // Live invariant: no realisations point at non-existent narinfo.
         // Schema (002_store.sql): realisations(drv_hash BYTEA,

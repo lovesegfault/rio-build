@@ -30,6 +30,13 @@ impl Scenario for AuthorizedKeysHotReload {
         }
     }
 
+    /// Edits a Secret and probes gateway SSH auth via `nix store ping`
+    /// — never submits a build, never touches the scheduler. Safe to
+    /// run concurrently with a leader kill.
+    fn reads(&self) -> &'static [Component] {
+        &[]
+    }
+
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
         // Functional assertion (not log-count grep): append a fresh key,
         // poll until an SSH connection USING that key is accepted. The

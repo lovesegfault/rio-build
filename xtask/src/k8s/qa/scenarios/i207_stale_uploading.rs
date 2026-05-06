@@ -31,6 +31,13 @@ impl Scenario for StaleUploading {
         }
     }
 
+    /// PG-only `manifests.status` invariant check — never submits a
+    /// build, never touches the scheduler. Safe to run concurrently
+    /// with a leader kill.
+    fn reads(&self) -> &'static [Component] {
+        &[]
+    }
+
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM manifests \
