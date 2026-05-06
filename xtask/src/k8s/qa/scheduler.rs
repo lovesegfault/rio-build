@@ -400,8 +400,8 @@ mod tests {
         // check) would leak a hold and deadlock the greedy loop.
         let mut l = ComponentLocks::default();
         assert!(l.try_acquire(&[C::Store], &[C::Scheduler]));
-        // Conflicts on Scheduler (R-W); also names Postgres, which must
-        // stay free afterwards.
+        // Conflicts on Scheduler (W-R: this writes, held read); also
+        // names Postgres, which must stay free afterwards.
         assert!(!l.try_acquire(&[C::Scheduler, C::Postgres], &[]));
         assert!(l.try_acquire(&[C::Postgres], &[]));
     }
