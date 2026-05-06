@@ -54,3 +54,33 @@ test "$n" -eq 10 || {
   echo "FAIL: vmtest-full expected 10 PriorityClasses, got $n" >&2
   exit 1
 }
+
+# r37 bug_017: --authorization-always-allow-paths is a StringSlice that
+# REPLACES the upstream default /healthz,/readyz,/livez. The probe
+# paths must be re-listed explicitly or the kubelet's probe round-trips
+# a SubjectAccessReview to the apiserver → crash-loop on brownout.
+yq -N 'select(.kind=="Deployment" and .metadata.name=="kube-build-scheduler") | .spec.template.spec.containers[0].command[]' "$out" \
+  | grep -- '--authorization-always-allow-paths=' \
+  | grep -q '/healthz' || {
+  echo "FAIL: kube-build-scheduler --authorization-always-allow-paths must" \
+       "include /healthz (StringSlice replaces upstream default — r37 bug_017)" >&2
+  exit 1
+}
+
+# r37 bug_019: KubeBuildSchedulerPendingStuck must NOT key on
+# queue="active" — un-placeable pods sit in unschedulable/backoff.
+mon=$TMPDIR/prio-mon.yaml
+helm template rio . --set global.image.tag=test --set monitoring.enabled=true >"$mon"
+# Use yq to extract the actual `expr` field so the assertion is
+# immune to comment-line count drift (the comment block contains
+# the literal `queue="active"` as historical reference).
+expr=$(yq -N '.spec.groups[].rules[] | select(.alert=="KubeBuildSchedulerPendingStuck") | .expr' "$mon")
+echo "$expr" | grep -q 'queue="active"' && {
+  echo "FAIL: KubeBuildSchedulerPendingStuck still keys on queue=\"active\"" \
+       "— it spends ~ms there; the alert structurally cannot fire (r37 bug_019)" >&2
+  exit 1
+}
+grep -q 'alert: KubeBuildSchedulerDown' "$mon" || {
+  echo "FAIL: KubeBuildSchedulerDown absent() alert missing (r37 bug_019)" >&2
+  exit 1
+}

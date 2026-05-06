@@ -77,6 +77,18 @@ spec:
         rio.build/node-role: general
       {{- end }}
       {{- include "rio.podSecurityContext" . | nindent 6 }}
+      # r37 bug_020: REQUIRE different nodes (mirrors rio-scheduler).
+      # Both on one node → a single drain kills both, every builder pod
+      # with `schedulerName: kube-build-scheduler` sits Pending for the
+      # ~30s reschedule + lease-acquire window — and StuckPending has
+      # `for: 60s`, so the gap is silent.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "rio.selectorLabels" "kube-build-scheduler" | nindent 18 }}
+              topologyKey: kubernetes.io/hostname
       containers:
         - name: kube-scheduler
           # Upstream image, digest-pinned (03-digest-pin); tag tracks the
@@ -91,7 +103,18 @@ spec:
             # Prometheus scrapes /metrics with its own SA token, not a
             # SubjectAccessReview-authorized identity. always-allow makes
             # the path bypass the kube-scheduler's delegated authorizer.
-            - --authorization-always-allow-paths=/metrics
+            #
+            # r37 bug_017: the flag is a StringSlice that REPLACES the
+            # upstream default `/healthz,/readyz,/livez` ("This allows
+            # the kubelet to always get health and readiness without
+            # causing an authorization check"). Setting it to /metrics
+            # alone forces the kubelet's probe to round-trip a
+            # SubjectAccessReview to the apiserver — during an apiserver
+            # brownout >10s (the AllowCacheTTL) the SAR fails closed →
+            # 403/500 → 3×10s → restart, exactly when the only scheduler
+            # that can bind builder pods is most needed. Re-list the
+            # defaults explicitly.
+            - --authorization-always-allow-paths=/healthz,/readyz,/livez,/metrics
           ports:
             - name: https-metrics
               containerPort: 10259

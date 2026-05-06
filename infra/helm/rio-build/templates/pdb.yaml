@@ -43,4 +43,25 @@ spec:
     matchLabels:
       {{- include "rio.selectorLabels" "rio-gateway" | nindent 6 }}
 {{- end }}
+
+{{- if .Values.buildScheduler.enabled }}
+---
+# r37 bug_020. maxUnavailable=1: one stays up during drain. Lease TTL is
+# 15s (kube-scheduler default leaseDuration); failover ~15s blip. The
+# default kube-scheduler ignores `schedulerName: kube-build-scheduler`
+# pods, so a window where BOTH are gone leaves every builder pod stuck
+# Pending with no fallback path.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kube-build-scheduler
+  namespace: {{ .Values.namespaces.system.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "kube-build-scheduler" "component" "scheduler") | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "rio.selectorLabels" "kube-build-scheduler" | nindent 6 }}
+{{- end }}
 {{- end }}

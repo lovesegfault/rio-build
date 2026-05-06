@@ -69,17 +69,46 @@ spec:
           # Upstream `scheduler_pending_pods` is labeled by `queue` only
           # (process-global SchedulingQueue, not per-profile). Select by
           # the ServiceMonitor's `job` label instead.
-          expr: scheduler_pending_pods{queue="active",job="kube-build-scheduler"} > 0
-          for: 60s
+          #
+          # r37 bug_019: a pod that fails to schedule (no feasible node,
+          # bind failure) spends ~ms in `activeQ` then moves to
+          # `unschedulableQ`/`backoffQ`. `queue="active"` was structurally
+          # ≈0 for every failure mode the alert names. Watch the queues
+          # un-placeable pods actually sit in.
+          expr: sum(scheduler_pending_pods{queue=~"unschedulable|backoff",job="kube-build-scheduler"}) > 0
+          # r37 bug_019: 5m is past the EBS cell lead-time (~30s) so a
+          # healthy cold-start clears before the alert. Metal cells
+          # (~10m lead) WILL still false-positive — RioNodeclaimPoolStuckPending
+          # owns the provisioning-stall signal; this alert covers the
+          # post-registration scheduling stall. Tighten by gating with
+          # `unless on() RioNodeclaimPoolStuckPending` if the false rate
+          # is unacceptable.
+          for: 5m
           labels:
             severity: warning
           annotations:
             summary: kube-build-scheduler has pods stuck Pending
             description: >-
               {{`{{ $value | humanize }}`}} builder pod(s) are in the
-              kube-build-scheduler active queue for >60s. Check
-              kube-build-scheduler pod health and nodeclaim_pool
+              kube-build-scheduler unschedulable/backoff queue for >5m.
+              Check kube-build-scheduler pod health and nodeclaim_pool
               reconciler deficit cover.
+
+        # r37 bug_019: a crashlooped kube-build-scheduler emits no series
+        # at all, so a queue-based alert cannot see it. The default
+        # kube-scheduler ignores `schedulerName: kube-build-scheduler`
+        # pods — there is no fallback path; the only signal is absence.
+        - alert: KubeBuildSchedulerDown
+          expr: absent(up{job="kube-build-scheduler"} == 1)
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: kube-build-scheduler is not being scraped
+            description: >-
+              No `up==1` series for kube-build-scheduler for 5m. Builder
+              pods with `schedulerName: kube-build-scheduler` cannot be
+              bound. Check pod status, RBAC, ServiceMonitor selector.
 
         # ADR-023 §Observability: prediction_ratio = actual/predicted
         # (dim=wall|mem; 1.0=perfect). Sustained p50 outside [0.5, 2.0]
@@ -283,6 +312,27 @@ spec:
               `provides_features`/`max_cores`/`max_mem` and the arch labels;
               add a hw-class that covers it or fix the producer. See
               docs/src/runbooks/sla-model.md#rionodeclaimpool-nohostingclass.
+
+        # qa-fix-b r37: a NodeClaim whose Karpenter finalizer never
+        # clears stays `terminating` indefinitely. `class_budget` and
+        # `live_cores` still count it (the EC2 instance bills until the
+        # finalizer clears, by design — see ffd.rs); FFD `simulate`
+        # excludes it. Effective fleet capacity is permanently reduced
+        # and `RioNodeclaimPoolStuckPending` (which watches in-flight
+        # age) won't fire. >5m is well past the ~60-90s finalizer drain.
+        - alert: RioNodeclaimPoolStuckTerminating
+          expr: rio_controller_nodeclaim_live{state="terminating"} > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: NodeClaim stuck terminating (Karpenter finalizer not clearing)
+            description: >-
+              {{`{{ $value | humanize }}`}} NodeClaim(s) in cell
+              {{`{{ $labels.cell }}`}} have had `metadata.deletionTimestamp`
+              set for >5m. Check the Karpenter controller and the Node's
+              drain/cordon state; `kubectl get nodeclaims -o wide` to find
+              the stuck object.
 
         # Forward-compat: rio_store_putpath_retries_total lands in P0539d.
         # Until then this expr evaluates empty (no series) → never fires.
