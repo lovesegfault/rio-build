@@ -257,7 +257,11 @@ pub struct NodeClaimPoolConfig {
     /// `sla.maxLeadTime`.
     pub max_lead_time: f64,
     /// §13b consolidator hold-open ceiling (seconds). `None` =
-    /// 2×`consolidate_after()` per ADR. Helm: not currently surfaced.
+    /// 2×`consolidate_after()` per ADR. Helm:
+    /// `scheduler.sla.maxConsolidationTime` (rendered by
+    /// `controller.yaml` and `scheduler.yaml`). r37 merged_010: the
+    /// model floor `max(boot_median/2, min)` wins when this is set
+    /// below it (`max_t.max(floor)` clamp in `consolidate_after`).
     pub max_consolidation_time: Option<f64>,
     /// r35 bug_050: per-hw-class-prefix `consolidate_after` floor
     /// (seconds). §13e routed Fetcher Pools through `nodeclaim_pool`,
@@ -990,17 +994,21 @@ impl NodeClaimPoolReconciler {
         self.report_unfulfillable(&ice_cells, &registered_cells, observed_types, bound_intents)
             .await?;
 
+        let all_cells = self.cfg.all_cells(&self.hw_config);
         consolidate::reap_idle(
             &self.nodeclaims,
             &live,
-            &placeable,
             &mut self.sketches,
-            &self.cfg,
-            |h, a, f| {
-                self.hw_config.matches_arch(h, a)
-                    && rio_common::k8s::features_compatible(f, &self.hw_config.provides_for(h))
+            &consolidate::ReapInputs {
+                placeable: &placeable,
+                all_cells: &all_cells,
+                cfg: &self.cfg,
+                hw_admits: |h, a, f| {
+                    self.hw_config.matches_arch(h, a)
+                        && rio_common::k8s::features_compatible(f, &self.hw_config.provides_for(h))
+                },
+                now_secs: now,
             },
-            now,
         )
         .await?;
 
@@ -1021,17 +1029,21 @@ impl NodeClaimPoolReconciler {
         let live = self.list_live_nodeclaims().await?;
         let now = now_epoch();
         consolidate::observe_idle_to_busy(&live, &mut self.prev_idle, &mut self.sketches, now);
+        let all_cells = self.cfg.all_cells(&self.hw_config);
         consolidate::reap_idle(
             &self.nodeclaims,
             &live,
-            &[],
             &mut self.sketches,
-            &self.cfg,
-            |h, a, f| {
-                self.hw_config.matches_arch(h, a)
-                    && rio_common::k8s::features_compatible(f, &self.hw_config.provides_for(h))
+            &consolidate::ReapInputs {
+                placeable: &[],
+                all_cells: &all_cells,
+                cfg: &self.cfg,
+                hw_admits: |h, a, f| {
+                    self.hw_config.matches_arch(h, a)
+                        && rio_common::k8s::features_compatible(f, &self.hw_config.provides_for(h))
+                },
+                now_secs: now,
             },
-            now,
         )
         .await?;
         // No `dead_nodes` signal without the scheduler; local
