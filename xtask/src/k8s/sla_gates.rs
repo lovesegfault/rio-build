@@ -9,7 +9,8 @@
 //!   0.05 per dimension.
 //! - **b**: rank-K residual bias spread ≤ τ. Queries `build_samples`
 //!   for organic pnames with ≥5 samples on ≥3 hw_classes, computes
-//!   per-hw_class median log-residual against the cached fit, reports
+//!   per-hw_class median log-residual `ln(t_ref/T_ref(c))` (where
+//!   `t_ref = wall_obs · α·factor[h]`) against the cached fit, reports
 //!   max−min spread per pname.
 //! - **c**: per-phase relative error ≤ 0.15. Queries the
 //!   `rio_scheduler_sla_prediction_ratio` histogram and reports
@@ -23,7 +24,7 @@
 //! Gates a/b assert; c/d report only (manual interpretation against
 //! the operator's tier ladder + workload).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -231,9 +232,12 @@ async fn gate_a(cli: &CliCtx, pg: &PgHandle) -> Result<()> {
 // ─── gate-b: rank-K residual bias spread ───────────────────────────────
 
 /// For every organic pname with ≥5 samples spread over ≥3 hw_classes,
-/// compute per-hw_class median log-residual against the cached fit's
-/// reference-second curve and report max−min spread. Spread > τ means
-/// the K=3 mixture is leaving structured per-h bias on the table.
+/// compute per-hw_class median log-residual `ln(t_ref/T_ref(c))` —
+/// where `t_ref = wall_obs · (α·factor[h])` is the hardware-NORMALIZED
+/// wall the estimator fits against — and report max−min spread. A
+/// converged model has median ≈ 0 for every h; spread > τ means the
+/// K=3 mixture is leaving structured per-h *uncaptured* bias on the
+/// table.
 async fn gate_b(cli: &CliCtx, pg: &PgHandle) -> Result<()> {
     // Candidate pnames: ≥5 samples over ≥3 distinct hw_classes in the
     // last 7d (same window HwTable reads). Exclude gate-a's synthetic.
@@ -260,9 +264,60 @@ async fn gate_b(cli: &CliCtx, pg: &PgHandle) -> Result<()> {
         );
     }
 
+    // r37 bug_026: `T_ref(c)` is fitted on hardware-NORMALIZED data
+    // (`t_ref = wall · α·factor[h]`), so `ln(wall_obs / T_ref(c))`
+    // centers at `-ln(α·factor[h])` per h — a known per-h CONSTANT
+    // that measures cluster heterogeneity, not model quality. Any
+    // correct model on a heterogeneous cluster fails. The fix divides
+    // out the known speedup so the per-h median centers at 0 for a
+    // converged model and the spread reflects only the *uncaptured*
+    // component.
+    //
+    // `HwTable::load` is the SAME canonical aggregation the estimator's
+    // `normalize` uses (cross-tenant median, trust gates, MAD-reject) —
+    // re-deriving it here would be a §Simulator-shares-accounting
+    // reimplementation. `α` per pname comes from `export-corpus` (the
+    // only RPC that carries it; gate_a uses the same path).
+    let hw_table = ui::step("load HwTable for gate-b normalization", || async {
+        let db = rio_scheduler::db::SchedulerDb::new(pg.pool.clone());
+        rio_scheduler::sla::hw::HwTable::load(&db).await
+    })
+    .await?;
+    let alpha_map: HashMap<(String, String), rio_scheduler::sla::alpha::Alpha> =
+        ui::step("read α per pname via export-corpus", || async {
+            let tmp = tempfile::NamedTempFile::new()?;
+            let path = tmp.path().to_str().context("tempfile path utf8")?;
+            cli.run(&["sla", "export-corpus", "--min-n", "1", "-o", path])?;
+            let body = std::fs::read_to_string(tmp.path())?;
+            let corpus: Value = serde_json::from_str(&body)?;
+            let mut m = HashMap::new();
+            for e in corpus
+                .get("entries")
+                .and_then(Value::as_array)
+                .unwrap_or(&vec![])
+            {
+                let (Some(p), Some(s)) = (
+                    e.get("pname").and_then(Value::as_str),
+                    e.get("system").and_then(Value::as_str),
+                ) else {
+                    continue;
+                };
+                let a: Vec<f64> = e
+                    .get("alpha")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_f64).collect())
+                    .unwrap_or_default();
+                if a.len() == rio_scheduler::sla::hw::K {
+                    m.insert((p.into(), s.into()), [a[0], a[1], a[2]]);
+                }
+            }
+            anyhow::Ok(m)
+        })
+        .await?;
+
     println!("\ngate-b  per-hw_class median log-residual spread (τ={GATE_B_TAU})");
     println!(
-        "  {:<32} {:>6} {:>4}  {:>8}  per-hw_class median ln(obs/T_ref(c))",
+        "  {:<32} {:>6} {:>4}  {:>8}  per-hw_class median ln(t_ref/T_ref(c))",
         "pname", "n", "n_h", "spread"
     );
     let mut worst = 0.0f64;
@@ -299,16 +354,26 @@ async fn gate_b(cli: &CliCtx, pg: &PgHandle) -> Result<()> {
         .fetch_all(&pg.pool)
         .await?;
 
-        // Per-hw_class median of ln(wall_obs / T_ref(c)). A perfectly
-        // hw-normalized fit has median ≈ −ln(α·factor[h]) per h; the
-        // SPREAD across h is what gate-b bounds (rank-K bias structure).
+        // Per-hw_class median of ln(t_ref / T_ref(c)) where
+        // t_ref = wall_obs · α·factor[h]. A converged model has
+        // median ≈ 0 for every h; the SPREAD across h is the per-h
+        // *uncaptured* residual the K=3 mixture leaves on the table.
+        let alpha = alpha_map
+            .get(&(pname.clone(), system.clone()))
+            .copied()
+            .unwrap_or(rio_scheduler::sla::alpha::UNIFORM);
         let mut by_h: BTreeMap<String, Vec<f64>> = BTreeMap::new();
         for (h, wall, c) in &rows {
             let Some(pred) = gate_b_t_ref(&st, *c) else {
                 continue;
             };
-            if pred > 0.0 && *wall > 0.0 {
-                by_h.entry(h.clone()).or_default().push((wall / pred).ln());
+            // r37 bug_026: hardware-normalize wall_obs the same way the
+            // estimator does before fitting T_ref. The residual is
+            // ln(t_ref / T_ref(c)) — 0 for a perfect model, regardless
+            // of which hwClass observed it.
+            let t_ref = hw_table.normalize(*wall, Some(h.as_str()), alpha);
+            if let Some(r) = gate_b_residual(t_ref, pred) {
+                by_h.entry(h.clone()).or_default().push(r);
             }
         }
         let medians: Vec<(String, f64)> = by_h
@@ -390,6 +455,15 @@ fn gate_a_has_fit(v: &Value) -> bool {
     serde_json::from_value::<SlaStatusResponse>(v.clone())
         .map(|s| s.has_fit)
         .unwrap_or(false)
+}
+
+/// r37 bug_026: per-row gate-b log-residual. Extracted from the loop so
+/// the math is unit-testable without a PG round-trip. `t_ref` is
+/// `wall_obs · (α·factor[h])` — the hardware-NORMALIZED wall the
+/// estimator fits T_ref against. For a perfect model on a heterogeneous
+/// cluster, `ln(t_ref/T_ref(c)) ≈ 0` for every h.
+fn gate_b_residual(t_ref: f64, pred: f64) -> Option<f64> {
+    (pred > 0.0 && t_ref > 0.0).then(|| (t_ref / pred).ln())
 }
 
 /// gate-b PASS/FAIL gate. Extracted so the vacuous-PASS case (mb_001:
@@ -627,6 +701,43 @@ mod tests {
         assert!(gate_b_verdict(0.2, 50, 50).is_ok());
         // Real FAIL unchanged.
         assert!(gate_b_verdict(0.5, 50, 50).is_err());
+    }
+
+    /// r37 bug_026: per-row gate-b log-residual must center at 0 for a
+    /// converged model — NOT at -ln(α·factor[h]). Pre-fix, gate_b fed
+    /// raw wall_obs to the ratio, so the per-h median was the cluster's
+    /// hardware heterogeneity (≈ -ln s_h), invariant to model quality.
+    /// Speedups are fed in directly (no HwTable construction): the
+    /// test-only HwTable constructors (`from_map`/`from_factors`) are
+    /// `#[cfg(test)]`, not visible from xtask. `HwTable::normalize`'s own
+    /// behaviour is covered in `rio_scheduler::sla::hw::tests::
+    /// normalize_scales_known`.
+    #[test]
+    fn gate_b_residual_centers_at_zero_for_perfect_model() {
+        // Two hwClasses, 4× speedup difference. wall_obs differs 4× but
+        // t_ref/T_ref(c) centers at 0 for both — spread is 0, not ln(4).
+        let s_ebs = 1.0; // dot(α, factor[ebs]) for an isotropic [1;K]
+        let s_nvme = 4.0; // dot(α, factor[nvme]) for an isotropic [4;K]
+        let pred = 100.0; // T_ref(c) for a fixed c.
+        // Converged model: wall_obs = T_ref(c) / s_h.
+        let wall_ebs = pred / s_ebs;
+        let wall_nvme = pred / s_nvme;
+        // post-fix: gate_b feeds t_ref = wall_obs · s_h.
+        let r_ebs = gate_b_residual(wall_ebs * s_ebs, pred).unwrap();
+        let r_nvme = gate_b_residual(wall_nvme * s_nvme, pred).unwrap();
+        assert!(
+            (r_ebs - r_nvme).abs() < 1e-9,
+            "residual spread must be 0 for a perfect model; got ebs={r_ebs} nvme={r_nvme}"
+        );
+        // pre-fix: gate_b fed raw wall_obs; spread = ln(4) ≈ 1.39 > τ=0.35.
+        let r_ebs_buggy = gate_b_residual(wall_ebs, pred).unwrap();
+        let r_nvme_buggy = gate_b_residual(wall_nvme, pred).unwrap();
+        assert!(
+            (r_ebs_buggy - r_nvme_buggy).abs() > GATE_B_TAU,
+            "PRECONDITION: this fixture must reproduce the bug (un-normalized \
+             spread {} must exceed GATE_B_TAU={GATE_B_TAU})",
+            (r_ebs_buggy - r_nvme_buggy).abs()
+        );
     }
 
     /// bug_033: `truncate` byte-slices `&s[..n-1]`; multi-byte chars at
