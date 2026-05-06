@@ -32,7 +32,7 @@ spec:
   seccompProfile:                              # SeccompProfileKind?, optional — CEL-forbidden for Fetcher
     type: Localhost                            #   RuntimeDefault | Localhost | Unconfined
     localhostProfile: operator/rio-builder.json#   required iff type=Localhost (r[ctrl.crd.seccomp-cel])
-  fuseCacheBytes: 53687091200                  # u64?, optional — Fetcher-only (REJECTED for Builder; Builder reads `[nodeclaim_pool].fuse_cache_bytes`). emptyDir sizeLimit + ephemeral-storage; default 4Gi
+  # fuseCacheBytes: <bytes>                    # u64?, REJECTED by CEL for BOTH kinds since r35 (merged_bug_024) — all pools read `[nodeclaim_pool].fuse_cache_bytes` (helm `poolDefaults.fuseCacheBytes`, 50Gi prod / 8Gi default). See r[ctrl.event.spec-degrade].
   # NOT CRD fields: resources (per-pod cpu/mem/disk come from the
   # scheduler's per-drv SpawnIntent — ADR-023); securityContext (caps
   # hardcoded in build_executor_pod_spec()); topologySpread (one-shot
@@ -599,8 +599,9 @@ An empty NodeClaim is kept while
 `λ(t)` is the windowed empirical arrival rate over `[t, t+W)` (window
 `W = q_0.5(boot)/2 ≥ 5s`) on right-censored `idle_gap[h,cap]`; the
 fitting-core term is the current tick's per-cell mean over `intents`
-restricted to those whose hw-class set contains the cell, or whose
-hw-class set is empty AND `hw_admits(cell, system, features)` holds —
+restricted to those whose admissible `(hw-class, capacity-type)` cell
+set (`cells_of(i)`) contains the cell, or whose hw-class set is empty
+AND `hw_admits(cell, system, features)` holds —
 the SAME predicate FFD's `simulate` uses for the agnostic-fallback gate
 (defined as 0 when intents is ⊥ or empty). A floor
 `consolidate_after ≥ max(q_0.5(boot)/2, min_consolidation_time[h])`
