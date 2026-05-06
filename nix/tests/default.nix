@@ -1066,7 +1066,7 @@ in
   #   builtin FODs by feature to `fetcher-*` (r35 B1). The deleted
   #   rio.build/node-role convention must NOT reappear. Karpenter
   #   NodePool/NodeClaim enforcement is EKS-only.
-  # r[verify ctrl.pool.fetcher-affinity-from-intent+4]
+  # r[verify ctrl.pool.fetcher-affinity-from-intent+5]
   #   fetcher-node-dedicated subtest: same shape check — pool-static
   #   nodeSelector present (the §13e B4 restore: it keys on
   #   pool.spec.kind, a Pool-level invariant the per-intent affinity is

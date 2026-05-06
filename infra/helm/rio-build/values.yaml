@@ -1068,10 +1068,12 @@ pools:
     kind: Fetcher
     # `builtin` so the spawn-signal intent is self-describing.
     systems: [x86_64-linux, i686-linux, builtin]
-    # null-clear so the reconciler injects the rio.build/fetcher
-    # toleration default (poolDefaults carries the builder toleration;
-    # without this the fetcher pod tolerates only the builder taint
-    # → never lands on a fetcher node).
+    # null-clear so the fetcher pod doesn't inherit the unused
+    # poolDefaults builder toleration. Hygienic, not load-bearing:
+    # post r37 bug_001 the controller MERGES (never replaces) the
+    # rio.build/fetcher toleration with operator-set tolerations, so
+    # even a non-null override here would still get the fetcher
+    # toleration appended (`r[ctrl.pool.fetcher-tolerations]`).
     tolerations: null
     # §13e: null-clear so the inherited poolDefaults.nodeSelector
     # (rio.build/node-role: builder) doesn't pin fetcher pods to

@@ -242,7 +242,7 @@ fn effective_host_users(pool: &Pool) -> Option<bool> {
 /// is the cross-layer guard that keeps them aligned. A typo in either
 /// is a permanently-Pending pod with an affinity no Node satisfies.
 // r[impl fetcher.node.dedicated+4]
-// r[impl ctrl.pool.fetcher-affinity-from-intent+4]
+// r[impl ctrl.pool.fetcher-affinity-from-intent+5]
 fn effective_node_selector(pool: &Pool) -> Option<BTreeMap<String, String>> {
     if is_fetcher(pool) {
         // r35 bug_044 (§Permissive-restrictive asymmetry): the
@@ -253,8 +253,11 @@ fn effective_node_selector(pool: &Pool) -> Option<BTreeMap<String, String>> {
         // it does not remove this one. The pre-r35 `or_else` (replace)
         // let an AZ pin co-tenant an open-egress fetcher with
         // rio-controller's node — dropping the constraint removes the
-        // lateral-movement boundary. NOT the same shape as
-        // `effective_tolerations` (permissive; over-firing is harmless).
+        // lateral-movement boundary. `effective_tolerations` (r37
+        // bug_001) is the merge-not-replace dual: missing the
+        // toleration deadlocks against THIS unconditional nodeSelector.
+        // The functions are pair-coupled — every key this fn ADDS
+        // requires a matching toleration there.
         //
         // UNCONDITIONAL `insert` — never `or_insert_with`. If the
         // operator sets `{rio.build/fetcher: "false"}`, the entry
@@ -290,30 +293,55 @@ fn taint_to_toleration(nt: rio_proto::types::NodeTaint) -> Toleration {
 /// taint on a fetcher class (e.g. `rio.build/egress-only`) routes its
 /// toleration automatically. Permissive — over-fire is harmless, and
 /// it's the cold-start fallback for `hw_class_names=[]`.
+///
+/// **r37 bug_001 (§Permissive-restrictive asymmetry — sibling of r35
+/// bug_044):** MERGE operator tolerations with the auto-injected
+/// fetcher set, never REPLACE. Pre-bug_044, dropping the auto-injected
+/// fetcher toleration weakened isolation but the pod still ran (no
+/// nodeSelector pinning it to tainted nodes). Post-bug_044,
+/// `effective_node_selector` unconditionally inserts
+/// `{rio.build/fetcher: true}` — the pod is pinned to fetcher nodes,
+/// every one of which carries `rio.build/fetcher:NoSchedule`. An
+/// operator setting `pool.spec.tolerations` (an AZ taint, an audit
+/// taint) would have dropped the fetcher toleration → permanent
+/// Pending with no warn/metric. Mirrors the `wants_metal` arm
+/// (append-with-dedup): operator tolerations ADD constraints, the
+/// fetcher one is structural.
+///
+/// No CEL guard needed: unlike `nodeSelector["rio.build/fetcher"]`
+/// (which an operator can set to `"false"` and weaken), tolerations
+/// are purely additive — there is no value the operator can set that
+/// breaks scheduling once the merge is unconditional.
 // r[impl ctrl.pool.intent-tolerations]
+// r[impl ctrl.pool.fetcher-tolerations]
 fn effective_tolerations(pool: &Pool, hw: &HwClassConfig) -> Option<Vec<Toleration>> {
-    if is_fetcher(pool) {
-        pool.spec.tolerations.clone().or_else(|| {
-            let taints = hw.taints_routing_to(rio_common::k8s::FETCHER_TAINT_KEY);
-            if taints.is_empty() {
-                // Cold-start: no fetcher hwClass loaded yet (or
-                // operator misconfig). Fall back to the literal taint
-                // so fetcher pods can still tolerate the static node
-                // taint during bootstrap. Mirrors `wants_metal`'s
-                // literal `kvm` floor — fail-OPEN.
-                Some(vec![Toleration {
-                    key: Some(rio_common::k8s::FETCHER_TAINT_KEY.into()),
-                    operator: Some("Exists".into()),
-                    effect: Some("NoSchedule".into()),
-                    ..Default::default()
-                }])
-            } else {
-                Some(taints.into_iter().map(taint_to_toleration).collect())
-            }
-        })
-    } else {
-        pool.spec.tolerations.clone()
+    if !is_fetcher(pool) {
+        return pool.spec.tolerations.clone();
     }
+    let mut t = pool.spec.tolerations.clone().unwrap_or_default();
+    let mut fetcher_tols: Vec<Toleration> = hw
+        .taints_routing_to(rio_common::k8s::FETCHER_TAINT_KEY)
+        .into_iter()
+        .map(taint_to_toleration)
+        .collect();
+    if fetcher_tols.is_empty() {
+        // Cold-start: no fetcher hwClass loaded yet (or operator
+        // misconfig). Fall back to the literal taint so fetcher pods
+        // can tolerate the static node taint during bootstrap. Mirrors
+        // `wants_metal`'s literal `kvm` floor — fail-OPEN.
+        fetcher_tols.push(Toleration {
+            key: Some(rio_common::k8s::FETCHER_TAINT_KEY.into()),
+            operator: Some("Exists".into()),
+            effect: Some("NoSchedule".into()),
+            ..Default::default()
+        });
+    }
+    for tol in fetcher_tols {
+        if !t.contains(&tol) {
+            t.push(tol);
+        }
+    }
+    Some(t)
 }
 
 /// Pool advertises a feature that routes drvs to a metal hw-class →
@@ -1432,7 +1460,7 @@ mod tests {
     /// (`FETCHER_TAINT_KEY`) is wired to NodeClaim labels via
     /// `cover::build_nodeclaim`; a `node-role` selector would never match
     /// any node.
-    // r[verify ctrl.pool.fetcher-affinity-from-intent+4]
+    // r[verify ctrl.pool.fetcher-affinity-from-intent+5]
     // r[verify fetcher.node.dedicated+4]
     #[test]
     fn fetcher_pod_no_legacy_node_role_selector() {
@@ -1501,7 +1529,7 @@ mod tests {
     /// `build_executor_pod_spec` does not see a per-intent affinity, so
     /// the only restrictive placement it CAN stamp is the pool-static
     /// nodeSelector.
-    // r[verify ctrl.pool.fetcher-affinity-from-intent+4]
+    // r[verify ctrl.pool.fetcher-affinity-from-intent+5]
     // r[verify fetcher.node.dedicated+4]
     #[test]
     fn builtin_fod_pod_has_pool_static_fetcher_node_selector() {
@@ -1541,7 +1569,7 @@ mod tests {
     /// restrictive and load-bearing for `system="builtin"` FODs whose
     /// `hw_class_names=[]` carries no per-intent affinity; dropping it
     /// removes the lateral-movement boundary.
-    // r[verify ctrl.pool.fetcher-affinity-from-intent+4]
+    // r[verify ctrl.pool.fetcher-affinity-from-intent+5]
     // r[verify fetcher.node.dedicated+4]
     #[test]
     fn fetcher_pod_spec_node_selector_merges_with_pool_static_default() {
@@ -1608,6 +1636,84 @@ mod tests {
             Some("true"),
             "operator-set rio.build/fetcher=false must be overridden — \
              the pool-static constraint is universal, not weakenable: {ns:?}"
+        );
+    }
+
+    /// r37 bug_001 (§Permissive-restrictive asymmetry, sibling of r35
+    /// bug_044): a Fetcher Pool with operator-set tolerations MUST keep
+    /// the auto-injected fetcher taint toleration. `effective_node_selector`
+    /// (bug_044 fix) unconditionally pins the pod to `rio.build/fetcher:
+    /// true` nodes — every one of which carries `rio.build/fetcher:
+    /// NoSchedule`. A pod with the nodeSelector but not the toleration is
+    /// permanently Pending and there is no warn/metric.
+    ///
+    /// This is the pair-coupling invariant: every nodeSelector key
+    /// `effective_node_selector` ADDS (vs the spec) corresponds to a taint
+    /// on the matching nodes, so the effective tolerations MUST include a
+    /// toleration for that taint — for all spec values.
+    // r[verify ctrl.pool.fetcher-tolerations]
+    #[test]
+    fn fetcher_pod_operator_tolerations_merge_not_replace() {
+        let hw = HwClassConfig::default();
+        let mut p = crate::fixtures::test_pool("f", ExecutorKind::Fetcher);
+        let custom = Toleration {
+            key: Some("custom.example/audit".into()),
+            operator: Some("Exists".into()),
+            effect: Some("NoSchedule".into()),
+            ..Default::default()
+        };
+        p.spec.tolerations = Some(vec![custom.clone()]);
+        let spec = build_executor_pod_spec(
+            &p,
+            &crate::fixtures::test_sched_addrs(),
+            &crate::fixtures::test_store_addrs(),
+            &hw,
+        );
+        let tols = spec.tolerations.expect("fetcher pod must have tolerations");
+        assert!(tols.contains(&custom), "operator toleration preserved");
+        assert!(
+            tols.iter()
+                .any(|t| t.key.as_deref() == Some(rio_common::k8s::FETCHER_TAINT_KEY)),
+            "fetcher taint toleration always present — pool-static \
+             nodeSelector (bug_044) pins to tainted nodes; dropping the \
+             toleration is permanent Pending: {tols:?}"
+        );
+        // Pair invariant: the nodeSelector key the controller adds requires
+        // a corresponding toleration in the same pod spec.
+        let ns = spec.node_selector.expect("fetcher pod has nodeSelector");
+        assert!(
+            ns.contains_key(rio_common::k8s::FETCHER_TAINT_KEY)
+                && tols
+                    .iter()
+                    .any(|t| t.key.as_deref() == Some(rio_common::k8s::FETCHER_TAINT_KEY)),
+            "every pool-static nodeSelector key with a matching taint must \
+             have a toleration"
+        );
+
+        // `Some(vec![])` (operator explicitly sets `tolerations: []`) is
+        // the most surprising trigger: the pre-fix `.or_else()` short-
+        // circuits on ANY `Some(_)`, including the empty list — the
+        // operator thinks they're clearing tolerations, but the result is
+        // permanent Pending. The merge handles it the same as
+        // `Some(vec![T])`: `unwrap_or_default()` yields `vec![]`, fetcher
+        // tolerations are appended unconditionally.
+        let mut p_empty = crate::fixtures::test_pool("f-empty", ExecutorKind::Fetcher);
+        p_empty.spec.tolerations = Some(vec![]);
+        let spec_empty = build_executor_pod_spec(
+            &p_empty,
+            &crate::fixtures::test_sched_addrs(),
+            &crate::fixtures::test_store_addrs(),
+            &hw,
+        );
+        let tols_empty = spec_empty
+            .tolerations
+            .expect("fetcher pod must have tolerations even with explicit empty operator set");
+        assert!(
+            tols_empty
+                .iter()
+                .any(|t| t.key.as_deref() == Some(rio_common::k8s::FETCHER_TAINT_KEY)),
+            "fetcher taint toleration present when operator sets `tolerations: []`: \
+             {tols_empty:?}"
         );
     }
 

@@ -322,7 +322,7 @@ its toleration automatically. This covers fitted intents
 (`r[ctrl.pool.kvm-device+2]`) covers `hw_class_names=[]` cold-start
 intents.
 
-r[ctrl.pool.fetcher-affinity-from-intent+4]
+r[ctrl.pool.fetcher-affinity-from-intent+5]
 The fetcher pod's restrictive placement constraint MUST be the merge of
 the per-intent `nodeAffinity` derived from `intent.hw_class_names` via
 `cells_to_selector_terms` (`r[ctrl.pool.node-affinity-from-intent]`)
@@ -347,9 +347,23 @@ intent-emit and node-provision: the per-intent affinity is also present
 once `hw_class_names` is populated by the arch-agnostic feature
 fall-through (r35 B1 — `system="builtin"` FODs route by
 `required_features=["fetcher"]`; the arch axis is a no-op for
-arch-unmappable systems). The pool-static fetcher toleration also stays
-— permissive constraints over-firing are harmless and serve as the
-`hw_class_names=[]` cold-start fallback.
+arch-unmappable systems). See `r[ctrl.pool.fetcher-tolerations]` for
+the tolerations dual.
+
+r[ctrl.pool.fetcher-tolerations]
+The fetcher pod's tolerations MUST be the merge of the pool-static
+fetcher tolerations (every taint of every hw-class carrying
+`rio.build/fetcher`, per `HwClassConfig::taints_routing_to`, with the
+literal `rio.build/fetcher:Exists:NoSchedule` as the unloaded-config
+floor) AND the operator's `pool.spec.tolerations` (r37 bug_001),
+deduplicated. The operator MUST NOT be able to drop the pool-static
+set: `r[ctrl.pool.fetcher-affinity-from-intent+5]` makes the
+`{rio.build/fetcher: true}` nodeSelector unconditional, so a fetcher
+pod is pinned to nodes carrying `rio.build/fetcher:NoSchedule` — a
+missing toleration is a permanent Pending with no warn/metric, not a
+"harmless permissive over-fire." Tolerations are purely additive (no
+operator-set value defeats an unconditional merge), so no CEL admission
+guard is needed.
 
 r[ctrl.pool.hw-bench-needed+2]
 The pool reconciler MUST stamp `rio.build/hw-bench-needed` on the pod

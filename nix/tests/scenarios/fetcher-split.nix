@@ -347,7 +347,7 @@ pkgs.testers.runNixOSTest {
     #       floor when no fetcher hwClass is loaded) lets fetcher pods
     #       tolerate the fetcher node taint.
     #   (b) pool-static `nodeSelector{rio.build/fetcher: true}` present
-    #       (§13e B4 restore — `r[ctrl.pool.fetcher-affinity-from-intent+4]`).
+    #       (§13e B4 restore — `r[ctrl.pool.fetcher-affinity-from-intent+5]`).
     #       In THIS fixture the `vmtest` hw-class declares no
     #       `providesFeatures`, so `reference_hw_class_for_system`
     #       returns None for builtin FODs and `hw_class_names=[]` →
