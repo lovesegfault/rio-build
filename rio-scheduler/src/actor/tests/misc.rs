@@ -909,7 +909,15 @@ async fn soft_feature_strip_only() {
     // big-parallel → stripped; D6: floor stays zero.
     actor.test_inject_ready_with_features("ff", None, "x86_64-linux", &["big-parallel"]);
     let s = actor.dag.node("ff").unwrap();
-    assert!(s.required_features.is_empty(), "stripped");
+    assert!(s.required_features().is_empty(), "stripped");
+    // r35: effective_features must agree — `apply_soft_features` routes
+    // through the `set_required_features` write-gate so both fields
+    // are pinned. Pre-r35 a constructor-only chokepoint left
+    // `effective_features = ["big-parallel"]` here.
+    assert!(
+        s.effective_features().as_slice().is_empty(),
+        "stripped (effective)"
+    );
     assert_eq!(
         s.sched.resource_floor,
         Default::default(),
@@ -919,9 +927,76 @@ async fn soft_feature_strip_only() {
     // I-204: survives leader transition.
     actor.clear_persisted_state();
     actor.test_inject_ready_with_features("ff2", None, "x86_64-linux", &["big-parallel"]);
+    let s2 = actor.dag.node("ff2").unwrap();
     assert!(
-        actor.dag.node("ff2").unwrap().required_features.is_empty(),
+        s2.required_features().is_empty(),
         "stripping survives clear_persisted_state"
+    );
+    assert!(
+        s2.effective_features().as_slice().is_empty(),
+        "stripping survives clear_persisted_state (effective)"
+    );
+}
+
+/// **r35 B0 (4/4 validator-converged blocker)** — `apply_soft_features`
+/// mutates `required_features` AFTER construction (both the merge and
+/// recovery paths call it). A constructor-only `effective_features`
+/// derivation captures the PRE-strip declared set, then desyncs when
+/// `apply_soft_features` strips `required_features` but not
+/// `effective_features` — silently regressing I-204 (soft features
+/// stripped at insertion so `rejection_reason`'s `feature-missing`
+/// clause sees hardware-gate features only).
+///
+/// The fix: `set_required_features` write-gate that re-derives
+/// `effective_features` atomically. `apply_soft_features` becomes a
+/// fourth derivation site routing through it.
+///
+/// **Write the assertion against `effective_features`, not
+/// `required_features` — a naive test against `required_features`
+/// passes for the wrong reason** (`apply_soft_features` always
+/// mutated that field).
+///
+/// Constructed via `insert_recovered_node` (NOT direct field
+/// assignment) per §Spike-assertion-must-execute — proves production
+/// code passes through the chokepoint.
+///
+/// **Pre-fix: RED** — `effective_features = ["big-parallel", "kvm"]`
+/// (constructor-only derivation never re-derives after the strip).
+// r[verify sched.sla.fod-feature-derivation+2]
+// r[verify sched.dispatch.soft-features]
+#[tokio::test]
+async fn apply_soft_features_re_derives_effective_features() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_cfg(
+        db.pool.clone(),
+        DagActorConfig {
+            soft_features: vec!["big-parallel".into()],
+            ..Default::default()
+        },
+    );
+
+    // Non-FOD with `["big-parallel", "kvm"]`. `apply_soft_features`
+    // (called by `insert_recovered_node`) strips `big-parallel`.
+    actor.test_inject_ready_with_features(
+        "ff-soft",
+        None,
+        "x86_64-linux",
+        &["big-parallel", "kvm"],
+    );
+    let s = actor.dag.node("ff-soft").unwrap();
+    // Both fields must agree post-strip — pin both so the next
+    // `required_features` mutation site can't desync them silently.
+    assert_eq!(
+        s.required_features(),
+        &["kvm".to_string()],
+        "apply_soft_features strips `big-parallel` from required_features",
+    );
+    assert_eq!(
+        s.effective_features().as_slice(),
+        &["kvm".to_string()],
+        "apply_soft_features MUST re-derive effective_features — a \
+         constructor-only chokepoint leaves it desynced at \
+         [\"big-parallel\", \"kvm\"]",
     );
 }
 

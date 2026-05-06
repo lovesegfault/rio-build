@@ -1401,7 +1401,11 @@ impl DagActor {
             warn!(
                 drv_hash = %drv_hash,
                 system = %state.system,
-                required_features = ?state.required_features,
+                // §13e + r35: intentional bypass — the operator triaging
+                // an unroutable drv needs to see what the tenant
+                // DECLARED. `effective_features` is the routing artifact.
+                declared_features = ?state.required_features(),
+                effective_features = ?state.effective_features().as_slice(),
                 failed_on = state.retry.failed_builders.len(),
                 "failed_builders excludes every statically-eligible worker \
                  (kind+system+features); poisoning (would otherwise defer \

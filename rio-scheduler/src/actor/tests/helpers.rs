@@ -329,6 +329,17 @@ pub(crate) async fn send_heartbeat_with(
 ) -> anyhow::Result<()> {
     let mut hb = HeartbeatFields::default();
     f(&mut hb);
+    // §13e + r35: fetcher pods are stamped `RIO_FEATURES=fetcher` by
+    // the controller (`pool/pod.rs::effective_features`); the worker
+    // heartbeat advertises it. Mirror that here so the dispatch-time
+    // `hard_filter` features check (`effective_features = [fetcher]`
+    // for every FOD post-r35) matches like production. A fetcher
+    // worker without `[fetcher]` is misconfigured. Only fill the
+    // default-empty case — a test that explicitly sets
+    // `supported_features` overrides.
+    if hb.kind == rio_proto::types::ExecutorKind::Fetcher && hb.supported_features.is_empty() {
+        hb.supported_features = vec![rio_common::k8s::FETCHER_FEATURE.to_string()];
+    }
     handle
         .send_unchecked(ActorCommand::Heartbeat(HeartbeatPayload {
             executor_id: executor_id.into(),

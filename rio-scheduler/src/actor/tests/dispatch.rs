@@ -2119,7 +2119,7 @@ async fn spawn_intent_node_affinity_from_solve_full() {
 /// §13e: FOD no longer falls through — `effective_features = [fetcher]`
 /// partitions `h_all` to `fetcher-*` and FOD participates in solve_full.
 // r[verify sched.sla.hw-class.admissible-set]
-// r[verify sched.sla.fod-feature-derivation]
+// r[verify sched.sla.fod-feature-derivation+2]
 #[tokio::test]
 async fn solve_full_gate_skips_kvm_serial_and_override() {
     let db = TestDb::new(&MIGRATOR).await;

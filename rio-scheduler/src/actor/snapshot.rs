@@ -99,28 +99,30 @@ pub(super) fn detect_hung_nodes(
     hung
 }
 
-/// §13e: derive a drv's effective feature set. FODs require `[fetcher]`
-/// regardless of `requiredSystemFeatures` (FODs SHOULD have empty
-/// declared features — `r[ctrl.crd.fetcher-no-features+2]` — but if a
-/// misconfigured drv declares `[kvm]` we override it: a kvm FOD would
-/// route to a kvm node with no fetcher airgap, breaking ADR-019).
-/// Single chokepoint mirroring the controller's `effective_features
-/// (spec)` so the spawn-decision query and the scheduler's intent
-/// features cannot diverge — divergence fails the I-181 ∅-guard CLOSED
-/// (no spawn, loud, not silent wrong-routing).
+/// §13e + r35: thin accessor for the drv's stored
+/// [`DerivationState::effective_features`] field. The derivation moved
+/// from this free fn (called at 5 spawn-intent-path sites) to a
+/// constructor invariant on `DerivationState` (§nth-strike STRIKE-3:
+/// each round of "the chokepoint isn't total" added another caller of
+/// this fn; each missed the next site — `assignment.rs` dispatch,
+/// `pool_covers`, the recovery row constructors). The biconditional
+/// `is_fixed_output ⟺ ∋ fetcher` is now enforced at construction +
+/// `set_required_features` write-gate, so this accessor cannot
+/// observe a stale or unstrut value.
 ///
-/// Every `required_features` consumer reachable from the spawn-intent
-/// path reads this. The only intentional bypass is
-/// `handle_inspect_build_dag`'s `required_features` field, which echoes
-/// the *declared* set for the operator (the derived set is a routing
-/// artifact, not what the tenant submitted).
-// r[impl sched.sla.fod-feature-derivation]
+/// Kept as a free fn so the 5 spawn-intent call sites stay textually
+/// unchanged. Returns an owned `Vec<String>` (the call sites assign it
+/// to `SpawnIntent.required_features` / `DrvHints.required_features`
+/// or pass `&feat` to `features_compatible`).
+///
+/// The TWO intentional bypasses read the *declared* set via
+/// `state.required_features()`: `handle_inspect_build_dag`'s
+/// `required_features` field (operator-facing echo of what the tenant
+/// submitted) and `actor/dispatch.rs`'s `failed_builders` warn (ditto
+/// — the operator needs to see what was declared, not what was
+/// derived, when triaging an unroutable drv).
 fn effective_features(state: &crate::state::DerivationState) -> Vec<String> {
-    if state.is_fixed_output {
-        vec![rio_common::k8s::FETCHER_FEATURE.to_string()]
-    } else {
-        state.required_features.clone()
-    }
+    state.effective_features().as_slice().to_vec()
 }
 
 /// Request-side filter shared by the Ready and forecast passes of
@@ -1948,7 +1950,11 @@ impl DagActor {
                     backoff_remaining_secs,
                     interested_build_count: s.interested_builds.len() as u32,
                     system: s.system.clone(),
-                    required_features: s.required_features.clone(),
+                    // §13e + r35: intentional bypass — the operator
+                    // needs to see what the tenant DECLARED, not what
+                    // the chokepoint derived. The derived set is a
+                    // routing artifact.
+                    required_features: s.required_features().to_vec(),
                     failed_builders: s
                         .retry
                         .failed_builders

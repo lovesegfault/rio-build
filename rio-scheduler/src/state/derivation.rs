@@ -18,6 +18,152 @@ use uuid::Uuid;
 
 use super::{DrvHash, ExecutorId, TransitionError, db_str_enum};
 
+/// LRU cap for the [`EffectiveFeatures::derive`] strip-warn debounce.
+/// Key cardinality is `|pname| × |reason|` (`reason ∈ {non_fod_fetcher,
+/// fod_declared_features}`, `|reason| = 2`). Bounded by the live drv
+/// set; 1024 matches the sibling `unroutable_features_warned` /
+/// `cap_mismatch_warned` caps. Eviction re-arms the warn (fail-safe
+/// over-emit).
+const FEATURES_STRIPPED_WARNED_CAP: usize = 1024;
+
+/// Process-wide once-per-`(pname, reason)` debounce for
+/// `rio_scheduler_features_stripped_total`. A static, not a `DagActor`
+/// field, because the chokepoint ([`EffectiveFeatures::derive`]) is a
+/// constructor invariant on `DerivationState` — it has no actor handle.
+/// Same `LruCache` shape as `unroutable_features_warned` /
+/// `cap_mismatch_warned` / `forecast_dropped_warned` (the
+/// `ONCE_PER_MISS` contract). Re-arms on eviction and on pod restart.
+static FEATURES_STRIPPED_WARNED: std::sync::LazyLock<
+    parking_lot::Mutex<lru::LruCache<(String, &'static str), ()>>,
+> = std::sync::LazyLock::new(|| {
+    parking_lot::Mutex::new(lru::LruCache::new(
+        std::num::NonZeroUsize::new(FEATURES_STRIPPED_WARNED_CAP).unwrap(),
+    ))
+});
+
+/// §13e + r35: derived feature set for a derivation. The biconditional
+/// `is_fixed_output ⟺ ∋ fetcher` is enforced **at construction** in
+/// BOTH directions, so producers cannot mint a value that violates the
+/// FOD↔Fetcher airgap and consumers cannot read a stale raw set.
+///
+/// Why a newtype and not a sibling `Vec<String>` field (§nth-strike
+/// STRIKE-3): three rounds of "the chokepoint isn't total" (§13e B1,
+/// §13e B4, r35 `hard_filter`/`statically_eligible`/`pool_covers`).
+/// Each fix added another caller of the free-fn `effective_features`;
+/// each missed the next site. The newtype has no `From<Vec<String>>`
+/// and no `pub` field, so the only way to obtain one is `derive` —
+/// the bypass is impossible by construction, not by discipline.
+///
+/// Stored on [`DerivationState`] alongside the raw `required_features`
+/// (kept for the diagnostic API echo: `InspectBuildDag`,
+/// `dispatch.rs`'s `failed_builders` warn, the PG persist).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveFeatures(Vec<String>);
+
+impl EffectiveFeatures {
+    /// Single chokepoint: FOD ⟹ `[fetcher]`; non-FOD ⟹ raw − `{fetcher}`.
+    ///
+    /// The forward override (FOD ⟹ `[fetcher]`) is the §13e fix: a
+    /// misconfigured FOD declaring `requiredSystemFeatures: ["kvm"]`
+    /// would otherwise route to a kvm node with no fetcher airgap,
+    /// breaking ADR-019.
+    ///
+    /// The reverse strip (non-FOD ⟹ raw − `{fetcher}`) is the
+    /// merged_bug_004 close: `fetcher` is a rio-internal routing tag,
+    /// not a tenant-declarable system feature. A non-FOD with
+    /// `requiredSystemFeatures: ["fetcher"]` would otherwise route to
+    /// (and idle-mint) a fetcher node it doesn't need, spending the
+    /// tenant's $/hr on a node-class that never builds it. Stripped
+    /// here ⟹ `effective_features = []` ⟹ wire
+    /// `SpawnIntent.required_features = []` ⟹ `pool_covers` Fetcher
+    /// tuple `["fetcher"]` rejects via the ∅-guard ⟹ routes to a
+    /// Builder Pool like any non-featured drv.
+    ///
+    /// `pname` is for warn/metric attribution only — it does not
+    /// affect the derived set.
+    // r[impl sched.sla.fod-feature-derivation+2]
+    pub fn derive(is_fixed_output: bool, raw: &[String], pname: Option<&str>) -> Self {
+        let out: Vec<String> = if is_fixed_output {
+            vec![rio_common::k8s::FETCHER_FEATURE.to_string()]
+        } else {
+            raw.iter()
+                .filter(|f| f.as_str() != rio_common::k8s::FETCHER_FEATURE)
+                .cloned()
+                .collect()
+        };
+        // Observability: the strip is silent — a tenant whose non-FOD
+        // legitimately needs network and declares `["fetcher"]` will
+        // run on an air-gapped builder and fail with `Connection
+        // refused`, an opaque sandbox error that doesn't say "your
+        // `fetcher` feature was stripped." Same for a FOD declaring
+        // `["kvm"]` — it routes to a fetcher node (no kvm). Reject-
+        // at-submit is disproportionate (the strip produces correct
+        // routing); warn + count instead. Debounced once per
+        // `(pname, reason)` so a 10K-drv DAG from one misconfigured
+        // tenant emits once, not 10K times.
+        //
+        // Two inline-literal `counter!` calls (not `=> reason` with a
+        // bound variable) so `labeled_metric_values_have_emit_sites`
+        // can statically scan the `"reason" => "<literal>"` pairs.
+        //
+        // Fire only when something the tenant DECLARED was removed —
+        // NOT when the chokepoint *added* a feature. A FOD with the
+        // spec-correct `requiredSystemFeatures: []` derives to
+        // `[fetcher]`; `out != raw` would warn on EVERY correctly
+        // configured FOD (the common case), and the metric named for
+        // a strip would count an addition. Same for `from_poisoned_row`
+        // (always passes `raw=[]`): a recovered Poisoned FOD must not
+        // count as a tenant misconfig.
+        if raw.iter().any(|f| !out.contains(f)) {
+            let reason: &'static str = if is_fixed_output {
+                "fod_declared_features"
+            } else {
+                "non_fod_fetcher"
+            };
+            let key = (pname.unwrap_or("").to_string(), reason);
+            if FEATURES_STRIPPED_WARNED.lock().put(key, ()).is_none() {
+                if is_fixed_output {
+                    ::metrics::counter!(
+                        "rio_scheduler_features_stripped_total",
+                        "reason" => "fod_declared_features",
+                    )
+                    .increment(1);
+                } else {
+                    ::metrics::counter!(
+                        "rio_scheduler_features_stripped_total",
+                        "reason" => "non_fod_fetcher",
+                    )
+                    .increment(1);
+                }
+                tracing::warn!(
+                    declared = ?raw,
+                    effective = ?out,
+                    is_fod = is_fixed_output,
+                    pname = pname.unwrap_or(""),
+                    reason,
+                    "stripped declared features at chokepoint — \
+                     is_fixed_output ⟺ ∋ fetcher is enforced at construction; \
+                     the declared set is preserved for diagnostics only",
+                );
+            }
+        }
+        Self(out)
+    }
+
+    /// Borrow the derived set. The only read path — there is no
+    /// `Deref<Target=Vec<String>>` and no public field, so a future
+    /// writer cannot `.push("kvm")` past the constructor invariant.
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+
+    /// Consume into the inner `Vec<String>` (for the wire
+    /// `SpawnIntent.required_features` populate).
+    pub fn into_vec(self) -> Vec<String> {
+        self.0
+    }
+}
+
 db_str_enum! {
     // r[impl sched.state.machine]
     /// State of a single derivation in the global DAG.
@@ -592,8 +738,20 @@ pub struct DerivationState {
     pub prefer_local_build: Option<bool>,
     /// Target system (e.g. "x86_64-linux").
     pub system: String,
-    /// Required system features the building worker must support.
-    pub required_features: Vec<String>,
+    /// Declared `requiredSystemFeatures` from the proto node, verbatim.
+    /// Diagnostic echo only — routing reads [`Self::effective_features`].
+    /// Private: ALL writes must go through [`Self::set_required_features`]
+    /// so `effective_features` re-derives atomically (the §13e+r35
+    /// chokepoint). Read via [`Self::required_features`].
+    required_features: Vec<String>,
+    /// §13e + r35: derived feature set. The biconditional
+    /// `is_fixed_output ⟺ ∋ fetcher` is enforced at construction (and
+    /// re-derived on every [`Self::set_required_features`]) so
+    /// producers cannot mint a value that violates the FOD↔Fetcher
+    /// airgap. Private — read via [`Self::effective_features`] (no
+    /// `Deref`, no `pub` field, no `From<Vec<String>>`; the only
+    /// producer is [`EffectiveFeatures::derive`]).
+    effective_features: EffectiveFeatures,
     /// Output names (e.g. ["out", "dev"]).
     pub output_names: Vec<String>,
     /// Whether this is a fixed-output derivation (fetchurl, etc.).
@@ -709,6 +867,11 @@ impl DerivationState {
             prefer_local_build: node.prefer_local_build,
             system: node.system.clone(),
             required_features: node.required_features.clone(),
+            effective_features: EffectiveFeatures::derive(
+                node.is_fixed_output,
+                &node.required_features,
+                (!node.pname.is_empty()).then_some(node.pname.as_str()),
+            ),
             output_names: node.output_names.clone(),
             is_fixed_output: node.is_fixed_output,
             ca: CaState {
@@ -779,6 +942,13 @@ impl DerivationState {
         let drv_path = rio_nix::store_path::StorePath::parse(&row.drv_path)
             .map_err(|e| (row.drv_hash.clone(), e))?;
         let now = Instant::now();
+        // §13e+r35: derive BEFORE the struct literal moves `row.pname` /
+        // `row.required_features`. Same chokepoint as `try_from_node`.
+        let effective_features = EffectiveFeatures::derive(
+            row.is_fixed_output,
+            &row.required_features,
+            row.pname.as_deref(),
+        );
         Ok(Self {
             drv_hash: row.drv_hash.into(),
             drv_path,
@@ -791,6 +961,7 @@ impl DerivationState {
             enable_parallel_checking: None,
             prefer_local_build: None,
             system: row.system,
+            effective_features,
             required_features: row.required_features,
             output_names: row.output_names,
             is_fixed_output: row.is_fixed_output,
@@ -879,6 +1050,11 @@ impl DerivationState {
         let clamped = row.elapsed_secs.max(0.0).min(MAX_ELAPSED_SECS);
         let elapsed = std::time::Duration::from_secs_f64(clamped);
         let poisoned_at = now.checked_sub(elapsed).unwrap_or(now);
+        // §13e+r35: recovered Poisoned has no persisted features
+        // (`required_features = []`). FOD ⟹ `[fetcher]` still derives
+        // correctly; non-FOD ⟹ `[]`.
+        let effective_features =
+            EffectiveFeatures::derive(row.is_fixed_output, &[], row.pname.as_deref());
         Ok(Self {
             drv_hash: row.drv_hash.into(),
             drv_path,
@@ -889,6 +1065,7 @@ impl DerivationState {
             prefer_local_build: None,
             system: row.system,
             required_features: Vec::new(),
+            effective_features,
             output_names: Vec::new(),
             is_fixed_output: row.is_fixed_output,
             ca: CaState::default(),
@@ -922,6 +1099,53 @@ impl DerivationState {
     /// Callers using `&str` auto-deref via `StorePath::Deref<Target=str>`.
     pub fn drv_path(&self) -> &rio_nix::store_path::StorePath {
         &self.drv_path
+    }
+
+    /// §13e + r35: the derived feature set. The biconditional
+    /// `is_fixed_output ⟺ ∋ fetcher` holds at every read because the
+    /// only producer is [`EffectiveFeatures::derive`] (constructor +
+    /// the `set_required_features` write-gate). EVERY routing
+    /// consumer reads this — `passes_intent_filter`, `h_all`
+    /// partition, `override_hash` memo key, `retain_hosting_cells`,
+    /// `bypass_cells` cold-start, `hard_filter`/`rejection_reason`,
+    /// `statically_eligible`, the wire `SpawnIntent.required_features`.
+    /// The TWO intentional bypasses read the *declared* set via
+    /// [`Self::required_features`]: `actor/snapshot.rs::handle_inspect_
+    /// build_dag` (operator-facing echo of what the tenant submitted)
+    /// and `actor/dispatch.rs`'s `failed_builders` warn (ditto).
+    pub fn effective_features(&self) -> &EffectiveFeatures {
+        &self.effective_features
+    }
+
+    /// Declared `requiredSystemFeatures`, verbatim from the proto node.
+    /// Diagnostic echo only — `InspectBuildDag` and the `dispatch.rs`
+    /// `failed_builders` warn show the operator what the tenant
+    /// submitted. ROUTING reads [`Self::effective_features`] — a
+    /// consumer reading this raw set is a §13e/r35 chokepoint bypass.
+    pub fn required_features(&self) -> &[String] {
+        &self.required_features
+    }
+
+    /// Atomic write-gate for `required_features`. ALL post-construction
+    /// mutation of `required_features` MUST go through this — it
+    /// re-derives `effective_features` so the biconditional
+    /// `is_fixed_output ⟺ effective_features ∋ fetcher` cannot drift
+    /// (§13e + r35 — the 4/4-validator-converged blocker:
+    /// `apply_soft_features` mutated `required_features` AFTER
+    /// construction, leaving a constructor-only `effective_features`
+    /// permanently desynced and silently regressing I-204).
+    ///
+    /// The constructors (`try_from_node` / `from_recovery_row` /
+    /// `from_poisoned_row`) call [`EffectiveFeatures::derive`]
+    /// directly; there is NO direct write path to either field outside
+    /// `state/derivation.rs`.
+    pub(crate) fn set_required_features(&mut self, raw: Vec<String>) {
+        self.required_features = raw;
+        self.effective_features = EffectiveFeatures::derive(
+            self.is_fixed_output,
+            &self.required_features,
+            self.pname.as_deref(),
+        );
     }
 
     /// True iff this node can be checked against `FindMissingPaths`:

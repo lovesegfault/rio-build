@@ -114,13 +114,26 @@ impl DerivationDag {
     /// Strip configured soft features from `state.required_features`.
     /// D6: `floor_hint` seeding removed — SLA sizing owns the initial
     /// shape; reactive `resource_floor` doubling owns the climb.
+    ///
+    /// §13e + r35: routes through [`DerivationState::set_required_features`]
+    /// so `effective_features` re-derives atomically. This is the
+    /// FOURTH derivation site (after the three constructors) — a
+    /// constructor-only chokepoint would leave `effective_features`
+    /// permanently desynced after the soft strip (the 4/4-validator-
+    /// converged blocker: `rejection_reason`'s `feature-missing`
+    /// clause would still see the soft feature, silently regressing
+    /// I-204).
     fn apply_soft_features(&self, state: &mut DerivationState) {
         if self.soft_features.is_empty() {
             return;
         }
-        state
-            .required_features
-            .retain(|f| !self.soft_features.iter().any(|sf| sf == f));
+        let stripped: Vec<String> = state
+            .required_features()
+            .iter()
+            .filter(|f| !self.soft_features.iter().any(|sf| sf == *f))
+            .cloned()
+            .collect();
+        state.set_required_features(stripped);
     }
 
     /// Insert a pre-built node (Phase 3b state recovery). No cycle

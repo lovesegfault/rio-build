@@ -45,6 +45,19 @@ pub fn describe_all() {
          providesFeatures is added; the WARN names which features."
     );
     describe_counter!(
+        "rio_scheduler_features_stripped_total",
+        "§13e+r35: EffectiveFeatures::derive stripped the declared \
+         requiredSystemFeatures at the FOD↔Fetcher chokepoint (labeled \
+         reason ∈ {non_fod_fetcher, fod_declared_features}). \
+         non_fod_fetcher: a non-FOD declared `fetcher` (rio-internal \
+         routing tag, not a tenant-declarable system feature); the \
+         drv routes to a Builder Pool. fod_declared_features: a FOD \
+         declared extraneous features (e.g. `kvm`); the drv routes to \
+         a Fetcher Pool. The strip produces correct routing — the WARN \
+         (debounced once per (pname, reason) edge) names the declared \
+         vs effective set so the tenant can fix the misconfig."
+    );
+    describe_counter!(
         "rio_scheduler_sla_suspicious_scaling_total",
         "exploration froze at maxCores still saturated (labeled tenant). \
          The build wants more cores than the cluster offers."
@@ -355,6 +368,7 @@ pub const SLA_METRICS: &[&str] = &[
     "rio_scheduler_sla_keys_evicted_total",
     "rio_scheduler_sla_class_ceiling_uncatalogued",
     "rio_scheduler_sla_forecast_dropped_total",
+    "rio_scheduler_features_stripped_total",
 ];
 
 /// Metrics with a closed-domain label whose VALUES are each a separate
@@ -406,6 +420,11 @@ pub const SLA_LABELED_METRICS: &[(&str, &str, &[&str])] = &[
         "rio_scheduler_sla_forecast_dropped_total",
         "reason",
         &["lead_horizon", "tenant_budget"],
+    ),
+    (
+        "rio_scheduler_features_stripped_total",
+        "reason",
+        &["non_fod_fetcher", "fod_declared_features"],
     ),
 ];
 
@@ -461,6 +480,9 @@ mod tests {
         include_str!("explore.rs"),
         include_str!("prior.rs"),
         include_str!("../actor/snapshot.rs"),
+        // §13e + r35: `EffectiveFeatures::derive` (the FOD↔Fetcher
+        // chokepoint) emits `rio_scheduler_features_stripped_total`.
+        include_str!("../state/derivation.rs"),
         include_str!("../actor/completion.rs"),
     ];
 

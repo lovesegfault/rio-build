@@ -1892,4 +1892,49 @@ mod tests {
             "featureless builder intent NOT covered by Fetcher Pool (∅-guard)"
         );
     }
+
+    /// **r35 B0/B2 boundary tripwire** — `pool_covers` does NOT check
+    /// the `kind` axis. A `kind=Builder` intent carrying
+    /// `required_features=["fetcher"]` (impossible post-B0: the
+    /// scheduler-side `EffectiveFeatures::derive` strips `fetcher`
+    /// from non-FOD declared sets so the wire intent never carries it)
+    /// would be accepted by a Fetcher Pool's coverage tuple `(systems,
+    /// [fetcher])` — `features_compatible([fetcher], [fetcher]) =
+    /// true`, no kind check.
+    ///
+    /// B0 makes this input unreachable; B2 hardens the predicate
+    /// anyway (defense-in-depth: a future scheduler regression must
+    /// not silently mint fetcher nodes for builder intents). This
+    /// test documents the contract and is the red-first proof for
+    /// B2.
+    ///
+    /// TODO: enable once B2 adds the `kind` axis to `PoolCoverage`.
+    #[test]
+    #[ignore = "r35 B2: PoolCoverage has no kind axis yet — B0 only \
+                makes the input unreachable; B2 hardens the predicate"]
+    fn pool_covers_rejects_kind_mismatch() {
+        let fetcher_pool = crate::fixtures::test_pool("f", ExecutorKind::Fetcher);
+        let fetcher_coverage: Vec<PoolCoverage> = vec![(
+            fetcher_pool.spec.systems.clone(),
+            crate::reconcilers::pool::pod::effective_features(&fetcher_pool.spec),
+        )];
+        // A Builder intent SHOULD never carry `[fetcher]` (B0 strips
+        // it scheduler-side) — but `pool_covers` is the controller's
+        // last line of defense against a scheduler regression. Build
+        // the impossible input directly.
+        let bld_with_fetcher = SpawnIntent {
+            system: fetcher_pool.spec.systems[0].clone(),
+            required_features: vec![rio_common::k8s::FETCHER_FEATURE.into()],
+            kind: crate::reconcilers::pool::executor_kind_to_proto(ExecutorKind::Builder).into(),
+            ..Default::default()
+        };
+        assert!(
+            !pool_covers(&bld_with_fetcher, &fetcher_coverage),
+            "Builder intent with [fetcher] must NOT be covered by a \
+             Fetcher Pool — `pool_covers` must check `kind`, not just \
+             features (B2: a scheduler regression that re-leaks \
+             `fetcher` into a builder intent would otherwise mint a \
+             permanently-idle fetcher node)"
+        );
+    }
 }

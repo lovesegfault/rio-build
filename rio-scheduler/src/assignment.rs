@@ -74,8 +74,17 @@ pub fn rejection_reason(w: &ExecutorState, drv: &DerivationState) -> Option<&'st
     if !w.systems.iter().any(|s| s == &drv.system) {
         return Some("system-mismatch");
     }
+    // §13e + r35: read the EFFECTIVE feature set, not the raw
+    // declaration. A FOD declaring `["kvm"]` has
+    // `effective_features = [fetcher]` (the constructor enforces the
+    // biconditional); a non-FOD declaring `["fetcher"]` has it
+    // stripped. Reading raw `required_features` is the merged_bug_004
+    // dispatch-site bypass — a misconfigured FOD would `feature-
+    // missing` against a fetcher worker that has the right kind,
+    // system, and capacity.
     if !drv
-        .required_features
+        .effective_features()
+        .as_slice()
         .iter()
         .all(|f| w.supported_features.contains(f))
     {
@@ -126,8 +135,14 @@ pub fn statically_eligible(w: &ExecutorState, drv: &DerivationState) -> bool {
     drv.is_fixed_output == (w.kind == ExecutorKind::Fetcher)
         && w.is_registered()
         && w.systems.iter().any(|s| s == &drv.system)
+        // §13e + r35: same `effective_features()` read as
+        // `rejection_reason`. The two MUST agree
+        // (`statically_eligible_agrees_with_rejection_reason`) — a
+        // raw read here while `rejection_reason` reads derived would
+        // mis-classify a misconfigured FOD as fleet-exhausted.
         && drv
-            .required_features
+            .effective_features()
+            .as_slice()
             .iter()
             .all(|f| w.supported_features.contains(f))
 }
@@ -381,6 +396,62 @@ mod tests {
         );
     }
 
+    /// **r35 B0 (merged_bug_004 dispatch site)** — `hard_filter` /
+    /// `rejection_reason` / `statically_eligible` MUST read
+    /// `effective_features`, not the raw declared `required_features`.
+    /// A FOD declaring `requiredSystemFeatures: ["kvm"]` has
+    /// `effective_features = ["fetcher"]` (FOD ⟹ `[fetcher]` is
+    /// unconditional), so a Fetcher worker with `supported_features =
+    /// ["fetcher"]` MUST accept it. Pre-fix `hard_filter` reads
+    /// `drv.required_features` raw → `["kvm"] ⊄ ["fetcher"]` →
+    /// `feature-missing` → the FOD is unroutable on a fetcher pool that
+    /// has the right kind, system, and capacity.
+    ///
+    /// Constructed via `try_from_node` (NOT direct field assignment)
+    /// per §Spike-assertion-must-execute — proves production code
+    /// passes through the chokepoint.
+    ///
+    /// **Pre-fix: RED** — `rejection_reason = Some("feature-missing")`.
+    // r[verify sched.sla.fod-feature-derivation+2]
+    #[test]
+    fn hard_filter_misconfigured_fod_kvm_routes_to_fetcher() {
+        // FOD with declared `["kvm"]` — degenerate but a tenant CAN
+        // declare it. Build the proto node directly so both
+        // `is_fixed_output` and `required_features` flow through
+        // `try_from_node` ⟹ `EffectiveFeatures::derive`.
+        let node = rio_proto::types::DerivationNode {
+            is_fixed_output: true,
+            required_features: vec!["kvm".into()],
+            ..make_derivation_node("misconfigured-fod", "x86_64-linux")
+        };
+        let drv = DerivationState::try_from_node(&node.into()).unwrap();
+        // Tripwire: the constructor must have derived `[fetcher]`,
+        // not echoed `[kvm]`. If this fails, the construction site
+        // bypassed the chokepoint.
+        assert_eq!(
+            drv.effective_features().as_slice(),
+            &["fetcher".to_string()],
+            "FOD ⟹ effective_features = [fetcher] regardless of declared",
+        );
+
+        // Fetcher worker advertising `[fetcher]` — the standard
+        // air-gapped fetcher pool config.
+        let mut fetcher = make_worker("f", 0);
+        fetcher.kind = ExecutorKind::Fetcher;
+        fetcher.supported_features = vec!["fetcher".into()];
+
+        assert_eq!(
+            rejection_reason(&fetcher, &drv),
+            None,
+            "FOD with declared [kvm] must route to a fetcher worker — \
+             effective_features = [fetcher] ⊆ [fetcher]; reading raw \
+             required_features = [kvm] ⊄ [fetcher] is the merged_bug_004 \
+             dispatch-site bypass",
+        );
+        assert!(hard_filter(&fetcher, &drv));
+        assert!(statically_eligible(&fetcher, &drv));
+    }
+
     /// Kind check runs BEFORE capacity — a full builder still rejects
     /// FODs for the right reason (wrong kind), not by accident (no
     /// capacity). Pins the ordering so a refactor that puts kind LAST
@@ -457,9 +528,13 @@ mod tests {
         "aarch64-linux".clone_into(&mut aarch_drv.system);
         assert_eq!(rejection_reason(&w, &aarch_drv), Some("system-mismatch"));
 
-        // feature-missing
+        // feature-missing — route through `set_required_features` (not
+        // direct field assignment) so `effective_features` re-derives.
+        // r35: a direct field assignment would compile (field is
+        // `pub(super)`-equivalent only inside `state/`) but the
+        // assertion would test the WRONG read path post-fix.
         let mut feat_drv = make_drv();
-        feat_drv.required_features = vec!["kvm".into()];
+        feat_drv.set_required_features(vec!["kvm".into()]);
         assert_eq!(rejection_reason(&w, &feat_drv), Some("feature-missing"));
 
         // failed-on
@@ -552,7 +627,10 @@ mod tests {
         // ExecutorState isn't Clone (stream_tx) → builders.
         let drv = make_drv();
         let mut feat_drv = make_drv();
-        feat_drv.required_features = vec!["kvm".into()];
+        // r35: route through the write-gate so `effective_features`
+        // re-derives — a direct field write would leave the test
+        // asserting the wrong read path post-fix.
+        feat_drv.set_required_features(vec!["kvm".into()]);
         let mut arm_drv = make_drv();
         "aarch64-linux".clone_into(&mut arm_drv.system);
         let mut failed_drv = make_drv();

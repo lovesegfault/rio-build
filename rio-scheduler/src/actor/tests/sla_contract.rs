@@ -2725,7 +2725,7 @@ async fn bypass_none_arm_featured_intent_emits_cells() {
 /// fetcher airgap (`r[builder.netpol.airgap]`). Pre-§13e the
 /// `bypass_cells` FOD hoist returned `[]` and the static `rio-fetcher`
 /// NodePool's pod nodeSelector caught it; that hoist is GONE.
-// r[verify sched.sla.fod-feature-derivation]
+// r[verify sched.sla.fod-feature-derivation+2]
 #[tokio::test]
 async fn bypass_none_arm_fod_with_features_routes_to_fetcher() {
     use crate::sla::config::{ARCH_LABEL, HwClassDef, NodeLabelMatch};
@@ -2858,7 +2858,7 @@ async fn unroutable_features_debounced_no_feature_label() {
 /// Also exercises the §13e debug_assert tripwire (was r31-A4): the
 /// invariant inverted from `is_fixed_output ⟹ cells = []` to
 /// `is_fixed_output ⟺ effective_features ∋ fetcher`.
-// r[verify sched.sla.fod-feature-derivation]
+// r[verify sched.sla.fod-feature-derivation+2]
 #[tokio::test]
 async fn contract_fod_capacity_override_routes_to_fetcher() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -2903,7 +2903,7 @@ async fn contract_fod_capacity_override_routes_to_fetcher() {
 /// see `[fetcher]` for FODs. Asserts on `bypass_cells` directly so a
 /// future arm bypassing the chokepoint is caught at the producer, not
 /// just by the post-finalize chokepoint or the §13e tripwire.
-// r[verify sched.sla.fod-feature-derivation]
+// r[verify sched.sla.fod-feature-derivation+2]
 #[tokio::test]
 async fn bypass_cells_fod_routes_to_fetcher_regardless_of_cap() {
     use crate::sla::config::CapacityType;
@@ -2991,7 +2991,7 @@ async fn bypass_cells_unhosted_cap_pin_drops_at_producer() {
 /// `nodeAffinity{rio.build/fetcher}`.
 ///
 /// `pname=None` → no fit → exercises `bypass_cells` (cold-start path).
-// r[verify sched.sla.fod-feature-derivation]
+// r[verify sched.sla.fod-feature-derivation+2]
 #[tokio::test]
 async fn fod_intent_routes_to_fetcher_cell() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -3018,7 +3018,7 @@ async fn fod_intent_routes_to_fetcher_cell() {
 /// fetcher cells via `solve_full` (not just the `bypass_cells`
 /// cold-start path). Pre-§13e the `!is_fixed_output` gate kept FODs
 /// out of `solve_full` entirely.
-// r[verify sched.sla.fod-feature-derivation]
+// r[verify sched.sla.fod-feature-derivation+2]
 #[tokio::test]
 async fn fod_intent_with_fit_routes_to_fetcher_cell() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -3046,7 +3046,7 @@ async fn fod_intent_with_fit_routes_to_fetcher_cell() {
 /// §13e inverse: a non-FOD builder intent must NOT route to fetcher
 /// cells. The bidirectional ∅-guard makes this structural:
 /// `[] ⊆ [fetcher]` fails `required.is_empty() == provides.is_empty()`.
-// r[verify sched.sla.fod-feature-derivation]
+// r[verify sched.sla.fod-feature-derivation+2]
 #[tokio::test]
 async fn builder_intent_does_not_route_to_fetcher_cell() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -3061,6 +3061,65 @@ async fn builder_intent_does_not_route_to_fetcher_cell() {
         !bld.hw_class_names.iter().any(|h| h.starts_with("fetcher-")),
         "builder must NOT route to a fetcher cell; got hw_class_names={:?}",
         bld.hw_class_names
+    );
+}
+
+/// **r35 B0 (merged_bug_004 reverse direction)** — a non-FOD declaring
+/// `requiredSystemFeatures: ["fetcher"]` has `fetcher` STRIPPED at the
+/// `EffectiveFeatures::derive` chokepoint. Pre-fix the non-FOD arm of
+/// `effective_features` passes the declared set through verbatim, so
+/// the wire `SpawnIntent.required_features` is `["fetcher"]` — the
+/// controller's `pool_covers` Fetcher tuple `["fetcher"]` accepts it,
+/// FFD places it, and a fetcher node is minted that never builds it
+/// (the dispatch-time `hard_filter` rejects FOD↔kind mismatch). The
+/// strip closes the "release silently mints idle fetcher node" path:
+/// `effective_features = []` ⟹ ∅-guard rejects the Fetcher Pool ⟹
+/// routes to a Builder Pool like any non-featured drv.
+///
+/// Constructed via `insert_recovered_node` (NOT direct field
+/// assignment) per §Spike-assertion-must-execute — proves production
+/// code passes through the chokepoint.
+///
+/// **Pre-fix: RED** — `required_features = ["fetcher"]`, not `[]`.
+// r[verify sched.sla.fod-feature-derivation+2]
+#[tokio::test]
+async fn non_fod_with_declared_fetcher_strips_routing_tag() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    seed_fit(&actor, "test-pkg");
+    // Non-FOD with `requiredSystemFeatures: ["fetcher"]` — a tenant
+    // CAN declare it (the gateway forwards `requiredSystemFeatures`
+    // verbatim). `fetcher` is a rio-internal routing tag.
+    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+        pname: Some("test-pkg".into()),
+        is_fixed_output: false,
+        required_features: vec!["fetcher".into()],
+        ..crate::db::RecoveryDerivationRow::test_default("d-non-fod-fetcher", "x86_64-linux")
+    });
+    let snap = actor.compute_spawn_intents(&Default::default());
+    let intent = snap
+        .intents
+        .iter()
+        .find(|i| i.intent_id == "d-non-fod-fetcher")
+        .expect("non-FOD intent emitted");
+    assert_eq!(
+        intent.required_features,
+        Vec::<String>::new(),
+        "non-FOD declaring `fetcher` must have it STRIPPED at the \
+         chokepoint (`fetcher` is a rio-internal routing tag, not a \
+         tenant-declarable system feature); got {:?}",
+        intent.required_features,
+    );
+    // Routing follow-through: with `effective_features = []` the
+    // intent must NOT reach fetcher cells — the ∅-guard rejects them.
+    assert!(
+        !intent
+            .hw_class_names
+            .iter()
+            .any(|h| h.starts_with("fetcher-")),
+        "non-FOD with stripped `fetcher` must NOT route to fetcher cells; \
+         got hw_class_names={:?}",
+        intent.hw_class_names,
     );
 }
 
@@ -3256,10 +3315,16 @@ async fn forecast_kvm_intent_uses_metal_lead() {
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_per_intent_lead(db.pool.clone(), 2_000);
 
-    // dep(Running, eta≈300) → q-kvm(Queued, requires kvm).
+    // dep(Running, eta≈300) → q-kvm(Queued, requires kvm). r35: route
+    // through `set_required_features` so `effective_features`
+    // re-derives — `compute_spawn_intents` reads the derived set.
     actor.test_inject_at("dep", "x86_64-linux", DerivationStatus::Running);
     actor.test_inject_at("q-kvm", "x86_64-linux", DerivationStatus::Queued);
-    actor.dag.node_mut("q-kvm").unwrap().required_features = vec!["kvm".into()];
+    actor
+        .dag
+        .node_mut("q-kvm")
+        .unwrap()
+        .set_required_features(vec!["kvm".into()]);
     actor.test_inject_edge("q-kvm", "dep");
     actor.test_set_running_eta("dep", 400.0, 100, 4);
 
@@ -3291,10 +3356,16 @@ async fn forecast_budget_drop_metric() {
     let mut actor = bare_actor_per_intent_lead(db.pool.clone(), 4);
 
     // dep(Running, eta≈300) → {qa, qb} (Queued, kvm — high lead = 600).
+    // r35: route through `set_required_features` so `effective_features`
+    // re-derives — `compute_spawn_intents` reads the derived set.
     actor.test_inject_at("dep", "x86_64-linux", DerivationStatus::Running);
     for q in ["qa", "qb"] {
         actor.test_inject_at(q, "x86_64-linux", DerivationStatus::Queued);
-        actor.dag.node_mut(q).unwrap().required_features = vec!["kvm".into()];
+        actor
+            .dag
+            .node_mut(q)
+            .unwrap()
+            .set_required_features(vec!["kvm".into()]);
         actor.test_inject_edge(q, "dep");
     }
     actor.test_set_running_eta("dep", 400.0, 100, 4);

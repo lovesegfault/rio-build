@@ -773,24 +773,32 @@ controller's `all_cells`/`fallback_cell` iterate THIS, not
 generates a `(h, Spot)` cell — preventing the conflicting-requirements
 ICE loop a requirement-based exclusion would cause.
 
-r[sched.sla.fod-feature-derivation]
-The scheduler derives a derivation's *effective* feature set at a single
-chokepoint: `is_fixed_output ⟹ [fetcher]`, otherwise the declared
-`requiredSystemFeatures`. Every `required_features` consumer reachable
-from the spawn-intent path (`passes_intent_filter`, `h_all` partition,
-`override_hash` memo key, `retain_hosting_cells`, `bypass_cells`
-cold-start, the wire `SpawnIntent.required_features`, the unroutable
-warn) reads the derived set, NOT the raw declaration. §13e: this routes
-FODs to the dynamic `fetcher-*` hwClasses (which advertise
-`providesFeatures: [fetcher]`) via the same bidirectional ∅-guard that
-routes kvm to metal — the static `rio-fetcher` NodePool's pod
-nodeSelector is no longer load-bearing. The override is unconditional: a
-misconfigured FOD declaring `requiredSystemFeatures: [kvm]` would
-otherwise route to a kvm node with no fetcher airgap (`r[builder.netpol.airgap]`).
-Invariant: `is_fixed_output ⟺ effective_features ∋ fetcher` — the
-chokepoint projects the role discriminator (FOD/non-FOD) onto the
-feature axis so `retain_hosting_cells` validates cell hosting AND
-consumer kind through one predicate.
+r[sched.sla.fod-feature-derivation+2]
+The scheduler derives a derivation's *effective* feature set ONCE at
+DAG-add time as a constructor invariant on `DerivationState`
+(`EffectiveFeatures::derive`). The biconditional `is_fixed_output ⟺
+effective_features ∋ fetcher` is enforced in BOTH directions: FODs
+project to `[fetcher]` regardless of the declared
+`requiredSystemFeatures`; non-FODs have `fetcher` STRIPPED from their
+declared set (a tenant cannot inject the rio-internal routing tag to
+spend fetcher $/hr on a drv that doesn't fetch). EVERY reader —
+`passes_intent_filter`, `h_all` partition, `override_hash` memo key,
+`retain_hosting_cells`, `bypass_cells` cold-start,
+`hard_filter`/`rejection_reason`, `statically_eligible`, and the wire
+`SpawnIntent.required_features` — reads the stored field, NOT the raw
+declaration. The two intentional bypasses (`InspectBuildDag`'s
+`required_features` echo, the dispatch-time `failed_builders` warn) read
+the *declared* set so the operator can see what the tenant submitted.
+Post-construction mutation of `required_features` (the soft-feature
+strip) routes through a `set_required_features` write-gate that
+re-derives `effective_features` atomically — the two fields cannot
+drift. §13e: this routes FODs to the dynamic `fetcher-*` hwClasses
+(which advertise `providesFeatures: [fetcher]`) via the same
+bidirectional ∅-guard that routes kvm to metal — the static
+`rio-fetcher` NodePool's pod nodeSelector is no longer load-bearing. The
+override is unconditional: a misconfigured FOD declaring
+`requiredSystemFeatures: [kvm]` would otherwise route to a kvm node with
+no fetcher airgap (`r[builder.netpol.airgap]`).
 
 ### Catalog-derived per-class ceilings (ADR-023 §13c-2)
 

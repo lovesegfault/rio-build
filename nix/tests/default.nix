@@ -1068,7 +1068,7 @@ in
   #   unit-tested in `builtin_fod_pod_has_pool_static_fetcher_node_selector`
   #   / `fetcher_pod_no_legacy_node_role_selector` and contract-tested
   #   in sla_contract.rs; this is the in-cluster shape check.
-  # r[verify sched.sla.fod-feature-derivation]
+  # r[verify sched.sla.fod-feature-derivation+2]
   #   dispatch-fod+nonfod + fetcher-isolation subtests: FOD routes to
   #   the kind=Fetcher pod (passes_intent_filter reads
   #   effective_features(state)=[fetcher] for FODs and matches the
