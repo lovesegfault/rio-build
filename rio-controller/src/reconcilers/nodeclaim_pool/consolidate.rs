@@ -98,8 +98,11 @@ pub fn consolidate_after(
     // structurally dead — `consolidate_after` returned `floor`
     // unconditionally. The spec (`r[ctrl.nodeclaim.consolidate-na+4]`)
     // says `W = q_0.5(boot)/2`; the implementation must match. Decoupling
-    // restores the invariant and makes the per-class `min` what it was
-    // designed to be: a floor the model can EXCEED under load.
+    // restores satisfiability for `E[c_fit] > node_cores/2` (≈1 build
+    // per node). For bin-packed cells (`E ≤ cores/2`, the §13b
+    // MostAllocated case) `λ̂` saturates at `1/w = 2/boot` and
+    // `λ̂·E ≤ cores/boot` always, so the floor is a hard bound the
+    // model cannot exceed regardless of arrival rate (r38 bug_022).
     let w = (boot_median / 2.0).max(5.0);
     let lambda_at = |t: f64| {
         let n_at_risk = events.iter().filter(|e| e.gap_secs >= t).count().max(1) as f64;
@@ -137,6 +140,19 @@ pub fn e_fitting_cores(placeable: &[Placement], node_cores: u32) -> f64 {
         return 0.0;
     }
     fitting.iter().copied().map(f64::from).sum::<f64>() / fitting.len() as f64
+}
+
+/// Hold-open threshold for an annotated node. `na` is the non-hold-open
+/// threshold for the SAME (cell, node_cores) — already floored by
+/// `consolidate_after`'s `max_t.max(floor)`. `.max(na)` enforces the
+/// invariant `threshold_hold_open ≥ threshold_non_hold_open` so a
+/// `max_consolidation_time < floor` misconfig cannot re-invert the
+/// protection annotation (r38 merged_004; r37 bug_009 was strike-1).
+/// Strike-3 escalation: CellCtx returns a `Threshold {busy, hold_open}`
+/// struct with the invariant enforced in the constructor.
+#[inline]
+fn hold_open_threshold(na: f64, max: Option<f64>) -> f64 {
+    max.unwrap_or(2.0 * na).max(na)
 }
 
 /// Filter `placeable` to intents that can ARRIVE at a node in `cell`
@@ -359,7 +375,7 @@ pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
         // annotation cannot invert.
         let na = ctx.na_threshold(n.allocatable.0, cfg.max_consolidation_time);
         let threshold = if n.annotation(HOLD_OPEN_ANNOTATION) == Some("true") {
-            cfg.max_consolidation_time.unwrap_or(2.0 * na)
+            hold_open_threshold(na, cfg.max_consolidation_time)
         } else {
             na
         };
@@ -425,10 +441,15 @@ pub fn observe_idle_to_busy(
 ) {
     // Terminating nodes excluded from `live_names` AND iteration: a node
     // that started terminating since last tick should drop from `prev_idle`
-    // WITHOUT recording an event — the censored event was (or will be)
-    // pushed by `reap_idle`/`reap_unhealthy` at delete time. Recording
-    // here would double-count, and Karpenter flipping `Empty=False`
-    // during drain would log a bogus uncensored "arrival".
+    // WITHOUT recording an event. For `reap_idle`'d nodes the censored
+    // event was pushed at delete time; recording here would double-count.
+    // For `reap_unhealthy`/out-of-band deletes (spot interruption,
+    // `kubectl delete nodeclaim`) the gap is silently dropped — an
+    // unhealthy node's idle history is tainted anyway (the executor
+    // crashed mid-idle), and `reap_unhealthy` takes `&CellSketches`
+    // immutably so it CANNOT push. Karpenter flipping `Empty=False`
+    // during drain would also log a bogus uncensored "arrival" if
+    // recorded here (r38 bug_031).
     let live_names: HashSet<&str> = live
         .iter()
         .filter(|n| !n.terminating)
@@ -876,21 +897,34 @@ mod tests {
         );
     }
 
-    /// Hold-open annotation → threshold = max_consolidation_time
-    /// instead of NA break-even.
+    /// r38 merged_004: hold-open ≥ non-hold-open MUST hold for ALL
+    /// `max_consolidation_time` values, including `Some(M)` with `M <
+    /// floor` (the inversion the merged_010 `consolidate_after` clamp
+    /// closed for one consumer but not this one). The pre-r38 test
+    /// `hold_open_uses_max_consolidation_time` only asserted struct
+    /// literals — never called `na_threshold` or the production formula.
     #[test]
-    fn hold_open_uses_max_consolidation_time() {
-        let mut n = node("ho", "h", CapacityType::Spot, 8, 0, 0);
-        n.annotations
-            .insert(HOLD_OPEN_ANNOTATION.into(), "true".into());
-        assert_eq!(n.annotation(HOLD_OPEN_ANNOTATION), Some("true"));
-        // The reap_idle logic reads this; threshold becomes the cfg
-        // value (or 2×floor default).
-        let cfg = NodeClaimPoolConfig {
-            max_consolidation_time: Some(300.0),
-            ..Default::default()
+    fn hold_open_threshold_never_below_non_hold_open_with_max_set() {
+        // Fetcher cell shape: boot=30, min=600 → floor=600.
+        let ctx = CellCtx {
+            events: vec![],
+            cell_placeable: vec![],
+            boot_median: 30.0,
+            min: Some(600.0),
         };
-        assert_eq!(cfg.max_consolidation_time, Some(300.0));
+        // `Some(300.0)` is the falsifying input the pre-r38 suite never
+        // produced: max < floor → na = 600, raw hold-open = 300 < na.
+        for max in [Some(300.0), Some(900.0), None] {
+            let na = ctx.na_threshold(64, max);
+            // Calls the production helper — NOT a re-derived copy of
+            // the formula. Drops in `reap_idle` would fail this test.
+            let ho = hold_open_threshold(na, max);
+            assert!(
+                ho >= na,
+                "hold-open {ho} < non-hold-open {na} at max={max:?} — \
+                 protection annotation inverted"
+            );
+        }
     }
 
     /// r37 merged_010 (§Granularity-coupling): `w` decoupled from `floor`.
@@ -917,6 +951,29 @@ mod tests {
             "NA model must extend past min floor under load; got {t}"
         );
         // Pre-fix this returned exactly 60.0 unconditionally.
+    }
+
+    /// r38 bug_022: for bin-packed cells (`E[c_fit] ≤ node_cores/2` —
+    /// the §13b MostAllocated case) the NA keep-condition is
+    /// structurally unsatisfiable: `λ̂ ≤ 1/w = 2/boot`, so `λ̂·E ≤
+    /// 2E/boot ≤ cores/boot`. The floor is a hard bound, not a backstop
+    /// the model improves on. Pin the bound so a future change to `w`
+    /// or the keep-condition is forced to reason about the bin-packed
+    /// case, not just `E = cores`.
+    // r[verify ctrl.nodeclaim.consolidate-na+4]
+    #[test]
+    fn consolidate_after_floor_binds_for_bin_packed_cells() {
+        // Builder shape: boot=30, node=64, intents packing 4-per-node
+        // (E=16 < 32=cores/2), min=60. Saturate the estimator with
+        // dense uncensored arrivals just past the floor.
+        let evs: Vec<_> = (61..=80).map(|k| ev(f64::from(k), false)).collect();
+        let t = consolidate_after(&evs, 16.0, 64, 30.0, None, Some(60.0));
+        // floor = max(15, 60) = 60. w = 15. rhs = 64/30 ≈ 2.13.
+        // λ̂ ≤ 1/15 ≈ 0.067; λ̂·E ≤ 0.067·16 ≈ 1.07 < 2.13.
+        assert_eq!(
+            t, 60.0,
+            "bin-packed cell floor must bind regardless of arrival rate; got {t}"
+        );
     }
 
     /// r37 merged_010: `max_consolidation_time < floor` no longer slips
@@ -1042,12 +1099,16 @@ mod tests {
             na > pre_fix_hold_open,
             "PRECONDITION: busy NA threshold {na} must exceed pre-fix hold-open {pre_fix_hold_open}"
         );
-        // Post-fix: hold-open = `2 × ctx.na_threshold` — both arms read
-        // the SAME `ctx.na_threshold`, so hold-open ≥ non-hold-open by
-        // construction. The structural protection is in `reap_idle`'s
-        // shape (`let na = ctx.na_threshold(...); ... 2.0 * na`); these
-        // assertions document the invariant the shape enforces.
-        assert!(2.0 * na >= pre_fix_hold_open);
-        assert!(2.0 * na >= na);
+        // Post-fix: hold-open = `hold_open_threshold(ctx.na_threshold, max)`
+        // — both arms read the SAME `ctx.na_threshold`, so hold-open ≥
+        // non-hold-open by construction (with `max=None` the helper
+        // returns `2·na`; r38 merged_004 added `.max(na)` for the
+        // `max < floor` arm — see the `_with_max_set` sibling). The
+        // structural protection is in `reap_idle`'s shape (`let na =
+        // ctx.na_threshold(...); ... hold_open_threshold(na, ...)`);
+        // these assertions document the invariant the shape enforces.
+        let post_fix_hold_open = hold_open_threshold(na, None);
+        assert!(post_fix_hold_open >= pre_fix_hold_open);
+        assert!(post_fix_hold_open >= na);
     }
 }

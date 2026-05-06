@@ -895,9 +895,15 @@ karpenter:
     # inter-build gap (output upload + next pod schedule + image pull);
     # marginal cost ~$0.0014/node-reap-avoided. The NA model raises the
     # threshold ABOVE 60s under arrival pressure; the floor only binds
-    # on cold-start (no idle-gap data) and low-arrival cells. NOT 600s
-    # (Karpenter's full warm-keep) — that's $0.0167/node-hr × hundreds
-    # of builders, and the model already learns to hold open under load.
+    # on cold-start (no idle-gap data) and low-arrival cells — and
+    # WHENEVER intents pack ≥2-per-node (`E[c_fit] ≤ cores/2`, the
+    # §13b MostAllocated bin-packing case): with `w = boot/2` the NA
+    # estimator's `λ̂` saturates at `1/w = 2/boot`, so `λ̂·E ≤ 2E/boot
+    # ≤ cores/boot` always — the keep-condition `λ̂·E > cores/boot` is
+    # structurally unsatisfiable. The model extends past the
+    # floor only for cells packing close to 1 intent per node (r38
+    # bug_022). NOT 600s (Karpenter's full warm-keep) — that's
+    # $0.0167/node-hr × hundreds of builders.
     minConsolidationTime:
       "fetcher-*": 600.0
       "*": 60.0
