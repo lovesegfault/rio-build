@@ -59,6 +59,17 @@ metadata:
     {{- include "rio.labels" (dict "root" . "name" "kube-build-scheduler" "component" "scheduler") | nindent 4 }}
 spec:
   replicas: 2
+  # r38 merged_021: required podAntiAffinity (line ~95) without an
+  # explicit strategy defaults to maxUnavailable=⌊2×0.25⌋=0, which
+  # cannot scale down EITHER old replica → rollout stalls until a 3rd
+  # node mints. kube-scheduler is leader-elected (`--leader-elect=true`
+  # default), so a 1-replica window is the same ~15s lease-failover
+  # blip the PDB already accepts. Mirrors scheduler.yaml's strategy.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
   selector:
     matchLabels:
       {{- include "rio.selectorLabels" "kube-build-scheduler" | nindent 6 }}

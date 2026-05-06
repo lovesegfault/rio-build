@@ -15,6 +15,17 @@ spec:
   # Without this (default 25%/25%), a 2-replica rollout takes one down
   # immediately and any NLB-routed-but-not-yet-propagated connection to
   # the other replica's IP races its termination too.
+  #
+  # r38 merged_021: `maxUnavailable: 0` + required podAntiAffinity
+  # (line ~58) means a rolling update needs a 3rd `general` node to
+  # surge onto. With Karpenter headroom that's a ~30-60s mint; without
+  # (k3s, fixed cluster) `helm upgrade --wait` hangs. This is a
+  # DELIBERATE trade-off: the I-064 NLB drain race is a session-loss
+  # bug; the rollout cost is a transient node mint. If a fixed-size
+  # cluster needs hot upgrades, set `gateway.replicas: 1` (single
+  # gateway, accept the ~15s reconnect window) or pre-provision a
+  # `general` slot. Do NOT set `maxUnavailable: 1` here without
+  # re-evaluating I-064.
   strategy:
     type: RollingUpdate
     rollingUpdate:

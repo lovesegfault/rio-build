@@ -23,8 +23,14 @@ test "$n" -eq 10 || {
 
 # kube-build-scheduler: Deployment with schedulerName profile + MostAllocated in
 # the ConfigMap, plus the two system:* ClusterRoleBindings.
-yq -N 'select(.kind=="Deployment" and .metadata.name=="kube-build-scheduler")' "$out" \
-  | grep -q 'kube-scheduler' || {
+#
+# r38: `grep -q` exits at first match while yq is still writing its ~3KB
+# Deployment doc → yq SIGPIPE (141) → pipefail flags the pipeline as
+# failed → false-positive FAIL ~16% of runs (see ci-failure-patterns.md
+# "stdenv pipefail SIGPIPE"). Capture yq output first; the here-string
+# avoids the pipe entirely.
+ksdep=$(yq -N 'select(.kind=="Deployment" and .metadata.name=="kube-build-scheduler")' "$out")
+grep -q 'kube-scheduler' <<<"$ksdep" || {
   echo "FAIL: kube-build-scheduler Deployment missing" >&2
   exit 1
 }
@@ -75,6 +81,14 @@ helm template rio . --set global.image.tag=test --set monitoring.enabled=true >"
 # immune to comment-line count drift (the comment block contains
 # the literal `queue="active"` as historical reference).
 expr=$(yq -N '.spec.groups[].rules[] | select(.alert=="KubeBuildSchedulerPendingStuck") | .expr' "$mon")
+# r38 merged_013: the negative-only check passes vacuously if the
+# alert is deleted/renamed (`yq` emits nothing → `grep` on "" → 1 →
+# `&&` short-circuits). Mirror the `KubeBuildSchedulerDown` positive
+# existence shape below.
+test -n "$expr" || {
+  echo "FAIL: KubeBuildSchedulerPendingStuck alert missing from PrometheusRule" >&2
+  exit 1
+}
 echo "$expr" | grep -q 'queue="active"' && {
   echo "FAIL: KubeBuildSchedulerPendingStuck still keys on queue=\"active\"" \
        "— it spends ~ms there; the alert structurally cannot fire (r37 bug_019)" >&2
