@@ -24,7 +24,7 @@
 //! Gates a/b assert; c/d report only (manual interpretation against
 //! the operator's tier ladder + workload).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -283,32 +283,67 @@ async fn gate_b(cli: &CliCtx, pg: &PgHandle) -> Result<()> {
         rio_scheduler::sla::hw::HwTable::load(&db).await
     })
     .await?;
-    let alpha_map: HashMap<(String, String), rio_scheduler::sla::alpha::Alpha> =
-        ui::step("read α per pname via export-corpus", || async {
-            let tmp = tempfile::NamedTempFile::new()?;
-            let path = tmp.path().to_str().context("tempfile path utf8")?;
-            cli.run(&["sla", "export-corpus", "--min-n", "1", "-o", path])?;
-            let body = std::fs::read_to_string(tmp.path())?;
-            let corpus: Value = serde_json::from_str(&body)?;
+    // r38 bug_016: `alpha_map` MUST be keyed `(pname, system, tenant)`.
+    // The candidate loop and `gate_b_t_ref` are per-tenant (the mb_001
+    // close); `export_corpus(None, ..)` dedups by `(pname, system)`
+    // keeping only the highest-n tenant's α. Using that α for a
+    // different tenant's residual reintroduces the bug_026
+    // cluster-heterogeneity term: `ln(α_other·f[h] / α_this·f[h])` is
+    // a per-h-varying constant added to the spread. Call
+    // `export-corpus --tenant <t>` per distinct tenant so each
+    // candidate row reads the matching α — the third tenant-coupled
+    // read in this loop, the other two were already mb_001-fixed.
+    //
+    // RPC count is bounded by the candidate query's `LIMIT 50`: a
+    // distinct-tenant set drawn from ≤50 (pname, system, tenant) rows
+    // is itself ≤50, so the per-tenant loop never exceeds 50
+    // ExportSlaCorpus round-trips.
+    //
+    // TODO(bug_016 option-3): the cleaner long-term fix is to carry
+    // `alpha` on `SlaStatusResponse` so `sla_status_typed` (already
+    // tenant-keyed, already called per candidate) returns it and this
+    // entire export-corpus loop disappears. Deferred: it's a proto
+    // change with downstream-parity cost (admin-mock.ts, parse.rs
+    // ALL_SUBCOMMANDS — see feedback_proto_addition_downstream_check)
+    // and `SeedEntry` doesn't carry tenant so option (2) was also out.
+    let tenants: BTreeSet<&str> = pnames.iter().map(|(_, _, t)| t.as_str()).collect();
+    let alpha_map: HashMap<(String, String, String), rio_scheduler::sla::alpha::Alpha> =
+        ui::step("read α per (pname, tenant) via export-corpus", || async {
             let mut m = HashMap::new();
-            for e in corpus
-                .get("entries")
-                .and_then(Value::as_array)
-                .unwrap_or(&vec![])
-            {
-                let (Some(p), Some(s)) = (
-                    e.get("pname").and_then(Value::as_str),
-                    e.get("system").and_then(Value::as_str),
-                ) else {
-                    continue;
-                };
-                let a: Vec<f64> = e
-                    .get("alpha")
+            for tenant in &tenants {
+                let tmp = tempfile::NamedTempFile::new()?;
+                let path = tmp.path().to_str().context("tempfile path utf8")?;
+                cli.run(&[
+                    "sla",
+                    "export-corpus",
+                    "--min-n",
+                    "1",
+                    "--tenant",
+                    tenant,
+                    "-o",
+                    path,
+                ])?;
+                let body = std::fs::read_to_string(tmp.path())?;
+                let corpus: Value = serde_json::from_str(&body)?;
+                for e in corpus
+                    .get("entries")
                     .and_then(Value::as_array)
-                    .map(|a| a.iter().filter_map(Value::as_f64).collect())
-                    .unwrap_or_default();
-                if a.len() == rio_scheduler::sla::hw::K {
-                    m.insert((p.into(), s.into()), [a[0], a[1], a[2]]);
+                    .unwrap_or(&vec![])
+                {
+                    let (Some(p), Some(s)) = (
+                        e.get("pname").and_then(Value::as_str),
+                        e.get("system").and_then(Value::as_str),
+                    ) else {
+                        continue;
+                    };
+                    let a: Vec<f64> = e
+                        .get("alpha")
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().filter_map(Value::as_f64).collect())
+                        .unwrap_or_default();
+                    if a.len() == rio_scheduler::sla::hw::K {
+                        m.insert((p.into(), s.into(), tenant.to_string()), [a[0], a[1], a[2]]);
+                    }
                 }
             }
             anyhow::Ok(m)
@@ -358,10 +393,9 @@ async fn gate_b(cli: &CliCtx, pg: &PgHandle) -> Result<()> {
         // t_ref = wall_obs · α·factor[h]. A converged model has
         // median ≈ 0 for every h; the SPREAD across h is the per-h
         // *uncaptured* residual the K=3 mixture leaves on the table.
-        let alpha = alpha_map
-            .get(&(pname.clone(), system.clone()))
-            .copied()
-            .unwrap_or(rio_scheduler::sla::alpha::UNIFORM);
+        // r38 bug_016: tenant-scoped lookup via gate_b_alpha so the
+        // keying is the same code path the test exercises.
+        let alpha = gate_b_alpha(&alpha_map, pname, system, tenant);
         let mut by_h: BTreeMap<String, Vec<f64>> = BTreeMap::new();
         for (h, wall, c) in &rows {
             let Some(pred) = gate_b_t_ref(&st, *c) else {
@@ -455,6 +489,23 @@ fn gate_a_has_fit(v: &Value) -> bool {
     serde_json::from_value::<SlaStatusResponse>(v.clone())
         .map(|s| s.has_fit)
         .unwrap_or(false)
+}
+
+/// r38 bug_016: alpha lookup MUST be keyed by tenant. A `(pname, system)`
+/// map keyed from a tenant-less `export-corpus` returns the highest-n
+/// tenant's α — wrong for any other tenant's candidate row, which shifts
+/// the per-h median by `ln(α_other·f[h] / α_this·f[h])`. Extracted so
+/// the keying is unit-testable without a PG/RPC round-trip.
+fn gate_b_alpha(
+    alpha_map: &HashMap<(String, String, String), rio_scheduler::sla::alpha::Alpha>,
+    pname: &str,
+    system: &str,
+    tenant: &str,
+) -> rio_scheduler::sla::alpha::Alpha {
+    alpha_map
+        .get(&(pname.to_string(), system.to_string(), tenant.to_string()))
+        .copied()
+        .unwrap_or(rio_scheduler::sla::alpha::UNIFORM)
 }
 
 /// r37 bug_026: per-row gate-b log-residual. Extracted from the loop so
@@ -737,6 +788,37 @@ mod tests {
             "PRECONDITION: this fixture must reproduce the bug (un-normalized \
              spread {} must exceed GATE_B_TAU={GATE_B_TAU})",
             (r_ebs_buggy - r_nvme_buggy).abs()
+        );
+    }
+
+    /// r38 bug_016: `gate_b_alpha` MUST resolve by `(pname, system, tenant)`.
+    /// Pre-fix, the map was keyed `(pname, system)` from a tenant-less
+    /// `export-corpus` (which dedups to the highest-n tenant), so
+    /// tenant-b's residual was normalized by tenant-a's α — a per-h-varying
+    /// constant that re-introduces the bug_026 cluster-heterogeneity term.
+    #[test]
+    fn gate_b_alpha_is_tenant_scoped() {
+        let mut m = HashMap::new();
+        m.insert(
+            ("gcc".into(), "x86_64-linux".into(), "tenant-a".into()),
+            [0.7, 0.2, 0.1],
+        );
+        m.insert(
+            ("gcc".into(), "x86_64-linux".into(), "tenant-b".into()),
+            [0.5, 0.3, 0.2],
+        );
+        assert_eq!(
+            gate_b_alpha(&m, "gcc", "x86_64-linux", "tenant-a"),
+            [0.7, 0.2, 0.1]
+        );
+        assert_eq!(
+            gate_b_alpha(&m, "gcc", "x86_64-linux", "tenant-b"),
+            [0.5, 0.3, 0.2]
+        );
+        // Unknown tenant falls back to UNIFORM, not another tenant's α.
+        assert_eq!(
+            gate_b_alpha(&m, "gcc", "x86_64-linux", "tenant-c"),
+            rio_scheduler::sla::alpha::UNIFORM
         );
     }
 
