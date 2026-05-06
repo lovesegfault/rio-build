@@ -145,10 +145,13 @@ pub use rio_common::config::UpstreamAddrs;
 //
 // The builder/fetcher diff is small: fetchers force ADR-019 hardening
 // (read-only rootfs, never privileged, Localhost seccomp, dedicated
-// node placement via per-intent affinity, hostUsers:false default,
-// derived `[fetcher]` features) regardless of spec. Each helper below
-// returns the effective value for one pod-spec field. Builder reads
-// spec verbatim; Fetcher overrides.
+// node placement via per-intent affinity AND a pool-static
+// `rio.build/fetcher` nodeSelector — the latter is the last-resort
+// restrictive constraint for `system="builtin"` FODs whose
+// `hw_class_names=[]` carries no per-intent affinity — hostUsers:false
+// default, derived `[fetcher]` features) regardless of spec. Each
+// helper below returns the effective value for one pod-spec field.
+// Builder reads spec verbatim; Fetcher overrides.
 
 #[inline]
 fn is_fetcher(pool: &Pool) -> bool {
@@ -157,7 +160,7 @@ fn is_fetcher(pool: &Pool) -> bool {
 
 /// §13e: Fetcher Pools advertise `[fetcher]`, NOT empty. FODs route by
 /// `effective_features(state) = [fetcher]` at the scheduler chokepoint
-/// (`r[sched.sla.fod-feature-derivation+2]`); the I-181 ∅-guard requires
+/// (`r[sched.sla.fod-feature-derivation+3]`); the I-181 ∅-guard requires
 /// the Pool's features to match. Divergence fails CLOSED — a bug that
 /// makes `effective_features(spec) ≠ [fetcher]` means the fetcher Pool
 /// never spawns (loud), not that FODs route to builder cells (silent).
@@ -231,10 +234,13 @@ fn effective_host_users(pool: &Pool) -> Option<bool> {
 /// a `builtins.fetchurl` pod can schedule onto any untainted node.
 ///
 /// Uses the §13e taint-key (`FETCHER_TAINT_KEY = rio.build/fetcher`), NOT
-/// the deleted `rio.build/node-role` convention — `cover::build_nodeclaim`
-/// stamps `FETCHER_TAINT_KEY` as both label AND taint on fetcher
-/// NodeClaims, so the selector and the node label come from the same
-/// constant and cannot drift.
+/// the deleted `rio.build/node-role` convention. The selector key is a
+/// Rust const; the matching NodeClaim *label* key is helm config
+/// (`[sla.hw_classes.fetcher-*].labels`, propagated through
+/// `cover::build_nodeclaim`'s `hw.labels` extend). They are NOT
+/// structurally single-sourced — `helm/20-fetcher-feature-routing.sh`
+/// is the cross-layer guard that keeps them aligned. A typo in either
+/// is a permanently-Pending pod with an affinity no Node satisfies.
 // r[impl fetcher.node.dedicated+4]
 // r[impl ctrl.pool.fetcher-affinity-from-intent+4]
 fn effective_node_selector(pool: &Pool) -> Option<BTreeMap<String, String>> {
@@ -800,7 +806,7 @@ fn build_executor_container(
                 env("RIO_OVERLAY_BASE_DIR", "/var/rio/overlays"),
                 env("RIO_LOG_FORMAT", "json"),
                 env("RIO_SYSTEMS", &pool.spec.systems.join(",")),
-                // Single source: `effective_features` (Fetcher → []).
+                // Single source: `effective_features` (Fetcher → [fetcher]).
                 env("RIO_FEATURES", &effective_features(&pool.spec).join(",")),
                 // Executor self-identification. figment reads
                 // `executor_id` → prefix RIO_ → `RIO_EXECUTOR_ID`.

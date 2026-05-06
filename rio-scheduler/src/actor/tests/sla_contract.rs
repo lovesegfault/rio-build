@@ -2725,7 +2725,7 @@ async fn bypass_none_arm_featured_intent_emits_cells() {
 /// fetcher airgap (`r[builder.netpol.airgap]`). Pre-§13e the
 /// `bypass_cells` FOD hoist returned `[]` and the static `rio-fetcher`
 /// NodePool's pod nodeSelector caught it; that hoist is GONE.
-// r[verify sched.sla.fod-feature-derivation+2]
+// r[verify sched.sla.fod-feature-derivation+3]
 #[tokio::test]
 async fn bypass_none_arm_fod_with_features_routes_to_fetcher() {
     use crate::sla::config::{ARCH_LABEL, HwClassDef, NodeLabelMatch};
@@ -2853,12 +2853,13 @@ async fn unroutable_features_debounced_no_feature_label() {
 /// = [fetcher]` ⟹ `reference_hw_class_for_system` finds `fetcher-*`).
 /// Pre-§13e the `bypass_cells` FOD hoist returned `[]` regardless of
 /// arm because the static `rio-fetcher` NodePool's pod nodeSelector
-/// caught FODs without per-intent affinity; that hoist is GONE.
+/// caught FODs without per-intent affinity; both the hoist and that
+/// NodePool are DELETED in §13e.
 ///
 /// Also exercises the §13e debug_assert tripwire (was r31-A4): the
 /// invariant inverted from `is_fixed_output ⟹ cells = []` to
 /// `is_fixed_output ⟺ effective_features ∋ fetcher`.
-// r[verify sched.sla.fod-feature-derivation+2]
+// r[verify sched.sla.fod-feature-derivation+3]
 #[tokio::test]
 async fn contract_fod_capacity_override_routes_to_fetcher() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -2903,7 +2904,7 @@ async fn contract_fod_capacity_override_routes_to_fetcher() {
 /// see `[fetcher]` for FODs. Asserts on `bypass_cells` directly so a
 /// future arm bypassing the chokepoint is caught at the producer, not
 /// just by the post-finalize chokepoint or the §13e tripwire.
-// r[verify sched.sla.fod-feature-derivation+2]
+// r[verify sched.sla.fod-feature-derivation+3]
 #[tokio::test]
 async fn bypass_cells_fod_routes_to_fetcher_regardless_of_cap() {
     use crate::sla::config::CapacityType;
@@ -2984,14 +2985,14 @@ async fn bypass_cells_unhosted_cap_pin_drops_at_producer() {
 
 /// §13e: a FOD intent must route to fetcher cells, NOT be hw-agnostic.
 /// Pre-§13e: `bypass_cells` returned `[]` for FODs (no per-intent
-/// affinity → static `rio-fetcher` NodePool's pod nodeSelector caught
-/// them). Post-§13e: FOD's `effective_features = [fetcher]` →
-/// `class_routes` admits `fetcher-{x86,arm}` → `retain_hosting_cells`
-/// keeps them → `cells_to_selector_terms` writes the per-intent
-/// `nodeAffinity{rio.build/fetcher}`.
+/// affinity → the now-DELETED static `rio-fetcher` NodePool's pod
+/// nodeSelector caught them). Post-§13e: FOD's `effective_features =
+/// [fetcher]` → `class_routes` admits `fetcher-{x86,arm}` →
+/// `retain_hosting_cells` keeps them → `cells_to_selector_terms`
+/// writes the per-intent `nodeAffinity{rio.build/fetcher}`.
 ///
 /// `pname=None` → no fit → exercises `bypass_cells` (cold-start path).
-// r[verify sched.sla.fod-feature-derivation+2]
+// r[verify sched.sla.fod-feature-derivation+3]
 #[tokio::test]
 async fn fod_intent_routes_to_fetcher_cell() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -3018,7 +3019,7 @@ async fn fod_intent_routes_to_fetcher_cell() {
 /// fetcher cells via `solve_full` (not just the `bypass_cells`
 /// cold-start path). Pre-§13e the `!is_fixed_output` gate kept FODs
 /// out of `solve_full` entirely.
-// r[verify sched.sla.fod-feature-derivation+2]
+// r[verify sched.sla.fod-feature-derivation+3]
 #[tokio::test]
 async fn fod_intent_with_fit_routes_to_fetcher_cell() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -3046,7 +3047,7 @@ async fn fod_intent_with_fit_routes_to_fetcher_cell() {
 /// §13e inverse: a non-FOD builder intent must NOT route to fetcher
 /// cells. The bidirectional ∅-guard makes this structural:
 /// `[] ⊆ [fetcher]` fails `required.is_empty() == provides.is_empty()`.
-// r[verify sched.sla.fod-feature-derivation+2]
+// r[verify sched.sla.fod-feature-derivation+3]
 #[tokio::test]
 async fn builder_intent_does_not_route_to_fetcher_cell() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -3081,7 +3082,7 @@ async fn builder_intent_does_not_route_to_fetcher_cell() {
 /// code passes through the chokepoint.
 ///
 /// **Pre-fix: RED** — `required_features = ["fetcher"]`, not `[]`.
-// r[verify sched.sla.fod-feature-derivation+2]
+// r[verify sched.sla.fod-feature-derivation+3]
 #[tokio::test]
 async fn non_fod_with_declared_fetcher_strips_routing_tag() {
     let db = TestDb::new(&MIGRATOR).await;

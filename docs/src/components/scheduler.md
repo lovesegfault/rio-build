@@ -773,7 +773,7 @@ controller's `all_cells`/`fallback_cell` iterate THIS, not
 generates a `(h, Spot)` cell — preventing the conflicting-requirements
 ICE loop a requirement-based exclusion would cause.
 
-r[sched.sla.fod-feature-derivation+2]
+r[sched.sla.fod-feature-derivation+3]
 The scheduler derives a derivation's *effective* feature set ONCE at
 DAG-add time as a constructor invariant on `DerivationState`
 (`EffectiveFeatures::derive`). The biconditional `is_fixed_output ⟺
@@ -788,17 +788,18 @@ spend fetcher $/hr on a drv that doesn't fetch). EVERY reader —
 `SpawnIntent.required_features` — reads the stored field, NOT the raw
 declaration. The two intentional bypasses (`InspectBuildDag`'s
 `required_features` echo, the dispatch-time `failed_builders` warn) read
-the *declared* set so the operator can see what the tenant submitted.
-Post-construction mutation of `required_features` (the soft-feature
-strip) routes through a `set_required_features` write-gate that
-re-derives `effective_features` atomically — the two fields cannot
+the in-memory normalized set — post I-204 soft-strip, but PRE the §13e
+FOD↔fetcher derivation, so the operator can spot a misrouted FOD (the
+verbatim declared set lives only in the `derivations.required_features`
+PG column). Post-construction mutation of `required_features` (the
+soft-feature strip) routes through a `set_required_features` write-gate
+that re-derives `effective_features` atomically — the two fields cannot
 drift. §13e: this routes FODs to the dynamic `fetcher-*` hwClasses
 (which advertise `providesFeatures: [fetcher]`) via the same
-bidirectional ∅-guard that routes kvm to metal — the static
-`rio-fetcher` NodePool's pod nodeSelector is no longer load-bearing. The
-override is unconditional: a misconfigured FOD declaring
-`requiredSystemFeatures: [kvm]` would otherwise route to a kvm node with
-no fetcher airgap (`r[builder.netpol.airgap]`).
+bidirectional ∅-guard that routes kvm to metal. The override is
+unconditional: a misconfigured FOD declaring `requiredSystemFeatures:
+[kvm]` would otherwise route to a kvm node with no fetcher airgap
+(`r[builder.netpol.airgap]`).
 
 ### Catalog-derived per-class ceilings (ADR-023 §13c-2)
 

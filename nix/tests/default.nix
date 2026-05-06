@@ -714,7 +714,7 @@ in
   vm-lifecycle-autoscale-k3s = lifecycleMod.mkTest {
     name = "autoscale";
     subtests = [
-      # r[verify ctrl.pool.ephemeral]
+      # r[verify ctrl.pool.ephemeral+1]
       # r[verify ctrl.ephemeral.intent-deadline]
       # r[verify ctrl.crd.host-users-network-exclusive]
       # ~180s: two builds × (reconcile tick + pod schedule + FUSE +
@@ -769,7 +769,7 @@ in
   # r[verify ctrl.nodeclaim.shim-nodepool]
   # r[verify ctrl.nodeclaim.anchor-bulk+4]
   # r[verify ctrl.nodeclaim.priority-bucket]
-  # r[verify ctrl.nodeclaim.placeable-gate+3]
+  # r[verify ctrl.nodeclaim.placeable-gate+4]
   vm-sla-sizing-kwok = forecast-provisioning {
     inherit pkgs common;
     fixture = k3sFull {
@@ -1075,7 +1075,7 @@ in
   #   unit-tested in `builtin_fod_pod_has_pool_static_fetcher_node_selector`
   #   / `fetcher_pod_no_legacy_node_role_selector` and contract-tested
   #   in sla_contract.rs; this is the in-cluster shape check.
-  # r[verify sched.sla.fod-feature-derivation+2]
+  # r[verify sched.sla.fod-feature-derivation+3]
   #   dispatch-fod+nonfod + fetcher-isolation subtests: FOD routes to
   #   the kind=Fetcher pod (passes_intent_filter reads
   #   effective_features(state)=[fetcher] for FODs and matches the

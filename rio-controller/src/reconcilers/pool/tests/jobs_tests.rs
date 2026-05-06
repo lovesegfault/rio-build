@@ -26,7 +26,7 @@ use crate::reconcilers::pool::jobs::{INTENT_SELECTOR_ANNOTATION, reap_stale_for_
 use rio_crds::pool::ExecutorKind;
 use rio_proto::types::SpawnIntent;
 
-// r[verify ctrl.pool.ephemeral]
+// r[verify ctrl.pool.ephemeral+1]
 #[test]
 fn ephemeral_spawn_fail_still_patches_status() {
     // STRUCTURAL GUARD: the spawn block (between `---- Spawn decision

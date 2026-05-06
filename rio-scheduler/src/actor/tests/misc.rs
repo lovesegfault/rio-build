@@ -962,7 +962,7 @@ async fn soft_feature_strip_only() {
 ///
 /// **Pre-fix: RED** — `effective_features = ["big-parallel", "kvm"]`
 /// (constructor-only derivation never re-derives after the strip).
-// r[verify sched.sla.fod-feature-derivation+2]
+// r[verify sched.sla.fod-feature-derivation+3]
 // r[verify sched.dispatch.soft-features]
 #[tokio::test]
 async fn apply_soft_features_re_derives_effective_features() {

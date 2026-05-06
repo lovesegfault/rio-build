@@ -182,7 +182,7 @@ impl PlaceableGate {
     /// fail-closed (a standby replica whose lease-gated reconciler never
     /// publishes would otherwise see `queued=0` and reap the leader's
     /// Pending Jobs).
-    // r[impl ctrl.nodeclaim.placeable-gate+3]
+    // r[impl ctrl.nodeclaim.placeable-gate+4]
     pub fn retain(&self, intents: &mut Vec<SpawnIntent>) -> bool {
         match self.0.borrow().clone() {
             Some(set) => {
@@ -910,7 +910,7 @@ impl NodeClaimPoolReconciler {
             "FFD simulation"
         );
         self.emit_tick_gauges(&live, &placeable, &unplaced, now);
-        // r[impl ctrl.nodeclaim.placeable-gate+3]
+        // r[impl ctrl.nodeclaim.placeable-gate+4]
         // Publish `intent_id`s FFD-placed on a `Registered=True` node
         // (`in_flight == false`). The `pool/jobs` reconciler retains
         // only these — Jobs are NOT created for intents placed on

@@ -139,9 +139,12 @@ fn fetcher_hardening_ignores_spec() {
         "Fetcher defaults hostUsers:false when spec is silent"
     );
 
-    // §13e: the pool-static fetcher nodeSelector is DELETED — restrictive
-    // placement comes from per-intent affinity (`cells_to_selector_terms`).
-    // The pool-static toleration stays (permissive, cold-start fallback).
+    // §13e B4: the legacy `rio.build/node-role` pool-static nodeSelector
+    // is DELETED, but `effective_node_selector` RESTORES a pool-static
+    // selector keyed on `FETCHER_TAINT_KEY` (`rio.build/fetcher`) — the
+    // last-resort restrictive constraint for builtin FODs whose
+    // `hw_class_names=[]` carries no per-intent affinity. The pool-static
+    // toleration stays (permissive, cold-start fallback).
     pool.spec.node_selector = None;
     pool.spec.tolerations = None;
     let spec = test_pod_spec(&pool);
@@ -149,7 +152,8 @@ fn fetcher_hardening_ignores_spec() {
         spec.node_selector
             .as_ref()
             .is_none_or(|ns| !ns.contains_key("rio.build/node-role")),
-        "no pool-static fetcher nodeSelector post-§13e (got {:?})",
+        "deleted `rio.build/node-role` pool-static fetcher nodeSelector \
+         must not reappear post-§13e (got {:?})",
         spec.node_selector
     );
     let tol = &spec.tolerations.as_ref().unwrap()[0];

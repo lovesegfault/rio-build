@@ -291,7 +291,7 @@ impl HwSampledCache {
     }
 }
 
-// r[impl ctrl.pool.ephemeral]
+// r[impl ctrl.pool.ephemeral+1]
 /// Reconcile a Pool: count active Jobs, poll spawn intents, spawn
 /// Jobs if work is waiting.
 ///
@@ -330,7 +330,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                 (Vec::new(), Some(e.to_string()))
             }
         };
-    // r[impl ctrl.nodeclaim.placeable-gate+3]
+    // r[impl ctrl.nodeclaim.placeable-gate+4]
     // ADR-023 §13b placeable gate: Builder Jobs spawn only for intents
     // the nodeclaim_pool reconciler's last FFD sim placed on a
     // `Registered=True` NodeClaim — structurally closes the spawn-
@@ -346,12 +346,19 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // placeable set DOES include fetcher intent IDs and gating fetcher
     // spawn on it would NOT stall (the pre-§13e rationale died with the
     // static `rio-fetcher` NodePool). The Builder-only retain is kept
-    // because fetcher fan-out is already bounded by `spec.maxConcurrent`
-    // and a fetcher pod is cheap (1 core, ~640Mi) — there is no
-    // 1226-Pending-Jobs problem for the gate to solve. Extending the
-    // retain to Fetcher pools is a follow-up. `Ctx.placeable = None` ⇔
-    // NodeClaim CRD absent (k3s VM tests without Karpenter) — the gate
-    // is structurally a no-op there.
+    // because the fetcher fan-out hazard is already bounded elsewhere:
+    // (a) provisioning-side, `cover_deficit`'s per-tick + per-class
+    //     `maxFleetCores` caps mint at most a handful of fetcher
+    //     NodeClaims per tick;
+    // (b) a fetcher pod is cheap (1 core, ~640Mi) — even an unbounded
+    //     Pending-Job pile-up doesn't translate to 1226 NodeClaim
+    //     provisioning requests the way builder Jobs (12c+) do.
+    // (Production fetcher Pools do NOT set `spec.maxConcurrent`; the
+    // Job-side ceiling is uncapped — the bound is the NodeClaim
+    // budget, not the Job count.) Extending the retain to Fetcher
+    // pools is a follow-up. `Ctx.placeable = None` ⇔ NodeClaim CRD
+    // absent (k3s VM tests without Karpenter) — the gate is
+    // structurally a no-op there.
     //
     // `gate_armed` answers "is `queued` authoritative for
     // `reap_excess_pending`?". When the gate exists (CRD present),
@@ -654,7 +661,7 @@ async fn queued_for_pool(
 ) -> std::result::Result<Vec<SpawnIntent>, tonic::Status> {
     // I-176: `filter_features=true` even when `features` is empty: a
     // featureless pool then sees only featureless work.
-    // `effective_features` (Fetcher → []) is the same chokepoint
+    // `effective_features` (Fetcher → [fetcher]) is the same chokepoint
     // `RIO_FEATURES` reads — keeps the spawn-decision query and the
     // spawned worker's capabilities derived from one value.
     let resp = admin_call(ctx.admin.clone().get_spawn_intents(
@@ -838,7 +845,7 @@ pub(super) async fn reap_stale_for_intents(
 ///   - `ttlSecondsAfterFinished: 600` — K8s TTL controller reaps.
 ///   - `activeDeadlineSeconds` — backstop for hung builds + wrong-
 ///     pool spawns.
-// r[impl ctrl.pool.ephemeral]
+// r[impl ctrl.pool.ephemeral+1]
 // r[impl ctrl.ephemeral.intent-deadline]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_job(
@@ -868,11 +875,14 @@ pub(super) fn build_job(
     // gate-active only. §13e: fetcher cells ARE NodeClaim-minted now
     // (`rio.build/fetcher` taint+label, `nodeclaim_pool` covers Fetcher
     // Pools post-B2.6), but the second-scheduler routing stays
-    // builder-only — fetcher pods are one-per-node by construction
-    // (`FETCHER_TAINT_KEY` taint + per-intent affinity) so MostAllocated
-    // bin-packing is moot. When `gate_active=false` (NodeClaim CRD
-    // absent — k3s VM tests without Karpenter) `kube-build-scheduler`
-    // isn't deployed, so the pod would sit Pending forever.
+    // builder-only. Fetcher pods are NOT one-per-node (no anti-
+    // affinity — multiple ~1c pods can co-locate); the divergence
+    // between FFD's prediction and the default scheduler's actual
+    // bin-packing is bounded by the tiny per-pod footprint, and it
+    // isn't worth coupling fetcher cells to the `kube-build-scheduler`
+    // dependency. When `gate_active=false` (NodeClaim CRD absent —
+    // k3s VM tests without Karpenter) `kube-build-scheduler` isn't
+    // deployed, so the pod would sit Pending forever.
     if gate_active && pool.spec.kind == ExecutorKind::Builder {
         pod_spec.scheduler_name = Some(KUBE_BUILD_SCHEDULER.into());
         pod_spec.priority_class_name = Some(format!(
@@ -1045,9 +1055,12 @@ fn apply_intent_resources(
     // tainted hwClass (gpu, secure-boot) routes its toleration
     // automatically. (`pod::wants_metal` covers the pool-static
     // *toleration* path for `hw_class_names=[]` cold-start intents;
-    // this covers the intent-affinity path. There is no pool-static
-    // *nodeSelector* path — r33 bug_002 deleted it. Restrictive
-    // placement is `intent.node_affinity` only.) Append-dedup so the
+    // this covers the intent-affinity path. On the kvm/metal axis
+    // there is no pool-static *nodeSelector* path — r33 bug_002
+    // deleted it; restrictive placement is `intent.node_affinity`
+    // only. Fetcher pools DO carry a pool-static `rio.build/fetcher`
+    // selector (r35 B4 — see `pod::effective_node_selector`), keyed
+    // on `pool.spec.kind`, not `hw_class_names`.) Append-dedup so the
     // operator-set `rio.build/builder` toleration and the pool-static
     // kvm toleration both survive without duplication.
     let mut intent_tols: Vec<Toleration> = Vec::new();
@@ -1129,7 +1142,7 @@ mod tests {
     ///   - ttlSecondsAfterFinished missing → completed Jobs
     ///     accumulate forever
     ///   - ownerReference missing → Pool delete leaves orphan Jobs
-    // r[verify ctrl.pool.ephemeral]
+    // r[verify ctrl.pool.ephemeral+1]
     #[test]
     fn job_spec_load_bearing_fields() {
         let pool = test_pool("eph-pool", ExecutorKind::Builder);
@@ -1794,8 +1807,10 @@ mod tests {
     // r[verify ctrl.nodeclaim.priority-bucket]
     /// Builder pods get `schedulerName: kube-build-scheduler` +
     /// `priorityClassName: rio-builder-prio-{⌊log₂ c*⌋}`. Fetcher pods
-    /// NEVER get them (placeable gate doesn't cover the dedicated
-    /// fetcher pool).
+    /// NEVER get them — second-scheduler routing stays Builder-only
+    /// (fetcher pods are ~1c; the FFD↔default-scheduler bin-packing
+    /// divergence is bounded by the tiny per-pod footprint, not worth
+    /// the `kube-build-scheduler` dependency for fetcher cells).
     #[test]
     fn build_job_stamps_kube_build_scheduler_and_priority() {
         let i = SpawnIntent {
@@ -1823,7 +1838,7 @@ mod tests {
         assert_eq!(f.priority_class_name, None);
     }
 
-    // r[verify ctrl.nodeclaim.placeable-gate+3]
+    // r[verify ctrl.nodeclaim.placeable-gate+4]
     /// `PlaceableGate::retain` filters to the FFD-placed-on-Registered
     /// set; unarmed gate clears + returns `false` so `queued_known =
     /// None` (fail-closed reap).
@@ -1846,7 +1861,7 @@ mod tests {
         assert!(v.is_empty());
     }
 
-    // r[verify ctrl.nodeclaim.placeable-gate+3]
+    // r[verify ctrl.nodeclaim.placeable-gate+4]
     /// The spawn-intent fan-out close in unit-test form: 1226 Ready
     /// intents, FFD placed 9 on Registered nodes → only 9 survive the
     /// gate. Pre-B12 (`ready` retain) all 1226 would mint Pending Jobs;

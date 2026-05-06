@@ -402,8 +402,12 @@ message SpawnIntent {
   // D5: target system (e.g. "x86_64-linux"). Controller filters by
   // `intent.system ∈ pool.spec.systems`.
   string system = 7;
-  // D5: required system features. Controller filters by
-  // `intent.required_features ⊆ pool.spec.features`.
+  // D5: required system features (scheduler-effective: §13e
+  // `EffectiveFeatures::derive` projects FODs to `[fetcher]` and
+  // strips `fetcher` from non-FODs before this lands on the wire).
+  // Controller filters by `features_compatible(intent.required_features,
+  // effective_features(pool.spec))` (bidirectional ∅-guard, NOT a
+  // bare subset check).
   repeated string required_features = 8;
   // D7: scheduler-computed `activeDeadlineSeconds` for the spawned
   // Job. For fitted keys: `wall_p99 × 5`; for probe/explore:

@@ -99,18 +99,20 @@ pkgs.testers.runNixOSTest {
         )
 
     # ── Label k3s-agent as the (notional) dedicated fetcher node ──────
-    # §13e: pool-static nodeSelector rio.build/node-role=fetcher is
-    # DELETED (reconcilers/pool/pod.rs effective_node_selector). The
-    # restrictive constraint is now per-intent nodeAffinity from
-    # `cells_to_selector_terms` reading `intent.hw_class_names` — but
-    # builtin:fetchurl FODs have system="builtin" → arch=None →
+    # §13e B4: the legacy `rio.build/node-role=fetcher` pool-static
+    # nodeSelector is DELETED, but `effective_node_selector`
+    # (reconcilers/pool/pod.rs) RESTORES a pool-static
+    # `rio.build/fetcher=true` selector keyed on the §13e taint-key.
+    # It is the LAST-RESORT restrictive constraint for builtin
+    # FODs: system="builtin" → arch=None →
     # `reference_hw_class_for_system` returns None → `hw_class_names=[]`
-    # → no nodeAffinity. In k3s the fetcher pod has no positive
-    # placement constraint and lands wherever kube-scheduler puts it.
-    # The label below documents intent but is NOT load-bearing; the
-    # subtest shape-checks the toleration and the *absence* of the
-    # deleted pool-static nodeSelector. The full Karpenter affinity
-    # chain (NodeClaim with rio.build/fetcher label/taint) is EKS-only.
+    # → no per-intent nodeAffinity from `cells_to_selector_terms`.
+    # The label below IS load-bearing — it satisfies the restored
+    # nodeSelector so the fetcher pod can bind in k3s. The subtest
+    # shape-checks the toleration AND the restored pool-static
+    # selector AND the *absence* of the deleted `rio.build/node-role`
+    # convention. The full Karpenter affinity chain (NodeClaim with
+    # rio.build/fetcher label/taint) is EKS-only.
     kubectl("label node k3s-agent rio.build/fetcher=true --overwrite", ns="kube-system")
 
     # ── "public" origin on upstream-v4:80 ─────────────────────────────

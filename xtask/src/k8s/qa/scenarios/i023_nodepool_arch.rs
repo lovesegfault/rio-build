@@ -8,10 +8,10 @@
 //! are intentionally arch-agnostic — control-plane images are multi-
 //! arch manifest lists (ECR `{sha}` → `{sha}-{amd64,arm64}`), so
 //! Graviton is a cost/availability optimization, not a correctness
-//! risk. Only the per-system fetcher NodePools MUST carry arch (the
-//! Jobs they host are single-arch). §13c: builder NodePools (incl.
-//! the static metal pool) are gone — §13b NodeClaims carry arch from
-//! the hwClass `requirements`.
+//! risk. §13c/§13e: builder AND fetcher NodePools (incl. the static
+//! metal and `rio-fetcher` pools) are gone — §13b NodeClaims carry
+//! arch from the hwClass `requirements`, so the only static NodePools
+//! left are the arch-agnostic ones above.
 
 use std::time::Duration;
 

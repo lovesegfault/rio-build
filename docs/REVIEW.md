@@ -328,6 +328,21 @@ the verifier treated "fixed axis X" as discharging "all axes."
 Escalate. The compiler-check template (per §Nth-strike): hoist the
 shared guard ABOVE the `match` so a future arm cannot bypass it.
 
+**⚠-notes vs ◆-amendments.** A verifier ⚠ note that names a SPECIFIC
+future failure mode — "if X drifts, Y will flap" with a concrete
+mechanism — is not a risk note; it is a prediction. r35 found that 3 of
+its 11 findings were PREDICTED by r34/§13e verifiers (merged_bug_027 by
+the r34 B0 verifier; bug_003 partially by the §13e B3 verifier;
+merged_bug_004's `assignment.rs` site by the §13e B1 verifier). Each
+prediction went into a ⚠ note instead of a ◆ amendment, and each
+became next round's bug.
+
+**Rule:** if you can write the failing test for the predicted failure
+mode, AMEND it now — don't note it. ⚠ notes are for risks the verifier
+cannot bound; ◆ amendments are for predictions the verifier CAN bound
+and is choosing not to fix. A ◆ amendment without a fix is a deferred
+bug, not a finding.
+
 ## Placement-supersets-provisioning
 
 When a control loop both *places* work (writing scheduling constraints

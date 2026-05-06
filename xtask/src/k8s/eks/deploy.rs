@@ -28,12 +28,15 @@ use crate::{git, helm, tofu, ui};
 /// SpawnIntent (ADR-023) — there is NO per-pool resources knob.
 ///
 /// Fetcher entries: `system="builtin"` FODs overflow to either arch;
-/// nodeSelector REPLACES the reconciler default. CEL forbids
-/// privileged/seccompProfile on Fetcher entries — those fields are
-/// deep-merged from poolDefaults but rejected at admission; the
-/// `null` clears prevent the merge. `hostUsers:null` clears
-/// poolDefaults.hostUsers:true so EKS gets the reconciler default
-/// `false` (hostUsers is NOT CEL-gated for Fetcher — k3s escape hatch).
+/// `nodeSelector:null` clears poolDefaults.nodeSelector so the
+/// reconciler default (`{rio.build/fetcher: true}` injected
+/// unconditionally by `effective_node_selector` and merged with any
+/// operator entries) passes through. CEL forbids privileged/
+/// seccompProfile on Fetcher entries — those fields are deep-merged
+/// from poolDefaults but rejected at admission; the `null` clears
+/// prevent the merge. `hostUsers:null` clears poolDefaults.
+/// hostUsers:true so EKS gets the reconciler default `false`
+/// (hostUsers is NOT CEL-gated for Fetcher — k3s escape hatch).
 const POOLS_JSON: &str = r#"[
   {"name":"x86-64","kind":"Builder","systems":["x86_64-linux","i686-linux"]},
   {"name":"aarch64","kind":"Builder","systems":["aarch64-linux"]},

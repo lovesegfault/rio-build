@@ -115,12 +115,16 @@ pub(super) fn detect_hung_nodes(
 /// to `SpawnIntent.required_features` / `DrvHints.required_features`
 /// or pass `&feat` to `features_compatible`).
 ///
-/// The TWO intentional bypasses read the *declared* set via
+/// The TWO intentional bypasses read the in-memory normalized set via
 /// `state.required_features()`: `handle_inspect_build_dag`'s
-/// `required_features` field (operator-facing echo of what the tenant
-/// submitted) and `actor/dispatch.rs`'s `failed_builders` warn (ditto
-/// — the operator needs to see what was declared, not what was
-/// derived, when triaging an unroutable drv).
+/// `required_features` field and `actor/dispatch.rs`'s `failed_builders`
+/// warn. Operator-facing diagnostic echo — but NOT the verbatim
+/// declared set: it is post I-204 soft-strip (the verbatim declaration
+/// lives only in the `derivations.required_features` PG column). What
+/// it omits relative to this fn is the §13e FOD↔fetcher derivation,
+/// which IS what the operator needs to see when triaging a routing
+/// surprise (`is_fixed_output ⟹ [fetcher]` regardless of what was
+/// declared).
 fn effective_features(state: &crate::state::DerivationState) -> Vec<String> {
     state.effective_features().as_slice().to_vec()
 }
@@ -1112,8 +1116,9 @@ impl DagActor {
         // partitions `h_all` to the `fetcher-*` classes via the same
         // ∅-guard. They participate in solve_full like any featured
         // intent (the cost model converges on the floor for the
-        // unsaturated CPU profile). The `rio-fetcher` static NodePool
-        // is no longer load-bearing for routing.
+        // unsaturated CPU profile). The static `rio-fetcher` NodePool
+        // is DELETED (§13e); the controller mints `fetcher-*`
+        // NodeClaims from the cells emitted here.
         //
         // §13d STRIKE-7 (bug_042, A8): ALSO arch-filter — `h_all`
         // feeds `solve_full`'s candidate set; a wrong-arch class gets a
@@ -1749,9 +1754,9 @@ impl DagActor {
     /// GONE. FODs reach `bypass_cells` cold-start with
     /// `effective_features = [fetcher]` and route to the `fetcher-*`
     /// classes via `reference_hw_class_for_system` like any featured
-    /// intent. The static `rio-fetcher` NodePool is no longer
-    /// load-bearing; the controller mints `fetcher-*` NodeClaims from
-    /// the cells emitted here.
+    /// intent. The static `rio-fetcher` NodePool is DELETED (§13e);
+    /// the controller mints `fetcher-*` NodeClaims from the cells
+    /// emitted here.
     pub(super) fn bypass_cells(
         &self,
         state: &crate::state::DerivationState,

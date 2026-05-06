@@ -81,7 +81,7 @@ impl EffectiveFeatures {
     ///
     /// `pname` is for warn/metric attribution only — it does not
     /// affect the derived set.
-    // r[impl sched.sla.fod-feature-derivation+2]
+    // r[impl sched.sla.fod-feature-derivation+3]
     pub fn derive(is_fixed_output: bool, raw: &[String], pname: Option<&str>) -> Self {
         let out: Vec<String> = if is_fixed_output {
             vec![rio_common::k8s::FETCHER_FEATURE.to_string()]
@@ -1109,19 +1109,23 @@ impl DerivationState {
     /// partition, `override_hash` memo key, `retain_hosting_cells`,
     /// `bypass_cells` cold-start, `hard_filter`/`rejection_reason`,
     /// `statically_eligible`, the wire `SpawnIntent.required_features`.
-    /// The TWO intentional bypasses read the *declared* set via
-    /// [`Self::required_features`]: `actor/snapshot.rs::handle_inspect_
-    /// build_dag` (operator-facing echo of what the tenant submitted)
-    /// and `actor/dispatch.rs`'s `failed_builders` warn (ditto).
+    /// The TWO intentional bypasses read the in-memory normalized set
+    /// via [`Self::required_features`]: `actor/snapshot.rs::
+    /// handle_inspect_build_dag` and `actor/dispatch.rs`'s
+    /// `failed_builders` warn (operator-facing echo, post I-204
+    /// soft-strip — pre §13e FOD↔fetcher derivation).
     pub fn effective_features(&self) -> &EffectiveFeatures {
         &self.effective_features
     }
 
-    /// Declared `requiredSystemFeatures`, verbatim from the proto node.
-    /// Diagnostic echo only — `InspectBuildDag` and the `dispatch.rs`
-    /// `failed_builders` warn show the operator what the tenant
-    /// submitted. ROUTING reads [`Self::effective_features`] — a
-    /// consumer reading this raw set is a §13e/r35 chokepoint bypass.
+    /// In-memory `requiredSystemFeatures`, post I-204 soft-strip (the
+    /// verbatim declared set lives only in the `derivations.
+    /// required_features` PG column — `set_required_features` mutates
+    /// this in place). Diagnostic echo only — `InspectBuildDag` and the
+    /// `dispatch.rs` `failed_builders` warn show the operator the
+    /// pre-§13e-derivation set so they can spot a misrouted FOD.
+    /// ROUTING reads [`Self::effective_features`] — a consumer reading
+    /// this raw set is a §13e/r35 chokepoint bypass.
     pub fn required_features(&self) -> &[String] {
         &self.required_features
     }

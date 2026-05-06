@@ -412,7 +412,7 @@ mod tests {
     /// passes through the chokepoint.
     ///
     /// **Pre-fix: RED** — `rejection_reason = Some("feature-missing")`.
-    // r[verify sched.sla.fod-feature-derivation+2]
+    // r[verify sched.sla.fod-feature-derivation+3]
     #[test]
     fn hard_filter_misconfigured_fod_kvm_routes_to_fetcher() {
         // FOD with declared `["kvm"]` — degenerate but a tenant CAN

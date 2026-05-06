@@ -431,10 +431,13 @@ scheduler:
     # nodeclaim_pool `maxFleetCores`. Folding metal in adds its capacity
     # to the global pool — bump by 10000 so non-metal keeps its
     # pre-§13c floor.
-    # §13e: same fold for fetchers. The static `rio-fetcher` NodePool's
-    # `limits:{cpu:5000}` was a separate budget; the `fetcher-*`
-    # hwClasses cap at 5000 each (Σ=10000). Bump global by another
-    # 10000 so the non-metal non-fetcher floor stays at 10000.
+    # §13e: same fold-shape for fetchers (split per arch). The static
+    # `rio-fetcher` NodePool's `limits:{cpu:5000}` was a SHARED budget
+    # across both arches; per-class `maxFleetCores` caps don't borrow
+    # across arches, so 5000/arch (Σ=10000, 2× the old total) preserves
+    # the all-x86 burst ceiling at the cost of doubling the mixed-arch
+    # worst case. Bump global by another 10000 so the non-metal
+    # non-fetcher floor stays at 10000.
     # INVARIANT (helm/13 asserts the combined form):
     #   Σ(metal-* maxFleetCores) ≤ 10000           (D4a)
     #   Σ(fetcher-* maxFleetCores) ≤ 10000         (§13e)
@@ -650,14 +653,22 @@ scheduler:
       # bidirectional ∅-guard means a featureless builder NEVER routes
       # to a fetcher cell and a FOD NEVER routes to a builder cell.
       #
-      # Sizing: cold-start (no pname samples) gets sla.probe (16c/48GiB
-      # default) for ~3 builds; observed_p_bar then detects the
-      # unsaturated CPU profile (cpu_seconds/wall p90 << 1) and clamps
-      # cap_c to 1.0. Steady-state c*=1. A FOD slower than the slowest
-      # bounded tier (p99=1200s) falls through to best-effort and gets
-      # cap_c = class_ceiling — over-provision cost waste, not a
-      # correctness hazard. Operators may add sla.featureProbes.fetcher
-      # for a cheaper cold-start (cpu must be ≥ 4 per ProbeShape::validate).
+      # Sizing — TWO cold-start regimes by `preferLocalBuild`:
+      #  (a) PLB FODs (`preferLocalBuild=true`, e.g. `builtins.fetchurl`,
+      #      `writeText`): pinned 1c/minimal-mem/minimal-disk
+      #      immediately, no learning — `intent_for` short-circuits
+      #      before the cold-start probe. The common case.
+      #  (b) Non-PLB FODs (`fetchgit`, large unpacked fetchurls,
+      #      pname-bearing fixed-output derivations): cold-start (no
+      #      pname samples) gets sla.probe (16c/48GiB default) for
+      #      ~3 builds; observed_p_bar then detects the unsaturated CPU
+      #      profile (cpu_seconds/wall p90 << 1) and clamps cap_c to
+      #      1.0. Steady-state c*=1.
+      # A FOD slower than the slowest bounded tier (p99=1200s) falls
+      # through to best-effort and gets cap_c = class_ceiling —
+      # over-provision cost waste, not a correctness hazard. Operators
+      # may add sla.featureProbes.fetcher for a cheaper non-PLB
+      # cold-start (cpu must be ≥ 4 per ProbeShape::validate).
       #
       # capacityTypes [spot, on-demand]: a spot interruption mid-FOD is
       # safe (FODs are idempotent, the failure_count machinery retries),
@@ -679,7 +690,7 @@ scheduler:
         providesFeatures: [fetcher]
         # §13e: replaces static rio-fetcher NodePool's `limits: {cpu: 5000}`
         # ("5000 vCPU ≈ 2500 concurrent tiny fetchers"). Without this the
-        # fetcher fanout is bounded only by the shared 20000-core global,
+        # fetcher fanout is bounded only by the shared 30000-core global,
         # silently regressing the fanout gate.
         maxFleetCores: 5000
       fetcher-arm:

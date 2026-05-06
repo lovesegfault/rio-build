@@ -14,7 +14,7 @@ metadata:
   name: x86-64
 spec:
   kind: Builder                                # Builder | Fetcher, required
-  maxConcurrent: 20                            # u32?, optional — concurrent-Job ceiling (one Job = one build); omit = uncapped (Karpenter NodePool limits.cpu is the only gate)
+  maxConcurrent: 20                            # u32?, optional — concurrent-Job ceiling (one Job = one build); omit = uncapped Job count (the §13b placeable gate + per-class maxFleetCores caps bound fanout, not Job count)
   image: rio-builder:dev                       # string, required — container image ref
   systems: [x86_64-linux]                      # list<string>, required (non-empty per CEL)
   hostUsers: false                             # bool?, optional — None ⇒ hostUsers:false (userns per ADR-012); CEL-forbidden for Fetcher
@@ -49,7 +49,7 @@ status:
 
 ### Job lifecycle
 
-r[ctrl.pool.ephemeral]
+r[ctrl.pool.ephemeral+1]
 The reconciler polls `AdminService.ClusterStatus` each requeue tick (10s)
 and spawns K8s Jobs when `queued_derivations > 0` and active Jobs <
 `spec.maxConcurrent` (or unconditionally when `maxConcurrent` is unset).
@@ -58,9 +58,14 @@ Each Job runs one rio-builder pod whose main loop exits after one
 `ttlSecondsAfterFinished: 600` reaps (10min postmortem window for `kubectl
 logs` on failed builders). Job settings: `backoffLimit: 0` (scheduler owns
 retry), `restartPolicy: Never`, `parallelism: 1`. `spec.maxConcurrent` is
-an optional concurrent-Job ceiling, not a standing set; when omitted, the
-Karpenter NodePool `limits.cpu` is the only fanout gate. Zero queued
-derivations means zero pods.
+an optional concurrent-Job ceiling, not a standing set; when omitted,
+fanout is bounded provisioning-side — the §13b placeable gate (Builder
+Pools spawn Jobs only for FFD-placed-on-`Registered` intents) and
+`cover_deficit`'s per-class `maxFleetCores` budget caps bound the
+NodeClaim mint, not the Job count. The Karpenter NodePool is NOT a
+fanout gate post-§13b: `rio-nodeclaim-shim` carries `limits.cpu:0` and
+the controller mints NodeClaims directly. Zero queued derivations means
+zero pods.
 
 **Isolation guarantee:** zero cross-build state. Fresh pod means fresh
 emptyDir for FUSE cache and overlayfs upper, fresh filesystem. Untrusted
@@ -595,7 +600,7 @@ are summed across capacity-types (per-hwClass, NOT per-Cell — a per-Cell
 cap would let spot+od each hit it independently → 2× $/hr exposure).
 `max_fleet_cores=None` ⇒ global budget only.
 
-r[ctrl.nodeclaim.placeable-gate+3]
+r[ctrl.nodeclaim.placeable-gate+4]
 For Builder pools, the Pool reconciler creates Jobs only for intents
 the nodeclaim_pool reconciler's last FFD simulation placed on a
 `Registered=True` NodeClaim. The §13a `ready` retain is replaced; Job
@@ -604,12 +609,15 @@ unarmed gate (no FFD tick yet) is fail-closed for both spawn and reap.
 The gate does NOT apply to Fetcher pools — fetcher NodeClaims are minted
 by the same `cover_deficit` (§13e: the FFD simulation covers Builder and
 Fetcher Pools), so the placeable set DOES contain fetcher intent IDs, but
-the Builder-only retain is kept: fetcher fan-out is bounded by
-`spec.maxConcurrent` and a fetcher pod is cheap (1 core), so there is no
-1226-Pending-Jobs problem for the gate to solve. Extending the retain to
-Fetcher pools is a follow-up. The gate also does NOT apply when the
-NodeClaim CRD is absent (the controller probes at startup; absent ⇒
-static-node cluster, gate is pass-through).
+the Builder-only retain is kept: the fetcher fan-out hazard is already
+bounded provisioning-side (`cover_deficit`'s per-tick + per-class
+`maxFleetCores` caps), and a fetcher pod is cheap (~1 core), so there is
+no 1226-Pending-Jobs problem for the gate to solve. (Production fetcher
+Pools do not set `spec.maxConcurrent` — the bound is the NodeClaim
+budget, not the Job count.) Extending the retain to Fetcher pools is a
+follow-up. The gate also does NOT apply when the NodeClaim CRD is absent
+(the controller probes at startup; absent ⇒ static-node cluster, gate is
+pass-through).
 
 ## Build CRD (removed)
 
