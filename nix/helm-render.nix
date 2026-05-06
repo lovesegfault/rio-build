@@ -75,7 +75,39 @@ pkgs.runCommand "rio-helm-rendered"
     mkdir -p charts
     ln -s ${subcharts.postgresql} charts/postgresql
 
-    helm template rio . -n ${namespace} -f ${valuesFile} ${extraValuesArgs} ${setArgs} > all.yaml
+    # ── Null-clear chart-default `scheduler.sla.{hwClasses,leadTimeSeed}` ─
+    # Helm DEEP-MERGES `scheduler.sla.hwClasses` (and `leadTimeSeed`)
+    # between the chart's values.yaml and every `-f` overlay. A k3s
+    # VM-test overlay that sets `hwClasses: {vmtest: ...}` therefore
+    # merges to `{vmtest, ...all prod classes}`, and the prod classes'
+    # per-intent nodeAffinity (`cells_to_selector_terms`) always appends
+    # `karpenter.sh/capacity-type` — a Karpenter NodeClaim label no k3s
+    # node has. §13e exposed this latent leak: a `system="x86_64-linux"`
+    # FOD now routes through `reference_hw_class_for_system`, finds the
+    # leaked `fetcher-x86`, gets `nodeAffinity{karpenter.sh/...}`, and
+    # the pod is permanently Pending in k3s (no Karpenter).
+    #
+    # `leadTimeSeed` is cleared in lockstep — `validate_shape()` rejects
+    # any `lead_time_seed` cell whose hwClass is not in `hw_classes`, so
+    # clearing one without the other crash-loops the scheduler at boot.
+    # The collateral change is `max_lead = 0` for fixtures that don't
+    # supply their own seed, which DISABLES the forecast pass — correct
+    # for k3s (forecast covers Karpenter NodeClaim lead time, which has
+    # no analogue here). The kwok forecast test supplies its own seed.
+    #
+    # Helm honours per-subkey `null` deletion against CHART defaults
+    # only (not prior `-f` files), so this generated overlay deletes
+    # exactly the chart's keys. Caller overlays (`vmtest-full.yaml`,
+    # extraValuesFiles) add their own — those survive untouched.
+    # Derived from the chart at build time so the deletion set tracks
+    # values.yaml automatically: the §13e regression was a new chart
+    # hwClass that no test config knew to null-clear.
+    yq '{"scheduler": {"sla": {
+      "hwClasses": (.scheduler.sla.hwClasses | with_entries(.value = null)),
+      "leadTimeSeed": (.scheduler.sla.leadTimeSeed // {} | with_entries(.value = null))
+    }}}' values.yaml > $TMPDIR/null-clear-chart-sla.yaml
+
+    helm template rio . -n ${namespace} -f $TMPDIR/null-clear-chart-sla.yaml -f ${valuesFile} ${extraValuesArgs} ${setArgs} > all.yaml
 
     mkdir -p $out
     # CRDs come from infra/helm/crds/ (not the chart — Helm's crds/ dir

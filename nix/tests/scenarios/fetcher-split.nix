@@ -457,10 +457,28 @@ pkgs.testers.runNixOSTest {
             "${drvs.fodDir} 2>&1"
         )
         if rc != 0:
+            # rc=124 (`timeout` expired) means the build never dispatched.
+            # The usual cause is a fetcher pod stuck Pending: §13e
+            # routes x86_64 FODs through `reference_hw_class_for_system`,
+            # so a stray fetcher hwClass (e.g. a chart-default leak) gets
+            # a per-intent nodeAffinity with `karpenter.sh/capacity-type`
+            # that no k3s node satisfies. Dump the events so the
+            # FailedScheduling reason surfaces here, not 20 minutes
+            # downstream.
+            print("=== fod-dir TIMEOUT: diagnostic dump ===")
+            print(k3s_server.execute(
+                "k3s kubectl -n ${nsFetchers} get pool,job,pod -o wide 2>&1; "
+                "k3s kubectl -n ${nsFetchers} get events "
+                "--sort-by=.lastTimestamp 2>&1 | tail -30; "
+                "k3s kubectl -n rio-system logs deploy/rio-controller "
+                "--tail=300 2>&1 | grep -i 'spawn\\|warn\\|error' | tail -40"
+            )[1])
             raise AssertionError(
-                f"fod-dir build failed (rc={rc}). 'Input/output error' on "
-                f"mkdir means a whiteout was placed at the output path "
-                f"(prepare_sandbox regression).\n{out}"
+                f"fod-dir build failed (rc={rc}). rc=124 (timeout) means "
+                f"the build never dispatched — see the diagnostic dump "
+                f"above. 'Input/output error' on mkdir means a whiteout "
+                f"was placed at the output path (prepare_sandbox "
+                f"regression).\n{out}"
             )
         assert "rio-fod-dir" in out, f"unexpected output {out!r}"
         print(f"fod-dir PASS: {out.strip().splitlines()[-1]}")
