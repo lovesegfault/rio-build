@@ -222,6 +222,14 @@ pub fn describe_metrics() {
          count-based `for: 90s` fires on healthy bursts."
     );
     describe_gauge!(
+        "rio_controller_nodeclaim_terminating_age_max_seconds",
+        "Oldest terminating NodeClaim per `cell` (now − metadata.deletionTimestamp; \
+         0 when none terminating). The per-claim age the StuckTerminating alert keys \
+         on — the terminating count never touches 0 under sustained scale-down churn, \
+         so a count-based `for:` fires on every healthy reap burst (r38 merged_001 — \
+         lifecycle inverse of the inflight scale-up case)."
+    );
+    describe_gauge!(
         "rio_controller_ffd_unplaced_cores",
         "Σ SpawnIntent.cores per `cell` left unplaced by the FFD simulation \
          at the last tick. cover_deficit's per-cell input. Non-zero with \

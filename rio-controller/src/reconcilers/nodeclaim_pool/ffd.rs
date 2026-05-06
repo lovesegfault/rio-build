@@ -60,18 +60,23 @@ pub struct LiveNode {
     /// `status.capacity`, populated at Launch); Registered claims use
     /// `status.allocatable` minus [`Self::requested`].
     pub registered: bool,
-    /// `metadata.deletionTimestamp.is_some()` — Karpenter's termination
-    /// finalizer is running (drain → cordon → delete Node → remove
-    /// finalizer; ~60-90s). The NodeClaim object is still in the API and
-    /// still consuming EC2 cores so the `max_fleet_cores` budget keeps
-    /// counting it (otherwise `cover_deficit` double-provisions while
-    /// the old node bills), but it is NOT a placement candidate: the
-    /// kube-scheduler refuses to bind onto a cordoned/terminating node
-    /// and any pod already there is being evicted. Without this gate the
-    /// FFD's simulated placement set ⊋ the K8s-acceptable set — it
+    /// `metadata.deletionTimestamp` epoch seconds. `Some(_)` ⇔ Karpenter's
+    /// termination finalizer is running (drain → cordon → delete Node →
+    /// remove finalizer; ~60-90s). The NodeClaim object is still in the
+    /// API and still consuming EC2 cores so the `max_fleet_cores` budget
+    /// keeps counting it (otherwise `cover_deficit` double-provisions
+    /// while the old node bills), but it is NOT a placement candidate:
+    /// the kube-scheduler refuses to bind onto a cordoned/terminating
+    /// node and any pod already there is being evicted. Without this gate
+    /// the FFD's simulated placement set ⊋ the K8s-acceptable set — it
     /// "places" intents on the dying node, reports `deficit=0`, and the
     /// replacement isn't minted until the finalizer clears (~80s late).
-    pub terminating: bool,
+    /// Carries the timestamp (not just the bool) so `emit_live_gauges`
+    /// can compute `terminating_age_max_seconds` (r38 merged_001 —
+    /// count-based StuckTerminating false-fires under sustained
+    /// scale-down churn, the same anti-pattern
+    /// `inflight_age_max_seconds` was added to fix for scale-up).
+    pub terminating_since: Option<f64>,
     /// `(hw_class, capacity_type)` recovered from `metadata.labels`.
     /// `None` ⇔ labels absent/malformed (a freshly-`create()`d claim
     /// before Karpenter resolves capacity-type, or a non-B8 claim that
@@ -113,6 +118,13 @@ fn time_secs(t: &Time) -> f64 {
 }
 
 impl LiveNode {
+    /// `true` ⇔ `metadata.deletionTimestamp.is_some()`. Backward-compat
+    /// shim for the original `bool` field.
+    #[inline]
+    pub fn terminating(&self) -> bool {
+        self.terminating_since.is_some()
+    }
+
     /// Remaining placeable `(cores, mem, disk)`. Registered →
     /// `allocatable − requested` (saturating: a mis-accounted node
     /// reads as 0-free, not underflow). In-flight → `allocatable`
@@ -212,7 +224,7 @@ impl From<NodeClaim> for LiveNode {
             .conditions
             .iter()
             .any(|c| c.type_ == "Registered" && c.status == "True");
-        let terminating = nc.metadata.deletion_timestamp.is_some();
+        let terminating_since = nc.metadata.deletion_timestamp.as_ref().map(time_secs);
         let cell = nc.metadata.labels.as_ref().and_then(|l| {
             let h = l.get(HW_CLASS_LABEL)?;
             let cap = cap_from_label(l.get(CAPACITY_TYPE_LABEL)?)?;
@@ -240,7 +252,7 @@ impl From<NodeClaim> for LiveNode {
             name: nc.metadata.name.unwrap_or_default(),
             node_name: status.node_name.clone(),
             registered,
-            terminating,
+            terminating_since,
             cell,
             instance_type,
             allocatable,
@@ -329,7 +341,7 @@ pub fn simulate(
     // r[impl ctrl.nodeclaim.ffd-exclude-terminating]
     let mut free: HashMap<&str, (u32, u64, u64)> = live
         .iter()
-        .filter(|n| n.cell.is_some() && !n.terminating)
+        .filter(|n| n.cell.is_some() && !n.terminating())
         .map(|n| (n.name.as_str(), n.free()))
         .collect();
 
@@ -348,7 +360,7 @@ pub fn simulate(
     // it's about to leave.
     let by_node_name: HashMap<&str, (bool, &str)> = live
         .iter()
-        .filter(|n| !n.terminating)
+        .filter(|n| !n.terminating())
         .filter_map(|n| {
             n.node_name
                 .as_deref()
@@ -458,7 +470,7 @@ pub(super) fn sim_packs(
             name: format!("sim{k}"),
             node_name: None,
             registered: true,
-            terminating: false,
+            terminating_since: None,
             cell: Some(cell.clone()),
             instance_type: None,
             allocatable: bin,
@@ -693,7 +705,7 @@ pub(crate) mod tests {
             name: name.into(),
             node_name: Some(format!("node-{name}")),
             registered: true,
-            terminating: false,
+            terminating_since: None,
             cell: Some(Cell(hw.into(), cap)),
             instance_type: None,
             allocatable: (cores, mem, disk),
@@ -706,8 +718,8 @@ pub(crate) mod tests {
 
     /// Mark `n` as terminating (`metadata.deletionTimestamp` set —
     /// Karpenter's finalizer is draining it).
-    pub(crate) fn terminating(mut n: LiveNode) -> LiveNode {
-        n.terminating = true;
+    pub(crate) fn set_terminating(mut n: LiveNode) -> LiveNode {
+        n.terminating_since = Some(0.0);
         n
     }
 
@@ -896,20 +908,34 @@ pub(crate) mod tests {
         assert!(!live.registered, "no status → not registered");
         assert_eq!(live.cell, None, "no labels → no cell");
         assert_eq!(live.allocatable, (0, 0, 0));
-        assert!(!live.terminating, "no deletionTimestamp → not terminating");
+        assert!(
+            !live.terminating(),
+            "no deletionTimestamp → not terminating"
+        );
+        assert_eq!(
+            live.terminating_since, None,
+            "no deletionTimestamp → no terminating_since"
+        );
     }
 
     /// `metadata.deletionTimestamp` set ⇒ Karpenter's termination
-    /// finalizer is draining the node (~60-90s). `LiveNode.terminating`
+    /// finalizer is draining the node (~60-90s). `LiveNode.terminating_since`
     /// is the structural carrier so every consumer (FFD placement,
     /// budget, gauges, consolidation) reads ONE field instead of each
     /// re-deriving from `metadata`.
     #[test]
     fn live_node_from_nodeclaim_reads_deletion_timestamp() {
         let mut claim = nc("dying", true);
-        claim.metadata.deletion_timestamp = Some(Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH));
+        let ts = Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH);
+        claim.metadata.deletion_timestamp = Some(ts.clone());
         let live: LiveNode = claim.into();
-        assert!(live.terminating, "deletionTimestamp set → terminating");
+        assert!(live.terminating(), "deletionTimestamp set → terminating");
+        assert_eq!(
+            live.terminating_since,
+            Some(time_secs(&ts)),
+            "terminating_since carries the deletionTimestamp epoch (so \
+             emit_live_gauges can compute terminating_age_max_seconds)"
+        );
         assert!(
             live.registered,
             "Registered=True still readable while terminating"
@@ -933,7 +959,8 @@ pub(crate) mod tests {
         // pre-fix bug placed there because the score loop read it from
         // `free`. With both nodes empty the score ties and `max_by`
         // picks the last element, masking the bug by iteration luck.
-        let mut dying = terminating(node("dying", "h", CapacityType::Spot, 8, 32 * GI, 100 * GI));
+        let mut dying =
+            set_terminating(node("dying", "h", CapacityType::Spot, 8, 32 * GI, 100 * GI));
         dying.requested = (4, 0, 0);
         let i = intent("a", 4, GI, &[("h", CapacityType::Spot)]);
 

@@ -87,7 +87,7 @@ pub fn classify(
         // Already terminating: a redundant `delete` is accepted by the
         // apiserver (not 404 — the object still exists), so it'd
         // double-increment `reaped_total` and re-ICE-mask the cell.
-        if n.terminating {
+        if n.terminating() {
             continue;
         }
         // Scheduler dead-node signal: keyed on the backing Node name
@@ -314,17 +314,17 @@ mod tests {
     /// cell every tick for the whole ~60-90s drain window.
     #[test]
     fn classify_skips_terminating() {
-        use super::super::ffd::tests::terminating;
+        use super::super::ffd::tests::set_terminating;
         let cfg = cfg_seeded("h", 45.0);
         let sk = CellSketches::default();
         // Would be ICE (Launched=False past timeout) if not terminating.
-        let mut ice = terminating(with_conds(
+        let mut ice = set_terminating(with_conds(
             node("ice", "h", CapacityType::Spot, 8, 0, 0),
             &[("Launched", "False", 1005.0)],
         ));
         ice.registered = false;
         // Would be Dead if not terminating.
-        let dead = terminating(node("dead", "h", CapacityType::Spot, 8, 0, 0));
+        let dead = set_terminating(node("dead", "h", CapacityType::Spot, 8, 0, 0));
         let dead_set: HashSet<&str> = ["node-dead"].into();
         let r = classify(&[ice, dead], &dead_set, &sk, &cfg, 1100.0);
         assert!(

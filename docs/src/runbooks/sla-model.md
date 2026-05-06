@@ -20,8 +20,9 @@ override or reset.
 | `RioNodeclaimPoolStuckPending` | NodeClaim in-flight >3× cell lead-time (floor 90s, cap 3×maxLeadTime) | [Provisioning stuck](#rionodeclaimpool-stuckpending) |
 | `RioNodeclaimPoolBootTimeoutLoop` | A cell is repeatedly minting and reaping NodeClaims for `reason=boot-timeout` | [Boot-timeout loop](#rionodeclaimpool-boottimeoutloop) |
 | `RioNodeclaimPoolNoHostingClass` | SpawnIntents dropped — no configured hw-class can host them | [No hosting class](#rionodeclaimpool-nohostingclass) |
+| `RioNodeclaimPoolStuckTerminating` | A NodeClaim has had `deletionTimestamp` set >5m without Karpenter's finalizer clearing | [Stuck terminating](#rionodeclaimpool-stuckterminating) |
 
-The first three are model-accuracy alerts; the last four are provisioning
+The first three are model-accuracy alerts; the last five are provisioning
 alerts that share the same `rio-cli sla` diagnostic surface.
 
 ## Step 1: Identify the offending pname
@@ -321,6 +322,27 @@ Diagnose: scheduler logs WARN with the unroutable `(system, features)` tuple
 once per `(tenant, features)` edge. The controller logs WARN once per intent
 drop. `tracey query rule ctrl.pool.fetcher-affinity-from-intent` for the
 spec text.
+
+### RioNodeclaimPool StuckTerminating
+
+A NodeClaim has been in the terminating state (`metadata.deletionTimestamp`
+set, Karpenter finalizer running) for >5m. Healthy drain is ~60-90s. The
+NodeClaim still counts against `max_fleet_cores` (the EC2 instance bills
+until the finalizer clears, by design — see `ffd.rs`), so a stuck finalizer
+permanently reduces effective fleet capacity for that cell.
+
+1. `kubectl get nodeclaims -o wide` — find the stuck object (the one with
+   the oldest `Age` past `deletionTimestamp`).
+2. `kubectl describe nodeclaim <name>` — check the `Disruption` and
+   `Termination` conditions for the blocker.
+3. Common causes: a non-draining DaemonSet pod (Karpenter waits for all
+   non-DS pods to evict, but a DS pod with `tolerations: ["*"]` can block
+   the Node delete); a stuck volume detach; the Karpenter controller
+   itself crashlooping.
+4. If the EC2 instance is already gone (spot interruption), the Karpenter
+   finalizer is waiting on a Node delete that never arrives: `kubectl
+   delete node <node-name> --force --grace-period=0`, then verify the
+   finalizer clears.
 
 ## Troubleshooting Matrix
 

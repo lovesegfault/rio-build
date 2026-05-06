@@ -207,6 +207,11 @@ in
         cd $TMPDIR/chart
         mkdir -p charts
         ln -s ${subcharts.postgresql} charts/postgresql
+        # 22-alert-quality.sh asserts every RioNodeclaimPool* alert has a
+        # runbook table row. The fragment sandbox only has the chart and
+        # nix/tests/helm/*.sh as build inputs — docs/ is unreachable —
+        # so stage the one runbook it cross-references.
+        cp ${../docs/src/runbooks/sla-model.md} $TMPDIR/chart/.runbook-sla-model.md
 
         for f in ${fragments}/*.sh; do
           echo "▸ helm-lint: $(basename "$f" .sh)" >&2

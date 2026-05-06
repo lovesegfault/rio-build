@@ -347,7 +347,7 @@ pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
         // would double-increment `nodeclaim_reaped_total` and double-
         // push the censored `IdleGapEvent`, biasing the NA-model
         // arrival rate low.
-        if n.terminating || !n.registered || reserved.contains(n.name.as_str()) {
+        if n.terminating() || !n.registered || reserved.contains(n.name.as_str()) {
             continue;
         }
         // Busy = Karpenter Empty=False, OR PodRequestedCache saw a
@@ -452,12 +452,12 @@ pub fn observe_idle_to_busy(
     // recorded here (r38 bug_031).
     let live_names: HashSet<&str> = live
         .iter()
-        .filter(|n| !n.terminating)
+        .filter(|n| !n.terminating())
         .map(|n| n.name.as_str())
         .collect();
     prev_idle.retain(|name, _| live_names.contains(name.as_str()));
     for n in live {
-        if n.terminating {
+        if n.terminating() {
             continue;
         }
         let idle = n.idle_secs(now_secs);
@@ -875,13 +875,13 @@ mod tests {
     /// rate up (holding nodes open longer than warranted).
     #[test]
     fn observe_idle_to_busy_skips_terminating() {
-        use super::super::ffd::tests::terminating;
+        use super::super::ffd::tests::set_terminating;
         let mut sk = CellSketches::default();
         let cell = Cell("h".into(), CapacityType::Spot);
         let mut prev_idle: HashMap<String, f64> = [("dying".into(), 80.0)].into();
         // Karpenter drain flips Empty=False AND sets deletionTimestamp
         // → naively this looks like an idle→busy edge.
-        let mut dying = terminating(with_conds(
+        let mut dying = set_terminating(with_conds(
             node("dying", "h", CapacityType::Spot, 8, 0, 0),
             &[("Registered", "True", 1000.0), ("Empty", "False", 1090.0)],
         ));

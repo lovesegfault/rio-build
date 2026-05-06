@@ -1465,7 +1465,7 @@ mod tests {
             name: format!("{h}-{}", cap.as_str()),
             node_name: None,
             registered: true,
-            terminating: false,
+            terminating_since: None,
             cell: Some(Cell(h.into(), cap)),
             instance_type: None,
             allocatable: (cores, 0, 0),
@@ -1505,7 +1505,7 @@ mod tests {
         // replacement claim consumes the SAME headroom the dying node
         // still occupies — never double-spend across the drain window.
         let mut dying = live_node("metal", CapacityType::Spot, 8);
-        dying.terminating = true;
+        dying.terminating_since = Some(0.0);
         assert_eq!(
             class_budget(100, Some(50), &[dying], "metal", 0),
             42,

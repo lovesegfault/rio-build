@@ -58,6 +58,7 @@ spec:
               idle for 5m. Check system/kind routing and ghost-executor
               accumulation.
 
+        {{- if .Values.buildScheduler.enabled }}
         # ADR-023 §13b: kube-build-scheduler second kube-scheduler.
         # Builder pods set `schedulerName: kube-build-scheduler`; if
         # THIS scheduler's active queue is non-empty for 60s, builder
@@ -65,6 +66,11 @@ spec:
         # RBAC drift, or NodeClaim deficit cover stalled). The default
         # kube-scheduler ignores kube-build-scheduler pods so they stay
         # Pending forever — page-worthy.
+        #
+        # r38 bug_002: gated on buildScheduler.enabled — the
+        # `kube-build-scheduler` job label only exists when the
+        # ServiceMonitor renders, so `absent()` (in KubeBuildSchedulerDown)
+        # would fire permanently with the component disabled.
         - alert: KubeBuildSchedulerPendingStuck
           # Upstream `scheduler_pending_pods` is labeled by `queue` only
           # (process-global SchedulingQueue, not per-profile). Select by
@@ -81,8 +87,12 @@ spec:
           # (~10m lead) WILL still false-positive — RioNodeclaimPoolStuckPending
           # owns the provisioning-stall signal; this alert covers the
           # post-registration scheduling stall. Tighten by gating with
-          # `unless on() RioNodeclaimPoolStuckPending` if the false rate
-          # is unacceptable.
+          # `unless on() (sum(rio_controller_nodeclaim_live{state="inflight"}) > 0)`
+          # — suppress while any NodeClaim is mid-boot, which is exactly
+          # the false-positive window — or raise `for:` past 3×maxLeadTime.
+          # Do NOT gate on RioNodeclaimPoolStuckPending: it fires at
+          # clamp(3×lead, 90, 1800)≈30m for metal, far past the ~10m
+          # healthy boot the false-positive names (r38 bug_030).
           for: 5m
           labels:
             severity: warning
@@ -109,6 +119,7 @@ spec:
               No `up==1` series for kube-build-scheduler for 5m. Builder
               pods with `schedulerName: kube-build-scheduler` cannot be
               bound. Check pod status, RBAC, ServiceMonitor selector.
+        {{- end }}
 
         # ADR-023 §Observability: prediction_ratio = actual/predicted
         # (dim=wall|mem; 1.0=perfect). Sustained p50 outside [0.5, 2.0]
@@ -319,20 +330,27 @@ spec:
         # finalizer clears, by design — see ffd.rs); FFD `simulate`
         # excludes it. Effective fleet capacity is permanently reduced
         # and `RioNodeclaimPoolStuckPending` (which watches in-flight
-        # age) won't fire. >5m is well past the ~60-90s finalizer drain.
+        # age) won't fire.
+        #
+        # r38 merged_001: keys on per-cell max age, NOT count — same
+        # rationale as RioNodeclaimPoolStuckPending. Under sustained
+        # scale-down (~1 reap/min, ~80s drain each) `live{state=
+        # terminating}` stays at 1-3 continuously; `terminating_age_max`
+        # never crosses 300s unless one claim is genuinely stuck.
         - alert: RioNodeclaimPoolStuckTerminating
-          expr: rio_controller_nodeclaim_live{state="terminating"} > 0
-          for: 5m
+          expr: rio_controller_nodeclaim_terminating_age_max_seconds > 300
+          for: 1m
           labels:
             severity: warning
           annotations:
             summary: NodeClaim stuck terminating (Karpenter finalizer not clearing)
             description: >-
-              {{`{{ $value | humanize }}`}} NodeClaim(s) in cell
-              {{`{{ $labels.cell }}`}} have had `metadata.deletionTimestamp`
-              set for >5m. Check the Karpenter controller and the Node's
-              drain/cordon state; `kubectl get nodeclaims -o wide` to find
-              the stuck object.
+              cell={{`{{ $labels.cell }}`}} has a NodeClaim
+              {{`{{ $value | humanizeDuration }}`}} past `metadata.deletionTimestamp`
+              without Karpenter's finalizer clearing. Check the Karpenter
+              controller and the Node's drain/cordon state;
+              `kubectl get nodeclaims -o wide` to find the stuck object.
+              See docs/src/runbooks/sla-model.md#rionodeclaimpool-stuckterminating.
 
         # Forward-compat: rio_store_putpath_retries_total lands in P0539d.
         # Until then this expr evaluates empty (no series) → never fires.
