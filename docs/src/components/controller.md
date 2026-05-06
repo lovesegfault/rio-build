@@ -365,6 +365,18 @@ missing toleration is a permanent Pending with no warn/metric, not a
 operator-set value defeats an unconditional merge), so no CEL admission
 guard is needed.
 
+r[ctrl.pool.builder-tolerations]
+The builder pod's tolerations MUST be the merge of the structural builder
+toleration (`rio.build/builder=true:NoSchedule`, the taint
+`cover::builder_taint()` stamps on every builder cell's NodeClaim) and the
+operator's `pool.spec.tolerations` (r38 bug_027 — sibling of
+`r[ctrl.pool.fetcher-tolerations]`), deduplicated. The operator MUST NOT
+be able to drop the structural toleration: the per-intent `nodeAffinity`
+(`r[ctrl.pool.node-affinity-from-intent]`) pins the pod to cover-minted
+nodes, every one of which carries the builder taint — a missing toleration
+is a permanent Pending with no warn/metric. Helm `mergeOverwrite` replaces
+list-typed `tolerations:`, so the merge MUST happen controller-side.
+
 r[ctrl.pool.hw-bench-needed+2]
 The pool reconciler MUST stamp `rio.build/hw-bench-needed` on the pod
 template at create time and expose it as `RIO_HW_BENCH_NEEDED` via a

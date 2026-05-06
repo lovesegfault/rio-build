@@ -287,56 +287,67 @@ fn taint_to_toleration(nt: rio_proto::types::NodeTaint) -> Toleration {
     }
 }
 
-/// §13e (mirrors r33 bug_011 for metal): pool-static fetcher
-/// toleration reads `taints_routing_to(FETCHER_TAINT_KEY)` instead of
-/// hardcoding `value=true`/`effect=NoSchedule`, so a future second
-/// taint on a fetcher class (e.g. `rio.build/egress-only`) routes its
-/// toleration automatically. Permissive — over-fire is harmless, and
-/// it's the cold-start fallback for `hw_class_names=[]`.
+/// §13e (mirrors r33 bug_011 for metal): pool-static structural
+/// toleration (fetcher OR builder) reads `taints_routing_to(...)` /
+/// the literal kind taint, and is MERGED with `pool.spec.tolerations`,
+/// never replaced.
 ///
-/// **r37 bug_001 (§Permissive-restrictive asymmetry — sibling of r35
-/// bug_044):** MERGE operator tolerations with the auto-injected
-/// fetcher set, never REPLACE. Pre-bug_044, dropping the auto-injected
-/// fetcher toleration weakened isolation but the pod still ran (no
-/// nodeSelector pinning it to tainted nodes). Post-bug_044,
-/// `effective_node_selector` unconditionally inserts
-/// `{rio.build/fetcher: true}` — the pod is pinned to fetcher nodes,
-/// every one of which carries `rio.build/fetcher:NoSchedule`. An
-/// operator setting `pool.spec.tolerations` (an AZ taint, an audit
-/// taint) would have dropped the fetcher toleration → permanent
-/// Pending with no warn/metric. Mirrors the `wants_metal` arm
-/// (append-with-dedup): operator tolerations ADD constraints, the
-/// fetcher one is structural.
+/// **r37 bug_001 (§Permissive-restrictive asymmetry — fetcher arm) +
+/// r38 bug_027 (sibling — builder arm):** both kinds carry a
+/// kind-derived structural taint on every cover-minted NodeClaim
+/// (`rio.build/fetcher` from `taints_routing_to`, `rio.build/builder`
+/// from `cover.rs::builder_taint()`). Helm `mergeOverwrite` REPLACES
+/// list-typed `pool.spec.tolerations`, so an operator setting any
+/// tolerations override (an AZ taint, an audit taint, or `[]`) drops
+/// the structural toleration. The pod is still pinned to the tainted
+/// nodes by `effective_node_selector` (fetcher) or per-intent
+/// `nodeAffinity` (builder) — toleration gone + affinity required =
+/// permanent Pending with no warn/metric. The merge is now
+/// UNCONDITIONAL — both arms append the structural set with dedup.
 ///
-/// No CEL guard needed: unlike `nodeSelector["rio.build/fetcher"]`
-/// (which an operator can set to `"false"` and weaken), tolerations
-/// are purely additive — there is no value the operator can set that
-/// breaks scheduling once the merge is unconditional.
+/// No CEL guard needed: tolerations are purely additive — there is no
+/// value the operator can set that breaks scheduling once the merge
+/// covers both arms.
 // r[impl ctrl.pool.intent-tolerations]
 // r[impl ctrl.pool.fetcher-tolerations]
+// r[impl ctrl.pool.builder-tolerations]
 fn effective_tolerations(pool: &Pool, hw: &HwClassConfig) -> Option<Vec<Toleration>> {
-    if !is_fetcher(pool) {
-        return pool.spec.tolerations.clone();
-    }
     let mut t = pool.spec.tolerations.clone().unwrap_or_default();
-    let mut fetcher_tols: Vec<Toleration> = hw
-        .taints_routing_to(rio_common::k8s::FETCHER_TAINT_KEY)
-        .into_iter()
-        .map(taint_to_toleration)
-        .collect();
-    if fetcher_tols.is_empty() {
-        // Cold-start: no fetcher hwClass loaded yet (or operator
-        // misconfig). Fall back to the literal taint so fetcher pods
-        // can tolerate the static node taint during bootstrap. Mirrors
-        // `wants_metal`'s literal `kvm` floor — fail-OPEN.
-        fetcher_tols.push(Toleration {
-            key: Some(rio_common::k8s::FETCHER_TAINT_KEY.into()),
-            operator: Some("Exists".into()),
+    let mut structural: Vec<Toleration> = if is_fetcher(pool) {
+        let mut tols: Vec<Toleration> = hw
+            .taints_routing_to(rio_common::k8s::FETCHER_TAINT_KEY)
+            .into_iter()
+            .map(taint_to_toleration)
+            .collect();
+        if tols.is_empty() {
+            // Cold-start: no fetcher hwClass loaded yet. Literal floor
+            // (mirrors `wants_metal`'s `kvm` fallback — fail-OPEN).
+            tols.push(Toleration {
+                key: Some(rio_common::k8s::FETCHER_TAINT_KEY.into()),
+                operator: Some("Exists".into()),
+                effect: Some("NoSchedule".into()),
+                ..Default::default()
+            });
+        }
+        tols
+    } else {
+        // Builder: every cover-minted builder NodeClaim carries
+        // `rio.build/builder=true:NoSchedule` (cover.rs::builder_taint()).
+        // The builder taint is NOT in hwClass config (cover.rs:448-452
+        // TODO — it's hardcoded in cover, not declared per-class), so
+        // `taints_routing_to("rio.build/builder")` is always empty.
+        // Use the literal toleration. When the cover.rs TODO is closed
+        // (single-source through hwClass config), this arm collapses
+        // into a single `taints_routing_to(builder_taint_key)` call.
+        vec![Toleration {
+            key: Some("rio.build/builder".into()),
+            operator: Some("Equal".into()),
+            value: Some("true".into()),
             effect: Some("NoSchedule".into()),
             ..Default::default()
-        });
-    }
-    for tol in fetcher_tols {
+        }]
+    };
+    for tol in structural.drain(..) {
         if !t.contains(&tol) {
             t.push(tol);
         }
@@ -776,8 +787,10 @@ pub fn build_executor_pod_spec(
             // Derive the taint set from the SAME map `cover` reads
             // (r33 bug_011); literal kvm floor is fail-OPEN under
             // unloaded config (mirrors `wants_metal`'s literal `"kvm"`
-            // floor). Append-dedup so the operator-set
-            // `rio.build/builder` toleration survives.
+            // floor). Append-dedup so the structural
+            // `rio.build/builder` toleration (now injected by
+            // `effective_tolerations`, not operator-supplied — r38
+            // bug_027) survives.
             if wants_metal(pool, hw_config) {
                 let mut metal_tols: Vec<Toleration> = hw_config
                     .taints_routing_to(KVM_NODE_LABEL)
@@ -1714,6 +1727,56 @@ mod tests {
                 .any(|t| t.key.as_deref() == Some(rio_common::k8s::FETCHER_TAINT_KEY)),
             "fetcher taint toleration present when operator sets `tolerations: []`: \
              {tols_empty:?}"
+        );
+    }
+
+    /// r38 bug_027 (§Permissive-restrictive asymmetry — sibling of r37
+    /// bug_001 for the builder arm): builder pod operator tolerations
+    /// MERGE with the structural `rio.build/builder` toleration, not
+    /// replace.
+    ///
+    /// This is the pair-coupling invariant for the builder arm: every
+    /// cover-minted builder NodeClaim carries
+    /// `rio.build/builder=true:NoSchedule` (`cover.rs::builder_taint()`),
+    /// and the per-intent `nodeAffinity`
+    /// (`r[ctrl.pool.node-affinity-from-intent]`) pins the pod to those
+    /// nodes — so the effective tolerations MUST include the builder
+    /// toleration for all spec values, or the pod is permanently
+    /// Pending with no warn/metric.
+    // r[verify ctrl.pool.builder-tolerations]
+    #[test]
+    fn builder_pod_operator_tolerations_merge_not_replace() {
+        let hw = HwClassConfig::default();
+        let mut p = crate::fixtures::test_pool("b", ExecutorKind::Builder);
+        let custom = Toleration {
+            key: Some("custom.example/audit".into()),
+            operator: Some("Exists".into()),
+            effect: Some("NoSchedule".into()),
+            ..Default::default()
+        };
+        p.spec.tolerations = Some(vec![custom.clone()]);
+        let tols = effective_tolerations(&p, &hw).expect("builder pod tolerations");
+        assert!(tols.contains(&custom), "operator toleration preserved");
+        assert!(
+            tols.iter()
+                .any(|t| t.key.as_deref() == Some("rio.build/builder")),
+            "builder taint toleration always present — per-intent \
+             nodeAffinity pins to cover-minted nodes carrying \
+             rio.build/builder:NoSchedule; dropping the toleration is \
+             permanent Pending: {tols:?}"
+        );
+
+        // `Some(vec![])` — operator explicitly clears tolerations.
+        // The most surprising trigger: the pre-fix builder arm returned
+        // `Some(vec![])` and the pod was permanently Pending.
+        let mut p_empty = crate::fixtures::test_pool("b-empty", ExecutorKind::Builder);
+        p_empty.spec.tolerations = Some(vec![]);
+        let tols_empty = effective_tolerations(&p_empty, &hw).expect("builder pod tolerations");
+        assert!(
+            tols_empty
+                .iter()
+                .any(|t| t.key.as_deref() == Some("rio.build/builder")),
+            "builder taint toleration present when operator sets `tolerations: []`"
         );
     }
 

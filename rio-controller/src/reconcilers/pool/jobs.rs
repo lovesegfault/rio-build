@@ -1061,7 +1061,8 @@ fn apply_intent_resources(
     // only. Fetcher pools DO carry a pool-static `rio.build/fetcher`
     // selector (r35 B4 — see `pod::effective_node_selector`), keyed
     // on `pool.spec.kind`, not `hw_class_names`.) Append-dedup so the
-    // operator-set `rio.build/builder` toleration and the pool-static
+    // structural `rio.build/builder` toleration (injected by
+    // `pod::effective_tolerations` — r38 bug_027) and the pool-static
     // kvm toleration both survive without duplication.
     let mut intent_tols: Vec<Toleration> = Vec::new();
     for h in &i.hw_class_names {
