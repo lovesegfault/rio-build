@@ -42,8 +42,13 @@ llvm                     aarch64-linux  acme         mem    0.312
 ```
 
 The ring is in-memory (this leader's tenure only) and fills as builds
-with a fitted curve complete. If empty, fall back to `rio-cli sla list`
-and inspect high-traffic keys manually.
+with a fitted curve complete. If empty (cold start, leader just
+failed over, or no builds with a fit yet), fall back to
+`rio-cli sla export-corpus -o /dev/stdout --min-n 5` to enumerate
+pnames the estimator HAS fitted, then `sla status` each.
+`sla list` lists **operator overrides** only — on a cluster with no
+overrides it prints `(no overrides)` and gives no signal about which
+pname is misbehaving.
 
 For each suspect pname, dump the cached fit:
 
@@ -234,7 +239,8 @@ defaults` shows the current probe shape.
 `rio_scheduler_sla_hw_cost_stale_seconds > 1800` for 5m. The spot-price poller
 hasn't refreshed in >30m (it ticks every 10m; auto-clamp to helm seed at 60m).
 Not a model-accuracy issue — cost ranking degrades, not sizing. Check
-scheduler leader-lease (`kubectl -n rio-system get lease rio-scheduler`) and
+scheduler leader-lease (`kubectl -n rio-system get lease rio-scheduler-leader`
+— the name is `helm:scheduler.leaseName`, not the Deployment name) and
 `ec2:DescribeSpotPriceHistory` IRSA permissions. Cross-reference
 `rio_scheduler_sla_hw_cost_fallback_total{reason}`.
 
