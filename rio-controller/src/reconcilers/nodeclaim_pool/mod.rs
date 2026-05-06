@@ -247,6 +247,18 @@ pub struct NodeClaimPoolConfig {
     /// §13b consolidator hold-open ceiling (seconds). `None` =
     /// 2×`consolidate_after()` per ADR. Helm: not currently surfaced.
     pub max_consolidation_time: Option<f64>,
+    /// r35 bug_050: per-hw-class-prefix `consolidate_after` floor
+    /// (seconds). §13e routed Fetcher Pools through `nodeclaim_pool`,
+    /// silently dropping Karpenter's `consolidateAfter: 10m` to the
+    /// NA-model floor `boot_median/2` (~15s) — a fetcher node burns a
+    /// boot every 15s of lull instead of holding 10min. The NA model is
+    /// correct (it observed the right λ); the *policy floor* was lost
+    /// in the migration. Keys are class names or `<prefix>*` globs
+    /// matched against `cell.0` (most-specific exact match wins, then
+    /// longest prefix). Default `{"fetcher-*": 600.0}` restores the
+    /// pre-§13e Karpenter behavior. Helm:
+    /// `karpenter.nodeclaimPool.minConsolidationTime`.
+    pub min_consolidation_time: HashMap<String, f64>,
     /// `(hw_class:cap)` → seed lead-time seconds, written by
     /// `xtask k8s probe-boot`. Seeds the DDSketch on cold start.
     /// Helm: `sla.leadTimeSeed`.
@@ -295,6 +307,27 @@ impl NodeClaimPoolConfig {
             .get(&cell.to_string())
             .copied()
             .unwrap_or(self.default_lead_time_seed)
+    }
+
+    /// r35 bug_050: `min_consolidation_time[cell]` — the operator floor
+    /// for `consolidate::consolidate_after`. `None` when no entry
+    /// matches `cell.0`. Lookup precedence: exact hw-class match wins,
+    /// then the longest matching `<prefix>*` glob. (HashMap iteration
+    /// order is unstable; the longest-prefix rule keeps overlapping
+    /// globs deterministic.)
+    pub fn min_consolidation_time_for(&self, cell: &Cell) -> Option<f64> {
+        if let Some(&v) = self.min_consolidation_time.get(&cell.0) {
+            return Some(v);
+        }
+        self.min_consolidation_time
+            .iter()
+            .filter_map(|(k, &v)| {
+                k.strip_suffix('*')
+                    .filter(|p| cell.0.starts_with(p))
+                    .map(|p| (p.len(), v))
+            })
+            .max_by_key(|&(len, _)| len)
+            .map(|(_, v)| v)
     }
 
     /// Cold-start fallback cell for an hw-agnostic intent
@@ -392,6 +425,10 @@ impl Default for NodeClaimPoolConfig {
             max_node_claims_per_cell_per_tick: 8,
             max_lead_time: 600.0,
             max_consolidation_time: None,
+            // r35 bug_050: Karpenter `consolidateAfter: 10m` parity for
+            // fetcher cells. Builder cells unfloored — the NA model's
+            // boot_median/2 (~10–25s) is the right grace there.
+            min_consolidation_time: HashMap::from([("fetcher-*".into(), 600.0)]),
             lead_time_seed: HashMap::new(),
             // Matches helm `sla.defaultLeadTimeSeed` default. Non-zero
             // so an unseeded cell's `health::classify` timeout (2×seed)
@@ -910,6 +947,10 @@ impl NodeClaimPoolReconciler {
             &placeable,
             &mut self.sketches,
             &self.cfg,
+            |h, a, f| {
+                self.hw_config.matches_arch(h, a)
+                    && rio_common::k8s::features_compatible(f, &self.hw_config.provides_for(h))
+            },
             now,
         )
         .await?;
@@ -937,6 +978,10 @@ impl NodeClaimPoolReconciler {
             &[],
             &mut self.sketches,
             &self.cfg,
+            |h, a, f| {
+                self.hw_config.matches_arch(h, a)
+                    && rio_common::k8s::features_compatible(f, &self.hw_config.provides_for(h))
+            },
             now,
         )
         .await?;
@@ -1404,6 +1449,58 @@ mod tests {
         // health::classify timeout (2×seed) covers ~18s real boot.
         assert_eq!(d.default_lead_time_seed, 30.0);
         assert_eq!(d.seed_for(&Cell("nope".into(), CapacityType::Spot)), 30.0);
+        // r35 bug_050: default fetcher floor restores the pre-§13e
+        // Karpenter `consolidateAfter: 10m` policy via the prefix glob.
+        assert_eq!(
+            d.min_consolidation_time_for(&Cell("fetcher-x86".into(), CapacityType::Spot)),
+            Some(600.0)
+        );
+        assert_eq!(
+            d.min_consolidation_time_for(&Cell("hi-ebs-x86".into(), CapacityType::Spot)),
+            None,
+            "builder cells unfloored by default"
+        );
+    }
+
+    /// r35 bug_050: `min_consolidation_time_for` lookup precedence.
+    /// Exact hw-class match wins over any glob; among globs, the
+    /// longest prefix wins (HashMap iteration order is unstable — a
+    /// shorter-glob-wins outcome would be a determinism bug). A key
+    /// that does NOT end with `*` is an EXACT match only; an operator
+    /// who writes `"fetcher": 600.0` expecting a glob gets a silent
+    /// no-match — the doc names this, and this test pins it.
+    #[test]
+    fn min_consolidation_time_lookup_precedence() {
+        let cfg = NodeClaimPoolConfig {
+            min_consolidation_time: HashMap::from([
+                ("fetcher-x86".into(), 100.0), // exact
+                ("fetcher-*".into(), 200.0),   // glob, prefix len 8
+                ("fetcher*".into(), 300.0),    // glob, prefix len 7
+                ("metal".into(), 400.0),       // exact, no `*` — NOT a glob
+            ]),
+            ..Default::default()
+        };
+        let cell = |h: &str| Cell(h.into(), CapacityType::Spot);
+        // Exact wins over both globs.
+        assert_eq!(
+            cfg.min_consolidation_time_for(&cell("fetcher-x86")),
+            Some(100.0)
+        );
+        // No exact → longest matching glob prefix wins (8 > 7).
+        assert_eq!(
+            cfg.min_consolidation_time_for(&cell("fetcher-arm")),
+            Some(200.0)
+        );
+        // Only the shorter glob matches (no `-` after `fetcher`).
+        assert_eq!(
+            cfg.min_consolidation_time_for(&cell("fetchernvme")),
+            Some(300.0)
+        );
+        // `"metal"` without `*` is exact-only — does NOT match `metal-x86`.
+        assert_eq!(cfg.min_consolidation_time_for(&cell("metal-x86")), None);
+        assert_eq!(cfg.min_consolidation_time_for(&cell("metal")), Some(400.0));
+        // Unmatched cell → None.
+        assert_eq!(cfg.min_consolidation_time_for(&cell("hi-ebs-x86")), None);
     }
 
     /// `fallback_cell`: prefers `(reference_hw_class, Spot)` when its

@@ -93,11 +93,6 @@ const READ_ONLY_ROOT_MOUNTS: &[(&str, &str, Option<&str>, Option<&str>)] = &[
 /// for Builder kind.
 pub(crate) const BUILDER_FUSE_CACHE_BYTES: u64 = 8 * (1 << 30);
 
-/// Default FUSE cache size for fetchers. FODs are typically small
-/// (source tarballs, git clones). Safe-minimum CRD default; prod
-/// inherits the helm `poolDefaults.fuseCacheBytes` 50Gi.
-pub(super) const FETCHER_FUSE_CACHE_BYTES: u64 = 4 * (1 << 30);
-
 /// Set once at boot from `[nodeclaim_pool].fuse_cache_bytes` so
 /// `fuse_cache_bytes()` for Builder pools, `intent_pod_footprint`'s
 /// callers in `nodeclaim_pool` (FFD,
@@ -109,21 +104,32 @@ pub static BUILDER_FUSE_CACHE: std::sync::OnceLock<u64> = std::sync::OnceLock::n
 
 /// Per-pool FUSE cache budget. Drives BOTH the `fuse-cache` emptyDir
 /// sizeLimit and the `ephemeral-storage` budget addend so they cannot
-/// drift. Builder pools single-source from [`BUILDER_FUSE_CACHE`]
-/// (= `[nodeclaim_pool].fuse_cache_bytes`) so FFD/cover/stamp agree;
-/// `PoolSpec.fuse_cache_bytes` is CEL-rejected for Builder kind, and
-/// pre-CEL CRs are ignored here with a Warning event
-/// (`DEGRADE_CHECKS::BuilderFuseCacheBytesIgnored`). Fetcher pools may
-/// override per-pool — Fetcher doesn't go through `nodeclaim_pool`.
+/// drift. ALL pools single-source from [`BUILDER_FUSE_CACHE`]
+/// (= `[nodeclaim_pool].fuse_cache_bytes`) so FFD/cover/stamp agree
+/// (§Simulator-shares-accounting). `PoolSpec.fuse_cache_bytes` is
+/// CEL-rejected for both kinds; pre-CEL CRs are ignored here with a
+/// Warning event (`DEGRADE_CHECKS::*FuseCacheBytesIgnored`).
+///
+/// r35 merged_bug_024: §13e routed Fetcher Pools through
+/// `nodeclaim_pool` — FFD/cover read `cfg.fuse_cache_bytes` for
+/// fetcher cells too, so a per-Pool Fetcher override would diverge the
+/// FFD fit-check from the stamped pod request (the same drift mb_035
+/// closed for Builder).
+//
+// TODO: per-kind `FETCHER_FUSE_CACHE` OnceLock fed from a new
+// `[nodeclaim_pool].fetcher_fuse_cache_bytes` (default 4 GiB) +
+// `intent_pod_footprint(i, kind, ...)`. With the OnceLock set in prod,
+// fetcher pods reserve `BUILDER_FUSE_CACHE` (50 GiB) instead of the
+// ~4 GiB FODs actually need, ~12× over-allocating ephemeral-storage —
+// safe direction (under-packs nodes, doesn't break builds) but
+// expensive at chromium-scale fan-out. Add once
+// `rio_controller_nodeclaim_idle_cores` shows the bin-packing
+// regression in prod.
 pub(super) fn fuse_cache_bytes(pool: &Pool) -> u64 {
     match pool.spec.kind {
-        ExecutorKind::Builder => *BUILDER_FUSE_CACHE
+        ExecutorKind::Builder | ExecutorKind::Fetcher => *BUILDER_FUSE_CACHE
             .get()
             .unwrap_or(&BUILDER_FUSE_CACHE_BYTES),
-        ExecutorKind::Fetcher => pool
-            .spec
-            .fuse_cache_bytes
-            .unwrap_or(FETCHER_FUSE_CACHE_BYTES),
     }
 }
 

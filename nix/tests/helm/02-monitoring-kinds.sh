@@ -45,13 +45,18 @@ grep -A4 'alert: RioNodeclaimPoolBootTimeoutLoop' "$out" \
 # r34 bug_017 (§Partition-single-source): the StuckPending clamp cap
 # must derive from `maxLeadTime`, not a hardcoded literal — the
 # invariant `cap >= 2×maxLeadTime` is load-bearing (the alert must
-# fire AFTER the reaper, which acts at 2×seed<=2×maxLeadTime). The
-# BootTimeoutLoop window also derives from the same constant.
+# fire AFTER the reaper, which acts at 2×seed<=2×maxLeadTime).
+# r35 merged_bug_027: BootTimeoutLoop's increase() window is
+# `4×maxLeadTime` = 2 full reap cycles (StuckPending stays `3×`) — the
+# r34 `3×` window spanned only 1.5 cycles when seed=maxLeadTime (metal
+# cells), giving `>= 2` a ~50% duty cycle and a flapping alert.
 expected_cap=$(( 3 * $(yq '.scheduler.sla.maxLeadTime' values.yaml) ))
+expected_window=$(( 4 * $(yq '.scheduler.sla.maxLeadTime' values.yaml) ))
 # Mirror the {{ max 90 ... }} floor in the template: a maxLeadTime < 30
 # would render a window/cap < 90, which is degenerate (Prometheus rejects
 # `[0s]` ranges; clamp(v, min, max) returns empty when min > max).
 [ "$expected_cap" -lt 90 ] && expected_cap=90
+[ "$expected_window" -lt 90 ] && expected_window=90
 grep -A4 'alert: RioNodeclaimPoolStuckPending' "$out" \
   | grep -q "clamp(.*, 90, ${expected_cap})" || {
   echo "FAIL: RioNodeclaimPoolStuckPending clamp cap != 3×maxLeadTime"  \
@@ -60,9 +65,10 @@ grep -A4 'alert: RioNodeclaimPoolStuckPending' "$out" \
   exit 1
 }
 grep -A4 'alert: RioNodeclaimPoolBootTimeoutLoop' "$out" \
-  | grep -q "\[${expected_cap}s\]" || {
-  echo "FAIL: BootTimeoutLoop increase() window != 3×maxLeadTime"       \
-    "(expected [${expected_cap}s]; window must span >= 1 reap cycle"     \
-    "= 2×seed <= 2×maxLeadTime)" >&2
+  | grep -q "\[${expected_window}s\]" || {
+  echo "FAIL: BootTimeoutLoop increase() window != 4×maxLeadTime"          \
+    "(expected [${expected_window}s]; window must span 2 full reap cycles" \
+    "= 2×(2×seed) <= 4×maxLeadTime so >= 2 reaps holds for the entire"     \
+    "sustained loop, not just ~50% of it; r35 merged_bug_027)" >&2
   exit 1
 }

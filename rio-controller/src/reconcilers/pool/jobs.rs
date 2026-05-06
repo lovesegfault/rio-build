@@ -1268,6 +1268,60 @@ mod tests {
         assert_eq!(q("ephemeral-storage"), fd);
     }
 
+    /// r35 merged_bug_024 (§Simulator-shares-accounting): the SAME
+    /// guarantee for Fetcher Pools. §13e routed Fetcher Pools through
+    /// `nodeclaim_pool` — FFD/cover read `[nodeclaim_pool].fuse_cache_
+    /// bytes` (the global), while a Fetcher Pool's `spec.fuseCacheBytes`
+    /// override fed the stamp side directly. The two diverge → FFD
+    /// fit-checks against a different ephemeral-storage triple than the
+    /// pod actually requests. Single-source from `BUILDER_FUSE_CACHE`
+    /// (the same OnceLock Builder pools use) closes the gap.
+    #[test]
+    fn footprint_matches_stamped_requests_fetcher() {
+        const GI: u64 = 1 << 30;
+        let mut pool = test_pool("p", ExecutorKind::Fetcher);
+        // Pre-CEL CR sets a per-pool override. Post-r35 this is silently
+        // ignored — `pod::fuse_cache_bytes` reads the global OnceLock.
+        pool.spec.fuse_cache_bytes = Some(6 * GI);
+        let i = SpawnIntent {
+            intent_id: "x".into(),
+            cores: 1,
+            mem_bytes: 4 * GI,
+            disk_bytes: 8 * GI,
+            disk_headroom_factor: Some(1.5),
+            ..Default::default()
+        };
+        let j = job(&pool, &i);
+        let spec = j
+            .spec
+            .as_ref()
+            .and_then(|s| s.template.spec.as_ref())
+            .unwrap();
+        let req = spec.containers[0]
+            .resources
+            .as_ref()
+            .and_then(|r| r.requests.as_ref())
+            .unwrap();
+        let q = |k: &str| req[k].0.parse::<u64>().unwrap();
+        // The production input source for FFD/cover_deficit is
+        // `cfg.fuse_cache_bytes` (= `BUILDER_FUSE_CACHE`). The stamp
+        // side MUST read the same — a per-pool override would make the
+        // pod request a different ephemeral-storage triple than FFD
+        // fit-checked.
+        let cfg_fuse = *pod::BUILDER_FUSE_CACHE
+            .get()
+            .unwrap_or(&pod::BUILDER_FUSE_CACHE_BYTES);
+        assert_eq!(
+            pod::fuse_cache_bytes(&pool),
+            cfg_fuse,
+            "Fetcher pool fuse_cache_bytes single-sourced from BUILDER_FUSE_CACHE              (per-Pool override defeats §Simulator-shares-accounting)"
+        );
+        let (fc, fm, fd) = intent_pod_footprint(&i, cfg_fuse);
+        assert_eq!(q("cpu"), u64::from(fc));
+        assert_eq!(q("memory"), fm);
+        assert_eq!(q("ephemeral-storage"), fd);
+    }
+
     /// mb_022: a Builder Pool that sets `fuseCacheBytes` (pre-CEL CR)
     /// is silently ignored at the value-read site — `fuse_cache_bytes`
     /// reads `BUILDER_FUSE_CACHE` regardless. The Warning event is
@@ -1286,10 +1340,18 @@ mod tests {
             cfg_fuse,
             "Builder ignores spec.fuseCacheBytes — single-sourced from BUILDER_FUSE_CACHE"
         );
-        // Fetcher may override.
+        // r35 merged_bug_024: Fetcher Pool ALSO ignores spec.fuseCacheBytes
+        // — single-sourced from BUILDER_FUSE_CACHE. §13e routed Fetcher
+        // Pools through nodeclaim_pool, so a per-Pool override would
+        // make FFD/cover predict a different ephemeral-storage footprint
+        // than the pod actually stamps.
         let mut f = test_pool("f", ExecutorKind::Fetcher);
         f.spec.fuse_cache_bytes = Some(100 * (1 << 30));
-        assert_eq!(pod::fuse_cache_bytes(&f), 100 * (1 << 30));
+        assert_eq!(
+            pod::fuse_cache_bytes(&f),
+            cfg_fuse,
+            "Fetcher ignores spec.fuseCacheBytes — single-sourced from BUILDER_FUSE_CACHE"
+        );
     }
 
     /// `apply_intent_resources` injects `RIO_DAEMON_TIMEOUT_SECS =
@@ -1595,23 +1657,27 @@ mod tests {
     /// `disk_p90` (overlay prjquota only) never learns the input-
     /// closure size, so every fresh drv_hash re-climbs the floor.
     ///
-    /// Third arm: `PoolSpec.fuse_cache_bytes` override is honoured for
-    /// BOTH sites — helm-rendered prod Pools set 50Gi, which would make
-    /// every pod request ≥51Gi ephemeral-storage on small-disk nodes
-    /// (k3s VM tests) without the override.
+    /// r35 merged_bug_024: `PoolSpec.fuse_cache_bytes` is IGNORED for
+    /// both kinds — single-sourced from `BUILDER_FUSE_CACHE` so
+    /// FFD/cover/stamp agree (§Simulator-shares-accounting). The
+    /// emptyDir sizeLimit and the `ephemeral-storage` addend both read
+    /// the same value so they cannot drift even within one kind.
     #[test]
     fn fuse_cache_budget_matches_sizelimit() {
         const GI: u64 = 1 << 30;
-        let builder_fuse = *pod::BUILDER_FUSE_CACHE
+        let cfg_fuse = *pod::BUILDER_FUSE_CACHE
             .get()
             .unwrap_or(&pod::BUILDER_FUSE_CACHE_BYTES);
         for (kind, override_, expect) in [
-            (ExecutorKind::Builder, None, builder_fuse),
-            (ExecutorKind::Fetcher, None, pod::FETCHER_FUSE_CACHE_BYTES),
+            (ExecutorKind::Builder, None, cfg_fuse),
+            (ExecutorKind::Fetcher, None, cfg_fuse),
             // mb_035: Builder ignores PoolSpec override (single-sourced).
-            (ExecutorKind::Builder, Some(4 * GI), builder_fuse),
-            // Fetcher honours per-pool override.
-            (ExecutorKind::Fetcher, Some(6 * GI), 6 * GI),
+            (ExecutorKind::Builder, Some(4 * GI), cfg_fuse),
+            // r35 merged_bug_024: Fetcher ALSO ignores PoolSpec override —
+            // §13e routes Fetcher Pools through nodeclaim_pool, so the
+            // override would make FFD predict a different footprint than
+            // the pod stamps.
+            (ExecutorKind::Fetcher, Some(6 * GI), cfg_fuse),
         ] {
             let mut pool = test_pool("p", kind);
             pool.spec.fuse_cache_bytes = override_;

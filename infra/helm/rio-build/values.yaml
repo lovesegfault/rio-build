@@ -736,10 +736,12 @@ scheduler:
       # .metal POST + firmware + kubelet boot. Observed metal boot is
       # typically 7–15 min; if 1200s proves too tight raise `maxLeadTime`
       # first (it caps the seed). The `RioNodeclaimPoolStuckPending`
-      # alert clamp ceiling and the `RioNodeclaimPoolBootTimeoutLoop`
-      # window both derive from `maxLeadTime` (3×, see
-      # prometheusrule.yaml) so they stay >= 2×maxLeadTime structurally
-      # — no manual coordination needed when raising it. The clamp
+      # alert clamp ceiling (3×maxLeadTime) and the
+      # `RioNodeclaimPoolBootTimeoutLoop` increase() window
+      # (4×maxLeadTime = 2 reap cycles; r35 merged_bug_027) both derive
+      # from `maxLeadTime` (see prometheusrule.yaml) so they stay
+      # >= 2×maxLeadTime structurally — no manual coordination needed
+      # when raising it. The clamp
       # keeps a structural 90s floor in case `maxLeadTime` is ever set
       # below 30 (Prometheus `clamp(v, min, max)` returns an empty
       # vector when min > max). (bug_015, bug_001, r34 bug_017)
@@ -864,6 +866,17 @@ karpenter:
   enabled: false
   nodeclaimPool:
     leaseName: rio-controller-nodeclaim-pool
+    # r35 bug_050: per-hw-class-prefix `consolidate_after` floor
+    # (seconds). §13e routed Fetcher Pools through the nodeclaim_pool
+    # reconciler, dropping Karpenter's `consolidateAfter: 10m` to the
+    # NA-model's `boot_median/2` (~15s) — a fetcher node burns a boot
+    # every 15s of lull instead of holding 10min. The NA model is
+    # correct (it observes the right λ); the *policy floor* was lost in
+    # the migration. Keys are class names or `<prefix>*` globs matched
+    # against the hw-class half of the cell. Builder cells unfloored —
+    # the NA model's boot_median/2 is the right grace there.
+    minConsolidationTime:
+      "fetcher-*": 600.0
   clusterName: ""   # from tofu output cluster_name
   nodeRoleName: ""  # from tofu output karpenter_node_role_name
   # ADR-021: NixOS node AMI (full cutover — no Bottlerocket). The
@@ -915,6 +928,19 @@ karpenter:
     # gate moved to per-class `maxFleetCores`; the global
     # `sla.maxFleetCores` was bumped to absorb it (see comment there).
     # The only static NodePool left is `rio-general` (control-plane).
+    #
+    # r35 bug_050: the deleted NodePool's `consolidateAfter: 10m` had no
+    # NA-model equivalent — `consolidate_after()` floors at
+    # `boot_median/2` (~15s for fetcher cells), so the migration silently
+    # turned a 10min idle grace into ~15s and burned a boot per lull.
+    # `karpenter.nodeclaimPool.minConsolidationTime` (above) restores the
+    # operator policy floor. Even with the knob, fetcher idle behavior is
+    # now NA-model-driven (Karpenter never observed arrival rate); the
+    # knob is a *floor* the model can exceed, not an exact replacement.
+    # If fetcher boot-thrash shows in `rio_controller_nodeclaim_reaped_
+    # total{reason=idle, cell=~"fetcher-.*"}` despite the floor, raise it
+    # — the model floor protects against transient lulls, the knob
+    # protects against the operator's idle-cost tolerance.
 
     # General: untainted, for future gateway/scheduler HPA overflow.
     # System nodegroup (min=3 max=5) handles today's load; this absorbs

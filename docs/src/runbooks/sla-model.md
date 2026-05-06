@@ -258,8 +258,8 @@ but kubelet never joined (AMI / nodeadm / CNI break). Not model-related;
 
 ### RioNodeclaimPool BootTimeoutLoop
 
-A cell has reaped ≥2 NodeClaims with `reason=boot-timeout` in a 3×maxLeadTime
-window (default 1800s) for 5 minutes. `cover_deficit` mints a NodeClaim, kubelet
+A cell has reaped ≥2 NodeClaims with `reason=boot-timeout` in a 4×maxLeadTime
+window (default 2400s) for 5 minutes. `cover_deficit` mints a NodeClaim, kubelet
 never registers within the 2×seed boot timeout, `health::classify` reaps it
 (`ReapReason::BootTimeout` — NOT ICE-masked, since capacity exists and the
 *boot* failed), and `cover_deficit` re-mints. The loop is unbounded: each
@@ -269,8 +269,10 @@ completing and the kvm/nixos-test queue growing.
 Distinct from `StuckPending` (which fires when the *reaper* fails) — this
 alert fires when the reaper succeeds repeatedly. The `>= 2` count gate
 distinguishes a one-off slow boot (1 reap, never fires) from a sustained
-loop; the 3×maxLeadTime window always spans at least one full reap cycle
-(`2×seed ≤ 2×maxLeadTime`).
+loop; the 4×maxLeadTime window spans 2 full reap cycles
+(`2×(2×seed) ≤ 4×maxLeadTime`) so the alert holds — not flaps — for the
+loop's duration (r35 merged_bug_027; the old 3× window had a ~50% duty
+cycle when `seed = maxLeadTime`).
 
 Likely causes: broken AMI image (post-release), nodeadm regression, EC2
 firmware update, NVMe reorder breaking instance-store mounts. Diagnose:

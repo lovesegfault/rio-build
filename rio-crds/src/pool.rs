@@ -175,6 +175,13 @@ impl ExecutorKind {
         "kind=Builder forbids fuseCacheBytes — Builder pools single-source from controller [nodeclaim_pool].fuse_cache_bytes so FFD/cover/stamp agree (mb_035)"
     )
 )]
+#[x_kube(
+    validation = Rule::new(
+        "self.kind != 'Fetcher' || !has(self.fuseCacheBytes)"
+    ).message(
+        "kind=Fetcher forbids fuseCacheBytes — §13e routes Fetcher Pools through nodeclaim_pool; per-pool override would diverge FFD from the stamped pod request (r35 merged_bug_024)"
+    )
+)]
 pub struct PoolSpec {
     /// Builder or Fetcher. Required — there is no sensible default
     /// (the two have opposite network postures).
@@ -234,11 +241,12 @@ pub struct PoolSpec {
     /// `fuse-cache` emptyDir sizeLimit AND the matching addend to the
     /// container's `ephemeral-storage` request/limit (kubelet sums
     /// disk-backed emptyDirs against that limit, so the two MUST agree).
-    /// Fetcher-only — Builder pools single-source from controller
-    /// `[nodeclaim_pool].fuse_cache_bytes` so FFD/cover/stamp agree
-    /// (mb_035); CEL rejects the field for Builder, and pre-CEL CRs are
-    /// ignored with a Warning event. `None` = 4Gi safe-minimum so
-    /// non-helm Fetcher Pools schedule on small-disk clusters.
+    /// CEL-rejected for BOTH kinds — all pools single-source from
+    /// controller `[nodeclaim_pool].fuse_cache_bytes` so FFD/cover/stamp
+    /// agree (§Simulator-shares-accounting). Builder: mb_035. Fetcher:
+    /// r35 merged_bug_024, after §13e routed Fetcher Pools through the
+    /// same NodeClaim accounting path. Pre-CEL CRs setting it are
+    /// ignored with a Warning event (`*FuseCacheBytesIgnored`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuse_cache_bytes: Option<u64>,
 
@@ -443,6 +451,15 @@ mod tests {
             (
                 "self.kind != 'Fetcher' || !has(self.features) || size(self.features) == 0",
                 "kind=Fetcher forbids spec.features",
+            ),
+            // r35 merged_bug_024: Fetcher fuseCacheBytes single-sourced
+            // from BUILDER_FUSE_CACHE — §13e routes Fetcher Pools through
+            // nodeclaim_pool, so a per-Pool override would diverge FFD
+            // from the stamped pod request (the same drift mb_035 closed
+            // for Builder).
+            (
+                "self.kind != 'Fetcher' || !has(self.fuseCacheBytes)",
+                "kind=Fetcher forbids fuseCacheBytes",
             ),
         ];
         // Count guard: ties the assertion list to the actual rendered

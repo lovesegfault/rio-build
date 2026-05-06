@@ -225,16 +225,19 @@ spec:
         # loop (mixed with bug_001's healthy-boot false positives); this
         # is the dedicated sibling for the loop signal.
         #
-        # Window 3×maxLeadTime > worst-case reap cycle 2×seed (seed ≤
-        # maxLeadTime), so the window always spans ≥1 reap during a
-        # sustained loop. `>= 2` reaps in the window distinguishes a
-        # one-off slow boot (1 reap, never fires) from a sustained loop
-        # (≥2 reaps within 1.5 cycles). Default chart: [1800s] window,
-        # fires ~25min into a 20min-cycle loop.
+        # r35 merged_bug_027: window 4×maxLeadTime = 2 full reap cycles
+        # (worst-case cycle 2×seed, seed ≤ maxLeadTime). `>= 2` reaps in
+        # the window distinguishes a one-off slow boot (1 reap, never
+        # fires) from a sustained loop (≥2 reaps within 2 cycles). The
+        # r34 3× window spanned only 1.5 cycles when seed=maxLeadTime
+        # (metal cells), giving `>= 2` a ~50% duty cycle — the alert
+        # flapped on a sustained loop instead of holding. Default chart:
+        # [2400s] window, fires ~25min into a 20min-cycle loop and
+        # HOLDS as long as the loop persists.
         - alert: RioNodeclaimPoolBootTimeoutLoop
           expr: |
             sum by (cell) (
-              increase(rio_controller_nodeclaim_reaped_total{reason="boot-timeout"}[{{ max 90 (mulf 3 (float64 .Values.scheduler.sla.maxLeadTime) | int) }}s])
+              increase(rio_controller_nodeclaim_reaped_total{reason="boot-timeout"}[{{ max 90 (mulf 4 (float64 .Values.scheduler.sla.maxLeadTime) | int) }}s])
             ) >= 2
           for: 5m
           labels:

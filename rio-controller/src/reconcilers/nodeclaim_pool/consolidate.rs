@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use super::NodeClaimPoolConfig;
-use super::ffd::{LiveNode, Placement};
+use super::ffd::{LiveNode, Placement, system_to_arch};
 use super::sketch::{Cell, CellSketches};
 
 /// Hold-open annotation key. Operator-settable: a NodeClaim carrying
@@ -60,15 +60,25 @@ pub struct IdleGapEvent {
 /// regardless of arrival rate. The windowed form is non-zero as long
 /// as any uncensored event falls within `boot_median/2` of `t`. Step
 /// `w/2` keeps overlapping coverage.
-// r[impl ctrl.nodeclaim.consolidate-na+2]
+// r[impl ctrl.nodeclaim.consolidate-na+3]
 pub fn consolidate_after(
     events: &[IdleGapEvent],
     e_fitting_cores: f64,
     node_cores: u32,
     boot_median: f64,
     max: Option<f64>,
+    min: Option<f64>,
 ) -> f64 {
-    let floor = boot_median / 2.0;
+    // r35 bug_050: per-class operator floor. §13e routed Fetcher Pools
+    // through `nodeclaim_pool`, dropping Karpenter's 10m
+    // `consolidateAfter` to the NA-model's `boot_median/2` (~15s for a
+    // 30s-boot fetcher). The model floor caps undershoot from a
+    // transient lull; `min` is the *policy* floor — what the operator
+    // pays per idle-second is theirs to weigh against a re-boot. `max`
+    // of the two: a dense-arrival fetcher cell still uses the higher
+    // NA threshold; a sparse one gets the policy floor instead of
+    // burn-a-boot-every-15s.
+    let floor = (boot_median / 2.0).max(min.unwrap_or(0.0));
     // RHS: cost of NOT having the node = cores worth of capacity that
     // takes boot_median to recover. boot_median.max(1) avoids div-by-0
     // on a degenerate sketch.
@@ -115,6 +125,37 @@ pub fn e_fitting_cores(placeable: &[Placement], node_cores: u32) -> f64 {
     fitting.iter().copied().map(f64::from).sum::<f64>() / fitting.len() as f64
 }
 
+/// Filter `placeable` to intents that can ARRIVE at a node in `cell`
+/// — the per-cell partition `e_fitting_cores` computes its mean over.
+///
+/// r35 bug_023: `r[ctrl.nodeclaim.consolidate-na+3]` says "per-cell
+/// mean over `intents`" — §13e removed the `kind` filter from
+/// `GetSpawnIntents`, so a global mean over `placeable` blends fetcher
+/// (`c*≈1`) and builder intents and biases `E[c_fit]` for builder
+/// nodes ~5× low. The filter is the SAME predicate FFD's `simulate`
+/// uses for the agnostic-fallback gate (NOT a `hw_class_names.is_
+/// empty()` pass-through, which over-counts hw-agnostic featureless
+/// intents on fetcher cells — the `rio.build/fetcher:NoSchedule` taint
+/// repels them at runtime, so counting them inflates the cell's
+/// hold-open). Returns owned `Vec<Placement>` (clone): for ≤200
+/// intents per tick the alloc is noise next to the `Api::delete`.
+pub fn placeable_for_cell(
+    placeable: &[Placement],
+    cell: &Cell,
+    hw_admits: impl Fn(&str, &str, &[String]) -> bool,
+) -> Vec<Placement> {
+    placeable
+        .iter()
+        .filter(|(i, _, _)| {
+            i.hw_class_names.iter().any(|h| h == &cell.0)
+                || (i.hw_class_names.is_empty()
+                    && system_to_arch(&i.system)
+                        .is_some_and(|a| hw_admits(&cell.0, a, &i.required_features)))
+        })
+        .cloned()
+        .collect()
+}
+
 /// Append `e` to `cell`'s ring-buffered `idle_gap_events`.
 fn push_idle_gap(sketches: &mut CellSketches, cell: &Cell, e: IdleGapEvent) {
     let evs = &mut sketches.cell_mut(cell).idle_gap_events;
@@ -138,6 +179,7 @@ pub async fn reap_idle(
     placeable: &[Placement],
     sketches: &mut CellSketches,
     cfg: &NodeClaimPoolConfig,
+    hw_admits: impl Fn(&str, &str, &[String]) -> bool,
     now_secs: f64,
 ) -> anyhow::Result<()> {
     let reserved: HashSet<&str> = placeable.iter().map(|(_, n, _)| n.as_str()).collect();
@@ -161,22 +203,45 @@ pub async fn reap_idle(
             .get(cell)
             .and_then(|s| s.boot_median())
             .unwrap_or_else(|| cfg.seed_for(cell));
+        let min = cfg.min_consolidation_time_for(cell);
         let threshold = if n.annotation(HOLD_OPEN_ANNOTATION) == Some("true") {
-            cfg.max_consolidation_time
-                .unwrap_or(2.0 * consolidate_after(&[], 0.0, n.allocatable.0, boot_median, None))
+            cfg.max_consolidation_time.unwrap_or(
+                2.0 * consolidate_after(&[], 0.0, n.allocatable.0, boot_median, None, min),
+            )
         } else {
             let events = sketches
                 .get(cell)
                 .map(|s| s.idle_gap_events.as_slice())
                 .unwrap_or(&[]);
+            // r35 bug_023: per-cell mean. §13e mixed fetcher (c*≈1) and
+            // builder intents in `placeable`; a global mean biases
+            // E[c_fit] for builder nodes ~5× low.
+            let cell_placeable = placeable_for_cell(placeable, cell, &hw_admits);
             consolidate_after(
                 events,
-                e_fitting_cores(placeable, n.allocatable.0),
+                e_fitting_cores(&cell_placeable, n.allocatable.0),
                 n.allocatable.0,
                 boot_median,
                 cfg.max_consolidation_time,
+                min,
             )
         };
+        // r35 (B3 verifier amend): observable for the per-cell
+        // e_fitting_cores partition (bug_023) and the policy floor
+        // (bug_050) — both shift this threshold silently. Last-write-
+        // wins per cell within a tick (nodes in a cell share an
+        // hw-class; allocatable can vary across instance types within
+        // the class but the threshold's order of magnitude doesn't).
+        // Operator check: `fetcher-*` cells ≥ minConsolidationTime
+        // floor; builder cells ~boot_median/2 unless λ·E[c_fit] holds
+        // them open. A cell at boot_median/2 when its
+        // minConsolidationTime entry says 600s = the prefix-glob
+        // didn't match.
+        metrics::gauge!(
+            "rio_controller_nodeclaim_consolidate_threshold_seconds",
+            "cell" => cell.to_string(),
+        )
+        .set(threshold);
         if idle <= threshold {
             continue;
         }
@@ -274,24 +339,24 @@ mod tests {
         // → λ=1/(5·3)≈0.067. λ·E_fit must exceed rhs to keep:
         // E_fit=100 → 6.67 > 0.8 → continues past floor.
         let evs = [ev(5.0, false), ev(10.0, false), ev(15.0, true)];
-        assert!(consolidate_after(&evs, 100.0, 8, 10.0, None) > 5.0);
+        assert!(consolidate_after(&evs, 100.0, 8, 10.0, None, None) > 5.0);
         // All-censored → λ=0 (hits=0) → floor.
         let cens = [ev(5.0, true), ev(10.0, true), ev(15.0, true)];
-        assert_eq!(consolidate_after(&cens, 100.0, 8, 10.0, None), 5.0);
+        assert_eq!(consolidate_after(&cens, 100.0, 8, 10.0, None, None), 5.0);
     }
 
-    /// r[ctrl.nodeclaim.consolidate-na+2]: floor = q_0.5(boot)/2. With
+    /// r[ctrl.nodeclaim.consolidate-na+3]: floor = q_0.5(boot)/2. With
     /// no events (λ=0), break-even fires immediately → returns floor.
-    // r[verify ctrl.nodeclaim.consolidate-na+2]
+    // r[verify ctrl.nodeclaim.consolidate-na+3]
     #[test]
     fn consolidate_after_respects_floor() {
         // boot_median=40 → floor=20. λ=0 → immediate break-even → 20.
-        let t = consolidate_after(&[], 4.0, 8, 40.0, None);
+        let t = consolidate_after(&[], 4.0, 8, 40.0, None, None);
         assert_eq!(t, 20.0);
         // Explicit max ceiling.
         let evs: Vec<_> = (1..=100).map(|k| ev(k as f64, false)).collect();
         // Dense events, high E[c_fit] → λ·E stays > rhs through to max.
-        let t2 = consolidate_after(&evs, 1e6, 8, 40.0, Some(50.0));
+        let t2 = consolidate_after(&evs, 1e6, 8, 40.0, Some(50.0), None);
         assert_eq!(t2, 50.0, "max ceiling");
     }
 
@@ -302,11 +367,11 @@ mod tests {
     fn keep_condition_uses_fitting_core_expectation() {
         let evs: Vec<_> = (21..=30).map(|k| ev(f64::from(k), false)).collect();
         // E[c_fit]=4, node=192, boot=40: λ·E ≪ rhs → floor.
-        let t = consolidate_after(&evs, 4.0, 192, 40.0, None);
+        let t = consolidate_after(&evs, 4.0, 192, 40.0, None, None);
         assert_eq!(t, 20.0);
         // Same events, E[c_fit]=100, node=8: λ(20)·100 = 5 >
         // 8/40=0.2 → keep past floor; break-even after the cluster.
-        let t2 = consolidate_after(&evs, 100.0, 8, 40.0, Some(100.0));
+        let t2 = consolidate_after(&evs, 100.0, 8, 40.0, Some(100.0), None);
         assert!(t2 >= 30.0, "kept while λ·E > rhs; t2={t2}");
     }
 
@@ -320,13 +385,13 @@ mod tests {
         let evs = [ev(25.3, false), ev(47.1, false), ev(80.9, false)];
         // E[c_fit]=100, node=8, boot=40: rhs=0.2. λ(20)=1/(20·3)≈0.017,
         // λ·E≈1.67 > 0.2 → does NOT return at floor.
-        let t = consolidate_after(&evs, 100.0, 8, 40.0, None);
+        let t = consolidate_after(&evs, 100.0, 8, 40.0, None, None);
         assert!(
             t > 20.0,
             "sparse events should not collapse to floor; got {t}"
         );
         // Sanity: with E[c_fit]=0 (no demand), break-even at floor.
-        assert_eq!(consolidate_after(&evs, 0.0, 8, 40.0, None), 20.0);
+        assert_eq!(consolidate_after(&evs, 0.0, 8, 40.0, None, None), 20.0);
     }
 
     /// `reap_idle`'s busy predicate matches `observe_idle_to_busy`:
@@ -378,6 +443,95 @@ mod tests {
         assert_eq!(e_fitting_cores(&[], 8), 0.0);
     }
 
+    /// r35 bug_023 (§Simulator-shares-accounting): `e_fitting_cores`
+    /// must be a per-cell mean. §13e removed the `kind` filter from
+    /// `GetSpawnIntents`, so `placeable` mixes fetcher (`c*≈1`) and
+    /// builder intents — a global mean for a 32c builder node biases
+    /// `E[c_fit]` ~5× low (12 intents avg=6.17 instead of 32). The
+    /// filter is the SAME predicate FFD's `hw_admits` uses, NOT a
+    /// `hw_class_names.is_empty()` pass-through (which over-counts
+    /// hw-agnostic intents on fetcher cells).
+    // r[verify ctrl.nodeclaim.consolidate-na+3]
+    #[test]
+    fn e_fitting_cores_per_cell_excludes_cross_kind() {
+        let p = |c: u32, hw: &str, sys: &str| -> Placement {
+            (
+                SpawnIntent {
+                    cores: c,
+                    hw_class_names: vec![hw.into()],
+                    system: sys.into(),
+                    ..Default::default()
+                },
+                "n".into(),
+                false,
+            )
+        };
+        let mut placeable: Vec<Placement> = (0..10)
+            .map(|_| p(1, "fetcher-x86", "x86_64-linux"))
+            .collect();
+        placeable.push(p(32, "hi-ebs-x86", "x86_64-linux"));
+        placeable.push(p(32, "hi-ebs-x86", "x86_64-linux"));
+        // Global mean over all 12: (10×1 + 2×32)/12 ≈ 6.17. Per-cell
+        // mean for hi-ebs-x86: 32.
+        let builder_cell = Cell("hi-ebs-x86".into(), CapacityType::Spot);
+        let admits = |_: &str, _: &str, _: &[String]| true;
+        let cell_placeable = placeable_for_cell(&placeable, &builder_cell, admits);
+        let e = e_fitting_cores(&cell_placeable, 32);
+        assert!(
+            (e - 32.0).abs() < 1e-9,
+            "per-cell E[c_fit] for hi-ebs-x86 should be 32, got {e}              (global mean would be ≈6.17)"
+        );
+        // The fetcher cell sees only the 10 fetcher intents.
+        let fetcher_cell = Cell("fetcher-x86".into(), CapacityType::Spot);
+        let cell_placeable = placeable_for_cell(&placeable, &fetcher_cell, admits);
+        let e = e_fitting_cores(&cell_placeable, 4);
+        assert!((e - 1.0).abs() < 1e-9, "fetcher cell E[c_fit]=1, got {e}");
+        // hw-agnostic intents (`hw_class_names=[]`) only count on cells
+        // `hw_admits` accepts — NOT a pass-through for every cell.
+        let agnostic: Placement = (
+            SpawnIntent {
+                cores: 16,
+                hw_class_names: vec![],
+                system: "x86_64-linux".into(),
+                ..Default::default()
+            },
+            "n".into(),
+            false,
+        );
+        let mixed = vec![p(1, "fetcher-x86", "x86_64-linux"), agnostic];
+        let admits_builder_only = |h: &str, _: &str, _: &[String]| h.starts_with("hi-");
+        let cp = placeable_for_cell(&mixed, &fetcher_cell, admits_builder_only);
+        assert_eq!(
+            e_fitting_cores(&cp, 4),
+            1.0,
+            "hw-agnostic intent excluded from fetcher cell when hw_admits rejects"
+        );
+        let cp = placeable_for_cell(&mixed, &builder_cell, admits_builder_only);
+        assert_eq!(
+            e_fitting_cores(&cp, 32),
+            16.0,
+            "hw-agnostic intent admitted on builder cell"
+        );
+    }
+
+    /// r35 bug_050 (§Granularity-coupling): §13e silently reduced
+    /// fetcher idle grace from Karpenter's `consolidateAfter: 10m` to
+    /// the NA-model floor `boot_median/2` (~15s). The operator-settable
+    /// per-class `min_consolidation_time` is the structural close — the
+    /// NA model is correct, the policy floor was missing.
+    // r[verify ctrl.nodeclaim.consolidate-na+3]
+    #[test]
+    fn consolidate_after_respects_min_floor() {
+        // boot_median=30 → NA floor = 15. With λ=0 (no events) the
+        // break-even fires at the floor — but `min=600` overrides it.
+        let t = consolidate_after(&[], 1.0, 1, 30.0, None, Some(600.0));
+        assert_eq!(t, 600.0, "min floor overrides boot_median/2 floor");
+        // Without `min` the old behavior holds (boot_median/2 floor).
+        assert_eq!(consolidate_after(&[], 1.0, 1, 30.0, None, None), 15.0);
+        // `min` < `boot_median/2` → NA floor wins (max of the two).
+        assert_eq!(consolidate_after(&[], 1.0, 1, 30.0, None, Some(5.0)), 15.0);
+    }
+
     #[test]
     fn idle_gap_ring_caps() {
         let mut sk = CellSketches::default();
@@ -418,6 +572,7 @@ mod tests {
             8,
             sk.get(&cell).unwrap().boot_median().unwrap(),
             cfg.max_consolidation_time,
+            None,
         );
         assert!(30.0 > threshold, "idle past floor");
 

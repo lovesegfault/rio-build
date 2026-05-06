@@ -57,11 +57,12 @@ spec:
                 description: "`fuse-cache` emptyDir sizeLimit AND the matching addend\
                   \ to the\ncontainer's `ephemeral-storage` request/limit (kubelet\
                   \ sums\ndisk-backed emptyDirs against that limit, so the two MUST\
-                  \ agree).\nFetcher-only \u2014 Builder pools single-source from\
-                  \ controller\n`[nodeclaim_pool].fuse_cache_bytes` so FFD/cover/stamp\
-                  \ agree\n(mb_035); CEL rejects the field for Builder, and pre-CEL\
-                  \ CRs are\nignored with a Warning event. `None` = 4Gi safe-minimum\
-                  \ so\nnon-helm Fetcher Pools schedule on small-disk clusters."
+                  \ agree).\nCEL-rejected for BOTH kinds \u2014 all pools single-source\
+                  \ from\ncontroller `[nodeclaim_pool].fuse_cache_bytes` so FFD/cover/stamp\n\
+                  agree (\xA7Simulator-shares-accounting). Builder: mb_035. Fetcher:\n\
+                  r35 merged_bug_024, after \xA713e routed Fetcher Pools through the\n\
+                  same NodeClaim accounting path. Pre-CEL CRs setting it are\nignored\
+                  \ with a Warning event (`*FuseCacheBytesIgnored`)."
                 format: uint64
                 minimum: 0.0
                 nullable: true
@@ -260,6 +261,10 @@ spec:
                 \ from controller [nodeclaim_pool].fuse_cache_bytes so FFD/cover/stamp\
                 \ agree (mb_035)"
               rule: self.kind != 'Builder' || !has(self.fuseCacheBytes)
+            - message: "kind=Fetcher forbids fuseCacheBytes \u2014 \xA713e routes\
+                \ Fetcher Pools through nodeclaim_pool; per-pool override would diverge\
+                \ FFD from the stamped pod request (r35 merged_bug_024)"
+              rule: self.kind != 'Fetcher' || !has(self.fuseCacheBytes)
           status:
             description: "Pool status \u2014 reconciler writes, operators read.\n\n\
               `Default` because kube-rs initializes it to `None` \u2192\n`Some(default())`\

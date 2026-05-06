@@ -538,15 +538,21 @@ the closed-loop `forecast_warm_hit_ratio` Schmitt widens/narrows the
 quantile by `Δq=0.02` per firing, capped at `q ≤ 0.99` and
 `lead_time ≤ sla.maxLeadTime`.
 
-r[ctrl.nodeclaim.consolidate-na+2]
+r[ctrl.nodeclaim.consolidate-na+3]
 An empty NodeClaim is kept while
 `λ(t)·𝔼[c_arrival·𝟙{c_arrival ≤ cores}] > cores/q_0.5(boot[h,cap])`.
 `λ(t)` is the windowed empirical arrival rate over `[t, t+W)` (window
 `W = q_0.5(boot)/2 ≥ 5s`) on right-censored `idle_gap[h,cap]`; the
 fitting-core term is the current tick's per-cell mean over `intents`
+restricted to those whose hw-class set contains the cell, or whose
+hw-class set is empty AND `hw_admits(cell, system, features)` holds —
+the SAME predicate FFD's `simulate` uses for the agnostic-fallback gate
 (defined as 0 when intents is ⊥ or empty). A floor
-`consolidate_after ≥ q_0.5(boot)/2` prevents a transient lull from
-collapsing to always-delete.
+`consolidate_after ≥ max(q_0.5(boot)/2, min_consolidation_time[h])`
+prevents a transient lull from collapsing to always-delete and lets the
+operator preserve the pre-§13e Karpenter `consolidateAfter` policy
+floor for cells the NA model would otherwise reap aggressively (default
+`{"fetcher-*": 600s}`).
 
 r[ctrl.nodeclaim.shim-nodepool]
 A single shim NodePool (`limits:{cpu:0}`,
@@ -651,7 +657,7 @@ The controller MUST reject `Pool` specs with `hostNetwork: true` and `privileged
 r[ctrl.event.spec-degrade]
 The Pool reconciler MUST emit a `Warning`-type Kubernetes Event for every spec field the builder silently degrades. CEL validation rejects NEW specs with invalid combinations; existing specs applied before the CEL rule landed are defensively corrected at pod-template time (e.g., `hostUsers` suppressed for `hostNetwork: true`). Without a Warning event, the operator has no signal that their spec is stale — `kubectl get pool -o yaml` shows the original value; the pod template shows the corrected value. The Warning names the field, the spec value, and the remediation.
 
-The FUSE cache emptyDir `sizeLimit` for **Builder** pools is single-sourced from `[nodeclaim_pool].fuse_cache_bytes` (controller.toml; helm `poolDefaults.fuseCacheBytes`, 50Gi in prod) so FFD/cover/stamp agree — `PoolSpec.fuseCacheBytes` is rejected for Builder kind. **Fetcher** pools may set `PoolSpec.fuseCacheBytes` (default `FETCHER_FUSE_CACHE_BYTES` = 4Gi). The same value is added to the container's `ephemeral-storage` request/limit so the two cannot drift. Pods are one-shot so the cache never outlives one build's input closure.
+The FUSE cache emptyDir `sizeLimit` for **all** pool kinds is single-sourced from `[nodeclaim_pool].fuse_cache_bytes` (controller.toml; helm `poolDefaults.fuseCacheBytes`, 50Gi in prod) so FFD/cover/stamp agree — `PoolSpec.fuseCacheBytes` is rejected for both Builder and Fetcher kind. (Pre-§13e, Fetcher pools could set a per-pool value because they didn't route through `nodeclaim_pool`; §13e routed them through, and r35 closed the resulting accounting drift.) The same value is added to the container's `ephemeral-storage` request/limit so the two cannot drift. Pods are one-shot so the cache never outlives one build's input closure.
 
 ## Pool Finalizer
 

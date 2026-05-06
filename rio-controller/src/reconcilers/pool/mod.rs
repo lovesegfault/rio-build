@@ -85,6 +85,7 @@ pub(crate) const REASON_FETCHER_SECCOMP_OVERRIDDEN: &str = "FetcherSeccompOverri
 pub(crate) const REASON_FETCHER_FUSE_TUNING_IGNORED: &str = "FetcherFuseTuningIgnored";
 pub(crate) const REASON_FETCHER_FEATURES_IGNORED: &str = "FetcherFeaturesIgnored";
 pub(crate) const REASON_BUILDER_FUSE_CACHE_IGNORED: &str = "BuilderFuseCacheBytesIgnored";
+pub(crate) const REASON_FETCHER_FUSE_CACHE_IGNORED: &str = "FetcherFuseCacheBytesIgnored";
 
 /// One spec-degrade check. `applies` is a pure predicate over the
 /// spec; if true, a `Warning` event with `reason`/`note` is emitted.
@@ -175,6 +176,19 @@ pub(crate) const DEGRADE_CHECKS: &[DegradeCheck] = &[
         note: "kind=Builder ignores fuseCacheBytes — Builder pools \
                single-source from controller [nodeclaim_pool].fuse_cache_bytes \
                so FFD/cover/stamp agree (mb_035). Drop fuseCacheBytes.",
+    },
+    // r35 merged_bug_024: §13e routes Fetcher Pools through
+    // `nodeclaim_pool` — FFD/cover read `[nodeclaim_pool].fuse_cache_
+    // bytes` for fetcher cells too. A per-Pool override would make FFD
+    // predict a different ephemeral-storage footprint than the pod
+    // stamps (the same drift mb_035 closed for Builder).
+    DegradeCheck {
+        applies: |s| is_fetcher_spec(s) && s.fuse_cache_bytes.is_some(),
+        reason: REASON_FETCHER_FUSE_CACHE_IGNORED,
+        note: "kind=Fetcher ignores fuseCacheBytes — §13e routes Fetcher \
+               Pools through nodeclaim_pool; per-pool override would diverge \
+               FFD from the stamped pod request (r35 merged_bug_024). Drop \
+               fuseCacheBytes.",
     },
 ];
 

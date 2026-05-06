@@ -284,11 +284,11 @@ async fn warn_fires_for_ephemeral_with_host_network() {
 #[tokio::test]
 async fn warn_fires_for_every_degrade_check() {
     use crate::reconcilers::pool::DEGRADE_CHECKS;
-    // Structural floor: 1 host-users + 5 Fetcher CEL rules + 1 Builder
+    // Structural floor: 1 host-users + 6 Fetcher CEL rules + 1 Builder
     // fuseCacheBytes. New CEL rules without a DegradeCheck entry trip
     // this.
     assert!(
-        DEGRADE_CHECKS.len() >= 7,
+        DEGRADE_CHECKS.len() >= 8,
         "DEGRADE_CHECKS shrank below the count of silent overrides in \
          pod.rs::effective_* — every override needs a Warning entry"
     );
@@ -307,6 +307,9 @@ async fn warn_fires_for_every_degrade_check() {
     // NOT "kvm" — proves DEGRADE_CHECKS[5] fires for ANY non-empty
     // features (the I-181 ∅-guard starves on any value, not just kvm).
     wp.spec.features = vec!["big-parallel".into()];
+    // r35 merged_bug_024: per-Pool fuseCacheBytes is also CEL-rejected
+    // for Fetcher kind — pre-CEL CRs get a Warning.
+    wp.spec.fuse_cache_bytes = Some(6 * (1 << 30));
 
     let (client, verifier) = ApiServerVerifier::new();
     let ctx = test_ctx(client);
@@ -318,7 +321,7 @@ async fn warn_fires_for_every_degrade_check() {
         .collect();
     assert_eq!(
         scenarios.len(),
-        5,
+        6,
         "fixture should trigger every Fetcher degrade check"
     );
     scenarios.extend(ephemeral_reconcile_scenarios());
@@ -419,7 +422,8 @@ fn degrade_builder_fuse_cache_ignored() {
     };
     assert!(
         !(check.applies)(&fetcher),
-        "Fetcher may set fuseCacheBytes (per-pool override is supported)"
+        "Builder check is kind-gated; Fetcher fuseCacheBytes warns via \
+         FetcherFuseCacheBytesIgnored (r35 merged_bug_024), not this one"
     );
 
     let builder_unset = crate::fixtures::test_pool("b2", ExecutorKind::Builder).spec;

@@ -235,6 +235,17 @@ pub fn describe_metrics() {
          DDSketch. What cover_deficit provisions ahead by. Stuck at the seed value = \
          no Registered=True transitions recorded yet (check seed_fallback_total)."
     );
+    describe_gauge!(
+        "rio_controller_nodeclaim_consolidate_threshold_seconds",
+        "Per-`cell` idle-NodeClaim reap threshold from the NA consolidation model \
+         (last node evaluated this tick; 0 when no idle nodes in the cell). \
+         The break-even consolidate_after() returns: max(boot_median/2, \
+         min_consolidation_time[cell]) floored, NA-extended while λ·E[c_fit] > \
+         cores/boot. Watch fetcher-* >= the configured min_consolidation_time \
+         floor and builder cells tracking ~boot_median/2 to confirm the per-cell \
+         e_fitting_cores partition and the policy floor are both routing (r35 \
+         bug_023/bug_050)."
+    );
     describe_counter!(
         "rio_controller_ddsketch_seed_fallback_total",
         "Per-`cell` seed injections at CellSketches::seed(). Incremented once per \

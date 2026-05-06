@@ -24,14 +24,11 @@ spec:
   {{- with $p.maxConcurrent }}
   maxConcurrent: {{ . }}
   {{- end }}
-  {{- /* Builder pools single-source fuseCacheBytes from controller
-         [nodeclaim_pool].fuse_cache_bytes so FFD/cover/stamp agree;
-         CEL forbids it for Builder (pre-CEL CRs: ignored + Warning). */}}
-  {{- if ne $p.kind "Builder" }}
-  {{- with $p.fuseCacheBytes }}
-  fuseCacheBytes: {{ int64 . }}
-  {{- end }}
-  {{- end }}
+  {{- /* fuseCacheBytes is NOT rendered for either kind. r35
+         merged_bug_024: §13e routes Fetcher Pools through nodeclaim_pool
+         too, so both single-source from [nodeclaim_pool].fuse_cache_bytes
+         (= poolDefaults.fuseCacheBytes) so FFD/cover/stamp agree. CEL
+         forbids it for both (pre-CEL CRs: ignored + Warning). */}}
   {{- /* hostUsers rendered for BOTH kinds — k3s containerd needs
          hostUsers:true (cgroup-chown gap); production EKS leaves it
          unset → reconciler defaults to false (ADR-019). NOT CEL-gated
