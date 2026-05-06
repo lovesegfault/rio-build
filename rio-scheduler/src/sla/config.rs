@@ -636,10 +636,14 @@ impl SlaConfig {
     /// `reference_hw_class` if [`Self::class_routes`] admits it for
     /// `(system, features)` AND [`Self::class_ceilings`] hosts
     /// `(cores, mem)`, else the first (sorted) `hw_classes` entry that
-    /// does. `None` ⇔ `system` unmappable OR no configured class hosts
-    /// that arch at that size with those features — caller emits empty
+    /// does. `None` ⇔ `system` unmappable AND `features` empty (no
+    /// constraint axis to route on — r35 B1) OR no configured class
+    /// hosts that arch/feature at that size — caller emits empty
     /// `hw_class_names` so the controller's `fallback_cell` reaches its
-    /// OWN `None` → `no_hosting_class`.
+    /// OWN `None` → `no_hosting_class`. An arch-unmappable system with
+    /// non-empty `features` (`system="builtin"` FODs) IS routed — by
+    /// feature alone, arch axis a no-op (r35 B1, §13d
+    /// placement⊇provisioning STRIKE-2).
     pub fn reference_hw_class_for_system(
         &self,
         system: &str,
@@ -649,9 +653,21 @@ impl SlaConfig {
         catalog: &super::catalog::CatalogCeilings,
         global: (u32, u64),
     ) -> Option<&str> {
-        let arch = rio_common::k8s::system_to_k8s_arch(system)?;
+        // r35 B1 (§13e B5): builtin FODs are arch-agnostic. Unmappable
+        // system → arch is a no-op (everything matches); the feature
+        // filter still constrains to `fetcher-*`. Mirrors
+        // `retain_hosting_cells`'s `is_none_or` and `class_routes`'
+        // `Option<&str>` semantics. The `arch.is_none() &&
+        // features.is_empty()` guard preserves the featureless arm —
+        // symmetric with `fallback_cell` so the operator pin path
+        // (`bypass_cells` Some(cap) arm) cannot route a featureless
+        // arch-unmappable intent to arbitrary cells.
+        let arch = rio_common::k8s::system_to_k8s_arch(system);
+        if arch.is_none() && features.is_empty() {
+            return None;
+        }
         let matches = |h: &str| {
-            self.class_routes(h, Some(arch), features) && {
+            self.class_routes(h, arch, features) && {
                 let (cc, cm) = self.class_ceilings(h, catalog, global);
                 cores <= cc && mem <= cm
             }
@@ -720,8 +736,9 @@ impl SlaConfig {
         let (cores, mem) = demand;
         // bug_042: arch axis. `None` (unmappable / `builtin`) → arch is
         // a no-op (everything kept) — mirrors `cells_to_selector_terms`
-        // dropping unknown classes and the controller's
-        // `system_to_arch(i.system).is_none()` returning no candidate.
+        // dropping unknown classes and the controller's `fallback_cell`
+        // / FFD `agnostic` arch=None pass-through (r35 B1: featured
+        // arch-unmappable intents route by feature alone there too).
         let want_arch = rio_common::k8s::system_to_k8s_arch(system);
         cells
             .into_iter()
@@ -2032,6 +2049,63 @@ mod tests {
                 base_global()
             ),
             None
+        );
+    }
+
+    /// r35 B1 (§13d placement⊇provisioning STRIKE-2): an arch-unmappable
+    /// system carrying `required_features` is genuinely arch-agnostic —
+    /// it routes by feature alone. `system="builtin"` FODs declare
+    /// `required_features=["fetcher"]`; `system_to_k8s_arch("builtin")`
+    /// returns `None` so the pre-fix `?`-early-return dropped to
+    /// `hw_class_names=[]` → no per-intent affinity, no provisioner, pod
+    /// permanently Pending with no alert (bug_003). A featureless
+    /// arch-unmappable system (`darwin-pdp11`) keeps the `None` arm —
+    /// no constraint axis to route on means no class can host it.
+    #[test]
+    fn reference_hw_class_for_system_builtin_routes_by_feature() {
+        let mut cfg = base();
+        cfg.hw_classes = HashMap::from([
+            (
+                "fetcher-x86".into(),
+                test_def_provides(ARCH_LABEL, "amd64", &["fetcher"]),
+            ),
+            (
+                "fetcher-arm".into(),
+                test_def_provides(ARCH_LABEL, "arm64", &["fetcher"]),
+            ),
+            ("mid-x86".into(), test_def(ARCH_LABEL, "amd64")),
+        ]);
+        cfg.reference_hw_class = "mid-x86".into();
+        let fetcher = vec!["fetcher".to_string()];
+        // builtin FOD (`arch=None`, features=["fetcher"]) → first
+        // (sorted) class providing the feature. Pre-B1 this returned
+        // `None` (arch `?`-early-return), leaving `hw_class_names=[]`
+        // and no provisioning path.
+        assert_eq!(
+            cfg.reference_hw_class_for_system(
+                "builtin",
+                1,
+                2 << 30,
+                &fetcher,
+                &Default::default(),
+                base_global()
+            ),
+            Some("fetcher-arm"),
+            "builtin FOD must route by feature to a fetcher class"
+        );
+        // featureless arch-unmappable → still None (no constraint axis
+        // to route on; the early-return is preserved for this arm).
+        assert_eq!(
+            cfg.reference_hw_class_for_system(
+                "darwin-pdp11",
+                1,
+                2 << 30,
+                &[],
+                &Default::default(),
+                base_global()
+            ),
+            None,
+            "featureless arch-unmappable system stays unroutable"
         );
     }
 

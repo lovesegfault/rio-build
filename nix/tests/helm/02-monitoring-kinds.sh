@@ -42,6 +42,27 @@ grep -A4 'alert: RioNodeclaimPoolBootTimeoutLoop' "$out" \
   exit 1
 }
 
+# r35 B1 (bug_003 second half): the no_hosting_class alert is the ONLY
+# signal that an intent dropped at `fallback_cell` left a pod
+# permanently Pending — every other nodeclaim alert is NodeClaim-derived
+# and a never-minted NodeClaim emits no series. bug_003's whole shape
+# was "no alert fires"; a future §SCC sweep silently dropping THIS alert
+# repeats the failure mode. Tripwire pins both the alert name and the
+# `reason="no_hosting_class"` key so a refactor can't keep the alert and
+# disarm the expr.
+grep -q 'alert: RioNodeclaimPoolNoHostingClass' "$out" || {
+  echo "FAIL: RioNodeclaimPoolNoHostingClass alert missing — when no" \
+    "configured hw-class hosts an intent the pod is permanently Pending" \
+    "and NOTHING fires; bug_003's no-alert half regresses silently" \
+    "(r35 B1)" >&2
+  exit 1
+}
+grep -A4 'alert: RioNodeclaimPoolNoHostingClass' "$out" \
+  | grep -q 'reason="no_hosting_class"' || {
+  echo "FAIL: NoHostingClass expr does not key on reason=no_hosting_class" >&2
+  exit 1
+}
+
 # r34 bug_017 (§Partition-single-source): the StuckPending clamp cap
 # must derive from `maxLeadTime`, not a hardcoded literal — the
 # invariant `cap >= 2×maxLeadTime` is load-bearing (the alert must

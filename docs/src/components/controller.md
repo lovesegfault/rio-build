@@ -315,7 +315,7 @@ its toleration automatically. This covers fitted intents
 (`r[ctrl.pool.kvm-device+2]`) covers `hw_class_names=[]` cold-start
 intents.
 
-r[ctrl.pool.fetcher-affinity-from-intent+2]
+r[ctrl.pool.fetcher-affinity-from-intent+3]
 The fetcher pod's restrictive placement constraint MUST be the union of
 the per-intent `nodeAffinity` derived from `intent.hw_class_names` via
 `cells_to_selector_terms` (`r[ctrl.pool.node-affinity-from-intent]`) AND
@@ -328,11 +328,13 @@ invariant, not an independent opinion of it. This is NOT the
 nodeSelector keyed on `pool.spec.features` (existential — an intent may
 need only one feature, which routes to a non-metal class), so the two
 places COULD disagree. Here they cannot. The pool-static constraint is
-load-bearing for `system="builtin"` FODs whose `hw_class_names` is
-empty (no arch → no cells → no per-intent affinity); without it, a
-`builtins.fetchurl` pod has only the toleration and can schedule onto
-any untainted node. The pool-static fetcher toleration also stays —
-permissive constraints over-firing are harmless and serve as the
+the LAST-RESORT restrictive constraint for the window between
+intent-emit and node-provision: the per-intent affinity is also present
+once `hw_class_names` is populated by the arch-agnostic feature
+fall-through (r35 B1 — `system="builtin"` FODs route by
+`required_features=["fetcher"]`; the arch axis is a no-op for
+arch-unmappable systems). The pool-static fetcher toleration also stays
+— permissive constraints over-firing are harmless and serve as the
 `hw_class_names=[]` cold-start fallback.
 
 r[ctrl.pool.hw-bench-needed+2]

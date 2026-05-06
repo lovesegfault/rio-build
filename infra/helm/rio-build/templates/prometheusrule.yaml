@@ -255,6 +255,35 @@ spec:
               Launched/Registered conditions; see
               docs/src/runbooks/sla-model.md#rionodeclaimpool-boottimeoutloop.
 
+        # r35 B1 (bug_003 second half): when `fallback_cell` finds no
+        # configured hw-class that can host an intent, the intent is
+        # dropped — no NodeClaim is minted, the pod has a restrictive
+        # `nodeSelector` and stays permanently Pending, and pre-B1
+        # NOTHING fired (all alerts were NodeClaim-derived). The B1 code
+        # fix makes the `system="builtin"` shape unreachable for
+        # featured intents, but the alert half is independent and
+        # structural: it catches the NEXT "no class can host" gap (a
+        # future arch addition without a hwClass, a featureless
+        # arch-unmappable system, an over-constrained `requiredFeatures`
+        # set). 15m window: each intent is dropped once per nodeclaim
+        # tick, so even a low-rate persistent gap accumulates.
+        - alert: RioNodeclaimPoolNoHostingClass
+          expr: |
+            increase(rio_controller_nodeclaim_intent_dropped_total{reason="no_hosting_class"}[15m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: NodeClaim intents dropped — no configured hw-class can host
+            description: >-
+              {{`{{ $value | humanize }}`}} SpawnIntents dropped over 15m
+              with reason=no_hosting_class. The build's pod is permanently
+              Pending and no NodeClaim will be minted. Check the intent's
+              `(system, required_features)` against `[sla.hw_classes]`
+              `provides_features`/`max_cores`/`max_mem` and the arch labels;
+              add a hw-class that covers it or fix the producer. See
+              docs/src/runbooks/sla-model.md#rionodeclaimpool-nohostingclass.
+
         # Forward-compat: rio_store_putpath_retries_total lands in P0539d.
         # Until then this expr evaluates empty (no series) → never fires.
         # >10/s sustained means S3/PG backpressure or the chunk-dedup

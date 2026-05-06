@@ -1054,12 +1054,19 @@ in
   # r[verify fetcher.node.dedicated+3]
   #   fetcher-node-dedicated subtest: pod spec has the rio.build/
   #   fetcher toleration (§13e cold-start fallback) AND the pool-static
-  #   nodeSelector{rio.build/fetcher: true} (§13e B4) — the sole
-  #   restrictive constraint for builtin FODs (system="builtin" → no
-  #   arch → no fetcher hwClass match → no per-intent nodeAffinity).
-  #   The deleted rio.build/node-role convention must NOT reappear.
-  #   Karpenter NodePool/NodeClaim enforcement is EKS-only.
-  # r[verify ctrl.pool.fetcher-affinity-from-intent+2]
+  #   nodeSelector{rio.build/fetcher: true} (§13e B4) — the LAST-RESORT
+  #   restrictive constraint for builtin FODs in the window between
+  #   intent-emit and node-provision (r35 B1). In this k3s fixture
+  #   (`vmtest-full.yaml`'s `vmtest` hw-class declares no
+  #   `providesFeatures`), `features_compatible(["fetcher"], [])` is
+  #   false → `reference_hw_class_for_system("builtin", ..., ["fetcher"])`
+  #   returns None → `hw_class_names=[]` → no per-intent nodeAffinity.
+  #   This is a property of the FIXTURE (no fetcher hw-class), not a
+  #   property of `system="builtin"` — the production path routes
+  #   builtin FODs by feature to `fetcher-*` (r35 B1). The deleted
+  #   rio.build/node-role convention must NOT reappear. Karpenter
+  #   NodePool/NodeClaim enforcement is EKS-only.
+  # r[verify ctrl.pool.fetcher-affinity-from-intent+3]
   #   fetcher-node-dedicated subtest: same shape check — pool-static
   #   nodeSelector present (the §13e B4 restore: it keys on
   #   pool.spec.kind, a Pool-level invariant the per-intent affinity is

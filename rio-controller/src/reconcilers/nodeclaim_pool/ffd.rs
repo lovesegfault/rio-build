@@ -287,19 +287,20 @@ pub type Placement = (SpawnIntent, String, bool);
 /// `hw_admits(h, arch, required_features)` — agnostic-fallback gate.
 /// `arch` is the resolved `kubernetes.io/arch` value derived from
 /// `intent.system` (NOT re-derived inside the closure — `simulate`
-/// already resolves it once per intent). §13d STRIKE-7 (mb_012):
-/// `required_features` is included so the closure can check
-/// `features_compatible` — a `hw_class_names=[]` intent carrying
-/// `required_features=["kvm"]` must NOT FFD-place onto a non-metal
-/// node; the inverse (featureless intent onto kvm-tainted metal node)
-/// must NOT either.
+/// already resolves it once per intent), `None` for arch-unmappable
+/// systems (`builtin` FODs — r35 B1; the closure treats `None` as
+/// pass-through). §13d STRIKE-7 (mb_012): `required_features` is
+/// included so the closure can check `features_compatible` — a
+/// `hw_class_names=[]` intent carrying `required_features=["kvm"]` must
+/// NOT FFD-place onto a non-metal node; the inverse (featureless intent
+/// onto kvm-tainted metal node) must NOT either.
 pub fn simulate(
     intents: &[SpawnIntent],
     live: &[LiveNode],
     sketches: &CellSketches,
     bound: &HashMap<String, String>,
     fuse_cache_bytes: u64,
-    hw_admits: impl Fn(&str, &str, &[String]) -> bool,
+    hw_admits: impl Fn(&str, Option<&str>, &[String]) -> bool,
 ) -> (Vec<Placement>, Vec<SpawnIntent>) {
     use crate::reconcilers::pool::jobs::intent_pod_footprint;
     // Running free per node. Cell-less nodes excluded up front: no
@@ -344,21 +345,28 @@ pub fn simulate(
         let open = a_open(&i, sketches);
         // hw-agnostic (`hw_class_names=[]`): eligible on any node
         // whose hw-class admits the intent (arch + features — see
-        // `hw_admits` doc). `arch.is_none()` (unmappable system) → no
-        // node matches. Distinguished from "all cells lead-time-gated"
-        // (non-empty `hw_class_names`, empty `open`) which stays
-        // cell-gated and falls through to unplaced.
-        let agnostic_arch = i
+        // `hw_admits` doc). r35 B1 (§13e B5): the gate is "at least one
+        // non-trivial constraint axis (arch OR features)". `arch=None ∧
+        // features=[]` is genuinely unroutable (featureless darwin/
+        // builtin); `arch=Some ∧ features=[]` is the original
+        // cold-start non-FOD case (arch routes); `arch=None ∧
+        // features=[fetcher]` is the §13e builtin-FOD case (features
+        // route, `matches_arch(_, None)` passes through). Distinguished
+        // from "all cells lead-time-gated" (non-empty `hw_class_names`,
+        // empty `open`) which stays cell-gated and falls through to
+        // unplaced.
+        let agnostic = i
             .hw_class_names
             .is_empty()
-            .then(|| system_to_arch(&i.system))
-            .flatten();
+            .then(|| (system_to_arch(&i.system), i.required_features.as_slice()));
         let best = live
             .iter()
             .filter(|n| {
                 n.cell.as_ref().is_some_and(|c| {
                     open.contains(c)
-                        || agnostic_arch.is_some_and(|a| hw_admits(&c.0, a, &i.required_features))
+                        || agnostic.is_some_and(|(a, f)| {
+                            (a.is_some() || !f.is_empty()) && hw_admits(&c.0, a, f)
+                        })
                 })
             })
             .filter(|n| {
@@ -745,7 +753,7 @@ pub(crate) mod tests {
 
     /// `hw_admits` stub: every hw-class admits every arch+features
     /// (tests that don't exercise the hw-agnostic path don't care).
-    fn any_admit(_h: &str, _a: &str, _f: &[String]) -> bool {
+    fn any_admit(_h: &str, _a: Option<&str>, _f: &[String]) -> bool {
         true
     }
 
@@ -1159,9 +1167,9 @@ pub(crate) mod tests {
             node("nx", "h-x86", CapacityType::Spot, 8, 64 * GI, 100 * GI),
             node("na", "h-arm", CapacityType::Spot, 8, 64 * GI, 100 * GI),
         ];
-        let hw_admits = |h: &str, a: &str, _f: &[String]| match h {
-            "h-x86" => a == "amd64",
-            "h-arm" => a == "arm64",
+        let hw_admits = |h: &str, a: Option<&str>, _f: &[String]| match h {
+            "h-x86" => a == Some("amd64"),
+            "h-arm" => a == Some("arm64"),
             _ => false,
         };
         let agn = |id: &str, sys: &str| SpawnIntent {
@@ -1235,8 +1243,9 @@ pub(crate) mod tests {
                 vec![]
             }
         };
-        let hw_admits =
-            |h: &str, _a: &str, f: &[String]| rio_common::k8s::features_compatible(f, &provides(h));
+        let hw_admits = |h: &str, _a: Option<&str>, f: &[String]| {
+            rio_common::k8s::features_compatible(f, &provides(h))
+        };
         let agn = |id: &str, features: &[&str]| SpawnIntent {
             intent_id: id.into(),
             cores: 4,
@@ -1285,6 +1294,87 @@ pub(crate) mod tests {
         );
         assert!(p.is_empty(), "kvm intent must NOT place on non-metal node");
         assert_eq!(u.len(), 1);
+    }
+
+    /// r35 B1 (validator amendment B2): the agnostic-fallback gate is
+    /// "at least one non-trivial constraint axis (arch OR features)".
+    /// A featureless arch-mappable hw-agnostic intent
+    /// (`hw_class_names=[]`, `required_features=[]`,
+    /// `system="x86_64-linux"`) MUST keep placing by arch — `arch=Some
+    /// ∧ features=[]` is the cold-start non-FOD case the FFD doc-comment
+    /// documents as load-bearing. A rewrite gating on `!f.is_empty()`
+    /// alone would over-mint via `cover_deficit` for every cold-start
+    /// non-FOD intent FFD can no longer place. This test pins the
+    /// invariant so a future refactor can't quietly drop the arch axis.
+    #[test]
+    fn ffd_simulate_places_hw_agnostic_featureless_on_arch_match() {
+        let nodes = [
+            node("nx", "h-x86", CapacityType::Spot, 8, 64 * GI, 100 * GI),
+            node("na", "h-arm", CapacityType::Spot, 8, 64 * GI, 100 * GI),
+        ];
+        // hw_admits routes by arch only (features unconstrained).
+        let hw_admits = |h: &str, a: Option<&str>, _f: &[String]| match h {
+            "h-x86" => a.is_none_or(|a| a == "amd64"),
+            "h-arm" => a.is_none_or(|a| a == "arm64"),
+            _ => false,
+        };
+        // featureless arch-mappable hw-agnostic intent → places on
+        // the arch-matching node.
+        let i = SpawnIntent {
+            intent_id: "plain".into(),
+            cores: 4,
+            mem_bytes: GI,
+            disk_bytes: GI,
+            system: "x86_64-linux".into(),
+            ready: Some(true),
+            ..Default::default()
+        };
+        let none = HashMap::new();
+        let (p, u) = simulate(
+            std::slice::from_ref(&i),
+            &nodes,
+            &CellSketches::default(),
+            &none,
+            0,
+            hw_admits,
+        );
+        assert_eq!(
+            p.len(),
+            1,
+            "featureless arch-mappable hw-agnostic intent must place by arch"
+        );
+        assert_eq!(placed_on(&p, "plain"), "nx");
+        assert!(u.is_empty());
+        // featureless arch-UNmappable → no constraint axis → unplaced
+        // (cover_deficit's no_hosting_class is the right answer; no
+        // node can be minted without an arch or a feature to route on).
+        let mut iu = i.clone();
+        iu.intent_id = "unmappable".into();
+        iu.system = "darwin-pdp11".into();
+        let (p, u) = simulate(&[iu], &nodes, &CellSketches::default(), &none, 0, hw_admits);
+        assert!(
+            p.is_empty(),
+            "featureless arch-unmappable intent has no constraint axis"
+        );
+        assert_eq!(u.len(), 1);
+        // featured arch-UNmappable (`builtin` FOD) → places by feature.
+        let mut iff = i;
+        iff.intent_id = "fod".into();
+        iff.system = "builtin".into();
+        iff.required_features = vec!["fetcher".into()];
+        let feat_admits =
+            |h: &str, _a: Option<&str>, f: &[String]| h == "h-x86" && f == ["fetcher"];
+        let (p, u) = simulate(
+            &[iff],
+            &nodes,
+            &CellSketches::default(),
+            &none,
+            0,
+            feat_admits,
+        );
+        assert_eq!(p.len(), 1, "builtin FOD must place by feature");
+        assert_eq!(placed_on(&p, "fod"), "nx");
+        assert!(u.is_empty());
     }
 
     #[test]

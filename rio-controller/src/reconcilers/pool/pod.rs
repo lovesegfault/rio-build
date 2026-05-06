@@ -236,7 +236,7 @@ fn effective_host_users(pool: &Pool) -> Option<bool> {
 /// NodeClaims, so the selector and the node label come from the same
 /// constant and cannot drift.
 // r[impl fetcher.node.dedicated+3]
-// r[impl ctrl.pool.fetcher-affinity-from-intent+2]
+// r[impl ctrl.pool.fetcher-affinity-from-intent+3]
 fn effective_node_selector(pool: &Pool) -> Option<BTreeMap<String, String>> {
     if is_fetcher(pool) {
         pool.spec.node_selector.clone().or_else(|| {
@@ -1401,7 +1401,7 @@ mod tests {
     /// (`FETCHER_TAINT_KEY`) is wired to NodeClaim labels via
     /// `cover::build_nodeclaim`; a `node-role` selector would never match
     /// any node.
-    // r[verify ctrl.pool.fetcher-affinity-from-intent+2]
+    // r[verify ctrl.pool.fetcher-affinity-from-intent+3]
     // r[verify fetcher.node.dedicated+3]
     #[test]
     fn fetcher_pod_no_legacy_node_role_selector() {
@@ -1470,7 +1470,7 @@ mod tests {
     /// `build_executor_pod_spec` does not see a per-intent affinity, so
     /// the only restrictive placement it CAN stamp is the pool-static
     /// nodeSelector.
-    // r[verify ctrl.pool.fetcher-affinity-from-intent+2]
+    // r[verify ctrl.pool.fetcher-affinity-from-intent+3]
     // r[verify fetcher.node.dedicated+3]
     #[test]
     fn builtin_fod_pod_has_pool_static_fetcher_node_selector() {

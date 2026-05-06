@@ -373,7 +373,19 @@ impl NodeClaimPoolConfig {
         hw: &HwClassConfig,
         masked: &HashSet<Cell>,
     ) -> Option<Cell> {
-        let arch = ffd::system_to_arch(&i.system)?;
+        // r35 B1 (§13e B5): featured arch-unmappable intent (`builtin`
+        // FODs) routes by feature alone. The `i.required_features.
+        // is_empty()` guard preserves the original early-return for
+        // featureless unmappable systems (no class to route to is the
+        // right answer there). `matches_arch(h, None)` treats a missing
+        // intent arch as pass-through — the feature filter is what
+        // narrows the candidate set. Symmetric with the scheduler's
+        // `reference_hw_class_for_system` so the §13d
+        // placement⊇provisioning invariant holds at both ends.
+        let arch = ffd::system_to_arch(&i.system);
+        if arch.is_none() && i.required_features.is_empty() {
+            return None;
+        }
         let candidate = |h: &str| {
             // Per-class ceiling filter: an hw-agnostic intent (override
             // bypass-path with `--cores=N`) may carry `cores >
@@ -1563,6 +1575,98 @@ mod tests {
         assert_eq!(
             cfg3.fallback_cell(&i("x86_64-linux"), &hw3, &none),
             Some(Cell("vmtest".into(), CapacityType::Spot))
+        );
+    }
+
+    /// r35 B1 (§13d placement⊇provisioning STRIKE-2): a `system="builtin"`
+    /// FOD (`required_features=["fetcher"]`, `hw_class_names=[]`) MUST route
+    /// to a `provides_features=["fetcher"]` class even though
+    /// `system_to_arch("builtin")` returns `None`. Pre-fix the arch
+    /// `?`-early-return dropped to `None` → `no_hosting_class` → no
+    /// NodeClaim minted → fetcher pod permanently Pending with no alert
+    /// (bug_003). The featureless arm (`fallback_cell_reference_then_
+    /// first_by_arch`'s `i("builtin")` pin above) is preserved — a
+    /// featureless arch-unmappable intent has NO constraint axis to
+    /// route on; `None` is correct there.
+    #[test]
+    fn fallback_cell_builtin_fod_routes_to_fetcher() {
+        use rio_proto::types::{HwClassLabels, NodeLabelMatch};
+        let cfg = NodeClaimPoolConfig {
+            reference_hw_class: "mid-ebs-x86".into(),
+            ..Default::default()
+        };
+        let arch = |a: &str| NodeLabelMatch {
+            key: ARCH_LABEL.into(),
+            value: a.into(),
+        };
+        let hw = HwClassConfig::default();
+        hw.set(
+            [
+                (
+                    "mid-ebs-x86".into(),
+                    HwClassLabels {
+                        labels: vec![arch("amd64")],
+                        max_cores: 64,
+                        max_mem: 256 << 30,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "fetcher-x86".into(),
+                    HwClassLabels {
+                        labels: vec![arch("amd64")],
+                        max_cores: 8,
+                        max_mem: 32 << 30,
+                        provides_features: vec!["fetcher".into()],
+                        capacity_types: vec!["od".into()],
+                        ..Default::default()
+                    },
+                ),
+            ]
+            .into(),
+            (192, 1536 << 30),
+        );
+        let none = HashSet::new();
+        // builtin FOD → fetcher-x86 (the only class providing
+        // `fetcher`). Pre-B1 `system_to_arch("builtin")?` returned
+        // `None` here.
+        let fod = SpawnIntent {
+            system: "builtin".into(),
+            required_features: vec!["fetcher".into()],
+            cores: 1,
+            mem_bytes: 2 << 30,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.fallback_cell(&fod, &hw, &none),
+            Some(Cell("fetcher-x86".into(), CapacityType::OnDemand)),
+            "builtin FOD must route to the fetcher class via features"
+        );
+    }
+
+    /// r35 B1 negative: featureless arch-unmappable intent stays `None`.
+    /// The B1 guard `(arch.is_none() && i.required_features.is_empty())`
+    /// preserves the early-return for this arm — there is no constraint
+    /// axis to route on, so `no_hosting_class` is the right answer.
+    /// Sibling of `fallback_cell_reference_then_first_by_arch`'s
+    /// `i("builtin")` and `i("")` pins.
+    #[test]
+    fn fallback_cell_unmappable_featureless_returns_none() {
+        let cfg = NodeClaimPoolConfig {
+            reference_hw_class: "mid-ebs-x86".into(),
+            ..Default::default()
+        };
+        let hw = HwClassConfig::from_literals(&[("mid-ebs-x86", &[(ARCH_LABEL, "amd64")])]);
+        let none = HashSet::new();
+        let i = SpawnIntent {
+            system: "darwin-pdp11".into(),
+            required_features: vec![],
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.fallback_cell(&i, &hw, &none),
+            None,
+            "featureless arch-unmappable intent has no constraint axis to route on"
         );
     }
 

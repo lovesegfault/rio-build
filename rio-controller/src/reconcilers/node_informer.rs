@@ -294,18 +294,23 @@ impl HwClassConfig {
     }
 
     /// Whether `h`'s `kubernetes.io/arch` label equals `arch`, OR is
-    /// absent (an arch-agnostic hw-class matches any arch). `false` if
-    /// `h` is unknown / config not yet loaded. §13b cold-start fallback
+    /// absent (an arch-agnostic hw-class matches any arch), OR `arch`
+    /// is `None` (an arch-agnostic intent — `system="builtin"` FODs —
+    /// matches any class; r35 B1). `false` if `h` is unknown / config
+    /// not yet loaded. §13b cold-start fallback
     /// (`NodeClaimPoolConfig::fallback_cell`) uses this to pick a
     /// reference cell for hw-agnostic intents by `intent.system`.
-    pub fn matches_arch(&self, h: &str, arch: &str) -> bool {
+    /// Mirrors the scheduler's `class_routes` `Option<&str>` arch
+    /// semantics so the two ends of the placement⊇provisioning
+    /// invariant cannot drift.
+    pub fn matches_arch(&self, h: &str, arch: Option<&str>) -> bool {
         let Some(d) = self.find(h) else {
             return false;
         };
         d.labels
             .iter()
             .find(|(k, _)| k == crate::reconcilers::nodeclaim_pool::ARCH_LABEL)
-            .is_none_or(|(_, v)| v == arch)
+            .is_none_or(|(_, v)| arch.is_none_or(|a| v == a))
     }
 
     /// Replace the config wholesale from a `GetHwClassConfigResponse`.
@@ -1220,15 +1225,23 @@ mod tests {
             ("arm", &[(ARCH_LABEL, "arm64")]),
             ("agnostic", &[("k", "v")]),
         ]);
-        assert!(cfg.matches_arch("x86", "amd64"));
-        assert!(!cfg.matches_arch("x86", "arm64"));
-        assert!(cfg.matches_arch("arm", "arm64"));
+        assert!(cfg.matches_arch("x86", Some("amd64")));
+        assert!(!cfg.matches_arch("x86", Some("arm64")));
+        assert!(cfg.matches_arch("arm", Some("arm64")));
         // No arch label → matches any.
-        assert!(cfg.matches_arch("agnostic", "amd64"));
-        assert!(cfg.matches_arch("agnostic", "arm64"));
-        // Unknown h → false.
-        assert!(!cfg.matches_arch("nope", "amd64"));
-        assert!(!HwClassConfig::default().matches_arch("x86", "amd64"));
+        assert!(cfg.matches_arch("agnostic", Some("amd64")));
+        assert!(cfg.matches_arch("agnostic", Some("arm64")));
+        // r35 B1: arch=None (arch-unmappable intent — `builtin` FOD) →
+        // matches any class. The intent is arch-agnostic; the class's
+        // arch label is irrelevant.
+        assert!(cfg.matches_arch("x86", None));
+        assert!(cfg.matches_arch("arm", None));
+        assert!(cfg.matches_arch("agnostic", None));
+        // Unknown h → false (even with arch=None — unknown class is
+        // never a candidate).
+        assert!(!cfg.matches_arch("nope", Some("amd64")));
+        assert!(!cfg.matches_arch("nope", None));
+        assert!(!HwClassConfig::default().matches_arch("x86", Some("amd64")));
     }
 
     #[test]

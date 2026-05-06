@@ -345,10 +345,14 @@ pkgs.testers.runNixOSTest {
     #       floor when no fetcher hwClass is loaded) lets fetcher pods
     #       tolerate the fetcher node taint.
     #   (b) pool-static `nodeSelector{rio.build/fetcher: true}` present
-    #       (§13e B4 restore — `r[ctrl.pool.fetcher-affinity-from-intent+2]`).
-    #       Builtin FODs have system="builtin" → arch=None →
-    #       `hw_class_names=[]` → no per-intent affinity, so the
-    #       pool-static selector is the SOLE restrictive constraint.
+    #       (§13e B4 restore — `r[ctrl.pool.fetcher-affinity-from-intent+3]`).
+    #       In THIS fixture the `vmtest` hw-class declares no
+    #       `providesFeatures`, so `reference_hw_class_for_system`
+    #       returns None for builtin FODs and `hw_class_names=[]` →
+    #       no per-intent affinity. r35 B1 routes builtin FODs by
+    #       feature to `fetcher-*` in production; in k3s the
+    #       pool-static selector is the LAST-RESORT restrictive
+    #       constraint.
     #   (c) the deleted `rio.build/node-role` convention must NOT
     #       reappear — only the §13e taint-key is wired to NodeClaim
     #       labels.
@@ -362,8 +366,9 @@ pkgs.testers.runNixOSTest {
         )
         sel = spec.get("nodeSelector") or {}
         # §13e B4 restored the pool-static nodeSelector with the new
-        # taint-key. It is the sole restrictive constraint for builtin
-        # FODs (no arch → no per-intent affinity).
+        # taint-key. It is the LAST-RESORT restrictive constraint for
+        # builtin FODs in this fixture (no fetcher hw-class →
+        # no per-intent affinity; r35 B1).
         assert sel.get("rio.build/fetcher") == "true", (
             f"fetcher pod must have pool-static rio.build/fetcher "
             f"nodeSelector (§13e B4): {sel!r}"
