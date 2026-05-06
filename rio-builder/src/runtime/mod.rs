@@ -1136,8 +1136,8 @@ mod tests {
     use rstest::rstest;
 
     #[test]
-    fn validate_host_arch_gates_builders_only() {
-        use rio_proto::types::ExecutorKind::{Builder, Fetcher};
+    fn validate_host_arch_gates_builders() {
+        use rio_proto::types::ExecutorKind::Builder;
         let s = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
 
         // builder: host must be in systems (excluding builtin)
@@ -1160,12 +1160,46 @@ mod tests {
         // builtin-only → no constraint (auto-detect path adds host first
         // anyway, but defensive)
         assert!(validate_host_arch(Builder, &s(&["builtin"]), "aarch64-linux").is_ok());
+    }
 
-        // fetcher: never validates (FODs are arch-agnostic)
+    /// r35 bug_039: a Fetcher worker with arch-typed systems
+    /// (`RIO_SYSTEMS=x86_64-linux,builtin` for `pkgs.fetchurl` FODs) on
+    /// the wrong host arch must NOT silently `Ok(())`. The pre-r35
+    /// `if kind == Fetcher { return Ok(()); }` early-return was the
+    /// other half of the bug_039 hole: §13e dropped the helm-static
+    /// fetcher arch nodeSelector AND skipped this check, so an
+    /// `x86-64-fetcher` pod that landed on arm64 registered, accepted
+    /// dispatch, and CrashLoopBackOff'd. The pod-spec arch nodeSelector
+    /// (option (a)) is the primary fix; this is the §13d defense-in-depth
+    /// backstop against helm chart drift.
+    #[test]
+    fn validate_host_arch_fetcher_arch_typed_systems() {
+        use rio_proto::types::ExecutorKind::Fetcher;
+        let s = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+
+        // Arch-typed Fetcher on the wrong host: refuse at boot.
         assert!(
-            validate_host_arch(Fetcher, &s(&["x86_64-linux", "builtin"]), "aarch64-linux").is_ok(),
-            "fetcher on wrong arch is intentional (cheap Gravitons)"
+            validate_host_arch(Fetcher, &s(&["x86_64-linux", "builtin"]), "aarch64-linux").is_err(),
+            "Fetcher worker with arch-typed RIO_SYSTEMS on wrong arch must refuse — \
+             a misplaced fetcher refuses arch-typed systems at register time \
+             instead of failing builds at dispatch (r35 bug_039)"
         );
+        // Arch-typed Fetcher on the right host: ok.
+        assert!(
+            validate_host_arch(Fetcher, &s(&["x86_64-linux", "builtin"]), "x86_64-linux").is_ok()
+        );
+        // Multi-arch Fetcher: accepts either.
+        assert!(
+            validate_host_arch(
+                Fetcher,
+                &s(&["x86_64-linux", "aarch64-linux"]),
+                "aarch64-linux"
+            )
+            .is_ok()
+        );
+        // builtin-only Fetcher (the common `builtins.fetchurl` case): no
+        // constraint — arch-agnostic, intentionally cheap Gravitons.
+        assert!(validate_host_arch(Fetcher, &s(&["builtin"]), "aarch64-linux").is_ok());
     }
 
     // -----------------------------------------------------------------------

@@ -265,6 +265,17 @@ spec:
                 \ Fetcher Pools through nodeclaim_pool; per-pool override would diverge\
                 \ FFD from the stamped pod request (r35 merged_bug_024)"
               rule: self.kind != 'Fetcher' || !has(self.fuseCacheBytes)
+            - message: "kind=Fetcher: nodeSelector['rio.build/fetcher'] is reconciler-owned\
+                \ and may only be 'true' \u2014 the dedicated-node constraint is universal\
+                \ and cannot be weakened (r35 bug_044)"
+              rule: self.kind != 'Fetcher' || !has(self.nodeSelector) || !('rio.build/fetcher'
+                in self.nodeSelector) || self.nodeSelector['rio.build/fetcher'] ==
+                'true'
+            - message: "kind=Builder forbids nodeSelector['rio.build/fetcher'] \u2014\
+                \ the fetcher taint repels Builder pods (no toleration) so the pod\
+                \ would be permanently Pending (r35 bug_044)"
+              rule: self.kind != 'Builder' || !has(self.nodeSelector) || !('rio.build/fetcher'
+                in self.nodeSelector)
           status:
             description: "Pool status \u2014 reconciler writes, operators read.\n\n\
               `Default` because kube-rs initializes it to `None` \u2192\n`Some(default())`\

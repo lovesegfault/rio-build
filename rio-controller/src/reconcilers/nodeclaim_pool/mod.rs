@@ -80,18 +80,19 @@ fn now_epoch() -> f64 {
         .map_or(0.0, |d| d.as_secs_f64())
 }
 
-/// `(systems, features)` extracted from a Builder Pool. The
-/// provisioner's coverage filter ([`pool_covers`]) checks intents
-/// against the union of these — the SAME `(systems, features)` pair
-/// the placer (`pool/jobs::queued_for_pool`) sends per-Pool to
+/// `(kind, systems, features)` extracted from a Builder/Fetcher Pool.
+/// The provisioner's coverage filter ([`pool_covers`]) checks intents
+/// against the union of these — the SAME `(kind, systems, features)`
+/// tuple the placer (`pool/jobs::queued_for_pool`) sends per-Pool to
 /// `GetSpawnIntents{filter_features: true}`.
-type PoolCoverage = (Vec<String>, Vec<String>);
+type PoolCoverage = (rio_proto::types::ExecutorKind, Vec<String>, Vec<String>);
 
 /// §13d Pool axis (r31 bug_019): does ANY configured Builder or Fetcher
 /// Pool place a Job for `intent`? Mirrors the scheduler's
-/// `passes_intent_filter` — `systems=[]` means no system filter (a
-/// Pool with no `systems` constraint accepts every arch), and
-/// `features` is checked via the SAME `features_compatible` predicate
+/// `passes_intent_filter` — a 3-axis (`kind`, `systems`, `features`)
+/// predicate. `systems=[]` means no system filter (a Pool with no
+/// `systems` constraint accepts every arch), and `features` is checked
+/// via the SAME `features_compatible` predicate
 /// (`pool/jobs::queued_for_pool` sends `filter_features=true` per
 /// Pool). The `retain_hosting_cells` chokepoint validates the *cell*
 /// axis (some hwClass hosts the intent); this validates the *Pool*
@@ -99,6 +100,16 @@ type PoolCoverage = (Vec<String>, Vec<String>);
 /// cell-routable but Pool-uncovered would mint a NodeClaim that
 /// FFD-places (`reserved`) → `reap_idle` skips forever — a
 /// permanently-idle on-demand metal node with no Job ever spawned.
+///
+/// r35 merged_bug_004 residual (B2): the `kind` axis is checked
+/// EXPLICITLY, not assumed redundant with the features axis. The
+/// `kind`/`features` redundancy holds only when the scheduler-side
+/// FOD↔fetcher biconditional (`EffectiveFeatures::derive`, B0) holds —
+/// but the controller has no view into whether that invariant held on
+/// the wire. A scheduler regression that re-leaks `fetcher` into a
+/// `kind=Builder` intent would otherwise mint a fetcher NodeClaim that
+/// the placer never Job-places (the placer DOES check `intent.kind ==
+/// pool.spec.kind`).
 ///
 /// §13e: callers MUST build `coverage` from `effective_features(spec)`,
 /// not `spec.features` — a Fetcher Pool's declared features are `[]`
@@ -112,8 +123,9 @@ type PoolCoverage = (Vec<String>, Vec<String>);
 /// failure mode (silent over-provisioning) doesn't surface in any
 /// fast test path.
 pub(super) fn pool_covers(intent: &SpawnIntent, coverage: &[PoolCoverage]) -> bool {
-    coverage.iter().any(|(systems, features)| {
-        (systems.is_empty() || systems.contains(&intent.system))
+    coverage.iter().any(|(kind, systems, features)| {
+        i32::from(*kind) == intent.kind
+            && (systems.is_empty() || systems.contains(&intent.system))
             && rio_common::k8s::features_compatible(&intent.required_features, features)
     })
 }
@@ -811,6 +823,7 @@ impl NodeClaimPoolReconciler {
                     })
                     .map(|p| {
                         (
+                            pool::executor_kind_to_proto(p.spec.kind),
                             p.spec.systems.clone(),
                             pool::pod::effective_features(&p.spec),
                         )
@@ -829,7 +842,7 @@ impl NodeClaimPoolReconciler {
                         dropped,
                         executor_pools = coverage.len(),
                         "SpawnIntents dropped at provisioner — no configured Pool \
-                         (Builder or Fetcher) covers their (system, effective_features); \
+                         (Builder or Fetcher) covers their (kind, system, effective_features); \
                          add a Pool or remove the hwClass advertising the feature"
                     );
                 }
@@ -2005,53 +2018,81 @@ mod tests {
     }
 
     /// §13d Pool axis (r31 bug_019): the provisioner's coverage filter
-    /// uses the SAME predicate as the placer — `systems` membership +
-    /// `features_compatible`. An intent the placer would never Job-place
-    /// must not be provisioned (mints a permanently-idle metal node).
+    /// uses the SAME predicate as the placer — `kind` + `systems`
+    /// membership + `features_compatible`. An intent the placer would
+    /// never Job-place must not be provisioned (mints a
+    /// permanently-idle metal node).
+    ///
+    /// r35 B2: every test intent carries an EXPLICIT `kind` so the
+    /// kind clause is exercised, never vacuously passed via
+    /// `Default::default()` (proto `ExecutorKind` defaults to
+    /// `Builder=0`).
     #[test]
     fn pool_covers_mirrors_placer_predicate() {
+        use rio_proto::types::ExecutorKind as PKind;
         let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let intent = |sys: &str, feats: &[&str]| SpawnIntent {
+        let intent = |kind: PKind, sys: &str, feats: &[&str]| SpawnIntent {
+            kind: kind.into(),
             system: sys.into(),
             required_features: s(feats),
             ..Default::default()
         };
 
-        // Default chart: only Builder Pool is `(systems=[x86_64-linux,
+        // Default chart: only Builder Pool is `(Builder, systems=[x86_64-linux,
         // i686-linux], features=[])`. A kvm intent has nowhere to go.
-        let default_chart: Vec<PoolCoverage> = vec![(s(&["x86_64-linux", "i686-linux"]), vec![])];
+        let default_chart: Vec<PoolCoverage> =
+            vec![(PKind::Builder, s(&["x86_64-linux", "i686-linux"]), vec![])];
         assert!(
-            !pool_covers(&intent("x86_64-linux", &["kvm"]), &default_chart),
+            !pool_covers(
+                &intent(PKind::Builder, "x86_64-linux", &["kvm"]),
+                &default_chart
+            ),
             "kvm intent uncovered when no kvm Pool configured (default chart) — pre-fix \
              this minted a permanently-idle on-demand metal node"
         );
         assert!(
-            pool_covers(&intent("x86_64-linux", &[]), &default_chart),
+            pool_covers(&intent(PKind::Builder, "x86_64-linux", &[]), &default_chart),
             "featureless x86 intent covered by featureless x86 Pool"
         );
         // arch axis: aarch64 intent with no aarch64 Pool.
         assert!(
-            !pool_covers(&intent("aarch64-linux", &[]), &default_chart),
+            !pool_covers(
+                &intent(PKind::Builder, "aarch64-linux", &[]),
+                &default_chart
+            ),
             "aarch64 intent uncovered when only x86 Pools exist"
         );
 
         // EKS-shaped: kvm Pool added → kvm intent covered.
         let eks: Vec<PoolCoverage> = vec![
-            (s(&["x86_64-linux", "i686-linux"]), vec![]),
-            (s(&["x86_64-linux"]), s(&["kvm", "nixos-test"])),
-            (s(&["aarch64-linux"]), vec![]),
+            (PKind::Builder, s(&["x86_64-linux", "i686-linux"]), vec![]),
+            (
+                PKind::Builder,
+                s(&["x86_64-linux"]),
+                s(&["kvm", "nixos-test"]),
+            ),
+            (PKind::Builder, s(&["aarch64-linux"]), vec![]),
         ];
-        assert!(pool_covers(&intent("x86_64-linux", &["kvm"]), &eks));
-        assert!(pool_covers(&intent("aarch64-linux", &[]), &eks));
+        assert!(pool_covers(
+            &intent(PKind::Builder, "x86_64-linux", &["kvm"]),
+            &eks
+        ));
+        assert!(pool_covers(
+            &intent(PKind::Builder, "aarch64-linux", &[]),
+            &eks
+        ));
         // Bidirectional ∅-guard: a featureless intent does NOT match
         // the kvm Pool — but it matches the featureless x86 Pool.
-        assert!(pool_covers(&intent("x86_64-linux", &[]), &eks));
+        assert!(pool_covers(
+            &intent(PKind::Builder, "x86_64-linux", &[]),
+            &eks
+        ));
 
         // `systems=[]` ⇔ no system filter (passes_intent_filter
         // semantics: `req.systems.is_empty()` skips the check).
-        let agnostic: Vec<PoolCoverage> = vec![(vec![], vec![])];
+        let agnostic: Vec<PoolCoverage> = vec![(PKind::Builder, vec![], vec![])];
         assert!(
-            pool_covers(&intent("aarch64-linux", &[]), &agnostic),
+            pool_covers(&intent(PKind::Builder, "aarch64-linux", &[]), &agnostic),
             "systems=[] Pool admits any arch"
         );
 
@@ -2059,7 +2100,10 @@ mod tests {
         // (fail-safe, not fail-open — the placer wouldn't spawn either).
         // Distinct from a Pool *list* error, which fail-OPENs by
         // skipping the retain entirely (see `reconcile_once`).
-        assert!(!pool_covers(&intent("x86_64-linux", &[]), &[]));
+        assert!(!pool_covers(
+            &intent(PKind::Builder, "x86_64-linux", &[]),
+            &[]
+        ));
 
         // §13e: a Fetcher Pool's coverage tuple uses
         // `effective_features(spec)` (= [fetcher]), NOT spec.features
@@ -2069,10 +2113,12 @@ mod tests {
         // intent here (no fetcher NodeClaim ever minted).
         let fetcher_pool = crate::fixtures::test_pool("f", ExecutorKind::Fetcher);
         let fetcher_coverage: Vec<PoolCoverage> = vec![(
+            crate::reconcilers::pool::executor_kind_to_proto(fetcher_pool.spec.kind),
             fetcher_pool.spec.systems.clone(),
             crate::reconcilers::pool::pod::effective_features(&fetcher_pool.spec),
         )];
         let fod = SpawnIntent {
+            kind: PKind::Fetcher.into(),
             system: fetcher_pool.spec.systems[0].clone(),
             required_features: vec![rio_common::k8s::FETCHER_FEATURE.into()],
             ..Default::default()
@@ -2082,40 +2128,37 @@ mod tests {
             "FOD intent covered by Fetcher Pool via effective_features (§13e)"
         );
         // Cross-kind partition: FOD ⊄ builder pool, builder intent ⊄
-        // fetcher pool (the bidirectional ∅-guard).
+        // fetcher pool (the bidirectional ∅-guard, AND the kind axis).
         assert!(
             !pool_covers(&fod, &eks),
-            "FOD intent NOT covered by featureless builder Pool (∅-guard)"
+            "FOD intent NOT covered by featureless builder Pool (∅-guard + kind)"
         );
-        let bld = intent(&fetcher_pool.spec.systems[0], &[]);
+        let bld = intent(PKind::Builder, &fetcher_pool.spec.systems[0], &[]);
         assert!(
             !pool_covers(&bld, &fetcher_coverage),
-            "featureless builder intent NOT covered by Fetcher Pool (∅-guard)"
+            "featureless builder intent NOT covered by Fetcher Pool (∅-guard + kind)"
         );
     }
 
-    /// **r35 B0/B2 boundary tripwire** — `pool_covers` does NOT check
-    /// the `kind` axis. A `kind=Builder` intent carrying
+    /// **r35 B0/B2 boundary tripwire** — `pool_covers` checks the
+    /// `kind` axis. A `kind=Builder` intent carrying
     /// `required_features=["fetcher"]` (impossible post-B0: the
     /// scheduler-side `EffectiveFeatures::derive` strips `fetcher`
     /// from non-FOD declared sets so the wire intent never carries it)
-    /// would be accepted by a Fetcher Pool's coverage tuple `(systems,
-    /// [fetcher])` — `features_compatible([fetcher], [fetcher]) =
-    /// true`, no kind check.
+    /// would otherwise be accepted by a Fetcher Pool's coverage tuple
+    /// `(Fetcher, systems, [fetcher])` —
+    /// `features_compatible([fetcher], [fetcher]) = true`.
     ///
     /// B0 makes this input unreachable; B2 hardens the predicate
     /// anyway (defense-in-depth: a future scheduler regression must
     /// not silently mint fetcher nodes for builder intents). This
     /// test documents the contract and is the red-first proof for
     /// B2.
-    ///
-    /// TODO: enable once B2 adds the `kind` axis to `PoolCoverage`.
     #[test]
-    #[ignore = "r35 B2: PoolCoverage has no kind axis yet — B0 only \
-                makes the input unreachable; B2 hardens the predicate"]
     fn pool_covers_rejects_kind_mismatch() {
         let fetcher_pool = crate::fixtures::test_pool("f", ExecutorKind::Fetcher);
         let fetcher_coverage: Vec<PoolCoverage> = vec![(
+            crate::reconcilers::pool::executor_kind_to_proto(fetcher_pool.spec.kind),
             fetcher_pool.spec.systems.clone(),
             crate::reconcilers::pool::pod::effective_features(&fetcher_pool.spec),
         )];
@@ -2136,6 +2179,27 @@ mod tests {
              features (B2: a scheduler regression that re-leaks \
              `fetcher` into a builder intent would otherwise mint a \
              permanently-idle fetcher node)"
+        );
+        // The inverse: a Fetcher intent must NOT be covered by a
+        // Builder Pool advertising `[fetcher]` (impossible — Builder
+        // Pools' `effective_features(spec)` strips `fetcher` — but
+        // build the impossible input directly for the same
+        // defense-in-depth proof).
+        let bld_advertising_fetcher: Vec<PoolCoverage> = vec![(
+            rio_proto::types::ExecutorKind::Builder,
+            fetcher_pool.spec.systems.clone(),
+            vec![rio_common::k8s::FETCHER_FEATURE.into()],
+        )];
+        let fod = SpawnIntent {
+            system: fetcher_pool.spec.systems[0].clone(),
+            required_features: vec![rio_common::k8s::FETCHER_FEATURE.into()],
+            kind: rio_proto::types::ExecutorKind::Fetcher.into(),
+            ..Default::default()
+        };
+        assert!(
+            !pool_covers(&fod, &bld_advertising_fetcher),
+            "Fetcher FOD intent must NOT be covered by a Builder Pool — \
+             `pool_covers` checks `kind` regardless of features"
         );
     }
 }

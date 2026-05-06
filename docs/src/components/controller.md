@@ -169,21 +169,23 @@ prefix-matches the Job name against its `recently_disconnected` map
 logged, reconcile continues). Defense-in-depth behind the worker-side
 `daemon_timeout` -> `TimedOut` primary path.
 
-r[ctrl.pod.arch-selector]
+r[ctrl.pod.arch-selector+2]
 When the pool's `spec.systems` resolves to a single *host* CPU
 architecture, the controller MUST inject
 `kubernetes.io/arch={amd64|arm64}` into the Job pod's `nodeSelector`
 (operator-set value wins via `or_insert`). 32-bit guest systems map to
 their 64-bit host (`i686`→`amd64`, `armv7l`/`armv6l`→`arm64`) so an
 `extra-platforms` pool like `[x86_64-linux, i686-linux]` still
-constrains to amd64. Builder-only: fetchers run `builtin`
-(arch-agnostic) and benefit from cheaper nodes. Without this, an
-`x86_64-linux` pool can land on an arm64 node (unconstrained fallback
-NodePool — I-098), register as `x86_64` from `RIO_SYSTEMS`, accept
-dispatch, and have the local nix-daemon refuse the build. Multi-arch
-and `builtin`-only pools
-get no selector and rely on the executor's startup arch check as the
-safety net.
+constrains to amd64. Applies to BOTH Builder and Fetcher Pools (r35
+bug_039): fetchers run `builtin` (arch-agnostic) AND arch-typed FODs
+from `pool.spec.systems` — the `systems`→arch resolution skips
+`builtin`, so a `["builtin"]`-only fetcher Pool stays arch-agnostic.
+Without this, an `x86_64-linux` pool can land on an arm64 node
+(unconstrained fallback NodePool — I-098), register as `x86_64` from
+`RIO_SYSTEMS`, accept dispatch, and have the local nix-daemon refuse
+the build. Multi-arch and `builtin`-only pools get no selector and rely
+on the executor's startup arch check (applied to BOTH kinds since r35)
+as the safety net.
 
 r[ctrl.pod.tgps-default]
 The Job pod spec MUST default `terminationGracePeriodSeconds` to
@@ -315,15 +317,22 @@ its toleration automatically. This covers fitted intents
 (`r[ctrl.pool.kvm-device+2]`) covers `hw_class_names=[]` cold-start
 intents.
 
-r[ctrl.pool.fetcher-affinity-from-intent+3]
-The fetcher pod's restrictive placement constraint MUST be the union of
+r[ctrl.pool.fetcher-affinity-from-intent+4]
+The fetcher pod's restrictive placement constraint MUST be the merge of
 the per-intent `nodeAffinity` derived from `intent.hw_class_names` via
-`cells_to_selector_terms` (`r[ctrl.pool.node-affinity-from-intent]`) AND
-the pool-static `nodeSelector{rio.build/fetcher: true}` (§13e B4). The
-two cannot drift: the pool-static constraint keys on `pool.spec.kind ==
-Fetcher` (a Pool-level invariant), and the per-intent affinity
-(`intent.hw_class_names ∩ {fetcher-*}`) is a PROJECTION of that
-invariant, not an independent opinion of it. This is NOT the
+`cells_to_selector_terms` (`r[ctrl.pool.node-affinity-from-intent]`)
+AND the pool-static `nodeSelector{rio.build/fetcher: true}` (§13e B4)
+AND the operator's `pool.spec.node_selector` (r35 bug_044). The
+operator selector ADDS constraints (AZ pin, instance type); it MUST NOT
+replace or weaken the pool-static fetcher constraint — the controller
+unconditionally inserts `rio.build/fetcher: true` after the
+operator-supplied keys, and the CEL admission rule rejects an
+operator-set `nodeSelector["rio.build/fetcher"]` value other than
+`"true"`. The pool-static and per-intent constraints cannot drift: the
+pool-static constraint keys on `pool.spec.kind == Fetcher` (a
+Pool-level invariant), and the per-intent affinity (`intent.
+hw_class_names ∩ {fetcher-*}`) is a PROJECTION of that invariant, not
+an independent opinion of it. This is NOT the
 `r[ctrl.pool.kvm-device+2]`/r33-bug_002 redundancy anti-pattern: the kvm
 nodeSelector keyed on `pool.spec.features` (existential — an intent may
 need only one feature, which routes to a non-metal class), so the two

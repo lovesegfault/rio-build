@@ -157,7 +157,7 @@ fn is_fetcher(pool: &Pool) -> bool {
 
 /// §13e: Fetcher Pools advertise `[fetcher]`, NOT empty. FODs route by
 /// `effective_features(state) = [fetcher]` at the scheduler chokepoint
-/// (`r[sched.sla.fod-feature-derivation]`); the I-181 ∅-guard requires
+/// (`r[sched.sla.fod-feature-derivation+2]`); the I-181 ∅-guard requires
 /// the Pool's features to match. Divergence fails CLOSED — a bug that
 /// makes `effective_features(spec) ≠ [fetcher]` means the fetcher Pool
 /// never spawns (loud), not that FODs route to builder cells (silent).
@@ -235,16 +235,31 @@ fn effective_host_users(pool: &Pool) -> Option<bool> {
 /// stamps `FETCHER_TAINT_KEY` as both label AND taint on fetcher
 /// NodeClaims, so the selector and the node label come from the same
 /// constant and cannot drift.
-// r[impl fetcher.node.dedicated+3]
-// r[impl ctrl.pool.fetcher-affinity-from-intent+3]
+// r[impl fetcher.node.dedicated+4]
+// r[impl ctrl.pool.fetcher-affinity-from-intent+4]
 fn effective_node_selector(pool: &Pool) -> Option<BTreeMap<String, String>> {
     if is_fetcher(pool) {
-        pool.spec.node_selector.clone().or_else(|| {
-            Some(BTreeMap::from([(
-                rio_common::k8s::FETCHER_TAINT_KEY.into(),
-                "true".into(),
-            )]))
-        })
+        // r35 bug_044 (§Permissive-restrictive asymmetry): the
+        // pool-static fetcher constraint is RESTRICTIVE and
+        // load-bearing for `system="builtin"` FODs whose
+        // `hw_class_names=[]` carries no per-intent affinity. The
+        // operator selector ADDS constraints (AZ pin, instance type),
+        // it does not remove this one. The pre-r35 `or_else` (replace)
+        // let an AZ pin co-tenant an open-egress fetcher with
+        // rio-controller's node — dropping the constraint removes the
+        // lateral-movement boundary. NOT the same shape as
+        // `effective_tolerations` (permissive; over-firing is harmless).
+        //
+        // UNCONDITIONAL `insert` — never `or_insert_with`. If the
+        // operator sets `{rio.build/fetcher: "false"}`, the entry
+        // exists and `or_insert_with` would PRESERVE it: the constraint
+        // is silently weakened and the pod escapes the dedicated taint.
+        // The constraint is universal; the operator cannot weaken it.
+        // The CEL guard rejects the misconfig at admission for new
+        // specs; this is the belt-and-suspenders for pre-CEL specs.
+        let mut ns = pool.spec.node_selector.clone().unwrap_or_default();
+        ns.insert(rio_common::k8s::FETCHER_TAINT_KEY.into(), "true".into());
+        Some(ns)
     } else {
         pool.spec.node_selector.clone()
     }
@@ -395,7 +410,7 @@ pub(super) fn proto_term_to_k8s(t: &rio_proto::types::NodeSelectorTerm) -> NodeS
 /// armv7l→arm64): a pool advertising `[x86_64-linux, i686-linux]` via
 /// `extra-platforms` must land on amd64, and no cloud provider offers
 /// 386/arm nodes anyway.
-// r[impl ctrl.pod.arch-selector]
+// r[impl ctrl.pod.arch-selector+2]
 pub(super) fn nix_systems_to_k8s_arch(systems: &[String]) -> Option<&'static str> {
     let mut arch: Option<&'static str> = None;
     for s in systems {
@@ -644,15 +659,25 @@ pub fn build_executor_pod_spec(
         ),
         node_selector: {
             let mut ns = effective_node_selector(pool).unwrap_or_default();
-            // r[impl ctrl.pod.arch-selector]
+            // r[impl ctrl.pod.arch-selector+2]
             // I-098: a pool with systems=[x86_64-linux] landed pods on an
             // arm64 node (fallback NodePool unconstrained) — builder
             // registers as x86_64 from RIO_SYSTEMS, scheduler dispatches
             // x86_64 drvs, nix-daemon refuses (host is aarch64). Derive
             // kubernetes.io/arch from systems so karpenter constrains arch.
-            // Builder-only: fetchers run `builtin` (arch-agnostic) and
-            // benefit from cheaper Graviton; rio-builder's startup arch
-            // check is the safety net for builders that slip through.
+            // Fetchers run `builtin` (arch-agnostic) AND arch-typed FODs
+            // from `pool.spec.systems`; rio-builder's startup arch check
+            // (now applied to Fetcher kind too — r35 bug_039) is the
+            // safety net for misplaced executors of either kind.
+            //
+            // r35 bug_039: §13e dropped the helm-static fetcher arch
+            // nodeSelector and `validate_host_arch` skipped Fetcher;
+            // both compensations gone → x86-64-fetcher pod on arm64
+            // CrashLoopBackOff'd forever (kubelet does not reschedule
+            // on container exit). Arch is UNIVERSAL — applies to
+            // fetcher Pools too. `nix_systems_to_k8s_arch` skips
+            // `builtin`, so a `["builtin"]`-only Pool stays
+            // arch-agnostic (no pin).
             //
             // Why is THIS pool-static restrictive constraint safe and
             // a kvm one was not (r33 bug_002)? Because
@@ -665,7 +690,7 @@ pub fn build_executor_pod_spec(
             // a non-metal class. Don't generalize this pattern to a
             // feature-gated nodeSelector — it's the §Permissive-
             // restrictive asymmetry.
-            if !fetcher && let Some(arch) = nix_systems_to_k8s_arch(&pool.spec.systems) {
+            if let Some(arch) = nix_systems_to_k8s_arch(&pool.spec.systems) {
                 ns.entry("kubernetes.io/arch".into()).or_insert(arch.into());
             }
             // No pool-static kvm nodeSelector (r33 bug_002). kvm
@@ -1047,7 +1072,7 @@ mod tests {
             nix_systems_to_k8s_arch(&s(&["armv7l-linux"])),
             Some("arm64")
         );
-        // r[verify ctrl.pod.arch-selector]
+        // r[verify ctrl.pod.arch-selector+2]
         // extra-platforms pool: i686 alongside x86_64 → still amd64
         assert_eq!(
             nix_systems_to_k8s_arch(&s(&["x86_64-linux", "i686-linux"])),
@@ -1401,8 +1426,8 @@ mod tests {
     /// (`FETCHER_TAINT_KEY`) is wired to NodeClaim labels via
     /// `cover::build_nodeclaim`; a `node-role` selector would never match
     /// any node.
-    // r[verify ctrl.pool.fetcher-affinity-from-intent+3]
-    // r[verify fetcher.node.dedicated+3]
+    // r[verify ctrl.pool.fetcher-affinity-from-intent+4]
+    // r[verify fetcher.node.dedicated+4]
     #[test]
     fn fetcher_pod_no_legacy_node_role_selector() {
         use rio_proto::types::{HwClassLabels, NodeLabelMatch, NodeTaint};
@@ -1470,8 +1495,8 @@ mod tests {
     /// `build_executor_pod_spec` does not see a per-intent affinity, so
     /// the only restrictive placement it CAN stamp is the pool-static
     /// nodeSelector.
-    // r[verify ctrl.pool.fetcher-affinity-from-intent+3]
-    // r[verify fetcher.node.dedicated+3]
+    // r[verify ctrl.pool.fetcher-affinity-from-intent+4]
+    // r[verify fetcher.node.dedicated+4]
     #[test]
     fn builtin_fod_pod_has_pool_static_fetcher_node_selector() {
         // Default (unloaded) hwClass config — the cold-start path:
@@ -1501,11 +1526,19 @@ mod tests {
         );
     }
 
-    /// §13e B4: an operator-supplied `pool.spec.node_selector` overrides
-    /// the pool-static fetcher default — `effective_node_selector` is
-    /// `or_else`, not `or_insert`. (Same shape as `effective_tolerations`.)
+    /// §13e B4 + r35 bug_044: an operator-supplied
+    /// `pool.spec.node_selector` MERGES with the pool-static fetcher
+    /// constraint. The operator's keys survive AND `rio.build/fetcher`
+    /// is unconditionally present. The pre-r35 `or_else` shape let an
+    /// operator AZ pin REPLACE the dedicated-node constraint —
+    /// §Permissive-restrictive asymmetry: this constraint is
+    /// restrictive and load-bearing for `system="builtin"` FODs whose
+    /// `hw_class_names=[]` carries no per-intent affinity; dropping it
+    /// removes the lateral-movement boundary.
+    // r[verify ctrl.pool.fetcher-affinity-from-intent+4]
+    // r[verify fetcher.node.dedicated+4]
     #[test]
-    fn fetcher_pod_spec_node_selector_overrides_pool_static_default() {
+    fn fetcher_pod_spec_node_selector_merges_with_pool_static_default() {
         let hw = HwClassConfig::default();
         let mut p = crate::fixtures::test_pool("f", ExecutorKind::Fetcher);
         p.spec.node_selector = Some(BTreeMap::from([(
@@ -1523,12 +1556,111 @@ mod tests {
             .expect("operator-supplied nodeSelector must survive");
         assert_eq!(
             ns.get("topology.kubernetes.io/zone").map(String::as_str),
-            Some("us-east-2a")
+            Some("us-east-2a"),
+            "operator-supplied AZ pin survives the merge"
         );
+        assert_eq!(
+            ns.get(rio_common::k8s::FETCHER_TAINT_KEY)
+                .map(String::as_str),
+            Some("true"),
+            "operator selector ADDS to the pool-static fetcher \
+             constraint, never replaces — the dedicated-node boundary \
+             is unconditional: {ns:?}"
+        );
+    }
+
+    /// r35 bug_044: the pool-static fetcher constraint cannot be
+    /// WEAKENED by the operator. If the operator sets
+    /// `nodeSelector{rio.build/fetcher: "false"}`, `effective_node_selector`
+    /// overrides it to `"true"` (UNCONDITIONAL `insert`, not
+    /// `or_insert_with` — `or_insert_with` would preserve the
+    /// operator's `"false"` and the pod would escape the dedicated
+    /// taint). The CEL guard rejects this misconfig at admission for
+    /// new specs; this is the controller-side belt-and-suspenders for
+    /// pre-CEL specs the apiserver already accepted.
+    // r[verify fetcher.node.dedicated+4]
+    #[test]
+    fn fetcher_pod_spec_node_selector_cannot_weaken_pool_static_default() {
+        let hw = HwClassConfig::default();
+        let mut p = crate::fixtures::test_pool("f", ExecutorKind::Fetcher);
+        p.spec.node_selector = Some(BTreeMap::from([(
+            rio_common::k8s::FETCHER_TAINT_KEY.into(),
+            "false".into(),
+        )]));
+        let spec = build_executor_pod_spec(
+            &p,
+            &crate::fixtures::test_sched_addrs(),
+            &crate::fixtures::test_store_addrs(),
+            &hw,
+        );
+        let ns = spec
+            .node_selector
+            .expect("fetcher pod must have a nodeSelector");
+        assert_eq!(
+            ns.get(rio_common::k8s::FETCHER_TAINT_KEY)
+                .map(String::as_str),
+            Some("true"),
+            "operator-set rio.build/fetcher=false must be overridden — \
+             the pool-static constraint is universal, not weakenable: {ns:?}"
+        );
+    }
+
+    /// r35 bug_039: a Fetcher Pool with arch-typed `systems` (e.g.,
+    /// `["x86_64-linux", "builtin"]` for `pkgs.fetchurl` FODs) gets the
+    /// `kubernetes.io/arch` nodeSelector from `nix_systems_to_k8s_arch`,
+    /// same as a Builder Pool. §13e dropped the helm-static fetcher
+    /// arch nodeSelector AND `validate_host_arch` skipped Fetcher —
+    /// both compensations gone meant an `x86-64-fetcher` worker could
+    /// land on an arm64 fetcher node and CrashLoopBackOff forever
+    /// (kubelet does not reschedule on container exit). A
+    /// `["builtin"]`-only Pool stays arch-agnostic (no pin) —
+    /// `nix_systems_to_k8s_arch` skips `builtin`.
+    // r[verify ctrl.pod.arch-selector+2]
+    #[test]
+    fn fetcher_pod_arch_selector_from_systems() {
+        let hw = HwClassConfig::default();
+
+        // Arch-typed Fetcher Pool: `systems=["x86_64-linux", "builtin"]`
+        // resolves to a single host arch → arch pin.
+        let mut p = crate::fixtures::test_pool("f", ExecutorKind::Fetcher);
+        p.spec.systems = s(&["x86_64-linux", "builtin"]);
+        let spec = build_executor_pod_spec(
+            &p,
+            &crate::fixtures::test_sched_addrs(),
+            &crate::fixtures::test_store_addrs(),
+            &hw,
+        );
+        let ns = spec
+            .node_selector
+            .expect("arch-typed Fetcher pod must have a nodeSelector");
+        assert_eq!(
+            ns.get("kubernetes.io/arch").map(String::as_str),
+            Some("amd64"),
+            "Fetcher Pool with arch-typed systems must pin arch — \
+             validate_host_arch failing at boot does not reschedule: {ns:?}"
+        );
+        // The pool-static fetcher constraint is still present (merge).
+        assert_eq!(
+            ns.get(rio_common::k8s::FETCHER_TAINT_KEY)
+                .map(String::as_str),
+            Some("true"),
+        );
+
+        // `["builtin"]`-only Fetcher Pool: arch-agnostic, no arch pin.
+        let mut p = crate::fixtures::test_pool("f", ExecutorKind::Fetcher);
+        p.spec.systems = s(&["builtin"]);
+        let spec = build_executor_pod_spec(
+            &p,
+            &crate::fixtures::test_sched_addrs(),
+            &crate::fixtures::test_store_addrs(),
+            &hw,
+        );
+        let ns = spec
+            .node_selector
+            .expect("builtin-only Fetcher pod still has the pool-static nodeSelector");
         assert!(
-            !ns.contains_key(rio_common::k8s::FETCHER_TAINT_KEY),
-            "operator-supplied nodeSelector replaces (not merges with) the \
-             pool-static default: {ns:?}"
+            !ns.contains_key("kubernetes.io/arch"),
+            "builtin-only Fetcher Pool must stay arch-agnostic: {ns:?}"
         );
     }
 

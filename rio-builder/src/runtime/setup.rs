@@ -424,18 +424,25 @@ pub(super) fn resolve_executor_identity(
 /// and have nix-daemon refuse them at build time. CrashLoopBackOff is
 /// the right shape — visible in `kubectl get pods`, doesn't poison drvs.
 ///
-/// Fetchers skip this: FODs are `builtin` (arch-agnostic) so a fetcher
-/// on the "wrong" arch is fine — and intentional (cheaper Gravitons).
+/// r35 bug_039: Fetcher workers DO need arch validation for the
+/// arch-typed FODs (`x86_64-linux pkgs.fetchurl`) in
+/// `pool.spec.systems`. The pre-§13e helm-static fetcher arch
+/// nodeSelector that compensated for the old `kind == Fetcher`
+/// early-return was deleted in §13e — both compensations gone meant a
+/// misplaced fetcher silently registered, accepted dispatch, and
+/// failed builds at run-time. A misplaced fetcher now refuses
+/// arch-typed systems at register time instead. `["builtin"]`-only
+/// fetchers (the common `builtins.fetchurl` case) stay arch-agnostic
+/// — the `non_builtin.is_none()` early-return below covers them. The
+/// `kind` param is retained for the call signature and a future third
+/// `ExecutorKind` with different arch rules; it no longer gates.
+///
 /// `host` is a parameter (not `detect_system()` inline) for testability.
 pub(super) fn validate_host_arch(
-    kind: rio_proto::types::ExecutorKind,
+    _kind: rio_proto::types::ExecutorKind,
     systems: &[String],
     host: &str,
 ) -> anyhow::Result<()> {
-    use rio_proto::types::ExecutorKind;
-    if kind == ExecutorKind::Fetcher {
-        return Ok(());
-    }
     let mut non_builtin = systems.iter().filter(|s| s.as_str() != "builtin");
     if non_builtin.clone().next().is_none() {
         return Ok(());

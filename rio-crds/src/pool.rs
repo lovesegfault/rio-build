@@ -182,6 +182,30 @@ impl ExecutorKind {
         "kind=Fetcher forbids fuseCacheBytes — §13e routes Fetcher Pools through nodeclaim_pool; per-pool override would diverge FFD from the stamped pod request (r35 merged_bug_024)"
     )
 )]
+// r35 bug_044: the merge-not-replace fix in `effective_node_selector`
+// silently OVERWRITES an operator-set `nodeSelector["rio.build/fetcher"]`
+// with `"true"`. A hard CEL block NAMES the misconfig at admission
+// instead of silently fixing it — silent overwrite is the
+// belt-and-suspenders for pre-CEL specs.
+#[x_kube(
+    validation = Rule::new(
+        "self.kind != 'Fetcher' || !has(self.nodeSelector) || !('rio.build/fetcher' in self.nodeSelector) || self.nodeSelector['rio.build/fetcher'] == 'true'"
+    ).message(
+        "kind=Fetcher: nodeSelector['rio.build/fetcher'] is reconciler-owned and may only be 'true' — the dedicated-node constraint is universal and cannot be weakened (r35 bug_044)"
+    )
+)]
+// r35 bug_044: a Builder Pool setting `nodeSelector{rio.build/fetcher: true}`
+// fails safe (the Builder pod lacks the toleration so the
+// `rio.build/fetcher:NoSchedule` taint repels it → permanently Pending) —
+// but that is a stuck-pod failure mode the operator should learn at
+// admission, not via a mysteriously Pending pod days later.
+#[x_kube(
+    validation = Rule::new(
+        "self.kind != 'Builder' || !has(self.nodeSelector) || !('rio.build/fetcher' in self.nodeSelector)"
+    ).message(
+        "kind=Builder forbids nodeSelector['rio.build/fetcher'] — the fetcher taint repels Builder pods (no toleration) so the pod would be permanently Pending (r35 bug_044)"
+    )
+)]
 pub struct PoolSpec {
     /// Builder or Fetcher. Required — there is no sensible default
     /// (the two have opposite network postures).
@@ -461,6 +485,16 @@ mod tests {
                 "self.kind != 'Fetcher' || !has(self.fuseCacheBytes)",
                 "kind=Fetcher forbids fuseCacheBytes",
             ),
+            // r35 bug_044: the merge in `effective_node_selector`
+            // silently overwrites an operator-set
+            // `nodeSelector["rio.build/fetcher"]`; this CEL guard NAMES
+            // the misconfig at admission instead. The merge is the
+            // belt-and-suspenders for pre-CEL specs.
+            // r[verify fetcher.node.dedicated+4]
+            (
+                "self.kind != 'Fetcher' || !has(self.nodeSelector) || !('rio.build/fetcher' in self.nodeSelector) || self.nodeSelector['rio.build/fetcher'] == 'true'",
+                "kind=Fetcher: nodeSelector['rio.build/fetcher'] is reconciler-owned",
+            ),
         ];
         // Count guard: ties the assertion list to the actual rendered
         // schema so adding a Fetcher CEL rule without updating this
@@ -483,6 +517,19 @@ mod tests {
         assert!(
             json.contains("kind=Builder forbids fuseCacheBytes"),
             "Builder fuseCacheBytes CEL rule has no message"
+        );
+        // r35 bug_044: a Builder Pool setting nodeSelector{rio.build/fetcher}
+        // fails safe (taint repels, pod permanently Pending) — but the
+        // operator should learn at admission, not via a stuck pod.
+        assert!(
+            json.contains(
+                "self.kind != 'Builder' || !has(self.nodeSelector) || !('rio.build/fetcher' in self.nodeSelector)"
+            ),
+            "Builder nodeSelector[rio.build/fetcher] CEL rule missing"
+        );
+        assert!(
+            json.contains("kind=Builder forbids nodeSelector['rio.build/fetcher']"),
+            "Builder nodeSelector[rio.build/fetcher] CEL rule has no message"
         );
         // r[verify ctrl.crd.seccomp-cel]
         // Nested KubeSchema CEL propagates.
