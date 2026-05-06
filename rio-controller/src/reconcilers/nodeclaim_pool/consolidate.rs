@@ -60,7 +60,7 @@ pub struct IdleGapEvent {
 /// regardless of arrival rate. The windowed form is non-zero as long
 /// as any uncensored event falls within `boot_median/2` of `t`. Step
 /// `w/2` keeps overlapping coverage.
-// r[impl ctrl.nodeclaim.consolidate-na+3]
+// r[impl ctrl.nodeclaim.consolidate-na+4]
 pub fn consolidate_after(
     events: &[IdleGapEvent],
     e_fitting_cores: f64,
@@ -128,7 +128,7 @@ pub fn e_fitting_cores(placeable: &[Placement], node_cores: u32) -> f64 {
 /// Filter `placeable` to intents that can ARRIVE at a node in `cell`
 /// — the per-cell partition `e_fitting_cores` computes its mean over.
 ///
-/// r35 bug_023: `r[ctrl.nodeclaim.consolidate-na+3]` says "per-cell
+/// r35 bug_023: `r[ctrl.nodeclaim.consolidate-na+4]` says "per-cell
 /// mean over `intents`" — §13e removed the `kind` filter from
 /// `GetSpawnIntents`, so a global mean over `placeable` blends fetcher
 /// (`c*≈1`) and builder intents and biases `E[c_fit]` for builder
@@ -199,7 +199,11 @@ pub async fn reap_idle(
         let Some(cell) = n.cell.as_ref() else {
             continue;
         };
-        if !n.registered || reserved.contains(n.name.as_str()) {
+        // Already terminating: Karpenter's finalizer is draining it. A
+        // second `delete` is idempotent (404-tolerated) but would
+        // double-increment `nodeclaim_reaped_total` and double-push the
+        // censored `IdleGapEvent`, biasing the NA-model arrival rate low.
+        if n.terminating || !n.registered || reserved.contains(n.name.as_str()) {
             continue;
         }
         // Busy = Karpenter Empty=False, OR PodRequestedCache saw a
@@ -244,11 +248,10 @@ pub async fn reap_idle(
         // wins per cell within a tick (nodes in a cell share an
         // hw-class; allocatable can vary across instance types within
         // the class but the threshold's order of magnitude doesn't).
-        // Operator check: `fetcher-*` cells ≥ minConsolidationTime
-        // floor; builder cells ~boot_median/2 unless λ·E[c_fit] holds
-        // them open. A cell at boot_median/2 when its
-        // minConsolidationTime entry says 600s = the prefix-glob
-        // didn't match.
+        // Operator check: `fetcher-*` cells ≥ 600s floor; builder cells
+        // ≥ 60s `*` floor unless λ·E[c_fit] holds them higher. A cell
+        // at boot_median/2 (~9-25s) when its minConsolidationTime entry
+        // says 60/600s = the prefix-glob didn't match.
         metrics::gauge!(
             "rio_controller_nodeclaim_consolidate_threshold_seconds",
             "cell" => cell.to_string(),
@@ -302,9 +305,22 @@ pub fn observe_idle_to_busy(
     sketches: &mut CellSketches,
     now_secs: f64,
 ) {
-    let live_names: HashSet<&str> = live.iter().map(|n| n.name.as_str()).collect();
+    // Terminating nodes excluded from `live_names` AND iteration: a node
+    // that started terminating since last tick should drop from `prev_idle`
+    // WITHOUT recording an event — the censored event was (or will be)
+    // pushed by `reap_idle`/`reap_unhealthy` at delete time. Recording
+    // here would double-count, and Karpenter flipping `Empty=False`
+    // during drain would log a bogus uncensored "arrival".
+    let live_names: HashSet<&str> = live
+        .iter()
+        .filter(|n| !n.terminating)
+        .map(|n| n.name.as_str())
+        .collect();
     prev_idle.retain(|name, _| live_names.contains(name.as_str()));
     for n in live {
+        if n.terminating {
+            continue;
+        }
         let idle = n.idle_secs(now_secs);
         let busy = idle.is_none() || n.requested.0 > 0;
         if busy {
@@ -357,9 +373,9 @@ mod tests {
         assert_eq!(consolidate_after(&cens, 100.0, 8, 10.0, None, None), 5.0);
     }
 
-    /// r[ctrl.nodeclaim.consolidate-na+3]: floor = q_0.5(boot)/2. With
+    /// r[ctrl.nodeclaim.consolidate-na+4]: floor = q_0.5(boot)/2. With
     /// no events (λ=0), break-even fires immediately → returns floor.
-    // r[verify ctrl.nodeclaim.consolidate-na+3]
+    // r[verify ctrl.nodeclaim.consolidate-na+4]
     #[test]
     fn consolidate_after_respects_floor() {
         // boot_median=40 → floor=20. λ=0 → immediate break-even → 20.
@@ -463,7 +479,7 @@ mod tests {
     /// filter is the SAME predicate FFD's `hw_admits` uses, NOT a
     /// `hw_class_names.is_empty()` pass-through (which over-counts
     /// hw-agnostic intents on fetcher cells).
-    // r[verify ctrl.nodeclaim.consolidate-na+3]
+    // r[verify ctrl.nodeclaim.consolidate-na+4]
     #[test]
     fn e_fitting_cores_per_cell_excludes_cross_kind() {
         let p = |c: u32, hw: &str, sys: &str| -> Placement {
@@ -581,7 +597,7 @@ mod tests {
     /// the NA-model floor `boot_median/2` (~15s). The operator-settable
     /// per-class `min_consolidation_time` is the structural close — the
     /// NA model is correct, the policy floor was missing.
-    // r[verify ctrl.nodeclaim.consolidate-na+3]
+    // r[verify ctrl.nodeclaim.consolidate-na+4]
     #[test]
     fn consolidate_after_respects_min_floor() {
         // boot_median=30 → NA floor = 15. With λ=0 (no events) the
@@ -692,6 +708,37 @@ mod tests {
         observe_idle_to_busy(&[], &mut prev_idle, &mut sk, 1170.0);
         assert!(prev_idle.is_empty());
         assert_eq!(sk.get(&cell).unwrap().idle_gap_events.len(), 1);
+    }
+
+    /// A node that started terminating since last tick (Karpenter
+    /// finalizer running) drops from `prev_idle` WITHOUT recording an
+    /// idle-gap event — `reap_idle`/`reap_unhealthy` already pushed the
+    /// censored event at delete time. Recording here would double-count
+    /// AND, when Karpenter flips `Empty=False` during drain, would log
+    /// a bogus uncensored "arrival" that biases the NA-model arrival
+    /// rate up (holding nodes open longer than warranted).
+    #[test]
+    fn observe_idle_to_busy_skips_terminating() {
+        use super::super::ffd::tests::terminating;
+        let mut sk = CellSketches::default();
+        let cell = Cell("h".into(), CapacityType::Spot);
+        let mut prev_idle: HashMap<String, f64> = [("dying".into(), 80.0)].into();
+        // Karpenter drain flips Empty=False AND sets deletionTimestamp
+        // → naively this looks like an idle→busy edge.
+        let mut dying = terminating(with_conds(
+            node("dying", "h", CapacityType::Spot, 8, 0, 0),
+            &[("Registered", "True", 1000.0), ("Empty", "False", 1090.0)],
+        ));
+        dying.requested = (4, 0, 0);
+        observe_idle_to_busy(&[dying], &mut prev_idle, &mut sk, 1100.0);
+        assert!(
+            sk.get(&cell).is_none_or(|s| s.idle_gap_events.is_empty()),
+            "terminating drain is not an arrival; no idle-gap event"
+        );
+        assert!(
+            !prev_idle.contains_key("dying"),
+            "terminating node pruned from prev_idle without an event"
+        );
     }
 
     /// Hold-open annotation → threshold = max_consolidation_time

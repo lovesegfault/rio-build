@@ -884,10 +884,23 @@ karpenter:
     # every 15s of lull instead of holding 10min. The NA model is
     # correct (it observes the right λ); the *policy floor* was lost in
     # the migration. Keys are class names or `<prefix>*` globs matched
-    # against the hw-class half of the cell. Builder cells unfloored —
-    # the NA model's boot_median/2 is the right grace there.
+    # against the hw-class half of the cell; longest prefix wins, so
+    # `fetcher-*` (len 8) overrides `*` (len 0).
+    #
+    # `*: 60.0` builder floor: `boot_median/2` (~9s for an 18s-boot
+    # builder) is BELOW the boot cost it's supposed to amortize —
+    # reaping at 9s when the next sequential build arrives at t=15s
+    # burns a ~30s reprovision (boot + tick lag) to save 6s of idle
+    # (~$0.0002 at $0.10/node-hr). 60s ≈ 3×boot covers the typical
+    # inter-build gap (output upload + next pod schedule + image pull);
+    # marginal cost ~$0.0014/node-reap-avoided. The NA model raises the
+    # threshold ABOVE 60s under arrival pressure; the floor only binds
+    # on cold-start (no idle-gap data) and low-arrival cells. NOT 600s
+    # (Karpenter's full warm-keep) — that's $0.0167/node-hr × hundreds
+    # of builders, and the model already learns to hold open under load.
     minConsolidationTime:
       "fetcher-*": 600.0
+      "*": 60.0
   clusterName: ""   # from tofu output cluster_name
   nodeRoleName: ""  # from tofu output karpenter_node_role_name
   # ADR-021: NixOS node AMI (full cutover — no Bottlerocket). The

@@ -526,6 +526,19 @@ before forecast, large before small), bin-select `MostAllocated` on
 the `allocatable` divisor — so the deficit is the unplaced residual
 and matches the `schedulerName: kube-build-scheduler` instance.
 
+r[ctrl.nodeclaim.ffd-exclude-terminating]
+NodeClaims with `metadata.deletionTimestamp` set (Karpenter's
+termination finalizer draining the node, ~60–90s) are NOT FFD
+placement candidates: kube-scheduler refuses to bind onto a
+cordoned/terminating node, so a simulated placement there overcounts
+capacity and `cover_deficit` under-mints the replacement until the
+finalizer clears (§13d "placement ⊇ provisioning"). Terminating claims
+DO still count toward `max_fleet_cores` / per-class fleet-core budgets
+— the EC2 instance bills until the finalizer removes it, and the
+replacement must consume headroom from the same budget the dying node
+still occupies. Surfaced as
+`rio_controller_nodeclaim_live{state="terminating"}`.
+
 r[ctrl.nodeclaim.anchor-bulk+4]
 Unplaced intents per `(h,cap)` cell whose pod footprint fits the cell's
 per-class `(max_cores, max_mem)` and global `max_disk` cap are covered
@@ -554,7 +567,7 @@ the closed-loop `forecast_warm_hit_ratio` Schmitt widens/narrows the
 quantile by `Δq=0.02` per firing, capped at `q ≤ 0.99` and
 `lead_time ≤ sla.maxLeadTime`.
 
-r[ctrl.nodeclaim.consolidate-na+3]
+r[ctrl.nodeclaim.consolidate-na+4]
 An empty NodeClaim is kept while
 `λ(t)·𝔼[c_arrival·𝟙{c_arrival ≤ cores}] > cores/q_0.5(boot[h,cap])`.
 `λ(t)` is the windowed empirical arrival rate over `[t, t+W)` (window
@@ -568,7 +581,10 @@ the SAME predicate FFD's `simulate` uses for the agnostic-fallback gate
 prevents a transient lull from collapsing to always-delete and lets the
 operator preserve the pre-§13e Karpenter `consolidateAfter` policy
 floor for cells the NA model would otherwise reap aggressively (default
-`{"fetcher-*": 600s}`).
+`{"fetcher-*": 600s, "*": 60s}` — the `q_0.5(boot)/2` model floor is
+below the boot cost it is supposed to amortize for short-boot builder
+cells; the universal 60s floor covers a sequential chain's typical
+inter-build gap at ≈ $0.0014/node-reap-avoided).
 
 r[ctrl.nodeclaim.shim-nodepool]
 A single shim NodePool (`limits:{cpu:0}`,

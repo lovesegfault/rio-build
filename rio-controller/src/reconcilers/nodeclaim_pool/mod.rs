@@ -267,8 +267,11 @@ pub struct NodeClaimPoolConfig {
     /// correct (it observed the right λ); the *policy floor* was lost
     /// in the migration. Keys are class names or `<prefix>*` globs
     /// matched against `cell.0` (most-specific exact match wins, then
-    /// longest prefix). Default `{"fetcher-*": 600.0}` restores the
-    /// pre-§13e Karpenter behavior. Helm:
+    /// longest prefix). Default `{"fetcher-*": 600.0, "*": 60.0}`:
+    /// fetchers restore the pre-§13e Karpenter behavior; builders get a
+    /// 60s floor (`boot_median/2 ≈ 9s` is below the ~18s boot cost it's
+    /// supposed to amortize — reaping there is strictly dominated; see
+    /// [`Self::default`]). Helm:
     /// `karpenter.nodeclaimPool.minConsolidationTime`.
     pub min_consolidation_time: HashMap<String, f64>,
     /// `(hw_class:cap)` → seed lead-time seconds, written by
@@ -450,9 +453,30 @@ impl Default for NodeClaimPoolConfig {
             max_lead_time: 600.0,
             max_consolidation_time: None,
             // r35 bug_050: Karpenter `consolidateAfter: 10m` parity for
-            // fetcher cells. Builder cells unfloored — the NA model's
-            // boot_median/2 (~10–25s) is the right grace there.
-            min_consolidation_time: HashMap::from([("fetcher-*".into(), 600.0)]),
+            // fetcher cells.
+            //
+            // `*: 60.0` builder floor: the NA-model floor `boot_median/2`
+            // (~9s for an 18s-boot builder) is BELOW the boot cost it's
+            // supposed to amortize — reaping at 9s when the next build
+            // arrives at t=15s burns a ~30s reprovision (boot + tick lag)
+            // to save 6s of idle (~$0.0002 at $0.10/node-hr). 60s ≈
+            // 3×boot_median: covers the typical inter-build gap in a
+            // sequential chain (output upload + next pod schedule + image
+            // pull) at marginal cost ~$0.0014/node-reap-avoided. The NA
+            // model still RAISES the threshold above 60s when arrival
+            // pressure justifies it; the floor only binds on cold-start
+            // (no idle-gap data yet) and low-arrival cells, where the
+            // model's `boot_median/2` would otherwise reap nodes faster
+            // than they boot. NOT 600s (Karpenter's full warm-keep) —
+            // that's $0.0167/node-hr × hundreds of builders, and the
+            // model already learns to hold open under load.
+            //
+            // Lookup precedence: longest prefix glob wins, so `fetcher-*`
+            // (len 8) overrides `*` (len 0) for fetcher cells.
+            min_consolidation_time: HashMap::from([
+                ("fetcher-*".into(), 600.0),
+                ("*".into(), 60.0),
+            ]),
             lead_time_seed: HashMap::new(),
             // Matches helm `sla.defaultLeadTimeSeed` default. Non-zero
             // so an unseeded cell's `health::classify` timeout (2×seed)
@@ -1038,26 +1062,38 @@ impl NodeClaimPoolReconciler {
     /// accurate during scheduler outages.
     fn emit_live_gauges(&self, live: &[ffd::LiveNode], now_secs: f64) {
         use std::collections::BTreeMap;
-        let mut by_state: BTreeMap<Cell, (u64, u64, f64)> = BTreeMap::new();
+        // `(registered, inflight, terminating, max_inflight_age)`. The
+        // three counts partition `live` — every NodeClaim is exactly one
+        // — so `state=registered` matches FFD's placement-candidate set
+        // (terminating excluded). The investigation's smoking gun
+        // (`live=1` while x2lm4 was draining → `deficit=0`) becomes
+        // `live{state=registered}=0, live{state=terminating}=1` —
+        // visible without log diving.
+        let mut by_state: BTreeMap<Cell, (u64, u64, u64, f64)> = BTreeMap::new();
         for n in live {
             let Some(c) = n.cell.clone() else { continue };
             let e = by_state.entry(c).or_default();
-            if n.registered {
+            if n.terminating {
+                e.2 += 1;
+            } else if n.registered {
                 e.0 += 1;
             } else {
                 e.1 += 1;
-                e.2 = e.2.max(n.age_secs(now_secs).unwrap_or(0.0));
+                e.3 = e.3.max(n.age_secs(now_secs).unwrap_or(0.0));
             }
         }
         for cell in self.cfg.all_cells(&self.hw_config) {
             let label = cell.to_string();
-            let (reg, inf, age) = by_state.get(&cell).copied().unwrap_or((0, 0, 0.0));
+            let (reg, inf, term, age) = by_state.get(&cell).copied().unwrap_or((0, 0, 0, 0.0));
             metrics::gauge!("rio_controller_nodeclaim_live",
                 "cell" => label.clone(), "state" => "registered")
             .set(reg as f64);
             metrics::gauge!("rio_controller_nodeclaim_live",
                 "cell" => label.clone(), "state" => "inflight")
             .set(inf as f64);
+            metrics::gauge!("rio_controller_nodeclaim_live",
+                "cell" => label.clone(), "state" => "terminating")
+            .set(term as f64);
             metrics::gauge!("rio_controller_nodeclaim_inflight_age_max_seconds",
                 "cell" => label.clone())
             .set(age);
@@ -1480,10 +1516,19 @@ mod tests {
             d.min_consolidation_time_for(&Cell("fetcher-x86".into(), CapacityType::Spot)),
             Some(600.0)
         );
+        // Builder cells get a 60s floor: the NA-model floor
+        // `boot_median/2` (~9s) is below the boot cost (~18s) — reaping
+        // there is strictly dominated. 60s ≈ 3×boot covers a sequential
+        // chain's inter-build gap. `fetcher-*` (prefix 8) overrides `*`
+        // (prefix 0) per longest-prefix precedence.
         assert_eq!(
             d.min_consolidation_time_for(&Cell("hi-ebs-x86".into(), CapacityType::Spot)),
-            None,
-            "builder cells unfloored by default"
+            Some(60.0),
+            "builder cells get the 60s universal floor"
+        );
+        assert_eq!(
+            d.min_consolidation_time_for(&Cell("metal-arm".into(), CapacityType::OnDemand)),
+            Some(60.0),
         );
     }
 

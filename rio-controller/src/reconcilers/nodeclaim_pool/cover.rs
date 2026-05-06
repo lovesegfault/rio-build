@@ -340,6 +340,16 @@ pub fn sizing(cell: &Cell, u: &[&SpawnIntent], cfg: &SizingCfg) -> (Vec<(u32, u6
 ///   `(h, *)` cell, accumulated across the per-Cell loop so spot's spend
 ///   subtracts from od's budget (otherwise each cap-type hits cap
 ///   independently → 2× $/hr exposure)
+///
+/// Terminating NodeClaims (`metadata.deletionTimestamp` set) STILL count
+/// in `class_live` / `Σ live.allocatable`: the EC2 instance bills until
+/// Karpenter's finalizer clears (~60-90s). FFD's [`super::ffd::simulate`]
+/// excludes them from placement (so `unplaced` correctly grows), but the
+/// budget keeps counting them so a replacement claim consumes headroom
+/// from the SAME budget the dying node still occupies — the fleet never
+/// silently exceeds `max_fleet_cores` across the drain window. Under a
+/// tight budget the replacement waits for the finalizer; that's the safe
+/// degradation (latency, not $).
 pub fn class_budget(
     global_remaining: u32,
     class_cap: Option<u32>,
@@ -1455,6 +1465,7 @@ mod tests {
             name: format!("{h}-{}", cap.as_str()),
             node_name: None,
             registered: true,
+            terminating: false,
             cell: Some(Cell(h.into(), cap)),
             instance_type: None,
             allocatable: (cores, 0, 0),
@@ -1488,6 +1499,18 @@ mod tests {
         let mut nameless = live_node("metal", CapacityType::Spot, 999);
         nameless.cell = None;
         assert_eq!(class_budget(100, Some(50), &[nameless], "metal", 0), 50);
+        // Terminating nodes DO count: the EC2 instance bills until
+        // Karpenter's finalizer clears (~60-90s). FFD excludes them
+        // from placement, but the budget must keep counting them so a
+        // replacement claim consumes the SAME headroom the dying node
+        // still occupies — never double-spend across the drain window.
+        let mut dying = live_node("metal", CapacityType::Spot, 8);
+        dying.terminating = true;
+        assert_eq!(
+            class_budget(100, Some(50), &[dying], "metal", 0),
+            42,
+            "terminating node still occupies fleet-core budget"
+        );
     }
 
     /// mb_024(2): fallback path is filtered through `masked` —

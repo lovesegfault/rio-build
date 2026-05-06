@@ -205,9 +205,14 @@ pub fn describe_metrics() {
     describe_gauge!(
         "rio_controller_nodeclaim_live",
         "Owned NodeClaims at the last tick by `cell` × `state`. \
-         state=registered: Registered=True (FFD-placeable); state=inflight: \
-         created but not yet Registered. Σ(registered) ≈ warm capacity; \
-         inflight stuck high = check reaped_total{reason=ice|boot-timeout}."
+         state=registered: Registered=True AND not terminating (FFD-placeable); \
+         state=inflight: created but not yet Registered; state=terminating: \
+         metadata.deletionTimestamp set (Karpenter finalizer draining, ~60-90s; \
+         excluded from FFD placement, still in max_fleet_cores budget). \
+         Σ(registered) ≈ warm capacity; inflight stuck high = check \
+         reaped_total{reason=ice|boot-timeout}; terminating>0 with \
+         registered=0 + ffd_unplaced_cores>0 = node draining out from under \
+         a queue (cover_deficit mints the replacement next tick)."
     );
     describe_gauge!(
         "rio_controller_nodeclaim_inflight_age_max_seconds",
@@ -241,10 +246,9 @@ pub fn describe_metrics() {
          (last node evaluated this tick; 0 when no idle nodes in the cell). \
          The break-even consolidate_after() returns: max(boot_median/2, \
          min_consolidation_time[cell]) floored, NA-extended while λ·E[c_fit] > \
-         cores/boot. Watch fetcher-* >= the configured min_consolidation_time \
-         floor and builder cells tracking ~boot_median/2 to confirm the per-cell \
-         e_fitting_cores partition and the policy floor are both routing (r35 \
-         bug_023/bug_050)."
+         cores/boot. Watch fetcher-* >= 600s and builder cells >= the 60s `*` \
+         floor to confirm the per-cell e_fitting_cores partition and the policy \
+         floor are both routing (r35 bug_023/bug_050)."
     );
     describe_counter!(
         "rio_controller_ddsketch_seed_fallback_total",

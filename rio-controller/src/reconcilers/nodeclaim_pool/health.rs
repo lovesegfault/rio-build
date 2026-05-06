@@ -84,6 +84,12 @@ pub fn classify(
         let Some(cell) = n.cell.as_ref() else {
             continue;
         };
+        // Already terminating: a redundant `delete` is accepted by the
+        // apiserver (not 404 — the object still exists), so it'd
+        // double-increment `reaped_total` and re-ICE-mask the cell.
+        if n.terminating {
+            continue;
+        }
         // Scheduler dead-node signal: keyed on the backing Node name
         // (what executors heartbeat against), not the NodeClaim name.
         if n.registered
@@ -297,6 +303,34 @@ mod tests {
         assert!(inflight.is_empty(), "both entries pruned");
         // Second call: nothing tracked → no ICE (idempotent).
         assert!(detect_vanished(&mut inflight, &live).is_empty());
+    }
+
+    /// A NodeClaim already terminating (`metadata.deletionTimestamp`
+    /// set — Karpenter finalizer draining) is NOT re-classified
+    /// regardless of its conditions. Re-deleting an already-terminating
+    /// object is accepted by the apiserver (NOT 404 — the object still
+    /// exists), so the `Ok` branch in `reap_unhealthy` would
+    /// double-increment `reaped_total{reason=ice}` and re-ICE-mask the
+    /// cell every tick for the whole ~60-90s drain window.
+    #[test]
+    fn classify_skips_terminating() {
+        use super::super::ffd::tests::terminating;
+        let cfg = cfg_seeded("h", 45.0);
+        let sk = CellSketches::default();
+        // Would be ICE (Launched=False past timeout) if not terminating.
+        let mut ice = terminating(with_conds(
+            node("ice", "h", CapacityType::Spot, 8, 0, 0),
+            &[("Launched", "False", 1005.0)],
+        ));
+        ice.registered = false;
+        // Would be Dead if not terminating.
+        let dead = terminating(node("dead", "h", CapacityType::Spot, 8, 0, 0));
+        let dead_set: HashSet<&str> = ["node-dead"].into();
+        let r = classify(&[ice, dead], &dead_set, &sk, &cfg, 1100.0);
+        assert!(
+            r.is_empty(),
+            "terminating NodeClaims are already being reaped; no re-classify: {r:?}"
+        );
     }
 
     /// `Launched=False` past `2×seed` → ICE. Under timeout → healthy.
