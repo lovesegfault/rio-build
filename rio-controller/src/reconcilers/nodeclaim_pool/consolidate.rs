@@ -139,18 +139,30 @@ pub fn e_fitting_cores(placeable: &[Placement], node_cores: u32) -> f64 {
 /// repels them at runtime, so counting them inflates the cell's
 /// hold-open). Returns owned `Vec<Placement>` (clone): for ≤200
 /// intents per tick the alloc is noise next to the `Api::delete`.
+///
+/// r35 B1 ripple: `hw_admits` arch arg is `Option<&str>` (mirrors
+/// FFD's `hw_admits` and `HwClassConfig::matches_arch`). The
+/// agnostic-fallback gate is "at least one non-trivial constraint
+/// axis" — `arch=None ∧ features=[]` is unroutable; `arch=None ∧
+/// features=[fetcher]` is the `system="builtin"` FOD case (features
+/// route, `matches_arch(_, None)` passes through). Pre-B1 this
+/// `is_some_and(|a| ...)` short-circuit dropped builtin FODs, so a
+/// fetcher cell whose only demand is builtin FODs read as zero
+/// placeable → `reap_idle` reaped it.
 pub fn placeable_for_cell(
     placeable: &[Placement],
     cell: &Cell,
-    hw_admits: impl Fn(&str, &str, &[String]) -> bool,
+    hw_admits: impl Fn(&str, Option<&str>, &[String]) -> bool,
 ) -> Vec<Placement> {
     placeable
         .iter()
         .filter(|(i, _, _)| {
             i.hw_class_names.iter().any(|h| h == &cell.0)
-                || (i.hw_class_names.is_empty()
-                    && system_to_arch(&i.system)
-                        .is_some_and(|a| hw_admits(&cell.0, a, &i.required_features)))
+                || (i.hw_class_names.is_empty() && {
+                    let a = system_to_arch(&i.system);
+                    let f = i.required_features.as_slice();
+                    (a.is_some() || !f.is_empty()) && hw_admits(&cell.0, a, f)
+                })
         })
         .cloned()
         .collect()
@@ -179,7 +191,7 @@ pub async fn reap_idle(
     placeable: &[Placement],
     sketches: &mut CellSketches,
     cfg: &NodeClaimPoolConfig,
-    hw_admits: impl Fn(&str, &str, &[String]) -> bool,
+    hw_admits: impl Fn(&str, Option<&str>, &[String]) -> bool,
     now_secs: f64,
 ) -> anyhow::Result<()> {
     let reserved: HashSet<&str> = placeable.iter().map(|(_, n, _)| n.as_str()).collect();
@@ -474,7 +486,7 @@ mod tests {
         // Global mean over all 12: (10×1 + 2×32)/12 ≈ 6.17. Per-cell
         // mean for hi-ebs-x86: 32.
         let builder_cell = Cell("hi-ebs-x86".into(), CapacityType::Spot);
-        let admits = |_: &str, _: &str, _: &[String]| true;
+        let admits = |_: &str, _: Option<&str>, _: &[String]| true;
         let cell_placeable = placeable_for_cell(&placeable, &builder_cell, admits);
         let e = e_fitting_cores(&cell_placeable, 32);
         assert!(
@@ -499,7 +511,7 @@ mod tests {
             false,
         );
         let mixed = vec![p(1, "fetcher-x86", "x86_64-linux"), agnostic];
-        let admits_builder_only = |h: &str, _: &str, _: &[String]| h.starts_with("hi-");
+        let admits_builder_only = |h: &str, _: Option<&str>, _: &[String]| h.starts_with("hi-");
         let cp = placeable_for_cell(&mixed, &fetcher_cell, admits_builder_only);
         assert_eq!(
             e_fitting_cores(&cp, 4),
@@ -511,6 +523,56 @@ mod tests {
             e_fitting_cores(&cp, 32),
             16.0,
             "hw-agnostic intent admitted on builder cell"
+        );
+
+        // r35 B1 ripple: a `system="builtin"` FOD (`hw_class_names=[]`,
+        // `arch=None`, `features=["fetcher"]`) routes by FEATURES.
+        // Pre-B1 the `is_some_and(|a| ...)` short-circuit dropped it
+        // (arch=None ⇒ never placeable for any cell) so a fetcher cell
+        // whose only demand is builtin FODs read as zero placeable →
+        // `reap_idle` reaped the cell its own demand was waiting for.
+        let builtin_fod: Placement = (
+            SpawnIntent {
+                cores: 1,
+                hw_class_names: vec![],
+                system: "builtin".into(),
+                required_features: vec!["fetcher".into()],
+                ..Default::default()
+            },
+            "n".into(),
+            false,
+        );
+        let admits_fetcher = |h: &str, _: Option<&str>, f: &[String]| {
+            h.starts_with("fetcher-") && f.contains(&"fetcher".into())
+        };
+        let cp = placeable_for_cell(
+            std::slice::from_ref(&builtin_fod),
+            &fetcher_cell,
+            admits_fetcher,
+        );
+        assert_eq!(
+            cp.len(),
+            1,
+            "builtin FOD must be counted as placeable for the fetcher cell — \
+             arch=None routes by features, mirroring FFD's agnostic-fallback gate"
+        );
+        // arch=None ∧ features=[] is genuinely unroutable: still excluded.
+        let unroutable: Placement = (
+            SpawnIntent {
+                cores: 1,
+                hw_class_names: vec![],
+                system: "builtin".into(),
+                required_features: vec![],
+                ..Default::default()
+            },
+            "n".into(),
+            false,
+        );
+        let cp = placeable_for_cell(&[unroutable], &fetcher_cell, |_, _, _| true);
+        assert!(
+            cp.is_empty(),
+            "arch=None ∧ features=[] is unroutable — the (a.is_some() || \
+             !f.is_empty()) gate excludes it from every cell"
         );
     }
 
