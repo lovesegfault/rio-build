@@ -382,8 +382,8 @@ fn chaos_pod_spec(name: &str, node: &str, script: &str) -> Pod {
             "hostNetwork": true,
             "restartPolicy": "Never",
             "tolerations": [
-                {"key": "rio.build/builder", "operator": "Exists", "effect": "NoSchedule"},
-                {"key": "rio.build/fetcher", "operator": "Exists", "effect": "NoSchedule"},
+                {"key": rio_common::k8s::BUILDER_TAINT_KEY, "operator": "Exists", "effect": "NoSchedule"},
+                {"key": rio_common::k8s::FETCHER_TAINT_KEY, "operator": "Exists", "effect": "NoSchedule"},
             ],
             "containers": [{
                 "name": "chaos",
@@ -809,8 +809,8 @@ mod tests {
             .into_iter()
             .filter_map(|t| t.key)
             .collect();
-        assert!(tol.contains(&"rio.build/builder".to_string()));
-        assert!(tol.contains(&"rio.build/fetcher".to_string()));
+        assert!(tol.contains(&rio_common::k8s::BUILDER_TAINT_KEY.to_string()));
+        assert!(tol.contains(&rio_common::k8s::FETCHER_TAINT_KEY.to_string()));
         // Privileged container.
         let c = &spec.containers[0];
         assert_eq!(c.security_context.as_ref().unwrap().privileged, Some(true));

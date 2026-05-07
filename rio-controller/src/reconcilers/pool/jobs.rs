@@ -1067,13 +1067,13 @@ fn apply_intent_resources(
     let mut intent_tols: Vec<Toleration> = Vec::new();
     for h in &i.hw_class_names {
         for t in hw.taints_for(h) {
-            let tol = Toleration {
-                key: Some(t.key),
-                operator: Some("Equal".into()),
-                value: Some(t.value),
-                effect: Some(t.effect),
-                ..Default::default()
-            };
+            // §13d chokepoint: `pod::taint_to_toleration` is the SAME
+            // projection `effective_tolerations`'s fetcher arm uses.
+            // Open-coding it here would let the per-intent toleration
+            // and the dedup target (`pod_t.contains` below) diverge —
+            // e.g. one side switching to `Exists` for empty-value
+            // taints, or one adding `toleration_seconds`.
+            let tol = pod::taint_to_toleration(t);
             if !intent_tols.contains(&tol) {
                 intent_tols.push(tol);
             }

@@ -274,10 +274,15 @@ fn effective_node_selector(pool: &Pool) -> Option<BTreeMap<String, String>> {
     }
 }
 
-/// Maps a `NodeTaint` proto to a kube `Toleration`. Single source for
-/// metal AND fetcher arms of `effective_tolerations` — the §13d
-/// chokepoint for taint→toleration projection.
-fn taint_to_toleration(nt: rio_proto::types::NodeTaint) -> Toleration {
+/// Maps a `NodeTaint` proto to a kube `Toleration`. The §13d chokepoint
+/// for taint→toleration projection — `effective_tolerations` (pool-static
+/// fetcher arm), `build_executor_pod_spec` (metal-toleration block),
+/// `apply_intent_resources` (per-intent hwClass tolerations), and any
+/// future caller MUST route through this so the cover-taint↔toleration
+/// round-trip and the per-intent dedup (`pod_t.contains`) see
+/// byte-identical `Toleration` values. Same `pub(super)` shape as
+/// [`proto_term_to_k8s`].
+pub(super) fn taint_to_toleration(nt: rio_proto::types::NodeTaint) -> Toleration {
     Toleration {
         key: Some(nt.key),
         operator: Some("Equal".into()),
@@ -335,12 +340,12 @@ fn effective_tolerations(pool: &Pool, hw: &HwClassConfig) -> Option<Vec<Tolerati
         // `rio.build/builder=true:NoSchedule` (cover.rs::builder_taint()).
         // The builder taint is NOT in hwClass config (cover.rs:448-452
         // TODO — it's hardcoded in cover, not declared per-class), so
-        // `taints_routing_to("rio.build/builder")` is always empty.
+        // `taints_routing_to(BUILDER_TAINT_KEY)` is always empty.
         // Use the literal toleration. When the cover.rs TODO is closed
         // (single-source through hwClass config), this arm collapses
-        // into a single `taints_routing_to(builder_taint_key)` call.
+        // into a single `taints_routing_to(BUILDER_TAINT_KEY)` call.
         vec![Toleration {
-            key: Some("rio.build/builder".into()),
+            key: Some(rio_common::k8s::BUILDER_TAINT_KEY.into()),
             operator: Some("Equal".into()),
             value: Some("true".into()),
             effect: Some("NoSchedule".into()),
@@ -1759,7 +1764,7 @@ mod tests {
         assert!(tols.contains(&custom), "operator toleration preserved");
         assert!(
             tols.iter()
-                .any(|t| t.key.as_deref() == Some("rio.build/builder")),
+                .any(|t| t.key.as_deref() == Some(rio_common::k8s::BUILDER_TAINT_KEY)),
             "builder taint toleration always present — per-intent \
              nodeAffinity pins to cover-minted nodes carrying \
              rio.build/builder:NoSchedule; dropping the toleration is \
@@ -1775,7 +1780,7 @@ mod tests {
         assert!(
             tols_empty
                 .iter()
-                .any(|t| t.key.as_deref() == Some("rio.build/builder")),
+                .any(|t| t.key.as_deref() == Some(rio_common::k8s::BUILDER_TAINT_KEY)),
             "builder taint toleration present when operator sets `tolerations: []`"
         );
     }

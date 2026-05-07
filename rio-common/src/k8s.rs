@@ -42,6 +42,23 @@ pub const FETCHER_FEATURE: &str = "fetcher";
 /// read the SAME key from the hwClass config.
 pub const FETCHER_TAINT_KEY: &str = "rio.build/fetcher";
 
+/// The builder node taint key, sibling of [`FETCHER_TAINT_KEY`]. Unlike
+/// the fetcher key (which §13e unified into both taint AND label key),
+/// this is taint-only — builder node *labels* are `cover::NODE_ROLE_LABEL`
+/// (`rio.build/node-role: builder`), not this key.
+/// Stamped on every cover-minted builder NodeClaim by
+/// `cover::builder_taint()` (so non-builder cluster pods stay off
+/// builder nodes — ADR-019); tolerated by `pod::effective_tolerations`'s
+/// builder arm (r38 bug_027). The pair-coupling invariant is the same
+/// as the fetcher case: the key the cover writes MUST match the key the
+/// toleration reads, byte-for-byte, or the pod is permanently Pending.
+/// One const for both ends so drift is a compile error.
+///
+/// NOT in hwClass config (cover.rs has a TODO to single-source ALL
+/// role taints/labels through hwClass config; this const is the
+/// `taints_routing_to(BUILDER_TAINT_KEY)` lookup key that close needs).
+pub const BUILDER_TAINT_KEY: &str = "rio.build/builder";
+
 /// Map a single nix `system` (e.g. `"x86_64-linux"`) to its
 /// `kubernetes.io/arch` label value. `None` for empty/`builtin`/
 /// unknown — caller treats an unmappable system as undroppable (no node

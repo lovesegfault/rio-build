@@ -71,7 +71,7 @@ pub const INSTANCE_SIZE_LABEL: &str = "karpenter.k8s.aws/instance-size";
 /// Paired with helm `poolDefaults.tolerations`.
 fn builder_taint() -> Taint {
     Taint {
-        key: "rio.build/builder".into(),
+        key: rio_common::k8s::BUILDER_TAINT_KEY.into(),
         value: Some("true".into()),
         effect: "NoSchedule".into(),
         ..Default::default()
@@ -1269,7 +1269,7 @@ mod tests {
         // mb_002: builder taint stamped (band-loop NodePool template
         // carried it; ADR-019 isolation).
         assert_eq!(spec.taints, vec![builder_taint()]);
-        assert_eq!(spec.taints[0].key, "rio.build/builder");
+        assert_eq!(spec.taints[0].key, rio_common::k8s::BUILDER_TAINT_KEY);
         assert_eq!(spec.taints[0].effect, "NoSchedule");
         // 2 hw-reqs + capacity-type + instance-size NotIn. NO
         // rio.build/* — those match 0 instance types and trigger
@@ -1372,7 +1372,7 @@ mod tests {
         assert_eq!(nc.spec.node_class_ref.name, METAL_NODE_CLASS);
         // §13c T7: metal hwClass taint chained after builder_taint().
         assert_eq!(nc.spec.taints.len(), 2, "builder_taint + kvm taint");
-        assert_eq!(nc.spec.taints[0].key, "rio.build/builder");
+        assert_eq!(nc.spec.taints[0].key, rio_common::k8s::BUILDER_TAINT_KEY);
         assert_eq!(nc.spec.taints[1].key, "rio.build/kvm");
         assert_eq!(nc.spec.taints[1].effect, "NoSchedule");
         // §13c N2: (metal, od) capacity-type requirement is exactly one
@@ -1398,7 +1398,10 @@ mod tests {
             },
         );
         assert_eq!(nc_std.spec.taints.len(), 1);
-        assert_eq!(nc_std.spec.taints[0].key, "rio.build/builder");
+        assert_eq!(
+            nc_std.spec.taints[0].key,
+            rio_common::k8s::BUILDER_TAINT_KEY
+        );
     }
 
     /// §13e: a `fetcher-*` cell mints a NodeClaim with the
@@ -1430,7 +1433,10 @@ mod tests {
         assert_eq!(nc.spec.taints[0].key, rio_common::k8s::FETCHER_TAINT_KEY);
         assert_eq!(nc.spec.taints[0].effect, "NoSchedule");
         assert!(
-            !nc.spec.taints.iter().any(|t| t.key == "rio.build/builder"),
+            !nc.spec
+                .taints
+                .iter()
+                .any(|t| t.key == rio_common::k8s::BUILDER_TAINT_KEY),
             "fetcher cell must NOT carry builder_taint (would deadlock \
              the fetcher pod binding)"
         );
