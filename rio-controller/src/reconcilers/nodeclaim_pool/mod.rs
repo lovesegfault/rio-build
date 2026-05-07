@@ -256,12 +256,16 @@ pub struct NodeClaimPoolConfig {
     /// §13b lead-time Schmitt clamp ceiling (seconds). Helm:
     /// `sla.maxLeadTime`.
     pub max_lead_time: f64,
-    /// §13b consolidator hold-open ceiling (seconds). `None` =
-    /// 2×`consolidate_after()` per ADR. Helm:
-    /// `scheduler.sla.maxConsolidationTime` (rendered by
-    /// `controller.yaml` and `scheduler.yaml`). r37 merged_010: the
-    /// model floor `max(boot_median/2, min)` wins when this is set
-    /// below it (`max_t.max(floor)` clamp in `consolidate_after`).
+    /// §13b consolidator hold-open threshold (seconds) for
+    /// `rio.build/hold-open`-annotated NodeClaims. `None` =
+    /// 2×`consolidate_after()` per ADR. NOT a ceiling: when set below
+    /// the NA break-even, `consolidate::hold_open_threshold` clamps
+    /// to ≥ `na` (r38 merged_004 — annotation cannot lower the
+    /// threshold). Helm: `scheduler.sla.maxConsolidationTime`
+    /// (rendered by `controller.yaml` and `scheduler.yaml`).
+    /// r37 merged_010: the model floor `max(boot_median/2, min)` wins
+    /// when this is set below it (`max_t.max(floor)` clamp in
+    /// `consolidate_after`).
     pub max_consolidation_time: Option<f64>,
     /// r35 bug_050: per-hw-class-prefix `consolidate_after` floor
     /// (seconds). §13e routed Fetcher Pools through `nodeclaim_pool`,

@@ -966,7 +966,11 @@ karpenter:
     # `karpenter.nodeclaimPool.minConsolidationTime` (above) restores the
     # operator policy floor. Even with the knob, fetcher idle behavior is
     # now NA-model-driven (Karpenter never observed arrival rate); the
-    # knob is a *floor* the model can exceed, not an exact replacement.
+    # knob is a hard floor — for bin-packed cells (≥2 intents/node, the
+    # §13b MostAllocated default) the NA model CANNOT extend past it
+    # (r38 bug_022); for cells packing ~1 intent/node it CAN extend
+    # under arrival pressure, but it always honors the floor as a
+    # minimum.
     # If fetcher boot-thrash shows in `rio_controller_nodeclaim_reaped_
     # total{reason=idle, cell=~"fetcher-.*"}` despite the floor, raise it
     # — the model floor protects against transient lulls, the knob

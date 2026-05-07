@@ -21,11 +21,13 @@ use super::ffd::{LiveNode, Placement, cells_of, system_to_arch};
 use super::sketch::{Cell, CellSketches};
 
 /// Hold-open annotation key. Operator-settable: a NodeClaim carrying
-/// `rio.build/hold-open=true` uses `max_consolidation_time` as its idle
-/// threshold instead of the NA break-even. Set via `kubectl annotate
-/// nodeclaim <n> rio.build/hold-open=true` for debugging or to keep one
-/// warm slot through a known lull. The reconciler does NOT set it
-/// automatically.
+/// `rio.build/hold-open=true` uses `hold_open_threshold` as its idle
+/// threshold — `max(max_consolidation_time, na)` when set, else
+/// `2 × na` (r38 merged_004 — the protection annotation can never make
+/// the threshold *lower* than an un-annotated node). Set via
+/// `kubectl annotate nodeclaim <n> rio.build/hold-open=true` for
+/// debugging or to keep one warm slot through a known lull. The
+/// reconciler does NOT set it automatically.
 pub const HOLD_OPEN_ANNOTATION: &str = "rio.build/hold-open";
 
 /// Ring-buffer cap for `CellState.idle_gap_events`. NA hazard reads the
@@ -263,11 +265,12 @@ impl CellCtx {
 
     /// NA break-even threshold for a `node_cores`-core node in this
     /// cell. The ONLY call into `consolidate_after` from `reap_idle` —
-    /// both the hold-open arm (`2.0 * na_threshold`) and the non-hold-
-    /// open arm read this. r37 bug_009: pre-CellCtx the hold-open arm
-    /// passed `(events=&[], e_fitting_cores=0.0)`, which always returns
-    /// `floor` — a busy cell's non-hold-open threshold could exceed
-    /// `2×floor`, so the operator-annotated node was reaped FIRST.
+    /// both the hold-open arm (via [`hold_open_threshold`]) and the
+    /// non-hold-open arm read this. r37 bug_009: pre-CellCtx the
+    /// hold-open arm passed `(events=&[], e_fitting_cores=0.0)`, which
+    /// always returns `floor` — a busy cell's non-hold-open threshold
+    /// could exceed `2×floor`, so the operator-annotated node was
+    /// reaped FIRST.
     fn na_threshold(&self, node_cores: u32, max: Option<f64>) -> f64 {
         consolidate_after(
             &self.events,
@@ -301,7 +304,8 @@ pub struct ReapInputs<'a, F: Fn(&str, Option<&str>, &[String]) -> bool> {
 /// A node is reapable when: `registered` AND not `terminating` AND not
 /// in this tick's FFD `reserved` set AND `idle_secs > threshold`.
 /// `threshold` is [`consolidate_after`] over the cell's
-/// `idle_gap_events`, or `max_consolidation_time` for hold-open nodes.
+/// `idle_gap_events`, raised to `hold_open_threshold` for hold-open
+/// nodes (`max(max_consolidation_time, na)` when set, else `2 × na`).
 /// Each reap records a censored `IdleGapEvent`. `Api::delete` 404 is
 /// ignored (already-gone race with Karpenter); other errors warn + skip.
 pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
@@ -383,9 +387,15 @@ pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
         // an hw-class; allocatable can vary across instance types within
         // the class but the threshold's order of magnitude doesn't).
         // Operator check: `fetcher-*` cells ≥ 600s floor; builder cells
-        // ≥ 60s `*` floor unless λ·E[c_fit] holds them higher. A cell
-        // at boot_median/2 (~9-25s) when its minConsolidationTime entry
-        // says 60/600s = the prefix-glob didn't match.
+        // ≥ 60s `*` floor. For bin-packed cells (`E[c_fit] ≤ cores/2`,
+        // the §13b MostAllocated default for builders), the floor is a
+        // HARD bound — `λ̂` saturates at `1/w = 2/boot` so the
+        // keep-condition is structurally unsatisfiable (r38 bug_022).
+        // Only cells packing ~1 intent/node can be NA-extended above
+        // the floor. A cell at boot_median/2 (~9-25s) when its
+        // minConsolidationTime entry says 60/600s = the prefix-glob
+        // didn't match.
+        // r[impl obs.metric.consolidate-threshold]
         metrics::gauge!(
             "rio_controller_nodeclaim_consolidate_threshold_seconds",
             "cell" => cell.to_string(),
@@ -917,7 +927,14 @@ mod tests {
         for max in [Some(300.0), Some(900.0), None] {
             let na = ctx.na_threshold(64, max);
             // Calls the production helper — NOT a re-derived copy of
-            // the formula. Drops in `reap_idle` would fail this test.
+            // the formula. Removing the `.max(na)` clamp from
+            // `hold_open_threshold` would fail this test. Neither this
+            // test nor the sibling
+            // `hold_open_threshold_never_below_non_hold_open` executes
+            // `reap_idle`; the wiring at consolidate.rs:380-384 is
+            // protected by shape (both arms read the same `na`), not by
+            // a test — see the sibling's comment for the structural
+            // rationale.
             let ho = hold_open_threshold(na, max);
             assert!(
                 ho >= na,
@@ -933,8 +950,11 @@ mod tests {
     /// unsatisfiable (`λ ≤ 1/w < cores/boot_median`) — the NA model
     /// returned `floor` unconditionally. The decoupled `w = boot_median/2`
     /// makes the keep-condition satisfiable again so the model can extend
-    /// past the floor under load, which is the documented purpose of the
-    /// floor (`values.yaml: "the knob is a *floor* the model can exceed"`).
+    /// past the floor under load — the `values.yaml` `minConsolidationTime`
+    /// rationale: a hard minimum the model "CAN extend under arrival
+    /// pressure" only for ~1-intent/node cells. This fixture is that case
+    /// (`E[c_fit] = node_cores`); the bin-packed inverse is
+    /// `consolidate_after_floor_binds_for_bin_packed_cells` below.
     // r[verify ctrl.nodeclaim.consolidate-na+4]
     #[test]
     fn consolidate_after_extends_past_policy_floor() {
