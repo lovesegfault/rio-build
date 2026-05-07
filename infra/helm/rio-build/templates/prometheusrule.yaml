@@ -61,11 +61,11 @@ spec:
         {{- if .Values.buildScheduler.enabled }}
         # ADR-023 §13b: kube-build-scheduler second kube-scheduler.
         # Builder pods set `schedulerName: kube-build-scheduler`; if
-        # THIS scheduler's active queue is non-empty for 60s, builder
-        # pods are stuck Pending (kube-build-scheduler crashlooped,
-        # RBAC drift, or NodeClaim deficit cover stalled). The default
-        # kube-scheduler ignores kube-build-scheduler pods so they stay
-        # Pending forever — page-worthy.
+        # THIS scheduler's unschedulable/backoff queues are non-empty
+        # for 5m, builder pods are stuck Pending (kube-build-scheduler
+        # crashlooped, RBAC drift, or NodeClaim deficit cover stalled).
+        # The default kube-scheduler ignores kube-build-scheduler pods
+        # so they stay Pending forever — page-worthy.
         #
         # r38 bug_002: gated on buildScheduler.enabled — the
         # `kube-build-scheduler` job label only exists when the
@@ -86,10 +86,16 @@ spec:
           # healthy cold-start clears before the alert. Metal cells
           # (~10m lead) WILL still false-positive — RioNodeclaimPoolStuckPending
           # owns the provisioning-stall signal; this alert covers the
-          # post-registration scheduling stall. Tighten by gating with
-          # `unless on() (sum(rio_controller_nodeclaim_live{state="inflight"}) > 0)`
-          # — suppress while any NodeClaim is mid-boot, which is exactly
-          # the false-positive window — or raise `for:` past 3×maxLeadTime.
+          # post-registration scheduling stall. There is no precise
+          # gate: `scheduler_pending_pods` and `nodeclaim_live` have no
+          # shared join key (the scheduler queue is process-global, the
+          # NodeClaim gauge is per-cell), and a global
+          # `unless on() (... inflight > 0)` would suppress the RBAC-drift
+          # signal whenever ANY cell is mid-boot (see the
+          # RioNodeclaimPoolStuckPending comment below — under sustained
+          # scale-up the inflight count never touches 0).
+          # If metal false-positives are noisy, raise `for:` past
+          # 3×maxLeadTime — that is the only safe knob.
           # Do NOT gate on RioNodeclaimPoolStuckPending: it fires at
           # clamp(3×lead, 90, 1800)≈30m for metal, far past the ~10m
           # healthy boot the false-positive names (r38 bug_030).
