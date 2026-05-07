@@ -409,13 +409,27 @@ mod tests {
         }
     }
 
-    /// bug_032: `AlsRounds` disambiguates "converged on round 4" from
-    /// "cap hit" — both previously returned `5`. The
-    /// `als_recovers_true_alpha` fixture (clean Amdahl, 4 well-spread
-    /// factor vectors) is proven-converging; an alternating-vertex
-    /// fixture with ±20% wall noise drives oscillation toward the cap.
+    /// bug_032: `AlsRounds` disambiguates "converged on round n" from
+    /// "cap hit" — both previously returned `5`. This test asserts
+    /// the `Converged(n)` arm and the §SCC(5) compile-level
+    /// exhaustiveness of [`AlsRounds`] (a third variant compile-errors
+    /// the `match`).
+    ///
+    /// r39 bug_022: this test does NOT assert [`AlsRounds::CapHit`].
+    /// The trust-region ridge ([`LAMBDA_RIDGE`]) damps the ALS map to
+    /// a contraction; this fixture converges round 1 and no
+    /// deterministic CapHit fixture has been found within the
+    /// 100-round cap. CapHit *is* reachable (the cap was raised from
+    /// 5 → 100 after gate-a hit it at 5; the c↔h confound margin is
+    /// ~65/100), but no test currently asserts it.
+    // TODO: a regression making `als_fit` always return `Converged`
+    // would pass every test here AND silently zero
+    // `rio_scheduler_sla_als_round_cap_hit_total` — the §Phasing-13a
+    // empirical gate reads it. Closing the gap requires a configurable
+    // `als_fit` (parametrized `max_rounds` or an injectable
+    // `fit_alpha`), which is an API change beyond a nit fix.
     #[test]
-    fn als_rounds_disambiguates_converged_from_cap() {
+    fn als_rounds_returns_converged_with_round_count() {
         // ── Converged: reuse the `als_recovers_true_alpha` fixture ────────
         let cs: Vec<f64> = (1..=5)
             .map(|i| f64::from(i) * 4.0)
@@ -453,8 +467,13 @@ mod tests {
             matches!(rounds, AlsRounds::Converged(_)),
             "clean-Amdahl fixture converges <{ALS_MAX_ROUNDS} rounds; got {rounds:?}"
         );
-        // ── CapHit: alternating-vertex factors + ±20% wall noise so α
-        // oscillates between simplex vertices across rounds ─────────────────
+        // ── Exhaustiveness: alternating-vertex factors + ±20% wall noise ─
+        // exercise the same code path with a noisier fixture; the
+        // exhaustive `match` is the §SCC(5) arm-coverage compile floor.
+        // (Pre-r39 this section was titled "CapHit" — but LAMBDA_RIDGE
+        // damps the alternating-vertex oscillation enough that even
+        // this fixture converges round 1, so the section never asserted
+        // the CapHit arm. See doc-comment.)
         let cs6: Vec<f64> = vec![4.0, 8.0, 16.0, 4.0, 8.0, 16.0];
         let hf6: Vec<Option<[f64; K]>> = vec![
             Some([3.0, 0.3, 0.3]),
@@ -478,13 +497,6 @@ mod tests {
             prev_usl: false,
         };
         let (_, _, _, rounds6) = als_fit(&cs6, &walls6, &hf6, &w6, &gate6, UNIFORM);
-        // LAMBDA_RIDGE damps the alternating-vertex oscillation enough
-        // that even this fixture converges (round 1) — a deterministic
-        // CapHit input would need to defeat the ridge, which is exactly
-        // what the ridge exists to prevent. The `als_fit_alpha_on_simplex`
-        // proptest's arbitrary-factor sweep drives both arms across its
-        // 128 cases; here the §SCC(5) arm-coverage floor is the
-        // exhaustive match (a third `AlsRounds` variant compile-errors).
         match rounds6 {
             AlsRounds::Converged(_) | AlsRounds::CapHit => (),
         }
