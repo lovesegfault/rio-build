@@ -62,8 +62,12 @@ exempt_strategy="rio-gateway"
 while read -r dep; do
   case " $exempt_aff_pdb " in *" $dep "*) continue ;; esac
   # podAntiAffinity (required)
-  yq -N "select(.kind==\"Deployment\" and .metadata.name==\"$dep\") | .spec.template.spec.affinity.podAntiAffinity" "$out" \
-    | grep -q 'requiredDuringSchedulingIgnoredDuringExecution' || {
+  # r39: capture yq output before grep -q. Same SIGPIPE shape as the
+  # yq | grep -q pipes swept in 12-priorityclass.sh — `grep -q` exits
+  # at first match → yq SIGPIPE (141) → pipefail flags the pipeline →
+  # false-positive FAIL. The here-string avoids the pipe.
+  aff=$(yq -N "select(.kind==\"Deployment\" and .metadata.name==\"$dep\") | .spec.template.spec.affinity.podAntiAffinity" "$out")
+  grep -q 'requiredDuringSchedulingIgnoredDuringExecution' <<<"$aff" || {
     echo "FAIL: Deployment $dep has replicas>1 but no required podAntiAffinity" >&2
     exit 1
   }

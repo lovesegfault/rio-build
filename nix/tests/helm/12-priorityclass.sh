@@ -34,14 +34,20 @@ grep -q 'kube-scheduler' <<<"$ksdep" || {
   echo "FAIL: kube-build-scheduler Deployment missing" >&2
   exit 1
 }
-yq -N 'select(.kind=="ConfigMap" and .metadata.name=="kube-build-scheduler-config") | .data["config.yaml"]' "$out" \
-  | grep -q 'type: MostAllocated' || {
+# r38/r39: capture yq output before grep -q. `grep -q` exits at first
+# match while yq is still writing → SIGPIPE (141) → pipefail flags the
+# pipeline as failed. `||`-polarity → false-positive FAIL ~16% of runs;
+# `&&`-polarity → the FAIL block is silently skipped, masking a real
+# regression (worse). Capture into a var; the here-string avoids the
+# pipe entirely. (See ci-failure-patterns.md "stdenv pipefail SIGPIPE".)
+kscfg=$(yq -N 'select(.kind=="ConfigMap" and .metadata.name=="kube-build-scheduler-config") | .data["config.yaml"]' "$out")
+grep -q 'type: MostAllocated' <<<"$kscfg" || {
   echo "FAIL: KubeSchedulerConfiguration missing MostAllocated scoring" >&2
   exit 1
 }
 for crb in kube-build-scheduler kube-build-volume-scheduler; do
-  yq -N "select(.kind==\"ClusterRoleBinding\" and .metadata.name==\"$crb\")" "$out" \
-    | grep -q 'kind: ClusterRoleBinding' || {
+  crb_doc=$(yq -N "select(.kind==\"ClusterRoleBinding\" and .metadata.name==\"$crb\")" "$out")
+  grep -q 'kind: ClusterRoleBinding' <<<"$crb_doc" || {
     echo "FAIL: ClusterRoleBinding $crb missing" >&2
     exit 1
   }
@@ -50,8 +56,8 @@ done
 # vmtest-full disables buildScheduler (airgap); PriorityClasses still render.
 out2=$TMPDIR/prio-vmtest.yaml
 helm template rio . -f values/vmtest-full.yaml >"$out2"
-yq -N 'select(.kind=="Deployment" and .metadata.name=="kube-build-scheduler")' "$out2" \
-  | grep -q . && {
+ksdep2=$(yq -N 'select(.kind=="Deployment" and .metadata.name=="kube-build-scheduler")' "$out2")
+test -z "$ksdep2" || {
   echo "FAIL: vmtest-full should not render kube-build-scheduler Deployment" >&2
   exit 1
 }
@@ -65,9 +71,9 @@ test "$n" -eq 10 || {
 # REPLACES the upstream default /healthz,/readyz,/livez. The probe
 # paths must be re-listed explicitly or the kubelet's probe round-trips
 # a SubjectAccessReview to the apiserver → crash-loop on brownout.
-yq -N 'select(.kind=="Deployment" and .metadata.name=="kube-build-scheduler") | .spec.template.spec.containers[0].command[]' "$out" \
-  | grep -- '--authorization-always-allow-paths=' \
-  | grep -q '/healthz' || {
+ksargs=$(yq -N 'select(.kind=="Deployment" and .metadata.name=="kube-build-scheduler") | .spec.template.spec.containers[0].command[]' "$out")
+aap=$(grep -- '--authorization-always-allow-paths=' <<<"$ksargs" || true)
+grep -q '/healthz' <<<"$aap" || {
   echo "FAIL: kube-build-scheduler --authorization-always-allow-paths must" \
        "include /healthz (StringSlice replaces upstream default — r37 bug_017)" >&2
   exit 1

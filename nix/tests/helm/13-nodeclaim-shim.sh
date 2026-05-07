@@ -35,8 +35,13 @@ test "$n" -eq 0 || {
   pools_of "$on" | grep -E '^rio-builder-' >&2
   exit 1
 }
+# r39: capture pools_of output before grep -q. Same SIGPIPE shape as
+# the yq | grep -q pipes swept in 12-priorityclass.sh — `grep -q`
+# exits at first match → `sort` (the function's last stage) SIGPIPE
+# (141) → pipefail flags the pipeline. The here-string avoids the pipe.
+all_pools=$(pools_of "$on")
 for p in rio-general; do
-  pools_of "$on" | grep -qx "$p" || {
+  grep -qx "$p" <<<"$all_pools" || {
     echo "FAIL: dropped NodePool $p" >&2
     exit 1
   }
@@ -45,7 +50,7 @@ done
 # managed via `fetcher-*` hwClasses. If it reappears, the static
 # NodePool's `limits:{cpu:5000}` and the per-class `maxFleetCores`
 # DOUBLE the fetcher fanout budget.
-if pools_of "$on" | grep -qx rio-fetcher; then
+if grep -qx rio-fetcher <<<"$all_pools"; then
   echo "FAIL: static rio-fetcher NodePool re-rendered (deleted in §13e)" >&2
   exit 1
 fi

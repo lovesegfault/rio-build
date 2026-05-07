@@ -17,8 +17,16 @@ done
 # the entire 7-15min metal boot window). Tripwire against a future
 # "simplification" that drops the join and silently re-globalizes the
 # threshold — the §SCC sweep miss this alert was last bitten by.
-grep -A4 'alert: RioNodeclaimPoolStuckPending' "$out" \
-  | grep -q 'rio_controller_nodeclaim_lead_time_seconds' || {
+#
+# r39: capture grep -A4 output before grep -q. Same SIGPIPE shape as
+# the yq | grep -q pipes swept in 12-priorityclass.sh — `grep -q`
+# exits at first match → producer SIGPIPE (141) → pipefail flags the
+# pipeline → false-positive FAIL. The here-string avoids the pipe.
+# `|| true` keeps `set -e` from aborting before the diagnostic when
+# the alert is missing (grep -A4 exits 1 on no match — the inner
+# grep -q on empty input then exits 1 and the FAIL block fires).
+sp_block=$(grep -A4 'alert: RioNodeclaimPoolStuckPending' "$out" || true)
+grep -q 'rio_controller_nodeclaim_lead_time_seconds' <<<"$sp_block" || {
   echo "FAIL: RioNodeclaimPoolStuckPending expr does not join on" \
     "rio_controller_nodeclaim_lead_time_seconds — per-cell threshold" \
     "lost (r33 bug_001)" >&2
@@ -36,8 +44,8 @@ grep -q 'alert: RioNodeclaimPoolBootTimeoutLoop' "$out" || {
     "mint→reap loop is silent without this sibling. (r34 bug_019)" >&2
   exit 1
 }
-grep -A4 'alert: RioNodeclaimPoolBootTimeoutLoop' "$out" \
-  | grep -q 'reason="boot-timeout"' || {
+btl_block=$(grep -A4 'alert: RioNodeclaimPoolBootTimeoutLoop' "$out" || true)
+grep -q 'reason="boot-timeout"' <<<"$btl_block" || {
   echo "FAIL: BootTimeoutLoop expr does not key on reason=boot-timeout" >&2
   exit 1
 }
@@ -57,8 +65,8 @@ grep -q 'alert: RioNodeclaimPoolNoHostingClass' "$out" || {
     "(r35 B1)" >&2
   exit 1
 }
-grep -A4 'alert: RioNodeclaimPoolNoHostingClass' "$out" \
-  | grep -q 'reason="no_hosting_class"' || {
+nhc_block=$(grep -A4 'alert: RioNodeclaimPoolNoHostingClass' "$out" || true)
+grep -q 'reason="no_hosting_class"' <<<"$nhc_block" || {
   echo "FAIL: NoHostingClass expr does not key on reason=no_hosting_class" >&2
   exit 1
 }
@@ -78,15 +86,18 @@ expected_window=$(( 4 * $(yq '.scheduler.sla.maxLeadTime' values.yaml) ))
 # `[0s]` ranges; clamp(v, min, max) returns empty when min > max).
 [ "$expected_cap" -lt 90 ] && expected_cap=90
 [ "$expected_window" -lt 90 ] && expected_window=90
-grep -A4 'alert: RioNodeclaimPoolStuckPending' "$out" \
-  | grep -q "clamp(.*, 90, ${expected_cap})" || {
+# Re-extract: $out hasn't changed since L20/L39 but local re-capture
+# keeps each assertion self-contained — a future re-order can't go
+# stale on the variable.
+sp_block=$(grep -A4 'alert: RioNodeclaimPoolStuckPending' "$out" || true)
+grep -q "clamp(.*, 90, ${expected_cap})" <<<"$sp_block" || {
   echo "FAIL: RioNodeclaimPoolStuckPending clamp cap != 3×maxLeadTime"  \
     "(expected ${expected_cap}; cap must derive from maxLeadTime so"     \
     "raising it never disarms the reaper-failed signal)" >&2
   exit 1
 }
-grep -A4 'alert: RioNodeclaimPoolBootTimeoutLoop' "$out" \
-  | grep -q "\[${expected_window}s\]" || {
+btl_block=$(grep -A4 'alert: RioNodeclaimPoolBootTimeoutLoop' "$out" || true)
+grep -q "\[${expected_window}s\]" <<<"$btl_block" || {
   echo "FAIL: BootTimeoutLoop increase() window != 4×maxLeadTime"          \
     "(expected [${expected_window}s]; window must span 2 full reap cycles" \
     "= 2×(2×seed) <= 4×maxLeadTime so >= 2 reaps holds for the entire"     \
