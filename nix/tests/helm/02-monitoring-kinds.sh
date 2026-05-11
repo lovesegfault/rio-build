@@ -26,10 +26,22 @@ done
 # the alert is missing (grep -A4 exits 1 on no match — the inner
 # grep -q on empty input then exits 1 and the FAIL block fires).
 sp_block=$(grep -A4 'alert: RioNodeclaimPoolStuckPending' "$out" || true)
-grep -q 'rio_controller_nodeclaim_lead_time_seconds' <<<"$sp_block" || {
+grep -q 'rio_controller_nodeclaim_ice_timeout_seconds' <<<"$sp_block" || {
   echo "FAIL: RioNodeclaimPoolStuckPending expr does not join on" \
-    "rio_controller_nodeclaim_lead_time_seconds — per-cell threshold" \
-    "lost (r33 bug_001)" >&2
+    "rio_controller_nodeclaim_ice_timeout_seconds — must anchor on the" \
+    "reaper's actual threshold, not a lead_time proxy that can fall" \
+    "below 2×seed (r41 bug_026; supersedes r33 bug_001's lead_time join)" >&2
+  exit 1
+}
+# r41 bug_026: `lead_time_seconds` must NOT appear in the StuckPending
+# expr. It's `q_0.9(boot − eta)` which learns DOWN with no floor at the
+# seed — once `< (2/3)×seed`, `3 × lead_time < 2×seed` and the alert
+# pages while the reaper is in its grace period. `! grep ... ||` so the
+# pass case (grep exits 1 → ! → 0) doesn't trip `set -e`.
+! grep -q 'rio_controller_nodeclaim_lead_time_seconds' <<<"$sp_block" || {
+  echo "FAIL: RioNodeclaimPoolStuckPending expr still references" \
+    "lead_time_seconds — that anchor diverges from the reaper's 2×seed" \
+    "floor (r41 bug_026)" >&2
   exit 1
 }
 
@@ -39,7 +51,7 @@ grep -q 'rio_controller_nodeclaim_lead_time_seconds' <<<"$sp_block" || {
 # alert keys on the reap rate, covering the false-negative arm.
 grep -q 'alert: RioNodeclaimPoolBootTimeoutLoop' "$out" || {
   echo "FAIL: RioNodeclaimPoolBootTimeoutLoop alert missing —"   \
-    "the StuckPending threshold (3×lead, cap from maxLeadTime)"   \
+    "the StuckPending threshold (2×ice_timeout, cap from maxLeadTime)"   \
     "sits above the reaper's 2×seed boot-timeout reap; a sustained" \
     "mint→reap loop is silent without this sibling. (r34 bug_019)" >&2
   exit 1

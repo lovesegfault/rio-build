@@ -33,7 +33,7 @@ pub(crate) mod ffd;
 mod health;
 pub mod sketch;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -631,6 +631,18 @@ pub struct NodeClaimPoolReconciler {
     /// and busy this tick records an uncensored `IdleGapEvent`.
     /// In-memory only — restart drops one tick's worth of edges.
     prev_idle: HashMap<String, f64>,
+    /// Cells written by [`Self::emit_live_gauges`] last tick that were
+    /// NOT in `all_cells()` (i.e. carried by a live NodeClaim whose
+    /// hwClass was removed from config mid-rollout). r41 bug_025: a
+    /// `metrics::gauge!` series persists at its last `.set()` value
+    /// — once the orphaned NodeClaim finishes draining and drops out of
+    /// `by_state`, `terminating_age_max_seconds{cell}` would otherwise
+    /// freeze at its last (possibly >300s) value and `StuckTerminating`
+    /// would page forever. Tracking the prior tick's extras gives each
+    /// vanished cell exactly one zero-write. In-memory only — restart
+    /// drops one tick's worth of trailing zero-writes (same TTL-omitted
+    /// rationale as `prev_idle`).
+    prev_extra_cells: HashSet<Cell>,
     /// `name → cell` for NodeClaims `cover_deficit` created and that
     /// haven't yet been observed Registered, terminating, or absent.
     /// Tick-over-tick diff against `live`: a name in here but absent
@@ -660,6 +672,63 @@ pub struct NodeClaimPoolReconciler {
     /// Monotonic tick counter for `cover_deficit`'s rotating-start
     /// round-robin.
     tick_counter: u64,
+}
+
+/// Cells `emit_live_gauges` must write this tick. r41 bug_025: a live
+/// NodeClaim's `cell` is label-derived; `all_cells()` is config-derived
+/// (GetHwClassConfig, ≤300s refresh). During a config rollout that
+/// removes a hwClass while a NodeClaim is draining, the cell drops out
+/// of `all_cells()` but stays in `by_state` — without the union, the
+/// gauge loop stops writing `terminating_age_max_seconds{cell}` and
+/// `RioNodeclaimPoolStuckTerminating` reads a frozen value forever
+/// (`metrics::gauge!` series persist at their last `.set()`; no
+/// deregister). `prev_extras` gives each vanished cell exactly one
+/// trailing zero-write so a resolved stuck-drain doesn't page forever.
+///
+/// Returns `(to_write, new_extras)`: cells to emit gauges for, and the
+/// next tick's extras set (live cells outside config). The caller
+/// stores the latter into `self.prev_extra_cells`.
+///
+/// Free function (not a method): `NodeClaimPoolReconciler::new` is
+/// `async` and needs a `kube::Client` + `PgPool`; the test module
+/// can't construct one, so the testable invariant lives outside.
+fn gauge_universe(
+    configured: &[Cell],
+    live_cells: impl Iterator<Item = Cell>,
+    prev_extras: &HashSet<Cell>,
+) -> (Vec<Cell>, HashSet<Cell>) {
+    let configured_set: HashSet<&Cell> = configured.iter().collect();
+    let extras: HashSet<Cell> = live_cells.filter(|c| !configured_set.contains(c)).collect();
+    let trailing: Vec<Cell> = prev_extras
+        .iter()
+        .filter(|c| !configured_set.contains(c) && !extras.contains(*c))
+        .cloned()
+        .collect();
+    let to_write: Vec<Cell> = configured
+        .iter()
+        .cloned()
+        .chain(extras.iter().cloned())
+        .chain(trailing)
+        .collect();
+    (to_write, extras)
+}
+
+/// Cells in `by_cell` not in `order` and the count of intents stranded
+/// there. r41 bug_021: scheduler-stamped cells (`cells_of(i)`) the
+/// controller's GetHwClassConfig doesn't know about — the cover loop
+/// never visits them, the intent is silently dropped.
+///
+/// Free function for the same reason as [`gauge_universe`]:
+/// `cover_deficit` is `async` with a `kube::Client` + `PgPool` the test
+/// module can't construct; the partition is the testable invariant.
+fn unknown_cell_intents<'m>(
+    by_cell: &'m BTreeMap<Cell, Vec<&SpawnIntent>>,
+    order: &[Cell],
+) -> (u64, Vec<&'m Cell>) {
+    let known: HashSet<&Cell> = order.iter().collect();
+    let unknown: Vec<&Cell> = by_cell.keys().filter(|c| !known.contains(c)).collect();
+    let n: u64 = unknown.iter().map(|c| by_cell[*c].len() as u64).sum();
+    (n, unknown)
 }
 
 impl NodeClaimPoolReconciler {
@@ -717,6 +786,7 @@ impl NodeClaimPoolReconciler {
             sketches,
             recorded_boot: HashSet::new(),
             prev_idle: HashMap::new(),
+            prev_extra_cells: HashSet::new(),
             inflight_created: HashMap::new(),
             consecutive_bot_ticks: 0,
             tick_counter: 0,
@@ -798,6 +868,16 @@ impl NodeClaimPoolReconciler {
                         self.recorded_boot.clear();
                         self.prev_idle.clear();
                         self.inflight_created.clear();
+                        // `prev_extra_cells` is intentionally NOT cleared
+                        // here (r41 bug_025). Unlike the three sets above
+                        // (whose stale entries *suppress* recording/
+                        // reaping), it is a cleanup-pending set: a stale
+                        // entry from before the lease lapse triggers one
+                        // extra trailing zero-write — exactly what's
+                        // needed to clear a gauge series that froze
+                        // mid-drain when the tick loop stopped. Clearing
+                        // it would orphan those series at their last
+                        // (possibly paging) value. See [`gauge_universe`].
                         self.hooks
                             .reload
                             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1145,14 +1225,14 @@ impl NodeClaimPoolReconciler {
     }
 
     /// Per-cell gauges derived from `live` + `now` only (no scheduler
-    /// intents needed). Iterates `cfg.all_cells()` so every (h,cap)
-    /// timeseries is emitted every tick — Prometheus gauge semantics: a
-    /// cell that drained to 0 reads as 0, not stale-at-last-nonzero.
-    /// Called from BOTH `reconcile_once` (via `emit_tick_gauges`) and
-    /// `consolidate_only` so `RioNodeclaimPoolStuckPending` stays
-    /// accurate during scheduler outages.
-    fn emit_live_gauges(&self, live: &[ffd::LiveNode], now_secs: f64) {
-        use std::collections::BTreeMap;
+    /// intents needed). Iterates `cfg.all_cells() ∪ by_state.keys() ∪
+    /// prev_extra_cells` so every (h,cap) timeseries is emitted every
+    /// tick — Prometheus gauge semantics: a cell that drained to 0 reads
+    /// as 0, not stale-at-last-nonzero. Called from BOTH `reconcile_once`
+    /// (via `emit_tick_gauges`) and `consolidate_only` so
+    /// `RioNodeclaimPoolStuckPending` stays accurate during scheduler
+    /// outages.
+    fn emit_live_gauges(&mut self, live: &[ffd::LiveNode], now_secs: f64) {
         // `(registered, inflight, terminating, max_inflight_age, max_term_age)`.
         // The three counts partition `live` — every NodeClaim is exactly one
         // — so `state=registered` matches FFD's placement-candidate set
@@ -1174,10 +1254,21 @@ impl NodeClaimPoolReconciler {
                 e.3 = e.3.max(n.age_secs(now_secs).unwrap_or(0.0));
             }
         }
-        for cell in self.cfg.all_cells(&self.hw_config) {
+        // r41 bug_025: union of config-derived and label-derived cells,
+        // plus one trailing tick — see [`gauge_universe`].
+        // `consolidate::reap_idle` already handles this lifecycle ("a
+        // live node may carry a cell removed from config mid-rollout —
+        // derive on demand"); this is the §SCC sibling fallback.
+        let configured = self.cfg.all_cells(&self.hw_config);
+        let (to_write, new_extras) = gauge_universe(
+            &configured,
+            by_state.keys().cloned(),
+            &self.prev_extra_cells,
+        );
+        for cell in &to_write {
             let label = cell.to_string();
             let (reg, inf, term, age, term_age) =
-                by_state.get(&cell).copied().unwrap_or((0, 0, 0, 0.0, 0.0));
+                by_state.get(cell).copied().unwrap_or((0, 0, 0, 0.0, 0.0));
             metrics::gauge!("rio_controller_nodeclaim_live",
                 "cell" => label.clone(), "state" => "registered")
             .set(reg as f64);
@@ -1193,16 +1284,28 @@ impl NodeClaimPoolReconciler {
             metrics::gauge!("rio_controller_nodeclaim_terminating_age_max_seconds",
                 "cell" => label.clone())
             .set(term_age);
-            metrics::gauge!("rio_controller_nodeclaim_lead_time_seconds", "cell" => label)
-                .set(self.sketches.lead_time(&cell));
+            metrics::gauge!("rio_controller_nodeclaim_lead_time_seconds", "cell" => label.clone())
+                .set(self.sketches.lead_time(cell));
+            // r41 bug_026: `RioNodeclaimPoolStuckPending` anchors on this
+            // (the reaper's actual threshold) instead of `3×lead_time`
+            // (a proxy that can fall below `2×seed` once the cell learns).
+            // Same expression `health::classify` evaluates at health.rs:122.
+            let ice_timeout = self.sketches.get(cell).map_or_else(
+                || 2.0 * self.cfg.seed_for(cell),
+                |s| s.ice_timeout(self.cfg.seed_for(cell)),
+            );
+            metrics::gauge!("rio_controller_nodeclaim_ice_timeout_seconds",
+                "cell" => label)
+            .set(ice_timeout);
         }
+        self.prev_extra_cells = new_extras;
     }
 
     /// Per-tick `r[obs.metric.controller]` gauges: live-derived (via
     /// [`Self::emit_live_gauges`]) plus FFD-derived (`ffd_unplaced_cores`,
     /// `ffd_placeable_intents`) which need scheduler intents.
     fn emit_tick_gauges(
-        &self,
+        &mut self,
         live: &[ffd::LiveNode],
         placeable: &[ffd::Placement],
         unplaced: &[SpawnIntent],
@@ -1218,10 +1321,25 @@ impl NodeClaimPoolReconciler {
             cover::assign_to_cells(unplaced, &self.sketches, &none, cover::cell_rank, |i| {
                 self.cfg.fallback_cell(i, &self.hw_config, &none)
             });
-        for cell in self.cfg.all_cells(&self.hw_config) {
+        // r41 bug_021 sibling: same `all_cells()` blind spot as
+        // `cover_deficit` — `by_cell` is keyed on scheduler-stamped
+        // cells, so a cell the controller hasn't loaded never gets a
+        // `ffd_unplaced_cores` series. Iterate the union. No trailing
+        // zero-write needed (unlike [`gauge_universe`]) — `by_cell` is
+        // recomputed each tick from current intents, so once the demand
+        // clears the cell drops out and the configured-only loop writes
+        // 0 for any cell still in `all_cells()`.
+        let configured = self.cfg.all_cells(&self.hw_config);
+        let configured_set: HashSet<&Cell> = configured.iter().collect();
+        let extras: Vec<Cell> = by_cell
+            .keys()
+            .filter(|c| !configured_set.contains(c))
+            .cloned()
+            .collect();
+        for cell in configured.iter().chain(extras.iter()) {
             let label = cell.to_string();
             let unplaced_cores: u32 = by_cell
-                .get(&cell)
+                .get(cell)
                 .map(|v| v.iter().map(|i| i.cores).sum())
                 .unwrap_or(0);
             metrics::gauge!("rio_controller_ffd_unplaced_cores", "cell" => label)
@@ -1432,6 +1550,42 @@ impl NodeClaimPoolReconciler {
                     }
                 }
             }
+        }
+        // r41 bug_021: `assign_to_cells` keys `by_cell` on scheduler-
+        // stamped cells (`cells_of(i)` reads `hw_class_names`/
+        // `node_affinity`, both written by the SCHEDULER at solve time).
+        // The cover loop above only visits `order = all_cells()` —
+        // derived from the CONTROLLER's `hw_config`, refreshed every
+        // ≤300s via `GetHwClassConfig`. During a config rollout the
+        // scheduler can stamp a hwClass the controller hasn't loaded
+        // yet; those intents land in `by_cell`, the loop never visits
+        // their cell, and they're silently dropped — no NodeClaim, no
+        // metric, no warn. The runbook's
+        // `RioNodeclaimPoolNoHostingClass` diagnose step explicitly
+        // names this case ("the controller's `HwClassConfig` is stale")
+        // and calls the alert "the ONLY signal" — but the alert reads
+        // `intent_dropped_total{reason=no_hosting_class}` which fires
+        // on `fallback_cell → None`, a different path. Surface the skew
+        // with its own reason. Mirrors the sibling
+        // `global_ceilings()`-absent / `labels_for()`-absent failure
+        // modes in this function which already `warn!`.
+        let (skewed, unknown) = unknown_cell_intents(&by_cell, &order);
+        if skewed > 0 {
+            metrics::counter!(
+                "rio_controller_nodeclaim_intent_dropped_total",
+                "reason" => "unknown_hw_class",
+            )
+            .increment(skewed);
+            warn!(
+                dropped = skewed,
+                cells = ?unknown,
+                "SpawnIntents target hwClasses not in the controller's \
+                 all_cells() — scheduler/controller GetHwClassConfig skew \
+                 (self-heals within ≤300s if the RPC is healthy) or hwClass \
+                 removed from controller config; if this persists past 5min, \
+                 check rio-controller GetHwClassConfig RPC errors and the \
+                 scheduler/controller deployment ages"
+            );
         }
         Ok(CoverResult { created })
     }
@@ -1722,6 +1876,85 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cfg.seed_for(&cell), 30.0);
+    }
+
+    /// r41 bug_025: a live NodeClaim whose hwClass is removed from
+    /// config mid-rollout still bills against `max_fleet_cores` but
+    /// drops out of `all_cells()`. `emit_live_gauges` must keep writing
+    /// `terminating_age_max_seconds{cell}` so `StuckTerminating` can
+    /// fire — the §SCC sibling of `reap_idle`'s "derive on demand"
+    /// fallback. After the NodeClaim finishes draining (drops out of
+    /// `live` AND `all_cells()`), the gauge must get one trailing
+    /// zero-write so a resolved stuck-drain doesn't page forever.
+    #[test]
+    fn gauge_universe_covers_extras_and_trailing() {
+        let configured = vec![Cell("known-x86".into(), CapacityType::OnDemand)];
+        let removed = Cell("removed-x86".into(), CapacityType::OnDemand);
+
+        // Tick 1: hwClass removed from config; NodeClaim still draining.
+        let prev = HashSet::new();
+        let (to_write, extras) =
+            gauge_universe(&configured, std::iter::once(removed.clone()), &prev);
+        assert!(
+            to_write.contains(&removed),
+            "extra cell must be gauged while live"
+        );
+        assert!(extras.contains(&removed), "tracked for trailing zero-write");
+
+        // Tick 2: NodeClaim finished draining; not in `live` or `all_cells()`.
+        // One trailing zero-write so StuckTerminating clears.
+        let (to_write, extras) = gauge_universe(&configured, std::iter::empty(), &extras);
+        assert!(
+            to_write.contains(&removed),
+            "vanished extra gets one trailing zero-write"
+        );
+        assert!(
+            extras.is_empty(),
+            "no longer tracked after the trailing write"
+        );
+
+        // Tick 3: gone for good.
+        let (to_write, _) = gauge_universe(&configured, std::iter::empty(), &extras);
+        assert!(
+            !to_write.contains(&removed),
+            "no further writes after the trailing tick"
+        );
+        assert_eq!(to_write, configured, "back to configured-only");
+
+        // Re-added to config: stops being an extra (configured wins).
+        let (_, extras) = gauge_universe(
+            std::slice::from_ref(&removed),
+            std::iter::once(removed.clone()),
+            &HashSet::new(),
+        );
+        assert!(extras.is_empty(), "configured cell is never an extra");
+    }
+
+    /// r41 bug_021: `assign_to_cells` keys `by_cell` on scheduler-
+    /// stamped cells; the cover loop visits only `all_cells()`. The
+    /// difference must be observable so config skew has a signal.
+    #[test]
+    fn unknown_cell_intents_partitions_by_order() {
+        let intent = SpawnIntent::default();
+        let known = Cell("x86-64".into(), CapacityType::OnDemand);
+        let unknown_cell = Cell("unknown-x86".into(), CapacityType::OnDemand);
+        let order = vec![known.clone()];
+
+        // by_cell has an entry the cover loop will never visit.
+        let by_cell: BTreeMap<Cell, Vec<&SpawnIntent>> = [
+            (known.clone(), vec![&intent]),
+            (unknown_cell.clone(), vec![&intent]),
+        ]
+        .into();
+        let (n, unknown) = unknown_cell_intents(&by_cell, &order);
+        assert_eq!(n, 1, "one intent stranded in the scheduler-only cell");
+        assert_eq!(unknown, vec![&unknown_cell]);
+
+        // by_cell ⊆ order → nothing stranded.
+        let by_cell: BTreeMap<Cell, Vec<&SpawnIntent>> = [(known, vec![&intent])].into();
+        let (n, unknown) = unknown_cell_intents(&by_cell, &order);
+        assert_eq!(n, 0);
+        assert!(unknown.is_empty());
     }
 
     /// `fallback_cell`: prefers `(reference_hw_class, Spot)` when its

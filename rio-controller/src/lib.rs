@@ -187,7 +187,10 @@ pub fn describe_metrics() {
          cell's per-class catalog ceiling (or max_node_disk) — \
          the scheduler's ClassCeiling gate didn't reject it (override-bypass \
          producer hole). The intent has no valid claim of any n; sizing drops \
-         it instead of looping mint→Pending."
+         it instead of looping mint→Pending. \
+         reason=unknown_hw_class: scheduler stamped a hwClass not yet in \
+         the controller's GetHwClassConfig — config skew; self-heals within \
+         ≤300s, persistent rate = controller's hw_refresh RPC failing."
     );
     describe_counter!(
         "rio_controller_nodeclaim_created_total",
@@ -247,6 +250,16 @@ pub fn describe_metrics() {
         "Per-`cell` provisioning lead-time: lead_time_q-quantile of the z=boot−eta_error \
          DDSketch. What cover_deficit provisions ahead by. Stuck at the seed value = \
          no Registered=True transitions recorded yet (check seed_fallback_total)."
+    );
+    describe_gauge!(
+        "rio_controller_nodeclaim_ice_timeout_seconds",
+        "Per-`cell` boot/ICE reap threshold the reaper acts at: \
+         max(2×lead_time_seed, q_0.99(boot)), floored at 2×seed until 100 \
+         boot samples. The StuckPending alert anchors on this (×2) so the \
+         alert always sits above the reaper — a firing alert means the \
+         reaper failed, not just a slow boot. Distinct from \
+         `lead_time_seconds` (q_0.9(boot−eta), what cover_deficit \
+         provisions ahead by — learns DOWN; not a reap floor)."
     );
     // r[impl obs.metric.consolidate-threshold]
     describe_gauge!(
