@@ -389,6 +389,79 @@ async fn test_hmac_signer_produces_verifiable_token() -> TestResult {
     Ok(())
 }
 
+/// bug_011 Phase 1 invariant: `dispatch.rs` signs `tenant: None` even
+/// when the build HAS an attributed tenant. This is the writer-side
+/// pin for the two-phase rollout — the serde-shape pin
+/// (`assignment_claims_tenant_forward_skew` in `rio-auth`) only proves
+/// `Some(_)` emits the key and `None` omits it; it constructs its own
+/// claims and never exercises `build_assignment_proto`. Without THIS
+/// test, a merge-conflict resolution or premature Phase 2 cherry-pick
+/// that restores `tenant: state.attributed_tenant(...)` would pass the
+/// whole suite, then break ≥50% of `PutPath` calls during the next
+/// rolling upgrade against a not-yet-rolled store fleet.
+///
+/// **Phase 2 changes this test, deliberately.** When the store fleet
+/// has rolled the Phase 1 reader, flip `dispatch.rs` to set `tenant`
+/// from `attributed_tenant` AND flip this assertion to
+/// `assert_eq!(claims.tenant, Some(tenant.to_string()))`. The two
+/// edits land in the same commit; this test failing is the signal
+/// they didn't.
+#[tokio::test]
+async fn test_hmac_assignment_tenant_unset_until_phase2() -> TestResult {
+    use rio_auth::hmac::{HmacSigner, HmacVerifier};
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let test_key = b"test-phase1-tenant-key-32-bytes!".to_vec();
+
+    // Tenant must exist (builds.tenant_id FK, migration 009). The
+    // build below is attributed to it, so `attributed_tenant(...)`
+    // returns `Some(tenant)` — meaning a regression to the Phase 2
+    // shape (`tenant: state.attributed_tenant(...)`) would produce
+    // `claims.tenant == Some(...)` and FAIL the assertion. A
+    // tenant-less build (the other hmac tests) can't catch that:
+    // `attributed_tenant` is `None` either way.
+    let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "phase1-tenant").await;
+
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, p| {
+        p.hmac_signer = Some(Arc::new(HmacSigner::from_key(test_key.clone())));
+    });
+
+    let mut worker_rx = connect_executor(&handle, "phase1-w", "x86_64-linux").await?;
+
+    let _ = merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id: Uuid::new_v4(),
+            tenant_id: Some(tenant),
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![make_node("phase1-drv")],
+            edges: vec![],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+            jwt_token: None,
+        },
+    )
+    .await?;
+
+    let assignment = recv_assignment(&mut worker_rx).await;
+    let claims = HmacVerifier::from_key(test_key)
+        .verify::<rio_auth::hmac::AssignmentClaims>(&assignment.assignment_token)
+        .expect("token verifies");
+
+    assert_eq!(
+        claims.tenant, None,
+        "Phase 1 (bug_011): dispatch.rs must sign tenant=None even for a \
+         tenant-attributed build, until the store fleet has rolled the \
+         AssignmentClaims.tenant reader. Phase 2 flips dispatch.rs AND \
+         this assertion to Some({tenant}) in the same commit; see the \
+         TODO at rio-scheduler/src/actor/dispatch.rs."
+    );
+
+    Ok(())
+}
+
 /// MAX_HMAC_TIMEOUT_SECS clamp: even if build_timeout is u64::MAX,
 /// the token's expiry stays bounded (≤ ~14 days from now: 7d × 2).
 #[tokio::test]

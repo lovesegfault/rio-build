@@ -85,19 +85,45 @@ pub struct AssignmentClaims {
     /// after build completion is well within that window. Prevents
     /// replay from a leaked token months later.
     pub expiry_unix: u64,
-    /// Attributing tenant UUID (hyphenated). Stamped scheduler-side at
-    /// dispatch from `attributed_tenant`; the store writes it to
-    /// `hw_perf_samples.submitting_tenant` (`r[sched.sla.threat.
-    /// hw-median-of-medians]`). `None` for orphaned/recovered nodes
-    /// (no live owning build). The store derives tenant from CLAIMS
-    /// (signed) — never from the request body — so a compromised
-    /// worker cannot fabricate tenant identities to defeat the
-    /// median-of-medians defence.
+    /// Attributing tenant UUID (hyphenated). When set, the store
+    /// writes it to `hw_perf_samples.submitting_tenant`
+    /// (`r[sched.sla.threat.hw-median-of-medians]`). The store derives
+    /// tenant from CLAIMS (signed) — never from the request body — so
+    /// a compromised worker cannot fabricate tenant identities to
+    /// defeat the median-of-medians defence. `None` for orphaned/
+    /// recovered nodes (no live owning build).
     ///
-    /// `#[serde(default)]`: tokens minted by a pre-tenant scheduler
-    /// (in-flight at deploy time) lack this field; they must still
-    /// verify (→ `tenant=None`).
-    #[serde(default)]
+    /// **Two-phase rollout (bug_011).** This struct carries
+    /// `#[serde(deny_unknown_fields)]`, so adding a field is a wire
+    /// break in the *forward* skew direction (new token → old store).
+    /// During a `helm upgrade` the scheduler (leader-elected
+    /// singleton, ~30s) rolls before the store fleet (multi-replica,
+    /// minutes); for that window every `PutPath` to a not-yet-rolled
+    /// store would reject with `unknown field 'tenant'` →
+    /// `permission_denied`. Both skew directions and how each serde
+    /// attribute closes them:
+    ///
+    /// - **old token → new store:** a pre-tenant scheduler's token
+    ///   lacks `"tenant"`. `#[serde(default)]` covers it — missing key
+    ///   deserializes to `None`. (`deny_unknown_fields` only rejects
+    ///   *extra* keys, not *missing* ones.)
+    /// - **new token → old store:** a post-tenant scheduler's token
+    ///   would carry `"tenant"`, which a pre-tenant store rejects.
+    ///   `skip_serializing_if = "Option::is_none"` + Phase 1's
+    ///   `tenant: None` close it: when `tenant=None` the key is never
+    ///   emitted, so the wire body is byte-identical to the pre-tenant
+    ///   shape. (`Option<T>` without `skip_serializing_if` would emit
+    ///   `"tenant": null`, which is *still* an unknown key.)
+    ///
+    /// **Phase 1 (this release):** the store can READ `tenant`; the
+    /// scheduler signs `tenant: None` at dispatch (the key is not
+    /// emitted). Roll the full fleet. **Phase 2 (next release):** flip
+    /// `dispatch.rs` to set `tenant` from `attributed_tenant`. Until
+    /// then, `hw_perf_samples.submitting_tenant` is NULL for every
+    /// build — the median-of-medians consumer already tolerates that
+    /// (it treats `None` as one tenant bucket, same as pre-M_054 rows
+    /// and probe pods).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
 }
 
@@ -717,6 +743,93 @@ mod tests {
             key.verify::<AssignmentClaims>(&tok).unwrap().tenant,
             with_tenant.tenant
         );
+    }
+
+    /// Forward-skew direction (bug_011): a token minted by a
+    /// post-tenant scheduler, presented to a PRE-tenant store during a
+    /// rolling upgrade. The HMAC tag check passes (tag is over raw
+    /// bytes); the parse step is where the skew breaks. With
+    /// `deny_unknown_fields` on the OLD struct and `"tenant"` in the
+    /// NEW struct's wire body, the old store rejects with
+    /// `unknown field 'tenant'` → `permission_denied` → every
+    /// `PutPath` to a not-yet-rolled store pod fails for the rollout
+    /// window.
+    ///
+    /// **Two-phase rollout (H1).** This test pins both halves:
+    ///
+    /// 1. `tenant: Some(_)` → the wire body carries `"tenant"` → a
+    ///    pre-tenant store CANNOT parse it. This is the residual
+    ///    hazard that gates Phase 2: whoever flips `dispatch.rs` from
+    ///    `tenant: None` to `tenant: state.attributed_tenant(...)`
+    ///    MUST first confirm the store fleet has fully rolled with the
+    ///    Phase 1 reader (`#[serde(default)]` on `tenant`). Until
+    ///    then, the `Some(_)` body is a wire break.
+    /// 2. `tenant: None` → `skip_serializing_if = "Option::is_none"`
+    ///    omits the key entirely → the wire body is byte-identical to
+    ///    the pre-tenant shape → a pre-tenant store parses it fine.
+    ///    This is what makes Phase 1 (scheduler signs `None`) safe to
+    ///    roll in any order against pre-tenant stores.
+    ///
+    /// If this test starts failing on the `Some(_)` half — i.e. the
+    /// pre-tenant struct started ACCEPTING `"tenant"` — somebody
+    /// dropped `deny_unknown_fields` from `AssignmentClaims`, which is
+    /// a different rollout strategy (Option H3 in the bug_011 plan)
+    /// and this test should be rewritten to pin that property instead.
+    #[test]
+    fn assignment_claims_tenant_forward_skew() {
+        // Pre-tenant store struct (hand-rolled snapshot of
+        // `AssignmentClaims` before `tenant` was added). Deliberately
+        // local so it never drifts to track the real struct.
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)] // fields read by serde, not by the test body
+        struct OldAssignmentClaims {
+            executor_id: String,
+            drv_hash: String,
+            expected_outputs: Vec<String>,
+            is_ca: bool,
+            expiry_unix: u64,
+        }
+
+        let key = HmacKey::from_key(TEST_KEY.to_vec());
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let claims_body = |c: &AssignmentClaims| -> Vec<u8> {
+            let token = key.sign(c);
+            let (claims_b64, _) = token.split_once('.').unwrap();
+            b64.decode(claims_b64).unwrap()
+        };
+
+        // Half 1 — `tenant: Some(_)` is a wire break against a
+        // pre-tenant store. Phase 2 must not land before the store
+        // fleet has rolled with the Phase 1 reader.
+        let mut with_tenant = test_claims(3600);
+        with_tenant.tenant = Some("4f8a3c0e-0000-4000-8000-000000000001".into());
+        let body = claims_body(&with_tenant);
+        assert!(
+            std::str::from_utf8(&body).unwrap().contains("\"tenant\""),
+            "Some(_) must emit the tenant key (precondition for the rejection assertion)"
+        );
+        let err = serde_json::from_slice::<OldAssignmentClaims>(&body)
+            .expect_err("pre-tenant store must reject a tenant-bearing body");
+        assert!(
+            err.to_string().contains("unknown field `tenant`"),
+            "expected `unknown field 'tenant'`, got: {err}"
+        );
+
+        // Half 2 — `tenant: None` is wire-compatible with a
+        // pre-tenant store: `skip_serializing_if` omits the key, so
+        // the body has the exact pre-tenant shape. This is what makes
+        // Phase 1 safe to roll in any order.
+        let without_tenant = test_claims(3600); // tenant: None
+        let body = claims_body(&without_tenant);
+        assert!(
+            !std::str::from_utf8(&body).unwrap().contains("tenant"),
+            "None must NOT emit the tenant key (skip_serializing_if)"
+        );
+        let parsed = serde_json::from_slice::<OldAssignmentClaims>(&body)
+            .expect("pre-tenant store must accept a tenant-less body");
+        assert_eq!(parsed.executor_id, without_tenant.executor_id);
+        assert_eq!(parsed.expiry_unix, without_tenant.expiry_unix);
     }
 
     #[test]
