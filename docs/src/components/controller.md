@@ -565,20 +565,22 @@ replacement must consume headroom from the same budget the dying node
 still occupies. Surfaced as
 `rio_controller_nodeclaim_live{state="terminating"}`.
 
-r[ctrl.nodeclaim.anchor-bulk+4]
+r[ctrl.nodeclaim.anchor-bulk+5]
 Unplaced intents per `(h,cap)` cell whose pod footprint fits the cell's
 per-class `(max_cores, max_mem)` and global `max_disk` cap are covered
 by `n` uniform claims at
 `(max(⌈Σc*/n⌉, max_i c*), max(Σm/n, max_i m), max(Σd_eph/n, max_i d_eph))`,
 where `n` iterates upward from the 3-axis lower bound
-`max(⌈Σc*/global_cores⌉, ⌈Σm/global_mem⌉, ⌈Σd_eph/maxDisk⌉)` until the
+`max(⌈Σc*/cell_cores⌉, ⌈Σm/cell_mem⌉, ⌈Σd_eph/maxDisk⌉)` until the
 production FFD's MostAllocated-cpu placement order packs every fitting
 intent; over-cap intents are dropped with
 `intent_dropped_total{reason=exceeds_cell_cap}`
 (`Σ/n` is a bin-packing lower bound, not a guarantee). §13c-3:
-`global_cores`/`global_mem` are read from
-`HwClassConfig::global_ceilings()` (shipped over `GetHwClassConfig`,
-not `controller.toml`); `cover_deficit` skips the tick when the
+`cell_cores`/`cell_mem` are the per-class effective ceiling
+`min(HwClassConfig::ceilings_for(h), HwClassConfig::global_ceilings())`
+(both shipped over `GetHwClassConfig`, not `controller.toml`), so each
+claim's `(c, m)` chunk is hostable by some instance in `h`'s
+`requirements` set; `cover_deficit` skips the tick when the global
 ceiling is not yet loaded (fail-closed, ≤300s self-heal). NodeClaim
 creation is capped at `sla.maxNodeClaimsPerCellPerTick` and the
 `sla.maxFleetCores` budget; cells are iterated round-robin from a

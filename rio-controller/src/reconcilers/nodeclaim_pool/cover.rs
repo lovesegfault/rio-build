@@ -1,6 +1,6 @@
 //! §13b deficit cover.
 //!
-//! Per `r[ctrl.nodeclaim.anchor-bulk+4]`: for each `(h,cap)` cell with
+//! Per `r[ctrl.nodeclaim.anchor-bulk+5]`: for each `(h,cap)` cell with
 //! unplaced demand, mint `n` uniform NodeClaims sized so the production
 //! FFD packs every fitting intent (over-cap dropped with
 //! `exceeds_cell_cap` metric — see [`sizing`]), capped at
@@ -243,7 +243,7 @@ pub struct SizingCfg {
 /// predicate IS production `simulate` — no reimplemented sort/score to
 /// diverge on. Unit-tested via the same call (the
 /// §Simulator-shares-accounting executable guarantee).
-// r[impl ctrl.nodeclaim.anchor-bulk+4]
+// r[impl ctrl.nodeclaim.anchor-bulk+5]
 pub fn sizing(cell: &Cell, u: &[&SpawnIntent], cfg: &SizingCfg) -> (Vec<(u32, u64, u64)>, f64) {
     use crate::reconcilers::pool::jobs::intent_pod_footprint;
     if u.is_empty() {
@@ -719,7 +719,7 @@ mod tests {
 
     /// STRIKE-3 (mb_009): direct cases. Unconstrained budget so sizing
     /// covers ALL intents (FFD oracle), and every claim ≤ per-axis cap.
-    // r[verify ctrl.nodeclaim.anchor-bulk+4]
+    // r[verify ctrl.nodeclaim.anchor-bulk+5]
     #[test]
     fn sizing_invariants_hold() {
         let scfg = cfg(64, u32::MAX, u32::MAX);
@@ -813,7 +813,7 @@ mod tests {
     /// the claim's `(c,m,d)`); a clamped 32c claim would just loop
     /// (mint→Pending→re-mint). `sizing()` filters and DROPS (with metric
     /// + warn), sizing on the remainder.
-    // r[verify ctrl.nodeclaim.anchor-bulk+4]
+    // r[verify ctrl.nodeclaim.anchor-bulk+5]
     #[test]
     fn sizing_filters_intent_exceeding_per_cell_cap() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
