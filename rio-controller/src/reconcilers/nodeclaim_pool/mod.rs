@@ -1377,13 +1377,20 @@ impl NodeClaimPoolReconciler {
                         )
                         .increment(1);
                         created.push((name, cell.clone()));
+                        // r40 bug_015: budget counters track cores MINTED this
+                        // tick (`class_budget` doc, cover.rs:339). A failed
+                        // create is neither Registered nor in-flight; counting
+                        // it phantom-consumes up to per_tick_cap × max_node_cores
+                        // (8×192 = 1536c) of `global_remaining`, under-
+                        // provisioning cells later in the round-robin. Increment
+                        // only on Ok so `created_cores` ⟺ `created.len()`.
+                        created_cores += c;
+                        *class_created.entry(cell.0.clone()).or_default() += c;
                     }
                     Err(e) => {
                         warn!(%cell, error = %e, "NodeClaim create failed; skipping");
                     }
                 }
-                created_cores += c;
-                *class_created.entry(cell.0.clone()).or_default() += c;
             }
         }
         Ok(CoverResult { created })
