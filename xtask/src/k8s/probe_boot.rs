@@ -397,8 +397,11 @@ struct ProbeResult {
 ///
 /// The shim is inert: `limits.cpu=0` means it never provisions on its
 /// own (assertion 2), `budgets:[{nodes:"0"}]` means it never disrupts
-/// (assertion 5), `expireAfter: Never` means probe nodes aren't
-/// drift-churned. NOT deleted on exit — helm renders the same object on
+/// (assertion 5). The template's `expireAfter: Never` mirrors the
+/// helm-rendered shim for parity; it does NOT propagate to the probe's
+/// externally-`create()`'d NodeClaims (see `mk_probe_nodeclaim` —
+/// those deliberately rely on Karpenter's 720h CRD default as orphan
+/// cleanup). NOT deleted on exit — helm renders the same object on
 /// deploy, and `cpu:0` makes it harmless to leave.
 async fn ensure_shim_nodepool(client: &kube::Client, node_class: &str) -> Result<()> {
     let pools = nodepool_api(client);
@@ -614,6 +617,10 @@ fn mk_probe_nodeclaim(cell: &Cell, def: &HwClassDef, metal_sizes: &[String]) -> 
     labels.insert("karpenter.sh/nodepool".into(), SHIM_NODEPOOL.into());
     labels.insert(PROBE_LABEL.into(), "true".into());
     labels.insert("rio.build/hw-class".into(), h.clone());
+    // expireAfter intentionally omitted — unlike `cover::build_nodeclaim`
+    // (which sets `Never`), probe NodeClaims live only minutes during
+    // `xtask k8s up --probe`; Karpenter's 720h CRD default acts as orphan
+    // cleanup if the probe crashes mid-run.
     serde_json::from_value(json!({
         "apiVersion": "karpenter.sh/v1",
         "kind": "NodeClaim",

@@ -555,6 +555,12 @@ pub fn build_nodeclaim(
                 requests: Some(requests),
                 ..Default::default()
             }),
+            // r40 bug_022: see NodeClaimSpec::expire_after doc. Without
+            // this, Karpenter v1's CRD defaults to 720h forceful
+            // expiration — every cover-minted NodeClaim and warm
+            // hold-open slot is cordoned/drained at +30d, in a
+            // synchronized fleet-wide wave for nodes from a deploy burst.
+            expire_after: Some("Never".into()),
         },
         status: None,
     }
@@ -1307,6 +1313,11 @@ mod tests {
         assert_eq!(req["cpu"], Quantity("8".into()));
         assert_eq!(req["memory"], Quantity((32 * GI).to_string()));
         assert_eq!(req["ephemeral-storage"], Quantity((100 * GI).to_string()));
+
+        // r40 bug_022: Karpenter v1 CRD defaults expireAfter to 720h
+        // (forceful since v1.1.0). The reconciler is the sole lifecycle
+        // owner — minted claims must opt out.
+        assert_eq!(spec.expire_after.as_deref(), Some("Never"));
     }
 
     /// Empty hw_requirements + empty metal_sizes (kwok/vmtest) → only

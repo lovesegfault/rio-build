@@ -9,15 +9,20 @@
 //!
 //! Field coverage is the subset the reconciler reads/writes:
 //! - **spec**: `nodeClassRef` + `requirements` + `resources.requests`
-//!   (what we set when creating a claim to cover a deficit)
+//!   (what we set when creating a claim to cover a deficit) +
+//!   `expireAfter` (must be `Never` — see the field doc)
 //! - **status**: `conditions` (Launched/Registered/Initialized),
 //!   `nodeName`, `providerID`, `capacity`/`allocatable` (FFD bin
 //!   sizing for in-flight claims)
 //!
-//! Karpenter spec fields we don't touch (startupTaints, kubelet,
-//! expireAfter, …) are absorbed by `preserve-unknown-fields` on
-//! round-trip — this struct never `replace()`s a Karpenter-authored
-//! claim, only `create()`s its own and `delete()`s by name.
+//! Karpenter spec fields we don't touch (startupTaints, kubelet, …)
+//! are absorbed by `preserve-unknown-fields` on round-trip — this
+//! struct never `replace()`s a Karpenter-authored claim, only
+//! `create()`s its own and `delete()`s by name. That rationale is
+//! correct for *reads*, not *creates*: CRD `default:` application
+//! happens on `Api::create()` regardless of `preserve-unknown-fields`,
+//! so any field with a server-side default the reconciler must override
+//! (currently only `expireAfter`) needs to live on this struct.
 
 use std::collections::BTreeMap;
 
@@ -72,6 +77,18 @@ pub struct NodeClaimSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(schema_with = "crate::any_object_array")]
     pub taints: Vec<Taint>,
+
+    /// Karpenter expiration TTL. The Karpenter v1 CRD defaults this to
+    /// `"720h"` on create, and v1.1.0+ expiration is FORCEFUL (bypasses
+    /// NodePool disruption budgets, PDBs, and `karpenter.sh/
+    /// do-not-disrupt`). The reconciler is the sole lifecycle owner of
+    /// cover-minted claims, so set `"Never"` explicitly — the shim
+    /// NodePool's `template.spec.expireAfter: Never` is only stamped on
+    /// NodeClaims Karpenter itself provisions from the pool, never on
+    /// externally-`Api::create()`'d ones (same gap that requires
+    /// `taints` to live here, see [`taints`](Self::taints) doc).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expire_after: Option<String>,
 }
 
 /// Karpenter `spec.nodeClassRef`. All three fields are required by
@@ -203,13 +220,16 @@ mod tests {
                 effect: "NoSchedule".into(),
                 ..Default::default()
             }],
+            expire_after: Some("Never".into()),
         };
         let json = serde_json::to_string(&spec).unwrap();
         assert!(json.contains("\"nodeClassRef\""));
         assert!(json.contains("\"minValues\":1"));
         assert!(json.contains("\"taints\""));
         assert!(json.contains("\"NoSchedule\""));
+        assert!(json.contains("\"expireAfter\""));
         assert!(!json.contains("node_class_ref"));
         assert!(!json.contains("min_values"));
+        assert!(!json.contains("expire_after"));
     }
 }
