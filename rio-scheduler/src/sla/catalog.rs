@@ -81,7 +81,7 @@ pub struct CatalogEntry {
 /// requirements matcher reads. `None` when the API row is missing the
 /// type name, vCPU count, or memory (degenerate response — skip rather
 /// than match a `(0, 0)` phantom).
-// r[impl scheduler.sla.ceiling.catalog-derived]
+// r[impl scheduler.sla.ceiling.catalog-derived+2]
 pub fn from_instance_type_info(it: &InstanceTypeInfo) -> Option<CatalogEntry> {
     let name = it.instance_type()?.as_str().to_owned();
     let cores = it.v_cpu_info()?.default_v_cpus()?;
@@ -108,7 +108,7 @@ pub fn from_instance_type_info(it: &InstanceTypeInfo) -> Option<CatalogEntry> {
 /// generation; trailing letters (`g`, `d`, `n`, `e`, `i`) are family
 /// modifiers Karpenter folds into the family but does NOT label
 /// separately — `requirements` select on category+generation only.
-// r[impl scheduler.sla.ceiling.catalog-derived]
+// r[impl scheduler.sla.ceiling.catalog-derived+2]
 fn karpenter_labels(it: &InstanceTypeInfo, name: &str) -> BTreeMap<&'static str, String> {
     let mut m = BTreeMap::new();
     let (family, size) = name.split_once('.').unwrap_or((name, ""));
@@ -162,7 +162,7 @@ fn k8s_arch(a: &ArchitectureType) -> Option<&'static str> {
 /// parse); `Exists`/`DoesNotExist` test key presence. Unknown operator
 /// → no match (fail-closed; the catalog ceiling falls to global rather
 /// than over-routing on an operator the controller wouldn't accept).
-// r[impl scheduler.sla.ceiling.catalog-derived]
+// r[impl scheduler.sla.ceiling.catalog-derived+2]
 pub fn requirements_match(
     reqs: &[NodeSelectorReq],
     labels: &BTreeMap<&'static str, String>,
@@ -199,9 +199,11 @@ fn num_cmp(v: Option<&String>, values: &[String]) -> Option<(i64, i64)> {
 
 /// Per-hwClass `(max_cores, max_mem)`: `argmax_t cores` over the matched
 /// catalog ∩ requirements ∩ metal-partition set, emitting *that type's*
-/// `(cores, mem)` — always a real shape, never an independent per-axis
-/// max (which would phantom a `(192c, 1.5TiB)` from disjoint
-/// `(192c, 32GiB)` and `(32c, 1.5TiB)` types and ICE-loop Karpenter).
+/// `(cores − 1, mem)` — cores reduced by 1 for kubelet
+/// `kubeReserved`/`systemReserved` overhead; mem unchanged; never an
+/// independent per-axis max (which would phantom a `(192c, 1.5TiB)`
+/// from disjoint `(192c, 32GiB)` and `(32c, 1.5TiB)` types and
+/// ICE-loop Karpenter).
 ///
 /// Metal partition mirrors `cover::build_nodeclaim`: `nodeClass ==
 /// rio-metal` → `instance-size In metal_sizes`; else `NotIn`. Empty
@@ -209,7 +211,7 @@ fn num_cmp(v: Option<&String>, values: &[String]) -> Option<(i64, i64)> {
 /// from the map (operator typo or AWS deprecation; warn) so they fall
 /// to the global ceiling and the [`super::metrics`] uncatalogued gauge
 /// fires.
-// r[impl scheduler.sla.ceiling.catalog-derived]
+// r[impl scheduler.sla.ceiling.catalog-derived+2]
 pub fn derive_ceilings(
     catalog: &[CatalogEntry],
     hw_classes: &HashMap<String, HwClassDef>,
@@ -235,7 +237,20 @@ pub fn derive_ceilings(
             .max_by_key(|e| (e.cores, e.mem_bytes));
         match best {
             Some(e) => {
-                out.insert(h.clone(), (e.cores, e.mem_bytes));
+                // r40 bug_013: Karpenter binpacks against `Capacity −
+                // Overhead`. On nodeadm/AL2023 the CPU reserve is
+                // ~60m–150m + eviction threshold, so a request of
+                // `default_v_cpus` exact never fits any instance —
+                // `Launched=False` → ICE-mask → permanent mint→reap
+                // loop. Reserve 1 core (covers kubeReserved +
+                // systemReserved + eviction across all instance sizes
+                // we ship today; the disk axis already does a `×0.9`
+                // margin in controller.yaml). Best-effort tier with an
+                // Amdahl fit hits `cap_c == ceiling` exactly (`p̄ =
+                // c_opt = ∞`), so this is the default outcome on
+                // metal, not an edge case. `.max(1)` floors a future
+                // 1-core catalog row at 1 instead of 0.
+                out.insert(h.clone(), (e.cores.saturating_sub(1).max(1), e.mem_bytes));
             }
             None => {
                 warn!(
@@ -330,12 +345,12 @@ mod tests {
         }
     }
 
-    /// §13c-2 r[verify scheduler.sla.ceiling.catalog-derived]: the core
+    /// §13c-2 r[verify scheduler.sla.ceiling.catalog-derived+2]: the core
     /// red-first test. `requirements` intersected with the catalog
     /// picks `argmax_t cores` over the **matched** set, not the global
     /// max. A `[c, m]` × gen `[7]` requirement matches
     /// `[c7a.large, m7i.4xlarge]`, NOT `r8g.metal-48xl`; argmax →
-    /// `m7i.4xlarge` → `(16, 64GiB)`.
+    /// `m7i.4xlarge` → `(16 − 1 kubelet reserve, 64GiB)`.
     #[test]
     fn requirements_match_picks_argmax_in_matched_set() {
         let catalog = vec![
@@ -356,8 +371,8 @@ mod tests {
         let out = derive_ceilings(&catalog, &classes, &[]);
         assert_eq!(
             out.get("lo-x86"),
-            Some(&(16, 64 << 30)),
-            "argmax over matched [c7a.large, m7i.4xlarge], not r8g.metal-48xl"
+            Some(&(15, 64 << 30)),
+            "argmax over matched [c7a.large, m7i.4xlarge] minus 1-core kubelet reserve"
         );
     }
 
@@ -383,8 +398,8 @@ mod tests {
         let out = derive_ceilings(&catalog, &classes, &[]);
         assert_eq!(
             out.get("nvme-arm"),
-            Some(&(96, 192 << 30)),
-            "Gt 0 excludes ebs-only c8a.48xlarge"
+            Some(&(95, 192 << 30)),
+            "Gt 0 excludes ebs-only c8a.48xlarge; 96c − 1 kubelet reserve"
         );
     }
 
@@ -402,6 +417,25 @@ mod tests {
         )]);
         let out = derive_ceilings(&catalog, &classes, &[]);
         assert!(out.is_empty(), "0-match class omitted, not (0,0)");
+    }
+
+    /// r40 bug_013 floor: a 1-core catalog row yields a `(1, mem)`
+    /// ceiling, not `(0, mem)`. Real EC2 types are ≥2 vCPUs so this is
+    /// paranoia, but a 0-core ceiling would strip every cell for the
+    /// class — fail loud at the floor instead.
+    #[test]
+    fn one_core_entry_floors_at_one() {
+        let catalog = vec![ce("t.tiny", 1, 1, "amd64", 0)];
+        let classes = HashMap::from([(
+            "tiny".to_owned(),
+            hw("rio-default", vec![req(label::CATEGORY, "In", &["t"])]),
+        )]);
+        let out = derive_ceilings(&catalog, &classes, &[]);
+        assert_eq!(
+            out.get("tiny"),
+            Some(&(1, 1 << 30)),
+            "1-core entry floors at 1 after kubelet reserve, not 0"
+        );
     }
 
     /// Metal partition: `nodeClass == rio-metal` synthesizes
@@ -429,8 +463,9 @@ mod tests {
         // Both pick a real type; the partition determines WHICH one.
         // `cores` ties at 192 — the assertion is on the EXCLUSION
         // (metal-x86 must not pick a non-metal size and vice versa).
-        assert_eq!(out.get("ebs-x86"), Some(&(192, 384 << 30)));
-        assert_eq!(out.get("metal-x86"), Some(&(192, 384 << 30)));
+        // 192c − 1 kubelet reserve = 191.
+        assert_eq!(out.get("ebs-x86"), Some(&(191, 384 << 30)));
+        assert_eq!(out.get("metal-x86"), Some(&(191, 384 << 30)));
         // With only the metal type in the catalog: ebs-x86 would have
         // 0 matches and metal-x86 picks it.
         let metal_only = vec![ce("c8a.metal-48xl", 192, 384, "amd64", 0)];
@@ -439,7 +474,7 @@ mod tests {
             !out.contains_key("ebs-x86"),
             "NotIn metalSizes excludes the only type"
         );
-        assert_eq!(out.get("metal-x86"), Some(&(192, 384 << 30)));
+        assert_eq!(out.get("metal-x86"), Some(&(191, 384 << 30)));
     }
 
     /// All NodeSelector operators evaluated. `Gt`/`Lt` are numeric;

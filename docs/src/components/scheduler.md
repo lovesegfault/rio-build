@@ -811,7 +811,7 @@ each class's `requirements` actually permit Karpenter to launch (the
 operator-side staleness step entirely: a `requirements` edit takes
 effect on the next rollout.
 
-r[scheduler.sla.ceiling.catalog-derived]
+r[scheduler.sla.ceiling.catalog-derived+2]
 The scheduler derives a per-hwClass catalog ceiling at boot by calling
 `describe_instance_types`, projecting each type onto Karpenter
 discovery labels (`instance-category`, `instance-generation`,
@@ -820,12 +820,15 @@ discovery labels (`instance-category`, `instance-generation`,
 against them (`In`/`NotIn`/`Gt`/`Lt`/`Exists`/`DoesNotExist`),
 synthesizing the metal `instance-size {In|NotIn} metalSizes`
 partition from `nodeClass == rio-metal` (mirroring the controller's
-`cover::build_nodeclaim`), and emitting the `(cores, mem)` of the
-**single largest-cores type** in the matched set — always a real
-shape, never an independent per-axis max (which would phantom a
-shape no real type satisfies and ICE-loop Karpenter). Spot cost
-source only; Static (vmtest) has no AWS API and yields an empty
-catalog. A class matching 0 types is omitted from the catalog (warn).
+`cover::build_nodeclaim`), and emitting the `(cores − 1, mem)` of the
+**single largest-cores type** in the matched set — cores reduced by 1
+for kubelet `kubeReserved`/`systemReserved` overhead (Karpenter
+binpacks against `Capacity − Overhead`, so a request of the raw vCPU
+count never fits); mem unchanged; never an independent per-axis max
+(which would phantom a shape no real type satisfies and ICE-loop
+Karpenter). Spot cost source only; Static (vmtest) has no AWS API and
+yields an empty catalog. A class matching 0 types is omitted from the
+catalog (warn).
 
 r[scheduler.sla.ceiling.uncatalogued-fallback]
 A class with no catalog ceiling — Static cost source, fetch failure,
@@ -853,8 +856,9 @@ r[scheduler.sla.ceiling.controller-mirror]
 The scheduler ships the catalog ceiling — `min(catalog, cfg)`, each
 falling to global when absent — to the controller over
 `GetHwClassConfig`. The wire value is always nonzero (`validate_shape()`
-rejects `Some(0)` overrides; catalog ceilings are real instance
-shapes); the controller's `ceilings_for` `>0` filter
+rejects `Some(0)` overrides; the catalog cores axis is
+`max(1, cores − 1)` and the mem axis is a real instance type's
+memory); the controller's `ceilings_for` `>0` filter
 (pre-R26-scheduler back-compat) is preserved. Skew is bounded by the
 controller's 300s `HwClassConfig` refresh.
 

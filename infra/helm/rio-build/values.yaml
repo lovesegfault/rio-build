@@ -419,6 +419,13 @@ scheduler:
     # ≥ 64 (the validate rule is `probe.cpu ≤ maxCores/4`). A
     # deployment whose Karpenter requirements only match instances
     # < 64c must EITHER set `probe.cpu ≤ 12` OR pin `maxCores`.
+    #
+    # The catalog-derived per-class ceiling is `instance_cores − 1`
+    # (kubelet reserve, r40 bug_013). `class_ceilings` takes
+    # `min(catalog, maxCores)`, so a `maxCores` set to a real
+    # instance's exact vCPU count (e.g. 192 for a 192-vCPU box) is
+    # dead — the catalog's 191 wins. That's correct (the 192 was
+    # never placeable) but is a silent change to a hand-pinned value.
     # maxCores: 192
     # maxMem: 1649267441664    # 1.5 TiB
     maxDisk: 214748364800      # 200 GiB

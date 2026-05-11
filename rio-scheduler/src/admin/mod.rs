@@ -830,9 +830,11 @@ impl AdminService for AdminServiceImpl {
                         // §13c-2 r[impl scheduler.sla.ceiling.controller-mirror]:
                         // ship `min(catalog, cfg)` with each falling to
                         // global. Wire stays nonzero (`validate()` rejects
-                        // global=0 and `Some(0)` overrides; catalog
-                        // ceilings are real instance shapes); the
-                        // controller's `ceilings_for` `>0` filter survives.
+                        // global=0 and `Some(0)` overrides; the catalog
+                        // cores axis floors at 1 via `derive_ceilings`'
+                        // `.max(1)`, mem is a real instance type's
+                        // memory); the controller's `ceilings_for`
+                        // `>0` filter survives.
                         max_cores: self.sla_config.class_ceilings(h, &catalog, global).0,
                         max_mem: self.sla_config.class_ceilings(h, &catalog, global).1,
                         taints,

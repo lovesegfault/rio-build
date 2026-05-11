@@ -536,7 +536,8 @@ impl SlaConfig {
     ///
     /// §13c-2: each axis is `min(catalog, cfg)` with each falling to
     /// the global ceiling when absent. The catalog ceiling is the
-    /// largest real instance type matching this class's `requirements`
+    /// largest real instance type matching this class's
+    /// `requirements`, with `cores − 1` for the kubelet reserve
     /// (derived at boot from `describe_instance_types`,
     /// [`super::catalog::derive_ceilings`]); the cfg override can only
     /// *tighten* (`validate_resolved()` enforces `0 < n ≤ global`). Empty
@@ -702,7 +703,13 @@ impl SlaConfig {
     ///   {rio.build/kvm: true}`, helm-test-pinned; pool-static
     ///   nodeSelector deleted r33 bug_002). (mb_012, r34 mb_004)
     /// - **size** — `(cores, mem) ≤ class_ceilings(h)` ⟺ pod
-    ///   requests ≤ Node allocatable. (r29 bug_019)
+    ///   requests ≤ Node allocatable, modulo the catalog-derived
+    ///   1-core kubelet reserve (`derive_ceilings` emits
+    ///   `instance_cores − 1` so the cores half holds against
+    ///   `Capacity − Overhead`, not raw `Capacity`; mem is
+    ///   unmargined — `cap_m = M(c)` is model output, never pinned
+    ///   to the ceiling, so the gap is unhittable). (r29 bug_019,
+    ///   r40 bug_013)
     /// - **capacity-type** — `cap ∈ capacity_types_for(h)` ⟺
     ///   `cells_to_selector_terms` writes `nodeAffinity
     ///   {karpenter.sh/capacity-type In [cap]}`. (mb_033)
