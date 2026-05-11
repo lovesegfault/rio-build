@@ -38,7 +38,6 @@ ladder_budget = {{ printf "%.1f" (float64 .ladderBudget) }}
 max_forecast_cores_per_tenant = {{ int64 .maxForecastCoresPerTenant }}
 max_keys_per_tenant = {{ int64 .maxKeysPerTenant }}
 max_lead_time = {{ printf "%.1f" (float64 .maxLeadTime) }}
-consolidate_explore_epsilon = {{ printf "%v" (float64 .consolidateExploreEpsilon) }}
 max_node_claims_per_cell_per_tick = {{ int64 .maxNodeClaimsPerCellPerTick }}
 {{- with .maxConsolidationTime }}
 max_consolidation_time = {{ printf "%.1f" (float64 .) }}

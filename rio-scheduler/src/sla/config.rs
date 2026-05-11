@@ -385,9 +385,13 @@ pub struct SlaConfig {
     /// Karpenter default.
     #[serde(default)]
     pub max_consolidation_time: Option<f64>,
-    /// Part-B: ε-greedy explore rate for the consolidation pass.
-    #[serde(default = "default_consolidate_explore_epsilon")]
-    pub consolidate_explore_epsilon: f64,
+    // (no consolidateExploreEpsilon — r41 bug_032: rendered, parsed,
+    // never read. The consolidation pass is the windowed Nelson-Aalen
+    // model (`nodeclaim_pool/consolidate.rs::consolidate_after`), not
+    // ε-greedy; `NodeClaimPoolConfig` never carried it. An operator who
+    // tuned `scheduler.sla.consolidateExploreEpsilon` observed no
+    // change. Deleted rather than wired — there is no consolidation
+    // explore loop to wire INTO.)
     /// Part-B: per-tick NodeClaim creation throttle per cell.
     #[serde(default = "default_max_node_claims_per_cell_per_tick")]
     pub max_node_claims_per_cell_per_tick: u32,
@@ -435,9 +439,6 @@ fn default_max_keys_per_tenant() -> usize {
 }
 pub(super) fn default_max_lead_time() -> f64 {
     600.0
-}
-fn default_consolidate_explore_epsilon() -> f64 {
-    0.02
 }
 fn default_max_node_claims_per_cell_per_tick() -> u32 {
     8
@@ -908,7 +909,6 @@ impl SlaConfig {
             max_keys_per_tenant: default_max_keys_per_tenant(),
             max_lead_time: default_max_lead_time(),
             max_consolidation_time: None,
-            consolidate_explore_epsilon: default_consolidate_explore_epsilon(),
             max_node_claims_per_cell_per_tick: default_max_node_claims_per_cell_per_tick(),
             cluster: String::new(),
             metal_sizes: Vec::new(),
@@ -1891,7 +1891,6 @@ mod tests {
             "max_keys_per_tenant",
             "max_lead_time",
             "max_consolidation_time",
-            "consolidate_explore_epsilon",
             "max_node_claims_per_cell_per_tick",
             "cluster",
             "metal_sizes",
@@ -2567,7 +2566,6 @@ mod tests {
             max_keys_per_tenant: _, // (scalar)
             max_lead_time: _,      // (scalar)
             max_consolidation_time: _, // (scalar)
-            consolidate_explore_epsilon: _, // (scalar)
             max_node_claims_per_cell_per_tick: _, // (scalar)
             cluster: _,            // (scalar)
             metal_sizes: _,        // (free)   instance-size suffix strings

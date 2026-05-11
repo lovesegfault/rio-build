@@ -454,7 +454,6 @@ scheduler:
     maxForecastCoresPerTenant: 2000
     maxKeysPerTenant: 50000
     maxLeadTime: 600
-    consolidateExploreEpsilon: 0.02
     maxNodeClaimsPerCellPerTick: 8
     # nodeClass per hw-class: rio-nvme for nvme storage tiers (so
     # instanceStorePolicy:RAID0 applies), rio-default for ebs. The
