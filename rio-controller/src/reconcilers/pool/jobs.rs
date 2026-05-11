@@ -537,7 +537,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                 executor_tokens.get(&intent.intent_id).map(String::as_str),
                 &hw_sampled,
                 ctx.hw_bench_mem_floor,
-                ctx.placeable.is_some(),
+                ctx.placeable.is_some() && ctx.kube_build_scheduler_enabled,
             )
         },
     )
@@ -880,9 +880,12 @@ pub(super) fn build_job(
     // between FFD's prediction and the default scheduler's actual
     // bin-packing is bounded by the tiny per-pod footprint, and it
     // isn't worth coupling fetcher cells to the `kube-build-scheduler`
-    // dependency. When `gate_active=false` (NodeClaim CRD absent —
-    // k3s VM tests without Karpenter) `kube-build-scheduler` isn't
-    // deployed, so the pod would sit Pending forever.
+    // dependency. `gate_active=false` when EITHER the NodeClaim CRD is
+    // absent (k3s VM tests without Karpenter) OR `buildScheduler.
+    // enabled=false` (operator disabled the second scheduler — registry
+    // mirror gap, rollback, derived overlay) — in both cases
+    // `kube-build-scheduler` isn't deployed, so a pod targeting it
+    // would sit Pending forever. r40 bug_018.
     if gate_active && pool.spec.kind == ExecutorKind::Builder {
         pod_spec.scheduler_name = Some(KUBE_BUILD_SCHEDULER.into());
         pod_spec.priority_class_name = Some(format!(
@@ -1837,6 +1840,44 @@ mod tests {
             "fetcher pods stay on default scheduler"
         );
         assert_eq!(f.priority_class_name, None);
+    }
+
+    /// `gate_active=false` ⇒ Builder pods get NO `schedulerName` and no
+    /// `priorityClassName`. The flag is `placeable.is_some() &&
+    /// kube_build_scheduler_enabled` (r40 bug_018) — false when the
+    /// NodeClaim CRD is absent (k3s VM tests) OR `buildScheduler.
+    /// enabled=false` (terraform-managed Karpenter, chart-disabled
+    /// second scheduler). In both cases `kube-build-scheduler` isn't
+    /// deployed, so a pod targeting it would sit Pending forever with
+    /// zero alerts (the `KubeBuildScheduler*` alerts are gated by the
+    /// same toggle).
+    #[test]
+    fn build_job_no_scheduler_name_when_gate_inactive() {
+        let i = SpawnIntent {
+            intent_id: "abc".into(),
+            cores: 17,
+            ..Default::default()
+        };
+        let builder = test_pool("p", ExecutorKind::Builder);
+        let job = build_job(
+            &builder,
+            crate::fixtures::oref(&builder),
+            &test_sched_addrs(),
+            &test_store_addrs(),
+            &HwClassConfig::default(),
+            &i,
+            None,
+            &HwSampledCache::default(),
+            0,
+            false, // gate_active
+        )
+        .unwrap();
+        let pod = job.spec.as_ref().unwrap().template.spec.clone().unwrap();
+        assert_eq!(
+            pod.scheduler_name, None,
+            "gate inactive → default kube-scheduler, not kube-build-scheduler"
+        );
+        assert_eq!(pod.priority_class_name, None);
     }
 
     // r[verify ctrl.nodeclaim.placeable-gate+4]

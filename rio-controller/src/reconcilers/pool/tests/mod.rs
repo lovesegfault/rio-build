@@ -68,6 +68,10 @@ pub(crate) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
         scaler: Default::default(),
         hw_bench_mem_floor: 8 * (1 << 30),
         placeable: Some(crate::reconcilers::nodeclaim_pool::PlaceableGate::unarmed()),
+        // r40 bug_018: matches `NodeClaimPoolConfig::default()` so test
+        // pools route through the second scheduler unless a test
+        // explicitly disables it.
+        kube_build_scheduler_enabled: true,
         hw_config: crate::reconcilers::node_informer::HwClassConfig::default(),
     })
 }

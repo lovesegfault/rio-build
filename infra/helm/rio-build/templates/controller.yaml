@@ -8,6 +8,15 @@
 {{- with .Values.scheduler.sla -}}
 [nodeclaim_pool]
 lease_name = {{ $.Values.karpenter.nodeclaimPool.leaseName | default "rio-controller-nodeclaim-pool" | quote }}
+{{- /* r40 bug_018: gate `schedulerName=kube-build-scheduler` stamping
+       on the chart's predicate ("does the kube-build-scheduler
+       Deployment render?"), not just the controller's ("is the
+       NodeClaim CRD present?"). Karpenter is terraform-managed in
+       prod, so the CRD is present even when `karpenter.enabled=false`
+       — without this knob, `buildScheduler.enabled=false` builder
+       pods would target a scheduler that doesn't exist (permanent
+       Pending, zero alerts: the alerts are gated by the same toggle). */}}
+kube_build_scheduler_enabled = {{ $.Values.buildScheduler.enabled }}
 reference_hw_class = {{ .referenceHwClass | quote }}
 default_lead_time_seed = {{ printf "%.1f" (float64 (default 30.0 .defaultLeadTimeSeed)) }}
 max_fleet_cores = {{ int64 .maxFleetCores }}

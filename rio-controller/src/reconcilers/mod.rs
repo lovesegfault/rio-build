@@ -158,6 +158,14 @@ pub struct Ctx {
     /// absent (k3s VM tests without Karpenter) — the gate is a
     /// pass-through and the nodeclaim_pool reconciler is not spawned.
     pub placeable: Option<nodeclaim_pool::PlaceableGate>,
+    /// r40 bug_018: `buildScheduler.enabled` from helm. AND'd with
+    /// `placeable.is_some()` to compute `gate_active` in
+    /// `pool/jobs::build_job` — the controller's predicate
+    /// ("Karpenter NodeClaim CRD present") and the chart's predicate
+    /// ("kube-build-scheduler Deployment renders") are independent
+    /// signals, and the pod must get a `schedulerName` only when BOTH
+    /// hold.
+    pub kube_build_scheduler_enabled: bool,
     /// `[sla.hw_classes.$h]` config fetched via `GetHwClassConfig`.
     /// §13d toleration axis (r31 bug_020): `pool/jobs::
     /// apply_intent_resources` derives per-intent tolerations from

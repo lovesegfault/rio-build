@@ -23,11 +23,13 @@ base=$(render_checksum)
 test -n "$base" || { echo "FAIL: checksum/controller-toml absent" >&2; exit 1; }
 
 # Each axis below maps to one TOML key; changing it MUST change the hash.
+# r40 bug_018: `kube_build_scheduler_enabled` reads `buildScheduler.enabled`.
 for axis in \
   "poolDefaults.fuseCacheBytes=99999999999" \
   'karpenter.metalSizes={metal,metal-zz}' \
   "scheduler.sla.maxFleetCores=12345" \
-  "karpenter.nodeclaimPool.leaseName=other-lease"
+  "karpenter.nodeclaimPool.leaseName=other-lease" \
+  "buildScheduler.enabled=false"
 do
   got=$(render_checksum --set "$axis")
   test "$got" != "$base" || {

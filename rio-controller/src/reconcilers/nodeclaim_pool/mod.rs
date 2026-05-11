@@ -316,6 +316,17 @@ pub struct NodeClaimPoolConfig {
     /// controller-config fallback `pool::pod::BUILDER_FUSE_CACHE_BYTES`
     /// (8Gi).
     pub fuse_cache_bytes: u64,
+    /// `true` ⟺ the `kube-build-scheduler` Deployment is rendered
+    /// (`buildScheduler.enabled`). r40 bug_018: builder pods get
+    /// `schedulerName=kube-build-scheduler` only when BOTH the
+    /// NodeClaim CRD is present (Karpenter installed) AND this flag is
+    /// set — otherwise the pod targets a scheduler that doesn't exist
+    /// and the default kube-scheduler ignores it (permanent Pending,
+    /// zero alerts: the `KubeBuildScheduler*` alerts are gated off by
+    /// the same `buildScheduler.enabled` toggle). Helm:
+    /// `buildScheduler.enabled`. Default: `true` (matches the chart's
+    /// default).
+    pub kube_build_scheduler_enabled: bool,
 }
 
 impl NodeClaimPoolConfig {
@@ -523,6 +534,12 @@ impl Default for NodeClaimPoolConfig {
             max_node_disk: 450 * (1 << 30),
             metal_sizes: Vec::new(),
             fuse_cache_bytes: pool::pod::BUILDER_FUSE_CACHE_BYTES,
+            // r40 bug_018: matches the chart's `buildScheduler.enabled`
+            // default. When `false`, `pool/jobs::build_job` does NOT
+            // stamp `schedulerName=kube-build-scheduler` even with the
+            // NodeClaim CRD present — the second scheduler isn't
+            // deployed, so a pod targeting it would Pending forever.
+            kube_build_scheduler_enabled: true,
         }
     }
 }
@@ -1592,6 +1609,10 @@ mod tests {
         assert!(d.reference_hw_class.is_empty());
         assert_eq!(d.max_fleet_cores, 10_000);
         assert_eq!(d.max_node_claims_per_cell_per_tick, 8);
+        // r40 bug_018: matches the chart's `buildScheduler.enabled`
+        // default — `true` so the second-scheduler routing is on by
+        // default and a missing TOML key doesn't silently disable it.
+        assert!(d.kube_build_scheduler_enabled);
         // bug_040: non-zero default so an unseeded cell's
         // health::classify timeout (2×seed) covers ~18s real boot.
         assert_eq!(d.default_lead_time_seed, 30.0);

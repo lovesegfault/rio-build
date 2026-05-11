@@ -291,6 +291,7 @@ async fn main() -> anyhow::Result<()> {
         scaler: Default::default(),
         hw_bench_mem_floor: cfg.hw_bench_mem_floor,
         placeable,
+        kube_build_scheduler_enabled: cfg.nodeclaim_pool.kube_build_scheduler_enabled,
         hw_config: hw_config.clone(),
     });
 
@@ -522,6 +523,7 @@ mod tests {
 
         [nodeclaim_pool]
         max_fleet_cores = 64
+        kube_build_scheduler_enabled = false
 
         max_node_disk = 25769803776
         metal_sizes = ["metal", "metal-24xl"]
@@ -535,6 +537,15 @@ mod tests {
             // Env yields bare strings). This is the same shape helm's
             // rio-controller-config ConfigMap renders.
             assert_eq!(cfg.nodeclaim_pool.max_fleet_cores, 64);
+            // r40 bug_018: `kube_build_scheduler_enabled` is the gate
+            // between "NodeClaim CRD present" and "stamp `schedulerName=
+            // kube-build-scheduler`". Helm renders it from `buildScheduler.
+            // enabled`; this is the only test proving the rendered TOML
+            // key actually deserializes into `NodeClaimPoolConfig` (the
+            // `pool/jobs::build_job` AND-gate is not unit-testable, and
+            // figment baselines silently leak defaults — a config field
+            // that adds a deploy-hazard gate gets the strongest test).
+            assert!(!cfg.nodeclaim_pool.kube_build_scheduler_enabled);
 
             assert_eq!(cfg.nodeclaim_pool.max_node_disk, 25769803776);
             assert_eq!(cfg.nodeclaim_pool.metal_sizes, vec!["metal", "metal-24xl"]);
