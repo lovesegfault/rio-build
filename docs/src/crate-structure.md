@@ -241,10 +241,13 @@ the wire-type mismatch, so every other field in the message is lost
 too); same-wire-type (e.g. `int32` → `sint32`, both varint) is worse —
 the receiver silently decodes the wrong value with no error at all.
 
-The `.fields` snapshot tripwires (`rio-proto/tests/field_presence.rs`
-for `admin_types.proto`, `rio-proto/tests/types_field_presence.rs` for
-`types.proto`) fail CI on any field-set change until the corresponding
-snapshot is regenerated, forcing both decisions to be explicit.
+The `.fields` snapshot tripwires
+(`rio-proto/tests/proto_field_presence.rs`, one `<name>_fields_frozen`
+test per `proto/*.proto` file) fail CI on any field-set change until
+the corresponding snapshot is regenerated, forcing both decisions to be
+explicit. A structural test (`every_proto_has_a_snapshot_test`)
+cross-checks the registered tripwire list against the on-disk `proto/`
+directory, so a new proto file cannot ship without one.
 
 ### rio-gateway — Nix protocol frontend
 

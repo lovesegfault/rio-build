@@ -1,9 +1,9 @@
 //! Shared helper for the `.fields` snapshot tripwire tests.
 //!
-//! `field_presence.rs` (admin_types.proto) and `types_field_presence.rs`
-//! (types.proto) both compare the live proto source against a checked-in
-//! `.fields` golden. The extraction logic lives here so the two snapshots
-//! cannot diverge in what they consider a "field declaration".
+//! `proto_field_presence.rs` compares each `proto/*.proto` file's live
+//! source against its checked-in `.fields` golden. The extraction logic
+//! lives here so every snapshot agrees on what counts as a "field
+//! declaration".
 
 /// Normalized field-declaration lines from a `.proto` source.
 ///

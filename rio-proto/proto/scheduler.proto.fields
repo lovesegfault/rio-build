@@ -1,0 +1,2 @@
+string tenant_id = 1;
+string tenant_name = 1;
