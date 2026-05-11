@@ -1164,12 +1164,14 @@ impl DagActor {
         // debounce edge.
         // Clamp the debounce key to bound per-ENTRY heap growth: the
         // raw strings are tenant-controlled (`requiredSystemFeatures`,
-        // unclamped at translate.rs); 64 entries × 32 chars matches
-        // executor_service.rs's `MAX_HEARTBEAT_FEATURES`; collisions
-        // dedup at ASCII-truncate, which only over-debounces
-        // (fail-safe). The entry COUNT is bounded by the LRU cap on the
-        // set itself (mb_001) — the clamp alone leaves the doc's own
-        // threat case `["x-${uuid}"]` open at the cardinality level.
+        // already clamped at translate.rs's `strings_clamped` — this
+        // is a defense-in-depth second line behind the gateway trust
+        // boundary); 64 entries × 32 chars matches executor_service.rs's
+        // `MAX_HEARTBEAT_FEATURES`; collisions dedup at ASCII-truncate,
+        // which only over-debounces (fail-safe). The entry COUNT is
+        // bounded by the LRU cap on the set itself (mb_001) — the
+        // clamp alone leaves the doc's own threat case `["x-${uuid}"]`
+        // open at the cardinality level.
         // `.put()` returns `Some` iff the key was already present;
         // `.is_none()` is the "first edge" predicate (mirrors
         // `HashSet::insert`'s `true`-on-new).

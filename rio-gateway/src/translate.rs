@@ -369,6 +369,14 @@ pub fn validate_dag(
 /// pnames while bounding the per-key cost.
 const MAX_ATTR_LEN: usize = 256;
 
+/// Cap on tenant-controlled string-list attrs
+/// (`requiredSystemFeatures`). Mirror of `executor_service.rs`'s
+/// `MAX_HEARTBEAT_FEATURES` (64) — the gateway is the trust boundary;
+/// the scheduler's heartbeat bound is the second line of defense. Same
+/// rationale: a list with thousands of entries is buggy or hostile,
+/// and 64 is well past any legitimate `requiredSystemFeatures` set.
+const MAX_LIST_LEN: usize = 64;
+
 pub(crate) struct StructuredEnv<'a> {
     env: &'a std::collections::BTreeMap<String, String>,
     json: Option<serde_json::Value>,
@@ -425,6 +433,28 @@ impl<'a> StructuredEnv<'a> {
                     .get(key)
                     .map(|s| s.split_whitespace().map(String::from).collect())
             })
+    }
+
+    /// [`Self::strings`] with a `MAX_LIST_LEN`-element / `MAX_ATTR_LEN`-
+    /// char clamp. ADR-023 §Threat-model: `requiredSystemFeatures` is
+    /// tenant-controlled and feeds the `derivations.required_features`
+    /// PG `text[]` column, `SpawnIntent.required_features` on the wire,
+    /// and the scheduler's in-memory `DerivationState`. Same threat as
+    /// [`Self::string_clamped`] but for a list. See also
+    /// `executor_service.rs`'s `MAX_HEARTBEAT_FEATURES` (the
+    /// post-translate scheduler-side bound) and `snapshot.rs`'s LRU
+    /// debounce-key clamp — both are second-line defenses behind this
+    /// gateway-side bound at the trust boundary.
+    fn strings_clamped(&self, key: &str) -> Option<Vec<String>> {
+        self.strings(key).map(|mut v| {
+            v.truncate(MAX_LIST_LEN);
+            for s in &mut v {
+                if s.chars().count() > MAX_ATTR_LEN {
+                    *s = s.chars().take(MAX_ATTR_LEN).collect();
+                }
+            }
+            v
+        })
     }
 }
 
@@ -483,7 +513,9 @@ pub fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::Derivati
         enable_parallel_checking: env.bool("enableParallelChecking"),
         prefer_local_build: env.bool("preferLocalBuild"),
         system: drv.platform().to_string(),
-        required_features: env.strings("requiredSystemFeatures").unwrap_or_default(),
+        required_features: env
+            .strings_clamped("requiredSystemFeatures")
+            .unwrap_or_default(),
         output_names,
         is_fixed_output: drv.is_fixed_output(),
         expected_output_paths,
@@ -959,6 +991,71 @@ mod tests {
         env.insert("pname".into(), "hello".into());
         let drv = make_basic_drv(env)?;
         assert_eq!(build_node("/nix/store/x.drv", &drv).pname, "hello");
+        Ok(())
+    }
+
+    /// ADR-023 §Threat-model: tenant-controlled `requiredSystemFeatures`
+    /// is clamped to `MAX_LIST_LEN` elements / `MAX_ATTR_LEN` chars at
+    /// the gateway trust boundary before it reaches the
+    /// `derivations.required_features` PG `text[]` column,
+    /// `SpawnIntent.required_features`, or the scheduler's in-memory
+    /// `DerivationState`. The scheduler-side `MAX_HEARTBEAT_FEATURES`
+    /// (executor_service.rs) is the second line of defense; this is the
+    /// first.
+    #[test]
+    fn test_clamps_required_features() -> anyhow::Result<()> {
+        // Element count: 100 entries → truncated to MAX_LIST_LEN (64).
+        // Whitespace-joined env representation (non-structuredAttrs path).
+        let many: String = (0..100)
+            .map(|i| format!("f{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut env = BTreeMap::new();
+        env.insert("requiredSystemFeatures".into(), many);
+        let drv = make_basic_drv(env)?;
+        let node = build_node("/nix/store/x.drv", &drv);
+        assert_eq!(node.required_features.len(), MAX_LIST_LEN);
+        assert_eq!(node.required_features[0], "f0", "head preserved");
+        assert_eq!(
+            node.required_features[MAX_LIST_LEN - 1],
+            format!("f{}", MAX_LIST_LEN - 1),
+            "truncate keeps prefix order"
+        );
+
+        // Per-element length: a 1000-char element → 256 chars.
+        let long = "x".repeat(1000);
+        let mut env = BTreeMap::new();
+        env.insert("requiredSystemFeatures".into(), long);
+        let drv = make_basic_drv(env)?;
+        let node = build_node("/nix/store/x.drv", &drv);
+        assert_eq!(node.required_features.len(), 1);
+        assert_eq!(node.required_features[0].chars().count(), MAX_ATTR_LEN);
+
+        // Both at once: 100 entries × 1000 chars each → 64 × 256.
+        // Use the structuredAttrs JSON path so each element is distinct
+        // (the env path is whitespace-split, so a long single token can't
+        // also carry a count).
+        let json_features: Vec<String> = (0..100)
+            .map(|i| format!("{i}{}", "y".repeat(1000)))
+            .collect();
+        let mut env = BTreeMap::new();
+        env.insert(
+            "__json".into(),
+            serde_json::json!({ "requiredSystemFeatures": json_features }).to_string(),
+        );
+        let drv = make_basic_drv(env)?;
+        let node = build_node("/nix/store/x.drv", &drv);
+        assert_eq!(node.required_features.len(), MAX_LIST_LEN);
+        for f in &node.required_features {
+            assert_eq!(f.chars().count(), MAX_ATTR_LEN);
+        }
+
+        // Under-threshold is unchanged.
+        let mut env = BTreeMap::new();
+        env.insert("requiredSystemFeatures".into(), "kvm big-parallel".into());
+        let drv = make_basic_drv(env)?;
+        let node = build_node("/nix/store/x.drv", &drv);
+        assert_eq!(node.required_features, vec!["kvm", "big-parallel"]);
         Ok(())
     }
 
