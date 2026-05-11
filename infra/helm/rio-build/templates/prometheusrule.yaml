@@ -339,9 +339,12 @@ spec:
         # the skew persists, watch the warn rate and
         # `intent_dropped_total{reason}` directly — no NodeClaim is
         # minted for either, so StuckPending stays silent, and
-        # `ffd_unplaced_cores` only iterates `all_cells()` so it has no
-        # series for an unknown cell (it DOES show `exceeds_cell_cap`
-        # demand because the cell is configured).
+        # `ffd_unplaced_cores` iterates `all_cells() ∪ by_cell.keys()`
+        # plus a one-shot trailing zero (r41 bug_021 + r43 bug_026), so
+        # it DOES have a series for an unknown cell — but only while
+        # demand persists; once the intents clear, one zero-write then
+        # silence. `exceeds_cell_cap` demand is shown because the cell
+        # is configured.
         - alert: RioNodeclaimPoolNoHostingClass
           expr: |
             increase(rio_controller_nodeclaim_intent_dropped_total{reason=~"no_hosting_class|no_pool_covers"}[15m]) > 0

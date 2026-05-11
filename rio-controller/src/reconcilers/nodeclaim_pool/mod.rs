@@ -655,6 +655,14 @@ pub struct NodeClaimPoolReconciler {
     /// drops one tick's worth of trailing zero-writes (same TTL-omitted
     /// rationale as `prev_idle`).
     prev_extra_cells: HashSet<Cell>,
+    /// Cells that had FFD-unplaced demand (`by_cell.keys()`) but were
+    /// not in `cfg.all_cells()` last tick; drives the trailing
+    /// zero-write for `ffd_unplaced_cores`. Distinct from
+    /// `prev_extra_cells` — that set is keyed on live NodeClaim cells,
+    /// this on intent cells; an intent's cell may have no NodeClaims
+    /// yet. NOT cleared on lease re-acquire (cleanup-pending polarity,
+    /// same rationale as `prev_extra_cells`; r43 bug_026).
+    prev_unplaced_extras: HashSet<Cell>,
     /// `name → cell` for NodeClaims `cover_deficit` created and that
     /// haven't yet been observed Registered, terminating, or absent.
     /// Tick-over-tick diff against `live`: a name in here but absent
@@ -698,8 +706,11 @@ pub struct NodeClaimPoolReconciler {
 /// trailing zero-write so a resolved stuck-drain doesn't page forever.
 ///
 /// Returns `(to_write, new_extras)`: cells to emit gauges for, and the
-/// next tick's extras set (live cells outside config). The caller
-/// stores the latter into `self.prev_extra_cells`.
+/// next tick's extras set (`live_cells` outside config). Callers that
+/// drive a trailing zero-write store the latter into a per-gauge
+/// `prev_*` field (`prev_extra_cells`, `prev_unplaced_extras` — both
+/// CLEANUP-polarity, see the lease-acquire table); the `reap_idle`
+/// callers consume only `to_write` and discard the second half.
 ///
 /// Free function (not a method): `NodeClaimPoolReconciler::new` is
 /// `async` and needs a `kube::Client` + `PgPool`; the test module
@@ -806,6 +817,7 @@ impl NodeClaimPoolReconciler {
             recorded_boot: HashSet::new(),
             prev_idle: HashMap::new(),
             prev_extra_cells: HashSet::new(),
+            prev_unplaced_extras: HashSet::new(),
             inflight_created: HashMap::new(),
             consecutive_bot_ticks: 0,
             tick_counter: 0,
@@ -911,6 +923,9 @@ impl NodeClaimPoolReconciler {
                         //     (stale entry → one trailing zero-write — the
                         //     desired behavior; clearing would orphan a gauge
                         //     series at its last possibly-paging value)
+                        //   - `prev_unplaced_extras` CLEANUP → never cleared
+                        //     (stale entry → one trailing zero-write for
+                        //     `ffd_unplaced_cores`; r43 bug_026)
                         //
                         // When adding a field that holds in-memory edge
                         // state, classify its polarity here and put the
@@ -940,6 +955,54 @@ impl NodeClaimPoolReconciler {
                 .record(started.elapsed().as_secs_f64());
         }
         info!("nodeclaim_pool reconciler stopped");
+    }
+
+    /// Kube-only sketch observations shared by [`Self::reconcile_once`]
+    /// and [`Self::consolidate_only`]. Anything added here runs in BOTH
+    /// paths — that is the point. If a new `observe_*` call is
+    /// kube-only, it goes here; if it needs the scheduler, it stays in
+    /// `reconcile_once`.
+    ///
+    /// Three rounds (r40 bug_012, r42 bug_023, r43 bug_023) hit the same
+    /// shape: a kube-only observation added to `reconcile_once` but not
+    /// `consolidate_only`, because the two paths each inlined their own
+    /// copy. This helper is the §nth-strike STRUCTURAL close — adding a
+    /// fourth inline copy re-arms the trap; adding here closes it.
+    ///
+    /// Caller must run AFTER `requested` is populated
+    /// (`list_live_nodeclaims`) and BEFORE `reap_idle` records the
+    /// censored half — `observe_idle_to_busy` needs uncensored
+    /// idle→busy edges.
+    ///
+    /// Returns `(registered_cells, observed_types)` from
+    /// [`CellSketches::observe_registered`]. `reconcile_once` consumes
+    /// them; `consolidate_only` discards them (the scheduler is
+    /// unreachable, so there is nothing to act on — same shape as the
+    /// existing `ice_cells` discard).
+    fn kube_only_observations(
+        &mut self,
+        live: &[ffd::LiveNode],
+        now: f64,
+    ) -> (Vec<Cell>, Vec<rio_proto::types::ObservedInstanceType>) {
+        // Uncensored idle→busy edges (see caller-ordering note above).
+        consolidate::observe_idle_to_busy(live, &mut self.prev_idle, &mut self.sketches, now);
+        // r[ctrl.nodeclaim.lead-time-ddsketch]: record boot times on
+        // Registered=True edges, then rotate any cells past halflife.
+        //
+        // r43 bug_023: `observe_registered` is a kube-only sketch-write.
+        // A scheduler outage that spans a NodeClaim's Registered
+        // transition would otherwise permanently lose the boot sample
+        // via the 3×TICK recency-gate at `sketch.rs::observe_registered`
+        // — the gate marks the node in `recorded_boot` (so it never
+        // re-edges) without recording.
+        let result = self
+            .sketches
+            .observe_registered(live, &mut self.recorded_boot, now);
+        self.sketches.maybe_rotate_all(
+            std::time::SystemTime::now(),
+            Duration::from_secs(self.cfg.sketch_halflife_secs),
+        );
+        result
     }
 
     /// One tick: poll → FFD sim → cover deficit → reap → persist.
@@ -1067,23 +1130,10 @@ impl NodeClaimPoolReconciler {
 
         let live = self.list_live_nodeclaims().await?;
         let now = now_epoch();
-        // Uncensored idle→busy edges: AFTER `requested` is populated
-        // (list_live_nodeclaims), BEFORE reap_idle records the
-        // censored half.
-        consolidate::observe_idle_to_busy(&live, &mut self.prev_idle, &mut self.sketches, now);
-
-        // r[ctrl.nodeclaim.lead-time-ddsketch]: record boot times on
-        // Registered=True edges, then rotate any cells past halflife.
         // `registered_cells` feeds `report_unfulfillable`'s ICE-clear;
         // `observed_types` feeds the scheduler's `CostTable.cells`
         // (R24B7 instance-type autodiscovery).
-        let (registered_cells, observed_types) =
-            self.sketches
-                .observe_registered(&live, &mut self.recorded_boot, now);
-        self.sketches.maybe_rotate_all(
-            std::time::SystemTime::now(),
-            Duration::from_secs(self.cfg.sketch_halflife_secs),
-        );
+        let (registered_cells, observed_types) = self.kube_only_observations(&live, now);
 
         let bound = self.pod_requested.bound_intents();
         // §13d STRIKE-7 (mb_012): the agnostic-fallback admit predicate
@@ -1239,7 +1289,11 @@ impl NodeClaimPoolReconciler {
         );
         let live = self.list_live_nodeclaims().await?;
         let now = now_epoch();
-        consolidate::observe_idle_to_busy(&live, &mut self.prev_idle, &mut self.sketches, now);
+        // r43 bug_023: same kube-only block as `reconcile_once`. Discard
+        // the return — `report_unfulfillable` and the scheduler's
+        // `CostTable.cells` need the scheduler reachable; same shape as
+        // the `ice_cells` discard below.
+        let _ = self.kube_only_observations(&live, now);
         // r42 bug_023: `consolidate_only` calls `emit_live_gauges`
         // AFTER `reap_idle`, so `prev_extra_cells` is still the
         // previous tick's value here — use it directly.
@@ -1398,20 +1452,21 @@ impl NodeClaimPoolReconciler {
             });
         // r41 bug_021 sibling: same `all_cells()` blind spot as
         // `cover_deficit` — `by_cell` is keyed on scheduler-stamped
-        // cells, so a cell the controller hasn't loaded never gets a
-        // `ffd_unplaced_cores` series. Iterate the union. No trailing
-        // zero-write needed (unlike [`gauge_universe`]) — `by_cell` is
-        // recomputed each tick from current intents, so once the demand
-        // clears the cell drops out and the configured-only loop writes
-        // 0 for any cell still in `all_cells()`.
+        // cells. r43 bug_026: extras cells need the same trailing
+        // zero-write as `nodeclaim_live*` — once an extras cell drops
+        // out of `by_cell`, it's in neither `configured` nor `extras`
+        // and the gauge series freezes at its last value forever
+        // (`metrics-exporter-prometheus` never deregisters). The r41
+        // verifier's "not an alert anchor → no trailing zero" reasoning
+        // was a premise failure: a stale gauge is wrong regardless of
+        // whether an alert reads it.
         let configured = self.cfg.all_cells(&self.hw_config);
-        let configured_set: HashSet<&Cell> = configured.iter().collect();
-        let extras: Vec<Cell> = by_cell
-            .keys()
-            .filter(|c| !configured_set.contains(c))
-            .cloned()
-            .collect();
-        for cell in configured.iter().chain(extras.iter()) {
+        let (to_write, new_unplaced_extras) = gauge_universe(
+            &configured,
+            by_cell.keys().cloned(),
+            &self.prev_unplaced_extras,
+        );
+        for cell in &to_write {
             let label = cell.to_string();
             let unplaced_cores: u32 = by_cell
                 .get(cell)
@@ -1420,6 +1475,7 @@ impl NodeClaimPoolReconciler {
             metrics::gauge!("rio_controller_ffd_unplaced_cores", "cell" => label)
                 .set(f64::from(unplaced_cores));
         }
+        self.prev_unplaced_extras = new_unplaced_extras;
         // Placeable split: NOT per-cell (an intent may target multiple
         // cells; the placement node's cell would mislead). The single
         // `state=registered|inflight` split is the warm-hit proxy.
@@ -2017,6 +2073,52 @@ mod tests {
             &HashSet::new(),
         );
         assert!(extras.is_empty(), "configured cell is never an extra");
+    }
+
+    /// r43 bug_026: `ffd_unplaced_cores` extras get the same trailing
+    /// zero-write as `nodeclaim_live*`. Without it, an extras cell that
+    /// drops out of `by_cell` (demand clears) while still unconfigured
+    /// freezes at its last non-zero value forever
+    /// (`metrics-exporter-prometheus` never deregisters series).
+    /// Reuses [`gauge_universe`]; the only thing this test pins beyond
+    /// `gauge_universe_covers_extras_and_trailing` is the
+    /// `ffd_unplaced_cores` callsite shape (`by_cell.keys()` →
+    /// `live_cells`, `prev_unplaced_extras` → `prev_extras`).
+    #[test]
+    fn ffd_unplaced_extras_get_trailing_zero() {
+        let configured = vec![Cell("a-x86".into(), CapacityType::Spot)];
+        let unknown = Cell("z-x86".into(), CapacityType::Spot);
+
+        // Tick N: unknown cell has unplaced demand (`by_cell` has it).
+        let prev = HashSet::new();
+        let (to_write, new_extras) =
+            gauge_universe(&configured, std::iter::once(unknown.clone()), &prev);
+        assert!(
+            to_write.contains(&unknown),
+            "extras cell gauged while demand persists"
+        );
+        assert!(
+            new_extras.contains(&unknown),
+            "tracked for trailing zero-write"
+        );
+
+        // Tick N+1: demand clears — `by_cell` no longer has `unknown`.
+        let (to_write, new_extras) = gauge_universe(&configured, std::iter::empty(), &new_extras);
+        assert!(
+            to_write.contains(&unknown),
+            "extras cell must get one trailing zero-write"
+        );
+        assert!(
+            !new_extras.contains(&unknown),
+            "trailing write is one-shot; not re-tracked"
+        );
+
+        // Tick N+2: gone for good.
+        let (to_write, _) = gauge_universe(&configured, std::iter::empty(), &new_extras);
+        assert!(
+            !to_write.contains(&unknown),
+            "no further writes after trailing tick"
+        );
     }
 
     /// r42 bug_023: `reap_idle` Phase 0's gauge-reset of
