@@ -293,9 +293,18 @@ impl CellCtx {
 pub struct ReapInputs<'a, F: Fn(&str, Option<&str>, &[String]) -> bool> {
     /// FFD placements for this tick (`reserved` + per-cell partition).
     pub placeable: &'a [Placement],
-    /// `cfg.all_cells(&hw_config)` — the gauge-reset and per-cell
-    /// precompute key set. r37 bug_006: every cell needs a write.
+    /// The gauge-reset and per-cell precompute key set. r37 bug_006:
+    /// every cell needs a write. r42 bug_023: callers pass the
+    /// `gauge_universe` set (configured ∪ live ∪ trailing) so a cell
+    /// removed from config gets one trailing zero-write for
+    /// `consolidate_threshold_seconds` after it drains.
     pub all_cells: &'a [Cell],
+    /// Controller-tracked `name → epoch-secs at which this node was
+    /// first observed idle (`requested.0 == 0`)`. Populated by
+    /// `observe_idle_to_busy` BEFORE this call. r42 bug_020: this is
+    /// the SOLE idle-duration source — Karpenter `Empty` does not
+    /// exist in v1; the controller is the authority.
+    pub prev_idle: &'a HashMap<String, f64>,
     pub cfg: &'a NodeClaimPoolConfig,
     pub hw_admits: F,
     pub now_secs: f64,
@@ -304,12 +313,13 @@ pub struct ReapInputs<'a, F: Fn(&str, Option<&str>, &[String]) -> bool> {
 /// Reap idle Registered NodeClaims past their break-even threshold.
 ///
 /// A node is reapable when: `registered` AND not `terminating` AND not
-/// in this tick's FFD `reserved` set AND `idle_secs > threshold`.
-/// `threshold` is [`consolidate_after`] over the cell's
-/// `idle_gap_events`, raised to `hold_open_threshold` for hold-open
-/// nodes (`max(max_consolidation_time, na)` when set, else `2 × na`).
-/// Each reap records a censored `IdleGapEvent`. `Api::delete` 404 is
-/// ignored (already-gone race with Karpenter); other errors warn + skip.
+/// in this tick's FFD `reserved` set AND `requested.0 == 0` AND
+/// `now − prev_idle[name] > threshold`. `threshold` is
+/// [`consolidate_after`] over the cell's `idle_gap_events`, raised to
+/// `hold_open_threshold` for hold-open nodes
+/// (`max(max_consolidation_time, na)` when set, else `2 × na`). Each
+/// reap records a censored `IdleGapEvent`. `Api::delete` 404 is ignored
+/// (already-gone race with Karpenter); other errors warn + skip.
 pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
     nodeclaims: &Api<NodeClaim>,
     live: &[LiveNode],
@@ -319,6 +329,7 @@ pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
     let ReapInputs {
         placeable,
         all_cells,
+        prev_idle,
         cfg,
         hw_admits,
         now_secs,
@@ -356,15 +367,19 @@ pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
         if n.terminating() || !n.registered || reserved.contains(n.name.as_str()) {
             continue;
         }
-        // Busy = Karpenter Empty=False, OR PodRequestedCache saw a
-        // binding before Karpenter flipped the condition (the same
-        // race `observe_idle_to_busy` guards). Without the
-        // `requested.0==0` check, a tight-fit node whose pod just
-        // bound (so `free()=0` → not in `reserved`) but whose Empty
-        // condition is stale/unwritten can be reaped mid-build.
-        let Some(idle) = n.idle_secs(now_secs).filter(|_| n.requested.0 == 0) else {
+        // r42 bug_020: idle = `now − prev_idle[name]`, the
+        // controller-tracked idle-since timestamp. `requested.0 > 0`
+        // → busy → not in `prev_idle` (observe_idle_to_busy removes
+        // it). A node not yet in `prev_idle` (created mid-tick, or
+        // observe_idle_to_busy hasn't seen it) is skipped — never
+        // reap a node whose idle history we haven't observed.
+        if n.requested.0 > 0 {
+            continue;
+        }
+        let Some(&since) = prev_idle.get(&n.name) else {
             continue;
         };
+        let idle = now_secs - since;
         // A live node may carry a cell removed from config mid-rollout —
         // derive on demand so it's still reaped (leaking is worse).
         if !cell_ctx.contains_key(cell) {
@@ -433,13 +448,16 @@ pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
 
 /// Edge-detect idle→busy transitions and record them as uncensored
 /// [`IdleGapEvent`]s. `prev_idle` is the reconciler's running
-/// `name → idle_secs` map from the previous tick; a node present there
-/// whose `idle_secs` is now `None` (Karpenter `Empty=False`) OR whose
-/// `requested.0 > 0` (PodRequestedCache saw a binding before Karpenter
-/// flipped the condition) had an arrival — record `{prev_idle[name],
-/// censored:false}` to its cell. `prev_idle` is then refreshed to
-/// `idle_secs(now)` for nodes still idle and pruned of names absent
-/// from `live` (reaped/gone — `reap_idle` records the censored event).
+/// `name → idle-since epoch-secs` map; a node present there whose
+/// `requested.0 > 0` (PodRequestedCache saw a binding) had an
+/// arrival — record `{now − prev_idle[name], censored:false}` to its
+/// cell. r42 bug_020: `prev_idle` is the AUTHORITY for idle
+/// duration — Karpenter v1 does not write the `Empty` condition the
+/// pre-r42 implementation relied on, so the only signal is the
+/// controller's own `requested.0` observation. Nodes not yet in
+/// `prev_idle` are seeded with `now_secs` on first observation of
+/// idleness (NOT registration time — that would re-introduce the
+/// "idle for hours" bug for any node that was busy and just freed).
 ///
 /// Called from `reconcile_once` after `list_live_nodeclaims` (so
 /// `requested` is populated) and before `reap_idle`. Without this every
@@ -459,9 +477,7 @@ pub fn observe_idle_to_busy(
     // `kubectl delete nodeclaim`) the gap is silently dropped — an
     // unhealthy node's idle history is tainted anyway (the executor
     // crashed mid-idle), and `reap_unhealthy` takes `&CellSketches`
-    // immutably so it CANNOT push. Karpenter flipping `Empty=False`
-    // during drain would also log a bogus uncensored "arrival" if
-    // recorded here (r38 bug_031).
+    // immutably so it CANNOT push (r38 bug_031).
     let live_names: HashSet<&str> = live
         .iter()
         .filter(|n| !n.terminating())
@@ -469,25 +485,35 @@ pub fn observe_idle_to_busy(
         .collect();
     prev_idle.retain(|name, _| live_names.contains(name.as_str()));
     for n in live {
-        if n.terminating() {
+        if n.terminating() || !n.registered {
             continue;
         }
-        let idle = n.idle_secs(now_secs);
-        let busy = idle.is_none() || n.requested.0 > 0;
+        let busy = n.requested.0 > 0;
         if busy {
-            if let (Some(&gap), Some(cell)) = (prev_idle.get(&n.name), n.cell.as_ref()) {
+            if let (Some(&since), Some(cell)) = (prev_idle.get(&n.name), n.cell.as_ref()) {
                 push_idle_gap(
                     sketches,
                     cell,
                     IdleGapEvent {
-                        gap_secs: gap,
+                        gap_secs: now_secs - since,
                         censored: false,
                     },
                 );
             }
             prev_idle.remove(&n.name);
-        } else if let Some(idle) = idle {
-            prev_idle.insert(n.name.clone(), idle);
+        } else {
+            // First observation of an idle node: seed with `now_secs`
+            // (the controller has just witnessed it become idle).
+            // Subsequent ticks: `or_insert` keeps the original
+            // timestamp — the node has been idle since. NEVER seed
+            // from `Registered=True` — a node busy for hours that
+            // just freed would appear idle-since-registration and be
+            // reaped immediately, re-introducing the exact bug this
+            // fixes. The never-bound-node case loses fidelity (seed
+            // is first-observed-tick, not registration-tick) but
+            // gains safety (under-reap, the same SAFE direction as
+            // a controller restart).
+            prev_idle.entry(n.name.clone()).or_insert(now_secs);
         }
     }
 }
@@ -574,32 +600,29 @@ mod tests {
     }
 
     /// `reap_idle`'s busy predicate matches `observe_idle_to_busy`:
-    /// `requested.0 > 0` is busy even when Karpenter hasn't yet
-    /// written `Empty=False`. A node with a freshly-bound pod
-    /// (requested>0, Empty unwritten → idle_secs falls back to
-    /// since-Registered) MUST NOT be reapable.
+    /// `requested.0 > 0` is busy. r42 bug_020: a node with a
+    /// freshly-bound pod MUST NOT be reapable even if it appears in
+    /// `prev_idle` (the cache is one tick stale). A node not in
+    /// `prev_idle` MUST NOT be reapable either — never reap a node
+    /// whose idle history hasn't been observed.
     #[test]
     fn reap_idle_skips_nonzero_requested() {
         let mut n = with_conds(
             node("bound", "h", CapacityType::Spot, 8, 0, 0),
             &[("Registered", "True", 1000.0)],
         );
-        // No Empty condition → idle_secs = now − Registered.
-        assert_eq!(n.idle_secs(1012.0), Some(12.0));
-        // But a pod is bound (requested > 0) → reap_idle's filter
-        // treats this as busy.
+        let prev_idle: HashMap<String, f64> = [("bound".into(), 1000.0)].into();
+        // A pod is bound (requested > 0) → reap_idle's first filter
+        // treats this as busy regardless of `prev_idle`.
         n.requested = (8, 0, 0);
-        assert_eq!(
-            n.idle_secs(1012.0).filter(|_| n.requested.0 == 0),
-            None,
-            "requested>0 → not reapable even with idle_secs.is_some()"
-        );
-        // Same node with requested=0 → idle, reapable.
+        assert!(n.requested.0 > 0, "busy predicate fires");
+        // Same node with requested=0 AND in prev_idle → idle, reapable.
         n.requested = (0, 0, 0);
-        assert_eq!(
-            n.idle_secs(1012.0).filter(|_| n.requested.0 == 0),
-            Some(12.0)
-        );
+        assert!(n.requested.0 == 0);
+        assert_eq!(prev_idle.get("bound").copied(), Some(1000.0));
+        // Node not yet in `prev_idle` (e.g. created mid-tick before
+        // observe_idle_to_busy ran) → skipped, never reaped.
+        assert_eq!(prev_idle.get("unobserved"), None);
     }
 
     #[test]
@@ -792,10 +815,12 @@ mod tests {
     }
 
     /// `reap_idle`'s reapability filter: registered ∧ ¬reserved ∧
-    /// idle > threshold. With no events, threshold = boot_median/2.
-    /// Kube side-effect not tested here (covered in VM tests); this
-    /// asserts the filter via a fake `live` set against the pure
-    /// threshold function.
+    /// `requested.0 == 0` ∧ in `prev_idle` ∧ `now − prev_idle > threshold`.
+    /// With no events, threshold = boot_median/2. r42 bug_020: the busy
+    /// gate is `requested.0 > 0` (the controller's own observation), NOT
+    /// a Karpenter `Empty` condition (which v1 never writes). Kube
+    /// side-effect not tested here (covered in VM tests); this asserts
+    /// the filter expressions against the pure threshold function.
     #[test]
     fn no_reap_when_busy_or_reserved() {
         let mut sk = CellSketches::default();
@@ -804,14 +829,15 @@ mod tests {
             sk.cell_mut(&cell).record(40.0, 0.0);
         }
         let cfg = NodeClaimPoolConfig::default();
-        // boot_median ≈ 40 → floor = 20. Node idle 30s > 20 → reapable
-        // unless reserved/busy.
+        // boot_median ≈ 40 → floor = 20. Node observed idle since 1070,
+        // now=1100 → idle=30s > 20 → reapable unless reserved/busy.
         let idle_node = with_conds(
             node("idle", "h", CapacityType::Spot, 8, 0, 0),
-            &[("Registered", "True", 1000.0), ("Empty", "True", 1070.0)],
+            &[("Registered", "True", 1000.0)],
         );
-        // now=1100 → idle=30s.
-        assert_eq!(idle_node.idle_secs(1100.0), Some(30.0));
+        let prev_idle: HashMap<String, f64> = [("idle".into(), 1070.0)].into();
+        let idle = 1100.0 - prev_idle["idle"];
+        assert!((idle - 30.0).abs() < 1e-9);
         let threshold = consolidate_after(
             &[],
             e_fitting_cores(&[], 8),
@@ -820,82 +846,120 @@ mod tests {
             cfg.max_consolidation_time,
             None,
         );
-        assert!(30.0 > threshold, "idle past floor");
+        assert!(idle > threshold, "idle past floor");
 
-        // Busy (Empty=False) → idle_secs=None → never reapable.
-        let busy = with_conds(
+        // Busy (`requested.0 > 0`) → first filter fires → never reapable.
+        let mut busy = with_conds(
             node("busy", "h", CapacityType::Spot, 8, 0, 0),
-            &[("Registered", "True", 1000.0), ("Empty", "False", 1070.0)],
+            &[("Registered", "True", 1000.0)],
         );
-        assert_eq!(busy.idle_secs(1100.0), None);
+        busy.requested = (4, 0, 0);
+        assert!(busy.requested.0 > 0, "busy filter fires before prev_idle");
 
         // Reserved (in placeable) → skipped regardless of idle.
         let reserved: HashSet<&str> = ["idle"].into();
         assert!(reserved.contains(idle_node.name.as_str()));
     }
 
-    /// F8: a node idle 40s last tick, busy this tick (`requested.0>0`)
-    /// → uncensored `IdleGapEvent{40.0,false}` recorded; `prev_idle`
-    /// updated for nodes that stay idle; nodes gone from `live` evicted
-    /// from `prev_idle`.
+    /// F8 + r42 bug_020: a node observed idle at tick 1, busy this tick
+    /// (`requested.0 > 0`) → uncensored `IdleGapEvent{now − seed, false}`
+    /// recorded; `prev_idle` keeps the original idle-since timestamp for
+    /// nodes that stay idle (`or_insert`, NOT a per-tick refresh); nodes
+    /// gone from `live` evicted from `prev_idle`.
     #[test]
     fn observe_idle_to_busy_pushes_uncensored() {
         let mut sk = CellSketches::default();
         let cell = Cell("h".into(), CapacityType::Spot);
-        let mut prev_idle: HashMap<String, f64> = [("a".into(), 40.0), ("b".into(), 15.0)].into();
+        // Tick 0 seeded a=1120 (idle 40s by tick 1160), b=1145.
+        let mut prev_idle: HashMap<String, f64> =
+            [("a".into(), 1120.0), ("b".into(), 1145.0)].into();
 
-        // Tick: a now busy (requested=4c), b still idle (Empty=True at
-        // 1100, requested=0), c is new (idle since registered=1042).
+        // Tick 1160: a now busy (requested=4c), b still idle
+        // (requested=0), c is new (first observed idle).
         let mut a = with_conds(
             node("a", "h", CapacityType::Spot, 8, 0, 0),
-            &[("Registered", "True", 1042.0), ("Empty", "False", 1150.0)],
+            &[("Registered", "True", 1042.0)],
         );
         a.requested = (4, 0, 0);
         let b = with_conds(
             node("b", "h", CapacityType::Spot, 8, 0, 0),
-            &[("Registered", "True", 1042.0), ("Empty", "True", 1100.0)],
+            &[("Registered", "True", 1042.0)],
         );
         let c = with_conds(
             node("c", "h", CapacityType::Spot, 8, 0, 0),
             &[("Registered", "True", 1042.0)],
         );
-        observe_idle_to_busy(&[a, b, c], &mut prev_idle, &mut sk, 1160.0);
+        observe_idle_to_busy(
+            &[a.clone(), b.clone(), c.clone()],
+            &mut prev_idle,
+            &mut sk,
+            1160.0,
+        );
 
         let evs = &sk.get(&cell).unwrap().idle_gap_events;
         assert_eq!(evs.len(), 1, "only a's idle→busy edge recorded");
         assert!((evs[0].gap_secs - 40.0).abs() < 1e-9);
         assert!(!evs[0].censored, "uncensored");
-        // prev_idle: a evicted (busy), b updated to 60s, c added at 118s.
+        // prev_idle: a evicted (busy), b KEEPS its 1145 seed (or_insert,
+        // not refresh), c seeded at 1160 (first observation, NOT
+        // registration time 1042).
         assert!(!prev_idle.contains_key("a"));
-        assert!((prev_idle["b"] - 60.0).abs() < 1e-9);
-        assert!((prev_idle["c"] - 118.0).abs() < 1e-9);
+        assert!(
+            (prev_idle["b"] - 1145.0).abs() < 1e-9,
+            "or_insert keeps seed"
+        );
+        assert!(
+            (prev_idle["c"] - 1160.0).abs() < 1e-9,
+            "first-observation seed, not registration time"
+        );
 
-        // Next tick: b reaped (gone from live). prev_idle prunes b
+        // Tick 1170: b still idle. or_insert keeps 1145, NOT 1170.
+        observe_idle_to_busy(&[b, c.clone()], &mut prev_idle, &mut sk, 1170.0);
+        assert!(
+            (prev_idle["b"] - 1145.0).abs() < 1e-9,
+            "stay-idle keeps original seed; idle accumulates"
+        );
+
+        // Tick 1180: b goes busy → gap = 1180 − 1145 = 35s (cumulative
+        // idle, NOT 1180 − 1170 = 10s).
+        let mut b_busy = with_conds(
+            node("b", "h", CapacityType::Spot, 8, 0, 0),
+            &[("Registered", "True", 1042.0)],
+        );
+        b_busy.requested = (4, 0, 0);
+        observe_idle_to_busy(&[b_busy, c], &mut prev_idle, &mut sk, 1180.0);
+        let evs = &sk.get(&cell).unwrap().idle_gap_events;
+        assert_eq!(evs.len(), 2);
+        assert!(
+            (evs[1].gap_secs - 35.0).abs() < 1e-9,
+            "gap is cumulative from first idle observation, not tick-over-tick"
+        );
+
+        // Next tick: b/c reaped (gone from live). prev_idle prunes
         // without recording an uncensored event (reap_idle records the
         // censored one).
-        observe_idle_to_busy(&[], &mut prev_idle, &mut sk, 1170.0);
+        observe_idle_to_busy(&[], &mut prev_idle, &mut sk, 1190.0);
         assert!(prev_idle.is_empty());
-        assert_eq!(sk.get(&cell).unwrap().idle_gap_events.len(), 1);
+        assert_eq!(sk.get(&cell).unwrap().idle_gap_events.len(), 2);
     }
 
     /// A node that started terminating since last tick (Karpenter
     /// finalizer running) drops from `prev_idle` WITHOUT recording an
     /// idle-gap event — `reap_idle`/`reap_unhealthy` already pushed the
     /// censored event at delete time. Recording here would double-count
-    /// AND, when Karpenter flips `Empty=False` during drain, would log
-    /// a bogus uncensored "arrival" that biases the NA-model arrival
-    /// rate up (holding nodes open longer than warranted).
+    /// and bias the NA-model arrival rate up (holding nodes open longer
+    /// than warranted).
     #[test]
     fn observe_idle_to_busy_skips_terminating() {
         use super::super::ffd::tests::set_terminating;
         let mut sk = CellSketches::default();
         let cell = Cell("h".into(), CapacityType::Spot);
-        let mut prev_idle: HashMap<String, f64> = [("dying".into(), 80.0)].into();
-        // Karpenter drain flips Empty=False AND sets deletionTimestamp
-        // → naively this looks like an idle→busy edge.
+        let mut prev_idle: HashMap<String, f64> = [("dying".into(), 1020.0)].into();
+        // Karpenter drain sets deletionTimestamp; the kubelet may still
+        // report a bound pod → naively this looks like an idle→busy edge.
         let mut dying = set_terminating(with_conds(
             node("dying", "h", CapacityType::Spot, 8, 0, 0),
-            &[("Registered", "True", 1000.0), ("Empty", "False", 1090.0)],
+            &[("Registered", "True", 1000.0)],
         ));
         dying.requested = (4, 0, 0);
         observe_idle_to_busy(&[dying], &mut prev_idle, &mut sk, 1100.0);
@@ -907,6 +971,60 @@ mod tests {
             !prev_idle.contains_key("dying"),
             "terminating node pruned from prev_idle without an event"
         );
+    }
+
+    /// r42 bug_020 KEYSTONE: a node Registered at `t=0`, busy for 100
+    /// ticks (`requested=(4,0,0)`, `prev_idle` never seeded), then idle
+    /// at tick 101 (`requested=(0,0,0)`). Pre-r42 `idle_secs()` fell
+    /// back to `Registered.lastTransitionTime` and reported ~101s →
+    /// `reap_idle` immediately killed a node that had been free for one
+    /// tick — the `r[ctrl.nodeclaim.consolidate-na]` warm-keep model
+    /// was DEAD CODE. Post-r42: `prev_idle["a"]` seeds at `tick101_now`,
+    /// so `reap_idle` sees `idle = now − prev_idle ≈ 0` and warm-keeps.
+    /// Asserts the structural invariant `reap_idle` reads via
+    /// `ReapInputs.prev_idle`.
+    // r[verify ctrl.nodeclaim.consolidate-na+5]
+    #[test]
+    fn busy_node_freed_seeds_prev_idle_at_now_not_registration() {
+        let mut sk = CellSketches::default();
+        let cell = Cell("h".into(), CapacityType::Spot);
+        let mut prev_idle: HashMap<String, f64> = HashMap::new();
+
+        let registered_at = 0.0;
+        let mut n = with_conds(
+            node("a", "h", CapacityType::Spot, 8, 0, 0),
+            &[("Registered", "True", registered_at)],
+        );
+
+        // Ticks 1..=100: busy. prev_idle never seeds (busy nodes are
+        // removed/never inserted).
+        n.requested = (4, 0, 0);
+        for tick in 1..=100u32 {
+            observe_idle_to_busy(&[n.clone()], &mut prev_idle, &mut sk, f64::from(tick));
+            assert!(prev_idle.is_empty(), "busy node never enters prev_idle");
+        }
+
+        // Tick 101: pod departs → requested drops to 0. The controller
+        // observes the busy→idle edge and seeds prev_idle at tick101.
+        let tick101_now = 101.0;
+        n.requested = (0, 0, 0);
+        observe_idle_to_busy(&[n.clone()], &mut prev_idle, &mut sk, tick101_now);
+
+        // The structural invariant `reap_idle` reads (`ReapInputs.prev_idle`):
+        // idle = now − prev_idle["a"] ≈ 0, NOT now − Registered = 101.
+        let since = prev_idle["a"];
+        assert!(
+            (since - tick101_now).abs() < 1e-9,
+            "seed at first-observed-idle tick, not registration time"
+        );
+        let idle = tick101_now - since;
+        assert!(idle < 5.0, "freed node has idle ≈ 0, not ≈ {tick101_now}");
+        assert!(
+            idle < tick101_now - registered_at,
+            "idle MUST be far less than node age — warm-keep is live again"
+        );
+        // No idle→busy edge recorded yet (this was busy→idle).
+        assert!(sk.get(&cell).is_none_or(|s| s.idle_gap_events.is_empty()));
     }
 
     /// r38 merged_004: hold-open ≥ non-hold-open MUST hold for ALL

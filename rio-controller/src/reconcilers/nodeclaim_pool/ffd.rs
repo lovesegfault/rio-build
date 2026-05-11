@@ -195,21 +195,17 @@ impl LiveNode {
         }
     }
 
-    /// Seconds since the node became idle (Karpenter's `Empty=True`
-    /// transition). Falls back to `Registered=True` transition when
-    /// `Empty` is absent — a node with no pod ever scheduled has been
-    /// idle since registration. `None` for in-flight claims.
-    pub fn idle_secs(&self, now_secs: f64) -> Option<f64> {
-        if !self.registered {
-            return None;
-        }
-        let since = match self.cond("Empty") {
-            Some(("True", t)) => t,
-            Some(_) => return None,
-            None => self.cond("Registered")?.1,
-        };
-        Some(now_secs - since)
-    }
+    // r42 bug_020: `idle_secs()` deleted. It read a Karpenter `Empty`
+    // condition Karpenter v1 does not write — emptiness was folded into
+    // `Consolidatable.reason` in v1.0; the shim NodePool's
+    // `consolidateAfter: Never` suppresses `Consolidatable` too. The
+    // fallback path always fired → "idle for hours" the moment a busy
+    // node's last pod left → the `r[ctrl.nodeclaim.consolidate-na]`
+    // warm-keep model was dead code. The controller's own `requested.0`
+    // transition tracked in `prev_idle` is the source of truth. **No
+    // replacement method**: the never-bound-node case is handled by
+    // `prev_idle.or_insert(now_secs)` on first observation in
+    // `observe_idle_to_busy`.
 
     /// Read `metadata.annotations[key]`.
     pub fn annotation(&self, key: &str) -> Option<&str> {
@@ -875,24 +871,11 @@ pub(crate) mod tests {
         assert_eq!(nc.age_secs(1100.0), None);
     }
 
-    /// `idle_secs()`: Empty=True → since-transition; Empty=False →
-    /// None (busy); no Empty cond → since-Registered. In-flight → None.
-    #[test]
-    fn live_node_idle_secs() {
-        let base = node("a", "h", CapacityType::Spot, 8, GI, GI);
-        let empty = with_conds(
-            base.clone(),
-            &[("Registered", "True", 1042.0), ("Empty", "True", 1100.0)],
-        );
-        assert_eq!(empty.idle_secs(1160.0), Some(60.0));
-        let busy = with_conds(base.clone(), &[("Empty", "False", 1100.0)]);
-        assert_eq!(busy.idle_secs(1160.0), None);
-        let never_scheduled = with_conds(base.clone(), &[("Registered", "True", 1042.0)]);
-        assert_eq!(never_scheduled.idle_secs(1160.0), Some(118.0));
-        let mut inflight = base;
-        inflight.registered = false;
-        assert_eq!(inflight.idle_secs(1160.0), None);
-    }
+    // r42 bug_020: `live_node_idle_secs` test deleted with `idle_secs()`.
+    // The test synthesized an `Empty` condition Karpenter v1 never writes
+    // — it tested dead code. The never-bound-node case is now exercised by
+    // `observe_idle_to_busy` tests asserting
+    // `prev_idle[name] == first_observed_tick_secs`.
 
     #[test]
     fn live_node_from_statusless_nodeclaim() {

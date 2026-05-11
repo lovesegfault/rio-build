@@ -715,7 +715,7 @@ mod tests {
     /// `z_active.count() > 0` and skipped. `HashMap` iteration order is
     /// per-instance `RandomState` (NOT insertion order), so a single
     /// back-to-back pair is a coin flip — 64 fresh `HashMap`s give
-    /// >99.9% probability of observing both orders if the result is
+    /// \>99.9% probability of observing both orders if the result is
     /// order-dependent.
     // r[verify ctrl.nodeclaim.lead-time-ddsketch]
     #[test]

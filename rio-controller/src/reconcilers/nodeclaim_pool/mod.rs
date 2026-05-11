@@ -625,10 +625,16 @@ pub struct NodeClaimPoolReconciler {
     /// are recorded-only (so they don't re-edge later) without pushing
     /// the cell to `report_unfulfillable`'s ICE-clear.
     recorded_boot: HashSet<String>,
-    /// `name → idle_secs` from the previous tick. Edge-detector state
-    /// for [`consolidate::observe_idle_to_busy`]: a node idle last tick
-    /// and busy this tick records an uncensored `IdleGapEvent`.
-    /// In-memory only — restart drops one tick's worth of edges.
+    /// `name → epoch-secs at which the node was first observed idle`
+    /// (`requested.0 == 0`). r42 bug_020: the SOLE idle-duration source
+    /// — Karpenter v1 does not write `Empty`, so the controller's own
+    /// `requested.0` observation is the authority. Seeded with `now_secs`
+    /// on first observation of idleness in
+    /// [`consolidate::observe_idle_to_busy`]; pruned on idle→busy or
+    /// when the node leaves `live`. Read by [`consolidate::reap_idle`]
+    /// via `ReapInputs.prev_idle`. In-memory only — restart re-seeds
+    /// every idle node from `now_secs` (under-reap by one threshold
+    /// cycle; SAFE direction, identical to a fresh fleet).
     prev_idle: HashMap<String, f64>,
     /// Cells written by [`Self::emit_live_gauges`] last tick that were
     /// NOT in `all_cells()` (i.e. carried by a live NodeClaim whose
@@ -1074,6 +1080,12 @@ impl NodeClaimPoolReconciler {
             live = live.len(),
             "FFD simulation"
         );
+        // r42 bug_023: snapshot `prev_extra_cells` BEFORE
+        // `emit_tick_gauges` overwrites it — `reap_idle`'s Phase 0
+        // gauge-reset needs the same `gauge_universe` set so a cell
+        // removed from config gets one trailing zero-write for
+        // `consolidate_threshold_seconds` after it drains.
+        let prev_extras_for_reap = self.prev_extra_cells.clone();
         self.emit_tick_gauges(&live, &placeable, &unplaced, now);
         // r[impl ctrl.nodeclaim.placeable-gate+4]
         // Publish `intent_id`s FFD-placed on a `Registered=True` node
@@ -1139,7 +1151,18 @@ impl NodeClaimPoolReconciler {
         self.report_unfulfillable(&ice_cells, &registered_cells, observed_types, bound_intents)
             .await?;
 
-        let all_cells = self.cfg.all_cells(&self.hw_config);
+        // r42 bug_023: same gauge_universe as `emit_live_gauges` —
+        // configured ∪ live cells ∪ one trailing tick of cells
+        // removed from config. Without the union, `reap_idle` Phase
+        // 0 never zeroes `consolidate_threshold_seconds` for an
+        // orphaned cell once it drains, contradicting the
+        // `describe_gauge!` "0 when no idle nodes" promise.
+        let configured = self.cfg.all_cells(&self.hw_config);
+        let (all_cells, _) = gauge_universe(
+            &configured,
+            live.iter().filter_map(|n| n.cell.clone()),
+            &prev_extras_for_reap,
+        );
         consolidate::reap_idle(
             &self.nodeclaims,
             &live,
@@ -1147,6 +1170,7 @@ impl NodeClaimPoolReconciler {
             &consolidate::ReapInputs {
                 placeable: &placeable,
                 all_cells: &all_cells,
+                prev_idle: &self.prev_idle,
                 cfg: &self.cfg,
                 hw_admits: |h, a, f| {
                     self.hw_config.matches_arch(h, a)
@@ -1174,7 +1198,15 @@ impl NodeClaimPoolReconciler {
         let live = self.list_live_nodeclaims().await?;
         let now = now_epoch();
         consolidate::observe_idle_to_busy(&live, &mut self.prev_idle, &mut self.sketches, now);
-        let all_cells = self.cfg.all_cells(&self.hw_config);
+        // r42 bug_023: `consolidate_only` calls `emit_live_gauges`
+        // AFTER `reap_idle`, so `prev_extra_cells` is still the
+        // previous tick's value here — use it directly.
+        let configured = self.cfg.all_cells(&self.hw_config);
+        let (all_cells, _) = gauge_universe(
+            &configured,
+            live.iter().filter_map(|n| n.cell.clone()),
+            &self.prev_extra_cells,
+        );
         consolidate::reap_idle(
             &self.nodeclaims,
             &live,
@@ -1182,6 +1214,7 @@ impl NodeClaimPoolReconciler {
             &consolidate::ReapInputs {
                 placeable: &[],
                 all_cells: &all_cells,
+                prev_idle: &self.prev_idle,
                 cfg: &self.cfg,
                 hw_admits: |h, a, f| {
                     self.hw_config.matches_arch(h, a)
@@ -1255,9 +1288,10 @@ impl NodeClaimPoolReconciler {
         }
         // r41 bug_025: union of config-derived and label-derived cells,
         // plus one trailing tick — see [`gauge_universe`].
-        // `consolidate::reap_idle` already handles this lifecycle ("a
-        // live node may carry a cell removed from config mid-rollout —
-        // derive on demand"); this is the §SCC sibling fallback.
+        // `consolidate::reap_idle` Phase 0 takes the same
+        // `gauge_universe` set via `ReapInputs.all_cells` (r42
+        // bug_023) — both gauges drain trailing zeros from the same
+        // `prev_extra_cells` snapshot.
         let configured = self.cfg.all_cells(&self.hw_config);
         let (to_write, new_extras) = gauge_universe(
             &configured,
@@ -1941,6 +1975,55 @@ mod tests {
             &HashSet::new(),
         );
         assert!(extras.is_empty(), "configured cell is never an extra");
+    }
+
+    /// r42 bug_023: `reap_idle` Phase 0's gauge-reset of
+    /// `consolidate_threshold_seconds` previously iterated only
+    /// `cfg.all_cells()` — a cell removed from config that drains its
+    /// last NodeClaim never got a final zero-write, contradicting the
+    /// `describe_gauge!` "0 when no idle nodes" promise.
+    /// `reconcile_once` and `consolidate_only` now pass the same
+    /// `gauge_universe()` set through `ReapInputs.all_cells`. This test
+    /// asserts the wiring shape: `gauge_universe(configured, live_cells,
+    /// prev_extras_for_reap)` yields a trailing entry for an orphaned
+    /// cell exactly one tick after it leaves `live`, then drops it.
+    #[test]
+    fn reap_idle_phase0_universe_includes_trailing_orphaned_cell() {
+        let configured = vec![Cell("known-x86".into(), CapacityType::OnDemand)];
+        let orphan = Cell("removed-x86".into(), CapacityType::OnDemand);
+
+        // Tick N: orphaned cell still has a live NodeClaim. The reap
+        // call site builds `live_cells` from `live.iter().filter_map(
+        // |n| n.cell.clone())` — an orphan with a draining node is
+        // included in `to_write` AND tracked in `extras`.
+        let prev_extras_for_reap: HashSet<Cell> = HashSet::new();
+        let live_cells = std::iter::once(orphan.clone());
+        let (to_write, extras) = gauge_universe(&configured, live_cells, &prev_extras_for_reap);
+        assert!(
+            to_write.contains(&orphan),
+            "orphan in ReapInputs.all_cells while a node is draining"
+        );
+        assert!(extras.contains(&orphan));
+
+        // Tick N+1: NodeClaim drained, no live node carries the cell.
+        // `prev_extras_for_reap` (snapshotted BEFORE `emit_tick_gauges`
+        // overwrites `prev_extra_cells`) still has the orphan → one
+        // trailing zero-write.
+        let prev_extras_for_reap = extras;
+        let (to_write, extras) =
+            gauge_universe(&configured, std::iter::empty(), &prev_extras_for_reap);
+        assert!(
+            to_write.contains(&orphan),
+            "orphan gets one trailing zero-write for consolidate_threshold_seconds"
+        );
+        assert!(extras.is_empty());
+
+        // Tick N+2: gone for good.
+        let (to_write, _) = gauge_universe(&configured, std::iter::empty(), &extras);
+        assert!(
+            !to_write.contains(&orphan),
+            "no further writes after trailing tick"
+        );
     }
 
     /// r41 bug_021: `assign_to_cells` keys `by_cell` on scheduler-
