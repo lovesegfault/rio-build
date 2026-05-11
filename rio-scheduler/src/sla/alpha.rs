@@ -197,7 +197,7 @@ pub fn fit_alpha(samples: &[AlphaSample], prior: Alpha, lambda_ridge: f64) -> Al
 
 // r[impl sched.sla.hw-class.alpha-als+2]
 /// Bounded ALS: alternate `(NNLS on wall·(α·factor[h]))` ↔ `(fit_alpha on
-/// T_ref(c)/wall)` until `‖Δα‖₁ < 10⁻²` or [`ALS_MAX_ROUNDS`].
+/// T_ref(c)/wall)` until `‖Δα‖₁ < `[`ALS_DELTA_TOL`] or [`ALS_MAX_ROUNDS`].
 ///
 /// `factors[i] = None` for NULL / unbench'd hw_class: those rows feed the
 /// NNLS step at `factor := [1;K]` (bias-neutral pass-through, ADR-023

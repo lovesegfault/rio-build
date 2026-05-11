@@ -113,11 +113,12 @@ pub fn describe_all() {
     );
     describe_counter!(
         "rio_scheduler_sla_als_round_cap_hit_total",
-        "ALS alternation hit the 5-round cap without ‖Δα‖₁<10⁻² \
+        "ALS alternation hit ALS_MAX_ROUNDS without ‖Δα‖₁ < ALS_DELTA_TOL \
          convergence (labeled `tenant`). The α/T_ref(c) joint fit \
-         failed to converge — alpha is the round-5 iterate, not a \
-         fixed point. Sustained nonzero ⇒ ALS_MAX_ROUNDS too low or \
-         the rank gate is admitting degenerate factor matrices."
+         failed to converge — alpha is the final iterate, not a \
+         fixed point. Sustained nonzero ⇒ investigate rank-gate \
+         degeneracy or fixture quality (the cap is already a \
+         worst-case budget — see alpha.rs constants)."
     );
     describe_counter!(
         "rio_scheduler_sla_keys_evicted_total",
