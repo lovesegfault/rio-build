@@ -93,7 +93,7 @@ pub struct AssignmentClaims {
     /// defeat the median-of-medians defence. `None` for orphaned/
     /// recovered nodes (no live owning build).
     ///
-    /// **Two-phase rollout (bug_011).** This struct carries
+    /// **Wire-compat (bug_011).** This struct carries
     /// `#[serde(deny_unknown_fields)]`, so adding a field is a wire
     /// break in the *forward* skew direction (new token → old store).
     /// During a `helm upgrade` the scheduler (leader-elected
@@ -108,21 +108,21 @@ pub struct AssignmentClaims {
     ///   deserializes to `None`. (`deny_unknown_fields` only rejects
     ///   *extra* keys, not *missing* ones.)
     /// - **new token → old store:** a post-tenant scheduler's token
-    ///   would carry `"tenant"`, which a pre-tenant store rejects.
-    ///   `skip_serializing_if = "Option::is_none"` + Phase 1's
-    ///   `tenant: None` close it: when `tenant=None` the key is never
-    ///   emitted, so the wire body is byte-identical to the pre-tenant
-    ///   shape. (`Option<T>` without `skip_serializing_if` would emit
-    ///   `"tenant": null`, which is *still* an unknown key.)
+    ///   carrying `"tenant"` is rejected by a pre-tenant store.
+    ///   `skip_serializing_if = "Option::is_none"` closes it whenever
+    ///   `tenant=None`: the key is never emitted, so the wire body is
+    ///   byte-identical to the pre-tenant shape. (`Option<T>` without
+    ///   `skip_serializing_if` would emit `"tenant": null`, which is
+    ///   *still* an unknown key.)
     ///
-    /// **Phase 1 (this release):** the store can READ `tenant`; the
-    /// scheduler signs `tenant: None` at dispatch (the key is not
-    /// emitted). Roll the full fleet. **Phase 2 (next release):** flip
-    /// `dispatch.rs` to set `tenant` from `attributed_tenant`. Until
-    /// then, `hw_perf_samples.submitting_tenant` is NULL for every
-    /// build — the median-of-medians consumer already tolerates that
-    /// (it treats `None` as one tenant bucket, same as pre-M_054 rows
-    /// and probe pods).
+    /// Rolled out in two phases (Option H1). **Phase 1** (`fb096e50f`)
+    /// added the field READ-only: store can parse `tenant`, scheduler
+    /// signed `tenant: None`. **Phase 2** (this commit) flips
+    /// `dispatch.rs` to set `tenant` from `attributed_tenant`; the
+    /// rollout precondition (no `Some(_)` token reaches a pre-Phase-1
+    /// store) was satisfied by a wipe deploy. The serde attributes stay
+    /// — they remain the wire-compat mechanism for any future rolling
+    /// upgrade of this struct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
 }
@@ -755,20 +755,22 @@ mod tests {
     /// `PutPath` to a not-yet-rolled store pod fails for the rollout
     /// window.
     ///
-    /// **Two-phase rollout (H1).** This test pins both halves:
+    /// **Wire-shape pin (Option H1, bug_011).** This test pins both
+    /// halves of the serde shape — independent of what `dispatch.rs`
+    /// actually writes (that's `test_hmac_assignment_carries_tenant`
+    /// in `rio-scheduler`):
     ///
     /// 1. `tenant: Some(_)` → the wire body carries `"tenant"` → a
-    ///    pre-tenant store CANNOT parse it. This is the residual
-    ///    hazard that gates Phase 2: whoever flips `dispatch.rs` from
-    ///    `tenant: None` to `tenant: state.attributed_tenant(...)`
-    ///    MUST first confirm the store fleet has fully rolled with the
-    ///    Phase 1 reader (`#[serde(default)]` on `tenant`). Until
-    ///    then, the `Some(_)` body is a wire break.
+    ///    pre-tenant store CANNOT parse it. This was the hazard that
+    ///    gated Phase 2 (`dispatch.rs` setting `tenant` from
+    ///    `attributed_tenant`) on the store fleet first carrying the
+    ///    Phase 1 reader (`fb096e50f`); satisfied via a wipe deploy.
     /// 2. `tenant: None` → `skip_serializing_if = "Option::is_none"`
     ///    omits the key entirely → the wire body is byte-identical to
     ///    the pre-tenant shape → a pre-tenant store parses it fine.
-    ///    This is what makes Phase 1 (scheduler signs `None`) safe to
-    ///    roll in any order against pre-tenant stores.
+    ///    This is what made Phase 1 (scheduler signed `None`) safe to
+    ///    roll in any order against pre-tenant stores, and what keeps
+    ///    `None` (orphaned/recovered nodes) wire-compatible today.
     ///
     /// If this test starts failing on the `Some(_)` half — i.e. the
     /// pre-tenant struct started ACCEPTING `"tenant"` — somebody
@@ -800,8 +802,8 @@ mod tests {
         };
 
         // Half 1 — `tenant: Some(_)` is a wire break against a
-        // pre-tenant store. Phase 2 must not land before the store
-        // fleet has rolled with the Phase 1 reader.
+        // pre-tenant store. This is why Phase 2 had to wait for the
+        // store fleet to carry the Phase 1 reader (fb096e50f).
         let mut with_tenant = test_claims(3600);
         with_tenant.tenant = Some("4f8a3c0e-0000-4000-8000-000000000001".into());
         let body = claims_body(&with_tenant);
@@ -818,8 +820,9 @@ mod tests {
 
         // Half 2 — `tenant: None` is wire-compatible with a
         // pre-tenant store: `skip_serializing_if` omits the key, so
-        // the body has the exact pre-tenant shape. This is what makes
-        // Phase 1 safe to roll in any order.
+        // the body has the exact pre-tenant shape. This is what made
+        // Phase 1 safe to roll in any order, and keeps the
+        // orphaned-node `None` case wire-compatible today.
         let without_tenant = test_claims(3600); // tenant: None
         let body = claims_body(&without_tenant);
         assert!(
