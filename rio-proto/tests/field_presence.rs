@@ -5,46 +5,12 @@
 //! about it" gate. Adding/retyping/re-qualifying a proto3 field is a
 //! wire-compat decision; this test forces the decision to be explicit.
 //!
+//! `types.proto` has its own snapshot in `types_field_presence.rs`.
+//!
 //! See `docs/src/crate-structure.md` §rio-proto for the rule this guards.
 
-/// Normalized field-declaration lines from a `.proto` source.
-///
-/// Matches any line of the shape `... <name> = <N>;` (optionally with a
-/// trailing `// ...` comment), which covers scalar, `optional`,
-/// `repeated`, `map<K,V>`, message-typed, and enum-value declarations —
-/// all wire-contract-relevant. Normalizes inner whitespace to single
-/// spaces so reflowing a field's leading indent doesn't trip the wire.
-fn extract_fields(proto: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for raw in proto.lines() {
-        // Strip trailing inline comment (after the last `//` that isn't
-        // inside a string — proto field decls have no string literals
-        // before `;`, so the simple split is safe).
-        let line = match raw.find("//") {
-            Some(i) => &raw[..i],
-            None => raw,
-        };
-        let line = line.trim();
-        // Shape: `... = N;` with N all-digit.
-        let Some(body) = line.strip_suffix(';') else {
-            continue;
-        };
-        let Some((head, num)) = body.rsplit_once('=') else {
-            continue;
-        };
-        let num = num.trim();
-        if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let head = head.split_whitespace().collect::<Vec<_>>().join(" ");
-        if head.is_empty() {
-            continue;
-        }
-        out.push(format!("{head} = {num};"));
-    }
-    out.sort();
-    out
-}
+mod common;
+use common::extract_fields;
 
 /// `admin_types.proto` field set matches the checked-in snapshot.
 ///

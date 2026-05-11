@@ -229,10 +229,22 @@ pre-dates this field" — i.e., reproduce the pre-addition behaviour. For
 back-compat-safe). For `repeated`/`map`, empty is usually safe. Every
 such field gets a `tests/roundtrip.rs` case in the consumer crate that
 decodes a byte-slice *without* the new tag and asserts the consumer's
-behaviour matches the old. The `.fields` snapshot tripwire
-(`rio-proto/tests/field_presence.rs`) fails CI on any
-`admin_types.proto` field-set change until the snapshot is regenerated,
-forcing this decision to be explicit.
+behaviour matches the old.
+
+**Field-retype/removal rule.** A retyped or removed proto3 field MUST
+keep its old field number and name `reserved` — never reuse a field
+number on a new type. A same-number retype is wire-incompatible during
+a rolling upgrade in two flavours: cross-wire-type (e.g. `double`
+(fixed64) → `string` (length-delimited)) fails the *whole message*
+decode with an opaque `DecodeError` (prost's per-field `merge` rejects
+the wire-type mismatch, so every other field in the message is lost
+too); same-wire-type (e.g. `int32` → `sint32`, both varint) is worse —
+the receiver silently decodes the wrong value with no error at all.
+
+The `.fields` snapshot tripwires (`rio-proto/tests/field_presence.rs`
+for `admin_types.proto`, `rio-proto/tests/types_field_presence.rs` for
+`types.proto`) fail CI on any field-set change until the corresponding
+snapshot is regenerated, forcing both decisions to be explicit.
 
 ### rio-gateway — Nix protocol frontend
 

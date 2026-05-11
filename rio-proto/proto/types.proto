@@ -377,7 +377,13 @@ message AppendHwPerfSampleRequest {
   // observed_throughput / REF_throughput so factor[d] >= 1 on faster
   // hardware. JSON-string (not three doubles) so the wire format and
   // the jsonb column stay structurally aligned as K evolves.
-  string factor_json = 3;
+  //
+  // Field 3 was `double factor` (single-K alu factor) — wire-incompatible
+  // (fixed64 vs length-delimited) with the K=3 JSON-string form; reserved
+  // so an old builder's tag-3 fixed64 payload is skipped as unknown
+  // instead of failing the whole decode.
+  reserved 3;
+  reserved "factor";
   // Field 4 was `submitting_tenant` (body-supplied). REMOVED: tenant
   // is derived server-side from the signed AssignmentClaims.tenant
   // (r[sched.sla.threat.hw-median-of-medians]); a body field would let
@@ -385,6 +391,7 @@ message AppendHwPerfSampleRequest {
   // the median-of-medians defence.
   reserved 4;
   reserved "submitting_tenant";
+  string factor_json = 5;
 }
 
 // StoreAdminService.GetLoad — per-replica load snapshot for the
