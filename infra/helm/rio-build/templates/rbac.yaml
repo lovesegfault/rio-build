@@ -157,6 +157,9 @@ subjects:
 ---
 # nodeclaim_pool lease (ADR-023 §13b): same in-house rio_lease library
 # as the scheduler — GET/CREATE/UPDATE on one Lease in rio-system.
+# `create` cannot be scoped by `resourceNames` (the object doesn't exist
+# yet), so it is a separate unrestricted rule; `get`/`update` are scoped
+# to the one Lease this component owns (r43 bug_014).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -167,7 +170,11 @@ metadata:
 rules:
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
-    verbs: [get, create, update]
+    verbs: [create]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [{{ .Values.karpenter.nodeclaimPool.leaseName | default "rio-controller-nodeclaim-pool" | quote }}]
+    verbs: [get, update]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -192,6 +199,9 @@ subjects:
 # privilege). In-house election (src/lease/election.rs): GET to observe,
 # CREATE on first acquire, UPDATE (PUT via kube::Api::replace) for
 # renew/steal/step_down. resourceVersion-guarded — 409 on race.
+# `create` cannot be scoped by `resourceNames` (the object doesn't exist
+# yet), so it is a separate unrestricted rule; `get`/`update` are scoped
+# to the one Lease this component owns (r43 bug_014).
 #
 # VM tests won't catch RBAC misconfig here: k3s controller-as-systemd uses
 # admin kubeconfig, bypassing RBAC. The Helm-rendered controller path
@@ -206,7 +216,11 @@ metadata:
 rules:
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
-    verbs: [get, create, update]
+    verbs: [create]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [{{ .Values.scheduler.leaseName | default "rio-scheduler-leader" | quote }}]
+    verbs: [get, update]
   # pod-deletion-cost annotation: leader PATCHes own Pod's
   # metadata.annotations so K8s kills standby first during RollingUpdate.
   # Namespace-wide (NOT resourceNames-scoped) because pod name is dynamic

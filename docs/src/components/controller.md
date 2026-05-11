@@ -437,10 +437,12 @@ The controller requires a dedicated ServiceAccount with a ClusterRole granting (
 | `""` (core) | events | list, watch — node_informer spot-interrupt watcher (`reason=SpotInterrupted`) |
 | `events.k8s.io` | events | create, patch |
 | `batch` | jobs | get, list, watch, create, delete |
+| `karpenter.sh` | nodeclaims | get, list, watch, create, delete — `nodeclaim_pool` reconciler (ADR-023 §13b) |
+| `coordination.k8s.io` | leases | create (any), get/update (scoped to `nodeclaim_pool.lease_name` via `resourceNames`) — namespaced Role `rio-controller-lease` |
 
-Lease permissions (`coordination.k8s.io/leases`: get, create, update) are granted to the **scheduler's** ServiceAccount via a namespaced Role, not the controller (the controller has no leader election).
+Lease permissions (`coordination.k8s.io/leases`) are granted to the scheduler's ServiceAccount via the `rio-scheduler-lease` namespaced Role AND, since ADR-023 §13b, to the controller's via the `rio-controller-lease` namespaced Role — the `nodeclaim_pool` reconciler is leader-elected (see [NodeClaim pool](#nodeclaim-pool-adr-023-13b)). Both Roles split `create` (unrestricted — RBAC cannot scope `create` by `resourceNames`) from `get`/`update` (scoped to the one Lease each component owns). All other controller reconcilers remain non-leader-gated.
 
-> **Note:** The controller does NOT hold permissions for `NetworkPolicies`, `ConfigMaps`, or `Leases`. NetworkPolicies are deployed as static manifests via the Helm chart (see below).
+> **Note:** The controller does NOT hold permissions for `NetworkPolicies` or `ConfigMaps`. NetworkPolicies are deployed as static manifests via the Helm chart (see below).
 
 ## NetworkPolicy
 
@@ -484,7 +486,7 @@ The controller binds its HTTP health server **before** awaiting `connect_forever
 | Gateway | TCP check on SSH port | After scheduler gRPC connection established | — |
 | Scheduler | TCP socket (gRPC health is leader-election-aware, unsuitable for K8s probes on HA standby) | TCP socket — process is live, port is bound. Leader election happens; client-side balancer routes to leader via named-service health. | TCP socket. Startup budget sized for state recovery (reload non-terminal builds from PG). |
 | Store | TCP socket | gRPC health check on named service --- after PostgreSQL + S3 reachable | — |
-| Controller | HTTP `/healthz` (unconditional 200; bound before `connect_forever`) | HTTP `/readyz` — 503 until scheduler gRPC connected, then 200 (single-replica, no leader election) | — |
+| Controller | HTTP `/healthz` (unconditional 200; bound before `connect_forever`) | HTTP `/readyz` — 503 until scheduler gRPC connected, then 200 (single-replica; only the `nodeclaim_pool` reconciler is leader-gated (ADR-023 §13b) — all others run unconditionally) | — |
 | Executor | HTTP `/healthz` + `/readyz` (no gRPC server) | `/readyz` 200 after first accepted heartbeat | HTTP check, `failureThreshold × periodSeconds ≥ 120s` (FUSE mount + cache warm) |
 
 ## Executor Lifecycle
@@ -540,8 +542,10 @@ timeout and a stale IP hangs on SYN). On success: `TriggerGC`, drain
 the `GcProgress` stream, increment `{result="success"}`. Implementation
 at `rio-controller/src/reconcilers/gc_schedule.rs`; wired via
 `spawn_monitored("gc-cron", ...)` gated on `gc_interval_hours > 0`.
-No leader-gate: controller is single-replica by design; `replicas>1`
-misconfig is serialized by the store's `GC_LOCK_ID` advisory lock.
+No leader-gate: controller is single-replica by design (only the
+`nodeclaim_pool` reconciler is leader-gated, ADR-023 §13b — all others,
+including this one, run unconditionally); `replicas>1` misconfig is
+serialized by the store's `GC_LOCK_ID` advisory lock.
 
 ## NodeClaim pool (ADR-023 §13b)
 
