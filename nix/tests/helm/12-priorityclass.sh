@@ -45,6 +45,17 @@ grep -q 'type: MostAllocated' <<<"$kscfg" || {
   echo "FAIL: KubeSchedulerConfiguration missing MostAllocated scoring" >&2
   exit 1
 }
+# r41 bug_028: MostAllocated alone isn't enough — NodeResourcesBalancedAllocation
+# is in the default Score plugin set and counteracts it (prefers balanced
+# utilization → spreads, breaking the §Simulator-shares-accounting contract
+# ffd::simulate() depends on). The disable must be explicit.
+ks_disabled=$(grep -A3 'disabled:' <<<"$kscfg" || true)
+grep -q 'NodeResourcesBalancedAllocation' <<<"$ks_disabled" || {
+  echo "FAIL: KubeSchedulerConfiguration must disable NodeResourcesBalancedAllocation" \
+       "(default Score plugin actively spreads — counteracts MostAllocated" \
+       "bin-packing; ffd::simulate() assumes the opposite — r41 bug_028)" >&2
+  exit 1
+}
 for crb in kube-build-scheduler kube-build-volume-scheduler; do
   crb_doc=$(yq -N "select(.kind==\"ClusterRoleBinding\" and .metadata.name==\"$crb\")" "$out")
   grep -q 'kind: ClusterRoleBinding' <<<"$crb_doc" || {

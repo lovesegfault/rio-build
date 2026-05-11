@@ -7,6 +7,30 @@ leaderElection:
   resourceNamespace: {{ .Values.namespaces.system.name }}
 profiles:
   - schedulerName: kube-build-scheduler
+    plugins:
+      score:
+        # r41 bug_028: NodeResourcesBalancedAllocation is enabled in the
+        # default Score plugin set at weight 1 and prefers nodes whose
+        # CPU/mem/storage utilizations are CLOSE TO EACH OTHER — a
+        # spread heuristic that actively penalizes the highly-CPU-skewed
+        # placements MostAllocated is selecting for. With both active,
+        # the production scheduler diverges from `ffd::simulate()`'s
+        # MostAllocated-on-CPU score, breaking the
+        # §Simulator-shares-accounting contract: `cover_deficit`
+        # under-mints (FFD says N nodes; reality needs N+k because pods
+        # spread) and `consolidate::reap_idle` reads residuals from a
+        # different bin-packing than the model assumes. Standard
+        # upstream packing-profile pattern (see kube-scheduler docs:
+        # "MostAllocated" vs "RequestedToCapacityRatio").
+        # PodTopologySpread (weight 2, system-default kubernetes.io/
+        # hostname maxSkew=5) is left enabled: its System defaultingType
+        # derives the pod selector from Services/RS/RC/STS — not Jobs —
+        # so for Job-owned builder pods the default selector is empty
+        # and the plugin Skips. ImageLocality is left enabled: prefers
+        # nodes with the builder image cached, which correlates with
+        # already-running-builders (aligned with packing, not against).
+        disabled:
+          - name: NodeResourcesBalancedAllocation
     pluginConfig:
       - name: NodeResourcesFit
         args:
