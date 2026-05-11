@@ -202,16 +202,27 @@ $ctx is the map to hasKey against; $key the field name; $val the value.
 */}}
 {{/*
 k8s Quantity string ("500Gi" / "2Ti") → bytes. Minimal: only the
-Gi/Ti suffixes the chart uses (`karpenter.dataVolumeSize`). Unsuffixed
-values are passed through as-is.
+integer Ki/Mi/Gi/Ti suffixes the chart uses (`karpenter.dataVolumeSize`).
+Fractional ("1.5Ti") and unrecognized ("500G", decimal SI) Quantities
+`fail` at `helm template` time — sprig `int64` would silently coerce
+them to 0, which zeroes `max_node_disk` in `controller.toml` and makes
+`cover::sizing`'s over-cap filter drop every intent (a fleet-wide
+provisioning halt with no alert). Bare integers are bytes.
 */}}
 {{- define "rio.quantityBytes" -}}
-{{- if hasSuffix "Gi" . -}}
-{{- mul (trimSuffix "Gi" . | int64) 1073741824 -}}
-{{- else if hasSuffix "Ti" . -}}
-{{- mul (trimSuffix "Ti" . | int64) 1099511627776 -}}
+{{- $q := toString . -}}
+{{- if not (regexMatch "^[0-9]+(Ki|Mi|Gi|Ti)?$" $q) -}}
+{{- fail (printf "rio.quantityBytes: %q is not an integer Quantity with a Ki/Mi/Gi/Ti suffix or no suffix; fix karpenter.dataVolumeSize in values.yaml" .) -}}
+{{- else if hasSuffix "Ti" $q -}}
+{{- mul (trimSuffix "Ti" $q | int64) 1099511627776 -}}
+{{- else if hasSuffix "Gi" $q -}}
+{{- mul (trimSuffix "Gi" $q | int64) 1073741824 -}}
+{{- else if hasSuffix "Mi" $q -}}
+{{- mul (trimSuffix "Mi" $q | int64) 1048576 -}}
+{{- else if hasSuffix "Ki" $q -}}
+{{- mul (trimSuffix "Ki" $q | int64) 1024 -}}
 {{- else -}}
-{{- int64 . -}}
+{{- int64 $q -}}
 {{- end -}}
 {{- end -}}
 
