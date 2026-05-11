@@ -15,8 +15,10 @@
 //!   tenants on one Node. Delete the NodeClaim (Karpenter handles
 //!   cordon+drain via finalizer).
 //!
-//! Dead reaping is capped at `min(3, ⌈5%·|live|⌉)` per tick — a false-
-//! positive scheduler signal can't drain the fleet in one tick.
+//! Dead reaping is capped at `min(3, ⌈5%·|registered|⌉)` per tick
+//! (registered ∧ ¬terminating, the only population `classify` can emit
+//! `Dead` for) — a false-positive scheduler signal can't drain the
+//! fleet in one tick.
 
 use std::collections::{HashMap, HashSet};
 
@@ -41,10 +43,48 @@ const LAUNCH_FAILED_REASONS: &[&str] = &[
     "NodeClassNotReady",
 ];
 
-/// Per-tick dead-node reap cap: `min(3, ⌈5%·|live|⌉)`. ICE/boot-timeout
+/// Per-tick dead-node reap cap: `min(3, ⌈5%·N⌉)`. ICE/boot-timeout
 /// reaps are NOT capped — those NodeClaims have no backing capacity.
-fn dead_reap_cap(live: usize) -> usize {
-    3.min((0.05 * live as f64).ceil() as usize).max(1)
+///
+/// `N` is the **registered, non-terminating** population — the only
+/// claims `classify` can ever emit `ReapReason::Dead` for. Counting
+/// in-flight or already-terminating claims would inflate the cap during
+/// scale-up bursts (5 registered + 60 in-flight → cap=3 → 60% of the
+/// registered fleet reapable in one tick, contradicting the module-doc
+/// "false-positive scheduler signal can't drain the fleet" claim).
+fn dead_reap_cap(registered: usize) -> usize {
+    3.min((0.05 * registered as f64).ceil() as usize).max(1)
+}
+
+/// Record a successfully-reaped NodeClaim's consequences: increment
+/// `rio_controller_nodeclaim_reaped_total`, mask the cell if ICE, and
+/// queue the name for `inflight_created` cleanup.
+///
+/// Called from BOTH the `Ok(_)` and `Err(404)` arms of the
+/// `delete()` match in [`reap_unhealthy`] — a 404 means Karpenter GC
+/// raced the controller's delete, but the claim *was* reaped and the
+/// cell is just as unfulfillable as if the controller had won the race.
+/// Diverging the arms (the original bug) leaves the cell unmasked for
+/// the rest of the tick → `cover_deficit` re-mints into it →
+/// `report_unfulfillable` never marks `IceBackoff` → the
+/// `RioNodeclaimPoolIceMaskedHigh` alert undercounts.
+fn record_reap(
+    reason: ReapReason,
+    cell: Cell,
+    name: &str,
+    ice_cells: &mut Vec<Cell>,
+    reaped_names: &mut Vec<String>,
+) {
+    metrics::counter!(
+        "rio_controller_nodeclaim_reaped_total",
+        "reason" => reason.as_str(),
+        "cell" => cell.to_string(),
+    )
+    .increment(1);
+    if reason == ReapReason::Ice {
+        ice_cells.push(cell);
+    }
+    reaped_names.push(name.to_string());
 }
 
 /// Why a NodeClaim is being reaped. `as_str` is the
@@ -238,7 +278,14 @@ pub async fn reap_unhealthy(
 ) -> anyhow::Result<(Vec<Cell>, Vec<String>)> {
     let dead: HashSet<&str> = dead_nodes.iter().map(String::as_str).collect();
     let to_reap = classify(live, &dead, sketches, cfg, now_secs);
-    let cap = dead_reap_cap(live.len());
+    // Cap the dead-reap rate against the population it can actually reap
+    // from — `classify` only emits `ReapReason::Dead` for
+    // `registered && !terminating()`. See `dead_reap_cap` doc.
+    let registered_count = live
+        .iter()
+        .filter(|n| n.registered && !n.terminating())
+        .count();
+    let cap = dead_reap_cap(registered_count);
     let mut dead_reaped = 0usize;
     let mut ice_cells = Vec::new();
     let mut reaped_names = Vec::new();
@@ -254,22 +301,14 @@ pub async fn reap_unhealthy(
         match nodeclaims.delete(&n.name, &DeleteParams::default()).await {
             Ok(_) => {
                 debug!(name = %n.name, %cell, reason = reason.as_str(), "reaped unhealthy NodeClaim");
-                metrics::counter!(
-                    "rio_controller_nodeclaim_reaped_total",
-                    "reason" => reason.as_str(),
-                    "cell" => cell.to_string(),
-                )
-                .increment(1);
-                if reason == ReapReason::Ice {
-                    ice_cells.push(cell);
-                }
-                reaped_names.push(n.name.clone());
+                record_reap(reason, cell, &n.name, &mut ice_cells, &mut reaped_names);
             }
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                // Already gone (Karpenter GC raced us). Treat as
-                // reaped: the entry should not feed detect_vanished
-                // either way (we'd already classified it).
-                reaped_names.push(n.name.clone());
+                // Already gone (Karpenter GC raced us). Apply the FULL
+                // `Ok(_)` consequence — the claim *was* reaped, just not
+                // by us. See `record_reap` doc.
+                debug!(name = %n.name, %cell, reason = reason.as_str(), "unhealthy NodeClaim already gone (GC raced); recorded reap");
+                record_reap(reason, cell, &n.name, &mut ice_cells, &mut reaped_names);
             }
             Err(e) => {
                 warn!(name = %n.name, error = %e, "unhealthy NodeClaim delete failed; skipping");
@@ -515,13 +554,99 @@ mod tests {
         // All 5 classified Dead; cap applied at delete-time, not here.
         assert_eq!(r.len(), 5);
         assert!(r.iter().all(|(_, reason)| *reason == ReapReason::Dead));
-        // Cap: 10 live → min(3, ⌈0.5⌉)=min(3,1)=1.
+        // Cap: 10 registered → min(3, ⌈0.5⌉)=min(3,1)=1.
         assert_eq!(dead_reap_cap(10), 1);
-        // 100 live → min(3, ⌈5⌉)=3.
+        // 100 registered → min(3, ⌈5⌉)=3.
         assert_eq!(dead_reap_cap(100), 3);
         assert_eq!(dead_reap_cap(40), 2);
-        // 0 live → 1 floor (avoids 0-cap on empty fleet edge).
+        // 0 registered → 1 floor (avoids 0-cap on empty fleet edge).
         assert_eq!(dead_reap_cap(0), 1);
+    }
+
+    /// `dead_reap_cap` is computed over the **registered, non-terminating**
+    /// population, not all owned NodeClaims. During scale-up
+    /// (5 registered + 60 in-flight + 2 terminating) the cap must stay
+    /// at 1 (`⌈5%·5⌉`), not inflate to 3 (`⌈5%·67⌉` clamped) —
+    /// `classify` can only emit `ReapReason::Dead` for the registered
+    /// 5, so a cap of 3 would let 60% of the reachable fleet be reaped
+    /// in one tick.
+    #[test]
+    fn dead_reap_cap_filters_to_reapable_population() {
+        use super::super::ffd::tests::set_terminating;
+        // 5 registered + 60 in-flight + 2 terminating.
+        let mut live: Vec<LiveNode> = (0..5)
+            .map(|k| node(&format!("reg{k}"), "h", CapacityType::Spot, 8, 0, 0))
+            .collect();
+        for k in 0..60 {
+            let mut n = node(&format!("inf{k}"), "h", CapacityType::Spot, 8, 0, 0);
+            n.registered = false;
+            live.push(n);
+        }
+        for k in 0..2 {
+            live.push(set_terminating(node(
+                &format!("term{k}"),
+                "h",
+                CapacityType::Spot,
+                8,
+                0,
+                0,
+            )));
+        }
+        // The exact filter expression `reap_unhealthy` feeds `dead_reap_cap`.
+        let registered_count = live
+            .iter()
+            .filter(|n| n.registered && !n.terminating())
+            .count();
+        assert_eq!(registered_count, 5);
+        assert_eq!(
+            dead_reap_cap(registered_count),
+            1,
+            "5 registered → ⌈5%·5⌉=1"
+        );
+        // The pre-fix denominator (all owned claims) would inflate the
+        // cap to 3, allowing 60% of the registered fleet to drain.
+        assert_eq!(
+            dead_reap_cap(live.len()),
+            3,
+            "67 owned → ⌈5%·67⌉ clamped to 3"
+        );
+    }
+
+    /// `record_reap` applies the FULL reap consequence — ICE-mask the
+    /// cell when `reason == Ice`, and queue the name. Both the `Ok(_)`
+    /// and `Err(404)` arms of `reap_unhealthy` call it; this pins the
+    /// shared-arm semantics so the 404 arm can never silently drop the
+    /// ICE mask again (the original bug).
+    #[test]
+    fn record_reap_pushes_ice_mask_and_name() {
+        let cell = Cell("h".into(), CapacityType::Spot);
+        let mut ice_cells = Vec::new();
+        let mut reaped_names = Vec::new();
+        // ICE: cell is masked AND name queued.
+        record_reap(
+            ReapReason::Ice,
+            cell.clone(),
+            "nc-ice",
+            &mut ice_cells,
+            &mut reaped_names,
+        );
+        assert_eq!(ice_cells, vec![cell.clone()]);
+        assert_eq!(reaped_names, vec!["nc-ice"]);
+        // Non-ICE: name queued but cell NOT masked (capacity exists,
+        // boot/heartbeat failed — `cover_deficit` may re-mint there).
+        for reason in [ReapReason::BootTimeout, ReapReason::Dead] {
+            let mut ice_cells = Vec::new();
+            let mut reaped_names = Vec::new();
+            record_reap(
+                reason,
+                cell.clone(),
+                "nc-other",
+                &mut ice_cells,
+                &mut reaped_names,
+            );
+            assert!(ice_cells.is_empty(), "{reason:?} must not ICE-mask");
+            assert_eq!(reaped_names, vec!["nc-other"]);
+        }
     }
 
     /// Registered nodes are never ICE/BootTimeout (they made it).
