@@ -286,7 +286,7 @@ Likely causes: broken AMI image (post-release), nodeadm regression, EC2
 firmware update, NVMe reorder breaking instance-store mounts. Diagnose:
 `kubectl get nodeclaims -o wide`, then SSM/EC2-serial-console on a live
 in-flight claim before the reaper deletes it. Stop the burn:
-`kubectl scale --replicas=0 deploy/rio-controller` (the loop has no value),
+`kubectl -n rio-system scale --replicas=0 deploy/rio-controller` (the loop has no value),
 then fix the AMI and re-roll.
 
 ### RioNodeclaimPool NoHostingClass
