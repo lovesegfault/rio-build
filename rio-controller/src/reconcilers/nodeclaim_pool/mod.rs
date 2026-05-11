@@ -325,10 +325,33 @@ impl NodeClaimPoolConfig {
     /// default must be non-zero — a 0 default would reap every
     /// NodeClaim of an unseeded cell at the next 10s tick (well before
     /// ~18s real boot completes).
+    ///
+    /// r40 bug_024: routes through [`Cell::parse`] so `"h:od"` and
+    /// `"h:on-demand"` are equivalent — the same normalization
+    /// `CellSketches::seed()`, the scheduler's `cell_key_serde`, and
+    /// `nix/tests/helm/18-metal-feature-routing.sh §5` already apply.
+    /// Without this, an operator who writes `"metal-x86:on-demand": 600.0`
+    /// (matching the Karpenter `capacityTypes` vocabulary two lines
+    /// away) passes helm-lint, seeds the DDSketch, and STILL falls to
+    /// `default_lead_time_seed=30s` here — `health::classify` reaps
+    /// every ~600s metal boot at the `2×30=60s` timeout, the exact
+    /// `RioNodeclaimPoolBootTimeoutLoop` this seed exists to prevent.
+    ///
+    /// Precedence: the canonical `"<h>:od"` key wins over the alias
+    /// `"<h>:on-demand"` when both are present (e.g. layered helm values
+    /// where one overlay uses the Karpenter form and the base uses the
+    /// short form). The `Display`-form `.get()` runs first; the
+    /// `Cell::parse` scan is only the fallback — a `find_map` over the
+    /// `HashMap` alone would be non-deterministic when both keys exist.
     pub fn seed_for(&self, cell: &Cell) -> f64 {
         self.lead_time_seed
             .get(&cell.to_string())
             .copied()
+            .or_else(|| {
+                self.lead_time_seed
+                    .iter()
+                    .find_map(|(k, v)| (Cell::parse(k).as_ref() == Some(cell)).then_some(*v))
+            })
             .unwrap_or(self.default_lead_time_seed)
     }
 
@@ -1634,6 +1657,50 @@ mod tests {
         assert_eq!(cfg.min_consolidation_time_for(&cell("metal")), Some(400.0));
         // Unmatched cell → None.
         assert_eq!(cfg.min_consolidation_time_for(&cell("hi-ebs-x86")), None);
+    }
+
+    /// r40 bug_024: `seed_for` accepts both `"h:od"` and `"h:on-demand"`
+    /// key forms — matching `CellSketches::seed()`, the scheduler's
+    /// `cell_key_serde`, and helm test 18 §5. Without this, an operator
+    /// who writes the Karpenter `on-demand` vocabulary (one keystroke
+    /// from `capacityTypes: ["on-demand"]`) passes every static gate,
+    /// seeds the dashboard sketch, and STILL gets `default_lead_time_seed`
+    /// from `health::classify` → boot-timeout reap loop.
+    #[test]
+    fn seed_for_accepts_on_demand_key_form() {
+        let cell = Cell("metal-x86".into(), CapacityType::OnDemand);
+        for key in ["metal-x86:od", "metal-x86:on-demand"] {
+            let cfg = NodeClaimPoolConfig {
+                lead_time_seed: [(key.to_string(), 600.0)].into(),
+                default_lead_time_seed: 30.0,
+                ..Default::default()
+            };
+            assert_eq!(cfg.seed_for(&cell), 600.0, "key form `{key}` should match");
+        }
+        // Both forms present → canonical `:od` wins (deterministic, not
+        // HashMap iteration order). Pins the `.get()` -> `or_else(find_map)`
+        // precedence; a regression to a bare `find_map` flakes here.
+        let cfg = NodeClaimPoolConfig {
+            lead_time_seed: [
+                ("metal-x86:od".to_string(), 600.0),
+                ("metal-x86:on-demand".to_string(), 700.0),
+            ]
+            .into(),
+            default_lead_time_seed: 30.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.seed_for(&cell),
+            600.0,
+            "`:od` precedence over `:on-demand`"
+        );
+        // Absent → default.
+        let cfg = NodeClaimPoolConfig {
+            lead_time_seed: HashMap::new(),
+            default_lead_time_seed: 30.0,
+            ..Default::default()
+        };
+        assert_eq!(cfg.seed_for(&cell), 30.0);
     }
 
     /// `fallback_cell`: prefers `(reference_hw_class, Spot)` when its
