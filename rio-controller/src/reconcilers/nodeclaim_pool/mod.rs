@@ -169,8 +169,27 @@ type PlaceableSet = Option<Arc<HashSet<String>>>;
 /// `intents.retain(|i| i.ready)` gate could not.
 ///
 /// `watch` semantics: the Pool reconciler reads the latest snapshot
-/// each tick (no event-per-publish; staleness bounded by the 10s tick
-/// cadence on both sides). `Arc<HashSet>` so `borrow().clone()` is O(1).
+/// each tick (no event-per-publish). Staleness is bounded by the 10s
+/// tick cadence on both sides **while the lease is held and the
+/// scheduler is reachable**. During a scheduler outage the producer
+/// (`reconcile_once`) early-returns on a ⊥ tick and, after
+/// `BOT_TICKS_BEFORE_CONSOLIDATE_ONLY` consecutive ⊥-ticks, switches
+/// to `consolidate_only` — neither path republishes, so the last-good
+/// set persists for the duration. That staleness is benign by
+/// construction: the only consumer (`pool/jobs::reconcile`) fetches
+/// its own intent list from the SAME scheduler before calling
+/// [`PlaceableGate::retain`], so when the producer is in
+/// `consolidate_only` the consumer has `intents=[]` and
+/// `scheduler_err.is_some()` — the stale set has nothing to filter and
+/// `queued_known=None` keeps `reap_excess_pending` fail-closed. The
+/// stale set is observable only across the recovery edge (≤1 tick) or
+/// under a one-sided RPC flap, where it admits a bounded subset of
+/// previously-confirmed-placeable IDs that self-corrects on the next
+/// successful FFD tick. Lease loss is the contrasting case and DOES
+/// reset to `None` (see [`ControllerLeaseHooks`]): there the stale set
+/// belongs to a *different replica's* FFD state and would drive
+/// `reap_excess_pending` against the new leader's Jobs.
+/// `Arc<HashSet>` so `borrow().clone()` is O(1).
 #[derive(Clone)]
 pub struct PlaceableGate(tokio::sync::watch::Receiver<PlaceableSet>);
 
@@ -610,6 +629,9 @@ pub struct NodeClaimPoolReconciler {
     /// Publish side of [`PlaceableGate`]. Written once per successful
     /// FFD tick with the `intent_id`s placed on `Registered=True`
     /// nodes; the `pool/jobs` reconciler reads it via `Ctx.placeable`.
+    /// NOT republished on ⊥-ticks or in `consolidate_only` (intentional
+    /// — see [`PlaceableGate`] for why the resulting staleness is
+    /// benign); reset to `None` on lease loss.
     placeable_tx: tokio::sync::watch::Sender<PlaceableSet>,
     /// Lease-transition flags from [`ControllerLeaseHooks`]. Checked
     /// at the top of each run-loop tick so acquire/lose edges do real
@@ -1282,6 +1304,14 @@ impl NodeClaimPoolReconciler {
     /// Consolidate-only mode: scheduler has been unreachable for
     /// [`BOT_TICKS_BEFORE_CONSOLIDATE_ONLY`] ticks. Don't grow the
     /// fleet; DO keep reaping idle/unhealthy (kube-only reads).
+    ///
+    /// `placeable_tx` is intentionally NOT republished here (nor on the
+    /// pre-threshold ⊥-tick early-return in `reconcile_once`): the FFD
+    /// sim needs scheduler intents we don't have. Publishing `None`
+    /// would unarm the gate for no benefit — `pool/jobs::reconcile`
+    /// can't reach the scheduler either, so it has `intents=[]` and the
+    /// stale set filters nothing. See [`PlaceableGate`] for the full
+    /// staleness argument and the lease-loss contrast.
     async fn consolidate_only(&mut self) -> anyhow::Result<()> {
         debug!(
             consecutive_bot = self.consecutive_bot_ticks,
