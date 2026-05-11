@@ -932,12 +932,14 @@ karpenter:
   # Root volume (/dev/xvda — single root, NixOS doesn't split OS/data).
   # boot.growPartition expands / to fill on first boot. MUST cover the
   # largest pod ephemeral-storage request a NodeClaim can carry:
-  # pod_ephemeral_request(sla.maxDisk, poolDefaults.fuseCacheBytes)
-  #   = maxDisk × 1.5 + fuseCacheBytes + 1Gi
-  #   = 200×1.5 + 50 + 1 = 351Gi
-  # plus ~10% kubelet eviction-threshold/image-cache reserve. nvme
-  # hw-classes ignore this (instance-store provides ephemeral-storage).
-  # 14-disk-ceiling.sh asserts the inequality.
+  # pod_ephemeral_request(sla.maxDisk, headroom(n_eff=1), poolDefaults.fuseCacheBytes)
+  #   = maxDisk × 1.95 + fuseCacheBytes + 1Gi   (worst-case headroom; jobs.rs::pod_ephemeral_request)
+  #   = 200×1.95 + 50 + 1 = 441Gi
+  # `max_node_disk` is dataVolumeSize × 0.9 (kubelet eviction/image-cache
+  # reserve), so the binding inequality is 500×0.9 = 450 ≥ 441 — only ~9Gi
+  # of slack. Bumping `maxDisk` or `fuseCacheBytes` will trip
+  # 14-disk-ceiling.sh; raise `dataVolumeSize` first. nvme hw-classes
+  # ignore this (instance-store provides ephemeral-storage).
   dataVolumeSize: 500Gi
   # gp3 provisioned IOPS+throughput (max for gp3). Build workloads are
   # IOPS-bound; baseline 3000 throttles -j32+. gp3 has no separate
