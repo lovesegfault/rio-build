@@ -595,9 +595,9 @@ the closed-loop `forecast_warm_hit_ratio` Schmitt widens/narrows the
 quantile by `Δq=0.02` per firing, capped at `q ≤ 0.99` and
 `lead_time ≤ sla.maxLeadTime`.
 
-r[ctrl.nodeclaim.consolidate-na+4]
+r[ctrl.nodeclaim.consolidate-na+5]
 An empty NodeClaim is kept while
-`λ(t)·𝔼[c_arrival·𝟙{c_arrival ≤ cores}] > cores/q_0.5(boot[h,cap])`.
+`λ(t)·𝔼[c_arrival | c_arrival ≤ cores] > cores/q_0.5(boot[h,cap])`.
 `λ(t)` is the windowed empirical arrival rate over `[t, t+W)` (window
 `W = q_0.5(boot)/2 ≥ 5s`) on right-censored `idle_gap[h,cap]`; the
 fitting-core term is the current tick's per-cell mean over `intents`

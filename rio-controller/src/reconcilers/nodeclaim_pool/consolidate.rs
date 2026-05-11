@@ -1,7 +1,7 @@
 //! Windowed-rate idle-node consolidation.
 //!
 //! Per `r[ctrl.nodeclaim.consolidate-na]`: an empty Registered NodeClaim
-//! is kept while `λ(t)·𝔼[c_arr·𝟙{≤cores}] > cores/q_0.5(boot)`; λ is
+//! is kept while `λ(t)·𝔼[c_arr | c_arr ≤ cores] > cores/q_0.5(boot)`; λ is
 //! the windowed empirical arrival rate over `[t, t+W)` on
 //! right-censored `idle_gap` events (W = `q_0.5(boot)/2`). The first
 //! `t` at which the inequality flips false is `consolidate_after(t)` —
@@ -62,7 +62,7 @@ pub struct IdleGapEvent {
 /// regardless of arrival rate. The windowed form is non-zero as long
 /// as any uncensored event falls within `boot_median/2` of `t`. Step
 /// `w/2` keeps overlapping coverage.
-// r[impl ctrl.nodeclaim.consolidate-na+4]
+// r[impl ctrl.nodeclaim.consolidate-na+5]
 pub fn consolidate_after(
     events: &[IdleGapEvent],
     e_fitting_cores: f64,
@@ -98,7 +98,7 @@ pub fn consolidate_after(
     // requires `w < boot_median`. The bug_050 (`fetcher-*`) and qa-fix-b
     // (`*`) policy floors BOTH exceed `boot_median`, making the NA model
     // structurally dead — `consolidate_after` returned `floor`
-    // unconditionally. The spec (`r[ctrl.nodeclaim.consolidate-na+4]`)
+    // unconditionally. The spec (`r[ctrl.nodeclaim.consolidate-na+5]`)
     // says `W = q_0.5(boot)/2`; the implementation must match. Decoupling
     // restores satisfiability for `E[c_fit] > node_cores/2` (≈1 build
     // per node). For bin-packed cells (`E ≤ cores/2`, the §13b
@@ -128,10 +128,12 @@ pub fn consolidate_after(
     max_t.max(floor)
 }
 
-/// `𝔼[c_arrival · 𝟙{c_arrival ≤ node_cores}]` over this tick's
-/// placeable intents — mean cores of intents that would fit on a
-/// `node_cores` node. Spec: 0 when intents is ⊥ or empty (caller
-/// passes `&[]` in consolidate-only mode).
+/// `𝔼[c_arrival | c_arrival ≤ node_cores]` over this tick's
+/// placeable intents — the **conditional** mean cores of intents that
+/// would fit on a `node_cores` node. NOT `𝔼[c·𝟙{c≤cores}]` — λ is
+/// already the fitting-restricted hazard, so dividing by `|fitting|`
+/// is correct (r42 bug_025). Spec: 0 when intents is ⊥ or empty
+/// (caller passes `&[]` in consolidate-only mode).
 pub fn e_fitting_cores(placeable: &[Placement], node_cores: u32) -> f64 {
     let fitting: Vec<u32> = placeable
         .iter()
@@ -160,7 +162,7 @@ fn hold_open_threshold(na: f64, max: Option<f64>) -> f64 {
 /// Filter `placeable` to intents that can ARRIVE at a node in `cell`
 /// — the per-cell partition `e_fitting_cores` computes its mean over.
 ///
-/// r35 bug_023: `r[ctrl.nodeclaim.consolidate-na+4]` says "per-cell
+/// r35 bug_023: `r[ctrl.nodeclaim.consolidate-na+5]` says "per-cell
 /// mean over `intents`" — §13e removed the `kind` filter from
 /// `GetSpawnIntents`, so a global mean over `placeable` blends fetcher
 /// (`c*≈1`) and builder intents and biases `E[c_fit]` for builder
@@ -522,9 +524,9 @@ mod tests {
         assert_eq!(consolidate_after(&cens, 100.0, 8, 10.0, None, None), 5.0);
     }
 
-    /// r[ctrl.nodeclaim.consolidate-na+4]: floor = q_0.5(boot)/2. With
+    /// r[ctrl.nodeclaim.consolidate-na+5]: floor = q_0.5(boot)/2. With
     /// no events (λ=0), break-even fires immediately → returns floor.
-    // r[verify ctrl.nodeclaim.consolidate-na+4]
+    // r[verify ctrl.nodeclaim.consolidate-na+5]
     #[test]
     fn consolidate_after_respects_floor() {
         // boot_median=40 → floor=20. λ=0 → immediate break-even → 20.
@@ -628,7 +630,7 @@ mod tests {
     /// filter is the SAME predicate FFD's `hw_admits` uses, NOT a
     /// `hw_class_names.is_empty()` pass-through (which over-counts
     /// hw-agnostic intents on fetcher cells).
-    // r[verify ctrl.nodeclaim.consolidate-na+4]
+    // r[verify ctrl.nodeclaim.consolidate-na+5]
     #[test]
     fn e_fitting_cores_per_cell_excludes_cross_kind() {
         use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm};
@@ -763,7 +765,7 @@ mod tests {
     /// the NA-model floor `boot_median/2` (~15s). The operator-settable
     /// per-class `min_consolidation_time` is the structural close — the
     /// NA model is correct, the policy floor was missing.
-    // r[verify ctrl.nodeclaim.consolidate-na+4]
+    // r[verify ctrl.nodeclaim.consolidate-na+5]
     #[test]
     fn consolidate_after_respects_min_floor() {
         // boot_median=30 → NA floor = 15. With λ=0 (no events) the
@@ -955,7 +957,7 @@ mod tests {
     /// pressure" only for ~1-intent/node cells. This fixture is that case
     /// (`E[c_fit] = node_cores`); the bin-packed inverse is
     /// `consolidate_after_floor_binds_for_bin_packed_cells` below.
-    // r[verify ctrl.nodeclaim.consolidate-na+4]
+    // r[verify ctrl.nodeclaim.consolidate-na+5]
     #[test]
     fn consolidate_after_extends_past_policy_floor() {
         // Builder cell shape: boot_median=18, min=60 (qa-fix-b chart
@@ -980,7 +982,7 @@ mod tests {
     /// the model improves on. Pin the bound so a future change to `w`
     /// or the keep-condition is forced to reason about the bin-packed
     /// case, not just `E = cores`.
-    // r[verify ctrl.nodeclaim.consolidate-na+4]
+    // r[verify ctrl.nodeclaim.consolidate-na+5]
     #[test]
     fn consolidate_after_floor_binds_for_bin_packed_cells() {
         // Builder shape: boot=30, node=64, intents packing 4-per-node
@@ -1002,7 +1004,7 @@ mod tests {
     /// karpenter.nodeclaimPool.minConsolidationTime) but the floor still
     /// holds — silently dropping below it would burn a boot every
     /// `max_consolidation_time` seconds.
-    // r[verify ctrl.nodeclaim.consolidate-na+4]
+    // r[verify ctrl.nodeclaim.consolidate-na+5]
     #[test]
     fn consolidate_after_max_t_clamped_at_floor() {
         // boot=18, min=60 → floor=60. max=10 < floor.
@@ -1020,7 +1022,7 @@ mod tests {
     /// on-demand` override, ICE-masked spot, InterruptRunaway — is NOT
     /// demand for `(h, Spot)`. Counting it inflates `e_fitting_cores` and
     /// over-extends the spot cell's hold-open.
-    // r[verify ctrl.nodeclaim.consolidate-na+4]
+    // r[verify ctrl.nodeclaim.consolidate-na+5]
     #[test]
     fn placeable_for_cell_respects_capacity_type() {
         use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm};
