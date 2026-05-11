@@ -592,13 +592,27 @@ pub struct NodeClaimPoolReconciler {
     /// In-memory only — restart drops one tick's worth of edges.
     prev_idle: HashMap<String, f64>,
     /// `name → cell` for NodeClaims `cover_deficit` created and that
-    /// haven't yet appeared `Registered`/reaped. Next-tick diff against
-    /// `live`: a name in here but absent from `live` ⇒ Karpenter GC'd
-    /// it (`Launched=False reason=LaunchFailed/InsufficientCapacity` →
+    /// haven't yet been observed Registered, terminating, or absent.
+    /// Tick-over-tick diff against `live`: a name in here but absent
+    /// from `live` AND not reaped by us ⇒ Karpenter GC'd it
+    /// (`Launched=False reason=LaunchFailed/InsufficientCapacity` →
     /// delete in ~1s, faster than the 10s tick). [`health::classify`]'s
     /// `Launched=False > timeout` never fires for those — the claim is
     /// gone before it's observed. ICE-masked via
     /// [`health::detect_vanished`].
+    ///
+    /// Mutators (any new writer must keep this list current — a fifth
+    /// path that deletes/forgets a tracked claim without showing up
+    /// here is exactly the bug_012/bug_020 shape):
+    /// 1. `cover_deficit` `extend()`s the names it `create()`d.
+    /// 2. `clear()` on config reload (the config-hash gate).
+    /// 3. [`health::detect_vanished`] retains in-flight, drops
+    ///    registered/terminating/vanished — runs in BOTH
+    ///    `reconcile_once` and `consolidate_only`.
+    /// 4. Reap-name removal: `reap_unhealthy` returns the names it
+    ///    `delete()`d; both callers `remove()` them BEFORE
+    ///    `detect_vanished` so the controller's own reaps aren't
+    ///    misread as Karpenter GC.
     inflight_created: HashMap<String, Cell>,
     /// Count of consecutive ticks where `GetSpawnIntents` returned ⊥
     /// (RPC error). Saturates at `u8::MAX`; reset on first success.
@@ -965,7 +979,7 @@ impl NodeClaimPoolReconciler {
         // `live`; `detect_vanished` catches claims Karpenter already
         // GC'd between ticks (the ~1s GC < 10s tick race the live
         // Part-B finding hit).
-        let mut ice_cells = health::reap_unhealthy(
+        let (mut ice_cells, reaped) = health::reap_unhealthy(
             &self.nodeclaims,
             &live,
             &intents.dead_nodes,
@@ -974,6 +988,14 @@ impl NodeClaimPoolReconciler {
             now,
         )
         .await?;
+        // r40 bug_020: drop the controller's own reaps from inflight_created
+        // BEFORE detect_vanished scans, so they're not misread as Karpenter
+        // GC on the next tick. (reap_idle only reaps registered claims —
+        // detect_vanished's `Some(n) if n.registered → false` arm already
+        // drops those.)
+        for name in &reaped {
+            self.inflight_created.remove(name);
+        }
         ice_cells.extend(health::detect_vanished(&mut self.inflight_created, &live));
         let mut masked: Vec<String> = intents.ice_masked_cells.clone();
         masked.extend(ice_cells.iter().map(Cell::to_string));
@@ -1054,8 +1076,21 @@ impl NodeClaimPoolReconciler {
         // ICE-timeout detection still runs on `live`. The returned
         // ice_cells are dropped — `report_unfulfillable` needs the
         // scheduler reachable.
-        health::reap_unhealthy(&self.nodeclaims, &live, &[], &self.sketches, &self.cfg, now)
-            .await?;
+        let (_, reaped) =
+            health::reap_unhealthy(&self.nodeclaims, &live, &[], &self.sketches, &self.cfg, now)
+                .await?;
+        // r40 bug_012: prune inflight_created against this tick's `live`
+        // so the controller's own reaps below aren't later misread by
+        // reconcile_once's detect_vanished as Karpenter GC. The
+        // doc-comment on `detect_vanished` ("the controller never deletes
+        // its own in-flight claims") only holds if every code path that
+        // deletes a tracked claim also removes it from `inflight_created`
+        // — `reconcile_once` did, `consolidate_only` did not. ICE cells
+        // are dropped (no scheduler to report to).
+        for name in &reaped {
+            self.inflight_created.remove(name);
+        }
+        let _ = health::detect_vanished(&mut self.inflight_created, &live);
         // FFD-derived gauges (`ffd_unplaced_cores`, `ffd_placeable_intents`)
         // need scheduler intents; live-derived gauges read only `live` +
         // `now`, both available here. Without this call, a scheduler

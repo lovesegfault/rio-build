@@ -141,26 +141,71 @@ pub fn classify(
 
 /// ICE detection for claims Karpenter GC'd between ticks. `inflight`
 /// holds `(name, cell)` for everything `cover_deficit` created and
-/// hasn't yet observed Registered/reaped. Any name absent from `live`
-/// was deleted by Karpenter (the controller never deletes its own
-/// in-flight claims) ⇒ the cell is unfulfillable. Names PRESENT in
-/// `live` are pruned (still in flight or registered — `classify` /
-/// `observe_registered` handle them).
+/// hasn't yet observed Registered, terminating, or absent.
+///
+/// Drop rules (all `→ false` removes the entry):
+/// - **Registered**: `observe_registered`/FFD own it now.
+/// - **Terminating**: the controller (or Karpenter expiration) is
+///   tearing it down deliberately; not an ICE signal.
+/// - **Absent from `live`**: vanished without ever Registering.
+///   Karpenter GC'd it (the controller's own reaps are removed from
+///   `inflight` by the caller before this runs) ⇒ the cell is
+///   unfulfillable. ICE-mask + `reaped_total{reason=vanished}`.
+/// - **In-flight (present, not Registered, not terminating)**: KEEP.
+///   r40 bug_020: dropping on first sighting let a claim observed at
+///   age ~10s and GC'd at ~13–16s escape every detection path —
+///   `detect_vanished` (already pruned), `classify`'s reason
+///   short-circuit (claim no longer in `live`), `classify`'s
+///   `age > ice_timeout` (`2×seed ≈ 1200s` for metal cells; the claim
+///   is gone long before then). The cell churns unmasked NodeClaims
+///   for many cycles, burns EC2 API quota, never feeds the ICE alert.
 ///
 /// This is the structural fix for the live B11 finding: Karpenter's
 /// `Launched=False reason=LaunchFailed` → GC happens in ~1s, faster
 /// than the 10s tick, so neither `classify`'s timeout path NOR its
 /// reason short-circuit ever sees the claim. Tick-over-tick absence
 /// detection is the only signal that survives.
+///
+/// No TTL on retained entries. The old drop-on-first-sighting bounded
+/// `inflight` to one tick's creates implicitly; the KEEP arm removes
+/// that cap. Still bounded: the `None` arm prunes every entry absent
+/// from `live` each tick, so after a `detect_vanished` call the map is
+/// a subset of `live` (only `cover_deficit`'s post-call `extend` adds
+/// not-yet-listed names). The map can't outgrow the cluster's
+/// stuck-Pending population plus one tick of creates. Every retain path
+/// is also finite for a *progressing* claim: it Registers
+/// (`n.registered` arm), terminates (`n.terminating()` arm), is reaped
+/// by `classify`'s `BootTimeout`/`Ice` and removed by the caller's
+/// `reap_unhealthy` name drain, or is GC'd by Karpenter (the `None`
+/// arm). Two `classify` escapes can park an entry indefinitely:
+/// (a) `creationTimestamp` absent — `age_secs` returns `None` and
+/// `classify` `continue`s before the timeout gate; the apiserver sets
+/// it on every persisted object, near-impossible; (b) `Launched`
+/// present with status ∉ `{True, False}` past timeout — `classify`'s
+/// final match has no `Some(("Unknown", _))` arm. (b) is plausible:
+/// Karpenter's `InitializeConditions` writes `Launched=Unknown` before
+/// the launch attempt, so a Karpenter outage/backlog parks claims
+/// there. Either way the claim is itself stuck in the cluster —
+/// already operator-visible via `nodeclaim_inflight_age_max_seconds` —
+/// and the entry frees the moment the claim resolves. If r41 finds the
+/// bound insufficient, add the TTL the bug_020 report recommends
+/// (`now - created_at > 2×ice_timeout`; needs an insertion timestamp in
+/// the map value) AND a `rio_controller_nodeclaim_inflight_tracked`
+/// gauge in `emit_live_gauges` so the leak is observable.
 pub fn detect_vanished(inflight: &mut HashMap<String, Cell>, live: &[LiveNode]) -> Vec<Cell> {
-    let live_names: HashSet<&str> = live.iter().map(|n| n.name.as_str()).collect();
+    let live_by_name: HashMap<&str, &LiveNode> =
+        live.iter().map(|n| (n.name.as_str(), n)).collect();
     let mut ice = Vec::new();
-    inflight.retain(|name, cell| {
-        if live_names.contains(name.as_str()) {
-            // Still in flight (or Registered) — drop from tracking;
-            // `classify` / `observe_registered` own it now.
-            false
-        } else {
+    inflight.retain(|name, cell| match live_by_name.get(name.as_str()) {
+        // Registered or terminating → done tracking; `classify` /
+        // `observe_registered` own it.
+        Some(n) if n.registered || n.terminating() => false,
+        // Still in-flight: KEEP. classify's reason short-circuit and
+        // ice_timeout don't cover the GC'd-between-observations
+        // window for slow-ICE cells.
+        Some(_) => true,
+        // Vanished without ever Registering → ICE.
+        None => {
             warn!(%name, %cell, "in-flight NodeClaim vanished (Karpenter GC); ICE-masking cell");
             metrics::counter!(
                 "rio_controller_nodeclaim_reaped_total",
@@ -175,10 +220,14 @@ pub fn detect_vanished(inflight: &mut HashMap<String, Cell>, live: &[LiveNode]) 
     ice
 }
 
-/// Reap unhealthy/ICE-stuck NodeClaims. Returns the set of cells hit
-/// by ICE this tick (fed to `report_unfulfillable` →
-/// `AckSpawnedIntents.unfulfillable_cells`). `Api::delete` 404 is
-/// ignored; other errors warn + skip (next tick retries).
+/// Reap unhealthy/ICE-stuck NodeClaims. Returns `(ice_cells, reaped_names)`:
+/// cells hit by ICE this tick (fed to `report_unfulfillable` →
+/// `AckSpawnedIntents.unfulfillable_cells`), and the `metadata.name`s
+/// the controller `delete()`d (so the caller can drop them from
+/// `inflight_created` — they're the controller's own reaps, not
+/// Karpenter GC, and must NOT feed `detect_vanished`'s ICE path on the
+/// next tick). `Api::delete` 404 is ignored; other errors warn + skip
+/// (next tick retries).
 pub async fn reap_unhealthy(
     nodeclaims: &Api<NodeClaim>,
     live: &[LiveNode],
@@ -186,12 +235,13 @@ pub async fn reap_unhealthy(
     sketches: &CellSketches,
     cfg: &NodeClaimPoolConfig,
     now_secs: f64,
-) -> anyhow::Result<Vec<Cell>> {
+) -> anyhow::Result<(Vec<Cell>, Vec<String>)> {
     let dead: HashSet<&str> = dead_nodes.iter().map(String::as_str).collect();
     let to_reap = classify(live, &dead, sketches, cfg, now_secs);
     let cap = dead_reap_cap(live.len());
     let mut dead_reaped = 0usize;
     let mut ice_cells = Vec::new();
+    let mut reaped_names = Vec::new();
     for (i, reason) in to_reap {
         let n = &live[i];
         if reason == ReapReason::Dead {
@@ -213,14 +263,20 @@ pub async fn reap_unhealthy(
                 if reason == ReapReason::Ice {
                     ice_cells.push(cell);
                 }
+                reaped_names.push(n.name.clone());
             }
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {}
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                // Already gone (Karpenter GC raced us). Treat as
+                // reaped: the entry should not feed detect_vanished
+                // either way (we'd already classified it).
+                reaped_names.push(n.name.clone());
+            }
             Err(e) => {
                 warn!(name = %n.name, error = %e, "unhealthy NodeClaim delete failed; skipping");
             }
         }
     }
-    Ok(ice_cells)
+    Ok((ice_cells, reaped_names))
 }
 
 #[cfg(test)]
@@ -290,19 +346,52 @@ mod tests {
     }
 
     /// `detect_vanished`: in-flight claim absent from `live` → cell
-    /// ICE'd + entry removed. Present → entry removed (handed off to
-    /// classify), no ICE.
+    /// ICE'd + entry removed. r40 bug_020: in-flight claim PRESENT in
+    /// `live` is KEPT (not dropped on first sighting); registered or
+    /// terminating claims are dropped (handed off to `classify` /
+    /// `observe_registered`).
     #[test]
     fn detect_vanished_masks_gcd_claims() {
+        use super::super::ffd::tests::set_terminating;
         let h = Cell("h".into(), CapacityType::Spot);
-        let mut inflight: HashMap<String, Cell> =
-            [("nc-gone".into(), h.clone()), ("nc-live".into(), h.clone())].into();
-        let live = [node("nc-live", "h", CapacityType::Spot, 8, 0, 0)];
+        let mut inflight: HashMap<String, Cell> = [
+            ("nc-gone".into(), h.clone()),
+            ("nc-inflight".into(), h.clone()),
+            ("nc-reg".into(), h.clone()),
+            ("nc-term".into(), h.clone()),
+        ]
+        .into();
+        let mut reg = node("nc-reg", "h", CapacityType::Spot, 8, 0, 0);
+        reg.registered = true;
+        // node() defaults registered=true; force unregistered so the test
+        // pins the n.terminating() arm of the retain `||` independently —
+        // otherwise n.registered short-circuits and a regression that drops
+        // the terminating() clause stays green.
+        let mut term = node("nc-term", "h", CapacityType::Spot, 8, 0, 0);
+        term.registered = false;
+        let term = set_terminating(term);
+        // node() defaults registered=true; force in-flight.
+        let mut inflight_node = node("nc-inflight", "h", CapacityType::Spot, 8, 0, 0);
+        inflight_node.registered = false;
+        let live = [inflight_node, reg, term];
+
         let ice = detect_vanished(&mut inflight, &live);
-        assert_eq!(ice, vec![h]);
-        assert!(inflight.is_empty(), "both entries pruned");
-        // Second call: nothing tracked → no ICE (idempotent).
+        assert_eq!(ice, vec![h], "only nc-gone (absent) ICE-masked");
+        assert_eq!(
+            inflight.keys().collect::<Vec<_>>(),
+            vec!["nc-inflight"],
+            "in-flight present claim kept; registered/terminating/vanished dropped"
+        );
+        // Second call (claim still in-flight, still live): nothing new
+        // ICE'd, claim stays tracked.
         assert!(detect_vanished(&mut inflight, &live).is_empty());
+        assert_eq!(inflight.len(), 1);
+        // Third call: claim GC'd between ticks → ICE.
+        assert_eq!(
+            detect_vanished(&mut inflight, &[]),
+            vec![Cell("h".into(), CapacityType::Spot)]
+        );
+        assert!(inflight.is_empty());
     }
 
     /// A NodeClaim already terminating (`metadata.deletionTimestamp`
