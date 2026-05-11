@@ -599,17 +599,22 @@ the closed-loop `forecast_warm_hit_ratio` Schmitt widens/narrows the
 quantile by `Δq=0.02` per firing, capped at `q ≤ 0.99` and
 `lead_time ≤ sla.maxLeadTime`.
 
-r[ctrl.nodeclaim.consolidate-na+5]
+r[ctrl.nodeclaim.consolidate-na+6]
 An empty NodeClaim is kept while
 `λ(t)·𝔼[c_arrival | c_arrival ≤ cores] > cores/q_0.5(boot[h,cap])`.
 `λ(t)` is the windowed empirical arrival rate over `[t, t+W)` (window
 `W = q_0.5(boot)/2 ≥ 5s`) on right-censored `idle_gap[h,cap]`; the
-fitting-core term is the current tick's per-cell mean over `intents`
+fitting-core term is the current tick's per-cell mean over `placeable`
+(FFD's placed output — design choice from r43 bug_028: FFD-unplaced
+intents are lead-time-gated forecasts and capacity-overflow demand;
+neither lands on the idle node THIS tick, though forecasts may land
+later, so the bias direction is ambiguous and was left matching the
+code over the original `intents` wording per §SCC(2))
 restricted to those whose admissible `(hw-class, capacity-type)` cell
 set (`cells_of(i)`) contains the cell, or whose hw-class set is empty
 AND `hw_admits(cell, system, features)` holds —
 the SAME predicate FFD's `simulate` uses for the agnostic-fallback gate
-(defined as 0 when intents is ⊥ or empty). A floor
+(defined as 0 when `placeable` is ⊥ or empty). A floor
 `consolidate_after ≥ max(q_0.5(boot)/2, min_consolidation_time[h])`
 prevents a transient lull from collapsing to always-delete and lets the
 operator preserve the pre-§13e Karpenter `consolidateAfter` policy
