@@ -305,12 +305,33 @@ impl CellSketches {
     /// `"h:cap"`) are skipped + warned.
     // r[impl ctrl.nodeclaim.lead-time-ddsketch]
     pub fn seed(&mut self, lead_time_seed: &HashMap<String, f64>) {
+        // r42 bug_018: canonicalize aliasing keys before seeding —
+        // when both `"h:od"` and `"h:on-demand"` are present, the
+        // `Display`-form key (`":od"`) deterministically wins. Mirror
+        // of `NodeClaimPoolConfig::seed_for`'s precedence (r40
+        // bug_024); without it, the skip-gate below (`z_active.count()
+        // > 0`) lets whichever key the `HashMap` visits first seed the
+        // cell — non-deterministic across restarts. `seed_for`'s old
+        // doc-comment claimed `seed()` "already applies" the same
+        // normalization, which was true at the *parsing* layer (both
+        // forms reach `Cell::parse`) but NOT at the *precedence* layer
+        // (`HashMap` iteration order decided ties).
+        let mut canonical: HashMap<Cell, f64> = HashMap::with_capacity(lead_time_seed.len());
         for (key, &seed) in lead_time_seed {
             let Some(cell) = Cell::parse(key) else {
                 warn!(%key, "lead_time_seed key not parseable as h:cap; skipping");
                 continue;
             };
-            let s = self.cell_mut(&cell);
+            if *key == cell.to_string() {
+                // `Display`-form key: always wins.
+                canonical.insert(cell, seed);
+            } else {
+                // Alias key: only if no `Display`-form key claimed it.
+                canonical.entry(cell).or_insert(seed);
+            }
+        }
+        for (cell, &seed) in &canonical {
+            let s = self.cell_mut(cell);
             if s.z_active.count() > 0 || s.z_shadow.count() > 0 {
                 continue;
             }
@@ -684,6 +705,33 @@ mod tests {
         // Idempotent: second call doesn't double-seed.
         sk.seed(&seeds);
         assert_eq!(sk.get(&cold).unwrap().z_active.count(), N_SEED);
+    }
+
+    /// r42 bug_018: when both `"h:od"` and `"h:on-demand"` keys are
+    /// present, the `Display`-form `:od` key MUST win deterministically
+    /// — same precedence as [`NodeClaimPoolConfig::seed_for`] (r40
+    /// bug_024). Pre-fix, the skip-gate let whichever key the
+    /// `HashMap` iterated first seed the cell; the second alias hit
+    /// `z_active.count() > 0` and skipped. `HashMap` iteration order is
+    /// per-instance `RandomState` (NOT insertion order), so a single
+    /// back-to-back pair is a coin flip — 64 fresh `HashMap`s give
+    /// >99.9% probability of observing both orders if the result is
+    /// order-dependent.
+    // r[verify ctrl.nodeclaim.lead-time-ddsketch]
+    #[test]
+    fn seed_od_wins_over_on_demand() {
+        let cell = Cell("h".into(), CapacityType::OnDemand);
+        for i in 0..64 {
+            let m: HashMap<String, f64> =
+                [("h:od".into(), 90.0), ("h:on-demand".into(), 30.0)].into();
+            let mut sk = CellSketches::default();
+            sk.seed(&m);
+            let lt = sk.lead_time(&cell);
+            assert!(
+                (lt - 90.0).abs() / 90.0 < 0.02,
+                "iter {i}: `:od` (90.0) must win over `:on-demand` (30.0); got lead_time={lt}"
+            );
+        }
     }
 
     /// mb_012: `seed()` skip-gate must check `z_shadow` too. After

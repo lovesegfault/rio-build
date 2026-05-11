@@ -350,10 +350,9 @@ impl NodeClaimPoolConfig {
     ///
     /// Precedence: the canonical `"<h>:od"` key wins over the alias
     /// `"<h>:on-demand"` when both are present (e.g. layered helm values
-    /// where one overlay uses the Karpenter form and the base uses the
-    /// short form). The `Display`-form `.get()` runs first; the
-    /// `Cell::parse` scan is only the fallback — a `find_map` over the
-    /// `HashMap` alone would be non-deterministic when both keys exist.
+    /// where one overlay uses the Karpenter form). The `Display`-form
+    /// `.get()` runs first; the `Cell::parse` scan is the fallback.
+    /// Same precedence as [`CellSketches::seed`] (r42 bug_018).
     pub fn seed_for(&self, cell: &Cell) -> f64 {
         self.lead_time_seed
             .get(&cell.to_string())
