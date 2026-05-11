@@ -632,9 +632,16 @@ pub struct NodeClaimPoolReconciler {
     /// on first observation of idleness in
     /// [`consolidate::observe_idle_to_busy`]; pruned on idle→busy or
     /// when the node leaves `live`. Read by [`consolidate::reap_idle`]
-    /// via `ReapInputs.prev_idle`. In-memory only — restart re-seeds
-    /// every idle node from `now_secs` (under-reap by one threshold
-    /// cycle; SAFE direction, identical to a fresh fleet).
+    /// via `ReapInputs.prev_idle`. In-memory only — restart AND
+    /// lease-acquire (both `Ok` and `Err` reload arms) re-seed every
+    /// idle node from `now_secs`. Under-reap by one threshold cycle:
+    /// SAFE direction, identical to a fresh fleet. The clear is
+    /// unconditional on the lease-acquire edge — unlike the other
+    /// in-memory sets, a stale `prev_idle` entry has AMPLIFY polarity
+    /// (inflated idle → over-reap), so it cannot wait for `load_seeded`
+    /// to succeed (r43 merged_bug_016). Pre-acquire idle→busy→idle
+    /// cycles are unobservable; treating them as fresh-idle is the only
+    /// safe assumption.
     prev_idle: HashMap<String, f64>,
     /// Cells written by [`Self::emit_live_gauges`] last tick that were
     /// NOT in `all_cells()` (i.e. carried by a live NodeClaim whose
@@ -736,6 +743,13 @@ fn unknown_cell_intents<'m>(
     (n, unknown)
 }
 
+// TODO: extract a lifecycle-invariants test suite that drives
+// `reconcile_once`/`consolidate_only`/lease-acquire/lease-loss edges
+// through a fake clock and asserts the per-field stale-state polarity
+// table above. Three rounds (r40 bug_012/020, r42 bug_023, r43 bug_023/
+// merged_016) found `consolidate_only`/`observe_*`/lease-edge interaction
+// bugs that single-path verifiers missed. Requires extracting the kube/PG
+// clients behind a trait so the test can drive the loop without a cluster.
 impl NodeClaimPoolReconciler {
     /// Construct + load persisted [`CellSketches`] from PG. Called once
     /// at startup AFTER PG connect; the loaded state survives controller
@@ -858,7 +872,17 @@ impl NodeClaimPoolReconciler {
             // tick retries the reload. Clears (recorded_boot etc.) go
             // in the Ok-arm only — atomic edge: full reload or full
             // retry.
+            //
+            // EXCEPTION: `prev_idle` clears unconditionally. Its
+            // stale-state polarity is opposite the other two sets
+            // (see the per-field table below): a stale `prev_idle`
+            // entry inflates `now − since` and CAUSES a reap, not
+            // suppresses one. Even if `load_seeded` errors, leaving a
+            // pre-lapse timestamp over-reaps. Clearing here makes the
+            // `Err` arm under-reap by one cycle (the documented SAFE
+            // direction) instead of unboundedly over-reaping.
             if self.reload_pending() {
+                self.prev_idle.clear();
                 let halflife = Duration::from_secs(self.cfg.sketch_halflife_secs);
                 match CellSketches::load_seeded(
                     &self.pg,
@@ -871,18 +895,27 @@ impl NodeClaimPoolReconciler {
                     Ok(s) => {
                         self.sketches = s;
                         self.recorded_boot.clear();
-                        self.prev_idle.clear();
                         self.inflight_created.clear();
                         // `prev_extra_cells` is intentionally NOT cleared
-                        // here (r41 bug_025). Unlike the three sets above
-                        // (whose stale entries *suppress* recording/
-                        // reaping), it is a cleanup-pending set: a stale
-                        // entry from before the lease lapse triggers one
-                        // extra trailing zero-write — exactly what's
-                        // needed to clear a gauge series that froze
-                        // mid-drain when the tick loop stopped. Clearing
-                        // it would orphan those series at their last
-                        // (possibly paging) value. See [`gauge_universe`].
+                        // here (r41 bug_025). Per-field stale-state
+                        // polarity on the lease-acquire edge:
+                        //
+                        //   - `recorded_boot`   suppress  → cleared in Ok arm
+                        //     (stale entry skips a record; lost sample)
+                        //   - `inflight_created` suppress → cleared in Ok arm
+                        //     (stale entry → spurious ICE-mask)
+                        //   - `prev_idle`       AMPLIFY   → cleared BEFORE the
+                        //     match (stale entry inflates idle → over-reap;
+                        //     r43 merged_bug_016)
+                        //   - `prev_extra_cells` CLEANUP  → never cleared
+                        //     (stale entry → one trailing zero-write — the
+                        //     desired behavior; clearing would orphan a gauge
+                        //     series at its last possibly-paging value)
+                        //
+                        // When adding a field that holds in-memory edge
+                        // state, classify its polarity here and put the
+                        // clear (or not-clear) on the matching edge. See
+                        // [`gauge_universe`].
                         self.hooks
                             .reload
                             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -950,6 +983,15 @@ impl NodeClaimPoolReconciler {
             if self.consecutive_bot_ticks >= BOT_TICKS_BEFORE_CONSOLIDATE_ONLY {
                 return self.consolidate_only().await;
             }
+            // TODO(r43 merged_bug_016/bug_023): ticks 1..BOT_TICKS_BEFORE_
+            // CONSOLIDATE_ONLY take this early exit and skip ALL kube-only
+            // observations — `prev_idle` stays un-pruned (≤4×TICK ≈ 40s
+            // over-estimate, below the 60s builder floor) and
+            // `observe_registered` boot samples in that window are lost
+            // (~20s after a Registered transition). Fixing both requires
+            // fetching `live` here (extra kube round-trip every outage
+            // tick). Defer to the lifecycle-invariants test (see TODO at
+            // the top of this `impl` block), which is the structural close.
             return Ok(());
         };
         self.consecutive_bot_ticks = 0;

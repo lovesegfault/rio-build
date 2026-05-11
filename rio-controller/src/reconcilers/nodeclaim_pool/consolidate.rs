@@ -943,6 +943,40 @@ mod tests {
         assert_eq!(sk.get(&cell).unwrap().idle_gap_events.len(), 2);
     }
 
+    /// r43 merged_bug_016: `observe_idle_to_busy` only `or_insert`s — it
+    /// never refreshes an existing entry. The lease-acquire edge MUST
+    /// `prev_idle.clear()` unconditionally (both Ok and Err reload arms)
+    /// because a stale entry that survived a standby window over-counts
+    /// the idle duration. This test pins the `or_insert` semantics so a
+    /// future "fix" that switches to `.insert()` (which would mask the
+    /// bug differently) trips a different assertion.
+    ///
+    /// NOTE: this test does NOT validate the `mod.rs` hoist — it pins
+    /// the `or_insert` precondition the bug depends on. The hoist itself
+    /// has no automated test (the lease-acquire edge needs kube/PG
+    /// clients the test module can't construct); see the
+    /// lifecycle-invariants TODO at the top of `impl
+    /// NodeClaimPoolReconciler`.
+    #[test]
+    fn observe_idle_to_busy_keeps_pre_existing_seed() {
+        let mut sk = CellSketches::default();
+        let mut prev_idle: HashMap<String, f64> = [("n1".into(), 1000.0)].into();
+        // Idle node (`requested.0 == 0`, registered). Mirrors `b` above.
+        let n1 = with_conds(
+            node("n1", "h", CapacityType::Spot, 8, 0, 0),
+            &[("Registered", "True", 900.0)],
+        );
+        observe_idle_to_busy(&[n1], &mut prev_idle, &mut sk, 1300.0);
+        // `or_insert` does NOT refresh: stale seed survives.
+        assert!(
+            (prev_idle["n1"] - 1000.0).abs() < 1e-9,
+            "or_insert keeps stale seed across ticks"
+        );
+        // ... and that is EXACTLY why the lease-acquire edge must
+        // `clear()` unconditionally — otherwise a 300s standby looks
+        // like 300s idle.
+    }
+
     /// A node that started terminating since last tick (Karpenter
     /// finalizer running) drops from `prev_idle` WITHOUT recording an
     /// idle-gap event — `reap_idle`/`reap_unhealthy` already pushed the
