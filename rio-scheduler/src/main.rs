@@ -230,7 +230,7 @@ async fn main() -> anyhow::Result<()> {
     // `cfg.unwrap_or(global)`. Time-bounded so a misconfigured IRSA
     // doesn't hang boot — on timeout/error the ceilings fall to global
     // and the `_class_ceiling_uncatalogued` gauge fires per class.
-    // r[impl scheduler.sla.ceiling.catalog-derived+2]
+    // r[impl scheduler.sla.ceiling.catalog-derived+3]
     if matches!(hw_cost_source, rio_scheduler::sla::cost::HwCostSource::Spot) {
         let ec2 = aws_sdk_ec2::Client::new(&aws_config::from_env().load().await);
         let catalog = match tokio::time::timeout(

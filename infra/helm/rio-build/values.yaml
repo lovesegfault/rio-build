@@ -420,12 +420,16 @@ scheduler:
     # deployment whose Karpenter requirements only match instances
     # < 64c must EITHER set `probe.cpu ≤ 12` OR pin `maxCores`.
     #
-    # The catalog-derived per-class ceiling is `instance_cores − 1`
-    # (kubelet reserve, r40 bug_013). `class_ceilings` takes
-    # `min(catalog, maxCores)`, so a `maxCores` set to a real
-    # instance's exact vCPU count (e.g. 192 for a 192-vCPU box) is
-    # dead — the catalog's 191 wins. That's correct (the 192 was
-    # never placeable) but is a silent change to a hand-pinned value.
+    # The catalog-derived per-class ceiling reserves allocatable from
+    # capacity on BOTH axes: `instance_cores − 1` (r40 bug_013) and
+    # `instance_mem × 9/10` (r42 bug_005). `class_ceilings` takes
+    # `min(catalog, maxCores)` and `min(catalog, maxMem)`, so a pin set
+    # to a real instance's raw capacity is dead on either axis —
+    # `maxCores: 192` for a 192-vCPU box loses to the catalog's 191,
+    # and `maxMem: 1.5 TiB` for a 1.5-TiB box loses to the catalog's
+    # 1.35 TiB. That's correct (the raw figure was never placeable)
+    # but is a silent change to a hand-pinned value: a `maxMem` set
+    # before r42 to a real instance's mem capacity is now a no-op.
     # maxCores: 192
     # maxMem: 1649267441664    # 1.5 TiB
     maxDisk: 214748364800      # 200 GiB

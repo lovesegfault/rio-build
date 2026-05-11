@@ -811,7 +811,7 @@ each class's `requirements` actually permit Karpenter to launch (the
 operator-side staleness step entirely: a `requirements` edit takes
 effect on the next rollout.
 
-r[scheduler.sla.ceiling.catalog-derived+2]
+r[scheduler.sla.ceiling.catalog-derived+3]
 The scheduler derives a per-hwClass catalog ceiling at boot by calling
 `describe_instance_types`, projecting each type onto Karpenter
 discovery labels (`instance-category`, `instance-generation`,
@@ -820,11 +820,12 @@ discovery labels (`instance-category`, `instance-generation`,
 against them (`In`/`NotIn`/`Gt`/`Lt`/`Exists`/`DoesNotExist`),
 synthesizing the metal `instance-size {In|NotIn} metalSizes`
 partition from `nodeClass == rio-metal` (mirroring the controller's
-`cover::build_nodeclaim`), and emitting the `(cores − 1, mem)` of the
-**single largest-cores type** in the matched set — cores reduced by 1
-for kubelet `kubeReserved`/`systemReserved` overhead (Karpenter
-binpacks against `Capacity − Overhead`, so a request of the raw vCPU
-count never fits); mem unchanged; never an independent per-axis max
+`cover::build_nodeclaim`), and emitting the `(cores − 1, mem × 9/10)` of
+the **single largest-cores type** in the matched set — both axes reduced
+for kubelet `kubeReserved`/`systemReserved`/eviction overhead and
+Karpenter's `vmMemoryOverheadPercent` (Karpenter binpacks against
+`Capacity − Overhead`, so a request of the raw capacity on either axis
+never fits any instance); never an independent per-axis max
 (which would phantom a shape no real type satisfies and ICE-loop
 Karpenter). Spot cost source only; Static (vmtest) has no AWS API and
 yields an empty catalog. A class matching 0 types is omitted from the
@@ -856,9 +857,9 @@ r[scheduler.sla.ceiling.controller-mirror]
 The scheduler ships the catalog ceiling — `min(catalog, cfg)`, each
 falling to global when absent — to the controller over
 `GetHwClassConfig`. The wire value is always nonzero (`validate_shape()`
-rejects `Some(0)` overrides; the catalog cores axis is
-`max(1, cores − 1)` and the mem axis is a real instance type's
-memory); the controller's `ceilings_for` `>0` filter
+rejects `Some(0)` overrides; the catalog cores axis is `max(1, cores − 1)`
+and the mem axis is `mem × 9/10` of a real instance type's
+memory, both nonzero); the controller's `ceilings_for` `>0` filter
 (pre-R26-scheduler back-compat) is preserved. Skew is bounded by the
 controller's 300s `HwClassConfig` refresh.
 

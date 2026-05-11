@@ -1401,7 +1401,7 @@ async fn poll_spot_once(
 mod tests {
     use super::*;
 
-    // r[verify scheduler.sla.ceiling.catalog-derived+2]
+    // r[verify scheduler.sla.ceiling.catalog-derived+3]
     /// `carry_catalog` preserves the boot-derived catalog across the
     /// lease-acquire edge-reload (`*cost.write() = fresh` would
     /// otherwise wipe it — it's not in PG and not re-derived).
