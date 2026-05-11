@@ -19,7 +19,7 @@ override or reset.
 | `RioNodeclaimPoolIceMaskedHigh` | ≥3 cells reaping NodeClaims for `reason=ice` | [Admissible set shrinking](#rionodeclaimpool-icemaskedhigh) |
 | `RioNodeclaimPoolStuckPending` | NodeClaim in-flight >2× cell `ice_timeout` (floor 90s, cap 3×maxLeadTime) | [Provisioning stuck](#rionodeclaimpool-stuckpending) |
 | `RioNodeclaimPoolBootTimeoutLoop` | A cell is repeatedly minting and reaping NodeClaims for `reason=boot-timeout` | [Boot-timeout loop](#rionodeclaimpool-boottimeoutloop) |
-| `RioNodeclaimPoolNoHostingClass` | SpawnIntents dropped — no configured hw-class can host them | [No hosting class](#rionodeclaimpool-nohostingclass) |
+| `RioNodeclaimPoolNoHostingClass` | SpawnIntents dropped — no configured hw-class or Pool can host them | [No hosting class](#rionodeclaimpool-nohostingclass) |
 | `RioNodeclaimPoolStuckTerminating` | A NodeClaim has had `deletionTimestamp` set >5m without Karpenter's finalizer clearing | [Stuck terminating](#rionodeclaimpool-stuckterminating) |
 
 The first three are model-accuracy alerts; the last five are provisioning
@@ -294,14 +294,18 @@ then fix the AMI and re-roll.
 
 ### RioNodeclaimPool NoHostingClass
 
-`fallback_cell` returned `None` for one or more SpawnIntents — no configured
-hw-class can host the intent's `(arch, size, required_features)`. The intent
-is dropped: no NodeClaim is minted, the pod's `nodeSelector`/`nodeAffinity`
-will never match a node, and the build is permanently Pending. This is the
-ONLY signal — every other nodeclaim alert is NodeClaim-derived, and a
-NodeClaim that was never minted emits no series.
+`fallback_cell` returned `None` (`reason=no_hosting_class`) or the
+provisioner's Pool-coverage filter dropped the intent
+(`reason=no_pool_covers`). Either way: no NodeClaim is minted, the pod's
+`nodeSelector`/`nodeAffinity` will never match a node, and the build is
+permanently Pending. This alert is the ONLY signal for the
+"no NodeClaim was ever minted" failure class — every other nodeclaim alert
+is NodeClaim-derived, and a NodeClaim that was never minted emits no series.
 
-Three causes, in decreasing likelihood:
+Causes by `{{ $labels.reason }}`:
+
+**`reason=no_hosting_class`** — `fallback_cell` found no `[sla.hw_classes]`
+entry for the intent's `(arch, size, required_features)`:
 
 - **`required_features` unmatched** — no `[sla.hw_classes.$h]` entry has
   `provides_features` covering the intent's `required_features`. Most likely
@@ -309,10 +313,14 @@ Three causes, in decreasing likelihood:
   Add or fix the hw-class. Check `rio_scheduler_unroutable_features_total`
   for the same shape on the scheduler side — if BOTH fire the misconfig is
   in `[sla.hw_classes]`; if only this one, the scheduler routed but the
-  controller's `HwClassConfig` is stale (300s refresh).
+  controller's `HwClassConfig` is stale (300s refresh). See also
+  `intent_dropped_total{reason="unknown_hw_class"}` — that reason fires when
+  the SCHEDULER stamped a hwClass the CONTROLLER doesn't yet know; it
+  self-heals within the GetHwClassConfig refresh and is a `warn!` not an alert.
 - **Footprint exceeds every arch-matching class's ceiling** — an
   override-bypass (`--cores=N`) intent larger than every class's
-  `max_cores`/`max_mem`. Check `rio_controller_nodeclaim_intent_dropped_total{reason="exceeds_cell_cap"}`
+  `max_cores`/`max_mem`. Check
+  `rio_controller_nodeclaim_intent_dropped_total{reason="exceeds_cell_cap"}`
   for the same drv.
 - **Featureless arch-unmappable system** — a non-FOD `system="builtin"` or
   `darwin-*` build with no `requiredSystemFeatures` to route on. There is no
@@ -321,10 +329,19 @@ Three causes, in decreasing likelihood:
   with `provides_features` matching the feature the build SHOULD be
   declaring, or fix the build.
 
+**`reason=no_pool_covers`** — a `[sla.hw_classes]` entry advertises a
+feature/system but no `Pool` (Builder or Fetcher) covers the intent's
+`(kind, system, effective_features)`. The provisioner would mint a NodeClaim
+for it but the placer would never spawn a Job onto it — the node would be
+permanently idle. `kubectl get pools.rio.build -A` and compare `spec.systems`
+/ `effective_features` against the dropped intent's `system` / features. Add
+a Pool or remove the hwClass entry.
+
 Diagnose: scheduler logs WARN with the unroutable `(system, features)` tuple
 once per `(tenant, features)` edge. The controller logs WARN once per intent
-drop. `tracey query rule ctrl.pool.fetcher-affinity-from-intent` for the
-spec text.
+drop (all four reasons: `no_hosting_class`, `no_pool_covers`,
+`exceeds_cell_cap`, `unknown_hw_class`). `tracey query rule
+ctrl.pool.fetcher-affinity-from-intent` for the spec text.
 
 ### RioNodeclaimPool StuckTerminating
 

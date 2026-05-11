@@ -1442,6 +1442,20 @@ impl NodeClaimPoolReconciler {
                 "reason" => "no_hosting_class",
             )
             .increment(dropped);
+            // r41 merged_015: the runbook (sla-model.md §NoHostingClass) and
+            // pod.rs:769,772 both claim "the controller logs WARN once per
+            // intent drop" — sibling reasons `no_pool_covers`,
+            // `exceeds_cell_cap`, and `unknown_hw_class` already warn; this
+            // was the asymmetric outlier. Per intent-tick (10s), so a
+            // persistent gap is visible in logs without waiting for the 15m
+            // alert window.
+            warn!(
+                dropped,
+                "SpawnIntents dropped — no configured hw-class can host them \
+                 (wrong arch, footprint exceeds every class's max_cores/max_mem, \
+                 or required_features unmatched); add or fix a [sla.hw_classes] \
+                 entry. See sla-model.md#rionodeclaimpool-nohostingclass"
+            );
         }
         let order =
             cover::cells_round_robin(self.cfg.all_cells(&self.hw_config), self.tick_counter);

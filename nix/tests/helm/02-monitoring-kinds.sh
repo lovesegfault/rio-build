@@ -78,8 +78,17 @@ grep -q 'alert: RioNodeclaimPoolNoHostingClass' "$out" || {
   exit 1
 }
 nhc_block=$(grep -A4 'alert: RioNodeclaimPoolNoHostingClass' "$out" || true)
-grep -q 'reason="no_hosting_class"' <<<"$nhc_block" || {
+grep -q 'no_hosting_class' <<<"$nhc_block" || {
   echo "FAIL: NoHostingClass expr does not key on reason=no_hosting_class" >&2
+  exit 1
+}
+# r41 merged_015: the alert is THE only signal that a SpawnIntent dropped
+# without minting a NodeClaim. `no_pool_covers` is the same Pending-forever
+# outcome via the Pool-coverage filter — it must be in the same alert.
+grep -q 'no_pool_covers' <<<"$nhc_block" || {
+  echo "FAIL: NoHostingClass expr does not also cover reason=no_pool_covers" \
+       "— a hwClass with no covering Pool is the same Pending-forever shape" \
+       "(r41 merged_015)" >&2
   exit 1
 }
 

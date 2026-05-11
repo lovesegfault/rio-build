@@ -326,22 +326,41 @@ spec:
         # arch-unmappable system, an over-constrained `requiredFeatures`
         # set). 15m window: each intent is dropped once per nodeclaim
         # tick, so even a low-rate persistent gap accumulates.
+        #
+        # r41 merged_015: `no_pool_covers` is the same outcome (build
+        # permanently Pending, no NodeClaim, no Job) for a different
+        # cause (a hwClass advertises a feature with no covering Pool —
+        # a rio.build/v1alpha1 ExecutorPool/hwClass config split). It
+        # was emitted at mod.rs:923 since r35 with no alert. NOT
+        # `unknown_hw_class` or `exceeds_cell_cap`: those are
+        # scheduler/controller skew that self-heals within the 300s
+        # GetHwClassConfig refresh (`for: 5m` would false-positive on a
+        # healthy rollout). They have a `warn!` at the drop site; if
+        # the skew persists, watch the warn rate and
+        # `intent_dropped_total{reason}` directly — no NodeClaim is
+        # minted for either, so StuckPending stays silent, and
+        # `ffd_unplaced_cores` only iterates `all_cells()` so it has no
+        # series for an unknown cell (it DOES show `exceeds_cell_cap`
+        # demand because the cell is configured).
         - alert: RioNodeclaimPoolNoHostingClass
           expr: |
-            increase(rio_controller_nodeclaim_intent_dropped_total{reason="no_hosting_class"}[15m]) > 0
+            increase(rio_controller_nodeclaim_intent_dropped_total{reason=~"no_hosting_class|no_pool_covers"}[15m]) > 0
           for: 5m
           labels:
             severity: warning
           annotations:
-            summary: NodeClaim intents dropped — no configured hw-class can host
+            summary: NodeClaim intents dropped — no configured hw-class or Pool can host
             description: >-
               {{`{{ $value | humanize }}`}} SpawnIntents dropped over 15m
-              with reason=no_hosting_class. The build's pod is permanently
-              Pending and no NodeClaim will be minted. Check the intent's
+              with reason={{`{{ $labels.reason }}`}}. The build's pod is permanently
+              Pending and no NodeClaim will be minted.
+              reason=no_hosting_class: check the intent's
               `(system, required_features)` against `[sla.hw_classes]`
-              `provides_features`/`max_cores`/`max_mem` and the arch labels;
-              add a hw-class that covers it or fix the producer. See
-              docs/src/runbooks/sla-model.md#rionodeclaimpool-nohostingclass.
+              `provides_features`/`max_cores`/`max_mem` and the arch labels.
+              reason=no_pool_covers: a hwClass advertises a feature with no
+              covering Builder/Fetcher Pool — `kubectl get pools.rio.build -A`
+              and check `spec.systems`/`effective_features`.
+              See docs/src/runbooks/sla-model.md#rionodeclaimpool-nohostingclass.
 
         # qa-fix-b r37: a NodeClaim whose Karpenter finalizer never
         # clears stays `terminating` indefinitely. `class_budget` and
