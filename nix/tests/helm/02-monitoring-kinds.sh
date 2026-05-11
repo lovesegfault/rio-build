@@ -97,11 +97,15 @@ grep -q 'no_pool_covers' <<<"$nhc_block" || {
 # invariant `cap >= 2×maxLeadTime` is load-bearing (the alert must
 # fire AFTER the reaper, which acts at 2×seed<=2×maxLeadTime).
 # r35 merged_bug_027: BootTimeoutLoop's increase() window is
-# `4×maxLeadTime` = 2 full reap cycles (StuckPending stays `3×`) — the
-# r34 `3×` window spanned only 1.5 cycles when seed=maxLeadTime (metal
-# cells), giving `>= 2` a ~50% duty cycle and a flapping alert.
+# `4×maxLeadTime + 4×TICK` = 2 full reap cycles + tick-grid slack
+# (StuckPending stays `3×`) — the r34 `3×` window spanned only 1.5
+# cycles when seed=maxLeadTime (metal cells), giving `>= 2` a ~50% duty
+# cycle and a flapping alert. r43 bug_024: a reap cycle costs
+# `2×seed + 2×TICK` (one tick to observe the reap, one for FFD to stop
+# placing on the dying claim before re-mint), so the bare `4×maxLeadTime`
+# under-spans by `4×TICK`; add the slack so `>= 2` holds for the loop.
 expected_cap=$(( 3 * $(yq '.scheduler.sla.maxLeadTime' values.yaml) ))
-expected_window=$(( 4 * $(yq '.scheduler.sla.maxLeadTime' values.yaml) ))
+expected_window=$(( 4 * $(yq '.scheduler.sla.maxLeadTime' values.yaml) + 40 ))
 # Mirror the {{ max 90 ... }} floor in the template: a maxLeadTime < 30
 # would render a window/cap < 90, which is degenerate (Prometheus rejects
 # `[0s]` ranges; clamp(v, min, max) returns empty when min > max).
@@ -119,9 +123,10 @@ grep -q "clamp(.*, 90, ${expected_cap})" <<<"$sp_block" || {
 }
 btl_block=$(grep -A4 'alert: RioNodeclaimPoolBootTimeoutLoop' "$out" || true)
 grep -q "\[${expected_window}s\]" <<<"$btl_block" || {
-  echo "FAIL: BootTimeoutLoop increase() window != 4×maxLeadTime"          \
-    "(expected [${expected_window}s]; window must span 2 full reap cycles" \
-    "= 2×(2×seed) <= 4×maxLeadTime so >= 2 reaps holds for the entire"     \
-    "sustained loop, not just ~50% of it; r35 merged_bug_027)" >&2
+  echo "FAIL: BootTimeoutLoop increase() window != 4×maxLeadTime + 4×TICK"  \
+    "(expected [${expected_window}s]; window must span 2 full reap cycles"  \
+    "+ tick-grid slack = 2×(2×seed + 2×TICK) <= 4×maxLeadTime + 4×TICK so" \
+    ">= 2 reaps holds for the entire sustained loop, not just ~50% of it;"  \
+    "r35 merged_bug_027, r43 bug_024)" >&2
   exit 1
 }

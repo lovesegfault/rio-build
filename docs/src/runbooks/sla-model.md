@@ -269,8 +269,8 @@ rio-controller leases (`kubectl -n rio-system get leases`), then
 
 ### RioNodeclaimPool BootTimeoutLoop
 
-A cell has reaped ≥2 NodeClaims with `reason=boot-timeout` in a 4×maxLeadTime
-window (default 2400s) for 5 minutes. `cover_deficit` mints a NodeClaim, kubelet
+A cell has reaped ≥2 NodeClaims with `reason=boot-timeout` in a `4×maxLeadTime + 4×TICK`
+window (default 2440s) for 5 minutes. `cover_deficit` mints a NodeClaim, kubelet
 never registers within the 2×seed boot timeout, `health::classify` reaps it
 (`ReapReason::BootTimeout` — NOT ICE-masked, since capacity exists and the
 *boot* failed), and `cover_deficit` re-mints. The loop is unbounded: each
@@ -280,10 +280,11 @@ completing and the kvm/nixos-test queue growing.
 Distinct from `StuckPending` (which fires when the *reaper* fails) — this
 alert fires when the reaper succeeds repeatedly. The `>= 2` count gate
 distinguishes a one-off slow boot (1 reap, never fires) from a sustained
-loop; the 4×maxLeadTime window spans 2 full reap cycles
-(`2×(2×seed) ≤ 4×maxLeadTime`) so the alert holds — not flaps — for the
-loop's duration (r35 merged_bug_027; the old 3× window had a ~50% duty
-cycle when `seed = maxLeadTime`).
+loop; the `4×maxLeadTime + 4×TICK` window spans 2 full reap cycles plus
+slack (`2×(2×seed + 2×TICK) ≤ 4×maxLeadTime + 4×TICK`) so the alert
+holds — not flaps — for the loop's duration (r35 merged_bug_027 widened
+3×→4×; r43 bug_024 added the `+4×TICK` slack for the tick-grid latency
+the bare `2×seed` model omits).
 
 Likely causes: broken AMI image (post-release), nodeadm regression, EC2
 firmware update, NVMe reorder breaking instance-store mounts. Diagnose:

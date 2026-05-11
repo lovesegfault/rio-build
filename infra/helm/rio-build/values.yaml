@@ -759,7 +759,8 @@ scheduler:
       # first (it caps the seed). The `RioNodeclaimPoolStuckPending`
       # alert clamp ceiling (3×maxLeadTime) and the
       # `RioNodeclaimPoolBootTimeoutLoop` increase() window
-      # (4×maxLeadTime = 2 reap cycles; r35 merged_bug_027) both derive
+      # (4×maxLeadTime + 4×TICK = 2 reap cycles; r35 merged_bug_027,
+      # r43 bug_024) both derive
       # from `maxLeadTime` (see prometheusrule.yaml) so they stay
       # >= 2×maxLeadTime structurally — no manual coordination needed
       # when raising it. The clamp
