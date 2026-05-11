@@ -1539,6 +1539,25 @@ impl DagActor {
                         reason.emit(&tenant);
                     }
                 }
+                // r40 bug_025: pre-clamp BEFORE `bypass_cells`. The
+                // producer-side `reference_hw_class_for_system` size
+                // filter and the post-finalize `retain_hosting_cells`
+                // chokepoint must agree on `(cores, mem)` —
+                // `retain_hosting_cells` is filter-only (can drop,
+                // can't add), so an over-cap override that makes the
+                // producer reject every class yields
+                // `node_affinity=[]`, and the chokepoint can't
+                // recover. With `[]` affinity, a featured intent's pod
+                // lands without the feature affinity and crashloops
+                // (no `RioNodeclaimPoolNoHostingClass` alert: the
+                // controller's `fallback_cell` reads the POST-clamp
+                // cores and succeeds). The shared chokepoint clamp at
+                // the end of `solve_intent_for` re-applies the same
+                // bounds — this pre-clamp is idempotent under it.
+                let c = c.min(self.sla_ceilings.max_cores as u32).max(1);
+                let m = m
+                    .max(state.sched.resource_floor.mem_bytes)
+                    .min(self.sla_ceilings.max_mem);
                 let cells = self.bypass_cells(
                     state,
                     override_.as_ref().and_then(|o| o.capacity),
@@ -1787,10 +1806,18 @@ impl DagActor {
             // controller's `fallback_cell` does. On `None` (no class
             // hosts this arch at this size, or unmappable system), emit
             // empty so the controller's `fallback_cell` reaches its OWN
-            // `None` → `no_hosting_class` metric. Pass the raw
-            // `(c, m.max(floor))` — producer-side filter is
-            // correctness-of-intent; the post-finalize chokepoint
-            // catches the post-clamp delta.
+            // `None` → `no_hosting_class` metric.
+            //
+            // r40 bug_025: `(cores, mem)` MUST be the caller's
+            // post-clamp values, not raw `intent_for` output. The
+            // post-finalize `retain_hosting_cells` chokepoint is
+            // filter-only — it cannot recover cells the producer
+            // rejected on a pre-clamp `cores > ceiling`, so the
+            // producer-side size filter and the chokepoint must agree
+            // on the demand they evaluate. `solve_intent_for`'s `None`
+            // arm pre-clamps before calling here. (Pre-r40 this
+            // comment claimed "the post-finalize chokepoint catches
+            // the post-clamp delta" — that claim IS the bug.)
             Some(cap) => match self.sla_config.reference_hw_class_for_system(
                 &state.system,
                 cores,

@@ -2899,6 +2899,76 @@ async fn contract_fod_capacity_override_routes_to_fetcher() {
     );
 }
 
+/// r40 bug_025: `solve_intent_for`'s `None` arm must clamp `cores` to
+/// `sla_ceilings.max_cores` BEFORE `bypass_cells` so the producer-side
+/// `reference_hw_class_for_system` size filter and the post-finalize
+/// `retain_hosting_cells` chokepoint agree on `(cores, mem)`. With
+/// pre-clamp `cores > ceiling`, the size filter rejects every class →
+/// `bypass_cells` returns `[]` → `retain_hosting_cells` (filter-only,
+/// can't add) keeps `[]` → `node_affinity = []`. For a featured intent
+/// the pod silently lands without the feature affinity and crashloops.
+///
+/// A `bypass_cells`-level test does NOT pin this: `bypass_cells(192) →
+/// non-empty` and `bypass_cells(256) → empty` are both true pre-fix —
+/// the producer's contract is unchanged. The fix is in the *call site*
+/// (the pre-clamp before `bypass_cells`), so only a `solve_intent_for`
+/// test goes red on revert.
+///
+/// Modeled on `contract_fod_capacity_override_routes_to_fetcher` —
+/// same FOD/featured shape, same `solve_intent_for` entry, but the
+/// override forces `cores` over `sla_ceilings.max_cores` (256 vs the
+/// `test_hw_sla_config` ceiling of 64) instead of pinning `--capacity`.
+///
+/// RED at 938f2a957: `intent.hw_class_names == []`.
+/// GREEN after the pre-clamp: `intent.hw_class_names == ["fetcher-x86"]`.
+#[tokio::test]
+async fn contract_overcap_cores_override_still_routes_featured_intent() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    // Featured intent: FOD ⟹ `effective_features = [fetcher]` (§13e),
+    // routes to `fetcher-*` only — same construction as the
+    // `--capacity` test above.
+    actor.test_inject_ready("d-overcap", Some("test-pkg"), "x86_64-linux", true);
+    let ceiling = actor.sla_ceilings.max_cores as u32;
+    let overcap = (ceiling as f64) * 4.0;
+    actor
+        .sla_estimator
+        .seed_overrides(vec![crate::db::SlaOverrideRow {
+            pname: "test-pkg".into(),
+            cores: Some(overcap),
+            ..Default::default()
+        }]);
+
+    let state = actor.dag.node("d-overcap").unwrap();
+    let (hw, cost, ig) = actor.solve_inputs();
+    let intent = actor.solve_intent_for(state, &hw, &cost, ig);
+
+    assert!(
+        !intent.hw_class_names.is_empty(),
+        "featured intent with over-cap `--cores={overcap}` (ceiling \
+         {ceiling}) must keep node_affinity — `bypass_cells` must see \
+         the post-clamp cores so `reference_hw_class_for_system` finds \
+         a hosting class; got hw_class_names={:?} node_affinity={:?}",
+        intent.hw_class_names,
+        intent.node_affinity,
+    );
+    assert!(
+        intent
+            .hw_class_names
+            .iter()
+            .all(|h| h.starts_with("fetcher-")),
+        "FOD with over-cap `--cores` override must route ONLY to \
+         fetcher cells (§13e); got hw_class_names={:?}",
+        intent.hw_class_names,
+    );
+    assert!(
+        intent.cores <= ceiling,
+        "over-cap `--cores={overcap}` must be clamped to ceiling \
+         {ceiling}; got intent.cores={}",
+        intent.cores,
+    );
+}
+
 /// §13e (was mb_023/r31 B0) — `bypass_cells` derives `effective_
 /// features` ABOVE the `match cap`, so BOTH arms (and any future arm)
 /// see `[fetcher]` for FODs. Asserts on `bypass_cells` directly so a
