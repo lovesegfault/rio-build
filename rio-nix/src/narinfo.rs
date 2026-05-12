@@ -801,7 +801,7 @@ FileSize: 54321
         let (ni, trusted) = signed_narinfo("k", [0u8; 32]);
         assert_eq!(ni.verify_sig(&[]), None, "empty trusted_keys");
 
-        let mut ni2 = ni.clone();
+        let mut ni2 = ni;
         ni2.sigs.clear();
         assert_eq!(ni2.verify_sig(&[trusted]), None, "empty sigs");
     }

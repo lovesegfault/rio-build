@@ -390,7 +390,7 @@ mod tests {
 
         let input = "/nix/store/54f75pjisgz20ql6azwmck1v779xs0a9-source".to_string();
         let other = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello".to_string();
-        let closure = vec![input.clone(), other.clone()];
+        let closure = vec![input.clone(), other];
         let enoent = format!(
             "while setting up the build environment: getting attributes of \
              path '{input}': No such file or directory"

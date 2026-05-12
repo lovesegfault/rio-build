@@ -16,7 +16,7 @@ use rio_proto::types::{
 };
 
 #[derive(Subcommand, Clone)]
-pub enum SlaCmd {
+pub(crate) enum SlaCmd {
     /// Pin a (pname, system?, tenant?) key to a forced tier / cores /
     /// mem. NULL system/tenant are wildcards (most-specific match wins).
     /// Picked up by the next estimator refresh tick (~60s).

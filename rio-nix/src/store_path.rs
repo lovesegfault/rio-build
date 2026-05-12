@@ -762,7 +762,7 @@ mod tests {
 
         let p_sorted =
             StorePath::make_fixed_output("src", &hash, true, &[r_a.clone(), r_b.clone()])?;
-        let p_rev = StorePath::make_fixed_output("src", &hash, true, &[r_b, r_a.clone()])?;
+        let p_rev = StorePath::make_fixed_output("src", &hash, true, &[r_b, r_a])?;
         assert_eq!(p_sorted, p_rev, "ref ordering must not affect path");
 
         let p_noref = StorePath::make_fixed_output("src", &hash, true, &[])?;

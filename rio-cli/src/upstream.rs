@@ -87,7 +87,7 @@ async fn resolve_tenant(tenant: String, cfg: &crate::Config) -> anyhow::Result<S
 // r[impl store.substitute.upstream]
 // r[impl cli.cmd.upstream]
 #[derive(Subcommand, Clone)]
-pub enum UpstreamCmd {
+pub(crate) enum UpstreamCmd {
     /// List configured upstream caches for a tenant (priority order).
     List {
         /// Tenant name or UUID.

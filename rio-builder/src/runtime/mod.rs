@@ -1244,11 +1244,7 @@ mod tests {
         // controller's belt-and-suspenders for pre-CEL specs).
         let (_, _, feats) =
             resolve_executor_identity(Fetcher, "f".into(), s(&["builtin"]), s(&["kvm"])).unwrap();
-        assert_eq!(
-            feats,
-            vec![f.clone()],
-            "Fetcher + [kvm] → overridden to [fetcher]"
-        );
+        assert_eq!(feats, vec![f], "Fetcher + [kvm] → overridden to [fetcher]");
 
         // Builder: declared verbatim, no auto-derive.
         let (_, _, feats) = resolve_executor_identity(

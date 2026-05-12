@@ -13,7 +13,7 @@ use serde::Serialize;
 use rio_crds::pool::{Pool, PoolStatus};
 
 #[derive(Subcommand, Clone)]
-pub enum PoolCmd {
+pub(crate) enum PoolCmd {
     /// List Pools in a namespace.
     Get {
         #[arg(short, long, default_value = "default")]
