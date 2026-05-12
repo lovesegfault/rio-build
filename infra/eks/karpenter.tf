@@ -60,26 +60,46 @@ resource "aws_iam_policy" "karpenter_node_primary_ipv6" {
   })
 }
 
-# Karpenter NodePools (rio-build chart, templates/karpenter.yaml) allow
-# capacity-type=[spot, on-demand]. The first spot request in an account
-# makes EC2 auto-create AWSServiceRoleForEC2Spot via the CALLER's
-# iam:CreateServiceLinkedRole — the controller role above doesn't have
-# that (and shouldn't; keep runtime IAM minimal). Symptom: karpenter
-# logs AuthFailure.ServiceLinkedRoleCreationNotPermitted and silently
-# falls through to on-demand. Pre-create under apply-time credentials.
+# rio's NodeClaims hard-pin `karpenter.sh/capacity-type In [spot]` for
+# default builder cells (cover.rs `build_nodeclaim`). The first spot
+# `CreateFleet` in an account auto-creates AWSServiceRoleForEC2Spot via
+# the CALLER's `iam:CreateServiceLinkedRole` — the Karpenter controller
+# role above doesn't have that (and shouldn't; keep runtime IAM minimal).
 #
-# SLRs are account-global singletons; aws_iam_service_linked_role fails
-# create if one already exists (prior manual spot request, another
-# stack). aws_iam_roles (plural) returns an empty set rather than
-# erroring on miss, so count=0 when present.
-data "aws_iam_roles" "spot_slr" {
-  name_regex  = "^AWSServiceRoleForEC2Spot$"
-  path_prefix = "/aws-service-role/spot.amazonaws.com/"
-}
-
-resource "aws_iam_service_linked_role" "spot" {
-  count            = length(data.aws_iam_roles.spot_slr.names) == 0 ? 1 : 0
-  aws_service_name = "spot.amazonaws.com"
+# Without the SLR every spot launch fails with
+# `AuthFailure.ServiceLinkedRoleCreationNotPermitted` (surfaced as
+# `UnfulfillableCapacity`). There is NO Karpenter-side fallback: the
+# capacity-type pin is a hard requirement. The controller ICE-masks the
+# cell, every cold-start fallback cell is spot, and builds stall — see
+# `RioNodeclaimPoolAllCellsIceMasked` and
+# docs/src/runbooks/sla-model.md#rionodeclaimpool-icemaskedhigh.
+#
+# Pre-create under apply-time credentials. NOT modeled as
+# `aws_iam_service_linked_role` with a data-source `count` guard — that
+# pattern flaps: apply N creates the role, apply N+1's plan-time data
+# source finds it, `count` goes to 0, terraform DESTROYS it (the
+# `DeleteServiceLinkedRole` succeeds while no spot instances run —
+# exactly the state of a fresh cluster pre-first-build), apply N+2
+# re-creates. Each odd-numbered apply leaves the cluster spot-broken.
+#
+# A `terraform_data` create-only provisioner is idempotent (the AWS CLI
+# exits 0 if the role exists, 0 if it creates it, ≠0 on a real auth or
+# transport error) and never deletes — the SLR is an account-global
+# singleton that should outlive any one stack.
+resource "terraform_data" "spot_slr" {
+  provisioner "local-exec" {
+    # Check-then-create rather than create-and-ignore-error: a real
+    # auth/transport failure must propagate (non-zero exit fails the
+    # apply), only the already-exists case is a no-op.
+    command = <<-EOT
+      set -e
+      if aws iam get-role --role-name AWSServiceRoleForEC2Spot >/dev/null 2>&1; then
+        echo "AWSServiceRoleForEC2Spot already exists"
+      else
+        aws iam create-service-linked-role --aws-service-name spot.amazonaws.com
+      fi
+    EOT
+  }
 }
 
 # Separate CRD chart: Helm NEVER upgrades CRDs in a chart's crds/
