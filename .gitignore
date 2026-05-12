@@ -63,3 +63,7 @@ mutants.out*/
 .data/
 *.qcow2
 .stress-test/
+
+# actor_pg_bench fixtures derived from internal repos — generated locally, never committed.
+*.bench-dag.json
+*.bench-traffic.json

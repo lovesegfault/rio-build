@@ -8,6 +8,7 @@ use clap_verbosity_flag::{Verbosity, WarnLevel};
 use human_panic::setup_panic;
 
 mod aws;
+mod bench;
 mod config;
 mod fuzz;
 mod git;
@@ -54,6 +55,8 @@ enum Cmd {
     NewMigration(migration::MigrationArgs),
     /// Kubernetes deploy (--provider {k3s,eks}).
     K8s(k8s::K8sArgs),
+    /// Benchmark fixture extraction (extract-dag, pr-gaps).
+    Bench(bench::BenchArgs),
 }
 
 fn main() -> std::process::ExitCode {
@@ -93,5 +96,6 @@ async fn run(cmd: Cmd, cfg: XtaskConfig) -> Result<()> {
         Cmd::Fuzz(args) => fuzz::run(args),
         Cmd::NewMigration(args) => migration::run(args),
         Cmd::K8s(args) => k8s::run(args, &cfg).await,
+        Cmd::Bench(args) => bench::run(args).await,
     }
 }
