@@ -70,7 +70,7 @@ fn path_hash(store_path: &str) -> Result<[u8; 32]> {
 /// `None` means the path has no complete manifest (either never uploaded,
 /// or stuck in 'uploading' from a crashed PutPath).
 #[instrument(skip(pool))]
-pub async fn get_manifest(pool: &PgPool, store_path: &str) -> Result<Option<ManifestKind>> {
+pub(crate) async fn get_manifest(pool: &PgPool, store_path: &str) -> Result<Option<ManifestKind>> {
     let hash = path_hash(store_path)?;
     // Single LEFT JOIN: both halves of the inline/chunked branch in
     // ONE statement = ONE MVCC snapshot. Filter on the manifests PK
@@ -150,7 +150,10 @@ fn decode_chunk_list(store_path: &str, chunk_list: &[u8]) -> Result<Vec<([u8; 32
 /// then a single index probe. `idx_narinfo_store_path` (migration 011)
 /// is defense-in-depth for any other text-filter callers.
 #[instrument(skip(pool))]
-pub async fn query_path_info(pool: &PgPool, store_path: &str) -> Result<Option<ValidatedPathInfo>> {
+pub(crate) async fn query_path_info(
+    pool: &PgPool,
+    store_path: &str,
+) -> Result<Option<ValidatedPathInfo>> {
     let hash = path_hash(store_path)?;
     let row: Option<NarinfoRow> =
         sqlx::query_as(narinfo_complete_select!("n.store_path_hash = $1"))
@@ -173,7 +176,7 @@ pub async fn query_path_info(pool: &PgPool, store_path: &str) -> Result<Option<V
 /// returning `None`). Filters on `store_path_hash = ANY(...)` (PK
 /// probe) — same I-078 reasoning as the single-path query.
 #[instrument(skip(pool, store_paths), fields(count = store_paths.len()))]
-pub async fn query_path_info_batch(
+pub(crate) async fn query_path_info_batch(
     pool: &PgPool,
     store_paths: &[String],
 ) -> Result<Vec<(String, Option<ValidatedPathInfo>)>> {
@@ -217,10 +220,10 @@ pub async fn query_path_info_batch(
 /// Returns `(path, Option<(info, manifest)>)` per input, in INPUT
 /// ORDER. `None` = no complete manifest. Same `status='complete'`
 /// filter and PK-probe shape (I-078) as the single-path queries.
-pub type ManifestBatchEntry = (String, Option<(ValidatedPathInfo, ManifestKind)>);
+pub(crate) type ManifestBatchEntry = (String, Option<(ValidatedPathInfo, ManifestKind)>);
 
 #[instrument(skip(pool, store_paths), fields(count = store_paths.len()))]
-pub async fn get_manifest_batch(
+pub(crate) async fn get_manifest_batch(
     pool: &PgPool,
     store_paths: &[String],
 ) -> Result<Vec<ManifestBatchEntry>> {
@@ -291,7 +294,10 @@ pub async fn get_manifest_batch(
 /// ANY(...)` for the same reason as `query_path_info` (I-078). With 1k
 /// paths, `= ANY(hashes)` is 1k PK probes; `= ANY(texts)` was 1k seq scans.
 #[instrument(skip(pool, store_paths), fields(count = store_paths.len()))]
-pub async fn find_missing_paths(pool: &PgPool, store_paths: &[String]) -> Result<Vec<String>> {
+pub(crate) async fn find_missing_paths(
+    pool: &PgPool,
+    store_paths: &[String],
+) -> Result<Vec<String>> {
     if store_paths.is_empty() {
         return Ok(Vec::new());
     }
@@ -333,7 +339,7 @@ pub async fn find_missing_paths(pool: &PgPool, store_paths: &[String]) -> Result
 /// planned binary-cache HTTP server.
 #[allow(dead_code)]
 #[instrument(skip(pool), fields(nar_hash = hex::encode(nar_hash)))]
-pub async fn path_by_nar_hash(pool: &PgPool, nar_hash: &[u8; 32]) -> Result<Option<String>> {
+pub(crate) async fn path_by_nar_hash(pool: &PgPool, nar_hash: &[u8; 32]) -> Result<Option<String>> {
     // Multiple paths CAN have the same nar_hash (two fetchurl of the
     // same file → same content → same NAR). LIMIT 1 picks one
     // arbitrarily — they all reassemble to the same bytes, so it
@@ -368,7 +374,7 @@ pub async fn path_by_nar_hash(pool: &PgPool, nar_hash: &[u8; 32]) -> Result<Opti
 /// injection (matches anything / anything-one-char); the gRPC validation
 /// prevents that by rejecting non-nixbase32 chars upfront.
 #[instrument(skip(pool))]
-pub async fn query_by_hash_part(
+pub(crate) async fn query_by_hash_part(
     pool: &PgPool,
     hash_part: &str,
 ) -> Result<Option<ValidatedPathInfo>> {
@@ -404,7 +410,11 @@ pub async fn query_by_hash_part(
 /// Returns rows updated (0 = path not found, 1 = appended). Caller maps
 /// 0 to NOT_FOUND.
 #[instrument(skip(pool, sigs), fields(count = sigs.len()))]
-pub async fn append_signatures(pool: &PgPool, store_path: &str, sigs: &[String]) -> Result<u64> {
+pub(crate) async fn append_signatures(
+    pool: &PgPool,
+    store_path: &str,
+    sigs: &[String],
+) -> Result<u64> {
     // WHERE ... = $1 (not LIKE): this takes a full path. Only
     // query_by_hash_part does prefix matching.
     //

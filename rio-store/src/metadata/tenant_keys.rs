@@ -26,7 +26,7 @@ use uuid::Uuid;
 /// no length constraint in PG; the 32-byte invariant is code-enforced.
 /// A wrong-length seed means someone inserted garbage (manual SQL, bad
 /// admin tool); fail loud rather than ed25519-panic or silently drop.
-pub async fn get_active_signer(
+pub(crate) async fn get_active_signer(
     pool: &PgPool,
     tenant_id: Uuid,
 ) -> Result<Option<Signer>, MetadataError> {
@@ -70,7 +70,7 @@ pub async fn get_active_signer(
 /// is the only sig). Without this, `r[store.tenant.sign-key]` +
 /// `r[store.substitute.tenant-sig-visibility]` compose into "tenant gets
 /// `NotFound` for the path it just built".
-pub async fn trusted_key_entries(
+pub(crate) async fn trusted_key_entries(
     pool: &PgPool,
     tenant_id: Uuid,
 ) -> Result<Vec<String>, MetadataError> {

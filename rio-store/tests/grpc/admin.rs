@@ -54,7 +54,7 @@ async fn trigger_gc_80k_roots_reaches_handler() -> TestResult {
     let roots: Vec<String> = (0..80_000)
         .map(|i| format!("not-a-store-path-but-seventy-bytes-long-padding-padding-{i:012}"))
         .collect();
-    let payload_bytes: usize = roots.iter().map(|s| s.len()).sum();
+    let payload_bytes: usize = roots.iter().map(String::len).sum();
     assert!(
         payload_bytes > 4 * 1024 * 1024,
         "payload must exceed tonic default 4 MiB to be meaningful; got {payload_bytes}"

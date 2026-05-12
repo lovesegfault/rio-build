@@ -26,7 +26,7 @@ use sqlx::PgPool;
 /// (most likely to have live sigs) is first in the verify loop. Minor
 /// optimization — `any_sig_trusted` is O(keys×sigs) regardless, but
 /// early-exit on common case is free.
-pub async fn load_cluster_key_history(pool: &PgPool) -> Result<Vec<String>, MetadataError> {
+pub(crate) async fn load_cluster_key_history(pool: &PgPool) -> Result<Vec<String>, MetadataError> {
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT pubkey FROM cluster_key_history \
          WHERE retired_at IS NULL \

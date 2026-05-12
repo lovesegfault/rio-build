@@ -29,7 +29,7 @@ use tracing::{debug, instrument};
 /// a deliberate false-negative (rollback no-ops, orphan scanner cleans
 /// up after `STALE_THRESHOLD`). Safe; the alternative (no token) lets
 /// a stale uploader clobber a fresh one mid-upload.
-pub type PlaceholderToken = f64;
+pub(crate) type PlaceholderToken = f64;
 
 // ---------------------------------------------------------------------------
 // Chunked manifest ops
@@ -69,7 +69,7 @@ pub type PlaceholderToken = f64;
 /// chunk both increment correctly (PG resolves the conflict, second one
 /// sees the first's row and runs the UPDATE clause).
 #[instrument(skip(pool, chunk_list, chunk_hashes, chunk_sizes), fields(store_path_hash = hex::encode(store_path_hash), chunks = chunk_hashes.len()))]
-pub async fn upgrade_manifest_to_chunked(
+pub(crate) async fn upgrade_manifest_to_chunked(
     pool: &PgPool,
     store_path_hash: &[u8],
     chunk_list: &[u8],        // serialized Manifest
@@ -226,7 +226,7 @@ pub async fn upgrade_manifest_to_chunked(
 /// every other `chunks` writer (`r[store.chunk.lock-order]`).
 // r[impl store.cas.chunk-upload-committed]
 #[instrument(skip(pool, hashes), fields(count = hashes.len()))]
-pub async fn mark_chunks_uploaded(pool: &PgPool, hashes: &[Vec<u8>]) -> Result<()> {
+pub(crate) async fn mark_chunks_uploaded(pool: &PgPool, hashes: &[Vec<u8>]) -> Result<()> {
     if hashes.is_empty() {
         return Ok(());
     }
@@ -251,7 +251,7 @@ pub async fn mark_chunks_uploaded(pool: &PgPool, hashes: &[Vec<u8>]) -> Result<(
 /// Just the narinfo UPDATE + status flip. Same atomic guarantees as the
 /// inline variant.
 #[instrument(skip(pool, info), fields(store_path = %info.store_path.as_str()))]
-pub async fn complete_manifest_chunked(
+pub(crate) async fn complete_manifest_chunked(
     pool: &PgPool,
     info: &ValidatedPathInfo,
     claim: uuid::Uuid,
@@ -281,7 +281,7 @@ pub async fn complete_manifest_chunked(
 /// `status='uploading'` / `nar_size=0` guards (defense-in-depth, same
 /// as the inline variant).
 #[instrument(skip(pool, chunk_hashes), fields(store_path_hash = hex::encode(store_path_hash), chunks = chunk_hashes.len()))]
-pub async fn delete_manifest_chunked_uploading(
+pub(crate) async fn delete_manifest_chunked_uploading(
     pool: &PgPool,
     store_path_hash: &[u8],
     token: PlaceholderToken,

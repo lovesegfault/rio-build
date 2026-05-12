@@ -38,7 +38,7 @@ use tracing::{debug, instrument};
 /// — the race winner may have finished).
 // r[impl store.put.placeholder-claim+2]
 #[instrument(skip(pool, references), fields(store_path_hash = hex::encode(store_path_hash), refs = references.len()))]
-pub async fn insert_manifest_uploading(
+pub(crate) async fn insert_manifest_uploading(
     pool: &PgPool,
     store_path_hash: &[u8],
     store_path: &str,
@@ -97,7 +97,7 @@ pub async fn insert_manifest_uploading(
 /// Single transaction: either the path becomes fully visible to
 /// `query_path_info` or it stays a placeholder. No partial-complete state.
 #[instrument(skip(pool, info, nar_data), fields(store_path = %info.store_path.as_str(), nar_size = nar_data.len()))]
-pub async fn complete_manifest_inline(
+pub(crate) async fn complete_manifest_inline(
     pool: &PgPool,
     info: &ValidatedPathInfo,
     claim: uuid::Uuid,
@@ -120,7 +120,7 @@ pub async fn complete_manifest_inline(
 /// still present" after a non-reclaiming flow.
 #[cfg(test)]
 #[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
-pub async fn manifest_uploading_age(
+pub(crate) async fn manifest_uploading_age(
     pool: &PgPool,
     store_path_hash: &[u8],
 ) -> Result<Option<std::time::Duration>> {
@@ -160,7 +160,7 @@ pub async fn manifest_uploading_age(
 /// asserts a leaked refcount no longer causes upload-skip.
 #[cfg(test)]
 #[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
-pub async fn delete_manifest_uploading(pool: &PgPool, store_path_hash: &[u8]) -> Result<()> {
+pub(crate) async fn delete_manifest_uploading(pool: &PgPool, store_path_hash: &[u8]) -> Result<()> {
     let mut tx = pool.begin().await?;
 
     sqlx::query(
@@ -194,7 +194,7 @@ pub async fn delete_manifest_uploading(pool: &PgPool, store_path_hash: &[u8]) ->
 /// Idempotency pre-check for PutPath: if `true`, the path exists and the
 /// caller should return `created: false` without touching anything.
 #[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
-pub async fn check_manifest_complete(pool: &PgPool, store_path_hash: &[u8]) -> Result<bool> {
+pub(crate) async fn check_manifest_complete(pool: &PgPool, store_path_hash: &[u8]) -> Result<bool> {
     // EXISTS returns a PG bool, which sqlx decodes cleanly. `SELECT 1` would
     // return int4 and need i32 (not i64) — a type-width footgun that turns
     // into an opaque "ColumnDecode" runtime error. EXISTS sidesteps it

@@ -19,7 +19,7 @@ use uuid::Uuid;
 /// VALUE` (which takes `ACCESS EXCLUSIVE` on PG <14).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
 #[sqlx(type_name = "text", rename_all = "lowercase")]
-pub enum SigMode {
+pub(crate) enum SigMode {
     /// Store the upstream's `Sig:` lines unchanged. Verifiers must
     /// trust the upstream's key.
     Keep,
@@ -35,7 +35,7 @@ impl SigMode {
     /// Parse from the proto's string field. Empty → `Keep` (the
     /// migration's `DEFAULT 'keep'`). Unrecognized → `None` (caller
     /// maps to INVALID_ARGUMENT).
-    pub fn parse(s: &str) -> Option<Self> {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         match s {
             "" | "keep" => Some(Self::Keep),
             "add" => Some(Self::Add),
@@ -44,7 +44,7 @@ impl SigMode {
         }
     }
 
-    pub fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::Keep => "keep",
             Self::Add => "add",
@@ -56,7 +56,7 @@ impl SigMode {
 /// One row from `tenant_upstreams`. The Substituter iterates these in
 /// `priority ASC` order trying each until one has the path.
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub struct Upstream {
+pub(crate) struct Upstream {
     pub id: i32,
     pub tenant_id: Uuid,
     pub url: String,
@@ -72,7 +72,7 @@ pub struct Upstream {
 /// upstreams; substitution is opt-in). The composite index
 /// `tenant_upstreams_tenant_idx (tenant_id, priority)` makes this a
 /// cheap indexed scan.
-pub async fn list_for_tenant(
+pub(crate) async fn list_for_tenant(
     pool: &PgPool,
     tenant_id: Uuid,
 ) -> Result<Vec<Upstream>, MetadataError> {
@@ -97,7 +97,7 @@ pub async fn list_for_tenant(
 /// server-side in one round-trip. Empty table → empty Vec → the
 /// visibility gate in the caller returns `NotFound` (correct: a tenant
 /// with no upstreams trusts no upstream-substituted paths).
-pub async fn tenant_trusted_keys(
+pub(crate) async fn tenant_trusted_keys(
     pool: &PgPool,
     tenant_id: Uuid,
 ) -> Result<Vec<String>, MetadataError> {
@@ -118,7 +118,7 @@ pub async fn tenant_trusted_keys(
 /// `MetadataError::Conflict` (23505) — the caller maps that to
 /// `ALREADY_EXISTS`, not an error-per-se (idempotent-ish: client can
 /// check the existing row via ListUpstreams).
-pub async fn insert(
+pub(crate) async fn insert(
     pool: &PgPool,
     tenant_id: Uuid,
     url: &str,
@@ -144,7 +144,11 @@ pub async fn insert(
 /// Delete one upstream by `(tenant_id, url)` (the UNIQUE key).
 /// Returns rows_affected — 0 means the pair didn't exist (caller
 /// maps to NOT_FOUND).
-pub async fn delete(pool: &PgPool, tenant_id: Uuid, url: &str) -> Result<u64, MetadataError> {
+pub(crate) async fn delete(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    url: &str,
+) -> Result<u64, MetadataError> {
     sqlx::query("DELETE FROM tenant_upstreams WHERE tenant_id = $1 AND url = $2")
         .bind(tenant_id)
         .bind(url)

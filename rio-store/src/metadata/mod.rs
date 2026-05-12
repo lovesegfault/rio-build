@@ -43,33 +43,35 @@ mod chunked;
 mod cluster_key_history;
 mod inline;
 mod queries;
-pub mod tenant_keys;
-pub mod upstreams;
+pub(crate) mod tenant_keys;
+pub(crate) mod upstreams;
 
 // Public API — explicit re-exports so all external callers in grpc/,
 // cas.rs keep their `metadata::foo` paths. Kept explicit (not
 // `pub use chunked::*` etc.) so dead items in submodules
 // surface as `unused` instead of being silently exported.
-pub use chunked::{
+pub(crate) use chunked::{
     PlaceholderToken, complete_manifest_chunked, delete_manifest_chunked_uploading,
     mark_chunks_uploaded, upgrade_manifest_to_chunked,
 };
-pub use cluster_key_history::load_cluster_key_history;
-pub use inline::{check_manifest_complete, complete_manifest_inline, insert_manifest_uploading};
+pub(crate) use cluster_key_history::load_cluster_key_history;
+pub(crate) use inline::{
+    check_manifest_complete, complete_manifest_inline, insert_manifest_uploading,
+};
 #[cfg(test)]
-pub use inline::{delete_manifest_uploading, manifest_uploading_age};
-pub use queries::{
+pub(crate) use inline::{delete_manifest_uploading, manifest_uploading_age};
+pub(crate) use queries::{
     append_signatures, find_missing_paths, get_manifest, get_manifest_batch, query_by_hash_part,
     query_path_info, query_path_info_batch,
 };
-pub use tenant_keys::get_active_signer;
-pub use upstreams::{SigMode, Upstream};
+pub(crate) use tenant_keys::get_active_signer;
+pub(crate) use upstreams::{SigMode, Upstream};
 
 // Error type lives in `crate::error` so the `schema` feature can
 // compile it without pulling `bytes`/`rio_proto`. Re-exported here so
 // every existing `metadata::MetadataError` / `metadata::Result` path
 // keeps working unchanged.
-pub use crate::error::{MetadataError, Result};
+pub(crate) use crate::error::{MetadataError, Result};
 
 /// PG 40P01-retry backoff: ~50–150 ms (`100ms ± 50%`). One-shot — no
 /// exponential growth (mult=1, single attempt). Just enough to
@@ -106,7 +108,7 @@ pub(crate) fn jitter() -> Duration {
 /// The one-clone cost (~KB for typical chunk batches) is negligible
 /// versus PG roundtrips.
 // r[impl store.chunk.lock-order]
-pub async fn with_sorted_retry<T, F, Fut>(mut keys: Vec<Vec<u8>>, body: F) -> Result<T>
+pub(crate) async fn with_sorted_retry<T, F, Fut>(mut keys: Vec<Vec<u8>>, body: F) -> Result<T>
 where
     F: Fn(Vec<Vec<u8>>) -> Fut,
     Fut: Future<Output = Result<T>>,
@@ -129,7 +131,7 @@ where
 /// Encapsulating the branch here means the "check inline_blob FIRST, only
 /// then query manifest_data" rule lives in exactly one SQL query.
 #[derive(Debug)]
-pub enum ManifestKind {
+pub(crate) enum ManifestKind {
     /// Whole NAR stored in `manifests.inline_blob`.
     Inline(Bytes),
     /// NAR chunked; reassemble from this ordered list.
@@ -145,7 +147,7 @@ impl ManifestKind {
     /// rationale). GetPath checks this against `narinfo.nar_size`
     /// before streaming so manifest/narinfo drift fails fast with
     /// DATA_LOSS instead of delivering garbage.
-    pub fn total_size(&self) -> u64 {
+    pub(crate) fn total_size(&self) -> u64 {
         match self {
             ManifestKind::Inline(bytes) => bytes.len() as u64,
             ManifestKind::Chunked(entries) => entries.iter().map(|(_, size)| *size as u64).sum(),
@@ -297,7 +299,7 @@ pub(super) async fn update_narinfo_complete(
 /// rows in any table; `update_narinfo_complete` (no `claim_id` column
 /// on narinfo) only runs once ownership is proven.
 // r[impl store.put.placeholder-claim+2]
-pub async fn complete_manifest_in_conn(
+pub(crate) async fn complete_manifest_in_conn(
     conn: &mut sqlx::PgConnection,
     info: &ValidatedPathInfo,
     claim: uuid::Uuid,

@@ -820,7 +820,7 @@ impl Substituter {
         let mut info = narinfo_to_validated(&ni, expected_hash)?;
         let store_path_hash = info.store_path.sha256_digest();
         info.store_path_hash = store_path_hash.to_vec();
-        let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
+        let refs_str: Vec<String> = info.references.iter().map(ToString::to_string).collect();
 
         let claim = match ingest::claim_placeholder(
             &self.pool,
