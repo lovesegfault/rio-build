@@ -367,6 +367,52 @@ spec:
               and check `spec.systems`/`effective_features`.
               See docs/src/runbooks/sla-model.md#rionodeclaimpool-nohostingclass.
 
+        # Sibling of NoHostingClass for the OTHER reason `assign_to_cells`
+        # drops a cold-start intent: a class CAN host it, but every
+        # hosting cell is ICE-masked because NodeClaim launches are
+        # failing in the cloud. Same symptom (build's drv permanently
+        # Ready and unroutable), opposite operator action — DON'T add a
+        # `[sla.hw_classes]` entry; fix the cloud. Distinguishing the
+        # two saves the operator from a config-side spelunk for an
+        # account-side gap (a missing AWSServiceRoleForEC2Spot took the
+        # `no_hosting_class` warn at face value and lost ~10min on the
+        # wrong axis).
+        #
+        # NOT folded into RioNodeclaimPoolIceMaskedHigh: that alert is
+        # cause-side (`reaped{ice|vanished}` per cell, ≥3 cells) and
+        # bounds noise with the 3-cell threshold; a kvm-only build whose
+        # single `metal-x86:od` cell is ICE'd never reaches 3 cells but
+        # IS stuck. This alert is consequence-side (intents actually
+        # dropped) — the two are coupled by intent on the runbook page,
+        # not by the rule expr.
+        #
+        # `for: 15m`, not 5m like NoHostingClass: ICE backoff TTLs are
+        # 60s × 2^step capped at maxLeadTime, so transient capacity dips
+        # self-heal within ~10min. A 5m `for:` would false-fire on every
+        # multi-cell spot blip. NoHostingClass is config-static and never
+        # self-heals — `for: 5m` is right there.
+        - alert: RioNodeclaimPoolAllCellsIceMasked
+          expr: |
+            increase(rio_controller_nodeclaim_intent_dropped_total{reason="all_cells_ice_masked"}[15m]) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: NodeClaim intents dropped — every hosting cell ICE-masked
+            description: >-
+              {{`{{ $value | humanize }}`}} SpawnIntents dropped over 15m because
+              every cell that could host them is ICE-masked. NodeClaim launches
+              are failing in the cloud — this is NOT a `[sla.hw_classes]` config
+              gap. Check `kubectl logs -n kube-system deploy/karpenter` for
+              CreateFleet errors (capacity, quota, or IAM — e.g. a missing
+              `AWSServiceRoleForEC2Spot` SLR fails every spot launch) and
+              `rio_controller_nodeclaim_reaped_total{reason=~"ice|vanished"}`.
+              Once the cloud-side issue is fixed, `kubectl rollout restart
+              deploy/rio-scheduler -n rio-system` clears the in-memory ICE
+              backoff immediately (otherwise it self-heals on TTL expiry,
+              up to `sla.maxLeadTime`).
+              See docs/src/runbooks/sla-model.md#rionodeclaimpool-icemaskedhigh.
+
         # qa-fix-b r37: a NodeClaim whose Karpenter finalizer never
         # clears stays `terminating` indefinitely. `class_budget` and
         # `live_cores` still count it (the EC2 instance bills until the

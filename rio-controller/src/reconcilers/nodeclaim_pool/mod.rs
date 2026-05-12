@@ -411,16 +411,29 @@ impl NodeClaimPoolConfig {
     /// `kubernetes.io/arch` label matches `intent.system` (or is absent
     /// — arch-agnostic hw-class) AND its per-class `max_cores`/`max_mem`
     /// host the intent, else the first (sorted) hw-class satisfying
-    /// both. `None` ⇔ `system` unmappable OR no configured hw-class
-    /// hosts that arch at that size (caller emits
-    /// `rio_controller_nodeclaim_intent_dropped_total
-    /// {reason=no_hosting_class}`).
+    /// both. `None` ⇔ `system` unmappable, no configured hw-class hosts
+    /// that arch at that size, OR every hosting cell is in `masked` —
+    /// the caller (`cover::assign_to_cells`) re-evaluates with
+    /// `masked=∅` to attribute the drop
+    /// (`rio_controller_nodeclaim_intent_dropped_total{reason=
+    /// no_hosting_class|all_cells_ice_masked}` — the two need different
+    /// operator actions; see `cover::DropTally`).
     ///
     /// Capacity-type is the FIRST listed for the class (Spot for
     /// default classes — cold-start probes are uniform `probe.cpu`-
     /// shaped and bounded by `max_node_claims_per_cell_per_tick`;
     /// on-demand fallback would defeat the §13b cost model. OnDemand
-    /// for od-only classes like metal — §13c).
+    /// for od-only classes like metal — §13c). **Consequence:** a
+    /// *structural* spot failure (account quota, missing
+    /// `AWSServiceRoleForEC2Spot`, region exhaustion) ICE-masks every
+    /// cold-start fallback cell, the build never completes, the
+    /// estimator never gets a fit, and `hw_class_names` stays `[]`
+    /// forever — the system has no automatic spot→od escape valve. That
+    /// is deliberate: spot ICE is normally transient (60s–`maxLeadTime`
+    /// backoff) and pre-empting to od burns money for nothing. The
+    /// escape valve for a structural failure is the operator's call,
+    /// surfaced by `RioNodeclaimPoolAllCellsIceMasked`: fix the cloud,
+    /// or set `capacityTypes: [on-demand]` on the affected class.
     ///
     /// §13d STRIKE-7 (r30 mb_012): `provides_features` IS filtered here.
     /// The pre-r30 doc claimed "post-§13c kvm intents always get
@@ -1477,8 +1490,8 @@ impl NodeClaimPoolReconciler {
         // policy, not a demand metric.
         let none = HashSet::new();
         let (by_cell, _) =
-            cover::assign_to_cells(unplaced, &self.sketches, &none, cover::cell_rank, |i| {
-                self.cfg.fallback_cell(i, &self.hw_config, &none)
+            cover::assign_to_cells(unplaced, &self.sketches, &none, cover::cell_rank, |i, m| {
+                self.cfg.fallback_cell(i, &self.hw_config, m)
             });
         // r41 bug_021 sibling: same `all_cells()` blind spot as
         // `cover_deficit` — `by_cell` is keyed on scheduler-stamped
@@ -1594,28 +1607,49 @@ impl NodeClaimPoolReconciler {
         let mut created_cores = 0u32;
 
         let (by_cell, dropped) =
-            cover::assign_to_cells(unplaced, &self.sketches, &ice, cover::cell_rank, |i| {
-                self.cfg.fallback_cell(i, &self.hw_config, &ice)
+            cover::assign_to_cells(unplaced, &self.sketches, &ice, cover::cell_rank, |i, m| {
+                self.cfg.fallback_cell(i, &self.hw_config, m)
             });
-        if dropped > 0 {
+        // r41 merged_015: the runbook (sla-model.md §NoHostingClass) and
+        // pod.rs:769,772 both claim "the controller logs WARN once per
+        // intent drop" — sibling reasons `no_pool_covers`,
+        // `exceeds_cell_cap`, and `unknown_hw_class` already warn; this
+        // was the asymmetric outlier. Per intent-tick (10s), so a
+        // persistent gap is visible in logs without waiting for the 15m
+        // alert window.
+        //
+        // Two `reason`s, two operator actions: collapsing them once
+        // misdiagnosed an account-level AWS spot SLR gap as a
+        // `[sla.hw_classes]` config gap (see `cover::DropTally`).
+        if dropped.no_hosting_class > 0 {
             metrics::counter!(
                 "rio_controller_nodeclaim_intent_dropped_total",
                 "reason" => "no_hosting_class",
             )
-            .increment(dropped);
-            // r41 merged_015: the runbook (sla-model.md §NoHostingClass) and
-            // pod.rs:769,772 both claim "the controller logs WARN once per
-            // intent drop" — sibling reasons `no_pool_covers`,
-            // `exceeds_cell_cap`, and `unknown_hw_class` already warn; this
-            // was the asymmetric outlier. Per intent-tick (10s), so a
-            // persistent gap is visible in logs without waiting for the 15m
-            // alert window.
+            .increment(dropped.no_hosting_class);
             warn!(
-                dropped,
+                dropped = dropped.no_hosting_class,
                 "SpawnIntents dropped — no configured hw-class can host them \
                  (wrong arch, footprint exceeds every class's max_cores/max_mem, \
                  or required_features unmatched); add or fix a [sla.hw_classes] \
                  entry. See sla-model.md#rionodeclaimpool-nohostingclass"
+            );
+        }
+        if dropped.all_cells_ice_masked > 0 {
+            metrics::counter!(
+                "rio_controller_nodeclaim_intent_dropped_total",
+                "reason" => "all_cells_ice_masked",
+            )
+            .increment(dropped.all_cells_ice_masked);
+            warn!(
+                dropped = dropped.all_cells_ice_masked,
+                masked_cells = ice.len(),
+                "SpawnIntents dropped — every cell that could host them is \
+                 ICE-masked (NodeClaim launches failing in the cloud, NOT a \
+                 [sla.hw_classes] config gap); check the Karpenter controller \
+                 log for capacity/quota/IAM errors and \
+                 `rio_controller_nodeclaim_reaped_total{{reason=~\"ice|vanished\"}}`. \
+                 See sla-model.md#rionodeclaimpool-icemaskedhigh"
             );
         }
         let order =

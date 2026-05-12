@@ -113,18 +113,55 @@ pub struct CoverCfg<'a> {
     pub metal_sizes: &'a [String],
 }
 
+/// Per-reason cold-start (`hw_class_names=[]`) drop counts from
+/// [`assign_to_cells`]. The two reasons share the symptom (no NodeClaim
+/// minted, build's drv permanently `Ready` and unroutable) but require
+/// **different operator actions** — collapsing them into a single count
+/// once misdiagnosed an account-level AWS IAM gap as a `[sla.hw_classes]`
+/// config gap (see `assign_distinguishes_no_class_from_all_masked`).
+///
+/// Forecast-only intents (`hw_class_names` non-empty, lead-time-gated)
+/// are NOT counted here — they're not dropped, just not yet placeable.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DropTally {
+    /// `fallback` returned `None` even with **no** ICE-masking — there
+    /// is no `[sla.hw_classes]` entry whose `(arch, max_cores, max_mem,
+    /// provides_features)` admits the intent. Persistent until the
+    /// config changes. **Operator action:** add or fix a class. See
+    /// `sla-model.md#rionodeclaimpool-nohostingclass`.
+    pub no_hosting_class: u64,
+    /// `fallback` admits the intent in principle, but **every** cell
+    /// that could host it is ICE-masked — NodeClaim launches are
+    /// failing in the cloud (capacity exhaustion, quota, IAM). Self-
+    /// heals once the ICE backoff expires *if* the cloud recovers;
+    /// persistent if the cloud failure is structural (e.g. a missing
+    /// `AWSServiceRoleForEC2Spot`). **Operator action:** check
+    /// `rio_controller_nodeclaim_reaped_total{reason=~"ice|vanished"}`
+    /// and the Karpenter controller log for launch errors. See
+    /// `sla-model.md#rionodeclaimpool-icemaskedhigh`.
+    pub all_cells_ice_masked: u64,
+}
+
 /// Group `unplaced` by the cheapest cell in each intent's `A_open`.
 ///
 /// Intents with empty `A_open` from `hw_class_names=[]` (cold-start
-/// `fit=None`) are routed via `fallback(i)` — typically the
+/// `fit=None`) are routed via `fallback(i, masked)` — typically the
 /// `referenceHwClass` cell of `intent.system`'s arch (see
 /// [`super::NodeClaimPoolConfig::fallback_cell`]). Intents with empty
 /// `A_open` from lead-time gating (every cell's lead-time shorter than
 /// `eta_seconds`) are dropped without fallback — they're forecast-only
-/// and a later tick re-evaluates. `fallback → None` (no configured cell
-/// hosts that arch at that size) increments the returned dropped count;
-/// caller emits
-/// `rio_controller_nodeclaim_intent_dropped_total{reason=no_hosting_class}`.
+/// and a later tick re-evaluates.
+///
+/// `fallback` takes the live mask so it can fail over to the next
+/// arch-matching cell when the reference cell is ICE-masked (mb_024).
+/// When the masked call returns `None`, the implementation re-evaluates
+/// `fallback(i, ∅)` to attribute the drop: still `None` → no class
+/// hosts the intent at all (`DropTally::no_hosting_class` — config
+/// gap); `Some` → the class exists but every hosting cell is masked
+/// (`DropTally::all_cells_ice_masked` — cloud capacity gap). The
+/// re-eval is bounded at one extra `O(|hw_classes|)` predicate pass
+/// **per dropped intent** — the steady-state hot path (intents that
+/// place) never pays it.
 ///
 /// `masked` cells (ICE-hit this tick or scheduler-reported
 /// `ice_masked_cells`) are filtered from each intent's `A_open` BEFORE
@@ -140,10 +177,11 @@ pub fn assign_to_cells<'a>(
     sketches: &CellSketches,
     masked: &HashSet<Cell>,
     cell_price: impl Fn(&Cell) -> f64,
-    fallback: impl Fn(&SpawnIntent) -> Option<Cell>,
-) -> (BTreeMap<Cell, Vec<&'a SpawnIntent>>, u64) {
+    fallback: impl Fn(&SpawnIntent, &HashSet<Cell>) -> Option<Cell>,
+) -> (BTreeMap<Cell, Vec<&'a SpawnIntent>>, DropTally) {
     let mut by_cell: BTreeMap<Cell, Vec<&SpawnIntent>> = BTreeMap::new();
-    let mut dropped = 0u64;
+    let mut dropped = DropTally::default();
+    let unmasked = HashSet::new();
     for i in unplaced {
         let open = a_open(i, sketches);
         let cheapest = open
@@ -157,13 +195,19 @@ pub fn assign_to_cells<'a>(
                     // No fallback — next tick re-evaluates.
                     return None;
                 }
-                // Fallback is filtered through `masked` too: a masked
-                // `(referenceHwClass, spot)` would land in `by_cell`
-                // and then be `continue`d by the per-cell ICE skip —
-                // silently stranding cold-start probes.
-                let c = fallback(i).filter(|c| !masked.contains(c));
+                // Defense-in-depth: re-filter even though the
+                // `fallback_cell` impl already respects `masked`. A
+                // masked `(referenceHwClass, spot)` that slipped through
+                // would land in `by_cell` and then be `continue`d by the
+                // per-cell ICE skip — silently stranding cold-start
+                // probes.
+                let c = fallback(i, masked).filter(|c| !masked.contains(c));
                 if c.is_none() {
-                    dropped += 1;
+                    if fallback(i, &unmasked).is_some() {
+                        dropped.all_cells_ice_masked += 1;
+                    } else {
+                        dropped.no_hosting_class += 1;
+                    }
                 }
                 c
             });
@@ -972,8 +1016,10 @@ mod tests {
         // h1 cheaper.
         let price = |c: &Cell| if c.0 == "h1" { 0.03 } else { 0.05 };
         let none = HashSet::new();
-        let (by, d) = assign_to_cells(&unplaced, &CellSketches::default(), &none, price, |_| None);
-        assert_eq!(d, 0);
+        let (by, d) = assign_to_cells(&unplaced, &CellSketches::default(), &none, price, |_, _| {
+            None
+        });
+        assert_eq!(d, DropTally::default());
         assert_eq!(by.len(), 2);
         let h1k = Cell("h1".into(), CapacityType::Spot);
         let h2k = Cell("h2".into(), CapacityType::Spot);
@@ -1016,9 +1062,13 @@ mod tests {
             &CellSketches::default(),
             &none,
             cell_rank,
-            |_| None,
+            |_, _| None,
         );
-        assert_eq!(d, 0, "no fallback drops — both have hw_class_names");
+        assert_eq!(
+            d,
+            DropTally::default(),
+            "no fallback drops — both have hw_class_names"
+        );
         let fcell = Cell("fetcher-x86".into(), CapacityType::Spot);
         let bcell = Cell("mid-ebs-x86".into(), CapacityType::Spot);
         assert_eq!(by.len(), 2, "exactly two disjoint cells");
@@ -1053,7 +1103,7 @@ mod tests {
             &CellSketches::default(),
             &HashSet::new(),
             cell_rank,
-            |_| None,
+            |_, _| None,
         );
         assert_eq!(by[&spot].len(), 1);
         // spot ICE-masked → od.
@@ -1063,23 +1113,24 @@ mod tests {
             &CellSketches::default(),
             &masked,
             cell_rank,
-            |_| None,
+            |_, _| None,
         );
-        assert_eq!(d, 0);
+        assert_eq!(d, DropTally::default());
         assert!(!by.contains_key(&spot));
         assert_eq!(by[&od].len(), 1);
         // Both masked → A_open empties; non-empty hw_class_names ⇒ NOT
-        // fallback-routed (next tick re-evaluates).
+        // fallback-routed (silently skipped, NOT counted as a drop —
+        // next tick re-evaluates).
         let masked: HashSet<Cell> = [spot, od].into();
         let (by, d) = assign_to_cells(
             &unplaced,
             &CellSketches::default(),
             &masked,
             cell_rank,
-            |_| None,
+            |_, _| None,
         );
         assert!(by.is_empty());
-        assert_eq!(d, 0);
+        assert_eq!(d, DropTally::default());
     }
 
     /// Cold-start: `hw_class_names=[]` → routed via `fallback`.
@@ -1113,7 +1164,7 @@ mod tests {
                 i
             },
         ];
-        let fallback = |i: &SpawnIntent| {
+        let fallback = |i: &SpawnIntent, _: &HashSet<Cell>| {
             (i.system == "x86_64-linux").then(|| Cell("ref".into(), CapacityType::Spot))
         };
         let (by, d) = assign_to_cells(
@@ -1123,7 +1174,8 @@ mod tests {
             |_| 0.0,
             fallback,
         );
-        assert_eq!(d, 1, "agn-u dropped");
+        assert_eq!(d.no_hosting_class, 1, "agn-u dropped");
+        assert_eq!(d.all_cells_ice_masked, 0);
         assert_eq!(by.len(), 1);
         assert_eq!(by[&ref_cell].len(), 1);
         assert_eq!(by[&ref_cell][0].intent_id, "agn-x");
@@ -1136,10 +1188,88 @@ mod tests {
             &CellSketches::default(),
             &HashSet::new(),
             |_| 0.0,
-            |_| None,
+            |_, _| None,
         );
         assert!(by.is_empty());
-        assert_eq!(d, 0);
+        assert_eq!(d, DropTally::default());
+    }
+
+    /// `assign_to_cells` distinguishes WHY a cold-start intent dropped —
+    /// the two reasons need different operator actions and the WARN/
+    /// metric in [`super::super::cover_deficit`] must name the right one.
+    ///
+    /// `fallback(i, ∅) → None`: no `[sla.hw_classes]` entry hosts the
+    /// intent's `(arch, footprint, features)` — config gap. Operator
+    /// adds or fixes a class. → `no_hosting_class`.
+    ///
+    /// `fallback(i, ∅) → Some` but `fallback(i, masked) → None`: every
+    /// cell that COULD host it is ICE-masked — NodeClaim launches are
+    /// failing in the cloud (capacity / quota / IAM). Operator checks
+    /// Karpenter, not `[sla.hw_classes]`. → `all_cells_ice_masked`.
+    ///
+    /// Discovered live: a fresh AWS account without the
+    /// `AWSServiceRoleForEC2Spot` SLR fails every spot CreateFleet,
+    /// every spot cell ICE-masks within ~6 ticks, and the
+    /// `no_hosting_class` warn told the operator to "add a
+    /// `[sla.hw_classes]` entry" for an account-level IAM gap.
+    #[test]
+    fn assign_distinguishes_no_class_from_all_masked() {
+        let ref_cell = Cell("ref".into(), CapacityType::Spot);
+        let arm_cell = Cell("arm".into(), CapacityType::Spot);
+        let unplaced = [
+            // Hostable, but every hosting cell is masked → ICE drop.
+            SpawnIntent {
+                intent_id: "hostable-masked".into(),
+                cores: 4,
+                system: "x86_64-linux".into(),
+                ready: Some(true),
+                ..Default::default()
+            },
+            // No class hosts this system → config drop.
+            SpawnIntent {
+                intent_id: "unhostable".into(),
+                cores: 4,
+                system: "riscv64-none".into(),
+                ready: Some(true),
+                ..Default::default()
+            },
+            // Hostable and unmasked → assigned.
+            SpawnIntent {
+                intent_id: "hostable-open".into(),
+                cores: 4,
+                system: "aarch64-linux".into(),
+                ready: Some(true),
+                ..Default::default()
+            },
+        ];
+        // Masked-aware fallback: same shape as `fallback_cell`'s — the
+        // closure tries its hosting cell and respects the supplied mask.
+        let fallback = |i: &SpawnIntent, m: &HashSet<Cell>| -> Option<Cell> {
+            let c = match i.system.as_str() {
+                "x86_64-linux" => Cell("ref".into(), CapacityType::Spot),
+                "aarch64-linux" => Cell("arm".into(), CapacityType::Spot),
+                _ => return None,
+            };
+            (!m.contains(&c)).then_some(c)
+        };
+        let masked: HashSet<Cell> = [ref_cell].into();
+        let (by, d) = assign_to_cells(
+            &unplaced,
+            &CellSketches::default(),
+            &masked,
+            |_| 0.0,
+            fallback,
+        );
+        assert_eq!(
+            d,
+            DropTally {
+                no_hosting_class: 1,
+                all_cells_ice_masked: 1,
+            },
+            "hostable-masked → ice; unhostable → no_class"
+        );
+        assert_eq!(by.len(), 1, "only the unmasked arm cell received work");
+        assert_eq!(by[&arm_cell][0].intent_id, "hostable-open");
     }
 
     #[test]
@@ -1544,8 +1674,16 @@ mod tests {
             ..Default::default()
         }];
         let ref_cell = Cell("ref".into(), CapacityType::Spot);
-        let fallback = |_: &SpawnIntent| Some(ref_cell.clone());
-        // ref-spot ICE-masked → fallback filtered out → dropped.
+        // Masked-BLIND fallback (returns the cell regardless of mask) —
+        // exercises the defense-in-depth `.filter(!masked)` after the
+        // `fallback(i, masked)` call. `fallback_cell` already respects
+        // its `masked` arg; this closure deliberately does not, so a
+        // future `fallback_cell` regression that stops filtering can't
+        // strand probes on a masked cell.
+        let fallback = |_: &SpawnIntent, _: &HashSet<Cell>| Some(ref_cell.clone());
+        // ref-spot ICE-masked → fallback filtered out → dropped as
+        // `all_cells_ice_masked` (the fallback CAN host it; the cell is
+        // just masked).
         let masked: HashSet<Cell> = [ref_cell.clone()].into();
         let (by, d) = assign_to_cells(
             &unplaced,
@@ -1555,6 +1693,13 @@ mod tests {
             fallback,
         );
         assert!(by.is_empty(), "masked fallback must not appear in by_cell");
-        assert_eq!(d, 1, "masked fallback counted in dropped");
+        assert_eq!(
+            d,
+            DropTally {
+                no_hosting_class: 0,
+                all_cells_ice_masked: 1,
+            },
+            "masked fallback counted as ICE drop, not config drop"
+        );
     }
 }

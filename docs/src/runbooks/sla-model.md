@@ -17,12 +17,13 @@ override or reset.
 | `RioSlaPriorDivergenceClamped` | fleet-prior parameter clamped at band edge for 10m | [Prior divergence](#riosla-priordivergenceclamped) |
 | `RioSlaHwCostStale` | hw-band $/vCPU·hr snapshot >30m old | [Hw-cost stale](#riosla-hwcoststale) |
 | `RioNodeclaimPoolIceMaskedHigh` | ≥3 cells reaping NodeClaims for `reason=ice` | [Admissible set shrinking](#rionodeclaimpool-icemaskedhigh) |
+| `RioNodeclaimPoolAllCellsIceMasked` | SpawnIntents dropped — every hosting cell is ICE-masked | [Admissible set shrinking](#rionodeclaimpool-icemaskedhigh) |
 | `RioNodeclaimPoolStuckPending` | NodeClaim in-flight >2× cell `ice_timeout` (floor 90s, cap 3×maxLeadTime) | [Provisioning stuck](#rionodeclaimpool-stuckpending) |
 | `RioNodeclaimPoolBootTimeoutLoop` | A cell is repeatedly minting and reaping NodeClaims for `reason=boot-timeout` | [Boot-timeout loop](#rionodeclaimpool-boottimeoutloop) |
 | `RioNodeclaimPoolNoHostingClass` | SpawnIntents dropped — no configured hw-class or Pool can host them | [No hosting class](#rionodeclaimpool-nohostingclass) |
 | `RioNodeclaimPoolStuckTerminating` | A NodeClaim has had `deletionTimestamp` set >5m without Karpenter's finalizer clearing | [Stuck terminating](#rionodeclaimpool-stuckterminating) |
 
-The first three are model-accuracy alerts; the last five are provisioning
+The first three are model-accuracy alerts; the last six are provisioning
 alerts that share the same `rio-cli sla` diagnostic surface.
 
 ## Step 1: Identify the offending pname
@@ -247,11 +248,49 @@ scheduler leader-lease (`kubectl -n rio-system get lease rio-scheduler-leader`
 
 ### RioNodeclaimPool IceMaskedHigh
 
-≥3 `(hw_class, capacity)` cells reaping NodeClaims for `reason=ice`
-(InsufficientCapacity / quota / unfulfillable instance type). The admissible
-set is shrinking toward `rio_scheduler_sla_hw_ladder_exhausted_total`. Check
-Karpenter controller logs and AWS quota; `rio-cli sla override <pname>
---capacity=on-demand` on hot pnames as a stopgap.
+Two coupled alerts watch the same failure from opposite ends:
+
+- **`RioNodeclaimPoolIceMaskedHigh`** (cause-side): ≥3 `(hw_class, capacity)`
+  cells reaping NodeClaims for `reason=ice|vanished`. The admissible set is
+  shrinking toward `rio_scheduler_sla_hw_ladder_exhausted_total`.
+- **`RioNodeclaimPoolAllCellsIceMasked`** (consequence-side): cold-start
+  SpawnIntents (`hw_class_names=[]`) dropped because **every** cell that
+  could host them is ICE-masked. The build's drv stays `Ready` and
+  unroutable; the scheduler logs `no registered executor advertises this
+  system`. Fires even when only **one** cell is ICE'd (e.g. a kvm-only
+  build whose single `metal-*:od` cell is failing) — the cause-side alert's
+  ≥3-cell threshold doesn't reach that case.
+
+Both mean **NodeClaim launches are failing in the cloud, not a
+`[sla.hw_classes]` config gap**. Check the Karpenter controller log for
+CreateFleet errors (capacity, quota, IAM) and `rio_controller_nodeclaim_
+reaped_total{reason=~"ice|vanished"}`:
+
+```bash
+kubectl logs -n kube-system deploy/karpenter --since=15m | grep -iE 'failed launching|insufficient|UnfulfillableCapacity'
+```
+
+Common structural cause on a fresh AWS account: `AWSServiceRoleForEC2Spot`
+does not exist (auto-created on first spot launch, but Karpenter's IAM role
+lacks `iam:CreateServiceLinkedRole`). Symptom in the Karpenter log:
+`AuthFailure.ServiceLinkedRoleCreationNotPermitted`. Fix once per account:
+
+```bash
+aws iam create-service-linked-role --aws-service-name spot.amazonaws.com
+```
+
+After fixing the cloud-side cause, the in-memory `IceBackoff` self-heals on
+TTL expiry (`60s × 2^step`, capped at `sla.maxLeadTime`). To clear it
+immediately, `kubectl rollout restart deploy/rio-scheduler -n rio-system` —
+the backoff is lease-holder-only and DAG state recovers from PG.
+
+For genuine spot capacity exhaustion (not structural), `rio-cli sla override
+<pname> --capacity=on-demand` on hot pnames as a stopgap, or set
+`capacityTypes: [on-demand]` on the affected `[sla.hw_classes]` entry. The
+cold-start `fallback_cell` deliberately offers only the cheapest capacity
+type per class (spot for default classes), so a structural spot failure
+will NOT auto-escape to on-demand — that escape valve is the operator's
+call (cost vs availability).
 
 ### RioNodeclaimPool StuckPending
 
@@ -295,13 +334,22 @@ then fix the AMI and re-roll.
 
 ### RioNodeclaimPool NoHostingClass
 
-`fallback_cell` returned `None` (`reason=no_hosting_class`) or the
+`fallback_cell` found no `[sla.hw_classes]` entry that admits the intent
+**even with no ICE-masking** (`reason=no_hosting_class`), or the
 provisioner's Pool-coverage filter dropped the intent
 (`reason=no_pool_covers`). Either way: no NodeClaim is minted, the pod's
 `nodeSelector`/`nodeAffinity` will never match a node, and the build is
-permanently Pending. This alert is the ONLY signal for the
-"no NodeClaim was ever minted" failure class — every other nodeclaim alert
-is NodeClaim-derived, and a NodeClaim that was never minted emits no series.
+permanently Pending. This alert and `RioNodeclaimPoolAllCellsIceMasked` are
+the ONLY signals for the "no NodeClaim was ever minted" failure class —
+every other nodeclaim alert is NodeClaim-derived, and a NodeClaim that was
+never minted emits no series.
+
+This alert is **config-static**: it never self-heals; the operator must
+change `[sla.hw_classes]` or the build's declared features. If a class CAN
+host the intent but every hosting cell is currently ICE-masked, that's a
+**different** failure (`reason=all_cells_ice_masked`,
+`RioNodeclaimPoolAllCellsIceMasked`) with the opposite operator action —
+fix the cloud, don't touch the config. See [IceMaskedHigh](#rionodeclaimpool-icemaskedhigh).
 
 Causes by `{{ $labels.reason }}`:
 
@@ -340,8 +388,8 @@ a Pool or remove the hwClass entry.
 
 Diagnose: scheduler logs WARN with the unroutable `(system, features)` tuple
 once per `(tenant, features)` edge. The controller logs WARN once per intent
-drop (all four reasons: `no_hosting_class`, `no_pool_covers`,
-`exceeds_cell_cap`, `unknown_hw_class`). `tracey query rule
+drop (all five reasons: `no_hosting_class`, `all_cells_ice_masked`,
+`no_pool_covers`, `exceeds_cell_cap`, `unknown_hw_class`). `tracey query rule
 ctrl.pool.fetcher-affinity-from-intent` for the spec text.
 
 ### RioNodeclaimPool StuckTerminating

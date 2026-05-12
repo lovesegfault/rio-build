@@ -180,9 +180,17 @@ pub fn describe_metrics() {
          mint a permanently-idle NodeClaim; add a Pool or remove the \
          hwClass advertising the feature. \
          reason=no_hosting_class: no configured hw-class can host the \
-         intent — wrong arch, footprint exceeds every arch-matching class's \
-         max_cores/max_mem, or required_features unmatched (the hwClasses \
-         key-set lacks a `provides_features` entry for it). \
+         intent EVEN WITH no ICE-masking — wrong arch, footprint exceeds \
+         every arch-matching class's max_cores/max_mem, or \
+         required_features unmatched (the hwClasses key-set lacks a \
+         `provides_features` entry for it). Persistent until \
+         `[sla.hw_classes]` changes. \
+         reason=all_cells_ice_masked: a class CAN host the intent but \
+         every hosting cell is ICE-masked — NodeClaim launches are \
+         failing in the cloud (capacity, quota, IAM). Self-heals once \
+         the ICE backoff expires *if* the cloud recovers; persistent if \
+         structural (e.g. missing AWSServiceRoleForEC2Spot). Check \
+         `nodeclaim_reaped_total{reason=~\"ice|vanished\"}` and Karpenter. \
          reason=exceeds_cell_cap: intent's pod footprint exceeds the assigned \
          cell's per-class catalog ceiling (or max_node_disk) — \
          the scheduler's ClassCeiling gate didn't reject it (override-bypass \

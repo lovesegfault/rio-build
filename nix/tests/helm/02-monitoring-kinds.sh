@@ -92,6 +92,26 @@ grep -q 'no_pool_covers' <<<"$nhc_block" || {
   exit 1
 }
 
+# Sibling tripwire for the OTHER no-NodeClaim-ever-minted reason: every
+# cell that could host the intent is ICE-masked. Same outcome (build's
+# drv permanently Ready and unroutable, no NodeClaim, no Job), opposite
+# operator action (fix the cloud, don't touch [sla.hw_classes]).
+# Deliberately a SEPARATE alert from NoHostingClass: ICE drops self-heal
+# on TTL expiry, so `for: 15m` (vs NoHostingClass `for: 5m`) avoids
+# false-firing on multi-cell spot blips. Folding it into NoHostingClass's
+# `for: 5m` would page on every transient capacity dip.
+grep -q 'alert: RioNodeclaimPoolAllCellsIceMasked' "$out" || {
+  echo "FAIL: RioNodeclaimPoolAllCellsIceMasked alert missing — when every" \
+    "hosting cell is ICE-masked (NodeClaim launches failing in the cloud)" \
+    "the build stalls and NOTHING fires; same no-alert shape as bug_003" >&2
+  exit 1
+}
+icem_block=$(grep -A4 'alert: RioNodeclaimPoolAllCellsIceMasked' "$out" || true)
+grep -q 'all_cells_ice_masked' <<<"$icem_block" || {
+  echo "FAIL: AllCellsIceMasked expr does not key on reason=all_cells_ice_masked" >&2
+  exit 1
+}
+
 # r34 bug_017 (§Partition-single-source): the StuckPending clamp cap
 # must derive from `maxLeadTime`, not a hardcoded literal — the
 # invariant `cap >= 2×maxLeadTime` is load-bearing (the alert must
