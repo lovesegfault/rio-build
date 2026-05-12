@@ -722,7 +722,7 @@ impl StoreService for MockStore {
             .contains(&store_path)
         {
             return Ok(Response::new(types::PathInfo {
-                store_path: store_path.clone(),
+                store_path,
                 nar_hash: vec![0u8; 32],
                 nar_size: 0,
                 ..Default::default()

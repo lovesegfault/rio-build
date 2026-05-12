@@ -642,7 +642,7 @@ mod tests {
         assert!(err.message().contains("required"), "msg: {}", err.message());
 
         // Valid token, caller in allowlist → Ok.
-        let mut int = ServiceTokenInterceptor::new(Some(signer.clone()), "rio-cli");
+        let mut int = ServiceTokenInterceptor::new(Some(signer), "rio-cli");
         let req = int.call(tonic::Request::new(())).unwrap();
         let c = ensure_service_caller(req.metadata(), Some(&key), &["rio-cli", "rio-controller"])
             .expect("allowlisted caller passes");

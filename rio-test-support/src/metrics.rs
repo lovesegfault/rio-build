@@ -51,7 +51,7 @@ pub(crate) struct DescribedNames(Arc<Mutex<Vec<String>>>);
 
 impl DescribedNames {
     /// Snapshot of all names captured so far. Clones out of the lock.
-    pub fn names(&self) -> Vec<String> {
+    pub(crate) fn names(&self) -> Vec<String> {
         self.0.lock().unwrap().clone()
     }
 }
@@ -91,7 +91,7 @@ pub(crate) struct DescribedHistograms(Arc<Mutex<Vec<String>>>);
 
 impl DescribedHistograms {
     /// Snapshot of all `describe_histogram!` names captured so far.
-    pub fn histograms(&self) -> Vec<String> {
+    pub(crate) fn histograms(&self) -> Vec<String> {
         self.0.lock().unwrap().clone()
     }
 }
