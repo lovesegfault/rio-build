@@ -21,14 +21,18 @@ use crate::k8s::qa::{Isolation, QaCtx, Scenario, ScenarioMeta, Verdict};
 
 pub struct BatchRpcScale;
 
-// 12-link chain at observed ~12s/link under phase-1 contention ≈ 144s.
-// 240s threshold catches the I-110 O(N²) tax (which would add
-// ~N²×40ms ≈ 6s — small at N=12 but the per-link dispatch latency
-// itself blows up under PG contention). Chain length is the lever:
-// too long and build wall-clock dominates; too short and the RPC tax
-// is noise.
+// Wall-clock gate: 12 links × ~12s/link nominal + ~2.3× tail slack
+// for builder spawn under phase-2 contention. Observed ~145s
+// isolated, ~247s under contention (2026-05-13, 3% over the prior
+// 240s threshold; that threshold itself was widened from 180s in
+// 7df06acc8). The structural assertion — count per-path store RPCs,
+// the I-110 fix collapses ~78 closure-BFS QueryPathInfo to ~12
+// BatchQueryPathInfo — is preferred but blocked: rio-store exposes
+// no per-method RPC counter. If one is added (it's an
+// observability.md-worthy metric), gate on a count budget instead;
+// 50× headroom vs ~1.7× wall-clock.
 const N_CHAIN: usize = 12;
-const THRESHOLD: Duration = Duration::from_secs(240);
+const THRESHOLD: Duration = Duration::from_secs(330);
 
 #[async_trait]
 impl Scenario for BatchRpcScale {
