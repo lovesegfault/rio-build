@@ -90,29 +90,50 @@ async fn run_inner(
     debug!("exec: {argv}");
 
     if ui::is_verbose() {
-        // Inherit stdio; suspend the spinner so output prints cleanly.
-        // I-198: std::process::Command::output()/status() block the
-        // calling thread. run/run_read are awaited inside spawned
-        // phase tasks — blocking here ties up a runtime worker for the
-        // child's lifetime. spawn_blocking offloads to the blocking
-        // pool and yields, same as the non-verbose tokio::process path
-        // below.
-        let out = tokio::task::spawn_blocking(move || {
-            if read_stdout {
-                std_cmd.stderr(Stdio::inherit()).output()
-            } else {
-                std_cmd.status().map(|s| std::process::Output {
-                    status: s,
-                    stdout: vec![],
-                    stderr: vec![],
-                })
+        if read_stdout {
+            // run_read in verbose: inherit stderr (live), capture
+            // stdout. I-198: std::process::Command::output() blocks
+            // the calling thread. run_read is awaited inside spawned
+            // phase tasks — blocking here ties up a runtime worker for
+            // the child's lifetime. spawn_blocking offloads to the
+            // blocking pool and yields, same as the non-verbose
+            // tokio::process path below. No bail-text contract here —
+            // run_read callers want stdout, not the error.
+            let out =
+                tokio::task::spawn_blocking(move || std_cmd.stderr(Stdio::inherit()).output())
+                    .await??;
+            if !out.status.success() {
+                bail!("{argv}: {}", out.status);
             }
-        })
-        .await??;
-        if !out.status.success() {
-            bail!("{argv}: {}", out.status);
+            return Ok(String::from_utf8(out.stdout)?.trim_end().to_string());
         }
-        return Ok(String::from_utf8(out.stdout)?.trim_end().to_string());
+        // run in verbose: inherit stdout (live), TEE stderr (live AND
+        // buffered). The bail must carry the stderr tail so
+        // text-matching retry classifiers (qa's
+        // is_transient_gateway_err) and verdict checks (iso03) work
+        // under `-v` — same Error contract b4b7f29c7 established for
+        // the non-verbose path. Plain inherit can't capture;
+        // piping-without-printing would buffer a long `nix build`'s
+        // progress to nowhere; tee gives both.
+        std_cmd.stdin(Stdio::null());
+        std_cmd.stdout(Stdio::inherit());
+        std_cmd.stderr(Stdio::piped());
+        let mut child = tokio::process::Command::from(std_cmd)
+            .spawn()
+            .with_context(|| format!("failed to spawn: {argv}"))?;
+        let stderr = child.stderr.take().expect("set via Stdio::piped() above");
+        let mut lines = BufReader::new(stderr).lines();
+        let mut err_buf = String::new();
+        while let Ok(Some(line)) = lines.next_line().await {
+            ui::eprint(format_args!("{line}\n"));
+            err_buf.push_str(&line);
+            err_buf.push('\n');
+        }
+        let status = child.wait().await?;
+        if !status.success() {
+            bail!("{argv}: {status}: {}", fold_stderr_tail(&err_buf));
+        }
+        return Ok(String::new());
     }
 
     std_cmd.stdin(Stdio::null());
@@ -144,23 +165,28 @@ async fn run_inner(
         for line in out_lines.lines().chain(err_buf.lines()) {
             ui::eprint(format_args!("  {} {line}\n", style("│").dim()));
         }
-        // Fold the last few stderr lines into the Error so callers
-        // matching on failure text (qa's gateway_build retry, anything
-        // else that needs to discriminate transient vs permanent)
-        // actually see it. Previously the error was "{argv}: exit
-        // status N" only, making the qa JWT-retry a no-op.
-        let tail: String = err_buf
-            .lines()
-            .rev()
-            .take(5)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join(" / ");
-        bail!("{argv}: {status}: {tail}");
+        bail!("{argv}: {status}: {}", fold_stderr_tail(&err_buf));
     }
     Ok(out_buf.trim_end().to_string())
+}
+
+/// Fold the last few stderr lines into a `bail!`-able fragment so
+/// callers matching on failure text (qa's `is_transient_gateway_err`,
+/// anything else that needs to discriminate transient vs permanent)
+/// actually see it. Both the verbose and non-verbose [`run`] paths use
+/// this so a `-v` run carries the same Error contract — previously the
+/// verbose bail was `{argv}: exit status N` only, making the qa
+/// JWT-retry a no-op under `-v`.
+fn fold_stderr_tail(err_buf: &str) -> String {
+    err_buf
+        .lines()
+        .rev()
+        .take(5)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 /// Run `cmd`, capturing stdout+stderr. `Ok(())` on success OR if
@@ -436,5 +462,32 @@ mod tests {
         assert!(!status.success());
         assert!(out.contains("to-stdout"), "stdout missing: {out:?}");
         assert!(out.contains("to-stderr"), "stderr missing: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn run_verbose_error_carries_stderr() {
+        // The verbose path's bail must include the child's stderr so
+        // text-matching retry classifiers (qa's is_transient_gateway_err)
+        // and verdict-shape checks (iso03) work under `-v`. b4b7f29c7
+        // fixed this for the non-verbose path; this asserts the verbose
+        // path matches.
+        //
+        // The marker is split across two `printf`s so it never appears
+        // contiguous in argv — `bail!` always includes `{argv}`, so a
+        // literal `echo signal-line` would make the assert tautological.
+        crate::ui::set_verbose_for_test(true);
+        let s = shell().unwrap();
+        let err = run(cmd!(
+            s,
+            "sh -c 'printf rio-tee- >&2; printf marker >&2; exit 1'"
+        ))
+        .await
+        .unwrap_err();
+        crate::ui::set_verbose_for_test(false);
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("rio-tee-marker"),
+            "verbose bail dropped stderr: {msg:?}"
+        );
     }
 }

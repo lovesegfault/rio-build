@@ -21,6 +21,15 @@ use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
 static LEVEL: OnceLock<LevelFilter> = OnceLock::new();
 
+/// Test override for [`is_verbose`]. `LEVEL` is a write-once
+/// [`OnceLock`] set from CLI flags at [`init`]; tests never call
+/// `init` and can't unset it once set, so the verbose `sh::run*`
+/// branches are otherwise unreachable from a unit test. A separate
+/// flag keeps the production state machine untouched.
+#[cfg(test)]
+static VERBOSE_TEST_OVERRIDE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// `-v` or higher: child process output inherited (streams live).
 ///
 /// clap-verbosity-flag uses WarnLevel as default, so:
@@ -29,7 +38,22 @@ static LEVEL: OnceLock<LevelFilter> = OnceLock::new();
 ///   -vv     → Debug  (+ argv logging)
 ///   -vvv    → Trace
 pub fn is_verbose() -> bool {
+    #[cfg(test)]
+    if VERBOSE_TEST_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
     *LEVEL.get().unwrap_or(&LevelFilter::WARN) >= LevelFilter::INFO
+}
+
+/// Force [`is_verbose`] to return `true` for the current process so
+/// tests can exercise the verbose `sh::run*` paths. Setting `false`
+/// clears the override (falls back to `LEVEL`, which tests never
+/// initialize, i.e. non-verbose). Process-global: fine under nextest
+/// (process-per-test); under `cargo test`, only call this from tests
+/// that restore `false` before returning.
+#[cfg(test)]
+pub fn set_verbose_for_test(v: bool) {
+    VERBOSE_TEST_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// EnvFilter directive string for `level`. xtask is FLOORED at info
