@@ -47,8 +47,16 @@ impl Scenario for AssignmentTerminal {
             }}"#
         );
 
-        // Expected to fail — swallow the Err (it's the success case).
-        let _ = ctx.nix_build_expr_via_gateway(0, &expr).await;
+        // Expected to fail — the *build* failing is the success case.
+        // Capture the gateway's error so a pre-dispatch failure (input
+        // FOD denied, gateway 401, schedule timeout) is distinguishable
+        // from the build itself returning exit 1. Only the latter
+        // creates an assignment row.
+        let build_result = ctx.nix_build_expr_via_gateway(0, &expr).await;
+        let build_err = build_result
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_else(|| "(build unexpectedly succeeded)".into());
 
         // The gateway returns the failure as soon as the builder
         // reports it; the scheduler's actor commits the assignment
@@ -77,10 +85,35 @@ impl Scenario for AssignmentTerminal {
             .await?;
 
         match row {
-            None => Ok(Verdict::Fail(format!(
-                "no assignment row for {name} within 30s of build failure — \
-                 dispatch never wrote one (check derivations.drv_path match)"
-            ))),
+            None => {
+                // Self-diagnose: which of the three failure modes is
+                // it? Dump (1) what the gateway returned, (2) whether
+                // a derivations row exists at all (rules out LIKE
+                // mismatch vs no-row), (3) what drv_path values exist
+                // in the recent-write window.
+                let pg = ctx.pg().clone();
+                let derivs: Vec<String> = sqlx::query_scalar(
+                    "SELECT drv_path FROM derivations \
+                     WHERE drv_path LIKE $1 ORDER BY created_at DESC LIMIT 5",
+                )
+                .bind(&pat)
+                .fetch_all(&pg)
+                .await
+                .unwrap_or_default();
+                let recent: Vec<String> = sqlx::query_scalar(
+                    "SELECT drv_path FROM derivations \
+                     ORDER BY created_at DESC LIMIT 5",
+                )
+                .fetch_all(&pg)
+                .await
+                .unwrap_or_default();
+                Ok(Verdict::Fail(format!(
+                    "no assignment row for {name} within 30s of build \
+                     completion. build_err: {build_err}; derivations \
+                     matching LIKE {pat}: {derivs:?}; 5 most recent \
+                     drv_path: {recent:?}"
+                )))
+            }
             Some((0, _)) => Ok(Verdict::Pass),
             Some((pending, _)) => Ok(Verdict::Fail(format!(
                 "{pending} assignment row(s) still status='pending' for a \
