@@ -308,6 +308,10 @@ proptest = "1"
 # futures-timer); we use #[tokio::test] for async cases directly.
 rstest = { version = "0.26", default-features = false }
 tempfile = "3"
+# FUSE store benchmarks (rio-builder/benches/fuse.rs). default-features
+# off drops the rayon dep — we measure single-process syscall latency,
+# not data-parallel kernels.
+criterion = { version = "0.7", default-features = false }
 tracing-test = "0.2"
 aws-smithy-mocks = "0.2"
 # Dev-only across the workspace: Router::oneshot (ServiceExt) for axum

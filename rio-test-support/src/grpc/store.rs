@@ -171,6 +171,14 @@ pub struct MockStoreFaults {
     /// Whether `query_path_info_gate` is armed. When false,
     /// `QueryPathInfo` ignores the gate (backwards-compatible).
     pub query_path_info_gate_armed: Arc<AtomicBool>,
+    /// Synthetic per-RPC latency (millis) applied at the START of every
+    /// `StoreService` RPC before any other fault check. 0 = no latency.
+    /// Models typical cross-component network RTT (builder ⇄ store) for
+    /// benchmarks and timeout-budget tests. Unlike
+    /// [`get_path_chunk_delay_ms`](Self::get_path_chunk_delay_ms) (which
+    /// stalls the streaming body) this delays the response *headers* —
+    /// the connection-establishment / request-routing component of RTT.
+    pub rpc_latency_ms: Arc<AtomicU64>,
     /// Per-NarChunk delay (millis) injected in `GetPath`'s stream. 0 = no
     /// delay. For I-211 progress-based timeout tests: with a multi-chunk
     /// NAR, `delay × chunk_count > idle_timeout` proves the fetch
@@ -190,6 +198,18 @@ pub struct MockStoreFaults {
     /// tests: a `>16 MiB` entry that early-Ok's must leave the framed
     /// reader at exactly `nar_size` so the next entry's header parses.
     pub put_path_early_ok_paths: Arc<RwLock<HashSet<String>>>,
+}
+
+impl MockStoreFaults {
+    /// Sleep for [`rpc_latency_ms`](Self::rpc_latency_ms) if non-zero.
+    /// Awaited at the top of every RPC handler that should observe
+    /// synthetic cross-component latency.
+    pub async fn apply_rpc_latency(&self) {
+        let ms = self.rpc_latency_ms.load(Ordering::SeqCst);
+        if ms > 0 {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
+    }
 }
 
 /// In-memory store: `store_path -> (PathInfo, nar_bytes)`.
@@ -597,6 +617,7 @@ impl StoreService for MockStore {
         &self,
         request: Request<types::GetPathRequest>,
     ) -> Result<Response<Self::GetPathStream>, Status> {
+        self.faults.apply_rpc_latency().await;
         if self.faults.fail_get_path.load(Ordering::SeqCst) {
             return Err(Status::unavailable("mock: injected get_path failure"));
         }
@@ -681,6 +702,7 @@ impl StoreService for MockStore {
         &self,
         request: Request<types::QueryPathInfoRequest>,
     ) -> Result<Response<types::PathInfo>, Status> {
+        self.faults.apply_rpc_latency().await;
         if self
             .faults
             .query_path_info_gate_armed

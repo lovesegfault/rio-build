@@ -20,7 +20,9 @@ mod read;
 
 pub(crate) mod fetch;
 
-pub(crate) use fetch::StoreClients;
+// Public so `benches/fuse.rs` (an out-of-crate compilation unit) can
+// build a `StoreClients` to hand to `mount_fuse_background`.
+pub use fetch::StoreClients;
 mod inode;
 mod ops;
 

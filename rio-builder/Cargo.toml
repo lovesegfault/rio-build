@@ -12,6 +12,13 @@ description = "Build executor with FUSE store for rio-build"
 name = "rio-builder"
 path = "src/main.rs"
 
+[[bench]]
+name = "fuse"
+harness = false
+# Benchmarks need /dev/fuse + bwrap + an unprivileged-userns kernel.
+# Skips gracefully (logs + early-return) when those are unavailable so
+# `cargo bench` doesn't fail on hosts without the right setup.
+
 [features]
 # RIO_BUILDER_SCRIPT fixture intercept (sla-sizing VM scenario): skips
 # the daemon lifecycle and reports scripted (wall, peak_mem, peak_cpu,
@@ -71,3 +78,8 @@ rio-test-support = { workspace = true }
 # Router::oneshot for health.rs tests (ServiceExt trait).
 tower.workspace = true
 figment.workspace = true
+# fuse bench: surface NixStoreFs setup_init's passthrough log
+# ("FUSE passthrough enabled"/"kernel lacks FUSE_PASSTHROUGH") which is
+# otherwise swallowed without a subscriber.
+tracing-subscriber.workspace = true
+criterion = { workspace = true }

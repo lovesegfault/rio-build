@@ -398,6 +398,24 @@
         "Nicolas Silva <nical@fastmail.com>"
       ]
     },
+    "anes": {
+      "crateName": "anes",
+      "version": "0.1.6",
+      "edition": "2018",
+      "sha256": "16bj1ww1xkwzbckk32j2pnbn5vk6wgsl3q4p3j9551xbcarwnijb",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Robert Vojta <rvojta@me.com>"
+      ]
+    },
     "anstream": {
       "crateName": "anstream",
       "version": "1.0.0",
@@ -3889,6 +3907,21 @@
         "lib"
       ]
     },
+    "cast": {
+      "crateName": "cast",
+      "version": "0.3.0",
+      "edition": "2018",
+      "sha256": "1dbyngbyz2qkk0jn2sxil8vrz3rnpcj142y184p9l4nbl9radcip",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Jorge Aparicio <jorge@japaric.io>"
+      ]
+    },
     "cbc 0.1.2": {
       "crateName": "cbc",
       "version": "0.1.2",
@@ -5044,6 +5077,102 @@
       "authors": [
         "Sam Rijs <srijs@airpost.net>",
         "Alex Crichton <alex@alexcrichton.com>"
+      ]
+    },
+    "criterion": {
+      "crateName": "criterion",
+      "version": "0.7.0",
+      "edition": "2021",
+      "sha256": "0a6rrgka8013l5d7bhlln60fja7nj4qmlhc4z92y3hqc5fk4gh71",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "anes",
+          "packageId": "anes"
+        },
+        {
+          "name": "cast",
+          "packageId": "cast"
+        },
+        {
+          "name": "ciborium",
+          "packageId": "ciborium"
+        },
+        {
+          "name": "clap",
+          "packageId": "clap"
+        },
+        {
+          "name": "criterion-plot",
+          "packageId": "criterion-plot"
+        },
+        {
+          "name": "itertools",
+          "packageId": "itertools 0.13.0"
+        },
+        {
+          "name": "num-traits",
+          "packageId": "num-traits"
+        },
+        {
+          "name": "oorandom",
+          "packageId": "oorandom"
+        },
+        {
+          "name": "regex",
+          "packageId": "regex"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        },
+        {
+          "name": "tinytemplate",
+          "packageId": "tinytemplate"
+        },
+        {
+          "name": "walkdir",
+          "packageId": "walkdir"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Jorge Aparicio <japaricious@gmail.com>",
+        "Brook Heisler <brookheisler@gmail.com>"
+      ]
+    },
+    "criterion-plot": {
+      "crateName": "criterion-plot",
+      "version": "0.6.0",
+      "edition": "2021",
+      "sha256": "0f73hgvmxacda8xk3a2xfbrqmphcz1ail2xdhjfmkbnzqw6wq6wv",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "cast",
+          "packageId": "cast"
+        },
+        {
+          "name": "itertools",
+          "packageId": "itertools 0.13.0"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Jorge Aparicio <japaricious@gmail.com>",
+        "Brook Heisler <brookheisler@gmail.com>"
       ]
     },
     "critical-section": {
@@ -13737,7 +13866,33 @@
         "lib"
       ]
     },
-    "itertools": {
+    "itertools 0.13.0": {
+      "crateName": "itertools",
+      "version": "0.13.0",
+      "edition": "2018",
+      "sha256": "11hiy3qzl643zcigknclh446qb9zlg4dpdzfkjaa9q9fqpgyfgj1",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "either",
+          "packageId": "either"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "use_alloc",
+        "use_std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "bluss"
+      ]
+    },
+    "itertools 0.14.0": {
       "crateName": "itertools",
       "version": "0.14.0",
       "edition": "2018",
@@ -16715,6 +16870,21 @@
         "lib"
       ]
     },
+    "oorandom": {
+      "crateName": "oorandom",
+      "version": "11.1.5",
+      "edition": "2018",
+      "sha256": "07mlf13z453fq01qff38big1lh83j8l6aaglf63ksqzzqxc0yyfn",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Simon Heath <icefox@dreamquest.io>"
+      ]
+    },
     "opaque-debug": {
       "crateName": "opaque-debug",
       "version": "0.3.1",
@@ -18995,7 +19165,7 @@
         },
         {
           "name": "itertools",
-          "packageId": "itertools"
+          "packageId": "itertools 0.14.0"
         },
         {
           "name": "log",
@@ -19072,7 +19242,7 @@
         },
         {
           "name": "itertools",
-          "packageId": "itertools"
+          "packageId": "itertools 0.14.0"
         },
         {
           "name": "proc-macro2",
@@ -20797,6 +20967,10 @@
       ],
       "devDependencies": [
         {
+          "name": "criterion",
+          "packageId": "criterion"
+        },
+        {
           "name": "figment",
           "packageId": "figment"
         },
@@ -20823,6 +20997,10 @@
         {
           "name": "tower",
           "packageId": "tower"
+        },
+        {
+          "name": "tracing-subscriber",
+          "packageId": "tracing-subscriber"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -26684,6 +26862,31 @@
       ],
       "authors": [
         "The ICU4X Project Developers"
+      ]
+    },
+    "tinytemplate": {
+      "crateName": "tinytemplate",
+      "version": "1.2.1",
+      "edition": "2015",
+      "sha256": "1g5n77cqkdh9hy75zdb01adxn45mkh9y40wdr7l68xpz35gnnkdy",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Brook Heisler <brookheisler@gmail.com>"
       ]
     },
     "tinyvec": {
