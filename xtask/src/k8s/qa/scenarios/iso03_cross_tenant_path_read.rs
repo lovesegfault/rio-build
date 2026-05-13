@@ -61,7 +61,7 @@ impl Scenario for CrossTenantPathRead {
         // `nix derivation show` keys the output spec differently across
         // CA-mode/nix-versions; `nix-store -q --outputs` is the
         // unambiguous "what paths does this drv produce" query.
-        let out = {
+        let target_out = {
             let s = shell()?;
             let outs = sh::run_read(cmd!(s, "nix-store -q --outputs {drv}")).await?;
             outs.lines()
@@ -70,42 +70,48 @@ impl Scenario for CrossTenantPathRead {
                 .ok_or_else(|| anyhow::anyhow!("nix-store -q --outputs {drv}: empty"))?
         };
 
-        // B attempts to copy A's output. NIX_SSHOPTS for BatchMode etc.
+        // B attempts to copy A's output. Capture stderr so the
+        // assertion on the failure *reason* works regardless of
+        // verbose mode — sh::run's `-v` path bails with the exit
+        // status only (see sh::run_capture's doc).
         let (b_store, _g) = ctx.gateway_tunnel(1).await?;
         let sshopts = crate::k8s::shared::NIX_SSHOPTS_BASE;
         let s = shell()?;
-        let copy = sh::run(
+        let (status, out) = sh::run_capture(
             cmd!(
                 s,
-                "timeout 30 nix copy --no-check-sigs --from {b_store} {out}"
+                "timeout 30 nix copy --no-check-sigs --from {b_store} {target_out}"
             )
             .env("NIX_SSHOPTS", sshopts),
         )
-        .await;
+        .await?;
 
-        match copy {
-            Err(e) => {
-                let msg = format!("{e:#}");
-                // Expected: narinfo-filter denies → "is not valid" /
-                // "does not exist" / "path ... not in store".
-                if msg.contains("not valid")
-                    || msg.contains("does not exist")
-                    || msg.contains("not in store")
-                    || msg.contains("NotFound")
-                {
-                    Ok(Verdict::Pass)
-                } else {
-                    Ok(Verdict::Fail(format!(
-                        "B's copy of A's output failed but not with the \
-                         narinfo-filter signature: {msg}"
-                    )))
-                }
-            }
-            Ok(()) => Ok(Verdict::Fail(format!(
-                "B successfully copied A's output {out} — \
-                 r[store.tenant.narinfo-filter] not applied (or {out} was \
+        if status.success() {
+            return Ok(Verdict::Fail(format!(
+                "B successfully copied A's output {target_out} — \
+                 r[store.tenant.narinfo-filter] not applied (or {target_out} was \
                  attributed to B via path_tenants)"
-            ))),
+            )));
+        }
+        // Expected: narinfo-filter denies → "is not valid" /
+        // "does not exist" / "path … not in store".
+        if out.contains("not valid")
+            || out.contains("does not exist")
+            || out.contains("not in store")
+            || out.contains("NotFound")
+        {
+            Ok(Verdict::Pass)
+        } else {
+            // `timeout` exits 124 on timeout — distinguish a transport
+            // hang (not a policy decision) from an actual error.
+            let kind = if status.code() == Some(124) {
+                "timed out (124) — transport hang, not a narinfo decision"
+            } else {
+                "failed but not with the narinfo-filter signature"
+            };
+            Ok(Verdict::Fail(format!(
+                "B's copy of A's output {kind}: {out}"
+            )))
         }
     }
 }

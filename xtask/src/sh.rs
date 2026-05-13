@@ -220,6 +220,39 @@ pub fn run_benign_if(
     }
 }
 
+/// Run `cmd`, capture stdout+stderr, and return `(status, combined)`
+/// regardless of exit code or verbosity. For test assertions on a
+/// command's failure output: [`run`] folds the last 5 stderr lines
+/// into the `Err` only on the non-verbose path (`b4b7f29c7`), so a
+/// `-v` QA run gives a caller `{argv}: exit status: 1` and nothing
+/// else. This helper bypasses the verbose/inherit short-circuit
+/// entirely — it always pipes both streams and never `bail!`s on a
+/// non-zero exit (the caller decides what a non-zero exit means).
+pub fn run_capture(
+    cmd: xshell::Cmd<'_>,
+) -> impl Future<Output = Result<(std::process::ExitStatus, String)>> + Send + use<> {
+    let argv = cmd.to_string();
+    let mut std_cmd: std::process::Command = cmd.quiet().into();
+    async move {
+        debug!("exec(capture): {argv}");
+        std_cmd.stdin(Stdio::null());
+        let out = tokio::process::Command::from(std_cmd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .with_context(|| format!("failed to spawn: {argv}"))?;
+        let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+        if !out.stderr.is_empty() {
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            combined.push_str(&String::from_utf8_lossy(&out.stderr));
+        }
+        Ok((out.status, combined))
+    }
+}
+
 /// Run a command that must interact with a tty (prompts for input).
 /// Always inherits stdio, regardless of verbosity.
 pub fn run_interactive(cmd: xshell::Cmd<'_>) -> Result<()> {
@@ -387,5 +420,21 @@ mod tests {
         let sh = Shell::new().unwrap();
         let r = run_benign_if(cmd!(sh, "true"), |_| false).await;
         assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_capture_returns_status_and_combined_output() {
+        let s = shell().unwrap();
+        // Command that writes to both streams and exits 1 — exactly the
+        // shape iso03 needs to assert on.
+        let (status, out) = run_capture(cmd!(
+            s,
+            "sh -c 'echo to-stdout; echo to-stderr >&2; exit 1'"
+        ))
+        .await
+        .unwrap();
+        assert!(!status.success());
+        assert!(out.contains("to-stdout"), "stdout missing: {out:?}");
+        assert!(out.contains("to-stderr"), "stderr missing: {out:?}");
     }
 }
