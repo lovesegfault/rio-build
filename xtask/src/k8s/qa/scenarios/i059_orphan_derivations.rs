@@ -60,7 +60,7 @@ impl Scenario for OrphanDerivations {
         let old_leader = ctx.scheduler_leader().await?;
         kill_pod(ctx, NS_SYSTEM, &old_leader)?;
         wait_new_leader(ctx, &old_leader, Duration::from_secs(60)).await?;
-        if !wait_recovery_done(ctx, -1.0, Duration::from_secs(60)).await? {
+        if !wait_recovery_done(ctx, 0.0, Duration::from_secs(60)).await? {
             cleanup.run().await?;
             return Ok(Verdict::Fail("new leader never completed recovery".into()));
         }

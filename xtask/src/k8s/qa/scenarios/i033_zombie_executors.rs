@@ -78,7 +78,7 @@ impl Scenario for ZombieExecutors {
         // leader's first success is >0 which is > stale-before only if
         // before==0. Safer: wait for `> 0` on the new leader directly.
         let _ = recovery_before;
-        if !wait_recovery_done(ctx, -1.0, Duration::from_secs(60)).await? {
+        if !wait_recovery_done(ctx, 0.0, Duration::from_secs(60)).await? {
             bg.abort();
             return Ok(Verdict::Fail(
                 "new leader never completed recovery within 60s".into(),
