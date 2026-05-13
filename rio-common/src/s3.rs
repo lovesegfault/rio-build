@@ -45,11 +45,29 @@ pub const DEFAULT_S3_MAX_ATTEMPTS: u32 = 10;
 ///    `DispatchFailure`. We have no untrusted-server streaming here
 ///    (chunks are tiny, pre-buffered; logs are pre-compressed), so
 ///    the protection is pure downside.
+///
+/// 3. `RIO_S3_FORCE_PATH_STYLE=true` (env, not config) forces
+///    path-style addressing (`http://host/bucket/key`) instead of the
+///    sdk's virtual-hosted default (`http://bucket.host/key`).
+///    Virtual-hosted needs per-bucket DNS — fine for AWS, broken for
+///    a loopback minio at `http://127.0.0.1:19000` (no resolver for
+///    `rio-bench-chunks.127.0.0.1`). The aws-sdk does NOT read
+///    `AWS_S3_FORCE_PATH_STYLE` — that's a CLI/boto3 convention only
+///    — so we read our own. Env-only because path-style is a *deploy
+///    topology* knob (which S3 implementation am I behind), not
+///    application config; it pairs with `AWS_ENDPOINT_URL` which is
+///    also env-only.
 pub async fn default_client(max_attempts: u32) -> aws_sdk_s3::Client {
     let cfg = aws_config::from_env()
         .retry_config(RetryConfig::standard().with_max_attempts(max_attempts))
         .stalled_stream_protection(StalledStreamProtectionConfig::disabled())
         .load()
         .await;
-    aws_sdk_s3::Client::new(&cfg)
+    let force_path = std::env::var("RIO_S3_FORCE_PATH_STYLE")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    let s3_cfg = aws_sdk_s3::config::Builder::from(&cfg)
+        .force_path_style(force_path)
+        .build();
+    aws_sdk_s3::Client::from_conf(s3_cfg)
 }

@@ -13,6 +13,14 @@ name = "rio-store"
 path = "src/main.rs"
 required-features = ["server"]
 
+# Ingestion / upload throughput benchmark. Talks to a *running*
+# rio-store over gRPC (RIO_STORE_ADDR) and a raw S3 endpoint
+# (BENCH_S3_BUCKET) for an apples-to-apples baseline. See
+# benches/ingest.rs and process-compose-bench.yaml for usage.
+[[bench]]
+name = "ingest"
+harness = false
+
 [features]
 default = ["server"]
 # Lean PG-schema accessors only (`error` + `realisations` modules). Lets
@@ -182,3 +190,8 @@ axum = { workspace = true }
 figment.workspace = true
 # For log-assertion tests (maybe_sign warn on empty refs).
 tracing-test = { workspace = true }
+# benches/ingest.rs (criterion harness).
+criterion = { workspace = true }
+rand = { workspace = true }
+# benches/ingest.rs raw-S3 baseline group (opt-in via BENCH_S3_BUCKET).
+aws-config = { workspace = true }

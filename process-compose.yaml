@@ -48,9 +48,11 @@ processes:
     command: |
       set -euo pipefail
       # Create the dev database if it doesn't exist yet.
-      if ! psql -h 127.0.0.1 -p 5432 -U rio -d postgres -tc \
+      # -X: skip ~/.psqlrc — a user rc that errors aborts psql before
+      # the SELECT, so the create never runs.
+      if ! psql -X -h 127.0.0.1 -p 5432 -U rio -d postgres -tc \
            "SELECT 1 FROM pg_database WHERE datname = 'rio_dev'" | grep -q 1; then
-        psql -h 127.0.0.1 -p 5432 -U rio -d postgres -c "CREATE DATABASE rio_dev"
+        psql -X -h 127.0.0.1 -p 5432 -U rio -d postgres -c "CREATE DATABASE rio_dev"
       fi
     depends_on:
       postgres:

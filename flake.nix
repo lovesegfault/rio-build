@@ -1165,6 +1165,11 @@
           _module.args.pkgs = import nixpkgs {
             inherit system;
             overlays = [ inputs.rust-overlay.overlays.default ];
+            # minio is flagged insecure in nixpkgs since the AGPL
+            # relicense (no CVE — license-change advisory). We use it
+            # only as a loopback S3 stand-in for the ingest benchmark
+            # (`process-compose-bench.yaml`); never deployed.
+            config.permittedInsecurePackages = [ "minio-2025-10-15T17-29-55Z" ];
           };
 
           # Configure treefmt

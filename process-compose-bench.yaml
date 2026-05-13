@@ -1,0 +1,130 @@
+# Ingest benchmark stack: postgres + minio + rio-store-with-S3-backend.
+#
+# This is the *system under test* for `rio-store/benches/ingest.rs`.
+# Everything talks over real loopback TCP — no in-process shims.
+# Postgres and minio data live under `.data/bench/` and persist across
+# restarts; `rm -rf .data/bench` for a clean slate.
+#
+# Two minio buckets:
+#   - rio-bench-chunks   — rio-store's chunk backend (S3 PutObject per
+#                          FastCDC chunk on the ingest path)
+#   - rio-bench-baseline — the bench's raw `s3-put` group writes here
+#                          directly (one PutObject per NAR, no
+#                          chunking). Same minio, same disk, so the
+#                          object store is held constant.
+#
+# Usage:
+#
+#   nix develop
+#   process-compose -f process-compose-bench.yaml up
+#
+#   # other terminal:
+#   RIO_STORE_ADDR=127.0.0.1:9002 \
+#   BENCH_S3_BUCKET=rio-bench-baseline \
+#   BENCH_S3_ENDPOINT=http://127.0.0.1:19000 \
+#   AWS_ACCESS_KEY_ID=bench AWS_SECRET_ACCESS_KEY=benchbench AWS_REGION=us-east-1 \
+#     cargo bench -p rio-store --bench ingest
+
+version: "0.5"
+
+processes:
+  postgres:
+    command: |
+      set -euo pipefail
+      pgdata=".data/bench/postgres"
+      if [ ! -f "$pgdata/PG_VERSION" ]; then
+        initdb -D "$pgdata" --encoding=UTF8 --locale=C -U rio --auth=trust
+        cat >> "$pgdata/postgresql.conf" <<CONF
+      listen_addresses = '127.0.0.1'
+      port = 15432
+      unix_socket_directories = ''
+      fsync = off
+      synchronous_commit = off
+      full_page_writes = off
+      CONF
+      fi
+      exec postgres -D "$pgdata"
+    readiness_probe:
+      exec:
+        command: pg_isready -h 127.0.0.1 -p 15432
+      initial_delay_seconds: 2
+      period_seconds: 2
+    shutdown:
+      signal: 2
+      timeout_seconds: 10
+
+  postgres-init:
+    command: |
+      set -euo pipefail
+      # -X: skip ~/.psqlrc — a user rc that errors (e.g. \i a missing
+      # file) would abort psql before the SELECT, so the create never
+      # runs and rio-store crashes with "database does not exist".
+      if ! psql -X -h 127.0.0.1 -p 15432 -U rio -d postgres -tc \
+           "SELECT 1 FROM pg_database WHERE datname = 'rio_bench'" | grep -q 1; then
+        psql -X -h 127.0.0.1 -p 15432 -U rio -d postgres -c "CREATE DATABASE rio_bench"
+      fi
+    depends_on:
+      postgres:
+        condition: process_healthy
+
+  minio:
+    command: |
+      exec minio server .data/bench/minio \
+        --address 127.0.0.1:19000 \
+        --console-address 127.0.0.1:19001
+    environment:
+      - MINIO_ROOT_USER=bench
+      - MINIO_ROOT_PASSWORD=benchbench
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        port: 19000
+        path: /minio/health/live
+      initial_delay_seconds: 2
+      period_seconds: 2
+
+  minio-init:
+    command: |
+      set -euo pipefail
+      mc alias set bench http://127.0.0.1:19000 bench benchbench
+      mc mb --ignore-existing bench/rio-bench-chunks
+      mc mb --ignore-existing bench/rio-bench-baseline
+    depends_on:
+      minio:
+        condition: process_healthy
+
+  rio-store:
+    command: cargo run --release -p rio-store
+    depends_on:
+      postgres-init:
+        condition: process_completed_successfully
+      minio-init:
+        condition: process_completed_successfully
+    environment:
+      - RIO_DATABASE_URL=postgres://rio@127.0.0.1:15432/rio_bench
+      - RIO_LISTEN_ADDR=127.0.0.1:9002
+      - RIO_LOG_FORMAT=pretty
+      - RIO_METRICS_ADDR=127.0.0.1:9092
+      - RIO_DRAIN_GRACE_SECS=0
+      # S3 chunk backend → minio above
+      - RIO_CHUNK_BACKEND__KIND=s3
+      - RIO_CHUNK_BACKEND__BUCKET=rio-bench-chunks
+      - RIO_CHUNK_BACKEND__PREFIX=
+      # aws-sdk default chain reads these (rio_common::s3::default_client)
+      - AWS_ACCESS_KEY_ID=bench
+      - AWS_SECRET_ACCESS_KEY=benchbench
+      - AWS_REGION=us-east-1
+      - AWS_ENDPOINT_URL=http://127.0.0.1:19000
+      # Path-style: minio serves http://host/bucket/key, not
+      # http://bucket.host/key. The aws-sdk default is virtual-hosted,
+      # which would need DNS for `rio-bench-chunks.127.0.0.1`.
+      # rio-specific knob — the aws-sdk does NOT honor
+      # `AWS_S3_FORCE_PATH_STYLE` (CLI/boto convention only). See
+      # `rio_common::s3::default_client`.
+      - RIO_S3_FORCE_PATH_STYLE=true
+    readiness_probe:
+      exec:
+        command: nc -z 127.0.0.1 9002
+      initial_delay_seconds: 5
+      period_seconds: 5
+      failure_threshold: 100

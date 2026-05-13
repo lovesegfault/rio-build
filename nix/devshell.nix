@@ -51,6 +51,12 @@ let
     # Local dev stack (`process-compose up`)
     process-compose
 
+    # rio-store ingest benchmark
+    # (`process-compose -f process-compose-bench.yaml up`). Needs a
+    # local S3-compatible store + a CLI to create the buckets.
+    minio
+    minio-client
+
     # Formatting (nix fmt also works, but direct treefmt is handy)
     treefmtWrapper
 

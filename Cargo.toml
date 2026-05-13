@@ -281,6 +281,10 @@ serde_json = "1"
 # Randomness (retry jitter)
 rand = "0.10"
 
+# Benchmark harness (rio-store/benches/ingest.rs). Dev-only; not in any
+# nix build closure.
+criterion = { version = "0.7", features = ["async_tokio"] }
+
 # Stream utilities (tonic re-exports, but we need it directly for ReceiverStream etc.)
 tokio-stream = "0.1"
 futures-util = "0.3"
