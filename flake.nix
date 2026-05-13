@@ -171,6 +171,20 @@
           cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
           inherit (cargoToml.workspace.package) version;
 
+          # Pinned Nix used as a *runtime* test input (golden conformance,
+          # nix-daemon --stdio for rio-builder, nix-store/nix-instantiate
+          # for rio-cli/xtask). The flake follows our nixpkgs (line ~11) so
+          # the drv hash never matches upstream's cache; CI rebuilds it from
+          # source on the runner pod. nix-everything's doCheck gates its full
+          # C++ + functional test suite, and several of those tests assume
+          # capabilities the runner's overlayfs / sandbox does not have
+          # (e.g. readLinkAt.works needs PATH_MAX symlink targets,
+          # functional shell.sh needs a writable real /nix/store). We are not
+          # validating Nix here -- only consuming it -- so skip its checks.
+          nixForTests = inputs.nix.packages.${system}.nix.overrideAttrs (_: {
+            doCheck = false;
+          });
+
           # --------------------------------------------------------------
           # Rust toolchains
           # --------------------------------------------------------------
@@ -510,9 +524,7 @@
                 ];
               in
               member:
-              pkgs.lib.optional (
-                member == null || builtins.elem member needsNix
-              ) inputs.nix.packages.${system}.nix
+              pkgs.lib.optional (member == null || builtins.elem member needsNix) nixForTests
               ++ pkgs.lib.optional (member == null || builtins.elem member needsPg) pkgs.postgresql_18
               ++ pkgs.lib.optional (member == null || member == "rio-gateway") pkgs.openssh;
             # Env vars for test runners, keyed by member. PG_BIN so
@@ -1041,7 +1053,7 @@
                 sysCrateEnv
                 goldenTestEnv
                 ;
-              nixPkg = inputs.nix.packages.${system}.nix;
+              nixPkg = nixForTests;
             })
             mutants
             mutants-smoke
