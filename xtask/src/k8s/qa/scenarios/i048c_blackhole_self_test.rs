@@ -63,17 +63,18 @@ impl Scenario for BlackholeSelfTest {
         if let Err(e) = chaos::remediate(&dir).await {
             tracing::warn!("stale-chaos remediation: {e:#}");
         }
-        // chaos::run includes pod-create + wait-Running (~10-20s) before
-        // the ip6tables rules go in. The previous deadline counted from
-        // call time, so the rules might only be active for ~25s of a
-        // 45s window — under h2 keepalive (30+10s). Instead: run the
-        // blackhole for KEEPALIVE_WINDOW + 30s startup-slack and poll
-        // the metric for the WHOLE duration; any increment is Pass.
+        // chaos::run includes CCNP-create + wait-Valid + a ~3s
+        // propagation grace before the deny is actually enforced on
+        // every node (cilium-operator validates fast; per-agent
+        // endpoint regen is what the grace covers). Run the blackhole
+        // for KEEPALIVE_WINDOW + 30s startup-slack and poll the metric
+        // for the WHOLE duration; any increment is Pass. Live spike
+        // 2026-05-13 saw the increment at ~30s — the slack is for tail.
         let chaos_dur = KEEPALIVE_WINDOW + Duration::from_secs(30);
         let chaos_fut = chaos::run(
             &dir,
             ChaosKind::Blackhole,
-            ChaosTarget::SchedulerLeader,
+            ChaosTarget::Scheduler,
             ChaosFrom::AllWorkers,
             chaos_dur,
         );
@@ -120,8 +121,10 @@ impl Scenario for BlackholeSelfTest {
         } else {
             Ok(Verdict::Fail(format!(
                 "{METRIC} did not increment during {chaos_dur:?} blackhole \
-                 (samples: {samples:?}) — ip6tables likely a no-op \
-                 (Cilium datapath bypass?) or scheduler-side keepalive \
+                 (samples: {samples:?}) — CCNP egressDeny not enforced \
+                 (check `kubectl get ccnp rio-chaos-blackhole -o yaml` \
+                 for Valid condition + that builder/fetcher endpoints \
+                 are policy-enforced) or scheduler-side keepalive \
                  not detecting"
             )))
         }

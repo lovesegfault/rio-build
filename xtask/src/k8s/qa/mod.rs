@@ -91,10 +91,13 @@ pub struct QaOpts {
     /// Build target for --load (passed to nix-bench flake).
     #[arg(long = "load-target", default_value = "hello")]
     load_target: String,
-    /// Blackhole target for --fault. Defaults to scheduler-leader.
+    /// Blackhole target for --fault. Defaults to scheduler. Label-
+    /// selector based — `scheduler` denies all `rio-scheduler` pods,
+    /// not just the lease-holder (functionally equivalent: workers
+    /// only hold a stream to the leader).
     #[arg(long = "fault-target", value_enum)]
     fault_target: Option<super::chaos::ChaosTarget>,
-    /// Blackhole source nodes for --fault. Defaults to all-workers.
+    /// Blackhole source endpoints for --fault. Defaults to all-workers.
     #[arg(long = "fault-from", value_enum)]
     fault_from: Option<super::chaos::ChaosFrom>,
     /// Blackhole duration for --fault.
@@ -259,8 +262,7 @@ pub async fn run(
                 chaos::run(
                     &dir,
                     chaos::ChaosKind::Blackhole,
-                    opts.fault_target
-                        .unwrap_or(chaos::ChaosTarget::SchedulerLeader),
+                    opts.fault_target.unwrap_or(chaos::ChaosTarget::Scheduler),
                     opts.fault_from.unwrap_or(chaos::ChaosFrom::AllWorkers),
                     opts.fault_duration,
                 )

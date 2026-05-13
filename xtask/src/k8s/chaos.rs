@@ -1,34 +1,57 @@
 //! `xtask k8s qa --fault` — structured network fault injection.
 //!
 //! **Why this exists (I-048c).** The h2 keepalive path on the balanced
-//! channel only fires when the peer's IP goes blackhole — packets
-//! dropped, no FIN, no RST. Process death (even SIGKILL) doesn't test
-//! it: the kernel reaps, closes FDs, sends FIN, the worker sees a
-//! clean close in sub-ms. `kubectl delete pod --grace-period=0` still
-//! SIGTERMs first. iptables on the host is blocked by EKS `brush`
-//! allowed-programs. NetworkPolicy is disabled in this cluster.
+//! channel only fires when the peer goes blackhole — packets dropped,
+//! no FIN, no RST. Process death (even SIGKILL) doesn't test it: the
+//! kernel reaps, closes FDs, sends FIN, the worker sees a clean close
+//! in sub-ms. `kubectl delete pod --grace-period=0` still SIGTERMs
+//! first.
 //!
-//! What does test it: a privileged hostNetwork pod, pinned to the
-//! worker's node, with iptables in-container (alpine + apk add).
-//! `hostNetwork: true` puts the container in the host net namespace,
-//! so iptables manipulates host netfilter directly. (NOT nsenter — that
-//! pulls in Bottlerocket's `brush` allowed-programs via the host mount
-//! namespace and gets blocked.) Packets to/from the
-//! target IP silently disappear. The h2 keepalive (30s interval, 10s
-//! timeout) detects the dead connection at ~40s.
+//! **Why not iptables (the I-048c fix to the I-048c verifier).** The
+//! original implementation spawned a privileged hostNetwork pod on
+//! each worker node and inserted `ip6tables -I FORWARD -j RIO-CHAOS`
+//! DROP rules matching the target pod IP. That worked pre-Cilium
+//! (kube-proxy + AWS VPC CNI; pod-to-pod traffic transited the host
+//! IP layer). Under Cilium with `bpf.masquerade=true` and a kernel
+//! ≥5.10, `bpf.hostLegacyRouting` defaults to **false**: pod-to-pod
+//! cross-node traffic is `bpf_redirect()`ed at the lxc TC ingress
+//! straight to `cilium_geneve`/`cilium_wg0`, never entering the kernel
+//! IP routing layer. Netfilter (FORWARD, raw/PREROUTING, mangle) and
+//! legacy `tc filter`s (Cilium 1.16+ attaches via tcx, which runs
+//! *before* legacy filters and short-circuits on redirect) never see
+//! those packets. Verified live 2026-05-13: `ip6tables -L FORWARD -v`
+//! on every node shows `0 packets, 0 bytes`. The k3s VM tests pin
+//! `bpf.hostLegacyRouting=true` for an unrelated socketLB→apiserver
+//! reason (`nix/cilium-render.nix`), so this datapath gap is
+//! EKS-only — invisible to CI.
 //!
-//! **Self-cleaning.** The chaos pod's shell traps TERM/EXIT and
-//! flushes its chain. After `<duration>` the sleep returns → trap
-//! fires → rules gone. xtask deletes the pod on its way out (Ctrl-C
-//! or normal completion).
+//! **What works: a CiliumClusterwideNetworkPolicy `egressDeny`.**
+//! Apply a deny rule at the same eBPF policy map the traffic actually
+//! traverses. Verified against the running 1.19.3 source (`bpf_lxc.c`):
+//! `policy_can_egress*()` is called for *both* `CT_NEW` and
+//! `CT_ESTABLISHED`, so an established gRPC stream's packets are
+//! dropped per-packet the moment the deny lands. L3/L4 deny is silent
+//! drop (no RST, no ICMP) — the exact blackhole semantics the keepalive
+//! check needs. Live spike 2026-05-13: builder hit
+//! `BrokenPipe … stream closed because of a broken pipe` (the
+//! h2-keepalive teardown signature, identical to the 2026-04-01
+//! pre-Cilium iptables verification) and
+//! `rio_scheduler_worker_disconnects_total` incremented in ~30s.
 //!
-//! **SIGKILL-safe.** Pod identity is flushed to
-//! `.stress-test/chaos/chaos.json` BEFORE the iptables rules go in.
-//! The next `qa --fault` invocation [`remediate`]s any stale entries
-//! first: deletes the chaos pod, then spawns a one-shot remediation
-//! pod on each affected node that flushes/deletes the chain
-//! (idempotent — `iptables -F` on a missing chain is a no-op with
-//! `2>/dev/null`).
+//! **Self-cleaning.** The CCNP is a single cluster-scoped k8s object —
+//! `delete ccnp rio-chaos-blackhole` is idempotent. No remediation
+//! pod, no chain flush. SIGKILL recovery is a delete-by-fixed-name on
+//! the next invocation, gated on `chaos.json` so it doesn't pay an API
+//! round-trip when there's nothing to clean.
+//!
+//! **Precondition: the `from` endpoints must already be policy-enforced.**
+//! Cilium switches an endpoint to default-deny in the deny direction
+//! the moment *any* policy (including a deny-only one) selects it.
+//! Builders/fetchers carry that policy from `builder-egress` /
+//! `fetcher-egress` (`infra/helm/rio-build/templates/networkpolicy.
+//! yaml`). If `networkPolicy.enabled=false`, applying a deny-only CCNP
+//! would airgap the workers entirely. [`run`] asserts the required
+//! CCNPs exist and bails with a fix-naming error otherwise.
 
 use std::fmt;
 use std::fs;
@@ -38,61 +61,59 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use console::style;
-use k8s_openapi::api::core::v1::Pod;
-use kube::api::{Api, DeleteParams, ListParams, PostParams};
+use kube::api::{Api, DeleteParams, PostParams};
+use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 use rio_crds::KubeErrorExt;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use crate::k8s::client as k;
-use crate::k8s::{NS, NS_BUILDERS, NS_FETCHERS, NS_STORE};
+use crate::k8s::{NS, NS_STORE};
 
-/// iptables chain name. Dedicated chain (not bare FORWARD inserts) so
-/// cleanup is `-F <chain>; -D FORWARD -j <chain>; -X <chain>` —
-/// idempotent and unambiguous. A bare `iptables -D FORWARD -s <ip> -j
-/// DROP` on cleanup would need to know the exact rule it inserted; a
-/// chain just gets flushed.
-const CHAIN: &str = "RIO-CHAOS";
+/// Fixed name. ONE blackhole at a time — chaos compositions (e.g.
+/// scheduler + store simultaneously) are a future kind, and a fixed
+/// name keeps SIGKILL remediation a name-lookup, not a label-scan.
+const CCNP_NAME: &str = "rio-chaos-blackhole";
 
-/// Namespace for chaos pods. `rio-system` is PSA `baseline`, but
-/// `hostNetwork: true` + `privileged: true` needs `privileged`. The
-/// builders/fetchers namespaces already are. Use builders — chaos pods
-/// don't need fetcher's egress allowance (hostNetwork bypasses the
-/// anyway, NetworkPolicy doesn't apply to hostNetwork).
-const CHAOS_NS: &str = NS_BUILDERS;
+/// CiliumClusterwideNetworkPolicy GVK. Cluster-scoped (not the
+/// namespaced `CiliumNetworkPolicy`) — `ChaosFrom::AllWorkers` spans
+/// `rio-builders` AND `rio-fetchers`, and the existing `builder-egress`
+/// / `fetcher-egress` policies are already CCNPs, so this stays in the
+/// same shape an operator already knows to look for.
+fn ccnp_gvk() -> GroupVersionKind {
+    GroupVersionKind::gvk("cilium.io", "v2", "CiliumClusterwideNetworkPolicy")
+}
 
-/// Digest-pinned alpine. `apk add iptables` at script start (~2s).
-///
-/// NOT busybox+nsenter: `nsenter -t 1 -m` enters the host MOUNT
-/// namespace, which on Bottlerocket pulls in `brush` allowed-programs
-/// wrappers — `iptables` resolves to `/usr/libexec/brush/allowed-
-/// programs/iptables` and gets blocked. `hostNetwork: true` already
-/// puts us in the host network namespace, so iptables run from inside
-/// THIS container's filesystem manipulates host netfilter directly. We
-/// just need an image that HAS iptables.
-const CHAOS_IMAGE: &str = "public.ecr.aws/docker/library/alpine:3.21@sha256:c3f8e73fdb79deaebaa2037150150191b9dcbfba68b4a46d70103204c53f4709";
+fn ccnp_api(client: &k::Client) -> Api<DynamicObject> {
+    Api::all_with(client.clone(), &ApiResource::from_gvk(&ccnp_gvk()))
+}
 
 // ─── CLI types ──────────────────────────────────────────────────────
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChaosKind {
-    /// iptables DROP on src+dst — pod IP becomes unroutable from the
-    /// victim node. No FIN, no RST; the only signal is keepalive
-    /// timeout.
+    /// CCNP `egressDeny` from the `--from` workers to the `--target`.
+    /// Silent drop at the eBPF policy map — no FIN, no RST; the only
+    /// signal is keepalive timeout. The faithful Cilium analog of an
+    /// iptables blackhole.
     Blackhole,
-    // Future: Latency (tc netem), Partition (multi-target), Flap
-    // (drop/restore cycles). Only Blackhole is wired.
+    // Future: Latency / Flap need `tc netem` and would re-introduce a
+    // hostNetwork chaos pod (CNP can't shape traffic). Only Blackhole
+    // is wired.
 }
 
-/// What to blackhole. `--target scheduler-leader` resolves the lease;
-/// `builder` / `fetcher` resolve to any currently-Running pod with the
-/// matching `rio.build/role` label. Worker pods are one-shot Jobs with
-/// no stable identity, so the chosen pod is whichever happens to be
-/// Running at resolve time.
+/// What to deny egress to. Resolved to a `toEndpoints` label
+/// selector — NOT a pod IP. CIDR-based deny rules don't match
+/// in-cluster identities (Cilium classifies pod IPs by *identity*, not
+/// CIDR; the `toCIDR` deny rule's CIDR-identity never overlaps a pod's
+/// pod-identity), and Deployment pods carry no leader-distinguishing
+/// label, so `Scheduler` denies *all* `rio-scheduler` pods. Functionally
+/// identical to leader-only for the i048c assertion: workers only hold
+/// a stream to the leader; the standby has no stream to drop.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChaosTarget {
-    SchedulerLeader,
+    Scheduler,
     Store,
     Builder,
     Fetcher,
@@ -104,12 +125,15 @@ impl fmt::Display for ChaosTarget {
     }
 }
 
-/// Which workers lose connectivity. Resolves to a set of node names —
-/// the chaos pod runs hostNetwork on each, so the iptables rules
-/// affect all pod-to-pod traffic transiting that node.
+/// Which workers lose connectivity. Becomes the CCNP `endpointSelector`.
+/// Pod-scoped (not node-scoped like the iptables predecessor): the
+/// deny lands at the worker pod's eBPF egress, not the node's FORWARD
+/// chain. Same observable effect for the keepalive test; a hair more
+/// surgical (a non-rio pod on the same node keeps its scheduler
+/// connectivity).
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChaosFrom {
-    /// Every node hosting a builder OR fetcher pod (deduped).
+    /// Every builder AND fetcher endpoint.
     AllWorkers,
     Builder,
     Fetcher,
@@ -133,20 +157,15 @@ pub fn parse_duration_secs(s: &str) -> Result<Duration> {
 
 // ─── state file ─────────────────────────────────────────────────────
 
-/// One chaos pod's identity, written to chaos.json BEFORE the pod's
-/// iptables rules go in. [`remediate`] reads this to clean up even if
-/// xtask was SIGKILLed mid-run.
-#[derive(Serialize, Deserialize, Clone)]
-pub struct ChaosEntry {
-    pub node: String,
-    pub pod_name: String,
-    pub target_ip: String,
-    pub chain: String,
-}
-
+/// SIGKILL-recovery marker. Written BEFORE the CCNP is created (if
+/// xtask dies between create and write, [`remediate`] can't find it —
+/// so write first; a leftover marker pointing at a CCNP that never got
+/// created is a harmless 404 on cleanup). Cleared after the CCNP is
+/// deleted.
 #[derive(Serialize, Deserialize, Default)]
 pub struct ChaosState {
-    pub entries: Vec<ChaosEntry>,
+    /// Name of the CCNP that may still be applied.
+    pub ccnp: Option<String>,
 }
 
 /// Same write-then-rename atomicity as `stress::write_pids`.
@@ -158,219 +177,111 @@ pub fn write_chaos(dir: &Path, st: &ChaosState) -> Result<()> {
     Ok(())
 }
 
+/// Read the marker. A missing file OR an unparseable one (e.g. the
+/// pre-CNP `{"entries":[…]}` schema from a SIGKILLed run before this
+/// migration) is `default()` — there's nothing the new code could
+/// remediate from old state anyway (the iptables chaos pods self-clean
+/// via their EXIT trap), and a hard error here would block the next QA
+/// run indefinitely.
 pub fn read_chaos(dir: &Path) -> Result<ChaosState> {
     let p = dir.join("chaos.json");
     if !p.exists() {
         return Ok(ChaosState::default());
     }
-    Ok(serde_json::from_str(&fs::read_to_string(p)?)?)
+    let raw = fs::read_to_string(&p)?;
+    Ok(serde_json::from_str(&raw).unwrap_or_else(|e| {
+        warn!("chaos.json unparseable ({e}); treating as clean");
+        ChaosState::default()
+    }))
 }
 
-// ─── target / from resolution ───────────────────────────────────────
+// ─── CCNP construction ──────────────────────────────────────────────
 
-/// Resolve a target to its pod IP.
-async fn resolve_target_ip(client: &k::Client, target: &ChaosTarget) -> Result<String> {
-    let (ns, pod_name) = match target {
-        ChaosTarget::SchedulerLeader => (NS, k::scheduler_leader(client, NS).await?),
-        ChaosTarget::Store => {
-            let name = first_pod_by_label(
-                client,
-                NS_STORE,
-                "app.kubernetes.io/name=rio-store",
-                "store",
-            )
-            .await?;
-            (NS_STORE, name)
-        }
-        ChaosTarget::Builder => (NS_BUILDERS, running_worker(client, "builder").await?),
-        ChaosTarget::Fetcher => (NS_FETCHERS, running_worker(client, "fetcher").await?),
-    };
-    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
-    let pod = pods.get(&pod_name).await?;
-    pod.status
-        .and_then(|s| s.pod_ip)
-        .with_context(|| format!("pod {ns}/{pod_name} has no podIP (not running?)"))
-}
-
-/// Resolve `--from` to a set of (description, node_name) pairs. The
-/// description is for human output; node_name is what pins the chaos
-/// pod via `spec.nodeName`.
-async fn resolve_from_nodes(client: &k::Client, from: &ChaosFrom) -> Result<Vec<(String, String)>> {
+/// Helm-managed CCNPs that must exist for a deny-only chaos CCNP to be
+/// safe on the `from` endpoints. Cilium docs: "Pods will enter
+/// default-deny mode as soon a single policy selects it" — that's
+/// *any* policy including a deny-only one. If `networkPolicy.enabled=
+/// false`, applying [`chaos_ccnp`] would be the FIRST policy on the
+/// workers and would airgap their entire egress (DNS, store, *and*
+/// scheduler) instead of just the chaos target.
+fn precondition_ccnps(from: &ChaosFrom) -> &'static [&'static str] {
     match from {
-        ChaosFrom::AllWorkers => {
-            let mut nodes = vec![];
-            for (ns, role) in [(NS_BUILDERS, "builder"), (NS_FETCHERS, "fetcher")] {
-                let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
-                for p in pods
-                    .list(&ListParams::default().labels(&format!("rio.build/role={role}")))
-                    .await?
-                {
-                    if let Some(node) = p.spec.and_then(|s| s.node_name) {
-                        let desc = p.metadata.name.unwrap_or_default();
-                        nodes.push((desc, node));
-                    }
-                }
-            }
-            // Dedup by node (multiple workers can share a node).
-            // Stable sort first so the kept description is deterministic.
-            nodes.sort_by(|a, b| a.1.cmp(&b.1));
-            nodes.dedup_by(|a, b| a.1 == b.1);
-            anyhow::ensure!(!nodes.is_empty(), "no worker pods found");
-            Ok(nodes)
-        }
+        ChaosFrom::AllWorkers => &["builder-egress", "fetcher-egress"],
+        ChaosFrom::Builder => &["builder-egress"],
+        ChaosFrom::Fetcher => &["fetcher-egress"],
+    }
+}
+
+/// `endpointSelector` for the `from` workers.
+///
+/// Selectors mirror the helm `networkpolicy.yaml` shapes so an
+/// operator reading `kubectl get ccnp -o yaml` next to the helm-owned
+/// policies sees the same vocabulary. The component label is stamped
+/// by the controller's `pool/pod.rs` `executor_labels` regardless of
+/// which namespace a Pool lands in — same reason the helm CCNPs select
+/// on it instead of namespace.
+fn from_endpoint_selector(from: &ChaosFrom) -> Value {
+    match from {
+        ChaosFrom::AllWorkers => json!({
+            "matchExpressions": [{
+                "key": "app.kubernetes.io/component",
+                "operator": "In",
+                "values": ["rio-builder", "rio-fetcher"],
+            }]
+        }),
         ChaosFrom::Builder => {
-            let name = running_worker(client, "builder").await?;
-            let node = node_of(client, NS_BUILDERS, &name).await?;
-            Ok(vec![(name, node)])
+            json!({"matchLabels": {"app.kubernetes.io/component": "rio-builder"}})
         }
         ChaosFrom::Fetcher => {
-            let name = running_worker(client, "fetcher").await?;
-            let node = node_of(client, NS_FETCHERS, &name).await?;
-            Ok(vec![(name, node)])
+            json!({"matchLabels": {"app.kubernetes.io/component": "rio-fetcher"}})
         }
     }
 }
 
-/// Any Running pod with `rio.build/role=<role>`. Worker pods are
-/// one-shot Jobs — Pending/Succeeded pods are skipped so the caller
-/// gets a podIP and a live netns.
-async fn running_worker(client: &k::Client, role: &str) -> Result<String> {
-    let ns = match role {
-        "builder" => NS_BUILDERS,
-        "fetcher" => NS_FETCHERS,
-        _ => unreachable!(),
-    };
-    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
-    pods.list(&ListParams::default().labels(&format!("rio.build/role={role}")))
-        .await?
-        .into_iter()
-        .find(|p| p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running"))
-        .and_then(|p| p.metadata.name)
-        .with_context(|| {
-            format!(
-                "no Running {role} pod in {ns} — submit a build first so a \
-                 worker exists (kubectl get pods -n {ns} -l rio.build/role={role})"
-            )
-        })
-}
-
-async fn first_pod_by_label(
-    client: &k::Client,
-    ns: &str,
-    selector: &str,
-    desc: &str,
-) -> Result<String> {
-    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
-    pods.list(&ListParams::default().labels(selector))
-        .await?
-        .into_iter()
-        .filter(|p| p.metadata.deletion_timestamp.is_none())
-        .filter_map(|p| p.metadata.name)
-        .next()
-        .with_context(|| format!("no {desc} pod found (selector {selector:?} in ns {ns})"))
-}
-
-async fn node_of(client: &k::Client, ns: &str, pod_name: &str) -> Result<String> {
-    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
-    pods.get(pod_name)
-        .await?
-        .spec
-        .and_then(|s| s.node_name)
-        .with_context(|| format!("pod {ns}/{pod_name} has no nodeName (not scheduled?)"))
-}
-
-// ─── chaos pod spec ─────────────────────────────────────────────────
-
-/// Shell script the chaos pod runs. POSIX sh — no bashisms.
+/// `egressDeny.toEndpoints` selector for the chaos `target`.
 ///
-/// `hostNetwork: true` puts the container in the host network
-/// namespace, so iptables run from THIS container's filesystem
-/// manipulates host netfilter directly. No nsenter needed — the
-/// busybox+nsenter approach pulled in Bottlerocket's `brush` wrappers
-/// via the host mount namespace and got blocked.
-///
-/// `apk add iptables` is ~2s; the chaos itself is 60s+. The package is
-/// cached after first pull on each node.
-///
-/// Chain protocol:
-///   1. `-N` create (or `-F` flush if it exists from a prior crashed run)
-///   2. `-C FORWARD -j CHAIN || -I FORWARD -j CHAIN` — link the chain
-///      into FORWARD only if not already linked (idempotent)
-///   3. `-A` append the DROP rules (both directions)
-///   4. trap: flush, unlink, delete chain. `2>/dev/null` makes each
-///      step a no-op if a prior step already cleaned (e.g., concurrent
-///      remediation pod from [`remediate`]).
-fn chaos_script(target_ip: &str, dur_secs: u64) -> String {
-    // Single-quote-safe: target_ip is a podIP (hex + colons in a
-    // v6-only cluster), CHAIN is a const literal, dur_secs is a u64.
-    // No injection surface. ip6tables — pod IPs are v6; the alpine
-    // `iptables` package provides both binaries.
-    format!(
-        r#"set -eu
-apk add --no-cache iptables 2>&1 | tail -1
-cleanup() {{
-  ip6tables -F {CHAIN} 2>/dev/null
-  ip6tables -D FORWARD -j {CHAIN} 2>/dev/null
-  ip6tables -X {CHAIN} 2>/dev/null
-  echo CLEANED
-}}
-trap cleanup TERM EXIT
-ip6tables -N {CHAIN} 2>/dev/null || ip6tables -F {CHAIN}
-ip6tables -C FORWARD -j {CHAIN} 2>/dev/null || ip6tables -I FORWARD -j {CHAIN}
-ip6tables -A {CHAIN} -s {target_ip} -j DROP
-ip6tables -A {CHAIN} -d {target_ip} -j DROP
-echo "blackhole active: {target_ip} via chain {CHAIN}"
-sleep {dur_secs} &
-wait $!
-echo "duration elapsed, exiting (trap will clean)"
-"#
-    )
+/// Cross-namespace `toEndpoints` need the `k8s:` prefix (Cilium's
+/// auto-injected source labels — `endpointSelector` doesn't, but
+/// `toEndpoints`/`fromEndpoints` do). Scheduler/store match by
+/// `name`+`namespace` (cluster-singleton Deployments); builder/fetcher
+/// by `component` only (namespace-agnostic, same rationale as
+/// [`from_endpoint_selector`]).
+fn target_endpoints(target: &ChaosTarget) -> Value {
+    match target {
+        ChaosTarget::Scheduler => json!([{
+            "matchLabels": {
+                "k8s:io.kubernetes.pod.namespace": NS,
+                "k8s:app.kubernetes.io/name": "rio-scheduler",
+            }
+        }]),
+        ChaosTarget::Store => json!([{
+            "matchLabels": {
+                "k8s:io.kubernetes.pod.namespace": NS_STORE,
+                "k8s:app.kubernetes.io/name": "rio-store",
+            }
+        }]),
+        ChaosTarget::Builder => json!([{
+            "matchLabels": {"k8s:app.kubernetes.io/component": "rio-builder"}
+        }]),
+        ChaosTarget::Fetcher => json!([{
+            "matchLabels": {"k8s:app.kubernetes.io/component": "rio-fetcher"}
+        }]),
+    }
 }
 
-/// Per-invocation pod-name nonce. Unix-seconds — distinct across runs
-/// so a stale Succeeded pod from a SIGKILL'd session doesn't collide
-/// with the next `pods.create` (409 AlreadyExists). NOT derived from
-/// `session_dir.file_name()`: stress passes a fixed `.stress-test/chaos`
-/// dir, so that derivation produced `rio-chaos-chaos-0` every time.
-fn session_nonce() -> i64 {
-    jiff::Timestamp::now().as_second()
-}
-
-/// One-shot remediation script — runs without the trap dance (it's
-/// the cleanup, not the chaos). Idempotent: every step `2>/dev/null`s
-/// so a missing chain is a no-op.
-fn remediation_script() -> String {
-    format!(
-        r#"apk add --no-cache iptables 2>&1 | tail -1
-ip6tables -F {CHAIN} 2>/dev/null
-ip6tables -D FORWARD -j {CHAIN} 2>/dev/null
-ip6tables -X {CHAIN} 2>/dev/null
-echo REMEDIATED
-"#
-    )
-}
-
-/// Build the Pod spec. Privileged + hostNetwork, pinned to `node`.
-/// Tolerates both `rio.build/builder` and `rio.build/fetcher` taints
-/// — worker nodes carry one or the other depending on which pool
-/// Karpenter provisioned them for.
-///
-/// No `hostPID` — that was for nsenter into PID 1, which we dropped
-/// (Bottlerocket brush trap). `hostNetwork` alone is sufficient: the
-/// container's iptables manipulates host netfilter directly.
-///
-/// `restartPolicy: Never` — the pod runs once. If it crashes mid-run
-/// (it won't; it's `sleep`), restart wouldn't help anyway: the chain
-/// is already in place, restart would re-insert it (which `-C ... ||
-/// -I` makes idempotent), but the `sleep` timer would reset. Never is
-/// the honest contract.
-fn chaos_pod_spec(name: &str, node: &str, script: &str) -> Pod {
+/// Build the CCNP. `egressDeny` only — no `egress`, no `ingress*`.
+/// Deny precedence over allow is what makes this composable with the
+/// helm-managed `builder-egress`/`fetcher-egress` policies (which
+/// allow scheduler:9001 and store:9002): the deny shadows the allow
+/// for the duration, the allow is untouched. Adding redundant allow
+/// rules here would be a foot-gun if someone copies this CCNP as a
+/// template — they'd inherit a `world` carve-out they didn't intend.
+fn chaos_ccnp(target: &ChaosTarget, from: &ChaosFrom) -> DynamicObject {
     serde_json::from_value(json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumClusterwideNetworkPolicy",
         "metadata": {
-            "name": name,
-            "namespace": CHAOS_NS,
+            "name": CCNP_NAME,
             "labels": {
                 "app.kubernetes.io/name": "rio-chaos",
                 "app.kubernetes.io/part-of": "rio-build",
@@ -378,27 +289,12 @@ fn chaos_pod_spec(name: &str, node: &str, script: &str) -> Pod {
             },
         },
         "spec": {
-            "nodeName": node,
-            "hostNetwork": true,
-            "restartPolicy": "Never",
-            "tolerations": [
-                {"key": rio_common::k8s::BUILDER_TAINT_KEY, "operator": "Exists", "effect": "NoSchedule"},
-                {"key": rio_common::k8s::FETCHER_TAINT_KEY, "operator": "Exists", "effect": "NoSchedule"},
-            ],
-            "containers": [{
-                "name": "chaos",
-                "image": CHAOS_IMAGE,
-                "command": ["sh", "-c"],
-                "args": [script],
-                "securityContext": {
-                    "privileged": true,
-                },
-            }],
+            "endpointSelector": from_endpoint_selector(from),
+            "egressDeny": [{"toEndpoints": target_endpoints(target)}],
         },
     }))
-    // The json! literal is fixed-shape; deserialization can't fail
-    // unless the schema is wrong, which is a compile-time bug class.
-    .expect("chaos pod spec is well-formed JSON")
+    // Fixed-shape literal — failure is a compile-time bug class.
+    .expect("chaos CCNP is well-formed JSON")
 }
 
 // ─── run ────────────────────────────────────────────────────────────
@@ -416,269 +312,149 @@ pub async fn run(
     let ChaosKind::Blackhole = kind;
 
     let client = k::client().await?;
+    let api = ccnp_api(&client);
 
-    info!("resolving --target {target} ...");
-    let target_ip = resolve_target_ip(&client, &target).await?;
-    info!("target {target} = {target_ip}");
-
-    info!("resolving --from {from} ...");
-    let nodes = resolve_from_nodes(&client, &from).await?;
-    for (desc, node) in &nodes {
-        info!("from: {desc} on node {node}");
-    }
-
-    // Unique pod-name suffix per invocation. One chaos pod per node —
-    // name is `rio-chaos-<ts>-<idx>`.
-    let session_ts = session_nonce();
-
-    let dur_secs = duration.as_secs();
-    let script = chaos_script(&target_ip, dur_secs);
-    let pods: Api<Pod> = Api::namespaced(client.clone(), CHAOS_NS);
-
-    // Track chaos pod identities BEFORE creating them. Same discipline
-    // as `stress run`: if xtask dies between create and the chaos.json
-    // write, cleanup can't find the pod. So write first (with names we
-    // pre-compute), then create. If create fails, cleanup tries to
-    // delete a nonexistent pod — that's a 404, harmless.
-    let mut state = ChaosState::default();
-    for (idx, (_desc, node)) in nodes.iter().enumerate() {
-        let pod_name = format!("rio-chaos-{session_ts}-{idx}");
-        state.entries.push(ChaosEntry {
-            node: node.clone(),
-            pod_name,
-            target_ip: target_ip.clone(),
-            chain: CHAIN.to_string(),
-        });
-    }
-    write_chaos(session_dir, &state)?;
-    info!("wrote {} chaos entries to chaos.json", state.entries.len());
-
-    // Now create the pods. If any create fails, we still try to clean
-    // up the ones that succeeded (the `?` would skip that, so collect
-    // results instead).
-    let mut created = vec![];
-    for entry in &state.entries {
-        let spec = chaos_pod_spec(&entry.pod_name, &entry.node, &script);
-        match pods.create(&PostParams::default(), &spec).await {
-            Ok(_) => {
-                info!("created chaos pod {} on {}", entry.pod_name, entry.node);
-                created.push(entry.pod_name.clone());
-            }
-            Err(e) => {
-                warn!("create {} failed: {e:#}", entry.pod_name);
-                // Don't bail yet — clean up what we did create.
-            }
+    // Precondition: workers must already be policy-enforced (see the
+    // module doc). Bail with the fix, not just the symptom.
+    for required in precondition_ccnps(&from) {
+        if api.get_opt(required).await?.is_none() {
+            bail!(
+                "chaos blackhole requires CCNP {required:?} (from \
+                 networkPolicy.enabled=true) so the deny rule layers \
+                 onto an already-policed endpoint instead of flipping \
+                 it to default-deny. Enable networkPolicy in the helm \
+                 values and `xtask k8s up --helm`."
+            );
         }
     }
-    if created.len() < state.entries.len() {
-        warn!("partial create: cleaning up {} pods", created.len());
-        for name in &created {
-            let _ = pods.delete(name, &DeleteParams::default()).await;
-        }
-        bail!(
-            "failed to create all chaos pods ({}/{} succeeded)",
-            created.len(),
-            state.entries.len()
-        );
-    }
 
-    // Wait for each pod to actually log ACTIVE. The pod's `echo
-    // ACTIVE` runs after the iptables rules are in. We poll phase ==
-    // Running as a proxy — the script reaches `sleep` immediately
-    // after ACTIVE, so Running = rules in place.
-    for entry in &state.entries {
-        let p = pods.clone();
-        let name = entry.pod_name.clone();
-        crate::ui::poll(
-            &format!("chaos pod {name} active"),
-            Duration::from_secs(1),
-            30,
-            move || {
-                let p = p.clone();
-                let name = name.clone();
-                async move {
-                    let pod = p.get(&name).await?;
-                    let phase = pod
-                        .status
-                        .as_ref()
-                        .and_then(|s| s.phase.as_deref())
-                        .unwrap_or("");
-                    Ok((phase == "Running").then_some(()))
-                }
-            },
-        )
-        .await?;
-    }
+    // SIGKILL discipline: marker on disk BEFORE the CCNP exists.
+    write_chaos(
+        session_dir,
+        &ChaosState {
+            ccnp: Some(CCNP_NAME.to_string()),
+        },
+    )?;
+
+    let ccnp = chaos_ccnp(&target, &from);
+    info!("applying CCNP {CCNP_NAME} ({from} → egressDeny → {target})");
+    api.create(&PostParams::default(), &ccnp).await?;
+
+    // Wait for cilium-operator validation. `Valid=True` does NOT mean
+    // every cilium-agent has regenerated its endpoint programs — that
+    // propagation is sub-second in practice (one CCNP, a handful of
+    // endpoints) but isn't observable from the k8s API without
+    // per-node polling. The spike showed first-heartbeat-fail at ~15s;
+    // i048c budgets 30s of startup slack on top of the 45s keepalive
+    // window. A short fixed grace after Valid is plenty.
+    crate::ui::poll(
+        &format!("CCNP {CCNP_NAME} valid"),
+        Duration::from_secs(1),
+        30,
+        || {
+            let api = api.clone();
+            async move {
+                let cnp = api.get(CCNP_NAME).await?;
+                Ok(ccnp_is_valid(&cnp).then_some(()))
+            }
+        },
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
     eprintln!();
     eprintln!(
-        "{} blackhole active: {} → {} ({} node(s), {} chain)",
+        "{} blackhole active: {} {} {} (CCNP {CCNP_NAME})",
         style("⏺").red().bold(),
         style(&from.to_string()).cyan(),
-        style(&target_ip).bold(),
-        nodes.len(),
-        CHAIN,
+        style("→ egressDeny →").dim(),
+        style(&target.to_string()).bold(),
     );
     eprintln!(
         "  holding for {} ... (Ctrl-C to lift early)",
-        style(format!("{dur_secs}s")).yellow()
+        style(format!("{}s", duration.as_secs())).yellow()
     );
     eprintln!();
 
-    // Block. Either the timer fires (normal completion) or Ctrl-C
-    // (early lift). Both paths fall through to cleanup below.
-    // `ctrl_c()` lazy-install (first poll, not call) is acceptable
-    // HERE: resources are k8s-side chaos pods (no local ProcessGuard);
-    // a SIGINT during the spawn/poll loop above leaks iptables chains
-    // on remote nodes, which the next-invocation `remediate` sweep
-    // already handles (see below). Contrast stress.rs/status.rs where
-    // the leaked resource is a local process holding a port.
+    // Block. Either the timer fires or Ctrl-C. Both fall through to
+    // cleanup. `ctrl_c()` lazy-install is acceptable HERE: the only
+    // cluster-side resource is the CCNP, and the next-invocation
+    // [`remediate`] sweep already handles a SIGKILL leak. Contrast
+    // stress.rs/status.rs where the leaked resource is a local
+    // process holding a port.
     let lift_reason = tokio::select! {
         _ = tokio::time::sleep(duration) => "duration elapsed",
         _ = tokio::signal::ctrl_c() => "Ctrl-C",
     };
     info!("lifting blackhole ({lift_reason})");
 
-    // Delete the chaos pods. Their TERM trap fires → iptables cleaned.
-    // We DON'T spawn a remediation pod here — the trap is reliable for
-    // graceful delete. Remediation is for the SIGKILL-recovery path
-    // (next `qa --fault` invocation calls `remediate` first).
-    let mut all_clean = true;
-    for entry in &state.entries {
-        match pods.delete(&entry.pod_name, &DeleteParams::default()).await {
-            Ok(_) => info!("deleted {} (trap will flush {CHAIN})", entry.pod_name),
-            Err(e) => {
-                warn!("delete {} failed: {e:#}", entry.pod_name);
-                all_clean = false;
-            }
-        }
-    }
-
-    // Poll for actual deletion — kubelet needs a moment to send TERM,
-    // run the trap, and reap. We don't want to claim "lifted" while
-    // the rules are still in place.
-    for entry in &state.entries {
-        let p = pods.clone();
-        let name = entry.pod_name.clone();
-        let res = crate::ui::poll(
-            &format!("chaos pod {name} gone"),
-            Duration::from_secs(1),
-            30,
-            move || {
-                let p = p.clone();
-                let name = name.clone();
-                async move { Ok(p.get_opt(&name).await?.is_none().then_some(())) }
-            },
-        )
-        .await;
-        if let Err(e) = res {
-            warn!("pod {} delete didn't complete: {e:#}", entry.pod_name);
-            all_clean = false;
-        }
-    }
-
-    if all_clean {
-        // Clear chaos.json — nothing left to remediate.
-        write_chaos(session_dir, &ChaosState::default())?;
+    // Idempotent: 404 = already gone (operator cleaned manually).
+    if let Err(e) = api.delete(CCNP_NAME, &DeleteParams::default()).await
+        && !e.is_not_found()
+    {
+        // Don't `?` — leave the marker on disk so the next invocation
+        // remediates.
+        warn!("delete CCNP {CCNP_NAME}: {e:#} — left chaos.json marker");
         eprintln!();
         eprintln!(
-            "{} blackhole lifted, chain {CHAIN} flushed",
-            style("✓").green()
-        );
-    } else {
-        eprintln!();
-        eprintln!(
-            "{} cleanup incomplete — next `qa --fault` will remediate via one-shot pod",
+            "{} cleanup incomplete — next `qa --fault` will retry the delete",
             style("!").yellow()
         );
+        return Ok(());
     }
 
+    write_chaos(session_dir, &ChaosState::default())?;
+    eprintln!();
+    eprintln!(
+        "{} blackhole lifted, CCNP {CCNP_NAME} deleted",
+        style("✓").green()
+    );
     Ok(())
+}
+
+/// `.status.conditions[type=Valid].status == "True"` on a CCNP
+/// `DynamicObject`. Cilium-operator sets this once the policy parses
+/// and the selectors resolve.
+fn ccnp_is_valid(cnp: &DynamicObject) -> bool {
+    cnp.data["status"]["conditions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|c| c["type"] == "Valid" && c["status"] == "True")
 }
 
 // ─── cleanup integration ────────────────────────────────────────────
 
-/// Remediate any chaos entries in `<session>/chaos.json`. Called at
-/// the start of `qa --fault`. For each entry: delete the chaos pod (404 is
-/// fine), then spawn a one-shot remediation pod on its node that
-/// flushes the chain. Idempotent — if the chain doesn't exist (the
-/// chaos pod's trap already cleaned), the remediation script is a
-/// no-op.
+/// Remediate a leftover chaos CCNP. Called at the start of `qa
+/// --fault` and `i048c`. Reads `chaos.json` so a clean state is a
+/// disk-read, not an API round-trip; if the marker says a CCNP was
+/// applied, delete it (404 = already gone, count as remediated).
 ///
-/// Returns `(remediated_count, had_entries)`. `had_entries` lets the
+/// Returns `(remediated_count, had_marker)`. `had_marker` lets the
 /// caller decide whether to print a chaos-cleanup summary line.
-#[allow(clippy::print_stderr)]
 pub async fn remediate(session_dir: &Path) -> Result<(usize, bool)> {
     let state = read_chaos(session_dir)?;
-    if state.entries.is_empty() {
+    let Some(name) = state.ccnp else {
         return Ok((0, false));
-    }
+    };
 
     let client = k::client().await?;
-    let pods: Api<Pod> = Api::namespaced(client.clone(), CHAOS_NS);
-
-    let session_ts = session_nonce();
-    let script = remediation_script();
-    let mut remediated = 0;
-
-    for (idx, entry) in state.entries.iter().enumerate() {
-        // Delete the original chaos pod first (if it's still there).
-        // Best-effort — 404 means it already exited or was deleted.
-        if let Err(e) = pods.delete(&entry.pod_name, &DeleteParams::default()).await
-            && !e.is_not_found()
-        {
-            warn!("delete chaos pod {}: {e:#}", entry.pod_name);
+    let api = ccnp_api(&client);
+    info!("remediating leftover CCNP {name}");
+    let remediated = match api.delete(&name, &DeleteParams::default()).await {
+        Ok(_) => 1,
+        Err(e) if e.is_not_found() => {
+            // chaos pod from a pre-SIGKILL run already self-cleaned, or
+            // an operator deleted it manually. Either way: clean.
+            0
         }
-
-        // One-shot remediation pod. Same spec shape, different script.
-        let rem_name = format!("rio-chaos-remediate-{session_ts}-{idx}");
-        let spec = chaos_pod_spec(&rem_name, &entry.node, &script);
-        match pods.create(&PostParams::default(), &spec).await {
-            Ok(_) => {
-                eprintln!(
-                    "    {} remediation pod {} on {} (flush {})",
-                    style("▸").cyan(),
-                    rem_name,
-                    entry.node,
-                    entry.chain,
-                );
-                // Wait for it to complete (Succeeded), then delete it.
-                // 30s is generous for `iptables -F; -D; -X`.
-                let p = pods.clone();
-                let n = rem_name.clone();
-                let done = crate::ui::poll(
-                    &format!("remediation {rem_name} done"),
-                    Duration::from_secs(1),
-                    30,
-                    move || {
-                        let p = p.clone();
-                        let n = n.clone();
-                        async move {
-                            let phase = p
-                                .get(&n)
-                                .await?
-                                .status
-                                .and_then(|s| s.phase)
-                                .unwrap_or_default();
-                            // Succeeded = script exited 0. Failed =
-                            // nonzero (still means chain is gone or
-                            // never existed; the script `2>/dev/null`s
-                            // everything). Either is "done".
-                            Ok((phase == "Succeeded" || phase == "Failed").then_some(()))
-                        }
-                    },
-                )
-                .await;
-                if done.is_ok() {
-                    remediated += 1;
-                }
-                let _ = pods.delete(&rem_name, &DeleteParams::default()).await;
-            }
-            Err(e) => warn!("create remediation pod {rem_name}: {e:#}"),
+        Err(e) => {
+            warn!("delete CCNP {name}: {e:#}");
+            // Leave the marker so the *next* invocation retries.
+            return Ok((0, true));
         }
-    }
+    };
 
-    // Clear chaos.json — we've done what we can.
     write_chaos(session_dir, &ChaosState::default())?;
     Ok((remediated, true))
 }
@@ -699,11 +475,16 @@ mod tests {
         for v in ChaosFrom::value_variants() {
             assert_eq!(ChaosFrom::from_str(&v.to_string(), false).unwrap(), *v);
         }
-        assert_eq!(ChaosTarget::SchedulerLeader.to_string(), "scheduler-leader");
+        // RENAMED in the CNP migration: label-selector targeting hits
+        // every `rio-scheduler` pod, not just the lease-holder. The old
+        // `scheduler-leader` name was a lie under the new mechanism —
+        // make it a CLI parse error so a stale invocation surfaces
+        // loudly instead of silently doing the wrong thing.
+        assert_eq!(ChaosTarget::Scheduler.to_string(), "scheduler");
+        assert!(ChaosTarget::from_str("scheduler-leader", false).is_err());
         assert_eq!(ChaosFrom::AllWorkers.to_string(), "all-workers");
-        assert!(ChaosTarget::from_str("scheduler", false).is_err());
-        // scheduler-leader is a valid TARGET but not a valid FROM.
-        assert!(ChaosFrom::from_str("scheduler-leader", false).is_err());
+        // scheduler is a valid TARGET but not a valid FROM.
+        assert!(ChaosFrom::from_str("scheduler", false).is_err());
     }
 
     #[test]
@@ -718,109 +499,155 @@ mod tests {
 
     #[test]
     fn chaos_state_roundtrip_via_disk() {
-        // Same disk-roundtrip discipline as stress::pids_roundtrip.
         let dir = tempfile::tempdir().unwrap();
         let st = ChaosState {
-            entries: vec![
-                ChaosEntry {
-                    node: "ip-10-42-1-219.us-east-2.compute.internal".into(),
-                    pod_name: "rio-chaos-1700000000-0".into(),
-                    target_ip: "fd42::1:99".into(),
-                    chain: "RIO-CHAOS".into(),
-                },
-                ChaosEntry {
-                    node: "ip-10-42-2-88.us-east-2.compute.internal".into(),
-                    pod_name: "rio-chaos-1700000000-1".into(),
-                    target_ip: "fd42::1:99".into(),
-                    chain: "RIO-CHAOS".into(),
-                },
-            ],
+            ccnp: Some(CCNP_NAME.into()),
         };
         write_chaos(dir.path(), &st).unwrap();
+        // Atomic write — tmp file gone after rename.
         assert!(!dir.path().join("chaos.json.tmp").exists());
         let r = read_chaos(dir.path()).unwrap();
-        assert_eq!(r.entries.len(), 2);
-        assert_eq!(r.entries[0].node, st.entries[0].node);
-        assert_eq!(r.entries[1].pod_name, "rio-chaos-1700000000-1");
-        assert_eq!(r.entries[0].chain, CHAIN);
+        assert_eq!(r.ccnp.as_deref(), Some(CCNP_NAME));
     }
 
     #[test]
     fn read_chaos_missing_is_default() {
         let dir = tempfile::tempdir().unwrap();
-        let st = read_chaos(dir.path()).unwrap();
-        assert!(st.entries.is_empty());
+        assert!(read_chaos(dir.path()).unwrap().ccnp.is_none());
     }
 
     #[test]
-    fn chaos_script_shape() {
-        let s = chaos_script("fd42::1:99", 60);
-        // Chain create/flush idempotency.
-        assert!(s.contains("ip6tables -N RIO-CHAOS 2>/dev/null || ip6tables -F RIO-CHAOS"));
-        // Link-if-not-linked.
-        assert!(
-            s.contains("ip6tables -C FORWARD -j RIO-CHAOS 2>/dev/null || ip6tables -I FORWARD")
-        );
-        // Both directions dropped.
-        assert!(s.contains("-s fd42::1:99 -j DROP"));
-        assert!(s.contains("-d fd42::1:99 -j DROP"));
-        // Trap cleanup.
-        assert!(s.contains("trap cleanup TERM EXIT"));
-        assert!(s.contains("ip6tables -X RIO-CHAOS"));
-        // Duration interpolated; sleep MUST be backgrounded + wait so
-        // the TERM trap fires immediately (POSIX sh defers traps until
-        // the foreground utility exits — a foreground `sleep 60` with
-        // terminationGracePeriodSeconds=30 means SIGKILL before cleanup).
-        assert!(s.contains("sleep 60 &\nwait $!"));
-        assert!(!s.contains("sleep 60\necho"));
-        // No nsenter — hostNetwork is enough; nsenter -m pulled in
-        // Bottlerocket brush.
-        assert!(!s.contains("nsenter"));
-        // iptables installed at script start.
-        assert!(s.contains("apk add --no-cache iptables"));
+    fn read_chaos_old_format_is_default() {
+        // SIGKILL recovery across the chaos-pod → CNP migration: an
+        // old-format `{"entries":[…]}` chaos.json (from a run killed
+        // before this change shipped) must not block the next QA run.
+        // The old chaos pods self-cleaned via their EXIT trap; there's
+        // nothing the new code could remediate from old state.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("chaos.json"),
+            r#"{"entries":[{"node":"n","pod_name":"p","target_ip":"i","chain":"c"}]}"#,
+        )
+        .unwrap();
+        assert!(read_chaos(dir.path()).unwrap().ccnp.is_none());
     }
 
     #[test]
-    fn remediation_script_idempotent() {
-        let s = remediation_script();
-        // Every ip6tables call must be 2>/dev/null'd — missing chain
-        // is the expected case (chaos pod's trap already cleaned).
-        assert!(s.contains("ip6tables -F RIO-CHAOS 2>/dev/null"));
-        assert!(s.contains("ip6tables -D FORWARD -j RIO-CHAOS 2>/dev/null"));
-        assert!(s.contains("ip6tables -X RIO-CHAOS 2>/dev/null"));
-        // No trap, no sleep — one-shot.
-        assert!(!s.contains("trap"));
-        assert!(!s.contains("sleep"));
-    }
-
-    #[test]
-    fn chaos_pod_spec_shape() {
-        let pod = chaos_pod_spec("rio-chaos-test", "ip-10-42-1-1", "echo hi");
-        let spec = pod.spec.unwrap();
-        assert_eq!(spec.node_name.as_deref(), Some("ip-10-42-1-1"));
-        assert_eq!(spec.host_network, Some(true));
-        // hostPID dropped — was for nsenter, replaced by hostNetwork + iptables-in-container
-        assert_eq!(spec.host_pid, None);
-        assert_eq!(spec.restart_policy.as_deref(), Some("Never"));
-        // Tolerates both worker taint keys.
-        let tol: Vec<_> = spec
-            .tolerations
-            .unwrap()
-            .into_iter()
-            .filter_map(|t| t.key)
-            .collect();
-        assert!(tol.contains(&rio_common::k8s::BUILDER_TAINT_KEY.to_string()));
-        assert!(tol.contains(&rio_common::k8s::FETCHER_TAINT_KEY.to_string()));
-        // Privileged container.
-        let c = &spec.containers[0];
-        assert_eq!(c.security_context.as_ref().unwrap().privileged, Some(true));
-        assert_eq!(c.image.as_deref(), Some(CHAOS_IMAGE));
-        // Namespace + labels.
-        let meta = pod.metadata;
-        assert_eq!(meta.namespace.as_deref(), Some(CHAOS_NS));
+    fn precondition_ccnps_per_from() {
+        // The proxy for "workers are policy-enforced" is "their
+        // helm-managed egress CCNP exists." [`run`] bails if it doesn't,
+        // because a deny-only CNP on an unpoliced endpoint flips it to
+        // default-deny and airgaps the worker entirely.
+        assert_eq!(precondition_ccnps(&ChaosFrom::Builder), &["builder-egress"]);
+        assert_eq!(precondition_ccnps(&ChaosFrom::Fetcher), &["fetcher-egress"]);
         assert_eq!(
-            meta.labels.unwrap().get("app.kubernetes.io/name"),
-            Some(&"rio-chaos".to_string())
+            precondition_ccnps(&ChaosFrom::AllWorkers),
+            &["builder-egress", "fetcher-egress"]
         );
+    }
+
+    #[test]
+    fn chaos_ccnp_scheduler_from_all_workers() {
+        // The i048c shape. Cluster-scoped CCNP (workers span two
+        // namespaces), `endpointSelector` selects both worker kinds,
+        // `egressDeny` (not `egress`) targets `rio-scheduler`.
+        let ccnp = chaos_ccnp(&ChaosTarget::Scheduler, &ChaosFrom::AllWorkers);
+        let v = serde_json::to_value(&ccnp).unwrap();
+        assert_eq!(v["apiVersion"], "cilium.io/v2");
+        assert_eq!(v["kind"], "CiliumClusterwideNetworkPolicy");
+        assert_eq!(v["metadata"]["name"], CCNP_NAME);
+        assert_eq!(
+            v["metadata"]["labels"]["app.kubernetes.io/managed-by"],
+            "xtask"
+        );
+
+        let expr = &v["spec"]["endpointSelector"]["matchExpressions"][0];
+        assert_eq!(expr["key"], "app.kubernetes.io/component");
+        assert_eq!(expr["operator"], "In");
+        let vals: Vec<&str> = expr["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        assert_eq!(vals, ["rio-builder", "rio-fetcher"]);
+
+        let to = &v["spec"]["egressDeny"][0]["toEndpoints"][0]["matchLabels"];
+        assert_eq!(to["k8s:io.kubernetes.pod.namespace"], NS);
+        assert_eq!(to["k8s:app.kubernetes.io/name"], "rio-scheduler");
+
+        // Deny-ONLY. `egress` allow rules would be redundant (deny wins)
+        // and a foot-gun if this CCNP gets copied as a template; `ingress*`
+        // is the wrong direction for `ChaosFrom`'s "block from worker side".
+        assert!(v["spec"].get("egress").is_none());
+        assert!(v["spec"].get("ingress").is_none());
+        assert!(v["spec"].get("ingressDeny").is_none());
+    }
+
+    #[test]
+    fn chaos_ccnp_store_from_builder() {
+        // Single-component `from` uses `matchLabels`, not
+        // `matchExpressions` — same shape the helm policies use.
+        let ccnp = chaos_ccnp(&ChaosTarget::Store, &ChaosFrom::Builder);
+        let v = serde_json::to_value(&ccnp).unwrap();
+        assert_eq!(
+            v["spec"]["endpointSelector"]["matchLabels"]["app.kubernetes.io/component"],
+            "rio-builder"
+        );
+        assert!(
+            v["spec"]["endpointSelector"]
+                .get("matchExpressions")
+                .is_none()
+        );
+        let to = &v["spec"]["egressDeny"][0]["toEndpoints"][0]["matchLabels"];
+        assert_eq!(to["k8s:io.kubernetes.pod.namespace"], NS_STORE);
+        assert_eq!(to["k8s:app.kubernetes.io/name"], "rio-store");
+    }
+
+    #[test]
+    fn chaos_ccnp_worker_target_no_namespace() {
+        // Builder/fetcher targets match by component, not name+namespace —
+        // the controller stamps the component label regardless of which
+        // namespace a Pool lands in (same rationale as `builder-egress`'s
+        // CCNP-not-CNP choice in `networkpolicy.yaml`).
+        let ccnp = chaos_ccnp(&ChaosTarget::Builder, &ChaosFrom::Fetcher);
+        let v = serde_json::to_value(&ccnp).unwrap();
+        let to = &v["spec"]["egressDeny"][0]["toEndpoints"][0]["matchLabels"];
+        assert_eq!(to["k8s:app.kubernetes.io/component"], "rio-builder");
+        assert!(to.get("k8s:io.kubernetes.pod.namespace").is_none());
+    }
+
+    #[test]
+    fn ccnp_is_valid_reads_conditions() {
+        // The exact shape cilium-operator writes on a validated CCNP.
+        let dyn_obj: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "cilium.io/v2",
+            "kind": "CiliumClusterwideNetworkPolicy",
+            "metadata": {"name": "x"},
+            "status": {"conditions": [
+                {"type": "Valid", "status": "True", "message": "Policy validation succeeded"},
+            ]},
+        }))
+        .unwrap();
+        assert!(ccnp_is_valid(&dyn_obj));
+
+        // Not-yet-validated: status absent.
+        let pending: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "cilium.io/v2",
+            "kind": "CiliumClusterwideNetworkPolicy",
+            "metadata": {"name": "x"},
+        }))
+        .unwrap();
+        assert!(!ccnp_is_valid(&pending));
+
+        // Validation FAILED — must not return true on `status: "False"`.
+        let invalid: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "cilium.io/v2",
+            "kind": "CiliumClusterwideNetworkPolicy",
+            "metadata": {"name": "x"},
+            "status": {"conditions": [{"type": "Valid", "status": "False"}]},
+        }))
+        .unwrap();
+        assert!(!ccnp_is_valid(&invalid));
     }
 }
