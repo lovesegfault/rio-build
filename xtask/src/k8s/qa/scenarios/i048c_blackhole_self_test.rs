@@ -5,6 +5,7 @@
 //! that ruled out Chaos Mesh / Litmus on the v6-only cluster. This is
 //! also the regression check for chaos.rs's own ip6tables path.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -12,12 +13,42 @@ use async_trait::async_trait;
 use tokio::time::sleep;
 
 use crate::k8s::chaos::{self, ChaosFrom, ChaosKind, ChaosTarget};
+use crate::k8s::eks::smoke::CliCtx;
 use crate::k8s::qa::{Component, Isolation, QaCtx, Scenario, ScenarioMeta, Verdict};
 
 pub struct BlackholeSelfTest;
 
 const METRIC: &str = "rio_scheduler_worker_disconnects_total";
 const KEEPALIVE_WINDOW: Duration = Duration::from_secs(45);
+
+/// `DebugListExecutors` row, via `rio-cli workers --actor`. Same shape
+/// `i033` deserializes; kept inline rather than hoisted to `common.rs` —
+/// two callsites is one short of the strike-3 extraction threshold.
+#[derive(serde::Deserialize)]
+struct DebugExecutor {
+    executor_id: String,
+    has_stream: bool,
+}
+#[derive(serde::Deserialize)]
+struct DebugList {
+    executors: Vec<DebugExecutor>,
+}
+
+/// Live (`has_stream=true`) executor IDs from the actor's in-memory map.
+/// A `has_stream=false` row is an I-048b zombie — heartbeat-only entry
+/// with no `stream_tx`; the keepalive can't disconnect what isn't a
+/// stream, so it must not satisfy the precondition.
+fn live_executor_ids(cli: &CliCtx) -> Result<HashSet<String>> {
+    let out = cli.run(&["--json", "workers", "--actor"])?;
+    let dl: DebugList = serde_json::from_str(&out)
+        .map_err(|e| anyhow::anyhow!("workers --actor json: {e}: {out}"))?;
+    Ok(dl
+        .executors
+        .into_iter()
+        .filter(|e| e.has_stream)
+        .map(|e| e.executor_id)
+        .collect())
+}
 
 #[async_trait]
 impl Scenario for BlackholeSelfTest {
@@ -33,25 +64,49 @@ impl Scenario for BlackholeSelfTest {
     }
 
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
-        // Need ≥1 builder CONNECTED to the leader (not just running) so
-        // there's something to disconnect. After a prior phase-2
-        // leader-kill, builders may be mid-reconnect; submit a warmup
-        // build to drive a fresh connection rather than Skip.
+        // The chaos can only break a stream the scheduler actually
+        // holds. The precondition must be IDENTITY-based, not gauge-
+        // based: `rio_scheduler_workers_active > 0` alone was satisfied
+        // 2.6s into a full-QA run by a leftover from the previous
+        // Exclusive scenario (i046's mid-drain builder) — long before
+        // the warmup builder could spawn — and that worker exited or
+        // had already been reaped before the CCNP propagated, leaving
+        // the keepalive nothing to time out on (observed 2026-05-13:
+        // metric flat for 75s, FAIL).
+        //
+        // Mirror i033's pattern: snapshot `DebugListExecutors`
+        // (the actor's in-memory executor map, `has_stream`-filtered),
+        // submit a 90s warmup build, and gate on a *fresh* live
+        // executor that wasn't in the snapshot. The fresh executor is
+        // the warmup builder by construction — i048c is `Exclusive`,
+        // nothing else dispatches concurrently. If dispatch is broken
+        // (i033's failure mode) this fails LOUDLY with "no fresh
+        // executor", which is the correct triage signal — better than
+        // applying a no-op chaos to a phantom and reporting a
+        // misleading "egressDeny not enforced".
+        //
+        // Fresh CliCtx, not `ctx.cli`: the shared handle is opened
+        // before phase 2 and a prior leader-kill (i024) leaves it
+        // forwarding to a dead pod or a standby (whose
+        // `DebugListExecutors` is intentionally empty — see proto.md).
+        let cli = CliCtx::open(&ctx.kube, 0, 0).await?;
+        let before_execs = live_executor_ids(&cli)?;
+
         let bg = ctx.nix_build_via_gateway_bg(0, "i048c-warmup", 90, 1);
         let connected =
             super::common::poll_until(Duration::from_secs(90), Duration::from_secs(3), || async {
-                let n = ctx
-                    .scrape_scheduler()
-                    .await?
-                    .sum("rio_scheduler_workers_active");
-                Ok((n > 0.0).then_some(n))
+                let now: HashSet<String> = live_executor_ids(&cli)?;
+                let fresh = now.difference(&before_execs).count();
+                Ok((fresh > 0).then_some(fresh))
             })
             .await?;
         if connected.is_none() {
             bg.abort();
             return Ok(Verdict::Fail(
-                "no executor connected to scheduler-leader within 90s of \
-                 submitting a build — dispatch/spawn-intent path broken"
+                "no fresh executor (has_stream=true, not in pre-warmup \
+                 DebugListExecutors snapshot) within 90s of submitting a \
+                 build — dispatch/spawn-intent path broken, or every \
+                 connected worker pre-dates this scenario"
                     .into(),
             ));
         }
