@@ -84,15 +84,12 @@ For a more sophisticated setup, use `nix-eval-jobs` with `--check-cache-status` 
 For build submission from within the cluster or automation, use the `SubmitBuild` RPC directly:
 
 ```bash
-# Via rio-cli (preferred for scripts)
-rio-cli submit /nix/store/abc...-hello.drv --priority 50 --timeout 7200 --tenant ci-team
-
 # Via grpcurl (low-level)
-grpcurl -plaintext -d '{"derivations": [{"drv_path": "/nix/store/abc...-hello.drv"}], "priority": 50}' \
-  rio-scheduler:50051 rio.scheduler.SchedulerService/SubmitBuild
+grpcurl -plaintext -d '{"nodes": [{"drv_path": "/nix/store/abc...-hello.drv", "system": "x86_64-linux"}], "priority_class": "ci", "tenant_name": "ci-team"}' \
+  rio-scheduler:9001 rio.scheduler.SchedulerService/SubmitBuild
 ```
 
-Note: The derivation must be a valid store path. Evaluation is external to rio-build (see [Non-Goals](./introduction.md#non-goals)). The `.drv` file must already exist in rio-store (uploaded via `wopAddToStoreNar` through a gateway session or `nix copy`).
+Note: The derivation must be a valid store path. Evaluation is external to rio-build (see [Non-Goals](./introduction.md#non-goals)). The `.drv` file must already exist in rio-store (uploaded via `wopAddToStoreNar` through a gateway session or `nix copy`). `rio-cli` does not yet provide a `submit` subcommand.
 
 ## Pre-Populating the Store: `nix copy`
 

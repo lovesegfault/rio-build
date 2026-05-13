@@ -36,9 +36,11 @@ Security-critical protocol parsers must be fuzz-tested. Targets live in per-crat
 - `opcode_parsing` --- each opcode's payload parsing (wopAddToStoreNar, wopBuildDerivation, etc.)
 - `nar_parsing` --- NAR streaming reader with malformed input
 - `narinfo_parsing` --- narinfo text format parser
-- `derivation_parsing` --- `.drv` ATerm format parser (including `__structuredAttrs` with `__json`)
+- `derivation_parsing` --- `.drv` ATerm format parser
 - `derived_path_parsing` --- DerivedPath wire format (`!`-separated `drvPath!output` strings)
 - `build_result_parsing` --- BuildResult wire format (status, error message, timing, built outputs)
+- `stderr_message_parsing` --- STDERR message wire format (`read_stderr_message`)
+- `refscan` --- store-path reference scanner (`RefScanSink`)
 - `manifest_deserialize` (rio-store) --- chunk manifest deserialization
 - Run continuously via `cargo-fuzz` / `libFuzzer`:
   - **CI tier:** 2min/target run with seed corpus (`nix flake check` includes `checks.fuzz-*`)
@@ -94,9 +96,9 @@ Scenarios ported from Lix [`functionaltests2`](https://git.lix.systems/lix-proje
 - `PutPath` for output path not in assignment token's `expected_output_paths` -> rejected
 - Cross-tenant data isolation: tenant A cannot query tenant B's builds via `AdminService`
 - Cross-tenant data isolation: tenant A's `wopQueryPathInfo` returns 404 for tenant B's paths (when per-tenant scoping is enabled)
-- DAG size exceeding `max_dag_size` -> rejected at the scheduler (not gateway --- the gateway forwards derivations; the scheduler enforces DAG-level limits)
+- DAG size exceeding `MAX_DAG_NODES` -> rejected at both gateway (`translate::validate_dag`, early reject) and scheduler
 
-> **Implemented:** security VM test fragments cover JWT validation, mTLS client-cert rejection, binary-cache auth (`nix/tests/scenarios/security.nix`); FOD proxy domain allowlist (`nix/tests/scenarios/fod-proxy.nix`); `__noChroot` gateway pre-check (`r[gw.reject.nochroot]`).
+> **Implemented:** security VM test fragments (`nix/tests/scenarios/security/standalone.nix`) cover HMAC assignment/service tokens, executor-kind spoofing, tenant resolution, JWT dual-mode fallback, per-tenant rate limiting, store-quota enforcement, and the `__noChroot` gateway pre-check (`r[gw.reject.nochroot]`).
 
 ## Chaos Testing
 
@@ -112,7 +114,7 @@ Scenarios ported from Lix [`functionaltests2`](https://git.lix.systems/lix-proje
 
 | Tier | Trigger | Tests | Aggregate target | Time Budget |
 |------|---------|-------|------------------|-------------|
-| CI | Every push | Unit tests, functional tests (real rio-store), clippy, treefmt, live-daemon golden conformance tests, cargo-deny, 2min fuzz ×8, VM integration tests | `nix-fast-build .#checks.<system>` | < 20 min |
+| CI | Every push | Unit tests, functional tests (real rio-store), clippy, treefmt, live-daemon golden conformance tests, cargo-deny, 2min fuzz ×10, VM integration tests | `nix-fast-build .#checks.<system>` | < 20 min |
 | Weekly | Scheduled | + golden-matrix (4 daemons), mutation testing, EKS cluster tests, chaos tests, load tests | `.#golden-matrix`, `.#mutants` | Unbounded |
 
 ## Mutation Testing

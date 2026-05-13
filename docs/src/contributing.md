@@ -76,7 +76,7 @@ The scope regex only allows alphanumerics and `-`/`_`/`/` --- **no commas** in t
 
 ## Project Structure
 
-The workspace is split into 13 crates (`rio-common`, `rio-nix`, `rio-proto`, `rio-crds`, `rio-gateway`, `rio-scheduler`, `rio-store`, `rio-builder`, `rio-controller`, `rio-cli`, `rio-test-support`, `xtask`, `workspace-hack`). See [Crate Structure](./crate-structure.md) for the responsibilities and module layout of each.
+The workspace is split into 15 crates (`rio-auth`, `rio-common`, `rio-lease`, `rio-nix`, `rio-proto`, `rio-crds`, `rio-gateway`, `rio-scheduler`, `rio-store`, `rio-builder`, `rio-controller`, `rio-cli`, `rio-test-support`, `xtask`, `workspace-hack`). See [Crate Structure](./crate-structure.md) for the responsibilities and module layout of each.
 
 ## Where to Start
 

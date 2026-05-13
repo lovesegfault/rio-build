@@ -117,8 +117,8 @@ Control-plane container images (scheduler, gateway, controller, store)
 MUST contain only the component binary and its direct runtime
 dependencies. Operator tooling — rio-cli, jq, debugging utilities —
 MUST NOT be bundled. Admin operations run rio-cli LOCALLY via
-`cargo xtask k8s cli`, which port-forwards the gRPC endpoints and
-fetches the mTLS client cert from the cluster. Bundling tooling in the
+`cargo xtask k8s cli`, which port-forwards the gRPC endpoints
+(plaintext gRPC; transport encryption is at the Cilium overlay). Bundling tooling in the
 scheduler image expands the attack surface (every transitive dependency
 is an execution primitive in a compromised pod) and couples the
 control-plane release cadence to CLI dependency updates.
@@ -188,7 +188,7 @@ A gateway-generated SSH host private key MUST be written with mode `0600` (owner
 | NAR signing key (`signing-key`) | Store | Annually or on compromise | Implemented |
 | HMAC signing key (assignment tokens) | Scheduler + Store | Annually or on compromise | Implemented — `RIO_HMAC_KEY_PATH`, same key file both sides |
 | HMAC signing key (service tokens) | Gateway + Store | Annually or on compromise | Implemented — `RIO_SERVICE_HMAC_KEY_PATH`; gateway signs, store verifies |
-| JWT signing key (tenant tokens)[^jwt] | Gateway | Annually; SIGHUP reload for zero-downtime | Implemented — `RIO_JWT_SIGNING_KEY_PATH`, gateway mints per-session JWT on SSH accept |
+| JWT signing key (tenant tokens)[^jwt] | Gateway | Annually; SIGHUP reload for zero-downtime | Implemented — `RIO_JWT__KEY_PATH`, gateway mints per-session JWT on SSH accept |
 | Database credentials (`database_url`) | Scheduler, Store, Controller | Via Vault database engine or External Secrets | Implemented |
 
 [^authkeys]: The `authorized_keys` comment field carries the tenant name (e.g., `ssh-ed25519 AAAA... acme`). The gateway resolves this to a tenant UUID via `SchedulerService.ResolveTenant` on SSH accept and mints a per-session JWT with `Claims.sub = tenant_id`.
