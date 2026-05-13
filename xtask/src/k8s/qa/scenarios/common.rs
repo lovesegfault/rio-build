@@ -1,11 +1,49 @@
 //! Helpers shared across scenarios. Kept here (not on `QaCtx`) so the
 //! sibling agent owning `ctx.rs` doesn't conflict.
 
+use std::collections::HashSet;
+
 use anyhow::Result;
 
 use crate::k8s::qa::QaCtx;
 use crate::k8s::status::{BUILDER_METRICS_PORT, STORE_METRICS_PORT, Scrape, scrape_pod};
 use crate::k8s::{NS_BUILDERS, NS_STORE};
+
+/// `DebugListExecutors` row, via `rio-cli workers --actor`. The actor's
+/// in-memory executor map — same source the dispatcher reads, no
+/// gauge-tick lag (`housekeeping.rs` recomputes `workers_active` on a
+/// tick, which can lie for one cycle after a leader-kill).
+/// `has_stream=false` is an I-048b zombie: a heartbeat-only entry with
+/// no `stream_tx` — there's no live stream for a keepalive to time out.
+#[derive(serde::Deserialize)]
+pub struct DebugExecutor {
+    pub executor_id: String,
+    pub has_stream: bool,
+}
+
+#[derive(serde::Deserialize)]
+pub struct DebugList {
+    pub executors: Vec<DebugExecutor>,
+}
+
+/// Live (`has_stream=true`) executor IDs from the actor's in-memory
+/// map. Use as a snapshot-diff precondition: capture before a warmup
+/// build, gate on a fresh ID appearing — `workers_active > 0` alone
+/// can be satisfied by a leftover that's about to leave (the i048c
+/// full-QA precondition race, 2026-05-13: satisfied at T+2.6s by a
+/// prior scenario's mid-drain builder, long before the warmup builder
+/// could spawn).
+pub fn live_executor_ids(cli: &crate::k8s::eks::smoke::CliCtx) -> anyhow::Result<HashSet<String>> {
+    let out = cli.run(&["--json", "workers", "--actor"])?;
+    let dl: DebugList = serde_json::from_str(&out)
+        .map_err(|e| anyhow::anyhow!("workers --actor json: {e}: {out}"))?;
+    Ok(dl
+        .executors
+        .into_iter()
+        .filter(|e| e.has_stream)
+        .map(|e| e.executor_id)
+        .collect())
+}
 
 /// Scrape one rio-store replica's `/metrics`. Multi-replica stores
 /// don't aggregate — caller picks the pod (or sums across all via

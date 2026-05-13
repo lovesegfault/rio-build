@@ -21,35 +21,6 @@ pub struct BlackholeSelfTest;
 const METRIC: &str = "rio_scheduler_worker_disconnects_total";
 const KEEPALIVE_WINDOW: Duration = Duration::from_secs(45);
 
-/// `DebugListExecutors` row, via `rio-cli workers --actor`. Same shape
-/// `i033` deserializes; kept inline rather than hoisted to `common.rs` —
-/// two callsites is one short of the strike-3 extraction threshold.
-#[derive(serde::Deserialize)]
-struct DebugExecutor {
-    executor_id: String,
-    has_stream: bool,
-}
-#[derive(serde::Deserialize)]
-struct DebugList {
-    executors: Vec<DebugExecutor>,
-}
-
-/// Live (`has_stream=true`) executor IDs from the actor's in-memory map.
-/// A `has_stream=false` row is an I-048b zombie — heartbeat-only entry
-/// with no `stream_tx`; the keepalive can't disconnect what isn't a
-/// stream, so it must not satisfy the precondition.
-fn live_executor_ids(cli: &CliCtx) -> Result<HashSet<String>> {
-    let out = cli.run(&["--json", "workers", "--actor"])?;
-    let dl: DebugList = serde_json::from_str(&out)
-        .map_err(|e| anyhow::anyhow!("workers --actor json: {e}: {out}"))?;
-    Ok(dl
-        .executors
-        .into_iter()
-        .filter(|e| e.has_stream)
-        .map(|e| e.executor_id)
-        .collect())
-}
-
 #[async_trait]
 impl Scenario for BlackholeSelfTest {
     fn meta(&self) -> ScenarioMeta {
@@ -90,12 +61,12 @@ impl Scenario for BlackholeSelfTest {
         // forwarding to a dead pod or a standby (whose
         // `DebugListExecutors` is intentionally empty — see proto.md).
         let cli = CliCtx::open(&ctx.kube, 0, 0).await?;
-        let before_execs = live_executor_ids(&cli)?;
+        let before_execs = super::common::live_executor_ids(&cli)?;
 
         let bg = ctx.nix_build_via_gateway_bg(0, "i048c-warmup", 90, 1);
         let connected =
             super::common::poll_until(Duration::from_secs(90), Duration::from_secs(3), || async {
-                let now: HashSet<String> = live_executor_ids(&cli)?;
+                let now: HashSet<String> = super::common::live_executor_ids(&cli)?;
                 let fresh = now.difference(&before_execs).count();
                 Ok((fresh > 0).then_some(fresh))
             })

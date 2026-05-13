@@ -12,7 +12,8 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use super::common::{NS_SYSTEM, kill_pod, poll_until, wait_new_leader, wait_recovery_done};
+use super::common::{DebugList, NS_SYSTEM, kill_pod, wait_new_leader, wait_recovery_done};
+use crate::k8s::eks::smoke::CliCtx;
 use crate::k8s::qa::{Component, Isolation, QaCtx, Scenario, ScenarioMeta, Verdict};
 
 pub struct ZombieExecutors;
@@ -31,22 +32,33 @@ impl Scenario for ZombieExecutors {
     }
 
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
-        // Precondition: at least one executor connected so the assert
-        // is meaningful. Spawn a quick build to bring one up.
+        // Snapshot the actor's live executor set BEFORE the warmup so
+        // the precondition gates on a *fresh* worker — not a leftover
+        // from the previous Exclusive scenario whose gauge hasn't
+        // re-ticked yet (the i048c full-QA precondition race,
+        // 2026-05-13). Fresh CliCtx: i033 *itself* kills the leader,
+        // so ctx.cli is about to go stale anyway, and a prior i024
+        // run already left it stale.
+        let cli_pre = CliCtx::open(&ctx.kube, 0, 0).await?;
+        let before_execs = super::common::live_executor_ids(&cli_pre)?;
         let bg = ctx.nix_build_via_gateway_bg(0, "i033-warmup", 30, 1);
-        let warm = poll_until(Duration::from_secs(60), Duration::from_secs(3), || async {
-            let n = ctx
-                .scrape_scheduler()
-                .await?
-                .sum("rio_scheduler_workers_active");
-            Ok((n > 0.0).then_some(()))
-        })
+        let warm = super::common::poll_until(
+            Duration::from_secs(90), // bumped 60→90: same headroom as i048c
+            Duration::from_secs(3),
+            || async {
+                let now = super::common::live_executor_ids(&cli_pre)?;
+                let fresh = now.difference(&before_execs).count();
+                Ok((fresh > 0).then_some(fresh))
+            },
+        )
         .await?;
         if warm.is_none() {
             bg.abort();
             return Ok(Verdict::Fail(
-                "no worker connected to scheduler-leader within 60s of \
-                 submitting a build — dispatch/spawn-intent path broken"
+                "no fresh executor (has_stream=true, not in pre-warmup \
+                 DebugListExecutors snapshot) within 90s of submitting a \
+                 build — dispatch/spawn-intent path broken, or every \
+                 connected worker pre-dates this scenario"
                     .into(),
             ));
         }
@@ -80,18 +92,10 @@ impl Scenario for ZombieExecutors {
         // The DebugListExecutors RPC is exposed via `rio-cli workers
         // --actor` (not a separate subcommand). JSON shape is
         // DebugListExecutorsResponse: {"executors":[{executor_id,
-        // has_stream, ...}]}. The original CliCtx's port-forward points
-        // at the leader we just killed → transport error. Re-open.
-        #[derive(serde::Deserialize)]
-        struct DebugExecutor {
-            executor_id: String,
-            has_stream: bool,
-        }
-        #[derive(serde::Deserialize)]
-        struct DebugList {
-            executors: Vec<DebugExecutor>,
-        }
-        let cli2 = crate::k8s::eks::smoke::CliCtx::open(&ctx.kube, 0, 0).await?;
+        // has_stream, ...}]} — `super::common::DebugList`. The original
+        // CliCtx's port-forward points at the leader we just killed →
+        // transport error. Re-open.
+        let cli2 = CliCtx::open(&ctx.kube, 0, 0).await?;
         let out = cli2.run(&["--json", "workers", "--actor"])?;
         let dl: DebugList = serde_json::from_str(&out)
             .map_err(|e| anyhow::anyhow!("workers --actor json: {e}: {out}"))?;
