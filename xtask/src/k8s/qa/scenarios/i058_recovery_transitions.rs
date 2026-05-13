@@ -27,7 +27,8 @@ impl Scenario for RecoveryTransitions {
             isolation: Isolation::Exclusive {
                 mutates: &[Component::Scheduler],
             },
-            timeout: Duration::from_secs(300),
+            // +90s budget for phase2_settle_after_kill
+            timeout: Duration::from_secs(390),
         }
     }
 
@@ -76,6 +77,9 @@ impl Scenario for RecoveryTransitions {
         let _ = bg.await;
 
         if drained.is_some() {
+            // Don't poison the next phase-2 scenario with this one's
+            // leader-kill blast radius — settle dispatch before returning.
+            super::common::phase2_settle_after_kill(ctx).await?;
             Ok(Verdict::Pass)
         } else {
             Ok(Verdict::Fail(

@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::k8s::qa::QaCtx;
 use crate::k8s::status::{BUILDER_METRICS_PORT, STORE_METRICS_PORT, Scrape, scrape_pod};
@@ -152,6 +152,47 @@ pub async fn wait_recovery_done(ctx: &QaCtx, before: f64, deadline: Duration) ->
     })
     .await?;
     Ok(r.is_some())
+}
+
+/// Settle the cluster after a leader-kill so the *next* phase-2
+/// scenario isn't blamed for this one's blast radius. Two slow paths
+/// follow a leader-kill (live-measured 2026-05-13):
+/// - The gateway's gRPC balancer takes ~3-10s to find the new leader.
+///   `ResolveTenant` fails in that window → `SubmitBuild` carries no
+///   JWT → `Unauthenticated`.
+/// - Every executor stream dies with the old leader — the new leader
+///   has 0 registered executors. The next build needs a cold spawn:
+///   controller poll (10s) → Job → maybe a NodeClaim → container pull
+///   → FUSE mount → connect → register. ~40s warm node, ~70-90s with
+///   provisioning.
+///
+/// Waiting for a *fresh* smoke build to *complete* proves both:
+/// gateway → new-leader routing AND cold-builder dispatch. Waiting
+/// for `workers_active > 0` or `recovery_total > 0` proves neither
+/// (i024's bg builder reconnects via the gateway's `WatchBuild`
+/// retry with its pre-existing JWT — a different code path from a
+/// fresh `SubmitBuild`; recovery is ~40ms, well before either path
+/// is functional).
+///
+/// Caller's `meta().timeout` must budget ~90s for this — it's the
+/// price of not poisoning the next scenario.
+pub async fn phase2_settle_after_kill(ctx: &QaCtx) -> Result<()> {
+    // Recovery gate: not load-bearing (recovery is ~40ms) but cheap
+    // and turns a slow-recovery regression into a clean failure here
+    // rather than a confusing one in the next scenario.
+    if !wait_recovery_done(ctx, 0.0, Duration::from_secs(60)).await? {
+        anyhow::bail!("post-kill settle: new leader never reported recovery success within 60s");
+    }
+    // Fresh build: proves end-to-end dispatch-readiness. 5s sleep,
+    // 1 KiB output — small enough not to dominate the budget, real
+    // enough to exercise the full pipeline.
+    ctx.nix_build_via_gateway(0, "settle-after-kill", 5, 1)
+        .await
+        .context(
+            "post-kill settle: fresh smoke build failed — \
+             gateway → new-leader → builder pipeline not ready",
+        )?;
+    Ok(())
 }
 
 /// Poll `f` every `interval` until it returns `Some` or `deadline`

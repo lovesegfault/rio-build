@@ -27,7 +27,8 @@ impl Scenario for ZombieExecutors {
             isolation: Isolation::Exclusive {
                 mutates: &[Component::Scheduler],
             },
-            timeout: Duration::from_secs(180),
+            // +90s budget for phase2_settle_after_kill
+            timeout: Duration::from_secs(270),
         }
     }
 
@@ -107,6 +108,9 @@ impl Scenario for ZombieExecutors {
             .collect();
 
         if zombies.is_empty() {
+            // Don't poison the next phase-2 scenario with this one's
+            // leader-kill blast radius — settle dispatch before returning.
+            super::common::phase2_settle_after_kill(ctx).await?;
             Ok(Verdict::Pass)
         } else {
             Ok(Verdict::Fail(format!(

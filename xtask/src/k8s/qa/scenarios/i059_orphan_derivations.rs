@@ -26,7 +26,8 @@ impl Scenario for OrphanDerivations {
             isolation: Isolation::Exclusive {
                 mutates: &[Component::Scheduler, Component::Postgres],
             },
-            timeout: Duration::from_secs(180),
+            // +90s budget for phase2_settle_after_kill
+            timeout: Duration::from_secs(270),
         }
     }
 
@@ -79,6 +80,9 @@ impl Scenario for OrphanDerivations {
         cleanup.run().await?;
 
         if n_assignments == 0 {
+            // Don't poison the next phase-2 scenario with this one's
+            // leader-kill blast radius — settle dispatch before returning.
+            super::common::phase2_settle_after_kill(ctx).await?;
             Ok(Verdict::Pass)
         } else {
             Ok(Verdict::Fail(format!(
