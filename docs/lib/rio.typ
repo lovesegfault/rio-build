@@ -45,6 +45,7 @@
 // chronos pinned to 0.2.1: 0.3.0 requires typst ≥0.14.2 but shiroa's
 // embedded reflexo-typst is 0.14.0. Bump when shiroaPkg catches up.
 #import "@preview/chronos:0.2.1" as chronos
+#import "/lib/refs.typ": refs
 
 // ─── colors ─────────────────────────────────────────────────────────
 #let accent = rgb("#1f6feb")
