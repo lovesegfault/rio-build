@@ -13,7 +13,7 @@ use tempfile::TempDir;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tracing::info;
 
-use crate::k8s::eks::smoke::{self, CliCtx, step_restart_gateway, step_tenant, step_upstream};
+use crate::k8s::eks::smoke::{self, CliCtx, step_tenant, step_upstream};
 use crate::k8s::shared::{self, ProcessGuard};
 use crate::k8s::status::{SCHED_METRICS_PORT, Scrape, scrape_pod};
 use crate::k8s::{NS, NS_BUILDERS, client as kube};
@@ -434,15 +434,24 @@ impl TenantPool {
     pub async fn new(kube_client: &kube::Client, cli: &CliCtx, size: usize) -> Result<Self> {
         let (nonce, key_dir, tenants, pubkeys) = alloc_tenants(cli, size).await?;
         Self::sweep_stale_keys(kube_client, nonce).await?;
-        // Batch-install: one Secret read + one write for all N keys, then
-        // ONE gateway rollout-restart so they take effect immediately
-        // (vs ~70s hot-reload × 1).
+        // Batch-install: one Secret read + one write for all N keys.
         shared::merge_authorized_keys_batch(
             kube_client,
             &pubkeys.iter().map(String::as_str).collect::<Vec<_>>(),
         )
         .await?;
-        step_restart_gateway(kube_client).await?;
+        // Wait for the gateway's `r[gw.keys.hot-reload]` (~70s ceiling:
+        // kubelet ≤60s Secret projection + gateway 10s poll) instead of
+        // `step_restart_gateway`. The health stage's smoke test restarts
+        // the gateway ~3 min before this point; a second back-to-back
+        // rollout leaves the gateway churning while phase-1 scenarios
+        // start submitting builds. The functional probe (mirroring i109
+        // `r[verify gw.keys.hot-reload]`): poll until tenant 0's key
+        // authenticates via `nix store ping`. "Key accepted" is the
+        // user-observable behavior the QA scenarios depend on; a fixed
+        // sleep would race kubelet projection lag, and a Secret-vs-log
+        // count comparison races with prior changes.
+        Self::wait_keys_hot_reload(&tenants[0]).await?;
         info!(
             "provisioned {} ephemeral tenants (qa-{nonce}-*) with per-tenant keys",
             tenants.len()
@@ -453,6 +462,59 @@ impl TenantPool {
             nonce,
             _key_dir: key_dir,
         })
+    }
+
+    /// Poll until the gateway accepts an SSH connection authenticated
+    /// with `tenant`'s key — the user-observable signal that
+    /// `r[gw.keys.hot-reload]` has propagated the
+    /// `merge_authorized_keys_batch` write. Same probe shape as i109
+    /// (`r[verify gw.keys.hot-reload]`): `nix store ping` does the SSH
+    /// auth + ssh-ng handshake but no build, and `BatchMode` /
+    /// `IdentitiesOnly` make a key-reject fail fast instead of falling
+    /// through to other auth methods.
+    ///
+    /// Replaces a `step_restart_gateway` here: the health stage's smoke
+    /// test already restarts the gateway ~3 min before this point, and
+    /// a second back-to-back rollout — with `podAntiAffinity` between
+    /// gateway replicas and `nodeAffinity` to system nodes — leaves the
+    /// Deployment churning while phase-1 scenarios start submitting.
+    /// 2026-05-14 round 4: 13 phase-1 timeouts with the gateway
+    /// `FailedScheduling` (`Insufficient cpu`) on system nodes for the
+    /// whole window. The hot-reload window costs ~70s of wall-clock vs
+    /// ~80s for a rollout, so the swap is roughly net-zero on time and
+    /// strictly less cluster disruption.
+    async fn wait_keys_hot_reload(probe_tenant: &Tenant) -> Result<()> {
+        let (port, _guard) = shared::port_forward(NS, "svc/rio-gateway", 0, 22).await?;
+        let key = probe_tenant.key.display().to_string();
+        let store = format!("ssh-ng://rio@localhost:{port}?ssh-key={key}");
+        let sshopts = format!("{} -o ConnectTimeout=5", shared::NIX_SSHOPTS_BASE);
+        // r[gw.keys.hot-reload]: kubelet ≤60s + gateway 10s poll = ~70s
+        // ceiling. 120s gives 50s slack for builder-disk I/O variance.
+        crate::ui::poll(
+            "QA tenant keys hot-reload",
+            Duration::from_secs(5),
+            24,
+            || {
+                let store = store.clone();
+                let sshopts = sshopts.clone();
+                async move {
+                    let s = crate::sh::shell()?;
+                    let ok = crate::sh::try_read(
+                        crate::sh::cmd!(s, "timeout 10 nix store ping --store {store}")
+                            .env("NIX_SSHOPTS", &sshopts),
+                    )
+                    .is_ok();
+                    Ok(ok.then_some(()))
+                }
+            },
+        )
+        .await
+        .context(
+            "gateway did not accept the QA tenant pool's keys within 120s — \
+             authorized_keys hot-reload not firing (see i109 / \
+             r[gw.keys.hot-reload]); verify the gateway is watching the \
+             rio-gateway-ssh Secret and the kubelet sync period is ≤60s",
+        )
     }
 
     /// Delete every tenant the pool created, strip their keys from the
