@@ -1,16 +1,10 @@
-#import "adr.typ": (
-  EE, MAD, accent, adr, algorithm, argmin, codly, codly-range, diagram, edge,
-  fletcher, gls, idea, info, lq, median, memo, mul, muted-backrefs, node, num,
-  print-glossary, qty, qtyrange, rann, register-glossary, sign, src, tip,
-  warning,
-)
-#import "adr-023-glossary.typ": glossary-entries
-#import "adr-023-mc.typ": (
+#import "/lib/rio.typ": *
+#import "/lib/glossary.typ": glossary-entries
+#import "/lib/mc/sla-sizing.typ": (
   duration-margin, geom-lognormal-figure, geom-lognormal-max,
   headroom-coverage-figure, lever-arm-figure, lever-arm-ratio,
 )
 #let dur-margin-pct = calc.round(100 * duration-margin(0.1), digits: 0)
-
 #register-glossary(glossary-entries)
 
 // Stable permalinks to github.com/lovesegfault/rio-build at the pinned SHA.
@@ -28,11 +22,15 @@
 )
 #let gh(display) = src(display, url: src-map.at(display, default: none))
 
-#show: adr.with(
-  number: 23,
-  title: [SLA-Driven Per-Derivation Sizing],
-  status: "Accepted (1–12 shipped; 13a/b proposed)",
-  date: "2026-04",
+#show: rio.with(
+  domains: ("sched.sla", "sched.admin"),
+  paper: (
+    title: [SLA-Driven Per-Derivation Sizing],
+    supertitle: "ARCHITECTURE DECISION RECORD",
+    status: "Accepted",
+    date: "2026-04",
+    bib: "/lib/bib.yml",
+  ),
 )
 
 #info(title: [How to read this document])[
@@ -109,6 +107,8 @@ Rio's existing scheduler→builder sizing pipeline is reused unchanged — this 
 
 == Tiered SLA
 
+#r("sched.sla.tier-envelope")
+
 The operator configures an ordered list of latency tiers, each a *percentile envelope* rather than a single bound:
 
 ```yaml
@@ -126,15 +126,21 @@ The envelope shape is what drives the @captype decision: a tight `p99` forces th
 
 == Coupled duration/memory model <coupled-model>
 
+#r("sched.sla.mem-coupled")
+
 #idea(title: [The whole model in one line])[
   $T(c) = S + P slash c + Q c$ is the entire duration model — Amdahl with a coherence penalty. Everything below (column normalization, Kish $n_"eff"$, Student-$t$ leverage, pinball loss) is numerical hygiene to make this three-parameter fit robust at $n_"eff" in [3, 10]$. On first read, skip to *CPU is the single control variable*.
 ]
+
+#r("sched.sla.model-key-tenant-scoped")
 
 *Duration* is modeled per `(pname, system, tenant)` from `build_samples` as
 $ T(c) = S + P / min(c, macron(p)) + Q dot.op min(c, macron(p)) $
 where $S$ is the serial floor, $P$ is parallelizable work-seconds, and $Q$ is the @usl coherence term modeling retrograde scaling @gunther2007. With $macron(p) >= c_"max" and Q = 0$ this is Amdahl; with $Q = 0$ alone it is the moldable-scheduling roofline form @benoit2022.
 
 The cap $macron(p)$ is the *observed parallelism* ceiling: the recency-weighted p90 of `avg_cores` over *uncensored* samples only, meaning those with `peak_cpu` $< 0.85 dot.op$ `cpu_limit` where the cap was observable. Average is used rather than peak, so a spin-loop reads as $macron(p) approx "limit"$ only if it sustained; a brief burst does not inflate it. To keep the cap from ratcheting downward against the policy's own past action, *$macron(p)$ is floored at $max{"cpu_limit"_i : "avg_cores"_i >= 0.85 dot.op "cpu_limit"_i and "vdist"_i = 0}$* — the highest cap at which the build was *censored* this epoch, inert when that set is empty. The floor prevents post-convergence samples, which have `avg_cores` $<= c^*$ and are cgroup-censored, from pulling $macron(p)$ down to $c^*$ and falsely capping the feasibility check $c^* <= C$. It does not over-shoot when an unsaturated exploration sample already revealed the true $macron(p)$.
+
+#r("sched.sla.fit-nnls")
 
 The fit is *linear in* ${1, 1 slash min(c, macron(p)), min(c, macron(p))}$, so it remains a single weighted-@nnls solve across all model stages. The §Model-staging $Q$-unfreeze is gated by $Delta"AICc"$, but the *solve* is one @nnls call with progressively unfrozen columns, not three code paths. @nnls forcing $S >= 0$ restricts to the $sigma >= kappa$ regime in Gunther's parameterization, where contention dominates coherence — typical of build workloads, but a regime restriction nonetheless. The design matrix is *column-normalized* before the solve and coefficients denormalized after, since raw column norms differ by \~#mul(200) and without normalization that ratio would dominate the condition number and make the solve numerically unstable.
 
@@ -153,6 +159,8 @@ rather than raw $n$. After a version bump the ring buffer may hold 32 samples bu
 Below $n_"eff" = 10$, p90 is not estimable. Instead the model fits ordinary least squares on $log M$ and applies the small-sample prediction-interval factor $exp(t_(0.9, max(3, n_"eff" - 2)) dot.op hat(sigma)_"resid" dot.op sqrt(1 + h_0))$, with leverage
 $ h_0 = 1 / (sum w_i) + (log c^* - overline(log c))^2 / S_(x x), $
 $S_(x x) = sum w_i (log c_i - overline(log c))^2$, and $overline(log c) := (sum w_i log c_i) slash (sum w_i)$. Because $n_"eff" >= sum w_i$ under sub-unit weights, substituting $1 slash n_"eff"$ for the first term would *narrow* the interval and is therefore anti-conservative. Degrees of freedom are floored at 3: the Student-$t$ factor, not $z = 1.28$, is what widens the interval under extrapolation, which is exactly the post-bump case.
+
+#r("sched.sla.disk-scalar")
 
 *Peak ephemeral-storage* $D$ is the *scalar p90* of observed `peak_disk_bytes` with the same recency × version-distance weighting. Disk does not scale with $c$: $N$ parallel compilers produce the same artifact set as one, so there is no $D(c)$ curve and no exploration interaction. This was validated empirically (@fig-disk-probe) across 6 packages at j4 vs j64, with peak ratio #num("1.000+-0.012") and max Δ #qty("62", "MiB") (internal validation 2026-04-06, c7a.16xlarge; raw data: `023-data/disk-probe.tsv`).
 
@@ -184,6 +192,8 @@ $S_(x x) = sum w_i (log c_i - overline(log c))^2$, and $overline(log c) := (sum 
   ),
 ) <fig-disk-probe>
 
+#r("sched.sla.disk-reaches-ephemeral-storage")
+
 Measurement reads kubelet's own XFS/ext4 *project quota* on the emptyDir, a node-local scratch volume. Kubelet (`LocalStorageCapacityIsolationFSQuotaMonitoring=true`) assigns the project ID; the @supervisor scrapes it via `FS_IOC_FSGETXATTR` on the dir inode and reads usage with `quotactl_fd()`. This requires Linux $>= 5.14$ and piggybacks the @supervisor#"'"s existing `CAP_SYS_ADMIN` from the overlay mount; the older `quotactl()` needs a block-device path the container cannot see. The read is kernel-tracked $O(1)$ and polled in the #qty("1", "Hz") `cpu_poll` loop. On the gp3-root pool today — `-o prjquota` lands with the NVMe-backed EC2NodeClass in v1.1 — kubelet falls back to \~#qty("60", "s") `du` polls and $D$ is *recorded as NULL*. The no-neighbor-eviction guarantee below holds only on the prjquota-enabled pool, and the request falls back to `sla.defaultDisk`. A statvfs-delta fallback was rejected because other pods on the same node would cross-contaminate it. The build tempdir lands inside this subtree by default — nix ≥2.30 sets `build-dir = ${stateDir}/builds` — so the quota captures intermediate object files, not just outputs.
 
 ENOSPC — kubelet `DiskPressure` eviction or `StorageFull` from rio's read-through store cache — is classified like @oom: penalty-bump @D to #mul(1.5) observed and automatically retry. The `overlays` emptyDir `sizeLimit` $= D dot.op "headroom"(n_"eff")$, and the pod's `resources.{requests,limits}.ephemeral-storage` $= D dot.op "headroom" + "fuseCacheBudget" + "logBudget"$. Limits equal requests with no burst, per project policy; the pod limit must strictly exceed the sum of emptyDir sizeLimits plus container-log/writable-layer slack. A build that overshoots is therefore evicted itself rather than triggering node-level `DiskPressure` that could evict a neighbor. Karpenter selects nodes with sufficient local storage, closing a pre-existing gap where size-class storage set emptyDir `sizeLimit` but never reached the pod's resource requests (#gh("pool/pod.rs:75")).
@@ -196,6 +206,8 @@ where $n_"par" in {2, 3}$ is the model's parameter count and $n_"distinct-c"$ is
 
 $z_q$ is the Student-$t$ prediction-interval factor evaluated at the design centroid. Evaluating at the centroid keeps $beta$ constant, so the closed-form quadratic below holds; @alg-quantile uses the same centroid $z_q$ as a fixed input, accepting under-coverage at extrapolation in exchange for not recomputing $h_0 (c)$ per bisection step. At large $n_"eff"$ with $n_"distinct-c"$ unbounded, $z_q -> Phi^(-1) (q) = 1.2816$; in practice $n_"distinct-c"$ binds post-convergence. At $n_"eff" = 3$, df $= max(3, n_"eff" - 2) = 3$ gives $t_(0.9, 3) sqrt(4 slash 3) approx 1.89$ — wider than asymptotic $z = 1.28$, narrower than the textbook $t_(0.9, 1) = 3.08$. The df floor trades small-sample conservatism against the $n_"eff" >= 3$ gate already excluding $"df" < 1$.
 
+#r("sched.sla.solve-citardauq")
+
 The solve is linear in $c$ at $Q = 0$ and quadratic otherwise. Apply the cancellation-free quadratic form @higham2002[§1.8] *only when $beta < 0 and beta^2 >= 4 Q P$*; otherwise the tier is infeasible — discriminant negative or target below the serial floor:
 
 $
@@ -204,9 +216,13 @@ $
 
 which degenerates to the Amdahl solution as $Q -> 0$. *Reject the tier as infeasible* if $c^* > C := min(macron(p), c_"opt", "maxCores")$ (@alg-estimate's $P slash q <= C$ check; clamping would silently miss the bound), where $c_"opt" := sqrt(P slash Q)$ if $Q > 0$ else $+oo$ is the @usl throughput peak. Otherwise clamp the lower end to 1 and request $(c^*, M(c^*) dot.op "headroom"(n_"eff"))$.
 
+#r("sched.sla.solve-reject-not-clamp")
+
 #memo(title: [Implementer gotcha])[
   The $c^* <= C$ check is *not* a clamp — clamping to $C$ would silently miss the bound (the capped $T$ is still above the target there). @alg-estimate rejects the tier instead.
 ]
+
+#r("sched.sla.headroom-confidence-scaled")
 
 Headroom is *confidence-scaled*:
 
@@ -299,10 +315,15 @@ A tier is *infeasible* when the model's minimum achievable duration $T_"min" = T
 
 == Saturation-gated exploration <exploration>
 
+#r("sched.sla.explore-saturation-gate")
+
 The model needs samples at distinct $c$ to fit. The scheduler obtains them via a control loop, gated so it never wastes cores a build demonstrably can't use:
 
 - record `cpu_limit`, `peak_cpu`, `cpu_seconds`, `peak_mem`, `wall_secs` per completion (@lst-cgroup);
 - $"avg_cores" = "cpu_seconds" slash "wall_secs"$; bump $c$ only when $"avg_cores" slash "cpu_limit" > 0.4$ AND duration exceeds the target tier — peak alone is insufficient (a brief parallel burst saturates `peak_cpu` without indicating the build would benefit from more cores);
+#r("sched.sla.explore-x4-first-bump")
+#r("sched.sla.explore-freeze")
+
 - the *first bump is #mul(4)*, not #mul(2). Noise sensitivity in the Amdahl solve is dominated by sample _spacing_, not count: $hat(S) = (c_2 T_2 - c_1 T_1) slash (c_2 - c_1)$, so $sigma(hat(S)) prop sqrt((c_1 T_1)^2 + (c_2 T_2)^2) slash (c_2 - c_1)$ — at ±15% run-to-run variance and $S slash P = 1 slash 8$, the #mul(2) span $c in {8, 16}$ gives $sigma(hat(S)) slash S$ roughly #lever-arm-ratio that of the #mul(8) span $c in {4, 32}$ (@fig-lever-arm). A wide first step buys a usable fit one run sooner;
 - exploration freezes at *span $>= 4$ or `maxCores`* — i.e., one #mul(4) bump on the up-path. A build that saturates at $4 dot.op "probe"$ has provided the @fig-lever-arm pair; a build that still saturates at `maxCores` (spin-loop) emits `rio_scheduler_sla_suspicious_scaling_total{tenant}`;
 - when frozen *unsaturated* (probe met SLA, or one bump landed under-utilized), halve $c$ instead — the key reaches span≥4 in $<= 2$ further runs and the solver can then cost-minimize downward;
@@ -475,6 +496,8 @@ All three are the _same_ @nnls solve with progressively unfrozen columns; there 
 
 == Tier reassignment
 
+#r("sched.sla.reassign-schmitt")
+
 Tier assignment is recomputed on each Estimator refresh from the current fit. To prevent flapping when @tmin straddles a tier boundary, reassignment uses a *Schmitt-trigger deadband* (asymmetric two-threshold hysteresis): promote to a tighter tier only when the 80% confidence interval on @tmin is below #mul(0.85) that tier's binding bound; demote only when it exceeds #mul(1.05) the current tier's. The interval is computed by *weighted case (pairs) bootstrap*: \~500 reps, resampling row indices with $P(i) prop w_i$, refitting @nnls _unweighted_ @lawson1974 (resampling already encodes the weights; refitting weighted would double-count). Replicates whose resampled design matrix has $< 2$ distinct $c$ are discarded as rank-deficient. The pairs bootstrap is known-inconsistent at an active @nnls constraint boundary ($Q = 0$) @andrews2000; the resulting CI is used only for the Schmitt deadband, not inference, so coverage error is tolerated rather than corrected. Per surviving replicate $b$ compute
 
 $
@@ -520,6 +543,8 @@ Karpenter provisions across instance generations by spot cost — #gh("values.ya
   },
 ) <fig-hw-factor>
 
+#r("sched.sla.hw-ref-seconds")
+
 Mitigation is *$K$-dimensional reference-second normalization*: a per-$h$ microbench *vector* $bold("factor")[h] in RR^K$ ($K = 3$: int-throughput, memory bandwidth, sequential I/O) and a per-pname *mixture* $bold(alpha)["pname"] in Delta^(K - 1)$ (the simplex), so the effective scalar factor is the dot product $bold(alpha)["pname"] dot.op bold("factor")[h]$. This is Ernest's @ernest2016 parametric basis with PARIS-style @paris2017 fingerprint/residual decomposition, but without PARIS's offline corpus or matrix completion. CherryPick @cherrypick2017 and Selecta @selecta2018 are the canonical Bayesian-optimization alternatives, rejected in §Alternatives. The $K = 3$ basis matches the axes cloud instance families segment on: gen-$n -> n + 1$ improves int-throughput, `r`/`x` families improve membw, and `*d`/`i*` families improve ioseq.
 
 *`hw_class`* is the tuple `{instance-cpu-manufacturer, instance-generation, storage}` derived from Karpenter node labels. Getting it into a build sample is the first plumbing problem: neither the downward API nor an admission webhook can expose node *labels*, since the webhook fires before `spec.nodeName` is bound, and builders are air-gapped from the apiserver. Instead the @controller's pod-annotator stamps `rio.build/hw-class` *after bind* via its Node informer and exposes it through a downward-API *volume* (#gh("controller.md:266")). The builder reads the annotation and includes it in its completion sample, so no server-side join is needed.
@@ -533,6 +558,8 @@ Mitigation is *$K$-dimensional reference-second normalization*: a per-$h$ microb
 `alu` and `ioseq` run concurrently; `membw` runs alone after, since it saturates the memory bus and would contaminate `alu`.
 
 The bench runs *only when the controller stamps `rio.build/hw-bench-needed=true` on the pod*. That annotation is set at pod-create time when two conditions hold. First, the scheduler reports via `AdminService.HwClassSampled` — cached per controller-tick from the `HwTable` snapshot — that *any* $h$ in the intent's $A$ has $< 3$ distinct `pod_id`. The actual $h$ is fixed only at kube-scheduler bind, so the create-time check is over $A$; this over-benches at most until every $h in A$ reaches the threshold. Second, `resources.requests.memory >= sla.hwBenchMemFloor` (default #qty("8", "GiB")), so STREAM cannot OOM a `preferLocalBuild`/fetcher pod. The threshold is reached only when 3 builds *complete* on $h$ — samples land at completion-ingest, not bench-finish — so early pods on a fresh $h$ re-bench, bounded by the 3-distinct-`pod_id` gate. The annotation is *fail-closed*: if it is unset the K=3 bench is skipped, only the phase-10 scalar `alu` probe still runs, and with default-uniform $bold(alpha)$ the model degrades to scalar.
+
+#r("sched.sla.hw-bench-append-only")
 
 Each probe computes $bold("factor")_d = "observed_throughput"_d slash "ref_throughput"_d$ per dimension $d$, so $bold("factor")[h]_d >= 1$ on faster hardware, and *appends* a row to `hw_perf_samples(hw_class, pod_id, factor jsonb, at)`. The Estimator's refresh tick aggregates $bold("factor")[h]_d = median("factor"_d)$ per dimension over rows with $>= 3$ distinct `pod_id`, with #gls("mad")-based outlier rejection. Here $MAD = median_i abs(r_i - median(r))$, and the 1.4826 factor used below makes $1.4826 dot.op MAD$ a consistent estimator of $sigma$ under normality @hampel1974. Append-only writes avoid the last-write-wins race that a single-row upsert would have under concurrent benches; the same append-then-aggregate split applies to `interrupt_rate` self-calibration.
 
@@ -559,6 +586,8 @@ The objective minimum is *unique up to $h$-exploration*. When one $(h, "cap")$ p
 This is the #link("https://allocations.access-ci.org/exchange_calculator")[ACCESS SU-normalization] approach generalized from a single benchmark to a $K = 3$ basis, plus the residual bias. A keyed approach (`hw_class` in the model key) was rejected — see §Alternatives.
 
 == Duration distribution
+
+#r("sched.sla.quantile-geo-lognormal")
 
 Percentile envelopes require a distribution, not a point estimate. The model composes three sources: a deterministic base, multiplicative lognormal run-to-run noise, and a geometric retry tail from spot interruption.
 
@@ -643,6 +672,13 @@ The emitted $c^*$ satisfies the SLA on whichever admissible class the provisione
   Reactive provisioning (Karpenter watches Pending pods, creates NodeClaims) cannot see the DAG: it learns of layer-$N+1$'s demand only when layer-$N$ completes, costing one node-boot of latency per layer (#qtyrange("40", "90", "s") × DAG depth). The scheduler has the DAG, per-dep ETAs, and per-intent $c^*$ — everything needed to provision layer-$N+1$'s capacity *while layer-$N$ runs*. No surveyed production workflow scheduler (Airflow, Spark DRA, Dataproc, Cloud Composer) does DAG-structural lookahead; predictive autoscalers like Netflix Scryer @nflxscryer2013 are time-series-based, not graph-based — to our knowledge this 1-layer-ahead ETA→NodeClaim approach is novel. The controller drives Karpenter's NodeClaim CRD directly so Karpenter's cloud-provider machinery (launch templates, `CreateFleet`, spot-interruption handling, AMI/IAM resolution) is retained without its reactive provisioner.
 
   Within that, the scheduler's edge over the cloud provider is the *time* model ($T(c, h)$, $bold(alpha)$, $lambda$); the cloud provider's edge is *live per-type per-@az price and availability*. Emitting an admissible set $A$ per intent (rather than a single $h$) lets each side optimize what it knows: the scheduler excludes classes its time model rules expensive; for placement on *existing* nodes kube-scheduler picks any $h in A$, and for *new* capacity the controller's per-cell deficit routes each unplaced intent to one cell (its EMA-cheapest in $A$) and `CreateFleet` picks within that cell's instance-type menu. Node reuse across intents means each provisioned $h$ accumulates samples across the workload mix; the explicit $epsilon_h$-pin (below) supplies cross-$h$ observations when one cell durably price-dominates.
+]
+
+#r("sched.sla.intent-from-solve")[
+  The scheduler exposes one `SpawnIntent{intent_id, cores, mem, disk}` per
+  queued derivation (FOD and non-FOD) in `GetSpawnIntents`. `cores` is
+  `ceil(solve_tier(c_star))` for fitted keys, probe defaults otherwise;
+  `prefer_local_build` / `enable_parallel_building=false` pin `cores=1`.
 ]
 
 *Forecast emission* extends `compute_spawn_intents` to walk the DAG twice: the *Ready* frontier as in v1.0, and a *forecast* frontier of `Queued` derivations whose every incomplete dependency is *running* with $"ETA" < max_((h,"cap") in A) "lead_time"[h, "cap"]$. Here $"ETA" = max(0, T(c, h_"placed") - "elapsed")$ evaluated at the running dep's dispatched $c$ and bound $h$, and `lead_time` is the per-cell learned boot horizon described below. Each `SpawnIntent` carries $(A, c^*, M, D, "eta")$ with `eta = 0` for Ready and the max-dep-ETA for forecast. An intent contributes to cell $(h, "cap")$'s demand only when $"eta" < "lead_time"[h, "cap"]$, so a slow-boot cell such as `metal` starts provisioning earlier than a fast one such as `ebs`. During the interval where only the slow cell's window is open the intent's demand is unambiguously that cell's, shrinking cross-$A$ ambiguity to the fastest cell's window.
@@ -821,6 +857,8 @@ Nix derivations carry structure the model can use to skip exploration:
 - *`preferLocalBuild`*: trivially-short drvs (`writeText`, `symlinkJoin`). Short-circuit to a fixed minimal probe; writes a `build_samples` row but is excluded from the fit and the fleet-aggregate prior.
 - *`requiredSystemFeatures`*: `sla.featureProbes: {feature → {cpu, memPerCore, memBase}}` generalizes the `big-parallel` special case — `kvm`/`nixos-test` map to high-`memBase`/low-`cpu` (qemu guest RAM dominates), `benchmark` maps to on-demand-only. Config validation enforces `featureProbes[*].cpu <= maxCores/4` (the same span-reachability invariant as `sla.probe.cpu`; without it, a `featureProbes.big-parallel.cpu = maxCores` first-run would freeze at `span = 1` and yield a rank-1 fit).
 
+#r("sched.sla.cores-reach-nix-build-cores")
+
 The chosen $c^*$ is plumbed to the build via *`wopSetOptions.buildCores`* (#gh("executor/mod.rs:791")) so `NIX_BUILD_CORES` $= c^*$ inside the sandbox — the pod's `resources.requests.cpu` alone does not reach the build's `-j`.
 
 The probe is expressed as `{cpu, memPerCore, memBase}` — not absolute memory — so that when the loop bumps cores after a single sample (no $M(c)$ slope fittable yet), it requests $"bumped_"c dot.op "memPerCore" + "memBase"$ rather than replaying run-1's peak and OOMing. The probe's linear form is for operator intuition; once $n_"eff" >= 3$, the log-linear $M(c)$ fit (parameters $a, b$) supersedes it. A second probe shape keyed on `requiredSystemFeatures ∋ big-parallel` is optional.
@@ -838,6 +876,8 @@ A new cluster has no `build_samples`, so every package pays the 2–3-run explor
 `rio-cli sla export-corpus [--tenant=<t>] [--min-n=3]` dumps fitted `{pname, system, version, S, P, Q, p̄, a, b, α, n_eff, ref_hw_class, ref_factor_vec}` rows to a JSON file (`version` so the importing cluster can apply $"vdist"$ down-weighting; without it a stale curve pools at full $n_0$ weight). ($bold(alpha)$, `ref_factor_vec` are §Phasing-13a targets; phase-12 export omits them.) Curves are in reference-seconds (§Hardware heterogeneity), so a corpus exported on Graviton4 imports correctly on Sapphire Rapids — the importing cluster rescales by $(bold(alpha) dot.op bold("factor")_"old_ref") slash (bold(alpha) dot.op bold("factor")_"new_ref")$ per pname. `sla.seedCorpus: <path>` (or `rio-cli sla import-corpus`) loads it on the new cluster. A seed entry is the highest-priority $hat(theta)_"prior"$ source in the partial-pooling blend (below): the new cluster starts from the old cluster's curves and pools toward its own fit as $n_"eff"$ grows, instead of cold-probing every package.
 
 Privacy is a non-issue for the primary use case — the operator is moving their own data between their own clusters. The export omits raw samples (timing/frequency would leak tenant activity if the file _were_ later shared) and includes only fitted parameters. An operator who wants to publish their corpus (e.g., a community nixpkgs reference set) can scrub pnames before doing so; rio does not ship one.
+
+#r("sched.sla.prior-partial-pool")
 
 Priors are not a hard precedence switch but *partial-pooled*:
 
@@ -860,6 +900,7 @@ The line this draws: operators own *intent* (tier boundaries, `maxCores`/`maxMem
 Mitigations, both required:
 
 - *Tenant-scoped model.* The fit key is `(pname, system, tenant)`, not `(pname, system)`. A tenant can poison only its own curves. The cross-tenant fleet-aggregate prior is computed as *median-over-tenants of per-tenant medians* (one vote per tenant — a Sybil-@pname spammer cannot capture >50% of rows by registering many keys) and clamped to $[#mul(0.5), #mul(2)]$ of operator config; the clamp is the load-bearing bound (worst case: #mul(2) over-provision of every cold start).
+#r("sched.sla.outlier-mad-reject")
 - *Outlier rejection on ingest.* Once a key has @neff $>= 5$, a completion sample whose log-residual exceeds $3 dot.op 1.4826 dot.op max(MAD, hat(sigma)_"resid" slash 1.4826, delta t slash "wall_secs")$ with $delta t = 1$s the cgroup poll interval, is recorded but *excluded from the fit* (#gls("mad")-based; the $hat(sigma)$-floor makes the threshold $approx 3 hat(sigma)$ when MAD degenerates, and the absolute floor covers the $hat(sigma) approx 0$ deterministic-build case). This increments `rio_scheduler_sla_outlier_rejected_total{tenant}`. Combined with the exploration freeze (@alg-explore), the per-key core-seconds a hostile drv can extract is bounded by $"buildTimeout" dot.op ("probe" + 4 dot.op "probe")$ on the up-path (one bump to span $>= 4$) — concurrent dispatches of the same key all read identical `FittedParams` and explore at the same level, so the practical limiter is the *tenant's billing quota*, not this bound. Post-freeze, a sustained spin-loop has $macron(p) approx "maxCores"$ and steady-state cost is `maxCores · buildTimeout` per dispatch — tenant billing remains the only steady-state limiter.
 
 A content-addressed key (drv hash) was rejected: every drv hash is unique, so the model would never accumulate samples. `(pname, tenant)` plus outlier rejection is the accepted compromise: a tenant can mis-size its own builds, but not anyone else's. *Same-pname configuration variants* (`.override`, `pkgsCross`, `clangStdenv`, `doCheck`) share the key — the dip-test metric flags bimodality but the fit pools them; an input-closure-hash bucket as a fourth key dimension is §Future work.
@@ -896,6 +937,8 @@ A content-addressed key (drv hash) was rejected: every drv hash is unique, so th
 == Runtime overrides
 
 Per-pname overrides are stored in a PG `sla_overrides` table and managed via `rio-cli sla override <pname> [--tier=T] [--p50|--p90|--p99=D] [--cores=N] [--mem=B] [--capacity=spot|on-demand] [--ttl=D]`. `rio-cli sla reset <pname>` (`AdminService.ResetSlaModel`) clears `build_samples` for the key — the runbook step for "model is wrong for pname X." The Estimator reads overrides on its existing \~#qty("60", "s") refresh tick alongside `build_samples`. `--tier` pins the target (system still solves for $c$); `--cores`/`--mem` pin the allocation directly (break-glass, bypasses the model). `--ttl` self-expires emergency overrides.
+
+#r("sched.sla.override-precedence")
 
 Resolution precedence for the *target tier*: override > learned (tightest feasible) > feature-probe match > global default.
 
@@ -1099,6 +1142,60 @@ The fit, percentile evaluator, and bisection solve are pure functions covered by
 - *Heteroskedastic-aware @nnls* — multiplicative-lognormal noise gives $"Var" prop T^2$; raw-space loss over-weights low-$c$/high-$T$ rows. Weight rows by $1 slash hat(T)_i^2$ (iteratively-reweighted) or fit in log-space.
 - *Community nixpkgs reference corpus* — a published seed-corpus file generated from a reference jobset. rio provides the export format; whether to publish one is a project decision, not a scheduler feature.
 
+= Normative requirements
+
+Requirements without a natural home in the design prose above (wire-level
+and operational invariants).
+
+#r("sched.sla.reactive-floor+2")[
+  `SchedHint.resource_floor: ResourceFloor { mem_bytes, disk_bytes, deadline_secs }`
+  (default zeros) is the per-dimension reactive floor for cold-start safety.
+  An explicit resource-exhaustion signal (controller-reported
+  `OomKilled`/`EvictedDiskPressure`/`DeadlineExceeded`, worker-reported
+  `CgroupOom`/`TimedOut`) MUST call `bump_floor_or_count`: if the relevant
+  dimension is already at its ceiling (`Ceilings.max_{mem,disk}` / `86400`
+  for deadline), increment `infra_count` (or `timeout_count` for deadline)
+  and return `promoted=false`; otherwise set the dimension to
+  `min(max(floor, last_intent) * 2, ceiling)` and return `promoted=true`.
+  `last_intent` is `state.sched.last_intent.{mem,disk,deadline}_*`
+  snapshotted at dispatch time. `solve_intent_for` MUST clamp its solved
+  (mem, disk) at `resource_floor` before returning, and MUST clamp
+  (cores, mem, disk) at `Ceilings.max_{cores,mem,disk}`. Persisted as
+  `derivations.floor_*` (`M_044`) so failover doesn't reset to zero. No
+  `cores` floor: OOM/DiskPressure are mem/disk under-provision;
+  DeadlineExceeded is a wall-time bound, not a parallelism bound.
+]
+
+#r("sched.sla.cost-leader-edge-reload")[
+  On a false→true leader edge, the cost-table poller MUST reload
+  `sla_ema_state` from PG before its first `persist()`. A failed reload
+  MUST NOT proceed to `persist()` (which would overwrite the previous
+  leader's evolved EMA with this replica's stale startup snapshot); retry
+  on the next tick.
+]
+
+#r("sched.admin.spawn-intents.feature-filter")[
+  When `GetSpawnIntentsRequest.filter_features` is set, the returned
+  `intents` MUST only include Ready derivations whose
+  `requiredSystemFeatures` is a subset of `features` --- i.e., derivations
+  an executor advertising exactly `features` would pass `hard_filter`'s
+  feature check for. Feature-gated pools (`features ≠ ∅`) MUST exclude
+  derivations with empty `requiredSystemFeatures` --- those are owned by
+  the featureless pool. The subset check alone (∅ ⊆ anything) would
+  over-count (I-181). The `kind` filter MUST be applied alongside (the
+  ADR-019 airgap boundary), and `systems` (when non-empty) MUST intersect
+  `intent.system` so a per-arch pool sees only its own backlog
+  (I-107/I-143). Unset `filter_features` (default) = unfiltered,
+  preserving CLI behavior.
+]
+
+#r("sched.sla.intent-match")[
+  `intent_id` is the derivation's `drv_hash`. A worker heartbeating
+  `intent_id == drv_hash` is preferred for that derivation over FIFO
+  pick-from-queue; on miss (drv re-planned, scheduler restart) dispatch
+  falls through to the regular overflow walk.
+]
+
 = Glossary
 
 #print-glossary(
@@ -1108,5 +1205,3 @@ The fit, percentile evaluator, and bisection solve are pure functions covered by
   user-print-group-heading: (..) => [],
   user-print-back-references: muted-backrefs,
 )
-
-#bibliography("adr-023.bib.yml", title: [References], style: "ieee")

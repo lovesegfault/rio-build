@@ -11,5 +11,7 @@
   summary: [
     = Spike
     #chapter("spec/system/_spike.typ")[Spike]
+    = Components
+    #chapter("spec/components/sla-sizing.typ")[SLA-Driven Sizing]
   ],
 )

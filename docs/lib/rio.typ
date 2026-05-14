@@ -264,10 +264,16 @@
   front
   body
 
+  // Per-chapter bibliography for every target except book-pdf (the
+  // stitched aggregate supplies one bibliography at the end; typst
+  // forbids more than one per document). shiroa compiles each chapter
+  // standalone, so omitting it there leaves @cite labels unresolved.
   if (
-    paper != none and target == "pdf" and paper.at("bib", default: none) != none
+    paper != none
+      and target != "book-pdf"
+      and paper.at("bib", default: none) != none
   ) {
-    pagebreak(weak: true)
+    if is-paged { pagebreak(weak: true) }
     bibliography(paper.bib)
   }
 }

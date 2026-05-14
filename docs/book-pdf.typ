@@ -3,3 +3,7 @@
 // check / artifact and stitches chapters via `#include`.
 #set document(title: "rio-build design book")
 #include "spec/system/_spike.typ"
+#pagebreak(weak: true)
+#include "spec/components/sla-sizing.typ"
+#pagebreak(weak: true)
+#bibliography("/lib/bib.yml")
