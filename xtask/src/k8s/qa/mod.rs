@@ -88,8 +88,13 @@ pub struct QaOpts {
     /// Parallel build count for --load.
     #[arg(long = "load-parallel", default_value_t = 8)]
     load_parallel: u8,
-    /// Build target for --load (passed to nix-bench flake).
-    #[arg(long = "load-target", default_value = "hello")]
+    /// Build target for --load (passed to nix-bench flake). Must be a
+    /// `packages.x86_64-linux` attribute of the bench flake (default
+    /// `~/src/nix-bench/main`); `hello-shallow` is the smallest. The
+    /// pre-eval step warns-and-continues if the attribute doesn't
+    /// resolve, but the actual `nix build` will fail every parallel
+    /// build — so a wrong default makes `--load` deterministically red.
+    #[arg(long = "load-target", default_value = "hello-shallow")]
     load_target: String,
     /// Blackhole target for --fault. Defaults to scheduler. Label-
     /// selector based — `scheduler` denies all `rio-scheduler` pods,
@@ -246,7 +251,20 @@ pub async fn run(
                     cfg,
                     &opts.load_target,
                     opts.load_parallel,
-                    0,
+                    // base_port: each parallel build binds
+                    // localhost:{base_port + i} for its ssh-ng tunnel,
+                    // so the caller must know the port up-front (the
+                    // store URL embeds it). 2250 is the default the
+                    // original `xtask k8s stress run` CLI shipped with;
+                    // `e7707afa1`'s smoke/stress→qa migration dropped
+                    // it to a literal 0, which `gateway_port_forward`
+                    // can't represent (it discards `port_forward`'s
+                    // ephemeral pick and reads the SSH banner from
+                    // 127.0.0.1:0 — a 75s silent timeout). Never hit
+                    // until 2026-05-13 because the QA suite always
+                    // FAILed at least one scenario and aborted before
+                    // reaching `load`.
+                    2250,
                     None,
                     false,
                 )

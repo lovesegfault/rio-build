@@ -444,7 +444,24 @@ async fn find_gateway_tg(elbv2: &aws_sdk_elasticloadbalancingv2::Client) -> Resu
 /// reaches the pod via the apiserver proxy regardless of NLB ingress
 /// rules; the NLB ingress path itself is what vm-ingress-v4v6-k3s
 /// covers.
+///
+/// `local_port` MUST be non-zero. `port_forward` accepts `0` (kubectl
+/// picks an ephemeral port and we read it back), but this wrapper
+/// discards the actual port — the caller needs to know `local_port`
+/// up-front to build `ssh-ng://rio@localhost:{local_port}`. Passing
+/// `0` would hand the SSH-banner poll `127.0.0.1:0`, which can never
+/// connect, and produce a 75s silent timeout. Use [`gateway_tunnel`]
+/// (returns the port) when the caller doesn't care which port.
 pub async fn gateway_port_forward(local_port: u16) -> Result<ProcessGuard> {
+    if local_port == 0 {
+        anyhow::bail!(
+            "gateway_port_forward(0) is unsupported — port_forward picks an \
+             ephemeral local port that this wrapper discards, and the SSH \
+             banner read then targets 127.0.0.1:0 which can never connect. \
+             pass a fixed port (e.g. 2250) or use gateway_tunnel() which \
+             returns the bound port."
+        );
+    }
     crate::k8s::shared::kill_port_listeners(local_port);
     let (_, guard) =
         crate::k8s::shared::port_forward(NS, "svc/rio-gateway", local_port, 22).await?;
@@ -592,4 +609,41 @@ pub async fn build_expr(expr: &str, store_url: &str) -> Result<()> {
 /// expression body.
 pub async fn smoke_build(tag: &str, secs: u32, out_kb: u32, store_url: &str) -> Result<()> {
     build_expr(&smoke_expr(tag, secs, out_kb), store_url).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn gateway_port_forward_rejects_port_zero() {
+        // gateway_port_forward(0) must bail BEFORE touching the
+        // network. `port_forward(... 0, ...)` hands a random local
+        // port back, but `gateway_port_forward` discards it (`let (_,
+        // guard) = ...`) and reads the SSH banner from the *requested*
+        // port — `127.0.0.1:0` — which can never connect. The previous
+        // behavior was a silent 75s timeout (25 attempts × 3s); the QA
+        // suite's load stage hit it on its first-ever full run because
+        // `qa/mod.rs` passed `base_port=0` (lost in `e7707afa1`'s
+        // smoke/stress→qa CLI migration; the old `--base-port` default
+        // was 2250). The 500ms outer timeout here makes the *test*
+        // fail loud-and-fast if the guard ever regresses, instead of
+        // hanging on whatever the CI sandbox does with kubectl.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            gateway_port_forward(0),
+        )
+        .await
+        .expect("gateway_port_forward(0) must bail before any network I/O, not time out");
+        // `ProcessGuard` is intentionally `!Debug` (it carries a raw
+        // pid + Child); match instead of `expect_err`.
+        let err = match result {
+            Ok(_) => panic!("port 0 is unrepresentable in the resulting store URL — must Err"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("unsupported"),
+            "wrong error: {err:#}"
+        );
+    }
 }
