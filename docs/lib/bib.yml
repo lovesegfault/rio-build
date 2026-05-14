@@ -1,0 +1,335 @@
+andrews2000:
+  type: article
+  title: Inconsistency of the Bootstrap When a Parameter is on the Boundary of the Parameter Space
+  author: Andrews, Donald W. K.
+  date: 2000
+  parent:
+    type: periodical
+    title: Econometrica
+    volume: 68
+    issue: 2
+
+benoit2022:
+  type: article
+  title: Online Scheduling of Moldable Task Graphs under Common Speedup Models
+  author:
+    - Benoit, Anne
+    - Perotin, Lucas
+    - Robert, Yves
+    - Sun, Hongyang
+  date: 2022
+  parent:
+    type: proceedings
+    title: ICPP '22
+  serial-number:
+    doi: 10.1145/3545008.3545049
+
+eks-roadmap-1468:
+  type: web
+  title: "EKS: Allow customizing kube-scheduler configuration"
+  author: aws/containers-roadmap
+  url: https://github.com/aws/containers-roadmap/issues/1468
+  date: 2021
+
+harchol-balter1999:
+  type: article
+  title: On Choosing a Task Assignment Policy for a Distributed Server System
+  author:
+    - Harchol-Balter, Mor
+    - Crovella, Mark E.
+    - Murta, Cristina D.
+  date: 1999
+  parent:
+    type: periodical
+    title: Journal of Parallel and Distributed Computing
+    volume: 59
+    issue: 2
+  serial-number:
+    doi: 10.1006/jpdc.1999.1577
+
+karpenter-liveness:
+  type: web
+  title: "Karpenter NodeClaim lifecycle liveness controller (registrationTTL = 15m)"
+  author: kubernetes-sigs/karpenter
+  url: https://github.com/kubernetes-sigs/karpenter/blob/main/pkg/controllers/nodeclaim/lifecycle/liveness.go
+  date: 2024
+
+kep-1287:
+  type: web
+  title: "Kubernetes v1.35: In-Place Pod Resize Graduated to GA"
+  author: Kubernetes
+  url: https://kubernetes.io/blog/2025/12/19/kubernetes-v1-35-in-place-pod-resize-ga/
+  date: 2025
+
+k8s-prioritysort:
+  type: web
+  title: kube-scheduler PrioritySort plugin
+  author: kubernetes/kubernetes
+  url: https://github.com/kubernetes/kubernetes/blob/master/pkg/scheduler/framework/plugins/queuesort/priority_sort.go
+  date: 2024
+
+karpenter-createfleet:
+  type: web
+  title: Karpenter spot consolidation with price-capacity-optimized
+  author: AWS Compute Blog
+  url: https://aws.amazon.com/blogs/compute/applying-spot-to-spot-consolidation-best-practices-with-karpenter/
+  date: 2024
+
+kube-rs-485:
+  type: web
+  title: "kube-rs: Support Leaderelection like client-go"
+  author: kube-rs/kube
+  url: https://github.com/kube-rs/kube/issues/485
+  date: 2021
+
+burnham2002:
+  type: book
+  title: "Model Selection and Multimodel Inference: A Practical Information-Theoretic Approach"
+  author: ["Burnham, Kenneth P.", "Anderson, David R."]
+  date: 2002
+  edition: 2
+  publisher: Springer
+
+gelman2007:
+  type: book
+  title: Data Analysis Using Regression and Multilevel/Hierarchical Models
+  author: ["Gelman, Andrew", "Hill, Jennifer"]
+  date: 2007
+  publisher: Cambridge University Press
+
+gunther2007:
+  type: book
+  title: Guerrilla Capacity Planning
+  author: Gunther, Neil J.
+  date: 2007
+  publisher: Springer
+  url: https://www.perfdynamics.com/Manifesto/USLscalability.html
+
+hampel1974:
+  type: article
+  title: The Influence Curve and Its Role in Robust Estimation
+  author: Hampel, Frank R.
+  date: 1974
+  page-range: 383-393
+  parent:
+    type: periodical
+    title: Journal of the American Statistical Association
+    volume: 69
+    issue: 346
+
+hartigan1985:
+  type: article
+  title: The Dip Test of Unimodality
+  author: ["Hartigan, J. A.", "Hartigan, P. M."]
+  date: 1985
+  page-range: 70-84
+  serial-number:
+    doi: 10.1214/aos/1176346577
+  parent:
+    type: periodical
+    title: Annals of Statistics
+    volume: 13
+    issue: 1
+
+higham2002:
+  type: book
+  title: Accuracy and Stability of Numerical Algorithms
+  author: Higham, Nicholas J.
+  date: 2002
+  edition: 2
+  publisher: SIAM
+
+kish1965:
+  type: book
+  title: Survey Sampling
+  author: Kish, Leslie
+  date: 1965
+  publisher: Wiley
+
+koenker2005:
+  type: book
+  title: Quantile Regression
+  author: Koenker, Roger
+  date: 2005
+  publisher: Cambridge University Press
+
+koenker1999:
+  type: article
+  title: Goodness of Fit and Related Inference Processes for Quantile Regression
+  author: ["Koenker, Roger", "Machado, José A. F."]
+  date: 1999
+  page-range: 1296-1310
+  serial-number:
+    doi: 10.1080/01621459.1999.10473882
+  parent:
+    type: periodical
+    title: Journal of the American Statistical Association
+    volume: 94
+    issue: 448
+
+lawson1974:
+  type: book
+  title: Solving Least Squares Problems
+  author: ["Lawson, Charles L.", "Hanson, Richard J."]
+  date: 1974
+  publisher: Prentice-Hall
+
+openbenchmarking2024:
+  type: web
+  title: Graviton4 vs Graviton3 vs Graviton2 vs EPYC vs Xeon
+  author: OpenBenchmarking.org
+  date: 2024
+  url: https://openbenchmarking.org/result/2407111-NE-AWS4GRAVI72
+
+phoronix2024:
+  type: web
+  title: AWS Graviton4 Benchmarks
+  author: Larabel, Michael
+  date: 2024
+  publisher: Phoronix
+  url: https://www.phoronix.com/review/aws-graviton4-benchmarks
+
+cherrypick2017:
+  type: article
+  title: "CherryPick: Adaptively Unearthing the Best Cloud Configurations for Big Data Analytics"
+  author:
+    - Alipourfard, Omid
+    - Liu, Hongqiang Harry
+    - Chen, Jianshu
+    - Venkataraman, Shivaram
+    - Yu, Minlan
+    - Zhang, Ming
+  date: 2017
+  parent:
+    type: proceedings
+    title: NSDI '17
+  url: https://www.usenix.org/conference/nsdi17/technical-sessions/presentation/alipourfard
+
+ernest2016:
+  type: article
+  title: "Ernest: Efficient Performance Prediction for Large-Scale Advanced Analytics"
+  author:
+    - Venkataraman, Shivaram
+    - Yang, Zongheng
+    - Franklin, Michael
+    - Recht, Benjamin
+    - Stoica, Ion
+  date: 2016
+  parent:
+    type: proceedings
+    title: NSDI '16
+  url: https://www.usenix.org/conference/nsdi16/technical-sessions/presentation/venkataraman
+
+gillis2014:
+  type: article
+  title: The Why and How of Nonnegative Matrix Factorization
+  author: Gillis, Nicolas
+  date: 2014
+  url: https://arxiv.org/abs/1401.5226
+
+kaplan1958:
+  type: article
+  title: Nonparametric Estimation from Incomplete Observations
+  author:
+    - Kaplan, E. L.
+    - Meier, Paul
+  date: 1958
+  parent:
+    type: periodical
+    title: Journal of the American Statistical Association
+    volume: 53
+    issue: 282
+
+mccalpin1995:
+  type: report
+  title: "Memory Bandwidth and Machine Balance in Current High Performance Computers"
+  author: McCalpin, John D.
+  date: 1995
+  parent:
+    type: periodical
+    title: IEEE TCCA Newsletter
+  url: https://www.cs.virginia.edu/stream/
+
+masson2019:
+  type: article
+  title: "DDSketch: A Fast and Fully-Mergeable Quantile Sketch with Relative-Error Guarantees"
+  author:
+    - Masson, Charles
+    - Rim, Jee E.
+    - Lee, Homin K.
+  date: 2019
+  parent:
+    type: periodical
+    title: Proceedings of the VLDB Endowment
+    volume: 12
+    issue: 12
+  url: https://www.vldb.org/pvldb/vol12/p2195-masson.pdf
+
+nflxscryer2013:
+  type: web
+  title: "Scryer: Netflix's Predictive Auto Scaling Engine"
+  author: Netflix Technology Blog
+  date: 2013
+  url: https://netflixtechblog.com/scryer-netflixs-predictive-auto-scaling-engine-a3f8fc922270
+
+paris2017:
+  type: article
+  title: "Selecting the Best VM across Multiple Public Clouds: A Data-Driven Performance Modeling Approach"
+  author:
+    - Yadwadkar, Neeraja J.
+    - Hariharan, Bharath
+    - Gonzalez, Joseph E.
+    - Smith, Burton
+    - Katz, Randy H.
+  date: 2017
+  parent:
+    type: proceedings
+    title: SoCC '17
+  url: https://dl.acm.org/doi/10.1145/3127479.3131614
+
+selecta2018:
+  type: article
+  title: "Selecta: Heterogeneous Cloud Storage Configuration for Data Analytics"
+  author:
+    - Klimovic, Ana
+    - Litz, Heiner
+    - Kozyrakis, Christos
+  date: 2018
+  parent:
+    type: proceedings
+    title: USENIX ATC '18
+  url: https://www.usenix.org/conference/atc18/presentation/klimovic-selecta
+
+selfliang1987:
+  type: article
+  title: Asymptotic Properties of Maximum Likelihood Estimators and Likelihood Ratio Tests Under Nonstandard Conditions
+  author:
+    - Self, Steven G.
+    - Liang, Kung-Yee
+  date: 1987
+  parent:
+    type: periodical
+    title: Journal of the American Statistical Association
+    volume: 82
+    issue: 398
+
+rzadca2020:
+  type: article
+  title: "Autopilot: Workload Autoscaling at Google"
+  author:
+    - Rzadca, Krzysztof
+    - Findeisen, Paweł
+    - Świderski, Jacek
+    - Zych, Przemysław
+    - Broniek, Przemysław
+    - Kusmierek, Jarek
+    - Nowak, Paweł
+    - Strack, Beata
+    - Witusowski, Piotr
+    - Hand, Steven
+    - Wilkes, John
+  date: 2020
+  parent:
+    type: proceedings
+    title: EuroSys '20
+  url: https://research.google/pubs/autopilot-workload-autoscaling-at-google-scale/
