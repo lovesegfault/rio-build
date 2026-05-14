@@ -382,6 +382,22 @@ pub enum K8sCmd {
     /// to settle. Run during a quiet window: gateway sessions on the
     /// drained nodes have up to `sessionDrainSecs` (1h) to finish.
     RotateGeneral,
+    /// Run one SQL statement against the cluster's PostgreSQL via the
+    /// in-cluster relay (`rio-qa-pg-relay` socat pod on EKS, direct
+    /// port-forward on k3s). Operator surgery tool — there is no
+    /// operator-side `psql` path: RDS lives in private VPC subnets and
+    /// the credentials are in a k8s Secret, so the only sanctioned
+    /// access is via `PgHandle` (credentials never reach a shell
+    /// command line, env var, or temp file). One statement per
+    /// invocation; for multi-statement surgery, run it twice.
+    /// `SELECT/WITH/EXPLAIN/SHOW/TABLE` print rows; everything else
+    /// prints rows-affected.
+    Pg {
+        /// The SQL statement. Quoted as one arg or trailing-var-arg —
+        /// both work; spaces between args become spaces in the SQL.
+        #[arg(trailing_var_arg = true, required = true)]
+        sql: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -530,7 +546,66 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             }
             eks::deploy::rotate_general().await
         }
+        K8sCmd::Pg { sql } => pg_exec(&sql.join(" ")).await,
     }
+}
+
+/// `xtask k8s pg <SQL>` — see [`K8sCmd::Pg`].
+///
+/// Reads (`SELECT`/`WITH`/`EXPLAIN`/`SHOW`/`TABLE`) print one
+/// pipe-separated line per row. Everything else (`DELETE`/`UPDATE`/
+/// `INSERT`/DDL) executes and prints rows-affected. The SQL is run
+/// verbatim — no injection guard, because the caller IS the operator
+/// and the threat model for `xtask` is "trusted shell on the operator
+/// box," not "untrusted user input."
+async fn pg_exec(sql: &str) -> Result<()> {
+    use sqlx::{Column, Row, ValueRef};
+
+    let kube_client = client::client().await?;
+    let pg = qa::ctx::PgHandle::open(&kube_client).await?;
+    let head = sql.split_whitespace().next().unwrap_or("");
+    let is_read = matches!(
+        head.to_ascii_uppercase().as_str(),
+        "SELECT" | "WITH" | "EXPLAIN" | "SHOW" | "TABLE" | "VALUES"
+    );
+    if is_read {
+        let rows = sqlx::query(sql).fetch_all(&pg.pool).await?;
+        if rows.is_empty() {
+            println!("(0 rows)");
+            return Ok(());
+        }
+        // Header from the first row's column metadata (PG returns the
+        // same shape for every row of one statement).
+        let cols: Vec<&str> = rows[0].columns().iter().map(|c| c.name()).collect();
+        println!("{}", cols.join(" | "));
+        for r in &rows {
+            let vals: Vec<String> = (0..cols.len())
+                .map(|i| {
+                    // Render via `try_get_raw` → `as_str` so we don't have to
+                    // pattern-match every PG type. NULL and non-text types
+                    // (bytea, timestamptz) fall back to a placeholder; for
+                    // anything you need rendered, cast in the SQL
+                    // (`encode(.., 'hex')`, `..::text`).
+                    r.try_get_raw(i)
+                        .ok()
+                        .and_then(|raw| {
+                            if raw.is_null() {
+                                Some("NULL".into())
+                            } else {
+                                raw.as_str().ok().map(str::to_owned)
+                            }
+                        })
+                        .unwrap_or_else(|| "<bin>".into())
+                })
+                .collect();
+            println!("{}", vals.join(" | "));
+        }
+        println!("({} rows)", rows.len());
+    } else {
+        let r = sqlx::query(sql).execute(&pg.pool).await?;
+        println!("{} rows affected", r.rows_affected());
+    }
+    Ok(())
 }
 
 /// Dispatch the selected `up` phases.
