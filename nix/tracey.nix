@@ -19,9 +19,9 @@ let
   # Flake input (not fetchFromGitHub): Cargo.lock is a store path at
   # eval time, so importCargoLock reads it without IFD.
   src = tracey-src;
-  # Workspace Cargo.toml on main still reports 1.3.0 — no tag yet past
-  # the Nix-lang-support / validate-exit-code commits we want.
-  version = "1.3.0-unstable-2026-04-11";
+  # Workspace Cargo.toml still reports 1.3.0 — no tag yet past the
+  # typst-spec fork commits we want.
+  version = "1.3.0-unstable-2026-05-14";
 
   dashboardRoot = "crates/tracey/src/bridge/http/dashboard";
 

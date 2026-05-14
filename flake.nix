@@ -27,7 +27,7 @@
     # Spec-coverage tool (nix/tracey.nix). Flake input (not fetchFromGitHub)
     # so importCargoLock reads Cargo.lock from a pre-fetched path — no IFD.
     tracey-src = {
-      url = "github:bearcove/tracey";
+      url = "github:lovesegfault/tracey/typst-spec";
       flake = false;
     };
 
@@ -1138,6 +1138,8 @@
             # Unit-test-only lcov (5min). `packages.coverage-html`
             # is the full unit+VM report.
             coverage-unit = crateChecks.coverage;
+            # Spec-coverage tool — standalone build for pin bumps.
+            tracey = traceyPkg;
             # Instrumented workspace (symlinkJoin). Inspection:
             #   objdump -h result/bin/rio-store | grep llvm_prf
             workspace-cov = crateBuildCov.workspace;

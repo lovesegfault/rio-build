@@ -324,15 +324,16 @@
     "tracey-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1775919362,
-        "narHash": "sha256-7XdxB9kbmyeu1wZlhA25ad5IpVzAMAU4QfN/izcqSPk=",
-        "owner": "bearcove",
+        "lastModified": 1777305304,
+        "narHash": "sha256-e9T1fdo4AKFfetsw87ggcSxhi3wkjg+mbDJK/QYEBNY=",
+        "owner": "lovesegfault",
         "repo": "tracey",
-        "rev": "33ea2228703c24799726f42f76d4081ff21350c8",
+        "rev": "be2bd23957977313bd1d912f0cdd1d626f4007eb",
         "type": "github"
       },
       "original": {
-        "owner": "bearcove",
+        "owner": "lovesegfault",
+        "ref": "typst-spec",
         "repo": "tracey",
         "type": "github"
       }
