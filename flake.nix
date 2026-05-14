@@ -374,6 +374,10 @@
             inherit (inputs) tracey-src;
           };
 
+          # mdbook-style HTML generator for typst sources. Not in
+          # nixpkgs; packaged here for the docs build.
+          shiroaPkg = pkgs.callPackage ./nix/shiroa.nix { };
+
           # crate2nix CLI built from source against OUR nixpkgs.
           # inputs.crate2nix is `flake = false` (bare source tree) so
           # its 8 transitive flake inputs (devshell, cachix,
@@ -1140,6 +1144,7 @@
             coverage-unit = crateChecks.coverage;
             # Spec-coverage tool — standalone build for pin bumps.
             tracey = traceyPkg;
+            shiroa = shiroaPkg;
             # Instrumented workspace (symlinkJoin). Inspection:
             #   objdump -h result/bin/rio-store | grep llvm_prf
             workspace-cov = crateBuildCov.workspace;
