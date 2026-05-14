@@ -15,7 +15,7 @@ use sqlx::Row;
 
 use crate::k8s::eks::TF_DIR;
 use crate::k8s::qa::{Component, Isolation, QaCtx, Scenario, ScenarioMeta, Verdict};
-use crate::sh::{self, cmd};
+use crate::sh::{self, cmd, shell};
 
 pub struct ChunkVerify;
 
@@ -28,7 +28,14 @@ impl Scenario for ChunkVerify {
             isolation: Isolation::Exclusive {
                 mutates: &[Component::S3, Component::Postgres],
             },
-            timeout: Duration::from_secs(300),
+            // Budget for the cold-spawn tail. The seed build is ~15 s
+            // when a warm builder is up (full QA run: phase-1 scenarios
+            // pre-warm the pool before phase-2 reaches i040), but 298 s
+            // when Karpenter has scaled to zero (`--only i040` against
+            // an idle cluster — observed 2026-05-14). 300 s gave 0
+            // margin for the SQL pick + S3 delete + verify-chunks scan
+            // (~30-60 s); 420 s keeps ~60 s slack past the cold tail.
+            timeout: Duration::from_secs(420),
         }
     }
 
@@ -53,34 +60,92 @@ impl Scenario for ChunkVerify {
             ));
         };
 
-        // Self-setup: seed a fresh refcount=1 chunk by building a
-        // unique-content output (>256 KiB so it's chunked, not
-        // inline-PG). currentTime in the body ensures the chunk hash
-        // is unique to this run, so we never delete a shared chunk.
+        // Self-setup: seed a fresh chunked output. The nonce is computed
+        // Rust-side (not `builtins.currentTime`) so the local
+        // `nix-instantiate` below and `gateway_build`'s internal one
+        // agree on the drv path — `currentTime` is wall-clock and the
+        // two evals can straddle a second boundary, yielding two
+        // different drvs and a `target_out` that was never built.
+        //
+        // ~305 KiB body (300 lines × ~1040 B) clears `INLINE_THRESHOLD`
+        // (256 KiB) with margin so the store's PutPath always takes the
+        // chunked CAS path — this scenario is dead if the output inlines.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
         let expr = format!(
             r#"{BUSYBOX_LET} builtins.derivation {{
-              name = "rio-qa-i040-seed-${{toString builtins.currentTime}}";
+              name = "rio-qa-i040-seed-{nonce}";
               system = "x86_64-linux";
               builder = "${{busybox}}";
-              args = ["sh" "-c" "for i in $(busybox seq 1 300); do echo i040-${{toString builtins.currentTime}}-$i-{CHUNK}; done > $out"];
+              args = ["sh" "-c" "for i in $(busybox seq 1 300); do echo i040-{nonce}-$i-{CHUNK}; done > $out"];
             }}"#,
             CHUNK = "x".repeat(1020),
             BUSYBOX_LET = crate::k8s::eks::smoke::BUSYBOX_LET,
         );
+        // Pre-instantiate to a fixed drv so we can compute the seed's
+        // output path after the build returns — `gateway_build` discards
+        // `nix build`'s stdout. Same pattern as iso03.
+        let drv = {
+            let s = shell()?;
+            sh::run_read(cmd!(s, "nix-instantiate --expr {expr}")).await?
+        };
         ctx.nix_build_expr_via_gateway(0, &expr).await?;
+        let target_out = {
+            let s = shell()?;
+            sh::run_read(cmd!(s, "nix-store -q --outputs {drv}"))
+                .await?
+                .lines()
+                .next()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("nix-store -q --outputs {drv}: empty"))?
+        };
 
-        // Pick a chunk with refcount==1 (the one we just made).
+        // Pick a chunk that belongs to the SEED'S OWN manifest. The
+        // earlier unscoped pick (`WHERE refcount=1 ORDER BY created_at
+        // DESC LIMIT 1`) picked "the most recent refcount=1 chunk in the
+        // whole table" — which after a phase-2 predecessor substitutes a
+        // new shared input is *that input's* chunk, not the seed's.
+        // Round 7 (2026-05-14) deleted busybox chunk `574e8a43f…`,
+        // round-8 i201 then found it stranded (PG row re-INSERTed by a
+        // subsequent build, S3 object still gone). Scoping to the seed
+        // makes "we never delete another path's chunk" structural.
+        //
+        // No `manifest_chunks` join table exists — `manifest_data.
+        // chunk_list` is the packed binary format from
+        // `rio-store/src/manifest.rs` (`r[store.manifest.format]`):
+        //   [version: u8 = 1] [entry: 36 B = blake3[32] ++ size_u32_le]*
+        // so the chunk hashes are extracted with `substring … FOR 32`
+        // over `generate_series`. The `refcount=1` filter still applies
+        // — within the seed's own manifest a chunk could theoretically
+        // collide with another path's via FastCDC; the nonce in every
+        // line makes that astronomically unlikely, but if it happens we
+        // want to skip that chunk, not corrupt the colliding path.
         let row = sqlx::query(
-            "SELECT encode(blake3_hash, 'hex') AS h FROM chunks \
-             WHERE refcount = 1 AND NOT deleted ORDER BY created_at DESC LIMIT 1",
+            "WITH seed AS (
+                SELECT md.chunk_list
+                FROM narinfo n
+                JOIN manifests m USING (store_path_hash)
+                JOIN manifest_data md USING (store_path_hash)
+                WHERE n.store_path = $1 AND m.status = 'complete'
+             ),
+             ch AS (
+                SELECT substring(chunk_list FROM 2 + 36 * g FOR 32) AS blake3_hash
+                FROM seed,
+                     generate_series(0, (octet_length(chunk_list) - 1) / 36 - 1) AS g
+             )
+             SELECT encode(ch.blake3_hash, 'hex') AS h
+             FROM ch
+             JOIN chunks c USING (blake3_hash)
+             WHERE c.refcount = 1 AND NOT c.deleted
+             LIMIT 1",
         )
+        .bind(&target_out)
         .fetch_optional(ctx.pg())
         .await?;
         let Some(row) = row else {
             return Ok(Verdict::Fail(
-                "seeded a unique ~300KiB output but no refcount=1 chunk appeared \
-                 — chunked PutPath path not taken (output inlined?)"
-                    .into(),
+                diagnose_missing_chunk(ctx, &target_out).await?,
             ));
         };
         let hex: String = row.try_get("h")?;
@@ -92,41 +157,53 @@ impl Scenario for ChunkVerify {
             "aws s3api delete-object --bucket {bucket} --key {key}"
         ))?;
 
-        // verify-chunks streams missing hex hashes to stdout.
-        // CliCtx::run captures stdout; --store-addr is set by CliCtx.
-        //
-        // Fresh CliCtx, not `ctx.cli`: `reads: [Store]` keeps i040 from
-        // running *while* i039-store-kill-survives holds the Store
-        // write, but i040 still runs *after* it — and the shared
-        // `ctx.cli` was opened before phase 2 with a port-forward to the
-        // store pod i039 just killed. Observed 2026-05-14 round 7:
-        // `transport error … BrokenPipe … stream closed because of a
-        // broken pipe` against a Terminating pod. Same stale-handle
-        // problem i033 solves with a fresh `CliCtx::open` after a
-        // leader-kill; the only difference is i040 inherits the kill
-        // from a serialized predecessor instead of doing one itself.
-        let cli = crate::k8s::eks::smoke::CliCtx::open(&ctx.kube, 0, 0).await?;
-        let out = match cli.run(&["verify-chunks", "--limit", "0"]) {
-            Ok(o) => o,
-            Err(e) => {
-                // Some deployments need the limit flag named
-                // differently or don't support it — fall back.
-                let msg = format!("{e:#}");
-                if msg.contains("unexpected argument") {
-                    cli.run(&["verify-chunks"])?
-                } else {
-                    return Err(e);
+        // The S3 object is gone — from here, PG cleanup MUST run on
+        // every exit path. The pre-2026-05-14 version skipped cleanup
+        // when verify-chunks errored (early `return Err`), leaving the
+        // PG `chunks` row pointing at a 404 → next round's i201 fails
+        // with "stranded chunk". Capture the verdict, cleanup, return.
+        let verdict: Result<Verdict> = async {
+            // verify-chunks streams missing hex hashes to stdout.
+            // CliCtx::run captures stdout; --store-addr is set by CliCtx.
+            //
+            // Fresh CliCtx, not `ctx.cli`: `reads: [Store]` keeps i040
+            // from running *while* i039-store-kill-survives holds the
+            // Store write, but i040 still runs *after* it — and the
+            // shared `ctx.cli` was opened before phase 2 with a
+            // port-forward to the store pod i039 just killed. Observed
+            // 2026-05-14 round 7: `transport error … BrokenPipe`.
+            let cli = crate::k8s::eks::smoke::CliCtx::open(&ctx.kube, 0, 0).await?;
+            let out = match cli.run(&["verify-chunks", "--limit", "0"]) {
+                Ok(o) => o,
+                Err(e) => {
+                    // Some deployments need the limit flag named
+                    // differently or don't support it — fall back.
+                    let msg = format!("{e:#}");
+                    if msg.contains("unexpected argument") {
+                        cli.run(&["verify-chunks"])?
+                    } else {
+                        return Err(e);
+                    }
                 }
+            };
+            if out.contains(&hex) {
+                Ok(Verdict::Pass)
+            } else {
+                Ok(Verdict::Fail(format!(
+                    "verify-chunks did not report deleted chunk {hex}. Output (first 500B): {}",
+                    &out.chars().take(500).collect::<String>()
+                )))
             }
-        };
+        }
+        .await;
 
-        // Restore PG↔S3 consistency: the S3 object is gone and we
-        // can't easily put it back, so delete the PG `chunks` row too.
-        // Otherwise i201 (which asserts no PG-says-exists-S3-says-404)
-        // will Fail on the row this scenario deliberately stranded.
-        // Any manifest_chunks referencing it will see it gone, but
-        // that's the lesser inconsistency (verify-chunks would re-flag
-        // the manifest — same as a real corruption).
+        // Restore PG↔S3 consistency. The S3 object is gone for good
+        // (would need a chunked re-upload of the seed); drop the PG
+        // `chunks` row so i201's PG-says-exists-S3-says-404 scan
+        // doesn't flag it, and drop the seed's narinfo (cascades to
+        // manifests → manifest_data → content_index) so the permanently
+        // corrupt path doesn't accumulate across rounds. Both warn-and-
+        // continue: a partial cleanup is still better than no cleanup.
         if let Err(e) = sqlx::query("DELETE FROM chunks WHERE blake3_hash = decode($1, 'hex')")
             .bind(&hex)
             .execute(ctx.pg())
@@ -134,14 +211,65 @@ impl Scenario for ChunkVerify {
         {
             tracing::warn!("i040 cleanup: DELETE FROM chunks {hex}: {e:#}");
         }
-
-        if out.contains(&hex) {
-            Ok(Verdict::Pass)
-        } else {
-            Ok(Verdict::Fail(format!(
-                "verify-chunks did not report deleted chunk {hex}. Output (first 500B): {}",
-                &out.chars().take(500).collect::<String>()
-            )))
+        if let Err(e) = sqlx::query("DELETE FROM narinfo WHERE store_path = $1")
+            .bind(&target_out)
+            .execute(ctx.pg())
+            .await
+        {
+            tracing::warn!("i040 cleanup: DELETE FROM narinfo {target_out}: {e:#}");
         }
+
+        verdict
     }
+}
+
+/// Why didn't the seed produce a deletable chunk? Each branch of the
+/// chunked-PutPath pipeline (narinfo → manifest → manifest_data →
+/// chunks) has a different failure mode and a different fix; the old
+/// catch-all "no refcount=1 chunk appeared" message couldn't tell them
+/// apart, so the round-8 occurrence had to be re-run with manual SQL.
+async fn diagnose_missing_chunk(ctx: &QaCtx, target_out: &str) -> Result<String> {
+    let diag = sqlx::query(
+        "SELECT m.store_path_hash IS NOT NULL AS has_manifest,
+                m.status,
+                m.inline_blob IS NOT NULL AS inlined,
+                n.nar_size,
+                (octet_length(md.chunk_list) - 1) / 36 AS n_chunks
+         FROM narinfo n
+         LEFT JOIN manifests m USING (store_path_hash)
+         LEFT JOIN manifest_data md USING (store_path_hash)
+         WHERE n.store_path = $1",
+    )
+    .bind(target_out)
+    .fetch_optional(ctx.pg())
+    .await?;
+    let why = match diag {
+        None => "no narinfo row — output never registered (build no-op'd?)".to_owned(),
+        Some(d) => {
+            let has_manifest: bool = d.try_get("has_manifest")?;
+            let status: Option<String> = d.try_get("status")?;
+            let inlined: bool = d.try_get("inlined")?;
+            let nar_size: i64 = d.try_get("nar_size")?;
+            let n_chunks: Option<i32> = d.try_get("n_chunks")?;
+            if !has_manifest {
+                "narinfo exists but no manifest — PutPath never started".into()
+            } else if status.as_deref() != Some("complete") {
+                format!("manifest status={status:?} — PutPath never completed")
+            } else if inlined {
+                format!(
+                    "output was inlined (NAR {nar_size} B < 256 KiB INLINE_THRESHOLD) — \
+                     seed body too small to take the chunked-PutPath path"
+                )
+            } else {
+                format!(
+                    "manifest is chunked ({} chunks, NAR {nar_size} B) but none have \
+                     refcount=1 — unique seed produced shared chunks (CDC collision?)",
+                    n_chunks.map_or_else(|| "?".into(), |n| n.to_string()),
+                )
+            }
+        }
+    };
+    Ok(format!(
+        "no deletable refcount=1 chunk for seed {target_out}: {why}"
+    ))
 }
