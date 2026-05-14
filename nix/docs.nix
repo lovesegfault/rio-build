@@ -122,7 +122,7 @@ rec {
         }
       )
       ''
-        typst compile --root ${compileRoot} \
+        typst compile --root ${compileRoot} -f pdf \
           --input x-target=book-pdf \
           --input gh-sha=${self.rev or "dirty"} \
           ${compileRoot}/book-pdf.typ $out
@@ -140,11 +140,20 @@ rec {
         }
       )
       ''
-        # shiroa writes a font cache + may probe XDG dirs.
+        # shiroa embeds reflexo-typst, which resolves @preview/* via
+        # XDG_DATA_HOME (ignores TYPST_PACKAGE_CACHE_PATH) and on
+        # startup writes its bundled copy of @preview/shiroa there
+        # — so the dir must be a writable copy, not a store symlink.
+        # `cp -rL`: rioTypst's lib/ is a buildEnv symlink farm.
         export HOME=$TMPDIR
+        export XDG_DATA_HOME=$HOME/.local/share
+        mkdir -p $XDG_DATA_HOME/typst
+        cp -rL "$TYPST_PACKAGE_CACHE_PATH" $XDG_DATA_HOME/typst/packages
+        chmod -R u+w $XDG_DATA_HOME/typst
         cp -r ${compileRoot} ./root && chmod -R +w ./root
         cd ./root
-        shiroa build --root . --mode static-html -d $out .
+        shiroa build --root . --mode static-html \
+          --font-path "$TYPST_FONT_PATHS" -d $out .
       '';
 
   checks = {
