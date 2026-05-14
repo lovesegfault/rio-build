@@ -430,10 +430,23 @@ mod tests {
             "i040 submits a build → must not run while i024 is killing the leader"
         );
 
-        // After i024 releases, both become runnable (and CAN run with
-        // each other — disjoint writes, read-read on Scheduler).
+        // After i024 releases, i039 becomes runnable. i040 must NOT
+        // run alongside i039: `verify-chunks` holds a gRPC stream to
+        // the store for the whole scan, and i039's store-kill drops it
+        // mid-scan with `BrokenPipe` (observed 2026-05-14). The
+        // original assertion ("disjoint writes, read-read on Scheduler
+        // → can run concurrently") missed that i040 *reads* Store —
+        // the same `mutates`-only-captures-destruction footgun that
+        // motivated the `reads` field in the first place, just with
+        // i039 as the writer instead of i024.
         l.release(mutates(i024), i024.reads());
         assert!(l.try_acquire(mutates(i039), i039.reads()));
+        assert!(
+            !l.try_acquire(mutates(i040), i040.reads()),
+            "i040 reads Store via verify-chunks → must not run while i039 is killing the store"
+        );
+        // After i039 releases, i040 is runnable.
+        l.release(mutates(i039), i039.reads());
         assert!(l.try_acquire(mutates(i040), i040.reads()));
     }
 

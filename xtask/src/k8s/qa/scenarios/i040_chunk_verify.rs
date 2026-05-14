@@ -32,6 +32,20 @@ impl Scenario for ChunkVerify {
         }
     }
 
+    /// Self-setup submits a build (Scheduler read) and `verify-chunks`
+    /// holds a gRPC connection to the store for the whole scan (Store
+    /// read). Without the explicit Store read, the phase-2 scheduler
+    /// runs i040 concurrently with `i039-store-kill-survives` (disjoint
+    /// `mutates`: `[S3, Postgres]` vs `[Store]`), and i039's store-kill
+    /// drops i040's `verify-chunks` stream mid-scan — observed
+    /// 2026-05-14 round 5: `transport error … BrokenPipe … stream
+    /// closed because of a broken pipe`. Same `mutates`-only-captures-
+    /// destruction footgun the i024/i039/i040 default-`reads` exists
+    /// for; this is the second instance for the same scenario pair.
+    fn reads(&self) -> &'static [Component] {
+        &[Component::Scheduler, Component::Store]
+    }
+
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
         let Ok(bucket) = crate::tofu::output(TF_DIR, "chunk_bucket_name") else {
             return Ok(Verdict::Skip(
