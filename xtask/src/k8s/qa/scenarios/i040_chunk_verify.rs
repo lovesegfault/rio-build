@@ -94,14 +94,26 @@ impl Scenario for ChunkVerify {
 
         // verify-chunks streams missing hex hashes to stdout.
         // CliCtx::run captures stdout; --store-addr is set by CliCtx.
-        let out = match ctx.cli.run(&["verify-chunks", "--limit", "0"]) {
+        //
+        // Fresh CliCtx, not `ctx.cli`: `reads: [Store]` keeps i040 from
+        // running *while* i039-store-kill-survives holds the Store
+        // write, but i040 still runs *after* it — and the shared
+        // `ctx.cli` was opened before phase 2 with a port-forward to the
+        // store pod i039 just killed. Observed 2026-05-14 round 7:
+        // `transport error … BrokenPipe … stream closed because of a
+        // broken pipe` against a Terminating pod. Same stale-handle
+        // problem i033 solves with a fresh `CliCtx::open` after a
+        // leader-kill; the only difference is i040 inherits the kill
+        // from a serialized predecessor instead of doing one itself.
+        let cli = crate::k8s::eks::smoke::CliCtx::open(&ctx.kube, 0, 0).await?;
+        let out = match cli.run(&["verify-chunks", "--limit", "0"]) {
             Ok(o) => o,
             Err(e) => {
                 // Some deployments need the limit flag named
                 // differently or don't support it — fall back.
                 let msg = format!("{e:#}");
                 if msg.contains("unexpected argument") {
-                    ctx.cli.run(&["verify-chunks"])?
+                    cli.run(&["verify-chunks"])?
                 } else {
                     return Err(e);
                 }
