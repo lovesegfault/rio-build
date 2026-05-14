@@ -78,6 +78,30 @@ fn is_benign_destroy_failure(msg: &str) -> bool {
         || msg.contains("no matches for kind")
 }
 
+/// `helm uninstall` failure text that's safe to continue past. NOT the
+/// same policy as [`is_benign_destroy_failure`]: kubectl timeouts are
+/// hard failures (a stuck NodeClaim must surface), but a `helm
+/// uninstall --wait` timeout means helm already removed the release
+/// record + submitted the manifest deletes — only the wait for
+/// `Terminating` resources ran out. The namespace deletes + finalizer
+/// strip + ENI/SG sweep below clean up whatever was wedged, so log and
+/// continue rather than abort the whole wipe/destroy.
+///
+/// Two timeout signatures depending on helm version, both of which
+/// helm wraps in `uninstallation completed with N error(s): <inner>`:
+/// - `timed out waiting for the condition` — kube-wait poll error,
+///   helm < ~3.16.
+/// - `context deadline exceeded` — `kstatus` waiter, helm ≥ 3.16
+///   (Go's `context.DeadlineExceeded`). Observed in the field: the
+///   `rio-gateway` `Service`'s aws-lbc finalizer waited on an NLB
+///   backend-SG delete that hit a transient `DependencyViolation`,
+///   pushing the wait past 10m.
+fn is_benign_helm_uninstall_failure(msg: &str) -> bool {
+    msg.contains("Kubernetes cluster unreachable")
+        || msg.contains("timed out waiting")
+        || msg.contains("context deadline exceeded")
+}
+
 /// All `*.rio.build` CRD names registered on the cluster (e.g.
 /// `pools.rio.build`). Covers the current `pool`/`componentscaler`
 /// types AND legacy pre-ADR-023 types (`builderpool`/`builderpoolset`/
@@ -198,19 +222,15 @@ pub(in crate::k8s) async fn uninstall_chart() -> Result<()> {
     // NodeClaims. helm's --ignore-not-found makes this idempotent.
     ui::step("helm uninstall rio", || async {
         let sh = shell()?;
-        // Unreachable apiserver = cluster already gone. Timeout = a
-        // resource (typically a stuck NodeClaim/Node, see step 1b) is
-        // wedged on a finalizer; the namespace deletes + finalizer
-        // strip below clean that up regardless, so log and continue
-        // rather than abort the whole wipe/destroy. `sh::run`'s error
-        // chain doesn't carry full stderr, so this MUST go through
-        // run_benign_if.
+        // Benign-match policy lives in [`is_benign_helm_uninstall_failure`].
+        // `sh::run`'s error chain doesn't carry full stderr, so this MUST
+        // go through run_benign_if.
         sh::run_benign_if(
             cmd!(
                 sh,
                 "helm uninstall rio -n {NS} --wait --timeout 10m --ignore-not-found"
             ),
-            |e| e.contains("Kubernetes cluster unreachable") || e.contains("timed out waiting"),
+            is_benign_helm_uninstall_failure,
         )
         .await
     })
@@ -442,7 +462,42 @@ async fn tofu_destroy() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_benign_destroy_failure, parse_rio_crds};
+    use super::{is_benign_destroy_failure, is_benign_helm_uninstall_failure, parse_rio_crds};
+
+    /// Regression for helm ≥ 3.16's `--wait` timeout shape. Older helm
+    /// returns `timed out waiting for the condition` (kube-wait poll);
+    /// newer helm uses the kstatus waiter and surfaces Go's
+    /// `context.DeadlineExceeded`. Observed live (helm v3.20.2):
+    /// `helm uninstall rio --wait --timeout 10m` hung on the
+    /// `rio-gateway` Service's aws-lbc finalizer (NLB SG delete hit a
+    /// transient `DependencyViolation`) and exited with the latter —
+    /// the old filter matched neither, so destroy hard-failed at step 2
+    /// instead of letting the namespace delete + ENI/SG sweep mop up.
+    #[test]
+    fn helm_benign_covers_both_wait_timeout_shapes() {
+        for msg in [
+            "Error: uninstallation completed with 1 error(s): context deadline exceeded",
+            "Error: uninstallation completed with 1 error(s): timed out waiting for the condition",
+            "Error: Kubernetes cluster unreachable: Get \"https://B26.eks.amazonaws.com\": dial tcp: lookup ...",
+        ] {
+            assert!(
+                is_benign_helm_uninstall_failure(msg),
+                "should be benign: {msg}"
+            );
+        }
+        // Non-timeout uninstall errors still surface — those mean helm
+        // couldn't even start the delete (RBAC, malformed release, ...)
+        // and the downstream steps won't help.
+        for msg in [
+            "Error: uninstall: Release name is invalid: rio!@#",
+            "Error: pods is forbidden: User \"x\" cannot delete resource",
+        ] {
+            assert!(
+                !is_benign_helm_uninstall_failure(msg),
+                "must NOT be benign: {msg}"
+            );
+        }
+    }
 
     /// Regression for the partially-provisioned-cluster case: destroy
     /// runs before the rio chart was ever installed, so CRDs don't
