@@ -378,6 +378,14 @@
           # nixpkgs; packaged here for the docs build.
           shiroaPkg = pkgs.callPackage ./nix/shiroa.nix { };
 
+          # Typst design-book pipeline: hermetic typst env (rioTypst),
+          # PDF (docs-pdf), shiroa HTML (docs). See nix/docs.nix.
+          docsLib = import ./nix/docs.nix {
+            inherit pkgs shiroaPkg;
+            inherit (pkgs) lib;
+            inherit (inputs) tracey-src self;
+          };
+
           # crate2nix CLI built from source against OUR nixpkgs.
           # inputs.crate2nix is `flake = false` (bare source tree) so
           # its 8 transitive flake inputs (devshell, cachix,
@@ -1145,6 +1153,10 @@
             # Spec-coverage tool — standalone build for pin bumps.
             tracey = traceyPkg;
             shiroa = shiroaPkg;
+            # Wrapped typst with the @preview/* package closure +
+            # fonts the design book uses. Debug: `nix run
+            # .#legacyPackages.<sys>.rioTypst -- compile foo.typ`.
+            inherit (docsLib) rioTypst;
             # Instrumented workspace (symlinkJoin). Inspection:
             #   objdump -h result/bin/rio-store | grep llvm_prf
             workspace-cov = crateBuildCov.workspace;
@@ -1284,6 +1296,8 @@
             # --format json -o Cargo.json` regenerates after lockfile
             # changes).
             crate2nix-cli = crate2nixCli;
+            # Typst design book outputs.
+            inherit (docsLib) docs docs-pdf;
           }
           # Container images: docker-{gateway,scheduler,store,worker}
           # plus a linkFarm aggregate at `.#dockerImages` (milestone
@@ -1411,6 +1425,8 @@
             # Workspace-level policy checks (deny, helm-lint, mdbook,
             # tracey-validate, crds-drift, tfvars-fresh, …).
             // miscChecks
+            # Typst design-book builds (PDF + shiroa HTML).
+            // docsLib.checks
             # 2min fuzz runs (Linux-only). Compiled binaries shared
             # across targets via rio-{nix,store}-fuzz-build.
             // fuzz.runs
