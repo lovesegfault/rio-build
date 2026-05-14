@@ -71,6 +71,14 @@ rustPlatform.buildRustPackage {
   pname = "tracey";
   inherit version src;
 
+  # Upstream's typst spec scanner treats every `#fn("str")` call as a
+  # requirement marker (denylist of stdlib names only). unify's
+  # `#qty("5","s")` etc. then collide as duplicate rule "5", config
+  # validation fails, daemon falls back to empty config, and `validate`
+  # exits 0. Patch narrows extraction to `#r`/`#req` and makes validate
+  # exit nonzero when a config error left the spec set empty.
+  patches = [ ./patches/tracey-typst-narrow-marker.patch ];
+
   cargoLock.lockFile = "${src}/Cargo.lock";
 
   # Default features include `search` (tantivy) — enables Cmd+K fuzzy
