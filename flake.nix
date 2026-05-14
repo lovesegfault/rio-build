@@ -1207,6 +1207,9 @@
 
               # TOML formatting
               taplo.enable = true;
+
+              # Typst formatting
+              typstyle.enable = true;
             };
             settings.global.excludes = [
               # cargo-hakari owns this file's format. taplo and hakari
@@ -1272,6 +1275,8 @@
               sysCrateEnv
               traceyPkg
               crate2nixCli
+              docsLib
+              shiroaPkg
               ;
             treefmtWrapper = config.treefmt.build.wrapper;
             preCommitInstall = config.pre-commit.installationScript;

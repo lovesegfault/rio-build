@@ -12,6 +12,9 @@
   sysCrateEnv,
   traceyPkg,
   crate2nixCli,
+  # nix/docs.nix — rioTypst (wrapped typst) + typstEnv (TYPST_* vars)
+  docsLib,
+  shiroaPkg,
   # config.treefmt.build.wrapper — `treefmt` in PATH
   treefmtWrapper,
   # config.pre-commit.installationScript — installs git hooks on shell entry
@@ -43,6 +46,13 @@ let
     # Documentation
     mdbook
     mdbook-mermaid
+    # Typst design book — wrapped typst (with @preview/* closure
+    # baked in via TYPST_PACKAGE_CACHE_PATH), shiroa HTML generator,
+    # and the typstyle formatter (wired into treefmt). typstEnv below
+    # exports the same TYPST_* vars for shiroa's in-process resolver.
+    docsLib.rioTypst
+    shiroaPkg
+    typstyle
 
     # Integration test deps
     postgresql_18
@@ -129,6 +139,7 @@ let
     })
       (
         sysCrateEnv.allEnv
+        // docsLib.typstEnv
         // {
           packages = [ rust ] ++ shellPackages;
           nativeBuildInputs = with pkgs; [

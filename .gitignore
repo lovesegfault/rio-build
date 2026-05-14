@@ -41,6 +41,9 @@ __pycache__/
 # mdbook output
 docs/book/
 
+# typst output
+docs/**/*.pdf
+
 # Sprint-local implementation plans (artifact, not source)
 docs/plans/
 

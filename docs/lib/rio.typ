@@ -12,7 +12,9 @@
 //   function's scope.
 // - shiroa's `is-*-target` are nullary functions, not booleans.
 
-#import "@preview/shiroa:0.3.1": is-web-target, is-html-target, is-pdf-target, templates
+#import "@preview/shiroa:0.3.1": (
+  is-html-target, is-pdf-target, is-web-target, templates,
+)
 #import "@preview/tracey:0.1.0": req
 
 #let _domains = state("rio-domains", none)
@@ -29,7 +31,9 @@
 #let rio(domains: none, paper: none, body) = {
   let target = sys.inputs.at("x-target", default: "pdf")
   _domains.update(domains)
-  set page(paper: "a4", margin: (x: 2.6cm, y: 2.8cm)) if target in ("pdf", "book-pdf")
+  set page(paper: "a4", margin: (x: 2.6cm, y: 2.8cm)) if (
+    target in ("pdf", "book-pdf")
+  )
   // Phase B wires shiroa's `templates.*-rules` here for the HTML
   // target. For the spike the chapter body passes through unchanged
   // and shiroa renders it via its own pipeline.
