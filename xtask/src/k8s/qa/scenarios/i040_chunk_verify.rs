@@ -70,16 +70,36 @@ impl Scenario for ChunkVerify {
         // ~305 KiB body (300 lines × ~1040 B) clears `INLINE_THRESHOLD`
         // (256 KiB) with margin so the store's PutPath always takes the
         // chunked CAS path — this scenario is dead if the output inlines.
+        //
+        // The iteration list is a Rust-generated word literal, NOT
+        // `$(busybox seq 1 300)`: a `builtins.derivation` with no PATH
+        // env var has an empty PATH in the build sandbox, so `busybox`
+        // isn't resolvable inside the script and the command
+        // substitution silently returns nothing — the loop runs 0
+        // times and `> $out` creates an empty file (112 B of NAR
+        // framing, well under the inline threshold). That broken seed
+        // shipped for months: the old unscoped chunk-pick (`WHERE
+        // refcount=1 ORDER BY created_at DESC LIMIT 1`) didn't care
+        // and deleted *some other path's* chunk every run — that was
+        // the actual i201-stranded-chunk source. Same wall the smoke
+        // author hit (`SMOKE_EXPR`: "stdenv bootstrap busybox lacks
+        // dd, $((arith)), AND printf"); same fix (literal word list).
+        // `$i` keeps each line — and so each chunk — unique.
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
+        let seq: String = (1u32..=300)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
         let expr = format!(
             r#"{BUSYBOX_LET} builtins.derivation {{
               name = "rio-qa-i040-seed-{nonce}";
               system = "x86_64-linux";
               builder = "${{busybox}}";
-              args = ["sh" "-c" "for i in $(busybox seq 1 300); do echo i040-{nonce}-$i-{CHUNK}; done > $out"];
+              args = ["sh" "-c" "for i in {SEQ}; do echo i040-{nonce}-$i-{CHUNK}; done > $out"];
             }}"#,
+            SEQ = seq,
             CHUNK = "x".repeat(1020),
             BUSYBOX_LET = crate::k8s::eks::smoke::BUSYBOX_LET,
         );
