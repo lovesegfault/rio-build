@@ -283,7 +283,9 @@ to lazily fetch store path content on demand.
   fetching and records the outcome after --- under singleflight a
   prefetch-owned failure is observed by FUSE waiters via EIO, so prefetch is
   NOT silent and MUST feed the breaker. The fetch timeout is
-  `fuse_fetch_timeout_secs` (default 180) from `builder.toml` --- NOT the
+  #(refs.cfg)("builder", "fuse_fetch_timeout_secs") (default
+  #(refs.cfg-default)("builder", "fuse_fetch_timeout_secs")) from
+  `builder.toml` --- NOT the
   global `GRPC_STREAM_TIMEOUT`. *CRITICAL: std::sync ONLY* --- FUSE callbacks
   run on fuser's thread pool, NOT in a tokio context. `AtomicU32` +
   `parking_lot::Mutex`; zero `tokio::sync`, zero `.await`.

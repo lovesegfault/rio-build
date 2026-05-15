@@ -197,12 +197,13 @@ everywhere (crate, CRD, proto, metrics, tracey markers, docs); *Fetcher* is the
 FOD-only executor --- same `rio-builder` binary, different `RIO_EXECUTOR_KIND`
 env.
 
-*Four-namespace layout.* `rio-system` (PSA `baseline`) holds scheduler,
-gateway, controller, dashboard, PostgreSQL. `rio-store` (`baseline`) holds the
-store in its own namespace so executor NetworkPolicies can target it precisely.
-`rio-builders` and `rio-fetchers` (both `privileged`) hold the respective
-Jobs. `privileged` PSA narrows to the two namespaces that need `CAP_SYS_ADMIN`
-for FUSE; the control plane drops to `baseline`.
+*Four-namespace layout.* `rio-system` (PSA #(refs.psa)("rio-system")) holds
+scheduler, gateway, controller, dashboard, PostgreSQL. `rio-store`
+(#(refs.psa)("rio-store")) holds the store in its own namespace so executor
+NetworkPolicies can target it precisely. `rio-builders` and `rio-fetchers`
+(both #(refs.psa)("rio-builders")) hold the respective Jobs. `privileged` PSA
+narrows to the two namespaces that need `CAP_SYS_ADMIN` for FUSE; the control
+plane is #rref("sec.psa.control-plane-restricted").
 
 *One CRD, two kinds.* A `Pool{kind=Builder}` lives in `rio-builders`; a
 `Pool{kind=Fetcher}` lives in `rio-fetchers`. The reconciler spawns one-shot

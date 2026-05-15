@@ -1674,9 +1674,11 @@ derivation without the full DAG context.
   - `Transport` (scheduler connection dropped) and `EofWithoutTerminal` (stream
     closed cleanly without a terminal `BuildCompleted`/`Failed`/`Cancelled`
     event --- typical leader-failover signature: SIGTERM → graceful shutdown →
-    TCP FIN → `Ok(None)`) → retried up to *10 times* with exponential backoff
-    *1 s/2 s/4 s/8 s/16 s, capped at 16 s for attempts 6--10*. The scheduler
-    replays `BuildEvent`s from `build_event_log` starting at `since_sequence`.
+    TCP FIN → `Ok(None)`) → retried up to *#(refs.const)("MAX_RECONNECT")
+    times* with exponential backoff
+    *1 s/2 s/4 s/8 s/16 s, capped at 16 s for the remaining attempts*. The
+    scheduler replays `BuildEvent`s from `build_event_log` starting at
+    `since_sequence`.
   - `Wire` → *not* retried; the gateway returns `MiscFailure` to the Nix client
     immediately. This indicates a protocol bug, not a transient connectivity
     issue.

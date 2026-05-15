@@ -137,9 +137,8 @@ the scope (use the broader scope or split into multiple commits).
 
 = Project Structure
 
-The workspace is split into 13 crates (`rio-common`, `rio-nix`, `rio-proto`,
-`rio-crds`, `rio-gateway`, `rio-scheduler`, `rio-store`, `rio-builder`,
-`rio-controller`, `rio-cli`, `rio-test-support`, `xtask`, `workspace-hack`).
+The workspace is split into #(refs.crate-count)() crates
+(#(refs.crate-list)()) plus the `workspace-hack` hakari stub.
 See #cross-link("/spec/system/crate-structure.typ")[Crate Structure] for the responsibilities
 and module layout of each.
 

@@ -453,12 +453,14 @@ and #cross-link("/spec/components/store.typ")[rio-store] for the chunked CAS.
   + The `BuildEvent` response stream breaks with a gRPC Transport error.
   + Gateway's `process_stream` classifies the error as
     `StreamProcessError::Transport` and re-subscribes via
-    `WatchBuild(build_id, since_sequence)` --- up to 5 times with exponential
-    backoff (1/2/4/8/16s).
+    `WatchBuild(build_id, since_sequence)` --- up to
+    #(refs.const)("MAX_RECONNECT") times with exponential
+    backoff (1/2/4/8/16s, capped at 16s).
   + New scheduler replays `BuildEvent`s from `build_event_log` starting at
     `since_sequence`. The Nix client sees continuous `STDERR` streaming
     (possibly a brief pause during backoff).
-  + If all 5 reconnects fail, or the error is `EofWithoutTerminal`/`Wire`,
+  + If all #(refs.const)("MAX_RECONNECT") reconnects fail, or the error is
+    `EofWithoutTerminal`/`Wire`,
     the gateway returns `MiscFailure` to the client (manual retry).
   + If the gateway itself also restarted, see @sec-client-disconnect above.
 + Log events between the old leader's last S3 flush and its crash may be lost

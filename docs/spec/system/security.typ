@@ -231,13 +231,13 @@
 
 #r("sec.psa.control-plane-restricted")[
   The `rio-system` and `rio-store` namespaces MUST enforce Pod Security
-  Admission `restricted`. Control-plane pods (scheduler, gateway, controller,
-  store) set `runAsNonRoot: true`, `capabilities.drop: [ALL]`,
+  Admission #(refs.psa)("rio-system"). Control-plane pods (scheduler, gateway,
+  controller, store) set `runAsNonRoot: true`, `capabilities.drop: [ALL]`,
   `allowPrivilegeEscalation: false`, `seccompProfile: RuntimeDefault`, and
   `readOnlyRootFilesystem: true`. These are gRPC servers with no FUSE, no
   mount, no raw-socket requirements --- `restricted` is the correct floor. The
-  executor namespaces (`rio-builders`, `rio-fetchers`) stay at `privileged` per
-  ADR-019; they need `CAP_SYS_ADMIN` for FUSE.
+  executor namespaces (`rio-builders`, `rio-fetchers`) stay at
+  #(refs.psa)("rio-builders") per ADR-019; they need `CAP_SYS_ADMIN` for FUSE.
 ]
 
 #r("sec.image.control-plane-minimal")[

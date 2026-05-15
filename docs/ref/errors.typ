@@ -118,8 +118,9 @@ See `rio-builder/src/executor/mod.rs` for the mapping implementation.
   [`rio-gateway/src/handler/build.rs`],
   [Gateway-internal enum distinguishing `Transport` (scheduler connection
     dropped) and `EofWithoutTerminal` (stream closed cleanly without terminal
-    BuildEvent --- leader-failover signature) --- *both retried* up to 10× with
-    backoff 1/2/4/8/16 s capped at 16 s --- and `Wire` (protocol parse error
+    BuildEvent --- leader-failover signature) --- *both retried* up to
+    #(refs.const)("MAX_RECONNECT")× with backoff 1/2/4/8/16 s capped at 16 s
+    --- and `Wire` (protocol parse error
     --- *not retried*). `Transport` and `EofWithoutTerminal` trigger the
     WatchBuild reconnect loop.],
 )
@@ -288,9 +289,10 @@ separately. A derivation is only globally poisoned if it fails on
   [Scheduler failover],
   [Gateway's `BuildEvent` stream breaks with a `Transport` or
     `EofWithoutTerminal` error. Gateway transparently reconnects via
-    `WatchBuild(since_sequence)` up to 10× with backoff (1/2/4/8/16 s, capped
-    at 16 s); scheduler replays from `build_event_log`. If reconnect budget
-    exhausted → `MiscFailure` to client.],
+    `WatchBuild(since_sequence)` up to #(refs.const)("MAX_RECONNECT")× with
+    backoff (1/2/4/8/16 s, capped at 16 s); scheduler replays from
+    `build_event_log`. If reconnect budget exhausted → `MiscFailure` to
+    client.],
 
   [Gateway crash],
   [SSH connection drops. Client reconnects; build reattaches via DAG-merge

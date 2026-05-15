@@ -1,7 +1,11 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: none)
 
-= Workspace Layout (15 crates)
+// gen/workspace.json — members + xtask's rio-* deps. Loaded directly
+// (not via refs.typ) so the autograph block can spread `.xtask_deps`.
+#let _ws = json("/gen/workspace.json")
+
+= Workspace Layout (#(refs.crate-count)() crates)
 
 ```
 rio-build/
@@ -101,8 +105,9 @@ derivation is invalidated on `.proto` changes but not on Rust-only commits.
       autograph.edge(<rio-cli>, <rio-proto>),
       autograph.edge(<rio-cli>, <rio-common>),
       autograph.edge(<rio-cli>, <rio-crds>),
-      autograph.edge(<xtask>, <rio-crds>),
-      autograph.edge(<xtask>, <rio-test-support>),
+      // xtask edges derive from gen/workspace.json so a new xtask
+      // rio-* dep extends the graph without a manual edit (merged_027).
+      .._ws.xtask_deps.map(d => autograph.edge(<xtask>, label(d))),
       // dev-dependencies (dashed, muted)
       autograph.edge(<rio-gateway>, <rio-test-support>, ..dev),
       autograph.edge(<rio-gateway>, <rio-store>, ..dev),
@@ -583,9 +588,10 @@ src/
 == xtask — Dev/ops tooling
 
 `cargo xtask` subcommands for codegen (`regen cargo-json`, `regen sqlx`,
-`regen fuzz-lock`), local cluster lifecycle (`up`/`down`/`status`), AMI
-build, and helm/k8s helpers. Depends on `rio-crds` (CRD apply) and
-`rio-test-support` (ephemeral PG bootstrap for `regen sqlx`).
+`regen fuzz-lock`, `regen docs-data`), local cluster lifecycle
+(`up`/`down`/`status`), AMI build, and helm/k8s helpers. Depends on
+#(_ws.xtask_deps.map(raw).join(", ")) --- see `gen/workspace.json` for the
+live list.
 
 = Dependencies
 

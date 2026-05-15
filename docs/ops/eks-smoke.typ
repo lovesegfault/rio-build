@@ -73,13 +73,17 @@ echo "Gateway: $GATEWAY_HOST"
 
 = Step 4: Create Pool
 
+Pods land in `rio-builders`, *not* `rio-system` --- builder pods need
+`CAP_SYS_ADMIN` (overlayfs mount), and `rio-system` is PSA
+#(refs.psa)("rio-system"). See #rref("sec.psa.control-plane-restricted").
+
 ```bash
 cat <<EOF | kubectl apply -f -
 apiVersion: rio.build/v1alpha1
 kind: Pool
 metadata:
   name: smoke-test
-  namespace: rio-builders   # NOT rio-system: builder pods need CAP_SYS_ADMIN; rio-system is PSA-restricted
+  namespace: rio-builders   # NOT rio-system (see above)
 spec:
   kind: Builder
   image: rio-builder:latest

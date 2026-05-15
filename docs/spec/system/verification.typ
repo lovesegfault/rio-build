@@ -286,13 +286,16 @@ boots a single-VM k3s cluster.
   `drain_stderr_expecting_error` is the inverse for error-path tests.
 ]
 
-#r("ts.metrics.grep")[
+#r("ts.metrics.grep+2")[
   `grep_emitted_names(manifest_dir)` greps the crate's `src/` for
   `metrics::{counter,gauge,histogram}!("...")` literals;
-  `grep_spec_names(obs_md, prefix)` greps #src("docs/spec/system/observability.typ")
-  table rows. Both run at *test time* from `metrics_suite!` (no per-crate
-  build.rs). The grep operates on *source text*, not on a Prometheus scrape ---
-  it catches an undescribed metric without running the binary.
+  `grep_spec_names(metrics_json_body, prefix)` filters
+  #src("docs/gen/metrics.json") (the regex-scanned `describe_*!` inventory)
+  by component prefix. Both run at *test time* from `metrics_suite!` (no
+  per-crate build.rs). The contract narrowed to "regex-scanned `describe_*!`
+  literals → `describe_metrics()` fires them" --- catches a `describe_*!`
+  that's in source but not reachable from the per-crate `describe_metrics()`
+  body (cfg-gated, dead, or in the wrong fn).
 ]
 
 == Benchmarks
