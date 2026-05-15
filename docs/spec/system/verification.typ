@@ -289,7 +289,7 @@ boots a single-VM k3s cluster.
 #r("ts.metrics.grep")[
   `grep_emitted_names(manifest_dir)` greps the crate's `src/` for
   `metrics::{counter,gauge,histogram}!("...")` literals;
-  `grep_spec_names(obs_md, prefix)` greps #src("docs/src/observability.md")
+  `grep_spec_names(obs_md, prefix)` greps #src("docs/spec/system/observability.typ")
   table rows. Both run at *test time* from `metrics_suite!` (no per-crate
   build.rs). The grep operates on *source text*, not on a Prometheus scrape ---
   it catches an undescribed metric without running the binary.

@@ -27,4 +27,4 @@ If GC deleted something it shouldn't have:
 
 + Pause the S3 drain job (narinfo/manifest rows CASCADE-deleted but chunks survive in `pending_s3_deletes`)
 + `SELECT * FROM pending_s3_deletes WHERE created_at > $gc_run_time` --- these chunks can be restored
-+ See `docs/src/components/store.md` §GC for chunk restore procedure
++ See #link("../spec/components/store.typ")[Store §GC] for chunk restore procedure

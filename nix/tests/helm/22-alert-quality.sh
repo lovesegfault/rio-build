@@ -100,20 +100,14 @@ test "$n_count_alerts" -eq 0 || exit 1
 
 # --- (3) runbook coverage ---
 # Copied into the helm-lint sandbox by the runCommand body — see NOTE above.
-# During the typst migration the runbook lives at one of (or both):
-#   .runbook-sla-model.md   — legacy mdbook source (docs/src/runbooks/)
-#   .runbook-sla-model.typ  — typst source (docs/ops/), `#refs.alert("Name")`
-# Substring grep matches both forms (`| RioNodeclaimPoolFoo |` and
-# `#refs.alert("RioNodeclaimPoolFoo")`). At least one must exist.
-runbook_md="$TMPDIR/chart/.runbook-sla-model.md"
+# Runbook is the typst source (docs/ops/), `#refs.alert("Name")`; substring
+# grep below matches `#refs.alert("RioNodeclaimPoolFoo")`.
 runbook_typ="$TMPDIR/chart/.runbook-sla-model.typ"
-runbooks=()
-[[ -f "$runbook_md" ]] && runbooks+=("$runbook_md")
-[[ -f "$runbook_typ" ]] && runbooks+=("$runbook_typ")
-test "${#runbooks[@]}" -gt 0 || {
-  echo "FAIL: no runbook staged (neither .md nor .typ) — misc-checks.nix cp missing?" >&2
+test -f "$runbook_typ" || {
+  echo "FAIL: no runbook staged — misc-checks.nix cp missing?" >&2
   exit 1
 }
+runbooks=("$runbook_typ")
 # Process substitution (NOT `cmd | while`): keeps `missing` and
 # `n_alerts` in the parent shell. The `... || echo 0` pipeline shape
 # is a footgun under pipefail — `grep -c` outputs "0" AND exits 1, so

@@ -44,8 +44,6 @@ let
     stress-ng # flake-repro under load (.claude/rules/ci-failure-patterns.md)
 
     # Documentation
-    mdbook
-    mdbook-mermaid
     # Typst design book — wrapped typst (with @preview/* closure
     # baked in via TYPST_PACKAGE_CACHE_PATH), shiroa HTML generator,
     # and the typstyle formatter (wired into treefmt). typstEnv below

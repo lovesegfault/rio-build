@@ -23,7 +23,7 @@ rio-build fills the gap:
 
 ## What it is *not*
 
-rio-build is a **build execution backend**, not a CI system. Out of scope: Nix evaluation (bring `nix-eval-jobs`), VCS webhooks, PR status checks, notifications, Hydra-style jobsets, Darwin workers, recursive Nix. See [the design book](docs/src/introduction.md) for where each of these lives instead.
+rio-build is a **build execution backend**, not a CI system. Out of scope: Nix evaluation (bring `nix-eval-jobs`), VCS webhooks, PR status checks, notifications, Hydra-style jobsets, Darwin workers, recursive Nix. See [the design book](docs/intro.typ) for where each of these lives instead.
 
 ## Architecture
 
@@ -61,7 +61,7 @@ rio-build is a **build execution backend**, not a CI system. Out of scope: Nix e
 
 ## Status
 
-**Pre-1.0, under active development.** Phase-gated — see [`docs/src/phases-archive/`](docs/src/phases-archive/) for the roadmap. Currently through Phase 4a (multi-tenancy: JWT auth, per-tenant quotas, per-tenant signing keys, query-level isolation; CA cutoff-compare; CLI tooling).
+**Pre-1.0, under active development.** Phase-gated — see the design book for the roadmap. Currently through Phase 4a (multi-tenancy: JWT auth, per-tenant quotas, per-tenant signing keys, query-level isolation; CA cutoff-compare; CLI tooling).
 
 > **Multi-tenancy warning:** Multi-tenant deployments with untrusted tenants are **unsafe before Phase 5** (incomplete query-level isolation). Deploy single-tenant or trusted-tenant until then.
 
@@ -127,13 +127,12 @@ nix build .#checks.x86_64-linux.vm-phase3a   # 3 VMs, k3s + controller + CRDs
 
 ## Design Book
 
-Full design docs are in [`docs/src/`](docs/src/) (mdBook). Start with:
+Full design docs are in [`docs/`](docs/) (typst; build with `nix build .#docs` for HTML or `.#docs-pdf`). Start with:
 
-- [**Introduction**](docs/src/introduction.md) — goals, non-goals, landscape
-- [**Architecture**](docs/src/architecture.md) — component diagram, data flows
-- [**Crate Structure**](docs/src/crate-structure.md) — dependency graph, module layout
-- [**Phases**](docs/src/phases-archive/) — implementation roadmap and task tracking
-- [**Observability**](docs/src/observability.md) — metric naming, tracing conventions
+- [**Introduction**](docs/intro.typ) — goals, non-goals, landscape
+- [**Architecture**](docs/architecture.typ) — component diagram, data flows
+- [**Crate Structure**](docs/spec/system/crate-structure.typ) — dependency graph, module layout
+- [**Observability**](docs/spec/system/observability.typ) — metric naming, tracing conventions
 
 ## License
 

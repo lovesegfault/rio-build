@@ -37,7 +37,6 @@
     #chapter("spec/components/controller.typ")[Controller]
     #chapter("spec/components/dashboard.typ")[Dashboard]
     #chapter("spec/components/cli.typ")[CLI]
-    #chapter("spec/system/_spike.typ")[(spike — remove in E)]
     = Reference
     #chapter("ref/configuration.typ")[Configuration]
     #chapter("ref/errors.typ")[Error Taxonomy]

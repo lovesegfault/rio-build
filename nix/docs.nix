@@ -81,17 +81,11 @@ let
     TYPST_FONT_PATHS = lib.concatStringsSep ":" (map toString fonts);
   };
 
-  # Only the typst-side sources. The mdbook tree at docs/src/ stays
-  # out so editing a .md doesn't rebuild the PDF. docs/gen/ is also
-  # excluded — compileRoot overlays the hermetic docsData there.
+  # Typst sources only. docs/gen/ is excluded — compileRoot overlays
+  # the hermetic docsData there.
   docsSrc = lib.fileset.toSource {
     root = ../docs;
-    fileset = lib.fileset.difference ../docs (
-      lib.fileset.unions [
-        ../docs/src
-        ../docs/gen
-      ]
-    );
+    fileset = lib.fileset.difference ../docs ../docs/gen;
   };
 
   # Generated reference data (metric/alert/error/config tables).

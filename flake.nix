@@ -1227,7 +1227,6 @@
             check.enable = true;
 
             settings.excludes = [
-              "docs/mermaid\\.min\\.js$"
               # Fuzz corpus seeds are exact binary/text inputs; trailing
               # newlines would change what the fuzzer sees.
               "^rio-nix/fuzz/corpus/"
@@ -1430,7 +1429,7 @@
             // {
               dashboard = rioDashboard;
             }
-            # Workspace-level policy checks (deny, helm-lint, mdbook,
+            # Workspace-level policy checks (deny, helm-lint,
             # tracey-validate, crds-drift, tfvars-fresh, …).
             // miscChecks
             # Typst design-book builds (PDF + shiroa HTML).

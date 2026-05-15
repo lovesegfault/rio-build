@@ -106,36 +106,12 @@ in
     '';
   };
 
-  # Design-book build. mdbook exits non-zero on broken
-  # SUMMARY.md links, malformed front-matter, or a failing
-  # preprocessor (mdbook-mermaid). rustdoc (`doc` check) only
-  # covers code docs — without this, docs/src/ breakage is
-  # invisible until someone runs `mdbook serve` locally.
-  #
-  # Source is scoped to docs/ so unrelated edits don't rebuild.
-  # Output is the rendered HTML (browsable via `result/index.html`).
-  mdbook =
-    pkgs.runCommand "rio-mdbook"
-      {
-        src = pkgs.lib.fileset.toSource {
-          root = ../docs;
-          fileset = ../docs;
-        };
-        nativeBuildInputs = with pkgs; [
-          mdbook
-          mdbook-mermaid
-        ];
-      }
-      ''
-        mdbook build $src -d $out
-      '';
-
   # Spec-coverage validation: fails on broken r[...]
   # references, duplicate requirement IDs, or unparseable
   # include files. Does NOT fail on uncovered/untested — those
   # are informational.
   #
-  # tracey scans docs/**/*.md (spec) + .rs/.nix/.py for
+  # tracey scans docs/spec/**/*.typ (spec) + .rs/.nix/.py for
   # `r[impl/verify ...]` annotations + .config/tracey/config.styx.
   # tracey's daemon writes .tracey/daemon.sock under the working
   # dir, so we cp to a writable tmpdir first.
@@ -210,12 +186,8 @@ in
         # 22-alert-quality.sh asserts every RioNodeclaimPool* alert has a
         # runbook table row. The fragment sandbox only has the chart and
         # nix/tests/helm/*.sh as build inputs — docs/ is unreachable —
-        # so stage the runbook(s) it cross-references. .typ is the
-        # post-migration source (Phase D ops/sla-model.typ); .md stays
-        # until Phase E drops docs/src/. The fragment greps whichever
-        # exists.
-        ${pkgs.lib.optionalString (builtins.pathExists ../docs/src/runbooks/sla-model.md) "cp ${../docs/src/runbooks/sla-model.md} $TMPDIR/chart/.runbook-sla-model.md"}
-        ${pkgs.lib.optionalString (builtins.pathExists ../docs/ops/sla-model.typ) "cp ${../docs/ops/sla-model.typ} $TMPDIR/chart/.runbook-sla-model.typ"}
+        # so stage the runbook it cross-references.
+        cp ${../docs/ops/sla-model.typ} $TMPDIR/chart/.runbook-sla-model.typ
 
         for f in ${fragments}/*.sh; do
           echo "▸ helm-lint: $(basename "$f" .sh)" >&2
