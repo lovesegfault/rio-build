@@ -346,14 +346,12 @@ The model needs samples at distinct $c$ to fit. The scheduler obtains them via a
 ] <lst-cgroup>
 
 Exploration state is *derivable from `build_samples`* over the current version only ($"vdist" = 0$, so a version bump resets it). From the set of `cpu_limit` values seen:
-#grid(
-  columns: 2,
-  column-gutter: 2em,
-  row-gutter: 0.5em,
-  box[$"distinct_c" = abs({"cpu_limit"})$], box[$"span" = max slash min$],
-  box[$c_"up" = min(4 dot.op max, "maxCores")$],
-  box[$c_"down" = max(1, floor(min slash 2))$],
-)
+$
+  "distinct_c" = abs({"cpu_limit"})
+  wide & "span" = max slash min \
+  c_"up" = min(4 dot.op max, "maxCores")
+  wide & c_"down" = max(1, floor(min slash 2))
+$
 Max/min over the set, not most-recent, so concurrent dispatches at different $c$ don't regress. Config validation requires $4 <= "sla.probe.cpu" <= "maxCores" slash 4$ (i.e., $"maxCores" >= 16$) so both paths can reach span $>= 4$ before their hard bound (as-shipped phase-12 enforces only $<= "maxCores"$; the $slash 4$ bound is §Phasing-13a tightening); a key that freezes at a bound with span $< 4$ is marked `frozen` and the solver engages with whatever span it has. The @estimator caches this derived tuple in `FittedParams` on the completion-ingest path, so dispatch reads no @pg; a leader failover reconstructs identical state from @pg on its first refresh.
 
 #algorithm(

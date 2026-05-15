@@ -38,7 +38,8 @@
 #import "@preview/lovelace:0.3.1": pseudocode-list
 #import "@preview/unify:0.7.1": num, numrange, qty, qtyrange
 #import "@preview/gentle-clues:1.3.1": (
-  gentle-clues, idea, info, memo, tip, warning,
+  gentle-clues, idea as _gc-idea, info as _gc-info, memo as _gc-memo,
+  tip as _gc-tip, warning as _gc-warning,
 )
 #import "@preview/lilaq:0.6.0" as lq
 #import "@preview/fletcher:0.5.8" as fletcher: diagram, edge, node
@@ -122,6 +123,24 @@
 // Postfix multiplier "4×" without binary-operator spacing.
 #let mul(n) = [#n#h(0pt)×]
 
+// gentle-clues callouts: in html mode the package's icon+title grid()
+// warns, so emit a plain <aside> instead (selectable text; styled by
+// add-styles below). Paged targets get the real gentle-clues render.
+#let _clue(gc-fn, kind, ..args) = if is-html-target() {
+  let title = args.named().at("title", default: none)
+  html.elem("aside", attrs: (class: "rio-clue rio-clue-" + kind), {
+    if title != none {
+      html.elem("p", attrs: (class: "rio-clue-title"), strong(title))
+    }
+    args.pos().join()
+  })
+} else { gc-fn(..args) }
+#let info = _clue.with(_gc-info, "info")
+#let warning = _clue.with(_gc-warning, "warning")
+#let memo = _clue.with(_gc-memo, "memo")
+#let tip = _clue.with(_gc-tip, "tip")
+#let idea = _clue.with(_gc-idea, "idea")
+
 // Glossarium back-reference printer: " — pp. 3, 7" in muted small text,
 // deduplicated. Passed as `user-print-back-references` to print-glossary.
 #let muted-backrefs(entry, deduplicate: true) = {
@@ -148,7 +167,19 @@
     ds == none or ds.any(d => id.starts-with(d + ".")),
     message: "marker " + id + " outside declared domains " + repr(ds),
   )
-  req(id, ..body)
+  if is-html-target() {
+    // Bypass tracey's req() — its block/box/v() layout primitives warn
+    // under typst's html target. tracey's scanner reads .typ source
+    // (regex for `r[...]`/`#r("...")`), not compiled output, so this
+    // doesn't affect `tracey query`.
+    html.elem("div", attrs: (class: "rio-req", id: "r-" + id), {
+      html.elem("code", attrs: (class: "rio-req-id"), "r[" + id + "]")
+      [ ]
+      body.pos().join()
+    })
+  } else {
+    req(id, ..body)
+  }
 }
 
 // Cross-reference to a marker elsewhere (`r[id]` rendered as a link when
@@ -240,24 +271,30 @@
   show table.cell.where(y: 0): strong
 
   // glossarium: intercepts @key refs for registered entries, falls
-  // through to native @label otherwise.
+  // through to native @label otherwise. In html mode, return `it.body`
+  // to consume the figure before glossarium's default theme wraps it in
+  // `align(start, ...)` (which warns under the html target).
   show: make-glossary
   show figure.where(kind: "glossarium_entry"): it => if is-paged {
     align(left, it)
-  } else { it }
+  } else { it.body }
 
   show: gentle-clues.with(breakable: false, headless: false)
 
   // codly: replaces the plain raw.where(block: true) styling above with
-  // line-numbered, language-tagged blocks.
-  show: codly-init.with()
-  codly(
-    languages: codly-languages,
-    zebra-fill: rgb("#f6f8fa"),
-    number-format: n => text(fill: muted, size: 0.8em)[#n],
-    stroke: 0.4pt + rule-color,
-    inset: 0.32em,
-  )
+  // line-numbered, language-tagged blocks. Paged-only — its grid()
+  // layout warns under the html target; let raw fall through to typst's
+  // native <pre><code class="language-X"> there (selectable, CSS-styleable).
+  show: if is-paged { codly-init.with() } else { it => it }
+  if is-paged {
+    codly(
+      languages: codly-languages,
+      zebra-fill: rgb("#f6f8fa"),
+      number-format: n => text(fill: muted, size: 0.8em)[#n],
+      stroke: 0.4pt + rule-color,
+      inset: 0.32em,
+    )
+  }
 
   // PDF-only page geometry (trailing conditional — see header note).
   set page(
@@ -295,9 +332,12 @@
     it => {
       show: markup-rules.with(themes: (default-theme: (dash-color: accent)))
       show: equation-rules.with(theme-box: _theme-frame)
-      show figure.where(kind: image): fig => context if (
-        shiroa-sys-target() == "html"
-      ) {
+      // html.frame() figures: diagrams (kind: image — typst's default
+      // for unrecognised bodies, so catches fletcher/chronos/lilaq/
+      // autograph/finite) and lovelace pseudocode (kind: "algorithm",
+      // whose grid() would otherwise warn). Selectable text matters
+      // less for these than for code/callouts.
+      let frame-figure = fig => context if shiroa-sys-target() == "html" {
         html.elem("figure", attrs: (class: "rio-figure"), {
           _theme-frame(tag: "div", theme => {
             set text(fill: theme.main-color)
@@ -308,10 +348,21 @@
           }
         })
       } else { fig }
+      show figure.where(kind: image): frame-figure
+      show figure.where(kind: "algorithm"): frame-figure
       add-styles(
         ```css
         .rio-figure { display: grid; place-items: center; overflow-x: auto; margin: 1.2em 0; }
         .rio-figure figcaption { font-size: 0.92em; margin-top: 0.6em; }
+        .rio-req { border-left: 3px solid #d0d7de; padding: 0.5em 0 0.5em 1em; margin: 1em 0; }
+        .rio-req-id { background: #f6f8fa; border-radius: 3px; padding: 0.1em 0.5em; font-size: 0.85em; }
+        .rio-clue { border-left: 4px solid; border-radius: 4px; padding: 0.6em 1em; margin: 1em 0; }
+        .rio-clue-title { margin: 0 0 0.4em 0; }
+        .rio-clue-info { border-color: #1f6feb; background: #ddf4ff; }
+        .rio-clue-warning { border-color: #d1242f; background: #ffebe9; }
+        .rio-clue-memo { border-color: #9a6700; background: #fff8c5; }
+        .rio-clue-tip { border-color: #1a7f37; background: #dafbe1; }
+        .rio-clue-idea { border-color: #8250df; background: #fbefff; }
         ```,
       )
       it
