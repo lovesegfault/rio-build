@@ -2,10 +2,6 @@
 
 #show: rio.with(domains: none)
 
-// TODO(typst-migration): replace per-component #table() blocks with
-// #for (comp, fields) in json("/gen/config.json").components { ... }
-// once xtask regen docs-data emits config.json (C5 deferred — schemars yak).
-
 rio-build uses TOML configuration files with environment variable overrides.
 Each component reads its own config file. Environment variables use the `RIO_`
 prefix with `__` for nesting (e.g., `RIO_STORE__INLINE_THRESHOLD=262144`).
@@ -13,22 +9,41 @@ prefix with `__` for nesting (e.g., `RIO_STORE__INLINE_THRESHOLD=262144`).
 Precedence (highest to lowest): CLI flags > environment variables > config
 file > compiled defaults.
 
+The per-component tables below are generated from the `Config` structs (via
+`schemars` → `xtask regen docs-data` → `gen/config.json`); the *Default*
+column is `Config::default()` serialized. Nested tables flatten as dotted
+keys (`jwt.required` ↔ TOML `[jwt] required = …` ↔ env `RIO_JWT__REQUIRED`).
+
+#let _cfg = json("/gen/config.json").components
+
+// One config-reference table per component. `fields` is the
+// `flatten_schema()` output: `[{key, type, default, description}]`.
+// Descriptions are rustdoc first-sentences with backticked code spans;
+// split on backticks and interleave raw() so `foo` renders as code
+// without eval()ing arbitrary markup.
+#let _md(s) = {
+  s
+    .split("`")
+    .enumerate()
+    .map(((i, part)) => if calc.odd(i) { raw(part) } else { part })
+    .join()
+}
+#let _cfg-table(fields) = table(
+  columns: (auto, auto, auto, 1fr),
+  table.header([Key], [Type], [Default], [Description]),
+  ..fields
+    .map(f => (
+      raw(f.key),
+      raw(f.type),
+      if f.default == "" [---] else { raw(f.default) },
+      _md(f.description),
+    ))
+    .flatten(),
+)
+
 = Gateway
 
-#table(
-  columns: 4,
-  table.header([Parameter], [Type], [Default], [Description]),
-  [`listen_addr`], [string], [`[::]:2222`], [SSH listen address and port],
-  [`host_key`],
-  [string],
-  [(required)],
-  [SSH host key file path. If unset or missing, gateway generates an ephemeral
-    key (breaks `known_hosts` on restart --- set in production).],
-
-  [`authorized_keys`], [string], [(required)], [Authorized SSH keys file path],
-  [`scheduler_addr`], [string], [(required)], [Scheduler gRPC endpoint],
-  [`store_addr`], [string], [(required)], [Store gRPC endpoint],
-)
+#_cfg-table(_cfg.gateway)
 
 #info[
   *Compile-time constants (not configurable):* `MIN_CLIENT_VERSION = 0x123`
@@ -38,31 +53,14 @@ file > compiled defaults.
 
 = Scheduler
 
-#table(
-  columns: 4,
-  table.header([Parameter], [Type], [Default], [Description]),
-  [`listen_addr`], [string], [`[::]:9001`], [gRPC listen address],
-  [`database_url`], [string], [(required)], [PostgreSQL connection string],
-  [`ema_alpha`], [f64], [0.3], [EMA smoothing factor for duration estimates],
-  [`poison_threshold`],
-  [u32],
-  [3],
-  [Failures across different executors before poisoning],
+#_cfg-table(_cfg.scheduler)
 
-  [`poison_ttl`], [Duration], [24h], [Time before poison state expires],
-  [`max_retries`], [u32], [2], [Maximum retry attempts per derivation],
-  [`hmac_key_path`],
-  [path],
-  [(unset)],
-  [HMAC-SHA256 key file for assignment token signing. Env: `RIO_HMAC_KEY_PATH`.
-    Same file must be configured on the store.],
-
-  [`store_admin_addr`],
-  [string],
-  [(unset)],
-  [Store admin gRPC endpoint (for `TriggerGC` proxy). If unset,
-    `AdminService.TriggerGC` returns UNIMPLEMENTED.],
-)
+#info[
+  *`[sla]` table:* ADR-023 SLA-driven sizing config is mandatory and
+  structured (no env override). It is documented separately in
+  #link("../spec/components/scheduler.typ")[scheduler: SLA sizing] and is
+  not flattened into the table above.
+]
 
 #info[
   *Compile-time constants (not configurable):* `DEFAULT_DURATION_SECS = 30.0`
@@ -72,39 +70,7 @@ file > compiled defaults.
 
 = Store
 
-#table(
-  columns: 4,
-  table.header([Parameter], [Type], [Default], [Description]),
-  [`listen_addr`], [string], [`[::]:9002`], [gRPC listen address],
-  [`database_url`], [string], [(required)], [PostgreSQL connection string],
-  [`metrics_addr`],
-  [socket addr],
-  [`[::]:9092`],
-  [Prometheus metrics listen address],
-
-  [`chunk_backend`],
-  [tagged enum],
-  [`{ kind = "inline" }`],
-  [Where chunks live. See `ChunkBackendKind` below.],
-
-  [`chunk_cache_capacity_bytes`],
-  [u64],
-  [2147483648 (2 GiB)],
-  [moka LRU capacity for chunk reads (shared across all services).],
-
-  [`signing_key_path`],
-  [path],
-  [(unset)],
-  [ed25519 narinfo signing key (Nix secret-key format). None = signing
-    disabled.],
-
-  [`hmac_key_path`],
-  [path],
-  [(unset)],
-  [HMAC-SHA256 key file for assignment token verification on PutPath. Env:
-    `RIO_HMAC_KEY_PATH`. Same file as scheduler. None = no token verification
-    (dev mode).],
-)
+#_cfg-table(_cfg.store)
 
 `chunk_backend` TOML syntax (tagged enum):
 
@@ -137,86 +103,7 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 
 = Builder
 
-#table(
-  columns: 4,
-  table.header([Parameter], [Type], [Default], [Description]),
-  [`executor_id`],
-  [string],
-  [(auto: hostname)],
-  [Builder identity. Empty → auto-detect via hostname.],
-
-  [`scheduler_addr`], [string], [(required)], [Scheduler gRPC endpoint],
-  [`store_addr`], [string], [(required)], [Store gRPC endpoint],
-  [`systems`],
-  [list\<string>],
-  [(auto: `{arch}-{os}`)],
-  [Nix systems this builder can build for (any-match). Env `RIO_SYSTEMS` is
-    comma-separated; TOML is an array.],
-
-  [`features`],
-  [list\<string>],
-  [`[]`],
-  [`requiredSystemFeatures` this builder supports (all-match). Same env/TOML
-    format as `systems`.],
-
-  [`fuse_mount_point`],
-  [path],
-  [`/var/rio/fuse-store`],
-  [FUSE mount point. *Never* `/nix/store` --- that would shadow the host
-    store.],
-
-  [`fuse_cache_dir`],
-  [path],
-  [`/var/rio/cache`],
-  [Local SSD cache directory for the FUSE cache],
-
-  [`fuse_threads`], [u32], [4], [Number of FUSE daemon threads],
-  [`fuse_passthrough`],
-  [bool],
-  [true],
-  [Enable kernel passthrough (Linux 6.9+). Disable only for debugging.],
-
-  [`overlay_base_dir`],
-  [path],
-  [`/var/rio/overlays`],
-  [Base directory for per-build overlay upper/work layers],
-
-  [`metrics_addr`],
-  [socket addr],
-  [`[::]:9093`],
-  [Prometheus metrics listen address],
-
-  [`health_addr`],
-  [socket addr],
-  [`[::]:9193`],
-  [HTTP `/healthz` + `/readyz` listen address (builder has no gRPC server)],
-
-  [`log_rate_limit`],
-  [u64],
-  [250000],
-  [Log lines/sec suppression threshold per build. Excess lines in a 1s window
-    are dropped with a marker injected at the next window; build continues. (0
-    = unlimited)],
-
-  [`log_size_limit`],
-  [u64],
-  [104857600 (100MB)],
-  [Maximum total log bytes per build. Exceeding aborts the build with
-    `LogLimitExceeded`. (0 = unlimited)],
-
-  [`daemon_timeout_secs`],
-  [u64],
-  [7200 (2h)],
-  [Timeout for the local `nix-daemon --stdio` subprocess when the client
-    didn't set `build_timeout`.],
-
-  [`executor_kind`],
-  [enum],
-  [`builder`],
-  [`builder` (airgapped, regular derivations) or `fetcher` (egress-open, FODs
-    only). Set via `RIO_EXECUTOR_KIND`. See
-    #link("../spec/components/fetcher.typ")[Fetcher §Rationale].],
-)
+#_cfg-table(_cfg.builder)
 
 #info[
   *Heartbeat interval* is a compile-time constant (`HEARTBEAT_INTERVAL_SECS =
@@ -226,25 +113,7 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 
 = Controller
 
-#table(
-  columns: 4,
-  table.header([Parameter], [Type], [Default], [Description]),
-  [`health_addr`],
-  [socket addr],
-  [`[::]:9194`],
-  [HTTP `/healthz` listen address],
-
-  [`metrics_addr`],
-  [socket addr],
-  [`[::]:9094`],
-  [Prometheus metrics listen address],
-
-  [`scheduler_addr`],
-  [string],
-  [(required)],
-  [Scheduler gRPC endpoint (for queue depth queries + DrainExecutor on
-    finalizer)],
-)
+#_cfg-table(_cfg.controller)
 
 #info[
   *The controller is NOT leader-elected* (single replica by design). Only the

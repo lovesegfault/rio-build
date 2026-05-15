@@ -12,6 +12,11 @@
 
 #let _metrics = json("/gen/metrics.json").names
 #let _alerts = json("/gen/alerts.json").names
+#let _cfg-keys = json("/gen/config.json")
+.components
+.values()
+.map(c => c.map(f => f.key))
+.flatten()
 #let _gh-sha = sys.inputs.at("gh-sha", default: "main")
 #let _src(p) = text(
   font: "DejaVu Sans Mono",
@@ -28,7 +33,10 @@
     assert(name in _alerts, message: "unknown alert: " + name)
     raw(name)
   },
-  cfg: key => raw(key),
+  cfg: key => {
+    assert(key in _cfg-keys, message: "unknown config key: " + key)
+    raw(key)
+  },
   gh: pl => link(
     "https://github.com/lovesegfault/rio-build/blob/"
       + _gh-sha
