@@ -9,6 +9,16 @@ use serde_json::json;
 
 use crate::sh::repo_root;
 
+/// `#[error("msg" ...)] Ident`. `(?s)` so the gap between the attr's
+/// `)]` and the variant ident may span newlines (rustfmt wraps long
+/// `#[error(...)]` bodies). The message capture handles `\"` and `\\`
+/// escapes (rio-nix/src/derivation/mod.rs has `expected '\"'`).
+/// Intervening attrs between `#[error]` and the ident aren't seen in
+/// this codebase (`#[cfg]` always precedes `#[error]`); if one shows
+/// up the variant is silently skipped, which is acceptable for a doc
+/// cross-ref table.
+const VARIANT_RE: &str = r#"(?s)#\[error\(\s*r?"((?:[^"\\]|\\.)*)"[^\]]*\]\s*([A-Z]\w*)"#;
+
 pub async fn run() -> Result<()> {
     let out = repo_root().join("docs/gen");
     fs::create_dir_all(&out)?;
@@ -86,15 +96,7 @@ fn errors() -> Result<serde_json::Value> {
     // Error enums are always top-level items so the col-0 close brace is
     // unambiguous (struct-variant `}` are indented).
     let enum_re = Regex::new(r"(?ms)^pub enum (\w*Error)\s*\{(.*?)^\}")?;
-    // Variant: `#[error("msg" ...)] Ident`. `(?s)` so the gap between the
-    // attr's `)]` and the variant ident may span newlines (rustfmt wraps
-    // long #[error(...)] bodies). One `[^"]*` for the message is fine —
-    // thiserror format strings don't contain raw `"` (escapes go through
-    // `{...:?}`). Intervening attrs between `#[error]` and the ident
-    // aren't seen in this codebase (`#[cfg]` always precedes `#[error]`);
-    // if one shows up the variant is silently skipped, which is acceptable
-    // for a doc cross-ref table.
-    let variant_re = Regex::new(r#"(?s)#\[error\(\s*r?"([^"]*)"[^\]]*\]\s*([A-Z]\w*)"#)?;
+    let variant_re = Regex::new(VARIANT_RE)?;
     let mut variants = Vec::new();
     visit_rio_crates(&mut |crate_name, body| {
         for em in enum_re.captures_iter(body) {
@@ -294,6 +296,36 @@ fn render_default(v: &serde_json::Value) -> String {
 fn is_emptyish(v: &serde_json::Value) -> bool {
     matches!(v, serde_json::Value::Null)
         || matches!(v, serde_json::Value::String(s) if s.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn variant_re_handles_escaped_quote() {
+        let re = Regex::new(VARIANT_RE).unwrap();
+        let src = r#"
+            #[error("expected '\"' to start string")]
+            ExpectedStringStart,
+            #[error("plain")]
+            Plain,
+        "#;
+        let caps: Vec<_> = re
+            .captures_iter(src)
+            .map(|c| (c[1].to_string(), c[2].to_string()))
+            .collect();
+        assert_eq!(
+            caps,
+            vec![
+                (
+                    r#"expected '\"' to start string"#.into(),
+                    "ExpectedStringStart".into()
+                ),
+                ("plain".into(), "Plain".into()),
+            ]
+        );
+    }
 }
 
 /// Doc comments are paragraphs of design rationale; the reference
