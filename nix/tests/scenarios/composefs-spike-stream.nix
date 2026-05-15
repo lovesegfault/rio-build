@@ -17,6 +17,7 @@
 }:
 pkgs.testers.runNixOSTest {
   name = "composefs-spike-stream";
+  globalTimeout = 600;
 
   nodes.machine = _: {
     # 256 MiB file in page cache + headroom.

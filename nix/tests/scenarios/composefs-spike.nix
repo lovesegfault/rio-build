@@ -17,6 +17,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "composefs-spike";
+  globalTimeout = 600;
 
   nodes.machine = _: {
     virtualisation.memorySize = 1024;

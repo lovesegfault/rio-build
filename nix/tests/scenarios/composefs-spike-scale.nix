@@ -15,6 +15,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "composefs-spike-scale";
+  globalTimeout = 600;
   skipTypeCheck = true;
 
   nodes.machine = _: {

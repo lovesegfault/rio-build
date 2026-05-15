@@ -12,6 +12,7 @@
 }:
 pkgs.testers.runNixOSTest {
   name = "spike-fuse-negdentry";
+  globalTimeout = 300;
 
   nodes.machine = _: {
     virtualisation.memorySize = 512;
