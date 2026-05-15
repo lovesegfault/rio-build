@@ -1,0 +1,34 @@
+#import "/lib/rio.typ": *
+#show: rio.with(domains: none)
+
+= Programmatic build submission: gRPC
+
+For build submission from within the cluster or automation, use the `SubmitBuild` RPC directly:
+
+```bash
+# Via rio-cli (preferred for scripts)
+rio-cli submit /nix/store/abc...-hello.drv --priority 50 --timeout 7200 --tenant ci-team
+
+# Via grpcurl (low-level)
+grpcurl -plaintext -d '{"derivations": [{"drv_path": "/nix/store/abc...-hello.drv"}], "priority": 50}' \
+  rio-scheduler:50051 rio.scheduler.SchedulerService/SubmitBuild
+```
+
+Note: The derivation must be a valid store path. Evaluation is external to rio-build (see #link("./introduction.md#non-goals")[Non-Goals]). The `.drv` file must already exist in rio-store (uploaded via `wopAddToStoreNar` through a gateway session or `nix copy`).
+
+= Pre-Populating the Store: `nix copy`
+
+To seed rio-store with existing build outputs (e.g., from a local build or another cache):
+
+```bash
+# Copy a specific output to rio-store
+nix copy --to ssh-ng://rio:2222 ./result
+
+# Copy an entire closure (including all runtime dependencies)
+nix copy --to ssh-ng://rio:2222 nixpkgs#hello
+
+# Copy from another binary cache to rio-store
+nix copy --from https://cache.nixos.org --to ssh-ng://rio:2222 nixpkgs#hello
+```
+
+This is useful for bootstrapping a new rio-build deployment with commonly-used packages (glibc, coreutils, stdenv) to avoid cold-cache latency on first builds.
