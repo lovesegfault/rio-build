@@ -15,7 +15,7 @@ use tracing::instrument;
 use rio_proto::types::{ExecutorMessage, PrefetchComplete, PrefetchHint, executor_message};
 
 use crate::fuse;
-use crate::fuse::StoreClients;
+use crate::store_fetch::StoreClients;
 
 /// I-212: warm-gate size cap. PrefetchHint paths whose `nar_size`
 /// exceeds this are skipped when the JIT allowlist is not yet armed
@@ -71,7 +71,7 @@ pub(super) struct PrefetchDeps {
 pub fn handle_prefetch_hint(
     prefetch: PrefetchHint,
     cache: Arc<fuse::cache::Cache>,
-    clients: crate::fuse::StoreClients,
+    clients: crate::store_fetch::StoreClients,
     rt: tokio::runtime::Handle,
     sem: Arc<Semaphore>,
     fetch_timeout: std::time::Duration,
