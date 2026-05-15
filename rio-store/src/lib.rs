@@ -182,6 +182,17 @@ pub fn describe_metrics() {
         "rio_store_tiered_writethrough_errors_total",
         "Tiered backend Express write-through failures (chunk served from S3 standard but Express not warmed)"
     );
+    // Spec'd in observability.md ahead of P0585 (Express eviction
+    // sweeper); register HELP text now so the metrics_registered
+    // spec→describe gate passes, the sweeper adds the emit sites.
+    describe_gauge!(
+        "rio_store_express_bytes",
+        "Per-AZ Express bucket size in bytes (labeled az_id; emitted by the lease-holding sweeper)"
+    );
+    describe_counter!(
+        "rio_store_express_evicted_total",
+        "Chunks deleted from Express by the eviction sweeper (labeled az_id)"
+    );
     describe_counter!(
         "rio_store_gc_path_resurrected_total",
         "Paths skipped by sweep because a new referrer appeared between mark and sweep (race window)"
