@@ -73,8 +73,6 @@ On the store side, ADR-022 introduces the **NAR index** (per-file `{path, size, 
 
 ## 4. The mount stack
 
-r[builder.fs.castore-stack]
-
 The builder assembles `/nix/store` from two layers per build:
 
 1. **castore-FUSE** — a `fuser` filesystem mounted at `/var/rio/castore/{build_id}/` serving the closure's Directory DAG (§8). `lookup`/`getattr`/`readdir`/`readlink` are answered from an in-heap `HashMap<u64, Node>` keyed by content-derived inode (`r[builder.fs.castore-inode-digest]`); `open()` resolves `ino → file_digest` and brokers a passthrough fd from the node-SSD backing cache. The tree is immutable for the mount's lifetime, so every reply carries `ttl: Duration::MAX` and `init` advertises `FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO | FUSE_PARALLEL_DIROPS | FUSE_CACHE_SYMLINKS` (`r[builder.fs.castore-cache-config]`). The mount-time DAG prefetch is wrapped in `timeout(dag_prefetch_timeout)` (default 30 s); expiry is an infra-retry, not a build failure.
@@ -107,25 +105,31 @@ The post-cutover `/nix/store` MUST be behaviourally indistinguishable from the p
 
 r[store.index.file-digest]
 
-For every store path, rio-store maintains a **NAR index**: a flat list of `NarIndexEntry { path, kind, size, executable, nar_offset, file_digest, dir_digest }` describing each file, directory, and symlink in the path's NAR. `file_digest` is `blake3(file content)` for regular files; `dir_digest` is defined in §8.
+r[store.index.nar-ls-offset]
+
+For every store path, rio-store maintains a **NAR index**: a flat list of `NarIndexEntry { path, kind, size, executable, nar_offset, file_digest, dir_digest }` describing each file, directory, and symlink in the path's NAR. `file_digest` is `blake3(file content)` for regular files; `dir_digest` is defined in §8. `nar_offset` is the byte offset of a regular file's content within the canonical NAR encoding (after the `"contents"` length-prefix), so a holder of the NAR-stream cumsum can slice a single file's bytes without re-parsing.
 
 r[store.index.putpath-eager]
+
 r[store.index.non-authoritative]
+
 r[store.index.nar-ls-streaming]
 
-The index is computed eagerly during `PutPath` from the NAR stream (`nar_ls` + per-file blake3 in a single forward `Read` pass — no `Seek`, bounded memory regardless of NAR size), and persisted to the `nar_index` table keyed by `store_path_hash` (one row per manifest). It is **derived, non-authoritative** state: if a row is missing, `GetNarIndex` recomputes it synchronously from the stored NAR and writes it back. There is no separate artifact in object storage — the index is regenerable from the NAR.
+r[store.index.sync-on-miss]
+
+r[store.index.putpath-bg-warm]
+
+The index is computed eagerly during `PutPath` from the NAR stream (`nar_ls` + per-file blake3 in a single forward `Read` pass — no `Seek`, bounded memory regardless of NAR size), and persisted to the `nar_index` table keyed by `store_path_hash` (one row per manifest). It is **derived, non-authoritative** state: if a row is missing, `GetNarIndex` MUST recompute it synchronously from the stored NAR (chunk fetch → reassemble → `nar_ls`, bounded by `nar_index_sync_max_bytes`) and write it back. There is no separate artifact in object storage — the index is regenerable from the NAR. A background `indexer_loop` polls the `WHERE NOT nar_indexed` partial-index work queue and computes any rows the eager `PutPath` path skipped (e.g. when the eager-compute semaphore was at capacity), so a build dispatched shortly after upload finds its inputs indexed within ~5 s.
+
+r[store.index.table-cascade]
 
 r[store.index.rpc]
 
-`GetNarIndex(nar_hash) → NarIndex` exposes this index. The builder does not fetch it at mount time — the Directory DAG (§8) carries everything `lookup`/`getattr`/`readdir`/`readlink` need. The `file_blobs` junction (P0572's derived `(file_digest, store_path_hash) → nar_offset` index, FK→`manifests` `ON DELETE CASCADE` so it cannot dangle after GC) is consulted **server-side** by `ReadBlob`/`StatBlob` (§6) at `open()` time; the builder never holds chunk coordinates client-side.
+`GetNarIndex(nar_hash) → NarIndex` exposes this index. The `nar_index` table row is keyed by `store_path_hash` with `ON DELETE CASCADE` from `manifests`, so GC of a path deletes its index row and the table never holds dangling indices. The builder does not fetch the index at mount time — the Directory DAG (§8) carries everything `lookup`/`getattr`/`readdir`/`readlink` need. The `file_blobs` junction (P0572's derived `(file_digest, store_path_hash) → nar_offset` index, FK→`manifests` `ON DELETE CASCADE` so it cannot dangle after GC) is consulted **server-side** by `ReadBlob`/`StatBlob` (§6) at `open()` time; the builder never holds chunk coordinates client-side.
 
 ## 6. Builder-side data path: castore-FUSE `open()`
 
-r[builder.fs.digest-fuse-open]
-
 The castore-FUSE handler serves the full tree from the in-heap Directory DAG (cold `lookup`/`readdir`/`readlink`, §4) and brokers data on `open()`. Its state is a `HashMap<u64, Node>` keyed by content-derived inode, populated at mount from one `GetDirectory(recursive=true)` call seeded with all closure `dir_digest` roots (`r[builder.fs.castore-dag-source]`). `lookup(parent_ino, name)` reads the parent's `Directory` body and returns the child's content-derived inode. Any name outside the prefetched DAG → `ENOENT` (declared-input allowlist).
-
-r[builder.fs.passthrough-on-hit]
 
 The handler negotiates `FUSE_PASSTHROUGH` at `init` (`max_stack_depth = 1`). `FUSE_DEV_IOC_BACKING_OPEN` requires init-ns `CAP_SYS_ADMIN` ([`backing.c:91-93`](https://github.com/torvalds/linux/blob/master/fs/fuse/backing.c)), so the ioctl is brokered by `rio-mountd` (§11), which kept a `dup()` of this build's `/dev/fuse` fd. On `open(ino → file_digest)`:
 
@@ -140,14 +144,11 @@ r[builder.fs.node-digest-cache]
 
 The FUSE **mount point** is per-build (`/var/rio/castore/{build_id}/`) so one build's mount namespace never exposes another's. The **backing cache** (`/var/rio/cache/`) is node-shared SSD, **owned by `rio-mountd` and read-only to builder pods**. Builders fetch into a per-build **staging dir** (`/var/rio/staging/{build_id}/`, builder-writable); after verify they send `Promote{digest}` to mountd, which stream-copies from staging into a fresh mountd-owned cache file while re-hashing, and renames into place only on `blake3 == digest`. The copy is the integrity boundary — the cache inode is one mountd created and verified; a sandbox-escaped build cannot poison it.
 
-r[builder.fs.node-chunk-cache]
-
 For files > `STREAM_THRESHOLD`, mountd also owns `/var/rio/chunks/ab/<chunk_blake3>`: the streaming fill task `open()`s here before `GetChunks`, writes misses into its own staging, and batches `PromoteChunks{[digest]}` for other builds' benefit (assembly never blocks on it). Chunks are independently content-addressed, so mountd's verify is context-free — concurrent builds share progress at chunk granularity without coordination. The second build to open `libLLVM.so` reads its chunks from local SSD even while the first is mid-fill. Eviction is mountd's LRU sweep over both cache and chunks under disk-pressure watermark.
 
 ## 7. Streaming open
 
 r[builder.fs.streaming-open]
-r[builder.fs.streaming-open-threshold]
 
 Streaming open is the **during-fill mode** for files > `STREAM_THRESHOLD` (default 8 MiB) on cache miss — the only case where `open()` cannot reply passthrough because no complete backing fd exists yet.
 
@@ -158,12 +159,15 @@ Real-world builds touch 0.3–33% of giant `.so`/`.a` files in scattered or bimo
 ## 8. Directory merkle layer and delta-sync
 
 r[store.index.dir-digest]
+
 r[store.castore.canonical-encoding]
 
 In the same `nar_ls` pass that computes `file_digest`, a bottom-up second pass computes `dir_digest` for every directory: `blake3(canonical-encode(Directory { files, directories, symlinks }))`, where `Directory` is the snix-compatible [`castore.proto`](https://git.snix.dev/snix/snix/raw/branch/canon/snix/castore/protos/castore.proto) message with children sorted by name. `root_digest` is the top directory's `dir_digest`. Each encoded `Directory` body is stored in a `directories` table keyed by its digest (`ON CONFLICT DO NOTHING` — bodies are content-addressed and shared across store paths).
 
 r[store.castore.directory-rpc]
+
 r[store.castore.blob-read]
+
 r[gw.substitute.dag-delta-sync]
 
 The castore RPC surface is `GetDirectory(digest, recursive) → stream<Directory>`, `HasDirectories([digest]) → bitmap`, `HasBlobs([file_digest]) → bitmap`, and `ReadBlob(file_digest) → stream<bytes>`. `GetDirectory` with `recursive=true` BFS-walks the subtree server-side and streams every `Directory` body in one RPC, deduped on digest. `ReadBlob` resolves `file_digest → (store_path_hash, nar_offset)` via the `file_blobs` junction (any row whose manifest is `'complete'`), then to chunk-range via that manifest's chunk cumsum, and streams the file content sliced from the underlying chunks — a snix-shaped client can substitute from rio-store holding only digests, without knowing rio's chunk layout. A delta-sync client (gateway substituter, inter-region replicator) syncing a closure to a target that already holds most of it:
@@ -179,6 +183,7 @@ This layer is **load-bearing on both paths**: the builder's castore-FUSE prefetc
 ## 9. Tiered chunk backend
 
 r[store.backend.tiered-get-fallback]
+
 r[store.backend.tiered-put-remote-first]
 
 `TieredChunkBackend` composes two `S3ChunkBackend` instances — a per-AZ S3 Express One Zone directory bucket as `local`, the regional S3 standard bucket as `remote`:
@@ -215,23 +220,13 @@ Four tiers, by role:
 
 **Chunk topology invariant:** regardless of `binary_cache_compat` mode, the chunk layout is always exactly one S3-standard regional bucket (canonical, unbounded, holds every chunk) plus N S3-Express per-AZ buckets (bounded read-through caches). The compat toggle controls **only** whether `.narinfo` + `nar/*.nar.zst` are *additionally* written to S3-standard; it never affects whether chunks land there. "Pure rio mode" still has every byte in S3-standard — the chunks just aren't reassembled into stock-Nix-readable NARs.
 
-r[store.compat.runtime-toggle]
-
 The binary-cache compatibility layer is a **runtime** config value (`store.binary_cache_compat.enabled`), not a build flag. Toggling it OFF stops new compat writes but leaves existing `.narinfo`/`nar/*.nar.zst` objects in place; toggling ON resumes for subsequent `PutPath` calls (a reconciler backfills the gap — see the implementation plan). Default is **ON** for the migration phase; operators flip to OFF once all consumers are rio-aware to reclaim ~2× S3 storage.
-
-r[store.compat.nar-on-put]
 
 When enabled, `PutPath` writes the NAR — zstd-compressed by default — to S3-standard at `nar/{FileHash}.nar.zst`, where `FileHash = sha256(compressed bytes)`. The bytes are reassembled from chunks immediately post-commit (chunks were just written and are moka-hot).
 
-r[store.compat.narinfo-on-put]
-
 When enabled, `PutPath` writes a stock-Nix-format `.narinfo` to S3-standard at `{StorePathHash}.narinfo`. Unlike the HTTP server's on-the-fly narinfo (which omits `FileHash`/`FileSize`), the compat-written narinfo includes them — the compressed artifact exists, so the fields are computable. Signatures are the same ones stored in PG (signed at `PutPath` time over the standard fingerprint).
 
-r[store.compat.write-after-commit]
-
 Compat writes happen **after** the PostgreSQL transaction commits, **synchronously** within the `PutPath` handler. A crash between PG-commit and compat-write leaves a PG row with no S3 narinfo — recoverable (the reconciler re-emits from chunks). A compat-write failure is logged and metered but does **not** roll back the PG commit or fail the `PutPath` RPC: the path is durably stored and rio-servable; only the stock-Nix fallback is missing for that one path. `write_mode = "async"` (background queue, lower `PutPath` latency, larger reconciler backlog on crash) is a documented future option, not implemented in the first pass.
-
-r[store.compat.stock-nix-substitute]
 
 With compat enabled and at least one `nix-cache-info` object present at the bucket root, the S3-standard bucket is a valid `nix copy --from s3://bucket?region=…` substituter with no rio process running. This is the migration on-ramp (existing Nix infrastructure reads the bucket directly while rio is rolled out) and the disaster-recovery floor (PG outage degrades to the slower stock-Nix path instead of a total outage).
 
@@ -240,7 +235,6 @@ With compat enabled and at least one `nix-cache-info` object present at the buck
 ## 11. Privilege boundary
 
 r[builder.mountd.fuse-handoff]
-r[builder.fs.fd-handoff-ordering]
 
 The builder pod runs unprivileged with no device mounts. `/dev/fuse` is not openable from the pod and `FUSE_DEV_IOC_BACKING_OPEN` requires init-ns `CAP_SYS_ADMIN`, so a node-level `rio-mountd` DaemonSet (host PID namespace, `CAP_SYS_ADMIN`) does the privileged operations and nothing else:
 
@@ -266,8 +260,6 @@ r[builder.mountd.concurrency]
 `rio-mountd` holds, per build, the UDS connection, a dup of that build's `/dev/fuse` fd, and the staging dirfds; ~250 LoC. Requests carry a `seq: u32` echoed in replies (so `spawn_blocking` `Promote`/`PromoteChunks` can reply out-of-order); errors are typed (`DigestMismatch`/`NotRegular`/`TooLarge`/`BadBuildId`/`AlreadyMounted` are build-fatal, `Retryable(..)` is infra-retry). The UDS socket is mode 0660 group `rio-builder`; mountd checks `SO_PEERCRED.gid` and rejects others. **`build_id` is validated as `^[A-Za-z0-9_-]{1,64}$`** (`r[builder.mountd.build-id-validated]`) and per-build paths are constructed via `openat(base_dirfd, build_id, O_NOFOLLOW)` against pre-opened `/var/rio/{castore,staging}` base dirfds — never string-interpolated. **One live connection per `SO_PEERCRED.uid`** (`r[builder.mountd.uid-bound]`): k8s userns maps each pod to a distinct host-uid range, so a sandbox-escaped build cannot open a second connection. **One live `build_id` per process** (`r[builder.mountd.build-id-unique]`): a process-wide set rejects `Mount{}` for a `build_id` another connection already owns — uid-bound alone does not stop a compromised builder using its first Mount to claim a victim's `build_id`. **One `Mount` per connection** (`r[builder.mountd.one-mount]`): a second `Mount{}` on the same conn is `AlreadyMounted`, so it cannot leak fuse mounts or staging dirs by spamming. **Staging quota is kernel-enforced** (`r[builder.mountd.staging-quota]`): mountd sets an XFS project quota on `staging/{build_id}` at `mkdirat`, so a compromised builder's `write(2)` hits `ENOSPC` at `staging_quota_bytes` regardless of whether it ever calls `Promote`. **Promote copies at most `st_size`** (`r[builder.mountd.promote-bounded-copy]`). It is a strictly smaller privileged surface than the pre-ADR-022 model, where the builder pod itself held `CAP_SYS_ADMIN`. The brokered `BACKING_OPEN` registers an fd the builder already holds (conn-scoped, depth-0-only); `Promote` is the integrity boundary for the shared cache.
 
 ## 12. Integrity
-
-r[builder.fs.file-digest-integrity]
 
 Per-file integrity is enforced in the castore-FUSE `open()` handler, not by the kernel:
 
@@ -303,8 +295,11 @@ A circuit breaker on the castore-FUSE fetch path trips on sustained rio-store un
 ## 14. Observability
 
 r[obs.metric.castore-fuse]
+
 r[obs.metric.mountd]
+
 r[obs.metric.chunk-backend-tiered]
+
 r[obs.metric.compat]
 
 | Metric | Meaning |
@@ -339,7 +334,7 @@ r[infra.node.kernel-fuse-passthrough]
 
 ## 16. Normative requirements index
 
-The `r[...]` markers introduced by ADR-022 across the design book are the spec-traceability anchors for `tracey`. Each has exactly one `// r[impl ...]` site and at least one `# r[verify ...]` site; `tracey query rule <id>` lists them. The implementation-plan tracey inventory names the defining file per marker.
+The `r[...]` markers introduced by ADR-022 across the design book are the spec-traceability anchors for `tracey`. Each has exactly one `// r[impl ...]` site and at least one `# r[verify ...]` site; `tracey query rule <id>` shows the defining file and all impl/verify sites. Markers are defined exactly once across the spec scope (`.config/tracey/config.styx` `include`); this document defines the markers carried by §4–§15 above, while §6.x markers live in [ADR-022 §6](./022-lazy-store-fs-erofs-vs-riofs.md#6-extension-chunked-output-upload-putpathchunked), tiered-backend platform markers in [ADR-023](./023-tiered-chunk-backend.md), and component-scoped markers in `docs/src/components/*.md`, `observability.md`, `security.md`, `deployment.md`. The implementation-plan tracey inventory tracks each marker's `impl`/`verify` plan number.
 
 | Domain | Markers |
 |---|---|

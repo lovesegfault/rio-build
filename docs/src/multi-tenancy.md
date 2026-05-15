@@ -40,6 +40,8 @@ All persistent data carries a `tenant_id` foreign key:
 | `derivations` | `tenant_id` (nullable FK → `tenants`) | Query-level filtering |
 | `path_tenants` | `tenant_id` (PK component) | N:M junction — path is visible to a tenant iff junction row exists |
 | `chunk_tenants` | `tenant_id` (PK component) | N:M junction — `FindMissingChunks` scope |
+| `directory_tenants` | `tenant_id` (PK component, FK → `tenants`) | N:M junction — `GetDirectory`/`HasDirectories` visibility (`r[store.castore.tenant-scope]`); `Directory` bodies leak child names/digests so the join is mandatory |
+| `file_blob_tenants` | `tenant_id` (PK component, FK → `tenants`) | N:M junction — `ReadBlob`/`StatBlob`/`HasBlobs` visibility (`r[store.castore.tenant-scope]`); rows for digests with zero remaining `file_blobs` rows are GC-deleted (`r[store.castore.gc]`) |
 | `content_index` | `tenant_id` (nullable, unused) | — (predates junction-table design; migration 002) |
 | `realisations` | `tenant_id` (nullable) | Query-level filtering |
 | `assignments` | *(none)* | Implicit via `derivation_id` FK --- no direct `tenant_id` column; tenant scope is derived by joining to `derivations` |

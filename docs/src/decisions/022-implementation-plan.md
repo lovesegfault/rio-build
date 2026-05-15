@@ -763,6 +763,8 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 
 ## tracey `r[…]` marker inventory (P0544 writes spec; later phases write impl/verify)
 
+> **Spec-file column is the planned canonical location.** Where a marker pre-existed in `decisions/022-design-overview.md` §4–§15 (the canonical design reference, in tracey scope as of P0544), it stays there rather than being duplicated; `tracey query rule <id>` shows the actual defining file. ADR-022 §6 (chunked upload) and ADR-023 (tiered backend) carry their own markers. Component spec files carry the markers not covered by the ADR docs.
+
 | Marker | Spec file (P0544) | `r[impl]` (plan) | `r[verify]` site (plan) |
 |---|---|---|---|
 | `store.backend.tiered-get-fallback` | components/store.md | tiered.rs `get()` (P0548) | vm-store-tiered `cold-miss-fallback` (P0555) |

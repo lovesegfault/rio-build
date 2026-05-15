@@ -29,6 +29,7 @@
   - [ADR-022: Lazy Store FS (castore FUSE)](./decisions/022-lazy-store-fs-erofs-vs-riofs.md)
     - [Design Overview](./decisions/022-design-overview.md)
     - [Implementation Plan](./decisions/022-implementation-plan.md)
+  - [ADR-023: Tiered Chunk Backend (per-AZ S3 Express)](./decisions/023-tiered-chunk-backend.md)
   - [ADR-024: Build-Log Archival Stays in Scheduler](./decisions/024-log-archival-placement.md)
 - [Components](./components.md)
   - [rio-gateway](./components/gateway.md)
