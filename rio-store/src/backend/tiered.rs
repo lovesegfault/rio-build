@@ -121,6 +121,23 @@ impl ChunkBackend for TieredChunkBackend {
     async fn delete_by_key(&self, key: &str) -> anyhow::Result<()> {
         self.remote.delete_by_key(key).await
     }
+
+    // Blobs are the stock-Nix binary-cache surface (narinfo / NAR /
+    // nix-cache-info). Stock Nix reads them straight from the regional
+    // bucket — Express never sees them — so all three ops are
+    // remote-only.
+
+    async fn put_blob(&self, key: &str, data: Bytes) -> anyhow::Result<()> {
+        self.remote.put_blob(key, data).await
+    }
+
+    async fn get_blob(&self, key: &str) -> anyhow::Result<Option<Bytes>> {
+        self.remote.get_blob(key).await
+    }
+
+    async fn delete_blob(&self, key: &str) -> anyhow::Result<()> {
+        self.remote.delete_blob(key).await
+    }
 }
 
 #[cfg(test)]

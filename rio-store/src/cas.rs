@@ -1174,6 +1174,15 @@ mod upload_tests {
         async fn delete_by_key(&self, _: &str) -> anyhow::Result<()> {
             unimplemented!()
         }
+        async fn put_blob(&self, _: &str, _: Bytes) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn get_blob(&self, _: &str) -> anyhow::Result<Option<Bytes>> {
+            unimplemented!()
+        }
+        async fn delete_blob(&self, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
     }
 
     /// Shared backing buffer for synthetic chunks. `do_upload` computes
