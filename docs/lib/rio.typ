@@ -115,11 +115,18 @@
   req(id, ..body)
 }
 
-// Cross-reference to a marker elsewhere (`r[id]` rendered as a link).
-#let rref(id) = link(
-  label("r-" + id),
-  text(font: "DejaVu Sans Mono", size: 0.85em, fill: muted)[r\[#id\]],
-)
+// Cross-reference to a marker elsewhere (`r[id]` rendered as a link when
+// the target label exists in this compilation unit, plain mono otherwise
+// so standalone chapter compiles don't fail on out-of-chapter refs).
+#let rref(id) = context {
+  let lbl = label("r-" + id)
+  let body = text(
+    font: "DejaVu Sans Mono",
+    size: 0.85em,
+    fill: muted,
+  )[r\[#id\]]
+  if query(lbl).len() > 0 { link(lbl, body) } else { body }
+}
 
 // ─── the template ───────────────────────────────────────────────────
 #let rio(domains: none, paper: none, body) = {
