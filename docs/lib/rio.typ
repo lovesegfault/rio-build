@@ -49,6 +49,10 @@
 // autograph re-exports fletcher's diagram/node/edge names — keep it
 // namespaced so the bare `diagram`/`node`/`edge` above stay fletcher's.
 #import "@preview/autograph:0.1.0" as autograph
+// pinit: page-absolute callout arrows. Pins resolve by page-scoped
+// label, so pin + pinit-* call must land on the SAME rendered page —
+// keep callouts inside the figure body alongside the pinned diagram.
+#import "@preview/pinit:0.2.2": pin, pinit-place, pinit-point-from
 #import "/lib/refs.typ": refs
 
 // ─── colors ─────────────────────────────────────────────────────────
