@@ -38,9 +38,7 @@
   cross-link, is-html-target, is-pdf-target, is-web-target, shiroa-sys-target,
   templates,
 )
-#import templates: (
-  add-styles, equation-rules, markup-rules, template-rules, theme-box,
-)
+#import templates: equation-rules, markup-rules, template-rules, theme-box
 #import "@preview/tracey:0.1.0": req
 #import "@preview/glossarium:0.5.10": (
   get-entry-back-references, gls, glspl, make-glossary, print-glossary,
@@ -136,7 +134,7 @@
 
 // gentle-clues callouts: in html mode the package's icon+title grid()
 // warns, so emit a plain <aside> instead (selectable text; styled by
-// add-styles below). Paged targets get the real gentle-clues render.
+// rio-css extra-assets below). Paged targets get the real gentle-clues render.
 #let _clue(gc-fn, kind, ..args) = if is-html-target() {
   let title = args.named().at("title", default: none)
   html.elem("aside", attrs: (class: "rio-clue rio-clue-" + kind), {
@@ -221,7 +219,7 @@
   //   is-dyn-web   — dyn-paged. typst target=paged → html.* MISSING.
   //   is-pdf       — direct `typst compile` (pdf / book-pdf).
   // is-paged-out = typst's layout engine renders = everything but html.
-  // Gate html.elem/html.frame/add-styles on is-html ONLY.
+  // Gate html.elem/html.frame/extra-assets on is-html ONLY.
   let is-html = is-html-target()
   let is-dyn-web = is-web-target()
   let is-paged-out = not is-html
@@ -371,6 +369,25 @@
   // chronos.diagram, automaton, autograph, lq.diagram — typst defaults
   // unrecognised figure bodies to kind: image. Algorithm/listing/table/
   // glossarium figures keep their explicit kinds and render as HTML.
+  // Custom CSS for our html-mode element bypasses (#r → div.rio-req,
+  // gentle-clues → aside.rio-clue, figure → .rio-figure, footnote →
+  // .rio-footnote). Passed via `extra-assets` (mdbook reads it; mdbook
+  // does NOT read the `shiroa-assets` state that `add-styles()` writes
+  // to — that's a starlight-only path).
+  let rio-css = ```css
+  .rio-figure { display: grid; place-items: center; overflow-x: auto; margin: 1.2em 0; }
+  .rio-figure figcaption { font-size: 0.92em; margin-top: 0.6em; }
+  .rio-req { border-left: 3px solid #d0d7de; padding: 0.5em 0 0.5em 1em; margin: 1em 0; }
+  .rio-req-id { background: #f6f8fa; border-radius: 3px; padding: 0.1em 0.5em; font-size: 0.85em; }
+  .rio-clue { border-left: 4px solid; border-radius: 4px; padding: 0.6em 1em; margin: 1em 0; }
+  .rio-clue-title { margin: 0 0 0.4em 0; }
+  .rio-clue-info { border-color: #1f6feb; background: #ddf4ff; }
+  .rio-clue-warning { border-color: #d1242f; background: #ffebe9; }
+  .rio-clue-memo { border-color: #9a6700; background: #fff8c5; }
+  .rio-clue-tip { border-color: #1a7f37; background: #dafbe1; }
+  .rio-clue-idea { border-color: #8250df; background: #fbefff; }
+  .rio-footnote { color: #656d76; font-size: 0.9em; }
+  ```
   show: if is-html {
     it => {
       show: template-rules.with(
@@ -378,6 +395,7 @@
         title: if paper != none { paper.title } else { "" },
         plain-body: body,
         web-theme: "mdbook",
+        extra-assets: (rio-css,),
       )
       show: markup-rules.with(
         web-theme: "mdbook",
@@ -409,22 +427,6 @@
         "span",
         attrs: (class: "rio-footnote"),
         [ (#it.body)],
-      )
-      add-styles(
-        ```css
-        .rio-figure { display: grid; place-items: center; overflow-x: auto; margin: 1.2em 0; }
-        .rio-figure figcaption { font-size: 0.92em; margin-top: 0.6em; }
-        .rio-req { border-left: 3px solid #d0d7de; padding: 0.5em 0 0.5em 1em; margin: 1em 0; }
-        .rio-req-id { background: #f6f8fa; border-radius: 3px; padding: 0.1em 0.5em; font-size: 0.85em; }
-        .rio-clue { border-left: 4px solid; border-radius: 4px; padding: 0.6em 1em; margin: 1em 0; }
-        .rio-clue-title { margin: 0 0 0.4em 0; }
-        .rio-clue-info { border-color: #1f6feb; background: #ddf4ff; }
-        .rio-clue-warning { border-color: #d1242f; background: #ffebe9; }
-        .rio-clue-memo { border-color: #9a6700; background: #fff8c5; }
-        .rio-clue-tip { border-color: #1a7f37; background: #dafbe1; }
-        .rio-clue-idea { border-color: #8250df; background: #fbefff; }
-        .rio-footnote { color: #656d76; font-size: 0.9em; }
-        ```,
       )
       it
     }
