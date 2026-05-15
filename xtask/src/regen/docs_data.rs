@@ -130,5 +130,11 @@ fn errors() -> Result<serde_json::Value> {
 }
 
 fn config() -> Result<serde_json::Value> {
-    Ok(json!({"components": {}})) // C5 (next batch)
+    // TODO(typst-migration): schemars derives on the 5 component Config
+    // structs deferred — they total ~3.2K LoC with custom serde adapters
+    // (`with = "secs"`), nested shared types (UpstreamAddrs/CommonConfig/
+    // JwtConfig), and xtask would need to grow rio-{builder,gateway,store}
+    // deps to call schema_for!(). ref/configuration.typ ships hand-ported
+    // for now. See ~/tmp/rio-typst/DESIGN.md §9.
+    Ok(json!({"components": {}}))
 }
