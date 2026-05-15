@@ -275,28 +275,33 @@ pub fn grep_emitted_names(manifest_dir: &str) -> Vec<String> {
     names.into_iter().collect()
 }
 
-/// Grep the observability.md table for metric names with `prefix`.
+/// Grep `docs/gen/metrics.json` for metric names with `prefix`.
 ///
-/// Table rows look like `` | `rio_component_metric_name` | Type | Desc | ``.
-/// First `|` stripped, cell trimmed of backticks, result must be
-/// purely `[a-z0-9_]+` (rejects prose mentions, comma-separated
-/// cells like the Histogram Buckets table, `{label}` examples,
-/// `|---|---|` separator).
-pub fn grep_spec_names(obs_md_src: &str, prefix: &str) -> Vec<String> {
-    let mut names: Vec<String> = obs_md_src
-        .lines()
-        .filter_map(|l| {
-            let first = l
-                .strip_prefix('|')?
-                .split('|')
-                .next()?
-                .trim()
-                .trim_matches('`');
-            (first.starts_with(prefix)
-                && !first.is_empty()
-                && first.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-            .then(|| first.to_string())
+/// The file is `{"names":["rio_a","rio_b",...]}` (sorted, unique),
+/// emitted by `xtask regen docs-data` from a regex scan of
+/// `describe_*!("rio_...")` literals across all `rio-*/src/**`. We
+/// don't pull in `serde_json` for this — splitting on `"` and
+/// keeping the `[a-z0-9_]+` tokens that match `prefix` is sufficient
+/// for a flat string array (and matches the old markdown-table grep
+/// in spirit).
+///
+/// This was the obs.md markdown-table parser before the typst spec
+/// migration. The spec table is now GENERATED from metrics.json, so
+/// the original "spec → describe" assertion has narrowed to
+/// "regex-scanned `describe_*!` literals → `describe_metrics()`
+/// fires them" — catches a `describe_*!` call that's in source but
+/// not reachable from the per-crate `describe_metrics()` body
+/// (cfg-gated, dead, or in the wrong fn). The `spec_floor` vacuity
+/// guard still trips if metrics.json is empty/stale.
+pub fn grep_spec_names(metrics_json_body: &str, prefix: &str) -> Vec<String> {
+    let mut names: Vec<String> = metrics_json_body
+        .split('"')
+        .filter(|s| {
+            s.starts_with(prefix)
+                && !s.is_empty()
+                && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         })
+        .map(str::to_owned)
         .collect();
     names.sort();
     names.dedup();
@@ -346,13 +351,14 @@ macro_rules! metrics_suite {
 
         #[test]
         fn all_spec_metrics_have_describe_call() {
-            let path = format!("{}/../docs/src/observability.md", manifest_dir());
-            let obs_md = ::std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("read {path}: {e}"));
-            let spec = $crate::metrics::grep_spec_names(&obs_md, $prefix);
+            let path = format!("{}/../docs/gen/metrics.json", manifest_dir());
+            let body = ::std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {path}: {e}; run `cargo xtask regen docs-data`"));
+            let spec = $crate::metrics::grep_spec_names(&body, $prefix);
             assert!(
                 spec.len() >= $spec_floor,
-                "obs.md grep found only {} {} entries — table format changed?",
+                "docs/gen/metrics.json has only {} {} entries — stale? run \
+                 `cargo xtask regen docs-data`",
                 spec.len(),
                 $prefix,
             );
@@ -463,8 +469,8 @@ pub fn assert_emitted_metrics_described(
         "metrics emitted in {crate_name}/src/ but NOT in describe_metrics():\n  {undescribed:#?}\n\
          \n\
          Add describe_counter!/describe_gauge!/describe_histogram! to \
-         {crate_name}/src/lib.rs::describe_metrics() AND a row to \
-         docs/src/observability.md."
+         {crate_name}/src/lib.rs::describe_metrics(), then `cargo xtask \
+         regen docs-data` to refresh docs/gen/metrics.json."
     );
 }
 
@@ -529,27 +535,26 @@ mod grep_tests {
     use super::grep_spec_names;
 
     #[test]
-    fn grep_extracts_table_column_one() {
-        let obs_md = "\
-| Metric | Type | Description |
-|---|---|---|
-| `rio_gateway_foo_total` | Counter | desc |
-| `rio_gateway_bar_seconds` | Histogram | desc |
-| rio_scheduler_baz | Counter | wrong prefix (excluded) |
-| `rio_gateway_foo_total` | Counter | dup row — deduped |
-
-prose mention of rio_gateway_inline (excluded — no leading `|`)
-
-| `rio_gateway_foo_total`, `rio_builder_bar` | `[1, 5]` | excluded — comma-sep cell |
-";
+    fn grep_extracts_json_names_array() {
+        let body = r#"{
+  "names": [
+    "rio_gateway_bar_seconds",
+    "rio_gateway_foo_total",
+    "rio_scheduler_baz"
+  ]
+}"#;
         assert_eq!(
-            grep_spec_names(obs_md, "rio_gateway_"),
+            grep_spec_names(body, "rio_gateway_"),
             vec!["rio_gateway_bar_seconds", "rio_gateway_foo_total"],
-            "sort+dedup; prose, comma-cells excluded"
+            "prefix-filtered, sorted; other-crate prefix excluded"
         );
-        // Separator + header rows excluded.
+        // The JSON object key ("names") doesn't start with rio_ so the
+        // dquote-split can't accidentally pick it up under any real
+        // per-crate prefix.
+        assert!(grep_spec_names(body, "rio_").iter().all(|n| n != "names"));
+        // Compact JSON (no pretty-print) still parses.
         assert_eq!(
-            grep_spec_names("|---|---|\n| `rio_x_ok` | g |\n", "rio_x_"),
+            grep_spec_names(r#"{"names":["rio_x_ok","rio_y_nope"]}"#, "rio_x_"),
             vec!["rio_x_ok"]
         );
     }

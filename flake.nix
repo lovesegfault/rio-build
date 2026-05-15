@@ -569,7 +569,7 @@
               fileset = pkgs.lib.fileset.unions [
                 workspaceFileset
                 ./.config/nextest.toml
-                ./docs/src/observability.md
+                ./docs/gen/metrics.json
               ];
             };
             # Fileset for the shared cargo-metadata drv and
@@ -600,10 +600,10 @@
                 ./rio-scheduler/tests
                 ./rio-store/tests
                 # metrics_registered tests grep the per-component
-                # metrics tables at runtime (rio-test-support
-                # grep_spec_names reads ../docs/src/observability.md
+                # metric set at runtime (rio-test-support
+                # grep_spec_names reads ../docs/gen/metrics.json
                 # via fs::read_to_string).
-                ./docs/src/observability.md
+                ./docs/gen/metrics.json
                 # proptest replays known-failing inputs from these.
                 ./rio-nix/proptest-regressions
               ];

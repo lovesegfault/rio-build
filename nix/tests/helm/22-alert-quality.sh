@@ -100,7 +100,20 @@ test "$n_count_alerts" -eq 0 || exit 1
 
 # --- (3) runbook coverage ---
 # Copied into the helm-lint sandbox by the runCommand body — see NOTE above.
-runbook="$TMPDIR/chart/.runbook-sla-model.md"
+# During the typst migration the runbook lives at one of (or both):
+#   .runbook-sla-model.md   — legacy mdbook source (docs/src/runbooks/)
+#   .runbook-sla-model.typ  — typst source (docs/ops/), `#refs.alert("Name")`
+# Substring grep matches both forms (`| RioNodeclaimPoolFoo |` and
+# `#refs.alert("RioNodeclaimPoolFoo")`). At least one must exist.
+runbook_md="$TMPDIR/chart/.runbook-sla-model.md"
+runbook_typ="$TMPDIR/chart/.runbook-sla-model.typ"
+runbooks=()
+[[ -f "$runbook_md" ]] && runbooks+=("$runbook_md")
+[[ -f "$runbook_typ" ]] && runbooks+=("$runbook_typ")
+test "${#runbooks[@]}" -gt 0 || {
+  echo "FAIL: no runbook staged (neither .md nor .typ) — misc-checks.nix cp missing?" >&2
+  exit 1
+}
 # Process substitution (NOT `cmd | while`): keeps `missing` and
 # `n_alerts` in the parent shell. The `... || echo 0` pipeline shape
 # is a footgun under pipefail — `grep -c` outputs "0" AND exits 1, so
@@ -109,8 +122,8 @@ missing=0
 n_alerts=0
 while read -r alert; do
   n_alerts=$((n_alerts + 1))
-  grep -q "$alert" "$runbook" || {
-    echo "FAIL: alert $alert not in $runbook" >&2
+  grep -q "$alert" "${runbooks[@]}" || {
+    echo "FAIL: alert $alert not in ${runbooks[*]}" >&2
     missing=$((missing + 1))
   }
 done < <(yq -N '.spec.groups[].rules[] | select(.alert // "" | test("^RioNodeclaimPool")) | .alert' "$mon_on")

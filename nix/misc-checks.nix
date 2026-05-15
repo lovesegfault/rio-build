@@ -210,8 +210,12 @@ in
         # 22-alert-quality.sh asserts every RioNodeclaimPool* alert has a
         # runbook table row. The fragment sandbox only has the chart and
         # nix/tests/helm/*.sh as build inputs — docs/ is unreachable —
-        # so stage the one runbook it cross-references.
-        cp ${../docs/src/runbooks/sla-model.md} $TMPDIR/chart/.runbook-sla-model.md
+        # so stage the runbook(s) it cross-references. .typ is the
+        # post-migration source (Phase D ops/sla-model.typ); .md stays
+        # until Phase E drops docs/src/. The fragment greps whichever
+        # exists.
+        ${pkgs.lib.optionalString (builtins.pathExists ../docs/src/runbooks/sla-model.md) "cp ${../docs/src/runbooks/sla-model.md} $TMPDIR/chart/.runbook-sla-model.md"}
+        ${pkgs.lib.optionalString (builtins.pathExists ../docs/ops/sla-model.typ) "cp ${../docs/ops/sla-model.typ} $TMPDIR/chart/.runbook-sla-model.typ"}
 
         for f in ${fragments}/*.sh; do
           echo "▸ helm-lint: $(basename "$f" .sh)" >&2
