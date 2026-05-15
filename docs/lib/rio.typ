@@ -389,15 +389,39 @@
         title: if paper != none { paper.title } else { "" },
         plain-body: body,
         web-theme: "starlight",
-        // dyn-paged html-wrapper pass: starlight 0.3.1 calls
-        // paged-load-trampoline() but never dyn-svg-support(), so the
-        // trampoline awaits an undefined typstRenderModuleReady. mdbook
-        // puts dyn-svg-support() in its <head>; starlight forgot.
+        // dyn-paged html-wrapper pass: starlight 0.3.1 has TWO mdbook-
+        // parity gaps that break dyn-paged:
+        //   1. calls paged-load-trampoline() but never dyn-svg-support(),
+        //      so the trampoline awaits an undefined typstRenderModuleReady
+        //      (mdbook head.typ:26 has it).
+        //   2. never defines window.getTypstTheme()/isTypstLightTheme()
+        //      which shiroa.js calls to pick which .{theme}.multi.sir.in
+        //      to fetch (mdbook page.typ:55 defines them; starlight has
+        //      its own light/dark switcher and forgot the bridge).
         // extra-assets lands in starlight's <head> via the sl:book-meta
-        // slot — inject the bootstrap there. Gate on html-wrapper so
-        // static-html doesn't fetch the (unused) wasm renderer.
+        // slot — inject both. Gate on html-wrapper so static-html
+        // doesn't fetch the (unused) wasm renderer.
         extra-assets: if x-target.starts-with("html-wrapper") {
-          (dyn-svg-support(),)
+          (
+            // (2) — map starlight's data-theme=light|dark to the mdbook
+            // 5-theme palette the .sir.in artifacts are named after.
+            // 'auto' resolves to the prefers-color-scheme media query.
+            html.elem(
+              "script",
+              "window.getTypstTheme = function() {
+                var t = document.documentElement.dataset.theme;
+                if (!t || t === 'auto') {
+                  t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                }
+                return t === 'dark' ? 'coal' : 'light';
+              };
+              window.isTypstLightTheme = function(t) {
+                return t === 'light' || t === 'rust';
+              };",
+            ),
+            // (1)
+            dyn-svg-support(),
+          )
         } else { () },
       )
       show: markup-rules.with(themes: (default-theme: (dash-color: accent)))
