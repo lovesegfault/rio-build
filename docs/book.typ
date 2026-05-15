@@ -22,12 +22,11 @@
     #chapter("guide/programmatic.typ")[Programmatic Access]
     = Architecture
     #chapter("architecture.typ")[System Architecture]
-    // shiroa's sidebar renderer (both starlight and mdbook) flattens
-    // parts and calls .sum() on each part's chapter list — a part with
-    // zero direct chapters (e.g. `= Spec` immediately followed by
-    // `== System`) crashes. Keep the spec grouping in the part label
-    // instead of nesting headings.
-    = Spec · System
+    // Nested parts work since shiroa-mdbook is built from our fork
+    // (rio-pin → PR #239: items.sum(default: [])); upstream 0.3.1
+    // crashes on a `=` part with no direct chapters.
+    = Spec
+    == System
     #chapter("spec/system/observability.typ")[Observability]
     #chapter("spec/system/security.typ")[Security & Threat Model]
     #chapter("spec/system/tenancy.typ")[Multi-Tenancy]
@@ -35,7 +34,7 @@
     #chapter("spec/system/verification.typ")[Verification]
     #chapter("spec/system/deployment.typ")[Deployment]
     #chapter("spec/system/crate-structure.typ")[Crate Structure]
-    = Spec · Components
+    == Components
     #chapter("spec/components/proto.typ")[Protocol]
     #chapter("spec/components/gateway.typ")[Gateway]
     - #chapter("spec/components/scheduler.typ")[Scheduler]
