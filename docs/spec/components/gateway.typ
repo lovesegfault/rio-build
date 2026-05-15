@@ -1091,15 +1091,33 @@ fetch). The optimization:
   Each SSH channel follows this lifecycle:
 ]
 
-// TODO: convert stateDiagram-v2 to fletcher
-```mermaid
-stateDiagram-v2
-    [*] --> handshake : SSH channel opened + exec "nix-daemon --stdio"
-    handshake --> ready : handshake complete (magic + version + features + postHandshake + STDERR_LAST)
-    ready --> ready : any opcode (wopSetOptions, query, upload, build)
-    ready --> [*] : SSH channel closed
-    handshake --> [*] : version mismatch (STDERR_ERROR)
-```
+#figure(
+  automaton(
+    (
+      handshake: (ready: "ok", closed: "mismatch"),
+      ready: (ready: "op", closed: "eof"),
+      closed: none,
+    ),
+    initial: "handshake",
+    final: ("closed",),
+    input-labels: (
+      ok: [handshake complete\ (magic + version + features\ + postHandshake + `STDERR_LAST`)],
+      op: [any opcode\ (`wopSetOptions`, query,\ upload, build)],
+      eof: [SSH channel closed],
+      mismatch: [version mismatch\ (`STDERR_ERROR`)],
+    ),
+    state-format: name => name,
+    style: (
+      handshake: (initial: [SSH channel opened\ + exec `nix-daemon --stdio`]),
+      handshake-ready: (curve: 0.6),
+      handshake-closed: (curve: -1.2, label: (pos: 0.5, dist: -0.4)),
+      ready-closed: (curve: 0.6),
+      state: (radius: 1.1),
+    ),
+    layout: finite-layout.linear.with(spacing: 4.5),
+  ),
+  caption: [SSH channel lifecycle.],
+)
 
 #memo(title: [Correction])[
   The original design required `wopSetOptions` as the mandatory first opcode
