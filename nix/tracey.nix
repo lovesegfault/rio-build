@@ -21,7 +21,7 @@ let
   src = tracey-src;
   # Workspace Cargo.toml still reports 1.3.0 — no tag yet past the
   # typst-spec fork commits we want.
-  version = "1.3.0-unstable-2026-05-14";
+  version = "1.3.0-unstable-2026-05-15";
 
   dashboardRoot = "crates/tracey/src/bridge/http/dashboard";
 
@@ -77,7 +77,8 @@ rustPlatform.buildRustPackage {
   # validation fails, daemon falls back to empty config, and `validate`
   # exits 0. Patch narrows extraction to `#r`/`#req` and makes validate
   # exit nonzero when a config error left the spec set empty.
-  patches = [ ./patches/tracey-typst-narrow-marker.patch ];
+  # The typst-narrow-marker patch (allowlist + config-error exit) is now
+  # upstream in the typst-spec branch as of 8e27ba6; no local patches needed.
 
   cargoLock.lockFile = "${src}/Cargo.lock";
 
