@@ -210,12 +210,14 @@ in
     }
     # Syntax check: njs js_import/js_set wiring is easy to get wrong
     # and vm-dashboard-k3s is the only other place nginx parses this.
-    # `nginx -t` resolves upstream hostnames at parse time, which the
-    # sandbox can't do for the cluster FQDN — sed it to a sandbox-
-    # resolvable address. Everything else (directives, regex, njs
-    # module presence, js script syntax) is checked verbatim.
+    # `nginx -t` resolves upstreams and open()s the error_log/access_log
+    # targets after parsing — sed the cluster FQDN to a resolvable
+    # address and /dev/std{err,out} to TMPDIR (a remote build sandbox
+    # may not provide /dev/std*). Everything else is checked verbatim.
     mkdir -p $TMPDIR/logs
-    sed 's/rio-scheduler\.rio-system\.svc\.cluster\.local/127.0.0.1/' \
+    sed -e 's/rio-scheduler\.rio-system\.svc\.cluster\.local/127.0.0.1/' \
+        -e "s#/dev/stderr#$TMPDIR/logs/error.log#" \
+        -e "s#/dev/stdout#$TMPDIR/logs/access.log#" \
       ${dockerImages.dashboardNginxConf} > $TMPDIR/nginx.conf
     ${dockerImages.dashboardNginx}/bin/nginx -t -p $TMPDIR -c $TMPDIR/nginx.conf
     touch $out
