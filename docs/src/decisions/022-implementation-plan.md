@@ -1,6 +1,6 @@
 # ADR-022 Implementation Plan — castore-FUSE lazy store + per-AZ S3 Express chunk cache
 
-**Status:** Phase-0 gate passed (P0541, P0544, P0569 done; P0543/P0578 do not block the gate and are still UNIMPL). Phase 1 in progress: P0545, P0546, P0548, P0549, P0550, P0568 done; P0570, P0572 next. Design is [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) + [Design Overview](./022-design-overview.md) + ADR-023. Per-item status is in the metadata line under each `### P05xx` heading.
+**Status:** Phase-0 gate passed (P0541, P0544, P0569 done; P0543/P0578 do not block the gate and are still UNIMPL). Phase 1/2 in progress: P0545, P0546, P0548, P0549, P0550, P0551, P0552, P0568, P0572 done; P0588/P0589 next. Design is [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) + [Design Overview](./022-design-overview.md) + ADR-023. Per-item status is in the metadata line under each `### P05xx` heading.
 **Plan-number range:** P0541–P0589 (gaps at 0542/0547/0558/0561/0587 are abandoned numbers; P0556 abandoned 2026-04-23 — do not reuse).
 **Clean-cutover constraint:** no FUSE fallback flag, no `RIO_STORE_BACKEND` selector. P0560 deletes the old FUSE module wholesale.
 **Cross-region forward-compat:** object store (S3/GCS) is authoritative for bytes; S3 Express One Zone is a per-AZ read-through cache; PG is single-region. Nothing here precludes cross-region deployment (object-store-authoritative, cache tier stateless) but it is not implemented. No DRA. **Express AZ-ID availability constrains region/AZ choice** — see [Design Overview §9](./022-design-overview.md).
@@ -275,7 +275,9 @@ Extend `ChunkBackend` with string-keyed `put_blob/get_blob/delete_blob` for P056
 Hoist `StoreClients` + the FUSE-independent fetch primitives (`JIT_MIN_THROUGHPUT_BPS`, `jit_fetch_timeout`, `RETRY_BACKOFF`, `jitter`) from `rio-builder/src/fuse/fetch/` (which imports `fuser::Errno`, `super::NixStoreFs`) to `rio-builder/src/store_fetch.rs`; leave old-FUSE-typed wrappers (`fetch_extract_insert`, `prefetch_path_blocking`, `stream_nar_to_spool`, `SyncSpool`) in `fuse/fetch/mod.rs` until P0560 deletes them. `runtime/{mod,prefetch,setup}.rs` callers switch to `crate::store_fetch::StoreClients` so they survive P0560; `fuse/fetch/mod.rs` re-exports for the surviving fuse-internal callers. `fetch_chunks_parallel` (the plan's original target) does not exist as a named fn yet — the parallel chunk fetch is the per-path `GetPath` server-stream; the batched cross-path variant is what P0568's `GetChunks` client adds on top of the hoisted `StoreClients`. **Exit:** `/nixbuild --checks` green; existing FUSE VM tests unchanged.
 
 ### P0572 — Directory merkle layer: `dir_digest`/`root_digest` + `directories` table
-**Crate:** `rio-proto, rio-nix, rio-store` · **Deps:** P0545, P0546, P0551, P0552 · **Complexity:** LOW (~50 LoC compute + table)
+**Crate:** `rio-proto, rio-store` · **Deps:** P0545, P0546, P0551, P0552 · **Complexity:** LOW · **Status: DONE 2026-05-15** (`75ad6288`)
+
+> Implementation note: the bottom-up `dir_digest` pass landed in `rio-store/src/castore.rs` rather than `rio-nix/src/nar/` — the canonical encoding is a prost encode of `rio_proto::castore::Directory`, and `rio-nix` cannot depend on `rio-proto` (the dependency runs the other way). `nar_ls` still emits the entry list; `castore::build()` does the second pass over it.
 
 **Load-bearing for the §2 mount path** — the castore-FUSE serves this DAG. The work happens once at PutPath/index time (<1 ms on top of P0546's blake3 pass; bytes already in RAM).
 
@@ -308,7 +310,7 @@ Hoist `StoreClients` + the FUSE-independent fetch primitives (`JIT_MIN_THROUGHPU
 ## Phase 2 — Store nar_index
 
 ### P0551 — migration 061
-**Crate:** `rio-store` · **Deps:** P0545 · **Complexity:** LOW
+**Crate:** `rio-store` · **Deps:** P0545 · **Complexity:** LOW · **Status: DONE 2026-05-15** (`678c206c`)
 | File | Change |
 |---|---|
 | `migrations/061_nar_index.sql` | `CREATE TABLE nar_index (store_path_hash, entries, root_node, created_at)` + `manifests.nar_indexed` partial-index work-queue (precedent: migration 031's `WHERE status='uploading'`). PG forbids subqueries in partial-index predicates, so the queue is a same-table bool flag; indexer flips `nar_indexed=true` on success (HOT-update eligible). **The migration also pre-creates** P0572's `directories`/`directory_tenants`/`file_blobs`/`file_blob_tenants`, P0581's `narinfo.compat_file_hash`, and P0586's `chunks.durable` + `chunks_present_idx` so the file is pinned once. P0583's `DROP COLUMN inline_blob` is **not** here (the store still reads it); that gets its own migration. |
@@ -320,7 +322,7 @@ Hoist `StoreClients` + the FUSE-independent fetch primitives (`JIT_MIN_THROUGHPU
 **Exit:** `/nixbuild --checks` green.
 
 ### P0552 — GetNarIndex handler + indexer loop
-**Crate:** `rio-store` · **Deps:** P0545, P0546, P0551 · **Complexity:** MED
+**Crate:** `rio-store` · **Deps:** P0545, P0546, P0551 · **Complexity:** MED · **Status: DONE 2026-05-15** (`678c206c`)
 | File | Change |
 |---|---|
 | `rio-store/src/nar_index.rs` | new — `compute(pool, backend, store_path)`: fetch chunks → reassemble → `nar_ls` (now emits `file_digest`) → `set_nar_index`. Guard: `nar_index_sync_max_bytes` config (default 4 GiB). `// r[impl store.index.{non-authoritative,sync-on-miss}]` |
@@ -725,8 +727,8 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 {"plan":550,"title":"Hoist StoreClients+fetch_chunks_parallel → store_fetch.rs (NOT pure mv)","deps":[544],"crate":"rio-builder","priority":85,"status":"DONE","complexity":"MED","note":"fetch.rs:20,32-33 imports fuser"}
 {"plan":568,"title":"Batched GetChunks server-stream (K_server=256) + prost .bytes() + tonic residuals + obs","deps":[545,550],"crate":"rio-proto,rio-store,rio-builder,infra","priority":85,"status":"DONE","complexity":"MED","note":"r[proto.chunk.batch-bidi]; abort-on-first-error; ChunkData.data → bytes::Bytes"}
 {"plan":570,"title":"StatBlob RPC: server-side file_digest → ChunkMeta[] (snix BlobService.Stat; shares file_blobs+cumsum helper with P0577 ReadBlob)","deps":[573],"crate":"rio-proto,rio-store","priority":85,"status":"UNIMPL","complexity":"LOW","note":"castore-FUSE open() resolves chunk-coords server-side; no client DigestResolver; r[store.castore.blob-stat]"}
-{"plan":551,"title":"migration 061_nar_index + manifests.nar_indexed bool + queries","deps":[545],"crate":"rio-store","priority":85,"status":"UNIMPL","complexity":"LOW","note":"partial-index work-queue WHERE NOT nar_indexed (precedent: 031); PG forbids cross-table predicate"}
-{"plan":552,"title":"GetNarIndex handler + indexer_loop","deps":[545,546,551],"crate":"rio-store","priority":85,"status":"UNIMPL","complexity":"MED","note":"nar_index_sync_max_bytes guard; entries carry file_digest"}
+{"plan":551,"title":"migration 061_nar_index + manifests.nar_indexed bool + queries","deps":[545],"crate":"rio-store","priority":85,"status":"DONE","complexity":"LOW","note":"partial-index work-queue WHERE NOT nar_indexed (precedent: 031); PG forbids cross-table predicate"}
+{"plan":552,"title":"GetNarIndex handler + indexer_loop","deps":[545,546,551],"crate":"rio-store","priority":85,"status":"DONE","complexity":"MED","note":"nar_index_sync_max_bytes guard; entries carry file_digest"}
 {"plan":553,"title":"infra/eks/s3-express.tf per-AZ directory bucket (for_each express_az_ids) + dedicated rio-store SG/NodeClass + s3express IAM","deps":[548],"crate":"infra","priority":80,"status":"UNIMPL","complexity":"LOW","note":"per-AZ from day one; TieredChunkBackend is AZ-count-agnostic; no CSI/PVC/kmod"}
 {"plan":554,"title":"helm chunkBackend.tiered + per-AZ Express bucket env (downward-API zone → IMDS zone-id → bucket)","deps":[548,553],"crate":"infra,xtask","priority":80,"status":"UNIMPL","complexity":"LOW","note":"FIRST SHIPPED VALUE (U2)"}
 {"plan":555,"title":"VM test: tiered-backend cache semantics","deps":[548,554],"crate":"nix","priority":80,"status":"UNIMPL","complexity":"MED","note":""}
@@ -752,7 +754,7 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 {"plan":563,"title":"Metrics: digest-fuse + tiered dashboards + alerts","deps":[544,548,559],"crate":"infra","priority":70,"status":"UNIMPL","complexity":"LOW","note":""}
 {"plan":564,"title":"helm cleanup + mountd DS wiring + kernel assertion (drop smarter-device-manager entirely)","deps":[554,560,567],"crate":"infra,rio-controller,nix","priority":75,"status":"UNIMPL","complexity":"LOW","note":"builders privileged:false; DELETE device-plugin.yaml + both NodeOverlays + nixos-node/smarter-device-manager; kvm via hostPath CharDevice + nodeSelector + extra-sandbox-paths (vm-kvm-hostpath-spike PASS)"}
 {"plan":565,"title":"Cutover runbooks (cache-tier, castore-FUSE)","deps":[555,562,564],"crate":"docs","priority":65,"status":"UNIMPL","complexity":"LOW","note":""}
-{"plan":572,"title":"Directory merkle layer: dir_digest/root_digest in NarIndex + directories+file_blobs tables + nar_index.root_node column + bottom-up compute in nar_ls","deps":[545,546,551,552],"crate":"rio-proto,rio-nix,rio-store","priority":90,"status":"UNIMPL","complexity":"LOW","note":"LOAD-BEARING for P0559 mount path (ADR §2.2); also U5 foundation; snix castore.proto vendored (MIT); pin canonical encoding (snix #111)"}
+{"plan":572,"title":"Directory merkle layer: dir_digest/root_digest in NarIndex + directories+file_blobs tables + nar_index.root_node column + bottom-up compute in castore.rs","deps":[545,546,551,552],"crate":"rio-proto,rio-store","priority":90,"status":"DONE","complexity":"LOW","note":"LOAD-BEARING for P0559 mount path (ADR §2.2); also U5 foundation; snix castore.proto vendored (MIT); pin canonical encoding (snix #111); pass lives in rio-store not rio-nix (rio-nix can't depend on rio-proto)"}
 {"plan":573,"title":"DirectoryService RPC: GetDirectory(recursive=true server-BFS stream) / HasDirectories / HasBlobs (batch bitmap; I-110 lesson)","deps":[572,589],"crate":"rio-proto,rio-store","priority":90,"status":"UNIMPL","complexity":"MED","note":"snix-wire-compatible; recursive=true is the P0559 mount-time prefetch path; tenant-scoping reads claims.tenant_id (P0589)"}
 {"plan":577,"title":"BlobService.Read(file_digest) server-stream (snix-compatible; file_blobs→chunk-range→GetChunks slice)","deps":[573],"crate":"rio-proto,rio-store","priority":80,"status":"UNIMPL","complexity":"LOW","note":"~40 LoC; completes castore surface"}
 {"plan":574,"title":"Gateway substituter: Directory-DAG delta-sync client (nix copy walks DAG, prunes present subtrees)","deps":[573,577],"crate":"rio-gateway,nix","priority":75,"status":"UNIMPL","complexity":"MED","note":"U5 LANDS; falls through to chunk-list when remote lacks capability"}
