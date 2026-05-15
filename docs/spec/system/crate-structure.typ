@@ -31,67 +31,92 @@ derivation is invalidated on `.proto` changes but not on Rust-only commits.
 
 = Dependency Graph
 
-// TODO: convert mermaid `graph TD` to fletcher — 12 nodes / ~30 edges with
-// solid (prod) vs dashed (dev) styling needs a hand-laid layered layout.
-```
-graph TD
-    rio-common["rio-common (config, observability, limits)"]
-    rio-nix["rio-nix (protocol, derivations, NAR)"]
-    rio-proto["rio-proto (gRPC definitions)"]
-    rio-crds["rio-crds (k8s CRD types)"]
-    rio-test-support["rio-test-support (PG, mock gRPC, wire)"]
-    rio-store["rio-store (chunked CAS)"]
-    rio-scheduler["rio-scheduler (DAG, scheduling)"]
-    rio-gateway["rio-gateway (SSH, protocol handler)"]
-    rio-builder["rio-builder (executor, FUSE, overlay)"]
-    rio-controller["rio-controller (k8s operator, CRDs, autoscale)"]
-    rio-cli["rio-cli (AdminService client)"]
-    xtask["xtask (dev/ops tooling)"]
-
-    rio-proto --> rio-nix
-    rio-proto --> rio-common
-
-    rio-test-support --> rio-nix
-    rio-test-support --> rio-proto
-
-    rio-gateway --> rio-nix
-    rio-gateway --> rio-proto
-    rio-gateway --> rio-common
-    rio-gateway -.->|dev| rio-test-support
-    rio-gateway -.->|dev| rio-store
-
-    rio-builder --> rio-nix
-    rio-builder --> rio-proto
-    rio-builder --> rio-common
-    rio-builder -.->|dev| rio-test-support
-
-    rio-scheduler --> rio-nix
-    rio-scheduler --> rio-proto
-    rio-scheduler --> rio-common
-    rio-scheduler --> rio-crds
-    rio-scheduler -.->|dev| rio-store
-    rio-scheduler -.->|dev| rio-test-support
-
-    rio-store --> rio-nix
-    rio-store --> rio-proto
-    rio-store --> rio-common
-    rio-store -.->|dev| rio-test-support
-
-    rio-controller --> rio-proto
-    rio-controller --> rio-common
-    rio-controller --> rio-crds
-    rio-controller -.->|dev| rio-test-support
-
-    rio-cli --> rio-proto
-    rio-cli --> rio-common
-    rio-cli --> rio-crds
-    rio-cli -.->|dev| rio-test-support
-
-    xtask --> rio-crds
-    xtask --> rio-test-support
-```
-
-Solid edges are prod dependencies; dashed are `[dev-dependencies]` only.
+#{
+  // Per-crate label: bold mono name over a small muted subtitle.
+  let crate(name, sub) = align(center)[
+    #text(font: "DejaVu Sans Mono", weight: 600, size: 0.85em, name)\
+    #text(size: 0.7em, fill: muted, sub)
+  ]
+  let dev = (stroke: (paint: muted, dash: "dashed", thickness: 0.6pt))
+  figure(
+    autograph.diagram(
+      engine: "dot",
+      node-shape: fletcher.shapes.rect,
+      node-stroke: 0.6pt + rule-color,
+      node-inset: 0.6em,
+      edge-stroke: 0.6pt,
+      edge-corner-radius: 8pt,
+      // nodes
+      autograph.node(<rio-common>, crate(
+        "rio-common",
+        [config, observability, limits],
+      )),
+      autograph.node(<rio-nix>, crate("rio-nix", [protocol, derivations, NAR])),
+      autograph.node(<rio-proto>, crate("rio-proto", [gRPC definitions])),
+      autograph.node(<rio-crds>, crate("rio-crds", [k8s CRD types])),
+      autograph.node(<rio-test-support>, crate(
+        "rio-test-support",
+        [PG, mock gRPC, wire],
+      )),
+      autograph.node(<rio-store>, crate("rio-store", [chunked CAS])),
+      autograph.node(<rio-scheduler>, crate(
+        "rio-scheduler",
+        [DAG, scheduling],
+      )),
+      autograph.node(<rio-gateway>, crate(
+        "rio-gateway",
+        [SSH, protocol handler],
+      )),
+      autograph.node(<rio-builder>, crate(
+        "rio-builder",
+        [executor, FUSE, overlay],
+      )),
+      autograph.node(<rio-controller>, crate(
+        "rio-controller",
+        [k8s operator, autoscale],
+      )),
+      autograph.node(<rio-cli>, crate("rio-cli", [AdminService client])),
+      autograph.node(<xtask>, crate("xtask", [dev/ops tooling])),
+      // prod edges (solid)
+      autograph.edge(<rio-proto>, <rio-nix>),
+      autograph.edge(<rio-proto>, <rio-common>),
+      autograph.edge(<rio-test-support>, <rio-nix>),
+      autograph.edge(<rio-test-support>, <rio-proto>),
+      autograph.edge(<rio-gateway>, <rio-nix>),
+      autograph.edge(<rio-gateway>, <rio-proto>),
+      autograph.edge(<rio-gateway>, <rio-common>),
+      autograph.edge(<rio-builder>, <rio-nix>),
+      autograph.edge(<rio-builder>, <rio-proto>),
+      autograph.edge(<rio-builder>, <rio-common>),
+      autograph.edge(<rio-scheduler>, <rio-nix>),
+      autograph.edge(<rio-scheduler>, <rio-proto>),
+      autograph.edge(<rio-scheduler>, <rio-common>),
+      autograph.edge(<rio-scheduler>, <rio-crds>),
+      autograph.edge(<rio-store>, <rio-nix>),
+      autograph.edge(<rio-store>, <rio-proto>),
+      autograph.edge(<rio-store>, <rio-common>),
+      autograph.edge(<rio-controller>, <rio-proto>),
+      autograph.edge(<rio-controller>, <rio-common>),
+      autograph.edge(<rio-controller>, <rio-crds>),
+      autograph.edge(<rio-cli>, <rio-proto>),
+      autograph.edge(<rio-cli>, <rio-common>),
+      autograph.edge(<rio-cli>, <rio-crds>),
+      autograph.edge(<xtask>, <rio-crds>),
+      autograph.edge(<xtask>, <rio-test-support>),
+      // dev-dependencies (dashed, muted)
+      autograph.edge(<rio-gateway>, <rio-test-support>, ..dev),
+      autograph.edge(<rio-gateway>, <rio-store>, ..dev),
+      autograph.edge(<rio-builder>, <rio-test-support>, ..dev),
+      autograph.edge(<rio-scheduler>, <rio-store>, ..dev),
+      autograph.edge(<rio-scheduler>, <rio-test-support>, ..dev),
+      autograph.edge(<rio-store>, <rio-test-support>, ..dev),
+      autograph.edge(<rio-controller>, <rio-test-support>, ..dev),
+      autograph.edge(<rio-cli>, <rio-test-support>, ..dev),
+    ),
+    caption: [Workspace dependency graph. Solid edges are prod dependencies;
+      dashed are `[dev-dependencies]` only.],
+  )
+}
 
 Notable edges:
 
