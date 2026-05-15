@@ -6,6 +6,12 @@
 
 #show: book
 
+// Output OUTSIDE the watched `--root docs` tree. Default is `./dist`
+// (= docs/dist/), which the file-watcher then sees as a change →
+// infinite rebuild loop under `shiroa serve`. nix/docs.nix passes
+// `-d $out` explicitly so this only matters for local `shiroa serve`.
+#build-meta(dest-dir: "../.direnv/shiroa-dist")
+
 #book-meta(
   title: "rio-build design book",
   summary: [
