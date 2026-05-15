@@ -30,8 +30,7 @@
 
 // ─── package imports ────────────────────────────────────────────────
 #import "@preview/shiroa:0.3.1": (
-  is-html-target, is-pdf-target, is-web-target, page-width, shiroa-sys-target,
-  templates,
+  is-html-target, is-pdf-target, is-web-target, shiroa-sys-target, templates,
 )
 #import templates: (
   add-styles, equation-rules, markup-rules, template-rules, theme-box,
@@ -336,15 +335,12 @@
     },
   ) if is-pdf
 
-  // dyn-paged: one tall scrollable page at shiroa's viewport width.
-  // shiroa CLI provides theme chrome around the wasm-rendered canvas,
-  // so no template-rules here — content renders like PDF (codly,
-  // gentle-clues, fletcher all on; wasm rasterizes them).
-  set page(
-    width: page-width,
-    height: auto,
-    margin: (x: 0em, y: 1em),
-  ) if is-dyn-web
+  // dyn-paged: shiroa CLI provides theme chrome around the wasm-rendered
+  // canvas and supplies its own page geometry (serve mode wraps the
+  // chapter in a container before #show fires, so `set page` here
+  // errors with "not allowed inside of containers"). Content renders
+  // like PDF — codly/gentle-clues/fletcher on, wasm rasterizes them.
+  // No html.elem emission, no template-rules.
 
   // shiroa static-html: emit the page chrome + content transforms.
   //
