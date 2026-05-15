@@ -132,7 +132,7 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
   roots). `GcRequest.grace_period_hours` defaults to *2h*. The orphan scanner
   and S3 drain task are spawned in `main.rs` with compile-time constants
   (`DRAIN_INTERVAL = 30s`, orphan stale threshold = 15min). See
-  #link("./components/store.md#two-phase-garbage-collection")[store: GC].
+  #link("../spec/components/store.typ")[store: GC].
 ]
 
 = Builder
@@ -215,7 +215,7 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
   [`builder`],
   [`builder` (airgapped, regular derivations) or `fetcher` (egress-open, FODs
     only). Set via `RIO_EXECUTOR_KIND`. See
-    #link("./decisions/019-builder-fetcher-split.md")[ADR-019].],
+    #link("../spec/components/fetcher.typ")[Fetcher §Rationale].],
 )
 
 #info[
@@ -250,7 +250,7 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
   *The controller is NOT leader-elected* (single replica by design). Only the
   scheduler uses a Kubernetes Lease (see scheduler `RIO_LEASE_NAME` /
   `RIO_LEASE_NAMESPACE` env vars documented in
-  #link("./components/scheduler.md#leader-election")[scheduler: Leader
+  #link("../spec/components/scheduler.typ")[scheduler: Leader
     Election]).
 ]
 
@@ -293,7 +293,7 @@ because `init_tracing()` runs before config parsing:
 )
 
 The OTel service name is auto-set per component (not user-configurable). See
-#link("./observability.md")[observability.md] for trace structure and metric
+#link("../spec/system/observability.typ")[Observability] for trace structure and metric
 details.
 
 = Multi-Tenancy Quotas
@@ -320,7 +320,7 @@ details.
 )
 
 Configured per tenant via the admin API or CRD annotations. See
-#link("./multi-tenancy.md")[multi-tenancy.md] for enforcement details.
+#link("../spec/system/tenancy.typ")[Multi-Tenancy] for enforcement details.
 
 = PostgreSQL Operations
 
@@ -339,7 +339,7 @@ across transaction boundaries.
   *Note:* The scheduler's leader election uses a *Kubernetes Lease*
   (`coordination.k8s.io/v1`), not PostgreSQL. PgBouncer mode has no effect on
   leader election. See
-  #link("./components/scheduler.md#leader-election")[scheduler: Leader
+  #link("../spec/components/scheduler.typ")[scheduler: Leader
     Election] for details.
 ]
 
@@ -382,4 +382,4 @@ each crate's `migrations/` directory.
 
 The `Pool` CRD provides runtime-configurable parameters that the controller
 reconciles without component restarts. See
-#link("./components/controller.md")[controller.md] for the full CRD spec.
+#link("../spec/components/controller.typ")[Controller] for the full CRD spec.

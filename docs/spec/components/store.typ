@@ -865,8 +865,8 @@ content-addressed output mappings independently of narinfo signatures.
   scanner's 15-minute sweep. The
   #(refs.metric)("rio_store_putpath_stale_reclaimed_total") counter tracks
   reclaim events; sustained high alongside
-  `rio_scheduler_resource_floor_promotions_total{kind="fod"}` indicates
-  under-sized fetcher pods (I-207/I-208).
+  #(refs.metric)("rio_scheduler_resource_floor_bumps_total")`{kind="fod"}`
+  indicates under-sized fetcher pods (I-207/I-208).
 ]
 
 = Two-Phase Garbage Collection

@@ -52,7 +52,7 @@ pub async fn send_set_options(s: &mut DuplexStream) -> anyhow::Result<()> {
 }
 
 /// `wopQueryPathInfo` (opcode 26) response fields, wire-order.
-/// `r[gw.opcode.query-path-info]` at docs/src/components/gateway.md.
+/// `r[gw.opcode.query-path-info]` at docs/spec/components/gateway.typ.
 ///
 /// Returned AFTER `valid: bool` — caller reads `valid` first, then
 /// calls [`read_path_info`] if `valid == true`. Tests usually want one

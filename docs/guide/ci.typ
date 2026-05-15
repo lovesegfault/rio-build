@@ -35,7 +35,7 @@ For a more sophisticated setup, use `nix-eval-jobs` with `--check-cache-status` 
 
 = Multi-Architecture Builds
 
-rio-build supports multiple architectures via separate builder pools. Each `Pool` CRD declares a `systems` list (e.g., `["x86_64-linux"]` or `["aarch64-linux"]`). The scheduler matches derivation `system` to executors whose `systems` list contains it, and also requires all derivation `requiredSystemFeatures` to be present in the executor's `features` list. (Darwin builders --- `aarch64-darwin`, `x86_64-darwin` --- are future work; see #link("./introduction.md")[introduction.md].)
+rio-build supports multiple architectures via separate builder pools. Each `Pool` CRD declares a `systems` list (e.g., `["x86_64-linux"]` or `["aarch64-linux"]`). The scheduler matches derivation `system` to executors whose `systems` list contains it, and also requires all derivation `requiredSystemFeatures` to be present in the executor's `features` list. (Darwin builders --- `aarch64-darwin`, `x86_64-darwin` --- are future work; see #link("../intro.typ")[Introduction].)
 
 ```bash
 # Build for a specific architecture (requires executors with matching system)
@@ -86,4 +86,4 @@ Recommended dashboards:
   [Assignment latency, critical path accuracy, DAG size distribution],
 )
 
-See #link("./observability.md")[Observability] for the full list of available metrics.
+See #link("../spec/system/observability.typ")[Observability] for the full list of available metrics.

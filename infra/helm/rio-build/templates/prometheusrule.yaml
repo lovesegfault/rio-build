@@ -314,7 +314,7 @@ spec:
               / firmware: Launched=True but kubelet never joins. Run
               `kubectl get nodeclaims -o wide` and check
               Launched/Registered conditions; see
-              docs/src/runbooks/sla-model.md#rionodeclaimpool-boottimeoutloop.
+              docs/ops/sla-model.typ#rionodeclaimpool-boottimeoutloop.
 
         # r35 B1 (bug_003 second half): when `fallback_cell` finds no
         # configured hw-class that can host an intent, the intent is
@@ -365,7 +365,7 @@ spec:
               reason=no_pool_covers: a hwClass advertises a feature with no
               covering Builder/Fetcher Pool — `kubectl get pools.rio.build -A`
               and check `spec.systems`/`effective_features`.
-              See docs/src/runbooks/sla-model.md#rionodeclaimpool-nohostingclass.
+              See docs/ops/sla-model.typ#rionodeclaimpool-nohostingclass.
 
         # Sibling of NoHostingClass for the OTHER reason `assign_to_cells`
         # drops a cold-start intent: a class CAN host it, but every
@@ -411,7 +411,7 @@ spec:
               deploy/rio-scheduler -n rio-system` clears the in-memory ICE
               backoff immediately (otherwise it self-heals on TTL expiry,
               up to `sla.maxLeadTime`).
-              See docs/src/runbooks/sla-model.md#rionodeclaimpool-icemaskedhigh.
+              See docs/ops/sla-model.typ#rionodeclaimpool-icemaskedhigh.
 
         # qa-fix-b r37: a NodeClaim whose Karpenter finalizer never
         # clears stays `terminating` indefinitely. `class_budget` and
@@ -439,7 +439,7 @@ spec:
               without Karpenter's finalizer clearing. Check the Karpenter
               controller and the Node's drain/cordon state;
               `kubectl get nodeclaims -o wide` to find the stuck object.
-              See docs/src/runbooks/sla-model.md#rionodeclaimpool-stuckterminating.
+              See docs/ops/sla-model.typ#rionodeclaimpool-stuckterminating.
 
         # Forward-compat: rio_store_putpath_retries_total lands in P0539d.
         # Until then this expr evaluates empty (no series) → never fires.

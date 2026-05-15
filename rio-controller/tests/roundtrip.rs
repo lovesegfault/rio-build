@@ -1,6 +1,6 @@
 //! Proto back-compat decode tests for messages this crate consumes.
 //!
-//! Per `docs/src/crate-structure.md` §rio-proto field-addition rule:
+//! Per `docs/spec/system/crate-structure.typ` §rio-proto field-addition rule:
 //! every `optional` proto3 scalar whose absence is load-bearing on the
 //! consumer side gets a case here that decodes a byte-slice WITHOUT the
 //! new tag and asserts the consumer's behaviour matches the

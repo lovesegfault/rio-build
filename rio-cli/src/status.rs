@@ -57,7 +57,7 @@ pub(crate) async fn run(as_json: bool, client: &mut AdminClient) -> anyhow::Resu
 
     print_status(&cs);
     // Worker and build detail lines below the summary — this is
-    // what `docs/src/phases/phase4.md` means by "rio-cli status":
+    // what the design book means by "rio-cli status":
     // enough to eyeball that workers registered and builds landed.
     for w in &workers.executors {
         println!(

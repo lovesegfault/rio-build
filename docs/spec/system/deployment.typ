@@ -1,11 +1,11 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: ("infra",))
 
-This guide covers deploying rio-build to a Kubernetes cluster. For development, see #link("./contributing.md")[Contributing].
+This guide covers deploying rio-build to a Kubernetes cluster. For development, see #link("../../contributing.typ")[Contributing].
 
 = Prerequisites
 
-- Kubernetes 1.33+ (EKS, GKE, or self-managed) --- required for user namespace isolation (`hostUsers: false`), see #link("./decisions/012-privileged-builder-pods.md")[ADR-012]
+- Kubernetes 1.33+ (EKS, GKE, or self-managed) --- required for user namespace isolation (`hostUsers: false`), see #link("./security.typ")[Security §Rationale]
 - PostgreSQL 15+ (managed service recommended: RDS, Cloud SQL, or CloudNativePG). Aurora/RDS PG 15+ have `rds.force_ssl=1` by default --- the connection string must include `?sslmode=require` (sqlx has `tls-rustls-aws-lc-rs` enabled for this)
 - S3-compatible object storage (AWS S3, MinIO, GCS with S3 compatibility)
 - `kubectl` configured for the target cluster
@@ -97,7 +97,7 @@ The EKS reference deployment (`infra/eks/`) uses Karpenter: the `executors` mana
 
 = Key Configuration
 
-See #link("./configuration.md")[Configuration Reference] for all parameters. The minimum required settings:
+See #link("../../ref/configuration.typ")[Configuration Reference] for all parameters. The minimum required settings:
 
 #table(
   columns: 2,
@@ -117,7 +117,7 @@ See #link("./configuration.md")[Configuration Reference] for all parameters. The
 
 = Secrets
 
-See #link("./security.md#secrets-management")[Security: Secrets Management] for recommended patterns (External Secrets Operator or Vault Agent Injector for production). At minimum, create Kubernetes Secrets for:
+See #link("./security.typ")[Security: Secrets Management] for recommended patterns (External Secrets Operator or Vault Agent Injector for production). At minimum, create Kubernetes Secrets for:
 
 - SSH host key (gateway)
 - Authorized SSH keys (gateway)
@@ -169,9 +169,9 @@ For a complete scripted walkthrough against EKS, run `cargo xtask k8s qa --healt
 
 = Production Considerations
 
-- *PostgreSQL HA:* Use RDS Multi-AZ, Cloud SQL HA, or Patroni. See #link("./configuration.md#postgresql-operations")[Configuration: PostgreSQL Operations].
-- *Monitoring:* Configure Prometheus scraping and Grafana dashboards. See #link("./integration.md#monitoring-integration")[Integration: Monitoring].
-- *Transport encryption:* Cilium WireGuard transparent encryption is on by default (`encryption.type: wireguard`). rio components speak plaintext gRPC; the overlay encrypts node-to-node. There are no per-component TLS certificates and no cert-manager dependency. See #link("./security.md")[Security: `r[sec.transport.cilium-wireguard]`].
+- *PostgreSQL HA:* Use RDS Multi-AZ, Cloud SQL HA, or Patroni. See #link("../../ref/configuration.typ")[Configuration: PostgreSQL Operations].
+- *Monitoring:* Configure Prometheus scraping and Grafana dashboards. See #link("./observability.typ")[Observability].
+- *Transport encryption:* Cilium WireGuard transparent encryption is on by default (`encryption.type: wireguard`). rio components speak plaintext gRPC; the overlay encrypts node-to-node. There are no per-component TLS certificates and no cert-manager dependency. See #link("./security.typ")[Security: `r[sec.transport.cilium-wireguard]`].
 - *NLB target health:* With `externalTrafficPolicy: Local` on the gateway Service, the NLB shows `N/M` targets healthy where `N` = number of nodes hosting a rio-gateway pod (the rest fail the `healthCheckNodePort` probe by design — they have no local backend). This is correct, not a bug.
 - *Backups:* PostgreSQL backups are critical. S3 data is durable by default. No additional backup needed for chunk storage.
 
@@ -194,4 +194,4 @@ For a complete scripted walkthrough against EKS, run `cargo xtask k8s qa --healt
 - *RPO:* Determined by PostgreSQL backup frequency. With WAL archiving, RPO can be near-zero. S3 data has effectively zero RPO.
 - *RTO:* Determined by PostgreSQL restore time + component restart time. Typically 5-15 minutes for managed databases.
 
-See #link("./multi-tenancy.md")[Multi-Tenancy] for tenant isolation configuration (resource quotas, per-tenant signing keys, narinfo visibility filtering).
+See #link("./tenancy.typ")[Multi-Tenancy] for tenant isolation configuration (resource quotas, per-tenant signing keys, narinfo visibility filtering).

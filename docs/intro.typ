@@ -55,14 +55,14 @@ following are explicitly out of scope:
   completion. These belong in the CI layer above rio-build.
 - *Eval scheduling / jobsets*: No equivalent of Hydra's jobset model. For
   periodic rebuilds, use cron + `nix-eval-jobs` + rio-build. See
-  #link("./integration.md")[Integration] for patterns.
+  #link("./guide/ci.typ")[CI Integration] for patterns.
 - *macOS (Darwin) builders*: The builder architecture (FUSE, overlayfs, Linux
   namespaces) is Linux-only. Darwin builds require a separate builder
   architecture (future work).
 - *Recursive Nix*: Derivations that invoke Nix internally (`__recursive` /
   `recursive-nix`) are not supported. Builders disable substitution and remote
   builders to prevent build hook recursion. See
-  #link("./components/builder.md#builder-nix-configuration")[builder configuration].
+  #link("./spec/components/builder.typ")[builder configuration].
 
 = When to Use rio-build
 
@@ -86,7 +86,7 @@ It is NOT the right choice when:
 - You need *GitHub PR status checks* --- use a CI system with rio-build as the
   build backend
 
-See #link("./multi-tenancy.md")[Multi-Tenancy] for tenant isolation details:
+See #link("./spec/system/tenancy.typ")[Multi-Tenancy] for tenant isolation details:
 resource quotas, per-tenant signing keys, and narinfo visibility filtering are
 enforced. Builder pods run with `privileged: false` by default (device plugin +
 `hostUsers: false` per ADR-012).

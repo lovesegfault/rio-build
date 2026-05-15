@@ -4,7 +4,7 @@
 # clauses or `{k="v"}` selectors. This fragment extracts every (metric,
 # label-key) pair and asserts it appears in the allowlist below, which is
 # sourced from the `describe_*!` HELP text in each component's lib.rs and
-# the tables in docs/src/observability.md.
+# the tables in docs/spec/system/observability.typ.
 #
 # A label-key drift (e.g. `reason` vs `result`) is invisible to `helm
 # template`: PromQL with an absent label collapses series to one

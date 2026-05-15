@@ -8,7 +8,7 @@
 #
 # r[impl infra.node.nixos-ami]
 #
-# Design: docs/src/decisions/021-nixos-node-ami.md (ADR-021).
+# Design: docs/spec/components/controller.typ §Rationale (supersedes ADR-021).
 {
   lib,
   # OCI archive(s) to import into containerd's content store concurrent

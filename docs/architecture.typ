@@ -84,19 +84,19 @@ builders or other components --- it watches CRDs and reconciles desired state.
 
 == Component Links
 
-- *#link("./components/gateway.md")[rio-gateway]* --- SSH server, Nix protocol
+- *#link("./spec/components/gateway.typ")[rio-gateway]* --- SSH server, Nix protocol
   frontend
-- *#link("./components/scheduler.md")[rio-scheduler]* --- DAG-aware build
+- *#link("./spec/components/scheduler.typ")[rio-scheduler]* --- DAG-aware build
   scheduler
-- *#link("./components/store.md")[rio-store]* --- Chunked CAS
-- *#link("./components/builder.md")[rio-builder]* --- Build executor with FUSE
+- *#link("./spec/components/store.typ")[rio-store]* --- Chunked CAS
+- *#link("./spec/components/builder.typ")[rio-builder]* --- Build executor with FUSE
   store
-- *#link("./components/controller.md")[rio-controller]* --- Kubernetes operator
-- *#link("./components/proto.md")[rio-proto]* --- gRPC service definitions
+- *#link("./spec/components/controller.typ")[rio-controller]* --- Kubernetes operator
+- *#link("./spec/components/proto.typ")[rio-proto]* --- gRPC service definitions
 - *rio-nix* --- Nix protocol implementation library (wire primitives, ATerm,
   NAR, store paths)
 - *rio-common* --- shared utilities (limits, observability init)
-- *#link("./components/dashboard.md")[rio-dashboard]* --- Web dashboard (Phase 5)
+- *#link("./spec/components/dashboard.typ")[rio-dashboard]* --- Web dashboard (Phase 5)
 
 #figure(
   caption: [Component topology. Gateway terminates ssh-ng and fans out to
@@ -194,12 +194,12 @@ builders or other components --- it watches CRDs and reconciles desired state.
   insert. The `rio_scheduler_ca_cutoff_saves_total` metric is the direct
   efficacy signal. See `r[sched.ca.cutoff-compare]`,
   `r[sched.ca.cutoff-propagate+2]`, `r[sched.ca.resolve]` in the
-  #link("./components/scheduler.md")[scheduler spec].
+  #link("./spec/components/scheduler.typ")[scheduler spec].
 ]
 
-See #link("./components/gateway.md")[rio-gateway] for protocol opcode details,
-#link("./components/scheduler.md")[rio-scheduler] for the scheduling algorithm,
-and #link("./components/store.md")[rio-store] for the chunked CAS.
+See #link("./spec/components/gateway.typ")[rio-gateway] for protocol opcode details,
+#link("./spec/components/scheduler.typ")[rio-scheduler] for the scheduling algorithm,
+and #link("./spec/components/store.typ")[rio-store] for the chunked CAS.
 
 // TODO(typst-migration): convert to chronos sequence diagram
 ```mermaid

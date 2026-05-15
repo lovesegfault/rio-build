@@ -40,7 +40,7 @@
 //!
 //! and commit `rio-proto/proto/<name>.proto.fields` alongside.
 //!
-//! See `docs/src/crate-structure.md` §rio-proto for the rule this guards.
+//! See `docs/spec/system/crate-structure.typ` §rio-proto for the rule this guards.
 
 mod common;
 use common::extract_fields;

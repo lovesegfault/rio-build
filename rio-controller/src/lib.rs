@@ -89,7 +89,7 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
 /// Register `# HELP` descriptions for all controller metrics.
 ///
 /// Call from `main()` immediately after `init_metrics()`. Descriptions
-/// sourced from docs/src/observability.md (the Controller Metrics table).
+/// sourced from docs/spec/system/observability.typ (the Controller Metrics table).
 /// See rio_gateway::describe_metrics for rationale.
 ///
 /// Hoisted from main.rs so the `tests/metrics_registered.rs` integration

@@ -72,7 +72,7 @@ resource "aws_iam_policy" "karpenter_node_primary_ipv6" {
 # capacity-type pin is a hard requirement. The controller ICE-masks the
 # cell, every cold-start fallback cell is spot, and builds stall — see
 # `RioNodeclaimPoolAllCellsIceMasked` and
-# docs/src/runbooks/sla-model.md#rionodeclaimpool-icemaskedhigh.
+# docs/ops/sla-model.typ#rionodeclaimpool-icemaskedhigh.
 #
 # Pre-create under apply-time credentials. NOT modeled as
 # `aws_iam_service_linked_role` with a data-source `count` guard — that

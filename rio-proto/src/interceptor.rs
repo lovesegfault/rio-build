@@ -6,7 +6,7 @@
 //! named for what they carry: this module never touches identity; the
 //! auth interceptor never touches spans.
 //!
-//! Per `docs/src/observability.md:164-166`: trace context is propagated via
+//! Per `docs/spec/system/observability.typ:164-166`: trace context is propagated via
 //! gRPC metadata using the W3C `traceparent` header. This module provides:
 //!
 //! - [`inject_current`]: copy the current span's trace context into a

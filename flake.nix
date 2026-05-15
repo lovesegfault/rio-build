@@ -1309,7 +1309,7 @@
           }
           # Container images: docker-{gateway,scheduler,store,worker}
           # plus a linkFarm aggregate at `.#dockerImages` (milestone
-          # target per docs/src/phases/phase2b.md:46).
+          # target per phase-2b design).
           // {
             docker-gateway = dockerImages.gateway;
             docker-scheduler = dockerImages.scheduler;

@@ -1136,7 +1136,7 @@ poolDefaults:
   # emptyDir sizeLimit. Single-sourced through controller.toml
   # `[nodeclaim_pool].fuse_cache_bytes` — NOT the per-Pool CRD spec
   # (CEL-rejected for BOTH kinds since r35; see
-  # docs/src/components/controller.md). Controller fallback when unset
+  # docs/spec/components/controller.typ). Controller fallback when unset
   # is 8Gi (`BUILDER_FUSE_CACHE_BYTES`) — the safe minimum so non-helm
   # Pools schedule on small-disk nodes; prod overrides UP here. Raising
   # this grows EVERY worker pod's ephemeral-storage request — check

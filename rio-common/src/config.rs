@@ -2,7 +2,7 @@
 //!
 //! Precedence (highest wins): CLI > env > TOML > compiled defaults.
 //! Env vars use `RIO_` prefix with `__` for nesting (`RIO_STORE__S3_BUCKET`
-//! sets `store.s3_bucket`). Per `docs/src/configuration.md:3-5`.
+//! sets `store.s3_bucket`). Per `docs/ref/configuration.typ:3-5`.
 //!
 //! # How binaries wire this up
 //!

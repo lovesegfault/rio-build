@@ -1985,7 +1985,7 @@ mod status_snapshot {
                (1) rio-test-support/golden/derivation_statuses.json\n\
                (2) rio-dashboard/src/lib/graphLayout.ts — STATUS_CLASS + SORT_RANK + TERMINAL\n\
                (3) rio-dashboard/src/lib/__tests__/graphLayout.test.ts — intended-set asserts\n\
-               (4) docs/src/components/scheduler.md — PG CHECK constraint list\n\
+               (4) docs/spec/components/scheduler.typ — PG CHECK constraint list\n\
                (5) this const: DerivationStatus::ALL (and the exhaustive match below)\n\
              ── emitted ──\n{json}\n── golden ──\n{golden}"
         );

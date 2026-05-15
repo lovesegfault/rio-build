@@ -255,7 +255,7 @@ pub const M_024: () = ();
 /// first so P0451's `cargo xtask regen sqlx` sees the new column
 /// names instead of failing on column-not-found.
 ///
-/// [ADR-019]: ../../../docs/src/decisions/019-builder-fetcher-split.md
+/// [ADR-019]: ../../../docs/spec/components/fetcher.typ
 pub const M_025: () = ();
 
 /// `migrations/026_tenant_upstreams.sql`

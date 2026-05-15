@@ -32,7 +32,7 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[];
 /// Call from `main()` immediately after `init_metrics()`. Without this,
 /// `/metrics` serves bare names with no `# HELP` lines — Grafana UIs and
 /// `promtool check metrics` have nothing to show. Descriptions sourced
-/// from docs/src/observability.md (the Gateway Metrics table).
+/// from docs/spec/system/observability.typ (the Gateway Metrics table).
 ///
 /// `metrics::describe_*!` are fire-and-forget: they register metadata with
 /// whatever recorder is installed. Safe to call before or after the metric

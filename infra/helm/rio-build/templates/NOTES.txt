@@ -37,7 +37,7 @@ Verify on a builder node:
 
 Profile updates: change nix/nixos-node/seccomp/rio-*.json → rebuild AMI
 (`cargo xtask k8s -p eks up --ami`) → Karpenter Drift rolls nodes on the
-new amiSelectorTerms tag. See docs/src/security.md
+new amiSelectorTerms tag. See docs/spec/system/security.typ
 r[worker.seccomp.localhost-profile].
 {{- end }}
 

@@ -107,7 +107,7 @@ nix-fast-build --flake .#checks.x86_64-linux --remote root@<builder>
   run treefmt automatically)
 - *Dependencies* --- dual-licensed under MIT OR Apache-2.0. Do not introduce
   GPL-3.0 dependencies into any crate (see
-  #link("./decisions.md")[Architecture Decision \#8])
+  #link("./spec/components/proto.typ")[proto §Rationale])
 
 = Commit Messages
 
@@ -140,7 +140,7 @@ the scope (use the broader scope or split into multiple commits).
 The workspace is split into 13 crates (`rio-common`, `rio-nix`, `rio-proto`,
 `rio-crds`, `rio-gateway`, `rio-scheduler`, `rio-store`, `rio-builder`,
 `rio-controller`, `rio-cli`, `rio-test-support`, `xtask`, `workspace-hack`).
-See #link("./crate-structure.md")[Crate Structure] for the responsibilities
+See #link("./spec/system/crate-structure.typ")[Crate Structure] for the responsibilities
 and module layout of each.
 
 = Where to Start
@@ -149,7 +149,7 @@ Good first contributions:
 
 - *Spec gaps* --- `tracey query uncovered` lists spec requirements with no
   implementation yet
-- *Fuzzing targets* described in #link("./verification.md")[verification.md]
+- *Fuzzing targets* described in #link("./spec/system/verification.typ")[Verification]
   --- wire format parsers are security-critical
 - *Golden tests* --- add live-daemon conformance scenarios for new opcodes
   (see `rio-gateway/tests/golden/`)
@@ -160,13 +160,13 @@ Good first contributions:
 
 Before contributing code, read these docs in order:
 
-+ #link("./introduction.md")[Introduction] --- what rio-build is and isn't
-+ #link("./architecture.md")[System Architecture] --- component diagram and
++ #link("./intro.typ")[Introduction] --- what rio-build is and isn't
++ #link("./architecture.typ")[System Architecture] --- component diagram and
   data flow
-+ #link("./data-flows.md")[Data Flows] --- step-by-step protocol sequences
++ #link("./architecture.typ")[Architecture §Data Flows] --- step-by-step protocol sequences
 + The component doc for the area you're working on (e.g.,
-  #link("./components/gateway.md")[gateway],
-  #link("./components/scheduler.md")[scheduler])
+  #link("./spec/components/gateway.typ")[gateway],
+  #link("./spec/components/scheduler.typ")[scheduler])
 
 = License
 
