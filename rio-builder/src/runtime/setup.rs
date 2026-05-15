@@ -17,7 +17,7 @@ use super::prefetch::PrefetchDeps;
 use super::slot::BuildSlot;
 use super::{BuildSpawnContext, BuilderRuntime, relay_loop};
 use crate::config::{Config, detect_system};
-use crate::fuse::StoreClients;
+use crate::store_fetch::StoreClients;
 
 pub(super) type WorkerClient = rio_proto::ExecutorServiceClient<tonic::transport::Channel>;
 

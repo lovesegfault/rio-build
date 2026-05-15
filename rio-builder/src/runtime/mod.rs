@@ -90,7 +90,7 @@ pub struct BuildSpawnContext {
     /// `execute_build` (drv fetch, upload, query); the full bundle is
     /// held by `NixStoreFs` (set at FUSE mount) so the JIT `lookup`
     /// callback can reach it.
-    pub store_clients: crate::fuse::StoreClients,
+    pub store_clients: crate::store_fetch::StoreClients,
     pub executor_id: String,
     pub fuse_mount_point: PathBuf,
     pub overlay_base_dir: PathBuf,
@@ -2622,7 +2622,7 @@ mod tests {
         let ch = rio_proto::client::connect_channel(&addr.to_string())
             .await
             .unwrap();
-        let clients = crate::fuse::StoreClients::from_channel(ch);
+        let clients = crate::store_fetch::StoreClients::from_channel(ch);
 
         // Seed both paths so a fetch (if attempted) would succeed.
         let known = test_store_basename("i212-known");
@@ -2687,7 +2687,7 @@ mod tests {
         let ch = rio_proto::client::connect_channel(&addr.to_string())
             .await
             .unwrap();
-        let clients = crate::fuse::StoreClients::from_channel(ch);
+        let clients = crate::store_fetch::StoreClients::from_channel(ch);
 
         let a = test_store_basename("i212-warm-a");
         let b = test_store_basename("i212-warm-b");
@@ -2740,7 +2740,7 @@ mod tests {
         let ch = rio_proto::client::connect_channel(&addr.to_string())
             .await
             .unwrap();
-        let clients = crate::fuse::StoreClients::from_channel(ch);
+        let clients = crate::store_fetch::StoreClients::from_channel(ch);
 
         let small = test_store_basename("i212-cap-small");
         let large = test_store_basename("i212-cap-large");
