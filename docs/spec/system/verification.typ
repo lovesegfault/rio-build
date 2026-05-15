@@ -1,0 +1,342 @@
+#import "/lib/rio.typ": *
+#show: rio.with(domains: ("ts",))
+
+= Verification
+
+== Protocol Conformance
+
+- Live-daemon golden tests: each test starts an isolated nix-daemon, exchanges
+  with it, and compares the response field-by-field against rio-build at the
+  byte level
+- No stored fixtures --- tests always run against the current nix-daemon
+  version, eliminating fixture staleness
+- STDERR activity stripping handles daemon messages
+  (`START_ACTIVITY`/`STOP_ACTIVITY`) that rio-build omits
+- Fields that legitimately differ (`version_string`, `trusted`) are skipped via
+  a configurable skip list
+
+=== Multi-Nix compatibility matrix
+
+Per-push CI runs conformance tests against the single Nix version pinned in
+`flake.nix` (`inputs.nix`). The *weekly* tier runs the full matrix via
+`.#golden-matrix` --- four daemon variants:
+
+#table(
+  columns: (auto, auto, 1fr),
+  align: (left, left, left),
+  table.header([Variant], [Source], [Notes]),
+  [`nix-pinned`], [`inputs.nix` (2.34.x)], [Same as per-push CI --- sanity row],
+
+  [`nix-stable`],
+  [`pkgs.nixVersions.nix_2_28`],
+  [Oldest CppNix nixpkgs still ships],
+
+  [`nix-unstable`], [`pkgs.nixVersions.git`], [Surfaces breakage early],
+  [`lix`],
+  [`pkgs.lix`],
+  [Fork --- diverges on feature set, version string, opcode additions;
+    policy-frozen at protocol 1.35 = `MIN_CLIENT_VERSION` floor coverage],
+)
+
+All four daemons come from the pinned nixpkgs (no separate flake inputs), so
+the weekly cron tests the locked nixpkgs; bump nixpkgs separately to test newer
+versions.
+
+Test harness reads `RIO_GOLDEN_DAEMON_BIN` (absolute daemon path) and
+`RIO_GOLDEN_DAEMON_VARIANT` (skip-list key). Per-variant skips live in
+#src("rio-gateway/tests/golden/daemon.rs::VARIANT_SKIP") --- each row is
+`(variant, test_name, reason)`. The `reason` field is load-bearing: it
+documents WHY so the skip can be removed once upstream converges.
+
+Lix is policy-frozen at protocol 1.35 (rio's `MIN_CLIENT_VERSION`), so a Lix
+client negotiates to 1.35 and rio omits the 1.37+
+`BuildResult.cpu_user`/`cpu_system` fields. The Lix-as-client direction is
+exercised end-to-end in checks by `vm-protocol-warm-lix-standalone` (same
+scenario as `vm-protocol-warm-standalone`, client `nix.package` set to
+`pkgs.lix`). Known golden-conformance divergences (Lix-as-reference-daemon vs
+rio-as-daemon):
+- Version string format (`"Lix N.N.N"` vs `"nix (Nix) N.N.N"`) --- handled by
+  the existing `SKIP_FIELDS` mechanism at field level
+- Daemon feature set advertised during handshake ---
+  `test_golden_live_handshake` skipped for Lix until the comparator tolerates
+  feature-set supersets
+
+`nix build .#golden-matrix` produces a linkfarm keyed by variant; `ls result/`
+shows one dir per daemon. Cold-cache build time \~60--90min (three full Nix
+source-tree builds); subsequent warm runs are minutes.
+
+== Fuzzing
+
+Security-critical protocol parsers must be fuzz-tested. Targets live in
+per-crate fuzz workspaces (#src("rio-nix/fuzz/"), #src("rio-store/fuzz/")):
+
+- `wire_primitives` --- u64, padded strings, framed streams, empty strings,
+  maximum sizes
+- `opcode_parsing` --- each opcode's payload parsing (wopAddToStoreNar,
+  wopBuildDerivation, etc.)
+- `nar_parsing` --- NAR streaming reader with malformed input
+- `narinfo_parsing` --- narinfo text format parser
+- `derivation_parsing` --- `.drv` ATerm format parser (including
+  `__structuredAttrs` with `__json`)
+- `derived_path_parsing` --- DerivedPath wire format (`!`-separated
+  `drvPath!output` strings)
+- `build_result_parsing` --- BuildResult wire format (status, error message,
+  timing, built outputs)
+- `manifest_deserialize` (rio-store) --- chunk manifest deserialization
+- Run continuously via `cargo-fuzz` / `libFuzzer`:
+  - *CI tier:* 2min/target run with seed corpus (`nix flake check` includes
+    `checks.fuzz-*`)
+  - *Deep runs:* `cd <crate>/fuzz && cargo fuzz run <target>` in the dev shell
+    --- libFuzzer accumulates corpus in `./corpus/`
+  - Corpus seeded from `rio-nix/fuzz/corpus/<target>/` and
+    `rio-store/fuzz/corpus/<target>/` (committed seeds prefixed `seed-`; NAR
+    seeds regenerable via `gen-nar-corpus.sh`)
+
+== Unit Tests
+
+- Wire format: roundtrip serialization for all protocol types (property tests
+  via `proptest`)
+- DAG scheduling: known graphs → expected critical paths and executor
+  assignments
+- Scheduler invariants (proptest): for any DAG and completion sequence, no
+  derivation is dispatched before all dependencies complete
+- DAG merging: merging two DAGs produces correct dedup and shared-node priority
+  inheritance
+- FastCDC chunking: deterministic chunking, dedup verification, chunk/reassembly
+  roundtrip
+- CAS: put/get/gc correctness, content-indexed lookup, PutPath idempotency
+- CA early cutoff: propagation through multi-level DAGs, mixed CA/input-addressed
+  DAGs
+- Narinfo: parse/generate roundtrip against known-good narinfo files
+- Store path computation: verify against known nix store paths
+- FUSE store: cache hit/miss behavior, LRU eviction, concurrent access
+
+== Functional Tests
+
+Gateway wire protocol against *real `rio-store`* (`StoreServiceImpl` + ephemeral
+PostgreSQL) --- the `RioStack` fixture at #src("rio-gateway/tests/functional/").
+No k8s, no VM, no KVM; runs in `cargo nextest` alongside unit tests
+(sub-second). Catches bugs `MockStore` hides:
+
+- `wopAddToStoreNar` → `wopQueryPathInfo` with real hash verification
+  (`MockStore` accepts any hash; real store runs `validate_nar_digest`)
+- `wopAddMultipleToStore` → `wopNarFromPath` through real FastCDC chunk + PG
+  manifest + reassembly (`MockStore` is `HashMap` insert/get --- byte-identical
+  by construction, not by correctness)
+- Reference chains: first tests to send non-empty `references` on the wire
+  (`wire_opcodes/` always sends `NO_STRINGS`)
+
+Scenarios ported from Lix
+#link("https://git.lix.systems/lix-project/lix/src/branch/main/tests/functional2")[`functionaltests2`].
+Port is *scenario* (what's being proved), not *invocation shape* (Lix's harness
+is nix-CLI, rio's is wire-protocol). White-box assertions query PG directly
+(`narinfo`, `manifests`) to prove the graph is real --- not an in-memory echo.
+
+*Coverage:* tranche 1 is store-roundtrip (put/get/query). Tranche 2 (CA builds,
+refscan, trustless remote) needs real scheduler; tranche 4 (ssh-ng transport)
+needs russh fixture.
+
+== Integration Tests
+
+- `nix build --store ssh-ng://rio nixpkgs#hello` --- minimal end-to-end
+- `nix build --builders 'ssh-ng://rio x86_64-linux'` --- build hook path
+- `nix flake check --store ssh-ng://rio` --- checks output
+- Multi-derivation chain (A → B → C) distributed across executors
+- Cache hit path: second build of same derivation returns instantly
+- Chunk dedup: build two similar packages, verify shared chunks
+- Executor failure mid-build → rescheduled to another executor
+- CA early cutoff: change input that produces same output → downstream skipped
+- Binary cache: configure rio-store as substituter, `nix build` from cache
+- Binary cache `/nix-cache-info` endpoint returns valid response
+- Gateway handles concurrent client sessions
+- Graceful shutdown: in-flight builds complete or are cleanly requeued
+- Scheduler state recovery: kill scheduler mid-build, restart, verify builds
+  resume
+- FUSE store: build with cold cache, verify paths fetched from rio-store on
+  demand
+
+== Security Integration Tests
+
+- `PutPath` with invalid assignment token (wrong derivation hash) → rejected
+  with `PERMISSION_DENIED`
+- `PutPath` with expired assignment token → rejected with `PERMISSION_DENIED`
+- `PutPath` for output path not in assignment token's `expected_output_paths` →
+  rejected
+- Cross-tenant data isolation: tenant A cannot query tenant B's builds via
+  `AdminService`
+- Cross-tenant data isolation: tenant A's `wopQueryPathInfo` returns 404 for
+  tenant B's paths (when per-tenant scoping is enabled)
+- DAG size exceeding `max_dag_size` → rejected at the scheduler (not gateway
+  --- the gateway forwards derivations; the scheduler enforces DAG-level limits)
+
+#info(title: [Implemented])[
+  Security VM test fragments cover JWT validation, mTLS client-cert rejection,
+  binary-cache auth (#src("nix/tests/scenarios/security.nix")); FOD proxy
+  domain allowlist (#src("nix/tests/scenarios/fod-proxy.nix")); `__noChroot`
+  gateway pre-check (#rref("gw.reject.nochroot")).
+]
+
+== Chaos Testing
+
+- S3 timeout during PutPath → verify orphan scanner reclaims stale manifests
+- Executor disconnect during build → verify reassignment to another executor
+- PostgreSQL unavailability → verify readiness probes gate traffic; verify
+  recovery
+- Scheduler crash during active builds → verify state recovery algorithm
+- Network partition between executor and scheduler → verify completion
+  buffering and retry
+
+#info(title: [Implemented])[
+  toxiproxy fault-injection chaos harness at
+  #src("nix/tests/scenarios/chaos.nix").
+]
+
+== Mutation Testing
+
+`cargo-mutants` mutates source --- swap `<` for `<=`, delete a statement,
+replace a return value with `Default::default()` --- reruns the test suite, and
+flags mutations that *survive* (the tests still pass). A surviving mutant is
+code the tests don't actually constrain. tracey answers "is this spec rule
+covered"; mutants answers "does the test that covers it actually catch bugs."
+Complementary signals.
+
+*Weekly tier, not per-push.* Mutation testing is O(mutations × test-suite-time);
+for the scoped target set (\~320 mutations, scheduler state machine / wire
+primitives / ATerm parser / HMAC / manifest) it's hours per run. The
+#src(".github/workflows/weekly.yml") `mutants` job builds `.#mutants` and
+surfaces caught/missed counts in the job summary. *Missed-count is a trend
+metric, not a gate* --- the job does not fail on nonzero. Diff week-over-week;
+an increase means a recent change weakened a test or introduced untested code.
+
+*Scoping* lives in #src(".config/mutants.toml"): `examine_globs` lists
+high-signal files where a surviving mutant is a genuine gap (not "you didn't
+test your tracing span"). `exclude_re` filters out tracing/metric calls ---
+those are already covered by the per-crate `metrics_registered` test.
+`cap_lints = true` prevents the `--deny warnings` policy from marking mutations
+unviable before a test can kill them.
+
+== VM Integration Tests
+
+NixOS-VM tests exercise full-system flows with real kernel features (FUSE,
+cgroup v2, overlayfs, k3s). Each test spins up 2--5 QEMU VMs via `nixosTest`.
+Run via `nix-fast-build --flake .#checks.x86_64-linux` (needs KVM). Tests are
+organized by scenario (#src("nix/tests/default.nix") is the source of truth):
+`vm-protocol-*`, `vm-scheduling-*`, `vm-lifecycle-*`, `vm-le-*`
+(leader-election), `vm-security-*`, `vm-dashboard-*`, `vm-observability-*`,
+`vm-chaos-*`, `vm-substitute-*`, `vm-ca-cutoff-*`, `vm-nixos-node`. Suffix
+`-standalone` runs against bare-process services in dedicated VMs; suffix `-k3s`
+boots a single-VM k3s cluster.
+
+== Test Environment
+
+#table(
+  columns: (auto, 1fr),
+  align: (left, left),
+  table.header([Dependency], [Purpose]),
+  [Nix daemon],
+  [Live-daemon golden conformance tests (auto-started per test via
+    `fresh_daemon_socket()`)],
+
+  [PostgreSQL],
+  [Build state storage (ephemeral `initdb` per test via
+    `rio-test-support::TestDb`; `PG_BIN` set by dev shell)],
+
+  [MinIO],
+  [S3 backend tests (VM tests use `services.minio`; unit tests use filesystem
+    backend)],
+
+  [k3s],
+  [Kubernetes integration tests (bootstrapped in `vm-*-k3s` VMs; no external
+    cluster needed)],
+)
+
+#r("ts.pg.server")[
+  `PgServer` is the process-global ephemeral postgres handle. `PgServer::get()`
+  lazily bootstraps via `initdb` + spawn `postgres` (Unix-socket-only,
+  `fsync=off`, `max_connections=500`) on first call and is also the public entry
+  point `xtask regen sqlx` reuses. `gc_stale_dirs` runs before every bootstrap
+  to reclaim `/tmp/rio-pg-*` dirs left by dead test processes (the `PG` static
+  never drops, so `TempDir::drop` never fires); a dir is stale iff its
+  `owner.pid` PID is dead --- missing/unparseable `owner.pid` is treated as a
+  live concurrent bootstrap and left alone. `TestDb::new_empty` creates the
+  isolated DB without running migrations (for tests exercising the migrator
+  itself); `TestDb::new` is `new_empty` + `migrator.run`.
+]
+
+#r("ts.pg.db-name")[
+  `TestDb` database names are `rio_test_{nanos}_{counter}` --- nanos alone is
+  not unique under raw-libtest's thread-per-test (two threads can hit the same
+  nanosecond), so a process-global atomic counter is appended.
+]
+
+#r("ts.wire.macros")[
+  `wire_bytes!` builds a `Vec<u8>` from `kind: value` pairs (`u64`, `string`,
+  `strings`, `bool`, `bytes`, `framed`, `raw`); `wire_send!` writes the same
+  primitives directly to a stream and flushes. Both expand to
+  `wire::write_<kind>(..)?` calls, so callers must be in async context with a
+  `Result` return.
+]
+
+#r("ts.wire.helpers")[
+  `do_handshake` sends the client side of the worker-protocol handshake against
+  a `DuplexStream` (not `client_handshake` --- that's the production driver in
+  `rio-nix::protocol::client`). `read_path_info` reads the 8-field
+  `wopQueryPathInfo` body so callsites don't repeat the discard sequence.
+  `drain_stderr_until_last` panics on `STDERR_ERROR`;
+  `drain_stderr_expecting_error` is the inverse for error-path tests.
+]
+
+#r("ts.metrics.grep")[
+  `grep_emitted_names(manifest_dir)` greps the crate's `src/` for
+  `metrics::{counter,gauge,histogram}!("...")` literals;
+  `grep_spec_names(obs_md, prefix)` greps #src("docs/src/observability.md")
+  table rows. Both run at *test time* from `metrics_suite!` (no per-crate
+  build.rs). The grep operates on *source text*, not on a Prometheus scrape ---
+  it catches an undescribed metric without running the binary.
+]
+
+== Benchmarks
+
+#table(
+  columns: (auto, 1fr, auto),
+  align: (left, left, left),
+  table.header([Metric], [Description], [Target]),
+  [*Scheduling latency*],
+  [Time from `nix build` invocation to first derivation starting on an
+    executor],
+  [p99 < 5s],
+
+  [*Cache hit latency*],
+  [End-to-end time for a fully cached 1MB output],
+  [< 1s],
+
+  [*Throughput*],
+  [Derivations/second at 1, 5, 10, 20 executors],
+  [Document actual],
+
+  [*Cache hit rate*],
+  [Fraction of derivations served from store vs. built],
+  [Document actual],
+
+  [*Dedup ratio*],
+  [Chunk storage savings compared to full NAR storage],
+  [Document actual],
+
+  [*Transfer volume*],
+  [Bytes moved between store and executors per build],
+  [Document actual],
+
+  [*Critical path accuracy*],
+  [Predicted vs. actual build completion time],
+  [Within 2x],
+
+  [*Comparison baseline*],
+  [`nix build` with standard remote builders on same hardware],
+  [Document speedup],
+)
+
+*Benchmark workloads:*
+- Small: `nixpkgs#hello` (few derivations, fast builds)
+- Medium: `nixpkgs#firefox` (large DAG, mix of fast and slow)
+- Large: NixOS system closure (thousands of derivations)
+- Incremental: rebuild after single-file change (tests cache hit + locality)
