@@ -327,8 +327,9 @@ The mount stack's hot path is page cache + overlayfs; kernel-side latency is obs
 
 r[infra.node.kernel-fuse-passthrough]
 
-- **Kernel ≥ 6.9** — `FUSE_PASSTHROUGH` ([`7dc4e97a4f9a`](https://git.kernel.org/linus/7dc4e97a4f9a)).
-- `CONFIG_OVERLAY_FS=y`, `CONFIG_FUSE_FS=y`, `CONFIG_FUSE_PASSTHROUGH=y`. All stock-on; the NixOS node module sets `=y` over `=m` and asserts the kernel version at boot.
+- **Kernel ≥ 6.9** — `FUSE_PASSTHROUGH` ([`7dc4e97a4f9a`](https://git.kernel.org/linus/7dc4e97a4f9a)). `nix/nixos-node/kernel.nix` asserts at module eval.
+- **Stock kernel, no rebuild.** `CONFIG_FUSE_FS=m`, `CONFIG_OVERLAY_FS=m` from nixpkgs `autoModules = true`; `CONFIG_FUSE_PASSTHROUGH=y` is the upstream Kconfig default (`bool default y depends on FUSE_FS`). The §3 EROFS+cachefiles `_ONDEMAND` symbols were the only off-by-default config and went with §3 — the node kernel is a binary-cache hit. `nix/nixos-node/kernel.nix` MUST be a standalone module (no `pins`/`specialArgs` deps) importable by `nix/tests/fixtures/` so test-VM kernels are the AMI's exact shape.
+- `boot.kernelModules = ["fuse" "overlay"]` — loaded by `systemd-modules-load.service` in `basic.target`, so `/dev/fuse` exists before `rio-mountd` starts and the overlay fs type is registered before any pod mounts. Functionally equivalent to `=y`; saves the ~40 min kernel rebuild a `structuredExtraConfig` override would cost on every nixpkgs bump.
 - `r[builder.fs.passthrough-stack-depth]`: the node-SSD backing cache (`/var/rio/cache/`) must be a non-stacking filesystem (ext4/xfs hostPath). FUSE with `max_stack_depth=1` under overlay reaches `FILESYSTEM_MAX_STACK_DEPTH=2`; a stacking fs as backing would exceed it.
 - `/dev/fuse` reachable by `rio-mountd` (host device); **not** mounted into builder pods.
 
