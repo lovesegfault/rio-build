@@ -1,9 +1,13 @@
 //! Regenerate `docs/gen/*.json` — validated cross-reference data for the
 //! typst spec build (`docs/lib/refs.typ` asserts membership against these).
 
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use regex::Regex;
 use serde_json::json;
 
@@ -26,7 +30,10 @@ pub async fn run() -> Result<()> {
     write(&out, "alerts.json", &alerts()?)?;
     write(&out, "errors.json", &errors()?)?;
     write(&out, "config.json", &config()?)?;
-    println!("wrote docs/gen/{{metrics,alerts,errors,config}}.json");
+    write(&out, "workspace.json", &workspace()?)?;
+    write(&out, "consts.json", &consts()?)?;
+    write(&out, "helm-ns.json", &helm_ns()?)?;
+    println!("wrote docs/gen/{{metrics,alerts,errors,config,workspace,consts,helm-ns}}.json");
     Ok(())
 }
 
@@ -129,6 +136,85 @@ fn errors() -> Result<serde_json::Value> {
         k(a).cmp(&k(b))
     });
     Ok(json!({"variants": variants}))
+}
+
+fn workspace() -> Result<serde_json::Value> {
+    // Parse `[workspace] members = [...]` from root Cargo.toml. Regex,
+    // not `cargo metadata`: docsData runs the crate2nix-built xtask in
+    // a sandbox without cargo. workspace-hack is the hakari stub
+    // (zeroed in nix/crate2nix.nix); excluded so refs.crate-list()
+    // doesn't render it as a real crate in contributor docs.
+    let body = fs::read_to_string(repo_root().join("Cargo.toml"))?;
+    let block = Regex::new(r"(?s)members\s*=\s*\[(.*?)\]")?
+        .captures(&body)
+        .context("no [workspace] members")?[1]
+        .to_string();
+    let members: Vec<String> = Regex::new(r#""([^"]+)""#)?
+        .captures_iter(&block)
+        .map(|c| c[1].to_string())
+        .filter(|n| n != "workspace-hack")
+        .collect();
+    // xtask's own [dependencies] — for crate-structure.typ's autograph
+    // edge list. Restricted to workspace-internal rio-* deps.
+    let xtask_toml = fs::read_to_string(repo_root().join("xtask/Cargo.toml"))?;
+    let dep_block = Regex::new(r"(?ms)^\[dependencies\]\s*$(.*?)(?:^\[|\z)")?
+        .captures(&xtask_toml)
+        .map(|c| c[1].to_string())
+        .unwrap_or_default();
+    let xtask_deps: Vec<String> = Regex::new(r"(?m)^(rio-[\w-]+)\b")?
+        .captures_iter(&dep_block)
+        .map(|c| c[1].to_string())
+        .collect();
+    Ok(json!({"members": members, "xtask_deps": xtask_deps}))
+}
+
+/// Doc-referenced rust consts. Curated allowlist, NOT a full scrape:
+/// each entry is a const the spec book cites by value at ≥2 prose
+/// sites, so per §Nth-strike it must derive. xtask fails if the regex
+/// finds no match at the named file (catches the const moving/rename).
+fn consts() -> Result<serde_json::Value> {
+    const TABLE: &[(&str, &str)] = &[
+        ("MAX_RECONNECT", "rio-gateway/src/handler/build.rs"),
+        // Add more as docs cite them. Threshold: cited at ≥2 prose
+        // sites, value is a plain integer literal.
+    ];
+    let mut out = serde_json::Map::new();
+    for (name, path) in TABLE {
+        let body = fs::read_to_string(repo_root().join(path))?;
+        let re = Regex::new(&format!(r"const\s+{name}\s*:\s*\w+\s*=\s*(\d+)"))?;
+        let v: u64 = re
+            .captures(&body)
+            .with_context(|| format!("const {name} not found at {path}"))?[1]
+            .parse()?;
+        out.insert((*name).into(), json!(v));
+    }
+    Ok(json!(out))
+}
+
+fn helm_ns() -> Result<serde_json::Value> {
+    // namespaces: block from helm values.yaml — keyed by role
+    // (system/store/builders/fetchers); re-key by .name so typst
+    // prose says #(refs.psa)("rio-system").
+    #[derive(serde::Deserialize)]
+    struct Ns {
+        name: String,
+        psa: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Values {
+        namespaces: BTreeMap<String, serde_yml::Value>,
+    }
+    let body = fs::read_to_string(repo_root().join("infra/helm/rio-build/values.yaml"))?;
+    let v: Values = serde_yml::from_str(&body)?;
+    let mut out = serde_json::Map::new();
+    for (role, raw) in v.namespaces {
+        if role == "create" {
+            continue; // `create: true` flag, not a namespace entry
+        }
+        let ns: Ns = serde_yml::from_value(raw)?;
+        out.insert(ns.name, json!({"psa": ns.psa, "role": role}));
+    }
+    Ok(json!(out))
 }
 
 fn config() -> Result<serde_json::Value> {

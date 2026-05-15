@@ -1,0 +1,29 @@
+{
+  "members": [
+    "rio-auth",
+    "rio-cli",
+    "rio-common",
+    "rio-controller",
+    "rio-gateway",
+    "rio-lease",
+    "rio-nix",
+    "rio-proto",
+    "rio-scheduler",
+    "rio-store",
+    "rio-test-support",
+    "rio-builder",
+    "rio-crds",
+    "xtask"
+  ],
+  "xtask_deps": [
+    "rio-test-support",
+    "rio-common",
+    "rio-crds",
+    "rio-scheduler",
+    "rio-proto",
+    "rio-gateway",
+    "rio-builder",
+    "rio-controller",
+    "rio-store"
+  ]
+}

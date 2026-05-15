@@ -1,0 +1,18 @@
+{
+  "rio-builders": {
+    "psa": "privileged",
+    "role": "builders"
+  },
+  "rio-fetchers": {
+    "psa": "privileged",
+    "role": "fetchers"
+  },
+  "rio-store": {
+    "psa": "restricted",
+    "role": "store"
+  },
+  "rio-system": {
+    "psa": "restricted",
+    "role": "system"
+  }
+}

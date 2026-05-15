@@ -117,16 +117,17 @@ let
     );
   };
 
-  # Generated reference data (metric/alert/error/config tables).
+  # Generated reference data (metric/alert/error/config tables, plus
+  # workspace/consts/helm-ns for the lib/refs.typ validators).
   # `xtask regen docs-data` scans rio-*/src/**/*.rs for describe_*! and
   # `pub enum *Error` plus prometheusrule.yaml for alert names. The
   # crate2nix-built xtask binary's compile-time CARGO_MANIFEST_DIR is a
   # store path, so RIO_REPO_ROOT points it at the runCommand src tree.
   #
   # Fileset is the minimal scan surface — rio-*/src/*.rs (read_dir scan
-  # needs the rio-* dir level to exist, fileFilter at the crate level
-  # gives that) + the prometheusrule template. NOT the full workspaceSrc:
-  # editing a Cargo.toml or a test file shouldn't rebuild the PDF.
+  # needs the rio-* dir level to exist) + the four non-.rs files the
+  # emitters read (prometheusrule.yaml, values.yaml, root + xtask
+  # Cargo.toml). Other Cargo.tomls / test files still don't rebuild.
   docsData =
     pkgs.runCommand "rio-docs-data"
       {
@@ -139,6 +140,9 @@ let
           fileset = lib.fileset.unions [
             (lib.fileset.fileFilter (f: f.hasExt "rs") ../.)
             ../infra/helm/rio-build/templates/prometheusrule.yaml
+            ../infra/helm/rio-build/values.yaml # helm_ns()
+            ../Cargo.toml # workspace()
+            ../xtask/Cargo.toml # workspace() xtask_deps
           ];
         };
       }
@@ -152,6 +156,9 @@ let
         test "$(jq '.names|length' $out/metrics.json)" -gt 0
         test "$(jq '.names|length' $out/alerts.json)" -gt 0
         test "$(jq '.variants|length' $out/errors.json)" -gt 0
+        test "$(jq '.members|length' $out/workspace.json)" -gt 0
+        test "$(jq 'keys|length' $out/consts.json)" -gt 0
+        test "$(jq 'keys|length' $out/helm-ns.json)" -eq 4
       '';
 
   # Compile root: docs sources + generated data, fused into one tree
