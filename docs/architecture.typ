@@ -245,7 +245,7 @@ on the message arrows below.
   *Status:* CA cutoff is end-to-end: compare (completion-time output-hash check
   against the content index) + propagate (Skipped status + DAG cascade) +
   resolve (CA-on-CA placeholder rewrite at dispatch time) + realisation_deps
-  insert. The `rio_scheduler_ca_cutoff_saves_total` metric is the direct
+  insert. The #(refs.metric)("rio_scheduler_ca_cutoff_saves_total") metric is the direct
   efficacy signal. See `r[sched.ca.cutoff-compare]`,
   `r[sched.ca.cutoff-propagate+2]`, `r[sched.ca.resolve]` in the
   #cross-link("/spec/components/scheduler.typ")[scheduler spec].

@@ -5,7 +5,7 @@
 All errors in rio-build are classified into categories that determine retry
 policy, client-visible behavior, and operational response.
 
-Referenced by: #link("../components/scheduler.md")[rio-scheduler] (retry/poison
+Referenced by: #cross-link("/spec/components/scheduler.typ")[rio-scheduler] (retry/poison
 state machine)
 
 = Error Classification
@@ -202,7 +202,7 @@ infinite retry loops. In-memory poison tracking (`failed_builders` HashSet per
 derivation) is *live*. PostgreSQL-backed `failed_builders TEXT[]` persistence
 exists (migration 004); `poisoned_at TIMESTAMPTZ` persistence (migration 009
 Part B) means the 24h TTL survives scheduler restart. See
-#link("../components/scheduler.md")[`sched.poison.ttl-persist`] for details.
+#cross-link("/spec/components/scheduler.typ")[`sched.poison.ttl-persist`] for details.
 
 #table(
   columns: 3,
@@ -221,7 +221,7 @@ Poisoned derivations:
 - Are NOT silently dropped --- the client receives an explicit error
 - Expire after `poisonTTL` so transient infrastructure issues self-heal
 - Can be manually cleared via `AdminService.ClearPoison(derivation_hash)` ---
-  see #link("../components/scheduler.md")[`sched.admin.clear-poison`]
+  see #cross-link("/spec/components/scheduler.typ")[`sched.admin.clear-poison`]
 
 *Per-executor tracking:* If a derivation fails only on a specific executor
 (e.g., hardware issue), the scheduler tracks per-executor failure counts
@@ -248,7 +248,7 @@ separately. A derivation is only globally poisoned if it fails on
     (`STDERR_NEXT`, `STDERR_RESULT BuildLogLine`). The nix-daemon subprocess
     MAY also enforce it (forwarded via `client_set_options`); rio-side is the
     authoritative backstop. See
-    #link("../components/builder.md")[`executor.silence.timeout-kill`].],
+    #cross-link("/spec/components/builder.typ")[`executor.silence.timeout-kill`].],
   [*Implemented*],
 
   [Per-build overall timeout],
@@ -257,7 +257,7 @@ separately. A derivation is only globally poisoned if it fails on
     `submitted_at.elapsed() > BuildOptions.build_timeout`, scheduler cancels
     non-terminal derivations and transitions the build to `Failed` with
     error_summary "build_timeout Ns exceeded". Zero = no overall timeout. See
-    #link("../components/scheduler.md")[`sched.timeout.per-build`].],
+    #cross-link("/spec/components/scheduler.typ")[`sched.timeout.per-build`].],
   [*Implemented*],
 
   [Scheduler backstop timeout],

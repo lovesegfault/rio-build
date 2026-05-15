@@ -60,7 +60,7 @@ alerts that share the same `rio-cli sla` diagnostic surface.
 = Step 1: Identify the offending pname <step-1>
 
 #(refs.alert)("RioSlaPredictionDrift") is fleet-wide (labelled by `dim=wall|mem`, not by
-pname — `rio_scheduler_sla_prediction_ratio` is a histogram, so there is
+pname — #(refs.metric)("rio_scheduler_sla_prediction_ratio") is a histogram, so there is
 no per-pname series to `topk` over). Find candidate keys via the CLI:
 
 ```bash
@@ -270,7 +270,7 @@ pnames drift simultaneously, suspect hw drift (see
 
 == RioSla PriorDivergenceClamped <riosla-priordivergenceclamped>
 
-`rio_scheduler_sla_prior_divergence{param}` pinned at `0.5` or `2.0` for 10m.
+#(refs.metric)("rio_scheduler_sla_prior_divergence")`{param}` pinned at `0.5` or `2.0` for 10m.
 The fleet-median prior parameter has diverged from the operator-probe basis in
 `[sla].probe` — the fleet is building things shaped very differently from what
 the probe assumes. Not a per-pname issue: re-run the probe characterisation
@@ -279,13 +279,13 @@ defaults` shows the current probe shape.
 
 == RioSla HwCostStale <riosla-hwcoststale>
 
-`rio_scheduler_sla_hw_cost_stale_seconds > 1800` for 5m. The spot-price poller
+#(refs.metric)("rio_scheduler_sla_hw_cost_stale_seconds")` > 1800` for 5m. The spot-price poller
 hasn't refreshed in >30m (it ticks every 10m; auto-clamp to helm seed at 60m).
 Not a model-accuracy issue — cost ranking degrades, not sizing. Check
 scheduler leader-lease (`kubectl -n rio-system get lease rio-scheduler-leader`
 — the name is `helm:scheduler.leaseName`, not the Deployment name) and
 `ec2:DescribeSpotPriceHistory` IRSA permissions. Cross-reference
-`rio_scheduler_sla_hw_cost_fallback_total{reason}`.
+#(refs.metric)("rio_scheduler_sla_hw_cost_fallback_total")`{reason}`.
 
 == RioNodeclaimPool IceMaskedHigh <rionodeclaimpool-icemaskedhigh>
 
@@ -293,7 +293,7 @@ Two coupled alerts watch the same failure from opposite ends:
 
 - *#(refs.alert)("RioNodeclaimPoolIceMaskedHigh")* (cause-side): ≥3 `(hw_class, capacity)`
   cells reaping NodeClaims for `reason=ice|vanished`. The admissible set is
-  shrinking toward `rio_scheduler_sla_hw_ladder_exhausted_total`.
+  shrinking toward #(refs.metric)("rio_scheduler_sla_hw_ladder_exhausted_total").
 - *#(refs.alert)("RioNodeclaimPoolAllCellsIceMasked")* (consequence-side): cold-start
   SpawnIntents (`hw_class_names=[]`) dropped because *every* cell that
   could host them is ICE-masked. The build's drv stays `Ready` and
@@ -305,7 +305,7 @@ Two coupled alerts watch the same failure from opposite ends:
 Both mean *NodeClaim launches are failing in the cloud, not a
 `[sla.hw_classes]` config gap*. Check the Karpenter controller log for
 CreateFleet errors (capacity, quota, IAM) and
-`rio_controller_nodeclaim_reaped_total{reason=~"ice|vanished"}`:
+#(refs.metric)("rio_controller_nodeclaim_reaped_total")`{reason=~"ice|vanished"}`:
 
 ```bash
 kubectl logs -n kube-system deploy/karpenter --since=15m | grep -iE 'failed launching|insufficient|UnfulfillableCapacity'
@@ -336,7 +336,7 @@ call (cost vs availability).
 == RioNodeclaimPool StuckPending <rionodeclaimpool-stuckpending>
 
 NodeClaim created but not Registered for >2× the cell's reap timeout
-(`rio_controller_nodeclaim_ice_timeout_seconds{cell}` =
+(#(refs.metric)("rio_controller_nodeclaim_ice_timeout_seconds")`{cell}` =
 `max(2×lead_time_seed, q_0.99(boot))`), clamped to a 90s floor /
 3×maxLeadTime cap (default 1800s) — \~90s for EBS cells (seed≈18s, ice\_timeout
 ≈36s, 2×=72s → floored at 90), \~30m for `metal-*` cells (seed=600s, ice\_timeout
@@ -400,7 +400,7 @@ entry for the intent's `(arch, size, required_features)`:
 - *`required_features` unmatched* — no `[sla.hw_classes.$h]` entry has
   `provides_features` covering the intent's `required_features`. Most likely
   after adding a new system-feature (`kvm`, `nixos-test`, a custom feature).
-  Add or fix the hw-class. Check `rio_scheduler_unroutable_features_total`
+  Add or fix the hw-class. Check #(refs.metric)("rio_scheduler_unroutable_features_total")
   for the same shape on the scheduler side — if BOTH fire the misconfig is
   in `[sla.hw_classes]`; if only this one, the scheduler routed but the
   controller's `HwClassConfig` is stale (300s refresh). See also
@@ -410,7 +410,7 @@ entry for the intent's `(arch, size, required_features)`:
 - *Footprint exceeds every arch-matching class's ceiling* — an
   override-bypass (`--cores=N`) intent larger than every class's
   `max_cores`/`max_mem`. Check
-  `rio_controller_nodeclaim_intent_dropped_total{reason="exceeds_cell_cap"}`
+  #(refs.metric)("rio_controller_nodeclaim_intent_dropped_total")`{reason="exceeds_cell_cap"}`
   for the same drv.
 - *Featureless arch-unmappable system* — a non-FOD `system="builtin"` or
   `darwin-*` build with no `requiredSystemFeatures` to route on. There is no

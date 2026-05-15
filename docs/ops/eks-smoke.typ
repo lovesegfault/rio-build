@@ -181,7 +181,7 @@ helm uninstall rio -n rio-system    # or: cargo xtask k8s destroy -p eks for ful
   [privileged: true or SYS_ADMIN cap],
 
   [Build hangs at "waiting for build"],
-  [Scheduler metrics `rio_scheduler_workers_active`],
+  [Scheduler metrics #(refs.metric)("rio_scheduler_workers_active")],
   [0 → no worker registered. Check worker logs.],
 
   [`nix copy` permission denied],
@@ -189,6 +189,6 @@ helm uninstall rio -n rio-system    # or: cargo xtask k8s destroy -p eks for ful
   [Secret mounted? Gateway restarted after creating secret?],
 
   [Store PutPath PERMISSION_DENIED],
-  [`rio_store_hmac_rejected_total{reason}`],
+  [#(refs.metric)("rio_store_hmac_rejected_total")`{reason}`],
   [HMAC key mismatch (assignment: scheduler↔store; service: gateway↔store)],
 )

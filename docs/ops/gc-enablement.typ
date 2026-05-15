@@ -18,7 +18,8 @@ GC mark-and-sweep deletes paths with no reachable references. Before enabling GC
 = Enabling
 
 + Start with conservative grace period: `rio-cli trigger-gc --grace-hours 168` (1 week)
-+ Monitor `rio_store_gc_paths_deleted_total` and `rio_store_gc_bytes_freed_total`
++ Monitor #(refs.metric)("rio_store_gc_path_swept_total") and
+  #(refs.metric)("rio_store_s3_deletes_pending")
 + If no issues after first run, reduce grace to desired value
 
 = Rollback

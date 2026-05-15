@@ -98,7 +98,7 @@ One build per pod (P0537). Size the pod for the build, not for a slot count.
 - With 5min average (including large packages): \~480 derivations/hour = \~125 hours total
 - Reality is bimodal: most builds are seconds, a few are hours. Expect 15--25 hours for a full nixpkgs rebuild on 40 executors.
 
-*With per-derivation SLA sizing (ADR-023):* the controller spawns one-shot Jobs sized to each derivation's solved `(cores, mem, disk)`, so a `hello` build gets a 1-core/512Mi pod and `firefox` gets 16-core/32Gi without operator partitioning. Karpenter bin-packs the heterogeneous pods onto right-sized nodes. See #link("components/controller.md")[controller component spec] for the reconciler flow.
+*With per-derivation SLA sizing (ADR-023):* the controller spawns one-shot Jobs sized to each derivation's solved `(cores, mem, disk)`, so a `hello` build gets a 1-core/512Mi pod and `firefox` gets 16-core/32Gi without operator partitioning. Karpenter bin-packs the heterogeneous pods onto right-sized nodes. See #cross-link("/spec/components/controller.typ")[controller component spec] for the reconciler flow.
 
 = Gateway and Scheduler
 

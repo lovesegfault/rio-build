@@ -1154,7 +1154,7 @@ exactly `--stdio`. This allows clients that send a full store path (e.g.,
 
 #r("gw.conn.session-error-visible")[
   Any error propagated from an SSH handler method (via `?`) is logged at
-  `error!` and increments `rio_gateway_errors_total{type="session"}`. The russh
+  `error!` and increments #(refs.metric)("rio_gateway_errors_total")`{type="session"}`. The russh
   default swallows these silently.
 ]
 
@@ -1199,7 +1199,7 @@ exactly `--stdio`. This allows clients that send a full store path (e.g.,
 ]
 
 #r("gw.conn.real-connection-marker")[
-  `rio_gateway_connections_total{result="new"}` and
+  #(refs.metric)("rio_gateway_connections_total")`{result="new"}` and
   #(refs.metric)("rio_gateway_connections_active") count connections that
   reached the SSH authentication layer (any `auth_*` callback). TCP probes that
   close before the SSH handshake are logged at `trace!` only.
@@ -1635,7 +1635,7 @@ derivation without the full DAG context.
   store returns `Aborted` when another upload holds the placeholder row for the
   same path (I-068) or on PG serialization conflicts. Each retry rebuilds the
   request stream from the `Arc<[u8]>`-held NAR without copying. Emits
-  `rio_gateway_putpath_aborted_retries_total{attempt}` per retry. The streaming
+  #(refs.metric)("rio_gateway_putpath_aborted_retries_total")`{attempt}` per retry. The streaming
   `grpc_put_path_streaming` helper is *not* retried on `Aborted` --- its reader
   is consumed and the bytes were forwarded as they arrived, so there is nothing
   to replay; in practice that path only fires for oversize non-`.drv` entries
