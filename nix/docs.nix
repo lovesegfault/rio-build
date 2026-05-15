@@ -161,6 +161,13 @@ let
         test "$(jq 'keys|length' $out/helm-ns.json)" -eq 4
       '';
 
+  # `--input` pairs both targets must see. Factored so the PDF and
+  # shiroa-HTML invocations can't drift (bug_003: HTML omitted gh-sha,
+  # so refs.gh() permalinks pointed at /blob/main/). x-target stays
+  # per-invocation (shiroa sets it itself; PDF passes book-pdf).
+  typstInputs = [ "gh-sha=${self.rev or "dirty"}" ];
+  inputArgs = lib.concatMapStringsSep " " (i: "--input ${lib.escapeShellArg i}") typstInputs;
+
   # Compile root: docs sources + generated data, fused into one tree
   # so typst's `--root` sees `/lib`, `/spec`, and `/gen` together.
   compileRoot = pkgs.runCommand "rio-docs-root" { } ''
@@ -182,8 +189,7 @@ rec {
       )
       ''
         typst compile --root ${compileRoot} -f pdf \
-          --input x-target=book-pdf \
-          --input gh-sha=${self.rev or "dirty"} \
+          ${inputArgs} --input x-target=book-pdf \
           ${compileRoot}/book-pdf.typ $out
       '';
 
@@ -212,6 +218,7 @@ rec {
         cp -r ${compileRoot} ./root && chmod -R +w ./root
         cd ./root
         shiroa build --root . --mode static-html \
+          ${inputArgs} \
           --font-path "$TYPST_FONT_PATHS" -d $out .
       '';
 
