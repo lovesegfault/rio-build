@@ -25,9 +25,9 @@
 
 // ─── package imports ────────────────────────────────────────────────
 #import "@preview/shiroa:0.3.1": (
-  is-html-target, is-pdf-target, is-web-target, templates,
+  is-html-target, is-pdf-target, is-web-target, shiroa-sys-target, templates,
 )
-#import templates: markup-rules
+#import templates: add-styles, equation-rules, markup-rules, theme-box
 #import "@preview/tracey:0.1.0": req
 #import "@preview/glossarium:0.5.10": (
   get-entry-back-references, gls, glspl, make-glossary, print-glossary,
@@ -61,6 +61,25 @@
 #let accent = rgb("#1f6feb")
 #let muted = rgb("#656d76")
 #let rule-color = rgb("#d0d7de")
+
+// ─── shiroa html-frame theming ──────────────────────────────────────
+// equation-rules and our figure-frame rule render content as inline SVG
+// via html.frame(). shiroa's theme-box emits a dark + light copy under
+// `.dark`/`.light` so starlight CSS can toggle them; it expects a
+// `themes` dict with `is-dark` + `main-color` per variant. shiroa ships
+// no preset — the full theme-box-styles-from() machinery parses tmTheme
+// XML for code highlighting, which we don't use (codly handles raw) —
+// so build the minimal dict directly.
+#let _web-themes = (
+  light-theme: (is-dark: false, main-color: rgb("#1b1f24")),
+  dark-theme: (is-dark: true, main-color: rgb("#c9d1d9")),
+  default-theme: (
+    is-dark: false,
+    main-color: rgb("#1b1f24"),
+    dash-color: accent,
+  ),
+)
+#let _theme-frame = theme-box.with(themes: _web-themes)
 
 // ─── math operators ─────────────────────────────────────────────────
 #let argmin = math.op("argmin", limits: true)
@@ -175,24 +194,31 @@
   show cite: set text(fill: accent)
   show bibliography: set par(justify: false)
   set heading(numbering: "1.1 ")
-  show heading.where(level: 1): it => {
+  // Heading geometry is paged-only — in html mode markup-rules supplies
+  // starlight's heading wrapper and an outer v() would warn.
+  show heading.where(level: 1): it => if is-paged {
     v(1.2em, weak: true)
     text(size: 16pt, weight: 700, fill: accent, it)
     v(0.5em)
-  }
-  show heading.where(level: 2): it => {
+  } else { it }
+  show heading.where(level: 2): it => if is-paged {
     v(1.0em, weak: true)
     text(size: 12.5pt, weight: 700, it)
     v(0.3em)
-  }
-  show heading.where(level: 3): it => {
+  } else { it }
+  show heading.where(level: 3): it => if is-paged {
     v(0.8em, weak: true)
     text(size: 11pt, weight: 700, it)
     v(0.2em)
-  }
+  } else { it }
 
   show math.equation.where(block: true): set block(above: 1.1em, below: 1.1em)
-  show math.equation.where(block: false): box
+  // box() is paged-layout — in html mode equation-rules wraps the
+  // equation in html.frame() and an outer box() would re-trigger the
+  // "layout ignored" warning.
+  show math.equation.where(block: false): it => if is-paged { box(it) } else {
+    it
+  }
 
   show figure.where(kind: "algorithm"): set align(left)
   show figure.where(kind: "algorithm"): set block(breakable: true)
@@ -208,16 +234,17 @@
   }
 
   set table(stroke: none, inset: (x: 0.8em, y: 0.55em))
-  show table: it => block(
-    stroke: (y: 0.4pt + rule-color),
-    align(center, it),
-  )
+  show table: it => if is-paged {
+    block(stroke: (y: 0.4pt + rule-color), align(center, it))
+  } else { it }
   show table.cell.where(y: 0): strong
 
   // glossarium: intercepts @key refs for registered entries, falls
   // through to native @label otherwise.
   show: make-glossary
-  show figure.where(kind: "glossarium_entry"): it => align(left, it)
+  show figure.where(kind: "glossarium_entry"): it => if is-paged {
+    align(left, it)
+  } else { it }
 
   show: gentle-clues.with(breakable: false, headless: false)
 
@@ -253,13 +280,42 @@
     },
   ) if is-paged
 
-  // shiroa web/html: wire starlight heading anchors + link colour.
-  // markup-rules only destructures `default-theme.dash-color` from the
-  // themes dict; the full theme-box-styles-from() preset machinery is
-  // not needed for chapter content (the shiroa CLI supplies page
-  // chrome around what this emits).
+  // shiroa web/html: wire starlight heading anchors + link colour, and
+  // route math + cetz-based figures through html.frame() so they emit
+  // inline SVG instead of being dropped by typst's native HTML target.
+  //
+  // markup-rules only destructures `default-theme.dash-color`.
+  // equation-rules needs a `theme-box` callback (dark/light dual-render
+  // for starlight's CSS toggle) — see _theme-frame above.
+  // figure.where(kind: image) catches every #figure(diagram(...)),
+  // chronos.diagram, automaton, autograph, lq.diagram — typst defaults
+  // unrecognised figure bodies to kind: image. Algorithm/listing/table/
+  // glossarium figures keep their explicit kinds and render as HTML.
   show: if is-web-target() or is-html-target() {
-    markup-rules.with(themes: (default-theme: (dash-color: accent)))
+    it => {
+      show: markup-rules.with(themes: (default-theme: (dash-color: accent)))
+      show: equation-rules.with(theme-box: _theme-frame)
+      show figure.where(kind: image): fig => context if (
+        shiroa-sys-target() == "html"
+      ) {
+        html.elem("figure", attrs: (class: "rio-figure"), {
+          _theme-frame(tag: "div", theme => {
+            set text(fill: theme.main-color)
+            html.elem("div", html.frame(fig.body))
+          })
+          if fig.caption != none {
+            html.elem("figcaption", fig.caption)
+          }
+        })
+      } else { fig }
+      add-styles(
+        ```css
+        .rio-figure { display: grid; place-items: center; overflow-x: auto; margin: 1.2em 0; }
+        .rio-figure figcaption { font-size: 0.92em; margin-top: 0.6em; }
+        ```,
+      )
+      it
+    }
   } else { it => it }
 
   // standalone-paper front matter — only for direct `typst compile`,
@@ -268,7 +324,7 @@
   // and the in-doc `#book-pdf-mode()` are equivalent gates.
   let in-book = target == "book-pdf"
   let front = context if (
-    paper != none and not in-book and not _book-mode.get()
+    paper != none and is-paged and not in-book and not _book-mode.get()
   ) [
     #align(center)[
       #text(
