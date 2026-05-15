@@ -71,12 +71,10 @@ let
         echo "$src" > "$sentinel"
       fi
       export XDG_DATA_HOME="$cache"
-      # Filter typst's per-file "html export is under active development"
-      # banner (and its three hint: lines) — one per chapter, pure noise.
-      # Real warnings still surface.
-      exec ${shiroaPkg}/bin/shiroa "$@" 2> >(grep -Ev \
-        '^(warning: html export is under active development| = hint: (its behaviour may change|do not rely on this feature|see https://github.com/typst/typst/issues/5512))' \
-        >&2)
+      # No stderr filtering — piping through grep would strip ANSI colour
+      # (shiroa's logger checks isatty). The per-chapter "html export is
+      # under active development" banner is tolerable noise in exchange.
+      exec ${shiroaPkg}/bin/shiroa "$@"
     '')
     typstyle
 
