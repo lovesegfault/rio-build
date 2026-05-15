@@ -19,6 +19,7 @@
   tracey-src,
   shiroaPkg,
   self,
+  xtaskBin,
 }:
 let
   # tracey's typst-side `req` shim. Version must match the package's
@@ -95,20 +96,48 @@ let
   };
 
   # Generated reference data (metric/alert/error/config tables).
-  # Stubbed here — Phase B replaces this with the real extractors.
-  docsData = pkgs.runCommand "rio-docs-data-stub" { } ''
-    mkdir -p $out/gen
-    for f in metrics alerts; do echo '{"names":[]}' > $out/gen/$f.json; done
-    echo '{"variants":[]}' > $out/gen/errors.json
-    echo '{"components":{}}' > $out/gen/config.json
-  '';
+  # `xtask regen docs-data` scans rio-*/src/**/*.rs for describe_*! and
+  # `pub enum *Error` plus prometheusrule.yaml for alert names. The
+  # crate2nix-built xtask binary's compile-time CARGO_MANIFEST_DIR is a
+  # store path, so RIO_REPO_ROOT points it at the runCommand src tree.
+  #
+  # Fileset is the minimal scan surface — rio-*/src/*.rs (read_dir scan
+  # needs the rio-* dir level to exist, fileFilter at the crate level
+  # gives that) + the prometheusrule template. NOT the full workspaceSrc:
+  # editing a Cargo.toml or a test file shouldn't rebuild the PDF.
+  docsData =
+    pkgs.runCommand "rio-docs-data"
+      {
+        nativeBuildInputs = [
+          xtaskBin
+          pkgs.jq
+        ];
+        src = lib.fileset.toSource {
+          root = ../.;
+          fileset = lib.fileset.unions [
+            (lib.fileset.fileFilter (f: f.hasExt "rs") ../.)
+            ../infra/helm/rio-build/templates/prometheusrule.yaml
+          ];
+        };
+      }
+      ''
+        # xtask writes to $RIO_REPO_ROOT/docs/gen — needs a writable
+        # tree. Copy not symlink: read_dir + create_dir_all both touch.
+        cp -r --no-preserve=mode $src work
+        export RIO_REPO_ROOT=$PWD/work
+        xtask regen docs-data
+        mv work/docs/gen $out
+        test "$(jq '.names|length' $out/metrics.json)" -gt 0
+        test "$(jq '.names|length' $out/alerts.json)" -gt 0
+        test "$(jq '.variants|length' $out/errors.json)" -gt 0
+      '';
 
   # Compile root: docs sources + generated data, fused into one tree
   # so typst's `--root` sees `/lib`, `/spec`, and `/gen` together.
   compileRoot = pkgs.runCommand "rio-docs-root" { } ''
     mkdir -p $out
     cp -r ${docsSrc}/* $out/
-    cp -r ${docsData}/gen $out/gen
+    cp -r ${docsData} $out/gen
   '';
 in
 rec {
