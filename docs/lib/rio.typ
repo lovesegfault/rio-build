@@ -5,15 +5,20 @@
 // tracey requirement marker and (when domains are declared) asserts
 // the id is in-scope.
 //
-// One template, three render targets (selected via `--input x-target=`):
+// One template, four render targets (selected via `--input x-target=`):
 //   "pdf"       — standalone paper. Full A4 geometry + title block +
 //                 outline + bibliography. The default for bare
 //                 `typst compile`.
 //   "book-pdf"  — chapter inside the stitched book-pdf.typ aggregate.
 //                 A4 geometry, but no per-chapter front-matter.
-//   web/html    — shiroa static site. Page geometry suppressed;
+//   html        — shiroa --mode static-html. typst target = html;
 //                 template-rules → starlight() emits the <head>/CSS/
 //                 sidebar chrome; markup-rules wires heading anchors.
+//   web         — shiroa --mode dyn-paged. typst target = PAGED (the
+//                 wasm renderer rasterizes the canvas); shiroa CLI
+//                 supplies theme chrome around it. html.* does NOT
+//                 exist here — render like PDF, just on one tall
+//                 auto-height page at shiroa's `page-width`.
 //
 // Mechanism notes:
 // - `set page(...) if cond` — trailing form. `if cond { set ... }`
@@ -25,7 +30,8 @@
 
 // ─── package imports ────────────────────────────────────────────────
 #import "@preview/shiroa:0.3.1": (
-  is-html-target, is-pdf-target, is-web-target, shiroa-sys-target, templates,
+  is-html-target, is-pdf-target, is-web-target, page-width, shiroa-sys-target,
+  templates,
 )
 #import templates: (
   add-styles, equation-rules, markup-rules, template-rules, theme-box,
@@ -207,7 +213,16 @@
 // ─── the template ───────────────────────────────────────────────────
 #let rio(domains: none, paper: none, body) = {
   let target = sys.inputs.at("x-target", default: "pdf")
-  let is-paged = target in ("pdf", "book-pdf")
+  // Three-way split (is-html / is-dyn-web mutually exclusive):
+  //   is-html      — static-html. typst target=html → html.elem exists.
+  //   is-dyn-web   — dyn-paged. typst target=paged → html.* MISSING.
+  //   is-pdf       — direct `typst compile` (pdf / book-pdf).
+  // is-paged-out = typst's layout engine renders = everything but html.
+  // Gate html.elem/html.frame/add-styles on is-html ONLY.
+  let is-html = is-html-target()
+  let is-dyn-web = is-web-target()
+  let is-paged-out = not is-html
+  let is-pdf = target in ("pdf", "book-pdf")
   _domains.update(domains)
 
   // common typography (target-neutral)
@@ -229,17 +244,17 @@
   set heading(numbering: "1.1 ")
   // Heading geometry is paged-only — in html mode markup-rules supplies
   // starlight's heading wrapper and an outer v() would warn.
-  show heading.where(level: 1): it => if is-paged {
+  show heading.where(level: 1): it => if is-paged-out {
     v(1.2em, weak: true)
     text(size: 16pt, weight: 700, fill: accent, it)
     v(0.5em)
   } else { it }
-  show heading.where(level: 2): it => if is-paged {
+  show heading.where(level: 2): it => if is-paged-out {
     v(1.0em, weak: true)
     text(size: 12.5pt, weight: 700, it)
     v(0.3em)
   } else { it }
-  show heading.where(level: 3): it => if is-paged {
+  show heading.where(level: 3): it => if is-paged-out {
     v(0.8em, weak: true)
     text(size: 11pt, weight: 700, it)
     v(0.2em)
@@ -249,7 +264,9 @@
   // box() is paged-layout — in html mode equation-rules wraps the
   // equation in html.frame() and an outer box() would re-trigger the
   // "layout ignored" warning.
-  show math.equation.where(block: false): it => if is-paged { box(it) } else {
+  show math.equation.where(block: false): it => if is-paged-out {
+    box(it)
+  } else {
     it
   }
 
@@ -267,7 +284,7 @@
   }
 
   set table(stroke: none, inset: (x: 0.8em, y: 0.55em))
-  show table: it => if is-paged {
+  show table: it => if is-paged-out {
     block(stroke: (y: 0.4pt + rule-color), align(center, it))
   } else { it }
   show table.cell.where(y: 0): strong
@@ -277,7 +294,7 @@
   // to consume the figure before glossarium's default theme wraps it in
   // `align(start, ...)` (which warns under the html target).
   show: make-glossary
-  show figure.where(kind: "glossarium_entry"): it => if is-paged {
+  show figure.where(kind: "glossarium_entry"): it => if is-paged-out {
     align(left, it)
   } else { it.body }
 
@@ -287,8 +304,8 @@
   // line-numbered, language-tagged blocks. Paged-only — its grid()
   // layout warns under the html target; let raw fall through to typst's
   // native <pre><code class="language-X"> there (selectable, CSS-styleable).
-  show: if is-paged { codly-init.with() } else { it => it }
-  if is-paged {
+  show: if is-paged-out { codly-init.with() } else { it => it }
+  if is-paged-out {
     codly(
       languages: codly-languages,
       zebra-fill: rgb("#f6f8fa"),
@@ -317,9 +334,19 @@
         line(length: 100%, stroke: 0.4pt + rule-color)
       }
     },
-  ) if is-paged
+  ) if is-pdf
 
-  // shiroa web/html: emit the page chrome + content transforms.
+  // dyn-paged: one tall scrollable page at shiroa's viewport width.
+  // shiroa CLI provides theme chrome around the wasm-rendered canvas,
+  // so no template-rules here — content renders like PDF (codly,
+  // gentle-clues, fletcher all on; wasm rasterizes them).
+  set page(
+    width: page-width,
+    height: auto,
+    margin: (x: 0em, y: 1em),
+  ) if is-dyn-web
+
+  // shiroa static-html: emit the page chrome + content transforms.
   //
   // template-rules is the outer wrapper — for static-html it dispatches
   // to shiroa-starlight's `starlight()`, which emits the full
@@ -327,8 +354,11 @@
   // header) and drops the show-body into the main-content slot. The
   // `book-meta` arg is `include "/book.typ"` so the sidebar reflects
   // the book manifest; book.typ doesn't import rio.typ so there's no
-  // cycle. Gated on is-html-target() only — dyn-paged web mode would
-  // pick the mdbook theme (which we don't ship).
+  // cycle.
+  //
+  // Whole block is gated on is-html ONLY — every branch below emits
+  // html.elem/html.frame/add-styles, which don't exist when typst's
+  // target is paged. dyn-paged (is-web-target) must NOT enter here.
   //
   // markup-rules + equation-rules + the figure/clue bypasses go inside
   // template-rules so they transform the content that lands in
@@ -341,16 +371,14 @@
   // chronos.diagram, automaton, autograph, lq.diagram — typst defaults
   // unrecognised figure bodies to kind: image. Algorithm/listing/table/
   // glossarium figures keep their explicit kinds and render as HTML.
-  show: if is-web-target() or is-html-target() {
+  show: if is-html {
     it => {
-      show: if is-html-target() {
-        template-rules.with(
-          book-meta: include "/book.typ",
-          title: if paper != none { paper.title } else { "" },
-          plain-body: body,
-          web-theme: "starlight",
-        )
-      } else { x => x }
+      show: template-rules.with(
+        book-meta: include "/book.typ",
+        title: if paper != none { paper.title } else { "" },
+        plain-body: body,
+        web-theme: "starlight",
+      )
       show: markup-rules.with(themes: (default-theme: (dash-color: accent)))
       show: equation-rules.with(theme-box: _theme-frame)
       // html.frame() figures: diagrams (kind: image — typst's default
@@ -405,7 +433,7 @@
   // and the in-doc `#book-pdf-mode()` are equivalent gates.
   let in-book = target == "book-pdf"
   let front = context if (
-    paper != none and is-paged and not in-book and not _book-mode.get()
+    paper != none and is-pdf and not in-book and not _book-mode.get()
   ) [
     #align(center)[
       #text(
@@ -448,7 +476,7 @@
       and not _book-mode.get()
       and paper.at("bib", default: none) != none
   ) {
-    if is-paged { pagebreak(weak: true) }
+    if is-pdf { pagebreak(weak: true) }
     bibliography(paper.bib)
   }
 }
