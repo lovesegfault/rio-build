@@ -52,7 +52,7 @@ mod queries;
 mod sign;
 
 pub use admin::StoreAdminServiceImpl;
-pub use chunk::ChunkServiceImpl;
+pub use chunk::{ChunkServiceImpl, GET_CHUNKS_K};
 
 /// Default cap on paths in a FindMissingPaths request (DoS guard).
 /// Matches `rio_nix::protocol::wire::MAX_COLLECTION_COUNT` — the gateway

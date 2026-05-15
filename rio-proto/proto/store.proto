@@ -139,6 +139,17 @@ service StoreService {
 service ChunkService {
   // Download a chunk by its digest.
   rpc GetChunk(rio.types.GetChunkRequest) returns (stream rio.types.GetChunkResponse);
+
+  // Batched chunk download (P0568). The castore-FUSE fill task (P0559)
+  // sends GetChunksRequest frames as it discovers local-cache misses;
+  // the server fans out K concurrent backend fetches and streams
+  // ChunkData back in completion order. ChunkData carries the digest so
+  // the client matches by content, not by request position. Aborts the
+  // stream on the first chunk error (NOT_FOUND / DATA_LOSS /
+  // UNAVAILABLE) — the client retries the gap, not the whole batch.
+  // Unscoped, like GetChunk: knowing a BLAKE3 hash already proves you
+  // have (or had) the bytes.
+  rpc GetChunks(stream rio.types.GetChunksRequest) returns (stream rio.types.ChunkData);
 }
 
 // Store-side administrative operations. The scheduler's AdminService.

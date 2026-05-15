@@ -372,6 +372,30 @@ message GetChunkResponse {
   bytes data = 1;                         // Chunk data
 }
 
+// Bidi-stream batch fetch (P0568). Each message carries a slice of the
+// caller's miss list — the §7 fill task pipelines local-cache misses to
+// the server as it walks the chunk list rather than front-loading a
+// full-list `stat()` scan. The server fans out fetches and replies
+// out of order, so digests within and across request frames are
+// interchangeable; ordering is by content, not position.
+message GetChunksRequest {
+  // BLAKE3 digests of chunks to fetch. Each MUST be 32 bytes.
+  repeated bytes digests = 1;
+}
+
+// One chunk per message. `digest` keys the response — the server fans
+// out concurrent fetches (`K_server`, see chunk.rs) and yields in
+// completion order, not request order. The server never sends a
+// partial or unverified chunk: any miss/corruption/backend error
+// aborts the whole stream with a gRPC status (NOT_FOUND / DATA_LOSS /
+// UNAVAILABLE), and the client retries only the digests it didn't
+// receive (chunks are content-addressed; arrival order doesn't carry
+// information).
+message ChunkData {
+  bytes digest = 1;                       // BLAKE3 digest (32 bytes)
+  bytes data = 2;                         // Chunk bytes; blake3(data) == digest
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Store admin (GC / pin / quota / resign)
 // ───────────────────────────────────────────────────────────────────────────

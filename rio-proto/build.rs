@@ -22,6 +22,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .file_descriptor_set_path(out_dir.join("file_descriptor_set.bin"));
 
+    // ChunkData.data carries up to CHUNK_MAX (256 KiB) per message on
+    // the GetChunks hot path. The moka chunk cache stores `Bytes`;
+    // mapping the proto `bytes` field to `bytes::Bytes` instead of
+    // `Vec<u8>` lets the handler hand the cached buffer to the encoder
+    // without a copy. The 32-byte digest fields stay `Vec<u8>` — a
+    // copy there is noise.
+    b = b.bytes(".rio.types.ChunkData.data");
+
     // CompletionReport (~312B) dwarfs the other ExecutorMessage oneof
     // arms (~80B). Generated code; boxing would ripple through every
     // construction/match site for a stack-slot win we don't need on

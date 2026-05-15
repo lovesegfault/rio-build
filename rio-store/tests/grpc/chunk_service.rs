@@ -260,3 +260,132 @@ async fn collect_get_chunk(
     }
     Ok(out)
 }
+
+// ===========================================================================
+// GetChunks (P0568)
+// ===========================================================================
+
+use std::collections::HashMap;
+
+use rio_proto::types::GetChunksRequest;
+
+/// Helper: open a GetChunks bidi stream, send `frames` (each a list of
+/// digests), close the request side, and collect every `ChunkData`
+/// keyed by digest. Errors from the stream propagate so callers can
+/// assert on the abort code.
+async fn collect_get_chunks(
+    client: &mut ChunkServiceClient<Channel>,
+    frames: Vec<Vec<Vec<u8>>>,
+) -> Result<HashMap<Vec<u8>, Vec<u8>>, tonic::Status> {
+    let (tx, rx) = mpsc::channel(8);
+    for digests in frames {
+        tx.send(GetChunksRequest { digests })
+            .await
+            .expect("fresh channel");
+    }
+    drop(tx);
+    let mut stream = client
+        .get_chunks(ReceiverStream::new(rx))
+        .await?
+        .into_inner();
+    let mut got: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    while let Some(chunk) = stream.message().await? {
+        let dup = got.insert(chunk.digest.clone(), chunk.data.to_vec());
+        assert!(dup.is_none(), "server sent the same digest twice");
+    }
+    Ok(got)
+}
+
+/// Batch fetch of every chunk in a chunked NAR, split across two
+/// request frames in an order unrelated to the manifest. Every chunk
+/// comes back, every byte BLAKE3-verifies against its requested
+/// digest, and the byte count matches the chunk total — proves the
+/// server resolves by content address, not request position.
+// r[verify proto.chunk.batch-bidi]
+#[tokio::test]
+async fn test_getchunks_batched_round_trip() -> TestResult {
+    let mut s = ChunkSession::new().await?;
+
+    let (nar, info, _) = make_large_nar(70, 768 * 1024);
+    let nar_size = nar.len() as i64;
+    put_path(&mut s.store, info, nar).await?;
+
+    let hashes: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT blake3_hash FROM chunks ORDER BY blake3_hash")
+            .fetch_all(&s.db.pool)
+            .await?;
+    assert!(hashes.len() >= 2, "NAR should have chunked into ≥2 pieces");
+
+    // Split across two frames so the request shape exercises the
+    // multi-frame path, and reverse the second so the server's
+    // by-digest matching is doing real work.
+    let mid = hashes.len() / 2;
+    let mut frame_b: Vec<Vec<u8>> = hashes[mid..].to_vec();
+    frame_b.reverse();
+    let got = collect_get_chunks(&mut s.chunk, vec![hashes[..mid].to_vec(), frame_b]).await?;
+
+    assert_eq!(got.len(), hashes.len(), "every requested digest answered");
+    let mut total = 0i64;
+    for h in &hashes {
+        let data = got.get(h).expect("requested digest returned");
+        assert_eq!(
+            blake3::hash(data).as_bytes().as_slice(),
+            h.as_slice(),
+            "ChunkData content BLAKE3-verifies against its digest"
+        );
+        total += data.len() as i64;
+    }
+    assert_eq!(total, nar_size, "sum of chunk sizes == NAR size");
+    Ok(())
+}
+
+/// Truncated digest in the middle of a batch → the stream aborts with
+/// INVALID_ARGUMENT before any backend lookup for that digest.
+/// Validation is front-loaded so a client bug surfaces as a usage
+/// error, not a confusing backend miss.
+// r[verify proto.chunk.batch-bidi]
+#[tokio::test]
+async fn test_getchunks_bad_digest_aborts() -> TestResult {
+    let mut s = ChunkSession::new().await?;
+    let err = collect_get_chunks(&mut s.chunk, vec![vec![vec![0xEE; 7]]])
+        .await
+        .expect_err("short digest should abort the stream");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    Ok(())
+}
+
+/// Unknown digest aborts with NOT_FOUND. The §6 fill task treats this
+/// as an integrity error (the chunk should exist per the manifest) and
+/// fails the build infrastructure-side — it MUST be distinguishable
+/// from a transport error, which is retryable.
+// r[verify proto.chunk.batch-bidi]
+#[tokio::test]
+async fn test_getchunks_not_found_aborts() -> TestResult {
+    let mut s = ChunkSession::new().await?;
+    let err = collect_get_chunks(&mut s.chunk, vec![vec![vec![0xEE; 32]]])
+        .await
+        .expect_err("unknown chunk should abort the stream");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+    Ok(())
+}
+
+/// Inline-only store → FAILED_PRECONDITION, same as GetChunk. The
+/// guard is shared so the two RPCs can't drift apart.
+#[tokio::test]
+async fn test_getchunks_no_cache_failed_precondition() -> TestResult {
+    let chunk_service = ChunkServiceImpl::new(None);
+    let router = Server::builder().add_service(ChunkServiceServer::new(chunk_service));
+    let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
+    let channel = Channel::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    let mut client = ChunkServiceClient::new(channel);
+
+    let err = collect_get_chunks(&mut client, vec![vec![vec![0; 32]]])
+        .await
+        .expect_err("no cache should fail");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+    server.abort();
+    Ok(())
+}
