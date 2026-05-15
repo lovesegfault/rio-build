@@ -12,8 +12,8 @@
 //   "book-pdf"  — chapter inside the stitched book-pdf.typ aggregate.
 //                 A4 geometry, but no per-chapter front-matter.
 //   web/html    — shiroa static site. Page geometry suppressed;
-//                 markup-rules wires the starlight heading/link
-//                 anchors. shiroa's CLI provides the page chrome.
+//                 template-rules → starlight() emits the <head>/CSS/
+//                 sidebar chrome; markup-rules wires heading anchors.
 //
 // Mechanism notes:
 // - `set page(...) if cond` — trailing form. `if cond { set ... }`
@@ -27,7 +27,9 @@
 #import "@preview/shiroa:0.3.1": (
   is-html-target, is-pdf-target, is-web-target, shiroa-sys-target, templates,
 )
-#import templates: add-styles, equation-rules, markup-rules, theme-box
+#import templates: (
+  add-styles, equation-rules, markup-rules, template-rules, theme-box,
+)
 #import "@preview/tracey:0.1.0": req
 #import "@preview/glossarium:0.5.10": (
   get-entry-back-references, gls, glspl, make-glossary, print-glossary,
@@ -317,9 +319,20 @@
     },
   ) if is-paged
 
-  // shiroa web/html: wire starlight heading anchors + link colour, and
-  // route math + cetz-based figures through html.frame() so they emit
-  // inline SVG instead of being dropped by typst's native HTML target.
+  // shiroa web/html: emit the page chrome + content transforms.
+  //
+  // template-rules is the outer wrapper — for static-html it dispatches
+  // to shiroa-starlight's `starlight()`, which emits the full
+  // <html><head> (CSS links, <title>, search) and <body> (sidebar nav,
+  // header) and drops the show-body into the main-content slot. The
+  // `book-meta` arg is `include "/book.typ"` so the sidebar reflects
+  // the book manifest; book.typ doesn't import rio.typ so there's no
+  // cycle. Gated on is-html-target() only — dyn-paged web mode would
+  // pick the mdbook theme (which we don't ship).
+  //
+  // markup-rules + equation-rules + the figure/clue bypasses go inside
+  // template-rules so they transform the content that lands in
+  // starlight's main-content slot.
   //
   // markup-rules only destructures `default-theme.dash-color`.
   // equation-rules needs a `theme-box` callback (dark/light dual-render
@@ -330,6 +343,14 @@
   // glossarium figures keep their explicit kinds and render as HTML.
   show: if is-web-target() or is-html-target() {
     it => {
+      show: if is-html-target() {
+        template-rules.with(
+          book-meta: include "/book.typ",
+          title: if paper != none { paper.title } else { "" },
+          plain-body: body,
+          web-theme: "starlight",
+        )
+      } else { x => x }
       show: markup-rules.with(themes: (default-theme: (dash-color: accent)))
       show: equation-rules.with(theme-box: _theme-frame)
       // html.frame() figures: diagrams (kind: image — typst's default
@@ -350,6 +371,14 @@
       } else { fig }
       show figure.where(kind: image): frame-figure
       show figure.where(kind: "algorithm"): frame-figure
+      // typst html refuses #footnote when a custom <html> element is
+      // present (starlight emits one). Render the note body inline as
+      // a muted parenthetical instead — close enough for web reading.
+      show footnote: it => html.elem(
+        "span",
+        attrs: (class: "rio-footnote"),
+        [ (#it.body)],
+      )
       add-styles(
         ```css
         .rio-figure { display: grid; place-items: center; overflow-x: auto; margin: 1.2em 0; }
@@ -363,6 +392,7 @@
         .rio-clue-memo { border-color: #9a6700; background: #fff8c5; }
         .rio-clue-tip { border-color: #1a7f37; background: #dafbe1; }
         .rio-clue-idea { border-color: #8250df; background: #fbefff; }
+        .rio-footnote { color: #656d76; font-size: 0.9em; }
         ```,
       )
       it
