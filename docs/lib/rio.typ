@@ -145,6 +145,13 @@
   if query(lbl).len() > 0 { link(lbl, body) } else { body }
 }
 
+// Cross-reference to a label in another chapter. Renders as a link when
+// the target exists in this compilation unit (book-pdf), plain text
+// otherwise so standalone chapter compiles don't fail.
+#let xref(target, body) = context {
+  if query(target).len() > 0 { link(target, body) } else { body }
+}
+
 // ─── the template ───────────────────────────────────────────────────
 #let rio(domains: none, paper: none, body) = {
   let target = sys.inputs.at("x-target", default: "pdf")
