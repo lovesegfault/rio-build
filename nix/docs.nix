@@ -82,15 +82,14 @@ let
   };
 
   # Only the typst-side sources. The mdbook tree at docs/src/ stays
-  # out so editing a .md doesn't rebuild the PDF.
+  # out so editing a .md doesn't rebuild the PDF. docs/gen/ is also
+  # excluded — compileRoot overlays the hermetic docsData there.
   docsSrc = lib.fileset.toSource {
     root = ../docs;
-    fileset = lib.fileset.unions (
-      map lib.fileset.maybeMissing [
-        ../docs/lib
-        ../docs/spec
-        ../docs/book.typ
-        ../docs/book-pdf.typ
+    fileset = lib.fileset.difference ../docs (
+      lib.fileset.unions [
+        ../docs/src
+        ../docs/gen
       ]
     );
   };

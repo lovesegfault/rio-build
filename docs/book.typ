@@ -9,9 +9,21 @@
 #book-meta(
   title: "rio-build design book",
   summary: [
-    = Spike
-    #chapter("spec/system/_spike.typ")[Spike]
-    = Components
+    #chapter("intro.typ")[Introduction]
+    = Guide
+    #chapter("guide/setup.typ")[Setup]
+    #chapter("guide/ci.typ")[CI Integration]
+    #chapter("guide/programmatic.typ")[Programmatic Access]
+    = Spec
     #chapter("spec/components/sla-sizing.typ")[SLA-Driven Sizing]
+    #chapter("spec/system/_spike.typ")[(spike)]
+    = Ops
+    #chapter("ops/capacity-planning.typ")[Capacity Planning]
+    #chapter("ops/gc-enablement.typ")[GC Enablement]
+    #chapter("ops/eks-smoke.typ")[EKS Smoke Test]
+    #chapter("ops/sla-model.typ")[SLA Model Runbook]
+    = Appendix
+    #chapter("glossary.typ")[Glossary]
+    #chapter("contributing.typ")[Contributing]
   ],
 )
