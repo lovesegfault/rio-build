@@ -49,7 +49,7 @@
 // template-rules' `extra-assets` (lands in starlight's <head> through
 // the sl:book-meta slot).
 #import html-support: supports-html-internal
-#import supports-html-internal: dyn-svg-support
+#import supports-html-internal: dyn-svg-support, shiroa-asset-file
 #import "@preview/tracey:0.1.0": req
 #import "@preview/glossarium:0.5.10": (
   get-entry-back-references, gls, glspl, make-glossary, print-glossary,
@@ -389,23 +389,25 @@
         title: if paper != none { paper.title } else { "" },
         plain-body: body,
         web-theme: "starlight",
-        // dyn-paged html-wrapper pass: starlight 0.3.1 has TWO mdbook-
+        // dyn-paged html-wrapper pass: starlight 0.3.1 has THREE mdbook-
         // parity gaps that break dyn-paged:
-        //   1. calls paged-load-trampoline() but never dyn-svg-support(),
-        //      so the trampoline awaits an undefined typstRenderModuleReady
+        //   1. calls paged-load-trampoline() but never dyn-svg-support()
+        //      → trampoline awaits an undefined typstRenderModuleReady
         //      (mdbook head.typ:26 has it).
         //   2. never defines window.getTypstTheme()/isTypstLightTheme()
         //      which shiroa.js calls to pick which .{theme}.multi.sir.in
-        //      to fetch (mdbook page.typ:55 defines them; starlight has
-        //      its own light/dark switcher and forgot the bridge).
+        //      to fetch (mdbook page.typ:55 defines them).
+        //   3. never loads svg_utils.js, which defines window.typstProcessSvg
+        //      / typstBindSemantics / layoutText that the wasm renderer
+        //      calls into — without it the wasm panics at vec2dom dom.rs:91
+        //      on JsValue(undefined) (mdbook page.typ:284 loads it).
         // extra-assets lands in starlight's <head> via the sl:book-meta
-        // slot — inject both. Gate on html-wrapper so static-html
+        // slot — inject all three. Gate on html-wrapper so static-html
         // doesn't fetch the (unused) wasm renderer.
         extra-assets: if x-target.starts-with("html-wrapper") {
           (
             // (2) — map starlight's data-theme=light|dark to the mdbook
             // 5-theme palette the .sir.in artifacts are named after.
-            // 'auto' resolves to the prefers-color-scheme media query.
             html.elem(
               "script",
               "window.getTypstTheme = function() {
@@ -419,6 +421,9 @@
                 return t === 'light' || t === 'rust';
               };",
             ),
+            // (3) — must precede (1); shiroa.js may call into svg_utils
+            // synchronously once the renderer is ready.
+            shiroa-asset-file("svg_utils.js"),
             // (1)
             dyn-svg-support(),
           )
