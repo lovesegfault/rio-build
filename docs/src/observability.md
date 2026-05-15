@@ -187,6 +187,10 @@ r[obs.metric.store]
 | `rio_store_s3_requests_total` | Counter | S3 API calls (labeled by operation) |
 | `rio_store_chunk_cache_hits_total` | Counter | moka chunk cache hits (for cross-instance aggregation) |
 | `rio_store_chunk_cache_misses_total` | Counter | moka chunk cache misses |
+| `rio_store_tiered_local_hits_total` | Counter | Tiered backend Express-tier hits (chunk served without an S3-standard RTT). Hit ratio = `rate(hits)/(rate(hits)+rate(misses))`. |
+| `rio_store_tiered_local_misses_total` | Counter | Tiered backend Express-tier misses (fell through to S3 standard, write-through filled Express). |
+| `rio_store_tiered_local_errors_total` | Counter | Tiered backend Express-tier read errors (degraded; falls through to S3 standard). Sustained nonzero with `local_hits` near zero = Express bucket unreachable in this AZ. |
+| `rio_store_tiered_writethrough_errors_total` | Counter | Express write-through failures (chunk served from S3 standard, Express not warmed). Cache stays cold; retried on next read. |
 | `rio_store_express_bytes` | Gauge | Current per-AZ Express bucket size in bytes (labeled `az_id`). Updated each sweep. Alert if > `target_bytes × evict_high_watermark` for >2 sweep intervals (sweeper stuck or losing leadership). |
 | `rio_store_express_evicted_total` | Counter | Chunks deleted from Express by the eviction sweeper (labeled `az_id`). Monotone; `rate()` ≈ churn. |
 | `rio_store_hmac_rejected_total` | Counter | PutPath calls rejected by HMAC verifier (bad signature, expired, path not in `expected_outputs`). Alert if rate > 0: indicates misconfiguration or compromise attempt. |

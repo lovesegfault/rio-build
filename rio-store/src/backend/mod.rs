@@ -1,6 +1,7 @@
 //! Chunk storage backends.
 //!
-//! Stores BLAKE3-addressed chunks. Three impls: S3 (prod), filesystem
+//! Stores BLAKE3-addressed chunks. Four impls: S3 (prod), tiered
+//! ([`TieredChunkBackend`] — Express read-through cache over S3), filesystem
 //! (dev), memory (tests). The trait is put/get/exists_batch/delete_by_key
 //! — chunks are immutable and content-addressed, so there's no update or
 //! rename. Delete goes through the `pending_s3_deletes` outbox: GC sweep
@@ -22,6 +23,10 @@
 //! Prefix-partitioning per `store.typ` — S3 shards by key prefix, so
 //! spreading across 256 prefixes avoids hotspotting a single shard when
 //! a thousand workers hit the store at once.
+
+mod tiered;
+
+pub use tiered::TieredChunkBackend;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -488,7 +493,12 @@ impl ChunkBackend for S3ChunkBackend {
             .body(data.into())
             .send()
             .await
-            .map_err(|e| classify_s3_error(e, format!("S3 PutObject failed for {key}")))?;
+            .map_err(|e| {
+                classify_s3_error(
+                    e,
+                    format!("S3 PutObject failed for s3://{}/{key}", self.bucket),
+                )
+            })?;
 
         Ok(())
     }
@@ -516,7 +526,9 @@ impl ChunkBackend for S3ChunkBackend {
                     .body
                     .collect()
                     .await
-                    .map_err(|e| anyhow::anyhow!("S3 body read failed for {key}: {e}"))?
+                    .map_err(|e| {
+                        anyhow::anyhow!("S3 body read failed for s3://{}/{key}: {e}", self.bucket)
+                    })?
                     .into_bytes();
                 Ok(Some(data))
             }
@@ -532,7 +544,7 @@ impl ChunkBackend for S3ChunkBackend {
                     // auth with transient retries forever.
                     Err(classify_s3_error(
                         service_err,
-                        format!("S3 GetObject failed for {key}"),
+                        format!("S3 GetObject failed for s3://{}/{key}", self.bucket),
                     ))
                 }
             }
@@ -567,7 +579,7 @@ impl ChunkBackend for S3ChunkBackend {
                             "rio_store_s3_requests_total", "operation" => "head_object"
                         )
                         .increment(1);
-                        match client.head_object().bucket(bucket).key(&key).send().await {
+                        match client.head_object().bucket(&bucket).key(&key).send().await {
                             Ok(_) => Ok(true),
                             Err(err) => {
                                 let service_err = err.into_service_error();
@@ -576,7 +588,7 @@ impl ChunkBackend for S3ChunkBackend {
                                 } else {
                                     Err(classify_s3_error(
                                         service_err,
-                                        format!("S3 HeadObject failed for {key}"),
+                                        format!("S3 HeadObject failed for s3://{bucket}/{key}"),
                                     ))
                                 }
                             }
@@ -617,7 +629,12 @@ impl ChunkBackend for S3ChunkBackend {
             .key(key)
             .send()
             .await
-            .map_err(|e| classify_s3_error(e, format!("S3 DeleteObject failed for {key}")))?;
+            .map_err(|e| {
+                classify_s3_error(
+                    e,
+                    format!("S3 DeleteObject failed for s3://{}/{key}", self.bucket),
+                )
+            })?;
         Ok(())
     }
 }
