@@ -130,11 +130,186 @@ fn errors() -> Result<serde_json::Value> {
 }
 
 fn config() -> Result<serde_json::Value> {
-    // TODO(typst-migration): schemars derives on the 5 component Config
-    // structs deferred — they total ~3.2K LoC with custom serde adapters
-    // (`with = "secs"`), nested shared types (UpstreamAddrs/CommonConfig/
-    // JwtConfig), and xtask would need to grow rio-{builder,gateway,store}
-    // deps to call schema_for!(). ref/configuration.typ ships hand-ported
-    // for now. See ~/tmp/rio-typst/DESIGN.md §9.
-    Ok(json!({"components": {}}))
+    let mut components = serde_json::Map::new();
+    macro_rules! component {
+        ($name:literal, $ty:ty) => {{
+            let schema = schemars::schema_for!($ty);
+            let defaults = serde_json::to_value(<$ty>::default())?;
+            components.insert($name.into(), flatten_schema(schema, &defaults));
+        }};
+    }
+    component!("gateway", rio_gateway::config::Config);
+    component!("scheduler", rio_scheduler::config::Config);
+    component!("store", rio_store::config::Config);
+    component!("builder", rio_builder::config::Config);
+    component!("controller", rio_controller::config::Config);
+    Ok(json!({"components": components}))
+}
+
+/// Walk a JSON Schema's `properties` into a flat list of
+/// `{key, type, default, description}` rows for the typst config
+/// reference. Nested objects (`UpstreamAddrs`, `JwtConfig`, …) flatten
+/// as `parent.child` keys; `#[serde(flatten)]` (CommonConfig) inlines
+/// at the parent level (schemars already does that). `defaults` is
+/// `serde_json::to_value(Config::default())` — schemars doesn't
+/// capture `#[serde(default)]` values, so they're zipped in by key.
+fn flatten_schema(schema: schemars::Schema, defaults: &serde_json::Value) -> serde_json::Value {
+    let root = schema.as_value();
+    // schemars 1.x puts referenced sub-schemas under `$defs` keyed by
+    // the bare type name (e.g., `UpstreamAddrs`). `$ref` values are
+    // `#/$defs/<name>`.
+    let defs = root
+        .pointer("/$defs")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let mut rows = Vec::new();
+    walk_props(root, defaults, &defs, "", &mut rows);
+    serde_json::Value::Array(rows)
+}
+
+fn walk_props(
+    schema: &serde_json::Value,
+    defaults: &serde_json::Value,
+    defs: &serde_json::Map<String, serde_json::Value>,
+    prefix: &str,
+    rows: &mut Vec<serde_json::Value>,
+) {
+    let Some(props) = schema.pointer("/properties").and_then(|v| v.as_object()) else {
+        return;
+    };
+    // Preserve declaration order: schemars 1.x walks struct fields in
+    // source order and serde_json's Map is insertion-ordered (we don't
+    // enable `preserve_order` but schemars does for its own output).
+    for (key, prop) in props {
+        let dotted = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        let default = defaults
+            .get(key)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        // Resolve `$ref` to the underlying `$defs` entry. Chase one
+        // level — schemars doesn't emit transitive refs for our types.
+        let (resolved, ref_name) = match prop.get("$ref").and_then(|v| v.as_str()) {
+            Some(r) => {
+                let name = r.trim_start_matches("#/$defs/");
+                (defs.get(name).unwrap_or(prop), Some(name.to_owned()))
+            }
+            None => (prop, None),
+        };
+        // Nested struct (has its own `properties`) → recurse with
+        // dotted prefix. Exception: tagged enums (`oneOf`) and arrays
+        // stay as a single row.
+        if resolved.get("properties").is_some() && resolved.get("oneOf").is_none() {
+            walk_props(resolved, &default, defs, &dotted, rows);
+            continue;
+        }
+        rows.push(json!({
+            "key": dotted,
+            "type": describe_type(resolved, ref_name.as_deref()),
+            "default": render_default(&default),
+            "description": prop
+                .get("description")
+                .or_else(|| resolved.get("description"))
+                .and_then(|v| v.as_str())
+                .map(first_sentence)
+                .unwrap_or_default(),
+        }));
+    }
+}
+
+/// Human-readable type name for the docs table. Prefers the `$ref`
+/// target's struct name (e.g., `ChunkBackendKind`) over generic
+/// `object`; renders `Option<T>` (schemars: `type: ["T","null"]` or
+/// `anyOf: [T, null]`) as the inner T.
+fn describe_type(schema: &serde_json::Value, ref_name: Option<&str>) -> String {
+    // anyOf: [<ref-or-type>, {type:null}] — Option<NestedStruct>.
+    if let Some(any) = schema.get("anyOf").and_then(|v| v.as_array()) {
+        let non_null: Vec<_> = any
+            .iter()
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) != Some("null"))
+            .collect();
+        if let [inner] = non_null[..] {
+            let inner_ref = inner
+                .get("$ref")
+                .and_then(|v| v.as_str())
+                .map(|r| r.trim_start_matches("#/$defs/"));
+            return describe_type(inner, inner_ref);
+        }
+    }
+    if let Some(name) = ref_name {
+        return name.to_string();
+    }
+    if schema.get("oneOf").is_some() {
+        return "tagged enum".into();
+    }
+    match schema.get("type") {
+        Some(serde_json::Value::String(t)) => match t.as_str() {
+            "array" => {
+                let item = schema
+                    .pointer("/items/type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("any");
+                format!("list<{item}>")
+            }
+            "integer" => schema
+                .get("format")
+                .and_then(|v| v.as_str())
+                .unwrap_or("integer")
+                .to_string(),
+            "number" => schema
+                .get("format")
+                .and_then(|v| v.as_str())
+                .unwrap_or("number")
+                .to_string(),
+            other => other.to_string(),
+        },
+        // type: ["string","null"] — Option<String> etc.
+        Some(serde_json::Value::Array(ts)) => ts
+            .iter()
+            .filter_map(|v| v.as_str())
+            .find(|&t| t != "null")
+            .unwrap_or("any")
+            .to_string(),
+        _ => "object".into(),
+    }
+}
+
+/// Compact JSON for the Default column. Empty string / null → blank
+/// (rendered as `(required)` or `(unset)` in typst per the prose).
+fn render_default(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(s) if s.is_empty() => String::new(),
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(a) if a.is_empty() => "[]".into(),
+        serde_json::Value::Object(o) if o.values().all(is_emptyish) => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn is_emptyish(v: &serde_json::Value) -> bool {
+    matches!(v, serde_json::Value::Null)
+        || matches!(v, serde_json::Value::String(s) if s.is_empty())
+}
+
+/// Doc comments are paragraphs of design rationale; the reference
+/// table wants the one-line summary. Take the first sentence (up to
+/// the first `. ` followed by an uppercase letter, or the whole
+/// string if no sentence break). Intra-doc links `[foo]` are kept
+/// as-is — typst renders square brackets literally.
+fn first_sentence(desc: &str) -> String {
+    let collapsed = desc.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Find ". " followed by uppercase (real sentence boundary, not
+    // "e.g. foo" or "1.5").
+    let bytes = collapsed.as_bytes();
+    for i in 0..bytes.len().saturating_sub(2) {
+        if bytes[i] == b'.' && bytes[i + 1] == b' ' && bytes[i + 2].is_ascii_uppercase() {
+            return collapsed[..=i].to_string();
+        }
+    }
+    collapsed
 }

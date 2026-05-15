@@ -32023,12 +32023,24 @@
           "packageId": "reqwest 0.13.2"
         },
         {
+          "name": "rio-builder",
+          "packageId": "rio-builder"
+        },
+        {
           "name": "rio-common",
           "packageId": "rio-common"
         },
         {
+          "name": "rio-controller",
+          "packageId": "rio-controller"
+        },
+        {
           "name": "rio-crds",
           "packageId": "rio-crds"
+        },
+        {
+          "name": "rio-gateway",
+          "packageId": "rio-gateway"
         },
         {
           "name": "rio-proto",
@@ -32039,12 +32051,20 @@
           "packageId": "rio-scheduler"
         },
         {
+          "name": "rio-store",
+          "packageId": "rio-store"
+        },
+        {
           "name": "rio-test-support",
           "packageId": "rio-test-support"
         },
         {
           "name": "rustls",
           "packageId": "rustls"
+        },
+        {
+          "name": "schemars",
+          "packageId": "schemars"
         },
         {
           "name": "scopeguard",
