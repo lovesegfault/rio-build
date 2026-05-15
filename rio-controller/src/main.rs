@@ -18,126 +18,17 @@ use std::sync::Arc;
 use clap::Parser;
 use k8s_openapi::api::batch::v1::Job;
 use kube::Client;
-use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use rio_controller::config::{CliArgs, Config};
 use rio_controller::reconcilers::node_informer::NodeLabelCache;
-use rio_controller::reconcilers::nodeclaim_pool::{
-    self, ControllerLeaseHooks, NodeClaimPoolConfig,
-};
+use rio_controller::reconcilers::nodeclaim_pool::{self, ControllerLeaseHooks};
 use rio_controller::reconcilers::{AdminClient, Ctx, componentscaler, node_informer, pool};
 use rio_controller::spawn_controller;
 use rio_crds::componentscaler::ComponentScaler;
 use rio_crds::pool::Pool;
 
-// ----- config (figment two-struct) --------------------------------------------
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(default)]
-struct Config {
-    /// rio-scheduler upstream. Env: `RIO_SCHEDULER__ADDR` /
-    /// `__BALANCE_HOST` / `__BALANCE_PORT`. `balance_host` used two
-    /// ways: (1) injected into worker pods as
-    /// `RIO_SCHEDULER__BALANCE_HOST`; (2) THIS process's autoscaler
-    /// uses it for leader-aware ClusterStatus polling. `None` →
-    /// single-channel via `addr` (ClusterIP — round-robins to the
-    /// standby ~50% of the time with replicas=2).
-    scheduler: rio_common::config::UpstreamAddrs,
-    /// rio-store upstream. Env: `RIO_STORE__ADDR` / `__BALANCE_HOST`
-    /// / `__BALANCE_PORT`. Injected into worker pod containers by
-    /// the Pool reconciler. I-077: balance host needed so
-    /// scaling rio-store 1→4 actually spreads load.
-    store: rio_common::config::UpstreamAddrs,
-    #[serde(flatten)]
-    common: rio_common::config::CommonConfig,
-    /// HTTP /healthz listen address. K8s livenessProbe hits this.
-    health_addr: std::net::SocketAddr,
-    /// GC cron interval (hours). 0 = disabled (reconciler not
-    /// spawned). The cron calls StoreAdminService.TriggerGC with
-    /// default params (dry_run=false, force=false, store's 2h
-    /// grace). `store_addr` is the connect target — StoreAdminService
-    /// is hosted on the store's gRPC port alongside StoreService.
-    gc_interval_hours: u64,
-    /// ADR-023 §13b NodeClaim pool reconciler. `enabled = false` =
-    /// reconciler not spawned (legacy 12-NodePool mode). Env:
-    /// `RIO_NODECLAIM_POOL__ENABLED` / `__DATABASE_URL` / `__LEASE_NAME`
-    /// / `__NODE_CLASS_REF` / `__MAX_FLEET_CORES` / etc.
-    nodeclaim_pool: NodeClaimPoolConfig,
-    /// HMAC key for minting `x-rio-service-token` on AdminService
-    /// calls. SAME file as the gateway/scheduler/store
-    /// `service_hmac_key_path` (one shared `rio-service-hmac` Secret).
-    /// `None` = dev mode (no header attached; scheduler's verifier is
-    /// also `None` and passes through). Env:
-    /// `RIO_SERVICE_HMAC_KEY_PATH`. See `r[sec.authz.service-token]`.
-    service_hmac_key_path: Option<std::path::PathBuf>,
-    /// ADR-023 §13a: pod `requests.memory` floor for the
-    /// `rio.build/hw-bench-needed` gate (STREAM triad working-set
-    /// safety). MUST match the scheduler's `[sla].hw_bench_mem_floor`;
-    /// helm renders both from `sla.hwBenchMemFloor`. Env:
-    /// `RIO_HW_BENCH_MEM_FLOOR`.
-    hw_bench_mem_floor: u64,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            scheduler: rio_common::config::UpstreamAddrs::with_port(9001),
-            store: rio_common::config::UpstreamAddrs::with_port(9002),
-            // 9094: gateway=9090, scheduler=9091, store=9092,
-            // worker=9093. Controller is next.
-            common: rio_common::config::CommonConfig::new(9094),
-            // Same +100 pattern as gateway/worker.
-            health_addr: rio_common::default_addr(9194),
-            // 24h: typical store growth between sweeps is a few
-            // thousand paths. Lower values are fine for VM tests.
-            gc_interval_hours: 24,
-            nodeclaim_pool: NodeClaimPoolConfig::default(),
-            service_hmac_key_path: None,
-            // 8 GiB: matches `rio_scheduler::sla::config::
-            // default_hw_bench_mem_floor`. STREAM triad's 3×4×LLC
-            // working set tops out ~4.6 GiB on c7a.48xlarge.
-            hw_bench_mem_floor: 8 * (1 << 30),
-        }
-    }
-}
-
-#[derive(Parser, Serialize, Default)]
-#[command(name = "rio-controller", about = "Kubernetes operator for rio-build")]
-struct CliArgs {
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metrics_addr: Option<std::net::SocketAddr>,
-
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    health_addr: Option<std::net::SocketAddr>,
-}
-
 // ----- main --------------------------------------------------------------------
-
-impl rio_common::config::ValidateConfig for Config {
-    /// Bounds checks on operator-settable fields. Extracted from
-    /// `main()` so the checks are unit-testable without spinning up
-    /// the full controller (kube-client connect, reconciler spawn).
-    /// Every `ensure!` documents a specific crash or silent-wrong
-    /// that occurs AFTER startup if the bad value gets through.
-    fn validate(&self) -> anyhow::Result<()> {
-        self.scheduler
-            .ensure_required("scheduler.addr", "controller")?;
-        rio_common::config::ensure_required(
-            &self.nodeclaim_pool.database_url,
-            "nodeclaim_pool.database_url",
-            "controller",
-        )?;
-        anyhow::ensure!(
-            self.nodeclaim_pool.max_fleet_cores > 0,
-            "nodeclaim_pool.max_fleet_cores must be > 0"
-        );
-        Ok(())
-    }
-}
-
-rio_common::impl_has_common_config!(Config);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

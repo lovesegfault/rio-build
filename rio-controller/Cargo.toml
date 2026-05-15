@@ -24,6 +24,7 @@ rio-common = { workspace = true }
 rio-crds = { workspace = true }
 rio-lease = { workspace = true }
 rio-proto = { workspace = true }
+schemars = { workspace = true }
 
 # --- Kubernetes ---
 # kube 3.0 notes: chrono → jiff timestamps, schemars MUST be 1.x

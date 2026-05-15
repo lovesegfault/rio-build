@@ -10,9 +10,10 @@
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct Config {
+    /// SSH listen address and port.
     pub listen_addr: std::net::SocketAddr,
     /// rio-scheduler upstream. Env: `RIO_SCHEDULER__ADDR` /
     /// `RIO_SCHEDULER__BALANCE_HOST` / `RIO_SCHEDULER__BALANCE_PORT`.
@@ -26,7 +27,9 @@ pub struct Config {
     /// single-channel only (no `balance_host` — store load is
     /// builder-driven, gateway's QueryPathInfo is light).
     pub store: rio_common::config::UpstreamAddrs,
+    /// SSH host key file path. Required.
     pub host_key: std::path::PathBuf,
+    /// Authorized SSH public keys file path. Required.
     pub authorized_keys: std::path::PathBuf,
     /// Shared `tls` / `metrics_addr` / `drain_grace` fields. Flattened
     /// so the wire format (TOML keys, env var names) is unchanged from
@@ -75,6 +78,7 @@ pub struct Config {
     /// retries against the new replica via NLB). 0 = exit immediately
     /// after accept stops (pre-I-064 behavior, useful for tests).
     #[serde(rename = "session_drain_secs", with = "rio_common::config::secs")]
+    #[schemars(with = "u64")]
     pub session_drain: std::time::Duration,
     /// Per-tenant build-submit rate limiting. `None` (default) →
     /// disabled (unlimited). Set via `gateway.toml [rate_limit]`

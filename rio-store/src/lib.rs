@@ -44,6 +44,8 @@ pub mod cas;
 #[cfg(feature = "server")]
 pub(crate) mod chunker;
 #[cfg(feature = "server")]
+pub mod config;
+#[cfg(feature = "server")]
 pub mod gc;
 #[cfg(feature = "server")]
 pub mod grpc;

@@ -12,8 +12,7 @@ use rio_store::grpc::{ChunkServiceImpl, StoreAdminServiceImpl, StoreServiceImpl}
 use rio_store::signing::{Signer, TenantSigner};
 use rio_store::substitute::Substituter;
 
-mod config;
-use config::{CliArgs, Config, derive_substitute_admission_cap, init_chunk_backend};
+use rio_store::config::{CliArgs, Config, derive_substitute_admission_cap, init_chunk_backend};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

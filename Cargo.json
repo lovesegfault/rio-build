@@ -20743,6 +20743,10 @@
           "packageId": "rio-proto"
         },
         {
+          "name": "schemars",
+          "packageId": "schemars"
+        },
+        {
           "name": "scopeguard",
           "packageId": "scopeguard"
         },
@@ -21002,6 +21006,10 @@
           "packageId": "rustls"
         },
         {
+          "name": "schemars",
+          "packageId": "schemars"
+        },
+        {
           "name": "serde",
           "packageId": "serde"
         },
@@ -21159,6 +21167,10 @@
         {
           "name": "rio-proto",
           "packageId": "rio-proto"
+        },
+        {
+          "name": "schemars",
+          "packageId": "schemars"
         },
         {
           "name": "serde",
@@ -21363,6 +21375,10 @@
         {
           "name": "russh",
           "packageId": "russh"
+        },
+        {
+          "name": "schemars",
+          "packageId": "schemars"
         },
         {
           "name": "serde",
@@ -21836,6 +21852,10 @@
           "packageId": "rio-store"
         },
         {
+          "name": "schemars",
+          "packageId": "schemars"
+        },
+        {
           "name": "serde",
           "packageId": "serde"
         },
@@ -22095,6 +22115,10 @@
         {
           "name": "rio-test-support",
           "packageId": "rio-test-support"
+        },
+        {
+          "name": "schemars",
+          "packageId": "schemars"
         },
         {
           "name": "scopeguard",

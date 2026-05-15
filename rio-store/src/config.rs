@@ -11,9 +11,9 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use crate::backend::{ChunkBackend, FilesystemChunkBackend, S3ChunkBackend};
+use crate::cas::ChunkCache;
 use rio_common::s3::DEFAULT_S3_MAX_ATTEMPTS;
-use rio_store::backend::{ChunkBackend, FilesystemChunkBackend, S3ChunkBackend};
-use rio_store::cas::ChunkCache;
 
 /// Chunk storage backend selection.
 ///
@@ -26,9 +26,9 @@ use rio_store::cas::ChunkCache;
 /// that have no chunk-backend config. All NARs go into PG
 /// `manifests.inline_blob` regardless of size. Fine for dev/CI;
 /// production wants `s3` or `filesystem`.
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "lowercase")]
-pub(crate) enum ChunkBackendKind {
+pub enum ChunkBackendKind {
     /// No chunk backend. All NARs inline in PG. ChunkService returns
     /// FAILED_PRECONDITION.
     #[default]
@@ -49,10 +49,12 @@ pub(crate) enum ChunkBackendKind {
 // networkpolicy.yaml allows CoreDNS + postgres:5432 (toEndpoints +
 // postgresCidr) + S3-VPC-endpoint:443 only — tracey doesn't scan YAML;
 // this Config is the scannable anchor.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
-pub(crate) struct Config {
+pub struct Config {
+    /// gRPC listen address.
     pub listen_addr: std::net::SocketAddr,
+    /// PostgreSQL connection URL. Required.
     pub database_url: String,
     #[serde(flatten)]
     pub common: rio_common::config::CommonConfig,
@@ -125,6 +127,7 @@ pub(crate) struct Config {
     /// `drain_grace + stream_drain` + slack, or kubelet SIGKILLs
     /// mid-wait. Default 90 s. Set via `RIO_STREAM_DRAIN_SECS`.
     #[serde(rename = "stream_drain_secs", with = "rio_common::config::secs")]
+    #[schemars(with = "u64")]
     pub stream_drain: std::time::Duration,
     /// PG connection pool size. Default 50 (was hardcoded 20). The
     /// QueryPathInfo / FindMissingPaths hot path under autoscaled
@@ -162,10 +165,10 @@ impl Default for Config {
             jwt: rio_common::config::JwtConfig::default(),
             service_hmac_key_path: None,
             service_bypass_callers: vec!["rio-gateway".into(), "rio-scheduler".into()],
-            chunk_upload_max_concurrent: rio_store::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
+            chunk_upload_max_concurrent: crate::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
             s3_max_attempts: DEFAULT_S3_MAX_ATTEMPTS,
-            max_batch_paths: rio_store::grpc::DEFAULT_MAX_BATCH_PATHS,
-            chunk_prefetch_k: rio_store::grpc::DEFAULT_CHUNK_PREFETCH_K,
+            max_batch_paths: crate::grpc::DEFAULT_MAX_BATCH_PATHS,
+            chunk_prefetch_k: crate::grpc::DEFAULT_CHUNK_PREFETCH_K,
             stream_drain: std::time::Duration::from_secs(90),
             pg_max_connections: DEFAULT_PG_MAX_CONNECTIONS,
             substitute_admission_permits: None,
@@ -177,7 +180,7 @@ impl Default for Config {
 /// 20) after I-076: 60 autoscaled builders at hello-shallow fan-out
 /// drove `acquired_after_secs=16` on QueryPathInfo. The query is a PK
 /// lookup; the bottleneck is connection acquisition.
-pub(crate) const DEFAULT_PG_MAX_CONNECTIONS: u32 = 50;
+pub const DEFAULT_PG_MAX_CONNECTIONS: u32 = 50;
 
 /// Derive the default `substitute_admission_permits` from the PG pool
 /// size. Spike 0.2 verified the substitute path holds a PG connection
@@ -189,7 +192,7 @@ pub(crate) const DEFAULT_PG_MAX_CONNECTIONS: u32 = 50;
 /// unbounded HTTP fan-out. 128 (not 256) keeps the per-replica S3
 /// fan-out self-consistent: 128 admitted × `S3_PUT_CONCURRENCY` (8) =
 /// 1024, the S3 single-prefix steady-state ceiling.
-pub(crate) fn derive_substitute_admission_cap(pg_max: u32) -> usize {
+pub fn derive_substitute_admission_cap(pg_max: u32) -> usize {
     (pg_max as usize * 3).clamp(64, 128)
 }
 
@@ -198,7 +201,7 @@ pub(crate) fn derive_substitute_admission_cap(pg_max: u32) -> usize {
     name = "rio-store",
     about = "NAR content-addressable store for rio-build"
 )]
-pub(crate) struct CliArgs {
+pub struct CliArgs {
     /// gRPC listen address
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -280,7 +283,7 @@ rio_common::impl_has_common_config!(Config);
 /// `?` on backend construction: filesystem mkdir fail or S3
 /// bad-region means we can't store chunks — startup error, not
 /// degraded mode. Inline backend can't fail (returns `None`).
-pub(crate) async fn init_chunk_backend(
+pub async fn init_chunk_backend(
     kind: &ChunkBackendKind,
     cache_capacity_bytes: u64,
     s3_max_attempts: u32,
@@ -356,7 +359,7 @@ mod tests {
         // ConfigMap mount configured via RIO_JWT__KEY_PATH).
         assert!(d.jwt.key_path.is_none());
         assert!(!d.jwt.required);
-        assert_eq!(d.max_batch_paths, rio_store::grpc::DEFAULT_MAX_BATCH_PATHS);
+        assert_eq!(d.max_batch_paths, crate::grpc::DEFAULT_MAX_BATCH_PATHS);
         // r[verify store.get.chunk-prefetch]
         assert_eq!(d.chunk_prefetch_k, 64);
         assert_eq!(d.stream_drain, std::time::Duration::from_secs(90));
@@ -714,7 +717,7 @@ mod tests {
         assert!(cfg.hmac_key_path.is_none());
         assert_eq!(
             cfg.chunk_upload_max_concurrent,
-            rio_store::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY
+            crate::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY
         );
         assert_eq!(cfg.s3_max_attempts, DEFAULT_S3_MAX_ATTEMPTS);
     });

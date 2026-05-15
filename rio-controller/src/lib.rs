@@ -41,6 +41,7 @@
 //! submission is via SSH (`nix build --store ssh-ng://`) — no
 //! K8s-native submission CRD.
 
+pub mod config;
 pub(crate) mod error;
 #[cfg(test)]
 pub(crate) mod fixtures;

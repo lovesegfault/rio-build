@@ -1326,7 +1326,9 @@ impl DerivationState {
 /// `Config` precedent. Serialize + PartialEq are
 /// for the TOML-roundtrip tests in main.rs (`assert_eq!(cfg.poison,
 /// PoisonConfig::default())`).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(default)]
 pub struct PoisonConfig {
     /// Failures before poison. Default 3 (the former POISON_THRESHOLD).

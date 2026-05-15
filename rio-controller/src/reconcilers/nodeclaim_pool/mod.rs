@@ -245,7 +245,7 @@ pub fn placeable_channel() -> (tokio::sync::watch::Sender<PlaceableSet>, Placeab
 /// `/etc/rio/controller.toml` (helm `rio-controller-config` ConfigMap) —
 /// figment's Env provider yields bare strings, so nested map fields
 /// cannot load from env.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct NodeClaimPoolConfig {
     /// PostgreSQL URL for [`CellSketches`] persist/load. Same DB as

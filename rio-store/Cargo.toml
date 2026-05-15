@@ -67,6 +67,7 @@ test-utils = ["server", "dep:rio-test-support"]
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+schemars = { workspace = true }
 # realisations.rs hex-encodes drv_hash for instrument span fields.
 hex = { workspace = true }
 # RFC 9110 Retry-After HTTP-date parsing (substitute.rs 429 handling).

@@ -17,6 +17,7 @@ rio-common = { workspace = true }
 rio-auth = { workspace = true }
 rio-nix = { workspace = true }
 rio-proto = { workspace = true }
+schemars = { workspace = true }
 
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

@@ -26,6 +26,7 @@ test-fixtures = ["dep:toml"]
 rio-common = { workspace = true }
 rio-nix = { workspace = true }
 rio-proto = { workspace = true }
+schemars = { workspace = true }
 
 tokio = { workspace = true }
 tonic = { workspace = true }

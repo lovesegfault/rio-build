@@ -26,6 +26,7 @@ test-fixtures = []
 rio-common = { workspace = true, features = ["postgres", "aws"] }
 rio-auth = { workspace = true }
 rio-proto = { workspace = true }
+schemars = { workspace = true }
 # `schema`-only: just `realisations` + `error` (sqlx + thiserror), no
 # aws-sdk-s3/axum/moka/reqwest. Lets ca/resolve.rs delegate to
 # `rio_store::realisations::query` instead of carrying a raw-SQL copy

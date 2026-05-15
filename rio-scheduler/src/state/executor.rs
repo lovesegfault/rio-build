@@ -266,7 +266,7 @@ impl ExecutorState {
 /// fields mean this is a BITWISE compare — acceptable for config
 /// (the test just asserts default-constructed identity, not
 /// computed-value equality).
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RetryPolicy {
     /// Maximum number of retries for transient failures.

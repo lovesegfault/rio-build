@@ -16,8 +16,7 @@ use rio_scheduler::admin::AdminServiceImpl;
 use rio_scheduler::db::SchedulerDb;
 use rio_scheduler::grpc::SchedulerGrpc;
 
-mod config;
-use config::{CliArgs, Config, DashboardConfig};
+use rio_scheduler::config::{CliArgs, Config, DashboardConfig};
 
 /// Scheduler-specific lease transition hooks: emit `rio_scheduler_lease_*`
 /// metrics and fire-and-forget `LeaderAcquired`/`LeaderLost` to the actor.

@@ -12714,6 +12714,10 @@
           "packageId": "rustls"
         },
         {
+          "name": "schemars",
+          "packageId": "schemars"
+        },
+        {
           "name": "serde",
           "packageId": "serde"
         },
@@ -13021,6 +13025,10 @@
         {
           "name": "rio-proto",
           "packageId": "rio-proto"
+        },
+        {
+          "name": "schemars",
+          "packageId": "schemars"
         },
         {
           "name": "scopeguard",

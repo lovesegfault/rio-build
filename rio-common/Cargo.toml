@@ -18,6 +18,8 @@ postgres = ["dep:sqlx"]
 aws = ["dep:aws-config", "dep:aws-sdk-s3"]
 
 [dependencies]
+# JSON Schema derivation for Config structs (`docs/gen/config.json`).
+schemars = { workspace = true }
 # Optional: shared migration wrapper (postgres feature).
 sqlx = { workspace = true, optional = true }
 # Optional: shared S3 client builder (aws feature).

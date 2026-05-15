@@ -108,7 +108,7 @@ pub mod secs {
 /// first so this never fires there, but tests that parse a bare
 /// TOML snippet (and figment's own internal re-deserialize during
 /// merge) need it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct CommonConfig {
     /// Prometheus exporter listen address. Per-binary defaults differ
@@ -121,6 +121,7 @@ pub struct CommonConfig {
     /// three tonic-serving binaries (scheduler/store/gateway) consume
     /// this; controller and builder ignore it.
     #[serde(rename = "drain_grace_secs", with = "secs")]
+    #[schemars(with = "u64")]
     pub drain_grace: std::time::Duration,
 }
 
@@ -168,7 +169,7 @@ impl CommonConfig {
 ///
 /// `rio-proto::client::connect` takes this to do the balance-vs-single
 /// dispatch that was previously open-coded ~40L per binary.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct UpstreamAddrs {
     /// ClusterIP Service `host:port`. Required (no compiled default —
@@ -365,7 +366,7 @@ pub trait ValidateConfig {
 /// for workers/health probes regardless). A handler that needs strict
 /// JWT reads `required` from its own config and checks for Claims
 /// extension presence.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct JwtConfig {
     /// true = JWT mint/verify failure → reject. false (default) =

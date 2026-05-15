@@ -9,39 +9,43 @@ use serde::{Deserialize, Serialize};
 
 // Two-struct config split — see rio-common/src/config.rs for rationale.
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
-pub(super) struct Config {
-    pub(super) listen_addr: std::net::SocketAddr,
+pub struct Config {
+    /// gRPC listen address for SchedulerService + ExecutorService.
+    pub listen_addr: std::net::SocketAddr,
     /// rio-store upstream. Env: `RIO_STORE__ADDR`. Scheduler uses
     /// `connect_store_lazy` (re-resolves on reconnect) so
     /// `balance_host` is unused — the lazy channel follows the
     /// ClusterIP Service's current endpoint without an explicit p2c.
-    pub(super) store: rio_common::config::UpstreamAddrs,
-    pub(super) database_url: String,
+    pub store: rio_common::config::UpstreamAddrs,
+    /// PostgreSQL connection URL. Required.
+    pub database_url: String,
     #[serde(flatten)]
-    pub(super) common: rio_common::config::CommonConfig,
+    pub common: rio_common::config::CommonConfig,
+    /// Tick interval (seconds) for scheduler housekeeping.
     #[serde(rename = "tick_interval_secs", with = "rio_common::config::secs")]
-    pub(super) tick_interval: std::time::Duration,
+    #[schemars(with = "u64")]
+    pub tick_interval: std::time::Duration,
     /// S3 bucket for build-log flush. `None` = flush disabled.
     /// Env: `RIO_LOG_S3_BUCKET`. Wired into LogFlusher in main().
-    pub(super) log_s3_bucket: Option<String>,
+    pub log_s3_bucket: Option<String>,
     /// I-204: `requiredSystemFeatures` values that are capability HINTS,
     /// not hardware gates. Stripped from each derivation at DAG-insert so
     /// they don't drive pool spawn or block dispatch. nixpkgs convention:
     /// `big-parallel`, `benchmark`. Helm sets via `scheduler.softFeatures`.
-    pub(super) soft_features: Vec<String>,
+    pub soft_features: Vec<String>,
     /// HMAC key file for signing assignment tokens. The store
     /// verifies on PutPath with the SAME key. Unset = unsigned
     /// tokens (dev mode). Generate: `openssl rand -out /path 32`.
-    pub(super) hmac_key_path: Option<std::path::PathBuf>,
+    pub hmac_key_path: Option<std::path::PathBuf>,
     /// HMAC key file for signing `x-rio-service-token` (SEPARATE from
     /// `hmac_key_path`). The scheduler mints `ServiceClaims { caller:
     /// "rio-scheduler" }` so the store honours `x-rio-probe-tenant-id`
     /// on dispatch-time `FindMissingPaths`/`QueryPathInfo` —
     /// `r[sched.dispatch.fod-substitute]`. Unset = dispatch-time
     /// substitution probe disabled (falls back to local-presence-only).
-    pub(super) service_hmac_key_path: Option<std::path::PathBuf>,
+    pub service_hmac_key_path: Option<std::path::PathBuf>,
     /// JWT verification. `key_path` → ConfigMap mount at
     /// `/etc/rio/jwt/ed25519_pubkey` (see helm jwt-pubkey-configmap.yaml).
     /// The gateway signs with the matching seed; scheduler verifies.
@@ -49,62 +53,67 @@ pub(super) struct Config {
     /// SIGHUP reloads from the same path — kubelet remounts the
     /// ConfigMap on rotation, operator SIGHUPs the pod. Set via
     /// `RIO_JWT__KEY_PATH` (nested figment key — double underscore).
-    pub(super) jwt: rio_common::config::JwtConfig,
+    pub jwt: rio_common::config::JwtConfig,
     /// Kubernetes Lease name for leader election. `None` = non-K8s
     /// mode (single-scheduler; is_leader=true immediately, generation
-    /// stays 1). Env: `RIO_LEASE_NAME`. See rio_scheduler::lease.
-    pub(super) lease_name: Option<String>,
+    /// stays 1). Env: `RIO_LEASE_NAME`. See crate::lease.
+    pub lease_name: Option<String>,
     /// Kubernetes namespace for the Lease. `None` = read from the
     /// in-cluster serviceaccount mount, fall back to "default".
     /// Env: `RIO_LEASE_NAMESPACE`. Ignored when `lease_name` is None.
-    pub(super) lease_namespace: Option<String>,
+    pub lease_namespace: Option<String>,
     /// Poison-detection thresholds. `[poison]` table in scheduler.toml.
     /// `r[sched.retry.per-executor-budget]` (scheduler.md:110) specifies
     /// both this and `retry` below as TOML-configurable. P0219 shipped
     /// the structs + builders; this wires them. Default: 3 distinct
     /// workers must fail (matches the former `POISON_THRESHOLD` const).
     /// No CLI override — infrequently-tweaked deploy config.
-    pub(super) poison: rio_scheduler::PoisonConfig,
+    pub poison: crate::PoisonConfig,
     /// Per-worker retry backoff curve. `[retry]` table in scheduler.toml.
     /// Default: 2 retries, 5s→300s exponential with 20% jitter. No CLI
     /// override for the same reason as `poison`.
-    pub(super) retry: rio_scheduler::RetryPolicy,
+    pub retry: crate::RetryPolicy,
     /// In-flight detached substitute-fetch task bound
     /// (r[sched.substitute.detached+2]) — memory-safety only; per-replica
     /// throttling is `r[store.substitute.admission]`. Sizes
     /// `DagActor.substitute_sem`. Env: `RIO_SUBSTITUTE_MAX_CONCURRENT`
     /// (operator escape hatch — not chart-set). Default 256.
     #[serde(default = "default_substitute_concurrency")]
-    pub(super) substitute_max_concurrent: usize,
+    pub substitute_max_concurrent: usize,
     /// gRPC-Web / CORS config for the dashboard SPA. `[dashboard]`
     /// table in scheduler.toml. Env: `RIO_DASHBOARD__*`.
-    pub(super) dashboard: DashboardConfig,
+    pub dashboard: DashboardConfig,
     /// ADR-023 SLA-driven sizing. `[sla]` table in scheduler.toml —
     /// mandatory (helm always renders it). No env override — structured
     /// config only. The figment baseline (`Default for Config`) is
-    /// [`rio_scheduler::sla::config::SlaConfig::figment_baseline`],
+    /// [`crate::sla::config::SlaConfig::figment_baseline`],
     /// which leaves `maxCores`/`maxMem`/`hwClasses` empty so a TOML
     /// that omits them is read as "unset" — figment merges per-key,
     /// so a populated baseline would mask the §13c-3 catalog derive.
     /// Validated via
-    /// [`rio_scheduler::sla::config::SlaConfig::validate_shape`] +
-    /// [`rio_scheduler::sla::config::SlaConfig::validate_resolved`].
-    pub(super) sla: rio_scheduler::sla::config::SlaConfig,
+    /// [`crate::sla::config::SlaConfig::validate_shape`] +
+    /// [`crate::sla::config::SlaConfig::validate_resolved`].
+    // Skipped from the docs schema: ADR-023 SLA config has its own
+    // dedicated spec chapter and ~2.7KLoC of nested types (Tier,
+    // ProbeShape, HwClassDef, Cell-keyed maps) that don't flatten
+    // usefully into ref/configuration.typ's per-key table.
+    #[schemars(skip)]
+    pub sla: crate::sla::config::SlaConfig,
     /// Permit a `[sla].reference_hw_class` change vs the value
     /// persisted in `sla_config_epoch` (M_058). DESTRUCTIVE — resets
     /// `build_samples`, `hw_perf_samples`, and this cluster's
     /// `sla_ema_state`. CLI-only (`--allow-reference-change`); never
     /// set from TOML/env so a stale flag can't survive a rollout.
-    pub(super) allow_reference_change: bool,
+    pub allow_reference_change: bool,
 }
 
 /// Dashboard browser-facing settings. The scheduler serves gRPC-Web
 /// natively on its main port (D3) so the ingress is a plain HTTP
 /// router — CORS therefore lives here, not in a proxy CRD.
 // r[impl dash.envoy.grpc-web-translate+3]
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
-pub(super) struct DashboardConfig {
+pub struct DashboardConfig {
     /// Comma-separated CORS allowed origins for gRPC-Web requests.
     /// Env: `RIO_DASHBOARD__CORS_ALLOW_ORIGINS`. The dashboard nginx
     /// Service is the only legitimate browser origin in-cluster;
@@ -112,7 +121,7 @@ pub(super) struct DashboardConfig {
     /// hostname via helm `dashboard.cors.allowOrigins`. Comma-joined
     /// string (not `Vec<String>`) so figment's env provider works
     /// without a custom split — helm renders `| join ","`.
-    pub(super) cors_allow_origins: String,
+    pub cors_allow_origins: String,
 }
 
 impl Default for DashboardConfig {
@@ -124,7 +133,7 @@ impl Default for DashboardConfig {
 }
 
 fn default_substitute_concurrency() -> usize {
-    rio_scheduler::DEFAULT_SUBSTITUTE_CONCURRENCY
+    crate::DEFAULT_SUBSTITUTE_CONCURRENCY
 }
 
 impl Default for Config {
@@ -142,11 +151,11 @@ impl Default for Config {
             jwt: rio_common::config::JwtConfig::default(),
             lease_name: None,
             lease_namespace: None,
-            poison: rio_scheduler::PoisonConfig::default(),
-            retry: rio_scheduler::RetryPolicy::default(),
+            poison: crate::PoisonConfig::default(),
+            retry: crate::RetryPolicy::default(),
             substitute_max_concurrent: default_substitute_concurrency(),
             dashboard: DashboardConfig::default(),
-            sla: rio_scheduler::sla::config::SlaConfig::figment_baseline(),
+            sla: crate::sla::config::SlaConfig::figment_baseline(),
             allow_reference_change: false,
         }
     }
@@ -157,38 +166,38 @@ impl Default for Config {
     name = "rio-scheduler",
     about = "DAG-aware build scheduler for rio-build"
 )]
-pub(super) struct CliArgs {
+pub struct CliArgs {
     /// gRPC listen address for SchedulerService + ExecutorService
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) listen_addr: Option<std::net::SocketAddr>,
+    pub listen_addr: Option<std::net::SocketAddr>,
 
     /// PostgreSQL connection URL
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) database_url: Option<String>,
+    pub database_url: Option<String>,
 
     /// Prometheus metrics listen address
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) metrics_addr: Option<std::net::SocketAddr>,
+    pub metrics_addr: Option<std::net::SocketAddr>,
 
     /// Tick interval for housekeeping (seconds)
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) tick_interval_secs: Option<u64>,
+    pub tick_interval_secs: Option<u64>,
 
     /// S3 bucket for build-log zstd flush (unset = flush disabled)
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) log_s3_bucket: Option<String>,
+    pub log_s3_bucket: Option<String>,
 
     /// Permit an `[sla].reference_hw_class` change vs persisted —
     /// DESTRUCTIVE: resets build_samples / hw_perf_samples /
-    /// sla_ema_state. See `rio_scheduler::sla::check_reference_epoch`.
+    /// sla_ema_state. See `crate::sla::check_reference_epoch`.
     #[arg(long)]
     #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub(super) allow_reference_change: bool,
+    pub allow_reference_change: bool,
 }
 
 impl rio_common::config::ValidateConfig for Config {

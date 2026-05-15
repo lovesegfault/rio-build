@@ -37,7 +37,7 @@ fn executor_kind_ser<S: serde::Serializer>(k: &ExecutorKind, s: S) -> Result<S::
 // Configuration (two-struct split per rio-common/src/config.rs)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct Config {
     /// If empty after merge → auto-detect via hostname.
@@ -51,6 +51,7 @@ pub struct Config {
         deserialize_with = "executor_kind",
         serialize_with = "executor_kind_ser"
     )]
+    #[schemars(with = "String")]
     pub executor_kind: ExecutorKind,
     /// rio-scheduler upstream. Env: `RIO_SCHEDULER__ADDR` /
     /// `__BALANCE_HOST` / `__BALANCE_PORT`. `balance_host = Some` →
@@ -67,6 +68,7 @@ pub struct Config {
     /// Env: `RIO_SYSTEMS=x86_64-linux,aarch64-linux` (comma-sep)
     /// or TOML `systems = ["x86_64-linux"]`.
     #[serde(deserialize_with = "rio_common::config::comma_vec")]
+    #[schemars(with = "Vec<String>")]
     pub systems: Vec<String>,
     /// requiredSystemFeatures this builder supports (e.g., "kvm",
     /// "big-parallel"). Scheduler's `hard_filter()` all-matches the
@@ -74,9 +76,13 @@ pub struct Config {
     /// or `rejection_reason()` rejects any derivation with
     /// requiredSystemFeatures.
     #[serde(deserialize_with = "rio_common::config::comma_vec")]
+    #[schemars(with = "Vec<String>")]
     pub features: Vec<String>,
+    /// FUSE mount point. Never `/nix/store` --- that would shadow the host store.
     pub fuse_mount_point: PathBuf,
+    /// Local SSD cache directory for the FUSE cache.
     pub fuse_cache_dir: PathBuf,
+    /// Number of FUSE daemon threads.
     pub fuse_threads: u32,
     /// Defaults to `true`. NOT the serde bool default — see `default_true`.
     /// A drift here (`false`) would silently disable kernel passthrough,
@@ -99,7 +105,9 @@ pub struct Config {
     /// `clang-21.1.8-debug` mid-stream → daemon EIO → build failure on a
     /// healthy store. Env: `RIO_FUSE_FETCH_TIMEOUT_SECS`.
     #[serde(rename = "fuse_fetch_timeout_secs", with = "rio_common::config::secs")]
+    #[schemars(with = "u64")]
     pub fuse_fetch_timeout: std::time::Duration,
+    /// Base directory for per-build overlay upper/work layers.
     pub overlay_base_dir: PathBuf,
     #[serde(flatten)]
     pub common: rio_common::config::CommonConfig,
@@ -117,6 +125,7 @@ pub struct Config {
     /// means the build is broken. See plan 21 Batch E
     /// `cfg-builder-knobs-unreachable-in-k8s`.
     pub log_rate_limit: u64,
+    /// Max total log bytes per build before `LogLimitExceeded`. (0 = unlimited)
     pub log_size_limit: u64,
     /// k8s `spec.nodeName` (downward API → `RIO_NODE_NAME`). Attached
     /// to `CompletionReport` for ADR-023's hw_class join (scheduler
@@ -157,6 +166,7 @@ pub struct Config {
     /// a bound on blast radius of a truly stuck daemon, not an expected
     /// build time.
     #[serde(rename = "daemon_timeout_secs", with = "rio_common::config::secs")]
+    #[schemars(with = "u64")]
     pub daemon_timeout: std::time::Duration,
     /// Silence timeout (seconds): kill the build if no output for N seconds.
     /// 0 = disabled. Used when the assignment's BuildOptions.max_silent_time
@@ -175,6 +185,7 @@ pub struct Config {
     /// the daemon to advertise `set-options-map-only`, which rio-gateway does
     /// not — tracked under WONTFIX(P0310).
     #[serde(rename = "max_silent_time_secs", with = "rio_common::config::secs")]
+    #[schemars(with = "u64")]
     pub max_silent_time: std::time::Duration,
     /// I-116 idle timeout: exit if no assignment arrives for this
     /// long. Controller spawns N Jobs based on queue depth; if the
@@ -182,6 +193,7 @@ pub struct Config {
     /// would otherwise idle until activeDeadlineSeconds. Env:
     /// `RIO_IDLE_SECS`. Default 120.
     #[serde(rename = "idle_secs", with = "rio_common::config::secs")]
+    #[schemars(with = "u64")]
     pub idle_timeout: std::time::Duration,
     // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
     // route to fetchers which have direct egress. Squid proxy deleted.
