@@ -201,46 +201,52 @@ See #link("./spec/components/gateway.typ")[rio-gateway] for protocol opcode deta
 #link("./spec/components/scheduler.typ")[rio-scheduler] for the scheduling algorithm,
 and #link("./spec/components/store.typ")[rio-store] for the chunked CAS.
 
-// TODO(typst-migration): convert to chronos sequence diagram
-```mermaid
-sequenceDiagram
-    participant Client as Nix Client
-    participant GW as rio-gateway
-    participant Sched as rio-scheduler
-    participant Builder as rio-builder
-    participant Store as rio-store
+#figure(
+  chronos.diagram({
+    import chronos: *
+    _par("Client", display-name: [Nix Client])
+    _par("GW", display-name: [rio-gateway])
+    _par("Sched", display-name: [rio-scheduler])
+    _par("Builder", display-name: [rio-builder])
+    _par("Store", display-name: [rio-store])
 
-    Client->>GW: SSH connect + handshake
-    Client->>GW: wopSetOptions (ssh:// only; ssh-ng skips)
-    Client->>GW: wopQueryValidPaths
-    GW->>Store: FindMissingPaths
-    Store-->>GW: missing paths
-    GW-->>Client: valid paths (inverted)
-    Client->>GW: wopAddToStoreNar (.drv files)
-    GW->>Store: PutPath
-    Client->>GW: wopQueryDerivationOutputMap
-    GW->>Store: GetPath (.drv NAR)
-    GW->>GW: parse ATerm -> output map
-    GW-->>Client: derivation output map
-    Client->>GW: wopBuildDerivation
-    GW->>Sched: SubmitBuild (DAG)
-    Sched->>Store: FindMissingPaths (cache check)
-    Store-->>Sched: missing paths
-    Sched->>Builder: WorkAssignment (via BuildExecution)
-    Builder->>Store: GetPath (FUSE fetch)
-    Builder->>Builder: nix sandbox build
-    Builder->>Sched: BuildLogBatch
-    Sched->>GW: BuildEvent (logs)
-    GW->>Client: STDERR_NEXT
-    Builder->>Store: PutPath (output)
-    Builder->>Sched: CompletionReport
-    Sched->>GW: BuildEvent (completed)
-    GW->>Client: STDERR_LAST + BuildResult
-    Client->>GW: wopNarFromPath
-    GW->>Store: GetPath
-    Store-->>GW: NAR stream
-    GW-->>Client: NAR data
-```
+    _seq("Client", "GW", comment: [SSH connect + handshake])
+    _seq(
+      "Client",
+      "GW",
+      comment: [`wopSetOptions` (`ssh://` only; ssh-ng skips)],
+    )
+    _seq("Client", "GW", comment: [`wopQueryValidPaths`])
+    _seq("GW", "Store", comment: [`FindMissingPaths`])
+    _seq("Store", "GW", comment: [missing paths], dashed: true)
+    _seq("GW", "Client", comment: [valid paths (inverted)], dashed: true)
+    _seq("Client", "GW", comment: [`wopAddToStoreNar` (.drv files)])
+    _seq("GW", "Store", comment: [`PutPath`])
+    _seq("Client", "GW", comment: [`wopQueryDerivationOutputMap`])
+    _seq("GW", "Store", comment: [`GetPath` (.drv NAR)])
+    _seq("GW", "GW", comment: [parse ATerm → output map])
+    _seq("GW", "Client", comment: [derivation output map], dashed: true)
+    _seq("Client", "GW", comment: [`wopBuildDerivation`])
+    _seq("GW", "Sched", comment: [`SubmitBuild` (DAG)])
+    _seq("Sched", "Store", comment: [`FindMissingPaths` (cache check)])
+    _seq("Store", "Sched", comment: [missing paths], dashed: true)
+    _seq("Sched", "Builder", comment: [`WorkAssignment` (via `BuildExecution`)])
+    _seq("Builder", "Store", comment: [`GetPath` (FUSE fetch)])
+    _seq("Builder", "Builder", comment: [nix sandbox build])
+    _seq("Builder", "Sched", comment: [`BuildLogBatch`])
+    _seq("Sched", "GW", comment: [`BuildEvent` (logs)])
+    _seq("GW", "Client", comment: [`STDERR_NEXT`])
+    _seq("Builder", "Store", comment: [`PutPath` (output)])
+    _seq("Builder", "Sched", comment: [`CompletionReport`])
+    _seq("Sched", "GW", comment: [`BuildEvent` (completed)])
+    _seq("GW", "Client", comment: [`STDERR_LAST` + `BuildResult`])
+    _seq("Client", "GW", comment: [`wopNarFromPath`])
+    _seq("GW", "Store", comment: [`GetPath`])
+    _seq("Store", "GW", comment: [NAR stream], dashed: true)
+    _seq("GW", "Client", comment: [NAR data], dashed: true)
+  }),
+  caption: [Remote-store build flow (`nix build --store ssh-ng://rio`).],
+)
 
 == Remote Builder: `nix build --builders 'ssh-ng://rio ...'`
 
@@ -273,27 +279,29 @@ sequenceDiagram
   distinguish build hook vs direct client connections.
 ]
 
-// TODO(typst-migration): convert to chronos sequence diagram
-```mermaid
-sequenceDiagram
-    participant Daemon as Local nix-daemon
-    participant Hook as Build Hook
-    participant GW as rio-gateway
-    participant Sched as rio-scheduler
-    participant Builder as rio-builder
+#figure(
+  chronos.diagram({
+    import chronos: *
+    _par("Daemon", display-name: [Local nix-daemon])
+    _par("Hook", display-name: [Build Hook])
+    _par("GW", display-name: [rio-gateway])
+    _par("Sched", display-name: [rio-scheduler])
+    _par("Builder", display-name: [rio-builder])
 
-    Daemon->>Hook: delegate derivation
-    Hook->>GW: SSH connect
-    Hook->>GW: wopBuildDerivation (single)
-    GW->>Sched: SubmitBuild (single node)
-    Sched->>Builder: WorkAssignment
-    Builder->>Builder: build
-    Builder->>Sched: CompletionReport
-    Sched->>GW: BuildEvent (completed)
-    GW->>Hook: BuildResult
-    Hook->>Daemon: output path
-    Daemon->>Daemon: continue DAG
-```
+    _seq("Daemon", "Hook", comment: [delegate derivation])
+    _seq("Hook", "GW", comment: [SSH connect])
+    _seq("Hook", "GW", comment: [`wopBuildDerivation` (single)])
+    _seq("GW", "Sched", comment: [`SubmitBuild` (single node)])
+    _seq("Sched", "Builder", comment: [`WorkAssignment`])
+    _seq("Builder", "Builder", comment: [build])
+    _seq("Builder", "Sched", comment: [`CompletionReport`])
+    _seq("Sched", "GW", comment: [`BuildEvent` (completed)])
+    _seq("GW", "Hook", comment: [`BuildResult`])
+    _seq("Hook", "Daemon", comment: [output path])
+    _seq("Daemon", "Daemon", comment: [continue DAG])
+  }),
+  caption: [Build-hook flow (`--builders 'ssh-ng://rio'`).],
+)
 
 == Client Disconnection
 
@@ -321,26 +329,29 @@ sequenceDiagram
   period is not planned.
 ]
 
-// TODO(typst-migration): convert to chronos sequence diagram
-```mermaid
-sequenceDiagram
-    participant Client as Nix Client
-    participant GW as rio-gateway
-    participant Sched as rio-scheduler
-    participant Builder as rio-builder
+#figure(
+  chronos.diagram({
+    import chronos: *
+    _par("Client", display-name: [Nix Client])
+    _par("GW", display-name: [rio-gateway])
+    _par("Sched", display-name: [rio-scheduler])
+    _par("Builder", display-name: [rio-builder])
 
-    Client-xGW: SSH connection drops
-    GW->>Sched: CancelBuild (client_disconnect)
-    alt Shared derivation
-        Sched->>Sched: continue (other builds need it)
-    else Unique derivation
-        Sched->>Sched: remove from queue immediately
-    end
-    Builder->>Sched: CompletionReport (if already Running)
-    Note over Sched: Outputs kept in store regardless
-    Client->>GW: Reconnect + re-submit
-    Sched->>Sched: DAG merge + cache hits on stored outputs
-```
+    _seq("Client", "GW", end-tip: "x", comment: [SSH connection drops])
+    _seq("GW", "Sched", comment: [`CancelBuild` (client_disconnect)])
+    _alt(
+      [Shared derivation],
+      { _seq("Sched", "Sched", comment: [continue (other builds need it)]) },
+      [Unique derivation],
+      { _seq("Sched", "Sched", comment: [remove from queue immediately]) },
+    )
+    _seq("Builder", "Sched", comment: [`CompletionReport` (if already Running)])
+    _note("over", [Outputs kept in store regardless], pos: "Sched")
+    _seq("Client", "GW", comment: [Reconnect + re-submit])
+    _seq("Sched", "Sched", comment: [DAG merge + cache hits on stored outputs])
+  }),
+  caption: [Client-disconnection handling.],
+)
 
 == Scheduler Failover
 
