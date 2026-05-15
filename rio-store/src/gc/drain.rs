@@ -900,6 +900,15 @@ mod tests {
                 }
                 self.inner.delete_by_key(k).await
             }
+            async fn put_blob(&self, k: &str, d: bytes::Bytes) -> anyhow::Result<()> {
+                self.inner.put_blob(k, d).await
+            }
+            async fn get_blob(&self, k: &str) -> anyhow::Result<Option<bytes::Bytes>> {
+                self.inner.get_blob(k).await
+            }
+            async fn delete_blob(&self, k: &str) -> anyhow::Result<()> {
+                self.inner.delete_blob(k).await
+            }
         }
 
         let entered_second = Arc::new(Notify::new());

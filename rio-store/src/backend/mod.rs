@@ -1,27 +1,27 @@
 //! Chunk storage backends.
 //!
-//! Stores BLAKE3-addressed chunks. Three impls: S3 (prod), filesystem
-//! (dev), memory (tests). The trait is put/get/exists_batch/delete_by_key
-//! — chunks are immutable and content-addressed, so there's no update or
-//! rename. Delete goes through the `pending_s3_deletes` outbox: GC sweep
-//! enqueues keys in-transaction, the drain task calls `delete_by_key`.
+//! Stores BLAKE3-addressed chunks plus string-keyed blobs (the
+//! stock-Nix narinfo/NAR sidecars). Four impls: S3 (prod), tiered
+//! ([`TieredChunkBackend`] — Express read-through cache over S3),
+//! filesystem (dev), memory (tests). Chunks are immutable and
+//! content-addressed, so there's no update or rename. Delete goes
+//! through the `pending_s3_deletes` outbox: GC sweep enqueues keys
+//! in-transaction, the drain task calls `delete_by_key`.
 //!
-//! # Design
+//! Chunk keys are `[u8; 32]` (BLAKE3), not strings — no path-traversal
+//! concern. Blob keys are strings and pass `validate_blob_key`.
+//! `get`/`get_blob` return `Bytes` (owned), not `AsyncRead`: chunks are
+//! ≤256 KiB and blobs are narinfo-sized; buffering simplifies callers.
+//! `exists_batch` (not `exists`) because PutPath checks hundreds of
+//! chunks per call.
 //!
-//! - Keys are `[u8; 32]` (BLAKE3), not string. No path-traversal concern
-//!   (hex-encoding a fixed-width array can't contain `../`).
-//! - `get` returns `Bytes` (owned), not `AsyncRead`. Chunks are small
-//!   (max 256 KiB); buffering into memory is fine and simplifies callers
-//!   — no stream-juggling during reassembly.
-//! - `exists_batch` (not `exists`): PutPath checks ~100s of chunks at
-//!   once. A batch RPC (or local batch check) beats 100 sequential calls.
-//!
-//! # S3 key scheme
-//!
-//! `chunks/{aa}/{blake3-hex}` where `{aa}` is the first two hex chars.
-//! Prefix-partitioning per `store.typ` — S3 shards by key prefix, so
-//! spreading across 256 prefixes avoids hotspotting a single shard when
-//! a thousand workers hit the store at once.
+//! S3 key scheme: `chunks/{aa}/{blake3-hex}` for chunks (the two-char
+//! prefix spreads load across S3 shards per `store.typ`),
+//! `{prefix}/{key}` for blobs.
+
+mod tiered;
+
+pub use tiered::TieredChunkBackend;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -188,6 +188,25 @@ pub trait ChunkBackend: Send + Sync {
     /// with backoff; after max attempts it stops (alert-worthy but not
     /// a process crash — S3 objects leak, PG state is correct).
     async fn delete_by_key(&self, key: &str) -> anyhow::Result<()>;
+
+    /// Store a string-keyed blob next to the chunk namespace.
+    ///
+    /// For the stock-Nix binary-cache sidecars (`{hash}.narinfo`,
+    /// `nar/{hash}.nar.zst`, `nix-cache-info`), which the
+    /// `[u8; 32]`-addressed API can't express. rio-store is the writer;
+    /// stock Nix reads them straight from the bucket. Last-writer-wins.
+    /// Backends reject `..` / absolute paths / the `chunks/` prefix and
+    /// otherwise leave the key shape to the caller.
+    async fn put_blob(&self, key: &str, data: Bytes) -> anyhow::Result<()>;
+
+    /// Fetch a string-keyed blob. `None` if absent. Used by the compat
+    /// reconciler and the once-only `nix-cache-info` write — not the
+    /// hot read path.
+    async fn get_blob(&self, key: &str) -> anyhow::Result<Option<Bytes>>;
+
+    /// Delete a string-keyed blob. Idempotent. Compat GC deletes the
+    /// narinfo/NAR sidecars when the underlying path is GC'd.
+    async fn delete_blob(&self, key: &str) -> anyhow::Result<()>;
 }
 
 /// Encode a chunk hash into its storage key (`{aa}/{hex}`).
@@ -228,6 +247,28 @@ fn validate_chunk_key(key: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Validate a blob key before `Path::join` / S3 PutObject. Reject
+/// anything that escapes `blobs_dir` or collides with the chunk
+/// namespace; otherwise the writer decides the layout.
+fn validate_blob_key(key: &str) -> anyhow::Result<()> {
+    if key.is_empty() {
+        anyhow::bail!("invalid blob key: empty");
+    }
+    if key.starts_with('/') {
+        anyhow::bail!("invalid blob key {key:?}: absolute path");
+    }
+    if key
+        .split('/')
+        .any(|c| c.is_empty() || c == "." || c == "..")
+    {
+        anyhow::bail!("invalid blob key {key:?}: dot/empty path component");
+    }
+    if key == "chunks" || key.starts_with("chunks/") {
+        anyhow::bail!("invalid blob key {key:?}: collides with chunk namespace");
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Memory backend (tests)
 // ============================================================================
@@ -240,6 +281,7 @@ fn validate_chunk_key(key: &str) -> anyhow::Result<()> {
 #[derive(Default)]
 pub struct MemoryChunkBackend {
     inner: RwLock<HashMap<[u8; 32], Bytes>>,
+    blobs: RwLock<HashMap<String, Bytes>>,
 }
 
 impl MemoryChunkBackend {
@@ -314,6 +356,34 @@ impl ChunkBackend for MemoryChunkBackend {
             .remove(&hash);
         Ok(())
     }
+
+    async fn put_blob(&self, key: &str, data: Bytes) -> anyhow::Result<()> {
+        validate_blob_key(key)?;
+        self.blobs
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_owned(), data);
+        Ok(())
+    }
+
+    async fn get_blob(&self, key: &str) -> anyhow::Result<Option<Bytes>> {
+        validate_blob_key(key)?;
+        Ok(self
+            .blobs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned())
+    }
+
+    async fn delete_blob(&self, key: &str) -> anyhow::Result<()> {
+        validate_blob_key(key)?;
+        self.blobs
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -322,16 +392,22 @@ impl ChunkBackend for MemoryChunkBackend {
 
 /// Filesystem chunk storage. Dev/single-node.
 ///
-/// Layout: `{base_dir}/chunks/{aa}/{blake3-hex}`. The two-level dir
-/// structure matches the S3 key scheme (so switching backends doesn't
-/// surprise operators) and keeps per-directory file counts reasonable.
+/// Layout: `{root}/chunks/{aa}/{blake3-hex}` for chunks,
+/// `{root}/blobs/{key}` for narinfo/NAR sidecars. The two-level chunk
+/// dir structure matches the S3 key scheme (so switching backends
+/// doesn't surprise operators) and keeps per-directory file counts
+/// reasonable.
 // r[impl store.backend.filesystem]
 pub struct FilesystemChunkBackend {
+    /// `{root}/chunks`.
     base_dir: PathBuf,
+    /// `{root}/blobs`. Sibling of `base_dir` so chunk and blob paths
+    /// can never alias.
+    blobs_dir: PathBuf,
 }
 
 impl FilesystemChunkBackend {
-    /// Create a new filesystem backend. Creates `{base_dir}/chunks/` and
+    /// Create a new filesystem backend. Creates `{root}/chunks/` and
     /// all 256 `{aa}/` subdirectories eagerly — small upfront cost (256
     /// mkdir calls, ~1ms) so `put()` never has to check-then-mkdir on
     /// the hot path — and makes the CREATION durable (merged_bug_033,
@@ -343,10 +419,13 @@ impl FilesystemChunkBackend {
     /// ground. Pre-fix the whole tree was created with ZERO dir
     /// fsyncs: a crash after a put lost dirents while manifest rows
     /// claimed durable coverage (first-boot window on the dev/
-    /// standalone-VM backends; production is S3).
-    pub fn new(base_dir: impl Into<PathBuf>) -> std::io::Result<Self> {
-        let base = base_dir.into();
-        let base_dir = base.join("chunks");
+    /// standalone-VM backends; production is S3). Also creates
+    /// `{root}/blobs/` shallow (`put_blob` mkdirs nested components on
+    /// demand — `nar/` is the only one and it's rare).
+    pub fn new(root: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let root = root.into();
+        let base_dir = root.join("chunks");
+        let blobs_dir = root.join("blobs");
         // Pre-scan BEFORE creating: which levels will be new?
         let mut created = Vec::new();
         let mut cursor = base_dir.clone();
@@ -362,6 +441,7 @@ impl FilesystemChunkBackend {
         }
         let deepest_preexisting = cursor;
         std::fs::create_dir_all(&base_dir)?;
+        std::fs::create_dir_all(&blobs_dir)?;
         // Precreate all 256 two-char-hex subdirectories.
         for b in 0u8..=255 {
             std::fs::create_dir_all(base_dir.join(format!("{b:02x}")))?;
@@ -377,28 +457,27 @@ impl FilesystemChunkBackend {
         if !created.is_empty() {
             crate::logs::chunks::fsync_dir_sync(&deepest_preexisting)?;
         }
-        Ok(Self { base_dir })
+        Ok(Self {
+            base_dir,
+            blobs_dir,
+        })
     }
 
     fn chunk_path(&self, hash: &[u8; 32]) -> PathBuf {
         self.base_dir.join(chunk_key(hash))
     }
-}
 
-#[async_trait::async_trait]
-impl ChunkBackend for FilesystemChunkBackend {
-    async fn put(&self, hash: &[u8; 32], data: Bytes) -> anyhow::Result<()> {
-        let path = self.chunk_path(hash);
-        debug!(path = %path.display(), size = data.len(), "FilesystemChunkBackend: storing chunk");
+    fn blob_path(&self, key: &str) -> PathBuf {
+        self.blobs_dir.join(key)
+    }
 
-        // Atomic-write pattern: temp + fsync + rename + dir-fsync.
-        // If we skip any of these, a crash between
-        // put() returning and complete_manifest() committing leaves the
-        // manifest claiming a chunk exists that's zero-length or absent.
-        //
-        // Temp goes in the same directory (rename atomicity needs same
-        // filesystem) with a random suffix so concurrent puts of the
-        // same content-addressed chunk don't race on the same temp name.
+    /// Atomic write: temp + fsync + rename + dir-fsync. Without all
+    /// four a crash between this returning and the manifest commit
+    /// leaves a key claiming a file that's zero-length or absent. Temp
+    /// goes in the target's directory (rename atomicity needs same
+    /// filesystem) with a random suffix so concurrent writes to the
+    /// same key don't race on the temp name.
+    async fn atomic_write(path: &std::path::Path, data: &Bytes) -> anyhow::Result<()> {
         let tmp_path = path.with_extension(format!(
             "{:016x}.tmp",
             uuid::Uuid::new_v4().as_u128() as u64
@@ -409,21 +488,30 @@ impl ChunkBackend for FilesystemChunkBackend {
         {
             use tokio::io::AsyncWriteExt;
             let mut f = tokio::fs::File::create(&tmp_path).await?;
-            f.write_all(&data).await?;
+            f.write_all(data).await?;
             f.sync_all().await?;
         }
-        tokio::fs::rename(&tmp_path, &path).await?;
+        tokio::fs::rename(&tmp_path, path).await?;
         scopeguard::ScopeGuard::into_inner(tmp_guard);
 
         // fsync parent dir. Without this, the rename's directory entry
         // can be lost on power failure even though the file data is
-        // durable. The parent is the {aa}/ subdir.
+        // durable.
         if let Some(parent) = path.parent() {
             let dir = tokio::fs::File::open(parent).await?;
             dir.sync_all().await?;
         }
-
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ChunkBackend for FilesystemChunkBackend {
+    async fn put(&self, hash: &[u8; 32], data: Bytes) -> anyhow::Result<()> {
+        let path = self.chunk_path(hash);
+        debug!(path = %path.display(), size = data.len(), "FilesystemChunkBackend: storing chunk");
+        // Constructor precreated the {aa}/ subdir; no mkdir on the hot path.
+        Self::atomic_write(&path, &data).await
     }
 
     async fn get(&self, hash: &[u8; 32]) -> anyhow::Result<Option<Bytes>> {
@@ -465,6 +553,35 @@ impl ChunkBackend for FilesystemChunkBackend {
         // key is the relative path from key_for. Rejoin to base_dir.
         let path = self.base_dir.join(key);
         match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn put_blob(&self, key: &str, data: Bytes) -> anyhow::Result<()> {
+        validate_blob_key(key)?;
+        let path = self.blob_path(key);
+        debug!(path = %path.display(), size = data.len(), "FilesystemChunkBackend: storing blob");
+        // Blob keys can be nested (`nar/`); not precreated like chunk subdirs.
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        Self::atomic_write(&path, &data).await
+    }
+
+    async fn get_blob(&self, key: &str) -> anyhow::Result<Option<Bytes>> {
+        validate_blob_key(key)?;
+        match tokio::fs::read(self.blob_path(key)).await {
+            Ok(data) => Ok(Some(Bytes::from(data))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn delete_blob(&self, key: &str) -> anyhow::Result<()> {
+        validate_blob_key(key)?;
+        match tokio::fs::remove_file(self.blob_path(key)).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
@@ -529,6 +646,136 @@ impl S3ChunkBackend {
         } else {
             format!("{}/chunks/{key}", self.prefix)
         }
+    }
+
+    /// Bucket-relative key for a string-keyed blob: `{prefix}/{key}`.
+    /// No `chunks/` segment — narinfo/NAR live at the prefix root,
+    /// where stock Nix expects `{narinfo}` and `nar/{nar}` to resolve.
+    fn blob_s3_key(&self, key: &str) -> String {
+        if self.prefix.is_empty() {
+            key.to_owned()
+        } else {
+            format!("{}/{key}", self.prefix)
+        }
+    }
+
+    async fn s3_put(&self, key: &str, data: Bytes) -> anyhow::Result<()> {
+        // opt-02 gate lives HERE — replica-global before the
+        // requests-total counter (it measures *dispatched* PUTs, not
+        // parked) and before `chunk_op_override()` so the 5 s
+        // `CHUNK_OP_ATTEMPT_TIMEOUT` clocks the S3 op only, never the
+        // queue. `acquire_owned` so the permit's lifetime is tied to
+        // this future (cancel-drop releases). The semaphore is
+        // constructed in `new()` and never closed, so `expect` is
+        // unreachable. Gating the helper (not the trait `put()`) means
+        // every S3 PutObject path — chunk-put AND blob-put — is
+        // covered; `TieredChunkBackend::put()` delegates here too.
+        let _permit = self
+            .put_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("put_gate never closed");
+        debug!(bucket = %self.bucket, key = %key, size = data.len(), "S3ChunkBackend: uploading");
+        metrics::counter!("rio_store_s3_requests_total", "operation" => "put_object").increment(1);
+        // D5: per-attempt deadline at the seam (s3-op-census row:
+        // put_object, body ≤ CHUNK_MAX, pre-buffered).
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(data.into())
+            .customize()
+            .config_override(chunk_op_override())
+            .send()
+            .await
+            .map_err(|e| {
+                classify_s3_error(
+                    e,
+                    format!("S3 PutObject failed for s3://{}/{key}", self.bucket),
+                )
+            })?;
+        Ok(())
+    }
+
+    async fn s3_get(&self, key: &str) -> anyhow::Result<Option<Bytes>> {
+        metrics::counter!("rio_store_s3_requests_total", "operation" => "get_object").increment(1);
+        // D5: per-attempt deadline at the seam (s3-op-census row:
+        // get_object, response body ≤ CHUNK_MAX).
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .customize()
+            .config_override(chunk_op_override())
+            .send()
+            .await
+        {
+            // Buffer into Bytes — chunks are ≤256 KiB and blobs are
+            // narinfo-sized; ByteStream::collect is zero-copy for a
+            // single segment. The attempt timeout above covers only up
+            // to response HEADERS — the body stream needs its own
+            // clock (CHUNK_GET_BODY_TIMEOUT) or a black-holed body
+            // read pins the caller forever.
+            Ok(out) => {
+                let collected = tokio::time::timeout(CHUNK_GET_BODY_TIMEOUT, out.body.collect())
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "S3 body read for s3://{}/{key} exceeded its typed bound \
+                             ({CHUNK_GET_BODY_TIMEOUT:?}) — peer presumed black-holed",
+                            self.bucket
+                        )
+                    })?;
+                Ok(Some(
+                    collected
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "S3 body read failed for s3://{}/{key}: {e}",
+                                self.bucket
+                            )
+                        })?
+                        .into_bytes(),
+                ))
+            }
+            Err(err) => {
+                let svc = err.into_service_error();
+                if svc.is_no_such_key() {
+                    Ok(None)
+                } else {
+                    // classify_s3_error roots auth errors at BackendAuthError
+                    // so the gRPC layer maps them to FailedPrecondition.
+                    Err(classify_s3_error(
+                        svc,
+                        format!("S3 GetObject failed for s3://{}/{key}", self.bucket),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// DeleteObject is idempotent — a non-existent key returns success.
+    /// D5: per-attempt deadline at the seam (s3-op-census row:
+    /// delete_object, no body).
+    async fn s3_delete(&self, key: &str) -> anyhow::Result<()> {
+        metrics::counter!("rio_store_s3_requests_total", "operation" => "delete_object")
+            .increment(1);
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .customize()
+            .config_override(chunk_op_override())
+            .send()
+            .await
+            .map_err(|e| {
+                classify_s3_error(
+                    e,
+                    format!("S3 DeleteObject failed for s3://{}/{key}", self.bucket),
+                )
+            })?;
+        Ok(())
     }
 }
 
@@ -609,37 +856,7 @@ pub(crate) fn log_op_override() -> aws_sdk_s3::config::Builder {
 #[async_trait::async_trait]
 impl ChunkBackend for S3ChunkBackend {
     async fn put(&self, hash: &[u8; 32], data: Bytes) -> anyhow::Result<()> {
-        // Replica-global gate FIRST — before the requests-total counter
-        // (it measures *dispatched* PUTs, not parked) and before
-        // `chunk_op_override()` so the 5 s `CHUNK_OP_ATTEMPT_TIMEOUT`
-        // clocks the S3 op only, never the queue. `acquire_owned` so
-        // the permit's lifetime is tied to this future (cancel-drop
-        // releases). The semaphore is constructed in `new()` and never
-        // closed, so `expect` is unreachable.
-        let _permit = self
-            .put_gate
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("put_gate never closed");
-        let key = self.s3_key(hash);
-        debug!(bucket = %self.bucket, key = %key, size = data.len(), "S3ChunkBackend: uploading");
-        metrics::counter!("rio_store_s3_requests_total", "operation" => "put_object").increment(1);
-
-        // D5: per-attempt deadline at the seam (s3-op-census row:
-        // put_object, body ≤ CHUNK_MAX, pre-buffered).
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .body(data.into())
-            .customize()
-            .config_override(chunk_op_override())
-            .send()
-            .await
-            .map_err(|e| classify_s3_error(e, format!("S3 PutObject failed for {key}")))?;
-
-        Ok(())
+        self.s3_put(&self.s3_key(hash), data).await
     }
 
     // TODO: gate `get()` under a replica-global semaphore too —
@@ -647,61 +864,7 @@ impl ChunkBackend for S3ChunkBackend {
     // the read-side analogue of the per-ingest PUT fan-out, with no
     // global cap. Out of scope for opt-02 (PUT plane only).
     async fn get(&self, hash: &[u8; 32]) -> anyhow::Result<Option<Bytes>> {
-        let key = self.s3_key(hash);
-        metrics::counter!("rio_store_s3_requests_total", "operation" => "get_object").increment(1);
-
-        // D5: per-attempt deadline at the seam (s3-op-census row:
-        // get_object, response body ≤ CHUNK_MAX).
-        match self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .customize()
-            .config_override(chunk_op_override())
-            .send()
-            .await
-        {
-            Ok(output) => {
-                // Collect into Bytes. Chunks are ≤256 KiB — buffering is fine
-                // and avoids the caller having to deal with a stream.
-                // aws_sdk's ByteStream::collect returns AggregatedBytes;
-                // into_bytes() is zero-copy if it was a single segment,
-                // one concat if it was chunked transfer (rare for small
-                // objects). The attempt timeout above covers only up to
-                // response HEADERS — the body stream needs its own
-                // clock (CHUNK_GET_BODY_TIMEOUT) or a black-holed body
-                // read pins the caller forever.
-                let collected = tokio::time::timeout(CHUNK_GET_BODY_TIMEOUT, output.body.collect())
-                    .await
-                    .map_err(|_| {
-                        anyhow::anyhow!(
-                            "S3 body read for {key} exceeded its typed bound \
-                                 ({CHUNK_GET_BODY_TIMEOUT:?}) — peer presumed black-holed"
-                        )
-                    })?;
-                let data = collected
-                    .map_err(|e| anyhow::anyhow!("S3 body read failed for {key}: {e}"))?
-                    .into_bytes();
-                Ok(Some(data))
-            }
-            Err(err) => {
-                let service_err = err.into_service_error();
-                if service_err.is_no_such_key() {
-                    Ok(None)
-                } else {
-                    // Propagate via classify_s3_error so AccessDenied
-                    // surfaces as BackendAuthError (FailedPrecondition,
-                    // non-retriable). Conflating with Ok(None) makes
-                    // every S3 blip look like data loss; conflating
-                    // auth with transient retries forever.
-                    Err(classify_s3_error(
-                        service_err,
-                        format!("S3 GetObject failed for {key}"),
-                    ))
-                }
-            }
-        }
+        self.s3_get(&self.s3_key(hash)).await
     }
 
     async fn exists_batch(&self, hashes: &[[u8; 32]]) -> anyhow::Result<Vec<bool>> {
@@ -778,7 +941,7 @@ impl ChunkBackend for S3ChunkBackend {
                         .increment(1);
                         match client
                             .head_object()
-                            .bucket(bucket)
+                            .bucket(&bucket)
                             .key(&key)
                             .customize()
                             .config_override(head_config)
@@ -793,7 +956,7 @@ impl ChunkBackend for S3ChunkBackend {
                                 } else {
                                     Err(classify_s3_error(
                                         service_err,
-                                        format!("S3 HeadObject failed for {key}"),
+                                        format!("S3 HeadObject failed for s3://{bucket}/{key}"),
                                     ))
                                 }
                             }
@@ -825,23 +988,22 @@ impl ChunkBackend for S3ChunkBackend {
     }
 
     async fn delete_by_key(&self, key: &str) -> anyhow::Result<()> {
-        metrics::counter!("rio_store_s3_requests_total", "operation" => "delete_object")
-            .increment(1);
-        // DeleteObject is idempotent: deleting a non-existent key
-        // returns success (no NotFound error). So no special-case
-        // for "already gone" — just send and return.
-        // D5: per-attempt deadline at the seam (s3-op-census row:
-        // delete_object, no body).
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .customize()
-            .config_override(chunk_op_override())
-            .send()
-            .await
-            .map_err(|e| classify_s3_error(e, format!("S3 DeleteObject failed for {key}")))?;
-        Ok(())
+        self.s3_delete(key).await
+    }
+
+    async fn put_blob(&self, key: &str, data: Bytes) -> anyhow::Result<()> {
+        validate_blob_key(key)?;
+        self.s3_put(&self.blob_s3_key(key), data).await
+    }
+
+    async fn get_blob(&self, key: &str) -> anyhow::Result<Option<Bytes>> {
+        validate_blob_key(key)?;
+        self.s3_get(&self.blob_s3_key(key)).await
+    }
+
+    async fn delete_blob(&self, key: &str) -> anyhow::Result<()> {
+        validate_blob_key(key)?;
+        self.s3_delete(&self.blob_s3_key(key)).await
     }
 }
 
@@ -1021,6 +1183,33 @@ mod tests {
         assert!(validate_chunk_key("").is_err());
     }
 
+    #[test]
+    fn validate_blob_key_accepts_narinfo_shapes() {
+        for k in [
+            "abcd1234efgh5678.narinfo",
+            "nar/abcdef1234567890.nar.zst",
+            "nix-cache-info",
+        ] {
+            assert!(validate_blob_key(k).is_ok(), "{k}");
+        }
+    }
+
+    #[test]
+    fn validate_blob_key_rejects_traversal_and_collision() {
+        for k in [
+            "",
+            "/etc/passwd",
+            "../escape",
+            "nar/../../escape",
+            "nar//double",
+            "./relative",
+            "chunks",
+            "chunks/00/abc",
+        ] {
+            assert!(validate_blob_key(k).is_err(), "{k}");
+        }
+    }
+
     // ------------------------------------------------------------------------
     // Memory backend
     // ------------------------------------------------------------------------
@@ -1072,6 +1261,52 @@ mod tests {
         // Same hash again — idempotent, count unchanged.
         backend.put(&HASH_A, Bytes::from_static(b"a")).await?;
         assert_eq!(backend.len(), 2);
+        Ok(())
+    }
+
+    /// Common blob-API contract, parameterised over backend.
+    async fn blob_roundtrip(b: &dyn ChunkBackend) -> anyhow::Result<()> {
+        let narinfo = Bytes::from_static(b"StorePath: /nix/store/abc\n");
+        let nar = Bytes::from_static(b"\x0d\x00\x00\x00nix-archive-1");
+
+        b.put_blob("abc.narinfo", narinfo.clone()).await?;
+        b.put_blob("nar/abc.nar.zst", nar.clone()).await?;
+        assert_eq!(b.get_blob("abc.narinfo").await?, Some(narinfo.clone()));
+        assert_eq!(b.get_blob("nar/abc.nar.zst").await?, Some(nar));
+        assert_eq!(b.get_blob("missing.narinfo").await?, None);
+
+        // Last-writer-wins.
+        let v2 = Bytes::from_static(b"v2");
+        b.put_blob("abc.narinfo", v2.clone()).await?;
+        assert_eq!(b.get_blob("abc.narinfo").await?, Some(v2));
+
+        // Idempotent delete.
+        b.delete_blob("abc.narinfo").await?;
+        assert_eq!(b.get_blob("abc.narinfo").await?, None);
+        b.delete_blob("abc.narinfo").await?;
+
+        // Traversal rejected on every entry point.
+        for k in ["../escape", "/abs", "chunks/00/x"] {
+            assert!(b.put_blob(k, Bytes::new()).await.is_err(), "put {k}");
+            assert!(b.get_blob(k).await.is_err(), "get {k}");
+            assert!(b.delete_blob(k).await.is_err(), "delete {k}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_blob_roundtrip() -> anyhow::Result<()> {
+        blob_roundtrip(&MemoryChunkBackend::new()).await
+    }
+
+    /// Blob namespace and chunk namespace don't alias.
+    #[tokio::test]
+    async fn memory_blob_separate_from_chunks() -> anyhow::Result<()> {
+        let b = MemoryChunkBackend::new();
+        b.put(&HASH_A, Bytes::from_static(b"chunk")).await?;
+        b.put_blob("abc.narinfo", Bytes::from_static(b"blob"))
+            .await?;
+        assert_eq!(b.len(), 1, "blob must not count as a chunk");
         Ok(())
     }
 
@@ -1146,6 +1381,17 @@ mod tests {
             let name = name.to_string_lossy();
             assert!(!name.ends_with(".tmp"), "leftover .tmp file: {name}");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fs_blob_roundtrip() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backend = FilesystemChunkBackend::new(dir.path())?;
+        blob_roundtrip(&backend).await?;
+        // Layout: blobs at {root}/blobs/{key}, sibling of chunks/.
+        assert!(dir.path().join("blobs").join("nar").is_dir());
+        assert!(dir.path().join("blobs").join("nar/abc.nar.zst").is_file());
         Ok(())
     }
 
@@ -1657,5 +1903,62 @@ mod tests {
             .sleep_impl(TestTokioSleep)
             .build();
         Client::from_conf(cfg)
+    }
+
+    #[test]
+    fn blob_s3_key_format() {
+        let cfg = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .build();
+        let client = Client::from_conf(cfg);
+
+        // Blobs live at the prefix root, not under chunks/.
+        let with_prefix = S3ChunkBackend::new(client.clone(), "b".into(), "prod".into());
+        assert_eq!(with_prefix.blob_s3_key("abc.narinfo"), "prod/abc.narinfo");
+        assert_eq!(
+            with_prefix.blob_s3_key("nar/abc.nar.zst"),
+            "prod/nar/abc.nar.zst"
+        );
+
+        let no_prefix = S3ChunkBackend::new(client, "b".into(), "".into());
+        assert_eq!(no_prefix.blob_s3_key("abc.narinfo"), "abc.narinfo");
+    }
+
+    /// Blob ops use blob_s3_key (no `chunks/` segment) and validate
+    /// the key. The mock client is keyed by operation, so the get/put
+    /// rule fires for whatever key is sent — blob_s3_key_format tests
+    /// the actual key shape.
+    #[tokio::test]
+    async fn s3_blob_roundtrip() -> anyhow::Result<()> {
+        use aws_sdk_s3::operation::delete_object::DeleteObjectOutput;
+        use aws_sdk_s3::operation::put_object::PutObjectOutput;
+        let put_r = mock!(Client::put_object).then_output(|| PutObjectOutput::builder().build());
+        let get_r = mock!(Client::get_object).then_output(|| {
+            GetObjectOutput::builder()
+                .body(ByteStream::from_static(b"narinfo body"))
+                .build()
+        });
+        let miss_r = mock!(Client::get_object)
+            .then_error(|| GetObjectError::NoSuchKey(NoSuchKey::builder().build()));
+        let del_r =
+            mock!(Client::delete_object).then_output(|| DeleteObjectOutput::builder().build());
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[&put_r, &get_r, &miss_r, &del_r]
+        );
+        let b = make_s3_backend(client);
+
+        b.put_blob("abc.narinfo", Bytes::from_static(b"x")).await?;
+        assert_eq!(
+            b.get_blob("abc.narinfo").await?.as_deref(),
+            Some(b"narinfo body".as_slice())
+        );
+        assert!(b.get_blob("missing.narinfo").await?.is_none());
+        b.delete_blob("abc.narinfo").await?;
+
+        // Traversal rejected before any S3 call.
+        assert!(b.put_blob("../escape", Bytes::new()).await.is_err());
+        Ok(())
     }
 }

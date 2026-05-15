@@ -11,7 +11,7 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::backend::{ChunkBackend, FilesystemChunkBackend, S3ChunkBackend};
+use crate::backend::{ChunkBackend, FilesystemChunkBackend, S3ChunkBackend, TieredChunkBackend};
 use crate::cas::ChunkCache;
 use rio_common::s3::DEFAULT_S3_MAX_ATTEMPTS;
 
@@ -40,6 +40,22 @@ pub enum ChunkBackendKind {
     /// (env vars, instance profile, etc) — NOT in this config. We're
     /// not putting secrets in a TOML file.
     S3 { bucket: String, prefix: String },
+    /// Two-tier: per-AZ S3 Express read-through cache over authoritative
+    /// S3 standard. `express_bucket = None` (or unset) degrades to the
+    /// plain `S3` shape — replicas in AZs without Express still
+    /// function. The Express bucket is per-AZ; helm wires the right one
+    /// via the node's `topology.kubernetes.io/zone` label (P0554).
+    /// See [ADR-023](../../docs/src/decisions/023-tiered-chunk-backend.md).
+    Tiered {
+        /// Authoritative S3 standard bucket.
+        bucket: String,
+        /// Key prefix shared by both tiers.
+        prefix: String,
+        /// Per-AZ S3 Express directory bucket (`*--x-s3` suffix).
+        /// `None` = no cache tier in this AZ.
+        #[serde(default)]
+        express_bucket: Option<String>,
+    },
 }
 
 // r[impl store.netpol.egress+3]
@@ -831,6 +847,57 @@ pub async fn init_chunk_backend(
                 cache_capacity_bytes,
             )))
         }
+        ChunkBackendKind::Tiered {
+            bucket,
+            prefix,
+            express_bucket,
+        } => {
+            info!(
+                %bucket,
+                %prefix,
+                express_bucket = express_bucket.as_deref().unwrap_or("<none>"),
+                s3_max_attempts,
+                "chunk backend: tiered (S3 standard + per-AZ Express cache)"
+            );
+            // Different retry budgets per tier. Remote is authoritative
+            // — a failed read there means "data unreachable", worth the
+            // full `s3_max_attempts` (default 10). Express is a
+            // best-effort cache that must fall through quickly on
+            // throttle/5xx; 2 attempts cover a transient connection
+            // reset, anything worse shows up in
+            // `rio_store_tiered_local_errors_total`. Both clients share
+            // the env credential/region chain; the SDK routes Express
+            // traffic by the `--x-s3` bucket-name suffix.
+            const EXPRESS_MAX_ATTEMPTS: u32 = 2;
+            let remote_client = rio_common::s3::default_client(s3_max_attempts).await;
+            let remote = S3ChunkBackend::new(
+                remote_client,
+                bucket.clone(),
+                prefix.clone(),
+                global_put_permits,
+            );
+            let local = match express_bucket {
+                Some(b) => {
+                    let local_client = rio_common::s3::default_client(EXPRESS_MAX_ATTEMPTS).await;
+                    // Tiered-local is read-only (`TieredChunkBackend::put`
+                    // writes remote only) — no need to bound a PUT plane
+                    // that doesn't exist. MAX_PERMITS keeps the gate
+                    // structurally present without ever parking.
+                    Some(S3ChunkBackend::new(
+                        local_client,
+                        b.clone(),
+                        prefix.clone(),
+                        tokio::sync::Semaphore::MAX_PERMITS,
+                    ))
+                }
+                None => None,
+            };
+            let backend: Arc<dyn ChunkBackend> = Arc::new(TieredChunkBackend::new(local, remote));
+            Some(Arc::new(ChunkCache::with_capacity(
+                backend,
+                cache_capacity_bytes,
+            )))
+        }
     })
 }
 
@@ -1475,6 +1542,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn chunk_backend_kind_toml_tiered() {
+        let cfg = parse_toml(
+            r#"
+            [chunk_backend]
+            kind = "tiered"
+            bucket = "rio-chunks"
+            prefix = "prod"
+            express_bucket = "rio-chunk-cache--use1-az4--x-s3"
+            "#,
+        );
+        match cfg.chunk_backend {
+            ChunkBackendKind::Tiered {
+                bucket,
+                prefix,
+                express_bucket,
+            } => {
+                assert_eq!(bucket, "rio-chunks");
+                assert_eq!(prefix, "prod");
+                assert_eq!(
+                    express_bucket.as_deref(),
+                    Some("rio-chunk-cache--use1-az4--x-s3")
+                );
+            }
+            other => panic!("expected Tiered, got {other:?}"),
+        }
+    }
+
+    /// `express_bucket` omitted → `None`. A replica scheduled in an AZ
+    /// without S3 Express runs degraded (S3-standard only, functional);
+    /// helm omits the key rather than supplying an empty string.
+    #[test]
+    fn chunk_backend_kind_toml_tiered_no_express() {
+        let cfg = parse_toml(
+            r#"
+            [chunk_backend]
+            kind = "tiered"
+            bucket = "rio-chunks"
+            prefix = ""
+            "#,
+        );
+        match cfg.chunk_backend {
+            ChunkBackendKind::Tiered { express_bucket, .. } => {
+                assert!(express_bucket.is_none());
+            }
+            other => panic!("expected Tiered, got {other:?}"),
+        }
+    }
+
     /// No [chunk_backend] section at all → default (Inline). This is
     /// the backward-compat path: pre-phase3a configs have no such
     /// section and should keep working.
@@ -1529,6 +1645,62 @@ mod tests {
                     assert_eq!(base_dir, PathBuf::from("/var/lib/chunks"));
                 }
                 other => panic!("expected Filesystem; got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    /// P0554 wires `express_bucket` from a per-pod env var (downward-API
+    /// `topology.kubernetes.io/zone` → AZ → bucket-name template). The
+    /// `Option<String>` field must round-trip via the env layer.
+    #[test]
+    fn chunk_backend_kind_env_tiered() {
+        rio_test_support::Jail::expect_with(|jail| {
+            jail.set_env("RIO_CHUNK_BACKEND__KIND", "tiered");
+            jail.set_env("RIO_CHUNK_BACKEND__BUCKET", "rio-chunks");
+            jail.set_env("RIO_CHUNK_BACKEND__PREFIX", "");
+            jail.set_env(
+                "RIO_CHUNK_BACKEND__EXPRESS_BUCKET",
+                "rio-chunk-cache--use1-az4--x-s3",
+            );
+            let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
+            match cfg.chunk_backend {
+                ChunkBackendKind::Tiered {
+                    bucket,
+                    express_bucket,
+                    ..
+                } => {
+                    assert_eq!(bucket, "rio-chunks");
+                    assert_eq!(
+                        express_bucket.as_deref(),
+                        Some("rio-chunk-cache--use1-az4--x-s3")
+                    );
+                }
+                other => panic!("expected Tiered; got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    /// `EXPRESS_BUCKET` env var omitted → `express_bucket: None`.
+    /// Helm omits the var on AZs without S3 Express; the env layer must
+    /// surface the absence as `None` (via `#[serde(default)]`) rather
+    /// than failing tagged-enum deserialization on a missing key.
+    #[test]
+    fn chunk_backend_kind_env_tiered_no_express() {
+        rio_test_support::Jail::expect_with(|jail| {
+            jail.set_env("RIO_CHUNK_BACKEND__KIND", "tiered");
+            jail.set_env("RIO_CHUNK_BACKEND__BUCKET", "rio-chunks");
+            jail.set_env("RIO_CHUNK_BACKEND__PREFIX", "");
+            let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
+            match cfg.chunk_backend {
+                ChunkBackendKind::Tiered { express_bucket, .. } => {
+                    assert!(
+                        express_bucket.is_none(),
+                        "absent EXPRESS_BUCKET env var must default to None"
+                    );
+                }
+                other => panic!("expected Tiered; got {other:?}"),
             }
             Ok(())
         });
