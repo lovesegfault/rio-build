@@ -52,7 +52,9 @@
 // pinit: page-absolute callout arrows. Pins resolve by page-scoped
 // label, so pin + pinit-* call must land on the SAME rendered page —
 // keep callouts inside the figure body alongside the pinned diagram.
-#import "@preview/pinit:0.2.2": pin, pinit-place, pinit-point-from
+#import "@preview/pinit:0.2.2": (
+  absolute-place, pin, pinit, pinit-place, pinit-point-from, simple-arrow,
+)
 #import "/lib/refs.typ": refs
 
 // ─── colors ─────────────────────────────────────────────────────────

@@ -196,60 +196,50 @@ builders or other components --- it watches CRDs and reconciles desired state.
 
 = Data Flows
 
+// pinit callout helper for chronos sequence diagrams. PDF-only: pinit
+// resolves pins via page-absolute coordinates, which has no analogue in
+// shiroa's HTML target. The same prose is rendered as a compact note
+// list after each figure for the web build (`flow-notes-web`).
+//
+// `flow-note` places every callout body in a fixed right-hand column
+// (page-absolute x = `_note-col-x`) at the pin's y-position, then draws
+// a leader arrow of whatever length is needed back to the pin. This
+// keeps bodies aligned regardless of which lifeline the pin sits on;
+// the diagram itself is scaled (`_flow-scale`) to leave that column
+// empty.
+#let _is-paged() = not (is-web-target() or is-html-target())
+#let _flow-scale = 58%
+#let _note-col-w = 4.1cm
+// A4, rio template x-margin 2.6cm → content right edge at 18.4cm.
+#let _note-col-x = 18.4cm - _note-col-w
+#let flow-note(key, dy: 0pt, body) = context if _is-paged() {
+  pinit(key, callback: pos => {
+    let body-y = pos.y + dy
+    absolute-place(dx: _note-col-x, dy: body-y - 0.55em, block(
+      width: _note-col-w,
+      text(size: 0.78em, fill: muted.darken(15%), body),
+    ))
+    absolute-place(simple-arrow(
+      start: (_note-col-x - 3pt, body-y + 1pt),
+      end: (pos.x + 3pt, pos.y + 2pt),
+      fill: muted,
+      thickness: 1pt,
+    ))
+  })
+}
+#let flow-diagram(factor: _flow-scale, body) = block(
+  width: 100%,
+  align(left, scale(factor, reflow: true, origin: top + left, body)),
+)
+#let flow-notes-web(..items) = context if not _is-paged() {
+  info(title: [Flow notes])[#list(..items.pos())]
+}
+
 == Remote Store: `nix build --store ssh-ng://rio .#package`
 
-```text
-1. User runs: nix build --store ssh-ng://rio .#package
-2. Nix evaluates the flake locally -> produces derivation DAG (.drv files)
-3. Nix opens SSH connection to rio-gateway
-4. Worker protocol handshake (magic bytes, version negotiation)
-5. Nix sends wopSetOptions (build configuration; ssh:// only — ssh-ng skips)
-6. Nix sends wopQueryValidPaths --- "which outputs do you have?"
-7. rio-gateway queries rio-store -> returns valid paths
-8. Nix sends wopAddToStoreNar for each missing .drv file and input source
-   -> rio-gateway stores in rio-store
-   (for protocol >= 1.32, sources are batched via wopAddMultipleToStore
-    rather than individual wopAddToStoreNar calls)
-8a. Nix sends wopQueryDerivationOutputMap for each derivation
-    -> Modern Nix clients (>= 2.4) call this unconditionally for all
-       derivation types (input-addressed and CA). rio-gateway resolves
-       via rio-store and returns the output name -> store path mapping.
-9. Nix sends wopBuildDerivation (or wopBuildPathsWithResults) for top-level
-   -> wopBuildDerivation sends an inline BasicDerivation (WITHOUT inputDrvs)
-   -> rio-gateway reconstructs the full DAG by parsing the .drv files
-      uploaded in step 8 (each .drv contains inputDrvs references forming
-      the DAG edges)
-   -> forwards to rio-scheduler via gRPC SubmitBuild
-10. rio-scheduler:
-    a. Queries rio-store for cache hits (already-built outputs)
-    b. Computes remaining build graph
-    c. Computes critical-path priorities
-    d. Dispatches ready derivations to executors
-11. For each dispatched derivation:
-    a. Scheduler sends PrefetchHint (anticipated input paths) on the
-       BuildExecution stream so the executor can pre-warm its FUSE cache
-    b. Executor's FUSE daemon checks local SSD cache for input paths (fast path)
-    c. Cache miss: FUSE daemon fetches from rio-store via gRPC, caches on SSD
-    d. Executor runs build in nix sandbox (overlay-merged /nix/store)
-    e. Executor streams build logs to scheduler via bidirectional
-       BuildExecution stream (log lines batched for efficiency)
-       Scheduler relays logs to gateway via BuildEvent stream (from SubmitBuild)
-       Gateway converts to STDERR_NEXT messages for the Nix client
-    f. Executor streams output NAR via PutPath; rio-store chunks via
-       FastCDC on the server side (executors never chunk locally)
-    g. Executor reports completion to scheduler
-    h. Scheduler stores completion, releases downstream nodes
-12. When top-level derivation completes:
-    a. Scheduler notifies gateway
-    b. Gateway sends STDERR_LAST + BuildResult to Nix client
-    c. Client requests wopNarFromPath for outputs
-       -> Gateway sends STDERR_LAST first, then writes the NAR as raw
-          bytes directly (no STDERR framing). The Nix client's
-          processStderr(ex) has no sink argument for this opcode, so
-          STDERR_WRITE would fail with 'error: no sink'. See
-          rio-gateway/src/handler/opcodes_read.rs.
-    d. Gateway streams NAR (reassembled from chunks) back to client
-```
+The client evaluates locally and drives the worker protocol; rio translates
+each opcode into internal gRPC. Load-bearing protocol detail is annotated
+on the message arrows below.
 
 #info[
   *Status:* CA cutoff is end-to-end: compare (completion-time output-hash check
@@ -265,126 +255,139 @@ See #link("./spec/components/gateway.typ")[rio-gateway] for protocol opcode deta
 #link("./spec/components/scheduler.typ")[rio-scheduler] for the scheduling algorithm,
 and #link("./spec/components/store.typ")[rio-store] for the chunked CAS.
 
-#figure(
-  chronos.diagram({
-    import chronos: *
-    _par("Client", display-name: [Nix Client])
-    _par("GW", display-name: [rio-gateway])
-    _par("Sched", display-name: [rio-scheduler])
-    _par("Builder", display-name: [rio-builder])
-    _par("Store", display-name: [rio-store])
+#let rs-notes = (
+  [Protocol $>=$ 1.32 batches sources via `wopAddMultipleToStore` instead.],
+  [Called unconditionally by Nix $>=$ 2.4 for both input-addressed and CA
+    derivations.],
+  [Inline `BasicDerivation` _without_ `inputDrvs` --- gateway rebuilds the
+    DAG from the `.drv` files uploaded above.],
+  [`PrefetchHint` precedes the assignment so the executor can pre-warm its
+    FUSE cache.],
+  [FastCDC chunking is server-side; executors never chunk locally.],
+  [`STDERR_LAST` first, then raw NAR bytes --- no `STDERR_WRITE` framing
+    (client's `processStderr` has no sink for this opcode).],
+)
 
-    _seq("Client", "GW", comment: [SSH connect + handshake])
-    _seq(
-      "Client",
-      "GW",
-      comment: [`wopSetOptions` (`ssh://` only; ssh-ng skips)],
-    )
-    _seq("Client", "GW", comment: [`wopQueryValidPaths`])
-    _seq("GW", "Store", comment: [`FindMissingPaths`])
-    _seq("Store", "GW", comment: [missing paths], dashed: true)
-    _seq("GW", "Client", comment: [valid paths (inverted)], dashed: true)
-    _seq("Client", "GW", comment: [`wopAddToStoreNar` (.drv files)])
-    _seq("GW", "Store", comment: [`PutPath`])
-    _seq("Client", "GW", comment: [`wopQueryDerivationOutputMap`])
-    _seq("GW", "Store", comment: [`GetPath` (.drv NAR)])
-    _seq("GW", "GW", comment: [parse ATerm → output map])
-    _seq("GW", "Client", comment: [derivation output map], dashed: true)
-    _seq("Client", "GW", comment: [`wopBuildDerivation`])
-    _seq("GW", "Sched", comment: [`SubmitBuild` (DAG)])
-    _seq("Sched", "Store", comment: [`FindMissingPaths` (cache check)])
-    _seq("Store", "Sched", comment: [missing paths], dashed: true)
-    _seq("Sched", "Builder", comment: [`WorkAssignment` (via `BuildExecution`)])
-    _seq("Builder", "Store", comment: [`GetPath` (FUSE fetch)])
-    _seq("Builder", "Builder", comment: [nix sandbox build])
-    _seq("Builder", "Sched", comment: [`BuildLogBatch`])
-    _seq("Sched", "GW", comment: [`BuildEvent` (logs)])
-    _seq("GW", "Client", comment: [`STDERR_NEXT`])
-    _seq("Builder", "Store", comment: [`PutPath` (output)])
-    _seq("Builder", "Sched", comment: [`CompletionReport`])
-    _seq("Sched", "GW", comment: [`BuildEvent` (completed)])
-    _seq("GW", "Client", comment: [`STDERR_LAST` + `BuildResult`])
-    _seq("Client", "GW", comment: [`wopNarFromPath`])
-    _seq("GW", "Store", comment: [`GetPath`])
-    _seq("Store", "GW", comment: [NAR stream], dashed: true)
-    _seq("GW", "Client", comment: [NAR data], dashed: true)
-  }),
+#figure(
+  {
+    // 5 lifelines + long opcode comments → widest of the flows; needs
+    // harder scale to clear the right-hand callout column.
+    flow-diagram(factor: 48%, chronos.diagram({
+      import chronos: *
+      _par("Client", display-name: [Nix Client])
+      _par("GW", display-name: [rio-gateway])
+      _par("Sched", display-name: [rio-scheduler])
+      _par("Builder", display-name: [rio-builder])
+      _par("Store", display-name: [rio-store])
+
+      _seq("Client", "GW", comment: [SSH connect + handshake])
+      _seq(
+        "Client",
+        "GW",
+        comment: [`wopSetOptions` (`ssh://` only; ssh-ng skips)],
+      )
+      _seq("Client", "GW", comment: [`wopQueryValidPaths`])
+      _seq("GW", "Store", comment: [`FindMissingPaths`])
+      _seq("Store", "GW", comment: [missing paths], dashed: true)
+      _seq("GW", "Client", comment: [valid paths (inverted)], dashed: true)
+      _seq(
+        "Client",
+        "GW",
+        comment: [`wopAddToStoreNar` (.drv files)#pin("rs-add")],
+      )
+      _seq("GW", "Store", comment: [`PutPath`])
+      _seq(
+        "Client",
+        "GW",
+        comment: [`wopQueryDerivationOutputMap`#pin("rs-qmap")],
+      )
+      _seq("GW", "Store", comment: [`GetPath` (.drv NAR)])
+      _seq("GW", "GW", comment: [parse ATerm → output map])
+      _seq("GW", "Client", comment: [derivation output map], dashed: true)
+      _seq("Client", "GW", comment: [`wopBuildDerivation`#pin("rs-build")])
+      _seq("GW", "Sched", comment: [`SubmitBuild` (DAG)])
+      _seq("Sched", "Store", comment: [`FindMissingPaths` (cache check)])
+      _seq("Store", "Sched", comment: [missing paths], dashed: true)
+      _seq(
+        "Sched",
+        "Builder",
+        comment: [`WorkAssignment` (via `BuildExecution`)#pin("rs-assign")],
+      )
+      _seq("Builder", "Store", comment: [`GetPath` (FUSE fetch)])
+      _seq("Builder", "Builder", comment: [nix sandbox build])
+      _seq("Builder", "Sched", comment: [`BuildLogBatch`])
+      _seq("Sched", "GW", comment: [`BuildEvent` (logs)])
+      _seq("GW", "Client", comment: [`STDERR_NEXT`])
+      _seq("Builder", "Store", comment: [`PutPath` (output)#pin("rs-put")])
+      _seq("Builder", "Sched", comment: [`CompletionReport`])
+      _seq("Sched", "GW", comment: [`BuildEvent` (completed)])
+      _seq("GW", "Client", comment: [`STDERR_LAST` + `BuildResult`])
+      _seq("Client", "GW", comment: [`wopNarFromPath`])
+      _seq("GW", "Store", comment: [`GetPath`])
+      _seq("Store", "GW", comment: [NAR stream], dashed: true)
+      _seq("GW", "Client", comment: [NAR data#pin("rs-nar")], dashed: true)
+    }))
+    flow-note("rs-add", dy: -10pt, rs-notes.at(0))
+    flow-note("rs-qmap", dy: -4pt, rs-notes.at(1))
+    flow-note("rs-build", dy: -4pt, rs-notes.at(2))
+    flow-note("rs-assign", dy: 6pt, rs-notes.at(3))
+    flow-note("rs-put", dy: -4pt, rs-notes.at(4))
+    flow-note("rs-nar", dy: -32pt, rs-notes.at(5))
+  },
   caption: [Remote-store build flow (`nix build --store ssh-ng://rio`).],
 )
+#flow-notes-web(..rs-notes)
 
 == Remote Builder: `nix build --builders 'ssh-ng://rio ...'`
 
-```text
-1. User runs: nix build .#package (with rio configured as a builder)
-2. Nix evaluates locally, starts building the DAG
-3. For each derivation, local nix-daemon invokes the build hook
-4. Build hook connects to rio-gateway via ssh-ng
-5. Build hook sends the .drv path, system, and features
-6. rio-gateway receives single-derivation build request
-   -> creates a mini build plan in rio-scheduler
-7. rio-scheduler assigns to an executor (same algorithm but single-derivation)
-8. Executor builds, uploads output to rio-store
-9. rio-gateway returns output to build hook
-10. Build hook copies output back to local store
-11. Local daemon continues with next derivation
-```
-
-#info[
-  *Key difference:* in build hook mode, the local daemon drives the DAG
-  traversal. rio only sees one derivation at a time. Less optimal scheduling,
-  but fully compatible with any existing Nix setup.
-]
-
-#info[
-  *Note on `--builders` mode:* In `--builders` mode, the local nix-daemon (not
-  the build hook program directly) connects to rio-gateway via ssh-ng. What
-  rio-gateway sees is a normal ssh-ng session with a specific operation
-  pattern. The build hook is a local daemon concept; rio-gateway doesn't
-  distinguish build hook vs direct client connections.
-]
-
-#figure(
-  chronos.diagram({
-    import chronos: *
-    _par("Daemon", display-name: [Local nix-daemon])
-    _par("Hook", display-name: [Build Hook])
-    _par("GW", display-name: [rio-gateway])
-    _par("Sched", display-name: [rio-scheduler])
-    _par("Builder", display-name: [rio-builder])
-
-    _seq("Daemon", "Hook", comment: [delegate derivation])
-    _seq("Hook", "GW", comment: [SSH connect])
-    _seq("Hook", "GW", comment: [`wopBuildDerivation` (single)])
-    _seq("GW", "Sched", comment: [`SubmitBuild` (single node)])
-    _seq("Sched", "Builder", comment: [`WorkAssignment`])
-    _seq("Builder", "Builder", comment: [build])
-    _seq("Builder", "Sched", comment: [`CompletionReport`])
-    _seq("Sched", "GW", comment: [`BuildEvent` (completed)])
-    _seq("GW", "Hook", comment: [`BuildResult`])
-    _seq("Hook", "Daemon", comment: [output path])
-    _seq("Daemon", "Daemon", comment: [continue DAG])
-  }),
-  caption: [Build-hook flow (`--builders 'ssh-ng://rio'`).],
+#let rb-notes = (
+  [rio-gateway sees a normal ssh-ng session --- it does not distinguish
+    build-hook from direct-client connections. The build hook is a local
+    nix-daemon concept.],
+  [Local daemon drives DAG traversal --- rio only ever sees one derivation
+    at a time. Less optimal scheduling, but compatible with any existing Nix
+    setup.],
 )
 
-== Client Disconnection
+#figure(
+  {
+    flow-diagram(chronos.diagram({
+      import chronos: *
+      _par("Daemon", display-name: [Local nix-daemon])
+      _par("Hook", display-name: [Build Hook])
+      _par("GW", display-name: [rio-gateway])
+      _par("Sched", display-name: [rio-scheduler])
+      _par("Builder", display-name: [rio-builder])
 
-```text
-1. Client SSH connection drops (network failure, ctrl-c, etc.)
-2. rio-gateway detects SSH channel close
-3. Gateway sends CancelBuild to scheduler with reason="client_disconnect"
-4. Scheduler policy:
-   a. For derivations shared with other active builds: continue building
-      (the DAG merge logic keeps shared derivation nodes live as long as
-      at least one interested build remains)
-   b. For derivations unique to this build: removed from the queue
-      immediately. If already Running, the executor is allowed to complete
-      (wasted work is bounded by one derivation per executor)
-5. Completed outputs remain in rio-store regardless of client state
-6. If the client reconnects and re-submits, the scheduler's DAG merge
-   re-inserts the derivations. Any outputs already stored in step 5 are
-   cache hits (instant completion via FindMissingPaths)
-```
+      _seq("Daemon", "Hook", comment: [delegate derivation])
+      _seq("Hook", "GW", comment: [SSH connect#pin("rb-conn")])
+      _seq("Hook", "GW", comment: [`wopBuildDerivation` (single)])
+      _seq("GW", "Sched", comment: [`SubmitBuild` (single node)])
+      _seq("Sched", "Builder", comment: [`WorkAssignment`])
+      _seq("Builder", "Builder", comment: [build])
+      _seq("Builder", "Sched", comment: [`CompletionReport`])
+      _seq("Sched", "GW", comment: [`BuildEvent` (completed)])
+      _seq("GW", "Hook", comment: [`BuildResult`])
+      _seq("Hook", "Daemon", comment: [output path])
+      _seq("Daemon", "Daemon", comment: [continue DAG#pin("rb-dag")])
+    }))
+    flow-note("rb-conn", dy: -6pt, rb-notes.at(0))
+    flow-note("rb-dag", dy: -28pt, rb-notes.at(1))
+  },
+  caption: [Build-hook flow (`--builders 'ssh-ng://rio'`).],
+)
+#flow-notes-web(..rb-notes)
+
+== Client Disconnection <sec-client-disconnect>
+
+#let cd-notes = (
+  [Shared derivation nodes stay live as long as at least one other interested
+    build remains (DAG merge).],
+  [Running executors are allowed to complete --- wasted work is bounded by
+    one derivation per executor.],
+  [On re-submit, outputs already stored are instant cache hits via
+    `FindMissingPaths`.],
+)
 
 #info[
   *Not implemented (by design):* No orphan timeout window or explicit
@@ -394,76 +397,93 @@ and #link("./spec/components/store.typ")[rio-store] for the chunked CAS.
 ]
 
 #figure(
-  chronos.diagram({
-    import chronos: *
-    _par("Client", display-name: [Nix Client])
-    _par("GW", display-name: [rio-gateway])
-    _par("Sched", display-name: [rio-scheduler])
-    _par("Builder", display-name: [rio-builder])
+  {
+    flow-diagram(chronos.diagram({
+      import chronos: *
+      _par("Client", display-name: [Nix Client])
+      _par("GW", display-name: [rio-gateway])
+      _par("Sched", display-name: [rio-scheduler])
+      _par("Builder", display-name: [rio-builder])
 
-    _seq("Client", "GW", end-tip: "x", comment: [SSH connection drops])
-    _seq("GW", "Sched", comment: [`CancelBuild` (client_disconnect)])
-    _alt(
-      [Shared derivation],
-      { _seq("Sched", "Sched", comment: [continue (other builds need it)]) },
-      [Unique derivation],
-      { _seq("Sched", "Sched", comment: [remove from queue immediately]) },
-    )
-    _seq("Builder", "Sched", comment: [`CompletionReport` (if already Running)])
-    _note("over", [Outputs kept in store regardless], pos: "Sched")
-    _seq("Client", "GW", comment: [Reconnect + re-submit])
-    _seq("Sched", "Sched", comment: [DAG merge + cache hits on stored outputs])
-  }),
+      _seq("Client", "GW", end-tip: "x", comment: [SSH connection drops])
+      _seq("GW", "Sched", comment: [`CancelBuild` (client_disconnect)])
+      _alt(
+        [Shared derivation],
+        {
+          _seq(
+            "Sched",
+            "Sched",
+            comment: [continue (other builds need it)#pin("cd-shared")],
+          )
+        },
+        [Unique derivation],
+        { _seq("Sched", "Sched", comment: [remove from queue immediately]) },
+      )
+      _seq(
+        "Builder",
+        "Sched",
+        comment: [`CompletionReport` (if already Running)#pin("cd-running")],
+      )
+      _note("over", [Outputs kept in store regardless], pos: "Sched")
+      _seq("Client", "GW", comment: [Reconnect + re-submit])
+      _seq(
+        "Sched",
+        "Sched",
+        comment: [DAG merge + cache hits on stored outputs#pin("cd-rejoin")],
+      )
+    }))
+    flow-note("cd-shared", dy: -14pt, cd-notes.at(0))
+    flow-note("cd-running", dy: -8pt, cd-notes.at(1))
+    flow-note("cd-rejoin", dy: -2pt, cd-notes.at(2))
+  },
   caption: [Client-disconnection handling.],
 )
+#flow-notes-web(..cd-notes)
 
 == Scheduler Failover
 
-```text
-1. Scheduler leader pod dies (crash, node failure, rolling update)
-2. New scheduler pod acquires the Kubernetes Lease for leader election
-3. New leader reconstructs in-memory state from PostgreSQL
-   (see scheduler.md State Recovery). Dispatch is gated on
-   recovery_complete.
-4. Executors detect stream break, reconnect BuildExecution streams to new leader
-5. For gateway connections with active SubmitBuild streams:
-   a. The SubmitBuild response stream (BuildEvent) breaks with a gRPC
-      Transport error
-   b. Gateway's process_stream classifies the error as
-      StreamProcessError::Transport and re-subscribes via
-      WatchBuild(build_id, since_sequence) — up to 5 times with
-      exponential backoff (1/2/4/8/16s)
-   c. New scheduler replays BuildEvents from build_event_log starting
-      at since_sequence. Nix client sees continuous STDERR streaming
-      (possibly a brief pause during backoff)
-   d. If all 5 reconnects fail OR the error is EofWithoutTerminal/Wire
-      → gateway returns MiscFailure to the client (manual retry)
-   e. If the gateway itself also restarted, see Client Disconnection above
-6. Log events between the old leader's last S3 flush and its crash may
-   be lost (bounded by the 30s periodic flush; see observability.md)
-```
++ Scheduler leader pod dies (crash, node failure, rolling update).
++ New scheduler pod acquires the Kubernetes Lease for leader election.
++ New leader reconstructs in-memory state from PostgreSQL (see the
+  #link("./spec/components/scheduler.typ")[scheduler spec] State Recovery
+  section). Dispatch is gated on `recovery_complete`.
++ Executors detect stream break and reconnect `BuildExecution` streams to the
+  new leader.
++ For gateway connections with active `SubmitBuild` streams:
+  + The `BuildEvent` response stream breaks with a gRPC Transport error.
+  + Gateway's `process_stream` classifies the error as
+    `StreamProcessError::Transport` and re-subscribes via
+    `WatchBuild(build_id, since_sequence)` --- up to 5 times with exponential
+    backoff (1/2/4/8/16s).
+  + New scheduler replays `BuildEvent`s from `build_event_log` starting at
+    `since_sequence`. The Nix client sees continuous `STDERR` streaming
+    (possibly a brief pause during backoff).
+  + If all 5 reconnects fail, or the error is `EofWithoutTerminal`/`Wire`,
+    the gateway returns `MiscFailure` to the client (manual retry).
+  + If the gateway itself also restarted, see @sec-client-disconnect above.
++ Log events between the old leader's last S3 flush and its crash may be lost
+  --- bounded by the 30s periodic flush (see
+  #link("./spec/observability.typ")[observability]).
 
 == Import-From-Derivation (IFD)
 
-IFD occurs when Nix evaluation depends on a build result. The flow is:
+IFD occurs when Nix evaluation depends on a build result:
 
-```text
-1. Client begins evaluation, discovers it needs to build a derivation
-   before it can continue evaluation
-2. Client opens a separate SSH channel (the primary channel is blocked
-   in evaluation) and sends wopBuildDerivation for the IFD derivation
-3. rio-gateway receives a single-derivation build request on the new channel
-   -> rio-gateway forwards to rio-scheduler as a SubmitBuild with
-      priority_class = "interactive" (IFD builds are evaluation-blocking)
-4. rio-scheduler detects IFD priority: the scheduler assigns maximum
-   priority to this derivation (above all queued non-IFD work)
-5. Executor builds the derivation, uploads output
-6. rio-gateway returns BuildResult to the client on the IFD channel
-7. Client retrieves the output via wopNarFromPath on the IFD channel
-8. Client resumes evaluation using the IFD output
-9. Client may submit the full DAG (including the IFD derivation) on the
-   primary channel --- the IFD derivation is already cached (instant hit)
-```
++ Client begins evaluation and discovers it needs to build a derivation
+  before evaluation can continue.
++ Client opens a separate SSH channel (the primary channel is blocked in
+  evaluation) and sends `wopBuildDerivation` for the IFD derivation.
++ rio-gateway receives a single-derivation build request on the new channel
+  and forwards it to rio-scheduler as a `SubmitBuild` with
+  `priority_class = "interactive"` (IFD builds are evaluation-blocking).
++ rio-scheduler assigns maximum priority to this derivation --- above all
+  queued non-IFD work.
++ Executor builds the derivation and uploads the output.
++ rio-gateway returns `BuildResult` to the client on the IFD channel.
++ Client retrieves the output via `wopNarFromPath` on the IFD channel and
+  resumes evaluation.
++ Client may submit the full DAG (including the IFD derivation) on the
+  primary channel --- the IFD derivation is already cached (instant hit).
 
 #info[
   *Detection heuristic:* IFD builds arrive as individual `wopBuildDerivation`
