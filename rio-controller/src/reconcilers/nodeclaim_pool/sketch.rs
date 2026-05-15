@@ -222,6 +222,17 @@ impl CellState {
             self.lead_time_q = (self.lead_time_q - 0.02).max(0.5);
         }
     }
+
+    /// True when [`schmitt_adjust`](Self::schmitt_adjust) can no longer
+    /// widen `lead_time_q`: either `q` has hit the 0.99 clamp, or the
+    /// `lead_time < max_lead_time` widen-gate is closed. Exported as
+    /// `rio_controller_nodeclaim_lead_time_q_at_cap{cell}` — sustained
+    /// at-cap with low `forecast_hit_ewma` is the spec's "structurally
+    /// cannot cover" signal (fat-tailed `eta_error` the model cannot
+    /// absorb without unbounded idle cost).
+    pub fn at_cap(&self, max_lead_time: f64) -> bool {
+        self.lead_time_q >= 0.99 || self.lead_time() >= max_lead_time
+    }
 }
 
 /// `s.quantile(q)` flattened. `None` ⇔ empty sketch (or `q∉[0,1]`,
@@ -932,15 +943,19 @@ mod tests {
         assert!((s.lead_time_q - 0.90).abs() < 1e-9);
         // Widen capped at 0.99.
         s.lead_time_q = 0.98;
+        assert!(!s.at_cap(600.0), "q=0.98 lt≈30: not yet at cap");
         s.schmitt_adjust(0.1, 0.9, 600.0);
         assert!((s.lead_time_q - 0.99).abs() < 1e-9);
         s.schmitt_adjust(0.1, 0.9, 600.0);
         assert!((s.lead_time_q - 0.99).abs() < 1e-9, "stays at cap");
+        assert!(s.at_cap(600.0), "q=0.99 ⇒ at_cap (clamp arm)");
         // Widen gated on lead_time < max: max=10 < lt≈30 → no widen.
         let mut s2 = CellState::default();
         s2.record(30.0, 0.0);
         s2.schmitt_adjust(0.1, 0.9, 10.0);
         assert!((s2.lead_time_q - 0.90).abs() < 1e-9, "max gate holds q");
+        assert!(s2.at_cap(10.0), "lt≈30 ≥ max=10 ⇒ at_cap (gate arm)");
+        assert!(!s2.at_cap(600.0), "same q=0.90, max=600: not at cap");
         // Narrow floored at 0.5.
         s2.lead_time_q = 0.51;
         s2.schmitt_adjust(0.99, 0.9, 600.0);

@@ -1458,6 +1458,17 @@ impl NodeClaimPoolReconciler {
             .set(term_age);
             metrics::gauge!("rio_controller_nodeclaim_lead_time_seconds", "cell" => label.clone())
                 .set(self.sketches.lead_time(cell));
+            // §13b closed-loop SLIs (`forecast_hit_ewma` is the EWMA
+            // `schmitt_adjust` reads at mod.rs:1202; `at_cap` is the
+            // widen-gate ceiling). 0.9/false for unknown cells = the
+            // `CellState::default()` mid-zone seed, i.e. a no-op.
+            let s = self.sketches.get(cell);
+            metrics::gauge!("rio_controller_nodeclaim_forecast_hit_ewma",
+                "cell" => label.clone())
+            .set(s.map_or(0.9, |s| s.forecast_hit_ewma));
+            metrics::gauge!("rio_controller_nodeclaim_lead_time_q_at_cap",
+                "cell" => label.clone())
+            .set(s.is_some_and(|s| s.at_cap(self.cfg.max_lead_time)) as u64 as f64);
             // r41 bug_026: `RioNodeclaimPoolStuckPending` anchors on this
             // (the reaper's actual threshold) instead of `3×lead_time`
             // (a proxy that can fall below `2×seed` once the cell learns).

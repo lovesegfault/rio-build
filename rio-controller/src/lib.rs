@@ -261,6 +261,21 @@ pub fn describe_metrics() {
          no Registered=True transitions recorded yet (check seed_fallback_total)."
     );
     describe_gauge!(
+        "rio_controller_nodeclaim_forecast_hit_ewma",
+        "Per-`cell` closed-loop SLI: EWMA(α=0.2) of the fraction of intents satisfiable \
+         from already-Registered nodeclaims at dispatch time. Drives the Schmitt deadband \
+         on lead_time_q (widen below 0.85·target, narrow above 1.05·target). \
+         Restart-resets to 0.9 (target mid-zone)."
+    );
+    describe_gauge!(
+        "rio_controller_nodeclaim_lead_time_q_at_cap",
+        "Per-`cell` boolean (0/1): the Schmitt loop can no longer widen lead_time_q — \
+         either q≥0.99 (clamp) or lead_time≥sla.maxLeadTime (widen-gate closed). \
+         Sustained 1 with low forecast_hit_ewma = structurally cannot cover \
+         (fat-tailed eta_error). Derivable from lead_time_seconds vs config; exported \
+         so the alert anchors on the actual gate predicate."
+    );
+    describe_gauge!(
         "rio_controller_nodeclaim_ice_timeout_seconds",
         "Per-`cell` boot/ICE reap threshold the reaper acts at: \
          max(2×lead_time_seed, q_0.99(boot)), floored at 2×seed until 100 \
