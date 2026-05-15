@@ -4,79 +4,143 @@
 
 = Overview
 
-```text
-┌──────────────────────────────────────────────────────────────────────┐
-│                        Nix Clients                                   │
-│                                                                      │
-│  Path A (remote store):                                              │
-│    nix build --store ssh-ng://rio .#package                          │
-│                                                                      │
-│  Path B (remote builder / build hook):                               │
-│    nix.buildMachines = [{ hostName="rio"; protocol="ssh-ng"; ... }]  │
-│    nix build .#package  (daemon delegates via build hook)            │
-└─────────────┬──────────────────────────────────┬─────────────────────┘
-              │ ssh-ng (worker protocol)         │ ssh-ng (worker protocol)
-              ▼                                  ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                  rio-gateway (multiple replicas)                     │
-│                                                                      │
-│  SSH server (russh) -> Nix worker protocol handler                   │
-│  Handles: handshake, wopSetOptions, wopBuildDerivation,              │
-│           wopQueryPathInfo, wopAddToStoreNar, wopNarFromPath, etc.   │
-│  Translates protocol ops -> internal gRPC calls                      │
-│  Auth: SSH key-based, maps to tenants                                │
-│  Multiplexes concurrent SSH sessions (no persistent state;           │
-│  per-connection ephemeral state only)                                │
-└──────────┬──────────────────────┬────────────────────────────────────┘
-           │ gRPC                 │ gRPC
-           ▼                      ▼
-┌────────────────────┐  ┌─────────────────────────────────────────────┐
-│   rio-scheduler    │  │              rio-store                      │
-│   (leader-elected) │  │                                             │
-│                    │  │  Chunked CAS (FastCDC + BLAKE3)             │
-│  Global build DAG  │  │  ┌─────────────────────────────────┐        │
-│  Critical-path     │◄►│  │ Metadata (PostgreSQL)           │        │
-│  scheduling        │  │  │ narinfo, references, manifests  │        │
-│  Resource-fit      │  │  │ CA content index (SHA-256)      │        │
-│  hard-filter       │  │  └─────────────────────────────────┘        │
-│  Streaming builder │  │  ┌─────────────────────────────────┐        │
-│  assignment        │  │  │ Blobs (S3-compatible)           │        │
-│  State: PostgreSQL │  │  │ Deduplicated chunks (BLAKE3)    │        │
-│                    │  │  │ Inline blobs for NARs < 256 KiB │        │
-└────────┬───────────┘  │                                             │
-         │ gRPC         └──────────────┬──────────────────────────────┘
-         │  (builders stream           │ gRPC
-         │   work via BuildExecution)  │
-         ▼                             ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                     Builder Pods (K8s, CAP_SYS_ADMIN)                │
-│                                                                      │
-│  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐      │
-│  │ builder-0  │  │ builder-1  │  │ builder-2  │  │ builder-N  │      │
-│  │            │  │            │  │            │  │            │      │
-│  │ FUSE mount │  │ FUSE mount │  │ FUSE mount │  │ FUSE mount │      │
-│  │ /nix/store │  │ /nix/store │  │ /nix/store │  │ /nix/store │      │
-│  │ + local    │  │ + local    │  │ + local    │  │ + local    │      │
-│  │   SSD cache│  │   SSD cache│  │   SSD cache│  │   SSD cache│      │
-│  │            │  │            │  │            │  │            │      │
-│  │ per-build  │  │ per-build  │  │ per-build  │  │ per-build  │      │
-│  │ overlayfs  │  │ overlayfs  │  │ overlayfs  │  │ overlayfs  │      │
-│  │ + synth    │  │ + synth    │  │ + synth    │  │ + synth    │      │
-│  │ SQLite DB  │  │ SQLite DB  │  │ SQLite DB  │  │ SQLite DB  │      │
-│  │            │  │            │  │            │  │            │      │
-│  │ nix sandbox│  │ nix sandbox│  │ nix sandbox│  │ nix sandbox│      │
-│  └────────────┘  └────────────┘  └────────────┘  └────────────┘      │
-└──────────────────────────────────────────────────────────────────────┘
-
-┌──────────────────────────────────────────────────────────────────────┐
-│                   rio-controller (K8s Operator)                      │
-│                                                                      │
-│  Manages: Pool Jobs, GC                                              │
-│  CRDs: Pool, ComponentScaler                                         │
-│  Watches: K8s API -> reconciles Jobs                                 │
-│  Single-replica by design (not leader-elected)                       │
-└──────────────────────────────────────────────────────────────────────┘
-```
+#figure(
+  caption: [System overview --- layered request path. Clients speak the Nix
+    worker protocol over SSH; the gateway translates to internal gRPC; the
+    scheduler and store are replica sets backed by PostgreSQL/S3; builders are
+    ephemeral one-shot pods reconciled by the controller.],
+  diagram(
+    spacing: (26mm, 10mm),
+    node-stroke: 0.5pt,
+    // ───── layer 1: clients
+    node(
+      (0.5, 0),
+      name: <clients>,
+      width: 30em,
+      align(left)[
+        *Nix Clients* \
+        #text(size: 0.8em)[
+          Path A (remote store): `nix build --store ssh-ng://rio .#pkg` \
+          Path B (build hook): `nix.buildMachines = [{ hostName="rio"; protocol="ssh-ng"; }]`
+        ]
+      ],
+    ),
+    edge(<clients>, <gw>, "-|>", [ssh-ng (worker protocol)], label-size: 0.8em),
+    // ───── layer 2: gateway
+    node(
+      (0.5, 1),
+      name: <gw>,
+      width: 30em,
+      fill: accent.lighten(88%),
+      align(left)[
+        *rio-gateway* #text(size: 0.8em, fill: muted)[--- multiple replicas, stateless] \
+        #text(size: 0.8em)[
+          SSH server (russh) → worker-protocol handler → gRPC. \
+          Handles `wopBuildDerivation`, `wopQueryPathInfo`, `wopAddToStoreNar`, … \
+          Auth: SSH key → tenant. Per-connection ephemeral state only.
+        ]
+      ],
+    ),
+    edge(<gw>, <sched>, "-|>", [gRPC], label-size: 0.8em, label-side: right),
+    edge(<gw>, <store>, "-|>", [gRPC], label-size: 0.8em, label-side: left),
+    // ───── layer 3: scheduler ∥ store
+    node(
+      (-0.2, 2.3),
+      name: <sched>,
+      shape: rect,
+      width: 12em,
+      fill: accent.lighten(88%),
+      align(left)[
+        *rio-scheduler* \
+        #text(size: 0.8em, fill: muted)[leader-elected] \
+        #text(size: 0.8em)[
+          Global build DAG \
+          Critical-path scheduling \
+          Resource-fit hard-filter \
+          State: PostgreSQL
+        ]
+      ],
+    ),
+    node(
+      (1.2, 2.3),
+      name: <store>,
+      shape: rect,
+      width: 15em,
+      fill: accent.lighten(88%),
+      align(left)[
+        *rio-store* \
+        #text(size: 0.8em, fill: muted)[chunked CAS --- FastCDC + BLAKE3]
+        #block(
+          stroke: 0.4pt + rule-color,
+          inset: 4pt,
+          radius: 2pt,
+          width: 100%,
+          above: 0.5em,
+          below: 0.4em,
+          text(
+            size: 0.75em,
+          )[*PostgreSQL* --- narinfo, refs, manifests, CA index],
+        )
+        #block(
+          stroke: 0.4pt + rule-color,
+          inset: 4pt,
+          radius: 2pt,
+          width: 100%,
+          below: 0em,
+          text(size: 0.75em)[*S3* --- BLAKE3 chunks, inline blobs \<256 KiB],
+        )
+      ],
+    ),
+    edge(<sched>, <store>, "<|-|>", label-size: 0.8em),
+    edge(
+      <sched>,
+      <pods>,
+      "-|>",
+      [gRPC `BuildExecution`],
+      label-size: 0.75em,
+      label-side: right,
+    ),
+    edge(<store>, <pods>, "-|>", [gRPC], label-size: 0.8em, label-side: left),
+    // ───── layer 4: builder pods
+    let bldr(tag) = align(left)[
+      *#tag* \
+      #text(size: 0.75em)[
+        FUSE `/nix/store` + SSD cache \
+        overlayfs + synth SQLite DB \
+        nix sandbox
+      ]
+    ],
+    node(
+      (-0.2, 3.6),
+      name: <pods-hdr>,
+      stroke: none,
+      inset: 0pt,
+      text(size: 0.8em, fill: muted)[Builder Pods (K8s, `CAP_SYS_ADMIN`)],
+    ),
+    node((-0.2, 4.0), name: <b0>, shape: rect, bldr[builder-0]),
+    node((0.5, 4.0), name: <bdots>, stroke: none, text(fill: muted)[⋯]),
+    node((1.2, 4.0), name: <bn>, shape: rect, bldr[builder-N]),
+    node(
+      enclose: (<pods-hdr>, <b0>, <bdots>, <bn>),
+      name: <pods>,
+      stroke: (paint: muted, dash: "dashed"),
+      inset: 8pt,
+    ),
+    // ───── layer 5: controller (no direct traffic)
+    node(
+      (0.5, 5.2),
+      name: <ctrl>,
+      width: 30em,
+      align(left)[
+        *rio-controller* #text(size: 0.8em, fill: muted)[--- K8s operator, single-replica] \
+        #text(size: 0.8em)[
+          CRDs: `Pool`, `ComponentScaler`. Watches K8s API → reconciles builder Jobs, GC.
+        ]
+      ],
+    ),
+    edge(<ctrl>, <pods>, "..|>", [reconciles], label-size: 0.8em),
+  ),
+)
 
 The controller is a supervisor that manages the lifecycle of all other
 components via the Kubernetes API. It does not receive direct traffic from
