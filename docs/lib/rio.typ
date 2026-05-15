@@ -35,7 +35,8 @@
 
 // ─── package imports ────────────────────────────────────────────────
 #import "@preview/shiroa:0.3.1": (
-  is-html-target, is-pdf-target, is-web-target, shiroa-sys-target, templates,
+  cross-link, is-html-target, is-pdf-target, is-web-target, shiroa-sys-target,
+  templates,
 )
 #import templates: (
   add-styles, equation-rules, markup-rules, template-rules, theme-box,
@@ -211,16 +212,6 @@
 #let xref(target, body) = context {
   if query(target).len() > 0 { link(target, body) } else { body }
 }
-
-// Link to another doc page by source path. dyn-paged's wasm renderer
-// rasterizes link URLs literally (no .typ→.html rewrite), so swap the
-// extension for non-PDF targets. The regex preserves a `#fragment`.
-#let doc-link(path, body) = link(
-  if is-pdf-target() { path } else {
-    path.replace(regex("\.typ($|#)"), m => ".html" + m.captures.at(0))
-  },
-  body,
-)
 
 // ─── the template ───────────────────────────────────────────────────
 #let rio(domains: none, paper: none, body) = {

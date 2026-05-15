@@ -148,19 +148,19 @@ builders or other components --- it watches CRDs and reconciles desired state.
 
 == Component Links
 
-- *#link("./spec/components/gateway.typ")[rio-gateway]* --- SSH server, Nix protocol
+- *#cross-link("/spec/components/gateway.typ")[rio-gateway]* --- SSH server, Nix protocol
   frontend
-- *#link("./spec/components/scheduler.typ")[rio-scheduler]* --- DAG-aware build
+- *#cross-link("/spec/components/scheduler.typ")[rio-scheduler]* --- DAG-aware build
   scheduler
-- *#link("./spec/components/store.typ")[rio-store]* --- Chunked CAS
-- *#link("./spec/components/builder.typ")[rio-builder]* --- Build executor with FUSE
+- *#cross-link("/spec/components/store.typ")[rio-store]* --- Chunked CAS
+- *#cross-link("/spec/components/builder.typ")[rio-builder]* --- Build executor with FUSE
   store
-- *#link("./spec/components/controller.typ")[rio-controller]* --- Kubernetes operator
-- *#link("./spec/components/proto.typ")[rio-proto]* --- gRPC service definitions
+- *#cross-link("/spec/components/controller.typ")[rio-controller]* --- Kubernetes operator
+- *#cross-link("/spec/components/proto.typ")[rio-proto]* --- gRPC service definitions
 - *rio-nix* --- Nix protocol implementation library (wire primitives, ATerm,
   NAR, store paths)
 - *rio-common* --- shared utilities (limits, observability init)
-- *#link("./spec/components/dashboard.typ")[rio-dashboard]* --- Web dashboard (Phase 5)
+- *#cross-link("/spec/components/dashboard.typ")[rio-dashboard]* --- Web dashboard (Phase 5)
 
 #figure(
   caption: [Component topology. Gateway terminates ssh-ng and fans out to
@@ -248,12 +248,12 @@ on the message arrows below.
   insert. The `rio_scheduler_ca_cutoff_saves_total` metric is the direct
   efficacy signal. See `r[sched.ca.cutoff-compare]`,
   `r[sched.ca.cutoff-propagate+2]`, `r[sched.ca.resolve]` in the
-  #link("./spec/components/scheduler.typ")[scheduler spec].
+  #cross-link("/spec/components/scheduler.typ")[scheduler spec].
 ]
 
-See #link("./spec/components/gateway.typ")[rio-gateway] for protocol opcode details,
-#link("./spec/components/scheduler.typ")[rio-scheduler] for the scheduling algorithm,
-and #link("./spec/components/store.typ")[rio-store] for the chunked CAS.
+See #cross-link("/spec/components/gateway.typ")[rio-gateway] for protocol opcode details,
+#cross-link("/spec/components/scheduler.typ")[rio-scheduler] for the scheduling algorithm,
+and #cross-link("/spec/components/store.typ")[rio-store] for the chunked CAS.
 
 #let rs-notes = (
   [Protocol $>=$ 1.32 batches sources via `wopAddMultipleToStore` instead.],
@@ -445,7 +445,7 @@ and #link("./spec/components/store.typ")[rio-store] for the chunked CAS.
 + Scheduler leader pod dies (crash, node failure, rolling update).
 + New scheduler pod acquires the Kubernetes Lease for leader election.
 + New leader reconstructs in-memory state from PostgreSQL (see the
-  #link("./spec/components/scheduler.typ")[scheduler spec] State Recovery
+  #cross-link("/spec/components/scheduler.typ")[scheduler spec] State Recovery
   section). Dispatch is gated on `recovery_complete`.
 + Executors detect stream break and reconnect `BuildExecution` streams to the
   new leader.
@@ -463,7 +463,7 @@ and #link("./spec/components/store.typ")[rio-store] for the chunked CAS.
   + If the gateway itself also restarted, see @sec-client-disconnect above.
 + Log events between the old leader's last S3 flush and its crash may be lost
   --- bounded by the 30s periodic flush (see
-  #link("./spec/observability.typ")[observability]).
+  #cross-link("/spec/system/observability.typ")[observability]).
 
 == Import-From-Derivation (IFD)
 
