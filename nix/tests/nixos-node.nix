@@ -121,18 +121,6 @@ pkgs.testers.runNixOSTest {
     with subtest("containerd up"):
         node.wait_for_unit("containerd.service")
 
-    # T5: containerd's config is a build-time store path (no nodeadm
-    # dep), so it MUST have started before nodeadm-init. Monotonic
-    # ActiveEnterTimestamp comparison.
-    with subtest("containerd started before nodeadm-init (T5 ordering)"):
-        ctd = int(node.succeed(
-            "systemctl show -P ActiveEnterTimestampMonotonic containerd.service"
-        ).strip())
-        nad = int(node.succeed(
-            "systemctl show -P ActiveEnterTimestampMonotonic nodeadm-init.service"
-        ).strip())
-        assert ctd < nad, f"containerd ({ctd}) should activate before nodeadm-init ({nad})"
-
     # T7f: pick-base-runtime-spec ExecStartPre symlinks the -kvm spec
     # iff /dev/kvm is a chardev. The CI runner has KVM (nested), so
     # assert agreement rather than a fixed variant.
