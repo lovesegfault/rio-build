@@ -181,11 +181,17 @@
     // under typst's html target. tracey's scanner reads .typ source
     // (regex for `r[...]`/`#r("...")`), not compiled output, so this
     // doesn't affect `tracey query`.
-    html.elem("div", attrs: (class: "rio-req", id: "r-" + id), {
-      html.elem("code", attrs: (class: "rio-req-id"), "r[" + id + "]")
-      [ ]
-      body.pos().join()
-    })
+    //
+    // The trailing typst `#label("r-"+id)` is what makes `rref()`'s
+    // `query(label())` find the target in static-HTML mode — the html
+    // `id:` attr alone is invisible to query(). typst's `link(label,…)`
+    // resolves the href to the labelled element's html `id` attribute,
+    // so the two stay in sync (verified empirically).
+    [#html.elem("div", attrs: (class: "rio-req", id: "r-" + id), {
+        html.elem("code", attrs: (class: "rio-req-id"), "r[" + id + "]")
+        [ ]
+        body.pos().join()
+      }) #label("r-" + id)]
   } else {
     req(id, ..body)
   }
