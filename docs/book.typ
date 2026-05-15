@@ -22,10 +22,11 @@
     #chapter("guide/programmatic.typ")[Programmatic Access]
     = Architecture
     #chapter("architecture.typ")[System Architecture]
-    // starlight's sidebar renderer flattens parts and calls .sum() on
-    // each part's chapter list — a part with zero direct chapters (e.g.
-    // `= Spec` immediately followed by `== System`) crashes. Keep the
-    // spec grouping in the part label instead of nesting headings.
+    // shiroa's sidebar renderer (both starlight and mdbook) flattens
+    // parts and calls .sum() on each part's chapter list — a part with
+    // zero direct chapters (e.g. `= Spec` immediately followed by
+    // `== System`) crashes. Keep the spec grouping in the part label
+    // instead of nesting headings.
     = Spec · System
     #chapter("spec/system/observability.typ")[Observability]
     #chapter("spec/system/security.typ")[Security & Threat Model]

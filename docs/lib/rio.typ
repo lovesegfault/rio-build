@@ -12,7 +12,7 @@
 //   "book-pdf"  — chapter inside the stitched book-pdf.typ aggregate.
 //                 A4 geometry, but no per-chapter front-matter.
 //   html        — shiroa --mode static-html. typst target = html;
-//                 template-rules → starlight() emits the <head>/CSS/
+//                 template-rules → mdbook() emits the <head>/CSS/
 //                 sidebar chrome; markup-rules wires heading anchors.
 //                 ALSO the html-wrapper pass of dyn-paged (see below).
 //   web         — shiroa --mode dyn-paged, content pass. typst target
@@ -22,8 +22,8 @@
 //                 dyn-paged compiles each chapter TWICE: once with
 //                 x-target=web-* (this branch → .sir.in artifact) and
 //                 once with x-target=html-wrapper (the `html` branch
-//                 above → starlight chrome + wasm trampoline in place
-//                 of the body).
+//                 above → mdbook chrome + wasm trampoline in place of
+//                 the body).
 //
 // Mechanism notes:
 // - `set page(...) if cond` — trailing form. `if cond { set ... }`
@@ -35,21 +35,11 @@
 
 // ─── package imports ────────────────────────────────────────────────
 #import "@preview/shiroa:0.3.1": (
-  html-support, is-html-target, is-pdf-target, is-web-target, shiroa-sys-target,
-  templates, x-target,
+  is-html-target, is-pdf-target, is-web-target, shiroa-sys-target, templates,
 )
 #import templates: (
   add-styles, equation-rules, markup-rules, template-rules, theme-box,
 )
-// dyn-svg-support emits the wasm-loader bootstrap (`<script
-// src=/internal/shiroa.js>` + the inline `window.typstRenderModuleReady
-// = ...` promise). shiroa-mdbook calls it from its head.typ; shiroa-
-// starlight 0.3.1 forgot to, so dyn-paged + starlight produces a
-// trampoline that awaits an undefined promise. We inject it via
-// template-rules' `extra-assets` (lands in starlight's <head> through
-// the sl:book-meta slot).
-#import html-support: supports-html-internal
-#import supports-html-internal: dyn-svg-support, shiroa-asset-file
 #import "@preview/tracey:0.1.0": req
 #import "@preview/glossarium:0.5.10": (
   get-entry-back-references, gls, glspl, make-glossary, print-glossary,
@@ -88,11 +78,11 @@
 // ─── shiroa html-frame theming ──────────────────────────────────────
 // equation-rules and our figure-frame rule render content as inline SVG
 // via html.frame(). shiroa's theme-box emits a dark + light copy under
-// `.dark`/`.light` so starlight CSS can toggle them; it expects a
-// `themes` dict with `is-dark` + `main-color` per variant. shiroa ships
-// no preset — the full theme-box-styles-from() machinery parses tmTheme
-// XML for code highlighting, which we don't use (codly handles raw) —
-// so build the minimal dict directly.
+// `.dark`/`.light` so the theme CSS (mdbook's general.css) can toggle
+// them; it expects a `themes` dict with `is-dark` + `main-color` per
+// variant. shiroa ships no preset — the full theme-box-styles-from()
+// machinery parses tmTheme XML for code highlighting, which we don't
+// use (codly handles raw) — so build the minimal dict directly.
 #let _web-themes = (
   light-theme: (is-dark: false, main-color: rgb("#1b1f24")),
   dark-theme: (is-dark: true, main-color: rgb("#c9d1d9")),
@@ -224,6 +214,16 @@
   if query(target).len() > 0 { link(target, body) } else { body }
 }
 
+// Link to another doc page by source path. dyn-paged's wasm renderer
+// rasterizes link URLs literally (no .typ→.html rewrite), so swap the
+// extension for non-PDF targets. The regex preserves a `#fragment`.
+#let doc-link(path, body) = link(
+  if is-pdf-target() { path } else {
+    path.replace(regex("\.typ($|#)"), m => ".html" + m.captures.at(0))
+  },
+  body,
+)
+
 // ─── the template ───────────────────────────────────────────────────
 #let rio(domains: none, paper: none, body) = {
   let target = sys.inputs.at("x-target", default: "pdf")
@@ -257,7 +257,7 @@
   show bibliography: set par(justify: false)
   set heading(numbering: "1.1 ")
   // Heading geometry is paged-only — in html mode markup-rules supplies
-  // starlight's heading wrapper and an outer v() would warn.
+  // the theme's heading wrapper and an outer v() would warn.
   show heading.where(level: 1): it => if is-paged-out {
     v(1.2em, weak: true)
     text(size: 16pt, weight: 700, fill: accent, it)
@@ -359,25 +359,25 @@
 
   // shiroa static-html: emit the page chrome + content transforms.
   //
-  // template-rules is the outer wrapper — for static-html it dispatches
-  // to shiroa-starlight's `starlight()`, which emits the full
-  // <html><head> (CSS links, <title>, search) and <body> (sidebar nav,
-  // header) and drops the show-body into the main-content slot. The
-  // `book-meta` arg is `include "/book.typ"` so the sidebar reflects
-  // the book manifest; book.typ doesn't import rio.typ so there's no
-  // cycle.
+  // template-rules is the outer wrapper — it dispatches to shiroa-
+  // mdbook's `mdbook()`, which emits the full <html><head> (CSS,
+  // <title>, dyn-svg-support wasm bootstrap) and <body> (sidebar nav,
+  // theme picker, getTypstTheme/svg_utils.js wiring) and drops the
+  // show-body into the main-content slot. The `book-meta` arg is
+  // `include "/book.typ"` so the sidebar reflects the book manifest;
+  // book.typ doesn't import rio.typ so there's no cycle.
   //
   // Whole block is gated on is-html ONLY — every branch below emits
   // html.elem/html.frame/add-styles, which don't exist when typst's
   // target is paged. dyn-paged (is-web-target) must NOT enter here.
   //
   // markup-rules + equation-rules + the figure/clue bypasses go inside
-  // template-rules so they transform the content that lands in
-  // starlight's main-content slot.
+  // template-rules so they transform the content that lands in mdbook's
+  // main-content slot.
   //
   // markup-rules only destructures `default-theme.dash-color`.
   // equation-rules needs a `theme-box` callback (dark/light dual-render
-  // for starlight's CSS toggle) — see _theme-frame above.
+  // for the CSS toggle) — see _theme-frame above.
   // figure.where(kind: image) catches every #figure(diagram(...)),
   // chronos.diagram, automaton, autograph, lq.diagram — typst defaults
   // unrecognised figure bodies to kind: image. Algorithm/listing/table/
@@ -388,49 +388,13 @@
         book-meta: include "/book.typ",
         title: if paper != none { paper.title } else { "" },
         plain-body: body,
-        web-theme: "starlight",
-        // dyn-paged html-wrapper pass: starlight 0.3.1 has THREE mdbook-
-        // parity gaps that break dyn-paged:
-        //   1. calls paged-load-trampoline() but never dyn-svg-support()
-        //      → trampoline awaits an undefined typstRenderModuleReady
-        //      (mdbook head.typ:26 has it).
-        //   2. never defines window.getTypstTheme()/isTypstLightTheme()
-        //      which shiroa.js calls to pick which .{theme}.multi.sir.in
-        //      to fetch (mdbook page.typ:55 defines them).
-        //   3. never loads svg_utils.js, which defines window.typstProcessSvg
-        //      / typstBindSemantics / layoutText that the wasm renderer
-        //      calls into — without it the wasm panics at vec2dom dom.rs:91
-        //      on JsValue(undefined) (mdbook page.typ:284 loads it).
-        // extra-assets lands in starlight's <head> via the sl:book-meta
-        // slot — inject all three. Gate on html-wrapper so static-html
-        // doesn't fetch the (unused) wasm renderer.
-        extra-assets: if x-target.starts-with("html-wrapper") {
-          (
-            // (2) — map starlight's data-theme=light|dark to the mdbook
-            // 5-theme palette the .sir.in artifacts are named after.
-            html.elem(
-              "script",
-              "window.getTypstTheme = function() {
-                var t = document.documentElement.dataset.theme;
-                if (!t || t === 'auto') {
-                  t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-                }
-                return t === 'dark' ? 'coal' : 'light';
-              };
-              window.isTypstLightTheme = function(t) {
-                return t === 'light' || t === 'rust';
-              };",
-            ),
-            // (3) — must precede (1); shiroa.js may call into svg_utils
-            // synchronously once the renderer is ready.
-            shiroa-asset-file("svg_utils.js"),
-            // (1)
-            dyn-svg-support(),
-          )
-        } else { () },
+        web-theme: "mdbook",
       )
-      show: markup-rules.with(themes: (default-theme: (dash-color: accent)))
-      show: equation-rules.with(theme-box: _theme-frame)
+      show: markup-rules.with(
+        web-theme: "mdbook",
+        themes: (default-theme: (dash-color: accent)),
+      )
+      show: equation-rules.with(web-theme: "mdbook", theme-box: _theme-frame)
       // html.frame() figures: diagrams (kind: image — typst's default
       // for unrecognised bodies, so catches fletcher/chronos/lilaq/
       // autograph/finite) and lovelace pseudocode (kind: "algorithm",
@@ -450,8 +414,8 @@
       show figure.where(kind: image): frame-figure
       show figure.where(kind: "algorithm"): frame-figure
       // typst html refuses #footnote when a custom <html> element is
-      // present (starlight emits one). Render the note body inline as
-      // a muted parenthetical instead — close enough for web reading.
+      // present (mdbook emits one). Render the note body inline as a
+      // muted parenthetical instead — close enough for web reading.
       show footnote: it => html.elem(
         "span",
         attrs: (class: "rio-footnote"),

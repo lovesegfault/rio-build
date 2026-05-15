@@ -57,7 +57,7 @@ let
         # chronos 0.3.0 wants typst ≥0.14.2; shiroa embeds 0.14.0.
         chronos_0_2_1
         shiroa
-        shiroa-starlight
+        shiroa-mdbook
       ])
       ++ [ traceyTypstPkg ]
     );
