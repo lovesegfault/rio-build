@@ -16,6 +16,7 @@
   subcharts,
   dockerImages,
   nodeAmi,
+  docsLib,
 }:
 let
   # Regenerate-then-diff drift check. `generate` populates
@@ -254,6 +255,118 @@ in
     what = "nix/pins.nix drifted from infra/eks/generated.auto.tfvars.json";
     regenHint = "nix build .#tfvars && jq -S . result > infra/eks/generated.auto.tfvars.json";
   };
+
+  # docs/gen/*.json are committed (nextest + dev-shell typst read them
+  # from the working tree) AND regenerated hermetically by docsData for
+  # the nix docs build. Drift means CI's docs build accepts a metric the
+  # dev's local `typst compile` rejects, and nextest under-covers.
+  #
+  # serde_json's `preserve_order` feature is workspace-unified
+  # differently between cargo (workspace-hack) and crate2nix
+  # (workspace-hack stubbed), so the local and nix-built xtask emit
+  # identical content with different object-key AND array-iteration
+  # orders (`walk_props` iterates a serde_json::Map). The committed
+  # copy is the local one; this check cares about content. `jq -S` +
+  # `walk(sort)` canonicalises both sides — same approach as
+  # tfvars-fresh, deepened for nested arrays.
+  docs-data-fresh = mkDriftCheck {
+    name = "docs-data-fresh";
+    nativeBuildInputs = [ pkgs.jq ];
+    generate = ''
+      # Recursive canonical sort: keys sorted (via -S after), arrays
+      # sorted by canonical-JSON of each element. `walk` is bottom-up
+      # so by the time it sorts an array, child objects already had
+      # their keys ordered — `tojson` is stable.
+      canon='walk(
+        if type=="object" then to_entries|sort_by(.key)|from_entries
+        elif type=="array" then sort_by(tojson)
+        else . end)'
+      mkdir -p $TMPDIR/gen $TMPDIR/committed
+      for f in ${docsLib.docsData}/*.json; do
+        jq -S "$canon" "$f" > $TMPDIR/gen/"$(basename "$f")"
+      done
+      for f in ${../docs/gen}/*.json; do
+        jq -S "$canon" "$f" > $TMPDIR/committed/"$(basename "$f")"
+      done
+    '';
+    committed = "$TMPDIR/committed";
+    what = "docs/gen/*.json drifted from xtask regen docs-data output";
+    regenHint = "nix develop -c cargo xtask regen docs-data";
+  };
+
+  # Prose references that bypass lib/refs.typ validators. Grep-based —
+  # typst itself can't see raw backticks. Each pattern catches a class
+  # that has produced ≥1 bughunter finding (Nth-strike close for
+  # merged_001/028/032 et al.).
+  docs-lint =
+    pkgs.runCommand "rio-docs-lint"
+      {
+        nativeBuildInputs = [ pkgs.jq ];
+        src = pkgs.lib.fileset.toSource {
+          root = ../docs;
+          fileset = pkgs.lib.fileset.fileFilter (f: f.hasExt "typ") ../docs;
+        };
+        metricsJson = ../docs/gen/metrics.json;
+      }
+      ''
+        set -euo pipefail
+        fail=0
+        # Internal .md link — must be #cross-link("/abs.typ") or plain text.
+        # Match every .md target, then exclude only URLs (`://`). Covers both
+        # `#link("x.md")` and `#link("x.md", body)` two-arg forms.
+        if grep -rn --include='*.typ' -E '#link\("[^"]*\.md"' $src \
+             | grep -v '://'; then
+          echo "FAIL: internal #link to .md — use #cross-link or drop link" >&2
+          fail=1
+        fi
+        # Raw backtick metric name — must be #(refs.metric)("…") so the
+        # gen/metrics.json membership assert fires. Component-prefix
+        # pattern (not suffix-based: 28 distinct suffixes, only 6 are
+        # common; prefix catches all). Prefix alternation derived from
+        # metrics.json so a new component auto-extends the lint.
+        # ref/metrics.typ is the generated table and is allowed raw
+        # names (it IS the source).
+        comps=$(jq -r '.names[] | capture("^rio_(?<c>[a-z]+)_").c' $metricsJson \
+          | sort -u | paste -sd'|')
+        if grep -rn --include='*.typ' -E "\`rio_($comps)_[a-z_]+" $src \
+             | grep -v 'ref/metrics\.typ\|lib/refs\.typ'; then
+          echo "FAIL: raw metric name — use #(refs.metric)(\"…\")" >&2
+          fail=1
+        fi
+        [[ $fail -eq 0 ]]
+        touch $out
+      '';
+
+  # REVIEW.md §-ref liveness — rust comments cite review-rule sections
+  # by name; assert the section exists. Prefix match, hyphen↔space
+  # folded (comments abbreviate `## Stability tests perturb…` to
+  # `§Stability-tests`). Also catches "REVIEW.md deleted again": grep
+  # on missing file → fail.
+  review-ref =
+    pkgs.runCommand "rio-review-ref"
+      {
+        rs = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../.)
+            ../docs/REVIEW.md
+          ];
+        };
+      }
+      ''
+        set -euo pipefail
+        hdrs=$(grep -E '^## ' $rs/docs/REVIEW.md | sed 's/^## //; s/ /-/g' | tr 'A-Z' 'a-z')
+        fail=0
+        while IFS= read -r line; do
+          ref=$(echo "$line" | grep -oE 'REVIEW\.md §[A-Za-z-]+' | sed 's/.*§//' | tr 'A-Z' 'a-z')
+          if ! echo "$hdrs" | grep -q "^$ref"; then
+            echo "FAIL: dangling REVIEW.md ref: $line" >&2
+            fail=1
+          fi
+        done < <(grep -rn --include='*.rs' 'REVIEW\.md §' $rs)
+        [[ $fail -eq 0 ]]
+        touch $out
+      '';
 }
 // {
   # Seed↔ECR-push layer-digest parity. The seed warms

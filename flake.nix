@@ -707,6 +707,7 @@
               subcharts
               dockerImages
               nodeAmi
+              docsLib
               ;
           };
 

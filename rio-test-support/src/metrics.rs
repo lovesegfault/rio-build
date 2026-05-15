@@ -253,7 +253,7 @@ impl Recorder for CountingRecorder {
 /// convention — no one imports the macros unqualified) and avoids
 /// false-matching `describe_counter!("…")`. `\s*` handles rustfmt's
 /// multi-line break after the paren.
-// r[impl ts.metrics.grep]
+// r[impl ts.metrics.grep+2]
 pub fn grep_emitted_names(manifest_dir: &str) -> Vec<String> {
     let re = regex::Regex::new(r#"\bmetrics::(?:counter|gauge|histogram)!\s*\(\s*"([a-z0-9_]+)""#)
         .unwrap();

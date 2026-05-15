@@ -368,6 +368,11 @@ fn describe_type(schema: &serde_json::Value, ref_name: Option<&str>) -> String {
 
 /// Compact JSON for the Default column. Empty string / null → blank
 /// (rendered as `(required)` or `(unset)` in typst per the prose).
+/// Object defaults are key-sorted via BTreeMap so the rendered string
+/// is deterministic regardless of serde_json's `preserve_order`
+/// feature (workspace-unified differently between cargo and crate2nix
+/// — the docs-data-fresh check would otherwise see drift on a
+/// HashMap-backed default like `{"fetcher-*":600,"*":60}`).
 fn render_default(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::Null => String::new(),
@@ -375,6 +380,10 @@ fn render_default(v: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Array(a) if a.is_empty() => "[]".into(),
         serde_json::Value::Object(o) if o.values().all(is_emptyish) => String::new(),
+        serde_json::Value::Object(o) => {
+            let sorted: BTreeMap<_, _> = o.iter().collect();
+            serde_json::to_string(&sorted).unwrap()
+        }
         other => other.to_string(),
     }
 }
@@ -382,6 +391,24 @@ fn render_default(v: &serde_json::Value) -> String {
 fn is_emptyish(v: &serde_json::Value) -> bool {
     matches!(v, serde_json::Value::Null)
         || matches!(v, serde_json::Value::String(s) if s.is_empty())
+}
+
+/// Doc comments are paragraphs of design rationale; the reference
+/// table wants the one-line summary. Take the first sentence (up to
+/// the first `. ` followed by an uppercase letter, or the whole
+/// string if no sentence break). Intra-doc links `[foo]` are kept
+/// as-is — typst renders square brackets literally.
+fn first_sentence(desc: &str) -> String {
+    let collapsed = desc.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Find ". " followed by uppercase (real sentence boundary, not
+    // "e.g. foo" or "1.5").
+    let bytes = collapsed.as_bytes();
+    for i in 0..bytes.len().saturating_sub(2) {
+        if bytes[i] == b'.' && bytes[i + 1] == b' ' && bytes[i + 2].is_ascii_uppercase() {
+            return collapsed[..=i].to_string();
+        }
+    }
+    collapsed
 }
 
 #[cfg(test)]
@@ -412,22 +439,4 @@ mod tests {
             ]
         );
     }
-}
-
-/// Doc comments are paragraphs of design rationale; the reference
-/// table wants the one-line summary. Take the first sentence (up to
-/// the first `. ` followed by an uppercase letter, or the whole
-/// string if no sentence break). Intra-doc links `[foo]` are kept
-/// as-is — typst renders square brackets literally.
-fn first_sentence(desc: &str) -> String {
-    let collapsed = desc.split_whitespace().collect::<Vec<_>>().join(" ");
-    // Find ". " followed by uppercase (real sentence boundary, not
-    // "e.g. foo" or "1.5").
-    let bytes = collapsed.as_bytes();
-    for i in 0..bytes.len().saturating_sub(2) {
-        if bytes[i] == b'.' && bytes[i + 1] == b' ' && bytes[i + 2].is_ascii_uppercase() {
-            return collapsed[..=i].to_string();
-        }
-    }
-    collapsed
 }
