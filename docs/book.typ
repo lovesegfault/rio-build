@@ -17,6 +17,15 @@
     = Architecture
     #chapter("architecture.typ")[System Architecture]
     = Spec
+    == System
+    #chapter("spec/system/observability.typ")[Observability]
+    #chapter("spec/system/security.typ")[Security & Threat Model]
+    #chapter("spec/system/tenancy.typ")[Multi-Tenancy]
+    #chapter("spec/system/failure-modes.typ")[Failure Modes]
+    #chapter("spec/system/verification.typ")[Verification]
+    #chapter("spec/system/deployment.typ")[Deployment]
+    #chapter("spec/system/crate-structure.typ")[Crate Structure]
+    == Components
     #chapter("spec/components/sla-sizing.typ")[SLA-Driven Sizing]
     #chapter("spec/system/_spike.typ")[(spike)]
     = Reference
