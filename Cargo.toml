@@ -168,8 +168,10 @@ zstd = "0.13"
 # /healthz router (rio-common, rio-builder) + dev-dep fake upstream (rio-store).
 axum = "0.8"
 # narinfo signing (rio-nix/rio-store) + JWT key material (rio-auth, gateway).
-# pkcs8 for key encode/decode; rand_core for keygen in tests.
-ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
+# pkcs8 for key encode/decode. No `rand_core` feature: keys are always
+# built from seed bytes (`from_bytes`/`from_seed`), never `::generate`
+# — see rio-auth/src/jwt.rs for the rand_core 0.6/0.9 skew rationale.
+ed25519-dalek = { version = "2", features = ["pkcs8"] }
 
 # --- phase5: JWT tenant tokens (rio-auth) ---
 # EdDSA (ed25519) signing — scheduler/store/controller verify the gateway's

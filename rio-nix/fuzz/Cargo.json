@@ -1713,10 +1713,6 @@
           "packageId": "ed25519"
         },
         {
-          "name": "rand_core",
-          "packageId": "rand_core 0.6.4"
-        },
-        {
           "name": "sha2",
           "packageId": "sha2 0.10.9"
         },
@@ -1734,7 +1730,6 @@
         "default",
         "fast",
         "pkcs8",
-        "rand_core",
         "std",
         "zeroize"
       ],
@@ -11872,10 +11867,6 @@
           "packageId": "rand_chacha 0.9.0"
         },
         {
-          "name": "rand_core",
-          "packageId": "rand_core 0.6.4"
-        },
-        {
           "name": "regex",
           "packageId": "regex"
         },
@@ -12217,10 +12208,6 @@
           "name": "rand",
           "packageId": "rand 0.8.5",
           "rename": "rand_c38e5c1d305a1b54"
-        },
-        {
-          "name": "rand_core",
-          "packageId": "rand_core 0.6.4"
         },
         {
           "name": "regex",
