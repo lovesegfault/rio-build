@@ -1,6 +1,14 @@
 // Single-file PDF aggregate. The shiroa manifest (book.typ) drives the
 // HTML site; this file is the `typst compile` entrypoint for the PDF
 // check / artifact and stitches chapters via `#include`.
+//
+// `book-pdf-mode()` sets state so each chapter's `rio()` suppresses its
+// per-chapter title-block and bibliography — the aggregate emits one
+// `#bibliography()` at the end. This makes bare `typst compile --root
+// docs docs/book-pdf.typ` work without `--input x-target=book-pdf`
+// (which the nix derivation still passes; both gates are equivalent).
+#import "/lib/rio.typ": book-pdf-mode
+#book-pdf-mode()
 #set document(title: "rio-build design book")
 #include "intro.typ"
 #pagebreak(weak: true)

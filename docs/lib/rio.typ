@@ -109,6 +109,13 @@
 
 // ─── tracey markers ─────────────────────────────────────────────────
 #let _domains = state("rio-domains", none)
+// True when compiling the stitched book-pdf.typ aggregate. Set by
+// `#book-pdf-mode()` at the top of book-pdf.typ so bare
+// `typst compile docs/book-pdf.typ` works without `--input x-target=`.
+// `--input x-target=book-pdf` (used by nix/docs.nix) still wins via
+// the `target` check in rio() — the state is the fallback for direct CLI.
+#let _book-mode = state("rio-book-mode", false)
+#let book-pdf-mode() = _book-mode.update(true)
 
 #let r(id, ..body) = context {
   let ds = _domains.get()
@@ -244,7 +251,12 @@
 
   // standalone-paper front matter — only for direct `typst compile`,
   // not when stitched into book-pdf or rendered by shiroa.
-  let front = if paper != none and target == "pdf" [
+  // `context` so `_book-mode.get()` resolves; the CLI `--input x-target`
+  // and the in-doc `#book-pdf-mode()` are equivalent gates.
+  let in-book = target == "book-pdf"
+  let front = context if (
+    paper != none and not in-book and not _book-mode.get()
+  ) [
     #align(center)[
       #text(
         size: 11pt,
@@ -280,9 +292,10 @@
   // stitched aggregate supplies one bibliography at the end; typst
   // forbids more than one per document). shiroa compiles each chapter
   // standalone, so omitting it there leaves @cite labels unresolved.
-  if (
+  context if (
     paper != none
-      and target != "book-pdf"
+      and not in-book
+      and not _book-mode.get()
       and paper.at("bib", default: none) != none
   ) {
     if is-paged { pagebreak(weak: true) }
