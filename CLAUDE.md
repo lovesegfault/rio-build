@@ -139,12 +139,14 @@ When adding a new parser, also add a fuzz target:
 
 ## Design Book
 
-This project has a comprehensive design book in `docs/src/`. When implementing a feature, cross-reference ALL relevant design docs:
+This project has a comprehensive design book in `docs/` (typst sources). When implementing a feature, cross-reference ALL relevant design docs:
 
-- **Component specs** (`docs/src/components/`): Protocol details, API contracts
-- **Observability spec** (`docs/src/observability.md`): Metric names, log format, tracing structure
-- **Crate structure** (`docs/src/crate-structure.md`): Expected modules and file layout
-- **Architecture** (`docs/src/architecture.md`): System-level design
+- **Component specs** (`docs/spec/components/`): Protocol details, API contracts
+- **Observability spec** (`docs/spec/system/observability.typ`): Metric names, log format, tracing structure
+- **Crate structure** (`docs/spec/system/crate-structure.typ`): Expected modules and file layout
+- **Architecture** (`docs/architecture.typ`): System-level design
+
+Render with `nix build .#packages.x86_64-linux.docs` (shiroa HTML, `result/index.html`) or `.#packages.x86_64-linux.docs-pdf` (stitched PDF). The dev shell has `typst` and `shiroa` available for `typst watch docs/book-pdf.typ` / `shiroa serve docs/`.
 
 ### Keeping docs and code in sync
 
@@ -152,7 +154,7 @@ When implementation reveals that a design doc is wrong (e.g., the spec says u32 
 
 ### Spec traceability (tracey)
 
-Normative requirements in `docs/src/` are marked with `r[domain.area.detail]` standalone paragraphs. Code that implements a requirement carries `// r[impl domain.area.detail]`; tests carry `// r[verify …]`. The CI check `tracey-validate` fails on broken references.
+Normative requirements in `docs/spec/` are marked with `#r("domain.area.detail")[body]` function calls (the `#r` helper is exported from `/lib/rio.typ` and asserts the ID matches the file's declared `domains:`). Code that implements a requirement carries `// r[impl domain.area.detail]`; tests carry `// r[verify …]`. The CI check `tracey-validate` fails on broken references.
 
 | Command | Use |
 |---|---|
@@ -163,7 +165,7 @@ Normative requirements in `docs/src/` are marked with `r[domain.area.detail]` st
 | `tracey query status` | Overall coverage summary |
 | `tracey bump` | Bump version of staged requirements whose text changed (marks existing annotations stale) |
 
-**When adding spec text that describes a new behavior or constraint:** add an `r[...]` marker (standalone paragraph, blank line before, col 0), then annotate the implementing code with `// r[impl ...]` and the test with `// r[verify ...]`. The marker-first discipline means `tracey query uncovered` surfaces unimplemented spec requirements immediately.
+**When adding spec text that describes a new behavior or constraint:** add an `#r("...")[body]` call (the `body` is the normative MUST sentence; rationale prose goes *after* the block, not inside it), then annotate the implementing code with `// r[impl ...]` and the test with `// r[verify ...]`. The marker-first discipline means `tracey query uncovered` surfaces unimplemented spec requirements immediately.
 
 **VM-test `r[verify]` placement:** for NixOS VM tests under `nix/tests/`, place `# r[verify ...]` markers in `default.nix` at the `subtests = [...]` entry that wires the fragment — NOT in the scenario file's col-0 header block. A marker in a scenario header tells tracey the rule is tested; it does not tell tracey the fragment runs. A marker at the subtests entry structurally couples the two: no wiring → no marker → tracey catches it.
 
@@ -180,7 +182,7 @@ subtests = [
 
 Scenario-file header blocks MAY keep prose descriptions of what each marker covers (useful for humans); they MUST NOT carry the marker token itself. `config.styx`'s `test_include` is narrowed to `nix/tests/default.nix` only, so a stray marker in a scenario file is invisible to tracey — the rule stays listed as untested until properly wired.
 
-**When spec text changes meaningfully:** run `tracey bump` before committing. This version-bumps the marker (e.g., `r[gw.opcode.foo]` → `r[gw.opcode.foo+2]`), making existing `r[impl gw.opcode.foo]` annotations stale until someone reviews and bumps them.
+**When spec text changes meaningfully:** run `tracey bump` before committing. This version-bumps the marker (e.g., `#r("gw.opcode.foo")` → `#r("gw.opcode.foo+2")`), making existing `r[impl gw.opcode.foo]` annotations stale until someone reviews and bumps them. `tracey bump` works on `.typ` sources.
 
 ### Deferred work
 
