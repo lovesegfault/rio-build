@@ -67,7 +67,11 @@ fn visit_rs(dir: &Path, f: &mut impl FnMut(&str)) -> Result<()> {
 }
 
 fn alerts() -> Result<serde_json::Value> {
-    Ok(json!({"names": []})) // C3 fills
+    let body =
+        fs::read_to_string(repo_root().join("infra/helm/rio-build/templates/prometheusrule.yaml"))?;
+    let re = Regex::new(r"(?m)^\s*-\s*alert:\s*(\w+)")?;
+    let names: BTreeSet<_> = re.captures_iter(&body).map(|c| c[1].to_string()).collect();
+    Ok(json!({"names": names.into_iter().collect::<Vec<_>>()}))
 }
 
 fn errors() -> Result<serde_json::Value> {

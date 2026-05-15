@@ -1,3 +1,19 @@
 {
-  "names": []
+  "names": [
+    "KubeBuildSchedulerDown",
+    "KubeBuildSchedulerPendingStuck",
+    "RioControllerRestarts",
+    "RioDispatchStarved",
+    "RioNodeclaimPoolAllCellsIceMasked",
+    "RioNodeclaimPoolBootTimeoutLoop",
+    "RioNodeclaimPoolIceMaskedHigh",
+    "RioNodeclaimPoolNoHostingClass",
+    "RioNodeclaimPoolStuckPending",
+    "RioNodeclaimPoolStuckTerminating",
+    "RioSchedulerActorSlow",
+    "RioSlaHwCostStale",
+    "RioSlaPredictionDrift",
+    "RioSlaPriorDivergenceClamped",
+    "RioStorePutPathRetries"
+  ]
 }
