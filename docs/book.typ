@@ -14,9 +14,14 @@
     #chapter("guide/setup.typ")[Setup]
     #chapter("guide/ci.typ")[CI Integration]
     #chapter("guide/programmatic.typ")[Programmatic Access]
+    = Architecture
+    #chapter("architecture.typ")[System Architecture]
     = Spec
     #chapter("spec/components/sla-sizing.typ")[SLA-Driven Sizing]
     #chapter("spec/system/_spike.typ")[(spike)]
+    = Reference
+    #chapter("ref/configuration.typ")[Configuration]
+    #chapter("ref/errors.typ")[Error Taxonomy]
     = Ops
     #chapter("ops/capacity-planning.typ")[Capacity Planning]
     #chapter("ops/gc-enablement.typ")[GC Enablement]

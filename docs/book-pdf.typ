@@ -4,8 +4,14 @@
 #set document(title: "rio-build design book")
 #include "intro.typ"
 #pagebreak(weak: true)
+#include "architecture.typ"
+#pagebreak(weak: true)
 #include "spec/system/_spike.typ"
 #pagebreak(weak: true)
 #include "spec/components/sla-sizing.typ"
+#pagebreak(weak: true)
+#include "ref/configuration.typ"
+#pagebreak(weak: true)
+#include "ref/errors.typ"
 #pagebreak(weak: true)
 #bibliography("/lib/bib.yml")
