@@ -182,6 +182,59 @@ message ChunkRef {
   uint32 size = 2;
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// NAR index (ADR-022)
+// ───────────────────────────────────────────────────────────────────────────
+
+enum NarEntryKind {
+  NAR_ENTRY_KIND_UNSPECIFIED = 0;
+  NAR_ENTRY_KIND_REGULAR = 1;
+  NAR_ENTRY_KIND_DIRECTORY = 2;
+  NAR_ENTRY_KIND_SYMLINK = 3;
+}
+
+// One file/dir/symlink within a store path's NAR. Computed at PutPath
+// time (`r[store.index.putpath-eager]`) by `nar_ls`; persisted to the
+// `nar_index` table (`r[store.index.table-cascade]`); exposed via
+// GetNarIndex/GetNarIndexBatch (`r[store.index.rpc]`).
+message NarIndexEntry {
+  // Path within the NAR, '/'-joined NAR component names. `bytes`, not
+  // `string`: NAR names are arbitrary non-NUL/non-slash byte sequences;
+  // non-UTF8 is legal.
+  bytes path = 1;
+  NarEntryKind kind = 2;
+  uint64 size = 3;           // regular files only; 0 for dirs/symlinks
+  bool executable = 4;       // regular files only
+  // Byte offset of file content within the canonical NAR encoding,
+  // after the `"contents"` length-prefix. Lets a holder of the NAR
+  // chunk cumsum slice one file's bytes without re-parsing. Regular
+  // files only (`r[store.index.nar-ls-offset]`).
+  uint64 nar_offset = 5;
+  bytes target = 6;          // symlinks only; same byte-not-string rule as `path`
+  // blake3(file content), 32 bytes. Empty for dirs/symlinks.
+  // (`r[store.index.file-digest]`)
+  bytes file_digest = 7;
+}
+
+message NarIndex {
+  repeated NarIndexEntry entries = 1;
+}
+
+message GetNarIndexRequest {
+  bytes nar_hash = 1;        // 32-byte SHA-256
+}
+
+message GetNarIndexBatchRequest {
+  repeated bytes nar_hashes = 1;
+}
+
+// One per requested nar_hash, request order preserved. `index` absent
+// = path is not in the store or has no complete manifest.
+message NarIndexResponse {
+  bytes nar_hash = 1;
+  optional NarIndex index = 2;
+}
+
 // Pre-fetched (PathInfo, manifest) sufficient for GetPath to skip PG
 // entirely. `chunks` empty + `inline_blob` set = inline NAR; `chunks`
 // non-empty = chunked (inline_blob ignored). Exactly one of the two is

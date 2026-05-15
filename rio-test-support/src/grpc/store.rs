@@ -1047,4 +1047,23 @@ impl StoreService for MockStore {
         // MockStore. Accept and discard.
         Ok(Response::new(()))
     }
+
+    // TODO(P0552): no consumers yet — castore-FUSE `tree::build_tree`
+    // (P0559) prefetches via GetDirectory, not GetNarIndex.
+    async fn get_nar_index(
+        &self,
+        _request: Request<types::GetNarIndexRequest>,
+    ) -> Result<Response<types::NarIndex>, Status> {
+        Err(Status::unimplemented("MockStore: GetNarIndex (P0552)"))
+    }
+
+    type GetNarIndexBatchStream =
+        tokio_stream::wrappers::ReceiverStream<Result<types::NarIndexResponse, Status>>;
+
+    async fn get_nar_index_batch(
+        &self,
+        _request: Request<types::GetNarIndexBatchRequest>,
+    ) -> Result<Response<Self::GetNarIndexBatchStream>, Status> {
+        Err(Status::unimplemented("MockStore: GetNarIndexBatch (P0552)"))
+    }
 }

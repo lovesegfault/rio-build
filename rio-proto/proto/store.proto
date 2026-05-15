@@ -117,6 +117,18 @@ service StoreService {
   // side — a failed append degrades
   // normalization (hw_class stays factor=1.0), not the build itself.
   rpc AppendHwPerfSample(rio.types.AppendHwPerfSampleRequest) returns (google.protobuf.Empty);
+
+  // ADR-022: per-file NAR index for one store path. The index is
+  // derived, non-authoritative state (`r[store.index.non-authoritative]`):
+  // a missing row triggers a synchronous recompute from the stored NAR
+  // (`r[store.index.sync-on-miss]`). NOT_FOUND only if the path itself
+  // has no complete manifest.
+  rpc GetNarIndex(rio.types.GetNarIndexRequest) returns (rio.types.NarIndex);
+
+  // Batch variant. Build-start fetches O(closure) indices; per-path
+  // RTT × ~357 paths is the I-110 PG-wall pattern again. One streamed
+  // call, request order preserved.
+  rpc GetNarIndexBatch(rio.types.GetNarIndexBatchRequest) returns (stream rio.types.NarIndexResponse);
 }
 
 // Chunk-level storage service for content-defined chunking.

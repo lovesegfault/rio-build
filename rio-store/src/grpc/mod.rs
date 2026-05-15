@@ -817,6 +817,28 @@ impl StoreService for StoreServiceImpl {
         .status_internal("AppendHwPerfSample: insert")?;
         Ok(Response::new(()))
     }
+
+    // TODO(P0552): GetNarIndex / GetNarIndexBatch — proto landed at
+    // P0545; the handler (PG `nar_index` table + sync-on-miss recompute
+    // + indexer_loop) is P0551/P0552.
+    #[instrument(skip(self, _request), fields(rpc = "GetNarIndex"))]
+    async fn get_nar_index(
+        &self,
+        _request: Request<rio_proto::types::GetNarIndexRequest>,
+    ) -> Result<Response<rio_proto::types::NarIndex>, Status> {
+        Err(Status::unimplemented("GetNarIndex (P0552)"))
+    }
+
+    type GetNarIndexBatchStream =
+        tokio_stream::wrappers::ReceiverStream<Result<rio_proto::types::NarIndexResponse, Status>>;
+
+    #[instrument(skip(self, _request), fields(rpc = "GetNarIndexBatch"))]
+    async fn get_nar_index_batch(
+        &self,
+        _request: Request<rio_proto::types::GetNarIndexBatchRequest>,
+    ) -> Result<Response<Self::GetNarIndexBatchStream>, Status> {
+        Err(Status::unimplemented("GetNarIndexBatch (P0552)"))
+    }
 }
 
 #[cfg(test)]
