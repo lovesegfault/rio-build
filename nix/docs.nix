@@ -109,6 +109,10 @@ let
         # gitignored local-build artifacts that may exist on disk
         (lib.fileset.maybeMissing ../docs/dist)
         (lib.fileset.maybeMissing ../docs/.cache)
+        # Contributor bug-pattern catalog cited from rust comments by
+        # literal path; not book content. Excluded so editing it doesn't
+        # rebuild docs-pdf/shiroa.
+        (lib.fileset.maybeMissing ../docs/REVIEW.md)
       ]
     );
   };
