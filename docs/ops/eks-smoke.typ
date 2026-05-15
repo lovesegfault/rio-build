@@ -1,0 +1,190 @@
+#import "/lib/rio.typ": *
+
+#show: rio.with(domains: none)
+
+= EKS Smoke Test Runbook
+
+Manual walkthrough of `cargo xtask k8s qa --health -p eks`. Use this when the
+automated run fails or for first-time setup validation.
+
+= Prerequisites
+
+- `terraform apply` complete (see `infra/eks/README.md`)
+- `kubectl` configured: `$(cd infra/eks && terraform output -raw kubeconfig_command)`
+- `STORE_IAM_ROLE_ARN` exported: `export STORE_IAM_ROLE_ARN=$(cd infra/eks && terraform output -raw store_iam_role_arn)`
+- SSH keypair for gateway: `ssh-keygen -t ed25519 -f ~/.ssh/rio_test_ed25519 -N ''`
+
+= Step 1: Deploy
+
+```bash
+cargo xtask k8s -p eks up --deploy    # helm upgrade --install from working tree
+```
+
+Wait for control-plane readiness:
+
+```bash
+kubectl -n rio-system wait --for=condition=Ready pod \
+  -l 'app.kubernetes.io/part-of=rio-build,app.kubernetes.io/component!=worker' \
+  --timeout=300s
+```
+
+*Troubleshooting if pods stuck Pending:*
+- `kubectl describe pod <name>` — check Events for scheduling issues
+- Common: no nodes matching `system` nodegroup (terraform nodegroup
+  didn't create, or AZ mismatch)
+- Fix: `kubectl get nodes --show-labels | grep system`
+
+*Troubleshooting if pods CrashLoopBackOff:*
+- `kubectl logs <pod> -p` — previous container's logs
+- Common: PG connection refused (RDS not ready or Secret wrong)
+- Fix: verify `rio-postgres` Secret: `kubectl -n rio-system get secret rio-postgres -o jsonpath='{.data.url}' | base64 -d`
+
+= Step 2: Gateway SSH Setup
+
+```bash
+kubectl -n rio-system create secret generic rio-gateway-ssh \
+  --from-file=authorized_keys=~/.ssh/rio_test_ed25519.pub \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl -n rio-system rollout restart deployment/rio-gateway
+kubectl -n rio-system rollout status deployment/rio-gateway --timeout=120s
+```
+
+= Step 3: Get Gateway Address
+
+```bash
+# Poll until NLB provisions (takes 2-3 min)
+while true; do
+  GATEWAY_HOST=$(kubectl -n rio-system get svc rio-gateway \
+    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+  [[ -n "$GATEWAY_HOST" ]] && break
+  echo "waiting for LoadBalancer..."
+  sleep 5
+done
+echo "Gateway: $GATEWAY_HOST"
+```
+
+*Troubleshooting if NLB never provisions:*
+- AWS Load Balancer Controller not installed: `kubectl get pods -n kube-system | grep aws-load-balancer`
+- Check Events: `kubectl -n rio-system describe svc rio-gateway`
+- Common: missing IAM permissions for the controller's SA
+
+*NLB target health is N/M, not M/M — this is correct.* `externalTrafficPolicy: Local` means only the N nodes hosting a rio-gateway pod pass the `healthCheckNodePort` probe; the rest are intentionally unhealthy. The dualstack NLB forwards to an IPv6-only target group; xtask sets `preserve_client_ip.enabled=false` and `enable-prefix-for-ipv6-source-nat=on` so IPv4 clients on the dualstack listener can reach IPv6 targets. Nodes set their own primary IPv6 at boot (`primary-ipv6-init.service` in the NixOS AMI).
+
+= Step 4: Create Pool
+
+```bash
+cat <<EOF | kubectl apply -f -
+apiVersion: rio.build/v1alpha1
+kind: Pool
+metadata:
+  name: smoke-test
+  namespace: rio-builders   # NOT rio-system: builder pods need CAP_SYS_ADMIN; rio-system is PSA-restricted
+spec:
+  kind: Builder
+  image: rio-builder:latest
+  systems: [x86_64-linux]
+  features: []
+  maxConcurrent: 4
+  nodeSelector:
+    rio.build/node-role: builder
+  tolerations:
+    - key: rio.build/builder
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+EOF
+
+# Builder Jobs spawn on demand once a build is queued — no standing pods to wait for.
+# Per-pod cpu/mem/disk come from the scheduler's per-drv SpawnIntent (ADR-023),
+# NOT from Pool.spec — there is no resources field.
+rio-cli pool describe smoke-test -n rio-builders    # or: kubectl -n rio-builders get pool smoke-test -o yaml
+```
+
+*Troubleshooting if workers stuck ContainerCreating:*
+- Check `/dev/fuse` on worker node: `kubectl debug node/<worker-node> -it --image=busybox -- ls -la /dev/fuse`
+- If missing: worker AMI doesn't have FUSE support (use Amazon
+  Linux 2023 with fuse3 installed, or a custom AMI)
+
+= Step 5: Build Test
+
+```bash
+nix build nixpkgs#hello \
+  --store "ssh-ng://rio@${GATEWAY_HOST}?ssh-key=~/.ssh/rio_test_ed25519" \
+  --no-link
+```
+
+*Expected:* completes in \<1 minute (hello is small). Worker pod
+logs show `build succeeded, uploading outputs`.
+
+= Step 6: Resilience Test (Kill Worker)
+
+```bash
+# Baseline metric (G6 lesson: capture BEFORE action)
+DISCONNECTS_BEFORE=$(kubectl -n rio-system exec deploy/rio-scheduler -- \
+  curl -s localhost:9091/metrics | \
+  grep '^rio_scheduler_worker_disconnects_total' | awk '{print $NF}')
+echo "Baseline disconnects: $DISCONNECTS_BEFORE"
+
+# Start a longer build in background
+nix build nixpkgs#git \
+  --store "ssh-ng://rio@${GATEWAY_HOST}?ssh-key=~/.ssh/rio_test_ed25519" \
+  --no-link &
+BUILD_PID=$!
+
+# Wait for dispatch, then kill a worker
+sleep 10
+kubectl -n rio-builders delete pod \
+  -l rio.build/pool=smoke-test --wait=false \
+  --field-selector=status.phase=Running | head -1
+
+# Wait for build completion
+wait $BUILD_PID && echo "Build completed despite worker kill ✓"
+
+# Verify metric
+DISCONNECTS_AFTER=$(kubectl -n rio-system exec deploy/rio-scheduler -- \
+  curl -s localhost:9091/metrics | \
+  grep '^rio_scheduler_worker_disconnects_total' | awk '{print $NF}')
+echo "After disconnects: $DISCONNECTS_AFTER"
+[[ $DISCONNECTS_AFTER -gt $DISCONNECTS_BEFORE ]] && echo "Reassign confirmed ✓"
+```
+
+= Step 7: GC Test (optional)
+
+```bash
+# Trigger GC via rio-cli over a port-forward (dry run first)
+cargo xtask k8s cli -p eks -- trigger-gc --dry-run --grace-period-hours 2
+```
+
+= Cleanup
+
+```bash
+kubectl -n rio-builders delete pool smoke-test
+helm uninstall rio -n rio-system    # or: cargo xtask k8s destroy -p eks for full teardown
+```
+
+= Troubleshooting Matrix
+
+#table(
+  columns: 3,
+  table.header([Symptom], [Check], [Fix]),
+  [Scheduler pod NOT_SERVING],
+  [`kubectl logs` for "lease"],
+  [Standby replica — normal. Check both pods.],
+
+  [Worker `unable to mount overlay`],
+  [`kubectl describe pod` Events],
+  [privileged: true or SYS_ADMIN cap],
+
+  [Build hangs at "waiting for build"],
+  [Scheduler metrics `rio_scheduler_workers_active`],
+  [0 → no worker registered. Check worker logs.],
+
+  [`nix copy` permission denied],
+  [`authorized_keys` secret],
+  [Secret mounted? Gateway restarted after creating secret?],
+
+  [Store PutPath PERMISSION_DENIED],
+  [`rio_store_hmac_rejected_total{reason}`],
+  [HMAC key mismatch (assignment: scheduler↔store; service: gateway↔store)],
+)
