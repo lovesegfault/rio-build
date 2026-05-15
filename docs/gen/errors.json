@@ -1,3 +1,1096 @@
 {
-  "variants": []
+  "variants": [
+    {
+      "crate": "rio-auth",
+      "enum": "HmacError",
+      "msg": "base64 decode failed: {0}",
+      "name": "Base64"
+    },
+    {
+      "crate": "rio-auth",
+      "enum": "HmacError",
+      "msg": "key file is empty",
+      "name": "EmptyKey"
+    },
+    {
+      "crate": "rio-auth",
+      "enum": "HmacError",
+      "msg": "token expired (expiry={expiry_unix}, now={now_unix})",
+      "name": "Expired"
+    },
+    {
+      "crate": "rio-auth",
+      "enum": "HmacError",
+      "msg": "token format invalid: expected 'claims.hmac', got {0} '.'-separated parts",
+      "name": "Format"
+    },
+    {
+      "crate": "rio-auth",
+      "enum": "HmacError",
+      "msg": "HMAC verification failed (tampered or wrong key)",
+      "name": "InvalidSignature"
+    },
+    {
+      "crate": "rio-auth",
+      "enum": "HmacError",
+      "msg": "key file I/O ({path}): {source}",
+      "name": "Io"
+    },
+    {
+      "crate": "rio-auth",
+      "enum": "HmacError",
+      "msg": "JSON decode failed: {0}",
+      "name": "Json"
+    },
+    {
+      "crate": "rio-auth",
+      "enum": "JwtError",
+      "msg": "JWT verify/encode failed: {0}",
+      "name": "Jwt"
+    },
+    {
+      "crate": "rio-auth",
+      "enum": "JwtError",
+      "msg": "ed25519 signing key → PKCS#8 DER encoding failed (corrupt key?): {0}",
+      "name": "KeyEncoding"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "ExecutorError",
+      "msg": "build failed: {0}",
+      "name": "BuildFailed"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "ExecutorError",
+      "msg": "build cancelled before cgroup creation",
+      "name": "Cancelled"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "ExecutorError",
+      "msg": "cgroup resource tracking failed: {0}",
+      "name": "Cgroup"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "ExecutorError",
+      "msg": "cgroup OOM during build; bumping resource floor",
+      "name": "CgroupOom"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "ExecutorError",
+      "msg": "daemon setup failed: {0}",
+      "name": "DaemonSetup"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "ExecutorError",
+      "msg": "daemon spawn failed: {0}",
+      "name": "DaemonSpawn"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "ExecutorError",
+      "msg": "gRPC error: {0}",
+      "name": "Grpc"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "ExecutorError",
+      "msg": "daemon handshake failed: {0}",
+      "name": "Handshake"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "ExecutorError",
+      "msg": "invalid derivation: {0}",
+      "name": "InvalidDerivation"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "ExecutorError",
+      "msg": "input metadata fetch failed for {path}: {source}",
+      "name": "MetadataFetch"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "ExecutorError",
+      "msg": "failed to write nix.conf: {0}",
+      "name": "NixConf"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "ExecutorError",
+      "msg": "overlay setup failed: {0}",
+      "name": "Overlay"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "ExecutorError",
+      "msg": "overlay setup task panicked: {0}",
+      "name": "OverlayTaskPanic"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "ExecutorError",
+      "msg": "synthetic DB generation failed: {0}",
+      "name": "SynthDb"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "ExecutorError",
+      "msg": "upload failed: {0}",
+      "name": "Upload"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "ExecutorError",
+      "msg": "wire protocol error: {0}",
+      "name": "Wire"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "ExecutorError",
+      "msg": "wrong executor kind: derivation is_fod={is_fod} but this executor is {executor_kind:?}",
+      "name": "WrongKind"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "OverlayError",
+      "msg": "failed to create directory {path}: {source}",
+      "name": "DirCreate"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "OverlayError",
+      "msg": "invalid build_id {0:?}: must be non-empty and contain no '/' or NUL",
+      "name": "InvalidBuildId"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "OverlayError",
+      "msg": "mount overlay failed: {source} (mount_data: {mount_data})",
+      "name": "Mount"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "OverlayError",
+      "msg": "overlay upper ({upper}) and FUSE lower ({lower}) are on the same filesystem (st_dev={st_dev}); the kernel will reject this mount. Set --overlay-base-dir to a directory on a different mount (e.g., a local SSD emptyDir volume, not the FUSE mount).",
+      "name": "SameFilesystem"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "OverlayError",
+      "msg": "stat({path}) failed: {source}",
+      "name": "Stat"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "OverlayError",
+      "msg": "umount2 overlay failed: {source}",
+      "name": "Unmount"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "OverlayError",
+      "msg": "overlay upperdir {path} is itself on an overlayfs mount (statfs f_type=OVERLAYFS_SUPER_MAGIC); the kernel refuses to use an overlayfs as upperdir/workdir. Set --overlay-base-dir to a directory on a real filesystem (e.g., a local SSD emptyDir volume), not the merged view of another overlay.",
+      "name": "UpperOnOverlayfs"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "UploadError",
+      "msg": "ref-scan returned unparseable store path {path:?}",
+      "name": "InvalidReference"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "UploadError",
+      "msg": "I/O error: {0}",
+      "name": "Io"
+    },
+    {
+      "crate": "rio-builder",
+      "enum": "UploadError",
+      "msg": "upload failed after {MAX_UPLOAD_RETRIES} retries for {path}: {source}",
+      "name": "UploadExhausted"
+    },
+    {
+      "crate": "rio-common",
+      "enum": "NameError",
+      "msg": "name is empty after trimming",
+      "name": "Empty"
+    },
+    {
+      "crate": "rio-common",
+      "enum": "NameError",
+      "msg": "name contains interior whitespace: {0:?}",
+      "name": "InteriorWhitespace"
+    },
+    {
+      "crate": "rio-controller",
+      "enum": "Error",
+      "msg": "finalizer error: {0}",
+      "name": "Finalizer"
+    },
+    {
+      "crate": "rio-controller",
+      "enum": "Error",
+      "msg": "invalid spec: {0}",
+      "name": "InvalidSpec"
+    },
+    {
+      "crate": "rio-controller",
+      "enum": "Error",
+      "msg": "kubernetes API error: {0}",
+      "name": "Kube"
+    },
+    {
+      "crate": "rio-gateway",
+      "enum": "GatewayError",
+      "msg": "{0}",
+      "name": "ClientReported"
+    },
+    {
+      "crate": "rio-gateway",
+      "enum": "GatewayError",
+      "msg": "derivation '{0}' not found in store",
+      "name": "DerivationNotFound"
+    },
+    {
+      "crate": "rio-gateway",
+      "enum": "GatewayError",
+      "msg": "failed to parse .drv '{path}': {msg}",
+      "name": "DerivationParse"
+    },
+    {
+      "crate": "rio-gateway",
+      "enum": "GatewayError",
+      "msg": "per-session derivation cache full ({count} entries, cap {cap})",
+      "name": "DrvCacheFull"
+    },
+    {
+      "crate": "rio-gateway",
+      "enum": "GatewayError",
+      "msg": "gRPC stream: {0}",
+      "name": "GrpcStream"
+    },
+    {
+      "crate": "rio-gateway",
+      "enum": "GatewayError",
+      "msg": "{context}: {source}",
+      "name": "InvalidPathInfo"
+    },
+    {
+      "crate": "rio-gateway",
+      "enum": "GatewayError",
+      "msg": "invalid reference path '{path}' for {context}: {source}",
+      "name": "InvalidReference"
+    },
+    {
+      "crate": "rio-gateway",
+      "enum": "GatewayError",
+      "msg": "invalid store path '{path}': {source}",
+      "name": "InvalidStorePath"
+    },
+    {
+      "crate": "rio-gateway",
+      "enum": "GatewayError",
+      "msg": "{context}: NAR read: {source}",
+      "name": "NarRead"
+    },
+    {
+      "crate": "rio-gateway",
+      "enum": "GatewayError",
+      "msg": "{context}: nar_size {got} exceeds maximum {max}",
+      "name": "NarTooLarge"
+    },
+    {
+      "crate": "rio-gateway",
+      "enum": "GatewayError",
+      "msg": "scheduler gRPC: {0}",
+      "name": "Scheduler"
+    },
+    {
+      "crate": "rio-gateway",
+      "enum": "GatewayError",
+      "msg": "store gRPC: {0}",
+      "name": "Store"
+    },
+    {
+      "crate": "rio-gateway",
+      "enum": "GatewayError",
+      "msg": "unknown opcode {0}, closing connection to avoid stream desynchronization",
+      "name": "UnknownOpcode"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "DerivationError",
+      "msg": "collection too large: {0} items (max {MAX_ATERM_LIST_ITEMS})",
+      "name": "CollectionTooLarge"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "DerivationError",
+      "msg": "cycle detected in derivation graph at: {0}",
+      "name": "CycleDetected"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "DerivationError",
+      "msg": "empty output name at index {0}",
+      "name": "EmptyOutputName"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "DerivationError",
+      "msg": "expected '{expected}', got '{got}'",
+      "name": "Expected"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "DerivationError",
+      "msg": "expected '\\",
+      "name": "ExpectedStringStart"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "DerivationError",
+      "msg": "input derivation not found: {0}",
+      "name": "InputNotFound"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "DerivationError",
+      "msg": "invalid escape sequence: \\\\{0}",
+      "name": "InvalidEscape"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "DerivationError",
+      "msg": "computed output path is invalid: {0}",
+      "name": "InvalidOutputPath"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "DerivationError",
+      "msg": "derivation content is not valid UTF-8: {0}",
+      "name": "InvalidUtf8"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "DerivationError",
+      "msg": "NAR extraction failed: {0}",
+      "name": "NarExtract"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "DerivationError",
+      "msg": "derivation must have at least one output",
+      "name": "NoOutputs"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "DerivationError",
+      "msg": "derivation graph too deep at '{0}' (max {MAX_HASH_RECURSION_DEPTH} levels)",
+      "name": "RecursionLimitExceeded"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "DerivationError",
+      "msg": "unexpected end of input",
+      "name": "UnexpectedEof"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "DerivedPathError",
+      "msg": "duplicate output name",
+      "name": "DuplicateOutputName"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "DerivedPathError",
+      "msg": "output name must not be empty",
+      "name": "EmptyOutputName"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "DerivedPathError",
+      "msg": "built path base must be a derivation (.drv): {0}",
+      "name": "NotDerivation"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "DerivedPathError",
+      "msg": "too many output names: {0} (max {MAX_OUTPUT_NAMES})",
+      "name": "TooManyOutputs"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "HandshakeError",
+      "msg": "invalid client magic: expected {WORKER_MAGIC_1:#018x}, got {0:#018x}",
+      "name": "InvalidMagic"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "HandshakeError",
+      "msg": "client protocol version {client_major}.{client_minor} is too old; rio-build requires 1.35+",
+      "name": "VersionTooOld"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "HandshakeError",
+      "msg": "wire format error: {0}",
+      "name": "Wire"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "HashError",
+      "msg": "invalid base64 encoding",
+      "name": "InvalidBase64"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "HashError",
+      "msg": "invalid hash format: {0}",
+      "name": "InvalidFormat"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "HashError",
+      "msg": "invalid nixbase32 encoding: {0}",
+      "name": "InvalidNixbase32"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "HashError",
+      "msg": "unknown hash algorithm: {0}",
+      "name": "UnknownAlgorithm"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "HashError",
+      "msg": "wrong digest length for {algo}: expected {expected}, got {got}",
+      "name": "WrongDigestLength"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "NarError",
+      "msg": "content size {0} exceeds maximum {MAX_CONTENT_SIZE}",
+      "name": "ContentTooLarge"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "NarError",
+      "msg": "invalid NAR entry name: {name:?}",
+      "name": "InvalidEntryName"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "NarError",
+      "msg": "invalid NAR magic: expected {NAR_MAGIC:?}, got {0:?}",
+      "name": "InvalidMagic"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "NarError",
+      "msg": "invalid UTF-8 in {context} at byte offset {offset}",
+      "name": "InvalidUtf8"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "NarError",
+      "msg": "I/O error: {0}",
+      "name": "Io"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "NarError",
+      "msg": "name length {0} exceeds maximum {MAX_NAME_LEN}",
+      "name": "NameTooLong"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "NarError",
+      "msg": "directory nesting depth {0} exceeds maximum {MAX_NAR_DEPTH}",
+      "name": "NestingTooDeep"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "NarError",
+      "msg": "non-zero padding byte after {0}-byte field",
+      "name": "NonZeroPadding"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "NarError",
+      "msg": "not a single-file NAR",
+      "name": "NotSingleFile"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "NarError",
+      "msg": "target length {0} exceeds maximum {MAX_TARGET_LEN}",
+      "name": "TargetTooLong"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "NarError",
+      "msg": "directory entry count {0} exceeds maximum {MAX_DIRECTORY_ENTRIES}",
+      "name": "TooManyEntries"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "NarError",
+      "msg": "expected token {expected:?}, got {got:?}",
+      "name": "UnexpectedToken"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "NarError",
+      "msg": "unknown node type: {0:?}",
+      "name": "UnknownNodeType"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "NarError",
+      "msg": "directory entries not in sorted order: {prev:?} >= {cur:?}",
+      "name": "UnsortedEntries"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "NarError",
+      "msg": "file {0:?} has an unsupported type (not regular/symlink/directory)",
+      "name": "UnsupportedFileType"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "NarInfoError",
+      "msg": "duplicate field: {0}",
+      "name": "DuplicateField"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "NarInfoError",
+      "msg": "invalid FileSize value {value:?}: {source}",
+      "name": "InvalidFileSize"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "NarInfoError",
+      "msg": "invalid NarSize value {value:?}: {source}",
+      "name": "InvalidNarSize"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "NarInfoError",
+      "msg": "missing required field: {0}",
+      "name": "MissingField"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "StorePathError",
+      "msg": "name is empty",
+      "name": "EmptyName"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "StorePathError",
+      "msg": "fixed-output path with references requires recursive SHA-256 (got {algo}, recursive={recursive})",
+      "name": "FixedOutputRefsNotAllowed"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "StorePathError",
+      "msg": "invalid nixbase32 character: {0:?}",
+      "name": "InvalidBase32Char"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "StorePathError",
+      "msg": "invalid nixbase32 length: expected {expected}, got {got}",
+      "name": "InvalidBase32Length"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "StorePathError",
+      "msg": "invalid nixbase32 string: non-zero padding bits (non-canonical encoding)",
+      "name": "InvalidBase32Padding"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "StorePathError",
+      "msg": "name contains invalid character: {0:?}",
+      "name": "InvalidNameChar"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "StorePathError",
+      "msg": "path does not start with {STORE_DIR}/",
+      "name": "InvalidPrefix"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "StorePathError",
+      "msg": "missing dash separator after hash",
+      "name": "MissingDash"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "StorePathError",
+      "msg": "name starts with '.'",
+      "name": "NameStartsWithDot"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "StorePathError",
+      "msg": "name too long: {0} chars (max {MAX_NAME_LEN})",
+      "name": "NameTooLong"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "StorePathError",
+      "msg": "text content-address requires sha256, got {got}",
+      "name": "TextHashMustBeSha256"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "StorePathError",
+      "msg": "path is too short to contain a hash",
+      "name": "TooShort"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "WireError",
+      "msg": "collection count {0} exceeds maximum {MAX_COLLECTION_COUNT}",
+      "name": "CollectionTooLarge"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "WireError",
+      "msg": "framed stream frame size {0} exceeds maximum {MAX_FRAME_SIZE}",
+      "name": "FrameTooLarge"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "WireError",
+      "msg": "framed stream total size {0} exceeds maximum {MAX_FRAMED_TOTAL}",
+      "name": "FramedStreamTooLarge"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "WireError",
+      "msg": "invalid hex in narHash field: {0}",
+      "name": "InvalidNarHash"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "WireError",
+      "msg": "invalid UTF-8 in string",
+      "name": "InvalidUtf8"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "WireError",
+      "msg": "I/O error: {0}",
+      "name": "Io"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "WireError",
+      "msg": "non-zero padding byte after {0}-byte string",
+      "name": "NonZeroPadding"
+    },
+    {
+      "crate": "rio-nix",
+      "enum": "WireError",
+      "msg": "string length {0} exceeds maximum {MAX_STRING_LEN}",
+      "name": "StringTooLong"
+    },
+    {
+      "crate": "rio-proto",
+      "enum": "NarCollectError",
+      "msg": "NAR spool write failed: {0}",
+      "name": "Io"
+    },
+    {
+      "crate": "rio-proto",
+      "enum": "NarCollectError",
+      "msg": "NAR exceeds maximum size: {got} > {limit}",
+      "name": "SizeExceeded"
+    },
+    {
+      "crate": "rio-proto",
+      "enum": "NarCollectError",
+      "msg": "gRPC stream error: {0}",
+      "name": "Stream"
+    },
+    {
+      "crate": "rio-proto",
+      "enum": "NarCollectError",
+      "msg": "store returned malformed PathInfo: {0}",
+      "name": "Validation"
+    },
+    {
+      "crate": "rio-proto",
+      "enum": "PathInfoValidationError",
+      "msg": "nar_hash must be 32 bytes (SHA-256), got {0}",
+      "name": "NarHashLen"
+    },
+    {
+      "crate": "rio-proto",
+      "enum": "PathInfoValidationError",
+      "msg": "invalid reference path {path:?}: {source}",
+      "name": "Reference"
+    },
+    {
+      "crate": "rio-proto",
+      "enum": "PathInfoValidationError",
+      "msg": "invalid store_path {path:?}: {source}",
+      "name": "StorePath"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "ActorError",
+      "msg": "backpressure: actor queue is overloaded",
+      "name": "Backpressure"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "ActorError",
+      "msg": "build not found: {0}",
+      "name": "BuildNotFound"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "ActorError",
+      "msg": "channel send error",
+      "name": "ChannelSend"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "ActorError",
+      "msg": "DAG merge failed: {0}",
+      "name": "Dag"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "ActorError",
+      "msg": "database error: {0}",
+      "name": "Database"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "ActorError",
+      "msg": "edge references unpersisted derivation (db_id missing): {drv_path}",
+      "name": "MissingDbId"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "ActorError",
+      "msg": "permission denied: build {build_id} belongs to a different tenant",
+      "name": "PermissionDenied"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "ActorError",
+      "msg": "store service unavailable (cache-check circuit breaker open)",
+      "name": "StoreUnavailable"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "DagError",
+      "msg": "dependency cycle detected",
+      "name": "CycleDetected"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "DagError",
+      "msg": "invalid drv_path {path:?}: {source}",
+      "name": "InvalidDrvPath"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "ResolveError",
+      "msg": "database error during resolution: {0}",
+      "name": "Db"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "ResolveError",
+      "msg": "input derivation path is not a valid store path: {0}",
+      "name": "InvalidInputDrvPath"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "ResolveError",
+      "msg": "derivation content is not valid UTF-8: {0}",
+      "name": "InvalidUtf8"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "ResolveError",
+      "msg": "drv_content is empty — cannot resolve without ATerm",
+      "name": "NoDrvContent"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "ResolveError",
+      "msg": "failed to parse derivation ATerm: {0}",
+      "name": "Parse"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "ResolveError",
+      "msg": "realisation for {drv_path}!{output_name} not found (modular hash {modular_hex})",
+      "name": "RealisationMissing"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "ResolveError",
+      "msg": "realisations lookup: {0}",
+      "name": "Store"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "TransitionError",
+      "msg": "invalid derivation transition {from} -> {to}: {reason}",
+      "name": "Invalid"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "TransitionError",
+      "msg": "invalid build state transition {from:?} -> {to:?}",
+      "name": "InvalidBuild"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "TransitionError",
+      "msg": "cannot transition from terminal build state {from:?} to {to:?}",
+      "name": "TerminalBuild"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "TransitionError",
+      "msg": "cannot transition from terminal state {from} to {to}",
+      "name": "TerminalToNonTerminal"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "TransitionError",
+      "msg": "unknown build state: {0}",
+      "name": "UnknownBuildState"
+    },
+    {
+      "crate": "rio-scheduler",
+      "enum": "TransitionError",
+      "msg": "unknown derivation status: {0}",
+      "name": "UnknownStatus"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "AdmissionError",
+      "msg": "admission gate closed",
+      "name": "Closed"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "AdmissionError",
+      "msg": "substitute admission saturated; retry (transient)",
+      "name": "Saturated"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "ChunkError",
+      "msg": "chunk {} failed BLAKE3 verification (corrupt; expected {}, got {})",
+      "name": "Corrupt"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "ChunkError",
+      "msg": "chunk {} not found in backend (data loss if manifest claims it exists)",
+      "name": "NotFound"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "ManifestError",
+      "msg": "manifest body length {0} is not a multiple of {ENTRY_SIZE} (truncated or corrupt)",
+      "name": "BadLength"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "ManifestError",
+      "msg": "manifest is empty (no version byte)",
+      "name": "Empty"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "ManifestError",
+      "msg": "manifest has {0} entries, exceeds MAX_CHUNKS {MAX_CHUNKS}",
+      "name": "TooManyChunks"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "ManifestError",
+      "msg": "unknown manifest version {0} (expected {VERSION})",
+      "name": "UnknownVersion"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "MetadataError",
+      "msg": "conflict: {0}",
+      "name": "Conflict"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "MetadataError",
+      "msg": "connection error: {0}",
+      "name": "Connection"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "MetadataError",
+      "msg": "corrupt manifest_data for {store_path}: {source}",
+      "name": "CorruptManifest"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "MetadataError",
+      "msg": "deadlock detected (retry)",
+      "name": "Deadlock"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "MetadataError",
+      "msg": "invariant violation: {0}",
+      "name": "InvariantViolation"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "MetadataError",
+      "msg": "malformed narinfo row: {0}",
+      "name": "MalformedRow"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "MetadataError",
+      "msg": "not found",
+      "name": "NotFound"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "MetadataError",
+      "msg": "database error: {0}",
+      "name": "Other"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "MetadataError",
+      "msg": "placeholder missing for {store_path} (concurrently deleted?)",
+      "name": "PlaceholderMissing"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "MetadataError",
+      "msg": "realisation conflict: ({drv_hash}, {output_name}) already maps to {existing}, attempted {attempted}",
+      "name": "RealisationConflict"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "MetadataError",
+      "msg": "resource exhausted: {0}",
+      "name": "ResourceExhausted"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "MetadataError",
+      "msg": "serialization failure (retry)",
+      "name": "Serialization"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "SignerError",
+      "msg": "base64 decode failed: {0}",
+      "name": "Base64"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "SignerError",
+      "msg": "key name is empty",
+      "name": "EmptyName"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "SignerError",
+      "msg": "key file format: expected 'name:base64', got {0} ':'-separated parts",
+      "name": "Format"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "SignerError",
+      "msg": "key file I/O: {0}",
+      "name": "Io"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "SignerError",
+      "msg": "secret key must be 32 or 64 bytes, got {0}",
+      "name": "KeyLength"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "SignerError",
+      "msg": "tenant key lookup: {0}",
+      "name": "TenantKeyLookup"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "SubstituteError",
+      "msg": "upstream fetch failed: {0}",
+      "name": "Fetch"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "SubstituteError",
+      "msg": "NAR hash mismatch: expected {expected}, got {got}",
+      "name": "HashMismatch"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "SubstituteError",
+      "msg": "ingest failed: {0}",
+      "name": "Ingest"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "SubstituteError",
+      "msg": "narinfo parse error: {0}",
+      "name": "NarInfo"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "SubstituteError",
+      "msg": "transient: concurrent uploader holds placeholder",
+      "name": "Raced"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "SubstituteError",
+      "msg": "transient: upstream rate-limited (retry after {retry_after:?})",
+      "name": "RateLimited"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "SubstituteError",
+      "msg": "NAR size mismatch: narinfo declared {declared}, got {actual} decompressed bytes",
+      "name": "SizeMismatch"
+    },
+    {
+      "crate": "rio-store",
+      "enum": "SubstituteError",
+      "msg": "upstream {what} exceeds {limit}-byte cap",
+      "name": "TooLarge"
+    }
+  ]
 }
