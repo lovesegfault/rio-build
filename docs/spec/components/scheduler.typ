@@ -857,34 +857,61 @@ Queue-level preemption is fully supported:
   transitions are performed inside the DAG actor to ensure serialized access.
 ]
 
-// TODO: render as a proper state diagram once a typst stateDiagram package
-// lands; mermaid stateDiagram-v2 has no fletcher/chronos equivalent.
-```mermaid
-stateDiagram-v2
-    [*] --> created : DAG merge adds node
-    created --> completed : cache hit (output in store)
-    created --> queued : build accepted
-    queued --> ready : all dependencies complete
-    ready --> assigned : executor selected
-    assigned --> running : executor acknowledges
-    running --> completed : build succeeded
-    running --> failed : build error (retriable)
-    running --> poisoned : poison threshold / max retries / permanent failure
-    assigned --> ready : executor lost / heartbeat timeout
-    failed --> ready : retry scheduled
-    completed --> [*]
-    poisoned --> created : 24h TTL expiry
-    created --> dependency_failed : dep poisoned before queue
-    queued --> dependency_failed : dep poisoned cascade
-    ready --> dependency_failed : dep poisoned cascade
-    dependency_failed --> [*]
-
-    note right of queued : Blocked on >=1 dependency
-    note right of ready : All deps satisfied,\nawaiting executor
-    note right of assigned : Guard: executor has\nrequired features + resources
-    note right of poisoned : Auto-expires after 24h\n(returns to created)
-    note right of dependency_failed : Terminal; maps to\nNix BuildStatus=10
-```
+// Mermaid's `note right of` annotations are dropped here — the transition-
+// guards table immediately below carries the same content.
+#figure(
+  automaton(
+    (
+      created: (completed: "hit", queued: "accept", dependency_failed: "dep"),
+      queued: (ready: "deps-ok", dependency_failed: "dep"),
+      ready: (assigned: "pick", dependency_failed: "dep"),
+      assigned: (running: "ack", ready: "lost"),
+      running: (completed: "ok", failed: "err", poisoned: "poison"),
+      failed: (ready: "retry"),
+      poisoned: (created: "ttl"),
+      completed: none,
+      dependency_failed: none,
+    ),
+    initial: "created",
+    final: ("completed", "dependency_failed"),
+    input-labels: (
+      hit: [cache hit],
+      accept: [build accepted],
+      deps-ok: [all deps complete],
+      pick: [executor selected],
+      ack: [executor acks],
+      lost: [executor lost /\ heartbeat timeout],
+      ok: [build succeeded],
+      err: [retriable error],
+      poison: [poison threshold /\ max retries /\ permanent failure],
+      retry: [retry scheduled],
+      ttl: [24h TTL expiry],
+      dep: [dep poisoned],
+    ),
+    state-format: name => text(size: 0.85em, name.replace("_", "_\n")),
+    style: (
+      created: (initial: "DAG merge"),
+      state: (radius: 0.9),
+      transition: (label: (size: 0.8em)),
+      created-completed: (curve: 1.6),
+      assigned-ready: (curve: 0.8),
+      failed-ready: (curve: 0.8),
+      poisoned-created: (curve: -1.8),
+    ),
+    layout: (
+      created: (0, 0),
+      queued: (3, 0),
+      ready: (6, 0),
+      assigned: (9, 0),
+      running: (12, 0),
+      completed: (12, 3),
+      failed: (9, -3),
+      poisoned: (12, -3),
+      dependency_failed: (3, -3),
+    ),
+  ),
+  caption: [Derivation-node state machine.],
+)
 
 #info(title: [Connection direction])[
   The architecture diagram shows arrows FROM the scheduler TO executors for the
@@ -1033,20 +1060,42 @@ stateDiagram-v2
   derivations.
 ]
 
-// TODO: render as a proper state diagram (mermaid stateDiagram-v2).
-```mermaid
-stateDiagram-v2
-    [*] --> pending : SubmitBuild received
-    pending --> active : DAG merged, scheduling begins
-    active --> succeeded : all derivations completed
-    active --> failed : any derivation PermanentFailure/poisoned (keepGoing=false)
-    active --> failed : all derivations resolved, at least one failed (keepGoing=true)
-    active --> cancelled : CancelBuild received
-    pending --> cancelled : CancelBuild before DAG merged
-    cancelled --> [*]
-    succeeded --> [*]
-    failed --> [*]
-```
+#figure(
+  automaton(
+    (
+      pending: (active: "merged", cancelled: "cancel-early"),
+      active: (succeeded: "all-ok", failed: "any-fail", cancelled: "cancel"),
+      succeeded: none,
+      failed: none,
+      cancelled: none,
+    ),
+    initial: "pending",
+    final: ("succeeded", "failed", "cancelled"),
+    input-labels: (
+      merged: [DAG merged,\ scheduling begins],
+      cancel-early: [`CancelBuild`\ before merge],
+      all-ok: [all derivations\ completed],
+      any-fail: [`keepGoing=false`: any\ PermanentFailure/poisoned;\ `keepGoing=true`: all resolved,\ ≥1 failed],
+      cancel: [`CancelBuild`\ received],
+    ),
+    state-format: name => name,
+    style: (
+      pending: (initial: "SubmitBuild"),
+      state: (radius: 1.0),
+      pending-cancelled: (curve: -1.2, label: (pos: 0.35, dist: -0.4)),
+      active-failed: (curve: 0, label: (dist: 0.5)),
+      active-cancelled: (curve: -1.4, label: (pos: 0.7, dist: -0.4)),
+    ),
+    layout: (
+      pending: (0, 0),
+      active: (4, 0),
+      succeeded: (8.5, 2),
+      failed: (8.5, 0),
+      cancelled: (8.5, -2),
+    ),
+  ),
+  caption: [Build-request state machine.],
+)
 
 #r("sched.event.derivation-terminal")[
   Every derivation transition to a terminal state (`Completed`, `Skipped`,
