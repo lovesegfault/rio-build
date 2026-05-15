@@ -103,7 +103,14 @@ let
   # the hermetic docsData there.
   docsSrc = lib.fileset.toSource {
     root = ../docs;
-    fileset = lib.fileset.difference ../docs ../docs/gen;
+    fileset = lib.fileset.difference ../docs (
+      lib.fileset.unions [
+        ../docs/gen
+        # gitignored local-build artifacts that may exist on disk
+        (lib.fileset.maybeMissing ../docs/dist)
+        (lib.fileset.maybeMissing ../docs/.cache)
+      ]
+    );
   };
 
   # Generated reference data (metric/alert/error/config tables).

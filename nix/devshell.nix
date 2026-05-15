@@ -53,14 +53,14 @@ let
     # it resolves @preview/* via $XDG_DATA_HOME/typst/packages and WRITES
     # its bundled @preview/shiroa there on startup, so it needs a writable
     # copy of the rioTypst package closure. Wrap to sync the closure into
-    # a project-local cache (.direnv/typst-xdg/, gitignored) on first run
-    # and whenever rioTypst changes, then exec the real shiroa with
-    # XDG_DATA_HOME pointed there. The sentinel file holds the source
-    # store path so a `direnv reload` after a typstDeps change re-syncs.
+    # docs/.cache/typst-xdg/ (gitignored) on first run and whenever
+    # rioTypst changes, then exec the real shiroa with XDG_DATA_HOME
+    # pointed there. The sentinel file holds the source store path so a
+    # `direnv reload` after a typstDeps change re-syncs.
     (writeShellScriptBin "shiroa" ''
       set -euo pipefail
       src="${docsLib.rioTypst}/lib/typst/packages"
-      cache="''${RIO_TYPST_XDG:-$PWD/.direnv/typst-xdg}"
+      cache="''${RIO_TYPST_XDG:-$PWD/docs/.cache/typst-xdg}"
       sentinel="$cache/.rio-typst-src"
       if [[ ! -f "$sentinel" || "$(cat "$sentinel")" != "$src" ]]; then
         echo "shiroa: syncing typst package closure → $cache" >&2
