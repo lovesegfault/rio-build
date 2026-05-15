@@ -60,7 +60,7 @@ runs:
         # default can shift again. Belt-and-suspenders.
         extra-conf: |
           experimental-features = nix-command flakes
-          substituters = https://rio-nix-cache.s3.us-west-2.amazonaws.com https://cache.nixos.org
+          substituters = https://rio-nix-cache.s3.us-east-2.amazonaws.com https://cache.nixos.org
           trusted-public-keys = rio-nix-cache:er1fTC0pPR1nSGU+qcYJPle1CW1xtTJul+gA/kUo0KI= cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
           max-jobs = auto
           sandbox = true
