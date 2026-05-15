@@ -310,6 +310,36 @@
         "RustCrypto Developers"
       ]
     },
+    "arrayref": {
+      "crateName": "arrayref",
+      "version": "0.3.9",
+      "edition": "2015",
+      "sha256": "1jzyp0nvp10dmahaq9a2rnxqdd5wxgbvp8xaibps3zai8c9fi8kn",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "David Roundy <roundyd@physics.oregonstate.edu>"
+      ]
+    },
+    "arrayvec": {
+      "crateName": "arrayvec",
+      "version": "0.7.6",
+      "edition": "2018",
+      "sha256": "0l1fz4ccgv6pm609rif37sl5nv5k6lbzi7kkppgzqzh1vwix20kw",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "bluss"
+      ]
+    },
     "async-broadcast": {
       "crateName": "async-broadcast",
       "version": "0.7.2",
@@ -825,6 +855,55 @@
         "RustCrypto Developers"
       ]
     },
+    "blake3": {
+      "crateName": "blake3",
+      "version": "1.8.4",
+      "edition": "2024",
+      "sha256": "07mmw05638klqy4kcnwvbjbn279j1g7ysfnhms2hgzax8a8mjbad",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "arrayref",
+          "packageId": "arrayref"
+        },
+        {
+          "name": "arrayvec",
+          "packageId": "arrayvec"
+        },
+        {
+          "name": "cfg-if",
+          "packageId": "cfg-if"
+        },
+        {
+          "name": "constant_time_eq",
+          "packageId": "constant_time_eq"
+        },
+        {
+          "name": "cpufeatures",
+          "packageId": "cpufeatures 0.3.0",
+          "target": "cfg(any(target_arch = \"x86\", target_arch = \"x86_64\"))"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "cc",
+          "packageId": "cc"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Jack O'Connor <oconnor663@gmail.com>",
+        "Samuel Neves"
+      ]
+    },
     "block-buffer 0.10.4": {
       "crateName": "block-buffer",
       "version": "0.10.4",
@@ -1291,6 +1370,24 @@
       ],
       "authors": [
         "RustCrypto Developers"
+      ]
+    },
+    "constant_time_eq": {
+      "crateName": "constant_time_eq",
+      "version": "0.4.2",
+      "edition": "2024",
+      "sha256": "16zamq60dq80k3rqlzh9j9cpjhishmh924lnwbplgrnmkkvfylix",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Cesar Eduardo Barros <cesarb@cesarb.eti.br>"
       ]
     },
     "core-foundation": {
@@ -5898,6 +5995,30 @@
         "bluss"
       ]
     },
+    "memoffset": {
+      "crateName": "memoffset",
+      "version": "0.9.1",
+      "edition": "2015",
+      "sha256": "12i17wh9a9plx869g7j4whf62xw68k5zd4k0k5nh6ys5mszid028",
+      "source": {
+        "type": "crates-io"
+      },
+      "buildDependencies": [
+        {
+          "name": "autocfg",
+          "packageId": "autocfg"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Gilad Naaman <gilad.naaman@gmail.com>"
+      ]
+    },
     "metrics": {
       "crateName": "metrics",
       "version": "0.24.3",
@@ -6147,6 +6268,10 @@
         {
           "name": "libc",
           "packageId": "libc"
+        },
+        {
+          "name": "memoffset",
+          "packageId": "memoffset"
         }
       ],
       "buildDependencies": [
@@ -6160,11 +6285,13 @@
         "feature",
         "fs",
         "hostname",
+        "memoffset",
         "mman",
         "mount",
         "process",
         "sched",
         "signal",
+        "socket",
         "uio",
         "user"
       ],
@@ -8471,6 +8598,10 @@
           "packageId": "base64"
         },
         {
+          "name": "blake3",
+          "packageId": "blake3"
+        },
+        {
           "name": "ed25519-dalek",
           "packageId": "ed25519-dalek"
         },
@@ -8527,6 +8658,10 @@
       },
       "dependencies": [
         {
+          "name": "blake3",
+          "packageId": "blake3"
+        },
+        {
           "name": "libfuzzer-sys",
           "packageId": "libfuzzer-sys"
         },
@@ -8555,6 +8690,10 @@
         {
           "name": "derived_path_parsing",
           "path": "fuzz_targets/derived_path_parsing.rs"
+        },
+        {
+          "name": "nar_ls",
+          "path": "fuzz_targets/nar_ls.rs"
         },
         {
           "name": "nar_parsing",

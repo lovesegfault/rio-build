@@ -220,7 +220,7 @@ mod proptests {
     /// Base cases: regular files and symlinks.
     /// Recursive case: directories with 0..5 entries, each with a unique
     /// sorted name and a recursive child node.
-    fn arb_nar_node() -> impl Strategy<Value = NarNode> {
+    pub(super) fn arb_nar_node() -> impl Strategy<Value = NarNode> {
         let leaf = prop_oneof![
             // Regular file: arbitrary executable flag + small content
             (
@@ -1063,4 +1063,241 @@ fn dump_path_non_utf8_symlink_target_rejected() {
         matches!(&err, NarError::Io(e) if e.to_string().contains("not valid UTF-8")),
         "dump_path_streaming: expected UTF-8 error, got {err:?}"
     );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// nar_ls (P0546) — streaming index
+// ───────────────────────────────────────────────────────────────────────────
+
+mod ls_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::io;
+
+    /// Walk a `NarNode` tree collecting the same `(path, kind)` set
+    /// `nar_ls` should emit, plus a `path → contents` map for the
+    /// regular files. Used as the proptest oracle.
+    fn collect_files(node: &NarNode, path: &mut Vec<u8>, out: &mut Vec<(Vec<u8>, Vec<u8>)>) {
+        match node {
+            NarNode::Regular { contents, .. } => {
+                out.push((path.clone(), contents.clone()));
+            }
+            NarNode::Symlink { .. } => {}
+            NarNode::Directory { entries } => {
+                for e in entries {
+                    let saved = path.len();
+                    if !path.is_empty() {
+                        path.push(b'/');
+                    }
+                    path.extend_from_slice(e.name.as_bytes());
+                    collect_files(&e.node, path, out);
+                    path.truncate(saved);
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4096))]
+        // r[verify store.index.nar-ls-offset]
+        // r[verify store.index.file-digest]
+        #[test]
+        fn nar_ls_offset_and_digest(node in super::proptests::arb_nar_node()) {
+            let mut buf = Vec::new();
+            serialize(&mut buf, &node)?;
+
+            let entries = nar_ls(Cursor::new(&buf))?;
+
+            let mut want_files = Vec::new();
+            collect_files(&node, &mut Vec::new(), &mut want_files);
+            let mut want: std::collections::HashMap<Vec<u8>, Vec<u8>> =
+                want_files.into_iter().collect();
+
+            for e in &entries {
+                if e.kind != NarEntryKind::Regular {
+                    prop_assert_eq!(e.size, 0);
+                    prop_assert_eq!(e.nar_offset, 0);
+                    prop_assert_eq!(e.file_digest, [0u8; 32]);
+                    continue;
+                }
+                let content = want.remove(&e.path).expect("unknown regular path");
+                prop_assert_eq!(e.size as usize, content.len());
+                // nar_offset → slice of the original NAR == content
+                let slice = &buf[e.nar_offset as usize..e.nar_offset as usize + content.len()];
+                prop_assert_eq!(slice, &content[..]);
+                // file_digest == blake3(content)
+                prop_assert_eq!(e.file_digest, *blake3::hash(&content).as_bytes());
+            }
+            prop_assert!(want.is_empty(), "nar_ls missed regular files: {:?}", want.keys());
+        }
+    }
+
+    // `nar_ls` accepts a strict superset of what `parse()` accepts —
+    // it additionally takes (a) regular-file content past
+    // `MAX_CONTENT_SIZE` (streamed, never buffered) and (b) non-UTF-8
+    // entry names / symlink targets (raw `Vec<u8>` API; `parse()`'s
+    // `String`-based `NarNode` cannot represent them). Random byte
+    // vectors essentially never form a valid NAR (24-byte magic
+    // prefix), so this proptest only exercises the both-reject path —
+    // the agree-on-valid-input direction is `nar_ls_offset_and_digest`
+    // above; the deliberate divergences are pinned by hand below and
+    // exercised continuously by the `nar_ls` fuzz target.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #[test]
+        fn nar_ls_superset_of_parse(bytes in proptest::collection::vec(any::<u8>(), 0..1024)) {
+            let parse_ok = parse(&mut Cursor::new(&bytes)).is_ok();
+            let ls_ok = nar_ls(Cursor::new(&bytes)).is_ok();
+            prop_assert!(!parse_ok || ls_ok,
+                "parse accepted but nar_ls rejected: {:?}", bytes);
+        }
+    }
+
+    /// `parse()` rejects non-UTF-8 entry names and symlink targets
+    /// because its `String`-based `NarNode` cannot represent them.
+    /// `nar_ls()` is byte-faithful (`Vec<u8>` path/target) — `dump_path`
+    /// over a Unix filesystem can legitimately produce arbitrary-byte
+    /// names. Pins the deliberate divergence the `nar_ls` fuzz target
+    /// special-cases as an `(Err(InvalidUtf8), Ok(_))` arm.
+    #[test]
+    fn nar_ls_accepts_non_utf8_names_parse_rejects() {
+        // Hand-encode: dir { entry "\xFF" → symlink "\xFE" }.
+        // serialize() can't produce this — NarEntry.name is String.
+        let mut buf = Vec::new();
+        write_str(&mut buf, NAR_MAGIC).unwrap();
+        write_str(&mut buf, "(").unwrap();
+        write_str(&mut buf, "type").unwrap();
+        write_str(&mut buf, "directory").unwrap();
+        write_str(&mut buf, "entry").unwrap();
+        write_str(&mut buf, "(").unwrap();
+        write_str(&mut buf, "name").unwrap();
+        write_bytes(&mut buf, &[0xFF]).unwrap();
+        write_str(&mut buf, "node").unwrap();
+        write_str(&mut buf, "(").unwrap();
+        write_str(&mut buf, "type").unwrap();
+        write_str(&mut buf, "symlink").unwrap();
+        write_str(&mut buf, "target").unwrap();
+        write_bytes(&mut buf, &[0xFE]).unwrap();
+        write_str(&mut buf, ")").unwrap();
+        write_str(&mut buf, ")").unwrap();
+        write_str(&mut buf, ")").unwrap();
+
+        assert!(matches!(
+            parse(&mut Cursor::new(&buf)),
+            Err(NarError::InvalidUtf8 { .. })
+        ));
+
+        let entries = nar_ls(Cursor::new(&buf)).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].kind, NarEntryKind::Directory);
+        assert_eq!(entries[1].path, vec![0xFF]);
+        assert_eq!(entries[1].kind, NarEntryKind::Symlink);
+        assert_eq!(entries[1].target, vec![0xFE]);
+    }
+
+    /// A `Read` that delivers `len` repeated bytes then EOF, never
+    /// allocating. Used to prove `nar_ls` holds bounded memory: the
+    /// content here is far past `MAX_CONTENT_SIZE`, so a `parse()`-style
+    /// buffer-whole impl would either OOM or reject it.
+    struct RepeatReader {
+        byte: u8,
+        remaining: u64,
+    }
+    impl Read for RepeatReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = (self.remaining.min(buf.len() as u64)) as usize;
+            buf[..n].fill(self.byte);
+            self.remaining -= n as u64;
+            Ok(n)
+        }
+    }
+
+    /// Hand-written NAR header for a single regular file of arbitrary
+    /// size, content supplied by a chained reader. `serialize()` would
+    /// need the bytes in a `Vec`.
+    fn synthetic_regular_header(content_len: u64) -> Vec<u8> {
+        let mut h = Vec::new();
+        write_str(&mut h, NAR_MAGIC).unwrap();
+        write_str(&mut h, "(").unwrap();
+        write_str(&mut h, "type").unwrap();
+        write_str(&mut h, "regular").unwrap();
+        write_str(&mut h, "contents").unwrap();
+        write_u64(&mut h, content_len).unwrap();
+        h
+    }
+
+    fn synthetic_regular_trailer(content_len: u64) -> Vec<u8> {
+        let mut t = Vec::new();
+        let pad = crate::protocol::wire::padding_len(content_len as usize);
+        t.extend_from_slice(&vec![0u8; pad]);
+        write_str(&mut t, ")").unwrap();
+        t
+    }
+
+    // r[verify store.index.nar-ls-streaming]
+    #[test]
+    fn nar_ls_bounded_memory_past_max_content_size() {
+        // 4× MAX_CONTENT_SIZE — parse() would reject it (ContentTooLarge);
+        // nar_ls streams it in 64 KiB blocks. RepeatReader allocates
+        // nothing, so this test going OOM means nar_ls buffers.
+        let len = MAX_CONTENT_SIZE * 4;
+        let header = synthetic_regular_header(len);
+        let nar_offset = header.len() as u64;
+        let trailer = synthetic_regular_trailer(len);
+
+        let r = Cursor::new(header)
+            .chain(RepeatReader {
+                byte: 0xAB,
+                remaining: len,
+            })
+            .chain(Cursor::new(trailer));
+
+        let entries = nar_ls(r).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, NarEntryKind::Regular);
+        assert_eq!(entries[0].size, len);
+        assert_eq!(entries[0].nar_offset, nar_offset);
+
+        // Compute expected blake3 incrementally (same block size).
+        let mut h = blake3::Hasher::new();
+        let block = vec![0xABu8; 64 * 1024];
+        let mut rem = len;
+        while rem > 0 {
+            let take = rem.min(block.len() as u64) as usize;
+            h.update(&block[..take]);
+            rem -= take as u64;
+        }
+        assert_eq!(entries[0].file_digest, *h.finalize().as_bytes());
+    }
+
+    /// `nar_ls` emits in NAR encounter order (DFS pre-order) so the
+    /// caller's bottom-up dir_digest pass (P0572) can iterate in
+    /// reverse without re-sorting.
+    #[test]
+    fn nar_ls_encounter_order() {
+        let tree = NarNode::Directory {
+            entries: vec![
+                NarEntry {
+                    name: "a".into(),
+                    node: NarNode::Directory {
+                        entries: vec![NarEntry {
+                            name: "x".into(),
+                            node: reg(false, b"x"),
+                        }],
+                    },
+                },
+                NarEntry {
+                    name: "b".into(),
+                    node: NarNode::Symlink {
+                        target: "a/x".into(),
+                    },
+                },
+            ],
+        };
+        let mut buf = Vec::new();
+        serialize(&mut buf, &tree).unwrap();
+        let entries = nar_ls(Cursor::new(&buf)).unwrap();
+        let paths: Vec<&[u8]> = entries.iter().map(|e| e.path.as_slice()).collect();
+        assert_eq!(paths, vec![&b""[..], b"a", b"a/x", b"b"]);
+    }
 }

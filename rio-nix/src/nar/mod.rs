@@ -29,6 +29,7 @@ use std::io;
 use thiserror::Error;
 
 mod fs;
+mod ls;
 mod reader;
 mod sync_wire;
 mod writer;
@@ -40,6 +41,7 @@ mod tests;
 #[doc(hidden)]
 pub use fs::{dump_path, extract_to_path};
 pub use fs::{dump_path_streaming, restore_path_streaming};
+pub use ls::{NarEntryKind, NarLsEntry, nar_ls};
 pub use reader::{extract_single_file, parse};
 pub use writer::serialize;
 

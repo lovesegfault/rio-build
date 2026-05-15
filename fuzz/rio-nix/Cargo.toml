@@ -19,6 +19,8 @@ libfuzzer-sys = "0.4"
 rio-nix = { path = "../../rio-nix", features = ["test-oracle"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "io-util"] }
+# nar_ls fuzz target re-derives blake3 over each indexed file slice.
+blake3 = "1"
 
 [[bin]]
 name = "wire_primitives"
@@ -71,5 +73,11 @@ doc = false
 [[bin]]
 name = "stderr_message_parsing"
 path = "fuzz_targets/stderr_message_parsing.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "nar_ls"
+path = "fuzz_targets/nar_ls.rs"
 test = false
 doc = false
