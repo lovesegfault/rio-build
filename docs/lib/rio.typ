@@ -14,11 +14,16 @@
 //   html        — shiroa --mode static-html. typst target = html;
 //                 template-rules → starlight() emits the <head>/CSS/
 //                 sidebar chrome; markup-rules wires heading anchors.
-//   web         — shiroa --mode dyn-paged. typst target = PAGED (the
-//                 wasm renderer rasterizes the canvas); shiroa CLI
-//                 supplies theme chrome around it. html.* does NOT
-//                 exist here — render like PDF, just on one tall
-//                 auto-height page at shiroa's `page-width`.
+//                 ALSO the html-wrapper pass of dyn-paged (see below).
+//   web         — shiroa --mode dyn-paged, content pass. typst target
+//                 = PAGED (the wasm renderer rasterizes the canvas);
+//                 html.* does NOT exist here — render like PDF on one
+//                 tall auto-height page at shiroa's `page-width`.
+//                 dyn-paged compiles each chapter TWICE: once with
+//                 x-target=web-* (this branch → .sir.in artifact) and
+//                 once with x-target=html-wrapper (the `html` branch
+//                 above → starlight chrome + wasm trampoline in place
+//                 of the body).
 //
 // Mechanism notes:
 // - `set page(...) if cond` — trailing form. `if cond { set ... }`
@@ -30,11 +35,21 @@
 
 // ─── package imports ────────────────────────────────────────────────
 #import "@preview/shiroa:0.3.1": (
-  is-html-target, is-pdf-target, is-web-target, shiroa-sys-target, templates,
+  html-support, is-html-target, is-pdf-target, is-web-target, shiroa-sys-target,
+  templates, x-target,
 )
 #import templates: (
   add-styles, equation-rules, markup-rules, template-rules, theme-box,
 )
+// dyn-svg-support emits the wasm-loader bootstrap (`<script
+// src=/internal/shiroa.js>` + the inline `window.typstRenderModuleReady
+// = ...` promise). shiroa-mdbook calls it from its head.typ; shiroa-
+// starlight 0.3.1 forgot to, so dyn-paged + starlight produces a
+// trampoline that awaits an undefined promise. We inject it via
+// template-rules' `extra-assets` (lands in starlight's <head> through
+// the sl:book-meta slot).
+#import html-support: supports-html-internal
+#import supports-html-internal: dyn-svg-support
 #import "@preview/tracey:0.1.0": req
 #import "@preview/glossarium:0.5.10": (
   get-entry-back-references, gls, glspl, make-glossary, print-glossary,
@@ -374,6 +389,16 @@
         title: if paper != none { paper.title } else { "" },
         plain-body: body,
         web-theme: "starlight",
+        // dyn-paged html-wrapper pass: starlight 0.3.1 calls
+        // paged-load-trampoline() but never dyn-svg-support(), so the
+        // trampoline awaits an undefined typstRenderModuleReady. mdbook
+        // puts dyn-svg-support() in its <head>; starlight forgot.
+        // extra-assets lands in starlight's <head> via the sl:book-meta
+        // slot — inject the bootstrap there. Gate on html-wrapper so
+        // static-html doesn't fetch the (unused) wasm renderer.
+        extra-assets: if x-target.starts-with("html-wrapper") {
+          (dyn-svg-support(),)
+        } else { () },
       )
       show: markup-rules.with(themes: (default-theme: (dash-color: accent)))
       show: equation-rules.with(theme-box: _theme-frame)
