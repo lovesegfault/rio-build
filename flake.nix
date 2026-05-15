@@ -171,6 +171,16 @@
           cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
           inherit (cargoToml.workspace.package) version;
 
+          # `nix-everything` without its `checkInputs` test gate. Tests
+          # need a `nix-daemon`/`nix-store` runtime, not Nix's own test
+          # suite — which fails on some remote builders' sandbox limits
+          # (e.g. `readLinkAt.works` ENAMETOOLONG) and then blocks
+          # checks.nextest-rio-* on a derivation outside this repo. The
+          # wrapper output is byte-identical with and without the gate.
+          nixForTests = inputs.nix.packages.${system}.nix.overrideAttrs (_: {
+            doCheck = false;
+          });
+
           # --------------------------------------------------------------
           # Rust toolchains
           # --------------------------------------------------------------
@@ -525,9 +535,7 @@
                 ];
               in
               member:
-              pkgs.lib.optional (
-                member == null || builtins.elem member needsNix
-              ) inputs.nix.packages.${system}.nix
+              pkgs.lib.optional (member == null || builtins.elem member needsNix) nixForTests
               ++ pkgs.lib.optional (member == null || builtins.elem member needsPg) pkgs.postgresql_18
               ++ pkgs.lib.optional (member == null || member == "rio-gateway") pkgs.openssh;
             # Env vars for test runners, keyed by member. PG_BIN so
@@ -1057,7 +1065,7 @@
                 sysCrateEnv
                 goldenTestEnv
                 ;
-              nixPkg = inputs.nix.packages.${system}.nix;
+              nixPkg = nixForTests;
             })
             mutants
             mutants-smoke
