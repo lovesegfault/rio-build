@@ -77,7 +77,7 @@ pub struct BuildSpawnContext {
     /// `execute_build` (drv fetch, upload, query); the full bundle is
     /// held by `NixStoreFs` (set at FUSE mount) so the JIT `lookup`
     /// callback can reach it.
-    pub store_clients: crate::fuse::StoreClients,
+    pub store_clients: crate::store_fetch::StoreClients,
     /// This pod's executor identity, echoed in every report.
     pub executor_id: String,
     /// Mount point of the FUSE store view builds read inputs from.

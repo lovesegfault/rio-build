@@ -20,7 +20,6 @@ mod read;
 
 pub(crate) mod fetch;
 
-pub(crate) use fetch::StoreClients;
 mod inode;
 mod ops;
 

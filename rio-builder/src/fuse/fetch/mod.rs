@@ -1,18 +1,27 @@
 //! Fetch and materialize store paths into the local cache.
 //!
-//! The production entry point is `NixStoreFs::ensure_cached`: called
-//! from FUSE callbacks (lookup, getattr). Handles singleflight WAIT
-//! semantics — if another thread is fetching, block on condvar until
-//! it finishes. It delegates to `fetch_extract_insert` for the actual
-//! work; the test-only `prefetch_path_blocking` seam drives the same
-//! fetch with RETURN-EARLY singleflight semantics.
-
-mod client;
+//! Two entry points:
+//! - `NixStoreFs::ensure_cached`: called from FUSE callbacks
+//!   (lookup, getattr). Handles singleflight WAIT semantics — if
+//!   another thread is fetching, block on condvar until it finishes.
+//! - [`prefetch_path_blocking`]: called from the PrefetchHint
+//!   handler via spawn_blocking. Same singleflight but with
+//!   RETURN-EARLY on WaitFor — prefetch is a hint, not a dependency;
+//!   if FUSE already has it in flight, we're done.
+//!
+//! Both delegate to `fetch_extract_insert` for the actual work.
+//!
+//! The FUSE-independent gRPC primitives ([`StoreClients`],
+//! [`jit_fetch_timeout`], the retry/jitter machinery) live in
+//! [`crate::store_fetch`] — re-exported here for the existing call
+//! sites. P0560 deletes this module wholesale; the castore-FUSE
+//! imports from `store_fetch` directly.
 
 #[cfg(test)]
 mod tests;
 
-pub use client::StoreClients;
+use crate::store_fetch::{RETRY_BACKOFF, jitter};
+pub use crate::store_fetch::{StoreClients, jit_fetch_timeout};
 
 /// Process-unique suffix for spool/tmp filenames. The cache dir is a
 /// per-pod emptyDir (dies with the pod), so cross-process collisions
@@ -35,7 +44,6 @@ use tracing::instrument;
 
 use super::NixStoreFs;
 use super::cache::{Cache, FetchClaim, FetchGuard, InflightEntry};
-#[cfg(test)]
 use super::circuit::CircuitBreaker;
 
 /// `AsyncWrite` adapter over a sync `std::fs::File` — does BLOCKING disk
@@ -109,91 +117,6 @@ const WAIT_SLICE: Duration = Duration::from_millis(200);
 /// the fetcher is genuinely wedged (executor starvation?) and EAGAIN is
 /// the least-bad errno.
 const WAIT_SLOP: Duration = Duration::from_secs(30);
-
-/// Minimum expected store→builder throughput for JIT fetch-timeout
-/// sizing. I-178: 15 MiB/s is a conservative floor — half the ~30 MB/s
-/// observed in cluster (`rio_builder_fuse_fetch_bytes_total` ÷
-/// `rio_builder_fuse_fetch_duration_seconds`). A 1.9 GB NAR at this
-/// floor needs ≈127 s; the previous flat 60 s timeout aborted the fetch
-/// mid-stream → daemon ENOENT → PermanentFailure poison.
-///
-/// Tune DOWN if `rio_builder_input_materialization_failures_total` is
-/// sustained nonzero (means real throughput is below this floor —
-/// cross-AZ builders, S3 throttle).
-pub const JIT_MIN_THROUGHPUT_BPS: u64 = 15 * 1024 * 1024;
-
-/// Per-path JIT fetch timeout: `max(base, nar_size / MIN_THROUGHPUT)`.
-///
-/// `base` is `fuse_fetch_timeout` (60 s) so small paths are unchanged
-/// from pre-I-178 behavior. Large paths get a size-proportional budget
-/// — the I-178 1.9 GB input gets ≈127 s instead of the flat 60 s that
-/// aborted it mid-stream.
-///
-/// Under JIT (I-043 redesign) the FUSE callback IS the fetch site —
-/// the daemon's `lstat` blocks in `request_wait_answer` for this
-/// duration on a cold input. The size-aware budget is therefore
-/// load-bearing for correctness (a too-short timeout → EIO →
-/// `InfrastructureFailure`), not just an optimization.
-pub fn jit_fetch_timeout(base: Duration, nar_size: u64) -> Duration {
-    base.max(Duration::from_secs(
-        nar_size.div_ceil(JIT_MIN_THROUGHPUT_BPS),
-    ))
-}
-
-/// Backoff schedule for retrying transient store-gRPC errors
-/// (`Unavailable` / `Unknown` — server restarting, transport disconnect)
-/// inside [`fetch_extract_insert`]. Five delays = six attempts. Total
-/// wait ~17.6s (× [`jitter`] per step → ~[8.8s, 26.4s)), sized to
-/// survive a `replicas: 1` store rolling restart (~10s old-pod-SIGTERM
-/// → new-pod-Ready) without surfacing `EIO` to the build sandbox.
-/// I-039: a deploy mid-LLVM-build was killing 40min of work with an
-/// opaque `Input/output error` on `stat()`.
-///
-/// I-189: schedule extended `[…, 5s]` → `[…, 5s, 10s]` and jittered at
-/// the call site (NOT baked into this const — the const stays
-/// deterministic for tests/docs; jitter is applied where the delay is
-/// consumed). Under `hello-deep-256x` (~38000 drvs), hundreds of
-/// builders `GetPath` the same 164 MB gcc within seconds; every builder
-/// hits the same h2 reset and then retries at the SAME instant — the
-/// retry IS the herd. Per-attempt jitter breaks lockstep; the extra
-/// 10 s step buys one more drain window.
-///
-/// Sits BELOW the circuit breaker: callers check the breaker before
-/// calling here, so if the store has been down long enough to trip it
-/// we never reach this loop. The retry handles the transition
-/// window (was-up → briefly-down → up-again); the breaker handles
-/// the steady-state (down-for-a-while → fail-fast).
-///
-/// Short in tests so the permanent-failure path stays sub-second.
-#[cfg(not(test))]
-const RETRY_BACKOFF: &[Duration] = &[
-    Duration::from_millis(100),
-    Duration::from_millis(500),
-    Duration::from_secs(2),
-    Duration::from_secs(5),
-    Duration::from_secs(10),
-];
-#[cfg(test)]
-const RETRY_BACKOFF: &[Duration] = &[
-    Duration::from_millis(10),
-    Duration::from_millis(50),
-    Duration::from_millis(200),
-    Duration::from_millis(500),
-];
-
-/// Jitter a backoff delay: `delay × U(0.5, 1.5)`.
-///
-/// I-189: under thundering-herd, every builder that hit the same
-/// transient error retries at the same instant — the retry IS the herd.
-/// ±50% spread breaks lockstep while keeping the expected delay equal
-/// to the schedule entry. Applied at the `tokio::time::sleep` call
-/// sites that consume [`RETRY_BACKOFF`], not baked into the const, so
-/// the schedule stays inspectable and the test-cfg short schedule
-/// stays deterministic in sum.
-// r[impl builder.fuse.retry-jitter]
-fn jitter(delay: Duration) -> Duration {
-    rio_common::backoff::Jitter::Proportional(0.5).apply(delay)
-}
 
 impl NixStoreFs {
     /// Ensure a store path is cached locally, fetching from remote if needed.
@@ -407,14 +330,11 @@ impl NixStoreFs {
     }
 }
 
-/// Why a test-driven fetch returned without fetching. Not an error —
-/// both mean "somebody else is/has handling/handled it."
+/// Why a prefetch returned without fetching. Not an error — both
+/// mean "somebody else is/has handling/handled it."
 ///
-/// Test-only since the scheduler-pushed PrefetchHint handler was
-/// removed with the stream client (the JIT/ensure_cached path is the
-/// only production fetch entry); kept as the public seam the
-/// fetch_extract_insert battery drives.
-#[cfg(test)]
+/// Exposed so the prefetch metric can distinguish the cases (cache-hit
+/// vs in-flight). Both are "success" from prefetch's perspective.
 #[derive(Debug, Clone, Copy)]
 pub enum PrefetchSkip {
     /// `cache.get_path()` returned Some — already on disk. Cheap
@@ -427,16 +347,12 @@ pub enum PrefetchSkip {
     AlreadyInFlight,
 }
 
-/// Fetch a store path outside the FUSE callback path. SYNC — call via
-/// `spawn_blocking`. Test-only since the scheduler-pushed PrefetchHint
-/// handler was removed with the stream client; the
-/// fetch_extract_insert tests drive the module-private fetch through
-/// this seam.
+/// Prefetch a store path. SYNC — call via `spawn_blocking`.
 ///
 /// Cache methods use `runtime.block_on` internally (designed for
 /// FUSE callbacks on dedicated blocking threads). Calling from an
 /// async context would panic with nested-runtime. So this fn is
-/// sync and callers wrap it in spawn_blocking.
+/// sync and the prefetch handler wraps it in spawn_blocking.
 ///
 /// Returns:
 /// - `Ok(None)`: fetched successfully, path is now in cache
@@ -453,7 +369,6 @@ pub enum PrefetchSkip {
 /// when FUSE arrives, FUSE waits on our guard — which is fine,
 /// we're in spawn_blocking so the wait doesn't starve the async
 /// executor.
-#[cfg(test)]
 pub fn prefetch_path_blocking(
     cache: &Cache,
     clients: &StoreClients,

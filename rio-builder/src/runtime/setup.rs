@@ -16,7 +16,7 @@ use super::slot::BuildSlot;
 use super::{BuildSpawnContext, BuilderRuntime};
 use crate::config::{Config, detect_system};
 use crate::executor::BuildTaskMessage;
-use crate::fuse::StoreClients;
+use crate::store_fetch::StoreClients;
 
 pub(super) type WorkerClient = rio_proto::ExecutorServiceClient<tonic::transport::Channel>;
 
