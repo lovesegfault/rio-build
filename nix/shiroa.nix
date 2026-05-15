@@ -6,20 +6,22 @@
 }:
 rustPlatform.buildRustPackage {
   pname = "shiroa";
-  # main@fea5b750: post-v0.3.1-rc4. Includes 4240a2b1 (reflexo-typst
-  # git-rev bump, "Fixed HTML export issues") and 83144846 (module
-  # reorganization). Embedded typst is still 0.14.0.
-  version = "0.3.1-unstable-2025-12-14";
+  # lovesegfault/shiroa@rio-pin: upstream main@fea5b750 + two patches
+  # carried as upstream PRs:
+  #   - Myriad-Dreamin/shiroa#238 (typst 0.14.2 / typst.ts v0.7.0-rc2)
+  #   - Myriad-Dreamin/shiroa#239 (sidebar items.sum(default: []))
+  # Drop the fork once both land upstream.
+  version = "0.3.1-unstable-2026-05-15";
   src = fetchFromGitHub {
-    owner = "Myriad-Dreamin";
+    owner = "lovesegfault";
     repo = "shiroa";
-    rev = "fea5b750fb5e6e1ba6841b25f5bc1e7d08f3fa90";
+    rev = "a8363c406e9451e83bb7297dd2fc8685f0e45101";
     # assets/artifacts/ (renderer wasm + frontend JS) is a submodule;
     # cli/src/project.rs include_bytes!()s from it at compile time.
     fetchSubmodules = true;
-    hash = "sha256-kvovTHi1WI/LMHUxBI6B1PcGb9DNdXjMxTvDMO51hwQ=";
+    hash = "sha256-nAS/MaXLOciH0jPXBJbeN/bj0tXKZC/j4EZH06oo5Io=";
   };
-  cargoHash = "sha256-Gi5Dx8xbCOBpfUTdi3zQTfqFkk5QNSB++lukSw9K7gU=";
+  cargoHash = "sha256-D9BLf8KBJ1nxsci+vkE1bVr9z40OZlq8Be/GVivsKfA=";
   nativeBuildInputs = [ pkg-config ];
   buildInputs = [ openssl ];
   doCheck = false;

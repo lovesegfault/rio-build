@@ -54,10 +54,7 @@ let
         autograph
         pinit
         suiji
-        # chronos 0.3.0 wants typst ≥0.14.2; shiroa main@fea5b750 still
-        # embeds typst 0.14.0 (4240a2b1 "bump typst.ts to 0.7.0-rc2"
-        # bumps reflexo's git rev, not the typst compiler version).
-        chronos_0_2_1
+        chronos
         shiroa
         shiroa-mdbook
       ])

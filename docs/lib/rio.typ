@@ -55,11 +55,7 @@
 )
 #import "@preview/lilaq:0.6.0" as lq
 #import "@preview/fletcher:0.5.8" as fletcher: diagram, edge, node
-// chronos pinned to 0.2.1: 0.3.0 requires typst ≥0.14.2 but shiroa's
-// embedded reflexo-typst is still 0.14.0 (as of main@fea5b750 — its
-// "bump typst.ts to 0.7.0-rc2" commit bumps reflexo's git rev, not the
-// typst compiler version). Bump when shiroaPkg's typst hits 0.14.2.
-#import "@preview/chronos:0.2.1" as chronos
+#import "@preview/chronos:0.3.0" as chronos
 #import "@preview/finite:0.5.1": automaton, layout as finite-layout
 // autograph re-exports fletcher's diagram/node/edge names — keep it
 // namespaced so the bare `diagram`/`node`/`edge` above stay fletcher's.
