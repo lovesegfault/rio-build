@@ -252,6 +252,33 @@ rec {
         echo "FAIL: only $n rref anchors in HTML (expected ≥80; bug_033/025 regressed)" >&2
         exit 1
       fi
+      # QA #1: html.frame() zero-width regression. Match the root <svg>
+      # element only (nested rect/path width=0 are legitimate).
+      if grep -rqE '<svg[^>]*width="0pt"' .; then
+        echo "FAIL: zero-width SVG in html output (QA #1 regressed)" >&2
+        grep -rlnE '<svg[^>]*width="0pt"' . | head -5 >&2
+        exit 1
+      fi
+      # QA #3: repository/edit links populated (typst emits bare `href`
+      # for missing values, not href="").
+      if grep -rqE '<a [^>]*\bhref(\s|>)' .; then
+        echo "FAIL: bare-href link (QA #3 — repository unset?)" >&2
+        exit 1
+      fi
+      grep -q 'href="https://github.com/lovesegfault/rio-build"' intro.html \
+        || { echo "FAIL: repository link missing (QA #3)" >&2; exit 1; }
+      # QA #5: tables wrapped in scroll div.
+      n=$(grep -roh 'class="rio-table"' . | wc -l)
+      if [[ $n -lt 30 ]]; then
+        echo "FAIL: only $n rio-table wrappers (expected ≥30; QA #5 regressed)" >&2
+        exit 1
+      fi
+      # QA #6: distinct page titles.
+      n=$(grep -rhoP '<title>[^<]+' . | sort -u | wc -l)
+      if [[ $n -lt 25 ]]; then
+        echo "FAIL: only $n distinct <title> values (expected ≥25; QA #6 regressed)" >&2
+        exit 1
+      fi
       touch $out
     '';
   };
