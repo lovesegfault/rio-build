@@ -369,6 +369,9 @@ mod tests {
         ) -> Result<((u16, shared::ProcessGuard), (u16, shared::ProcessGuard))> {
             unimplemented!()
         }
+        async fn secret_bytes(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
         async fn destroy(&self, _: &XtaskConfig) -> Result<()> {
             unimplemented!()
         }

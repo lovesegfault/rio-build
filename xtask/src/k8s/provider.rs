@@ -126,6 +126,14 @@ pub trait Provider: Send + Sync {
         (u16, super::shared::ProcessGuard),
     )>;
 
+    /// Fetch a Secret's data key from the rio-system namespace.
+    /// `None` if the Secret or key is absent (dev cluster without
+    /// HMAC). Default impl creates a fresh kube client; the phases.rs
+    /// test mock returns `Ok(None)`.
+    async fn secret_bytes(&self, name: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        super::shared::secret_bytes(name, key).await
+    }
+
     /// helm uninstall + tofu destroy (eks) | rook teardown (k3s).
     async fn destroy(&self, cfg: &XtaskConfig) -> Result<()>;
 }

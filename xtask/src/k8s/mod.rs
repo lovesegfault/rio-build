@@ -759,12 +759,33 @@ pub async fn with_cli_tunnel<F>(p: &dyn Provider, sched: u16, store: u16, f: F) 
 where
     F: FnOnce(&xshell::Shell) -> Result<()>,
 {
+    use std::os::fd::AsRawFd;
     let ((sched, _g1), (store, _g2)) =
         ui::step("tunnel scheduler+store", || p.tunnel_grpc(sched, store)).await?;
 
     let sh = sh::shell()?;
     let _e1 = sh.push_env("RIO_SCHEDULER_ADDR", format!("localhost:{sched}"));
     let _e2 = sh.push_env("RIO_STORE_ADDR", format!("localhost:{store}"));
+    // Service-HMAC key so rio-cli can mint x-rio-service-token (Admin
+    // RPCs are token-gated in production). None = dev cluster, run
+    // unsigned. Secret data-key per _helpers.tpl:116 / smoke.rs.
+    let _key_fd = match p
+        .secret_bytes("rio-service-hmac", "service-hmac.key")
+        .await?
+    {
+        Some(b) => {
+            let fd = shared::bytes_to_memfd(&b)?;
+            sh.set_var(
+                "RIO_SERVICE_HMAC_KEY_PATH",
+                format!("/dev/fd/{}", fd.as_raw_fd()),
+            );
+            Some(fd) // hold open for the closure's lifetime
+        }
+        None => {
+            debug!("Secret rio-service-hmac not found — rio-cli runs tokenless");
+            None
+        }
+    };
     f(&sh)
 }
 

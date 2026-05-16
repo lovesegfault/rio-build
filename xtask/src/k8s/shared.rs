@@ -585,6 +585,45 @@ pub async fn port_forward(
 /// Shared by all three providers — kubectl reaches the apiserver proxy
 /// regardless of whether that's via k3s loopback or `aws eks
 /// update-kubeconfig`. ADR-019: scheduler is in rio-system, store in
+/// Fetch a Secret's data key from the rio-system namespace as raw
+/// bytes (the HMAC key is `openssl rand 32`, NOT UTF-8). `None` if
+/// the Secret or key is absent.
+pub async fn secret_bytes(name: &str, key: &str) -> Result<Option<Vec<u8>>> {
+    use ::kube::Api;
+    use k8s_openapi::api::core::v1::Secret;
+    let client = kube::client().await?;
+    let api: Api<Secret> = Api::namespaced(client, NS);
+    Ok(api
+        .get_opt(name)
+        .await?
+        .and_then(|s| s.data)
+        .and_then(|d| d.get(key).map(|v| v.0.clone())))
+}
+
+/// Write bytes to an anonymous memfd and return the held-open File.
+/// memfd not tempfile: secrets never hit disk. NO `MFD_CLOEXEC` — the
+/// rio-cli child must inherit the fd to open `/dev/fd/N`.
+pub fn bytes_to_memfd(b: &[u8]) -> Result<std::fs::File> {
+    use ::nix::sys::memfd::{MFdFlags, memfd_create};
+    use std::io::Write;
+    let fd = memfd_create(c"rio-secret", MFdFlags::empty())?;
+    let mut f = std::fs::File::from(fd);
+    f.write_all(b)?;
+    Ok(f)
+}
+
+#[cfg(test)]
+#[test]
+fn bytes_to_memfd_round_trips_via_dev_fd() {
+    // Recurrence guard for bug_022: with_cli_tunnel hands rio-cli a
+    // /dev/fd/N path to this memfd; assert the path reads back the
+    // bytes (proves NO MFD_CLOEXEC + the fd is positioned/readable).
+    use std::os::fd::AsRawFd;
+    let f = bytes_to_memfd(b"k").unwrap();
+    let path = format!("/dev/fd/{}", f.as_raw_fd());
+    assert_eq!(std::fs::read(&path).unwrap(), b"k");
+}
+
 /// rio-store — per-service `-n`. Scheduler forward targets the leader
 /// pod (from the Lease) because standbys reject admin writes.
 ///

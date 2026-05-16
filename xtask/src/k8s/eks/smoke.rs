@@ -8,15 +8,13 @@
 //!   4. port-forward gateway:22 (NLB ingress: vm-ingress-v4v6-k3s)
 //!   5. large-output build (NAR > 256 KiB → chunked S3 path → IRSA)
 
-use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use ::kube::api::{Api, ListParams};
 use anyhow::{Context, Result, bail};
-use k8s_openapi::api::core::v1::{Pod, Secret};
-use nix::sys::memfd::{MFdFlags, memfd_create};
+use k8s_openapi::api::core::v1::Pod;
 use tokio::io::AsyncReadExt;
 use tracing::{debug, info};
 
@@ -75,29 +73,16 @@ impl CliCtx {
         // passed — use what kubectl actually bound, not the request.
         let (sched, store) = (guards.0.0, guards.1.0);
 
-        // Raw 32-byte key (openssl rand 32) — NOT UTF-8, so fetch
-        // bytes directly rather than via `kube::get_secret_key`.
-        let secrets: Api<Secret> = Api::namespaced(client.clone(), NS);
-        let hmac_key_fd = match secrets.get_opt("rio-service-hmac").await? {
-            Some(s) => {
-                let key = s
-                    .data
-                    .and_then(|d| d.get("service-hmac.key").map(|v| v.0.clone()))
-                    .context("Secret rio-service-hmac missing key 'service-hmac.key'")?;
-                // memfd_create(2): key only ever lives in anonymous
-                // RAM. NO MFD_CLOEXEC — the rio-cli child must inherit
-                // the fd to open /dev/fd/N. `HmacSigner::load` reads
-                // via `std::fs::read`, which works on /dev/fd paths.
-                let fd = memfd_create(c"rio-service-hmac", MFdFlags::empty())?;
-                let mut f = std::fs::File::from(fd);
-                f.write_all(&key)?;
-                Some(f)
-            }
-            None => {
-                debug!("Secret rio-service-hmac not found — rio-cli runs tokenless");
-                None
-            }
-        };
+        // Raw 32-byte key (openssl rand 32) — NOT UTF-8. Same
+        // secret-fetch + memfd path as `with_cli_tunnel` (mod.rs).
+        let _ = client; // kube client now created inside secret_bytes
+        let hmac_key_fd = crate::k8s::shared::secret_bytes("rio-service-hmac", "service-hmac.key")
+            .await?
+            .map(|b| crate::k8s::shared::bytes_to_memfd(&b))
+            .transpose()?;
+        if hmac_key_fd.is_none() {
+            debug!("Secret rio-service-hmac not found — rio-cli runs tokenless");
+        }
 
         Ok(Self {
             _guards: guards,
