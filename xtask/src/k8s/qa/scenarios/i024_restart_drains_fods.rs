@@ -22,7 +22,7 @@ impl Scenario for RestartDrainsFods {
             id: "i024-restart-drains-fods",
             i_ref: Some(24),
             isolation: Isolation::Exclusive {
-                mutates: &[Component::Scheduler, Component::FetcherPool],
+                mutates: &[Component::Scheduler, Component::Fetchers],
             },
             // +90s budget for phase2_settle_after_kill
             timeout: Duration::from_secs(330),

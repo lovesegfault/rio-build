@@ -891,7 +891,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     //
     // 10 attempts = 1+2+4+8+16 + 5×16 = 111s total. 5 attempts
     // (=31s) was too tight: a force-killed leader's REPLACEMENT pod
-    // needs ~20-30s (start + mTLS cert mount + lease acquire on 5s
+    // needs ~20-30s (start + lease acquire on 5s
     // tick). Found by vm-le-build-k3s under the replacement-wins-race
     // path — standby-wins was fast enough to mask it.
     // r[impl gw.reconnect.backoff]

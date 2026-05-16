@@ -283,9 +283,9 @@ const FIELD_RE: &str = r"(?m)^\s*pub\s+(?:r#)?(\w+)\s*:";
 fn cli() -> Result<serde_json::Value> {
     // rio-cli's `#[derive(Subcommand)]` enum variants → kebab-case
     // subcommand names (clap's default rename). Runbooks cite these
-    // ~55× (R4-024 `bps`, R6-011 `trigger-gc` were stale). Nested
-    // subcommands (pool/sla/upstream sub-enums) are NOT scraped this
-    // round — `refs.cli-sub` validates top-level only.
+    // ~55×; two were found stale (R4-024, R6-011). Nested subcommands
+    // (pool/sla/upstream sub-enums) are NOT scraped this round —
+    // `refs.cli-sub` validates top-level only.
     use heck::ToKebabCase;
     let body = fs::read_to_string(repo_root().join("rio-cli/src/main.rs"))?;
     let block = Regex::new(r"(?ms)^#\[derive\(Subcommand[^\)]*\)\]\s*.*?^enum\s+\w+\s*\{(.*?)^\}")?

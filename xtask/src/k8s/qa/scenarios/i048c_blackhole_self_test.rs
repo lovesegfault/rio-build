@@ -28,7 +28,7 @@ impl Scenario for BlackholeSelfTest {
             id: "i048c-blackhole-self-test",
             i_ref: Some(48),
             isolation: Isolation::Exclusive {
-                mutates: &[Component::Scheduler, Component::BuilderPool],
+                mutates: &[Component::Scheduler, Component::Builders],
             },
             timeout: Duration::from_secs(240),
         }

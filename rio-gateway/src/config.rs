@@ -89,7 +89,7 @@ pub struct Config {
     /// HMAC key file for minting `x-rio-service-token` on store
     /// `PutPath`. SAME file as the store's `service_hmac_key_path`
     /// (separate secret from the assignment-token key). Unset =
-    /// service-token disabled (store falls back to mTLS CN-allowlist
+    /// service-token disabled (store runs unsigned dev-mode
     /// or rejects). Set via `RIO_SERVICE_HMAC_KEY_PATH`.
     pub service_hmac_key_path: Option<std::path::PathBuf>,
     /// Global SSH connection cap (`r[gw.conn.cap]`). At cap, new

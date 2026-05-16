@@ -805,7 +805,7 @@
           #
           #   vm-protocol-{warm,cold}-standalone — 3 VMs: opcode coverage
           #   vm-scheduling-{core,disrupt}-standalone — 5 VMs: fanout, resource-floor, cgroup
-          #   vm-security-standalone — 3 VMs: mTLS, HMAC, tenant-resolve
+          #   vm-security-standalone — 3 VMs: HMAC, JWT, tenant-resolve
           #   vm-observability-standalone — 5 VMs: metrics, traces, logs
           #   vm-ca-cutoff-standalone — CA-on-CA cutoff propagation
           #   vm-chaos-standalone — fault injection

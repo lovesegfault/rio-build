@@ -356,7 +356,7 @@ impl StoreServiceImpl {
     /// it as a `Sig:` line without ever touching the privkey.
     ///
     /// `tenant_id` comes from JWT `Claims.sub` (P0259 interceptor). `None`
-    /// means: no JWT (dual-mode fallback), OR mTLS bypass (gateway cert,
+    /// means: no JWT (dual-mode fallback), OR dev-mode (no service-token) (gateway cert,
     /// `nix copy` path — no per-build attribution), OR dev mode (no
     /// interceptor). All three correctly fall through to cluster key.
     ///

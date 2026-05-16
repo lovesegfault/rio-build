@@ -63,7 +63,7 @@ k3sFull (
     // extraValues;
     # dockerImages.vmTestSeed covers rio-{gateway,scheduler,store,
     # controller,builder} but NOT rio-bootstrap (k3s-full.nix —
-    # "fod-proxy/bootstrap excluded"). Without this preload the Job pod goes
+    # "bootstrap excluded"). Without this preload the Job pod goes
     # ImagePullBackOff (airgapped — no registry to pull from).
     extraImages = [ dockerImages.bootstrap ] ++ extraImages;
   }

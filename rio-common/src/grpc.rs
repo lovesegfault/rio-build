@@ -70,7 +70,7 @@ pub const ASSIGNMENT_TOKEN_HEADER: &str = "x-rio-assignment-token";
 
 /// Service-identity HMAC token. Minted by trusted control-plane callers
 /// (gateway) on `PutPath`; the store verifies it as the HMAC-bypass
-/// condition. Transport-agnostic replacement for the mTLS CN-allowlist.
+/// condition. Transport-agnostic replacement for the service-HMAC token.
 /// See `rio_auth::hmac::ServiceClaims`.
 pub const SERVICE_TOKEN_HEADER: &str = "x-rio-service-token";
 

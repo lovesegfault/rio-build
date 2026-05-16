@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
     // log don't break up the builder calls below. Wrap the cluster
     // Signer in a TenantSigner — per-tenant key lookup hits
     // `tenant_keys` on the same PG pool. Paths without tenant
-    // attribution (mTLS bypass, dev mode) fall through to the cluster
+    // attribution (dev-mode (no service-token), dev mode) fall through to the cluster
     // key inside resolve_once (via maybe_sign).
     let tenant_signer = match signer {
         Some(s) => {

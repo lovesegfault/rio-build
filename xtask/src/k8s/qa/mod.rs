@@ -157,8 +157,8 @@ pub enum Component {
     Store,
     Gateway,
     Controller,
-    BuilderPool,
-    FetcherPool,
+    Builders,
+    Fetchers,
     Postgres,
     S3,
 }

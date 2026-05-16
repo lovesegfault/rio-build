@@ -213,9 +213,9 @@ buildScheduler:
 # ──────────────────────────────────────────────────────────────────────────
 # rio-store
 # ──────────────────────────────────────────────────────────────────────────
-# PG + S3/inline chunk storage. replicas=1: stateless at runtime but
-# concurrent migrations from multiple replicas would race. Add a
-# migration-lock mechanism before scaling horizontally.
+# PG + S3/inline chunk storage. replicas=1 by default; multi-replica
+# is safe — startup migrations serialize via pg_try_advisory_lock
+# (r[store.db.migrate-try-lock]).
 store:
   enabled: true
   image: rio-store

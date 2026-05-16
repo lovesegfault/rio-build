@@ -265,7 +265,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
             extra_roots: req.extra_roots,
         };
 
-        rio_common::task::spawn_monitored("admin-trigger-gc", async move {
+        rio_common::task::spawn_monitored("admin-gc", async move {
             if let Err(e) = gc::run_gc(&pool, chunk_backend, params, tx.clone(), &shutdown).await {
                 // run_gc already warn!-logged the detail. Forward
                 // the terminal Err into the stream so the client's

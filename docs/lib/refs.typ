@@ -116,8 +116,8 @@
     assert(kind in _crds.kinds, message: "unknown CRD kind: " + kind)
     raw(kind)
   },
-  // rio-cli top-level subcommand. Runbooks cite ~55× (`trigger-gc` and
-  // `bps` were stale). Nested subcommands not validated this round.
+  // rio-cli top-level subcommand. Runbooks cite ~55×; two found stale
+  // (R4-024, R6-011). Nested subcommands not validated this round.
   cli-sub: name => {
     assert(
       name in _cli.subcommands,

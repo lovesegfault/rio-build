@@ -24,7 +24,7 @@ impl Scenario for DrainReachesLeader {
             id: "i046-drain-reaches-leader",
             i_ref: Some(46),
             isolation: Isolation::Exclusive {
-                mutates: &[Component::BuilderPool, Component::Scheduler],
+                mutates: &[Component::Builders, Component::Scheduler],
             },
             timeout: Duration::from_secs(180),
         }

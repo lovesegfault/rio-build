@@ -12,7 +12,7 @@
 //! allowed. Re-scan on every completion.
 //!
 //! The read set exists because `mutates` only captures destruction:
-//! i024 kills the scheduler leader (`mutates: [Scheduler, FetcherPool]`)
+//! i024 kills the scheduler leader (`mutates: [Scheduler, Fetchers]`)
 //! while i039 (`mutates: [Store]`) and i040 (`mutates: [S3, Postgres]`)
 //! had disjoint write sets and ran concurrently — but both *submit*
 //! builds, so they hit the leader transition and saw a false-positive
@@ -407,7 +407,7 @@ mod tests {
     }
 
     /// The cluster-A regression this module fixes: i024 kills the
-    /// scheduler leader (`mutates: [Scheduler, FetcherPool]`); i039
+    /// scheduler leader (`mutates: [Scheduler, Fetchers]`); i039
     /// (`mutates: [Store]`) and i040 (`mutates: [S3, Postgres]`) have
     /// disjoint write sets but both submit builds, so they read
     /// `Scheduler`. Pre-fix the greedy scheduler ran all three at

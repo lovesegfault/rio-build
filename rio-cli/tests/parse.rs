@@ -120,7 +120,7 @@ fn per_subcommand_help_renders() {
         let out = run_cli(&[sub, "--help"]);
         assert!(out.status.success(), "{sub} --help: {:?}", out.status);
     }
-    // bps has nested subcommands — check both levels.
+    // pool has nested subcommands — check both levels.
     for sub in [
         &["pool", "--help"][..],
         &["pool", "get", "--help"],
@@ -186,7 +186,7 @@ fn per_subcommand_help_renders() {
 #[case::drain_min(&["drain-executor", "builder-0"], true)]
 #[case::drain_force(&["drain-executor", "builder-0", "--force"], true)]
 #[case::drain_missing_id(&["drain-executor"], false)]
-// bps: nested. get has default namespace; describe needs a name; bare errors.
+// pool: nested. get has default namespace; describe needs a name; bare errors.
 #[case::pool_get_default_ns(&["pool", "get"], true)]
 #[case::pool_get_ns(&["pool", "get", "-n", "rio-system"], true)]
 #[case::pool_describe(&["pool", "describe", "my-pool"], true)]

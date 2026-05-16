@@ -3,7 +3,8 @@
 #
 # networkPolicy.enabled=true (via extraValues in default.nix) renders
 # infra/helm/rio-build/templates/networkpolicy.yaml → rio-builder-egress
-# policy (allows DNS + scheduler:9001 + store:9002 + fod-proxy:3128 ONLY).
+# policy (allows DNS + scheduler:9001 + store:9002 ONLY; fetcher egress is open
+# per r[fetcher.netpol.egress-open]).
 # Cilium enforces (eBPF; --disable-network-policy in the fixture turns
 # off k3s's bundled kube-router so Cilium is the sole policy engine).
 #

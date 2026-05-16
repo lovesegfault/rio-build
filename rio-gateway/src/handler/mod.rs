@@ -91,7 +91,7 @@ pub(crate) fn jwt_metadata(jwt_token: Option<&str>) -> Vec<(&'static str, &str)>
 /// `signer` is keyed with `RIO_SERVICE_HMAC_KEY_PATH` (NOT the
 /// assignment key). Mints fresh per call (`expiry = now + 60s`) —
 /// HMAC-SHA256 over ~50 bytes is sub-µs, no caching needed. No-op when
-/// `signer` is `None` (dev mode; store falls back to mTLS CN-allowlist
+/// `signer` is `None` (dev mode; store runs unsigned dev-mode
 /// or rejects).
 pub(crate) fn attach_service_token<T>(
     req: &mut tonic::Request<T>,
@@ -338,7 +338,7 @@ pub struct SessionContext {
     /// Service-identity HMAC signer keyed with
     /// `RIO_SERVICE_HMAC_KEY_PATH`. Attached as `x-rio-service-token`
     /// on store `PutPath` calls so the store grants HMAC bypass
-    /// without relying on mTLS peer certs. `None` = disabled (dev
+    /// without relying on service tokens. `None` = disabled (dev
     /// mode). `Arc` because the spawned tasks in
     /// `handle_add_multiple_to_store` need an owned clone.
     pub service_signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,

@@ -109,7 +109,7 @@ impl StoreSession {
     }
 
     /// Store with HMAC verifier enabled. PutPath requires a valid
-    /// `x-rio-assignment-token` header unless peer is mTLS-identified
+    /// `x-rio-assignment-token` header unless dev-mode (no verifier)
     /// as rio-gateway. For testing the assignment-token enforcement.
     pub async fn new_with_hmac(key: Vec<u8>) -> anyhow::Result<Self> {
         let verifier = rio_auth::hmac::HmacVerifier::from_key(key);

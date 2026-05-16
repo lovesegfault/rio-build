@@ -1,7 +1,7 @@
 //! I-086: a Pool reconcile failure must be LOUD — `WARN` log +
 //! `rio_controller_reconcile_errors_total` increment, not silent.
 //!
-//! Original symptom: FetcherPool stuck `READY 0` for 22min with zero
+//! Original symptom: Fetchers stuck `READY 0` for 22min with zero
 //! controller log lines mentioning it. The error_policy on its
 //! Controller builder swallowed the error.
 //!

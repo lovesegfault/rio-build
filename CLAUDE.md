@@ -197,7 +197,7 @@ See `.claude/rules/protocol-wire.md` (loads when editing `rio-gateway/src/**` or
 When adding metrics or tracing, verify end-to-end — don't just initialize the exporter:
 
 - Metrics are actually **registered** (not just the exporter)
-- Metric names match `observability.md` naming conventions (`rio_{component}_`)
+- Metric names match `observability.typ` naming conventions (`rio_{component}_`)
 - Gauges are decremented on cleanup (connection close, session end)
 - Default log format is JSON, not pretty-printed
 - Handlers have `#[instrument]` spans with meaningful fields

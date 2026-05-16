@@ -184,7 +184,7 @@ impl Config {
     /// Connect to the scheduler's `AdminService`. Called once for the
     /// admin-dispatch arm of `main()`; non-admin subcommands (kube /
     /// store / SchedulerService) are matched first so they never `?`
-    /// on an unreachable scheduler — `rio-cli bps describe` must work
+    /// on an unreachable scheduler — `rio-cli pool describe` must work
     /// when the scheduler is down (e.g., to diagnose why).
     pub(crate) async fn connect_admin(&self) -> anyhow::Result<AdminClient> {
         let ch = rio_proto::client::connect_channel(&self.scheduler_addr)
@@ -372,7 +372,7 @@ async fn main() -> anyhow::Result<()> {
     // and have working defaults, so they run unconditionally even for
     // kube-only subcommands that ignore them. gRPC CONNECT is per-arm
     // (see `Config::connect_admin` / `connect_store_admin`) — that's
-    // the part that must not gate `bps` / `upstream` on an unreachable
+    // the part that must not gate `pool` / `upstream` on an unreachable
     // scheduler.
     let cfg: Config = rio_common::config::load("cli", cli)?;
     {

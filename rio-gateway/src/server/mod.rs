@@ -208,7 +208,7 @@ impl GatewayServer {
 
     /// Enable `x-rio-service-token` minting on store `PutPath`. Until
     /// called, write opcodes attach no service token (store falls back
-    /// to mTLS CN-allowlist or rejects). Builder-style.
+    /// to service-HMAC token or rejects). Builder-style.
     pub fn with_service_hmac_signer(mut self, signer: rio_auth::hmac::HmacSigner) -> Self {
         self.service_signer = Some(Arc::new(signer));
         self

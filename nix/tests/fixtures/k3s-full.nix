@@ -106,9 +106,8 @@ in
   # lifecycle.nix passes autoscaler tuning (pollSecs=3 etc).
   extraValues ? { },
   # Extra images for the airgap set. dockerImages.vmTestSeed covers every
-  # rio-* component but NOT squid (dockerImages.fod-proxy is a separate
-  # image). Scenarios that enable fodProxy.enabled=true need the squid
-  # image preloaded or the pod goes ImagePullBackOff (airgapped — no pull).
+  # rio-* component. Scenarios needing additional images (e.g. bootstrap)
+  # preload them here or the pod goes ImagePullBackOff (airgapped — no pull).
   extraImages ? [ ],
   # JWT pubkey mount — scheduler+store get the rio-jwt-pubkey ConfigMap
   # mounted at /etc/rio/jwt; gateway gets the rio-jwt-signing Secret.
@@ -210,8 +209,8 @@ let
 
   # ── Airgap image set ────────────────────────────────────────────────
   # Same list on BOTH nodes — pods land on either via scheduler whims
-  # (especially scheduler.replicas=2 antiAffinity). fod-proxy/bootstrap
-  # excluded (disabled in vmtest-full.yaml).
+  # (especially scheduler.replicas=2 antiAffinity). bootstrap excluded
+  # (disabled in vmtest-full.yaml).
   #
   # vmTestSeed is ONE multi-manifest oci-archive (rio-<component>:dev
   # refs, blob-deduped layers). k3s imports serially before kubelet — one
@@ -245,8 +244,8 @@ let
   # kubelet's imagefs.available hard-eviction threshold is 5% — at
   # 95%+ it EVICTS pods, and evicted pod carcasses linger in `kubectl
   # get pods` (status.phase=Failed reason=Evicted) breaking any wait
-  # that polls for pods-gone. Observed: rio-fod-proxy.tar.zst (squid
-  # + cyrus-sasl + openldap + ~15 deps) decompresses to ~800MB, pushed
+  # that polls for pods-gone. Observed: a since-removed squid image
+  # (cyrus-sasl + openldap + ~15 deps) decompresses to ~800MB, pushed
   # the 3G tmpfs to 90%+ → kubelet evicted rio-controller then
   # rio-gateway mid-waitReady.
   #
