@@ -124,10 +124,10 @@ let
   # crate2nix-built xtask binary's compile-time CARGO_MANIFEST_DIR is a
   # store path, so RIO_REPO_ROOT points it at the runCommand src tree.
   #
-  # Fileset is the minimal scan surface — rio-*/src/*.rs (read_dir scan
-  # needs the rio-* dir level to exist) + the four non-.rs files the
-  # emitters read (prometheusrule.yaml, values.yaml, root + xtask
-  # Cargo.toml). Other Cargo.tomls / test files still don't rebuild.
+  # Fileset is the minimal scan surface: rio-*/src/*.rs, every
+  # Cargo.toml (workspace() reads each member's [package].description
+  # + [dependencies]/[dev-dependencies]/[target.*] for the full crate
+  # graph), and the two helm files alerts()/helm_ns() read.
   docsData =
     pkgs.runCommand "rio-docs-data"
       {
@@ -139,10 +139,9 @@ let
           root = ../.;
           fileset = lib.fileset.unions [
             (lib.fileset.fileFilter (f: f.hasExt "rs") ../.)
+            (lib.fileset.fileFilter (f: f.name == "Cargo.toml") ../.)
             ../infra/helm/rio-build/templates/prometheusrule.yaml
             ../infra/helm/rio-build/values.yaml # helm_ns()
-            ../Cargo.toml # workspace()
-            ../xtask/Cargo.toml # workspace() xtask_deps
           ];
         };
       }
