@@ -155,9 +155,9 @@ echo "After disconnects: $DISCONNECTS_AFTER"
 
 = Step 7: GC Test (optional)
 
+Trigger GC via `rio-cli `#(refs.cli-sub)("gc") over a port-forward (dry run first):
 ```bash
-# Trigger GC via rio-cli over a port-forward (dry run first)
-cargo xtask k8s cli -p eks -- trigger-gc --dry-run --grace-period-hours 2
+cargo xtask k8s cli -p eks -- gc --dry-run --grace-hours 2
 ```
 
 = Cleanup
