@@ -4,9 +4,9 @@
 = rio-cli
 
 Admin CLI for rio-build. Thin wrapper over `AdminService` (scheduler) and
-`StoreAdminService` (store) gRPC. Not packaged as a separate image --- the
-binary is bundled into the scheduler container so the operator path is
-`kubectl exec deploy/rio-scheduler -- rio-cli …`.
+`StoreAdminService` (store) gRPC. Run locally via
+`cargo xtask k8s cli -- <cmd>` (port-forwards + service-HMAC key fetch). NOT
+bundled into control-plane images (#rref("sec.image.control-plane-minimal")).
 
 == Connection model
 

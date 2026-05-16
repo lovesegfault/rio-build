@@ -623,7 +623,7 @@ unique chunks.
 
 #memo(title: [Future work])[
   Cluster key rotation history and per-tenant signing keys are intended to be
-  manageable via a `rio-cli keys` subcommand (validating
+  manageable via a future `keys` subcommand (validating
   `name:base64(32-byte-ed25519-pubkey)` format before INSERT; retirement sets
   `retired_at` to preserve the audit trail). Until that lands, manual `psql` is
   the workflow --- load-time checks (#rref("store.key.rotation-cluster-history"))

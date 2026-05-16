@@ -6,13 +6,13 @@
 For build submission from within the cluster or automation, use the `SubmitBuild` RPC directly:
 
 ```bash
-# Via rio-cli (preferred for scripts)
-rio-cli submit /nix/store/abc...-hello.drv --priority 50 --timeout 7200 --tenant ci-team
-
 # Via grpcurl (low-level)
 grpcurl -plaintext -d '{"derivations": [{"drv_path": "/nix/store/abc...-hello.drv"}], "priority": 50}' \
   rio-scheduler:50051 rio.scheduler.SchedulerService/SubmitBuild
 ```
+
+(rio-cli has no `submit` subcommand --- use `nix build --store ssh-ng://…` for
+the canonical client path, or `grpcurl` as above for raw RPC.)
 
 Note: The derivation must be a valid #gls("store-path"). Evaluation is external to rio-build (see #cross-link("/intro.typ")[Non-Goals]). The `.drv` file must already exist in rio-store (uploaded via `wopAddToStoreNar` through a gateway session or `nix copy`).
 

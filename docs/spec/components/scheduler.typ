@@ -231,7 +231,7 @@ any critical-path value).
   process) are not the build's fault. `TransientFailure` (build ran, exited
   non-zero, might succeed elsewhere) DOES count. Executor disconnect DOES count
   --- a build that crashes the daemon 3× is poisoned; false-positives from
-  unrelated executor deaths are cleared by `rio-cli poison clear`. Both knobs
+  unrelated executor deaths are cleared by `rio-cli poison-clear`. Both knobs
   are configurable via `scheduler.toml`: `threshold` (default 3, the former
   `POISON_THRESHOLD` const), `require_distinct_workers` (default true ---
   HashSet semantics; false = any N failures poison, for single-executor dev
