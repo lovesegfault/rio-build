@@ -227,10 +227,20 @@ builders or other components --- it watches CRDs and reconciles desired state.
     ))
   })
 }
-#let flow-diagram(factor: _flow-scale, body) = block(
-  width: 100%,
-  align(left, scale(factor, reflow: true, origin: top + left, body)),
-)
+// block(width: 100%) is paged-only — inside html.frame()'s paged
+// sub-context there's no container width, so 100% → 0pt → zero-width
+// SVG (QA #1). is-html-target() (compile-global, NOT context-lazy
+// shiroa-sys-target which would evaluate to "paged" inside html.frame)
+// gates the wrapper; html mode emits bare scale() for intrinsic width
+// and frame-figure's .rio-figure CSS handles centering.
+#let flow-diagram(factor: _flow-scale, body) = if is-html-target() {
+  scale(factor, reflow: true, origin: top + left, body)
+} else {
+  block(
+    width: 100%,
+    align(left, scale(factor, reflow: true, origin: top + left, body)),
+  )
+}
 #let flow-notes-web(..items) = context if not _is-paged() {
   info(title: [Flow notes])[#list(..items.pos())]
 }

@@ -122,13 +122,23 @@
   kind: "algorithm",
   supplement: [Algorithm],
   caption: caption,
-  block(
-    width: 100%,
-    stroke: (y: 0.6pt + rule-color),
-    inset: (y: 0.6em),
-    breakable: true,
-    pseudocode-list(booktabs: false, indentation: 1.4em, body),
-  ),
+  // The block(width: 100%) wrapper is paged-only — inside
+  // html.frame()'s paged sub-context there's no container width, so
+  // 100% → 0pt → zero-width SVG (QA #1). is-html-target() is
+  // compile-global (NOT context-lazy shiroa-sys-target which would
+  // evaluate to "paged" inside html.frame); frame-figure supplies a
+  // fixed-width box for kind:"algorithm" instead.
+  if is-html-target() {
+    pseudocode-list(booktabs: false, indentation: 1.4em, body)
+  } else {
+    block(
+      width: 100%,
+      stroke: (y: 0.6pt + rule-color),
+      inset: (y: 0.6em),
+      breakable: true,
+      pseudocode-list(booktabs: false, indentation: 1.4em, body),
+    )
+  },
 )
 
 // Right-aligned italic annotation for pseudocode lines.
@@ -560,10 +570,18 @@
       // whose grid() would otherwise warn). Selectable text matters
       // less for these than for code/callouts.
       let frame-figure = fig => context if shiroa-sys-target() == "html" {
+        // 560pt ≈ 746px (mdbook --content-max-width is 750px). Only
+        // algorithms get a fixed-width box — they never exceed the
+        // column and benefit from fill width. Diagrams (kind: image)
+        // stay intrinsic so wide autograph/fletcher (1500pt+) aren't
+        // clipped; .rio-figure CSS handles overflow scroll. QA #1/#4.
+        let body = if fig.kind == "algorithm" {
+          box(width: 560pt, fig.body)
+        } else { fig.body }
         html.elem("figure", attrs: (class: "rio-figure"), {
           _theme-frame(tag: "div", theme => {
             set text(fill: theme.main-color)
-            html.elem("div", html.frame(fig.body))
+            html.elem("div", html.frame(body))
           })
           if fig.caption != none {
             html.elem("figcaption", fig.caption)
