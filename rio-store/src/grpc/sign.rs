@@ -356,8 +356,10 @@ impl StoreServiceImpl {
     /// it as a `Sig:` line without ever touching the privkey.
     ///
     /// `tenant_id` comes from JWT `Claims.sub` (P0259 interceptor). `None`
-    /// means: no JWT (dual-mode fallback), OR dev-mode (no service-token) (gateway cert,
-    /// `nix copy` path — no per-build attribution), OR dev mode (no
+    /// means: no JWT (dual-mode fallback), OR service-token caller
+    /// (gateway `nix copy` — no per-build attribution; see
+    /// [`crate::grpc::StoreServiceImpl::verify_assignment_token`]),
+    /// OR dev mode (no
     /// interceptor). All three correctly fall through to cluster key.
     ///
     /// Async because tenant-key resolution hits PG for the `tenant_keys`

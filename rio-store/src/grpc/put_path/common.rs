@@ -138,8 +138,10 @@ pub(in crate::grpc) fn validate_put_metadata(
     // server-derived.
     info.store_path_hash = info.store_path.sha256_digest().to_vec();
 
-    // Step 6: HMAC path-in-claims check. None = verifier disabled OR
-    // dev-mode (no service-token) (gateway) → no check. Floating-CA (claims.is_ca) →
+    // Step 6: HMAC path-in-claims check. `None` (verifier disabled OR
+    // service-token bypass — see `StoreServiceImpl::
+    // verify_assignment_token`) → no path-membership check.
+    // Floating-CA (claims.is_ca) →
     // skip the membership check here: the output path is computed
     // post-build from the NAR hash, so expected_outputs is [""] at
     // sign time. Authorization for the CA case is enforced by
@@ -349,8 +351,9 @@ pub(in crate::grpc) use crate::ingest::PlaceholderGuard;
 impl StoreServiceImpl {
     // r[impl sec.boundary.grpc-hmac]
     /// HMAC token verify + JWT tenant extraction. Shared step-0 of the
-    /// write-ahead flow. See [`Self::verify_assignment_token`] for the
-    /// HMAC verifier semantics (dev-mode/dev-mode/token paths).
+    /// write-ahead flow (see
+    /// [`StoreServiceImpl::verify_assignment_token`] for the
+    /// `Ok(None)` cases).
     ///
     /// Distinct claim types — don't confuse them:
     /// - `hmac::AssignmentClaims`: worker_id + drv_hash +
@@ -360,8 +363,10 @@ impl StoreServiceImpl {
     ///   WHOSE tenant key signs the narinfo. Per-session.
     ///
     /// `tenant_id = None` covers: no interceptor wired (dev mode), no
-    /// `x-rio-tenant-token` header (dual-mode fallback), or dev-mode (no service-token)
-    /// (gateway cert) — all cluster-key-correct.
+    /// `x-rio-tenant-token` header (dual-mode fallback), or
+    /// service-token caller (gateway — no per-build assignment token;
+    /// see [`StoreServiceImpl::verify_assignment_token`]) — all
+    /// cluster-key-correct.
     pub(in crate::grpc) fn authorize<T>(&self, request: &Request<T>) -> Result<PutAuth, Status> {
         let hmac_claims = self.verify_assignment_token(request)?;
         let tenant_id = request

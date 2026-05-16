@@ -55,8 +55,8 @@ pub trait HmacClaims: Serialize + serde::de::DeserializeOwned {
 #[serde(deny_unknown_fields)]
 pub struct AssignmentClaims {
     /// Worker the assignment was for. Not checked on verify (the store
-    /// doesn't know which worker is calling — service-HMAC identifies the caller
-    /// but not the pod name), but useful for audit logs.
+    /// has no transport-level worker identity, so this field is the
+    /// only attribution). Audit-only — not authz.
     pub executor_id: String,
     /// Derivation hash. Ties the token to a specific build; a worker
     /// can't reuse one derivation's token for another.

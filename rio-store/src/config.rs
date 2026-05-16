@@ -90,8 +90,9 @@ pub struct Config {
     pub jwt: rio_common::config::JwtConfig,
     /// HMAC key file for verifying `x-rio-service-token` on PutPath.
     /// SEPARATE from `hmac_key_path` (different secret). Unset =
-    /// service-token bypass disabled (gateway runs unsigned dev-mode
-    /// CN-allowlist). Set via `RIO_SERVICE_HMAC_KEY_PATH`.
+    /// service-token bypass unavailable; gateway PutPath rejected
+    /// unless `hmac_key_path` is also unset (full dev-mode). Set via
+    /// `RIO_SERVICE_HMAC_KEY_PATH`.
     pub service_hmac_key_path: Option<PathBuf>,
     /// `ServiceClaims.caller` values whose `x-rio-service-token` is
     /// honoured (PutPath HMAC-bypass and `x-rio-probe-tenant-id` gate).

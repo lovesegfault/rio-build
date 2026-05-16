@@ -52,13 +52,18 @@ async fn drain_stream(stream: &mut Streaming<PutPathRequest>) {
 }
 
 impl StoreServiceImpl {
-    /// Verify the `x-rio-assignment-token` metadata header.
-    ///
-    /// Returns:
-    /// - `Ok(None)` if verifier disabled (dev mode) → no check
-    /// - `Ok(None)` if service-token bypass (caller in allowlist) → no check
-    /// - `Ok(Some(claims))` if assignment token valid → caller checks path ∈ claims
-    /// - `Err(PERMISSION_DENIED)` if token missing/invalid/expired
+    /// HMAC assignment-token gate. Returns:
+    /// - `Ok(Some(claims))` — valid `x-rio-assignment-token`; caller
+    ///   checks the requested path ∈ `claims.expected_outputs`.
+    /// - `Ok(None)` — TWO distinct reasons (callers must NOT restate;
+    ///   cite this fn instead — R7-m001 found 5 divergent restatements):
+    ///     1. **dev-mode**: `hmac_verifier` unset → accept all.
+    ///     2. **service-token bypass**: valid `x-rio-service-token`
+    ///        whose `caller` ∈ `service_bypass_callers`
+    ///        (gateway/scheduler) → no per-build assignment token
+    ///        required.
+    /// - `Err(PERMISSION_DENIED)` — token missing/invalid/expired, or
+    ///   service-token caller not allowlisted.
     pub(super) fn verify_assignment_token<T>(
         &self,
         request: &Request<T>,

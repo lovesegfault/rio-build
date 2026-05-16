@@ -337,8 +337,8 @@ pub struct SessionContext {
     pub jwt: SessionJwt,
     /// Service-identity HMAC signer keyed with
     /// `RIO_SERVICE_HMAC_KEY_PATH`. Attached as `x-rio-service-token`
-    /// on store `PutPath` calls so the store grants HMAC bypass
-    /// without relying on service tokens. `None` = disabled (dev
+    /// on store `PutPath` calls so the store grants the service-token
+    /// bypass on PutPath. `None` = disabled (dev
     /// mode). `Arc` because the spawned tasks in
     /// `handle_add_multiple_to_store` need an owned clone.
     pub service_signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,

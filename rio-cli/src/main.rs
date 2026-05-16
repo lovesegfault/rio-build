@@ -223,8 +223,7 @@ impl Config {
 }
 
 // rio-cli's CLI surface is the subcommand enum; the cross-cutting
-// flags are `--scheduler-addr` and `--json`. TLS is env-only
-// sets it via env anyway and three cert-path flags would clutter --help.
+// flags are `--scheduler-addr` and `--json`.
 #[derive(Parser, Serialize, Default)]
 #[command(name = "rio-cli", about = "Admin CLI for rio-build")]
 struct CliArgs {
@@ -368,7 +367,7 @@ async fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no subcommand given (try --help)"))?;
     let as_json = cli.json;
 
-    // Config load + TLS init are local-only (env/file read, no network)
+    // Config load is local-only (env/file read, no network)
     // and have working defaults, so they run unconditionally even for
     // kube-only subcommands that ignore them. gRPC CONNECT is per-arm
     // (see `Config::connect_admin` / `connect_store_admin`) — that's
