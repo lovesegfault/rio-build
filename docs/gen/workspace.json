@@ -194,7 +194,7 @@
       "name": "rio-crds"
     },
     {
-      "description": "",
+      "description": "Dev/ops tooling: codegen, local cluster lifecycle, AMI build, helm/k8s helpers",
       "name": "xtask"
     }
   ]

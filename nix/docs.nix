@@ -160,6 +160,7 @@ let
         test "$(jq 'keys|length' $out/consts.json)" -gt 0
         test "$(jq 'keys|length' $out/helm-ns.json)" -eq 4
         test "$(jq 'keys|length' $out/modules.json)" -gt 10
+        test "$(jq '.subcommands|length' $out/cli.json)" -gt 10
       '';
 
   # `--input` pairs both targets must see. Factored so the PDF and

@@ -1,0 +1,21 @@
+{
+  "subcommands": [
+    "create-tenant",
+    "delete-tenant",
+    "list-tenants",
+    "status",
+    "workers",
+    "builds",
+    "derivations",
+    "logs",
+    "gc",
+    "poison-clear",
+    "poison-list",
+    "cancel-build",
+    "drain-executor",
+    "pool",
+    "sla",
+    "verify-chunks",
+    "upstream"
+  ]
+}

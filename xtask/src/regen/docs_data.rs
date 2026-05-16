@@ -75,8 +75,9 @@ pub async fn run() -> Result<()> {
     write(&out, "helm-ns.json", &helm_ns()?)?;
     write(&out, "crds.json", &crds()?)?;
     write(&out, "modules.json", &modules()?)?;
+    write(&out, "cli.json", &cli()?)?;
     println!(
-        "wrote docs/gen/{{metrics,alerts,errors,config,workspace,consts,helm-ns,crds,modules}}.json"
+        "wrote docs/gen/{{metrics,alerts,errors,config,workspace,consts,helm-ns,crds,modules,cli}}.json"
     );
     Ok(())
 }
@@ -240,7 +241,7 @@ fn crds() -> Result<serde_json::Value> {
     // without cargo so no kube-rs introspection.
     let kind_re = Regex::new(r#"kind\s*=\s*"(\w+)""#)?;
     let spec_re = Regex::new(r"(?ms)^pub struct (\w+)Spec\s*\{(.*?)^\}")?;
-    let field_re = Regex::new(r"(?m)^\s*pub\s+(\w+)\s*:")?;
+    let field_re = Regex::new(FIELD_RE)?;
     let mut kinds = BTreeSet::new();
     let mut fields = BTreeMap::<String, Vec<String>>::new();
     for entry in fs::read_dir(repo_root().join("rio-crds/src"))? {
@@ -264,17 +265,38 @@ fn crds() -> Result<serde_json::Value> {
             );
             let fs: Vec<_> = field_re
                 .captures_iter(&s[2])
-                .map(|c| {
-                    c[1].strip_prefix("r#")
-                        .unwrap_or(&c[1])
-                        .trim_end_matches('_')
-                        .to_lower_camel_case()
-                })
+                .map(|c| c[1].trim_end_matches('_').to_lower_camel_case())
                 .collect();
             fields.insert(kind, fs);
         }
     }
     Ok(json!({"kinds": kinds.into_iter().collect::<Vec<_>>(), "fields": fields}))
+}
+
+/// `pub <ident>:` field, raw-ident-aware. `(?:r#)?` is *inside* the
+/// regex (`\w` can't span `#`), so the capture is the bare ident.
+/// bug_004: the prior `(\w+)` regex couldn't reach `r#type`; the
+/// `strip_prefix("r#")` postprocess was dead code and the test that
+/// exercised it bypassed the regex.
+const FIELD_RE: &str = r"(?m)^\s*pub\s+(?:r#)?(\w+)\s*:";
+
+fn cli() -> Result<serde_json::Value> {
+    // rio-cli's `#[derive(Subcommand)]` enum variants → kebab-case
+    // subcommand names (clap's default rename). Runbooks cite these
+    // ~55× (R4-024 `bps`, R6-011 `trigger-gc` were stale). Nested
+    // subcommands (pool/sla/upstream sub-enums) are NOT scraped this
+    // round — `refs.cli-sub` validates top-level only.
+    use heck::ToKebabCase;
+    let body = fs::read_to_string(repo_root().join("rio-cli/src/main.rs"))?;
+    let block = Regex::new(r"(?ms)^#\[derive\(Subcommand[^\)]*\)\]\s*.*?^enum\s+\w+\s*\{(.*?)^\}")?
+        .captures(&body)
+        .context("no Subcommand enum in rio-cli/src/main.rs")?[1]
+        .to_string();
+    let subs: Vec<String> = Regex::new(r"(?m)^\s{4}([A-Z]\w*)\b")?
+        .captures_iter(&block)
+        .map(|c| c[1].to_kebab_case())
+        .collect();
+    Ok(json!({"subcommands": subs}))
 }
 
 /// `[workspace] members` from root Cargo.toml, minus `workspace-hack`
@@ -791,17 +813,17 @@ mod tests {
     }
 
     #[test]
-    fn crds_field_camel_case() {
+    fn crds_field_re_handles_raw_ident_and_camel() {
+        let re = Regex::new(FIELD_RE).unwrap();
         let conv = |s: &str| {
-            s.strip_prefix("r#")
-                .unwrap_or(s)
+            re.captures(s).unwrap()[1]
                 .trim_end_matches('_')
                 .to_lower_camel_case()
         };
-        assert_eq!(conv("host_network"), "hostNetwork");
-        assert_eq!(conv("systems"), "systems");
-        assert_eq!(conv("r#type"), "type");
-        assert_eq!(conv("type_"), "type");
+        assert_eq!(conv("    pub host_network: bool,"), "hostNetwork");
+        assert_eq!(conv("    pub systems: Vec<String>,"), "systems");
+        assert_eq!(conv("    pub r#type: String,"), "type");
+        assert_eq!(conv("    pub type_: String,"), "type");
     }
 
     #[test]
