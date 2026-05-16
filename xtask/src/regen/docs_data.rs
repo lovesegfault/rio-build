@@ -13,15 +13,17 @@ use serde_json::json;
 
 use crate::sh::repo_root;
 
-/// `#[error("msg" ...)] Ident`. `(?s)` so the gap between the attr's
-/// `)]` and the variant ident may span newlines (rustfmt wraps long
-/// `#[error(...)]` bodies). The message capture handles `\"` and `\\`
-/// escapes (rio-nix/src/derivation/mod.rs has `expected '\"'`).
+/// Optional `///` doc-block, then `#[error("msg" ...)] Ident`. `(?ms)`
+/// so `^` matches per-line for the doc capture and `.` spans the
+/// `)]`→ident newline (rustfmt wraps long `#[error(...)]` bodies). The
+/// message capture handles `\"`/`\\` escapes (rio-nix/src/derivation/
+/// mod.rs has `expected '\"'`). Captures: 1=doc-block, 2=msg, 3=ident.
 /// Intervening attrs between `#[error]` and the ident aren't seen in
 /// this codebase (`#[cfg]` always precedes `#[error]`); if one shows
 /// up the variant is silently skipped, which is acceptable for a doc
 /// cross-ref table.
-const VARIANT_RE: &str = r#"(?s)#\[error\(\s*r?"((?:[^"\\]|\\.)*)"[^\]]*\]\s*([A-Z]\w*)"#;
+const VARIANT_RE: &str =
+    r#"(?ms)((?:^\s*///[^\n]*\n)*)\s*#\[error\(\s*r?"((?:[^"\\]|\\.)*)"[^\]]*\]\s*([A-Z]\w*)"#;
 
 /// `describe_{counter,gauge,histogram}!("rio_X_...", [Unit::*, ]"help")`.
 /// Kind from the macro name; the metrics-crate `Unit` arg is optional
@@ -158,25 +160,33 @@ fn alerts() -> Result<serde_json::Value> {
 }
 
 fn errors() -> Result<serde_json::Value> {
-    // Enum-block: `pub enum <Name>Error {` to the next `}` at column 0.
-    // Error enums are always top-level items so the col-0 close brace is
-    // unambiguous (struct-variant `}` are indented).
-    let enum_re = Regex::new(r"(?ms)^pub enum (\w*Error)\s*\{(.*?)^\}")?;
+    // Enum-block: `(?:pub\s+)?` so non-pub error enums are scanned too
+    // (rio-gateway's StreamProcessError is private but documented in
+    // ref/errors.typ). `}` at column 0 closes the enum — error enums
+    // are always top-level items so this is unambiguous (struct-variant
+    // `}` are indented).
+    let enum_re = Regex::new(r"(?ms)^(?:pub\s+)?enum (\w*Error)\s*\{(.*?)^\}")?;
     let variant_re = Regex::new(VARIANT_RE)?;
+    let collapse = |s: String| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut variants = Vec::new();
     visit_rio_crates(&mut |crate_name, body| {
         for em in enum_re.captures_iter(body) {
             let enum_name = em[1].to_string();
             for vm in variant_re.captures_iter(&em[2]) {
-                let msg = unescape_rust_str(&vm[1])
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let doc = collapse(
+                    vm[1]
+                        .lines()
+                        .map(|l| l.trim_start().trim_start_matches("///").trim_start())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+                let msg = collapse(unescape_rust_str(&vm[2]));
                 variants.push(json!({
                     "enum": enum_name,
-                    "name": vm[2].to_string(),
+                    "name": vm[3].to_string(),
                     "crate": crate_name,
                     "msg": msg,
+                    "doc": doc,
                 }));
             }
         }
@@ -210,15 +220,6 @@ fn workspace() -> Result<serde_json::Value> {
         .filter(|n| n != "workspace-hack")
         .collect();
 
-    // rio-* internal deps from a deps table. Only workspace-internal
-    // edges (rio-*, xtask) — third-party deps are noise for the graph.
-    let internal = |t: &toml::Table| -> BTreeSet<String> {
-        t.keys()
-            .filter(|k| k.starts_with("rio-") || *k == "xtask")
-            .cloned()
-            .collect()
-    };
-
     let mut members = Vec::new();
     let mut deps = BTreeMap::<String, serde_json::Value>::new();
     for name in &member_names {
@@ -232,35 +233,117 @@ fn workspace() -> Result<serde_json::Value> {
             .to_string();
         members.push(json!({"name": name, "description": desc}));
 
+        // Default-feature dep: closure. BFS from `default` over feature→
+        // feature refs, collecting `dep:X` tokens. Per-manifest only — no
+        // cross-crate feature unification (autograph shows what `cargo
+        // build -p <crate>` links, not what a downstream consumer might
+        // enable).
+        let default_deps = default_dep_closure(&t);
+
+        // rio-* internal deps from a deps table, partitioned: required,
+        // or `optional=true` AND not in the default-feature dep: closure.
+        let internal = |t: &toml::Table| -> (BTreeSet<String>, BTreeSet<String>) {
+            let mut req = BTreeSet::new();
+            let mut opt = BTreeSet::new();
+            for (k, v) in t {
+                if !(k.starts_with("rio-") || k == "xtask") {
+                    continue;
+                }
+                let is_opt = v
+                    .as_table()
+                    .and_then(|d| d.get("optional"))
+                    .and_then(|o| o.as_bool())
+                    .unwrap_or(false);
+                if is_opt && !default_deps.contains(k) {
+                    opt.insert(k.clone());
+                } else {
+                    req.insert(k.clone());
+                }
+            }
+            (req, opt)
+        };
+
         let mut prod = BTreeSet::<String>::new();
+        let mut optional = BTreeSet::<String>::new();
         let mut dev = BTreeSet::<String>::new();
         if let Some(d) = t.get("dependencies").and_then(|v| v.as_table()) {
-            prod.extend(internal(d));
+            let (r, o) = internal(d);
+            prod.extend(r);
+            optional.extend(o);
         }
         if let Some(d) = t.get("dev-dependencies").and_then(|v| v.as_table()) {
-            dev.extend(internal(d));
+            dev.extend(internal(d).0); // dev-deps don't carry `optional`
         }
-        // [target.<cfg>.dependencies] — rio-test-support has a
-        // cfg(target_os="linux") block.
+        // [target.<cfg>.dependencies] — same partition.
         if let Some(tg) = t.get("target").and_then(|v| v.as_table()) {
             for cfg in tg.values() {
                 if let Some(d) = cfg.get("dependencies").and_then(|v| v.as_table()) {
-                    prod.extend(internal(d));
+                    let (r, o) = internal(d);
+                    prod.extend(r);
+                    optional.extend(o);
                 }
                 if let Some(d) = cfg.get("dev-dependencies").and_then(|v| v.as_table()) {
-                    dev.extend(internal(d));
+                    dev.extend(internal(d).0);
                 }
             }
         }
-        // Dep in both renders as solid only (rio-scheduler has
-        // rio-store in both: schema feature prod, test-utils dev).
-        let dev: Vec<_> = dev.difference(&prod).cloned().collect();
+        // Self-dep (rio-store has `path = "."` under dev-deps to enable
+        // its own test-utils feature for tests/) — not a graph edge.
+        prod.remove(name);
+        optional.remove(name);
+        dev.remove(name);
+        // Dep in prod+dev → solid only; in optional+dev → dotted only
+        // (rio-store has rio-test-support in both optional [deps] AND
+        // [dev-deps]; without this filter the autograph would render a
+        // dotted+dashed double-edge).
+        let dev: Vec<_> = dev
+            .difference(&prod)
+            .filter(|d| !optional.contains(*d))
+            .cloned()
+            .collect();
         deps.insert(
             name.clone(),
-            json!({"prod": prod.into_iter().collect::<Vec<_>>(), "dev": dev}),
+            json!({
+                "prod": prod.into_iter().collect::<Vec<_>>(),
+                "optional": optional.into_iter().collect::<Vec<_>>(),
+                "dev": dev,
+            }),
         );
     }
     Ok(json!({"members": members, "deps": deps}))
+}
+
+/// BFS from `[features].default` over feature→feature refs, collecting
+/// `dep:X` tokens. `crate/feat` and `crate?/feat` are cross-refs (they
+/// enable a *dep's* feature), not sub-features of this manifest.
+fn default_dep_closure(t: &toml::Table) -> BTreeSet<String> {
+    let mut deps = BTreeSet::new();
+    let Some(features) = t.get("features").and_then(|v| v.as_table()) else {
+        return deps;
+    };
+    let mut seen = BTreeSet::new();
+    let mut queue = vec!["default".to_string()];
+    while let Some(f) = queue.pop() {
+        if !seen.insert(f.clone()) {
+            continue;
+        }
+        for tok in features
+            .get(&f)
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+        {
+            if let Some(d) = tok.strip_prefix("dep:") {
+                deps.insert(d.to_owned());
+            } else if !tok.contains('/') {
+                // Bare token = sub-feature ref. `crate/feat` and
+                // `crate?/feat` enable a dep's feature, not ours.
+                queue.push(tok.to_owned());
+            }
+        }
+    }
+    deps
 }
 
 /// Doc-referenced rust consts. Curated allowlist, NOT a full scrape:
@@ -519,27 +602,49 @@ mod tests {
     }
 
     #[test]
-    fn variant_re_captures_then_unescape() {
+    fn variant_re_captures_doc_msg_ident() {
         let re = Regex::new(VARIANT_RE).unwrap();
         let src = r#"
+            /// The Nix client disconnected.
+            /// NOT reconnect-worthy.
+            #[error("client disconnected: {0}")]
+            Wire(anyhow::Error),
             #[error("expected '\"' to start string")]
             ExpectedStringStart,
-            #[error("plain")]
-            Plain,
         "#;
         let caps: Vec<_> = re
             .captures_iter(src)
-            .map(|c| (unescape_rust_str(&c[1]), c[2].to_string()))
+            .map(|c| (c[1].to_string(), unescape_rust_str(&c[2]), c[3].to_string()))
             .collect();
+        assert_eq!(caps.len(), 2);
+        assert!(caps[0].0.contains("NOT reconnect-worthy"));
+        assert_eq!(caps[0].1, "client disconnected: {0}");
+        assert_eq!(caps[0].2, "Wire");
+        assert_eq!(caps[1].0, ""); // no doc block
+        assert_eq!(caps[1].1, r#"expected '"' to start string"#);
+        assert_eq!(caps[1].2, "ExpectedStringStart");
+    }
+
+    #[test]
+    fn default_dep_closure_bfs() {
+        let t: toml::Table = r#"
+            [features]
+            default = ["server"]
+            server = ["dep:rio-common", "dep:rio-auth", "schema", "tokio/rt"]
+            schema = ["dep:rio-nix"]
+            test-utils = ["server", "dep:rio-test-support"]
+        "#
+        .parse()
+        .unwrap();
+        let closure = default_dep_closure(&t);
+        // default→server→{rio-common,rio-auth,schema}→{rio-nix};
+        // tokio/rt is a cross-ref (skipped); test-utils not reachable.
         assert_eq!(
-            caps,
-            vec![
-                (
-                    r#"expected '"' to start string"#.into(),
-                    "ExpectedStringStart".into()
-                ),
-                ("plain".into(), "Plain".into()),
-            ]
+            closure,
+            ["rio-auth", "rio-common", "rio-nix"]
+                .into_iter()
+                .map(String::from)
+                .collect()
         );
     }
 
