@@ -214,18 +214,28 @@ Notable edges:
 // IS now derived (the previous hand-tree had drifted).
 == rio-proto — gRPC definitions
 
-// .proto files (NOT src/ — hand-maintained; modules.json covers src/ only).
-```
-proto/
-├── types.proto        # Shared: PathInfo, Heartbeat, common enums
-├── dag.proto          # DerivationNode, DerivationEdge, DerivationEvent (package rio.types)
-├── build_types.proto  # BuildEvent, BuildResult, BuildProgress (package rio.types)
-├── admin_types.proto  # Admin-specific request/response types (package rio.types)
-├── store.proto        # StoreService + ChunkService
-├── scheduler.proto    # SchedulerService
-├── builder.proto       # BuilderService
-└── admin.proto        # AdminService (dashboard/CLI)
-```
+// .proto files derive from gen/protos.json (`service X` decls + first
+// `//` comment per file). bug_030: hand-tree said BuilderService; the
+// file defines ExecutorService.
+#let _protos = json("/gen/protos.json")
+#raw(
+  "proto/\n"
+    + _protos
+      .pairs()
+      .sorted(key: p => p.at(0))
+      .map(p => {
+        let (f, info) = p
+        let pad = " " * calc.max(1, 22 - f.len())
+        let ann = if info.services.len() > 0 {
+          info.services.join(" + ")
+        } else {
+          info.doc
+        }
+        "├── " + f + pad + "# " + ann
+      })
+      .join("\n"),
+  block: true,
+)
 #_module-tree("rio-proto")
 
 *Field-addition rule.* A new proto3 scalar field whose consumer
