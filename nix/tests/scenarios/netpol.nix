@@ -27,7 +27,7 @@
 # P0220's proven in-cluster differentiator): reachable without NetPol,
 # blocked with.
 #
-# Ingress policy: SKIPPED (Phase 5). FOD proxy egress allowlist: P0243.
+# Ingress policy: SKIPPED (Phase 5).
 {
   pkgs,
   common,

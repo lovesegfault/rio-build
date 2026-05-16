@@ -185,7 +185,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
     /// count), one after sweep (collected + bytes), final with
     /// is_complete=true.
     ///
-    /// `grace_period_hours`: None = default (2h). Some(0) = zero
+    /// `grace_period_hours`: None = [`DEFAULT_GC_GRACE_HOURS`]. Some(0) = zero
     /// grace (explicit). Protects paths
     /// created in the last N hours from collection even if not
     /// yet referenced.
@@ -221,7 +221,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
             crate::grpc::validate_store_path(root)?;
         }
 
-        // proto3 `optional uint32`: None = unset (use default 2h),
+        // proto3 `optional uint32`: None = unset (use DEFAULT_GC_GRACE_HOURS),
         // Some(0) = explicit zero grace (useful for tests + pre-shutdown GC).
         // Distinguishing these matters — treating 0 as "use default"
         // would make zero-grace impossible to request.

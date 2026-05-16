@@ -187,7 +187,7 @@ pub(crate) async fn run_loop<F, Fut>(
 /// [`TickResult`] variant.
 ///
 /// The GcRequest is intentionally minimal: `dry_run=false`,
-/// `grace_period_hours=None` (store's 2h default),
+/// `grace_period_hours=None` (store's `DEFAULT_GC_GRACE_HOURS` default),
 /// `extra_roots=vec![]`. The cron has no visibility into live-
 /// build output paths (that's the scheduler's `GcRoots` actor,
 /// and it proxies via `AdminService.TriggerGC`, not us). For

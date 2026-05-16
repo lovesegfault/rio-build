@@ -566,8 +566,8 @@ async fn health_service_clone_shares_reporter_state() -> anyhow::Result<()> {
     let (reporter, health_service) = tonic_health::server::health_reporter();
     let health_service_clone = health_service.clone();
 
-    // Spawn TWO servers, each on its own port, each with its
-    // own clone of the health service.
+    // Spawn TWO servers, each on its own port (test-only — production
+    // has one port), each with its own clone of the health service.
     let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr1 = l1.local_addr()?;
     let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -624,8 +624,8 @@ async fn health_service_clone_shares_reporter_state() -> anyhow::Result<()> {
     assert_eq!(
         s2,
         ServingStatus::NotServing,
-        "clone tracks toggles — standby on plaintext port would \
-         correctly show NOT_SERVING → K8s excludes it"
+        "clone tracks toggles — a second server with the cloned \
+         health_service mirrors NOT_SERVING (proves state is shared)"
     );
     Ok(())
 }

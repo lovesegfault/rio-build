@@ -466,7 +466,7 @@ pub const M_031: () = ();
 /// scheduler restart. P0556: without this, a scheduler failover
 /// between an OOMKilled tiny-fetcher attempt and the retry resets
 /// `DerivationState.size_class_floor` to `None` → the FOD goes back
-/// to tiny → OOMs again. With ephemeral FetcherPools (one Job per
+/// to tiny → OOMs again. With ephemeral fetcher Jobs (one Job per
 /// FOD, the production default since P0541) that's a guaranteed
 /// wasted pod-start per failover; under chaos-monkey scheduler
 /// restarts it's an OOM loop.

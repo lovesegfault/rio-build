@@ -30,8 +30,9 @@ pub struct Config {
     pub health_addr: std::net::SocketAddr,
     /// GC cron interval (hours). 0 = disabled (reconciler not
     /// spawned). The cron calls StoreAdminService.TriggerGC with
-    /// default params (dry_run=false, force=false, store's 2h
-    /// grace). `store_addr` is the connect target — StoreAdminService
+    /// default params (dry_run=false, force=false, store's
+    /// `DEFAULT_GC_GRACE_HOURS` grace). `store_addr` is the connect
+    /// target — StoreAdminService
     /// is hosted on the store's gRPC port alongside StoreService.
     pub gc_interval_hours: u64,
     /// ADR-023 §13b NodeClaim pool reconciler. `enabled = false` =
