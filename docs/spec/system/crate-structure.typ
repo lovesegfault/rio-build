@@ -50,73 +50,24 @@ derivation is invalidated on `.proto` changes but not on Rust-only commits.
       node-inset: 0.6em,
       edge-stroke: 0.6pt,
       edge-corner-radius: 8pt,
-      // nodes
-      autograph.node(<rio-common>, crate(
-        "rio-common",
-        [config, observability, limits],
+      // Nodes AND edges derive from gen/workspace.json (each crate's
+      // Cargo.toml [package].description + [dependencies] /
+      // [dev-dependencies] / [target.*.dependencies] rio-* entries).
+      // bug_021: the hand-maintained list mis-classified scheduler→store
+      // as dev-only and omitted rio-auth/rio-lease nodes entirely.
+      .._ws.members.map(m => autograph.node(
+        label(m.name),
+        crate(m.name, [#m.description]),
       )),
-      autograph.node(<rio-nix>, crate("rio-nix", [protocol, derivations, NAR])),
-      autograph.node(<rio-proto>, crate("rio-proto", [gRPC definitions])),
-      autograph.node(<rio-crds>, crate("rio-crds", [k8s CRD types])),
-      autograph.node(<rio-test-support>, crate(
-        "rio-test-support",
-        [PG, mock gRPC, wire],
-      )),
-      autograph.node(<rio-store>, crate("rio-store", [chunked CAS])),
-      autograph.node(<rio-scheduler>, crate(
-        "rio-scheduler",
-        [DAG, scheduling],
-      )),
-      autograph.node(<rio-gateway>, crate(
-        "rio-gateway",
-        [SSH, protocol handler],
-      )),
-      autograph.node(<rio-builder>, crate(
-        "rio-builder",
-        [executor, FUSE, overlay],
-      )),
-      autograph.node(<rio-controller>, crate(
-        "rio-controller",
-        [k8s operator, autoscale],
-      )),
-      autograph.node(<rio-cli>, crate("rio-cli", [AdminService client])),
-      autograph.node(<xtask>, crate("xtask", [dev/ops tooling])),
-      // prod edges (solid)
-      autograph.edge(<rio-proto>, <rio-nix>),
-      autograph.edge(<rio-proto>, <rio-common>),
-      autograph.edge(<rio-test-support>, <rio-nix>),
-      autograph.edge(<rio-test-support>, <rio-proto>),
-      autograph.edge(<rio-gateway>, <rio-nix>),
-      autograph.edge(<rio-gateway>, <rio-proto>),
-      autograph.edge(<rio-gateway>, <rio-common>),
-      autograph.edge(<rio-builder>, <rio-nix>),
-      autograph.edge(<rio-builder>, <rio-proto>),
-      autograph.edge(<rio-builder>, <rio-common>),
-      autograph.edge(<rio-scheduler>, <rio-nix>),
-      autograph.edge(<rio-scheduler>, <rio-proto>),
-      autograph.edge(<rio-scheduler>, <rio-common>),
-      autograph.edge(<rio-scheduler>, <rio-crds>),
-      autograph.edge(<rio-store>, <rio-nix>),
-      autograph.edge(<rio-store>, <rio-proto>),
-      autograph.edge(<rio-store>, <rio-common>),
-      autograph.edge(<rio-controller>, <rio-proto>),
-      autograph.edge(<rio-controller>, <rio-common>),
-      autograph.edge(<rio-controller>, <rio-crds>),
-      autograph.edge(<rio-cli>, <rio-proto>),
-      autograph.edge(<rio-cli>, <rio-common>),
-      autograph.edge(<rio-cli>, <rio-crds>),
-      // xtask edges derive from gen/workspace.json so a new xtask
-      // rio-* dep extends the graph without a manual edit (merged_027).
-      .._ws.xtask_deps.map(d => autograph.edge(<xtask>, label(d))),
-      // dev-dependencies (dashed, muted)
-      autograph.edge(<rio-gateway>, <rio-test-support>, ..dev),
-      autograph.edge(<rio-gateway>, <rio-store>, ..dev),
-      autograph.edge(<rio-builder>, <rio-test-support>, ..dev),
-      autograph.edge(<rio-scheduler>, <rio-store>, ..dev),
-      autograph.edge(<rio-scheduler>, <rio-test-support>, ..dev),
-      autograph.edge(<rio-store>, <rio-test-support>, ..dev),
-      autograph.edge(<rio-controller>, <rio-test-support>, ..dev),
-      autograph.edge(<rio-cli>, <rio-test-support>, ..dev),
+      .._ws
+        .deps
+        .pairs()
+        .map(p => {
+          let (c, d) = p
+          d.prod.map(t => autograph.edge(label(c), label(t)))
+          d.dev.map(t => autograph.edge(label(c), label(t), ..dev))
+        })
+        .flatten(),
     ),
     caption: [Workspace dependency graph. Solid edges are prod dependencies;
       dashed are `[dev-dependencies]` only.],
@@ -129,7 +80,7 @@ Notable edges:
 - *`rio-proto → rio-common`*: `connect_channel`/`connect_with_retry` use `rio_common::backoff` and `rio_common::grpc` constants. Contract tests floor-assert `rio_common::limits` constants at compile time (e.g., `MAX_DAG_NODES >= 70_000`).
 - *`rio-scheduler → rio-nix` (prod)*: `Derivation` parsing for closure resolution and `StorePath` validation in the merge path.
 - *`rio-scheduler → rio-crds` (prod)*: lease-election only.
-- *`rio-scheduler → rio-store` (dev-only)*: integration tests spin up a real `StoreServiceServer` from `rio-store::grpc`.
+- *`rio-scheduler → rio-store` (prod, `schema` feature)*: `ca/resolve.rs` → `rio_store::realisations::query`; integration tests additionally pull `test-utils`.
 - *`rio-gateway → rio-store` (dev-only)*: golden-daemon tests assert against a real `StoreServiceServer` (with `test-utils` feature) instead of `MockStore`.
 
 = Module Structure
@@ -590,8 +541,8 @@ src/
 `cargo xtask` subcommands for codegen (`regen cargo-json`, `regen sqlx`,
 `regen fuzz-lock`, `regen docs-data`), local cluster lifecycle
 (`up`/`down`/`status`), AMI build, and helm/k8s helpers. Depends on
-#(_ws.xtask_deps.map(raw).join(", ")) --- see `gen/workspace.json` for the
-live list.
+#(_ws.deps.at("xtask").prod.map(raw).join(", ")) --- see
+`gen/workspace.json` for the live list.
 
 = Dependencies
 
