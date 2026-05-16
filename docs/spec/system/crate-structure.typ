@@ -104,13 +104,12 @@ src/
 │                      #   metrics); Bootstrap<C>/HasCommonConfig; tonic_builder; drain helpers
 ├── signal.rs          # SIGTERM/SIGINT → CancellationToken; sighup_reload (hot-reload loop)
 ├── task.rs            # spawn_monitored task wrapper
-├── tenant.rs          # NormalizedName tenant ID newtype
-└── tls.rs             # mTLS config load + tonic channel TLS (anyhow::Error, not a typed TlsError)
+└── tenant.rs          # NormalizedName tenant ID newtype
 ```
 
 #r(
   "common.bootstrap",
-)[`bootstrap<C, A>(component, cli, describe_metrics, histogram_buckets)` is the cold-start prologue every binary calls from `main()`: install rustls crypto provider → `init_tracing` (returns `OtelGuard`) → figment `load` → `load_client_tls` + `init_client_tls` → `ValidateConfig::validate` → `shutdown_signal` + `init_metrics` (with the per-crate `histogram_buckets` table) + `describe_metrics()` → enter root `component` span. Returns `Bootstrap<C>{ cfg, shutdown, serve_shutdown, otel_guard, root_span }` — `otel_guard` and `root_span` MUST be bound (not destructured with `..`) or OTel teardown / span exit happens immediately. `HasCommonConfig` projects each binary's `Config` to its flattened `CommonConfig` so `bootstrap` can read `tls`/`metrics_addr`/`metric_labels` without knowing the concrete type.]
+)[`bootstrap<C, A>(component, cli, describe_metrics, histogram_buckets)` is the cold-start prologue every binary calls from `main()`: `init_tracing` (returns `OtelGuard`) → figment `load` → `ValidateConfig::validate` → `shutdown_signal` + `init_metrics` (with the per-crate `histogram_buckets` table) + `describe_metrics()` → enter root `component` span. Returns `Bootstrap<C>{ cfg, shutdown, serve_shutdown, otel_guard, root_span }` — `otel_guard` and `root_span` MUST be bound (not destructured with `..`) or OTel teardown / span exit happens immediately. `HasCommonConfig` projects each binary's `Config` to its flattened `CommonConfig` so `bootstrap` can read `metrics_addr`/`metric_labels` without knowing the concrete type. There is no application-level TLS --- transport encryption is mesh-level (see #rref("sec.transport.cilium-wireguard")).]
 
 #r(
   "common.signal.sighup-reload",

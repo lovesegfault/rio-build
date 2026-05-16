@@ -11,10 +11,10 @@ binary is bundled into the scheduler container so the operator path is
 == Connection model
 
 `--scheduler-addr` (default `localhost:9001`) and `--store-addr` (default
-`rio-store.rio-store:9002`) target the in-pod case. TLS is env-only
-(`RIO_TLS__*`). gRPC connect is *per-subcommand* --- `bps` (kube-only) and
-`upstream`/`verify-chunks` (store-only) MUST work when the scheduler is
-unreachable (e.g., to diagnose why).
+`rio-store.rio-store:9002`) target the in-pod case. gRPC connect is
+*per-subcommand* --- `pool` (kube-only) and `upstream`/`verify-chunks`
+(store-only) MUST work when the scheduler is unreachable (e.g., to diagnose
+why).
 
 `--json` makes handlers print exactly one JSON document to stdout (for `jq`
 pipelines). Prost-generated types don't derive `Serialize`; each subcommand
