@@ -81,13 +81,17 @@
 #let rule-color = rgb("#d0d7de")
 
 // ─── shiroa html-frame theming ──────────────────────────────────────
-// equation-rules and our figure-frame rule render content as inline SVG
-// via html.frame(). shiroa's theme-box emits a dark + light copy under
-// `.dark`/`.light` so the theme CSS (mdbook's general.css) can toggle
-// them; it expects a `themes` dict with `is-dark` + `main-color` per
-// variant. shiroa ships no preset — the full theme-box-styles-from()
-// machinery parses tmTheme XML for code highlighting, which we don't
-// use (codly handles raw) — so build the minimal dict directly.
+// equation-rules renders inline math as inline SVG via html.frame().
+// shiroa's theme-box emits a dark + light copy under `.dark`/`.light`
+// so the theme CSS (mdbook's general.css) can toggle them. Figures do
+// NOT use this anymore — they emit one variant and the CSS filter at
+// `.rio-figure svg` handles dark themes (halves the per-figure SVG
+// payload). Inline equations have no `.rio-figure` wrapper so still
+// need both copies. theme-box expects a `themes` dict with `is-dark` +
+// `main-color` per variant; shiroa ships no preset (its
+// theme-box-styles-from() parses tmTheme XML for code highlighting,
+// which we don't use — codly handles raw), so build the minimal dict
+// directly.
 #let _web-themes = (
   light-theme: (is-dark: false, main-color: rgb("#1b1f24")),
   dark-theme: (is-dark: true, main-color: rgb("#c9d1d9")),
@@ -651,11 +655,12 @@
         let body = if fig.kind == "algorithm" {
           box(width: 560pt, fig.body)
         } else { fig.body }
+        // Single-variant render — dark themes recolor via CSS filter
+        // (.ayu/.navy/.coal .rio-figure svg below). The previous
+        // _theme-frame wrapper emitted dark+light SVG copies and
+        // class-toggled visibility; doubled the per-figure payload.
         html.elem("figure", attrs: (class: "rio-figure"), {
-          _theme-frame(tag: "div", theme => {
-            set text(fill: theme.main-color)
-            html.elem("div", html.frame(body))
-          })
+          html.elem("div", html.frame(body))
           if fig.caption != none {
             html.elem("figcaption", fig.caption)
           }
