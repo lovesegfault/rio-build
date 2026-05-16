@@ -13,6 +13,8 @@
 #let _metrics = json("/gen/metrics.json").names
 #let _alerts = json("/gen/alerts.json").names
 #let _ws = json("/gen/workspace.json")
+// _ws.members is [{name, description}]; extract names for membership.
+#let _ws-names = _ws.members.map(m => m.name)
 #let _consts = json("/gen/consts.json")
 #let _helm-ns = json("/gen/helm-ns.json")
 // Per-component config map. Nested by component because 15 keys
@@ -75,11 +77,11 @@
     raw(_helm-ns.at(ns).psa)
   },
   crate: name => {
-    assert(name in _ws.members, message: "unknown crate: " + name)
+    assert(name in _ws-names, message: "unknown crate: " + name)
     raw(name)
   },
-  crate-count: () => [#_ws.members.len()],
-  crate-list: () => _ws.members.map(raw).join(", "),
+  crate-count: () => [#_ws-names.len()],
+  crate-list: () => _ws-names.map(raw).join(", "),
   gh: pl => link(
     "https://github.com/lovesegfault/rio-build/blob/"
       + _gh-sha
