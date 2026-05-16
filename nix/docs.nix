@@ -224,6 +224,12 @@ rec {
         shiroa build --root . --mode static-html \
           ${inputArgs} \
           --font-path "$TYPST_FONT_PATHS" -d $out .
+        # Hoist + dedup <symbol> glyph defs (typst content-hashes glyph
+        # IDs so identical glyphs share an id but every html.frame()
+        # SVG carries its own <defs> copy — sla-sizing.html had 13K
+        # defs with 1070 distinct ids). Also rewrites the equation
+        # fill="#000000" sentinel → currentColor.
+        ${pkgs.python3}/bin/python3 ${./docs-svg-dedup.py} $out
       '';
 
   checks = {
