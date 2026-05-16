@@ -532,7 +532,7 @@ Cilium overlay layer.
     backstop: tampered content fails `verify_fod_hashes()` before upload.
   - The scheduler NEVER routes a FOD to a builder, even under fetcher pressure
     (`r[sched.dispatch.fod-to-fetcher]`).
-- *Formerly:* the Squid `fod-proxy` with domain allowlisting. Deleted in
+- *Formerly:* a Squid FOD proxy with domain allowlisting. Deleted in
   ADR-019 --- the hash check is sufficient; a domain allowlist adds operational
   friction for marginal gain.
 

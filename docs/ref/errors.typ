@@ -101,7 +101,7 @@ See `rio-builder/src/executor/mod.rs` for the mapping implementation.
 == Infrastructure Error Types
 
 // Curated highlight list. Each name asserts existence in
-// gen/errors.json.enums (catches TlsError); description comes from the
+// gen/errors.json.enums (catches a deleted enum); description from the
 // enum-level `///` doc (asserted non-empty unless an override exists),
 // or from _highlight-override for typst-side rich bodies the rust
 // comment can't carry (refs.const, per-variant refs.error-doc).

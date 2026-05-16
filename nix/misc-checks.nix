@@ -337,6 +337,33 @@ in
             ../.github
           ];
         };
+        # Directories #src()/refs.gh paths reference. Fileset (not bare
+        # unfilteredRoot) so docs-lint's hash doesn't depend on
+        # Cargo.lock / fuzz corpora / target/. If a future #src()
+        # points outside this set the lint reports DEAD — extend the
+        # union, don't switch to unfilteredRoot.
+        pathSrc = pkgs.lib.fileset.toSource {
+          root = unfilteredRoot;
+          fileset = pkgs.lib.fileset.unions (
+            [
+              ../nix
+              ../infra
+              ../.config
+              ../.github
+              ../rio-proto/proto
+            ]
+            ++ builtins.map pkgs.lib.fileset.maybeMissing [
+              ../docs/gen
+              ../docs/spec
+              ../docs/ref
+              ../docs/ops
+            ]
+            ++ map (m: ../. + "/${m}") (
+              builtins.filter (m: m != "workspace-hack")
+                (builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.members
+            )
+          );
+        };
         metricsJson = ../docs/gen/metrics.json;
       }
       ''
@@ -388,6 +415,38 @@ in
         if [[ -n "$stray" ]]; then
           echo "FAIL: book-pdf.typ includes chapters not in book.typ:" >&2
           echo "$stray" >&2
+          fail=1
+        fi
+        # #src("path") and (refs.gh)("path:L") name files in the repo.
+        # Assert each exists. bug_016: verification.typ referenced a
+        # deleted scenario file. --exclude-dir=lib: refs.typ/rio.typ's
+        # own header comments contain literal `(refs.gh)("path:line")`
+        # examples that would false-positive.
+        while IFS= read -r path; do
+          p=''${path%%:*}
+          if [[ ! -e "$pathSrc/$p" ]]; then
+            echo "FAIL: #src/refs.gh references nonexistent path: $path" >&2
+            fail=1
+          fi
+        done < <(grep -rohE --exclude-dir=lib '#src\("[^"]+"\)|\(refs\.gh\)\("[^"]+"\)' $typSrc \
+          | sed -E 's/.*\("([^"]+)"\).*/\1/' | sort -u)
+        # Retired identifiers — names that no longer exist in code/CRDs/
+        # CLI but kept appearing in docs (R4: ≥5 instances). One
+        # alternation per rename; future renames append here.
+        if grep -rn -E '\bBuilderPool\b|\bbps\b subcommand|RIO_TLS__|\bTlsError\b|rio-common/src/tls\.rs|load_client_tls|init_client_tls|fod-proxy|spec\.sizing|Sizing::' $typSrc; then
+          echo "FAIL: retired identifier in docs — see deny-list in misc-checks.nix" >&2
+          fail=1
+        fi
+        # describe_metrics() doc-comment parity. Five lib.rs comments
+        # must point at xtask's canonical (and NONE may regress to the
+        # old "sourced from" wording — second strike R3-m002 → R4-003).
+        n=$(grep -rl 'docs_data.rs::metrics()' $crossSrc/rio-*/src/lib.rs | wc -l)
+        if [[ $n -ne 5 ]]; then
+          echo "FAIL: $n/5 describe_metrics() comments reference xtask canonical" >&2
+          fail=1
+        fi
+        if grep -rn 'sourced from' $crossSrc/rio-*/src/lib.rs; then
+          echo "FAIL: describe_metrics() comment regressed to old wording" >&2
           fail=1
         fi
         [[ $fail -eq 0 ]]

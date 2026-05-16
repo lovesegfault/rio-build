@@ -86,7 +86,7 @@ scheduler knows the expected hash before dispatch; the fetcher re-derives
 #r("builder.netpol.airgap")[
   `builder-egress` NetworkPolicy (in `rio-builders`) allows: CoreDNS:53,
   `rio-scheduler.rio-system:9001`, `rio-store.rio-store:9002`. Nothing else.
-  The `fod-proxy:3128` rule is deleted. Optionally, if `Pool.spec.s3Direct:
+  The Squid-FOD-proxy `:3128` rule is deleted. Optionally, if `Pool.spec.s3Direct:
   true`, the S3 VPC endpoint CIDR is added (for direct chunk upload; default is
   store-proxied).
 ]
@@ -113,7 +113,7 @@ scheduler knows the expected hash before dispatch; the fetcher re-derives
   posture as `builder-egress`.
 ]
 
-The Squid `fod-proxy` is deleted. The FOD hash check is the integrity boundary;
+The Squid FOD proxy is deleted. The FOD hash check is the integrity boundary;
 a domain allowlist adds operational friction for marginal gain.
 
 == Sandbox hardening
