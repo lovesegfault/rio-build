@@ -321,8 +321,12 @@ in
         crossSrc = pkgs.lib.fileset.toSource {
           root = ../.;
           fileset = pkgs.lib.fileset.unions [
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../.)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs" || f.name == "Cargo.toml") ../.)
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "nix" || f.hasExt "sh") ../nix)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "ts") ../rio-dashboard)
+            ../flake.nix
+            ../CLAUDE.md
+            ../README.md
             (pkgs.lib.fileset.fileFilter (
               f:
               builtins.any f.hasExt [
@@ -441,16 +445,21 @@ in
         # Retired identifiers — names that no longer exist in code/CRDs/
         # CLI but kept appearing in docs (R4: ≥5 instances). One
         # alternation per rename; future renames append here.
-        if grep -rn -E '\bBuilderPool\b|\bbps\b subcommand|RIO_TLS__|\bTlsError\b|rio-common/src/tls\.rs|load_client_tls|init_client_tls|fod-proxy|spec\.sizing|Sizing::|mTLS client[- ]cert|fuseCacheBudget|logBudget|migration-lock mechanism' $typSrc; then
+        deny_common='\bBuilderPool\b|rio-cli bps\b|`bps`|RIO_TLS__|\bTlsError\b|rio-common/src/tls\.rs|load_client_tls|init_client_tls|fod-proxy|spec\.sizing|Sizing::|fuseCacheBudget|logBudget|migration-lock mechanism|trigger-gc|--grace-period-hours|mTLS client[- ]cert|mTLS cert mount|mTLS main port|VMs: mTLS|plaintext-health listener|TLS and plaintext ports|mTLS bypass|mTLS-identified|mTLS identifies|falls? back to mTLS|mTLS peer cert'
+        # Docs: deny_common + bare \bmTLS\b (glossary excluded — it
+        # defines the term).
+        if grep -rn -E "$deny_common|\bmTLS\b" $typSrc \
+             | grep -v 'glossary\.typ'; then
           echo "FAIL: retired identifier in docs — see deny-list in misc-checks.nix" >&2
           fail=1
         fi
-        # mTLS-client-cert phrasing also lives in rust comments + helm/
-        # nix (docker.nix, rio-cli, xtask, values.yaml) — scan crossSrc
-        # too. The rio-auth/common/store "replaced mTLS CN-allowlist"
-        # historical comments don't match this phrase (verified).
-        if grep -rn -iE 'mTLS client[- ]cert' $crossSrc; then
-          echo "FAIL: retired mTLS-client-cert claim in non-doc source" >&2
+        # crossSrc allowlist: pool.rs:4-11 explains the BuilderPool→Pool
+        # consolidation (legitimate history); flake.nix "Before this
+        # assert, vm-lifecycle-bps-k3s and vm-fod-proxy-k3s" is
+        # legitimate history; misc-checks.nix is the lint itself.
+        if grep -rn -E "$deny_common" $crossSrc \
+             | grep -vE 'rio-crds/src/pool\.rs:([4-9]|1[01]):|flake\.nix:.*Before this assert|misc-checks\.nix'; then
+          echo "FAIL: retired identifier in non-doc source" >&2
           fail=1
         fi
         # DEFAULT_GC_GRACE_HOURS literal-value tripwire — the const is

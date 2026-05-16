@@ -132,8 +132,8 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 
 There is no application-level TLS. Components run plaintext gRPC servers;
 encryption is provided by Cilium WireGuard at the overlay layer
-(`r[sec.transport.cilium-wireguard]`). K8s gRPC health probes hit the main
-port directly --- no separate plaintext-health listener.
+(`r[sec.transport.cilium-wireguard]`). K8s gRPC health probes hit the single
+main port directly.
 
 #table(
   columns: 2,

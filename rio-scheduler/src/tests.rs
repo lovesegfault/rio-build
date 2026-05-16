@@ -552,7 +552,7 @@ async fn health_serving_after_set() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.health.shared-reporter]
+// r[verify sched.health.shared-reporter+2]
 /// The lease toggle and the gRPC server share ONE HealthReporter
 /// (single port). `health_service.clone()` shares state — a fresh
 /// `health_reporter()` would never be toggled → standby always
