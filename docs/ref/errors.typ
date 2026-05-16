@@ -98,33 +98,53 @@ explicitly; *all other Nix statuses fall through to `PermanentFailure`*:
 
 See `rio-builder/src/executor/mod.rs` for the mapping implementation.
 
-== Infrastructure Error Types (rio-common)
+== Infrastructure Error Types
 
-#table(
-  columns: 3,
-  table.header([Error Type], [Source], [Description]),
-  [`HmacError`],
-  [`rio-common/src/hmac.rs`],
-  [Token verification failures: I/O reading key file, empty key, malformed
-    token (wrong part count, bad base64/JSON), signature mismatch, expiry in
-    the past. Surfaced to clients as `PERMISSION_DENIED`.],
-
-  [`TlsError`],
-  [`rio-common/src/tls.rs`],
-  [TLS config load failures: I/O reading PEM files, empty cert/key, PEM parse
-    errors. These are *startup* errors (fail-fast), not runtime.],
-
-  [`StreamProcessError`],
-  [`rio-gateway/src/handler/build.rs`],
-  [Gateway-internal enum distinguishing `Transport`
+// Curated highlight list. Each name asserts existence in
+// gen/errors.json.enums (catches TlsError); description comes from the
+// enum-level `///` doc (asserted non-empty unless an override exists),
+// or from _highlight-override for typst-side rich bodies the rust
+// comment can't carry (refs.const, per-variant refs.error-doc).
+#let _errs = json("/gen/errors.json")
+#let _enums = (:)
+#for e in _errs.enums { _enums.insert(e.name, e) }
+#let _highlight = ("HmacError", "JwtError", "StreamProcessError")
+#let _highlight-override = (
+  HmacError: [Token verification failures: I/O reading key file, empty
+    key, malformed token (wrong part count, bad base64/JSON), signature
+    mismatch, expiry in the past. Surfaced to clients as
+    `PERMISSION_DENIED`.],
+  JwtError: [Tenant-JWT verification failures: signature mismatch, expired,
+    unknown tenant, malformed claims. Surfaced as `PERMISSION_DENIED` at
+    SSH auth (gateway) or gRPC interceptor (admin).],
+  StreamProcessError: [Gateway-internal: distinguishes `Transport`
     (#(refs.error-doc)("StreamProcessError", "Transport")) and
     `EofWithoutTerminal`
     (#(refs.error-doc)("StreamProcessError", "EofWithoutTerminal")) ---
     *both retried* up to #(refs.const)("MAX_RECONNECT")× with backoff
-    1/2/4/8/16 s capped at 16 s --- and `Wire`
-    (#(refs.error-doc)("StreamProcessError", "Wire") --- *not retried*).
-    `Transport` and `EofWithoutTerminal` trigger the WatchBuild reconnect
-    loop.],
+    1/2/4/8/16 s capped at 16 s --- from `Wire`
+    (#(refs.error-doc)("StreamProcessError", "Wire") --- *not
+    retried*).],
+)
+#table(
+  columns: 3,
+  table.header([Error Type], [Crate], [Description]),
+  .._highlight
+    .map(name => {
+      assert(
+        name in _enums,
+        message: "highlighted enum not in gen/errors.json: " + name,
+      )
+      let e = _enums.at(name)
+      let desc = if name in _highlight-override {
+        _highlight-override.at(name)
+      } else {
+        assert(e.doc != "", message: "highlighted enum has no /// doc: " + name)
+        [#e.doc]
+      }
+      (raw(name), raw(e.crate), desc)
+    })
+    .flatten(),
 )
 
 == FUSE/Overlay Failures
