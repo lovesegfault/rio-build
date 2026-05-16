@@ -285,6 +285,14 @@ rec {
         echo "FAIL: only $n distinct <title> values (expected ≥25; QA #6 regressed)" >&2
         exit 1
       fi
+      # Equation single-render + symbol-dedup got sla-sizing.html from
+      # 25M → ~4.4M. Tripwire so a future eq-heavy chapter (or a
+      # docs-svg-dedup.py regression) doesn't silently re-bloat.
+      sz=$(stat -c%s spec/components/sla-sizing.html)
+      if [[ $sz -gt 7340032 ]]; then
+        echo "FAIL: sla-sizing.html is $sz bytes (>7MB; equation/dedup regression?)" >&2
+        exit 1
+      fi
       touch $out
     '';
   };
