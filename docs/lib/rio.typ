@@ -309,7 +309,10 @@
 
 // ─── the template ───────────────────────────────────────────────────
 #let rio(domains: none, paper: none, body) = {
-  let target = sys.inputs.at("x-target", default: "pdf")
+  // `x-target` (NOT `target` — that would shadow typst's builtin
+  // `target()` which the glossarium show-rules below need to detect
+  // `html.frame()`'s paged sub-context).
+  let x-target = sys.inputs.at("x-target", default: "pdf")
   // Three-way split (is-html / is-dyn-web mutually exclusive):
   //   is-html      — static-html. typst target=html → html.elem exists.
   //   is-dyn-web   — dyn-paged. typst target=paged → html.* MISSING.
@@ -319,7 +322,7 @@
   let is-html = is-html-target()
   let is-dyn-web = is-web-target()
   let is-paged-out = not is-html
-  let is-pdf = target in ("pdf", "book-pdf")
+  let is-pdf = x-target in ("pdf", "book-pdf")
   _domains.update(domains)
 
   // common typography (target-neutral)
@@ -399,41 +402,54 @@
     register-glossary(glossary-entries)
   }
   show: make-glossary
-  show figure.where(kind: "glossarium_entry"): it => context if is-paged-out {
-    align(left, it)
-  } else if _gloss-own.get() and it.has("label") {
-    // The `print-glossary` figures in chapters that own their glossary
-    // (glossary.typ, sla-sizing): wrap with `id="label-<key>"` so the
-    // cross-chapter `<a href="…#label-<key>">` below has a fragment
-    // target. Non-own chapters' `_gloss-anchors` figures (empty body,
-    // `_gloss-own` false) fall through to `it.body` — present so
-    // glossarium's `link(label(key), …)` resolves, but the link is
-    // rewritten to cross-chapter by the `show link:` rule.
-    html.elem("span", attrs: (id: "label-" + str(it.label)), it.body)
-  } else { it.body }
+  // The two glossarium show-rules below emit `html.elem`, which warns
+  // ("elem was ignored during paged export") inside `html.frame()`'s
+  // paged sub-context — `is-html` (captured from `sys.inputs`) stays
+  // true there, but typst's native `target()` flips to `"paged"`. So:
+  // outer `if is-html` keeps the rules out of pure-PDF compiles where
+  // `target` is undefined; inner `target() == "html"` keeps the
+  // `html.elem` arm out of framed-SVG sub-exports.
+  show figure.where(kind: "glossarium_entry"): if is-html {
+    it => context if target() != "html" {
+      // html.frame() paged sub-context — render plainly so the SVG
+      // doesn't drop it.
+      align(left, it)
+    } else if _gloss-own.get() and it.has("label") {
+      // The `print-glossary` figures in chapters that own their glossary
+      // (glossary.typ, sla-sizing): wrap with `id="label-<key>"` so the
+      // cross-chapter `<a href="…#label-<key>">` below has a fragment
+      // target. Non-own chapters' `_gloss-anchors` figures (empty body,
+      // `_gloss-own` false) fall through to `it.body` — present so
+      // glossarium's `link(label(key), …)` resolves, but the link is
+      // rewritten to cross-chapter by the `show link:` rule.
+      html.elem("span", attrs: (id: "label-" + str(it.label)), it.body)
+    } else { it.body }
+  } else { it => align(left, it) }
   // shiroa static-html: rewrite glossarium's `link(label(key), …)`
   // (the common tail of `@key`, `#gls(key)`, `#glspl(key)`) to a
   // cross-chapter `<a href="<base>glossary.html#label-<key>">`. Can't
   // use cross-link(reference:) — it queries locally first, finds the
   // hidden anchor, and short-circuits to a same-page link. Chapters
   // that `provides-glossary()` keep the intra-chapter link.
-  show link: it => context {
-    if (
-      is-html
-        and not _gloss-own.get()
-        and type(it.dest) == label
-        and str(it.dest) in _gloss-keys
-    ) {
-      html.elem(
-        "a",
-        attrs: (
-          class: "typst-content-link",
-          href: x-url-base + "glossary.html#label-" + str(it.dest),
-        ),
-        it.body,
-      )
-    } else { it }
-  }
+  show link: if is-html {
+    it => context {
+      if (
+        target() == "html"
+          and not _gloss-own.get()
+          and type(it.dest) == label
+          and str(it.dest) in _gloss-keys
+      ) {
+        html.elem(
+          "a",
+          attrs: (
+            class: "typst-content-link",
+            href: x-url-base + "glossary.html#label-" + str(it.dest),
+          ),
+          it.body,
+        )
+      } else { it }
+    }
+  } else { it => it }
 
   show: gentle-clues.with(breakable: false, headless: false)
 
@@ -572,7 +588,7 @@
   // not when stitched into book-pdf or rendered by shiroa.
   // `context` so `_book-mode.get()` resolves; the CLI `--input x-target`
   // and the in-doc `#book-pdf-mode()` are equivalent gates.
-  let in-book = target == "book-pdf"
+  let in-book = x-target == "book-pdf"
   let front = context if (
     paper != none and is-pdf and not in-book and not _book-mode.get()
   ) [
