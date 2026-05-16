@@ -170,7 +170,7 @@ needs russh fixture.
   --- the gateway forwards derivations; the scheduler enforces DAG-level limits)
 
 #info(title: [Implemented])[
-  Security VM test fragments cover JWT validation, @mtls client-cert rejection,
+  Security VM test fragments cover JWT validation, HMAC-token rejection,
   binary-cache auth (#src("nix/tests/scenarios/security.nix")); `__noChroot`
   gateway pre-check (#rref("gw.reject.nochroot")).
 ]

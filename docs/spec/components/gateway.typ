@@ -1525,7 +1525,7 @@ CA derivations, it returns the realized output paths if known.
 *Note on `wopAddTempRoot`:* Accepts the store path and records it as a
 connection-scoped temporary GC root in-memory. These #glspl("temp-root") prevent GC of
 paths the client is actively using. They are lost on gateway pod restart, which
-is acceptable given the store's GC grace period (default 2h). The store's GC
+is acceptable given the store's GC grace period (default #(refs.const)("DEFAULT_GC_GRACE_HOURS")h). The store's GC
 relies on the grace period rather than querying gateways for active temp roots.
 
 == Build Hook Protocol Path

@@ -95,7 +95,7 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 #info[
   *GC configuration:* GC is triggered via `StoreAdminService.TriggerGC` (or
   proxied through scheduler `AdminService.TriggerGC` which adds live-build
-  roots). `GcRequest.grace_period_hours` defaults to *2h*. The orphan scanner
+  roots). `GcRequest.grace_period_hours` defaults to *#(refs.const)("DEFAULT_GC_GRACE_HOURS")h*. The orphan scanner
   and S3 drain task are spawned in `main.rs` with compile-time constants
   (`DRAIN_INTERVAL = 30s`, orphan stale threshold = 15min). See
   #cross-link("/spec/components/store.typ")[store: GC].

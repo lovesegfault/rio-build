@@ -28,7 +28,7 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
   [rio-store],
   [Deployment],
   [1],
-  [Stateless at runtime (PG + S3 hold everything), but concurrent startup migrations from multiple replicas would race. Scale horizontally later after adding a migration-lock mechanism.],
+  [Stateless at runtime (PG + S3 hold everything). Multi-replica is safe: startup migrations serialize via #rref("store.db.migrate-try-lock").],
 
   [rio-controller],
   [Deployment],
@@ -177,7 +177,7 @@ For a complete scripted walkthrough against EKS, run `cargo xtask k8s qa --healt
 
 = Upgrades
 
-- *Schema migrations:* Run via `sqlx::migrate!` (uses sqlx's built-in PG advisory lock internally). All migrations are forward-compatible; rollback is supported by deploying the previous binary version (it ignores unknown columns/tables). Note: sqlx's lock covers single-service migrations; multi-replica store deployment needs a migration-lock mechanism (hence `replicas: 1` today).
+- *Schema migrations:* Run via `sqlx::migrate!` with sqlx's built-in lock disabled (`set_locking(false)`); rio-store's own PG advisory `pg_try_advisory_lock` serializes concurrent replicas (#rref("store.db.migrate-try-lock")). All migrations are forward-compatible; rollback is supported by deploying the previous binary version (it ignores unknown columns/tables).
 - *Rolling updates:* Builder Jobs (created by rio-controller) set `terminationGracePeriodSeconds: 7200` --- the builder's SIGTERM handler blocks until its single in-flight build completes, then exits 0. Gateway pods use the Kubernetes default (30s); no extended grace period is configured in the base manifests. Builder pods are one-shot, so a control-plane upgrade naturally rolls the fleet as Jobs complete and new ones spawn with the new image.
 - *Blue/green deployments:* Supported if separate PostgreSQL schemas and S3 key prefixes are used per deployment. The gateway can be switched atomically via NLB target group changes.
 - *Version skew policy:* Gateway and executor binaries can be at most 1 minor version behind the scheduler and store. The scheduler and store must be upgraded first.

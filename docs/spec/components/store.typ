@@ -882,7 +882,7 @@ content-addressed output mappings independently of narinfo signatures.
     PutPath runs freely throughout. The CTE's MVCC snapshot is a point-in-time
     view --- placeholders that commit after it are caught by sweep's re-check.
   - *Grace period:* Configurable per-invocation via `GcRequest.grace_period_hours`
-    (default *2h*). Protects paths uploaded shortly before GC that builds
+    (default *#(refs.const)("DEFAULT_GC_GRACE_HOURS")h*). Protects paths uploaded shortly before GC that builds
     haven't referenced yet.
   - *Phase 2 (Sweep):* Re-read chunk refcounts at sweep time (NOT from a
     mark-phase snapshot). Per unreachable path, in batched transactions:

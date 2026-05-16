@@ -246,7 +246,7 @@
   contain only the component binary and its direct runtime dependencies.
   Operator tooling --- rio-cli, jq, debugging utilities --- MUST NOT be
   bundled. Admin operations run rio-cli LOCALLY via `cargo xtask k8s cli`,
-  which port-forwards the gRPC endpoints and fetches the mTLS client cert from
+  which port-forwards the gRPC endpoints and fetches the service-HMAC key from
   the cluster. Bundling tooling in the scheduler image expands the attack
   surface (every transitive dependency is an execution primitive in a
   compromised pod) and couples the control-plane release cadence to CLI
