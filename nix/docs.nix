@@ -143,6 +143,7 @@ let
             (lib.fileset.fileFilter (f: f.name == "Cargo.toml") ../.)
             ../infra/helm/rio-build/templates/prometheusrule.yaml
             ../infra/helm/rio-build/values.yaml # helm_ns()
+            ../rio-proto/proto # protos()
           ];
         };
       }
@@ -161,6 +162,7 @@ let
         test "$(jq 'keys|length' $out/helm-ns.json)" -eq 4
         test "$(jq 'keys|length' $out/modules.json)" -gt 10
         test "$(jq '.subcommands|length' $out/cli.json)" -gt 10
+        test "$(jq 'keys|length' $out/protos.json)" -ge 8
       '';
 
   # `--input` pairs both targets must see. Factored so the PDF and

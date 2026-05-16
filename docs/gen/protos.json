@@ -1,0 +1,44 @@
+{
+  "admin.proto": {
+    "doc": "Administrative service for the rio-cli and rio-dashboard.",
+    "services": [
+      "AdminService"
+    ]
+  },
+  "admin_types.proto": {
+    "doc": "Admin/status wire types — ClusterStatus, ListExecutors/Builds/Tenants,",
+    "services": []
+  },
+  "build_types.proto": {
+    "doc": "Build lifecycle wire types — SubmitBuild/WatchBuild/QueryBuild/CancelBuild",
+    "services": []
+  },
+  "builder.proto": {
+    "doc": "Executor-facing RPCs served by the rio-scheduler process.",
+    "services": [
+      "ExecutorService"
+    ]
+  },
+  "dag.proto": {
+    "doc": "DAG wire types — derivation nodes/edges and per-derivation events.",
+    "services": []
+  },
+  "scheduler.proto": {
+    "doc": "Gateway-facing RPCs for build submission and monitoring.",
+    "services": [
+      "SchedulerService"
+    ]
+  },
+  "store.proto": {
+    "doc": "Store service for NAR storage and path metadata.",
+    "services": [
+      "StoreService",
+      "ChunkService",
+      "StoreAdminService"
+    ]
+  },
+  "types.proto": {
+    "doc": "Shared primitive message types — imported by every other .proto in the",
+    "services": []
+  }
+}

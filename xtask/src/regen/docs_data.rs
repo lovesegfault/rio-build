@@ -76,8 +76,9 @@ pub async fn run() -> Result<()> {
     write(&out, "crds.json", &crds()?)?;
     write(&out, "modules.json", &modules()?)?;
     write(&out, "cli.json", &cli()?)?;
+    write(&out, "protos.json", &protos()?)?;
     println!(
-        "wrote docs/gen/{{metrics,alerts,errors,config,workspace,consts,helm-ns,crds,modules,cli}}.json"
+        "wrote docs/gen/{{metrics,alerts,errors,config,workspace,consts,helm-ns,crds,modules,cli,protos}}.json"
     );
     Ok(())
 }
@@ -297,6 +298,36 @@ fn cli() -> Result<serde_json::Value> {
         .map(|c| c[1].to_kebab_case())
         .collect();
     Ok(json!({"subcommands": subs}))
+}
+
+fn protos() -> Result<serde_json::Value> {
+    // `service X` declarations + first `//` comment per .proto file.
+    // crate-structure.typ's proto/ block derives from this — last
+    // hand-tree (R7-030: it said BuilderService; file defines
+    // ExecutorService). Service-less files keep their first-comment
+    // summary so the row isn't blank.
+    let svc_re = Regex::new(r"(?m)^service\s+(\w+)\b")?;
+    let mut out = BTreeMap::<String, serde_json::Value>::new();
+    for entry in fs::read_dir(repo_root().join("rio-proto/proto"))? {
+        let p = entry?.path();
+        if p.extension().is_some_and(|e| e == "proto") {
+            let body = fs::read_to_string(&p)?;
+            let svcs: Vec<_> = svc_re
+                .captures_iter(&body)
+                .map(|c| c[1].to_string())
+                .collect();
+            let doc = body
+                .lines()
+                .find(|l| l.trim_start().starts_with("//"))
+                .map(|l| l.trim_start().trim_start_matches("//").trim().to_string())
+                .unwrap_or_default();
+            out.insert(
+                p.file_name().unwrap().to_string_lossy().into_owned(),
+                json!({"services": svcs, "doc": doc}),
+            );
+        }
+    }
+    Ok(json!(out))
 }
 
 /// `[workspace] members` from root Cargo.toml, minus `workspace-hack`
