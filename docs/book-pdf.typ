@@ -7,6 +7,13 @@
 // `#bibliography()` at the end. This makes bare `typst compile --root
 // docs docs/book-pdf.typ` work without `--input x-target=book-pdf`
 // (which the nix derivation still passes; both gates are equivalent).
+//
+// Scope: PDF = intro + architecture + spec/ + ref/. The HTML site
+// (book.typ) additionally has guide/, ops/, glossary, contributing —
+// operational/contributor content that doesn't belong in the design
+// reference PDF. A new SPEC or REF chapter goes in BOTH files; a new
+// guide/ops chapter is HTML-only. cross-link()s from PDF chapters to
+// HTML-only ones degrade to plain text in the PDF (acceptable).
 #import "/lib/rio.typ": book-pdf-mode
 #book-pdf-mode()
 #set document(title: "rio-build design book")
