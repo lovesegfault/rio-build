@@ -13,17 +13,15 @@ use serde_json::json;
 
 use crate::sh::repo_root;
 
-/// Optional `///` doc-block, then `#[error("msg" ...)] Ident`. `(?ms)`
-/// so `^` matches per-line for the doc capture and `.` spans the
+/// Optional `///` doc-block, optional intervening attrs (`#[cfg]`,
+/// `#[allow]`), then `#[error("msg" ...)] Ident`. `(?ms)` so `^`
+/// matches per-line for the doc/attr captures and `.` spans the
 /// `)]`→ident newline (rustfmt wraps long `#[error(...)]` bodies). The
 /// message capture handles `\"`/`\\` escapes (rio-nix/src/derivation/
 /// mod.rs has `expected '\"'`). Captures: 1=doc-block, 2=msg, 3=ident.
-/// Intervening attrs between `#[error]` and the ident aren't seen in
-/// this codebase (`#[cfg]` always precedes `#[error]`); if one shows
-/// up the variant is silently skipped, which is acceptable for a doc
-/// cross-ref table.
-const VARIANT_RE: &str =
-    r#"(?ms)((?:^\s*///[^\n]*\n)*)\s*#\[error\(\s*r?"((?:[^"\\]|\\.)*)"[^\]]*\]\s*([A-Z]\w*)"#;
+/// bug_014: without the attr-skip group, a `#[cfg]` between `///` and
+/// `#[error]` would orphan the doc capture (matched as zero-width).
+const VARIANT_RE: &str = r#"(?ms)((?:^\s*///[^\n]*\n)*)(?:^\s*#\[[^\]]+\]\s*\n)*\s*#\[error\(\s*r?"((?:[^"\\]|\\.)*)"[^\]]*\]\s*([A-Z]\w*)"#;
 
 /// `describe_{counter,gauge,histogram}!("rio_X_...", [Unit::*, ]"help")`.
 /// Kind from the macro name; the metrics-crate `Unit` arg is optional
@@ -72,7 +70,8 @@ pub async fn run() -> Result<()> {
     write(&out, "workspace.json", &workspace()?)?;
     write(&out, "consts.json", &consts()?)?;
     write(&out, "helm-ns.json", &helm_ns()?)?;
-    println!("wrote docs/gen/{{metrics,alerts,errors,config,workspace,consts,helm-ns}}.json");
+    write(&out, "crds.json", &crds()?)?;
+    println!("wrote docs/gen/{{metrics,alerts,errors,config,workspace,consts,helm-ns,crds}}.json");
     Ok(())
 }
 
@@ -81,6 +80,12 @@ fn write(dir: &Path, name: &str, v: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// Scrape `describe_{counter,gauge,histogram}!` callsites into
+/// `gen/metrics.json`. The `describe_*!()` help strings in each
+/// component's `lib.rs::describe_metrics()` are the source of truth;
+/// `docs/ref/metrics.typ` derives its tables from this output, NOT the
+/// other way around (the typst migration inverted the pre-existing
+/// "spec → describe" direction).
 fn metrics() -> Result<serde_json::Value> {
     let re = Regex::new(METRICS_RE)?;
     // First describe_*! wins per name (some metrics are described in
@@ -159,49 +164,92 @@ fn alerts() -> Result<serde_json::Value> {
     Ok(json!({"names": names.into_iter().collect::<Vec<_>>()}))
 }
 
+/// Strip `^\s*///\s?` from each line of a captured doc-block, join,
+/// whitespace-collapse. Shared by enum-level and variant-level `///`
+/// captures.
+fn strip_doc_prefix(s: &str) -> String {
+    s.lines()
+        .map(|l| l.trim_start().trim_start_matches("///").trim_start())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn errors() -> Result<serde_json::Value> {
-    // Enum-block: `(?:pub\s+)?` so non-pub error enums are scanned too
-    // (rio-gateway's StreamProcessError is private but documented in
-    // ref/errors.typ). `}` at column 0 closes the enum — error enums
-    // are always top-level items so this is unambiguous (struct-variant
-    // `}` are indented).
-    let enum_re = Regex::new(r"(?ms)^(?:pub\s+)?enum (\w*Error)\s*\{(.*?)^\}")?;
+    // Enum-block: optional `///` doc, optional attrs (#[derive],
+    // #[non_exhaustive]), `(?:pub\s+)?` so non-pub error enums are
+    // scanned too (rio-gateway's StreamProcessError is private but
+    // documented in ref/errors.typ). `}` at column 0 closes the enum —
+    // error enums are always top-level items so this is unambiguous
+    // (struct-variant `}` are indented). Captures: 1=enum-doc, 2=name,
+    // 3=body.
+    let enum_re = Regex::new(
+        r"(?ms)((?:^\s*///[^\n]*\n)*)(?:^\s*#\[[^\]]+\]\s*\n)*^(?:pub\s+)?enum (\w*Error)\s*\{(.*?)^\}",
+    )?;
     let variant_re = Regex::new(VARIANT_RE)?;
     let collapse = |s: String| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut variants = Vec::new();
+    let mut enums = Vec::new();
     visit_rio_crates(&mut |crate_name, body| {
         for em in enum_re.captures_iter(body) {
-            let enum_name = em[1].to_string();
-            for vm in variant_re.captures_iter(&em[2]) {
-                let doc = collapse(
-                    vm[1]
-                        .lines()
-                        .map(|l| l.trim_start().trim_start_matches("///").trim_start())
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                );
-                let msg = collapse(unescape_rust_str(&vm[2]));
+            let enum_name = em[2].to_string();
+            enums.push(json!({
+                "name": enum_name,
+                "crate": crate_name,
+                "doc": strip_doc_prefix(&em[1]),
+            }));
+            for vm in variant_re.captures_iter(&em[3]) {
                 variants.push(json!({
                     "enum": enum_name,
                     "name": vm[3].to_string(),
                     "crate": crate_name,
-                    "msg": msg,
-                    "doc": doc,
+                    "msg": collapse(unescape_rust_str(&vm[2])),
+                    "doc": strip_doc_prefix(&vm[1]),
                 }));
             }
         }
     })?;
-    variants.sort_by(|a, b| {
-        let k = |v: &serde_json::Value| {
-            (
-                v["crate"].as_str().unwrap().to_owned(),
-                v["enum"].as_str().unwrap().to_owned(),
-                v["name"].as_str().unwrap().to_owned(),
-            )
-        };
-        k(a).cmp(&k(b))
-    });
-    Ok(json!({"variants": variants}))
+    let key = |ks: &'static [&str]| {
+        move |v: &serde_json::Value| -> Vec<String> {
+            ks.iter()
+                .map(|k| v[k].as_str().unwrap().to_owned())
+                .collect()
+        }
+    };
+    variants.sort_by_key(key(&["crate", "enum", "name"]));
+    enums.sort_by_key(key(&["crate", "name"]));
+    Ok(json!({"variants": variants, "enums": enums}))
+}
+
+fn crds() -> Result<serde_json::Value> {
+    // Scrape `#[kube(..., kind = "X", ...)]` and the following
+    // `pub struct XSpec { pub field: ... }` from rio-crds. Same
+    // regex-on-source approach as metrics()/errors() — docsData runs
+    // without cargo so no kube-rs introspection.
+    let kind_re = Regex::new(r#"kind\s*=\s*"(\w+)""#)?;
+    let spec_re = Regex::new(r"(?ms)^pub struct (\w+)Spec\s*\{(.*?)^\}")?;
+    let field_re = Regex::new(r"(?m)^\s*pub\s+(\w+)\s*:")?;
+    let mut kinds = BTreeSet::new();
+    let mut fields = BTreeMap::<String, Vec<String>>::new();
+    for entry in fs::read_dir(repo_root().join("rio-crds/src"))? {
+        let p = entry?.path();
+        if p.extension().is_none_or(|x| x != "rs") {
+            continue;
+        }
+        let body = fs::read_to_string(&p)?;
+        kinds.extend(kind_re.captures_iter(&body).map(|c| c[1].to_string()));
+        for s in spec_re.captures_iter(&body) {
+            let kind = s[1].to_string();
+            let fs: Vec<_> = field_re
+                .captures_iter(&s[2])
+                .map(|c| c[1].to_string())
+                .collect();
+            fields.insert(kind, fs);
+        }
+    }
+    Ok(json!({"kinds": kinds.into_iter().collect::<Vec<_>>(), "fields": fields}))
 }
 
 fn workspace() -> Result<serde_json::Value> {
@@ -353,6 +401,7 @@ fn default_dep_closure(t: &toml::Table) -> BTreeSet<String> {
 fn consts() -> Result<serde_json::Value> {
     const TABLE: &[(&str, &str)] = &[
         ("MAX_RECONNECT", "rio-gateway/src/handler/build.rs"),
+        ("DEFAULT_GC_GRACE_HOURS", "rio-store/src/grpc/admin.rs"),
         // Add more as docs cite them. Threshold: cited at ≥2 prose
         // sites, value is a plain integer literal.
     ];
@@ -623,6 +672,21 @@ mod tests {
         assert_eq!(caps[1].0, ""); // no doc block
         assert_eq!(caps[1].1, r#"expected '"' to start string"#);
         assert_eq!(caps[1].2, "ExpectedStringStart");
+    }
+
+    #[test]
+    fn variant_re_handles_attrs_between_doc_and_error() {
+        let re = Regex::new(VARIANT_RE).unwrap();
+        for src in [
+            // single #[cfg]
+            "    /// doc.\n    #[cfg(feature = \"server\")]\n    #[error(\"m\")]\n    Foo,",
+            // stacked attrs
+            "    /// doc.\n    #[cfg(test)]\n    #[allow(dead_code)]\n    #[error(\"m\")]\n    Foo,",
+        ] {
+            let c = re.captures(src).unwrap();
+            assert!(c[1].contains("doc."), "doc not captured for: {src}");
+            assert_eq!(&c[3], "Foo");
+        }
     }
 
     #[test]

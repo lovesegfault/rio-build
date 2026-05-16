@@ -1,3 +1,4 @@
 {
+  "DEFAULT_GC_GRACE_HOURS": 2,
   "MAX_RECONNECT": 10
 }

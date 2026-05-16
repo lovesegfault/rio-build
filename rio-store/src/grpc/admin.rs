@@ -14,6 +14,11 @@
 // workflow; see the "Signing keys" section of
 // docs/spec/components/store.typ.
 
+/// Default GC grace period when the AdminService GC request omits
+/// `grace_period_hours`. The window after a gateway restart during
+/// which a temp-root's referent stays GC-safe.
+const DEFAULT_GC_GRACE_HOURS: u32 = 2;
+
 use std::sync::Arc;
 
 use sqlx::PgPool;
@@ -225,7 +230,10 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         // depth against callers that bypass admin.rs). u32 > i32::MAX wraps
         // negative → make_interval(hours => negative) → grace protects
         // nothing. 24*365 = one-year ceiling; log shows effective value.
-        let grace_hours = req.grace_period_hours.unwrap_or(2).min(24 * 365);
+        let grace_hours = req
+            .grace_period_hours
+            .unwrap_or(DEFAULT_GC_GRACE_HOURS)
+            .min(24 * 365);
 
         info!(
             dry_run = req.dry_run,

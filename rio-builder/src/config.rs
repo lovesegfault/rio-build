@@ -147,10 +147,11 @@ pub struct Config {
     /// Fail-closed: when `false` only the scalar `alu` probe runs and
     /// the K=3 bench is skipped (`r[sched.sla.hw-class.k3-bench]`).
     pub hw_bench_needed: bool,
-    /// ADR-023 SpawnIntent match key from the pod's `rio.build/
-    /// intent-id` annotation (downward API → `RIO_INTENT_ID`). Sent
-    /// in every heartbeat so the scheduler can match this pod to its
-    /// pre-computed assignment. Empty = Static-sized pod (no intent).
+    /// ADR-023 SpawnIntent match key from the pod's
+    /// `rio.build/intent-id` annotation (downward API →
+    /// `RIO_INTENT_ID`). Sent in every heartbeat so the scheduler can
+    /// match this pod to its pre-computed assignment. Empty =
+    /// Static-sized pod (no intent).
     pub intent_id: String,
     /// HMAC-signed `ExecutorClaims{intent_id, kind, expiry}` from the
     /// controller's `RIO_EXECUTOR_TOKEN` env var (passed through from

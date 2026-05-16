@@ -1,4 +1,156 @@
 {
+  "enums": [
+    {
+      "crate": "rio-auth",
+      "doc": "",
+      "name": "HmacError"
+    },
+    {
+      "crate": "rio-auth",
+      "doc": "",
+      "name": "JwtError"
+    },
+    {
+      "crate": "rio-builder",
+      "doc": "Error type for executor operations. No `#[from] anyhow::Error` — every variant has a typed source. A catch-all `#[from] anyhow::Error` would mean any `?` on an anyhow::Result anywhere in execute_build silently becomes the wrong variant. Typed sources make the compiler catch misattribution at the `?` site.",
+      "name": "ExecutorError"
+    },
+    {
+      "crate": "rio-builder",
+      "doc": "Errors from overlay setup and teardown. Distinct from `anyhow::Error` so `ExecutorError::Overlay(#[from])` only catches overlay failures — a bare `?` on an unrelated `anyhow::Result` elsewhere in `execute_build` no longer silently becomes an \"overlay setup failed\" message.",
+      "name": "OverlayError"
+    },
+    {
+      "crate": "rio-builder",
+      "doc": "Errors from upload operations. NAR serialization happens inside the retry loop (each retry is a fresh disk read), so NAR errors surface as `UploadExhausted` wrapping a `tonic::Status::internal(\"NAR serialization failed...\")`.",
+      "name": "UploadError"
+    },
+    {
+      "crate": "rio-common",
+      "doc": "Construction-time rejection. The `Display` impl's message is what callers map to `Status::invalid_argument`.",
+      "name": "NameError"
+    },
+    {
+      "crate": "rio-controller",
+      "doc": "Top-level reconcile error. kube's `Controller::run` takes an `error_policy` fn that receives this and decides requeue timing. `Box` on the finalizer variant: `finalizer::Error<Self>` is recursive (it wraps our Error for ApplyFailed/CleanupFailed). Unboxed it's an infinite-size type. Box breaks the cycle with a pointer indirection.",
+      "name": "Error"
+    },
+    {
+      "crate": "rio-gateway",
+      "doc": "Typed errors for the handler layer. Converts to `anyhow::Error` at the boundary via `thiserror`'s `std::error::Error` impl + anyhow's blanket `From<E: Error>`. The outer handler signature remains `anyhow::Result<()>` — use `.into()` or `?` to convert.",
+      "name": "GatewayError"
+    },
+    {
+      "crate": "rio-gateway",
+      "doc": "Error from `process_build_events`. Distinguishes transport errors (scheduler connection dropped — reconnect-worthy) from stream EOF without terminal (scheduler closed gracefully but incompletely — NOT reconnect-worthy, the build state is lost).",
+      "name": "StreamProcessError"
+    },
+    {
+      "crate": "rio-nix",
+      "doc": "Errors from parsing or hashing ATerm derivations.",
+      "name": "DerivationError"
+    },
+    {
+      "crate": "rio-nix",
+      "doc": "Errors from parsing a `DerivedPath` string.",
+      "name": "DerivedPathError"
+    },
+    {
+      "crate": "rio-nix",
+      "doc": "Errors specific to the handshake.",
+      "name": "HandshakeError"
+    },
+    {
+      "crate": "rio-nix",
+      "doc": "",
+      "name": "HashError"
+    },
+    {
+      "crate": "rio-nix",
+      "doc": "Errors from NAR operations.",
+      "name": "NarError"
+    },
+    {
+      "crate": "rio-nix",
+      "doc": "Errors from narinfo parsing.",
+      "name": "NarInfoError"
+    },
+    {
+      "crate": "rio-nix",
+      "doc": "",
+      "name": "StorePathError"
+    },
+    {
+      "crate": "rio-nix",
+      "doc": "",
+      "name": "WireError"
+    },
+    {
+      "crate": "rio-proto",
+      "doc": "Error from [`collect_nar_stream`] / [`collect_nar_stream_to_writer`].",
+      "name": "NarCollectError"
+    },
+    {
+      "crate": "rio-proto",
+      "doc": "",
+      "name": "PathInfoValidationError"
+    },
+    {
+      "crate": "rio-scheduler",
+      "doc": "Errors from the actor.",
+      "name": "ActorError"
+    },
+    {
+      "crate": "rio-scheduler",
+      "doc": "Errors from DAG operations.",
+      "name": "DagError"
+    },
+    {
+      "crate": "rio-scheduler",
+      "doc": "Errors during CA input resolution.",
+      "name": "ResolveError"
+    },
+    {
+      "crate": "rio-scheduler",
+      "doc": "Errors from state machine transitions. Lives in mod.rs (not derivation.rs or build.rs) because variants reference both `DerivationStatus` and `BuildState` — putting it in either submodule would create a dependency on the other.",
+      "name": "TransitionError"
+    },
+    {
+      "crate": "rio-store",
+      "doc": "Domain error from [`AdmissionGate::acquire_bounded`]. Kept tonic-free so [`crate::substitute::Substituter`] can hold the gate without pulling gRPC types into its error enum; the gRPC layer maps via `From<AdmissionError> for Status`.",
+      "name": "AdmissionError"
+    },
+    {
+      "crate": "rio-store",
+      "doc": "Error from `ChunkCache::get_verified`.",
+      "name": "ChunkError"
+    },
+    {
+      "crate": "rio-store",
+      "doc": "",
+      "name": "ManifestError"
+    },
+    {
+      "crate": "rio-store",
+      "doc": "Typed error for the metadata/DB layer. Replaces `anyhow::Result` so callers can discriminate retriable failures (connection, serialization) from permanent ones (corruption) and map to precise gRPC status codes.",
+      "name": "MetadataError"
+    },
+    {
+      "crate": "rio-store",
+      "doc": "How [`persist_nar`] failed. The caller maps this to its own error domain (`tonic::Status` for gRPC, `SubstituteError` for substitution) and decides whether to [`abort_placeholder`]: the chunked path already rolled back internally.",
+      "name": "PersistError"
+    },
+    {
+      "crate": "rio-store",
+      "doc": "",
+      "name": "SignerError"
+    },
+    {
+      "crate": "rio-store",
+      "doc": "Errors surfaced by the substitution path. Callers map these to gRPC status; `NotFound` is the normal miss case (no upstream has the path, or the tenant has no upstreams configured). `Clone` so moka's `try_get_with` can hand the same error to every coalesced waiter (it stores `Arc<E>` internally; we unwrap to owned).",
+      "name": "SubstituteError"
+    }
+  ],
   "variants": [
     {
       "crate": "rio-auth",
@@ -1129,7 +1281,7 @@
     },
     {
       "crate": "rio-store",
-      "doc": "",
+      "doc": "A `manifest_data.chunk_list` blob failed to deserialize. Written by us, read by us — if it doesn't round-trip, either the write was torn or the format version is wrong. NOT retriable. Maps to `data_loss`.",
       "enum": "MetadataError",
       "msg": "corrupt manifest_data for {store_path}: {source}",
       "name": "CorruptManifest"
@@ -1150,7 +1302,7 @@
     },
     {
       "crate": "rio-store",
-      "doc": "",
+      "doc": "A narinfo row failed validation (bad store_path, wrong-length nar_hash). PG's schema doesn't enforce these as CHECK constraints. Caught at the egress boundary. NOT retriable. Maps to `internal`.",
       "enum": "MetadataError",
       "msg": "malformed narinfo row: {0}",
       "name": "MalformedRow"

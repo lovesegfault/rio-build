@@ -93,7 +93,7 @@
       },
       {
         "default": "",
-        "description": "ADR-023 SpawnIntent match key from the pod's `rio.build/ intent-id` annotation (downward API → `RIO_INTENT_ID`).",
+        "description": "ADR-023 SpawnIntent match key from the pod's `rio.build/intent-id` annotation (downward API → `RIO_INTENT_ID`).",
         "key": "intent_id",
         "type": "string"
       },
