@@ -335,6 +335,7 @@ in
               ]
             ) ../infra)
             ../.github
+            ../.cargo
           ];
         };
         # Directories #src()/refs.gh paths reference. Fileset (not bare
@@ -399,9 +400,16 @@ in
         stems=$(grep -oE '#chapter\("[^"]+\.typ"' $typSrc/book.typ \
           | sed 's/#chapter("//;s/\.typ"//' \
           | xargs -n1 basename | sort -u | paste -sd'|')
+        # Folded chapters: existed in docs/src/*.md, merged into other
+        # .typ files during the migration (no 1:1 .typ). Frozen
+        # migration-time diff of `git ls-tree origin/main -- docs/src/`
+        # minus the book.typ chapter set; not derivable in the hermetic
+        # build (no git).
+        folded="challenges|dependencies|data-flows|decisions|components|integration|introduction|multi-tenancy|SUMMARY"
+        stems="$stems|$folded"
         # nb: this file is in $crossSrc — the literal pattern below
         # would match itself, so misc-checks.nix is excluded post-hoc.
-        if grep -rn -E "\b($stems)\.md\b|docs/src/" $crossSrc \
+        if grep -rn -E "\b($stems)\.md\b|docs/src/" $crossSrc $typSrc \
              | grep -v 'nix/misc-checks\.nix'; then
           echo "FAIL: stale .md reference to a migrated chapter — update to .typ path" >&2
           fail=1
@@ -433,8 +441,33 @@ in
         # Retired identifiers — names that no longer exist in code/CRDs/
         # CLI but kept appearing in docs (R4: ≥5 instances). One
         # alternation per rename; future renames append here.
-        if grep -rn -E '\bBuilderPool\b|\bbps\b subcommand|RIO_TLS__|\bTlsError\b|rio-common/src/tls\.rs|load_client_tls|init_client_tls|fod-proxy|spec\.sizing|Sizing::' $typSrc; then
+        if grep -rn -E '\bBuilderPool\b|\bbps\b subcommand|RIO_TLS__|\bTlsError\b|rio-common/src/tls\.rs|load_client_tls|init_client_tls|fod-proxy|spec\.sizing|Sizing::|mTLS client[- ]cert|fuseCacheBudget|logBudget|migration-lock mechanism' $typSrc; then
           echo "FAIL: retired identifier in docs — see deny-list in misc-checks.nix" >&2
+          fail=1
+        fi
+        # mTLS-client-cert phrasing also lives in rust comments + helm/
+        # nix (docker.nix, rio-cli, xtask, values.yaml) — scan crossSrc
+        # too. The rio-auth/common/store "replaced mTLS CN-allowlist"
+        # historical comments don't match this phrase (verified).
+        if grep -rn -iE 'mTLS client[- ]cert' $crossSrc; then
+          echo "FAIL: retired mTLS-client-cert claim in non-doc source" >&2
+          fail=1
+        fi
+        # DEFAULT_GC_GRACE_HOURS literal-value tripwire — the const is
+        # in gen/consts.json so prose must derive. R4 derived 1/4; R5
+        # found 3 left.
+        if grep -rn -E '\b2h\b.*grace|grace.*\b2h\b' $typSrc; then
+          echo "FAIL: literal '2h' grace-period — use #(refs.const)(\"DEFAULT_GC_GRACE_HOURS\")h" >&2
+          fail=1
+        fi
+        # configuration.typ is 100% derived from rust Config::default()
+        # via gen/config.json. Rust source citing it as a spec source is
+        # inverted-dataflow (R3-m002, R4-003, R5-019). observability.typ
+        # is NOT in this pattern — ~25 legitimate `Per observability.typ`
+        # refs describe spec contracts that aren't derived.
+        if grep -rn --include='*.rs' '\bconfiguration\.typ\b' $crossSrc \
+             | grep -v 'render.*into\|flows\? into\|-> .*configuration\.typ'; then
+          echo "FAIL: rust comment cites configuration.typ — it's derived FROM rust" >&2
           fail=1
         fi
         # describe_metrics() doc-comment parity. Five lib.rs comments
