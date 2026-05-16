@@ -31,6 +31,23 @@
   }
   m
 }
+#let _crds = json("/gen/crds.json")
+// Components whose config carries a `lease_name` (or `*.lease_name`)
+// key — i.e., they hold a Kubernetes Lease for leader election.
+// merged_015: 3 prose sites disagreed on this; derive.
+#let _leased = {
+  let leased = ()
+  for (comp, fields) in _cfg-map {
+    if fields.keys().any(k => k.ends-with("lease_name")) {
+      leased.push(comp)
+    }
+  }
+  leased.sorted()
+}
+#assert(
+  _leased.len() >= 2,
+  message: "refs.leased-components derived <2 — config-key shape changed?",
+)
 #let _gh-sha = sys.inputs.at("gh-sha", default: "main")
 #let _src(p) = text(
   font: "DejaVu Sans Mono",
@@ -88,8 +105,25 @@
       v != none,
       message: "unknown error variant: " + enum-name + "::" + variant,
     )
+    assert(
+      v.doc != "",
+      message: "error variant has no /// doc: " + enum-name + "::" + variant,
+    )
     [#v.doc]
   },
+  crd: kind => {
+    assert(kind in _crds.kinds, message: "unknown CRD kind: " + kind)
+    raw(kind)
+  },
+  crd-field: (kind, field) => {
+    assert(kind in _crds.fields, message: "unknown CRD kind: " + kind)
+    assert(
+      field in _crds.fields.at(kind),
+      message: "unknown " + kind + " field: " + field,
+    )
+    raw(field)
+  },
+  leased-components: () => _leased.map(raw).join(" and "),
   crate: name => {
     assert(name in _ws-names, message: "unknown crate: " + name)
     raw(name)
