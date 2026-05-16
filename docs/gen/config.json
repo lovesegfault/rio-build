@@ -99,7 +99,7 @@
       },
       {
         "default": "250000",
-        "description": "Log limits (configuration.md:68-69). 0 = unlimited.",
+        "description": "Log limits (configuration.typ). 0 = unlimited.",
         "key": "log_rate_limit",
         "type": "uint64"
       },

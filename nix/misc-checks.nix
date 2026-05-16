@@ -297,14 +297,33 @@ in
   # Prose references that bypass lib/refs.typ validators. Grep-based —
   # typst itself can't see raw backticks. Each pattern catches a class
   # that has produced ≥1 bughunter finding (Nth-strike close for
-  # merged_001/028/032 et al.).
+  # merged_001/028/032 et al.; tightened per merged_015/bug_005).
   docs-lint =
     pkgs.runCommand "rio-docs-lint"
       {
         nativeBuildInputs = [ pkgs.jq ];
-        src = pkgs.lib.fileset.toSource {
+        # docs/**/*.typ minus gitignored build artifacts (mirrors
+        # docsSrc — without the difference, .cache/typst-xdg vendored
+        # packages (~230 .typ files) are scanned and the lint becomes
+        # non-deterministic across dev environments).
+        typSrc = pkgs.lib.fileset.toSource {
           root = ../docs;
-          fileset = pkgs.lib.fileset.fileFilter (f: f.hasExt "typ") ../docs;
+          fileset = pkgs.lib.fileset.difference (pkgs.lib.fileset.fileFilter (f: f.hasExt "typ") ../docs) (
+            pkgs.lib.fileset.unions [
+              (pkgs.lib.fileset.maybeMissing ../docs/.cache)
+              (pkgs.lib.fileset.maybeMissing ../docs/dist)
+            ]
+          );
+        };
+        # Non-.typ files that reference docs by path — rust comments +
+        # warn! bodies, nix comments, github workflows, shell scripts.
+        crossSrc = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../.)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "nix" || f.hasExt "sh") ../nix)
+            ../.github
+          ];
         };
         metricsJson = ../docs/gen/metrics.json;
       }
@@ -314,7 +333,7 @@ in
         # Internal .md link — must be #cross-link("/abs.typ") or plain text.
         # Match every .md target, then exclude only URLs (`://`). Covers both
         # `#link("x.md")` and `#link("x.md", body)` two-arg forms.
-        if grep -rn --include='*.typ' -E '#link\("[^"]*\.md"' $src \
+        if grep -rn --include='*.typ' -E '#link\("[^"]*\.md"' $typSrc \
              | grep -v '://'; then
           echo "FAIL: internal #link to .md — use #cross-link or drop link" >&2
           fail=1
@@ -324,13 +343,39 @@ in
         # pattern (not suffix-based: 28 distinct suffixes, only 6 are
         # common; prefix catches all). Prefix alternation derived from
         # metrics.json so a new component auto-extends the lint.
-        # ref/metrics.typ is the generated table and is allowed raw
-        # names (it IS the source).
+        # ref/metrics.typ derives FROM metrics.json now so no exemption.
         comps=$(jq -r '.names[] | capture("^rio_(?<c>[a-z]+)_").c' $metricsJson \
           | sort -u | paste -sd'|')
-        if grep -rn --include='*.typ' -E "\`rio_($comps)_[a-z_]+" $src \
-             | grep -v 'ref/metrics\.typ\|lib/refs\.typ'; then
+        if grep -rn --include='*.typ' -E "\`rio_($comps)_[a-z_]+" $typSrc \
+             | grep -v 'lib/refs\.typ'; then
           echo "FAIL: raw metric name — use #(refs.metric)(\"…\")" >&2
+          fail=1
+        fi
+        # Stale `<chapter>.md` reference in non-typ sources — the
+        # chapter was migrated to typst. Stem alternation derived from
+        # book.typ's #chapter() list (the canonical chapter set; same
+        # source as the book-pdf-subset check below) so a new chapter
+        # auto-extends and lib/book/manifest stems are excluded by
+        # construction.
+        stems=$(grep -oE '#chapter\("[^"]+\.typ"' $typSrc/book.typ \
+          | sed 's/#chapter("//;s/\.typ"//' \
+          | xargs -n1 basename | sort -u | paste -sd'|')
+        # nb: this file is in $crossSrc — the literal pattern below
+        # would match itself, so misc-checks.nix is excluded post-hoc.
+        if grep -rn -E "\b($stems)\.md\b|docs/src/" $crossSrc \
+             | grep -v 'nix/misc-checks\.nix'; then
+          echo "FAIL: stale .md reference to a migrated chapter — update to .typ path" >&2
+          fail=1
+        fi
+        # book-pdf.typ includes ⊆ book.typ chapters. Catches stale/typo'd
+        # #include paths; the reverse (HTML chapter not in PDF) is
+        # intentional per book-pdf.typ's scope comment.
+        pdf=$(grep -oE '#include "[^"]+\.typ"' $typSrc/book-pdf.typ | sed 's/#include "//;s/"//')
+        html=$(grep -oE '#chapter\("[^"]+\.typ"' $typSrc/book.typ | sed 's/#chapter("//;s/"//')
+        stray=$(comm -23 <(echo "$pdf" | sort) <(echo "$html" | sort))
+        if [[ -n "$stray" ]]; then
+          echo "FAIL: book-pdf.typ includes chapters not in book.typ:" >&2
+          echo "$stray" >&2
           fail=1
         fi
         [[ $fail -eq 0 ]]
@@ -345,6 +390,7 @@ in
   review-ref =
     pkgs.runCommand "rio-review-ref"
       {
+        nativeBuildInputs = [ pkgs.gawk ];
         rs = pkgs.lib.fileset.toSource {
           root = ../.;
           fileset = pkgs.lib.fileset.unions [
@@ -357,13 +403,29 @@ in
         set -euo pipefail
         hdrs=$(grep -E '^## ' $rs/docs/REVIEW.md | sed 's/^## //; s/ /-/g' | tr 'A-Z' 'a-z')
         fail=0
-        while IFS= read -r line; do
-          ref=$(echo "$line" | grep -oE 'REVIEW\.md §[A-Za-z-]+' | sed 's/.*§//' | tr 'A-Z' 'a-z')
-          if ! echo "$hdrs" | grep -q "^$ref"; then
-            echo "FAIL: dangling REVIEW.md ref: $line" >&2
+        # Two trigger forms: `REVIEW.md §Word` on one line, or
+        # `…REVIEW.md` at EOL followed by `// §Word` (rustfmt wraps long
+        # comments — snapshot.rs:763, sla/mod.rs:154). Any non-comment
+        # line resets the carry so a stray `§` after a code line doesn't
+        # match.
+        while IFS=: read -r file line ref; do
+          ref_l=$(echo "$ref" | tr 'A-Z' 'a-z')
+          if ! echo "$hdrs" | grep -q "^$ref_l"; then
+            echo "FAIL: dangling REVIEW.md ref: $file:$line §$ref" >&2
             fail=1
           fi
-        done < <(grep -rn --include='*.rs' 'REVIEW\.md §' $rs)
+        done < <(
+          find $rs -name '*.rs' -exec gawk '
+            match($0, /REVIEW\.md[[:space:]]*§([A-Za-z][A-Za-z-]*)/, m) {
+              print FILENAME":"FNR":"m[1]; carry=0; next
+            }
+            /REVIEW\.md[[:space:]]*$/ { carry=1; next }
+            carry && match($0, /^[[:space:]]*\/\/\/?[[:space:]]*§([A-Za-z][A-Za-z-]*)/, m) {
+              print FILENAME":"FNR":"m[1]
+            }
+            { carry=0 }
+          ' {} +
+        )
         [[ $fail -eq 0 ]]
         touch $out
       '';

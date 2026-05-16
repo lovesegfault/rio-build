@@ -430,7 +430,7 @@ async fn gt13_batch_reclaims_stale_uploading() -> TestResult {
 /// Placeholder cleanup is now structural (PlaceholderGuard's Drop
 /// reaps owned placeholders on ANY exit including a bare `?`), but a
 /// `?` still bypasses the metric increment — the SLI at
-/// observability.md:351 would over-report availability. Every error
+/// observability.typ would over-report availability. Every error
 /// return in phase-2/phase-3 MUST go through `bail!`.
 ///
 /// Brittle-by-design: a false-positive on a `?` inside a closure or a

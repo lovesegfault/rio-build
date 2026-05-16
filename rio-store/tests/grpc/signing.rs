@@ -172,7 +172,7 @@ async fn test_putpath_sig_covers_references() -> TestResult {
 }
 
 // ===========================================================================
-// Per-tenant signing — store.tenant.sign-key (store.md:188)
+// Per-tenant signing — store.tenant.sign-key (store.typ)
 // ===========================================================================
 
 /// Spawn a store server with a fake interceptor that ALWAYS attaches
