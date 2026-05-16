@@ -120,11 +120,12 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
   // if the controller's lease config goes away this box is stale and
   // the typst build fails here instead of silently rotting.
   #let _ = (refs.cfg)("controller", "nodeclaim_pool.lease_name")
-  The controller's `nodeclaim_pool` reconciler is leader-elected via
-  `rio_lease` (since ADR-023 §13b), as is the scheduler --- both hold a
-  Kubernetes Lease. The chart default is still single-replica for the
-  controller; see #cross-link("/spec/components/controller.typ")[the
-    controller component spec] for the lease scoping.
+  Leader-elected components: #(refs.leased-components)() (each holds a
+  Kubernetes Lease via `rio_lease`; for the controller it's the
+  `nodeclaim_pool` reconciler since ADR-023 §13b). The chart default is
+  still single-replica for the controller; see
+  #cross-link("/spec/components/controller.typ")[the controller
+    component spec] for the lease scoping.
 ]
 
 = Transport

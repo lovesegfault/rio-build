@@ -33,7 +33,7 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
   [rio-controller],
   [Deployment],
   [1],
-  [K8s operator. *Single replica, not leader-elected* --- two controllers would fight over SSA patches (conflicting fieldManager). Add @leader-election later if the \~30s pod-reschedule gap during restart becomes a problem.],
+  [K8s operator. *Single replica by chart default*; the `nodeclaim_pool` reconciler is leader-elected via `rio_lease`. Leader-elected components: #(refs.leased-components)().],
 
   [rio-builder],
   [Job (ephemeral)],
