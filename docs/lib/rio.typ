@@ -170,6 +170,12 @@
 #let _book-mode = state("rio-book-mode", false)
 #let book-pdf-mode() = _book-mode.update(true)
 
+// Label/anchor id with the tracey `+N` revision suffix stripped.
+// Spec authors write `#r("foo+2")` (the `+N` is tracey's bump grammar)
+// but reference as `#rref("foo")`; the label must be version-agnostic
+// so a `tracey bump` doesn't silently kill inbound links (bug_025).
+#let _rid(id) = "r-" + id.replace(regex("\+\d+$"), "")
+
 #let r(id, ..body) = context {
   let ds = _domains.get()
   assert(
@@ -182,18 +188,22 @@
     // (regex for `r[...]`/`#r("...")`), not compiled output, so this
     // doesn't affect `tracey query`.
     //
-    // The trailing typst `#label("r-"+id)` is what makes `rref()`'s
+    // The trailing typst `#label(_rid(id))` is what makes `rref()`'s
     // `query(label())` find the target in static-HTML mode — the html
     // `id:` attr alone is invisible to query(). typst's `link(label,…)`
     // resolves the href to the labelled element's html `id` attribute,
     // so the two stay in sync (verified empirically).
-    [#html.elem("div", attrs: (class: "rio-req", id: "r-" + id), {
+    [#html.elem("div", attrs: (class: "rio-req", id: _rid(id)), {
         html.elem("code", attrs: (class: "rio-req-id"), "r[" + id + "]")
         [ ]
         body.pos().join()
-      }) #label("r-" + id)]
+      }) #label(_rid(id))]
   } else {
-    req(id, ..body)
+    // tracey's bundled req() doesn't attach a #label — add one so
+    // rref() resolves in PDF/dyn-paged too. The displayed badge keeps
+    // the full `+N` id (req renders it); only the LINK target is
+    // version-agnostic.
+    [#req(id, ..body) #label(_rid(id))]
   }
 }
 
@@ -201,7 +211,7 @@
 // the target label exists in this compilation unit, plain mono otherwise
 // so standalone chapter compiles don't fail on out-of-chapter refs).
 #let rref(id) = context {
-  let lbl = label("r-" + id)
+  let lbl = label(_rid(id))
   let body = text(
     font: "DejaVu Sans Mono",
     size: 0.85em,

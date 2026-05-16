@@ -12,6 +12,7 @@
 
 #let _metrics = json("/gen/metrics.json").names
 #let _alerts = json("/gen/alerts.json").names
+#let _errors = json("/gen/errors.json")
 #let _ws = json("/gen/workspace.json")
 // _ws.members is [{name, description}]; extract names for membership.
 #let _ws-names = _ws.members.map(m => m.name)
@@ -75,6 +76,19 @@
   psa: ns => {
     assert(ns in _helm-ns, message: "unknown namespace: " + ns)
     raw(_helm-ns.at(ns).psa)
+  },
+  // Per-variant explanation from the rust `///` doc-comment above each
+  // `#[error(...)]`. merged_021: three docs restated the Wire variant's
+  // semantics; two were wrong. The rust comment is the single source.
+  error-doc: (enum-name, variant) => {
+    let v = _errors.variants.find(e => (
+      e.enum == enum-name and e.name == variant
+    ))
+    assert(
+      v != none,
+      message: "unknown error variant: " + enum-name + "::" + variant,
+    )
+    [#v.doc]
   },
   crate: name => {
     assert(name in _ws-names, message: "unknown crate: " + name)
