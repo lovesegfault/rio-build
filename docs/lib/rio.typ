@@ -38,7 +38,7 @@
   cross-link, is-html-target, is-pdf-target, is-web-target, shiroa-sys-target,
   templates, x-current, x-url-base,
 )
-#import templates: equation-rules, markup-rules, template-rules, theme-box
+#import templates: markup-rules, template-rules
 // tracey's `req()` rendering helper is no longer used — `#r()` below
 // renders via showybox (paged) / html.elem (html) directly. The
 // `@preview/tracey` package stays in nix/docs.nix typstDeps for
@@ -81,27 +81,13 @@
 #let rule-color = rgb("#d0d7de")
 
 // ─── shiroa html-frame theming ──────────────────────────────────────
-// equation-rules renders inline math as inline SVG via html.frame().
-// shiroa's theme-box emits a dark + light copy under `.dark`/`.light`
-// so the theme CSS (mdbook's general.css) can toggle them. Figures do
-// NOT use this anymore — they emit one variant and the CSS filter at
-// `.rio-figure svg` handles dark themes (halves the per-figure SVG
-// payload). Inline equations have no `.rio-figure` wrapper so still
-// need both copies. theme-box expects a `themes` dict with `is-dark` +
-// `main-color` per variant; shiroa ships no preset (its
-// theme-box-styles-from() parses tmTheme XML for code highlighting,
-// which we don't use — codly handles raw), so build the minimal dict
-// directly.
-#let _web-themes = (
-  light-theme: (is-dark: false, main-color: rgb("#1b1f24")),
-  dark-theme: (is-dark: true, main-color: rgb("#c9d1d9")),
-  default-theme: (
-    is-dark: false,
-    main-color: rgb("#1b1f24"),
-    dash-color: accent,
-  ),
-)
-#let _theme-frame = theme-box.with(themes: _web-themes)
+// Figures and equations both render as inline SVG via html.frame().
+// Neither dual-renders anymore — figures recolor via CSS filter
+// (.rio-figure svg) and equations via `currentColor`: they emit at a
+// sentinel fill (#000000) that nix/docs-svg-dedup.py rewrites to
+// `fill="currentColor"`, and `.inline-equation svg { color: var(--fg) }`
+// themes it. shiroa's theme-box (which emitted dark+light copies and
+// class-toggled visibility) is no longer used.
 
 // Flatten book-meta.summary into [(path, title), ...] and locate
 // x-current. Returns (title: str, prev: (path,title)|none,
@@ -415,9 +401,9 @@
   } else { it }
 
   show math.equation.where(block: true): set block(above: 1.1em, below: 1.1em)
-  // box() is paged-layout — in html mode equation-rules wraps the
-  // equation in html.frame() and an outer box() would re-trigger the
-  // "layout ignored" warning.
+  // box() is paged-layout — in html mode the equation show-rule below
+  // wraps the equation in html.frame() and an outer box() would
+  // re-trigger the "layout ignored" warning.
   show math.equation.where(block: false): it => if is-paged-out {
     box(it)
   } else {
@@ -564,13 +550,11 @@
   // html.elem/html.frame/add-styles, which don't exist when typst's
   // target is paged. dyn-paged (is-web-target) must NOT enter here.
   //
-  // markup-rules + equation-rules + the figure/clue bypasses go inside
+  // markup-rules + the equation/figure/clue bypasses go inside
   // template-rules so they transform the content that lands in mdbook's
   // main-content slot.
   //
   // markup-rules only destructures `default-theme.dash-color`.
-  // equation-rules needs a `theme-box` callback (dark/light dual-render
-  // for the CSS toggle) — see _theme-frame above.
   // figure.where(kind: image) catches every #figure(diagram(...)),
   // chronos.diagram, automaton, autograph, lq.diagram — typst defaults
   // unrecognised figure bodies to kind: image. Algorithm/listing/table/
@@ -581,6 +565,11 @@
   // does NOT read the `shiroa-assets` state that `add-styles()` writes
   // to — that's a starlight-only path).
   let rio-css = ```css
+  /* Equations: single-render, themed via currentColor (typst emits
+     fill="#000000"; nix/docs-svg-dedup.py rewrites to currentColor). */
+  .inline-equation { display: inline-block; width: fit-content; }
+  .block-equation { display: grid; place-items: center; overflow-x: auto; }
+  .inline-equation svg, .block-equation svg { color: var(--fg, #1b1f24); }
   .rio-figure { display: block; text-align: center; overflow-x: auto; margin: 1.2em 0; }
   .rio-figure svg { max-width: none; }   /* QA #4: don't shrink wide diagrams; let the wrapper scroll */
   .rio-figure figcaption { font-size: 0.92em; margin-top: 0.6em; }
@@ -662,7 +651,40 @@
         web-theme: "mdbook",
         themes: (default-theme: (dash-color: accent)),
       )
-      show: equation-rules.with(web-theme: "mdbook", theme-box: _theme-frame)
+      // Single-render equations: theme via CSS `currentColor`, not
+      // dual-SVG. shiroa's equation-rules wraps each eq in theme-box
+      // → dark+light copies (byte-identical except fill); on
+      // sla-sizing.html that's ~2000 eqs × 2 copies × ~7KB glyph
+      // paths. Emit ONE html.frame() at fill=black; nix/docs-svg-
+      // dedup.py rewrites #000000 → currentColor and rio-css sets
+      // `.inline-equation svg { color: var(--fg) }`. (equation-rules'
+      // add-styles() is starlight-only anyway, so the CSS lives in
+      // rio-css.)
+      show math.equation: set text(weight: 400)
+      show math.equation.where(block: false): it => context (
+        if shiroa-sys-target() == "html" {
+          html.elem(
+            "span",
+            attrs: (class: "inline-equation", role: "math"),
+            html.frame({
+              set text(fill: black)
+              it
+            }),
+          )
+        } else { it }
+      )
+      show math.equation.where(block: true): it => context (
+        if shiroa-sys-target() == "html" {
+          html.elem(
+            "p",
+            attrs: (class: "block-equation", role: "math"),
+            html.frame({
+              set text(fill: black)
+              it
+            }),
+          )
+        } else { it }
+      )
       // html.frame() figures: diagrams (kind: image — typst's default
       // for unrecognised bodies, so catches fletcher/chronos/lilaq/
       // autograph/finite) and lovelace pseudocode (kind: "algorithm",
@@ -678,9 +700,7 @@
           box(width: 560pt, fig.body)
         } else { fig.body }
         // Single-variant render — dark themes recolor via CSS filter
-        // (.ayu/.navy/.coal .rio-figure svg below). The previous
-        // _theme-frame wrapper emitted dark+light SVG copies and
-        // class-toggled visibility; doubled the per-figure payload.
+        // (.ayu/.navy/.coal .rio-figure svg below).
         html.elem("figure", attrs: (class: "rio-figure"), {
           html.elem("div", html.frame(body))
           if fig.caption != none {
