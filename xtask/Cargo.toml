@@ -76,6 +76,7 @@ serde_yml.workspace = true
 
 # Crypto / encoding
 sha2.workspace = true
+heck.workspace = true
 hex.workspace = true
 base64.workspace = true
 ed25519-dalek.workspace = true

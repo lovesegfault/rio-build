@@ -31088,10 +31088,6 @@
           "packageId": "bytes"
         },
         {
-          "name": "cipher",
-          "packageId": "cipher 0.4.4"
-        },
-        {
           "name": "crossbeam-epoch",
           "packageId": "crossbeam-epoch"
         },
@@ -31219,10 +31215,6 @@
           "packageId": "indexmap"
         },
         {
-          "name": "inout",
-          "packageId": "inout 0.1.4"
-        },
-        {
           "name": "jiff",
           "packageId": "jiff"
         },
@@ -31261,16 +31253,6 @@
         {
           "name": "metrics-util",
           "packageId": "metrics-util"
-        },
-        {
-          "name": "miniz_oxide",
-          "packageId": "miniz_oxide",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "miniz_oxide",
-          "packageId": "miniz_oxide",
-          "target": "x86_64-unknown-linux-gnu"
         },
         {
           "name": "nix",
@@ -31361,10 +31343,6 @@
           "packageId": "regex-syntax"
         },
         {
-          "name": "reqwest",
-          "packageId": "reqwest 0.13.2"
-        },
-        {
           "name": "rustls",
           "packageId": "rustls"
         },
@@ -31431,14 +31409,6 @@
         {
           "name": "sqlx-sqlite",
           "packageId": "sqlx-sqlite"
-        },
-        {
-          "name": "ssh-cipher",
-          "packageId": "ssh-cipher"
-        },
-        {
-          "name": "ssh-encoding",
-          "packageId": "ssh-encoding"
         },
         {
           "name": "subtle",
@@ -31981,6 +31951,10 @@
         {
           "name": "gix",
           "packageId": "gix"
+        },
+        {
+          "name": "heck",
+          "packageId": "heck"
         },
         {
           "name": "hex",

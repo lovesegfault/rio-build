@@ -23,7 +23,6 @@ base64 = { version = "0.22" }
 base64ct = { version = "1", default-features = false, features = ["std"] }
 byteorder = { version = "1" }
 bytes = { version = "1" }
-cipher = { version = "0.4", default-features = false, features = ["block-padding"] }
 crossbeam-epoch = { version = "0.9" }
 crossbeam-utils = { version = "0.8" }
 crypto-common-6f8ce4dd05d13bba = { package = "crypto-common", version = "0.2", default-features = false, features = ["getrandom"] }
@@ -51,7 +50,6 @@ hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "logging", "native-tokio", "ring", "tls12"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service", "tracing"] }
 indexmap = { version = "2" }
-inout = { version = "0.1", default-features = false, features = ["std"] }
 jiff = { version = "0.2", features = ["serde"] }
 k8s-openapi = { version = "0.27", features = ["v1_35"] }
 kube = { version = "3", features = ["derive", "runtime", "ws"] }
@@ -81,7 +79,6 @@ rand_core = { version = "0.6", default-features = false, features = ["std"] }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "aws_lc_rs", "logging", "ring", "std", "tls12"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "ring", "std"] }
 scopeguard = { version = "1" }
@@ -99,8 +96,6 @@ spki = { version = "0.7", default-features = false, features = ["pem", "std"] }
 sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-aws-lc-rs", "any", "json", "migrate", "offline", "uuid"] }
 sqlx-postgres = { version = "0.8", default-features = false, features = ["json", "migrate", "offline", "uuid"] }
 sqlx-sqlite = { version = "0.8", default-features = false, features = ["bundled", "json", "migrate", "offline", "uuid"] }
-ssh-cipher = { version = "0.2", default-features = false, features = ["aes-cbc", "aes-ctr", "aes-gcm", "chacha20poly1305"] }
-ssh-encoding = { version = "0.2", default-features = false, features = ["bytes", "pem", "sha2", "std"] }
 subtle = { version = "2", features = ["const-generics"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 tokio = { version = "1", features = ["full", "test-util"] }
@@ -186,7 +181,6 @@ zeroize = { version = "1" }
 [target.x86_64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
-miniz_oxide = { version = "0.8", default-features = false, features = ["simd", "with-alloc"] }
 nix = { version = "0.31", features = ["fs", "hostname", "mman", "mount", "sched", "signal", "user"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
@@ -200,7 +194,6 @@ libc = { version = "0.2", features = ["extra_traits"] }
 [target.aarch64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
-miniz_oxide = { version = "0.8", default-features = false, features = ["simd", "with-alloc"] }
 nix = { version = "0.31", features = ["fs", "hostname", "mman", "mount", "sched", "signal", "user"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }

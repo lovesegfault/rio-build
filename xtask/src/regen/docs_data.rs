@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use heck::ToLowerCamelCase;
 use regex::Regex;
 use serde_json::json;
 
@@ -21,7 +22,9 @@ use crate::sh::repo_root;
 /// mod.rs has `expected '\"'`). Captures: 1=doc-block, 2=msg, 3=ident.
 /// bug_014: without the attr-skip group, a `#[cfg]` between `///` and
 /// `#[error]` would orphan the doc capture (matched as zero-width).
-const VARIANT_RE: &str = r#"(?ms)((?:^\s*///[^\n]*\n)*)(?:^\s*#\[[^\]]+\]\s*\n)*\s*#\[error\(\s*r?"((?:[^"\\]|\\.)*)"[^\]]*\]\s*([A-Z]\w*)"#;
+/// bug_017: the `#[error(...)]` arg may be `transparent` instead of a
+/// string literal — group 2 is then absent (`.get(2)`).
+const VARIANT_RE: &str = r#"(?ms)((?:^\s*///[^\n]*\n)*)(?:^\s*#\[[^\]]+\]\s*\n)*\s*#\[error\((?:\s*r?"((?:[^"\\]|\\.)*)"[^\]]*|\s*transparent\s*)\)\]\s*([A-Z]\w*)"#;
 
 /// `describe_{counter,gauge,histogram}!("rio_X_...", [Unit::*, ]"help")`.
 /// Kind from the macro name; the metrics-crate `Unit` arg is optional
@@ -71,7 +74,10 @@ pub async fn run() -> Result<()> {
     write(&out, "consts.json", &consts()?)?;
     write(&out, "helm-ns.json", &helm_ns()?)?;
     write(&out, "crds.json", &crds()?)?;
-    println!("wrote docs/gen/{{metrics,alerts,errors,config,workspace,consts,helm-ns,crds}}.json");
+    write(&out, "modules.json", &modules()?)?;
+    println!(
+        "wrote docs/gen/{{metrics,alerts,errors,config,workspace,consts,helm-ns,crds,modules}}.json"
+    );
     Ok(())
 }
 
@@ -201,11 +207,15 @@ fn errors() -> Result<serde_json::Value> {
                 "doc": strip_doc_prefix(&em[1]),
             }));
             for vm in variant_re.captures_iter(&em[3]) {
+                let msg = vm
+                    .get(2)
+                    .map(|m| collapse(unescape_rust_str(m.as_str())))
+                    .unwrap_or_else(|| "(transparent — delegates to inner error)".into());
                 variants.push(json!({
                     "enum": enum_name,
                     "name": vm[3].to_string(),
                     "crate": crate_name,
-                    "msg": collapse(unescape_rust_str(&vm[2])),
+                    "msg": msg,
                     "doc": strip_doc_prefix(&vm[1]),
                 }));
             }
@@ -242,14 +252,102 @@ fn crds() -> Result<serde_json::Value> {
         kinds.extend(kind_re.captures_iter(&body).map(|c| c[1].to_string()));
         for s in spec_re.captures_iter(&body) {
             let kind = s[1].to_string();
+            // All *Spec structs use #[serde(rename_all = "camelCase")];
+            // a per-field #[serde(rename = "...")] would diverge from
+            // heck's output (e.g. providerID ≠ providerId). Fail loud
+            // so future renames in a Spec body don't silently rot the
+            // validator.
+            anyhow::ensure!(
+                !s[2].contains("#[serde(rename ="),
+                "{kind}Spec has per-field #[serde(rename=...)]; crds() \
+                 camelCase conversion would mis-render — handle explicitly"
+            );
             let fs: Vec<_> = field_re
                 .captures_iter(&s[2])
-                .map(|c| c[1].to_string())
+                .map(|c| {
+                    c[1].strip_prefix("r#")
+                        .unwrap_or(&c[1])
+                        .trim_end_matches('_')
+                        .to_lower_camel_case()
+                })
                 .collect();
             fields.insert(kind, fs);
         }
     }
     Ok(json!({"kinds": kinds.into_iter().collect::<Vec<_>>(), "fields": fields}))
+}
+
+/// `[workspace] members` from root Cargo.toml, minus `workspace-hack`
+/// (the hakari stub, zeroed in nix/crate2nix.nix). Shared by
+/// `workspace()` and `modules()`.
+fn workspace_members() -> Result<Vec<String>> {
+    let root: toml::Table = fs::read_to_string(repo_root().join("Cargo.toml"))?.parse()?;
+    Ok(root["workspace"]["members"]
+        .as_array()
+        .context("no [workspace] members")?
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .filter(|n| n != "workspace-hack")
+        .collect())
+}
+
+fn modules() -> Result<serde_json::Value> {
+    // Recursive walk of each crate's src/ (depth ≤ 3, skip tests/),
+    // first-line `//!` doc per file or per <dir>/mod.rs.
+    // crate-structure.typ derives the per-crate module trees from this
+    // (R4-m002 tls.rs + R5-m004 karpenter.rs + rio-common
+    // k8s.rs/newtype.rs were hand-tree drift).
+    fn first_doc_line(p: &Path) -> String {
+        fs::read_to_string(p)
+            .ok()
+            .and_then(|b| {
+                b.lines()
+                    .next()
+                    .filter(|l| l.starts_with("//!"))
+                    .map(|l| l.trim_start_matches("//!").trim().to_string())
+            })
+            .unwrap_or_default()
+    }
+    fn walk(dir: &Path, prefix: &str, depth: u8, out: &mut Vec<serde_json::Value>) -> Result<()> {
+        let mut entries: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name == "tests" || name == "tests.rs" {
+                continue;
+            }
+            let rel = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if e.path().is_dir() {
+                let doc = first_doc_line(&e.path().join("mod.rs"));
+                out.push(json!({"path": format!("{rel}/"), "depth": depth, "doc": doc}));
+                if depth < 3 {
+                    walk(&e.path(), &rel, depth + 1, out)?;
+                }
+            } else if name.ends_with(".rs") && name != "mod.rs" {
+                out.push(json!({
+                    "path": rel,
+                    "depth": depth,
+                    "doc": first_doc_line(&e.path()),
+                }));
+            }
+        }
+        Ok(())
+    }
+    let mut out = BTreeMap::<String, Vec<serde_json::Value>>::new();
+    for m in workspace_members()? {
+        let src = repo_root().join(&m).join("src");
+        if !src.is_dir() {
+            continue;
+        }
+        let mut entries = Vec::new();
+        walk(&src, "", 0, &mut entries)?;
+        out.insert(m, entries);
+    }
+    Ok(json!(out))
 }
 
 fn workspace() -> Result<serde_json::Value> {
@@ -259,14 +357,7 @@ fn workspace() -> Result<serde_json::Value> {
     // crate2nix-built xtask in a sandbox without cargo. workspace-hack
     // is the hakari stub (zeroed in nix/crate2nix.nix); excluded so
     // refs.crate-list() doesn't render it as a real crate.
-    let root: toml::Table = fs::read_to_string(repo_root().join("Cargo.toml"))?.parse()?;
-    let member_names: Vec<String> = root["workspace"]["members"]
-        .as_array()
-        .context("no [workspace] members")?
-        .iter()
-        .filter_map(|v| v.as_str().map(String::from))
-        .filter(|n| n != "workspace-hack")
-        .collect();
+    let member_names = workspace_members()?;
 
     let mut members = Vec::new();
     let mut deps = BTreeMap::<String, serde_json::Value>::new();
@@ -687,6 +778,30 @@ mod tests {
             assert!(c[1].contains("doc."), "doc not captured for: {src}");
             assert_eq!(&c[3], "Foo");
         }
+    }
+
+    #[test]
+    fn variant_re_handles_transparent() {
+        let re = Regex::new(VARIANT_RE).unwrap();
+        let src = "    /// wraps inner.\n    #[error(transparent)]\n    Clock(#[from] ClockError),";
+        let c = re.captures(src).unwrap();
+        assert!(c[1].contains("wraps inner"));
+        assert!(c.get(2).is_none()); // no msg literal
+        assert_eq!(&c[3], "Clock");
+    }
+
+    #[test]
+    fn crds_field_camel_case() {
+        let conv = |s: &str| {
+            s.strip_prefix("r#")
+                .unwrap_or(s)
+                .trim_end_matches('_')
+                .to_lower_camel_case()
+        };
+        assert_eq!(conv("host_network"), "hostNetwork");
+        assert_eq!(conv("systems"), "systems");
+        assert_eq!(conv("r#type"), "type");
+        assert_eq!(conv("type_"), "type");
     }
 
     #[test]

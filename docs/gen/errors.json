@@ -163,6 +163,13 @@
       "crate": "rio-auth",
       "doc": "",
       "enum": "HmacError",
+      "msg": "(transparent — delegates to inner error)",
+      "name": "Clock"
+    },
+    {
+      "crate": "rio-auth",
+      "doc": "",
+      "enum": "HmacError",
       "msg": "key file is empty",
       "name": "EmptyKey"
     },
@@ -662,6 +669,13 @@
       "enum": "DerivedPathError",
       "msg": "built path base must be a derivation (.drv): {0}",
       "name": "NotDerivation"
+    },
+    {
+      "crate": "rio-nix",
+      "doc": "",
+      "enum": "DerivedPathError",
+      "msg": "(transparent — delegates to inner error)",
+      "name": "StorePath"
     },
     {
       "crate": "rio-nix",
@@ -1390,6 +1404,13 @@
       "enum": "SignerError",
       "msg": "tenant key lookup: {0}",
       "name": "TenantKeyLookup"
+    },
+    {
+      "crate": "rio-store",
+      "doc": "Per-replica admission gate timed out (or closed). Transient — `Err` so moka does NOT cache it; the next caller after the burst clears retries cleanly.",
+      "enum": "SubstituteError",
+      "msg": "(transparent — delegates to inner error)",
+      "name": "Admission"
     },
     {
       "crate": "rio-store",

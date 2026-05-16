@@ -1,37 +1,37 @@
 {
   "fields": {
     "ComponentScaler": [
-      "target_ref",
+      "targetRef",
       "signal",
       "replicas",
-      "seed_ratio",
-      "load_endpoint",
-      "load_thresholds"
+      "seedRatio",
+      "loadEndpoint",
+      "loadThresholds"
     ],
     "NodeClaim": [
-      "node_class_ref",
+      "nodeClassRef",
       "requirements",
       "resources",
       "taints",
-      "expire_after"
+      "expireAfter"
     ],
     "Pool": [
       "kind",
       "image",
       "systems",
-      "max_concurrent",
-      "node_selector",
+      "maxConcurrent",
+      "nodeSelector",
       "tolerations",
-      "host_users",
-      "fuse_threads",
-      "fuse_passthrough",
-      "fuse_cache_bytes",
+      "hostUsers",
+      "fuseThreads",
+      "fusePassthrough",
+      "fuseCacheBytes",
       "features",
-      "image_pull_policy",
-      "termination_grace_period_seconds",
+      "imagePullPolicy",
+      "terminationGracePeriodSeconds",
       "privileged",
-      "seccomp_profile",
-      "host_network"
+      "seccompProfile",
+      "hostNetwork"
     ]
   },
   "kinds": [

@@ -217,7 +217,7 @@
       `spec.{`#(refs.crd-field)("Pool", "systems"),
       #(refs.crd-field)("Pool", "features"),
       #(refs.crd-field)("Pool", "privileged"),
-      #(refs.crd-field)("Pool", "host_network")`, …}` per
+      #(refs.crd-field)("Pool", "hostNetwork")`, …}` per
       `rio-crds/src/pool.rs`.],
   ),
   (
