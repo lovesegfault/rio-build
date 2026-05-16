@@ -537,8 +537,10 @@
   // does NOT read the `shiroa-assets` state that `add-styles()` writes
   // to — that's a starlight-only path).
   let rio-css = ```css
-  .rio-figure { display: grid; place-items: center; overflow-x: auto; margin: 1.2em 0; }
+  .rio-figure { display: block; text-align: center; overflow-x: auto; margin: 1.2em 0; }
+  .rio-figure svg { max-width: none; }   /* QA #4: don't shrink wide diagrams; let the wrapper scroll */
   .rio-figure figcaption { font-size: 0.92em; margin-top: 0.6em; }
+  .rio-table { overflow-x: auto; max-width: 100%; }   /* QA #5 */
   .rio-req { border-left: 3px solid #d0d7de; padding: 0.5em 0 0.5em 1em; margin: 1em 0; }
   .rio-req-id { background: #f6f8fa; border-radius: 3px; padding: 0.1em 0.5em; font-size: 0.85em; }
   .rio-clue { border-left: 4px solid; border-radius: 4px; padding: 0.6em 1em; margin: 1em 0; }
@@ -590,6 +592,24 @@
       } else { fig }
       show figure.where(kind: image): frame-figure
       show figure.where(kind: "algorithm"): frame-figure
+      // Tables wider than the content column need horizontal scroll.
+      // QA #5. shiroa-sys-target() returns "paged" inside html.frame()
+      // (it aliases std.target), so this no-ops there. Wraps ALL
+      // tables (acceptable — narrow tables get a benign extra div).
+      show table: it => context if shiroa-sys-target() == "html" {
+        html.elem("div", attrs: (class: "rio-table"), it)
+      } else { it }
+      // figure(kind: table) isn't routed through frame-figure (tables
+      // stay HTML, not SVG); give it the same .rio-figure margin/
+      // caption styling.
+      show figure.where(kind: table): fig => context if (
+        shiroa-sys-target() == "html"
+      ) {
+        html.elem("figure", attrs: (class: "rio-figure"), {
+          html.elem("div", attrs: (class: "rio-table"), fig.body)
+          if fig.caption != none { html.elem("figcaption", fig.caption) }
+        })
+      } else { fig }
       // typst html refuses #footnote when a custom <html> element is
       // present (mdbook emits one). Render the note body inline as a
       // muted parenthetical instead — close enough for web reading.
