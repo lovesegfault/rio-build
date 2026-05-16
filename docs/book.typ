@@ -14,6 +14,8 @@
 
 #book-meta(
   title: "rio-build design book",
+  repository: "https://github.com/lovesegfault/rio-build",
+  repository-edit: "https://github.com/lovesegfault/rio-build/edit/main/docs/{path}",
   summary: [
     #chapter("intro.typ")[Introduction]
     = Guide

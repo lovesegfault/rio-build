@@ -36,7 +36,7 @@
 // ─── package imports ────────────────────────────────────────────────
 #import "@preview/shiroa:0.3.1": (
   cross-link, is-html-target, is-pdf-target, is-web-target, shiroa-sys-target,
-  templates, x-url-base,
+  templates, x-current, x-url-base,
 )
 #import templates: equation-rules, markup-rules, template-rules, theme-box
 // tracey's `req()` rendering helper is no longer used — `#r()` below
@@ -98,6 +98,46 @@
   ),
 )
 #let _theme-frame = theme-box.with(themes: _web-themes)
+
+// Flatten book-meta.summary into [(path, title), ...] and locate
+// x-current. Returns (title: str, prev: (path,title)|none,
+// next: (path,title)|none). QA #6 + #9 share this — title for
+// <title>/<h1>, prev/next for the nav-wrapper. The chapter title in
+// book.typ is the single source of truth; chapters' first `=` is a
+// section heading, not the page title. Must be called from `context`.
+#let _chapter-nav() = {
+  let bm = query(<shiroa-book-meta>).at(0, default: none)
+  if bm == none or x-current == none {
+    return (title: "", prev: none, next: none)
+  }
+  // Recursively flatten the summary tree (parts/nested chapters).
+  // Chapter nodes have {kind:"chapter", link, title, sub?}; part
+  // nodes have {kind:"part", title}.
+  let flatten(nodes) = {
+    let acc = ()
+    for n in nodes {
+      if n.kind == "chapter" and n.at("link", default: none) != none {
+        // n.title is shiroa's _store-content wrapper:
+        // (kind: "plain-text", content: <str>).
+        acc.push((path: n.link, title: n.title.content))
+      }
+      if "sub" in n { acc += flatten(n.sub) }
+    }
+    acc
+  }
+  let flat = flatten(bm.value.summary)
+  // x-current is the bare relative path ("intro.typ"); summary links
+  // match. Normalize leading-slash variant defensively.
+  let i = flat.position(c => (
+    c.path == x-current or "/" + c.path == x-current
+  ))
+  if i == none { return (title: "", prev: none, next: none) }
+  (
+    title: flat.at(i).title,
+    prev: if i > 0 { flat.at(i - 1) } else { none },
+    next: if i + 1 < flat.len() { flat.at(i + 1) } else { none },
+  )
+}
 
 // ─── math operators ─────────────────────────────────────────────────
 #let argmin = math.op("argmin", limits: true)
@@ -556,7 +596,15 @@
     it => {
       show: template-rules.with(
         book-meta: include "/book.typ",
-        title: if paper != none { paper.title } else { "" },
+        // QA #6: chapter title from book.typ's #chapter()[Title]
+        // (single source of truth). Wrapped in `context` since
+        // _chapter-nav() queries the document; mdbook's meta-title
+        // callback compares `title != ""` — content is never == "" so
+        // the `[#title -- #site-title]` branch always fires, which is
+        // what we want.
+        title: if paper != none { paper.title } else {
+          context _chapter-nav().title
+        },
         plain-body: body,
         web-theme: "mdbook",
         extra-assets: (rio-css,),
@@ -619,6 +667,34 @@
         [ (#it.body)],
       )
       it
+      // QA #9: prev/next chapter nav (mdbook-style). Same
+      // _chapter-nav() traversal that feeds <title> above.
+      context {
+        let nav = _chapter-nav()
+        if nav.prev != none or nav.next != none {
+          html.elem(
+            "nav",
+            attrs: (class: "nav-wrapper", aria-label: "Page navigation"),
+            {
+              if nav.prev != none {
+                cross-link("/" + nav.prev.path, html.elem(
+                  "span",
+                  attrs: (class: "nav-prev"),
+                  [← #nav.prev.title],
+                ))
+              }
+              [ ]
+              if nav.next != none {
+                cross-link("/" + nav.next.path, html.elem(
+                  "span",
+                  attrs: (class: "nav-next"),
+                  [#nav.next.title →],
+                ))
+              }
+            },
+          )
+        }
+      }
     }
   } else { it => it }
 
