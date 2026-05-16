@@ -329,7 +329,7 @@ pub fn grep_spec_names(metrics_json_body: &str, prefix: &str) -> Vec<String> {
 /// Parameters:
 /// - `describe_fn`: path to the crate's `pub fn describe_metrics()`
 /// - `crate_name`: human-readable name for error messages
-/// - `prefix`: `"rio_X_"` — selects this crate's rows from observability.md
+/// - `prefix`: `"rio_X_"` — selects this crate's rows from observability.typ
 /// - `histogram_buckets`: the crate's `pub const HISTOGRAM_BUCKETS` table
 /// - `spec_floor`: min rows expected in the obs.md table (vacuity guard)
 /// - `emit_floor`: min `metrics::*!` literals expected in src/ (regex-health guard)
@@ -396,7 +396,7 @@ macro_rules! metrics_suite {
 /// Assert that every name in `spec_metrics` appears in the set of
 /// `describe_*!` calls fired by `describe_fn`.
 ///
-/// Spec→describe direction: catches "spec'd in observability.md but
+/// Spec→describe direction: catches "spec'd in observability.typ but
 /// the `describe_metrics()` fn forgot to mention it" — the metric
 /// scrapes with no `# HELP` line, Grafana tooltips empty.
 ///
@@ -428,7 +428,7 @@ pub fn assert_spec_metrics_described(spec_metrics: &[&str], describe_fn: fn(), c
 ///
 /// Emit→describe direction: catches "someone added
 /// `metrics::counter!("new_thing")` deep in a handler but forgot both
-/// the `describe_*!` AND the observability.md row" — P0214's
+/// the `describe_*!` AND the observability.typ row" — P0214's
 /// `rio_scheduler_build_timeouts_total` did exactly this and sailed
 /// through the spec→describe check (which only knows what's IN the
 /// spec list).

@@ -9,7 +9,7 @@
 //!   2. **Periodic (30s)** — tick scans all active buffers and uploads
 //!      snapshots with `is_complete=false`. Does NOT drain: the derivation
 //!      is still running, live serving via the ring buffer must continue.
-//!      Per `observability.md:38-40` this bounds log loss on scheduler
+//!      Per `observability.typ` this bounds log loss on scheduler
 //!      crash to ≤30s.
 //!
 //! The flusher NEVER blocks the actor. It's mpsc-fed (`try_send`, bounded
@@ -37,7 +37,7 @@ use uuid::Uuid;
 
 use super::{LogBuffers, drv_log_hash, log_s3_key};
 
-/// How often to snapshot active buffers to S3. Per `observability.md:38-40`:
+/// How often to snapshot active buffers to S3. Per `observability.typ`:
 /// bounds log loss on crash to ≤30s; lower = more S3 PUTs + CPU.
 const PERIODIC_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -212,7 +212,7 @@ impl LogFlusher {
         is_final: bool,
     ) {
         // S3 key: for finals, `logs/{min_build_id}/{drv_hash}.log.zst` via
-        // `log_s3_key()`. Per spec (observability.md:12-14). We use the MIN
+        // `log_s3_key()`. Per spec (observability.typ). We use the MIN
         // interested build's id for the key path (deterministic:
         // `get_interested_builds()` sorts, so `.first()` is min(UUID) — the
         // spec doesn't say which build_id when N>1, and PG rows all point

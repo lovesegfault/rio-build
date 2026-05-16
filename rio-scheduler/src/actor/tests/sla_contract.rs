@@ -2057,7 +2057,7 @@ async fn contract_pinned_explore_first_writer_independent() {
 ///
 /// This test sets λ runaway (every spot cell `LambdaGate`) + OD
 /// `ClassCeiling` (the unrelated config-drift reason OD failed) → the
-/// semantic case observability.md:156 documents. Red on 6eab30da:
+/// semantic case observability.typ documents. Red on 6eab30da:
 /// `infeasible_counts["interrupt_runaway"] == 0`, `core_ceiling == 1`.
 #[tokio::test]
 async fn contract_interrupt_runaway_reachable() {

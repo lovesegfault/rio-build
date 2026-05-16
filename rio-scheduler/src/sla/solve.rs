@@ -111,7 +111,7 @@ impl SolveResult {
 /// `rio_scheduler_sla_infeasible_total{reason=…,tenant=…}` label
 /// values. The type-safe single emit point for the metric — every
 /// caller routes through [`Self::emit`] so the label string can't drift
-/// from `observability.md`.
+/// from `observability.typ`.
 ///
 /// ADR-023 §Observability splits the legacy `ceiling_exhausted` reason
 /// into the four specific ceilings + `interrupt_runaway` so the alert
@@ -456,7 +456,7 @@ pub fn intent_for(
     };
     let r = solve_tier(fit, tiers, ceil);
     // Infeasible-at-any-tier — the operator-facing alerting hook
-    // (observability.md). Gated on "≥1 tier had bounds": a pure
+    // (observability.typ). Gated on "≥1 tier had bounds": a pure
     // best-effort ladder (`tiers=[{p*:None}]`) or an empty ladder
     // (unknown pinned-tier override) is not an exhaust event. R7B1:
     // returned (NOT emitted) so the caller's debounce records iff

@@ -6,7 +6,7 @@
 //! scale BEFORE the burst hits), then EMA-corrects `learnedRatio`
 //! against `max(GetLoad)` across the target's pods (observed — keeps
 //! the prediction honest as rio evolves). See `r[ctrl.scaler.
-//! component]` / `r[ctrl.scaler.ratio-learn]` in controller.md.
+//! component]` / `r[ctrl.scaler.ratio-learn]` in controller.typ.
 //!
 //! Why not k8s HPA: no metrics-server / custom.metrics.k8s.io adapter
 //! in-cluster. The controller already has the demand signal

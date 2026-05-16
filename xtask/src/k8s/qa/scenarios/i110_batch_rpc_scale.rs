@@ -29,7 +29,7 @@ pub struct BatchRpcScale;
 // the I-110 fix collapses ~78 closure-BFS QueryPathInfo to ~12
 // BatchQueryPathInfo — is preferred but blocked: rio-store exposes
 // no per-method RPC counter. If one is added (it's an
-// observability.md-worthy metric), gate on a count budget instead;
+// observability.typ-worthy metric), gate on a count budget instead;
 // 50× headroom vs ~1.7× wall-clock.
 const N_CHAIN: usize = 12;
 const THRESHOLD: Duration = Duration::from_secs(330);

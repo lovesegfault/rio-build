@@ -371,7 +371,7 @@ enum PreDaemon {
 /// log streaming, output upload, and cleanup.
 ///
 /// This is the ROOT span for the worker's contribution to a build trace.
-/// Per observability.md:152 (trace structure), child spans are:
+/// Per observability.typ (trace structure), child spans are:
 /// `fetch_drv_from_store`, `compute_input_closure`,
 /// `generate_db`, `spawn_daemon_in_namespace`, `run_daemon_build`,
 /// `upload_all_outputs`. `drv_path` is the primary identifier (matches

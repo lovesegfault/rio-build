@@ -396,7 +396,7 @@ rec {
   #   - hostName: VM hostname (also used as worker_id)
   #   - otelEndpoint: optional OTLP endpoint (worker spans not strictly
   #     needed for the milestone but make the trace tree look like the
-  #     observability.md spec diagram)
+  #     observability.typ spec diagram)
   #
   # The writableStore=false setting is load-bearing —
   # see the inline rationale. The 4-core virtualisation setting is also
@@ -428,7 +428,7 @@ rec {
       # OTel endpoint for the worker. Worker spans aren't strictly
       # needed for the milestone (gateway→scheduler is the
       # critical trace hop), but having them in Tempo makes the trace
-      # tree match the observability.md spec diagram.
+      # tree match the observability.typ spec diagram.
       systemd.services.rio-builder.environment =
         lib.optionalAttrs (otelEndpoint != null) {
           RIO_OTEL_ENDPOINT = otelEndpoint;

@@ -24,7 +24,7 @@
 //!
 //! # Leader gating
 //!
-//! Per controller.md, rio-controller is single-replica. Only the
+//! Per controller.typ, rio-controller is single-replica. Only the
 //! `nodeclaim_pool` reconciler is lease-gated (rolling-upgrade surge
 //! safety); this cron is NOT — `replicas > 1` would mean both fire.
 //! The store's `GC_LOCK_ID` advisory lock serializes them (second

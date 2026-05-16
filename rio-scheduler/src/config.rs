@@ -63,7 +63,7 @@ pub struct Config {
     /// Env: `RIO_LEASE_NAMESPACE`. Ignored when `lease_name` is None.
     pub lease_namespace: Option<String>,
     /// Poison-detection thresholds. `[poison]` table in scheduler.toml.
-    /// `r[sched.retry.per-executor-budget]` (scheduler.md:110) specifies
+    /// `r[sched.retry.per-executor-budget]` (scheduler.typ) specifies
     /// both this and `retry` below as TOML-configurable. P0219 shipped
     /// the structs + builders; this wires them. Default: 3 distinct
     /// workers must fail (matches the former `POISON_THRESHOLD` const).

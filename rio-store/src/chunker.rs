@@ -7,7 +7,7 @@
 //! whole point of chunked dedup: two NARs that are 70% identical should
 //! share 70% of their chunks.
 //!
-//! # Size parameters (from `store.md:11`)
+//! # Size parameters (from `store.typ`)
 //!
 //! - **min = 16 KiB**: FastCDC won't cut before this. Very small chunks
 //!   would mean many S3 objects + large manifests for little dedup gain.
@@ -23,7 +23,7 @@
 //! Chunk hashes are BLAKE3, not SHA-256. The Nix protocol never sees these
 //! — they're internal storage keys only. BLAKE3 is ~3× faster than SHA-256
 //! for this workload and has the same collision resistance. The
-//! `store.md:38` "hash domain separation" table makes this explicit: SHA-256
+//! `store.typ` "hash domain separation" table makes this explicit: SHA-256
 //! for everything Nix-facing, BLAKE3 for chunks only.
 
 use fastcdc::v2020::FastCDC;

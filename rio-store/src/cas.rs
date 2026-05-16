@@ -540,12 +540,12 @@ async fn rollback(
 ///    an entry count that might be 2 GiB or might be 100 MiB depending
 ///    on chunk-size distribution).
 /// 2. **Singleflight** — if N concurrent GetPaths all need chunk X, one
-///    backend GET runs; N-1 await the same future. `store.md:114-122`
+///    backend GET runs; N-1 await the same future. `store.typ`
 ///    calls this the thundering-herd fix: cold start with 100 builds
 ///    needing overlapping closures would be O(100×M) S3 GETs without
 ///    this; with it, O(M).
 /// 3. **BLAKE3 verify** — EVERY returned chunk is hashed against the
-///    requested hash. This is `store.md:45`: "corrupt chunks are re-
+///    requested hash. This is `store.typ`: "corrupt chunks are re-
 ///    fetched or flagged as an error". Catches: S3 bitrot, moka's
 ///    memory getting corrupted (hardware fault), a backend bug returning
 ///    the wrong chunk. The verify is ~250 MB/s; for a 64 KiB chunk

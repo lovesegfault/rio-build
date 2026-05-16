@@ -83,7 +83,7 @@ impl StoreServiceImpl {
         rio_proto::interceptor::link_parent(&request);
         // Duration histogram via scopeguard so ALL exits record —
         // mirrors `put_path_impl` exactly (same metric name → same
-        // semantics; observability.md SLI assumes it).
+        // semantics; observability.typ SLI assumes it).
         let start = std::time::Instant::now();
         let _duration_guard = scopeguard::guard((), move |()| {
             metrics::histogram!("rio_store_put_path_duration_seconds")

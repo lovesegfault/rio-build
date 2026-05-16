@@ -1,6 +1,6 @@
 //! `AdminService.GetBuildLogs` implementation.
 //!
-//! Two data sources (per `observability.md:44-50`):
+//! Two data sources (per `observability.typ`):
 //!
 //! | Build State | Source |
 //! |---|---|

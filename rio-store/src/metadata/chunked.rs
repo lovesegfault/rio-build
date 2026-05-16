@@ -53,7 +53,7 @@ pub type PlaceholderToken = f64;
 ///
 /// # Why refcounts are incremented here (before upload), not at complete
 ///
-/// Per `store.md:94`: incrementing before upload protects chunks from GC
+/// Per `store.typ`: incrementing before upload protects chunks from GC
 /// sweep immediately. If a GC pass runs between upload and complete, it
 /// sees refcount > 0 and skips. If we waited until complete, a GC between
 /// "chunks uploaded to S3" and "status flipped" would sweep → orphaned.

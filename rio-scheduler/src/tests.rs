@@ -45,7 +45,7 @@ fn config_defaults_are_stable() {
 /// TOML → Config parse for `[poison]` and `[retry]` tables.
 /// Field names match PoisonConfig (`threshold`,
 /// `require_distinct_workers`) and RetryPolicy (`max_retries`,
-/// `backoff_base_secs`, …). The spec at scheduler.md:110 promised
+/// `backoff_base_secs`, …). The spec at scheduler.typ promised
 /// these knobs were TOML-configurable; P0219 shipped the structs
 /// but left the Config side unwired. This proves the parse works.
 ///

@@ -59,7 +59,7 @@ impl Scenario for BlackholeSelfTest {
         // Fresh CliCtx, not `ctx.cli`: the shared handle is opened
         // before phase 2 and a prior leader-kill (i024) leaves it
         // forwarding to a dead pod or a standby (whose
-        // `DebugListExecutors` is intentionally empty — see proto.md).
+        // `DebugListExecutors` is intentionally empty — see proto.typ).
         let cli = CliCtx::open(&ctx.kube, 0, 0).await?;
         let before_execs = super::common::live_executor_ids(&cli)?;
 

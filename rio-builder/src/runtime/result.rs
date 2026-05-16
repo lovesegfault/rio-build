@@ -168,7 +168,7 @@ pub(super) fn outcome_label(completion: &CompletionReport) -> &'static str {
 /// cancel, panic) MUST go through here so:
 ///
 /// - `rio_builder_builds_total{outcome}` increments exactly once per
-///   build (observability.md:202 SLI). bug_174: the panic-catcher
+///   build (observability.typ SLI). bug_174: the panic-catcher
 ///   previously open-coded the send and skipped the counter, so a
 ///   worker that panicked on 1/100 builds reported the same success
 ///   rate as a healthy one.

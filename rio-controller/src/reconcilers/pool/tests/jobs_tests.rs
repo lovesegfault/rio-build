@@ -282,7 +282,7 @@ async fn reap_excess_pending_deletes_oldest_and_counts() {
         "metric incremented with pool label; saw keys: {:?}",
         recorder.all_keys(),
     );
-    // HELP text + observability.md claim only `pool` — assert no other
+    // HELP text + observability.typ claim only `pool` — assert no other
     // label sneaks in (regression guard for the phantom-`class` drift).
     let reap_keys: Vec<_> = recorder
         .all_keys()

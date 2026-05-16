@@ -525,7 +525,7 @@ impl StoreServiceImpl {
         )?;
 
         // TODO: realisation signature verification once the scheduler's
-        // insert_realisation_batch path signs (store.md:237 — signed
+        // insert_realisation_batch path signs (store.typ — signed
         // tuple is (drv_hash, output_name, output_path, nar_hash)).
         // Adding sig-verify here without a signer would reject all
         // writes; the service-caller gate above + gateway opcode

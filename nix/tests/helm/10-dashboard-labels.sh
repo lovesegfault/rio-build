@@ -12,7 +12,7 @@
 # (`{absent="x"}` → "No data"). bug_141/460/483 shipped exactly this.
 #
 # Adding a new (metric,label) pair: extend ALLOW below AND make sure the
-# emission site + observability.md agree.
+# emission site + observability.typ agree.
 
 # metric:label, one per line. `le` is the implicit Prometheus histogram
 # bucket label and is allowed on every *_bucket metric below.

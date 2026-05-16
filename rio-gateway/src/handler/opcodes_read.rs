@@ -634,7 +634,7 @@ async fn handle_register_drv_output_legacy<R: AsyncRead + Unpin, W: AsyncWrite +
     // QueryPathInfo(outPath).nar_hash. This field is NOT on the CA-cutoff
     // critical path (cutoff is realisation-based);
     // it's for realisation SIGNING — the signed tuple is
-    // (drv_hash, output_name, output_path, nar_hash) per store.md:206.
+    // (drv_hash, output_name, output_path, nar_hash) per store.typ.
     // Zeros would mean signing attests to nothing about the output content.
     //
     // outPath should already be in the store: Nix's protocol order is build

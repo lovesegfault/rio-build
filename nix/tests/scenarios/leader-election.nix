@@ -408,7 +408,7 @@ let
       # new leader (grpc.health.v1 probe ~3s), worker's relay reconnects
       # and replays buffered events. The client's nix-build sees nothing.
       #
-      # This is the end-to-end proof of scheduler.md's "Workers reconnect
+      # This is the end-to-end proof of scheduler.typ's "Workers reconnect
       # in place — running builds continue, no pod restarts."
       with subtest("build-during-failover: build survives scheduler leader kill"):
           # Re-check topology after the prep churn above.

@@ -1085,7 +1085,7 @@ fn emit_stale_gauge(cost: &parking_lot::RwLock<CostTable>, now: f64) {
 /// on its own observed false→true edge so its first fold lands on the
 /// freshly-reloaded table, not the stale in-mem one (which the reload
 /// would then overwrite). Standby replicas emit the staleness gauge
-/// (per-replica, observability.md says it "climbs when … this replica
+/// (per-replica, observability.typ says it "climbs when … this replica
 /// is standby") but skip the AWS body.
 pub async fn spot_price_poller(
     leader: LeaderState,
@@ -1108,7 +1108,7 @@ pub async fn spot_price_poller(
             _ = tick.tick() => {},
         }
         let now = now_epoch();
-        // Pre-leader-gate emit: per-replica gauge — observability.md
+        // Pre-leader-gate emit: per-replica gauge — observability.typ
         // documents "climbs on standby" as the failover-health signal.
         // Spot-only (this poller doesn't spawn under Static/None).
         emit_stale_gauge(&cost, now);
@@ -1982,7 +1982,7 @@ mod tests {
     /// `fold_spot_poll` emits `_hw_cost_fallback_total{reason=…}` on
     /// the two non-success arms and folds prices on success. Wires the
     /// previously-dead `api_error` / `empty_history` label values
-    /// (observability.md:164).
+    /// (observability.typ).
     #[test]
     fn fold_spot_poll_emits_fallback_reasons() {
         use metrics_util::debugging::DebugValue;

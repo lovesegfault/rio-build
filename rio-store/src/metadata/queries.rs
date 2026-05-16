@@ -106,7 +106,7 @@ pub async fn get_manifest(pool: &PgPool, store_path: &str) -> Result<Option<Mani
             &chunk_list,
         )?))),
         // manifest exists + inline_blob NULL but NO manifest_data row:
-        // invariant violation (store.md:222 says inline_blob NULL ⇔
+        // invariant violation (store.typ says inline_blob NULL ⇔
         // manifest_data exists). Single-snapshot read; this arm is now
         // ONLY reachable via genuine corruption (manual DB surgery or
         // a CASCADE bug) — concurrent GC cannot produce it. Surface

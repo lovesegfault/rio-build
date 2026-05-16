@@ -220,7 +220,7 @@ impl SchedulerService for SchedulerGrpc {
 
         let bcast = self.send_and_await(cmd, reply_rx).await?;
         // Record build_id + tenant_id on the span (declared Empty in #[instrument]).
-        // Per observability.md these are required structured-log fields.
+        // Per observability.typ these are required structured-log fields.
         tracing::Span::current().record("build_id", build_id.to_string());
         if let Some(tid) = tenant_id {
             tracing::Span::current().record("tenant_id", tracing::field::display(tid));

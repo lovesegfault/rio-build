@@ -1621,7 +1621,7 @@ impl NodeClaimPoolReconciler {
             cover::assign_to_cells(unplaced, &self.sketches, &ice, cover::cell_rank, |i, m| {
                 self.cfg.fallback_cell(i, &self.hw_config, m)
             });
-        // r41 merged_015: the runbook (sla-model.md §NoHostingClass) and
+        // r41 merged_015: the runbook (sla-model.typ §NoHostingClass) and
         // pod.rs:769,772 both claim "the controller logs WARN once per
         // intent drop" — sibling reasons `no_pool_covers`,
         // `exceeds_cell_cap`, and `unknown_hw_class` already warn; this
@@ -1643,7 +1643,7 @@ impl NodeClaimPoolReconciler {
                 "SpawnIntents dropped — no configured hw-class can host them \
                  (wrong arch, footprint exceeds every class's max_cores/max_mem, \
                  or required_features unmatched); add or fix a [sla.hw_classes] \
-                 entry. See sla-model.md#rionodeclaimpool-nohostingclass"
+                 entry. See sla-model.typ#rionodeclaimpool-nohostingclass"
             );
         }
         if dropped.all_cells_ice_masked > 0 {
@@ -1660,7 +1660,7 @@ impl NodeClaimPoolReconciler {
                  [sla.hw_classes] config gap); check the Karpenter controller \
                  log for capacity/quota/IAM errors and \
                  `rio_controller_nodeclaim_reaped_total{{reason=~\"ice|vanished\"}}`. \
-                 See sla-model.md#rionodeclaimpool-icemaskedhigh"
+                 See sla-model.typ#rionodeclaimpool-icemaskedhigh"
             );
         }
         let order =

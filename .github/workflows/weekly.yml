@@ -15,7 +15,7 @@ env:
 
 jobs:
   # Multi-Nix golden conformance matrix: 4 daemon variants × the
-  # golden_conformance test suite. See docs/src/verification.md
+  # golden_conformance test suite. See docs/spec/system/verification.typ
   # § Multi-Nix compatibility matrix.
   #
   # Building the linkfarm pulls all four variant runs as one job —
@@ -40,7 +40,7 @@ jobs:
 
   # Mutation testing — ~320 scoped mutations × per-mutant nextest
   # run. Missed-count (survived mutants) is the trend metric; the
-  # job does NOT fail on nonzero. See docs/src/verification.md
+  # job does NOT fail on nonzero. See docs/spec/system/verification.typ
   # § Mutation testing.
   #
   # Serial with golden-matrix (one-runner-at-a-time is fine for a

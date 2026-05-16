@@ -19,7 +19,7 @@
 //! # S3 key scheme
 //!
 //! `chunks/{aa}/{blake3-hex}` where `{aa}` is the first two hex chars.
-//! Prefix-partitioning per `store.md:54` — S3 shards by key prefix, so
+//! Prefix-partitioning per `store.typ` — S3 shards by key prefix, so
 //! spreading across 256 prefixes avoids hotspotting a single shard when
 //! a thousand workers hit the store at once.
 

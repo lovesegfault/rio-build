@@ -97,7 +97,7 @@ impl Drop for OtelGuard {
 /// - `RIO_OTEL_ENDPOINT`: OTLP gRPC collector endpoint (e.g.,
 ///   `http://otel-collector:4317`). Unset = OTel disabled entirely.
 /// - `RIO_OTEL_SAMPLE_RATE`: 0.0–1.0, fraction of traces to sample
-///   (default: 1.0). Per `configuration.md:102`.
+///   (default: 1.0). Per `configuration.typ`.
 pub fn init_tracing(component: &'static str) -> anyhow::Result<OtelGuard> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -249,7 +249,7 @@ pub const BUILD_DURATION_BUCKETS: &[f64] = &[
 /// [`crate::server::bootstrap`]) — the `metrics-exporter-prometheus`
 /// default buckets (`[0.005..10.0]`) are tuned for HTTP request latencies
 /// and are useless for build durations that span seconds to hours. See
-/// `observability.md` for the full bucket table.
+/// `observability.typ` for the full bucket table.
 ///
 /// Per-crate `metrics_registered` tests assert every `describe_histogram!`
 /// has an entry in that crate's `HISTOGRAM_BUCKETS` OR is in its

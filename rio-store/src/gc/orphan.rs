@@ -430,7 +430,7 @@ mod tests {
     // r[verify store.substitute.stale-reclaim]
     /// I-040 unit: `reap_one` on a CHUNKED placeholder MUST decrement.
     /// This is what the inline `delete_manifest_uploading` skipped.
-    /// Spec at store.md:133: "The chunk list in `manifest_data` is
+    /// Spec at store.typ: "The chunk list in `manifest_data` is
     /// used to decrement refcounts" — substitute's reclaim violated
     /// this (called the inline delete unconditionally).
     #[tokio::test]

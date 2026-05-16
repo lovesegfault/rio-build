@@ -68,7 +68,7 @@ pub fn drv_log_hash(s: &str) -> String {
 }
 
 /// Construct the canonical S3 key for a completed derivation's log blob:
-/// `logs/{build_id}/{drv_hash}.log.zst` per `observability.md`. The
+/// `logs/{build_id}/{drv_hash}.log.zst` per `observability.typ`. The
 /// `logs/` segment is fixed (peer to rio-store's `chunks/` in the same
 /// bucket); rio assumes a dedicated bucket, so there is no configurable
 /// prefix.
@@ -326,7 +326,7 @@ impl LogBuffers {
     /// means periodic snapshots upload an ever-growing prefix of the same
     /// log (wasteful in S3 PUTs, but bounded: at most one per 30s per active
     /// derivation, and the spec explicitly accepts that tradeoff at
-    /// `observability.md:38-40`).
+    /// `observability.typ`).
     pub(crate) fn snapshot(&self, drv_path: &str) -> Option<(u64, u64, u64, Vec<Vec<u8>>)> {
         let buf = self.buffers.get(&drv_log_hash(drv_path))?;
         let first_line = buf.lines.front().map(|(n, _)| *n).unwrap_or(0);

@@ -128,7 +128,7 @@ pub struct DropTally {
     /// is no `[sla.hw_classes]` entry whose `(arch, max_cores, max_mem,
     /// provides_features)` admits the intent. Persistent until the
     /// config changes. **Operator action:** add or fix a class. See
-    /// `sla-model.md#rionodeclaimpool-nohostingclass`.
+    /// `sla-model.typ#rionodeclaimpool-nohostingclass`.
     pub no_hosting_class: u64,
     /// `fallback` admits the intent in principle, but **every** cell
     /// that could host it is ICE-masked — NodeClaim launches are
@@ -138,7 +138,7 @@ pub struct DropTally {
     /// `AWSServiceRoleForEC2Spot`). **Operator action:** check
     /// `rio_controller_nodeclaim_reaped_total{reason=~"ice|vanished"}`
     /// and the Karpenter controller log for launch errors. See
-    /// `sla-model.md#rionodeclaimpool-icemaskedhigh`.
+    /// `sla-model.typ#rionodeclaimpool-icemaskedhigh`.
     pub all_cells_ice_masked: u64,
 }
 

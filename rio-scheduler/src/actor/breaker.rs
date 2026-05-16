@@ -308,7 +308,7 @@ mod tests {
 
     // r[verify sched.breaker.cache-check+3]
     /// Auto-close + single failure does NOT double-count
-    /// `circuit_open_total` (observability.md: counts open transitions
+    /// `circuit_open_total` (observability.typ: counts open transitions
     /// (outages), not 30s windows).
     #[test]
     fn auto_close_then_failure_no_duplicate_metric() {

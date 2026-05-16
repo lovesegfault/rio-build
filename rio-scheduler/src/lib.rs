@@ -79,7 +79,7 @@ const DISPATCH_WAIT_BUCKETS: &[f64] = &[
 /// (induced subgraph over the 5000-node cap at realistic 4× edge density).
 /// Default Prometheus buckets `[0.005..10.0]` are useless here — every
 /// sample lands in `+Inf`. These match the suggested buckets in
-/// observability.md's Histogram Buckets table.
+/// observability.typ's Histogram Buckets table.
 const GRAPH_EDGES_BUCKETS: &[f64] = &[100.0, 500.0, 1000.0, 5000.0, 10000.0, 20000.0];
 
 /// Histogram bucket boundaries for `rio_scheduler_warm_prefetch_paths`.

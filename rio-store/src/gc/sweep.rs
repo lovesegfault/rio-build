@@ -470,7 +470,7 @@ pub async fn sweep(
             // committed tx. Survives SweepAbort (prior batches already
             // emitted); never fires under dry_run (rolled back —
             // a counter is a promise of monotonic fact, not a what-if).
-            // Singular naming matches observability.md:138; `s3_key`
+            // Singular naming matches observability.typ; `s3_key`
             // not `chunk` — chunks are marked deleted in PG, KEYS are
             // what get queued for S3 DeleteObject.
             metrics::counter!("rio_store_gc_path_swept_total").increment(delta.paths_deleted);

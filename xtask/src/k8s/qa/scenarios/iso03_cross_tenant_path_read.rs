@@ -1,9 +1,9 @@
 //! Cross-tenant: B cannot read A's output via narinfo.
 //!
-//! Policy (`r[store.tenant.narinfo-filter]`, security.md:141): the
+//! Policy (`r[store.tenant.narinfo-filter]`, security.typ): the
 //! store-side `sig_visibility_gate` filters `QueryPathInfo` by
 //! `path_tenants.tenant_id = claims.sub`. The underlying chunks are
-//! shared (security.md:52 — content-addressed, immutable), but a
+//! shared (security.typ — content-addressed, immutable), but a
 //! tenant only sees narinfo for paths attributed to them via
 //! `path_tenants`. So B's `nix copy --from ssh-ng://...key=B {A's
 //! out}` should fail at the QueryPathInfo step ("path is not valid"
