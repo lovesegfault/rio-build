@@ -135,7 +135,7 @@ any critical-path value).
    d. Record actual (cores, mem_peak, disk_peak, wall) into build_samples for SLA refit
    e. Recompute priorities incrementally: walk up ancestors only, using dirty-flag
       propagation -- only ancestors whose max-successor-priority changed need updating
-9. On failure: classify error (see errors.md), apply retry policy, reassign or mark as failed
+9. On failure: classify error (see ref/errors.typ), apply retry policy, reassign or mark as failed
 ```
 
 #r("sched.merge.toctou-serial")[

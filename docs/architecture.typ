@@ -543,7 +543,6 @@ delivery is essential to avoid over-engineering early phases.
 = Design risks
 
 == Import-From-Derivation
-// from challenges.md §4
 
 Nix evaluation may block on build results. The gateway must handle this
 gracefully --- the client sends a build request mid-evaluation, and rio must
@@ -552,7 +551,6 @@ prioritize these "evaluation-blocking" builds. These show up as individual
 Import-From-Derivation data flow above.
 
 == Schema migration
-// from challenges.md §15
 
 Database schema evolves across phases (new tables, new columns, index
 changes). Migrations must be:

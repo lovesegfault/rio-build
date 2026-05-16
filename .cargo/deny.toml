@@ -1,6 +1,6 @@
 # cargo-deny configuration for rio-build.
 #
-# Policy (dependencies.md:33): deny GPL-3.0+ (project is MIT/Apache-2.0),
+# Policy (docs/contributing.typ §Code Style): deny GPL-3.0+ (project is MIT/Apache-2.0),
 # check RustSec advisories in CI. Runs as part of `nix flake check` via
 # craneLib.cargoDeny.
 
