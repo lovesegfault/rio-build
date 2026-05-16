@@ -370,6 +370,7 @@ in
           );
         };
         metricsJson = ../docs/gen/metrics.json;
+        cliJson = ../docs/gen/cli.json;
       }
       ''
         set -euo pipefail
@@ -445,11 +446,18 @@ in
         # Retired identifiers — names that no longer exist in code/CRDs/
         # CLI but kept appearing in docs (R4: ≥5 instances). One
         # alternation per rename; future renames append here.
-        deny_common='\bBuilderPool\b|rio-cli bps\b|`bps`|RIO_TLS__|\bTlsError\b|rio-common/src/tls\.rs|load_client_tls|init_client_tls|fod-proxy|spec\.sizing|Sizing::|fuseCacheBudget|logBudget|migration-lock mechanism|trigger-gc|--grace-period-hours|mTLS client[- ]cert|mTLS cert mount|mTLS main port|VMs: mTLS|plaintext-health listener|TLS and plaintext ports|mTLS bypass|mTLS-identified|mTLS identifies|falls? back to mTLS|mTLS peer cert'
-        # Docs: deny_common + bare \bmTLS\b (glossary excluded — it
-        # defines the term).
-        if grep -rn -E "$deny_common|\bmTLS\b" $typSrc \
-             | grep -v 'glossary\.typ'; then
+        #
+        # Split into shared/docs/cross (R7-m025): a single alternation
+        # over both scan sets is the structural reason "widen pattern X
+        # → false-positive in the other scan set" recurs. deny_shared
+        # is identifiers retired everywhere; deny_docs adds doc-only
+        # phrases (legitimately appear in code as historical context);
+        # deny_cross adds case/separator variants needed for nix/infra
+        # that would FP docs' "Squid FOD proxy is deleted" prose.
+        deny_shared='\bBuilderPool\b|\bFetcherPools?\b|rio-cli bps\b|`bps`|vm-lifecycle-bps|RIO_TLS__|\bTlsError\b|rio-common/src/tls\.rs|load_client_tls|init_client_tls|spec\.sizing|Sizing::|fuseCacheBudget|logBudget|migration-lock mechanism|trigger-gc|--grace-period-hours|mTLS client[- ]cert|mTLS cert mount|mTLS main port|VMs: mTLS|plaintext-health listener|TLS and plaintext ports|mTLS bypass|mTLS-identified|mTLS identifies|falls? back to mTLS|mTLS peer cert|\bplaintext port\b|CN-allowlist\)|\(gateway cert|dev-mode/dev-mode|TLS is env-only|\bTLS init\b|without relying on service tokens|replacement for the service-HMAC'
+        deny_docs="$deny_shared|\bmTLS\b|fod-proxy|bundled into the scheduler|kubectl exec deploy/rio-scheduler -- rio-cli"
+        deny_cross="$deny_shared|[Ff][Oo][Dd][- ]proxy"
+        if grep -rn -E "$deny_docs" $typSrc | grep -v 'glossary\.typ'; then
           echo "FAIL: retired identifier in docs — see deny-list in misc-checks.nix" >&2
           fail=1
         fi
@@ -457,18 +465,36 @@ in
         # consolidation (legitimate history); flake.nix "Before this
         # assert, vm-lifecycle-bps-k3s and vm-fod-proxy-k3s" is
         # legitimate history; misc-checks.nix is the lint itself.
-        if grep -rn -E "$deny_common" $crossSrc \
+        if grep -rn -E "$deny_cross" $crossSrc \
              | grep -vE 'rio-crds/src/pool\.rs:([4-9]|1[01]):|flake\.nix:.*Before this assert|misc-checks\.nix'; then
           echo "FAIL: retired identifier in non-doc source" >&2
           fail=1
         fi
         # DEFAULT_GC_GRACE_HOURS literal-value tripwire — the const is
-        # in gen/consts.json so prose must derive. R4 derived 1/4; R5
-        # found 3 left.
+        # in gen/consts.json so prose must derive. Broad over $typSrc;
+        # NARROW over $crossSrc (only the doc-comment shapes that
+        # should cite the const — broad would FP `ungracefully` /
+        # daemon_timeout's unrelated `2h` / test literals).
         if grep -rn -E '\b2h\b.*grace|grace.*\b2h\b' $typSrc; then
           echo "FAIL: literal '2h' grace-period — use #(refs.const)(\"DEFAULT_GC_GRACE_HOURS\")h" >&2
           fail=1
         fi
+        if grep -rn -E "store's 2h\b|None = default \(2h\)|use default 2h\b" $crossSrc \
+             | grep -v 'misc-checks\.nix'; then
+          echo "FAIL: rust comment hardcodes 2h grace — cite DEFAULT_GC_GRACE_HOURS" >&2
+          fail=1
+        fi
+        # Raw `rio-cli X` spans (inline backtick OR fenced-block
+        # line-start) bypass refs.cli-sub. Extract and assert ∈
+        # gen/cli.json. Nested subcommands (`rio-cli sla status`) only
+        # check top-level `sla`.
+        while IFS= read -r sub; do
+          if ! jq -e --arg s "$sub" '.subcommands | index($s)' $cliJson > /dev/null; then
+            echo "FAIL: raw \`rio-cli $sub\` — unknown subcommand (use #(refs.cli-sub) or fix)" >&2
+            fail=1
+          fi
+        done < <(grep -rohE '(^|`)rio-cli [a-z][a-z-]*' $typSrc \
+          | sed -E 's/(^|`)rio-cli //' | sort -u)
         # configuration.typ is 100% derived from rust Config::default()
         # via gen/config.json. Rust source citing it as a spec source is
         # inverted-dataflow (R3-m002, R4-003, R5-019). observability.typ

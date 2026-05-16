@@ -185,7 +185,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
     /// count), one after sweep (collected + bytes), final with
     /// is_complete=true.
     ///
-    /// `grace_period_hours`: None = [`DEFAULT_GC_GRACE_HOURS`]. Some(0) = zero
+    /// `grace_period_hours`: None = `DEFAULT_GC_GRACE_HOURS`. Some(0) = zero
     /// grace (explicit). Protects paths
     /// created in the last N hours from collection even if not
     /// yet referenced.
