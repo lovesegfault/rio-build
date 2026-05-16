@@ -36,7 +36,7 @@
 // ─── package imports ────────────────────────────────────────────────
 #import "@preview/shiroa:0.3.1": (
   cross-link, is-html-target, is-pdf-target, is-web-target, shiroa-sys-target,
-  templates,
+  templates, x-url-base,
 )
 #import templates: equation-rules, markup-rules, template-rules, theme-box
 // tracey's `req()` rendering helper is no longer used — `#r()` below
@@ -193,6 +193,13 @@
 // re-fire: typst's `state.get()` is positional, so the second `rio()`'s
 // `context` read sees the first call's `_gloss-done.update(true)`.
 #let _gloss-done = state("rio-gloss-done", false)
+// Chapters that `provides-glossary()` (sla-sizing, glossary.typ) own
+// their `<key>` anchors via `print-glossary`; `_gloss-own` lets the
+// shiroa `@key` cross-link intercept in `rio()` fall through to the
+// intra-chapter glossarium link there.
+#let _gloss-own = state("rio-gloss-own", false)
+// Registered key set, for the `show link:` membership check.
+#let _gloss-keys = glossary-entries.map(e => e.key)
 // Bare empty-body figures: rio()'s `show figure.where(kind:
 // "glossarium_entry")` rule renders them as `it.body` (=[]) in html
 // mode and `align(left, it)` in paged (also visually empty), so no box
@@ -209,12 +216,15 @@
 // so `rio()` skips `_gloss-anchors` (which would otherwise duplicate
 // the `<key>` labels their `print-glossary` emits), and registers if
 // nothing has yet (standalone compile of the chapter; under book-pdf an
-// earlier chapter's `rio()` already did).
+// earlier chapter's `rio()` already did). `_gloss-own` is the separate
+// gate for the shiroa cross-link intercept (it stays false in chapters
+// that rely on rio()'s anchors and true here).
 #let provides-glossary() = {
   context if not _gloss-done.get() {
     register-glossary(glossary-entries)
   }
   _gloss-done.update(true)
+  _gloss-own.update(true)
 }
 
 // Label/anchor id with the tracey `+N` revision suffix stripped.
@@ -389,9 +399,41 @@
     register-glossary(glossary-entries)
   }
   show: make-glossary
-  show figure.where(kind: "glossarium_entry"): it => if is-paged-out {
+  show figure.where(kind: "glossarium_entry"): it => context if is-paged-out {
     align(left, it)
+  } else if _gloss-own.get() and it.has("label") {
+    // The `print-glossary` figures in chapters that own their glossary
+    // (glossary.typ, sla-sizing): wrap with `id="label-<key>"` so the
+    // cross-chapter `<a href="…#label-<key>">` below has a fragment
+    // target. Non-own chapters' `_gloss-anchors` figures (empty body,
+    // `_gloss-own` false) fall through to `it.body` — present so
+    // glossarium's `link(label(key), …)` resolves, but the link is
+    // rewritten to cross-chapter by the `show link:` rule.
+    html.elem("span", attrs: (id: "label-" + str(it.label)), it.body)
   } else { it.body }
+  // shiroa static-html: rewrite glossarium's `link(label(key), …)`
+  // (the common tail of `@key`, `#gls(key)`, `#glspl(key)`) to a
+  // cross-chapter `<a href="<base>glossary.html#label-<key>">`. Can't
+  // use cross-link(reference:) — it queries locally first, finds the
+  // hidden anchor, and short-circuits to a same-page link. Chapters
+  // that `provides-glossary()` keep the intra-chapter link.
+  show link: it => context {
+    if (
+      is-html
+        and not _gloss-own.get()
+        and type(it.dest) == label
+        and str(it.dest) in _gloss-keys
+    ) {
+      html.elem(
+        "a",
+        attrs: (
+          class: "typst-content-link",
+          href: x-url-base + "glossary.html#label-" + str(it.dest),
+        ),
+        it.body,
+      )
+    } else { it }
+  }
 
   show: gentle-clues.with(breakable: false, headless: false)
 
@@ -567,7 +609,9 @@
   // here so they land INSIDE the shiroa `<html>` wrapper (template-rules
   // is already applied). Gated on `_gloss-done` (one set per document)
   // and `_book-mode` (book-pdf's included sla-sizing.typ prints the
-  // real glossary, supplying the labels).
+  // real glossary, supplying the labels). In static-html they're still
+  // emitted so glossarium's `link(label(key))` resolves; the `show
+  // link:` intercept above rewrites the link to cross-chapter.
   context if not _gloss-done.get() and not _book-mode.get() {
     _gloss-anchors
   }
