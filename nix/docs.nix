@@ -225,12 +225,12 @@ rec {
     typst = docs-pdf;
     shiroa = docs;
     # PDF/HTML divergence smoke. Asserts the two cross-target invariants
-    # bug_003/033 broke: gh-sha permalinks pinned (no own-repo
-    # /blob/main/) and rref() anchors live (~75 same-chapter rrefs as of
-    # 2026-05; cross-chapter degrade to plain text by design — shiroa
-    # static-html compiles per-chapter — so this is a regression
-    # tripwire, not an exhaustive count). Runs against the built `docs`
-    # output so it's free (just greps result/).
+    # bug_003/033/025 broke: gh-sha permalinks pinned (no own-repo
+    # /blob/main/) and rref() anchors live (~115 same-chapter rrefs as
+    # of 2026-05 after the _rid()-strip fix; cross-chapter degrade to
+    # plain text by design — shiroa static-html compiles per-chapter —
+    # so this is a regression tripwire, not an exhaustive count). Runs
+    # against the built `docs` output so it's free (just greps result/).
     shiroa-smoke = pkgs.runCommand "rio-docs-html-smoke" { } ''
       set -euo pipefail
       cd ${docs}
@@ -243,8 +243,8 @@ rec {
         exit 1
       fi
       n=$(grep -rohE '<a [^>]*href="#r-' . | wc -l)
-      if [[ $n -lt 52 ]]; then
-        echo "FAIL: only $n rref anchors in HTML (expected ≥52; bug_033 regressed)" >&2
+      if [[ $n -lt 80 ]]; then
+        echo "FAIL: only $n rref anchors in HTML (expected ≥80; bug_033/025 regressed)" >&2
         exit 1
       fi
       touch $out

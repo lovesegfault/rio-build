@@ -316,12 +316,24 @@ in
           );
         };
         # Non-.typ files that reference docs by path — rust comments +
-        # warn! bodies, nix comments, github workflows, shell scripts.
+        # warn! bodies, nix comments, github workflows, shell scripts,
+        # helm chart annotations / tofu comments / NOTES.txt.
         crossSrc = pkgs.lib.fileset.toSource {
           root = ../.;
           fileset = pkgs.lib.fileset.unions [
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../.)
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "nix" || f.hasExt "sh") ../nix)
+            (pkgs.lib.fileset.fileFilter (
+              f:
+              builtins.any f.hasExt [
+                "yaml"
+                "yml"
+                "tf"
+                "tfvars"
+                "txt"
+                "tpl"
+              ]
+            ) ../infra)
             ../.github
           ];
         };
