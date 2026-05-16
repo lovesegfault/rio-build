@@ -27,17 +27,9 @@ pub use server::{
 /// HTTP/SSH-latency-shaped and fit the global `[0.005..10.0]` default.
 pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[];
 
-/// Register `# HELP` descriptions for all gateway metrics.
-///
-/// Call from `main()` immediately after `init_metrics()`. Without this,
-/// `/metrics` serves bare names with no `# HELP` lines — Grafana UIs and
-/// `promtool check metrics` have nothing to show. Descriptions sourced
-/// from docs/spec/system/observability.typ (the Gateway Metrics table).
-///
-/// `metrics::describe_*!` are fire-and-forget: they register metadata with
-/// whatever recorder is installed. Safe to call before or after the metric
-/// is first emitted; the exporter merges description with value at scrape
-/// time. Calling twice is a no-op (first description wins).
+/// Registers prometheus metric descriptions. The help strings here are
+/// the source for `docs/ref/metrics.typ` — see
+/// `xtask/src/regen/docs_data.rs::metrics()` for the data-flow.
 // r[impl obs.metric.gateway]
 pub fn describe_metrics() {
     use metrics::{describe_counter, describe_gauge, describe_histogram};

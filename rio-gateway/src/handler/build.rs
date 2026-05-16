@@ -25,9 +25,9 @@ use crate::quota::{QuotaCache, QuotaVerdict, human_bytes};
 use crate::translate;
 
 /// Error from `process_build_events`. Distinguishes transport
-/// errors (scheduler connection dropped — reconnect-worthy) from
-/// stream EOF without terminal (scheduler closed gracefully but
-/// incompletely — NOT reconnect-worthy, the build state is lost).
+/// errors and stream EOF-without-terminal (both reconnect-worthy
+/// failover signatures — see the per-variant docs) from `Wire`
+/// (client-side disconnect — not retried).
 #[derive(Debug, thiserror::Error)]
 enum StreamProcessError {
     /// gRPC-level error (connection reset, timeout). Scheduler

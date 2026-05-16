@@ -121,7 +121,7 @@ let
   # Generated reference data (metric/alert/error/config tables, plus
   # workspace/consts/helm-ns for the lib/refs.typ validators).
   # `xtask regen docs-data` scans rio-*/src/**/*.rs for describe_*! and
-  # `pub enum *Error` plus prometheusrule.yaml for alert names. The
+  # `(?:pub\s+)?enum *Error` plus prometheusrule.yaml for alert names. The
   # crate2nix-built xtask binary's compile-time CARGO_MANIFEST_DIR is a
   # store path, so RIO_REPO_ROOT points it at the runCommand src tree.
   #

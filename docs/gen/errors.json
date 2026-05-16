@@ -42,7 +42,7 @@
     },
     {
       "crate": "rio-gateway",
-      "doc": "Error from `process_build_events`. Distinguishes transport errors (scheduler connection dropped — reconnect-worthy) from stream EOF without terminal (scheduler closed gracefully but incompletely — NOT reconnect-worthy, the build state is lost).",
+      "doc": "Error from `process_build_events`. Distinguishes transport errors and stream EOF-without-terminal (both reconnect-worthy failover signatures — see the per-variant docs) from `Wire` (client-side disconnect — not retried).",
       "name": "StreamProcessError"
     },
     {

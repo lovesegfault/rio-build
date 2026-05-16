@@ -121,13 +121,9 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
     ),
 ];
 
-/// Register `# HELP` descriptions for all scheduler metrics.
-///
-/// Call from `main()` immediately after `init_metrics()`. The
-/// describe_*!() help strings here are the source for
-/// docs/ref/metrics.typ's Scheduler table (via xtask regen docs-data
-/// → docs/gen/metrics.json). See rio_gateway::describe_metrics for
-/// rationale.
+/// Registers prometheus metric descriptions. The help strings here are
+/// the source for `docs/ref/metrics.typ` — see
+/// `xtask/src/regen/docs_data.rs::metrics()` for the data-flow.
 // r[impl obs.metric.scheduler]
 pub fn describe_metrics() {
     use metrics::{describe_counter, describe_gauge, describe_histogram};
