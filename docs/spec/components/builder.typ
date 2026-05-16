@@ -1580,7 +1580,7 @@ both unconditionally; no hostPath volume; `hostUsers: false` works.
 `CAP_SYS_ADMIN` is scoped to the user namespace and a container escape cannot
 use it on the host. The Helm chart default is `builderPoolDefaults.privileged:
 false`; no device plugin runs, no extended resource is requested. The
-@builderpool @crd exposes an optional `privileged: bool` --- when `true` the
+@pool @crd exposes an optional `privileged: bool` --- when `true` the
 container runs fully privileged with the hostPath `/dev/fuse` fallback, an
 escape hatch for clusters whose default seccomp profiles block `mount(2)` even
 with `SYS_ADMIN`, or whose containerd lacks idmap-mount support. Production

@@ -6,6 +6,7 @@
 // Body text references entries with `@key`; glossarium back-links each
 // entry to every page it's cited on. The top-level Glossary chapter
 // (docs/glossary.typ) prints all entries with `show-all: true`.
+#import "/lib/refs.typ": refs
 
 #let notation = (
   (
@@ -209,9 +210,15 @@
     description: [The rio reconciler that watches Nodes/NodeClaims and writes @pg; runs separately from the @scheduler.],
   ),
   (
-    key: "builderpool",
-    short: [`BuilderPool`],
-    description: [The CRD that scopes a builder pool's `nodeClassRef`, ephemeral budgets, and `spec.sizing: Static|Sla` opt-out.],
+    key: "pool",
+    short: [#(refs.crd)("Pool")],
+    plural: [#(refs.crd)("Pool")s],
+    description: [k8s CRD declaring an executor pool ---
+      `spec.{`#(refs.crd-field)("Pool", "systems"),
+      #(refs.crd-field)("Pool", "features"),
+      #(refs.crd-field)("Pool", "privileged"),
+      #(refs.crd-field)("Pool", "host_network")`, …}` per
+      `rio-crds/src/pool.rs`.],
   ),
   (
     key: "aterm",
@@ -271,7 +278,7 @@
   (
     key: "overlayfs",
     short: [overlayfs],
-    description: [A Linux union filesystem that layers a writable "upper" directory over one or more read-only "lower" directories. rio-build uses stacked lowers (`/nix/store:{fuse_mount}` --- host store first, FUSE second) so nix-daemon and its dependencies remain reachable after the overlay's merged dir is bind-mounted at `/nix/store` in the child's mount namespace.],
+    description: [A Linux union filesystem that layers a writable "upper" directory over one or more read-only "lower" directories. rio-build uses a single FUSE lower (the chunk-store mount) under a tmpfs upper, mounted at `/nix/store` in the child's mount namespace --- the build sees ONLY its declared inputs (`r[builder.overlay.stacked-lower]`). The nix-daemon subprocess runs in a chroot store outside the overlay.],
   ),
   (
     key: "seccomp",
@@ -315,7 +322,7 @@
   (
     key: "leader-election",
     short: [leader election],
-    description: [A distributed coordination pattern where one instance is selected as the active leader. rio-build uses Kubernetes Lease objects for scheduler leader election, ensuring only one scheduler instance owns the in-memory DAG at a time.],
+    description: [A distributed coordination pattern where one instance is selected as the active leader. rio-build uses Kubernetes Lease objects (via `rio_lease`) for #(refs.leased-components)() leader election; the scheduler lease ensures only one instance owns the in-memory DAG at a time.],
   ),
   (
     key: "gc-root",
@@ -348,7 +355,7 @@
   (
     key: "temp-root",
     short: [temp root],
-    description: [A connection-scoped temporary GC root registered via `wopAddTempRoot`. Prevents GC of store paths that a client is actively using during an SSH session. Lost on gateway restart; the store's 24-hour GC grace period provides safety.],
+    description: [A connection-scoped temporary GC root registered via `wopAddTempRoot`. Prevents GC of store paths that a client is actively using during an SSH session. Lost on gateway restart; the store's #(refs.const)("DEFAULT_GC_GRACE_HOURS")-hour GC grace period provides safety.],
   ),
   (
     key: "backpressure",

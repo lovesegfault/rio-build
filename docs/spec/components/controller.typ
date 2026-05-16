@@ -63,7 +63,7 @@ Manages rio-build lifecycle on Kubernetes via CRDs.
   logs` on failed builders). Job settings: `backoffLimit: 0` (scheduler owns
   retry), `restartPolicy: Never`, `parallelism: 1`. `spec.maxConcurrent` is an
   optional concurrent-Job ceiling, not a standing set; when omitted, fanout is
-  bounded provisioning-side --- the §13b placeable gate (#glspl("builderpool") spawn
+  bounded provisioning-side --- the §13b placeable gate (#glspl("pool") spawn
   Jobs only for FFD-placed-on-`Registered` intents) and `cover_deficit`'s
   per-class `maxFleetCores` budget caps bound the NodeClaim mint, not the Job
   count. The Karpenter NodePool is NOT a fanout gate post-§13b:
