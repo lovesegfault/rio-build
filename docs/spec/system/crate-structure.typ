@@ -1,9 +1,31 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: none)
 
-// gen/workspace.json — members + xtask's rio-* deps. Loaded directly
-// (not via refs.typ) so the autograph block can spread `.xtask_deps`.
+// gen/workspace.json — members + per-crate `deps:{prod,optional,dev}`.
+// Loaded directly (not via refs.typ) so the autograph block can spread
+// `_ws.deps.pairs()`.
 #let _ws = json("/gen/workspace.json")
+// gen/modules.json — recursive src/ walk per crate (path, depth, doc =
+// first //! line). The §Module Structure trees derive from this so a
+// new/renamed/deleted module is reflected without a manual edit
+// (R4-m002 tls.rs + R5-m004 karpenter.rs were hand-tree drift).
+#let _mods = json("/gen/modules.json")
+#let _module-tree(crate) = {
+  let entries = _mods.at(crate)
+  raw(
+    "src/\n"
+      + entries
+        .map(m => {
+          let leaf = m.path.split("/").filter(s => s != "").last()
+          let indent = "│   " * m.depth
+          let pad = " " * calc.max(1, 22 - indent.len() - leaf.len())
+          let doc = if m.doc != "" { "# " + m.doc } else { "" }
+          indent + "├── " + leaf + pad + doc
+        })
+        .join("\n"),
+    block: true,
+  )
+}
 
 = Workspace Layout (#(refs.crate-count)() crates)
 
@@ -87,25 +109,7 @@ Notable edges:
 
 == rio-common — Shared utilities
 
-```
-src/
-├── lib.rs             # default_addr ([::] dual-stack bind)
-├── backoff.rs         # Exponential backoff with jitter + shutdown-aware retry loop
-├── config.rs          # figment-based config layering; CommonConfig, ValidateConfig, JwtConfig
-├── grpc.rs            # gRPC timeouts, message-size constants, x-rio-* metadata keys, h2 window tuning,
-│                      #   retry_status (transient-status retry helper)
-├── limits.rs          # MAX_NAR_SIZE, MAX_DAG_NODES/EDGES, heartbeat constants
-├── migrate.rs         # Shared sqlx migration runner (try-then-wait advisory lock)
-├── observability.rs   # Tracing/OTel init (OtelGuard), init_metrics (global_labels, DEFAULT_BUCKETS,
-│                      #   per-crate histogram_buckets)
-├── s3.rs              # Shared aws_sdk_s3::Client builder (store chunk backend + scheduler log flush)
-├── schema.rs          # Cross-service PG row types (compile-time schema contract)
-├── server.rs          # bootstrap(): 6-step cold-start prologue (crypto, tracing, config, TLS, signal,
-│                      #   metrics); Bootstrap<C>/HasCommonConfig; tonic_builder; drain helpers
-├── signal.rs          # SIGTERM/SIGINT → CancellationToken; sighup_reload (hot-reload loop)
-├── task.rs            # spawn_monitored task wrapper
-└── tenant.rs          # NormalizedName tenant ID newtype
-```
+#_module-tree("rio-common")
 
 #r(
   "common.bootstrap",
@@ -121,42 +125,13 @@ src/
 
 == rio-auth — Tenant JWT + assignment HMAC
 
-```
-src/
-├── lib.rs             # ClockBeforeEpoch, now_unix() shared pre-epoch guard
-├── hmac.rs            # HMAC-SHA256 assignment tokens (AssignmentClaims sign/verify)
-├── jwt.rs             # JWT encode/decode primitives (ed25519)
-└── jwt_interceptor.rs # tonic interceptor for JWT verify + Claims extraction
-```
+#_module-tree("rio-auth")
 
 Extracted from `rio-common` so a JWT-comment edit no longer rebuilds every binary. Depends on `rio-common` for `signal::Token` / `sighup_reload` and the `TENANT_TOKEN_HEADER` constant; nothing in `rio-common` depends back. Gateway holds the JWT signing key; scheduler/store/controller verify via `JwtLayer`.
 
 == rio-nix — Nix protocol and data types
 
-```
-src/
-├── lib.rs
-├── derivation/
-│   ├── mod.rs         # Derivation struct + output types
-│   ├── aterm.rs       # ATerm parser/serializer (.drv files)
-│   └── hash.rs        # Derivation hash modulo computation
-├── protocol/
-│   ├── mod.rs
-│   ├── opcodes.rs     # WorkerOp enum
-│   ├── handshake.rs   # Version negotiation, magic bytes
-│   ├── wire/
-│   │   ├── mod.rs     # Primitives: u64, bytes, strings, collections
-│   │   └── framed.rs  # Framed stream reader/writer
-│   ├── stderr.rs      # STDERR_* framing (NEXT/LAST/ERROR/RESULT/WRITE)
-│   ├── build.rs       # BasicDerivation + BuildResult wire types
-│   ├── client.rs      # Client-side protocol (drives nix-daemon --stdio)
-│   └── derived_path.rs # DerivedPath string parser
-├── store_path.rs      # StorePath + nixbase32
-├── nar.rs             # NAR streaming read/write/extract
-├── narinfo.rs         # NarInfo parse/serialize + fingerprint() + verify_sig()
-├── refscan.rs         # Reference scanner: Aho-Corasick over nixbase32 store-path hashes
-└── hash.rs            # NixHash + HashAlgo (SHA-256, SHA-512, SHA-1); colon + SRI parse/serialize
-```
+#_module-tree("rio-nix")
 
 #r(
   "nix.hash.algos",
@@ -190,6 +165,7 @@ Fuzz targets for the parsers live in `rio-nix/fuzz/` (separate workspace, own `C
 
 == rio-proto — gRPC definitions
 
+// .proto files (NOT src/ — hand-maintained; modules.json covers src/ only).
 ```
 proto/
 ├── types.proto        # Shared: PathInfo, Heartbeat, common enums
@@ -244,234 +220,27 @@ directory, so a new proto file cannot ship without one.
 
 == rio-gateway — Nix protocol frontend
 
-```
-src/
-├── lib.rs
-├── main.rs
-├── server/
-│   ├── mod.rs         # russh SSH server: accept loop + connection handler
-│   ├── keys.rs        # SSH host-key + authorized_keys load + hot-reload watcher
-│   └── session_jwt.rs # Per-SSH-session JWT mint + refresh
-├── session.rs         # Per-client session state
-├── quota.rs           # Per-tenant store-quota check (pre-SubmitBuild reject)
-├── ratelimit.rs       # Per-tenant connection/opcode rate limiter (token-bucket)
-├── translate.rs       # Nix protocol ↔ gRPC translation helpers
-└── handler/
-    ├── mod.rs         # Opcode dispatch loop
-    ├── grpc.rs        # gRPC client wrappers (timeout + retry)
-    ├── build.rs       # wopBuildPaths/wopBuildDerivation/wopBuildPathsWithResults
-    ├── opcodes_read.rs  # Read-only opcodes (QueryPathInfo, NarFromPath, ...)
-    └── opcodes_write.rs # Write opcodes (AddToStoreNar, AddMultipleToStore, ...)
-```
+#_module-tree("rio-gateway")
 
 == rio-scheduler — DAG scheduler
 
-```
-src/
-├── lib.rs
-├── main.rs
-├── actor/             # Single-threaded actor owning all mutable state
-│   ├── mod.rs         # Actor struct, spawn, push_ready helper
-│   ├── command.rs     # ActorCommand enum (split into AdminQuery/DebugCmd sub-enums) + reply types
-│   ├── config.rs      # DagActorConfig / DagActorPlumbing: grouped construction inputs
-│   ├── handle.rs      # ActorHandle: mpsc sender wrapper + is_alive/backpressure checks
-│   ├── breaker.rs     # Circuit-breaker for store RPCs (open/half-open/closed)
-│   ├── build.rs       # SubmitBuild / CancelBuild handlers
-│   ├── merge.rs       # DAG merge: cache-check, dedupe, transitions
-│   ├── dispatch.rs    # Ready-queue drain → executor assignment
-│   ├── completion.rs  # CompletionReport handler + EMA update + cascade
-│   ├── recovery.rs    # Post-LeaderAcquired state reload + ReconcileAssignments
-│   ├── executor.rs    # Heartbeat merge + executor liveness
-│   ├── snapshot.rs    # Read-only &self snapshot/inspect handlers (back AdminService RPCs)
-│   ├── debug.rs       # cfg(test) debug handlers + DAG injection helpers
-│   └── tests/         # Per-handler unit tests (split from old coverage.rs)
-│       ├── mod.rs
-│       ├── helpers.rs     # MockStore, make_test_node, scripted events
-│       ├── wiring.rs      # Actor spawn + channel plumbing
-│       ├── build.rs       # SubmitBuild/CancelBuild
-│       ├── merge.rs       # DAG merge + dedupe + cache-check
-│       ├── dispatch.rs    # Ready-queue drain + assignment
-│       ├── completion.rs  # CompletionReport + cascade
-│       ├── recovery.rs    # State reload + reconcile
-│       ├── executor.rs    # Heartbeat + liveness
-│       ├── keep_going.rs  # keep_going=true/false cascade behavior
-│       ├── fault.rs       # Store errors, circuit breaker, poison
-│       ├── misc.rs        # Small cross-cutting tests
-│       └── integration.rs # Multi-handler scenarios
-├── state/
-│   ├── mod.rs         # PriorityClass, re-exports
-│   ├── newtypes.rs    # DrvHash, ExecutorId (Arc<str>-backed; scheduler-internal — NOT shared with proto/builder)
-│   ├── derivation.rs  # DerivationState (RetryState/CaState/SchedHint sub-structs), DerivationStatus transitions
-│   ├── build.rs       # BuildInfo, BuildState transitions
-│   └── executor.rs    # ExecutorInfo, heartbeat timeout tracking
-├── dag/
-│   ├── mod.rs         # Dag: node/edge storage, reverse-deps walk
-│   └── tests.rs
-├── grpc/
-│   ├── mod.rs         # gRPC service wiring → actor message send
-│   ├── actor_guards.rs    # Leader-guard + actor-alive request interceptors
-│   ├── scheduler_service.rs # SchedulerService impl (SubmitBuild, WatchBuild, CancelBuild)
-│   ├── executor_service.rs  # ExecutorService impl (BuildExecution stream, Heartbeat)
-│   └── tests/         # bridge, guards, stream, submit
-├── logs/
-│   ├── mod.rs         # LogBuffers: DashMap ring buffers per derivation
-│   └── flush.rs       # LogFlusher: S3 zstd PUT on completion
-├── admin/
-│   ├── mod.rs         # AdminService impl dispatch
-│   ├── builds.rs      # ListBuilds / GetBuild / CancelBuild
-│   ├── gc.rs          # TriggerGC
-│   ├── graph.rs       # GetBuildGraph (induced-subgraph walk, node cap)
-│   ├── logs.rs        # GetBuildLogs (ring buffer + S3 replay)
-│   ├── spawn_intents.rs # GetSpawnIntents (ADR-023 per-drv intents)
-│   ├── tenants.rs     # ListTenants / tenant quota inspect
-│   ├── executors.rs   # ListExecutors / DrainExecutor / ClusterStatus
-│   └── tests/         # per-handler admin tests
-├── ca/
-│   ├── mod.rs         # CA early-cutoff: output-hash compare against content index
-│   └── resolve.rs     # CA derivation resolution (inputDrvs placeholder → realized path rewrite)
-├── db/
-│   ├── mod.rs         # PG pool + transaction helpers
-│   ├── assignments.rs # derivation→executor assignment rows
-│   ├── batch.rs       # Batched multi-row INSERT helpers
-│   ├── builds.rs      # builds table CRUD + terminal transitions
-│   ├── derivations.rs # derivations table CRUD + status transitions
-│   ├── history.rs     # build_samples write/retention + sla_overrides CRUD
-│   ├── live_pins.rs   # GC live-pin rows (non-terminal build outputs)
-│   ├── recovery.rs    # Non-terminal state reload queries
-│   ├── tenants.rs     # tenant rows + quota columns
-│   └── tests/         # per-module PG integration tests
-├── lease/
-│   ├── mod.rs         # LeaseState enum + leader-guard helpers
-│   └── election.rs    # Kubernetes Lease-based leader election (HOSTNAME-driven identity)
-├── assignment.rs      # Executor selection (hard-filter, first-match)
-├── actor/floor.rs     # D4 reactive resource_floor doubling (bump_floor_or_count)
-├── critical_path.rs   # Bottom-up priority computation + incremental update
-├── event_log.rs       # BuildEvent ring buffer + PG replay for WatchBuild since_sequence
-└── queue.rs           # ReadyQueue: BinaryHeap with lazy invalidation
-```
+#_module-tree("rio-scheduler")
 
 == rio-store — Content-addressable store
 
-```
-src/
-├── lib.rs
-├── main.rs
-├── backend.rs         # ChunkBackend trait + S3/filesystem/memory impls + delete_by_key (GC drain)
-├── grpc/
-│   ├── mod.rs         # StoreService + ChunkService skeleton
-│   ├── admin.rs       # Store AdminService (TriggerGC, VerifyChunks, upstream CRUD, GetLoad)
-│   ├── put_path/
-│   │   ├── mod.rs     # PutPath streaming handler
-│   │   └── common.rs  # Shared PutPath/PutPathBatch write-ahead state machine steps
-│   ├── put_path_batch.rs # PutPathBatch (multi-NAR streaming, shared tx)
-│   ├── get_path.rs    # GetPath streaming handler
-│   ├── queries.rs     # Read-side RPCs (QueryPathInfo, FindMissingPaths, AddSignatures, realisations, TenantQuota)
-│   ├── sign.rs        # narinfo signing + cross-tenant signature-visibility gate
-│   └── chunk.rs       # GetChunk / FindMissingChunks
-├── gc/
-│   ├── mod.rs         # GC orchestrator + two-phase mark/sweep entry
-│   ├── mark.rs        # Mark phase: reachability walk from live pins + tenant roots
-│   ├── sweep.rs       # Sweep phase: narinfo DELETE + chunk refcount decrement
-│   ├── drain.rs       # pending_s3_deletes drain task (batched S3 DeleteObjects)
-│   ├── orphan.rs      # Orphan scanner: reap stale 'uploading' manifests (crashed mid-PutPath)
-│   └── tenant.rs      # Per-tenant store accounting + quota lookup (TenantQuota RPC)
-├── cas.rs             # moka chunk cache + singleflight + BLAKE3 verify
-├── chunker.rs         # FastCDC content-defined chunking
-├── manifest.rs        # Chunk-list serialize/deserialize
-├── metadata/          # narinfo + manifests PG tables
-│   ├── mod.rs         # MetadataStore struct + transaction helpers
-│   ├── inline.rs      # Small-NAR inline storage (no chunk manifest)
-│   ├── chunked.rs     # Large-NAR chunked storage (manifest-backed)
-│   ├── queries.rs     # Shared SELECT/UPDATE helpers + narinfo_cols! macro
-│   ├── tenant_keys.rs # Per-tenant signing-key rows (load + rotate)
-│   ├── cluster_key_history.rs # Prior cluster signing keys (unretired pubkeys for sig_visibility_gate)
-│   └── upstreams.rs   # Per-tenant upstream binary-cache config (tenant_upstreams table)
-├── migrations.rs      # Per-migration M_NNN doc-consts (rationale/history — SQL files are frozen)
-├── realisations.rs    # CA realisation storage (Register/Query)
-├── substitute.rs      # Upstream binary-cache substitution: block-and-fetch narinfo+NAR, ingest via CAS path
-├── signing.rs         # ed25519 narinfo signing
-├── test_helpers.rs    # Shared test-only seeding helpers (seed_* builders, #[cfg(test)])
-└── validate.rs        # ValidatedPathInfo checks (hash, refs, size)
-```
+#_module-tree("rio-store")
 
 == rio-builder — Build executor
 
-```
-src/
-├── lib.rs
-├── main.rs
-├── config.rs          # figment-layered Config: CLI/env/builder.toml + comma_vec deserialize helper
-├── health.rs          # HTTP /healthz + /readyz via axum (builder has no gRPC server — it's a client)
-├── cgroup.rs          # cgroup v2 per-build subtree setup + memory.peak/cpu.stat readers
-├── runtime.rs         # Builder runtime loop: poll scheduler → execute → report
-├── executor/
-│   ├── mod.rs         # execute_build: overlay → daemon → upload → report
-│   ├── daemon/
-│   │   ├── mod.rs     # run_daemon_build: timeout-wrapped driver + kill_on_drop
-│   │   ├── spawn.rs   # spawn_daemon_in_namespace: bind-mount overlay, set cgroup, exec nix-daemon --stdio
-│   │   └── stderr_loop.rs # STDERR_RESULT drain: BuildLogLine → LogBatcher
-│   └── inputs.rs      # Input resolution: fetch_drv_from_store, resolve_inputs
-├── fuse/
-│   ├── mod.rs         # Filesystem impl + mount_fuse_background
-│   ├── inode.rs       # Inode allocator + path↔ino maps
-│   ├── fetch/
-│   │   ├── mod.rs     # Fetch + materialize store paths into local cache (GetPath → NAR extract)
-│   │   ├── client.rs  # StoreClients: gRPC client bundle + transport selection for FUSE fetches
-│   │   └── tests.rs
-│   ├── circuit.rs     # Fetch circuit breaker (std::sync only — no tokio in FUSE callbacks)
-│   ├── ops.rs         # Filesystem trait impl: lookup/getattr/open/readlink/readdir + slow-path fallbacks
-│   ├── lookup.rs      # FUSE attribute helpers (stat_to_attr, TTL constants) — handlers live in ops.rs
-│   ├── read.rs        # File content serving: read/readlink/readdir + prefetch (pread-based)
-│   └── cache.rs       # SQLite-backed SSD cache with LRU eviction
-├── overlay.rs         # overlayfs setup/teardown (host store + FUSE lower)
-├── synth_db.rs        # Synthetic nix.sqlite for sandboxed nix-daemon
-├── upload.rs          # HashingChannelWriter: stream NAR → PutPath
-└── log_stream.rs      # LogBatcher: 64-line/100ms batch + rate/size limits
-```
+#_module-tree("rio-builder")
 
 == rio-controller — Kubernetes operator
 
-```
-src/
-├── lib.rs
-├── main.rs            # rustls CryptoProvider::install_default() + controller watch loop
-├── bin/
-│   └── crdgen.rs      # Emit Pool/ComponentScaler CRD YAML
-├── error.rs           # ControllerError + finalizer::Error<Self> boxed recursion
-├── fixtures.rs        # Test fixtures: fake kube::Client via tower-test mock::pair()
-└── reconcilers/
-    ├── mod.rs         # Controller::new() + error_policy + requeue intervals
-    ├── gc_schedule.rs # GC cron interval loop (not a CRD reconciler) → store TriggerGC RPC
-    ├── componentscaler/
-    │   ├── mod.rs     # ComponentScaler reconciler: GetLoad fan-out + /scale patch
-    │   └── decide.rs  # Predictive Σ(queued+running) → desired-replicas decision
-    └── pool/
-        ├── mod.rs     # Pool reconcile entry: drain finalizer + crds↔proto ExecutorKind bridge
-        ├── pod.rs     # Pod-spec builder (security context, volumes, labels, fetcher hardening)
-        ├── job.rs     # Job-mode plumbing: spawn_for_each, reap_excess_pending, reap_orphan_running
-        ├── jobs.rs    # Reconcile loop: GetSpawnIntents → build_job → status patch
-        ├── disruption.rs # DisruptionTarget Pod watcher → DrainExecutor{force:true}
-        └── tests/
-```
+#_module-tree("rio-controller")
 
 == rio-test-support — Test harness
 
-```
-src/
-├── lib.rs             # TestDb re-export, TestResult alias, init_test_logging
-├── config.rs          # figment::Jail standing-guard test macros (jail_roundtrip!, jail_defaults!)
-├── pg.rs              # Ephemeral PostgreSQL (initdb + postgres via PG_BIN)
-├── wire.rs            # wire_bytes!/wire_send! macros, handshake/setOptions/stderr helpers
-├── grpc/
-│   ├── mod.rs         # Re-exports
-│   ├── store.rs       # In-memory StoreService + ChunkService mock + fault knobs
-│   ├── scheduler.rs   # Configurable SchedulerService mock (scripted streams, error injection)
-│   ├── admin.rs       # Minimal AdminService mock for CLI smoke tests (build.rs-generated stubs)
-│   └── spawn.rs       # In-process tonic server spawn helpers (incl. layered + duplex)
-├── kube_mock.rs       # Fake kube::Client via tower-test mock::pair() + scenario verifier
-├── metrics.rs         # Test-only metrics::Recorder impls + metrics_suite! assertion helpers
-└── fixtures.rs        # test_store_path, rand_store_hash, NAR/PathInfo/DAG builders, seed_store_output
-```
+#_module-tree("rio-test-support")
 
 `rio-test-support` is a `[dependencies]` (not dev-dep) of `xtask` — `xtask regen sqlx` reuses `PgServer::bootstrap`. All other crates depend on it under `[dev-dependencies]` only; `rio-store` additionally has it under `[dependencies]` with `optional = true` (`test-utils` feature, not in `default`).
 
@@ -513,27 +282,11 @@ src/
 
 == rio-crds — Kubernetes CRD types
 
-```
-src/
-├── lib.rs             # schema_with=any_object for k8s-openapi fields (avoid {} schema)
-├── pool.rs            # Pool CRD spec/status (kind: Builder|Fetcher) + #[derive(CustomResource, KubeSchema)]
-└── componentscaler.rs # ComponentScaler CRD spec/status (predictive Deployment /scale)
-```
+#_module-tree("rio-crds")
 
 == rio-cli — Operator CLI
 
-```
-src/
-├── main.rs            # clap CLI entry + AdminService client wiring
-├── derivations.rs     # `rio derivations` — actor in-memory DAG snapshot for a build
-├── gc.rs              # `rio gc` — trigger store GC sweep (AdminService.TriggerGC, server-streaming)
-├── logs.rs            # `rio logs` — stream build logs for a derivation (GetBuildLogs)
-├── status.rs          # `rio status` — cluster summary + executor/build rollup
-├── upstream.rs        # `rio upstream list|add|remove` — per-tenant upstream cache CRUD (StoreAdminService)
-├── verify_chunks.rs   # `rio verify-chunks` — PG↔backend chunk consistency audit (StoreAdminService.VerifyChunks)
-├── workers.rs         # `rio workers` — ListExecutors table + per-executor drain; --actor/--diff for in-mem state
-└── pool.rs            # `rio pool get|describe` — Pool CR inspection (kube-rs, not gRPC)
-```
+#_module-tree("rio-cli")
 
 == xtask — Dev/ops tooling
 
