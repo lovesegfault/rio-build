@@ -39,7 +39,13 @@
   templates,
 )
 #import templates: equation-rules, markup-rules, template-rules, theme-box
-#import "@preview/tracey:0.1.0": req
+// tracey's `req()` rendering helper is no longer used — `#r()` below
+// renders via showybox (paged) / html.elem (html) directly. The
+// `@preview/tracey` package stays in nix/docs.nix typstDeps for
+// consistency with `tracey query` config.styx, but nothing imports
+// from it at compile time. tracey's scanner reads .typ SOURCE for
+// `#r("…")` calls, so the import was never load-bearing for
+// traceability.
 #import "@preview/glossarium:0.5.10": (
   get-entry-back-references, gls, glspl, make-glossary, print-glossary,
   register-glossary,
@@ -52,6 +58,7 @@
   gentle-clues, idea as _gc-idea, info as _gc-info, memo as _gc-memo,
   tip as _gc-tip, warning as _gc-warning,
 )
+#import "@preview/showybox:2.0.4": showybox
 #import "@preview/lilaq:0.6.0" as lq
 #import "@preview/fletcher:0.5.8" as fletcher: diagram, edge, node
 #import "@preview/chronos:0.3.0" as chronos
@@ -199,11 +206,34 @@
         body.pos().join()
       }) #label(_rid(id))]
   } else {
-    // tracey's bundled req() doesn't attach a #label — add one so
-    // rref() resolves in PDF/dyn-paged too. The displayed badge keeps
-    // the full `+N` id (req renders it); only the LINK target is
-    // version-agnostic.
-    [#req(id, ..body) #label(_rid(id))]
+    // PDF/dyn-paged: showybox mirroring the .rio-req CSS above
+    // (3px left border #d0d7de, badge #f6f8fa, body inset 1em left).
+    // tracey's bundled req() is pure rendering (block+box, no
+    // metadata or state) — its scanner reads .typ SOURCE for
+    // `#r("…")` calls — so replacing the render keeps `tracey query`
+    // intact. The badge keeps the full `+N` id; only the #label is
+    // version-agnostic via _rid so `tracey bump` doesn't rot rrefs.
+    [#showybox(
+        frame: (
+          border-color: rgb("#d0d7de"),
+          body-color: white,
+          thickness: (left: 3pt),
+          radius: 0pt,
+          inset: (left: 1em, top: 0.5em, bottom: 0.5em, right: 0em),
+        ),
+        breakable: true,
+        spacing: 1em,
+        {
+          box(
+            fill: rgb("#f6f8fa"),
+            radius: 3pt,
+            inset: (x: 0.5em, y: 0.15em),
+            text(font: "DejaVu Sans Mono", size: 0.85em)[r\[#id\]],
+          )
+          [ ]
+          body.pos().join()
+        },
+      ) #label(_rid(id))]
   }
 }
 

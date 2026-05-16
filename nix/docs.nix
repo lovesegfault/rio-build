@@ -62,6 +62,7 @@ let
         lovelace
         unify
         gentle-clues
+        showybox
         lilaq
         fletcher
         finite
