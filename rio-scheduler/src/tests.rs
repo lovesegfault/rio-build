@@ -553,12 +553,10 @@ async fn health_serving_after_set() -> anyhow::Result<()> {
 }
 
 // r[verify sched.health.shared-reporter]
-/// The health service is Clone, so we can serve it from TWO
-/// tonic servers (mTLS main port + plaintext health port)
-/// with ONE shared HealthReporter. The toggle loop writes to the
-/// reporter once; BOTH servers see the status change. If we created
-/// a fresh reporter for the plaintext port, it would never toggle
-/// → standby always SERVING → K8s routes to non-leader.
+/// The lease toggle and the gRPC server share ONE HealthReporter
+/// (single port). `health_service.clone()` shares state — a fresh
+/// `health_reporter()` would never be toggled → standby always
+/// SERVING → K8s routes to non-leader.
 #[tokio::test]
 async fn health_service_clone_shares_reporter_state() -> anyhow::Result<()> {
     use tonic_health::pb::{

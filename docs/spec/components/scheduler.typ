@@ -1791,10 +1791,11 @@ CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
   logs a warning and observed-record expiry is the fallback.
 ]
 
-#r("sched.health.shared-reporter")[
-  `health_service.clone()` SHARES reporter state across TLS and plaintext
-  ports. A fresh `health_reporter()` on the plaintext port would never be set
-  to NOT_SERVING → standby always appears Ready → cluster split.
+#r("sched.health.shared-reporter+2")[
+  The lease toggle calls `set_not_serving`/`set_serving` on the SAME
+  `HealthReporter` the gRPC server was built with (single port). A fresh
+  `health_reporter()` would never be toggled → standby always appears Ready →
+  cluster split.
 ]
 
 #r("sched.grpc.leader-guard")[
