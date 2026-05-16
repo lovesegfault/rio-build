@@ -43,7 +43,7 @@ than plain gRPC metadata:
   - `jti`: unique token ID for revocation tracking
 + *Signing*: Tokens are signed with an ed25519 key held by the gateway. The
   signing key is stored as a Kubernetes Secret (recommend KMS/Vault for
-  production). Key rotation follows the same procedure as narinfo signing
+  production). Key rotation follows the same procedure as @narinfo signing
   keys.
 + *Propagation*: The signed JWT propagates through all internal gRPC calls
   in the `x-rio-tenant-token` metadata header, replacing the unsigned
@@ -152,12 +152,12 @@ Single-tenant mode (empty `authorized_keys` comment) never quota-checks.
   align: (left, left),
   table.header([Parameter], [Description]),
   [`max_concurrent_builds`], [Maximum builds running simultaneously],
-  [`max_dag_size`], [Maximum derivations in a single build DAG],
+  [`max_dag_size`], [Maximum derivations in a single build @dag],
   [`max_store_size`],
   [Maximum total store usage (enforced pre-SubmitBuild via
     `gc_max_store_bytes`)],
 
-  [`max_nar_upload_size`], [Maximum single NAR upload size],
+  [`max_nar_upload_size`], [Maximum single @nar upload size],
 )
 
 == Security Considerations

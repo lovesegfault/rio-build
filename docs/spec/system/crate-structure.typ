@@ -551,7 +551,7 @@ src/
   align: (left, left, center, left),
   table.header([Crate], [Purpose], [Phase], [Notes]),
   [`rio-nix` (ours)],
-  [Nix types: store paths, derivations, NAR, narinfo, wire protocol],
+  [Nix types: store paths, derivations, @nar, @narinfo, wire protocol],
   [1],
   [Implemented from scratch; MIT/Apache-2.0],
 
@@ -593,12 +593,12 @@ src/
   [`sha2`],
   [SHA-256 hashing],
   [1],
-  [NAR hash verification, store path computation, content index. All Nix-facing hashes use SHA-256.],
+  [NAR hash verification, @store-path computation, content index. All Nix-facing hashes use SHA-256.],
 
   [`blake3`],
   [Fast cryptographic hashing],
   [2],
-  [Chunk content addressing (rio-store CAS).],
+  [Chunk content addressing (rio-store @cas).],
 
   [`moka`],
   [In-process LRU cache],
@@ -613,7 +613,7 @@ src/
   [`dashmap`],
   [Concurrent hash map],
   [2],
-  [Scheduler log ring buffers (written outside actor loop); singleflight for concurrent S3 fetches.],
+  [Scheduler log ring buffers (written outside actor loop); @singleflight for concurrent S3 fetches.],
 
   [`ordered-float`],
   [`Ord` wrapper for floats],
@@ -627,7 +627,7 @@ src/
   [2],
   [Binary cache signature support. `features = ["rand_core", "pkcs8"]`.],
 
-  [`fuser`], [FUSE filesystem], [2], [Per-worker `/nix/store` mount],
+  [`fuser`], [@fuse filesystem], [2], [Per-worker `/nix/store` mount],
   [`tracing-opentelemetry`],
   [Distributed tracing],
   [2 (done)],
@@ -695,7 +695,7 @@ src/
 
 == Dependencies Considered and Rejected
 
-- *`petgraph`*: DAG representation. Rejected — the scheduler's graph is a simple adjacency-list `HashMap` with a custom `DerivationStatus` state machine; petgraph's algorithms (toposort, scc) don't match the incremental ready-queue pattern.
+- *`petgraph`*: @dag representation. Rejected — the scheduler's graph is a simple adjacency-list `HashMap` with a custom `DerivationStatus` state machine; petgraph's algorithms (toposort, scc) don't match the incremental ready-queue pattern.
 - *`memmap2`*: Zero-copy chunk access for filesystem backend. Rejected — the filesystem backend uses buffered I/O; SIGBUS handling complexity not justified for a dev/test-only backend. Production uses S3 (streamed over HTTP, no mmap).
 - *`ginepro`*: gRPC client-side load balancing via DNS. Rejected — Cilium provides L4 load-balancing via eBPF kube-proxy replacement; tonic clients connect to a ClusterIP and Cilium distributes per-connection.
 - *`arbtest`*: Property testing via structure-aware fuzzing. Rejected — `proptest` covers roundtrip serialization; `cargo-fuzz` covers parser fuzzing. No gap between them.

@@ -4,7 +4,7 @@
 = rio-gateway
 
 The gateway is the entry point. It terminates SSH connections and speaks the
-Nix worker protocol, making rio-build appear as a standard Nix remote
+Nix @worker-protocol, making rio-build appear as a standard Nix remote
 store/builder.
 
 == Responsibilities
@@ -12,7 +12,7 @@ store/builder.
 - SSH server via `russh` crate --- accepts connections, authenticates via SSH
   keys
 - Implement the Nix worker protocol (version negotiation, opcode handling)
-- Handle both remote store mode (full DAG submission) and build hook mode
+- Handle both remote store mode (full @dag submission) and @build-hook mode
   (per-derivation delegation)
 - STDERR streaming loop: send `STDERR_NEXT`, `STDERR_START_ACTIVITY`,
   `STDERR_STOP_ACTIVITY`, `STDERR_RESULT`, `STDERR_LAST` during operations
@@ -44,12 +44,12 @@ store/builder.
   columns: 3,
   align: (left, left, left),
   table.header([Opcode], [Value], [Description]),
-  [`wopIsValidPath`], [1], [Check if a store path exists],
+  [`wopIsValidPath`], [1], [Check if a @store-path exists],
   [`wopAddToStore`], [7], [Legacy content-addressed store path import],
   [`wopAddTextToStore`], [8], [Legacy text file import (builtins.toFile)],
   [`wopBuildPaths`], [9], [Build a set of derivations],
   [`wopEnsurePath`], [10], [Ensure a store path is valid/available],
-  [`wopAddTempRoot`], [11], [Add temporary GC root],
+  [`wopAddTempRoot`], [11], [Add temporary @gc-root],
   [`wopSetOptions`], [19], [Accept client build configuration],
   [`wopQueryPathInfo`], [26], [Return full path metadata],
   [`wopQueryPathFromHashPart`],
@@ -60,7 +60,7 @@ store/builder.
   [`wopQueryValidPaths`], [31], [Batch validity check],
   [`wopBuildDerivation`], [36], [Build a single derivation],
   [`wopAddSignatures`], [37], [Add signatures to a path],
-  [`wopNarFromPath`], [38], [Export path as NAR],
+  [`wopNarFromPath`], [38], [Export path as @nar],
   [`wopAddToStoreNar`], [39], [Accept NAR imports],
   [`wopQueryMissing`], [40], [Report what needs building],
   [`wopQueryDerivationOutputMap`], [41], [Get output name → path mapping],
@@ -457,7 +457,7 @@ full DAG by parsing the `.drv` files uploaded in the preceding
 parsed `.drv` file (obtained from the per-session `.drv` cache built during
 `wopAddToStoreNar`/`wopAddMultipleToStore`, or fetched from rio-store if the
 `.drv` was uploaded in a previous session). For input-addressed derivations,
-the output paths are deterministic and computed from the derivation's ATerm
+the output paths are deterministic and computed from the derivation's @aterm
 representation. For CA derivations (Phase 5), the gateway first checks
 rio-store for realized output paths via `QueryPathInfo`; if unknown, it returns
 the placeholder output paths from the `.drv`.
@@ -483,7 +483,7 @@ the placeholder output paths from the `.drv`.
   )
 ]
 
-Response (after STDERR loop):
+Response (after @stderr-loop):
 
 #table(
   columns: 4,
@@ -1237,8 +1237,8 @@ exactly `--stdio`. This allows clients that send a full store path (e.g.,
   must be ≥ `drain_grace_secs + session_drain_secs + CANCEL_GRACE` + slack.
 ]
 
-The deployed `session_drain_secs` (3600 s) is the operator SLA: a deploy may
-interrupt builds running >1 h on the evicted gateway replica. Karpenter is held
+The deployed `session_drain_secs` (3600 s) is the operator #gls("sla"): a deploy may
+interrupt builds running >1 h on the evicted gateway replica. @karpenter is held
 off the control-plane NodePool entirely (`disruption.budgets: nodes=0,
 reasons=[Drifted]` on `rio-general`), so AMI drift never auto-evicts gateway
 pods; the operator runs `cargo xtask k8s rotate-general` during a quiet window
@@ -1658,7 +1658,7 @@ derivation without the full DAG context.
   traffic is light).
 ]
 
-- Multiple gateway replicas sit behind a TCP load balancer (NLB on EKS with
+- Multiple gateway replicas sit behind a TCP load balancer (@nlb on EKS with
   idle timeout ≥ 3600s).
 - Session state is connection-scoped --- the gateway is stateless beyond the
   lifetime of a single SSH connection.

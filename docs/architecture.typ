@@ -6,7 +6,7 @@
 
 #figure(
   caption: [System overview --- layered request path. Clients speak the Nix
-    worker protocol over SSH; the gateway translates to internal gRPC; the
+    @worker-protocol over SSH; the gateway translates to internal gRPC; the
     scheduler and store are replica sets backed by PostgreSQL/S3; builders are
     ephemeral one-shot pods reconciled by the controller.],
   diagram(
@@ -21,7 +21,7 @@
         *Nix Clients* \
         #text(size: 0.8em)[
           Path A (remote store): `nix build --store ssh-ng://rio .#pkg` \
-          Path B (build hook): `nix.buildMachines = [{ hostName="rio"; protocol="ssh-ng"; }]`
+          Path B (@build-hook): `nix.buildMachines = [{ hostName="rio"; protocol="ssh-ng"; }]`
         ]
       ],
     ),
@@ -54,7 +54,7 @@
         *rio-scheduler* \
         #text(size: 0.8em, fill: muted)[leader-elected] \
         #text(size: 0.8em)[
-          Global build DAG \
+          Global build @dag \
           Critical-path scheduling \
           Resource-fit hard-filter \
           State: PostgreSQL
@@ -69,7 +69,7 @@
       fill: accent.lighten(88%),
       align(left)[
         *rio-store* \
-        #text(size: 0.8em, fill: muted)[chunked CAS --- FastCDC + BLAKE3]
+        #text(size: 0.8em, fill: muted)[chunked @cas --- @fastcdc + @blake3]
         #block(
           stroke: 0.4pt + rule-color,
           inset: 4pt,
@@ -79,7 +79,7 @@
           below: 0.4em,
           text(
             size: 0.75em,
-          )[*PostgreSQL* --- narinfo, refs, manifests, CA index],
+          )[*PostgreSQL* --- @narinfo, refs, manifests, CA index],
         )
         #block(
           stroke: 0.4pt + rule-color,
@@ -105,8 +105,8 @@
     let bldr(tag) = align(left)[
       *#tag* \
       #text(size: 0.75em)[
-        FUSE `/nix/store` + SSD cache \
-        overlayfs + synth SQLite DB \
+        @fuse `/nix/store` + SSD cache \
+        @overlayfs + synth SQLite DB \
         nix sandbox
       ]
     ],
@@ -157,8 +157,8 @@ builders or other components --- it watches CRDs and reconciles desired state.
   store
 - *#cross-link("/spec/components/controller.typ")[rio-controller]* --- Kubernetes operator
 - *#cross-link("/spec/components/proto.typ")[rio-proto]* --- gRPC service definitions
-- *rio-nix* --- Nix protocol implementation library (wire primitives, ATerm,
-  NAR, store paths)
+- *rio-nix* --- Nix protocol implementation library (wire primitives, @aterm,
+  @nar, store paths)
 - *rio-common* --- shared utilities (limits, observability init)
 - *#cross-link("/spec/components/dashboard.typ")[rio-dashboard]* --- Web dashboard (Phase 5)
 
@@ -443,7 +443,7 @@ and #cross-link("/spec/components/store.typ")[rio-store] for the chunked CAS.
 == Scheduler Failover
 
 + Scheduler leader pod dies (crash, node failure, rolling update).
-+ New scheduler pod acquires the Kubernetes Lease for leader election.
++ New scheduler pod acquires the Kubernetes Lease for #gls("leader-election").
 + New leader reconstructs in-memory state from PostgreSQL (see the
   #cross-link("/spec/components/scheduler.typ")[scheduler spec] State Recovery
   section). Dispatch is gated on `recovery_complete`.
@@ -470,7 +470,7 @@ and #cross-link("/spec/components/store.typ")[rio-store] for the chunked CAS.
 
 == Import-From-Derivation (IFD)
 
-IFD occurs when Nix evaluation depends on a build result:
+@ifd occurs when Nix evaluation depends on a build result:
 
 + Client begins evaluation and discovers it needs to build a derivation
   before evaluation can continue.

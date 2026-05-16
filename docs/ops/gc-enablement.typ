@@ -7,7 +7,7 @@ GC mark-and-sweep deletes paths with no reachable references. Before enabling GC
 
 = Prerequisites (must be true before enabling GC)
 
-+ *Builder version*: All builders running a version with the NAR reference scanner (commit `9165dc23` or later). Check: `kubectl get pods -l app=rio-builder -o jsonpath='{.items[*].spec.containers[*].image}'`
++ *Builder version*: All builders running a version with the @nar reference scanner (commit `9165dc23` or later). Check: `kubectl get pods -l app=rio-builder -o jsonpath='{.items[*].spec.containers[*].image}'`
 
 + *Backfill complete*: All paths uploaded before the scanner fix have been re-scanned. Check: `SELECT COUNT(*) FROM narinfo WHERE refs_backfilled = false` should be 0.
 
@@ -26,6 +26,6 @@ GC mark-and-sweep deletes paths with no reachable references. Before enabling GC
 
 If GC deleted something it shouldn't have:
 
-+ Pause the S3 drain job (narinfo/manifest rows CASCADE-deleted but chunks survive in `pending_s3_deletes`)
++ Pause the S3 drain job (#gls("narinfo")/manifest rows CASCADE-deleted but chunks survive in `pending_s3_deletes`)
 + `SELECT * FROM pending_s3_deletes WHERE created_at > $gc_run_time` --- these chunks can be restored
 + See #cross-link("/spec/components/store.typ")[Store §GC] for chunk restore procedure

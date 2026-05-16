@@ -72,14 +72,14 @@ Manages rio-build lifecycle on Kubernetes via CRDs.
 ]
 
 *Isolation guarantee:* zero cross-build state. Fresh pod means fresh emptyDir
-for FUSE cache and overlayfs upper, fresh filesystem. Untrusted tenants cannot
+for @fuse cache and @overlayfs upper, fresh filesystem. Untrusted tenants cannot
 leave poisoned cache entries for subsequent builds --- there is no "subsequent
 build" on that pod. Strongest isolation when combined with `hostUsers: false` +
 non-privileged (see #rref("sec.pod.host-users-false")).
 
 *Cost:* per-build cold start (pod scheduling + container pull + FUSE mount +
 scheduler registration --- typically 10--30s) plus one reconcile tick (\~10s)
-before the Job is spawned. Nodes outlive pods (Karpenter consolidation policy),
+before the Job is spawned. Nodes outlive pods (@karpenter consolidation policy),
 so the node-level FSx cache survives pod churn --- the cold-start cost is pod
 overhead, not refetching the closure.
 
@@ -294,7 +294,7 @@ gone.
   ```
 ]
 
-Why not k8s HPA: no metrics-server / custom.metrics.k8s.io adapter in-cluster,
+Why not k8s #gls("hpa"): no metrics-server / custom.metrics.k8s.io adapter in-cluster,
 and the controller already has the demand signal (`ClusterStatus`). See
 #rref("ctrl.scaler.component+2") / #rref("ctrl.scaler.ratio-learn") for
 reconciler behavior.
@@ -520,7 +520,7 @@ owns). All other controller reconcilers remain non-leader-gated.
 
 == NetworkPolicy
 
-NetworkPolicy resources are deployed via the Helm chart
+@networkpolicy resources are deployed via the Helm chart
 (`infra/helm/rio-build/templates/networkpolicy.yaml`, gated on
 `networkPolicy.enabled`), not controller-managed. The controller has no
 `networking.k8s.io` RBAC permissions. Intended policies:
@@ -535,7 +535,7 @@ NetworkPolicy resources are deployed via the Helm chart
 - *Store*: egress to PostgreSQL and S3. DNS egress to kube-system.
 - *Controller*: egress to rio-scheduler (gRPC, for
   `AdminService.ClusterStatus`/`GetSpawnIntents` queue-depth queries) and to
-  the Kubernetes API server (for CRD watches and Job management). DNS egress to
+  the Kubernetes API server (for @crd watches and Job management). DNS egress to
   kube-system.
 
 == PodDisruptionBudget
@@ -559,7 +559,7 @@ NetworkPolicy resources are deployed via the Helm chart
 
 Scheduler and gateway PDBs are static manifests in the Helm chart
 (`infra/helm/rio-build/templates/pdb.yaml`, gated on
-`podDisruptionBudget.enabled`). Executor pods are one-shot Jobs --- a PDB on
+`podDisruptionBudget.enabled`). Executor pods are one-shot Jobs --- a @pdb on
 Jobs is meaningless (eviction of a Job pod just reschedules the build via
 #rref("ctrl.drain.disruption-target")).
 

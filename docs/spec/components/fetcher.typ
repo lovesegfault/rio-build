@@ -3,7 +3,7 @@
 
 = rio-fetcher
 
-FOD-only executor. Same binary as rio-builder, launched with
+#gls("fod")-only executor. Same binary as rio-builder, launched with
 `RIO_EXECUTOR_KIND=fetcher`.
 
 Regular builds and FOD fetches have opposite network requirements --- builds
@@ -19,7 +19,7 @@ boundary. See @fetcher-rationale-split for the full rationale.
 - Execute the FOD fetch via `nix-daemon --stdio` with network access enabled in
   the sandbox
 - Verify the output hash before upload (#rref("builder.fod.verify-hash"))
-- Upload the verified output NAR to rio-store
+- Upload the verified output @nar to rio-store
 - Heartbeat to the scheduler with `ExecutorKind::Fetcher`
 
 == Differences from builder
@@ -43,7 +43,7 @@ boundary. See @fetcher-rationale-split for the full rationale.
     [Dedicated `rio.build/fetcher` taint (#rref("fetcher.node.dedicated"))],
 
     [Rootfs], [Writable], [`readOnlyRootFilesystem: true`],
-    [CRD],
+    [@crd],
     [`Pool{kind=Builder}`],
     [`Pool{kind=Fetcher}` (ADR-019 hardening forced)],
 
@@ -203,7 +203,7 @@ scheduler, gateway, controller, dashboard, PostgreSQL. `rio-store`
 NetworkPolicies can target it precisely. `rio-builders`
 (#(refs.psa)("rio-builders")) and `rio-fetchers` (#(refs.psa)("rio-fetchers"))
 hold the respective Jobs. `privileged` PSA
-narrows to the two namespaces that need `CAP_SYS_ADMIN` for FUSE; the control
+narrows to the two namespaces that need `CAP_SYS_ADMIN` for @fuse; the control
 plane is #rref("sec.psa.control-plane-restricted").
 
 *One CRD, two kinds.* A `Pool{kind=Builder}` lives in `rio-builders`; a
@@ -257,7 +257,7 @@ together. Four namespaces means cross-namespace RBAC for the controller and
 `namespaceSelector`-based NetworkPolicies. `rio_worker_*` metrics became
 `rio_builder_*`; #(refs.metric)("rio_scheduler_queue_depth") and
 #(refs.metric)("rio_scheduler_utilization") gained a `{kind}` label
-(`builder`/`fetcher`) to track the split. The fetcher seccomp
+(`builder`/`fetcher`) to track the split. The fetcher @seccomp
 profile may be too strict for exotic fetchers (git-lfs, Mercurial, Subversion)
 --- the profile starts as builder-profile-plus-denies and the allowlist widens
 as real FODs hit denied syscalls. The VM test suite includes at least one

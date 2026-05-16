@@ -15,7 +15,7 @@
     node((2, 0.5), [rio-scheduler], name: <sched>, fill: accent.lighten(88%)),
     node((3, 0.5), [rio-store], name: <store>, fill: accent.lighten(88%)),
     node((2, 1.5), [rio-builder], name: <ex>, fill: accent.lighten(88%)),
-    node((4, 0), [S3 (IRSA)], name: <s3>, shape: fletcher.shapes.cylinder),
+    node((4, 0), [S3 (@irsa)], name: <s3>, shape: fletcher.shapes.cylinder),
     node((4, 1), [PostgreSQL], name: <pg>, shape: fletcher.shapes.cylinder),
     node(
       (3, 1.5),
@@ -55,7 +55,7 @@
 
 - *Threat*: Malicious `.drv` files, crafted protocol messages, resource
   exhaustion
-- *Mitigations*: Protocol parser fuzzing (see `rio-nix/fuzz/`), global NAR size
+- *Mitigations*: Protocol parser fuzzing (see `rio-nix/fuzz/`), global @nar size
   limits (`MAX_NAR_SIZE`)
 
 #memo(title: [TODO])[
@@ -160,7 +160,7 @@
   the store's `StoreAdminService` (`TriggerGC`, `AddUpstream`, `GetLoad`, …):
   builders share port 9001/9002 with those services (CCNP allows the port at L4
   only), so without the gate a compromised builder could poison λ[h], drain
-  arbitrary executors, set SLA overrides to bias the solver fleet-wide,
+  arbitrary executors, set @sla overrides to bias the solver fleet-wide,
   un-poison quarantined derivations, or inject attacker-keyed upstream caches
   into another tenant's substitution path. Callers (rio-controller, rio-cli,
   rio-scheduler) mint `caller="<self>"` per request via
@@ -191,7 +191,7 @@
   resources
 - *Mitigations*: `CAP_SYS_ADMIN` + `seccompProfile: RuntimeDefault` (NOT
   `privileged: true`), `hostUsers: false` (user-namespace isolation), dedicated
-  node pool, NetworkPolicy, `automountServiceAccountToken: false`, IMDSv2 hop
+  node pool, @networkpolicy, `automountServiceAccountToken: false`, @imdsv2 hop
   limit=1
 
 == Executor Pod Security
@@ -292,7 +292,7 @@
     [Designed],
 
     [*Chunk integrity*],
-    [BLAKE3 verified on every read from S3/cache],
+    [@blake3 verified on every read from S3/cache],
     [Designed],
 
     [*Signing key protection*],
@@ -304,7 +304,7 @@
     [Recommended],
 
     [*Executor isolation*],
-    [Per-build overlayfs, Nix sandbox, NetworkPolicy],
+    [Per-build @overlayfs, Nix sandbox, NetworkPolicy],
     [Designed],
 
     [*Metadata service blocking*],
@@ -321,7 +321,7 @@
     [Implemented --- `infra/helm/rio-build/templates/networkpolicy.yaml`],
 
     [*Multi-tenant data isolation*],
-    [Per-tenant narinfo visibility filtering + per-tenant signing keys; shared
+    [Per-tenant @narinfo visibility filtering + per-tenant signing keys; shared
       executors with per-build overlay isolation],
     [Implemented],
   ),
@@ -364,7 +364,7 @@ tracey rule or phase deferral.
     [`sandbox = true` in `nix.conf` ensures all builds run inside the Nix
       sandbox (user/mount/PID/network namespaces).],
 
-    [DAG size limit],
+    [@dag size limit],
     [Gateway + Scheduler],
     [Implemented],
     [Gateway's `translate::validate_dag` checks `nodes.len() > MAX_DAG_NODES`
@@ -511,7 +511,7 @@ Cilium overlay layer.
 - *Threat*: Fixed-output derivations (FODs) needing credentials (e.g., private
   GitHub repos) require network access and authentication during build.
 - *Mitigation*: FODs execute on dedicated fetcher pods with open egress; the
-  FOD hash check is the integrity boundary. Per-tenant credentials are injected
+  @fod hash check is the integrity boundary. Per-tenant credentials are injected
   via fetcher pod env from Secrets, never via builder pods. See ADR-019.
 
 === FOD Network Isolation
@@ -555,7 +555,7 @@ Cilium overlay layer.
 
 Builder pods are *always* one-shot Jobs (see `r[ctrl.pool.ephemeral]` in the
 controller spec): one pod per build, zero shared state. Each build gets a fresh
-emptyDir for the FUSE cache and overlayfs upper --- an untrusted tenant cannot
+emptyDir for the @fuse cache and overlayfs upper --- an untrusted tenant cannot
 leave behind poisoned cache entries, doctored overlays, or stale mount points
 for the next build, because there is no "next build" on that pod. The pod
 terminates after one `CompletionReport`; K8s reaps the Job via
@@ -611,7 +611,7 @@ heartbeat) plus one reconciler tick (\~10s).
 + *Executors require `CAP_SYS_ADMIN`.* This capability enables mount namespace
   manipulation, which is powerful. `seccompProfile: RuntimeDefault` blocks \~40
   syscalls (`kexec_load`, `open_by_handle_at`, etc.), but `CAP_SYS_ADMIN` still
-  grants significant host access. The Localhost seccomp profile
+  grants significant host access. The Localhost @seccomp profile
   (`r[builder.seccomp.localhost-profile]`) additionally blocks
   `ptrace`/`bpf`/`setns`/`process_vm_*` --- production deployments should set
   `PoolSpec.seccompProfile: {type: Localhost, localhostProfile:

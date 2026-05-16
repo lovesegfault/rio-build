@@ -23,14 +23,14 @@ state machine)
 
   [*TransientFailure*],
   [Yes (with backoff)],
-  [Executor OOM-killed, executor pod preempted, network timeout during input
+  [Executor #gls("oom")-killed, executor pod preempted, network timeout during input
     fetch],
   [`BuildResult::TransientFailure`],
   [3],
 
   [*InfrastructureFailure*],
   [Yes (different executor)],
-  [S3 unavailable, PostgreSQL connection timeout, FUSE cache I/O error,
+  [S3 unavailable, PostgreSQL connection timeout, @fuse cache I/O error,
     overlay mount failure],
   [`BuildResult::TransientFailure` + reassignment],
   [3],
@@ -89,7 +89,7 @@ explicitly; *all other Nix statuses fall through to `PermanentFailure`*:
 
   [`OutputRejected` (5)],
   [PermanentFailure],
-  [Fallthrough. Output hash mismatch (FOD) or path collision.],
+  [Fallthrough. Output hash mismatch (@fod) or path collision.],
 
   [`NoSubstituters` (14)],
   [PermanentFailure],
@@ -297,7 +297,7 @@ separately. A derivation is only globally poisoned if it fails on
     client.],
 
   [Gateway crash],
-  [SSH connection drops. Client reconnects; build reattaches via DAG-merge
+  [SSH connection drops. Client reconnects; build reattaches via #gls("dag")-merge
     cache hits (stored outputs are instant-hit). Logs between crash and
     reconnect are lost unless log persistence is configured.],
 

@@ -14,7 +14,7 @@ grpcurl -plaintext -d '{"derivations": [{"drv_path": "/nix/store/abc...-hello.dr
   rio-scheduler:50051 rio.scheduler.SchedulerService/SubmitBuild
 ```
 
-Note: The derivation must be a valid store path. Evaluation is external to rio-build (see #cross-link("/intro.typ")[Non-Goals]). The `.drv` file must already exist in rio-store (uploaded via `wopAddToStoreNar` through a gateway session or `nix copy`).
+Note: The derivation must be a valid #gls("store-path"). Evaluation is external to rio-build (see #cross-link("/intro.typ")[Non-Goals]). The `.drv` file must already exist in rio-store (uploaded via `wopAddToStoreNar` through a gateway session or `nix copy`).
 
 = Pre-Populating the Store: `nix copy`
 

@@ -46,15 +46,15 @@ split.
 ]
 
 Inline blobs never touch S3 --- they live entirely in PostgreSQL. The
-inline/chunked decision is made at `PutPath` time based on NAR size; see the
+inline/chunked decision is made at `PutPath` time based on @nar size; see the
 "Inline vs. chunked invariant" in @store-schema.
 
 = Layer 2: Nix Metadata Store
 
 - Maps store paths to their chunk manifests (ordered list of chunk digests)
-- Stores narinfo metadata: deriver, NAR hash, NAR size, references, signatures,
+- Stores @narinfo metadata: deriver, NAR hash, NAR size, references, signatures,
   `tenant_id`
-- Content-addressed index: maps output content hash → store path (for CA early
+- Content-addressed index: maps output content hash → @store-path (for CA early
   cutoff)
 - Input-addressed index: maps derivation hash → output store paths (traditional
   lookups)
@@ -121,7 +121,7 @@ narinfo.
   UPSERT, chunks whose refcount is exactly 1 were newly inserted by this upload
   and need to go to S3; chunks with refcount > 1 already existed. This has a
   small TOCTOU window (two concurrent uploaders of the same chunk may both skip
-  upload), but the race is harmless --- `GetPath` BLAKE3-verifies every chunk
+  upload), but the race is harmless --- `GetPath` #gls("blake3")-verifies every chunk
   and surfaces `NotFound` as a clear error, not silent corruption. A separate
   `FindMissingChunks` gRPC batch-query exists for external callers (e.g.,
   executor-side pre-upload checks).
@@ -230,7 +230,7 @@ the `pending_s3_deletes` table.
   [Batch validity check (like REAPI's FindMissingBlobs)],
 
   [`QueryPathFromHashPart(hash_part)`],
-  [Resolve full store path from 32-char nixbase32 hash prefix
+  [Resolve full store path from 32-char @nixbase32 hash prefix
     (#rref("store.api.hash-part"))],
 
   [`AddSignatures(store_path, sigs)`],
@@ -342,7 +342,7 @@ the `pending_s3_deletes` table.
 + *Buffer + verify:* Accumulate the streamed NAR chunks into a buffer, then
   compute SHA-256 over the buffered bytes and verify against the declared
   `NarHash`. On mismatch, delete the placeholder row and reject.
-+ *Write-ahead manifest (PG):* Chunk the buffered NAR with FastCDC, then in a
++ *Write-ahead manifest (PG):* Chunk the buffered NAR with @fastcdc, then in a
   single PostgreSQL transaction: write `manifest_data` (serialized chunk list)
   and UPSERT chunk refcounts. This protects chunks from GC sweep immediately
   --- even if the upload crashes after this point, orphan cleanup will find the
@@ -1243,7 +1243,7 @@ CREATE INDEX idx_pending_s3_deletes_drain
 
 = Design References (no code dependencies)
 
-- tvix `castore` protobuf definitions (MIT-licensed): inform our CAS gRPC API
+- tvix `castore` protobuf definitions (MIT-licensed): inform our @cas gRPC API
   design
 - tvix `store` protobuf definitions (MIT-licensed): inform our PathInfo API
   design
@@ -1268,7 +1268,7 @@ CREATE INDEX idx_pending_s3_deletes_drain
   NarDigest, `validate_nar_digest`)
 - `rio-store/src/backend/` --- ChunkBackend trait + S3/filesystem/memory impls
 - `rio-store/src/cas.rs` --- `put_chunked` orchestration, ChunkCache (moka LRU
-  + singleflight + BLAKE3 verify)
+  + @singleflight + BLAKE3 verify)
 - `rio-store/src/chunker.rs` --- FastCDC wrapper (16K/64K/256K min/avg/max)
 - `rio-store/src/manifest.rs` --- Chunk manifest (de)serialization, versioned
   binary format
@@ -1318,7 +1318,7 @@ latency is mitigated by caching.
 rio-store and executors is the main bottleneck. NAR streaming avoids
 materializing full NARs in memory; chunk-level deduplication enables
 incremental transfers; the scheduler sends prefetch hints to the executor's
-FUSE cache before assigning work; and the per-executor FUSE store with local
+@fuse cache before assigning work; and the per-executor FUSE store with local
 SSD cache provides local-disk performance for hot paths without shared
 infrastructure.
 
@@ -1326,7 +1326,7 @@ infrastructure.
 store has two write-time failure modes: _orphaned chunks_ (chunk upload
 succeeds but metadata write fails, leaving unreferenced chunks in blob storage)
 and _broken manifests_ (metadata write succeeds but some chunks are missing,
-producing an unreadable manifest). The write-ahead manifest pattern resolves
+producing an unreadable manifest). The @write-ahead-manifest pattern resolves
 both: write chunk references to a pending manifest before uploading chunks,
 then promote to committed after all chunks are verified ---
 #rref("store.put.wal-manifest").
@@ -1347,7 +1347,7 @@ CA-first would have required derivation resolution and output rewriting before
 the basic build pipeline worked.
 
 *The hard part: CA early cutoff correctness.* When a CA derivation's output
-matches cached content, the cutoff must propagate correctly through the DAG ---
+matches cached content, the cutoff must propagate correctly through the @dag ---
 a cutoff at node N means all transitive dependents of N can potentially skip
 rebuilding if their other inputs are also unchanged. This requires careful
 state management in the scheduler.
@@ -1418,7 +1418,7 @@ there is no "occasional" case.
 
 If rio-store is degraded (slow but not down), all executors' FUSE cache misses
 queue up: FUSE read operations block, build sandboxes stall, and the
-scheduler's backpressure mechanism (actor queue depth > 80%) rejects new builds
+scheduler's @backpressure mechanism (actor queue depth > 80%) rejects new builds
 with `RESOURCE_EXHAUSTED`. After 5 consecutive `ensure_cached` failures, the
 FUSE circuit breaker opens and `check()` returns `EIO` immediately (fail-fast)
 --- see #rref("builder.fuse.circuit-breaker").

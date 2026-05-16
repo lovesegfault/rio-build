@@ -35,7 +35,7 @@ For a more sophisticated setup, use `nix-eval-jobs` with `--check-cache-status` 
 
 = Multi-Architecture Builds
 
-rio-build supports multiple architectures via separate builder pools. Each `Pool` CRD declares a `systems` list (e.g., `["x86_64-linux"]` or `["aarch64-linux"]`). The scheduler matches derivation `system` to executors whose `systems` list contains it, and also requires all derivation `requiredSystemFeatures` to be present in the executor's `features` list. (Darwin builders --- `aarch64-darwin`, `x86_64-darwin` --- are future work; see #cross-link("/intro.typ")[Introduction].)
+rio-build supports multiple architectures via separate builder pools. Each `Pool` @crd declares a `systems` list (e.g., `["x86_64-linux"]` or `["aarch64-linux"]`). The scheduler matches derivation `system` to executors whose `systems` list contains it, and also requires all derivation `requiredSystemFeatures` to be present in the executor's `features` list. (Darwin builders --- `aarch64-darwin`, `x86_64-darwin` --- are future work; see #cross-link("/intro.typ")[Introduction].)
 
 ```bash
 # Build for a specific architecture (requires executors with matching system)
@@ -77,13 +77,13 @@ Recommended dashboards:
   [Active builds, queue depth, cache hit rate, build duration p50/p95/p99],
 
   [*Executor Utilization*],
-  [CPU/memory per executor, FUSE cache hit ratio, builds/hour],
+  [CPU/memory per executor, @fuse cache hit ratio, builds/hour],
 
   [*Store Health*],
   [Chunk dedup ratio, S3 request rate, PutPath latency, GC progress],
 
   [*Scheduler*],
-  [Assignment latency, critical path accuracy, DAG size distribution],
+  [Assignment latency, critical path accuracy, @dag size distribution],
 )
 
 See #cross-link("/spec/system/observability.typ")[Observability] for the full list of available metrics.

@@ -18,7 +18,7 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
   [rio-gateway],
   [Deployment],
   [2+],
-  [Stateless (per-connection ephemeral state only). Behind NLB.],
+  [Stateless (per-connection ephemeral state only). Behind #gls("nlb").],
 
   [rio-scheduler],
   [Deployment],
@@ -33,12 +33,12 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
   [rio-controller],
   [Deployment],
   [1],
-  [K8s operator. *Single replica, not leader-elected* --- two controllers would fight over SSA patches (conflicting fieldManager). Add leader election later if the \~30s pod-reschedule gap during restart becomes a problem.],
+  [K8s operator. *Single replica, not leader-elected* --- two controllers would fight over SSA patches (conflicting fieldManager). Add @leader-election later if the \~30s pod-reschedule gap during restart becomes a problem.],
 
   [rio-builder],
   [Job (ephemeral)],
   [0+ (autoscaled)],
-  [Managed by rio-controller via Pool CRD (`kind: Builder`). Requires dedicated node pool.],
+  [Managed by rio-controller via Pool @crd (`kind: Builder`). Requires dedicated node pool.],
 )
 
 = Deployment Order
@@ -81,10 +81,10 @@ Executors require a dedicated node pool with:
 ]
 
 - *Taint:* `rio.build/executor=true:NoSchedule` (only executor pods scheduled here). Note: system pods (coredns) need at least one untainted node — use a separate system node group.
-- *Instance type:* Compute-optimized (e.g., `c8a.xlarge` on AWS). For IO-heavy builds the `rio-builder-nvme-{x86,aarch64}` NodePools select instance-store-NVMe families via `karpenter.k8s.aws/instance-local-nvme > 0`; the AMI's `rio-nvme-mount.service` (early boot, before tmpfiles and nodeadm) stripes the instance-store devices into `/dev/md0`, formats XFS, and mounts at `/var/lib/kubelet` with `prjquota` so kubelet enforces per-pod ephemeral-storage via XFS project quotas. The `rio-nvme` EC2NodeClass sets `instanceStorePolicy: RAID0` so Karpenter's bin-pack simulation counts NVMe capacity toward ephemeral-storage; nodeadm does not act on it (the AMI's `nodeadm init --skip run` never executes the local-disk aspect), so `rio-nvme-mount.service` still owns the mdadm→mkfs.xfs+prjquota chain uncontested.
-- *AMI:* the NixOS node AMI (`.#node-ami-<arch>`, ADR-021). Amazon Linux 2 (AL2, kernel 5.10) does *NOT* support overlayfs-over-FUSE and is not compatible with rio-build executors.
+- *Instance type:* Compute-optimized (e.g., `c8a.xlarge` on AWS). For IO-heavy builds the `rio-builder-nvme-{x86,aarch64}` NodePools select instance-store-NVMe families via `karpenter.k8s.aws/instance-local-nvme > 0`; the AMI's `rio-nvme-mount.service` (early boot, before tmpfiles and nodeadm) stripes the instance-store devices into `/dev/md0`, formats XFS, and mounts at `/var/lib/kubelet` with `prjquota` so kubelet enforces per-pod ephemeral-storage via XFS project quotas. The `rio-nvme` EC2NodeClass sets `instanceStorePolicy: RAID0` so @karpenter's bin-pack simulation counts NVMe capacity toward ephemeral-storage; nodeadm does not act on it (the AMI's `nodeadm init --skip run` never executes the local-disk aspect), so `rio-nvme-mount.service` still owns the mdadm→mkfs.xfs+prjquota chain uncontested.
+- *AMI:* the NixOS node AMI (`.#node-ami-<arch>`, ADR-021). Amazon Linux 2 (AL2, kernel 5.10) does *NOT* support #gls("overlayfs")-over-@fuse and is not compatible with rio-build executors.
 - *Kernel:* Linux 6.1+ (for overlayfs-over-FUSE support). Linux 6.9+ recommended for FUSE passthrough mode. Verify with `uname -r` on worker nodes.
-- *IMDSv2:* Hop limit = 1 (defense-in-depth against metadata access from containers)
+- *#gls("imdsv2"):* Hop limit = 1 (defense-in-depth against metadata access from containers)
 - *Pod spec:* `hostUsers: false` is incompatible with `/dev/fuse` hostPath volumes (kernel rejects idmap mounts on device nodes). containerd `base_runtime_spec` injects `/dev/{fuse,kvm}` directly (OCI `linux.devices` — runc `mknod`s inside the container's `/dev`); see `nix/base-runtime-spec.nix` (NixOS AMI: `nix/nixos-node/containerd-config.nix`; k3s VM fixture: `services.k3s.containerdConfigTemplate` in `nix/tests/fixtures/k3s-full.nix`).
 - *`/dev/fuse` access:* Executor pods need access to `/dev/fuse`. A `hostPath` volume with `privileged: true` works for development but production should use `base_runtime_spec` device injection to avoid granting full privileges. `CAP_SYS_ADMIN` alone is not sufficient for `/dev/fuse` access — the container's device cgroup must also allow the FUSE character device.
 - *EKS addons:* `vpc-cni` and `kube-proxy` must be installed before node groups are created (they are daemonsets). `coredns` requires schedulable (untainted) nodes and should be installed after the system node group is ready.
@@ -121,7 +121,7 @@ See #cross-link("/spec/system/security.typ")[Security: Secrets Management] for r
 
 - SSH host key (gateway)
 - Authorized SSH keys (gateway)
-- NAR signing key (store)
+- @nar signing key (store)
 - Database credentials (scheduler, store)
 - HMAC signing key for assignment tokens (scheduler, store) --- set via `RIO_HMAC_KEY_PATH` on both. The scheduler signs Claims{executor_id, drv_hash, expected_outputs, is_ca, expiry_unix} at dispatch; the store verifies on `PutPath`. Same key file both sides (shared secret). Generate: `openssl rand -out /path/to/key 32`.
 
@@ -169,7 +169,7 @@ For a complete scripted walkthrough against EKS, run `cargo xtask k8s qa --healt
 
 = Production Considerations
 
-- *PostgreSQL HA:* Use RDS Multi-AZ, Cloud SQL HA, or Patroni. See #cross-link("/ref/configuration.typ")[Configuration: PostgreSQL Operations].
+- *PostgreSQL HA:* Use RDS Multi-@az, Cloud SQL HA, or Patroni. See #cross-link("/ref/configuration.typ")[Configuration: PostgreSQL Operations].
 - *Monitoring:* Configure Prometheus scraping and Grafana dashboards. See #cross-link("/spec/system/observability.typ")[Observability].
 - *Transport encryption:* Cilium WireGuard transparent encryption is on by default (`encryption.type: wireguard`). rio components speak plaintext gRPC; the overlay encrypts node-to-node. There are no per-component TLS certificates and no cert-manager dependency. See #cross-link("/spec/system/security.typ")[Security: `r[sec.transport.cilium-wireguard]`].
 - *NLB target health:* With `externalTrafficPolicy: Local` on the gateway Service, the NLB shows `N/M` targets healthy where `N` = number of nodes hosting a rio-gateway pod (the rest fail the `healthCheckNodePort` probe by design — they have no local backend). This is correct, not a bug.
@@ -184,12 +184,12 @@ For a complete scripted walkthrough against EKS, run `cargo xtask k8s qa --healt
 
 = Disaster Recovery
 
-- *PostgreSQL:* Standard backup/restore via `pg_dump`, WAL archiving, or managed service snapshots (e.g., RDS automated backups). PostgreSQL is the authoritative source for all metadata (narinfo, chunk manifests, scheduling state, build history). *PG metadata cannot be reconstructed from S3 alone.*
+- *PostgreSQL:* Standard backup/restore via `pg_dump`, WAL archiving, or managed service snapshots (e.g., RDS automated backups). PostgreSQL is the authoritative source for all metadata (@narinfo, chunk manifests, scheduling state, build history). *PG metadata cannot be reconstructed from S3 alone.*
 - *S3:* Durable by default (11 nines). Chunk data in S3 is the source of truth for build artifacts. Enable S3 versioning as defense against accidental deletes.
 - *Recovery procedure:* Restore PostgreSQL from backup, verify S3 bucket accessibility, restart all components. Executors reconnect and re-register.
 
   #info[
-    *State recovery (Phase 3b):* On `LeaderAcquired` (lease acquisition), the scheduler calls `recover_from_pg` which rebuilds the in-memory DAG from PostgreSQL: loads non-terminal builds + derivations + edges + build_derivations, reconstructs `DerivationState` via `from_recovery_row`, recomputes critical-path priorities, repopulates the ready queue. The lease loop fire-and-forgets `LeaderAcquired` (non-blocking — keeps renewing during recovery); `recovery_complete` flag gates dispatch. If recovery fails (PG down), sets `recovery_complete=true` anyway with an empty DAG (degrade to pre-recovery behavior, don't block). Generation counter seeded from `MAX(assignments.generation) + 1` via `fetch_max` for defensive monotonicity. See `rio-scheduler/src/actor/recovery.rs`.
+    *State recovery (Phase 3b):* On `LeaderAcquired` (lease acquisition), the scheduler calls `recover_from_pg` which rebuilds the in-memory @dag from PostgreSQL: loads non-terminal builds + derivations + edges + build_derivations, reconstructs `DerivationState` via `from_recovery_row`, recomputes critical-path priorities, repopulates the ready queue. The lease loop fire-and-forgets `LeaderAcquired` (non-blocking — keeps renewing during recovery); `recovery_complete` flag gates dispatch. If recovery fails (PG down), sets `recovery_complete=true` anyway with an empty DAG (degrade to pre-recovery behavior, don't block). Generation counter seeded from `MAX(assignments.generation) + 1` via `fetch_max` for defensive monotonicity. See `rio-scheduler/src/actor/recovery.rs`.
   ]
 - *RPO:* Determined by PostgreSQL backup frequency. With WAL archiving, RPO can be near-zero. S3 data has effectively zero RPO.
 - *RTO:* Determined by PostgreSQL restore time + component restart time. Typically 5-15 minutes for managed databases.

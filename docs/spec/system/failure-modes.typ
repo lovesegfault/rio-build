@@ -54,10 +54,10 @@ Split-brain is bounded by the Kubernetes Lease renew deadline (default 15s):
 
 == Cascading FUSE Cache Miss Storm
 
-If rio-store is degraded (slow but not down), all executors' FUSE cache misses
+If rio-store is degraded (slow but not down), all executors' @fuse cache misses
 queue up:
 - Executors' FUSE read operations block, causing build sandboxes to stall
-- The scheduler's backpressure mechanism (actor queue depth > 80%) rejects new
+- The scheduler's @backpressure mechanism (actor queue depth > 80%) rejects new
   builds with `RESOURCE_EXHAUSTED`
 - After 5 consecutive `ensure_cached` failures, the FUSE circuit breaker opens
   and `check()` returns `EIO` immediately (fail-fast). The existing

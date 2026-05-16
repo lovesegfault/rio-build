@@ -56,7 +56,7 @@ keys (`jwt.required` ↔ TOML `[jwt] required = …` ↔ env `RIO_JWT__REQUIRED`
 #_cfg-table(_cfg.scheduler)
 
 #info[
-  *`[sla]` table:* ADR-023 SLA-driven sizing config is mandatory and
+  *`[sla]` table:* ADR-023 #gls("sla")-driven sizing config is mandatory and
   structured (no env override). It is documented separately in
   #cross-link("/spec/components/scheduler.typ")[scheduler: SLA sizing] and is
   not flattened into the table above.
@@ -88,7 +88,7 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 #info[
   *Compile-time constants (not configurable):* `INLINE_THRESHOLD` = 256 KiB,
   `CHUNK_MIN` = 16 KiB, `CHUNK_AVG` = 64 KiB, `CHUNK_MAX` = 256 KiB. These
-  live in `rio-store/src/cas.rs` and `chunker.rs`. BLAKE3-verify-on-read and
+  live in `rio-store/src/cas.rs` and `chunker.rs`. #gls("blake3")-verify-on-read and
   SHA-256-verify-on-put are always on (no config toggle).
 ]
 
@@ -179,7 +179,10 @@ details.
   [50],
   [Maximum concurrent build requests per tenant],
 
-  [`max_dag_size`], [u32], [10000], [Maximum derivations in a single build DAG],
+  [`max_dag_size`],
+  [u32],
+  [10000],
+  [Maximum derivations in a single build @dag],
 
   [`max_store_size`],
   [u64],
@@ -189,10 +192,10 @@ details.
   [`max_nar_upload_size`],
   [u64],
   [10737418240 (10GB)],
-  [Maximum single NAR upload size],
+  [Maximum single @nar upload size],
 )
 
-Configured per tenant via the admin API or CRD annotations. See
+Configured per tenant via the admin API or @crd annotations. See
 #cross-link("/spec/system/tenancy.typ")[Multi-Tenancy] for enforcement details.
 
 = PostgreSQL Operations
@@ -209,7 +212,7 @@ pooling (not session-mode) since rio-build does not use prepared statements
 across transaction boundaries.
 
 #info[
-  *Note:* The scheduler's leader election uses a *Kubernetes Lease*
+  *Note:* The scheduler's @leader-election uses a *Kubernetes Lease*
   (`coordination.k8s.io/v1`), not PostgreSQL. PgBouncer mode has no effect on
   leader election. See
   #cross-link("/spec/components/scheduler.typ")[scheduler: Leader
@@ -233,7 +236,7 @@ Environment variable: `RIO_GRPC_MAX_MESSAGE_SIZE`
 == High Availability
 
 - *Development:* Single PostgreSQL instance is sufficient.
-- *Production:* Use a managed HA service (RDS Multi-AZ, Cloud SQL HA, or
+- *Production:* Use a managed HA service (RDS Multi-@az, Cloud SQL HA, or
   Patroni on self-hosted). The store and scheduler tolerate brief leader
   failovers (connection retry with backoff).
 

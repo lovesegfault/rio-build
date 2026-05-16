@@ -2,7 +2,7 @@
 
 #show: rio.with(domains: none)
 
-The SLA sizer (ADR-023) fits a per-`(pname, system, tenant)` duration/memory
+The @sla sizer (ADR-023) fits a per-`(pname, system, tenant)` duration/memory
 curve from observed builds and solves for the cheapest core count that hits
 the configured tier targets. When the fit is wrong — stale samples, hw drift,
 a pname whose behaviour changed upstream — builds get under- or
@@ -34,7 +34,7 @@ override or reset.
   [#link(<rionodeclaimpool-icemaskedhigh>)[Admissible set shrinking]],
 
   [#(refs.alert)("RioNodeclaimPoolAllCellsIceMasked")],
-  [SpawnIntents dropped — every hosting cell is ICE-masked],
+  [SpawnIntents dropped — every hosting cell is #gls("ice")-masked],
   [#link(<rionodeclaimpool-icemaskedhigh>)[Admissible set shrinking]],
 
   [#(refs.alert)("RioNodeclaimPoolStuckPending")],
@@ -50,7 +50,7 @@ override or reset.
   [#link(<rionodeclaimpool-nohostingclass>)[No hosting class]],
 
   [#(refs.alert)("RioNodeclaimPoolStuckTerminating")],
-  [A NodeClaim has had `deletionTimestamp` set >5m without Karpenter's finalizer clearing],
+  [A NodeClaim has had `deletionTimestamp` set >5m without @karpenter's finalizer clearing],
   [#link(<rionodeclaimpool-stuckterminating>)[Stuck terminating]],
 )
 
@@ -284,7 +284,7 @@ hasn't refreshed in >30m (it ticks every 10m; auto-clamp to helm seed at 60m).
 Not a model-accuracy issue — cost ranking degrades, not sizing. Check
 scheduler leader-lease (`kubectl -n rio-system get lease rio-scheduler-leader`
 — the name is `helm:scheduler.leaseName`, not the Deployment name) and
-`ec2:DescribeSpotPriceHistory` IRSA permissions. Cross-reference
+`ec2:DescribeSpotPriceHistory` @irsa permissions. Cross-reference
 #(refs.metric)("rio_scheduler_sla_hw_cost_fallback_total")`{reason}`.
 
 == RioNodeclaimPool IceMaskedHigh <rionodeclaimpool-icemaskedhigh>
@@ -323,7 +323,7 @@ aws iam create-service-linked-role --aws-service-name spot.amazonaws.com
 After fixing the cloud-side cause, the in-memory `IceBackoff` self-heals on
 TTL expiry (`60s × 2^step`, capped at `sla.maxLeadTime`). To clear it
 immediately, `kubectl rollout restart deploy/rio-scheduler -n rio-system` —
-the backoff is lease-holder-only and DAG state recovers from PG.
+the backoff is lease-holder-only and @dag state recovers from PG.
 
 For genuine spot capacity exhaustion (not structural), `rio-cli sla override
 <pname> --capacity=on-demand` on hot pnames as a stopgap, or set
@@ -412,7 +412,7 @@ entry for the intent's `(arch, size, required_features)`:
   `max_cores`/`max_mem`. Check
   #(refs.metric)("rio_controller_nodeclaim_intent_dropped_total")`{reason="exceeds_cell_cap"}`
   for the same drv.
-- *Featureless arch-unmappable system* — a non-FOD `system="builtin"` or
+- *Featureless arch-unmappable system* — a non-@fod `system="builtin"` or
   `darwin-*` build with no `requiredSystemFeatures` to route on. There is no
   class to mint for an intent that constrains on neither arch nor features;
   the build cannot be scheduled. Operator must add a `[sla.hw_classes.$h]`

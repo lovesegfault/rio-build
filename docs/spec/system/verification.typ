@@ -74,11 +74,11 @@ per-crate fuzz workspaces (#src("rio-nix/fuzz/"), #src("rio-store/fuzz/")):
   maximum sizes
 - `opcode_parsing` --- each opcode's payload parsing (wopAddToStoreNar,
   wopBuildDerivation, etc.)
-- `nar_parsing` --- NAR streaming reader with malformed input
-- `narinfo_parsing` --- narinfo text format parser
-- `derivation_parsing` --- `.drv` ATerm format parser (including
+- `nar_parsing` --- @nar streaming reader with malformed input
+- `narinfo_parsing` --- @narinfo text format parser
+- `derivation_parsing` --- `.drv` @aterm format parser (including
   `__structuredAttrs` with `__json`)
-- `derived_path_parsing` --- DerivedPath wire format (`!`-separated
+- `derived_path_parsing` --- @derivedpath wire format (`!`-separated
   `drvPath!output` strings)
 - `build_result_parsing` --- BuildResult wire format (status, error message,
   timing, built outputs)
@@ -96,20 +96,20 @@ per-crate fuzz workspaces (#src("rio-nix/fuzz/"), #src("rio-store/fuzz/")):
 
 - Wire format: roundtrip serialization for all protocol types (property tests
   via `proptest`)
-- DAG scheduling: known graphs → expected critical paths and executor
+- @dag scheduling: known graphs → expected critical paths and executor
   assignments
 - Scheduler invariants (proptest): for any DAG and completion sequence, no
   derivation is dispatched before all dependencies complete
 - DAG merging: merging two DAGs produces correct dedup and shared-node priority
   inheritance
-- FastCDC chunking: deterministic chunking, dedup verification, chunk/reassembly
+- @fastcdc chunking: deterministic chunking, dedup verification, chunk/reassembly
   roundtrip
-- CAS: put/get/gc correctness, content-indexed lookup, PutPath idempotency
+- #gls("cas"): put/get/gc correctness, content-indexed lookup, PutPath idempotency
 - CA early cutoff: propagation through multi-level DAGs, mixed CA/input-addressed
   DAGs
 - Narinfo: parse/generate roundtrip against known-good narinfo files
 - Store path computation: verify against known nix store paths
-- FUSE store: cache hit/miss behavior, LRU eviction, concurrent access
+- @fuse store: cache hit/miss behavior, LRU eviction, concurrent access
 
 == Functional Tests
 
@@ -139,7 +139,7 @@ needs russh fixture.
 == Integration Tests
 
 - `nix build --store ssh-ng://rio nixpkgs#hello` --- minimal end-to-end
-- `nix build --builders 'ssh-ng://rio x86_64-linux'` --- build hook path
+- `nix build --builders 'ssh-ng://rio x86_64-linux'` --- @build-hook path
 - `nix flake check --store ssh-ng://rio` --- checks output
 - Multi-derivation chain (A → B → C) distributed across executors
 - Cache hit path: second build of same derivation returns instantly
@@ -157,7 +157,7 @@ needs russh fixture.
 
 == Security Integration Tests
 
-- `PutPath` with invalid assignment token (wrong derivation hash) → rejected
+- `PutPath` with invalid @assignment-token (wrong derivation hash) → rejected
   with `PERMISSION_DENIED`
 - `PutPath` with expired assignment token → rejected with `PERMISSION_DENIED`
 - `PutPath` for output path not in assignment token's `expected_output_paths` →
@@ -170,8 +170,8 @@ needs russh fixture.
   --- the gateway forwards derivations; the scheduler enforces DAG-level limits)
 
 #info(title: [Implemented])[
-  Security VM test fragments cover JWT validation, mTLS client-cert rejection,
-  binary-cache auth (#src("nix/tests/scenarios/security.nix")); FOD proxy
+  Security VM test fragments cover JWT validation, @mtls client-cert rejection,
+  binary-cache auth (#src("nix/tests/scenarios/security.nix")); @fod proxy
   domain allowlist (#src("nix/tests/scenarios/fod-proxy.nix")); `__noChroot`
   gateway pre-check (#rref("gw.reject.nochroot")).
 ]
@@ -218,7 +218,7 @@ unviable before a test can kill them.
 == VM Integration Tests
 
 NixOS-VM tests exercise full-system flows with real kernel features (FUSE,
-cgroup v2, overlayfs, k3s). Each test spins up 2--5 QEMU VMs via `nixosTest`.
+cgroup v2, @overlayfs, k3s). Each test spins up 2--5 QEMU VMs via `nixosTest`.
 Run via `nix-fast-build --flake .#checks.x86_64-linux` (needs KVM). Tests are
 organized by scenario (#src("nix/tests/default.nix") is the source of truth):
 `vm-protocol-*`, `vm-scheduling-*`, `vm-lifecycle-*`, `vm-le-*`

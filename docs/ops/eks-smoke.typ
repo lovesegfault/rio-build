@@ -31,7 +31,7 @@ kubectl -n rio-system wait --for=condition=Ready pod \
 *Troubleshooting if pods stuck Pending:*
 - `kubectl describe pod <name>` — check Events for scheduling issues
 - Common: no nodes matching `system` nodegroup (terraform nodegroup
-  didn't create, or AZ mismatch)
+  didn't create, or @az mismatch)
 - Fix: `kubectl get nodes --show-labels | grep system`
 
 *Troubleshooting if pods CrashLoopBackOff:*
@@ -64,7 +64,7 @@ done
 echo "Gateway: $GATEWAY_HOST"
 ```
 
-*Troubleshooting if NLB never provisions:*
+*Troubleshooting if @nlb never provisions:*
 - AWS Load Balancer Controller not installed: `kubectl get pods -n kube-system | grep aws-load-balancer`
 - Check Events: `kubectl -n rio-system describe svc rio-gateway`
 - Common: missing IAM permissions for the controller's SA
@@ -74,7 +74,7 @@ echo "Gateway: $GATEWAY_HOST"
 = Step 4: Create Pool
 
 Pods land in `rio-builders`, *not* `rio-system` --- builder pods need
-`CAP_SYS_ADMIN` (overlayfs mount), and `rio-system` is PSA
+`CAP_SYS_ADMIN` (@overlayfs mount), and `rio-system` is PSA
 #(refs.psa)("rio-system"). See #rref("sec.psa.control-plane-restricted").
 
 ```bash
@@ -107,7 +107,7 @@ rio-cli pool describe smoke-test -n rio-builders    # or: kubectl -n rio-builder
 
 *Troubleshooting if workers stuck ContainerCreating:*
 - Check `/dev/fuse` on worker node: `kubectl debug node/<worker-node> -it --image=busybox -- ls -la /dev/fuse`
-- If missing: worker AMI doesn't have FUSE support (use Amazon
+- If missing: worker AMI doesn't have @fuse support (use Amazon
   Linux 2023 with fuse3 installed, or a custom AMI)
 
 = Step 5: Build Test

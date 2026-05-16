@@ -5,7 +5,10 @@
   headroom-coverage-figure, lever-arm-figure, lever-arm-ratio,
 )
 #let dur-margin-pct = calc.round(100 * duration-margin(0.1), digits: 0)
-#register-glossary(glossary-entries)
+// This chapter prints visible glossary sections (Rio-concepts /
+// Notation / Terms), so it owns the `<key>` anchors — tell `rio()` not
+// to emit its hidden anchor set.
+#provides-glossary()
 
 #show: rio.with(
   domains: ("sched.sla", "sched.admin"),

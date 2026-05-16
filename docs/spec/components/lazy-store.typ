@@ -70,7 +70,7 @@ kernel config we control; with NixOS, we have one.
 
 = What both deliver that FUSE cannot
 
-The unreachable-via-FUSE property: *a warm range of a partially-materialized
+The unreachable-via-@fuse property: *a warm range of a partially-materialized
 file is read with zero userspace crossings.* FUSE passthrough binds one backing
 fd at `open()`; a 200 MB `libLLVM.so` with 4 MB of hot `.rodata` either upcalls
 on every read until fully fetched or blocks `open()` for \~1.3 s. Both A and B
@@ -89,7 +89,7 @@ PutPath stream → buffer NAR (Vec<u8>) → SHA-256 verify → if ≥INLINE_THRE
     → upsert chunk refcounts (PG) → parallel S3 PUT new chunks → manifest row (ChunkRef[]) status=complete
 ```
 
-No per-file index, no NAR parse on the write path. For EROFS, step 6 grows a
+No per-file index, no @nar parse on the write path. For EROFS, step 6 grows a
 third action *after* `put_chunked` succeeds:
 
 ```rust
@@ -132,7 +132,7 @@ A *bootstrap* (Nydus term; "meta blob") = small EROFS image with superblock +
 inodes + dirents + per-file chunk-index arrays + device table, *no file data*.
 EROFS asks fscache for blob data by `(cookie = device-slot tag, off, len)`.
 
-*Can data blobs BE our FastCDC chunks?* *No*, two structural reasons:
+*Can data blobs BE our @fastcdc chunks?* *No*, two structural reasons:
 
 + *Alignment.* `startblk` is a block number. EROFS chunks are `4KiB × 2ⁿ`;
   FastCDC chunks (#(refs.gh)("rio-store/src/chunker.rs:32")) are 16–256 KiB at
@@ -659,7 +659,7 @@ minimal.
     [`.riom` serialize from already-in-memory `ManifestHint`s — *\~10 ms*.],
 
     [*Persistent artifacts*],
-    [`boot/<narhash>.erofs` per store path in S3 (\~0.3% of NAR size).
+    [`boot/<narhash>.erofs` per @store-path in S3 (\~0.3% of NAR size).
       GC-tracked.],
     [*None.*],
 
@@ -782,7 +782,7 @@ _correct about runtime simplicity_ but undersells three things:
   2–3 min VM loop and debuggable with `drgn` against a vmcore. For an org
   without standing kernel expertise, the second is a different _kind_ of cost —
   not bigger, but spikier and harder to schedule. The I-055 breaker cascade and
-  I-043 overlayfs negative-dentry incidents both took days because the failure
+  I-043 @overlayfs negative-dentry incidents both took days because the failure
   was below the daemon; B puts \~800 LoC of _our_ novel code in that same
   below-the-daemon stratum.
 
@@ -856,7 +856,7 @@ them — both A and B funnel cold misses through the same userspace fetch path
   trips open after 5 consecutive failures; while open, `SubmitBuild` is
   rejected with `StoreUnavailable` instead of queueing every derivation as a
   cache miss.
-- *Scheduler backpressure.* Actor-queue-depth hysteresis (80% activate, 60%
+- *Scheduler #gls("backpressure").* Actor-queue-depth hysteresis (80% activate, 60%
   deactivate) refuses new submissions when the actor is overloaded.
 - *Executor circuit breaker.* The executor tracks consecutive store-fetch
   failures; when the breaker opens, `HeartbeatRequest.store_degraded` is set

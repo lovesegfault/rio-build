@@ -1,7 +1,7 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: ("sched", "scheduler", "admin"))
 
-Receives derivation build requests, analyzes the DAG, and publishes work to
+Receives derivation build requests, analyzes the @dag, and publishes work to
 executors via a bidirectional streaming RPC.
 
 = Responsibilities
@@ -12,7 +12,7 @@ executors via a bidirectional streaming RPC.
 - Critical-path priority computation (bottom-up: priority = own_duration +
   max(successor priorities)); recomputed incrementally on completion by walking
   ancestors with dirty-flag propagation
-- Duration estimation from the SLA model's `T_min` (per-`(pname, system,
+- Duration estimation from the @sla model's `T_min` (per-`(pname, system,
   tenant)` fit; see §Duration Estimation)
 - Resource-aware scheduling: match derivation `requiredSystemFeatures` and
   resource needs to executor capabilities (subset matching: all required
@@ -24,7 +24,7 @@ executors via a bidirectional streaming RPC.
   output paths via `ActorCommand::GcRoots` and forwarding them as `extra_roots`
 - Priority queue with inter-build priority (CI > interactive > scheduled) and
   intra-build priority (critical path)
-- IFD prioritization: builds that block evaluation get maximum priority
+- @ifd prioritization: builds that block evaluation get maximum priority
   (detected by protocol sequencing --- `wopBuildDerivation` arriving before
   `wopBuildPathsWithResults` on the same session)
 - CA early cutoff: per-edge tracking --- when a CA derivation output matches
@@ -50,7 +50,7 @@ executors via a bidirectional streaming RPC.
   - CA early cutoff → edge cutoff + potential cancellation command
 ]
 
-gRPC handler tasks send commands to the DAG actor and `await` responses. This
+gRPC handler tasks send commands to the @dag-actor and `await` responses. This
 eliminates lock contention, makes operation ordering deterministic, and
 simplifies reasoning about correctness. PostgreSQL writes are batched and
 performed asynchronously by the actor.
@@ -98,8 +98,8 @@ performed asynchronously by the actor.
 *Implemented:* critical-path priority (BinaryHeap ReadyQueue), per-derivation
 SLA sizing (`solve_intent_for` → `(cores, mem, disk, deadline)` per
 #rref("sched.admin.spawn-intents")), PrefetchHint (full `approx_input_closure`
-before WorkAssignment), leader election via Kubernetes Lease gated on
-`RIO_LEASE_NAME`, `AdminService.ClusterStatus`/`DrainExecutor`, Pool CRD +
+before WorkAssignment), @leader-election via Kubernetes Lease gated on
+`RIO_LEASE_NAME`, `AdminService.ClusterStatus`/`DrainExecutor`, Pool @crd +
 one-shot Job reconciler. Interactive builds get a +1e9 priority boost (dwarfs
 any critical-path value).
 
@@ -1182,7 +1182,7 @@ Not all state changes require synchronous PostgreSQL writes:
   [Batched and flushed periodically (every 1--5s)],
 )
 
-On crash, async writes may be lost but are non-critical: EMA re-converges after
+On crash, async writes may be lost but are non-critical: @ema re-converges after
 a few builds, and status is rebuilt from ground truth (derivation/assignment
 tables) during state recovery.
 
@@ -1298,7 +1298,7 @@ exponential backoff until the scheduler accepts it.
 FODs and non-FODs share the same `find_executor()` path: intent-match (ADR-023)
 first, else `best_executor()` over the kind-matching pool. The `kind=fetcher`
 hard-filter in #rref("sched.dispatch.fod-to-fetcher") is the absolute boundary
---- if no fetcher is available the FOD queues; the scheduler NEVER sends a FOD
+--- if no fetcher is available the @fod queues; the scheduler NEVER sends a FOD
 to a builder under pressure. A queued FOD is preferable to a builder with
 internet access. The #(refs.metric)("rio_scheduler_queue_depth")`{kind}` gauge
 tracks queued derivations per kind.
@@ -1467,7 +1467,7 @@ tracks queued derivations per kind.
 
 = Backpressure
 
-The scheduler applies backpressure at multiple layers to prevent overload:
+The scheduler applies @backpressure at multiple layers to prevent overload:
 
 *gRPC flow control:* The `BuildExecution` streams use the default HTTP/2 flow
 control window (64 KiB initial, dynamically adjusted). The scheduler does not
@@ -1940,7 +1940,7 @@ This approach keeps per-event processing well under the 1ms budget needed for
 Per-class `(max_cores, max_mem)` ceilings are derived *at scheduler boot* from
 the AWS instance-type catalog rather than hand-maintained config --- the prior
 §13c-1 design's hand-pinned values drifted from what each class's
-`requirements` actually permit Karpenter to launch (the `cover::sizing` STRIKE
+`requirements` actually permit @karpenter to launch (the `cover::sizing` STRIKE
 rounds). Boot-time derivation removes the operator-side staleness step
 entirely: a `requirements` edit takes effect on the next rollout.
 
@@ -2344,7 +2344,7 @@ for store vs. scheduler if write contention becomes an issue.
 == Predictive cache warming // supersedes ADR-009
 <sched-rationale-prefetch>
 
-The scheduler drives FUSE cache pre-warming. When scheduling a derivation to a
+The scheduler drives @fuse cache pre-warming. When scheduling a derivation to a
 worker, the scheduler sends prefetch hints for the input closure paths via the
 bidirectional build execution stream (#rref("sched.assign.warm-gate")). The
 worker's FUSE daemon begins fetching these paths into its local SSD cache
@@ -2382,7 +2382,7 @@ through it and dropping `aws-sdk-s3` from the scheduler's dependency tree ---
 was *rejected*.
 
 Build logs are scheduler artifacts, not store artifacts. rio-store's domain is
-the content-addressed Nix store: NAR chunks, narinfo, signatures, realisations,
+the content-addressed Nix store: @nar chunks, @narinfo, signatures, realisations,
 GC by reachability. Build logs are `build_id`-addressed (not content-addressed),
 mutable (periodic overwrites the same key), retained on a build-lifetime TTL
 (not reachability), unsigned, and not deduplicated. They share nothing with
@@ -2410,7 +2410,7 @@ retry policy, one stalled-stream setting). What remains is "scheduler links
 store. `StoreService` stays scoped to Nix-store semantics. Log-loss-on-crash
 bound stays ≤30s per #rref("obs.log.periodic-flush"). Revisit if: store gains a
 generic blob tier for some other reason; multi-region deployment makes
-per-component IRSA roles materially expensive; or periodic-snapshot volume
+per-component @irsa roles materially expensive; or periodic-snapshot volume
 grows enough that scheduler→S3 egress becomes a cost line item (at which point
 the fix is delta-upload, not relocation).
 

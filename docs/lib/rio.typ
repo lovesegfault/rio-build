@@ -73,6 +73,7 @@
   absolute-place, pin, pinit, pinit-place, pinit-point-from, simple-arrow,
 )
 #import "/lib/refs.typ": refs
+#import "/lib/glossary.typ": glossary-entries
 
 // ─── colors ─────────────────────────────────────────────────────────
 #let accent = rgb("#1f6feb")
@@ -176,6 +177,45 @@
 // the `target` check in rio() — the state is the fallback for direct CLI.
 #let _book-mode = state("rio-book-mode", false)
 #let book-pdf-mode() = _book-mode.update(true)
+
+// glossarium per-chapter wiring. `@key`/`#gls("key")` resolve via
+// `link(label(key), …)` to a `figure(kind: "glossarium_entry")<key>` —
+// `make-glossary`'s `ref` show rule checks `r.element.kind` and only
+// intercepts when such a figure exists. `register-glossary` alone is NOT
+// enough (populates entry state, emits no labels); `print-glossary`
+// creates the labelled figures but a chapter doesn't want a visible
+// glossary section. `_gloss-anchors` emits one zero-size labelled figure
+// per key so refs resolve without rendering anything.
+//
+// Both registration (panics on duplicate keys) and anchors (duplicate
+// `<key>` labels error) must run exactly ONCE per document. `_gloss-done`
+// gates the in-`rio()` placement so book-pdf's many `rio()` calls don't
+// re-fire: typst's `state.get()` is positional, so the second `rio()`'s
+// `context` read sees the first call's `_gloss-done.update(true)`.
+#let _gloss-done = state("rio-gloss-done", false)
+// Bare empty-body figures: rio()'s `show figure.where(kind:
+// "glossarium_entry")` rule renders them as `it.body` (=[]) in html
+// mode and `align(left, it)` in paged (also visually empty), so no box
+// wrapper needed — and a box() at top-level would land OUTSIDE shiroa's
+// `<html>` element. Placement is just before `body` in `rio()`, after
+// all show rules, so the figures are inside the html structure.
+#let _gloss-anchors = {
+  for e in glossary-entries [
+    #figure(kind: "glossarium_entry", supplement: "", [])#label(e.key)
+  ]
+}
+// For chapters that print a visible glossary themselves (sla-sizing,
+// glossary.typ): call BEFORE `#show: rio.with(…)`. Marks `_gloss-done`
+// so `rio()` skips `_gloss-anchors` (which would otherwise duplicate
+// the `<key>` labels their `print-glossary` emits), and registers if
+// nothing has yet (standalone compile of the chapter; under book-pdf an
+// earlier chapter's `rio()` already did).
+#let provides-glossary() = {
+  context if not _gloss-done.get() {
+    register-glossary(glossary-entries)
+  }
+  _gloss-done.update(true)
+}
 
 // Label/anchor id with the tracey `+N` revision suffix stripped.
 // Spec authors write `#r("foo+2")` (the `+N` is tracey's bump grammar)
@@ -337,9 +377,17 @@
   show table.cell.where(y: 0): strong
 
   // glossarium: intercepts @key refs for registered entries, falls
-  // through to native @label otherwise. In html mode, return `it.body`
-  // to consume the figure before glossarium's default theme wraps it in
-  // `align(start, ...)` (which warns under the html target).
+  // through to native @label otherwise. Registration is gated on
+  // `_gloss-done` so book-pdf's many `rio()` calls fire exactly once.
+  // The `<key>` anchor figures (`_gloss-anchors`) are placed just
+  // before `body` below — after all show rules so they land inside
+  // shiroa's `<html>` element — and the `_gloss-done.update(true)` is
+  // there too so both placements share one gate. In html mode, return
+  // `it.body` to consume the figure before glossarium's default theme
+  // wraps it in `align(start, ...)` (which warns under the html target).
+  context if not _gloss-done.get() {
+    register-glossary(glossary-entries)
+  }
   show: make-glossary
   show figure.where(kind: "glossarium_entry"): it => if is-paged-out {
     align(left, it)
@@ -515,6 +563,15 @@
   ] else []
 
   front
+  // Hidden glossary `<key>` anchors (see `_gloss-anchors` above): placed
+  // here so they land INSIDE the shiroa `<html>` wrapper (template-rules
+  // is already applied). Gated on `_gloss-done` (one set per document)
+  // and `_book-mode` (book-pdf's included sla-sizing.typ prints the
+  // real glossary, supplying the labels).
+  context if not _gloss-done.get() and not _book-mode.get() {
+    _gloss-anchors
+  }
+  _gloss-done.update(true)
   body
 
   // Per-chapter bibliography for every target except book-pdf (the

@@ -257,7 +257,7 @@ for HTTP request latencies. Build durations span seconds to hours, so
   [#(refs.metric)("rio_builder_fuse_fetch_duration_seconds"),
     #(refs.metric)("rio_store_substitute_duration_seconds"),
     #(refs.metric)("rio_store_check_available_duration_seconds")],
-  [`[0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120]` (NAR fetch + drain;
+  [`[0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120]` (@nar fetch + drain;
     GB-scale paths via I-212 JIT span 60-127s)],
 )
 

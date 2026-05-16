@@ -11,14 +11,14 @@ This page provides resource sizing guidance for rio-build deployments. All estim
   columns: 3,
   table.header([Data Type], [Size Per Record], [Notes]),
   [Derivation (scheduler)], [\~1 KB], [Includes metadata, edges, assignments],
-  [narinfo (store)], [\~500 bytes], [Includes references, signatures],
+  [@narinfo (store)], [\~500 bytes], [Includes references, signatures],
   [Chunk manifest (store)],
   [\~200 bytes],
-  [List of (BLAKE3 hash, size) pairs per NAR],
+  [List of (@blake3 hash, size) pairs per @nar],
 
   [Build history (scheduler)],
   [\~200 bytes],
-  [EMA duration, resource usage per pname/system],
+  [@ema duration, resource usage per pname/system],
 )
 
 *Worked example --- nixpkgs full rebuild:*
@@ -37,7 +37,7 @@ This page provides resource sizing guidance for rio-build deployments. All estim
   [\~200 GB],
   [All packages for one system],
 
-  [With FastCDC dedup], [\~100--140 GB], [30--50% chunk dedup savings],
+  [With @fastcdc dedup], [\~100--140 GB], [30--50% chunk dedup savings],
   [Inline paths (\< 256 KB)],
   [\~60% by count, \~5% by size],
   [Stored as single blobs, no chunking overhead],
@@ -63,7 +63,7 @@ One build per pod (P0537). Size the pod for the build, not for a slot count.
   [4 vCPU minimum],
   [The build's CPU; Nix's `enableParallelBuilding` uses what's available],
 
-  [Memory], [8 GB minimum], [Nix sandbox + overlay + FUSE daemon overhead],
+  [Memory], [8 GB minimum], [Nix sandbox + overlay + @fuse daemon overhead],
   [Local SSD (FUSE cache)],
   [100 GB],
   [Covers \~50% of nixpkgs closure; larger = better hit rate],
@@ -98,7 +98,7 @@ One build per pod (P0537). Size the pod for the build, not for a slot count.
 - With 5min average (including large packages): \~480 derivations/hour = \~125 hours total
 - Reality is bimodal: most builds are seconds, a few are hours. Expect 15--25 hours for a full nixpkgs rebuild on 40 executors.
 
-*With per-derivation SLA sizing (ADR-023):* the controller spawns one-shot Jobs sized to each derivation's solved `(cores, mem, disk)`, so a `hello` build gets a 1-core/512Mi pod and `firefox` gets 16-core/32Gi without operator partitioning. Karpenter bin-packs the heterogeneous pods onto right-sized nodes. See #cross-link("/spec/components/controller.typ")[controller component spec] for the reconciler flow.
+*With per-derivation @sla sizing (ADR-023):* the controller spawns one-shot Jobs sized to each derivation's solved `(cores, mem, disk)`, so a `hello` build gets a 1-core/512Mi pod and `firefox` gets 16-core/32Gi without operator partitioning. @karpenter bin-packs the heterogeneous pods onto right-sized nodes. See #cross-link("/spec/components/controller.typ")[controller component spec] for the reconciler flow.
 
 = Gateway and Scheduler
 
@@ -115,7 +115,7 @@ One build per pod (P0537). Size the pod for the build, not for a slot count.
   [1 active + 1 standby],
   [2 vCPU],
   [4 GB],
-  [In-memory DAG: \~8 bytes/node + \~16 bytes/edge. 60K-node DAG ≈ 50--100 MB],
+  [In-memory #gls("dag"): \~8 bytes/node + \~16 bytes/edge. 60K-node DAG ≈ 50--100 MB],
 
   [Store],
   [2--3],

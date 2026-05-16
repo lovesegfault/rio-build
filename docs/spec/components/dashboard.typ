@@ -4,7 +4,7 @@
 = rio-dashboard
 
 _Web dashboard for operational visibility. Svelte 5 SPA, in-process tonic-web
-on the scheduler, Cilium Gateway API ingress, DAG visualization via
+on the scheduler, Cilium Gateway API ingress, @dag visualization via
 `@xyflow/svelte`._
 
 == Architecture
@@ -82,7 +82,7 @@ reconciled from `GatewayClass`/`Gateway`/`GRPCRoute` CRDs
 envoy handles it (no separate Envoy Gateway operator). nginx is a thin HTTP/1.1
 proxy that serves the SPA static assets and forwards `/rio.*` to the
 Cilium-provisioned Gateway Service. CORS lives in the scheduler (`tower-http`
-`CorsLayer`, `RIO_DASHBOARD__CORS_ALLOW_ORIGINS`), not in a proxy CRD.
+`CorsLayer`, `RIO_DASHBOARD__CORS_ALLOW_ORIGINS`), not in a proxy #gls("crd").
 
 *No Ingress.* Access is via `kubectl port-forward svc/rio-dashboard 8080:80`
 --- the dashboard is an operator-facing tool (matches the Grafana model, not a

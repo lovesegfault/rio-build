@@ -13,8 +13,8 @@ Internal gRPC APIs between components + external API for tooling.
   least 1 MiB and MUST NOT enable `http2_adaptive_window`.
 ]
 
-The h2 default 65 535-byte window caps a `GetPath` NAR stream at \~20--30 MB/s
-at cross-AZ RTT regardless of link bandwidth. hyper's `adaptive_window(true)`
+The h2 default 65 535-byte window caps a `GetPath` @nar stream at \~20--30 MB/s
+at cross-@az RTT regardless of link bandwidth. hyper's `adaptive_window(true)`
 resets `initial_stream_window_size` / `initial_conn_window_size` to
 `SPEC_WINDOW_SIZE = 65 535` and BDP-probes upward from there; tonic's builder
 applies it after the explicit initial-window calls, so setting both silently
@@ -152,7 +152,7 @@ service StoreService {
   round-trips). Callers needing those semantics use the singular RPCs.
 ]
 
-The batch RPCs exist because the builder's input-closure BFS + FUSE-warm stat
+The batch RPCs exist because the builder's input-closure BFS + #gls("fuse")-warm stat
 loop were issuing \~800 singular RPCs per build --- at 246 concurrent ephemeral
 builders that saturated the store's PG pool (acquire times → 11s → FUSE breaker
 → EIO). One batch call per BFS layer backed by `WHERE store_path_hash =
@@ -317,7 +317,7 @@ message CompletionReport {
 ```
 
 `peak_memory_bytes` / `peak_cpu_cores` feed the `build_samples` table for the
-ADR-023 SLA fit. Zero is the no-signal sentinel (cgroup setup failed or build
+ADR-023 @sla fit. Zero is the no-signal sentinel (cgroup setup failed or build
 failed before the cgroup was populated). cgroup v2 is a *hard requirement*; the
 executor fails startup if the delegated subtree is unavailable.
 
@@ -450,7 +450,7 @@ message DerivationEdge {
 ```
 
 #info(title: [Size limits])[
-  A full nixpkgs stdenv rebuild DAG contains \~60,000 nodes. At \~200 bytes per
+  A full nixpkgs stdenv rebuild @dag contains \~60,000 nodes. At \~200 bytes per
   `DerivationNode`, the message is \~12MB. The gateway enforces `MAX_DAG_NODES`
   (1,048,576) before constructing the request. gRPC max message size should be
   set to at least 32MB.
@@ -617,7 +617,7 @@ rio-build implements both the `ssh-ng://` remote store protocol and the build
 hook protocol (for `--builders`). Nix clients connect transparently without
 custom tooling. The `ssh-ng://` path gives full DAG visibility: the client
 pushes the entire derivation closure, enabling global scheduling and
-deduplication. The build hook path provides per-derivation delegation, useful
+deduplication. The @build-hook path provides per-derivation delegation, useful
 for compatibility with existing `nix.conf` setups and CI runners that already
 use `--builders`. Both paths terminate at rio-gateway, which translates wire
 protocol operations into the gRPC services defined above.
@@ -645,8 +645,8 @@ required opcodes, and edge cases relies on cross-referencing the
 == Custom Nix protocol implementation // supersedes ADR-008
 <proto-rationale-custom-impl>
 
-The Nix wire protocol, derivation parsing, NAR format, store path computation,
-and nixbase32 are implemented from scratch in the `rio-nix` crate. This keeps
+The Nix wire protocol, derivation parsing, NAR format, @store-path computation,
+and @nixbase32 are implemented from scratch in the `rio-nix` crate. This keeps
 rio-build MIT/Apache-2.0 dual-licensed.
 
 The most complete existing Rust implementation is `nix-compat` (Tvix/Snix

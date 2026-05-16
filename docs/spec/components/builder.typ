@@ -6,7 +6,7 @@
 One-shot process in a K8s Job pod that executes a single derivation, then
 exits.
 
-Per ADR-019, this component is scoped to *non-FOD builds only* --- fully
+Per ADR-019, this component is scoped to *non-@fod builds only* --- fully
 airgapped, no internet egress. Fixed-output derivation fetches route to the
 separate rio-fetcher executor. Both share the same `rio-builder` binary,
 distinguished by `RIO_EXECUTOR_KIND`.
@@ -20,7 +20,7 @@ distinguished by `RIO_EXECUTOR_KIND`.
 
 - Receive a single build assignment from the scheduler via gRPC (one
   derivation per pod, then exit)
-- Run the FUSE store daemon (the `fuse` module) that mounts at
+- Run the @fuse store daemon (the `fuse` module) that mounts at
   `/var/rio/fuse-store` (configurable) with lazy on-demand fetching from
   rio-store
 - Set up the build's overlay filesystem: FUSE mount as lower layer, local SSD
@@ -29,7 +29,7 @@ distinguished by `RIO_EXECUTOR_KIND`.
 - Execute build: invoke `nix-daemon --stdio` locally for sandboxed build
   execution
 - Stream build logs back to scheduler via gRPC bidirectional streaming
-- After build: upload output NAR to rio-store (chunked), report completion
+- After build: upload output @nar to rio-store (chunked), report completion
 - Heartbeat / health checking to scheduler
 - Resource usage reporting (CPU, memory, disk, build duration)
 
@@ -41,7 +41,7 @@ directly at `/nix/store`, which would shadow the host store and break every
 process on the machine including the builder itself). The overlay's merged
 directory is what gets bind-mounted at `/nix/store`, and only inside the
 build's mount namespace. The FUSE daemon communicates with rio-store via gRPC
-to lazily fetch store path content on demand.
+to lazily fetch @store-path content on demand.
 
 #figure(
   caption: [Builder pod store layout. The FUSE mount is the overlay's lower;
@@ -70,7 +70,7 @@ to lazily fetch store path content on demand.
     ),
     node(
       (0, 2.2),
-      align(left)[overlayfs merged\ #text(size: 0.8em)[upper:
+      align(left)[@overlayfs merged\ #text(size: 0.8em)[upper:
           `/var/rio/overlays/{build}`\ lower: FUSE\ bind-mounted at
           `/nix/store`]],
       name: <ov>,
@@ -596,11 +596,11 @@ can route derivations:
 After build completes:
 
 + Read new paths from upper layer
-+ Chunk and upload to rio-store (CAS). Each `PutPath` request carries the
-  scheduler-issued HMAC assignment token in the `x-rio-assignment-token` gRPC
++ Chunk and upload to rio-store (@cas). Each `PutPath` request carries the
+  scheduler-issued HMAC @assignment-token in the `x-rio-assignment-token` gRPC
   metadata header; the store verifies the token and rejects uploads for paths
   not in `claims.expected_outputs` (see #rref("common.hmac.claims"))
-+ Register path metadata (narinfo, references)
++ Register path metadata (@narinfo, references)
 + Discard upper layer
 
 *Teardown failure handling:* Overlay teardown (`umount2`) can fail if the
@@ -669,7 +669,7 @@ pod's emptyDir.
 #info(title: [Pre-scan cost])[
   The scan is a separate disk read before the first upload attempt. Retries do
   NOT re-scan (the scan result is deterministic). The Boyer-Moore skip-scan
-  over the restricted nixbase32 alphabet does \~memcpy speed on binary
+  over the restricted @nixbase32 alphabet does \~memcpy speed on binary
   sections (skips \~31/32 bytes); a 4 GiB output adds \~4s wall time on NVMe.
   If this becomes measurable, the escape hatch is a trailer-refs protocol
   extension (send refs in `PutPathTrailer` instead of the first `PathInfo`
@@ -839,7 +839,7 @@ is the PostgreSQL metadata query, not the SQLite generation.
 
 A builder pod runs *one* build, then exits. The pod's `resources.limits` ARE
 the build's limits --- there is no per-build cgroup `memory.max`/`cpu.max`
-layer. A runaway build can OOM only its own pod; the next queued derivation
+layer. A runaway build can @oom only its own pod; the next queued derivation
 gets a fresh Job. Operators size the pod via `Pool.spec.resources`.
 
 The per-build sub-cgroup is *measurement and cancellation only*: cgroup v2
@@ -966,7 +966,7 @@ Workers require elevated privileges for FUSE mounts, overlayfs mounts, and the
 Nix sandbox (user/mount/PID/network namespaces).
 
 *Required capabilities:* `CAP_SYS_ADMIN` + `CAP_SYS_CHROOT`. Do NOT use
-`privileged: true` --- it disables seccomp profiles entirely.
+`privileged: true` --- it disables @seccomp profiles entirely.
 
 #info(title: [Spike finding (Phase 1a)])[
   `CAP_SYS_ADMIN` + `CAP_SYS_CHROOT` without `privileged: true` is not
@@ -993,11 +993,11 @@ When the profile is unset (or `privileged=true`), pods fall back to
   isolate builder pods from other workloads.
 - `automountServiceAccountToken: false` --- builders communicate with the
   scheduler via gRPC, not the Kubernetes API.
-- NetworkPolicy restricting egress to rio-scheduler and rio-store only (gRPC
+- @networkpolicy restricting egress to rio-scheduler and rio-store only (gRPC
   ports). No access to the Kubernetes API server or cloud metadata service
   (`fd00:ec2::254` / `169.254.169.254`). See #rref("builder.netpol.airgap") in
   ADR-019.
-- IMDSv2 with hop limit = 1 on builder nodes (defense-in-depth against
+- @imdsv2 with hop limit = 1 on builder nodes (defense-in-depth against
   metadata access from privileged pods).
 
 == Device Access
@@ -1511,7 +1511,7 @@ reports (success/failure, output paths, timing), acknowledgments. Heartbeats
 are a *separate unary RPC* (`Worker.Heartbeat`), not carried on the
 `BuildExecution` stream --- the heartbeat loop runs independently of stream
 lifecycle so liveness reporting survives stream reconnection. The stream
-provides natural backpressure: if a worker is overwhelmed, gRPC flow control
+provides natural #gls("backpressure"): if a worker is overwhelmed, gRPC flow control
 slows the scheduler's assignment rate. Connection drops are detected via gRPC
 keepalives, enabling fast failure detection and rescheduling.
 
@@ -1580,7 +1580,7 @@ both unconditionally; no hostPath volume; `hostUsers: false` works.
 `CAP_SYS_ADMIN` is scoped to the user namespace and a container escape cannot
 use it on the host. The Helm chart default is `builderPoolDefaults.privileged:
 false`; no device plugin runs, no extended resource is requested. The
-`BuilderPool` CRD exposes an optional `privileged: bool` --- when `true` the
+`BuilderPool` @crd exposes an optional `privileged: bool` --- when `true` the
 container runs fully privileged with the hostPath `/dev/fuse` fallback, an
 escape hatch for clusters whose default seccomp profiles block `mount(2)` even
 with `SYS_ADMIN`, or whose containerd lacks idmap-mount support. Production
@@ -1604,7 +1604,7 @@ schedules the file is guaranteed present, so `rio-controller` emits
 *Why node-baked over an operator.* security-profiles-operator's `spod`
 DaemonSet runs concurrently with workload pods; without a `wait-seccomp`
 initContainer the kubelet would `CreateContainerError` on the pod that races
-spod onto a fresh Karpenter node. Under ephemeral builders (one Job per
+spod onto a fresh @karpenter node. Under ephemeral builders (one Job per
 derivation, thousands per hour), that init's 5--15s poll dominated cold-start
 latency, and SPO's controller OOMKilled under sustained node-churn (I-154).
 Node-baked eliminates both: zero per-pod overhead, no in-cluster operator

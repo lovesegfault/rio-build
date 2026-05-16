@@ -61,7 +61,7 @@ per-message progress drains without a whole-call deadline.
 
   [`derivations`],
   [`AdminService.InspectBuildDag`],
-  [Live actor DAG snapshot for a build],
+  [Live actor @dag snapshot for a build],
 
   [`logs`],
   [`AdminService.GetBuildLogs`],
