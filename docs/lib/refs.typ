@@ -32,6 +32,7 @@
   m
 }
 #let _crds = json("/gen/crds.json")
+#let _cli = json("/gen/cli.json")
 // Components whose config carries a `lease_name` (or `*.lease_name`)
 // key — i.e., they hold a Kubernetes Lease for leader election.
 // merged_015: 3 prose sites disagreed on this; derive.
@@ -114,6 +115,15 @@
   crd: kind => {
     assert(kind in _crds.kinds, message: "unknown CRD kind: " + kind)
     raw(kind)
+  },
+  // rio-cli top-level subcommand. Runbooks cite ~55× (`trigger-gc` and
+  // `bps` were stale). Nested subcommands not validated this round.
+  cli-sub: name => {
+    assert(
+      name in _cli.subcommands,
+      message: "unknown rio-cli subcommand: " + name,
+    )
+    raw(name)
   },
   crd-field: (kind, field) => {
     assert(kind in _crds.fields, message: "unknown CRD kind: " + kind)
