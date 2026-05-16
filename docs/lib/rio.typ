@@ -607,28 +607,6 @@
   /* Code-block background (codly's HTML output is plain <pre><code>). */
   main pre { background: var(--quote-bg, #f6f8fa); padding: 0.8em 1em;
              border-radius: 4px; overflow-x: auto; }
-  /* QA #10: shiroa-mdbook's inline page-load script (page.typ:78-89)
-     adds .sidebar-hidden to <html> when clientWidth < 800 (or per
-     localStorage), but ships no CSS that reacts to it and no click
-     handler for #sidebar-toggle. Supply both. */
-  #sidebar { transition: transform 0.2s; }
-  .sidebar-hidden #sidebar { transform: translateX(calc(0px - var(--sidebar-width, 300px))); }
-  .sidebar-hidden .page-wrapper { margin-inline-start: 0; }
-  .sidebar-hidden .sidebar-resize-handle { display: none; }
-  ```
-  // shiroa-mdbook ships #sidebar-toggle with no handler. Minimal one:
-  // toggle .sidebar-hidden ↔ .sidebar-visible on <html>, mirroring
-  // page.typ's load-time class and persisting to the same
-  // localStorage key it reads. inline-assets emits this as a
-  // data:-uri <script> in <head>, so wrap in DOMContentLoaded.
-  let rio-js = ```js
-  document.addEventListener("DOMContentLoaded",()=>{
-    document.getElementById("sidebar-toggle")?.addEventListener("click",()=>{
-      let h=document.documentElement,hid=h.classList.toggle("sidebar-hidden");
-      h.classList.toggle("sidebar-visible",!hid);
-      try{localStorage.setItem("shiroa-sidebar",hid?"hidden":"visible")}catch(e){}
-    });
-  });
   ```
   show: if is-html {
     it => {
@@ -645,7 +623,7 @@
         },
         plain-body: body,
         web-theme: "mdbook",
-        extra-assets: (rio-css, rio-js),
+        extra-assets: (rio-css,),
       )
       show: markup-rules.with(
         web-theme: "mdbook",
