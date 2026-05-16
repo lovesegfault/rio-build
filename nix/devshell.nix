@@ -192,6 +192,11 @@ let
           # cluster. Matches xtask/src/sh.rs:kubeconfig_path().
           shellHook = ''
             export KUBECONFIG="$PWD/.kube/config"
+            # Anchor the shiroa wrapper's XDG cache to repo-root regardless
+            # of invocation cwd (bug_022: `cd docs && shiroa serve .`
+            # otherwise writes to docs/docs/.cache/). git rev-parse so
+            # `nix develop` from a subdirectory also resolves correctly.
+            export RIO_TYPST_XDG="$(git rev-parse --show-toplevel)/docs/.cache/typst-xdg"
             # Shared intermediate build cache across all worktrees
             # (~/src/rio-build/*). Per-worktree target/ keeps only
             # final artifacts. Fine-grain locking (nightly; ignored
