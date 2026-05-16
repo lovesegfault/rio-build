@@ -1671,17 +1671,15 @@ derivation without the full DAG context.
   *WatchBuild reconnect:* When the `SubmitBuild` / `WatchBuild` response stream
   breaks (scheduler failover, transient network), the gateway's
   `process_stream` distinguishes error classes via `StreamProcessError`:
-  - `Transport` (scheduler connection dropped) and `EofWithoutTerminal` (stream
-    closed cleanly without a terminal `BuildCompleted`/`Failed`/`Cancelled`
-    event --- typical leader-failover signature: SIGTERM → graceful shutdown →
-    TCP FIN → `Ok(None)`) → retried up to *#(refs.const)("MAX_RECONNECT")
-    times* with exponential backoff
+  - `Transport` (#(refs.error-doc)("StreamProcessError", "Transport")) and
+    `EofWithoutTerminal`
+    (#(refs.error-doc)("StreamProcessError", "EofWithoutTerminal")) → retried
+    up to *#(refs.const)("MAX_RECONNECT") times* with exponential backoff
     *1 s/2 s/4 s/8 s/16 s, capped at 16 s for the remaining attempts*. The
     scheduler replays `BuildEvent`s from `build_event_log` starting at
     `since_sequence`.
-  - `Wire` → *not* retried; the gateway returns `MiscFailure` to the Nix client
-    immediately. This indicates a protocol bug, not a transient connectivity
-    issue.
+  - `Wire` → *not* retried; the gateway returns `MiscFailure` to the Nix
+    client immediately. #(refs.error-doc)("StreamProcessError", "Wire")
   The reconnect counter resets on the first successful `BuildEvent` received
   after a reconnect (NOT on `WatchBuild` returning `Ok` --- accepting the RPC
   doesn't prove the stream will yield events).

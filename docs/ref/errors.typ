@@ -116,13 +116,15 @@ See `rio-builder/src/executor/mod.rs` for the mapping implementation.
 
   [`StreamProcessError`],
   [`rio-gateway/src/handler/build.rs`],
-  [Gateway-internal enum distinguishing `Transport` (scheduler connection
-    dropped) and `EofWithoutTerminal` (stream closed cleanly without terminal
-    BuildEvent --- leader-failover signature) --- *both retried* up to
-    #(refs.const)("MAX_RECONNECT")× with backoff 1/2/4/8/16 s capped at 16 s
-    --- and `Wire` (protocol parse error
-    --- *not retried*). `Transport` and `EofWithoutTerminal` trigger the
-    WatchBuild reconnect loop.],
+  [Gateway-internal enum distinguishing `Transport`
+    (#(refs.error-doc)("StreamProcessError", "Transport")) and
+    `EofWithoutTerminal`
+    (#(refs.error-doc)("StreamProcessError", "EofWithoutTerminal")) ---
+    *both retried* up to #(refs.const)("MAX_RECONNECT")× with backoff
+    1/2/4/8/16 s capped at 16 s --- and `Wire`
+    (#(refs.error-doc)("StreamProcessError", "Wire") --- *not retried*).
+    `Transport` and `EofWithoutTerminal` trigger the WatchBuild reconnect
+    loop.],
 )
 
 == FUSE/Overlay Failures

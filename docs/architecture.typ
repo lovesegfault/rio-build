@@ -460,7 +460,7 @@ and #cross-link("/spec/components/store.typ")[rio-store] for the chunked CAS.
     `since_sequence`. The Nix client sees continuous `STDERR` streaming
     (possibly a brief pause during backoff).
   + If all #(refs.const)("MAX_RECONNECT") reconnects fail, or the error is
-    `Wire` (client-side disconnect --- not a failover signature), the gateway
+    `Wire` (#(refs.error-doc)("StreamProcessError", "Wire")), the gateway
     returns `MiscFailure` to the client (manual retry). See
     #rref("gw.reconnect.backoff") for the full classification.
   + If the gateway itself also restarted, see @sec-client-disconnect above.
