@@ -294,15 +294,20 @@ async fn test_prefetch_invalid_basename_enoent_no_grpc() {
          EIO here means we hit the gRPC path despite the parse failure."
     );
 
-    // No retry backoff observed → never entered the retry loop → never
-    // called gRPC. test-cfg RETRY_BACKOFF totals ~760ms; sub-100ms is
-    // unambiguously the pre-gRPC return.
-    let elapsed = start.elapsed();
-    let backoff_floor: Duration = RETRY_BACKOFF.iter().sum();
-    assert!(
-        elapsed < backoff_floor,
-        "expected immediate return (<{backoff_floor:?}), got {elapsed:?} — \
-         suggests we entered the gRPC retry loop"
+    // Never entered the gRPC loop: layer-1 StorePath::parse rejected
+    // the basename before any client call. Count-ops assertion replaces
+    // `elapsed < backoff_floor` (same wall-clock-gate-under-load flake
+    // mode as the three tests below; not yet observed flaking but the
+    // shape is identical).
+    eprintln!(
+        "placeholder ENOENT after {:?} (diagnostic only)",
+        start.elapsed()
+    );
+    assert_eq!(
+        store.calls.get_path_calls.load(Ordering::SeqCst),
+        0,
+        "invalid-basename ENOENT ⟹ zero gRPC; nonzero means the \
+         pre-gRPC StorePath::parse gate was bypassed"
     );
 }
 
@@ -526,13 +531,22 @@ async fn test_prefetch_idle_timeout_stalled_chunk_eio() {
 
     let err = result.expect_err("expected Err(EIO) from idle timeout");
     assert_eq!(err.code(), Errno::EIO.code(), "expected EIO, got: {err:?}");
-    // Tripped on the first gap, not after multiple — bound is per-chunk.
-    // Allow slack for CI variance but assert it's well under the 800ms
-    // gap (i.e., the receiver gave up, not the sender).
-    assert!(
-        started.elapsed() < Duration::from_millis(700),
-        "idle timeout should trip near 300ms, took {:?}",
+    // Tripped on the first gap, not after retries — DeadlineExceeded is
+    // non-transient (no retry), so exactly ONE GetPath landed. Asserting
+    // call-count is the structural form of the old `elapsed < 700ms`
+    // wall-clock gate (which proved "receiver gave up before the 800ms
+    // sender gap" but flaked under full-gate parallel load when both the
+    // 300ms client timer AND the 800ms server timer slipped — observed
+    // 1228ms). The behavior "no retry" is what we actually care about.
+    eprintln!(
+        "idle-timeout EIO after {:?} (diagnostic only)",
         started.elapsed()
+    );
+    assert_eq!(
+        store.calls.get_path_calls.load(Ordering::SeqCst),
+        1,
+        "DeadlineExceeded is non-transient → no retry → exactly 1 GetPath; \
+         >1 means the timeout was retried (regression to pre-I-211 behavior)"
     );
 }
 
@@ -967,13 +981,20 @@ async fn test_prefetch_skipped_when_circuit_open() {
 
     let err = result.expect_err("circuit open → Err(EIO)");
     assert_eq!(err.code(), Errno::EIO.code());
-    // No retry backoff → never reached the gRPC loop.
-    let backoff_floor: Duration = RETRY_BACKOFF.iter().sum::<Duration>().mul_f64(0.5);
-    assert!(
-        start.elapsed() < backoff_floor,
-        "expected immediate EIO from circuit.check(), got {:?} \
-         (≥ {backoff_floor:?} suggests gRPC retry loop ran)",
+    // Never reached gRPC: circuit.check() returns Err before any client
+    // call. Count-ops assertion replaces the wall-clock gate
+    // `elapsed < backoff_floor` (~380ms) which flaked under full-gate
+    // parallel load (observed 524ms — spawn_blocking scheduling slip,
+    // NOT a retry). The behavior under test is "no RPC", not "fast".
+    eprintln!(
+        "circuit-open EIO after {:?} (diagnostic only)",
         start.elapsed()
+    );
+    assert_eq!(
+        store.calls.get_path_calls.load(Ordering::SeqCst),
+        0,
+        "circuit open ⟹ prefetch returns BEFORE any gRPC contact; \
+         nonzero means circuit.check() was bypassed"
     );
 }
 
@@ -1015,11 +1036,20 @@ async fn test_concurrent_commit_then_claim_no_refetch() {
         matches!(result, Ok(Some(PrefetchSkip::AlreadyCached))),
         "already-cached path must short-circuit to AlreadyCached, got {result:?}"
     );
-    // And it was immediate (no gRPC contact).
-    assert!(
-        start.elapsed() < Duration::from_millis(100),
-        "AlreadyCached must skip gRPC, got {:?}",
+    // No gRPC contact: the fast-path returns before any client call.
+    // Count-ops assertion replaces `elapsed < 100ms` which flaked under
+    // full-gate parallel load (observed 795ms — pure spawn_blocking
+    // scheduling slip). "Skipped gRPC" is the behavior; "fast" was a
+    // proxy for it.
+    eprintln!(
+        "AlreadyCached after {:?} (diagnostic only)",
         start.elapsed()
+    );
+    assert_eq!(
+        store.calls.get_path_calls.load(Ordering::SeqCst),
+        0,
+        "AlreadyCached fast-path ⟹ zero gRPC; nonzero means the \
+         cache.get_path() short-circuit was bypassed"
     );
     // Breaker untouched.
     assert!(!circuit.is_open());

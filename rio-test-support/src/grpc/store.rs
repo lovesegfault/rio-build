@@ -98,6 +98,13 @@ pub struct MockStoreCalls {
     /// I-110c: lets tests assert the FUSE fetch carried the primed
     /// hint.
     pub get_path_hints: Arc<RwLock<Vec<Option<types::ManifestHint>>>>,
+    /// Number of `get_path` calls received. Incremented on entry,
+    /// BEFORE the `fail_get_path` early-return — distinguishes "client
+    /// never reached the RPC" from "RPC returned Unavailable". For
+    /// structural no-gRPC-contact assertions in `rio-builder` FUSE
+    /// fetch tests (replaces wall-clock `elapsed < backoff_floor`
+    /// asserts that flaked under full-gate parallel load).
+    pub get_path_calls: Arc<AtomicU32>,
     /// `x-rio-tenant-token` value on each QueryRealisation call
     /// (`None` = absent). For `r[gw.jwt.propagate]` — floating-CA
     /// output resolution in `wopBuildPathsWithResults`.
@@ -597,6 +604,11 @@ impl StoreService for MockStore {
         &self,
         request: Request<types::GetPathRequest>,
     ) -> Result<Response<Self::GetPathStream>, Status> {
+        // Count BEFORE any fault-injection early-return so tests can
+        // assert "client never contacted gRPC" (== 0) vs "client did
+        // and got Unavailable" (> 0). `get_path_hints` below is pushed
+        // only on the success path so it can't serve this purpose.
+        self.calls.get_path_calls.fetch_add(1, Ordering::SeqCst);
         if self.faults.fail_get_path.load(Ordering::SeqCst) {
             return Err(Status::unavailable("mock: injected get_path failure"));
         }
