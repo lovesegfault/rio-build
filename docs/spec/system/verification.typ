@@ -171,8 +171,7 @@ needs russh fixture.
 
 #info(title: [Implemented])[
   Security VM test fragments cover JWT validation, @mtls client-cert rejection,
-  binary-cache auth (#src("nix/tests/scenarios/security.nix")); @fod proxy
-  domain allowlist (#src("nix/tests/scenarios/fod-proxy.nix")); `__noChroot`
+  binary-cache auth (#src("nix/tests/scenarios/security.nix")); `__noChroot`
   gateway pre-check (#rref("gw.reject.nochroot")).
 ]
 

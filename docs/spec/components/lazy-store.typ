@@ -81,7 +81,7 @@ unfetched. Both also make `lookup`/`stat`/`readdir` kernel-native.
 
 == rio-store write-path changes
 
-Today (#(refs.gh)("rio-store/src/grpc/put_path.rs:222")):
+Today (#(refs.gh)("rio-store/src/grpc/put_path/mod.rs")):
 
 ```text
 PutPath stream → buffer NAR (Vec<u8>) → SHA-256 verify → if ≥INLINE_THRESHOLD:
@@ -106,7 +106,7 @@ metadata::set_bootstrap(&pool, &store_path_hash, boot.len())?;            // new
 directory on disk; we have a NAR in RAM.
 
 *When:* at PutPath. The NAR is already buffered
-(#(refs.gh)("rio-store/src/grpc/put_path.rs:431") `nar_data: Vec<u8>`); one
+(#(refs.gh)("rio-store/src/grpc/put_path/mod.rs") `nar_data: Vec<u8>`); one
 more walk is \~free. Lazy generation would re-download chunks → reassemble →
 parse, which is the I-110 burst we built batching to avoid. *Backfill* for
 existing manifests: one-shot `xtask backfill-erofs-boot` (walk
@@ -260,7 +260,7 @@ struct cachefiles_read {    // OP_READ payload
 )
 
 *rio-builder daemon* (`tokio::io::unix::AsyncFd`, not `mio` like Nydus, to
-share the runtime with #(refs.gh)("rio-builder/src/fuse/fetch.rs")):
+share the runtime with #(refs.gh)("rio-builder/src/fuse/fetch/")):
 
 ```rust
 async fn fscache_upcall_loop(dev: File, clients: StoreClients,
@@ -830,7 +830,7 @@ _correct about runtime simplicity_ but undersells three things:
   file in 2 wk with no KASAN splats, B's risk estimate drops and the week-4
   decision has real data on both sides.
 + *Keep FUSE as the fallback* behind the existing flag throughout — all three
-  share #(refs.gh)("rio-builder/src/fuse/fetch.rs").
+  share #(refs.gh)("rio-builder/src/fuse/fetch/").
 
 = Rationale
 
@@ -845,7 +845,7 @@ load.
 
 The mitigations are layered, and the kernel-filesystem choice doesn't change
 them — both A and B funnel cold misses through the same userspace fetch path
-(#(refs.gh)("rio-builder/src/fuse/fetch.rs")):
+(#(refs.gh)("rio-builder/src/fuse/fetch/")):
 
 - *Fetch timeout.* `fetch_extract_insert` wraps the entire
   gRPC-fetch-plus-stream-drain in `GRPC_STREAM_TIMEOUT` (300 s). A stalled
@@ -931,12 +931,12 @@ Primary (read for this report):
   )[`Documentation/filesystems/caching/cachefiles.rst`]
 
 Our code:
-- #(refs.gh)("rio-store/src/grpc/put_path.rs"), #(refs.gh)("rio-store/src/cas.rs"),
+- #(refs.gh)("rio-store/src/grpc/put_path/"), #(refs.gh)("rio-store/src/cas.rs"),
   #(refs.gh)("rio-store/src/chunker.rs"), #(refs.gh)("rio-store/src/manifest.rs")
 - #(refs.gh)("rio-proto/proto/types.proto")
 - #(refs.gh)("rio-builder/src/fuse/mod.rs"),
   #(refs.gh)("rio-builder/src/fuse/ops.rs"),
-  #(refs.gh)("rio-builder/src/fuse/fetch.rs"),
+  #(refs.gh)("rio-builder/src/fuse/fetch/"),
   #(refs.gh)("rio-builder/src/overlay.rs")
 
 Background:

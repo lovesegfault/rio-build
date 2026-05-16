@@ -1705,7 +1705,7 @@ derivation without the full DAG context.
 
 == Key Files
 
-- #(refs.gh)("rio-gateway/src/server.rs") --- SSH server setup (russh),
+- #(refs.gh)("rio-gateway/src/server/") --- SSH server setup (russh),
   per-channel task spawning, `exec_request` matching
 - #(refs.gh)("rio-gateway/src/session.rs") --- Per-SSH-channel protocol session
   loop (`run_protocol`), CancelBuild on disconnect

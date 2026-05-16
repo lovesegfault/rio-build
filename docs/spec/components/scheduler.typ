@@ -2214,7 +2214,7 @@ entirely: a `requirements` edit takes effect on the next rollout.
 - #src("rio-scheduler/src/db/") --- PostgreSQL persistence (derivations,
   assignments, build_samples telemetry; split into 9 domain modules per P0411)
 - #src("rio-scheduler/src/logs/") --- LogBuffers ring buffer + S3 LogFlusher
-- #src("rio-scheduler/src/lease/") --- Kubernetes Lease leader-election loop
+- #src("rio-lease/src/") --- Kubernetes Lease leader-election loop
   (generation counter, `is_leader` flag, `recovery_complete` gate)
 - #src("rio-scheduler/src/actor/recovery.rs") --- State recovery: reload
   non-terminal builds/derivations from PG on LeaderAcquired

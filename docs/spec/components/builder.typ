@@ -1377,7 +1377,7 @@ is stable (post Phase 3).
     src("rio-builder/src/fuse/cache.rs"),
     [LRU cache management (SQLite-indexed, SSD-backed)],
 
-    src("rio-builder/src/fuse/fetch.rs"),
+    src("rio-builder/src/fuse/fetch/"),
     [`ensure_cached`: NAR fetch + extract from rio-store (prefetch +
       on-demand)],
 
