@@ -23,6 +23,43 @@ use crate::sh::repo_root;
 /// cross-ref table.
 const VARIANT_RE: &str = r#"(?s)#\[error\(\s*r?"((?:[^"\\]|\\.)*)"[^\]]*\]\s*([A-Z]\w*)"#;
 
+/// `describe_{counter,gauge,histogram}!("rio_X_...", [Unit::*, ]"help")`.
+/// Kind from the macro name; the metrics-crate `Unit` arg is optional
+/// (sla/metrics.rs uses the 3-arg form for `_prediction_ratio`); help
+/// from the trailing string literal (same `\"`/`\\`-aware capture and
+/// `unescape_rust_str` postprocess as `VARIANT_RE`). The `rio_` anchor
+/// avoids the literal `"describe_counter!("` strings rio-scheduler's
+/// metrics self-test contains.
+const METRICS_RE: &str = r#"(?s)describe_(counter|gauge|histogram)!\s*\(\s*"(rio_[a-zA-Z0-9_]+)"\s*,\s*(?:Unit::\w+\s*,\s*)?"((?:[^"\\]|\\.)*)""#;
+
+/// Unescape a rust-source string-literal capture (the bytes BETWEEN
+/// the surrounding `"`s as the regex sees them). Handles `\"`, `\\`,
+/// `\n`, `\t`, and the rustfmt line-continuation `\<newline>`. Unknown
+/// escapes pass through verbatim.
+fn unescape_rust_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('\n') => {} // line-continuation: \<LF> → ∅
+            Some(o) => {
+                out.push('\\');
+                out.push(o);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 pub async fn run() -> Result<()> {
     let out = repo_root().join("docs/gen");
     fs::create_dir_all(&out)?;
@@ -43,16 +80,38 @@ fn write(dir: &Path, name: &str, v: &serde_json::Value) -> Result<()> {
 }
 
 fn metrics() -> Result<serde_json::Value> {
-    // Capture is anchored to `rio_` (observability.md naming convention)
-    // rather than `[^"]+`: rio-scheduler/src/sla/metrics.rs contains
-    // literal `"describe_counter!("` strings in its own self-test that
-    // would otherwise produce garbage captures.
-    let re = Regex::new(r#"describe_(?:counter|gauge|histogram)!\s*\(\s*"(rio_[a-zA-Z0-9_]+)""#)?;
-    let mut names = BTreeSet::new();
+    let re = Regex::new(METRICS_RE)?;
+    // First describe_*! wins per name (some metrics are described in
+    // multiple crates' lib.rs for nextest's per-crate spec floor).
+    let mut seen = BTreeMap::<String, serde_json::Value>::new();
     visit_rio_crates(&mut |_crate, body| {
-        names.extend(re.captures_iter(body).map(|c| c[1].to_string()));
+        for c in re.captures_iter(body) {
+            let name = c[2].to_string();
+            seen.entry(name.clone()).or_insert_with(|| {
+                let help = unescape_rust_str(&c[3])
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                json!({"name": name, "kind": &c[1], "help": help})
+            });
+        }
     })?;
-    Ok(json!({"names": names.into_iter().collect::<Vec<_>>()}))
+    // Group by `rio_{component}_` prefix. by_component is what
+    // ref/metrics.typ iterates; flat `names` kept for the existing
+    // refs.metric membership assert + docs-lint prefix derivation.
+    let mut by_comp = BTreeMap::<String, Vec<serde_json::Value>>::new();
+    for (name, m) in &seen {
+        let comp = name
+            .strip_prefix("rio_")
+            .and_then(|s| s.split_once('_'))
+            .map(|(c, _)| c.to_string())
+            .unwrap_or_else(|| "misc".into());
+        by_comp.entry(comp).or_default().push(m.clone());
+    }
+    Ok(json!({
+        "names": seen.keys().cloned().collect::<Vec<_>>(),
+        "by_component": by_comp,
+    }))
 }
 
 /// Walk every `rio-*/src/**/*.rs` file under the repo root, calling `f`
@@ -109,10 +168,7 @@ fn errors() -> Result<serde_json::Value> {
         for em in enum_re.captures_iter(body) {
             let enum_name = em[1].to_string();
             for vm in variant_re.captures_iter(&em[2]) {
-                // Collapse rustfmt line-continuation whitespace inside
-                // multi-line #[error(...)] strings (e.g. `"foo \\\n  bar"`).
-                let msg = vm[1]
-                    .replace("\\\n", "")
+                let msg = unescape_rust_str(&vm[1])
                     .split_whitespace()
                     .collect::<Vec<_>>()
                     .join(" ");
@@ -139,33 +195,72 @@ fn errors() -> Result<serde_json::Value> {
 }
 
 fn workspace() -> Result<serde_json::Value> {
-    // Parse `[workspace] members = [...]` from root Cargo.toml. Regex,
-    // not `cargo metadata`: docsData runs the crate2nix-built xtask in
-    // a sandbox without cargo. workspace-hack is the hakari stub
-    // (zeroed in nix/crate2nix.nix); excluded so refs.crate-list()
-    // doesn't render it as a real crate in contributor docs.
-    let body = fs::read_to_string(repo_root().join("Cargo.toml"))?;
-    let block = Regex::new(r"(?s)members\s*=\s*\[(.*?)\]")?
-        .captures(&body)
-        .context("no [workspace] members")?[1]
-        .to_string();
-    let members: Vec<String> = Regex::new(r#""([^"]+)""#)?
-        .captures_iter(&block)
-        .map(|c| c[1].to_string())
+    // Parse via the toml crate, not regex: regex section-scraping
+    // consumes the next `[` and silently skips [dev-dependencies] for
+    // 11/13 crates. Not `cargo metadata`: docsData runs the
+    // crate2nix-built xtask in a sandbox without cargo. workspace-hack
+    // is the hakari stub (zeroed in nix/crate2nix.nix); excluded so
+    // refs.crate-list() doesn't render it as a real crate.
+    let root: toml::Table = fs::read_to_string(repo_root().join("Cargo.toml"))?.parse()?;
+    let member_names: Vec<String> = root["workspace"]["members"]
+        .as_array()
+        .context("no [workspace] members")?
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
         .filter(|n| n != "workspace-hack")
         .collect();
-    // xtask's own [dependencies] — for crate-structure.typ's autograph
-    // edge list. Restricted to workspace-internal rio-* deps.
-    let xtask_toml = fs::read_to_string(repo_root().join("xtask/Cargo.toml"))?;
-    let dep_block = Regex::new(r"(?ms)^\[dependencies\]\s*$(.*?)(?:^\[|\z)")?
-        .captures(&xtask_toml)
-        .map(|c| c[1].to_string())
-        .unwrap_or_default();
-    let xtask_deps: Vec<String> = Regex::new(r"(?m)^(rio-[\w-]+)\b")?
-        .captures_iter(&dep_block)
-        .map(|c| c[1].to_string())
-        .collect();
-    Ok(json!({"members": members, "xtask_deps": xtask_deps}))
+
+    // rio-* internal deps from a deps table. Only workspace-internal
+    // edges (rio-*, xtask) — third-party deps are noise for the graph.
+    let internal = |t: &toml::Table| -> BTreeSet<String> {
+        t.keys()
+            .filter(|k| k.starts_with("rio-") || *k == "xtask")
+            .cloned()
+            .collect()
+    };
+
+    let mut members = Vec::new();
+    let mut deps = BTreeMap::<String, serde_json::Value>::new();
+    for name in &member_names {
+        let t: toml::Table =
+            fs::read_to_string(repo_root().join(name).join("Cargo.toml"))?.parse()?;
+        let desc = t
+            .get("package")
+            .and_then(|p| p.get("description"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        members.push(json!({"name": name, "description": desc}));
+
+        let mut prod = BTreeSet::<String>::new();
+        let mut dev = BTreeSet::<String>::new();
+        if let Some(d) = t.get("dependencies").and_then(|v| v.as_table()) {
+            prod.extend(internal(d));
+        }
+        if let Some(d) = t.get("dev-dependencies").and_then(|v| v.as_table()) {
+            dev.extend(internal(d));
+        }
+        // [target.<cfg>.dependencies] — rio-test-support has a
+        // cfg(target_os="linux") block.
+        if let Some(tg) = t.get("target").and_then(|v| v.as_table()) {
+            for cfg in tg.values() {
+                if let Some(d) = cfg.get("dependencies").and_then(|v| v.as_table()) {
+                    prod.extend(internal(d));
+                }
+                if let Some(d) = cfg.get("dev-dependencies").and_then(|v| v.as_table()) {
+                    dev.extend(internal(d));
+                }
+            }
+        }
+        // Dep in both renders as solid only (rio-scheduler has
+        // rio-store in both: schema feature prod, test-utils dev).
+        let dev: Vec<_> = dev.difference(&prod).cloned().collect();
+        deps.insert(
+            name.clone(),
+            json!({"prod": prod.into_iter().collect::<Vec<_>>(), "dev": dev}),
+        );
+    }
+    Ok(json!({"members": members, "deps": deps}))
 }
 
 /// Doc-referenced rust consts. Curated allowlist, NOT a full scrape:
@@ -416,7 +511,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn variant_re_handles_escaped_quote() {
+    fn unescape_rust_str_handles_all_escapes() {
+        assert_eq!(unescape_rust_str(r#"a \"q\" b"#), r#"a "q" b"#);
+        assert_eq!(unescape_rust_str(r"a\\b"), r"a\b");
+        assert_eq!(unescape_rust_str("a \\\n  b"), "a   b"); // line-cont
+        assert_eq!(unescape_rust_str(r"\{0}"), r"\{0}"); // unknown passes through
+    }
+
+    #[test]
+    fn variant_re_captures_then_unescape() {
         let re = Regex::new(VARIANT_RE).unwrap();
         let src = r#"
             #[error("expected '\"' to start string")]
@@ -426,16 +529,43 @@ mod tests {
         "#;
         let caps: Vec<_> = re
             .captures_iter(src)
+            .map(|c| (unescape_rust_str(&c[1]), c[2].to_string()))
+            .collect();
+        assert_eq!(
+            caps,
+            vec![
+                (
+                    r#"expected '"' to start string"#.into(),
+                    "ExpectedStringStart".into()
+                ),
+                ("plain".into(), "Plain".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn metrics_re_handles_both_arg_forms() {
+        let re = Regex::new(METRICS_RE).unwrap();
+        let src = r#"
+            describe_histogram!(
+                "rio_scheduler_sla_prediction_ratio",
+                Unit::Count,
+                "actual/predicted, by dim"
+            );
+            describe_gauge!("rio_gateway_connections_active", "currently active");
+        "#;
+        let caps: Vec<_> = re
+            .captures_iter(src)
             .map(|c| (c[1].to_string(), c[2].to_string()))
             .collect();
         assert_eq!(
             caps,
             vec![
                 (
-                    r#"expected '\"' to start string"#.into(),
-                    "ExpectedStringStart".into()
+                    "histogram".into(),
+                    "rio_scheduler_sla_prediction_ratio".into()
                 ),
-                ("plain".into(), "Plain".into()),
+                ("gauge".into(), "rio_gateway_connections_active".into()),
             ]
         );
     }
