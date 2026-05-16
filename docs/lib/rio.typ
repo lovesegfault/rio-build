@@ -591,6 +591,29 @@
   .rio-clue-tip { border-color: #1a7f37; background: #dafbe1; }
   .rio-clue-idea { border-color: #8250df; background: #fbefff; }
   .rio-footnote { color: #656d76; font-size: 0.9em; }
+  .nav-wrapper { display: flex; justify-content: space-between; margin-top: 2em;
+                 padding-top: 1em; border-top: 1px solid var(--quote-border, #d0d7de); }
+  /* QA #7: dark-theme diagram contrast. cetz output carries explicit
+     fill/stroke; can't recolor via typst show-rules. CSS filter
+     approximates a dark variant. Imperfect (hue-rotate shifts blues),
+     but far better than black-on-dark. Option (b) #themed-figure(builder)
+     deferred. */
+  .ayu .rio-figure svg, .navy .rio-figure svg, .coal .rio-figure svg {
+    filter: invert(0.87) hue-rotate(180deg);
+  }
+  /* QA #8: dark-theme clue/req-id contrast. */
+  .ayu .rio-clue, .navy .rio-clue, .coal .rio-clue { color: var(--fg); }
+  .ayu .rio-clue-info, .navy .rio-clue-info, .coal .rio-clue-info { background: #0d2847; }
+  .ayu .rio-clue-warning, .navy .rio-clue-warning, .coal .rio-clue-warning { background: #3d0f12; }
+  .ayu .rio-clue-memo, .navy .rio-clue-memo, .coal .rio-clue-memo { background: #3a2e05; }
+  .ayu .rio-clue-tip, .navy .rio-clue-tip, .coal .rio-clue-tip { background: #0a2e1a; }
+  .ayu .rio-clue-idea, .navy .rio-clue-idea, .coal .rio-clue-idea { background: #2d1b47; }
+  .ayu .rio-req-id, .navy .rio-req-id, .coal .rio-req-id { background: #161b22; }
+  /* Anchor scroll-offset for sticky header. */
+  [id^="r-"], [id^="label-"], h2[id], h3[id], h4[id] { scroll-margin-top: 3.5em; }
+  /* Code-block background (codly's HTML output is plain <pre><code>). */
+  main pre { background: var(--quote-bg, #f6f8fa); padding: 0.8em 1em;
+             border-radius: 4px; overflow-x: auto; }
   ```
   show: if is-html {
     it => {
