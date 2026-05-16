@@ -45,7 +45,7 @@ const BUILDER_POOL: &str = "x86-64";
 const FETCHER_POOL: &str = "x86-64-fetcher";
 
 /// Context for running rio-cli LOCALLY against a port-forwarded
-/// scheduler+store. Holds the tunnel guards, the mTLS cert tempdir,
+/// scheduler+store. Holds the tunnel guards
 /// and the service-HMAC key memfd — dropping this tears everything
 /// down. Fetched once at the top of the phase and threaded through to
 /// each step that needs rio-cli (cheaper than re-opening tunnels per

@@ -122,7 +122,7 @@ let
         tar -C $d -c . | gzip -1n > $out
       '';
 
-  # Common to all images. cacert for TLS (S3, gRPC with mTLS if enabled),
+  # Common to all images. cacert for TLS (S3, upstream binary caches),
   # tzdata so log timestamps aren't UTC-only.
   baseContents = [
     pkgs.cacert
@@ -531,7 +531,7 @@ rec {
   # r[impl sec.image.control-plane-minimal]
   # Control-plane images carry ONLY the component binary. rio-cli is NOT
   # bundled here — admin ops run it locally via `cargo xtask k8s cli`
-  # (with_cli_tunnel port-forwards 9001/9002 + fetches mTLS client cert).
+  # (with_cli_tunnel port-forwards 9001/9002 + fetches the service-HMAC key).
   # See xtask/src/k8s/mod.rs and the spec marker above; bundling tooling
   # in a control-plane image is an execution primitive in a compromised
   # pod.

@@ -2,7 +2,7 @@
 //!
 //! Intended for LOCAL use via port-forward (`cargo xtask k8s cli --
 //! <cmd>`): xtask opens tunnels to scheduler:9001 + store:9002, fetches
-//! the mTLS client cert from the cluster Secret, and execs THIS binary
+//! the service-HMAC key from the cluster Secret, and execs THIS binary
 //! with `RIO_SCHEDULER_ADDR`/`RIO_STORE_ADDR` set.
 //!
 //! In-pod exec (`kubectl exec deploy/rio-scheduler -- rio-cli <cmd>`)
@@ -151,8 +151,8 @@ pub(crate) struct Config {
     store_addr: String,
     /// HMAC key for minting `x-rio-service-token`. Same file as
     /// gateway/scheduler/store/controller (one shared `rio-service-hmac`
-    /// Secret). xtask's port-forward wrapper fetches it alongside the
-    /// mTLS cert; in-pod exec inside the scheduler pod has it mounted.
+    /// Secret). xtask's port-forward wrapper fetches it; in-pod exec
+    /// inside the scheduler pod has it mounted.
     /// `None` → no header (dev-mode; scheduler's verifier is also
     /// `None` and passes through). Env: `RIO_SERVICE_HMAC_KEY_PATH`.
     service_hmac_key_path: Option<std::path::PathBuf>,

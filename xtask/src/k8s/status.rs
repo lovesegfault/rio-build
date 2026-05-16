@@ -219,9 +219,9 @@ pub(crate) async fn gather(client: &k::Client, context: String) -> Report {
         ip_assign_failures: gather_ip_assign_failures(client).await,
         // Lease lives in rio-system (scheduler's own namespace).
         scheduler_leader: k::scheduler_leader(client, NS).await.ok(),
-        // Local rio-cli via port-forward + fetched mTLS — NOT in-pod
+        // Local rio-cli via port-forward + fetched HMAC key — NOT in-pod
         // exec (scheduler image shouldn't bundle rio-cli). Best-effort:
-        // a failed tunnel or cert-fetch renders as an error line, same
+        // a failed tunnel or key-fetch renders as an error line, same
         // as every other section in this report.
         rio_cli: match CliCtx::open(client, 0, 0).await {
             Ok(cli) => match cli.run(&["status"]) {

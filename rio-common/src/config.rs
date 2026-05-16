@@ -2,7 +2,7 @@
 //!
 //! Precedence (highest wins): CLI > env > TOML > compiled defaults.
 //! Env vars use `RIO_` prefix with `__` for nesting (`RIO_STORE__S3_BUCKET`
-//! sets `store.s3_bucket`). Per `docs/ref/configuration.typ:3-5`.
+//! sets `store.s3_bucket`).
 //!
 //! # How binaries wire this up
 //!
@@ -255,7 +255,7 @@ where
         .merge(Toml::file(format!("/etc/rio/{component}.toml")))
         .merge(Toml::file(format!("{component}.toml")))
         // Env::split("__") turns RIO_STORE__S3_BUCKET into store.s3_bucket.
-        // This matches configuration.typ's spec. Note: figment lowercases the
+        // Note: figment lowercases the
         // env var key after stripping the prefix, so RIO_LISTEN_ADDR maps
         // to `listen_addr` in the Config struct.
         .merge(Env::prefixed("RIO_").split("__"))
@@ -697,7 +697,7 @@ mod tests {
 
     #[test]
     fn env_double_underscore_nesting() {
-        // RIO_NESTED__S3_BUCKET → nested.s3_bucket per configuration.typ.
+        // RIO_NESTED__S3_BUCKET → nested.s3_bucket via Env::split("__").
         figment::Jail::expect_with(|jail| {
             jail.set_env("RIO_NESTED__S3_BUCKET", "my-bucket");
             let cfg: TestConfig =

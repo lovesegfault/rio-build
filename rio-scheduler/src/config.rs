@@ -95,8 +95,8 @@ pub struct Config {
     /// [`crate::sla::config::SlaConfig::validate_resolved`].
     // Skipped from the docs schema: ADR-023 SLA config has its own
     // dedicated spec chapter and ~2.7KLoC of nested types (Tier,
-    // ProbeShape, HwClassDef, Cell-keyed maps) that don't flatten
-    // usefully into ref/configuration.typ's per-key table.
+    // ProbeShape, HwClassDef, Cell-keyed maps) that don't render
+    // usefully into the per-key table that flows into configuration.typ.
     #[schemars(skip)]
     pub sla: crate::sla::config::SlaConfig,
     /// Permit a `[sla].reference_hw_class` change vs the value

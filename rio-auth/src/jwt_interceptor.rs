@@ -347,7 +347,7 @@ mod tests {
 
     /// Header absent → dual-mode fallback. Workers, health probes,
     /// admin tools all take this path. They authenticate through
-    /// OTHER mechanisms (HMAC, mTLS client cert, none).
+    /// OTHER mechanisms (HMAC service token, none).
     #[test]
     fn absent_header_passes_through() {
         let (_, vk) = keypair(0x42);

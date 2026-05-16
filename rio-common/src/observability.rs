@@ -97,7 +97,7 @@ impl Drop for OtelGuard {
 /// - `RIO_OTEL_ENDPOINT`: OTLP gRPC collector endpoint (e.g.,
 ///   `http://otel-collector:4317`). Unset = OTel disabled entirely.
 /// - `RIO_OTEL_SAMPLE_RATE`: 0.0–1.0, fraction of traces to sample
-///   (default: 1.0). Per `configuration.typ`.
+///   (default: 1.0).
 pub fn init_tracing(component: &'static str) -> anyhow::Result<OtelGuard> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 

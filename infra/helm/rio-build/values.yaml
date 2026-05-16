@@ -1050,7 +1050,7 @@ dashboard:
   # Expose ClearPoison/DrainExecutor/CreateTenant/TriggerGC via the
   # dashboard gateway. Default false — the GRPCRoute for mutating
   # methods is NOT rendered, so envoy returns 404 on those paths.
-  # Use rio-cli with an mTLS client cert for admin operations until
+  # Use rio-cli with the service-HMAC key for admin operations until
   # dashboard-native authz lands. Flipping this to true is fail-open:
   # any browser that can reach the gateway can issue mutating RPCs
   # (CORS is advisory — a curl client ignores it).

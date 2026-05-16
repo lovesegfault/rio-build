@@ -116,7 +116,7 @@ pub struct Config {
     /// K8s readinessProbe hits /readyz (200 after first accepted
     /// heartbeat), livenessProbe hits /healthz (always 200).
     pub health_addr: std::net::SocketAddr,
-    /// Log limits (configuration.typ). 0 = unlimited.
+    /// Log rate limit (lines/s). 0 = unlimited.
     /// Wired into LogLimits → LogBatcher in main().
     ///
     /// NOT in PoolSpec (CRD): rate-exceeded lines are suppressed
@@ -223,7 +223,6 @@ impl Default for Config {
             // gateway (9090→9190). Scheduler/store piggyback health
             // on their gRPC ports; builder+gateway have no gRPC server.
             health_addr: rio_common::default_addr(9193),
-            // configuration.typ specs these defaults.
             log_rate_limit: 250_000,
             log_size_limit: 100 * 1024 * 1024, // 100 MiB
             node_name: String::new(),
@@ -405,7 +404,6 @@ mod tests {
         assert_eq!(d.overlay_base_dir, PathBuf::from("/var/rio/overlays"));
         assert_eq!(d.common.metrics_addr.to_string(), "[::]:9093");
         assert_eq!(d.health_addr.to_string(), "[::]:9193");
-        // Spec values from configuration.typ.
         assert_eq!(d.log_rate_limit, 250_000);
         assert_eq!(d.log_size_limit, 100 * 1024 * 1024);
     }
