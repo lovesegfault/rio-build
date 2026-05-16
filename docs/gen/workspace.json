@@ -2,6 +2,7 @@
   "deps": {
     "rio-auth": {
       "dev": [],
+      "optional": [],
       "prod": [
         "rio-common"
       ]
@@ -10,6 +11,7 @@
       "dev": [
         "rio-test-support"
       ],
+      "optional": [],
       "prod": [
         "rio-common",
         "rio-nix",
@@ -20,6 +22,7 @@
       "dev": [
         "rio-test-support"
       ],
+      "optional": [],
       "prod": [
         "rio-auth",
         "rio-common",
@@ -29,12 +32,14 @@
     },
     "rio-common": {
       "dev": [],
+      "optional": [],
       "prod": []
     },
     "rio-controller": {
       "dev": [
         "rio-test-support"
       ],
+      "optional": [],
       "prod": [
         "rio-auth",
         "rio-common",
@@ -45,6 +50,7 @@
     },
     "rio-crds": {
       "dev": [],
+      "optional": [],
       "prod": []
     },
     "rio-gateway": {
@@ -52,6 +58,7 @@
         "rio-store",
         "rio-test-support"
       ],
+      "optional": [],
       "prod": [
         "rio-auth",
         "rio-common",
@@ -63,6 +70,7 @@
       "dev": [
         "rio-test-support"
       ],
+      "optional": [],
       "prod": [
         "rio-common",
         "rio-crds"
@@ -70,10 +78,12 @@
     },
     "rio-nix": {
       "dev": [],
+      "optional": [],
       "prod": []
     },
     "rio-proto": {
       "dev": [],
+      "optional": [],
       "prod": [
         "rio-common",
         "rio-nix"
@@ -83,6 +93,7 @@
       "dev": [
         "rio-test-support"
       ],
+      "optional": [],
       "prod": [
         "rio-auth",
         "rio-common",
@@ -94,19 +105,20 @@
       ]
     },
     "rio-store": {
-      "dev": [
-        "rio-store"
+      "dev": [],
+      "optional": [
+        "rio-test-support"
       ],
       "prod": [
         "rio-auth",
         "rio-common",
         "rio-nix",
-        "rio-proto",
-        "rio-test-support"
+        "rio-proto"
       ]
     },
     "rio-test-support": {
       "dev": [],
+      "optional": [],
       "prod": [
         "rio-nix",
         "rio-proto"
@@ -114,6 +126,7 @@
     },
     "xtask": {
       "dev": [],
+      "optional": [],
       "prod": [
         "rio-builder",
         "rio-common",
