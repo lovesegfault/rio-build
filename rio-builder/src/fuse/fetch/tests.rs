@@ -365,14 +365,18 @@ async fn test_prefetch_store_unavailable_returns_eio() {
     let err = result.expect_err("expected Err(EIO)");
     assert_eq!(err.code(), Errno::EIO.code(), "expected EIO, got: {err:?}");
 
-    // Total backoff should have been observed (cfg(test): ~760ms ×
-    // jitter ∈ [0.5, 1.5) per step → floor ~380ms). Lower-bound
-    // check — proves retries happened, not just immediate EIO.
-    let elapsed = start.elapsed();
-    let min: Duration = RETRY_BACKOFF.iter().sum::<Duration>().mul_f64(0.5);
-    assert!(
-        elapsed >= min,
-        "expected ≥{min:?} total backoff (proves retries fired), got {elapsed:?}"
+    // Structural assert: every Unavailable retry hit GetPath once
+    // (initial + each backoff step). The fail_get_path early-return
+    // is AFTER the call counter, so it counts attempts. The previous
+    // `elapsed >= 380ms` lower-bound was satisfiable by harness
+    // overhead alone (907263c saw 795ms with zero gRPC under load),
+    // so a no-retry regression could false-PASS.
+    assert_eq!(
+        store.calls.get_path_calls.load(Ordering::SeqCst) as usize,
+        1 + RETRY_BACKOFF.len(),
+        "expected 1 initial + {} retry GetPath calls; elapsed={:?}",
+        RETRY_BACKOFF.len(),
+        start.elapsed(),
     );
 }
 
