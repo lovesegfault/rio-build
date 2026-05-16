@@ -64,7 +64,7 @@ store/builder.
   [`wopAddToStoreNar`], [39], [Accept NAR imports],
   [`wopQueryMissing`], [40], [Report what needs building],
   [`wopQueryDerivationOutputMap`], [41], [Get output name → path mapping],
-  [`wopRegisterDrvOutput`], [42], [Register CA derivation output],
+  [`wopRegisterDrvOutput`], [42], [Register @ca derivation output],
   [`wopQueryRealisation`], [43], [Query CA realisation],
   [`wopAddMultipleToStore`], [44], [Batch NAR import],
   [`wopBuildPathsWithResults`], [46], [Build paths and return results],
@@ -740,7 +740,7 @@ Each *builtOutput* entry is a `(DrvOutput, Realisation)` pair:
   _unbounded_ `FramedStreamReader` (`new_unbounded`) --- the per-entry
   `nar_size ≤ MAX_NAR_SIZE` check inside the de-framed stream and `num_paths ≤
   MAX_COLLECTION_COUNT` are the DoS gates; the aggregate is unbounded by design
-  (closures legitimately exceed 4 GiB; per-frame ≤ `MAX_FRAME_SIZE` and
+  (#glspl("closure") legitimately exceed 4 GiB; per-frame ≤ `MAX_FRAME_SIZE` and
   streaming processing keep memory bounded regardless).
 ]
 
@@ -1523,7 +1523,7 @@ input-addressed derivations, it returns the statically-known output paths. For
 CA derivations, it returns the realized output paths if known.
 
 *Note on `wopAddTempRoot`:* Accepts the store path and records it as a
-connection-scoped temporary GC root in-memory. These temp roots prevent GC of
+connection-scoped temporary GC root in-memory. These #glspl("temp-root") prevent GC of
 paths the client is actively using. They are lost on gateway pod restart, which
 is acceptable given the store's GC grace period (default 2h). The store's GC
 relies on the grace period rather than querying gateways for active temp roots.

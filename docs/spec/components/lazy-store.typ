@@ -138,7 +138,7 @@ EROFS asks fscache for blob data by `(cookie = device-slot tag, off, len)`.
   FastCDC chunks (#(refs.gh)("rio-store/src/chunker.rs:32")) are 16–256 KiB at
   content-defined byte boundaries. A FastCDC cut at NAR byte 17 313 is
   unrepresentable.
-+ *Cardinality.* `device_id` is `__le16` → 65 535 blobs max. A chromium closure
++ *Cardinality.* `device_id` is `__le16` → 65 535 blobs max. A chromium @closure
   ≈ 600 000 FastCDC chunks.
 
 *The mapping that works* (= what RAFS v6 does): one *logical blob per store

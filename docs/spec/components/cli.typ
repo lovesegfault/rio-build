@@ -71,7 +71,7 @@ per-message progress drains without a whole-call deadline.
 
   [`poison-list` / `poison-clear`],
   [`AdminService.{ListPoisoned,ClearPoison}`],
-  [Show/clear derivation poison roots],
+  [Show/clear @poison-derivation roots],
 
   [`cancel-build`],
   [`AdminService.CancelBuild`],

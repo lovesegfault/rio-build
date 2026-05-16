@@ -63,7 +63,7 @@ Manages rio-build lifecycle on Kubernetes via CRDs.
   logs` on failed builders). Job settings: `backoffLimit: 0` (scheduler owns
   retry), `restartPolicy: Never`, `parallelism: 1`. `spec.maxConcurrent` is an
   optional concurrent-Job ceiling, not a standing set; when omitted, fanout is
-  bounded provisioning-side --- the §13b placeable gate (Builder Pools spawn
+  bounded provisioning-side --- the §13b placeable gate (#glspl("builderpool") spawn
   Jobs only for FFD-placed-on-`Registered` intents) and `cover_deficit`'s
   per-class `maxFleetCores` budget caps bound the NodeClaim mint, not the Job
   count. The Karpenter NodePool is NOT a fanout gate post-§13b:
@@ -81,7 +81,7 @@ non-privileged (see #rref("sec.pod.host-users-false")).
 scheduler registration --- typically 10--30s) plus one reconcile tick (\~10s)
 before the Job is spawned. Nodes outlive pods (@karpenter consolidation policy),
 so the node-level FSx cache survives pod churn --- the cold-start cost is pod
-overhead, not refetching the closure.
+overhead, not refetching the @closure.
 
 *Dispatch path:* the scheduler sees a Job pod heartbeat in, dispatches one
 derivation, receives `CompletionReport`, then the pod disconnects. The active
@@ -1078,7 +1078,7 @@ root with a TOML settings API but no kernel control (the per-page FUSE /
 future out-of-tree `riofs` kmod), no exposure of `cgroup_writable = true` on
 the runc runtime (so `hostUsers: false` was undeployable on EKS), and no
 reproducibility (`bottlerocket@latest` is a moving alias --- the only deploy
-artifact that wasn't a content-addressed flake output).
+artifact that wasn't a #gls("ca", display: "content-addressed") flake output).
 
 The worker-node AMI is built from nixpkgs
 `maintainers/scripts/ec2/amazon-image.nix`, with `awslabs/amazon-eks-ami/
@@ -1180,7 +1180,7 @@ cold. Every executor needs to fetch the same common dependencies (glibc,
 coreutils, etc.) from rio-store, creating a thundering herd on the store's S3
 backend. Mitigations: an in-process LRU chunk cache on rio-store (`ChunkCache`,
 moka-based, default 2 GiB) reduces S3 round-trips for hot chunks; and
-per-derivation prefetch hints --- the scheduler sends input-path prefetch to
+per-derivation #glspl("prefetch-hint") --- the scheduler sends input-path prefetch to
 the assigned executor before dispatch, so the FUSE cache warms during the
 scheduling window rather than on first `read()`. Staggered scheduling with the
 cold-start prefetch warm-gate (#rref("sched.assign.warm-gate")) is implemented

@@ -45,8 +45,8 @@ split.
   closures.
 ]
 
-Inline blobs never touch S3 --- they live entirely in PostgreSQL. The
-inline/chunked decision is made at `PutPath` time based on @nar size; see the
+@inline-storage #glspl("blob") never touch S3 --- they live entirely in PostgreSQL.
+The inline/chunked decision is made at `PutPath` time based on @nar size; see the
 "Inline vs. chunked invariant" in @store-schema.
 
 = Layer 2: Nix Metadata Store
@@ -54,7 +54,7 @@ inline/chunked decision is made at `PutPath` time based on @nar size; see the
 - Maps store paths to their chunk manifests (ordered list of chunk digests)
 - Stores @narinfo metadata: deriver, NAR hash, NAR size, references, signatures,
   `tenant_id`
-- Content-addressed index: maps output content hash → @store-path (for CA early
+- @ca index: maps output content hash → @store-path (for CA early
   cutoff)
 - Input-addressed index: maps derivation hash → output store paths (traditional
   lookups)
@@ -636,7 +636,7 @@ unique chunks.
 #r("store.realisation.register+2")[
   `RegisterRealisation` inserts a CA derivation realisation row `(drv_hash,
   output_name) → (output_path, output_hash, signatures)` into the
-  `realisations` table. `drv_hash` is the modular derivation hash
+  `realisations` table. `drv_hash` is the @modular-hash
   (`hashDerivationModulo`) --- it depends only on the derivation's fixed
   attributes, NOT on output paths, so two CA derivations with identical inputs
   hash the same. Service-caller-only (`PERMISSION_DENIED` otherwise); the
@@ -1317,7 +1317,7 @@ latency is mitigated by caching.
 *The hard part: store path transfer efficiency.* Moving closures between
 rio-store and executors is the main bottleneck. NAR streaming avoids
 materializing full NARs in memory; chunk-level deduplication enables
-incremental transfers; the scheduler sends prefetch hints to the executor's
+incremental transfers; the scheduler sends #glspl("prefetch-hint") to the executor's
 @fuse cache before assigning work; and the per-executor FUSE store with local
 SSD cache provides local-disk performance for hot paths without shared
 infrastructure.

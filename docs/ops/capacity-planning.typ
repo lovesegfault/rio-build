@@ -49,7 +49,7 @@ This page provides resource sizing guidance for rio-build deployments. All estim
 
   [Inline paths (\< #qty("256", "KB"))],
   [\~#qty("60", "percent") by count, \~#qty("5", "percent") by size],
-  [Stored as single blobs, no chunking overhead],
+  [Stored as single #glspl("blob"), no chunking overhead],
 
   [Average chunk size],
   [#qty("64", "KB")],

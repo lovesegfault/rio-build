@@ -18,7 +18,7 @@ executors via a bidirectional streaming RPC.
   resource needs to executor capabilities (subset matching: all required
   features must be present on the executor)
 - Auto-pin live build inputs: on dispatch, `pin_live_inputs` writes the
-  derivation's input closure to the `scheduler_live_pins` table (used by
+  derivation's input @closure to the `scheduler_live_pins` table (used by
   rio-store's GC mark phase as a root seed); unpinned on completion
 - Proxy `AdminService.TriggerGC` to rio-store, first collecting live-build
   output paths via `ActorCommand::GcRoots` and forwarding them as `extra_roots`
@@ -34,7 +34,7 @@ executors via a bidirectional streaming RPC.
   reassign its in-flight derivations to another executor. _Slow-executor
   speculative reassignment (actual_time > estimated_time × 3) is not currently
   implemented._
-- Poison derivation tracking: mark derivations that fail on 3+ different
+- @poison-derivation tracking: mark derivations that fail on 3+ different
   executors; auto-expire after 24h (see the error taxonomy)
 
 = Concurrency Model
@@ -544,7 +544,7 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
   requests. When a new derivation DAG arrives from the gateway, it is merged
   into the global graph:
   - *Input-addressed derivations*: deduplicated by store path
-  - *Content-addressed derivations*: deduplicated by modular derivation hash
+  - *#gls("ca", display: "Content-addressed") derivations*: deduplicated by @modular-hash
     (as computed by `hashDerivationModulo` --- excludes output paths, depends
     only on the derivation's fixed attributes)
 ]
@@ -1383,7 +1383,7 @@ tracks queued derivations per kind.
 
 #r("sched.assign.warm-gate")[
   A newly-registered executor (step 3 above --- first heartbeat with open
-  stream) receives an initial `PrefetchHint` before any `WorkAssignment`. The
+  stream) receives an initial @prefetch-hint before any `WorkAssignment`. The
   executor fetches the hinted paths into its FUSE cache and replies with
   `PrefetchComplete` on the `BuildExecution` stream. The scheduler's
   `ExecutorState.warm` flag starts `false` and flips `true` on receipt.

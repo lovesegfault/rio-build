@@ -32,7 +32,7 @@ that schedules build DAGs across builder pods with intelligent caching.
   resource-fit placement on ephemeral one-shot executors
 + *Chunked content-addressable store* with cross-build deduplication (@fastcdc +
   @blake3), with inline fast-path for small NARs
-+ *CA-ready design* --- store schema and scheduler support content-addressed
++ *#gls("ca")-ready design* --- store schema and scheduler support content-addressed
   derivations from day one; early cutoff optimization with per-edge tracking
 + *#gls("fuse")-backed builder stores* with lazy on-demand fetching from CAS, local SSD
   caching, and per-build overlay isolation with synthetic SQLite DB

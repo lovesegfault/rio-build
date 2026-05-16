@@ -187,7 +187,7 @@ fixed-output derivation fetches forced a leaky compromise. Regular builds
 execute arbitrary shell code from derivations and have no legitimate reason to
 reach the internet --- a compromised build that can exfiltrate secrets or call
 home is a real threat. FOD fetches download from arbitrary URLs by design, but
-the output is content-addressed: the scheduler knows the expected hash before
+the output is #gls("ca", display: "content-addressed"): the scheduler knows the expected hash before
 dispatch, and a tampered fetch produces a hash mismatch that
 `verify_fod_hashes()` rejects before upload.
 

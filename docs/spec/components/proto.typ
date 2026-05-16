@@ -152,7 +152,7 @@ service StoreService {
   round-trips). Callers needing those semantics use the singular RPCs.
 ]
 
-The batch RPCs exist because the builder's input-closure BFS + #gls("fuse")-warm stat
+The batch RPCs exist because the builder's input-@closure BFS + #gls("fuse")-warm stat
 loop were issuing \~800 singular RPCs per build --- at 246 concurrent ephemeral
 builders that saturated the store's PG pool (acquire times → 11s → FUSE breaker
 → EIO). One batch call per BFS layer backed by `WHERE store_path_hash =
@@ -229,7 +229,7 @@ service AdminService {
   The `BuildExecution` RPC replaces the previous `PullWork` +
   `ReportCompletion` design with a single bidirectional stream per executor,
   enabling:
-  - Scheduler-to-executor signals (assignment, cancellation, prefetch hints)
+  - Scheduler-to-executor signals (assignment, cancellation, #glspl("prefetch-hint"))
     without out-of-band RPCs
   - Executor-to-scheduler signals (log batches, completion, ack) with
     reliability guarantees

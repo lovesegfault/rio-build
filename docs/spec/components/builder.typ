@@ -112,12 +112,12 @@ to lazily fetch @store-path content on demand.
   independently. No RWX PersistentVolume, no NFS/EFS/CephFS provisioning, no
   StoreSync reconciler.
 - *Lazy loading*: Only paths actually accessed during a build are fetched. A
-  nixpkgs closure is tens of GB, but a typical build accesses a small
+  nixpkgs @closure is tens of GB, but a typical build accesses a small
   fraction.
 - *Perfect caching*: Store paths are immutable and content-addressed. Once
   cached, data never needs invalidation or re-fetching. The SSD cache is
   purely additive with LRU eviction under disk pressure.
-- *Predictive prefetch*: The scheduler sends prefetch hints via the build
+- *Predictive prefetch*: The scheduler sends #glspl("prefetch-hint") via the build
   execution stream before assigning work. The FUSE daemon warms its cache with
   the build's input closure paths before the build starts.
 
@@ -1580,7 +1580,7 @@ both unconditionally; no hostPath volume; `hostUsers: false` works.
 `CAP_SYS_ADMIN` is scoped to the user namespace and a container escape cannot
 use it on the host. The Helm chart default is `builderPoolDefaults.privileged:
 false`; no device plugin runs, no extended resource is requested. The
-`BuilderPool` @crd exposes an optional `privileged: bool` --- when `true` the
+@builderpool @crd exposes an optional `privileged: bool` --- when `true` the
 container runs fully privileged with the hostPath `/dev/fuse` fallback, an
 escape hatch for clusters whose default seccomp profiles block `mount(2)` even
 with `SYS_ADMIN`, or whose containerd lacks idmap-mount support. Production

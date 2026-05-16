@@ -293,16 +293,10 @@
     short: [inline storage],
     description: [A fast-path in rio-store for NARs below 256 KiB (`INLINE_THRESHOLD`, compile-time const) that bypasses FastCDC chunking. Stored directly in the PostgreSQL `manifests.inline_blob` BYTEA column --- inline blobs *never touch S3*.],
   ),
-  (
-    key: "build-request",
-    short: [build (request)],
-    description: [A full build request (DAG of derivations) submitted via `SubmitBuild`. Contains one or more derivations. Tracked by `build_id`.],
-  ),
-  (
-    key: "build-derivation",
-    short: [build (derivation)],
-    description: [Execution of a single derivation on an executor. Multiple derivation builds comprise a build request. Tracked by `derivation_hash`.],
-  ),
+  // build-request / build-derivation: removed — disambiguator entries
+  // ("build (request)" vs "build (derivation)") that no prose references.
+  // The distinction is made inline where it matters (e.g., gateway.typ's
+  // SubmitBuild flow).
   (
     key: "blob",
     short: [blob],
@@ -348,11 +342,9 @@
     short: [DAG actor],
     description: [The single-owner Tokio task in the scheduler that owns the in-memory global DAG. All DAG mutations (merges, completions, cancellations) are processed sequentially via an `mpsc` channel, eliminating lock contention.],
   ),
-  (
-    key: "rio-fuse",
-    short: [rio-fuse],
-    description: [The custom FUSE filesystem implemented as a module (`fuse/`) inside `rio-builder` (not a separate crate or binary). Mounts at `/var/rio/fuse-store` and lazily fetches store path content from rio-store via gRPC on demand, caching on local SSD.],
-  ),
+  // rio-fuse: removed — never appears as a concept name in prose (only as
+  // the `/var/rio/fuse-store` mount path); the `fuse` key covers the
+  // filesystem concept and builder.typ §FUSE describes the module.
   (
     key: "temp-root",
     short: [temp root],

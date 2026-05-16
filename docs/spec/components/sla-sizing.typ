@@ -65,7 +65,7 @@ In high-performance-computing literature this is *moldable job scheduling*: the 
 
 Replace fit-based sizing with SLA-driven sizing. The operator declares latency tiers; the scheduler learns per-derivation duration and memory as functions of allocated cores, and requests the cheapest `(cpu, mem)` that lands the derivation in its tightest feasible tier.
 
-Rio's existing scheduler→builder sizing pipeline is reused unchanged — this ADR changes what it _carries_, not how it flows. `BuilderPool.spec.sizing: Static` remains as an opt-out for operators who want explicit fixed bins.
+Rio's existing scheduler→builder sizing pipeline is reused unchanged — this ADR changes what it _carries_, not how it flows. The @builderpool `spec.sizing: Static` remains as an opt-out for operators who want explicit fixed bins.
 
 #figure(
   caption: [Data and compute flow. The slow ingest path writes `FittedParams`; the fast dispatch path only reads it — everything per-key (NNLS refit, bootstrap) happens off the hot path.],
