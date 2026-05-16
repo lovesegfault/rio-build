@@ -7,25 +7,22 @@
 
 = Workspace Layout (#(refs.crate-count)() crates)
 
-```
-rio-build/
-├── Cargo.toml           # Workspace root
-├── rio-common/          # Shared utilities (no rio-* deps — leaf)
-├── rio-auth/            # JWT/HMAC tokens + tonic auth interceptor (depends on rio-common only)
-├── rio-nix/             # Nix protocol types and wire format (no rio-* deps — leaf)
-├── rio-proto/           # Protobuf/gRPC definitions
-├── rio-crds/            # Kubernetes CRD types (Pool, ComponentScaler)
-├── rio-test-support/    # Test harness (ephemeral PG, mock gRPC, wire helpers)
-├── rio-gateway/         # SSH server + Nix worker protocol frontend
-├── rio-scheduler/       # DAG-aware build scheduler
-├── rio-store/           # NAR content-addressable store
-├── rio-builder/         # Build executor + FUSE store
-├── rio-controller/      # Kubernetes operator (reconciler, autoscaler)
-├── rio-cli/             # Operator CLI (AdminService client)
-├── xtask/               # Dev/ops tooling (k8s up/down, AMI build, codegen)
-├── workspace-hack/      # cargo-hakari unification crate (no source, dep-only)
-└── rio-dashboard/       # Svelte 5 SPA — NOT a Rust crate; built by nix/dashboard.nix (pnpm+Vite)
-```
+// ASCII tree derives from gen/workspace.json (same _ws.members the
+// autograph below spreads). bug_016: the hand-maintained tree omitted
+// rio-lease while the derived heading and graph showed 14.
+#let _tree-rows = _ws.members.map(m => {
+  let pad = " " * calc.max(0, 19 - m.name.len())
+  "├── " + m.name + "/" + pad + "# " + m.description
+})
+#raw(
+  "rio-build/\n"
+    + "├── Cargo.toml           # Workspace root\n"
+    + _tree-rows.join("\n")
+    + "\n"
+    + "├── workspace-hack/      # cargo-hakari unification crate (no source, dep-only)\n"
+    + "└── rio-dashboard/       # Svelte 5 SPA — NOT a Rust crate; built by nix/dashboard.nix\n",
+  block: true,
+)
 
 `rio-dashboard/` is a workspace sibling but NOT a Cargo workspace member. It has
 its own `package.json`/`pnpm-lock.yaml` and is built by `nix/dashboard.nix` via
@@ -42,6 +39,7 @@ derivation is invalidated on `.proto` changes but not on Rust-only commits.
     #text(size: 0.7em, fill: muted, sub)
   ]
   let dev = (stroke: (paint: muted, dash: "dashed", thickness: 0.6pt))
+  let opt = (stroke: (paint: rule-color, dash: "dotted", thickness: 0.6pt))
   figure(
     autograph.diagram(
       engine: "dot",
@@ -65,12 +63,14 @@ derivation is invalidated on `.proto` changes but not on Rust-only commits.
         .map(p => {
           let (c, d) = p
           d.prod.map(t => autograph.edge(label(c), label(t)))
+          d.optional.map(t => autograph.edge(label(c), label(t), ..opt))
           d.dev.map(t => autograph.edge(label(c), label(t), ..dev))
         })
         .flatten(),
     ),
-    caption: [Workspace dependency graph. Solid edges are prod dependencies;
-      dashed are `[dev-dependencies]` only.],
+    caption: [Workspace dependency graph. Solid = prod (default-feature
+      reachable); dotted = `optional = true` not enabled by `default`;
+      dashed = `[dev-dependencies]` only.],
   )
 }
 
@@ -474,7 +474,7 @@ src/
 └── fixtures.rs        # test_store_path, rand_store_hash, NAR/PathInfo/DAG builders, seed_store_output
 ```
 
-`rio-test-support` is a `[dependencies]` (not dev-dep) of `xtask` — `xtask regen sqlx` reuses `PgServer::bootstrap`. All other crates depend on it under `[dev-dependencies]` only.
+`rio-test-support` is a `[dependencies]` (not dev-dep) of `xtask` — `xtask regen sqlx` reuses `PgServer::bootstrap`. All other crates depend on it under `[dev-dependencies]` only; `rio-store` additionally has it under `[dependencies]` with `optional = true` (`test-utils` feature, not in `default`).
 
 #r(
   "ts.mock.admin",
