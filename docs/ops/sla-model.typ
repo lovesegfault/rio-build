@@ -169,7 +169,7 @@ build's structured log `hw_class` field) → the per-hw normalization factor
 is stale. The
 `hw_perf_samples` table is 7-day windowed; a hardware change takes up to a
 week to wash through. No per-pname fix — the fleet-median recomputes every
-estimator refresh tick (\~60s). Cross-check
+estimator refresh tick (\~#qty("60", "s")). Cross-check
 #link(<riosla-priordivergenceclamped>)[#(refs.alert)("RioSlaPriorDivergenceClamped")].
 
 == Wrong tier
@@ -186,7 +186,7 @@ or rejected from the tier you expect (`serial-floor` / `envelope`):
 = Step 4: Override or reset <step-4>
 
 All overrides are `(pname, system?, tenant?)`-scoped (NULL = wildcard,
-most-specific wins) and take effect on the next estimator refresh (\~60s).
+most-specific wins) and take effect on the next estimator refresh (\~#qty("60", "s")).
 
 == Pin to a named tier
 
@@ -280,7 +280,7 @@ defaults` shows the current probe shape.
 == RioSla HwCostStale <riosla-hwcoststale>
 
 #(refs.metric)("rio_scheduler_sla_hw_cost_stale_seconds")` > 1800` for 5m. The spot-price poller
-hasn't refreshed in >30m (it ticks every 10m; auto-clamp to helm seed at 60m).
+hasn't refreshed in >#qty("30", "min") (it ticks every #qty("10", "min"); auto-clamp to helm seed at #qty("60", "min")).
 Not a model-accuracy issue — cost ranking degrades, not sizing. Check
 scheduler leader-lease (`kubectl -n rio-system get lease rio-scheduler-leader`
 — the name is `helm:scheduler.leaseName`, not the Deployment name) and
@@ -354,7 +354,7 @@ window (default 2440s) for 5 minutes. `cover_deficit` mints a NodeClaim, kubelet
 never registers within the 2×seed boot timeout, `health::classify` reaps it
 (`ReapReason::BootTimeout` — NOT ICE-masked, since capacity exists and the
 _boot_ failed), and `cover_deficit` re-mints. The loop is unbounded: each
-cycle holds an idle metal instance for `2×seed` (\~20 min), with zero builds
+cycle holds an idle metal instance for `2×seed` (\~#qty("20", "min")), with zero builds
 completing and the kvm/nixos-test queue growing.
 
 Distinct from `StuckPending` (which fires when the _reaper_ fails) — this
@@ -403,7 +403,7 @@ entry for the intent's `(arch, size, required_features)`:
   Add or fix the hw-class. Check #(refs.metric)("rio_scheduler_unroutable_features_total")
   for the same shape on the scheduler side — if BOTH fire the misconfig is
   in `[sla.hw_classes]`; if only this one, the scheduler routed but the
-  controller's `HwClassConfig` is stale (300s refresh). See also
+  controller's `HwClassConfig` is stale (#qty("300", "s") refresh). See also
   `intent_dropped_total{reason="unknown_hw_class"}` — that reason fires when
   the SCHEDULER stamped a hwClass the CONTROLLER doesn't yet know; it
   self-heals within the GetHwClassConfig refresh and is a `warn!` not an alert.
@@ -436,7 +436,7 @@ ctrl.pool.fetcher-affinity-from-intent` for the spec text.
 == RioNodeclaimPool StuckTerminating <rionodeclaimpool-stuckterminating>
 
 A NodeClaim has been in the terminating state (`metadata.deletionTimestamp`
-set, Karpenter finalizer running) for >5m. Healthy drain is \~60-90s. The
+set, Karpenter finalizer running) for >#qty("5", "min"). Healthy drain is \~#qtyrange("60", "90", "s"). The
 NodeClaim still counts against `max_fleet_cores` (the EC2 instance bills
 until the finalizer clears, by design — see `ffd.rs`), so a stuck finalizer
 permanently reduces effective fleet capacity for that cell.
