@@ -116,11 +116,15 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 #_cfg-table(_cfg.controller)
 
 #info[
-  *The controller is NOT leader-elected* (single replica by design). Only the
-  scheduler uses a Kubernetes Lease (see scheduler `RIO_LEASE_NAME` /
-  `RIO_LEASE_NAMESPACE` env vars documented in
-  #cross-link("/spec/components/scheduler.typ")[scheduler: Leader
-    Election]).
+  // Tripwire: refs.cfg asserts the key exists in gen/config.json —
+  // if the controller's lease config goes away this box is stale and
+  // the typst build fails here instead of silently rotting.
+  #let _ = (refs.cfg)("controller", "nodeclaim_pool.lease_name")
+  The controller's `nodeclaim_pool` reconciler is leader-elected via
+  `rio_lease` (since ADR-023 §13b), as is the scheduler --- both hold a
+  Kubernetes Lease. The chart default is still single-replica for the
+  controller; see #cross-link("/spec/components/controller.typ")[the
+    controller component spec] for the lease scoping.
 ]
 
 = Transport

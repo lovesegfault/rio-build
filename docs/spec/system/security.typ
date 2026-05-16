@@ -236,8 +236,9 @@
   `allowPrivilegeEscalation: false`, `seccompProfile: RuntimeDefault`, and
   `readOnlyRootFilesystem: true`. These are gRPC servers with no FUSE, no
   mount, no raw-socket requirements --- `restricted` is the correct floor. The
-  executor namespaces (`rio-builders`, `rio-fetchers`) stay at
-  #(refs.psa)("rio-builders") per ADR-019; they need `CAP_SYS_ADMIN` for FUSE.
+  executor namespaces stay at #(refs.psa)("rio-builders") (`rio-builders`) /
+  #(refs.psa)("rio-fetchers") (`rio-fetchers`) per ADR-019; they need
+  `CAP_SYS_ADMIN` for FUSE.
 ]
 
 #r("sec.image.control-plane-minimal")[

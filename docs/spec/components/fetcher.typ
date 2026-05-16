@@ -200,8 +200,9 @@ env.
 *Four-namespace layout.* `rio-system` (PSA #(refs.psa)("rio-system")) holds
 scheduler, gateway, controller, dashboard, PostgreSQL. `rio-store`
 (#(refs.psa)("rio-store")) holds the store in its own namespace so executor
-NetworkPolicies can target it precisely. `rio-builders` and `rio-fetchers`
-(both #(refs.psa)("rio-builders")) hold the respective Jobs. `privileged` PSA
+NetworkPolicies can target it precisely. `rio-builders`
+(#(refs.psa)("rio-builders")) and `rio-fetchers` (#(refs.psa)("rio-fetchers"))
+hold the respective Jobs. `privileged` PSA
 narrows to the two namespaces that need `CAP_SYS_ADMIN` for FUSE; the control
 plane is #rref("sec.psa.control-plane-restricted").
 
