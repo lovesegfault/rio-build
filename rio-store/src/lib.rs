@@ -111,9 +111,11 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
 
 /// Register `# HELP` descriptions for all store metrics.
 ///
-/// Call from `main()` immediately after `init_metrics()`. Descriptions
-/// sourced from docs/spec/system/observability.typ (the Store Metrics table).
-/// See rio_gateway::describe_metrics for rationale.
+/// Call from `main()` immediately after `init_metrics()`. The
+/// describe_*!() help strings here are the source for
+/// docs/ref/metrics.typ's Store table (via xtask regen docs-data
+/// → docs/gen/metrics.json). See rio_gateway::describe_metrics for
+/// rationale.
 // r[impl obs.metric.store]
 #[cfg(feature = "server")]
 pub fn describe_metrics() {

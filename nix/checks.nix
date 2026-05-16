@@ -51,7 +51,7 @@
   workspaceSrc ? null,
   # Manifests-only fileset for the shared cargo-metadata derivation and
   # nextest's --workspace-remap target. Contains Cargo.toml's + .config/
-  # nextest.toml + the few runtime-read files (observability.typ,
+  # nextest.toml + the few runtime-read files (docs/gen/metrics.json,
   # proptest-regressions/). Editing src/**.rs does NOT change this hash,
   # so per-member nextest runs cache independently of unrelated source
   # edits. Defaults to workspaceSrc for backward-compat.

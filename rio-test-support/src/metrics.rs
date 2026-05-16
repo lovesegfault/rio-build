@@ -285,7 +285,7 @@ pub fn grep_emitted_names(manifest_dir: &str) -> Vec<String> {
 /// for a flat string array (and matches the old markdown-table grep
 /// in spirit).
 ///
-/// This was the obs.md markdown-table parser before the typst spec
+/// This was the markdown-table parser before the typst spec
 /// migration. The spec table is now GENERATED from metrics.json, so
 /// the original "spec → describe" assertion has narrowed to
 /// "regex-scanned `describe_*!` literals → `describe_metrics()`
@@ -329,9 +329,9 @@ pub fn grep_spec_names(metrics_json_body: &str, prefix: &str) -> Vec<String> {
 /// Parameters:
 /// - `describe_fn`: path to the crate's `pub fn describe_metrics()`
 /// - `crate_name`: human-readable name for error messages
-/// - `prefix`: `"rio_X_"` — selects this crate's rows from observability.typ
+/// - `prefix`: `"rio_X_"` — selects this crate's rows from `docs/gen/metrics.json` (line 354)
 /// - `histogram_buckets`: the crate's `pub const HISTOGRAM_BUCKETS` table
-/// - `spec_floor`: min rows expected in the obs.md table (vacuity guard)
+/// - `spec_floor`: min rows expected in metrics.json (vacuity guard)
 /// - `emit_floor`: min `metrics::*!` literals expected in src/ (regex-health guard)
 /// - `default_buckets_ok`: histograms deliberately on `[0.005..10.0]` defaults
 #[macro_export]
@@ -396,7 +396,7 @@ macro_rules! metrics_suite {
 /// Assert that every name in `spec_metrics` appears in the set of
 /// `describe_*!` calls fired by `describe_fn`.
 ///
-/// Spec→describe direction: catches "spec'd in observability.typ but
+/// Spec→describe direction: catches "name in docs/gen/metrics.json but
 /// the `describe_metrics()` fn forgot to mention it" — the metric
 /// scrapes with no `# HELP` line, Grafana tooltips empty.
 ///
@@ -427,8 +427,8 @@ pub fn assert_spec_metrics_described(spec_metrics: &[&str], describe_fn: fn(), c
 /// `describe_*!` calls fired by `describe_fn`.
 ///
 /// Emit→describe direction: catches "someone added
-/// `metrics::counter!("new_thing")` deep in a handler but forgot both
-/// the `describe_*!` AND the observability.typ row" — P0214's
+/// `metrics::counter!("new_thing")` deep in a handler but forgot
+/// the `describe_*!` (which populates docs/gen/metrics.json)" — P0214's
 /// `rio_scheduler_build_timeouts_total` did exactly this and sailed
 /// through the spec→describe check (which only knows what's IN the
 /// spec list).
