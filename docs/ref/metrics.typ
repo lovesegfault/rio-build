@@ -2,8 +2,6 @@
 
 #show: rio.with(domains: none)
 
-= Metric Reference
-
 Full per-component metric inventory. Naming convention, label rules,
 leader-gating, and histogram bucket policy are specified normatively in
 #xref(label("r-obs.metric.gateway"), [Observability §Metrics]).

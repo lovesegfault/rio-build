@@ -4,7 +4,7 @@
 The global artifact store. Two-layer design inspired by tvix's castore/store
 split.
 
-= Layer 1: Chunk Store (content-addressed blobs)
+== Layer 1: Chunk Store (content-addressed blobs)
 
 #r("store.cas.fastcdc")[
   - NAR archives are split into chunks using FastCDC (content-defined chunking)

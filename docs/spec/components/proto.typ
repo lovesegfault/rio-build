@@ -1,8 +1,6 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: ("proto",))
 
-= rio-proto
-
 Internal gRPC APIs between components + external API for tooling.
 
 == Transport

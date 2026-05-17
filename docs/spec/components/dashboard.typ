@@ -1,8 +1,6 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: ("dash",))
 
-= rio-dashboard
-
 _Web dashboard for operational visibility. Svelte 5 SPA, in-process tonic-web
 on the scheduler, Cilium Gateway API ingress, @dag visualization via
 `@xyflow/svelte`._

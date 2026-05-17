@@ -1,8 +1,6 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: none)
 
-= Capacity Planning
-
 This page provides resource sizing guidance for rio-build deployments. All estimates are approximate and should be validated against actual workload data.
 
 = PostgreSQL Storage

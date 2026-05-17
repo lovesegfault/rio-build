@@ -3,7 +3,7 @@
 
 This guide covers deploying rio-build to a Kubernetes cluster. For development, see #cross-link("/contributing.typ")[Contributing].
 
-= Prerequisites
+== Prerequisites
 
 - Kubernetes 1.33+ (EKS, GKE, or self-managed) --- required for user namespace isolation (`hostUsers: false`), see #cross-link("/spec/system/security.typ")[Security §Rationale]
 - PostgreSQL 15+ (managed service recommended: RDS, Cloud SQL, or CloudNativePG). Aurora/RDS PG 15+ have `rds.force_ssl=1` by default --- the connection string must include `?sslmode=require` (sqlx has `tls-rustls-aws-lc-rs` enabled for this)

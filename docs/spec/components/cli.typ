@@ -1,8 +1,6 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: ("cli",))
 
-= rio-cli
-
 Admin CLI for rio-build. Thin wrapper over `AdminService` (scheduler) and
 `StoreAdminService` (store) gRPC. Run locally via
 `cargo xtask k8s cli -- <cmd>` (port-forwards + service-HMAC key fetch). NOT

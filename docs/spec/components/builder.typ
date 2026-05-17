@@ -1,8 +1,6 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: ("builder",))
 
-= rio-builder
-
 One-shot process in a K8s Job pod that executes a single derivation, then
 exits.
 

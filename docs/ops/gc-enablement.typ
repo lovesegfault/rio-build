@@ -1,8 +1,6 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: none)
 
-= GC Enablement Checklist
-
 GC mark-and-sweep deletes paths with no reachable references. Before enabling GC on a cluster, verify reference data is correct.
 
 = Prerequisites (must be true before enabling GC)

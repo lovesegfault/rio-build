@@ -2,7 +2,7 @@
 
 #show: rio.with(domains: none)
 
-= Overview
+== Overview
 
 #figure(
   caption: [System overview --- layered request path. Clients speak the Nix

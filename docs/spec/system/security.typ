@@ -1,7 +1,7 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: ("sec", "common", "builder"))
 
-= Threat Model
+== Threat Model
 
 == Trust Boundaries
 

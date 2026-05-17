@@ -726,6 +726,15 @@
         attrs: (class: "rio-footnote"),
         [ (#it.body)],
       )
+      // Page <h1> from the chapter manifest title. Chapters carry no
+      // leading `= Title` of their own (docs-lint enforces); content
+      // starts at `==` or with prose. QA2-h1.
+      context {
+        let t = _chapter-nav().title
+        if t != "" {
+          html.elem("h1", attrs: (class: "rio-chapter-title"), t)
+        }
+      }
       it
       // QA #9/QA2-R3: prev/next chapter nav. mdbook's chrome.css
       // expects TWO blocks with `.previous`/`.next` children:
