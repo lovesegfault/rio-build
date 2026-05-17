@@ -26,6 +26,16 @@ rustPlatform.buildRustPackage {
     hash = "sha256-B6FnNatMyDJPLzm3KkkbB1Jg+XmjkCgl9z2t7ZCVNXs=";
   };
   cargoHash = "sha256-D9BLf8KBJ1nxsci+vkE1bVr9z40OZlq8Be/GVivsKfA=";
+  # assets/artifacts/svg_utils.js console.log()s "new svg util updated
+  # 37" on every page load. The file lives in the assets/artifacts
+  # SUBMODULE (Myriad-Dreamin/typst, upstream-owned) so a rio-pin commit
+  # can't carry it without forking the submodule too — patch post-fetch
+  # instead. The build-mode output strips the script tag entirely
+  # (nix/docs-svg-dedup.py); this is for `shiroa serve` dev-loop UX.
+  postPatch = ''
+    sed -i 's/console\.log("new svg util updated[^;]*;//' \
+      assets/artifacts/svg_utils.js
+  '';
   nativeBuildInputs = [ pkg-config ];
   buildInputs = [ openssl ];
   doCheck = false;

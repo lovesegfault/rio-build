@@ -237,6 +237,10 @@ rec {
         # the CSS attribute selectors are what's load-bearing — serve
         # mode has no post-process).
         ${pkgs.python3}/bin/python3 ${./docs-svg-dedup.py} $out
+        # Dyn-paged renderer assets — script tags are stripped by
+        # svg-dedup.py above (no .typst-doc elements in static-html);
+        # the files are now unreferenced. ~1.1MB.
+        rm -f $out/internal/{shiroa.js,svg_utils.js,typst_ts_renderer_bg.wasm}
         # Static assets shiroa doesn't generate (404.html). print.html
         # is intentionally absent — `nix build .#docs-pdf` is the print
         # equivalent (shiroa-mdbook hardcodes print-enable=false anyway).
@@ -325,9 +329,10 @@ rec {
       if grep -q 'pp\.' glossary.html; then
         echo "FAIL: glossary.html has 'pp.' page-backrefs (QA2-D)" >&2; exit 1
       fi
-      # QA4-#9: no duplicate <defs id="glyph"> (svg-dedup strips it).
-      if grep -rq 'id="glyph"' .; then
-        echo 'FAIL: <defs id="glyph"> present (svg-dedup not run? QA4-#9)' >&2; exit 1
+      # QA4-#9/QA5-B: no duplicate <defs id="glyph">/<defs id="clip-path">,
+      # no /internal/shiroa.js (svg-dedup strips all three).
+      if grep -rqE 'id="glyph"|id="clip-path"|/internal/shiroa\.js' .; then
+        echo 'FAIL: <defs id="glyph|clip-path"> or shiroa.js ref present (svg-dedup not run?)' >&2; exit 1
       fi
       # QA4-B output-level guards: title-dup show-rule removed +
       # range-limited promote applied. deployment.typ §3 reappears (was

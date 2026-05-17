@@ -47,11 +47,33 @@ for f in pathlib.Path(sys.argv[1]).rglob("*.html"):
     # post-process). stroke covers fraction bars/radicals/arrows.
     out = out.replace(b'fill="#000000"', b'fill="currentColor"')
     out = out.replace(b'stroke="#000000"', b'stroke="currentColor"')
-    # typst emits <defs id="glyph"> per html.frame(); the id is unused
-    # (no #glyph references) and duplicates across frames. Strip it.
-    # (Per-frame <symbol> dups are serve-only; the hoist above handles
-    # them in build.)
+    # typst emits <defs id="glyph"> / <defs id="clip-path"> per
+    # html.frame(); the wrapper ids are unused (refs go to the inner
+    # <symbol id="gHEX"> / <clipPath id="cHEX">, never #glyph or
+    # #clip-path) and duplicate across frames. Strip them.
     out = out.replace(b'<defs id="glyph">', b"<defs>")
+    out = out.replace(b'<defs id="clip-path">', b"<defs>")
+    # Dyn-paged renderer plumbing — useless in --mode static-html (no
+    # .typst-doc elements; html.frame() emits final SVG). shiroa.js
+    # polls /heartbeat (404 spam under miniserve); svg_utils.js
+    # console.log()s on load then no-ops; the wasm-init inline script
+    # (matched by its base64 prefix = `window.typstRerender `) fetches
+    # a 1MB wasm and waits on shiroa-js load. Strip the two file refs;
+    # reduce wasm-init to just the no-op stubs index.js calls
+    # (typstRerender on theme switch / sidebar resize).
+    out = re.sub(
+        rb'<script src="[^"]*/internal/shiroa\.js"[^>]*></script>\s*', b"", out
+    )
+    out = re.sub(
+        rb'<script src="[^"]*/internal/svg_utils\.js"[^>]*>\s*</script>\s*', b"", out
+    )
+    out = re.sub(
+        rb'<script src="data:application/javascript;base64,'
+        rb'd2luZG93LnR5cHN0UmVyZW5kZXIg[^"]*">\s*</script>',
+        b"<script>window.typstRerender=()=>{};"
+        b"window.typstChangeTheme=()=>{};</script>",
+        out,
+    )
     if out != src:
         f.write_bytes(out)
         total = len(seen) + len(SYM.findall(src)) - len(seen)  # = original count
