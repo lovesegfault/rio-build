@@ -26,8 +26,19 @@
     edge(<cl>, <gw>, "-|>", [SSH], label-size: 0.8em),
     edge(<gw>, <sched>, "-|>", [gRPC], label-size: 0.8em),
     edge(<sched>, <store>, "-|>", [gRPC], label-size: 0.8em),
-    edge(<ex>, <store>, "-|>", [gRPC], label-size: 0.8em),
-    edge(<ex>, <sched>, "-|>", [gRPC], label-size: 0.8em),
+    // QA4-#4: <ex>→<store> diagonal and <ex>→<sched> vertical both
+    // anchor labels at the <ex> vertex by default; label-side/pos
+    // separates them.
+    edge(
+      <ex>,
+      <store>,
+      "-|>",
+      [gRPC],
+      label-size: 0.8em,
+      label-side: right,
+      label-pos: 0.6,
+    ),
+    edge(<ex>, <sched>, "-|>", [gRPC], label-size: 0.8em, label-side: left),
     edge(<store>, <s3>, "-|>"),
     edge(<store>, <pg>, "-|>"),
     edge(<ex>, <sb>, "-|>"),
