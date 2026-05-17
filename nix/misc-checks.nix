@@ -322,7 +322,10 @@ in
           root = ../.;
           fileset = pkgs.lib.fileset.unions [
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs" || f.name == "Cargo.toml") ../.)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "nix" || f.hasExt "sh") ../nix)
+            # .json under nix/: the seccomp profiles carry prose `"//"`
+            # comments that reference spec markers + crate names — same
+            # drift surface as .nix/.sh.
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "nix" || f.hasExt "sh" || f.hasExt "json") ../nix)
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "ts") ../rio-dashboard)
             ../flake.nix
             ../CLAUDE.md
@@ -454,10 +457,12 @@ in
         # phrases (legitimately appear in code as historical context);
         # deny_cross adds case/separator variants needed for nix/infra
         # that would FP docs' "Squid FOD proxy is deleted" prose.
-        deny_shared='\bBuilderPool\b|\bFetcherPools?\b|rio-cli bps\b|`bps`|vm-lifecycle-bps|RIO_TLS__|\bTlsError\b|rio-common/src/tls\.rs|load_client_tls|init_client_tls|spec\.sizing|Sizing::|fuseCacheBudget|logBudget|migration-lock mechanism|trigger-gc|--grace-period-hours|mTLS client[- ]cert|mTLS cert mount|mTLS main port|VMs: mTLS|plaintext-health listener|TLS and plaintext ports|mTLS bypass|mTLS-identified|mTLS identifies|falls? back to mTLS|mTLS peer cert|\bplaintext port\b|CN-allowlist\)|\(gateway cert|dev-mode/dev-mode|TLS is env-only|\bTLS init\b|without relying on service tokens|replacement for the service-HMAC|RIO_JWT_SIGNING_KEY_PATH|rio\.jwt(Verify|Sign)Env|worker\.seccomp|`tls` / `metrics_addr`'
+        deny_shared='\bBuilderPool\b|\bFetcherPools?\b|rio-cli bps\b|`bps`|vm-lifecycle-bps|RIO_TLS__|\bTlsError\b|rio-common/src/tls\.rs|load_client_tls|init_client_tls|spec\.sizing|Sizing::|fuseCacheBudget|logBudget|migration-lock mechanism|trigger-gc|--grace-period-hours|mTLS client[- ]cert|mTLS cert mount|mTLS main port|VMs: mTLS|plaintext-health listener|TLS and plaintext ports|mTLS bypass|mTLS-identified|mTLS identifies|falls? back to mTLS|mTLS peer cert|\bplaintext port\b|CN-allowlist\)|\(gateway cert|dev-mode/dev-mode|TLS is env-only|\bTLS init\b|without relying on service tokens|replacement for the service-HMAC|RIO_JWT_SIGNING_KEY_PATH|rio\.jwt(Verify|Sign)Env|worker\.seccomp|`tls` / `metrics_addr`|\brio-worker\b'
         deny_docs="$deny_shared|\bmTLS\b|fod-proxy|bundled into the scheduler|kubectl exec deploy/rio-scheduler -- rio-cli"
         deny_cross="$deny_shared|[Ff][Oo][Dd][- ]proxy"
-        if grep -rn -E "$deny_docs" $typSrc | grep -v 'glossary\.typ'; then
+        # builder.typ's "Formerly `rio-worker`" info-box is the rename
+        # record (deliberate); allowlist it for the rio-worker pattern.
+        if grep -rn -E "$deny_docs" $typSrc | grep -vE 'glossary\.typ|builder\.typ:.*Formerly|builder\.typ:.*r\[worker'; then
           echo "FAIL: retired identifier in docs — see deny-list in misc-checks.nix" >&2
           fail=1
         fi

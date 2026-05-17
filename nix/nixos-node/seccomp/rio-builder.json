@@ -491,7 +491,7 @@
       "action": "SCMP_ACT_ALLOW"
     },
     {
-      "//": "amd64-specific (arch_prctl: TLS setup; modify_ldt: segment descriptors). rio-worker deploys on x86_64-linux + aarch64-linux; include both arch sets unconditionally — the kernel ignores syscalls not defined for the running arch.",
+      "//": "amd64-specific (arch_prctl: TLS setup; modify_ldt: segment descriptors). rio-builder deploys on x86_64-linux + aarch64-linux; include both arch sets unconditionally — the kernel ignores syscalls not defined for the running arch.",
       "names": [
         "arch_prctl",
         "modify_ldt"

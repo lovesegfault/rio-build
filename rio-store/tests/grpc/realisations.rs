@@ -251,7 +251,7 @@ async fn register_realisation_requires_service_caller() -> TestResult {
     r2.drv_hash = vec![0xCC; 32];
     let err = s
         .client
-        .register_realisation(register_req_with_service_token(r2, "rio-worker"))
+        .register_realisation(register_req_with_service_token(r2, "rio-intruder"))
         .await
         .expect_err("non-allowlisted caller → permission_denied");
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
