@@ -188,17 +188,17 @@
   `rio-store/src/grpc/{put_path/,admin.rs}`, `rio-scheduler/src/admin/mod.rs`.
 ]
 
-#r("sec.jwt.pubkey-mount")[
+#r("sec.jwt.pubkey-mount+2")[
   When `jwt.enabled=true`, scheduler and store pods MUST have the
   `rio-jwt-pubkey` ConfigMap mounted at `/etc/rio/jwt/ed25519_pubkey` and
   `RIO_JWT__KEY_PATH` set to that path. Without the mount, `cfg.jwt.key_path`
   remains `None` and the interceptor falls through to inert mode (every RPC
   passes, no `Claims` attached) --- a silent fail-open. The gateway
   correspondingly mounts the `rio-jwt-signing` Secret at
-  `/etc/rio/jwt/ed25519_seed`. Helm `_helpers.tpl` provides
-  `rio.jwtVerifyEnv`/`VolumeMount`/`Volume` and
-  `rio.jwtSignEnv`/`VolumeMount`/`Volume` triplets, self-guarded on
-  `.Values.jwt.enabled`.
+  `/etc/rio/jwt/ed25519_seed`. Helm `_helpers.tpl` provides the
+  consolidated `rio.mounts` template (parameterized by
+  `form: env|mount|volume` and `want: list "jwtVerify" "jwtSign" …`),
+  self-guarded on `.Values.jwt.enabled`.
 ]
 
 === Boundary 3: Executor → Nix Sandbox
@@ -478,10 +478,11 @@ Cilium overlay layer.
     [Implemented --- `RIO_HMAC_KEY_PATH`, same key file both sides],
 
     [HMAC signing key (service tokens)],
-    [Gateway + Store],
+    [Controller, CLI, Scheduler, Gateway (mint); Scheduler, Store (verify)],
     [Annually or on compromise],
-    [Implemented --- `RIO_SERVICE_HMAC_KEY_PATH`; gateway signs, store
-      verifies],
+    [Implemented --- `RIO_SERVICE_HMAC_KEY_PATH`; minters {controller, cli,
+      scheduler, gateway}, verifiers {scheduler `AdminService`, store
+      `StoreAdminService`}],
 
     [JWT signing key (tenant tokens)#footnote[
         The gateway mints a per-session JWT on SSH accept (`mint_session_jwt`,
@@ -492,8 +493,8 @@ Cilium overlay layer.
       ]],
     [Gateway],
     [Annually; SIGHUP reload for zero-downtime],
-    [Implemented --- `RIO_JWT_SIGNING_KEY_PATH`, gateway mints per-session JWT
-      on SSH accept],
+    [Implemented --- `RIO_JWT__KEY_PATH`, gateway mints per-session JWT on SSH
+      accept],
 
     [Database credentials (`database_url`)],
     [Scheduler, Store, Controller],

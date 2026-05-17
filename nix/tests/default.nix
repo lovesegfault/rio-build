@@ -664,7 +664,7 @@ in
   vm-lifecycle-core-k3s = lifecycleMod.mkTest {
     name = "core";
     subtests = [
-      # r[verify sec.jwt.pubkey-mount]
+      # r[verify sec.jwt.pubkey-mount+2]
       #   jwt-mount-present: scheduler+store have rio-jwt-pubkey ConfigMap
       #   at /etc/rio/jwt; gateway has rio-jwt-signing Secret. Placed
       #   FIRST — pure precondition check, no pod disruption, ~5s.

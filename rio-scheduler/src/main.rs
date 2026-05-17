@@ -520,7 +520,7 @@ async fn main() -> anyhow::Result<()> {
     let listen_addr = cfg.listen_addr;
     let max_message_size = rio_common::grpc::max_message_size();
 
-    // r[impl sec.jwt.pubkey-mount]
+    // r[impl sec.jwt.pubkey-mount+2]
     // JWT pubkey from ConfigMap mount (if configured) + SIGHUP reload
     // loop. kubelet remounts the ConfigMap on rotation; operator
     // SIGHUPs the pod; the spawned reload task re-reads + swaps the
