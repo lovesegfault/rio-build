@@ -277,9 +277,9 @@ rec {
         # and the docs path are baked in; everything else (port,
         # interface, auth, tls) passes through, e.g., `nix run .#docs --
         # -p 9000 -i 0.0.0.0`. miniserve's default port is 8080. This
-        # serves the nix-built output (4.4MB sla-sizing, currentColor
-        # eqs, deduped symbols, 404.html) — the dev-loop `shiroa serve`
-        # sees none of those post-process steps.
+        # serves the nix-built output (4.4MB sla-sizing, deduped
+        # symbols, dyn-render JS stripped, 404.html) — the dev-loop
+        # `shiroa serve` sees none of those post-process steps.
         mkdir -p $bin/bin
         makeWrapper ${pkgs.miniserve}/bin/miniserve $bin/bin/rio-docs \
           --add-flags "--index index.html" \

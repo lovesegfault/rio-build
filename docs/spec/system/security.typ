@@ -180,8 +180,9 @@
   arbitrary executors, set @sla overrides to bias the solver fleet-wide,
   un-poison quarantined derivations, or inject attacker-keyed upstream caches
   into another tenant's substitution path. Callers (rio-controller, rio-cli,
-  rio-scheduler) mint `caller="<self>"` per request via
-  `ServiceTokenInterceptor`; the verifier checks against a per-RPC allowlist.
+  rio-scheduler, rio-gateway, rio-dashboard) mint `caller="<self>"` per request
+  via `ServiceTokenInterceptor`; the verifier checks against a per-RPC
+  allowlist.
   The canonical mutating-RPC list is the `mutating_rpcs_require_service_token`
   test. This replaces the former certificate-CN check and is
   transport-agnostic. See `rio_auth::hmac::ensure_service_caller`,
@@ -477,12 +478,16 @@ Cilium overlay layer.
     [Annually or on compromise],
     [Implemented --- `RIO_HMAC_KEY_PATH`, same key file both sides],
 
+    // Derived from `rg 'HmacSigner::load' rio-*/src/` (Rust minters)
+    // + helm `rio-service-hmac` mounts (dashboard); verifiers from
+    // `rg 'ensure_service_caller|service_verifier' rio-*/src/`.
     [HMAC signing key (service tokens)],
-    [Controller, CLI, Scheduler, Gateway (mint); Scheduler, Store (verify)],
+    [Controller, CLI, Scheduler, Gateway, Dashboard (mint); Scheduler, Store
+      (verify)],
     [Annually or on compromise],
     [Implemented --- `RIO_SERVICE_HMAC_KEY_PATH`; minters {controller, cli,
-      scheduler, gateway}, verifiers {scheduler `AdminService`, store
-      `StoreAdminService`}],
+      scheduler, gateway, dashboard}, verifiers {scheduler `AdminService`,
+      store `StoreAdminService` + `PutPath`}],
 
     [JWT signing key (tenant tokens)#footnote[
         The gateway mints a per-session JWT on SSH accept (`mint_session_jwt`,

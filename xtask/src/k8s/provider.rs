@@ -127,9 +127,10 @@ pub trait Provider: Send + Sync {
     )>;
 
     /// Fetch a Secret's data key from the rio-system namespace.
-    /// `None` if the Secret or key is absent (dev cluster without
-    /// HMAC). Default impl creates a fresh kube client; the phases.rs
-    /// test mock returns `Ok(None)`.
+    /// `None` if the Secret is absent (dev cluster without HMAC); a
+    /// Secret that exists but lacks `key` hard-errors. Default impl
+    /// creates a fresh kube client; the phases.rs test mock returns
+    /// `Ok(None)`.
     async fn secret_bytes(&self, name: &str, key: &str) -> Result<Option<Vec<u8>>> {
         super::shared::secret_bytes(name, key).await
     }

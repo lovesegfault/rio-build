@@ -4,7 +4,7 @@
 
 rio-build uses TOML configuration files with environment variable overrides.
 Each component reads its own config file. Environment variables use the `RIO_`
-prefix with `__` for nesting (e.g., `RIO_STORE__CHUNK_BACKEND=s3`).
+prefix with `__` for nesting (e.g., `RIO_CHUNK_BACKEND__KIND=s3`).
 
 Precedence (highest to lowest): CLI flags > environment variables > config
 file > compiled defaults.
@@ -139,9 +139,13 @@ main port directly.
   columns: 2,
   table.header([Env var], [Description]),
   [`RIO_SERVICE_HMAC_KEY_PATH`],
-  [Service-token HMAC key (raw bytes). Gateway signs `x-rio-service-token`;
-    store verifies. Separate from the assignment-token key. See
-    `r[sec.authz.service-token]`.],
+  // Derived from `rg 'HmacSigner::load' rio-*/src/` + helm
+  // `rio-service-hmac` mounts; keep in sync with security.typ's
+  // §Service-token-bypass + Secret Inventory row.
+  [Service-token HMAC key (raw bytes). Minters {controller, cli, scheduler,
+    gateway, dashboard} sign `x-rio-service-token`; verifiers {scheduler
+    `AdminService`, store `StoreAdminService` + `PutPath`}. Separate from the
+    assignment-token key. See `r[sec.authz.service-token]`.],
 
   [`RIO_DASHBOARD__CORS_ALLOW_ORIGINS`],
   [(scheduler) Comma-separated CORS allowed origins for gRPC-Web. Defaults to

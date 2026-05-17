@@ -24,10 +24,11 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-nix
-      # Enables Pages on the repo if not already and surfaces base-url
-      # metadata that deploy-pages reads. We don't consume base_path
-      # (docs use root-relative links), but the deploy step expects
-      # the artifact to have been produced under a configured run.
+      # Surfaces base-url metadata that deploy-pages reads. We don't
+      # consume base_path (docs use root-relative links), but the
+      # deploy step expects the artifact to have been produced under a
+      # configured run. (Does NOT enable Pages — no `enablement: true`
+      # and the build job has no `pages: write`.)
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
       # `result` is the .out output (post-processed HTML tree —
       # symbol-dedup, dyn-render JS strip, 404.html). The .bin output
