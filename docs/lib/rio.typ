@@ -597,8 +597,7 @@
   .rio-clue-tip { border-color: #1a7f37; background: #dafbe1; }
   .rio-clue-idea { border-color: #8250df; background: #fbefff; }
   .rio-footnote { color: #656d76; font-size: 0.9em; }
-  .nav-wrapper { display: flex; justify-content: space-between; margin-top: 2em;
-                 padding-top: 1em; border-top: 1px solid var(--quote-border, #d0d7de); }
+  .rio-chapter-title { margin: 0 0 1em 0; font-size: 2em; }
   /* QA #7: dark-theme diagram contrast. cetz output carries explicit
      fill/stroke; can't recolor via typst show-rules. CSS filter
      approximates a dark variant. Imperfect (hue-rotate shifts blues),
@@ -728,30 +727,37 @@
         [ (#it.body)],
       )
       it
-      // QA #9: prev/next chapter nav (mdbook-style). Same
-      // _chapter-nav() traversal that feeds <title> above.
+      // QA #9/QA2-R3: prev/next chapter nav. mdbook's chrome.css
+      // expects TWO blocks with `.previous`/`.next` children:
+      //   .nav-wrapper      — mobile bottom buttons (display:none on
+      //                        desktop, @media ≤1080px shows it)
+      //   .nav-wide-wrapper — desktop floating side arrows
+      // cross-link wraps in <a> but doesn't pass attrs through, so put
+      // the chrome.css class on an inner span.
       context {
         let nav = _chapter-nav()
         if nav.prev != none or nav.next != none {
+          let nav-link(ch, cls, body) = if ch != none {
+            cross-link("/" + ch.path, html.elem(
+              "span",
+              attrs: (class: cls),
+              body,
+            ))
+          }
           html.elem(
             "nav",
             attrs: (class: "nav-wrapper", aria-label: "Page navigation"),
             {
-              if nav.prev != none {
-                cross-link("/" + nav.prev.path, html.elem(
-                  "span",
-                  attrs: (class: "nav-prev"),
-                  [← #nav.prev.title],
-                ))
-              }
-              [ ]
-              if nav.next != none {
-                cross-link("/" + nav.next.path, html.elem(
-                  "span",
-                  attrs: (class: "nav-next"),
-                  [#nav.next.title →],
-                ))
-              }
+              nav-link(nav.prev, "mobile-nav-chapters previous", [←])
+              nav-link(nav.next, "mobile-nav-chapters next", [→])
+            },
+          )
+          html.elem(
+            "nav",
+            attrs: (class: "nav-wide-wrapper", aria-label: "Page navigation"),
+            {
+              nav-link(nav.prev, "nav-chapters previous", [←])
+              nav-link(nav.next, "nav-chapters next", [→])
             },
           )
         }
