@@ -206,6 +206,14 @@ rec {
             "out"
             "bin"
           ];
+          # nixpkgs' multiple-outputs.sh defaults outputsToInstall to
+          # ["bin"] when a "bin" output exists, so `nix build .#docs`
+          # would symlink result→bin only (no HTML tree). Override so
+          # `result` is the HTML tree, `result-bin` the wrapper.
+          meta.outputsToInstall = [
+            "out"
+            "bin"
+          ];
           nativeBuildInputs = [
             shiroaPkg
             rioTypst
@@ -241,10 +249,26 @@ rec {
         # svg-dedup.py above (no .typst-doc elements in static-html);
         # the files are now unreferenced. ~1.1MB.
         rm -f $out/internal/{shiroa.js,svg_utils.js,typst_ts_renderer_bg.wasm}
-        # Static assets shiroa doesn't generate (404.html). print.html
-        # is intentionally absent — `nix build .#docs-pdf` is the print
-        # equivalent (shiroa-mdbook hardcodes print-enable=false anyway).
-        cp ${../docs/dist-static}/*.html $out/
+        # 404.html — derive from intro.html (chrome, sidebar, theme
+        # switcher, all CSS/JS) by replacing <title> + <main>. shiroa
+        # has no hidden-chapter mechanism (a `#chapter("404.typ")` would
+        # appear in the sidebar), and a hand-written stub can't pick up
+        # the inlined data:uri CSS — deriving from a built page gets
+        # full theme-awareness for free. print.html is intentionally
+        # absent — `nix build .#docs-pdf` is the print equivalent
+        # (shiroa-mdbook hardcodes print-enable=false anyway).
+        awk '
+          /<title>/ { sub(/<title>[^<]*<\/title>/,
+                          "<title>Not Found – rio-build design book</title>") }
+          /<main>/ { in_main=1
+                     print "            <main>"
+                     print "              <h1 class=\"rio-chapter-title\">Not Found</h1>"
+                     print "              <p>The page you are looking for does not exist.</p>"
+                     print "              <p><a href=\"/\">← rio-build design book</a></p>"
+                     next }
+          /<\/main>/ && in_main { in_main=0 }
+          !in_main { print }
+        ' $out/intro.html > $out/404.html
         # `nix run .#docs` → serve the post-processed tree. Only --index
         # and the docs path are baked in; everything else (port,
         # interface, auth, tls) passes through, e.g., `nix run .#docs --
