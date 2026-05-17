@@ -596,7 +596,12 @@
   .inline-equation svg [stroke="#000000"],
   .block-equation svg [stroke="#000000"] { stroke: currentColor; }
   .rio-figure { display: block; text-align: center; overflow-x: auto; margin: 1.2em 0; }
-  .rio-frame svg { max-width: none; }   /* QA #4: don't shrink wide diagrams; let the wrapper scroll */
+  /* typst's html.frame emits inline `style="width: Nem"` (em at the
+     typst font-size, ~10.5pt) alongside `width="Npt"`. At the page's
+     16px/em that overshoots ~14%. Clamp to column width; height:auto
+     keeps aspect ratio. (The earlier `max-width: none` was for the
+     2051px crate-structure graph, since redrawn to 455px.) */
+  .rio-frame > svg { max-width: 100%; height: auto; }
   .rio-figure figcaption { font-size: 0.92em; margin-top: 0.6em; }
   .rio-table { overflow-x: auto; max-width: 100%; }   /* QA #5 */
   /* QA4-#5: scroll affordance for wide figures/tables. macOS auto-hides
@@ -651,6 +656,11 @@
      Without an explicit left anchor the arrow lands at <main>'s left
      edge and intercepts clicks across a 90px strip. */
   .nav-wide-wrapper .previous { left: var(--page-padding); }
+  /* The .previous fixed arrow at left:15px sits in the same x-range
+     as the open sidebar; without an explicit z-index the later-in-DOM
+     .nav-chapters paints above. mdBook's chrome.css normally sets
+     this; shiroa-mdbook's copy doesn't. */
+  .sidebar { z-index: 10; }
   /* Copy-to-clipboard button (rio-js below adds it to each <pre>). */
   .rio-copy { position: absolute; top: .5em; right: .5em; padding: .2em .5em;
               border: 1px solid var(--icons); border-radius: 3px;
