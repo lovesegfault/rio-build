@@ -194,9 +194,9 @@ pkgs.testers.runNixOSTest {
         # seccompProfile: vmtest-full-nonpriv inherits the chart
         # default (Localhost), which the controller renders as
         # POD-level RuntimeDefault + CONTAINER-level Localhost
-        # (security.typ worker.seccomp.localhost-profile). The pod
+        # (security.typ builder.seccomp.localhost-profile). The pod
         # sandbox doesn't need pivot_root; enforcement is on the
-        # worker container.
+        # builder container.
         pod_sc = pod["spec"].get("securityContext", {})
         seccomp = pod_sc.get("seccompProfile", {})
         assert seccomp.get("type") == "RuntimeDefault", (

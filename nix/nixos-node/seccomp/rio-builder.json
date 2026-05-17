@@ -1,5 +1,5 @@
 {
-  "//": "rio-worker seccomp profile (Localhost). See docs/spec/system/security.typ r[worker.seccomp.localhost-profile].",
+  "//": "rio-builder seccomp profile (Localhost). See docs/spec/system/security.typ r[builder.seccomp.localhost-profile].",
   "//provenance": "Derived from Docker/moby default.json v27.5.1 (RuntimeDefault equivalent), flattened to OCI runtime spec format for the worker cap set (CAP_SYS_ADMIN + CAP_SYS_CHROOT). The Docker profile uses includes/excludes preprocessing which is Docker-specific; kubelet Localhost profiles are consumed by runc/crun which expect the OCI LinuxSeccomp format. Flattening: resolve the conditional blocks for the capabilities the worker actually has, drop the rest.",
   "//denied": "ptrace, bpf, setns, process_vm_readv, process_vm_writev — absent from ALL allow blocks, so defaultAction=ERRNO(EPERM) applies. Under RuntimeDefault these ARE allowed: ptrace/process_vm_* via the minKernel:4.8 block (always active on modern kernels), bpf/setns via the CAP_SYS_ADMIN block (worker has that cap). A sandbox escape inside the worker would have these tools; this profile takes them away.",
   "//why-each": {

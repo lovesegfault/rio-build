@@ -527,7 +527,7 @@ async fn main() -> anyhow::Result<()> {
     // Arc<RwLock> the interceptor closure captured below.
     //
     // cfg.jwt.key_path is set via RIO_JWT__KEY_PATH env, itself set by
-    // helm _helpers.tpl (rio.jwtVerifyEnv/VolumeMount/Volume) when
+    // helm _helpers.tpl (`rio.mounts` with want=jwtVerify) when
     // .Values.jwt.enabled. Without the mount → key_path stays None →
     // interceptor inert → silent fail-open. The helm triplet is the
     // real impl; this marker is the Rust-side anchor tracey can see.

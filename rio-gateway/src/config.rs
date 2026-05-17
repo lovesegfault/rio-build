@@ -31,9 +31,9 @@ pub struct Config {
     pub host_key: std::path::PathBuf,
     /// Authorized SSH public keys file path. Required.
     pub authorized_keys: std::path::PathBuf,
-    /// Shared `tls` / `metrics_addr` / `drain_grace` fields. Flattened
-    /// so the wire format (TOML keys, env var names) is unchanged from
-    /// when they were direct fields.
+    /// Shared `metrics_addr` / `drain_grace` fields. Flattened so the
+    /// wire format (TOML keys, env var names) is unchanged from when
+    /// they were direct fields.
     #[serde(flatten)]
     pub common: rio_common::config::CommonConfig,
     /// gRPC health check listen address. The gateway's main protocol is

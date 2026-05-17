@@ -82,8 +82,8 @@ pub fn tonic_builder() -> tonic::transport::Server {
 /// [`CommonConfig`]. Every binary's `Config` carries
 /// `#[serde(flatten)] common: CommonConfig`; this trait names that
 /// field so [`bootstrap`] (which loads the full `Config` via figment)
-/// can read the shared `tls` / `metrics_addr` / `drain_grace` without
-/// knowing the concrete type.
+/// can read the shared `metrics_addr` / `drain_grace` without knowing
+/// the concrete type.
 ///
 /// `metric_labels` is a method (not a `CommonConfig` field) because
 /// it's derived at runtime from other config — rio-builder computes
