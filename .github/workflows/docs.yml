@@ -1,0 +1,54 @@
+name: docs
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# id-token: build job needs OIDC for niks3-push; deploy job needs OIDC
+# for Pages. pages:write is scoped to the deploy job only.
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  NIKS3_URL: http://niks3.niks3.svc.cluster.local:5751
+
+jobs:
+  build:
+    runs-on: rio-ci
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: ./.github/actions/setup-nix
+      # Enables Pages on the repo if not already and surfaces base-url
+      # metadata that deploy-pages reads. We don't consume base_path
+      # (docs use root-relative links), but the deploy step expects
+      # the artifact to have been produced under a configured run.
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      # `result` is the .out output (post-processed HTML tree —
+      # symbol-dedup, dyn-render JS strip, 404.html). The .bin output
+      # (miniserve wrapper) isn't built or needed here.
+      - run: nix build .#docs --print-build-logs
+      - uses: ./.github/actions/niks3-push
+        if: always() && !cancelled()
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: result
+
+  deploy:
+    needs: build
+    # Pages deploy is a pure API call — doesn't need rio-ci.
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
