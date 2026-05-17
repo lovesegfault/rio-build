@@ -174,8 +174,15 @@
   },
 )
 
-// Right-aligned italic annotation for pseudocode lines.
-#let rann(body) = {
+// Right-aligned italic annotation for pseudocode lines. Right-aligned
+// in PDF (h(1fr) needs container width); below-line in HTML
+// (html.frame() has no width to push against, and below-line reflows
+// at any viewport — width-independent, so the 560pt box stays). QA2-C.
+#let rann(body) = if is-html-target() {
+  linebreak()
+  h(2em)
+  text(size: 0.85em, style: "italic", fill: muted, body)
+} else {
   h(1fr)
   text(size: 0.85em, style: "italic", body)
 }
