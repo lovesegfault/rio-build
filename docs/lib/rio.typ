@@ -83,7 +83,7 @@
 // ─── shiroa html-frame theming ──────────────────────────────────────
 // Figures and equations both render as inline SVG via html.frame().
 // Neither dual-renders anymore — figures recolor via CSS
-// `filter: invert()` (.rio-figure svg) and equations via
+// `filter: invert()` (.rio-frame svg) and equations via
 // `currentColor`: they emit at sentinel fill/stroke="#000000" and the
 // CSS attribute selectors at `.inline-equation svg [fill="#000000"]`
 // override them to `currentColor` so `.inline-equation svg
@@ -588,7 +588,7 @@
   /* serve mode has no post-process; the inline fill/stroke="#000000"
      stays literal. Attribute-selector override makes equation glyphs
      and strokes (fraction bars, radicals) track `color:` in BOTH serve
-     and build. NOT applied to .rio-figure svg — those use the
+     and build. NOT applied to .rio-frame svg — those use the
      `filter: invert()` dark-theme path; recolouring would double-apply.
      The post-process is now size-only, not load-bearing. QA2-R1. */
   .inline-equation svg [fill="#000000"],
@@ -596,7 +596,7 @@
   .inline-equation svg [stroke="#000000"],
   .block-equation svg [stroke="#000000"] { stroke: currentColor; }
   .rio-figure { display: block; text-align: center; overflow-x: auto; margin: 1.2em 0; }
-  .rio-figure svg { max-width: none; }   /* QA #4: don't shrink wide diagrams; let the wrapper scroll */
+  .rio-frame svg { max-width: none; }   /* QA #4: don't shrink wide diagrams; let the wrapper scroll */
   .rio-figure figcaption { font-size: 0.92em; margin-top: 0.6em; }
   .rio-table { overflow-x: auto; max-width: 100%; }   /* QA #5 */
   .rio-req { border-left: 3px solid #d0d7de; padding: 0.5em 0 0.5em 1em; margin: 1em 0; }
@@ -615,7 +615,7 @@
      approximates a dark variant. Imperfect (hue-rotate shifts blues),
      but far better than black-on-dark. Option (b) #themed-figure(builder)
      deferred. */
-  .ayu .rio-figure svg, .navy .rio-figure svg, .coal .rio-figure svg {
+  .ayu .rio-frame svg, .navy .rio-frame svg, .coal .rio-frame svg {
     filter: invert(0.87) hue-rotate(180deg);
   }
   /* QA #8: dark-theme clue/req-id contrast. */
@@ -757,9 +757,13 @@
           box(width: 560pt, fig.body)
         } else { fig.body }
         // Single-variant render — dark themes recolor via CSS filter
-        // (.ayu/.navy/.coal .rio-figure svg below).
+        // (.ayu/.navy/.coal .rio-frame svg below). .rio-frame scopes
+        // the invert filter to the diagram SVG only — figcaption
+        // inline-eq SVGs and figure(kind: table) body cells are
+        // .rio-figure children but NOT .rio-frame; they're
+        // currentColor-recoloured and must not be inverted. QA4-#1.
         html.elem("figure", attrs: (class: "rio-figure"), {
-          html.elem("div", html.frame(body))
+          html.elem("div", attrs: (class: "rio-frame"), html.frame(body))
           if fig.caption != none {
             html.elem("figcaption", fig.caption)
           }
