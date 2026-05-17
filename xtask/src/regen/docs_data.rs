@@ -637,9 +637,12 @@ fn walk_props(
     let Some(props) = schema.pointer("/properties").and_then(|v| v.as_object()) else {
         return;
     };
-    // Preserve declaration order: schemars 1.x walks struct fields in
-    // source order and serde_json's Map is insertion-ordered (we don't
-    // enable `preserve_order` but schemars does for its own output).
+    // Iteration order is alphabetical: schemars walks fields in source
+    // order but serde_json::Map (without `preserve_order`, which the
+    // workspace doesn't unify) is BTreeMap-backed. The committed
+    // config.json reflects this; nix/misc-checks.nix's docs-data-fresh
+    // jq-canonicalizes both sides for the same reason — see
+    // render_default() below.
     for (key, prop) in props {
         let dotted = if prefix.is_empty() {
             key.clone()

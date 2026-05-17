@@ -4,7 +4,7 @@
 
 rio-build uses TOML configuration files with environment variable overrides.
 Each component reads its own config file. Environment variables use the `RIO_`
-prefix with `__` for nesting (e.g., `RIO_STORE__INLINE_THRESHOLD=262144`).
+prefix with `__` for nesting (e.g., `RIO_STORE__CHUNK_BACKEND=s3`).
 
 Precedence (highest to lowest): CLI flags > environment variables > config
 file > compiled defaults.

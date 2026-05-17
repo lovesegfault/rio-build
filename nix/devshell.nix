@@ -77,10 +77,11 @@ let
       #
       # NOTE: `shiroa serve` output is NOT post-processed. The nix build
       # (`.#docs`) runs nix/docs-svg-dedup.py (glyph-sprite hoist,
-      # currentColor rewrite) and copies docs/dist-static/*.html. Under
-      # `serve` you'll see: sla-sizing.html ~10.5MB (vs ~4.4MB built);
-      # 404.html missing; refs.gh() links carry `gh-sha=dirty`. All
-      # cosmetic — `nix build .#docs` is the canonical output.
+      # currentColor rewrite, dyn-render JS strip) and derives 404.html
+      # from intro.html. Under `serve` you'll see: sla-sizing.html
+      # ~10.5MB (vs ~4.4MB built); 404.html missing; refs.gh() links
+      # carry `gh-sha=dirty`. All cosmetic — `nix build .#docs` is the
+      # canonical output.
       exec ${shiroaPkg}/bin/shiroa "$@"
     '')
     typstyle
