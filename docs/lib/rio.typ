@@ -800,34 +800,14 @@
           html.elem("h1", attrs: (class: "rio-chapter-title"), t)
         }
       }
-      // Suppress redundant chapter-title headings: some chapters carry
-      // a leading `= <ManifestTitle>` (e.g., `= rio-gateway`); the
-      // synthetic <h1> above already renders it. Match by normalized
-      // text so chapters whose first `=` is a real section
-      // (`= Overview`, `= Threat Model`) are left alone — their
-      // hierarchy stays intact under the synthetic <h1>. QA3: the
-      // earlier per-file migration (delete/demote the first `=`)
-      // flattened the `==` children into 0.x siblings.
-      show heading.where(level: 1): h => context {
-        let title = lower(_chapter-nav().title).trim()
-        let h-text = lower(plain-text(h.body)).trim()
-        // Match exact, OR `rio-<title>` form (`= rio-gateway` vs
-        // manifest `Gateway`), OR title is a prefix of the heading
-        // (`= GC Enablement Checklist` vs `GC Enablement`;
-        // `= EKS Smoke Test Runbook` vs `EKS Smoke Test`). title==""
-        // (no manifest entry — book.typ/book-pdf.typ itself, or a
-        // chapter not in the summary) → never suppress.
-        if (
-          title != ""
-            and (
-              h-text == title
-                or h-text == "rio-" + title
-                or h-text.starts-with(title + " ")
-            )
-        ) {
-          none // suppress; <h1 class="rio-chapter-title"> covers it
-        } else { h }
-      }
+      // Chapters do NOT carry a leading `= <Title>` heading — the
+      // synthetic <h1> above renders the manifest title; chapter body
+      // starts at level-1 sections (`= Responsibilities`, …). QA4-B:
+      // the QA3 show-rule suppression had three failure modes
+      // (false-positive prefix match ate `= Deployment Order`; H1→H3
+      // skip; §-starts-at-2); the 14 title-dup chapters are now
+      // source-migrated (range-limited promote) and docs-lint catches
+      // re-introduction.
       it
       // QA #9/QA2-R3: prev/next chapter nav. mdbook's chrome.css
       // expects TWO blocks with `.previous`/`.next` children:

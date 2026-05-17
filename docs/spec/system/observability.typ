@@ -1,16 +1,15 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: ("obs", "common", "sched"))
 
-= Observability
 
 rio-build provides three pillars of observability: logs, metrics, and traces.
 
-== Build Log Storage
+= Build Log Storage
 
 Build logs are stored durably for post-build analysis and the dashboard log
 viewer.
 
-=== Storage Format
+== Storage Format
 
 Build logs are stored in S3 as zstd-compressed blobs:
 
@@ -21,7 +20,7 @@ logs/{build_id}/{derivation_hash}.log.zst
 Metadata (byte offsets, timestamps, line counts) is stored in PostgreSQL for
 efficient seeking and pagination.
 
-=== Log Lifecycle
+== Log Lifecycle
 
 #r("obs.log.batch-64-100ms")[
   Log lines are batched (up to 64 lines or 100ms, whichever first) in
@@ -95,7 +94,7 @@ efficient seeking and pagination.
   planned.
 ]
 
-=== Log Serving
+== Log Serving
 
 #table(
   columns: (auto, 1fr),
@@ -106,12 +105,12 @@ efficient seeking and pagination.
   [Failed], [S3 blob (flushed on failure as well)],
 )
 
-== Metrics
+= Metrics
 
 Each component exposes a Prometheus-compatible `/metrics` endpoint via
 `metrics-exporter-prometheus`.
 
-=== Gateway Metrics
+== Gateway Metrics
 
 #r("obs.metric.gateway")[
   rio-gateway MUST expose the metrics in
@@ -119,7 +118,7 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
   MUST follow the `rio_gateway_*` naming prefix.
 ]
 
-=== Scheduler Metrics
+== Scheduler Metrics
 
 #r("obs.metric.scheduler")[
   rio-scheduler MUST expose the metrics in
@@ -145,7 +144,7 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
   `sum(rate(...))` is the idiomatic query form anyway.
 ]
 
-=== Store Metrics
+== Store Metrics
 
 #r("obs.metric.store")[
   rio-store MUST expose the metrics in
@@ -162,7 +161,7 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
   of the burst, and this gauge corrects the ratio when the prediction drifts.
 ]
 
-=== Builder Metrics
+== Builder Metrics
 
 #r("obs.metric.builder")[
   rio-builder MUST expose the metrics in
@@ -201,7 +200,7 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
   limit configured.
 ]
 
-=== Controller Metrics
+== Controller Metrics
 
 #r("obs.metric.consolidate-threshold")[
   #(refs.metric)("rio_controller_nodeclaim_consolidate_threshold_seconds")
@@ -218,7 +217,7 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
   metrics MUST follow the `rio_controller_*` naming prefix.
 ]
 
-=== Histogram Buckets
+== Histogram Buckets
 
 `metrics-exporter-prometheus` defaults to
 `[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]` --- tuned
@@ -266,7 +265,7 @@ Histograms not listed here (e.g.,
 #(refs.metric)("rio_store_put_path_duration_seconds")) use the default
 buckets --- those are genuinely sub-second request latencies.
 
-== Graceful Drain
+= Graceful Drain
 
 #r("common.drain.not-serving-before-exit")[
   On SIGTERM, each long-lived server MUST call `set_not_serving()` on its
@@ -297,12 +296,12 @@ The drain grace period is configurable via `drain_grace_secs` (default 6;
   `select!`.
 ]
 
-== Distributed Tracing
+= Distributed Tracing
 
 rio-build uses OpenTelemetry for distributed tracing with trace context
 propagation via gRPC metadata.
 
-=== Trace Structure
+== Trace Structure
 
 A typical build trace spans multiple components:
 
@@ -323,7 +322,7 @@ Build (gateway)
 └── Return result (gateway → client)
 ```
 
-=== Configuration
+== Configuration
 
 OTel config is read from environment variables (NOT figment) because
 `init_tracing()` runs before config parsing and must not depend on any
@@ -346,7 +345,7 @@ crate's config layout.
 The OTel `service.name` resource attribute is set automatically per component
 (gateway, scheduler, store, executor, controller) by `init_tracing()`.
 
-=== Concurrency tuning
+== Concurrency tuning
 
 Figment env-vars (`RIO_<FIELD>`) that bound fan-out at known saturation
 points. These interact multiplicatively --- the defaults are tuned together.
@@ -389,7 +388,7 @@ ingest, raise `RIO_S3_MAX_ATTEMPTS` first (cheap, retries absorb transient
 connection churn); lower `RIO_CHUNK_UPLOAD_MAX_CONCURRENT` only if retries
 don't clear it (reduces throughput).
 
-=== Trace Propagation
+== Trace Propagation
 
 #r("obs.trace.w3c-traceparent")[
   Trace context is propagated via gRPC metadata using the W3C `traceparent`
@@ -453,9 +452,9 @@ don't clear it (reduces throughput).
   to its own `current_trace_id_hex()`.
 ]
 
-== SLOs, SLIs, and Alerting
+= SLOs, SLIs, and Alerting
 
-=== Service Level Indicators (SLIs)
+== Service Level Indicators (SLIs)
 
 #table(
   columns: (auto, 1fr),
@@ -475,7 +474,7 @@ don't clear it (reduces throughput).
   [#(refs.metric)("rio_builder_builds_total") outcome=success / total],
 )
 
-=== Service Level Objectives (SLOs)
+== Service Level Objectives (SLOs)
 
 #table(
   columns: (1fr, auto),
@@ -487,7 +486,7 @@ don't clear it (reduces throughput).
   [Cache-hit latency (p99)], [< 1s],
 )
 
-=== Alerting
+== Alerting
 
 - *Error budget burn rate:* Alert when the error budget consumption rate
   exceeds 14.4x the allowed rate over 1h (fast burn) or 6x over 6h (slow
@@ -498,7 +497,7 @@ don't clear it (reduces throughput).
   (`HEARTBEAT_TIMEOUT_SECS=30` + ≤1 tick alignment). Indicates an executor
   has silently died or lost network connectivity.
 
-== Structured Logging
+= Structured Logging
 
 #r("obs.log.required-fields")[
   All components emit structured JSON logs via `tracing-subscriber` with the
@@ -548,7 +547,7 @@ Optional fields may be added per component as `tracing` span fields. All
 fields use snake_case. Missing context fields (e.g., `build_id` outside a
 build context) are omitted rather than set to empty strings.
 
-== Dashboard Data Sources
+= Dashboard Data Sources
 
 The rio-dashboard consumes data from two sources:
 

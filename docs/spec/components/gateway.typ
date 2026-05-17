@@ -1,13 +1,12 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: ("gw",))
 
-= rio-gateway
 
 The gateway is the entry point. It terminates SSH connections and speaks the
 Nix @worker-protocol, making rio-build appear as a standard Nix remote
 store/builder.
 
-== Responsibilities
+= Responsibilities
 
 - SSH server via `russh` crate --- accepts connections, authenticates via SSH
   keys
@@ -20,7 +19,7 @@ store/builder.
 - Each SSH channel maintains independent protocol state (separate handshake and
   option negotiation)
 
-== Network reachability
+= Network reachability
 
 #r("gw.ingress.v6-direct")[
   The gateway MUST be reachable from an IPv6-only client over the cluster's
@@ -33,7 +32,7 @@ store/builder.
   does not implement this translation; it is an infrastructure requirement.
 ]
 
-== Critical Opcodes
+= Critical Opcodes
 
 #r("gw.opcode.mandatory-set")[
   The opcodes below are the mandatory implementation set for a working
@@ -70,7 +69,7 @@ store/builder.
   [`wopBuildPathsWithResults`], [46], [Build paths and return results],
 )
 
-=== wopSetOptions (19) Field Sequence
+== wopSetOptions (19) Field Sequence
 
 #r("gw.opcode.set-options.field-order")[
   The fields are sent in order, all as `u64` unless noted. The
@@ -113,7 +112,7 @@ store/builder.
   protocol feature that rio-gateway does not implement.
 ]
 
-=== wopNarFromPath (38) Wire Format
+== wopNarFromPath (38) Wire Format
 
 #r("gw.opcode.nar-from-path")[
   Exports a store path as a NAR archive.
@@ -142,7 +141,7 @@ store/builder.
   #(refs.gh)("rio-gateway/src/handler/opcodes_read.rs").
 ]
 
-=== wopAddToStore (7) Wire Format
+== wopAddToStore (7) Wire Format
 
 Legacy content-addressed store path import. The client sends a name, a
 content-address method string, references, and the raw file contents (or NAR)
@@ -228,7 +227,7 @@ Response (after `STDERR_LAST`) is a full `ValidPathInfo`:
     `fixed:[r:]<algo>:<nixbase32>`],
 )
 
-=== wopAddToStoreNar (39) Wire Format
+== wopAddToStoreNar (39) Wire Format
 
 #r("gw.opcode.add-to-store-nar+2")[
   For protocol >= 1.25 (always present since we target 1.35+):
@@ -279,7 +278,7 @@ Response (after `STDERR_LAST`) is a full `ValidPathInfo`:
   `u64(1)` result value after `STDERR_LAST`.
 ]
 
-=== wopAddMultipleToStore (44) Wire Format
+== wopAddMultipleToStore (44) Wire Format
 
 #r("gw.opcode.add-multiple.batch+2")[
   Added in protocol 1.32 (always present for 1.35+). This is the primary upload
@@ -361,7 +360,7 @@ The outer framed stream terminates with a `u64(0)` sentinel.
 `wopAddMultipleToStore` handler's `logger->stopWork()` sequence in
 `daemon.cc`).
 
-=== DerivedPath Wire Format
+== DerivedPath Wire Format
 
 #r("gw.wire.derived-path")[
   `DerivedPath` is used by `wopBuildPaths` (9) and `wopBuildPathsWithResults`
@@ -399,7 +398,7 @@ Both `wopBuildPaths` and `wopBuildPathsWithResults` send a `string collection`
 of `DerivedPath` values. The gateway must parse each string to determine the
 form and extract the derivation path and requested outputs.
 
-=== wopBuildDerivation (36) --- BasicDerivation Wire Format
+== wopBuildDerivation (36) --- BasicDerivation Wire Format
 
 #r("gw.opcode.build-derivation+2")[
   Sends an inline `BasicDerivation` (without `inputDrvs`). For protocol 1.35+:
@@ -444,7 +443,7 @@ full DAG by parsing the `.drv` files uploaded in the preceding
 `wopAddToStoreNar`/`wopAddMultipleToStore` step. Each `.drv` file contains
 `inputDrvs` references that form the DAG edges.
 
-=== wopQueryDerivationOutputMap (41) Wire Format
+== wopQueryDerivationOutputMap (41) Wire Format
 
 #r("gw.opcode.query-derivation-output-map")[
   *Important:* This opcode is called by all modern Nix clients
@@ -472,7 +471,7 @@ the placeholder output paths from the `.drv`.
   [S → C], [(per output) `path`], [string], [Output store path],
 )
 
-=== wopIsValidPath (1) Wire Format
+== wopIsValidPath (1) Wire Format
 
 #r("gw.opcode.is-valid-path")[
   #table(
@@ -492,7 +491,7 @@ Response (after @stderr-loop):
   [S → C], [`valid`], [u64 bool], [1 if path exists in store, 0 otherwise],
 )
 
-=== wopQueryPathInfo (26) Wire Format
+== wopQueryPathInfo (26) Wire Format
 
 #r("gw.opcode.query-path-info")[
   #table(
@@ -528,7 +527,7 @@ If `valid == 1`, the following fields are sent in order:
   [`ca`], [string], [Content address (empty for input-addressed)],
 )
 
-=== wopQueryValidPaths (31) Wire Format
+== wopQueryValidPaths (31) Wire Format
 
 #r("gw.opcode.query-valid-paths")[
   #table(
@@ -557,7 +556,7 @@ Response (after STDERR loop):
     exist in the store],
 )
 
-=== wopBuildPaths (9) Wire Format
+== wopBuildPaths (9) Wire Format
 
 #r("gw.opcode.build-paths")[
   #table(
@@ -582,7 +581,7 @@ includes `STDERR_ERROR`.
   `BuildResult` structures.
 ]
 
-=== wopQueryMissing (40) Wire Format
+== wopQueryMissing (40) Wire Format
 
 #r("gw.opcode.query-missing")[
   #table(
@@ -612,7 +611,7 @@ Response (after STDERR loop):
   [`narSize`], [u64], [Estimated total NAR size in bytes],
 )
 
-=== wopBuildPathsWithResults (46) Response Wire Format
+== wopBuildPathsWithResults (46) Response Wire Format
 
 #r("gw.opcode.build-paths-with-results")[
   `wopBuildPathsWithResults` (opcode 46) returns one `KeyedBuildResult` per
@@ -633,7 +632,7 @@ Response (after STDERR loop):
   [(per entry) `buildResult`], [BuildResult], [See `BuildResult` format below],
 )
 
-==== BuildResult Wire Format
+=== BuildResult Wire Format
 
 All fields below are present for 1.35+ except `cpu_user`/`cpu_system`, which
 are gated on protocol >= 1.37 (Lix at 1.35 omits them):
@@ -701,7 +700,7 @@ Each *builtOutput* entry is a `(DrvOutput, Realisation)` pair:
     `{"id":"...","outPath":"...","signatures":[],"dependentRealisations":{}}`],
 )
 
-== Wire Format
+= Wire Format
 
 #r("gw.wire.all-ints-u64")[
   All wire integers are 64-bit unsigned little-endian. There are *no
@@ -758,7 +757,7 @@ Each *builtOutput* entry is a `(DrvOutput, Realisation)` pair:
 - Framed data (for NARs): sequence of `u64(chunk_len) + chunk_data` terminated
   by `u64(0)` --- chunk data is NOT padded (unlike strings)
 
-=== Handshake Sequence (Protocol 1.38+)
+== Handshake Sequence (Protocol 1.38+)
 
 #memo(title: [Correction (discovered during implementation)])[
   The original design stated that magic bytes are u32, the only exception to
@@ -863,7 +862,7 @@ the handshake before the client will send any opcodes.
   handshake completes).
 ]
 
-== Protocol Multiplexing
+= Protocol Multiplexing
 
 #r("gw.conn.sequential")[
   The Nix worker protocol is strictly sequential within a single connection ---
@@ -882,7 +881,7 @@ the handshake before the client will send any opcodes.
   channels for concurrent operations (e.g., IFD during evaluation).
 ]
 
-== DAG Reconstruction
+= DAG Reconstruction
 
 #r("gw.dag.reconstruct+2")[
   When the gateway receives `wopBuildDerivation`, `wopBuildPaths`, or
@@ -960,7 +959,7 @@ the handshake before the client will send any opcodes.
   (`--rebuild`) or repair result.
 ]
 
-=== Inline .drv Optimization
+== Inline .drv Optimization
 
 After DAG construction, the gateway optionally inlines the ATerm content of
 `.drv` files into the `drv_content` field of each `DerivationNode`. This saves
@@ -989,7 +988,7 @@ fetch). The optimization:
   state is connection-scoped and discarded when the SSH channel closes.
 ]
 
-== Authentication + Tenant Identity
+= Authentication + Tenant Identity
 
 #r("gw.auth.tenant-from-key-comment")[
   The tenant name lives in the *server-side `authorized_keys` entry's comment
@@ -1085,7 +1084,7 @@ fetch). The optimization:
   (#rref("store.tenant.narinfo-filter")); only the `.drv` lookup is exempt.
 ]
 
-== Connection Lifecycle
+= Connection Lifecycle
 
 #r("gw.conn.lifecycle")[
   Each SSH channel follows this lifecycle:
@@ -1244,7 +1243,7 @@ reasons=[Drifted]` on `rio-general`), so AMI drift never auto-evicts gateway
 pods; the operator runs `cargo xtask k8s rotate-general` during a quiet window
 to roll those nodes onto a new AMI under the same 1 h drain budget.
 
-== STDERR Message Types
+= STDERR Message Types
 
 #r("gw.stderr.message-types")[
   #table(
@@ -1301,7 +1300,7 @@ to roll those nodes onto a new AMI under the same 1 h drain budget.
   )
 ]
 
-=== STDERR_ERROR Wire Format
+== STDERR_ERROR Wire Format
 
 #r("gw.stderr.error-format")[
   This is a complex nested structure. The gateway must construct it correctly
@@ -1363,7 +1362,7 @@ subsequent `finish()` returns `Err` and `inner_mut()` panics.
   [(per trace) `message`], [string], [Trace message],
 )
 
-=== STDERR_START_ACTIVITY Wire Format
+== STDERR_START_ACTIVITY Wire Format
 
 #r("gw.stderr.activity+2")[
   #table(
@@ -1446,7 +1445,7 @@ failed → fell through to a build).
   (child first) on the paired `CACHED`/`STARTED`/`COMPLETED`/`FAILED`.
 ]
 
-=== STDERR_RESULT BuildEvent mapping
+== STDERR_RESULT BuildEvent mapping
 
 #r("gw.stderr.result.build-log-line")[
   Build log lines are emitted as `STDERR_RESULT` with `result_type=101`
@@ -1470,7 +1469,7 @@ failed → fell through to a build).
   per-derivation `actBuild` activity.
 ]
 
-== Protocol Compatibility
+= Protocol Compatibility
 
 #r("gw.compat.version-range+2")[
   rio-build advertises protocol *1.38* (`0x126`) to support the
@@ -1528,7 +1527,7 @@ paths the client is actively using. They are lost on gateway pod restart, which
 is acceptable given the store's GC grace period (default #(refs.const)("DEFAULT_GC_GRACE_HOURS")h). The store's GC
 relies on the grace period rather than querying gateways for active temp roots.
 
-== Build Hook Protocol Path
+= Build Hook Protocol Path
 
 #r("gw.hook.single-node-dag")[
   When a Nix client uses `--builders` (build hook mode) instead of `--store
@@ -1577,7 +1576,7 @@ derivation without the full DAG context.
   quality for large builds.
 ]
 
-== Rate Limiting & Connection Management
+= Rate Limiting & Connection Management
 
 #r("gw.rate.per-tenant")[
   Per-tenant build-submit rate limiting via `governor`
@@ -1642,7 +1641,7 @@ derivation without the full DAG context.
   where the I-068 collision case does not apply.
 ]
 
-== High Availability
+= High Availability
 
 #r("gw.sched.balanced")[
   The gateway connects to the scheduler in one of two modes selected by
@@ -1703,7 +1702,7 @@ derivation without the full DAG context.
   `sessionDrainSecs` (default 600s) so in-flight SSH sessions complete during
   rolling updates. `terminationGracePeriodSeconds` is computed from all three.
 
-== Key Files
+= Key Files
 
 - #(refs.gh)("rio-gateway/src/server/") --- SSH server setup (russh),
   per-channel task spawning, `exec_request` matching

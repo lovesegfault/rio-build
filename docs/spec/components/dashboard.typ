@@ -1,13 +1,12 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: ("dash",))
 
-= rio-dashboard
 
 _Web dashboard for operational visibility. Svelte 5 SPA, in-process tonic-web
 on the scheduler, Cilium Gateway API ingress, @dag visualization via
 `@xyflow/svelte`._
 
-== Architecture
+= Architecture
 
 The dashboard is a *Svelte 5* single-page application (`rio-dashboard/`, built
 by `nix/dashboard.nix` via `fetchPnpmDeps` + Vite). It does NOT share a process
@@ -95,7 +94,7 @@ hostname.
 visualization, `@dagrejs/dagre` for layout (falls back to a Web Worker above
 500 nodes).
 
-== Key Views
+= Key Views
 
 #table(
   columns: (auto, auto, 1fr),
@@ -148,7 +147,7 @@ dashboard scope --- they live in the Grafana dashboards
 per-build detail (DAG, logs, management actions) that a Prometheus/Grafana
 stack can't give you.
 
-== Normative requirements
+= Normative requirements
 
 #r("dash.envoy.grpc-web-translate+3")[
   The scheduler accepts gRPC-Web natively on its main port via `tonic-web`

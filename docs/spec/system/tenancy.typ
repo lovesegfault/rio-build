@@ -1,12 +1,11 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: none)
 
-= Multi-Tenancy
 
 rio-build supports multi-tenant operation where multiple teams or projects
 share a single cluster with data isolation and resource controls.
 
-== Tenant Identity
+= Tenant Identity
 
 Tenants are identified via SSH key mapping. The gateway's `authorized_keys`
 file includes tenant annotations:
@@ -23,7 +22,7 @@ tenant name from the `authorized_keys` entry comment, and
 #rref("sched.tenant.resolve") for how the scheduler resolves the name to a
 UUID.
 
-=== Signed Tenant Tokens
+== Signed Tenant Tokens
 
 #info(title: [Landed])[
   JWT token flow is complete — lib + issuance + verify middleware + jti
@@ -55,7 +54,7 @@ than plain gRPC metadata:
   to all services via a Kubernetes ConfigMap mounted at startup. Services
   reload the key on SIGHUP for zero-downtime rotation.
 
-== Data Isolation
+= Data Isolation
 
 All persistent data carries a `tenant_id` foreign key:
 
@@ -93,31 +92,31 @@ Query-level filtering ensures tenants can only see their own builds and
 metadata through the `AdminService` and `SchedulerService` RPCs. The gateway
 injects `tenant_id` (as a signed JWT) into all requests.
 
-== Shared Resources
+= Shared Resources
 
-=== Workers
+== Workers
 
 Workers are shared across tenants. Per-build overlay filesystem isolation
 ensures that one tenant's build cannot access another tenant's build
 artifacts or intermediate state. The Nix sandbox provides additional
 process-level isolation.
 
-=== Store Paths
+== Store Paths
 
 Store paths can be shared across tenants. Since store paths are
 content-addressed (or input-addressed with deterministic hashes), identical
 paths built by different tenants are deduplicated at the chunk level. This
 is a significant storage efficiency benefit.
 
-== Per-Tenant Features
+= Per-Tenant Features
 
-=== Signing Keys
+== Signing Keys
 
 Each tenant can have their own ed25519 signing key for narinfo signatures.
 This allows tenants to maintain independent trust chains for their binary
 caches. The cluster-wide key remains the fallback for tenants without a key.
 
-=== GC Policies
+== GC Policies
 
 #info(title: [Implemented])[
   Per-tenant GC retention via the `path_tenants` junction + 6th UNION arm in
@@ -135,7 +134,7 @@ Garbage collection retention policies are configurable per tenant:
   [`gc_max_store_size`], [Maximum total store size for the tenant],
 )
 
-=== Resource Quotas
+== Resource Quotas
 
 Per-tenant store quota (`tenants.gc_max_store_bytes`) is enforced at the
 gateway before `SubmitBuild` — see #rref("store.gc.tenant-quota-enforce").
@@ -160,9 +159,9 @@ Single-tenant mode (empty `authorized_keys` comment) never quota-checks.
   [`max_nar_upload_size`], [Maximum single @nar upload size],
 )
 
-== Security Considerations
+= Security Considerations
 
-=== `FindMissingChunks` Scoping
+== `FindMissingChunks` Scoping
 
 The `FindMissingChunks` RPC can reveal whether another tenant has built a
 specific package (by probing for chunk existence). Two scoping options:
@@ -183,14 +182,14 @@ specific package (by probing for chunk existence). Two scoping options:
   longer available.
 ]
 
-=== Build Activity Leakage
+== Build Activity Leakage
 
 Beyond `FindMissingChunks`, a tenant can observe shared derivation
 scheduling (e.g., a shared derivation completes faster than expected,
 implying another tenant built it first). This is inherent to the DAG merging
 optimization and is documented as an accepted risk.
 
-== Implementation Status
+= Implementation Status
 
 #table(
   columns: (1fr, auto, auto),

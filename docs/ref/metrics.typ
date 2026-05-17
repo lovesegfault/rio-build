@@ -2,7 +2,6 @@
 
 #show: rio.with(domains: none)
 
-= Metric Reference
 
 Full per-component metric inventory. Naming convention, label rules,
 leader-gating, and histogram bucket policy are specified normatively in
@@ -24,16 +23,16 @@ leader-gating, and histogram bucket policy are specified normatively in
     .flatten(),
 )
 
-== Gateway <tbl-metrics-gateway>
+= Gateway <tbl-metrics-gateway>
 #_metric-table("gateway")
 
-== Scheduler <tbl-metrics-scheduler>
+= Scheduler <tbl-metrics-scheduler>
 #_metric-table("scheduler")
 
-== Store <tbl-metrics-store>
+= Store <tbl-metrics-store>
 #_metric-table("store")
 
-== Builder <tbl-metrics-builder>
+= Builder <tbl-metrics-builder>
 
 #info[
   Per ADR-019 §Observability, the former `rio_worker_*` metrics are now
@@ -45,10 +44,10 @@ leader-gating, and histogram bucket policy are specified normatively in
 
 #_metric-table("builder")
 
-== Controller <tbl-metrics-controller>
+= Controller <tbl-metrics-controller>
 #_metric-table("controller")
 
-== Retired and renamed
+= Retired and renamed
 
 Historical notes the source `describe_*!` help cannot carry (the metric
 in question no longer exists to annotate). New code should reference the

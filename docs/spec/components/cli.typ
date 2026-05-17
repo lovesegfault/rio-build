@@ -1,14 +1,13 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: ("cli",))
 
-= rio-cli
 
 Admin CLI for rio-build. Thin wrapper over `AdminService` (scheduler) and
 `StoreAdminService` (store) gRPC. Run locally via
 `cargo xtask k8s cli -- <cmd>` (port-forwards + service-HMAC key fetch). NOT
 bundled into control-plane images (#rref("sec.image.control-plane-minimal")).
 
-== Connection model
+= Connection model
 
 `--scheduler-addr` (default `localhost:9001`) and `--store-addr` (default
 `rio-store.rio-store:9002`) target the in-pod case. gRPC connect is
@@ -41,7 +40,7 @@ separate 10s connect timeout (TCP/handshake bound). Streaming RPCs
 (`TriggerGC`, `GetBuildLogs`, `VerifyChunks`) wrap only the initial call;
 per-message progress drains without a whole-call deadline.
 
-== Subcommands
+= Subcommands
 
 #table(
   columns: (auto, auto, 1fr),

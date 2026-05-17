@@ -1,9 +1,8 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: ("ts",))
 
-= Verification
 
-== Protocol Conformance
+= Protocol Conformance
 
 - Live-daemon golden tests: each test starts an isolated nix-daemon, exchanges
   with it, and compares the response field-by-field against rio-build at the
@@ -15,7 +14,7 @@
 - Fields that legitimately differ (`version_string`, `trusted`) are skipped via
   a configurable skip list
 
-=== Multi-Nix compatibility matrix
+== Multi-Nix compatibility matrix
 
 Per-push CI runs conformance tests against the single Nix version pinned in
 `flake.nix` (`inputs.nix`). The *weekly* tier runs the full matrix via
@@ -65,7 +64,7 @@ rio-as-daemon):
 shows one dir per daemon. Cold-cache build time \~60--90min (three full Nix
 source-tree builds); subsequent warm runs are minutes.
 
-== Fuzzing
+= Fuzzing
 
 Security-critical protocol parsers must be fuzz-tested. Targets live in
 per-crate fuzz workspaces (#src("rio-nix/fuzz/"), #src("rio-store/fuzz/")):
@@ -92,7 +91,7 @@ per-crate fuzz workspaces (#src("rio-nix/fuzz/"), #src("rio-store/fuzz/")):
     `rio-store/fuzz/corpus/<target>/` (committed seeds prefixed `seed-`; NAR
     seeds regenerable via `gen-nar-corpus.sh`)
 
-== Unit Tests
+= Unit Tests
 
 - Wire format: roundtrip serialization for all protocol types (property tests
   via `proptest`)
@@ -111,7 +110,7 @@ per-crate fuzz workspaces (#src("rio-nix/fuzz/"), #src("rio-store/fuzz/")):
 - Store path computation: verify against known nix store paths
 - @fuse store: cache hit/miss behavior, LRU eviction, concurrent access
 
-== Functional Tests
+= Functional Tests
 
 Gateway wire protocol against *real `rio-store`* (`StoreServiceImpl` + ephemeral
 PostgreSQL) --- the `RioStack` fixture at #src("rio-gateway/tests/functional/").
@@ -136,7 +135,7 @@ is nix-CLI, rio's is wire-protocol). White-box assertions query PG directly
 refscan, trustless remote) needs real scheduler; tranche 4 (ssh-ng transport)
 needs russh fixture.
 
-== Integration Tests
+= Integration Tests
 
 - `nix build --store ssh-ng://rio nixpkgs#hello` --- minimal end-to-end
 - `nix build --builders 'ssh-ng://rio x86_64-linux'` --- @build-hook path
@@ -155,7 +154,7 @@ needs russh fixture.
 - FUSE store: build with cold cache, verify paths fetched from rio-store on
   demand
 
-== Security Integration Tests
+= Security Integration Tests
 
 - `PutPath` with invalid @assignment-token (wrong derivation hash) → rejected
   with `PERMISSION_DENIED`
@@ -175,7 +174,7 @@ needs russh fixture.
   gateway pre-check (#rref("gw.reject.nochroot")).
 ]
 
-== Chaos Testing
+= Chaos Testing
 
 - S3 timeout during PutPath → verify orphan scanner reclaims stale manifests
 - Executor disconnect during build → verify reassignment to another executor
@@ -190,7 +189,7 @@ needs russh fixture.
   #src("nix/tests/scenarios/chaos.nix").
 ]
 
-== Mutation Testing
+= Mutation Testing
 
 `cargo-mutants` mutates source --- swap `<` for `<=`, delete a statement,
 replace a return value with `Default::default()` --- reruns the test suite, and
@@ -214,7 +213,7 @@ those are already covered by the per-crate `metrics_registered` test.
 `cap_lints = true` prevents the `--deny warnings` policy from marking mutations
 unviable before a test can kill them.
 
-== VM Integration Tests
+= VM Integration Tests
 
 NixOS-VM tests exercise full-system flows with real kernel features (FUSE,
 cgroup v2, @overlayfs, k3s). Each test spins up 2--5 QEMU VMs via `nixosTest`.
@@ -226,7 +225,7 @@ organized by scenario (#src("nix/tests/default.nix") is the source of truth):
 `-standalone` runs against bare-process services in dedicated VMs; suffix `-k3s`
 boots a single-VM k3s cluster.
 
-== Test Environment
+= Test Environment
 
 #table(
   columns: (auto, 1fr),
@@ -297,7 +296,7 @@ boots a single-VM k3s cluster.
   body (cfg-gated, dead, or in the wrong fn).
 ]
 
-== Benchmarks
+= Benchmarks
 
 #table(
   columns: (auto, 1fr, auto),

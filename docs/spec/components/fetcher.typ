@@ -1,7 +1,6 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: ("fetcher", "builder", "store"))
 
-= rio-fetcher
 
 #gls("fod")-only executor. Same binary as rio-builder, launched with
 `RIO_EXECUTOR_KIND=fetcher`.
@@ -12,7 +11,7 @@ pod type forces a leaky compromise. Splitting them lets builders be fully
 airgapped while fetchers rely on the FOD hash check as their integrity
 boundary. See @fetcher-rationale-split for the full rationale.
 
-== Responsibilities
+= Responsibilities
 
 - Receive FOD build assignments from the scheduler via gRPC (the scheduler
   routes FODs here per #rref("sched.dispatch.fod-to-fetcher"))
@@ -22,7 +21,7 @@ boundary. See @fetcher-rationale-split for the full rationale.
 - Upload the verified output @nar to rio-store
 - Heartbeat to the scheduler with `ExecutorKind::Fetcher`
 
-== Differences from builder
+= Differences from builder
 
 #figure(
   table(
@@ -51,7 +50,7 @@ boundary. See @fetcher-rationale-split for the full rationale.
   ),
 )
 
-== Hash verification before upload
+= Hash verification before upload
 
 #r("fetcher.upload.hash-verify-before")[
   The fetcher MUST verify the FOD output hash *before* initiating upload to
@@ -68,7 +67,7 @@ scheduler knows the expected hash before dispatch; the fetcher re-derives
 `is_fod` from the `.drv` itself and cross-checks
 (#rref("builder.executor.kind-gate")).
 
-== Hashed mirrors
+= Hashed mirrors
 
 #r("fetcher.nixconf.hashed-mirrors")[
   The fetcher's `nix.conf` MUST set `hashed-mirrors` (default
@@ -81,7 +80,7 @@ scheduler knows the expected hash before dispatch; the fetcher re-derives
   at an internal mirror; an empty value disables the lookup.
 ]
 
-== Network isolation
+= Network isolation
 
 #r("builder.netpol.airgap")[
   `builder-egress` NetworkPolicy (in `rio-builders`) allows: CoreDNS:53,
@@ -116,7 +115,7 @@ scheduler knows the expected hash before dispatch; the fetcher re-derives
 The Squid FOD proxy is deleted. The FOD hash check is the integrity boundary;
 a domain allowlist adds operational friction for marginal gain.
 
-== Sandbox hardening
+= Sandbox hardening
 
 #r("fetcher.sandbox.strict-seccomp")[
   Fetchers get a stricter seccomp profile (`rio-fetcher.json`) than builders:
@@ -134,7 +133,7 @@ an exploit payload. The FOD hash check catches content tampering, but a fetcher
 that is itself rooted during the fetch (via a curl/git CVE) could pivot to the
 node. The stricter profile shrinks that surface.
 
-== Node isolation
+= Node isolation
 
 #r("fetcher.node.dedicated+4")[
   Fetcher pods land on dedicated nodes carrying the
@@ -161,7 +160,7 @@ node. The stricter profile shrinks that surface.
 An attacker who escapes a fetcher pod lands on a node that runs only other
 fetchers. Lateral movement stays inside the hash-check boundary.
 
-== Related markers
+= Related markers
 
 The following markers defined in other chapters govern fetcher behaviour:
 

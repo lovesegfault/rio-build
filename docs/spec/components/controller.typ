@@ -1,13 +1,12 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: ("ctrl", "store"))
 
-= rio-controller
 
 Manages rio-build lifecycle on Kubernetes via CRDs.
 
-== CRDs
+= CRDs
 
-=== Pool
+== Pool
 
 #r("ctrl.crd.pool")[
   ```yaml
@@ -51,7 +50,7 @@ Manages rio-build lifecycle on Kubernetes via CRDs.
   ```
 ]
 
-=== Job lifecycle
+== Job lifecycle
 
 #r("ctrl.pool.ephemeral+1")[
   The reconciler polls `AdminService.ClusterStatus` each requeue tick (10s) and
@@ -227,7 +226,7 @@ gone.
   `privileged` so privileged kvm pods still tolerate the metal taint.
 ]
 
-=== Reconciler
+== Reconciler
 
 #r("ctrl.pool.reconcile")[
   One reconciler handles both kinds. Each tick: poll
@@ -264,7 +263,7 @@ gone.
   grace period.
 ]
 
-=== ComponentScaler
+== ComponentScaler
 
 #r("ctrl.crd.componentscaler")[
   ```yaml
@@ -299,7 +298,7 @@ and the controller already has the demand signal (`ClusterStatus`). See
 #rref("ctrl.scaler.component+2") / #rref("ctrl.scaler.ratio-learn") for
 reconciler behavior.
 
-== Reconciliation Loops
+= Reconciliation Loops
 
 #r("ctrl.admin.rpc-timeout")[
   Every `AdminServiceClient` RPC issued from a controller reconcile or watcher
@@ -449,7 +448,7 @@ reconciler behavior.
   "scheduler down, queued unknown".
 ]
 
-== RBAC
+= RBAC
 
 The controller requires a dedicated ServiceAccount with a ClusterRole granting
 (see `infra/helm/rio-build/templates/rbac.yaml`):
@@ -518,7 +517,7 @@ owns). All other controller reconcilers remain non-leader-gated.
   chart (see below).
 ]
 
-== NetworkPolicy
+= NetworkPolicy
 
 @networkpolicy resources are deployed via the Helm chart
 (`infra/helm/rio-build/templates/networkpolicy.yaml`, gated on
@@ -538,7 +537,7 @@ owns). All other controller reconcilers remain non-leader-gated.
   the Kubernetes API server (for @crd watches and Job management). DNS egress to
   kube-system.
 
-== PodDisruptionBudget
+= PodDisruptionBudget
 
 #figure(
   table(
@@ -563,7 +562,7 @@ Scheduler and gateway PDBs are static manifests in the Helm chart
 Jobs is meaningless (eviction of a Job pod just reschedules the build via
 #rref("ctrl.drain.disruption-target")).
 
-== Service Definitions
+= Service Definitions
 
 #figure(
   table(
@@ -582,7 +581,7 @@ Jobs is meaningless (eviction of a Job pod just reschedules the build via
   ),
 )
 
-== Health Probes
+= Health Probes
 
 #r("ctrl.probe.named-service")[
   Health probes against `grpc.health.v1.Health/Check` MUST target a named
@@ -656,7 +655,7 @@ Jobs is meaningless (eviction of a Job pod just reschedules the build via
   ),
 )
 
-== Executor Lifecycle
+= Executor Lifecycle
 
 #r("ctrl.drain.sigterm")[
   *Scale-down:* `terminationGracePeriodSeconds` is set to `7200` (2 hours) to
@@ -691,7 +690,7 @@ the drain. The Job pod template does NOT define a preStop.
   is the fallback if the watcher misses the window.
 ]
 
-== ComponentScaler
+= ComponentScaler
 
 #r("ctrl.scaler.component+2")[
   The controller reconciles `ComponentScaler` CRs into `apps/v1 Deployment
@@ -745,7 +744,7 @@ upgrade` resets the replica count and fights the controller. The controller's
 `/scale` patches use field-manager `rio-controller-componentscaler` (distinct
 from helm's apply manager).
 
-== GC Cron
+= GC Cron
 
 #r("ctrl.gc.startup-delay")[
   The GC cron's FIRST tick MUST be delayed by `STARTUP_DELAY` (300 s) plus
@@ -774,7 +773,7 @@ from helm's apply manager).
   serialized by the store's `GC_LOCK_ID` advisory lock.
 ]
 
-== NodeClaim pool (ADR-023 §13b)
+= NodeClaim pool (ADR-023 §13b)
 <sec-nodeclaim-pool>
 
 #r("ctrl.nodeclaim.ffd-sim")[
@@ -902,7 +901,7 @@ from helm's apply manager).
   is pass-through).
 ]
 
-== Build CRD (removed)
+= Build CRD (removed)
 
 The `Build` CRD (`rio.build/v1alpha1 Build`) was removed in P0294. It was an
 alternative K8s-native build submission path that duplicated the SSH
@@ -914,7 +913,7 @@ deleted: `kubectl delete builds.rio.build --all -A`. The CRD itself remains
 installed (helm `crds/` directory is install-only, not upgrade-managed); delete
 it manually: `kubectl delete crd builds.rio.build`.
 
-== Component Deployment Model
+= Component Deployment Model
 
 The controller manages:
 - *Pool* CRD → spawns/reaps one-shot builder/fetcher Jobs (per-intent
@@ -926,7 +925,7 @@ The controller does *NOT* manage:
 - Rationale: scheduler and store have simple lifecycle (single replica or
   leader-elected); CRD management adds complexity without benefit
 
-== Key Files
+= Key Files
 
 - `rio-crds/src/` --- CRD type definitions (separate crate; Pool,
   ComponentScaler)
@@ -935,14 +934,14 @@ The controller does *NOT* manage:
 - `rio-controller/src/reconcilers/componentscaler/` --- ComponentScaler
   (rio-store/rio-gateway Deployment scaling)
 
-== CRD Versioning
+= CRD Versioning
 
 CRDs follow a `v1alpha1` → `v1beta1` → `v1` progression. The initial
 implementation uses `v1alpha1` with no stability guarantees. Plan a conversion
 webhook before promoting to `v1beta1` to support zero-downtime upgrades from
 `v1alpha1`.
 
-== CRD Validation
+= CRD Validation
 
 CRDs use CEL validation rules (`x-kubernetes-validations`) for structural
 constraints:
@@ -1043,7 +1042,7 @@ resulting accounting drift.) The same value is added to the container's
 `ephemeral-storage` request/limit so the two cannot drift. Pods are one-shot so
 the cache never outlives one build's input closure.
 
-== Pool Finalizer
+= Pool Finalizer
 
 Pool CRDs carry a `pool.rio.build/drain` finalizer. The finalizer's `cleanup()`
 removes the finalizer immediately; in-flight Jobs finish their one build

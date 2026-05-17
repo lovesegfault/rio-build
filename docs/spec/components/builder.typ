@@ -1,7 +1,6 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: ("builder",))
 
-= rio-builder
 
 One-shot process in a K8s Job pod that executes a single derivation, then
 exits.
@@ -16,7 +15,7 @@ distinguished by `RIO_EXECUTOR_KIND`.
   from `r[worker.*]` to `r[builder.*]`.
 ]
 
-== Responsibilities
+= Responsibilities
 
 - Receive a single build assignment from the scheduler via gRPC (one
   derivation per pod, then exit)
@@ -33,7 +32,7 @@ distinguished by `RIO_EXECUTOR_KIND`.
 - Heartbeat / health checking to scheduler
 - Resource usage reporting (CPU, memory, disk, build duration)
 
-== FUSE Store (`rio-builder::fuse`)
+= FUSE Store (`rio-builder::fuse`)
 
 Each builder runs a FUSE filesystem that presents store paths to the build.
 The FUSE daemon mounts at `/var/rio/fuse-store` (configurable --- *never*
@@ -103,7 +102,7 @@ to lazily fetch @store-path content on demand.
   ),
 )
 
-=== Why FUSE Instead of a Shared PV
+== Why FUSE Instead of a Shared PV
 
 - *Overlay-over-NFS is unsupported*: The Linux kernel does not guarantee
   overlayfs correctness over NFS/EFS. FUSE mounts appear as local filesystems
@@ -121,7 +120,7 @@ to lazily fetch @store-path content on demand.
   execution stream before assigning work. The FUSE daemon warms its cache with
   the build's input closure paths before the build starts.
 
-=== FUSE Cache
+== FUSE Cache
 
 - *Backend*: Local SSD (`emptyDir`)
 - *Granularity*: Whole store paths (not individual chunks). The FUSE daemon
@@ -162,7 +161,7 @@ to lazily fetch @store-path content on demand.
   via the FUSE fetch path.
 ]
 
-=== Prefetch Warm-Gate
+== Prefetch Warm-Gate
 
 #r("builder.warmgate.handshake")[
   On receipt of a `PrefetchHint` from the scheduler, the builder spawns one
@@ -202,7 +201,7 @@ to lazily fetch @store-path content on demand.
   hits per builder collapse to ≤2.
 ]
 
-=== FUSE Implementation
+== FUSE Implementation
 
 #r("builder.fuse.fetch-bounded-memory")[
   `ensure_cached` MUST stream NAR bytes to a same-filesystem spool file and
@@ -319,7 +318,7 @@ to lazily fetch @store-path content on demand.
   scheduler-driven via `PrefetchHint` messages on the assignment stream, not
   triggered by `open()`.
 
-=== FUSE Design Notes
+== FUSE Design Notes
 
 The FUSE daemon is split across submodules: `fuse/mod.rs` (daemon lifecycle,
 mount management, `NixStoreFs` struct), `fuse/ops.rs` (the `Filesystem` trait
@@ -364,7 +363,7 @@ affect the FUSE daemon implementation:
   fallback not activated.*
 ]
 
-== Builder Nix Configuration
+= Builder Nix Configuration
 
 Builder pods ship a minimal `nix.conf` with an optional operator override from
 the `rio-nix-conf` ConfigMap, mounted *as a directory* at `/etc/rio/nix-conf/`
@@ -398,7 +397,7 @@ experimental-features = ca-derivations
 This configuration ensures workers only build derivations locally and never
 attempt to delegate or substitute externally.
 
-=== Builder Capabilities
+== Builder Capabilities
 
 Each builder advertises two capability lists in its heartbeat so the scheduler
 can route derivations:
@@ -428,7 +427,7 @@ can route derivations:
   instance, significantly complicating the builder architecture.
 ]
 
-== rio-nix Client Protocol
+= rio-nix Client Protocol
 
 #r("builder.daemon.stdio-client")[
   Builders invoke `nix-daemon --stdio` and must speak the Nix worker protocol
@@ -534,7 +533,7 @@ can route derivations:
   to `0` means unlimited.
 ]
 
-== Overlay Store Architecture
+= Overlay Store Architecture
 
 #r("builder.overlay.per-build")[
   Each active build gets its own overlayfs mount with a separate upper
@@ -610,7 +609,7 @@ leaked mount increments
 one-shot, so the leak is bounded to that single build and discarded with the
 pod's emptyDir.
 
-=== Multi-Output Derivation Upload
+== Multi-Output Derivation Upload
 
 #r("builder.upload.idempotent-precheck")[
   Before uploading, the builder batch-checks all scanned outputs via
@@ -717,7 +716,7 @@ output on the original builder is lost when the overlay is discarded.
   I-125b.
 ]
 
-== Store Database Management
+= Store Database Management
 
 #r("builder.synth-db.per-build")[
   Nix requires a functional store database (SQLite at
@@ -779,7 +778,7 @@ overlay upper layer:
 Performance: direct SQLite writes handle 1000+ paths in \<50ms. The bottleneck
 is the PostgreSQL metadata query, not the SQLite generation.
 
-=== Synthetic DB Risks
+== Synthetic DB Risks
 
 - *Schema version coupling*: Nix store DB schema (currently version 10) is an
   internal API with no stability guarantees. Pin to a specific Nix version and
@@ -794,7 +793,7 @@ is the PostgreSQL metadata query, not the SQLite generation.
   instead of `journal_mode=OFF`. While the DB is ephemeral, Nix may check the
   journal mode on open.
 
-== Concurrent Build Isolation
+= Concurrent Build Isolation
 
 #r("builder.cgroup.sibling-layout")[
   Per-build cgroups are *siblings* of the builder's own cgroup under the
@@ -835,7 +834,7 @@ is the PostgreSQL metadata query, not the SQLite generation.
   PID; forked builders reparent to init.
 ]
 
-=== Build Resource Limits
+== Build Resource Limits
 
 A builder pod runs *one* build, then exits. The pod's `resources.limits` ARE
 the build's limits --- there is no per-build cgroup `memory.max`/`cpu.max`
@@ -891,7 +890,7 @@ is compromised, the per-build overlay upper layer ensures rogue writes are
 isolated and discarded; the next build runs in a fresh pod and sees none of
 it.
 
-== Fixed-Output Derivation (FOD) Handling
+= Fixed-Output Derivation (FOD) Handling
 
 #info[
   Per ADR-019, FODs route to the rio-fetcher executor, not builders. Builders
@@ -923,7 +922,7 @@ it.
     share the same cached output.
 ]
 
-== Namespace Ordering
+= Namespace Ordering
 <sec-ns-order>
 
 #r("builder.ns.order+2")[
@@ -960,7 +959,7 @@ it.
   is structurally impossible.
 ]
 
-== Security Context
+= Security Context
 
 Workers require elevated privileges for FUSE mounts, overlayfs mounts, and the
 Nix sandbox (user/mount/PID/network namespaces).
@@ -1000,7 +999,7 @@ When the profile is unset (or `privileged=true`), pods fall back to
 - @imdsv2 with hop limit = 1 on builder nodes (defense-in-depth against
   metadata access from privileged pods).
 
-== Device Access
+= Device Access
 
 Workers require access to `/dev/fuse` for the FUSE filesystem. Mount it as a
 `hostPath` volume:
@@ -1021,7 +1020,7 @@ containers:
 Without `/dev/fuse`, the FUSE daemon cannot create the store mount and the
 builder will fail to start.
 
-== FUSE Passthrough Mode (Linux 6.9+)
+= FUSE Passthrough Mode (Linux 6.9+)
 
 #r("builder.fuse.passthrough")[
   Linux 6.9 introduced FUSE passthrough mode (`FUSE_PASSTHROUGH`), which
@@ -1044,7 +1043,7 @@ passthrough:
 natively via `KernelConfig::set_max_stack_depth(1)` +
 `ReplyOpen::open_backing()` + `opened_passthrough()`.
 
-=== Spike Findings
+== Spike Findings
 
 The Phase 1a spike validated passthrough on EKS AL2023 (kernel 6.12). Key
 findings:
@@ -1089,7 +1088,7 @@ findings:
   layer.
 ]
 
-== Nix Version Pinning
+= Nix Version Pinning
 
 #r("builder.nix.pinned-schema")[
   The synthetic SQLite store database generated per-build in the overlay upper
@@ -1108,7 +1107,7 @@ findings:
 - Document the pinned Nix version and the expected schema version in the
   builder configuration
 
-== Future: Privilege Splitting
+= Future: Privilege Splitting
 
 The current design holds `CAP_SYS_ADMIN` throughout build execution because
 both overlayfs setup and the Nix sandbox require it. A sandbox escape gives
@@ -1137,7 +1136,7 @@ requires empirical testing against the target Nix version.
 *Status:* Deferred. Will be investigated when the basic builder architecture
 is stable (post Phase 3).
 
-== Build Status Reporting
+= Build Status Reporting
 
 #r("builder.status.nix-to-proto")[
   The mapping from `rio_nix::BuildStatus` to `proto::BuildResultStatus` MUST
@@ -1151,7 +1150,7 @@ is stable (post Phase 3).
   `InfrastructureFailure`.
 ]
 
-== Build Cancellation
+= Build Cancellation
 
 #r("builder.cancel.cgroup-kill")[
   When the scheduler sends a `CancelSignal` on the BuildExecution stream, the
@@ -1175,7 +1174,7 @@ is stable (post Phase 3).
   burning `activeDeadlineSeconds` of compute.
 ]
 
-== Just-in-time Input Fetch
+= Just-in-time Input Fetch
 
 #r("builder.fuse.jit-register")[
   The executor MUST register the build's input closure (basename → nar_size,
@@ -1201,7 +1200,7 @@ is stable (post Phase 3).
   paths outside their declared input closure (hermeticity).
 ]
 
-== Stream Relay & Reconnect
+= Stream Relay & Reconnect
 
 #r("builder.completion.pending-armed-early")[
   `completion_pending` MUST be armed `true` at the start of `executor_future`,
@@ -1266,7 +1265,7 @@ is stable (post Phase 3).
   materialization failures.
 ]
 
-== Shutdown
+= Shutdown
 
 #r("builder.idle-exit+2")[
   The reconnect loop's `select!` has a `tokio::time::sleep_until(last_activity
@@ -1343,7 +1342,7 @@ is stable (post Phase 3).
   `CAP_SYS_ADMIN` the FUSE mount already requires.
 ]
 
-== Key Files
+= Key Files
 
 #figure(
   table(
