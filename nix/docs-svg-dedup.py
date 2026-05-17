@@ -47,6 +47,11 @@ for f in pathlib.Path(sys.argv[1]).rglob("*.html"):
     # post-process). stroke covers fraction bars/radicals/arrows.
     out = out.replace(b'fill="#000000"', b'fill="currentColor"')
     out = out.replace(b'stroke="#000000"', b'stroke="currentColor"')
+    # typst emits <defs id="glyph"> per html.frame(); the id is unused
+    # (no #glyph references) and duplicates across frames. Strip it.
+    # (Per-frame <symbol> dups are serve-only; the hoist above handles
+    # them in build.)
+    out = out.replace(b'<defs id="glyph">', b"<defs>")
     if out != src:
         f.write_bytes(out)
         total = len(seen) + len(SYM.findall(src)) - len(seen)  # = original count
