@@ -309,6 +309,17 @@ rec {
       if grep -q 'pp\.' glossary.html; then
         echo "FAIL: glossary.html has 'pp.' page-backrefs (QA2-D)" >&2; exit 1
       fi
+      # QA4-#9: no duplicate <defs id="glyph"> (svg-dedup strips it).
+      if grep -rq 'id="glyph"' .; then
+        echo 'FAIL: <defs id="glyph"> present (svg-dedup not run? QA4-#9)' >&2; exit 1
+      fi
+      # QA4-B output-level guards: title-dup show-rule removed +
+      # range-limited promote applied. deployment.typ §3 reappears (was
+      # eaten by `starts-with("deployment ")`); gateway H2 gap closed.
+      grep -q '>Deployment Order</h2>' spec/system/deployment.html \
+        || { echo "FAIL: deployment.html missing '>Deployment Order</h2>' (QA4-#3)" >&2; exit 1; }
+      grep -q '>Responsibilities</h2>' spec/components/gateway.html \
+        || { echo "FAIL: gateway.html missing '>Responsibilities</h2>' (QA4-#6 H2 gap)" >&2; exit 1; }
       touch $out
     '';
     # Serve-parity smoke. Runs raw shiroa build (no svg-dedup post-

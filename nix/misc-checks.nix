@@ -517,6 +517,42 @@ in
           echo "FAIL: describe_metrics() comment regressed to old wording" >&2
           fail=1
         fi
+        # QA4-B: chapter's FIRST `= ` heading must not duplicate its
+        # manifest title — the synthetic <h1 class="rio-chapter-title">
+        # already renders the title; a leading `= <Title>` either
+        # (a) duplicates it (now that the QA3 show-rule is gone), or
+        # (b) was previously suppressed leaving an H1→H3 skip /
+        # §-starts-at-2. Heuristic matches the QA3 rule's three forms
+        # (exact / `rio-<title>` / `<title> *` prefix). Limitation:
+        # `[^]]+` title-extraction fails on a `]` in a manifest title;
+        # none currently exist.
+        while IFS=: read -r ch title; do
+          # `|| true`: chapters with no `^= ` (post-migration glossary)
+          # make grep exit 1; under set -e that's fatal before the
+          # -z check below can skip them.
+          first=$(grep -m1 '^= ' "$typSrc/$ch" 2>/dev/null | sed 's/^= //' || true)
+          [[ -z "$first" ]] && continue
+          tlow=$(echo "$title" | tr 'A-Z' 'a-z')
+          flow=$(echo "$first" | tr 'A-Z' 'a-z')
+          if [[ "$flow" == "$tlow" || "$flow" == "rio-$tlow" || "$flow" == "$tlow "* ]]; then
+            echo "FAIL: $ch first heading '= $first' duplicates manifest title '$title'" >&2
+            fail=1
+          fi
+        done < <(grep -oE '#chapter\("[^"]+\.typ"\)\[[^]]+\]' $typSrc/book.typ \
+          | sed -E 's/#chapter\("([^"]+)"\)\[([^]]+)\]/\1:\2/')
+        # QA4-#2: stray `=` at (post-indent) line-start — typst parses as
+        # heading inside content blocks. book*.typ's `summary:[...]` part
+        # markers (`= Guide`, `= Spec`) are intentional.
+        if grep -rn --include='*.typ' --exclude='book*.typ' -E '^\s+= ' $typSrc; then
+          echo "FAIL: indented '= ' parsed as heading — escape as '\= ' or rewrap" >&2
+          fail=1
+        fi
+        # QA4-#1/#5: CSS-presence in source (base64-decode in shiroa-smoke
+        # is fragile; source-grep is robust).
+        grep -q '\.rio-frame svg' $typSrc/lib/rio.typ \
+          || { echo "FAIL: lib/rio.typ missing '.rio-frame svg' (QA4-#1 invert scope)" >&2; fail=1; }
+        grep -q 'scrollbar-width: thin' $typSrc/lib/rio.typ \
+          || { echo "FAIL: lib/rio.typ missing 'scrollbar-width: thin' (QA4-#5)" >&2; fail=1; }
         [[ $fail -eq 0 ]]
         touch $out
       '';
