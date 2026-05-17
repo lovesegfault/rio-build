@@ -87,10 +87,11 @@
 // `currentColor`: they emit at sentinel fill/stroke="#000000" and the
 // CSS attribute selectors at `.inline-equation svg [fill="#000000"]`
 // override them to `currentColor` so `.inline-equation svg
-// { color: var(--fg) }` themes it. nix/docs-svg-dedup.py also rewrites
-// the literal attrs (size-only optimisation; the CSS is what makes
-// `shiroa serve` correct since it has no post-process). shiroa's
-// theme-box (dark+light copies, class-toggled) is no longer used.
+// { color: var(--fg) }` themes it. NO post-process rewrite — a
+// page-wide replace would also hit .rio-frame diagram SVGs, which
+// double-applies (currentColor → light --fg → invert → dark-on-dark);
+// the CSS scoping is load-bearing. Works in serve and build alike.
+// shiroa's theme-box (dark+light copies, class-toggled) is unused.
 
 // Flatten book-meta.summary into [(path, title), ...] and locate
 // x-current. Returns (title: str, prev: (path,title)|none,
@@ -580,17 +581,17 @@
   // does NOT read the `shiroa-assets` state that `add-styles()` writes
   // to — that's a starlight-only path).
   let rio-css = ```css
-  /* Equations: single-render, themed via currentColor (typst emits
-     fill="#000000"; nix/docs-svg-dedup.py rewrites to currentColor). */
+  /* Equations: single-render, themed via attribute-selector override.
+     typst emits fill/stroke="#000000"; the [fill="#000000"] selectors
+     below override to currentColor so `.inline-equation svg
+     { color: var(--fg) }` themes them. Works identically in serve and
+     build (no post-process needed). NOT applied to .rio-frame svg —
+     those use the `filter: invert()` dark-theme path; recolouring
+     would double-apply (currentColor → light --fg → invert →
+     dark-on-dark). QA2-R1. */
   .inline-equation { display: inline-block; width: fit-content; }
   .block-equation { display: grid; place-items: center; overflow-x: auto; }
   .inline-equation svg, .block-equation svg { color: var(--fg, #1b1f24); }
-  /* serve mode has no post-process; the inline fill/stroke="#000000"
-     stays literal. Attribute-selector override makes equation glyphs
-     and strokes (fraction bars, radicals) track `color:` in BOTH serve
-     and build. NOT applied to .rio-frame svg — those use the
-     `filter: invert()` dark-theme path; recolouring would double-apply.
-     The post-process is now size-only, not load-bearing. QA2-R1. */
   .inline-equation svg [fill="#000000"],
   .block-equation svg [fill="#000000"] { fill: currentColor; }
   .inline-equation svg [stroke="#000000"],
@@ -683,7 +684,11 @@
     document.querySelectorAll('main pre').forEach(pre => {
       const b = document.createElement('button');
       b.className = 'rio-copy'; b.textContent = '⧉'; b.title = 'Copy';
-      b.onclick = () => navigator.clipboard.writeText(pre.innerText)
+      // Read from <code>, not <pre> — the button is appended INSIDE
+      // <pre>, and position:absolute/opacity don't exclude an element
+      // from innerText (only display:none/visibility:hidden do).
+      b.onclick = () => navigator.clipboard
+        .writeText((pre.querySelector('code') || pre).innerText)
         .then(() => { b.textContent='✓'; setTimeout(()=>b.textContent='⧉', 1200); });
       pre.style.position = 'relative'; pre.appendChild(b);
     });
@@ -734,9 +739,10 @@
       // dual-SVG. shiroa's equation-rules wraps each eq in theme-box
       // → dark+light copies (byte-identical except fill); on
       // sla-sizing.html that's ~2000 eqs × 2 copies × ~7KB glyph
-      // paths. Emit ONE html.frame() at fill=black; nix/docs-svg-
-      // dedup.py rewrites #000000 → currentColor and rio-css sets
-      // `.inline-equation svg { color: var(--fg) }`. (equation-rules'
+      // paths. Emit ONE html.frame() at fill=black; the rio-css
+      // `[fill="#000000"]` attribute selectors override to
+      // currentColor so `.inline-equation svg { color: var(--fg) }`
+      // themes them — works in serve and build. (equation-rules'
       // add-styles() is starlight-only anyway, so the CSS lives in
       // rio-css.)
       show math.equation: set text(weight: 400)

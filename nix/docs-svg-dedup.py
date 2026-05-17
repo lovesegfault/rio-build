@@ -5,10 +5,8 @@ document-level <svg style="display:none"><defs>, dedup by id.
 typst content-hashes glyph IDs so identical glyphs share an id;
 <use href="#gXXX"> resolves document-globally (SVG-sprite pattern).
 
-Also rewrites the equation single-render sentinel
-fill="#000000" → fill="currentColor" so
-`.inline-equation svg { color: var(--fg) }` (rio-css) themes them
-without dual-rendering.
+Also strips the dyn-paged renderer script tags (shiroa.js heartbeat
+poll, svg_utils.js, wasm-init) — useless in --mode static-html.
 """
 
 import pathlib
@@ -40,13 +38,13 @@ for f in pathlib.Path(sys.argv[1]).rglob("*.html"):
         # Sprite must go INSIDE <body> (HTML validity); insert
         # immediately after the opening tag.
         out = BODY_OPEN.sub(lambda m: m.group(0) + sprite, out, count=1)
-    # currentColor rewrite (lib/rio.typ's sentinel — see the
-    # math.equation show-rule comment). Size-only: the CSS
-    # [fill="#000000"]/[stroke="#000000"] attribute selectors are what
-    # make rendering correct (and `shiroa serve` parity, which has no
-    # post-process). stroke covers fraction bars/radicals/arrows.
-    out = out.replace(b'fill="#000000"', b'fill="currentColor"')
-    out = out.replace(b'stroke="#000000"', b'stroke="currentColor"')
+    # NO currentColor rewrite. The rio-css `[fill="#000000"]` attribute
+    # selectors handle equation theming in both serve and build; a
+    # page-wide replace would also hit .rio-frame diagram SVGs (which
+    # use `filter: invert()` for dark themes — currentColor → light
+    # --fg → inverted → dark-on-dark). And `currentColor` is longer
+    # than `#000000`, so it isn't even a size win.
+    #
     # typst emits <defs id="glyph"> / <defs id="clip-path"> per
     # html.frame(); the wrapper ids are unused (refs go to the inner
     # <symbol id="gHEX"> / <clipPath id="cHEX">, never #glyph or

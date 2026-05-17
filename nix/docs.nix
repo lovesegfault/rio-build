@@ -240,10 +240,8 @@ rec {
         # Hoist + dedup <symbol> glyph defs (typst content-hashes glyph
         # IDs so identical glyphs share an id but every html.frame()
         # SVG carries its own <defs> copy — sla-sizing.html had 13K
-        # defs with 1070 distinct ids). Also rewrites the equation
-        # fill/stroke="#000000" sentinel → currentColor (size-only;
-        # the CSS attribute selectors are what's load-bearing — serve
-        # mode has no post-process).
+        # defs with 1070 distinct ids). Also strips dyn-paged renderer
+        # script tags (shiroa.js heartbeat, svg_utils.js, wasm-init).
         ${pkgs.python3}/bin/python3 ${./docs-svg-dedup.py} $out
         # Dyn-paged renderer assets — script tags are stripped by
         # svg-dedup.py above (no .typst-doc elements in static-html);
