@@ -646,6 +646,11 @@
     html:not(.sidebar-visible) .sidebar { transform: translateX(calc(0px - var(--sidebar-width))); }
     html:not(.sidebar-visible) .page-wrapper { margin-left: 0; transform: none; }
   }
+  /* shiroa-mdbook's chrome.css has `.previous { float: left }` (no-op
+     on position:fixed) instead of mdBook's `left: var(--page-padding)`.
+     Without an explicit left anchor the arrow lands at <main>'s left
+     edge and intercepts clicks across a 90px strip. */
+  .nav-wide-wrapper .previous { left: var(--page-padding); }
   /* Copy-to-clipboard button (rio-js below adds it to each <pre>). */
   .rio-copy { position: absolute; top: .5em; right: .5em; padding: .2em .5em;
               border: 1px solid var(--icons); border-radius: 3px;
