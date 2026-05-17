@@ -2,6 +2,16 @@
 // this file to discover the chapter list; chapter paths are resolved
 // relative to this file (and absolute `/lib/...` imports inside
 // chapters resolve against `--root`).
+//
+// print.html: intentionally not generated — `nix build .#docs-pdf`
+// (the stitched book-pdf.typ aggregate) is the print equivalent.
+// shiroa-mdbook hardcodes `print-enable = false` anyway.
+//
+// Known console warning: shiroa.js:4262 "deprecated parameters for
+// initSync()" — wasm-bindgen API churn in the typst.ts renderer
+// bundle (rio-pin's vendored assets/artifacts/shiroa.js). Benign;
+// patching the generated bundle is fragile. Tracked at
+// Myriad-Dreamin/typst.ts for the next renderer release.
 #import "@preview/shiroa:0.3.1": *
 
 #show: book

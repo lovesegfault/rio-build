@@ -232,6 +232,10 @@ rec {
         # the CSS attribute selectors are what's load-bearing — serve
         # mode has no post-process).
         ${pkgs.python3}/bin/python3 ${./docs-svg-dedup.py} $out
+        # Static assets shiroa doesn't generate (404.html). print.html
+        # is intentionally absent — `nix build .#docs-pdf` is the print
+        # equivalent (shiroa-mdbook hardcodes print-enable=false anyway).
+        cp ${../docs/dist-static}/*.html $out/
       '';
 
   checks = {
