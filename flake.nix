@@ -1285,6 +1285,15 @@
             preCommitInstall = config.pre-commit.installationScript;
           };
 
+          # `nix run .#docs` — serve the post-processed HTML tree via
+          # miniserve. The `bin` output of docsLib.docs holds the
+          # wrapper; the `out` output is the static tree (what
+          # `nix build .#docs` symlinks at `result`).
+          apps.docs = {
+            type = "app";
+            program = "${docsLib.docs.bin}/bin/rio-docs";
+          };
+
           # --------------------------------------------------------------
           # Packages — minimal set of deployable / top-level outputs.
           # --------------------------------------------------------------
