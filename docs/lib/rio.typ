@@ -211,6 +211,11 @@
 // Glossarium back-reference printer: " — pp. 3, 7" in muted small text,
 // deduplicated. Passed as `user-print-back-references` to print-glossary.
 #let muted-backrefs(entry, deduplicate: true) = {
+  // Page backrefs are meaningless in HTML (every chapter is "page 1").
+  // QA2-D. is-html-target() (compile-global) — this is called from
+  // glossarium's printer outside any html.frame() so either gate would
+  // work, but stay consistent with the other helpers.
+  if is-html-target() { return }
   let refs = get-entry-back-references(entry, deduplicate: true)
   if refs.len() > 0 {
     let lbl = if refs.len() == 1 { "p." } else { "pp." }
