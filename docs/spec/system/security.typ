@@ -56,13 +56,12 @@
 - *Threat*: Malicious `.drv` files, crafted protocol messages, resource
   exhaustion
 - *Mitigations*: Protocol parser fuzzing (see `rio-nix/fuzz/`), global @nar size
-  limits (`MAX_NAR_SIZE`)
-
-#memo(title: [TODO])[
-  Per-tenant rate limiting; connection/channel limits; SSH-key→tenant mapping.
-  (Key-algorithm filtering is not planned --- operator's `authorized_keys` is
-  operator's trust boundary.)
-]
+  limits (`MAX_NAR_SIZE`); per-tenant build-submit rate limiting
+  (#rref("gw.rate.per-tenant")); global connection cap
+  (#rref("gw.conn.cap")); SSH-key→tenant mapping via the server-side
+  `authorized_keys` comment (#rref("gw.auth.tenant-from-key-comment")).
+  Key-algorithm filtering is not provided --- the operator's `authorized_keys`
+  file is the operator's trust boundary.
 
 === Boundary 2: Gateway/Executor → Internal Services (gRPC)
 

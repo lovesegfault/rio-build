@@ -627,8 +627,7 @@ unique chunks.
   `name:base64(32-byte-ed25519-pubkey)` format before INSERT; retirement sets
   `retired_at` to preserve the audit trail). Until that lands, manual `psql` is
   the workflow --- load-time checks (#rref("store.key.rotation-cluster-history"))
-  catch malformed rows regardless. See `// TODO:` in
-  `rio-store/src/grpc/admin.rs`.
+  catch malformed rows regardless.
 ]
 
 == Realisations
