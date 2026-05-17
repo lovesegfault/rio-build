@@ -41,8 +41,12 @@ for f in pathlib.Path(sys.argv[1]).rglob("*.html"):
         # immediately after the opening tag.
         out = BODY_OPEN.sub(lambda m: m.group(0) + sprite, out, count=1)
     # currentColor rewrite (lib/rio.typ's sentinel — see the
-    # math.equation show-rule comment).
+    # math.equation show-rule comment). Size-only: the CSS
+    # [fill="#000000"]/[stroke="#000000"] attribute selectors are what
+    # make rendering correct (and `shiroa serve` parity, which has no
+    # post-process). stroke covers fraction bars/radicals/arrows.
     out = out.replace(b'fill="#000000"', b'fill="currentColor"')
+    out = out.replace(b'stroke="#000000"', b'stroke="currentColor"')
     if out != src:
         f.write_bytes(out)
         total = len(seen) + len(SYM.findall(src)) - len(seen)  # = original count

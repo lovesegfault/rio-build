@@ -82,12 +82,15 @@
 
 // ─── shiroa html-frame theming ──────────────────────────────────────
 // Figures and equations both render as inline SVG via html.frame().
-// Neither dual-renders anymore — figures recolor via CSS filter
-// (.rio-figure svg) and equations via `currentColor`: they emit at a
-// sentinel fill (#000000) that nix/docs-svg-dedup.py rewrites to
-// `fill="currentColor"`, and `.inline-equation svg { color: var(--fg) }`
-// themes it. shiroa's theme-box (which emitted dark+light copies and
-// class-toggled visibility) is no longer used.
+// Neither dual-renders anymore — figures recolor via CSS
+// `filter: invert()` (.rio-figure svg) and equations via
+// `currentColor`: they emit at sentinel fill/stroke="#000000" and the
+// CSS attribute selectors at `.inline-equation svg [fill="#000000"]`
+// override them to `currentColor` so `.inline-equation svg
+// { color: var(--fg) }` themes it. nix/docs-svg-dedup.py also rewrites
+// the literal attrs (size-only optimisation; the CSS is what makes
+// `shiroa serve` correct since it has no post-process). shiroa's
+// theme-box (dark+light copies, class-toggled) is no longer used.
 
 // Flatten book-meta.summary into [(path, title), ...] and locate
 // x-current. Returns (title: str, prev: (path,title)|none,
@@ -570,6 +573,16 @@
   .inline-equation { display: inline-block; width: fit-content; }
   .block-equation { display: grid; place-items: center; overflow-x: auto; }
   .inline-equation svg, .block-equation svg { color: var(--fg, #1b1f24); }
+  /* serve mode has no post-process; the inline fill/stroke="#000000"
+     stays literal. Attribute-selector override makes equation glyphs
+     and strokes (fraction bars, radicals) track `color:` in BOTH serve
+     and build. NOT applied to .rio-figure svg — those use the
+     `filter: invert()` dark-theme path; recolouring would double-apply.
+     The post-process is now size-only, not load-bearing. QA2-R1. */
+  .inline-equation svg [fill="#000000"],
+  .block-equation svg [fill="#000000"] { fill: currentColor; }
+  .inline-equation svg [stroke="#000000"],
+  .block-equation svg [stroke="#000000"] { stroke: currentColor; }
   .rio-figure { display: block; text-align: center; overflow-x: auto; margin: 1.2em 0; }
   .rio-figure svg { max-width: none; }   /* QA #4: don't shrink wide diagrams; let the wrapper scroll */
   .rio-figure figcaption { font-size: 0.92em; margin-top: 0.6em; }

@@ -228,7 +228,9 @@ rec {
         # IDs so identical glyphs share an id but every html.frame()
         # SVG carries its own <defs> copy — sla-sizing.html had 13K
         # defs with 1070 distinct ids). Also rewrites the equation
-        # fill="#000000" sentinel → currentColor.
+        # fill/stroke="#000000" sentinel → currentColor (size-only;
+        # the CSS attribute selectors are what's load-bearing — serve
+        # mode has no post-process).
         ${pkgs.python3}/bin/python3 ${./docs-svg-dedup.py} $out
       '';
 
