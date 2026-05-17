@@ -581,23 +581,24 @@ pub async fn port_forward(
     Ok((bound, guard))
 }
 
-/// Port-forward scheduler:9001 + store:9002, wait for TCP accept on both.
-/// Shared by all three providers — kubectl reaches the apiserver proxy
-/// regardless of whether that's via k3s loopback or `aws eks
-/// update-kubeconfig`. ADR-019: scheduler is in rio-system, store in
 /// Fetch a Secret's data key from the rio-system namespace as raw
-/// bytes (the HMAC key is `openssl rand 32`, NOT UTF-8). `None` if
-/// the Secret or key is absent.
+/// bytes (the HMAC key is `openssl rand 32`, NOT UTF-8). `Ok(None)`
+/// only if the Secret itself is absent (404); a Secret that exists
+/// but lacks `key` hard-errors so a malformed Secret surfaces as
+/// "missing data key X" instead of a downstream `PermissionDenied`.
 pub async fn secret_bytes(name: &str, key: &str) -> Result<Option<Vec<u8>>> {
     use ::kube::Api;
     use k8s_openapi::api::core::v1::Secret;
     let client = kube::client().await?;
     let api: Api<Secret> = Api::namespaced(client, NS);
-    Ok(api
-        .get_opt(name)
-        .await?
-        .and_then(|s| s.data)
-        .and_then(|d| d.get(key).map(|v| v.0.clone())))
+    let Some(secret) = api.get_opt(name).await? else {
+        return Ok(None);
+    };
+    let bytes = secret
+        .data
+        .and_then(|d| d.get(key).map(|v| v.0.clone()))
+        .with_context(|| format!("Secret {name} present but missing data key {key:?}"))?;
+    Ok(Some(bytes))
 }
 
 /// Write bytes to an anonymous memfd and return the held-open File.
@@ -624,6 +625,10 @@ fn bytes_to_memfd_round_trips_via_dev_fd() {
     assert_eq!(std::fs::read(&path).unwrap(), b"k");
 }
 
+/// Port-forward scheduler:9001 + store:9002, wait for TCP accept on both.
+/// Shared by all three providers — kubectl reaches the apiserver proxy
+/// regardless of whether that's via k3s loopback or `aws eks
+/// update-kubeconfig`. ADR-019: scheduler is in rio-system, store in
 /// rio-store — per-service `-n`. Scheduler forward targets the leader
 /// pod (from the Lease) because standbys reject admin writes.
 ///
