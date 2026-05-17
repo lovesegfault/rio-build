@@ -2010,9 +2010,10 @@ entirely: a `requirements` edit takes effect on the next rollout.
 #r("scheduler.sla.global.derive")[
   The boot-derived effective global is `max(catalog
   ceilings).clamp(MIN_CORES, MAX_CORES_GLOBAL)` for cores and `max(catalog
-  ceilings).clamp(MIN_MEM, MAX_MEM_GLOBAL)` for mem, where `MAX_CORES_GLOBAL =
-  1023` (PriorityClass bucket count − 1), `MAX_MEM_GLOBAL = 32 TiB`, `MIN_CORES
-  = 16` (per `probe.cpu ∈ [4, max_cores/4]`), `MIN_MEM = 1 GiB`. The resolved
+  ceilings).clamp(MIN_MEM, MAX_MEM_GLOBAL)` for mem, where
+  `MAX_CORES_GLOBAL = 1023` (PriorityClass bucket count − 1),
+  `MAX_MEM_GLOBAL = 32 TiB`, `MIN_CORES = 16` (per
+  `probe.cpu ∈ [4, max_cores/4]`), `MIN_MEM = 1 GiB`. The resolved
   global lives on `CostTable.resolved_global`, set unconditionally in `main.rs`
   after the catalog fetch, before actor spawn. Every consumer
   (`Ceilings::from_resolved`, `class_ceilings()`, `GetSlaDefaults`,

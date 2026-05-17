@@ -592,8 +592,9 @@ unique chunks.
 ]
 
 #r("store.tenant.narinfo-filter")[
-  Authenticated narinfo requests MUST filter results by `path_tenants.tenant_id
-  = auth.tenant_id`. Anonymous (unauthenticated) requests return unfiltered
+  Authenticated narinfo requests MUST filter results by
+  `path_tenants.tenant_id = auth.tenant_id`. Anonymous (unauthenticated)
+  requests return unfiltered
   results for backward compatibility.
 ]
 

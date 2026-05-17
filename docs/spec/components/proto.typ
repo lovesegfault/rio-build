@@ -207,8 +207,8 @@ service AdminService {
   survive actor restart); the diagnostic pair surface live dispatch-filter
   inputs that PG can't show: `executor_has_stream` (assigned to a dead-stream
   executor = stuck forever, I-025) and `has_stream` / `warm` / `draining` /
-  `store_degraded` per executor (PG `last_seen` says alive but actor map empty
-  = bidi stream stuck on TCP keepalive to old leader, I-048b/c).
+  `store_degraded` per executor (PG `last_seen` says alive but actor map
+  empty = bidi stream stuck on TCP keepalive to old leader, I-048b/c).
   `DebugListExecutors` is NOT leader-gated --- a standby's empty map is itself
   diagnostic.
 ]

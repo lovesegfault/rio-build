@@ -156,8 +156,9 @@ per-message progress drains without a whole-call deadline.
   `self.executors` map). `--diff` calls BOTH `ListExecutors` (PG) and
   `DebugListExecutors` and joins by `executor_id` with per-row `⚠` divergence
   markers: `pg-only` = stream not connected to this leader (I-048c symptom),
-  `actor-only` = PG `last_seen` stale (transient), `both` + `has_stream=false`
-  = I-048b zombie (heartbeat-created entry, no `stream_tx`). Both `--actor`
+  `actor-only` = PG `last_seen` stale (transient), `both` +
+  `has_stream=false` = I-048b zombie (heartbeat-created entry, no
+  `stream_tx`). Both `--actor`
   header lines and `--diff` rows show `ZOMBIE`/`DRAINING`/`DEGRADED` markers
   --- all three gate `has_capacity()`, so any present means dispatch can't
   reach this worker even if stream/registered/warm all show Y.

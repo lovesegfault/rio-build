@@ -908,8 +908,9 @@ it.
   + *Network access*: Unlike regular derivations, FODs are allowed network
     access inside the sandbox. This is handled by `nix-daemon` internally ---
     when it sees `outputHash` set on a derivation via `wopBuildDerivation`, it
-    automatically relaxes network namespace isolation for that build. `sandbox
-    = true` in `nix.conf` is sufficient (Nix's sandbox is FOD-aware). Network
+    automatically relaxes network namespace isolation for that build.
+    `sandbox = true` in `nix.conf` is sufficient (Nix's sandbox is
+    FOD-aware). Network
     egress is governed at the pod level by the fetcher NetworkPolicy
     (#rref("fetcher.netpol.egress-open")).
   + *Output verification*: After the build completes, the executor computes
