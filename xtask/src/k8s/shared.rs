@@ -618,9 +618,18 @@ pub fn bytes_to_memfd(b: &[u8]) -> Result<std::fs::File> {
 fn bytes_to_memfd_round_trips_via_dev_fd() {
     // Recurrence guard for bug_022: with_cli_tunnel hands rio-cli a
     // /dev/fd/N path to this memfd; assert the path reads back the
-    // bytes (proves NO MFD_CLOEXEC + the fd is positioned/readable).
-    use std::os::fd::AsRawFd;
+    // bytes AND that FD_CLOEXEC is unset (so the fd survives exec()
+    // into rio-cli). The /dev/fd/N read alone is same-process —
+    // FD_CLOEXEC only bites across exec(), so without the F_GETFD
+    // assert this would still pass with `MFdFlags::MFD_CLOEXEC`.
+    use ::nix::fcntl::{FcntlArg, FdFlag, fcntl};
+    use std::os::fd::{AsFd, AsRawFd};
     let f = bytes_to_memfd(b"k").unwrap();
+    let flags = FdFlag::from_bits_retain(fcntl(f.as_fd(), FcntlArg::F_GETFD).unwrap());
+    assert!(
+        !flags.contains(FdFlag::FD_CLOEXEC),
+        "memfd has FD_CLOEXEC; rio-cli child won't inherit it"
+    );
     let path = format!("/dev/fd/{}", f.as_raw_fd());
     assert_eq!(std::fs::read(&path).unwrap(), b"k");
 }

@@ -125,9 +125,13 @@ let
   # crate2nix-built xtask binary's compile-time CARGO_MANIFEST_DIR is a
   # store path, so RIO_REPO_ROOT points it at the runCommand src tree.
   #
-  # Fileset is the minimal scan surface: rio-*/src/*.rs, every
-  # Cargo.toml (workspace() reads each member's [package].description
-  # + [dependencies]/[dev-dependencies]/[target.*] for the full crate
+  # Fileset is the scan surface: every workspace-member src/**/*.rs
+  # (over-approximated as "every .rs repo-wide" — modules() walks each
+  # workspace_member()/src/ including xtask, so a `rio-*/src/` glob
+  # would silently drop xtask from modules.json via the
+  # `if !src.is_dir() { continue }` skip), every Cargo.toml
+  # (workspace() reads each member's [package].description +
+  # [dependencies]/[dev-dependencies]/[target.*] for the full crate
   # graph), and the two helm files alerts()/helm_ns() read.
   docsData =
     pkgs.runCommand "rio-docs-data"
