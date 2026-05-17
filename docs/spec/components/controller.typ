@@ -1,6 +1,8 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: ("ctrl", "store"))
 
+= rio-controller
+
 Manages rio-build lifecycle on Kubernetes via CRDs.
 
 == CRDs

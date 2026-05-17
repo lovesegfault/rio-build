@@ -35,8 +35,8 @@
 
 // ─── package imports ────────────────────────────────────────────────
 #import "@preview/shiroa:0.3.1": (
-  cross-link, is-html-target, is-pdf-target, is-web-target, shiroa-sys-target,
-  templates, x-current, x-url-base,
+  cross-link, is-html-target, is-pdf-target, is-web-target, plain-text,
+  shiroa-sys-target, templates, x-current, x-url-base,
 )
 #import templates: markup-rules, template-rules
 // tracey's `req()` rendering helper is no longer used — `#r()` below
@@ -738,14 +738,40 @@
         attrs: (class: "rio-footnote"),
         [ (#it.body)],
       )
-      // Page <h1> from the chapter manifest title. Chapters carry no
-      // leading `= Title` of their own (docs-lint enforces); content
-      // starts at `==` or with prose. QA2-h1.
+      // Page <h1> from the chapter manifest title. QA2-h1.
       context {
         let t = _chapter-nav().title
         if t != "" {
           html.elem("h1", attrs: (class: "rio-chapter-title"), t)
         }
+      }
+      // Suppress redundant chapter-title headings: some chapters carry
+      // a leading `= <ManifestTitle>` (e.g., `= rio-gateway`); the
+      // synthetic <h1> above already renders it. Match by normalized
+      // text so chapters whose first `=` is a real section
+      // (`= Overview`, `= Threat Model`) are left alone — their
+      // hierarchy stays intact under the synthetic <h1>. QA3: the
+      // earlier per-file migration (delete/demote the first `=`)
+      // flattened the `==` children into 0.x siblings.
+      show heading.where(level: 1): h => context {
+        let title = lower(_chapter-nav().title).trim()
+        let h-text = lower(plain-text(h.body)).trim()
+        // Match exact, OR `rio-<title>` form (`= rio-gateway` vs
+        // manifest `Gateway`), OR title is a prefix of the heading
+        // (`= GC Enablement Checklist` vs `GC Enablement`;
+        // `= EKS Smoke Test Runbook` vs `EKS Smoke Test`). title==""
+        // (no manifest entry — book.typ/book-pdf.typ itself, or a
+        // chapter not in the summary) → never suppress.
+        if (
+          title != ""
+            and (
+              h-text == title
+                or h-text == "rio-" + title
+                or h-text.starts-with(title + " ")
+            )
+        ) {
+          none // suppress; <h1 class="rio-chapter-title"> covers it
+        } else { h }
       }
       it
       // QA #9/QA2-R3: prev/next chapter nav. mdbook's chrome.css
@@ -753,32 +779,37 @@
       //   .nav-wrapper      — mobile bottom buttons (display:none on
       //                        desktop, @media ≤1080px shows it)
       //   .nav-wide-wrapper — desktop floating side arrows
-      // cross-link wraps in <a> but doesn't pass attrs through, so put
-      // the chrome.css class on an inner span.
+      // Emit <a> directly (cross-link doesn't pass attrs) so the
+      // chrome.css class + rel + aria-label land on the link itself.
       context {
         let nav = _chapter-nav()
         if nav.prev != none or nav.next != none {
-          let nav-link(ch, cls, body) = if ch != none {
-            cross-link("/" + ch.path, html.elem(
-              "span",
-              attrs: (class: cls),
+          let nav-a(ch, cls, rel, body) = if ch != none {
+            html.elem(
+              "a",
+              attrs: (
+                class: cls,
+                rel: rel,
+                href: x-url-base + ch.path.replace(regex(".typ$"), ".html"),
+                aria-label: rel + ": " + ch.title,
+              ),
               body,
-            ))
+            )
           }
           html.elem(
             "nav",
             attrs: (class: "nav-wrapper", aria-label: "Page navigation"),
             {
-              nav-link(nav.prev, "mobile-nav-chapters previous", [←])
-              nav-link(nav.next, "mobile-nav-chapters next", [→])
+              nav-a(nav.prev, "mobile-nav-chapters previous", "prev", [←])
+              nav-a(nav.next, "mobile-nav-chapters next", "next", [→])
             },
           )
           html.elem(
             "nav",
             attrs: (class: "nav-wide-wrapper", aria-label: "Page navigation"),
             {
-              nav-link(nav.prev, "nav-chapters previous", [←])
-              nav-link(nav.next, "nav-chapters next", [→])
+              nav-a(nav.prev, "nav-chapters previous", "prev", [←])
+              nav-a(nav.next, "nav-chapters next", "next", [→])
             },
           )
         }

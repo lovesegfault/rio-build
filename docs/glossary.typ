@@ -6,6 +6,8 @@
 
 #show: rio.with(domains: none)
 
+= Glossary
+
 #print-glossary(
   glossary-entries,
   show-all: true,

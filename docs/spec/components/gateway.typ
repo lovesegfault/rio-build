@@ -1,6 +1,8 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: ("gw",))
 
+= rio-gateway
+
 The gateway is the entry point. It terminates SSH connections and speaks the
 Nix @worker-protocol, making rio-build appear as a standard Nix remote
 store/builder.

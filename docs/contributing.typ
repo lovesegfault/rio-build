@@ -1,7 +1,7 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: none)
 
-== Development Environment
+= Development Environment
 
 rio-build uses a Nix flake-based development environment. If you have
 #link("https://direnv.net/")[direnv] installed, the environment activates

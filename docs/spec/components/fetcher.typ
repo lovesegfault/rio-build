@@ -1,6 +1,8 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: ("fetcher", "builder", "store"))
 
+= rio-fetcher
+
 #gls("fod")-only executor. Same binary as rio-builder, launched with
 `RIO_EXECUTOR_KIND=fetcher`.
 

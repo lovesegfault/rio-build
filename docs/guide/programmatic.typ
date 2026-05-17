@@ -1,7 +1,7 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: none)
 
-== Programmatic build submission: gRPC
+= Programmatic build submission: gRPC
 
 For build submission from within the cluster or automation, use the `SubmitBuild` RPC directly:
 

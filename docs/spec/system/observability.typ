@@ -1,6 +1,8 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: ("obs", "common", "sched"))
 
+= Observability
+
 rio-build provides three pillars of observability: logs, metrics, and traces.
 
 == Build Log Storage

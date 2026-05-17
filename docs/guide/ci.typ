@@ -1,7 +1,7 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: none)
 
-== CI/CD: GitHub Actions + rio-build
+= CI/CD: GitHub Actions + rio-build
 
 Use GitHub Actions for evaluation and triggering, rio-build for execution:
 

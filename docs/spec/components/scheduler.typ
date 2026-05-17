@@ -4,7 +4,7 @@
 Receives derivation build requests, analyzes the @dag, and publishes work to
 executors via a bidirectional streaming RPC.
 
-== Responsibilities
+= Responsibilities
 
 - Parse derivation graphs from gateway requests
 - Query rio-store for cache hits (already-built outputs)

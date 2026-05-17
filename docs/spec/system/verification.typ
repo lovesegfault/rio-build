@@ -1,6 +1,8 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: ("ts",))
 
+= Verification
+
 == Protocol Conformance
 
 - Live-daemon golden tests: each test starts an isolated nix-daemon, exchanges

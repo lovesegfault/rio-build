@@ -1,7 +1,7 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: none)
 
-== Authentication Setup
+= Authentication Setup
 
 == SSH Key Configuration
 

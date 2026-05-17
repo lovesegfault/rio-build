@@ -1,6 +1,8 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: none)
 
+= Multi-Tenancy
+
 rio-build supports multi-tenant operation where multiple teams or projects
 share a single cluster with data isolation and resource controls.
 
