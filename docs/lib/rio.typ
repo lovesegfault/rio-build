@@ -631,7 +631,62 @@
   /* Code-block background (codly's HTML output is plain <pre><code>). */
   main pre { background: var(--quote-bg, #f6f8fa); padding: 0.8em 1em;
              border-radius: 4px; overflow-x: auto; }
+  /* Sidebar 1080 breakpoint: upstream index.js collapses at width<800;
+     mdbook proper uses ~1080. CSS-only override — below 1080,
+     default-hide unless explicitly .sidebar-visible (which the toggle
+     button sets). */
+  @media (max-width: 1080px) {
+    html:not(.sidebar-visible) .sidebar { transform: translateX(calc(0px - var(--sidebar-width))); }
+    html:not(.sidebar-visible) .page-wrapper { margin-left: 0; transform: none; }
+  }
+  /* Copy-to-clipboard button (rio-js below adds it to each <pre>). */
+  .rio-copy { position: absolute; top: .5em; right: .5em; padding: .2em .5em;
+              border: 1px solid var(--icons); border-radius: 3px;
+              background: var(--quote-bg, #f6f8fa); color: var(--icons);
+              cursor: pointer; font-size: .9em; opacity: 0; transition: opacity .15s; }
+  pre:hover .rio-copy, .rio-copy:focus { opacity: 1; }
   ```
+  // ←/→ nav keys + copy-button for <pre>. inline-assets emits as a
+  // data:application/javascript URI in <head>, so wrap in
+  // DOMContentLoaded. Self-contained — no upstream gate exists for
+  // either (checked themes/mdbook/mod.typ).
+  let rio-js = ```js
+  document.addEventListener('DOMContentLoaded', () => {
+    document.addEventListener('keydown', e => {
+      if (e.target.closest('input,textarea') || e.altKey || e.ctrlKey || e.metaKey) return;
+      const go = sel => { const a = document.querySelector(sel); if (a) location.href = a.href; };
+      if (e.key === 'ArrowLeft') go('a.nav-chapters.previous');
+      if (e.key === 'ArrowRight') go('a.nav-chapters.next');
+    });
+    document.querySelectorAll('main pre').forEach(pre => {
+      const b = document.createElement('button');
+      b.className = 'rio-copy'; b.textContent = '⧉'; b.title = 'Copy';
+      b.onclick = () => navigator.clipboard.writeText(pre.innerText)
+        .then(() => { b.textContent='✓'; setTimeout(()=>b.textContent='⧉', 1200); });
+      pre.style.position = 'relative'; pre.appendChild(b);
+    });
+  });
+  ```
+  // Favicon: monospace "r" on accent-colour circle, data-URI so it's
+  // self-contained (no extra file to deploy). inline-assets has no
+  // raw-html branch so emit via a tiny lang:"js" createElement append
+  // (compile-time constant href; no user input). URL-encoded SVG (typst
+  // has no built-in base64).
+  let _favicon-uri = (
+    "data:image/svg+xml,"
+      + "%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E"
+      + "%3Ccircle cx='16' cy='16' r='16' fill='"
+      + accent.to-hex().replace("#", "%23")
+      + "'/%3E"
+      + "%3Ctext x='16' y='24' text-anchor='middle' font-family='monospace' "
+      + "font-weight='bold' font-size='22' fill='%23fff'%3Er%3C/text%3E%3C/svg%3E"
+  )
+  let rio-favicon = raw(
+    lang: "js",
+    "(l=>{l.rel='icon';l.href=\""
+      + _favicon-uri
+      + "\";document.head.appendChild(l)})(document.createElement('link'));",
+  )
   show: if is-html {
     it => {
       show: template-rules.with(
@@ -647,7 +702,7 @@
         },
         plain-body: body,
         web-theme: "mdbook",
-        extra-assets: (rio-css,),
+        extra-assets: (rio-css, rio-js, rio-favicon),
       )
       show: markup-rules.with(
         web-theme: "mdbook",
