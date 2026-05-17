@@ -56,30 +56,37 @@ derivation is invalidated on `.proto` changes but not on Rust-only commits.
 = Dependency Graph
 
 #{
-  // Per-crate label: bold mono name over a small muted subtitle.
-  let crate(name, sub) = align(center)[
-    #text(font: "DejaVu Sans Mono", weight: 600, size: 0.85em, name)\
-    #text(size: 0.7em, fill: muted, sub)
-  ]
+  // QA5: full Cargo.toml descriptions made each node 80+ chars wide
+  // → 1539pt graph (~2051px), 3× column scroll. autograph 0.1.0 can't
+  // pass rankdir/nodesep to graphviz (its README says so), and dot
+  // already lays out TB — the ~1000pt width even without subtitles is
+  // ~8 consumer crates landing on one rank with dot's fixed inter-node
+  // spacing. Drop the description subtitle (repeated verbatim in
+  // §Module Structure right below) and use twopi (radial: most-shared
+  // deps near centre, consumers on the rim) — the only autograph-
+  // reachable engine that fits the 750px column.
+  let crate(name) = text(
+    font: "DejaVu Sans Mono",
+    weight: 600,
+    size: 0.75em,
+    name,
+  )
   let dev = (stroke: (paint: muted, dash: "dashed", thickness: 0.6pt))
   let opt = (stroke: (paint: rule-color, dash: "dotted", thickness: 0.6pt))
   figure(
     autograph.diagram(
-      engine: "dot",
+      engine: "twopi",
       node-shape: fletcher.shapes.rect,
       node-stroke: 0.6pt + rule-color,
-      node-inset: 0.6em,
+      node-inset: 0.4em,
       edge-stroke: 0.6pt,
       edge-corner-radius: 8pt,
       // Nodes AND edges derive from gen/workspace.json (each crate's
-      // Cargo.toml [package].description + [dependencies] /
-      // [dev-dependencies] / [target.*.dependencies] rio-* entries).
-      // bug_021: the hand-maintained list mis-classified scheduler→store
-      // as dev-only and omitted rio-auth/rio-lease nodes entirely.
-      .._ws.members.map(m => autograph.node(
-        label(m.name),
-        crate(m.name, [#m.description]),
-      )),
+      // Cargo.toml [dependencies] / [dev-dependencies] /
+      // [target.*.dependencies] rio-* entries). bug_021: the
+      // hand-maintained list mis-classified scheduler→store as dev-only
+      // and omitted rio-auth/rio-lease nodes entirely.
+      .._ws.members.map(m => autograph.node(label(m.name), crate(m.name))),
       .._ws
         .deps
         .pairs()

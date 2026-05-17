@@ -7,52 +7,59 @@
 
 #figure(
   caption: [Trust boundaries. The Cilium overlay encrypts node-to-node; SSH is the only external ingress.],
-  diagram(
-    spacing: (16mm, 12mm),
-    node-stroke: 0.5pt,
-    node((0, 1), [Untrusted\ (Nix clients)], name: <cl>),
-    node((1, 0.5), [rio-gateway], name: <gw>, fill: accent.lighten(88%)),
-    node((2, 0.5), [rio-scheduler], name: <sched>, fill: accent.lighten(88%)),
-    node((3, 0.5), [rio-store], name: <store>, fill: accent.lighten(88%)),
-    node((2, 1.5), [rio-builder], name: <ex>, fill: accent.lighten(88%)),
-    node((4, 0), [S3 (@irsa)], name: <s3>, shape: fletcher.shapes.cylinder),
-    node((4, 1), [PostgreSQL], name: <pg>, shape: fletcher.shapes.cylinder),
-    node(
-      (3, 1.5),
-      [nix sandbox\ #text(size: 0.85em)[(purity, NOT security)]],
-      name: <sb>,
-      stroke: (dash: "dashed"),
-    ),
-    edge(<cl>, <gw>, "-|>", [SSH], label-size: 0.8em),
-    edge(<gw>, <sched>, "-|>", [gRPC], label-size: 0.8em),
-    edge(<sched>, <store>, "-|>", [gRPC], label-size: 0.8em),
-    // QA4-#4: <ex>→<store> diagonal and <ex>→<sched> vertical both
-    // anchor labels at the <ex> vertex by default; label-side/pos
-    // separates them.
-    edge(
-      <ex>,
-      <store>,
-      "-|>",
-      [gRPC],
-      label-size: 0.8em,
-      label-side: right,
-      label-pos: 0.6,
-    ),
-    edge(<ex>, <sched>, "-|>", [gRPC], label-size: 0.8em, label-side: left),
-    edge(<store>, <s3>, "-|>"),
-    edge(<store>, <pg>, "-|>"),
-    edge(<ex>, <sb>, "-|>"),
-    node(
-      enclose: (<gw>, <sched>, <store>, <ex>),
-      stroke: (paint: muted, dash: "dashed"),
-      inset: 10pt,
-      snap: false,
-      align(top + left, text(
-        size: 0.8em,
-        fill: muted,
-      )[Cilium overlay (WireGuard node-to-node)]),
-    ),
-  ),
+  // QA5: was 764pt (~1019px) — clipped in the 750px column. Tightened
+  // horizontal spacing 16mm→8mm and shrank node text to 0.8em (≈30%
+  // width cut). The enclose-node label moved top-left → bottom-left so
+  // it sits on the dashed border instead of overlapping the gw box.
+  {
+    set text(size: 0.8em)
+    diagram(
+      spacing: (7mm, 11mm),
+      node-stroke: 0.5pt,
+      node((0, 1), [Untrusted\ (Nix clients)], name: <cl>),
+      node((1, 0.5), [rio-gateway], name: <gw>, fill: accent.lighten(88%)),
+      node((2, 0.5), [rio-scheduler], name: <sched>, fill: accent.lighten(88%)),
+      node((3, 0.5), [rio-store], name: <store>, fill: accent.lighten(88%)),
+      node((2, 1.5), [rio-builder], name: <ex>, fill: accent.lighten(88%)),
+      node((4, 0), [S3 (@irsa)], name: <s3>, shape: fletcher.shapes.cylinder),
+      node((4, 1), [PostgreSQL], name: <pg>, shape: fletcher.shapes.cylinder),
+      node(
+        (3, 1.5),
+        [nix sandbox\ #text(size: 0.85em)[(purity, NOT security)]],
+        name: <sb>,
+        stroke: (dash: "dashed"),
+      ),
+      edge(<cl>, <gw>, "-|>", [SSH], label-size: 0.8em),
+      edge(<gw>, <sched>, "-|>", [gRPC], label-size: 0.8em),
+      edge(<sched>, <store>, "-|>", [gRPC], label-size: 0.8em),
+      // QA4-#4: <ex>→<store> diagonal and <ex>→<sched> vertical both
+      // anchor labels at the <ex> vertex by default; label-side/pos
+      // separates them.
+      edge(
+        <ex>,
+        <store>,
+        "-|>",
+        [gRPC],
+        label-size: 0.8em,
+        label-side: right,
+        label-pos: 0.6,
+      ),
+      edge(<ex>, <sched>, "-|>", [gRPC], label-size: 0.8em, label-side: left),
+      edge(<store>, <s3>, "-|>"),
+      edge(<store>, <pg>, "-|>"),
+      edge(<ex>, <sb>, "-|>"),
+      node(
+        enclose: (<gw>, <sched>, <store>, <ex>),
+        stroke: (paint: muted, dash: "dashed"),
+        inset: 10pt,
+        snap: false,
+        align(bottom + left, text(
+          size: 0.8em,
+          fill: muted,
+        )[Cilium overlay (WireGuard node-to-node)]),
+      ),
+    )
+  },
 )
 
 === Boundary 1: Nix Client → Gateway (SSH)
