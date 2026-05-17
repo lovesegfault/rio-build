@@ -260,6 +260,8 @@ rec {
         awk '
           /<title>/ { sub(/<title>[^<]*<\/title>/,
                           "<title>Not Found – rio-build design book</title>") }
+          /class="menu-title"/ { sub(/class="menu-title">[^<]*</,
+                                     "class=\"menu-title\">Not Found<") }
           /<main>/ { in_main=1
                      print "            <main>"
                      print "              <h1 class=\"rio-chapter-title\">Not Found</h1>"
@@ -279,6 +281,7 @@ rec {
         mkdir -p $bin/bin
         makeWrapper ${pkgs.miniserve}/bin/miniserve $bin/bin/rio-docs \
           --add-flags "--index index.html" \
+          --add-flags "--header Cache-Control:no-cache" \
           --add-flags "$out"
       '';
 
