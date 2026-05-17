@@ -3,7 +3,7 @@
 
 GC mark-and-sweep deletes paths with no reachable references. Before enabling GC on a cluster, verify reference data is correct.
 
-= Prerequisites (must be true before enabling GC)
+== Prerequisites (must be true before enabling GC)
 
 + *Builder version*: All builders running a version with the @nar reference scanner (commit `9165dc23` or later). Check: `kubectl get pods -l app=rio-builder -o jsonpath='{.items[*].spec.containers[*].image}'`
 

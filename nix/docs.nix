@@ -295,7 +295,56 @@ rec {
         echo "FAIL: sla-sizing.html is $sz bytes (>7MB; equation/dedup regression?)" >&2
         exit 1
       fi
+      # QA2-h1: <h1> emitted from manifest title.
+      grep -q 'class="rio-chapter-title"' intro.html \
+        || { echo "FAIL: rio-chapter-title h1 missing (QA2-h1)" >&2; exit 1; }
+      # QA2-R3: nav-wide-wrapper present.
+      grep -q 'class="nav-wide-wrapper"' spec/components/gateway.html \
+        || { echo "FAIL: nav-wide-wrapper missing (QA2-R3)" >&2; exit 1; }
+      # QA2-D: no "pp." page-backrefs in HTML glossary.
+      if grep -q 'pp\.' glossary.html; then
+        echo "FAIL: glossary.html has 'pp.' page-backrefs (QA2-D)" >&2; exit 1
+      fi
       touch $out
     '';
+    # Serve-parity smoke. Runs raw shiroa build (no svg-dedup post-
+    # process), then asserts the CSS rules that make serve-mode correct
+    # are in the page (decoded from the data: URI) AND the search index
+    # covers all chapters. Catches R1/R2-class regressions where a fix
+    # is nix-postprocess-only.
+    serve-parity =
+      pkgs.runCommand "rio-docs-serve-parity"
+        (
+          typstEnv
+          // {
+            nativeBuildInputs = [
+              shiroaPkg
+              pkgs.jq
+              pkgs.coreutils
+            ];
+          }
+        )
+        ''
+          set -euo pipefail
+          export HOME=$TMPDIR XDG_DATA_HOME=$TMPDIR/.local/share
+          mkdir -p $XDG_DATA_HOME/typst
+          cp -rL "$TYPST_PACKAGE_CACHE_PATH" $XDG_DATA_HOME/typst/packages
+          chmod -R u+w $XDG_DATA_HOME/typst
+          cp -r ${compileRoot} root && chmod -R +w root && cd root
+          shiroa build --root . --mode static-html ${inputArgs} -d $TMPDIR/out .
+          # rio-css ships as data:text/css;base64,… — decode to grep.
+          # Last entry: rio-css comes after the bundled chrome/general/
+          # variables sheets in head.typ.
+          css=$(grep -oP 'data:text/css;base64,\K[A-Za-z0-9+/=]+' \
+            $TMPDIR/out/intro.html | tail -1 | base64 -d)
+          echo "$css" | grep -q '\[fill="#000000"\]' || {
+            echo "FAIL: serve-parity — [fill=#000000] CSS rule missing" >&2; exit 1; }
+          echo "$css" | grep -q '\[stroke="#000000"\]' || {
+            echo "FAIL: serve-parity — [stroke=#000000] CSS rule missing" >&2; exit 1; }
+          n=$(jq '.doc_urls | length' $TMPDIR/out/searchindex.json)
+          test "$n" -ge 30 || {
+            echo "FAIL: serve-parity — searchindex has $n docs (expected ≥30)" >&2; exit 1; }
+          touch $out
+        '';
   };
 }

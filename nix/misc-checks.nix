@@ -430,6 +430,18 @@ in
           echo "$stray" >&2
           fail=1
         fi
+        # Chapter-title convention: book.typ's manifest title is the
+        # page <h1>; chapter files must not carry their own `= Title`
+        # (would duplicate). QA2-h1. Gate on first-10-lines so
+        # section-level `=` deeper in the file (architecture.typ's
+        # `= Import-From-Derivation` etc.) is allowed.
+        while IFS= read -r ch; do
+          if head -10 "$typSrc/$ch" | grep -q '^= '; then
+            echo "FAIL: $ch has leading '= ' — manifest title is the h1; demote to '== ' or delete" >&2
+            fail=1
+          fi
+        done < <(grep -oE '#chapter\("[^"]+\.typ"' $typSrc/book.typ \
+          | sed 's/#chapter("//;s/"//')
         # #src("path") and (refs.gh)("path:L") name files in the repo.
         # Assert each exists. bug_016: verification.typ referenced a
         # deleted scenario file. --exclude-dir=lib: refs.typ/rio.typ's

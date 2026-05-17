@@ -5,7 +5,7 @@
 Manual walkthrough of `cargo xtask k8s qa --health -p eks`. Use this when the
 automated run fails or for first-time setup validation.
 
-= Prerequisites
+== Prerequisites
 
 - `terraform apply` complete (see `infra/eks/README.md`)
 - `kubectl` configured: `$(cd infra/eks && terraform output -raw kubeconfig_command)`
