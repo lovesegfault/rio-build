@@ -599,6 +599,13 @@
   .rio-frame svg { max-width: none; }   /* QA #4: don't shrink wide diagrams; let the wrapper scroll */
   .rio-figure figcaption { font-size: 0.92em; margin-top: 0.6em; }
   .rio-table { overflow-x: auto; max-width: 100%; }   /* QA #5 */
+  /* QA4-#5: scroll affordance for wide figures/tables. macOS auto-hides
+     scrollbars; without a hint, 2350px-wide diagrams look clipped. */
+  .rio-figure, .rio-table { scrollbar-width: thin; }
+  .rio-figure::-webkit-scrollbar, .rio-table::-webkit-scrollbar { height: 8px; }
+  .rio-figure::-webkit-scrollbar-thumb,
+  .rio-table::-webkit-scrollbar-thumb { background: var(--scrollbar, #c0c0c0);
+                                        border-radius: 4px; }
   .rio-req { border-left: 3px solid #d0d7de; padding: 0.5em 0 0.5em 1em; margin: 1em 0; }
   .rio-req-id { background: #f6f8fa; border-radius: 3px; padding: 0.1em 0.5em; font-size: 0.85em; }
   .rio-clue { border-left: 4px solid; border-radius: 4px; padding: 0.6em 1em; margin: 1em 0; }
