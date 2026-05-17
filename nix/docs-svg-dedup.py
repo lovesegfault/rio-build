@@ -53,6 +53,16 @@ for f in pathlib.Path(sys.argv[1]).rglob("*.html"):
     # #clip-path) and duplicate across frames. Strip them.
     out = out.replace(b'<defs id="glyph">', b"<defs>")
     out = out.replace(b'<defs id="clip-path">', b"<defs>")
+    # html.frame() emits both width="Npt" AND an inline
+    # style="width: Mem; height: Mem" computed at typst's font size
+    # (~10.5pt/em). The browser honours the inline style at the page's
+    # 16px/em → ~14% overshoot. The .rio-frame > svg { max-width: 100% }
+    # rule clamps width but can't override inline height (specificity),
+    # leaving letterbox bands. Strip the inline style; the width=/height=
+    # attrs + viewBox are sufficient.
+    out = re.sub(
+        rb'(<svg class="typst-doc"[^>]*?) style="[^"]*"', rb"\1", out
+    )
     # Dyn-paged renderer plumbing — useless in --mode static-html (no
     # .typst-doc elements; html.frame() emits final SVG). shiroa.js
     # polls /heartbeat (404 spam under miniserve); svg_utils.js
