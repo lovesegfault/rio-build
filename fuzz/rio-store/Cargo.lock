@@ -4077,6 +4077,7 @@ dependencies = [
  "httpdate",
  "metrics",
  "moka",
+ "prost",
  "reqwest",
  "rio-auth",
  "rio-common",

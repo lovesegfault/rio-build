@@ -818,26 +818,124 @@ impl StoreService for StoreServiceImpl {
         Ok(Response::new(()))
     }
 
-    // TODO(P0552): GetNarIndex / GetNarIndexBatch — proto landed at
-    // P0545; the handler (PG `nar_index` table + sync-on-miss recompute
-    // + indexer_loop) is P0551/P0552.
-    #[instrument(skip(self, _request), fields(rpc = "GetNarIndex"))]
+    /// PG hit → return; miss → synchronous recompute
+    /// (`r[store.index.sync-on-miss]`, bounded by
+    /// [`crate::nar_index::NAR_INDEX_SYNC_MAX_BYTES`]) write-through.
+    /// `NotFound` if the path has no complete manifest.
+    // r[impl store.index.rpc]
+    #[instrument(skip(self, request), fields(rpc = "GetNarIndex"))]
     async fn get_nar_index(
         &self,
-        _request: Request<rio_proto::types::GetNarIndexRequest>,
+        request: Request<rio_proto::types::GetNarIndexRequest>,
     ) -> Result<Response<rio_proto::types::NarIndex>, Status> {
-        Err(Status::unimplemented("GetNarIndex (P0552)"))
+        let nar_hash = parse_nar_hash(&request.into_inner().nar_hash)?;
+        let bytes = self.lookup_or_compute_nar_index(&nar_hash).await?;
+        let index = crate::nar_index::decode_entries(&bytes)
+            .map_err(|e| Status::data_loss(format!("corrupt nar_index row: {e}")))?;
+        Ok(Response::new(index))
     }
 
     type GetNarIndexBatchStream =
         tokio_stream::wrappers::ReceiverStream<Result<rio_proto::types::NarIndexResponse, Status>>;
 
-    #[instrument(skip(self, _request), fields(rpc = "GetNarIndexBatch"))]
+    /// Per-`nar_hash` responses, request order preserved. PG-hit only —
+    /// no sync-on-miss recompute (a wide miss set would block the RPC
+    /// for minutes); `index` absent for misses, `indexer_loop` fills
+    /// them within ~5 s.
+    // r[impl store.index.rpc]
+    #[instrument(skip(self, request), fields(rpc = "GetNarIndexBatch"))]
     async fn get_nar_index_batch(
         &self,
-        _request: Request<rio_proto::types::GetNarIndexBatchRequest>,
+        request: Request<rio_proto::types::GetNarIndexBatchRequest>,
     ) -> Result<Response<Self::GetNarIndexBatchStream>, Status> {
-        Err(Status::unimplemented("GetNarIndexBatch (P0552)"))
+        let req = request.into_inner();
+        if req.nar_hashes.len() > self.max_batch_paths {
+            return Err(Status::invalid_argument(format!(
+                "GetNarIndexBatch: {} hashes exceeds max {}",
+                req.nar_hashes.len(),
+                self.max_batch_paths,
+            )));
+        }
+        let pool = self.pool.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(async move {
+            for raw in req.nar_hashes {
+                let resp = match parse_nar_hash(&raw) {
+                    Err(e) => Err(e),
+                    Ok(h) => match metadata::get_nar_index(&pool, &h).await {
+                        Err(e) => Err(metadata_status("GetNarIndexBatch", e)),
+                        Ok(opt) => Ok(rio_proto::types::NarIndexResponse {
+                            nar_hash: raw,
+                            index: match opt {
+                                None => None,
+                                Some(b) => match crate::nar_index::decode_entries(&b) {
+                                    Ok(idx) => {
+                                        metrics::counter!("rio_store_nar_index_cache_hits_total")
+                                            .increment(1);
+                                        Some(idx)
+                                    }
+                                    Err(e) => {
+                                        let _ = tx
+                                            .send(Err(Status::data_loss(format!(
+                                                "corrupt nar_index row: {e}"
+                                            ))))
+                                            .await;
+                                        return;
+                                    }
+                                },
+                            },
+                        }),
+                    },
+                };
+                if tx.send(resp).await.is_err() {
+                    return; // client disconnected
+                }
+            }
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+}
+
+/// 32-byte nar_hash from a wire request, or `INVALID_ARGUMENT`.
+fn parse_nar_hash(raw: &[u8]) -> Result<[u8; 32], Status> {
+    raw.try_into().map_err(|_| {
+        Status::invalid_argument(format!("nar_hash must be 32 bytes, got {}", raw.len()))
+    })
+}
+
+impl StoreServiceImpl {
+    /// `nar_index` PG read with sync-on-miss recompute. Shared by
+    /// `GetNarIndex`; the batch RPC takes the PG-hit-only fast path.
+    async fn lookup_or_compute_nar_index(&self, nar_hash: &[u8; 32]) -> Result<Vec<u8>, Status> {
+        if let Some(b) = metadata::get_nar_index(&self.pool, nar_hash)
+            .await
+            .map_err(|e| metadata_status("GetNarIndex", e))?
+        {
+            metrics::counter!("rio_store_nar_index_cache_hits_total").increment(1);
+            return Ok(b);
+        }
+        let store_path = metadata::path_by_nar_hash(&self.pool, nar_hash)
+            .await
+            .map_err(|e| metadata_status("GetNarIndex", e))?
+            .ok_or_else(|| Status::not_found("no complete manifest for nar_hash"))?;
+        crate::nar_index::compute(
+            &self.pool,
+            self.chunk_cache.as_ref(),
+            &store_path,
+            crate::nar_index::NAR_INDEX_SYNC_MAX_BYTES,
+        )
+        .await
+        .map_err(|e| {
+            // Over-cap is a deferral, not a failure: the indexer loop
+            // will pick it up; tell the client to retry, not give up.
+            if e.is::<crate::nar_index::OverSyncCap>() {
+                return Status::resource_exhausted(e.to_string());
+            }
+            error!(store_path, error = %e, "GetNarIndex sync-on-miss compute failed");
+            Status::internal(format!("nar_index compute failed: {e}"))
+        })
     }
 }
 

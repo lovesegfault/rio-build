@@ -9,7 +9,7 @@
 use super::*;
 use rio_nix::store_path::StorePath;
 use sqlx::PgPool;
-use tracing::instrument;
+use tracing::{debug, instrument};
 
 // narinfo_cols! is #[macro_export] so it lands at crate root — re-import.
 use crate::narinfo_cols;
@@ -334,10 +334,9 @@ pub(crate) async fn find_missing_paths(
 /// Uses `idx_narinfo_nar_hash` (migration 002_store.sql). Without it, every NAR
 /// fetch would seq-scan narinfo.
 ///
-/// Currently no production caller (the substituter's dedup check was
-/// subsumed by `claim_placeholder`'s `AlreadyComplete` arm); kept for the
-/// planned binary-cache HTTP server.
-#[allow(dead_code)]
+/// `GetNarIndex` sync-on-miss uses this to find a `store_path` to
+/// re-index from a `nar_hash` request key. (The substituter's dedup
+/// check was subsumed by `claim_placeholder`'s `AlreadyComplete` arm.)
 #[instrument(skip(pool), fields(nar_hash = hex::encode(nar_hash)))]
 pub(crate) async fn path_by_nar_hash(pool: &PgPool, nar_hash: &[u8; 32]) -> Result<Option<String>> {
     // Multiple paths CAN have the same nar_hash (two fetchurl of the
@@ -471,6 +470,125 @@ pub(crate) async fn append_signatures(
             Ok(1)
         }
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// NAR index (ADR-022 P0551) — `nar_index` table primitives.
+//
+// `entries` is an encoded `rio.types.NarIndex` proto. The metadata
+// layer treats it as opaque bytes: encode/decode lives in
+// `nar_index.rs`. Keyed by `store_path_hash` with FK→`manifests`
+// `ON DELETE CASCADE`, so GC removes the index row alongside the
+// manifest.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Persist a computed NAR index and flip `nar_indexed` in one
+/// transaction. Idempotent: re-indexing overwrites. The leading
+/// `manifests` UPDATE row-locks the same row the GC sweep `FOR
+/// UPDATE`s, so a concurrent index/GC of the same path serializes;
+/// writing both in one txn also means a crash can't leave an
+/// indexed-but-still-pending row.
+// r[impl store.index.table-cascade]
+#[instrument(skip(pool, entries), fields(store_path_hash = hex::encode(store_path_hash), bytes = entries.len()))]
+pub async fn set_nar_index(
+    pool: &PgPool,
+    store_path_hash: &[u8; 32],
+    entries: &[u8],
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    // `status='complete'` gate: between `compute()`'s manifest read and
+    // this write, GC can sweep the path and a re-upload can re-claim
+    // the hash with a fresh `'uploading'` row. Without the gate the
+    // stale index would land on the new row and `nar_indexed=TRUE`
+    // would suppress re-indexing forever.
+    let claimed = sqlx::query(
+        "UPDATE manifests SET nar_indexed = TRUE \
+          WHERE store_path_hash = $1 AND status = 'complete'",
+    )
+    .bind(store_path_hash.as_slice())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0;
+    if !claimed {
+        debug!(
+            store_path_hash = %hex::encode(store_path_hash),
+            "manifest gone or re-claimed since compute(); skipping index write"
+        );
+        tx.rollback().await?;
+        return Ok(());
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO nar_index (store_path_hash, entries)
+        VALUES ($1, $2)
+        ON CONFLICT (store_path_hash) DO UPDATE SET entries = excluded.entries
+        "#,
+    )
+    .bind(store_path_hash.as_slice())
+    .bind(entries)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Fetch the encoded `NarIndex` by NAR hash — the wire key
+/// `GetNarIndex` receives. Asymmetric with [`set_nar_index`] (which
+/// takes the table PK `store_path_hash`): the table is GC-keyed on the
+/// path; the RPC is content-keyed on the NAR. Multiple paths can share
+/// a `nar_hash` (FOD dedup); they all have identical NAR bytes →
+/// identical index, so `LIMIT 1` is correct. `None` = not indexed yet
+/// (or path absent / GC'd).
+#[instrument(skip(pool), fields(nar_hash = hex::encode(nar_hash)))]
+pub async fn get_nar_index(pool: &PgPool, nar_hash: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+    let row: Option<(Vec<u8>,)> = sqlx::query_as(
+        r#"
+        SELECT i.entries
+        FROM nar_index i
+        INNER JOIN narinfo n ON i.store_path_hash = n.store_path_hash
+        INNER JOIN manifests m ON i.store_path_hash = m.store_path_hash
+        WHERE n.nar_hash = $1 AND m.status = 'complete'
+        LIMIT 1
+        "#,
+    )
+    .bind(nar_hash.as_slice())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(b,)| b))
+}
+
+/// Drain the indexer work-queue: complete, not-yet-indexed manifests,
+/// oldest first.
+#[instrument(skip(pool))]
+pub async fn list_nar_index_pending(pool: &PgPool, limit: i64) -> Result<Vec<(Vec<u8>, String)>> {
+    let rows: Vec<(Vec<u8>, String)> = sqlx::query_as(
+        r#"
+        SELECT m.store_path_hash, n.store_path
+        FROM manifests m
+        INNER JOIN narinfo n ON m.store_path_hash = n.store_path_hash
+        WHERE NOT m.nar_indexed AND m.status = 'complete'
+        ORDER BY m.updated_at ASC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Rotate a failed indexer-queue entry to the back so it doesn't starve
+/// newer paths. `'complete'` rows' `updated_at` is otherwise unused.
+pub async fn bump_nar_index_retry(pool: &PgPool, store_path_hash: &[u8]) -> Result<()> {
+    sqlx::query(
+        "UPDATE manifests SET updated_at = now() \
+          WHERE store_path_hash = $1 AND NOT nar_indexed AND status = 'complete'",
+    )
+    .bind(store_path_hash)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1066,6 +1184,90 @@ mod tests {
         assert!(
             !joined.contains("Seq Scan on narinfo"),
             "EXPLAIN should NOT seq-scan narinfo; got:\n{joined}"
+        );
+    }
+
+    /// `nar_index` round-trip + work-queue drain + FK cascade.
+    ///
+    /// - `set_nar_index` flips `nar_indexed` → row leaves the pending
+    ///   queue.
+    /// - GC of the manifest (cascade from narinfo DELETE) removes the
+    ///   `nar_index` row — no dangling indices.
+    // r[verify store.index.table-cascade]
+    #[tokio::test]
+    async fn nar_index_roundtrip_and_cascade() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let p = test_store_path("nar-index-a");
+        // Distinct nar_hash != store_path_hash so the get-by-nar_hash
+        // JOIN is actually exercised, not coincidentally satisfied by
+        // the seed default (nar_hash == path_hash when unset).
+        let nar_hash = [0xBB; 32];
+        let hash_vec = StoreSeed::raw_path(&p)
+            .with_nar_hash(nar_hash)
+            .with_inline_blob(b"x".as_slice())
+            .seed(&db.pool)
+            .await;
+        let hash: [u8; 32] = hash_vec.as_slice().try_into().unwrap();
+
+        // Pending until indexed.
+        let pending = list_nar_index_pending(&db.pool, 10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, hash_vec);
+        assert_eq!(pending[0].1, p);
+        assert!(get_nar_index(&db.pool, &nar_hash).await.unwrap().is_none());
+
+        // Set (by store_path_hash) → readable (by nar_hash) + drained
+        // from queue.
+        set_nar_index(&db.pool, &hash, b"encoded-nar-index")
+            .await
+            .unwrap();
+        assert_eq!(
+            get_nar_index(&db.pool, &nar_hash).await.unwrap().as_deref(),
+            Some(b"encoded-nar-index".as_slice())
+        );
+        assert!(
+            list_nar_index_pending(&db.pool, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Idempotent overwrite.
+        set_nar_index(&db.pool, &hash, b"v2").await.unwrap();
+        assert_eq!(
+            get_nar_index(&db.pool, &nar_hash).await.unwrap().as_deref(),
+            Some(b"v2".as_slice())
+        );
+
+        // GC: DELETE narinfo cascades through manifests to nar_index.
+        sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1")
+            .bind(hash.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(get_nar_index(&db.pool, &nar_hash).await.unwrap().is_none());
+        let count: (i64,) = sqlx::query_as("SELECT count(*) FROM nar_index")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 0, "FK cascade must remove nar_index row");
+    }
+
+    /// Uploading manifests are invisible to the index work-queue and
+    /// to `get_nar_index`.
+    #[tokio::test]
+    async fn nar_index_uploading_invisible() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let p = test_store_path("nar-index-uploading");
+        StoreSeed::raw_path(&p)
+            .with_manifest_status("uploading")
+            .seed(&db.pool)
+            .await;
+        assert!(
+            list_nar_index_pending(&db.pool, 10)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }

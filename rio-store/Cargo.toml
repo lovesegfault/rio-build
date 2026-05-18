@@ -49,6 +49,7 @@ server = [
   "dep:clap",
   "dep:metrics",
   "dep:anyhow",
+  "dep:prost",
   "dep:scopeguard",
   "dep:serde",
   "dep:serde_json",
@@ -149,6 +150,9 @@ metrics = { workspace = true, optional = true }
 
 # Error handling
 anyhow = { workspace = true, optional = true }
+# Encode/decode `rio.types.NarIndex` for the `nar_index.entries` BYTEA
+# column (nar_index.rs). Already in the deptree via tonic-prost.
+prost = { workspace = true, optional = true }
 # Advisory lock RAII: detach PoolConnection on ANY exit (including
 # cancel) so PG session-scoped lock auto-releases. Round 4 Z2/Z7.
 scopeguard = { workspace = true, optional = true }
