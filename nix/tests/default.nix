@@ -283,8 +283,8 @@ in
   #   Lix. Lix is policy-frozen at daemon protocol 1.35, so this
   #   exercises rio's MIN_CLIENT_VERSION floor and the ≥1.37
   #   BuildResult.cpu_* gate against a real ssh-ng client end-to-end.
-  #   Single Lix test in checks — wire-level Lix-as-daemon coverage
-  #   lives in the weekly .#golden-matrix.
+  #   Single Lix VM test in checks — wire-level Lix-as-daemon coverage
+  #   lives in checks.golden-lix (golden_conformance against pkgs.lix).
   vm-protocol-warm-lix-standalone = protocol {
     inherit pkgs common;
     nameSuffix = "-lix";

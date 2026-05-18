@@ -16,9 +16,8 @@
 
 == Multi-Nix compatibility matrix
 
-Per-push CI runs conformance tests against the single Nix version pinned in
-`flake.nix` (`inputs.nix`). The *weekly* tier runs the full matrix via
-`.#golden-matrix` --- four daemon variants:
+Per-push CI runs `golden_conformance` against four daemon variants
+(`checks.golden-<variant>`):
 
 #table(
   columns: (auto, auto, 1fr),
@@ -37,9 +36,10 @@ Per-push CI runs conformance tests against the single Nix version pinned in
     policy-frozen at protocol 1.35 = `MIN_CLIENT_VERSION` floor coverage],
 )
 
-All four daemons come from the pinned nixpkgs (no separate flake inputs), so
-the weekly cron tests the locked nixpkgs; bump nixpkgs separately to test newer
-versions.
+Three of four daemons come from the pinned nixpkgs (no separate flake inputs)
+and substitute from cache.nixos.org; only `nix-pinned` builds from
+`inputs.nix`. gen-matrix's cache-filter skips all four on PRs that don't touch
+the conformance binary's closure.
 
 Test harness reads `RIO_GOLDEN_DAEMON_BIN` (absolute daemon path) and
 `RIO_GOLDEN_DAEMON_VARIANT` (skip-list key). Per-variant skips live in
@@ -60,9 +60,7 @@ rio-as-daemon):
   `test_golden_live_handshake` skipped for Lix until the comparator tolerates
   feature-set supersets
 
-`nix build .#golden-matrix` produces a linkfarm keyed by variant; `ls result/`
-shows one dir per daemon. Cold-cache build time \~60--90min (three full Nix
-source-tree builds); subsequent warm runs are minutes.
+`nix build .#checks.x86_64-linux.golden-<variant>` runs one variant locally.
 
 = Fuzzing
 
@@ -202,13 +200,12 @@ code the tests don't actually constrain. tracey answers "is this spec rule
 covered"; mutants answers "does the test that covers it actually catch bugs."
 Complementary signals.
 
-*Weekly tier, not per-push.* Mutation testing is O(mutations × test-suite-time);
+*Dev-only, not per-push.* Mutation testing is O(mutations × test-suite-time);
 for the scoped target set (\~320 mutations, scheduler state machine / wire
-primitives / ATerm parser / HMAC / manifest) it's hours per run. The
-#src(".github/workflows/weekly.yml") `mutants` job builds `.#mutants` and
-surfaces caught/missed counts in the job summary. *Missed-count is a trend
-metric, not a gate* --- the job does not fail on nonzero. Diff week-over-week;
-an increase means a recent change weakened a test or introduced untested code.
+primitives / ATerm parser / HMAC / manifest) it's hours per run. Build with
+`nix build .#mutants .#mutants.report-assert` when wanted; *missed-count is a
+trend metric, not a gate* --- compare against a prior run. An increase means a
+recent change weakened a test or introduced untested code.
 
 *Scoping* lives in #src(".config/mutants.toml"): `examine_globs` lists
 high-signal files where a surviving mutant is a genuine gap (not "you didn't

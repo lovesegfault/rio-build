@@ -195,9 +195,8 @@ let
     '';
 in
 {
-  # Per-workspace crate2nix tree, exposed under
-  # legacyPackages.fuzz-builds for debugging
-  # (`nix build .#fuzz-builds.rio-nix-fuzz && ls result/bin/`).
+  # Per-workspace crate2nix tree. Consumed by checks.fuzz-* (the
+  # runs depend on these as inputs); not re-exported standalone.
   builds = {
     inherit (rio-nix-fuzz-build.members) rio-nix-fuzz;
     inherit (rio-store-fuzz-build.members) rio-store-fuzz;

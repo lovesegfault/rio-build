@@ -765,7 +765,7 @@
                 # recursion (nodeSystem ≠ eval system is the common
                 # case: x86 host builds the aarch64 AMI).
                 rioSeedImages = [
-                  inputs.self.packages.${nodeSystem}.docker-executor-seed
+                  inputs.self.packages.${nodeSystem}.dockerImages.executorSeed
                 ];
               };
               modules = [
@@ -943,24 +943,17 @@
               )
             ) allTests);
 
-          vmTests = removeAttrs (mkVmTests {
+          vmTests = mkVmTests {
             inherit rio-workspace dockerImages;
             coverage = false;
-          }) vmTestsManual;
-
-          # VM tests not in the merge gate. Exposed under
-          # `legacyPackages.vm-manual.<name>` for `nix build` runs. A test
-          # lands here when its fixture infrastructure is sound (eval +
-          # driverInteractive build green) but the e2e iteration loop is
-          # too long for the per-PR gate, or it depends on a known gap
-          # tracked elsewhere. Each entry MUST have a comment naming the
-          # gating gap; remove the entry (NOT the test) once the gap is
-          # closed.
-          vmTestsManual = [ ];
+          };
 
           # Coverage-mode VM tests. Not in `checks` (too slow for flake
-          # check) — exposed as packages.cov-vm-<scenario> for manual runs
-          # + consumed by nix/coverage.nix for the merged lcov.
+          # check) — consumed by nix/coverage.nix for the per-test +
+          # merged lcov (packages.coverage.vm-*). Each per-test lcov
+          # exposes its raw run at `.raw` via passthru, so
+          # `.#coverage.vm-<scenario>.raw` builds just the
+          # coverage-mode VM test (profraws at result/coverage/).
           vmTestsCov =
             removeAttrs
               (mkVmTests {
@@ -980,18 +973,15 @@
               # nixos-node boots no rio-* binaries (nodeadm + kubelet only) —
               # zero profraws, so a coverage-mode rebuild is wasted CI time
               # and would skew after_n_builds.
-              (
-                [
-                  "vm-lifecycle-prod-parity-k3s"
-                  "vm-nixos-node"
-                  # Lix client variant: rio-side coverage is identical to
-                  # vm-protocol-warm-standalone (only the client differs,
-                  # and the client isn't instrumented). Excluding keeps
-                  # after_n_builds stable.
-                  "vm-protocol-warm-lix-standalone"
-                ]
-                ++ vmTestsManual
-              );
+              [
+                "vm-lifecycle-prod-parity-k3s"
+                "vm-nixos-node"
+                # Lix client variant: rio-side coverage is identical to
+                # vm-protocol-warm-standalone (only the client differs,
+                # and the client isn't instrumented). Excluding keeps
+                # after_n_builds stable.
+                "vm-protocol-warm-lix-standalone"
+              ];
 
           # --------------------------------------------------------------
           # Coverage merge pipeline (Linux-only — depends on vmTestsCov)
@@ -1027,9 +1017,11 @@
           # --------------------------------------------------------------
           #
           # Runs golden_conformance against 4 daemon variants: pinned Nix,
-          # nixpkgs nix_2_28, nixVersions.git, lix. Weekly cron
-          # invokes `nix build .#golden-matrix`. NOT a check — packages
-          # tier so `nix flake check` doesn't pull the extra daemons.
+          # nixpkgs nix_2_28, nixVersions.git, lix. In `checks` as
+          # golden-<variant> — 3/4 daemons substitute from cache.nixos.org
+          # so per-PR cost is just the nextest invocations, and gen-matrix
+          # cache-filters them when the conformance binary's closure
+          # didn't change.
           goldenMatrix = import ./nix/golden-matrix.nix {
             inherit pkgs inputs system;
             inherit (crateChecks) mkNextestRun;
@@ -1140,58 +1132,18 @@
         in
         {
           # Free-form, not enumerated by `nix flake show`, not checked
-          # by `nix flake check`. Debug/manual targets that shouldn't
-          # bloat `packages` enumeration but stay reachable for
-          # targeted `nix build .#legacyPackages.<sys>.<path>`.
+          # by `nix flake check`. Things that tooling reaches into by
+          # path (CI, xtask) or that are nested debug maps. Everything
+          # that was a flat re-export of an internal let-binding with
+          # zero external callers is gone — the let-bindings stay, the
+          # `.#<name>` alias does not.
           legacyPackages = {
             # The top-level `flake.githubActions` alias makes this
-            # accessible as `.#githubActions.*`.
+            # accessible as `.#githubActions.*` (ci.yml's GHA env).
             inherit githubActions;
-            # Per-member crate2nix bins (rio-scheduler, rio-common, ...).
-            # `packages.workspace` is the canonical aggregate.
-            member-bins = crateBuild.memberBins;
-            # Helm charts from nixhelm (unpacked dirs). xtask + the
-            # README symlink workflow consume these.
+            # Helm charts from nixhelm (unpacked dirs). xtask
+            # `.#helm.<name>` + the README symlink workflow consume.
             helm = subcharts;
-            # Compiled fuzz target binaries — `checks.fuzz-*` consume
-            # these as inputs. Debug: `nix build
-            # .#legacyPackages.<sys>.fuzz-builds.rio-nix-fuzz`.
-            fuzz-builds = fuzz.builds;
-            # Per-member test binaries (`rustc --test`). nextest
-            # consumes these via crateChecks.testBins; exposed here
-            # for "why is this binary 227MB" debugging.
-            test-bins = crateChecks.testBins;
-            # Toolchain wrappers — debugging the arg-filtering.
-            inherit (crateChecks)
-              clippyRustc
-              rustdocRustc
-              nextest
-              nextestMetadata
-              ;
-            # Spec-coverage tool — standalone build for pin bumps.
-            tracey = traceyPkg;
-            shiroa = shiroaPkg;
-            # Wrapped typst with the @preview/* package closure +
-            # fonts the design book uses. Debug: `nix run
-            # .#legacyPackages.<sys>.rioTypst -- compile foo.typ`.
-            inherit (docsLib) rioTypst;
-            # Instrumented workspace (symlinkJoin). Inspection:
-            #   objdump -h result/bin/rio-store | grep llvm_prf
-            workspace-cov = crateBuildCov.workspace;
-            inherit rio-workspace-cov;
-          }
-          // {
-            # Coverage-mode VM test runs: cov-vm.<scenario>. Raw
-            # profraws at result/coverage/<node>/. NOT lcovs — for
-            # those see packages.coverage.passthru.<name>.
-            cov-vm = vmTestsCov;
-            # Manual VM tests not in `checks` — see `vmTestsManual`
-            # comment for the per-entry gating gap. Build one with
-            # `nix build .#legacyPackages.x86_64-linux.vm-manual.<name>`.
-            vm-manual = pkgs.lib.getAttrs vmTestsManual (mkVmTests {
-              inherit rio-workspace dockerImages;
-              coverage = false;
-            });
           };
 
           # Import rust-overlay
@@ -1326,78 +1278,75 @@
             # layer. Regenerate the committed copy:
             #   nix build .#tfvars && jq -S . result > infra/eks/generated.auto.tfvars.json
             tfvars = pkgs.writeText "generated.auto.tfvars.json" (builtins.toJSON (import ./nix/pins.nix));
-            # crate2nix CLI for the dev shell (`crate2nix generate
-            # --format json -o Cargo.json` regenerates after lockfile
-            # changes).
-            crate2nix-cli = crate2nixCli;
             # Typst design book outputs.
             inherit (docsLib) docs docs-pdf;
           }
-          # Container images: docker-{gateway,scheduler,store,worker}
-          # plus a linkFarm aggregate at `.#dockerImages` (milestone
-          # target per phase-2b design).
+          # Container images. `.#dockerImages` is the linkFarm xtask
+          # `eks push` walks; individual images at `.#dockerImages.<name>`
+          # via passthru (gateway, scheduler, store, builder, controller,
+          # bootstrap, dashboard, executorSeed, vmTestSeed). The flat
+          # `docker-<name>` aliases are gone — pure re-exports, no callers.
+          # overrideAttrs (not `drv // { passthru = … }`) so mkDerivation's
+          # extendDerivation promotes passthru attrs to top-level — that's
+          # what makes `.#dockerImages.executorSeed` resolve.
           // {
-            docker-gateway = dockerImages.gateway;
-            docker-scheduler = dockerImages.scheduler;
-            docker-store = dockerImages.store;
-            docker-builder = dockerImages.builder;
-            docker-controller = dockerImages.controller;
-            docker-bootstrap = dockerImages.bootstrap;
-            docker-dashboard = dockerImages.dashboard;
-            # AMI layer-cache seed (oci-archive tarball, builder ref;
-            # fetcher pods use the same image). NOT pushed to ECR —
-            # baked into the NixOS node AMI's containerd content store.
-            docker-executor-seed = dockerImages.executorSeed;
-            # k3s VM-test seed (oci-archive tarball, all component
-            # refs, deduped layers). NOT pushed to ECR — preloaded via
-            # services.k3s.images in nix/tests/fixtures/k3s-full.nix.
-            # Replaces the former docker-all aggregate (W1: that image
-            # was pushed to ECR via the linkFarm below despite never
-            # being used on EKS).
-            docker-vmtest-seed = dockerImages.vmTestSeed;
-            dockerImages = pkgs.linkFarm "rio-docker-images" (
-              pkgs.lib.mapAttrsToList
-                (name: drv: {
-                  name = "${name}.tar.zst";
-                  path = drv;
-                })
-                (
-                  # push.rs walks this linkFarm and runs `skopeo copy
-                  # docker-archive:` on every entry. Structural filter:
-                  # only attrs produced by dockerTools.buildLayeredImage
-                  # (which sets passthru.imageTag) are pushable. This
-                  # excludes oci-archive seeds (executorSeed/vmTestSeed →
-                  # AMI/k3s, not ECR), parity checks, and non-image
-                  # passthrus exported for misc-checks (bootstrapScript,
-                  # dashboardReadonlyMethods, dashboardNginxConf). A
-                  # removeAttrs denylist here previously leaked
-                  # dashboardNginxConf → ECR rejected the camelCase repo
-                  # name; the imageTag gate makes that class of leak
-                  # unrepresentable.
-                  pkgs.lib.filterAttrs (_: v: pkgs.lib.isDerivation v && v ? imageTag) dockerImages
-                )
-            );
+            dockerImages =
+              (pkgs.linkFarm "rio-docker-images" (
+                pkgs.lib.mapAttrsToList
+                  (name: drv: {
+                    name = "${name}.tar.zst";
+                    path = drv;
+                  })
+                  (
+                    # push.rs walks this linkFarm and runs `skopeo copy
+                    # docker-archive:` on every entry. Structural filter:
+                    # only attrs produced by dockerTools.buildLayeredImage
+                    # (which sets passthru.imageTag) are pushable. This
+                    # excludes oci-archive seeds (executorSeed/vmTestSeed →
+                    # AMI/k3s, not ECR), parity checks, and non-image
+                    # passthrus exported for misc-checks (bootstrapScript,
+                    # dashboardReadonlyMethods, dashboardNginxConf). A
+                    # removeAttrs denylist here previously leaked
+                    # dashboardNginxConf → ECR rejected the camelCase repo
+                    # name; the imageTag gate makes that class of leak
+                    # unrepresentable.
+                    pkgs.lib.filterAttrs (_: v: pkgs.lib.isDerivation v && v ? imageTag) dockerImages
+                  )
+              )).overrideAttrs
+                (old: {
+                  # Full nix/docker.nix attrset (incl. the non-ECR
+                  # oci-archive seeds and misc-checks helpers that the
+                  # linkFarm filter above excludes).
+                  passthru = (old.passthru or { }) // dockerImages;
+                });
 
             # ──────────────────────────────────────────────────────────
             # NixOS EKS node AMI (ADR-021). Replaces bottlerocket@latest
             # for builder/fetcher Karpenter NodePools.
             #
-            #   nix build .#node-ami-x86_64    # → result/nixos-amazon-image-*.vhd
+            #   nix build .#ami                       # native to <system>
+            #   nix build .#packages.aarch64-linux.ami  # cross-target from x86
             #   cargo xtask k8s -p eks ami push --arch x86_64
             #
             # Output dir contains the disk image plus `nix-support/
             # image-info.json` (label, system, file, boot_mode) which
             # `xtask ami push` reads for coldsnap upload + register-image.
             #
-            # Per-arch attrs (NOT keyed off the eval host's `system`): the
-            # build host cross-builds both, like .#packages.<sys>.
-            # dockerImages. xtask asks for both explicitly.
+            # Keyed off the eval `system` (not flat per-arch attrs): the
+            # derivations are native to nodeSystem regardless of where
+            # they're exposed, so the path tells the truth. xtask asks
+            # for `.#packages.<target>-linux.ami` explicitly.
             # ──────────────────────────────────────────────────────────
-            node-ami-x86_64 = nodeAmi "x86_64-linux" { };
-            node-ami-aarch64 = nodeAmi "aarch64-linux" { };
-            # I-205: x86 .metal NodePool only — see nodeAmi comment.
-            node-ami-x86_64-bios = nodeAmi "x86_64-linux" { efi = false; };
-
+            ami = nodeAmi system { };
+          }
+          // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+            # I-205: x86 .metal SKUs are legacy-bios ONLY (zero support
+            # UEFI per `aws ec2 describe-instance-types`). arm64 .metal
+            # is UEFI, so this attr is meaningless there — see nodeAmi
+            # comment for the EC2NodeClass split.
+            ami-bios = nodeAmi system { efi = false; };
+          }
+          // {
             # CRD YAML for the crds-drift check. runCommand invokes
             # the crdgen binary and dumps Pool + ComponentScaler to
             # $out; misc-checks.nix:crds-drift splits it via
@@ -1419,29 +1368,39 @@
             # Coverage (manual — NOT a check)
             # ──────────────────────────────────────────────────────────
             #
-            # Three aggregates plus per-entry passthru:
             #   coverage      — unit + VM merged (~25min, needs KVM).
             #                   result/lcov.info, result/html/,
-            #                   result/per-test/. passthru.<name> is the
-            #                   per-entry lcov (unit-<crate> | vm-<scenario>)
-            #                   — same set as githubActions.matrix.coverage.
-            #   coverage-unit — lcov -a over per-crate unit lcovs (~5min)
-            #   coverage-vm   — lcov -a over per-scenario VM lcovs
-            #   coverage-html — html/ subdir of `coverage` only
+            #                   result/per-test/.
+            #   coverage.unit — lcov -a over per-crate unit lcovs (~5min)
+            #   coverage.vm   — lcov -a over per-scenario VM lcovs
+            #   coverage.html — html/ subdir only
+            #   coverage.{unit-<crate>,vm-<scenario>} — per-entry lcov,
+            #                   same set as githubActions.matrix.coverage
             coverage = coverage.full.overrideAttrs (old: {
-              passthru = (old.passthru or { }) // githubActions.matrix.coverage;
+              passthru =
+                (old.passthru or { })
+                # Per-entry lcovs (unit-<crate> | vm-<scenario>) — same
+                # set as githubActions.matrix.coverage.
+                // githubActions.matrix.coverage
+                // {
+                  # The two mid-tier aggregates and the html-only view.
+                  # `nix build .#coverage.unit` etc.
+                  unit = crateChecks.coverage;
+                  vm = coverage.vmLcov;
+                  html = pkgs.runCommand "rio-coverage-html" { } ''
+                    ln -s ${coverage.full}/html $out
+                  '';
+                };
             });
-            coverage-unit = crateChecks.coverage;
-            coverage-vm = coverage.vmLcov;
-            coverage-html = pkgs.runCommand "rio-coverage-html" { } ''
-              ln -s ${coverage.full}/html $out
-            '';
 
-            # Multi-Nix golden matrix (weekly). Under `packages` not
-            # `checks` → checks gate won't build the three extra Nix
-            # source trees on every push.
-            golden-matrix = goldenMatrix;
-            inherit mutants mutants-report-assert;
+            # Mutation-testing sweep. Dev-only (`nix build .#mutants`);
+            # multi-hour, not gated. report-assert is the cheap
+            # threshold gate that depends on the full sweep output.
+            mutants = mutants.overrideAttrs (old: {
+              passthru = (old.passthru or { }) // {
+                report-assert = mutants-report-assert;
+              };
+            });
           };
 
           # --------------------------------------------------------------
@@ -1458,6 +1417,8 @@
             // prefixed "clippy-test-" crateChecks.clippyTest
             // prefixed "doc-" crateChecks.doc
             // prefixed "nextest-" crateChecks.nextestRuns
+            # Wire-protocol conformance against 4 daemon variants.
+            // prefixed "golden-" goldenMatrix.runs
             // {
               dashboard = rioDashboard;
             }

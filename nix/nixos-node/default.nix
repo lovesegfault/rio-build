@@ -1,6 +1,6 @@
 # NixOS EKS worker node — top-level module.
 #
-# Composed into a nixosSystem from flake.nix as `.#node-ami-<arch>`. The
+# Composed into a nixosSystem from flake.nix as `.#packages.<arch>-linux.ami`. The
 # nixpkgs `maintainers/scripts/ec2/amazon-image.nix` builder module is
 # imported alongside this one (NOT here) so the same module tree can be
 # reused by P2's `nix/tests/nixos-node.nix` VM test without dragging in

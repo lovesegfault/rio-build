@@ -13,8 +13,9 @@
 # derivation if zero mutations were tested. Findings are a trend metric,
 # not a gate.
 #
-# `packages` not `checks` (same as golden-matrix): hours per run, not
-# something `nix flake check` should touch.
+# `packages` not `checks`: hours per run, not something `nix flake
+# check` should touch. Dev-only (`nix build .#mutants` when wanted);
+# no scheduled cron.
 #
 # crate2nix port: cargo-mutants fundamentally needs a writable cargo
 # workspace (it mutates source in-place and re-invokes `cargo build` +
@@ -216,9 +217,9 @@ let
 
   # Post-run report validator on the FULL mutants output. NOT a
   # smoke test — has `${mutants}` as a build input, so building
-  # this builds the multi-hour sweep. Weekly cron sequences `nix
-  # build .#mutants .#mutants-report-assert`; nix substitutes the
-  # mutants output from cache, so this adds O(seconds).
+  # this builds the multi-hour sweep. Dev-only: `nix build .#mutants
+  # .#mutants.report-assert`; nix substitutes the mutants output from
+  # cache if it was already built, so the assert adds O(seconds).
   # Belt-and-braces with the baseline-health gate inside `mutants`
   # itself — if that gate is relaxed, this still catches a void run.
   mutants-report-assert =

@@ -24,8 +24,8 @@
 #
 # I-205: x86_64 .metal SKUs are legacy-bios ONLY (zero support UEFI per
 # `aws ec2 describe-instance-types`), so metal NodeClaims can't use the
-# UEFI/UKI AMI on x86. rio-metal selects the `node-ami-x86_64-bios`
-# variant for amd64 and the regular UEFI image for arm64 (Graviton
+# UEFI/UKI AMI on x86. rio-metal selects the `ami-bios` variant
+# for amd64 and the regular UEFI image for arm64 (Graviton
 # .metal requires UEFI). Spec is otherwise identical to rio-default;
 # §13c: only the §13b `metal-*` hwClasses reference rio-metal (via
 # `nodeClass: rio-metal`), virtualized pools stay on rio-default

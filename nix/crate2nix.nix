@@ -108,7 +108,7 @@ let
       # zero deps so per-crate targets don't drag in the whole workspace
       # closure: `.#rio-builder` 491→344 rust drvs, `.#rio-nix` 429→87.
       # docker images consume `memberBins` per-component, so the win
-      # carries through to `.#docker-builder` etc.
+      # carries through to `.#dockerImages.builder` etc.
       #
       # NOTE: this must intercept `crate_` here, not via
       # `defaultCrateOverrides` below — buildRustCrate threads

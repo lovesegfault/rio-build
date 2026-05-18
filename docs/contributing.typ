@@ -69,13 +69,12 @@ nix-fast-build --flake .#checks.x86_64-linux --remote root@<builder>
   [`nix-fast-build .#checks.<system>`],
   [< 20 min],
 
-  [Weekly],
-  [Scheduled],
+  [On-demand],
+  [Dev-initiated],
   [
-    + golden-matrix (4 daemons), mutation testing, EKS cluster tests, chaos
-      tests, load tests
+    + mutation testing, EKS cluster tests, chaos tests, load tests
   ],
-  [`.#golden-matrix`, `.#mutants`],
+  [`.#mutants`, `xtask k8s qa`],
   [Unbounded],
 )
 

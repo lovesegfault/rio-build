@@ -1,7 +1,7 @@
 # Container images for each rio component, built via dockerTools.buildLayeredImage.
 #
 # Usage:
-#   nix build .#docker-gateway      # single image tarball at result
+#   nix build .#dockerImages.gateway      # single image tarball at result
 #   nix build .#dockerImages        # all at result/{gateway,scheduler,store,controller,builder}.tar.zst
 #   docker load < result/gateway.tar.zst
 #   docker run rio-gateway:dev --help

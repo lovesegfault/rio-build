@@ -439,7 +439,7 @@ async fn test_golden_live_add_signatures() -> anyhow::Result<()> {
 /// bug_139: `skip_fields()` is variant-aware. Under the default
 /// variant the handshake `features` field is compared (CppNix↔rio
 /// must agree); under `lix` it is skipped. The lix branch is
-/// integration-tested by `nix build .#golden-matrix`; this is the
+/// integration-tested by `checks.golden-lix`; this is the
 /// per-push guard that the BASE skip list (used by all 12
 /// `run_live_conformance` callers' handshake preamble) hasn't
 /// regressed.

@@ -923,8 +923,9 @@ karpenter:
   # ADR-021: NixOS node AMI (full cutover — no Bottlerocket). The
   # rio-default EC2NodeClass selects by `rio.build/ami=<tag>` EC2 tag
   # (one term per arch). `cargo xtask k8s -p eks up --ami` builds
-  # .#node-ami-{x86_64,aarch64}, registers them, tags rio.build/ami=
-  # <12-hex drvPath hash>, and writes .rio-ami-tag — `up --deploy`
+  # .#packages.{x86_64,aarch64}-linux.ami, registers them, tags
+  # rio.build/ami=<12-hex drvPath hash>, and writes .rio-ami-tag —
+  # `up --deploy`
   # reads that file (or recomputes the hash) and sets this. No
   # default: a missing tag is "AMI not built", not
   # "use whatever was last tagged".
@@ -1038,7 +1039,7 @@ karpenter:
 # the SPA Deployment (dashboard.yaml — nginx + static bundle).
 dashboard:
   enabled: false
-  # nginx pod carrying the Svelte dist/ bundle (nix build .#docker-
+  # nginx pod carrying the Svelte dist/ bundle (nix build .#dockerImages.
   # dashboard). Stateless — scale for availability, not load (static
   # SPA + thin proxy).
   replicas: 1

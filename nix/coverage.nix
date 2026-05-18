@@ -101,45 +101,54 @@ let
 
   mkPerTestLcov =
     name: vmTest:
-    pkgs.runCommand "rio-cov-${name}" { } ''
-      ${extractProfraws "${vmTest}/coverage"}
-      if [ "''${#profraws[@]}" -eq 0 ]; then
-        echo "WARNING: no profraws for ${name}, emitting empty lcov"
-        touch $out
-        exit 0
-      fi
-      ${sysroot}/llvm-profdata merge -sparse "''${profraws[@]}" -o $TMPDIR/m.profdata
-      # 2>/dev/null: llvm-cov writes warnings ("N functions have
-      # mismatched data") to stdout, which corrupts the lcov file.
-      # These warnings are expected (shared libs between binaries);
-      # stderr of lcov step shows any real issues.
-      # target/release/build/: generated proto code (tonic-prost-build
-      # output). Source doesn't exist in workspaceSrc (build artifact),
-      # so genhtml would fail. These are wrapper code, not ours —
-      # the real coverage signal is in rio-*/src/.
-      ${sysroot}/llvm-cov export \
-        --format=lcov \
-        --instr-profile=$TMPDIR/m.profdata \
-        ${objectFlags} \
-        --ignore-filename-regex='${ignoreRegex}' \
-        2>/dev/null > $TMPDIR/raw.lcov
-      # `-a` (add tracefile) is the operation; `--substitute`
-      # piggybacks on it. lcov requires one of -z/-c/-a/-e/-r/-l
-      # alongside --substitute (it's a modifier, not standalone).
-      # --ignore-errors unused: lcov 2.x errors on an unmatched
-      # --substitute pattern by default; crate2nix's already-
-      # normalized unit lcov may not match the VM stripPrefix.
-      ${pkgs.lcov}/bin/lcov --ignore-errors unused \
-        --substitute '${stripPrefix}' \
-        -a $TMPDIR/raw.lcov -o $TMPDIR/stripped.lcov
-      # Extract here, not in the aggregate: each raw VM lcov is
-      # ~165MB (every dep crate, ~16k SF entries) and shrinks ~160×
-      # to ~1MB after filtering to workspace paths. Doing it per-test
-      # makes vmLcov's `lcov -a` operate on ~24MB instead of ~4GB and
-      # cuts what gets cached/substituted by the same factor.
-      ${pkgs.lcov}/bin/lcov --ignore-errors unused,empty \
-        --extract $TMPDIR/stripped.lcov 'rio-*' -o $out
-    '';
+    pkgs.runCommand "rio-cov-${name}"
+      {
+        # Reachable as `.#coverage.vm-<scenario>.raw` — the
+        # coverage-mode VM run itself (result/coverage/<node>/
+        # profraw.tar.gz). Debugging the profraw→lcov pipeline
+        # without re-evaluating the whole NixOS config to find
+        # the input drv.
+        passthru.raw = vmTest;
+      }
+      ''
+          ${extractProfraws "${vmTest}/coverage"}
+        if [ "''${#profraws[@]}" -eq 0 ]; then
+          echo "WARNING: no profraws for ${name}, emitting empty lcov"
+          touch $out
+          exit 0
+        fi
+        ${sysroot}/llvm-profdata merge -sparse "''${profraws[@]}" -o $TMPDIR/m.profdata
+        # 2>/dev/null: llvm-cov writes warnings ("N functions have
+        # mismatched data") to stdout, which corrupts the lcov file.
+        # These warnings are expected (shared libs between binaries);
+        # stderr of lcov step shows any real issues.
+        # target/release/build/: generated proto code (tonic-prost-build
+        # output). Source doesn't exist in workspaceSrc (build artifact),
+        # so genhtml would fail. These are wrapper code, not ours —
+        # the real coverage signal is in rio-*/src/.
+        ${sysroot}/llvm-cov export \
+          --format=lcov \
+          --instr-profile=$TMPDIR/m.profdata \
+          ${objectFlags} \
+          --ignore-filename-regex='${ignoreRegex}' \
+          2>/dev/null > $TMPDIR/raw.lcov
+        # `-a` (add tracefile) is the operation; `--substitute`
+        # piggybacks on it. lcov requires one of -z/-c/-a/-e/-r/-l
+        # alongside --substitute (it's a modifier, not standalone).
+        # --ignore-errors unused: lcov 2.x errors on an unmatched
+        # --substitute pattern by default; crate2nix's already-
+        # normalized unit lcov may not match the VM stripPrefix.
+        ${pkgs.lcov}/bin/lcov --ignore-errors unused \
+          --substitute '${stripPrefix}' \
+          -a $TMPDIR/raw.lcov -o $TMPDIR/stripped.lcov
+        # Extract here, not in the aggregate: each raw VM lcov is
+        # ~165MB (every dep crate, ~16k SF entries) and shrinks ~160×
+        # to ~1MB after filtering to workspace paths. Doing it per-test
+        # makes vmLcov's `lcov -a` operate on ~24MB instead of ~4GB and
+        # cuts what gets cached/substituted by the same factor.
+        ${pkgs.lcov}/bin/lcov --ignore-errors unused,empty \
+          --extract $TMPDIR/stripped.lcov 'rio-*' -o $out
+      '';
 
   perTestLcov = lib.mapAttrs mkPerTestLcov vmTestsCov;
 

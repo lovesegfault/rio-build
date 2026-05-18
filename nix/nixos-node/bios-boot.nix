@@ -9,7 +9,7 @@
 # Karpenter CreateFleet → InvalidParameterValue on every candidate,
 # NodeClaims churned forever.
 #
-# This module is composed ONLY into `.#node-ami-x86_64-bios` (flake.nix
+# This module is composed ONLY into `.#packages.x86_64-linux.ami-bios` (flake.nix
 # nodeAmi efi=false). Virtualized x86 and all arm64 stay on uki-boot.nix.
 # nixpkgs amazon-image.nix already wires `boot.loader.grub.{device =
 # "/dev/xvda", timeout = 1, extraConfig = serial}` when `ec2.efi=false`;

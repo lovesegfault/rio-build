@@ -1117,7 +1117,7 @@ tags. Key choices:
   legacy-bios/grub for x86_64 `.metal`.* AWS x86_64 bare-metal SKUs reject UEFI
   AMIs (`InvalidParameterValue`) --- every entry through gen 8 reports
   `["legacy-bios"]` only. A UEFI-only x86 AMI made x86 metal nodes
-  unschedulable (I-205). `.#node-ami-x86_64-bios` builds the same module tree
+  unschedulable (I-205). `.#packages.x86_64-linux.ami-bios` builds the same module tree
   with `ec2.efi=false`; `xtask ami push` registers it alongside the UEFI
   variants and tags all three with `rio.build/boot={uefi,legacy-bios}`. A
   second EC2NodeClass `rio-metal` selects `(amd64, legacy-bios)` and `(arm64,

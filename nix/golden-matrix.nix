@@ -1,27 +1,23 @@
-# Multi-Nix golden conformance matrix (weekly tier — NOT in checks).
+# Multi-Nix golden conformance matrix.
 #
 # Runs `cargo-nextest run -E 'binary(golden_conformance)'` once per daemon
 # variant, each pointing at a different nix-daemon binary. Surfaces wire-
 # protocol divergences across Nix 2.28 / Nix pinned / Nix master / Lix
 # before they bite real clients.
 #
-# Output: a linkFarm keyed by variant name, each entry → the nextest run
-# result for that daemon. `nix build .#golden-matrix && ls result/` shows
-# one dir per variant.
-#
-# This deliberately lives under `packages` (not `checks`). Weekly cron
-# invokes `nix build .#golden-matrix` directly. Three of the four daemons
-# (nix-stable / nix-unstable / lix) come from nixpkgs rather than separate
-# flake inputs — drops 16 lock nodes and skips the 20-30 min source builds
-# the inputs would require. Trade-off: tracks nixpkgs's snapshot of each
-# daemon (days-to-weeks lag vs upstream HEAD), which is fine for a weekly
-# wire-protocol conformance check.
+# Exposed as `checks.golden-<variant>` (4 entries). Three of the four
+# daemons (nix-stable / nix-unstable / lix) come from nixpkgs rather than
+# separate flake inputs — drops 16 lock nodes and substitutes from
+# cache.nixos.org instead of source-building. Only nix-pinned builds from
+# source (inputs.nix, already cached for the dev shell). Per-variant cost
+# is one nextest invocation with a different nix-cli in PATH +
+# RIO_GOLDEN_DAEMON_BIN env; gen-matrix's cache-filter skips all four on
+# any PR that doesn't touch the conformance binary's closure.
 #
 # crate2nix port: reuses crateChecks.mkNextestRun (reuse-build mode — the
 # test binaries are already compiled by buildRustCrate, nextest just runs
 # them). nextestMeta is shared across all variants (it only depends on
-# testBinDrvs + workspaceSrc). Per-variant cost = one nextest invocation
-# with a different nix-cli in PATH + RIO_GOLDEN_DAEMON_BIN env.
+# testBinDrvs + workspaceSrc).
 {
   pkgs,
   inputs,
@@ -70,9 +66,6 @@ let
       ];
     };
 in
-pkgs.linkFarm "rio-golden-matrix" (
-  pkgs.lib.mapAttrsToList (variant: nixPkg: {
-    name = variant;
-    path = mkMatrixRun variant nixPkg;
-  }) daemons
-)
+{
+  runs = pkgs.lib.mapAttrs mkMatrixRun daemons;
+}

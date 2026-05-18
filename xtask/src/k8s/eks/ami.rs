@@ -1,7 +1,7 @@
 //! Build + register the NixOS node AMI (ADR-021).
 //!
-//!   1. `nix build .#node-ami-<arch>`  → result/ with disk image +
-//!      nix-support/image-info.json
+//!   1. `nix build .#packages.<system>.ami` → result/ with disk
+//!      image + nix-support/image-info.json
 //!   2. `coldsnap upload <image>`      → EBS snapshot (EBS Direct API,
 //!      no S3 / VM-Import round-trip)
 //!   3. `aws ec2 register-image` with `TagSpecification` → AMI ID,
@@ -50,7 +50,16 @@ pub enum AmiArch {
 /// the same content tag stay distinguishable (I-205).
 #[derive(Clone)]
 struct Target {
+    /// Short identifier used in EC2 AMI Name (`rio-nixos-node-…-{attr}`)
+    /// and UI step labels. Stable across the `node-ami-<attr>` →
+    /// `packages.<sys>.ami[-bios]` flake rename so existing AMI Names
+    /// stay matchable.
     attr: &'static str,
+    /// Full flake installable (`.#{installable}`). The flake exposes
+    /// `packages.<system>.ami` (UEFI) per system plus
+    /// `packages.x86_64-linux.ami-bios`; we address the target system
+    /// explicitly so cross-building from either host works.
+    installable: &'static str,
     ec2_arch: ArchitectureValues,
     k8s_arch: &'static str,
     boot: &'static str,
@@ -58,12 +67,14 @@ struct Target {
 
 const X86: Target = Target {
     attr: "x86_64",
+    installable: "packages.x86_64-linux.ami",
     ec2_arch: ArchitectureValues::X8664,
     k8s_arch: "amd64",
     boot: "uefi",
 };
 const ARM: Target = Target {
     attr: "aarch64",
+    installable: "packages.aarch64-linux.ami",
     ec2_arch: ArchitectureValues::Arm64,
     k8s_arch: "arm64",
     boot: "uefi",
@@ -74,6 +85,7 @@ const ARM: Target = Target {
 // rio-metal`) select this via the `rio-metal` EC2NodeClass.
 const X86_BIOS: Target = Target {
     attr: "x86_64-bios",
+    installable: "packages.x86_64-linux.ami-bios",
     ec2_arch: ArchitectureValues::X8664,
     k8s_arch: "amd64",
     boot: "legacy-bios",
@@ -100,10 +112,10 @@ struct ImageInfo {
 
 /// Content-addressed AMI tag: 12 hex chars of `sha256(∑ drvPaths)`.
 ///
-/// `nix eval .#node-ami-<arch>.drvPath` is fast (instantiation only,
+/// `nix eval .#<installable>.drvPath` is fast (instantiation only,
 /// no build) and deterministic — same flake.lock + module config
-/// → same drvPath → same tag. Hashing BOTH arches means the tag
-/// changes iff either AMI's content would, including arch-specific
+/// → same drvPath → same tag. Hashing ALL targets means the tag
+/// changes iff any AMI's content would, including arch-specific
 /// closure changes (e.g. arm firmware) that the x86 drvPath alone
 /// would miss. Called by `up --ami` to find/tag; deploy reads the
 /// tag back from EC2 (`resolve_latest_tag`), not by recomputing.
@@ -118,14 +130,14 @@ pub async fn ami_tag() -> Result<String> {
     for t in AmiArch::All.targets() {
         // Shell scoped tight so it isn't held across the await
         // (xshell::Shell is !Sync; keeping the future Send-clean).
-        let attr = t.attr;
+        let installable = t.installable;
         let fut = {
             let sh = shell()?;
-            run_read(cmd!(sh, "nix eval --raw .#node-ami-{attr}.drvPath"))
+            run_read(cmd!(sh, "nix eval --raw .#{installable}.drvPath"))
         };
         let drv = fut
             .await
-            .with_context(|| format!("evaluating .#node-ami-{attr}.drvPath"))?;
+            .with_context(|| format!("evaluating .#{installable}.drvPath"))?;
         h.update(drv.trim().as_bytes());
     }
     Ok(hex::encode(&h.finalize()[..6]))
@@ -183,7 +195,7 @@ async fn build_and_register_one(
     cluster: &str,
     t: &Target,
 ) -> Result<()> {
-    let (attr, k8s_arch) = (t.attr, t.k8s_arch);
+    let (attr, installable, k8s_arch) = (t.attr, t.installable, t.k8s_arch);
     // Per-target idempotency: a prior partial push (e.g. x86 done,
     // aarch64 interrupted) skips the done one.
     if let Some(existing) = find_existing(ec2, ami_tag, t).await? {
@@ -197,14 +209,14 @@ async fn build_and_register_one(
         let sh = shell()?;
         run_read(cmd!(
             sh,
-            "nix build -L --no-link --print-out-paths .#node-ami-{attr}"
+            "nix build -L --no-link --print-out-paths .#{installable}"
         ))
     };
-    let out = ui::step(&format!("nix build .#node-ami-{attr}"), || build).await?;
+    let out = ui::step(&format!("nix build .#{installable}"), || build).await?;
     let info = read_image_info(Path::new(out.trim()))?;
     anyhow::ensure!(
         info.boot_mode == t.boot,
-        ".#node-ami-{attr} built boot_mode={} but target expects {} — \
+        ".#{installable} built boot_mode={} but target expects {} — \
          flake nodeAmi efi arg out of sync with xtask Target table",
         info.boot_mode,
         t.boot
@@ -273,7 +285,7 @@ fn read_image_info(out: &Path) -> Result<ImageInfo> {
     let p = out.join("nix-support/image-info.json");
     let raw = std::fs::read_to_string(&p).with_context(|| {
         format!(
-            "reading {} — did `nix build .#node-ami-*` run?",
+            "reading {} — did `nix build .#packages.<system>.ami` run?",
             p.display()
         )
     })?;
