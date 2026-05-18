@@ -57,10 +57,6 @@ runs:
     # built-paths-only) instead of storescan (drain-time diff that
     # would re-push everything substituted from cache.nixos.org).
     #
-    # Forked at v1.0.1 + one fix: auth-token script uses
-    # process.execPath instead of bare `node` (ARC runners have no
-    # node on PATH). Upstream: Mic92/niks3-action#19 — switch back
-    # once it lands in a tag.
-    - uses: lovesegfault/niks3-action@2a806fb0e995fca12426623b2cf09a14439f70ff # v1.0.1+arc
+    - uses: Mic92/niks3-action@a3da573cc4d21634990e5f21391abe55ed49ec46 # v1.0.2
       with:
         server-url: ${{ inputs.niks3-url }}
