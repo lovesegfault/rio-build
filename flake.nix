@@ -1126,6 +1126,10 @@
             # the store path in its push — so the first job to
             # complete uploads it to S3, subsequent jobs substitute.
             inherit (inputs.niks3.packages.${system}) niks3;
+            # Parallel evaluator for gen-matrix's cache-aware filter
+            # (.github/scripts/gen-matrix.sh). Pinned via nixpkgs so
+            # the JSONL schema gen-matrix's jq depends on is stable.
+            inherit (pkgs) nix-eval-jobs;
           };
         in
         {
