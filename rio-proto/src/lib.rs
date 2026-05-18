@@ -189,6 +189,7 @@ pub use builder::executor_service_server::{ExecutorService, ExecutorServiceServe
 pub use scheduler::scheduler_service_client::SchedulerServiceClient;
 pub use scheduler::scheduler_service_server::{SchedulerService, SchedulerServiceServer};
 pub use store::chunk_service_server::{ChunkService, ChunkServiceServer};
+pub use store::directory_service_server::{DirectoryService, DirectoryServiceServer};
 pub use store::store_admin_service_client::StoreAdminServiceClient;
 pub use store::store_admin_service_server::{StoreAdminService, StoreAdminServiceServer};
 pub use store::store_service_client::StoreServiceClient;

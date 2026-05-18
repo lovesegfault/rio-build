@@ -230,6 +230,42 @@ message GetNarIndexRequest {
   bytes nar_hash = 1;        // 32-byte SHA-256
 }
 
+// ADR-022 castore RPC surface (P0573). Wire-compatible with snix's
+// castore.proto DirectoryService.Get for fields 1/2 (singular root).
+message GetDirectoryRequest {
+  // snix-compat: a single root, addressable by digest only today.
+  // Kept as a oneof so a future name-based selector slots in without
+  // a wire bump.
+  oneof by_what {
+    bytes digest = 1;        // 32-byte blake3 dir_digest
+  }
+  // false → exactly the requested body. true → server-side BFS of the
+  // whole subtree, deduped by digest (snix DirectoryService.Get
+  // semantics: roots first, then children).
+  bool recursive = 2;
+  // rio multi-root extension: BFS frontier seeded from {digest} ∪
+  // digests, deduped across all roots. The builder sends every closure
+  // dir_digest in one call (1 RPC instead of one per root — I-110
+  // lesson). snix clients omit the field (proto3 unknown-field) and
+  // stay wire-compatible.
+  repeated bytes digests = 3;
+}
+
+message HasDirectoriesRequest {
+  repeated bytes digests = 1;  // 32-byte blake3 dir_digests
+}
+
+message HasBlobsRequest {
+  repeated bytes digests = 1;  // 32-byte blake3 file_digests
+}
+
+// One bit per request index, LSB-first within each byte. Bit i set ⇔
+// digests[i] is present and tenant-visible. Length is
+// ceil(len(digests) / 8) bytes; trailing bits of the last byte are 0.
+message HasBitmap {
+  bytes bitmap = 1;
+}
+
 message GetNarIndexBatchRequest {
   repeated bytes nar_hashes = 1;
 }

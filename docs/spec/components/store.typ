@@ -687,7 +687,7 @@ snix-compatible Directory/Blob surface backed by `directories`/`file_blobs`
   `GetDirectory`/`HasDirectories`/`HasBlobs`/`ReadBlob`/`StatBlob` MUST be
   tenant-scoped: queries join `directory_tenants`/`file_blob_tenants` on the
   caller's `tenant_id` (from JWT `Claims.sub` or HMAC
-  `AssignmentClaims.tenant_id`, #rref("common.hmac.claims")) and return
+  `AssignmentClaims.tenant`, #rref("common.hmac.claims")) and return
   NotFound for digests the caller's tenant has not produced. Directory bodies
   leak child names/digests --- cross-tenant exposure here is a confidentiality
   issue, unlike the chunk-level surface (see "Cross-Tenant Chunk Probing" in

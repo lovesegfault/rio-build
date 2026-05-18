@@ -108,6 +108,14 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         "rio_store_check_available_duration_seconds",
         SUBSTITUTE_DURATION_BUCKETS,
     ),
+    (
+        // Digest-list length, not seconds: 1 (single probe) to the
+        // HAS_BATCH_MAX cap (65536). Chromium-scale closure ~25k.
+        "rio_store_directory_has_batch_size",
+        &[
+            1.0, 8.0, 32.0, 128.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0,
+        ],
+    ),
 ];
 
 /// Registers prometheus metric descriptions. The help strings here are
@@ -349,6 +357,16 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_nar_index_cache_hits_total",
         "GetNarIndex requests served from the nar_index table without recompute"
+    );
+
+    // ADR-022 castore RPC surface (P0573).
+    describe_histogram!(
+        "rio_store_directory_get_seconds",
+        "GetDirectory wall time per RPC (recursive BFS over the Directory DAG)"
+    );
+    describe_histogram!(
+        "rio_store_directory_has_batch_size",
+        "Digest-list length per HasDirectories/HasBlobs call (labeled rpc)"
     );
 
     // Pre-register drain gauges at 0. metrics-rs only materializes a gauge

@@ -45,6 +45,7 @@ use crate::substitute::{SubstituteError, Substituter};
 
 mod admin;
 mod chunk;
+mod directory;
 mod get_path;
 mod put_path;
 mod put_path_batch;
@@ -53,6 +54,7 @@ mod sign;
 
 pub use admin::StoreAdminServiceImpl;
 pub use chunk::{ChunkServiceImpl, GET_CHUNKS_K};
+pub use directory::DirectoryServiceImpl;
 
 /// Default cap on paths in a FindMissingPaths request (DoS guard).
 /// Matches `rio_nix::protocol::wire::MAX_COLLECTION_COUNT` — the gateway
@@ -333,8 +335,10 @@ impl StoreServiceImpl {
 
     /// Enable HMAC verification on PutPath assignment tokens.
     /// Builder-style — chains after `new()` or `with_chunk_cache()`.
-    pub fn with_hmac_verifier(mut self, verifier: rio_auth::hmac::HmacVerifier) -> Self {
-        self.hmac_verifier = Some(Arc::new(verifier));
+    /// Takes `Arc` so `main.rs` shares one verifier with
+    /// `DirectoryServiceImpl` (one copy of the key bytes in memory).
+    pub fn with_hmac_verifier(mut self, verifier: Arc<rio_auth::hmac::HmacVerifier>) -> Self {
+        self.hmac_verifier = Some(verifier);
         self
     }
 

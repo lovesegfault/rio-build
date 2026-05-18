@@ -114,7 +114,7 @@ impl StoreSession {
     /// as rio-gateway. For testing the assignment-token enforcement.
     pub async fn new_with_hmac(key: Vec<u8>) -> anyhow::Result<Self> {
         let verifier = rio_auth::hmac::HmacVerifier::from_key(key);
-        Self::build(|pool| StoreServiceImpl::new(pool).with_hmac_verifier(verifier)).await
+        Self::build(|pool| StoreServiceImpl::new(pool).with_hmac_verifier(Arc::new(verifier))).await
     }
 
     /// Store with BOTH assignment-token verifier and service-token
@@ -126,7 +126,9 @@ impl StoreSession {
     ) -> anyhow::Result<Self> {
         let db = TestDb::new(&MIGRATOR).await;
         let service = StoreServiceImpl::new(db.pool.clone())
-            .with_hmac_verifier(rio_auth::hmac::HmacVerifier::from_key(assignment_key))
+            .with_hmac_verifier(Arc::new(rio_auth::hmac::HmacVerifier::from_key(
+                assignment_key,
+            )))
             .with_service_hmac_verifier(Arc::new(rio_auth::hmac::HmacVerifier::from_key(
                 service_key,
             )));
@@ -242,6 +244,7 @@ mod admin;
 mod chunk_service;
 mod chunked;
 mod core;
+mod directory;
 mod hash_part;
 mod hmac;
 mod nar_index;

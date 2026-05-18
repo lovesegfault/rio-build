@@ -3,6 +3,7 @@ package rio.store;
 
 import "google/protobuf/empty.proto";
 import "types.proto";
+import "castore.proto"; // DirectoryService.GetDirectory → Directory
 
 // Store service for NAR storage and path metadata.
 // Inspired by tvix castore/store protos (MIT).
@@ -129,6 +130,22 @@ service StoreService {
   // RTT × ~357 paths is the I-110 PG-wall pattern again. One streamed
   // call, request order preserved.
   rpc GetNarIndexBatch(rio.types.GetNarIndexBatchRequest) returns (stream rio.types.NarIndexResponse);
+}
+
+// ADR-022 castore RPC surface (P0573). Tenant-scoped: every RPC joins
+// the directory_tenants/file_blob_tenants junction on the caller's
+// tenant_id (JWT or HMAC assignment-token claim) — Directory bodies
+// leak child names/digests, so cross-tenant exposure is a
+// confidentiality issue. See `r[store.castore.tenant-scope]`.
+service DirectoryService {
+  // recursive=true BFS-walks the subtree server-side; multi-root via
+  // field 3. Field semantics in types.proto.
+  rpc GetDirectory(rio.types.GetDirectoryRequest) returns (stream rio.castore.Directory);
+
+  // Batch presence probe for the delta-sync pruning loop (ADR-022 §5).
+  // A bit set ⇔ the digest is present and tenant-visible.
+  rpc HasDirectories(rio.types.HasDirectoriesRequest) returns (rio.types.HasBitmap);
+  rpc HasBlobs(rio.types.HasBlobsRequest) returns (rio.types.HasBitmap);
 }
 
 // Chunk-level storage service for content-defined chunking.
