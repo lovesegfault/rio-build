@@ -51,17 +51,23 @@ def realise(name: str, out_path: str) -> tuple[str, str | None]:
     return name, out_path
 
 
-def upload(name: str, path: str, token: str) -> None:
+def upload(name: str, path: str) -> None:
     print(f"::group::codecov upload: {name}")
     sys.stdout.flush()
+    # Fresh token per upload: GitHub OIDC tokens expire in ~5 min, and
+    # 38 serial codecovcli calls at 5-10s each sits at that boundary.
+    # One in-cluster HTTP round-trip is cheap; an expired token reds
+    # ci-gate (--fail-on-error + check=True, and coverage-upload is
+    # not in allowed-skips).
+    token = fetch_oidc_token()
     # upload-coverage, NOT upload-process: both reach do_upload_logic
     # but upload-coverage sets upload_coverage=True which selects the
     # /upload-coverage endpoint (new ingest pipeline) instead of the
-    # legacy /commits/{sha}/reports/{code}/uploads. Our lcov paths are
-    # `source/src/...` (per-crate sandbox prefix; crate name lost) and
-    # only the new endpoint's path-fixing matches them against the
-    # repo tree. The legacy endpoint returns "unusable report".
-    # Matches codecov-action@v6's subcommand. slug/sha are passed
+    # legacy /commits/{sha}/reports/{code}/uploads. Matches
+    # codecov-action@v6's subcommand; the new ingest pipeline is what
+    # Codecov tests against. lcov paths are already repo-relative
+    # (`rio-<crate>/src/...` via crate2nix.nix localRemap), so
+    # server-side path-fixing is not load-bearing. slug/sha are passed
     # explicitly: the action's wrapper feeds them via CC_* env that
     # its bundled CLI reads, but click's required=True on --commit-sha
     # fires before the GHA CI-adapter fallback in plain codecovcli.
@@ -69,7 +75,10 @@ def upload(name: str, path: str, token: str) -> None:
         [CODECOVCLI, "upload-coverage",
          "--git-service", "github",
          "--slug", os.environ["GITHUB_REPOSITORY"],
-         "--commit-sha", os.environ["GITHUB_SHA"],
+         # Workflow exports head.sha on PRs (GITHUB_SHA would be the
+         # ephemeral refs/pull/N/merge commit, which Codecov can't
+         # match against the PR's commit list).
+         "--commit-sha", os.environ["COVERAGE_COMMIT_SHA"],
          "--token", token,
          "--flag", name,
          "--file", path,
@@ -86,7 +95,14 @@ def upload(name: str, path: str, token: str) -> None:
 
 def main() -> int:
     n = len(COVERAGE)
-    token = fetch_oidc_token()
+    # Fork PRs never get id-token:write (GitHub forcibly downgrades it
+    # regardless of the workflow's permissions: block), so the
+    # ACTIONS_ID_TOKEN_REQUEST_* env vars are absent. Degrade to a
+    # no-op like niks3-action does — a hard failure here would red
+    # ci-gate on every external contribution.
+    if "ACTIONS_ID_TOKEN_REQUEST_URL" not in os.environ:
+        print("::notice::no id-token (fork PR?) — skipping codecov upload")
+        return 0
     print(f"realising {n} lcov outputs from cache (concurrency=8):")
     sys.stdout.flush()
 
@@ -105,7 +121,7 @@ def main() -> int:
                 have[name] = path
 
     for name, path in sorted(have.items()):
-        upload(name, path, token)
+        upload(name, path)
 
     print(f"::notice::uploaded {len(have)}/{n} coverage flags")
     if missing:

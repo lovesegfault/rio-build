@@ -141,10 +141,14 @@ jobs:
       # gen-matrix already evaluated every coverage outPath; pass them
       # through so this step does zero flake eval — just parallel
       # nix-store -r then serial codecovcli per flag. Also reads
-      # GITHUB_SHA/GITHUB_REPOSITORY/ACTIONS_ID_TOKEN_REQUEST_* from env.
+      # GITHUB_REPOSITORY/ACTIONS_ID_TOKEN_REQUEST_* from env.
       - run: nix run .#coverage-upload
         env:
           COVERAGE_PATHS: ${{ needs.gen-matrix.outputs.coverage-paths }}
+          # On pull_request GITHUB_SHA is the ephemeral refs/pull/N/merge
+          # commit; Codecov needs the PR head SHA to associate uploads
+          # with the PR's commit list (status checks + after_n_builds).
+          COVERAGE_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
   # Single stable name for branch protection. Dynamic matrices
   # mean individual entry names change as tests are added/removed —
   # marking them required would break. This job fans-in and succeeds
