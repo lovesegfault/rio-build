@@ -20,6 +20,18 @@ runs:
     - shell: bash
       run: echo "USER=$(id -un)" >> "$GITHUB_ENV"
 
+    # Warm flake-input fetches (gitv3/tarball-cache) and the eval
+    # cache. Restore-only: gen-matrix (ci.yml) is the canonical saver
+    # — it runs first, does the deepest eval, and every matrix job
+    # `needs:` it, so they restore what it just populated. Keyed on
+    # flake.lock since inputs are what invalidate the fetcher cache;
+    # restore-keys gives a near-hit on lock bumps.
+    - uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: ~/.cache/nix
+        key: nix-eval-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock') }}
+        restore-keys: nix-eval-${{ runner.os }}-${{ runner.arch }}-
+
     # Upstream NixOS action (no telemetry). No tags yet — pin by SHA.
     # 6b8548f includes PR#9 (--enable-flakes; the wrapped installer
     # stopped enabling flakes by default) and PR#10 (skip udev write

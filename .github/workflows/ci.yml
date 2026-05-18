@@ -44,6 +44,16 @@ jobs:
         # rio-nix-cache S3. Adding a new matrix to flake.nix → add one
         # `outputs:` entry above + one `for m in` entry in the script.
         run: bash .github/scripts/gen-matrix.sh
+      # setup-nix restores ~/.cache/nix everywhere; only this job
+      # saves. It runs first and does the deepest eval, so downstream
+      # jobs (which all `needs:` this one) restore what it just
+      # populated. always(): a failed eval still warmed the fetcher
+      # cache, which is most of the bytes.
+      - uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        if: always()
+        with:
+          path: ~/.cache/nix
+          key: nix-eval-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock') }}
 
   checks:
     name: check / ${{ matrix.name }}
