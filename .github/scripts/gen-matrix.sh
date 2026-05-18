@@ -2,8 +2,8 @@
 # Emit GHA matrix outputs for ci.yml, eliding entries already in the
 # binary cache.
 #
-# The flake exposes `.#githubActions.matrix.{checks,fuzz,vm-test,coverage}`
-# as flat name→drv attrsets. nix-eval-jobs --check-cache-status probes
+# The flake exposes `.#githubActions.{checks,fuzz,vm-test,coverage}` as
+# flat name→drv attrsets. nix-eval-jobs --check-cache-status probes
 # configured substituters (rio-nix-cache S3) for each and we drop
 # anything already cached. coverage is filtered too: the build half
 # (KVM-heavy VM runs) skips when cached; the upload half is a separate
@@ -12,13 +12,12 @@
 # runner.
 #
 # Dry-run locally:
-#   GHA=githubActions GITHUB_OUTPUT=/dev/stdout bash .github/scripts/gen-matrix.sh
+#   GITHUB_OUTPUT=/dev/stdout bash .github/scripts/gen-matrix.sh
 set -euo pipefail
 
-: "${GHA:?GHA env (flake attr prefix) must be set}"
 : "${GITHUB_OUTPUT:?GITHUB_OUTPUT must be set}"
 
-NEJ=$(nix build ".#${GHA}.nix-eval-jobs" --no-link --print-out-paths)/bin/nix-eval-jobs
+NEJ=$(nix build .#nix-eval-jobs --no-link --print-out-paths)/bin/nix-eval-jobs
 
 # ARC pods are CFS-quota'd, not cpuset-pinned, so nproc reports the
 # host core count (often 32+). Each nix-eval-jobs worker is a full
@@ -37,7 +36,7 @@ echo "nix-eval-jobs: ${WORKERS} workers, ~2-5min cold, streaming attrs as they c
 # is what we actually process.
 nej_out=$(mktemp)
 "$NEJ" \
-  --flake ".#${GHA}.matrix" \
+  --flake .#githubActions \
   --force-recurse \
   --check-cache-status \
   --workers "$WORKERS" \

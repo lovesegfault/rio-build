@@ -13,10 +13,6 @@ concurrency:
   # Cancel stale PR runs; never cancel pushes to main.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
-env:
-  # Flake attr prefix for CI targets. See flake.nix githubActions.
-  GHA: githubActions
-
 jobs:
   # Matrix generator — the ONLY dependency for every build job.
   # ~2min: checkout + nix-install + nix-eval-jobs (parallel eval of
@@ -68,7 +64,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-nix
-      - run: nix build ".#${GHA}.matrix.checks.${{ matrix.name }}" --print-build-logs
+      - run: nix build ".#githubActions.checks.${{ matrix.name }}" --print-build-logs
   fuzz:
     name: fuzz / ${{ matrix.name }}
     needs: gen-matrix
@@ -82,7 +78,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-nix
-      - run: nix build ".#${GHA}.matrix.fuzz.${{ matrix.name }}" --print-build-logs
+      - run: nix build ".#githubActions.fuzz.${{ matrix.name }}" --print-build-logs
   vm-test:
     name: vm / ${{ matrix.name }}
     needs: gen-matrix
@@ -100,7 +96,7 @@ jobs:
           kvm: true
       - name: Verify KVM
         run: '[[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]'
-      - run: nix build ".#${GHA}.matrix.vm-test.${{ matrix.name }}" --print-build-logs
+      - run: nix build ".#githubActions.vm-test.${{ matrix.name }}" --print-build-logs
   coverage:
     name: coverage / ${{ matrix.name }}
     needs: gen-matrix
@@ -122,14 +118,14 @@ jobs:
       - name: Verify KVM
         if: startsWith(matrix.name, 'vm-')
         run: '[[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]'
-      - run: nix build ".#${GHA}.matrix.coverage.${{ matrix.name }}" --print-build-logs
+      - run: nix build ".#githubActions.coverage.${{ matrix.name }}" --print-build-logs
 
   # Decoupled from the (cache-filtered, KVM-heavy) build matrix above:
   # this single job substitutes every lcov from S3 and posts each to
   # Codecov under its own flag. Runs even when coverage is fully
   # skipped (all cached) or partially failed (best-effort: a broken VM
   # scenario doesn't blank the whole report). One flag per
-  # `githubActions.matrix.coverage` entry; count still enforced by
+  # `githubActions.coverage` entry; count still enforced by
   # `codecov-matrix-sync`.
   coverage-upload:
     needs: [gen-matrix, coverage]
@@ -146,7 +142,7 @@ jobs:
       # through so this step does zero flake eval — just parallel
       # nix-store -r then serial codecovcli per flag. Also reads
       # GITHUB_SHA/GITHUB_REPOSITORY/ACTIONS_ID_TOKEN_REQUEST_* from env.
-      - run: nix run ".#${GHA}.coverage-upload"
+      - run: nix run .#coverage-upload
         env:
           COVERAGE_PATHS: ${{ needs.gen-matrix.outputs.coverage-paths }}
   # Single stable name for branch protection. Dynamic matrices

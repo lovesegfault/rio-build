@@ -1,6 +1,6 @@
 # Codecov configuration for rio-build.
 #
-# One flag per `githubActions.matrix.coverage` entry uploads per PR;
+# One flag per `githubActions.coverage` entry uploads per PR;
 # count enforced by the `codecov-matrix-sync` flake check. Paths in the
 # lcov files are repo-relative (`rio-scheduler/src/...`): the per-crate
 # `--remap-path-prefix=$NIX_BUILD_TOP/source=/<crateName>` in

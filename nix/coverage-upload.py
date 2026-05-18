@@ -22,7 +22,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 COVERAGE: dict[str, str] = json.loads(os.environ["COVERAGE_PATHS"])
-# Baked by replaceVars (flake.nix githubActions) so the CLI version is
+# Baked by replaceVars (packages.coverage-upload) so the CLI version is
 # pinned to nixpkgs alongside everything else.
 CODECOVCLI = "@codecovcli@"
 
