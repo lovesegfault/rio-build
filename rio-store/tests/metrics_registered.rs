@@ -24,5 +24,7 @@ rio_test_support::metrics_suite! {
         // [0.005..10.0] fits.
         "rio_store_put_path_duration_seconds",
         "rio_store_get_path_duration_seconds",
+        // Same shape: chunk fetch + nar_ls dominated by S3 RTT.
+        "rio_store_nar_index_compute_seconds",
     ],
 }

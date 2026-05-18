@@ -42,6 +42,8 @@ pub mod backend;
 #[cfg(feature = "server")]
 pub mod cas;
 #[cfg(feature = "server")]
+pub mod castore;
+#[cfg(feature = "server")]
 pub(crate) mod chunker;
 #[cfg(feature = "server")]
 pub mod config;
@@ -57,6 +59,8 @@ pub(crate) mod ingest;
 pub mod manifest;
 #[cfg(feature = "server")]
 pub(crate) mod metadata;
+#[cfg(feature = "server")]
+pub mod nar_index;
 #[cfg(feature = "server")]
 pub mod signing;
 #[cfg(feature = "server")]
@@ -349,6 +353,19 @@ pub fn describe_metrics() {
         "PG connection-pool utilization: (size - num_idle) / max_connections. \
          Updated on each StoreAdminService.GetLoad call (ComponentScaler 10s tick). \
          Sustained > 0.8 = under-provisioned store replicas (I-105 cliff approaching)."
+    );
+
+    describe_counter!(
+        "rio_store_nar_index_compute_total",
+        "NAR-index computations (eager PutPath + indexer_loop + sync-on-miss)"
+    );
+    describe_histogram!(
+        "rio_store_nar_index_compute_seconds",
+        "Per-path NAR reassemble + nar_ls + persist (indexer_loop only)"
+    );
+    describe_counter!(
+        "rio_store_nar_index_cache_hits_total",
+        "GetNarIndex requests served from the nar_index table without recompute"
     );
 
     // Pre-register drain gauges at 0. metrics-rs only materializes a gauge
