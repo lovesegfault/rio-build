@@ -4,7 +4,7 @@
 //! [`NixHash`](hash::NixHash), [`Derivation`](derivation::Derivation),
 //! [`NarInfo`](narinfo::NarInfo)), the worker-protocol wire primitives
 //! ([`protocol::wire`]), and handshake/STDERR framing. Fuzzed parsers
-//! live in `rio-nix/fuzz/`.
+//! live in `fuzz/rio-nix/`.
 
 pub mod derivation;
 pub mod hash;

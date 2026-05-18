@@ -22,7 +22,7 @@ Every opcode and wire primitive needs a byte-level test that constructs raw byte
 Include:
 - Proptest roundtrips for all wire primitives (u64, bytes, bool, strings, collections)
 - Live-daemon golden conformance tests: each test starts an isolated nix-daemon and compares responses at the byte level (see `tests/golden/`)
-- Fuzz targets for wire parsing (`cargo-fuzz` in `rio-nix/fuzz/`)
+- Fuzz targets for wire parsing (`cargo-fuzz` in `fuzz/rio-nix/`)
 
 **Before marking an opcode as complete, verify:**
 - [ ] `tracey query rule gw.opcode.<name>` shows both `impl` (in `opcodes_*.rs`) and `verify` (in `wire_opcodes/` + `golden/`)

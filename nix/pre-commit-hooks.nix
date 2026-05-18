@@ -102,7 +102,7 @@
         # the output file's directory, so -o $tmp/... would
         # produce ../../root/... paths that never match — generate
         # in-place under .check, diff, then clean up.
-        for dir in . rio-nix/fuzz rio-store/fuzz; do
+        for dir in . fuzz/rio-nix fuzz/rio-store; do
           # Snapshot Cargo.lock — `cargo metadata` inside
           # crate2nix can bump transitive deps if the local
           # cache is cold. Restore so the check has no side

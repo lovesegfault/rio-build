@@ -16,7 +16,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 # nar_parsing fuzz target uses the eager `extract_to_path` as a confinement
 # oracle (parse → extract MUST stay inside the tempdir).
-rio-nix = { path = "..", features = ["test-oracle"] }
+rio-nix = { path = "../../rio-nix", features = ["test-oracle"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "io-util"] }
 

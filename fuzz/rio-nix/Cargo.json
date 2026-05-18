@@ -6975,7 +6975,7 @@
       "edition": "2024",
       "source": {
         "type": "local",
-        "path": "../."
+        "path": "../../rio-nix"
       },
       "dependencies": [
         {

@@ -231,11 +231,9 @@
               # Per-member filesets — the FULL crate subtree, including
               # tests/ and proptest-regressions/. This is what test-time
               # builds (nextest, clippy --all-targets, coverage) and the
-              # nextest runtime overlay consume. rio-nix and rio-store
-              # narrow to exclude their fuzz/ subworkspaces (separate
-              # Cargo.lock, must not leak into the main tree). No
-              # commonCargoSources filter — that strips proto/, which
-              # rio-proto's build.rs needs as ./proto/.
+              # nextest runtime overlay consume. No commonCargoSources
+              # filter — that strips proto/, which rio-proto's build.rs
+              # needs as ./proto/.
               memberFilesets = {
                 rio-auth = ./rio-auth;
                 rio-builder = ./rio-builder;
@@ -245,19 +243,10 @@
                 rio-crds = ./rio-crds;
                 rio-gateway = ./rio-gateway;
                 rio-lease = ./rio-lease;
-                rio-nix = pkgs.lib.fileset.unions [
-                  ./rio-nix/src
-                  ./rio-nix/Cargo.toml
-                  ./rio-nix/proptest-regressions
-                ];
+                rio-nix = ./rio-nix;
                 rio-proto = ./rio-proto;
                 rio-scheduler = ./rio-scheduler;
-                rio-store = pkgs.lib.fileset.unions [
-                  ./rio-store/src
-                  ./rio-store/tests
-                  ./rio-store/Cargo.toml
-                  ./rio-store/build.rs
-                ];
+                rio-store = ./rio-store;
                 rio-test-support = ./rio-test-support;
                 workspace-hack = ./workspace-hack;
                 xtask = ./xtask;
@@ -1283,8 +1272,7 @@
                 settings.excludes = [
                   # Fuzz corpus seeds are exact binary/text inputs; trailing
                   # newlines would change what the fuzzer sees.
-                  "^rio-nix/fuzz/corpus/"
-                  "^rio-store/fuzz/corpus/"
+                  "^fuzz/.+/corpus/"
                 ];
 
                 settings.hooks = {

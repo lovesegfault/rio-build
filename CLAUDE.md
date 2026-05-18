@@ -39,7 +39,7 @@ treefmt
 nix flake check
 
 # Fuzz a parser (default shell is nightly, so this works directly)
-cd rio-nix/fuzz && cargo fuzz run wire_primitives
+cd fuzz/rio-nix && cargo fuzz run wire_primitives
 ```
 
 ## Build System
@@ -119,11 +119,11 @@ When the gate is red and the cause isn't obvious from the log, see `.claude/rule
 
 ## Fuzzing
 
-Fuzz targets live in per-crate `fuzz/` workspaces (excluded from the main workspace, separate `Cargo.lock` each). Currently: `rio-nix/fuzz/` (protocol/wire parsers) and `rio-store/fuzz/` (manifest parser). The default dev shell is nightly, so `cargo fuzz` works without extra setup:
+Fuzz targets live in per-crate `fuzz/<crate>` workspaces (excluded from the main workspace, separate `Cargo.lock` each). Currently: `fuzz/rio-nix/` (protocol/wire parsers) and `fuzz/rio-store/` (manifest parser). The default dev shell is nightly, so `cargo fuzz` works without extra setup:
 
 ```bash
-nix develop -c bash -c 'cd rio-nix/fuzz && cargo fuzz run wire_primitives'
-nix develop -c bash -c 'cd rio-store/fuzz && cargo fuzz run manifest_deserialize'
+nix develop -c bash -c 'cd fuzz/rio-nix && cargo fuzz run wire_primitives'
+nix develop -c bash -c 'cd fuzz/rio-store && cargo fuzz run manifest_deserialize'
 ```
 
 CI equivalent:
@@ -132,8 +132,8 @@ nix build .#checks.x86_64-linux.fuzz-wire_primitives  # 2min, in flake check
 ```
 
 When adding a new parser, also add a fuzz target:
-1. Add a `[[bin]]` entry in the relevant `fuzz/Cargo.toml` + target file in `fuzz_targets/`
-2. Add seed inputs to `fuzz/corpus/<target>/` (must be prefixed `seed-`; NAR seeds: see `gen-nar-corpus.sh`)
+1. Add a `[[bin]]` entry in the relevant `fuzz/<crate>/Cargo.toml` + target file in `fuzz_targets/`
+2. Add seed inputs to `fuzz/<crate>/corpus/<target>/` (must be prefixed `seed-`; NAR seeds: see `gen-nar-corpus.sh`)
 3. Add the target to `fuzzTargets` in `nix/fuzz.nix` (target name + which `fuzzBuild` + `corpusRoot`)
 4. If the fuzzed crate's deps changed, run `cargo xtask regen fuzz-lock` (fuzz lockfiles are independent of the main workspace)
 

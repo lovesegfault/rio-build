@@ -166,7 +166,7 @@ Notable edges:
       "nix.drv.parse-from-nar",
     )[`Derivation::parse_from_nar` extracts the single regular file from a NAR, UTF-8-decodes it, and runs the ATerm parser — the convenience path for `.drv` blobs that arrive NAR-wrapped over the wire.]
 
-    Fuzz targets for the parsers live in `rio-nix/fuzz/` (separate workspace, own `Cargo.lock`). A second fuzz workspace at `rio-store/fuzz/` covers the manifest parser. Both are excluded from the main workspace — when a fuzzed crate's deps change, run `cd <crate>/fuzz && cargo update -p <crate>` to sync the independent lockfile.
+    Fuzz targets for the parsers live in `fuzz/rio-nix/` (separate workspace, own `Cargo.lock`). A second fuzz workspace at `fuzz/rio-store/` covers the manifest parser. Both are excluded from the main workspace — when a fuzzed crate's deps change, run `cd fuzz/<crate> && cargo update -p <crate>` to sync the independent lockfile.
   ],
   "rio-test-support": [
     `rio-test-support` is a `[dependencies]` (not dev-dep) of `xtask` — `xtask regen sqlx` reuses `PgServer::bootstrap`. All other crates depend on it under `[dev-dependencies]` only; `rio-store` additionally has it under `[dependencies]` with `optional = true` (`test-utils` feature, not in `default`).

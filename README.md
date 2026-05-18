@@ -107,10 +107,10 @@ PostgreSQL integration tests bootstrap their own ephemeral server via `rio-test-
 
 ### Fuzzing
 
-Fuzz targets live in per-crate `fuzz/` workspaces (separate `Cargo.lock` each):
+Fuzz targets live in per-crate `fuzz/<crate>` workspaces (separate `Cargo.lock` each):
 
 ```bash
-cd rio-nix/fuzz && cargo fuzz run wire_primitives
+cd fuzz/rio-nix && cargo fuzz run wire_primitives
 # or via nix:
 nix build .#checks.x86_64-linux.fuzz-smoke-wire_primitives   # 30s smoke
 nix build .#fuzz-nightly-wire_primitives                     # 10min

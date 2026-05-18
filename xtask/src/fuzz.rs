@@ -1,7 +1,7 @@
-//! Run a fuzz target without remembering which crate's fuzz/ dir it lives in.
+//! Run a fuzz target without remembering which fuzz/ subdir it lives in.
 //!
 //! Targets are auto-discovered: `\[workspace\] exclude` in the root
-//! Cargo.toml lists `*/fuzz` dirs, each with `[[bin]]` entries naming
+//! Cargo.toml lists `fuzz/*` dirs, each with `[[bin]]` entries naming
 //! targets. Adding a new target means adding a `[[bin]]` (required
 //! anyway) — no xtask edit.
 
@@ -32,7 +32,7 @@ struct Bin {
     name: String,
 }
 
-/// `*/fuzz` entries from `\[workspace\] exclude`. Shared with
+/// `fuzz/*` entries from `\[workspace\] exclude`. Shared with
 /// `regen fuzz-lock`.
 pub fn discover_dirs() -> Result<Vec<String>> {
     let root: WorkspaceManifest =
@@ -41,7 +41,7 @@ pub fn discover_dirs() -> Result<Vec<String>> {
         .workspace
         .exclude
         .into_iter()
-        .filter(|d| d.ends_with("/fuzz"))
+        .filter(|d| d.starts_with("fuzz/"))
         .collect())
 }
 

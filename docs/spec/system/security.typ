@@ -73,7 +73,7 @@
 
 - *Threat*: Malicious `.drv` files, crafted protocol messages, resource
   exhaustion
-- *Mitigations*: Protocol parser fuzzing (see `rio-nix/fuzz/`), global @nar size
+- *Mitigations*: Protocol parser fuzzing (see `fuzz/rio-nix/`), global @nar size
   limits (`MAX_NAR_SIZE`); per-tenant build-submit rate limiting
   (#rref("gw.rate.per-tenant")); global connection cap
   (#rref("gw.conn.cap")); SSH-key→tenant mapping via the server-side

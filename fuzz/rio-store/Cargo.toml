@@ -9,12 +9,12 @@ cargo-fuzz = true
 
 # Own workspace root — excluded from the parent workspace (../../Cargo.toml)
 # but has its own Cargo.lock so Nix can vendor its deps independently.
-# Mirrors rio-nix/fuzz/Cargo.toml.
+# Mirrors fuzz/rio-nix/Cargo.toml.
 [workspace]
 
 [dependencies]
 libfuzzer-sys = "0.4"
-rio-store = { path = ".." }
+rio-store = { path = "../../rio-store" }
 
 [[bin]]
 name = "manifest_deserialize"

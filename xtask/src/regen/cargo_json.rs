@@ -12,7 +12,7 @@ pub async fn run() -> Result<()> {
     let sh = shell()?;
     let root = repo_root();
 
-    for dir in [".", "rio-nix/fuzz", "rio-store/fuzz"] {
+    for dir in [".", "fuzz/rio-nix", "fuzz/rio-store"] {
         let _push = sh.push_dir(root.join(dir));
         sh::run(cmd!(sh, "crate2nix generate --format json -o Cargo.json")).await?;
         // crate2nix doesn't emit a trailing newline; end-of-file-fixer

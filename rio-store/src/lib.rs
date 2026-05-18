@@ -51,7 +51,7 @@ pub mod gc;
 pub mod grpc;
 #[cfg(feature = "server")]
 pub(crate) mod ingest;
-// pub (not pub(crate)) so the fuzz target at rio-store/fuzz/ can call
+// pub (not pub(crate)) so the fuzz target at fuzz/rio-store/ can call
 // Manifest::deserialize. The fuzz crate is a separate workspace root.
 #[cfg(feature = "server")]
 pub mod manifest;
@@ -69,7 +69,7 @@ pub mod test_helpers;
 /// Shared sqlx migrator for the `migrations/` directory. Embeds
 /// migration SQL at compile time via `sqlx::migrate!`.
 ///
-/// Gated on `test`/`test-utils` — the rio-store/fuzz/ workspace compiles
+/// Gated on `test`/`test-utils` — the fuzz/rio-store/ workspace compiles
 /// this lib as a dep without the feature, and its source filter may
 /// exclude migrations/. sqlx::migrate! reads files at COMPILE time, so
 /// even an unused static can break the fuzz build. The cfg-gate means

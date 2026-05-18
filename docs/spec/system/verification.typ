@@ -74,7 +74,7 @@ scenario as `vm-protocol-warm-standalone`, client `nix.package` set to
 = Fuzzing
 
 Security-critical protocol parsers must be fuzz-tested. Targets live in
-per-crate fuzz workspaces (#src("rio-nix/fuzz/"), #src("rio-store/fuzz/")):
+per-crate fuzz workspaces (#src("fuzz/rio-nix/"), #src("fuzz/rio-store/")):
 
 - `wire_primitives` --- u64, padded strings, framed streams, empty strings,
   maximum sizes
@@ -94,10 +94,10 @@ per-crate fuzz workspaces (#src("rio-nix/fuzz/"), #src("rio-store/fuzz/")):
 - Run continuously via `cargo-fuzz` / `libFuzzer`:
   - *CI tier:* 2min/target run with seed corpus (`nix flake check` includes
     `checks.fuzz-*`)
-  - *Deep runs:* `cd <crate>/fuzz && cargo fuzz run <target>` in the dev shell
+  - *Deep runs:* `cd fuzz/<crate> && cargo fuzz run <target>` in the dev shell
     --- libFuzzer accumulates corpus in `./corpus/`
-  - Corpus seeded from `rio-nix/fuzz/corpus/<target>/` and
-    `rio-store/fuzz/corpus/<target>/` (committed seeds prefixed `seed-`; NAR
+  - Corpus seeded from `fuzz/rio-nix/corpus/<target>/` and
+    `fuzz/rio-store/corpus/<target>/` (committed seeds prefixed `seed-`; NAR
     seeds regenerable via `gen-nar-corpus.sh`)
 
 = Unit Tests

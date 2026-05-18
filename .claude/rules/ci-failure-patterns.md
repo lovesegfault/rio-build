@@ -7,7 +7,7 @@ Reference catalog of CI-gate failure signatures that have bitten this project at
 | Pattern | Symptom | Fix |
 |---|---|---|
 | **Nightly-only syntax** | compiles in `nix develop`, fails in `checks.clippy-*` | `if let` chain guards, `let_chains`, etc. — devshell is nightly, CI is stable. Rewrite or use `nix develop .#stable`. |
-| **Stale fuzz Cargo.lock** | fuzz build fails, `rio-nix/fuzz/Cargo.lock` or `rio-store/fuzz/Cargo.lock` out of sync | Per-crate fuzz workspaces have independent lockfiles. `cd <crate>/fuzz && cargo update -p <crate>`. |
+| **Stale fuzz Cargo.lock** | fuzz build fails, `fuzz/rio-nix/Cargo.lock` or `fuzz/rio-store/Cargo.lock` out of sync | Per-crate fuzz workspaces have independent lockfiles. `cd fuzz/<crate> && cargo update -p <crate>`. |
 | **codecov after_n_builds drift** | `codecov-matrix-sync` check fails: `after_n_builds=N but coverage matrix has M entries` | Added/removed a VM coverage target without bumping `.github/codecov.yml`. Update `after_n_builds` to match. |
 | **tracey broken ref** | `tracey-validate` fails: `r[impl X]` has no matching spec marker | Code has `// r[impl foo.bar]` but `docs/spec/**/*.typ` lacks `#r("foo.bar")`. Either add the spec marker (`#r("...")[body]` call) or fix the typo. |
 | **pyflakes f-string** | VM test fails at lint, not runtime: `F541 f-string without placeholders` | nixos-test-driver runs pyflakes on `testScript`. `f"foo"` with no `{...}` is a pyflakes error. Drop the `f` prefix. |

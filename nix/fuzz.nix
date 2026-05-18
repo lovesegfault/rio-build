@@ -5,8 +5,8 @@
 # libfuzzer-sys + `-Zsanitizer`. They depend on in-tree crates by path.
 #
 # Two fuzz workspaces:
-#   rio-nix/fuzz    — protocol/wire parsers (~450 sancov crates)
-#   rio-store/fuzz  — manifest parser (~590 sancov crates; pulls
+#   fuzz/rio-nix    — protocol/wire parsers (~450 sancov crates)
+#   fuzz/rio-store  — manifest parser (~590 sancov crates; pulls
 #                     rio-store's full dep tree)
 #
 # Build: per-crate via crate2nix (third + fourth instantiations
@@ -95,25 +95,25 @@ let
     };
 
   rio-nix-fuzz-build = mkFuzzBuild {
-    resolvedJson = ../rio-nix/fuzz/Cargo.json;
+    resolvedJson = ../fuzz/rio-nix/Cargo.json;
     fuzzCrateName = "rio-nix-fuzz";
     fuzzCrateSrc = fileset.toSource {
-      root = ../rio-nix/fuzz;
+      root = ../fuzz/rio-nix;
       fileset = fileset.unions [
-        ../rio-nix/fuzz/Cargo.toml
-        ../rio-nix/fuzz/fuzz_targets
+        ../fuzz/rio-nix/Cargo.toml
+        ../fuzz/rio-nix/fuzz_targets
       ];
     };
   };
 
   rio-store-fuzz-build = mkFuzzBuild {
-    resolvedJson = ../rio-store/fuzz/Cargo.json;
+    resolvedJson = ../fuzz/rio-store/Cargo.json;
     fuzzCrateName = "rio-store-fuzz";
     fuzzCrateSrc = fileset.toSource {
-      root = ../rio-store/fuzz;
+      root = ../fuzz/rio-store;
       fileset = fileset.unions [
-        ../rio-store/fuzz/Cargo.toml
-        ../rio-store/fuzz/fuzz_targets
+        ../fuzz/rio-store/Cargo.toml
+        ../fuzz/rio-store/fuzz_targets
       ];
     };
   };
@@ -139,19 +139,19 @@ let
     (map (t: {
       target = t;
       fuzzBins = rio-nix-fuzz-build.members.rio-nix-fuzz;
-      corpusRoot = unfilteredRoot + "/rio-nix/fuzz/corpus";
+      corpusRoot = unfilteredRoot + "/fuzz/rio-nix/corpus";
     }) rioNixFuzzTargets)
     ++ [
       {
         target = "manifest_deserialize";
         fuzzBins = rio-store-fuzz-build.members.rio-store-fuzz;
-        corpusRoot = unfilteredRoot + "/rio-store/fuzz/corpus";
+        corpusRoot = unfilteredRoot + "/fuzz/rio-store/corpus";
       }
     ];
 
   # Per-target fuzz run: 2 minutes, seed-corpus only. Cheap
   # runCommand wrapper over the prebuilt binary. For deep runs
-  # with accumulated corpus, `cd <crate>/fuzz && cargo fuzz run`
+  # with accumulated corpus, `cd fuzz/<crate> && cargo fuzz run`
   # in the dev shell (libFuzzer persists corpus in ./corpus/).
   mkFuzzCheck =
     {
