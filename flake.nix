@@ -768,6 +768,7 @@
                   nodeAmi
                   docsLib
                   ;
+                xtaskBin = crateBuild.memberBins.xtask;
               };
 
               # Container images (Linux-only — dockerTools uses Linux VM

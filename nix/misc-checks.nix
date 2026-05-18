@@ -17,6 +17,7 @@
   dockerImages,
   nodeAmi,
   docsLib,
+  xtaskBin,
 }:
 let
   # Regenerate-then-diff drift check. `generate` populates
@@ -149,6 +150,43 @@ in
           sleep 2
           tracey query validate 2>&1 | tee $out
         }
+      '';
+
+  # Workspace-level invariant lints (`xtask lint <check>`) — pure file
+  # walks over staged source, no DB/network. Each subcommand is a
+  # cross-crate check that doesn't fit in any single crate's tests:
+  #
+  # - `schema-liveness`: every table created in
+  #   `rio-migrations/migrations/*.sql` is referenced by name in ≥1
+  #   `.rs` file under rio-store/rio-scheduler/xtask. Catches dead
+  #   schema before `migration_checksums_frozen` makes dropping it cost
+  #   a second migration. Used to live in `rio-store/build.rs` (corpus
+  #   concat) + a `rio-store/tests/migrations.rs` test; promoted to
+  #   xtask so it runs as a pure file walk instead of a build.rs corpus
+  #   concat needing crate2nix sibling-src symlinks.
+  #
+  # The crate2nix-built xtask's compile-time `CARGO_MANIFEST_DIR` is a
+  # store path, so `RIO_REPO_ROOT` points it at the staged fileset
+  # (same pattern as docsData in nix/docs.nix). Fileset is exactly the
+  # lint's read surface — rebuild only when migration SQL or PG-query
+  # crate source changes.
+  xtask-lint =
+    pkgs.runCommand "rio-xtask-lint"
+      {
+        nativeBuildInputs = [ xtaskBin ];
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            ../rio-migrations/migrations
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-store/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../xtask/src)
+          ];
+        };
+      }
+      ''
+        export RIO_REPO_ROOT=$src
+        xtask lint schema-liveness 2>&1 | tee $out
       '';
 
   # Helm chart lint + template for all value profiles. Catches

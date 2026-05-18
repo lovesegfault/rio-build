@@ -13,6 +13,7 @@ mod fuzz;
 mod git;
 mod helm;
 mod k8s;
+mod lint;
 mod migration;
 mod mutants;
 mod regen;
@@ -54,6 +55,11 @@ enum Cmd {
     NewMigration(migration::MigrationArgs),
     /// Kubernetes deploy (--provider {k3s,eks}).
     K8s(k8s::K8sArgs),
+    /// Workspace-level invariant checks ("lints that can't be lints").
+    Lint {
+        #[command(subcommand)]
+        which: lint::Lint,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -93,5 +99,6 @@ async fn run(cmd: Cmd, cfg: XtaskConfig) -> Result<()> {
         Cmd::Fuzz(args) => fuzz::run(args),
         Cmd::NewMigration(args) => migration::run(args),
         Cmd::K8s(args) => k8s::run(args, &cfg).await,
+        Cmd::Lint { which } => lint::run(&which),
     }
 }

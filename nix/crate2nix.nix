@@ -230,19 +230,6 @@ let
     root = ../rio-proto;
     fileset = pkgs.lib.fileset.fileFilter (f: f.hasExt "proto") ../rio-proto/proto;
   };
-  # rio-store/build.rs walks `../rio-scheduler/src` + `../xtask/src` to
-  # build the schema-liveness corpus. Cross-directory-at-compile-time:
-  # buildRustCrate's src is just `rio-store/`. `.rs` filter keeps the
-  # fileset hash stable across Cargo.toml / proptest-regression /
-  # fixture churn. rio-store's OWN src/ is already present (it IS the
-  # crate being built).
-  pgQuerySrcFileset = pkgs.lib.fileset.toSource {
-    root = ../.;
-    fileset = pkgs.lib.fileset.unions [
-      (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
-      (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../xtask/src)
-    ];
-  };
   # rio-scheduler/src/sla/config.rs::helm_renders_every_sla_key does
   # include_str!("../../../infra/helm/rio-build/templates/scheduler.yaml")
   # — class-level guard against `[sla]` keys helm forgot to render.
@@ -403,20 +390,7 @@ let
     # cargo-metadata stub. (sqlx::migrate!() lives only in
     # rio-migrations, which is a leaf crate and needs neither.)
     rio-scheduler = _: sqlxOffline;
-    # rio-store: sqlxOffline + sibling-crate src/ symlinks for
-    # build.rs's schema-liveness corpus walk. Separate override so
-    # editing rio-scheduler/xtask source doesn't invalidate
-    # rio-scheduler's / rio-controller's own crate2nix builds.
-    rio-store =
-      _:
-      sqlxOffline
-      // {
-        postUnpack = ''
-          mkdir -p $NIX_BUILD_TOP/rio-scheduler $NIX_BUILD_TOP/xtask
-          ln -sf ${pgQuerySrcFileset}/rio-scheduler/src $NIX_BUILD_TOP/rio-scheduler/src
-          ln -sf ${pgQuerySrcFileset}/xtask/src $NIX_BUILD_TOP/xtask/src
-        '';
-      };
+    rio-store = _: sqlxOffline;
     # nodeclaim_pool/sketch.rs uses sqlx::query! (offline cache + CARGO
     # stub). The #[cfg(test)]-only seccomp include_str! is in
     # testOnlyPostUnpack — applied by checks.nix's mkTestVariant
