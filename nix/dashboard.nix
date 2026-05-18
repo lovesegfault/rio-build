@@ -38,10 +38,10 @@ let
   # include_str!'s) to assert STATUS_CLASS/SORT_RANK/TERMINAL cover every
   # Rust-emitted status string. Kept SEPARATE from src (like protoSrc) so
   # a Rust-only change doesn't invalidate the dashboard drv unless it
-  # actually touches the golden. Copied to ../rio-test-support/golden in
-  # preBuild so the test's relative readFileSync path works identically
-  # in local dev and sandbox.
-  goldenSrc = pkgs.lib.cleanSource ../rio-test-support/golden;
+  # actually touches the golden. Copied to ../rio-scheduler/tests/golden
+  # in preBuild so the test's relative readFileSync path works
+  # identically in local dev and sandbox.
+  goldenSrc = pkgs.lib.cleanSource ../rio-scheduler/tests/golden;
 in
 pkgs.stdenvNoCC.mkDerivation {
   pname = "rio-dashboard";
@@ -85,11 +85,11 @@ pkgs.stdenvNoCC.mkDerivation {
     grep -q 'export const AdminService' src/gen/admin_pb.ts
 
     # Place the cross-language golden at the path graphLayout.test.ts
-    # expects (../rio-test-support/golden/ relative to the unpacked
+    # expects (../rio-scheduler/tests/golden/ relative to the unpacked
     # rio-dashboard/ src root). The sandbox unpacks src under
     # $NIX_BUILD_TOP/<name>/ so sibling dirs are writable.
-    mkdir -p ../rio-test-support/golden
-    cp ${goldenSrc}/derivation_statuses.json ../rio-test-support/golden/
+    mkdir -p ../rio-scheduler/tests/golden
+    cp ${goldenSrc}/derivation_statuses.json ../rio-scheduler/tests/golden/
   '';
 
   # lint → test → build. `pnpm run build` = `svelte-check && vite build`.

@@ -251,32 +251,13 @@
                 workspace-hack = ./workspace-hack;
                 xtask = ./xtask;
               };
-              # Per-crate test-only paths beyond the default tests/ and
-              # proptest-regressions/ — files that live inside a crate dir
-              # for organizational reasons but are never read at lib/bin
-              # compile time (only by #[cfg(test)] code, possibly in OTHER
-              # crates). Subtracting them from memberBinFilesets keeps the
-              # binary derivations cached across fixture edits.
-              memberTestOnlyExtras = {
-                # Shared cross-language golden — include_str!'d inside
-                # #[cfg(test)] in rio-scheduler/src/state/derivation.rs and
-                # read by rio-dashboard's TS test. rio-test-support's own
-                # lib never touches it. rio-test-support is a NON-dev dep
-                # of rio-store (via test-utils feature) and xtask, so
-                # leaving golden/ in its bin fileset would rehash those
-                # rlibs → workspace bins → every VM test on a fixture edit.
-                # The test variants get golden/ via the testOnlyPostUnpack
-                # symlink, which has its own narrow fileset.
-                rio-test-support = [ ./rio-test-support/golden ];
-              };
               # Per-member fileset for the lib/bin compile — memberFilesets
-              # MINUS tests/, proptest-regressions/, and any crate-specific
-              # test-only extras. buildRustCrate never reads tests/ when
-              # buildTests=false (the entire `find tests/` step is gated on
-              # it; proptest replays at TEST RUNTIME, not compile time), so
-              # a tests/-only edit must not rehash the binary derivations
-              # that VM tests, docker images, crdgen, and the lib-only
-              # clippy/doc checks consume.
+              # MINUS tests/ and proptest-regressions/. buildRustCrate never
+              # reads tests/ when buildTests=false (the entire `find tests/`
+              # step is gated on it; proptest replays at TEST RUNTIME, not
+              # compile time), so a tests/-only edit must not rehash the
+              # binary derivations that VM tests, docker images, crdgen, and
+              # the lib-only clippy/doc checks consume.
               #
               # nix/checks.nix's mkTestVariant overrides `src` back to the
               # wide variant for buildTests=true builds — without that, the
@@ -285,13 +266,10 @@
               memberBinFilesets = pkgs.lib.mapAttrs (
                 name: fs:
                 pkgs.lib.fileset.difference fs (
-                  pkgs.lib.fileset.unions (
-                    [
-                      (pkgs.lib.fileset.maybeMissing (./. + "/${name}/tests"))
-                      (pkgs.lib.fileset.maybeMissing (./. + "/${name}/proptest-regressions"))
-                    ]
-                    ++ (memberTestOnlyExtras.${name} or [ ])
-                  )
+                  pkgs.lib.fileset.unions [
+                    (pkgs.lib.fileset.maybeMissing (./. + "/${name}/tests"))
+                    (pkgs.lib.fileset.maybeMissing (./. + "/${name}/proptest-regressions"))
+                  ]
                 )
               ) memberFilesets;
               # lcov --extract patterns: one per workspace member

@@ -37,7 +37,7 @@ export const WORKER_THRESHOLD = 500;
 
 // DerivationStatus string → CSS class. Mirrors
 // rio-scheduler/src/state/derivation.rs DerivationStatus::as_str(). The
-// golden snapshot at rio-test-support/golden/derivation_statuses.json is
+// golden snapshot at rio-scheduler/tests/golden/derivation_statuses.json is
 // the cross-language source of truth — both the Rust snapshot test
 // (derivation.rs status_snapshot mod) and the vitest cross-language
 // describe (graphLayout.test.ts) fail if a new variant isn't plumbed

@@ -40,12 +40,13 @@ import {
 // reject the cross-package path. fs resolves it regardless. Path is
 // cwd-relative: vitest runs from the package root (rio-dashboard/)
 // both locally (`pnpm run test`) and in the nix sandbox (dashboard.nix
-// preBuild copies the golden to ../rio-test-support/golden/ so this
+// preBuild copies the golden to ../rio-scheduler/tests/golden/ so this
 // same path works).
 type GoldenRow = { status: string; terminal: boolean };
 const goldenPath = resolve(
   '..',
-  'rio-test-support',
+  'rio-scheduler',
+  'tests',
   'golden',
   'derivation_statuses.json',
 );

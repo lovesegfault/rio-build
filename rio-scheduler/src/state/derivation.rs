@@ -170,7 +170,7 @@ db_str_enum! {
     ///
     /// The macro-generated [`ALL`](Self::ALL) const lists variants in
     /// the order the golden snapshot at
-    /// `rio-test-support/golden/derivation_statuses.json` expects —
+    /// `rio-scheduler/tests/golden/derivation_statuses.json` expects —
     /// the snapshot test, the exhaustive transition-table test, and the
     /// dashboard's cross-language cardinality check (vitest reads the
     /// same golden) all key on it.
@@ -1935,7 +1935,7 @@ mod tests {
 #[cfg(test)]
 mod status_snapshot {
     //! Cross-language DerivationStatus enforcement. The golden file at
-    //! `rio-test-support/golden/derivation_statuses.json` is the single
+    //! `rio-scheduler/tests/golden/derivation_statuses.json` is the single
     //! source of truth — both this Rust-side snapshot test AND
     //! rio-dashboard's vitest (`graphLayout.test.ts` cross-language
     //! describe block) compare against it. A 12th variant added here
@@ -1978,13 +1978,13 @@ mod status_snapshot {
     #[test]
     fn derivation_status_snapshot_is_current() {
         let json = emit();
-        let golden = include_str!("../../../rio-test-support/golden/derivation_statuses.json");
+        let golden = include_str!("../../tests/golden/derivation_statuses.json");
         assert_eq!(
             json.trim(),
             golden.trim(),
             "\nDerivationStatus {{as_str, is_terminal}} set drifted from golden.\n\
              If you added/reclassified a variant, update IN ORDER:\n\
-               (1) rio-test-support/golden/derivation_statuses.json\n\
+               (1) rio-scheduler/tests/golden/derivation_statuses.json\n\
                (2) rio-dashboard/src/lib/graphLayout.ts — STATUS_CLASS + SORT_RANK + TERMINAL\n\
                (3) rio-dashboard/src/lib/__tests__/graphLayout.test.ts — intended-set asserts\n\
                (4) docs/spec/components/scheduler.typ — PG CHECK constraint list\n\

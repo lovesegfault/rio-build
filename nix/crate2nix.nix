@@ -230,16 +230,6 @@ let
     exit 1
   '';
 
-  # Cross-crate compile-time read:
-  # include_str!("../../../rio-test-support/golden/...") in rio-scheduler
-  # src/state/derivation.rs. buildRustCrate's src is just the crate dir,
-  # so the sibling path resolves outside. Narrow fileset so editing
-  # golden/ only invalidates rio-scheduler.
-  goldenFileset = pkgs.lib.fileset.toSource {
-    root = ../rio-test-support;
-    fileset = ../rio-test-support/golden;
-  };
-
   # rio-test-support/build.rs runs protoc on ../rio-proto/proto/admin.proto
   # to emit a FileDescriptorSet for MockAdmin codegen. Same cross-directory
   # problem as migrations: buildRustCrate src is just rio-test-support/.
@@ -308,9 +298,9 @@ let
   # Test-only postUnpack — symlinks for include_str!() callsites that
   # live INSIDE #[cfg(test)] modules and are therefore never compiled
   # with buildTests=false. Keeping these out of defaultCrateOverrides
-  # means editing the underlying fixture files (golden JSON, seccomp
-  # profile, helm template) does not rehash the lib/bin derivations
-  # that VM tests, docker images, and crdgen consume.
+  # means editing the underlying fixture files (seccomp profile, helm
+  # template) does not rehash the lib/bin derivations that VM tests,
+  # docker images, and crdgen consume.
   #
   # nix/checks.nix's mkTestVariant appends these via .overrideAttrs
   # alongside `buildTests = true` — the only build mode that compiles
@@ -318,15 +308,12 @@ let
   #
   # Inventory (verified each is structurally inside #[cfg(test)]):
   #   rio-scheduler:
-  #     src/state/derivation.rs:1981 — golden/derivation_statuses.json
   #     src/sla/config.rs:1866      — infra/helm/.../scheduler.yaml
   #   rio-controller:
   #     src/reconcilers/pool/tests/builders_tests.rs:192 — seccomp/rio-builder.json
   #       (parent module: pool/mod.rs:38-39 `#[cfg(test)] pub(super) mod tests`)
   testOnlyPostUnpack = {
     rio-scheduler = ''
-      mkdir -p $NIX_BUILD_TOP/rio-test-support
-      ln -sf ${goldenFileset}/golden $NIX_BUILD_TOP/rio-test-support/golden
       mkdir -p $NIX_BUILD_TOP/infra/helm/rio-build/templates
       ln -sf ${schedulerTplFileset}/helm/rio-build/templates/scheduler.yaml \
         $NIX_BUILD_TOP/infra/helm/rio-build/templates/scheduler.yaml

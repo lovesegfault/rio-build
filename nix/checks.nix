@@ -312,8 +312,8 @@ let
   # so `.override { src = … }` is a no-op; `.overrideAttrs` patches
   # the final mkDerivation attrs directly.
   #
-  # Same story for the test-only postUnpack symlinks (golden,
-  # seccomp, scheduler.yaml): they feed `include_str!()` calls inside
+  # Same story for the test-only postUnpack symlinks (seccomp,
+  # scheduler.yaml): they feed `include_str!()` calls inside
   # `#[cfg(test)]` modules, never compiled with buildTests=false.
   # crate2nix.nix exposes them via `testOnlyPostUnpack` keyed by crate
   # name; we append them here so editing those fixture files only
