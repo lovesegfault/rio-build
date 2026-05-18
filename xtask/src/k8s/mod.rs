@@ -608,6 +608,28 @@ async fn pg_exec(sql: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether `run_up` should re-init the tofu backend (`tofu init
+/// -reconfigure` against `rio-tfstate-{sts-account-id}`) before any
+/// phase runs.
+///
+/// Every EKS phase that reads `tofu output` — `kubeconfig`, `ami`,
+/// `push`, `deploy`, plus `--wipe` — needs `.terraform/` init'd
+/// against the *current* account's bucket. `provision` and `destroy`
+/// already self-heal via [`eks::init_backend`]; the rest historically
+/// trusted whatever `.terraform/` was on disk and 403'd when it was
+/// from a prior account (or NXDOMAIN'd on a kube call against the
+/// stale `.kube/config` that `tofu output` would have corrected).
+///
+/// The one exception is fresh-account bootstrap: the state bucket
+/// doesn't exist until `bootstrap` creates it, so `tofu init` against
+/// it would fail; `provision` runs `init_backend` immediately after.
+/// `--wipe` is excluded from that exception — it always init's — even
+/// though it forces the full pipeline (so `Bootstrap` is in the
+/// selected set), because wiping a fresh account is a no-op.
+fn needs_upfront_backend_init(kind: ProviderKind, wipe: bool, selected: &[Phase]) -> bool {
+    matches!(kind, ProviderKind::Eks) && (wipe || !selected.contains(&Phase::Bootstrap))
+}
+
 /// Dispatch the selected `up` phases.
 ///
 /// `explicit` distinguishes `up --ami -p k3s` (hard error: the user
@@ -686,7 +708,25 @@ pub(super) async fn run_up(
         }
     };
 
+    // Re-init `.terraform/` against the CURRENT account's tfstate
+    // bucket before any phase reads `tofu output`. provision and
+    // destroy already self-heal via init_backend (see its doc); the
+    // standalone phases (--kubeconfig, --ami, --push, --deploy) and
+    // --wipe were unguarded — a `.terraform/` cached from a prior
+    // account 403s the first `tofu output`, and a stale `.kube/config`
+    // NXDOMAINs the first kube call. Skipped only when bootstrap is
+    // selected without --wipe: a fresh account's bucket doesn't exist
+    // yet (bootstrap creates it; provision init's right after).
+    if needs_upfront_backend_init(kind, o.wipe, &selected) {
+        eks::init_backend(&cfg).await?;
+    }
+
     if o.wipe {
+        // wipe makes kube/kubectl/helm calls before the kubeconfig
+        // phase ever runs — same staleness, one layer up. Refresh
+        // first so wipe targets the cluster `tofu output` names, not
+        // whatever `.kube/config` was last written against.
+        ui::step("kubeconfig", || p.kubeconfig(&cfg)).await?;
         wipe::run(kind).await?;
     }
 
@@ -854,5 +894,58 @@ mod tests {
         assert!(o.validate_phase_opts(&o.phases()).is_ok());
         o.ami_arch = AmiArch::Aarch64;
         assert!(o.validate_phase_opts(&o.phases()).is_err());
+    }
+
+    /// `needs_upfront_backend_init` decides whether `run_up` re-inits
+    /// `.terraform/` before any phase reads `tofu output`. The matrix
+    /// below is the operational contract: every standalone phase that
+    /// reads tofu state must self-heal a stale backend; the only
+    /// exception is fresh-account bootstrap (no bucket exists yet —
+    /// running `tofu init` against it would fail, and provision will
+    /// init right after bootstrap creates it). `--wipe` always init's:
+    /// it forces the full pipeline (so `Bootstrap` is in the selected
+    /// set) but a wipe can never target a fresh account.
+    #[test]
+    fn upfront_backend_init_matrix() {
+        use Phase::*;
+        let eks = ProviderKind::Eks;
+        let k3s = ProviderKind::K3s;
+
+        // Standalone phases against an existing cluster — must init.
+        // This is the bug class that motivated the guard: a stale
+        // `.terraform/` 403'd the first `tofu output` for every one
+        // of these, because none of them run `provision`.
+        for sel in [
+            &[Kubeconfig][..],
+            &[Ami],
+            &[Push],
+            &[Deploy],
+            &[Push, Deploy],
+            &[Provision], // double-init with provision's own — idempotent
+        ] {
+            assert!(
+                needs_upfront_backend_init(eks, false, sel),
+                "{sel:?} should init"
+            );
+        }
+
+        // --wipe forces the full pipeline (Bootstrap included), but
+        // wipe targets an existing cluster so the bucket exists.
+        assert!(needs_upfront_backend_init(eks, true, &Phase::ALL));
+
+        // Fresh-account bootstrap: bucket may not exist; provision
+        // init's after bootstrap creates it. Skipping here keeps a
+        // first `up` from failing on a `tofu init` against nothing.
+        assert!(!needs_upfront_backend_init(eks, false, &Phase::ALL));
+        assert!(!needs_upfront_backend_init(eks, false, &[Bootstrap]));
+        assert!(!needs_upfront_backend_init(
+            eks,
+            false,
+            &[Bootstrap, Provision]
+        ));
+
+        // K3s has no tofu state — never init, regardless of phases.
+        assert!(!needs_upfront_backend_init(k3s, false, &[Kubeconfig]));
+        assert!(!needs_upfront_backend_init(k3s, true, &Phase::ALL));
     }
 }
