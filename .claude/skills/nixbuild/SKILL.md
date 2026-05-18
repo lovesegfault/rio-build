@@ -1,6 +1,6 @@
 ---
 name: nixbuild
-description: Local nix build with structured log lifecycle. Use for the full checks gate / .#coverage-full runs from agent context to avoid flooding it with build output.
+description: Local nix build with structured log lifecycle. Use for the full checks gate / .#coverage runs from agent context to avoid flooding it with build output.
 ---
 
 ## Invocation
@@ -8,7 +8,7 @@ description: Local nix build with structured log lifecycle. Use for the full che
 ```bash
 .claude/bin/nixbuild --checks                             # full CI gate via nix-fast-build
 .claude/bin/nixbuild .#checks.x86_64-linux.vm-lifecycle   # single check
-.claude/bin/nixbuild .#coverage-full --keep-going         # extra args pass through
+.claude/bin/nixbuild .#coverage --keep-going         # extra args pass through
 ```
 
 **Quiet by default.** Stderr gets one line (the log path); stdout gets a JSON report at the end. No 3MB build log streamed into context. For interactive debugging where you want live output, use plain `nix build -L` instead.

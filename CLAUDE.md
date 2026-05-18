@@ -59,10 +59,11 @@ cd rio-nix/fuzz && cargo fuzz run wire_primitives
 | `nix build .#checks.x86_64-linux.tracey-validate` | Spec-coverage validation (r[...] annotation integrity) |
 | `tracey query status` | Spec-coverage summary (in dev shell) |
 | `nix fmt` | Same as `treefmt` |
-| `/nixbuild .#coverage-full` | Combined unit+VM coverage (lcov+HTML, ~25min, needs KVM) |
+| `/nixbuild .#coverage` | Combined unit+VM coverage (lcov+HTML, ~25min, needs KVM) |
 | `nix build .#checks.x86_64-linux.cov-smoke` | Fast (~5min) one-scenario coverage-infra smoke |
 | `nix build .#legacyPackages.x86_64-linux.cov-vm.protocol-warm-standalone` | Run one VM test in coverage mode (debugging, raw profraws at `result/coverage/`) |
-| `nix build .#legacyPackages.x86_64-linux.coverage-vm.protocol-warm-standalone` | Per-test lcov from one coverage-mode VM run |
+| `nix build .#coverage.passthru.vm-protocol-warm-standalone` | Per-entry lcov (one VM test or one `unit-<crate>`) |
+| `nix build .#coverage-unit` / `.#coverage-vm` | Unit-only / VM-only lcov aggregates |
 
 ### CI gate
 
@@ -74,8 +75,8 @@ cd rio-nix/fuzz && cargo fuzz run wire_primitives
 
 Three tiers:
 
-- **Cov-smoke** (~5min, in checks): `nix build .#checks.x86_64-linux.cov-smoke`. One representative VM scenario in coverage mode, asserts profraw→lcov pipeline produced non-empty data. Catches "coverage infrastructure broken" at merge-gate. A PSA break went 118 commits undetected before this was added — coverage-full failures were triaged as individual test-gaps instead of a pipeline-level halt.
-- **Combined unit+VM** (~25min, needs KVM): `/nixbuild .#coverage-full`. Output: `result/lcov.info` (combined), `result/html/`, `result/per-test/vm-<scenario>-<fixture>.lcov`. HTML alone: `nix build .#coverage-html`. Fills the ~15% "permanently red" gap of VM-only code (FUSE callbacks, namespace setup, cgroup tracking, main.rs wiring, k8s lease/reconcilers, SSH accept loop). **Not** a check — run on demand.
+- **Cov-smoke** (~5min, in checks): `nix build .#checks.x86_64-linux.cov-smoke`. One representative VM scenario in coverage mode, asserts profraw→lcov pipeline produced non-empty data. Catches "coverage infrastructure broken" at merge-gate. A PSA break went 118 commits undetected before this was added — `.#coverage` failures were triaged as individual test-gaps instead of a pipeline-level halt.
+- **Combined unit+VM** (~25min, needs KVM): `/nixbuild .#coverage`. Output: `result/lcov.info` (combined), `result/html/`, `result/per-test/vm-<scenario>-<fixture>.lcov`. HTML alone: `nix build .#coverage-html`. Fills the ~15% "permanently red" gap of VM-only code (FUSE callbacks, namespace setup, cgroup tracking, main.rs wiring, k8s lease/reconcilers, SSH accept loop). **Not** a check — run on demand.
 
 VM coverage architecture details: see `.claude/rules/coverage.md` (loads when editing `nix/coverage.nix`).
 

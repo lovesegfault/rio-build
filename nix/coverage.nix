@@ -31,18 +31,19 @@ let
   inherit (pkgs) lib;
 
   # Source-path normalization pattern. buildRustCrate's
-  # --remap-path-prefix maps the sandbox build dir to `/`, so
-  # profraws reference `/rio-common/src/lib.rs`. Strip the leading
-  # slash to get repo-relative paths genhtml can resolve.
+  # --remap-path-prefix maps the sandbox build dir to `/`; the
+  # per-crate localRemap in crate2nix.nix maps the unpacked
+  # `source/` dir (fileset.toSource's fixed name) to `/<crateName>`
+  # so profraws reference `/rio-common/src/lib.rs`. Strip the leading
+  # slash to get repo-relative paths genhtml/codecov can resolve.
   stripPrefix = "s|^/||";
 
   # --ignore-filename-regex for llvm-cov export on VM-test profraws.
-  # Dep paths like `/tokio-1.50.0/...` get filtered by the final
-  # `lcov --extract 'rio-*'` step; this regex catches common build
-  # artifacts that --extract misses. `target/.*build` covers
-  # crate2nix's target/build/ (buildRustCrate puts generated proto
-  # code at target/build/<crate>.out/, genhtml can't resolve it
-  # against workspaceSrc).
+  # Dep paths like `/tokio-1.50.0/...` get filtered by the per-test
+  # `lcov --extract 'rio-*'` step in mkPerTestLcov; this regex
+  # catches build artifacts that --extract would let through (rio-*
+  # prefix matches `rio-proto/target/build/...` generated proto code,
+  # which genhtml can't resolve against workspaceSrc).
   ignoreRegex = "\\.cargo/registry|\\.cargo/git|/rustc/|/nix/store/.*-vendor|target/.*build";
 
   # Toolchain llvm tools. rustStable is the rust-bin derivation;
@@ -130,7 +131,14 @@ let
       # normalized unit lcov may not match the VM stripPrefix.
       ${pkgs.lcov}/bin/lcov --ignore-errors unused \
         --substitute '${stripPrefix}' \
-        -a $TMPDIR/raw.lcov -o $out
+        -a $TMPDIR/raw.lcov -o $TMPDIR/stripped.lcov
+      # Extract here, not in the aggregate: each raw VM lcov is
+      # ~165MB (every dep crate, ~16k SF entries) and shrinks ~160×
+      # to ~1MB after filtering to workspace paths. Doing it per-test
+      # makes vmLcov's `lcov -a` operate on ~24MB instead of ~4GB and
+      # cuts what gets cached/substituted by the same factor.
+      ${pkgs.lcov}/bin/lcov --ignore-errors unused,empty \
+        --extract $TMPDIR/stripped.lcov 'rio-*' -o $out
     '';
 
   perTestLcov = lib.mapAttrs mkPerTestLcov vmTestsCov;
@@ -201,8 +209,8 @@ in
   # Fast coverage-infrastructure smoke. ONE scenario in coverage
   # mode, asserts the profraw→lcov pipeline produced real data.
   # ~5min. In checks (blocking) — catches "coverage infra broken"
-  # without the 25min coverage-full cost. A PSA break went 118
-  # commits undetected because coverage-full is backgrounded and
+  # without the 25min .#coverage cost. A PSA break went 118
+  # commits undetected because .#coverage is backgrounded and
   # its failures were triaged as individual test-gaps instead of a
   # pipeline-level halt. With cov-smoke in checks, infra breaks
   # fail the merge gate directly.
@@ -236,7 +244,7 @@ in
   # workspace crates. result/html/ = genhtml. result/per-test/ =
   # individual breakdowns.
   full =
-    pkgs.runCommand "rio-coverage-full"
+    pkgs.runCommand "rio-coverage"
       {
         nativeBuildInputs = [ pkgs.lcov ];
       }
@@ -257,18 +265,16 @@ in
           echo "WARNING: vmLcov is empty, using unit-only"
           cp ${unitLcov} $TMPDIR/combined.lcov
         fi
-        # --extract filters to workspace crates (drops any stray
-        # deps that made it through --ignore-filename-regex).
-        lcov --extract $TMPDIR/combined.lcov 'rio-*' -o $TMPDIR/extracted.lcov
-        # --remove filters out generated build artifacts that
-        # --extract let through (rio-proto/target/build/... matches
-        # 'rio-*' but the generated .rs doesn't exist in workspaceSrc).
-        # crate2nix puts tonic-prost-build output at target/build/;
-        # genhtml can't resolve it against workspaceSrc. unused: don't
-        # error if pattern
-        # doesn't match (clean unit-only runs may not have these).
+        # --remove drops generated build artifacts that the per-entry
+        # --extract 'rio-*' let through (rio-proto/target/build/...
+        # matches the prefix but the generated .rs doesn't exist in
+        # workspaceSrc). Both inputs are already 'rio-*'-filtered at
+        # source (covLcovs / mkPerTestLcov), so the old --extract
+        # pass here is gone — it was a no-op on ~2MB of pre-filtered
+        # data anyway. unused: don't error if pattern doesn't match
+        # (clean unit-only runs may not have these).
         lcov --ignore-errors unused \
-          --remove $TMPDIR/extracted.lcov '*/target/*' -o $out/lcov.info
+          --remove $TMPDIR/combined.lcov '*/target/*' -o $out/lcov.info
 
         # HTML report. cd into source so genhtml can find files
         # for the source view. --ignore-errors source: safety net

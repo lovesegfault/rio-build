@@ -2,8 +2,11 @@
 #
 # One flag per `githubActions.matrix.coverage` entry uploads per PR;
 # count enforced by the `codecov-matrix-sync` flake check. Paths in the
-# lcov files are already repo-relative — nix/coverage.nix strips the
-# sandbox prefix before upload, so no `fixes:` block is needed here.
+# lcov files are repo-relative (`rio-scheduler/src/...`): the per-crate
+# `--remap-path-prefix=$NIX_BUILD_TOP/source=/<crateName>` in
+# nix/crate2nix.nix restores the crate name that fileset.toSource's
+# fixed `source` basename would otherwise lose, then the lcov pipeline
+# strips the leading `/`. No `fixes:` block needed here.
 
 codecov:
   notify:
@@ -16,7 +19,7 @@ codecov:
     # knob that gates on upload count. Drift is now caught by the
     # codecov-matrix-sync check in flake.nix — updating the matrix without
     # bumping this value fails `nix flake check`.
-    after_n_builds: 25
+    after_n_builds: 38
     # Keep wait_for_ci as a floor: if a coverage job is skipped/cancelled
     # we still want to hold until CI is done rather than wait forever.
     wait_for_ci: true

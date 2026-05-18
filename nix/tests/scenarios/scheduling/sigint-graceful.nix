@@ -20,7 +20,7 @@ scope: with scope; ''
   #      proven above, this confirms Mount::drop ran in the normal
   #      unwind (what a human debugging EBUSY would check first).
   #   3. [coverage mode only] profraw count increased → atexit
-  #      fired → LLVM flush ran. Guards .#coverage-full: a main.rs
+  #      fired → LLVM flush ran. Guards .#coverage: a main.rs
   #      refactor breaking the cancellation arm would silently
   #      zero worker VM coverage.
   #

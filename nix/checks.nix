@@ -402,9 +402,12 @@ let
   clippyTestDrvs = lib.mapAttrs (name: m: clippyTestMember name m.build) members;
   testBinDrvs = lib.mapAttrs (name: m: testMember name m.build) members;
   docDrvs = lib.mapAttrs (name: m: docMember name m.build) members;
-  covTestBinDrvs = lib.mapAttrs (
-    name: m: covTestMember name m.build
-  ) crateBuildCov.cargoNix.workspaceMembers;
+  # noHack here (not just on the export): coverageLcov aggregates
+  # covLcovs internally, so workspace-hack must be gone before either
+  # the per-crate map or the aggregate sees it.
+  covTestBinDrvs = noHack (
+    lib.mapAttrs (name: m: covTestMember name m.build) crateBuildCov.cargoNix.workspaceMembers
+  );
 
   # ──────────────────────────────────────────────────────────────────
   # nextest reuse-build runner
@@ -826,86 +829,95 @@ let
   # llvm-profdata gives "unsupported profile format version" errors.
   sysroot = "${rustStable}/lib/rustlib/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/bin";
 
-  # Coverage runner: run instrumented test binaries via nextest with
-  # LLVM_PROFILE_FILE set, then merge profraws → a single .profdata
-  # in $out. nextest's per-test-process model would emit ~2200
-  # profraws at ~12GB under naive %m-%p; pool mode (%Nm) caps scratch
-  # at N files per binary signature (runtime lock-merges concurrent
-  # writers), and merging here keeps the cached $out under 100MB.
-  # Re-running 47s of tests is cheaper than caching 12GB of raw
-  # profile, so the old profraw/merge cache split is not worth it.
-  covProfraw = mkNextestRun {
-    name = "rio-nextest-cov";
-    meta = mkNextestMeta covTestBinDrvs;
-    preRun = ''
-      # %4m = pool of 4 raw profiles per module signature; the LLVM
-      # runtime lock-merges concurrent writes from same-binary test
-      # processes. nextest spawns each test as a child process; the
-      # env var is inherited. $TMPDIR is the sandbox-writable scratch.
-      mkdir -p $TMPDIR/profraw
-      export LLVM_PROFILE_FILE="$TMPDIR/profraw/rio-%4m.profraw"
-    '';
-    postRun = ''
-      shopt -s nullglob
-      profraws=($TMPDIR/profraw/*.profraw)
-      if [ ''${#profraws[@]} -eq 0 ]; then
-        echo "ERROR: no profraws collected from any test binary" >&2
-        exit 1
-      fi
-      echo "  merging ''${#profraws[@]} profraw files" | tee -a $out/log
-      ${sysroot}/llvm-profdata merge -sparse "''${profraws[@]}" -o $out/merged.profdata
-    '';
-  };
+  # Per-member coverage: same shape as nextestRuns but on the
+  # instrumented tree, with profraw collection + llvm-cov export
+  # folded into postRun. Output: $out/lcov.info per crate, repo-
+  # relative paths. Touching one crate rebuilds only its entry; the
+  # rest cache-hit (and gen-matrix's cache-filter then skips them in
+  # CI entirely). Each lcov covers everything THIS crate's tests
+  # exercised — including transitive rio-* code — which is the
+  # correct "what does this test suite cover" semantics; codecov
+  # merges flags so the project total is unchanged.
+  covLcovs = lib.mapAttrs (
+    name: bin:
+    mkNextestRun {
+      name = "rio-cov-unit-${name}";
+      member = name;
+      meta = mkNextestMeta { ${name} = bin; };
+      extraArgs = [
+        "-E"
+        "package(${name})"
+      ];
+      preRun = ''
+        # %4m = pool of 4 raw profiles per module signature; the LLVM
+        # runtime lock-merges concurrent writes from same-binary test
+        # processes. nextest spawns each test as a child process; the
+        # env var is inherited.
+        mkdir -p $TMPDIR/profraw
+        export LLVM_PROFILE_FILE="$TMPDIR/profraw/rio-%4m.profraw"
+      '';
+      postRun = ''
+        shopt -s nullglob
+        profraws=($TMPDIR/profraw/*.profraw)
+        if [ ''${#profraws[@]} -eq 0 ]; then
+          # Crate with no tests (e.g. type-only). Empty lcov; lcov -a
+          # in the aggregate handles it via --ignore-errors empty.
+          touch $out/lcov.info
+        else
+          echo "  merging ''${#profraws[@]} profraws → lcov" | tee -a $out/log
+          ${sysroot}/llvm-profdata merge -sparse "''${profraws[@]}" -o $TMPDIR/m.profdata
+          # Object list: this crate's test binaries only. llvm-cov
+          # reads __llvm_covfun/__llvm_covmap sections — TEST binaries
+          # (not main) since they contain both library code (via --test)
+          # and test-only code. buildRustCrate's --remap-path-prefix
+          # maps the sandbox build dir to `/`; the per-crate localRemap
+          # in crate2nix.nix maps the unpacked `source/` dir to
+          # `/<crateName>` so paths are `/rio-common/src/lib.rs`
+          # (workspace) or `/tokio-1.50.0/src/lib.rs` (deps).
+          objs=()
+          for t in ${bin}/tests/*; do [ -x "$t" ] && objs+=(--object "$t"); done
+          ${sysroot}/llvm-cov export \
+            --format=lcov \
+            --instr-profile=$TMPDIR/m.profdata \
+            "''${objs[@]}" \
+            2>/dev/null > $TMPDIR/raw.lcov
+          # Strip leading slash → repo-relative; extract rio-* (drops
+          # deps and generated target/ — neither are in the repo tree).
+          # --ignore-errors unused: lcov 2.x errors on an unmatched
+          # pattern; we don't know which fire per-crate.
+          ${pkgs.lcov}/bin/lcov \
+            --ignore-errors unused \
+            --substitute 's|^/||' \
+            -a $TMPDIR/raw.lcov -o $TMPDIR/stripped.lcov
+          ${pkgs.lcov}/bin/lcov \
+            --ignore-errors unused \
+            --extract $TMPDIR/stripped.lcov 'rio-*' \
+            -o $out/lcov.info
+        fi
+      '';
+    }
+  ) covTestBinDrvs;
 
-  # Export: profdata → lcov. Object files (--object) are the test
-  # binaries themselves — llvm-cov reads the __llvm_covfun /
-  # __llvm_covmap sections embedded at compile time. We read the TEST
-  # binaries (not the main binaries) since they contain both the
-  # library code (via --test) and test-only code.
-  coverageLcov = pkgs.runCommand "rio-coverage-lcov" { } ''
-    set -euo pipefail
-    mkdir -p $out
-
-    # Object list: every test binary from every cov member.
-    # llvm-cov reads coverage-map sections; any binary not present
-    # in the profdata is simply reported as 0% (not an error).
-    objs=""
-    ${lib.concatMapStringsSep "\n" (d: ''
-      for t in ${d}/tests/*; do
-        [ -x "$t" ] && objs="$objs --object $t"
-      done
-    '') (lib.attrValues covTestBinDrvs)}
-
-    # Export lcov. buildRustCrate's --remap-path-prefix maps the
-    # sandbox build dir to `/`, so source paths in the profile data
-    # are `/rio-common/src/lib.rs` (workspace crates) or
-    # `/tokio-1.50.0/src/lib.rs` (deps). We can't reliably filter
-    # deps at llvm-cov level (no common prefix); filter at lcov
-    # level via --extract instead.
-    ${sysroot}/llvm-cov export \
-      --format=lcov \
-      --instr-profile=${covProfraw}/merged.profdata \
-      $objs \
-      2>/dev/null > $TMPDIR/raw.lcov
-
-    # Strip leading slash so paths are repo-relative
-    # (`rio-common/src/lib.rs` not `/rio-common/src/lib.rs`) — what
-    # codecov expects. Then extract only workspace-crate paths
-    # (rio-*/...). --ignore-errors unused:
-    # lcov 2.x treats an unmatched --substitute pattern as an error
-    # by default; we don't know ahead of time whether every pattern
-    # fires (depends on which crates' tests ran).
-    ${pkgs.lcov}/bin/lcov \
-      --ignore-errors unused \
-      --substitute 's|^/||' \
-      -a $TMPDIR/raw.lcov -o $TMPDIR/stripped.lcov
-    ${pkgs.lcov}/bin/lcov \
-      --extract $TMPDIR/stripped.lcov 'rio-*' \
-      -o $out/lcov.info
-
-    echo "=== Coverage Summary ==="
-    ${pkgs.lcov}/bin/lcov --summary $out/lcov.info
-  '';
+  # Aggregate unit lcov for coverage.full's genhtml (lcov -a over the
+  # per-crate set). Not in the CI matrix — that uses covLcovs entries
+  # directly so a single-crate change doesn't rebuild this.
+  coverageLcov =
+    pkgs.runCommand "rio-coverage-lcov"
+      {
+        # File-shaped per-crate inputs so the symlink in coverage.nix
+        # unitLcov stays a single-file path.
+        passAsFile = [ "addArgs" ];
+        addArgs = lib.concatMapStringsSep "\n" (d: "-a ${d}/lcov.info") (lib.attrValues covLcovs);
+      }
+      ''
+        mkdir -p $out
+        # --ignore-errors empty: crates with no tests emit a 0-byte
+        # lcov.info; lcov -a errors on empty tracefiles by default.
+        ${pkgs.lcov}/bin/lcov --ignore-errors empty \
+          $(cat $addArgsPath) -o $out/lcov.info
+        echo "=== Coverage Summary ==="
+        ${pkgs.lcov}/bin/lcov --summary $out/lcov.info
+      '';
 
   # workspace-hack is the crate2nix-stubbed empty crate (nix/crate2nix.nix
   # zeroes its deps). Clippy/doc/nextest on a 1-line stub is a no-op;
@@ -921,9 +933,11 @@ in
   testBins = testBinDrvs;
   doc = noHack docDrvs;
 
-  # Coverage. covProfraw runs instrumented tests + collects raw
-  # profile data; coverage is the merged lcov.
-  inherit covProfraw;
+  # Coverage. covLcovs is the per-member map for the CI matrix +
+  # codecov flags; coverage is the lcov -a aggregate (consumed by
+  # coverage.full's genhtml, not in the CI matrix). workspace-hack
+  # is already filtered at covTestBinDrvs.
+  inherit covLcovs;
   coverage = coverageLcov;
 
   # nextest: metadata synthesis (cached) + reuse-build runner. null

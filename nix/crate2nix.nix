@@ -124,6 +124,19 @@ let
       # independent. memberFilesets keys must match Cargo.json's
       # source.path (= crate dir name, which == crateName here).
       isLocal = memberSrcs ? ${crate_.crateName};
+      # memberSrcs are per-crate fileset.toSource outputs, which are
+      # always named `<hash>-source` → stdenv unpacks to
+      # $NIX_BUILD_TOP/source/ → buildRustCrate's
+      # `--remap-path-prefix=$NIX_BUILD_TOP=/` produces `/source/src/…`
+      # in debuginfo/coverage maps, losing the crate name. Remap the
+      # crate-specific dir to `/<crateName>` so the existing lcov
+      # `s|^/||` + `--extract 'rio-*'` pipeline yields repo-relative
+      # paths (`rio-scheduler/src/foo.rs`). extraRustcOpts come AFTER
+      # buildRustCrate's baseRustcOpts on the rustc argv, and rustc
+      # applies remaps last-match-wins, so this more-specific prefix
+      # takes effect for local source while deps still get
+      # `<name>-<ver>/…` from the base remap.
+      localRemap = "--remap-path-prefix=$NIX_BUILD_TOP/source=/${crate_.crateName}";
       crate_' =
         if crate_.crateName == "workspace-hack" then
           crate_
@@ -143,7 +156,7 @@ let
         extraRustcOpts =
           remapOpts
           ++ globalExtraRustcOpts
-          ++ lib.optionals isLocal localExtraRustcOpts
+          ++ lib.optionals isLocal (localExtraRustcOpts ++ [ localRemap ])
           ++ (crate_'.extraRustcOpts or [ ]);
       }
       // lib.optionalAttrs (globalExtraRustcOpts != [ ]) {

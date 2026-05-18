@@ -1098,13 +1098,20 @@
               # Normal VM tests. Keys: vm-<scenario>-<fixture>. Per-test
               # red/green signal in the GHA UI.
               vm-test = vmTests;
-              # lcov-producing jobs, one per Codecov flag. `unit`
-              # runs on spot; `vm-*` need KVM (instrumented VM tests
-              # → profraw → lcov). Workflow picks runs-on by prefix.
-              coverage = {
-                unit = coverage.unitLcov;
-              }
-              // coverage.perTestLcov;
+              # lcov-producing jobs, one per Codecov flag. `unit-*`
+              # run on spot (one per workspace member, so a single-
+              # crate edit only rebuilds that one); `vm-*` need KVM
+              # (instrumented VM tests → profraw → lcov). Workflow
+              # picks runs-on by prefix. Each entry is file-shaped
+              # (the lcov is $out directly) to match perTestLcov.
+              coverage =
+                pkgs.lib.mapAttrs' (
+                  n: d:
+                  pkgs.lib.nameValuePair "unit-${n}" (
+                    pkgs.runCommand "rio-cov-unit-${n}" { } "ln -s ${d}/lcov.info $out"
+                  )
+                ) crateChecks.covLcovs
+                // coverage.perTestLcov;
             };
             # Parallel evaluator for gen-matrix's cache-aware filter
             # (.github/scripts/gen-matrix.sh). Pinned via nixpkgs so
@@ -1160,11 +1167,7 @@
               rustdocRustc
               nextest
               nextestMetadata
-              covProfraw
               ;
-            # Unit-test-only lcov (5min). `packages.coverage-html`
-            # is the full unit+VM report.
-            coverage-unit = crateChecks.coverage;
             # Spec-coverage tool — standalone build for pin bumps.
             tracey = traceyPkg;
             shiroa = shiroaPkg;
@@ -1177,9 +1180,10 @@
             workspace-cov = crateBuildCov.workspace;
             inherit rio-workspace-cov;
           }
-          # Coverage-mode VM test runs: cov-vm.<scenario>. Build one to
-          # get raw profraws at result/coverage/<node>/.
           // {
+            # Coverage-mode VM test runs: cov-vm.<scenario>. Raw
+            # profraws at result/coverage/<node>/. NOT lcovs — for
+            # those see packages.coverage.passthru.<name>.
             cov-vm = vmTestsCov;
             # Manual VM tests not in `checks` — see `vmTestsManual`
             # comment for the per-entry gating gap. Build one with
@@ -1188,11 +1192,6 @@
               inherit rio-workspace dockerImages;
               coverage = false;
             });
-            # Per-test lcovs: coverage-vm.<scenario>. Inspect one VM
-            # test's contribution in isolation.
-            coverage-vm = coverage.perTestLcov;
-            # VM-only combined lcov (no unit-test merge). Debugging.
-            coverage-vm-merged = coverage.vmLcov;
           };
 
           # Import rust-overlay
@@ -1420,15 +1419,20 @@
             # Coverage (manual — NOT a check)
             # ──────────────────────────────────────────────────────────
             #
-            # coverage-full: unit + all VM tests merged. ~25min,
-            # needs KVM (run via nix-fast-build --remote). Output:
-            #   result/lcov.info   — combined, stripped to workspace paths
-            #   result/html/       — genhtml report
-            #   result/per-test/   — vm-<scenario>.lcov individual breakdowns
-            coverage-full = coverage.full;
-            # HTML view of coverage-full at result/ (no lcov.info /
-            # per-test subdirs). For unit-test-only lcov, see
-            # legacyPackages.coverage-unit.
+            # Three aggregates plus per-entry passthru:
+            #   coverage      — unit + VM merged (~25min, needs KVM).
+            #                   result/lcov.info, result/html/,
+            #                   result/per-test/. passthru.<name> is the
+            #                   per-entry lcov (unit-<crate> | vm-<scenario>)
+            #                   — same set as githubActions.matrix.coverage.
+            #   coverage-unit — lcov -a over per-crate unit lcovs (~5min)
+            #   coverage-vm   — lcov -a over per-scenario VM lcovs
+            #   coverage-html — html/ subdir of `coverage` only
+            coverage = coverage.full.overrideAttrs (old: {
+              passthru = (old.passthru or { }) // githubActions.matrix.coverage;
+            });
+            coverage-unit = crateChecks.coverage;
+            coverage-vm = coverage.vmLcov;
             coverage-html = pkgs.runCommand "rio-coverage-html" { } ''
               ln -s ${coverage.full}/html $out
             '';
@@ -1474,7 +1478,7 @@
               # cov-smoke: one coverage-mode VM scenario, asserts
               # profraw→lcov pipeline works. ~5min. Catches "coverage
               # infra broken" at merge-gate instead of 118 commits
-              # later via backgrounded coverage-full. Needs KVM —
+              # later via backgrounded `.#coverage`. Needs KVM —
               # `nix flake check` on a non-KVM host will fail this;
               # use nix-fast-build's --skip-cached or build the
               # checks subset that excludes it.
