@@ -64,7 +64,7 @@ nix-fast-build --flake .#checks.x86_64-linux --remote root@<builder>
   [CI],
   [Every push],
   [Unit tests, functional tests (real rio-store), clippy, treefmt,
-    live-daemon golden conformance tests, cargo-deny, 2min fuzz ×8, VM
+    live-daemon golden conformance tests, cargo-deny, 2min fuzz ×10, VM
     integration tests],
   [`nix-fast-build .#checks.<system>`],
   [< 20 min],
