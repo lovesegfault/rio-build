@@ -146,6 +146,13 @@ service DirectoryService {
   // A bit set ⇔ the digest is present and tenant-visible.
   rpc HasDirectories(rio.types.HasDirectoriesRequest) returns (rio.types.HasBitmap);
   rpc HasBlobs(rio.types.HasBlobsRequest) returns (rio.types.HasBitmap);
+
+  // Fetch a regular file's bytes by blake3 digest (P0577). The server
+  // resolves the digest to a NAR chunk window via file_blobs and the
+  // manifest cumsum, then streams the chunks sliced to the file
+  // boundary. The caller never sees rio's chunk layout. NotFound if
+  // no tenant-visible row.
+  rpc ReadBlob(rio.types.ReadBlobRequest) returns (stream rio.types.BlobChunk);
 }
 
 // Chunk-level storage service for content-defined chunking.

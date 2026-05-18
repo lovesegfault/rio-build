@@ -583,24 +583,28 @@ pub async fn set_nar_index(
             .await?;
         }
         if !dag.file_blobs.is_empty() {
-            let (blob_digests, blob_offsets): (Vec<Vec<u8>>, Vec<i64>) = dag
-                .file_blobs
-                .iter()
-                // nar_offset is BIGINT; a > i64::MAX NAR offset cannot
+            let mut blob_digests: Vec<Vec<u8>> = Vec::with_capacity(dag.file_blobs.len());
+            let mut blob_offsets: Vec<i64> = Vec::with_capacity(dag.file_blobs.len());
+            let mut blob_sizes: Vec<i64> = Vec::with_capacity(dag.file_blobs.len());
+            for (d, o, s) in &dag.file_blobs {
+                blob_digests.push(d.to_vec());
+                // nar_offset/size are BIGINT; a > i64::MAX value cannot
                 // exist (NAR sizes are bounded well below 8 EiB).
-                .map(|(d, o)| (d.to_vec(), i64::try_from(*o).unwrap_or(i64::MAX)))
-                .unzip();
+                blob_offsets.push(i64::try_from(*o).unwrap_or(i64::MAX));
+                blob_sizes.push(i64::try_from(*s).unwrap_or(i64::MAX));
+            }
             sqlx::query(
                 r#"
-                INSERT INTO file_blobs (digest, store_path_hash, nar_offset)
-                SELECT u.digest, $2, u.nar_offset
-                  FROM UNNEST($1::bytea[], $3::bigint[]) AS u(digest, nar_offset)
+                INSERT INTO file_blobs (digest, store_path_hash, nar_offset, size)
+                SELECT u.digest, $2, u.nar_offset, u.size
+                  FROM UNNEST($1::bytea[], $3::bigint[], $4::bigint[]) AS u(digest, nar_offset, size)
                 ON CONFLICT DO NOTHING
                 "#,
             )
             .bind(&blob_digests)
             .bind(store_path_hash.as_slice())
             .bind(&blob_offsets)
+            .bind(&blob_sizes)
             .execute(&mut *tx)
             .await?;
             // DO UPDATE (not DO NOTHING) so an existing `(digest,
@@ -1409,7 +1413,7 @@ mod tests {
         let unique_dir_a = ([0x22u8; 32], b"dir-body-a".to_vec());
         let dag = |dirs: Vec<([u8; 32], Vec<u8>)>| crate::castore::DirectoryDag {
             directories: dirs,
-            file_blobs: vec![([0x33u8; 32], 96)],
+            file_blobs: vec![([0x33u8; 32], 96, 8)],
             root_node: vec![1, 2, 3],
             root_digest: vec![],
             dir_digests: vec![],

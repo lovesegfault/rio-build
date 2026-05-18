@@ -29,5 +29,8 @@ rio_test_support::metrics_suite! {
         // BFS over the Directory DAG: ~33 PG round-trips for a
         // chromium-scale closure (8k dirs, batches of 256).
         "rio_store_directory_get_seconds",
+        // Per-file chunk fetch + slice; same envelope as get_path
+        // (PG lookup + a handful of S3 RTTs).
+        "rio_store_directory_read_seconds",
     ],
 }

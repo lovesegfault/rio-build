@@ -266,6 +266,19 @@ message HasBitmap {
   bytes bitmap = 1;
 }
 
+// ADR-022 P0577: fetch a regular file's bytes by blake3 digest.
+// Wire-compatible with snix castore.proto BlobService.Read; snix
+// names the field `digest`, both are field 1 / bytes.
+message ReadBlobRequest {
+  bytes file_digest = 1;  // 32-byte blake3 of the file content
+}
+
+// One frame of file content. blake3(concat(frames.data)) ==
+// request.file_digest.
+message BlobChunk {
+  bytes data = 1;
+}
+
 message GetNarIndexBatchRequest {
   repeated bytes nar_hashes = 1;
 }

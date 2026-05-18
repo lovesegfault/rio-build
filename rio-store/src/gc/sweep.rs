@@ -1115,7 +1115,7 @@ mod tests {
         };
         let mk_dag = |dirs: &[[u8; 32]]| crate::castore::DirectoryDag {
             directories: dirs.iter().map(|d| (*d, b"body".to_vec())).collect(),
-            file_blobs: vec![(shared_blob, 0)],
+            file_blobs: vec![(shared_blob, 0, 8)],
             root_node: vec![],
             root_digest: vec![],
             dir_digests: vec![],

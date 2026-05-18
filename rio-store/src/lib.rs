@@ -359,7 +359,7 @@ pub fn describe_metrics() {
         "GetNarIndex requests served from the nar_index table without recompute"
     );
 
-    // ADR-022 castore RPC surface (P0573).
+    // ADR-022 castore RPC surface (P0573 / P0577).
     describe_histogram!(
         "rio_store_directory_get_seconds",
         "GetDirectory wall time per RPC (recursive BFS over the Directory DAG)"
@@ -367,6 +367,10 @@ pub fn describe_metrics() {
     describe_histogram!(
         "rio_store_directory_has_batch_size",
         "Digest-list length per HasDirectories/HasBlobs call (labeled rpc)"
+    );
+    describe_histogram!(
+        "rio_store_directory_read_seconds",
+        "ReadBlob wall time per RPC (chunk fetch + slice + stream)"
     );
 
     // Pre-register drain gauges at 0. metrics-rs only materializes a gauge

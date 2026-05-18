@@ -1,15 +1,18 @@
-//! ADR-022 castore RPC surface (P0573).
+//! ADR-022 castore RPC surface (P0573 / P0577).
 //!
-//! `GetDirectory` / `HasDirectories` / `HasBlobs`. All tenant-scoped:
-//! every query joins `directory_tenants` / `file_blob_tenants` on the
-//! caller's `tenant_id` so a digest the tenant didn't produce is
-//! invisible (NotFound, or absent from the bitmap). Directory bodies
-//! leak child names/digests — confidentiality, not just isolation.
+//! `GetDirectory` / `HasDirectories` / `HasBlobs` / `ReadBlob`. All
+//! tenant-scoped: every query joins `directory_tenants` /
+//! `file_blob_tenants` on the caller's `tenant_id` so a digest the
+//! tenant didn't produce is invisible (NotFound, or absent from the
+//! bitmap). Directory bodies leak child names/digests — confidentiality,
+//! not just isolation.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
+use bytes::Bytes;
+use futures_util::StreamExt;
 use prost::Message;
 use sqlx::PgPool;
 use tokio_stream::wrappers::ReceiverStream;
@@ -18,7 +21,12 @@ use tracing::{instrument, warn};
 
 use rio_proto::DirectoryService;
 use rio_proto::castore::Directory;
-use rio_proto::types::{GetDirectoryRequest, HasBitmap, HasBlobsRequest, HasDirectoriesRequest};
+use rio_proto::types::{
+    BlobChunk, GetDirectoryRequest, HasBitmap, HasBlobsRequest, HasDirectoriesRequest,
+    ReadBlobRequest,
+};
+
+use crate::cas::ChunkCache;
 
 /// BFS frontier batch cap. ~33 round trips for a chromium-scale
 /// closure (8k dirs); matches PG's parameter limit headroom.
@@ -41,19 +49,39 @@ const GET_DIRECTORY_MAX_RESULTS: usize = 262_144;
 /// pathological caller or a bug.
 const HAS_BATCH_MAX: usize = 65_536;
 
+/// `ReadBlob` chunk prefetch width. `buffered()`, not `_unordered`:
+/// file bytes must arrive in offset order. Lower than `GetPath`'s 64
+/// because a single-file read pulls fewer chunks and the FUSE caller
+/// is rarely throughput-bound.
+const READ_BLOB_PREFETCH_K: usize = 8;
+
+/// `ReadBlob` response channel depth. Same rationale as
+/// [`GET_DIRECTORY_CHANNEL_DEPTH`].
+const READ_BLOB_CHANNEL_DEPTH: usize = 4;
+
 pub struct DirectoryServiceImpl {
     pool: PgPool,
     /// HMAC verifier for assignment tokens. Same key the dispatch
     /// signer uses (NOT the service-token key). The builder presents
     /// `x-rio-assignment-token`; `claims.tenant` carries the tenant.
     hmac_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
+    /// Shared with `StoreServiceImpl`/`ChunkServiceImpl`; `ReadBlob`
+    /// fetches chunked-manifest files through it. `None` on an
+    /// inline-only store: chunked files return `FAILED_PRECONDITION`,
+    /// inline files still resolve.
+    chunk_cache: Option<Arc<ChunkCache>>,
 }
 
 impl DirectoryServiceImpl {
-    pub fn new(pool: PgPool, hmac_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>) -> Self {
+    pub fn new(
+        pool: PgPool,
+        hmac_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
+        chunk_cache: Option<Arc<ChunkCache>>,
+    ) -> Self {
         Self {
             pool,
             hmac_verifier,
+            chunk_cache,
         }
     }
 
@@ -126,6 +154,7 @@ fn build_bitmap(requested: &[[u8; 32]], present: &HashSet<[u8; 32]>) -> Vec<u8> 
 // r[impl store.castore.directory-rpc]
 impl DirectoryService for DirectoryServiceImpl {
     type GetDirectoryStream = ReceiverStream<Result<Directory, Status>>;
+    type ReadBlobStream = ReceiverStream<Result<BlobChunk, Status>>;
 
     /// Server-side BFS over the Directory DAG.
     ///
@@ -320,6 +349,264 @@ impl DirectoryService for DirectoryServiceImpl {
             bitmap: build_bitmap(&digests, &present),
         }))
     }
+
+    /// Stream a regular file's bytes by `file_digest`.
+    ///
+    /// `file_digest → (nar_offset, size)` via `file_blobs`, then to a
+    /// chunk window via the manifest cumsum. The caller never sees
+    /// rio's chunk layout.
+    // r[impl store.castore.blob-read]
+    #[instrument(skip(self, request), fields(rpc = "ReadBlob"))]
+    async fn read_blob(
+        &self,
+        request: Request<ReadBlobRequest>,
+    ) -> Result<Response<Self::ReadBlobStream>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        let tenant = self.castore_tenant_id(&request)?;
+        let digest = parse_digest(&request.into_inner().file_digest)?;
+        let started = Instant::now();
+
+        // `manifests.status` filter excludes 'uploading' placeholders.
+        // LIMIT 1: any tenant-visible referrer's NAR works; the bytes
+        // are content-addressed. `file_blobs.size` (M_063) is
+        // denormalized so this never decodes `nar_index.entries`
+        // (O(files-in-NAR)) on the FUSE `open()` fast path.
+        type BlobRow = (i64, i64, Option<Vec<u8>>, Option<Vec<u8>>);
+        let row: Option<BlobRow> = sqlx::query_as(
+            "SELECT f.nar_offset, f.size, m.inline_blob, md.chunk_list \
+               FROM file_blobs f \
+               JOIN file_blob_tenants ft ON ft.digest = f.digest \
+               JOIN manifests m ON m.store_path_hash = f.store_path_hash \
+                    AND m.status = 'complete' \
+               LEFT JOIN manifest_data md ON md.store_path_hash = f.store_path_hash \
+              WHERE f.digest = $1 AND ft.tenant_id = $2 \
+              LIMIT 1",
+        )
+        .bind(digest.as_slice())
+        .bind(tenant)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(internal)?;
+        let Some((nar_offset, file_size, inline_blob, chunk_list)) = row else {
+            return Err(Status::not_found("file blob not found"));
+        };
+        let nar_offset = u64::try_from(nar_offset)
+            .map_err(|_| Status::data_loss("file_blobs.nar_offset is negative"))?;
+        let file_size = u64::try_from(file_size)
+            .map_err(|_| Status::data_loss("file_blobs.size is negative"))?;
+        let end = nar_offset
+            .checked_add(file_size)
+            .ok_or_else(|| Status::data_loss("nar_offset + file_size overflows"))?;
+
+        let plan = match (inline_blob, chunk_list) {
+            (Some(blob), _) => BlobPlan::Inline(slice_inline(blob, nar_offset, end)?),
+            (None, Some(chunk_list)) => {
+                let cache = self.chunk_cache.clone().ok_or_else(|| {
+                    Status::failed_precondition(
+                        "ReadBlob requires a chunk backend for chunked manifests",
+                    )
+                })?;
+                BlobPlan::Chunked(cache, build_chunk_plan(&chunk_list, nar_offset, end)?)
+            }
+            // Same invariant `metadata::get_manifest` enforces: a
+            // complete manifest has exactly one of inline_blob /
+            // manifest_data. Surface as DATA_LOSS, not NotFound, so
+            // corruption isn't mistaken for a cache miss.
+            (None, None) => {
+                return Err(Status::data_loss(
+                    "manifest has neither inline_blob nor manifest_data",
+                ));
+            }
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel(READ_BLOB_CHANNEL_DEPTH);
+        rio_common::task::spawn_monitored("read-blob-stream", async move {
+            let stream_fut = stream_blob(&tx, plan, digest);
+            match tokio::time::timeout(rio_common::grpc::GRPC_STREAM_TIMEOUT, stream_fut).await {
+                Err(_) => {
+                    warn!(
+                        timeout = ?rio_common::grpc::GRPC_STREAM_TIMEOUT,
+                        file_size, "ReadBlob stream timed out"
+                    );
+                    let _ = tx
+                        .send(Err(Status::deadline_exceeded("stream timeout")))
+                        .await;
+                }
+                // Record only on a clean stream so DATA_LOSS and
+                // disconnect timings don't skew the histogram. Same
+                // policy as get_directory and get_path.
+                Ok(true) => {
+                    metrics::histogram!("rio_store_directory_read_seconds")
+                        .record(started.elapsed().as_secs_f64());
+                }
+                Ok(false) => {}
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+/// Resolved fetch plan for one `ReadBlob`.
+enum BlobPlan {
+    /// File bytes already sliced from `manifests.inline_blob`.
+    Inline(Bytes),
+    /// Chunk hashes in NAR order with the byte range to emit from each.
+    /// Pre-slicing every chunk (not just first/last) keeps the stream
+    /// loop branch-free. Carrying the cache here proves a chunked plan
+    /// always has a backend.
+    Chunked(Arc<ChunkCache>, Vec<ChunkSlice>),
+}
+
+struct ChunkSlice {
+    hash: [u8; 32],
+    /// Byte range within the chunk to emit.
+    start: usize,
+    end: usize,
+}
+
+/// Slice `[nar_offset, end)` from an inline NAR.
+fn slice_inline(blob: Vec<u8>, nar_offset: u64, end: u64) -> Result<Bytes, Status> {
+    let blob = Bytes::from(blob);
+    if end > blob.len() as u64 {
+        return Err(Status::data_loss(format!(
+            "inline NAR is {} bytes but file ends at {end}",
+            blob.len()
+        )));
+    }
+    // Safe: end ≤ blob.len() ≤ usize::MAX (checked above).
+    Ok(blob.slice(nar_offset as usize..end as usize))
+}
+
+/// Compute the chunk slices covering NAR bytes `[nar_offset, end)`.
+/// `cumsum[i]` is where chunk `i` starts; `partition_point` finds the
+/// first/last chunks straddling the range.
+fn build_chunk_plan(
+    chunk_list: &[u8],
+    nar_offset: u64,
+    end: u64,
+) -> Result<Vec<ChunkSlice>, Status> {
+    let manifest = crate::manifest::Manifest::deserialize(chunk_list)
+        .map_err(|e| Status::data_loss(format!("corrupt manifest_data.chunk_list: {e}")))?;
+    let mut cumsum: Vec<u64> = Vec::with_capacity(manifest.entries.len());
+    let mut acc = 0u64;
+    for e in &manifest.entries {
+        cumsum.push(acc);
+        acc += u64::from(e.size);
+    }
+    if end > acc {
+        return Err(Status::data_loss(format!(
+            "chunked NAR is {acc} bytes but file ends at {end}"
+        )));
+    }
+    if nar_offset == end {
+        return Ok(Vec::new()); // zero-byte file
+    }
+    // Last chunk starting at or before `nar_offset`.
+    let first = cumsum
+        .partition_point(|&c| c <= nar_offset)
+        .saturating_sub(1);
+    // First chunk starting at or after `end` (exclusive bound).
+    let last_excl = cumsum.partition_point(|&c| c < end);
+    let plan = manifest.entries[first..last_excl]
+        .iter()
+        .zip(&cumsum[first..last_excl])
+        .map(|(entry, &chunk_start)| {
+            let chunk_end = chunk_start + u64::from(entry.size);
+            let take_start = nar_offset.max(chunk_start) - chunk_start;
+            let take_end = end.min(chunk_end) - chunk_start;
+            ChunkSlice {
+                hash: entry.hash,
+                // ManifestEntry.size is u32, so the per-chunk range fits usize.
+                start: take_start as usize,
+                end: take_end as usize,
+            }
+        })
+        .collect();
+    Ok(plan)
+}
+
+/// Drive the `ReadBlob` body stream. Inline = one sliced buffer;
+/// chunked = K-parallel ordered prefetch via `cache.get_verified()`.
+///
+/// Returns `true` only on a clean stream with the body matching
+/// `file_digest`, so the caller can gate the latency histogram.
+async fn stream_blob(tx: &FrameTx, plan: BlobPlan, file_digest: [u8; 32]) -> bool {
+    let mut hasher = blake3::Hasher::new();
+    match plan {
+        BlobPlan::Inline(bytes) => {
+            for piece in bytes.chunks(rio_proto::client::NAR_CHUNK_SIZE) {
+                if !send_piece(tx, &mut hasher, piece).await {
+                    return false;
+                }
+            }
+        }
+        BlobPlan::Chunked(cache, slices) => {
+            let mut chunk_stream = futures_util::stream::iter(slices)
+                .map(|s| {
+                    let cache = Arc::clone(&cache);
+                    async move { cache.get_verified(&s.hash).await.map(|b| (s, b)) }
+                })
+                .buffered(READ_BLOB_PREFETCH_K);
+            while let Some(result) = chunk_stream.next().await {
+                let (slice, bytes) = match result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!(error = %e, "ReadBlob: chunk fetch/verify failed");
+                        let _ = tx
+                            .send(Err(Status::data_loss(format!(
+                                "chunk reassembly failed: {e}"
+                            ))))
+                            .await;
+                        return false;
+                    }
+                };
+                let Some(piece) = bytes.get(slice.start..slice.end) else {
+                    let _ = tx
+                        .send(Err(Status::data_loss(
+                            "chunk shorter than manifest declared",
+                        )))
+                        .await;
+                    return false;
+                };
+                if !send_piece(tx, &mut hasher, piece).await {
+                    return false;
+                }
+            }
+        }
+    }
+    // Whole-file BLAKE3 verify, like GetPath's whole-NAR SHA-256.
+    // Per-chunk BLAKE3 already ran in `get_verified()`, so a mismatch
+    // here means cumsum/index drift (wrong offset or size), not S3
+    // corruption. The trailer attributes the failure to the server
+    // instead of leaving the client to guess from a bad hash.
+    let actual: [u8; 32] = hasher.finalize().into();
+    if actual != file_digest {
+        tracing::error!(
+            expected = %hex::encode(file_digest),
+            actual = %hex::encode(actual),
+            "ReadBlob: whole-file integrity check failed"
+        );
+        metrics::counter!("rio_store_integrity_failures_total").increment(1);
+        let _ = tx
+            .send(Err(Status::data_loss(
+                "whole-file integrity check failed (BLAKE3 mismatch)",
+            )))
+            .await;
+        return false;
+    }
+    true
+}
+
+type FrameTx = tokio::sync::mpsc::Sender<Result<BlobChunk, Status>>;
+
+/// Hash and emit one body frame. `false` on client disconnect.
+async fn send_piece(tx: &FrameTx, hasher: &mut blake3::Hasher, piece: &[u8]) -> bool {
+    hasher.update(piece);
+    tx.send(Ok(BlobChunk {
+        data: piece.to_vec(),
+    }))
+    .await
+    .is_ok()
 }
 
 /// Closed enum of `has_in` join targets. Keeps the table+junction

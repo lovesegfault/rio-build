@@ -125,7 +125,7 @@ r[store.index.table-cascade]
 
 r[store.index.rpc]
 
-`GetNarIndex(nar_hash) → NarIndex` exposes this index. The `nar_index` table row is keyed by `store_path_hash` with `ON DELETE CASCADE` from `manifests`, so GC of a path deletes its index row and the table never holds dangling indices. The builder does not fetch the index at mount time — the Directory DAG (§8) carries everything `lookup`/`getattr`/`readdir`/`readlink` need. The `file_blobs` junction (P0572's derived `(file_digest, store_path_hash) → nar_offset` index, FK→`manifests` `ON DELETE CASCADE` so it cannot dangle after GC) is consulted **server-side** by `ReadBlob`/`StatBlob` (§6) at `open()` time; the builder never holds chunk coordinates client-side.
+`GetNarIndex(nar_hash) → NarIndex` exposes this index. The `nar_index` table row is keyed by `store_path_hash` with `ON DELETE CASCADE` from `manifests`, so GC of a path deletes its index row and the table never holds dangling indices. The builder does not fetch the index at mount time — the Directory DAG (§8) carries everything `lookup`/`getattr`/`readdir`/`readlink` need. The `file_blobs` junction (P0572's derived `(file_digest, store_path_hash) → (nar_offset, size)` index, FK→`manifests` `ON DELETE CASCADE` so it cannot dangle after GC) is consulted **server-side** by `ReadBlob`/`StatBlob` (§6) at `open()` time; the builder never holds chunk coordinates client-side.
 
 ## 6. Builder-side data path: castore-FUSE `open()`
 

@@ -1,6 +1,6 @@
 # ADR-022 Implementation Plan — castore-FUSE lazy store + per-AZ S3 Express chunk cache
 
-**Status:** Phase-0 gate passed (P0541, P0544, P0569 done; P0543/P0578 do not block the gate and are still UNIMPL). Phase 1/2 in progress: P0545, P0546, P0548, P0549, P0550, P0551, P0552, P0568, P0572, P0573, P0588, P0589 done; P0577 next. Design is [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) + [Design Overview](./022-design-overview.md) + ADR-023. Per-item status is in the metadata line under each `### P05xx` heading.
+**Status:** Phase-0 gate passed (P0541, P0544, P0569 done; P0543/P0578 do not block the gate and are still UNIMPL). Phase 1/2 in progress: P0545, P0546, P0548, P0549, P0550, P0551, P0552, P0568, P0572, P0573, P0577, P0588, P0589 done; P0570 next (shares the cumsum helper with P0577). Design is [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) + [Design Overview](./022-design-overview.md) + ADR-023. Per-item status is in the metadata line under each `### P05xx` heading.
 **Plan-number range:** P0541–P0589 (gaps at 0542/0547/0558/0561/0587 are abandoned numbers; P0556 abandoned 2026-04-23 — do not reuse).
 **Clean-cutover constraint:** no FUSE fallback flag, no `RIO_STORE_BACKEND` selector. P0560 deletes the old FUSE module wholesale.
 **Cross-region forward-compat:** object store (S3/GCS) is authoritative for bytes; S3 Express One Zone is a per-AZ read-through cache; PG is single-region. Nothing here precludes cross-region deployment (object-store-authoritative, cache tier stateless) but it is not implemented. No DRA. **Express AZ-ID availability constrains region/AZ choice** — see [Design Overview §9](./022-design-overview.md).
@@ -673,15 +673,20 @@ The unprivileged builder cannot (a) open `/dev/fuse`, (b) call `FUSE_DEV_IOC_BAC
 **Exit:** `/nixbuild --checks` green.
 
 ### P0577 — `BlobService.Read(file_digest)` server-stream
-**Crate:** `rio-proto, rio-store` · **Deps:** P0573 · **Complexity:** LOW (~40 LoC)
+**Crate:** `rio-proto, rio-store` · **Deps:** P0573 · **Complexity:** LOW (~40 LoC) · **Status:** DONE
 
 Completes the snix-compatible castore surface: a client holding only a `file_digest` (from a `Directory` body) can fetch the bytes without knowing rio's chunk layout.
 
 | File | Change |
 |---|---|
 | `rio-proto/proto/store.proto` | `rpc ReadBlob(ReadBlobRequest) returns (stream BlobChunk)` — `ReadBlobRequest { bytes file_digest = 1; }`, `BlobChunk { bytes data = 1; }`. Wire-compatible with snix `castore.proto BlobService.Read`. `// r[impl store.castore.blob-read]` |
-| `rio-store/src/grpc/directory.rs` | `read_blob(file_digest)`: `SELECT f.store_path_hash, f.nar_offset FROM file_blobs f JOIN file_blob_tenants t ON t.digest=f.digest WHERE f.digest=$1 AND t.tenant_id=$2 LIMIT 1` (any surviving referrer; FK to `manifests` guarantees liveness) → resolve to chunk-range via that manifest's chunk cumsum (same `partition_point` as P0570) → stream via existing `GetChunks` machinery, slicing first/last chunk to the file boundary. NotFound if no tenant-scoped row. |
-| tests | ephemeral PG: PutPath → `ReadBlob(file_digest)` body == original file content; `blake3(body) == file_digest`. `// r[verify store.castore.blob-read]` |
+| `migrations/062_file_blob_size.sql` | `ALTER TABLE file_blobs ADD COLUMN size BIGINT NOT NULL DEFAULT 0` — denormalize file size onto the junction so the read path never decodes `nar_index.entries`. Content-derived (same digest ⇒ same size), so two rows for one digest can't disagree. |
+| `rio-store/src/castore.rs` | `DirectoryDag.file_blobs: Vec<([u8;32], u64, u64)>` — carry `(digest, nar_offset, size)` from `NarLsEntry` |
+| `rio-store/src/grpc/directory.rs` | `read_blob(file_digest)`: `SELECT f.nar_offset, f.size, m.inline_blob, md.chunk_list FROM file_blobs f JOIN file_blob_tenants ft ON ft.digest=f.digest JOIN manifests m ON m.store_path_hash=f.store_path_hash AND m.status='complete' LEFT JOIN manifest_data md USING (store_path_hash) WHERE f.digest=$1 AND ft.tenant_id=$2 LIMIT 1`. Inline manifests: slice `inline_blob[nar_offset..nar_offset+size]`. Chunked: cumsum `partition_point` → ordered chunk slices `(hash, start, end)` → `cache.get_verified()` ×K=8 `buffered()` → stream `BlobChunk` frames. Whole-file BLAKE3 trailer (`rio_store_integrity_failures_total` on mismatch). NotFound if no tenant-scoped row. `// r[impl store.castore.blob-read]` |
+| `rio-store/src/lib.rs` | `rio_store_directory_read_seconds` |
+| tests | ephemeral PG + `MemoryChunkBackend`: inline / chunked / single-chunk-skip-and-take / zero-byte / cross-tenant-denial / no-backend / corrupt-chunk-list / size-overrun. `blake3(body) == file_digest`. `// r[verify store.castore.{blob-read,tenant-scope}]` |
+
+**Reconciliation note:** the plan's original sketch resolved `file_digest → chunk-range` from `file_blobs` alone, but `file_blobs` (M_061) only carries `nar_offset` — `file_size` is needed for the chunk window's right edge. M_062 adds `file_blobs.size` rather than decoding `nar_index.entries` per call: the `entries` blob is O(files-in-NAR) (~2.5 MB for a chromium-scale output), and `read_blob` is the FUSE `open()` fast path. The "stream via existing GetChunks machinery" line meant the `ChunkCache` directly, not the gRPC `GetChunks` — `read_blob` uses the same `cache.get_verified()` `GetPath` does, with `buffered(8)` ordered prefetch.
 
 **Exit:** `/nixbuild --checks` green.
 
@@ -763,7 +768,7 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 {"plan":565,"title":"Cutover runbooks (cache-tier, castore-FUSE)","deps":[555,562,564],"crate":"docs","priority":65,"status":"UNIMPL","complexity":"LOW","note":""}
 {"plan":572,"title":"Directory merkle layer: dir_digest/root_digest in NarIndex + directories+file_blobs tables + nar_index.root_node column + bottom-up compute in castore.rs","deps":[545,546,551,552],"crate":"rio-proto,rio-store","priority":90,"status":"DONE","complexity":"LOW","note":"LOAD-BEARING for P0559 mount path (ADR §2.2); also U5 foundation; snix castore.proto vendored (MIT); pin canonical encoding (snix #111); pass lives in rio-store not rio-nix (rio-nix can't depend on rio-proto)"}
 {"plan":573,"title":"DirectoryService RPC: GetDirectory(recursive=true server-BFS stream) / HasDirectories / HasBlobs (batch bitmap; I-110 lesson)","deps":[572,589],"crate":"rio-proto,rio-store","priority":90,"status":"DONE","complexity":"MED","note":"snix-wire-compatible; recursive=true is the P0559 mount-time prefetch path; tenant-scoping reads claims.tenant (P0589)"}
-{"plan":577,"title":"BlobService.Read(file_digest) server-stream (snix-compatible; file_blobs→chunk-range→GetChunks slice)","deps":[573],"crate":"rio-proto,rio-store","priority":80,"status":"UNIMPL","complexity":"LOW","note":"~40 LoC; completes castore surface"}
+{"plan":577,"title":"BlobService.Read(file_digest) server-stream (snix-compatible; file_blobs→nar_index size→chunk-cumsum slice)","deps":[573],"crate":"rio-proto,rio-store","priority":80,"status":"DONE","complexity":"LOW","note":"completes castore surface; r[store.castore.blob-read]"}
 {"plan":574,"title":"Gateway substituter: Directory-DAG delta-sync client (nix copy walks DAG, prunes present subtrees)","deps":[573,577],"crate":"rio-gateway,nix","priority":75,"status":"UNIMPL","complexity":"MED","note":"U5 LANDS; falls through to chunk-list when remote lacks capability"}
 ```
 

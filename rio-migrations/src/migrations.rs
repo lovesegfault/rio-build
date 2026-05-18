@@ -1045,6 +1045,21 @@ pub const M_061: () = ();
 /// `drv_logs` on main), so it's 062.
 pub const M_062: () = ();
 
+/// 063 — `file_blobs.size` (P0577/P0570).
+///
+/// Denormalizes file content length onto the `file_blobs` junction so
+/// `ReadBlob`/`StatBlob` compute the chunk window from one row. The
+/// alternative is fetching and decoding `nar_index.entries` per call:
+/// O(files-in-NAR), ~2.5 MB for a 25k-file chromium output, on the
+/// FUSE `open()` fast path. Size is content-derived (same digest ⇒
+/// same bytes ⇒ same size), so two rows for one digest cannot
+/// disagree.
+///
+/// `DEFAULT 0` keeps the `ALTER` rewrite-free and lets test fixtures
+/// that don't exercise size (`HasBlobs`) omit the column. There are
+/// no pre-063 rows to backfill: 062 and 063 ship in the same release.
+pub const M_063: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

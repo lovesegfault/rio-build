@@ -207,9 +207,12 @@ async fn main() -> anyhow::Result<()> {
     let chunk_service = ChunkServiceImpl::new(chunk_cache.clone());
 
     // Tenant-scoped via JWT or HMAC assignment-token claim — see
-    // grpc/directory.rs.
-    let directory_service =
-        rio_store::grpc::DirectoryServiceImpl::new(pool.clone(), hmac_verifier_arc);
+    // grpc/directory.rs. ReadBlob shares the chunk cache.
+    let directory_service = rio_store::grpc::DirectoryServiceImpl::new(
+        pool.clone(),
+        hmac_verifier_arc,
+        chunk_cache.clone(),
+    );
 
     // StoreAdminServiceImpl: TriggerGC + VerifyChunks + upstream CRUD
     // + GetLoad. Gets the chunk backend directly (for key_for in
