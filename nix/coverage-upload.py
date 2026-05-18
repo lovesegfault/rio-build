@@ -54,8 +54,19 @@ def realise(name: str, out_path: str) -> tuple[str, str | None]:
 def upload(name: str, path: str, token: str) -> None:
     print(f"::group::codecov upload: {name}")
     sys.stdout.flush()
+    # upload-coverage, NOT upload-process: both reach do_upload_logic
+    # but upload-coverage sets upload_coverage=True which selects the
+    # /upload-coverage endpoint (new ingest pipeline) instead of the
+    # legacy /commits/{sha}/reports/{code}/uploads. Our lcov paths are
+    # `source/src/...` (per-crate sandbox prefix; crate name lost) and
+    # only the new endpoint's path-fixing matches them against the
+    # repo tree. The legacy endpoint returns "unusable report".
+    # Matches codecov-action@v6's subcommand. slug/sha are passed
+    # explicitly: the action's wrapper feeds them via CC_* env that
+    # its bundled CLI reads, but click's required=True on --commit-sha
+    # fires before the GHA CI-adapter fallback in plain codecovcli.
     subprocess.run(
-        [CODECOVCLI, "upload-process",
+        [CODECOVCLI, "upload-coverage",
          "--git-service", "github",
          "--slug", os.environ["GITHUB_REPOSITORY"],
          "--commit-sha", os.environ["GITHUB_SHA"],
@@ -63,6 +74,10 @@ def upload(name: str, path: str, token: str) -> None:
          "--flag", name,
          "--file", path,
          "--disable-search",
+         # Default plugins (xcode/gcov/pycoverage) probe for binaries
+         # we don't ship and warn; we pass a finished lcov so none of
+         # them would run on anything anyway.
+         "--plugin", "noop",
          "--fail-on-error"],
         check=True,
     )
