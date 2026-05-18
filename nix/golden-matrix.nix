@@ -30,13 +30,20 @@ let
   # are nixpkgs-packaged binaries (substitutable from cache.nixos.org).
   #
   # nix-stable uses the oldest nixVersions.nix_2_* still in nixpkgs
-  # (2.20 was dropped). Oldest-protocol-minor coverage is provided by
-  # the lix variant (frozen at 1.35 = rio's MIN_CLIENT_VERSION).
+  # (2.20 was dropped).
+  #
+  # NO lix variant: lix is policy-frozen at protocol 1.35, but the
+  # golden harness sends 1.38-shaped opcode payloads (it doesn't
+  # downgrade per negotiated version), so every opcode test would just
+  # compare lix's STDERR_ERROR vs rio's STDERR_LAST — meaningless.
+  # Lix-as-CLIENT coverage (the direction that matters in production)
+  # is `checks.vm-protocol-warm-lix-standalone`. If/when the harness
+  # is taught to encode opcodes at the negotiated version, re-add
+  # `inherit (pkgs) lix;` here for oldest-protocol-minor coverage.
   daemons = {
     nix-pinned = inputs.nix.packages.${system}.nix-cli or inputs.nix.packages.${system}.default;
     nix-stable = pkgs.nixVersions.nix_2_28;
     nix-unstable = pkgs.nixVersions.git;
-    inherit (pkgs) lix;
   };
 
   # One nextest run per daemon. The variant's nix package is PREPENDED

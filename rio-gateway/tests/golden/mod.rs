@@ -175,20 +175,37 @@ fn is_stderr_activity(msg_type: u64) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Parse a handshake response into named fields.
+///
+/// Version-aware: `features` is a 1.38+ phase. The negotiated version
+/// is `min(PROTOCOL_VERSION, server_version)` and we read
+/// `server_version` from this same byte stream, so the parse self-
+/// describes which fields are present. Daemons at <1.38 (Lix is
+/// policy-frozen at 1.35) don't send `features`; emit an empty-bytes
+/// field so downstream `assert_field_conformance` still has a
+/// stable `name` to match against the skip list.
 pub async fn parse_handshake_fields(data: &[u8]) -> Vec<ResponseField> {
+    use rio_nix::protocol::handshake::{PROTOCOL_VERSION, encode_version};
     let mut cursor = Cursor::new(data.to_vec());
+    let magic2 = read_u64_field(&mut cursor).await;
+    let version = read_u64_field(&mut cursor).await;
+    let srv_ver = u64::from_le_bytes(version.clone().try_into().unwrap());
+    let features = if srv_ver.min(PROTOCOL_VERSION) >= encode_version(1, 38) {
+        read_strings_field(&mut cursor).await
+    } else {
+        Vec::new()
+    };
     vec![
         ResponseField {
             name: "magic2",
-            bytes: read_u64_field(&mut cursor).await,
+            bytes: magic2,
         },
         ResponseField {
             name: "version",
-            bytes: read_u64_field(&mut cursor).await,
+            bytes: version,
         },
         ResponseField {
             name: "features",
-            bytes: read_strings_field(&mut cursor).await,
+            bytes: features,
         },
         ResponseField {
             name: "version_string",

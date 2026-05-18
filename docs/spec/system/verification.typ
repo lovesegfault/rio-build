@@ -16,7 +16,7 @@
 
 == Multi-Nix compatibility matrix
 
-Per-push CI runs `golden_conformance` against four daemon variants
+Per-push CI runs `golden_conformance` against three CppNix daemon variants
 (`checks.golden-<variant>`):
 
 #table(
@@ -30,16 +30,19 @@ Per-push CI runs `golden_conformance` against four daemon variants
   [Oldest CppNix nixpkgs still ships],
 
   [`nix-unstable`], [`pkgs.nixVersions.git`], [Surfaces breakage early],
-  [`lix`],
-  [`pkgs.lix`],
-  [Fork --- diverges on feature set, version string, opcode additions;
-    policy-frozen at protocol 1.35 = `MIN_CLIENT_VERSION` floor coverage],
 )
 
-Three of four daemons come from the pinned nixpkgs (no separate flake inputs)
+Two of three daemons come from the pinned nixpkgs (no separate flake inputs)
 and substitute from cache.nixos.org; only `nix-pinned` builds from
-`inputs.nix`. gen-matrix's cache-filter skips all four on PRs that don't touch
+`inputs.nix`. gen-matrix's cache-filter skips all three on PRs that don't touch
 the conformance binary's closure.
+
+Lix is *not* in the golden matrix: it is policy-frozen at protocol 1.35,
+and the harness sends 1.38-shaped opcode payloads (it doesn't downgrade per
+negotiated version), so Lix-as-reference-daemon would just compare
+`STDERR_ERROR` vs rio's `STDERR_LAST` for every opcode. Lix-as-*client*
+coverage --- the direction that matters in production --- is
+`checks.vm-protocol-warm-lix-standalone`.
 
 Test harness reads `RIO_GOLDEN_DAEMON_BIN` (absolute daemon path) and
 `RIO_GOLDEN_DAEMON_VARIANT` (skip-list key). Per-variant skips live in
@@ -52,13 +55,18 @@ client negotiates to 1.35 and rio omits the 1.37+
 `BuildResult.cpu_user`/`cpu_system` fields. The Lix-as-client direction is
 exercised end-to-end in checks by `vm-protocol-warm-lix-standalone` (same
 scenario as `vm-protocol-warm-standalone`, client `nix.package` set to
-`pkgs.lix`). Known golden-conformance divergences (Lix-as-reference-daemon vs
-rio-as-daemon):
-- Version string format (`"Lix N.N.N"` vs `"nix (Nix) N.N.N"`) --- handled by
-  the existing `SKIP_FIELDS` mechanism at field level
-- Daemon feature set advertised during handshake ---
-  `test_golden_live_handshake` skipped for Lix until the comparator tolerates
-  feature-set supersets
+`pkgs.lix`). Known golden-conformance divergences against rio-as-daemon
+(handled at the field level by `skip_fields()` in
+#src("rio-gateway/tests/golden_conformance.rs")):
+- `version_string` --- each daemon has its own
+- `features` (nix-unstable only) --- the handshake feature set is
+  set-membership, not byte-equality. CppNix master grows
+  `WorkerProto::Feature` entries continuously
+  (`realisation-with-path-not-hash`, `delete-dead-specific-referrers`, ...).
+  rio advertises `[]` so clients fall back to the pre-feature wire encoding
+  rio implements; nix intersects client∩server and that's the correct
+  negotiated result. `nix-pinned`/`nix-stable` stay byte-exact (`[]` on
+  both sides) so rio accidentally advertising something is caught.
 
 `nix build .#checks.x86_64-linux.golden-<variant>` runs one variant locally.
 

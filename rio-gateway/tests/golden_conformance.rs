@@ -86,17 +86,31 @@ async fn gateway_response(client_bytes: &[u8], store: MockStore) -> anyhow::Resu
 
 /// Fields that legitimately differ between nix-daemon and rio-gateway.
 ///
-/// Variant-aware: handshake `features` is a *field* divergence (Lix
-/// advertises `lix-custom`/`pipe-operators` and omits some CppNix
-/// experimental features), not a *test* divergence — the handshake
-/// runs as a preamble in every `run_live_conformance` caller, so
-/// handling it at the field level keeps all 12 callers green under
-/// `RIO_GOLDEN_DAEMON_VARIANT=lix` instead of just the one test the
-/// old `VARIANT_SKIP` row covered. The handshake `features` spec is
+/// Variant-aware: handshake `features` is a *field* divergence, not a
+/// *test* divergence — the handshake runs as a preamble in every
+/// `run_live_conformance` caller, so handling it at the field level
+/// keeps all 12 callers green instead of just the one test a
+/// `VARIANT_SKIP` row would cover. The handshake `features` spec is
 /// set-membership, not byte-equality.
+///
+/// `nix-pinned`/`nix-stable` stay byte-exact: those are pinned
+/// versions where rio↔CppNix both sending `[]` is a real signal that
+/// rio hasn't accidentally started advertising something it doesn't
+/// implement.
 fn skip_fields() -> &'static [&'static str] {
     match golden::daemon::daemon_variant() {
-        "lix" => &["version_string", "trusted", "features"],
+        // lix: policy-frozen at protocol 1.35, so `version` differs
+        //   from rio's 0x126 by construction; advertises its own
+        //   feature set (lix-custom, pipe-operators).
+        "lix" => &["version", "version_string", "trusted", "features"],
+        // nix-unstable: WorkerProto::Feature is now CppNix's primary
+        //   protocol-evolution mechanism — master grows entries
+        //   continuously (realisation-with-path-not-hash,
+        //   delete-dead-specific-referrers, …). rio advertises [] so
+        //   clients fall back to the pre-feature encoding rio
+        //   implements; nix intersects client∩server and that's the
+        //   correct negotiated result.
+        "nix-unstable" => &["version_string", "trusted", "features"],
         _ => &["version_string", "trusted"],
     }
 }
@@ -436,25 +450,27 @@ async fn test_golden_live_add_signatures() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// bug_139: `skip_fields()` is variant-aware. Under the default
-/// variant the handshake `features` field is compared (CppNix↔rio
-/// must agree); under `lix` it is skipped. The lix branch is
-/// integration-tested by `checks.golden-lix`; this is the
-/// per-push guard that the BASE skip list (used by all 12
-/// `run_live_conformance` callers' handshake preamble) hasn't
-/// regressed.
+/// bug_139: `skip_fields()` is variant-aware. Under the pinned/stable
+/// variants the handshake `features` field is compared (CppNix↔rio
+/// must agree on `[]`); under `lix`/`nix-unstable` it is skipped.
+/// Those branches are integration-tested by `checks.golden-{lix,
+/// nix-unstable}`; this is the per-push guard that the BASE skip list
+/// (used by all 12 `run_live_conformance` callers' handshake
+/// preamble) hasn't regressed.
 #[test]
 fn skip_fields_variant_aware() {
-    // Default variant: features must NOT be skipped.
     let base = skip_fields();
     assert!(base.contains(&"version_string"));
     assert!(base.contains(&"trusted"));
-    if golden::daemon::daemon_variant() == "lix" {
-        assert!(base.contains(&"features"));
-    } else {
-        assert!(
-            !base.contains(&"features"),
-            "features must be compared for non-lix variants"
-        );
-    }
+    let v = golden::daemon::daemon_variant();
+    assert_eq!(
+        base.contains(&"features"),
+        matches!(v, "lix" | "nix-unstable"),
+        "features must be compared exactly for pinned/stable variants"
+    );
+    assert_eq!(
+        base.contains(&"version"),
+        v == "lix",
+        "version must be compared for all CppNix variants"
+    );
 }

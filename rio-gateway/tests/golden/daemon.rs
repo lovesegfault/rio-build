@@ -198,28 +198,38 @@ async fn exchange_with_daemon_inner(
     let mut srv_phase1 = vec![0u8; 16];
     stream.read_exact(&mut srv_phase1).await?;
     all_server.extend_from_slice(&srv_phase1);
+    let srv_ver = u64::from_le_bytes(srv_phase1[8..16].try_into().unwrap());
+    let negotiated = srv_ver.min(PROTOCOL_VERSION);
 
-    // --- Handshake phase 2: features exchange ---
-    let phase2 = wire_bytes![strings: wire::NO_STRINGS];
-    stream.write_all(&phase2).await?;
-    stream.flush().await?;
-    all_client.extend_from_slice(&phase2);
+    // --- Handshake phase 2: features exchange (1.38+) ---
+    //
+    // Lix is policy-frozen at 1.35; sending features unconditionally
+    // deadlocks (test waits for daemon's feature-list; daemon — past
+    // phase 1 at 1.35 — is already waiting for cpu_affinity). The
+    // negotiated check must mirror rio_nix::protocol::handshake's
+    // own gate.
+    if negotiated >= rio_nix::protocol::handshake::encode_version(1, 38) {
+        let phase2 = wire_bytes![strings: wire::NO_STRINGS];
+        stream.write_all(&phase2).await?;
+        stream.flush().await?;
+        all_client.extend_from_slice(&phase2);
 
-    // Read server features (count + strings)
-    let mut count_buf = vec![0u8; 8];
-    stream.read_exact(&mut count_buf).await?;
-    let count = u64::from_le_bytes(count_buf.clone().try_into().unwrap()) as usize;
-    all_server.extend_from_slice(&count_buf);
-    for _ in 0..count {
-        let mut len_buf = vec![0u8; 8];
-        stream.read_exact(&mut len_buf).await?;
-        let len = u64::from_le_bytes(len_buf.clone().try_into().unwrap()) as usize;
-        let padded = (len + 7) & !7;
-        all_server.extend_from_slice(&len_buf);
-        if padded > 0 {
-            let mut str_buf = vec![0u8; padded];
-            stream.read_exact(&mut str_buf).await?;
-            all_server.extend_from_slice(&str_buf);
+        // Read server features (count + strings)
+        let mut count_buf = vec![0u8; 8];
+        stream.read_exact(&mut count_buf).await?;
+        let count = u64::from_le_bytes(count_buf.clone().try_into().unwrap()) as usize;
+        all_server.extend_from_slice(&count_buf);
+        for _ in 0..count {
+            let mut len_buf = vec![0u8; 8];
+            stream.read_exact(&mut len_buf).await?;
+            let len = u64::from_le_bytes(len_buf.clone().try_into().unwrap()) as usize;
+            let padded = (len + 7) & !7;
+            all_server.extend_from_slice(&len_buf);
+            if padded > 0 {
+                let mut str_buf = vec![0u8; padded];
+                stream.read_exact(&mut str_buf).await?;
+                all_server.extend_from_slice(&str_buf);
+            }
         }
     }
 

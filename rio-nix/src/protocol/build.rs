@@ -412,6 +412,15 @@ pub async fn write_build_result<W: AsyncWrite + Unpin>(
     }
 
     // Protocol 1.28+ (always present since we target 1.35+): builtOutputs (DrvOutputs map)
+    //
+    // TODO: realisation-with-path-not-hash — CppNix ≥2.35's
+    // WorkerProto::Feature for native binary builtOutputs/DrvOutput
+    // encoding (store-path keyed, no JSON). rio doesn't advertise it
+    // (handshake.rs sends `[]`), so nix master clients fall back to
+    // this path. Implementing means rewriting this writer + the
+    // matching reader above + opcodes_read.rs wopRegisterDrvOutput/
+    // wopQueryRealisation. Safe to defer: the JSON path stays in
+    // CppNix as the feature-absent fallback.
     wire::write_u64(w, result.built_outputs.len() as u64).await?;
     for output in &result.built_outputs {
         // Key: DrvOutput string
