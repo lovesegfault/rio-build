@@ -40,23 +40,9 @@ specs (
     name rio
     source_url https://github.com/lovesegfault/rio-build
     include (
-      docs/src/components/gateway.md
-      docs/src/components/scheduler.md
-      docs/src/components/store.md
-      docs/src/components/builder.md
-      docs/src/components/fetcher.md
-      docs/src/components/controller.md
-      docs/src/components/dashboard.md
-      docs/src/components/proto.md
-      docs/src/components/cli.md
-      docs/src/components/sla-sizing.md
-      docs/src/observability.md
-      docs/src/security.md
-      docs/src/deployment.md
-      docs/src/crate-structure.md
-      docs/src/verification.md
-      docs/src/capacity-planning.md
-      docs/src/decisions/019-builder-fetcher-split.md
+      docs/spec/**/*.typ
+      // ADR-022/023 markdown ADR docs predate the typst migration.
+      // Tracey scans `^r[ID]` markers in .md and `#r("ID")` in .typ.
       docs/src/decisions/022-lazy-store-fs-erofs-vs-riofs.md
       docs/src/decisions/022-design-overview.md
       docs/src/decisions/023-tiered-chunk-backend.md

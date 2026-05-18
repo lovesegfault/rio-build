@@ -45,7 +45,7 @@ pub enum ChunkBackendKind {
     /// plain `S3` shape — replicas in AZs without Express still
     /// function. The Express bucket is per-AZ; helm wires the right one
     /// via the node's `topology.kubernetes.io/zone` label (P0554).
-    /// See [ADR-023](../../docs/src/decisions/023-tiered-chunk-backend.md).
+    /// See ADR-023 (tiered chunk backend).
     Tiered {
         /// Authoritative S3 standard bucket.
         bucket: String,

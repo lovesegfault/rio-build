@@ -5,10 +5,18 @@
   paper: (
     title: [Lazy Store Filesystem],
     supertitle: "ARCHITECTURE DECISION RECORD",
-    status: "Accepted (Path A — EROFS + fscache)",
+    status: "Superseded — see ADR-022 Design Overview (castore-FUSE)",
     date: "2026-02",
   ),
 )
+
+#info(title: [Status])[
+  Superseded: the spike work surfaced a third candidate (Path C,
+  composefs-style — castore-FUSE metadata + passthrough-fd data) that won on
+  owned-code and operational simplicity. The accepted design lives in the
+  ADR-022 Design Overview (markdown, predates the typst migration). This
+  document is kept as the original A-vs-B comparison record.
+]
 
 #info(title: [Scope])[
   Deep technical comparison of the two phase-2 candidates from

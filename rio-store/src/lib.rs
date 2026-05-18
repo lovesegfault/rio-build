@@ -186,7 +186,7 @@ pub fn describe_metrics() {
         "rio_store_tiered_writethrough_errors_total",
         "Tiered backend Express write-through failures (chunk served from S3 standard but Express not warmed)"
     );
-    // Spec'd in observability.md ahead of P0585 (Express eviction
+    // Spec'd in observability.typ ahead of P0585 (Express eviction
     // sweeper); register HELP text now so the metrics_registered
     // spec→describe gate passes, the sweeper adds the emit sites.
     describe_gauge!(
