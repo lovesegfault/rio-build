@@ -398,6 +398,10 @@ async fn main() -> anyhow::Result<()> {
         executor_path_slots,
         shutdown.clone(),
     );
+    // NAR indexer: drains the `WHERE NOT nar_indexed` work-queue for
+    // paths the eager PutPath path skipped. Same disposition as the GC
+    // tasks: panics logged, shutdown-on-cancel.
+    rio_store::nar_index::spawn_indexer_loop(pool.clone(), chunk_cache.clone(), shutdown.clone());
 
     let max_msg_size = rio_common::grpc::max_message_size();
 

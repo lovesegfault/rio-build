@@ -26,7 +26,8 @@ pub use rio_store::test_helpers::{
     mem_backend, put_path, put_path_raw, spawn_store_service as spawn_store_server,
 };
 use rio_test_support::fixtures::{
-    make_large_nar, make_nar, make_path_info_for_nar, pseudo_random_bytes, test_store_path,
+    make_large_nar, make_nar, make_path_info, make_path_info_for_nar, pseudo_random_bytes,
+    test_store_path,
 };
 use rio_test_support::{TestDb, TestResult};
 
@@ -246,6 +247,7 @@ mod core;
 mod declared;
 mod hash_part;
 mod hmac;
+mod nar_index;
 mod realisations;
 mod reassembly;
 mod registration;

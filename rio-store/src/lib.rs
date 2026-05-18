@@ -46,6 +46,8 @@ pub mod budget;
 #[cfg(feature = "server")]
 pub mod cas;
 #[cfg(feature = "server")]
+pub mod castore;
+#[cfg(feature = "server")]
 pub(crate) mod chunker;
 #[cfg(feature = "server")]
 pub mod config;
@@ -68,6 +70,8 @@ pub mod manifest;
 pub mod materialize;
 #[cfg(feature = "server")]
 pub(crate) mod metadata;
+#[cfg(feature = "server")]
+pub mod nar_index;
 #[cfg(feature = "server")]
 pub mod signing;
 #[cfg(feature = "server")]
@@ -871,6 +875,19 @@ pub fn describe_metrics() {
     // hasn't reported yet" (same reasoning as the drain gauges below).
     metrics::gauge!("rio_store_log_active_ingest_sessions").set(0.0);
     metrics::gauge!("rio_store_log_tail_subscribers").set(0.0);
+
+    describe_counter!(
+        "rio_store_nar_index_compute_total",
+        "NAR-index computations (eager PutPath + indexer_loop + sync-on-miss)"
+    );
+    describe_histogram!(
+        "rio_store_nar_index_compute_seconds",
+        "Per-path NAR reassemble + nar_ls + persist (indexer_loop only)"
+    );
+    describe_counter!(
+        "rio_store_nar_index_cache_hits_total",
+        "GetNarIndex requests served from the nar_index table without recompute"
+    );
 
     // Pre-register drain gauges at 0. metrics-rs only materializes a gauge
     // on first .set(); describe_gauge! alone doesn't. drain_once (gc/drain.rs)

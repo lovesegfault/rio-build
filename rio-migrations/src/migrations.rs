@@ -2523,6 +2523,35 @@ pub const M_108: () = ();
 /// the same implicit-transaction-block reason as [`M_108`].
 pub const M_109: () = ();
 
+/// `migrations/110_nar_index.sql`
+///
+/// ADR-022 castore schema, all in one migration so it's pinned once:
+///
+/// - **P0551** (this commit): `nar_index` (`entries` = encoded
+///   `rio.types.NarIndex`) + `manifests.nar_indexed` partial-index
+///   work-queue (same pattern as 031). Derived state, FK→`manifests`
+///   `ON DELETE CASCADE`. PG forbids cross-table partial-index
+///   predicates, hence the same-table bool flag (HOT-update eligible).
+/// - **P0572** (pre-created): `nar_index.root_node`, `directories` +
+///   `directory_tenants` (refcounted content-addressed `Directory`
+///   bodies), `file_blobs` + `file_blob_tenants` (`(file_digest,
+///   manifest)` junction — GC of one referrer leaves the other's row).
+/// - **P0581** (pre-created): `narinfo.compat_file_hash` for
+///   legacy-binary-cache compat-write GC coupling.
+/// - **P0586** (pre-created): `chunks.durable` + partial index —
+///   "S3-PUT-confirmed" presence flag closing the I-201 WAL-window
+///   race in `HasChunks`/`FindMissingChunks`.
+///
+/// **NOT here:** P0583's `DROP COLUMN inline_blob` — the store still
+/// reads it (`metadata::get_manifest`, `cas.rs`, `get_path.rs`); that
+/// DROP gets its own migration once the inline-storage path is gone.
+///
+/// Plan called this `054`; 054-061 landed first (061 went to
+/// `drv_logs` on main) and 062-064 (wanted-outputs, topdown_pruned,
+/// closure_hole) landed while ADR-022 was in flight, so it's 110,
+/// post formal-sprint rebase.
+pub const M_110: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql
