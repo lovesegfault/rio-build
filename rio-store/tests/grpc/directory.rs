@@ -20,8 +20,8 @@ use rio_proto::DirectoryServiceServer;
 use rio_proto::castore::{Directory, DirectoryEntry, FileEntry};
 use rio_proto::store::directory_service_client::DirectoryServiceClient;
 use rio_proto::types::{
-    GetDirectoryRequest, HasBlobsRequest, HasDirectoriesRequest, ReadBlobRequest,
-    get_directory_request,
+    GetDirectoryRequest, HasBlobsRequest, HasDirectoriesRequest, ReadBlobRequest, StatBlobRequest,
+    StatBlobResponse, get_directory_request,
 };
 use rio_store::MIGRATOR;
 use rio_store::backend::{ChunkBackend, MemoryChunkBackend};
@@ -730,6 +730,247 @@ async fn read_blob_size_overruns_nar_data_loss() {
 
     let err = read_blob(&mut f, digest, &tok).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::DataLoss);
+}
+
+async fn stat_blob_with(
+    f: &mut Fixture,
+    digest: [u8; 32],
+    tok: &str,
+    send_chunks: bool,
+) -> Result<StatBlobResponse, tonic::Status> {
+    Ok(f.client
+        .stat_blob(with_token(
+            StatBlobRequest {
+                file_digest: digest.to_vec(),
+                send_chunks,
+            },
+            tok,
+        ))
+        .await?
+        .into_inner())
+}
+
+/// Drive `StatBlob` with `send_chunks=true`.
+async fn stat_blob(
+    f: &mut Fixture,
+    digest: [u8; 32],
+    tok: &str,
+) -> Result<StatBlobResponse, tonic::Status> {
+    stat_blob_with(f, digest, tok, true).await
+}
+
+/// Reassemble the file body from a `StatBlobResponse` the way the
+/// FUSE fill task would: fetch each chunk from the backend, slice the
+/// first/last per the response offsets.
+async fn reassemble_stat(f: &Fixture, resp: &StatBlobResponse) -> Vec<u8> {
+    let n = resp.chunks.len();
+    let mut body = Vec::new();
+    for (i, c) in resp.chunks.iter().enumerate() {
+        let digest: [u8; 32] = c.digest.as_slice().try_into().unwrap();
+        let bytes = f.chunks.get(&digest).await.unwrap().unwrap();
+        assert_eq!(bytes.len() as u64, c.size, "ChunkMeta.size matches store");
+        let start = if i == 0 {
+            resp.first_chunk_skip as usize
+        } else {
+            0
+        };
+        let end = if i + 1 == n {
+            resp.last_chunk_take as usize
+        } else {
+            bytes.len()
+        };
+        body.extend_from_slice(&bytes[start..end]);
+    }
+    body
+}
+
+/// Multi-chunk file straddling NAR-framed boundaries: the chunk
+/// window covers exactly the file's bytes once first/last are sliced.
+// r[verify store.castore.blob-stat]
+#[tokio::test]
+async fn stat_blob_chunked_window() {
+    let mut f = fixture().await;
+    // 100-byte chunks, 700-byte file at offset 64: spans chunks 0-7.
+    let b = make_blob_nar(700, 21);
+    let digest = seed_blob(&f, "sb-chunked", &b, Some(100)).await;
+    let tok = token(f.tenant_a);
+
+    let resp = stat_blob(&mut f, digest, &tok).await.unwrap();
+    assert_eq!(resp.chunks.len(), 8);
+    assert_eq!(resp.first_chunk_skip, 64);
+    // File ends at NAR byte 764; chunk 7 starts at 700; 764-700=64.
+    assert_eq!(resp.last_chunk_take, 64);
+    let body = reassemble_stat(&f, &resp).await;
+    assert_eq!(body, b.file);
+    assert_eq!(<[u8; 32]>::from(blake3::hash(&body)), digest);
+}
+
+/// Single-chunk window: skip and take both apply to the same chunk.
+// r[verify store.castore.blob-stat]
+#[tokio::test]
+async fn stat_blob_single_chunk() {
+    let mut f = fixture().await;
+    let b = make_blob_nar(16, 22);
+    let digest = seed_blob(&f, "sb-single", &b, Some(1 << 20)).await;
+    let tok = token(f.tenant_a);
+
+    let resp = stat_blob(&mut f, digest, &tok).await.unwrap();
+    assert_eq!(resp.chunks.len(), 1);
+    assert_eq!(resp.first_chunk_skip, 64);
+    assert_eq!(resp.last_chunk_take, 80);
+    let body = reassemble_stat(&f, &resp).await;
+    assert_eq!(body, b.file);
+}
+
+/// Zero-byte file: empty chunk list, both offsets 0.
+// r[verify store.castore.blob-stat]
+#[tokio::test]
+async fn stat_blob_zero_byte_file() {
+    let mut f = fixture().await;
+    let b = make_blob_nar(0, 23);
+    let digest = seed_blob(&f, "sb-zero", &b, Some(50)).await;
+    let tok = token(f.tenant_a);
+
+    let resp = stat_blob(&mut f, digest, &tok).await.unwrap();
+    assert!(resp.chunks.is_empty());
+    assert_eq!(resp.first_chunk_skip, 0);
+    assert_eq!(resp.last_chunk_take, 0);
+}
+
+/// `send_chunks=false` is a presence probe: empty response on a known
+/// digest, NotFound otherwise.
+// r[verify store.castore.blob-stat]
+#[tokio::test]
+async fn stat_blob_presence_probe() {
+    let mut f = fixture().await;
+    let b = make_blob_nar(64, 24);
+    let digest = seed_blob(&f, "sb-probe", &b, Some(100)).await;
+    let tok = token(f.tenant_a);
+
+    let resp = stat_blob_with(&mut f, digest, &tok, false).await.unwrap();
+    assert!(resp.chunks.is_empty());
+
+    let unknown: [u8; 32] = blake3::hash(b"sb-nope").into();
+    let err = stat_blob_with(&mut f, unknown, &tok, false)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound);
+}
+
+/// Inline manifests have no chunk list: FAILED_PRECONDITION steers
+/// the caller to ReadBlob. Presence probe doesn't classify, so it
+/// still succeeds.
+// r[verify store.castore.blob-stat]
+#[tokio::test]
+async fn stat_blob_inline_failed_precondition() {
+    let mut f = fixture().await;
+    let b = make_blob_nar(64, 25);
+    let digest = seed_blob(&f, "sb-inline", &b, None).await;
+    let tok = token(f.tenant_a);
+
+    let err = stat_blob(&mut f, digest, &tok).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+    let resp = stat_blob_with(&mut f, digest, &tok, false).await.unwrap();
+    assert!(resp.chunks.is_empty());
+}
+
+/// Cross-tenant: a digest tenant A produced is NotFound for tenant B,
+/// same status as an unknown digest.
+// r[verify store.castore.blob-stat]
+// r[verify store.castore.tenant-scope]
+#[tokio::test]
+async fn stat_blob_tenant_scoped() {
+    let mut f = fixture().await;
+    let b = make_blob_nar(64, 26);
+    let digest = seed_blob(&f, "sb-tenant", &b, Some(100)).await;
+    let tok_b = token(f.tenant_b);
+
+    let err = stat_blob(&mut f, digest, &tok_b).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound);
+}
+
+/// `file_blobs.size` overrunning a *chunked* NAR is DATA_LOSS — the
+/// inline-path overrun test doesn't reach `build_chunk_plan`, which
+/// `read_blob` and `stat_blob` share.
+// r[verify store.castore.blob-stat]
+// r[verify store.castore.blob-read]
+#[tokio::test]
+async fn stat_blob_size_overruns_chunked_data_loss() {
+    let mut f = fixture().await;
+    let b = make_blob_nar(200, 27);
+    let digest = seed_blob(&f, "sb-overrun", &b, Some(50)).await;
+    sqlx::query("UPDATE file_blobs SET size = $1")
+        .bind(1_000_000i64)
+        .execute(&f.db.pool)
+        .await
+        .unwrap();
+    let tok = token(f.tenant_a);
+
+    let err = stat_blob(&mut f, digest, &tok).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::DataLoss);
+    let err = read_blob(&mut f, digest, &tok).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::DataLoss);
+}
+
+/// A manifest with neither `inline_blob` nor `manifest_data` is
+/// corrupt PG state — the commit txn always writes one. Both RPCs
+/// report DATA_LOSS.
+// r[verify store.castore.blob-stat]
+// r[verify store.castore.blob-read]
+#[tokio::test]
+async fn stat_blob_neither_inline_nor_chunked_data_loss() {
+    let mut f = fixture().await;
+    let b = make_blob_nar(64, 28);
+    let digest = seed_blob(&f, "sb-neither", &b, None).await;
+    sqlx::query("UPDATE manifests SET inline_blob = NULL")
+        .execute(&f.db.pool)
+        .await
+        .unwrap();
+    let tok = token(f.tenant_a);
+
+    let err = stat_blob(&mut f, digest, &tok).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::DataLoss);
+    let err = read_blob(&mut f, digest, &tok).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::DataLoss);
+}
+
+/// Reassemble across chunk geometries and verify blake3 round-trips.
+/// Fixed cases rather than proptest: each shrink would re-seed a PG
+/// fixture, and these cases already cover the boundary classes.
+// r[verify store.castore.blob-stat]
+#[tokio::test]
+async fn stat_blob_window_round_trips_varied_geometry() {
+    let mut f = fixture().await;
+    let tok = token(f.tenant_a);
+    // (file_len, chunk_size): file < / == / > chunk, chunk-aligned
+    // ends, 1-byte chunks, multi-chunk straddle.
+    let cases = [
+        (1, 64),
+        (63, 64),
+        (64, 64),
+        (65, 64),
+        (128, 64),
+        (700, 100),
+        (700, 1),
+        (1, 4096),
+        (5000, 333),
+    ];
+    for (i, &(file_len, chunk_size)) in cases.iter().enumerate() {
+        let b = make_blob_nar(file_len, 30 + i as u8);
+        let digest = seed_blob(&f, &format!("sb-prop-{i}"), &b, Some(chunk_size)).await;
+        let resp = stat_blob(&mut f, digest, &tok).await.unwrap();
+        let body = reassemble_stat(&f, &resp).await;
+        assert_eq!(
+            body, b.file,
+            "case {i}: file_len={file_len} chunk={chunk_size}"
+        );
+        assert_eq!(
+            <[u8; 32]>::from(blake3::hash(&body)),
+            digest,
+            "case {i}: digest mismatch"
+        );
+    }
 }
 
 /// Three-level DAG with a self-referencing cycle: BFS terminates and

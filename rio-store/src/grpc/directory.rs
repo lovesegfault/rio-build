@@ -1,11 +1,11 @@
-//! ADR-022 castore RPC surface (P0573 / P0577).
+//! ADR-022 castore RPC surface (P0573 / P0577 / P0570).
 //!
-//! `GetDirectory` / `HasDirectories` / `HasBlobs` / `ReadBlob`. All
-//! tenant-scoped: every query joins `directory_tenants` /
-//! `file_blob_tenants` on the caller's `tenant_id` so a digest the
-//! tenant didn't produce is invisible (NotFound, or absent from the
-//! bitmap). Directory bodies leak child names/digests — confidentiality,
-//! not just isolation.
+//! `GetDirectory` / `HasDirectories` / `HasBlobs` / `ReadBlob` /
+//! `StatBlob`. All tenant-scoped: every query joins
+//! `directory_tenants` / `file_blob_tenants` on the caller's
+//! `tenant_id` so a digest the tenant didn't produce is invisible
+//! (NotFound, or absent from the bitmap). Directory bodies leak child
+//! names/digests — confidentiality, not just isolation.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -22,8 +22,8 @@ use tracing::{instrument, warn};
 use rio_proto::DirectoryService;
 use rio_proto::castore::Directory;
 use rio_proto::types::{
-    BlobChunk, GetDirectoryRequest, HasBitmap, HasBlobsRequest, HasDirectoriesRequest,
-    ReadBlobRequest,
+    BlobChunk, ChunkMeta, GetDirectoryRequest, HasBitmap, HasBlobsRequest, HasDirectoriesRequest,
+    ReadBlobRequest, StatBlobRequest, StatBlobResponse,
 };
 
 use crate::cas::ChunkCache;
@@ -390,13 +390,7 @@ impl DirectoryService for DirectoryServiceImpl {
         let Some((nar_offset, file_size, inline_blob, chunk_list)) = row else {
             return Err(Status::not_found("file blob not found"));
         };
-        let nar_offset = u64::try_from(nar_offset)
-            .map_err(|_| Status::data_loss("file_blobs.nar_offset is negative"))?;
-        let file_size = u64::try_from(file_size)
-            .map_err(|_| Status::data_loss("file_blobs.size is negative"))?;
-        let end = nar_offset
-            .checked_add(file_size)
-            .ok_or_else(|| Status::data_loss("nar_offset + file_size overflows"))?;
+        let (nar_offset, end) = nar_window(nar_offset, file_size)?;
 
         let plan = match (inline_blob, chunk_list) {
             (Some(blob), _) => BlobPlan::Inline(slice_inline(blob, nar_offset, end)?),
@@ -426,7 +420,8 @@ impl DirectoryService for DirectoryServiceImpl {
                 Err(_) => {
                     warn!(
                         timeout = ?rio_common::grpc::GRPC_STREAM_TIMEOUT,
-                        file_size, "ReadBlob stream timed out"
+                        file_size = end - nar_offset,
+                        "ReadBlob stream timed out"
                     );
                     let _ = tx
                         .send(Err(Status::deadline_exceeded("stream timeout")))
@@ -444,6 +439,107 @@ impl DirectoryService for DirectoryServiceImpl {
         });
         Ok(Response::new(ReceiverStream::new(rx)))
     }
+
+    /// Resolve `file_digest` to a chunk window. Same `file_blobs` →
+    /// cumsum resolution as `read_blob`, but returns the chunk list so
+    /// the FUSE caller can fetch chunks itself (`/var/rio/chunks/`,
+    /// then `GetChunks`) and slice the boundary chunks.
+    // r[impl store.castore.blob-stat]
+    #[instrument(skip(self, request), fields(rpc = "StatBlob"))]
+    async fn stat_blob(
+        &self,
+        request: Request<StatBlobRequest>,
+    ) -> Result<Response<StatBlobResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        let tenant = self.castore_tenant_id(&request)?;
+        let req = request.into_inner();
+        let digest = parse_digest(&req.file_digest)?;
+
+        // Probe before the chunk-list query: `md.chunk_list` is TOASTed
+        // (megabytes for a large NAR) and the probe never reads it.
+        // `has_in()` would also do, but it skips `m.status = 'complete'`.
+        if !req.send_chunks {
+            let exists: Option<(i32,)> = sqlx::query_as(
+                "SELECT 1 FROM file_blobs f \
+                   JOIN file_blob_tenants ft ON ft.digest = f.digest \
+                   JOIN manifests m ON m.store_path_hash = f.store_path_hash \
+                        AND m.status = 'complete' \
+                  WHERE f.digest = $1 AND ft.tenant_id = $2 LIMIT 1",
+            )
+            .bind(digest.as_slice())
+            .bind(tenant)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(internal)?;
+            return exists
+                .map(|_| Response::new(StatBlobResponse::default()))
+                .ok_or_else(|| Status::not_found("file blob not found"));
+        }
+
+        // `IS NOT NULL`, not the bytes: only the classification matters.
+        type StatRow = (i64, i64, bool, Option<Vec<u8>>);
+        let row: Option<StatRow> = sqlx::query_as(
+            "SELECT f.nar_offset, f.size, m.inline_blob IS NOT NULL, md.chunk_list \
+               FROM file_blobs f \
+               JOIN file_blob_tenants ft ON ft.digest = f.digest \
+               JOIN manifests m ON m.store_path_hash = f.store_path_hash \
+                    AND m.status = 'complete' \
+               LEFT JOIN manifest_data md ON md.store_path_hash = f.store_path_hash \
+              WHERE f.digest = $1 AND ft.tenant_id = $2 LIMIT 1",
+        )
+        .bind(digest.as_slice())
+        .bind(tenant)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(internal)?;
+        let Some((nar_offset, file_size, is_inline, chunk_list)) = row else {
+            return Err(Status::not_found("file blob not found"));
+        };
+        if is_inline {
+            // No chunk list to return; a synthetic ChunkMeta wouldn't be
+            // in the chunk store, and a file in an inline NAR is small
+            // enough for ReadBlob anyway.
+            return Err(Status::failed_precondition(
+                "file is in an inline manifest; use ReadBlob",
+            ));
+        }
+        let Some(chunk_list) = chunk_list else {
+            return Err(Status::data_loss(
+                "manifest has neither inline_blob nor manifest_data",
+            ));
+        };
+        let (nar_offset, end) = nar_window(nar_offset, file_size)?;
+        let plan = build_chunk_plan(&chunk_list, nar_offset, end)?;
+        // Bounded by entry.size: u32, but a future build_chunk_plan
+        // refactor must not silently wrap a slice offset.
+        let off =
+            |v: usize| u32::try_from(v).map_err(|_| Status::internal("chunk slice offset > u32"));
+        Ok(Response::new(StatBlobResponse {
+            first_chunk_skip: plan.first().map_or(Ok(0), |s| off(s.start))?,
+            last_chunk_take: plan.last().map_or(Ok(0), |s| off(s.end))?,
+            chunks: plan
+                .into_iter()
+                .map(|s| ChunkMeta {
+                    digest: s.hash.to_vec(),
+                    size: u64::from(s.size),
+                })
+                .collect(),
+        }))
+    }
+}
+
+/// `(nar_offset, file_size)` from PG to a `[nar_offset, end)` byte
+/// window, rejecting negative or overflowing values as `DATA_LOSS`
+/// (write-side bugs, not client errors).
+fn nar_window(nar_offset: i64, file_size: i64) -> Result<(u64, u64), Status> {
+    let nar_offset = u64::try_from(nar_offset)
+        .map_err(|_| Status::data_loss("file_blobs.nar_offset is negative"))?;
+    let file_size =
+        u64::try_from(file_size).map_err(|_| Status::data_loss("file_blobs.size is negative"))?;
+    let end = nar_offset
+        .checked_add(file_size)
+        .ok_or_else(|| Status::data_loss("nar_offset + file_size overflows"))?;
+    Ok((nar_offset, end))
 }
 
 /// Resolved fetch plan for one `ReadBlob`.
@@ -459,6 +555,10 @@ enum BlobPlan {
 
 struct ChunkSlice {
     hash: [u8; 32],
+    /// Total chunk size from the manifest. `ReadBlob`'s stream loop
+    /// only needs `start..end`; `StatBlob` returns this so the caller
+    /// can size its fetch buffer and validate `GetChunks` responses.
+    size: u32,
     /// Byte range within the chunk to emit.
     start: usize,
     end: usize,
@@ -516,6 +616,7 @@ fn build_chunk_plan(
             let take_end = end.min(chunk_end) - chunk_start;
             ChunkSlice {
                 hash: entry.hash,
+                size: entry.size,
                 // ManifestEntry.size is u32, so the per-chunk range fits usize.
                 start: take_start as usize,
                 end: take_end as usize,

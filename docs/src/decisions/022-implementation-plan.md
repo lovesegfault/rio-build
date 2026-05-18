@@ -1,6 +1,6 @@
 # ADR-022 Implementation Plan — castore-FUSE lazy store + per-AZ S3 Express chunk cache
 
-**Status:** Phase-0 gate passed (P0541, P0544, P0569 done; P0543/P0578 do not block the gate and are still UNIMPL). Phase 1/2 in progress: P0545, P0546, P0548, P0549, P0550, P0551, P0552, P0568, P0572, P0573, P0577, P0588, P0589 done; P0570 next (shares the cumsum helper with P0577). Design is [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) + [Design Overview](./022-design-overview.md) + ADR-023. Per-item status is in the metadata line under each `### P05xx` heading.
+**Status:** Phase-0 gate passed (P0541, P0544, P0569 done; P0543/P0578 do not block the gate and are still UNIMPL). Phase 1/2 in progress: P0545, P0546, P0548, P0549, P0550, P0551, P0552, P0568, P0570, P0572, P0573, P0577, P0588, P0589 done. Castore RPC surface (`GetDirectory`/`Has*`/`ReadBlob`/`StatBlob`) is now complete; P0574 (gateway delta-sync client) and P0557 (eager nar_index compute) are unblocked. Design is [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) + [Design Overview](./022-design-overview.md) + ADR-023. Per-item status is in the metadata line under each `### P05xx` heading.
 **Plan-number range:** P0541–P0589 (gaps at 0542/0547/0558/0561/0587 are abandoned numbers; P0556 abandoned 2026-04-23 — do not reuse).
 **Clean-cutover constraint:** no FUSE fallback flag, no `RIO_STORE_BACKEND` selector. P0560 deletes the old FUSE module wholesale.
 **Cross-region forward-compat:** object store (S3/GCS) is authoritative for bytes; S3 Express One Zone is a per-AZ read-through cache; PG is single-region. Nothing here precludes cross-region deployment (object-store-authoritative, cache tier stateless) but it is not implemented. No DRA. **Express AZ-ID availability constrains region/AZ choice** — see [Design Overview §9](./022-design-overview.md).
@@ -296,7 +296,7 @@ Hoist `StoreClients` + the FUSE-independent fetch primitives (`JIT_MIN_THROUGHPU
 **Exit:** `/nixbuild --checks` green; `dir_digest`/`root_digest` populated for all regular paths; golden-bytes encoding test pinned.
 
 ### P0570 — `StatBlob` RPC: server-side `file_digest → ChunkMeta[]`
-**Crate:** `rio-proto, rio-store` · **Deps:** P0573 · **Complexity:** LOW
+**Crate:** `rio-proto, rio-store` · **Deps:** P0573 · **Complexity:** LOW · **Status: DONE 2026-05-18**
 | File | Change |
 |---|---|
 | `rio-proto/proto/store.proto` | `rpc StatBlob(StatBlobRequest) returns (StatBlobResponse)` — `StatBlobRequest { bytes file_digest = 1; bool send_chunks = 2; }`, `StatBlobResponse { repeated ChunkMeta chunks = 1; uint32 first_chunk_skip = 2; uint32 last_chunk_take = 3; }`, `ChunkMeta { bytes digest = 1; uint64 size = 2; }`. The `first_chunk_skip`/`last_chunk_take` slice offsets are needed for files resolved via a legacy-`PutPath` manifest, whose whole-NAR FastCDC chunks straddle the file boundary; for `PutPathChunked`-ingested manifests both are full-chunk (`skip=0`, `take=chunks[last].size`). snix's [`BlobService.Stat`](https://git.snix.dev/snix/snix/raw/branch/canon/snix/castore/protos/rpc_blobstore.proto). `// r[impl store.castore.blob-stat]` |
@@ -304,6 +304,10 @@ Hoist `StoreClients` + the FUSE-independent fetch primitives (`JIT_MIN_THROUGHPU
 | tests | proptest: synth N NARs with overlapping files → `StatBlob(file_digest).chunks` concatenate to bytes whose blake3 == digest. `// r[verify store.castore.blob-stat]` |
 
 **Exit:** `/nixbuild --checks` green.
+
+> **Reconciliation (2026-05-18).** Two deviations:
+> (1) **Inline manifests → `FAILED_PRECONDITION`.** The plan's SQL didn't account for inline manifests, which have no `chunk_list`. A synthetic `ChunkMeta` for the inline blob would point at a digest that isn't in the chunk store. Files in inline NARs are below `STREAM_THRESHOLD`, so the caller should be on `ReadBlob`; `FAILED_PRECONDITION` makes the misroute visible. The query selects `inline_blob IS NOT NULL`, not the bytes, and `send_chunks=false` runs an `EXISTS` probe that skips `manifest_data` entirely — neither path detoasts a large blob.
+> (2) **Fixed-geometry sweep, not proptest.** Each round-trip seeds a NAR+manifest+chunks into PG; proptest's shrink loop would re-seed hundreds of fixtures per failure. The sweep covers the boundary classes (file < / == / > chunk, chunk-aligned ends, 1-byte chunks, multi-chunk straddle), and `read_blob`'s whole-file BLAKE3 trailer is a tighter end-to-end check on the same `build_chunk_plan`.
 
 ---
 
@@ -738,7 +742,7 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 {"plan":549,"title":"ChunkBackend blob-API (put_blob/get_blob/delete_blob)","deps":[544,548],"crate":"rio-store","priority":85,"status":"DONE","complexity":"LOW","note":"serialise after 548; used by P0566 narinfo/manifests sidecar only"}
 {"plan":550,"title":"Hoist StoreClients+fetch_chunks_parallel → store_fetch.rs (NOT pure mv)","deps":[544],"crate":"rio-builder","priority":85,"status":"DONE","complexity":"MED","note":"fetch.rs:20,32-33 imports fuser"}
 {"plan":568,"title":"Batched GetChunks server-stream (K_server=256) + prost .bytes() + tonic residuals + obs","deps":[545,550],"crate":"rio-proto,rio-store,rio-builder,infra","priority":85,"status":"DONE","complexity":"MED","note":"r[proto.chunk.batch-bidi]; abort-on-first-error; ChunkData.data → bytes::Bytes"}
-{"plan":570,"title":"StatBlob RPC: server-side file_digest → ChunkMeta[] (snix BlobService.Stat; shares file_blobs+cumsum helper with P0577 ReadBlob)","deps":[573],"crate":"rio-proto,rio-store","priority":85,"status":"UNIMPL","complexity":"LOW","note":"castore-FUSE open() resolves chunk-coords server-side; no client DigestResolver; r[store.castore.blob-stat]"}
+{"plan":570,"title":"StatBlob RPC: server-side file_digest → ChunkMeta[] (snix BlobService.Stat; shares file_blobs+cumsum helper with P0577 ReadBlob)","deps":[573],"crate":"rio-proto,rio-store","priority":85,"status":"DONE","complexity":"LOW","note":"castore-FUSE open() resolves chunk-coords server-side; no client DigestResolver; r[store.castore.blob-stat]"}
 {"plan":551,"title":"migration 061_nar_index + manifests.nar_indexed bool + queries","deps":[545],"crate":"rio-store","priority":85,"status":"DONE","complexity":"LOW","note":"partial-index work-queue WHERE NOT nar_indexed (precedent: 031); PG forbids cross-table predicate"}
 {"plan":552,"title":"GetNarIndex handler + indexer_loop","deps":[545,546,551],"crate":"rio-store","priority":85,"status":"DONE","complexity":"MED","note":"nar_index_sync_max_bytes guard; entries carry file_digest"}
 {"plan":553,"title":"infra/eks/s3-express.tf per-AZ directory bucket (for_each express_az_ids) + dedicated rio-store SG/NodeClass + s3express IAM","deps":[548],"crate":"infra","priority":80,"status":"UNIMPL","complexity":"LOW","note":"per-AZ from day one; TieredChunkBackend is AZ-count-agnostic; no CSI/PVC/kmod"}
@@ -800,7 +804,7 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 | `builder.fs.passthrough-on-hit` | decisions/022 §2.6 | castore_fuse/open.rs (P0559) | vm-castore-e2e `passthrough-small`+`warm-read` (P0560§B) |
 | `builder.fs.passthrough-stack-depth` | decisions/022 §2.9 | castore_fuse/mod.rs init (P0559) | composefs-spike-priv `passthrough-under-overlay` (P0578) |
 | `builder.fs.file-digest-integrity` | decisions/022 §2.7 | castore_fuse/open.rs (P0559) | vm-castore-e2e `integrity-fail` (P0560§B) |
-| `store.castore.blob-stat` | components/store.md | rio-store/grpc/directory.rs (P0570) | proptest (P0570) |
+| `store.castore.blob-stat` | components/store.md | rio-store/grpc/directory.rs (P0570) | fixed-geometry sweep + chunked-overrun (P0570; see reconciliation) |
 | `sched.dispatch.input-roots` | components/scheduler.md | rio-scheduler/actor/dispatch.rs (P0588) | unit (P0588) |
 | `builder.fs.fetch-circuit` | components/builder.md | castore_fuse/circuit.rs (P0559) | vm-castore-e2e `eio-on-fetch-fail` (P0560§B) |
 | `builder.fs.node-digest-cache` | components/builder.md | bin/rio-mountd.rs (P0571) | vm-castore-e2e `cross-build-dedup` (P0560§B) |
@@ -813,7 +817,7 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 | `store.castore.directory-rpc` | decisions/022-design-overview §8 | rio-store/grpc/directory.rs (P0573) | unit (P0573) |
 | `store.castore.blob-read` | decisions/022-design-overview §8 | rio-store/grpc/directory.rs (P0577) | unit (P0577) |
 | `store.castore.gc` | components/store.md | rio-store/nar_index.rs + gc/sweep.rs (P0572) | rio-store/tests/gc.rs (P0572) |
-| `store.castore.tenant-scope` | components/store.md | rio-store/grpc/directory.rs (P0573+P0577) | unit cross-tenant-probe (P0573) |
+| `store.castore.tenant-scope` | components/store.md | rio-store/grpc/directory.rs (P0573+P0577+P0570) | unit cross-tenant-probe (P0573, P0577, P0570) |
 | `store.index.nar-ls-streaming` | components/store.md | rio-nix/nar/ (P0546) | unit panic-on-seek (P0546) |
 | `gw.substitute.dag-delta-sync` | components/gateway.md | rio-gateway/substitute/dag_sync.rs (P0574) | vm-dag-delta-sync (P0574) |
 | `builder.result.input-eio-is-infra` | components/builder.md | executor/mod.rs (P0560§A, ported) | vm-castore-e2e `eio-on-fetch-fail` (P0560§B) |

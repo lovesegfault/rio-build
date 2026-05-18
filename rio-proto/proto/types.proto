@@ -279,6 +279,36 @@ message BlobChunk {
   bytes data = 1;
 }
 
+// ADR-022 P0570: resolve a regular file's chunk window by blake3
+// digest. Same field shape as snix castore.proto BlobService.Stat
+// (digest=1, send_chunks=2); rio's response adds slice offsets because
+// rio chunks are CDC over the whole NAR, so a file can begin or end
+// mid-chunk.
+message StatBlobRequest {
+  bytes file_digest = 1;  // 32-byte blake3 of the file content
+  // false (default): presence probe — empty response or NotFound.
+  // true: also resolve and return the chunk window.
+  bool send_chunks = 2;
+}
+
+message ChunkMeta {
+  bytes digest = 1;  // 32-byte blake3 of the chunk bytes
+  uint64 size = 2;   // full chunk size, not the sliced contribution
+}
+
+// Chunk window covering one file. Reassemble as:
+//   chunks[0][first_chunk_skip..]   (len > 1)
+//   chunks[1..len-1]                whole
+//   chunks[len-1][..last_chunk_take]
+//   chunks[0][first_chunk_skip..last_chunk_take]  (len == 1)
+// blake3 of the concatenation == request.file_digest. Empty `chunks`
+// with skip=take=0: zero-byte file, or send_chunks=false.
+message StatBlobResponse {
+  repeated ChunkMeta chunks = 1;
+  uint32 first_chunk_skip = 2;
+  uint32 last_chunk_take = 3;
+}
+
 message GetNarIndexBatchRequest {
   repeated bytes nar_hashes = 1;
 }

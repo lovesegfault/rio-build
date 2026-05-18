@@ -153,6 +153,14 @@ service DirectoryService {
   // boundary. The caller never sees rio's chunk layout. NotFound if
   // no tenant-visible row.
   rpc ReadBlob(rio.types.ReadBlobRequest) returns (stream rio.types.BlobChunk);
+
+  // Resolve a regular file's chunk window by blake3 digest (P0570).
+  // The castore-FUSE open() path calls this for files above the
+  // streaming threshold so it can fetch chunks itself (local cache,
+  // then GetChunks); smaller files use ReadBlob. NotFound if no
+  // tenant-visible row; FailedPrecondition for inline manifests
+  // (no chunk list — use ReadBlob).
+  rpc StatBlob(rio.types.StatBlobRequest) returns (rio.types.StatBlobResponse);
 }
 
 // Chunk-level storage service for content-defined chunking.
