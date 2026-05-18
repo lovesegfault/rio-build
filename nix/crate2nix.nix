@@ -272,16 +272,6 @@ let
     root = ../infra;
     fileset = ../infra/helm/rio-build/templates/scheduler.yaml;
   };
-  # Reconstruct the sibling-dir structure that cross-crate compile-time
-  # reads expect. Only USED by rio-scheduler but costs nothing in
-  # crates that don't reference it.
-  linkGolden = ''
-    mkdir -p $NIX_BUILD_TOP/rio-test-support
-    ln -sf ${goldenFileset}/golden $NIX_BUILD_TOP/rio-test-support/golden
-    mkdir -p $NIX_BUILD_TOP/infra/helm/rio-build/templates
-    ln -sf ${schedulerTplFileset}/helm/rio-build/templates/scheduler.yaml \
-      $NIX_BUILD_TOP/infra/helm/rio-build/templates/scheduler.yaml
-  '';
 
   withMigrations = _: {
     # postUnpack runs after buildRustCrate has unpacked the crate src.
@@ -291,7 +281,6 @@ let
     # symlink makes that path resolve to the fileset'd store path.
     postUnpack = ''
       ln -sf ${migrationsFileset} $NIX_BUILD_TOP/migrations
-      ${linkGolden}
     '';
     # query! macros read .sqlx/*.json instead of connecting to PG at
     # compile time. SQLX_OFFLINE_DIR bypasses the workspace-root walk;
@@ -316,8 +305,33 @@ let
     fileset = ./nixos-node/seccomp;
   };
 
-  withSeccompProfiles = _: {
-    postUnpack = ''
+  # Test-only postUnpack — symlinks for include_str!() callsites that
+  # live INSIDE #[cfg(test)] modules and are therefore never compiled
+  # with buildTests=false. Keeping these out of defaultCrateOverrides
+  # means editing the underlying fixture files (golden JSON, seccomp
+  # profile, helm template) does not rehash the lib/bin derivations
+  # that VM tests, docker images, and crdgen consume.
+  #
+  # nix/checks.nix's mkTestVariant appends these via .overrideAttrs
+  # alongside `buildTests = true` — the only build mode that compiles
+  # the #[cfg(test)] blocks that read them.
+  #
+  # Inventory (verified each is structurally inside #[cfg(test)]):
+  #   rio-scheduler:
+  #     src/state/derivation.rs:1981 — golden/derivation_statuses.json
+  #     src/sla/config.rs:1866      — infra/helm/.../scheduler.yaml
+  #   rio-controller:
+  #     src/reconcilers/pool/tests/builders_tests.rs:192 — seccomp/rio-builder.json
+  #       (parent module: pool/mod.rs:38-39 `#[cfg(test)] pub(super) mod tests`)
+  testOnlyPostUnpack = {
+    rio-scheduler = ''
+      mkdir -p $NIX_BUILD_TOP/rio-test-support
+      ln -sf ${goldenFileset}/golden $NIX_BUILD_TOP/rio-test-support/golden
+      mkdir -p $NIX_BUILD_TOP/infra/helm/rio-build/templates
+      ln -sf ${schedulerTplFileset}/helm/rio-build/templates/scheduler.yaml \
+        $NIX_BUILD_TOP/infra/helm/rio-build/templates/scheduler.yaml
+    '';
+    rio-controller = ''
       mkdir -p $NIX_BUILD_TOP/nix/nixos-node
       ln -sf ${seccompFileset} $NIX_BUILD_TOP/nix/nixos-node/seccomp
     '';
@@ -443,23 +457,11 @@ let
     rio-gateway = withMigrations;
 
     # withMigrations: nodeclaim_pool/sketch.rs uses sqlx::query!
-    # (offline cache + CARGO stub) and lib.rs's #[cfg(test)] MIGRATOR
-    # uses sqlx::migrate!("../migrations"). withSeccompProfiles:
-    # include_str!("../../../../../nix/nixos-node/seccomp/...") in
-    # pool tests — compile-time file read crossing crate boundary.
-    rio-controller =
-      attrs:
-      let
-        base = withMigrations attrs;
-        seccomp = withSeccompProfiles attrs;
-      in
-      base
-      // {
-        postUnpack = ''
-          ${base.postUnpack}
-          ${seccomp.postUnpack}
-        '';
-      };
+    # (offline cache + CARGO stub) and lib.rs's MIGRATOR uses
+    # sqlx::migrate!("../migrations"). The #[cfg(test)]-only seccomp
+    # include_str! is in testOnlyPostUnpack — applied by checks.nix's
+    # mkTestVariant alongside buildTests=true.
+    rio-controller = withMigrations;
 
     # build.rs compiles libFuzzer's C++ via the `cc` crate. stdenv's
     # g++ (NOT clang — see below) plus -fsanitize=address so the C++
@@ -540,4 +542,9 @@ in
   memberBins = lib.mapAttrs (
     name: m: scrubBins "${name}-bin${binSuffix}" "${m.build}/bin"
   ) cargoNix.workspaceMembers;
+
+  # Test-only postUnpack snippets, keyed by crate name. Consumed by
+  # nix/checks.nix's mkTestVariant — see the `testOnlyPostUnpack`
+  # let-binding above for the inventory and rationale.
+  inherit testOnlyPostUnpack;
 }

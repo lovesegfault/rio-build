@@ -297,6 +297,23 @@ let
   #
   # `extraOverride` lets clippyTestMember inject the clippy driver +
   # lint flags on top of the test-build shape.
+  #
+  # The base derivation's src is the BIN fileset (no tests/, no
+  # proptest-regressions/) so VM tests / docker / clippy-lib stay
+  # cached across test-only edits. Test variants must restore the wide
+  # src — `buildRustCrate` runs `find tests/` at build time, so a
+  # missing tests/ silently produces zero integration test binaries.
+  # `src` is NOT a lib.makeOverridable arg in buildRustCrate (it's
+  # threaded from the outer `crate_:` closure, not the inner arg set)
+  # so `.override { src = … }` is a no-op; `.overrideAttrs` patches
+  # the final mkDerivation attrs directly.
+  #
+  # Same story for the test-only postUnpack symlinks (golden,
+  # seccomp, scheduler.yaml): they feed `include_str!()` calls inside
+  # `#[cfg(test)]` modules, never compiled with buildTests=false.
+  # crate2nix.nix exposes them via `testOnlyPostUnpack` keyed by crate
+  # name; we append them here so editing those fixture files only
+  # rehashes the test variants, not the binaries.
   mkTestVariant =
     {
       suffix,
@@ -314,6 +331,8 @@ let
     )).overrideAttrs
       (old: {
         name = "${old.name}-${suffix}";
+        src = memberSrcs.${name} or old.src;
+        postUnpack = (old.postUnpack or "") + (crateBuild.testOnlyPostUnpack.${name} or "");
       });
 
   testMember = mkTestVariant {

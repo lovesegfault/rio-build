@@ -229,12 +229,14 @@
               # Source root for filesets
               unfilteredRoot = ./.;
 
-              # Per-member filesets for the crate2nix per-crate src override.
-              # buildRustCrate works on per-crate directories, so each
-              # workspace member's subtree must be included verbatim (no
+              # Per-member filesets — the FULL crate subtree, including
+              # tests/ and proptest-regressions/. This is what test-time
+              # builds (nextest, clippy --all-targets, coverage) and the
+              # nextest runtime overlay consume. rio-nix and rio-store
+              # narrow to exclude their fuzz/ subworkspaces (separate
+              # Cargo.lock, must not leak into the main tree). No
               # commonCargoSources filter — that strips proto/, which
-              # rio-proto's build.rs needs as ./proto/). rio-nix and
-              # rio-store narrow to exclude their fuzz/ subworkspaces.
+              # rio-proto's build.rs needs as ./proto/.
               memberFilesets = {
                 rio-auth = ./rio-auth;
                 rio-builder = ./rio-builder;
@@ -261,6 +263,49 @@
                 workspace-hack = ./workspace-hack;
                 xtask = ./xtask;
               };
+              # Per-crate test-only paths beyond the default tests/ and
+              # proptest-regressions/ — files that live inside a crate dir
+              # for organizational reasons but are never read at lib/bin
+              # compile time (only by #[cfg(test)] code, possibly in OTHER
+              # crates). Subtracting them from memberBinFilesets keeps the
+              # binary derivations cached across fixture edits.
+              memberTestOnlyExtras = {
+                # Shared cross-language golden — include_str!'d inside
+                # #[cfg(test)] in rio-scheduler/src/state/derivation.rs and
+                # read by rio-dashboard's TS test. rio-test-support's own
+                # lib never touches it. rio-test-support is a NON-dev dep
+                # of rio-store (via test-utils feature) and xtask, so
+                # leaving golden/ in its bin fileset would rehash those
+                # rlibs → workspace bins → every VM test on a fixture edit.
+                # The test variants get golden/ via the testOnlyPostUnpack
+                # symlink, which has its own narrow fileset.
+                rio-test-support = [ ./rio-test-support/golden ];
+              };
+              # Per-member fileset for the lib/bin compile — memberFilesets
+              # MINUS tests/, proptest-regressions/, and any crate-specific
+              # test-only extras. buildRustCrate never reads tests/ when
+              # buildTests=false (the entire `find tests/` step is gated on
+              # it; proptest replays at TEST RUNTIME, not compile time), so
+              # a tests/-only edit must not rehash the binary derivations
+              # that VM tests, docker images, crdgen, and the lib-only
+              # clippy/doc checks consume.
+              #
+              # nix/checks.nix's mkTestVariant overrides `src` back to the
+              # wide variant for buildTests=true builds — without that, the
+              # `find tests/` at build time discovers zero integration test
+              # binaries and nextest silently runs nothing.
+              memberBinFilesets = pkgs.lib.mapAttrs (
+                name: fs:
+                pkgs.lib.fileset.difference fs (
+                  pkgs.lib.fileset.unions (
+                    [
+                      (pkgs.lib.fileset.maybeMissing (./. + "/${name}/tests"))
+                      (pkgs.lib.fileset.maybeMissing (./. + "/${name}/proptest-regressions"))
+                    ]
+                    ++ (memberTestOnlyExtras.${name} or [ ])
+                  )
+                )
+              ) memberFilesets;
               # Union for consumers that still need the whole workspace as
               # one tree (nextest CARGO_MANIFEST_DIR, deny, fuzz, genhtml).
               workspaceFileset = pkgs.lib.fileset.unions (
@@ -441,13 +486,20 @@
               # $NIX_BUILD_TOP and `workspace_member` defaults to "."
               # (Cargo.toml at root), so a crate-root-shaped src works
               # without sourceRoot games.
+              #
+              # Derived from memberBinFilesets (NOT memberFilesets) so the
+              # base build derivations are hash-stable across tests/-only
+              # edits. This is the input to crateBuild/crateBuildCov/fuzz —
+              # everything downstream of those (workspaceBins → VM tests,
+              # memberBins → docker, clippyMember, docMember) inherits the
+              # narrow src and stays cached when only test code changes.
               memberSrcs = pkgs.lib.mapAttrs (
                 name: fileset:
                 pkgs.lib.fileset.toSource {
                   root = ./. + "/${name}";
                   inherit fileset;
                 }
-              ) memberFilesets;
+              ) memberBinFilesets;
               mkCrateBuild =
                 extra:
                 import ./nix/crate2nix.nix (
@@ -581,15 +633,17 @@
                     ./docs/gen/metrics.json
                   ];
                 };
-                # Fileset for the shared cargo-metadata drv and
-                # --workspace-remap target. Excludes src/**.rs (cargo
-                # metadata only needs target-file EXISTENCE, not content;
-                # cargoMetadataJson postPatch stubs lib.rs/main.rs). DOES
-                # include */tests/ and src/bin/ — cargo's autotests +
-                # explicit [[bin]] discovery scans those by filename.
-                # Editing the bulk of src/ does not change this hash, so
-                # per-member nextest runs cache independently of unrelated
-                # source edits.
+                # Fileset for the shared cargo-metadata drv and the
+                # per-member nextest --workspace-remap base. Manifests +
+                # config only — NO source content. cargo metadata only
+                # needs target-file EXISTENCE (not content) to discover
+                # autotests/autobins, and stubTargetFiles synthesizes
+                # those at build time from eval-time pathExists/readDir
+                # facts. Keeping tests/ out of this fileset means editing
+                # rio-gateway/tests/foo.rs does not rehash the SHARED
+                # cargoMetadataJson drv → nextest-rio-store stays cached.
+                # Per-member overlays (memberSrcs.<member> below) supply
+                # real source for the target member's runtime reads.
                 nextestRunSrc = pkgs.lib.fileset.toSource {
                   root = unfilteredRoot;
                   fileset = pkgs.lib.fileset.unions [
@@ -597,30 +651,21 @@
                     ./Cargo.lock
                     (pkgs.lib.fileset.fileFilter (f: f.name == "Cargo.toml") unfilteredRoot)
                     ./.config/nextest.toml
-                    # cargo metadata's autotests discovery scans tests/
-                    # by filename. Including the (small) test files lets
-                    # the per-member binaries-metadata reference cross-
-                    # crate binary() filtersets in nextest.toml.
-                    ./rio-builder/tests
-                    ./rio-cli/tests
-                    ./rio-controller/tests
-                    ./rio-gateway/tests
-                    ./rio-proto/tests
-                    ./rio-scheduler/tests
-                    ./rio-store/tests
                     # metrics_registered tests grep the per-component
                     # metric set at runtime (rio-test-support
-                    # grep_spec_names reads ../docs/gen/metrics.json
-                    # via fs::read_to_string).
+                    # grep_spec_names reads ../docs/gen/metrics.json via
+                    # fs::read_to_string). Lives outside any crate dir,
+                    # so the per-member overlay never supplies it.
                     ./docs/gen/metrics.json
-                    # proptest replays known-failing inputs from these.
-                    ./rio-nix/proptest-regressions
                   ];
                 };
                 # Per-member full src/ for the runtime overlay (mkNextestRun
                 # cp's the target member's real source into $ws/<member>/ so
-                # tests that scan their own crate dir — grep_emitted_names —
-                # see real content). Rooted at the member dir.
+                # tests that scan their own crate dir — grep_emitted_names,
+                # proptest-regressions replays — see real content). Rooted
+                # at the member dir. Derived from the WIDE memberFilesets
+                # (tests/ + proptest-regressions/) — this is the only
+                # variant that needs them at runtime.
                 memberSrcs = pkgs.lib.mapAttrs (
                   name: fs:
                   pkgs.lib.fileset.toSource {
@@ -629,9 +674,11 @@
                   }
                 ) memberFilesets;
                 # Mirror cargo's auto-detected target files (src/lib.rs,
-                # src/main.rs, src/bin/*.rs) as empty stubs. pathExists at
-                # eval time depends on file EXISTENCE not content, so
-                # editing the bodies doesn't change this string.
+                # src/main.rs, src/bin/*.rs, tests/*.rs, tests/*/main.rs)
+                # as empty stubs. pathExists/readDir at eval time depend
+                # on file EXISTENCE not content, so editing the bodies
+                # doesn't change this string — cargoMetadataJson stays
+                # cached until a target file is added or removed.
                 stubTargetFiles =
                   let
                     stubIf =
@@ -645,12 +692,36 @@
                       pkgs.lib.optionalString (builtins.pathExists d) (
                         pkgs.lib.concatMapStrings (f: stubIf (d + "/${f}")) (builtins.attrNames (builtins.readDir d))
                       );
+                    # Mirrors cargo's integration-test autodiscovery:
+                    #   tests/<name>.rs       → target `<name>`
+                    #   tests/<name>/main.rs  → target `<name>`
+                    # Other files in tests/ (mod.rs, helpers, fixtures)
+                    # are NOT autotest targets — cargo only compiles them
+                    # when a target `mod`-includes them, which the metadata
+                    # walk never does.
+                    stubTestDir =
+                      d:
+                      pkgs.lib.optionalString (builtins.pathExists d) (
+                        let
+                          entries = builtins.readDir d;
+                        in
+                        pkgs.lib.concatMapStrings (
+                          f:
+                          if entries.${f} == "regular" && pkgs.lib.hasSuffix ".rs" f then
+                            stubIf (d + "/${f}")
+                          else if entries.${f} == "directory" then
+                            stubIf (d + "/${f}/main.rs")
+                          else
+                            ""
+                        ) (builtins.attrNames entries)
+                      );
                   in
                   pkgs.lib.concatMapStrings (
                     m:
                     stubIf (./. + "/${m}/src/lib.rs")
                     + stubIf (./. + "/${m}/src/main.rs")
                     + stubBinDir (./. + "/${m}/src/bin")
+                    + stubTestDir (./. + "/${m}/tests")
                   ) (builtins.attrNames memberFilesets);
                 nextestExtraArgs = [
                   "--profile"
