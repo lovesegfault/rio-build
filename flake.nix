@@ -1110,6 +1110,25 @@
             # (.github/scripts/gen-matrix.sh). Pinned via nixpkgs so
             # the JSONL schema gen-matrix's jq depends on is stable.
             inherit (pkgs) nix-eval-jobs;
+            # Codecov uploader. The {name: outPath} map comes from
+            # gen-matrix via $COVERAGE_PATHS (NOT baked in — baking
+            # would couple this derivation's eval to every coverage
+            # target evaluating cleanly, defeating best-effort upload).
+            # Only the codecovcli store path is substituted.
+            # writePython3Bin's flake8 runs on the post-substitution
+            # body; the placeholder is inside a string literal so it
+            # passes pre-substitution too.
+            coverage-upload =
+              pkgs.writers.writePython3Bin "coverage-upload"
+                {
+                  # The substituted store path overflows 79 cols.
+                  flakeIgnore = [ "E501" ];
+                }
+                (
+                  pkgs.replaceVars ./nix/coverage-upload.py {
+                    codecovcli = "${pkgs.codecov-cli}/bin/codecovcli";
+                  }
+                );
           };
         in
         {
@@ -1180,6 +1199,13 @@
           _module.args.pkgs = import nixpkgs {
             inherit system;
             overlays = [ inputs.rust-overlay.overlays.default ];
+            # codecov-cli (githubActions.codecov-cli, used by
+            # .github/scripts/coverage-upload.sh) transitively
+            # depends on test-results-parser, which is FSL-1.1 —
+            # the test-analytics path we never call. Everything
+            # else stays unfree-free; if a second name appears
+            # here, reconsider.
+            config.allowUnfreePredicate = p: nixpkgs.lib.getName p == "test-results-parser";
           };
 
           # Configure treefmt
