@@ -1806,6 +1806,43 @@ impl DagActor {
             }
         }
 
+        // ADR-022 castore-FUSE (P0588): resolve the transitive input
+        // closure + castore root nodes. On PG failure we send empty
+        // input_roots and the builder falls back to QueryPathInfo BFS.
+        // r[impl sched.dispatch.input-roots]
+        let input_root_rows = {
+            let seeds = crate::assignment::approx_input_closure(&self.dag, drv_hash);
+            if seeds.is_empty() {
+                Vec::new()
+            } else {
+                match self.db.compute_input_roots(&seeds).await {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        warn!(drv_hash = %drv_hash, error = %e,
+                              "input_roots closure compute failed; \
+                               builder falls back to QueryPathInfo BFS");
+                        Vec::new()
+                    }
+                }
+            }
+        };
+        // Cloned once: reused for digest and WorkAssignment.input_closure.
+        let input_closure: Vec<String> = input_root_rows
+            .iter()
+            .map(|r| r.store_path.clone())
+            .collect();
+        // Wire-compat: a non-empty digest is serialized in the token;
+        // a pre-P0589 store rejects it on deny_unknown_fields. The
+        // store fleet must roll before the scheduler singleton (or
+        // wipe deploy) — see r[common.hmac.claims].
+        let input_closure_digest = if input_closure.is_empty() {
+            // Empty = no attestation. validate_begin (P0586) treats it
+            // as "scheduler couldn't compute", not "closure was empty".
+            String::new()
+        } else {
+            rio_auth::hmac::AssignmentClaims::digest_input_closure(&input_closure)
+        };
+
         let state = self.dag.node(drv_hash)?;
         let build_opts = self.build_options_for_derivation(drv_hash);
 
@@ -1859,6 +1896,8 @@ impl DagActor {
                 // safe to set unconditionally since fb096e50f's `skip_serializing_if`
                 // + `#[serde(default)]` cover both rolling-upgrade skew directions.
                 tenant: state.attributed_tenant(&self.builds).map(|u| u.to_string()),
+                role: rio_auth::hmac::TokenRole::Builder,
+                input_closure_digest,
             })
         } else {
             // Legacy unsigned: format-string. Store with
@@ -1905,6 +1944,28 @@ impl DagActor {
             // proto-build — the actor is single-threaded so that can't
             // happen, but the field is non-Option in the proto.
             exec_id: state.exec_id.map(|u| u.to_string()).unwrap_or_default(),
+            input_closure,
+            input_roots: input_root_rows
+                .into_iter()
+                .map(|r| {
+                    // Corrupt RootNode blob → treat as unindexed and log.
+                    // Indexer/scheduler encoding skew would otherwise
+                    // surface only as the builder always GetNarIndex'ing.
+                    let root_node = r.root_node.and_then(|bytes| {
+                        prost::Message::decode(bytes.as_slice())
+                            .map_err(|e| {
+                                warn!(store_path = %r.store_path, error = %e,
+                                      "corrupt nar_index.root_node; \
+                                       sending without root");
+                            })
+                            .ok()
+                    });
+                    rio_proto::types::InputRoot {
+                        store_path: r.store_path,
+                        root_node,
+                    }
+                })
+                .collect(),
         })
     }
 

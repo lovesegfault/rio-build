@@ -115,12 +115,25 @@
   The scheduler signs *assignment tokens* (HMAC-SHA256) when dispatching work.
   Token format is
   `base64url(json(AssignmentClaims)).base64url(hmac_sha256(key, claims_json))`.
-  `AssignmentClaims` has exactly five fields: `executor_id` (string, audit only
-  --- the store doesn't know which executor is calling), `drv_hash` (string,
-  ties token to a specific build), `expected_outputs` (list of store paths, the
-  authorization check), `is_ca` (bool, skips the membership check for
-  floating-CA derivations whose output paths are computed post-build),
-  `expiry_unix` (u64 Unix seconds, replay prevention).
+  `AssignmentClaims` carries: `executor_id` (string, audit only --- the store
+  doesn't know which executor is calling), `drv_hash` (string, ties token to a
+  specific build), `expected_outputs` (list of store paths, the authorization
+  check), `is_ca` (bool, skips the membership check for floating-CA derivations
+  whose output paths are computed post-build), `expiry_unix` (u64 Unix seconds,
+  replay prevention), `tenant` (optional UUID string, attribution for
+  `hw_perf_samples.submitting_tenant` --- derived from claims, never from the
+  request body, so a compromised worker cannot fabricate tenant identities),
+  `role` (`TokenRole` enum --- what the holder may do; the store gates `PutPath`
+  and `Begin` on `Builder`), and `input_closure_digest` (hex
+  `blake3(sorted(input_closure).join("\n"))`, the §6.3 server-side refscan
+  attestation; empty = scheduler couldn't compute the closure at dispatch ---
+  see #rref("sched.dispatch.input-roots")). `tenant`, `role`, and
+  `input_closure_digest` are `#[serde(default)]` (old token still parses) and
+  `#[serde(skip_serializing_if = …)]` (default-valued token serializes to the
+  pre-P0589 byte shape, so `deny_unknown_fields` on a not-yet-rolled store
+  still parses it). Once the scheduler emits a non-default `role` or a non-empty
+  `input_closure_digest`, the new-token-to-old-store skew is closed only by
+  deploy ordering (store fleet rolls before the scheduler singleton).
   - Executors present the assignment token in the `x-rio-assignment-token` gRPC
     metadata header when calling `PutPath` on the store. The store verifies the
     token signature, checks `now < expiry_unix`, and rejects with

@@ -687,6 +687,23 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
   uploaded.
 ]
 
+#r("sched.dispatch.input-roots")[
+  `WorkAssignment` MUST carry the build's transitive input closure
+  (`input_closure`, sorted store-path strings) and, for each closure path that
+  has a `nar_index` row, its castore root node (`input_roots`). The closure is
+  the BFS over `narinfo.references` from the dispatch-time seeds (DAG
+  children's outputs ∪ `inputSrcs`), not the shallow `approx_input_closure`
+  prefetch hint. The same sorted `input_closure` is what
+  `AssignmentClaims.input_closure_digest` hashes
+  (#rref("common.hmac.claims")). On PG failure the scheduler sends both empty
+  and the builder falls back to its own `QueryPathInfo` BFS.
+]
+The `nar_index.root_node` column is populated asynchronously by the indexer
+loop (#rref("store.index.putpath-bg-warm")); a closure path that hasn't been
+indexed yet appears in `input_closure` but has no `input_roots` entry. The
+builder calls `GetNarIndex` for those paths on demand
+(#rref("store.index.sync-on-miss")).
+
 #r("sched.heartbeat.adopt")[
   A heartbeat-reported running build the scheduler doesn't have on record for
   that executor is adopted into BOTH `executor.running_build` (so dispatch sees

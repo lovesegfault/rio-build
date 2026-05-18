@@ -21,6 +21,7 @@ use crate::state::DerivationStatus;
 mod assignments;
 mod batch;
 mod builds;
+mod closure;
 mod derivations;
 mod history;
 mod live_pins;
@@ -35,6 +36,7 @@ mod tests;
 // `crate::db::read_event_log` without knowing the internal layout.
 pub(crate) use recovery::read_event_log;
 
+pub use closure::InputRootRow;
 pub use history::{BuildSampleRow, SlaOverrideRow};
 
 // r[impl sched.db.partial-index-literal]

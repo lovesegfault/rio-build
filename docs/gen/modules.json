@@ -963,6 +963,11 @@
       "doc": "Build CRUD + status transitions — `builds` table."
     },
     {
+      "path": "db/closure.rs",
+      "depth": 1,
+      "doc": "Transitive input-closure walk for `WorkAssignment.input_roots`."
+    },
+    {
       "path": "db/derivations.rs",
       "depth": 1,
       "doc": "Per-derivation state + poison tracking — `derivations` table."

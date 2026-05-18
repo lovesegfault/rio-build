@@ -9,10 +9,11 @@ package rio.types;
 // — prost merges by package into a single `rio.types.rs`.
 
 import "google/protobuf/timestamp.proto";
-import "dag.proto";   // BuildEvent.derivation → DerivationEvent;
-                      // SubmitBuildRequest.{nodes,edges} → DerivationNode/Edge
-import "types.proto"; // HeartbeatRequest → ResourceUsage;
-                      // BuildResult.status → BuildResultStatus
+import "dag.proto";     // BuildEvent.derivation → DerivationEvent;
+                        // SubmitBuildRequest.{nodes,edges} → DerivationNode/Edge
+import "types.proto";   // HeartbeatRequest → ResourceUsage;
+                        // BuildResult.status → BuildResultStatus
+import "castore.proto"; // WorkAssignment.input_roots → InputRoot.root_node
 
 // ───────────────────────────────────────────────────────────────────────────
 // Executor kind (ADR-019 builder/fetcher split)
@@ -325,6 +326,24 @@ message WorkAssignment {
   // string). Echoed by the worker in the log header (display-only, not
   // load-bearing). Keys logs/{drv_hash}/{exec_id}.log.zst.
   string exec_id = 13;
+  // ADR-022 castore-FUSE (P0588): castore root nodes for the FUSE
+  // mount, one per closure path. Empty if the scheduler couldn't
+  // compute the closure. Field 3 (input_paths) was reserved and is
+  // not reused.
+  repeated InputRoot input_roots = 14;
+  // Sorted transitive runtime closure of the build's inputs (BFS over
+  // narinfo.references from the dispatch-time seeds). Exactly the value
+  // the scheduler hashes into AssignmentClaims.input_closure_digest
+  // (P0589) so the builder can echo it without recomputing the BFS.
+  repeated string input_closure = 15;
+}
+
+// One closure input path with its castore root for the FUSE prefetch.
+// `root_node` is unset when the path hasn't been NAR-indexed yet
+// (P0552's indexer is async); the builder falls back to GetNarIndex.
+message InputRoot {
+  string store_path = 1;
+  rio.castore.RootNode root_node = 2;
 }
 
 // Build configuration options propagated from the client.

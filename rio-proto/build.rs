@@ -38,6 +38,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "rio.types.ExecutorMessage.msg",
         "#[allow(clippy::large_enum_variant)]",
     );
+    // WorkAssignment (~256B after P0588's input_roots/input_closure)
+    // dwarfs CancelSignal (~48B). Same rationale as ExecutorMessage:
+    // boxing churns every construction/match site on a stream that
+    // carries one assignment per build.
+    b = b.type_attribute(
+        "rio.types.SchedulerMessage.msg",
+        "#[allow(clippy::large_enum_variant)]",
+    );
 
     // Derive `serde::Serialize` on the admin-facing response types so
     // rio-cli can `serde_json::to_string_pretty(&resp)` directly instead
