@@ -32,7 +32,7 @@ let
     cargo-expand
     cargo-fuzz # works in default (nightly) shell; errors on stable
     cargo-hakari # workspace-hack regen — `cargo xtask regen hakari`
-    cargo-mutants # weekly tier — see `cargo xtask mutants` / `.#mutants`
+    cargo-mutants # dev-only mutation testing — see `cargo xtask mutants` / `.#mutants`
     cargo-nextest
     cargo-outdated
     cargo-watch

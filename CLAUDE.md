@@ -68,7 +68,7 @@ cd rio-nix/fuzz && cargo fuzz run wire_primitives
 
 `checks.*` is flat granular (~110 derivations: per-member clippy/clippy-test/doc/nextest, fuzz runs, VM tests, misc policy checks). `nix-fast-build` streams evaluation into builds via nix-eval-jobs — VM tests start evaluating in parallel with rust checks instead of after, and individual check failures surface immediately without waiting for the whole graph.
 
-`packages.*` is the minimal set of deployable artifacts (workspace binaries, docker images, AMIs, tfvars). `legacyPackages.*` holds debug/manual targets (per-test coverage, fuzz builds, helm charts) that shouldn't be enumerated by `nix flake show`.
+`packages.*` is the minimal set of deployable artifacts (workspace binaries, docker images, AMIs, tfvars). Debug/manual targets (per-test coverage, fuzz builds, helm subcharts) hang off `packages.{coverage,helm,dockerImages,mutants}` as passthru attrs — reachable by attr path, not enumerated by `nix flake show`.
 
 ### Coverage
 

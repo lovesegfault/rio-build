@@ -90,7 +90,6 @@
       inputs.flake-compat.follows = "flake-compat";
     };
 
-    # Self-hosted binary cache push CLI. Pinned in flake.lock;
     # Helm charts as Nix derivations (FODs — hash-pinned, cached). The
     # bitnami PG subchart + rook-ceph operator + cluster charts come from
     # here. Alternative was vendoring .tgz into git (ugly) or hand-rolling
@@ -830,7 +829,8 @@
               dockerImages = mkDockerImages { inherit rio-crates; };
 
               # NixOS EKS node AMI builder (ADR-021). Exposed below as
-              # packages.node-ami-{x86_64,aarch64}. The amazon-image.nix
+              # packages.<system>.ami (and packages.x86_64-linux.ami-bios
+              # for legacy BIOS boot). The amazon-image.nix
               # builder module emits a directory with the disk image +
               # nix-support/image-info.json (consumed by `xtask ami push`).
               #
@@ -883,8 +883,8 @@
 
               # Subcharts from nixhelm (FODs — hash-pinned `helm pull`).
               # Referenced by: helm-lint check (symlinked into charts/ in-sandbox),
-              # packages.helm-* (`cargo xtask {eks deploy,dev apply}` symlink from
-              # the result path into the working-tree charts/ — gitignored).
+              # packages.helm.<name> (`cargo xtask {eks deploy,dev apply}` symlink
+              # from the result path into the working-tree charts/ — gitignored).
               subcharts = import ./nix/helm-charts.nix {
                 inherit (inputs) nixhelm;
                 inherit system;
@@ -1112,13 +1112,14 @@
               };
 
               # --------------------------------------------------------------
-              # Multi-Nix golden conformance matrix (weekly tier)
+              # Multi-Nix golden conformance matrix (in checks)
               # --------------------------------------------------------------
               #
-              # Runs golden_conformance against 4 daemon variants: pinned Nix,
-              # nixpkgs nix_2_28, nixVersions.git, lix. In `checks` as
-              # golden-<variant> — 3/4 daemons substitute from cache.nixos.org
-              # so per-PR cost is just the nextest invocations, and gen-matrix
+              # Runs golden_conformance against 3 daemon variants: pinned Nix,
+              # nixpkgs nix_2_28, nixVersions.git (lix dropped — see
+              # golden-matrix.nix for why). In `checks` as golden-<variant> —
+              # 2/3 daemons substitute from cache.nixos.org so per-PR cost is
+              # just the nextest invocations, and gen-matrix
               # cache-filters them when the conformance binary's closure
               # didn't change.
               goldenMatrix = import ./nix/golden-matrix.nix {
@@ -1127,7 +1128,7 @@
               };
 
               # --------------------------------------------------------------
-              # Mutation testing (weekly tier — NOT in checks)
+              # Mutation testing (dev-only — NOT in checks)
               # --------------------------------------------------------------
               inherit
                 (import ./nix/mutants.nix {
@@ -1233,9 +1234,9 @@
               _module.args.pkgs = import nixpkgs {
                 inherit system;
                 overlays = [ inputs.rust-overlay.overlays.default ];
-                # codecov-cli (githubActions.codecov-cli, used by
-                # .github/scripts/coverage-upload.sh) transitively
-                # depends on test-results-parser, which is FSL-1.1 —
+                # codecov-cli (baked into packages.coverage-upload via
+                # nix/coverage-upload.py) transitively depends on
+                # test-results-parser, which is FSL-1.1 —
                 # the test-analytics path we never call. Everything
                 # else stays unfree-free; if a second name appears
                 # here, reconsider.
@@ -1350,8 +1351,9 @@
               # Packages — minimal set of deployable / top-level outputs.
               # --------------------------------------------------------------
               # Per-member check derivations live in `checks` (granular,
-              # for nix-fast-build streaming). Debug/manual targets live
-              # in `legacyPackages` (not enumerated by `nix flake show`).
+              # for nix-fast-build streaming). Debug/manual targets are
+              # passthru on packages.{coverage,helm,dockerImages,mutants}
+              # (reachable by attr path, not enumerated by `nix flake show`).
               packages = {
                 default = rio-workspace;
                 workspace = rio-workspace;
@@ -1537,7 +1539,7 @@
                 // prefixed "clippy-test-" crateChecks.clippyTest
                 // prefixed "doc-" crateChecks.doc
                 // prefixed "nextest-" crateChecks.nextestRuns
-                # Wire-protocol conformance against 4 daemon variants.
+                # Wire-protocol conformance against 3 daemon variants.
                 // prefixed "golden-" goldenMatrix.runs
                 // {
                   dashboard = rioDashboard;
@@ -1568,7 +1570,7 @@
                   # rio-auth/src/jwt.rs (~5min cold). Proves the
                   # mutate→rebuild→retest→classify pipeline works and
                   # catches ≥1 mutant. The full sweep is .#mutants
-                  # (weekly, hours).
+                  # (dev-only, hours).
                   inherit mutants-smoke;
                   # Regression: per-node profraw extract must not drop
                   # filename-colliding profraws across multi-worker nodes.

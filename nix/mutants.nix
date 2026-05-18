@@ -1,4 +1,4 @@
-# cargo-mutants weekly tier — mutates source (swap < for <=, delete a
+# cargo-mutants (dev-only) — mutates source (swap < for <=, delete a
 # statement, replace a return with Default::default()), reruns the test
 # suite, flags mutations that SURVIVE — code paths the tests don't
 # actually constrain. Tracey answers "is this spec rule covered";
@@ -6,8 +6,8 @@
 #
 # Scoped via .config/mutants.toml to high-signal targets (scheduler
 # state machine, wire primitives, ATerm parser, HMAC verify, manifest
-# encoding — ~320 mutations). Weekly cron invokes `nix build .#mutants`;
-# survived-count is diffed week-over-week. Exit 2 (survived) and 3
+# encoding — ~320 mutations). `nix build .#mutants` runs the sweep;
+# survived-count is diffed run-over-run. Exit 2 (survived) and 3
 # (timeouts only) are EXPECTED and swallowed; everything else
 # propagates. A baseline-health jq gate additionally fails the
 # derivation if zero mutations were tested. Findings are a trend metric,
@@ -27,7 +27,7 @@
 # the only per-invocation cost is the baseline cargo build +
 # per-mutation rebuilds — same as it ever was under crane. No dep-level
 # caching across invocations, but that was true of crane's buildDepsOnly
-# too (weekly-tier, cold cache each cron run is acceptable).
+# too (dev-only, cold cache is acceptable).
 {
   pkgs,
   version,
@@ -122,7 +122,7 @@ let
         # inside a throwaway sandbox anyway.
         #
         # `--no-shuffle` is the default in current cargo-mutants
-        # but kept explicit for the week-over-week diff guarantee.
+        # but kept explicit for the run-over-run diff guarantee.
         #
         # `--output $out`: cargo-mutants creates mutants.out/
         # INSIDE the given dir, so result/mutants.out/outcomes.json.
@@ -164,7 +164,7 @@ let
         installPhase = ''
           runHook preInstall
           # Extract caught/missed counts from the JSON outcome
-          # stream for the weekly-diff step. No `|| echo 0`
+          # stream for the run-over-run diff. No `|| echo 0`
           # fallback: the baseline-health gate above already
           # fails if outcomes.json is missing — a jq failure
           # here is a real error (malformed JSON).
@@ -184,7 +184,7 @@ let
     );
 
   # Full sweep — ~320 mutations across high-signal targets via
-  # .config/mutants.toml. Weekly tier (hours).
+  # .config/mutants.toml. Dev-only (hours).
   mutants = mkMutants {
     pname = "rio-mutants";
     mutantsArgs = [

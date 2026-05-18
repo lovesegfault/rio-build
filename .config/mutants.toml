@@ -3,9 +3,9 @@
 # missed-count baseline is understood.
 #
 # Run via `nix develop -c cargo mutants` (local, against $PWD) or
-# `nix build .#mutants` (hermetic weekly tier). Exits 2 when any
-# mutant survives — that's expected; we diff missed-count week-
-# over-week.
+# `nix build .#mutants` (hermetic dev-only run). Exits 2 when any
+# mutant survives — that's expected; we diff missed-count run-
+# over-run.
 
 # Files to mutate. Globs relative to workspace root. Each target here
 # has tight unit-test coverage where a surviving mutant is a genuine

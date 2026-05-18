@@ -2,8 +2,8 @@
 #
 # Runs `cargo-nextest run -E 'binary(golden_conformance)'` once per daemon
 # variant, each pointing at a different nix-daemon binary. Surfaces wire-
-# protocol divergences across Nix 2.28 / Nix pinned / Nix master / Lix
-# before they bite real clients.
+# protocol divergences across Nix 2.28 / Nix pinned / Nix master before
+# they bite real clients (Lix excluded — see `daemons` comment below).
 #
 # Exposed as `checks.golden-<variant>` (3 entries). Two of the three
 # daemons (nix-stable / nix-unstable) come from nixpkgs rather than
