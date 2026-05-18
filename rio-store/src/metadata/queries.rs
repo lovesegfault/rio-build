@@ -9,7 +9,7 @@
 use super::*;
 use rio_nix::store_path::StorePath;
 use sqlx::PgPool;
-use tracing::instrument;
+use tracing::{debug, instrument};
 
 // narinfo_cols! is #[macro_export] so it lands at crate root — re-import.
 use crate::narinfo_cols;
@@ -334,10 +334,9 @@ pub(crate) async fn find_missing_paths(
 /// Uses `idx_narinfo_nar_hash` (migration 002_store.sql). Without it, every NAR
 /// fetch would seq-scan narinfo.
 ///
-/// Currently no production caller (the substituter's dedup check was
-/// subsumed by `claim_placeholder`'s `AlreadyComplete` arm); kept for the
-/// planned binary-cache HTTP server.
-#[allow(dead_code)]
+/// `GetNarIndex` sync-on-miss uses this to find a `store_path` to
+/// re-index from a `nar_hash` request key. (The substituter's dedup
+/// check was subsumed by `claim_placeholder`'s `AlreadyComplete` arm.)
 #[instrument(skip(pool), fields(nar_hash = hex::encode(nar_hash)))]
 pub(crate) async fn path_by_nar_hash(pool: &PgPool, nar_hash: &[u8; 32]) -> Result<Option<String>> {
     // Multiple paths CAN have the same nar_hash (two fetchurl of the
@@ -471,6 +470,221 @@ pub(crate) async fn append_signatures(
             Ok(1)
         }
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// NAR index (ADR-022 P0551) — `nar_index` table primitives.
+//
+// `entries` is an encoded `rio.types.NarIndex` proto. The metadata
+// layer treats it as opaque bytes: encode/decode lives in
+// `nar_index.rs`. Keyed by `store_path_hash` with FK→`manifests`
+// `ON DELETE CASCADE`, so GC removes the index row alongside the
+// manifest.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Persist a computed NAR index, the Directory DAG, and the
+/// `file_blobs` junction in one transaction; flip `nar_indexed`.
+/// Idempotent: a second call is a no-op so the directory refcounts
+/// and tenant junctions establish exactly once per path.
+///
+/// The leading `manifests` UPDATE row-locks the same row the GC sweep
+/// `FOR UPDATE`s, so a concurrent index/GC of the same path serializes
+/// on it. `dag.directories`/`dag.file_blobs` are digest-sorted by
+/// [`crate::castore::build`] (`r[store.chunk.lock-order]`).
+// r[impl store.index.table-cascade]
+// r[impl store.castore.gc]
+// r[impl store.castore.tenant-scope]
+#[instrument(
+    skip(pool, entries, dag),
+    fields(store_path_hash = hex::encode(store_path_hash), bytes = entries.len())
+)]
+pub async fn set_nar_index(
+    pool: &PgPool,
+    store_path_hash: &[u8; 32],
+    entries: &[u8],
+    dag: &crate::castore::DirectoryDag,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    // `status='complete'` gate: between `compute()`'s manifest read and
+    // this write, GC can sweep the path and a re-upload can re-claim
+    // the hash with a fresh `'uploading'` row. Without the gate the
+    // stale index would land on the new row and `nar_indexed=TRUE`
+    // would suppress re-indexing forever.
+    let claimed = sqlx::query(
+        "UPDATE manifests SET nar_indexed = TRUE \
+          WHERE store_path_hash = $1 AND status = 'complete'",
+    )
+    .bind(store_path_hash.as_slice())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0;
+    if !claimed {
+        debug!(
+            store_path_hash = %hex::encode(store_path_hash),
+            "manifest gone or re-claimed since compute(); skipping index write"
+        );
+        tx.rollback().await?;
+        return Ok(());
+    }
+    let inserted = sqlx::query(
+        r#"
+        INSERT INTO nar_index (store_path_hash, entries, root_node)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (store_path_hash) DO NOTHING
+        "#,
+    )
+    .bind(store_path_hash.as_slice())
+    .bind(entries)
+    .bind(&dag.root_node)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0;
+
+    // First index of a path establishes its directory refcounts +
+    // tenant junctions; re-indexing must not double-count.
+    if inserted {
+        if !dag.directories.is_empty() {
+            let (dir_digests, dir_bodies): (Vec<Vec<u8>>, Vec<Vec<u8>>) = dag
+                .directories
+                .iter()
+                .map(|(d, b)| (d.to_vec(), b.clone()))
+                .unzip();
+            sqlx::query(
+                r#"
+                INSERT INTO directories (digest, body, refcount)
+                SELECT u.digest, u.body, 1
+                  FROM UNNEST($1::bytea[], $2::bytea[]) AS u(digest, body)
+                ON CONFLICT (digest) DO UPDATE
+                   SET refcount = directories.refcount + 1
+                "#,
+            )
+            .bind(&dir_digests)
+            .bind(&dir_bodies)
+            .execute(&mut *tx)
+            .await?;
+            // Tenant scoping: every tenant that referenced this path
+            // (`path_tenants`) may read its Directory bodies. Cross-
+            // product UNNEST × path_tenants is one round-trip.
+            sqlx::query(
+                r#"
+                INSERT INTO directory_tenants (digest, tenant_id)
+                SELECT u.digest, pt.tenant_id
+                  FROM UNNEST($1::bytea[]) AS u(digest)
+                 CROSS JOIN path_tenants pt
+                 WHERE pt.store_path_hash = $2
+                ON CONFLICT DO NOTHING
+                "#,
+            )
+            .bind(&dir_digests)
+            .bind(store_path_hash.as_slice())
+            .execute(&mut *tx)
+            .await?;
+        }
+        if !dag.file_blobs.is_empty() {
+            let (blob_digests, blob_offsets): (Vec<Vec<u8>>, Vec<i64>) = dag
+                .file_blobs
+                .iter()
+                // nar_offset is BIGINT; a > i64::MAX NAR offset cannot
+                // exist (NAR sizes are bounded well below 8 EiB).
+                .map(|(d, o)| (d.to_vec(), i64::try_from(*o).unwrap_or(i64::MAX)))
+                .unzip();
+            sqlx::query(
+                r#"
+                INSERT INTO file_blobs (digest, store_path_hash, nar_offset)
+                SELECT u.digest, $2, u.nar_offset
+                  FROM UNNEST($1::bytea[], $3::bigint[]) AS u(digest, nar_offset)
+                ON CONFLICT DO NOTHING
+                "#,
+            )
+            .bind(&blob_digests)
+            .bind(store_path_hash.as_slice())
+            .bind(&blob_offsets)
+            .execute(&mut *tx)
+            .await?;
+            // DO UPDATE (not DO NOTHING) so an existing `(digest,
+            // tenant)` row takes a lock and a concurrent GC orphan
+            // sweep waits for this commit before re-checking
+            // `file_blobs`. DO NOTHING would let the sweep delete the
+            // row out from under us.
+            sqlx::query(
+                r#"
+                INSERT INTO file_blob_tenants (digest, tenant_id)
+                SELECT u.digest, pt.tenant_id
+                  FROM UNNEST($1::bytea[]) AS u(digest)
+                 CROSS JOIN path_tenants pt
+                 WHERE pt.store_path_hash = $2
+                ON CONFLICT (digest, tenant_id)
+                  DO UPDATE SET tenant_id = EXCLUDED.tenant_id
+                "#,
+            )
+            .bind(&blob_digests)
+            .bind(store_path_hash.as_slice())
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Fetch the encoded `NarIndex` by NAR hash — the wire key
+/// `GetNarIndex` receives. Asymmetric with [`set_nar_index`] (which
+/// takes the table PK `store_path_hash`): the table is GC-keyed on the
+/// path; the RPC is content-keyed on the NAR. Multiple paths can share
+/// a `nar_hash` (FOD dedup); they all have identical NAR bytes →
+/// identical index, so `LIMIT 1` is correct. `None` = not indexed yet
+/// (or path absent / GC'd).
+#[instrument(skip(pool), fields(nar_hash = hex::encode(nar_hash)))]
+pub async fn get_nar_index(pool: &PgPool, nar_hash: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+    let row: Option<(Vec<u8>,)> = sqlx::query_as(
+        r#"
+        SELECT i.entries
+        FROM nar_index i
+        INNER JOIN narinfo n ON i.store_path_hash = n.store_path_hash
+        INNER JOIN manifests m ON i.store_path_hash = m.store_path_hash
+        WHERE n.nar_hash = $1 AND m.status = 'complete'
+        LIMIT 1
+        "#,
+    )
+    .bind(nar_hash.as_slice())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(b,)| b))
+}
+
+/// Drain the indexer work-queue: complete, not-yet-indexed manifests,
+/// oldest first.
+#[instrument(skip(pool))]
+pub async fn list_nar_index_pending(pool: &PgPool, limit: i64) -> Result<Vec<(Vec<u8>, String)>> {
+    let rows: Vec<(Vec<u8>, String)> = sqlx::query_as(
+        r#"
+        SELECT m.store_path_hash, n.store_path
+        FROM manifests m
+        INNER JOIN narinfo n ON m.store_path_hash = n.store_path_hash
+        WHERE NOT m.nar_indexed AND m.status = 'complete'
+        ORDER BY m.updated_at ASC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Rotate a failed indexer-queue entry to the back so it doesn't starve
+/// newer paths. `'complete'` rows' `updated_at` is otherwise unused.
+pub async fn bump_nar_index_retry(pool: &PgPool, store_path_hash: &[u8]) -> Result<()> {
+    sqlx::query(
+        "UPDATE manifests SET updated_at = now() \
+          WHERE store_path_hash = $1 AND NOT nar_indexed AND status = 'complete'",
+    )
+    .bind(store_path_hash)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1066,6 +1280,233 @@ mod tests {
         assert!(
             !joined.contains("Seq Scan on narinfo"),
             "EXPLAIN should NOT seq-scan narinfo; got:\n{joined}"
+        );
+    }
+
+    /// Empty `DirectoryDag` for tests that don't exercise the castore
+    /// inserts.
+    fn empty_dag() -> crate::castore::DirectoryDag {
+        crate::castore::DirectoryDag {
+            directories: vec![],
+            file_blobs: vec![],
+            root_node: vec![],
+            root_digest: vec![],
+            dir_digests: vec![],
+        }
+    }
+
+    /// `nar_index` round-trip + work-queue drain + FK cascade.
+    ///
+    /// - `set_nar_index` flips `nar_indexed` → row leaves the pending
+    ///   queue.
+    /// - GC of the manifest (cascade from narinfo DELETE) removes the
+    ///   `nar_index` row — no dangling indices.
+    // r[verify store.index.table-cascade]
+    #[tokio::test]
+    async fn nar_index_roundtrip_and_cascade() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let p = test_store_path("nar-index-a");
+        // Distinct nar_hash != store_path_hash so the get-by-nar_hash
+        // JOIN is actually exercised, not coincidentally satisfied by
+        // the seed default (nar_hash == path_hash when unset).
+        let nar_hash = [0xBB; 32];
+        let hash_vec = StoreSeed::raw_path(&p)
+            .with_nar_hash(nar_hash)
+            .with_inline_blob(b"x".as_slice())
+            .seed(&db.pool)
+            .await;
+        let hash: [u8; 32] = hash_vec.as_slice().try_into().unwrap();
+
+        // Pending until indexed.
+        let pending = list_nar_index_pending(&db.pool, 10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, hash_vec);
+        assert_eq!(pending[0].1, p);
+        assert!(get_nar_index(&db.pool, &nar_hash).await.unwrap().is_none());
+
+        // Set (by store_path_hash) → readable (by nar_hash) + drained
+        // from queue.
+        set_nar_index(&db.pool, &hash, b"encoded-nar-index", &empty_dag())
+            .await
+            .unwrap();
+        assert_eq!(
+            get_nar_index(&db.pool, &nar_hash).await.unwrap().as_deref(),
+            Some(b"encoded-nar-index".as_slice())
+        );
+        assert!(
+            list_nar_index_pending(&db.pool, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Idempotent: a second call is a NO-OP — the directory
+        // refcounts and tenant-junction rows are established once on
+        // first index, and re-running them would double-count.
+        set_nar_index(&db.pool, &hash, b"v2", &empty_dag())
+            .await
+            .unwrap();
+        assert_eq!(
+            get_nar_index(&db.pool, &nar_hash).await.unwrap().as_deref(),
+            Some(b"encoded-nar-index".as_slice()),
+            "second set_nar_index must not overwrite (no-op)"
+        );
+
+        // GC: DELETE narinfo cascades through manifests to nar_index.
+        sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1")
+            .bind(hash.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(get_nar_index(&db.pool, &nar_hash).await.unwrap().is_none());
+        let count: (i64,) = sqlx::query_as("SELECT count(*) FROM nar_index")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 0, "FK cascade must remove nar_index row");
+    }
+
+    /// The castore inserts: `directories` refcount UPSERT,
+    /// `directory_tenants`/`file_blob_tenants` cross-product over
+    /// `path_tenants`, `file_blobs` junction; cascade-cleanup on
+    /// narinfo DELETE.
+    // r[verify store.castore.gc]
+    // r[verify store.castore.tenant-scope]
+    #[tokio::test]
+    async fn nar_index_castore_inserts() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = crate::test_helpers::seed_tenant(&db.pool, "castore-tenant").await;
+
+        let p_a = test_store_path("castore-a");
+        let hash_a: [u8; 32] = StoreSeed::raw_path(&p_a)
+            .with_nar_hash([0xC1; 32])
+            .with_inline_blob(b"a".as_slice())
+            .seed(&db.pool)
+            .await
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let p_b = test_store_path("castore-b");
+        let hash_b: [u8; 32] = StoreSeed::raw_path(&p_b)
+            .with_nar_hash([0xC2; 32])
+            .with_inline_blob(b"b".as_slice())
+            .seed(&db.pool)
+            .await
+            .as_slice()
+            .try_into()
+            .unwrap();
+        for h in [&hash_a, &hash_b] {
+            sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+                .bind(h.as_slice())
+                .bind(tenant)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        // Both paths share a Directory body and a file blob.
+        let shared_dir = ([0x11u8; 32], b"dir-body".to_vec());
+        let unique_dir_a = ([0x22u8; 32], b"dir-body-a".to_vec());
+        let dag = |dirs: Vec<([u8; 32], Vec<u8>)>| crate::castore::DirectoryDag {
+            directories: dirs,
+            file_blobs: vec![([0x33u8; 32], 96)],
+            root_node: vec![1, 2, 3],
+            root_digest: vec![],
+            dir_digests: vec![],
+        };
+
+        set_nar_index(
+            &db.pool,
+            &hash_a,
+            b"a",
+            &dag(vec![shared_dir.clone(), unique_dir_a.clone()]),
+        )
+        .await
+        .unwrap();
+        set_nar_index(&db.pool, &hash_b, b"b", &dag(vec![shared_dir.clone()]))
+            .await
+            .unwrap();
+
+        // Shared directory refcount = 2; unique = 1.
+        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM directories WHERE digest = $1")
+            .bind(shared_dir.0.as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc, 2);
+        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM directories WHERE digest = $1")
+            .bind(unique_dir_a.0.as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc, 1);
+
+        // file_blobs is a junction: two rows for the shared digest.
+        let fb: i64 = sqlx::query_scalar("SELECT count(*) FROM file_blobs WHERE digest = $1")
+            .bind([0x33u8; 32].as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(fb, 2);
+
+        // Tenant junctions populated from path_tenants.
+        let dt: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM directory_tenants WHERE digest = $1 AND tenant_id = $2",
+        )
+        .bind(shared_dir.0.as_slice())
+        .bind(tenant)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(dt, 1);
+        let ft: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM file_blob_tenants WHERE digest = $1 AND tenant_id = $2",
+        )
+        .bind([0x33u8; 32].as_slice())
+        .bind(tenant)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(ft, 1);
+
+        // root_node persisted.
+        let rn: Vec<u8> =
+            sqlx::query_scalar("SELECT root_node FROM nar_index WHERE store_path_hash = $1")
+                .bind(hash_a.as_slice())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(rn, vec![1, 2, 3]);
+
+        // GC of A: file_blobs row for A cascades; B's survives.
+        sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1")
+            .bind(hash_a.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let fb: i64 = sqlx::query_scalar("SELECT count(*) FROM file_blobs WHERE digest = $1")
+            .bind([0x33u8; 32].as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(fb, 1, "B's file_blobs row survives GC of A");
+    }
+
+    /// Uploading manifests are invisible to the index work-queue and
+    /// to `get_nar_index`.
+    #[tokio::test]
+    async fn nar_index_uploading_invisible() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let p = test_store_path("nar-index-uploading");
+        StoreSeed::raw_path(&p)
+            .with_manifest_status("uploading")
+            .seed(&db.pool)
+            .await;
+        assert!(
+            list_nar_index_pending(&db.pool, 10)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }
