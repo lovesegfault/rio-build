@@ -71,6 +71,10 @@ async fn get_nar_index_sync_on_miss_then_cache_hit() -> TestResult {
     assert_eq!(idx.entries[0].path, b"");
     assert_eq!(idx.entries[0].kind, NarEntryKind::Directory as i32);
     assert!(idx.entries[0].file_digest.is_empty());
+    // P0572: directory entries carry `dir_digest`; root's matches `root_digest`.
+    // r[verify store.index.dir-digest]
+    assert_eq!(idx.entries[0].dir_digest.len(), 32);
+    assert_eq!(idx.root_digest, idx.entries[0].dir_digest);
     let by_name: std::collections::HashMap<&[u8], _> =
         idx.entries.iter().map(|e| (e.path.as_slice(), e)).collect();
     let a = by_name[b"a".as_slice()];

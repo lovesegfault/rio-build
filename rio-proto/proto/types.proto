@@ -214,10 +214,16 @@ message NarIndexEntry {
   // blake3(file content), 32 bytes. Empty for dirs/symlinks.
   // (`r[store.index.file-digest]`)
   bytes file_digest = 7;
+  // blake3(canonical-encode(rio.castore.Directory)), 32 bytes. Empty
+  // for files/symlinks. (`r[store.index.dir-digest]`)
+  bytes dir_digest = 8;
 }
 
 message NarIndex {
   repeated NarIndexEntry entries = 1;
+  // `dir_digest` of the root directory; empty when the NAR root is a
+  // single file or symlink (no Directory body to digest).
+  bytes root_digest = 2;
 }
 
 message GetNarIndexRequest {

@@ -149,6 +149,15 @@ pub mod admin {
     tonic::include_proto!("rio.admin");
 }
 
+/// Content-addressed Directory DAG types (ADR-022 §2.2/§8).
+///
+/// `Directory`/`DirectoryEntry`/`FileEntry`/`SymlinkEntry` mirror snix
+/// `castore.proto` so `dir_digest` is interoperable; `RootNode` is the
+/// rio-local discriminated root encoded into `nar_index.root_node`.
+pub mod castore {
+    tonic::include_proto!("rio.castore");
+}
+
 /// Binary `FileDescriptorSet` covering every `.proto` file compiled by
 /// `build.rs` (all six services + shared `rio.types`, with transitive
 /// imports — `prost_build` always passes `--include_imports`).

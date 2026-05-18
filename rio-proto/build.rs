@@ -111,6 +111,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "proto/dag.proto",
             "proto/build_types.proto",
             "proto/admin_types.proto",
+            // Castore Directory DAG (own package, no service).
+            "proto/castore.proto",
             // Service definition files (each a distinct package).
             "proto/scheduler.proto",
             "proto/builder.proto",

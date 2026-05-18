@@ -1,0 +1,79 @@
+syntax = "proto3";
+package rio.castore;
+
+// Content-addressed Directory DAG (ADR-022 §2.2/§8). Vendored from
+// snix `castore.proto` (MIT) to keep `dir_digest` / `root_digest`
+// snix-wire-compatible: a tree imported by `tvix-store import` and by
+// rio's `nar_ls` second pass MUST produce identical digests.
+//
+// CANONICAL ENCODING RULE — `r[store.castore.canonical-encoding]`:
+// `dir_digest = blake3(canonical_encode(Directory))`. The canonical
+// bytes are prost's default field-order encode of a `Directory` whose
+// `directories`/`files`/`symlinks` lists are each sorted byte-lex by
+// `name`, with no unknown fields and proto3 default-valued scalars
+// omitted.
+//
+// Determinism caveat (snix #111): prost field-order encoding is not
+// formally guaranteed across versions. The
+// `rio_store::castore::tests::golden_directory_encoding` test pins
+// the exact output bytes for a known tree and fails loudly if a prost
+// upgrade changes them, surfacing the wire-compat decision instead of
+// silently splitting the dedup namespace.
+
+// A directory node in the merkle DAG. Children are split by kind into
+// three lists, each sorted byte-lexicographically by `name`. Names
+// MUST be globally unique across all three lists, MUST NOT contain
+// `/` or NUL, and MUST NOT be `.` or `..` — `nar_ls` enforces this on
+// the source NAR; the canonical encode preserves the order.
+message Directory {
+  repeated DirectoryEntry directories = 1;
+  repeated FileEntry files = 2;
+  repeated SymlinkEntry symlinks = 3;
+}
+
+// A subdirectory reference within a `Directory`.
+message DirectoryEntry {
+  // Basename. Raw NAR bytes (non-UTF8 legal).
+  bytes name = 1;
+  // blake3 of the child `Directory`'s canonical encoding, 32 bytes.
+  bytes digest = 2;
+  // Total recursive descendant count: immediate children plus the sum
+  // of every child directory's `size`. Verifiable incrementally by
+  // resolving `digest` (snix uses it for inode allocation; the ADR-022
+  // FUSE derives inodes from digests instead and ignores it).
+  uint64 size = 3;
+}
+
+// A regular file reference within a `Directory`.
+message FileEntry {
+  // Basename. Raw NAR bytes (non-UTF8 legal).
+  bytes name = 1;
+  // blake3 of the file contents, 32 bytes.
+  bytes digest = 2;
+  // File content length in bytes.
+  uint64 size = 3;
+  bool executable = 4;
+}
+
+// A symlink reference within a `Directory`.
+message SymlinkEntry {
+  // Basename. Raw NAR bytes (non-UTF8 legal).
+  bytes name = 1;
+  // Symlink target. Raw NAR bytes (non-UTF8 legal).
+  bytes target = 2;
+}
+
+// Discriminated root node for one store path. NARs whose root is a
+// directory carry only its `dir_digest` (the `Directory` body is in
+// the `directories` table); single-file or single-symlink roots carry
+// the full entry inline (with empty `name` — a NAR root has no name).
+//
+// Persisted as the encoded `nar_index.root_node` BYTEA and shipped in
+// `WorkAssignment.input_roots` (P0588).
+message RootNode {
+  oneof node {
+    bytes dir_digest = 1;
+    FileEntry file = 2;
+    SymlinkEntry symlink = 3;
+  }
+}

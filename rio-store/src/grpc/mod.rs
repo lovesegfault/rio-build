@@ -821,13 +821,16 @@ impl StoreService for StoreServiceImpl {
     /// PG hit → return; miss → synchronous recompute
     /// (`r[store.index.sync-on-miss]`, bounded by
     /// [`crate::nar_index::NAR_INDEX_SYNC_MAX_BYTES`]) write-through.
-    /// `NotFound` if the path has no complete manifest.
+    /// `NotFound` if the path has no complete manifest. Builder-internal
+    /// like `BatchGetManifest`: the response carries `file_digest`
+    /// capability tokens, so end-user tenants are refused.
     // r[impl store.index.rpc]
     #[instrument(skip(self, request), fields(rpc = "GetNarIndex"))]
     async fn get_nar_index(
         &self,
         request: Request<rio_proto::types::GetNarIndexRequest>,
     ) -> Result<Response<rio_proto::types::NarIndex>, Status> {
+        self.reject_end_user_tenant(&request, "GetNarIndex")?;
         let nar_hash = parse_nar_hash(&request.into_inner().nar_hash)?;
         let bytes = self.lookup_or_compute_nar_index(&nar_hash).await?;
         let index = crate::nar_index::decode_entries(&bytes)
@@ -841,13 +844,14 @@ impl StoreService for StoreServiceImpl {
     /// Per-`nar_hash` responses, request order preserved. PG-hit only —
     /// no sync-on-miss recompute (a wide miss set would block the RPC
     /// for minutes); `index` absent for misses, `indexer_loop` fills
-    /// them within ~5 s.
+    /// them within ~5 s. Builder-internal: end-user tenants refused.
     // r[impl store.index.rpc]
     #[instrument(skip(self, request), fields(rpc = "GetNarIndexBatch"))]
     async fn get_nar_index_batch(
         &self,
         request: Request<rio_proto::types::GetNarIndexBatchRequest>,
     ) -> Result<Response<Self::GetNarIndexBatchStream>, Status> {
+        self.reject_end_user_tenant(&request, "GetNarIndexBatch")?;
         let req = request.into_inner();
         if req.nar_hashes.len() > self.max_batch_paths {
             return Err(Status::invalid_argument(format!(
@@ -925,6 +929,7 @@ impl StoreServiceImpl {
             self.chunk_cache.as_ref(),
             &store_path,
             crate::nar_index::NAR_INDEX_SYNC_MAX_BYTES,
+            Some(&self.nar_bytes_budget),
         )
         .await
         .map_err(|e| {
@@ -933,8 +938,9 @@ impl StoreServiceImpl {
             if e.is::<crate::nar_index::OverSyncCap>() {
                 return Status::resource_exhausted(e.to_string());
             }
+            // Log the cause server-side; don't echo it to the client.
             error!(store_path, error = %e, "GetNarIndex sync-on-miss compute failed");
-            Status::internal(format!("nar_index compute failed: {e}"))
+            Status::internal("nar_index compute failed")
         })
     }
 }

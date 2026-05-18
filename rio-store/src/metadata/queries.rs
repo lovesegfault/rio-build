@@ -482,18 +482,27 @@ pub(crate) async fn append_signatures(
 // manifest.
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Persist a computed NAR index and flip `nar_indexed` in one
-/// transaction. Idempotent: re-indexing overwrites. The leading
-/// `manifests` UPDATE row-locks the same row the GC sweep `FOR
-/// UPDATE`s, so a concurrent index/GC of the same path serializes;
-/// writing both in one txn also means a crash can't leave an
-/// indexed-but-still-pending row.
+/// Persist a computed NAR index, the Directory DAG, and the
+/// `file_blobs` junction in one transaction; flip `nar_indexed`.
+/// Idempotent: a second call is a no-op so the directory refcounts
+/// and tenant junctions establish exactly once per path.
+///
+/// The leading `manifests` UPDATE row-locks the same row the GC sweep
+/// `FOR UPDATE`s, so a concurrent index/GC of the same path serializes
+/// on it. `dag.directories`/`dag.file_blobs` are digest-sorted by
+/// [`crate::castore::build`] (`r[store.chunk.lock-order]`).
 // r[impl store.index.table-cascade]
-#[instrument(skip(pool, entries), fields(store_path_hash = hex::encode(store_path_hash), bytes = entries.len()))]
+// r[impl store.castore.gc]
+// r[impl store.castore.tenant-scope]
+#[instrument(
+    skip(pool, entries, dag),
+    fields(store_path_hash = hex::encode(store_path_hash), bytes = entries.len())
+)]
 pub async fn set_nar_index(
     pool: &PgPool,
     store_path_hash: &[u8; 32],
     entries: &[u8],
+    dag: &crate::castore::DirectoryDag,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
     // `status='complete'` gate: between `compute()`'s manifest read and
@@ -518,17 +527,104 @@ pub async fn set_nar_index(
         tx.rollback().await?;
         return Ok(());
     }
-    sqlx::query(
+    let inserted = sqlx::query(
         r#"
-        INSERT INTO nar_index (store_path_hash, entries)
-        VALUES ($1, $2)
-        ON CONFLICT (store_path_hash) DO UPDATE SET entries = excluded.entries
+        INSERT INTO nar_index (store_path_hash, entries, root_node)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (store_path_hash) DO NOTHING
         "#,
     )
     .bind(store_path_hash.as_slice())
     .bind(entries)
+    .bind(&dag.root_node)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected()
+        > 0;
+
+    // First index of a path establishes its directory refcounts +
+    // tenant junctions; re-indexing must not double-count.
+    if inserted {
+        if !dag.directories.is_empty() {
+            let (dir_digests, dir_bodies): (Vec<Vec<u8>>, Vec<Vec<u8>>) = dag
+                .directories
+                .iter()
+                .map(|(d, b)| (d.to_vec(), b.clone()))
+                .unzip();
+            sqlx::query(
+                r#"
+                INSERT INTO directories (digest, body, refcount)
+                SELECT u.digest, u.body, 1
+                  FROM UNNEST($1::bytea[], $2::bytea[]) AS u(digest, body)
+                ON CONFLICT (digest) DO UPDATE
+                   SET refcount = directories.refcount + 1
+                "#,
+            )
+            .bind(&dir_digests)
+            .bind(&dir_bodies)
+            .execute(&mut *tx)
+            .await?;
+            // Tenant scoping: every tenant that referenced this path
+            // (`path_tenants`) may read its Directory bodies. Cross-
+            // product UNNEST × path_tenants is one round-trip.
+            sqlx::query(
+                r#"
+                INSERT INTO directory_tenants (digest, tenant_id)
+                SELECT u.digest, pt.tenant_id
+                  FROM UNNEST($1::bytea[]) AS u(digest)
+                 CROSS JOIN path_tenants pt
+                 WHERE pt.store_path_hash = $2
+                ON CONFLICT DO NOTHING
+                "#,
+            )
+            .bind(&dir_digests)
+            .bind(store_path_hash.as_slice())
+            .execute(&mut *tx)
+            .await?;
+        }
+        if !dag.file_blobs.is_empty() {
+            let (blob_digests, blob_offsets): (Vec<Vec<u8>>, Vec<i64>) = dag
+                .file_blobs
+                .iter()
+                // nar_offset is BIGINT; a > i64::MAX NAR offset cannot
+                // exist (NAR sizes are bounded well below 8 EiB).
+                .map(|(d, o)| (d.to_vec(), i64::try_from(*o).unwrap_or(i64::MAX)))
+                .unzip();
+            sqlx::query(
+                r#"
+                INSERT INTO file_blobs (digest, store_path_hash, nar_offset)
+                SELECT u.digest, $2, u.nar_offset
+                  FROM UNNEST($1::bytea[], $3::bigint[]) AS u(digest, nar_offset)
+                ON CONFLICT DO NOTHING
+                "#,
+            )
+            .bind(&blob_digests)
+            .bind(store_path_hash.as_slice())
+            .bind(&blob_offsets)
+            .execute(&mut *tx)
+            .await?;
+            // DO UPDATE (not DO NOTHING) so an existing `(digest,
+            // tenant)` row takes a lock and a concurrent GC orphan
+            // sweep waits for this commit before re-checking
+            // `file_blobs`. DO NOTHING would let the sweep delete the
+            // row out from under us.
+            sqlx::query(
+                r#"
+                INSERT INTO file_blob_tenants (digest, tenant_id)
+                SELECT u.digest, pt.tenant_id
+                  FROM UNNEST($1::bytea[]) AS u(digest)
+                 CROSS JOIN path_tenants pt
+                 WHERE pt.store_path_hash = $2
+                ON CONFLICT (digest, tenant_id)
+                  DO UPDATE SET tenant_id = EXCLUDED.tenant_id
+                "#,
+            )
+            .bind(&blob_digests)
+            .bind(store_path_hash.as_slice())
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -1187,6 +1283,18 @@ mod tests {
         );
     }
 
+    /// Empty `DirectoryDag` for tests that don't exercise the castore
+    /// inserts.
+    fn empty_dag() -> crate::castore::DirectoryDag {
+        crate::castore::DirectoryDag {
+            directories: vec![],
+            file_blobs: vec![],
+            root_node: vec![],
+            root_digest: vec![],
+            dir_digests: vec![],
+        }
+    }
+
     /// `nar_index` round-trip + work-queue drain + FK cascade.
     ///
     /// - `set_nar_index` flips `nar_indexed` → row leaves the pending
@@ -1218,7 +1326,7 @@ mod tests {
 
         // Set (by store_path_hash) → readable (by nar_hash) + drained
         // from queue.
-        set_nar_index(&db.pool, &hash, b"encoded-nar-index")
+        set_nar_index(&db.pool, &hash, b"encoded-nar-index", &empty_dag())
             .await
             .unwrap();
         assert_eq!(
@@ -1232,11 +1340,16 @@ mod tests {
                 .is_empty()
         );
 
-        // Idempotent overwrite.
-        set_nar_index(&db.pool, &hash, b"v2").await.unwrap();
+        // Idempotent: a second call is a NO-OP — the directory
+        // refcounts and tenant-junction rows are established once on
+        // first index, and re-running them would double-count.
+        set_nar_index(&db.pool, &hash, b"v2", &empty_dag())
+            .await
+            .unwrap();
         assert_eq!(
             get_nar_index(&db.pool, &nar_hash).await.unwrap().as_deref(),
-            Some(b"v2".as_slice())
+            Some(b"encoded-nar-index".as_slice()),
+            "second set_nar_index must not overwrite (no-op)"
         );
 
         // GC: DELETE narinfo cascades through manifests to nar_index.
@@ -1251,6 +1364,132 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count.0, 0, "FK cascade must remove nar_index row");
+    }
+
+    /// The castore inserts: `directories` refcount UPSERT,
+    /// `directory_tenants`/`file_blob_tenants` cross-product over
+    /// `path_tenants`, `file_blobs` junction; cascade-cleanup on
+    /// narinfo DELETE.
+    // r[verify store.castore.gc]
+    // r[verify store.castore.tenant-scope]
+    #[tokio::test]
+    async fn nar_index_castore_inserts() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = crate::test_helpers::seed_tenant(&db.pool, "castore-tenant").await;
+
+        let p_a = test_store_path("castore-a");
+        let hash_a: [u8; 32] = StoreSeed::raw_path(&p_a)
+            .with_nar_hash([0xC1; 32])
+            .with_inline_blob(b"a".as_slice())
+            .seed(&db.pool)
+            .await
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let p_b = test_store_path("castore-b");
+        let hash_b: [u8; 32] = StoreSeed::raw_path(&p_b)
+            .with_nar_hash([0xC2; 32])
+            .with_inline_blob(b"b".as_slice())
+            .seed(&db.pool)
+            .await
+            .as_slice()
+            .try_into()
+            .unwrap();
+        for h in [&hash_a, &hash_b] {
+            sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+                .bind(h.as_slice())
+                .bind(tenant)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        // Both paths share a Directory body and a file blob.
+        let shared_dir = ([0x11u8; 32], b"dir-body".to_vec());
+        let unique_dir_a = ([0x22u8; 32], b"dir-body-a".to_vec());
+        let dag = |dirs: Vec<([u8; 32], Vec<u8>)>| crate::castore::DirectoryDag {
+            directories: dirs,
+            file_blobs: vec![([0x33u8; 32], 96)],
+            root_node: vec![1, 2, 3],
+            root_digest: vec![],
+            dir_digests: vec![],
+        };
+
+        set_nar_index(
+            &db.pool,
+            &hash_a,
+            b"a",
+            &dag(vec![shared_dir.clone(), unique_dir_a.clone()]),
+        )
+        .await
+        .unwrap();
+        set_nar_index(&db.pool, &hash_b, b"b", &dag(vec![shared_dir.clone()]))
+            .await
+            .unwrap();
+
+        // Shared directory refcount = 2; unique = 1.
+        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM directories WHERE digest = $1")
+            .bind(shared_dir.0.as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc, 2);
+        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM directories WHERE digest = $1")
+            .bind(unique_dir_a.0.as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc, 1);
+
+        // file_blobs is a junction: two rows for the shared digest.
+        let fb: i64 = sqlx::query_scalar("SELECT count(*) FROM file_blobs WHERE digest = $1")
+            .bind([0x33u8; 32].as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(fb, 2);
+
+        // Tenant junctions populated from path_tenants.
+        let dt: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM directory_tenants WHERE digest = $1 AND tenant_id = $2",
+        )
+        .bind(shared_dir.0.as_slice())
+        .bind(tenant)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(dt, 1);
+        let ft: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM file_blob_tenants WHERE digest = $1 AND tenant_id = $2",
+        )
+        .bind([0x33u8; 32].as_slice())
+        .bind(tenant)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(ft, 1);
+
+        // root_node persisted.
+        let rn: Vec<u8> =
+            sqlx::query_scalar("SELECT root_node FROM nar_index WHERE store_path_hash = $1")
+                .bind(hash_a.as_slice())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(rn, vec![1, 2, 3]);
+
+        // GC of A: file_blobs row for A cascades; B's survives.
+        sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1")
+            .bind(hash_a.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let fb: i64 = sqlx::query_scalar("SELECT count(*) FROM file_blobs WHERE digest = $1")
+            .bind([0x33u8; 32].as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(fb, 1, "B's file_blobs row survives GC of A");
     }
 
     /// Uploading manifests are invisible to the index work-queue and

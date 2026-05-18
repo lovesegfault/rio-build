@@ -42,6 +42,8 @@ pub mod backend;
 #[cfg(feature = "server")]
 pub mod cas;
 #[cfg(feature = "server")]
+pub mod castore;
+#[cfg(feature = "server")]
 pub(crate) mod chunker;
 #[cfg(feature = "server")]
 pub mod config;
