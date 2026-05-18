@@ -2769,14 +2769,24 @@ mod tests {
     async fn check_available_pass_exceeds_deadline() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let tid = seed_tenant(&db.pool, "sub-head-pass-deadline").await;
-        // No 429s — exercise the pass-0 deadline bound directly. 400ms
-        // per HEAD, 200 paths, concurrency=128 (WantMassQuery): wave-1
-        // (128) lands ~setup+400ms; wave-2 (72) would land ~setup+800ms
-        // but the deadline (set below, AFTER setup) cuts it. Asserts
-        // the take_until semantics: wave-1 hits survive, wave-2 is
-        // deferred (Indeterminate). Wide margins for builder variance.
+        // No 429s — exercise the pass-0 deadline bound directly.
+        // 200 paths, concurrency=128 (WantMassQuery): wave-1 (128)
+        // lands ~head_delay+overhead, wave-2 (72) ~2×(head_delay+overhead).
+        // Deadline at 1.5×head_delay is the midpoint when overhead=0.
+        // Asserts the take_until semantics: wave-1 hits survive, wave-2
+        // is deferred (Indeterminate).
+        //
+        // Slack budget: under contended CI builders (8 nextest jobs ×
+        // postgres × this fake server, all on the same box) the
+        // per-wave executor/HTTP overhead can exceed 500ms. The deadline
+        // must satisfy `head_delay + overhead < deadline` for wave-1 to
+        // land; with deadline = 1.5×head_delay that means
+        // `overhead < 0.5×head_delay`. 1500ms gives a 750ms ceiling.
+        // The previous 400ms (200ms ceiling) flaked deterministically on
+        // overlay-backed builders.
+        const HEAD_DELAY: Duration = Duration::from_millis(1500);
         let fake = spawn_mass_probe_upstream(ProbeCfg {
-            head_delay: Duration::from_millis(400),
+            head_delay: HEAD_DELAY,
             ..Default::default()
         })
         .await;
@@ -2807,7 +2817,7 @@ mod tests {
         .await
         .unwrap();
         let t0 = tokio::time::Instant::now();
-        let deadline = t0 + Duration::from_millis(600);
+        let deadline = t0 + HEAD_DELAY.mul_f64(1.5);
         let available = sub.check_available(tid, &paths, deadline).await.unwrap();
         let elapsed = t0.elapsed();
 
@@ -2832,10 +2842,12 @@ mod tests {
             paths.len(),
             "every path must be in hits or indeterminate"
         );
-        // Returned near deadline, not after wave-2 (~800ms+). Loose
-        // upper bound; the structural asserts above are primary.
+        // Returned near deadline, not after wave-2 (~2×head_delay).
+        // Loose upper bound — 4×head_delay = 6s — the structural asserts
+        // above are primary; this just catches "ignored the deadline and
+        // waited out the whole stream."
         assert!(
-            elapsed < Duration::from_secs(2),
+            elapsed < HEAD_DELAY * 4,
             "must return at deadline, not wait out wave-2; elapsed={elapsed:?}"
         );
         // Survived hits ARE cached.

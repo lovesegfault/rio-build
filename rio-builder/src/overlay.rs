@@ -474,11 +474,30 @@ mod tests {
     /// preflight statfs check must pass. The positive case (upper
     /// actually on overlayfs → UpperOnOverlayfs) needs CAP_SYS_ADMIN to
     /// construct and is exercised by the VM test.
+    ///
+    /// SKIPPED when the test sandbox itself is on overlayfs: the test's
+    /// premise ("a tempdir is a normal FS") is false in containerized
+    /// nix builders whose `/build` lands in the container's writable
+    /// overlay layer (no tmpfs / hostPath at the build dir). On those
+    /// hosts the preflight WOULD reject — by design — but that's the
+    /// runner's filesystem, not a bug in `OverlayBuilder`. Asserting
+    /// against it would just measure the host. The VM test owns the
+    /// positive case under a controlled FS.
     #[cfg(target_os = "linux")]
     #[test]
     fn test_statfs_tmpdir_not_overlayfs() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let fstype = nix::sys::statfs::statfs(dir.path())?.filesystem_type();
+        if fstype == nix::sys::statfs::OVERLAYFS_SUPER_MAGIC {
+            eprintln!(
+                "SKIP test_statfs_tmpdir_not_overlayfs: tempdir is on overlayfs \
+                 (f_type={fstype:?}). The build sandbox is in the container's \
+                 writable layer — back /nix/var/nix/builds with tmpfs or a \
+                 hostPath to run this test. Preflight rejection is correct \
+                 here; the test's premise (\"tempdir is a normal FS\") is not."
+            );
+            return Ok(());
+        }
         assert_ne!(
             fstype,
             nix::sys::statfs::OVERLAYFS_SUPER_MAGIC,

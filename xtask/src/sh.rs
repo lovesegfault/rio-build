@@ -457,7 +457,16 @@ mod tests {
 
     #[tokio::test]
     async fn run_capture_returns_status_and_combined_output() {
-        let s = shell().unwrap();
+        // Shell::new(), not shell(): shell() change_dir()s to
+        // repo_root(), which falls back to env!("CARGO_MANIFEST_DIR")'s
+        // parent when RIO_REPO_ROOT is unset. crate2nix bakes the build
+        // sandbox path (/build/xtask → /build) at compile time; that
+        // path only exists at *test* runtime if the sandbox is
+        // configured with `sandbox-build-dir = /build` (NixOS default,
+        // not the determinate nix-installer default). The cwd is
+        // irrelevant to run_capture's behavior — same convention as the
+        // run_benign_if_* tests above.
+        let s = Shell::new().unwrap();
         // Command that writes to both streams and exits 1 — exactly the
         // shape iso03 needs to assert on.
         let (status, out) = run_capture(cmd!(
@@ -483,7 +492,8 @@ mod tests {
         // contiguous in argv — `bail!` always includes `{argv}`, so a
         // literal `echo signal-line` would make the assert tautological.
         crate::ui::set_verbose_for_test(true);
-        let s = shell().unwrap();
+        // Shell::new(), not shell() — see run_capture_returns_status_… above.
+        let s = Shell::new().unwrap();
         let err = run(cmd!(
             s,
             "sh -c 'printf rio-tee- >&2; printf marker >&2; exit 1'"
