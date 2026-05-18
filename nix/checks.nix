@@ -37,6 +37,10 @@
   # re-imported with globalExtraRustcOpts=["-Cinstrument-coverage"]).
   # Used to produce test binaries that emit .profraw files at runtime.
   crateBuildCov,
+  # lcov --extract patterns (one `<crateName>/*` per workspace member,
+  # workspace-hack excluded). Derived from memberFilesets in flake.nix
+  # so non-rio-prefixed members (xtask) aren't dropped by a literal.
+  covExtractPatterns,
   # Runtime inputs for test execution (PG, nix-cli, openssh), keyed by
   # member name. `null` = aggregate run (return the union). Per-member
   # so nextest-rio-crds doesn't drag postgres into its closure.
@@ -900,17 +904,20 @@ let
             --instr-profile=$TMPDIR/m.profdata \
             "''${objs[@]}" \
             2>/dev/null > $TMPDIR/raw.lcov
-          # Strip leading slash → repo-relative; extract rio-* (drops
-          # deps and generated target/ — neither are in the repo tree).
-          # --ignore-errors unused: lcov 2.x errors on an unmatched
-          # pattern; we don't know which fire per-crate.
+          # Strip leading slash → repo-relative; extract workspace
+          # member paths (drops deps like tokio-1.50.0/ and generated
+          # target/ — neither are in the repo tree). Pattern list is
+          # derived from memberFilesets so non-rio-prefixed members
+          # (xtask) aren't dropped. --ignore-errors unused: lcov 2.x
+          # errors on an unmatched pattern; one crate's tests rarely
+          # exercise every member.
           ${pkgs.lcov}/bin/lcov \
             --ignore-errors unused \
             --substitute 's|^/||' \
             -a $TMPDIR/raw.lcov -o $TMPDIR/stripped.lcov
           ${pkgs.lcov}/bin/lcov \
             --ignore-errors unused \
-            --extract $TMPDIR/stripped.lcov 'rio-*' \
+            --extract $TMPDIR/stripped.lcov ${lib.escapeShellArgs covExtractPatterns} \
             -o $out/lcov.info
         fi
       '';
@@ -969,6 +976,7 @@ in
   nextestRuns = if workspaceSrc != null then noHack nextestRuns else { };
   nextestMetadata = if workspaceSrc != null then nextestMeta else null;
   mkNextestRun = if workspaceSrc != null then mkNextestRun else null;
+  mkNextestMeta = if workspaceSrc != null then mkNextestMeta else null;
 
   # The toolchain wrappers, exposed for debugging / manual invocation:
   #   nix build .#packages.x86_64-linux.clippy-rustc

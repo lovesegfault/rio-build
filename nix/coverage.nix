@@ -26,6 +26,10 @@
   vmTestsCov,
   workspaceSrc,
   unitCoverage,
+  # lcov --extract patterns (one `<crateName>/*` per workspace member,
+  # workspace-hack excluded). Derived from memberFilesets in flake.nix
+  # so non-rio-prefixed members (xtask) aren't dropped by a literal.
+  covExtractPatterns,
 }:
 let
   inherit (pkgs) lib;
@@ -40,10 +44,11 @@ let
 
   # --ignore-filename-regex for llvm-cov export on VM-test profraws.
   # Dep paths like `/tokio-1.50.0/...` get filtered by the per-test
-  # `lcov --extract 'rio-*'` step in mkPerTestLcov; this regex
-  # catches build artifacts that --extract would let through (rio-*
-  # prefix matches `rio-proto/target/build/...` generated proto code,
-  # which genhtml can't resolve against workspaceSrc).
+  # `lcov --extract <covExtractPatterns>` step in mkPerTestLcov; this
+  # regex catches build artifacts that --extract would let through
+  # (the per-member pattern matches `rio-proto/target/build/...`
+  # generated proto code, which genhtml can't resolve against
+  # workspaceSrc).
   ignoreRegex = "\\.cargo/registry|\\.cargo/git|/rustc/|/nix/store/.*-vendor|target/.*build";
 
   # Toolchain llvm tools. rustStable is the rust-bin derivation;
@@ -146,8 +151,9 @@ let
         # to ~1MB after filtering to workspace paths. Doing it per-test
         # makes vmLcov's `lcov -a` operate on ~24MB instead of ~4GB and
         # cuts what gets cached/substituted by the same factor.
+        # Pattern list derived from memberFilesets — includes xtask.
         ${pkgs.lcov}/bin/lcov --ignore-errors unused,empty \
-          --extract $TMPDIR/stripped.lcov 'rio-*' -o $out
+          --extract $TMPDIR/stripped.lcov ${lib.escapeShellArgs covExtractPatterns} -o $out
       '';
 
   perTestLcov = lib.mapAttrs mkPerTestLcov vmTestsCov;
@@ -275,10 +281,11 @@ in
           cp ${unitLcov} $TMPDIR/combined.lcov
         fi
         # --remove drops generated build artifacts that the per-entry
-        # --extract 'rio-*' let through (rio-proto/target/build/...
-        # matches the prefix but the generated .rs doesn't exist in
-        # workspaceSrc). Both inputs are already 'rio-*'-filtered at
-        # source (covLcovs / mkPerTestLcov), so the old --extract
+        # --extract <covExtractPatterns> let through
+        # (rio-proto/target/build/... matches the per-member pattern
+        # but the generated .rs doesn't exist in workspaceSrc). Both
+        # inputs are already member-filtered at source (covLcovs /
+        # mkPerTestLcov), so the old --extract
         # pass here is gone — it was a no-op on ~2MB of pre-filtered
         # data anyway. unused: don't error if pattern doesn't match
         # (clean unit-only runs may not have these).

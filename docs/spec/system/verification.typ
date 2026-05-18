@@ -34,8 +34,9 @@ Per-push CI runs `golden_conformance` against three CppNix daemon variants
 
 Two of three daemons come from the pinned nixpkgs (no separate flake inputs)
 and substitute from cache.nixos.org; only `nix-pinned` builds from
-`inputs.nix`. gen-matrix's cache-filter skips all three on PRs that don't touch
-the conformance binary's closure.
+`inputs.nix`. The runs are scoped to `rio-gateway` (single-member nextest
+meta), so gen-matrix's cache-filter skips all three on PRs that don't touch
+`rio-gateway`'s closure.
 
 Lix is *not* in the golden matrix: it is policy-frozen at protocol 1.35,
 and the harness sends 1.38-shaped opcode payloads (it doesn't downgrade per

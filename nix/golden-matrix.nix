@@ -5,24 +5,28 @@
 # protocol divergences across Nix 2.28 / Nix pinned / Nix master / Lix
 # before they bite real clients.
 #
-# Exposed as `checks.golden-<variant>` (4 entries). Three of the four
-# daemons (nix-stable / nix-unstable / lix) come from nixpkgs rather than
+# Exposed as `checks.golden-<variant>` (3 entries). Two of the three
+# daemons (nix-stable / nix-unstable) come from nixpkgs rather than
 # separate flake inputs — drops 16 lock nodes and substitutes from
 # cache.nixos.org instead of source-building. Only nix-pinned builds from
 # source (inputs.nix, already cached for the dev shell). Per-variant cost
 # is one nextest invocation with a different nix-cli in PATH +
-# RIO_GOLDEN_DAEMON_BIN env; gen-matrix's cache-filter skips all four on
-# any PR that doesn't touch the conformance binary's closure.
+# RIO_GOLDEN_DAEMON_BIN env; gen-matrix's cache-filter skips all three on
+# any PR that doesn't touch rio-gateway's closure.
 #
 # crate2nix port: reuses crateChecks.mkNextestRun (reuse-build mode — the
 # test binaries are already compiled by buildRustCrate, nextest just runs
-# them). nextestMeta is shared across all variants (it only depends on
-# testBinDrvs + workspaceSrc).
+# them). meta is scoped to rio-gateway only (member="rio-gateway" +
+# single-bin mkNextestMeta), so the closure is just rio-gateway's test
+# bins + its memberSrc — edits to other crates leave the golden-* drvs
+# cached and gen-matrix skips them.
 {
   pkgs,
   inputs,
   system,
   mkNextestRun,
+  mkNextestMeta,
+  testBins,
 }:
 let
   # Daemon package per variant. nix-pinned is the flake's explicitly
@@ -56,6 +60,13 @@ let
     variant: nixPkg:
     mkNextestRun {
       name = "rio-golden-${variant}";
+      # Scope to rio-gateway: meta is built from its test bin alone (not
+      # the whole-workspace nextestMeta default), and member="rio-gateway"
+      # picks the per-member memberSrc + runtimeTestInputs. Without this
+      # the closure pulls in every member's test bins + workspaceSrc and
+      # any Rust edit anywhere invalidates all three golden-* drvs.
+      member = "rio-gateway";
+      meta = mkNextestMeta { inherit (testBins) rio-gateway; };
       extraRuntimeInputs = [ nixPkg ];
       extraEnv = {
         # Absolute daemon path — the harness prefers this over PATH so
