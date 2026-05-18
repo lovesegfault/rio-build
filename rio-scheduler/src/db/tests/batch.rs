@@ -140,7 +140,7 @@ async fn test_batch_upsert_10k_nodes() -> anyhow::Result<()> {
 /// — 1k nodes, full `persist_merge_to_db` order (derivations →
 /// build_derivations → edges in one tx) — pinned at <2s.
 ///
-/// Research outcome (see [`rio_store::migrations::M_028`]):
+/// Research outcome (see [`rio_migrations::migrations::M_028`]):
 ///
 /// - Migration 028 already dropped the three `→ derivations(derivation_id)`
 ///   FKs (`derivation_edges.{parent,child}_id`, `build_derivations.

@@ -10,6 +10,7 @@
     "rio-crds": "rio-crds",
     "rio-gateway": "rio-gateway",
     "rio-lease": "rio-lease",
+    "rio-migrations": "rio-migrations",
     "rio-nix": "rio-nix",
     "rio-proto": "rio-proto",
     "rio-scheduler": "rio-scheduler",
@@ -21226,6 +21227,10 @@
           "packageId": "prost"
         },
         {
+          "name": "rio-migrations",
+          "packageId": "rio-migrations"
+        },
+        {
           "name": "rio-test-support",
           "packageId": "rio-test-support"
         },
@@ -21426,6 +21431,10 @@
           "packageId": "figment"
         },
         {
+          "name": "rio-migrations",
+          "packageId": "rio-migrations"
+        },
+        {
           "name": "rio-store",
           "packageId": "rio-store"
         },
@@ -21521,6 +21530,49 @@
         {
           "name": "rio-test-support",
           "packageId": "rio-test-support"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
+    "rio-migrations": {
+      "crateName": "rio-migrations",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "rio-migrations"
+      },
+      "dependencies": [
+        {
+          "name": "sqlx",
+          "packageId": "sqlx"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
+        }
+      ],
+      "devDependencies": [
+        {
+          "name": "hex",
+          "packageId": "hex"
+        },
+        {
+          "name": "rio-common",
+          "packageId": "rio-common"
+        },
+        {
+          "name": "rio-test-support",
+          "packageId": "rio-test-support"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio"
         }
       ],
       "libCrateTypes": [
@@ -21835,6 +21887,10 @@
           "packageId": "rio-lease"
         },
         {
+          "name": "rio-migrations",
+          "packageId": "rio-migrations"
+        },
+        {
           "name": "rio-nix",
           "packageId": "rio-nix"
         },
@@ -22100,6 +22156,10 @@
           "packageId": "rio-common"
         },
         {
+          "name": "rio-migrations",
+          "packageId": "rio-migrations"
+        },
+        {
           "name": "rio-nix",
           "packageId": "rio-nix"
         },
@@ -22192,10 +22252,6 @@
         {
           "name": "proptest",
           "packageId": "proptest"
-        },
-        {
-          "name": "regex",
-          "packageId": "regex"
         },
         {
           "name": "rio-store",

@@ -5,7 +5,7 @@
 //! (GC mark/sweep seeds from it) and `tenants` (cache-server auth +
 //! GC quota lookup). Before this module the contract between the two
 //! services was the column shape only, checked at RUNTIME by
-//! `rio-store/tests/migrations.rs::cross_service_schema_contract` —
+//! `rio-migrations/tests/migrations.rs::cross_service_schema_contract` —
 //! a scheduler-side migration that renamed/retyped a column would
 //! pass `cargo build` and fail in a test (or worse, production).
 //!

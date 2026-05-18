@@ -52,7 +52,7 @@ metrics = { workspace = true }
 # via postcard bytea (migration 059). rio-lease (above) for the leader-
 # elected reconcile loop. sqlx: the reconciler reads/writes
 # `nodeclaim_cell_state` directly (controller-only table; no store RPC
-# round-trip — see rio-store/src/migrations.rs M_059 ALLOW_DEAD note).
+# round-trip — see rio-migrations/src/migrations.rs M_059).
 sketches-ddsketch = { workspace = true }
 postcard = { workspace = true }
 sqlx = { workspace = true }
@@ -68,6 +68,8 @@ rand = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
+# Embedded MIGRATOR for `nodeclaim_pool::sketch` PG test fixtures.
+rio-migrations = { workspace = true }
 # ApiServerVerifier + Scenario (tower-test mock apiserver).
 rio-test-support = { workspace = true }
 http = { workspace = true }

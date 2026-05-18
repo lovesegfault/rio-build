@@ -11,22 +11,20 @@
 //! any persistent DB. Commentary, rationale, "why we chose X over Y",
 //! dead-code notes — all go HERE, keyed by migration number. The
 //! `.sql` files carry only the minimal SQL + a one-line pointer
-//! (`-- Commentary: see rio-store/src/migrations.rs M_NNN`).
+//! (`-- Commentary: see rio-migrations/src/migrations.rs M_NNN`).
 //!
 //! When you need to explain a migration's behavior: add or extend the
 //! `M_NNN` const below. Do NOT edit the `.sql`. The checksum-freeze
-//! test at `rio-store/tests/migrations.rs` enforces this — a comment
-//! edit to a shipped `.sql` fails CI with a pointer back here.
+//! test at `rio-migrations/tests/migrations.rs` enforces this — a
+//! comment edit to a shipped `.sql` fails CI with a pointer back here.
+//!
+//! The try-then-wait advisory-lock runner that applies these lives in
+//! `rio_common::migrate::run` — both rio-store and rio-scheduler run
+//! the SAME migration set against the SAME database under the same
+//! lock key (`rio_common::migrate::MIGRATE_LOCK_ID`), so the runner is
+//! shared, not crate-local.
 
 #![allow(dead_code)] // M_NNN doc-consts; never referenced, only `cargo doc`'d
-
-// The try-then-wait advisory-lock wrapper moved to
-// `rio_common::migrate` so rio-scheduler (which runs the SAME
-// migration set against the SAME database) uses the same lock key
-// and the same non-blocking strategy. Re-exported here so existing
-// callers (`rio_store::migrations::run`) and the [`crate::gc`] doc
-// cross-ref to `MIGRATE_LOCK_ID` keep working.
-pub use rio_common::migrate::{MIGRATE_LOCK_ID, run};
 
 /// `migrations/008_round4.sql`
 ///
@@ -489,9 +487,10 @@ pub const M_032: () = ();
 /// `migrations/033_chunks_uploaded_at.sql`
 ///
 /// Nullable `uploaded_at TIMESTAMPTZ` on `chunks` — the commit point
-/// for backend (S3) presence. Set by [`crate::metadata::chunked::
-/// mark_chunks_uploaded`] AFTER a successful `ChunkBackend::put`;
-/// cleared back to NULL when GC marks the chunk `deleted=true`.
+/// for backend (S3) presence. Set by rio-store's
+/// `metadata::chunked::mark_chunks_uploaded` AFTER a successful
+/// `ChunkBackend::put`; cleared back to NULL when GC marks the chunk
+/// `deleted=true`.
 ///
 /// **Race this closes (observed in production 2026-04-06):** under the
 /// previous `RETURNING (refcount = 1)` heuristic, two concurrent
@@ -940,10 +939,9 @@ pub const M_058: () = ();
 /// small (capped ring), read-rarely, schema-evolving; jsonb avoids a
 /// second migration when the event shape changes.
 ///
-/// Read/written by **rio-controller** only — the schema-liveness
-/// guard's corpus is store/scheduler/xtask, so this table is
-/// `ALLOW_DEAD`-listed in `rio-store/tests/migrations.rs` until the
-/// corpus grows or the persist moves behind a store RPC.
+/// Read/written by **rio-controller** only, so this table is
+/// not covered by `cross_service_schema_contract` (which scopes to
+/// rio-store reads); revisit if the persist moves behind a store RPC.
 pub const M_059: () = ();
 
 /// `migrations/060_sla_observed_instance_types.sql`

@@ -1,7 +1,7 @@
 //! Shared sqlx migration runner — try-then-wait advisory lock.
 //!
-//! rio-store and rio-scheduler both run the same workspace-root
-//! `migrations/` set against the same Postgres database. Both MUST
+//! rio-store and rio-scheduler both run the same `rio-migrations`
+//! migration set against the same Postgres database. Both MUST
 //! serialize via the same lock and the same non-blocking strategy:
 //! sqlx's default blocking `pg_advisory_lock` deadlocks against
 //! `CREATE INDEX CONCURRENTLY` (migrations 011, 022) when ≥2 replicas
@@ -65,10 +65,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// scopeguard-unlock dance needed.
 ///
 /// `migrator` is taken by value: `set_locking` needs `&mut`, and
-/// keeping the `sqlx::migrate!()` macro at the call site (each
-/// crate's `main.rs` / tests) instead of in this shared crate
-/// sidesteps the source-filter issue where rio-common's compile
-/// unit may not see `migrations/` (it's a sibling, not a child).
+/// `Migrator` is not `Clone` in sqlx 0.8.x. Callers pass
+/// `rio_migrations::migrator()` to get a fresh owned value.
 pub async fn run(pool: &PgPool, mut migrator: Migrator) -> Result<(), MigrateError> {
     // Dedicated lock connection, detached so dropping it closes the
     // socket (releasing the session lock) on ANY exit path. NOT the

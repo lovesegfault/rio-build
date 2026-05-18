@@ -15,7 +15,7 @@
 //! median across tenant-groups. One tenant flooding `hw_perf_samples`
 //! contributes one rank to the fleet median, not N. The dropped
 //! `hw_perf_factors` view did a flat row-median — see
-//! `rio_store::migrations::M_054`.
+//! `rio_migrations::migrations::M_054`.
 //!
 //! Memory is NOT normalized: peak RSS is dominated by the workload, not
 //! core throughput. ADR-023's M(c) is fitted on raw bytes.

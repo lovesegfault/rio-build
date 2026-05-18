@@ -105,8 +105,8 @@ Pre-commit hooks run treefmt automatically on commit.
 
 `sqlx::migrate!()` checksums `.sql` files by content (SHA-384 over the full file body, including comments). Editing a comment changes the checksum → persistent-DB deploys fail with `VersionMismatch`.
 
-- **Commentary, rationale, history:** goes in `rio-store/src/migrations.rs` (per-migration `M_NNN` doc-consts). NOT in the `.sql`.
-- **New migration:** add the SQL, run `cargo test -p rio-store --test migrations`, copy the hex-SHA from the `unpinned migration NNN` panic into `PINNED` at `rio-store/tests/migrations.rs`, commit both.
+- **Commentary, rationale, history:** goes in `rio-migrations/src/migrations.rs` (per-migration `M_NNN` doc-consts). NOT in the `.sql`.
+- **New migration:** add the SQL, run `cargo test -p rio-migrations --test migrations`, copy the hex-SHA from the `unpinned migration NNN` panic into `PINNED` at `rio-migrations/tests/migrations.rs`, commit both.
 - **Behavior change to a shipped migration:** write a NEW migration. Never edit shipped ones. The checksum-freeze test (`migration_checksums_frozen`) fails CI on any content change.
 
 ## CI gate

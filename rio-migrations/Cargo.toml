@@ -1,0 +1,22 @@
+[package]
+name = "rio-migrations"
+description = "Database migration SQL, embedded migrator, and per-migration commentary"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+sqlx = { workspace = true, features = ["migrate"] }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+# `rio_common::migrate::run` in `concurrent_migrations_no_deadlock`.
+rio-common = { workspace = true, features = ["postgres"] }
+# `TestDb::new(&MIGRATOR)` ephemeral PG fixture.
+rio-test-support = { workspace = true }
+# `migration_checksums_frozen` hex-encodes the embedded SHA-384.
+hex = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

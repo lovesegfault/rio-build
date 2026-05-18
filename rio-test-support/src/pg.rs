@@ -376,7 +376,7 @@ impl TestDb {
     ///
     /// For tests that exercise the migrator itself (concurrent
     /// startup, advisory-lock behaviour) — see
-    /// `rio-store/tests/migrations.rs`. Everything else wants
+    /// `rio-migrations/tests/migrations.rs`. Everything else wants
     /// [`new`](Self::new).
     pub async fn new_empty() -> Self {
         let server = PgServer::get();

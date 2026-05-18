@@ -12,7 +12,7 @@ use tracing::info;
 use crate::sh::repo_root;
 use crate::ui;
 
-const PINNED_FILE: &str = "rio-store/tests/migrations.rs";
+const PINNED_FILE: &str = "rio-migrations/tests/migrations.rs";
 
 #[derive(Args)]
 pub struct MigrationArgs {
@@ -46,7 +46,7 @@ pub fn run(args: MigrationArgs) -> Result<()> {
 }
 
 fn create(name: &str) -> Result<()> {
-    let mig_dir = repo_root().join("migrations");
+    let mig_dir = repo_root().join("rio-migrations/migrations");
     let next = std::fs::read_dir(&mig_dir)?
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
         .filter_map(|f| f.split('_').next()?.parse::<i64>().ok())
@@ -69,7 +69,7 @@ fn create(name: &str) -> Result<()> {
 }
 
 fn repin(n: i64) -> Result<()> {
-    let mig_dir = repo_root().join("migrations");
+    let mig_dir = repo_root().join("rio-migrations/migrations");
     let path = std::fs::read_dir(&mig_dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .find(|p| {

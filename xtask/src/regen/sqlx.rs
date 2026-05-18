@@ -47,7 +47,10 @@ pub async fn run() -> Result<()> {
     });
 
     ui::step("cargo sqlx migrate run", || {
-        sh::run(cmd!(sh, "cargo sqlx migrate run --source migrations"))
+        sh::run(cmd!(
+            sh,
+            "cargo sqlx migrate run --source rio-migrations/migrations"
+        ))
     })
     .await?;
 

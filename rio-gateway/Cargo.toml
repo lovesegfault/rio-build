@@ -68,12 +68,15 @@ libc = "0.2"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
+# Embedded MIGRATOR re-exported by tests/functional/mod.rs for the
+# RioStack fixture's `TestDb::new(&MIGRATOR)`.
+rio-migrations = { workspace = true }
 rio-test-support = { workspace = true }
 rstest = { workspace = true }
 # tests/functional/: RioStack fixture runs REAL StoreServiceImpl (not
 # MockStore) backed by ephemeral PG. No dep cycle: both rio-gateway and
 # rio-store depend on rio-proto; neither depends on the other.
-# `test-utils` exposes spawn_store_service + MIGRATOR.
+# `test-utils` exposes spawn_store_service.
 rio-store = { workspace = true, features = ["test-utils"] }
 sqlx = { workspace = true }
 tempfile = { workspace = true }

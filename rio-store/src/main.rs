@@ -337,7 +337,7 @@ async fn init_db_pool(database_url: &str, max_connections: u32) -> anyhow::Resul
     // against migrations 011/022's CREATE INDEX CONCURRENTLY when
     // ≥2 replicas start together (I-194). Shared with rio-scheduler
     // (same DB, same migrations) — see rio_common::migrate::run.
-    rio_common::migrate::run(&pool, sqlx::migrate!("../migrations"))
+    rio_common::migrate::run(&pool, rio_migrations::migrator())
         .await
         .inspect_err(|e| error!(error = %e, "database migrations failed"))?;
     info!("database migrations applied");

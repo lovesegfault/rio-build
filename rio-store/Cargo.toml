@@ -72,6 +72,10 @@ schemars = { workspace = true }
 hex = { workspace = true }
 # RFC 9110 Retry-After HTTP-date parsing (substitute.rs 429 handling).
 httpdate = { workspace = true }
+# Embedded MIGRATOR + migrator() factory. main.rs runs it at startup;
+# the cfg-gated `pub use rio_migrations::MIGRATOR` re-export keeps the
+# `crate::MIGRATOR` test surface stable.
+rio-migrations = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 # --- server-only (gated via the `server` feature) ---------------------
@@ -158,9 +162,6 @@ serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 rstest = { workspace = true }
-# every_table_is_queried (tests/migrations.rs): word-boundary table-name
-# search over the OUT_DIR/all_rs.txt corpus produced by build.rs.
-regex = { workspace = true }
 # Self-reference to enable `test-utils` for integration tests under
 # tests/ — those compile the lib as a dep WITHOUT cfg(test), so the
 # feature is the only way they see `test_helpers` / `MIGRATOR`.

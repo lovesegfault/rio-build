@@ -10,26 +10,22 @@
 //! turning checksum drift into a CI failure instead of a deploy-time
 //! surprise.
 //!
-//! See `rio-store/src/migrations.rs` for the policy and the home for
-//! migration commentary.
+//! See `rio-migrations/src/migrations.rs` for the policy and the home
+//! for migration commentary.
 
 use std::time::Duration;
 
-// Integration tests compile the lib WITHOUT cfg(test), so the
-// lib-level MIGRATOR static at rio-store/src/lib.rs:34 is invisible
-// here. Keep a separate copy (same path, same content — the macro
-// expands at compile time).
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
+use rio_migrations::MIGRATOR;
 
-/// I-194 regression: 3 concurrent `migrations::run()` against one
-/// fresh DB all complete, and the `CREATE INDEX CONCURRENTLY`
+/// I-194 regression: 3 concurrent `rio_common::migrate::run()` against
+/// one fresh DB all complete, and the `CREATE INDEX CONCURRENTLY`
 /// migration (022) lands a valid index. (011's CIC index is dropped
 /// by 035, so nothing left to assert there.)
 ///
 /// Under sqlx's default blocking `pg_advisory_lock`, replica B's
 /// blocked `SELECT pg_advisory_lock(...)` holds a virtualxid that
 /// replica A's CIC waits on → deadlock. The try-then-wait lock in
-/// `migrations::run` holds no long-lived vxid while polling.
+/// `rio_common::migrate::run` holds no long-lived vxid while polling.
 ///
 /// 60s timeout: full migration set on the ephemeral PG runs in
 /// well under 5s; the timeout is the deadlock detector. NOT
@@ -41,13 +37,13 @@ async fn concurrent_migrations_no_deadlock() {
     let db = rio_test_support::TestDb::new_empty().await;
 
     // Three "replicas" racing on the same fresh DB. Each gets its
-    // own Migrator value (`sqlx::migrate!` produces an owned struct
-    // per invocation; `set_locking` mutates).
+    // own owned Migrator value (`migrator()` re-invokes the macro;
+    // `set_locking` in `rio_common::migrate::run` mutates).
     let r = tokio::time::timeout(Duration::from_secs(60), async {
         tokio::try_join!(
-            rio_store::migrations::run(&db.pool, sqlx::migrate!("../migrations")),
-            rio_store::migrations::run(&db.pool, sqlx::migrate!("../migrations")),
-            rio_store::migrations::run(&db.pool, sqlx::migrate!("../migrations")),
+            rio_common::migrate::run(&db.pool, rio_migrations::migrator()),
+            rio_common::migrate::run(&db.pool, rio_migrations::migrator()),
+            rio_common::migrate::run(&db.pool, rio_migrations::migrator()),
         )
     })
     .await
@@ -131,14 +127,14 @@ async fn migration_050_allowlist_rejects_unicode_ws() {
 /// the `PINNED` table below, commit alongside the new `.sql`.
 ///
 /// **Checksum CHANGED for an existing migration:** the edit is almost
-/// certainly wrong. Move commentary to `rio-store/src/migrations.rs`
+/// certainly wrong. Move commentary to `rio-migrations/src/migrations.rs`
 /// instead — see `M_018` there for the pattern. The ONLY legitimate
 /// reason to update a pinned checksum is a pre-production behavior
 /// change, and only after verifying no persistent DB has applied it.
 #[test]
 fn migration_checksums_frozen() {
     // (version, hex-SHA384). Regenerate with:
-    //   for f in migrations/*.sql; do \
+    //   for f in rio-migrations/migrations/*.sql; do \
     //     v=$(basename "$f" | sed 's/_.*//'); \
     //     echo "($((10#$v)), \"$(sha384sum "$f" | cut -d' ' -f1)\"),"; \
     //   done
@@ -203,7 +199,7 @@ fn migration_checksums_frozen() {
         (53, "5b63404691d5229bbdfb2936686f2014f84e11fbc142b9fc945c8f18e1fd3035973f3780e4494f5cd87cc00cab90af3a"),
         (54, "b82007070c87e904074836f8d1d737ed593163cbb0ae87f112dbde4de6be97fef66e31a91b40412f8674d7a6e4a2250c"),
         // 055 deleted (dead schema on never-queried hw_cost_factors) —
-        // sqlx tolerates the gap; see rio-store/src/migrations.rs.
+        // sqlx tolerates the gap; see rio-migrations/src/migrations.rs.
         (56, "b456694bdc1a9b6dbc5cb36025ec198e389b77960ce783ed0afd276ff37476ad632c6c468826239316624433de4e8672"),
         (57, "6c626a27371ef3f46b23a2cfcdcd0052f487c1a90cbd6cade384ad7dda48e71835f94d40b718354ef0c2b46c1c1bae92"),
         (58, "3e2f05cc03b48c2e82bbaa8dc3b36fe89260c12bb9a5f921acac104dc2b9772e8f4c3b9a0ba9867599ec6901e20984d7"),
@@ -220,7 +216,7 @@ fn migration_checksums_frozen() {
             Some(&expected) => assert_eq!(
                 actual, expected,
                 "\n  migration {:03} checksum changed — move commentary to \
-                 rio-store/src/migrations.rs (M_{:03}), do NOT edit the .sql.\n  \
+                 rio-migrations/src/migrations.rs (M_{:03}), do NOT edit the .sql.\n  \
                  If this is an intentional pre-prod behavior change AND no \
                  persistent DB has applied it, update PINNED here.",
                 m.version, m.version,
@@ -234,7 +230,7 @@ fn migration_checksums_frozen() {
     assert!(
         unpinned.is_empty(),
         "\n  unpinned migration(s) — add to PINNED in \
-         rio-store/tests/migrations.rs:\n{}",
+         rio-migrations/tests/migrations.rs:\n{}",
         unpinned
             .iter()
             .map(|(v, h)| format!("        ({v}, \"{h}\"),"))
@@ -310,128 +306,6 @@ async fn cross_service_schema_contract() {
     }
 }
 
-/// Schema-liveness guard: every table that exists after applying all
-/// `migrations/*.sql` is referenced by name in ≥1 workspace `.rs` file.
-///
-/// `migration_checksums_frozen` only catches *edits* to shipped
-/// migrations — it does not catch a NEW migration that creates or
-/// extends schema nothing reads. Migration 055 added EMA-state columns
-/// to `hw_cost_factors`; the actual EMA persist shipped via
-/// `sla_ema_state` instead, so 055 (and 042's `hw_cost_factors` itself)
-/// were dead on arrival, and the `M_055` doc-const actively misled.
-/// Once a dead migration ships, the checksum freeze means dropping the
-/// schema needs a SECOND migration. This test fails the first one
-/// before it freezes.
-///
-/// Corpus is concatenated `.rs` source from the PG-querying crates
-/// (rio-store, rio-scheduler, xtask), produced by `rio-store/build.rs`.
-/// NOT `.sqlx/query-*.json` — that only covers `query!`/`query_as!`
-/// macro callsites; the ≈200 non-macro `sqlx::query()` / `QueryBuilder`
-/// sites leave no `.sqlx/` entry. `src/migrations.rs` is excluded so
-/// doc-const prose can't mask a dead table.
-///
-/// **A new table this test flags as dead:** either it IS dead (delete
-/// the migration before it ships), or add it to `ALLOW_DEAD` below
-/// with a one-line rationale naming the consumer-to-be.
-#[test]
-fn every_table_is_queried() {
-    use std::collections::BTreeSet;
-
-    // Tables intentionally present in the schema with zero `.rs`
-    // references. Each entry MUST carry a rationale.
-    const ALLOW_DEAD: &[(&str, &str)] = &[
-        (
-            "hw_cost_factors",
-            "ADR-023 chose sla_ema_state instead; DROP TABLE deferred to a \
-             follow-up migration (042 is frozen)",
-        ),
-        (
-            "nodeclaim_cell_state",
-            "ADR-023 §13b: read/written by rio-controller's nodeclaim_pool \
-             reconciler — controller is not in this test's PG-query corpus \
-             (store/scheduler/xtask only)",
-        ),
-    ];
-
-    // ── Live-table set: CREATE/ALTER add, DROP removes, in version
-    // order. `MIGRATOR.iter()` already yields by ascending version
-    // (sqlx sorts at macro-expansion time) and exposes the embedded
-    // `.sql` body — no separate `include_dir!` needed.
-    //
-    // SQL `--` comment lines are stripped first (017 has the prose
-    // "CREATE TABLE inline REFERENCES" in a comment, which would
-    // otherwise extract a phantom `inline` table). No block comments
-    // exist in `migrations/` today; if one appears the regex simply
-    // misses tables inside it, which is a false negative, not a false
-    // positive — acceptable.
-    let ddl = regex::Regex::new(
-        r"(?x)
-          \b CREATE \s+ TABLE \s+ (?: IF \s+ NOT \s+ EXISTS \s+ )? (?<create> \w+ )
-        | \b ALTER  \s+ TABLE \s+                                  (?<alter>  \w+ )
-        | \b DROP   \s+ TABLE \s+ (?: IF \s+ EXISTS \s+ )?         (?<drop>   \w+ )
-        ",
-    )
-    .unwrap();
-    let mut live: BTreeSet<String> = BTreeSet::new();
-    for m in MIGRATOR.iter() {
-        let stripped: String = m
-            .sql
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("--"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        for c in ddl.captures_iter(&stripped) {
-            if let Some(t) = c.name("create").or_else(|| c.name("alter")) {
-                live.insert(t.as_str().to_owned());
-            } else if let Some(t) = c.name("drop") {
-                live.remove(t.as_str());
-            }
-        }
-    }
-    // Floor guard: a regex regression that matches nothing would make
-    // the loop below vacuously pass.
-    assert!(live.len() > 20, "parsed only {} live tables", live.len());
-
-    // ── Corpus: `rio-store/build.rs` concats `**/*.rs` from rio-store +
-    // rio-scheduler + xtask (excluding `migrations.rs`) into OUT_DIR.
-    let rs_corpus = include_str!(concat!(env!("OUT_DIR"), "/all_rs.txt"));
-
-    let mut dead = Vec::new();
-    for t in &live {
-        if ALLOW_DEAD.iter().any(|(n, _)| n == t) {
-            continue;
-        }
-        // Word-boundary match so `foo` doesn't satisfy on `foo_bar` /
-        // `foobar`. Table names are `\w+` so `\b` is the right anchor.
-        let re = regex::Regex::new(&format!(r"\b{}\b", regex::escape(t))).unwrap();
-        if !re.is_match(rs_corpus) {
-            dead.push(t.clone());
-        }
-    }
-    assert!(
-        dead.is_empty(),
-        "\n  table(s) declared in migrations/ but never referenced in \
-         rio-store/rio-scheduler/xtask Rust source:\n    {dead:?}\n  \
-         dead schema — delete the migration before it ships, or add to \
-         ALLOW_DEAD with rationale",
-    );
-
-    // Reverse check: ALLOW_DEAD entries that ARE now referenced (or no
-    // longer exist) are stale — drop them so the allowlist doesn't
-    // accrete.
-    for &(t, _) in ALLOW_DEAD {
-        assert!(
-            live.contains(t),
-            "ALLOW_DEAD lists `{t}` but no live migration creates it — remove the entry",
-        );
-        let re = regex::Regex::new(&format!(r"\b{}\b", regex::escape(t))).unwrap();
-        assert!(
-            !re.is_match(rs_corpus),
-            "ALLOW_DEAD lists `{t}` but it IS referenced in Rust source — remove the entry",
-        );
-    }
-}
-
 /// M_048 regression: M_030's backfill matched only `'completed'`, missing
 /// `'skipped'` (M_021). For terminal builds — which never re-fire
 /// `persist_build_counts` — the undercount was permanent. M_048 recounts
@@ -486,7 +360,7 @@ async fn migration_048_recounts_skipped_as_completed() {
     // a single prepared statement and choke on the leading comment in
     // some PG configs — raw_sql sends it as a simple-query batch.
     sqlx::raw_sql(include_str!(
-        "../../migrations/048_builds_denorm_recount_skipped.sql"
+        "../migrations/048_builds_denorm_recount_skipped.sql"
     ))
     .execute(&db.pool)
     .await

@@ -47,12 +47,13 @@ pub(crate) mod error;
 pub(crate) mod fixtures;
 pub mod reconcilers;
 
-/// Embedded migrator for `nodeclaim_pool::sketch` PG tests. Same
-/// `migrations/` dir as rio-store/rio-scheduler — controller doesn't run
-/// this in `main()` (store/scheduler own startup migration), only the
+/// Re-export of the shared embedded migrator from `rio-migrations` for
+/// `nodeclaim_pool::sketch` PG tests. Same migration set as
+/// rio-store/rio-scheduler — controller doesn't run this in `main()`
+/// (store/scheduler own startup migration), only the
 /// `TestDb::new(&MIGRATOR)` fixtures do.
 #[cfg(test)]
-pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
+pub use rio_migrations::MIGRATOR;
 
 /// Histogram bucket boundaries for controller reconcile latency (seconds).
 ///

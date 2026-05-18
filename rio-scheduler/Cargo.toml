@@ -25,6 +25,10 @@ test-fixtures = []
 [dependencies]
 rio-common = { workspace = true, features = ["postgres", "aws"] }
 rio-auth = { workspace = true }
+# Embedded MIGRATOR + migrator() factory. main.rs runs it at startup;
+# the `pub use rio_migrations::MIGRATOR` re-export keeps the
+# `crate::MIGRATOR` test surface stable.
+rio-migrations = { workspace = true }
 rio-proto = { workspace = true }
 schemars = { workspace = true }
 # `schema`-only: just `realisations` + `error` (sqlx + thiserror), no

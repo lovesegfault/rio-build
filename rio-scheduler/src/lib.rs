@@ -45,13 +45,13 @@ pub use state::{PoisonConfig, RetryPolicy};
 // Default for main.rs Config's `#[serde(default = ...)]` fn.
 pub use actor::DEFAULT_SUBSTITUTE_CONCURRENCY;
 
-/// Shared sqlx migrator for the `migrations/` directory. Test-only
-/// (`TestDb::new(&MIGRATOR)`) — production goes through
-/// `rio_common::migrate::run` in `main.rs`. Same migration set as
-/// rio-store; each crate embeds its own copy because `sqlx::migrate!`
-/// resolves the path relative to the crate's `CARGO_MANIFEST_DIR` at
-/// compile time.
-pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
+/// Re-export of the shared embedded migrator from `rio-migrations`.
+/// Test-only (`TestDb::new(&MIGRATOR)`) — production goes through
+/// `rio_common::migrate::run(&pool, rio_migrations::migrator())` in
+/// `main.rs`. Same migration set as rio-store; both consume the single
+/// `rio-migrations` source of truth.
+#[cfg(test)]
+pub use rio_migrations::MIGRATOR;
 
 /// Histogram bucket boundaries for `rio_scheduler_critical_path_accuracy`.
 ///

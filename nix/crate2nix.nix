@@ -187,19 +187,10 @@ let
   # crates not in that set and for cross-directory compile-time
   # references that crate2nix's per-crate-src model can't see.
   #
-  # The big one: `sqlx::migrate!("../migrations")` in rio-scheduler and
-  # rio-store — the macro reads SQL files at COMPILE time from a path
-  # relative to the crate dir. buildRustCrate's src is just
-  # `rio-scheduler/`, so `../migrations` resolves to the nix-store
-  # parent, which doesn't exist. Workaround: postUnpack symlinks the
-  # migrations dir next to the crate src. Same trick Naersk users apply;
-  # crate2nix issue #17 tracks the upstream limitation.
+  # `sqlx::migrate!("./migrations")` lives only in `rio-migrations` and
+  # reads from inside its own crate dir, so no migration symlink hack
+  # is needed — the per-member fileset already includes `migrations/`.
   #
-  migrationsFileset = pkgs.lib.fileset.toSource {
-    root = ../migrations;
-    fileset = ../migrations;
-  };
-
   # sqlx offline query cache — content-addressed JSON per query!(...)
   # callsite. sqlx-macros-core 0.8.x ALWAYS runs `$CARGO metadata` to
   # find workspace_root (workspace.rs:Metadata::resolve) — even with
@@ -231,8 +222,8 @@ let
   '';
 
   # rio-test-support/build.rs runs protoc on ../rio-proto/proto/admin.proto
-  # to emit a FileDescriptorSet for MockAdmin codegen. Same cross-directory
-  # problem as migrations: buildRustCrate src is just rio-test-support/.
+  # to emit a FileDescriptorSet for MockAdmin codegen. Cross-directory
+  # compile-time read: buildRustCrate src is just rio-test-support/.
   # Include all .proto files — admin.proto imports types/dag/admin_types,
   # which transitively import build_types. protoc needs the full graph.
   protoFileset = pkgs.lib.fileset.toSource {
@@ -240,12 +231,11 @@ let
     fileset = pkgs.lib.fileset.fileFilter (f: f.hasExt "proto") ../rio-proto/proto;
   };
   # rio-store/build.rs walks `../rio-scheduler/src` + `../xtask/src` to
-  # build the schema-liveness corpus for `every_table_is_queried`
-  # (tests/migrations.rs). Same cross-directory-at-compile-time problem
-  # as `migrations/`: buildRustCrate's src is just `rio-store/`. `.rs`
-  # filter keeps the fileset hash stable across Cargo.toml / proptest-
-  # regression / fixture churn. rio-store's OWN src/ is already present
-  # (it IS the crate being built).
+  # build the schema-liveness corpus. Cross-directory-at-compile-time:
+  # buildRustCrate's src is just `rio-store/`. `.rs` filter keeps the
+  # fileset hash stable across Cargo.toml / proptest-regression /
+  # fixture churn. rio-store's OWN src/ is already present (it IS the
+  # crate being built).
   pgQuerySrcFileset = pkgs.lib.fileset.toSource {
     root = ../.;
     fileset = pkgs.lib.fileset.unions [
@@ -263,20 +253,13 @@ let
     fileset = ../infra/helm/rio-build/templates/scheduler.yaml;
   };
 
-  withMigrations = _: {
-    # postUnpack runs after buildRustCrate has unpacked the crate src.
-    # CWD is the unpacked crate directory; its parent is
-    # $NIX_BUILD_TOP — writable. sqlx::migrate!("../migrations")
-    # resolves $CARGO_MANIFEST_DIR/../migrations at compile time; this
-    # symlink makes that path resolve to the fileset'd store path.
-    postUnpack = ''
-      ln -sf ${migrationsFileset} $NIX_BUILD_TOP/migrations
-    '';
-    # query! macros read .sqlx/*.json instead of connecting to PG at
-    # compile time. SQLX_OFFLINE_DIR bypasses the workspace-root walk;
-    # CARGO points at a stub that outputs minimal `cargo metadata` JSON
-    # (sqlx-macros-core 0.8.x always invokes it, no bypass — see
-    # cargoMetadataStub above for the full failure chain).
+  # query! macros read .sqlx/*.json instead of connecting to PG at
+  # compile time. SQLX_OFFLINE_DIR bypasses the workspace-root walk;
+  # CARGO points at a stub that outputs minimal `cargo metadata` JSON
+  # (sqlx-macros-core 0.8.x always invokes it, no bypass — see
+  # cargoMetadataStub above for the full failure chain). Applied to
+  # every crate with `query!()`/`query_as!()` callsites.
+  sqlxOffline = {
     SQLX_OFFLINE = "true";
     SQLX_OFFLINE_DIR = "${sqlxCacheFileset}/.sqlx";
     CARGO = "${cargoMetadataStub}";
@@ -416,39 +399,29 @@ let
         '';
       };
 
-    # sqlx::migrate!("../migrations") compile-time file read. See
-    # `withMigrations` above. rio-gateway only uses it in tests/
-    # (integration-test MIGRATOR static), so its non-test build
-    # succeeds without this — but buildTests=true compiles tests/
-    # and needs the symlink.
-    rio-scheduler = withMigrations;
-    # rio-store: withMigrations + sibling-crate src/ symlinks for
-    # build.rs's schema-liveness corpus walk. Separate override (not
-    # folded into `withMigrations`) so editing rio-scheduler/xtask
-    # source doesn't invalidate rio-scheduler's / rio-gateway's own
-    # crate2nix builds.
+    # sqlx::query!()/query_as!() callsites — need the offline cache +
+    # cargo-metadata stub. (sqlx::migrate!() lives only in
+    # rio-migrations, which is a leaf crate and needs neither.)
+    rio-scheduler = _: sqlxOffline;
+    # rio-store: sqlxOffline + sibling-crate src/ symlinks for
+    # build.rs's schema-liveness corpus walk. Separate override so
+    # editing rio-scheduler/xtask source doesn't invalidate
+    # rio-scheduler's / rio-controller's own crate2nix builds.
     rio-store =
-      attrs:
-      let
-        base = withMigrations attrs;
-      in
-      base
+      _:
+      sqlxOffline
       // {
         postUnpack = ''
-          ${base.postUnpack}
           mkdir -p $NIX_BUILD_TOP/rio-scheduler $NIX_BUILD_TOP/xtask
           ln -sf ${pgQuerySrcFileset}/rio-scheduler/src $NIX_BUILD_TOP/rio-scheduler/src
           ln -sf ${pgQuerySrcFileset}/xtask/src $NIX_BUILD_TOP/xtask/src
         '';
       };
-    rio-gateway = withMigrations;
-
-    # withMigrations: nodeclaim_pool/sketch.rs uses sqlx::query!
-    # (offline cache + CARGO stub) and lib.rs's MIGRATOR uses
-    # sqlx::migrate!("../migrations"). The #[cfg(test)]-only seccomp
-    # include_str! is in testOnlyPostUnpack — applied by checks.nix's
-    # mkTestVariant alongside buildTests=true.
-    rio-controller = withMigrations;
+    # nodeclaim_pool/sketch.rs uses sqlx::query! (offline cache + CARGO
+    # stub). The #[cfg(test)]-only seccomp include_str! is in
+    # testOnlyPostUnpack — applied by checks.nix's mkTestVariant
+    # alongside buildTests=true.
+    rio-controller = _: sqlxOffline;
 
     # build.rs compiles libFuzzer's C++ via the `cc` crate. stdenv's
     # g++ (NOT clang — see below) plus -fsanitize=address so the C++

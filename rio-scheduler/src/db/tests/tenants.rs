@@ -61,7 +61,7 @@ async fn tenant_seed_optional_columns() {
 /// Migrations 020 + 050 add CHECK constraints that reject tenant
 /// names violating the `NormalizedName` invariant (untrimmed,
 /// empty, or containing interior whitespace) and the strict ASCII
-/// allowlist respectively. See `rio-store/src/migrations.rs` M_020
+/// allowlist respectively. See `rio-migrations/src/migrations.rs` M_020
 /// for why 020 alone is weaker than `NormalizedName` (Unicode gap).
 ///
 /// Probe via direct INSERT — bypasses CreateTenant's Rust-side

@@ -12412,6 +12412,31 @@
         "Rio Contributors"
       ]
     },
+    "rio-migrations": {
+      "crateName": "rio-migrations",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "../../rio-migrations"
+      },
+      "dependencies": [
+        {
+          "name": "sqlx",
+          "packageId": "sqlx"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
     "rio-nix": {
       "crateName": "rio-nix",
       "version": "0.1.0",
@@ -12652,6 +12677,10 @@
         {
           "name": "rio-common",
           "packageId": "rio-common"
+        },
+        {
+          "name": "rio-migrations",
+          "packageId": "rio-migrations"
         },
         {
           "name": "rio-nix",

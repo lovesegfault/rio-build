@@ -1,6 +1,6 @@
 //! `.fields` snapshot tripwire for every `.proto` file in the crate.
 //!
-//! Same pattern as `rio-store/tests/migrations.rs::migration_checksums_frozen`:
+//! Same pattern as `rio-migrations/tests/migrations.rs::migration_checksums_frozen`:
 //! not a correctness check — a "you touched this, prove you thought
 //! about it" gate. Adding/retyping/re-qualifying a proto3 field is a
 //! wire-compat decision; this test forces the decision to be explicit.

@@ -31,7 +31,7 @@ use tonic::transport::Channel;
 
 use super::common::{SessionHandles, spawn_session_task};
 
-pub use rio_store::MIGRATOR;
+pub use rio_migrations::MIGRATOR;
 
 /// Gateway wire protocol backed by REAL `rio-store` (ephemeral PG,
 /// `StoreServiceImpl`) + `MockScheduler`. Functional-tier: catches bugs

@@ -58,25 +58,22 @@ pub mod manifest;
 #[cfg(feature = "server")]
 pub(crate) mod metadata;
 #[cfg(feature = "server")]
-pub mod migrations;
-#[cfg(feature = "server")]
 pub mod signing;
 #[cfg(feature = "server")]
 pub mod substitute;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_helpers;
 
-/// Shared sqlx migrator for the `migrations/` directory. Embeds
-/// migration SQL at compile time via `sqlx::migrate!`.
+/// Re-export of the shared embedded migrator from `rio-migrations`.
 ///
-/// Gated on `test`/`test-utils` — the fuzz/rio-store/ workspace compiles
-/// this lib as a dep without the feature, and its source filter may
-/// exclude migrations/. sqlx::migrate! reads files at COMPILE time, so
-/// even an unused static can break the fuzz build. The cfg-gate means
-/// the macro only expands for unit tests or downstream test fixtures
-/// (which enable `test-utils` and have migrations/ in scope).
+/// Gated on `test`/`test-utils` so `rio_store::MIGRATOR` stays out of
+/// the public API for non-test consumers — production code goes through
+/// `rio_common::migrate::run` with `rio_migrations::migrator()`. The
+/// re-export exists for the ~200 `TestDb::new(&crate::MIGRATOR)`
+/// callsites in this crate's `#[cfg(test)]` modules. `crate::MIGRATOR`
+/// and `rio_store::MIGRATOR` resolve to the same static.
 #[cfg(any(test, feature = "test-utils"))]
-pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
+pub use rio_migrations::MIGRATOR;
 
 /// Histogram bucket boundaries for `rio_store_substitute_duration_seconds`.
 ///

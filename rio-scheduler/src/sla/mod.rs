@@ -23,7 +23,7 @@ use crate::db::{SchedulerDb, SlaOverrideRow};
 /// - with the flag: bumps `epoch`, records the new value, and resets
 ///   the ref-second-denominated state (`sla_ema_state` for this
 ///   cluster; `build_samples` + `hw_perf_samples` unconditionally —
-///   neither is cluster-scoped, see `rio_store::migrations::M_058`).
+///   neither is cluster-scoped, see `rio_migrations::migrations::M_058`).
 ///
 /// Idempotent: a second boot with the same `cfg` is a no-op.
 // r[impl sched.sla.hw-class.config]
