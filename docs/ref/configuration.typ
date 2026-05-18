@@ -63,9 +63,10 @@ keys (`jwt.required` ↔ TOML `[jwt] required = …` ↔ env `RIO_JWT__REQUIRED`
 ]
 
 #info[
-  *Compile-time constants (not configurable):* `DEFAULT_DURATION_SECS = 30.0`
+  *Compile-time constants (not configurable):* `DEFAULT_DURATION_SECS = 60.0`
   --- fallback build-duration estimate when no SLA fit exists for the `(pname,
-  system, tenant)` key.
+  system, tenant)` key. `POISON_TTL = 24h` --- time before a poisoned
+  derivation auto-expires; checked on each housekeeping tick.
 ]
 
 = Store
@@ -229,14 +230,13 @@ across transaction boundaries.
 #table(
   columns: 4,
   table.header([Parameter], [Type], [Default], [Description]),
-  [`grpc.max_message_size`],
-  [u32],
-  [33554432 (32MB)],
-  [Maximum gRPC message size in bytes. Must be >= 32MB for large DAG
-    submissions (nixpkgs stdenv is \~12MB). Applies to all gRPC services.],
+  [`RIO_GRPC_MAX_MESSAGE_SIZE`],
+  [usize (env var)],
+  [268435456 (256 MiB)],
+  [Maximum gRPC message size in bytes. Sized for `MAX_DAG_NODES`-scale
+    `SubmitBuild` requests (\~120 MB at \~150k nodes). Applies to all gRPC
+    services. Read from the environment, not a config-file key.],
 )
-
-Environment variable: `RIO_GRPC_MAX_MESSAGE_SIZE`
 
 == High Availability
 

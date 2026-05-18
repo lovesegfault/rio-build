@@ -48,55 +48,47 @@ state machine)
   [2a (in-memory poison)],
 )
 
-#info[
-  *Note:* There is no `TimedOut` variant in the `BuildResultStatus` proto enum.
-  Nix's `BuildStatus::TimedOut` (wire value 8) currently maps to
-  `PermanentFailure` via the executor's fallthrough mapping.
-]
-
 == Additional Nix BuildResult Mappings
 
-The executor maps `rio_nix::BuildStatus` (the real Nix wire enum) to the proto
-`BuildResultStatus`. Only `PermanentFailure` and `TransientFailure` are mapped
-explicitly; *all other Nix statuses fall through to `PermanentFailure`*:
+`rio_nix::BuildStatus` (the Nix wire enum) maps to the proto `BuildResultStatus`
+via an exhaustive `From` impl. Most variants map 1:1; only `MiscFailure` and
+`NoSubstituters` collapse to `PermanentFailure`:
 
 #table(
   columns: 3,
   table.header([Nix Status], [rio-build Classification], [Notes]),
-  [`PermanentFailure` (3)], [PermanentFailure], [Explicit mapping],
-  [`TransientFailure` (6)], [TransientFailure], [Explicit mapping],
+  [`PermanentFailure` (3)], [PermanentFailure], [1:1],
+  [`TransientFailure` (6)], [TransientFailure], [1:1],
   [`MiscFailure` (9)],
   [PermanentFailure],
-  [Fallthrough for uncategorized failures. Kept as permanent: field experience
-    (Phase 3a VM tests) shows these are usually deterministic (malformed .drv,
-    missing env var) rather than transient.],
+  [Collapsed. nix-daemon's own catch-all ("failed, unclassified"). Treated as
+    deterministic: don't retry.],
 
   [`TimedOut` (8)],
-  [PermanentFailure],
-  [Fallthrough. No distinct proto variant.],
+  [TimedOut],
+  [1:1. Scheduler treats as permanent-no-reassign.],
 
-  [`LogLimitExceeded` (11)],
-  [PermanentFailure],
-  [Fallthrough. Retry would repeat.],
+  [`LogLimitExceeded` (11)], [LogLimitExceeded], [1:1. Retry would repeat.],
 
   [`NotDeterministic` (12)],
-  [PermanentFailure],
-  [Fallthrough. Detected by Nix's `--check`.],
+  [NotDeterministic],
+  [1:1. Detected by Nix's `--check`.],
 
   [`InputRejected` (4)],
-  [PermanentFailure],
-  [Fallthrough. Derivation references an invalid/unresolvable input.],
+  [InputRejected],
+  [1:1. Derivation references an invalid/unresolvable input.],
 
   [`OutputRejected` (5)],
-  [PermanentFailure],
-  [Fallthrough. Output hash mismatch (@fod) or path collision.],
+  [OutputRejected],
+  [1:1. Output hash mismatch (@fod) or path collision.],
 
   [`NoSubstituters` (14)],
   [PermanentFailure],
-  [Fallthrough. rio-build does not use external substituters.],
+  [Collapsed. Workers run with `substitute = false`; seeing this means
+    misconfiguration.],
 )
 
-See `rio-builder/src/executor/mod.rs` for the mapping implementation.
+See `rio-proto/src/status.rs` for the mapping implementation.
 
 == Infrastructure Error Types
 

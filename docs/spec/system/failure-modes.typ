@@ -21,8 +21,8 @@ If S3 writes fail but reads succeed (e.g., S3 rate limiting on PUTs):
 
 == Network Partition: Scheduler ↔ Executors
 
-- Executors detect partition via heartbeat timeout (\~50--60s wall-clock: 30s
-  staleness threshold + 3-tick confirmation)
+- Executors detect partition via heartbeat timeout (\~30--40s wall-clock:
+  `HEARTBEAT_TIMEOUT_SECS = 30s` checked on each \~10s scheduler tick)
 - Executors close their `BuildExecution` stream and attempt reconnection with
   backoff
 - The scheduler calls `reset_to_ready()` on disconnected executors' running
