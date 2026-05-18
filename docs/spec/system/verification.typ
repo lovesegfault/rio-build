@@ -75,12 +75,14 @@ per-crate fuzz workspaces (#src("rio-nix/fuzz/"), #src("rio-store/fuzz/")):
   wopBuildDerivation, etc.)
 - `nar_parsing` --- @nar streaming reader with malformed input
 - `narinfo_parsing` --- @narinfo text format parser
-- `derivation_parsing` --- `.drv` @aterm format parser (including
-  `__structuredAttrs` with `__json`)
+- `derivation_parsing` --- `.drv` @aterm format parser
 - `derived_path_parsing` --- @derivedpath wire format (`!`-separated
   `drvPath!output` strings)
 - `build_result_parsing` --- BuildResult wire format (status, error message,
   timing, built outputs)
+- `stderr_message_parsing` --- STDERR message wire format
+  (`read_stderr_message`)
+- `refscan` --- store-path reference scanner (`RefScanSink`)
 - `manifest_deserialize` (rio-store) --- chunk manifest deserialization
 - Run continuously via `cargo-fuzz` / `libFuzzer`:
   - *CI tier:* 2min/target run with seed corpus (`nix flake check` includes
@@ -165,13 +167,15 @@ needs russh fixture.
   `AdminService`
 - Cross-tenant data isolation: tenant A's `wopQueryPathInfo` returns 404 for
   tenant B's paths (when per-tenant scoping is enabled)
-- DAG size exceeding `max_dag_size` → rejected at the scheduler (not gateway
-  --- the gateway forwards derivations; the scheduler enforces DAG-level limits)
+- DAG size exceeding `MAX_DAG_NODES` → rejected at both gateway
+  (`translate::validate_dag`, early reject) and scheduler
 
 #info(title: [Implemented])[
-  Security VM test fragments cover JWT validation, HMAC-token rejection,
-  binary-cache auth (#src("nix/tests/scenarios/security.nix")); `__noChroot`
-  gateway pre-check (#rref("gw.reject.nochroot")).
+  Security VM test fragments
+  (#src("nix/tests/scenarios/security/standalone.nix")) cover HMAC
+  assignment/service tokens, executor-kind spoofing, tenant resolution, JWT
+  dual-mode fallback, per-tenant rate limiting, store-quota enforcement, and
+  the `__noChroot` gateway pre-check (#rref("gw.reject.nochroot")).
 ]
 
 = Chaos Testing

@@ -129,9 +129,11 @@ Garbage collection retention policies are configurable per tenant:
   columns: (auto, 1fr),
   align: (left, left),
   table.header([Parameter], [Description]),
-  [`gc_grace_period`], [Time between mark and sweep phases],
-  [`gc_retention_days`], [Minimum retention for completed build outputs],
-  [`gc_max_store_size`], [Maximum total store size for the tenant],
+  [`gc_retention_hours`],
+  [Minimum retention for completed build outputs (default 168 = 7 days)],
+
+  [`gc_max_store_bytes`],
+  [Maximum total store size for the tenant (`NULL` = unlimited)],
 )
 
 == Resource Quotas

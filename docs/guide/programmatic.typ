@@ -7,8 +7,8 @@ For build submission from within the cluster or automation, use the `SubmitBuild
 
 ```bash
 # Via grpcurl (low-level)
-grpcurl -plaintext -d '{"derivations": [{"drv_path": "/nix/store/abc...-hello.drv"}], "priority": 50}' \
-  rio-scheduler:50051 rio.scheduler.SchedulerService/SubmitBuild
+grpcurl -plaintext -d '{"nodes": [{"drv_path": "/nix/store/abc...-hello.drv", "system": "x86_64-linux"}], "priority_class": "ci", "tenant_name": "ci-team"}' \
+  rio-scheduler:9001 rio.scheduler.SchedulerService/SubmitBuild
 ```
 
 (rio-cli has no `submit` subcommand --- use `nix build --store ssh-ng://…` for
