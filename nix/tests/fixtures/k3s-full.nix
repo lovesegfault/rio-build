@@ -472,7 +472,15 @@ let
       "d /var/lib/kubelet/seccomp/operator 0755 root root -"
       "C /var/lib/kubelet/seccomp/operator/rio-builder.json 0644 root root - ${../../nixos-node/seccomp/rio-builder.json}"
       "C /var/lib/kubelet/seccomp/operator/rio-fetcher.json 0644 root root - ${../../nixos-node/seccomp/rio-fetcher.json}"
-    ];
+    ]
+    # Belt-and-suspenders for coverage mode: pre-empt kubelet's
+    # DirectoryOrCreate (which creates 0755 root:root) so the cov
+    # hostPath is world-writable regardless of pod UID. The helm
+    # chart's rio.podSecurityContext sets runAsUser: 0 under
+    # coverage (the primary fix), but image-UID drift would
+    # silently re-break profraw flush without this — tmpfiles runs
+    # at boot, before k3s.
+    ++ pkgs.lib.optional coverage "d /var/lib/rio/cov 0777 root root -";
   };
 
   # ── v6-only k3s node overlay ────────────────────────────────────────

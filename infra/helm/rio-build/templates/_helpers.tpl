@@ -155,14 +155,18 @@ readOnlyRootFilesystem. UID 65532 = distroless nonroot; nix/docker.nix
 sets config.User to match so `docker run` without k8s also runs
 unprivileged.
 
-Self-guarded on NOT coverage.enabled: coverage mode mounts a hostPath
-at /var/lib/rio/cov for LLVM profraw collection. hostPath is NOT
-subject to fsGroup (k8s docs: "fsGroup ignored for hostPath"), so
-a UID-65532 process can't write to root-owned /var/lib/rio/cov →
-profraw atexit flush fails EACCES → zero coverage. Under coverage
-mode the k3s-full fixture overrides namespaces.{system,store}.psa
-to privileged (k3s-full.nix optionalAttrs coverage block) so the
-unguarded pod is still admitted.
+Coverage branch: explicit runAsUser/runAsGroup: 0. Coverage mode
+mounts a hostPath at /var/lib/rio/cov for LLVM profraw collection.
+hostPath is NOT subject to fsGroup (k8s docs: "fsGroup ignored for
+hostPath"), so a UID-65532 process can't write to root-owned
+/var/lib/rio/cov → profraw atexit flush fails EACCES → zero coverage.
+Omitting securityContext entirely does NOT yield root: the runtime
+falls back to the IMAGE's config.User (65532, baked in nix/docker.nix
+nonrootUser), so the EACCES persists. Explicit runAsUser: 0 overrides
+the image. The k3s-full fixture sets namespaces.{system,store}.psa
+to privileged under coverage (k3s-full.nix optionalAttrs coverage
+block) so the root pod is admitted, and pre-creates /var/lib/rio/cov
+0777 via tmpfiles as belt-and-suspenders.
 
 rio.podSecurityContext goes at spec.template.spec (pod-level);
 rio.containerSecurityContext at spec.template.spec.containers[]
@@ -171,7 +175,11 @@ at pod level, allowPrivilegeEscalation/capabilities/readOnlyRoot at
 container level.
 */}}
 {{- define "rio.podSecurityContext" -}}
-{{- if not .Values.coverage.enabled }}
+{{- if .Values.coverage.enabled }}
+securityContext:
+  runAsUser: 0
+  runAsGroup: 0
+{{- else }}
 securityContext:
   runAsNonRoot: true
   runAsUser: 65532

@@ -120,10 +120,25 @@ def main() -> int:
             else:
                 have[name] = path
 
+    empty: list[str] = []
     for name, path in sorted(have.items()):
+        # Defense-in-depth: mkPerTestLcov emits a 0-byte $out when a VM
+        # scenario collected zero profraws. Uploading that gives a
+        # Codecov-side async processing error (ingested, then rejected
+        # as unparseable). The known-empty scenarios are excluded from
+        # ciMatrix.coverage in flake.nix; this catches future
+        # regressions before they hit Codecov.
+        if os.path.getsize(path) == 0:
+            print(
+                f"::warning title=empty lcov::{name}: 0-byte lcov "
+                "(no profraws collected) — skipping upload"
+            )
+            empty.append(name)
+            continue
         upload(name, path)
 
-    print(f"::notice::uploaded {len(have)}/{n} coverage flags")
+    uploaded = len(have) - len(empty)
+    print(f"::notice::uploaded {uploaded}/{n} coverage flags")
     if missing:
         gone = " ".join(sorted(missing))
         print(f"::warning::not uploaded (missing from cache): {gone}")

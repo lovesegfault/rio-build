@@ -824,7 +824,13 @@ rec {
                 # Unlike standalone, kubectl deletes ALL rio pods at
                 # once → concurrent SIGTERM → no ordering issue.
                 #
-                # CRITICAL: `kubectl delete deploy,sts --wait=true`
+                # Jobs included so still-running builder pods get
+                # SIGTERM'd too — scenarios that spawn long-sleep
+                # builders (componentscaler/netpol) would otherwise
+                # leave them running and the wait-for-delete below
+                # times out without ever signalling them.
+                #
+                # CRITICAL: `kubectl delete deploy,sts,job --wait=true`
                 # waits only for the DEPLOYMENT object to be gone.
                 # Pods are still terminating when it returns. The
                 # `kubectl wait --for=delete pods` below blocks until
@@ -837,13 +843,31 @@ rec {
                 # test runs).
                 n.execute(
                     "[ -f /etc/rancher/k3s/k3s.yaml ] && {"
-                    "  k3s kubectl delete deploy,sts -A "
+                    "  k3s kubectl delete deploy,sts,job -A "
                     "    -l 'app.kubernetes.io/part-of=rio-build' "
                     "    --wait=true --timeout=60s 2>/dev/null;"
                     "  k3s kubectl wait --for=delete pods -A "
                     "    -l 'app.kubernetes.io/part-of=rio-build' "
                     "    --timeout=60s 2>/dev/null;"
                     "} || true"
+                )
+                # The k3s server runs at least one control-plane pod;
+                # zero pod profraws here means the silent EACCES is
+                # back (image config.User=65532 vs root-owned 0755
+                # hostPath; see rio.podSecurityContext in
+                # _helpers.tpl). Hard-fail at the point of collection
+                # rather than emit a 0-byte lcov that surfaces only as
+                # a Codecov-side processing error. Agent/client nodes
+                # (no kubeconfig) skip the assert.
+                out = n.succeed(
+                    "if [ -f /etc/rancher/k3s/k3s.yaml ]; then "
+                    "  ls /var/lib/rio/cov/rio-*.profraw 2>/dev/null | wc -l; "
+                    "else echo skip; fi"
+                ).strip()
+                assert out == "skip" or int(out) > 0, (
+                    f"{n.name}: zero pod profraws after graceful delete - "
+                    f"EACCES on hostPath? image User=65532 vs root-owned "
+                    f"0755 dir? (see _helpers.tpl rio.podSecurityContext)"
                 )
                 # Empty tarball if dir doesn't exist (e.g., client node
                 # runs no rio services).
