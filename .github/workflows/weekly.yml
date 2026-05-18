@@ -10,9 +10,6 @@ permissions:
   contents: read
   id-token: write   # OIDC → niks3
 
-env:
-  NIKS3_URL: http://niks3.niks3.svc.cluster.local:5751
-
 jobs:
   # Multi-Nix golden conformance matrix: 4 daemon variants × the
   # golden_conformance test suite. See docs/spec/system/verification.typ
@@ -35,9 +32,6 @@ jobs:
           # locked nixpkgs; bump nixpkgs separately to test newer
           # versions. Dev+CI use the same locked nixpkgs.
           nix build .#golden-matrix --print-build-logs
-      - uses: ./.github/actions/niks3-push
-        if: always() && !cancelled()
-
   # Mutation testing — ~320 scoped mutations × per-mutant nextest
   # run. Missed-count (survived mutants) is the trend metric; the
   # job does NOT fail on nonzero. See docs/spec/system/verification.typ
@@ -68,5 +62,3 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           head -50 result/mutants.out/missed.txt >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-      - uses: ./.github/actions/niks3-push
-        if: always() && !cancelled()

@@ -14,7 +14,6 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  NIKS3_URL: http://niks3.niks3.svc.cluster.local:5751
   # Flake attr prefix for CI targets. See flake.nix githubActions.
   GHA: githubActions
 
@@ -60,9 +59,6 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-nix
       - run: nix build ".#${GHA}.matrix.checks.${{ matrix.name }}" --print-build-logs
-      - uses: ./.github/actions/niks3-push
-        if: always() && !cancelled()
-
   fuzz:
     name: fuzz / ${{ matrix.name }}
     needs: gen-matrix
@@ -77,9 +73,6 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-nix
       - run: nix build ".#${GHA}.matrix.fuzz.${{ matrix.name }}" --print-build-logs
-      - uses: ./.github/actions/niks3-push
-        if: always() && !cancelled()
-
   vm-test:
     name: vm / ${{ matrix.name }}
     needs: gen-matrix
@@ -98,9 +91,6 @@ jobs:
       - name: Verify KVM
         run: '[[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]'
       - run: nix build ".#${GHA}.matrix.vm-test.${{ matrix.name }}" --print-build-logs
-      - uses: ./.github/actions/niks3-push
-        if: always() && !cancelled()
-
   coverage:
     name: coverage / ${{ matrix.name }}
     needs: gen-matrix
@@ -134,9 +124,6 @@ jobs:
           fail_ci_if_error: true
           # `files:` is exhaustive; don't fall back to repo-wide discovery.
           disable_search: true
-      - uses: ./.github/actions/niks3-push
-        if: always() && !cancelled()
-
   # Single stable name for branch protection. Dynamic matrices
   # mean individual entry names change as tests are added/removed —
   # marking them required would break. This job fans-in and succeeds

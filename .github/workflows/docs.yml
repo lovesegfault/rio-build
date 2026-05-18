@@ -4,7 +4,7 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# id-token: build job needs OIDC for niks3-push; deploy job needs OIDC
+# id-token: build job needs OIDC for niks3; deploy job needs OIDC
 # for Pages. pages:write is scoped to the deploy job only.
 permissions:
   contents: read
@@ -13,9 +13,6 @@ permissions:
 concurrency:
   group: pages
   cancel-in-progress: true
-
-env:
-  NIKS3_URL: http://niks3.niks3.svc.cluster.local:5751
 
 jobs:
   build:
@@ -34,8 +31,6 @@ jobs:
       # symbol-dedup, dyn-render JS strip, 404.html). The .bin output
       # (miniserve wrapper) isn't built or needed here.
       - run: nix build .#docs --print-build-logs
-      - uses: ./.github/actions/niks3-push
-        if: always() && !cancelled()
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: result

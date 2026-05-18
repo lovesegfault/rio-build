@@ -153,34 +153,6 @@
         "type": "github"
       }
     },
-    "niks3": {
-      "inputs": {
-        "flake-parts": [
-          "flake-parts"
-        ],
-        "nixpkgs": [
-          "nixpkgs"
-        ],
-        "process-compose": [],
-        "treefmt-nix": [
-          "treefmt-nix"
-        ]
-      },
-      "locked": {
-        "lastModified": 1771012035,
-        "narHash": "sha256-zskaX55kGzbFFO0UGwTsOpALEzPTSIycgbrQRurlVz8=",
-        "owner": "Mic92",
-        "repo": "niks3",
-        "rev": "bb87dcb1b46a1f0c9426b733f4fe325245e386fa",
-        "type": "github"
-      },
-      "original": {
-        "owner": "Mic92",
-        "ref": "v1.4.0",
-        "repo": "niks3",
-        "type": "github"
-      }
-    },
     "nix": {
       "inputs": {
         "flake-compat": [
@@ -277,7 +249,6 @@
         "flake-compat": "flake-compat",
         "flake-parts": "flake-parts",
         "git-hooks-nix": "git-hooks-nix",
-        "niks3": "niks3",
         "nix": "nix",
         "nixhelm": "nixhelm",
         "nixpkgs": "nixpkgs",

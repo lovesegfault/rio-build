@@ -91,21 +91,6 @@
     };
 
     # Self-hosted binary cache push CLI. Pinned in flake.lock;
-    # included in githubActions.build so the first CI job pushes
-    # it to rio-nix-cache → subsequent jobs substitute from S3
-    # in-region (fast, no curl/GitHub-cache round-trip).
-    niks3 = {
-      url = "github:Mic92/niks3/v1.4.0";
-      inputs = {
-        nixpkgs.follows = "nixpkgs";
-        flake-parts.follows = "flake-parts";
-        treefmt-nix.follows = "treefmt-nix";
-        # process-compose isn't a dep of the package build path;
-        # stubbing it drops the lock node without adding a real input.
-        process-compose.follows = "";
-      };
-    };
-
     # Helm charts as Nix derivations (FODs — hash-pinned, cached). The
     # bitnami PG subchart + rook-ceph operator + cluster charts come from
     # here. Alternative was vendoring .tgz into git (ugly) or hand-rolling
@@ -1121,11 +1106,6 @@
               }
               // coverage.perTestLcov;
             };
-            # niks3 CLI for cache pushes. niks3-push action builds
-            # this via `nix build --print-out-paths` and includes
-            # the store path in its push — so the first job to
-            # complete uploads it to S3, subsequent jobs substitute.
-            inherit (inputs.niks3.packages.${system}) niks3;
             # Parallel evaluator for gen-matrix's cache-aware filter
             # (.github/scripts/gen-matrix.sh). Pinned via nixpkgs so
             # the JSONL schema gen-matrix's jq depends on is stable.
