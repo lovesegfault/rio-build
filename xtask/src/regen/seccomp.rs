@@ -2,7 +2,7 @@
 //!
 //! Moby's default.json has conditional blocks keyed on capabilities.
 //! Flatten for the caps the worker HAS, remove the syscalls we deny
-//! (per security.typ r[builder.seccomp.localhost-profile]), then diff.
+//! (per security.typ r[builder.seccomp.localhost-profile+2]), then diff.
 //!
 //! The flattening is approximate — moby's format has arch-specific
 //! blocks, minKernel conditionals. Produces a diff for HUMAN REVIEW.
@@ -20,7 +20,7 @@ const PROFILE_PATH: &str = "nix/nixos-node/seccomp/rio-builder.json";
 const WORKER_CAPS: &[&str] = &["CAP_SYS_ADMIN", "CAP_SYS_CHROOT"];
 
 /// Syscalls the builder profile MUST NOT allow (per security.typ
-/// r[builder.seccomp.localhost-profile]). Single source of truth —
+/// r[builder.seccomp.localhost-profile+2]). Single source of truth —
 /// `regen seccomp` strips these from the moby diff baseline, and
 /// `lint seccomp-allowlist` asserts they're absent from the checked-in
 /// profile's ALLOW blocks.

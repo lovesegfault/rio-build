@@ -398,6 +398,8 @@ fn helm_sla() -> Result<()> {
 /// profile *files* stay at `nix/nixos-node/seccomp/`; they're
 /// deployment config consumed by `hardening.nix`, `k3s-full.nix`, and
 /// `xtask regen seccomp`.
+// r[verify builder.seccomp.localhost-profile+2]
+// r[verify fetcher.sandbox.strict-seccomp]
 fn seccomp_allowlist() -> Result<()> {
     // Worker-critical syscalls — must be present in an ALLOW block. If
     // any of these regress the worker can't mount overlayfs / set up

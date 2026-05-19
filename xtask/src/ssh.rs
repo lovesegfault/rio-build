@@ -22,7 +22,7 @@ use crate::config::XtaskConfig;
 /// session (see `r[gw.jwt.issue]`).
 pub const DEFAULT_TENANT: &str = "default";
 
-// r[impl sched.tenant.resolve]
+// r[impl sched.tenant.resolve+2]
 /// Read, validate, and comment-adjust the user's SSH pubkey.
 ///
 /// `ssh-key` refuses to parse private keys as public, so the bash's
@@ -156,7 +156,7 @@ mod tests {
         (dir, cfg)
     }
 
-    // r[verify sched.tenant.resolve]
+    // r[verify sched.tenant.resolve+2]
     #[test]
     fn authorized_keys_default_tenant() {
         let (_d, cfg) = cfg_with_key(None);
