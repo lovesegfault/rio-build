@@ -417,6 +417,68 @@ impl DagActor {
         });
     }
 
+    /// Record which execution each interested build observed for
+    /// `drv_hash`, so the dashboard's build view (and `rio-cli
+    /// derivations <build-id>`) can fetch the *exact* `drv_logs` row
+    /// instead of falling back to "latest exec for this drv" — which
+    /// can be wrong after a retry or a later build's rebuild of the
+    /// same drv.
+    ///
+    /// Best-effort, fire-and-forget — a failed write degrades the
+    /// dashboard's build view to the latest-exec fallback, not a hard
+    /// error. The same shape as the event-log GC and `build_samples`
+    /// inserts: spawned (not awaited in the actor loop) so a slow PG
+    /// can't stall the next command.
+    ///
+    /// Called from `handle_success_completion` and
+    /// `terminal_failure_epilogue`, the two terminal paths where an
+    /// execution actually ran. NOT called from cascaded
+    /// `DependencyFailed`, `Cancelled`, or `Skipped` — those drvs
+    /// didn't execute, `state.exec_id` is `None` for them, and
+    /// `build_derivations.exec_id` stays `NULL` so consumers fall back
+    /// to latest-exec resolution.
+    ///
+    /// No-op (silent) when `state.exec_id` or `state.db_id` is `None` —
+    /// the former for never-dispatched drvs (shouldn't reach this
+    /// terminal path; defensive), the latter for nodes whose merge tx
+    /// hasn't committed (impossible here — merge commits before any
+    /// dispatch — but cheap to guard).
+    ///
+    /// r[impl sched.merge.exec-correlation]
+    pub(super) fn record_exec_correlation(&self, drv_hash: &DrvHash, interested_builds: &[Uuid]) {
+        let Some(state) = self.dag.node(drv_hash) else {
+            return;
+        };
+        let (Some(exec_id), Some(derivation_id)) = (state.exec_id, state.db_id) else {
+            return;
+        };
+        if interested_builds.is_empty() {
+            return;
+        }
+        let builds: Vec<Uuid> = interested_builds.to_vec();
+        let pool = self.db.pool().clone();
+        rio_common::task::spawn_monitored("exec-correlation", async move {
+            if let Err(e) = sqlx::query(
+                "UPDATE build_derivations SET exec_id = $1 \
+                 WHERE derivation_id = $2 AND build_id = ANY($3)",
+            )
+            .bind(exec_id)
+            .bind(derivation_id)
+            .bind(&builds)
+            .execute(&pool)
+            .await
+            {
+                warn!(
+                    exec_id = %exec_id,
+                    derivation_id = %derivation_id,
+                    error = %e,
+                    "exec-correlation update failed (best-effort; dashboard \
+                     falls back to latest-exec)"
+                );
+            }
+        });
+    }
+
     /// Seal the log ring buffer for `drv_hash` so late `LogBatch`
     /// pushes (still in flight on the BuildExecution stream after the
     /// worker sent CompletionReport) cannot recreate an entry the

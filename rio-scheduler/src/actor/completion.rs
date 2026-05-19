@@ -1054,6 +1054,12 @@ impl DagActor {
         // transition() above.
         self.seal_log_buffer(drv_hash);
         self.trigger_log_flush(drv_hash, "succeeded");
+        // Record which execution each interested build observed, so the
+        // dashboard build view can fetch this exact `drv_logs` row
+        // instead of falling back to latest-exec (wrong after a retry
+        // or a later rebuild of the same drv). Best-effort, spawned —
+        // see record_exec_correlation. r[impl sched.merge.exec-correlation]
+        self.record_exec_correlation(drv_hash, &interested_builds);
         let _ = &mut t_phase;
         let total = t_total.elapsed();
         // IA-branch parity with the CA `info!` in `ca_insert_realisations`:
@@ -1866,6 +1872,13 @@ impl DagActor {
         // transition builds to terminal and schedule cleanup).
         let trigger_builds = self.get_interested_builds(drv_hash);
         self.trigger_log_flush(drv_hash, "failed");
+        // Record which execution each interested build observed. The
+        // trigger set (not the cascaded union) is correct here: a
+        // cascaded `DependencyFailed` parent never executed, so its
+        // `state.exec_id` is `None` and `build_derivations.exec_id`
+        // stays `NULL` for it (consumers fall back to latest-exec).
+        // r[impl sched.merge.exec-correlation]
+        self.record_exec_correlation(drv_hash, &trigger_builds);
         let trigger_path = self.dag.path_or_hash_fallback(drv_hash);
         for build_id in &trigger_builds {
             // r[impl gw.activity.progress-before-stop]

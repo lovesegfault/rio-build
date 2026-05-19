@@ -3377,3 +3377,94 @@ async fn test_infra_retry_cap_uniform_across_reasons(
     );
     Ok(())
 }
+
+/// `build_derivations.exec_id` is set on `Completed` to the `exec_id`
+/// the build actually observed for this derivation, so the dashboard
+/// build view (and `rio-cli derivations <build-id>`) can fetch the
+/// exact `drv_logs` row instead of falling back to "latest exec for
+/// this drv" — which is wrong after a retry or a later build's rebuild
+/// of the same drv.
+///
+/// Uses the `exec_id` from the `WorkAssignment` (the wire carrier) as
+/// the expected value — that's the same UUIDv7 minted in
+/// `assign_to_worker` and stamped on `DerivationState`,
+/// `assignments.exec_id`, and the `LogBuffers` ring buffer entry. The
+/// completion handler reads `state.exec_id`; if any carrier disagrees
+/// this test would catch it as a mismatch.
+///
+/// The write is fire-and-forget (`spawn_monitored`), so the test polls
+/// PG with the established 10ms × 100 pattern rather than asserting
+/// immediately after `barrier()` (which only drains the actor loop, not
+/// background tasks).
+// r[verify sched.merge.exec-correlation]
+#[tokio::test]
+async fn completion_records_build_exec_correlation() -> TestResult {
+    let (db, handle, _task, mut stream_rx) = setup_with_worker("ec-worker", "x86_64-linux").await?;
+
+    let build_id = Uuid::new_v4();
+    let node = make_node("ec-drv");
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    // Dispatch happened — capture the minted exec_id from the wire
+    // carrier. This is the same UUIDv7 stamped on `state.exec_id` that
+    // the completion handler will read.
+    let assignment = recv_assignment(&mut stream_rx).await;
+    let expected_exec: Uuid = assignment
+        .exec_id
+        .parse()
+        .expect("WorkAssignment.exec_id must be a UUID after dispatch");
+
+    // Precondition: build_derivations.exec_id is NULL before completion
+    // (set on terminal, not on dispatch). Asserting the precondition
+    // makes the post-completion check non-vacuous.
+    let pre: Option<Uuid> = sqlx::query_scalar(
+        "SELECT bd.exec_id FROM build_derivations bd \
+         JOIN derivations d ON d.derivation_id = bd.derivation_id \
+         WHERE bd.build_id = $1 AND d.drv_path = $2",
+    )
+    .bind(build_id)
+    .bind(test_drv_path("ec-drv"))
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        pre, None,
+        "exec_id NULL before completion (set on terminal)"
+    );
+
+    complete_success(
+        &handle,
+        "ec-worker",
+        &test_drv_path("ec-drv"),
+        &test_store_path("ec-out"),
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Poll PG: the exec-correlation write is spawned (fire-and-forget),
+    // so it's not done when barrier() returns. Established 10ms × 100
+    // pattern (see helpers::wait_for_status); the write is one UPDATE
+    // and should land within a few ticks.
+    let mut got: Option<Uuid> = None;
+    for _ in 0..100 {
+        got = sqlx::query_scalar(
+            "SELECT bd.exec_id FROM build_derivations bd \
+             JOIN derivations d ON d.derivation_id = bd.derivation_id \
+             WHERE bd.build_id = $1 AND d.drv_path = $2",
+        )
+        .bind(build_id)
+        .bind(test_drv_path("ec-drv"))
+        .fetch_one(&db.pool)
+        .await?;
+        if got.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        got,
+        Some(expected_exec),
+        "build_derivations.exec_id records the execution this build \
+         observed (the WorkAssignment.exec_id sent at dispatch)"
+    );
+    Ok(())
+}
