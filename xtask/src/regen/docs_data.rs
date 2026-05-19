@@ -594,20 +594,40 @@ fn helm_ns() -> Result<serde_json::Value> {
     Ok(json!(out))
 }
 
+/// Read each binary crate's committed `tests/fixtures/config-schema.json`
+/// snapshot (`{"schema": <schema_for! output>, "defaults": <Config::default()>}`)
+/// and flatten into the typst-facing rows. The fixtures are kept fresh by
+/// the per-crate `config_schema_frozen` snapshot test
+/// (`rio_test_support::config_schema_frozen!`) — xtask never compiles the
+/// binary crates, so editing `rio-gateway/src/` doesn't rebuild xtask.
 fn config() -> Result<serde_json::Value> {
+    let root = repo_root();
     let mut components = serde_json::Map::new();
-    macro_rules! component {
-        ($name:literal, $ty:ty) => {{
-            let schema = schemars::schema_for!($ty);
-            let defaults = serde_json::to_value(<$ty>::default())?;
-            components.insert($name.into(), flatten_schema(schema, &defaults));
-        }};
+    for (name, crate_dir) in [
+        ("gateway", "rio-gateway"),
+        ("scheduler", "rio-scheduler"),
+        ("store", "rio-store"),
+        ("builder", "rio-builder"),
+        ("controller", "rio-controller"),
+    ] {
+        let path = root
+            .join(crate_dir)
+            .join("tests/fixtures/config-schema.json");
+        let raw: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).with_context(|| {
+                format!(
+                    "read {} (regenerate: BLESS=1 cargo nextest run -E 'test(config_schema_frozen)')",
+                    path.display()
+                )
+            })?)?;
+        let schema = raw
+            .get("schema")
+            .with_context(|| format!("{}: missing `schema` key", path.display()))?;
+        let defaults = raw
+            .get("defaults")
+            .with_context(|| format!("{}: missing `defaults` key", path.display()))?;
+        components.insert(name.into(), flatten_schema(schema, defaults));
     }
-    component!("gateway", rio_gateway::config::Config);
-    component!("scheduler", rio_scheduler::config::Config);
-    component!("store", rio_store::config::Config);
-    component!("builder", rio_builder::config::Config);
-    component!("controller", rio_controller::config::Config);
     Ok(json!({"components": components}))
 }
 
@@ -615,11 +635,10 @@ fn config() -> Result<serde_json::Value> {
 /// `{key, type, default, description}` rows for the typst config
 /// reference. Nested objects (`UpstreamAddrs`, `JwtConfig`, …) flatten
 /// as `parent.child` keys; `#[serde(flatten)]` (CommonConfig) inlines
-/// at the parent level (schemars already does that). `defaults` is
-/// `serde_json::to_value(Config::default())` — schemars doesn't
+/// at the parent level (schemars already does that). `defaults` is the
+/// fixture's `serde_json::to_value(Config::default())` — schemars doesn't
 /// capture `#[serde(default)]` values, so they're zipped in by key.
-fn flatten_schema(schema: schemars::Schema, defaults: &serde_json::Value) -> serde_json::Value {
-    let root = schema.as_value();
+fn flatten_schema(root: &serde_json::Value, defaults: &serde_json::Value) -> serde_json::Value {
     // schemars 1.x puts referenced sub-schemas under `$defs` keyed by
     // the bare type name (e.g., `UpstreamAddrs`). `$ref` values are
     // `#/$defs/<name>`.

@@ -5,6 +5,121 @@
     "rio-nix-fuzz": "rio-nix-fuzz"
   },
   "crates": {
+    "adler2": {
+      "crateName": "adler2",
+      "version": "2.0.1",
+      "edition": "2021",
+      "sha256": "1ymy18s9hs7ya1pjc9864l30wk8p2qfqdi7mhhcc5nfakxbij09j",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Jonas Schievink <jonasschievink@gmail.com>",
+        "oyvindln <oyvindln@users.noreply.github.com>"
+      ]
+    },
+    "aead": {
+      "crateName": "aead",
+      "version": "0.5.2",
+      "edition": "2021",
+      "sha256": "1c32aviraqag7926xcb9sybdm36v5vh9gnxpn4pxdwjc50zl28ni",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "crypto-common",
+          "packageId": "crypto-common 0.1.7"
+        },
+        {
+          "name": "generic-array",
+          "packageId": "generic-array"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "RustCrypto Developers"
+      ]
+    },
+    "aes": {
+      "crateName": "aes",
+      "version": "0.8.4",
+      "edition": "2021",
+      "sha256": "1853796anlwp4kqim0s6wm1srl4ib621nm0cl2h3c8klsjkgfsdi",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "cfg-if",
+          "packageId": "cfg-if"
+        },
+        {
+          "name": "cipher",
+          "packageId": "cipher"
+        },
+        {
+          "name": "cpufeatures",
+          "packageId": "cpufeatures 0.2.17",
+          "target": "cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\", target_arch = \"x86\"))"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "RustCrypto Developers"
+      ]
+    },
+    "aes-gcm": {
+      "crateName": "aes-gcm",
+      "version": "0.10.3",
+      "edition": "2021",
+      "sha256": "1lgaqgg1gh9crg435509lqdhajg1m2vgma6f7fdj1qa2yyh10443",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "aead",
+          "packageId": "aead"
+        },
+        {
+          "name": "aes",
+          "packageId": "aes"
+        },
+        {
+          "name": "cipher",
+          "packageId": "cipher"
+        },
+        {
+          "name": "ctr",
+          "packageId": "ctr"
+        },
+        {
+          "name": "ghash",
+          "packageId": "ghash"
+        },
+        {
+          "name": "subtle",
+          "packageId": "subtle"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "aes"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "RustCrypto Developers"
+      ]
+    },
     "ahash": {
       "crateName": "ahash",
       "version": "0.8.12",
@@ -620,6 +735,30 @@
         "RustCrypto Developers"
       ]
     },
+    "block-padding": {
+      "crateName": "block-padding",
+      "version": "0.3.3",
+      "edition": "2021",
+      "sha256": "14wdad0r1qk5gmszxqd8cky6vx8qg7c153jv981mixzrpzmlz2d8",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "generic-array",
+          "packageId": "generic-array"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "RustCrypto Developers"
+      ]
+    },
     "bumpalo": {
       "crateName": "bumpalo",
       "version": "3.20.2",
@@ -706,6 +845,31 @@
         "Michal 'vorner' Vaner <vorner@vorner.cz>"
       ]
     },
+    "cbc": {
+      "crateName": "cbc",
+      "version": "0.1.2",
+      "edition": "2021",
+      "sha256": "19l9y9ccv1ffg6876hshd123f2f8v7zbkc4nkckqycxf8fajmd96",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "cipher",
+          "packageId": "cipher"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "block-padding",
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "RustCrypto Developers"
+      ]
+    },
     "cc": {
       "crateName": "cc",
       "version": "1.2.57",
@@ -773,6 +937,64 @@
         "Zicklag <zicklag@katharostech.com>"
       ]
     },
+    "chacha20": {
+      "crateName": "chacha20",
+      "version": "0.9.1",
+      "edition": "2021",
+      "sha256": "0678wipx6kghp71hpzhl2qvx80q7caz3vm8vsvd07b1fpms3yqf3",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "cfg-if",
+          "packageId": "cfg-if"
+        },
+        {
+          "name": "cipher",
+          "packageId": "cipher"
+        },
+        {
+          "name": "cpufeatures",
+          "packageId": "cpufeatures 0.2.17",
+          "target": "cfg(any(target_arch = \"x86_64\", target_arch = \"x86\"))"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "RustCrypto Developers"
+      ]
+    },
+    "cipher": {
+      "crateName": "cipher",
+      "version": "0.4.4",
+      "edition": "2021",
+      "sha256": "1b9x9agg67xq5nq879z66ni4l08m6m3hqcshk37d4is4ysd3ngvp",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "crypto-common",
+          "packageId": "crypto-common 0.1.7"
+        },
+        {
+          "name": "inout",
+          "packageId": "inout"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "block-padding"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "RustCrypto Developers"
+      ]
+    },
     "cmake": {
       "crateName": "cmake",
       "version": "0.1.57",
@@ -807,6 +1029,37 @@
       ],
       "authors": [
         "RustCrypto Developers"
+      ]
+    },
+    "combine": {
+      "crateName": "combine",
+      "version": "4.6.7",
+      "edition": "2018",
+      "sha256": "1z8rh8wp59gf8k23ar010phgs0wgf5i8cx4fg01gwcnzfn5k0nms",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
+          "name": "memchr",
+          "packageId": "memchr"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc",
+        "bytes",
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Markus Westerlind <marwes91@gmail.com>"
       ]
     },
     "concurrent-queue": {
@@ -1139,6 +1392,27 @@
       "resolvedDefaultFeatures": [
         "getrandom",
         "rand_core"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "RustCrypto Developers"
+      ]
+    },
+    "ctr": {
+      "crateName": "ctr",
+      "version": "0.9.2",
+      "edition": "2021",
+      "sha256": "0d88b73waamgpfjdml78icxz45d95q7vi2aqa604b0visqdfws83",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "cipher",
+          "packageId": "cipher"
+        }
       ],
       "libCrateTypes": [
         "lib"
@@ -2737,6 +3011,31 @@
         "The Rand Project Developers"
       ]
     },
+    "ghash": {
+      "crateName": "ghash",
+      "version": "0.5.1",
+      "edition": "2021",
+      "sha256": "1wbg4vdgzwhkpkclz1g6bs4r5x984w5gnlsj4q5wnafb5hva9n7h",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "opaque-debug",
+          "packageId": "opaque-debug"
+        },
+        {
+          "name": "polyval",
+          "packageId": "polyval"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "RustCrypto Developers"
+      ]
+    },
     "gloo-timers": {
       "crateName": "gloo-timers",
       "version": "0.3.0",
@@ -3947,6 +4246,35 @@
         "lib"
       ]
     },
+    "inout": {
+      "crateName": "inout",
+      "version": "0.1.4",
+      "edition": "2021",
+      "sha256": "008xfl1jn9rxsq19phnhbimccf4p64880jmnpg59wqi07kk117w7",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "block-padding",
+          "packageId": "block-padding"
+        },
+        {
+          "name": "generic-array",
+          "packageId": "generic-array"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "block-padding",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "RustCrypto Developers"
+      ]
+    },
     "ipnet": {
       "crateName": "ipnet",
       "version": "2.12.0",
@@ -4152,6 +4480,141 @@
       ],
       "authors": [
         "Andrew Gallant <jamslam@gmail.com>"
+      ]
+    },
+    "jni": {
+      "crateName": "jni",
+      "version": "0.22.4",
+      "edition": "2024",
+      "sha256": "161lza8gz071h22pgyqyx4n91ixd691z2dbb1pq2g97k5i49mzay",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "cfg-if",
+          "packageId": "cfg-if"
+        },
+        {
+          "name": "combine",
+          "packageId": "combine"
+        },
+        {
+          "name": "jni-macros",
+          "packageId": "jni-macros"
+        },
+        {
+          "name": "jni-sys",
+          "packageId": "jni-sys"
+        },
+        {
+          "name": "log",
+          "packageId": "log"
+        },
+        {
+          "name": "simd_cesu8",
+          "packageId": "simd_cesu8"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        },
+        {
+          "name": "windows-link",
+          "packageId": "windows-link",
+          "target": "cfg(windows)"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "walkdir",
+          "packageId": "walkdir"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "jni team"
+      ]
+    },
+    "jni-macros": {
+      "crateName": "jni-macros",
+      "version": "0.22.4",
+      "edition": "2024",
+      "sha256": "18v02mcn5c7mb2yw6r930xg6ynsn7hwkxv8z2kdhn3qprjn0j0d0",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "proc-macro2",
+          "packageId": "proc-macro2"
+        },
+        {
+          "name": "quote",
+          "packageId": "quote"
+        },
+        {
+          "name": "simd_cesu8",
+          "packageId": "simd_cesu8"
+        },
+        {
+          "name": "syn",
+          "packageId": "syn"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "rustc_version",
+          "packageId": "rustc_version"
+        }
+      ],
+      "procMacro": true
+    },
+    "jni-sys": {
+      "crateName": "jni-sys",
+      "version": "0.4.1",
+      "edition": "2021",
+      "sha256": "1wlahx6f2zhczdjqyn8mk7kshb8x5vsd927sn3lvw41rrf47ldy6",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "jni-sys-macros",
+          "packageId": "jni-sys-macros"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Steven Fackler <sfackler@gmail.com>",
+        "Robert Bragg <robert@sixbynine.org>"
+      ]
+    },
+    "jni-sys-macros": {
+      "crateName": "jni-sys-macros",
+      "version": "0.4.1",
+      "edition": "2021",
+      "sha256": "0r32gbabrak15a7p487765b5wc0jcna2yv88mk6m1zjqyi1bkh1q",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "quote",
+          "packageId": "quote"
+        },
+        {
+          "name": "syn",
+          "packageId": "syn"
+        }
+      ],
+      "procMacro": true,
+      "authors": [
+        "Robert Bragg <robert@sixbynine.org>"
       ]
     },
     "jobserver": {
@@ -5055,6 +5518,21 @@
         "The Rust Project Developers"
       ]
     },
+    "lru-slab": {
+      "crateName": "lru-slab",
+      "version": "0.1.2",
+      "edition": "2021",
+      "sha256": "0m2139k466qj3bnpk66bwivgcx3z88qkxvlzk70vd65jq373jaqi",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Benjamin Saunders <ben.e.saunders@gmail.com>"
+      ]
+    },
     "matchers": {
       "crateName": "matchers",
       "version": "0.2.0",
@@ -5248,6 +5726,38 @@
       ],
       "authors": [
         "Sean McArthur <sean@seanmonstar.com>"
+      ]
+    },
+    "miniz_oxide": {
+      "crateName": "miniz_oxide",
+      "version": "0.8.9",
+      "edition": "2021",
+      "sha256": "05k3pdg8bjjzayq3rf0qhpirq9k37pxnasfn4arbs17phqn6m9qz",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "adler2",
+          "packageId": "adler2"
+        },
+        {
+          "name": "simd-adler32",
+          "packageId": "simd-adler32"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "simd",
+        "simd-adler32",
+        "with-alloc"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Frommi <daniil.liferenko@gmail.com>",
+        "oyvindln <oyvindln@users.noreply.github.com>",
+        "Rich Geldreich richgel99@gmail.com"
       ]
     },
     "mio": {
@@ -5585,6 +6095,21 @@
       ],
       "authors": [
         "Aleksey Kladov <aleksey.kladov@gmail.com>"
+      ]
+    },
+    "opaque-debug": {
+      "crateName": "opaque-debug",
+      "version": "0.3.1",
+      "edition": "2018",
+      "sha256": "10b3w0kydz5jf1ydyli5nv10gdfp97xh79bgz327d273bs46b3f0",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "RustCrypto Developers"
       ]
     },
     "openssl-probe": {
@@ -6076,6 +6601,70 @@
         "jzr"
       ]
     },
+    "poly1305": {
+      "crateName": "poly1305",
+      "version": "0.8.0",
+      "edition": "2021",
+      "sha256": "1grs77skh7d8vi61ji44i8gpzs3r9x7vay50i6cg8baxfa8bsnc1",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "cpufeatures",
+          "packageId": "cpufeatures 0.2.17",
+          "target": "cfg(any(target_arch = \"x86_64\", target_arch = \"x86\"))"
+        },
+        {
+          "name": "opaque-debug",
+          "packageId": "opaque-debug"
+        },
+        {
+          "name": "universal-hash",
+          "packageId": "universal-hash"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "RustCrypto Developers"
+      ]
+    },
+    "polyval": {
+      "crateName": "polyval",
+      "version": "0.6.2",
+      "edition": "2021",
+      "sha256": "09gs56vm36ls6pyxgh06gw2875z2x77r8b2km8q28fql0q6yc7wx",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "cfg-if",
+          "packageId": "cfg-if"
+        },
+        {
+          "name": "cpufeatures",
+          "packageId": "cpufeatures 0.2.17",
+          "target": "cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\", target_arch = \"x86\"))"
+        },
+        {
+          "name": "opaque-debug",
+          "packageId": "opaque-debug"
+        },
+        {
+          "name": "universal-hash",
+          "packageId": "universal-hash"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "RustCrypto Developers"
+      ]
+    },
     "portable-atomic": {
       "crateName": "portable-atomic",
       "version": "1.13.1",
@@ -6358,6 +6947,203 @@
       ],
       "authors": [
         "Toby Lawrence <toby@nuclearfurnace.com>"
+      ]
+    },
+    "quinn": {
+      "crateName": "quinn",
+      "version": "0.11.9",
+      "edition": "2021",
+      "sha256": "086gzj666dr3slmlynkvxlndy28hahgl361d6bf93hk3i6ahmqmr",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
+          "name": "pin-project-lite",
+          "packageId": "pin-project-lite"
+        },
+        {
+          "name": "quinn-proto",
+          "packageId": "quinn-proto",
+          "rename": "proto"
+        },
+        {
+          "name": "quinn-udp",
+          "packageId": "quinn-udp",
+          "rename": "udp"
+        },
+        {
+          "name": "rustc-hash",
+          "packageId": "rustc-hash"
+        },
+        {
+          "name": "rustls",
+          "packageId": "rustls"
+        },
+        {
+          "name": "socket2",
+          "packageId": "socket2",
+          "target": "cfg(not(all(target_family = \"wasm\", target_os = \"unknown\")))"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        },
+        {
+          "name": "web-time",
+          "packageId": "web-time",
+          "target": "cfg(all(target_family = \"wasm\", target_os = \"unknown\"))"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "cfg_aliases",
+          "packageId": "cfg_aliases"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "aws-lc-rs",
+        "runtime-tokio",
+        "rustls-aws-lc-rs"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "quinn-proto": {
+      "crateName": "quinn-proto",
+      "version": "0.11.14",
+      "edition": "2021",
+      "sha256": "1660jkxhzi1pnywzs13ifczwrlv6ds9qds111vsnxjciqpz44js3",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "aws-lc-rs",
+          "packageId": "aws-lc-rs"
+        },
+        {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
+          "name": "getrandom",
+          "packageId": "getrandom 0.3.4",
+          "target": "cfg(all(target_family = \"wasm\", target_os = \"unknown\"))"
+        },
+        {
+          "name": "lru-slab",
+          "packageId": "lru-slab"
+        },
+        {
+          "name": "rand",
+          "packageId": "rand 0.9.2"
+        },
+        {
+          "name": "ring",
+          "packageId": "ring",
+          "target": "cfg(all(target_family = \"wasm\", target_os = \"unknown\"))"
+        },
+        {
+          "name": "rustc-hash",
+          "packageId": "rustc-hash"
+        },
+        {
+          "name": "rustls",
+          "packageId": "rustls"
+        },
+        {
+          "name": "rustls-pki-types",
+          "packageId": "rustls-pki-types",
+          "target": "cfg(all(target_family = \"wasm\", target_os = \"unknown\"))"
+        },
+        {
+          "name": "slab",
+          "packageId": "slab"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        },
+        {
+          "name": "tinyvec",
+          "packageId": "tinyvec"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        },
+        {
+          "name": "web-time",
+          "packageId": "web-time",
+          "target": "cfg(all(target_family = \"wasm\", target_os = \"unknown\"))"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "aws-lc-rs",
+        "rustls-aws-lc-rs"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "quinn-udp": {
+      "crateName": "quinn-udp",
+      "version": "0.5.14",
+      "edition": "2021",
+      "sha256": "1gacawr17a2zkyri0r3m0lc9spzmxbq1by3ilyb8v2mdvjhcdpmd",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "libc",
+          "packageId": "libc"
+        },
+        {
+          "name": "once_cell",
+          "packageId": "once_cell",
+          "target": "cfg(windows)"
+        },
+        {
+          "name": "socket2",
+          "packageId": "socket2",
+          "target": "cfg(not(all(target_family = \"wasm\", target_os = \"unknown\")))"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        },
+        {
+          "name": "windows-sys",
+          "packageId": "windows-sys 0.52.0",
+          "target": "cfg(windows)"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "cfg_aliases",
+          "packageId": "cfg_aliases"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "tracing"
+      ],
+      "libCrateTypes": [
+        "lib"
       ]
     },
     "quote": {
@@ -6916,6 +7702,177 @@
         "Andrew Gallant <jamslam@gmail.com>"
       ]
     },
+    "reqwest": {
+      "crateName": "reqwest",
+      "version": "0.13.3",
+      "edition": "2021",
+      "sha256": "1h7fgnllk7ihw7836b7z73h9fb5vk90y3irvcm0ysan2l8g05q32",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "base64",
+          "packageId": "base64"
+        },
+        {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
+          "name": "futures-core",
+          "packageId": "futures-core"
+        },
+        {
+          "name": "futures-util",
+          "packageId": "futures-util"
+        },
+        {
+          "name": "http",
+          "packageId": "http 1.4.0"
+        },
+        {
+          "name": "http-body",
+          "packageId": "http-body 1.0.1",
+          "target": "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))"
+        },
+        {
+          "name": "http-body-util",
+          "packageId": "http-body-util",
+          "target": "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))"
+        },
+        {
+          "name": "hyper",
+          "packageId": "hyper",
+          "target": "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))"
+        },
+        {
+          "name": "hyper-rustls",
+          "packageId": "hyper-rustls",
+          "target": "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))"
+        },
+        {
+          "name": "hyper-util",
+          "packageId": "hyper-util",
+          "target": "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))"
+        },
+        {
+          "name": "js-sys",
+          "packageId": "js-sys",
+          "target": "cfg(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\")))"
+        },
+        {
+          "name": "log",
+          "packageId": "log",
+          "target": "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))"
+        },
+        {
+          "name": "percent-encoding",
+          "packageId": "percent-encoding",
+          "target": "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))"
+        },
+        {
+          "name": "pin-project-lite",
+          "packageId": "pin-project-lite",
+          "target": "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))"
+        },
+        {
+          "name": "rustls",
+          "packageId": "rustls",
+          "target": "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))"
+        },
+        {
+          "name": "rustls-pki-types",
+          "packageId": "rustls-pki-types",
+          "target": "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))"
+        },
+        {
+          "name": "rustls-platform-verifier",
+          "packageId": "rustls-platform-verifier",
+          "target": "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        },
+        {
+          "name": "sync_wrapper",
+          "packageId": "sync_wrapper"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio",
+          "target": "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))"
+        },
+        {
+          "name": "tokio-rustls",
+          "packageId": "tokio-rustls",
+          "target": "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))"
+        },
+        {
+          "name": "tokio-util",
+          "packageId": "tokio-util",
+          "target": "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))"
+        },
+        {
+          "name": "tower",
+          "packageId": "tower",
+          "target": "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))"
+        },
+        {
+          "name": "tower-http",
+          "packageId": "tower-http",
+          "target": "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))"
+        },
+        {
+          "name": "tower-service",
+          "packageId": "tower-service",
+          "target": "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))"
+        },
+        {
+          "name": "url",
+          "packageId": "url"
+        },
+        {
+          "name": "wasm-bindgen",
+          "packageId": "wasm-bindgen",
+          "target": "cfg(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\")))"
+        },
+        {
+          "name": "wasm-bindgen-futures",
+          "packageId": "wasm-bindgen-futures",
+          "target": "cfg(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\")))"
+        },
+        {
+          "name": "wasm-streams",
+          "packageId": "wasm-streams",
+          "target": "cfg(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\")))"
+        },
+        {
+          "name": "web-sys",
+          "packageId": "web-sys",
+          "target": "cfg(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\")))"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "__rustls",
+        "__rustls-aws-lc-rs",
+        "__tls",
+        "json",
+        "rustls",
+        "stream"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sean McArthur <sean@seanmonstar.com>"
+      ]
+    },
     "ring": {
       "crateName": "ring",
       "version": "0.17.14",
@@ -6962,7 +7919,8 @@
       "resolvedDefaultFeatures": [
         "alloc",
         "default",
-        "dev_urandom_fallback"
+        "dev_urandom_fallback",
+        "wasm32_unknown_unknown_js"
       ],
       "libCrateTypes": [
         "lib"
@@ -7092,6 +8050,25 @@
           "name": "wire_primitives",
           "path": "fuzz_targets/wire_primitives.rs"
         }
+      ]
+    },
+    "rustc-hash": {
+      "crateName": "rustc-hash",
+      "version": "2.1.2",
+      "edition": "2021",
+      "sha256": "1gjdc5bw9982cj176jvgz9rrqf9xvr1q1ddpzywf5qhs7yzhlc4l",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "The Rust Project Developers"
       ]
     },
     "rustc_version": {
@@ -7273,6 +8250,11 @@
       },
       "dependencies": [
         {
+          "name": "web-time",
+          "packageId": "web-time",
+          "target": "cfg(all(target_family = \"wasm\", target_os = \"unknown\"))"
+        },
+        {
           "name": "zeroize",
           "packageId": "zeroize"
         }
@@ -7280,8 +8262,112 @@
       "resolvedDefaultFeatures": [
         "alloc",
         "default",
-        "std"
+        "std",
+        "web",
+        "web-time"
       ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "rustls-platform-verifier": {
+      "crateName": "rustls-platform-verifier",
+      "version": "0.7.0",
+      "edition": "2021",
+      "sha256": "181v4d0vl53vdh2wq56vghal1zyhdgqvy4xa8r45zwz4di9y5l96",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "core-foundation",
+          "packageId": "core-foundation",
+          "target": "cfg(any(target_vendor = \"apple\"))"
+        },
+        {
+          "name": "core-foundation-sys",
+          "packageId": "core-foundation-sys",
+          "target": "cfg(any(target_vendor = \"apple\"))"
+        },
+        {
+          "name": "jni",
+          "packageId": "jni",
+          "target": "cfg(target_os = \"android\")"
+        },
+        {
+          "name": "log",
+          "packageId": "log"
+        },
+        {
+          "name": "once_cell",
+          "packageId": "once_cell",
+          "target": "cfg(target_os = \"android\")"
+        },
+        {
+          "name": "rustls",
+          "packageId": "rustls"
+        },
+        {
+          "name": "rustls-native-certs",
+          "packageId": "rustls-native-certs",
+          "target": "cfg(all(unix, not(target_os = \"android\"), not(target_vendor = \"apple\"), not(target_arch = \"wasm32\")))"
+        },
+        {
+          "name": "rustls-platform-verifier-android",
+          "packageId": "rustls-platform-verifier-android",
+          "target": "cfg(target_os = \"android\")"
+        },
+        {
+          "name": "rustls-webpki",
+          "packageId": "rustls-webpki",
+          "rename": "webpki",
+          "target": "cfg(all(unix, not(target_os = \"android\"), not(target_vendor = \"apple\"), not(target_arch = \"wasm32\")))"
+        },
+        {
+          "name": "rustls-webpki",
+          "packageId": "rustls-webpki",
+          "rename": "webpki",
+          "target": "cfg(target_arch = \"wasm32\")"
+        },
+        {
+          "name": "rustls-webpki",
+          "packageId": "rustls-webpki",
+          "rename": "webpki",
+          "target": "cfg(target_os = \"android\")"
+        },
+        {
+          "name": "security-framework",
+          "packageId": "security-framework",
+          "target": "cfg(any(target_vendor = \"apple\"))"
+        },
+        {
+          "name": "security-framework-sys",
+          "packageId": "security-framework-sys",
+          "target": "cfg(any(target_vendor = \"apple\"))"
+        },
+        {
+          "name": "webpki-root-certs",
+          "packageId": "webpki-root-certs",
+          "target": "cfg(target_arch = \"wasm32\")"
+        },
+        {
+          "name": "windows-sys",
+          "packageId": "windows-sys 0.61.2",
+          "target": "cfg(windows)"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "rustls-platform-verifier-android": {
+      "crateName": "rustls-platform-verifier-android",
+      "version": "0.1.1",
+      "edition": "2021",
+      "sha256": "13vq6sxsgz9547xm2zbdxiw8x7ad1g8n8ax6xvxsjqszk7q6awgq",
+      "source": {
+        "type": "crates-io"
+      },
       "libCrateTypes": [
         "lib"
       ]
@@ -7351,6 +8437,28 @@
       ],
       "authors": [
         "David Tolnay <dtolnay@gmail.com>"
+      ]
+    },
+    "same-file": {
+      "crateName": "same-file",
+      "version": "1.0.6",
+      "edition": "2018",
+      "sha256": "00h5j1w87dmhnvbv9l8bic3y7xxsnjmssvifw2ayvgx9mb1ivz4k",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "winapi-util",
+          "packageId": "winapi-util",
+          "target": "cfg(windows)"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Andrew Gallant <jamslam@gmail.com>"
       ]
     },
     "schannel": {
@@ -7550,6 +8658,10 @@
           "name": "libc",
           "packageId": "libc"
         }
+      ],
+      "resolvedDefaultFeatures": [
+        "OSX_10_13",
+        "default"
       ],
       "libCrateTypes": [
         "lib"
@@ -8085,6 +9197,70 @@
       ],
       "authors": [
         "RustCrypto Developers"
+      ]
+    },
+    "simd-adler32": {
+      "crateName": "simd-adler32",
+      "version": "0.3.9",
+      "edition": "2018",
+      "sha256": "0532ysdwcvzyp2bwpk8qz0hijplcdwpssr5gy5r7qwqqy5z5qgbh",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Marvin Countryman <me@maar.vin>"
+      ]
+    },
+    "simd_cesu8": {
+      "crateName": "simd_cesu8",
+      "version": "1.1.1",
+      "edition": "2021",
+      "sha256": "0crcbgvyycmazji2vqj9vxn2czdyl3gxmicp4xqdzkc7pdbh3ycl",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "simdutf8",
+          "packageId": "simdutf8"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "rustc_version",
+          "packageId": "rustc_version"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sean C. Roach <me@seancroach.dev>"
+      ]
+    },
+    "simdutf8": {
+      "crateName": "simdutf8",
+      "version": "0.1.5",
+      "edition": "2018",
+      "sha256": "0vmpf7xaa0dnaikib5jlx6y4dxd3hxqz6l830qb079g7wcsgxag3",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Hans Kratz <hans@appfour.com>"
       ]
     },
     "sketches-ddsketch": {
@@ -8647,6 +9823,109 @@
         "Austin Bonander <austin.bonander@gmail.com>",
         "Chloe Ross <orangesnowfox@gmail.com>",
         "Daniel Akhterov <akhterovd@gmail.com>"
+      ]
+    },
+    "ssh-cipher": {
+      "crateName": "ssh-cipher",
+      "version": "0.2.0",
+      "edition": "2021",
+      "sha256": "0kvq113x9fcy2jcxp00xk472zxm8d9zxxz2vyqx3rlzh88ki7b6a",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "aes",
+          "packageId": "aes"
+        },
+        {
+          "name": "aes-gcm",
+          "packageId": "aes-gcm"
+        },
+        {
+          "name": "cbc",
+          "packageId": "cbc"
+        },
+        {
+          "name": "chacha20",
+          "packageId": "chacha20"
+        },
+        {
+          "name": "cipher",
+          "packageId": "cipher"
+        },
+        {
+          "name": "ctr",
+          "packageId": "ctr"
+        },
+        {
+          "name": "poly1305",
+          "packageId": "poly1305"
+        },
+        {
+          "name": "ssh-encoding",
+          "packageId": "ssh-encoding",
+          "rename": "encoding"
+        },
+        {
+          "name": "subtle",
+          "packageId": "subtle"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "aes-cbc",
+        "aes-ctr",
+        "aes-gcm",
+        "chacha20poly1305"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "RustCrypto Developers"
+      ]
+    },
+    "ssh-encoding": {
+      "crateName": "ssh-encoding",
+      "version": "0.2.0",
+      "edition": "2021",
+      "sha256": "05aavlhk68vm60vbw8lcgx1p5wry367ck8niij7af221xywl54pb",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "base64ct",
+          "packageId": "base64ct",
+          "rename": "base64"
+        },
+        {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
+          "name": "pem-rfc7468",
+          "packageId": "pem-rfc7468",
+          "rename": "pem"
+        },
+        {
+          "name": "sha2",
+          "packageId": "sha2 0.10.9"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc",
+        "base64",
+        "bytes",
+        "pem",
+        "sha2",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "RustCrypto Developers"
       ]
     },
     "stable_deref_trait": {
@@ -10134,6 +11413,31 @@
         "Manish Goregaokar <manishsmail@gmail.com>"
       ]
     },
+    "universal-hash": {
+      "crateName": "universal-hash",
+      "version": "0.5.1",
+      "edition": "2021",
+      "sha256": "1sh79x677zkncasa95wz05b36134822w6qxmi1ck05fwi33f47gw",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "crypto-common",
+          "packageId": "crypto-common 0.1.7"
+        },
+        {
+          "name": "subtle",
+          "packageId": "subtle"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "RustCrypto Developers"
+      ]
+    },
     "unsafe-libyaml": {
       "crateName": "unsafe-libyaml",
       "version": "0.2.11",
@@ -10343,6 +11647,32 @@
         "lib"
       ]
     },
+    "walkdir": {
+      "crateName": "walkdir",
+      "version": "2.5.0",
+      "edition": "2018",
+      "sha256": "0jsy7a710qv8gld5957ybrnc07gavppp963gs32xk4ag8130jy99",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "same-file",
+          "packageId": "same-file"
+        },
+        {
+          "name": "winapi-util",
+          "packageId": "winapi-util",
+          "target": "cfg(windows)"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Andrew Gallant <jamslam@gmail.com>"
+      ]
+    },
     "want": {
       "crateName": "want",
       "version": "0.3.1",
@@ -10467,6 +11797,53 @@
       "resolvedDefaultFeatures": [
         "default",
         "msrv",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "The wasm-bindgen Developers"
+      ]
+    },
+    "wasm-bindgen-futures": {
+      "crateName": "wasm-bindgen-futures",
+      "version": "0.4.64",
+      "edition": "2021",
+      "sha256": "1f3xnr40wwims4zhvh119dhwmffz4h4x82cffi118ri878mm5ig9",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "cfg-if",
+          "packageId": "cfg-if"
+        },
+        {
+          "name": "futures-util",
+          "packageId": "futures-util"
+        },
+        {
+          "name": "js-sys",
+          "packageId": "js-sys"
+        },
+        {
+          "name": "once_cell",
+          "packageId": "once_cell"
+        },
+        {
+          "name": "wasm-bindgen",
+          "packageId": "wasm-bindgen"
+        },
+        {
+          "name": "web-sys",
+          "packageId": "web-sys",
+          "target": "cfg(target_feature = \"atomics\")"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "futures-util",
         "std"
       ],
       "libCrateTypes": [
@@ -10618,6 +11995,44 @@
         "lib"
       ]
     },
+    "wasm-streams": {
+      "crateName": "wasm-streams",
+      "version": "0.5.0",
+      "edition": "2021",
+      "sha256": "1fqbcx33w8ys5i5dv3p28a82g4yiclmhn80fcfp137kwa7vc87lx",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "futures-util",
+          "packageId": "futures-util"
+        },
+        {
+          "name": "js-sys",
+          "packageId": "js-sys"
+        },
+        {
+          "name": "wasm-bindgen",
+          "packageId": "wasm-bindgen"
+        },
+        {
+          "name": "wasm-bindgen-futures",
+          "packageId": "wasm-bindgen-futures"
+        },
+        {
+          "name": "web-sys",
+          "packageId": "web-sys"
+        }
+      ],
+      "libCrateTypes": [
+        "cdylib",
+        "rlib"
+      ],
+      "authors": [
+        "Mattias Buelens <mattias@buelens.com>"
+      ]
+    },
     "wasmparser": {
       "crateName": "wasmparser",
       "version": "0.244.0",
@@ -10678,9 +12093,48 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "AbortController",
+        "AbortSignal",
+        "Blob",
+        "BlobPropertyBag",
+        "Event",
         "EventTarget",
+        "File",
+        "FormData",
+        "Headers",
+        "MessageEvent",
         "Performance",
+        "QueuingStrategy",
+        "ReadableByteStreamController",
+        "ReadableStream",
+        "ReadableStreamByobReader",
+        "ReadableStreamByobRequest",
+        "ReadableStreamDefaultController",
+        "ReadableStreamDefaultReader",
+        "ReadableStreamGetReaderOptions",
+        "ReadableStreamReadResult",
+        "ReadableStreamReaderMode",
+        "ReadableStreamType",
+        "ReadableWritablePair",
+        "Request",
+        "RequestCache",
+        "RequestCredentials",
+        "RequestInit",
+        "RequestMode",
+        "Response",
+        "ServiceWorkerGlobalScope",
+        "StreamPipeOptions",
+        "TransformStream",
+        "TransformStreamDefaultController",
+        "Transformer",
+        "UnderlyingSink",
+        "UnderlyingSource",
         "Window",
+        "Worker",
+        "WorkerGlobalScope",
+        "WritableStream",
+        "WritableStreamDefaultController",
+        "WritableStreamDefaultWriter",
         "default",
         "std"
       ],
@@ -10689,6 +12143,49 @@
       ],
       "authors": [
         "The wasm-bindgen Developers"
+      ]
+    },
+    "web-time": {
+      "crateName": "web-time",
+      "version": "1.1.0",
+      "edition": "2021",
+      "sha256": "1fx05yqx83dhx628wb70fyy10yjfq1jpl20qfqhdkymi13rq0ras",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "js-sys",
+          "packageId": "js-sys",
+          "target": "cfg(all(target_family = \"wasm\", target_os = \"unknown\"))"
+        },
+        {
+          "name": "wasm-bindgen",
+          "packageId": "wasm-bindgen",
+          "target": "cfg(all(target_family = \"wasm\", target_os = \"unknown\"))"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "webpki-root-certs": {
+      "crateName": "webpki-root-certs",
+      "version": "1.0.7",
+      "edition": "2021",
+      "sha256": "0b59x5mzsilk42w59nif3lfhc24pgzb0v35pi6p01qy37z7424gk",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "rustls-pki-types",
+          "packageId": "rustls-pki-types",
+          "rename": "pki_types"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
       ]
     },
     "webpki-roots 0.26.11": {
@@ -10798,6 +12295,28 @@
         "Peter Atashian <retep998@gmail.com>"
       ]
     },
+    "winapi-util": {
+      "crateName": "winapi-util",
+      "version": "0.1.11",
+      "edition": "2021",
+      "sha256": "08hdl7mkll7pz8whg869h58c1r9y7in0w0pk8fm24qc77k0b39y2",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "windows-sys",
+          "packageId": "windows-sys 0.61.2",
+          "target": "cfg(windows)"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Andrew Gallant <jamslam@gmail.com>"
+      ]
+    },
     "winapi-x86_64-pc-windows-gnu": {
       "crateName": "winapi-x86_64-pc-windows-gnu",
       "version": "0.4.0",
@@ -10870,7 +12389,10 @@
       "resolvedDefaultFeatures": [
         "Win32",
         "Win32_Foundation",
+        "Win32_Networking",
+        "Win32_Networking_WinSock",
         "Win32_System",
+        "Win32_System_IO",
         "Win32_System_Threading",
         "default"
       ],
@@ -11628,6 +13150,10 @@
           "packageId": "bytes"
         },
         {
+          "name": "cipher",
+          "packageId": "cipher"
+        },
+        {
           "name": "crossbeam-epoch",
           "packageId": "crossbeam-epoch"
         },
@@ -11755,6 +13281,10 @@
           "packageId": "indexmap"
         },
         {
+          "name": "inout",
+          "packageId": "inout"
+        },
+        {
           "name": "jiff",
           "packageId": "jiff"
         },
@@ -11793,6 +13323,16 @@
         {
           "name": "metrics-util",
           "packageId": "metrics-util"
+        },
+        {
+          "name": "miniz_oxide",
+          "packageId": "miniz_oxide",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "miniz_oxide",
+          "packageId": "miniz_oxide",
+          "target": "x86_64-unknown-linux-gnu"
         },
         {
           "name": "nix",
@@ -11879,6 +13419,10 @@
           "packageId": "regex-syntax"
         },
         {
+          "name": "reqwest",
+          "packageId": "reqwest"
+        },
+        {
           "name": "rustls",
           "packageId": "rustls"
         },
@@ -11945,6 +13489,14 @@
         {
           "name": "sqlx-sqlite",
           "packageId": "sqlx-sqlite"
+        },
+        {
+          "name": "ssh-cipher",
+          "packageId": "ssh-cipher"
+        },
+        {
+          "name": "ssh-encoding",
+          "packageId": "ssh-encoding"
         },
         {
           "name": "subtle",
@@ -12069,12 +13621,24 @@
       ],
       "buildDependencies": [
         {
+          "name": "ahash",
+          "packageId": "ahash"
+        },
+        {
           "name": "aws-lc-rs",
           "packageId": "aws-lc-rs"
         },
         {
+          "name": "aws-smithy-types",
+          "packageId": "aws-smithy-types"
+        },
+        {
           "name": "base64",
           "packageId": "base64"
+        },
+        {
+          "name": "base64ct",
+          "packageId": "base64ct"
         },
         {
           "name": "bitflags",
@@ -12099,6 +13663,14 @@
           "packageId": "cc"
         },
         {
+          "name": "cipher",
+          "packageId": "cipher"
+        },
+        {
+          "name": "crossbeam-epoch",
+          "packageId": "crossbeam-epoch"
+        },
+        {
           "name": "crossbeam-utils",
           "packageId": "crossbeam-utils"
         },
@@ -12108,17 +13680,43 @@
           "rename": "crypto_common_c65f7effa3be6d31"
         },
         {
+          "name": "crypto-common",
+          "packageId": "crypto-common 0.2.1",
+          "rename": "crypto_common_6f8ce4dd05d13bba"
+        },
+        {
+          "name": "ctutils",
+          "packageId": "ctutils"
+        },
+        {
+          "name": "der",
+          "packageId": "der"
+        },
+        {
           "name": "digest",
           "packageId": "digest 0.10.7",
           "rename": "digest_93f6ce9d446188ac"
+        },
+        {
+          "name": "digest",
+          "packageId": "digest 0.11.2",
+          "rename": "digest_a6292c17cd707f01"
         },
         {
           "name": "either",
           "packageId": "either"
         },
         {
+          "name": "event-listener-strategy",
+          "packageId": "event-listener-strategy"
+        },
+        {
           "name": "fastrand",
           "packageId": "fastrand"
+        },
+        {
+          "name": "futures",
+          "packageId": "futures"
         },
         {
           "name": "futures-channel",
@@ -12147,15 +13745,13 @@
         },
         {
           "name": "getrandom",
-          "packageId": "getrandom 0.4.2",
-          "rename": "getrandom_9fbad63c4bcf4a8f",
-          "target": "aarch64-unknown-linux-gnu"
+          "packageId": "getrandom 0.3.4",
+          "rename": "getrandom_468e82937335b1c9"
         },
         {
           "name": "getrandom",
           "packageId": "getrandom 0.4.2",
-          "rename": "getrandom_9fbad63c4bcf4a8f",
-          "target": "x86_64-unknown-linux-gnu"
+          "rename": "getrandom_9fbad63c4bcf4a8f"
         },
         {
           "name": "hashbrown",
@@ -12163,18 +13759,71 @@
           "rename": "hashbrown_3575ec1268b04181"
         },
         {
+          "name": "hashbrown",
+          "packageId": "hashbrown 0.16.1",
+          "rename": "hashbrown_986da7b5efc2b80e"
+        },
+        {
+          "name": "hybrid-array",
+          "packageId": "hybrid-array"
+        },
+        {
+          "name": "hyper",
+          "packageId": "hyper"
+        },
+        {
+          "name": "hyper-rustls",
+          "packageId": "hyper-rustls"
+        },
+        {
+          "name": "hyper-util",
+          "packageId": "hyper-util"
+        },
+        {
+          "name": "hyper-util",
+          "packageId": "hyper-util",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "hyper-util",
+          "packageId": "hyper-util",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
           "name": "indexmap",
           "packageId": "indexmap"
         },
         {
-          "name": "libc",
-          "packageId": "libc",
-          "target": "aarch64-unknown-linux-gnu"
+          "name": "inout",
+          "packageId": "inout"
+        },
+        {
+          "name": "jiff",
+          "packageId": "jiff"
+        },
+        {
+          "name": "k8s-openapi",
+          "packageId": "k8s-openapi"
+        },
+        {
+          "name": "kube",
+          "packageId": "kube"
+        },
+        {
+          "name": "kube-client",
+          "packageId": "kube-client"
+        },
+        {
+          "name": "kube-core",
+          "packageId": "kube-core"
+        },
+        {
+          "name": "lazy_static",
+          "packageId": "lazy_static"
         },
         {
           "name": "libc",
-          "packageId": "libc",
-          "target": "x86_64-unknown-linux-gnu"
+          "packageId": "libc"
         },
         {
           "name": "log",
@@ -12185,6 +13834,38 @@
           "packageId": "memchr"
         },
         {
+          "name": "metrics-util",
+          "packageId": "metrics-util"
+        },
+        {
+          "name": "miniz_oxide",
+          "packageId": "miniz_oxide",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "miniz_oxide",
+          "packageId": "miniz_oxide",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "nix",
+          "packageId": "nix",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "nix",
+          "packageId": "nix",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "num-bigint-dig",
+          "packageId": "num-bigint-dig"
+        },
+        {
+          "name": "num-integer",
+          "packageId": "num-integer"
+        },
+        {
           "name": "num-traits",
           "packageId": "num-traits"
         },
@@ -12193,8 +13874,24 @@
           "packageId": "once_cell"
         },
         {
+          "name": "ordered-float",
+          "packageId": "ordered-float 5.3.0"
+        },
+        {
+          "name": "pem-rfc7468",
+          "packageId": "pem-rfc7468"
+        },
+        {
           "name": "percent-encoding",
           "packageId": "percent-encoding"
+        },
+        {
+          "name": "pkcs8",
+          "packageId": "pkcs8"
+        },
+        {
+          "name": "portable-atomic",
+          "packageId": "portable-atomic"
         },
         {
           "name": "ppv-lite86",
@@ -12205,9 +13902,22 @@
           "packageId": "prost"
         },
         {
+          "name": "quanta",
+          "packageId": "quanta"
+        },
+        {
           "name": "rand",
           "packageId": "rand 0.8.5",
           "rename": "rand_c38e5c1d305a1b54"
+        },
+        {
+          "name": "rand",
+          "packageId": "rand 0.9.2",
+          "rename": "rand_274715c4dabd11b0"
+        },
+        {
+          "name": "rand_chacha",
+          "packageId": "rand_chacha 0.9.0"
         },
         {
           "name": "regex",
@@ -12220,6 +13930,10 @@
         {
           "name": "regex-syntax",
           "packageId": "regex-syntax"
+        },
+        {
+          "name": "reqwest",
+          "packageId": "reqwest"
         },
         {
           "name": "rustls",
@@ -12246,8 +13960,20 @@
           "packageId": "serde_json"
         },
         {
+          "name": "sha1",
+          "packageId": "sha1 0.10.6"
+        },
+        {
           "name": "sha2",
           "packageId": "sha2 0.10.9"
+        },
+        {
+          "name": "signature",
+          "packageId": "signature"
+        },
+        {
+          "name": "sketches-ddsketch",
+          "packageId": "sketches-ddsketch"
         },
         {
           "name": "slab",
@@ -12262,6 +13988,10 @@
           "packageId": "spin"
         },
         {
+          "name": "spki",
+          "packageId": "spki"
+        },
+        {
           "name": "sqlx-core",
           "packageId": "sqlx-core"
         },
@@ -12274,6 +14004,14 @@
           "packageId": "sqlx-sqlite"
         },
         {
+          "name": "ssh-cipher",
+          "packageId": "ssh-cipher"
+        },
+        {
+          "name": "ssh-encoding",
+          "packageId": "ssh-encoding"
+        },
+        {
           "name": "subtle",
           "packageId": "subtle"
         },
@@ -12282,8 +14020,26 @@
           "packageId": "syn"
         },
         {
+          "name": "sync_wrapper",
+          "packageId": "sync_wrapper"
+        },
+        {
           "name": "tokio",
           "packageId": "tokio"
+        },
+        {
+          "name": "tokio-rustls",
+          "packageId": "tokio-rustls"
+        },
+        {
+          "name": "tokio-rustls",
+          "packageId": "tokio-rustls",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "tokio-rustls",
+          "packageId": "tokio-rustls",
+          "target": "x86_64-unknown-linux-gnu"
         },
         {
           "name": "tokio-stream",
@@ -12302,6 +14058,34 @@
           "packageId": "toml_parser"
         },
         {
+          "name": "tower",
+          "packageId": "tower"
+        },
+        {
+          "name": "tower",
+          "packageId": "tower",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "tower",
+          "packageId": "tower",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "tower-http",
+          "packageId": "tower-http"
+        },
+        {
+          "name": "tower-http",
+          "packageId": "tower-http",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "tower-http",
+          "packageId": "tower-http",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
           "name": "tracing",
           "packageId": "tracing"
         },
@@ -12310,12 +14094,21 @@
           "packageId": "tracing-core"
         },
         {
+          "name": "tracing-subscriber",
+          "packageId": "tracing-subscriber"
+        },
+        {
           "name": "typenum",
           "packageId": "typenum"
         },
         {
           "name": "uuid",
           "packageId": "uuid"
+        },
+        {
+          "name": "winnow",
+          "packageId": "winnow 0.7.15",
+          "rename": "winnow_ca01ad9e24f5d932"
         },
         {
           "name": "winnow",
@@ -12329,6 +14122,18 @@
         {
           "name": "zeroize",
           "packageId": "zeroize"
+        },
+        {
+          "name": "zstd",
+          "packageId": "zstd"
+        },
+        {
+          "name": "zstd-safe",
+          "packageId": "zstd-safe"
+        },
+        {
+          "name": "zstd-sys",
+          "packageId": "zstd-sys"
         }
       ],
       "libCrateTypes": [

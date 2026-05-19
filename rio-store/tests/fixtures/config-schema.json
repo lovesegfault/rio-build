@@ -1,0 +1,257 @@
+{
+  "schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "Config",
+    "description": "Configuration fields shared by every rio-* binary's `Config`.\n\nEmbed via `#[serde(flatten)]` so the wire format stays flat:\n`metrics_addr` / `drain_grace_secs` are top-level TOML keys (env\n`RIO_METRICS_ADDR`, `RIO_DRAIN_GRACE_SECS`).\n\n```ignore\n#[derive(Serialize, Deserialize)]\n#[serde(default)]\nstruct Config {\n    listen_addr: String,\n    #[serde(flatten)]\n    common: rio_common::config::CommonConfig,\n    // ...\n}\n```\n\nReplaces the per-binary `metrics_addr` / `drain_grace_secs`\nfields and the byte-identical 8-line `HasCommonConfig` impl that\nprojected them. [`crate::server::bootstrap`] reads this via the\none-method [`crate::server::HasCommonConfig`] trait.\n\n`#[serde(default)]` is required: `flatten` bypasses the outer\nstruct's `#[serde(default)]`, so a TOML that sets only crate-\nspecific fields would otherwise fail with a missing-field error.\nIn production [`load`] always layers `Serialized::defaults`\nfirst so this never fires there, but tests that parse a bare\nTOML snippet (and figment's own internal re-deserialize during\nmerge) need it.",
+    "type": "object",
+    "properties": {
+      "listen_addr": {
+        "description": "gRPC listen address.",
+        "type": "string",
+        "default": "[::]:9002"
+      },
+      "database_url": {
+        "description": "PostgreSQL connection URL. Required.",
+        "type": "string",
+        "default": ""
+      },
+      "metrics_addr": {
+        "description": "Prometheus exporter listen address. Per-binary defaults differ\n(gateway 9090, scheduler 9091, …) so each `Config::default()`\nsets this explicitly via [`CommonConfig::new`].",
+        "type": "string",
+        "default": "[::]:0"
+      },
+      "drain_grace_secs": {
+        "description": "SIGTERM → NOT_SERVING → exit drain window. Gives kubelet\nreadiness probe (periodSeconds: 5) + endpoint propagation time\nto observe before the listener stops. 0 = no drain. Only the\nthree tonic-serving binaries (scheduler/store/gateway) consume\nthis; controller and builder ignore it.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 6
+      },
+      "chunk_backend": {
+        "description": "Where chunks live. Default: inline (no backend). See\n[`ChunkBackendKind`] for TOML syntax.",
+        "$ref": "#/$defs/ChunkBackendKind",
+        "default": {
+          "kind": "inline"
+        }
+      },
+      "chunk_cache_capacity_bytes": {
+        "description": "moka LRU capacity for chunk reads, in bytes. Default 2 GiB.\nOne cache shared by StoreService + ChunkService — a chunk\nwarmed by either is hot for both. Only relevant when\nchunk_backend != inline.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 2147483648
+      },
+      "nar_buffer_budget_bytes": {
+        "description": "Global NAR reassembly buffer budget in bytes — total permits\nacross ALL concurrent PutPath handlers. Each handler acquires\n`chunk.len()` permits before extending its accumulation Vec.\nNone → DEFAULT_NAR_BUDGET (8 × MAX_NAR_SIZE = 32 GiB). Lower\nthis on small-memory nodes; raise it if you have >8 concurrent\nmax-size uploads and RAM to match.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint64",
+        "minimum": 0,
+        "default": null
+      },
+      "signing_key_path": {
+        "description": "ed25519 narinfo signing key path (Nix secret-key format:\n`name:base64-seed`). None = signing disabled (paths stored\nwithout our signature; still serveable, just unverified). The\nkey file should be mode 0600 and NOT in git.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      },
+      "hmac_key_path": {
+        "description": "HMAC key file for verifying assignment tokens on PutPath.\nSAME file as scheduler's `hmac_key_path`. Unset = accept\nall PutPath callers (dev mode).",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      },
+      "jwt": {
+        "description": "JWT verification. `key_path` → ConfigMap mount at\n`/etc/rio/jwt/ed25519_pubkey` (same mount as scheduler — one\ngateway signing key → one pubkey across all verifier services).\nUnset = interceptor inert (dev mode). SIGHUP reloads from the\nsame path. Set via `RIO_JWT__KEY_PATH`.",
+        "$ref": "#/$defs/JwtConfig",
+        "default": {
+          "required": false,
+          "key_path": null
+        }
+      },
+      "service_hmac_key_path": {
+        "description": "HMAC key file for verifying `x-rio-service-token` on PutPath.\nSEPARATE from `hmac_key_path` (different secret). Unset =\nservice-token bypass unavailable; gateway PutPath rejected\nunless `hmac_key_path` is also unset (full dev-mode). Set via\n`RIO_SERVICE_HMAC_KEY_PATH`.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      },
+      "service_bypass_callers": {
+        "description": "`ServiceClaims.caller` values whose `x-rio-service-token` is\nhonoured (PutPath HMAC-bypass and `x-rio-probe-tenant-id` gate).\nDefault: `[\"rio-gateway\", \"rio-scheduler\"]`.",
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": [
+          "rio-gateway",
+          "rio-scheduler"
+        ]
+      },
+      "chunk_upload_max_concurrent": {
+        "description": "Max concurrent S3 chunk uploads per `put_chunked` call.\nDefault 8. Per-replica `r[store.substitute.admission]` bounds\nconcurrent `put_chunked` calls; `substitute_admission_permits\n× this` is the per-replica in-flight PutObject ceiling. Raise\nif the store runs with a larger aws-sdk pool; lower (min 1)\nif you see `DispatchFailure` in store logs during large-NAR\ningest. Set via `RIO_CHUNK_UPLOAD_MAX_CONCURRENT`.",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0,
+        "default": 8
+      },
+      "s3_max_attempts": {
+        "description": "Max aws-sdk retry attempts per S3 operation (PutObject,\nGetObject, HeadObject). Default 10 — raised from the aws-sdk\ndefault of 3 because S3-compatible backends (rustfs, MinIO)\nrecycle connections more aggressively than AWS S3, surfacing\nas transient `DispatchFailure` that the sdk's standard retry\npolicy handles but exhausts at 3. Set via `RIO_S3_MAX_ATTEMPTS`.",
+        "type": "integer",
+        "format": "uint32",
+        "minimum": 0,
+        "default": 10
+      },
+      "max_batch_paths": {
+        "description": "Cap on paths in a FindMissingPaths request (DoS guard).\nDefault 1M — ~80 MB of path strings per request. Set via\n`RIO_MAX_BATCH_PATHS`.",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0,
+        "default": 1048576
+      },
+      "chunk_prefetch_k": {
+        "description": "`GetPath` chunk-prefetch depth (`.buffered(K)`). Cold-cache\nthroughput ceiling is `K × CHUNK_AVG / s3_ttfb`; per-stream\nmemory cost is `K × CHUNK_MAX` (≤ 16 MiB at 64). Default 64.\nSet via `RIO_CHUNK_PREFETCH_K`.",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0,
+        "default": 64
+      },
+      "stream_drain_secs": {
+        "description": "Max time to wait for in-flight `GetPath` body streams to\ncomplete after the drain-grace sleep, before tearing down the\nlistener on SIGTERM. `terminationGracePeriodSeconds` MUST cover\n`drain_grace + stream_drain` + slack, or kubelet SIGKILLs\nmid-wait. Default 90 s. Set via `RIO_STREAM_DRAIN_SECS`.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 90
+      },
+      "pg_max_connections": {
+        "description": "PG connection pool size. Default 50 (was hardcoded 20). The\nQueryPathInfo / FindMissingPaths hot path under autoscaled\nbuilder load (60+ builders × ~100 input paths each at fan-out)\nis bottlenecked on `sqlx::pool::acquire`, not query latency\n(PK lookups). Aurora handles hundreds of connections per\ninstance; raise this with `replicas` for thousands-of-builds\nscale. Set via `RIO_PG_MAX_CONNECTIONS`.",
+        "type": "integer",
+        "format": "uint32",
+        "minimum": 0,
+        "default": 50
+      },
+      "substitute_admission_permits": {
+        "description": "Per-replica cap on concurrent `try_substitute` calls. Excess\nqueue server-side up to `SUBSTITUTE_ADMISSION_WAIT` (25 s),\nthen `RESOURCE_EXHAUSTED` (transient; client retries). Additive\nto `nar_buffer_budget_bytes` — this bounds COUNT, that bounds\nBYTES. `None` (default) derives from the PG pool via\n[`derive_substitute_admission_cap`]: `(pg_max × 3).clamp(64,\n128)`. Env: `RIO_SUBSTITUTE_ADMISSION_PERMITS`.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint",
+        "minimum": 0,
+        "default": null
+      }
+    },
+    "$defs": {
+      "ChunkBackendKind": {
+        "description": "Chunk storage backend selection.\n\nSerde internally-tagged (`kind`): TOML writes\n`[chunk_backend]\\nkind = \"s3\"\\nbucket = \"...\"`. The tag field is\n`kind` not the serde default `type` — `type` is a Rust keyword\nand would need `r#type` everywhere we match on it.\n\nDefault is `Inline`: backward-compatible with existing deployments\nthat have no chunk-backend config. All NARs go into PG\n`manifests.inline_blob` regardless of size. Fine for dev/CI;\nproduction wants `s3` or `filesystem`.",
+        "oneOf": [
+          {
+            "description": "No chunk backend. All NARs inline in PG. ChunkService returns\nFAILED_PRECONDITION.",
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "inline"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          {
+            "description": "Local filesystem. 256-subdir fanout by hash prefix (same layout\nas git objects). `base_dir` is created at startup.",
+            "type": "object",
+            "properties": {
+              "base_dir": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "const": "filesystem"
+              }
+            },
+            "required": [
+              "kind",
+              "base_dir"
+            ]
+          },
+          {
+            "description": "S3-compatible. Credentials come from the aws-sdk's default chain\n(env vars, instance profile, etc) — NOT in this config. We're\nnot putting secrets in a TOML file.",
+            "type": "object",
+            "properties": {
+              "bucket": {
+                "type": "string"
+              },
+              "prefix": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "const": "s3"
+              }
+            },
+            "required": [
+              "kind",
+              "bucket",
+              "prefix"
+            ]
+          }
+        ]
+      },
+      "JwtConfig": {
+        "description": "JWT dual-mode configuration. Nested in each binary's `Config` as\n`jwt: JwtConfig`. Env vars: `RIO_JWT__REQUIRED=true` etc.\n\nDual-mode is PERMANENT: both the JWT path and the SSH-comment\nfallback stay maintained forever. `jwt_required` is the operator's\nper-deployment switch — true = STRICT (reject on mint/verify\nfailure), false = PERMISSIVE (fall back to tenant_name on failure).\n\nGateway interpretation: `required=true` → if ResolveTenant fails or\ntimes out during SSH auth, reject the connection (no JWT can be\nminted → no tenant identity → unauthenticated). `required=false` →\ndegrade to tenant_name-only (jwt_token=None, downstream falls back).\n\nScheduler/store interpretation: handled at the HANDLER level (not\nthe interceptor — the interceptor stays permissive-on-absent-header\nfor workers/health probes regardless). A handler that needs strict\nJWT reads `required` from its own config and checks for Claims\nextension presence.",
+        "type": "object",
+        "properties": {
+          "required": {
+            "description": "true = JWT mint/verify failure → reject. false (default) =\nfall back to SSH-comment tenant_name path.\n\nDefault false: existing deployments (no JWT Secret mounted)\nkeep working. Setting `RIO_JWT__REQUIRED=true` without also\nmounting the signing key → gateway rejects every SSH connect\nat auth time (clear failure, not silent degradation).",
+            "type": "boolean",
+            "default": false
+          },
+          "key_path": {
+            "description": "Path to the ed25519 signing seed (gateway) or pubkey\n(scheduler/store). K8s: Secret mount at\n`/etc/rio/jwt/ed25519_seed` or ConfigMap mount at\n`/etc/rio/jwt/ed25519_pubkey`. `None` → JWT disabled for\nthis process (matches the `Option<SigningKey>` /\n`Option<Arc<RwLock<VerifyingKey>>>` pattern in jwt.rs /\njwt_interceptor.rs).",
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          }
+        }
+      }
+    }
+  },
+  "defaults": {
+    "listen_addr": "[::]:9002",
+    "database_url": "",
+    "metrics_addr": "[::]:9092",
+    "drain_grace_secs": 6,
+    "chunk_backend": {
+      "kind": "inline"
+    },
+    "chunk_cache_capacity_bytes": 2147483648,
+    "nar_buffer_budget_bytes": null,
+    "signing_key_path": null,
+    "hmac_key_path": null,
+    "jwt": {
+      "required": false,
+      "key_path": null
+    },
+    "service_hmac_key_path": null,
+    "service_bypass_callers": [
+      "rio-gateway",
+      "rio-scheduler"
+    ],
+    "chunk_upload_max_concurrent": 8,
+    "s3_max_attempts": 10,
+    "max_batch_paths": 1048576,
+    "chunk_prefetch_k": 64,
+    "stream_drain_secs": 90,
+    "pg_max_connections": 50,
+    "substitute_admission_permits": null
+  }
+}

@@ -145,6 +145,11 @@ let
           fileset = lib.fileset.unions [
             (lib.fileset.fileFilter (f: f.hasExt "rs") ../.)
             (lib.fileset.fileFilter (f: f.name == "Cargo.toml") ../.)
+            # config(): per-crate schema snapshots committed by the
+            # `config_schema_frozen` snapshot tests. Glob (not 5
+            # literal paths) so adding a binary crate is a one-place
+            # change (test file + regen).
+            (lib.fileset.fileFilter (f: f.name == "config-schema.json") ../.)
             ../infra/helm/rio-build/templates/prometheusrule.yaml
             ../infra/helm/rio-build/values.yaml # helm_ns()
             ../rio-proto/proto # protos()

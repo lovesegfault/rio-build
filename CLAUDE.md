@@ -109,6 +109,19 @@ Pre-commit hooks run treefmt automatically on commit.
 - **New migration:** add the SQL, run `cargo test -p rio-migrations --test migrations`, copy the hex-SHA from the `unpinned migration NNN` panic into `PINNED` at `rio-migrations/tests/migrations.rs`, commit both.
 - **Behavior change to a shipped migration:** write a NEW migration. Never edit shipped ones. The checksum-freeze test (`migration_checksums_frozen`) fails CI on any content change.
 
+### Config schemas are committed snapshots
+
+`xtask regen docs-data` reads each binary crate's committed `tests/fixtures/config-schema.json` (a `{"schema": <schema_for!>, "defaults": <Config::default()>}` blob) instead of compiling rio-{gateway,builder,controller,store,scheduler}. The per-crate `tests/config_schema.rs` test (`rio_test_support::config_schema_frozen!`) fails CI when the fixture drifts from `Config`.
+
+When you change a `Config` field (add/remove/rename, change a default, edit a doc comment that flows into the description column):
+
+```bash
+BLESS=1 cargo nextest run -E 'test(config_schema_frozen)'   # rewrites the per-crate fixture(s)
+cargo xtask regen docs-data                                  # re-flattens docs/gen/config.json
+```
+
+Commit BOTH the regenerated fixture(s) AND `docs/gen/config.json`. The `docs-data-fresh` and `nextest-rio-X` checks each catch one half of forgetting.
+
 ## CI gate
 
 **Every change MUST pass `nix-fast-build --flake .#checks.x86_64-linux` before merge.** This is the single gate — it covers per-member clippy, nextest, docs, pre-commit, 2min fuzz, and all VM tests. "Done but CI red" is not done.

@@ -1,0 +1,212 @@
+{
+  "schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "Config",
+    "description": "Configuration fields shared by every rio-* binary's `Config`.\n\nEmbed via `#[serde(flatten)]` so the wire format stays flat:\n`metrics_addr` / `drain_grace_secs` are top-level TOML keys (env\n`RIO_METRICS_ADDR`, `RIO_DRAIN_GRACE_SECS`).\n\n```ignore\n#[derive(Serialize, Deserialize)]\n#[serde(default)]\nstruct Config {\n    listen_addr: String,\n    #[serde(flatten)]\n    common: rio_common::config::CommonConfig,\n    // ...\n}\n```\n\nReplaces the per-binary `metrics_addr` / `drain_grace_secs`\nfields and the byte-identical 8-line `HasCommonConfig` impl that\nprojected them. [`crate::server::bootstrap`] reads this via the\none-method [`crate::server::HasCommonConfig`] trait.\n\n`#[serde(default)]` is required: `flatten` bypasses the outer\nstruct's `#[serde(default)]`, so a TOML that sets only crate-\nspecific fields would otherwise fail with a missing-field error.\nIn production [`load`] always layers `Serialized::defaults`\nfirst so this never fires there, but tests that parse a bare\nTOML snippet (and figment's own internal re-deserialize during\nmerge) need it.",
+    "type": "object",
+    "properties": {
+      "listen_addr": {
+        "description": "SSH listen address and port.",
+        "type": "string",
+        "default": "[::]:2222"
+      },
+      "scheduler": {
+        "description": "rio-scheduler upstream. Env: `RIO_SCHEDULER__ADDR` /\n`RIO_SCHEDULER__BALANCE_HOST` / `RIO_SCHEDULER__BALANCE_PORT`.\n`balance_host = Some` (K8s, multi-replica): DNS-resolve, probe\ngrpc.health.v1, route to SERVING (=leader). `None` (VM tests,\nsingle-replica): single-channel via `addr`. `addr` is still\nrequired even with balance — it's the ClusterIP Service, used\nas the TLS verify domain (the cert's SAN).",
+        "$ref": "#/$defs/UpstreamAddrs",
+        "default": {
+          "addr": "",
+          "balance_host": null,
+          "balance_port": 9001
+        }
+      },
+      "store": {
+        "description": "rio-store upstream. Env: `RIO_STORE__ADDR`. Gateway connects\nsingle-channel only (no `balance_host` — store load is\nbuilder-driven, gateway's QueryPathInfo is light).",
+        "$ref": "#/$defs/UpstreamAddrs",
+        "default": {
+          "addr": "",
+          "balance_host": null,
+          "balance_port": 9002
+        }
+      },
+      "host_key": {
+        "description": "SSH host key file path. Required.",
+        "type": "string",
+        "default": ""
+      },
+      "authorized_keys": {
+        "description": "Authorized SSH public keys file path. Required.",
+        "type": "string",
+        "default": ""
+      },
+      "metrics_addr": {
+        "description": "Prometheus exporter listen address. Per-binary defaults differ\n(gateway 9090, scheduler 9091, …) so each `Config::default()`\nsets this explicitly via [`CommonConfig::new`].",
+        "type": "string",
+        "default": "[::]:0"
+      },
+      "drain_grace_secs": {
+        "description": "SIGTERM → NOT_SERVING → exit drain window. Gives kubelet\nreadiness probe (periodSeconds: 5) + endpoint propagation time\nto observe before the listener stops. 0 = no drain. Only the\nthree tonic-serving binaries (scheduler/store/gateway) consume\nthis; controller and builder ignore it.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 6
+      },
+      "health_addr": {
+        "description": "gRPC health check listen address. The gateway's main protocol is\nSSH (russh), not gRPC, so we can't piggyback health on an\nexisting tonic server. This spawns a dedicated one with ONLY\n`grpc.health.v1.Health`. K8s readinessProbe hits this port.\n\nSeparate from metrics_addr: metrics is HTTP (Prometheus scrape),\nhealth is gRPC. Could multiplex with tonic's accept_http1 +\na route, but that's more complexity than a second listener.",
+        "type": "string",
+        "default": "[::]:9190"
+      },
+      "jwt": {
+        "description": "JWT issuance. `key_path` → K8s Secret mount at\n`/etc/rio/jwt/ed25519_seed` (see helm jwt-signing-secret.yaml).\nUnset = JWT disabled (dual-mode SSH-comment fallback path).\nEnv: `RIO_JWT__KEY_PATH`, `RIO_JWT__REQUIRED`.",
+        "$ref": "#/$defs/JwtConfig",
+        "default": {
+          "required": false,
+          "key_path": null
+        }
+      },
+      "resolve_timeout_ms": {
+        "description": "ResolveTenant RPC timeout in milliseconds (env:\n`RIO_RESOLVE_TIMEOUT_MS`). The round-trip to the\nscheduler happens in the SSH auth hot path — every connect, once.\nBounds the auth-time latency penalty when the scheduler is slow or\nunreachable. Default 500ms: long enough for a warm PG lookup + RPC\noverhead, short enough that a stuck scheduler doesn't make SSH auth\nhang noticeably. On timeout: `jwt.required=false` → degrade to\ntenant_name-only; `jwt.required=true` → reject.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 500
+      },
+      "session_drain_secs": {
+        "description": "Seconds to wait after the SSH accept loop stops for active\nsessions to close on their own. The accept loop only stops\nACCEPTING; already-established `nix build --store ssh-ng://`\nsessions continue until the client EOFs (build finished),\nerrors, or this timeout expires (then process exit kills them).\n\nI-064: previously the gateway dropped `russh`'s accept future on\n`serve_shutdown`, which (via russh's broadcast channel)\ndisconnected EVERY session — a rollout killed all in-flight\nclients with `Nix daemon disconnected unexpectedly`.\n\nk8s `terminationGracePeriodSeconds` must be ≥\n`drain_grace_secs + session_drain_secs + CANCEL_GRACE` + slack,\nor kubelet SIGKILLs mid-drain. Helm sets it. Default 60 — long enough for\na typical `wopBuildPathsWithResults` round-trip on small\nclosures; long builds outlive this and are dropped (client\nretries against the new replica via NLB). 0 = exit immediately\nafter accept stops (pre-I-064 behavior, useful for tests).",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 60
+      },
+      "rate_limit": {
+        "description": "Per-tenant build-submit rate limiting. `None` (default) →\ndisabled (unlimited). Set via `gateway.toml [rate_limit]`\nsection or `RIO_RATE_LIMIT__PER_MINUTE` /\n`RIO_RATE_LIMIT__BURST` env vars. Both fields must be ≥1.\nSee `r[gw.rate.per-tenant]`.",
+        "anyOf": [
+          {
+            "$ref": "#/$defs/RateLimitConfig"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "service_hmac_key_path": {
+        "description": "HMAC key file for minting `x-rio-service-token` on store\n`PutPath`. SAME file as the store's `service_hmac_key_path`\n(separate secret from the assignment-token key). Unset =\nservice-token disabled (store runs unsigned dev-mode\nor rejects). Set via `RIO_SERVICE_HMAC_KEY_PATH`.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      },
+      "max_connections": {
+        "description": "Global SSH connection cap (`r[gw.conn.cap]`). At cap, new\nconnects are rejected at the first `auth_*` callback. Default\n[`crate::server::DEFAULT_MAX_CONNECTIONS`] (1000 —\n≈2 GiB bounded at 4 channels × 2×256 KiB each).",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0,
+        "default": 1000
+      },
+      "max_transitive_inputs": {
+        "description": "DAG-reconstruction cap on transitive input derivations per\nbuild (DoS guard). Default\n[`crate::drv_cache::DEFAULT_MAX_TRANSITIVE_INPUTS`]\n(100k — ~8 MB of path strings). Set via\n`RIO_MAX_TRANSITIVE_INPUTS`.",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0,
+        "default": 1048576
+      }
+    },
+    "$defs": {
+      "UpstreamAddrs": {
+        "description": "Upstream gRPC address triple: a ClusterIP `addr` for single-channel\nmode plus an optional headless-Service `balance_host` for health-\naware p2c. Same shape for scheduler and store; the per-upstream\ndefault `balance_port` differs (9001/9002), set via [`Self::with_port`].\n\nEmbed in each binary's `Config` as a nested field (NOT flattened):\n\n```ignore\nstruct Config {\n    scheduler: UpstreamAddrs,  // env: RIO_SCHEDULER__ADDR / __BALANCE_HOST / __BALANCE_PORT\n    store: UpstreamAddrs,      // env: RIO_STORE__ADDR / ...\n}\n```\n\n`#[serde(default)]` is required: figment merges per-field across\nlayers, so a TOML `[scheduler]` table with only `addr` set must NOT\nfail with `MissingField(\"balance_port\")` — the unspecified fields\nfall through to `Default` (which `Serialized::defaults` populates\nfrom `Config::default()` in production, but bare-TOML tests need\nthe struct-level fallback).\n\n`rio-proto::client::connect` takes this to do the balance-vs-single\ndispatch that was previously open-coded ~40L per binary.",
+        "type": "object",
+        "properties": {
+          "addr": {
+            "description": "ClusterIP Service `host:port`. Required (no compiled default —\ndeployment-specific). Validated via [`Self::ensure_required`].\nAlso the TLS verify domain when `balance_host` is set (cert\nSAN is the Service name, not the pod IP).",
+            "type": "string",
+            "default": ""
+          },
+          "balance_host": {
+            "description": "Headless Service hostname for health-aware p2c. `None` (env\nunset) → single-channel via `addr`. `Some` → DNS-resolve,\nprobe `grpc.health.v1`, route to SERVING endpoints only.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "balance_port": {
+            "description": "gRPC port for balanced-channel pod-IP connects. Only used when\n`balance_host` is `Some`.",
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0,
+            "maximum": 65535,
+            "default": 0
+          }
+        }
+      },
+      "JwtConfig": {
+        "description": "JWT dual-mode configuration. Nested in each binary's `Config` as\n`jwt: JwtConfig`. Env vars: `RIO_JWT__REQUIRED=true` etc.\n\nDual-mode is PERMANENT: both the JWT path and the SSH-comment\nfallback stay maintained forever. `jwt_required` is the operator's\nper-deployment switch — true = STRICT (reject on mint/verify\nfailure), false = PERMISSIVE (fall back to tenant_name on failure).\n\nGateway interpretation: `required=true` → if ResolveTenant fails or\ntimes out during SSH auth, reject the connection (no JWT can be\nminted → no tenant identity → unauthenticated). `required=false` →\ndegrade to tenant_name-only (jwt_token=None, downstream falls back).\n\nScheduler/store interpretation: handled at the HANDLER level (not\nthe interceptor — the interceptor stays permissive-on-absent-header\nfor workers/health probes regardless). A handler that needs strict\nJWT reads `required` from its own config and checks for Claims\nextension presence.",
+        "type": "object",
+        "properties": {
+          "required": {
+            "description": "true = JWT mint/verify failure → reject. false (default) =\nfall back to SSH-comment tenant_name path.\n\nDefault false: existing deployments (no JWT Secret mounted)\nkeep working. Setting `RIO_JWT__REQUIRED=true` without also\nmounting the signing key → gateway rejects every SSH connect\nat auth time (clear failure, not silent degradation).",
+            "type": "boolean",
+            "default": false
+          },
+          "key_path": {
+            "description": "Path to the ed25519 signing seed (gateway) or pubkey\n(scheduler/store). K8s: Secret mount at\n`/etc/rio/jwt/ed25519_seed` or ConfigMap mount at\n`/etc/rio/jwt/ed25519_pubkey`. `None` → JWT disabled for\nthis process (matches the `Option<SigningKey>` /\n`Option<Arc<RwLock<VerifyingKey>>>` pattern in jwt.rs /\njwt_interceptor.rs).",
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          }
+        }
+      },
+      "RateLimitConfig": {
+        "description": "Operator-supplied quota. `burst` is the bucket capacity; `per_minute`\nis the refill rate. A burst of N means N builds can fire\nback-to-back before the limiter kicks in — useful for\n`nix copy --to ssh-ng://…` which uploads a closure worth of\nderivations then submits one build per root.\n\nFields are [`NonZeroU32`] so a zero value is rejected at config\ndeserialization (figment surfaces the serde error naming the\nfield) rather than panicking inside [`TenantLimiter::new`].",
+        "type": "object",
+        "properties": {
+          "per_minute": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 1
+          },
+          "burst": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "per_minute",
+          "burst"
+        ]
+      }
+    }
+  },
+  "defaults": {
+    "listen_addr": "[::]:2222",
+    "scheduler": {
+      "addr": "",
+      "balance_host": null,
+      "balance_port": 9001
+    },
+    "store": {
+      "addr": "",
+      "balance_host": null,
+      "balance_port": 9002
+    },
+    "host_key": "",
+    "authorized_keys": "",
+    "metrics_addr": "[::]:9090",
+    "drain_grace_secs": 6,
+    "health_addr": "[::]:9190",
+    "jwt": {
+      "required": false,
+      "key_path": null
+    },
+    "resolve_timeout_ms": 500,
+    "session_drain_secs": 60,
+    "rate_limit": null,
+    "service_hmac_key_path": null,
+    "max_connections": 1000,
+    "max_transitive_inputs": 1048576
+  }
+}

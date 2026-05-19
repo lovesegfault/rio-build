@@ -31135,6 +31135,10 @@
           "packageId": "bytes"
         },
         {
+          "name": "cipher",
+          "packageId": "cipher 0.4.4"
+        },
+        {
           "name": "crossbeam-epoch",
           "packageId": "crossbeam-epoch"
         },
@@ -31262,6 +31266,10 @@
           "packageId": "indexmap"
         },
         {
+          "name": "inout",
+          "packageId": "inout 0.1.4"
+        },
+        {
           "name": "jiff",
           "packageId": "jiff"
         },
@@ -31300,6 +31308,16 @@
         {
           "name": "metrics-util",
           "packageId": "metrics-util"
+        },
+        {
+          "name": "miniz_oxide",
+          "packageId": "miniz_oxide",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "miniz_oxide",
+          "packageId": "miniz_oxide",
+          "target": "x86_64-unknown-linux-gnu"
         },
         {
           "name": "nix",
@@ -31386,6 +31404,10 @@
           "packageId": "regex-syntax"
         },
         {
+          "name": "reqwest",
+          "packageId": "reqwest 0.13.2"
+        },
+        {
           "name": "rustls",
           "packageId": "rustls"
         },
@@ -31452,6 +31474,14 @@
         {
           "name": "sqlx-sqlite",
           "packageId": "sqlx-sqlite"
+        },
+        {
+          "name": "ssh-cipher",
+          "packageId": "ssh-cipher"
+        },
+        {
+          "name": "ssh-encoding",
+          "packageId": "ssh-encoding"
         },
         {
           "name": "subtle",
@@ -31576,12 +31606,24 @@
       ],
       "buildDependencies": [
         {
+          "name": "ahash",
+          "packageId": "ahash"
+        },
+        {
           "name": "aws-lc-rs",
           "packageId": "aws-lc-rs"
         },
         {
+          "name": "aws-smithy-types",
+          "packageId": "aws-smithy-types"
+        },
+        {
           "name": "base64",
           "packageId": "base64"
+        },
+        {
+          "name": "base64ct",
+          "packageId": "base64ct"
         },
         {
           "name": "bitflags",
@@ -31606,6 +31648,14 @@
           "packageId": "cc"
         },
         {
+          "name": "cipher",
+          "packageId": "cipher 0.4.4"
+        },
+        {
+          "name": "crossbeam-epoch",
+          "packageId": "crossbeam-epoch"
+        },
+        {
           "name": "crossbeam-utils",
           "packageId": "crossbeam-utils"
         },
@@ -31615,17 +31665,43 @@
           "rename": "crypto_common_c65f7effa3be6d31"
         },
         {
+          "name": "crypto-common",
+          "packageId": "crypto-common 0.2.1",
+          "rename": "crypto_common_6f8ce4dd05d13bba"
+        },
+        {
+          "name": "ctutils",
+          "packageId": "ctutils"
+        },
+        {
+          "name": "der",
+          "packageId": "der 0.7.10"
+        },
+        {
           "name": "digest",
           "packageId": "digest 0.10.7",
           "rename": "digest_93f6ce9d446188ac"
+        },
+        {
+          "name": "digest",
+          "packageId": "digest 0.11.2",
+          "rename": "digest_a6292c17cd707f01"
         },
         {
           "name": "either",
           "packageId": "either"
         },
         {
+          "name": "event-listener-strategy",
+          "packageId": "event-listener-strategy"
+        },
+        {
           "name": "fastrand",
           "packageId": "fastrand"
+        },
+        {
+          "name": "futures",
+          "packageId": "futures"
         },
         {
           "name": "futures-channel",
@@ -31654,15 +31730,13 @@
         },
         {
           "name": "getrandom",
-          "packageId": "getrandom 0.4.2",
-          "rename": "getrandom_9fbad63c4bcf4a8f",
-          "target": "aarch64-unknown-linux-gnu"
+          "packageId": "getrandom 0.3.4",
+          "rename": "getrandom_468e82937335b1c9"
         },
         {
           "name": "getrandom",
           "packageId": "getrandom 0.4.2",
-          "rename": "getrandom_9fbad63c4bcf4a8f",
-          "target": "x86_64-unknown-linux-gnu"
+          "rename": "getrandom_9fbad63c4bcf4a8f"
         },
         {
           "name": "hashbrown",
@@ -31670,18 +31744,71 @@
           "rename": "hashbrown_3575ec1268b04181"
         },
         {
+          "name": "hashbrown",
+          "packageId": "hashbrown 0.16.1",
+          "rename": "hashbrown_986da7b5efc2b80e"
+        },
+        {
+          "name": "hybrid-array",
+          "packageId": "hybrid-array"
+        },
+        {
+          "name": "hyper",
+          "packageId": "hyper 1.9.0"
+        },
+        {
+          "name": "hyper-rustls",
+          "packageId": "hyper-rustls"
+        },
+        {
+          "name": "hyper-util",
+          "packageId": "hyper-util"
+        },
+        {
+          "name": "hyper-util",
+          "packageId": "hyper-util",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "hyper-util",
+          "packageId": "hyper-util",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
           "name": "indexmap",
           "packageId": "indexmap"
         },
         {
-          "name": "libc",
-          "packageId": "libc",
-          "target": "aarch64-unknown-linux-gnu"
+          "name": "inout",
+          "packageId": "inout 0.1.4"
+        },
+        {
+          "name": "jiff",
+          "packageId": "jiff"
+        },
+        {
+          "name": "k8s-openapi",
+          "packageId": "k8s-openapi"
+        },
+        {
+          "name": "kube",
+          "packageId": "kube"
+        },
+        {
+          "name": "kube-client",
+          "packageId": "kube-client"
+        },
+        {
+          "name": "kube-core",
+          "packageId": "kube-core"
+        },
+        {
+          "name": "lazy_static",
+          "packageId": "lazy_static"
         },
         {
           "name": "libc",
-          "packageId": "libc",
-          "target": "x86_64-unknown-linux-gnu"
+          "packageId": "libc"
         },
         {
           "name": "log",
@@ -31692,6 +31819,38 @@
           "packageId": "memchr"
         },
         {
+          "name": "metrics-util",
+          "packageId": "metrics-util"
+        },
+        {
+          "name": "miniz_oxide",
+          "packageId": "miniz_oxide",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "miniz_oxide",
+          "packageId": "miniz_oxide",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "nix",
+          "packageId": "nix 0.31.2",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "nix",
+          "packageId": "nix 0.31.2",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "num-bigint-dig",
+          "packageId": "num-bigint-dig"
+        },
+        {
+          "name": "num-integer",
+          "packageId": "num-integer"
+        },
+        {
           "name": "num-traits",
           "packageId": "num-traits"
         },
@@ -31700,8 +31859,24 @@
           "packageId": "once_cell"
         },
         {
+          "name": "ordered-float",
+          "packageId": "ordered-float 5.3.0"
+        },
+        {
+          "name": "pem-rfc7468",
+          "packageId": "pem-rfc7468 0.7.0"
+        },
+        {
           "name": "percent-encoding",
           "packageId": "percent-encoding"
+        },
+        {
+          "name": "pkcs8",
+          "packageId": "pkcs8 0.10.2"
+        },
+        {
+          "name": "portable-atomic",
+          "packageId": "portable-atomic"
         },
         {
           "name": "ppv-lite86",
@@ -31712,9 +31887,22 @@
           "packageId": "prost"
         },
         {
+          "name": "quanta",
+          "packageId": "quanta"
+        },
+        {
           "name": "rand",
           "packageId": "rand 0.8.6",
           "rename": "rand_c38e5c1d305a1b54"
+        },
+        {
+          "name": "rand",
+          "packageId": "rand 0.9.4",
+          "rename": "rand_274715c4dabd11b0"
+        },
+        {
+          "name": "rand_chacha",
+          "packageId": "rand_chacha 0.9.0"
         },
         {
           "name": "regex",
@@ -31727,6 +31915,10 @@
         {
           "name": "regex-syntax",
           "packageId": "regex-syntax"
+        },
+        {
+          "name": "reqwest",
+          "packageId": "reqwest 0.13.2"
         },
         {
           "name": "rustls",
@@ -31753,8 +31945,20 @@
           "packageId": "serde_json"
         },
         {
+          "name": "sha1",
+          "packageId": "sha1 0.10.6"
+        },
+        {
           "name": "sha2",
           "packageId": "sha2 0.10.9"
+        },
+        {
+          "name": "signature",
+          "packageId": "signature 2.2.0"
+        },
+        {
+          "name": "sketches-ddsketch",
+          "packageId": "sketches-ddsketch"
         },
         {
           "name": "slab",
@@ -31769,6 +31973,10 @@
           "packageId": "spin 0.9.8"
         },
         {
+          "name": "spki",
+          "packageId": "spki 0.7.3"
+        },
+        {
           "name": "sqlx-core",
           "packageId": "sqlx-core"
         },
@@ -31781,6 +31989,14 @@
           "packageId": "sqlx-sqlite"
         },
         {
+          "name": "ssh-cipher",
+          "packageId": "ssh-cipher"
+        },
+        {
+          "name": "ssh-encoding",
+          "packageId": "ssh-encoding"
+        },
+        {
           "name": "subtle",
           "packageId": "subtle"
         },
@@ -31789,8 +32005,26 @@
           "packageId": "syn"
         },
         {
+          "name": "sync_wrapper",
+          "packageId": "sync_wrapper"
+        },
+        {
           "name": "tokio",
           "packageId": "tokio"
+        },
+        {
+          "name": "tokio-rustls",
+          "packageId": "tokio-rustls"
+        },
+        {
+          "name": "tokio-rustls",
+          "packageId": "tokio-rustls",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "tokio-rustls",
+          "packageId": "tokio-rustls",
+          "target": "x86_64-unknown-linux-gnu"
         },
         {
           "name": "tokio-stream",
@@ -31809,6 +32043,34 @@
           "packageId": "toml_parser"
         },
         {
+          "name": "tower",
+          "packageId": "tower"
+        },
+        {
+          "name": "tower",
+          "packageId": "tower",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "tower",
+          "packageId": "tower",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "tower-http",
+          "packageId": "tower-http"
+        },
+        {
+          "name": "tower-http",
+          "packageId": "tower-http",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "tower-http",
+          "packageId": "tower-http",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
           "name": "tracing",
           "packageId": "tracing"
         },
@@ -31817,12 +32079,21 @@
           "packageId": "tracing-core"
         },
         {
+          "name": "tracing-subscriber",
+          "packageId": "tracing-subscriber"
+        },
+        {
           "name": "typenum",
           "packageId": "typenum"
         },
         {
           "name": "uuid",
           "packageId": "uuid"
+        },
+        {
+          "name": "winnow",
+          "packageId": "winnow 0.7.15",
+          "rename": "winnow_ca01ad9e24f5d932"
         },
         {
           "name": "winnow",
@@ -31836,6 +32107,18 @@
         {
           "name": "zeroize",
           "packageId": "zeroize"
+        },
+        {
+          "name": "zstd",
+          "packageId": "zstd"
+        },
+        {
+          "name": "zstd-safe",
+          "packageId": "zstd-safe"
+        },
+        {
+          "name": "zstd-sys",
+          "packageId": "zstd-sys"
         }
       ],
       "libCrateTypes": [
@@ -32036,24 +32319,12 @@
           "packageId": "reqwest 0.13.2"
         },
         {
-          "name": "rio-builder",
-          "packageId": "rio-builder"
-        },
-        {
           "name": "rio-common",
           "packageId": "rio-common"
         },
         {
-          "name": "rio-controller",
-          "packageId": "rio-controller"
-        },
-        {
           "name": "rio-crds",
           "packageId": "rio-crds"
-        },
-        {
-          "name": "rio-gateway",
-          "packageId": "rio-gateway"
         },
         {
           "name": "rio-proto",
@@ -32064,20 +32335,12 @@
           "packageId": "rio-scheduler"
         },
         {
-          "name": "rio-store",
-          "packageId": "rio-store"
-        },
-        {
           "name": "rio-test-support",
           "packageId": "rio-test-support"
         },
         {
           "name": "rustls",
           "packageId": "rustls"
-        },
-        {
-          "name": "schemars",
-          "packageId": "schemars"
         },
         {
           "name": "scopeguard",

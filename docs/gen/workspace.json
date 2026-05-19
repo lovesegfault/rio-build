@@ -140,14 +140,10 @@
       "dev": [],
       "optional": [],
       "prod": [
-        "rio-builder",
         "rio-common",
-        "rio-controller",
         "rio-crds",
-        "rio-gateway",
         "rio-proto",
         "rio-scheduler",
-        "rio-store",
         "rio-test-support"
       ]
     }

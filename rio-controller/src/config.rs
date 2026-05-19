@@ -1,7 +1,9 @@
 //! `rio-controller` binary configuration: figment-loaded `Config`
 //! struct, clap `CliArgs` overlay, and the `ValidateConfig` bounds
-//! checks. Extracted from `main.rs` so xtask can `schema_for!(Config)`
-//! for `docs/gen/config.json`.
+//! checks. Extracted from `main.rs` so `tests/config_schema.rs` can
+//! snapshot `schema_for!(Config)` into the committed
+//! `tests/fixtures/config-schema.json` that `xtask regen docs-data`
+//! reads.
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};

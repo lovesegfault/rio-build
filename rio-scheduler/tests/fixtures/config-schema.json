@@ -1,0 +1,369 @@
+{
+  "schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "Config",
+    "description": "Configuration fields shared by every rio-* binary's `Config`.\n\nEmbed via `#[serde(flatten)]` so the wire format stays flat:\n`metrics_addr` / `drain_grace_secs` are top-level TOML keys (env\n`RIO_METRICS_ADDR`, `RIO_DRAIN_GRACE_SECS`).\n\n```ignore\n#[derive(Serialize, Deserialize)]\n#[serde(default)]\nstruct Config {\n    listen_addr: String,\n    #[serde(flatten)]\n    common: rio_common::config::CommonConfig,\n    // ...\n}\n```\n\nReplaces the per-binary `metrics_addr` / `drain_grace_secs`\nfields and the byte-identical 8-line `HasCommonConfig` impl that\nprojected them. [`crate::server::bootstrap`] reads this via the\none-method [`crate::server::HasCommonConfig`] trait.\n\n`#[serde(default)]` is required: `flatten` bypasses the outer\nstruct's `#[serde(default)]`, so a TOML that sets only crate-\nspecific fields would otherwise fail with a missing-field error.\nIn production [`load`] always layers `Serialized::defaults`\nfirst so this never fires there, but tests that parse a bare\nTOML snippet (and figment's own internal re-deserialize during\nmerge) need it.",
+    "type": "object",
+    "properties": {
+      "listen_addr": {
+        "description": "gRPC listen address for SchedulerService + ExecutorService.",
+        "type": "string",
+        "default": "[::]:9001"
+      },
+      "store": {
+        "description": "rio-store upstream. Env: `RIO_STORE__ADDR`. Scheduler uses\n`connect_store_lazy` (re-resolves on reconnect) so\n`balance_host` is unused — the lazy channel follows the\nClusterIP Service's current endpoint without an explicit p2c.",
+        "$ref": "#/$defs/UpstreamAddrs",
+        "default": {
+          "addr": "",
+          "balance_host": null,
+          "balance_port": 9002
+        }
+      },
+      "database_url": {
+        "description": "PostgreSQL connection URL. Required.",
+        "type": "string",
+        "default": ""
+      },
+      "metrics_addr": {
+        "description": "Prometheus exporter listen address. Per-binary defaults differ\n(gateway 9090, scheduler 9091, …) so each `Config::default()`\nsets this explicitly via [`CommonConfig::new`].",
+        "type": "string",
+        "default": "[::]:0"
+      },
+      "drain_grace_secs": {
+        "description": "SIGTERM → NOT_SERVING → exit drain window. Gives kubelet\nreadiness probe (periodSeconds: 5) + endpoint propagation time\nto observe before the listener stops. 0 = no drain. Only the\nthree tonic-serving binaries (scheduler/store/gateway) consume\nthis; controller and builder ignore it.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 6
+      },
+      "tick_interval_secs": {
+        "description": "Tick interval (seconds) for scheduler housekeeping.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 10
+      },
+      "log_s3_bucket": {
+        "description": "S3 bucket for build-log flush. `None` = flush disabled.\nEnv: `RIO_LOG_S3_BUCKET`. Wired into LogFlusher in main().",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      },
+      "soft_features": {
+        "description": "I-204: `requiredSystemFeatures` values that are capability HINTS,\nnot hardware gates. Stripped from each derivation at DAG-insert so\nthey don't drive pool spawn or block dispatch. nixpkgs convention:\n`big-parallel`, `benchmark`. Helm sets via `scheduler.softFeatures`.",
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": []
+      },
+      "hmac_key_path": {
+        "description": "HMAC key file for signing assignment tokens. The store\nverifies on PutPath with the SAME key. Unset = unsigned\ntokens (dev mode). Generate: `openssl rand -out /path 32`.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      },
+      "service_hmac_key_path": {
+        "description": "HMAC key file for signing `x-rio-service-token` (SEPARATE from\n`hmac_key_path`). The scheduler mints `ServiceClaims { caller:\n\"rio-scheduler\" }` so the store honours `x-rio-probe-tenant-id`\non dispatch-time `FindMissingPaths`/`QueryPathInfo` —\n`r[sched.dispatch.fod-substitute]`. Unset = dispatch-time\nsubstitution probe disabled (falls back to local-presence-only).",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      },
+      "jwt": {
+        "description": "JWT verification. `key_path` → ConfigMap mount at\n`/etc/rio/jwt/ed25519_pubkey` (see helm jwt-pubkey-configmap.yaml).\nThe gateway signs with the matching seed; scheduler verifies.\nUnset = interceptor inert (dev mode / pre-key-rotation-infra).\nSIGHUP reloads from the same path — kubelet remounts the\nConfigMap on rotation, operator SIGHUPs the pod. Set via\n`RIO_JWT__KEY_PATH` (nested figment key — double underscore).",
+        "$ref": "#/$defs/JwtConfig",
+        "default": {
+          "required": false,
+          "key_path": null
+        }
+      },
+      "lease_name": {
+        "description": "Kubernetes Lease name for leader election. `None` = non-K8s\nmode (single-scheduler; is_leader=true immediately, generation\nstays 1). Env: `RIO_LEASE_NAME`. See crate::lease.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      },
+      "lease_namespace": {
+        "description": "Kubernetes namespace for the Lease. `None` = read from the\nin-cluster serviceaccount mount, fall back to \"default\".\nEnv: `RIO_LEASE_NAMESPACE`. Ignored when `lease_name` is None.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      },
+      "poison": {
+        "description": "Poison-detection thresholds. `[poison]` table in scheduler.toml.\n`r[sched.retry.per-executor-budget]` (scheduler.typ) specifies\nboth this and `retry` below as TOML-configurable. P0219 shipped\nthe structs + builders; this wires them. Default: 3 distinct\nworkers must fail (matches the former `POISON_THRESHOLD` const).\nNo CLI override — infrequently-tweaked deploy config.",
+        "$ref": "#/$defs/PoisonConfig",
+        "default": {
+          "threshold": 3,
+          "require_distinct_workers": true
+        }
+      },
+      "retry": {
+        "description": "Per-worker retry backoff curve. `[retry]` table in scheduler.toml.\nDefault: 2 retries, 5s→300s exponential with 20% jitter. No CLI\noverride for the same reason as `poison`.",
+        "$ref": "#/$defs/RetryPolicy",
+        "default": {
+          "max_retries": 2,
+          "max_infra_retries": 10,
+          "max_timeout_retries": 4,
+          "infra_retry_window_secs": 300.0,
+          "max_exempt_infra_retries": 50,
+          "backoff_base_secs": 5.0,
+          "backoff_multiplier": 2.0,
+          "backoff_max_secs": 300.0,
+          "jitter_fraction": 0.2
+        }
+      },
+      "substitute_max_concurrent": {
+        "description": "In-flight detached substitute-fetch task bound\n(r[sched.substitute.detached+2]) — memory-safety only; per-replica\nthrottling is `r[store.substitute.admission]`. Sizes\n`DagActor.substitute_sem`. Env: `RIO_SUBSTITUTE_MAX_CONCURRENT`\n(operator escape hatch — not chart-set). Default 256.",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0,
+        "default": 256
+      },
+      "dashboard": {
+        "description": "gRPC-Web / CORS config for the dashboard SPA. `[dashboard]`\ntable in scheduler.toml. Env: `RIO_DASHBOARD__*`.",
+        "$ref": "#/$defs/DashboardConfig",
+        "default": {
+          "cors_allow_origins": "http://rio-dashboard.rio-system.svc.cluster.local"
+        }
+      },
+      "allow_reference_change": {
+        "description": "Permit a `[sla].reference_hw_class` change vs the value\npersisted in `sla_config_epoch` (M_058). DESTRUCTIVE — resets\n`build_samples`, `hw_perf_samples`, and this cluster's\n`sla_ema_state`. CLI-only (`--allow-reference-change`); never\nset from TOML/env so a stale flag can't survive a rollout.",
+        "type": "boolean",
+        "default": false
+      }
+    },
+    "$defs": {
+      "UpstreamAddrs": {
+        "description": "Upstream gRPC address triple: a ClusterIP `addr` for single-channel\nmode plus an optional headless-Service `balance_host` for health-\naware p2c. Same shape for scheduler and store; the per-upstream\ndefault `balance_port` differs (9001/9002), set via [`Self::with_port`].\n\nEmbed in each binary's `Config` as a nested field (NOT flattened):\n\n```ignore\nstruct Config {\n    scheduler: UpstreamAddrs,  // env: RIO_SCHEDULER__ADDR / __BALANCE_HOST / __BALANCE_PORT\n    store: UpstreamAddrs,      // env: RIO_STORE__ADDR / ...\n}\n```\n\n`#[serde(default)]` is required: figment merges per-field across\nlayers, so a TOML `[scheduler]` table with only `addr` set must NOT\nfail with `MissingField(\"balance_port\")` — the unspecified fields\nfall through to `Default` (which `Serialized::defaults` populates\nfrom `Config::default()` in production, but bare-TOML tests need\nthe struct-level fallback).\n\n`rio-proto::client::connect` takes this to do the balance-vs-single\ndispatch that was previously open-coded ~40L per binary.",
+        "type": "object",
+        "properties": {
+          "addr": {
+            "description": "ClusterIP Service `host:port`. Required (no compiled default —\ndeployment-specific). Validated via [`Self::ensure_required`].\nAlso the TLS verify domain when `balance_host` is set (cert\nSAN is the Service name, not the pod IP).",
+            "type": "string",
+            "default": ""
+          },
+          "balance_host": {
+            "description": "Headless Service hostname for health-aware p2c. `None` (env\nunset) → single-channel via `addr`. `Some` → DNS-resolve,\nprobe `grpc.health.v1`, route to SERVING endpoints only.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "balance_port": {
+            "description": "gRPC port for balanced-channel pod-IP connects. Only used when\n`balance_host` is `Some`.",
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0,
+            "maximum": 65535,
+            "default": 0
+          }
+        }
+      },
+      "JwtConfig": {
+        "description": "JWT dual-mode configuration. Nested in each binary's `Config` as\n`jwt: JwtConfig`. Env vars: `RIO_JWT__REQUIRED=true` etc.\n\nDual-mode is PERMANENT: both the JWT path and the SSH-comment\nfallback stay maintained forever. `jwt_required` is the operator's\nper-deployment switch — true = STRICT (reject on mint/verify\nfailure), false = PERMISSIVE (fall back to tenant_name on failure).\n\nGateway interpretation: `required=true` → if ResolveTenant fails or\ntimes out during SSH auth, reject the connection (no JWT can be\nminted → no tenant identity → unauthenticated). `required=false` →\ndegrade to tenant_name-only (jwt_token=None, downstream falls back).\n\nScheduler/store interpretation: handled at the HANDLER level (not\nthe interceptor — the interceptor stays permissive-on-absent-header\nfor workers/health probes regardless). A handler that needs strict\nJWT reads `required` from its own config and checks for Claims\nextension presence.",
+        "type": "object",
+        "properties": {
+          "required": {
+            "description": "true = JWT mint/verify failure → reject. false (default) =\nfall back to SSH-comment tenant_name path.\n\nDefault false: existing deployments (no JWT Secret mounted)\nkeep working. Setting `RIO_JWT__REQUIRED=true` without also\nmounting the signing key → gateway rejects every SSH connect\nat auth time (clear failure, not silent degradation).",
+            "type": "boolean",
+            "default": false
+          },
+          "key_path": {
+            "description": "Path to the ed25519 signing seed (gateway) or pubkey\n(scheduler/store). K8s: Secret mount at\n`/etc/rio/jwt/ed25519_seed` or ConfigMap mount at\n`/etc/rio/jwt/ed25519_pubkey`. `None` → JWT disabled for\nthis process (matches the `Option<SigningKey>` /\n`Option<Arc<RwLock<VerifyingKey>>>` pattern in jwt.rs /\njwt_interceptor.rs).",
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          }
+        }
+      },
+      "PoisonConfig": {
+        "description": "Poison detection config. Replaces the former `POISON_THRESHOLD` const.\n\n`require_distinct_workers` toggles between HashSet semantics\n(`failed_builders.len()` — default, current behavior) and a flat\ncounter (`failure_count` — any N failures poison, regardless of\nworker; for single-worker dev deployments where 3 distinct workers\nwill never exist).\n\n`#[serde(default)]` on the struct → absent keys fall through to\n`Default::default()`, so `[poison] threshold = 5` leaves\n`require_distinct_workers = true` (unchanged). Matches the\n`Config` precedent. Serialize + PartialEq are\nfor the TOML-roundtrip tests in main.rs (`assert_eq!(cfg.poison,\nPoisonConfig::default())`).",
+        "type": "object",
+        "properties": {
+          "threshold": {
+            "description": "Failures before poison. Default 3 (the former POISON_THRESHOLD).",
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0,
+            "default": 3
+          },
+          "require_distinct_workers": {
+            "description": "Whether failures must be on distinct workers. Default `true`\n(HashSet semantics — matches prior behavior). `false` = any N\nfailures poison regardless of worker.",
+            "type": "boolean",
+            "default": true
+          }
+        }
+      },
+      "RetryPolicy": {
+        "description": "Retry policy configuration.\n\n`#[serde(default)]` on the struct → absent keys fall through to\n`Default::default()`, so `[retry] max_retries = 5` leaves the\nbackoff curve unchanged. `PartialEq` is for the TOML-roundtrip\ntests (`assert_eq!(cfg.retry, RetryPolicy::default())`). Float\nfields mean this is a BITWISE compare — acceptable for config\n(the test just asserts default-constructed identity, not\ncomputed-value equality).",
+        "type": "object",
+        "properties": {
+          "max_retries": {
+            "description": "Maximum number of retries for transient failures.",
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0,
+            "default": 2
+          },
+          "max_infra_retries": {
+            "description": "Maximum number of retries for InfrastructureFailure. Higher\nthan `max_retries` because infra failures are executor-local\n(not the build's fault) — but NOT unbounded: a scheduler-side\nbug that misclassifies a deterministic failure as infra\n(e.g., empty CA input path → MetadataFetch error) would\notherwise hot-loop forever. Observed: 9748 re-dispatches in\none session before the CA-path-propagation fix landed.",
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0,
+            "default": 10
+          },
+          "max_timeout_retries": {
+            "description": "Maximum number of `TimedOut` re-dispatches before the\nderivation goes terminal (`Cancelled`). Each `TimedOut` retry\nbumps `resource_floor.deadline` (I-200, `r[sched.timeout.promote-\non-exceed]`), so this caps how many floor doublings a build\ncan climb on timeout before the operator gets a visible\nfailure. Default 4 (16× the initial deadline); a build that\ntimes out at 16× is genuinely stuck. Separate counter from\n`max_retries` (timeouts don't\neat the transient budget) and from `max_infra_retries` (no\ntime-window reset — sparse timeouts over hours are still the\nsame hung build).",
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0,
+            "default": 4
+          },
+          "infra_retry_window_secs": {
+            "description": "Seconds since the LAST infra failure after which the\n`infra_retry_count` is reset to 0. Infra failures are by\ndefinition transient — N quick failures suggests a\nmisclassified permanent error, but N failures spread over\nhours are independent incidents and shouldn't accumulate\ntoward poison. I-127: a leaked PutPath lock caused 4 builders\nin a row to hit \"concurrent PutPath\"; the drv was poisoned at\n99.7% despite being fine. With a window, the counter resets\nonce the cluster self-heals (lock released, store recovered).",
+            "type": "number",
+            "format": "double",
+            "default": 300.0
+          },
+          "max_exempt_infra_retries": {
+            "description": "Maximum number of `exempt_from_cap` infra-retry attempts before\nthe derivation is poisoned. CONCURRENT_PUTPATH and\n`floor_outcome.promoted` skip `infra_count++` entirely, so a\nleaked store-side placeholder lock (the I-125a class) makes\nevery honest worker report the exempt message → infinite pod\nchurn at `info!` level only. This high-water cap is the\nscheduler-side terminal: every other completion status has one\n(`max_retries`, `max_infra_retries`, `max_timeout_retries`,\nsize-tier ladder); without this, the I-127 exemption was the\nsole worker-reportable status with zero scheduler-side bound.",
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0,
+            "default": 50
+          },
+          "backoff_base_secs": {
+            "description": "Base backoff duration in seconds.",
+            "type": "number",
+            "format": "double",
+            "default": 5.0
+          },
+          "backoff_multiplier": {
+            "description": "Backoff multiplier.",
+            "type": "number",
+            "format": "double",
+            "default": 2.0
+          },
+          "backoff_max_secs": {
+            "description": "Maximum backoff duration in seconds.",
+            "type": "number",
+            "format": "double",
+            "default": 300.0
+          },
+          "jitter_fraction": {
+            "description": "Jitter fraction (0.0 to 1.0).",
+            "type": "number",
+            "format": "double",
+            "default": 0.2
+          }
+        }
+      },
+      "DashboardConfig": {
+        "description": "Dashboard browser-facing settings. The scheduler serves gRPC-Web\nnatively on its main port (D3) so the ingress is a plain HTTP\nrouter — CORS therefore lives here, not in a proxy CRD.",
+        "type": "object",
+        "properties": {
+          "cors_allow_origins": {
+            "description": "Comma-separated CORS allowed origins for gRPC-Web requests.\nEnv: `RIO_DASHBOARD__CORS_ALLOW_ORIGINS`. The dashboard nginx\nService is the only legitimate browser origin in-cluster;\nexternal access (Ingress/LoadBalancer) appends its public\nhostname via helm `dashboard.cors.allowOrigins`. Comma-joined\nstring (not `Vec<String>`) so figment's env provider works\nwithout a custom split — helm renders `| join \",\"`.",
+            "type": "string",
+            "default": "http://rio-dashboard.rio-system.svc.cluster.local"
+          }
+        }
+      }
+    }
+  },
+  "defaults": {
+    "listen_addr": "[::]:9001",
+    "store": {
+      "addr": "",
+      "balance_host": null,
+      "balance_port": 9002
+    },
+    "database_url": "",
+    "metrics_addr": "[::]:9091",
+    "drain_grace_secs": 6,
+    "tick_interval_secs": 10,
+    "log_s3_bucket": null,
+    "soft_features": [],
+    "hmac_key_path": null,
+    "service_hmac_key_path": null,
+    "jwt": {
+      "required": false,
+      "key_path": null
+    },
+    "lease_name": null,
+    "lease_namespace": null,
+    "poison": {
+      "threshold": 3,
+      "require_distinct_workers": true
+    },
+    "retry": {
+      "max_retries": 2,
+      "max_infra_retries": 10,
+      "max_timeout_retries": 4,
+      "infra_retry_window_secs": 300.0,
+      "max_exempt_infra_retries": 50,
+      "backoff_base_secs": 5.0,
+      "backoff_multiplier": 2.0,
+      "backoff_max_secs": 300.0,
+      "jitter_fraction": 0.2
+    },
+    "substitute_max_concurrent": 256,
+    "dashboard": {
+      "cors_allow_origins": "http://rio-dashboard.rio-system.svc.cluster.local"
+    },
+    "sla": {
+      "tiers": [
+        {
+          "name": "normal",
+          "p50": null,
+          "p90": null,
+          "p99": null
+        }
+      ],
+      "default_tier": "normal",
+      "probe": {
+        "cpu": 4.0,
+        "mem_per_core": 1073741824,
+        "mem_base": 1073741824,
+        "deadline_secs": 3600
+      },
+      "feature_probes": {},
+      "max_cores": null,
+      "max_mem": null,
+      "max_disk": 6442450944,
+      "default_disk": 2147483648,
+      "ring_buffer": 32,
+      "seed_corpus": null,
+      "hw_cost_source": "static",
+      "hw_classes": {},
+      "hw_cost_tolerance": 0.15,
+      "hw_explore_epsilon": 0.02,
+      "hw_bench_mem_floor": 8589934592,
+      "lead_time_seed": {},
+      "max_fleet_cores": 10000,
+      "ladder_budget": 600.0,
+      "reference_hw_class": "test-hw",
+      "max_forecast_cores_per_tenant": 2000,
+      "max_keys_per_tenant": 50000,
+      "max_lead_time": 600.0,
+      "max_consolidation_time": null,
+      "max_node_claims_per_cell_per_tick": 8,
+      "cluster": "",
+      "metal_sizes": []
+    },
+    "allow_reference_change": false
+  }
+}

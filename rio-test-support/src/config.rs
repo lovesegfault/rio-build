@@ -114,3 +114,77 @@ macro_rules! jail_defaults {
         }
     };
 }
+
+/// Snapshot guard: assert the committed `tests/fixtures/config-schema.json`
+/// matches the live `schema_for!($ty)` + `<$ty>::default()`.
+///
+/// `xtask regen docs-data` reads the committed fixture (NOT the crate
+/// itself) to flatten into `docs/gen/config.json` rows — keeping the
+/// 5 binary crates out of xtask's dependency graph. This test is the
+/// enforcement that the fixture and `Config` stay in lockstep, the
+/// same role `migration_checksums_frozen` plays for shipped `.sql`.
+///
+/// Regenerate with:
+/// ```text
+/// BLESS=1 cargo nextest run -E 'test(config_schema_frozen)'
+/// cargo xtask regen docs-data
+/// ```
+/// and commit BOTH the per-crate fixture(s) AND `docs/gen/config.json`.
+///
+/// Self-contained — references `::schemars` / `::serde_json` from the
+/// **caller's** crate root (`#[macro_export]` macros resolve at the
+/// call site). All 5 binary crates carry both as direct deps.
+///
+/// Read/write via runtime `CARGO_MANIFEST_DIR` (not `env!`): nextest's
+/// `--workspace-remap` rewrites it to the writable workspace copy that
+/// has the per-member `tests/fixtures/`; the compile-time value points
+/// at the buildRustCrate source store path. `BLESS` is never set in the
+/// Nix sandbox, so the write branch never runs against a read-only path.
+///
+/// Comparison is `serde_json::Value::==` after parsing both sides —
+/// `Value::Object` is BTreeMap-backed (the workspace doesn't unify
+/// `preserve_order`), so source key order never causes a false mismatch.
+#[macro_export]
+macro_rules! config_schema_frozen {
+    ($ty:ty) => {
+        #[test]
+        fn config_schema_frozen() {
+            let path = ::std::path::PathBuf::from(
+                ::std::env::var("CARGO_MANIFEST_DIR")
+                    .expect("CARGO_MANIFEST_DIR not set; run via cargo/nextest"),
+            )
+            .join("tests/fixtures/config-schema.json");
+            let live = ::serde_json::json!({
+                "schema": ::schemars::schema_for!($ty),
+                "defaults": ::serde_json::to_value(<$ty>::default()).unwrap(),
+            });
+            if ::std::env::var_os("BLESS").is_some() {
+                ::std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                ::std::fs::write(&path, ::serde_json::to_string_pretty(&live).unwrap() + "\n")
+                    .unwrap();
+                return;
+            }
+            let committed: ::serde_json::Value = ::serde_json::from_str(
+                &::std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                    panic!(
+                        "{} missing ({e}).\nGenerate it: BLESS=1 cargo nextest run \
+                         -E 'test(config_schema_frozen)'",
+                        path.display()
+                    )
+                }),
+            )
+            .unwrap();
+            assert_eq!(
+                committed,
+                live,
+                "\n\nconfig schema for `{}` drifted from {}.\n\
+                 The fixture is the source `xtask regen docs-data` reads — regenerate BOTH:\n  \
+                 BLESS=1 cargo nextest run -E 'test(config_schema_frozen)'\n  \
+                 cargo xtask regen docs-data\n\
+                 then commit the fixture(s) AND docs/gen/config.json.\n",
+                stringify!($ty),
+                path.display(),
+            );
+        }
+    };
+}
