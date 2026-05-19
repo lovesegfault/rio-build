@@ -185,7 +185,7 @@ service AdminService {
   rpc ClusterStatus(Empty) returns (ClusterStatusResponse);
   rpc ListExecutors(ListExecutorsRequest) returns (ListExecutorsResponse);
   rpc ListBuilds(ListBuildsRequest) returns (ListBuildsResponse);
-  rpc GetBuildLogs(GetBuildLogsRequest) returns (stream BuildLogChunk);
+  rpc GetDerivationLogs(GetDerivationLogsRequest) returns (stream DerivationLogChunk);
   rpc TriggerGC(GCRequest) returns (stream GCProgress);
   rpc DrainExecutor(DrainExecutorRequest) returns (DrainExecutorResponse);
   rpc CancelBuild(CancelBuildRequest) returns (CancelBuildResponse);  // operator override (caller_tenant=None); service-token gated

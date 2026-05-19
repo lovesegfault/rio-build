@@ -37,7 +37,7 @@ because actor-routed RPCs (`InspectBuildDag`, `ClusterSnapshot`) queue behind
 the actor mailbox, and the operator needs the dump precisely when the actor is
 saturated (I-163: \~9.5k mailbox commands under load). `connect_admin` has a
 separate 10s connect timeout (TCP/handshake bound). Streaming RPCs
-(`TriggerGC`, `GetBuildLogs`, `VerifyChunks`) wrap only the initial call;
+(`TriggerGC`, `GetDerivationLogs`, `VerifyChunks`) wrap only the initial call;
 per-message progress drains without a whole-call deadline.
 
 = Subcommands
@@ -63,8 +63,9 @@ per-message progress drains without a whole-call deadline.
   [Live actor @dag snapshot for a build],
 
   [`logs`],
-  [`AdminService.GetBuildLogs`],
-  [Stream a derivation's log (ring-buffer or S3)],
+  [`AdminService.GetDerivationLogs`],
+  [Stream a derivation's log (ring-buffer or S3); `--exec-id` pins an
+    execution, default latest],
 
   [`gc`], [`AdminService.TriggerGC`], [Streamed mark/sweep; `--dry-run`],
 

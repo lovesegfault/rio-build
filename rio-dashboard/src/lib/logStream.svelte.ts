@@ -12,7 +12,7 @@
 // observes as a dropped receiver.
 import { admin } from '../api/admin';
 
-// r[impl dash.stream.log-tail]
+// r[impl dash.stream.log-tail+2]
 // r[impl dash.log.cap]
 // r[impl dash.log.virtualize]
 // (Virtualization itself lives in LogViewer.svelte — windowed slice over

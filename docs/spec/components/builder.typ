@@ -544,6 +544,18 @@ can route derivations:
   status regardless.
 ]
 
+Before the build process starts, the worker writes a 3-line `rio:` header
+(`exec`, `builder`, `started`) as a direct `BuildLogBatch` at line 0; after the
+process exits it writes a 2-line footer (`exec`, `result`) at the final line
+offset. Both are sent on the same `BuildExecution` stream as build output, *not*
+through the `LogBatcher` (which is created and consumed inside the daemon
+lifecycle). The `LogBatcher` is seeded with the header line count so the
+build's real output numbers after the header. The header carries the
+`WorkAssignment.exec_id`, the system + `hw_class`, and the assigned resource
+triple --- never pod or node identity. The normative requirement and the
+display-only / no-pod-identity rationale live in
+#rref("obs.log.worker-header") in the observability spec.
+
 #r("builder.daemon.stderr-result-logs")[
   Modern `nix-daemon` sends build output via `STDERR_RESULT` with
   `BuildLogLine`, NOT raw `STDERR_NEXT`. The builder's stderr loop MUST handle

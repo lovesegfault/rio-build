@@ -117,7 +117,7 @@ visualization, `@dagrejs/dagre` for layout (falls back to a Web Worker above
     degrades to table >2000 nodes, polls 5s until all-terminal],
 
   [Build drawer · Logs tab],
-  [`AdminService.GetBuildLogs` (server stream)],
+  [`AdminService.GetDerivationLogs` (server stream)],
   [Live-tail build output, UTF-8-lossy decode, virtualized scroller; `drvPath`
     filter set by Graph node click],
 
@@ -162,10 +162,10 @@ stack can't give you.
   CRDs.
 ]
 
-#r("dash.auth.method-gate+2")[
+#r("dash.auth.method-gate+3")[
   The `GRPCRoute` splits `AdminService` methods by impact: read-only methods
   (`ClusterStatus`, `ListExecutors`, `ListPoisoned`, `ListBuilds`,
-  `GetBuildLogs`, `ListTenants`, `GetBuildGraph`, `GetSpawnIntents`) route
+  `GetDerivationLogs`, `ListTenants`, `GetBuildGraph`, `GetSpawnIntents`) route
   unconditionally; mutating methods (`ClearPoison`, `DrainExecutor`,
   `CreateTenant`, `TriggerGC`) route only when `dashboard.enableMutatingMethods`
   is true (default false). Until dashboard-native authz lands, mutating
@@ -188,17 +188,17 @@ stack can't give you.
   nodes (`GetBuildGraphResponse.truncated`).
 ]
 
-#r("dash.stream.log-tail")[
-  `GetBuildLogs` server-stream consumption MUST use
+#r("dash.stream.log-tail+2")[
+  `GetDerivationLogs` server-stream consumption MUST use
   `TextDecoder('utf-8', {fatal: false})` --- build output can contain non-UTF-8
   bytes (compiler locale garbage). Lossy decode to `U+FFFD`, never throw. nginx
   `proxy_buffering off` is required or the stream buffers entirely before
   reaching the browser.
 ]
 
-#r("dash.stream.idle-timeout")[
+#r("dash.stream.idle-timeout+2")[
   The streaming chain MUST tolerate ≥1h of silence on an open
-  `GetBuildLogs`/`WatchBuild` stream (a build that prints nothing for 5 minutes
+  `GetDerivationLogs`/`WatchBuild` stream (a build that prints nothing for 5 minutes
   is normal under LLVM-cold-ccache). nginx `proxy_read_timeout` is set to 1h
   (default 60s cuts first); the scheduler sends a 30s server-initiated h2
   keep-alive PING (`http2_keep_alive_interval`) so the Cilium Gateway envoy's

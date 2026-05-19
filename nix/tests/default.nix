@@ -975,7 +975,7 @@ in
   #   WatchBuild / live log tail. ~6min (k3s bring-up + Cilium
   #   Gateway reconcile). No separate Envoy Gateway operator —
   #   Cilium's embedded envoy handles the GRPCRoute.
-  # r[verify dash.auth.method-gate+2]
+  # r[verify dash.auth.method-gate+3]
   #   The fixture doesn't set dashboard.enableMutatingMethods so the
   #   rio-scheduler-mutating HTTPRoute is absent — `kubectl get
   #   httproute rio-scheduler-mutating` fails. Proves the helm-template

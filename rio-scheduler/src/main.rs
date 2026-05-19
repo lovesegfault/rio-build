@@ -554,7 +554,7 @@ async fn main() -> anyhow::Result<()> {
     // accept_http1: gRPC-Web arrives as HTTP/1.1 POST from browser
     // fetch(); GrpcWebLayer needs the h1 codec enabled. Native gRPC
     // clients keep negotiating h2 — both protocols on one port.
-    // r[impl dash.stream.idle-timeout]
+    // r[impl dash.stream.idle-timeout+2]
     // http2_keep_alive_interval: 30s server-initiated PING keeps
     // long-lived server streams (GetDerivationLogs, WatchBuild) alive
     // through any proxy's idle-timeout. Replaces the Envoy Gateway

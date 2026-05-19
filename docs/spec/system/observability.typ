@@ -11,14 +11,50 @@ viewer.
 
 == Storage Format
 
-Build logs are stored in S3 as zstd-compressed blobs:
+Build logs are stored in S3 as zstd-compressed blobs, keyed by the derivation
+execution that produced them:
 
 ```
-logs/{build_id}/{derivation_hash}.log.zst
+logs/{derivation_hash}/{exec_id}.log.zst          (final flush)
+logs/{derivation_hash}/{exec_id}.partial.log.zst  (periodic 30s snapshot)
 ```
 
-Metadata (byte offsets, timestamps, line counts) is stored in PostgreSQL for
-efficient seeking and pagination.
+`exec_id` is a per-execution UUIDv7 minted by the scheduler at dispatch
+(`assign_to_worker`). Time-sortability means "latest execution for a
+derivation" is a single index seek (`ORDER BY exec_id DESC LIMIT 1`).
+Metadata (S3 key, line counts, byte offsets, completion status, timestamps)
+is stored in the `drv_logs` PostgreSQL table for efficient seeking,
+pagination, and TTL retention.
+
+#r("obs.log.exec-keyed")[
+  Build logs MUST be stored at `logs/{drv_hash}/{exec_id}.log.zst` keyed by
+  per-execution UUIDv7. One blob and one PG row per execution regardless of
+  how many builds are interested in the derivation.
+]
+
+A derivation is built once even if N builds want it (`sched.merge.dedup`), so
+keying by `(build_id, drv_hash)` would write N PG rows pointing at one blob ---
+or, in the prior model, N copies of the blob under N keys. Keying by
+`(drv_hash, exec_id)` stores the log once and lets `build_derivations.exec_id`
+carry the build↔execution correlation. Periodic snapshots get the `.partial`
+suffix and a `drv_logs` row with `is_complete = false`; the final flush
+overwrites the row, writes the non-`.partial` key, and best-effort deletes the
+snapshot. Both are swept by the same TTL.
+
+#r("obs.log.worker-header")[
+  The worker MUST write `rio: exec`, `rio: builder`, `rio: started` lines as
+  the first lines of every build log, and a `rio: exec` + `rio: result` footer
+  after the build process exits. These lines are display-only and consumers
+  MUST NOT parse them for authoritative state.
+]
+
+The header/footer are written into the same untrusted byte stream as build
+output --- arbitrary build code can emit its own `rio: result ok` lines. The
+system's source of truth for `exec_id`, outcome, and sizing is `drv_logs` and
+`assignments`, not the log text. The `grep '^rio:'` extraction is a convenience
+for humans (the post-failure log tail Nix prints, the dashboard log viewer),
+not a protocol. Pod and node identity are deliberately excluded --- the
+"cluster is one machine" abstraction holds at the log level too.
 
 == Log Lifecycle
 
@@ -70,10 +106,11 @@ efficient seeking and pagination.
 + The scheduler buffers logs in an in-memory ring buffer per active
   derivation.
 + On derivation completion, the scheduler asynchronously flushes the buffer
-  to S3 as a zstd-compressed blob and writes metadata (byte offsets,
-  timestamps) to PostgreSQL.
-+ The `AdminService.GetBuildLogs` RPC reads from the in-memory buffer for
-  active builds and from S3 for completed builds.
+  to S3 as a zstd-compressed blob and upserts a `drv_logs` row keyed by
+  `exec_id` (S3 key, byte offsets, timestamps, completion status).
++ The `AdminService.GetDerivationLogs` RPC reads from the in-memory buffer for
+  active builds and from S3 for completed builds, resolving the latest
+  execution when the caller does not pin one.
 
 #info(title: [Periodic flush])[
   Logs are also flushed to S3 periodically (every 30s) during active builds,

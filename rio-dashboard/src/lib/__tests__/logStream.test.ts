@@ -1,4 +1,4 @@
-// r[verify dash.stream.log-tail]
+// r[verify dash.stream.log-tail+2]
 // Runes-in-module store driven by a mocked async-generator RPC. The
 // `.svelte.ts` compile pass means `$state` inside createLogStream works
 // under vitest too (the Svelte vite plugin handles the transform).

@@ -160,6 +160,38 @@ any critical-path value).
   #(refs.metric)("rio_scheduler_undeclared_built_output_total").
 ]
 
+#r("sched.log.batch-binding")[
+  The `BuildLogBatch` ingestion path MUST drop batches whose `derivation_path`
+  does not match an active assignment held by the calling executor's stream. A
+  batch for an unsolicited derivation MUST NOT allocate a buffer entry.
+]
+
+This is the log-path analogue of #rref("sched.completion.output-membership").
+The completion check runs inside the actor with `state.assigned_executor` in
+scope; the log batch ingestion path deliberately bypasses the actor (so a
+chatty build can't fill the actor's bounded mpsc), so the gate is colocated
+with the data the recv task has --- the ring buffer entry, stamped with
+`(exec_id, assigned_executor)` at dispatch. Without it, a compromised builder
+spamming a fabricated `derivation_path` pollutes that drv's per-execution log
+blob, and a late batch from a heartbeat-timed-out executor lands after a
+re-dispatch and gets attributed to the *next* execution. Dropped batches
+increment #(refs.metric)("rio_scheduler_log_batches_rejected_total").
+
+#r("sched.merge.exec-correlation")[
+  The completion handler MUST set `build_derivations.exec_id` for every
+  interested build when a derivation reaches `Completed` or `Failed`. The
+  column MUST stay `NULL` for `Cached`, `DependencyFailed`, `Cancelled`,
+  `Skipped`, and non-terminal derivations (no execution to correlate).
+]
+
+The build↔exec correlation lets the dashboard's build view fetch the *exact*
+log a build observed (`GetDerivationLogs(drv, exec_id)`) instead of falling
+back to "latest execution for this derivation" --- which can differ if the drv
+was rebuilt by a later build. The write is best-effort fire-and-forget: a
+failed write degrades the dashboard view, not the build outcome. It runs in
+`record_exec_correlation`, called from the same per-build fan-out as
+`trigger_log_flush`.
+
 #r("sched.completion.idempotent")[
   A `CompletionReport` for an already-completed derivation is accepted and
   ignored (no-op). The actor's state machine treats `completed → completed` as
@@ -1519,9 +1551,9 @@ backoff. This prevents unbounded request queueing at the gateway layer.
   [Per-completion telemetry rows feeding the ADR-023 SLA fit (ring-buffered per
     `(pname, system, tenant)`)],
 
-  [`build_logs`],
-  [S3 blob metadata per (`build_id`, `drv_hash`) --- `s3_key`, `line_count`,
-    `is_complete` for log-flush UPSERTs],
+  [`drv_logs`],
+  [S3 blob metadata per execution (`exec_id` PK, `drv_hash`) --- `s3_key`,
+    `line_count`, `is_complete`, `started_at` for log-flush UPSERTs and TTL GC],
 
   [`build_event_log`],
   [Prost-encoded `BuildEvent` per (`build_id`, `sequence`) for gateway
@@ -1674,10 +1706,10 @@ CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
 ```
 
 #info[
-  Auxiliary tables omitted from pseudo-DDL above: `build_logs` (S3 blob
-  metadata per derivation) and `build_event_log` (Prost-encoded BuildEvent per
-  sequence for gateway replay). See `rio-migrations/migrations/` for full
-  schema.
+  Auxiliary tables omitted from pseudo-DDL above: `drv_logs` (S3 blob
+  metadata per derivation execution, `exec_id` PK) and `build_event_log`
+  (Prost-encoded BuildEvent per sequence for gateway replay). See
+  `rio-migrations/migrations/` for full schema.
 ]
 
 = Leader Election
@@ -2223,7 +2255,7 @@ entirely: a `requirements` edit takes effect on the next rollout.
 - #src("rio-scheduler/src/event_log.rs") --- PostgreSQL-backed
   `build_event_log` writes for gateway `since_sequence` replay
 - #src("rio-scheduler/src/admin/") --- AdminService gRPC (ClusterStatus,
-  DrainExecutor, GetBuildLogs, TriggerGC)
+  DrainExecutor, GetDerivationLogs, TriggerGC)
 
 CA early cutoff is end-to-end: compare (#rref("sched.ca.cutoff-compare") ---
 completion-time content-index lookup), propagate
@@ -2385,14 +2417,15 @@ was *rejected*.
 
 Build logs are scheduler artifacts, not store artifacts. rio-store's domain is
 the content-addressed Nix store: @nar chunks, @narinfo, signatures, realisations,
-GC by reachability. Build logs are `build_id`-addressed (not content-addressed),
-mutable (periodic overwrites the same key), retained on a build-lifetime TTL
-(not reachability), unsigned, and not deduplicated. They share nothing with
-`PutPath` except "bytes go to S3." Adding them to `StoreService` dilutes its
-single responsibility into "also a generic blob bucket." The metadata table is
-FK-coupled to scheduler state (`build_logs.build_id REFERENCES
-builds(build_id)`); a `PutLog` RPC either leaves the PG write scheduler-side
-anyway or drags `build_id` into store's vocabulary.
+GC by reachability. Build logs are execution-addressed (`exec_id`, not
+content-addressed), mutable (periodic snapshots and the final flush UPSERT the
+same row), retained on a wall-clock TTL (not reachability), unsigned, and not
+deduplicated. They share nothing with `PutPath` except "bytes go to S3." Adding
+them to `StoreService` dilutes its single responsibility into "also a generic
+blob bucket." The `drv_logs` metadata table is correlated to scheduler state
+(`build_derivations.exec_id` records which execution each interested build
+observed); a `PutLog` RPC either leaves the PG write scheduler-side anyway or
+drags scheduler-private execution identity into store's vocabulary.
 
 Latency is not the problem; channel mixing is. The flush is fully async --- the
 actor `try_send`s and moves on --- but the periodic-snapshot bytes would ride
