@@ -303,7 +303,22 @@ impl ExecutorService for SchedulerGrpc {
                             //    This is the durability path: even if the actor is
                             //    backpressured or the gateway stream lags, the lines
                             //    land here and are serveable via AdminService.
-                            log_buffers.push(&log);
+                            //
+                            //    push_for, not push: enforces the (executor, drv)
+                            //    binding. Drops batches from executors not assigned
+                            //    this drv (compromised builder spamming a fabricated
+                            //    derivation_path; late batch after re-dispatch landing
+                            //    after discard_log_buffer, where push()'s or_default()
+                            //    would create an unstamped entry attributed to the
+                            //    NEXT exec_id). The `seen_drvs` MAX_DRVS_PER_STREAM cap
+                            //    above is a per-stream DoS bound; this is a per-batch
+                            //    correctness gate. They're complementary, not redundant.
+                            //    r[impl sched.log.batch-binding]
+                            log_buffers.push_for(
+                                &log.derivation_path,
+                                &log,
+                                executor_id_for_recv.as_str(),
+                            );
 
                             // 2. Gateway forward — via actor (it owns the
                             //    drv_path→hash→interested_builds resolution and the

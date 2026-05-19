@@ -227,6 +227,21 @@ async fn test_log_pipeline_grpc_wire_end_to_end() -> anyhow::Result<()> {
     // ═══════════ THE TEST ═══════════
     // Worker sends a LogBatch on the stream. This is the real gRPC wire
     // path, not a direct actor send.
+    //
+    // Pre-stamp the gRPC service's LogBuffers with the (exec_id,
+    // executor) binding the recv task's `push_for` checks
+    // (sched.log.batch-binding). In production `assign_to_worker`
+    // calls `set_log_exec` against the SAME `LogBuffers` Arc the recv
+    // task holds; this test's actor (`setup_grpc`) deliberately uses
+    // a SEPARATE `LogBuffers` so its assertions don't race actor-side
+    // discard/seal — so the actor's stamp landed on the actor's Arc,
+    // not the one we read below. Stamp this one explicitly with the
+    // same exec_id the assignment carried.
+    let exec_id: uuid::Uuid = work
+        .exec_id
+        .parse()
+        .expect("WorkAssignment.exec_id must be a UUID after dispatch");
+    log_buffers.set_exec(&work.drv_path, exec_id, "log-e2e-worker");
     let log_batch = rio_proto::types::BuildLogBatch {
         derivation_path: work.drv_path.clone(),
         lines: vec![b"wire-line-0".to_vec(), b"wire-line-1".to_vec()],
@@ -412,7 +427,13 @@ async fn test_log_buffer_survives_stream_close_before_actor_seal() -> anyhow::Re
     let mut inbound = worker_client.build_execution(outbound).await?.into_inner();
 
     // Push a LogBatch so the recv task records this drv in seen_drvs.
+    // Pre-stamp the gRPC LogBuffers so `push_for` (the (executor, drv)
+    // binding gate, sched.log.batch-binding) accepts the batch — this
+    // test's purpose is the seal-vs-stream-close race, not the gate.
+    // No real dispatch happens here (no merge), so we mint a synthetic
+    // exec_id; what `push_for` checks is the executor match.
     let drv_path = test_drv_path("seal-reap");
+    log_buffers.set_exec(&drv_path, uuid::Uuid::now_v7(), "seal-worker");
     stream_tx
         .send(rio_proto::types::ExecutorMessage {
             msg: Some(rio_proto::types::executor_message::Msg::LogBatch(
@@ -456,11 +477,23 @@ async fn test_log_buffer_survives_stream_close_before_actor_seal() -> anyhow::Re
     Ok(())
 }
 
-/// bug_319: `log_buffers.push()` must not accept unbounded distinct
-/// `derivation_path` keys from an untrusted worker. One stream may
-/// create at most `MAX_DRVS_PER_STREAM` entries; on stream close,
-/// un-sealed entries are discarded so periodic-flush stops iterating
-/// them.
+/// bug_319 + sched.log.batch-binding: an untrusted worker must not be
+/// able to allocate `LogBuffers` ring entries for fabricated
+/// `derivation_path` keys. The original bug_319 fix bounded this with
+/// `MAX_DRVS_PER_STREAM` (8 keys per stream — a leak rate, not a
+/// closure). The `(executor, drv)` binding gate (`push_for`,
+/// sched.log.batch-binding) closes it entirely: a batch whose drv was
+/// never `set_exec`-stamped is rejected, no entry created. The
+/// `seen_drvs` cap is now a residual bound on the recv task's
+/// `HashSet<String>` memory, not the load-bearing defense for buffer
+/// allocation.
+///
+/// Sends batches for 12 unsolicited drvs + 1 stamped sentinel. Asserts
+/// `active_count() == 1` (only the sentinel — proving the gate rejects
+/// unsolicited drvs *and* accepts assigned ones, and that the recv task
+/// drained the queue before we asserted). Pre-gate this asserted `8`
+/// (the 8/12 leak the cap allowed).
+// r[verify sched.log.batch-binding]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_log_batch_distinct_paths_capped_per_stream() -> anyhow::Result<()> {
     let (_db, grpc, _handle, _actor_task) = setup_grpc().await;
@@ -485,7 +518,39 @@ async fn test_log_batch_distinct_paths_capped_per_stream() -> anyhow::Result<()>
     let outbound = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
     let mut inbound = worker_client.build_execution(outbound).await?.into_inner();
 
-    // 12 distinct fake paths; cap is 8. Distinct HASH portions —
+    // Sentinel: one drv stamped as if `assign_to_worker` had run for
+    // this executor. Its batches are how we know the recv task drained
+    // the unsolicited batches between them — FIFO ordering means by the
+    // time sentinel batch #2 lands, the 12 unsolicited batches between
+    // #1 and #2 were processed (and rejected by the gate).
+    //
+    // The sentinel must be the FIRST distinct drv on the stream:
+    // `seen_drvs` caps at `MAX_DRVS_PER_STREAM` (8), and the cap fires
+    // BEFORE the gate. A sentinel sent 13th would hit the cap, not the
+    // gate, and its batch would be dropped — wrong layer under test.
+    let sentinel = "/nix/store/cap-sentinel-test.drv".to_string();
+    log_buffers.set_exec(&sentinel, uuid::Uuid::now_v7(), "cap-worker");
+    let send_sentinel = |line_no: u64| {
+        let stream_tx = stream_tx.clone();
+        let sentinel = sentinel.clone();
+        async move {
+            stream_tx
+                .send(rio_proto::types::ExecutorMessage {
+                    msg: Some(rio_proto::types::executor_message::Msg::LogBatch(
+                        rio_proto::types::BuildLogBatch {
+                            derivation_path: sentinel,
+                            lines: vec![b"sentinel".to_vec()],
+                            first_line_number: line_no,
+                            executor_id: "cap-worker".into(),
+                        },
+                    )),
+                })
+                .await
+        }
+    };
+    send_sentinel(0).await?;
+
+    // 12 distinct fake paths, none stamped. Distinct HASH portions —
     // LogBuffers keys on `drv_log_hash` (bug_126), so `test_drv_path`
     // (one shared TEST_HASH) would collapse to a single buffer.
     for i in 0..12 {
@@ -502,26 +567,27 @@ async fn test_log_batch_distinct_paths_capped_per_stream() -> anyhow::Result<()>
             })
             .await?;
     }
-    // recv task is on a worker thread; poll until cap is reached.
+    // Sentinel batch #2. Same drv path → already in `seen_drvs`, so the
+    // cap doesn't drop it. By the time it lands, the recv task has
+    // processed the 12 unsolicited batches (FIFO).
+    send_sentinel(1).await?;
     tokio::time::timeout(Duration::from_secs(2), async {
-        while log_buffers.active_count() < 8 {
+        while log_buffers
+            .read_since(&sentinel, 0)
+            .is_none_or(|v| v.len() < 2)
+        {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("active_count should reach 8");
+    .expect("both sentinel batches should land — recv task drained the queue");
     assert_eq!(
         log_buffers.active_count(),
-        8,
-        "MAX_DRVS_PER_STREAM caps distinct buffer keys per stream"
+        1,
+        "only the stamped sentinel allocates a buffer entry; unsolicited \
+         drvs are rejected by the (executor, drv) binding gate, not capped"
     );
 
-    // Stream-exit cleanup is now actor-side (epoch-gated +
-    // ownership-aware via `ExecutorDisconnected.seen_drvs`); this
-    // test's actor doesn't share the gRPC's `log_buffers` Arc, so the
-    // discard is asserted by the actor-level
-    // `test_disconnect_discards_only_unknown_drvs` instead. Here we
-    // only assert the per-stream CAP held.
     drop(stream_tx);
     let _ = tokio::time::timeout(Duration::from_secs(2), inbound.next()).await;
     Ok(())
