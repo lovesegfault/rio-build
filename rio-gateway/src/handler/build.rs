@@ -477,11 +477,17 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
                     "Failed with no tracked activity (I-206)"
                 );
             }
-            // Log failure via STDERR_NEXT
+            // Log failure via STDERR_NEXT, with a copy-pasteable
+            // `rio-cli logs` hint. No `--build-id` needed — logs are
+            // keyed by `(drv_hash, exec_id)` and `rio-cli logs <drv>`
+            // resolves the latest execution, which is the one that just
+            // failed. The drv path is single-quoted so the line is
+            // shell-safe to copy-paste even when the drv name contains
+            // shell metacharacters.
             stderr
                 .log(&format!(
-                    "derivation '{}' failed: {}",
-                    drv_event.derivation_path, drv_event.error_message
+                    "derivation '{}' failed: {}\n  ↳ rio-cli logs '{}'",
+                    drv_event.derivation_path, drv_event.error_message, drv_event.derivation_path
                 ))
                 .await?;
         }
@@ -836,23 +842,35 @@ async fn submit_initial<W: AsyncWrite + Unpin>(
     };
     tracing::Span::current().record("build_id", &build_id);
 
-    // Emit trace_id to the client via STDERR_NEXT — gives operators a
-    // grep handle for Tempo when debugging a user's build. With the
-    // header path this now fires BEFORE event 0 — operator gets the
-    // Tempo handle the moment the build is accepted, not after the
-    // first event arrives. PRIORITIZE the scheduler's trace_id
-    // (x-rio-trace-id header, read above) over our own — the scheduler
-    // span is the one that actually spans the full scheduler→worker
-    // chain (data-carry per r[sched.trace.assignment-traceparent]).
-    // Our own trace only has gateway spans. Fallback to our own for
-    // legacy schedulers that don't set the header. Empty-guard
-    // suppresses output when no OTel tracer is configured
-    // (current_trace_id_hex returns "" for TraceId::INVALID and the
-    // header is absent with no OTel on the scheduler side either).
+    // Surface the build_id once per `nix build` via STDERR_NEXT so the
+    // user can find their build in the dashboard or `rio-cli builds`.
+    // The build_id is no longer load-bearing for `rio-cli logs` — logs
+    // are keyed by `(drv_hash, exec_id)`, which the user already has
+    // from the failure output and the worker's `rio: exec` log header —
+    // but it's still the handle for build tracking, cancellation, and
+    // dashboard links. With the header path this fires BEFORE event 0,
+    // so the user gets the handle the moment the build is accepted.
+    //
+    // The trace_id is appended when OTel is wired — gives operators a
+    // grep handle for Tempo when debugging a user's build. PRIORITIZE
+    // the scheduler's trace_id (x-rio-trace-id header, read above) over
+    // our own — the scheduler span is the one that actually spans the
+    // full scheduler→worker chain (data-carry per
+    // r[sched.trace.assignment-traceparent]). Our own trace only has
+    // gateway spans. Fallback to our own for legacy schedulers that
+    // don't set the header. Empty trace (no OTel tracer configured —
+    // current_trace_id_hex returns "" for TraceId::INVALID, header
+    // absent with no OTel on the scheduler side) drops the suffix; the
+    // build_id line is still emitted unconditionally.
     let trace_id = header_trace_id.unwrap_or_else(rio_proto::interceptor::current_trace_id_hex);
-    if !trace_id.is_empty() {
-        let _ = stderr.log(&format!("rio trace_id: {trace_id}\n")).await;
-    }
+    let trace_suffix = if trace_id.is_empty() {
+        String::new()
+    } else {
+        format!(" (trace {trace_id})")
+    };
+    let _ = stderr
+        .log(&format!("rio: build {build_id}{trace_suffix}\n"))
+        .await;
 
     Ok((build_id, event_stream))
 }

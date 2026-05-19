@@ -86,9 +86,9 @@ pkgs.testers.runNixOSTest {
     # immediately but better to check everything post-traffic.
     #
     # strip_to_store_path=False: `output` is searched for the
-    # `rio trace_id: <hex>` STDERR_NEXT line (trace-id-propagation
-    # subtest below). The default strip would discard everything but
-    # the store path.
+    # `rio: build <id> (trace <hex>)` STDERR_NEXT line
+    # (trace-id-propagation subtest below). The default strip would
+    # discard everything but the store path.
     output = build("${drvs.chain}", strip_to_store_path=False)
 
     # Port map (nix/modules/*.nix defaults):
@@ -240,12 +240,15 @@ pkgs.testers.runNixOSTest {
     # trace-id-propagation: STDERR_NEXT trace_id spans scheduler+worker
     # ══════════════════════════════════════════════════════════════════
     #
-    # Gateway emits `rio trace_id: <32-hex>` via STDERR_NEXT after
-    # SubmitBuild — gives operators a grep handle into the trace
-    # backend. The emitted id is the SCHEDULER's trace_id (from the
-    # x-rio-trace-id response-metadata header, not the gateway's own
-    # span — see r[obs.trace.scheduler-id-in-metadata]). That trace
-    # extends through worker via WorkAssignment.traceparent data-carry.
+    # Gateway emits `rio: build <id> (trace <32-hex>)` via STDERR_NEXT
+    # after SubmitBuild — the build_id is the user-facing handle for
+    # the dashboard / `rio-cli builds` / cancellation; the trace suffix
+    # gives operators a grep handle into the trace backend (appended
+    # only when OTel is wired — these VM nodes have it). The emitted
+    # trace id is the SCHEDULER's (from the x-rio-trace-id
+    # response-metadata header, not the gateway's own span — see
+    # r[obs.trace.scheduler-id-in-metadata]). That trace extends
+    # through worker via WorkAssignment.traceparent data-carry.
     #
     # link_parent() + #[instrument] produces a LINK, not a parent: the
     # scheduler handler span keeps its own trace_id. Gateway's trace
@@ -254,9 +257,9 @@ pkgs.testers.runNixOSTest {
     # (return scheduler trace_id in response metadata) is now landed.
 
     with subtest("trace-id-propagation: STDERR_NEXT id spans scheduler+worker"):
-        m = re.search(r"rio trace_id: ([0-9a-f]{32})", output)
+        m = re.search(r"rio: build \S+ \(trace ([0-9a-f]{32})\)", output)
         assert m, (
-            f"expected 'rio trace_id: <32-hex>' in build output; "
+            f"expected 'rio: build <id> (trace <32-hex>)' in build output; "
             f"first 500 chars: {output[:500]!r}"
         )
         emitted_trace_id = m.group(1).lower()

@@ -630,10 +630,11 @@ in
   #   names after a build — presence proves describe_*! wiring AND
   #   actual increments (metrics-rs registers on first increment).
   # r[verify obs.trace.scheduler-id-in-metadata]
-  #   trace-id-propagation subtest: STDERR_NEXT `rio trace_id:` line
-  #   is the scheduler's x-rio-trace-id (not the gateway's own span);
-  #   asserted to appear on both scheduler AND worker spans in the
-  #   collector file — proves the header carries the USEFUL id.
+  #   trace-id-propagation subtest: the `(trace <hex>)` suffix on the
+  #   `rio: build <id>` STDERR_NEXT line is the scheduler's
+  #   x-rio-trace-id (not the gateway's own span); asserted to appear
+  #   on both scheduler AND worker spans in the collector file —
+  #   proves the header carries the USEFUL id.
   # r[verify sched.trace.assignment-traceparent]
   #   span_from_traceparent parenting-vs-link observation: checks
   #   whether the worker build-executor span's parentSpanId matches a

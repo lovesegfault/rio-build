@@ -684,13 +684,28 @@ fn seed_minimal_drv(h: &GatewaySession) -> &'static str {
     drv_path
 }
 
-/// Collect all stderr messages until STDERR_LAST.
+/// Whether a frame is the gateway's own per-build diagnostic preamble
+/// (`rio: build <id> [(trace ...)]`) — emitted unconditionally before
+/// event 0, NOT a build event. The frame-sequence tests below assert on
+/// the activity/log frame ordering produced by *build events*; the
+/// preamble is orthogonal noise to those assertions, so the collection
+/// helpers strip it. Coverage for the preamble itself lives in
+/// `test_build_paths_emits_build_id_preamble`.
+fn is_diagnostic_preamble(msg: &StderrMessage) -> bool {
+    matches!(msg, StderrMessage::Next(s) if s.starts_with("rio: build "))
+}
+
+/// Collect all stderr messages until STDERR_LAST. Strips the per-build
+/// `rio: build` diagnostic preamble — see [`is_diagnostic_preamble`].
 async fn collect_stderr_frames(stream: &mut tokio::io::DuplexStream) -> Vec<StderrMessage> {
     let mut frames = Vec::new();
     loop {
         let msg = read_stderr_message(stream).await.expect("read stderr");
         if matches!(msg, StderrMessage::Last) {
             break;
+        }
+        if is_diagnostic_preamble(&msg) {
+            continue;
         }
         frames.push(msg);
     }
@@ -699,7 +714,9 @@ async fn collect_stderr_frames(stream: &mut tokio::io::DuplexStream) -> Vec<Stde
 
 /// Collect stderr frames until STDERR_LAST or STDERR_ERROR (both terminal
 /// for a single opcode). Unlike `collect_stderr_frames`, includes the
-/// terminal frame in the returned Vec so callers can inspect it.
+/// terminal frame in the returned Vec so callers can inspect it. Strips
+/// the per-build `rio: build` diagnostic preamble — see
+/// [`is_diagnostic_preamble`].
 async fn collect_stderr_frames_terminal(
     stream: &mut tokio::io::DuplexStream,
 ) -> Vec<StderrMessage> {
@@ -707,12 +724,103 @@ async fn collect_stderr_frames_terminal(
     loop {
         let msg = read_stderr_message(stream).await.expect("read stderr");
         let is_terminal = matches!(msg, StderrMessage::Last | StderrMessage::Error(_));
-        frames.push(msg);
+        if !is_diagnostic_preamble(&msg) {
+            frames.push(msg);
+        }
         if is_terminal {
             break;
         }
     }
     frames
+}
+
+/// Read stderr frames until the first non-preamble one. Used by the
+/// disconnect/shutdown tests, which read frames manually (not via
+/// [`collect_stderr_frames`]) because they need to drop the stream
+/// mid-build rather than drain to STDERR_LAST.
+async fn read_first_build_frame(stream: &mut tokio::io::DuplexStream) -> StderrMessage {
+    loop {
+        let msg = read_stderr_message(stream).await.expect("read stderr");
+        if !is_diagnostic_preamble(&msg) {
+            return msg;
+        }
+    }
+}
+
+/// The gateway emits a `rio: build <id>` STDERR_NEXT line as the FIRST
+/// frame after submit, BEFORE any build event — gives the user the
+/// build-tracking handle (dashboard, `rio-cli builds`, cancellation)
+/// the moment the build is accepted. This is the only test that
+/// observes the preamble; the other frame-sequence tests strip it via
+/// `collect_stderr_frames` because their assertions are about the
+/// activity/log frames produced by *build events*, which the preamble
+/// is not.
+///
+/// The trace suffix is absent here — the test harness has no OTel
+/// tracer wired, so `current_trace_id_hex()` returns "" and the
+/// gateway drops the `(trace ...)` part. The build_id is still
+/// emitted unconditionally; that's the load-bearing change from the
+/// old `rio trace_id:` line, which was suppressed entirely without
+/// OTel.
+#[tokio::test]
+async fn test_build_paths_emits_build_id_preamble() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
+        ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 1,
+            cached_derivations: 0,
+        })),
+        ev(build_event::Event::Completed(types::BuildCompleted {
+            output_paths: vec![],
+        })),
+    ]));
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9, // wopBuildPaths
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    // Read raw frames (NOT via collect_stderr_frames, which strips the
+    // preamble) and assert the first one is the build_id line. The
+    // build_id is the value the mock scheduler set in the
+    // x-rio-build-id response header.
+    let first = read_stderr_message(&mut h.stream)
+        .await
+        .expect("read stderr");
+    match &first {
+        StderrMessage::Next(s) => {
+            assert!(
+                s.starts_with("rio: build "),
+                "preamble frame should start with 'rio: build ', got: {s:?}"
+            );
+            // No trace suffix without OTel.
+            assert!(
+                !s.contains("(trace "),
+                "trace suffix should be absent without OTel: {s:?}"
+            );
+            // Single line, newline-terminated (matches `nix build`'s
+            // line-buffered stderr expectation).
+            assert!(s.ends_with('\n'), "preamble should be newline-terminated");
+            assert_eq!(s.matches('\n').count(), 1, "preamble should be one line");
+        }
+        other => panic!("expected STDERR_NEXT preamble, got {other:?}"),
+    }
+
+    // Drain the rest so finish() doesn't see a partial protocol.
+    loop {
+        if matches!(
+            read_stderr_message(&mut h.stream).await.expect("read"),
+            StderrMessage::Last
+        ) {
+            break;
+        }
+    }
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(result, 1);
+    h.finish().await;
+    Ok(())
 }
 
 /// BuildLogBatch lines become STDERR_NEXT frames.
@@ -985,6 +1093,9 @@ async fn test_build_paths_derivation_failed_emits_log_and_stop() -> anyhow::Resu
     );
 
     // Failed -> opcode 9 sends STDERR_ERROR. Before that: Start, Stop, Next(log).
+    // The failure log line carries a copy-pasteable `rio-cli logs` hint
+    // (no `--build-id` needed — exec-keyed storage resolves the latest
+    // execution, which is the one that just failed).
     let mut saw_start = false;
     let mut saw_stop = false;
     let mut saw_failed_log = false;
@@ -995,7 +1106,13 @@ async fn test_build_paths_derivation_failed_emits_log_and_stop() -> anyhow::Resu
         match msg {
             StderrMessage::StartActivity { .. } => saw_start = true,
             StderrMessage::StopActivity { .. } => saw_stop = true,
-            StderrMessage::Next(s) if s.contains("failed: boom") => saw_failed_log = true,
+            StderrMessage::Next(s) if s.contains("failed: boom") => {
+                assert!(
+                    s.contains(&format!("↳ rio-cli logs '{target}'")),
+                    "failure line should carry a copy-pasteable rio-cli hint: {s:?}"
+                );
+                saw_failed_log = true;
+            }
             StderrMessage::Error(_) => break,
             StderrMessage::Last => panic!("unexpected LAST before ERROR"),
             _ => {}
@@ -1764,11 +1881,10 @@ async fn test_mid_opcode_disconnect_cancels_build() -> anyhow::Result<()> {
     // we'd be testing a different (uninteresting) path.
     let first_frame = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        read_stderr_message(&mut h.stream),
+        read_first_build_frame(&mut h.stream),
     )
     .await
-    .expect("first stderr frame within 5s")
-    .expect("read stderr frame");
+    .expect("first build frame within 5s");
     assert!(
         matches!(first_frame, StderrMessage::Next(ref s) if s.contains("building step")),
         "expected STDERR_NEXT with log line, got: {first_frame:?}"
@@ -1906,11 +2022,10 @@ async fn test_shutdown_signal_cancels_active_builds() -> anyhow::Result<()> {
     // inside the stream loop with build_id in the map.
     let first_frame = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        read_stderr_message(&mut h.stream),
+        read_first_build_frame(&mut h.stream),
     )
     .await
-    .expect("first stderr frame within 5s")
-    .expect("read stderr frame");
+    .expect("first build frame within 5s");
     assert!(
         matches!(first_frame, StderrMessage::Next(ref s) if s.contains("building step")),
         "expected STDERR_NEXT, got: {first_frame:?}"
@@ -2011,11 +2126,10 @@ async fn test_shutdown_signal_mid_build_no_pipe_break_cancels() -> anyhow::Resul
     // Anchor: inside process_build_events, build_id in the map.
     let first_frame = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        read_stderr_message(&mut h.stream),
+        read_first_build_frame(&mut h.stream),
     )
     .await
-    .expect("first stderr frame within 5s")
-    .expect("read stderr frame");
+    .expect("first build frame within 5s");
     assert!(
         matches!(first_frame, StderrMessage::Next(ref s) if s.contains("building step")),
         "expected STDERR_NEXT, got: {first_frame:?}"
@@ -2390,11 +2504,10 @@ async fn test_disconnect_cancel_propagates_jwt() -> anyhow::Result<()> {
     // Anchor: first Log frame proves we're past SubmitBuild.
     let first = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        read_stderr_message(&mut h.stream),
+        read_first_build_frame(&mut h.stream),
     )
     .await
-    .expect("first stderr frame within 5s")
-    .expect("read stderr frame");
+    .expect("first build frame within 5s");
     assert!(matches!(first, StderrMessage::Next(ref s) if s.contains("building step")));
 
     // Drop client → BrokenPipe on next stderr write → cancel_active_builds.
