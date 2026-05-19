@@ -392,13 +392,19 @@ impl DagActor {
     /// Fire a log-flush request for the given derivation. No-op if the
     /// flusher isn't configured (tests, or `RIO_LOG_S3_BUCKET` unset).
     ///
-    /// Called from `handle_completion_success` AND `handle_permanent_failure`
-    /// — both paths flush because failed builds still have useful logs.
-    /// NOT called from `handle_transient_failure`: the derivation gets
-    /// re-queued, a new worker builds it from scratch, and the next
-    /// `assign_to_worker` calls [`Self::discard_log_buffer`] so the old
-    /// partial buffer is dropped before the new worker's first push.
-    pub(super) fn trigger_log_flush(&self, drv_hash: &DrvHash, interested_builds: Vec<Uuid>) {
+    /// Called from `handle_completion_success` (status `"succeeded"`) AND
+    /// `terminal_failure_epilogue` (status `"failed"`) — both paths flush
+    /// because failed builds still have useful logs. NOT called from
+    /// `handle_transient_failure`: the derivation gets re-queued, a new
+    /// worker builds it from scratch, and the next `assign_to_worker`
+    /// calls [`Self::discard_log_buffer`] so the old partial buffer is
+    /// dropped before the new worker's first push.
+    ///
+    /// `status` is recorded in `drv_logs.status` so the read path can
+    /// show outcome alongside the log without a join. The flusher reads
+    /// `exec_id` from the ring-buffer entry (stamped by `set_log_exec`),
+    /// not from this request — the actor doesn't carry it here.
+    pub(super) fn trigger_log_flush(&self, drv_hash: &DrvHash, status: &'static str) {
         let Some(drv_path) = self.dag.path_for_hash(drv_hash).map(String::from) else {
             // Should be impossible at this call site (completion handlers
             // already validated the hash exists in the DAG), but defensive.
@@ -407,7 +413,7 @@ impl DagActor {
         };
         self.events.try_log_flush(crate::logs::FlushRequest {
             drv_path,
-            interested_builds,
+            status: Some(status.to_string()),
         });
     }
 

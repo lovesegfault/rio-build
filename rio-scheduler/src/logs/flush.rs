@@ -5,21 +5,32 @@
 //!      derivation hits a terminal state (success OR permanent failure).
 // r[impl obs.log.periodic-flush]
 //!      This drains the buffer (`LogBuffers::drain`) and uploads the final
-//!      blob with `is_complete=true`.
+//!      blob to `logs/{drv_hash}/{exec_id}.log.zst` with `is_complete=true`.
 //!   2. **Periodic (30s)** — tick scans all active buffers and uploads
-//!      snapshots with `is_complete=false`. Does NOT drain: the derivation
-//!      is still running, live serving via the ring buffer must continue.
-//!      Per `observability.typ` this bounds log loss on scheduler
-//!      crash to ≤30s.
+//!      snapshots to `logs/{drv_hash}/{exec_id}.partial.log.zst` with
+//!      `is_complete=false`. Does NOT drain: the derivation is still
+//!      running, live serving via the ring buffer must continue. Per
+//!      `observability.typ` this bounds log loss on scheduler crash to
+//!      ≤30s. The `.partial` is best-effort deleted by the final flush
+//!      (or swept by the TTL GC at expiry if that delete fails).
+//!
+//! Both flush kinds write **one** `drv_logs` row per execution, UPSERTed on
+//! `(exec_id)` — a periodic snapshot inserts the row at `is_complete=false`,
+//! the final flush flips it to `is_complete=true` and stamps `finished_at`.
+//! The `exec_id` (per-execution UUIDv7 minted by `assign_to_worker`) lives
+//! on the `LogBuffers` ring-buffer entry; the flusher reads it from there
+//! because it has no actor `FlushRequest` for the periodic path. A flush
+//! with no `exec_id` (entry never `set_exec`'d — recovery gap or
+//! test-construction artifact) is **dropped**, not written under a garbage
+//! key.
 //!
 //! The flusher NEVER blocks the actor. It's mpsc-fed (`try_send`, bounded
 //! channel); if the channel is full, the actor's completion flush is
 //! dropped. The buffer stays in `LogBuffers.buffers` (sealed) and the next
-//! periodic tick still snapshots it to `logs/periodic/{hash}` — so the
-//! content survives at the periodic key, but no `build_logs` PG row is
-//! written and the dashboard sees only the last `is_complete=false`
-//! snapshot. `CleanupTerminalBuild` (~30s later) reaps the DAG node and
-//! discards the buffer (`LogBuffers::discard`), bounding the leak.
+//! periodic tick still snapshots it — so the content survives at the
+//! `.partial` key with an `is_complete=false` PG row. `CleanupTerminalBuild`
+//! (~30s later) reaps the DAG node and discards the buffer
+//! (`LogBuffers::discard`), bounding the leak.
 //!
 //! Compression is CPU-bound; runs in `spawn_blocking` so it doesn't hog a
 //! tokio worker thread during the typical 10-100ms compression of a few-MB log.
@@ -42,17 +53,19 @@ use super::{LogBuffers, drv_log_hash, log_s3_key};
 const PERIODIC_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Request to flush one derivation's logs. Sent by the actor from
-/// `handle_completion_success` and `handle_permanent_failure` (both paths
+/// `handle_completion_success` and `terminal_failure_epilogue` (both paths
 /// flush — failed builds still have useful logs).
 #[derive(Debug)]
 pub struct FlushRequest {
-    /// The buffer key — full `/nix/store/{hash}-{name}.drv` path. Also
-    /// the source for the S3 key (`logs/{build_id}/{drv_hash}.log.zst`)
-    /// and PG `drv_hash` column via [`drv_log_hash`].
+    /// The buffer key — full `/nix/store/{hash}-{name}.drv` path. Also the
+    /// source for the S3 key `logs/{drv_hash}/{exec_id}.log.zst` and PG
+    /// `drv_logs.drv_hash` column via [`drv_log_hash`].
     pub drv_path: String,
-    /// One PG row per build, all pointing at the same S3 blob. The derivation
-    /// builds exactly once even if N builds want it (DAG merging).
-    pub interested_builds: Vec<Uuid>,
+    /// Build outcome for `drv_logs.status` (`"succeeded"` / `"failed"`).
+    /// `None` for periodic snapshots (build still running). Recorded in PG
+    /// so `rio-cli logs` and the dashboard can show outcome alongside the
+    /// log without a join against `derivations`.
+    pub status: Option<String>,
 }
 
 /// S3 log flusher. Owns no state except what's passed in — `Arc<LogBuffers>`
@@ -136,6 +149,11 @@ impl LogFlusher {
     /// On-completion flush: drain the buffer (derivation is done, no more
     /// writes coming) and upload with `is_complete=true`.
     async fn flush_final(&self, req: FlushRequest) {
+        // Read exec_id BEFORE drain() removes the entry. The accessor
+        // returns None if the entry doesn't exist (silent build, dup
+        // request) or was never set_exec'd — both make the flush a no-op
+        // anyway, so the ordering is safe.
+        let exec_id = self.buffers.exec_id(&req.drv_path);
         let drained = self.buffers.drain(&req.drv_path);
         // Seal bridged completion→drain; that window is now closed.
         // Clear so `sealed` stays bounded even if the recv task is
@@ -150,13 +168,15 @@ impl LogFlusher {
             debug!(drv_path = %req.drv_path, "no buffer to flush (silent build or dup)");
             return;
         };
-        self.upload_and_record(req, first_line, line_count, raw_bytes, lines, true)
+        self.upload_and_record(req, exec_id, first_line, line_count, raw_bytes, lines, true)
             .await;
     }
 
     /// Periodic flush: snapshot all active buffers (non-draining) and upload
     /// with `is_complete=false`. Builds still running → buffer stays for
-    /// live serving.
+    /// live serving. No actor `FlushRequest` is involved — the periodic
+    /// flush is self-driven off `LogBuffers::active_keys()` and reads
+    /// `exec_id` from the ring-buffer entry (the carrier `set_exec` stamps).
     async fn flush_periodic(&self) {
         let keys = self.buffers.active_keys();
         if keys.is_empty() {
@@ -165,6 +185,7 @@ impl LogFlusher {
         debug!(active = keys.len(), "periodic log snapshot");
 
         for drv_path in keys {
+            let exec_id = self.buffers.exec_id(&drv_path);
             let Some((first_line, line_count, raw_bytes, lines)) = self.buffers.snapshot(&drv_path)
             else {
                 // Buffer vanished between active_keys() and snapshot() —
@@ -172,26 +193,20 @@ impl LogFlusher {
                 continue;
             };
 
-            // Periodic flush doesn't know interested_builds — that lives
-            // in the actor's DAG, which we deliberately don't touch. So
-            // periodic snapshots write NO PG rows. The on-completion
-            // flush (which DOES know builds) writes the authoritative PG
-            // rows + the canonical S3 key.
-            //
-            // Periodic snapshots are for crash recovery only: "the
-            // scheduler died, but here's what was in the ring buffer ~30s
-            // ago". A human operator can find them by S3 list on
-            // `logs/periodic/`. They're NOT served by AdminService.
             let req = FlushRequest {
                 drv_path,
-                interested_builds: Vec::new(), // no PG rows for periodic
+                // Build still running — outcome unknown. Stays NULL in
+                // PG until the final flush sets it.
+                status: None,
             };
-            self.upload_and_record(req, first_line, line_count, raw_bytes, lines, false)
-                .await;
+            self.upload_and_record(
+                req, exec_id, first_line, line_count, raw_bytes, lines, false,
+            )
+            .await;
         }
     }
 
-    /// Compress → S3 PUT → PG insert (if `interested_builds` is non-empty).
+    /// Compress → S3 PUT → PG UPSERT (one row per execution).
     ///
     /// Errors are logged, not propagated. The flusher must never die on a
     /// transient S3/PG error — if it did, ALL future logs would be lost,
@@ -202,34 +217,51 @@ impl LogFlusher {
     /// alternative — re-inserting on fail — was considered and rejected
     /// as it complicates the buffer lifecycle for a rare edge case;
     /// is_complete would stay false anyway).
+    ///
+    /// `exec_id` is read from the ring-buffer entry by the caller (before
+    /// `drain()` removes it for finals). `None` ⇒ skip: there is no
+    /// meaningful S3 key without it. `set_exec` is always called at
+    /// `assign_to_worker` and re-stamped by recovery for active
+    /// assignments, so a `None` here is a recovery gap or a
+    /// test-construction artifact — drop loudly rather than write under a
+    /// garbage key the read path will never find.
+    #[allow(clippy::too_many_arguments)] // call-site-local; threading a struct would just rename the args
     async fn upload_and_record(
         &self,
         req: FlushRequest,
+        exec_id: Option<Uuid>,
         first_line: u64,
         line_count: u64,
-        _raw_bytes: u64,
+        raw_bytes: u64,
         lines: Vec<Vec<u8>>,
         is_final: bool,
     ) {
-        // S3 key: for finals, `logs/{min_build_id}/{drv_hash}.log.zst` via
-        // `log_s3_key()`. Per spec (observability.typ). We use the MIN
-        // interested build's id for the key path (deterministic:
-        // `get_interested_builds()` sorts, so `.first()` is min(UUID) — the
-        // spec doesn't say which build_id when N>1, and PG rows all point
-        // at the same s3_key anyway).
-        //
-        // For periodic: interested_builds is empty → key is
-        // `logs/periodic/{drv_hash}.log.zst`.
+        let Some(exec_id) = exec_id else {
+            warn!(
+                drv = %req.drv_path,
+                is_final,
+                "skipping flush: no exec_id (set_exec never called — recovery gap or test artifact)"
+            );
+            return;
+        };
+        // set_exec creates an empty ring-buffer entry; the periodic tick
+        // would otherwise flush a zero-line `.partial` blob and PG row for
+        // the window between dispatch and the worker's first batch (overlay
+        // setup, FUSE warm — easily >30s). Skip — there's nothing to
+        // store. flush_final's caller already early-returns on a None
+        // drain (silent build), so this only fires for the periodic path's
+        // snapshot of a stamped-but-empty entry.
+        if line_count == 0 {
+            return;
+        }
+
         let drv_hash = drv_log_hash(&req.drv_path);
         debug_assert!(
             !drv_hash.is_empty(),
             "drv_log_hash({:?}) yielded empty hash — drv_path not store-path-shaped",
             req.drv_path
         );
-        let s3_key = match req.interested_builds.first() {
-            Some(bid) => log_s3_key(bid, &req.drv_path),
-            None => format!("logs/periodic/{drv_hash}.log.zst"),
-        };
+        let s3_key = log_s3_key(&req.drv_path, &exec_id, !is_final);
 
         // Compress in spawn_blocking. ~10 MiB of log compresses in ~50ms on
         // modern hardware; not long enough to matter for latency, but long
@@ -281,35 +313,60 @@ impl LogFlusher {
         );
         metrics::counter!("rio_scheduler_log_flush_total", "kind" => if is_final { "final" } else { "periodic" }).increment(1);
 
-        // PG rows — only for finals (periodic snapshots aren't dashboard-
-        // servable, see flush_periodic comment).
-        if !req.interested_builds.is_empty()
-            && let Err(e) = insert_log_rows(
-                &self.pool,
-                &req.interested_builds,
-                &drv_hash,
-                &s3_key,
-                first_line,
-                line_count,
-                is_final,
-            )
-            .await
+        // PG UPSERT — one row per execution, keyed on exec_id. Periodic
+        // and final flushes UPSERT the same row (is_complete flips
+        // false→true on the final).
+        if let Err(e) = upsert_drv_log(
+            &self.pool,
+            exec_id,
+            &drv_hash,
+            &s3_key,
+            first_line,
+            line_count,
+            raw_bytes,
+            is_final,
+            req.status.as_deref(),
+        )
+        .await
         {
             warn!(
                 s3_key = %s3_key,
-                "PG build_logs insert failed; S3 blob exists but dashboard \
-                 won't find it. Manual: SELECT from build_logs or S3 list."
+                "PG drv_logs upsert failed; S3 blob exists but read path \
+                 won't find it. Manual: SELECT from drv_logs or S3 list."
             );
             // Route through the chokepoint helper so the counter has a
             // consistent {phase, is_final} label set (bug_018: the
             // inline emit had `phase` only → `{is_final="true"}` queries
             // silently excluded PG failures).
             flush_failure(is_final, "pg", &s3_key, &e, &req.drv_path);
+            return;
+        }
+
+        // Best-effort delete the `.partial` snapshot AFTER the final blob's
+        // PG row landed — the final supersedes it. A failed delete leaves a
+        // stale `.partial` that the TTL GC sweep catches at expiry; that's
+        // an accepted residual leak (bounded by retention), not an error.
+        if is_final {
+            let partial_key = log_s3_key(&req.drv_path, &exec_id, true);
+            if let Err(e) = self
+                .s3
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(&partial_key)
+                .send()
+                .await
+            {
+                debug!(
+                    key = %partial_key,
+                    error = %e,
+                    "best-effort .partial delete failed (TTL sweep will catch it at expiry)"
+                );
+            }
         }
     }
 }
 
-/// Log + metric for a compress/S3 failure. Level depends on `is_final`:
+/// Log + metric for a compress/S3/PG failure. Level depends on `is_final`:
 /// final flushes already drained the buffer (data is gone → `error!`);
 /// periodic flushes snapshotted (buffer intact, next tick retries →
 /// `warn!`). Prevents an S3 blip from emitting N false "log is lost"
@@ -356,48 +413,82 @@ fn compress_lines(lines: &[Vec<u8>]) -> std::io::Result<Vec<u8>> {
     encoder.finish()
 }
 
-/// UPSERT build_logs rows (one per build_id). ON CONFLICT updates the
-/// existing row — this handles the periodic-then-final sequence where a
-/// snapshot row already exists and the final flush should overwrite it.
-async fn insert_log_rows(
+/// UPSERT one `drv_logs` row keyed on `(exec_id)`.
+///
+/// The periodic→final sequence UPSERTs the same row: a periodic snapshot
+/// inserts at `is_complete=false`, the final flush flips it `true`, swaps
+/// the `s3_key` from `.partial.log.zst` to `.log.zst`, and stamps
+/// `finished_at`. `started_at` is intentionally NOT in `DO UPDATE SET` —
+/// the first INSERT decodes it from the UUIDv7's embedded timestamp (the
+/// dispatch instant, exact, no clock read), and subsequent UPSERTs preserve
+/// the original. The workspace sqlx has no chrono/time feature (see
+/// `db/history.rs:44`), so the timestamp is bound as f64 epoch seconds and
+/// PG's `to_timestamp()` does the conversion server-side; `finished_at`
+/// uses server-side `now()` matching the existing `builds` write path.
+#[allow(clippy::too_many_arguments)] // one UPSERT with the full row — a struct param would just rename the args
+async fn upsert_drv_log(
     pool: &PgPool,
-    build_ids: &[Uuid],
+    exec_id: Uuid,
     drv_hash: &str,
     s3_key: &str,
     first_line: u64,
     line_count: u64,
+    total_bytes: u64,
     is_complete: bool,
+    status: Option<&str>,
 ) -> sqlx::Result<()> {
-    // One query per build. Could be a bulk UNNEST, but N is typically 1-2
-    // and the S3 PUT above already dominates latency.
-    for bid in build_ids {
-        sqlx::query(
-            "INSERT INTO build_logs
-                 (build_id, drv_hash, s3_key, first_line, line_count, is_complete)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (build_id, drv_hash) DO UPDATE SET
-                 s3_key = EXCLUDED.s3_key,
-                 first_line = EXCLUDED.first_line,
-                 line_count = EXCLUDED.line_count,
-                 is_complete = EXCLUDED.is_complete,
-                 created_at = now()",
-        )
-        .bind(bid)
-        .bind(drv_hash)
-        .bind(s3_key)
-        .bind(first_line as i64)
-        .bind(line_count as i64)
-        .bind(is_complete)
-        .execute(pool)
-        .await?;
-    }
+    // Decode the dispatch instant from the UUIDv7's high 48 bits. A
+    // non-v7 UUID has no embedded timestamp — should never happen since
+    // `assign_to_worker` mints with `Uuid::now_v7()`. A naive
+    // `Option<f64>` bind would `to_timestamp(NULL)` → NOT NULL violation
+    // on `started_at`, so:
+    let started_at_epoch: f64 = exec_id
+        .get_timestamp()
+        .map(|ts| {
+            let (secs, nanos) = ts.to_unix();
+            secs as f64 + f64::from(nanos) / 1e9
+        })
+        // Use 0.0 (1970) rather than panicking — the row is wrong but the
+        // system stays up, and the GC sweep will expire it immediately,
+        // which is what you'd want for a row that should never have
+        // existed.
+        .unwrap_or(0.0);
+
+    sqlx::query(
+        "INSERT INTO drv_logs
+             (exec_id, drv_hash, s3_key, first_line, line_count, total_bytes,
+              is_complete, status, started_at, finished_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9),
+                 CASE WHEN $7 THEN now() ELSE NULL END)
+         ON CONFLICT (exec_id) DO UPDATE SET
+             s3_key = EXCLUDED.s3_key,
+             first_line = EXCLUDED.first_line,
+             line_count = EXCLUDED.line_count,
+             total_bytes = EXCLUDED.total_bytes,
+             is_complete = EXCLUDED.is_complete,
+             status = EXCLUDED.status,
+             finished_at = EXCLUDED.finished_at",
+    )
+    .bind(exec_id)
+    .bind(drv_hash)
+    .bind(s3_key)
+    .bind(first_line as i64)
+    .bind(line_count as i64)
+    .bind(total_bytes as i64)
+    .bind(is_complete)
+    .bind(status)
+    .bind(started_at_epoch)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
 // r[verify obs.log.periodic-flush]
+// r[verify obs.log.exec-keyed]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_sdk_s3::operation::delete_object::DeleteObjectOutput;
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_smithy_mocks::{RuleMode, mock, mock_client};
     use rio_test_support::TestDb;
@@ -406,39 +497,47 @@ mod tests {
     type CapturedPut = (String, Vec<u8>);
     /// Shared sink the `.match_requests` closure fills.
     type CapturedPuts = Arc<std::sync::Mutex<Vec<CapturedPut>>>;
+    /// DeleteObject keys captured.
+    type CapturedDeletes = Arc<std::sync::Mutex<Vec<String>>>;
 
-    /// Build a mock S3 client that captures PutObject calls. Returns
-    /// `(client, captured_requests)` where captured is the (key, body_bytes)
-    /// pairs the client observed.
+    /// Build a mock S3 client that captures PutObject and DeleteObject
+    /// calls. Returns `(client, captured_puts, captured_deletes)`.
     ///
     /// aws-smithy-mocks doesn't have a direct "capture request" API, so we
-    /// use an Arc<Mutex<Vec>> that the `.match_requests` closure fills.
-    fn mock_s3_capturing_puts() -> (S3Client, CapturedPuts) {
-        let captured: CapturedPuts = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let cap = Arc::clone(&captured);
+    /// use an `Arc<Mutex<Vec>>` that the `.match_requests` closure fills.
+    fn mock_s3_capturing() -> (S3Client, CapturedPuts, CapturedDeletes) {
+        let puts: CapturedPuts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let deletes: CapturedDeletes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pcap = Arc::clone(&puts);
+        let dcap = Arc::clone(&deletes);
         // match_requests gets the parsed request struct. We can read the key
         // directly, but the body is a ByteStream which needs async to drain.
         // aws-smithy-mocks' closure is sync. Workaround: the body for our
         // test is small and in-memory; `.bytes()` on the inner returns it
         // synchronously for Bytes-backed streams (which ByteStream::from(Vec)
         // produces).
-        let rule = mock!(S3Client::put_object)
+        let put_rule = mock!(S3Client::put_object)
             .match_requests(move |req| {
                 let key = req.key().unwrap_or("<no-key>").to_string();
-                // Body introspection via bytes(): works for in-memory bodies.
-                // For file-backed streams this would be None; our tests always
-                // use in-memory ByteStream::from(Vec<u8>).
                 let body_bytes = req
                     .body()
                     .bytes()
                     .map(|b| b.to_vec())
                     .unwrap_or_else(|| b"<streaming-body-not-introspectable>".to_vec());
-                cap.lock().unwrap().push((key, body_bytes));
+                pcap.lock().unwrap().push((key, body_bytes));
                 true
             })
             .then_output(|| PutObjectOutput::builder().build());
-        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&rule]);
-        (client, captured)
+        let del_rule = mock!(S3Client::delete_object)
+            .match_requests(move |req| {
+                dcap.lock()
+                    .unwrap()
+                    .push(req.key().unwrap_or("<no-key>").to_string());
+                true
+            })
+            .then_output(|| DeleteObjectOutput::builder().build());
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put_rule, &del_rule]);
+        (client, puts, deletes)
     }
 
     fn mk_batch(
@@ -454,13 +553,18 @@ mod tests {
         }
     }
 
-    /// Seed a build row so build_logs.build_id FK has something to reference.
-    async fn seed_build(pool: &PgPool, build_id: Uuid) -> anyhow::Result<()> {
-        sqlx::query("INSERT INTO builds (build_id, status) VALUES ($1, 'active')")
-            .bind(build_id)
-            .execute(pool)
-            .await?;
-        Ok(())
+    /// Stamp + populate a buffer for `drv_path`. Returns the `exec_id`
+    /// the flusher will key the S3 blob and PG row on. Mirrors the
+    /// production order: `assign_to_worker` calls `set_exec` (which
+    /// creates the entry), then the worker's first `BuildLogBatch`
+    /// populates it.
+    fn stamp_and_push(buffers: &LogBuffers, drv_path: &str, lines: &[&[u8]]) -> Uuid {
+        let exec_id = Uuid::now_v7();
+        buffers.set_exec(drv_path, exec_id, "test-worker");
+        if !lines.is_empty() {
+            buffers.push(&mk_batch(drv_path, 0, lines));
+        }
+        exec_id
     }
 
     #[test]
@@ -489,18 +593,16 @@ mod tests {
     #[tokio::test]
     async fn flush_final_drains_buffer_and_uploads() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let build_id = Uuid::new_v4();
-        seed_build(&db.pool, build_id).await?;
 
         // Use a realistic full store path — regression guard for the bug
         // where the S3 key embedded the entire `/nix/store/{hash}-{name}.drv`
-        // (producing `logs/{bid}//nix/store/...`) instead of just `{hash}`.
+        // (producing `logs/{hash}//nix/store/...`) instead of just `{hash}`.
         let drv_path = "/nix/store/amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2-firefox-unwrapped-149.0.drv";
         let drv_hash = "amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2";
 
-        let (s3, captured) = mock_s3_capturing_puts();
+        let (s3, puts, deletes) = mock_s3_capturing();
         let buffers = Arc::new(LogBuffers::new());
-        buffers.push(&mk_batch(drv_path, 0, &[b"line0", b"line1", b"line2"]));
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"line0", b"line1", b"line2"]);
         assert_eq!(buffers.active_count(), 1);
 
         let flusher = LogFlusher::new(
@@ -513,7 +615,7 @@ mod tests {
         flusher
             .flush_final(FlushRequest {
                 drv_path: drv_path.into(),
-                interested_builds: vec![build_id],
+                status: Some("succeeded".into()),
             })
             .await;
 
@@ -525,28 +627,44 @@ mod tests {
         // deadlock if the mock client were called from another task
         // on this same thread (it isn't here, but clippy is right to
         // flag it as a footgun).
-        let puts: Vec<CapturedPut> = captured.lock().unwrap().clone();
-        assert_eq!(puts.len(), 1);
-        let (key, body) = &puts[0];
-        assert_eq!(key, &format!("logs/{build_id}/{drv_hash}.log.zst"));
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1);
+        let (key, body) = &captured[0];
+        assert_eq!(key, &format!("logs/{drv_hash}/{exec_id}.log.zst"));
         assert!(
             !key.contains("/nix/store/"),
             "S3 key must not embed the store prefix"
         );
         assert_eq!(&body[..4], &[0x28, 0xb5, 0x2f, 0xfd], "should be zstd");
 
-        // PG row inserted with is_complete=true.
-        let row: (i64, i64, bool) = sqlx::query_as(
-            "SELECT first_line, line_count, is_complete FROM build_logs \
-             WHERE build_id = $1 AND drv_hash = $2",
+        // The final flush best-effort deletes the `.partial` snapshot.
+        let dels: Vec<String> = deletes.lock().unwrap().clone();
+        assert_eq!(
+            dels,
+            vec![format!("logs/{drv_hash}/{exec_id}.partial.log.zst")]
+        );
+
+        // ONE PG row, keyed on exec_id, with is_complete=true.
+        let row: (i64, i64, i64, bool, Option<String>) = sqlx::query_as(
+            "SELECT first_line, line_count, total_bytes, is_complete, status \
+             FROM drv_logs WHERE exec_id = $1",
         )
-        .bind(build_id)
-        .bind(drv_hash)
+        .bind(exec_id)
         .fetch_one(&db.pool)
         .await?;
         assert_eq!(row.0, 0, "first_line (no eviction)");
         assert_eq!(row.1, 3, "line_count");
-        assert!(row.2, "is_complete should be true for final flush");
+        assert_eq!(
+            row.2, 15,
+            "total_bytes (raw line bytes from RingBuf — no newlines: 3 × 5)"
+        );
+        assert!(row.3, "is_complete should be true for final flush");
+        assert_eq!(row.4.as_deref(), Some("succeeded"));
+        // Exactly one row total — no fan-out.
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM drv_logs")
+            .fetch_one(&db.pool)
+            .await?;
+        assert_eq!(count.0, 1);
         Ok(())
     }
 
@@ -555,21 +673,21 @@ mod tests {
         // Silent build (zero log output) or duplicate flush req — buffer
         // doesn't exist. Should not panic, not S3-PUT, not PG-insert.
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let (s3, captured) = mock_s3_capturing_puts();
+        let (s3, puts, _deletes) = mock_s3_capturing();
         let buffers = Arc::new(LogBuffers::new());
-        // DON'T push anything.
+        // DON'T set_exec or push anything.
 
         let flusher = LogFlusher::new(s3, "test-bucket".into(), db.pool.clone(), buffers);
 
         flusher
             .flush_final(FlushRequest {
                 drv_path: "nonexistent".into(),
-                interested_builds: vec![Uuid::new_v4()],
+                status: Some("failed".into()),
             })
             .await;
 
-        assert!(captured.lock().unwrap().is_empty(), "no S3 PUT");
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM build_logs")
+        assert!(puts.lock().unwrap().is_empty(), "no S3 PUT");
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM drv_logs")
             .fetch_one(&db.pool)
             .await?;
         assert_eq!(count.0, 0, "no PG row");
@@ -577,15 +695,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flush_skipped_without_exec_id() -> anyhow::Result<()> {
+        // A push() without set_exec creates an entry with exec_id = None.
+        // The flusher MUST skip it — there's no meaningful S3 key without
+        // exec_id. This guards the load-bearing invariant in the
+        // `RingBuf.exec_id` doc.
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, _deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        // Legacy push() without set_exec → entry exists but unstamped.
+        buffers.push(&mk_batch("/nix/store/aaaa-nostamp.drv", 0, &[b"line"]));
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+        );
+
+        // Both paths should skip.
+        flusher.flush_periodic().await;
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: "/nix/store/aaaa-nostamp.drv".into(),
+                status: Some("succeeded".into()),
+            })
+            .await;
+
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "no S3 PUT for unstamped entry"
+        );
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM drv_logs")
+            .fetch_one(&db.pool)
+            .await?;
+        assert_eq!(count.0, 0, "no PG row for unstamped entry");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zero_line_flush_is_skipped() -> anyhow::Result<()> {
+        // set_exec creates an empty entry. flush_periodic must not produce
+        // an S3 PUT or PG row for it — there's nothing to store, and a
+        // zero-line `.partial` blob/row for every dispatched-but-not-yet-
+        // streaming drv would be noise.
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, _deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        buffers.set_exec("/nix/store/aaaa-empty.drv", Uuid::now_v7(), "test-worker");
+        assert_eq!(buffers.active_count(), 1, "set_exec creates the entry");
+
+        let flusher = LogFlusher::new(s3, "test-bucket".into(), db.pool.clone(), buffers);
+
+        flusher.flush_periodic().await;
+
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "no S3 PUT for empty buffer"
+        );
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM drv_logs")
+            .fetch_one(&db.pool)
+            .await?;
+        assert_eq!(count.0, 0, "no PG row for empty buffer");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn flush_periodic_snapshots_not_drains() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let (s3, captured) = mock_s3_capturing_puts();
+        let (s3, puts, deletes) = mock_s3_capturing();
         let buffers = Arc::new(LogBuffers::new());
-        buffers.push(&mk_batch(
-            "/nix/store/aaaa-test.drv",
-            0,
-            &[b"running", b"still-running"],
-        ));
+        let drv_path = "/nix/store/aaaa-test.drv";
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"running", b"still-running"]);
 
         let flusher = LogFlusher::new(
             s3,
@@ -602,122 +783,127 @@ mod tests {
             1,
             "periodic flush must snapshot, not drain"
         );
-        assert_eq!(
-            buffers
-                .read_since("/nix/store/aaaa-test.drv", 0)
-                .unwrap()
-                .len(),
-            2
+        assert_eq!(buffers.read_since(drv_path, 0).unwrap().len(), 2);
+
+        // S3 PUT happened under the `.partial` key, no delete.
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1);
+        let (key, _body) = &captured[0];
+        assert_eq!(key, &format!("logs/aaaa/{exec_id}.partial.log.zst"));
+        assert!(
+            deletes.lock().unwrap().is_empty(),
+            "periodic must not delete"
         );
 
-        // S3 PUT happened under periodic/ key, NO PG row.
-        let puts: Vec<CapturedPut> = captured.lock().unwrap().clone();
-        assert_eq!(puts.len(), 1);
-        let (key, _body) = &puts[0];
-        assert_eq!(key, "logs/periodic/aaaa.log.zst");
-
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM build_logs")
-            .fetch_one(&db.pool)
-            .await?;
-        assert_eq!(count.0, 0, "periodic flush writes no PG rows");
+        // ONE PG row with is_complete=false, status NULL.
+        let row: (bool, Option<String>) =
+            sqlx::query_as("SELECT is_complete, status FROM drv_logs WHERE exec_id = $1")
+                .bind(exec_id)
+                .fetch_one(&db.pool)
+                .await?;
+        assert!(!row.0, "periodic flush is is_complete=false");
+        assert!(row.1.is_none(), "periodic flush has no status");
         Ok(())
     }
 
     #[tokio::test]
-    async fn upsert_overwrites_snapshot_with_final() -> anyhow::Result<()> {
-        // The periodic-then-final sequence: a periodic snapshot wrote a row
-        // with is_complete=false (it doesn't in current code, but ON CONFLICT
-        // must still handle the general case), then the final flush UPSERTs.
-        // Actually wait — periodic doesn't write PG rows. So the only way to
-        // hit ON CONFLICT is: two finals for the same (build, drv). That
-        // happens if the actor sends a dup FlushRequest. The first one
-        // drains + inserts; the second finds no buffer → noop. So ON CONFLICT
-        // is unreachable in the current code path.
-        //
-        // BUT: it's still the right SQL for future-proofing (e.g., if we add
-        // "retry final flush on S3 failure" later). Test it directly.
+    async fn periodic_then_final_upserts_same_row() -> anyhow::Result<()> {
+        // The full periodic → final lifecycle: a snapshot row is created at
+        // is_complete=false, the final flush UPSERTs it to is_complete=true,
+        // swaps the s3_key from `.partial` to the canonical key, and stamps
+        // status + finished_at. started_at is preserved from the first
+        // INSERT (NOT in DO UPDATE SET).
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let build_id = Uuid::new_v4();
-        seed_build(&db.pool, build_id).await?;
+        let (s3, _puts, _deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/aaaa-lifecycle.drv";
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"compiling"]);
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+        );
 
-        insert_log_rows(&db.pool, &[build_id], "hash", "key-v1", 0, 10, false).await?;
-        insert_log_rows(&db.pool, &[build_id], "hash", "key-v2", 7, 50, true).await?;
-
-        let row: (String, i64, i64, bool) = sqlx::query_as(
-            "SELECT s3_key, first_line, line_count, is_complete FROM build_logs
-             WHERE build_id = $1 AND drv_hash = $2",
+        flusher.flush_periodic().await;
+        let snap: (bool, String, f64) = sqlx::query_as(
+            "SELECT is_complete, s3_key, EXTRACT(EPOCH FROM started_at)::float8 \
+             FROM drv_logs WHERE exec_id = $1",
         )
-        .bind(build_id)
-        .bind("hash")
+        .bind(exec_id)
         .fetch_one(&db.pool)
         .await?;
-        assert_eq!(row.0, "key-v2", "UPSERT should overwrite");
-        assert_eq!(row.1, 7, "first_line UPSERTed");
-        assert_eq!(row.2, 50);
-        assert!(row.3);
+        assert!(!snap.0);
+        assert!(snap.1.ends_with(".partial.log.zst"));
 
-        // Still exactly one row (UPSERT, not duplicate insert).
-        let count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM build_logs WHERE build_id = $1 AND drv_hash = $2")
-                .bind(build_id)
-                .bind("hash")
-                .fetch_one(&db.pool)
-                .await?;
+        // More lines arrive, then the build finishes.
+        buffers.push(&mk_batch(drv_path, 1, &[b"linking", b"done"]));
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                status: Some("succeeded".into()),
+            })
+            .await;
+
+        let fin: (bool, String, Option<String>, i64, f64, Option<f64>) = sqlx::query_as(
+            "SELECT is_complete, s3_key, status, line_count, \
+                    EXTRACT(EPOCH FROM started_at)::float8, \
+                    EXTRACT(EPOCH FROM finished_at)::float8 \
+             FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert!(fin.0, "final flips is_complete");
+        assert!(fin.1.ends_with(".log.zst") && !fin.1.contains(".partial"));
+        assert_eq!(fin.2.as_deref(), Some("succeeded"));
+        assert_eq!(fin.3, 3, "line_count from the final drain");
+        // started_at preserved across the UPSERT (not overwritten).
+        assert!(
+            (fin.4 - snap.2).abs() < 1e-3,
+            "started_at preserved: {} vs {}",
+            fin.4,
+            snap.2
+        );
+        assert!(fin.5.is_some(), "finished_at stamped on final");
+
+        // Still exactly one row.
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM drv_logs")
+            .fetch_one(&db.pool)
+            .await?;
         assert_eq!(count.0, 1);
         Ok(())
     }
 
     #[tokio::test]
-    async fn flush_final_multiple_interested_builds_one_blob_n_rows() -> anyhow::Result<()> {
-        // The DAG-merging case: 3 builds all want the same derivation.
-        // One S3 blob, 3 PG rows, all with the same s3_key.
+    async fn started_at_decoded_from_uuidv7_timestamp() -> anyhow::Result<()> {
+        // started_at must come from the UUIDv7's embedded dispatch
+        // timestamp, NOT a fresh clock read at flush time. Construct a
+        // UUIDv7 with a known epoch and assert the PG column matches.
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let b1 = Uuid::new_v4();
-        let b2 = Uuid::new_v4();
-        let b3 = Uuid::new_v4();
-        for b in [b1, b2, b3] {
-            seed_build(&db.pool, b).await?;
-        }
+        // 2024-01-01 00:00:00 UTC = 1704067200.
+        let known_epoch_ms: u64 = 1_704_067_200_000;
+        let ts = uuid::Timestamp::from_unix_time(known_epoch_ms / 1000, 0, 0, 0);
+        let exec_id = Uuid::new_v7(ts);
 
-        let drv_path = "/nix/store/ssssssssssssssssssssssssssssssss-shared.drv";
-        let (s3, captured) = mock_s3_capturing_puts();
-        let buffers = Arc::new(LogBuffers::new());
-        buffers.push(&mk_batch(drv_path, 0, &[b"shared-line"]));
+        upsert_drv_log(&db.pool, exec_id, "h", "k", 0, 1, 5, false, None).await?;
 
-        let flusher = LogFlusher::new(s3, "test-bucket".into(), db.pool.clone(), buffers);
-
-        flusher
-            .flush_final(FlushRequest {
-                drv_path: drv_path.into(),
-                interested_builds: vec![b1, b2, b3],
-            })
-            .await;
-
-        // ONE S3 PUT.
-        assert_eq!(captured.lock().unwrap().len(), 1);
-        let expected_key = format!("logs/{b1}/ssssssssssssssssssssssssssssssss.log.zst");
-        assert_eq!(captured.lock().unwrap()[0].0, expected_key);
-
-        // THREE PG rows, all same s3_key.
-        let rows: Vec<(Uuid, String)> = sqlx::query_as(
-            "SELECT build_id, s3_key FROM build_logs \
-             WHERE drv_hash = 'ssssssssssssssssssssssssssssssss'",
+        let row: (f64,) = sqlx::query_as(
+            "SELECT EXTRACT(EPOCH FROM started_at)::float8 FROM drv_logs WHERE exec_id = $1",
         )
-        .fetch_all(&db.pool)
+        .bind(exec_id)
+        .fetch_one(&db.pool)
         .await?;
-        assert_eq!(rows.len(), 3);
-        for (_bid, key) in &rows {
-            assert_eq!(key, &expected_key, "all rows point at same blob");
-        }
-        let bids: std::collections::HashSet<Uuid> = rows.iter().map(|(b, _)| *b).collect();
-        assert_eq!(bids, [b1, b2, b3].into_iter().collect());
+        // UUIDv7 has ~ms precision. Accept up to 1s drift to stay
+        // robust to PG's TIMESTAMPTZ μs rounding.
+        assert!(
+            (row.0 - known_epoch_ms as f64 / 1000.0).abs() < 1.0,
+            "started_at {} should be ≈ {}",
+            row.0,
+            known_epoch_ms as f64 / 1000.0,
+        );
         Ok(())
     }
-
-    // bug_032 regression (S3-key determinism via sorted interested_builds)
-    // is at `actor::tests::misc::get_interested_builds_is_sorted` — it
-    // exercises the production `get_interested_builds()` path; testing
-    // here would require re-implementing the sort locally (vacuous).
 
     #[tokio::test]
     async fn s3_failure_logs_error_but_flusher_survives() -> anyhow::Result<()> {
@@ -725,8 +911,6 @@ mod tests {
         // the failure metric, and returns. The NEXT flush_final for a different
         // drv should still work. (If the flusher died, all future logs lost.)
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let build_id = Uuid::new_v4();
-        seed_build(&db.pool, build_id).await?;
 
         // Two rules: first PUT → generic server error, second PUT → OK.
         // (Same error-modeling approach as rio-store/src/backend/s3.rs:200 —
@@ -744,12 +928,19 @@ mod tests {
         });
         let rule_ok =
             mock!(S3Client::put_object).then_output(|| PutObjectOutput::builder().build());
-        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&rule_fail, &rule_ok]);
+        let rule_del =
+            mock!(S3Client::delete_object).then_output(|| DeleteObjectOutput::builder().build());
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[&rule_fail, &rule_ok, &rule_del]
+        );
 
         let buffers = Arc::new(LogBuffers::new());
         // Keys with no `-` so `drv_log_hash` leaves them distinct.
-        buffers.push(&mk_batch("drvfail", 0, &[b"will-be-lost"]));
-        buffers.push(&mk_batch("drvok", 0, &[b"will-survive"]));
+        let exec_fail = stamp_and_push(&buffers, "drvfail", &[b"will-be-lost"]);
+        let exec_ok = stamp_and_push(&buffers, "drvok", &[b"will-survive"]);
+        let _ = exec_fail; // S3 PUT fails; never lands in PG.
 
         let flusher = LogFlusher::new(
             client,
@@ -763,7 +954,7 @@ mod tests {
         flusher
             .flush_final(FlushRequest {
                 drv_path: "drvfail".into(),
-                interested_builds: vec![build_id],
+                status: Some("failed".into()),
             })
             .await;
         assert_eq!(
@@ -776,16 +967,16 @@ mod tests {
         flusher
             .flush_final(FlushRequest {
                 drv_path: "drvok".into(),
-                interested_builds: vec![build_id],
+                status: Some("succeeded".into()),
             })
             .await;
 
         // Only the second PG row exists (first flush failed before PG insert).
-        let rows: Vec<(String,)> = sqlx::query_as("SELECT drv_hash FROM build_logs")
+        let rows: Vec<(Uuid,)> = sqlx::query_as("SELECT exec_id FROM drv_logs")
             .fetch_all(&db.pool)
             .await?;
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, "drvok");
+        assert_eq!(rows[0].0, exec_ok);
         Ok(())
     }
 
@@ -810,11 +1001,11 @@ mod tests {
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&rule_fail]);
 
         let buffers = Arc::new(LogBuffers::new());
-        buffers.push(&mk_batch(
+        let _ = stamp_and_push(
+            &buffers,
             "/nix/store/pppppppppppppppppppppppppppppppp-periodic.drv",
-            0,
             &[b"still-running"],
-        ));
+        );
         let flusher = LogFlusher::new(
             client,
             "test-bucket".into(),
@@ -841,21 +1032,30 @@ mod tests {
     /// starvation can't be reproduced without injecting artificial
     /// latency. The fix (drop `biased;`) is correct by `select!`
     /// semantics; this test guards the surrounding loop wiring.
+    ///
+    /// The observable is the per-tick "skipping flush: no exec_id" warn
+    /// rather than S3 PUTs: a stamped (`set_exec`'d) entry would trigger
+    /// the new `drv_logs` UPSERT, and PG socket I/O does not coexist
+    /// with `tokio::time::pause()` auto-advance — the PG await has its
+    /// own `tokio::time` timers that never fire under paused time, so
+    /// the flusher's loop blocks on the first PG round-trip and the
+    /// second tick never fires (the same class of issue the "TestDb
+    /// before pause()" guard already documents). An *unstamped* entry
+    /// makes `upload_and_record` skip before any I/O — pure CPU per
+    /// tick, paused-time-safe — and still proves the tick wiring.
     #[tokio::test]
+    #[tracing_test::traced_test]
     async fn periodic_tick_fires_in_spawn_loop() -> anyhow::Result<()> {
         // TestDb before pause(): sqlx pool acquire uses tokio::time
         // for its timeout, which PoolTimedOuts under paused time.
         let db = TestDb::new(&crate::MIGRATOR).await;
         tokio::time::pause();
 
-        let (s3, captured) = mock_s3_capturing_puts();
+        let (s3, _puts, _deletes) = mock_s3_capturing();
         let buffers = Arc::new(LogBuffers::new());
-        let ongoing_hash = "ongoingxxxxxxxxxxxxxxxxxxxxxxxxx";
-        buffers.push(&mk_batch(
-            &format!("/nix/store/{ongoing_hash}-llvm.drv"),
-            0,
-            &[b"compiling"],
-        ));
+        // Legacy push() — entry exists, no exec_id. The flusher visits
+        // it every tick, warns, and skips before any I/O.
+        buffers.push(&mk_batch("/nix/store/ongoing-llvm.drv", 0, &[b"compiling"]));
 
         let (tx, rx) = mpsc::channel::<FlushRequest>(8);
         LogFlusher::new(s3, "b".into(), db.pool.clone(), Arc::clone(&buffers)).spawn(rx);
@@ -864,17 +1064,22 @@ mod tests {
         // recv-vs-tick (not the channel-close final sweep).
         tokio::time::sleep(Duration::from_secs(65)).await;
 
-        let ongoing_key = format!("logs/periodic/{ongoing_hash}.log.zst");
-        let periodic = captured
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(k, _)| k == &ongoing_key)
-            .count();
-        assert!(
-            periodic >= 2,
-            "two ticks in 65s → ≥2 periodic PUTs, got {periodic}"
-        );
+        // Two ticks in 65s (T=30, T=60) → ≥2 per-tick warns. Counting
+        // warn lines proves the tick fired; a stamped entry would
+        // hit the PG path which hangs under paused time (see doc above).
+        logs_assert(|lines: &[&str]| {
+            let n = lines
+                .iter()
+                .filter(|l| l.contains("skipping flush: no exec_id"))
+                .count();
+            if n >= 2 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "two ticks in 65s → ≥2 per-tick skip warns, got {n}"
+                ))
+            }
+        });
         drop(tx);
         Ok(())
     }

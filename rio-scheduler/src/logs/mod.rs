@@ -67,16 +67,28 @@ pub fn drv_log_hash(s: &str) -> String {
         .to_string()
 }
 
-/// Construct the canonical S3 key for a completed derivation's log blob:
-/// `logs/{build_id}/{drv_hash}.log.zst` per `observability.typ`. The
-/// `logs/` segment is fixed (peer to rio-store's `chunks/` in the same
+/// Construct the canonical S3 key for a derivation execution's log blob:
+/// `logs/{drv_hash}/{exec_id}.log.zst` (or `.partial.log.zst` for periodic
+/// snapshots). One blob per execution.
+// r[impl obs.log.exec-keyed]
+///
+/// The `logs/` segment is fixed (peer to rio-store's `chunks/` in the same
 /// bucket); rio assumes a dedicated bucket, so there is no configurable
 /// prefix.
 ///
-/// `drv_path` is the full `/nix/store/...` path (the ring-buffer key);
-/// the hash is extracted via [`drv_log_hash`].
-pub fn log_s3_key(build_id: &Uuid, drv_path: &str) -> String {
-    format!("logs/{build_id}/{}.log.zst", drv_log_hash(drv_path))
+/// `drv_path` is normalized via [`drv_log_hash`] (full path / basename /
+/// bare hash). `exec_id` is the per-execution UUIDv7 minted by
+/// `assign_to_worker`. `partial` is `true` for periodic (30s) snapshots of
+/// an active build, `false` for the completion flush — the final blob
+/// supersedes the `.partial` and the flusher best-effort deletes the
+/// latter.
+pub fn log_s3_key(drv_path: &str, exec_id: &Uuid, partial: bool) -> String {
+    let suffix = if partial {
+        ".partial.log.zst"
+    } else {
+        ".log.zst"
+    };
+    format!("logs/{}/{}{}", drv_log_hash(drv_path), exec_id, suffix)
 }
 
 /// Max lines retained per derivation. Beyond this, oldest lines are evicted.
@@ -474,11 +486,21 @@ mod tests {
 
     #[test]
     fn log_s3_key_layout() {
-        let bid = Uuid::nil();
+        let exec = Uuid::nil();
         let drv = "/nix/store/amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2-hello.drv";
         assert_eq!(
-            log_s3_key(&bid, drv),
-            format!("logs/{bid}/amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2.log.zst"),
+            log_s3_key(drv, &exec, false),
+            format!("logs/amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2/{exec}.log.zst"),
+        );
+        assert_eq!(
+            log_s3_key(drv, &exec, true),
+            format!("logs/amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2/{exec}.partial.log.zst"),
+        );
+        // Idempotent on a basename and a bare hash too — same normalizer
+        // as the rest of LogBuffers.
+        assert_eq!(
+            log_s3_key("amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2-hello.drv", &exec, false),
+            format!("logs/amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2/{exec}.log.zst"),
         );
     }
 

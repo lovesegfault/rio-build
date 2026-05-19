@@ -2214,7 +2214,7 @@ async fn try_log_flush_silent_on_closed() {
     let bus = BuildEventBus::new(None, Some(tx));
     bus.try_log_flush(crate::logs::FlushRequest {
         drv_path: "x".into(),
-        interested_builds: vec![],
+        status: None,
     });
 
     assert_eq!(

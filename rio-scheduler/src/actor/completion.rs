@@ -1053,7 +1053,7 @@ impl DagActor {
         // threaded — no LogBatch can have arrived since the
         // transition() above.
         self.seal_log_buffer(drv_hash);
-        self.trigger_log_flush(drv_hash, interested_builds);
+        self.trigger_log_flush(drv_hash, "succeeded");
         let _ = &mut t_phase;
         let total = t_total.elapsed();
         // IA-branch parity with the CA `info!` in `ca_insert_realisations`:
@@ -1865,7 +1865,7 @@ impl DagActor {
         // one). Flush BEFORE handle_derivation_failure (which may
         // transition builds to terminal and schedule cleanup).
         let trigger_builds = self.get_interested_builds(drv_hash);
-        self.trigger_log_flush(drv_hash, trigger_builds.clone());
+        self.trigger_log_flush(drv_hash, "failed");
         let trigger_path = self.dag.path_or_hash_fallback(drv_hash);
         for build_id in &trigger_builds {
             // r[impl gw.activity.progress-before-stop]
