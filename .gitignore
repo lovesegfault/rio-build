@@ -57,6 +57,7 @@ rio-dashboard/dist/
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 .claude/notes/
+.claude/worktrees/
 
 # tracey daemon state (unix socket, cache)
 .tracey/
