@@ -19,6 +19,14 @@ description = "CustomResourceDefinition types for rio-build (Pool, ComponentScal
 # heavy for scheduler/xtask to depend on. This crate is the lightest
 # kube-adjacent leaf in the workspace.
 
+[[bin]]
+name = "crdgen"
+path = "src/bin/crdgen.rs"
+# Generates infra/helm/crds/*.yaml from the CRD types in this crate.
+# Lives here (not rio-controller) so `packages.crds` and `crds-drift`
+# depend on the lightest kube-adjacent leaf instead of the full
+# reconciler crate — editing rio-store no longer rebuilds crdgen.
+
 [dependencies]
 # `derive` feature only — CustomResource + KubeSchema proc-macros.
 # NOT `runtime`/`client`: those pull the reconciler machinery.
@@ -29,8 +37,7 @@ serde = { workspace = true }
 # kube's CustomResource derive macro emits `serde_json::` paths
 # directly in the generated code — must be a direct dep, not dev.
 serde_json = { workspace = true }
-workspace-hack = { version = "0.1", path = "../workspace-hack" }
-
-[dev-dependencies]
-# crd_serializes test: YAML smoke check.
+# Write-only for crdgen (and the crd_serializes test). Maintained
+# serde_yaml fork — see deny.toml RUSTSEC-2024-0320.
 serde_yml = { workspace = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }

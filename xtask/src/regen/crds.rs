@@ -24,11 +24,12 @@ pub async fn run() -> Result<()> {
     // both callers identical bytes; running the same Rust code does
     // that by construction).
     //
-    // --bin (not -p) so feature resolution stays workspace-wide and we
-    // reuse the already-built rio-controller artifacts.
+    // -p rio-crds: crdgen lives in the lightest kube-adjacent leaf so
+    // a non-CRD edit doesn't rebuild it; pinning the package keeps
+    // feature resolution scoped to rio-crds + its deps.
     let out_s = out.to_str().unwrap();
-    ui::step("cargo run --bin crdgen", || async {
-        sh::run(cmd!(sh, "cargo run --bin crdgen -- {out_s}")).await
+    ui::step("cargo run -p rio-crds --bin crdgen", || async {
+        sh::run(cmd!(sh, "cargo run -p rio-crds --bin crdgen -- {out_s}")).await
     })
     .await?;
 

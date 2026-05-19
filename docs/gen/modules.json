@@ -370,16 +370,6 @@
   "rio-controller": [
     {
       "depth": 0,
-      "doc": "",
-      "path": "bin/"
-    },
-    {
-      "depth": 1,
-      "doc": "Generate CRD YAML for the Helm chart.",
-      "path": "bin/crdgen.rs"
-    },
-    {
-      "depth": 0,
       "doc": "`rio-controller` binary configuration: figment-loaded `Config`",
       "path": "config.rs"
     },
@@ -485,6 +475,16 @@
     }
   ],
   "rio-crds": [
+    {
+      "depth": 0,
+      "doc": "",
+      "path": "bin/"
+    },
+    {
+      "depth": 1,
+      "doc": "Generate CRD YAML for the Helm chart.",
+      "path": "bin/crdgen.rs"
+    },
     {
       "depth": 0,
       "doc": "ComponentScaler CRD: predictive replica autoscaling for rio's",

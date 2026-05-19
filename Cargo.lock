@@ -6680,7 +6680,6 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "serde_yml",
  "sketches-ddsketch",
  "sqlx",
  "thiserror 2.0.18",

@@ -12,12 +12,6 @@ description = "Kubernetes operator for rio-build: Pool, ComponentScaler CRDs"
 name = "rio-controller"
 path = "src/main.rs"
 
-[[bin]]
-name = "crdgen"
-path = "src/bin/crdgen.rs"
-# crdgen is write-only serde_yaml (see deny.toml RUSTSEC-2024-0320).
-# Separate binary so the YAML dep doesn't leak into the controller itself.
-
 [dependencies]
 rio-auth = { workspace = true }
 rio-common = { workspace = true }
@@ -40,8 +34,6 @@ tokio = { workspace = true }
 # --- Serialization ---
 serde = { workspace = true }
 serde_json = { workspace = true }
-# Write-only for crdgen. Maintained serde_yaml fork.
-serde_yml = { workspace = true }
 
 # --- Observability ---
 tracing = { workspace = true }

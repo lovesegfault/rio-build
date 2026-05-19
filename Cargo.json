@@ -21177,10 +21177,6 @@
           "packageId": "serde_json"
         },
         {
-          "name": "serde_yml",
-          "packageId": "serde_yml"
-        },
-        {
           "name": "sketches-ddsketch",
           "packageId": "sketches-ddsketch"
         },
@@ -21241,10 +21237,6 @@
       ],
       "crateBin": [
         {
-          "name": "crdgen",
-          "path": "src/bin/crdgen.rs"
-        },
-        {
           "name": "rio-controller",
           "path": "src/main.rs"
         }
@@ -21286,14 +21278,18 @@
           "packageId": "serde_json"
         },
         {
+          "name": "serde_yml",
+          "packageId": "serde_yml"
+        },
+        {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
         }
       ],
-      "devDependencies": [
+      "crateBin": [
         {
-          "name": "serde_yml",
-          "packageId": "serde_yml"
+          "name": "crdgen",
+          "path": "src/bin/crdgen.rs"
         }
       ],
       "libCrateTypes": [

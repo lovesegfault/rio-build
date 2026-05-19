@@ -1441,9 +1441,14 @@
                 # commit means a CRD schema change silently updates the
                 # deployed file — we want that change REVIEWED (it may
                 # be backward-incompatible).
+                #
+                # crdgen lives in rio-crds (the lightest kube-adjacent
+                # leaf), not the whole-workspace binary set, so this
+                # output and the crds-drift check cache-hit on any
+                # non-CRD edit.
                 crds = pkgs.runCommand "rio-crds" { } ''
                   mkdir -p $out
-                  ${rio-workspace}/bin/crdgen $out
+                  ${crateBuild.memberBins.rio-crds}/bin/crdgen $out
                 '';
 
                 # ──────────────────────────────────────────────────────────
