@@ -489,9 +489,9 @@
 
               # Coverage-instrumented tree: re-import with
               # globalExtraRustcOpts=["-Cinstrument-coverage"]. Doubles the
-              # derivation count (645 normal + 645 instrumented), but each
-              # half caches independently — touching a workspace crate only
-              # rebuilds that crate's two variants + dependents.
+              # derivation count (one normal + one instrumented per crate),
+              # but each half caches independently — touching a workspace
+              # crate only rebuilds that crate's two variants + dependents.
               # `stripBins = false` keeps __llvm_covfun/__llvm_covmap intact.
               crateBuildCov = mkCrateBuild {
                 globalExtraRustcOpts = [
@@ -507,7 +507,7 @@
               # ──────────────────────────────────────────────────────────
               #
               # Per-crate checks layered on the crate2nix build graph.
-              # Deps are built once (regular rustc, 645 cached drvs);
+              # Deps are built once with regular rustc and stay cached;
               # workspace members are rebuilt per-check with the
               # appropriate driver (clippy-driver, rustc --test, rustdoc).
               # See nix/checks.nix for the wrapper mechanics — notably the

@@ -1,22 +1,23 @@
 # crate2nix check backends: clippy, tests, doc, coverage.
 #
 # Layers on top of nix/crate2nix.nix's per-crate build graph.
-# Dependencies are built ONCE with regular rustc (655 cached drvs);
+# Dependency crates (the vast majority of the resolved graph) are
+# built ONCE with regular rustc and shared across all check variants;
 # workspace members are re-built per-check with the appropriate
 # driver (clippy-driver, rustc --test, rustdoc, rustc -Cinstrument-coverage).
 #
 # This is how you get per-crate caching for the CI gate — deps never
-# re-clippy, never re-testcompile, never re-doc. Only the 10 workspace
+# re-clippy, never re-testcompile, never re-doc. Only the workspace
 # members get per-check rebuilds, and each of those caches independently.
 #
 # ┌──────────────────────────────────────────────────────────────────┐
-# │                     dep crates (645, cached)                     │
+# │                      dep crates (cached once)                    │
 # │                 regular rustc, --cap-lints allow                 │
 # └────────────────┬─────────────────────────────────────────────────┘
 #                  │ .rlib outputs (shared by all check variants)
 #                  ▼
 # ┌──────────────────────────────────────────────────────────────────┐
-# │               workspace members (10, per-check)                  │
+# │              workspace members (one drv per check)               │
 # ├────────────────┬──────────────┬──────────────┬──────────────────┤
 # │     build      │    clippy    │    tests     │       doc        │
 # │  rustc (base)  │ clippy-driver│ rustc --test │    rustdoc       │
