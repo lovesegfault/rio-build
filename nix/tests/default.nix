@@ -507,6 +507,8 @@ in
           # r[verify builder.fuse.listxattr-empty]
           "fuse-listxattr"
           "overlay-readdir"
+          # r[verify builder.fuse.canonical-metadata]
+          "canonical-meta"
           # r[verify store.inline.threshold]
           # r[verify obs.metric.transfer-volume]
           "chunks"

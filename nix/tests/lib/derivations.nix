@@ -47,6 +47,15 @@ rec {
   # If <5: overlayfs serves readdir from stale dcache (correctness bug).
   multifile = "${dir}/multifile.nix";
 
+  # FUSE chroot store metadata canonicality probe: stats a FUSE-served
+  # input store path and writes `<mtime> <perm>` to $out. Canonical Nix
+  # store-path metadata is `1 555` (1s past Epoch, exec/dir perm). Any
+  # other value means `restore_path_streaming` / `stat_to_attr` regressed
+  # to passing through `mtime≈now` — which makes
+  # `set-source-date-epoch-to-latest.sh` raise SOURCE_DATE_EPOCH and
+  # tar-producing FODs (`fetchPnpmDeps`/…) non-deterministic.
+  canonicalMeta = "${dir}/canonical-meta.nix";
+
   # builtin:fetchurl busybox FOD + raw consumer. Cold-store only.
   # Takes `{ tag, sleepSecs }` at nix-build time via `--arg`.
   coldBootstrap = "${dir}/cold-bootstrap.nix";
