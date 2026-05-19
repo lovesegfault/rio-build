@@ -153,18 +153,27 @@ mod tests {
             Some(100 << 30),
         );
         assert_eq!(lines.len() as u64, HEADER_LINE_COUNT);
-        assert!(String::from_utf8_lossy(&lines[0]).starts_with("rio: exec     01976e8b-test"));
         assert!(
-            String::from_utf8_lossy(&lines[1])
+            str::from_utf8(&lines[0])
+                .unwrap()
+                .starts_with("rio: exec     01976e8b-test")
+        );
+        assert!(
+            str::from_utf8(&lines[1])
+                .unwrap()
                 .contains("rio: builder  x86_64-linux/large (16c, 32 GiB, 100 GiB)")
         );
-        assert!(String::from_utf8_lossy(&lines[2]).starts_with("rio: started  "));
+        assert!(
+            str::from_utf8(&lines[2])
+                .unwrap()
+                .starts_with("rio: started  ")
+        );
     }
 
     #[test]
     fn header_renders_with_absent_fields() {
         let lines = header_lines("01976e8b-test", "x86_64-linux", None, None, None, None);
-        let builder_line = String::from_utf8_lossy(&lines[1]);
+        let builder_line = str::from_utf8(&lines[1]).unwrap();
         // No hw_class → no slash.
         assert!(
             !builder_line.contains('/'),
@@ -180,17 +189,22 @@ mod tests {
     fn footer_renders_failed() {
         let lines = footer_lines("01976e8b-test", "failed (exit 1)", Duration::from_secs(263));
         assert!(
-            String::from_utf8_lossy(&lines[1])
+            str::from_utf8(&lines[1])
+                .unwrap()
                 .contains("rio: result   failed (exit 1) after 4m23s")
         );
         // Footer repeats the exec line so a truncated tail still has it.
-        assert!(String::from_utf8_lossy(&lines[0]).starts_with("rio: exec     01976e8b-test"));
+        assert!(
+            str::from_utf8(&lines[0])
+                .unwrap()
+                .starts_with("rio: exec     01976e8b-test")
+        );
     }
 
     #[test]
     fn footer_renders_ok() {
         let lines = footer_lines("01976e8b-test", "ok", Duration::from_secs(45));
-        assert!(String::from_utf8_lossy(&lines[1]).contains("ok after 45s"));
+        assert!(str::from_utf8(&lines[1]).unwrap().contains("ok after 45s"));
     }
 
     #[test]

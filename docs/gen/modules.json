@@ -28,6 +28,11 @@
       "doc": "Per-build cgroup v2 resource tracking."
     },
     {
+      "path": "banner.rs",
+      "depth": 0,
+      "doc": "Worker log banner: a `rio:`-prefixed header at the start of every"
+    },
+    {
       "path": "config.rs",
       "depth": 0,
       "doc": "Builder configuration: Config + CliArgs (two-struct split per"

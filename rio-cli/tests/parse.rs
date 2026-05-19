@@ -168,9 +168,10 @@ fn per_subcommand_help_renders() {
 #[case::drvs_all_active_stuck(&["derivations", "--all-active", "--stuck"], true)]
 #[case::drvs_conflict(&["derivations", "abc-123", "--all-active"], false)]
 #[case::drvs_neither(&["derivations"], true)]
-// logs: positional drv required; --build-id optional.
+// logs: positional drv required; --exec-id optional (default: latest execution).
 #[case::logs_min(&["logs", "/nix/store/foo.drv"], true)]
-#[case::logs_with_build_id(&["logs", "/nix/store/foo.drv", "--build-id", "uuid"], true)]
+#[case::logs_with_exec_id(&["logs", "/nix/store/foo.drv", "--exec-id", "uuid"], true)]
+#[case::logs_old_build_id_rejected(&["logs", "/nix/store/foo.drv", "--build-id", "uuid"], false)]
 #[case::logs_missing_drv(&["logs"], false)]
 // gc: --dry-run flag.
 #[case::gc_bare(&["gc"], true)]

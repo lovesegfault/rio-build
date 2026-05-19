@@ -85,6 +85,7 @@ string drv_path = 1;
 string error_message = 1;
 string error_msg = 2;
 string error_summary = 12;
+string exec_id = 13;
 string executor_id = 1;
 string executor_id = 1;
 string executor_id = 4;
