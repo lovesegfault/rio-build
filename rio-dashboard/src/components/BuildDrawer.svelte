@@ -21,7 +21,15 @@
   // tab. Keeping the state here (not in Graph.svelte) so switching
   // between tabs doesn't lose the selection — Graph re-mounts on every
   // tab flip but the drawer survives.
+  //
+  // focusedExecId is the per-build observation of which execution this
+  // build watched (`GraphNode.exec_id` ← `build_derivations.exec_id`),
+  // captured at click time so the log fetch can pin the EXACT execution
+  // rather than fall back to "latest." Empty for Cached / never-ran
+  // terminals / non-terminal — LogViewer renders an "approximate"
+  // banner for those.
   let focusedDrv = $state<string | undefined>(undefined);
+  let focusedExecId = $state<string>('');
 </script>
 
 <button
@@ -105,8 +113,8 @@
            one. Without the key Svelte reuses the component instance and
            the IIFE inside createLogStream keeps draining the prior
            build's fetch. -->
-      {#key `${build.buildId}:${focusedDrv ?? ''}`}
-        <LogViewer buildId={build.buildId} drvPath={focusedDrv} />
+      {#key `${build.buildId}:${focusedDrv ?? ''}:${focusedExecId}`}
+        <LogViewer drvPath={focusedDrv} execId={focusedExecId} />
       {/key}
     {:else}
       <!-- Keyed on buildId for the same reason as LogViewer: Graph's
@@ -116,8 +124,9 @@
       {#key build.buildId}
         <Graph
           buildId={build.buildId}
-          ondrvclick={(drv) => {
+          ondrvclick={(drv, execId) => {
             focusedDrv = drv;
+            focusedExecId = execId;
             activeTab = 'logs';
           }}
         />

@@ -26,6 +26,11 @@ export type RawNode = {
   system: string;
   status: string;
   assignedExecutorId: string;
+  // Per-build observation of which execution this build watched
+  // (`build_derivations.exec_id`). Empty for Cached / never-ran
+  // terminals / non-terminal — the log fetch falls back to "latest
+  // exec" and labels itself approximate.
+  execId: string;
 };
 
 export type RawEdge = {

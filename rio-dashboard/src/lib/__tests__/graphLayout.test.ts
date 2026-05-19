@@ -61,6 +61,7 @@ function mkNode(over: Partial<RawNode> = {}): RawNode {
     system: 'x86_64-linux',
     status: 'completed',
     assignedExecutorId: '',
+    execId: '',
     ...over,
   };
 }

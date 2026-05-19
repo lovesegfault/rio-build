@@ -64,6 +64,11 @@ function mkResp(statuses: string[], truncated = true) {
       system: 'x86_64-linux',
       status,
       assignedExecutorId: '',
+      // Empty until the completion handler records it on
+      // Completed/Failed — never set in this poll-loop fixture (it
+      // would, with a terminal status, but these tests assert the
+      // poll/degrade machinery, not the exec_id wiring).
+      execId: '',
     })),
     edges: [],
     truncated,

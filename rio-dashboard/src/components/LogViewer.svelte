@@ -19,20 +19,26 @@
   import { createLogStream, type LogStream } from '../lib/logStream.svelte';
 
   let {
-    buildId,
     // Populated by BuildDrawer when a DrvNode is clicked in the Graph
     // tab — the drawer's `focusedDrv` state threads through via the
     // `ondrvclick` callback on Graph.svelte. Undefined means "whole
     // build" (no derivation filter on the log stream).
     drvPath = undefined,
+    // Per-build observation of which execution this build watched
+    // (`GraphNode.exec_id` ← `build_derivations.exec_id`). Empty for
+    // Cached / never-ran terminals / non-terminal — the server
+    // resolves "latest exec" and the viewer renders an "approximate"
+    // banner so the user knows the log may be from a different
+    // execution than the one this build observed.
+    execId = '',
     // @internal test-only hook: jsdom layout is all-zeros so the
     // scroll-derived viewport range can't be exercised. A test stubs
     // this to assert slice bounds directly. Production never passes it.
     // Underscore prefix signals "don't use this" in autocomplete.
     _viewportOverride = undefined,
   }: {
-    buildId: string;
     drvPath?: string;
+    execId?: string;
     /** @internal test-only — jsdom layout is all-zeros; tests stub the viewport directly. */
     _viewportOverride?: { start: number; end: number };
   } = $props();
@@ -42,13 +48,24 @@
   // the drawer closes or the tab switches, so there's no dangling
   // connection left streaming into the void.
   //
-  // svelte-ignore: capturing the initial prop value is intentional.
-  // BuildDrawer wraps us in `{#key build.buildId}` so a changed buildId
-  // remounts the component (fresh stream) rather than expecting us to
-  // reconnect mid-flight. Reacting to prop churn here would double up
-  // with that key and leak the prior AbortController.
+  // svelte-ignore: capturing the initial prop values is intentional.
+  // BuildDrawer wraps us in `{#key buildId:drvPath:execId}` so a change
+  // to any of them remounts the component (fresh stream) rather than
+  // expecting us to reconnect mid-flight. Reacting to prop churn here
+  // would double up with that key and leak the prior AbortController.
   // svelte-ignore state_referenced_locally
-  const stream: LogStream = createLogStream(buildId, drvPath);
+  const stream: LogStream = createLogStream(drvPath, execId);
+
+  // The build view's GraphNode.exec_id is empty for Cached, never-ran
+  // terminals (DependencyFailed/Cancelled/Skipped), and non-terminal
+  // drvs — there's no per-build execution to observe. The server falls
+  // back to MAX(exec_id) (the latest execution of the drv across all
+  // builds), which is the right answer for a cache hit (it observed
+  // whatever the last execution produced) but is "approximate" because
+  // a later execution may have overwritten it by read time. The
+  // whole-build view (drvPath undefined) doesn't get the banner —
+  // there's no per-drv exec_id to be approximate against.
+  const approximate = $derived(drvPath !== undefined && execId === '');
   $effect(() => () => stream.destroy());
 
   let container: HTMLElement | undefined = $state();
@@ -148,6 +165,12 @@
   {#if stream.err}
     <div role="alert" class="err">log stream failed: {stream.err.message}</div>
   {/if}
+  {#if approximate}
+    <div class="approximate" data-testid="log-approximate">
+      — latest available execution; this build's exact log was not
+      recorded (cached, never ran, or still in flight) —
+    </div>
+  {/if}
   {#if stream.truncated}
     <div class="truncated" data-testid="log-truncated">
       — {stream.droppedLines.toLocaleString()} earlier lines truncated —
@@ -207,7 +230,8 @@
   .spacer {
     flex-shrink: 0;
   }
-  .truncated {
+  .truncated,
+  .approximate {
     padding: 0.5rem 0.75rem;
     color: #64748b;
     font-style: italic;

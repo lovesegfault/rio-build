@@ -59,7 +59,7 @@ describe('createLogStream', () => {
       );
     });
 
-    const s = createLogStream('build-accum');
+    const s = createLogStream();
     expect(s.lines).toEqual([]);
     expect(s.done).toBe(false);
 
@@ -93,7 +93,7 @@ describe('createLogStream', () => {
       );
     });
 
-    const s = createLogStream('build-r8');
+    const s = createLogStream();
     await flush(2);
 
     // No throw — err stays null, done flips.
@@ -116,7 +116,7 @@ describe('createLogStream', () => {
       throw new Error('upstream reset');
     });
 
-    const s = createLogStream('build-err');
+    const s = createLogStream();
     await flush(3);
 
     // First chunk landed before the throw — partial output is preserved.
@@ -146,7 +146,7 @@ describe('createLogStream', () => {
       );
     });
 
-    const s = createLogStream('build-abort');
+    const s = createLogStream();
     await flush(2);
     expect(s.lines).toEqual(['x']);
     expect(seenSignal?.aborted).toBe(false);
@@ -174,7 +174,7 @@ describe('createLogStream', () => {
       // No isComplete chunk, just end.
     });
 
-    const s = createLogStream('build-early');
+    const s = createLogStream();
     await flush(3);
 
     expect(s.lines).toEqual(['z']);
@@ -187,10 +187,30 @@ describe('createLogStream', () => {
       yield chunk([], true);
     });
 
-    createLogStream('b', '/nix/store/xyz-foo.drv');
+    createLogStream('/nix/store/xyz-foo.drv');
     await flush(2);
 
     const [req] = getDerivationLogs.mock.calls[0];
     expect(req.derivationPath).toBe('/nix/store/xyz-foo.drv');
+    // No execId passed → empty string sent → server resolves the
+    // latest execution for the drv. The dashboard's "approximate"
+    // banner is the LogViewer's concern, not this store's.
+    expect(req.execId).toBe('');
+  });
+
+  it('passes execId through when provided', async () => {
+    getDerivationLogs.mockImplementation(async function* () {
+      yield chunk([], true);
+    });
+
+    // execId is the per-build observation from GraphNode.exec_id —
+    // pins the EXACT execution this build observed (not the latest
+    // for the drv across all builds).
+    createLogStream('/nix/store/xyz-foo.drv', '01976e8b-test-exec');
+    await flush(2);
+
+    const [req] = getDerivationLogs.mock.calls[0];
+    expect(req.derivationPath).toBe('/nix/store/xyz-foo.drv');
+    expect(req.execId).toBe('01976e8b-test-exec');
   });
 });

@@ -51,11 +51,17 @@ fn node_row_to_proto(r: GraphNodeRow) -> GraphNode {
         system: r.system,
         status: r.status,
         assigned_executor_id: r.assigned_builder_id,
-        // Populated on Completed/Failed once exec_id flows through the
-        // scheduler dispatch path; empty until then. Dashboard falls
-        // back to "latest exec" when empty (correct for cached and
-        // never-ran terminals regardless).
-        exec_id: String::new(),
+        // From `build_derivations.exec_id` — the per-build observation
+        // of which execution this build watched, recorded by the
+        // completion handler on Completed/Failed
+        // (r[sched.merge.exec-correlation]). Empty for Cached,
+        // never-ran terminals (DependencyFailed, Cancelled, Skipped),
+        // and non-terminal — the dashboard falls back to "latest exec"
+        // for those, which is the right answer (a cache hit observed
+        // whatever the last execution produced) but is labeled
+        // "approximate" because a later execution may have overwritten
+        // it by read time.
+        exec_id: r.exec_id.map(|u| u.to_string()).unwrap_or_default(),
     }
 }
 

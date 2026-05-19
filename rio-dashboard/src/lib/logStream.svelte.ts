@@ -44,11 +44,15 @@ export type LogStream = {
   destroy: () => void;
 };
 
-// buildId is kept in the signature for caller compatibility (BuildDrawer keys on it)
-// but is no longer part of the log request — storage is keyed by (drv_hash, exec_id);
-// the server resolves the latest exec when execId is empty. GraphNode.exec_id wiring
-// (so the build view fetches the EXACT exec that build observed) is a follow-up.
-export function createLogStream(_buildId: string, drvPath?: string): LogStream {
+// Storage is keyed by `(drv_hash, exec_id)`. `drvPath` selects the
+// derivation; `execId` selects the execution (the per-build observation
+// from `GraphNode.exec_id` ← `build_derivations.exec_id`). Empty
+// `execId` (the default — Cached / never-ran terminals / non-terminal
+// have no per-build execution to observe) resolves server-side to the
+// latest execution of the drv across all builds. `buildId` is no longer
+// in the signature: the build view's `GetBuildGraph` already partitions
+// the node set by build, and the log fetch is scoped to that.
+export function createLogStream(drvPath?: string, execId = ''): LogStream {
   const lines = $state<string[]>([]);
   let done = $state(false);
   let err = $state<Error | null>(null);
@@ -66,7 +70,7 @@ export function createLogStream(_buildId: string, drvPath?: string): LogStream {
       // follow-on if one is written). For now the stream lives and dies
       // with the component.
       const stream = admin.getDerivationLogs(
-        { derivationPath: drvPath ?? '', execId: '', sinceLine: 0n },
+        { derivationPath: drvPath ?? '', execId, sinceLine: 0n },
         { signal: ctrl.signal },
       );
       for await (const chunk of stream) {

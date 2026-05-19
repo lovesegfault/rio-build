@@ -15,6 +15,9 @@ export type DrvNodeData = {
   drvPath: string;
   status: string;
   executorId: string;
+  // Per-build observation of which execution this build watched. Empty
+  // for Cached / never-ran terminals / non-terminal — see RawNode.
+  execId: string;
 };
 
 // xyflow's Node generic needs Record<string, unknown>-compatible data;
@@ -199,6 +202,7 @@ export function toXyflow(
       drvPath: n.drvPath,
       status: n.status,
       executorId: n.assignedExecutorId,
+      execId: n.execId,
     },
     class: `drv-${statusClass(n.status)}`,
   }));

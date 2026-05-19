@@ -34,7 +34,7 @@ describe('LogViewer', () => {
       err: new Error('boom'),
       destroy: vi.fn(),
     });
-    render(LogViewer, { props: { buildId: 'b-err' } });
+    render(LogViewer, { props: {} });
 
     // {#if stream.err} branch: <div role="alert">log stream failed:
     // {stream.err.message}</div>. Using the ARIA role — a future
@@ -54,7 +54,7 @@ describe('LogViewer', () => {
       err: null,
       destroy: vi.fn(),
     });
-    render(LogViewer, { props: { buildId: 'b-empty' } });
+    render(LogViewer, { props: {} });
 
     // {:else if stream.lines.length === 0 && !stream.err} branch.
     expect(screen.getByText('no log output')).toBeInTheDocument();
@@ -71,7 +71,7 @@ describe('LogViewer', () => {
       err: null,
       destroy: vi.fn(),
     });
-    render(LogViewer, { props: { buildId: 'b-tail' } });
+    render(LogViewer, { props: {} });
 
     expect(screen.getByTestId('log-tail')).toBeInTheDocument();
     expect(screen.getByText(/streaming/)).toBeInTheDocument();
@@ -89,7 +89,7 @@ describe('LogViewer', () => {
       err: null,
       destroy: vi.fn(),
     });
-    render(LogViewer, { props: { buildId: 'b-done' } });
+    render(LogViewer, { props: {} });
 
     expect(screen.queryByTestId('log-tail')).toBeNull();
     // Non-empty lines → empty-state branch also absent.
@@ -117,7 +117,7 @@ describe('LogViewer', () => {
       truncated: false,
       destroy: vi.fn(),
     });
-    const { container } = render(LogViewer, { props: { buildId: 'b-virt' } });
+    const { container } = render(LogViewer, { props: {} });
 
     const pres = container.querySelectorAll('pre.line');
     expect(pres.length).toBeLessThan(100);
@@ -141,8 +141,7 @@ describe('LogViewer', () => {
     });
     const { container } = render(LogViewer, {
       props: {
-        buildId: 'b-override',
-        _viewportOverride: { start: 400, end: 430 },
+                _viewportOverride: { start: 400, end: 430 },
       },
     });
 
@@ -175,7 +174,7 @@ describe('LogViewer', () => {
       droppedLines: 12340,
       destroy: vi.fn(),
     });
-    render(LogViewer, { props: { buildId: 'b-trunc' } });
+    render(LogViewer, { props: {} });
 
     expect(screen.getByTestId('log-truncated')).toBeInTheDocument();
     expect(screen.getByText(/12,340 earlier lines truncated/)).toBeInTheDocument();
@@ -210,7 +209,7 @@ describe('LogViewer', () => {
         destroy: vi.fn(),
       });
       const { container } = render(LogViewer, {
-        props: { buildId: 'b-a11y', _viewportOverride: { start: 10, end: 20 } },
+        props: { _viewportOverride: { start: 10, end: 20 } },
       });
       const spacers = container.querySelectorAll('.spacer');
       const top = spacers[0] as HTMLElement;

@@ -66,7 +66,7 @@ describe('createLogStream perf', () => {
     });
 
     const start = performance.now();
-    const s = createLogStream('build-perf');
+    const s = createLogStream();
     // CHUNKS+2 rounds: one per chunk resume, plus slack for the IIFE
     // entry and the final `done = true` assignment.
     await flush(CHUNKS + 2);
@@ -94,7 +94,7 @@ describe('createLogStream perf', () => {
       yield chunk(WIDTH, true);
     });
 
-    const s = createLogStream('build-trunc');
+    const s = createLogStream();
     await flush(CHUNKS + 2);
 
     expect(s.done).toBe(true);
@@ -117,7 +117,7 @@ describe('createLogStream perf', () => {
       yield chunk(60_000, true);
     });
 
-    const s = createLogStream('build-burst');
+    const s = createLogStream();
     await flush(3);
 
     expect(s.done).toBe(true);
@@ -135,7 +135,7 @@ describe('createLogStream perf', () => {
       yield chunk(70_000, true);
     });
 
-    const s = createLogStream('b-giant');
+    const s = createLogStream();
     await flush(3);
 
     expect(s.done).toBe(true);
@@ -155,7 +155,7 @@ describe('createLogStream perf', () => {
       yield chunk(100_000, true);
     });
 
-    const s = createLogStream('b-100k');
+    const s = createLogStream();
     await flush(3);
 
     // Pre-fix: spread throws, catch sets err = RangeError, done = true.

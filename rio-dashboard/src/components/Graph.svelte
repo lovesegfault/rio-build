@@ -49,7 +49,14 @@
   let {
     buildId,
     ondrvclick = undefined,
-  }: { buildId: string; ondrvclick?: (drvPath: string) => void } = $props();
+  }: {
+    buildId: string;
+    // execId is the per-build observation of which execution this build
+    // watched (`build_derivations.exec_id` via `GraphNode.exec_id`).
+    // Empty for Cached / never-ran terminals / non-terminal — the log
+    // fetch falls back to "latest exec" and labels itself approximate.
+    ondrvclick?: (drvPath: string, execId: string) => void;
+  } = $props();
 
   // Module-level const — Svelte 5 doesn't have React's "inline nodeTypes
   // remounts all custom nodes" footgun (compile-time reactivity knows the
@@ -142,6 +149,11 @@
   // new response and rewrite only the .data and .class of each existing
   // xyflow node. xyflow's internal diff notices the class change and
   // re-renders just that node's DOM — no relayout, no viewport jump.
+  // execId is patched alongside status because both transition once
+  // (empty → set) when the drv reaches a terminal state — without the
+  // patch a node clicked between polls would still pass execId="" and
+  // the log fetch would fall back to "latest" with the approximate
+  // banner even after the exact correlation is recorded.
   function patchStatuses(gn: readonly RawNode[]) {
     const by = new Map(gn.map((n) => [n.drvPath, n]));
     nodes = nodes.map((n) => {
@@ -154,6 +166,7 @@
           ...n.data,
           status: raw.status,
           executorId: raw.assignedExecutorId,
+          execId: raw.execId,
         },
       };
     });
@@ -276,7 +289,7 @@
         {#each layout.nodes as n (n.drvPath)}
           <tr
             data-testid="graph-table-row"
-            onclick={() => ondrvclick?.(n.drvPath)}
+            onclick={() => ondrvclick?.(n.drvPath, n.execId)}
           >
             <td>{n.pname}</td>
             <td><span class={`pill ${statusClass(n.status)}`}>{n.status}</span></td>
@@ -295,7 +308,8 @@
       {nodeTypes}
       fitView
       nodesDraggable={false}
-      onnodeclick={({ node }) => ondrvclick?.(node.id)}
+      onnodeclick={({ node }) =>
+        ondrvclick?.(node.id, (node.data?.execId as string) ?? '')}
     >
       <Background />
       <Controls />

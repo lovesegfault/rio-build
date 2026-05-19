@@ -297,6 +297,13 @@ impl RecoveryDerivationRow {
 ///
 /// `derivation_id` is NOT in the proto — it's collected here so the edge
 /// query can filter to the returned node set (truncation correctness).
+///
+/// `exec_id` comes from the `build_derivations` edge (the build↔exec
+/// observation), not `derivations` — the same drv can have a different
+/// `exec_id` per build (rebuilt after GC, retried). NULL until the
+/// completion handler records it on `Completed`/`Failed`; stays NULL
+/// for `Cached` and never-ran terminals (no execution to record). The
+/// dashboard falls back to "latest exec" when empty.
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct GraphNodeRow {
     pub derivation_id: Uuid,
@@ -305,6 +312,7 @@ pub(crate) struct GraphNodeRow {
     pub system: String,
     pub status: String,
     pub assigned_builder_id: String,
+    pub exec_id: Option<Uuid>,
 }
 
 /// Row from `load_build_graph` edges query. Mirrors proto `GraphEdge`.

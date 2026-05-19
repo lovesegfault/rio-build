@@ -262,6 +262,14 @@ impl SchedulerDb {
         // proto3 non-optional string is empty-string-for-null.
         // derivation_id is carried so the edge query below can filter
         // to THIS returned set (not the whole build).
+        //
+        // bd.exec_id is the build↔exec observation recorded by the
+        // completion handler on Completed/Failed — see
+        // r[sched.merge.exec-correlation]. It comes from the JOIN'd
+        // `build_derivations` edge (already in the query), not a new
+        // table; nullable, NOT COALESCE'd (the proto layer maps None →
+        // empty string and the dashboard treats empty as "fall back to
+        // latest exec").
         let nodes: Vec<GraphNodeRow> = sqlx::query_as(
             r#"
             SELECT d.derivation_id,
@@ -269,7 +277,8 @@ impl SchedulerDb {
                    COALESCE(d.pname, '') AS pname,
                    d.system,
                    d.status,
-                   COALESCE(d.assigned_builder_id, '') AS assigned_builder_id
+                   COALESCE(d.assigned_builder_id, '') AS assigned_builder_id,
+                   bd.exec_id
             FROM derivations d
             JOIN build_derivations bd ON bd.derivation_id = d.derivation_id
             WHERE bd.build_id = $1
