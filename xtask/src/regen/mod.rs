@@ -10,7 +10,7 @@ mod crds;
 mod docs_data;
 mod fuzz_lock;
 mod hakari;
-mod seccomp;
+pub(crate) mod seccomp;
 mod sqlx;
 
 #[derive(Subcommand)]

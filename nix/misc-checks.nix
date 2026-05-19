@@ -181,6 +181,9 @@ in
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../xtask/src)
             ../infra/helm/rio-build/templates/scheduler.yaml
+            # seccomp-allowlist reads only the builder profile —
+            # rio-fetcher.json edits don't rehash this check.
+            ./nixos-node/seccomp/rio-builder.json
           ];
         };
       }

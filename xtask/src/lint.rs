@@ -25,6 +25,13 @@ pub enum Lint {
     /// scheduler helm template. Catches a `[sla]` field helm forgot to
     /// surface to operators.
     HelmSla,
+    /// `nix/nixos-node/seccomp/rio-builder.json` is an allowlist
+    /// (`defaultAction: SCMP_ACT_ERRNO`), the 5 builder-denied syscalls
+    /// are absent from every ALLOW block, and the worker-critical
+    /// syscalls (mount/unshare/chroot/clone/umount2) are present.
+    /// Catches a profile edit that flips to a denylist or strands the
+    /// Nix sandbox.
+    SeccompAllowlist,
 }
 
 impl Lint {
@@ -37,7 +44,7 @@ impl Lint {
     /// subcommand list clap derives from the enum, so a variant added
     /// to the enum but not here fails `cargo test -p xtask`.
     fn all() -> Vec<Lint> {
-        vec![Lint::SchemaLiveness, Lint::HelmSla]
+        vec![Lint::SchemaLiveness, Lint::HelmSla, Lint::SeccompAllowlist]
     }
 }
 
@@ -46,6 +53,7 @@ pub fn run(lint: &Lint) -> Result<()> {
     match lint {
         Lint::SchemaLiveness => schema_liveness(),
         Lint::HelmSla => helm_sla(),
+        Lint::SeccompAllowlist => seccomp_allowlist(),
     }
 }
 
@@ -366,6 +374,93 @@ fn helm_sla() -> Result<()> {
         rendered_keys = HELM_RENDERED_SLA_KEYS.len(),
         template = %tpl_path.display(),
         "helm-sla ok"
+    );
+    Ok(())
+}
+
+/// Builder seccomp profile structure guard.
+///
+/// The profile is a `type: Localhost` k8s seccomp profile baked into
+/// the NixOS node AMI (ADR-021) and applied to every builder pod. This
+/// lint asserts it stays an ALLOWLIST and that the deny/allow sets
+/// don't regress.
+///
+/// Lives here (a runtime file read) rather than as a unit test
+/// (compile-time `include_str!`) so the per-crate nix sandbox doesn't
+/// need a cross-directory symlink hack to resolve a path 5 levels
+/// outside `rio-controller/`. Same rationale as `helm_sla` above. The
+/// profile *file* stays at `nix/nixos-node/seccomp/`; it's deployment
+/// config consumed by `hardening.nix`, `k3s-full.nix`, and
+/// `xtask regen seccomp`.
+fn seccomp_allowlist() -> Result<()> {
+    // Worker-critical syscalls — must be present in an ALLOW block. If
+    // any of these regress the worker can't mount overlayfs / set up
+    // the Nix sandbox. Regression guard for future profile edits.
+    const NEEDED: &[&str] = &["mount", "unshare", "chroot", "clone", "umount2"];
+
+    let path = repo_root().join("nix/nixos-node/seccomp/rio-builder.json");
+    let raw = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let profile: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("{} is not valid JSON", path.display()))?;
+
+    // The profile must be an ALLOWLIST (defaultAction ERRNO). A
+    // denylist (defaultAction ALLOW + explicit ERRNO for the 5
+    // targets) would be a security REGRESSION vs RuntimeDefault — it
+    // would re-enable the ~40 syscalls RuntimeDefault blocks
+    // (kexec_load, open_by_handle_at, userfaultfd etc). K8s
+    // type: Localhost REPLACES RuntimeDefault; it doesn't stack.
+    ensure!(
+        profile["defaultAction"] == "SCMP_ACT_ERRNO",
+        "{}: defaultAction is {}, want \"SCMP_ACT_ERRNO\" — profile must be an \
+         allowlist; a denylist regresses vs RuntimeDefault (Audit B1 #12)",
+        path.display(),
+        profile["defaultAction"],
+    );
+    ensure!(
+        profile["defaultErrnoRet"] == 1,
+        "{}: defaultErrnoRet is {}, want 1 (EPERM — the standard \
+         'operation not permitted' errno)",
+        path.display(),
+        profile["defaultErrnoRet"],
+    );
+
+    // Collect every syscall that appears in any ALLOW block. The
+    // denied syscalls must be absent from ALL of them — defaultAction
+    // ERRNO is what denies them. An explicit ERRNO block for them
+    // would be harmless but redundant; absence from ALLOW is the
+    // actual security property.
+    let allowed: BTreeSet<&str> = profile["syscalls"]
+        .as_array()
+        .with_context(|| format!("{}: `syscalls` is not an array", path.display()))?
+        .iter()
+        .filter(|b| b["action"] == "SCMP_ACT_ALLOW")
+        .flat_map(|b| b["names"].as_array().into_iter().flatten())
+        .filter_map(|n| n.as_str())
+        .collect();
+
+    for denied in crate::regen::seccomp::DENIED {
+        ensure!(
+            !allowed.contains(denied),
+            "{}: `{denied}` appears in an ALLOW block — must be ABSENT \
+             (denied via defaultAction ERRNO)",
+            path.display(),
+        );
+    }
+    for needed in NEEDED {
+        ensure!(
+            allowed.contains(needed),
+            "{}: `{needed}` missing from ALLOW blocks — worker overlayfs/\
+             Nix-sandbox setup needs it",
+            path.display(),
+        );
+    }
+
+    tracing::info!(
+        allowed_syscalls = allowed.len(),
+        denied = crate::regen::seccomp::DENIED.len(),
+        needed = NEEDED.len(),
+        profile = %path.display(),
+        "seccomp-allowlist ok"
     );
     Ok(())
 }

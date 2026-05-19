@@ -18,7 +18,13 @@ use crate::sh::{cmd, repo_root, shell};
 const PROFILE_PATH: &str = "nix/nixos-node/seccomp/rio-builder.json";
 
 const WORKER_CAPS: &[&str] = &["CAP_SYS_ADMIN", "CAP_SYS_CHROOT"];
-const DENIED: &[&str] = &[
+
+/// Syscalls the builder profile MUST NOT allow (per security.typ
+/// r[builder.seccomp.localhost-profile]). Single source of truth —
+/// `regen seccomp` strips these from the moby diff baseline, and
+/// `lint seccomp-allowlist` asserts they're absent from the checked-in
+/// profile's ALLOW blocks.
+pub(crate) const DENIED: &[&str] = &[
     "ptrace",
     "bpf",
     "setns",

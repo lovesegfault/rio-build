@@ -219,41 +219,6 @@ let
     '';
   };
 
-  # rio-controller's pool tests include_str! the seccomp profile
-  # from ../../../../../nix/nixos-node/seccomp/ (5 levels up from
-  # src/reconcilers/pool/tests/ = repo root). Same cross-directory
-  # compile-time-read problem as migrations: buildRustCrate's src is
-  # just rio-controller/, so the relative path resolves outside the
-  # unpacked sourceRoot. Symlink the seccomp/ dir at $NIX_BUILD_TOP/nix/
-  # so the include_str! path resolves. Narrow fileset keeps the hash
-  # stable when unrelated nixos-node files change.
-  seccompFileset = pkgs.lib.fileset.toSource {
-    root = ./nixos-node/seccomp;
-    fileset = ./nixos-node/seccomp;
-  };
-
-  # Test-only postUnpack — symlinks for include_str!() callsites that
-  # live INSIDE #[cfg(test)] modules and are therefore never compiled
-  # with buildTests=false. Keeping these out of defaultCrateOverrides
-  # means editing the underlying fixture files (seccomp profile) does
-  # not rehash the lib/bin derivations that VM tests, docker images,
-  # and crdgen consume.
-  #
-  # nix/checks.nix's mkTestVariant appends these via .overrideAttrs
-  # alongside `buildTests = true` — the only build mode that compiles
-  # the #[cfg(test)] blocks that read them.
-  #
-  # Inventory (verified each is structurally inside #[cfg(test)]):
-  #   rio-controller:
-  #     src/reconcilers/pool/tests/builders_tests.rs:192 — seccomp/rio-builder.json
-  #       (parent module: pool/mod.rs:38-39 `#[cfg(test)] pub(super) mod tests`)
-  testOnlyPostUnpack = {
-    rio-controller = ''
-      mkdir -p $NIX_BUILD_TOP/nix/nixos-node
-      ln -sf ${seccompFileset} $NIX_BUILD_TOP/nix/nixos-node/seccomp
-    '';
-  };
-
   # Crates whose build.rs invokes `protoc` (directly or via prost-build/
   # tonic-prost-build). nixpkgs' prost-build override sets PROTOC on
   # prost-build itself, but the env var must be on the CONSUMER that
@@ -341,9 +306,7 @@ let
     # crate and needs no override.)
     rio-scheduler = _: sqlxOffline;
     rio-store = _: sqlxOffline;
-    # nodeclaim_pool/sketch.rs uses sqlx::query! (offline cache). The
-    # #[cfg(test)]-only seccomp include_str! is in testOnlyPostUnpack —
-    # applied by checks.nix's mkTestVariant alongside buildTests=true.
+    # nodeclaim_pool/sketch.rs uses sqlx::query! (offline cache).
     rio-controller = _: sqlxOffline;
 
     # build.rs compiles libFuzzer's C++ via the `cc` crate. stdenv's
@@ -425,9 +388,4 @@ in
   memberBins = lib.mapAttrs (
     name: m: scrubBins "${name}-bin${binSuffix}" "${m.build}/bin"
   ) cargoNix.workspaceMembers;
-
-  # Test-only postUnpack snippets, keyed by crate name. Consumed by
-  # nix/checks.nix's mkTestVariant — see the `testOnlyPostUnpack`
-  # let-binding above for the inventory and rationale.
-  inherit testOnlyPostUnpack;
 }
