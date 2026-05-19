@@ -345,12 +345,16 @@ let
       // extraOverride
     )).overrideAttrs
       (old: {
-        name = "${old.name}-${suffix}";
+        # buildRustCrate already appends `-test` to the name when
+        # buildTests=true, so `old.name` is `rust_<crate>-<ver>-test`.
+        # `suffix` composes on top of that — it must NOT repeat `test`.
+        name = "${old.name}${lib.optionalString (suffix != "") "-${suffix}"}";
         src = memberRuntimeSrcs.${name} or old.src;
       });
 
   testMember = mkTestVariant {
-    suffix = "test";
+    # buildRustCrate's `-test` is the whole name; nothing to add.
+    suffix = "";
     devDeps = devDepsFor;
     extraOverride = {
       extraRustcOpts = [ "-Ccodegen-units=16" ];
@@ -362,7 +366,7 @@ let
   # compiled. This is the half of `--all-targets` that clippyMember
   # alone misses.
   clippyTestMember = mkTestVariant {
-    suffix = "clippy-test";
+    suffix = "clippy";
     devDeps = devDepsFor;
     extraOverride = {
       rust = clippyRustc;
@@ -413,7 +417,7 @@ let
   # dereferences crateBuildCov's builtCrates so instrumented rlibs
   # link together.
   covTestMember = mkTestVariant {
-    suffix = "cov-test";
+    suffix = "cov";
     devDeps = devDepsForCov;
     extraOverride = {
       extraRustcOpts = [ "-Ccodegen-units=16" ];
