@@ -108,6 +108,14 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         "rio_store_check_available_duration_seconds",
         SUBSTITUTE_DURATION_BUCKETS,
     ),
+    (
+        // Digest-list length, not seconds: 1 (single probe) to the
+        // HAS_BATCH_MAX cap (65536). Chromium-scale closure ~25k.
+        "rio_store_directory_has_batch_size",
+        &[
+            1.0, 8.0, 32.0, 128.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0,
+        ],
+    ),
 ];
 
 /// Registers prometheus metric descriptions. The help strings here are
@@ -152,7 +160,10 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_integrity_failures_total",
-        "GetPath content integrity check failures (bitrot/corruption)"
+        "Content integrity check failures, labeled by `site`: \
+         `get_path` (whole-NAR SHA-256, indicates bitrot/corruption), \
+         `read_blob` (whole-file BLAKE3, indicates cumsum/index drift), \
+         `chunk` (per-chunk BLAKE3, indicates bitrot/corruption)"
     );
     describe_gauge!(
         "rio_store_chunk_dedup_ratio",
@@ -186,7 +197,7 @@ pub fn describe_metrics() {
         "rio_store_tiered_writethrough_errors_total",
         "Tiered backend Express write-through failures (chunk served from S3 standard but Express not warmed)"
     );
-    // Spec'd in observability.md ahead of P0585 (Express eviction
+    // Spec'd in observability.typ ahead of P0585 (Express eviction
     // sweeper); register HELP text now so the metrics_registered
     // spec→describe gate passes, the sweeper adds the emit sites.
     describe_gauge!(
@@ -366,6 +377,20 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_nar_index_cache_hits_total",
         "GetNarIndex requests served from the nar_index table without recompute"
+    );
+
+    // ADR-022 castore RPC surface (P0573 / P0577).
+    describe_histogram!(
+        "rio_store_directory_get_seconds",
+        "GetDirectory wall time per RPC (recursive BFS over the Directory DAG)"
+    );
+    describe_histogram!(
+        "rio_store_directory_has_batch_size",
+        "Digest-list length per HasDirectories/HasBlobs call (labeled rpc)"
+    );
+    describe_histogram!(
+        "rio_store_directory_read_seconds",
+        "ReadBlob wall time per RPC (chunk fetch + slice + stream)"
     );
 
     // Pre-register drain gauges at 0. metrics-rs only materializes a gauge

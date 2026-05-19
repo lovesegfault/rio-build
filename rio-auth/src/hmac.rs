@@ -355,6 +355,10 @@ pub fn ensure_service_caller(
 /// file, same field, and a process is one role or the other (never
 /// both), so a single struct with both methods is sufficient. The
 /// [`HmacSigner`]/[`HmacVerifier`] aliases keep call sites readable.
+///
+/// Deliberately not `Clone`: callers needing to share a verifier across
+/// service impls wrap one in `Arc` so there's exactly one copy of the
+/// key bytes in memory.
 pub struct HmacKey {
     key: Vec<u8>,
 }
@@ -625,6 +629,17 @@ mod tests {
         assert_eq!(
             AssignmentClaims::digest_input_closure(&[]),
             blake3::hash(b"").to_hex().to_string(),
+        );
+        // Golden vector: pins separator placement (round-trip can't).
+        assert_eq!(
+            AssignmentClaims::digest_input_closure(&a),
+            blake3::hash(b"/nix/store/aaa-foo\n/nix/store/bbb-bar")
+                .to_hex()
+                .to_string(),
+        );
+        assert_eq!(
+            AssignmentClaims::digest_input_closure(&["x".to_string()]),
+            blake3::hash(b"x").to_hex().to_string(),
         );
     }
 

@@ -15,9 +15,10 @@ pub struct DirectoryDag {
     /// UPSERT and GC decrement take row locks in the same order
     /// (`r[store.chunk.lock-order]`).
     pub directories: Vec<([u8; 32], Vec<u8>)>,
-    /// Distinct `(file_digest, nar_offset)`, sorted; first occurrence's
-    /// offset wins (same content → same bytes at any offset).
-    pub file_blobs: Vec<([u8; 32], u64)>,
+    /// Distinct `(file_digest, nar_offset, size)`, digest-sorted.
+    /// First occurrence's offset wins; size is content-derived so
+    /// duplicates always agree.
+    pub file_blobs: Vec<([u8; 32], u64, u64)>,
     /// Encoded [`RootNode`] for `nar_index.root_node`.
     pub root_node: Vec<u8>,
     /// Root `dir_digest`, or empty when the root is not a directory.
@@ -119,18 +120,23 @@ pub fn build(entries: &[NarLsEntry]) -> DirectoryDag {
         Vec::new()
     };
 
-    // Distinct file_digest → nar_offset, first occurrence wins.
-    let mut file_blobs_map: HashMap<[u8; 32], u64> = HashMap::new();
+    // Distinct file_digest → (nar_offset, size), first occurrence wins.
+    let mut file_blobs_map: HashMap<[u8; 32], (u64, u64)> = HashMap::new();
     for e in entries {
         if e.kind == NarEntryKind::Regular {
-            file_blobs_map.entry(e.file_digest).or_insert(e.nar_offset);
+            file_blobs_map
+                .entry(e.file_digest)
+                .or_insert((e.nar_offset, e.size));
         }
     }
 
     let mut directories: Vec<([u8; 32], Vec<u8>)> = bodies.into_iter().collect();
     directories.sort_unstable_by_key(|(d, _)| *d);
-    let mut file_blobs: Vec<([u8; 32], u64)> = file_blobs_map.into_iter().collect();
-    file_blobs.sort_unstable_by_key(|(d, _)| *d);
+    let mut file_blobs: Vec<([u8; 32], u64, u64)> = file_blobs_map
+        .into_iter()
+        .map(|(d, (o, s))| (d, o, s))
+        .collect();
+    file_blobs.sort_unstable_by_key(|(d, _, _)| *d);
 
     DirectoryDag {
         directories,
@@ -310,8 +316,9 @@ mod tests {
         // 1 distinct file content.
         assert_eq!(dag.file_blobs.len(), 1);
         assert_eq!(dag.file_blobs[0].0, [9u8; 32]);
-        // First occurrence's offset retained.
+        // First occurrence's offset retained, size carried through.
         assert_eq!(dag.file_blobs[0].1, 100);
+        assert_eq!(dag.file_blobs[0].2, 4);
     }
 
     /// Single-file root → no directories, root_digest empty, root_node
@@ -322,7 +329,7 @@ mod tests {
         let dag = build(&entries);
         assert!(dag.directories.is_empty());
         assert!(dag.root_digest.is_empty());
-        assert_eq!(dag.file_blobs, vec![([3u8; 32], 96)]);
+        assert_eq!(dag.file_blobs, vec![([3u8; 32], 96, 7)]);
         let rn = RootNode::decode(dag.root_node.as_slice()).unwrap();
         match rn.node.unwrap() {
             root_node::Node::File(f) => {
