@@ -1,6 +1,6 @@
 # ADR-022 Implementation Plan — castore-FUSE lazy store + per-AZ S3 Express chunk cache
 
-**Status:** Phase-0 gate passed (P0541, P0544, P0569 done; P0543/P0578 do not block the gate and are still UNIMPL). Phase 1/2 in progress: P0545, P0546, P0548, P0549, P0550, P0551, P0552, P0568, P0570, P0572, P0573, P0577, P0588, P0589 done. Castore RPC surface (`GetDirectory`/`Has*`/`ReadBlob`/`StatBlob`) is now complete; P0574 (gateway delta-sync client) and P0557 (eager nar_index compute) are unblocked. Design is [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) + [Design Overview](./022-design-overview.md) + ADR-023. Per-item status is in the metadata line under each `### P05xx` heading.
+**Status:** Phase-0 gate passed (P0541, P0544, P0569 done; P0543/P0578 do not block the gate and are still UNIMPL). Phase 1/2 in progress: P0545, P0546, P0548, P0549, P0550, P0551, P0552, P0568, P0570, P0572, P0573, P0577, P0588, P0589 done. Castore RPC surface (`GetDirectory`/`Has*`/`ReadBlob`/`StatBlob`) is now complete; P0574 (gateway delta-sync client) is the next unblocked feature item. P0557 (eager nar_index compute) is BLOCKED on P0586 — `set_nar_index`'s `path_tenants` cross-join (added by P0572 after P0557 was planned) makes a `finalize_single` spawn permanently lose the race against the scheduler's `upsert_path_tenants`; see P0557 note. Design is [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) + [Design Overview](./022-design-overview.md) + ADR-023. Per-item status is in the metadata line under each `### P05xx` heading.
 **Plan-number range:** P0541–P0589 (gaps at 0542/0547/0558/0561/0587 are abandoned numbers; P0556 abandoned 2026-04-23 — do not reuse).
 **Clean-cutover constraint:** no FUSE fallback flag, no `RIO_STORE_BACKEND` selector. P0560 deletes the old FUSE module wholesale.
 **Cross-region forward-compat:** object store (S3/GCS) is authoritative for bytes; S3 Express One Zone is a per-AZ read-through cache; PG is single-region. Nothing here precludes cross-region deployment (object-store-authoritative, cache tier stateless) but it is not implemented. No DRA. **Express AZ-ID availability constrains region/AZ choice** — see [Design Overview §9](./022-design-overview.md).
@@ -128,7 +128,7 @@ P0552 GetNarIndex + indexer_loop  P0573 GetDirectory  │                       
    │                              │                             P0585 Express eviction sweeper
    │                              │
 ┌── Phase 4 store-side index (gated on Phase-0 + P0546) ──┐
-P0557 PutPath eager nar_index (try_acquire-gated; NAR in RAM → nar_ls+blake3) ◄─(P0551, P0552)
+P0557 PutPath eager nar_index (try_acquire-gated; NAR in RAM → nar_ls+blake3) ◄─(P0551, P0552, P0572, P0586) ⛔BLOCKED on P0586 — path_tenants race
 P0556 [ABANDONED — §3 EROFS encoder; §2 has no image]
    │
 ┌── Phase 5 castore-FUSE builder-side ──┐                                                       │
@@ -448,7 +448,35 @@ Hoist `StoreClients` + the FUSE-independent fetch primitives (`JIT_MIN_THROUGHPU
 **Status: ABANDONED 2026-04-23.** Was the EROFS metadata-image encoder for the §3 composefs-style alternative. §2 castore-FUSE serves the Directory DAG directly via `lookup`/`readdir` — no image, no encoder, no `composefs-sys` crate, no `libcomposefs-user-xattr.patch`, no `composefs-encoder.nix` VM test, no `composefs_encode` fuzz target. Number kept for stability; do not reuse.
 
 ### P0557 — PutPath eager `nar_index` compute (no encode)
-**Crate:** `rio-store` · **Deps:** P0551, P0552 · **Complexity:** LOW
+**Crate:** `rio-store` · **Deps:** P0551, P0552, P0572, P0586 · **Complexity:** LOW · **Status: BLOCKED on P0586 — see note**
+
+> **Blocked (2026-05-19).** This item was planned against the P0551/P0552 shape of
+> `set_nar_index(pool, hash, entries)` — one tenant-independent table write. P0572
+> retroactively grew it to `set_nar_index(…, dag)` writing `directories`,
+> `directory_tenants`, `file_blobs`, `file_blob_tenants`, with the two `*_tenants`
+> inserts via `CROSS JOIN path_tenants`. `path_tenants` is populated by the
+> *scheduler* (`upsert_path_tenants` in dispatch/merge), which fires after the
+> worker reports build completion — i.e. after `PutPath` returns. An eager spawn
+> inside `finalize_single` therefore *always* runs `set_nar_index` against an
+> empty `path_tenants` table: the cross joins emit zero rows, `nar_indexed`
+> flips `TRUE`, the indexer loop never re-touches the path, and the junction
+> inserts are gated `if inserted` so no later pass repairs them. Result:
+> `GetDirectory`/`HasDirectories`/`HasBlobs`/`ReadBlob`/`StatBlob` return
+> `NotFound` for the path's owning tenant, permanently.
+>
+> The plan's own exit criterion (`GetNarIndex` < 100 ms) doesn't probe this:
+> `GetNarIndex` is builder-internal (`reject_end_user_tenant`), never joins the
+> junction tables, and goes green over the bug. The indexer loop carries the same
+> latent race today (~ms scheduler RTT vs. 5 s poll — usually wins, not a
+> guarantee).
+>
+> **Resolution: P0586.** Its commit txn writes `path_tenants` + `directory_tenants`
+> + `file_blob_tenants` + `nar_index` in one transaction with `claims.tenant`
+> threaded through the HMAC `WorkAssignment` claim — no race window. Once P0586
+> lands, the eager-index optimization is correct by construction (the bytes are
+> in RAM during the same txn). Implement P0557 inside P0586's commit path, not as
+> a separate `finalize_single` spawn.
+
 | File | Change |
 |---|---|
 | `rio-store/src/grpc/put_path/mod.rs` (after `cas::put_chunked` Ok) | `if let Ok(permit) = index_sem.clone().try_acquire_owned() { tokio::spawn(async move { let _p = permit; nar_index::compute_from_bytes(pool, &nar_bytes, store_path).await }) }` — eager only if a permit is *immediately* free; otherwise leave for `indexer_loop` (≤5 s pickup). NAR bytes passed as `Arc<Vec<u8>>`. `index_sem` sized by config `nar_index_concurrency` (default 4). `// r[impl store.index.putpath-eager]` |
@@ -458,7 +486,7 @@ Hoist `StoreClients` + the FUSE-independent fetch primitives (`JIT_MIN_THROUGHPU
 | `nix/tests/scenarios/protocol-warm.nix` | new subtest `eager-nar-index`: PutPath a 3-file NAR → `GetNarIndex` returns within 100 ms (eager path hit, before `indexer_loop` would have picked it up). |
 | `nix/tests/default.nix` | wire `eager-nar-index` subtest with `# r[verify store.index.putpath-eager]` at the `subtests=[…]` entry |
 
-**Exit:** `/nixbuild --checks` green; `vm-protocol-warm` `eager-nar-index` subtest green.
+**Exit:** `/nixbuild --checks` green; `vm-protocol-warm` `eager-nar-index` subtest green. The exit criterion above only probes `GetNarIndex`; add a tenant-scoped `GetDirectory`/`StatBlob` round-trip on a freshly-built path to actually catch the `path_tenants` race.
 
 ---
 
@@ -759,7 +787,7 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 {"plan":585,"title":"Express eviction sweeper: per-AZ Lease, size-bounded MRU (target 8 TiB, hi/lo watermark)","deps":[548,554],"crate":"rio-store,infra","priority":75,"status":"UNIMPL","complexity":"LOW","note":"LastModified=last-cold-miss (read-through-only fill); S3 Lifecycle is age-based ceiling only, app sweep is authoritative for size target"}
 {"plan":586,"title":"PutPathChunked: multi-output Begin + bounds validate + fused walk + HasChunks + pipelined sync narhash+refs verify + CA defer-placeholder","deps":[551,572,573,577,589],"crate":"rio-store,rio-builder,rio-proto","priority":85,"status":"UNIMPL","complexity":"HIGH","note":"closes TODO(P0433/P0434); Begin{outputs[],directories[],novel[],input_closure[]}; bounds + dir-digest recompute before placeholder; per-output verify driver (global first_site for novel); commit txn writes castore + tenant tables; is_ca defers placeholder to commit"}
 {"plan":556,"title":"[ABANDONED] libcomposefs FFI encoder (composefs-sys + encode.rs) — §3 EROFS alternative","deps":[],"crate":"","priority":0,"status":"ABANDONED","complexity":null,"note":"2026-04-23: §2 castore-FUSE has no metadata image; encoder/patch/VM-test/fuzz all dropped"}
-{"plan":557,"title":"PutPath eager nar_index compute (try_acquire-gated; no encode)","deps":[551,552],"crate":"rio-store","priority":80,"status":"UNIMPL","complexity":"LOW","note":"nar_ls+blake3 while NAR in RAM; no S3 artifact"}
+{"plan":557,"title":"PutPath eager nar_index compute (try_acquire-gated; no encode)","deps":[551,552,572,586],"crate":"rio-store","priority":80,"status":"BLOCKED","complexity":"LOW","note":"BLOCKED on P0586: set_nar_index now cross-joins path_tenants (P0572); scheduler writes that AFTER PutPath returns; eager spawn would write empty tenant junctions, permanently. Implement inside P0586's commit txn instead."}
 {"plan":567,"title":"rio-mountd DaemonSet (fuse-fd-handoff + BACKING_OPEN broker + Promote/PromoteChunks verify-copy + cache+chunks ownership + build_id validation + per-uid conn binding + staging quota + metrics)","deps":[576,578],"crate":"rio-builder,infra","priority":80,"status":"UNIMPL","complexity":"MED","note":"~250 LoC (no erofs/losetup); tokio async per-conn; Promote+PromoteChunks both on spawn_blocking+Semaphore; build_id ^[A-Za-z0-9_-]{1,64}$; openat(base_dirfd) not string-concat; one conn per peer_uid; mountd-side staging_quota enforcement"}
 {"plan":588,"title":"WorkAssignment.{input_roots,input_closure}: scheduler→builder root_node + sorted-closure transport (proto fields 13,14 + dispatch.rs closure walk)","deps":[572],"crate":"rio-proto,rio-scheduler","priority":85,"status":"DONE","complexity":"LOW","note":"~50 LoC; r[sched.dispatch.input-roots]; input_closure is exactly what P0589 hashes into claims.input_closure_digest"}
 {"plan":559,"title":"castore_fuse/{tree,open,circuit}.rs (Directory-DAG tree; per-digest inodes; Duration::MAX ttl + READDIRPLUS/CACHE_DIR/CACHE_SYMLINKS/PARALLEL_DIROPS; FOPEN_PASSTHROUGH on cache-hit via mountd broker)","deps":[550,567,568,570,572,573,577,588],"crate":"rio-builder","priority":80,"status":"UNIMPL","complexity":"MED","note":"~650 LoC; snix-style; open() resolves chunk-coords server-side via ReadBlob/StatBlob (no client DigestResolver); passthrough is steady-state, read-upcall only during P0575 fill window"}
