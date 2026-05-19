@@ -37,6 +37,7 @@
     },
     "rio-controller": {
       "dev": [
+        "rio-migrations",
         "rio-test-support"
       ],
       "optional": [],
@@ -55,6 +56,7 @@
     },
     "rio-gateway": {
       "dev": [
+        "rio-migrations",
         "rio-store",
         "rio-test-support"
       ],
@@ -75,6 +77,14 @@
         "rio-common",
         "rio-crds"
       ]
+    },
+    "rio-migrations": {
+      "dev": [
+        "rio-common",
+        "rio-test-support"
+      ],
+      "optional": [],
+      "prod": []
     },
     "rio-nix": {
       "dev": [],
@@ -99,6 +109,7 @@
         "rio-common",
         "rio-crds",
         "rio-lease",
+        "rio-migrations",
         "rio-nix",
         "rio-proto",
         "rio-store"
@@ -112,6 +123,7 @@
       "prod": [
         "rio-auth",
         "rio-common",
+        "rio-migrations",
         "rio-nix",
         "rio-proto"
       ]
@@ -164,6 +176,10 @@
     {
       "description": "Kubernetes Lease-based leader election for rio-build components",
       "name": "rio-lease"
+    },
+    {
+      "description": "Database migration SQL, embedded migrator, and per-migration commentary",
+      "name": "rio-migrations"
     },
     {
       "description": "Nix protocol types and wire format",

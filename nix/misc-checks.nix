@@ -415,6 +415,11 @@ in
               ../docs/spec
               ../docs/ref
               ../docs/ops
+              # #src("fuzz/rio-{nix,store}/") — Cargo.toml only so the
+              # directory exists without pulling corpora/Cargo.lock into
+              # the hash (see comment above).
+              ../fuzz/rio-nix/Cargo.toml
+              ../fuzz/rio-store/Cargo.toml
             ]
             ++ map (m: ../. + "/${m}") (
               builtins.filter (m: m != "workspace-hack")

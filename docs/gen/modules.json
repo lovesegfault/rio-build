@@ -605,6 +605,18 @@
       "path": "lib.rs"
     }
   ],
+  "rio-migrations": [
+    {
+      "depth": 0,
+      "doc": "Single source of truth for database migrations.",
+      "path": "lib.rs"
+    },
+    {
+      "depth": 0,
+      "doc": "Migration commentary — the \"living\" half of `migrations/*.sql`.",
+      "path": "migrations.rs"
+    }
+  ],
   "rio-nix": [
     {
       "depth": 0,
@@ -1304,11 +1316,6 @@
     },
     {
       "depth": 0,
-      "doc": "Migration commentary — the \"living\" half of `migrations/*.sql`.",
-      "path": "migrations.rs"
-    },
-    {
-      "depth": 0,
       "doc": "CA derivation realisation storage.",
       "path": "realisations.rs"
     },
@@ -1403,7 +1410,7 @@
     },
     {
       "depth": 0,
-      "doc": "Run a fuzz target without remembering which crate's fuzz/ dir it lives in.",
+      "doc": "Run a fuzz target without remembering which fuzz/ subdir it lives in.",
       "path": "fuzz.rs"
     },
     {
@@ -1805,6 +1812,11 @@
       "depth": 1,
       "doc": "`xtask k8s up --wipe` — reset the data plane to pristine state",
       "path": "k8s/wipe.rs"
+    },
+    {
+      "depth": 0,
+      "doc": "Workspace-level invariant checks (\"lints that can't be lints\").",
+      "path": "lint.rs"
     },
     {
       "depth": 0,

@@ -1251,7 +1251,7 @@ impl Ceilings {
 ///
 /// Class-level guard for merged_bug_056 (helm forgot `hw_cost_source`
 /// → §13a unreachable in production). The unit test
-/// [`tests::helm_keys_complete`] asserts this list ∪
+/// `tests::helm_keys_complete` asserts this list ∪
 /// [`HELM_NOT_RENDERED_SLA_KEYS`] covers every [`SlaConfig`] field;
 /// `xtask lint helm-sla` asserts each appears in the rendered chart.
 pub const HELM_RENDERED_SLA_KEYS: &[&str] = &[
