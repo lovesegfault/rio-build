@@ -113,8 +113,11 @@ in
   # include files. Does NOT fail on uncovered/untested — those
   # are informational.
   #
-  # tracey scans docs/spec/**/*.typ (spec) + .rs/.nix/.py for
+  # tracey scans docs/spec/**/*.typ (spec) + .rs/.nix/.py/.ts for
   # `r[impl/verify ...]` annotations + .config/tracey/config.styx.
+  # `.ts` is required: config.styx lists rio-dashboard/src/{lib,api}/*.ts
+  # in `impls.include` and `__tests__/*.ts` in `test_include`; without
+  # it the gate passes vacuously for the dashboard's spec coverage.
   # tracey's daemon writes .tracey/daemon.sock under the working
   # dir, so we cp to a writable tmpdir first.
   tracey-validate =
@@ -126,7 +129,9 @@ in
             ../docs
             ../.config/tracey
             ../nix/tests/default.nix
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs" || f.hasExt "nix" || f.hasExt "py") unfilteredRoot)
+            (pkgs.lib.fileset.fileFilter (
+              f: f.hasExt "rs" || f.hasExt "nix" || f.hasExt "py" || f.hasExt "ts"
+            ) unfilteredRoot)
           ];
         };
         nativeBuildInputs = [ traceyPkg ];
@@ -181,9 +186,11 @@ in
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../xtask/src)
             ../infra/helm/rio-build/templates/scheduler.yaml
-            # seccomp-allowlist reads only the builder profile —
-            # rio-fetcher.json edits don't rehash this check.
+            # seccomp-allowlist validates both Localhost profiles —
+            # rio-builder.json and rio-fetcher.json. Both must be in
+            # the fileset so an edit to either rehashes this check.
             ./nixos-node/seccomp/rio-builder.json
+            ./nixos-node/seccomp/rio-fetcher.json
           ];
         };
       }

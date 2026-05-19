@@ -33,15 +33,17 @@ let
   # an rpc and forgets to regen locally — the sandbox always generates fresh.
   protoSrc = pkgs.lib.cleanSource ../rio-proto/proto;
 
-  # Cross-language golden snapshots. graphLayout.test.ts reads
+  # Cross-language golden snapshot. graphLayout.test.ts reads
   # derivation_statuses.json (the same file rio-scheduler's nextest
   # include_str!'s) to assert STATUS_CLASS/SORT_RANK/TERMINAL cover every
   # Rust-emitted status string. Kept SEPARATE from src (like protoSrc) so
   # a Rust-only change doesn't invalidate the dashboard drv unless it
-  # actually touches the golden. Copied to ../rio-scheduler/tests/golden
-  # in preBuild so the test's relative readFileSync path works
-  # identically in local dev and sandbox.
-  goldenSrc = pkgs.lib.cleanSource ../rio-scheduler/tests/golden;
+  # actually touches the golden. Scoped to the single file the test
+  # reads — a future sibling fixture under golden/ shouldn't rebuild
+  # the multi-minute pnpm/vite/svelte-check pipeline. Copied to
+  # ../rio-scheduler/tests/golden in preBuild so the test's relative
+  # readFileSync path works identically in local dev and sandbox.
+  goldenStatuses = ../rio-scheduler/tests/golden/derivation_statuses.json;
 in
 pkgs.stdenvNoCC.mkDerivation {
   pname = "rio-dashboard";
@@ -89,7 +91,7 @@ pkgs.stdenvNoCC.mkDerivation {
     # rio-dashboard/ src root). The sandbox unpacks src under
     # $NIX_BUILD_TOP/<name>/ so sibling dirs are writable.
     mkdir -p ../rio-scheduler/tests/golden
-    cp ${goldenSrc}/derivation_statuses.json ../rio-scheduler/tests/golden/
+    cp ${goldenStatuses} ../rio-scheduler/tests/golden/derivation_statuses.json
   '';
 
   # lint → test → build. `pnpm run build` = `svelte-check && vite build`.

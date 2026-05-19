@@ -126,13 +126,16 @@ let
   # store path, so RIO_REPO_ROOT points it at the runCommand src tree.
   #
   # Fileset is the scan surface: every workspace-member src/**/*.rs
-  # (over-approximated as "every .rs repo-wide" — modules() walks each
-  # workspace_member()/src/ including xtask, so a `rio-*/src/` glob
-  # would silently drop xtask from modules.json via the
-  # `if !src.is_dir() { continue }` skip), every Cargo.toml
-  # (workspace() reads each member's [package].description +
-  # [dependencies]/[dev-dependencies]/[target.*] for the full crate
-  # graph), and the two helm files alerts()/helm_ns() read.
+  # (derived from `[workspace] members` so xtask and any future member
+  # is picked up — modules() walks each workspace_member()/src/, and a
+  # `rio-*/src/` glob would silently drop xtask from modules.json via
+  # the `if !src.is_dir() { continue }` skip). `<member>/tests/` and
+  # `fuzz/` workspaces are excluded: `xtask regen docs-data` never
+  # reads them, so including them only forces docs rebuilds on
+  # test-file edits. Plus every Cargo.toml (workspace() reads each
+  # member's [package].description + [dependencies]/[dev-dependencies]/
+  # [target.*] for the full crate graph), and the two helm files
+  # alerts()/helm_ns() read.
   docsData =
     pkgs.runCommand "rio-docs-data"
       {
@@ -142,18 +145,22 @@ let
         ];
         src = lib.fileset.toSource {
           root = ../.;
-          fileset = lib.fileset.unions [
-            (lib.fileset.fileFilter (f: f.hasExt "rs") ../.)
-            (lib.fileset.fileFilter (f: f.name == "Cargo.toml") ../.)
-            # config(): per-crate schema snapshots committed by the
-            # `config_schema_frozen` snapshot tests. Glob (not 5
-            # literal paths) so adding a binary crate is a one-place
-            # change (test file + regen).
-            (lib.fileset.fileFilter (f: f.name == "config-schema.json") ../.)
-            ../infra/helm/rio-build/templates/prometheusrule.yaml
-            ../infra/helm/rio-build/values.yaml # helm_ns()
-            ../rio-proto/proto # protos()
-          ];
+          fileset = lib.fileset.unions (
+            [
+              (lib.fileset.fileFilter (f: f.name == "Cargo.toml") ../.)
+              # config(): per-crate schema snapshots committed by the
+              # `config_schema_frozen` snapshot tests. Glob (not 5
+              # literal paths) so adding a binary crate is a one-place
+              # change (test file + regen).
+              (lib.fileset.fileFilter (f: f.name == "config-schema.json") ../.)
+              ../infra/helm/rio-build/templates/prometheusrule.yaml
+              ../infra/helm/rio-build/values.yaml # helm_ns()
+              ../rio-proto/proto # protos()
+            ]
+            ++
+              map (m: lib.fileset.fileFilter (f: f.hasExt "rs") (../. + "/${m}/src"))
+                (builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.members
+          );
         };
       }
       ''
@@ -178,8 +185,23 @@ let
   # shiroa-HTML invocations can't drift (bug_003: HTML omitted gh-sha,
   # so refs.gh() permalinks pointed at /blob/main/). x-target stays
   # per-invocation (shiroa sets it itself; PDF passes book-pdf).
-  typstInputs = [ "gh-sha=${self.rev or "dirty"}" ];
-  inputArgs = lib.concatMapStringsSep " " (i: "--input ${lib.escapeShellArg i}") typstInputs;
+  #
+  # gh-sha is a *parameter*: `checks.*` derivations bake a stable
+  # placeholder so they cache across commits that don't touch typst/rs
+  # sources (`self.rev` changes every commit, which made the four docs
+  # checks spin up runners on every PR). `packages.{docs,docs-pdf}`
+  # bake the real SHA — they're the deployed artifacts whose refs.gh()
+  # permalinks users actually click. The placeholder is SHA-shaped and
+  # != "main" so the shiroa-smoke `/blob/main/` regression assert
+  # still fires on the real bug class (bug_003: HTML omitted gh-sha →
+  # refs.gh() defaulted to "main").
+  realSha = self.rev or "dirty";
+  placeholderSha = "0000000000000000000000000000000000000000";
+  mkInputArgs =
+    ghSha:
+    lib.concatMapStringsSep " " (i: "--input ${lib.escapeShellArg i}") [
+      "gh-sha=${ghSha}"
+    ];
 
   # Compile root: docs sources + generated data, fused into one tree
   # so typst's `--root` sees `/lib`, `/spec`, and `/gen` together.
@@ -188,11 +210,9 @@ let
     cp -r ${docsSrc}/* $out/
     cp -r ${docsData} $out/gen
   '';
-in
-rec {
-  inherit rioTypst typstEnv docsData;
 
-  docs-pdf =
+  mkDocsPdf =
+    ghSha:
     pkgs.runCommand "rio-docs-pdf"
       (
         typstEnv
@@ -202,11 +222,12 @@ rec {
       )
       ''
         typst compile --root ${compileRoot} -f pdf \
-          ${inputArgs} --input x-target=book-pdf \
+          ${mkInputArgs ghSha} --input x-target=book-pdf \
           ${compileRoot}/book-pdf.typ $out
       '';
 
-  docs =
+  mkDocs =
+    ghSha:
     pkgs.runCommand "rio-docs-html"
       (
         typstEnv
@@ -244,7 +265,7 @@ rec {
         cp -r ${compileRoot} ./root && chmod -R +w ./root
         cd ./root
         shiroa build --root . --mode static-html \
-          ${inputArgs} \
+          ${mkInputArgs ghSha} \
           --font-path "$TYPST_FONT_PATHS" -d $out .
         # Hoist + dedup <symbol> glyph defs (typst content-hashes glyph
         # IDs so identical glyphs share an id but every html.frame()
@@ -292,9 +313,23 @@ rec {
           --add-flags "$out"
       '';
 
+  # Placeholder-SHA builds for the checks gate. Distinct attrs (not
+  # `inherit docs;`) so the smoke checks below close over the cache-
+  # stable derivations, not the per-commit ones.
+  docsCheck = mkDocs placeholderSha;
+  docsPdfCheck = mkDocsPdf placeholderSha;
+in
+rec {
+  inherit rioTypst typstEnv docsData;
+
+  # Real-SHA builds for `packages.{docs,docs-pdf}` — the deployed
+  # artifacts whose refs.gh() permalinks readers actually click.
+  docs-pdf = mkDocsPdf realSha;
+  docs = mkDocs realSha;
+
   checks = {
-    typst = docs-pdf;
-    shiroa = docs;
+    typst = docsPdfCheck;
+    shiroa = docsCheck;
     # PDF/HTML divergence smoke. Asserts the two cross-target invariants
     # bug_003/033/025 broke: gh-sha permalinks pinned (no own-repo
     # /blob/main/) and rref() anchors live (~115 same-chapter rrefs as
@@ -304,7 +339,7 @@ rec {
     # against the built `docs` output so it's free (just greps result/).
     shiroa-smoke = pkgs.runCommand "rio-docs-html-smoke" { } ''
       set -euo pipefail
-      cd ${docs}
+      cd ${docsCheck}
       # Scope to own-repo permalinks: external upstream links like
       # github.com/aws/karpenter-provider-aws/blob/main/... are
       # legitimate and would false-positive an unscoped /blob/main/ grep.
@@ -401,7 +436,7 @@ rec {
           cp -rL "$TYPST_PACKAGE_CACHE_PATH" $XDG_DATA_HOME/typst/packages
           chmod -R u+w $XDG_DATA_HOME/typst
           cp -r ${compileRoot} root && chmod -R +w root && cd root
-          shiroa build --root . --mode static-html ${inputArgs} -d $TMPDIR/out .
+          shiroa build --root . --mode static-html ${mkInputArgs placeholderSha} -d $TMPDIR/out .
           # rio-css ships as data:text/css;base64,… — decode to grep.
           # Last entry: rio-css comes after the bundled chrome/general/
           # variables sheets in head.typ.

@@ -378,33 +378,81 @@ fn helm_sla() -> Result<()> {
     Ok(())
 }
 
-/// Builder seccomp profile structure guard.
+/// Seccomp profile structure guard for the builder and fetcher
+/// `Localhost` profiles.
 ///
-/// The profile is a `type: Localhost` k8s seccomp profile baked into
-/// the NixOS node AMI (ADR-021) and applied to every builder pod. This
-/// lint asserts it stays an ALLOWLIST and that the deny/allow sets
-/// don't regress.
+/// Both profiles are `type: Localhost` k8s seccomp profiles baked into
+/// the NixOS node AMI (ADR-021) and force-applied to every
+/// builder/fetcher pod by `pool/pod.rs`. This lint asserts each stays
+/// an ALLOWLIST and that the deny/allow sets don't regress. The
+/// fetcher profile is the higher-risk one (fetchers face the open
+/// internet) and adds `keyctl`/`add_key` to the deny set per ADR-019;
+/// it must also carry the explicit `SCMP_ACT_ERRNO` block its
+/// `//provenance` header documents — that block is what makes the
+/// extra denies grep-able and robust against allowlist widening.
 ///
 /// Lives here (a runtime file read) rather than as a unit test
 /// (compile-time `include_str!`) so the per-crate nix sandbox doesn't
 /// need a cross-directory symlink hack to resolve a path 5 levels
 /// outside `rio-controller/`. Same rationale as `helm_sla` above. The
-/// profile *file* stays at `nix/nixos-node/seccomp/`; it's deployment
-/// config consumed by `hardening.nix`, `k3s-full.nix`, and
+/// profile *files* stay at `nix/nixos-node/seccomp/`; they're
+/// deployment config consumed by `hardening.nix`, `k3s-full.nix`, and
 /// `xtask regen seccomp`.
 fn seccomp_allowlist() -> Result<()> {
     // Worker-critical syscalls — must be present in an ALLOW block. If
     // any of these regress the worker can't mount overlayfs / set up
-    // the Nix sandbox. Regression guard for future profile edits.
+    // the Nix sandbox. Same set for both profiles: the fetcher runs
+    // the FOD build script inside the same sandbox.
     const NEEDED: &[&str] = &["mount", "unshare", "chroot", "clone", "umount2"];
 
-    let path = repo_root().join("nix/nixos-node/seccomp/rio-builder.json");
+    // Fetcher-only ADR-019 denies, on top of the builder DENIED set.
+    const FETCHER_EXTRA_DENIED: &[&str] = &["keyctl", "add_key"];
+
+    let fetcher_denied: Vec<&str> = crate::regen::seccomp::DENIED
+        .iter()
+        .chain(FETCHER_EXTRA_DENIED)
+        .copied()
+        .collect();
+
+    check_seccomp_profile(
+        "nix/nixos-node/seccomp/rio-builder.json",
+        crate::regen::seccomp::DENIED,
+        NEEDED,
+        // Builder profile relies on defaultAction ERRNO alone; no
+        // explicit ERRNO block required.
+        &[],
+    )?;
+    check_seccomp_profile(
+        "nix/nixos-node/seccomp/rio-fetcher.json",
+        &fetcher_denied,
+        NEEDED,
+        // The fetcher profile MUST keep its explicit ERRNO block — see
+        // its `//provenance` header. The block is redundant with
+        // defaultAction (none of these are in an ALLOW block) but it
+        // is the grep-able guard against allowlist widening.
+        &fetcher_denied,
+    )?;
+    Ok(())
+}
+
+/// Validate one seccomp `Localhost` profile.
+///
+/// `must_explicit_errno`: syscalls that MUST appear in an explicit
+/// `SCMP_ACT_ERRNO` block, in addition to being absent from ALLOW.
+/// Pass `&[]` when defaultAction-ERRNO alone is sufficient.
+fn check_seccomp_profile(
+    rel_path: &str,
+    denied: &[&str],
+    needed: &[&str],
+    must_explicit_errno: &[&str],
+) -> Result<()> {
+    let path = repo_root().join(rel_path);
     let raw = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let profile: serde_json::Value = serde_json::from_str(&raw)
         .with_context(|| format!("{} is not valid JSON", path.display()))?;
 
     // The profile must be an ALLOWLIST (defaultAction ERRNO). A
-    // denylist (defaultAction ALLOW + explicit ERRNO for the 5
+    // denylist (defaultAction ALLOW + explicit ERRNO for the deny
     // targets) would be a security REGRESSION vs RuntimeDefault — it
     // would re-enable the ~40 syscalls RuntimeDefault blocks
     // (kexec_load, open_by_handle_at, userfaultfd etc). K8s
@@ -424,32 +472,47 @@ fn seccomp_allowlist() -> Result<()> {
         profile["defaultErrnoRet"],
     );
 
+    let blocks = profile["syscalls"]
+        .as_array()
+        .with_context(|| format!("{}: `syscalls` is not an array", path.display()))?;
+
     // Collect every syscall that appears in any ALLOW block. The
     // denied syscalls must be absent from ALL of them — defaultAction
-    // ERRNO is what denies them. An explicit ERRNO block for them
-    // would be harmless but redundant; absence from ALLOW is the
-    // actual security property.
-    let allowed: BTreeSet<&str> = profile["syscalls"]
-        .as_array()
-        .with_context(|| format!("{}: `syscalls` is not an array", path.display()))?
+    // ERRNO is what denies them.
+    let allowed: BTreeSet<&str> = blocks
         .iter()
         .filter(|b| b["action"] == "SCMP_ACT_ALLOW")
         .flat_map(|b| b["names"].as_array().into_iter().flatten())
         .filter_map(|n| n.as_str())
         .collect();
+    let explicit_errno: BTreeSet<&str> = blocks
+        .iter()
+        .filter(|b| b["action"] == "SCMP_ACT_ERRNO")
+        .flat_map(|b| b["names"].as_array().into_iter().flatten())
+        .filter_map(|n| n.as_str())
+        .collect();
 
-    for denied in crate::regen::seccomp::DENIED {
+    for d in denied {
         ensure!(
-            !allowed.contains(denied),
-            "{}: `{denied}` appears in an ALLOW block — must be ABSENT \
+            !allowed.contains(d),
+            "{}: `{d}` appears in an ALLOW block — must be ABSENT \
              (denied via defaultAction ERRNO)",
             path.display(),
         );
     }
-    for needed in NEEDED {
+    for d in must_explicit_errno {
         ensure!(
-            allowed.contains(needed),
-            "{}: `{needed}` missing from ALLOW blocks — worker overlayfs/\
+            explicit_errno.contains(d),
+            "{}: `{d}` missing from the explicit SCMP_ACT_ERRNO block — \
+             the profile's provenance header documents it as required \
+             (grep-able guard against allowlist widening)",
+            path.display(),
+        );
+    }
+    for n in needed {
+        ensure!(
+            allowed.contains(n),
+            "{}: `{n}` missing from ALLOW blocks — worker overlayfs/\
              Nix-sandbox setup needs it",
             path.display(),
         );
@@ -457,8 +520,9 @@ fn seccomp_allowlist() -> Result<()> {
 
     tracing::info!(
         allowed_syscalls = allowed.len(),
-        denied = crate::regen::seccomp::DENIED.len(),
-        needed = NEEDED.len(),
+        denied = denied.len(),
+        explicit_errno = must_explicit_errno.len(),
+        needed = needed.len(),
         profile = %path.display(),
         "seccomp-allowlist ok"
     );
