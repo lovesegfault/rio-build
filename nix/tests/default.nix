@@ -969,7 +969,7 @@ in
   #   curl with application/grpc-web+proto against the Cilium-
   #   provisioned Gateway Service; asserts DATA frame 0x00 prefix
   #   (unary ClusterStatus) + trailer frame prefix 80 00 00 00
-  #   (streaming GetBuildLogs). The frame-prefix grep proves
+  #   (streaming GetDerivationLogs). The frame-prefix grep proves
   #   tonic-web doesn't buffer server-streams — load-bearing for
   #   WatchBuild / live log tail. ~6min (k3s bring-up + Cilium
   #   Gateway reconcile). No separate Envoy Gateway operator —
@@ -980,7 +980,7 @@ in
   #   httproute rio-scheduler-mutating` fails. Proves the helm-template
   #   fail-closed holds at runtime through the operator's reconcile.
   # r[verify dash.journey.build-to-logs]
-  #   The GetBuildLogs 0x80 trailer assertion proves server-streaming
+  #   The GetDerivationLogs 0x80 trailer assertion proves server-streaming
   #   works through the nginx→Cilium Gateway→scheduler chain. Handler
   #   returns errors as in-stream items (not tonic Trailers-Only) so
   #   tonic-web encodes them as 0x80 body frames browser fetch can read.

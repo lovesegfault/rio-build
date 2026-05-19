@@ -37,7 +37,7 @@ pub use flush::{FlushRequest, LogFlusher};
 /// `{drv_hash}` component of the S3 key.
 ///
 /// This is the SINGLE source of truth shared by the flusher (write side,
-/// [`log_s3_key`] + `insert_log_rows`) and `AdminService.GetBuildLogs`
+/// [`log_s3_key`] + `insert_log_rows`) and `AdminService.GetDerivationLogs`
 /// (read side, PG lookup) so the derivation can never drift. Before this
 /// helper existed, the write side keyed on the full `/nix/store/...` path
 /// while the read side keyed on the basename — the PG lookup never matched
@@ -222,7 +222,7 @@ impl LogBuffers {
 
     /// Read lines with line number ≥ `since`, non-consuming.
     ///
-    /// For `AdminService.GetBuildLogs` — lets a late-joining dashboard
+    /// For `AdminService.GetDerivationLogs` — lets a late-joining dashboard
     /// client catch up from the ring buffer without blocking on S3.
     ///
     /// Returns `None` if no buffer exists for `drv_path` (derivation not

@@ -347,7 +347,7 @@ let
     "ListExecutors"
     "ListPoisoned"
     "ListBuilds"
-    "GetBuildLogs"
+    "GetDerivationLogs"
     "ListTenants"
     "GetBuildGraph"
     "GetSpawnIntents"

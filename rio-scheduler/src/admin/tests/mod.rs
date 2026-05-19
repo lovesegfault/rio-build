@@ -24,7 +24,7 @@ mod workers_tests;
 
 /// Set up `AdminServiceImpl` with a live actor but no S3.
 ///
-/// The GetBuildLogs tests don't exercise the actor (they hit ring
+/// The GetDerivationLogs tests don't exercise the actor (they hit ring
 /// buffer or S3 directly), but the constructor needs a handle.
 /// `setup_actor` gives a real actor backed by the same PG — no
 /// mocks needed. The `_task` keeps the actor task alive; dropping
@@ -86,8 +86,8 @@ pub(super) async fn setup_svc_default() -> (
 }
 
 pub(super) async fn collect_stream(
-    stream: ReceiverStream<Result<BuildLogChunk, Status>>,
-) -> Vec<BuildLogChunk> {
+    stream: ReceiverStream<Result<DerivationLogChunk, Status>>,
+) -> Vec<DerivationLogChunk> {
     stream.filter_map(|r| r.ok()).collect::<Vec<_>>().await
 }
 
@@ -308,7 +308,7 @@ const SERVICE_GATED: &[&str] = &[
     "GetHwClassConfig",
 ];
 const UNGATED_PUBLIC: &[&str] = &[
-    "GetBuildLogs",
+    "GetDerivationLogs",
     "ClusterStatus",
     "ListExecutors",
     "ListBuilds",
@@ -821,10 +821,10 @@ async fn admin_cancel_build_gated_on_service_token() {
 
 /// Unwrap an `Ok(Response)` whose stream yields exactly one `Err(Status)`.
 ///
-/// `get_build_logs` returns errors as stream items (not handler-level
+/// `get_derivation_logs` returns errors as stream items (not handler-level
 /// `Err`) for grpc-web compatibility — see `err_stream` in `logs.rs`.
 pub(super) async fn expect_stream_err(
-    result: Result<Response<ReceiverStream<Result<BuildLogChunk, Status>>>, Status>,
+    result: Result<Response<ReceiverStream<Result<DerivationLogChunk, Status>>>, Status>,
 ) -> Status {
     let mut stream = result
         .expect("handler should return Ok(stream), error is in-stream")

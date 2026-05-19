@@ -209,18 +209,18 @@ pkgs.testers.runNixOSTest {
         )
 
     # ══════════════════════════════════════════════════════════════════
-    # logs — GetBuildLogs streaming (error-path: no active derivation)
+    # logs — GetDerivationLogs streaming (error-path: no active derivation)
     # ══════════════════════════════════════════════════════════════════
     # No build running → no ring buffer entry → server requires
-    # build_id for S3 lookup. Without --build-id the server returns
-    # NotFound ("no active ring buffer and build_id was not provided").
+    # exec_id for S3 lookup. Without --exec-id the server returns
+    # NotFound ("no active ring buffer and exec_id was not provided").
     # Deliberate error-path: proves the CLI surfaces the stream-open
     # gRPC Status correctly (not the same as stream-message errors).
     #
     # cli() uses k3s_server.succeed which asserts exit 0; for this
     # one call, use .fail() directly. 2>&1 captures the anyhow error
     # message so the assert can grep for the expected code.
-    with subtest("cli logs: NotFound when no ring buffer + no build_id"):
+    with subtest("cli logs: NotFound when no ring buffer + no exec_id"):
         out = k3s_server.fail(
             "${common.covShellEnv}"
             "${cliEnv}"

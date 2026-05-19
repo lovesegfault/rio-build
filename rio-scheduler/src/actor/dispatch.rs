@@ -1870,6 +1870,10 @@ impl DagActor {
             assigned_cores: state.sched.last_intent.as_ref().map(|i| i.cores),
             assigned_mem_bytes: None,
             assigned_disk_bytes: None,
+            // Per-execution identifier. Minted at assign_to_worker once the
+            // dispatch path threads it through (later commit); until then
+            // the worker echoes an empty string in the log header.
+            exec_id: String::new(),
         })
     }
 

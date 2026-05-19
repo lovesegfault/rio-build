@@ -1,4 +1,4 @@
-//! `GetBuildLogs` RPC tests + `drv_log_hash`/`decompress_and_chunk` helpers.
+//! `GetDerivationLogs` RPC tests + `drv_log_hash`/`decompress_and_chunk` helpers.
 //!
 //! Split from the 1732L monolithic `admin/tests.rs` (P0386) to mirror the
 //! `admin/logs.rs` submodule seam introduced by P0383.
@@ -21,7 +21,7 @@ fn mk_batch(drv_path: &str, first_line: u64, lines: &[&[u8]]) -> BuildLogBatch {
 }
 
 #[tokio::test]
-async fn get_build_logs_from_ring_buffer() -> anyhow::Result<()> {
+async fn get_derivation_logs_from_ring_buffer() -> anyhow::Result<()> {
     let buffers = Arc::new(LogBuffers::new());
     buffers.push(&mk_batch(
         "/nix/store/abc-test.drv",
@@ -32,8 +32,8 @@ async fn get_build_logs_from_ring_buffer() -> anyhow::Result<()> {
     let (svc, _actor, _task, _db) = setup_svc(buffers, None).await;
 
     let resp = svc
-        .get_build_logs(Request::new(GetBuildLogsRequest {
-            build_id: String::new(), // not needed for ring buffer
+        .get_derivation_logs(Request::new(GetDerivationLogsRequest {
+            exec_id: String::new(), // not needed for ring buffer
             derivation_path: "/nix/store/abc-test.drv".into(),
             since_line: 0,
         }))
@@ -52,7 +52,7 @@ async fn get_build_logs_from_ring_buffer() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn get_build_logs_since_line_filters() -> anyhow::Result<()> {
+async fn get_derivation_logs_since_line_filters() -> anyhow::Result<()> {
     let buffers = Arc::new(LogBuffers::new());
     buffers.push(&mk_batch(
         "/nix/store/abc-test.drv",
@@ -63,8 +63,8 @@ async fn get_build_logs_since_line_filters() -> anyhow::Result<()> {
     let (svc, _actor, _task, _db) = setup_svc(buffers, None).await;
 
     let resp = svc
-        .get_build_logs(Request::new(GetBuildLogsRequest {
-            build_id: String::new(),
+        .get_derivation_logs(Request::new(GetDerivationLogsRequest {
+            exec_id: String::new(),
             derivation_path: "/nix/store/abc-test.drv".into(),
             since_line: 3,
         }))
@@ -78,7 +78,7 @@ async fn get_build_logs_since_line_filters() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn get_build_logs_from_s3_fallback() -> anyhow::Result<()> {
+async fn get_derivation_logs_from_s3_fallback() -> anyhow::Result<()> {
     let db = TestDb::new(&crate::MIGRATOR).await;
     let build_id = uuid::Uuid::new_v4();
     sqlx::query("INSERT INTO builds (build_id, status) VALUES ($1, 'succeeded')")
@@ -141,8 +141,8 @@ async fn get_build_logs_from_s3_fallback() -> anyhow::Result<()> {
     );
 
     let resp = svc
-        .get_build_logs(Request::new(GetBuildLogsRequest {
-            build_id: build_id.to_string(),
+        .get_derivation_logs(Request::new(GetDerivationLogsRequest {
+            exec_id: build_id.to_string(),
             derivation_path: "/nix/store/abc-test.drv".into(),
             since_line: 0,
         }))
@@ -161,14 +161,14 @@ async fn get_build_logs_from_s3_fallback() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn get_build_logs_not_found_in_either() -> anyhow::Result<()> {
+async fn get_derivation_logs_not_found_in_either() -> anyhow::Result<()> {
     let buffers = Arc::new(LogBuffers::new());
     // No S3 configured, buffer empty.
     let (svc, _actor, _task, _db) = setup_svc(buffers, None).await;
 
     let result = svc
-        .get_build_logs(Request::new(GetBuildLogsRequest {
-            build_id: uuid::Uuid::new_v4().to_string(),
+        .get_derivation_logs(Request::new(GetDerivationLogsRequest {
+            exec_id: uuid::Uuid::new_v4().to_string(),
             derivation_path: "/nix/store/nowhere.drv".into(),
             since_line: 0,
         }))
@@ -180,12 +180,12 @@ async fn get_build_logs_not_found_in_either() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn get_build_logs_empty_drv_path_invalid() -> anyhow::Result<()> {
+async fn get_derivation_logs_empty_drv_path_invalid() -> anyhow::Result<()> {
     let (svc, _actor, _task, _db) = setup_svc_default().await;
 
     let result = svc
-        .get_build_logs(Request::new(GetBuildLogsRequest {
-            build_id: String::new(),
+        .get_derivation_logs(Request::new(GetDerivationLogsRequest {
+            exec_id: String::new(),
             derivation_path: String::new(),
             since_line: 0,
         }))
@@ -197,17 +197,17 @@ async fn get_build_logs_empty_drv_path_invalid() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// GetBuildLogs with a non-empty but malformed build_id → InvalidArgument.
+/// GetDerivationLogs with a non-empty but malformed exec_id → InvalidArgument.
 /// The ring buffer is empty (no match on drv_path), so it falls through
-/// to the S3 path, which parses build_id.
+/// to the S3 path, which parses exec_id.
 #[tokio::test]
-async fn test_get_build_logs_invalid_uuid() -> anyhow::Result<()> {
-    // Ring buffer empty → forces S3 fallback → build_id parse.
+async fn test_get_derivation_logs_invalid_uuid() -> anyhow::Result<()> {
+    // Ring buffer empty → forces S3 fallback → exec_id parse.
     let (svc, _actor, _task, _db) = setup_svc_default().await;
 
     let result = svc
-        .get_build_logs(Request::new(GetBuildLogsRequest {
-            build_id: "not-a-uuid".into(),
+        .get_derivation_logs(Request::new(GetDerivationLogsRequest {
+            exec_id: "not-a-uuid".into(),
             derivation_path: "/nix/store/nowhere.drv".into(),
             since_line: 0,
         }))
@@ -216,8 +216,8 @@ async fn test_get_build_logs_invalid_uuid() -> anyhow::Result<()> {
     let status = expect_stream_err(result).await;
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
     assert!(
-        status.message().contains("build_id"),
-        "error should mention build_id: {}",
+        status.message().contains("exec_id"),
+        "error should mention exec_id: {}",
         status.message()
     );
     Ok(())
@@ -384,8 +384,8 @@ async fn try_s3_short_circuits_on_since_ge_line_count() -> anyhow::Result<()> {
     );
 
     let resp = svc
-        .get_build_logs(Request::new(GetBuildLogsRequest {
-            build_id: build_id.to_string(),
+        .get_derivation_logs(Request::new(GetDerivationLogsRequest {
+            exec_id: build_id.to_string(),
             derivation_path: "/nix/store/abc-test.drv".into(),
             since_line: 5,
         }))

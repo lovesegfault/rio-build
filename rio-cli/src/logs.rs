@@ -1,27 +1,27 @@
 //! `rio-cli logs` — stream build logs for a derivation.
 //!
-//! Calls `AdminService.GetBuildLogs` (server-streaming). The server
-//! keys its ring buffer on `derivation_path`, not `build_id` — the
-//! positional arg is the drv path. `--build-id` is only needed for
-//! completed builds (S3 archive lookup); active builds serve from
-//! the ring buffer by drv path alone.
+//! Calls `AdminService.GetDerivationLogs` (server-streaming). Storage
+//! is keyed on `(drv_hash, exec_id)`; the positional arg is the drv
+//! path. `--exec-id` is optional and defaults to the latest execution.
 
 use std::io::Write;
 
 use crate::AdminClient;
 use anyhow::anyhow;
-use rio_proto::types::GetBuildLogsRequest;
+use rio_proto::types::GetDerivationLogsRequest;
 
 use crate::RPC_TIMEOUT;
 
 #[derive(clap::Args, Clone)]
 pub(crate) struct Args {
-    /// Full derivation store path (e.g. `/nix/store/abc-foo.drv`).
+    /// Full derivation store path (e.g. `/nix/store/abc-foo.drv`),
+    /// basename, or bare 32-char hash.
     drv_path: String,
-    /// Build UUID. Only needed if the derivation is no longer in
-    /// the active-build ring buffer (S3 archive lookup).
+    /// Specific execution to fetch. Defaults to the latest. UUIDs come
+    /// from the worker's `rio: exec` log header line, the dashboard, or
+    /// `rio-cli derivations <build-id>`.
     #[arg(long)]
-    build_id: Option<String>,
+    exec_id: Option<String>,
 }
 
 /// Run the `logs` subcommand.
@@ -38,11 +38,11 @@ pub(crate) async fn run(client: &mut AdminClient, a: Args) -> anyhow::Result<()>
     // deadline (an active build may go minutes between log
     // lines; that's not a hang, that's a slow build).
     let mut stream = rio_common::grpc::with_timeout(
-        "GetBuildLogs",
+        "GetDerivationLogs",
         RPC_TIMEOUT,
-        client.get_build_logs(GetBuildLogsRequest {
-            build_id: a.build_id.unwrap_or_default(),
+        client.get_derivation_logs(GetDerivationLogsRequest {
             derivation_path: a.drv_path,
+            exec_id: a.exec_id.unwrap_or_default(),
             since_line: 0,
         }),
     )
@@ -58,11 +58,13 @@ pub(crate) async fn run(client: &mut AdminClient, a: Args) -> anyhow::Result<()>
     // emit thousands.
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    while let Some(chunk) = stream
-        .message()
-        .await
-        .map_err(|s| anyhow!("GetBuildLogs: stream: {} ({:?})", s.message(), s.code()))?
-    {
+    while let Some(chunk) = stream.message().await.map_err(|s| {
+        anyhow!(
+            "GetDerivationLogs: stream: {} ({:?})",
+            s.message(),
+            s.code()
+        )
+    })? {
         for line in &chunk.lines {
             out.write_all(line)?;
             out.write_all(b"\n")?;

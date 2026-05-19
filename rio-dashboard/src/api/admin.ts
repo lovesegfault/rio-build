@@ -6,7 +6,7 @@
 // shared (connection pooling, interceptors land in one place).
 //
 // All three legs of the killer journey (Builds list → Graph → LogViewer)
-// call through this one client: ListBuilds → GetBuildGraph → GetBuildLogs.
+// call through this one client: ListBuilds → GetBuildGraph → GetDerivationLogs.
 // ClearPoisonButton and the Executors-page kind filter likewise call
 // ClearPoison/ListExecutors through this client. The journey pages carry
 // documentary tracey markers in .svelte (which tracey doesn't parse);

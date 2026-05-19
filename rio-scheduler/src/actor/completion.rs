@@ -1045,7 +1045,7 @@ impl DagActor {
         // emitted inside release_downstream, after Progress). By the
         // time the gateway sees Completed, the ring buffer still has
         // the full log (flusher hasn't drained yet — async on a
-        // separate task). So AdminService.GetBuildLogs can serve from
+        // separate task). So AdminService.GetDerivationLogs can serve from
         // the ring buffer in the gap before the S3 upload lands. Seal
         // first: late LogBatch pushes between now and the flusher's
         // drain are dropped instead of recreating an orphan entry; the

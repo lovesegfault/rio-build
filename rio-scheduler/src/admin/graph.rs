@@ -51,6 +51,11 @@ fn node_row_to_proto(r: GraphNodeRow) -> GraphNode {
         system: r.system,
         status: r.status,
         assigned_executor_id: r.assigned_builder_id,
+        // Populated on Completed/Failed once exec_id flows through the
+        // scheduler dispatch path; empty until then. Dashboard falls
+        // back to "latest exec" when empty (correct for cached and
+        // never-ran terminals regardless).
+        exec_id: String::new(),
     }
 }
 

@@ -127,7 +127,7 @@ enum DerivationEventKind {
 
 // Dashboard DAG — deliberately THIN (~200B/node). DerivationNode is ≤64KB
 // (drv_content inline). 2000 nodes × 64KB = 128MB > max_encoding_message_size.
-// GraphNode carries 5 strings — just what the dashboard needs to render a
+// GraphNode carries a handful of strings — just what the dashboard needs to render a
 // node box with a status color.
 message GraphNode {
   string drv_path = 1;
@@ -135,6 +135,10 @@ message GraphNode {
   string system = 3;
   string status = 4;               // derivations.status CHECK constraint values
   string assigned_executor_id = 5; // empty if unassigned
+  // exec_id of the execution this build observed for this drv. Set on
+  // Completed/Failed; empty for Cached, DependencyFailed, Cancelled,
+  // Skipped, and non-terminal. Empty → dashboard falls back to latest.
+  string exec_id = 6;
 }
 
 message GraphEdge {

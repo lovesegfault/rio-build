@@ -320,7 +320,7 @@ in
 
   # proxy_buffering off in dashboardNginxConf is LOAD-BEARING
   # (docker.nix:349): nginx default-buffers upstream → WatchBuild /
-  # GetBuildLogs streams arrive as one blob at close. The config is a
+  # GetDerivationLogs streams arrive as one blob at close. The config is a
   # writeText baked into the dashboard image, invisible to helm-lint.
   # vm-dashboard-k3s's 0x80-at-tail grep can't distinguish (NotFound is
   # tiny either way) — this is the structural backstop.

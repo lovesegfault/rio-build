@@ -1,6 +1,6 @@
 //! AdminService gRPC implementation.
 //!
-//! All RPCs are fully implemented as of phase4a: `GetBuildLogs`,
+//! All RPCs are fully implemented as of phase4a: `GetDerivationLogs`,
 //! `ClusterStatus`, `DrainExecutor`, `TriggerGC`, `ListExecutors`,
 //! `ListBuilds`, `ClearPoison`, `ListTenants`, `CreateTenant`,
 //! `GetBuildGraph`, `GetSpawnIntents`.
@@ -26,21 +26,22 @@ use rio_common::tenant::NormalizedName;
 use rio_proto::AdminService;
 use rio_proto::types::ClearSlaOverrideRequest;
 use rio_proto::types::{
-    AckSpawnedIntentsRequest, AppendInterruptSampleRequest, BuildLogChunk, CancelBuildRequest,
+    AckSpawnedIntentsRequest, AppendInterruptSampleRequest, CancelBuildRequest,
     CancelBuildResponse, ClearPoisonRequest, ClearPoisonResponse, ClusterStatusResponse,
     CreateTenantRequest, CreateTenantResponse, DebugExecutorState, DebugListExecutorsResponse,
-    DeleteTenantRequest, DeleteTenantResponse, DrainExecutorRequest, DrainExecutorResponse,
-    ExportSlaCorpusRequest, ExportSlaCorpusResponse, GcProgress, GcRequest, GetBuildGraphRequest,
-    GetBuildGraphResponse, GetBuildLogsRequest, GetHwClassConfigResponse,
-    GetSlaMispredictorsRequest, GetSlaMispredictorsResponse, GetSpawnIntentsRequest,
-    GetSpawnIntentsResponse, HwClassSampledRequest, HwClassSampledResponse, ImportSlaCorpusRequest,
-    ImportSlaCorpusResponse, InjectBuildSampleRequest, InspectBuildDagRequest,
-    InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse, ListExecutorsRequest,
-    ListExecutorsResponse, ListPoisonedResponse, ListSlaOverridesRequest, ListSlaOverridesResponse,
-    ListTenantsResponse, MintExecutorTokensRequest, MintExecutorTokensResponse, PoisonedDerivation,
-    ReportExecutorTerminationRequest, ReportExecutorTerminationResponse, ResetSlaModelRequest,
-    SetSlaOverrideRequest, SlaDefaultsResponse, SlaExplainRequest, SlaExplainResponse, SlaOverride,
-    SlaStatusRequest, SlaStatusResponse, TerminationReason,
+    DeleteTenantRequest, DeleteTenantResponse, DerivationLogChunk, DrainExecutorRequest,
+    DrainExecutorResponse, ExportSlaCorpusRequest, ExportSlaCorpusResponse, GcProgress, GcRequest,
+    GetBuildGraphRequest, GetBuildGraphResponse, GetDerivationLogsRequest,
+    GetHwClassConfigResponse, GetSlaMispredictorsRequest, GetSlaMispredictorsResponse,
+    GetSpawnIntentsRequest, GetSpawnIntentsResponse, HwClassSampledRequest, HwClassSampledResponse,
+    ImportSlaCorpusRequest, ImportSlaCorpusResponse, InjectBuildSampleRequest,
+    InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse,
+    ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse, ListSlaOverridesRequest,
+    ListSlaOverridesResponse, ListTenantsResponse, MintExecutorTokensRequest,
+    MintExecutorTokensResponse, PoisonedDerivation, ReportExecutorTerminationRequest,
+    ReportExecutorTerminationResponse, ResetSlaModelRequest, SetSlaOverrideRequest,
+    SlaDefaultsResponse, SlaExplainRequest, SlaExplainResponse, SlaOverride, SlaStatusRequest,
+    SlaStatusResponse, TerminationReason,
 };
 use uuid::Uuid;
 
@@ -239,14 +240,14 @@ impl AdminServiceImpl {
 
 #[tonic::async_trait]
 impl AdminService for AdminServiceImpl {
-    type GetBuildLogsStream = ReceiverStream<Result<BuildLogChunk, Status>>;
+    type GetDerivationLogsStream = ReceiverStream<Result<DerivationLogChunk, Status>>;
     type TriggerGCStream = ReceiverStream<Result<GcProgress, Status>>;
 
-    #[instrument(skip(self, request), fields(rpc = "GetBuildLogs"))]
-    async fn get_build_logs(
+    #[instrument(skip(self, request), fields(rpc = "GetDerivationLogs"))]
+    async fn get_derivation_logs(
         &self,
-        request: Request<GetBuildLogsRequest>,
-    ) -> Result<Response<Self::GetBuildLogsStream>, Status> {
+        request: Request<GetDerivationLogsRequest>,
+    ) -> Result<Response<Self::GetDerivationLogsStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
 
         // grpc-web compatibility: ALL error paths return Ok(stream-yielding-
@@ -262,7 +263,7 @@ impl AdminService for AdminServiceImpl {
             return Ok(Response::new(logs::err_stream(status)));
         }
         let req = request.into_inner();
-        let stream = logs::get_build_logs(&self.log_buffers, &self.s3, &self.pool, req).await;
+        let stream = logs::get_derivation_logs(&self.log_buffers, &self.s3, &self.pool, req).await;
         Ok(Response::new(stream))
     }
 
@@ -370,7 +371,7 @@ impl AdminService for AdminServiceImpl {
     ) -> Result<Response<Self::TriggerGCStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
         // grpc-web compatibility: same Trailers-Only constraint as
-        // get_build_logs above. ALL error paths return Ok(stream-
+        // get_derivation_logs above. ALL error paths return Ok(stream-
         // yielding-Err); the handler never returns Err.
         if let Err(status) = self
             .ensure_service_caller(request.metadata(), &["rio-cli"])

@@ -211,7 +211,7 @@ async fn status_human_output_has_all_sections() -> anyhow::Result<()> {
 async fn logs_drains_stream_and_prints_bytes() -> anyhow::Result<()> {
     let (_admin, addr, _handle) = spawn_mock_admin().await?;
 
-    // MockAdmin's get_build_logs sends one chunk with b"mock log line".
+    // MockAdmin's get_derivation_logs sends one chunk with b"mock log line".
     // The CLI writes each line raw + newline.
     let (status, stdout, stderr) = run_cli(&addr, &["logs", "/nix/store/abc-foo.drv"]);
     assert!(status.success(), "logs: {stderr}");

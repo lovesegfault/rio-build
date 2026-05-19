@@ -1,4 +1,4 @@
-//! `AdminService.GetBuildLogs` implementation.
+//! `AdminService.GetDerivationLogs` implementation.
 //!
 //! Two data sources (per `observability.typ`):
 //!
@@ -22,11 +22,11 @@ use tonic::Status;
 use rio_common::grpc::StatusExt;
 use tracing::debug;
 
-use rio_proto::types::{BuildLogChunk, GetBuildLogsRequest};
+use rio_proto::types::{DerivationLogChunk, GetDerivationLogsRequest};
 
 use crate::logs::LogBuffers;
 
-/// Full `GetBuildLogs` handler body: validate → ring buffer → S3.
+/// Full `GetDerivationLogs` handler body: validate → ring buffer → S3.
 ///
 /// `try_ring_buffer` and `try_s3` are separately testable; this
 /// function just sequences them with the right fallback logic.
@@ -35,18 +35,18 @@ use crate::logs::LogBuffers;
 /// as `Err(Status)` — returning `Err` from a server-streaming handler
 /// makes tonic emit Trailers-Only, which the grpc-web dashboard can't
 /// read (browser fetch API can't access HTTP trailers).
-pub(super) async fn get_build_logs(
+pub(super) async fn get_derivation_logs(
     log_buffers: &LogBuffers,
     s3: &Option<(S3Client, String)>,
     pool: &PgPool,
-    req: GetBuildLogsRequest,
-) -> ReceiverStream<Result<BuildLogChunk, Status>> {
-    // Validate: need at least derivation_path. build_id is needed only
+    req: GetDerivationLogsRequest,
+) -> ReceiverStream<Result<DerivationLogChunk, Status>> {
+    // Validate: need at least derivation_path. exec_id is needed only
     // for the S3 path (PG lookup is keyed on it); ring buffer is keyed
     // on drv_path alone.
     if req.derivation_path.is_empty() {
         return err_stream(Status::invalid_argument(
-            "derivation_path is required (build_id is optional if the \
+            "derivation_path is required (exec_id is optional if the \
              derivation is still active)",
         ));
     }
@@ -61,20 +61,20 @@ pub(super) async fn get_build_logs(
         return chunks_to_stream(chunks);
     }
 
-    // Step 2: S3 (completed). Need build_id for the PG lookup.
-    if req.build_id.is_empty() {
+    // Step 2: S3 (completed). Need exec_id for the PG lookup (S3 reshape in a later task).
+    if req.exec_id.is_empty() {
         return err_stream(Status::not_found(format!(
-            "derivation {:?} has no active ring buffer and build_id was \
+            "derivation {:?} has no active ring buffer and exec_id was \
              not provided for S3 lookup. If the build completed, retry \
-             with build_id.",
+             with exec_id (latest-execution lookup is not yet supported).",
             req.derivation_path
         )));
     }
-    let build_id: uuid::Uuid = match req.build_id.parse() {
+    let exec_id: uuid::Uuid = match req.exec_id.parse() {
         Ok(id) => id,
         Err(e) => {
             return err_stream(Status::invalid_argument(format!(
-                "invalid build_id UUID: {e}"
+                "invalid exec_id UUID: {e}"
             )));
         }
     };
@@ -90,7 +90,7 @@ pub(super) async fn get_build_logs(
     // so the lookup key can't drift from what was written.
     let drv_hash = crate::logs::drv_log_hash(&req.derivation_path);
 
-    match try_s3(s3, pool, &build_id, &drv_hash, req.since_line).await {
+    match try_s3(s3, pool, &exec_id, &drv_hash, req.since_line).await {
         Ok(Some(chunks)) => {
             debug!(
                 drv_hash = %drv_hash,
@@ -100,7 +100,7 @@ pub(super) async fn get_build_logs(
             chunks_to_stream(chunks)
         }
         Ok(None) => err_stream(Status::not_found(format!(
-            "no log found for build {build_id} derivation {drv_hash:?} \
+            "no log found for exec {exec_id} derivation {drv_hash:?} \
              (not in ring buffer or S3). Either the derivation produced \
              no output, or the flusher hasn't uploaded yet."
         ))),
@@ -127,13 +127,14 @@ pub(super) fn try_ring_buffer(
     log_buffers: &LogBuffers,
     drv_path: &str,
     since: u64,
-) -> Option<Vec<BuildLogChunk>> {
+) -> Option<Vec<DerivationLogChunk>> {
     let lines = log_buffers.read_since(drv_path, since)?;
     if lines.is_empty() {
         // Buffer present but caller already has everything. Per the
         // proto contract: empty + is_complete=false → re-poll.
-        return Some(vec![BuildLogChunk {
+        return Some(vec![DerivationLogChunk {
             derivation_path: drv_path.to_string(),
+            exec_id: String::new(),
             lines: vec![],
             first_line_number: since,
             is_complete: false,
@@ -144,8 +145,9 @@ pub(super) fn try_ring_buffer(
     let mut chunks = Vec::new();
     for group in lines.chunks(CHUNK_LINES) {
         let first_line = group[0].0;
-        chunks.push(BuildLogChunk {
+        chunks.push(DerivationLogChunk {
             derivation_path: drv_path.to_string(),
+            exec_id: String::new(),
             lines: group.iter().map(|(_n, bytes)| bytes.clone()).collect(),
             first_line_number: first_line,
             is_complete: false, // ring buffer = still active
@@ -164,10 +166,10 @@ pub(super) fn try_ring_buffer(
 async fn try_s3(
     s3: &Option<(S3Client, String)>,
     pool: &PgPool,
-    build_id: &uuid::Uuid,
+    exec_id: &uuid::Uuid,
     drv_hash: &str,
     since: u64,
-) -> Result<Option<Vec<BuildLogChunk>>, Status> {
+) -> Result<Option<Vec<DerivationLogChunk>>, Status> {
     let Some((s3, bucket)) = s3 else {
         // No S3 configured. Can't serve completed logs.
         return Ok(None);
@@ -179,7 +181,7 @@ async fn try_s3(
         "SELECT s3_key, first_line, line_count FROM build_logs
          WHERE build_id = $1 AND drv_hash = $2 AND is_complete = true",
     )
-    .bind(build_id)
+    .bind(exec_id)
     .bind(drv_hash)
     .fetch_optional(pool)
     .await
@@ -197,8 +199,9 @@ async fn try_s3(
     // (client never learns the build finished). One empty terminal
     // chunk satisfies the proto contract.
     if s3_is_caught_up(since, first_line, line_count as u64) {
-        return Ok(Some(vec![BuildLogChunk {
+        return Ok(Some(vec![DerivationLogChunk {
             derivation_path: drv_hash.to_string(),
+            exec_id: String::new(),
             lines: vec![],
             first_line_number: since,
             is_complete: true,
@@ -258,7 +261,7 @@ pub(super) fn s3_is_caught_up(since: u64, first_line: u64, line_count: u64) -> b
 /// so the returned `first_line_number` matches what `try_ring_buffer`
 /// would have reported.
 ///
-/// `drv_label` goes into `BuildLogChunk.derivation_path`. The S3 path uses
+/// `drv_label` goes into `DerivationLogChunk.derivation_path`. The S3 path uses
 /// `drv_hash` but the proto field is called `derivation_path` — we put the
 /// hash there since that's all we have at this point (the ring-buffer path
 /// uses the real drv_path, but for completed builds the DAG entry is gone).
@@ -267,7 +270,7 @@ pub(super) fn decompress_and_chunk(
     drv_label: &str,
     first_line: u64,
     since: u64,
-) -> std::io::Result<Vec<BuildLogChunk>> {
+) -> std::io::Result<Vec<DerivationLogChunk>> {
     let decoded = zstd::decode_all(compressed)?;
     // The flusher writes `line\nline\nline\n` — strip the trailing
     // delimiter BEFORE splitting so `split('\n')` yields exactly the
@@ -298,8 +301,9 @@ pub(super) fn decompress_and_chunk(
         }
         buf.push(line.to_vec());
         if buf.len() >= CHUNK_LINES {
-            chunks.push(BuildLogChunk {
+            chunks.push(DerivationLogChunk {
                 derivation_path: drv_label.to_string(),
+                exec_id: String::new(),
                 lines: std::mem::take(&mut buf),
                 first_line_number: chunk_first_line,
                 is_complete: false,
@@ -308,8 +312,9 @@ pub(super) fn decompress_and_chunk(
         }
     }
     if !buf.is_empty() {
-        chunks.push(BuildLogChunk {
+        chunks.push(DerivationLogChunk {
             derivation_path: drv_label.to_string(),
+            exec_id: String::new(),
             lines: buf,
             first_line_number: chunk_first_line,
             is_complete: false,
@@ -326,7 +331,9 @@ pub(super) fn decompress_and_chunk(
 /// fully materialized (we either read the ring buffer or decompressed S3
 /// into memory), so there's no backpressure benefit to streaming — but
 /// the gRPC API is streaming, so we honor it.
-fn chunks_to_stream(chunks: Vec<BuildLogChunk>) -> ReceiverStream<Result<BuildLogChunk, Status>> {
+fn chunks_to_stream(
+    chunks: Vec<DerivationLogChunk>,
+) -> ReceiverStream<Result<DerivationLogChunk, Status>> {
     let (tx, rx) = mpsc::channel(chunks.len().max(1));
     tokio::spawn(async move {
         for chunk in chunks {

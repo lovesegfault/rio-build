@@ -316,6 +316,10 @@ message WorkAssignment {
   optional uint32 assigned_cores = 10;
   optional uint64 assigned_mem_bytes = 11;
   optional uint64 assigned_disk_bytes = 12;
+  // Per-execution identifier minted by the scheduler at dispatch (UUIDv7
+  // string). Echoed by the worker in the log header (display-only, not
+  // load-bearing). Keys logs/{drv_hash}/{exec_id}.log.zst.
+  string exec_id = 13;
 }
 
 // Build configuration options propagated from the client.

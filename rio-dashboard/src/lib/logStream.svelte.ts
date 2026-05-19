@@ -44,7 +44,11 @@ export type LogStream = {
   destroy: () => void;
 };
 
-export function createLogStream(buildId: string, drvPath?: string): LogStream {
+// buildId is kept in the signature for caller compatibility (BuildDrawer keys on it)
+// but is no longer part of the log request — storage is keyed by (drv_hash, exec_id);
+// the server resolves the latest exec when execId is empty. GraphNode.exec_id wiring
+// (so the build view fetches the EXACT exec that build observed) is a follow-up.
+export function createLogStream(_buildId: string, drvPath?: string): LogStream {
   const lines = $state<string[]>([]);
   let done = $state(false);
   let err = $state<Error | null>(null);
@@ -61,8 +65,8 @@ export function createLogStream(buildId: string, drvPath?: string): LogStream {
       // owns it — would ride along with a P0392-adjacent virtualization
       // follow-on if one is written). For now the stream lives and dies
       // with the component.
-      const stream = admin.getBuildLogs(
-        { buildId, derivationPath: drvPath ?? '', sinceLine: 0n },
+      const stream = admin.getDerivationLogs(
+        { derivationPath: drvPath ?? '', execId: '', sinceLine: 0n },
         { signal: ctrl.signal },
       );
       for await (const chunk of stream) {

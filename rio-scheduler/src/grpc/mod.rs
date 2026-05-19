@@ -44,7 +44,7 @@ pub struct SchedulerGrpc {
     pub(super) actor: ActorHandle,
     /// Per-derivation log ring buffers. Written directly by the
     /// BuildExecution recv task (bypasses the actor), read by
-    /// AdminService.GetBuildLogs and drained by the S3 flusher on
+    /// AdminService.GetDerivationLogs and drained by the S3 flusher on
     /// completion. `Arc` because `SchedulerGrpc` is `Clone`d per-connection
     /// and all handlers + the spawned recv tasks need the same buffers.
     pub(super) log_buffers: Arc<LogBuffers>,

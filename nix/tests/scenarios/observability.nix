@@ -175,7 +175,7 @@ pkgs.testers.runNixOSTest {
     # results). `rio_scheduler_log_lines_forwarded_total` increments
     # inside the actor's ForwardLogBatch handler — ≥3 (one per step)
     # proves the full internal pipeline works. The ring buffer +
-    # AdminService.GetBuildLogs give the authoritative log-serving path
+    # AdminService.GetDerivationLogs give the authoritative log-serving path
     # for the dashboard; the STDERR_NEXT tail is a best-effort
     # convenience whose rendering we don't control.
     #

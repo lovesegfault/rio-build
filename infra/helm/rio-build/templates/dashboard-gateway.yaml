@@ -72,7 +72,7 @@ spec:
         - path: { type: Exact, value: /rio.admin.AdminService/ListExecutors }
         - path: { type: Exact, value: /rio.admin.AdminService/ListPoisoned }
         - path: { type: Exact, value: /rio.admin.AdminService/ListBuilds }
-        - path: { type: Exact, value: /rio.admin.AdminService/GetBuildLogs }
+        - path: { type: Exact, value: /rio.admin.AdminService/GetDerivationLogs }
         - path: { type: Exact, value: /rio.admin.AdminService/ListTenants }
         - path: { type: Exact, value: /rio.admin.AdminService/GetBuildGraph }
         - path: { type: Exact, value: /rio.admin.AdminService/GetSpawnIntents }

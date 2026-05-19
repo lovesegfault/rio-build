@@ -39,7 +39,7 @@ impl Scenario for RelayLoop {
         // The builder's stdout is relayed via scheduler→gateway. The
         // direct user-facing assert (captured `nix build` stdout)
         // would be tighter, but `smoke_build` swallows it. Leader log
-        // is the next-best observable: GetBuildLogs / relay traces
+        // is the next-best observable: GetDerivationLogs / relay traces
         // include the line.
         let leader = ctx.scheduler_leader().await?;
         let logs = ctx.kubectl(&["-n", crate::k8s::NS, "logs", &leader, "--since=60s"])?;

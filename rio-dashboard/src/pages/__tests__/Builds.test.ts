@@ -10,7 +10,7 @@ import {
   teardownStandardAfterEach,
 } from '../../test-support/admin-mock';
 
-// The drawer embeds LogViewer (P0279), which fires getBuildLogs on
+// The drawer embeds LogViewer (P0279), which fires getDerivationLogs on
 // mount — adminMock's empty-generator default keeps the `for await`
 // from crashing on `undefined is not iterable`. The log stream itself
 // is covered in lib/__tests__/logStream.test.ts.

@@ -17,7 +17,7 @@ use super::spawn::spawn_grpc_server;
 /// scheduler state (that's what the real AdminServiceImpl tests in
 /// rio-scheduler/src/admin/tests.rs are for).
 ///
-/// Streaming RPCs (GetBuildLogs, TriggerGC) return a stream with a
+/// Streaming RPCs (GetDerivationLogs, TriggerGC) return a stream with a
 /// single terminal message so the client's drain loop exits cleanly.
 // r[impl ts.mock.admin]
 #[derive(Clone, Default)]
@@ -41,8 +41,8 @@ include!(concat!(env!("OUT_DIR"), "/mock_admin_generated.rs"));
 
 #[tonic::async_trait]
 impl AdminService for MockAdmin {
-    type GetBuildLogsStream =
-        tokio_stream::wrappers::ReceiverStream<Result<types::BuildLogChunk, Status>>;
+    type GetDerivationLogsStream =
+        tokio_stream::wrappers::ReceiverStream<Result<types::DerivationLogChunk, Status>>;
     type TriggerGCStream =
         tokio_stream::wrappers::ReceiverStream<Result<types::GcProgress, Status>>;
 
@@ -55,17 +55,18 @@ impl AdminService for MockAdmin {
     // a currently-generated method, move its proto name into MANUAL_METHODS
     // in build.rs and write the body here.
 
-    async fn get_build_logs(
+    async fn get_derivation_logs(
         &self,
-        _: Request<types::GetBuildLogsRequest>,
-    ) -> Result<Response<Self::GetBuildLogsStream>, Status> {
+        _: Request<types::GetDerivationLogsRequest>,
+    ) -> Result<Response<Self::GetDerivationLogsStream>, Status> {
         // One chunk with one line, then EOF. Real server requires
         // derivation_path non-empty; the mock accepts anything (smoke
         // test doesn't validate server-side argument handling).
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let _ = tx
-            .send(Ok(types::BuildLogChunk {
+            .send(Ok(types::DerivationLogChunk {
                 derivation_path: "/nix/store/mock.drv".into(),
+                exec_id: String::new(),
                 lines: vec![b"mock log line".to_vec()],
                 first_line_number: 0,
                 is_complete: true,

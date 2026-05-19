@@ -322,7 +322,7 @@ pub enum ActorCommand {
     /// Sent by the BuildExecution recv task via `try_send` (NOT
     /// `send_unchecked`) — under backpressure this drops, which is
     /// intentional: the ring buffer (written directly by the recv task,
-    /// not through here) still has the lines, so AdminService.GetBuildLogs
+    /// not through here) still has the lines, so AdminService.GetDerivationLogs
     /// can serve them even if the live gateway feed missed some.
     /// Fire-and-forget; no reply.
     ///

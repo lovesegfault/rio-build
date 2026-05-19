@@ -555,7 +555,7 @@ async fn main() -> anyhow::Result<()> {
     // clients keep negotiating h2 — both protocols on one port.
     // r[impl dash.stream.idle-timeout]
     // http2_keep_alive_interval: 30s server-initiated PING keeps
-    // long-lived server streams (GetBuildLogs, WatchBuild) alive
+    // long-lived server streams (GetDerivationLogs, WatchBuild) alive
     // through any proxy's idle-timeout. Replaces the Envoy Gateway
     // ClientTrafficPolicy `streamIdleTimeout: 1h` — the stream is
     // never idle from the proxy's view.

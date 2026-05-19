@@ -104,7 +104,7 @@ const RPC_MAX_ATTEMPTS: u32 = 3;
 /// **Unary only.** The `T: Default` bound rejects `Streaming<_>` at
 /// compile time (prost-generated messages and `()` derive `Default`;
 /// `tonic::Streaming` does not). Server-streaming RPCs (TriggerGC,
-/// GetBuildLogs) need per-message progress, not a whole-call deadline,
+/// GetDerivationLogs) need per-message progress, not a whole-call deadline,
 /// and re-issuing the call on retry would silently drop already-
 /// received messages — wrap the stream-drain loop instead.
 pub(crate) async fn rpc<T: Default>(
@@ -295,10 +295,9 @@ enum Cmd {
     Derivations(derivations::Args),
     /// Stream build logs for a derivation.
     ///
-    /// The server keys its ring buffer on `derivation_path`, not
-    /// `build_id` — the positional here is the drv path. `--build-id`
-    /// is needed only for completed builds (S3 lookup path); for
-    /// active builds the ring buffer serves logs by drv path alone.
+    /// Storage is keyed by `(drv_hash, exec_id)`. The positional is
+    /// the .drv path (or basename or bare hash). `--exec-id` selects
+    /// a specific execution; default is the latest.
     Logs(logs::Args),
     /// Trigger garbage collection. Scheduler proxies to the store
     /// after populating `extra_roots` from live builds, so in-flight

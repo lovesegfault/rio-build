@@ -890,7 +890,7 @@
     {
       "path": "admin/logs.rs",
       "depth": 1,
-      "doc": "`AdminService.GetBuildLogs` implementation."
+      "doc": "`AdminService.GetDerivationLogs` implementation."
     },
     {
       "path": "admin/sla.rs",
