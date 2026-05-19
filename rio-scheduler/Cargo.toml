@@ -146,8 +146,9 @@ rstest = { workspace = true }
 # (tests/sla_fit_props.rs).
 proptest = { workspace = true }
 # admin/tests/mod.rs::admin_rpc_gate_coverage parses admin.proto via
-# include_str! + regex (rio-proto/build.rs doesn't emit a
-# FILE_DESCRIPTOR_SET; rio-test-support's is for MockAdmin codegen only).
+# rio_proto::proto_src + regex (raw-text path; sufficient for the
+# rpc/message/field surface that test asserts on without a prost-types
+# dev-dep — rio_proto::FILE_DESCRIPTOR_SET is there if it ever needs more).
 regex = { workspace = true }
 aws-smithy-mocks = { workspace = true }
 # sla/solve.rs + cost.rs: assert that documented-but-unwired metrics are

@@ -143,6 +143,21 @@ pub mod admin {
     tonic::include_proto!("rio.admin");
 }
 
+/// Binary `FileDescriptorSet` covering every `.proto` file compiled by
+/// `build.rs` (all six services + shared `rio.types`, with transitive
+/// imports — `prost_build` always passes `--include_imports`).
+///
+/// Consumed by `rio-test-support/build.rs` to generate `MockAdmin`
+/// default-stub macros: it decodes this with `prost_types::
+/// FileDescriptorSet::decode` and iterates `AdminService.method[]`.
+/// Exporting the descriptor set keeps the workspace's protoc invocation
+/// in one crate — without this, `rio-test-support/build.rs` ran its own
+/// protoc on `../rio-proto/proto/admin.proto`, a cross-directory
+/// compile-time read that needed a fileset + symlink hack under
+/// crate2nix's sandboxed per-crate builds.
+pub const FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/file_descriptor_set.bin"));
+
 /// Raw `.proto` source for downstream structural tests
 /// (`rio-scheduler/src/admin/tests::admin_rpc_gate_coverage`). crate2nix
 /// sandboxes each crate's build, so a downstream

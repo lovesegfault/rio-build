@@ -578,13 +578,13 @@ async fn get_hw_class_config_ships_catalog_or_global_ceilings() -> anyhow::Resul
 /// signed credential on a multi-caller read-path response is a
 /// cross-tenant leak regardless of the verb's gating.
 ///
-/// `rio-proto/build.rs` does NOT emit a `FILE_DESCRIPTOR_SET` (only
-/// `rio-test-support/build.rs` does, for its own MockAdmin codegen), so
-/// both parts parse the proto sources via [`rio_proto::proto_src`] +
-/// regex (crate2nix sandboxes each crate's build, so a sibling-crate
-/// `include_str!` does NOT resolve under nix builds). The proto grammar
-/// this needs (rpc decls, message blocks, field decls) is regular
-/// enough that regex is robust; protoc validates the rest.
+/// rio-proto re-exports both: `FILE_DESCRIPTOR_SET` (the prost binary
+/// descriptor, used by rio-test-support's MockAdmin codegen) and
+/// [`rio_proto::proto_src`] (the raw `.proto` text). This test parses
+/// the raw text with a regex — sufficient for the rpc/message/field
+/// surface it asserts on, and avoids a prost-types dev-dep. If the
+/// regex grammar ever needs to grow (e.g. tracking `repeated` or oneof
+/// fields), switch to a `FILE_DESCRIPTOR_SET` walk.
 // r[verify sched.sla.threat.read-path-auth]
 #[test]
 fn admin_rpc_gate_coverage() {

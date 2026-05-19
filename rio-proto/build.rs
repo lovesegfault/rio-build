@@ -1,7 +1,26 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // prost-build 0.14 / tonic-prost-build 0.14 do NOT emit
+    // `cargo:rerun-if-changed` for the compiled protos (the
+    // build_with_config path drops it). Without an explicit directive
+    // here, cargo's watch-everything default applies — which works, but
+    // is silently disabled the moment ANY `rerun-if-changed` is emitted.
+    // Make the dependency explicit so the rerun chain is robust to
+    // future additions. Emitted first so a `?` early-return below can't
+    // skip it.
+    println!("cargo:rerun-if-changed=proto/");
+
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
+
+    // Emit the binary FileDescriptorSet alongside the generated Rust
+    // modules. Re-exported from lib.rs as `FILE_DESCRIPTOR_SET` so
+    // downstream build scripts (rio-test-support's MockAdmin codegen)
+    // can decode it via a [build-dependencies] on rio-proto instead of
+    // running their own protoc on `../rio-proto/proto/`. Single protoc
+    // invocation point for the whole workspace.
     let mut b = tonic_prost_build::configure()
         .build_server(true)
-        .build_client(true);
+        .build_client(true)
+        .file_descriptor_set_path(out_dir.join("file_descriptor_set.bin"));
 
     // CompletionReport (~312B) dwarfs the other ExecutorMessage oneof
     // arms (~80B). Generated code; boxing would ripple through every
@@ -92,5 +111,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ],
         &["proto/"],
     )?;
+
     Ok(())
 }

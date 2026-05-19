@@ -99,10 +99,12 @@ nix = { workspace = true, features = ["process", "signal"] }
 k8s-openapi = { workspace = true }
 
 [build-dependencies]
-# build.rs runs protoc --descriptor_set_out on admin.proto and
-# decodes the FileDescriptorSet to iterate service methods (same
-# parser rio-proto uses — single source of truth). Gated on `full`:
-# the generated MockAdmin macro is only consumed by grpc/admin.rs.
+# build.rs decodes rio-proto's FILE_DESCRIPTOR_SET (the workspace's
+# sole protoc invocation) and iterates AdminService.method[] for
+# MockAdmin codegen. Gated on `full`: the generated macro is only
+# consumed by grpc/admin.rs. `dep:rio-proto` in the `full` feature
+# list activates it from both [dependencies] and here.
+rio-proto = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 prost-types = { workspace = true, optional = true }
 # heck: prost's ident normalization (GCRequest → GcRequest) +

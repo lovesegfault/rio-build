@@ -221,15 +221,6 @@ let
     exit 1
   '';
 
-  # rio-test-support/build.rs runs protoc on ../rio-proto/proto/admin.proto
-  # to emit a FileDescriptorSet for MockAdmin codegen. Cross-directory
-  # compile-time read: buildRustCrate src is just rio-test-support/.
-  # Include all .proto files — admin.proto imports types/dag/admin_types,
-  # which transitively import build_types. protoc needs the full graph.
-  protoFileset = pkgs.lib.fileset.toSource {
-    root = ../rio-proto;
-    fileset = pkgs.lib.fileset.fileFilter (f: f.hasExt "proto") ../rio-proto/proto;
-  };
   # query! macros read .sqlx/*.json instead of connecting to PG at
   # compile time. SQLX_OFFLINE_DIR bypasses the workspace-root walk;
   # CARGO points at a stub that outputs minimal `cargo metadata` JSON
@@ -355,19 +346,9 @@ let
     rio-proto = _: protoCrate;
     tonic-health = _: protoCrate;
     opentelemetry-proto = _: protoCrate;
-
-    # rio-test-support: build.rs runs protoc --descriptor_set_out on
-    # ../rio-proto/proto/admin.proto (MockAdmin codegen). Needs PROTOC
-    # plus the proto files symlinked into place.
-    rio-test-support =
-      _:
-      protoCrate
-      // {
-        postUnpack = ''
-          mkdir -p $NIX_BUILD_TOP/rio-proto
-          ln -sf ${protoFileset}/proto $NIX_BUILD_TOP/rio-proto/proto
-        '';
-      };
+    # rio-test-support's build.rs (MockAdmin codegen) decodes
+    # rio_proto::FILE_DESCRIPTOR_SET via a [build-dependencies] on
+    # rio-proto — no protoc, no cross-directory proto reads, no override.
 
     # sqlx::query!()/query_as!() callsites — need the offline cache +
     # cargo-metadata stub. (sqlx::migrate!() lives only in

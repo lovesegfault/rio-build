@@ -6,11 +6,16 @@
 //! Before this build.rs, that stub was hand-written per-RPC and the
 //! grep-hunt ("which mock broke?") happened at compile time.
 //!
-//! APPROACH: run protoc with `--descriptor_set_out` on `admin.proto`,
-//! decode the binary `FileDescriptorSet` with `prost-types`, iterate
-//! `service[].method[]` for name/input_type/output_type/server_streaming
-//! as struct fields (same parser rio-proto uses — single source of truth).
-//! Emit a `macro_rules!` definition wrapping one fn body per unary RPC.
+//! APPROACH: decode `rio_proto::FILE_DESCRIPTOR_SET` (the binary
+//! `FileDescriptorSet` rio-proto's build.rs already emits as a
+//! side effect of its tonic codegen — the workspace's sole protoc
+//! invocation), iterate `service[].method[]` for name/input_type/
+//! output_type/server_streaming, and emit a `macro_rules!` definition
+//! wrapping one fn body per unary RPC. Consuming the descriptor set
+//! via a `[build-dependencies]` on rio-proto means cargo's normal
+//! dependency tracking re-runs this script whenever the protos change
+//! — no cross-directory `rerun-if-changed` paths, no second protoc
+//! run, no fileset symlink hack under crate2nix's per-crate sandboxes.
 //! `src/grpc/admin.rs` `include!`s the macro def at module level, then calls
 //! it inside the `impl AdminService for MockAdmin` block. (`include!` itself
 //! can't sit in impl-item position — "non-impl item macro in impl item
@@ -31,14 +36,12 @@
 
 // MockAdmin codegen is only consumed by grpc/admin.rs (feature = "full").
 // When `full` is off (xtask's default-features = false), skip everything
-// — no protoc invocation, no prost/heck build-deps.
+// — no rio-proto/prost/heck build-deps in the graph at all.
 #[cfg(not(feature = "full"))]
 fn main() {}
 
 #[cfg(feature = "full")]
 use std::fmt::Write as _;
-#[cfg(feature = "full")]
-use std::process::Command;
 
 #[cfg(feature = "full")]
 use heck::{ToSnakeCase, ToUpperCamelCase};
@@ -63,42 +66,19 @@ const MANUAL_METHODS: &[&str] = &[
 
 #[cfg(feature = "full")]
 fn main() {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let proto_dir = format!("{manifest}/../rio-proto/proto");
-    let proto_file = format!("{proto_dir}/admin.proto");
-    println!("cargo:rerun-if-changed={proto_file}");
-    // admin.proto imports these — rerun if they change too (the
-    // descriptor set includes them via --include_imports).
-    for dep in ["types.proto", "dag.proto", "admin_types.proto"] {
-        println!("cargo:rerun-if-changed={proto_dir}/{dep}");
-    }
-
     let out_dir = std::env::var("OUT_DIR").unwrap();
-    let descriptor_path = format!("{out_dir}/admin_descriptor.bin");
 
-    // protoc via the PROTOC env var (set by the dev shell / nix build).
-    // Same binary rio-proto's tonic-build uses — identical parse.
-    // --include_imports: the descriptor set must contain the transitive
-    // deps (types.proto etc.) or the service's input/output types won't
-    // resolve. We only read admin.proto's FileDescriptorProto from the
-    // set, but protoc needs the full graph to emit it.
-    let protoc = std::env::var("PROTOC").expect("PROTOC env var (set by dev shell)");
-    let status = Command::new(&protoc)
-        .arg("--descriptor_set_out")
-        .arg(&descriptor_path)
-        .arg("--include_imports")
-        .arg("-I")
-        .arg(&proto_dir)
-        .arg(&proto_file)
-        .status()
-        .unwrap_or_else(|e| panic!("spawn {protoc}: {e}"));
-    assert!(status.success(), "protoc failed: {status}");
+    // FileDescriptorSet emitted by rio-proto's build.rs and re-exported
+    // as a const. The build-dependency on rio-proto means cargo rebuilds
+    // (and reruns) this script whenever rio-proto's lib changes — which
+    // happens on `.proto` edits because rio-proto/build.rs emits
+    // `cargo:rerun-if-changed=proto/` and the const is `include_bytes!`
+    // of the regenerated descriptor set.
+    let fds = FileDescriptorSet::decode(rio_proto::FILE_DESCRIPTOR_SET)
+        .expect("rio_proto::FILE_DESCRIPTOR_SET decodes as a prost FileDescriptorSet");
 
-    let bytes = std::fs::read(&descriptor_path).expect("read descriptor set");
-    let fds = FileDescriptorSet::decode(&*bytes).expect("decode FileDescriptorSet");
-
-    // The set has one FileDescriptorProto per .proto file (admin.proto +
-    // its imports). We want AdminService, which lives in admin.proto.
+    // The set has one FileDescriptorProto per .proto file (every file
+    // rio-proto compiles, plus imports). We want AdminService.
     let service = fds
         .file
         .iter()
@@ -187,7 +167,8 @@ fn main() {
 
     assert!(
         !generated_body.is_empty(),
-        "descriptor set has zero generated methods for AdminService — protoc/proto_dir wrong?"
+        "descriptor set has zero generated methods for AdminService — \
+         did every method move to MANUAL_METHODS, or did the service get renamed?"
     );
 
     std::fs::write(
