@@ -404,13 +404,13 @@ pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
         // an hw-class; allocatable can vary across instance types within
         // the class but the threshold's order of magnitude doesn't).
         // Operator check: `fetcher-*` cells ≥ 600s floor; builder cells
-        // ≥ 60s `*` floor. For bin-packed cells (`E[c_fit] ≤ cores/2`,
+        // ≥ 300s `*` floor. For bin-packed cells (`E[c_fit] ≤ cores/2`,
         // the §13b MostAllocated default for builders), the floor is a
         // HARD bound — `λ̂` saturates at `1/w = 2/boot` so the
         // keep-condition is structurally unsatisfiable (r38 bug_022).
         // Only cells packing ~1 intent/node can be NA-extended above
         // the floor. A cell at boot_median/2 (~9-25s) when its
-        // minConsolidationTime entry says 60/600s = the prefix-glob
+        // minConsolidationTime entry says 300/600s = the prefix-glob
         // didn't match.
         // r[impl obs.metric.consolidate-threshold]
         metrics::gauge!(
@@ -1099,22 +1099,24 @@ mod tests {
     }
 
     /// r37 merged_010 (§Granularity-coupling): `w` decoupled from `floor`.
-    /// With `min ≥ boot_median` (the chart default `*: 60.0` for an 18s-
-    /// boot builder), the pre-fix `w = floor.max(5.0)` made `λ·E > rhs`
-    /// unsatisfiable (`λ ≤ 1/w < cores/boot_median`) — the NA model
-    /// returned `floor` unconditionally. The decoupled `w = boot_median/2`
-    /// makes the keep-condition satisfiable again so the model can extend
-    /// past the floor under load — the `values.yaml` `minConsolidationTime`
+    /// With `min ≥ boot_median` (any operator floor for an 18s-boot
+    /// builder; chart default is `*: 300.0`), the pre-fix
+    /// `w = floor.max(5.0)` made `λ·E > rhs` unsatisfiable
+    /// (`λ ≤ 1/w < cores/boot_median`) — the NA model returned `floor`
+    /// unconditionally. The decoupled `w = boot_median/2` makes the
+    /// keep-condition satisfiable again so the model can extend past
+    /// the floor under load — the `values.yaml` `minConsolidationTime`
     /// rationale: a hard minimum the model "CAN extend under arrival
-    /// pressure" only for ~1-intent/node cells. This fixture is that case
-    /// (`E[c_fit] = node_cores`); the bin-packed inverse is
+    /// pressure" only for ~1-intent/node cells. This fixture is that
+    /// case (`E[c_fit] = node_cores`); the bin-packed inverse is
     /// `consolidate_after_floor_binds_for_bin_packed_cells` below.
+    /// Fixture uses `min=60` (a representative floor) — the property is
+    /// about the `w`/`floor` decoupling, not the deployed value.
     // r[verify ctrl.nodeclaim.consolidate-na+6]
     #[test]
     fn consolidate_after_extends_past_policy_floor() {
-        // Builder cell shape: boot_median=18, min=60 (qa-fix-b chart
-        // default). Dense arrivals at 60..70s (right past the floor),
-        // E[c_fit]=64, node=64.
+        // Builder cell shape: boot_median=18, min=60. Dense arrivals
+        // at 60..70s (right past the floor), E[c_fit]=64, node=64.
         let evs: Vec<_> = (61..=70).map(|k| ev(f64::from(k), false)).collect();
         let t = consolidate_after(&evs, 64.0, 64, 18.0, None, Some(60.0));
         // floor = max(9, 60) = 60. w = max(9, 5) = 9. rhs = 64/18 ≈ 3.56.

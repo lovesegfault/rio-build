@@ -293,7 +293,7 @@ pub fn describe_metrics() {
          past the floor ONLY for cells packing ~1 intent/node \
          (E[c_fit] > cores/2); for bin-packed cells (the §13b MostAllocated \
          builder default) the floor is a hard bound the model cannot exceed. \
-         Watch fetcher-* >= 600s and builder cells >= the 60s `*` floor to \
+         Watch fetcher-* >= 600s and builder cells >= the 300s `*` floor to \
          confirm the per-cell e_fitting_cores partition and the policy floor \
          are both routing (r35 bug_023/bug_050; r38 bug_022)."
     );

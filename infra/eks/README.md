@@ -86,9 +86,9 @@ cargo xtask k8s -p eks up --push --deploy
 Two layers, chained:
 
 1. **Pod layer** (`rio-controller`): builders are ephemeral one-shot Jobs — one pod per derivation, spawned on dispatch, deleted on completion. The controller gates spawn rate against each Pool's `spec.maxConcurrent`; there is no replica count to scale.
-2. **Node layer** (Karpenter): watches for Pending pods that can't schedule, provisions an EC2 instance that fits (~30-60s boot). When builds complete and pods exit, empty nodes are consolidated after `consolidateAfter` (30s for builders, 5m for general).
+2. **Node layer**: for builder/fetcher cells, `rio-controller`'s `nodeclaim_pool` reconciler mints NodeClaims directly against `rio-nodeclaim-shim` (ADR-023 §13b) and reaps idle ones via the NA consolidation model, floored at `karpenter.nodeclaimPool.minConsolidationTime` (300s for builders, 600s for fetchers). For `rio-general`, Karpenter watches Pending pods and consolidates `WhenEmpty` after `consolidateAfter` (5m). EC2 boot is ~30-60s.
 
-The chain: build submitted → scheduler dispatches → controller creates a Job → pod Pending (no builder node exists) → Karpenter provisions a node → pod Running. Cold start from zero: ~50-80s. `consolidationPolicy: WhenEmpty` means Karpenter never evicts a builder mid-build — only consolidates after the Job has exited.
+The chain: build submitted → scheduler dispatches → controller creates a Job + a NodeClaim if no node fits → pod Pending → node boots → pod Running. Cold start from zero: ~50-80s. `karpenter.sh/do-not-disrupt` on builder pods means a node is never evicted mid-build.
 
 Two static NodePools: `rio-nodeclaim-shim` (`limits.cpu:0` — Karpenter sees it but never provisions; `rio-controller`'s nodeclaim_pool reconciler creates NodeClaims directly per ADR-023 §13b/§13c — for both builders AND fetchers since §13e), `rio-general` (untainted, for future gateway/scheduler HPA overflow). Three EC2NodeClasses: `rio-default` (UEFI/UKI), `rio-nvme` (UEFI/UKI + RAID0 instance store), `rio-metal` (BIOS for x86 `.metal`, UEFI for arm64 `.metal` — KVM builds). Builder and fetcher hardware classes (incl. metal) live in `infra/helm/rio-build/values.yaml` under `scheduler.sla.hwClasses`; static NodePools under `karpenter.nodePools`.
 

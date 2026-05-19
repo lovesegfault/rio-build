@@ -528,27 +528,35 @@ impl Default for NodeClaimPoolConfig {
             // r35 bug_050: Karpenter `consolidateAfter: 10m` parity for
             // fetcher cells.
             //
-            // `*: 60.0` builder floor: the NA-model floor `boot_median/2`
+            // `*: 300.0` builder floor: the NA-model floor `boot_median/2`
             // (~9s for an 18s-boot builder) is BELOW the boot cost it's
             // supposed to amortize — reaping at 9s when the next build
             // arrives at t=15s burns a ~30s reprovision (boot + tick lag)
-            // to save 6s of idle (~$0.0002 at $0.10/node-hr). 60s ≈
-            // 3×boot_median: covers the typical inter-build gap in a
-            // sequential chain (output upload + next pod schedule + image
-            // pull) at marginal cost ~$0.0014/node-reap-avoided. The NA
-            // model still RAISES the threshold above 60s when arrival
-            // pressure justifies it; the floor only binds on cold-start
-            // (no idle-gap data yet) and low-arrival cells, where the
-            // model's `boot_median/2` would otherwise reap nodes faster
-            // than they boot. NOT 600s (Karpenter's full warm-keep) —
-            // that's $0.0167/node-hr × hundreds of builders, and the
-            // model already learns to hold open under load.
+            // to save 6s of idle (~$0.0002 at $0.10/node-hr). 300s covers
+            // two gaps: (1) the inter-build dispatch gap in a sequential
+            // chain (output upload + next pod schedule + image pull,
+            // ~60s ≈ 3×boot_median); (2) `>-<` DAG bottlenecks — a
+            // wide→narrow→wide build graph idles the fleet during the
+            // narrow phase, but the §13b forecast frontier is 1
+            // dep-layer deep so the wide-again layer's Queued drvs emit
+            // no intents and the threshold drops to the floor.
+            // Observed bottlenecks are mostly <5min. ~$0.0083/node-hr
+            // idle (vs $0.0167 at Karpenter's 10m). The NA model still
+            // RAISES the threshold above the floor when arrival pressure
+            // justifies it, but only for cells packing ~1 intent/node
+            // (r38 bug_022) — for bin-packed cells the floor is the
+            // threshold, which is fine: DAG-shaped demand is
+            // deterministic, not stochastic, and a hazard model can't
+            // see it. Targeted fix is a backlog-aware floor (scheduler
+            // aggregates Queued cores per cell into
+            // `GetSpawnIntentsResponse`; controller raises floor while
+            // nonzero) so this stops being blind insurance.
             //
             // Lookup precedence: longest prefix glob wins, so `fetcher-*`
             // (len 8) overrides `*` (len 0) for fetcher cells.
             min_consolidation_time: HashMap::from([
                 ("fetcher-*".into(), 600.0),
-                ("*".into(), 60.0),
+                ("*".into(), 300.0),
             ]),
             lead_time_seed: HashMap::new(),
             // Matches helm `sla.defaultLeadTimeSeed` default. Non-zero
@@ -1997,19 +2005,21 @@ mod tests {
             d.min_consolidation_time_for(&Cell("fetcher-x86".into(), CapacityType::Spot)),
             Some(600.0)
         );
-        // Builder cells get a 60s floor: the NA-model floor
+        // Builder cells get a 300s floor: the NA-model floor
         // `boot_median/2` (~9s) is below the boot cost (~18s) — reaping
-        // there is strictly dominated. 60s ≈ 3×boot covers a sequential
-        // chain's inter-build gap. `fetcher-*` (prefix 8) overrides `*`
+        // there is strictly dominated. 300s covers the sequential
+        // inter-build gap (~60s) AND `>-<` DAG bottlenecks (mostly
+        // <5min) where the §13b 1-layer forecast can't see the
+        // wide-again layer. `fetcher-*` (prefix 8) overrides `*`
         // (prefix 0) per longest-prefix precedence.
         assert_eq!(
             d.min_consolidation_time_for(&Cell("hi-ebs-x86".into(), CapacityType::Spot)),
-            Some(60.0),
-            "builder cells get the 60s universal floor"
+            Some(300.0),
+            "builder cells get the 300s universal floor"
         );
         assert_eq!(
             d.min_consolidation_time_for(&Cell("metal-arm".into(), CapacityType::OnDemand)),
-            Some(60.0),
+            Some(300.0),
         );
     }
 

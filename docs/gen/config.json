@@ -286,7 +286,7 @@
         "type": "list<string>"
       },
       {
-        "default": "{\"*\":60.0,\"fetcher-*\":600.0}",
+        "default": "{\"*\":300.0,\"fetcher-*\":600.0}",
         "description": "r35 bug_050: per-hw-class-prefix `consolidate_after` floor (seconds). §13e routed Fetcher Pools through `nodeclaim_pool`, silently dropping Karpenter's `consolidateAfter: 10m` to the NA-model floor `boot_median/2` (~15s) — a fetcher node burns a boot every 15s of lull instead of holding 10min.",
         "key": "nodeclaim_pool.min_consolidation_time",
         "type": "object"

@@ -898,26 +898,39 @@ karpenter:
     # against the hw-class half of the cell; longest prefix wins, so
     # `fetcher-*` (len 8) overrides `*` (len 0).
     #
-    # `*: 60.0` builder floor: `boot_median/2` (~9s for an 18s-boot
+    # `*: 300.0` builder floor. `boot_median/2` (~9s for an 18s-boot
     # builder) is BELOW the boot cost it's supposed to amortize —
     # reaping at 9s when the next sequential build arrives at t=15s
-    # burns a ~30s reprovision (boot + tick lag) to save 6s of idle
-    # (~$0.0002 at $0.10/node-hr). 60s ≈ 3×boot covers the typical
-    # inter-build gap (output upload + next pod schedule + image pull);
-    # marginal cost ~$0.0014/node-reap-avoided. The NA model raises the
-    # threshold ABOVE 60s under arrival pressure; the floor only binds
-    # on cold-start (no idle-gap data) and low-arrival cells — and
-    # WHENEVER intents pack ≥2-per-node (`E[c_fit] ≤ cores/2`, the
-    # §13b MostAllocated bin-packing case): with `w = boot/2` the NA
-    # estimator's `λ̂` saturates at `1/w = 2/boot`, so `λ̂·E ≤ 2E/boot
-    # ≤ cores/boot` always — the keep-condition `λ̂·E > cores/boot` is
-    # structurally unsatisfiable. The model extends past the
-    # floor only for cells packing close to 1 intent per node (r38
-    # bug_022). NOT 600s (Karpenter's full warm-keep) — that's
-    # $0.0167/node-hr × hundreds of builders.
+    # burns a ~30s reprovision to save 6s of idle (~$0.0002 at
+    # $0.10/node-hr). 300s covers two gaps: (1) the inter-build
+    # dispatch gap (output upload + next pod schedule + image pull,
+    # ~60s ≈ 3×boot); (2) `>-<` DAG bottlenecks — a wide→narrow→wide
+    # build graph idles the fleet during the narrow phase, but the
+    # §13b forecast frontier is 1 dep-layer deep (`compute_spawn_
+    # intents`'s `eta < lead_time` gate), so the wide-again layer's
+    # Queued drvs emit no intents, `placeable` collapses, the threshold
+    # drops to the floor, nodes get reaped, then ~50-80s cold-start
+    # when the bottleneck clears. Observed bottlenecks are mostly
+    # <5min. ~$0.0083/node-hr idle (vs $0.0167 at Karpenter's 10m).
+    #
+    # The NA model raises the threshold ABOVE the floor under arrival
+    # pressure, but only for cells packing ~1 intent/node (r38
+    # bug_022): WHENEVER intents pack ≥2-per-node (`E[c_fit] ≤
+    # cores/2`, the §13b MostAllocated default), with `w = boot/2` the
+    # NA estimator's `λ̂` saturates at `1/w = 2/boot`, so `λ̂·E ≤
+    # 2E/boot ≤ cores/boot` always — the keep-condition `λ̂·E >
+    # cores/boot` is unsatisfiable. So for bin-packed builder cells
+    # the floor IS the threshold, which is fine: DAG-shaped demand is
+    # deterministic, not stochastic — a hazard model can't see it.
+    #
+    # Known gap: this is blind insurance — pays idle cost whether or
+    # not work is pending. Targeted fix is a backlog-aware floor:
+    # scheduler aggregates Queued+Created cores per cell into
+    # `GetSpawnIntentsResponse`, controller raises the cell floor while
+    # nonzero. Revisit at production fleet sizes.
     minConsolidationTime:
       "fetcher-*": 600.0
-      "*": 60.0
+      "*": 300.0
   clusterName: ""   # from tofu output cluster_name
   nodeRoleName: ""  # from tofu output karpenter_node_role_name
   # ADR-021: NixOS node AMI (full cutover — no Bottlerocket). The
