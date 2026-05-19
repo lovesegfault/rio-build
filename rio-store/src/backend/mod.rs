@@ -1395,6 +1395,22 @@ mod tests {
         Ok(())
     }
 
+    /// Only `NotFound` is soft; other I/O errors must propagate.
+    #[tokio::test]
+    async fn fs_blob_io_errors_propagate() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backend = FilesystemChunkBackend::new(dir.path())?;
+        std::fs::create_dir_all(dir.path().join("blobs").join("abc.narinfo"))?;
+        for r in [
+            backend.get_blob("abc.narinfo").await.map(|_| ()),
+            backend.delete_blob("abc.narinfo").await,
+        ] {
+            let kind = r.unwrap_err().downcast::<std::io::Error>().unwrap().kind();
+            assert_ne!(kind, std::io::ErrorKind::NotFound);
+        }
+        Ok(())
+    }
+
     // ------------------------------------------------------------------------
     // S3 backend (aws-smithy-mocks)
     // ------------------------------------------------------------------------
@@ -1957,8 +1973,10 @@ mod tests {
         assert!(b.get_blob("missing.narinfo").await?.is_none());
         b.delete_blob("abc.narinfo").await?;
 
-        // Traversal rejected before any S3 call.
+        // Traversal rejected before any S3 call — every entry point.
         assert!(b.put_blob("../escape", Bytes::new()).await.is_err());
+        assert!(b.get_blob("../escape").await.is_err());
+        assert!(b.delete_blob("../escape").await.is_err());
         Ok(())
     }
 }

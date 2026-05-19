@@ -319,4 +319,29 @@ mod tests {
         assert_eq!(del_rule.num_calls(), 1);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn blob_ops_remote_only() -> anyhow::Result<()> {
+        use aws_sdk_s3::operation::delete_object::DeleteObjectOutput;
+        let put_r = mock!(Client::put_object).then_output(|| PutObjectOutput::builder().build());
+        let get_r = mock!(Client::get_object).then_output(body(b"narinfo"));
+        let del_r =
+            mock!(Client::delete_object).then_output(|| DeleteObjectOutput::builder().build());
+        let backend = TieredChunkBackend::new(
+            Some(must_not_touch("express")),
+            s3("std", &[&put_r, &get_r, &del_r]),
+        );
+        backend
+            .put_blob("abc.narinfo", Bytes::from_static(b"x"))
+            .await?;
+        assert_eq!(
+            backend.get_blob("abc.narinfo").await?.as_deref(),
+            Some(b"narinfo".as_slice())
+        );
+        backend.delete_blob("abc.narinfo").await?;
+        assert_eq!(put_r.num_calls(), 1);
+        assert_eq!(get_r.num_calls(), 1);
+        assert_eq!(del_r.num_calls(), 1);
+        Ok(())
+    }
 }

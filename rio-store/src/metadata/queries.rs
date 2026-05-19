@@ -118,6 +118,40 @@ pub(crate) async fn get_manifest(pool: &PgPool, store_path: &str) -> Result<Opti
     }
 }
 
+/// [`get_manifest`] plus the manifest's `claim_id`, read in the same
+/// snapshot so the indexer can fence its later `set_nar_index` write
+/// against the manifest epoch it read. See [`set_nar_index`]'s gate
+/// comment.
+pub(crate) async fn get_manifest_for_index(
+    pool: &PgPool,
+    store_path: &str,
+) -> Result<Option<(ManifestKind, Option<uuid::Uuid>)>> {
+    let hash = path_hash(store_path)?;
+    type Row = (Option<Vec<u8>>, Option<Vec<u8>>, Option<uuid::Uuid>);
+    let row: Option<Row> = sqlx::query_as(
+        r#"
+        SELECT m.inline_blob, md.chunk_list, m.claim_id
+        FROM manifests m
+        LEFT JOIN manifest_data md USING (store_path_hash)
+        WHERE m.store_path_hash = $1 AND m.status = 'complete'
+        "#,
+    )
+    .bind(hash.as_slice())
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        None => Ok(None),
+        Some((Some(blob), _, claim)) => Ok(Some((ManifestKind::Inline(Bytes::from(blob)), claim))),
+        Some((None, Some(chunk_list), claim)) => Ok(Some((
+            ManifestKind::Chunked(decode_chunk_list(store_path, &chunk_list)?),
+            claim,
+        ))),
+        Some((None, None, _)) => Err(MetadataError::InvariantViolation(format!(
+            "manifest for {store_path} has NULL inline_blob but no manifest_data row"
+        ))),
+    }
+}
+
 /// Deserialize a `manifest_data.chunk_list` blob into the
 /// `ManifestKind::Chunked` tuple shape. Shared by `get_manifest` and
 /// `get_manifest_batch`.
@@ -483,9 +517,12 @@ pub(crate) async fn append_signatures(
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Persist a computed NAR index, the Directory DAG, and the
-/// `file_blobs` junction in one transaction; flip `nar_indexed`.
-/// Idempotent: a second call is a no-op so the directory refcounts
-/// and tenant junctions establish exactly once per path.
+/// `file_blobs`/`directory_paths` junctions in one transaction; flip
+/// `nar_indexed`. Idempotent: a second call is a no-op so the
+/// directory refcounts establish exactly once per path. Tenancy is
+/// not materialized here — DirectoryService resolves it at read time
+/// from `path_tenants` (a tenant added after first-index needs no
+/// resync).
 ///
 /// The leading `manifests` UPDATE row-locks the same row the GC sweep
 /// `FOR UPDATE`s, so a concurrent index/GC of the same path serializes
@@ -501,20 +538,26 @@ pub(crate) async fn append_signatures(
 pub async fn set_nar_index(
     pool: &PgPool,
     store_path_hash: &[u8; 32],
+    claim_id: Option<uuid::Uuid>,
     entries: &[u8],
     dag: &crate::castore::DirectoryDag,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
-    // `status='complete'` gate: between `compute()`'s manifest read and
-    // this write, GC can sweep the path and a re-upload can re-claim
-    // the hash with a fresh `'uploading'` row. Without the gate the
-    // stale index would land on the new row and `nar_indexed=TRUE`
-    // would suppress re-indexing forever.
+    // `status='complete'` + `claim_id` gate: between `compute()`'s
+    // manifest read and this write, GC can sweep the path and a
+    // re-upload can re-claim the hash and reach `'complete'` again.
+    // Without the `claim_id` fence (same one `complete_manifest_in_conn`
+    // uses) the stale index would land on the new row and
+    // `nar_indexed=TRUE` would suppress re-indexing forever.
+    // `IS NOT DISTINCT FROM` so a NULL claim_id (pre-052 manifest)
+    // still matches.
     let claimed = sqlx::query(
         "UPDATE manifests SET nar_indexed = TRUE \
-          WHERE store_path_hash = $1 AND status = 'complete'",
+          WHERE store_path_hash = $1 AND status = 'complete' \
+            AND claim_id IS NOT DISTINCT FROM $2",
     )
     .bind(store_path_hash.as_slice())
+    .bind(claim_id)
     .execute(&mut *tx)
     .await?
     .rows_affected()
@@ -543,7 +586,7 @@ pub async fn set_nar_index(
         > 0;
 
     // First index of a path establishes its directory refcounts +
-    // tenant junctions; re-indexing must not double-count.
+    // per-path junctions; re-indexing must not double-count.
     if inserted {
         if !dag.directories.is_empty() {
             let (dir_digests, dir_bodies): (Vec<Vec<u8>>, Vec<Vec<u8>>) = dag
@@ -564,16 +607,11 @@ pub async fn set_nar_index(
             .bind(&dir_bodies)
             .execute(&mut *tx)
             .await?;
-            // Tenant scoping: every tenant that referenced this path
-            // (`path_tenants`) may read its Directory bodies. Cross-
-            // product UNNEST × path_tenants is one round-trip.
             sqlx::query(
                 r#"
-                INSERT INTO directory_tenants (digest, tenant_id)
-                SELECT u.digest, pt.tenant_id
+                INSERT INTO directory_paths (digest, store_path_hash)
+                SELECT u.digest, $2
                   FROM UNNEST($1::bytea[]) AS u(digest)
-                 CROSS JOIN path_tenants pt
-                 WHERE pt.store_path_hash = $2
                 ON CONFLICT DO NOTHING
                 "#,
             )
@@ -583,44 +621,28 @@ pub async fn set_nar_index(
             .await?;
         }
         if !dag.file_blobs.is_empty() {
-            let (blob_digests, blob_offsets): (Vec<Vec<u8>>, Vec<i64>) = dag
-                .file_blobs
-                .iter()
-                // nar_offset is BIGINT; a > i64::MAX NAR offset cannot
+            let mut blob_digests: Vec<Vec<u8>> = Vec::with_capacity(dag.file_blobs.len());
+            let mut blob_offsets: Vec<i64> = Vec::with_capacity(dag.file_blobs.len());
+            let mut blob_sizes: Vec<i64> = Vec::with_capacity(dag.file_blobs.len());
+            for (d, o, s) in &dag.file_blobs {
+                blob_digests.push(d.to_vec());
+                // nar_offset/size are BIGINT; a > i64::MAX value cannot
                 // exist (NAR sizes are bounded well below 8 EiB).
-                .map(|(d, o)| (d.to_vec(), i64::try_from(*o).unwrap_or(i64::MAX)))
-                .unzip();
+                blob_offsets.push(i64::try_from(*o).unwrap_or(i64::MAX));
+                blob_sizes.push(i64::try_from(*s).unwrap_or(i64::MAX));
+            }
             sqlx::query(
                 r#"
-                INSERT INTO file_blobs (digest, store_path_hash, nar_offset)
-                SELECT u.digest, $2, u.nar_offset
-                  FROM UNNEST($1::bytea[], $3::bigint[]) AS u(digest, nar_offset)
+                INSERT INTO file_blobs (digest, store_path_hash, nar_offset, size)
+                SELECT u.digest, $2, u.nar_offset, u.size
+                  FROM UNNEST($1::bytea[], $3::bigint[], $4::bigint[]) AS u(digest, nar_offset, size)
                 ON CONFLICT DO NOTHING
                 "#,
             )
             .bind(&blob_digests)
             .bind(store_path_hash.as_slice())
             .bind(&blob_offsets)
-            .execute(&mut *tx)
-            .await?;
-            // DO UPDATE (not DO NOTHING) so an existing `(digest,
-            // tenant)` row takes a lock and a concurrent GC orphan
-            // sweep waits for this commit before re-checking
-            // `file_blobs`. DO NOTHING would let the sweep delete the
-            // row out from under us.
-            sqlx::query(
-                r#"
-                INSERT INTO file_blob_tenants (digest, tenant_id)
-                SELECT u.digest, pt.tenant_id
-                  FROM UNNEST($1::bytea[]) AS u(digest)
-                 CROSS JOIN path_tenants pt
-                 WHERE pt.store_path_hash = $2
-                ON CONFLICT (digest, tenant_id)
-                  DO UPDATE SET tenant_id = EXCLUDED.tenant_id
-                "#,
-            )
-            .bind(&blob_digests)
-            .bind(store_path_hash.as_slice())
+            .bind(&blob_sizes)
             .execute(&mut *tx)
             .await?;
         }
@@ -1324,9 +1346,27 @@ mod tests {
         assert_eq!(pending[0].1, p);
         assert!(get_nar_index(&db.pool, &nar_hash).await.unwrap().is_none());
 
+        // A stale `claim_id` (captured before a GC + re-upload) must
+        // be a no-op — the gate fences on epoch, not just
+        // `status='complete'`.
+        set_nar_index(
+            &db.pool,
+            &hash,
+            Some(uuid::Uuid::new_v4()),
+            b"stale-epoch",
+            &empty_dag(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            get_nar_index(&db.pool, &nar_hash).await.unwrap().is_none(),
+            "set_nar_index with mismatched claim_id must be a no-op"
+        );
+
         // Set (by store_path_hash) → readable (by nar_hash) + drained
-        // from queue.
-        set_nar_index(&db.pool, &hash, b"encoded-nar-index", &empty_dag())
+        // from queue. Seed leaves `claim_id` NULL; the indexer
+        // captures NULL and the `IS NOT DISTINCT FROM` gate matches.
+        set_nar_index(&db.pool, &hash, None, b"encoded-nar-index", &empty_dag())
             .await
             .unwrap();
         assert_eq!(
@@ -1343,7 +1383,7 @@ mod tests {
         // Idempotent: a second call is a NO-OP — the directory
         // refcounts and tenant-junction rows are established once on
         // first index, and re-running them would double-count.
-        set_nar_index(&db.pool, &hash, b"v2", &empty_dag())
+        set_nar_index(&db.pool, &hash, None, b"v2", &empty_dag())
             .await
             .unwrap();
         assert_eq!(
@@ -1367,9 +1407,10 @@ mod tests {
     }
 
     /// The castore inserts: `directories` refcount UPSERT,
-    /// `directory_tenants`/`file_blob_tenants` cross-product over
-    /// `path_tenants`, `file_blobs` junction; cascade-cleanup on
-    /// narinfo DELETE.
+    /// `directory_paths` + `file_blobs` junctions; cascade-cleanup on
+    /// narinfo DELETE. Tenancy is read-time (`path_tenants`), so a
+    /// tenant added after first-index sees the path's directories and
+    /// blobs.
     // r[verify store.castore.gc]
     // r[verify store.castore.tenant-scope]
     #[tokio::test]
@@ -1409,7 +1450,7 @@ mod tests {
         let unique_dir_a = ([0x22u8; 32], b"dir-body-a".to_vec());
         let dag = |dirs: Vec<([u8; 32], Vec<u8>)>| crate::castore::DirectoryDag {
             directories: dirs,
-            file_blobs: vec![([0x33u8; 32], 96)],
+            file_blobs: vec![([0x33u8; 32], 96, 8)],
             root_node: vec![1, 2, 3],
             root_digest: vec![],
             dir_digests: vec![],
@@ -1418,14 +1459,21 @@ mod tests {
         set_nar_index(
             &db.pool,
             &hash_a,
+            None,
             b"a",
             &dag(vec![shared_dir.clone(), unique_dir_a.clone()]),
         )
         .await
         .unwrap();
-        set_nar_index(&db.pool, &hash_b, b"b", &dag(vec![shared_dir.clone()]))
-            .await
-            .unwrap();
+        set_nar_index(
+            &db.pool,
+            &hash_b,
+            None,
+            b"b",
+            &dag(vec![shared_dir.clone()]),
+        )
+        .await
+        .unwrap();
 
         // Shared directory refcount = 2; unique = 1.
         let rc: i32 = sqlx::query_scalar("SELECT refcount FROM directories WHERE digest = $1")
@@ -1449,25 +1497,37 @@ mod tests {
             .unwrap();
         assert_eq!(fb, 2);
 
-        // Tenant junctions populated from path_tenants.
-        let dt: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM directory_tenants WHERE digest = $1 AND tenant_id = $2",
+        // Per-path linkage: shared directory has two `directory_paths`
+        // rows (one per containing NAR).
+        let dp: i64 = sqlx::query_scalar("SELECT count(*) FROM directory_paths WHERE digest = $1")
+            .bind(shared_dir.0.as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(dp, 2);
+
+        // A tenant gaining a `path_tenants` row after first-index sees
+        // the directory immediately (tenancy is read-time, not a
+        // first-index snapshot).
+        let late_tenant = crate::test_helpers::seed_tenant(&db.pool, "castore-late").await;
+        sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+            .bind(hash_a.as_slice())
+            .bind(late_tenant)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let visible: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM directories d \
+               JOIN directory_paths dp ON dp.digest = d.digest \
+               JOIN path_tenants pt ON pt.store_path_hash = dp.store_path_hash \
+              WHERE d.digest = $1 AND pt.tenant_id = $2",
         )
         .bind(shared_dir.0.as_slice())
-        .bind(tenant)
+        .bind(late_tenant)
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        assert_eq!(dt, 1);
-        let ft: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM file_blob_tenants WHERE digest = $1 AND tenant_id = $2",
-        )
-        .bind([0x33u8; 32].as_slice())
-        .bind(tenant)
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-        assert_eq!(ft, 1);
+        assert_eq!(visible, 1, "late-arriving tenant sees the directory");
 
         // root_node persisted.
         let rn: Vec<u8> =

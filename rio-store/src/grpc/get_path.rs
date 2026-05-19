@@ -420,7 +420,8 @@ impl StoreServiceImpl {
                         total_bytes,
                         "GetPath: whole-NAR integrity check failed"
                     );
-                    metrics::counter!("rio_store_integrity_failures_total").increment(1);
+                    metrics::counter!("rio_store_integrity_failures_total", "site" => "get_path")
+                        .increment(1);
                     let _ = tx
                         .send(Err(Status::data_loss(
                             "whole-NAR integrity check failed (SHA-256 or size mismatch)",

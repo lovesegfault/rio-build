@@ -2552,6 +2552,44 @@ pub const M_109: () = ();
 /// post formal-sprint rebase.
 pub const M_110: () = ();
 
+/// 111 — `file_blobs.size` (P0577/P0570).
+///
+/// Denormalizes file content length onto the `file_blobs` junction so
+/// `ReadBlob`/`StatBlob` compute the chunk window from one row. The
+/// alternative is fetching and decoding `nar_index.entries` per call:
+/// O(files-in-NAR), ~2.5 MB for a 25k-file chromium output, on the
+/// FUSE `open()` fast path. Size is content-derived (same digest ⇒
+/// same bytes ⇒ same size), so two rows for one digest cannot
+/// disagree.
+///
+/// `DEFAULT 0` keeps the `ALTER` rewrite-free and lets test fixtures
+/// that don't exercise size (`HasBlobs`) omit the column. There are
+/// no pre-111 rows to backfill: 110 and 111 ship in the same release.
+pub const M_111: () = ();
+
+/// 112 — `directory_paths` + drop `directory_tenants`/`file_blob_tenants`.
+///
+/// 110's `directory_tenants`/`file_blob_tenants` were a one-shot
+/// snapshot of `path_tenants` taken at first-index time inside
+/// `set_nar_index`. Two unsound consequences:
+///
+/// - **Cross-tenant pick.** `file_blob_tenants` is keyed `(digest,
+///   tenant)` — coarser than `file_blobs`' `(digest, store_path_hash)`.
+///   The blob-fetch query joined on digest only, then `LIMIT 1` with no
+///   `ORDER BY`, so it could return another tenant's NAR window/chunk
+///   list for a content-shared digest.
+/// - **Late-tenant lockout.** Nothing resynced the junctions after
+///   first-index. A tenant that gains a `path_tenants` row later
+///   (cache hit, scheduler race) was permanently denied DirectoryService
+///   reads for a path they legitimately own.
+///
+/// Fix: derive tenancy at read time from `path_tenants`, the single
+/// source of truth. `file_blobs` already carries `store_path_hash`;
+/// `directory_paths` is the analogous linkage for `directories` (one
+/// row per `(Directory body, NAR containing it)`, FK CASCADE on both
+/// sides — GC of either parent removes the row).
+pub const M_112: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

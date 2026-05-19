@@ -161,7 +161,10 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ts) = tenant_signer {
         store_service = store_service.with_signer(ts);
     }
-    if let Some(v) = hmac_verifier {
+    // Same verifier shared with DirectoryServiceImpl below — both gate
+    // on `x-rio-assignment-token`.
+    let hmac_verifier_arc = hmac_verifier.map(Arc::new);
+    if let Some(v) = hmac_verifier_arc.clone() {
         store_service = store_service.with_hmac_verifier(v);
     }
     store_service = store_service.with_service_bypass_callers(cfg.service_bypass_callers);
@@ -232,6 +235,14 @@ async fn main() -> anyhow::Result<()> {
     // on GetChunk, which is correct for an inline-only store (there
     // ARE no chunks to get).
     let chunk_service = ChunkServiceImpl::new(chunk_cache.clone());
+
+    // Tenant-scoped via JWT or HMAC assignment-token claim — see
+    // grpc/directory.rs. ReadBlob shares the chunk cache.
+    let directory_service = rio_store::grpc::DirectoryServiceImpl::new(
+        pool.clone(),
+        hmac_verifier_arc.clone(),
+        chunk_cache.clone(),
+    );
 
     // LogService: build-log ingest + tailing. The log chunk store
     // follows the NAR chunk backend's kind: S3 → the same bucket under
@@ -498,6 +509,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .add_service(
             ChunkServiceServer::new(chunk_service)
+                .max_decoding_message_size(max_msg_size)
+                .max_encoding_message_size(max_msg_size),
+        )
+        .add_service(
+            rio_proto::DirectoryServiceServer::new(directory_service)
                 .max_decoding_message_size(max_msg_size)
                 .max_encoding_message_size(max_msg_size),
         )

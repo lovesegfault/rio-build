@@ -206,8 +206,6 @@ async fn select_sweep_order(conn: &mut sqlx::PgConnection) -> Result<Vec<Vec<u8>
 struct SweptCastoreRefs {
     /// Distinct `dir_digest`s referenced by this path's index.
     dirs: Vec<[u8; 32]>,
-    /// Distinct `file_digest`s; the orphan-cleanup candidate set.
-    files: Vec<[u8; 32]>,
 }
 
 /// Delete one swept path's metadata: realisations + path_tenants +
@@ -301,10 +299,7 @@ async fn delete_swept_path(
                 .fetch_optional(&mut **tx)
                 .await?;
         match entries.as_deref().map(crate::nar_index::digests_from_index) {
-            Some(Ok(d)) => SweptCastoreRefs {
-                dirs: d.dirs,
-                files: d.files,
-            },
+            Some(Ok(d)) => SweptCastoreRefs { dirs: d.dirs },
             Some(Err(e)) => {
                 warn!(
                     store_path_hash = %hex::encode(store_path_hash),
@@ -318,7 +313,7 @@ async fn delete_swept_path(
     };
 
     // Step 2b: DELETE narinfo. CASCADE takes manifests, manifest_data,
-    // nar_index, file_blobs.
+    // nar_index, file_blobs, directory_paths.
     let deleted = sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1")
         .bind(store_path_hash)
         .execute(&mut **tx)
@@ -327,61 +322,40 @@ async fn delete_swept_path(
 }
 
 /// Decrement `directories.refcount` for the batch's swept paths and
-/// clean orphaned `file_blob_tenants` rows whose last `file_blobs`
-/// referrer just cascade-deleted. Runs once after the per-path loop so
-/// row locks are taken in one btree-ordered pass.
+/// hard-delete bodies that drop to zero. Runs once after the per-path
+/// loop so row locks are taken in one btree-ordered pass.
 ///
 /// `dir_counts[d]` = swept-paths-referencing-`d` — the inverse of
-/// `set_nar_index`'s per-path `+1`. `file_digests` is the union of the
-/// swept paths' file digests (orphan-cleanup candidate set).
+/// `set_nar_index`'s per-path `+1`. The `directory_paths`/`file_blobs`
+/// junctions need no cleanup here: they CASCADE-delete with their
+/// `manifests` parent.
 // r[impl store.castore.gc]
 async fn decrement_directory_refs(
     tx: &mut Transaction<'_, Postgres>,
     dir_counts: &BTreeMap<[u8; 32], i64>,
-    file_digests: &std::collections::BTreeSet<[u8; 32]>,
 ) -> Result<(), sqlx::Error> {
-    if !dir_counts.is_empty() {
-        let (digests, counts): (Vec<Vec<u8>>, Vec<i64>) =
-            dir_counts.iter().map(|(d, n)| (d.to_vec(), *n)).unzip();
-        sqlx::query(
-            r#"
-            UPDATE directories d
-               SET refcount = d.refcount - u.n
-              FROM UNNEST($1::bytea[], $2::bigint[]) AS u(digest, n)
-             WHERE d.digest = u.digest
-            "#,
-        )
+    if dir_counts.is_empty() {
+        return Ok(());
+    }
+    let (digests, counts): (Vec<Vec<u8>>, Vec<i64>) =
+        dir_counts.iter().map(|(d, n)| (d.to_vec(), *n)).unzip();
+    sqlx::query(
+        r#"
+        UPDATE directories d
+           SET refcount = d.refcount - u.n
+          FROM UNNEST($1::bytea[], $2::bigint[]) AS u(digest, n)
+         WHERE d.digest = u.digest
+        "#,
+    )
+    .bind(&digests)
+    .bind(&counts)
+    .execute(&mut **tx)
+    .await?;
+    // Hard-delete zeroed digests; CASCADE takes `directory_paths`.
+    sqlx::query("DELETE FROM directories WHERE digest = ANY($1::bytea[]) AND refcount <= 0")
         .bind(&digests)
-        .bind(&counts)
         .execute(&mut **tx)
         .await?;
-        // Hard-delete zeroed digests; CASCADE takes `directory_tenants`.
-        sqlx::query("DELETE FROM directories WHERE digest = ANY($1::bytea[]) AND refcount <= 0")
-            .bind(&digests)
-            .execute(&mut **tx)
-            .await?;
-    }
-    if !file_digests.is_empty() {
-        let candidates: Vec<Vec<u8>> = file_digests.iter().map(|d| d.to_vec()).collect();
-        // Lock the candidate rows first. A concurrent `set_nar_index`
-        // for another path holds these (`ON CONFLICT DO UPDATE`); once
-        // it commits, the DELETE below re-snapshots and sees the new
-        // `file_blobs` row instead of phantom-deleting the junction.
-        sqlx::query("SELECT 1 FROM file_blob_tenants WHERE digest = ANY($1::bytea[]) FOR UPDATE")
-            .bind(&candidates)
-            .execute(&mut **tx)
-            .await?;
-        sqlx::query(
-            r#"
-            DELETE FROM file_blob_tenants ft
-             WHERE ft.digest = ANY($1::bytea[])
-               AND NOT EXISTS (SELECT 1 FROM file_blobs fb WHERE fb.digest = ft.digest)
-            "#,
-        )
-        .bind(&candidates)
-        .execute(&mut **tx)
-        .await?;
-    }
     Ok(())
 }
 
@@ -914,10 +888,9 @@ async fn sweep_one_batch(
     // `UPDATE directories ... FROM unnest($1,$2)` — `r[store.chunk.
     // lock-order]` satisfied across paths). NOT the dropped
     // `chunks.refcount` — chunk GC is the collect cycle's job.
-    // `file_digests` is the candidate set for `file_blob_tenants`
-    // orphan cleanup.
+    // `file_blobs`/`directory_paths` junctions CASCADE off `manifests`;
+    // no manual cleanup.
     let mut dir_counts: BTreeMap<[u8; 32], i64> = BTreeMap::new();
-    let mut file_digests: std::collections::BTreeSet<[u8; 32]> = std::collections::BTreeSet::new();
     for store_path_hash in to_delete {
         if !still_unreachable.contains(store_path_hash) {
             delta.paths_resurrected += 1;
@@ -938,10 +911,9 @@ async fn sweep_one_batch(
         for d in refs.dirs {
             *dir_counts.entry(d).or_default() += 1;
         }
-        file_digests.extend(refs.files);
     }
 
-    decrement_directory_refs(&mut tx, &dir_counts, &file_digests).await?;
+    decrement_directory_refs(&mut tx, &dir_counts).await?;
 
     if dry_run {
         // Rollback DELETES only; closure_remove temp-table writes
@@ -1024,10 +996,9 @@ mod tests {
     }
 
     /// Castore GC: shared `directories` refcount decrements per
-    /// referencing-path GC; row hard-deletes at zero. `file_blobs`
-    /// rows for the surviving referrer remain (junction, not
-    /// refcount); `file_blob_tenants` orphan rows clean up when the
-    /// last referrer goes.
+    /// referencing-path GC; row hard-deletes at zero. `file_blobs` /
+    /// `directory_paths` rows for the surviving referrer remain
+    /// (junctions CASCADE off `manifests`).
     // r[verify store.castore.gc]
     #[tokio::test]
     async fn sweep_decrements_directory_refcounts() {
@@ -1069,7 +1040,7 @@ mod tests {
         };
         let mk_dag = |dirs: &[[u8; 32]]| crate::castore::DirectoryDag {
             directories: dirs.iter().map(|d| (*d, b"body".to_vec())).collect(),
-            file_blobs: vec![(shared_blob, 0)],
+            file_blobs: vec![(shared_blob, 0, 8)],
             root_node: vec![],
             root_digest: vec![],
             dir_digests: vec![],
@@ -1092,7 +1063,7 @@ mod tests {
                 .execute(&db.pool)
                 .await
                 .unwrap();
-            crate::metadata::set_nar_index(&db.pool, &h, &mk_entries(dirs), &mk_dag(dirs))
+            crate::metadata::set_nar_index(&db.pool, &h, None, &mk_entries(dirs), &mk_dag(dirs))
                 .await
                 .unwrap();
             hashes.push(h_vec);
@@ -1130,22 +1101,22 @@ mod tests {
             "zero-refcount dir hard-deleted"
         );
 
-        // file_blobs: B's row survives, file_blob_tenants survives.
+        // file_blobs / directory_paths: B's rows survive (CASCADE off
+        // B's manifest, not A's).
         let fb: i64 = sqlx::query_scalar("SELECT count(*) FROM file_blobs WHERE digest = $1")
             .bind(shared_blob.as_slice())
             .fetch_one(&db.pool)
             .await
             .unwrap();
         assert_eq!(fb, 1, "B's file_blobs row survives GC of A");
-        let ft: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM file_blob_tenants WHERE digest = $1")
-                .bind(shared_blob.as_slice())
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
-        assert_eq!(ft, 1, "tenant row survives while a referrer remains");
+        let dp: i64 = sqlx::query_scalar("SELECT count(*) FROM directory_paths WHERE digest = $1")
+            .bind(shared_dir.as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(dp, 1, "B's directory_paths row survives GC of A");
 
-        // GC B: shared deletes, file_blob_tenants cleans up.
+        // GC B: shared dir hard-deletes; all junctions gone (CASCADE).
         sweep(
             &db.pool,
             None,
@@ -1157,19 +1128,16 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rc(shared_dir).await, None);
-        let ft: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM file_blob_tenants WHERE digest = $1")
-                .bind(shared_blob.as_slice())
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
-        assert_eq!(ft, 0, "orphan file_blob_tenants row cleaned");
-        // directory_tenants cascade-deleted with the directories rows.
-        let dt: i64 = sqlx::query_scalar("SELECT count(*) FROM directory_tenants")
+        let dp: i64 = sqlx::query_scalar("SELECT count(*) FROM directory_paths")
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        assert_eq!(dt, 0);
+        assert_eq!(dp, 0, "directory_paths cascade-deleted");
+        let fb: i64 = sqlx::query_scalar("SELECT count(*) FROM file_blobs")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(fb, 0, "file_blobs cascade-deleted");
     }
 
     /// merged_bug_019: dry-run must NOT increment any of the three

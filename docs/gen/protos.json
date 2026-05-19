@@ -163,6 +163,7 @@
   "store.proto": {
     "services": [
       "StoreService",
+      "DirectoryService",
       "ChunkService",
       "StoreAdminService",
       "LogService"
