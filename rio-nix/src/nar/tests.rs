@@ -601,6 +601,90 @@ fn restore_streaming_large_file_over_256mib() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Restored regular files and directories MUST have the canonical Nix
+/// store-path mtime (1 second past Epoch). NAR carries no timestamps; on
+/// extraction Nix's `restorePath()` finishes with
+/// `canonicalisePathMetaData()` which sets `mtime=1`. If `restore_node`
+/// leaves `mtime=now` (the `File::create()`/`create_dir()` default), the
+/// FUSE-served chroot store presents non-canonical metadata and any build
+/// that reads input mtimes mis-behaves — most visibly, nixpkgs'
+/// `set-source-date-epoch-to-latest.sh` `postUnpackHook` finds a
+/// "newest" source file with `mtime≈now`, sets `SOURCE_DATE_EPOCH` to
+/// it, and a `tar --mtime=@$SOURCE_DATE_EPOCH`-producing FOD
+/// (`fetchPnpmDeps`, `fetchYarnDeps`, …) becomes non-deterministic.
+///
+/// Symlink mtime is intentionally NOT asserted here: there is no `std`
+/// API to set a symlink's own mtime without a new dependency, and the
+/// FUSE serve layer (`stat_to_attr`) hardcodes canonical times
+/// regardless of on-disk state. Nothing in `set-source-date-epoch-to-
+/// latest.sh` reads symlink mtime (`find -type f`).
+// r[verify builder.nar.canonical-mtime]
+#[test]
+fn restore_streaming_canonicalizes_mtime() -> anyhow::Result<()> {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    // The canonical Nix store-path mtime: 1 second past Epoch. Not 0
+    // (some tools treat 0 as "no timestamp") and not "now" (breaks
+    // reproducibility). Matches `mtimeStore` in Nix's
+    // `posix-fs-canonicalise.cc`.
+    const CANON_MTIME: u64 = 1;
+
+    let src_dir = tempfile::TempDir::new()?;
+    let src = src_dir.path().join("root");
+    std::fs::create_dir(&src)?;
+    std::fs::create_dir(src.join("sub"))?;
+    std::fs::write(src.join("file.txt"), "x")?;
+    std::fs::write(src.join("sub/inner.txt"), "y")?;
+    std::os::unix::fs::symlink("file.txt", src.join("link"))?;
+
+    let mut nar = Vec::new();
+    dump_path_streaming(&src, &mut nar)?;
+
+    let dst_dir = tempfile::TempDir::new()?;
+    let dst = dst_dir.path().join("restored");
+    restore_path_streaming(&mut Cursor::new(&nar), &dst)?;
+
+    let want = SystemTime::UNIX_EPOCH + Duration::from_secs(CANON_MTIME);
+    // Walk every restored regular file and directory, including the
+    // root, and assert mtime is the canonical value. Use
+    // `symlink_metadata` so symlinks are skipped (`is_file()` /
+    // `is_dir()` are both false on a symlink's own metadata).
+    let mut checked = 0usize;
+    for path in walkdir(&dst) {
+        let meta = std::fs::symlink_metadata(&path)?;
+        if meta.is_file() || meta.is_dir() {
+            let got = meta.modified()?;
+            assert_eq!(
+                got.duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(u64::MAX),
+                CANON_MTIME,
+                "non-canonical mtime on {path:?}: got {got:?}, want {want:?}. \
+                 NAR restore must mirror Nix's canonicalisePathMetaData (mtime=1)."
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 4,
+        "expected to check ≥4 nodes (root dir, sub dir, 2 files), got {checked}"
+    );
+    Ok(())
+}
+
+/// Tiny walk helper for tests — yields `root` itself and every
+/// descendant path. Symlinks are NOT followed (so a symlink to a
+/// directory is yielded as a single node, not traversed into).
+fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = vec![root.to_path_buf()];
+    if root.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+        for entry in std::fs::read_dir(root).unwrap() {
+            out.extend(walkdir(&entry.unwrap().path()));
+        }
+    }
+    out
+}
+
 /// Same path-traversal guard as `parse`: `..`, `/`, NUL, empty, `.`
 /// in entry names are rejected BEFORE any filesystem write under
 /// `dest` for that name.

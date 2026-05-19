@@ -161,6 +161,49 @@ to lazily fetch @store-path content on demand.
   via the FUSE fetch path.
 ]
 
+#r("builder.nar.canonical-mtime")[
+  Regular files and directories restored from a NAR MUST have their
+  modification time set to the canonical Nix store-path value of one second
+  past the Epoch (`mtime=1`).
+]
+
+NAR carries no timestamps; `restore_node` writes via `File::create()` /
+`create_dir()` which leave `mtime≈now`. Nix's reference `restorePath()`
+finishes with `canonicalisePathMetaData()` (`posix-fs-canonicalise.cc`,
+`mtimeStore = 1`). Without that step, every input store path the build reads
+through the FUSE chroot store carries the fetch wall-clock as its mtime, and
+the nixpkgs `set-source-date-epoch-to-latest.sh` `postUnpackHook` --- which
+scans `$sourceRoot` for the newest regular file --- raises `SOURCE_DATE_EPOCH`
+to that value. Any FOD that bakes `SOURCE_DATE_EPOCH` into its output (the
+`tar --mtime=@$SOURCE_DATE_EPOCH` archives `fetchPnpmDeps` v3,
+`fetchYarnDeps`, and `fetchNpmDeps` produce) becomes non-deterministic and
+fails its hash check on every rebuild. Symlink mtime is intentionally out of
+scope here: `std` has no API to set a symlink's own mtime without a new
+dependency, the `find -type f` in the SOURCE_DATE_EPOCH hook ignores
+symlinks, and the FUSE attribute layer
+(#rref("builder.fuse.canonical-metadata")) hardcodes canonical times for
+every node type regardless of on-disk state.
+
+#r("builder.fuse.canonical-metadata")[
+  The FUSE store filesystem MUST present canonical Nix store-path metadata
+  (`mtime`/`atime`/`ctime` of one second past the Epoch, `perm` `0o444` for
+  non-executable regular files and `0o555` otherwise, `uid`/`gid` of `0`)
+  rather than the on-disk metadata of the backing cache files.
+]
+
+The FUSE FS *is* the chroot store's lower layer; its visible metadata is the
+metadata builds receive. Cache files are written at fetch time with the
+process `uid`/`gid`, an `umask`-derived mode, and `mtime≈now` --- none of
+which match what Nix's reference daemon presents for valid store paths. The
+serve-side hardcode is defense-in-depth on top of
+#rref("builder.nar.canonical-mtime"): even if a cache file's on-disk
+timestamp drifts (filesystem maintenance, a future cache backend that
+forgets to canonicalize), the build never sees it. Canonical permissions
+also prevent a build from observing a writable mode on an input store path
+and attempting an in-place mutation (overlayfs would silently copy-up; a
+stock Nix build would `EACCES` --- a behavior divergence worth avoiding even
+though no in-tree build relies on it).
+
 == Prefetch Warm-Gate
 
 #r("builder.warmgate.handshake")[

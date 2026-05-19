@@ -26,6 +26,44 @@ use super::{NarEntry, NarNode, writer::serialize};
 /// forward most reads as single gRPC chunks without re-buffering.
 const STREAM_CHUNK: usize = 256 * 1024;
 
+/// Canonical Nix store-path mtime: one second past the Epoch. Matches
+/// `mtimeStore` in Nix's `libstore/posix-fs-canonicalise.cc`. Not 0 (some
+/// tools treat 0 as "no timestamp") and never the wall-clock — store paths
+/// are immutable and content-addressed; their metadata is fully determined
+/// by the NAR.
+const CANON_MTIME_SECS: u64 = 1;
+
+/// Set `dest`'s `atime`/`mtime` to the canonical Nix store-path value
+/// ([`CANON_MTIME_SECS`]). Mirrors the timestamp half of Nix's
+/// `canonicalisePathMetaData` so a restored store path is byte-for-byte
+/// what `nix-store --import` would have produced.
+///
+/// Does nothing for symlinks: `std` has no `lutimes`/`utimensat(NOFOLLOW)`
+/// wrapper, the `set-source-date-epoch-to-latest.sh` `postUnpackHook`
+/// (the consumer this fix exists for) only scans `find -type f`, and the
+/// FUSE attribute layer (`stat_to_attr`) hardcodes canonical times for
+/// every node type regardless of on-disk state, so a non-canonical
+/// on-disk symlink mtime is never observable from inside a build.
+///
+/// **Ordering:** for directories this MUST be called *after* all children
+/// are written. Creating/renaming a child entry updates the parent's
+/// `mtime`; setting a child's *own* `mtime` does not. `restore_node`'s
+/// post-recursion call site satisfies this.
+fn set_canonical_mtime(dest: &std::path::Path) -> io::Result<()> {
+    use std::time::{Duration, SystemTime};
+    let canon = SystemTime::UNIX_EPOCH + Duration::from_secs(CANON_MTIME_SECS);
+    // O_RDONLY suffices — `futimens(2)` only requires the fd's owner to
+    // match (or `CAP_FOWNER`), not write permission. Works on directory
+    // fds (`O_RDONLY` on a dir is valid on Linux). `OpenOptions` rather
+    // than `File::open` to make the intent explicit.
+    let f = std::fs::OpenOptions::new().read(true).open(dest)?;
+    f.set_times(
+        std::fs::FileTimes::new()
+            .set_accessed(canon)
+            .set_modified(canon),
+    )
+}
+
 /// Eager in-memory NAR dump. Test/fuzz oracle only — production uses
 /// [`dump_path_streaming`].
 #[cfg(any(test, feature = "test-oracle"))]
@@ -222,6 +260,13 @@ pub fn restore_path_streaming(r: &mut impl Read, dest: &std::path::Path) -> Resu
 /// Streaming analogue of `extract_to_path(parse_node(r))`. Reads NAR
 /// framing tokens and writes the corresponding filesystem object at
 /// `dest`, copying regular-file contents in 256 KiB chunks.
+///
+/// Restored regular files and directories carry the canonical Nix
+/// store-path `mtime` (1 second past Epoch) — the timestamp half of
+/// Nix's `canonicalisePathMetaData` — so `find -newer`/`make`/
+/// `set-source-date-epoch-to-latest.sh` see input store paths exactly
+/// as a stock Nix daemon would present them.
+// r[impl builder.nar.canonical-mtime]
 fn restore_node(r: &mut impl Read, dest: &std::path::Path, depth: usize) -> Result<()> {
     if depth > MAX_NAR_DEPTH {
         return Err(NarError::NestingTooDeep(depth));
@@ -283,6 +328,11 @@ fn restore_node(r: &mut impl Read, dest: &std::path::Path, depth: usize) -> Resu
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))?;
             }
+            // Canonical mtime LAST — after `write_all` (which bumps
+            // mtime) and `set_permissions` (which only bumps ctime per
+            // POSIX, but ordering it before the mtime set keeps the
+            // sequence obviously-correct on a non-POSIX FS).
+            set_canonical_mtime(dest)?;
             expect_str(r, ")")?;
         }
         "directory" => {
@@ -332,6 +382,11 @@ fn restore_node(r: &mut impl Read, dest: &std::path::Path, depth: usize) -> Resu
                     }
                 }
             }
+            // AFTER all children: every `restore_node(child)` above
+            // created an entry under `dest`, refreshing its mtime each
+            // time. (A child setting its *own* mtime does NOT refresh the
+            // parent's — only namespace operations do.)
+            set_canonical_mtime(dest)?;
         }
         "symlink" => {
             expect_str(r, "target")?;
@@ -342,6 +397,9 @@ fn restore_node(r: &mut impl Read, dest: &std::path::Path, depth: usize) -> Resu
                 source: e,
             })?;
             std::os::unix::fs::symlink(&target, dest)?;
+            // No mtime canonicalization for symlinks: `set_canonical_mtime`
+            // documents why this is correct (no `std` API, the consumer
+            // hooks ignore symlinks, FUSE serve-side covers it).
             expect_str(r, ")")?;
         }
         _ => return Err(NarError::UnknownNodeType(node_type)),
