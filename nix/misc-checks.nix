@@ -152,31 +152,23 @@ in
         }
       '';
 
-  # Workspace-level invariant lints (`xtask lint <check>`) — pure file
-  # walks over staged source, no DB/network. Each subcommand is a
-  # cross-crate check that doesn't fit in any single crate's tests:
+  # Workspace-level invariant lints — pure file walks over staged
+  # source, no DB/network. `xtask lint` with no subcommand runs every
+  # `Lint` variant, so the dispatch is self-discovering: adding a lint
+  # to `xtask/src/lint.rs` adds it here without editing this file. The
+  # per-lint rationale lives on the enum's variant doc-comments.
   #
-  # - `schema-liveness`: every table created in
-  #   `rio-migrations/migrations/*.sql` is referenced by name in ≥1
-  #   `.rs` file under rio-store/rio-scheduler/xtask. Catches dead
-  #   schema before `migration_checksums_frozen` makes dropping it cost
-  #   a second migration. Used to live in `rio-store/build.rs` (corpus
-  #   concat) + a `rio-store/tests/migrations.rs` test; promoted to
-  #   xtask so it runs as a pure file walk instead of a build.rs corpus
-  #   concat needing crate2nix sibling-src symlinks.
-  #
-  # - `helm-sla`: every `HELM_RENDERED_SLA_KEYS` entry appears in the
-  #   scheduler helm template. Catches a `[sla]` field helm forgot to
-  #   surface to operators (merged_bug_056). The completeness half
-  #   (every SlaConfig field is classified) stays as a unit test —
-  #   pure serde, no file read; this half needed a cross-directory
-  #   `include_str!` and a crate2nix fileset symlink, so it moved here.
+  # The fileset is the union of every lint's read surface — keep it
+  # matched. A new lint that reads files outside the union below MUST
+  # extend it, or the lint sees a partial tree under nix and fails (or
+  # worse, passes vacuously). Run the lint once with `xtask lint` from
+  # a clean checkout vs. `nix build .#checks.<system>.xtask-lint` to
+  # confirm parity. The narrow fileset is the point: rebuild only when
+  # a lint's input changes, not on every workspace edit.
   #
   # The crate2nix-built xtask's compile-time `CARGO_MANIFEST_DIR` is a
   # store path, so `RIO_REPO_ROOT` points it at the staged fileset
-  # (same pattern as docsData in nix/docs.nix). Fileset is exactly the
-  # lints' read surface — rebuild only when migration SQL, PG-query
-  # crate source, or the scheduler helm template changes.
+  # (same pattern as docsData in nix/docs.nix).
   xtask-lint =
     pkgs.runCommand "rio-xtask-lint"
       {
@@ -194,8 +186,7 @@ in
       }
       ''
         export RIO_REPO_ROOT=$src
-        xtask lint schema-liveness
-        xtask lint helm-sla
+        xtask lint
         touch $out
       '';
 

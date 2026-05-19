@@ -12,7 +12,10 @@ use anyhow::{Context, Result, bail, ensure};
 
 use crate::sh::repo_root;
 
-#[derive(clap::Subcommand)]
+// New variant? Add an arm in `run()` (compiler-enforced) AND an entry in
+// `all()` (test-enforced — see `all_returns_every_variant`). Nothing
+// else: `xtask lint` and the `xtask-lint` flake check run `all()`.
+#[derive(Debug, clap::Subcommand)]
 pub enum Lint {
     /// Every table created by `rio-migrations/migrations/*.sql` is
     /// referenced by name in ≥1 workspace `.rs` file. Catches dead
@@ -24,11 +27,51 @@ pub enum Lint {
     HelmSla,
 }
 
+impl Lint {
+    /// Every lint, in run order, for the `xtask lint` umbrella.
+    ///
+    /// Hand-maintained because clap subcommand enums don't expose a
+    /// value iterator (and `strum::EnumIter` would mean a new direct
+    /// dep just for this). Drift is impossible to ship: the
+    /// `all_returns_every_variant` test compares this against the
+    /// subcommand list clap derives from the enum, so a variant added
+    /// to the enum but not here fails `cargo test -p xtask`.
+    fn all() -> Vec<Lint> {
+        vec![Lint::SchemaLiveness, Lint::HelmSla]
+    }
+}
+
+/// Run one lint.
 pub fn run(lint: &Lint) -> Result<()> {
     match lint {
         Lint::SchemaLiveness => schema_liveness(),
         Lint::HelmSla => helm_sla(),
     }
+}
+
+/// Run every lint. The `xtask lint` no-subcommand umbrella —
+/// `nix/misc-checks.nix`'s `xtask-lint` derivation calls this so a new
+/// `Lint` variant joins the flake check without editing the `.nix`.
+///
+/// Collect-all, not fail-fast: each lint runs even if an earlier one
+/// failed, so a single local `xtask lint` surfaces every violation
+/// instead of one per fix-rerun cycle. CI doesn't care (any failure is
+/// red either way); the choice is for the developer loop.
+pub fn run_all() -> Result<()> {
+    let mut failed = Vec::new();
+    for lint in Lint::all() {
+        if let Err(e) = run(&lint) {
+            tracing::error!(lint = ?lint, error = format_args!("{e:#}"), "lint failed");
+            failed.push(lint);
+        }
+    }
+    ensure!(
+        failed.is_empty(),
+        "{} of {} lint(s) failed: {failed:?}",
+        failed.len(),
+        Lint::all().len(),
+    );
+    Ok(())
 }
 
 /// Schema-liveness guard: every table that exists after applying all
@@ -350,6 +393,30 @@ fn walk_rs(dir: &Path, f: &mut impl FnMut(&Path) -> Result<()>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Lint::all()` must list every enum variant, or `xtask lint`
+    /// (and the `xtask-lint` flake check) silently skip the new lint.
+    /// The compiler enforces the `run()` match arm; this test enforces
+    /// `all()`. Ground truth is clap's own subcommand registry —
+    /// `augment_subcommands` registers one subcommand per variant — so
+    /// the test self-updates when a variant is added.
+    #[test]
+    fn all_returns_every_variant() {
+        let cmd = <Lint as clap::Subcommand>::augment_subcommands(clap::Command::new("lint"));
+        let clap_variants: Vec<_> = cmd
+            .get_subcommands()
+            .map(|c| c.get_name().to_owned())
+            .collect();
+        assert_eq!(
+            Lint::all().len(),
+            clap_variants.len(),
+            "Lint::all() lists {} lint(s) but the Lint enum has {} variant(s) \
+             ({clap_variants:?}). Add the missing variant to `Lint::all()` so \
+             `xtask lint` runs it.",
+            Lint::all().len(),
+            clap_variants.len(),
+        );
+    }
 
     fn scan(sql: &str) -> Result<BTreeSet<String>> {
         let mut live = BTreeSet::new();
