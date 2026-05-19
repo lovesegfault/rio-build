@@ -673,6 +673,8 @@
                     version
                     unfilteredRoot
                     workspaceFileset
+                    manifestsFileset
+                    stubTargetFiles
                     rustStable
                     rustPlatformStable
                     sysCrateEnv

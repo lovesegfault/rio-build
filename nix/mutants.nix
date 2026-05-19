@@ -33,6 +33,11 @@
   version,
   unfilteredRoot,
   workspaceFileset,
+  # Manifests + lockfile only (nix/lib/filesets.nix). Paired with
+  # stubTargetFiles so `cargo metadata` works against a source tree
+  # that omits non-target-package `.rs` content.
+  manifestsFileset,
+  stubTargetFiles,
   rustStable,
   rustPlatformStable,
   sysCrateEnv,
@@ -53,6 +58,12 @@ let
       # (golden_conformance, postgres, ssh-daemon). Smoke is
       # scoped to one package and skips all that.
       withWorkspaceTestDeps ? true,
+      # Source slice to stage. The full sweep mutates files
+      # across the workspace and needs `workspaceFileset`;
+      # `mutants-smoke` only builds/tests `rio-auth` and stages
+      # just its in-tree dep closure + manifests so a `.rs` edit
+      # outside rio-auth/rio-common doesn't rehash the ~5min drv.
+      srcFileset ? workspaceFileset,
     }:
     pkgs.stdenv.mkDerivation (
       sysCrateEnv.allEnv
@@ -70,7 +81,7 @@ let
         src = lib.fileset.toSource {
           root = unfilteredRoot;
           fileset = lib.fileset.unions [
-            workspaceFileset
+            srcFileset
             ../.config/mutants.toml
             ../.config/nextest.toml
           ];
@@ -136,6 +147,11 @@ let
         # actually ran (non-baseline outcomes > 0).
         buildPhase = ''
           runHook preBuild
+          # When `srcFileset` is narrowed (mutants-smoke), `cargo metadata`
+          # still loads the full workspace graph and needs every member's
+          # auto-detected target file to exist. Synthesize empty stubs for
+          # the absent ones (no-op `touch` for the ones that ARE staged).
+          ${stubTargetFiles}
           mkdir -p $out
           cargo mutants \
             --in-place --no-shuffle \
@@ -201,6 +217,14 @@ let
   # Dominant cost is the cold cargo build of rio-auth's dep tree
   # (~5min); the mutations themselves add seconds. Asserts ≥1
   # tested AND ≥1 caught.
+  #
+  # srcFileset is narrowed to rio-auth's in-tree dep closure
+  # (rio-auth → rio-common → workspace-hack) + manifests so the
+  # ~5min cold cargo build only re-runs when one of those crates
+  # — or a manifest — changes, not on every workspace `.rs` edit.
+  # The closure is hardcoded (cargo can't tell us at eval time);
+  # if rio-auth gains a new in-tree dep, cargo errors loudly on
+  # the missing `src/lib.rs` — add the crate dir here.
   mutants-smoke = mkMutants {
     pname = "rio-mutants-smoke";
     mutantsArgs = [
@@ -213,6 +237,12 @@ let
     ];
     assertCaught = true;
     withWorkspaceTestDeps = false;
+    srcFileset = lib.fileset.unions [
+      manifestsFileset
+      ../rio-auth
+      ../rio-common
+      ../workspace-hack
+    ];
   };
 
   # Post-run report validator on the FULL mutants output. NOT a
