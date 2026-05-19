@@ -117,6 +117,17 @@ type Line = (u64, Vec<u8>);
 struct RingBuf {
     lines: VecDeque<Line>,
     bytes: usize,
+    /// Per-execution identifier minted at `assign_to_worker`. Carrier for
+    /// the periodic flush path (which is tick-driven and has no actor
+    /// `FlushRequest` to read per-drv context from). `None` on entries
+    /// created by [`LogBuffers::push`]'s `or_default()` (legacy path,
+    /// tests only) — the flusher MUST skip those.
+    exec_id: Option<Uuid>,
+    /// Executor assigned this drv. The `(executor, drv)` binding check
+    /// in [`LogBuffers::push_for`] compares against the calling stream's
+    /// executor — a batch from any other source is dropped.
+    /// r[impl sched.log.batch-binding]
+    assigned_executor: Option<String>,
 }
 
 /// Per-derivation log ring buffers, keyed by [`drv_log_hash`] of the
@@ -133,8 +144,8 @@ struct RingBuf {
 ///
 /// A derivation is built exactly once even if N builds want it (DAG
 /// merging), so one ring buffer per drv_hash is correct — the S3 flush
-/// writes one blob and N `build_logs` PG rows (one per interested
-/// build, same s3_key).
+/// writes one blob and one `drv_logs` PG row per execution, keyed by
+/// `(drv_hash, exec_id)`.
 pub struct LogBuffers {
     buffers: DashMap<String, RingBuf>,
     /// Tombstone set: derivations that have reached a terminal state.
@@ -173,7 +184,15 @@ impl LogBuffers {
         // uncontended. For cross-key, DashMap's sharding means we rarely
         // block other drv_paths.
         let mut buf = self.buffers.entry(key).or_default();
+        Self::push_into(&mut buf, batch);
+    }
 
+    /// Append batch lines to a ring buffer, truncating long lines and
+    /// evicting oldest when over capacity. Shared by [`Self::push`]
+    /// (legacy, `or_default` entry) and [`Self::push_for`] (gated entry,
+    /// single-lock — caller already holds the shard write lock so the
+    /// binding check and the write are atomic).
+    fn push_into(buf: &mut RingBuf, batch: &BuildLogBatch) {
         let base = batch.first_line_number;
         for (i, line) in batch.lines.iter().enumerate() {
             let mut l = line.clone();
@@ -247,6 +266,103 @@ impl LogBuffers {
                 .cloned()
                 .collect(),
         )
+    }
+
+    /// Stamp a fresh ring-buffer entry with the execution metadata.
+    ///
+    /// Called at `assign_to_worker` immediately after [`Self::discard`]
+    /// (which removes the prior entry and un-seals) and by recovery for
+    /// each active assignment loaded from PG. Creates the entry — it is
+    /// the carrier for the periodic flush, which runs before the
+    /// worker's first `BuildLogBatch` arrives.
+    ///
+    /// `executor` is stored for the `(executor, drv)` binding check in
+    /// [`Self::push_for`].
+    pub fn set_exec(&self, drv_path: &str, exec_id: Uuid, executor: &str) {
+        let key = drv_log_hash(drv_path);
+        let mut entry = self.buffers.entry(key).or_default();
+        entry.exec_id = Some(exec_id);
+        entry.assigned_executor = Some(executor.to_owned());
+    }
+
+    /// Read the exec_id for a drv. `None` if no entry or `set_exec` was
+    /// never called (a legacy `push()` test, or a recovery gap — the
+    /// flusher MUST skip those rather than write a garbage S3 key).
+    pub fn exec_id(&self, drv_path: &str) -> Option<Uuid> {
+        self.buffers.get(&drv_log_hash(drv_path))?.exec_id
+    }
+
+    /// Push a batch with `(executor, drv)` binding enforcement.
+    /// r[impl sched.log.batch-binding]
+    ///
+    /// Drops the batch (no-op + counted metric + warn log) when:
+    /// - no entry exists for `drv_path` (unsolicited drv — does NOT
+    ///   create an entry; this changes the legacy [`Self::push`]'s
+    ///   `or_default()` behavior, which is itself the threat: a
+    ///   fabricated `derivation_path` should not allocate a fresh
+    ///   buffer), or
+    /// - the entry's `assigned_executor` does not match `executor`
+    ///   (calling stream is not the one assigned this drv).
+    ///
+    /// The completion path's analogous check
+    /// (`sched.completion.output-membership`, `completion.rs`) runs
+    /// inside the actor. This runs in the recv task, which deliberately
+    /// bypasses the actor (see module header comment) — so the check is
+    /// colocated with the data the recv task has: the ring buffer entry,
+    /// stamped by [`Self::set_exec`] at dispatch.
+    ///
+    /// Rejection is per-batch, not per-stream — a single bad batch must
+    /// not tear down a stream carrying other valid drvs.
+    ///
+    /// The check and the write happen under a single `get_mut()` write
+    /// lock: there is no window between "verify the executor" and
+    /// "append the lines" for a concurrent `discard()` + `set_exec()`
+    /// re-dispatch to swap the entry under us. (A check-then-`drop`-
+    /// then-`push()` shape would re-`or_default()` a freshly re-stamped
+    /// entry and land the old executor's lines in the new exec's buffer
+    /// — exactly the cross-executor pollution this gate exists to stop.)
+    pub fn push_for(&self, drv_path: &str, batch: &BuildLogBatch, executor: &str) {
+        let key = drv_log_hash(drv_path);
+        if self.sealed.contains(&key) {
+            // Late batch after terminal; matches push()'s seal check.
+            return;
+        }
+        let Some(mut entry) = self.buffers.get_mut(&key) else {
+            tracing::warn!(drv = %drv_path, executor, "rejected log batch: no active assignment");
+            metrics::counter!(
+                "rio_scheduler_log_batches_rejected_total",
+                "reason" => "no_assignment"
+            )
+            .increment(1);
+            return;
+        };
+        if entry.assigned_executor.is_none() {
+            // Entry created by legacy `push()` (test-only path) — never
+            // stamped with an executor. Reject under its own label so
+            // dashboards can distinguish "test fixture wired wrong" from
+            // a real cross-executor probe.
+            tracing::warn!(drv = %drv_path, executor, "rejected log batch: entry unstamped (no set_exec)");
+            metrics::counter!(
+                "rio_scheduler_log_batches_rejected_total",
+                "reason" => "unstamped"
+            )
+            .increment(1);
+            return;
+        }
+        if entry.assigned_executor.as_deref() != Some(executor) {
+            tracing::warn!(
+                drv = %drv_path, executor, assigned = ?entry.assigned_executor,
+                "rejected log batch: executor mismatch"
+            );
+            metrics::counter!(
+                "rio_scheduler_log_batches_rejected_total",
+                "reason" => "executor_mismatch"
+            )
+            .increment(1);
+            return;
+        }
+        // Same write-lock guard for check AND write — no TOCTOU window.
+        Self::push_into(&mut entry, batch);
     }
 
     /// Discard a buffer without returning its contents. Also un-seals.
@@ -701,5 +817,80 @@ mod tests {
             "single line truncated to MAX_LINE_LEN"
         );
         assert_eq!(bytes, MAX_LINE_LEN as u64);
+    }
+
+    // ── set_exec / push_for binding check ───────────────────────────────
+    // r[verify sched.log.batch-binding]
+
+    #[test]
+    fn set_exec_creates_empty_entry_with_metadata() {
+        let bufs = LogBuffers::new();
+        let exec = Uuid::now_v7();
+        bufs.set_exec("drv-a", exec, "executor-1");
+        // Entry exists and is empty.
+        assert_eq!(bufs.active_count(), 1);
+        assert_eq!(bufs.exec_id("drv-a"), Some(exec));
+        // No lines yet.
+        assert_eq!(bufs.read_since("drv-a", 0), Some(vec![]));
+    }
+
+    #[test]
+    fn discard_then_set_exec_resets_entry() {
+        let bufs = LogBuffers::new();
+        let exec1 = Uuid::now_v7();
+        bufs.set_exec("drv-a", exec1, "executor-1");
+        bufs.push(&mk_batch("drv-a", 0, &[b"line1"]));
+        bufs.discard("drv-a");
+        let exec2 = Uuid::now_v7();
+        bufs.set_exec("drv-a", exec2, "executor-2");
+        // Old lines gone, new exec_id.
+        assert_eq!(bufs.exec_id("drv-a"), Some(exec2));
+        assert_eq!(bufs.read_since("drv-a", 0), Some(vec![]));
+    }
+
+    #[test]
+    fn exec_id_none_for_legacy_push() {
+        let bufs = LogBuffers::new();
+        // push() still creates entries (or_default) — but with no exec_id.
+        // The flusher MUST treat this as "skip" rather than mint a key.
+        bufs.push(&mk_batch("drv-a", 0, &[b"line1"]));
+        assert_eq!(bufs.exec_id("drv-a"), None);
+    }
+
+    #[test]
+    fn push_for_rejects_wrong_executor() {
+        let bufs = LogBuffers::new();
+        bufs.set_exec("drv-a", Uuid::now_v7(), "executor-1");
+        bufs.push_for("drv-a", &mk_batch("drv-a", 0, &[b"line1"]), "executor-2");
+        // Rejected — no lines stored.
+        assert_eq!(bufs.read_since("drv-a", 0), Some(vec![]));
+    }
+
+    #[test]
+    fn push_for_rejects_unknown_drv() {
+        let bufs = LogBuffers::new();
+        // No set_exec → no entry → rejected, does NOT create an entry.
+        bufs.push_for("drv-x", &mk_batch("drv-x", 0, &[b"line1"]), "executor-1");
+        assert_eq!(bufs.active_count(), 0);
+    }
+
+    #[test]
+    fn push_for_accepts_matching_executor() {
+        let bufs = LogBuffers::new();
+        bufs.set_exec("drv-a", Uuid::now_v7(), "executor-1");
+        bufs.push_for("drv-a", &mk_batch("drv-a", 0, &[b"line1"]), "executor-1");
+        let lines = bufs.read_since("drv-a", 0).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], (0, b"line1".to_vec()));
+    }
+
+    #[test]
+    fn push_for_respects_seal() {
+        let bufs = LogBuffers::new();
+        bufs.set_exec("drv-a", Uuid::now_v7(), "executor-1");
+        bufs.seal("drv-a");
+        bufs.push_for("drv-a", &mk_batch("drv-a", 0, &[b"late"]), "executor-1");
+        // Sealed → rejected even from the right executor.
+        assert_eq!(bufs.read_since("drv-a", 0), Some(vec![]));
     }
 }

@@ -317,6 +317,11 @@ pub fn describe_metrics() {
         "LogBatch dropped: stream exceeded MAX_DRVS_PER_STREAM distinct derivation_path values"
     );
     describe_counter!(
+        "rio_scheduler_log_batches_rejected_total",
+        "BuildLogBatch dropped by the (executor, drv) binding check. \
+         Labeled by reason: no_assignment | unstamped | executor_mismatch."
+    );
+    describe_counter!(
         "rio_scheduler_executor_reconnect_rejected_total",
         "BuildExecution reconnects rejected by the stream-hijack guard (label: reason)"
     );
