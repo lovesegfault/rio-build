@@ -18,11 +18,16 @@ pub enum Lint {
     /// referenced by name in ≥1 workspace `.rs` file. Catches dead
     /// schema before the checksum freeze makes it permanent.
     SchemaLiveness,
+    /// Every `HELM_RENDERED_SLA_KEYS` entry appears in the rendered
+    /// scheduler helm template. Catches a `[sla]` field helm forgot to
+    /// surface to operators.
+    HelmSla,
 }
 
 pub fn run(lint: &Lint) -> Result<()> {
     match lint {
         Lint::SchemaLiveness => schema_liveness(),
+        Lint::HelmSla => helm_sla(),
     }
 }
 
@@ -215,6 +220,42 @@ fn schema_liveness() -> Result<()> {
         allow_dead = ALLOW_DEAD.len(),
         corpus_files = total,
         "schema-liveness ok"
+    );
+    Ok(())
+}
+
+/// Helm `[sla]` chart-coverage guard: every entry in
+/// `HELM_RENDERED_SLA_KEYS` appears as a substring of the scheduler
+/// helm template.
+///
+/// Class-level guard for merged_bug_056 (helm forgot `hw_cost_source`
+/// → §13a unreachable in production). The companion check — every
+/// `SlaConfig` serde field is classified as RENDERED or NOT_RENDERED —
+/// stays as a unit test (`helm_keys_complete` in
+/// `rio-scheduler/src/sla/config.rs`) because it's a pure serde
+/// round-trip with no file read. Splitting the chart-coverage half here
+/// removes the only `include_str!` reaching from `rio-scheduler/src/`
+/// into `infra/helm/`, which forced a cross-directory fileset symlink
+/// in `nix/crate2nix.nix`.
+fn helm_sla() -> Result<()> {
+    use rio_scheduler::sla::config::HELM_RENDERED_SLA_KEYS;
+
+    let tpl_path = repo_root().join("infra/helm/rio-build/templates/scheduler.yaml");
+    let tpl =
+        fs::read_to_string(&tpl_path).with_context(|| format!("reading {}", tpl_path.display()))?;
+    for k in HELM_RENDERED_SLA_KEYS {
+        ensure!(
+            tpl.contains(k),
+            "[sla] key `{k}` not rendered by {} — add a `{{{{- with .X }}}}` block, \
+             or move it to HELM_NOT_RENDERED_SLA_KEYS in \
+             rio-scheduler/src/sla/config.rs with a rationale",
+            tpl_path.display()
+        );
+    }
+    tracing::info!(
+        rendered_keys = HELM_RENDERED_SLA_KEYS.len(),
+        template = %tpl_path.display(),
+        "helm-sla ok"
     );
     Ok(())
 }

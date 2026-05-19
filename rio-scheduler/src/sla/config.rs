@@ -1245,6 +1245,52 @@ impl Ceilings {
     }
 }
 
+/// Snake-case `[sla]` TOML keys the helm template MUST render.
+/// `tpl.contains` is a substring check — the template writes each as
+/// `name = ...` or `[sla.name]` so the bare snake_case key is sufficient.
+///
+/// Class-level guard for merged_bug_056 (helm forgot `hw_cost_source`
+/// → §13a unreachable in production). The unit test
+/// [`tests::helm_keys_complete`] asserts this list ∪
+/// [`HELM_NOT_RENDERED_SLA_KEYS`] covers every [`SlaConfig`] field;
+/// `xtask lint helm-sla` asserts each appears in the rendered chart.
+pub const HELM_RENDERED_SLA_KEYS: &[&str] = &[
+    "tiers",
+    "default_tier",
+    "probe",
+    "feature_probes",
+    "max_cores",
+    "max_mem",
+    "max_disk",
+    "default_disk",
+    "hw_cost_source",
+    "hw_classes",
+    "hw_cost_tolerance",
+    "hw_explore_epsilon",
+    "hw_bench_mem_floor",
+    "lead_time_seed",
+    "max_fleet_cores",
+    "ladder_budget",
+    "reference_hw_class",
+    "max_forecast_cores_per_tenant",
+    "max_keys_per_tenant",
+    "max_lead_time",
+    "max_consolidation_time",
+    "max_node_claims_per_cell_per_tick",
+    "cluster",
+    "metal_sizes",
+];
+
+/// `[sla]` keys intentionally NOT rendered by helm (with rationale).
+/// Adding a field here requires justifying why operators never set it.
+pub const HELM_NOT_RENDERED_SLA_KEYS: &[(&str, &str)] = &[
+    ("ring_buffer", "internal refit window; not operator-tuned"),
+    (
+        "seed_corpus",
+        "file path — corpus loads via ImportSlaCorpus RPC in k8s",
+    ),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1856,79 +1902,30 @@ mod tests {
         assert!(err.contains("unknown field"), "{err}");
     }
 
-    /// Class-level guard for merged_bug_056 (helm forgot
-    /// `hw_cost_source` → §13a unreachable in production). Asserts
-    /// every `[sla]` TOML key appears verbatim in the helm template,
-    /// and that the key list itself is complete (so adding a field
-    /// without listing it here ALSO fails).
+    /// Completeness: every `SlaConfig` serde field is listed in
+    /// [`HELM_RENDERED_SLA_KEYS`] ∪ [`HELM_NOT_RENDERED_SLA_KEYS`].
+    /// serde_json emits every struct field (incl. `Option::None` as
+    /// null, empty maps as `{}`), so adding a field without classifying
+    /// it (rendered vs. not-rendered + rationale) fails here.
+    ///
+    /// The chart-coverage check (does the helm template actually render
+    /// each RENDERED key?) is `xtask lint helm-sla` — split out so the
+    /// crate's unit tests don't need an `include_str!` reaching into
+    /// `infra/helm/`.
     #[test]
-    fn helm_renders_every_sla_key() {
-        const TPL: &str = include_str!("../../../infra/helm/rio-build/templates/scheduler.yaml");
-
-        // Snake-case TOML field names that the helm `[sla]` block MUST
-        // render. `TPL.contains` is a substring check — the template
-        // writes each as `name = ...` or `[sla.name]` so the bare
-        // snake_case key is sufficient.
-        const RENDERED: &[&str] = &[
-            "tiers",
-            "default_tier",
-            "probe",
-            "feature_probes",
-            "max_cores",
-            "max_mem",
-            "max_disk",
-            "default_disk",
-            "hw_cost_source",
-            "hw_classes",
-            "hw_cost_tolerance",
-            "hw_explore_epsilon",
-            "hw_bench_mem_floor",
-            "lead_time_seed",
-            "max_fleet_cores",
-            "ladder_budget",
-            "reference_hw_class",
-            "max_forecast_cores_per_tenant",
-            "max_keys_per_tenant",
-            "max_lead_time",
-            "max_consolidation_time",
-            "max_node_claims_per_cell_per_tick",
-            "cluster",
-            "metal_sizes",
-        ];
-        // Intentionally NOT helm-rendered (with rationale). Adding a
-        // field here requires justifying why operators never set it.
-        const NOT_RENDERED: &[(&str, &str)] = &[
-            ("ring_buffer", "internal refit window; not operator-tuned"),
-            (
-                "seed_corpus",
-                "file path — corpus loads via ImportSlaCorpus RPC in k8s",
-            ),
-        ];
-
-        for k in RENDERED {
-            assert!(
-                TPL.contains(k),
-                "[sla] key `{k}` not rendered by infra/helm/rio-build/templates/scheduler.yaml \
-                 — add a `{{{{- with .X }}}}` block, or move to NOT_RENDERED with rationale"
-            );
-        }
-
-        // Completeness: serde_json emits every struct field (incl.
-        // `Option::None` as null, empty maps as `{{}}`); compare its
-        // top-level key set against RENDERED ∪ NOT_RENDERED so a new
-        // `SlaConfig` field that nobody listed fails here.
+    fn helm_keys_complete() {
         let v = serde_json::to_value(SlaConfig::test_default()).unwrap();
         let actual: std::collections::BTreeSet<&str> =
             v.as_object().unwrap().keys().map(String::as_str).collect();
-        let listed: std::collections::BTreeSet<&str> = RENDERED
+        let listed: std::collections::BTreeSet<&str> = HELM_RENDERED_SLA_KEYS
             .iter()
             .copied()
-            .chain(NOT_RENDERED.iter().map(|(k, _)| *k))
+            .chain(HELM_NOT_RENDERED_SLA_KEYS.iter().map(|(k, _)| *k))
             .collect();
         assert_eq!(
             actual, listed,
-            "\nSlaConfig serde fields ≠ RENDERED ∪ NOT_RENDERED — \
-             add the new field to one of the two lists above"
+            "\nSlaConfig serde fields ≠ HELM_RENDERED_SLA_KEYS ∪ HELM_NOT_RENDERED_SLA_KEYS — \
+             add the new field to one of the two lists (in this module, not the test)"
         );
     }
 

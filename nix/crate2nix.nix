@@ -230,16 +230,6 @@ let
     root = ../rio-proto;
     fileset = pkgs.lib.fileset.fileFilter (f: f.hasExt "proto") ../rio-proto/proto;
   };
-  # rio-scheduler/src/sla/config.rs::helm_renders_every_sla_key does
-  # include_str!("../../../infra/helm/rio-build/templates/scheduler.yaml")
-  # — class-level guard against `[sla]` keys helm forgot to render.
-  # Single-file fileset so unrelated chart edits don't invalidate the
-  # rio-scheduler build.
-  schedulerTplFileset = pkgs.lib.fileset.toSource {
-    root = ../infra;
-    fileset = ../infra/helm/rio-build/templates/scheduler.yaml;
-  };
-
   # query! macros read .sqlx/*.json instead of connecting to PG at
   # compile time. SQLX_OFFLINE_DIR bypasses the workspace-root walk;
   # CARGO points at a stub that outputs minimal `cargo metadata` JSON
@@ -268,26 +258,19 @@ let
   # Test-only postUnpack — symlinks for include_str!() callsites that
   # live INSIDE #[cfg(test)] modules and are therefore never compiled
   # with buildTests=false. Keeping these out of defaultCrateOverrides
-  # means editing the underlying fixture files (seccomp profile, helm
-  # template) does not rehash the lib/bin derivations that VM tests,
-  # docker images, and crdgen consume.
+  # means editing the underlying fixture files (seccomp profile) does
+  # not rehash the lib/bin derivations that VM tests, docker images,
+  # and crdgen consume.
   #
   # nix/checks.nix's mkTestVariant appends these via .overrideAttrs
   # alongside `buildTests = true` — the only build mode that compiles
   # the #[cfg(test)] blocks that read them.
   #
   # Inventory (verified each is structurally inside #[cfg(test)]):
-  #   rio-scheduler:
-  #     src/sla/config.rs:1866      — infra/helm/.../scheduler.yaml
   #   rio-controller:
   #     src/reconcilers/pool/tests/builders_tests.rs:192 — seccomp/rio-builder.json
   #       (parent module: pool/mod.rs:38-39 `#[cfg(test)] pub(super) mod tests`)
   testOnlyPostUnpack = {
-    rio-scheduler = ''
-      mkdir -p $NIX_BUILD_TOP/infra/helm/rio-build/templates
-      ln -sf ${schedulerTplFileset}/helm/rio-build/templates/scheduler.yaml \
-        $NIX_BUILD_TOP/infra/helm/rio-build/templates/scheduler.yaml
-    '';
     rio-controller = ''
       mkdir -p $NIX_BUILD_TOP/nix/nixos-node
       ln -sf ${seccompFileset} $NIX_BUILD_TOP/nix/nixos-node/seccomp

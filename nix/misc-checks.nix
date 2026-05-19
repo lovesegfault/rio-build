@@ -165,11 +165,18 @@ in
   #   xtask so it runs as a pure file walk instead of a build.rs corpus
   #   concat needing crate2nix sibling-src symlinks.
   #
+  # - `helm-sla`: every `HELM_RENDERED_SLA_KEYS` entry appears in the
+  #   scheduler helm template. Catches a `[sla]` field helm forgot to
+  #   surface to operators (merged_bug_056). The completeness half
+  #   (every SlaConfig field is classified) stays as a unit test —
+  #   pure serde, no file read; this half needed a cross-directory
+  #   `include_str!` and a crate2nix fileset symlink, so it moved here.
+  #
   # The crate2nix-built xtask's compile-time `CARGO_MANIFEST_DIR` is a
   # store path, so `RIO_REPO_ROOT` points it at the staged fileset
   # (same pattern as docsData in nix/docs.nix). Fileset is exactly the
-  # lint's read surface — rebuild only when migration SQL or PG-query
-  # crate source changes.
+  # lints' read surface — rebuild only when migration SQL, PG-query
+  # crate source, or the scheduler helm template changes.
   xtask-lint =
     pkgs.runCommand "rio-xtask-lint"
       {
@@ -181,12 +188,15 @@ in
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-store/src)
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../xtask/src)
+            ../infra/helm/rio-build/templates/scheduler.yaml
           ];
         };
       }
       ''
         export RIO_REPO_ROOT=$src
-        xtask lint schema-liveness 2>&1 | tee $out
+        xtask lint schema-liveness
+        xtask lint helm-sla
+        touch $out
       '';
 
   # Helm chart lint + template for all value profiles. Catches
