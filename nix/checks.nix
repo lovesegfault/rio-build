@@ -482,9 +482,10 @@ let
   #      Binary paths are ABSOLUTE nix-store paths — no target-dir-remap
   #      needed, nextest reads them directly.
   #
-  # Split into two derivations: `nextestMeta` produces the JSON (cached,
-  # only rebuilds when testBinDrvs change), `nextestRun` executes
-  # against that metadata (the expensive part; what the CI gate checks).
+  # Split into two derivations: `mkNextestMeta` produces the JSON
+  # (cached, only rebuilds when its testBinDrvs change), `mkNextestRun`
+  # executes against that metadata (the expensive part; what the CI
+  # gate checks).
   rustTarget = pkgs.stdenv.hostPlatform.rust.rustcTarget;
 
   # A minimal .cargo/config.toml that makes `cargo metadata --offline
@@ -690,10 +691,8 @@ let
         [ "$n" -ge 1 ] || { echo "ERROR: zero real binaries synthesized"; exit 1; }
       '';
 
-  nextestMeta = mkNextestMeta testBinDrvs;
-
   # nextest runner: the actual test-execution derivation. Consumes the
-  # cached nextestMeta and runs `cargo-nextest run` against the
+  # cached metadata derivation and runs `cargo-nextest run` against the
   # prebuilt binaries. Per-test-process isolation means the
   # PR_SET_PDEATHSIG race doesn't apply — each test process IS the
   # postgres parent, so postgres lives for exactly as long as the test
@@ -707,18 +706,16 @@ let
   # without re-importing the whole module — `-P ci` vs default-profile
   # runs, or golden-matrix's per-daemon-variant runs (same test
   # binaries, different RIO_GOLDEN_DAEMON_BIN + nix-cli in PATH).
-  # nextestMeta is shared across all variants (it only depends on
-  # testBinDrvs + cargoMetadataJson, neither of which change
-  # per-variant).
   mkNextestRun =
     {
       name ? "rio-nextest-all",
       # Member name for per-crate runtimeTestInputs/testEnv keying.
       # null = aggregate run (gets the union of all members' deps).
       member ? null,
-      # Metadata derivation (cargo-metadata.json + binaries-metadata.json).
-      # Override to point at instrumented binaries for the coverage run.
-      meta ? nextestMeta,
+      # Metadata derivation (cargo-metadata.json + binaries-metadata.json),
+      # produced by mkNextestMeta. Per-member callers scope it to one
+      # test-binary drv; coverage callers point it at instrumented bins.
+      meta,
       # Extra runtime inputs layered on top of runtimeTestInputs.
       # PREPENDED so callers can shadow the module-level nix-cli with
       # a variant daemon — the golden harness shells out to nix-store
@@ -824,8 +821,6 @@ let
         find $ws -name junit.xml -exec cp {} $out/ \; 2>/dev/null || true
         ${postRun}
       '';
-
-  nextestRun = mkNextestRun { };
 
   # Per-member nextest runners. Each gets its own meta synthesized from
   # ONE test-binary derivation, so building checks.nextest-rio-common
@@ -969,20 +964,13 @@ in
   inherit covLcovs;
   coverage = coverageLcov;
 
-  # nextest: metadata synthesis (cached) + reuse-build runner. null
-  # when workspaceSrc unset (callers that only want clippy/doc can
-  # skip the nextest wiring). mkNextestRun is the parameterized form
-  # — golden-matrix uses it to spin one run per daemon variant with
-  # a different nix-cli in PATH and RIO_GOLDEN_DAEMON_BIN env.
+  # nextest: per-member reuse-build runners. null/empty when
+  # workspaceSrc unset (callers that only want clippy/doc can skip the
+  # nextest wiring). mkNextestRun/mkNextestMeta are the parameterized
+  # forms — golden-matrix uses them to spin one run per daemon variant
+  # with a different nix-cli in PATH and RIO_GOLDEN_DAEMON_BIN env.
   # nextestRuns is the per-member map for granular checks.*.
-  nextest = if workspaceSrc != null then nextestRun else null;
   nextestRuns = if workspaceSrc != null then noHack nextestRuns else { };
-  nextestMetadata = if workspaceSrc != null then nextestMeta else null;
   mkNextestRun = if workspaceSrc != null then mkNextestRun else null;
   mkNextestMeta = if workspaceSrc != null then mkNextestMeta else null;
-
-  # The toolchain wrappers, exposed for debugging / manual invocation:
-  #   nix build .#packages.x86_64-linux.clippy-rustc
-  #   ./result/bin/rustc --version   # prints clippy-driver version
-  inherit clippyRustc rustdocRustc;
 }

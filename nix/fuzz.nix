@@ -195,14 +195,9 @@ let
     '';
 in
 {
-  # Per-workspace crate2nix tree. Consumed by checks.fuzz-* (the
-  # runs depend on these as inputs); not re-exported standalone.
-  builds = {
-    inherit (rio-nix-fuzz-build.members) rio-nix-fuzz;
-    inherit (rio-store-fuzz-build.members) rio-store-fuzz;
-  };
-
   # 2min fuzz runs. Keys: "fuzz-<target>". Spliced into `checks.*`.
+  # The compiled fuzz binaries (rio-{nix,store}-fuzz-build.members.*)
+  # are run-time inputs of these derivations, not re-exported standalone.
   runs = builtins.listToAttrs (
     map (t: {
       name = "fuzz-${t.target}";

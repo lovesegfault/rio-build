@@ -374,9 +374,9 @@
               # Fuzz build pipeline (extracted to nix/fuzz.nix)
               # --------------------------------------------------------------
               #
-              # Produces:
-              #   fuzz.builds.rio-{nix,store}-fuzz-build  — compiled target binaries
-              #   fuzz.runs   — 2min checks, keyed fuzz-<target>
+              # Produces fuzz.runs — 2min checks, keyed fuzz-<target>.
+              # The compiled fuzz binaries are run-time inputs of those
+              # derivations, not exposed standalone.
               fuzz = import ./nix/fuzz.nix {
                 inherit
                   pkgs

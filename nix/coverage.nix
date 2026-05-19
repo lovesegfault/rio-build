@@ -9,7 +9,6 @@
 # Outputs:
 #   perTestLcov.vm-<scenario>  — one lcov per VM test
 #   vmLcov                  — all VM tests unioned
-#   unitLcov                — unit-test lcov, path-normalized
 #   full                    — unit ∪ VM, HTML report, per-test breakdown
 #
 # CRITICAL: use the toolchain-bundled llvm-profdata/llvm-cov, NOT
@@ -193,7 +192,7 @@ let
   smokeScenario = "vm-protocol-warm-standalone";
 in
 {
-  inherit perTestLcov vmLcov unitLcov;
+  inherit perTestLcov vmLcov;
 
   # Regression: two nodes producing IDENTICALLY-named profraws (same
   # PID + same binary signature — happens with identically-configured
