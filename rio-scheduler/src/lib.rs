@@ -322,6 +322,11 @@ pub fn describe_metrics() {
          Labeled by reason: no_assignment | unstamped | executor_mismatch."
     );
     describe_counter!(
+        "rio_scheduler_log_gc_swept_total",
+        "drv_logs rows (and their .log.zst + .partial.log.zst S3 blobs) deleted \
+         by the LogFlusher TTL GC sweep. Cadence ~1h; threshold scheduler.logRetentionDays."
+    );
+    describe_counter!(
         "rio_scheduler_executor_reconnect_rejected_total",
         "BuildExecution reconnects rejected by the stream-hijack guard (label: reason)"
     );

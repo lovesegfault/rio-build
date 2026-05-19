@@ -52,6 +52,23 @@ use super::{LogBuffers, drv_log_hash, log_s3_key};
 /// bounds log loss on crash to ≤30s; lower = more S3 PUTs + CPU.
 const PERIODIC_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How often the TTL GC sweep runs. ~1h matches `tick_sweep_event_log`'s
+/// cadence (the actor's other periodic PG sweep). The sweep is one
+/// `select!` arm — flushes are SERIALIZED against it, not interleaved
+/// (a `select!` doesn't re-poll its other arms until the awaited future
+/// returns; `yield_now()` only yields to sibling *tasks*). The delay is
+/// bounded: [`LOG_GC_BATCH`]-row passes, each ~one PG round-trip + two
+/// S3 `DeleteObjects`, and at a 1h cadence + 30d TTL the steady-state
+/// pass count is ~1. Final flushes queue in `flush_rx` (1000-deep);
+/// periodic ticks accumulate one `MissedTickBehavior::Skip` and recover.
+const LOG_GC_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Rows deleted per GC pass. Matches `tick_gc_orphan_derivations`'s
+/// batch cap and aligns with S3 `DeleteObjects`' 1000-key limit (each
+/// row produces 2 keys — `.log.zst` + `.partial.log.zst` — so a batch
+/// of 1000 rows splits into 2 `DeleteObjects` calls).
+const LOG_GC_BATCH: i64 = 1000;
+
 /// Request to flush one derivation's logs. Sent by the actor from
 /// `handle_completion_success` and `terminal_failure_epilogue` (both paths
 /// flush — failed builds still have useful logs).
@@ -76,15 +93,25 @@ pub struct LogFlusher {
     bucket: String,
     pool: PgPool,
     buffers: Arc<LogBuffers>,
+    /// TTL for `drv_logs` rows + S3 blobs. Validated > 0 at config load
+    /// (`Config::validate`). See [`Self::sweep_expired_logs`].
+    log_retention_days: u32,
 }
 
 impl LogFlusher {
-    pub fn new(s3: S3Client, bucket: String, pool: PgPool, buffers: Arc<LogBuffers>) -> Self {
+    pub fn new(
+        s3: S3Client,
+        bucket: String,
+        pool: PgPool,
+        buffers: Arc<LogBuffers>,
+        log_retention_days: u32,
+    ) -> Self {
         Self {
             s3,
             bucket,
             pool,
             buffers,
+            log_retention_days,
         }
     }
 
@@ -104,9 +131,21 @@ impl LogFlusher {
             // empty buffer set 0ms after startup).
             tick.tick().await;
 
+            // GC tick: lives here, not in the actor's housekeeping, because
+            // it needs both PG (DELETE) and S3 (DeleteObjects) — and the only
+            // S3Client in rio-scheduler is on LogFlusher. The actor's
+            // `tick_sweep_event_log` / `tick_gc_orphan_derivations` are
+            // PG-only. Same skip-behind + consume-first treatment as the
+            // periodic tick.
+            let mut gc_tick = tokio::time::interval(LOG_GC_INTERVAL);
+            gc_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            gc_tick.tick().await;
+
             info!(
                 bucket = %self.bucket,
                 interval = ?PERIODIC_FLUSH_INTERVAL,
+                gc_interval = ?LOG_GC_INTERVAL,
+                retention_days = self.log_retention_days,
                 "log flusher started"
             );
 
@@ -138,6 +177,10 @@ impl LogFlusher {
 
                     _ = tick.tick() => {
                         self.flush_periodic().await;
+                    }
+
+                    _ = gc_tick.tick() => {
+                        self.sweep_expired_logs().await;
                     }
                 }
             }
@@ -364,6 +407,164 @@ impl LogFlusher {
             }
         }
     }
+
+    /// TTL-based log GC: delete `drv_logs` rows (and their S3 blobs)
+    /// older than [`Self::log_retention_days`]. **One TTL, no
+    /// `is_complete` discriminator** — the age filter already excludes
+    /// active builds (no build runs 30 days; the daemon timeout is ~2h),
+    /// and a 30-day-old `is_complete=false` row is exactly as expired as
+    /// a complete one — it indicates a flusher crash mid-write or a
+    /// scheduler hard-kill, and the diagnostic value of a month-old
+    /// truncated log is nil.
+    ///
+    /// **Why on `LogFlusher`, not the actor's housekeeping.** The sweep
+    /// needs both PG (DELETE rows) and S3 (DeleteObjects). The actor's
+    /// `tick_sweep_event_log` / `tick_gc_orphan_derivations` are PG-only;
+    /// `DagActor` has no `S3Client`. The only `S3Client` in rio-scheduler
+    /// lives here. The flusher also already runs on a dedicated tokio
+    /// task off the actor's hot path.
+    ///
+    /// **Bounded delay, not interleaving.** The sweep is one `select!`
+    /// arm alongside the periodic and final flushes — they are
+    /// SERIALIZED against it, not interleaved. `tokio::select!` does
+    /// NOT re-poll its other arms until the awaited future returns; the
+    /// `yield_now()` between batches is cooperative scheduling for
+    /// *sibling tasks* on the worker thread (admin gRPC, the actor),
+    /// not arm fairness. While the sweep runs:
+    ///   - final flushes queue in `flush_rx` (1000-deep, won't drop
+    ///     unless the actor outruns the channel for the whole pass);
+    ///   - periodic ticks accumulate one `MissedTickBehavior::Skip`
+    ///     and recover on the next interval.
+    ///
+    /// The serialization is deliberate, not accepted: a `tokio::spawn`'d
+    /// sweep could race a flush UPSERT against the GC DELETE on the same
+    /// `drv_logs` row (a drv whose retention window expires mid-flush).
+    /// The delay is bounded by `(expired_rows / LOG_GC_BATCH) × (PG
+    /// round-trip + 2 S3 DeleteObjects)` — at a 1h cadence + 30d TTL the
+    /// steady-state pass count is ~1, so a few seconds at worst.
+    ///
+    /// **`.partial` orphans.** Both `.log.zst` and `.partial.log.zst`
+    /// keys are deleted per row, so a `.partial` blob orphaned by a
+    /// failed best-effort delete during the final flush is caught at
+    /// expiry. There is **no** separate fast-orphan sweep — that would
+    /// need a watermark column to avoid re-sweeping `O(table)` rows per
+    /// tick, and a `.partial` orphan is at most `log_retention_days`
+    /// stale (acceptable residual leak; an S3 lifecycle rule on the
+    /// `logs/` prefix can backstop it without code).
+    ///
+    /// **Failure modes.** PG DELETE failure aborts the pass (logged,
+    /// retried next tick). S3 DeleteObjects failure is logged and the
+    /// pass continues — the PG rows are already gone, and re-running the
+    /// query won't re-find them, so the orphan blobs are unreachable
+    /// from PG. They're bounded by the same lifecycle-rule backstop.
+    async fn sweep_expired_logs(&self) {
+        let mut total_swept = 0u64;
+        loop {
+            // Batch-bounded DELETE. The `IN (SELECT ... LIMIT N)`
+            // sub-select is the standard Postgres idiom for limiting
+            // a DELETE — DELETE itself has no LIMIT clause. RETURNING
+            // gives us `drv_hash`/`exec_id` so we can construct the S3
+            // keys directly (rather than parsing the row's `s3_key`,
+            // which carries only ONE of `.log.zst` / `.partial.log.zst`
+            // depending on whether the final flush ran). No ORDER BY:
+            // any 1000 expired rows are equally good to delete, and
+            // skipping the sort lets PG short-circuit the seq scan.
+            let expired: Vec<(Uuid, String)> = match sqlx::query_as(
+                "DELETE FROM drv_logs
+                 WHERE exec_id IN (
+                     SELECT exec_id FROM drv_logs
+                     WHERE started_at < now() - $1 * interval '1 day'
+                     LIMIT $2
+                 )
+                 RETURNING exec_id, drv_hash",
+            )
+            .bind(i64::from(self.log_retention_days))
+            .bind(LOG_GC_BATCH)
+            .fetch_all(&self.pool)
+            .await
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    warn!(error = %e, "log GC sweep: PG DELETE failed (retried next tick)");
+                    return;
+                }
+            };
+            if expired.is_empty() {
+                break;
+            }
+
+            // S3 batch delete: 2 keys per row (final + partial). LOG_GC_BATCH
+            // rows × 2 keys = up to 2000 keys; chunk at 1000 to fit the S3
+            // DeleteObjects limit. `quiet(true)` suppresses per-key success
+            // entries in the response (we only care about errors). Use
+            // `log_s3_key` — `drv_log_hash` is idempotent so passing the
+            // already-normalized `drv_hash` produces the same key the flush
+            // path wrote.
+            let keys: Vec<aws_sdk_s3::types::ObjectIdentifier> = expired
+                .iter()
+                .flat_map(|(exec_id, drv_hash)| {
+                    [
+                        log_s3_key(drv_hash, exec_id, false),
+                        log_s3_key(drv_hash, exec_id, true),
+                    ]
+                })
+                .map(|key| {
+                    aws_sdk_s3::types::ObjectIdentifier::builder()
+                        .key(key)
+                        .build()
+                        // `key` is the only required field and is always
+                        // set above — the builder cannot fail.
+                        .expect("ObjectIdentifier: key is set")
+                })
+                .collect();
+            for chunk in keys.chunks(1000) {
+                let delete = aws_sdk_s3::types::Delete::builder()
+                    .set_objects(Some(chunk.to_vec()))
+                    .quiet(true)
+                    .build()
+                    .expect("Delete: objects is set");
+                if let Err(e) = self
+                    .s3
+                    .delete_objects()
+                    .bucket(&self.bucket)
+                    .delete(delete)
+                    .send()
+                    .await
+                {
+                    // PG rows already gone — these blobs are unreachable
+                    // from PG, so they won't be re-tried. Bounded by the
+                    // S3 lifecycle-rule backstop. Log at warn (operator
+                    // should know S3 deletes are failing) but don't abort
+                    // the pass — there may be more expired rows to sweep.
+                    warn!(
+                        error = %e,
+                        keys = chunk.len(),
+                        "log GC sweep: S3 DeleteObjects failed \
+                         (orphan blobs; lifecycle rule is the backstop)"
+                    );
+                }
+            }
+
+            total_swept += expired.len() as u64;
+            // Cooperative scheduling for sibling TASKS on the worker
+            // thread, NOT select!-arm fairness — the other arms don't
+            // run until this fn returns (see fn doc, "Bounded delay").
+            tokio::task::yield_now().await;
+        }
+        if total_swept > 0 {
+            info!(
+                deleted = total_swept,
+                retention_days = self.log_retention_days,
+                "log GC sweep"
+            );
+        }
+        // .increment(0) registers the time series on first call, so
+        // rio_scheduler_log_gc_swept_total exists in Prometheus even when
+        // nothing has expired yet — distinguishing "GC never ran" (no
+        // series) from "GC ran, found nothing" (series at 0). Outside the
+        // `if` deliberately.
+        metrics::counter!("rio_scheduler_log_gc_swept_total").increment(total_swept);
+    }
 }
 
 /// Log + metric for a compress/S3/PG failure. Level depends on `is_final`:
@@ -489,6 +690,7 @@ async fn upsert_drv_log(
 mod tests {
     use super::*;
     use aws_sdk_s3::operation::delete_object::DeleteObjectOutput;
+    use aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput;
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_smithy_mocks::{RuleMode, mock, mock_client};
     use rio_test_support::TestDb;
@@ -536,7 +738,25 @@ mod tests {
                 true
             })
             .then_output(|| DeleteObjectOutput::builder().build());
-        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put_rule, &del_rule]);
+        // Batch deletes (GC sweep) flatten into the same captured-deletes
+        // Vec, so a test can assert on individual keys regardless of
+        // whether the production code chose `delete_object` or
+        // `delete_objects` for a given key.
+        let dcap2 = Arc::clone(&deletes);
+        let del_objects_rule = mock!(S3Client::delete_objects)
+            .match_requests(move |req| {
+                let mut sink = dcap2.lock().unwrap();
+                for obj in req.delete().map(|d| d.objects()).unwrap_or_default() {
+                    sink.push(obj.key().to_string());
+                }
+                true
+            })
+            .then_output(|| DeleteObjectsOutput::builder().build());
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[&put_rule, &del_rule, &del_objects_rule]
+        );
         (client, puts, deletes)
     }
 
@@ -610,6 +830,7 @@ mod tests {
             "test-bucket".into(),
             db.pool.clone(),
             Arc::clone(&buffers),
+            30,
         );
 
         flusher
@@ -677,7 +898,7 @@ mod tests {
         let buffers = Arc::new(LogBuffers::new());
         // DON'T set_exec or push anything.
 
-        let flusher = LogFlusher::new(s3, "test-bucket".into(), db.pool.clone(), buffers);
+        let flusher = LogFlusher::new(s3, "test-bucket".into(), db.pool.clone(), buffers, 30);
 
         flusher
             .flush_final(FlushRequest {
@@ -711,6 +932,7 @@ mod tests {
             "test-bucket".into(),
             db.pool.clone(),
             Arc::clone(&buffers),
+            30,
         );
 
         // Both paths should skip.
@@ -745,7 +967,7 @@ mod tests {
         buffers.set_exec("/nix/store/aaaa-empty.drv", Uuid::now_v7(), "test-worker");
         assert_eq!(buffers.active_count(), 1, "set_exec creates the entry");
 
-        let flusher = LogFlusher::new(s3, "test-bucket".into(), db.pool.clone(), buffers);
+        let flusher = LogFlusher::new(s3, "test-bucket".into(), db.pool.clone(), buffers, 30);
 
         flusher.flush_periodic().await;
 
@@ -773,6 +995,7 @@ mod tests {
             "test-bucket".into(),
             db.pool.clone(),
             Arc::clone(&buffers),
+            30,
         );
 
         flusher.flush_periodic().await;
@@ -823,6 +1046,7 @@ mod tests {
             "test-bucket".into(),
             db.pool.clone(),
             Arc::clone(&buffers),
+            30,
         );
 
         flusher.flush_periodic().await;
@@ -947,6 +1171,7 @@ mod tests {
             "test-bucket".into(),
             db.pool.clone(),
             Arc::clone(&buffers),
+            30,
         );
 
         // First flush → S3 fails. Buffer is drained but upload fails → log
@@ -1011,6 +1236,7 @@ mod tests {
             "test-bucket".into(),
             db.pool.clone(),
             Arc::clone(&buffers),
+            30,
         );
 
         flusher.flush_periodic().await;
@@ -1058,7 +1284,7 @@ mod tests {
         buffers.push(&mk_batch("/nix/store/ongoing-llvm.drv", 0, &[b"compiling"]));
 
         let (tx, rx) = mpsc::channel::<FlushRequest>(8);
-        LogFlusher::new(s3, "b".into(), db.pool.clone(), Arc::clone(&buffers)).spawn(rx);
+        LogFlusher::new(s3, "b".into(), db.pool.clone(), Arc::clone(&buffers), 30).spawn(rx);
 
         // Auto-advance drives the interval; tx open so the loop is
         // recv-vs-tick (not the channel-close final sweep).
@@ -1081,6 +1307,156 @@ mod tests {
             }
         });
         drop(tx);
+        Ok(())
+    }
+
+    /// Seed a `drv_logs` row directly with an arbitrary `started_at`.
+    /// The production flush path always derives `started_at` from the
+    /// UUIDv7's embedded timestamp, so the only way to test the GC
+    /// cutoff is to bypass it. Returns `(exec_id, drv_hash)`.
+    async fn seed_drv_log_aged(
+        pool: &PgPool,
+        age_days: i64,
+        is_complete: bool,
+    ) -> anyhow::Result<(Uuid, String)> {
+        let exec_id = Uuid::now_v7();
+        // 32-char fake hash distinct per call (the full 128-bit UUID
+        // as hex). drv_log_hash() passes a 32-char hash-shaped string
+        // through unchanged, so log_s3_key() produces a key that
+        // matches what the GC sweep will reconstruct.
+        let drv_hash = format!("{:032x}", exec_id.as_u128());
+        sqlx::query(
+            "INSERT INTO drv_logs
+                 (exec_id, drv_hash, s3_key, first_line, line_count,
+                  total_bytes, is_complete, status, started_at, finished_at)
+             VALUES ($1, $2, $3, 0, 1, 1, $4, NULL,
+                     now() - $5 * interval '1 day',
+                     CASE WHEN $4 THEN now() - $5 * interval '1 day' ELSE NULL END)",
+        )
+        .bind(exec_id)
+        .bind(&drv_hash)
+        .bind(log_s3_key(&drv_hash, &exec_id, !is_complete))
+        .bind(is_complete)
+        .bind(age_days)
+        .execute(pool)
+        .await?;
+        Ok((exec_id, drv_hash))
+    }
+
+    /// The GC sweep deletes expired rows + BOTH S3 blobs and keeps
+    /// recent ones. The expired seed is deliberately `is_complete=false`
+    /// to verify the "one TTL, no `is_complete` discriminator" rule —
+    /// a 60-day-old `.partial`-only row (flusher crashed mid-write) is
+    /// exactly as expired as a complete one.
+    // r[verify obs.log.exec-keyed]
+    #[tokio::test]
+    async fn gc_sweep_deletes_expired_logs_and_keeps_recent() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, _puts, deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30, // retention: 60d-old → expired, 0d-old → kept
+        );
+
+        // Expired (60d, incomplete — the no-discriminator case) and
+        // recent (0d, complete). The recent row must survive the sweep.
+        let (old_exec, old_hash) = seed_drv_log_aged(&db.pool, 60, false).await?;
+        let (new_exec, _new_hash) = seed_drv_log_aged(&db.pool, 0, true).await?;
+
+        flusher.sweep_expired_logs().await;
+
+        // PG: expired row gone, recent row kept.
+        let remaining: Vec<(Uuid,)> = sqlx::query_as("SELECT exec_id FROM drv_logs")
+            .fetch_all(&db.pool)
+            .await?;
+        let remaining: Vec<Uuid> = remaining.into_iter().map(|(u,)| u).collect();
+        assert!(
+            !remaining.contains(&old_exec),
+            "60d-old row must be swept (got {remaining:?})"
+        );
+        assert!(
+            remaining.contains(&new_exec),
+            "0d-old row must be kept (got {remaining:?})"
+        );
+
+        // S3: BOTH keys for the expired row deleted (the row's stored
+        // `s3_key` was the `.partial` one; the sweep also issues a
+        // delete for the final `.log.zst` it never wrote — S3
+        // DeleteObjects on a nonexistent key is a no-op, and not having
+        // to know which blobs exist is the point of always deleting
+        // both). Nothing for the recent row.
+        let dels: Vec<String> = deletes.lock().unwrap().clone();
+        let want_final = log_s3_key(&old_hash, &old_exec, false);
+        let want_partial = log_s3_key(&old_hash, &old_exec, true);
+        assert!(
+            dels.contains(&want_final),
+            "expected S3 delete of {want_final}, got {dels:?}"
+        );
+        assert!(
+            dels.contains(&want_partial),
+            "expected S3 delete of {want_partial}, got {dels:?}"
+        );
+        assert_eq!(
+            dels.len(),
+            2,
+            "no S3 deletes for the kept row, got {dels:?}"
+        );
+        Ok(())
+    }
+
+    /// Multi-batch backstop: more expired rows than `LOG_GC_BATCH` are
+    /// swept across multiple passes (the loop keeps going until the
+    /// DELETE returns 0 rows). Seeds `LOG_GC_BATCH + 1` rows — the
+    /// smallest count that forces a second pass.
+    #[tokio::test]
+    async fn gc_sweep_drains_more_than_one_batch() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, _puts, deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+        );
+
+        // LOG_GC_BATCH + 1 forces a second pass. Per-row INSERT round
+        // trips would be slow at 1001 rows, so use a single
+        // generate_series INSERT.
+        let n = LOG_GC_BATCH + 1;
+        sqlx::query(
+            "INSERT INTO drv_logs
+                 (exec_id, drv_hash, s3_key, first_line, line_count,
+                  total_bytes, is_complete, status, started_at)
+             SELECT
+                 gen_random_uuid(),
+                 lpad(i::text, 32, '0'),
+                 'logs/' || lpad(i::text, 32, '0') || '/x.log.zst',
+                 0, 1, 1, FALSE, NULL,
+                 now() - interval '60 days'
+             FROM generate_series(1, $1) AS i",
+        )
+        .bind(n)
+        .execute(&db.pool)
+        .await?;
+
+        flusher.sweep_expired_logs().await;
+
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM drv_logs")
+            .fetch_one(&db.pool)
+            .await?;
+        assert_eq!(count, 0, "all {n} expired rows swept across batches");
+        // 2 keys per row.
+        assert_eq!(
+            deletes.lock().unwrap().len() as i64,
+            n * 2,
+            "2 S3 keys per swept row"
+        );
         Ok(())
     }
 }

@@ -356,6 +356,12 @@ scheduler:
   # Build logs flush to S3 from the scheduler (log aggregation lives here,
   # not the store). Empty → logs stay in PG only.
   logS3Bucket: ""
+  # TTL for build logs (drv_logs rows + their .log.zst/.partial.log.zst
+  # S3 blobs). The LogFlusher GC tick (~1h cadence) deletes anything
+  # older. Default 30 days. Must be > 0 — the scheduler refuses to start
+  # on 0 (it would delete every log on every sweep). To effectively
+  # disable, set high (e.g. 3650).
+  logRetentionDays: 30
   # Scheduler-side substitute fan-out is DEFAULT_SUBSTITUTE_CONCURRENCY=256
   # (a memory-safety bound on detached tokio tasks, NOT a throughput knob).
   # Per-replica throttling lives in the store: r[store.substitute.admission].

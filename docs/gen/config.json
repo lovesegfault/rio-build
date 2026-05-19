@@ -1,775 +1,781 @@
 {
   "components": {
-    "gateway": [
-      {
-        "key": "listen_addr",
-        "type": "string",
-        "default": "[::]:2222",
-        "description": "SSH listen address and port."
-      },
-      {
-        "key": "scheduler.addr",
-        "type": "string",
-        "default": "",
-        "description": "ClusterIP Service `host:port`."
-      },
-      {
-        "key": "scheduler.balance_host",
-        "type": "string",
-        "default": "",
-        "description": "Headless Service hostname for health-aware p2c. `None` (env unset) → single-channel via `addr`. `Some` → DNS-resolve, probe `grpc.health.v1`, route to SERVING endpoints only."
-      },
-      {
-        "key": "scheduler.balance_port",
-        "type": "uint16",
-        "default": "9001",
-        "description": "gRPC port for balanced-channel pod-IP connects."
-      },
-      {
-        "key": "store.addr",
-        "type": "string",
-        "default": "",
-        "description": "ClusterIP Service `host:port`."
-      },
-      {
-        "key": "store.balance_host",
-        "type": "string",
-        "default": "",
-        "description": "Headless Service hostname for health-aware p2c. `None` (env unset) → single-channel via `addr`. `Some` → DNS-resolve, probe `grpc.health.v1`, route to SERVING endpoints only."
-      },
-      {
-        "key": "store.balance_port",
-        "type": "uint16",
-        "default": "9002",
-        "description": "gRPC port for balanced-channel pod-IP connects."
-      },
-      {
-        "key": "host_key",
-        "type": "string",
-        "default": "",
-        "description": "SSH host key file path."
-      },
-      {
-        "key": "authorized_keys",
-        "type": "string",
-        "default": "",
-        "description": "Authorized SSH public keys file path."
-      },
-      {
-        "key": "metrics_addr",
-        "type": "string",
-        "default": "[::]:9090",
-        "description": "Prometheus exporter listen address."
-      },
-      {
-        "key": "drain_grace_secs",
-        "type": "uint64",
-        "default": "6",
-        "description": "SIGTERM → NOT_SERVING → exit drain window."
-      },
-      {
-        "key": "health_addr",
-        "type": "string",
-        "default": "[::]:9190",
-        "description": "gRPC health check listen address."
-      },
-      {
-        "key": "jwt.required",
-        "type": "boolean",
-        "default": "false",
-        "description": "true = JWT mint/verify failure → reject. false (default) = fall back to SSH-comment tenant_name path."
-      },
-      {
-        "key": "jwt.key_path",
-        "type": "string",
-        "default": "",
-        "description": "Path to the ed25519 signing seed (gateway) or pubkey (scheduler/store)."
-      },
-      {
-        "key": "resolve_timeout_ms",
-        "type": "uint64",
-        "default": "500",
-        "description": "ResolveTenant RPC timeout in milliseconds (env: `RIO_RESOLVE_TIMEOUT_MS`)."
-      },
-      {
-        "key": "session_drain_secs",
-        "type": "uint64",
-        "default": "60",
-        "description": "Seconds to wait after the SSH accept loop stops for active sessions to close on their own."
-      },
-      {
-        "key": "rate_limit",
-        "type": "RateLimitConfig",
-        "default": "",
-        "description": "Per-tenant build-submit rate limiting. `None` (default) → disabled (unlimited)."
-      },
-      {
-        "key": "service_hmac_key_path",
-        "type": "string",
-        "default": "",
-        "description": "HMAC key file for minting `x-rio-service-token` on store `PutPath`."
-      },
-      {
-        "key": "max_connections",
-        "type": "uint",
-        "default": "1000",
-        "description": "Global SSH connection cap (`r[gw.conn.cap]`)."
-      },
-      {
-        "key": "max_transitive_inputs",
-        "type": "uint",
-        "default": "1048576",
-        "description": "DAG-reconstruction cap on transitive input derivations per build (DoS guard)."
-      }
-    ],
-    "scheduler": [
-      {
-        "key": "listen_addr",
-        "type": "string",
-        "default": "[::]:9001",
-        "description": "gRPC listen address for SchedulerService + ExecutorService."
-      },
-      {
-        "key": "store.addr",
-        "type": "string",
-        "default": "",
-        "description": "ClusterIP Service `host:port`."
-      },
-      {
-        "key": "store.balance_host",
-        "type": "string",
-        "default": "",
-        "description": "Headless Service hostname for health-aware p2c. `None` (env unset) → single-channel via `addr`. `Some` → DNS-resolve, probe `grpc.health.v1`, route to SERVING endpoints only."
-      },
-      {
-        "key": "store.balance_port",
-        "type": "uint16",
-        "default": "9002",
-        "description": "gRPC port for balanced-channel pod-IP connects."
-      },
-      {
-        "key": "database_url",
-        "type": "string",
-        "default": "",
-        "description": "PostgreSQL connection URL."
-      },
-      {
-        "key": "metrics_addr",
-        "type": "string",
-        "default": "[::]:9091",
-        "description": "Prometheus exporter listen address."
-      },
-      {
-        "key": "drain_grace_secs",
-        "type": "uint64",
-        "default": "6",
-        "description": "SIGTERM → NOT_SERVING → exit drain window."
-      },
-      {
-        "key": "tick_interval_secs",
-        "type": "uint64",
-        "default": "10",
-        "description": "Tick interval (seconds) for scheduler housekeeping."
-      },
-      {
-        "key": "log_s3_bucket",
-        "type": "string",
-        "default": "",
-        "description": "S3 bucket for build-log flush. `None` = flush disabled."
-      },
-      {
-        "key": "soft_features",
-        "type": "list<string>",
-        "default": "[]",
-        "description": "I-204: `requiredSystemFeatures` values that are capability HINTS, not hardware gates."
-      },
-      {
-        "key": "hmac_key_path",
-        "type": "string",
-        "default": "",
-        "description": "HMAC key file for signing assignment tokens."
-      },
-      {
-        "key": "service_hmac_key_path",
-        "type": "string",
-        "default": "",
-        "description": "HMAC key file for signing `x-rio-service-token` (SEPARATE from `hmac_key_path`)."
-      },
-      {
-        "key": "jwt.required",
-        "type": "boolean",
-        "default": "false",
-        "description": "true = JWT mint/verify failure → reject. false (default) = fall back to SSH-comment tenant_name path."
-      },
-      {
-        "key": "jwt.key_path",
-        "type": "string",
-        "default": "",
-        "description": "Path to the ed25519 signing seed (gateway) or pubkey (scheduler/store)."
-      },
-      {
-        "key": "lease_name",
-        "type": "string",
-        "default": "",
-        "description": "Kubernetes Lease name for leader election. `None` = non-K8s mode (single-scheduler; is_leader=true immediately, generation stays 1)."
-      },
-      {
-        "key": "lease_namespace",
-        "type": "string",
-        "default": "",
-        "description": "Kubernetes namespace for the Lease. `None` = read from the in-cluster serviceaccount mount, fall back to \"default\"."
-      },
-      {
-        "key": "poison.threshold",
-        "type": "uint32",
-        "default": "3",
-        "description": "Failures before poison."
-      },
-      {
-        "key": "poison.require_distinct_workers",
-        "type": "boolean",
-        "default": "true",
-        "description": "Whether failures must be on distinct workers."
-      },
-      {
-        "key": "retry.max_retries",
-        "type": "uint32",
-        "default": "2",
-        "description": "Maximum number of retries for transient failures."
-      },
-      {
-        "key": "retry.max_infra_retries",
-        "type": "uint32",
-        "default": "10",
-        "description": "Maximum number of retries for InfrastructureFailure."
-      },
-      {
-        "key": "retry.max_timeout_retries",
-        "type": "uint32",
-        "default": "4",
-        "description": "Maximum number of `TimedOut` re-dispatches before the derivation goes terminal (`Cancelled`)."
-      },
-      {
-        "key": "retry.infra_retry_window_secs",
-        "type": "double",
-        "default": "300.0",
-        "description": "Seconds since the LAST infra failure after which the `infra_retry_count` is reset to 0."
-      },
-      {
-        "key": "retry.max_exempt_infra_retries",
-        "type": "uint32",
-        "default": "50",
-        "description": "Maximum number of `exempt_from_cap` infra-retry attempts before the derivation is poisoned."
-      },
-      {
-        "key": "retry.backoff_base_secs",
-        "type": "double",
-        "default": "5.0",
-        "description": "Base backoff duration in seconds."
-      },
-      {
-        "key": "retry.backoff_multiplier",
-        "type": "double",
-        "default": "2.0",
-        "description": "Backoff multiplier."
-      },
-      {
-        "key": "retry.backoff_max_secs",
-        "type": "double",
-        "default": "300.0",
-        "description": "Maximum backoff duration in seconds."
-      },
-      {
-        "key": "retry.jitter_fraction",
-        "type": "double",
-        "default": "0.2",
-        "description": "Jitter fraction (0.0 to 1.0)."
-      },
-      {
-        "key": "substitute_max_concurrent",
-        "type": "uint",
-        "default": "256",
-        "description": "In-flight detached substitute-fetch task bound (r[sched.substitute.detached+2]) — memory-safety only; per-replica throttling is `r[store.substitute.admission]`."
-      },
-      {
-        "key": "dashboard.cors_allow_origins",
-        "type": "string",
-        "default": "http://rio-dashboard.rio-system.svc.cluster.local",
-        "description": "Comma-separated CORS allowed origins for gRPC-Web requests."
-      },
-      {
-        "key": "allow_reference_change",
-        "type": "boolean",
-        "default": "false",
-        "description": "Permit a `[sla].reference_hw_class` change vs the value persisted in `sla_config_epoch` (M_058)."
-      }
-    ],
-    "store": [
-      {
-        "key": "listen_addr",
-        "type": "string",
-        "default": "[::]:9002",
-        "description": "gRPC listen address."
-      },
-      {
-        "key": "database_url",
-        "type": "string",
-        "default": "",
-        "description": "PostgreSQL connection URL."
-      },
-      {
-        "key": "metrics_addr",
-        "type": "string",
-        "default": "[::]:9092",
-        "description": "Prometheus exporter listen address."
-      },
-      {
-        "key": "drain_grace_secs",
-        "type": "uint64",
-        "default": "6",
-        "description": "SIGTERM → NOT_SERVING → exit drain window."
-      },
-      {
-        "key": "chunk_backend",
-        "type": "ChunkBackendKind",
-        "default": "{\"kind\":\"inline\"}",
-        "description": "Where chunks live."
-      },
-      {
-        "key": "chunk_cache_capacity_bytes",
-        "type": "uint64",
-        "default": "2147483648",
-        "description": "moka LRU capacity for chunk reads, in bytes."
-      },
-      {
-        "key": "nar_buffer_budget_bytes",
-        "type": "integer",
-        "default": "",
-        "description": "Global NAR reassembly buffer budget in bytes — total permits across ALL concurrent PutPath handlers."
-      },
-      {
-        "key": "signing_key_path",
-        "type": "string",
-        "default": "",
-        "description": "ed25519 narinfo signing key path (Nix secret-key format: `name:base64-seed`)."
-      },
-      {
-        "key": "hmac_key_path",
-        "type": "string",
-        "default": "",
-        "description": "HMAC key file for verifying assignment tokens on PutPath."
-      },
-      {
-        "key": "jwt.required",
-        "type": "boolean",
-        "default": "false",
-        "description": "true = JWT mint/verify failure → reject. false (default) = fall back to SSH-comment tenant_name path."
-      },
-      {
-        "key": "jwt.key_path",
-        "type": "string",
-        "default": "",
-        "description": "Path to the ed25519 signing seed (gateway) or pubkey (scheduler/store)."
-      },
-      {
-        "key": "service_hmac_key_path",
-        "type": "string",
-        "default": "",
-        "description": "HMAC key file for verifying `x-rio-service-token` on PutPath."
-      },
-      {
-        "key": "service_bypass_callers",
-        "type": "list<string>",
-        "default": "[\"rio-gateway\",\"rio-scheduler\"]",
-        "description": "`ServiceClaims.caller` values whose `x-rio-service-token` is honoured (PutPath HMAC-bypass and `x-rio-probe-tenant-id` gate)."
-      },
-      {
-        "key": "chunk_upload_max_concurrent",
-        "type": "uint",
-        "default": "8",
-        "description": "Max concurrent S3 chunk uploads per `put_chunked` call."
-      },
-      {
-        "key": "s3_max_attempts",
-        "type": "uint32",
-        "default": "10",
-        "description": "Max aws-sdk retry attempts per S3 operation (PutObject, GetObject, HeadObject)."
-      },
-      {
-        "key": "max_batch_paths",
-        "type": "uint",
-        "default": "1048576",
-        "description": "Cap on paths in a FindMissingPaths request (DoS guard)."
-      },
-      {
-        "key": "chunk_prefetch_k",
-        "type": "uint",
-        "default": "64",
-        "description": "`GetPath` chunk-prefetch depth (`.buffered(K)`)."
-      },
-      {
-        "key": "stream_drain_secs",
-        "type": "uint64",
-        "default": "90",
-        "description": "Max time to wait for in-flight `GetPath` body streams to complete after the drain-grace sleep, before tearing down the listener on SIGTERM. `terminationGracePeriodSeconds` MUST cover `drain_grace + stream_drain` + slack, or kubelet SIGKILLs mid-wait."
-      },
-      {
-        "key": "pg_max_connections",
-        "type": "uint32",
-        "default": "50",
-        "description": "PG connection pool size."
-      },
-      {
-        "key": "substitute_admission_permits",
-        "type": "integer",
-        "default": "",
-        "description": "Per-replica cap on concurrent `try_substitute` calls."
-      }
-    ],
     "builder": [
       {
-        "key": "executor_id",
-        "type": "string",
-        "default": "",
-        "description": "If empty after merge → auto-detect via hostname."
-      },
-      {
-        "key": "executor_kind",
-        "type": "string",
-        "default": "builder",
-        "description": "Builder (airgapped, arbitrary derivation code) or fetcher (open egress, FOD-only)."
-      },
-      {
-        "key": "scheduler.addr",
-        "type": "string",
-        "default": "",
-        "description": "ClusterIP Service `host:port`."
-      },
-      {
-        "key": "scheduler.balance_host",
-        "type": "string",
-        "default": "",
-        "description": "Headless Service hostname for health-aware p2c. `None` (env unset) → single-channel via `addr`. `Some` → DNS-resolve, probe `grpc.health.v1`, route to SERVING endpoints only."
-      },
-      {
-        "key": "scheduler.balance_port",
-        "type": "uint16",
-        "default": "9001",
-        "description": "gRPC port for balanced-channel pod-IP connects."
-      },
-      {
-        "key": "store.addr",
-        "type": "string",
-        "default": "",
-        "description": "ClusterIP Service `host:port`."
-      },
-      {
-        "key": "store.balance_host",
-        "type": "string",
-        "default": "",
-        "description": "Headless Service hostname for health-aware p2c. `None` (env unset) → single-channel via `addr`. `Some` → DNS-resolve, probe `grpc.health.v1`, route to SERVING endpoints only."
-      },
-      {
-        "key": "store.balance_port",
-        "type": "uint16",
-        "default": "9002",
-        "description": "gRPC port for balanced-channel pod-IP connects."
-      },
-      {
-        "key": "systems",
-        "type": "list<string>",
-        "default": "[]",
-        "description": "Systems this builder can build for."
-      },
-      {
-        "key": "features",
-        "type": "list<string>",
-        "default": "[]",
-        "description": "requiredSystemFeatures this builder supports (e.g., \"kvm\", \"big-parallel\")."
-      },
-      {
-        "key": "fuse_mount_point",
-        "type": "string",
-        "default": "/var/rio/fuse-store",
-        "description": "FUSE mount point."
-      },
-      {
-        "key": "fuse_cache_dir",
-        "type": "string",
-        "default": "/var/rio/cache",
-        "description": "Local SSD cache directory for the FUSE cache."
-      },
-      {
-        "key": "fuse_threads",
-        "type": "uint32",
-        "default": "4",
-        "description": "Number of FUSE daemon threads."
-      },
-      {
-        "key": "fuse_passthrough",
-        "type": "boolean",
-        "default": "true",
-        "description": "Defaults to `true`."
-      },
-      {
-        "key": "fuse_fetch_timeout_secs",
-        "type": "uint64",
-        "default": "60",
-        "description": "Timeout (seconds) for FUSE-initiated `GetPath` fetches."
-      },
-      {
-        "key": "overlay_base_dir",
-        "type": "string",
-        "default": "/var/rio/overlays",
-        "description": "Base directory for per-build overlay upper/work layers."
-      },
-      {
-        "key": "metrics_addr",
-        "type": "string",
-        "default": "[::]:9093",
-        "description": "Prometheus exporter listen address."
-      },
-      {
-        "key": "drain_grace_secs",
-        "type": "uint64",
-        "default": "6",
-        "description": "SIGTERM → NOT_SERVING → exit drain window."
-      },
-      {
-        "key": "health_addr",
-        "type": "string",
-        "default": "[::]:9193",
-        "description": "HTTP /healthz + /readyz listen address."
-      },
-      {
-        "key": "log_rate_limit",
-        "type": "uint64",
-        "default": "250000",
-        "description": "Log rate limit (lines/s). 0 = unlimited."
-      },
-      {
-        "key": "log_size_limit",
-        "type": "uint64",
-        "default": "104857600",
-        "description": "Max total log bytes per build before `LogLimitExceeded`. (0 = unlimited)"
-      },
-      {
-        "key": "node_name",
-        "type": "string",
-        "default": "",
-        "description": "k8s `spec.nodeName` (downward API → `RIO_NODE_NAME`)."
-      },
-      {
-        "key": "hw_class",
-        "type": "string",
-        "default": "",
-        "description": "ADR-023 phase-10: `rio.build/hw-class` pod annotation (controller-stamped from the Node informer)."
-      },
-      {
-        "key": "hw_bench_needed",
-        "type": "boolean",
-        "default": "false",
-        "description": "ADR-023 §13a: `rio.build/hw-bench-needed` pod annotation (downward API → `RIO_HW_BENCH_NEEDED`)."
-      },
-      {
-        "key": "intent_id",
-        "type": "string",
-        "default": "",
-        "description": "ADR-023 SpawnIntent match key from the pod's `rio.build/intent-id` annotation (downward API → `RIO_INTENT_ID`)."
-      },
-      {
-        "key": "executor_token",
-        "type": "string",
-        "default": "",
-        "description": "HMAC-signed `ExecutorClaims{intent_id, kind, expiry}` from the controller's `RIO_EXECUTOR_TOKEN` env var (passed through from `SpawnIntent.executor_token`)."
-      },
-      {
-        "key": "daemon_timeout_secs",
-        "type": "uint64",
         "default": "7200",
-        "description": "Timeout (seconds) for the local nix-daemon subprocess build when the client didn't specify BuildOptions.build_timeout."
+        "description": "Timeout (seconds) for the local nix-daemon subprocess build when the client didn't specify BuildOptions.build_timeout.",
+        "key": "daemon_timeout_secs",
+        "type": "uint64"
       },
       {
-        "key": "max_silent_time_secs",
-        "type": "uint64",
-        "default": "0",
-        "description": "Silence timeout (seconds): kill the build if no output for N seconds. 0 = disabled."
+        "default": "6",
+        "description": "SIGTERM → NOT_SERVING → exit drain window.",
+        "key": "drain_grace_secs",
+        "type": "uint64"
       },
       {
-        "key": "idle_secs",
-        "type": "uint64",
+        "default": "",
+        "description": "If empty after merge → auto-detect via hostname.",
+        "key": "executor_id",
+        "type": "string"
+      },
+      {
+        "default": "builder",
+        "description": "Builder (airgapped, arbitrary derivation code) or fetcher (open egress, FOD-only).",
+        "key": "executor_kind",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "HMAC-signed `ExecutorClaims{intent_id, kind, expiry}` from the controller's `RIO_EXECUTOR_TOKEN` env var (passed through from `SpawnIntent.executor_token`).",
+        "key": "executor_token",
+        "type": "string"
+      },
+      {
+        "default": "[]",
+        "description": "requiredSystemFeatures this builder supports (e.g., \"kvm\", \"big-parallel\").",
+        "key": "features",
+        "type": "list<string>"
+      },
+      {
+        "default": "/var/rio/cache",
+        "description": "Local SSD cache directory for the FUSE cache.",
+        "key": "fuse_cache_dir",
+        "type": "string"
+      },
+      {
+        "default": "60",
+        "description": "Timeout (seconds) for FUSE-initiated `GetPath` fetches.",
+        "key": "fuse_fetch_timeout_secs",
+        "type": "uint64"
+      },
+      {
+        "default": "/var/rio/fuse-store",
+        "description": "FUSE mount point.",
+        "key": "fuse_mount_point",
+        "type": "string"
+      },
+      {
+        "default": "true",
+        "description": "Defaults to `true`.",
+        "key": "fuse_passthrough",
+        "type": "boolean"
+      },
+      {
+        "default": "4",
+        "description": "Number of FUSE daemon threads.",
+        "key": "fuse_threads",
+        "type": "uint32"
+      },
+      {
+        "default": "[::]:9193",
+        "description": "HTTP /healthz + /readyz listen address.",
+        "key": "health_addr",
+        "type": "string"
+      },
+      {
+        "default": "false",
+        "description": "ADR-023 §13a: `rio.build/hw-bench-needed` pod annotation (downward API → `RIO_HW_BENCH_NEEDED`).",
+        "key": "hw_bench_needed",
+        "type": "boolean"
+      },
+      {
+        "default": "",
+        "description": "ADR-023 phase-10: `rio.build/hw-class` pod annotation (controller-stamped from the Node informer).",
+        "key": "hw_class",
+        "type": "string"
+      },
+      {
         "default": "120",
-        "description": "I-116 idle timeout: exit if no assignment arrives for this long."
+        "description": "I-116 idle timeout: exit if no assignment arrives for this long.",
+        "key": "idle_secs",
+        "type": "uint64"
+      },
+      {
+        "default": "",
+        "description": "ADR-023 SpawnIntent match key from the pod's `rio.build/intent-id` annotation (downward API → `RIO_INTENT_ID`).",
+        "key": "intent_id",
+        "type": "string"
+      },
+      {
+        "default": "250000",
+        "description": "Log rate limit (lines/s). 0 = unlimited.",
+        "key": "log_rate_limit",
+        "type": "uint64"
+      },
+      {
+        "default": "104857600",
+        "description": "Max total log bytes per build before `LogLimitExceeded`. (0 = unlimited)",
+        "key": "log_size_limit",
+        "type": "uint64"
+      },
+      {
+        "default": "0",
+        "description": "Silence timeout (seconds): kill the build if no output for N seconds. 0 = disabled.",
+        "key": "max_silent_time_secs",
+        "type": "uint64"
+      },
+      {
+        "default": "[::]:9093",
+        "description": "Prometheus exporter listen address.",
+        "key": "metrics_addr",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "k8s `spec.nodeName` (downward API → `RIO_NODE_NAME`).",
+        "key": "node_name",
+        "type": "string"
+      },
+      {
+        "default": "/var/rio/overlays",
+        "description": "Base directory for per-build overlay upper/work layers.",
+        "key": "overlay_base_dir",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "ClusterIP Service `host:port`.",
+        "key": "scheduler.addr",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "Headless Service hostname for health-aware p2c. `None` (env unset) → single-channel via `addr`. `Some` → DNS-resolve, probe `grpc.health.v1`, route to SERVING endpoints only.",
+        "key": "scheduler.balance_host",
+        "type": "string"
+      },
+      {
+        "default": "9001",
+        "description": "gRPC port for balanced-channel pod-IP connects.",
+        "key": "scheduler.balance_port",
+        "type": "uint16"
+      },
+      {
+        "default": "",
+        "description": "ClusterIP Service `host:port`.",
+        "key": "store.addr",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "Headless Service hostname for health-aware p2c. `None` (env unset) → single-channel via `addr`. `Some` → DNS-resolve, probe `grpc.health.v1`, route to SERVING endpoints only.",
+        "key": "store.balance_host",
+        "type": "string"
+      },
+      {
+        "default": "9002",
+        "description": "gRPC port for balanced-channel pod-IP connects.",
+        "key": "store.balance_port",
+        "type": "uint16"
+      },
+      {
+        "default": "[]",
+        "description": "Systems this builder can build for.",
+        "key": "systems",
+        "type": "list<string>"
       }
     ],
     "controller": [
       {
-        "key": "scheduler.addr",
-        "type": "string",
-        "default": "",
-        "description": "ClusterIP Service `host:port`."
-      },
-      {
-        "key": "scheduler.balance_host",
-        "type": "string",
-        "default": "",
-        "description": "Headless Service hostname for health-aware p2c. `None` (env unset) → single-channel via `addr`. `Some` → DNS-resolve, probe `grpc.health.v1`, route to SERVING endpoints only."
-      },
-      {
-        "key": "scheduler.balance_port",
-        "type": "uint16",
-        "default": "9001",
-        "description": "gRPC port for balanced-channel pod-IP connects."
-      },
-      {
-        "key": "store.addr",
-        "type": "string",
-        "default": "",
-        "description": "ClusterIP Service `host:port`."
-      },
-      {
-        "key": "store.balance_host",
-        "type": "string",
-        "default": "",
-        "description": "Headless Service hostname for health-aware p2c. `None` (env unset) → single-channel via `addr`. `Some` → DNS-resolve, probe `grpc.health.v1`, route to SERVING endpoints only."
-      },
-      {
-        "key": "store.balance_port",
-        "type": "uint16",
-        "default": "9002",
-        "description": "gRPC port for balanced-channel pod-IP connects."
-      },
-      {
-        "key": "metrics_addr",
-        "type": "string",
-        "default": "[::]:9094",
-        "description": "Prometheus exporter listen address."
-      },
-      {
-        "key": "drain_grace_secs",
-        "type": "uint64",
         "default": "6",
-        "description": "SIGTERM → NOT_SERVING → exit drain window."
+        "description": "SIGTERM → NOT_SERVING → exit drain window.",
+        "key": "drain_grace_secs",
+        "type": "uint64"
       },
       {
-        "key": "health_addr",
-        "type": "string",
-        "default": "[::]:9194",
-        "description": "HTTP /healthz listen address."
-      },
-      {
-        "key": "gc_interval_hours",
-        "type": "uint64",
         "default": "24",
-        "description": "GC cron interval (hours). 0 = disabled (reconciler not spawned)."
+        "description": "GC cron interval (hours). 0 = disabled (reconciler not spawned).",
+        "key": "gc_interval_hours",
+        "type": "uint64"
       },
       {
-        "key": "nodeclaim_pool.database_url",
-        "type": "string",
-        "default": "",
-        "description": "PostgreSQL URL for [`CellSketches`] persist/load."
+        "default": "[::]:9194",
+        "description": "HTTP /healthz listen address.",
+        "key": "health_addr",
+        "type": "string"
       },
       {
-        "key": "nodeclaim_pool.lease_name",
-        "type": "string",
-        "default": "",
-        "description": "Lease object name for leader election. `None` → non-K8s mode (always-leader, see [`rio_lease::LeaseConfig::from_parts`])."
-      },
-      {
-        "key": "nodeclaim_pool.lease_namespace",
-        "type": "string",
-        "default": "",
-        "description": "Lease namespace. `None` → in-cluster service-account mount."
-      },
-      {
-        "key": "nodeclaim_pool.reference_hw_class",
-        "type": "string",
-        "default": "",
-        "description": "`[sla].referenceHwClass` — the cold-start fallback cell for hw-agnostic intents (`fit=None` → `hw_class_names=[]`)."
-      },
-      {
-        "key": "nodeclaim_pool.max_fleet_cores",
-        "type": "uint32",
-        "default": "10000",
-        "description": "§13b deficit-cover budget cap (sum of `allocatable.cpu` across all owned NodeClaims, Registered + in-flight)."
-      },
-      {
-        "key": "nodeclaim_pool.max_node_claims_per_cell_per_tick",
-        "type": "uint32",
-        "default": "8",
-        "description": "§13b per-cell-per-tick NodeClaim create cap."
-      },
-      {
-        "key": "nodeclaim_pool.max_lead_time",
-        "type": "double",
-        "default": "600.0",
-        "description": "§13b lead-time Schmitt clamp ceiling (seconds)."
-      },
-      {
-        "key": "nodeclaim_pool.max_consolidation_time",
-        "type": "number",
-        "default": "",
-        "description": "§13b consolidator hold-open threshold (seconds) for `rio.build/hold-open`-annotated NodeClaims. `None` = 2×`consolidate_after()` per ADR."
-      },
-      {
-        "key": "nodeclaim_pool.min_consolidation_time",
-        "type": "object",
-        "default": "{\"*\":300.0,\"fetcher-*\":600.0}",
-        "description": "r35 bug_050: per-hw-class-prefix `consolidate_after` floor (seconds). §13e routed Fetcher Pools through `nodeclaim_pool`, silently dropping Karpenter's `consolidateAfter: 10m` to the NA-model floor `boot_median/2` (~15s) — a fetcher node burns a boot every 15s of lull instead of holding 10min."
-      },
-      {
-        "key": "nodeclaim_pool.lead_time_seed",
-        "type": "object",
-        "default": "",
-        "description": "`(hw_class:cap)` → seed lead-time seconds, written by `xtask k8s probe-boot`."
-      },
-      {
-        "key": "nodeclaim_pool.default_lead_time_seed",
-        "type": "double",
-        "default": "30.0",
-        "description": "Seed lead-time (seconds) for cells absent from [`Self::lead_time_seed`]."
-      },
-      {
-        "key": "nodeclaim_pool.sketch_halflife_secs",
-        "type": "uint64",
-        "default": "21600",
-        "description": "Quantile-sketch active→shadow rotation interval (seconds)."
-      },
-      {
-        "key": "nodeclaim_pool.max_node_disk",
-        "type": "uint64",
-        "default": "483183820800",
-        "description": "Per-NodeClaim `resources.requests.ephemeral-storage` ceiling."
-      },
-      {
-        "key": "nodeclaim_pool.metal_sizes",
-        "type": "list<string>",
-        "default": "[]",
-        "description": "`karpenter.k8s.aws/instance-size NotIn` values appended to every NodeClaim's `spec.requirements` — the metal partition (I-205)."
-      },
-      {
-        "key": "nodeclaim_pool.fuse_cache_bytes",
-        "type": "uint64",
         "default": "8589934592",
-        "description": "FUSE-cache budget added to every builder pod's `ephemeral-storage` request (the `fuse-cache` emptyDir)."
-      },
-      {
-        "key": "nodeclaim_pool.kube_build_scheduler_enabled",
-        "type": "boolean",
-        "default": "true",
-        "description": "`true` ⟺ the `kube-build-scheduler` Deployment is rendered (`buildScheduler.enabled`). r40 bug_018: builder pods get `schedulerName=kube-build-scheduler` only when BOTH the NodeClaim CRD is present (Karpenter installed) AND this flag is set — otherwise the pod targets a scheduler that doesn't exist and the default kube-scheduler ignores it (permanent Pending, zero alerts: the `KubeBuildScheduler*` alerts are gated off by the same `buildScheduler.enabled` toggle)."
-      },
-      {
-        "key": "service_hmac_key_path",
-        "type": "string",
-        "default": "",
-        "description": "HMAC key for minting `x-rio-service-token` on AdminService calls."
-      },
-      {
+        "description": "ADR-023 §13a: pod `requests.memory` floor for the `rio.build/hw-bench-needed` gate (STREAM triad working-set safety).",
         "key": "hw_bench_mem_floor",
-        "type": "uint64",
+        "type": "uint64"
+      },
+      {
+        "default": "[::]:9094",
+        "description": "Prometheus exporter listen address.",
+        "key": "metrics_addr",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "PostgreSQL URL for [`CellSketches`] persist/load.",
+        "key": "nodeclaim_pool.database_url",
+        "type": "string"
+      },
+      {
+        "default": "30.0",
+        "description": "Seed lead-time (seconds) for cells absent from [`Self::lead_time_seed`].",
+        "key": "nodeclaim_pool.default_lead_time_seed",
+        "type": "double"
+      },
+      {
         "default": "8589934592",
-        "description": "ADR-023 §13a: pod `requests.memory` floor for the `rio.build/hw-bench-needed` gate (STREAM triad working-set safety)."
+        "description": "FUSE-cache budget added to every builder pod's `ephemeral-storage` request (the `fuse-cache` emptyDir).",
+        "key": "nodeclaim_pool.fuse_cache_bytes",
+        "type": "uint64"
+      },
+      {
+        "default": "true",
+        "description": "`true` ⟺ the `kube-build-scheduler` Deployment is rendered (`buildScheduler.enabled`). r40 bug_018: builder pods get `schedulerName=kube-build-scheduler` only when BOTH the NodeClaim CRD is present (Karpenter installed) AND this flag is set — otherwise the pod targets a scheduler that doesn't exist and the default kube-scheduler ignores it (permanent Pending, zero alerts: the `KubeBuildScheduler*` alerts are gated off by the same `buildScheduler.enabled` toggle).",
+        "key": "nodeclaim_pool.kube_build_scheduler_enabled",
+        "type": "boolean"
+      },
+      {
+        "default": "",
+        "description": "`(hw_class:cap)` → seed lead-time seconds, written by `xtask k8s probe-boot`.",
+        "key": "nodeclaim_pool.lead_time_seed",
+        "type": "object"
+      },
+      {
+        "default": "",
+        "description": "Lease object name for leader election. `None` → non-K8s mode (always-leader, see [`rio_lease::LeaseConfig::from_parts`]).",
+        "key": "nodeclaim_pool.lease_name",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "Lease namespace. `None` → in-cluster service-account mount.",
+        "key": "nodeclaim_pool.lease_namespace",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "§13b consolidator hold-open threshold (seconds) for `rio.build/hold-open`-annotated NodeClaims. `None` = 2×`consolidate_after()` per ADR.",
+        "key": "nodeclaim_pool.max_consolidation_time",
+        "type": "number"
+      },
+      {
+        "default": "10000",
+        "description": "§13b deficit-cover budget cap (sum of `allocatable.cpu` across all owned NodeClaims, Registered + in-flight).",
+        "key": "nodeclaim_pool.max_fleet_cores",
+        "type": "uint32"
+      },
+      {
+        "default": "600.0",
+        "description": "§13b lead-time Schmitt clamp ceiling (seconds).",
+        "key": "nodeclaim_pool.max_lead_time",
+        "type": "double"
+      },
+      {
+        "default": "8",
+        "description": "§13b per-cell-per-tick NodeClaim create cap.",
+        "key": "nodeclaim_pool.max_node_claims_per_cell_per_tick",
+        "type": "uint32"
+      },
+      {
+        "default": "483183820800",
+        "description": "Per-NodeClaim `resources.requests.ephemeral-storage` ceiling.",
+        "key": "nodeclaim_pool.max_node_disk",
+        "type": "uint64"
+      },
+      {
+        "default": "[]",
+        "description": "`karpenter.k8s.aws/instance-size NotIn` values appended to every NodeClaim's `spec.requirements` — the metal partition (I-205).",
+        "key": "nodeclaim_pool.metal_sizes",
+        "type": "list<string>"
+      },
+      {
+        "default": "{\"*\":300.0,\"fetcher-*\":600.0}",
+        "description": "r35 bug_050: per-hw-class-prefix `consolidate_after` floor (seconds). §13e routed Fetcher Pools through `nodeclaim_pool`, silently dropping Karpenter's `consolidateAfter: 10m` to the NA-model floor `boot_median/2` (~15s) — a fetcher node burns a boot every 15s of lull instead of holding 10min.",
+        "key": "nodeclaim_pool.min_consolidation_time",
+        "type": "object"
+      },
+      {
+        "default": "",
+        "description": "`[sla].referenceHwClass` — the cold-start fallback cell for hw-agnostic intents (`fit=None` → `hw_class_names=[]`).",
+        "key": "nodeclaim_pool.reference_hw_class",
+        "type": "string"
+      },
+      {
+        "default": "21600",
+        "description": "DDSketch active→shadow rotation interval (seconds).",
+        "key": "nodeclaim_pool.sketch_halflife_secs",
+        "type": "uint64"
+      },
+      {
+        "default": "",
+        "description": "ClusterIP Service `host:port`.",
+        "key": "scheduler.addr",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "Headless Service hostname for health-aware p2c. `None` (env unset) → single-channel via `addr`. `Some` → DNS-resolve, probe `grpc.health.v1`, route to SERVING endpoints only.",
+        "key": "scheduler.balance_host",
+        "type": "string"
+      },
+      {
+        "default": "9001",
+        "description": "gRPC port for balanced-channel pod-IP connects.",
+        "key": "scheduler.balance_port",
+        "type": "uint16"
+      },
+      {
+        "default": "",
+        "description": "HMAC key for minting `x-rio-service-token` on AdminService calls.",
+        "key": "service_hmac_key_path",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "ClusterIP Service `host:port`.",
+        "key": "store.addr",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "Headless Service hostname for health-aware p2c. `None` (env unset) → single-channel via `addr`. `Some` → DNS-resolve, probe `grpc.health.v1`, route to SERVING endpoints only.",
+        "key": "store.balance_host",
+        "type": "string"
+      },
+      {
+        "default": "9002",
+        "description": "gRPC port for balanced-channel pod-IP connects.",
+        "key": "store.balance_port",
+        "type": "uint16"
+      }
+    ],
+    "gateway": [
+      {
+        "default": "",
+        "description": "Authorized SSH public keys file path.",
+        "key": "authorized_keys",
+        "type": "string"
+      },
+      {
+        "default": "6",
+        "description": "SIGTERM → NOT_SERVING → exit drain window.",
+        "key": "drain_grace_secs",
+        "type": "uint64"
+      },
+      {
+        "default": "[::]:9190",
+        "description": "gRPC health check listen address.",
+        "key": "health_addr",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "SSH host key file path.",
+        "key": "host_key",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "Path to the ed25519 signing seed (gateway) or pubkey (scheduler/store).",
+        "key": "jwt.key_path",
+        "type": "string"
+      },
+      {
+        "default": "false",
+        "description": "true = JWT mint/verify failure → reject. false (default) = fall back to SSH-comment tenant_name path.",
+        "key": "jwt.required",
+        "type": "boolean"
+      },
+      {
+        "default": "[::]:2222",
+        "description": "SSH listen address and port.",
+        "key": "listen_addr",
+        "type": "string"
+      },
+      {
+        "default": "1000",
+        "description": "Global SSH connection cap (`r[gw.conn.cap]`).",
+        "key": "max_connections",
+        "type": "uint"
+      },
+      {
+        "default": "1048576",
+        "description": "DAG-reconstruction cap on transitive input derivations per build (DoS guard).",
+        "key": "max_transitive_inputs",
+        "type": "uint"
+      },
+      {
+        "default": "[::]:9090",
+        "description": "Prometheus exporter listen address.",
+        "key": "metrics_addr",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "Per-tenant build-submit rate limiting. `None` (default) → disabled (unlimited).",
+        "key": "rate_limit",
+        "type": "RateLimitConfig"
+      },
+      {
+        "default": "500",
+        "description": "ResolveTenant RPC timeout in milliseconds (env: `RIO_RESOLVE_TIMEOUT_MS`).",
+        "key": "resolve_timeout_ms",
+        "type": "uint64"
+      },
+      {
+        "default": "",
+        "description": "ClusterIP Service `host:port`.",
+        "key": "scheduler.addr",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "Headless Service hostname for health-aware p2c. `None` (env unset) → single-channel via `addr`. `Some` → DNS-resolve, probe `grpc.health.v1`, route to SERVING endpoints only.",
+        "key": "scheduler.balance_host",
+        "type": "string"
+      },
+      {
+        "default": "9001",
+        "description": "gRPC port for balanced-channel pod-IP connects.",
+        "key": "scheduler.balance_port",
+        "type": "uint16"
+      },
+      {
+        "default": "",
+        "description": "HMAC key file for minting `x-rio-service-token` on store `PutPath`.",
+        "key": "service_hmac_key_path",
+        "type": "string"
+      },
+      {
+        "default": "60",
+        "description": "Seconds to wait after the SSH accept loop stops for active sessions to close on their own.",
+        "key": "session_drain_secs",
+        "type": "uint64"
+      },
+      {
+        "default": "",
+        "description": "ClusterIP Service `host:port`.",
+        "key": "store.addr",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "Headless Service hostname for health-aware p2c. `None` (env unset) → single-channel via `addr`. `Some` → DNS-resolve, probe `grpc.health.v1`, route to SERVING endpoints only.",
+        "key": "store.balance_host",
+        "type": "string"
+      },
+      {
+        "default": "9002",
+        "description": "gRPC port for balanced-channel pod-IP connects.",
+        "key": "store.balance_port",
+        "type": "uint16"
+      }
+    ],
+    "scheduler": [
+      {
+        "default": "false",
+        "description": "Permit a `[sla].reference_hw_class` change vs the value persisted in `sla_config_epoch` (M_058).",
+        "key": "allow_reference_change",
+        "type": "boolean"
+      },
+      {
+        "default": "http://rio-dashboard.rio-system.svc.cluster.local",
+        "description": "Comma-separated CORS allowed origins for gRPC-Web requests.",
+        "key": "dashboard.cors_allow_origins",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "PostgreSQL connection URL.",
+        "key": "database_url",
+        "type": "string"
+      },
+      {
+        "default": "6",
+        "description": "SIGTERM → NOT_SERVING → exit drain window.",
+        "key": "drain_grace_secs",
+        "type": "uint64"
+      },
+      {
+        "default": "",
+        "description": "HMAC key file for signing assignment tokens.",
+        "key": "hmac_key_path",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "Path to the ed25519 signing seed (gateway) or pubkey (scheduler/store).",
+        "key": "jwt.key_path",
+        "type": "string"
+      },
+      {
+        "default": "false",
+        "description": "true = JWT mint/verify failure → reject. false (default) = fall back to SSH-comment tenant_name path.",
+        "key": "jwt.required",
+        "type": "boolean"
+      },
+      {
+        "default": "",
+        "description": "Kubernetes Lease name for leader election. `None` = non-K8s mode (single-scheduler; is_leader=true immediately, generation stays 1).",
+        "key": "lease_name",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "Kubernetes namespace for the Lease. `None` = read from the in-cluster serviceaccount mount, fall back to \"default\".",
+        "key": "lease_namespace",
+        "type": "string"
+      },
+      {
+        "default": "[::]:9001",
+        "description": "gRPC listen address for SchedulerService + ExecutorService.",
+        "key": "listen_addr",
+        "type": "string"
+      },
+      {
+        "default": "30",
+        "description": "Build log retention in days.",
+        "key": "log_retention_days",
+        "type": "uint32"
+      },
+      {
+        "default": "",
+        "description": "S3 bucket for build-log flush. `None` = flush disabled.",
+        "key": "log_s3_bucket",
+        "type": "string"
+      },
+      {
+        "default": "[::]:9091",
+        "description": "Prometheus exporter listen address.",
+        "key": "metrics_addr",
+        "type": "string"
+      },
+      {
+        "default": "true",
+        "description": "Whether failures must be on distinct workers.",
+        "key": "poison.require_distinct_workers",
+        "type": "boolean"
+      },
+      {
+        "default": "3",
+        "description": "Failures before poison.",
+        "key": "poison.threshold",
+        "type": "uint32"
+      },
+      {
+        "default": "5.0",
+        "description": "Base backoff duration in seconds.",
+        "key": "retry.backoff_base_secs",
+        "type": "double"
+      },
+      {
+        "default": "300.0",
+        "description": "Maximum backoff duration in seconds.",
+        "key": "retry.backoff_max_secs",
+        "type": "double"
+      },
+      {
+        "default": "2.0",
+        "description": "Backoff multiplier.",
+        "key": "retry.backoff_multiplier",
+        "type": "double"
+      },
+      {
+        "default": "300.0",
+        "description": "Seconds since the LAST infra failure after which the `infra_retry_count` is reset to 0.",
+        "key": "retry.infra_retry_window_secs",
+        "type": "double"
+      },
+      {
+        "default": "0.2",
+        "description": "Jitter fraction (0.0 to 1.0).",
+        "key": "retry.jitter_fraction",
+        "type": "double"
+      },
+      {
+        "default": "50",
+        "description": "Maximum number of `exempt_from_cap` infra-retry attempts before the derivation is poisoned.",
+        "key": "retry.max_exempt_infra_retries",
+        "type": "uint32"
+      },
+      {
+        "default": "10",
+        "description": "Maximum number of retries for InfrastructureFailure.",
+        "key": "retry.max_infra_retries",
+        "type": "uint32"
+      },
+      {
+        "default": "2",
+        "description": "Maximum number of retries for transient failures.",
+        "key": "retry.max_retries",
+        "type": "uint32"
+      },
+      {
+        "default": "4",
+        "description": "Maximum number of `TimedOut` re-dispatches before the derivation goes terminal (`Cancelled`).",
+        "key": "retry.max_timeout_retries",
+        "type": "uint32"
+      },
+      {
+        "default": "",
+        "description": "HMAC key file for signing `x-rio-service-token` (SEPARATE from `hmac_key_path`).",
+        "key": "service_hmac_key_path",
+        "type": "string"
+      },
+      {
+        "default": "[]",
+        "description": "I-204: `requiredSystemFeatures` values that are capability HINTS, not hardware gates.",
+        "key": "soft_features",
+        "type": "list<string>"
+      },
+      {
+        "default": "",
+        "description": "ClusterIP Service `host:port`.",
+        "key": "store.addr",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "Headless Service hostname for health-aware p2c. `None` (env unset) → single-channel via `addr`. `Some` → DNS-resolve, probe `grpc.health.v1`, route to SERVING endpoints only.",
+        "key": "store.balance_host",
+        "type": "string"
+      },
+      {
+        "default": "9002",
+        "description": "gRPC port for balanced-channel pod-IP connects.",
+        "key": "store.balance_port",
+        "type": "uint16"
+      },
+      {
+        "default": "256",
+        "description": "In-flight detached substitute-fetch task bound (r[sched.substitute.detached+2]) — memory-safety only; per-replica throttling is `r[store.substitute.admission]`.",
+        "key": "substitute_max_concurrent",
+        "type": "uint"
+      },
+      {
+        "default": "10",
+        "description": "Tick interval (seconds) for scheduler housekeeping.",
+        "key": "tick_interval_secs",
+        "type": "uint64"
+      }
+    ],
+    "store": [
+      {
+        "default": "{\"kind\":\"inline\"}",
+        "description": "Where chunks live.",
+        "key": "chunk_backend",
+        "type": "ChunkBackendKind"
+      },
+      {
+        "default": "2147483648",
+        "description": "moka LRU capacity for chunk reads, in bytes.",
+        "key": "chunk_cache_capacity_bytes",
+        "type": "uint64"
+      },
+      {
+        "default": "64",
+        "description": "`GetPath` chunk-prefetch depth (`.buffered(K)`).",
+        "key": "chunk_prefetch_k",
+        "type": "uint"
+      },
+      {
+        "default": "8",
+        "description": "Max concurrent S3 chunk uploads per `put_chunked` call.",
+        "key": "chunk_upload_max_concurrent",
+        "type": "uint"
+      },
+      {
+        "default": "",
+        "description": "PostgreSQL connection URL.",
+        "key": "database_url",
+        "type": "string"
+      },
+      {
+        "default": "6",
+        "description": "SIGTERM → NOT_SERVING → exit drain window.",
+        "key": "drain_grace_secs",
+        "type": "uint64"
+      },
+      {
+        "default": "",
+        "description": "HMAC key file for verifying assignment tokens on PutPath.",
+        "key": "hmac_key_path",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "Path to the ed25519 signing seed (gateway) or pubkey (scheduler/store).",
+        "key": "jwt.key_path",
+        "type": "string"
+      },
+      {
+        "default": "false",
+        "description": "true = JWT mint/verify failure → reject. false (default) = fall back to SSH-comment tenant_name path.",
+        "key": "jwt.required",
+        "type": "boolean"
+      },
+      {
+        "default": "[::]:9002",
+        "description": "gRPC listen address.",
+        "key": "listen_addr",
+        "type": "string"
+      },
+      {
+        "default": "1048576",
+        "description": "Cap on paths in a FindMissingPaths request (DoS guard).",
+        "key": "max_batch_paths",
+        "type": "uint"
+      },
+      {
+        "default": "[::]:9092",
+        "description": "Prometheus exporter listen address.",
+        "key": "metrics_addr",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "Global NAR reassembly buffer budget in bytes — total permits across ALL concurrent PutPath handlers.",
+        "key": "nar_buffer_budget_bytes",
+        "type": "integer"
+      },
+      {
+        "default": "50",
+        "description": "PG connection pool size.",
+        "key": "pg_max_connections",
+        "type": "uint32"
+      },
+      {
+        "default": "10",
+        "description": "Max aws-sdk retry attempts per S3 operation (PutObject, GetObject, HeadObject).",
+        "key": "s3_max_attempts",
+        "type": "uint32"
+      },
+      {
+        "default": "[\"rio-gateway\",\"rio-scheduler\"]",
+        "description": "`ServiceClaims.caller` values whose `x-rio-service-token` is honoured (PutPath HMAC-bypass and `x-rio-probe-tenant-id` gate).",
+        "key": "service_bypass_callers",
+        "type": "list<string>"
+      },
+      {
+        "default": "",
+        "description": "HMAC key file for verifying `x-rio-service-token` on PutPath.",
+        "key": "service_hmac_key_path",
+        "type": "string"
+      },
+      {
+        "default": "",
+        "description": "ed25519 narinfo signing key path (Nix secret-key format: `name:base64-seed`).",
+        "key": "signing_key_path",
+        "type": "string"
+      },
+      {
+        "default": "90",
+        "description": "Max time to wait for in-flight `GetPath` body streams to complete after the drain-grace sleep, before tearing down the listener on SIGTERM. `terminationGracePeriodSeconds` MUST cover `drain_grace + stream_drain` + slack, or kubelet SIGKILLs mid-wait.",
+        "key": "stream_drain_secs",
+        "type": "uint64"
+      },
+      {
+        "default": "",
+        "description": "Per-replica cap on concurrent `try_substitute` calls.",
+        "key": "substitute_admission_permits",
+        "type": "integer"
       }
     ]
   }
