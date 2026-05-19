@@ -66,12 +66,18 @@
   # so editing target-file CONTENT doesn't invalidate cargoMetadataJson.
   # Empty string when nextestRunSrc already has full src/ (backward-compat).
   stubTargetFiles ? "",
-  # Per-member full source (memberFilesets from flake.nix, each rooted
-  # at the member dir). Overlaid onto $ws/<member>/ by mkNextestRun so
-  # tests that scan their own src/ at runtime (rio-test-support::
-  # metrics::grep_emitted_names) see real content. Only the TARGET
-  # member's src is overlaid — other members stay manifests-only.
-  memberSrcs ? { },
+  # Per-member full source incl. tests/ (the WIDE memberFilesets from
+  # flake.nix, each rooted at the member dir — distinct from the
+  # bin-only memberSrcs that feeds crate2nix). Overlaid onto
+  # $ws/<member>/ by mkNextestRun so tests that scan their own src/ at
+  # runtime (rio-test-support::metrics::grep_emitted_names) see real
+  # content. Only the TARGET member's src is overlaid — other members
+  # stay manifests-only.
+  memberRuntimeSrcs ? { },
+  # Drop workspace-hack from the per-member maps. flake.nix defines
+  # the filter once and threads it here so checks.nix and the lcov
+  # extract-pattern derivation share one definition.
+  noHack,
   # Extra args appended to `cargo-nextest run`. Callers typically
   # pass `--profile ci --no-tests=warn`.
   nextestExtraArgs ? [ ],
@@ -339,7 +345,7 @@ let
     )).overrideAttrs
       (old: {
         name = "${old.name}-${suffix}";
-        src = memberSrcs.${name} or old.src;
+        src = memberRuntimeSrcs.${name} or old.src;
       });
 
   testMember = mkTestVariant {
@@ -783,9 +789,9 @@ let
             # nextest-rio-scheduler.
             ''
               cp -r --no-preserve=mode ${nextestRunSrc} $ws
-              ${lib.optionalString (memberSrcs ? ${member}) ''
+              ${lib.optionalString (memberRuntimeSrcs ? ${member}) ''
                 rm -rf $ws/${member}
-                cp -r --no-preserve=mode ${memberSrcs.${member}} $ws/${member}
+                cp -r --no-preserve=mode ${memberRuntimeSrcs.${member}} $ws/${member}
               ''}
             ''
         }
@@ -943,10 +949,6 @@ let
         ${pkgs.lcov}/bin/lcov --summary $out/lcov.info
       '';
 
-  # workspace-hack is the crate2nix-stubbed empty crate (nix/crate2nix.nix
-  # zeroes its deps). Clippy/doc/nextest on a 1-line stub is a no-op;
-  # filter it from the per-member maps that populate checks.*.
-  noHack = lib.filterAttrs (n: _: n != "workspace-hack");
 in
 {
   # Per-member check derivations. Exposed in checks.* for granular
