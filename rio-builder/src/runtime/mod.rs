@@ -1543,8 +1543,8 @@ mod tests {
     ///
     /// Not testing SIGTERM-to-self: signal delivery under cargo test
     /// is nondeterministic, and nextest's per-process model means a
-    /// stray SIGTERM kills the test binary. vm-phase3a does real
-    /// SIGTERM via `k3s kubectl delete pod`.
+    /// stray SIGTERM kills the test binary. The k3s VM scenarios do
+    /// real SIGTERM via `k3s kubectl delete pod`.
     #[tokio::test]
     async fn drain_wait_slot_synchronization() {
         let slot = Arc::new(BuildSlot::default());
@@ -2219,7 +2219,7 @@ mod tests {
         // once pseudo-file in a real cgroup2fs; in tmpfs it's just
         // a regular file that gets the "1" written. Good enough
         // for testing the plumbing (real cgroup behavior is
-        // VM-tested in vm-phase3b).
+        // covered by the VM scenario tests).
         let tmpdir = tempfile::tempdir().unwrap();
         let cgroup_path = tmpdir.path().to_path_buf();
 

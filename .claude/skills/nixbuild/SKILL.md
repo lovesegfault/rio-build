@@ -21,7 +21,7 @@ rc=$(jq -r .rc <<<"$report")
 [[ $rc -eq 0 ]] || jq -r .log_tail <<<"$report"
 ```
 
-`--checks` mode wraps `nix-fast-build --flake .#checks.<system>` (stream-evaluates ~110 granular checks via nix-eval-jobs). `store_path` is empty in this mode — there is no single aggregate output.
+`--checks` mode wraps `nix-fast-build --flake .#checks.<system>` (stream-evaluates the full granular check matrix — per-member clippy/doc/nextest, fuzz, VM tests, misc policy — via nix-eval-jobs). `store_path` is empty in this mode — there is no single aggregate output.
 
 ## Output
 

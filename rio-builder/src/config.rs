@@ -367,7 +367,7 @@ mod tests {
     /// Regression guard against silent default drift. CRITICAL case:
     /// `fuse_passthrough` defaults to `true` — NOT the serde bool default.
     /// A drift to `false` adds a userspace copy per FUSE read (~2× per-build
-    /// latency) and would only show up as a vm-phase2a timing regression,
+    /// latency) and would only show up as a VM-test timing regression,
     /// not a hard failure.
     #[test]
     fn config_defaults_are_stable() {

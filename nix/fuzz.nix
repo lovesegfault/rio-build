@@ -5,9 +5,9 @@
 # libfuzzer-sys + `-Zsanitizer`. They depend on in-tree crates by path.
 #
 # Two fuzz workspaces:
-#   fuzz/rio-nix    — protocol/wire parsers (~450 sancov crates)
-#   fuzz/rio-store  — manifest parser (~590 sancov crates; pulls
-#                     rio-store's full dep tree)
+#   fuzz/rio-nix    — protocol/wire parsers
+#   fuzz/rio-store  — manifest parser (pulls rio-store's full dep
+#                     tree, so its sancov closure is much larger)
 #
 # Build: per-crate via crate2nix (third + fourth instantiations
 # alongside the main + coverage trees). Same `globalExtraRustcOpts`
@@ -18,7 +18,8 @@
 # The sancov-instrumented rlibs CAN'T share with the release tree
 # (different codegen), but they cache per-crate within their own tree:
 # editing rio-nix/src rebuilds rio-nix-sancov + the rio-nix-fuzz
-# member (one drv → 9 bins), not the ~450 transitive deps.
+# member (one drv, all its [[bin]] targets), not the hundreds of
+# transitive sancov deps.
 {
   pkgs,
   lib,
@@ -175,7 +176,8 @@ let
       # -fork=N spawns N libFuzzer workers that share corpus. Cap at
       # 16: wall time is fixed (-max_total_time), so more workers =
       # more inputs covered but also more CPU stolen from the rest of
-      # the checks gate (10 targets × 192 cores = 1920 procs on the
+      # the checks gate (one fork pool per fuzz target, all running
+      # concurrently — uncapped that's targets × cores procs on the
       # big box).
       # Workers write to fuzz-*.log; dump those on failure so crash
       # stacks land in the Nix build log.

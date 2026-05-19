@@ -53,7 +53,7 @@ cd fuzz/rio-nix && cargo fuzz run wire_primitives
 | Command | What it does |
 |---|---|
 | `nix build` | Build the workspace (release profile with thin LTO) |
-| `nix-fast-build --flake .#checks.x86_64-linux` | Full CI gate: per-member clippy/doc/nextest, pre-commit, 2min fuzz ×9, all VM tests, cov-smoke (Linux+KVM only). Streams eval→build. |
+| `nix-fast-build --flake .#checks.x86_64-linux` | Full CI gate: per-member clippy/doc/nextest, pre-commit, 2min fuzz per target, all VM tests, cov-smoke (Linux+KVM only). Streams eval→build. |
 | `nix flake check` | Runs all `checks.*` (same set as nix-fast-build, but serial eval) |
 | `nix develop .#stable` | Dev shell with stable Rust (CI parity) |
 | `nix build .#checks.x86_64-linux.tracey-validate` | Spec-coverage validation (r[...] annotation integrity) |

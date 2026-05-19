@@ -1,9 +1,11 @@
 //! ChunkService gRPC implementation.
 //!
 //! Chunking is server-side only: PutPath drives `cas::put_chunked`
-//! (FastCDC + dedup via the `refcount==1` RETURNING clause). The only
-//! chunk-level RPC is `GetChunk`, which the builder fans out to
-//! reassemble NARs from their manifests.
+//! (FastCDC + dedup via the `refcount==1` RETURNING clause), and
+//! GetPath streams whole NARs back. The only chunk-level RPC is
+//! `GetChunk`; it has no production caller today and is exercised
+//! only by tests, as the chunk-level retrieval surface for future
+//! out-of-process reassembly.
 //!
 //! GetChunk is unscoped: knowing a BLAKE3 hash already proves you have
 //! (or had) the bytes.

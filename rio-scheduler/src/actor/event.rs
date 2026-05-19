@@ -363,12 +363,13 @@ impl DagActor {
             );
         }
         // Metric: proves worker → scheduler → actor pipeline works.
-        // vm-phase2b asserts this > 0. The gateway → client leg
-        // (STDERR_NEXT rendering) depends on the Nix client's
-        // verbosity and activity-context handling — not something we
-        // control, so not asserted on in the VM test. The ring buffer
-        // + AdminService give the authoritative log-serving path;
-        // STDERR_NEXT is a convenience tail that may or may not render.
+        // The observability VM scenario asserts this > 0. The gateway
+        // → client leg (STDERR_NEXT rendering) depends on the Nix
+        // client's verbosity and activity-context handling — not
+        // something we control, so not asserted on in the VM test.
+        // The ring buffer + AdminService give the authoritative
+        // log-serving path; STDERR_NEXT is a convenience tail that
+        // may or may not render.
         metrics::counter!("rio_scheduler_log_lines_forwarded_total").increment(lines);
     }
 

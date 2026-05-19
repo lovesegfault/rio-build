@@ -72,12 +72,15 @@ rio-build is a **build execution backend**, not a CI system. Out of scope: Nix e
 | `rio-nix` | Nix wire protocol, ATerm/NAR parsers, store path types (leaf — no rio-* deps) |
 | `rio-proto` | gRPC service definitions (tonic) |
 | `rio-common` | Shared config, observability, limits, Arc<str> newtypes |
+| `rio-auth` | JWT/HMAC token sign-verify, gRPC tenant interceptor |
 | `rio-gateway` | SSH server + Nix worker protocol frontend |
 | `rio-scheduler` | DAG scheduler, critical-path priority, SLA-driven per-drv sizing |
 | `rio-store` | Chunked CAS, narinfo signing, binary-cache HTTP server |
 | `rio-builder` | Build executor, FUSE store, overlayfs isolation, cgroup metering |
 | `rio-controller` | Kubernetes operator (Pool CRD, autoscaler) |
 | `rio-crds` | Kubernetes CRD types (kube-derive), shared between controller and CLI |
+| `rio-lease` | Kubernetes Lease leader election (extracted from rio-scheduler) |
+| `rio-migrations` | SQL migrations + embedded MIGRATOR + per-migration commentary |
 | `rio-cli` | Admin CLI (trigger GC, tenant mgmt, backfill, dry-run introspection) |
 | `rio-test-support` | Ephemeral PostgreSQL bootstrap, mock gRPC, wire helpers |
 
@@ -111,18 +114,17 @@ Fuzz targets live in per-crate `fuzz/<crate>` workspaces (separate `Cargo.lock` 
 
 ```bash
 cd fuzz/rio-nix && cargo fuzz run wire_primitives
-# or via nix:
-nix build .#checks.x86_64-linux.fuzz-smoke-wire_primitives   # 30s smoke
-nix build .#fuzz-nightly-wire_primitives                     # 10min
+# or via nix (one 2min check per fuzz target):
+nix build .#checks.x86_64-linux.fuzz-wire_primitives
 ```
 
 ### VM Tests
 
-Per-phase NixOS VM tests validate end-to-end behavior against a real `nix` client:
+Per-scenario NixOS VM tests validate end-to-end behavior against a real `nix` client:
 
 ```bash
-nix build .#checks.x86_64-linux.vm-phase2a   # 4 VMs, distributed 2-builder build
-nix build .#checks.x86_64-linux.vm-phase3a   # 3 VMs, k3s + controller + CRDs
+nix build .#checks.x86_64-linux.vm-protocol-warm-standalone   # gateway + builder + store, no k3s
+nix build .#checks.x86_64-linux.vm-cli-k3s                    # k3s + controller + CRDs + CLI
 ```
 
 ## Design Book

@@ -17,4 +17,4 @@ nix build .#checks.x86_64-linux.vm-<name>.driverInteractive
 
 Report results tersely — pass/fail per step, first error if any failed.
 
-If the user asks for "full" checks, use `/nixbuild --checks` (all ~110 granular checks via nix-fast-build — VM tests, fuzz, ~20min).
+If the user asks for "full" checks, use `/nixbuild --checks` (the full granular check matrix via nix-fast-build — VM tests, fuzz, ~20min).

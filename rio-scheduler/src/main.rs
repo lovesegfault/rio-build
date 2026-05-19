@@ -33,11 +33,11 @@ struct SchedulerLeaseHooks {
 
 impl rio_scheduler::lease::LeaseHooks for SchedulerLeaseHooks {
     fn on_acquire(&self) {
-        // Counter for VM test observability: vm-phase3a's lease smoke
-        // test polls this to confirm the lease loop actually acquired
-        // (vs silently failing kube-client init and running standby
-        // forever). The info! log has the same signal but metrics are
-        // less brittle for VM grep.
+        // Counter for VM test observability: the leader-election VM
+        // scenario polls this to confirm the lease loop actually
+        // acquired (vs silently failing kube-client init and running
+        // standby forever). The info! log has the same signal but
+        // metrics are less brittle for VM grep.
         metrics::counter!("rio_scheduler_lease_acquired_total").increment(1);
         let actor = self.actor.clone();
         tokio::spawn(async move {

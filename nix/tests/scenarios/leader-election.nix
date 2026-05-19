@@ -134,21 +134,24 @@ let
       # ══════════════════════════════════════════════════════════════════
       # lease-acquired-metric — acquire-transition sanity + profraw check
       # ══════════════════════════════════════════════════════════════════
-      # lease/mod.rs:300-305 comment says vm-phase3a polled this metric.
-      # That check was lost in the fixture migration. Restoring it here
-      # guards two things at once:
-      #   1. The acquire transition (lease/mod.rs:282-353) actually fires.
-      #      waitReady proved a holder exists, but that only proves the
+      # SchedulerLeaseHooks::on_acquire (rio-scheduler/src/main.rs)
+      # increments rio_scheduler_lease_acquired_total and its comment
+      # says a VM scenario polls it. That check was lost when the legacy
+      # phase fixtures were retired. Restoring it here guards two things
+      # at once:
+      #   1. The acquire transition in rio-lease's run_lease_loop
+      #      (rio-lease/src/lib.rs) actually fires. waitReady proved a
+      #      holder exists, but that only proves the
       #      election.try_acquire_or_renew() succeeded — not that the
       #      edge-detection (`if now_leading && !was_leading`) ever went
       #      TRUE. A was_leading-init bug could let the lease work while
       #      deletion-cost/LeaderAcquired never fire.
       #   2. Profraw collection. Pre-POD_NAME fix, replacement pods on
       #      the same node overwrote the predecessor's profraw (both PID 1,
-      #      same %m, shared hostPath). lcov showed DA:282=91 but DA:293=0
-      #      — the condition ran 91× but the body never. This metric
-      #      proves the body DID run; if lcov still shows 0 after the
-      #      _helpers.tpl POD_NAME fix, the instrumentation is broken.
+      #      same %m, shared hostPath). lcov showed the loop condition ran
+      #      many times but the acquire body never. This metric proves the
+      #      body DID run; if lcov still shows 0 after the _helpers.tpl
+      #      POD_NAME fix, the instrumentation is broken.
       with subtest("lease-acquired-metric: acquire transition fires"):
           total_acq = 0.0
           for pod in scheduler_pods():

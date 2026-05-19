@@ -1676,7 +1676,7 @@ CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
 #info[
   Auxiliary tables omitted from pseudo-DDL above: `build_logs` (S3 blob
   metadata per derivation) and `build_event_log` (Prost-encoded BuildEvent per
-  sequence for gateway replay). See `migrations/` (workspace root) for full
+  sequence for gateway replay). See `rio-migrations/migrations/` for full
   schema.
 ]
 

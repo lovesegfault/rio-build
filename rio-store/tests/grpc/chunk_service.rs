@@ -1,8 +1,11 @@
 //! ChunkService RPCs (GetChunk).
 //!
-//! Chunking is server-side only — PutPath drives `cas::put_chunked`.
-//! GetChunk is the sole chunk-level RPC; the builder fans it out to
-//! reassemble NARs from their manifests.
+//! Chunking is server-side only — PutPath drives `cas::put_chunked`,
+//! and GetPath streams whole NARs back. GetChunk is the sole
+//! chunk-level RPC; it has no production caller today (the builder
+//! uses whole-NAR `GetPath` streaming) and is exercised only here, as
+//! the chunk-level retrieval surface for future out-of-process
+//! reassembly.
 
 use super::*;
 
@@ -12,7 +15,7 @@ use super::*;
 
 use rio_proto::ChunkServiceServer;
 // ChunkServiceClient is not re-exported at crate root (no production
-// callers outside the builder). Tests reach it via the deep codegen path.
+// callers). Tests reach it via the deep codegen path.
 use rio_proto::store::chunk_service_client::ChunkServiceClient;
 use rio_proto::types::GetChunkRequest;
 use rio_store::cas::ChunkCache;

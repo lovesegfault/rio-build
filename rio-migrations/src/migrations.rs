@@ -18,6 +18,14 @@
 //! test at `rio-migrations/tests/migrations.rs` enforces this — a
 //! comment edit to a shipped `.sql` fails CI with a pointer back here.
 //!
+//! **Stale `.sql` headers are intentional.** Migrations that shipped
+//! before this crate was extracted carry headers like `-- Commentary:
+//! see rio-store/src/migrations.rs M_NNN` — that file moved here, but
+//! editing the headers would change the checksum and break every
+//! persistent DB that already applied them. The pointers in this
+//! file's `M_NNN` consts are authoritative; the `.sql` headers are
+//! frozen at whatever path was current when the migration shipped.
+//!
 //! The try-then-wait advisory-lock runner that applies these lives in
 //! `rio_common::migrate::run` — both rio-store and rio-scheduler run
 //! the SAME migration set against the SAME database under the same

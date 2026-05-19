@@ -1571,7 +1571,7 @@ apply to unmapped UIDs). The NixOS node AMI (ADR-021) sets `cgroup_writable =
 true` directly via `virtualisation.containerd.settings`, so EKS deployments
 default to `hostUsers: false`.
 
-The controller-generated pod spec (`rio-controller/src/reconcilers/common/pod.rs`) matches: `/dev/fuse` via containerd `base_runtime_spec`
+The controller-generated pod spec (`rio-controller/src/reconcilers/pool/pod.rs`) matches: `/dev/fuse` via containerd `base_runtime_spec`
 (`nix/base-runtime-spec.nix` declares `/dev/{fuse,kvm}` in OCI `linux.devices`
 + `linux.resources.devices`; containerd's runc runtime is pointed at it via
 `nix/nixos-node/containerd-config.nix` on the NixOS AMI per ADR-021 §7, or

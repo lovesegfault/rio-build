@@ -128,12 +128,15 @@ pub mod builder {
 /// Also includes `ChunkService` (`GetChunk` only). Chunking is
 /// **server-side**: executors stream full NARs via `StoreService::
 /// PutPath`; rio-store does the FastCDC cut internally and dedupes
-/// chunks via the `chunks` table refcount. The builder fans out
-/// `GetChunk` to reassemble NARs from their manifests.
+/// chunks via the `chunks` table refcount. Reassembly is also
+/// server-side — `StoreService::GetPath` streams whole NARs back, so
+/// `GetChunk` has no production caller today; it is registered and
+/// served as the chunk-level retrieval surface for future
+/// out-of-process reassembly (and exercised by tests against the
+/// `ChunkServiceImpl` cache wiring).
 ///
-/// `ChunkServiceClient` is **not** re-exported at crate root: the
-/// only production caller (the builder's reassembly loop) reaches it
-/// via the deep codegen path
+/// `ChunkServiceClient` is **not** re-exported at crate root: with no
+/// production caller, only tests reach it, via the deep codegen path
 /// `store::chunk_service_client::ChunkServiceClient`.
 // r[impl proto.store.batch-rpc]
 pub mod store {

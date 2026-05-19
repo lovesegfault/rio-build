@@ -1,8 +1,10 @@
 //! Shared configuration, observability, and utility types.
 //!
 //! Leaf crate — no `rio-*` dependencies. Provides [`limits`] constants,
-//! [`observability`] init, and gRPC/TLS/JWT plumbing shared across the
-//! workspace.
+//! [`observability`] init, and gRPC/TLS plumbing shared across the
+//! workspace. The JWT/HMAC sign-verify stack moved to `rio-auth`;
+//! only the [`JwtConfig`](config::JwtConfig) serde struct and the
+//! `*_TOKEN_HEADER` string constants in [`grpc`] remain here.
 
 pub mod backoff;
 pub mod config;

@@ -292,11 +292,10 @@ impl<'a> StderrLoop<'a> {
             // sends builder stderr output. It DOES NOT come as raw
             // STDERR_NEXT — that's only for daemon chatter.
             //
-            // This was a latent phase2a bug: we were silently dropping
-            // all build output. It never mattered because phase2a
-            // didn't assert on log content. vm-phase2b's log-pipeline
-            // assertion caught it — exactly what milestone VM tests
-            // are for.
+            // This was a latent bug: we were silently dropping all
+            // build output. It never mattered until a VM test added a
+            // log-pipeline assertion and caught it — exactly what
+            // end-to-end VM tests are for.
             //
             // fields[0] is the log line (String). Same batching +
             // limit logic as STDERR_NEXT.
@@ -1425,8 +1424,8 @@ mod tests {
 
     /// STDERR_RESULT with result_type=101 (BuildLogLine) is captured as a
     /// log line. This is how modern nix-daemon actually sends builder
-    /// output — NOT as raw STDERR_NEXT. Latent phase2a bug caught by
-    /// vm-phase2b's log-pipeline assertion.
+    /// output — NOT as raw STDERR_NEXT. Latent bug caught by a VM
+    /// test's log-pipeline assertion.
     #[tokio::test]
     async fn test_stderr_loop_result_build_log_line_captured() -> anyhow::Result<()> {
         use rio_nix::protocol::stderr::{ResultField, ResultType};

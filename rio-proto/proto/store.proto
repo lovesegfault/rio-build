@@ -120,8 +120,10 @@ service StoreService {
 }
 
 // Chunk-level storage service for content-defined chunking.
-// Server-side chunking only — PutPath chunks via cas::put_chunked; the
-// builder fans out GetChunk to reassemble NARs.
+// Server-side chunking only — PutPath chunks via cas::put_chunked, and
+// GetPath streams whole NARs back. GetChunk has no production caller
+// today; it is the chunk-level retrieval surface for future
+// out-of-process reassembly, exercised only by tests.
 service ChunkService {
   // Download a chunk by its digest.
   rpc GetChunk(rio.types.GetChunkRequest) returns (stream rio.types.GetChunkResponse);
