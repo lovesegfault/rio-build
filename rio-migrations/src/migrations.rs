@@ -969,6 +969,31 @@ pub const M_059: () = ();
 /// Read/written by **rio-scheduler** only (`CostTable::load`/`persist`).
 pub const M_060: () = ();
 
+/// `migrations/061_drv_logs.sql`
+///
+/// Re-key build log storage by derivation execution. Replaces
+/// `build_logs (build_id, drv_hash)` with `drv_logs (exec_id PK, drv_hash)`.
+/// One row/blob per execution instead of N per interested build — the
+/// scheduler dedups derivations across all concurrent builds, so a build log
+/// is a property of the *execution*, not the build request that asked for it.
+///
+/// `exec_id` is UUIDv7 (time-sortable), minted by the scheduler at
+/// `assign_to_worker`. The PK is `exec_id` alone — globally unique by
+/// construction, schema-enforced — with a secondary `(drv_hash, exec_id DESC)`
+/// index for the latest-exec lookup. `drv_hash` is the 32-char `drv_log_hash()`
+/// form of the `.drv` store path, NOT `derivations.drv_hash` (the polymorphic
+/// dedup identity: full path for IA, modular hash for CA — they cannot be
+/// joined directly).
+///
+/// Adds `assignments.exec_id` (recovery carrier — the new leader reloads it
+/// for active assignments after failover so the flusher keys subsequent
+/// uploads correctly) and `build_derivations.exec_id` (build↔exec
+/// correlation — set by the completion handler on Completed/Failed, NULL for
+/// Cached/never-ran terminals).
+///
+/// Greenfield drop+recreate, no backfill.
+pub const M_061: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql
