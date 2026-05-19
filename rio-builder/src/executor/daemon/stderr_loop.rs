@@ -58,15 +58,20 @@ pub(in crate::executor) async fn run_daemon_build(
     opts: DaemonBuildOpts,
     batcher: LogBatcher,
     log_tx: &mpsc::Sender<ExecutorMessage>,
-) -> Result<BuildResult, ExecutorError> {
-    let mut stdin = daemon
-        .stdin
-        .take()
-        .ok_or_else(|| ExecutorError::DaemonSetup("failed to get daemon stdin".into()))?;
-    let stdout = daemon
-        .stdout
-        .take()
-        .ok_or_else(|| ExecutorError::DaemonSetup("failed to get daemon stdout".into()))?;
+) -> (Result<BuildResult, ExecutorError>, u64) {
+    // Returned alongside the result on every path so the caller can set
+    // the footer banner's `first_line_number`. Setup failures (stdin/
+    // stdout missing, handshake timeout) never reach the stderr loop —
+    // the batcher's seeded count is the only line accounting available.
+    let seeded_count = batcher.line_count();
+    let setup_err = |m: &str| (Err(ExecutorError::DaemonSetup(m.into())), seeded_count);
+
+    let Some(mut stdin) = daemon.stdin.take() else {
+        return setup_err("failed to get daemon stdin");
+    };
+    let Some(stdout) = daemon.stdout.take() else {
+        return setup_err("failed to get daemon stdout");
+    };
 
     // Handshake + setOptions + send build — all bounded by DAEMON_SETUP_TIMEOUT.
     // All three steps share DAEMON_SETUP_TIMEOUT: a stuck setOptions or stalled
@@ -76,7 +81,7 @@ pub(in crate::executor) async fn run_daemon_build(
     // value for its owned reader task. So: put stdout in an Option, borrow
     // mutably for setup, then take() it for the loop.
     let mut stdout = Some(stdout);
-    let negotiated_version = tokio::time::timeout(DAEMON_SETUP_TIMEOUT, async {
+    let negotiated_version = match tokio::time::timeout(DAEMON_SETUP_TIMEOUT, async {
         let stdout_ref = stdout.as_mut().expect("taken only once, after this block");
         let handshake_result = client_handshake(stdout_ref, &mut stdin).await?;
         let negotiated = handshake_result.negotiated_version();
@@ -95,7 +100,11 @@ pub(in crate::executor) async fn run_daemon_build(
         Ok::<_, ExecutorError>(negotiated)
     })
     .await
-    .map_err(|_| ExecutorError::DaemonSetup("daemon setup sequence timed out".into()))??;
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return (Err(e), seeded_count),
+        Err(_) => return setup_err("daemon setup sequence timed out"),
+    };
 
     // Read STDERR loop with log streaming (build may run for a long time).
     // stdout is moved into the loop's owned reader task; we don't need it
@@ -110,9 +119,9 @@ pub(in crate::executor) async fn run_daemon_build(
     // Timeout is a BUILD OUTCOME, not an executor error: returning Err
     // would land in runtime.rs's InfrastructureFailure arm →
     // reassignment storm (same build, same inputs, same timeout,
-    // forever). The Result<_, WireError> here is different — a wire
+    // forever). The Result<_, WireError> path is different — a wire
     // error mid-STDERR-loop IS an executor fault (daemon died, pipe
-    // corrupted); that `?` stays.
+    // corrupted); it maps to `ExecutorError::Wire` below.
     //
     // The local nix-daemon MAY also enforce maxSilentTime itself
     // (forwarded via client_set_options above) — but rio-side is the
@@ -122,7 +131,7 @@ pub(in crate::executor) async fn run_daemon_build(
     //
     // r[impl builder.timeout.no-reassign]
     // r[impl builder.daemon.negotiated-version]
-    let build_result = read_build_stderr_loop(
+    let (loop_result, final_line_count) = read_build_stderr_loop(
         stdout,
         opts.max_silent_time,
         opts.build_timeout,
@@ -130,9 +139,9 @@ pub(in crate::executor) async fn run_daemon_build(
         batcher,
         log_tx,
     )
-    .await?;
+    .await;
 
-    Ok(build_result)
+    (loop_result.map_err(ExecutorError::from), final_line_count)
 }
 
 /// Hard cap on STDERR-protocol messages per build. Distinct from the
@@ -359,6 +368,14 @@ impl<'a> StderrLoop<'a> {
             let _ = send_batch(self.log_tx, batch).await;
         }
     }
+
+    /// Lines accounted for by the batcher (`initial_line` + everything
+    /// flushed). Read after [`Self::final_flush`] so the executor can
+    /// set the footer banner's `first_line_number` to follow the build
+    /// output without colliding.
+    fn line_count(&self) -> u64 {
+        self.batcher.line_count()
+    }
 }
 
 /// Send a log batch on the executor stream. Returns `false` if the
@@ -405,7 +422,7 @@ async fn read_build_stderr_loop<R>(
     negotiated_version: u64,
     batcher: LogBatcher,
     log_tx: &mpsc::Sender<ExecutorMessage>,
-) -> Result<BuildResult, wire::WireError>
+) -> (Result<BuildResult, wire::WireError>, u64)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -544,25 +561,36 @@ where
     // Final flush: the loop owns the batcher (by-value), so any partial
     // batch must be drained here.
     state.final_flush().await;
+    // Captured *after* final_flush so it accounts for the trailing
+    // partial batch and any rate-suppression marker the flush emitted.
+    // Returned alongside the result on every path — wire errors
+    // included, since the build still produced N lines before the pipe
+    // broke and the footer's `first_line_number` should follow them.
+    let final_line_count = state.line_count();
 
     // Terminal-message paths (Last/Error) fell through here: recover the reader
     // so we can read the BuildResult that follows STDERR_LAST. For the other
     // outcomes (misc_fail, wire Err), the abort guard fires on return and
     // cleans up the reader task; we don't need the reader back.
-    match outcome? {
-        Some(fail) => Ok(fail),
-        None => {
-            // Reader task has already returned (it pushed STDERR_LAST and
-            // broke its loop). `.await` here does not block; it just
-            // collects the return value.
-            let mut reader = reader_task.await.map_err(|e| {
-                wire::WireError::Io(std::io::Error::other(format!(
-                    "stderr reader task join failed: {e}"
-                )))
-            })?;
-            rio_nix::protocol::build::read_build_result(&mut reader, negotiated_version).await
+    let result = match outcome {
+        Err(e) => Err(e),
+        Ok(Some(fail)) => Ok(fail),
+        Ok(None) => {
+            async {
+                // Reader task has already returned (it pushed STDERR_LAST and
+                // broke its loop). `.await` here does not block; it just
+                // collects the return value.
+                let mut reader = reader_task.await.map_err(|e| {
+                    wire::WireError::Io(std::io::Error::other(format!(
+                        "stderr reader task join failed: {e}"
+                    )))
+                })?;
+                rio_nix::protocol::build::read_build_result(&mut reader, negotiated_version).await
+            }
+            .await
         }
-    }
+    };
+    (result, final_line_count)
 }
 
 // r[verify builder.daemon.stderr-result-logs]
@@ -603,10 +631,13 @@ mod tests {
             "/nix/store/test.drv".into(),
             "test-worker".into(),
             crate::log_stream::LogLimits::UNLIMITED,
+            0,
         );
         let (tx, mut rx) = mpsc::channel(128);
         let cursor = std::io::Cursor::new(input);
-        let result =
+        // Discard the final line count — these tests assert on the
+        // BuildResult and batch contents, not the footer offset.
+        let (result, _final_line_count) =
             read_build_stderr_loop(cursor, 0, NO_BUILD_TIMEOUT, PROTOCOL_VERSION, batcher, &tx)
                 .await;
         drop(tx);
@@ -706,12 +737,13 @@ mod tests {
             "/nix/store/test.drv".into(),
             "test-worker".into(),
             crate::log_stream::LogLimits::UNLIMITED,
+            0,
         );
         let (tx, rx) = mpsc::channel(1);
         drop(rx); // channel closed before loop starts
         let cursor = std::io::Cursor::new(buf);
 
-        let result =
+        let (result, _) =
             read_build_stderr_loop(cursor, 0, NO_BUILD_TIMEOUT, PROTOCOL_VERSION, batcher, &tx)
                 .await;
         let br = result.expect("channel-closed is Ok(failure)");
@@ -784,6 +816,7 @@ mod tests {
             "/nix/store/test.drv".into(),
             "test-worker".into(),
             crate::log_stream::LogLimits::UNLIMITED,
+            0,
         );
         let (log_tx, mut log_rx) = mpsc::channel(8);
 
@@ -798,6 +831,9 @@ mod tests {
                 &log_tx,
             )
             .await
+            // Discard the final line count — these tests assert on the
+            // BuildResult and batch contents, not the footer offset.
+            .0
         });
 
         // Send exactly one STDERR_NEXT line, then go silent.
@@ -869,6 +905,7 @@ mod tests {
             "/nix/store/test.drv".into(),
             "test-worker".into(),
             crate::log_stream::LogLimits::UNLIMITED,
+            0,
         );
         let (log_tx, mut log_rx) = mpsc::channel(8);
 
@@ -882,6 +919,9 @@ mod tests {
                 &log_tx,
             )
             .await
+            // Discard the final line count — these tests assert on the
+            // BuildResult and batch contents, not the footer offset.
+            .0
         });
 
         // Write the first 4 bytes of the STDERR_NEXT u64 tag. This leaves
@@ -970,6 +1010,7 @@ mod tests {
             "/nix/store/test.drv".into(),
             "test-worker".into(),
             crate::log_stream::LogLimits::UNLIMITED,
+            0,
         );
         let (log_tx, log_rx) = mpsc::channel(8);
         let handle = tokio::spawn(async move {
@@ -982,6 +1023,9 @@ mod tests {
                 &log_tx,
             )
             .await
+            // Discard the final line count — these tests assert on the
+            // BuildResult and batch contents, not the footer offset.
+            .0
         });
         (write_half, log_rx, handle)
     }
@@ -1158,10 +1202,17 @@ mod tests {
         input: Vec<u8>,
         limits: crate::log_stream::LogLimits,
     ) -> (Result<BuildResult, wire::WireError>, Vec<ExecutorMessage>) {
-        let batcher = LogBatcher::new("/nix/store/test.drv".into(), "test-worker".into(), limits);
+        let batcher = LogBatcher::new(
+            "/nix/store/test.drv".into(),
+            "test-worker".into(),
+            limits,
+            0,
+        );
         let (tx, mut rx) = mpsc::channel(128);
         let cursor = std::io::Cursor::new(input);
-        let result =
+        // Discard the final line count — these tests assert on the
+        // BuildResult and batch contents, not the footer offset.
+        let (result, _final_line_count) =
             read_build_stderr_loop(cursor, 0, NO_BUILD_TIMEOUT, PROTOCOL_VERSION, batcher, &tx)
                 .await;
         drop(tx);
@@ -1525,6 +1576,7 @@ mod tests {
             "/nix/store/t.drv".into(),
             "w".into(),
             crate::log_stream::LogLimits::UNLIMITED,
+            0,
         );
         StderrLoop::new(batcher, tx, Duration::ZERO)
     }
@@ -1623,6 +1675,7 @@ mod tests {
             "/nix/store/test.drv".into(),
             "test-worker".into(),
             crate::log_stream::LogLimits::UNLIMITED,
+            0,
         );
         let (log_tx, mut log_rx) = mpsc::channel(8);
         let loop_handle = tokio::spawn(async move {
@@ -1635,6 +1688,9 @@ mod tests {
                 &log_tx,
             )
             .await
+            // Discard the final line count — these tests assert on the
+            // BuildResult and batch contents, not the footer offset.
+            .0
         });
 
         // 3 lines (< MAX_BATCH_LINES=64): stay buffered, no flush yet.
@@ -1749,11 +1805,13 @@ mod tests {
             "/nix/store/test.drv".into(),
             "test-worker".into(),
             crate::log_stream::LogLimits::UNLIMITED,
+            0,
         );
         let (tx, _rx) = mpsc::channel(8);
         let cursor = std::io::Cursor::new(buf);
         let br = read_build_stderr_loop(cursor, 0, NO_BUILD_TIMEOUT, v136, batcher, &tx)
             .await
+            .0
             .expect("1.36-serialized BuildResult must parse at negotiated_version=1.36");
         assert_eq!(br.status, BuildStatus::Built);
         assert_eq!(br.times_built, 1);

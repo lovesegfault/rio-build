@@ -223,6 +223,16 @@ impl BuildSpawnContext {
             cgroup_parent: self.cgroup_parent.clone(),
             executor_kind: self.executor_kind,
             systems: Arc::clone(&self.systems),
+            // Snapshot for the `rio:` banner header. Lazily populated by
+            // `hw_bench` on first assignment (resolve runs concurrently
+            // with FUSE mount); `None` until the annotator stamps the
+            // downward-API volume, in which case the banner drops the
+            // `/{hw_class}` suffix.
+            hw_class: self
+                .hw_class
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
             fuse_cache: Some(Arc::clone(&self.fuse_cache)),
             fuse_fetch_timeout: self.fuse_fetch_timeout,
             cancelled,

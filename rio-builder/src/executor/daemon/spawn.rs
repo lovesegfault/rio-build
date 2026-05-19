@@ -355,6 +355,7 @@ mod tests {
             "test.drv".into(),
             "test-worker".into(),
             crate::log_stream::LogLimits::UNLIMITED,
+            0,
         );
         let (log_tx, _log_rx) = mpsc::channel(4);
 
@@ -378,7 +379,7 @@ mod tests {
         .await
         .expect("handshake should fail fast, not hang");
         assert!(
-            result.is_err(),
+            result.0.is_err(),
             "handshake against closed stdout should fail"
         );
 

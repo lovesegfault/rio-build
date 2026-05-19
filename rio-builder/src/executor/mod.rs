@@ -103,6 +103,15 @@ pub struct ExecutorEnv {
     /// `setup_nix_conf` so the per-build daemon's `extra-platforms`
     /// stays consistent with what the heartbeat advertises.
     pub systems: Arc<[String]>,
+    /// Resolved `hw_class` (controller-stamped pod annotation,
+    /// downward-API volume). Read once per assignment by
+    /// `BuildSpawnContext::executor_env` from the shared
+    /// `Arc<Mutex<Option<String>>>` so [`execute_build`] gets a plain
+    /// `Option<&str>` for the `rio:` banner header. `None` when
+    /// non-k8s, the annotator hasn't stamped yet (first ~1s after
+    /// pod bind), or the resolve poll timed out — the banner renders
+    /// the system without the `/{hw_class}` suffix in that case.
+    pub hw_class: Option<String>,
     /// Handle to the FUSE local cache. The executor calls
     /// `register_inputs` (JIT allowlist, I-043 redesign) and
     /// `prefetch_manifests` (I-110c PG-skip hints) on it after
@@ -471,11 +480,51 @@ pub async fn execute_build(
     // rio_builder_builds_total is incremented at completion (main.rs) with
     // an outcome label so SLI queries can compute success rate.
     let build_start = std::time::Instant::now();
+    // `Instant: Copy` — the scopeguard closure below copies it, so
+    // `build_start` is still readable for the banner footer's duration.
+    let exec_start = build_start;
     let _build_guard = scopeguard::guard((), move |()| {
         metrics::gauge!("rio_builder_builds_active").decrement(1.0);
         metrics::histogram!("rio_builder_build_duration_seconds")
             .record(build_start.elapsed().as_secs_f64());
     });
+
+    // r[impl obs.log.worker-header]
+    // Banner header — the first thing in the build log, ahead of any
+    // build output. Sent directly on `log_tx` (not through `LogBatcher`
+    // — that's created inside `run_daemon_lifecycle`, three call frames
+    // down); the batcher is seeded with `HEADER_LINE_COUNT` so the
+    // build's real output numbers from line 3 instead of colliding.
+    //
+    // Display-only: see `banner.rs`'s module doc. The lines flow
+    // through the normal `BuildLogBatch` → scheduler ring buffer →
+    // S3 pipeline and are visible in `nix build -L`, `rio-cli logs`,
+    // the dashboard, and Nix's post-failure log tail.
+    //
+    // Sent AFTER the wrong-kind gate so a misroute (FOD → builder pod)
+    // doesn't pollute the log with a header for a build that was never
+    // going to run. Sent BEFORE overlay setup so a failed mount still
+    // leaves a self-describing log (header, no output, no footer).
+    //
+    // `exec_id` is the per-execution UUIDv7 from `WorkAssignment` —
+    // empty before commit `34956e1f4` plumbed `assign_to_worker`'s
+    // mint, but always populated against the current scheduler. The
+    // log header is the only place the worker echoes it.
+    send_banner_batch(
+        log_tx,
+        drv_path,
+        &env.executor_id,
+        0,
+        crate::banner::header_lines(
+            &assignment.exec_id,
+            drv.platform(),
+            env.hw_class.as_deref(),
+            assignment.assigned_cores,
+            assignment.assigned_mem_bytes,
+            assignment.assigned_disk_bytes,
+        ),
+    )
+    .await;
 
     // ── Pre-daemon block: overlay → resolve → sandbox → daemon. ───────
     // Wrapped so the `?` sites stay `?`: every error here is pre-cgroup
@@ -626,7 +675,14 @@ pub async fn execute_build(
         }
         .await;
 
-    let (overlay_mount, input_paths, build_result, peak_memory_bytes, peak_cpu_cores) = match pre {
+    let (
+        overlay_mount,
+        input_paths,
+        build_result,
+        peak_memory_bytes,
+        peak_cpu_cores,
+        final_line_count,
+    ) = match pre {
         Err(e) => return ExecuteOutcome::pre_cgroup(e),
         #[cfg(feature = "test-fixtures")]
         Ok(PreDaemon::Fixture(r)) => return ExecuteOutcome::fixture(r),
@@ -638,6 +694,7 @@ pub async fn execute_build(
                     build_result,
                     peak_memory_bytes,
                     peak_cpu_cores,
+                    final_line_count,
                 },
         }) => (
             overlay_mount,
@@ -645,8 +702,38 @@ pub async fn execute_build(
             build_result,
             peak_memory_bytes,
             peak_cpu_cores,
+            final_line_count,
         ),
     };
+
+    // r[impl obs.log.worker-header]
+    // Banner footer — sent AFTER `run_daemon_lifecycle` returned (the
+    // `LogBatcher` was consumed inside it; we send a `BuildLogBatch`
+    // directly). `first_line_number` follows the build output so the
+    // footer doesn't collide with the last real lines or leave a gap
+    // in the dashboard's `since_line` resumption. Goes out BEFORE any
+    // post-daemon `?` (collect_outputs / teardown) so the stored log
+    // self-describes the build process's outcome even when upload
+    // failed afterward — `CompletionReport` carries the post-daemon
+    // failure, the footer carries the build's own result.
+    //
+    // Pre-cgroup early returns above (`Err(e)`, `Fixture`) don't reach
+    // here: those builds never ran a daemon, so there's no exit to
+    // report. The header is still in the log; a reader sees the
+    // header with no output and no footer and knows setup failed
+    // before the build started.
+    send_banner_batch(
+        log_tx,
+        drv_path,
+        &env.executor_id,
+        final_line_count,
+        crate::banner::footer_lines(
+            &assignment.exec_id,
+            &footer_result_str(&build_result),
+            exec_start.elapsed(),
+        ),
+    )
+    .await;
 
     // ── Post-daemon: peaks now in scope; carry across every Err. ──────
     // r[impl builder.cgroup.memory-peak+2]
@@ -822,6 +909,13 @@ struct DaemonOutcome {
     build_result: Result<rio_nix::protocol::build::BuildResult, ExecutorError>,
     peak_memory_bytes: u64,
     peak_cpu_cores: f64,
+    /// Lines accounted for by the [`LogBatcher`] (the seeded banner
+    /// header offset + everything the stderr loop flushed). Read by
+    /// [`execute_build`] to set the footer banner's `first_line_number`
+    /// so it follows the build output instead of colliding. Equal to
+    /// [`crate::banner::HEADER_LINE_COUNT`] when [`run_daemon_build`]'s
+    /// setup failed before the loop ran (no build output produced).
+    final_line_count: u64,
 }
 
 /// Spawn `nix-daemon`, attach it to a per-build cgroup, run the build,
@@ -898,8 +992,18 @@ async fn run_daemon_lifecycle(
     // net. The explicit kill below remains the primary cleanup
     // (graceful, bounded wait for reap); kill_on_drop covers early
     // returns between spawn and here.
-    let batcher = LogBatcher::new(drv_path.to_owned(), env.executor_id.clone(), env.log_limits);
-    let build_result = run_daemon_build(
+    // Seeded with `HEADER_LINE_COUNT`: `execute_build` already sent
+    // the `rio:` banner header (3 lines) directly on `log_tx` before
+    // calling us, so the build's real output should start at line 3.
+    // Without this, the build's line 0 collides with `rio: exec` and
+    // the dashboard's `since_line` resumption desyncs.
+    let batcher = LogBatcher::new(
+        drv_path.to_owned(),
+        env.executor_id.clone(),
+        env.log_limits,
+        crate::banner::HEADER_LINE_COUNT,
+    );
+    let (build_result, final_line_count) = run_daemon_build(
         &mut daemon,
         drv_path,
         basic_drv,
@@ -957,6 +1061,7 @@ async fn run_daemon_lifecycle(
         build_result,
         peak_memory_bytes,
         peak_cpu_cores,
+        final_line_count,
     })
 }
 
@@ -1216,6 +1321,68 @@ pub fn sanitize_build_id(drv_path: &str) -> String {
         .collect()
 }
 
+/// Send a worker banner (header or footer) as a `BuildLogBatch`
+/// directly on `log_tx`, bypassing the [`LogBatcher`] (which is
+/// created inside [`run_daemon_lifecycle`] and consumed by the stderr
+/// loop — not in scope at the call sites).
+///
+/// Best-effort: a closed channel means the scheduler stream is gone,
+/// in which case the build's `CompletionReport` won't reach the
+/// scheduler either — `runtime/` handles that. The banner is
+/// display-only; dropping it is harmless.
+async fn send_banner_batch(
+    log_tx: &mpsc::Sender<ExecutorMessage>,
+    drv_path: &str,
+    executor_id: &str,
+    first_line_number: u64,
+    lines: Vec<Vec<u8>>,
+) {
+    let batch = rio_proto::types::BuildLogBatch {
+        derivation_path: drv_path.to_owned(),
+        executor_id: executor_id.to_owned(),
+        first_line_number,
+        lines,
+    };
+    let msg = ExecutorMessage {
+        msg: Some(rio_proto::types::executor_message::Msg::LogBatch(batch)),
+    };
+    if log_tx.send(msg).await.is_err() {
+        tracing::debug!(
+            drv_path = %drv_path,
+            "banner batch dropped: log channel closed (scheduler stream gone)"
+        );
+    }
+}
+
+/// Map a [`run_daemon_lifecycle`] result to the banner footer's
+/// `result` string: `ok`, `failed (StatusName)`, or `cancelled`.
+///
+/// Display-only: the precise classification (`InfrastructureFailure`
+/// vs `Failed` vs `Cancelled`, retry eligibility, error chain) lives
+/// on `CompletionReport`. The footer just lets a human reading the
+/// log know the build's own outcome without scrolling to the
+/// scheduler's view. `BuildStatus` doesn't carry an exit code (the
+/// daemon protocol only reports a status enum), so `failed (exit N)`
+/// from the design spec maps to the closest available signal: the
+/// status discriminant.
+fn footer_result_str(
+    build_result: &Result<rio_nix::protocol::build::BuildResult, ExecutorError>,
+) -> String {
+    use rio_nix::protocol::build::BuildStatus;
+    match build_result {
+        Ok(br) if br.status.is_success() => "ok".to_string(),
+        Ok(br) => match br.status {
+            BuildStatus::TimedOut => "failed (timed out)".to_string(),
+            BuildStatus::LogLimitExceeded => "failed (log limit exceeded)".to_string(),
+            other => format!("failed ({other:?})"),
+        },
+        Err(ExecutorError::Cancelled) => "cancelled".to_string(),
+        // The full error string is on `CompletionReport.error_msg`;
+        // the footer is a one-line summary.
+        Err(_) => "failed (executor error)".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1375,6 +1542,7 @@ mod tests {
             cgroup_parent: "/tmp".into(),
             executor_kind: rio_proto::types::ExecutorKind::Builder,
             systems: Arc::from(["x86_64-linux".to_string()]),
+            hw_class: None,
             fuse_cache: None,
             fuse_fetch_timeout: Duration::from_secs(60),
             cancelled: Arc::new(AtomicBool::new(false)),

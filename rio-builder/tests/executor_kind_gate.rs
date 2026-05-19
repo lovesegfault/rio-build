@@ -33,6 +33,7 @@ fn make_env(kind: ExecutorKind, dir: &std::path::Path) -> ExecutorEnv {
         cgroup_parent: dir.to_path_buf(),
         executor_kind: kind,
         systems: Arc::from(["x86_64-linux".into()]),
+        hw_class: None,
         fuse_cache: None,
         fuse_fetch_timeout: std::time::Duration::from_secs(60),
         cancelled: Arc::new(AtomicBool::new(false)),

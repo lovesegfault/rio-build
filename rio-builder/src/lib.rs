@@ -25,6 +25,7 @@
 //! +-- Heartbeat loop (runtime.rs, 10s interval)
 //! ```
 
+pub(crate) mod banner;
 pub mod cgroup;
 pub mod config;
 pub mod executor;

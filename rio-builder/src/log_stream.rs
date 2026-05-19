@@ -103,13 +103,25 @@ impl LogBatcher {
     }
 
     /// Create a new log batcher for the given derivation.
-    pub fn new(drv_path: String, executor_id: String, limits: LogLimits) -> Self {
+    ///
+    /// `initial_line` seeds the line counter. The executor sends a
+    /// `rio:` banner header (`crate::banner::HEADER_LINE_COUNT` lines)
+    /// directly on `log_tx` *before* `run_daemon_lifecycle` constructs
+    /// the batcher; seeding the counter lets the build's real output
+    /// start numbering after the header instead of colliding at line 0.
+    /// Tests that exercise the batcher in isolation pass `0`.
+    pub fn new(
+        drv_path: String,
+        executor_id: String,
+        limits: LogLimits,
+        initial_line: u64,
+    ) -> Self {
         let now = Instant::now();
         Self {
             drv_path,
             executor_id,
             lines: Vec::with_capacity(MAX_BATCH_LINES),
-            next_line_number: 0,
+            next_line_number: initial_line,
             batch_start: now,
             limits,
             lines_this_window: 0,
@@ -117,6 +129,15 @@ impl LogBatcher {
             window_start: now,
             total_bytes: 0,
         }
+    }
+
+    /// Total lines accounted for: `initial_line` + every line ever
+    /// flushed (including rate-suppression markers, excluding currently
+    /// buffered lines — call after [`Self::final_flush`]). The executor
+    /// reads this after the stderr loop drains to set the footer
+    /// banner's `first_line_number`.
+    pub fn line_count(&self) -> u64 {
+        self.next_line_number
     }
 
     /// Add a log line. Returns the batch if it's full, or a limit-exceeded
@@ -275,7 +296,21 @@ mod tests {
     use super::*;
 
     fn mk(limits: LogLimits) -> LogBatcher {
-        LogBatcher::new("drv-path".into(), "worker-1".into(), limits)
+        LogBatcher::new("drv-path".into(), "worker-1".into(), limits, 0)
+    }
+
+    /// `initial_line` seeds `next_line_number` so the first flush's
+    /// `first_line_number` follows the worker's `rio:` banner header
+    /// (sent directly on `log_tx`, outside the batcher) instead of
+    /// colliding at line 0.
+    #[test]
+    fn initial_line_offsets_first_batch() {
+        let mut batcher = LogBatcher::new("drv".into(), "w".into(), LogLimits::UNLIMITED, 3);
+        assert_eq!(batcher.line_count(), 3, "seeded before any lines");
+        batcher.add_line(b"a".to_vec());
+        let batch = batcher.flush();
+        assert_eq!(batch.first_line_number, 3);
+        assert_eq!(batcher.line_count(), 4, "advances past the seed");
     }
 
     // -----------------------------------------------------------------------
