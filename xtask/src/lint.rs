@@ -25,12 +25,13 @@ pub enum Lint {
     /// scheduler helm template. Catches a `[sla]` field helm forgot to
     /// surface to operators.
     HelmSla,
-    /// `nix/nixos-node/seccomp/rio-builder.json` is an allowlist
-    /// (`defaultAction: SCMP_ACT_ERRNO`), the 5 builder-denied syscalls
-    /// are absent from every ALLOW block, and the worker-critical
-    /// syscalls (mount/unshare/chroot/clone/umount2) are present.
-    /// Catches a profile edit that flips to a denylist or strands the
-    /// Nix sandbox.
+    /// `nix/nixos-node/seccomp/{rio-builder,rio-fetcher}.json` are
+    /// allowlists (`defaultAction: SCMP_ACT_ERRNO`), the denied
+    /// syscalls are absent from every ALLOW block, the
+    /// worker-critical syscalls (mount/unshare/chroot/clone/umount2)
+    /// are present, and the fetcher profile keeps its explicit
+    /// SCMP_ACT_ERRNO block (ADR-019). Catches a profile edit that
+    /// flips to a denylist or strands the Nix sandbox.
     SeccompAllowlist,
 }
 

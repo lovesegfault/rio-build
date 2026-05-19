@@ -130,6 +130,11 @@
   # per-package builds use a different feature set than the
   # workspace build → cache thrash. `hakari verify` is fast
   # (metadata-only, no compile).
+  #
+  # Like crate2nix-check above, this hook no-ops in the hermetic
+  # `pre-commit run --all-files` derivation (nothing is staged) and
+  # is bypassed by `--no-verify`. The hermetic backstop is
+  # `checks.<system>.hakari-drift` (nix/misc-checks.nix).
   hakari-check = {
     enable = true;
     name = "hakari-check";

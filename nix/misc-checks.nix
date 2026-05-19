@@ -108,6 +108,61 @@ in
     '';
   };
 
+  # workspace-hack drift check. The pre-commit `hakari-check` hook is
+  # gated on `git diff --cached` and so no-ops in the hermetic
+  # `pre-commit run --all-files` derivation (nothing is staged) — the
+  # same documented limitation as `crate2nix-check`. workspace-hack is
+  # also stubbed in nix builds (nix/crate2nix.nix), so a stale
+  # workspace-hack never breaks CI directly. Without this check the
+  # only enforcement is the pre-commit hook, which `--no-verify` and
+  # any non-interactive push path bypass.
+  #
+  # Stale workspace-hack means per-package `cargo build -p X` resolves
+  # a narrower feature set than `cargo build --workspace`, causing
+  # full recompiles on every workspace↔package switch. Silent local
+  # dev-loop degradation, no CI signal.
+  #
+  # `cargo hakari verify` is a metadata-only check (no rustc) that
+  # asserts workspace-hack still unifies one version of every
+  # non-omitted third-party crate. Same `cargoSetupHook +
+  # importCargoLock` setup as `deny` so `cargo metadata` resolves
+  # against vendored sources without network.
+  hakari-drift = pkgs.stdenv.mkDerivation {
+    pname = "rio-hakari-drift";
+    inherit version;
+    src = pkgs.lib.fileset.toSource {
+      root = unfilteredRoot;
+      fileset = pkgs.lib.fileset.unions [
+        ../.config/hakari.toml
+        workspaceFileset
+      ];
+    };
+    cargoDeps = rustPlatformStable.importCargoLock {
+      lockFile = ../Cargo.lock;
+    };
+    nativeBuildInputs = with pkgs; [
+      cargo-hakari
+      rustStable
+      rustPlatformStable.cargoSetupHook
+    ];
+    buildPhase = ''
+      export HOME=$TMPDIR
+      # cargoSetupHook writes .cargo/config.toml with vendored source
+      # replacement; cargo-hakari's internal `cargo metadata` reads it.
+      # CARGO_NET_OFFLINE belt-and-braces against accidental registry
+      # access if a future cargo-hakari version changes its metadata
+      # invocation.
+      export CARGO_NET_OFFLINE=true
+      cargo hakari verify || {
+        echo 'error: workspace-hack is stale — run `cargo xtask regen hakari`'
+        exit 1
+      }
+    '';
+    installPhase = ''
+      touch $out
+    '';
+  };
+
   # Spec-coverage validation: fails on broken r[...]
   # references, duplicate requirement IDs, or unparseable
   # include files. Does NOT fail on uncovered/untested — those
