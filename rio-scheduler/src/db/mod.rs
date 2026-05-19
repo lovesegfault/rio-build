@@ -254,6 +254,11 @@ pub(crate) struct RecoveryDerivationRow {
     pub floor_mem_bytes: i64,
     pub floor_disk_bytes: i64,
     pub floor_deadline_secs: i64,
+    /// Per-execution identifier from the active `assignments` row
+    /// (`migrations/061`). `None` for unassigned drvs (no
+    /// pending/acknowledged assignment). Recovery re-stamps this onto
+    /// `LogBuffers` so the new leader's flusher keys the right S3 blob.
+    pub exec_id: Option<Uuid>,
 }
 
 #[cfg(test)]
@@ -280,6 +285,7 @@ impl RecoveryDerivationRow {
             floor_mem_bytes: 0,
             floor_disk_bytes: 0,
             floor_deadline_secs: 0,
+            exec_id: None,
         }
     }
 }

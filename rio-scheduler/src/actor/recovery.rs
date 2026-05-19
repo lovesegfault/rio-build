@@ -148,6 +148,7 @@ impl DagActor {
         // Build db_id → drv_hash map for edge + build_derivation
         // resolution below. Also build DerivationState nodes.
         let mut id_to_hash: HashMap<Uuid, DrvHash> = HashMap::with_capacity(drv_rows.len());
+        let mut restamped_buffers = 0usize;
         for row in drv_rows {
             let derivation_id = row.derivation_id;
             let Ok(status) = row.status.parse::<DerivationStatus>() else {
@@ -163,8 +164,37 @@ impl DagActor {
                 }
             };
             let hash = state.drv_hash.clone();
+            // Capture before the move into the DAG. `set_log_exec`
+            // looks the drv path up FROM the DAG, so the node must be
+            // inserted before it's called.
+            let restamp = match (status, state.exec_id, state.assigned_executor.clone()) {
+                (
+                    DerivationStatus::Assigned | DerivationStatus::Running,
+                    Some(exec_id),
+                    Some(executor_id),
+                ) => Some((exec_id, executor_id)),
+                _ => None,
+            };
             id_to_hash.insert(derivation_id, hash.clone());
             self.dag.insert_recovered_node(state);
+            // Re-stamp the LogBuffers ring buffer for active
+            // assignments. The new leader's `LogBuffers` is empty
+            // (per-process, never persisted), and `set_exec` runs only
+            // in `assign_to_worker` — which doesn't run for
+            // already-assigned drvs whose workers are still streaming.
+            // Without this, the flusher writes wrong/missing S3 keys
+            // after failover, and `push_for` rejects every batch from
+            // the still-connected worker (no entry → no_assignment).
+            if let Some((exec_id, executor_id)) = restamp {
+                self.set_log_exec(&hash, exec_id, &executor_id);
+                restamped_buffers += 1;
+            }
+        }
+        if restamped_buffers > 0 {
+            info!(
+                count = restamped_buffers,
+                "re-stamped log buffers for active assignments"
+            );
         }
 
         // --- Load poisoned derivations (separate query) ---

@@ -1973,3 +1973,78 @@ async fn test_recovery_restores_build_timeout_baseline() -> TestResult {
     );
     Ok(())
 }
+
+/// After leader failover the new leader's `LogBuffers` is empty
+/// (per-process, never persisted). `set_exec` runs only in
+/// `assign_to_worker`, which doesn't run for already-assigned drvs —
+/// `collect_orphaned_assignments` deliberately leaves still-connected
+/// workers' Assigned/Running drvs in place, and those workers keep
+/// streaming logs to the new leader. Recovery must re-stamp the ring
+/// buffer from `assignments.exec_id` so the flusher keys the right S3
+/// blob and `push_for` accepts the in-flight batches.
+///
+/// Cannot use `RecoveryFixture` — the phase-2 actor needs `log_buffers`
+/// wired (the default plumbing leaves it `None`, making `set_log_exec`
+/// a no-op). Replicates the fixture's two-phase shape inline.
+///
+/// Keep the phase-1 boundary (timeout, drop order, channel cleanup) in
+/// sync with `RecoveryFixture::run_with_store` — it's the same shape.
+#[tokio::test]
+async fn test_recovery_repopulates_log_buffers_exec_id() -> TestResult {
+    let exec_id = Uuid::now_v7();
+    let drv_tag = "z-restamp-drv";
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // --- Phase 1: write state on the "old leader". ---
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        merge_single_node(&handle, Uuid::new_v4(), drv_tag, PriorityClass::Scheduled).await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // The merged node is `ready` with no assignment. Backdate it to
+    // an in-flight Assigned state with an active assignment carrying
+    // the known exec_id — the shape recovery sees after a leader dies
+    // mid-build with a still-connected worker streaming logs.
+    let (drv_id,): (Uuid,) =
+        sqlx::query_as("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+            .bind(drv_tag)
+            .fetch_one(&db.pool)
+            .await?;
+    sqlx::query(
+        "UPDATE derivations SET status = 'assigned', assigned_builder_id = 'restamp-worker' \
+         WHERE derivation_id = $1",
+    )
+    .bind(drv_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO assignments (derivation_id, builder_id, generation, status, exec_id) \
+         VALUES ($1, 'restamp-worker', 1, 'pending', $2)",
+    )
+    .bind(drv_id)
+    .bind(exec_id)
+    .execute(&db.pool)
+    .await?;
+
+    // --- Phase 2: fresh actor recovers, with log_buffers wired so we
+    // can observe the re-stamp. ---
+    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, plumbing| {
+        plumbing.log_buffers = Some(log_buffers.clone());
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        log_buffers.exec_id(&test_drv_path(drv_tag)),
+        Some(exec_id),
+        "recovery should re-stamp LogBuffers.exec_id for active assignments \
+         from assignments.exec_id; got {:?}",
+        log_buffers.exec_id(&test_drv_path(drv_tag)),
+    );
+
+    Ok(())
+}

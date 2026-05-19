@@ -45,6 +45,13 @@ impl SchedulerDb {
     /// predicate (`migrations/004_recovery.sql:85`). Same exclusion
     /// set as `sweep_stale_live_pins`.
     ///
+    /// LEFT JOIN to the active `assignments` row pulls `exec_id` (the
+    /// recovery carrier — `migrations/061`). `assignments_active_uq`
+    /// (`migrations/001_scheduler.sql:98`, a partial UNIQUE index on
+    /// `derivation_id WHERE status IN ('pending', 'acknowledged')`)
+    /// guarantees at most one active assignment per derivation, so the
+    /// join cannot fan out. `exec_id` is NULL for unassigned drvs.
+    ///
     /// CAVEAT: this query has NO join to builds. A derivation whose
     /// own status is non-terminal loads even if every build that ever
     /// referenced it is terminal (failed/cancelled). Those orphans get
@@ -58,16 +65,19 @@ impl SchedulerDb {
     ) -> Result<Vec<RecoveryDerivationRow>, sqlx::Error> {
         sqlx::query_as(terminal_status_sql!(
             r"
-            SELECT derivation_id, drv_hash, drv_path, pname, system, status,
-                   required_features,
-                   assigned_builder_id,
-                   retry_count, resubmit_cycles,
-                   expected_output_paths, output_names, is_fixed_output,
-                   is_ca,
-                   failed_builders,
-                   floor_mem_bytes, floor_disk_bytes, floor_deadline_secs
-            FROM derivations
-            WHERE status NOT IN "
+            SELECT d.derivation_id, d.drv_hash, d.drv_path, d.pname, d.system, d.status,
+                   d.required_features,
+                   d.assigned_builder_id,
+                   d.retry_count, d.resubmit_cycles,
+                   d.expected_output_paths, d.output_names, d.is_fixed_output,
+                   d.is_ca,
+                   d.failed_builders,
+                   d.floor_mem_bytes, d.floor_disk_bytes, d.floor_deadline_secs,
+                   a.exec_id
+            FROM derivations d
+            LEFT JOIN assignments a ON a.derivation_id = d.derivation_id
+                                   AND a.status IN ('pending', 'acknowledged')
+            WHERE d.status NOT IN "
         ))
         .fetch_all(&self.pool)
         .await

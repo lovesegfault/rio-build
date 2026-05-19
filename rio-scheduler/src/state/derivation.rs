@@ -987,9 +987,11 @@ impl DerivationState {
             status,
             interested_builds: HashSet::new(), // populated by build_derivations join
             assigned_executor: row.assigned_builder_id.map(Into::into),
-            // Recovery: exec_id loaded from assignments.exec_id by
-            // recover_from_pg → set on DerivationState + LogBuffers (Task 11).
-            exec_id: None,
+            // From the active `assignments` row (see
+            // `load_nonterminal_derivations`). Recovery re-stamps the
+            // LogBuffers ring buffer from this so the new leader's
+            // flusher keys the right S3 blob; see `load_dag_from_rows`.
+            exec_id: row.exec_id,
             sched: SchedHint {
                 // M_044: persisted reactive floor. PG bigint → i64;
                 // negatives (impossible by DEFAULT 0 + only-ever-doubled
@@ -1773,6 +1775,7 @@ mod tests {
             floor_mem_bytes: 0,
             floor_disk_bytes: 0,
             floor_deadline_secs: 0,
+            exec_id: None,
         };
         let state = DerivationState::from_recovery_row(row, DerivationStatus::Queued).unwrap();
         assert!(state.ca.is_ca, "precondition: recovered as CA");
