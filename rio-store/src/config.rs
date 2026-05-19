@@ -45,7 +45,7 @@ pub enum ChunkBackendKind {
     /// plain `S3` shape — replicas in AZs without Express still
     /// function. The Express bucket is per-AZ; helm wires the right one
     /// via the node's `topology.kubernetes.io/zone` label (P0554).
-    /// See [ADR-023](../../docs/src/decisions/023-tiered-chunk-backend.md).
+    /// See ADR-023 (tiered chunk backend).
     Tiered {
         /// Authoritative S3 standard bucket.
         bucket: String,
@@ -85,9 +85,11 @@ pub struct Config {
     /// Global NAR reassembly buffer budget in bytes — total permits
     /// across ALL concurrent PutPath handlers. Each handler acquires
     /// `chunk.len()` permits before extending its accumulation Vec.
-    /// None → DEFAULT_NAR_BUDGET (8 × MAX_NAR_SIZE = 32 GiB). Lower
-    /// this on small-memory nodes; raise it if you have >8 concurrent
-    /// max-size uploads and RAM to match.
+    /// None → DEFAULT_NAR_BUDGET (8 × MAX_NAR_SIZE = 32 GiB). Must be
+    /// ≥ MAX_NAR_SIZE (4 GiB) — a smaller budget deadlocks any caller
+    /// charging a NAR larger than the budget. Lower toward MAX_NAR_SIZE
+    /// on small-memory nodes (concurrency drops to 1); raise it if you
+    /// have >8 concurrent max-size uploads and RAM to match.
     pub nar_buffer_budget_bytes: Option<u64>,
     /// ed25519 narinfo signing key path (Nix secret-key format:
     /// `name:base64-seed`). None = signing disabled (paths stored
@@ -241,7 +243,7 @@ impl rio_common::config::ValidateConfig for Config {
     /// meets that bar is checked here.
     fn validate(&self) -> anyhow::Result<()> {
         use rio_common::config::ensure_required as required;
-        use rio_common::limits::MIN_NAR_CHUNK_CHARGE;
+        use rio_common::limits::MAX_NAR_SIZE;
         required(&self.database_url, "database_url", "store")?;
         // 0 → buffer_unordered(0) returns Pending forever (no waker):
         // every put_chunked silently hangs the data plane.
@@ -256,14 +258,16 @@ impl rio_common::config::ValidateConfig for Config {
             self.s3_max_attempts >= 1,
             "s3_max_attempts must be >= 1; set RIO_S3_MAX_ATTEMPTS"
         );
-        // < MIN_NAR_CHUNK_CHARGE → Semaphore::new(n<256); every PutPath
-        // acquire_many(chunk.len().max(256)) is Pending forever. There
-        // is no "unlimited" sentinel; unset for the 32 GiB default.
+        // < MAX_NAR_SIZE → `acquire_many(n)` for a NAR sized in
+        // (budget, MAX_NAR_SIZE] parks forever (not error) and
+        // FIFO-blocks everything queued behind it. `limits.rs`
+        // documents budget >= MAX_NAR_SIZE as the no-self-deadlock
+        // invariant; enforce it at boot, not at the first 4 GiB NAR.
         anyhow::ensure!(
             self.nar_buffer_budget_bytes
-                .is_none_or(|b| b >= MIN_NAR_CHUNK_CHARGE as u64),
-            "nar_buffer_budget_bytes must be >= {MIN_NAR_CHUNK_CHARGE} \
-             (smaller hangs all uploads); unset RIO_NAR_BUFFER_BUDGET_BYTES \
+                .is_none_or(|b| b >= MAX_NAR_SIZE),
+            "nar_buffer_budget_bytes must be >= MAX_NAR_SIZE ({MAX_NAR_SIZE}) \
+             (smaller deadlocks uploads); unset RIO_NAR_BUFFER_BUDGET_BYTES \
              for the 32 GiB default — there is no 'unlimited' sentinel"
         );
         // 0 → PgPoolOptions max_connections(0) → PoolTimedOut after 30s
@@ -480,17 +484,27 @@ mod tests {
         assert!(err.contains("nar_buffer_budget_bytes"), "got: {err}");
     }
 
-    /// Any budget < MIN_NAR_CHUNK_CHARGE has identical Pending-forever
-    /// behavior because `acquire_many` floors at 256.
+    /// Any budget < MAX_NAR_SIZE makes `acquire_many(total)` for a
+    /// legal NAR sized in (budget, MAX_NAR_SIZE] park forever.
     #[test]
-    fn validate_rejects_sub_min_nar_budget() {
-        let cfg = Config {
+    fn validate_rejects_budget_below_max_nar_size() {
+        use rio_common::limits::MAX_NAR_SIZE;
+        for bad in [100u64, MAX_NAR_SIZE - 1] {
+            let cfg = Config {
+                database_url: "postgres://x".into(),
+                nar_buffer_budget_bytes: Some(bad),
+                ..Default::default()
+            };
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("nar_buffer_budget_bytes"), "got: {err}");
+        }
+        // Exactly MAX_NAR_SIZE is the floor (concurrency = 1).
+        let at_floor = Config {
             database_url: "postgres://x".into(),
-            nar_buffer_budget_bytes: Some(100),
+            nar_buffer_budget_bytes: Some(MAX_NAR_SIZE),
             ..Default::default()
         };
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("nar_buffer_budget_bytes"), "got: {err}");
+        assert!(at_floor.validate().is_ok());
         // None (unset) is fine — that's the 32 GiB default.
         let ok = Config {
             database_url: "postgres://x".into(),

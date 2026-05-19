@@ -61,7 +61,10 @@ pub async fn compute(
     budget: Option<&Arc<tokio::sync::Semaphore>>,
 ) -> anyhow::Result<Vec<u8>> {
     let hash = StorePath::parse(store_path)?.sha256_digest();
-    let manifest = metadata::get_manifest(pool, store_path)
+    // `claim_id` is read with the manifest contents so `set_nar_index`
+    // can fence against a GC + re-upload racing the reassemble window
+    // below.
+    let (manifest, claim_id) = metadata::get_manifest_for_index(pool, store_path)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no complete manifest for {store_path}"))?;
     let total = manifest.total_size();
@@ -84,10 +87,15 @@ pub async fn compute(
     };
 
     let nar = reassemble(cache, manifest, total).await?;
-    let entries = nar_ls(Cursor::new(&nar))?;
-    let dag = castore::build(&entries);
-    let encoded = encode_entries(&entries, &dag);
-    metadata::set_nar_index(pool, &hash, &encoded, &dag).await?;
+    // nar_ls (BLAKE3 over all file content) + castore::build is
+    // multi-second CPU work for a 4 GiB NAR; run it off the async
+    // worker.
+    let (encoded, dag) = crate::cas::cpu_bound(|| -> anyhow::Result<_> {
+        let entries = nar_ls(Cursor::new(&nar))?;
+        let dag = castore::build(&entries);
+        Ok((encode_entries(&entries, &dag), dag))
+    })?;
+    metadata::set_nar_index(pool, &hash, claim_id, &encoded, &dag).await?;
     metrics::counter!("rio_store_nar_index_compute_total").increment(1);
     Ok(encoded)
 }

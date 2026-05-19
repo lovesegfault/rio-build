@@ -821,7 +821,7 @@ impl ChunkCache {
         if actual == *expected {
             Ok(bytes)
         } else {
-            metrics::counter!("rio_store_integrity_failures_total").increment(1);
+            metrics::counter!("rio_store_integrity_failures_total", "site" => "chunk").increment(1);
             Err(ChunkError::Corrupt {
                 expected: *expected,
                 actual,

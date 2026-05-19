@@ -324,6 +324,47 @@ impl ChunkService for MockStore {
             rx,
         )))
     }
+
+    type GetChunksStream = tokio_stream::wrappers::ReceiverStream<Result<types::ChunkData, Status>>;
+
+    /// Bidi-stream batch fetch (P0568). Same lookup as `get_chunk` —
+    /// reads the seeded `state.chunks` map, no fan-out (the real
+    /// server's `K_server` parallelism is a perf concern, not a
+    /// behavior the consumer can observe; `ChunkData` carries the
+    /// digest precisely so completion order doesn't matter). Mirrors
+    /// the real abort-on-first-miss contract so retry tests against
+    /// the mock exercise the same code path as production.
+    async fn get_chunks(
+        &self,
+        request: Request<Streaming<types::GetChunksRequest>>,
+    ) -> Result<Response<Self::GetChunksStream>, Status> {
+        let mut requests = request.into_inner();
+        let chunks = std::sync::Arc::clone(&self.state.chunks);
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            'frames: while let Ok(Some(frame)) = requests.message().await {
+                for digest in frame.digests {
+                    let item = chunks
+                        .read()
+                        .unwrap()
+                        .get(&digest)
+                        .cloned()
+                        .map(|data| types::ChunkData {
+                            digest,
+                            data: data.into(),
+                        })
+                        .ok_or_else(|| Status::not_found("mock: chunk not found"));
+                    let is_err = item.is_err();
+                    if tx.send(item).await.is_err() || is_err {
+                        break 'frames;
+                    }
+                }
+            }
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
 }
 
 impl MockStore {
@@ -1085,5 +1126,24 @@ impl StoreService for MockStore {
         // SCHEDULER (HwTable::load), not anything that goes through
         // MockStore. Accept and discard.
         Ok(Response::new(()))
+    }
+
+    // TODO(P0552): no consumers yet — castore-FUSE `tree::build_tree`
+    // (P0559) prefetches via GetDirectory, not GetNarIndex.
+    async fn get_nar_index(
+        &self,
+        _request: Request<types::GetNarIndexRequest>,
+    ) -> Result<Response<types::NarIndex>, Status> {
+        Err(Status::unimplemented("MockStore: GetNarIndex (P0552)"))
+    }
+
+    type GetNarIndexBatchStream =
+        tokio_stream::wrappers::ReceiverStream<Result<types::NarIndexResponse, Status>>;
+
+    async fn get_nar_index_batch(
+        &self,
+        _request: Request<types::GetNarIndexBatchRequest>,
+    ) -> Result<Response<Self::GetNarIndexBatchStream>, Status> {
+        Err(Status::unimplemented("MockStore: GetNarIndexBatch (P0552)"))
     }
 }
