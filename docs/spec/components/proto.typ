@@ -693,19 +693,19 @@ directing them to upgrade.
     align: (left, left, left),
     table.header([Protocol Version], [Nix Release], [Key Features]),
     [1.35],
-    [Nix 2.18 / Lix],
+    [Nix 2.15--2.19 / Lix],
     [*Minimum for rio-build:* trusted status in handshake; Lix's frozen
       version],
 
-    [1.36], [Nix 2.19], [Minor fixes],
-    [1.37], [Nix 2.20], [CPU timing in BuildResult (gated in rio)],
-    [1.38],
-    [Nix 2.21],
-    [Feature exchange in handshake (gated in rio); *rio advertises this*],
+    [1.37],
+    [Nix 2.20--2.23],
+    [CPU timing in BuildResult (gated in rio). 1.36 was never assigned to a
+      release.],
 
-    [1.39], [Nix 2.22], [Minor protocol refinements],
-    [1.40], [Nix 2.23], [Additional BuildResult fields],
-    [1.41], [Nix 2.24], [Latest stable at time of writing],
+    [1.38],
+    [Nix 2.24+],
+    [Feature exchange in handshake (gated in rio); *rio advertises this*.
+      Latest released as of Nix 2.28.],
   ),
 )
 
@@ -717,10 +717,11 @@ directing them to upgrade.
     table.header(
       [NixOS Release], [Nix Version], [Protocol Version], [Compatible?]
     ),
-    [NixOS 23.05], [Nix 2.15], [1.33], [No],
+    [NixOS 23.05], [Nix 2.13], [1.34], [No],
     [NixOS 23.11], [Nix 2.18], [1.35], [Yes],
-    [NixOS 24.05], [Nix 2.21], [1.38], [Yes],
-    [NixOS 24.11], [Nix 2.24], [1.41], [Yes],
+    [NixOS 24.05], [Nix 2.18], [1.35], [Yes],
+    [NixOS 24.11], [Nix 2.24], [1.38], [Yes],
+    [NixOS 25.05], [Nix 2.28], [1.38], [Yes],
     [Lix (any)], [---], [1.35], [Yes],
   ),
 )
