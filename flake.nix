@@ -241,7 +241,7 @@
               # fileset is just its own directory — no per-crate unions
               # or exclusions. The lib/bin vs. test split is layered on
               # top in memberBinFilesets below, not encoded here.
-              inherit ((pkgs.lib.importTOML ./Cargo.toml).workspace) members;
+              inherit (cargoToml.workspace) members;
               memberFilesets = pkgs.lib.genAttrs members (n: ./. + "/${n}");
               # Per-member fileset for the lib/bin compile — memberFilesets
               # MINUS tests/ and proptest-regressions/. buildRustCrate never
