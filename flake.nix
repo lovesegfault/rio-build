@@ -251,6 +251,8 @@
                 workspaceFileset
                 workspaceSrc
                 memberSrcs
+                manifestsFileset
+                stubTargetFiles
                 ;
 
               # Prefix every key in an attrset. Used to surface per-member
@@ -431,7 +433,9 @@
                     pkgs
                     unfilteredRoot
                     workspaceFileset
+                    manifestsFileset
                     memberFilesets
+                    stubTargetFiles
                     goldenTestEnv
                     nixForTests
                     ;
@@ -489,6 +493,8 @@
                   version
                   unfilteredRoot
                   workspaceFileset
+                  manifestsFileset
+                  stubTargetFiles
                   rustStable
                   rustPlatformStable
                   traceyPkg

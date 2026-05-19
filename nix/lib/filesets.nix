@@ -109,4 +109,69 @@ rec {
       inherit fileset;
     }
   ) memberBinFilesets;
+
+  # Manifests + lockfile only — NO `.rs` source content. The
+  # minimal fileset `cargo metadata` needs to resolve workspace
+  # structure and the dep graph. Pair with `stubTargetFiles` so
+  # cargo's autotest/autobin discovery finds the (empty) target
+  # files. Shared by cargoMetadataJson (nix/lib/nextest-args.nix
+  # → nix/checks.nix), the deny check (nix/misc-checks.nix), and
+  # mutants-smoke (nix/mutants.nix) — all manifest-only checks
+  # that should not rebuild on every `.rs` edit.
+  manifestsFileset = lib.fileset.unions [
+    (unfilteredRoot + "/Cargo.toml")
+    (unfilteredRoot + "/Cargo.lock")
+    (lib.fileset.fileFilter (f: f.name == "Cargo.toml") unfilteredRoot)
+  ];
+
+  # Mirror cargo's auto-detected target files (src/lib.rs,
+  # src/main.rs, src/bin/*.rs, tests/*.rs, tests/*/main.rs)
+  # as empty stubs. pathExists/readDir at eval time depend
+  # on file EXISTENCE not content, so editing the bodies
+  # doesn't change this string — manifest-only checks stay
+  # cached until a target file is added or removed.
+  stubTargetFiles =
+    let
+      stubIf =
+        p:
+        lib.optionalString (builtins.pathExists p) ''
+          mkdir -p "$(dirname ${lib.removePrefix (toString unfilteredRoot + "/") (toString p)})"
+          touch ${lib.removePrefix (toString unfilteredRoot + "/") (toString p)}
+        '';
+      stubBinDir =
+        d:
+        lib.optionalString (builtins.pathExists d) (
+          lib.concatMapStrings (f: stubIf (d + "/${f}")) (builtins.attrNames (builtins.readDir d))
+        );
+      # Mirrors cargo's integration-test autodiscovery:
+      #   tests/<name>.rs       → target `<name>`
+      #   tests/<name>/main.rs  → target `<name>`
+      # Other files in tests/ (mod.rs, helpers, fixtures)
+      # are NOT autotest targets — cargo only compiles them
+      # when a target `mod`-includes them, which the metadata
+      # walk never does.
+      stubTestDir =
+        d:
+        lib.optionalString (builtins.pathExists d) (
+          let
+            entries = builtins.readDir d;
+          in
+          lib.concatMapStrings (
+            f:
+            if entries.${f} == "regular" && lib.hasSuffix ".rs" f then
+              stubIf (d + "/${f}")
+            else if entries.${f} == "directory" then
+              stubIf (d + "/${f}/main.rs")
+            else
+              ""
+          ) (builtins.attrNames entries)
+        );
+    in
+    lib.concatMapStrings (
+      m:
+      stubIf (unfilteredRoot + "/${m}/src/lib.rs")
+      + stubIf (unfilteredRoot + "/${m}/src/main.rs")
+      + stubBinDir (unfilteredRoot + "/${m}/src/bin")
+      + stubTestDir (unfilteredRoot + "/${m}/tests")
+    ) (builtins.attrNames memberFilesets);
 }

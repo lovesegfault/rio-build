@@ -16,8 +16,14 @@
   unfilteredRoot,
   # Workspace fileset union (nix/lib/filesets.nix).
   workspaceFileset,
+  # Manifests + lockfile only (nix/lib/filesets.nix). Underlies
+  # nextestRunSrc; paired with stubTargetFiles.
+  manifestsFileset,
   # Per-member full filesets — WIDE (tests/ + proptest-regressions/).
   memberFilesets,
+  # Bash snippet that creates empty stub target files so cargo
+  # metadata works against a manifests-only source (nix/lib/filesets.nix).
+  stubTargetFiles,
   # RIO_GOLDEN_* env vars for golden conformance tests.
   goldenTestEnv,
   # Nix CLI without its self-test gate — what test runtimes spawn.
@@ -107,9 +113,7 @@ in
   nextestRunSrc = pkgs.lib.fileset.toSource {
     root = unfilteredRoot;
     fileset = pkgs.lib.fileset.unions [
-      (unfilteredRoot + "/Cargo.toml")
-      (unfilteredRoot + "/Cargo.lock")
-      (pkgs.lib.fileset.fileFilter (f: f.name == "Cargo.toml") unfilteredRoot)
+      manifestsFileset
       (unfilteredRoot + "/.config/nextest.toml")
       # metrics_registered tests grep the per-component
       # metric set at runtime (rio-test-support
@@ -134,56 +138,11 @@ in
       fileset = fs;
     }
   ) memberFilesets;
-  # Mirror cargo's auto-detected target files (src/lib.rs,
-  # src/main.rs, src/bin/*.rs, tests/*.rs, tests/*/main.rs)
-  # as empty stubs. pathExists/readDir at eval time depend
-  # on file EXISTENCE not content, so editing the bodies
-  # doesn't change this string — cargoMetadataJson stays
-  # cached until a target file is added or removed.
-  stubTargetFiles =
-    let
-      stubIf =
-        p:
-        pkgs.lib.optionalString (builtins.pathExists p) ''
-          mkdir -p "$(dirname ${pkgs.lib.removePrefix (toString unfilteredRoot + "/") (toString p)})"
-          touch ${pkgs.lib.removePrefix (toString unfilteredRoot + "/") (toString p)}
-        '';
-      stubBinDir =
-        d:
-        pkgs.lib.optionalString (builtins.pathExists d) (
-          pkgs.lib.concatMapStrings (f: stubIf (d + "/${f}")) (builtins.attrNames (builtins.readDir d))
-        );
-      # Mirrors cargo's integration-test autodiscovery:
-      #   tests/<name>.rs       → target `<name>`
-      #   tests/<name>/main.rs  → target `<name>`
-      # Other files in tests/ (mod.rs, helpers, fixtures)
-      # are NOT autotest targets — cargo only compiles them
-      # when a target `mod`-includes them, which the metadata
-      # walk never does.
-      stubTestDir =
-        d:
-        pkgs.lib.optionalString (builtins.pathExists d) (
-          let
-            entries = builtins.readDir d;
-          in
-          pkgs.lib.concatMapStrings (
-            f:
-            if entries.${f} == "regular" && pkgs.lib.hasSuffix ".rs" f then
-              stubIf (d + "/${f}")
-            else if entries.${f} == "directory" then
-              stubIf (d + "/${f}/main.rs")
-            else
-              ""
-          ) (builtins.attrNames entries)
-        );
-    in
-    pkgs.lib.concatMapStrings (
-      m:
-      stubIf (unfilteredRoot + "/${m}/src/lib.rs")
-      + stubIf (unfilteredRoot + "/${m}/src/main.rs")
-      + stubBinDir (unfilteredRoot + "/${m}/src/bin")
-      + stubTestDir (unfilteredRoot + "/${m}/tests")
-    ) (builtins.attrNames memberFilesets);
+  # Pass through the empty-target-file stub script so checks.nix's
+  # cargoMetadataJson can pair it with nextestRunSrc. Defined in
+  # nix/lib/filesets.nix alongside manifestsFileset (both are
+  # source-tree-slice concerns, shared with deny / mutants-smoke).
+  inherit stubTargetFiles;
   nextestExtraArgs = [
     "--profile"
     "ci"

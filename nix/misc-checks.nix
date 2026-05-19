@@ -10,6 +10,12 @@
   version,
   unfilteredRoot,
   workspaceFileset,
+  # Manifests + lockfile only (nix/lib/nextest-args.nix). Paired with
+  # `stubTargetFiles` so `cargo metadata` works without `.rs` source —
+  # the `deny` check reads only manifests, and tying it to
+  # `workspaceFileset` made it rebuild on every `.rs` edit.
+  manifestsFileset,
+  stubTargetFiles,
   rustStable,
   rustPlatformStable,
   traceyPkg,
@@ -55,6 +61,15 @@ in
   # needs vendored sources (cargoSetupHook writes a source-
   # replacement config so cargo finds crates.io deps in the
   # vendored dir instead of the registry index).
+  #
+  # src is manifests + lockfile + deny.toml only — cargo-deny
+  # never reads `.rs` content (license is `[workspace.package]`,
+  # not per-file headers; advisories/bans/sources come from
+  # Cargo.lock). `stubTargetFiles` synthesizes the empty target
+  # files cargo's autodiscovery needs at build time, computed
+  # at eval time from pathExists/readDir — so a `.rs` body edit
+  # never rehashes this drv, only adding/removing a target
+  # file or touching a manifest does.
   deny = pkgs.stdenv.mkDerivation {
     pname = "rio-deny";
     inherit version;
@@ -62,7 +77,7 @@ in
       root = unfilteredRoot;
       fileset = pkgs.lib.fileset.unions [
         ../.cargo/deny.toml
-        workspaceFileset
+        manifestsFileset
       ];
     };
     cargoDeps = rustPlatformStable.importCargoLock {
@@ -78,6 +93,7 @@ in
     # source replacement. cargo metadata reads it; no registry
     # access needed.
     buildPhase = ''
+      ${stubTargetFiles}
       # HOME defaults to /homeless-shelter (RO). deny.toml's
       # db-path = "~/.cargo/advisory-db" resolves against
       # HOME. cargo-deny expects the DB as a GIT REPO (reads
