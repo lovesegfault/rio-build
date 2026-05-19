@@ -49,6 +49,13 @@ ignore:
   - "rio-test-support/**"  # PG bootstrap, gRPC harness, wire helpers
   - "**/tests/**"          # integration tests drive coverage, don't need it
   - "**/fuzz/**"           # fuzz targets (excluded from workspace anyway)
+  # Spike harnesses: throwaway proof-of-concept binaries booted inside
+  # QEMU by the composefs/FUSE VM tests. Never run under `cargo nextest`
+  # so they have 0% unit coverage by construction. Already excluded from
+  # the *coverage-mode* VM build (flake.nix vmTestsCov removeAttrs) for
+  # the same reason — including them in patch math just deflates the
+  # signal on real production code.
+  - "**/bin/spike_*.rs"
 
 comment:
   # condensed_header drops the giant coverage-diff ASCII block;
