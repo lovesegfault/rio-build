@@ -192,45 +192,31 @@ let
   # is needed — the per-member fileset already includes `migrations/`.
   #
   # sqlx offline query cache — content-addressed JSON per query!(...)
-  # callsite. sqlx-macros-core 0.8.x ALWAYS runs `$CARGO metadata` to
-  # find workspace_root (workspace.rs:Metadata::resolve) — even with
-  # SQLX_OFFLINE + SQLX_OFFLINE_DIR set, there's no bypass.
-  # buildRustCrate calls rustc directly (no cargo, no workspace
-  # Cargo.lock) so: without CARGO → "`CARGO` must be set"; with real
-  # cargo → "EOF while parsing a value" (cargo metadata fails, no valid
-  # workspace). Both → macro expands to dummy type → E0282.
-  #
-  # Fix: point CARGO at a stub that outputs the minimal metadata JSON
-  # sqlx needs (workspace_root + target_directory + empty packages).
-  # workspace_root points at the store path containing .sqlx/, so sqlx
-  # finds the offline cache there. maybeMissing: a fresh clone before
-  # the first `cargo xtask regen sqlx` won't have .sqlx/ yet.
+  # callsite. maybeMissing: a fresh clone before the first
+  # `cargo xtask regen sqlx` won't have .sqlx/ yet.
   sqlxCacheFileset = pkgs.lib.fileset.toSource {
     root = ../.;
     fileset = pkgs.lib.fileset.maybeMissing ../.sqlx;
   };
-  cargoMetadataStub = pkgs.writeShellScript "cargo-metadata-stub" ''
-    # sqlx-macros-core runs `$CARGO metadata --format-version=1`.
-    # It only reads .workspace_root (to locate .sqlx/) + .target_directory
-    # (unused in offline mode). Minimal valid cargo_metadata::Metadata JSON:
-    if [ "$1" = "metadata" ]; then
-      echo '{"packages":[],"workspace_members":[],"workspace_default_members":[],"resolve":null,"target_directory":"/tmp","version":1,"workspace_root":"${sqlxCacheFileset}","metadata":null}'
-      exit 0
-    fi
-    echo "cargo-metadata-stub: unexpected invocation: $*" >&2
-    exit 1
-  '';
 
   # query! macros read .sqlx/*.json instead of connecting to PG at
-  # compile time. SQLX_OFFLINE_DIR bypasses the workspace-root walk;
-  # CARGO points at a stub that outputs minimal `cargo metadata` JSON
-  # (sqlx-macros-core 0.8.x always invokes it, no bypass — see
-  # cargoMetadataStub above for the full failure chain). Applied to
-  # every crate with `query!()`/`query_as!()` callsites.
+  # compile time. sqlx-macros-core 0.8.x finds the cache by (in order,
+  # short-circuiting find() — query/mod.rs:166-176 @ 0.8.6):
+  #   1. `offline_dir` parsed from a `.env` file at $CARGO_MANIFEST_DIR/.env
+  #      (load_dot_env, query/mod.rs:390-435 — the SQLX_OFFLINE_DIR *env
+  #      var* is NOT consulted on this path, only the .env file)
+  #   2. $CARGO_MANIFEST_DIR/.sqlx
+  #   3. workspace_root().join(".sqlx") — spawns `$CARGO metadata`
+  # buildRustCrate calls rustc directly (no cargo, no CARGO env var, no
+  # workspace Cargo.lock), so (3) would need a fake `cargo` shim. (1) is
+  # checked first and short-circuits — write the .env in postUnpack so
+  # the macro never reaches (3). Applied to every crate with
+  # `query!()`/`query_as!()` callsites.
   sqlxOffline = {
     SQLX_OFFLINE = "true";
-    SQLX_OFFLINE_DIR = "${sqlxCacheFileset}/.sqlx";
-    CARGO = "${cargoMetadataStub}";
+    postUnpack = ''
+      echo "SQLX_OFFLINE_DIR=${sqlxCacheFileset}/.sqlx" > $sourceRoot/.env
+    '';
   };
 
   # rio-controller's pool tests include_str! the seccomp profile
@@ -350,15 +336,14 @@ let
     # rio_proto::FILE_DESCRIPTOR_SET via a [build-dependencies] on
     # rio-proto — no protoc, no cross-directory proto reads, no override.
 
-    # sqlx::query!()/query_as!() callsites — need the offline cache +
-    # cargo-metadata stub. (sqlx::migrate!() lives only in
-    # rio-migrations, which is a leaf crate and needs neither.)
+    # sqlx::query!()/query_as!() callsites — need the offline cache.
+    # (sqlx::migrate!() lives only in rio-migrations, which is a leaf
+    # crate and needs no override.)
     rio-scheduler = _: sqlxOffline;
     rio-store = _: sqlxOffline;
-    # nodeclaim_pool/sketch.rs uses sqlx::query! (offline cache + CARGO
-    # stub). The #[cfg(test)]-only seccomp include_str! is in
-    # testOnlyPostUnpack — applied by checks.nix's mkTestVariant
-    # alongside buildTests=true.
+    # nodeclaim_pool/sketch.rs uses sqlx::query! (offline cache). The
+    # #[cfg(test)]-only seccomp include_str! is in testOnlyPostUnpack —
+    # applied by checks.nix's mkTestVariant alongside buildTests=true.
     rio-controller = _: sqlxOffline;
 
     # build.rs compiles libFuzzer's C++ via the `cc` crate. stdenv's
