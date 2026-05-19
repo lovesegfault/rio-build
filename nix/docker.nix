@@ -310,163 +310,25 @@ let
   # `ServiceClaims{caller:"rio-dashboard", expiry_unix:now+60}` per
   # request and injects it as `x-rio-service-token`. Same envelope as
   # rio-auth's ServiceTokenInterceptor (b64url(json).b64url(hmac)).
+  #
+  # Config + njs module live in standalone files (.conf / .js) so
+  # they get syntax highlighting and lint tools, and so this file
+  # stays about layered-image construction. Allow-lists stay here as
+  # Nix data — they're shared with dashboardReadonlyMethods (the
+  # method-gate-parity check) and substituted into the .conf template.
   dashboardNginx = pkgs.nginx.override {
     modules = [ pkgs.nginxModules.njs ];
   };
-  dashboardServiceTokenJs = pkgs.writeText "service-token.js" ''
-    import crypto from 'crypto';
-    import fs from 'fs';
-
-    // Key file mounted from the rio-service-hmac Secret. Read once at
-    // worker init (njs caches the module-level binding); a key rotation
-    // requires a pod restart, same as every other rio component.
-    // Missing mount → empty string → scheduler in dev mode (verifier=
-    // None) accepts anything; with verifier set, the empty-key HMAC is
-    // rejected and the request fails closed (PermissionDenied).
-    let key;
-    try {
-      const raw = fs.readFileSync('/etc/rio/hmac/service-hmac.key');
-      // Mirror rio-auth load_key EXACTLY: strip one trailing CRLF or
-      // LF at the byte level so a Secret created with `echo` (no -n)
-      // or a YAML `|` block scalar still verifies. NOT .toString()
-      // .replace() — the key is raw `openssl rand 32` bytes; a UTF-8
-      // round-trip would corrupt it. lib/hmac-keys.nix appends LF to
-      // the test fixture so vm-dashboard-k3s breaks if this drifts.
-      let n = raw.length;
-      if (n >= 2 && raw[n - 2] === 0x0d && raw[n - 1] === 0x0a) {
-        n -= 2;
-      } else if (n >= 1 && raw[n - 1] === 0x0a) {
-        n -= 1;
-      }
-      key = raw.slice(0, n);
-    } catch (e) {
-      key = Buffer.from("");
-    }
-
-    function b64url(buf) {
-      return buf
-        .toString('base64')
-        .replace(/\+/g, '-')
-        .replace(/\//g, '_')
-        .replace(/=+$/, "");
-    }
-
-    function token(r) {
-      const claims = JSON.stringify({
-        caller: 'rio-dashboard',
-        expiry_unix: Math.floor(Date.now() / 1000) + 60,
-      });
-      const body = Buffer.from(claims);
-      const tag = crypto.createHmac('sha256', key).update(body).digest();
-      return b64url(body) + '.' + b64url(tag);
-    }
-
-    export default { token };
-  '';
-  # Shared proxy_pass directives for both allow-list locations (admin
-  # + scheduler). Unbuffered streaming + long read-timeout are LOAD-
-  # BEARING — see the in-config comment.
-  dashboardProxyDirectives = ''
-    proxy_pass http://rio_scheduler;
-    proxy_http_version 1.1;
-    proxy_buffering off;
-    proxy_read_timeout 3600s;
-    proxy_set_header Content-Type $content_type;
-    proxy_set_header X-Grpc-Web $http_x_grpc_web;
-    # r[impl sched.sla.threat.read-path-auth] (documentary — tracey
-    # does not scan .nix outside nix/tests/default.nix). The njs
-    # variable is computed per request; 60s expiry matches
-    # ServiceTokenInterceptor.
-    proxy_set_header x-rio-service-token $rio_service_token;
-  '';
-  dashboardNginxConf = pkgs.writeText "nginx.conf" ''
-    # Non-root container (runAsUser, readOnlyRootFilesystem). Master
-    # process runs foreground; no `user` directive (we're already
-    # unprivileged — nginx warns on `user` when not root and ignores
-    # it). pid + temp paths go to /tmp (emptyDir mount in the
-    # Deployment).
-    daemon off;
-    pid /tmp/nginx.pid;
-    error_log /dev/stderr info;
-    events { worker_connections 1024; }
-    http {
-      include ${dashboardNginx}/conf/mime.types;
-      js_import svc from ${dashboardServiceTokenJs};
-      js_set $rio_service_token svc.token;
-      access_log /dev/stdout;
-      # All writable paths in /tmp. readOnlyRootFilesystem blocks the
-      # compiled-in defaults (/var/cache/nginx/* on most distros,
-      # $prefix/client_body_temp/* on nixpkgs). One emptyDir covers
-      # all five — nginx only writes to these on large bodies /
-      # upstream responses; gRPC-Web POSTs are small proto frames.
-      client_body_temp_path /tmp/client_body;
-      proxy_temp_path       /tmp/proxy;
-      fastcgi_temp_path     /tmp/fastcgi;
-      uwsgi_temp_path       /tmp/uwsgi;
-      scgi_temp_path        /tmp/scgi;
-
-      # Single upstream: rio-scheduler directly. The scheduler serves
-      # gRPC-Web NATIVELY (tonic-web layer, D3) so the in-cluster nginx
-      # → scheduler hop needs no Gateway. The Cilium Gateway is for
-      # north-south (browser → cluster) — Cilium's L7 redirect fires on
-      # the LoadBalancer IP, not the Service ClusterIP, so an in-cluster
-      # client targeting the Gateway Service FQDN would just hang
-      # (selectorless Service, no Endpoints).
-      upstream rio_scheduler {
-        server rio-scheduler.rio-system.svc.cluster.local:9001;
-      }
-      server {
-        # 8080 not 80: runAsNonRoot means no CAP_NET_BIND_SERVICE →
-        # can't bind <1024. The k8s Service maps :80 → targetPort:8080.
-        # [::] not bare 8080: bare `listen PORT` binds 0.0.0.0 only;
-        # in a v6-only pod the kubelet httpGet probe targets the pod's
-        # v6 IP and never connects. With Linux bindv6only=0 (default)
-        # [::] dual-binds, so v4 lo still works for port-forward.
-        listen [::]:8080;
-
-        # SPA: all unknown routes serve index.html, the client-side
-        # router (svelte-routing / whatever P0274 picked) handles the
-        # path. try_files short-circuits to the real file for static
-        # assets (/assets/*.js, *.css).
-        location / {
-          root ${rioDashboard};
-          try_files $uri /index.html;
-        }
-
-        # r[dash.auth.method-gate+2] ALLOW-LIST: only the readonly
-        # methods enumerated above are proxied; everything else under
-        # /rio.* falls through to the catch-all 404 below. This was a
-        # 4-method DENY-list, which fail-OPENED ~10 mutating RPCs
-        # (ResetSlaModel, SubmitBuild, CancelBuild, ReportExecutor-
-        # Termination, …) to any port-forwarded browser. Allow-list
-        # polarity matches the Cilium Gateway HTTPRoute and is
-        # CI-enforced via dashboard-method-gate-parity.
-        #
-        # nginx evaluates regex locations in config order, first-match
-        # wins — proxy locations FIRST, catch-all 404 LAST.
-        #
-        # gRPC-Web is plain HTTP/1.1 POST with a length-prefixed proto
-        # body; rio-scheduler's tonic-web layer (D3) handles gRPC-Web
-        # on the same port as native gRPC.
-        location ~ ^/rio\.admin\.AdminService/(${lib.concatStringsSep "|" dashboardReadonlyAdmin})$ {
-          # LOAD-BEARING proxy_buffering off: GetBuildLogs is a live-
-          # tailing stream; with buffering on, nginx flushes nothing
-          # until completion. proxy_read_timeout 3600s: matches the
-          # scheduler's http2_keepalive_interval(30s) so quiet streams
-          # survive. (Same directives in dashboardProxyDirectives.)
-          ${dashboardProxyDirectives}
-        }
-        location ~ ^/rio\.scheduler\.SchedulerService/(${lib.concatStringsSep "|" dashboardReadonlyScheduler})$ {
-          ${dashboardProxyDirectives}
-        }
-        # Fail-closed catch-all for any other /rio.* path (mutating
-        # admin RPCs, SubmitBuild/CancelBuild, future methods).
-        location ~ ^/rio\. {
-          return 404;
-        }
-      }
-    }
-  '';
+  dashboardServiceTokenJs = pkgs.writeText "service-token.js" (
+    builtins.readFile ./dashboard-service-token.js
+  );
+  dashboardNginxConf = pkgs.replaceVars ./dashboard-nginx.conf {
+    mimeTypes = "${dashboardNginx}/conf/mime.types";
+    serviceTokenJs = dashboardServiceTokenJs;
+    spaRoot = rioDashboard;
+    readonlyAdminAlt = lib.concatStringsSep "|" dashboardReadonlyAdmin;
+    readonlySchedulerAlt = lib.concatStringsSep "|" dashboardReadonlyScheduler;
+  };
 
   mkImage =
     {
@@ -574,90 +436,7 @@ rec {
   # Exposed (not let-local) so the bootstrap-idempotent check
   # (nix/misc-checks.nix) can run it against a mocked aws CLI and
   # assert the signing-key block converges from partial state.
-  bootstrapScript = pkgs.writeShellScript "rio-bootstrap" ''
-    set -euo pipefail
-    : "''${AWS_REGION:?}" "''${CHUNK_BUCKET:?}"
-
-        if aws secretsmanager describe-secret --secret-id rio/hmac >/dev/null 2>&1; then
-          echo "[bootstrap] rio/hmac already exists, skipping"
-        else
-          echo "[bootstrap] generating rio/hmac"
-          # 32 raw bytes. SecretBinary (not SecretString) — the HMAC key
-          # isn't text. ESO's decodingStrategy: None preserves raw bytes.
-          openssl rand 32 > /tmp/hmac
-          aws secretsmanager create-secret --name rio/hmac \
-            --secret-binary fileb:///tmp/hmac
-        fi
-
-        if aws secretsmanager describe-secret --secret-id rio/service-hmac >/dev/null 2>&1; then
-          echo "[bootstrap] rio/service-hmac already exists, skipping"
-        else
-          echo "[bootstrap] generating rio/service-hmac"
-          # SEPARATE key from rio/hmac — gateway signs ServiceClaims with
-          # this; store verifies. A leaked assignment key cannot mint
-          # service tokens (different secret, different claims shape).
-          openssl rand 32 > /tmp/service-hmac
-          aws secretsmanager create-secret --name rio/service-hmac \
-            --secret-binary fileb:///tmp/service-hmac
-        fi
-
-        # Guard on BOTH halves. With one guard and two creates, a Job
-        # retry after dying between the two creates (or a rotation by
-        # deleting only the private half) left a permanently mismatched
-        # pair while the Job reported success — every client signature
-        # check then fails. Guarding both + create||put converges from
-        # any partial state.
-        if aws secretsmanager describe-secret --secret-id rio/signing-key >/dev/null 2>&1 \
-           && aws secretsmanager describe-secret --secret-id rio/signing-key-pub >/dev/null 2>&1; then
-          echo "[bootstrap] rio/signing-key{,-pub} already exist, skipping"
-        else
-          echo "[bootstrap] generating rio/signing-key"
-          tmp=$(mktemp -d)
-          # Key name includes the bucket so narinfo `Sig:` lines identify
-          # which cluster signed them. Format: name:base64-seed.
-          # --store dummy://: nix-store opens LocalStore on startup
-          # (mkdir /nix/store/.links) → EROFS under readOnlyRootFilesystem.
-          # The dummy backend skips all filesystem store init.
-          nix-store --store dummy:// \
-            --generate-binary-cache-key "rio-$CHUNK_BUCKET" \
-            "$tmp/key.sec" "$tmp/key.pub"
-          # Pub FIRST, create||put: a half-done prior run or a delete-
-          # private-only rotation converges instead of leaving a stale
-          # pub. If we die after pub-create, retry's guard fails (private
-          # missing) → regenerate both → pub overwritten via put.
-          # Public half stored separately so operators can `get-secret-
-          # value` it for their nix.conf trusted-public-keys without
-          # access to the private half.
-          aws secretsmanager create-secret --name rio/signing-key-pub \
-            --secret-string "file://$tmp/key.pub" 2>/dev/null \
-            || aws secretsmanager put-secret-value --secret-id rio/signing-key-pub \
-                 --secret-string "file://$tmp/key.pub"
-          aws secretsmanager create-secret --name rio/signing-key \
-            --secret-string "file://$tmp/key.sec" 2>/dev/null \
-            || aws secretsmanager put-secret-value --secret-id rio/signing-key \
-                 --secret-string "file://$tmp/key.sec"
-          echo "[bootstrap] public key (add to nix.conf trusted-public-keys):"
-          cat "$tmp/key.pub"
-        fi
-
-        if aws secretsmanager describe-secret --secret-id rio/gateway-host-key >/dev/null 2>&1; then
-          echo "[bootstrap] rio/gateway-host-key already exists, skipping"
-        else
-          echo "[bootstrap] generating rio/gateway-host-key"
-          tmp=$(mktemp -d)
-          # OpenSSH-format ed25519 private key. -N "" (no passphrase),
-          # -C "" (no comment — the comment field in a host key is unused
-          # and would otherwise leak the build-time hostname). -f writes
-          # to $tmp (the /tmp emptyDir, writable under
-          # readOnlyRootFilesystem). russh::keys::load_secret_key reads
-          # the OpenSSH PEM format ssh-keygen emits.
-          ssh-keygen -t ed25519 -N "" -C "" -f "$tmp/host_key" </dev/null
-          aws secretsmanager create-secret --name rio/gateway-host-key \
-            --secret-string "file://$tmp/host_key"
-          echo "[bootstrap] gateway host key fingerprint (for known_hosts pinning):"
-      ssh-keygen -l -f "$tmp/host_key.pub"
-    fi
-  '';
+  bootstrapScript = pkgs.writeShellScript "rio-bootstrap" (builtins.readFile ./bootstrap-job.sh);
   bootstrap = buildZstd {
     name = "rio-bootstrap";
     tag = "dev";
