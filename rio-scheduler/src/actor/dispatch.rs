@@ -1807,19 +1807,34 @@ impl DagActor {
         }
 
         // ADR-022 castore-FUSE (P0588): resolve the transitive input
-        // closure + castore root nodes. On PG failure we send empty
-        // input_roots and the builder falls back to QueryPathInfo BFS.
+        // closure + castore root nodes. On PG failure or timeout we
+        // send empty input_roots and the builder falls back to
+        // QueryPathInfo BFS. Timeout + heartbeat credit like every
+        // other actor-blocking PG await on this path (I-139): a slow
+        // recursive CTE must not stall the mailbox long enough to
+        // falsely reap live workers.
         // r[impl sched.dispatch.input-roots]
         let input_root_rows = {
             let seeds = crate::assignment::approx_input_closure(&self.dag, drv_hash);
             if seeds.is_empty() {
                 Vec::new()
             } else {
-                match self.db.compute_input_roots(&seeds).await {
-                    Ok(rows) => rows,
-                    Err(e) => {
+                let started = std::time::Instant::now();
+                let res =
+                    tokio::time::timeout(self.grpc_timeout, self.db.compute_input_roots(&seeds))
+                        .await;
+                self.credit_heartbeats_for_stall(started.elapsed());
+                match res {
+                    Ok(Ok(rows)) => rows,
+                    Ok(Err(e)) => {
                         warn!(drv_hash = %drv_hash, error = %e,
                               "input_roots closure compute failed; \
+                               builder falls back to QueryPathInfo BFS");
+                        Vec::new()
+                    }
+                    Err(_) => {
+                        warn!(drv_hash = %drv_hash, timeout = ?self.grpc_timeout,
+                              "input_roots closure compute timed out; \
                                builder falls back to QueryPathInfo BFS");
                         Vec::new()
                     }
