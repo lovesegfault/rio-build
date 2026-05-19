@@ -101,6 +101,12 @@ Pre-commit hooks run treefmt automatically on commit.
 - Use semantic commit messages scoped by crate (e.g., `feat(rio-nix): add ATerm derivation parser`).
 - **tracey MCP (optional):** `nix develop -c tracey ai --claude` registers the tracey MCP server + installs the annotation skill. After registration, Claude Code can query `tracey_uncovered` / `tracey_untested` / `tracey_rule` during dev sessions. The daemon caches scan results — `rm -rf .tracey/` to force rescan.
 
+### Generated files (`cargo xtask regen`)
+
+Several committed files are derived from source (`Cargo.json`, `workspace-hack/Cargo.toml`, `.sqlx/`, `infra/helm/crds/`, `docs/gen/`, `fuzz/*/Cargo.{json,lock}`, `rio-*/tests/fixtures/config-schema.json`, …). Each has a `cargo xtask regen <subcommand>`; **`cargo xtask regen` with no subcommand runs all the idempotent regenerators in dependency order.** Run `cargo xtask regen --help` for the current subcommand list and what each owns.
+
+CI catches stale files via per-file drift checks (`hakari-drift`, `crds-drift`, `docs-data-fresh`, the `crate2nix-check` / `hakari-check` / `sqlx-prepare-check` pre-commit hooks, …). A failing drift check names the regen command in its error message — when in doubt, run the no-subcommand umbrella before committing.
+
 ### Migration files are frozen after they ship
 
 `sqlx::migrate!()` checksums `.sql` files by content (SHA-384 over the full file body, including comments). Editing a comment changes the checksum → persistent-DB deploys fail with `VersionMismatch`.

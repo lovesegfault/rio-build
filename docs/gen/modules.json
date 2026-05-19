@@ -323,11 +323,6 @@
     },
     {
       "depth": 0,
-      "doc": "Shared sqlx migration runner — try-then-wait advisory lock.",
-      "path": "migrate.rs"
-    },
-    {
-      "depth": 0,
       "doc": "Declarative `newtype!` macro for unit-safe scalar wrappers.",
       "path": "newtype.rs"
     },
@@ -340,11 +335,6 @@
       "depth": 0,
       "doc": "Shared `aws_sdk_s3::Client` builder.",
       "path": "s3.rs"
-    },
-    {
-      "depth": 0,
-      "doc": "Cross-service row types — compile-time schema contract.",
-      "path": "schema.rs"
     },
     {
       "depth": 0,
@@ -613,8 +603,18 @@
     },
     {
       "depth": 0,
+      "doc": "Shared sqlx migration runner — try-then-wait advisory lock.",
+      "path": "migrate.rs"
+    },
+    {
+      "depth": 0,
       "doc": "Migration commentary — the \"living\" half of `migrations/*.sql`.",
       "path": "migrations.rs"
+    },
+    {
+      "depth": 0,
+      "doc": "Cross-service row types — compile-time schema contract.",
+      "path": "schema.rs"
     }
   ],
   "rio-nix": [

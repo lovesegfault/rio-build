@@ -80,7 +80,6 @@
     },
     "rio-migrations": {
       "dev": [
-        "rio-common",
         "rio-test-support"
       ],
       "optional": [],
