@@ -209,23 +209,41 @@ impl ChunkService for ChunkServiceImpl {
             .buffer_unordered(GET_CHUNKS_K);
 
         let (tx, rx) = tokio::sync::mpsc::channel(GET_CHUNKS_CHANNEL_DEPTH);
-        tokio::spawn(async move {
-            futures_util::pin_mut!(fetches);
-            while let Some(item) = fetches.next().await {
-                let is_err = item.is_err();
-                if tx.send(item).await.is_err() {
-                    // Receiver gone — client disconnected. Dropping
-                    // `fetches` cancels in-flight backend reads.
-                    break;
+        // Like get_path: a half-open client otherwise parks this task
+        // on `tx.send()` forever, pinning ~K×CHUNK_MAX of in-flight
+        // chunk data (tonic_builder() sets no h2 keepalive — the
+        // stream timeout is the only backstop).
+        rio_common::task::spawn_monitored("get-chunks-stream", async move {
+            let drain = async {
+                futures_util::pin_mut!(fetches);
+                while let Some(item) = fetches.next().await {
+                    let is_err = item.is_err();
+                    if tx.send(item).await.is_err() {
+                        // Receiver gone — client disconnected. Dropping
+                        // `fetches` cancels in-flight backend reads.
+                        break;
+                    }
+                    if is_err {
+                        // First error closes the stream: the file can't
+                        // be assembled, so there's no value finishing
+                        // the remaining fetches. The K in-flight futures
+                        // are dropped (cooperative cancel — bounded by
+                        // one S3 GET each).
+                        break;
+                    }
                 }
-                if is_err {
-                    // First error closes the stream: the file can't be
-                    // assembled, so there's no value finishing the
-                    // remaining fetches. The K in-flight futures are
-                    // dropped (cooperative cancel — bounded by one S3
-                    // GET each).
-                    break;
-                }
+            };
+            if tokio::time::timeout(rio_common::grpc::GRPC_STREAM_TIMEOUT, drain)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    timeout = ?rio_common::grpc::GRPC_STREAM_TIMEOUT,
+                    "GetChunks stream timed out"
+                );
+                let _ = tx
+                    .send(Err(Status::deadline_exceeded("GetChunks stream timeout")))
+                    .await;
             }
         });
 

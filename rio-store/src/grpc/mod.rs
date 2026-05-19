@@ -866,38 +866,59 @@ impl StoreService for StoreServiceImpl {
         }
         let pool = self.pool.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(16);
-        tokio::spawn(async move {
-            for raw in req.nar_hashes {
-                let resp = match parse_nar_hash(&raw) {
-                    Err(e) => Err(e),
-                    Ok(h) => match metadata::get_nar_index(&pool, &h).await {
-                        Err(e) => Err(metadata_status("GetNarIndexBatch", e)),
-                        Ok(opt) => Ok(rio_proto::types::NarIndexResponse {
-                            nar_hash: raw,
-                            index: match opt {
-                                None => None,
-                                Some(b) => match crate::nar_index::decode_entries(&b) {
-                                    Ok(idx) => {
-                                        metrics::counter!("rio_store_nar_index_cache_hits_total")
+        // Like get_path: a half-open client otherwise parks this task
+        // on `tx.send()` forever. The timeout also bounds a max-batch
+        // request (`max_batch_paths` serial PG round trips).
+        rio_common::task::spawn_monitored("get-nar-index-batch", async move {
+            let drain = async {
+                for raw in req.nar_hashes {
+                    let resp = match parse_nar_hash(&raw) {
+                        Err(e) => Err(e),
+                        Ok(h) => match metadata::get_nar_index(&pool, &h).await {
+                            Err(e) => Err(metadata_status("GetNarIndexBatch", e)),
+                            Ok(opt) => Ok(rio_proto::types::NarIndexResponse {
+                                nar_hash: raw,
+                                index: match opt {
+                                    None => None,
+                                    Some(b) => match crate::nar_index::decode_entries(&b) {
+                                        Ok(idx) => {
+                                            metrics::counter!(
+                                                "rio_store_nar_index_cache_hits_total"
+                                            )
                                             .increment(1);
-                                        Some(idx)
-                                    }
-                                    Err(e) => {
-                                        let _ = tx
-                                            .send(Err(Status::data_loss(format!(
-                                                "corrupt nar_index row: {e}"
-                                            ))))
-                                            .await;
-                                        return;
-                                    }
+                                            Some(idx)
+                                        }
+                                        Err(e) => {
+                                            let _ = tx
+                                                .send(Err(Status::data_loss(format!(
+                                                    "corrupt nar_index row: {e}"
+                                                ))))
+                                                .await;
+                                            return;
+                                        }
+                                    },
                                 },
-                            },
-                        }),
-                    },
-                };
-                if tx.send(resp).await.is_err() {
-                    return; // client disconnected
+                            }),
+                        },
+                    };
+                    if tx.send(resp).await.is_err() {
+                        return; // client disconnected
+                    }
                 }
+            };
+            if tokio::time::timeout(rio_common::grpc::GRPC_STREAM_TIMEOUT, drain)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    timeout = ?rio_common::grpc::GRPC_STREAM_TIMEOUT,
+                    "GetNarIndexBatch stream timed out"
+                );
+                let _ = tx
+                    .send(Err(Status::deadline_exceeded(
+                        "GetNarIndexBatch stream timeout",
+                    )))
+                    .await;
             }
         });
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
