@@ -60,13 +60,12 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         .await
     })
     .await?;
-    tracing::info!("SMOKE TEST PASSED");
     Ok(())
 }
 
 pub async fn tunnel(local_port: u16) -> Result<ProcessGuard> {
     let (_, guard) = port_forward(NS, "svc/rio-gateway", local_port, 22).await?;
-    ui::poll("reading SSH banner", Duration::from_secs(2), 10, || async {
+    ui::poll_debug("reading SSH banner", Duration::from_secs(2), 10, || async {
         Ok(
             tokio::time::timeout(Duration::from_secs(3), chaos::ssh_banner(local_port))
                 .await

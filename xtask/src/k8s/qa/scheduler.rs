@@ -22,6 +22,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -34,13 +35,55 @@ use crate::config::XtaskConfig;
 use crate::k8s::client as kube;
 use crate::k8s::eks::smoke::CliCtx;
 use crate::k8s::provider::ProviderKind;
-use crate::ui;
 
 #[derive(Debug)]
 pub struct Outcome {
     pub id: &'static str,
     pub verdict: Verdict,
     pub elapsed: Duration,
+}
+
+/// Live progress counter shared between phases. Each completion emits
+/// its verdict line *immediately* (not batched at the end of the run)
+/// with a `[done/total]` tally so the operator can see how much is
+/// left without scrolling.
+struct Progress {
+    done: AtomicUsize,
+    total: usize,
+}
+
+impl Progress {
+    fn new(total: usize) -> Arc<Self> {
+        Arc::new(Self {
+            done: AtomicUsize::new(0),
+            total,
+        })
+    }
+
+    /// Emit one verdict line for `o` with the running tally. Returns
+    /// the outcome unchanged so callers can `.collect()` through it.
+    fn report(&self, o: Outcome) -> Outcome {
+        let n = self.done.fetch_add(1, Ordering::Relaxed) + 1;
+        let (mark, msg) = match &o.verdict {
+            Verdict::Pass => ("PASS", String::new()),
+            Verdict::Skip(m) => ("SKIP", format!(" — {m}")),
+            Verdict::Fail(m) => ("FAIL", format!(" — {m}")),
+        };
+        let tally = format!("[{n:>2}/{}]", self.total);
+        let line = format!(
+            "{mark:4} {:32} {:>6.1}s  {tally}{msg}",
+            o.id,
+            o.elapsed.as_secs_f64()
+        );
+        match o.verdict {
+            Verdict::Pass => info!("{line}"),
+            // SKIP/FAIL are both worth a second glance — SKIP means a
+            // precondition wasn't met (the scenario didn't actually
+            // exercise its assertion).
+            Verdict::Skip(_) | Verdict::Fail(_) => warn!("{line}"),
+        }
+        o
+    }
 }
 
 pub async fn run(
@@ -72,28 +115,24 @@ pub async fn run(
         .into_iter()
         .partition(|s| !matches!(s.meta().isolation, Isolation::Exclusive { .. }));
 
+    let progress = Progress::new(p1.len() + p2.len());
+    let stage_start = Instant::now();
     let mut outcomes = Vec::new();
 
-    ui::step("qa scenarios — phase 1 (shared + tenant)", || async {
-        outcomes.extend(run_phase1(p1, &kube, &cli, &pg_pool, &pool).await);
-        Ok::<_, anyhow::Error>(())
-    })
-    .await?;
+    // Plain banners, NOT `ui::step()` spans — a span here would prefix
+    // every scenario's verdict line with `step{name="qa scenarios — …"}: `.
+    // The verdict lines (emitted live from collect()/run_phase2()) plus
+    // the per-stage summary carry the structure.
+    info!("phase 1: shared + tenant ({} scenarios)", p1.len());
+    outcomes.extend(run_phase1(p1, &kube, &cli, &pg_pool, &pool, &progress).await);
 
-    ui::step("qa scenarios — phase 2 (exclusive)", || async {
-        outcomes.extend(run_phase2(p2, &kube, &cli, &pg_pool, &pool).await);
-        Ok::<_, anyhow::Error>(())
-    })
-    .await?;
+    info!("phase 2: exclusive ({} scenarios)", p2.len());
+    outcomes.extend(run_phase2(p2, &kube, &cli, &pg_pool, &pool, &progress).await);
 
-    // Report BEFORE cleanup — a cleanup failure (e.g. cli-tunnel
+    // Summarize BEFORE cleanup — a cleanup failure (e.g. cli-tunnel
     // port-forward died after a scheduler-kill scenario) must not
     // swallow the verdicts.
-    report(&outcomes);
-    let fails = outcomes
-        .iter()
-        .filter(|o| matches!(o.verdict, Verdict::Fail(_)))
-        .count();
+    let fails = report(&outcomes, stage_start.elapsed());
 
     // Best-effort cleanup. Phase-2 scenarios may have killed the
     // scheduler-leader the original cli-tunnel was forwarded to —
@@ -124,6 +163,7 @@ async fn run_phase1(
     cli: &Arc<CliCtx>,
     pg: &Arc<sqlx::PgPool>,
     pool: &Arc<TenantPool>,
+    progress: &Arc<Progress>,
 ) -> Vec<Outcome> {
     let mut set = JoinSet::new();
     for s in scenarios {
@@ -148,7 +188,7 @@ async fn run_phase1(
             out
         });
     }
-    collect(set).await
+    collect(set, progress).await
 }
 
 /// Reader/writer locks over `Component`s held by in-flight phase-2
@@ -218,6 +258,7 @@ async fn run_phase2(
     cli: &Arc<CliCtx>,
     pg: &Arc<sqlx::PgPool>,
     pool: &Arc<TenantPool>,
+    progress: &Arc<Progress>,
 ) -> Vec<Outcome> {
     let mut pending: VecDeque<_> = scenarios.into_iter().collect();
     let mut locks = ComponentLocks::default();
@@ -256,7 +297,7 @@ async fn run_phase2(
             Some(res) => {
                 let (o, (mutates, reads)) = res.expect("scenario task panicked");
                 locks.release(mutates, reads);
-                out.push(o);
+                out.push(progress.report(o));
             }
             None => break,
         }
@@ -305,31 +346,37 @@ async fn exec(
     }
 }
 
-async fn collect(mut set: JoinSet<Outcome>) -> Vec<Outcome> {
+async fn collect(mut set: JoinSet<Outcome>, progress: &Arc<Progress>) -> Vec<Outcome> {
     let mut out = Vec::new();
     while let Some(r) = set.join_next().await {
-        out.push(r.expect("scenario task panicked"));
+        out.push(progress.report(r.expect("scenario task panicked")));
     }
     out
 }
 
-fn report(outcomes: &[Outcome]) {
+/// End-of-stage summary: a one-line count and a re-list of FAIL/SKIP
+/// (the verdict lines were already emitted live as each scenario
+/// finished, but a long phase-2 means they scrolled past — re-list the
+/// ones that need a second look). Returns the FAIL count so the caller
+/// decides the exit status.
+fn report(outcomes: &[Outcome], elapsed: Duration) -> usize {
+    let count = |pred: fn(&Verdict) -> bool| outcomes.iter().filter(|o| pred(&o.verdict)).count();
+    let pass = count(|v| matches!(v, Verdict::Pass));
+    let skip = count(|v| matches!(v, Verdict::Skip(_)));
+    let fail = count(|v| matches!(v, Verdict::Fail(_)));
+    info!(
+        "{pass} PASS · {skip} SKIP · {fail} FAIL — {:.0}s wall",
+        elapsed.as_secs_f64()
+    );
     for o in outcomes {
-        let (mark, msg) = match &o.verdict {
-            Verdict::Pass => ("PASS", String::new()),
-            Verdict::Skip(m) => ("SKIP", format!(" — {m}")),
-            Verdict::Fail(m) => ("FAIL", format!(" — {m}")),
+        let m = match &o.verdict {
+            Verdict::Pass => continue,
+            Verdict::Skip(m) => format!("SKIP {:32} — {m}", o.id),
+            Verdict::Fail(m) => format!("FAIL {:32} — {m}", o.id),
         };
-        let line = format!(
-            "{mark:4} {:32} {:>6.1}s{msg}",
-            o.id,
-            o.elapsed.as_secs_f64()
-        );
-        match o.verdict {
-            Verdict::Fail(_) => warn!("{line}"),
-            _ => info!("{line}"),
-        }
+        warn!("{m}");
     }
+    fail
 }
 
 #[cfg(test)]

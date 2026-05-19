@@ -1,23 +1,30 @@
 //! Tracing init + interactive prompt helpers.
 //!
 //! `step`/`poll` are thin `tracing::info_span!` wrappers — kept so the
-//! ~70 callsites across `k8s/` don't churn. The previous custom
-//! span→spinner Layer (✓/✗ tree, bottom-line spinner, indent-aware
-//! formatter) was cosmetic; stock `fmt::compact` with span context is
-//! enough for a dev tool.
+//! ~70 callsites across `k8s/` don't churn. They emit one explicit
+//! `✓ name  N.Ns` / `✗ name: err` line on completion (instead of
+//! `FmtSpan::CLOSE`, whose `time.busy=… time.idle=…` fields are
+//! tracing internals an operator never reads). `step_debug`/`poll_debug`
+//! are the *mechanism* tier — port-forwards, SSH banners, nix copies —
+//! that repeat dozens of times per QA run and only matter under `-v`.
+//!
+//! The previous custom span→spinner Layer (✓/✗ tree, bottom-line
+//! spinner, indent-aware formatter) was cosmetic; stock `fmt::compact`
+//! plus an explicit completion line is enough for a dev tool, and
+//! works the same in a TTY and a `tee`'d log.
 
 use std::fmt::Display;
 use std::future::Future;
 use std::io::{IsTerminal, Write as _};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use inquire::validator::Validation;
 use inquire::{Confirm, InquireError, Select, Text};
 use tracing::level_filters::LevelFilter;
-use tracing::{Instrument, debug, info_span};
-use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
+use tracing::{Instrument, Span, debug, debug_span, info_span};
+use tracing_subscriber::EnvFilter;
 
 static LEVEL: OnceLock<LevelFilter> = OnceLock::new();
 
@@ -67,10 +74,13 @@ fn build_filter_directive(level: LevelFilter) -> String {
 }
 
 /// Initialize tracing. Call once from main(). Stock compact fmt to
-/// stderr, env-filter (`RUST_LOG` overrides the flag), span-close
-/// events so `step()` boundaries show up. xtask itself stays at info
-/// even at the Warn default; runtime internals capped at info even at
-/// -vvv (their trace floods).
+/// stderr, env-filter (`RUST_LOG` overrides the flag). `step()`
+/// boundaries are explicit `✓ name  N.Ns` lines emitted from
+/// [`step_owned`] — not `FmtSpan::CLOSE` events, which carry
+/// `time.busy`/`time.idle` fields and a flattened span path that an
+/// operator never reads. xtask itself stays at info even at the Warn
+/// default; runtime internals capped at info even at -vvv (their
+/// trace floods).
 pub fn init(level: LevelFilter) {
     LEVEL.set(level).ok();
     let filter = EnvFilter::try_from_default_env()
@@ -79,7 +89,6 @@ pub fn init(level: LevelFilter) {
         .with_env_filter(filter)
         .with_target(false)
         .with_writer(std::io::stderr)
-        .with_span_events(FmtSpan::CLOSE)
         .compact()
         .init();
 }
@@ -170,8 +179,9 @@ where
 
 // -- step / poll --------------------------------------------------------
 
-/// Run `f` inside an `info_span!(step = name)`. Logs the error chain
-/// on Err so a `?` deep in `k8s up` still shows which step failed.
+/// Run `f` inside an `info_span!(step = name)`. Emits `✓ name  N.Ns`
+/// at INFO on success and `✗ name: err` at ERROR on failure so a `?`
+/// deep in `k8s up` still shows which step failed.
 pub async fn step<F, Fut, T>(name: &str, f: F) -> Result<T>
 where
     F: FnOnce() -> Fut,
@@ -190,20 +200,58 @@ pub fn step_owned<T>(
     name: String,
     fut: impl Future<Output = Result<T>>,
 ) -> impl Future<Output = Result<T>> {
-    let span = info_span!("step", name);
+    let span = info_span!("step", %name);
     async move {
-        let r = fut.await;
-        if let Err(e) = &r {
-            tracing::error!("{e:#}");
-        }
+        let start = Instant::now();
+        let r = fut.instrument(span).await;
+        // Emit outside ANY span: the line already names the step, and
+        // a `step{name=…}: ` parent prefix is redundant noise. The
+        // surrounding lines (stage banner / parent step verdict) carry
+        // the hierarchy.
+        Span::none().in_scope(|| match &r {
+            Ok(_) => tracing::info!("✓ {name:36} {:>6.1}s", start.elapsed().as_secs_f64()),
+            Err(e) => tracing::error!("✗ {name}: {e:#}"),
+        });
         r
     }
-    .instrument(span)
+}
+
+/// Like [`step`] but at DEBUG: silent at the default verbosity, shows
+/// under `-v`. For *mechanism* steps — port-forwards, SSH banners,
+/// `nix copy`/`nix build` legs — that repeat dozens of times per run
+/// and whose verdict is owned by the caller (a scenario, the smoke
+/// test, an `up` phase). Errors are also `debug!`: the layer that owns
+/// the verdict surfaces failures; logging `error!` from inside the
+/// mechanism would steal that verdict (and false-positives on
+/// scenarios that *expect* a build to fail, e.g. i209).
+pub async fn step_debug<F, Fut, T>(name: &str, f: F) -> Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    step_debug_owned(name.to_string(), f()).await
+}
+
+/// Owned-name variant of [`step_debug`].
+pub fn step_debug_owned<T>(
+    name: String,
+    fut: impl Future<Output = Result<T>>,
+) -> impl Future<Output = Result<T>> {
+    let span = debug_span!("step", %name);
+    async move {
+        let start = Instant::now();
+        let r = fut.instrument(span).await;
+        Span::none().in_scope(|| match &r {
+            Ok(_) => debug!("✓ {name:36} {:>6.1}s", start.elapsed().as_secs_f64()),
+            Err(e) => debug!("✗ {name}: {e:#}"),
+        });
+        r
+    }
 }
 
 /// Log a skipped step (e.g. `tofu apply` when plan shows no diff).
 pub fn step_skip(name: &str, reason: &str) {
-    tracing::info!(step = name, reason, "skipped");
+    tracing::info!("⊘ {name:36} skipped — {reason}");
 }
 
 /// Poll `f` every `interval` up to `max` times inside a step span.
@@ -214,6 +262,15 @@ where
     Fut: Future<Output = Result<Option<T>>>,
 {
     step_owned(name.to_string(), poll_in(interval, max, f)).await
+}
+
+/// [`poll`] at DEBUG — see [`step_debug`] for when to use which.
+pub async fn poll_debug<T, F, Fut>(name: &str, interval: Duration, max: u32, f: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Option<T>>>,
+{
+    step_debug_owned(name.to_string(), poll_in(interval, max, f)).await
 }
 
 /// Poll inside the CURRENT span (caller already wrapped in `ui::step`).

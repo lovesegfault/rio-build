@@ -29,6 +29,6 @@ pub fn run() -> Result<()> {
             "helm template -f {v} produced no output"
         );
     }
-    info!("lint: {} values files render", values.len());
+    info!("{} values files render", values.len());
     Ok(())
 }

@@ -194,7 +194,6 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         .await
     })
     .await?;
-    info!("SMOKE TEST PASSED");
     Ok(())
 }
 
@@ -450,7 +449,7 @@ pub async fn gateway_port_forward(local_port: u16) -> Result<ProcessGuard> {
     crate::k8s::shared::kill_port_listeners(local_port);
     let (_, guard) =
         crate::k8s::shared::port_forward(NS, "svc/rio-gateway", local_port, 22).await?;
-    ui::poll("reading SSH banner", Duration::from_secs(3), 25, || async {
+    ui::poll_debug("reading SSH banner", Duration::from_secs(3), 25, || async {
         Ok(
             tokio::time::timeout(Duration::from_secs(3), ssh_banner(local_port))
                 .await
@@ -557,13 +556,16 @@ pub async fn build_expr(expr: &str, store_url: &str) -> Result<()> {
     // (Shell is !Sync — RefCell internals). sh::run converts Cmd<'_>
     // to owned Command synchronously, so the borrow on `sh` is
     // released before the returned future is polled.
-    let drv = ui::step("nix-instantiate", || {
+    // Mechanism steps (instantiate/copy/build) are step_debug — they
+    // repeat dozens of times per QA run and their verdict is owned by
+    // the caller (smoke step or scenario). `-v` shows them.
+    let drv = ui::step_debug("nix-instantiate", || {
         let sh = shell().unwrap();
         crate::sh::run_read(cmd!(sh, "nix-instantiate --expr {expr}"))
     })
     .await?;
 
-    ui::step(
+    ui::step_debug(
         &format!("nix copy {}", drv.rsplit('/').next().unwrap_or(&drv)),
         || {
             let sh = shell().unwrap();
@@ -576,7 +578,7 @@ pub async fn build_expr(expr: &str, store_url: &str) -> Result<()> {
     .await?;
 
     let drv_out = format!("{drv}^*");
-    ui::step("nix build", || {
+    ui::step_debug("nix build", || {
         let sh = shell().unwrap();
         crate::sh::run(
             cmd!(

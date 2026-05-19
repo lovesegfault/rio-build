@@ -13,11 +13,12 @@
 //! the one stage that could move into `checks.*`. Everything else needs
 //! a live cluster.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use clap::Args;
+use tracing::info;
 
 use crate::config::XtaskConfig;
 use crate::k8s::provider::{Provider, ProviderKind};
@@ -131,6 +132,32 @@ impl QaOpts {
         Stage::ALL.into_iter().filter(|&s| self.has(s)).collect()
     }
 
+    /// Stage-specific detail appended to the `[N/M] {stage}` banner —
+    /// the knobs that explain why one run takes longer than another.
+    fn banner_detail(&self, s: Stage) -> String {
+        match s {
+            Stage::Lint | Stage::Health => String::new(),
+            Stage::Scenarios => {
+                let n = scenarios::ALL
+                    .iter()
+                    .filter(|s| {
+                        self.only.is_empty() || self.only.iter().any(|f| s.meta().id.contains(f))
+                    })
+                    .count();
+                format!(" — {n} registered, {} tenants", self.tenant_pool)
+            }
+            Stage::Load => format!(" — {}× {}", self.load_parallel, self.load_target),
+            Stage::Fault => format!(
+                " — blackhole {:?}, {:?}→{:?}",
+                self.fault_duration,
+                self.fault_from
+                    .unwrap_or(super::chaos::ChaosFrom::AllWorkers),
+                self.fault_target
+                    .unwrap_or(super::chaos::ChaosTarget::Scheduler),
+            ),
+        }
+    }
+
     fn validate_stage_opts(&self, selected: &[Stage]) -> Result<()> {
         let explicit = selected.len() != Stage::ALL.len();
         if !explicit {
@@ -236,58 +263,88 @@ pub async fn run(
     let selected = opts.stages();
     opts.validate_stage_opts(&selected)?;
 
-    for stage in &selected {
-        tracing::info!("qa stage: {}", stage.name());
-        match stage {
-            Stage::Lint => lint::run()?,
-            Stage::Health => p.smoke(cfg).await?,
-            Stage::Scenarios => {
-                scheduler::run(scenarios::ALL, &opts.only, opts.tenant_pool, kind, cfg).await?
-            }
-            Stage::Load => {
-                super::stress::cmd_run(
-                    p,
-                    kind,
-                    cfg,
-                    &opts.load_target,
-                    opts.load_parallel,
-                    // base_port: each parallel build binds
-                    // localhost:{base_port + i} for its ssh-ng tunnel,
-                    // so the caller must know the port up-front (the
-                    // store URL embeds it). 2250 is the default the
-                    // original `xtask k8s stress run` CLI shipped with;
-                    // `e7707afa1`'s smoke/stress→qa migration dropped
-                    // it to a literal 0, which `gateway_port_forward`
-                    // can't represent (it discards `port_forward`'s
-                    // ephemeral pick and reads the SSH banner from
-                    // 127.0.0.1:0 — a 75s silent timeout). Never hit
-                    // until 2026-05-13 because the QA suite always
-                    // FAILed at least one scenario and aborted before
-                    // reaching `load`.
-                    2250,
-                    None,
-                    false,
-                )
-                .await?
-            }
-            Stage::Fault => {
-                use super::chaos;
-                let dir = crate::sh::repo_root().join(".stress-test/chaos");
-                std::fs::create_dir_all(&dir)?;
-                if let Err(e) = chaos::remediate(&dir).await {
-                    tracing::warn!("stale-chaos remediation: {e:#}");
+    let total = selected.len();
+    let run_start = Instant::now();
+    for (i, stage) in selected.iter().enumerate() {
+        info!(
+            "[{}/{total}] {}{}",
+            i + 1,
+            stage.name(),
+            opts.banner_detail(*stage)
+        );
+        let stage_start = Instant::now();
+        let result: Result<()> = async {
+            match stage {
+                Stage::Lint => lint::run()?,
+                Stage::Health => p.smoke(cfg).await?,
+                Stage::Scenarios => {
+                    scheduler::run(scenarios::ALL, &opts.only, opts.tenant_pool, kind, cfg).await?
                 }
-                chaos::run(
-                    &dir,
-                    chaos::ChaosKind::Blackhole,
-                    opts.fault_target.unwrap_or(chaos::ChaosTarget::Scheduler),
-                    opts.fault_from.unwrap_or(chaos::ChaosFrom::AllWorkers),
-                    opts.fault_duration,
-                )
-                .await?
+                Stage::Load => {
+                    super::stress::cmd_run(
+                        p,
+                        kind,
+                        cfg,
+                        &opts.load_target,
+                        opts.load_parallel,
+                        // base_port: each parallel build binds
+                        // localhost:{base_port + i} for its ssh-ng tunnel,
+                        // so the caller must know the port up-front (the
+                        // store URL embeds it). 2250 is the default the
+                        // original `xtask k8s stress run` CLI shipped with;
+                        // `e7707afa1`'s smoke/stress→qa migration dropped
+                        // it to a literal 0, which `gateway_port_forward`
+                        // can't represent (it discards `port_forward`'s
+                        // ephemeral pick and reads the SSH banner from
+                        // 127.0.0.1:0 — a 75s silent timeout). Never hit
+                        // until 2026-05-13 because the QA suite always
+                        // FAILed at least one scenario and aborted before
+                        // reaching `load`.
+                        2250,
+                        None,
+                        false,
+                    )
+                    .await?
+                }
+                Stage::Fault => {
+                    use super::chaos;
+                    let dir = crate::sh::repo_root().join(".stress-test/chaos");
+                    std::fs::create_dir_all(&dir)?;
+                    if let Err(e) = chaos::remediate(&dir).await {
+                        tracing::warn!("stale-chaos remediation: {e:#}");
+                    }
+                    chaos::run(
+                        &dir,
+                        chaos::ChaosKind::Blackhole,
+                        opts.fault_target.unwrap_or(chaos::ChaosTarget::Scheduler),
+                        opts.fault_from.unwrap_or(chaos::ChaosFrom::AllWorkers),
+                        opts.fault_duration,
+                    )
+                    .await?
+                }
+            }
+            Ok(())
+        }
+        .await;
+        let elapsed = stage_start.elapsed().as_secs_f64();
+        match result {
+            Ok(()) => info!("✓ {:36} {elapsed:>6.1}s", stage.name()),
+            Err(e) => {
+                tracing::error!("✗ {} — {e:#}", stage.name());
+                tracing::error!(
+                    "qa FAILED at stage [{}/{total}] {} — {:.0}s",
+                    i + 1,
+                    stage.name(),
+                    run_start.elapsed().as_secs_f64()
+                );
+                return Err(e);
             }
         }
     }
+    info!(
+        "qa PASSED — {total}/{total} stages, {:.0}s",
+        run_start.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 

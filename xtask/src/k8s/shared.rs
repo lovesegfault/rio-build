@@ -674,7 +674,7 @@ pub async fn tunnel_grpc(
     // — then dies mid-RPC, surfacing as `transport error` from
     // rio-cli. `scheduler_leader` rejects non-live holders; surface
     // the reason and keep polling until the new leader has acquired.
-    let leader = ui::poll("scheduler lease holder", Duration::from_secs(2), 30, || {
+    let leader = ui::poll_debug("scheduler lease holder", Duration::from_secs(2), 30, || {
         let c = client.clone();
         async move {
             // Post-`--wipe` the Lease may name a deleted pod while NO
@@ -700,7 +700,7 @@ pub async fn tunnel_grpc(
     let sched = port_forward(NS, &leader, sched_port, 9001).await?;
     let store = port_forward(super::NS_STORE, "svc/rio-store", store_port, 9002).await?;
     let (sp, tp) = (sched.0, store.0);
-    ui::poll(
+    ui::poll_debug(
         "scheduler+store TCP accept",
         Duration::from_secs(2),
         10,

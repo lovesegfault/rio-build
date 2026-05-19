@@ -151,7 +151,7 @@ impl QaCtx {
     pub async fn gateway_tunnel(&self, tenant_idx: usize) -> Result<(String, ProcessGuard)> {
         let key = self.tenant(tenant_idx).key.clone();
         let (port, guard) = shared::port_forward(NS, "svc/rio-gateway", 0, 22).await?;
-        crate::ui::poll(
+        crate::ui::poll_debug(
             "gateway SSH banner",
             Duration::from_secs(2),
             20,
@@ -201,16 +201,19 @@ impl QaCtx {
 /// Shared body of all four `nix_build[_expr]_via_gateway[_bg]` so each
 /// variant is a one-liner.
 async fn gateway_build(key: PathBuf, expr: String) -> Result<()> {
-    // Wrapped in a `step` so an Err is logged at ERROR level. The `_bg`
-    // variants `tokio::spawn` this fn and the caller may never await
-    // the JoinHandle (i048c only `bg.abort()`s on its own timeout) — an
-    // unwrapped `?` here would drop the error into the void. The SSH
-    // banner / nix-* legs below are already step-wrapped.
-    let (port, _guard) = crate::ui::step("port-forward gateway:22", || {
+    // Mechanism steps (`step_debug`) — repeated ~50× per QA run, only
+    // useful under `-v`. Failures still propagate via `?`; the
+    // *scenario* verdict (PASS/FAIL) surfaces them at default
+    // verbosity. The `_bg` variants `tokio::spawn` this fn and the
+    // caller may never await the JoinHandle (i048c only `bg.abort()`s
+    // on its own timeout) — those callers must check `bg.is_finished()`
+    // / `bg.await` if a silent bg failure would matter, since a
+    // step_debug error is not loud enough to be the only signal.
+    let (port, _guard) = crate::ui::step_debug("port-forward gateway:22", || {
         shared::port_forward(NS, "svc/rio-gateway", 0, 22)
     })
     .await?;
-    crate::ui::poll(
+    crate::ui::poll_debug(
         "gateway SSH banner",
         Duration::from_secs(2),
         20,
