@@ -98,11 +98,12 @@ pub fn run_all() -> Result<()> {
 /// before it freezes.
 ///
 /// The corpus is workspace `.rs` source from the PG-querying crates
-/// (rio-store, rio-scheduler, xtask). NOT `.sqlx/query-*.json` — that
-/// only covers `query!`/`query_as!` macro callsites; the ≈200 non-macro
-/// `sqlx::query()` / `QueryBuilder` sites leave no `.sqlx/` entry.
-/// `migrations.rs` is excluded so the per-migration doc-const prose
-/// (which names every table as commentary) can't mask a dead table.
+/// (rio-store, rio-scheduler, rio-controller, xtask). NOT
+/// `.sqlx/query-*.json` — that only covers `query!`/`query_as!` macro
+/// callsites; the ≈200 non-macro `sqlx::query()` / `QueryBuilder` sites
+/// leave no `.sqlx/` entry. `migrations.rs` is excluded so the
+/// per-migration doc-const prose (which names every table as
+/// commentary) can't mask a dead table.
 ///
 /// **A new table this lint flags as dead:** either it IS dead (delete
 /// the migration before it ships), or add it to `ALLOW_DEAD` below
@@ -112,19 +113,11 @@ fn schema_liveness() -> Result<()> {
 
     // Tables intentionally present in the schema with zero `.rs`
     // references in the corpus. Each entry MUST carry a rationale.
-    const ALLOW_DEAD: &[(&str, &str)] = &[
-        (
-            "hw_cost_factors",
-            "ADR-023 chose sla_ema_state instead; DROP TABLE deferred to a \
-             follow-up migration (042 is frozen)",
-        ),
-        (
-            "nodeclaim_cell_state",
-            "ADR-023 §13b: read/written by rio-controller's nodeclaim_pool \
-             reconciler — controller is not in this lint's PG-query corpus \
-             (store/scheduler/xtask only)",
-        ),
-    ];
+    const ALLOW_DEAD: &[(&str, &str)] = &[(
+        "hw_cost_factors",
+        "ADR-023 chose sla_ema_state instead; DROP TABLE deferred to a \
+         follow-up migration (042 is frozen)",
+    )];
 
     // ── Live-table set: CREATE/ALTER add, DROP removes, in version
     // order. Migration filenames are zero-padded `NNN_*.sql`, so a
@@ -166,8 +159,9 @@ fn schema_liveness() -> Result<()> {
     // (`xtask/src/lint.rs`) and the doc-const file
     // (`rio-migrations/src/migrations.rs`, which is outside the corpus
     // roots anyway). If you add a `lint.rs` or `migrations.rs` to
-    // rio-store, rio-scheduler, or xtask that DOES legitimately
-    // reference table names, switch this to a path-relative match.
+    // rio-store, rio-scheduler, rio-controller, or xtask that DOES
+    // legitimately reference table names, switch this to a path-relative
+    // match.
     //
     // Why each entry is excluded:
     // - `migrations.rs`: the per-migration doc-const file names every
@@ -183,7 +177,12 @@ fn schema_liveness() -> Result<()> {
     //   `rio-store/tests/migrations.rs` — outside the `src/`-only walk
     //   — so it never had this problem.
     const CORPUS_EXCLUDE: &[&str] = &["migrations.rs", "lint.rs"];
-    let corpus_roots = ["rio-store/src", "rio-scheduler/src", "xtask/src"];
+    let corpus_roots = [
+        "rio-store/src",
+        "rio-scheduler/src",
+        "rio-controller/src",
+        "xtask/src",
+    ];
     let mut corpus = String::new();
     let mut total = 0usize;
     for rel in corpus_roots {
@@ -214,7 +213,7 @@ fn schema_liveness() -> Result<()> {
     ensure!(
         total > 50,
         "schema-liveness corpus suspiciously small ({total} files) — \
-         expected ≥50 across rio-store + rio-scheduler + xtask"
+         expected ≥50 across rio-store + rio-scheduler + rio-controller + xtask"
     );
 
     let mut dead = Vec::new();
@@ -232,7 +231,7 @@ fn schema_liveness() -> Result<()> {
     if !dead.is_empty() {
         bail!(
             "table(s) declared in migrations/ but never referenced in \
-             rio-store/rio-scheduler/xtask Rust source:\n    {dead:?}\n  \
+             rio-store/rio-scheduler/rio-controller/xtask Rust source:\n    {dead:?}\n  \
              dead schema — delete the migration before it ships, or add to \
              ALLOW_DEAD in xtask/src/lint.rs with rationale",
         );

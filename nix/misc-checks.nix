@@ -239,6 +239,7 @@ in
             ../rio-migrations/migrations
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-store/src)
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-controller/src)
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../xtask/src)
             ../infra/helm/rio-build/templates/scheduler.yaml
             # seccomp-allowlist validates both Localhost profiles —
