@@ -9,10 +9,6 @@ publish = false
 description = "Shared configuration, observability, and error types for rio-build"
 
 [features]
-# Shared sqlx migration runner (migrate.rs). Only rio-store +
-# rio-scheduler enable this — gateway/builder/controller stay
-# sqlx-free.
-postgres = ["dep:sqlx"]
 # Shared aws-sdk-s3 client builder (s3.rs). Only rio-store +
 # rio-scheduler enable this.
 aws = ["dep:aws-config", "dep:aws-sdk-s3"]
@@ -20,8 +16,6 @@ aws = ["dep:aws-config", "dep:aws-sdk-s3"]
 [dependencies]
 # JSON Schema derivation for Config structs (`docs/gen/config.json`).
 schemars = { workspace = true }
-# Optional: shared migration wrapper (postgres feature).
-sqlx = { workspace = true, optional = true }
 # Optional: shared S3 client builder (aws feature).
 aws-config = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
@@ -63,8 +57,6 @@ rustls = { workspace = true }
 
 # PEM body validation (tls.rs validate_pem_sections).
 base64 = { workspace = true }
-# schema.rs `Uuid` columns. Auth-stack `serde` feature moved to rio-auth.
-uuid = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]

@@ -667,7 +667,7 @@ pub(crate) fn parse_cors_origins(raw: &str) -> Vec<http::HeaderValue> {
 
 /// Connect to PostgreSQL and run migrations. Separate from the rest of
 /// main() so the migration call site (`rio_migrations::migrator()` →
-/// `rio_common::migrate::run`) is obvious in the boot sequence.
+/// `rio_migrations::migrate::run`) is obvious in the boot sequence.
 ///
 /// Bounded retry (8 tries, exponential 1→16s): when systemd starts PG
 /// and the scheduler near-simultaneously, or after a PG restart within
@@ -719,8 +719,8 @@ async fn init_db_pool(
     // together (I-194). Raw `Migrator::run` here would also lock on a
     // DIFFERENT key (sqlx hashes the DB name) than rio-store's
     // `MIGRATE_LOCK_ID`, so a scheduler and a store starting together
-    // would not mutually exclude. See rio_common::migrate::run.
-    rio_common::migrate::run(&pool, rio_migrations::migrator()).await?;
+    // would not mutually exclude. See rio_migrations::migrate::run.
+    rio_migrations::migrate::run(&pool, rio_migrations::migrator()).await?;
     info!("database migrations applied");
 
     let db = SchedulerDb::new(pool.clone());

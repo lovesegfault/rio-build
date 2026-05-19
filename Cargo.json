@@ -21006,10 +21006,6 @@
           "packageId": "serde"
         },
         {
-          "name": "sqlx",
-          "packageId": "sqlx"
-        },
-        {
           "name": "thiserror",
           "packageId": "thiserror 2.0.18"
         },
@@ -21040,10 +21036,6 @@
         {
           "name": "tracing-subscriber",
           "packageId": "tracing-subscriber"
-        },
-        {
-          "name": "uuid",
-          "packageId": "uuid"
         },
         {
           "name": "workspace-hack",
@@ -21085,8 +21077,7 @@
         }
       ],
       "resolvedDefaultFeatures": [
-        "aws",
-        "postgres"
+        "aws"
       ],
       "libCrateTypes": [
         "lib"
@@ -21545,6 +21536,18 @@
           "packageId": "sqlx"
         },
         {
+          "name": "tokio",
+          "packageId": "tokio"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        },
+        {
+          "name": "uuid",
+          "packageId": "uuid"
+        },
+        {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
         }
@@ -21553,10 +21556,6 @@
         {
           "name": "hex",
           "packageId": "hex"
-        },
-        {
-          "name": "rio-common",
-          "packageId": "rio-common"
         },
         {
           "name": "rio-test-support",

@@ -11,14 +11,10 @@ pub mod config;
 pub mod grpc;
 pub mod k8s;
 pub mod limits;
-#[cfg(feature = "postgres")]
-pub mod migrate;
 pub mod newtype;
 pub mod observability;
 #[cfg(feature = "aws")]
 pub mod s3;
-#[cfg(feature = "postgres")]
-pub mod schema;
 pub mod server;
 pub mod signal;
 pub mod task;

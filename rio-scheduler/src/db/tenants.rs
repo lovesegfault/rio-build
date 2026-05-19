@@ -31,7 +31,7 @@ impl SchedulerDb {
     ///
     /// `query_as!` (not runtime `query_as`): compile-checks the
     /// projection against [`TenantRow`] — the cross-service contract
-    /// struct in `rio_common::schema`. The `!` overrides on
+    /// struct in `rio_migrations::schema`. The `!` overrides on
     /// `has_cache_token`/`created_at` tell sqlx the expressions are
     /// non-NULL (PG can't infer that for `IS NOT NULL` / `EXTRACT`).
     pub(crate) async fn list_tenants(&self) -> Result<Vec<TenantRow>, sqlx::Error> {

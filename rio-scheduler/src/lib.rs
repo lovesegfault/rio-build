@@ -47,7 +47,7 @@ pub use actor::DEFAULT_SUBSTITUTE_CONCURRENCY;
 
 /// Re-export of the shared embedded migrator from `rio-migrations`.
 /// Test-only (`TestDb::new(&MIGRATOR)`) — production goes through
-/// `rio_common::migrate::run(&pool, rio_migrations::migrator())` in
+/// `rio_migrations::migrate::run(&pool, rio_migrations::migrator())` in
 /// `main.rs`. Same migration set as rio-store; both consume the single
 /// `rio-migrations` source of truth.
 #[cfg(test)]

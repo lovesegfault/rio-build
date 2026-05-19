@@ -145,7 +145,7 @@ pub(crate) struct BuildListRow {
 /// `rio-common` so rio-store's reads `query_as!` into the SAME
 /// struct — a column rename/retype is then a compile error in both
 /// crates, not a runtime tripwire.
-pub(crate) use rio_common::schema::TenantRow;
+pub(crate) use rio_migrations::schema::TenantRow;
 
 /// Row from `load_nonterminal_builds`. FromRow for named-column
 /// mapping (tuples at this arity are error-prone).

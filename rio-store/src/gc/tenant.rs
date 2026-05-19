@@ -3,7 +3,7 @@
 //! Phase 4b: accounting only. Phase 5: enforcement at the gateway
 //! (reject SubmitBuild above quota — `r[store.gc.tenant-quota-enforce]`).
 
-use rio_common::schema::TenantRow;
+use rio_migrations::schema::TenantRow;
 use sqlx::PgPool;
 use uuid::Uuid;
 

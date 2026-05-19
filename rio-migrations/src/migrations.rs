@@ -27,9 +27,9 @@
 //! frozen at whatever path was current when the migration shipped.
 //!
 //! The try-then-wait advisory-lock runner that applies these lives in
-//! `rio_common::migrate::run` — both rio-store and rio-scheduler run
+//! `rio_migrations::migrate::run` — both rio-store and rio-scheduler run
 //! the SAME migration set against the SAME database under the same
-//! lock key (`rio_common::migrate::MIGRATE_LOCK_ID`), so the runner is
+//! lock key (`rio_migrations::migrate::MIGRATE_LOCK_ID`), so the runner is
 //! shared, not crate-local.
 
 #![allow(dead_code)] // M_NNN doc-consts; never referenced, only `cargo doc`'d

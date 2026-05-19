@@ -15,9 +15,6 @@
 //! under `SQLX_OFFLINE`), not production. The runtime test stays as
 //! defense-in-depth — it catches a `query_as!` → runtime `query_as`
 //! regression that would silently drop the compile-time check.
-//!
-//! Feature-gated on `postgres` (same as [`crate::migrate`]) so
-//! gateway/builder/controller stay sqlx-free.
 
 use uuid::Uuid;
 

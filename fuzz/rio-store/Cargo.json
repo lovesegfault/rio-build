@@ -12717,10 +12717,6 @@
           "packageId": "serde"
         },
         {
-          "name": "sqlx",
-          "packageId": "sqlx"
-        },
-        {
           "name": "thiserror",
           "packageId": "thiserror 2.0.18"
         },
@@ -12753,17 +12749,12 @@
           "packageId": "tracing-subscriber"
         },
         {
-          "name": "uuid",
-          "packageId": "uuid"
-        },
-        {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
         }
       ],
       "resolvedDefaultFeatures": [
-        "aws",
-        "postgres"
+        "aws"
       ],
       "libCrateTypes": [
         "lib"
@@ -12784,6 +12775,18 @@
         {
           "name": "sqlx",
           "packageId": "sqlx"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        },
+        {
+          "name": "uuid",
+          "packageId": "uuid"
         },
         {
           "name": "workspace-hack",

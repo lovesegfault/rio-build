@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use rio_migrations::MIGRATOR;
 
-/// I-194 regression: 3 concurrent `rio_common::migrate::run()` against
+/// I-194 regression: 3 concurrent `rio_migrations::migrate::run()` against
 /// one fresh DB all complete, and the `CREATE INDEX CONCURRENTLY`
 /// migration (022) lands a valid index. (011's CIC index is dropped
 /// by 035, so nothing left to assert there.)
@@ -25,7 +25,7 @@ use rio_migrations::MIGRATOR;
 /// Under sqlx's default blocking `pg_advisory_lock`, replica B's
 /// blocked `SELECT pg_advisory_lock(...)` holds a virtualxid that
 /// replica A's CIC waits on → deadlock. The try-then-wait lock in
-/// `rio_common::migrate::run` holds no long-lived vxid while polling.
+/// `rio_migrations::migrate::run` holds no long-lived vxid while polling.
 ///
 /// 60s timeout: full migration set on the ephemeral PG runs in
 /// well under 5s; the timeout is the deadlock detector. NOT
@@ -38,12 +38,12 @@ async fn concurrent_migrations_no_deadlock() {
 
     // Three "replicas" racing on the same fresh DB. Each gets its
     // own owned Migrator value (`migrator()` re-invokes the macro;
-    // `set_locking` in `rio_common::migrate::run` mutates).
+    // `set_locking` in `rio_migrations::migrate::run` mutates).
     let r = tokio::time::timeout(Duration::from_secs(60), async {
         tokio::try_join!(
-            rio_common::migrate::run(&db.pool, rio_migrations::migrator()),
-            rio_common::migrate::run(&db.pool, rio_migrations::migrator()),
-            rio_common::migrate::run(&db.pool, rio_migrations::migrator()),
+            rio_migrations::migrate::run(&db.pool, rio_migrations::migrator()),
+            rio_migrations::migrate::run(&db.pool, rio_migrations::migrator()),
+            rio_migrations::migrate::run(&db.pool, rio_migrations::migrator()),
         )
     })
     .await
@@ -257,7 +257,7 @@ fn migration_checksums_frozen() {
 /// `gc/sweep.rs`), and GC quotas read `tenants` (`gc/tenant.rs`).
 ///
 /// **Primary** enforcement is now compile-time: both crates
-/// `query_as!` into `rio_common::schema::{LivePin, TenantRow}`, so a
+/// `query_as!` into `rio_migrations::schema::{LivePin, TenantRow}`, so a
 /// column rename/retype breaks `cargo build`. THIS test is
 /// defense-in-depth — it catches a regression where someone swaps a
 /// `query_as!` site back to runtime `query_as` (silently dropping

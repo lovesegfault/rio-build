@@ -1267,7 +1267,7 @@ mod tests {
         // table sqlx-prepare can't see).
         let q_hash = StoreSeed::path("late-live-pin").seed(&db.pool).await;
         let _pin = sqlx::query_as!(
-            rio_common::schema::LivePin,
+            rio_migrations::schema::LivePin,
             "INSERT INTO scheduler_live_pins (store_path_hash, drv_hash) \
              VALUES ($1, 'drv') RETURNING store_path_hash, drv_hash",
             &q_hash,

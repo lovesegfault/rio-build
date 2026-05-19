@@ -35,7 +35,7 @@ impl SchedulerDb {
         // shouldn't error.
         //
         // `query!` (not runtime `query`): compile-checks the column
-        // list against `rio_common::schema::LivePin` — store reads
+        // list against `rio_migrations::schema::LivePin` — store reads
         // these columns in gc/mark.rs + gc/sweep.rs.
         let drv_hashes = vec![drv_hash.as_str(); hashes.len()];
         sqlx::query!(

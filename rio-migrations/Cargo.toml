@@ -10,11 +10,15 @@ publish = false
 
 [dependencies]
 sqlx = { workspace = true, features = ["migrate"] }
+# `migrate::run` poll loop (`tokio::time::sleep`).
+tokio = { workspace = true, features = ["time"] }
+# `migrate::run` follower-poll log lines.
+tracing = { workspace = true }
+# `schema::TenantRow::tenant_id` column type.
+uuid = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
-# `rio_common::migrate::run` in `concurrent_migrations_no_deadlock`.
-rio-common = { workspace = true, features = ["postgres"] }
 # `TestDb::new(&MIGRATOR)` ephemeral PG fixture.
 rio-test-support = { workspace = true }
 # `migration_checksums_frozen` hex-encodes the embedded SHA-384.

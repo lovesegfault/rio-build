@@ -9,9 +9,6 @@
 //! the database name — so two services calling raw `Migrator::run`
 //! against the same DB would mutually exclude, but a service using
 //! [`run`] and one using raw `Migrator::run` would NOT.
-//!
-//! Feature-gated on `postgres` so rio-common stays sqlx-free for
-//! consumers that don't touch the DB (gateway, builder, controller).
 
 use std::time::Duration;
 
@@ -66,7 +63,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 ///
 /// `migrator` is taken by value: `set_locking` needs `&mut`, and
 /// `Migrator` is not `Clone` in sqlx 0.8.x. Callers pass
-/// `rio_migrations::migrator()` to get a fresh owned value.
+/// [`crate::migrator()`] to get a fresh owned value.
 pub async fn run(pool: &PgPool, mut migrator: Migrator) -> Result<(), MigrateError> {
     // Dedicated lock connection, detached so dropping it closes the
     // socket (releasing the session lock) on ANY exit path. NOT the

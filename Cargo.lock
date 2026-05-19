@@ -6636,7 +6636,6 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "sqlx",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -6648,7 +6647,6 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
- "uuid",
  "workspace-hack",
 ]
 
@@ -6765,10 +6763,11 @@ name = "rio-migrations"
 version = "0.1.0"
 dependencies = [
  "hex",
- "rio-common",
  "rio-test-support",
  "sqlx",
  "tokio",
+ "tracing",
+ "uuid",
  "workspace-hack",
 ]
 

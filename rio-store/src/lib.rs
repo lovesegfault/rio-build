@@ -68,7 +68,7 @@ pub mod test_helpers;
 ///
 /// Gated on `test`/`test-utils` so `rio_store::MIGRATOR` stays out of
 /// the public API for non-test consumers — production code goes through
-/// `rio_common::migrate::run` with `rio_migrations::migrator()`. The
+/// `rio_migrations::migrate::run` with `rio_migrations::migrator()`. The
 /// re-export exists for the ~200 `TestDb::new(&crate::MIGRATOR)`
 /// callsites in this crate's `#[cfg(test)]` modules. `crate::MIGRATOR`
 /// and `rio_store::MIGRATOR` resolve to the same static.
