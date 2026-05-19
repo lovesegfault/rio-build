@@ -19214,6 +19214,10 @@
           "path": "src/bin/spike_negdentry_fuse.rs"
         },
         {
+          "name": "spike_passthrough_fuse",
+          "path": "src/bin/spike_passthrough_fuse.rs"
+        },
+        {
           "name": "spike_stream_fuse",
           "path": "src/bin/spike_stream_fuse.rs"
         }

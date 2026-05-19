@@ -395,11 +395,24 @@ affect the FUSE daemon implementation:
 - Mount configuration uses a `Config` struct with `mount_options:
   Vec<MountOption>`, `acl: SessionACL` (replaces `MountOption::AllowOther`
   with `SessionACL::All`), `n_threads`, and `clone_fd`.
-- Passthrough API: `KernelConfig::set_max_stack_depth(1)` in `init()`,
+- Passthrough API: `KernelConfig::add_capabilities(InitFlags::FUSE_PASSTHROUGH)`
+  *and* `KernelConfig::set_max_stack_depth(1)` in `init()` --- *both* are
+  required; `set_max_stack_depth` does not imply the capability flag, and
+  without it the kernel never sets `fc->passthrough` so `BACKING_OPEN` is
+  unconditionally `EPERM` (P0578 spike finding, `vm-composefs-spike-priv` Q8).
   `ReplyOpen::open_backing(impl AsFd) -> Result<BackingId>`,
   `ReplyOpen::opened_passthrough(FileHandle, FopenFlags, &BackingId)`.
-  `BackingId` must be kept alive (via a map keyed by file handle) until
-  `release()`.
+  *One* `BackingId` per inode, refcounted across all open `fh`s and dropped
+  on the last `release()` --- a second concurrent passthrough open whose
+  `fuse_backing` differs from the inode's recorded `fi->fb` is rejected with
+  `-EBUSY` → user-visible `EIO`, and overlay copy-up issues several lower
+  opens in one syscall (P0578 spike finding, `vm-composefs-spike-priv` Q10).
+  The `FopenFlags` passed to `opened_passthrough()` MUST be a subset of the
+  kernel's `FOPEN_PASSTHROUGH_MASK` (`{PASSTHROUGH, DIRECT_IO,
+  PARALLEL_DIRECT_WRITES, NOFLUSH}`); in particular `FOPEN_KEEP_CACHE` is
+  rejected with user-visible `EIO` (P0578 spike finding, `vm-composefs-spike-priv`
+  Q7) --- passthrough bypasses the FUSE inode page cache, so KEEP_CACHE is a
+  contradiction.
 
 #info(title: [Fallback architecture])[
   If the FUSE+overlay spike (Phase 1a) fails, the fallback is a bind-mount

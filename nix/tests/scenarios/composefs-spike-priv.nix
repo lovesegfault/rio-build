@@ -229,9 +229,140 @@ pkgs.testers.runNixOSTest {
             f"recv={recv_log.strip()!r} ls={ls_log.strip()!r}"
         )
 
+    # ── Q7-Q12: P0578 — FUSE passthrough under overlay ────────────────
+    #
+    # ADR-022 §2 castore-FUSE design needs four kernel facts to hold:
+    #   Q7  overlay can stack on a FUSE lower with FOPEN_PASSTHROUGH
+    #       (FUSE max_stack_depth=1 → overlay at depth 2, the kernel cap)
+    #   Q8  BACKING_OPEN ioctl needs CAP_SYS_ADMIN (unpriv → EPERM); a
+    #       root-held dup() of the same /dev/fuse fd succeeds — this is
+    #       the rio-mountd broker boundary
+    #   Q9  reads through the passthrough fd survive kill -9 of the FUSE
+    #       server (the kernel holds the backing fd, not the server)
+    #   Q10 copy-up through overlay works on a passthrough-backed lower
+    #       (chmod / append → upperdir gets the full file)
+    #   Q11 cache files are readonly: unpriv O_WRONLY → EACCES
+    #   Q12 readlink/getattr come from the FUSE server, but read() on a
+    #       regular file never hits it (passthrough bypasses the request
+    #       path) — assert the read counter doesn't move
+
+    def setup_passthrough():
+        machine.succeed(
+            "mkdir -p /tmp/pt-cache /tmp/pt-mnt /tmp/pt-up /tmp/pt-work /tmp/pt-merged"
+        )
+        # 4 MiB pseudo-random file: enough that a partial read shows up.
+        machine.succeed(
+            "head -c 4194304 /dev/urandom > /tmp/pt-cache/big.bin && "
+            "echo -n 'hello passthrough' > /tmp/pt-cache/small.txt && "
+            "chmod 0444 /tmp/pt-cache/* && "
+            "sha256sum /tmp/pt-cache/big.bin | cut -d' ' -f1 > /tmp/pt-big.sha"
+        )
+        machine.succeed(
+            "${rio-workspace}/bin/spike_passthrough_fuse "
+            "/tmp/pt-mnt /tmp/pt-cache /tmp/pt-probe 1000 "
+            ">/tmp/pt-fuse.log 2>&1 & echo $! >/tmp/pt-fuse.pid"
+        )
+        machine.wait_until_succeeds("test -f /tmp/pt-probe.ready", timeout=15)
+        # Direct read through the FUSE mount BEFORE adding overlay — if
+        # passthrough breaks, this isolates FUSE from overlay.
+        rc, out = machine.execute("head -c 16 /tmp/pt-mnt/small.txt 2>&1")
+        if rc != 0:
+            print("FUSE direct-read failed:", out.strip())
+            print("fuse-log:", machine.succeed("cat /tmp/pt-fuse.log 2>&1").strip())
+        assert rc == 0, "FUSE passthrough read failed before overlay"
+        machine.succeed(
+            "mount -t overlay overlay -o "
+            "lowerdir=/tmp/pt-mnt,upperdir=/tmp/pt-up,workdir=/tmp/pt-work,userxattr "
+            "/tmp/pt-merged"
+        )
+
+    def teardown_passthrough():
+        machine.succeed("umount -l /tmp/pt-merged 2>/dev/null || true")
+        machine.succeed(
+            "kill -9 $(cat /tmp/pt-fuse.pid 2>/dev/null) 2>/dev/null || true"
+        )
+        machine.succeed("umount -l /tmp/pt-mnt 2>/dev/null || true")
+
+    with subtest("Q7: overlay stacks on FUSE lower with passthrough"):
+        setup_passthrough()
+        # The mount itself succeeding (in setup_passthrough) IS the depth
+        # check: overlay refuses lowers at >= FILESYSTEM_MAX_STACK_DEPTH.
+        # Verify content reaches us through the full stack.
+        merged_sha = machine.succeed(
+            "sha256sum /tmp/pt-merged/big.bin | cut -d' ' -f1"
+        ).strip()
+        cache_sha = machine.succeed("cat /tmp/pt-big.sha").strip()
+        small = machine.succeed("cat /tmp/pt-merged/small.txt").strip()
+        ok = merged_sha == cache_sha and small == "hello passthrough"
+        record("Q7", ok, f"merged_sha={merged_sha[:12]} cache_sha={cache_sha[:12]}")
+
+    with subtest("Q8: BACKING_OPEN needs CAP_SYS_ADMIN; dup'd fd works"):
+        probe = machine.succeed("cat /tmp/pt-probe")
+        root_ok = "root_backing_open=ok" in probe
+        unpriv_eperm = "unpriv_backing_open=EPERM" in probe
+        record("Q8", root_ok and unpriv_eperm, probe.strip().replace("\n", " | "))
+
+    with subtest("Q12: read() never reaches the FUSE server"):
+        # Issue a fresh read that hasn't been page-cached yet.
+        machine.succeed("echo 1 > /proc/sys/vm/drop_caches")
+        machine.succeed("sha256sum /tmp/pt-merged/big.bin >/dev/null")
+        fuse_log = machine.succeed("cat /tmp/pt-fuse.log")
+        ok = "UNEXPECTED read upcall" not in fuse_log
+        record("Q12", ok, "no read upcalls" if ok else "passthrough not engaged")
+
+    with subtest("Q10: copy-up through overlay over passthrough lower"):
+        # chmod triggers a full data copy-up (no metacopy with userxattr);
+        # append re-opens the now-upper file. The copy-up reads the lower
+        # through the passthrough fd to populate the upper. Issues several
+        # opens of the lower in the same syscall — the FUSE server MUST
+        # share one BackingId per ino across them or the kernel's
+        # `fi->fb != fb` check returns EBUSY → user-visible EIO.
+        rc, out = machine.execute("chmod 0644 /tmp/pt-merged/small.txt 2>&1")
+        if rc != 0:
+            print("Q10 chmod failed:", out.strip())
+            print("Q10 dmesg-tail:", machine.succeed("dmesg | tail -10"))
+        machine.succeed("echo -n ' + appended' >> /tmp/pt-merged/small.txt")
+        upper = machine.succeed("cat /tmp/pt-up/small.txt")
+        merged = machine.succeed("cat /tmp/pt-merged/small.txt")
+        ok = rc == 0 and upper == "hello passthrough + appended" and merged == upper
+        record("Q10", ok, f"chmod_rc={rc} upper={upper!r}")
+
+    with subtest("Q11: cache files readonly to unpriv writers"):
+        rc, out = machine.execute(
+            "runuser -u riobuild -- bash -c "
+            "'echo x > /tmp/pt-cache/big.bin' 2>&1"
+        )
+        ok = rc != 0 and ("Permission denied" in out or "permission denied" in out.lower())
+        record("Q11", ok, f"rc={rc} out={out.strip()!r}")
+
+    with subtest("Q9: reads survive FUSE server kill"):
+        # Hold an fd open through the overlay, kill the FUSE server, then
+        # read through the held fd. Passthrough installs the backing ext4
+        # fd as the file's read path — server death is invisible to reads.
+        # `exec 9<` opens (and FOPEN_PASSTHROUGH-replies) eagerly, so by
+        # the time the kill fires, no FUSE request is pending.
+        machine.succeed(
+            "exec 9</tmp/pt-merged/big.bin && "
+            "kill -9 $(cat /tmp/pt-fuse.pid) && sleep 0.5 && "
+            "actual=$(cat <&9 | sha256sum | cut -d' ' -f1) && "
+            "exec 9<&- && "
+            "[ \"$actual\" = \"$(cat /tmp/pt-big.sha)\" ] && echo MATCH > /tmp/pt-q9 || echo MISMATCH > /tmp/pt-q9"
+        )
+        q9 = machine.succeed("cat /tmp/pt-q9").strip()
+        record("Q9", q9 == "MATCH", q9)
+        teardown_passthrough()
+
     print("\n──────── verdict ────────")
     for q in sorted(verdict):
         v, d = verdict[q]
         print(f"{q}: {v}  {d}")
+    # Q4/Q6 are exploratory (may FAIL on some kernels without blocking the
+    # design); Q1/Q2/Q3/Q5 hard-assert above. Q7-Q12 are P0578 gate
+    # criteria for the §2 castore-FUSE design — any FAIL is a blocker.
+    p0578_failed = [
+        q for q, (v, _) in verdict.items()
+        if v == "FAIL" and q in ("Q7", "Q8", "Q9", "Q10", "Q11", "Q12")
+    ]
+    assert not p0578_failed, f"P0578 gate failed: {p0578_failed}"
   '';
 }

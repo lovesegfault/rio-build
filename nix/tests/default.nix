@@ -264,6 +264,11 @@ in
   vm-composefs-spike = composefs-spike { inherit pkgs rio-workspace; };
   vm-composefs-spike-scale = composefs-spike-scale { inherit pkgs rio-workspace; };
   vm-composefs-spike-stream = composefs-spike-stream { inherit pkgs rio-workspace; };
+  # P0578 — Q7-Q12: passthrough under overlay, BACKING_OPEN broker
+  # boundary, no-read-upcall, copy-up, reads-survive-server-kill.
+  # r[verify builder.fs.passthrough-stack-depth]
+  # r[verify builder.fs.passthrough-on-hit]
+  # r[verify builder.mountd.backing-broker]
   vm-composefs-spike-priv = composefs-spike-priv { inherit pkgs rio-workspace; };
   vm-spike-fuse-negdentry = spike-fuse-negdentry { inherit pkgs rio-workspace; };
 
