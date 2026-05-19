@@ -77,14 +77,8 @@ fn schema_liveness() -> Result<()> {
     // ── Live-table set: CREATE/ALTER add, DROP removes, in version
     // order. Migration filenames are zero-padded `NNN_*.sql`, so a
     // lexicographic sort matches `MIGRATOR.iter()`'s ascending-version
-    // order without parsing the prefix.
-    //
-    // SQL `--` comment lines are stripped first (017 has the prose
-    // "CREATE TABLE inline REFERENCES" in a comment, which would
-    // otherwise extract a phantom `inline` table). No block comments
-    // exist in `migrations/` today; if one appears the regex simply
-    // misses tables inside it, which is a false negative, not a false
-    // positive — acceptable.
+    // order without parsing the prefix. Per-file extraction (regex +
+    // comment-stripping + fail-loud guard) lives in `scan_migration_ddl`.
     let mig_dir = root.join("rio-migrations/migrations");
     ensure!(
         mig_dir.is_dir(),
@@ -100,30 +94,11 @@ fn schema_liveness() -> Result<()> {
         .collect();
     sql_paths.sort();
 
-    let ddl = regex::Regex::new(
-        r"(?x)
-          \b CREATE \s+ TABLE \s+ (?: IF \s+ NOT \s+ EXISTS \s+ )? (?<create> \w+ )
-        | \b ALTER  \s+ TABLE \s+                                  (?<alter>  \w+ )
-        | \b DROP   \s+ TABLE \s+ (?: IF \s+ EXISTS \s+ )?         (?<drop>   \w+ )
-        ",
-    )
-    .unwrap();
     let mut live: BTreeSet<String> = BTreeSet::new();
     for path in &sql_paths {
         let sql =
             fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let stripped: String = sql
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("--"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        for c in ddl.captures_iter(&stripped) {
-            if let Some(t) = c.name("create").or_else(|| c.name("alter")) {
-                live.insert(t.as_str().to_owned());
-            } else if let Some(t) = c.name("drop") {
-                live.remove(t.as_str());
-            }
-        }
+        scan_migration_ddl(&sql, path, &mut live)?;
     }
     // Floor guard: a regex regression that matches nothing would make
     // the loop below vacuously pass.
@@ -132,18 +107,29 @@ fn schema_liveness() -> Result<()> {
     // ── Corpus: concat every `.rs` file under the PG-querying crates'
     // `src/` trees.
     //
-    // Excluded by filename:
+    // Files excluded from the walk. Matched by **basename only** — any
+    // file with one of these names anywhere under a corpus root is
+    // excluded, not just the one path the exclusion was written for.
+    // Currently safe: the only basename collisions are this file
+    // (`xtask/src/lint.rs`) and the doc-const file
+    // (`rio-migrations/src/migrations.rs`, which is outside the corpus
+    // roots anyway). If you add a `lint.rs` or `migrations.rs` to
+    // rio-store, rio-scheduler, or xtask that DOES legitimately
+    // reference table names, switch this to a path-relative match.
+    //
+    // Why each entry is excluded:
     // - `migrations.rs`: the per-migration doc-const file names every
     //   table as prose, which would defeat the liveness check. (Today
     //   no corpus dir contains one — it moved to
     //   `rio-migrations/src/migrations.rs` — but the exclusion stays so
     //   re-introducing it doesn't silently mask dead tables.)
-    // - `lint.rs`: this file. ALLOW_DEAD entries and the doc-comments
-    //   above name tables as commentary; including the lint in its own
-    //   corpus makes every allowlisted table look "referenced" and
-    //   breaks the reverse stale-allowlist check below. The original
-    //   test lived in `rio-store/tests/migrations.rs` — outside the
-    //   `src/`-only walk — so it never had this problem.
+    // - `lint.rs`: this file. ALLOW_DEAD entries, the doc-comments
+    //   above, and the `#[cfg(test)]` synthetic SQL all name tables as
+    //   commentary; including the lint in its own corpus makes every
+    //   allowlisted table look "referenced" and breaks the reverse
+    //   stale-allowlist check below. The original test lived in
+    //   `rio-store/tests/migrations.rs` — outside the `src/`-only walk
+    //   — so it never had this problem.
     const CORPUS_EXCLUDE: &[&str] = &["migrations.rs", "lint.rs"];
     let corpus_roots = ["rio-store/src", "rio-scheduler/src", "xtask/src"];
     let mut corpus = String::new();
@@ -224,6 +210,87 @@ fn schema_liveness() -> Result<()> {
     Ok(())
 }
 
+/// Parse one migration's SQL and apply its table-level DDL to `live`.
+///
+/// SQL `--` comment lines are stripped first (017 has the prose
+/// "CREATE TABLE inline REFERENCES" in a comment, which would otherwise
+/// extract a phantom `inline` table). No block comments exist in
+/// `migrations/` today; if one appears the regex simply misses tables
+/// inside it, which is a false negative, not a false positive —
+/// acceptable.
+///
+/// The extraction regex recognizes (uppercase only, matching house
+/// style):
+///   - `CREATE TABLE [IF NOT EXISTS] <name>` — inserts `<name>`
+///   - `ALTER TABLE <name>`                  — inserts `<name>`
+///   - `DROP TABLE [IF EXISTS] <name>`       — removes `<name>`
+///
+/// It does **not** handle:
+///   - `ALTER TABLE old RENAME TO new` — captures `old`, never tracks
+///     `new`. The line still matches, so this is a *silent* gap; the
+///     fail-loud guard below cannot catch it.
+///   - schema-qualified names (`public.foo`) — captures `public`, not
+///     `foo`. Also a silent gap (line still matches).
+///   - `CREATE UNLOGGED/TEMP[ORARY] TABLE` — modifier between `CREATE`
+///     and `TABLE` defeats the regex. Caught by the guard.
+///   - lowercase DDL — regex is case-sensitive. Caught by the guard.
+///
+/// The fail-loud guard bails on any non-comment line that *looks* like
+/// table DDL (case-insensitive `CREATE/ALTER/DROP … TABLE` prefix) but
+/// the extraction regex doesn't match — so a novel DDL shape errors
+/// instead of silently bypassing the liveness check. Non-table DDL
+/// (`CREATE INDEX`/`VIEW`/`EXTENSION`/`FUNCTION`, `DROP CONSTRAINT`,
+/// `ALTER COLUMN`/`INDEX` continuation lines, …) does not trip it.
+fn scan_migration_ddl(sql: &str, path: &Path, live: &mut BTreeSet<String>) -> Result<()> {
+    let ddl = regex::Regex::new(
+        r"(?x)
+          \b CREATE \s+ TABLE \s+ (?: IF \s+ NOT \s+ EXISTS \s+ )? (?<create> \w+ )
+        | \b ALTER  \s+ TABLE \s+                                  (?<alter>  \w+ )
+        | \b DROP   \s+ TABLE \s+ (?: IF \s+ EXISTS \s+ )?         (?<drop>   \w+ )
+        ",
+    )
+    .unwrap();
+    // Prefixes that mark a line as table DDL for the fail-loud guard.
+    // Deliberately broader than the regex (UNLOGGED/TEMP[ORARY]) so the
+    // shapes the regex CAN'T capture are the ones that bail.
+    const TABLE_DDL_PREFIXES: &[&str] = &[
+        "CREATE TABLE",
+        "CREATE UNLOGGED TABLE",
+        "CREATE TEMPORARY TABLE",
+        "CREATE TEMP TABLE",
+        "ALTER TABLE",
+        "DROP TABLE",
+    ];
+    let mut stripped = String::new();
+    for (i, line) in sql.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("--") {
+            continue;
+        }
+        let upper = trimmed.to_ascii_uppercase();
+        if TABLE_DDL_PREFIXES.iter().any(|kw| upper.starts_with(kw)) && !ddl.is_match(line) {
+            bail!(
+                "{}: unrecognized table DDL at line {}: `{trimmed}` — the \
+                 schema-liveness extraction regex doesn't handle this shape; \
+                 update `scan_migration_ddl` in xtask/src/lint.rs (regex + \
+                 doc-comment), or rephrase the migration to a recognized shape",
+                path.display(),
+                i + 1,
+            );
+        }
+        stripped.push_str(line);
+        stripped.push('\n');
+    }
+    for c in ddl.captures_iter(&stripped) {
+        if let Some(t) = c.name("create").or_else(|| c.name("alter")) {
+            live.insert(t.as_str().to_owned());
+        } else if let Some(t) = c.name("drop") {
+            live.remove(t.as_str());
+        }
+    }
+    Ok(())
+}
+
 /// Helm `[sla]` chart-coverage guard: every entry in
 /// `HELM_RENDERED_SLA_KEYS` appears as a substring of the scheduler
 /// helm template.
@@ -276,4 +343,88 @@ fn walk_rs(dir: &Path, f: &mut impl FnMut(&Path) -> Result<()>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// `lint.rs` is in `CORPUS_EXCLUDE`, so the synthetic table names below
+// can't leak into the schema-liveness corpus and mask a real dead table.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scan(sql: &str) -> Result<BTreeSet<String>> {
+        let mut live = BTreeSet::new();
+        scan_migration_ddl(sql, Path::new("synthetic.sql"), &mut live)?;
+        Ok(live)
+    }
+
+    #[test]
+    fn extracts_create_alter_drop() {
+        let live = scan(
+            "CREATE TABLE foo (id INT);\n\
+             ALTER TABLE bar ADD COLUMN x INT;\n\
+             CREATE TABLE IF NOT EXISTS baz (id INT);\n\
+             DROP TABLE foo;\n\
+             DROP TABLE IF EXISTS gone;",
+        )
+        .unwrap();
+        assert_eq!(
+            live,
+            BTreeSet::from(["bar".to_owned(), "baz".to_owned()]),
+            "CREATE then DROP cancels; ALTER and IF NOT EXISTS recognized"
+        );
+    }
+
+    #[test]
+    fn comment_lines_and_non_table_ddl_pass_through() {
+        // None of these should bail OR extract a table.
+        let live = scan(
+            "-- CREATE TABLE phantom (commented out)\n\
+             CREATE INDEX foo_idx ON foo (x);\n\
+             CREATE UNIQUE INDEX bar_idx ON bar (y);\n\
+             CREATE VIEW v AS SELECT 1;\n\
+             CREATE EXTENSION IF NOT EXISTS pgcrypto;\n\
+             -- continuation lines from a multi-line ALTER TABLE\n\
+                 ALTER COLUMN x TYPE BIGINT,\n\
+                 DROP CONSTRAINT foo_pkey;\n\
+             DROP INDEX foo_idx;\n\
+             DROP VIEW v;",
+        )
+        .unwrap();
+        assert!(live.is_empty(), "no table DDL extracted, got {live:?}");
+    }
+
+    #[test]
+    fn fail_loud_guard_rejects_unrecognized_table_ddl() {
+        // Shapes the regex can't match at all → guard must bail.
+        for bad in [
+            "CREATE UNLOGGED TABLE foo (id INT);",
+            "CREATE TEMPORARY TABLE foo (id INT);",
+            "CREATE TEMP TABLE foo (id INT);",
+            "create table foo (id INT);", // lowercase
+            "Drop Table foo;",            // mixed case
+        ] {
+            let err = scan(bad).unwrap_err();
+            assert!(
+                err.to_string().contains("unrecognized table DDL"),
+                "expected guard to fire on `{bad}`, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_silent_gaps_do_not_trip_the_guard() {
+        // These ARE wrong (see scan_migration_ddl's doc-comment) but the
+        // regex partially matches, so the guard can't catch them — pin
+        // the behavior so a future regex tweak that changes it is
+        // noticed.
+        let live = scan("ALTER TABLE old RENAME TO new;").unwrap();
+        assert_eq!(live, BTreeSet::from(["old".to_owned()]), "new not tracked");
+
+        let live = scan("CREATE TABLE public.foo (id INT);").unwrap();
+        assert_eq!(
+            live,
+            BTreeSet::from(["public".to_owned()]),
+            "schema captured, not table"
+        );
+    }
 }
