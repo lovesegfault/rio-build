@@ -499,6 +499,22 @@
               };
 
               # --------------------------------------------------------------
+              # Kani Rust Verifier toolchain
+              # --------------------------------------------------------------
+              #
+              # kani-compiler, kani-driver, the always-encode-mir sysroot.
+              # Built from source against a nightly pinned by kani's
+              # rust-toolchain.toml (NOT rustNightly — kani-compiler links
+              # rustc_private, so the date is exact). `nix build
+              # .#kani-toolchain`. Toolchain only; no harness verification
+              # yet (a future crateBuildKani tree + nix/kani.nix consume
+              # kaniToolchain exports).
+              kaniToolchain = import ./nix/kani-toolchain.nix {
+                inherit pkgs;
+                inherit (pkgs) lib;
+              };
+
+              # --------------------------------------------------------------
               # Non-rustc check derivations (shared by checks.* and ci aggregate)
               # --------------------------------------------------------------
               miscChecks = import ./nix/misc-checks.nix {
@@ -928,6 +944,23 @@
                 tfvars = pkgs.writeText "generated.auto.tfvars.json" (builtins.toJSON (import ./nix/pins.nix));
                 # Typst design book outputs.
                 inherit (docsLib) docs docs-pdf;
+                # Kani Rust Verifier toolchain — manual build (`nix build
+                # .#kani-toolchain`), not a check. Heavy: pulls a second
+                # nightly with rustc-dev (~2 GB) and rebuilds std with
+                # always-encode-mir. Other kaniToolchain exports
+                # (kani-rustc, kani-sysroot, kaniNightly,
+                # kani-driver-wrapped) hang off this attr as passthru —
+                # the project deliberately has no legacyPackages bridge.
+                kani-toolchain = kaniToolchain.kani.overrideAttrs (old: {
+                  passthru = (old.passthru or { }) // {
+                    inherit (kaniToolchain)
+                      kani-driver-wrapped
+                      kani-rustc
+                      kani-sysroot
+                      kaniNightly
+                      ;
+                  };
+                });
               }
               # Container images. `.#dockerImages` is the linkFarm xtask
               # `eks push` walks; individual images at `.#dockerImages.<name>`
