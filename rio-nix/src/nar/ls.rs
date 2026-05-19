@@ -66,12 +66,12 @@ pub struct NarLsEntry {
     pub nar_offset: u64,
     /// Symlinks only.
     pub target: Vec<u8>,
-    /// `blake3(content)` for regular files. Zeroes for dirs/symlinks.
+    /// `blake3(content)` for regular files. Zeroes for dirs/symlinks;
+    /// `nar_index::to_proto_entry` maps non-Regular kinds to an empty
+    /// `bytes` field on the wire.
     ///
-    /// TODO(P0552): proto's `NarIndexEntry.file_digest` is "empty for
-    /// dirs/symlinks"; the conversion layer must map `kind != Regular`
-    /// → `b""`, not `.to_vec()` (32 zeros). Or change this field to
-    /// `Option<[u8; 32]>` and make the absent case unrepresentable.
+    /// TODO: consider `Option<[u8; 32]>` so the absent case is
+    /// unrepresentable rather than a zero sentinel.
     ///
     /// r[impl store.index.file-digest]
     pub file_digest: [u8; 32],

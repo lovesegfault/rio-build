@@ -160,7 +160,10 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_integrity_failures_total",
-        "GetPath content integrity check failures (bitrot/corruption)"
+        "Content integrity check failures, labeled by `site`: \
+         `get_path` (whole-NAR SHA-256, indicates bitrot/corruption), \
+         `read_blob` (whole-file BLAKE3, indicates cumsum/index drift), \
+         `chunk` (per-chunk BLAKE3, indicates bitrot/corruption)"
     );
     describe_gauge!(
         "rio_store_chunk_dedup_ratio",
