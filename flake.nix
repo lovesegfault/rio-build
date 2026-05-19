@@ -562,8 +562,7 @@
               #   vm-netpol-k3s — NetworkPolicy enforcement
               #
               # mkVmTests: build the attrset for a given (workspace,
-              # dockerImages, coverage) triple — see nix/tests/wiring.nix
-              # for the cpuHints table + withMinCpu builder-floor logic.
+              # dockerImages, coverage) triple — see nix/tests/wiring.nix.
               # vmTests uses the normal build; vmTestsCov uses the
               # instrumented build + coverage=true so common.nix sets
               # LLVM_PROFILE_FILE and appends collectCoverage to each

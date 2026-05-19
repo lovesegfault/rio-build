@@ -12,7 +12,7 @@
 #   client-v6 (1GB)                    — v6-only SSH user (aliased `client`)
 #   upstream-v6 (512MB)                — v6-only http.server :8080
 #   client-v4 + upstream-v4 (1.5GB)    — only with `withV4Nodes = true`
-# ~16.5GB base (normal), ~18GB +v4, ~22GB coverage — withMinCpu 8.
+# ~16.5GB base (normal), ~18GB +v4, ~22GB coverage.
 #
 # Airgapped: every image preloaded via services.k3s.images on BOTH
 # nodes (pods can schedule on either). NodePort gateway → client

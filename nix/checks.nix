@@ -756,10 +756,6 @@ let
           # sequences by default; disable for log greppability.
           CARGO_TERM_COLOR = "never";
           NEXTEST_HIDE_PROGRESS_BAR = "1";
-          # Remote-builder resource floor — postgres + tokio test
-          # parallelism OOMs below ~16GB.
-          NIXBUILDNET_MIN_CPU = "16";
-          NIXBUILDNET_MIN_MEM = "16384";
         }
       )
       ''
