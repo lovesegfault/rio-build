@@ -234,24 +234,15 @@
               # nextest runtime overlay consume. No commonCargoSources
               # filter — that strips proto/, which rio-proto's build.rs
               # needs as ./proto/.
-              memberFilesets = {
-                rio-auth = ./rio-auth;
-                rio-builder = ./rio-builder;
-                rio-cli = ./rio-cli;
-                rio-common = ./rio-common;
-                rio-controller = ./rio-controller;
-                rio-crds = ./rio-crds;
-                rio-gateway = ./rio-gateway;
-                rio-lease = ./rio-lease;
-                rio-migrations = ./rio-migrations;
-                rio-nix = ./rio-nix;
-                rio-proto = ./rio-proto;
-                rio-scheduler = ./rio-scheduler;
-                rio-store = ./rio-store;
-                rio-test-support = ./rio-test-support;
-                workspace-hack = ./workspace-hack;
-                xtask = ./xtask;
-              };
+              #
+              # Derived from Cargo.toml's [workspace] members so adding
+              # or removing a crate is a Cargo.toml-only change. After
+              # the cross-directory-read elimination, every crate's
+              # fileset is just its own directory — no per-crate unions
+              # or exclusions. The lib/bin vs. test split is layered on
+              # top in memberBinFilesets below, not encoded here.
+              inherit ((pkgs.lib.importTOML ./Cargo.toml).workspace) members;
+              memberFilesets = pkgs.lib.genAttrs members (n: ./. + "/${n}");
               # Per-member fileset for the lib/bin compile — memberFilesets
               # MINUS tests/ and proptest-regressions/. buildRustCrate never
               # reads tests/ when buildTests=false (the entire `find tests/`
