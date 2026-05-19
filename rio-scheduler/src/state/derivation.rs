@@ -765,6 +765,19 @@ pub struct DerivationState {
     pub interested_builds: HashSet<Uuid>,
     /// Worker currently assigned/running this derivation.
     pub assigned_executor: Option<ExecutorId>,
+    /// Per-execution identifier minted by `assign_to_worker` for the
+    /// active assignment. UUIDv7 — keys the `drv_logs` PG row and the
+    /// `logs/{drv_hash}/{exec_id}.log.zst` S3 blob. Mirrors the
+    /// `LogBuffers` ring-buffer entry's `exec_id` (the flusher's read
+    /// path) and `assignments.exec_id` (the recovery carrier). NOT the
+    /// flusher's read path — the actor and the flusher are deliberately
+    /// decoupled (see `logs/mod.rs` module header).
+    ///
+    /// `None` on construction. Set by `assign_to_worker`; cleared by
+    /// `reset_to_ready`. May be stale between a deassign (cancel, retry,
+    /// orphan-recovery) and the next re-dispatch — readers run only
+    /// during or after `assign_to_worker`, which always overwrites it.
+    pub exec_id: Option<Uuid>,
     /// Scheduling hints (estimator outputs, resource_floor, critical-path priority).
     pub sched: SchedHint,
     /// ATerm-serialized .drv content, inlined by the gateway for
@@ -891,6 +904,7 @@ impl DerivationState {
             status: DerivationStatus::Created,
             interested_builds: HashSet::new(),
             assigned_executor: None,
+            exec_id: None,
             // est_duration/priority: placeholders — merge.rs sets them
             // via critical_path::compute_initial right after
             // try_from_node (SLA cache not in scope here). 0.0 is a
@@ -973,6 +987,9 @@ impl DerivationState {
             status,
             interested_builds: HashSet::new(), // populated by build_derivations join
             assigned_executor: row.assigned_builder_id.map(Into::into),
+            // Recovery: exec_id loaded from assignments.exec_id by
+            // recover_from_pg → set on DerivationState + LogBuffers (Task 11).
+            exec_id: None,
             sched: SchedHint {
                 // M_044: persisted reactive floor. PG bigint → i64;
                 // negatives (impossible by DEFAULT 0 + only-ever-doubled
@@ -1072,6 +1089,7 @@ impl DerivationState {
             status: DerivationStatus::Poisoned,
             interested_builds: HashSet::new(),
             assigned_executor: None,
+            exec_id: None,
             sched: SchedHint::default(),
             drv_content: Vec::new(),
             input_srcs: Vec::new(),
@@ -1266,6 +1284,7 @@ impl DerivationState {
             }
         }
         self.assigned_executor = None;
+        self.exec_id = None;
         Ok(())
     }
 

@@ -13,8 +13,13 @@ async fn test_update_assignment_status_pending_no_completed_at() -> anyhow::Resu
     let db = SchedulerDb::new(test_db.pool.clone());
 
     let drv_id = insert_test_derivation(&db, "bbb").await?;
-    db.insert_assignment(drv_id, &ExecutorId::from("worker-1"), 1)
-        .await?;
+    db.insert_assignment(
+        drv_id,
+        &ExecutorId::from("worker-1"),
+        1,
+        uuid::Uuid::now_v7(),
+    )
+    .await?;
 
     db.update_assignment_status(drv_id, AssignmentStatus::Pending)
         .await?;
@@ -37,8 +42,13 @@ async fn test_update_assignment_status_completed_sets_completed_at() -> anyhow::
     let db = SchedulerDb::new(test_db.pool.clone());
 
     let drv_id = insert_test_derivation(&db, "ccc").await?;
-    db.insert_assignment(drv_id, &ExecutorId::from("worker-1"), 1)
-        .await?;
+    db.insert_assignment(
+        drv_id,
+        &ExecutorId::from("worker-1"),
+        1,
+        uuid::Uuid::now_v7(),
+    )
+    .await?;
 
     db.update_assignment_status(drv_id, AssignmentStatus::Completed)
         .await?;

@@ -1468,6 +1468,21 @@ impl DagActor {
         // drop this attempt's pushes). No-op for first dispatch.
         self.discard_log_buffer(drv_hash);
 
+        // Mint a fresh per-execution identifier. UUIDv7 — time-sortable,
+        // keys the `drv_logs` row and the `logs/{drv_hash}/{exec_id}.*`
+        // S3 blobs. Stamped on the ring-buffer entry (flusher carrier)
+        // and `DerivationState` (actor carrier); persisted to
+        // `assignments.exec_id` in `record_assignment` (recovery
+        // carrier); sent in `WorkAssignment.exec_id` (worker echo).
+        // Minted AFTER discard so the buffer entry it stamps is fresh,
+        // and BEFORE record_assignment so the PG row is consistent
+        // with the in-memory state.
+        let exec_id = Uuid::now_v7();
+        self.set_log_exec(drv_hash, exec_id, executor_id);
+        if let Some(state) = self.dag.node_mut(drv_hash) {
+            state.exec_id = Some(exec_id);
+        }
+
         // Single atomic load. The lease task may fetch_add the
         // generation between the DB insert and the WorkAssignment send
         // below (there's an await in between). Without this snapshot,
@@ -1481,7 +1496,7 @@ impl DagActor {
         // (is_leader=true, which dispatch_ready checked at loop top).
         let generation = self.leader.generation();
 
-        self.record_assignment(drv_hash, executor_id, generation)
+        self.record_assignment(drv_hash, executor_id, generation, exec_id)
             .await;
 
         // PrefetchHint BEFORE WorkAssignment: the worker starts
@@ -1562,6 +1577,7 @@ impl DagActor {
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
         generation: u64,
+        exec_id: Uuid,
     ) {
         self.persist_status(drv_hash, DerivationStatus::Assigned, Some(executor_id))
             .await;
@@ -1572,7 +1588,7 @@ impl DagActor {
             && let Some(db_id) = state.db_id
             && let Err(e) = self
                 .db
-                .insert_assignment(db_id, executor_id, generation as i64)
+                .insert_assignment(db_id, executor_id, generation as i64, exec_id)
                 .await
         {
             error!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
@@ -1656,8 +1672,14 @@ impl DagActor {
         {
             worker.running_build = None;
         }
+        // Discard the ring-buffer entry that `set_log_exec` just
+        // created — without this, a failed dispatch leaks an empty
+        // stamped entry that the periodic flusher would skip (zero
+        // lines) but never reap. Idempotent; the entry is empty (the
+        // worker never started streaming because try_send failed).
+        self.discard_log_buffer(drv_hash);
         // Assigned -> Ready. Caller (dispatch_ready) defers; next pass
-        // retries.
+        // retries. `reset_to_ready` also clears `exec_id`.
         if let Some(state) = self.dag.node_mut(drv_hash)
             && let Err(e) = state.reset_to_ready()
         {
@@ -1870,10 +1892,13 @@ impl DagActor {
             assigned_cores: state.sched.last_intent.as_ref().map(|i| i.cores),
             assigned_mem_bytes: None,
             assigned_disk_bytes: None,
-            // Per-execution identifier. Minted at assign_to_worker once the
-            // dispatch path threads it through (later commit); until then
-            // the worker echoes an empty string in the log header.
-            exec_id: String::new(),
+            // Per-execution identifier minted in `assign_to_worker` and
+            // stored on `DerivationState`. The worker echoes this in the
+            // log header (display-only). Empty only on the unreachable
+            // path where the dag node lost its exec_id between assign and
+            // proto-build — the actor is single-threaded so that can't
+            // happen, but the field is non-Option in the proto.
+            exec_id: state.exec_id.map(|u| u.to_string()).unwrap_or_default(),
         })
     }
 
