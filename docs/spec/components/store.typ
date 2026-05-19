@@ -685,10 +685,13 @@ snix-compatible Directory/Blob surface backed by `directories`/`file_blobs`
 
 #r("store.castore.tenant-scope")[
   `GetDirectory`/`HasDirectories`/`HasBlobs`/`ReadBlob`/`StatBlob` MUST be
-  tenant-scoped: queries join `directory_tenants`/`file_blob_tenants` on the
-  caller's `tenant_id` (from JWT `Claims.sub` or HMAC
-  `AssignmentClaims.tenant`, #rref("common.hmac.claims")) and return
-  NotFound for digests the caller's tenant has not produced. Directory bodies
+  tenant-scoped: queries resolve a digest to its containing store path(s)
+  (`directory_paths` / `file_blobs.store_path_hash`) and join `path_tenants`
+  on the caller's `tenant_id` (from JWT `Claims.sub` or HMAC
+  `AssignmentClaims.tenant`, #rref("common.hmac.claims")). `path_tenants` is
+  the single source of tenancy truth at read time. Return NotFound for
+  digests the caller's tenant cannot reach via any owned path. Directory
+  bodies
   leak child names/digests --- cross-tenant exposure here is a confidentiality
   issue, unlike the chunk-level surface (see "Cross-Tenant Chunk Probing" in
   the security spec). `GetChunks` is *not* tenant-scoped: a 32-byte BLAKE3
@@ -700,11 +703,10 @@ snix-compatible Directory/Blob surface backed by `directories`/`file_blobs`
 
 #r("store.castore.gc")[
   `directories` rows are refcounted (one increment per referencing manifest).
-  `file_blobs` is a `(digest, store_path_hash)` junction with `ON DELETE
-  CASCADE` from `manifests` --- GC of one referrer cascade-deletes its rows,
-  surviving referrers' rows remain, so `ReadBlob`/`StatBlob` never resolve to a
-  dead manifest. After cascade, `file_blob_tenants` rows for digests with zero
-  remaining `file_blobs` rows are deleted in the same sweep transaction.
+  `file_blobs` and `directory_paths` are `(digest, store_path_hash)` junctions
+  with `ON DELETE CASCADE` from `manifests` --- GC of one referrer
+  cascade-deletes its rows, surviving referrers' rows remain, so
+  `ReadBlob`/`StatBlob` never resolve to a dead manifest.
 ]
 
 = Upstream Cache Substitution

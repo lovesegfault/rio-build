@@ -1060,6 +1060,29 @@ pub const M_062: () = ();
 /// no pre-063 rows to backfill: 062 and 063 ship in the same release.
 pub const M_063: () = ();
 
+/// 064 — `directory_paths` + drop `directory_tenants`/`file_blob_tenants`.
+///
+/// 062's `directory_tenants`/`file_blob_tenants` were a one-shot
+/// snapshot of `path_tenants` taken at first-index time inside
+/// `set_nar_index`. Two unsound consequences:
+///
+/// - **Cross-tenant pick.** `file_blob_tenants` is keyed `(digest,
+///   tenant)` — coarser than `file_blobs`' `(digest, store_path_hash)`.
+///   The blob-fetch query joined on digest only, then `LIMIT 1` with no
+///   `ORDER BY`, so it could return another tenant's NAR window/chunk
+///   list for a content-shared digest.
+/// - **Late-tenant lockout.** Nothing resynced the junctions after
+///   first-index. A tenant that gains a `path_tenants` row later
+///   (cache hit, scheduler race) was permanently denied DirectoryService
+///   reads for a path they legitimately own.
+///
+/// Fix: derive tenancy at read time from `path_tenants`, the single
+/// source of truth. `file_blobs` already carries `store_path_hash`;
+/// `directory_paths` is the analogous linkage for `directories` (one
+/// row per `(Directory body, NAR containing it)`, FK CASCADE on both
+/// sides — GC of either parent removes the row).
+pub const M_064: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

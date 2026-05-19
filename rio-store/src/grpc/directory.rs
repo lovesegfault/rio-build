@@ -1,11 +1,12 @@
 //! ADR-022 castore RPC surface (P0573 / P0577 / P0570).
 //!
 //! `GetDirectory` / `HasDirectories` / `HasBlobs` / `ReadBlob` /
-//! `StatBlob`. All tenant-scoped: every query joins
-//! `directory_tenants` / `file_blob_tenants` on the caller's
-//! `tenant_id` so a digest the tenant didn't produce is invisible
-//! (NotFound, or absent from the bitmap). Directory bodies leak child
-//! names/digests — confidentiality, not just isolation.
+//! `StatBlob`. All tenant-scoped: every query resolves a digest to the
+//! store path(s) that contain it (`directory_paths` /
+//! `file_blobs.store_path_hash`) and joins `path_tenants` on the
+//! caller's `tenant_id`, so a digest the tenant didn't produce is
+//! invisible (NotFound, or absent from the bitmap). Directory bodies
+//! leak child names/digests — confidentiality, not just isolation.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -29,8 +30,20 @@ use rio_proto::types::{
 use crate::cas::ChunkCache;
 
 /// BFS frontier batch cap. ~33 round trips for a chromium-scale
-/// closure (8k dirs); matches PG's parameter limit headroom.
+/// closure (8k dirs); matches PG's parameter limit headroom. This
+/// only bounds the *size* side-query — the body fetch is further
+/// split by [`GET_DIRECTORY_BATCH_BYTES`].
 const GET_DIRECTORY_BATCH: usize = 256;
+
+/// Per-`fetch_all` byte ceiling for `GetDirectory` body batches.
+///
+/// `Directory.body` rows have no write-side cap (only an entry-count
+/// cap, `MAX_DIRECTORY_ENTRIES` ~46 MB encoded), so a count-only batch
+/// can transiently materialize ~12 GB into one `Vec` before a single
+/// row reaches the bounded channel. The size side-query (`length(body)`,
+/// no TOAST detoast) lets the batch be split greedily under this
+/// ceiling — same byte-budgeting `GetPath`/`PutPath` already apply.
+const GET_DIRECTORY_BATCH_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Stream channel depth. Small on purpose — h2 flow control already
 /// backpressures the wire, and a deep channel just buffers decoded
@@ -200,8 +213,10 @@ impl DirectoryService for DirectoryServiceImpl {
             let digest = frontier[0];
             let body: Option<(Vec<u8>,)> = sqlx::query_as(
                 "SELECT d.body FROM directories d \
-                  JOIN directory_tenants t ON t.digest = d.digest \
-                 WHERE d.digest = $1 AND t.tenant_id = $2",
+                  JOIN directory_paths dp ON dp.digest = d.digest \
+                  JOIN path_tenants pt ON pt.store_path_hash = dp.store_path_hash \
+                 WHERE d.digest = $1 AND pt.tenant_id = $2 \
+                 LIMIT 1",
             )
             .bind(digest.as_slice())
             .bind(tenant)
@@ -238,10 +253,18 @@ impl DirectoryService for DirectoryServiceImpl {
                     let mut next: Vec<[u8; 32]> = Vec::new();
                     for batch in frontier.chunks(GET_DIRECTORY_BATCH) {
                         let digests: Vec<&[u8]> = batch.iter().map(|d| d.as_slice()).collect();
-                        let rows: Vec<(Vec<u8>,)> = match sqlx::query_as(
-                            "SELECT d.body FROM directories d \
-                              JOIN directory_tenants t ON t.digest = d.digest \
-                             WHERE d.digest = ANY($1::bytea[]) AND t.tenant_id = $2",
+                        // Size side-query: `length(body)` reads the
+                        // bytea header, never detoasts. Splits the
+                        // body fetch under GET_DIRECTORY_BATCH_BYTES
+                        // so one `fetch_all` can't materialize GBs.
+                        // DISTINCT: a digest shared by N tenant-visible
+                        // paths must count once (and stream once).
+                        type SizeRow = (Vec<u8>, i64);
+                        let sizes: Vec<SizeRow> = match sqlx::query_as(
+                            "SELECT DISTINCT d.digest, length(d.body)::bigint FROM directories d \
+                              JOIN directory_paths dp ON dp.digest = d.digest \
+                              JOIN path_tenants pt ON pt.store_path_hash = dp.store_path_hash \
+                             WHERE d.digest = ANY($1::bytea[]) AND pt.tenant_id = $2",
                         )
                         .bind(&digests)
                         .bind(tenant)
@@ -254,43 +277,65 @@ impl DirectoryService for DirectoryServiceImpl {
                                 return;
                             }
                         };
-                        for (body,) in rows {
-                            let dir = match Directory::decode(body.as_slice()) {
-                                Ok(d) => d,
+                        for sub in greedy_split_by_bytes(&sizes, GET_DIRECTORY_BATCH_BYTES) {
+                            let sub_digests: Vec<&[u8]> =
+                                sub.iter().map(|(d, _)| d.as_slice()).collect();
+                            let rows: Vec<(Vec<u8>,)> = match sqlx::query_as(
+                                "SELECT DISTINCT ON (d.digest) d.body FROM directories d \
+                              JOIN directory_paths dp ON dp.digest = d.digest \
+                              JOIN path_tenants pt ON pt.store_path_hash = dp.store_path_hash \
+                             WHERE d.digest = ANY($1::bytea[]) AND pt.tenant_id = $2 \
+                             ORDER BY d.digest",
+                            )
+                            .bind(&sub_digests)
+                            .bind(tenant)
+                            .fetch_all(&pool)
+                            .await
+                            {
+                                Ok(r) => r,
                                 Err(e) => {
-                                    // A corrupt persisted body is a write-side
-                                    // bug, not a transient — fail loud.
-                                    let _ = tx.send(Err(corrupt(e))).await;
+                                    let _ = tx.send(Err(internal(e))).await;
                                     return;
                                 }
                             };
-                            for child in &dir.directories {
-                                match parse_digest(&child.digest) {
-                                    Ok(d) => {
-                                        if seen.insert(d) {
-                                            next.push(d);
-                                        }
+                            for (body,) in rows {
+                                let dir = match Directory::decode(body.as_slice()) {
+                                    Ok(d) => d,
+                                    Err(e) => {
+                                        // A corrupt persisted body is a write-side
+                                        // bug, not a transient — fail loud.
+                                        let _ = tx.send(Err(corrupt(e))).await;
+                                        return;
                                     }
-                                    // Same write-side corruption class as an
-                                    // undecodable body, but recoverable: skip
-                                    // the child and keep streaming.
-                                    Err(_) => warn!(
-                                        len = child.digest.len(),
-                                        "corrupt child digest in directory body; skipping"
-                                    ),
+                                };
+                                for child in &dir.directories {
+                                    match parse_digest(&child.digest) {
+                                        Ok(d) => {
+                                            if seen.insert(d) {
+                                                next.push(d);
+                                            }
+                                        }
+                                        // Same write-side corruption class as an
+                                        // undecodable body, but recoverable: skip
+                                        // the child and keep streaming.
+                                        Err(_) => warn!(
+                                            len = child.digest.len(),
+                                            "corrupt child digest in directory body; skipping"
+                                        ),
+                                    }
                                 }
-                            }
-                            sent += 1;
-                            if sent > GET_DIRECTORY_MAX_RESULTS {
-                                let _ = tx
+                                sent += 1;
+                                if sent > GET_DIRECTORY_MAX_RESULTS {
+                                    let _ = tx
                                     .send(Err(Status::resource_exhausted(format!(
                                         "directory walk exceeded {GET_DIRECTORY_MAX_RESULTS} results"
                                     ))))
                                     .await;
-                                return;
-                            }
-                            if tx.send(Ok(dir)).await.is_err() {
-                                return; // client hung up
+                                    return;
+                                }
+                                if tx.send(Ok(dir)).await.is_err() {
+                                    return; // client hung up
+                                }
                             }
                         }
                     }
@@ -331,9 +376,10 @@ impl DirectoryService for DirectoryServiceImpl {
         }))
     }
 
-    /// Presence bitmap over `file_blobs` × `file_blob_tenants`. JOINs
-    /// `file_blobs` (not just the tenant junction) so a junction row
-    /// orphaned by a GC race doesn't read as "present".
+    /// Presence bitmap over `file_blobs` × `path_tenants`. The join is
+    /// per-path (`store_path_hash`), so a digest is "present" iff at
+    /// least one tenant-readable NAR contains it — GC of one referrer
+    /// can't dangle the answer.
     #[instrument(skip(self, request), fields(rpc = "HasBlobs"))]
     async fn has_blobs(
         &self,
@@ -368,18 +414,22 @@ impl DirectoryService for DirectoryServiceImpl {
 
         // `manifests.status` filter excludes 'uploading' placeholders.
         // LIMIT 1: any tenant-visible referrer's NAR works; the bytes
-        // are content-addressed. `file_blobs.size` (M_063) is
-        // denormalized so this never decodes `nar_index.entries`
-        // (O(files-in-NAR)) on the FUSE `open()` fast path.
+        // are content-addressed. The `path_tenants` join is on the same
+        // `store_path_hash` as `file_blobs`, so the chosen NAR is one
+        // this tenant may read — a digest-only join could pick another
+        // tenant's NAR for a content-shared file. `file_blobs.size`
+        // (M_063) is denormalized so this never decodes
+        // `nar_index.entries` (O(files-in-NAR)) on the FUSE `open()`
+        // fast path.
         type BlobRow = (i64, i64, Option<Vec<u8>>, Option<Vec<u8>>);
         let row: Option<BlobRow> = sqlx::query_as(
             "SELECT f.nar_offset, f.size, m.inline_blob, md.chunk_list \
                FROM file_blobs f \
-               JOIN file_blob_tenants ft ON ft.digest = f.digest \
+               JOIN path_tenants pt ON pt.store_path_hash = f.store_path_hash \
                JOIN manifests m ON m.store_path_hash = f.store_path_hash \
                     AND m.status = 'complete' \
                LEFT JOIN manifest_data md ON md.store_path_hash = f.store_path_hash \
-              WHERE f.digest = $1 AND ft.tenant_id = $2 \
+              WHERE f.digest = $1 AND pt.tenant_id = $2 \
               LIMIT 1",
         )
         .bind(digest.as_slice())
@@ -461,10 +511,10 @@ impl DirectoryService for DirectoryServiceImpl {
         if !req.send_chunks {
             let exists: Option<(i32,)> = sqlx::query_as(
                 "SELECT 1 FROM file_blobs f \
-                   JOIN file_blob_tenants ft ON ft.digest = f.digest \
+                   JOIN path_tenants pt ON pt.store_path_hash = f.store_path_hash \
                    JOIN manifests m ON m.store_path_hash = f.store_path_hash \
                         AND m.status = 'complete' \
-                  WHERE f.digest = $1 AND ft.tenant_id = $2 LIMIT 1",
+                  WHERE f.digest = $1 AND pt.tenant_id = $2 LIMIT 1",
             )
             .bind(digest.as_slice())
             .bind(tenant)
@@ -481,11 +531,11 @@ impl DirectoryService for DirectoryServiceImpl {
         let row: Option<StatRow> = sqlx::query_as(
             "SELECT f.nar_offset, f.size, m.inline_blob IS NOT NULL, md.chunk_list \
                FROM file_blobs f \
-               JOIN file_blob_tenants ft ON ft.digest = f.digest \
+               JOIN path_tenants pt ON pt.store_path_hash = f.store_path_hash \
                JOIN manifests m ON m.store_path_hash = f.store_path_hash \
                     AND m.status = 'complete' \
                LEFT JOIN manifest_data md ON md.store_path_hash = f.store_path_hash \
-              WHERE f.digest = $1 AND ft.tenant_id = $2 LIMIT 1",
+              WHERE f.digest = $1 AND pt.tenant_id = $2 LIMIT 1",
         )
         .bind(digest.as_slice())
         .bind(tenant)
@@ -687,7 +737,7 @@ async fn stream_blob(tx: &FrameTx, plan: BlobPlan, file_digest: [u8; 32]) -> boo
             actual = %hex::encode(actual),
             "ReadBlob: whole-file integrity check failed"
         );
-        metrics::counter!("rio_store_integrity_failures_total").increment(1);
+        metrics::counter!("rio_store_integrity_failures_total", "site" => "read_blob").increment(1);
         let _ = tx
             .send(Err(Status::data_loss(
                 "whole-file integrity check failed (BLAKE3 mismatch)",
@@ -722,8 +772,14 @@ enum HasTable {
 impl HasTable {
     const fn join_clause(self) -> &'static str {
         match self {
-            Self::Directories => "directories d JOIN directory_tenants t ON t.digest = d.digest",
-            Self::FileBlobs => "file_blobs d JOIN file_blob_tenants t ON t.digest = d.digest",
+            Self::Directories => {
+                "directories d \
+                 JOIN directory_paths dp ON dp.digest = d.digest \
+                 JOIN path_tenants t ON t.store_path_hash = dp.store_path_hash"
+            }
+            Self::FileBlobs => {
+                "file_blobs d JOIN path_tenants t ON t.store_path_hash = d.store_path_hash"
+            }
         }
     }
 }
@@ -758,6 +814,29 @@ impl DirectoryServiceImpl {
     }
 }
 
+/// Greedily split `(digest, size)` rows into runs whose summed `size`
+/// stays under `budget`, except a single row over budget is its own
+/// run (it would never fit; emit it alone rather than loop forever).
+/// Used to bound the per-`fetch_all` byte sum for `GetDirectory`.
+fn greedy_split_by_bytes(rows: &[(Vec<u8>, i64)], budget: u64) -> Vec<&[(Vec<u8>, i64)]> {
+    let mut out: Vec<&[(Vec<u8>, i64)]> = Vec::new();
+    let mut start = 0usize;
+    let mut acc = 0u64;
+    for (i, (_, sz)) in rows.iter().enumerate() {
+        let sz = u64::try_from(*sz).unwrap_or(0);
+        if i > start && acc.saturating_add(sz) > budget {
+            out.push(&rows[start..i]);
+            start = i;
+            acc = 0;
+        }
+        acc = acc.saturating_add(sz);
+    }
+    if start < rows.len() {
+        out.push(&rows[start..]);
+    }
+    out
+}
+
 fn internal(e: impl std::fmt::Display) -> Status {
     warn!(error = %e, "DirectoryService PG error");
     Status::internal("directory query failed")
@@ -779,6 +858,29 @@ mod tests {
         let over = vec![vec![0u8; 32]; HAS_BATCH_MAX + 1];
         let err = parse_digests(&over).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// Per-batch byte sum is bounded; an over-budget
+    /// single row is its own run rather than an infinite loop.
+    #[test]
+    fn greedy_split_bounds_byte_sum() {
+        let row = |n: u8, sz: i64| (vec![n; 32], sz);
+        // Empty.
+        assert!(greedy_split_by_bytes(&[], 100).is_empty());
+        // Fits in one run.
+        let small = vec![row(1, 10), row(2, 10), row(3, 10)];
+        let runs = greedy_split_by_bytes(&small, 100);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].len(), 3);
+        // Splits when exceeding budget.
+        let mixed = vec![row(1, 60), row(2, 60), row(3, 60)];
+        let runs = greedy_split_by_bytes(&mixed, 100);
+        assert_eq!(runs.len(), 3, "each 60-byte row alone fits under 100");
+        // Single over-budget row is its own run, not an infinite loop.
+        let big = vec![row(1, 1000)];
+        let runs = greedy_split_by_bytes(&big, 100);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].len(), 1);
     }
 
     #[test]

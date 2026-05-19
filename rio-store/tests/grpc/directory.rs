@@ -1,9 +1,9 @@
 //! ADR-022 castore RPC surface integration tests (P0573 / P0577).
 //!
 //! Spins up a `DirectoryService` server with HMAC tenant resolution,
-//! seeds the `directories` / `directory_tenants` / `file_blobs` /
-//! `file_blob_tenants` tables directly (the indexer pipeline that
-//! normally populates them is exercised by the `nar_index` tests), and
+//! seeds the `directories` / `directory_paths` / `file_blobs` /
+//! `path_tenants` tables directly (the indexer pipeline that normally
+//! populates them is exercised by the `nar_index` tests), and
 //! drives `GetDirectory` / `HasDirectories` / `HasBlobs` / `ReadBlob`
 //! end-to-end.
 
@@ -87,6 +87,9 @@ async fn put_dir(
         symlinks: vec![],
     };
     let digest: [u8; 32] = blake3::hash(name.as_bytes()).into();
+    // Tenancy is read-time via `directory_paths` → `path_tenants`,
+    // so a directory needs a backing manifest row owned by `tenant`.
+    let path_hash = seed_owned_path(pool, tenant, &format!("dir-{name}")).await;
     sqlx::query("INSERT INTO directories (digest, body) VALUES ($1, $2) ON CONFLICT DO NOTHING")
         .bind(digest.as_slice())
         .bind(dir.encode_to_vec())
@@ -94,20 +97,20 @@ async fn put_dir(
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO directory_tenants (digest, tenant_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        "INSERT INTO directory_paths (digest, store_path_hash) VALUES ($1, $2) \
+         ON CONFLICT DO NOTHING",
     )
     .bind(digest.as_slice())
-    .bind(tenant)
+    .bind(&path_hash)
     .execute(pool)
     .await
     .unwrap();
     digest
 }
 
-/// Persist a `file_blobs` + `file_blob_tenants` row for `tenant`.
-/// `file_blobs` FK-references `manifests` so we need a backing path.
-async fn put_blob(pool: &sqlx::PgPool, tenant: uuid::Uuid, name: &str) -> [u8; 32] {
-    let digest: [u8; 32] = blake3::hash(name.as_bytes()).into();
+/// Insert `narinfo` + `manifests` (`'complete'`) + `path_tenants` for a
+/// synthetic path named `name`, owned by `tenant`. Returns the path hash.
+async fn seed_owned_path(pool: &sqlx::PgPool, tenant: uuid::Uuid, name: &str) -> Vec<u8> {
     let path_hash = sha2::Sha256::digest(name.as_bytes()).to_vec();
     sqlx::query(
         "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size) \
@@ -127,19 +130,27 @@ async fn put_blob(pool: &sqlx::PgPool, tenant: uuid::Uuid, name: &str) -> [u8; 3
     .await
     .unwrap();
     sqlx::query(
+        "INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(&path_hash)
+    .bind(tenant)
+    .execute(pool)
+    .await
+    .unwrap();
+    path_hash
+}
+
+/// Persist a `file_blobs` row tied to a `path_tenants`-owned path.
+async fn put_blob(pool: &sqlx::PgPool, tenant: uuid::Uuid, name: &str) -> [u8; 32] {
+    let digest: [u8; 32] = blake3::hash(name.as_bytes()).into();
+    let path_hash = seed_owned_path(pool, tenant, name).await;
+    sqlx::query(
         "INSERT INTO file_blobs (digest, store_path_hash, nar_offset) VALUES ($1, $2, 0) \
          ON CONFLICT DO NOTHING",
     )
     .bind(digest.as_slice())
     .bind(&path_hash)
-    .execute(pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO file_blob_tenants (digest, tenant_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-    )
-    .bind(digest.as_slice())
-    .bind(tenant)
     .execute(pool)
     .await
     .unwrap();
@@ -463,8 +474,8 @@ fn make_blob_nar(file_len: usize, seed: u8) -> BlobNar {
     }
 }
 
-/// Persist a `(narinfo, manifests, file_blobs, file_blob_tenants)` row
-/// set whose manifest is either inline (whole NAR in
+/// Persist a `(narinfo, manifests, path_tenants, file_blobs)` row set
+/// whose manifest is either inline (whole NAR in
 /// `manifests.inline_blob`) or chunked (`manifest_data.chunk_list` +
 /// chunks in `Fixture.chunks`). Returns the `file_digest`.
 async fn seed_blob(f: &Fixture, name: &str, b: &BlobNar, chunk_size: Option<usize>) -> [u8; 32] {
@@ -531,13 +542,13 @@ async fn seed_blob(f: &Fixture, name: &str, b: &BlobNar, chunk_size: Option<usiz
     .execute(&f.db.pool)
     .await
     .unwrap();
-    // ON CONFLICT: a digest seeded under two paths (e.g. zero-byte
-    // files) shares the tenant row; the FK chain still resolves.
+    // Tenancy: read-time via `path_tenants` on the `file_blobs` row's
+    // `store_path_hash`.
     sqlx::query(
-        "INSERT INTO file_blob_tenants (digest, tenant_id) VALUES ($1, $2) \
+        "INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2) \
          ON CONFLICT DO NOTHING",
     )
-    .bind(b.file_digest.as_slice())
+    .bind(&path_hash)
     .bind(f.tenant_a)
     .execute(&f.db.pool)
     .await
