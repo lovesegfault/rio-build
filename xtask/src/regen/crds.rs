@@ -17,22 +17,20 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    // crdgen writes one `<crd-name>.yaml` per CRD directly into the
+    // output dir. The crds-drift check builds the same binary
+    // hermetically and `diff -r`s — single serialization path, no
+    // split/reserialize step (the old PyYAML splitter existed to give
+    // both callers identical bytes; running the same Rust code does
+    // that by construction).
+    //
     // --bin (not -p) so feature resolution stays workspace-wide and we
     // reuse the already-built rio-controller artifacts.
-    let yaml = ui::step("cargo run --bin crdgen", || async {
-        sh::read(cmd!(sh, "cargo run --bin crdgen"))
+    let out_s = out.to_str().unwrap();
+    ui::step("cargo run --bin crdgen", || async {
+        sh::run(cmd!(sh, "cargo run --bin crdgen -- {out_s}")).await
     })
     .await?;
-
-    let tmp = tempfile::NamedTempFile::new()?;
-    std::fs::write(tmp.path(), &yaml)?;
-
-    // Same python the drift check runs. serde_yml re-serialize (previous
-    // approach) produced `description: |-` where PyYAML emits quoted
-    // scalars; drift-check diff -r saw every description field as changed.
-    let tmp_s = tmp.path().to_str().unwrap();
-    let out_s = out.to_str().unwrap();
-    sh::run(cmd!(sh, "python3 scripts/split-crds.py {tmp_s} {out_s}")).await?;
 
     let n = std::fs::read_dir(&out)?
         .filter_map(Result::ok)

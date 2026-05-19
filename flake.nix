@@ -1430,20 +1430,21 @@
               }
               // {
                 # CRD YAML for the crds-drift check. runCommand invokes
-                # the crdgen binary and dumps Pool + ComponentScaler to
-                # $out; misc-checks.nix:crds-drift splits it via
-                # split-crds.py and diffs against infra/helm/crds/.
-                # `cargo xtask regen crds` does NOT use this — it runs
-                # `cargo run --bin crdgen` directly to avoid a nix build
-                # in the dev loop.
+                # the crdgen binary, which writes one `<crd-name>.yaml`
+                # per CRD into $out; misc-checks.nix:crds-drift `diff -r`s
+                # against infra/helm/crds/. `cargo xtask regen crds` does
+                # NOT use this — it runs `cargo run --bin crdgen` directly
+                # to avoid a nix build in the dev loop. Same binary, same
+                # bytes.
                 #
                 # Why not auto-regenerate in CI: the committed YAML is
                 # what operators `kubectl apply`. Regenerating on every
                 # commit means a CRD schema change silently updates the
                 # deployed file — we want that change REVIEWED (it may
                 # be backward-incompatible).
-                crds = pkgs.runCommand "rio-crds.yaml" { } ''
-                  ${rio-workspace}/bin/crdgen > $out
+                crds = pkgs.runCommand "rio-crds" { } ''
+                  mkdir -p $out
+                  ${rio-workspace}/bin/crdgen $out
                 '';
 
                 # ──────────────────────────────────────────────────────────

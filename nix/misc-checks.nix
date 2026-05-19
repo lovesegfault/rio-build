@@ -262,20 +262,19 @@ in
     touch $out
   '';
 
-  # CRD drift: crdgen output (split per-CRD) must equal the
+  # CRD drift: crdgen output (one file per CRD) must equal the
   # committed infra/helm/crds/. Catches the "Rust CRD struct
   # changed but nobody ran cargo xtask regen crds" drift — the committed
   # YAML is what Argo syncs, so a stale file means the deployed
   # schema diverges from what the controller expects.
   #
-  # Calls scripts/split-crds.py (same script xtask uses) to split
-  # multi-doc → one file per metadata.name.
+  # packages.crds is a directory with one `<crd-name>.yaml` per CRD,
+  # produced by the same crdgen binary `cargo xtask regen crds` runs —
+  # single serialization path, so the bytes match by construction.
   crds-drift = mkDriftCheck {
     name = "crds-drift";
-    nativeBuildInputs = [ (pkgs.python3.withPackages (p: [ p.pyyaml ])) ];
     generate = ''
-      mkdir -p $TMPDIR/gen
-      python3 ${../scripts/split-crds.py} ${config.packages.crds} $TMPDIR/gen
+      cp -r ${config.packages.crds} $TMPDIR/gen
     '';
     committed = ../infra/helm/crds;
     what = "crdgen output drifted from infra/helm/crds/";

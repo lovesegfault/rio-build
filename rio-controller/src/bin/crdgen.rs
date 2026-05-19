@@ -2,30 +2,43 @@
 //!
 //! `cargo xtask regen crds`
 //!
+//! Writes one `<crd-name>.yaml` per CRD into the directory given as the
+//! sole argument. This is the single serialization path for the
+//! committed `infra/helm/crds/` files: `cargo xtask regen crds`
+//! produces them and the `crds-drift` flake check rebuilds them
+//! hermetically and `diff -r`s. Both run this binary, so the bytes
+//! match by construction — there is no second encoder to drift.
+//!
 //! serde_yml is the maintained serde_yaml fork (RUSTSEC-2024-0320).
 //! Write-only here — serializes our own structs.
+
+use std::path::Path;
 
 use kube::CustomResourceExt;
 use rio_crds::componentscaler::ComponentScaler;
 use rio_crds::pool::Pool;
 
 fn main() {
-    // serde_yml does NOT emit the `---` document separator
-    // (verified: output starts with `apiVersion:` directly). The
-    // leading `---` is optional per YAML spec but kustomize is
-    // stricter with multi-doc files — include it before each doc.
-    // No trailing newline after the last doc: serde_yml already
-    // ends with one, and kustomize chokes on `---\n\n` empty docs.
-    print!("---\n{}", yaml::<Pool>());
-    print!("---\n{}", yaml::<ComponentScaler>());
+    let out = std::env::args().nth(1).unwrap_or_else(|| {
+        eprintln!("usage: crdgen <out-dir>");
+        std::process::exit(2);
+    });
+    let out = Path::new(&out);
+    write::<Pool>(out);
+    write::<ComponentScaler>(out);
 }
 
-/// Serialize one CRD to YAML. Generic over the kube-derive-
-/// generated struct (Pool, ComponentScaler). Panics on serialize
-/// failure — crdgen is a build-time tool; a CRD that can't
-/// serialize is a compile-surface bug, not a recoverable runtime
-/// condition.
-fn yaml<K: CustomResourceExt>() -> String {
-    serde_yml::to_string(&K::crd())
-        .unwrap_or_else(|e| panic!("{} CRD serialize: {e}", K::crd_name()))
+/// Serialize one CRD to `<out>/<crd-name>.yaml`. Generic over the
+/// kube-derive-generated struct (Pool, ComponentScaler).
+/// `crd_name()` is `<plural>.<group>` — same value as `metadata.name`,
+/// which is what the per-CRD files have always been keyed on.
+///
+/// Panics on serialize/IO failure — crdgen is a build-time tool; a
+/// CRD that can't serialize is a compile-surface bug, not a
+/// recoverable runtime condition.
+fn write<K: CustomResourceExt>(out: &Path) {
+    let yaml = serde_yml::to_string(&K::crd())
+        .unwrap_or_else(|e| panic!("{} CRD serialize: {e}", K::crd_name()));
+    let path = out.join(format!("{}.yaml", K::crd_name()));
+    std::fs::write(&path, yaml).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
 }

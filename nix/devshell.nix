@@ -152,9 +152,6 @@ let
     grpcurl # manual AdminService poking when rio-cli isn't enough
     openssl # openssl rand 32 → HMAC key
     git
-
-    # cargo xtask regen crds → scripts/split-crds.py
-    (python3.withPackages (ps: [ ps.pyyaml ]))
   ];
 
   # Shared mkShell builder. Lists build deps explicitly
