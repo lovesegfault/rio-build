@@ -37,7 +37,10 @@ pub const CGROUP_OOM_MSG: &str = "cgroup OOM during build";
 
 pub mod client;
 pub mod interceptor;
-pub mod status;
+// Trait impls (`From<NixStatus> for BuildResultStatus` and inverse) are
+// visible globally regardless of module visibility — `pub` would only
+// add an empty namespace to the docs.
+mod status;
 pub mod validated;
 
 /// Shared protobuf types (messages, enums) used across all services.

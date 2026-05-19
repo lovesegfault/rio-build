@@ -49,4 +49,4 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 # libc::raise for SIGHUP self-delivery in pubkey-reload test.
-libc = "0.2"
+libc = { workspace = true }

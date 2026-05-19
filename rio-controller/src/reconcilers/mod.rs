@@ -32,7 +32,7 @@ use crate::error::{Error, Result, error_kind};
 
 /// Re-export so reconciler modules can `use crate::reconcilers::
 /// KubeErrorExt` without naming rio-crds directly.
-pub use rio_crds::{KubeErrorExt, KubeResultExt};
+pub use rio_crds::KubeErrorExt;
 
 /// Upper bound on every `AdminServiceClient` RPC issued from a
 /// reconcile/watcher loop. `build_endpoint` sets `.connect_timeout()`

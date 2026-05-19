@@ -64,7 +64,7 @@ serde_json = { workspace = true }
 # raw_os_error() match on EMFILE/ENFILE in the SSH accept loop
 # (server/mod.rs classify_accept_error). io::ErrorKind maps both to
 # Uncategorized on stable, so the libc constants are the reliable check.
-libc = "0.2"
+libc = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]

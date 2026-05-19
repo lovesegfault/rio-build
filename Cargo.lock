@@ -6597,7 +6597,6 @@ dependencies = [
  "anyhow",
  "clap",
  "hex",
- "http 1.4.0",
  "k8s-openapi",
  "kube",
  "rio-auth",

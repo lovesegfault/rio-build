@@ -150,7 +150,7 @@ aws-smithy-mocks = { workspace = true }
 # actually emitted. Already transitive via metrics-exporter-prometheus
 # (zero lockfile churn); promoted to direct dev-dep for the
 # `debugging::DebuggingRecorder` snapshotter.
-metrics-util = { version = "0.20", features = ["debugging"] }
+metrics-util = { workspace = true }
 aws-sdk-s3 = { workspace = true, features = ["test-util"] }
 aws-sdk-ec2 = { workspace = true, features = ["test-util"] }
 # grpc/tests.rs trace_id header test: needs the tracing→OTel bridge so

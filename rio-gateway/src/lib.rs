@@ -11,7 +11,7 @@ pub(crate) mod quota;
 pub(crate) mod ratelimit;
 pub mod server;
 pub mod session;
-pub mod translate;
+pub(crate) mod translate;
 
 pub use quota::QuotaCache;
 pub use ratelimit::{RateLimitConfig, TenantLimiter};

@@ -11,16 +11,18 @@
 //! fallback; x_kube is the first-class path).
 //!
 //! Extracted from rio-controller so rio-cli can import CRD types
-//! without the full reconciler dependency graph. rio-controller
-//! re-exports this crate verbatim (`pub use rio_crds as crds;`).
+//! without the full reconciler dependency graph. Consumers
+//! (rio-controller, rio-cli, xtask) import `rio_crds::pool::Pool`
+//! etc. directly; rio-controller's reconcilers module re-exports
+//! the helper trait below so its own modules can avoid naming
+//! rio-crds.
 //!
-//! Also hosts [`KubeErrorExt`]/[`KubeResultExt`] — small
-//! `kube::Error` classification helpers shared by
-//! controller/scheduler/xtask. Not strictly "type definitions",
-//! but this is the lightest kube-adjacent crate in the workspace
-//! (rio-common stays kube-free; rio-controller pulls
-//! kube-runtime), so they live here rather than spawning a
-//! `rio-kube` micro-crate for ~30 lines.
+//! Also hosts [`KubeErrorExt`] — a small `kube::Error`
+//! classification helper shared by controller/scheduler/xtask. Not
+//! strictly "type definitions", but this is the lightest
+//! kube-adjacent crate in the workspace (rio-common stays
+//! kube-free; rio-controller pulls kube-runtime), so it lives here
+//! rather than spawning a `rio-kube` micro-crate for ~20 lines.
 
 pub mod componentscaler;
 pub mod karpenter;
@@ -51,24 +53,6 @@ impl KubeErrorExt for kube::Error {
     }
     fn is_conflict(&self) -> bool {
         matches!(self, kube::Error::Api(ae) if ae.code == 409)
-    }
-}
-
-/// Map `Err(404)` → `Ok(None)`. For `delete()` / `get()` calls where
-/// "already gone" is the same as success.
-pub trait KubeResultExt<T> {
-    /// `Ok(v)` → `Ok(Some(v))`; `Err(404)` → `Ok(None)`; other
-    /// errors pass through.
-    fn ok_if_not_found(self) -> Result<Option<T>, kube::Error>;
-}
-
-impl<T> KubeResultExt<T> for Result<T, kube::Error> {
-    fn ok_if_not_found(self) -> Result<Option<T>, kube::Error> {
-        match self {
-            Ok(v) => Ok(Some(v)),
-            Err(e) if e.is_not_found() => Ok(None),
-            Err(e) => Err(e),
-        }
     }
 }
 
