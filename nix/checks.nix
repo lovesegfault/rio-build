@@ -103,6 +103,16 @@ let
   # resolves the sysroot from `rustc --print sysroot` at startup, and
   # buildRustCrate's configure phase calls `cargo metadata`. Symlink
   # the full bin/ then replace the `rustc` name with the wrapper.
+  #
+  # clippy.toml lives at the workspace root — outside every per-crate
+  # fileset (which are rooted at ./<crate>). clippy-driver searches
+  # CLIPPY_CONF_DIR, then cwd-upward; in the per-crate sandbox there's
+  # no clippy.toml on either path, so disallowed-methods is silently
+  # empty. Stage just the config file and point CLIPPY_CONF_DIR at it.
+  clippyConfDir = lib.fileset.toSource {
+    root = ../.;
+    fileset = ../clippy.toml;
+  };
   clippyRustc = pkgs.runCommand "clippy-rustc-wrapper" { } ''
     mkdir -p $out/bin
     ln -s ${rustStable}/bin/* $out/bin/
@@ -121,6 +131,7 @@ let
         exec ${rustStable}/bin/rustc "$@"
       fi
     done
+    export CLIPPY_CONF_DIR="${clippyConfDir}"
     exec ${rustStable}/bin/clippy-driver "$@"
     EOF
     chmod +x $out/bin/rustc

@@ -322,7 +322,10 @@ fn protos() -> Result<serde_json::Value> {
                 .map(|l| l.trim_start().trim_start_matches("//").trim().to_string())
                 .unwrap_or_default();
             out.insert(
-                p.file_name().unwrap().to_string_lossy().into_owned(),
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .context("non-utf8 .proto filename")?
+                    .to_owned(),
                 json!({"services": svcs, "doc": doc}),
             );
         }
@@ -365,7 +368,10 @@ fn modules() -> Result<serde_json::Value> {
         let mut entries: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
-            let name = e.file_name().to_string_lossy().into_owned();
+            let name = e
+                .file_name()
+                .into_string()
+                .map_err(|n| anyhow::anyhow!("non-utf8 src/ entry: {n:?}"))?;
             if name == "tests" || name == "tests.rs" {
                 continue;
             }
