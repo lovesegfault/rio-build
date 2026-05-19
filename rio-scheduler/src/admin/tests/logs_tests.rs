@@ -77,38 +77,88 @@ async fn get_derivation_logs_since_line_filters() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Compress a test log the same way the flusher does (zstd level 6,
+/// each line `\n`-terminated). Shared by the S3-path tests.
+fn compress_lines(lines: &[&str]) -> anyhow::Result<Vec<u8>> {
+    use std::io::Write;
+    let mut enc = zstd::stream::Encoder::new(Vec::new(), 6)?;
+    for line in lines {
+        enc.write_all(line.as_bytes())?;
+        enc.write_all(b"\n")?;
+    }
+    Ok(enc.finish()?)
+}
+
+/// Seed a `drv_logs` row the flusher would have written. `drv_hash` is
+/// the 32-char store hash only (`drv_log_hash` output), NOT the
+/// basename. `started_at` is `NOT NULL` — `now()` is fine for tests
+/// (the GC sweep won't fire). Returns the row's `exec_id`.
+///
+/// `exec_id` is a `now_v7()` UUID. Multi-row seeds in one test rely on
+/// `uuid 1.11+`'s per-process atomic counter for within-millisecond
+/// monotonicity — that's a crate guarantee, not an RFC 9562 one (§6.2
+/// makes within-ms ordering optional). Tests that depend on the seed
+/// order MUST assert it explicitly so a counter-discipline regression
+/// (crate update, multi-process generation) fails loudly at the
+/// assumption rather than silently as a wrong-content mismatch.
+async fn seed_drv_log(
+    pool: &sqlx::PgPool,
+    drv_hash: &str,
+    s3_key: &str,
+    line_count: i64,
+    is_complete: bool,
+) -> anyhow::Result<uuid::Uuid> {
+    let exec_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO drv_logs
+             (exec_id, drv_hash, s3_key, line_count, is_complete, started_at)
+         VALUES ($1, $2, $3, $4, $5, now())",
+    )
+    .bind(exec_id)
+    .bind(drv_hash)
+    .bind(s3_key)
+    .bind(line_count)
+    .bind(is_complete)
+    .execute(pool)
+    .await?;
+    Ok(exec_id)
+}
+
+/// Build an `AdminServiceImpl` against an existing `TestDb` + mocked S3.
+///
+/// `setup_svc` creates its own `TestDb`, which is wrong when the test
+/// needs to seed PG rows BEFORE constructing the svc (the flusher-written
+/// `drv_logs` row must exist when the handler queries it). Shared by the
+/// S3-path tests so the wiring boilerplate isn't repeated per test.
+fn svc_with_db_and_s3(
+    db: &TestDb,
+    s3: aws_sdk_s3::Client,
+) -> (AdminServiceImpl, ActorHandle, tokio::task::JoinHandle<()>) {
+    let buffers = Arc::new(LogBuffers::new());
+    let (actor, task) = setup_actor(db.pool.clone());
+    let svc = AdminServiceImpl::new(
+        buffers,
+        Some((s3, "test-bucket".into())),
+        db.pool.clone(),
+        actor.clone(),
+        "127.0.0.1:1".into(),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        crate::lease::LeaderState::default(),
+        rio_common::signal::Token::new(),
+        String::new(),
+        Arc::new(crate::sla::config::SlaConfig::test_default()),
+        None,
+        Arc::default(),
+    );
+    (svc, actor, task)
+}
+
 #[tokio::test]
 async fn get_derivation_logs_from_s3_fallback() -> anyhow::Result<()> {
     let db = TestDb::new(&crate::MIGRATOR).await;
-    let build_id = uuid::Uuid::new_v4();
-    sqlx::query("INSERT INTO builds (build_id, status) VALUES ($1, 'succeeded')")
-        .bind(build_id)
-        .execute(&db.pool)
-        .await?;
+    let compressed = compress_lines(&["from-s3-0", "from-s3-1", "from-s3-2"])?;
 
-    // Compress a test log the same way the flusher does.
-    let compressed = {
-        use std::io::Write;
-        let mut enc = zstd::stream::Encoder::new(Vec::new(), 6)?;
-        for line in ["from-s3-0", "from-s3-1", "from-s3-2"] {
-            enc.write_all(line.as_bytes())?;
-            enc.write_all(b"\n")?;
-        }
-        enc.finish()?
-    };
-
-    // Seed the PG row the flusher would have written. drv_hash is the
-    // 32-char store hash only (drv_log_hash output), NOT the basename.
-    sqlx::query(
-        "INSERT INTO build_logs (build_id, drv_hash, s3_key, line_count, is_complete)
-         VALUES ($1, $2, $3, $4, true)",
-    )
-    .bind(build_id)
-    .bind("abc")
-    .bind(format!("logs/{build_id}/abc.log.zst"))
-    .bind(3_i64)
-    .execute(&db.pool)
-    .await?;
+    let exec_id = seed_drv_log(&db.pool, "abc", "logs/abc/X.log.zst", 3, true).await?;
 
     // Mock S3 to return the zstd blob.
     let rule = mock!(S3Client::get_object).then_output(move || {
@@ -119,30 +169,11 @@ async fn get_derivation_logs_from_s3_fallback() -> anyhow::Result<()> {
     let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&rule]);
 
     // Ring buffer is EMPTY — forces S3 fallback.
-    //
-    // Can't use setup_svc here: this test seeds PG rows BEFORE
-    // constructing svc (the flusher-written build_logs row), and
-    // setup_svc creates its own TestDb. Wire manually.
-    let buffers = Arc::new(LogBuffers::new());
-    let (actor, _task) = setup_actor(db.pool.clone());
-    let svc = AdminServiceImpl::new(
-        buffers,
-        Some((s3, "test-bucket".into())),
-        db.pool.clone(),
-        actor,
-        "127.0.0.1:1".into(),
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        crate::lease::LeaderState::default(),
-        rio_common::signal::Token::new(),
-        String::new(),
-        Arc::new(crate::sla::config::SlaConfig::test_default()),
-        None,
-        Arc::default(),
-    );
+    let (svc, _actor, _task) = svc_with_db_and_s3(&db, s3);
 
     let resp = svc
         .get_derivation_logs(Request::new(GetDerivationLogsRequest {
-            exec_id: build_id.to_string(),
+            exec_id: exec_id.to_string(),
             derivation_path: "/nix/store/abc-test.drv".into(),
             since_line: 0,
         }))
@@ -153,9 +184,82 @@ async fn get_derivation_logs_from_s3_fallback() -> anyhow::Result<()> {
     assert_eq!(chunks[0].lines.len(), 3);
     assert_eq!(chunks[0].lines[0], b"from-s3-0");
     assert_eq!(chunks[0].lines[2], b"from-s3-2");
+    assert_eq!(
+        chunks[0].exec_id,
+        exec_id.to_string(),
+        "S3 chunk reports which execution it served"
+    );
     assert!(
         chunks[0].is_complete,
-        "S3 serve → derivation finished, is_complete=true"
+        "S3 serve from a final blob → is_complete=true"
+    );
+    Ok(())
+}
+
+/// Empty `exec_id` resolves to the latest execution (`MAX(exec_id)` —
+/// UUIDv7 is time-sortable). Two seeds, the request asks for "latest",
+/// and the chunk reports which exec it picked.
+///
+/// `r[verify obs.log.exec-keyed]` — proves the latest-exec resolution
+/// the design promises: `rio-cli logs <drv>` works without a build_id
+/// or exec_id.
+#[tokio::test]
+async fn get_derivation_logs_latest_exec_resolution() -> anyhow::Result<()> {
+    let db = TestDb::new(&crate::MIGRATOR).await;
+
+    // Two executions for the same drv. The first carries the WRONG
+    // content so the test fails loudly if the older one wins.
+    let stale = compress_lines(&["stale-0", "stale-1"])?;
+    let fresh = compress_lines(&["fresh-0", "fresh-1", "fresh-2"])?;
+    let old_exec = seed_drv_log(&db.pool, "abc", "logs/abc/old.log.zst", 2, true).await?;
+    let new_exec = seed_drv_log(&db.pool, "abc", "logs/abc/new.log.zst", 3, true).await?;
+    // `ORDER BY exec_id DESC` only finds `new_exec` if the second seed
+    // sorts after the first. Within-ms monotonicity is a `uuid 1.11+`
+    // counter-discipline guarantee, NOT an RFC 9562 property — assert it
+    // so an assumption break fails HERE, not as a wrong-content mismatch
+    // 30 lines down.
+    assert!(
+        new_exec > old_exec,
+        "uuid 1.11+ monotonic counter must order within-process now_v7() \
+         calls; if this fails the latest-exec resolution test below is \
+         meaningless"
+    );
+
+    // S3 mock: distinct content per key so we know which blob was hit.
+    let rule_old = mock!(S3Client::get_object)
+        .match_requests(|r| r.key() == Some("logs/abc/old.log.zst"))
+        .then_output(move || {
+            GetObjectOutput::builder()
+                .body(ByteStream::from(stale.clone()))
+                .build()
+        });
+    let rule_new = mock!(S3Client::get_object)
+        .match_requests(|r| r.key() == Some("logs/abc/new.log.zst"))
+        .then_output(move || {
+            GetObjectOutput::builder()
+                .body(ByteStream::from(fresh.clone()))
+                .build()
+        });
+    let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&rule_old, &rule_new]);
+
+    let (svc, _actor, _task) = svc_with_db_and_s3(&db, s3);
+
+    // exec_id EMPTY → latest.
+    let resp = svc
+        .get_derivation_logs(Request::new(GetDerivationLogsRequest {
+            exec_id: String::new(),
+            derivation_path: "/nix/store/abc-test.drv".into(),
+            since_line: 0,
+        }))
+        .await?;
+    let chunks = collect_stream(resp.into_inner()).await;
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].lines.len(), 3, "latest exec has 3 lines");
+    assert_eq!(chunks[0].lines[0], b"fresh-0", "must be the LATEST blob");
+    assert_eq!(
+        chunks[0].exec_id,
+        new_exec.to_string(),
+        "chunk reports the resolved exec, not the older one"
     );
     Ok(())
 }
@@ -255,12 +359,16 @@ fn decompress_and_chunk_roundtrip() -> anyhow::Result<()> {
     }
     let zst = enc.finish()?;
 
-    let chunks = decompress_and_chunk(&zst, "test", 0, 0)?;
+    let chunks = decompress_and_chunk(&zst, "test", "exec-1", 0, 0)?;
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].lines.len(), 5, "trailing \\n artifact stripped");
     assert_eq!(chunks[0].lines[0], b"line-0");
     assert_eq!(chunks[0].lines[4], b"line-4");
-    assert!(chunks[0].is_complete);
+    assert_eq!(chunks[0].exec_id, "exec-1");
+    // `is_complete` is the CALLER's responsibility (try_s3 stamps the
+    // last chunk from the row). decompress_and_chunk doesn't know
+    // whether the blob was final or `.partial`.
+    assert!(!chunks[0].is_complete);
     Ok(())
 }
 
@@ -323,7 +431,7 @@ fn decompress_and_chunk_255_lines_no_trailing_empty() -> anyhow::Result<()> {
     }
     let zst = enc.finish()?;
 
-    let chunks = decompress_and_chunk(&zst, "test", 0, 0)?;
+    let chunks = decompress_and_chunk(&zst, "test", "exec-1", 0, 0)?;
     assert_eq!(chunks.len(), 1, "255 < CHUNK_LINES → one chunk");
     assert_eq!(
         chunks[0].lines.len(),
@@ -331,29 +439,17 @@ fn decompress_and_chunk_255_lines_no_trailing_empty() -> anyhow::Result<()> {
         "trailing-\\n artifact must not leak as a 256th empty line"
     );
     assert!(!chunks[0].lines.last().unwrap().is_empty());
-    assert!(chunks[0].is_complete);
     Ok(())
 }
 
 /// `try_s3` short-circuits when `since ≥ line_count`: no S3 GET, single
-/// empty `is_complete=true` chunk. Proven by passing an S3 client mocked
-/// to PANIC on GetObject — if the short-circuit doesn't fire, the test
-/// fails on the mock.
+/// empty terminal chunk. Proven by passing an S3 client mocked to PANIC
+/// on GetObject — if the short-circuit doesn't fire, the test fails on
+/// the mock.
 #[tokio::test]
 async fn try_s3_short_circuits_on_since_ge_line_count() -> anyhow::Result<()> {
     let db = TestDb::new(&crate::MIGRATOR).await;
-    let build_id = uuid::Uuid::new_v4();
-    sqlx::query("INSERT INTO builds (build_id, status) VALUES ($1, 'succeeded')")
-        .bind(build_id)
-        .execute(&db.pool)
-        .await?;
-    sqlx::query(
-        "INSERT INTO build_logs (build_id, drv_hash, s3_key, line_count, is_complete)
-         VALUES ($1, 'abc', 'logs/x.log.zst', 5, true)",
-    )
-    .bind(build_id)
-    .execute(&db.pool)
-    .await?;
+    let exec_id = seed_drv_log(&db.pool, "abc", "logs/abc/X.log.zst", 5, true).await?;
 
     // S3 mock that fails any GetObject — proves we never call it.
     let rule = mock!(S3Client::get_object).then_error(|| {
@@ -366,26 +462,11 @@ async fn try_s3_short_circuits_on_since_ge_line_count() -> anyhow::Result<()> {
     });
     let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&rule]);
 
-    let buffers = Arc::new(LogBuffers::new());
-    let (actor, _task) = setup_actor(db.pool.clone());
-    let svc = AdminServiceImpl::new(
-        buffers,
-        Some((s3, "test-bucket".into())),
-        db.pool.clone(),
-        actor,
-        "127.0.0.1:1".into(),
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        crate::lease::LeaderState::default(),
-        rio_common::signal::Token::new(),
-        String::new(),
-        Arc::new(crate::sla::config::SlaConfig::test_default()),
-        None,
-        Arc::default(),
-    );
+    let (svc, _actor, _task) = svc_with_db_and_s3(&db, s3);
 
     let resp = svc
         .get_derivation_logs(Request::new(GetDerivationLogsRequest {
-            exec_id: build_id.to_string(),
+            exec_id: exec_id.to_string(),
             derivation_path: "/nix/store/abc-test.drv".into(),
             since_line: 5,
         }))
@@ -393,7 +474,63 @@ async fn try_s3_short_circuits_on_since_ge_line_count() -> anyhow::Result<()> {
     let chunks = collect_stream(resp.into_inner()).await;
     assert_eq!(chunks.len(), 1);
     assert!(chunks[0].lines.is_empty());
-    assert!(chunks[0].is_complete, "S3 path = derivation finished");
+    assert_eq!(chunks[0].exec_id, exec_id.to_string());
+    assert!(chunks[0].is_complete, "row was final → derivation finished");
+    Ok(())
+}
+
+/// `chunk.exec_id` is set in BOTH the ring-buffer path and the S3 path.
+/// Ring buffer: from the buffer entry's `set_exec` stamp. S3: from the
+/// `drv_logs` row (resolved or provided). A client knows which execution
+/// it's watching without a second lookup.
+#[tokio::test]
+async fn chunk_exec_id_reports_resolved_exec() -> anyhow::Result<()> {
+    // — Ring buffer path —
+    let buffers = Arc::new(LogBuffers::new());
+    let exec_active = uuid::Uuid::now_v7();
+    buffers.set_exec("/nix/store/abc-test.drv", exec_active, "executor-1");
+    buffers.push(&mk_batch("/nix/store/abc-test.drv", 0, &[b"l0", b"l1"]));
+    let (svc, _actor, _task, _db) = setup_svc(buffers, None).await;
+    let resp = svc
+        .get_derivation_logs(Request::new(GetDerivationLogsRequest {
+            exec_id: String::new(),
+            derivation_path: "/nix/store/abc-test.drv".into(),
+            since_line: 0,
+        }))
+        .await?;
+    let chunks = collect_stream(resp.into_inner()).await;
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(
+        chunks[0].exec_id,
+        exec_active.to_string(),
+        "ring-buffer chunk carries the stamped exec_id"
+    );
+
+    // — S3 path —
+    let db = TestDb::new(&crate::MIGRATOR).await;
+    let compressed = compress_lines(&["l0", "l1"])?;
+    let exec_done = seed_drv_log(&db.pool, "abc", "logs/abc/X.log.zst", 2, true).await?;
+    let rule = mock!(S3Client::get_object).then_output(move || {
+        GetObjectOutput::builder()
+            .body(ByteStream::from(compressed.clone()))
+            .build()
+    });
+    let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&rule]);
+    let (svc, _actor, _task) = svc_with_db_and_s3(&db, s3);
+    let resp = svc
+        .get_derivation_logs(Request::new(GetDerivationLogsRequest {
+            exec_id: exec_done.to_string(),
+            derivation_path: "/nix/store/abc-test.drv".into(),
+            since_line: 0,
+        }))
+        .await?;
+    let chunks = collect_stream(resp.into_inner()).await;
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(
+        chunks[0].exec_id,
+        exec_done.to_string(),
+        "S3 chunk carries the resolved exec_id"
+    );
     Ok(())
 }
 
@@ -407,7 +544,7 @@ fn decompress_and_chunk_since_filtering() -> anyhow::Result<()> {
     }
     let zst = enc.finish()?;
 
-    let chunks = decompress_and_chunk(&zst, "test", 0, 3)?;
+    let chunks = decompress_and_chunk(&zst, "test", "exec-1", 0, 3)?;
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].lines.len(), 2, "since=3 → lines 3,4 only");
     assert_eq!(chunks[0].first_line_number, 3);
@@ -428,18 +565,17 @@ fn decompress_and_chunk_with_first_line_offset() -> anyhow::Result<()> {
     }
     let zst = enc.finish()?;
 
-    let chunks = decompress_and_chunk(&zst, "test", 50_000, 50_070)?;
+    let chunks = decompress_and_chunk(&zst, "test", "exec-1", 50_000, 50_070)?;
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].lines.len(), 30, "true lines 50_070..50_099");
     assert_eq!(chunks[0].first_line_number, 50_070);
     assert_eq!(chunks[0].lines[0], b"orig-50070");
     assert_eq!(chunks[0].lines[29], b"orig-50099");
-    assert!(chunks[0].is_complete);
 
     // since < first_line (client never saw the evicted head — fresh
     // poll after completion). All 100 survivors returned, labeled
     // from first_line.
-    let chunks = decompress_and_chunk(&zst, "test", 50_000, 0)?;
+    let chunks = decompress_and_chunk(&zst, "test", "exec-1", 50_000, 0)?;
     assert_eq!(chunks[0].lines.len(), 100);
     assert_eq!(chunks[0].first_line_number, 50_000);
     assert_eq!(chunks[0].lines[0], b"orig-50000");
