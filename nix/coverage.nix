@@ -103,8 +103,38 @@ let
     profraws=($TMPDIR/raw/**/*.profraw)
   '';
 
+  # Smoke scenario for the cov-smoke gate. Picked for broadest
+  # coverage-infrastructure surface per minute: protocol-warm
+  # exercises store+scheduler+gateway together in ~5min at 3 vCPU
+  # (k3s scenarios are 8 vCPU, ~2× slower). If a future break class
+  # only surfaces in k3s fixtures, swap this — but the primary job
+  # is "prove profraw→lcov pipeline works end-to-end", and any
+  # scenario that produces non-empty profraws does that.
+  #
+  # Defined before mkPerTestLcov so the smoke scenario's lcov drv can
+  # self-assert (hard-fail on empty/malformed data) instead of needing
+  # a separate wrapper drv. That keeps the "coverage infra broken"
+  # gate inside `ciMatrix.coverage.${smokeScenario}` — the entry CI
+  # already builds — instead of a second `ciMatrix.vm-test.cov-smoke`
+  # entry that rebuilds the same ~5-10min instrumented VM scenario on
+  # a parallel KVM runner.
+  smokeScenario = "vm-protocol-warm-standalone";
+
   mkPerTestLcov =
     name: vmTest:
+    # Smoke gate: the smoke scenario's lcov MUST contain real coverage
+    # data — empty or SF:-less lcov means the profraw→lcov pipeline is
+    # broken, not "this test exercised nothing". A PSA break went 118
+    # commits undetected because `.#coverage` is run on demand and its
+    # failures were triaged as individual test gaps instead of a
+    # pipeline-level halt; folding the assertion into this drv makes
+    # the GHA `coverage` job (which already builds it) the merge gate.
+    # Other scenarios keep the soft warn-and-continue path so a
+    # single VM test producing no profraws (e.g., a node that runs no
+    # rio services) doesn't blank the merged report.
+    let
+      isSmoke = name == smokeScenario;
+    in
     pkgs.runCommand "rio-cov-${name}"
       {
         # Reachable as `.#coverage.vm-<scenario>.raw` — the
@@ -117,9 +147,20 @@ let
       ''
           ${extractProfraws "${vmTest}/coverage"}
         if [ "''${#profraws[@]}" -eq 0 ]; then
-          echo "WARNING: no profraws for ${name}, emitting empty lcov"
-          touch $out
-          exit 0
+          ${
+            if isSmoke then
+              ''
+                echo "FAIL: ${name} produced no profraws — coverage infra broken" >&2
+                echo "Check graceful-shutdown flush + collectCoverage in nix/tests/common.nix" >&2
+                exit 1
+              ''
+            else
+              ''
+                echo "WARNING: no profraws for ${name}, emitting empty lcov"
+                touch $out
+                exit 0
+              ''
+          }
         fi
         ${sysroot}/llvm-profdata merge -sparse "''${profraws[@]}" -o $TMPDIR/m.profdata
         # 2>/dev/null: llvm-cov writes warnings ("N functions have
@@ -153,6 +194,22 @@ let
         # Pattern list derived from memberFilesets — includes xtask.
         ${pkgs.lcov}/bin/lcov --ignore-errors unused,empty \
           --extract $TMPDIR/stripped.lcov ${lib.escapeShellArgs covExtractPatterns} -o $out
+        ${lib.optionalString isSmoke ''
+          # Smoke assertion: profraws existed, but the lcov pipeline can
+          # still produce garbage (failed llvm-cov export → header-only
+          # file, or --extract dropping every record). Catch that here
+          # so the GHA coverage job fails — not a downstream consumer
+          # silently ingesting an empty report.
+          if [ ! -s $out ]; then
+            echo "FAIL: ${name} produced no coverage data (empty lcov)" >&2
+            echo "Coverage infrastructure broken — profraws collected but pipeline produced nothing" >&2
+            exit 1
+          fi
+          if ! grep -q '^SF:' $out; then
+            echo "FAIL: ${name} lcov has no SF: records (malformed)" >&2
+            exit 1
+          fi
+        ''}
       '';
 
   perTestLcov = lib.mapAttrs mkPerTestLcov vmTestsCov;
@@ -182,14 +239,6 @@ let
   unitLcov = pkgs.runCommand "rio-cov-unit" { } ''
     ln -s ${unitCoverage}/lcov.info $out
   '';
-  # Smoke scenario for the cov-smoke gate. Picked for broadest
-  # coverage-infrastructure surface per minute: protocol-warm
-  # exercises store+scheduler+gateway together in ~5min at 3 vCPU
-  # (k3s scenarios are 8 vCPU, ~2× slower). If a future break class
-  # only surfaces in k3s fixtures, swap this — but the primary job
-  # is "prove profraw→lcov pipeline works end-to-end", and any
-  # scenario that produces non-empty profraws does that.
-  smokeScenario = "vm-protocol-warm-standalone";
 in
 {
   inherit perTestLcov vmLcov;
@@ -220,34 +269,25 @@ in
     touch $out
   '';
 
-  # Fast coverage-infrastructure smoke. ONE scenario in coverage
-  # mode, asserts the profraw→lcov pipeline produced real data.
-  # ~5min. In checks (blocking) — catches "coverage infra broken"
-  # without the 25min .#coverage cost. A PSA break went 118
-  # commits undetected because .#coverage is backgrounded and
-  # its failures were triaged as individual test-gaps instead of a
-  # pipeline-level halt. With cov-smoke in checks, infra breaks
-  # fail the merge gate directly.
+  # Fast coverage-infrastructure smoke for `nix-fast-build .#checks`
+  # (and `nix flake check` on KVM hosts). ONE scenario in coverage
+  # mode, ~5min. The actual gate — empty/SF: assertion — lives inside
+  # `perTestLcov.${smokeScenario}` (mkPerTestLcov self-asserts for the
+  # smoke scenario), which is also the GHA `ciMatrix.coverage` matrix
+  # entry. Folding the gate into the lcov drv means the GHA `coverage`
+  # job (which already builds `perTestLcov.${smokeScenario}` for
+  # codecov upload) IS the merge-gate guard — no second
+  # `ciMatrix.vm-test.cov-smoke` entry rebuilding the same ~5-10min
+  # instrumented VM scenario on a parallel KVM runner.
+  #
+  # This wrapper adds a human-readable `lcov --summary` for the local
+  # build log and the `result/scenario` provenance marker — useful when
+  # iterating on the coverage pipeline locally, dead weight in CI.
   smoke =
     let
       lcov = perTestLcov.${smokeScenario};
     in
     pkgs.runCommand "rio-cov-smoke" { nativeBuildInputs = [ pkgs.lcov ]; } ''
-      # mkPerTestLcov emits `touch $out` (empty file) on zero
-      # profraws — that's a WARNING for the merge pipeline but a
-      # FAILURE for smoke: empty = coverage infra didn't collect.
-      if [ ! -s ${lcov} ]; then
-        echo "FAIL: ${smokeScenario} produced no coverage data (empty lcov)" >&2
-        echo "Coverage infrastructure broken — profraws not collected or pipeline failed" >&2
-        exit 1
-      fi
-      # Structural sanity: at least one SF: (source file) record.
-      # Guards against a non-empty-but-garbage lcov (e.g., only a
-      # header line from a failed llvm-cov export).
-      if ! grep -q '^SF:' ${lcov}; then
-        echo "FAIL: ${smokeScenario} lcov has no SF: records (malformed)" >&2
-        exit 1
-      fi
       mkdir -p $out
       cp ${lcov} $out/smoke.lcov
       echo "${smokeScenario}" > $out/scenario

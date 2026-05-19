@@ -705,10 +705,19 @@
                 # P0525 added that aggregate for, now retired). Subtract
                 # what other matrices already cover (fuzz, vm-test) plus
                 # `cov-smoke` (needs KVM; the checks matrix runs on
-                # non-KVM rio-ci — moved to ciMatrix.vm-test below so the
-                # GHA gate, not just local nix-fast-build, catches
-                # coverage-infra regressions). attrNames forces only key
-                # names, not values — codecov-matrix-sync's value reads
+                # non-KVM rio-ci). cov-smoke is NOT re-added to any other
+                # matrix: the coverage-infra assertion it carries lives
+                # inside `perTestLcov.${smokeScenario}` (nix/coverage.nix
+                # mkPerTestLcov), which IS the
+                # `ciMatrix.coverage.vm-protocol-warm-standalone` entry —
+                # already built on a KVM runner for codecov upload. A
+                # second entry here would rebuild the same ~5-10min
+                # instrumented VM scenario on a parallel runner whenever
+                # the lcov drv is uncached (~73% of commits). cov-smoke
+                # stays in `checks.*` only, for local
+                # `nix-fast-build .#checks` (single host, shared store —
+                # no double-build). attrNames forces only key names, not
+                # values — codecov-matrix-sync's value reads
                 # ciMatrix.coverage, but its KEY is a literal, so no
                 # recursion.
                 checks = builtins.removeAttrs config.checks (
@@ -720,16 +729,8 @@
                 # spot CPU is cheap and the cache fills after first green.
                 fuzz = fuzz.runs;
                 # Normal VM tests. Keys: vm-<scenario>-<fixture>. Per-test
-                # red/green signal in the GHA UI. cov-smoke is not a vmTests
-                # entry but lands here for KVM access (ci.yml's vm-test job
-                # is flat `runs-on: rio-ci-kvm`, no name-based routing).
-                # Its underlying VM scenario (vm-protocol-warm-standalone
-                # in coverage mode) is shared with ciMatrix.coverage, so
-                # the incremental cost is the lcov [-s]/SF: assertions on
-                # an already-built drv.
-                vm-test = vmTests // {
-                  cov-smoke = coverage.smoke;
-                };
+                # red/green signal in the GHA UI.
+                vm-test = vmTests;
                 # lcov-producing jobs, one per Codecov flag. `unit-*`
                 # run on spot (one per workspace member, so a single-
                 # crate edit only rebuilds that one); `vm-*` need KVM
@@ -1099,7 +1100,12 @@
                   # later via backgrounded `.#coverage`. Needs KVM —
                   # `nix flake check` on a non-KVM host will fail this;
                   # use nix-fast-build's --skip-cached or build the
-                  # checks subset that excludes it.
+                  # checks subset that excludes it. The actual gate
+                  # assertion lives inside `perTestLcov.${smokeScenario}`
+                  # (which this depends on); see nix/coverage.nix and the
+                  # ciMatrix comment above. checks.*-only — not in any
+                  # ciMatrix because the GHA `coverage` job already builds
+                  # the self-asserting lcov drv on a KVM runner.
                   cov-smoke = coverage.smoke;
                   # mutants-smoke: bounded cargo-mutants run on
                   # rio-auth/src/jwt.rs (~5min cold). Proves the
