@@ -72,14 +72,53 @@ impl Scenario for BlackholeSelfTest {
             })
             .await?;
         if connected.is_none() {
-            bg.abort();
-            return Ok(Verdict::Fail(
+            // Disambiguate "dispatch broken" from "warmup build never
+            // submitted". The bg task is port-forward → SSH-banner poll
+            // (≤80s) → nix-instantiate → nix copy → nix build; any leg
+            // can fail or stall before the build reaches the gateway —
+            // and phase 2 serializes on Scheduler, so nothing else is
+            // dispatching while we poll: the *only* fresh executor that
+            // can appear is the warmup builder. If the build was never
+            // submitted, the poll has zero chance and the failure is a
+            // host-side/setup problem, not a spawn-intent bug. Observed
+            // on a 2026-05-19 fresh-deploy full-QA run: gateway logs had
+            // no i048c-warmup SSH session, controller had no spawn
+            // intent — the bg task died silently and `bg.abort()` ate
+            // the evidence. Instrument-first (same pattern as
+            // 166e6f5fe / i209): surface the bg task's state so the
+            // next failure points at a leg.
+            let bg_state = if bg.is_finished() {
+                match bg.await {
+                    Ok(Ok(())) => "completed Ok — build was submitted and \
+                         finished but no fresh executor was observed (cache \
+                         hit? cli forwarding to a standby with an empty \
+                         executor map?)"
+                        .to_string(),
+                    Ok(Err(e)) => format!("errored: {e:#}"),
+                    Err(je) if je.is_panic() => {
+                        let p = je.into_panic();
+                        let msg = p
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                            .unwrap_or_else(|| "non-string panic payload".into());
+                        format!("panicked: {msg}")
+                    }
+                    Err(je) => format!("join error: {je}"),
+                }
+            } else {
+                bg.abort();
+                "still running at poll deadline — port-forward / SSH-banner \
+                 / nix-instantiate / nix-copy stuck or slow; warmup build \
+                 likely never reached the gateway"
+                    .to_string()
+            };
+            return Ok(Verdict::Fail(format!(
                 "no fresh executor (has_stream=true, not in pre-warmup \
                  DebugListExecutors snapshot) within 90s of submitting a \
-                 build — dispatch/spawn-intent path broken, or every \
-                 connected worker pre-dates this scenario"
-                    .into(),
-            ));
+                 build. warmup bg task: {bg_state}. (only suspect the \
+                 dispatch/spawn-intent path if the bg task completed Ok)"
+            )));
         }
 
         let before = ctx.scrape_scheduler().await?.sum(METRIC);

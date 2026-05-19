@@ -201,7 +201,15 @@ impl QaCtx {
 /// Shared body of all four `nix_build[_expr]_via_gateway[_bg]` so each
 /// variant is a one-liner.
 async fn gateway_build(key: PathBuf, expr: String) -> Result<()> {
-    let (port, _guard) = shared::port_forward(NS, "svc/rio-gateway", 0, 22).await?;
+    // Wrapped in a `step` so an Err is logged at ERROR level. The `_bg`
+    // variants `tokio::spawn` this fn and the caller may never await
+    // the JoinHandle (i048c only `bg.abort()`s on its own timeout) — an
+    // unwrapped `?` here would drop the error into the void. The SSH
+    // banner / nix-* legs below are already step-wrapped.
+    let (port, _guard) = crate::ui::step("port-forward gateway:22", || {
+        shared::port_forward(NS, "svc/rio-gateway", 0, 22)
+    })
+    .await?;
     crate::ui::poll(
         "gateway SSH banner",
         Duration::from_secs(2),

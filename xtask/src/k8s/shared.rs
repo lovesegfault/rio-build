@@ -562,20 +562,38 @@ pub async fn port_forward(
     let mut guard = ProcessGuard::spawn(cmd)?;
     let stdout = guard.child.stdout.take().expect("piped above");
     let mut lines = BufReader::new(stdout).lines();
-    let bound = loop {
-        let Some(line) = lines.next_line().await? else {
-            anyhow::bail!("kubectl port-forward {target} exited before binding");
-        };
-        // First line: `Forwarding from 127.0.0.1:NNNNN -> REMOTE`.
-        // (Second is `[::1]:NNNNN`; per-conn `Handling connection` follows.)
-        if let Some(rest) = line.strip_prefix("Forwarding from 127.0.0.1:") {
-            break rest
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse().ok())
-                .with_context(|| format!("unparseable port-forward line: {line}"))?;
+    // kubectl can hang indefinitely without producing a bind line
+    // (apiserver auth stall, target pod gone, exec creds wedged) — and
+    // `next_line()` blocks until then. A bind-or-bail deadline keeps a
+    // wedged kubectl from silently stalling the caller forever. This
+    // was the only leg of `gateway_build` with no deadline at all
+    // (SSH-banner is `ui::poll`-bounded, nix-* eventually time out on
+    // their own); a 2026-05-19 full-QA run lost an i048c warmup build
+    // somewhere in that chain with no evidence of which leg stalled.
+    let bind_loop = async {
+        loop {
+            let Some(line) = lines.next_line().await? else {
+                anyhow::bail!("kubectl port-forward {target} exited before binding");
+            };
+            // First line: `Forwarding from 127.0.0.1:NNNNN -> REMOTE`.
+            // (Second is `[::1]:NNNNN`; per-conn `Handling connection` follows.)
+            if let Some(rest) = line.strip_prefix("Forwarding from 127.0.0.1:") {
+                break rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .with_context(|| format!("unparseable port-forward line: {line}"));
+            }
         }
     };
+    let bound = tokio::time::timeout(Duration::from_secs(30), bind_loop)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "kubectl port-forward {target} did not bind within 30s — \
+                 apiserver slow, exec credential wedged, or target unschedulable"
+            )
+        })??;
     // Drain the rest so kubectl never blocks on a full pipe.
     tokio::spawn(async move { while lines.next_line().await.ok().flatten().is_some() {} });
     Ok((bound, guard))
