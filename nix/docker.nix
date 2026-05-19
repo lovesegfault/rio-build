@@ -106,6 +106,18 @@ let
   # those are already INSIDE the compressed layer blobs. Compressing
   # the outer tar masks the strings; `ctr image import` and k3s
   # wharfie both auto-detect gzip.
+  #
+  # tar must be byte-reproducible: this is an input-addressed runCommand,
+  # so the SAME store path can be produced independently on multiple
+  # machines (local + remote builders). If two builds yield different
+  # bytes under the same path, any downstream derivation that pinned the
+  # narHash (e.g. the AMI's closureInfo registration) fails with
+  # "hash mismatch importing path" when the build host has the other
+  # variant. The skopeo OCI layout itself IS reproducible (Q9.2 — and
+  # verified again here: extracted contents diff clean across builders);
+  # what leaks is tar metadata: readdir-order entry sequencing, build
+  # wall-clock mtimes, and the sandbox UID's username (nixbld vs nixbld1
+  # on different hosts). gzip's -n already strips its own mtime header.
   mkSeed =
     { name, images }:
     pkgs.runCommand "rio-${name}-seed.oci.tar.gz"
@@ -119,7 +131,9 @@ let
       ''
         d=$TMPDIR/oci
         ${lib.concatMapStrings ({ ref, archive }: ociSkopeoCopy archive "oci:$d:${ref}") images}
-        tar -C $d -c . | gzip -1n > $out
+        tar -C $d -c \
+          --sort=name --mtime='@1' --owner=0 --group=0 --numeric-owner \
+          . | gzip -1n > $out
       '';
 
   # Common to all images. cacert for TLS (S3, upstream binary caches),
