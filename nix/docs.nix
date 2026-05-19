@@ -2,8 +2,8 @@
 #
 # Produces a hermetic typst environment (rioTypst) with the @preview/*
 # packages the book uses, plus two output forms:
-#   - docs-pdf  : single-file PDF via `typst compile` (checks.typst)
-#   - docs      : static HTML site via shiroa (checks.shiroa)
+#   - docs-pdf  : single-file PDF via `typst compile` (checks.docs-pdf)
+#   - docs      : static HTML site via shiroa (checks.docs-html)
 #
 # nixpkgs' `typst.withPackages` / `typst.wrapper` only collect
 # `propagatedBuildInputs` ONE level deep (see wrapper.nix's foldl').
@@ -192,7 +192,7 @@ let
   # checks spin up runners on every PR). `packages.{docs,docs-pdf}`
   # bake the real SHA — they're the deployed artifacts whose refs.gh()
   # permalinks users actually click. The placeholder is SHA-shaped and
-  # != "main" so the shiroa-smoke `/blob/main/` regression assert
+  # != "main" so the docs-html-smoke `/blob/main/` regression assert
   # still fires on the real bug class (bug_003: HTML omitted gh-sha →
   # refs.gh() defaulted to "main").
   realSha = self.rev or "dirty";
@@ -327,9 +327,14 @@ rec {
   docs-pdf = mkDocsPdf realSha;
   docs = mkDocs realSha;
 
+  # Attr names follow the `<artifact>-<kind>` convention every other
+  # check group uses (`clippy-`, `nextest-`, `vm-`, …) so a red
+  # `check / docs-pdf` GHA entry or `nix-fast-build` failure line says
+  # what was checked, not which tool ran. They line up with the
+  # deployed `packages.{docs,docs-pdf}` artifact names.
   checks = {
-    typst = docsPdfCheck;
-    shiroa = docsCheck;
+    docs-pdf = docsPdfCheck;
+    docs-html = docsCheck;
     # PDF/HTML divergence smoke. Asserts the two cross-target invariants
     # bug_003/033/025 broke: gh-sha permalinks pinned (no own-repo
     # /blob/main/) and rref() anchors live (~115 same-chapter rrefs as
@@ -337,7 +342,7 @@ rec {
     # plain text by design — shiroa static-html compiles per-chapter —
     # so this is a regression tripwire, not an exhaustive count). Runs
     # against the built `docs` output so it's free (just greps result/).
-    shiroa-smoke = pkgs.runCommand "rio-docs-html-smoke" { } ''
+    docs-html-smoke = pkgs.runCommand "rio-docs-html-smoke" { } ''
       set -euo pipefail
       cd ${docsCheck}
       # Scope to own-repo permalinks: external upstream links like
@@ -417,7 +422,7 @@ rec {
     # are in the page (decoded from the data: URI) AND the search index
     # covers all chapters. Catches R1/R2-class regressions where a fix
     # is nix-postprocess-only.
-    serve-parity =
+    docs-serve-parity =
       pkgs.runCommand "rio-docs-serve-parity"
         (
           typstEnv

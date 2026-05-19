@@ -1091,7 +1091,7 @@
                 # Workspace-level policy checks (deny, helm-lint,
                 # tracey-validate, crds-drift, tfvars-fresh, …).
                 // miscChecks
-                # Typst design-book builds (PDF + shiroa HTML).
+                # Design-book builds (`docs-pdf`, `docs-html` + smokes).
                 // docsLib.checks
                 # 2min fuzz runs (Linux-only). Compiled binaries shared
                 # across targets via rio-{nix,store}-fuzz-build.

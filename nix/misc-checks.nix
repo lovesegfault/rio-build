@@ -679,7 +679,7 @@ in
           echo "FAIL: indented '= ' parsed as heading — escape as '\= ' or rewrap" >&2
           fail=1
         fi
-        # QA4-#1/#5: CSS-presence in source (base64-decode in shiroa-smoke
+        # QA4-#1/#5: CSS-presence in source (base64-decode in docs-html-smoke
         # is fragile; source-grep is robust).
         grep -q '\.rio-frame svg' $typSrc/lib/rio.typ \
           || { echo "FAIL: lib/rio.typ missing '.rio-frame svg' (QA4-#1 invert scope)" >&2; fail=1; }
