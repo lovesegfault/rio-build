@@ -578,26 +578,33 @@ async fn get_hw_class_config_ships_catalog_or_global_ceilings() -> anyhow::Resul
 /// signed credential on a multi-caller read-path response is a
 /// cross-tenant leak regardless of the verb's gating.
 ///
-/// rio-proto re-exports both: `FILE_DESCRIPTOR_SET` (the prost binary
-/// descriptor, used by rio-test-support's MockAdmin codegen) and
-/// [`rio_proto::proto_src`] (the raw `.proto` text). This test parses
-/// the raw text with a regex — sufficient for the rpc/message/field
-/// surface it asserts on, and avoids a prost-types dev-dep. If the
-/// regex grammar ever needs to grow (e.g. tracking `repeated` or oneof
-/// fields), switch to a `FILE_DESCRIPTOR_SET` walk.
+/// Walks `rio_proto::FILE_DESCRIPTOR_SET` (the prost binary descriptor
+/// rio-proto already emits for rio-test-support's MockAdmin codegen) —
+/// the rpc/message/field surface comes structured rather than from
+/// regex-parsing the raw `.proto` text, so a `repeated` qualifier
+/// moving or a oneof being introduced can't silently widen the grammar.
 // r[verify sched.sla.threat.read-path-auth]
 #[test]
 fn admin_rpc_gate_coverage() {
+    use prost::Message;
+    use prost_types::{DescriptorProto, FileDescriptorSet};
     use std::collections::{HashMap, HashSet};
 
+    let fds = FileDescriptorSet::decode(rio_proto::FILE_DESCRIPTOR_SET)
+        .expect("rio_proto::FILE_DESCRIPTOR_SET decodes as a prost FileDescriptorSet");
+
     // ─── (a) every RPC is classified, partition is disjoint ──────────
-    let admin_proto = rio_proto::proto_src::ADMIN;
-    let rpc_re = regex::Regex::new(r"\brpc\s+(\w+)\s*\(").unwrap();
-    let all_rpcs: HashSet<&str> = rpc_re
-        .captures_iter(admin_proto)
-        .map(|c| c.get(1).unwrap().as_str())
-        .collect();
-    assert!(!all_rpcs.is_empty(), "rpc regex matched nothing");
+    let admin_svc = fds
+        .file
+        .iter()
+        .flat_map(|f| &f.service)
+        .find(|s| s.name() == "AdminService")
+        .expect("AdminService in descriptor set");
+    let all_rpcs: HashSet<&str> = admin_svc.method.iter().map(|m| m.name()).collect();
+    assert!(
+        !all_rpcs.is_empty(),
+        "AdminService descriptor has no methods"
+    );
 
     let gated: HashSet<&str> = SERVICE_GATED.iter().copied().collect();
     let public: HashSet<&str> = UNGATED_PUBLIC.iter().copied().collect();
@@ -623,8 +630,8 @@ fn admin_rpc_gate_coverage() {
     // `_claims` are unambiguous; `_key` is too FP-prone (model_key,
     // cache_key) so it's matched only as the bare `key` in a
     // `*_secret_key`/`*_signing_key` compound — none exist today, and
-    // map<K,V> field names like `key` are scoped to the map entry, not
-    // the message.
+    // map<K,V> entry field names (`key`) are scoped to the synthetic
+    // `*Entry` message, not the parent.
     let bad_suffix = |name: &str| {
         name.ends_with("_token")
             || name.ends_with("_secret")
@@ -632,86 +639,52 @@ fn admin_rpc_gate_coverage() {
             || name.ends_with("_key")
     };
 
-    // Parse `rpc Name(Req) returns (stream? Resp)` → Name → Resp.
-    // Resp is `.`-qualified (`rio.types.Foo`); take the last segment.
-    let ret_re = regex::Regex::new(
-        r"\brpc\s+(\w+)\s*\([^)]*\)\s*returns\s*\(\s*(?:stream\s+)?([\w.]+)\s*\)",
-    )
-    .unwrap();
-    let response_of: HashMap<&str, &str> = ret_re
-        .captures_iter(admin_proto)
-        .map(|c| {
-            let name = c.get(1).unwrap().as_str();
-            let resp = c.get(2).unwrap().as_str();
-            (name, resp.rsplit('.').next().unwrap())
-        })
+    // Method.output_type is `.`-qualified (`.rio.types.Foo`,
+    // `.google.protobuf.Empty`); take the last segment.
+    let response_of: HashMap<&str, &str> = admin_svc
+        .method
+        .iter()
+        .map(|m| (m.name(), m.output_type().rsplit('.').next().unwrap()))
         .collect();
 
-    // Parse all message blocks across the four `package rio.types`
-    // files into `name → [(field_type_last_segment, field_name)]`.
-    // `message X { ... }` blocks may nest one level (oneof / nested
-    // message); a brace-counting walk handles both.
-    let protos = [
-        rio_proto::proto_src::ADMIN_TYPES,
-        rio_proto::proto_src::TYPES,
-        rio_proto::proto_src::DAG,
-        rio_proto::proto_src::BUILD_TYPES,
-    ]
-    .join("\n");
-    let protos = protos.as_str();
-    let msg_re = regex::Regex::new(r"\bmessage\s+(\w+)\s*\{").unwrap();
-    // `[qualifier] type name = N;` — qualifier ∈ optional|repeated;
-    // `map<K,V>` collapses to V (the value message is what we'd
-    // recurse into; K is always scalar in this proto set).
-    let field_re = regex::Regex::new(
-        r"^\s*(?:optional\s+|repeated\s+)?(?:map<\s*\w+\s*,\s*([\w.]+)\s*>|([\w.]+))\s+(\w+)\s*=\s*\d+\s*;",
-    )
-    .unwrap();
-    let mut messages: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    let bytes = protos.as_bytes();
-    for m in msg_re.captures_iter(protos) {
-        let name = m.get(1).unwrap().as_str().to_owned();
-        let body_start = m.get(0).unwrap().end();
-        // Brace-count to find the matching `}`.
-        let mut depth = 1usize;
-        let mut i = body_start;
-        while depth > 0 {
-            match bytes[i] {
-                b'{' => depth += 1,
-                b'}' => depth -= 1,
-                _ => {}
-            }
-            i += 1;
-        }
-        let body = &protos[body_start..i - 1];
-        let fields: Vec<(String, String)> = body
-            .lines()
-            .filter_map(|l| field_re.captures(l))
-            .map(|c| {
-                let ty = c
-                    .get(1)
-                    .or_else(|| c.get(2))
-                    .unwrap()
-                    .as_str()
-                    .rsplit('.')
-                    .next()
-                    .unwrap()
-                    .to_owned();
-                (ty, c.get(3).unwrap().as_str().to_owned())
+    // Flatten every `rio.types` message (admin_types/types/dag/
+    // build_types all share that package) into
+    // `name → [(field_type_last_segment, field_name)]`. Nested types
+    // are registered by bare name too — proto3 has no nested message
+    // declarations in this set, but `map<K,V>` synthesizes a `*Entry`
+    // message whose `value` field carries the message type to recurse
+    // into. Scalar fields have an empty `type_name`, so they leaf out
+    // on the next traversal step (`messages.get("")` is never a hit).
+    fn collect(msg: &DescriptorProto, out: &mut HashMap<String, Vec<(String, String)>>) {
+        let fields: Vec<(String, String)> = msg
+            .field
+            .iter()
+            .map(|f| {
+                let ty = f.type_name().rsplit('.').next().unwrap().to_owned();
+                (ty, f.name().to_owned())
             })
             .collect();
-        messages.entry(name).or_default().extend(fields);
+        out.entry(msg.name().to_owned()).or_default().extend(fields);
+        for nested in &msg.nested_type {
+            collect(nested, out);
+        }
+    }
+    let mut messages: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for f in fds.file.iter().filter(|f| f.package() == "rio.types") {
+        for msg in &f.message_type {
+            collect(msg, &mut messages);
+        }
     }
     assert!(
         messages.contains_key("SpawnIntent"),
-        "message regex matched nothing useful"
+        "descriptor walk found no rio.types messages"
     );
 
     // Transitive walk from each UNGATED_PUBLIC response type.
     for &rpc in UNGATED_PUBLIC {
         let resp = response_of
             .get(rpc)
-            .unwrap_or_else(|| panic!("response type for {rpc} not parsed"));
+            .unwrap_or_else(|| panic!("response type for {rpc} not in descriptor"));
         if *resp == "Empty" {
             continue;
         }
