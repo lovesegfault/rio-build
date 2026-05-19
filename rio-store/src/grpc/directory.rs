@@ -767,3 +767,28 @@ fn corrupt(e: impl std::fmt::Display) -> Status {
     warn!(error = %e, "DirectoryService: corrupt directory body");
     Status::data_loss("corrupt directory body")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_digests_batch_boundary() {
+        let at = vec![vec![0u8; 32]; HAS_BATCH_MAX];
+        assert!(parse_digests(&at).is_ok());
+        let over = vec![vec![0u8; 32]; HAS_BATCH_MAX + 1];
+        let err = parse_digests(&over).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn slice_inline_end_boundary() {
+        // end == len: full slice, not data_loss.
+        assert_eq!(slice_inline(vec![1, 2, 3], 1, 3).unwrap().as_ref(), &[2, 3]);
+        // end > len: data_loss.
+        assert_eq!(
+            slice_inline(vec![1, 2, 3], 0, 4).unwrap_err().code(),
+            tonic::Code::DataLoss
+        );
+    }
+}

@@ -176,3 +176,58 @@ async fn get_nar_index_batch_order_and_misses() -> TestResult {
     assert!(stream.next().await.is_none());
     Ok(())
 }
+
+#[tokio::test]
+async fn get_nar_index_batch_rejects_oversized() -> TestResult {
+    const TEST_CAP: usize = 4;
+    let db = TestDb::new(&MIGRATOR).await;
+    let service = StoreServiceImpl::new(db.pool.clone()).with_max_batch_paths(TEST_CAP);
+    let (mut client, _server) = spawn_store_server(service).await?;
+
+    let err = client
+        .get_nar_index_batch(GetNarIndexBatchRequest {
+            nar_hashes: vec![vec![0u8; 32]; TEST_CAP + 1],
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    use tokio_stream::StreamExt;
+    let mut stream = client
+        .get_nar_index_batch(GetNarIndexBatchRequest {
+            nar_hashes: vec![vec![0u8; 32]; TEST_CAP],
+        })
+        .await?
+        .into_inner();
+    let mut n = 0;
+    while stream.next().await.is_some() {
+        n += 1;
+    }
+    assert_eq!(n, TEST_CAP);
+    Ok(())
+}
+
+#[tokio::test]
+async fn compute_rejects_over_sync_cap() -> TestResult {
+    use rio_store::nar_index::{OverSyncCap, compute};
+
+    let mut s = StoreSession::new().await?;
+    let (nar, nar_hash, path) = make_dir_nar("nar-index-cap", b"x");
+    let total = nar.len() as u64;
+    let info = make_path_info(&path, &nar, nar_hash);
+    put_path(&mut s.client, info, nar).await?;
+
+    // 1 byte over the cap → OverSyncCap.
+    let err = compute(&s.db.pool, None, &path, total - 1, None)
+        .await
+        .unwrap_err();
+    assert!(err.is::<OverSyncCap>(), "{err}");
+
+    // Exactly at the cap → allowed (`>`, not `>=`).
+    let r = compute(&s.db.pool, None, &path, total, None).await;
+    assert!(
+        r.as_ref().err().is_none_or(|e| !e.is::<OverSyncCap>()),
+        "{r:?}"
+    );
+    Ok(())
+}

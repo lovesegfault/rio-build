@@ -630,6 +630,17 @@ mod tests {
             AssignmentClaims::digest_input_closure(&[]),
             blake3::hash(b"").to_hex().to_string(),
         );
+        // Golden vector: pins separator placement (round-trip can't).
+        assert_eq!(
+            AssignmentClaims::digest_input_closure(&a),
+            blake3::hash(b"/nix/store/aaa-foo\n/nix/store/bbb-bar")
+                .to_hex()
+                .to_string(),
+        );
+        assert_eq!(
+            AssignmentClaims::digest_input_closure(&["x".to_string()]),
+            blake3::hash(b"x").to_hex().to_string(),
+        );
     }
 
     #[test]

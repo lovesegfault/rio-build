@@ -1270,6 +1270,70 @@ mod ls_tests {
         assert_eq!(entries[0].file_digest, *h.finalize().as_bytes());
     }
 
+    /// Hand-encoded — `serialize()` can't emit these names.
+    #[rstest]
+    #[case::empty(b"")]
+    #[case::dot(b".")]
+    #[case::dotdot(b"..")]
+    #[case::slash(b"a/b")]
+    #[case::nul(b"a\0b")]
+    fn nar_ls_rejects_invalid_entry_names(#[case] name: &[u8]) {
+        let mut buf = Vec::new();
+        write_str(&mut buf, NAR_MAGIC).unwrap();
+        write_str(&mut buf, "(").unwrap();
+        write_str(&mut buf, "type").unwrap();
+        write_str(&mut buf, "directory").unwrap();
+        write_str(&mut buf, "entry").unwrap();
+        write_str(&mut buf, "(").unwrap();
+        write_str(&mut buf, "name").unwrap();
+        write_bytes(&mut buf, name).unwrap();
+        write_str(&mut buf, "node").unwrap();
+        write_str(&mut buf, "(").unwrap();
+        write_str(&mut buf, "type").unwrap();
+        write_str(&mut buf, "symlink").unwrap();
+        write_str(&mut buf, "target").unwrap();
+        write_str(&mut buf, "x").unwrap();
+        write_str(&mut buf, ")").unwrap();
+        write_str(&mut buf, ")").unwrap();
+        write_str(&mut buf, ")").unwrap();
+
+        assert!(matches!(
+            nar_ls(Cursor::new(&buf)),
+            Err(NarError::InvalidEntryName { .. })
+        ));
+    }
+
+    /// Mirrors `reject_deeply_nested_nar` for `nar_ls`.
+    #[test]
+    fn nar_ls_rejects_too_deep_nesting() {
+        let mut node = reg(false, b"");
+        for _ in 0..(MAX_NAR_DEPTH + 1) {
+            node = NarNode::Directory {
+                entries: vec![entry("a", node)],
+            };
+        }
+        let mut buf = Vec::new();
+        serialize(&mut buf, &node).unwrap();
+        assert!(matches!(
+            nar_ls(Cursor::new(&buf)),
+            Err(NarError::NestingTooDeep(_))
+        ));
+    }
+
+    #[test]
+    fn nar_ls_accepts_at_depth_limit() {
+        let mut node = reg(false, b"");
+        for _ in 0..MAX_NAR_DEPTH {
+            node = NarNode::Directory {
+                entries: vec![entry("a", node)],
+            };
+        }
+        let mut buf = Vec::new();
+        serialize(&mut buf, &node).unwrap();
+        let entries = nar_ls(Cursor::new(&buf)).unwrap();
+        assert_eq!(entries.len(), MAX_NAR_DEPTH + 1); // 256 dirs + 1 leaf
+    }
+
     /// `nar_ls` emits in NAR encounter order (DFS pre-order) so the
     /// caller's bottom-up dir_digest pass (P0572) can iterate in
     /// reverse without re-sorting.
