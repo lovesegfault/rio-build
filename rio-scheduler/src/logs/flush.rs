@@ -72,8 +72,9 @@ const LOG_GC_INTERVAL: Duration = Duration::from_secs(3600);
 const LOG_GC_BATCH: i64 = 1000;
 
 /// Request to flush one derivation's logs. Sent by the actor from
-/// `handle_success_completion` and `terminal_failure_epilogue` (both paths
-/// flush — failed builds still have useful logs).
+/// `terminal_log_epilogue` (see its doc for the caller list — success,
+/// permanent failure, and build-level cancellation all flush; failed
+/// builds still have useful logs).
 #[derive(Debug)]
 pub struct FlushRequest {
     /// The buffer key — full `/nix/store/{hash}-{name}.drv` path. Also the

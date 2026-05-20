@@ -225,7 +225,12 @@ write). Dropped phase updates increment
 (`Poisoned` and timeout-exhausted `Cancelled`), and
 `cancel_build_derivations` (any path that cancels in-flight derivations:
 user cancel, per-build wall-clock timeout, fail-fast, top-down substitute
-fail) --- each of which implies the worker ran the build. Recovery's
+fail) --- each of which implies the worker ran the build. The
+not-yet-dispatched arms of the same cancel sweep (`Queued`/`Ready`/`Created` →
+`DependencyFailed`, `Substituting` → `Cancelled`) call the chokepoint only
+when `exec_id_for_terminal` resolves --- i.e. when a prior execution was
+reset and left a stamped log buffer; the never-dispatched majority skip it.
+Recovery's
 `adopt_orphan_completion` calls `record_exec_correlation` directly (the
 disconnected worker's log is already lost; only the correlation can be
 reconstructed from `assignments.exec_id`). The actual gate is

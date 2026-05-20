@@ -995,8 +995,10 @@ pub const M_060: () = ();
 /// for active assignments after failover so the flusher keys subsequent
 /// uploads correctly) and `build_derivations.exec_id` (build↔exec
 /// correlation — set by the completion handler on terminal paths where an
-/// execution ran: `Completed`, `Poisoned`, and `Cancelled` reached from
-/// `Assigned`/`Running`; `NULL` for cascaded `DependencyFailed`/`Skipped`/
+/// execution ran: `Completed`, `Poisoned`, `Cancelled` reached from
+/// `Assigned`/`Running`, and `Cancelled`/`DependencyFailed` swept by a
+/// build cancel when the prior execution was reset and left a stamped
+/// log buffer; `NULL` for cascaded `DependencyFailed`/`Skipped`/
 /// cache-hit `Completed`/never-dispatched/non-terminal — see
 /// `sched.merge.exec-correlation+4`).
 ///

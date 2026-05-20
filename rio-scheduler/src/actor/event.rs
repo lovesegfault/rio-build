@@ -491,7 +491,10 @@ impl DagActor {
     /// never-dispatched poison, cascaded `DependencyFailed`, or the
     /// assignment never landed: `rollback_assignment` discarded the
     /// buffer before any push).
-    fn exec_id_for_terminal(&self, state: &crate::state::DerivationState) -> Option<Uuid> {
+    pub(super) fn exec_id_for_terminal(
+        &self,
+        state: &crate::state::DerivationState,
+    ) -> Option<Uuid> {
         state.exec_id.or_else(|| {
             self.log_buffers
                 .as_ref()
@@ -558,14 +561,13 @@ impl DagActor {
     ///
     /// Called from [`Self::terminal_log_epilogue`] (the seal/flush/
     /// correlate chokepoint — success, permanent failure, and
-    /// build-level cancellation of an `Assigned`/`Running` drv) and
-    /// from recovery's `adopt_orphan_completion` directly. The
-    /// chokepoint doc enumerates the call sites and the
-    /// never-dispatched carve-outs (cascaded `DependencyFailed`,
-    /// `Skipped`, cache-hit `Completed`, `Substituting`-cancel) —
-    /// those drvs have no `exec_id`, so this helper no-ops anyway and
-    /// `build_derivations.exec_id` stays `NULL` for them, falling back
-    /// to latest-exec resolution.
+    /// build-level cancellation) and from recovery's
+    /// `adopt_orphan_completion` directly. The chokepoint doc
+    /// enumerates the call sites and the never-dispatched carve-outs
+    /// (cascaded `DependencyFailed`, `Skipped`, cache-hit
+    /// `Completed`) — those drvs have no `exec_id`, so this helper
+    /// no-ops anyway and `build_derivations.exec_id` stays `NULL` for
+    /// them, falling back to latest-exec resolution.
     ///
     /// No-op (silent) when both `state.exec_id` and the `LogBuffers`
     /// entry's stamp are `None` (never-dispatched drvs — see
@@ -632,12 +634,27 @@ impl DagActor {
     /// - `terminal_failure_epilogue` — `"failed"` (covers `Poisoned` via
     ///   `poison_and_cascade`/`handle_permanent_failure`, timeout-exhausted
     ///   `Cancelled` via `handle_timeout_failure`, and `DependencyFailed`
-    ///   via `handle_substitute_complete`'s revert arm — the last is a
-    ///   never-dispatched no-op, see below)
+    ///   via `handle_substitute_complete`'s revert arm — a no-op for
+    ///   never-dispatched drvs, but a *reset* drv re-probed into
+    ///   `Substituting` retains the prior execution's buffer stamp and
+    ///   gets correctly finalized here)
     /// - `cancel_build_derivations` (`to_cancel` arm) — `"cancelled"`
     ///   (build-level cancellation/failure of an `Assigned`/`Running`
     ///   drv: `handle_cancel_build`, per-build wall-clock timeout,
     ///   fail-fast, top-down substitute fail)
+    /// - `cancel_build_derivations` (`to_cancel_substituting` and
+    ///   `to_depfail` arms) — `"cancelled"`, gated on
+    ///   [`Self::exec_id_for_terminal`]: a `Ready`/`Substituting` drv
+    ///   that went through `reset_to_ready()` retains a `LogBuffers`
+    ///   entry stamped with the prior (reset) execution's `exec_id` —
+    ///   that execution's `.partial` row must be finalized here or it
+    ///   lingers at `is_complete=false` for the 30-day TTL as the
+    ///   latest exec for the drv. The never-dispatched majority of
+    ///   those arms (`Queued`/`Created`, first-attempt
+    ///   `Ready`/`Substituting`) have no exec_id from either carrier
+    ///   and skip the call — nothing to finalize, and routing them
+    ///   through `trigger_log_flush` would warn-spam its no-exec_id
+    ///   arm on every cancel of a not-yet-started build.
     ///
     /// NOT called from:
     /// - `adopt_orphan_completion` (recovery) — the worker disconnected
@@ -648,13 +665,21 @@ impl DagActor {
     ///   placeholder — `flush_final` would no-op on it but the
     ///   `GetDerivationLogs` read path would serve an empty re-poll
     ///   chunk until `CleanupTerminalBuild` reaps it).
-    /// - never-dispatched terminals (cache-hit / substitute-success
-    ///   `Completed`, cascaded `DependencyFailed`, `Skipped`,
-    ///   `Substituting`-cancel, `Queued`/`Ready`/`Created`-cancel):
-    ///   no execution, no `exec_id`, no buffer. Calling would be a
-    ///   harmless no-op (`trigger_log_flush` early-returns on missing
-    ///   `exec_id`), but the call sites don't bother — see the
-    ///   cargo-cult note on `cancel_build_derivations`.
+    /// - cascaded `DependencyFailed` and `Skipped`: structurally never
+    ///   dispatched — a cascaded ancestor's deps were never all
+    ///   `Completed`, so it was never `Ready`, so it has no exec_id
+    ///   from either carrier and no buffer. Calling would be a
+    ///   harmless warn-spamming no-op.
+    /// - cache-hit / substitute-success `Completed`
+    ///   (`complete_ready_from_store_batch`): usually never dispatched
+    ///   (no buffer), but a *reset* drv completed via store hit or
+    ///   substitute retains the prior execution's stamped buffer.
+    ///   That exec's row stays `is_complete=false` for the GC TTL as
+    ///   the drv's latest exec and the unsealed buffer is served as
+    ///   "still active" until `CleanupTerminalBuild`. Known gap,
+    ///   GC-bounded; closing it needs a status-vocabulary decision
+    ///   (`"succeeded"` would attribute the substitute's success to
+    ///   the aborted execution), so it is deliberately not wired here.
     ///
     /// Sequencing: seal first so late `LogBatch` pushes between now and
     /// the flusher's drain are dropped instead of recreating an orphan

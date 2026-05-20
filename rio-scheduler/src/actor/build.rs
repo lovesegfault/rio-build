@@ -137,10 +137,15 @@ impl DagActor {
             // the 30-day TTL and bd.exec_id NULL (dashboard shows the
             // "approximate" banner for a log that was streamed).
             //
-            // Deliberately NOT called from `to_cancel_substituting` or
-            // `to_depfail` below — those drvs have no exec_id and no
-            // buffer, so the call would be a guaranteed no-op (see
-            // terminal_log_epilogue's doc for the carve-out).
+            // The `to_cancel_substituting` and `to_depfail` arms below
+            // call this too, gated on `exec_id_for_terminal`: most of
+            // those drvs never dispatched (no exec_id, no buffer — the
+            // call would only warn-spam trigger_log_flush), but a
+            // Ready/Substituting drv that went through reset_to_ready()
+            // retains a LogBuffers entry stamped with the prior (reset)
+            // execution's exec_id, and that execution's `.partial` row
+            // must be finalized here or it lingers for the 30-day TTL
+            // as the drv's latest exec.
             // The seal here precedes the CancelSignal try_send below,
             // so the worker's late `rio: result cancelled` footer is
             // dropped — see terminal_log_epilogue's sequencing note.
@@ -182,6 +187,16 @@ impl DagActor {
             if let Some(state) = self.dag.node_mut(drv_hash)
                 && state.transition(DerivationStatus::Cancelled).is_ok()
             {
+                // Finalize the prior (reset) execution's log if one is
+                // still buffered — see the to_cancel arm's comment.
+                // r[impl sched.merge.exec-correlation+4]
+                if self
+                    .dag
+                    .node(drv_hash)
+                    .is_some_and(|s| self.exec_id_for_terminal(s).is_some())
+                {
+                    self.terminal_log_epilogue(drv_hash, "cancelled", &[build_id]);
+                }
                 transitioned.push(drv_hash.as_str());
             }
         }
@@ -215,6 +230,21 @@ impl DagActor {
                 && state.transition(DerivationStatus::DependencyFailed).is_ok()
             {
                 self.ready_queue.remove(drv_hash);
+                // Finalize the prior (reset) execution's log if one is
+                // still buffered — see the to_cancel arm's comment.
+                // status="cancelled" even though this drv's terminal is
+                // DependencyFailed: the column records the scheduler's
+                // disposition of the *log* (the build went away), not
+                // the drv's terminal enum, and "failed" is reserved for
+                // permanent build failure.
+                // r[impl sched.merge.exec-correlation+4]
+                if self
+                    .dag
+                    .node(drv_hash)
+                    .is_some_and(|s| self.exec_id_for_terminal(s).is_some())
+                {
+                    self.terminal_log_epilogue(drv_hash, "cancelled", &[build_id]);
+                }
                 depfailed.push(drv_hash.as_str());
             }
         }

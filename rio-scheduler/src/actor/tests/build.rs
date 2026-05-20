@@ -1008,3 +1008,181 @@ async fn cancel_running_drv_finalizes_log(#[case] from_status: DerivationStatus)
     );
     Ok(())
 }
+
+/// A `Ready`/`Substituting` drv whose prior execution was reset
+/// (`reset_to_ready()` on worker disconnect / transient failure: clears
+/// `state.exec_id`, retains the stamped `LogBuffers` entry) lands in
+/// `cancel_build_derivations`' `to_depfail` / `to_cancel_substituting`
+/// arm when the build is cancelled before re-dispatch. That arm MUST
+/// finalize the retained execution's log the same way the `to_cancel`
+/// (Assigned/Running) arm does — seal, flush (`status="cancelled"`,
+/// `is_complete=true`, `.partial` swap), correlate — or the prior exec's
+/// `drv_logs` row stays `is_complete=false`/`status=NULL` for the 30-day
+/// TTL as the drv's latest (and final) execution.
+///
+/// The never-dispatched sibling pins the gate's other half: no exec_id
+/// from either carrier → no FlushRequest, no seal tombstone, no
+/// warn-spam from `trigger_log_flush`.
+///
+/// Pre-fix: the `to_depfail`/`to_cancel_substituting` arms skipped the
+/// epilogue on the (false) claim that those drvs "have no exec_id and
+/// no buffer, so the call would be a guaranteed no-op".
+///
+/// r[verify sched.merge.exec-correlation+4]
+/// r[verify obs.log.exec-keyed]
+#[rstest::rstest]
+#[case::ready(DerivationStatus::Ready, DerivationStatus::DependencyFailed)]
+#[case::substituting(DerivationStatus::Substituting, DerivationStatus::Cancelled)]
+#[tokio::test]
+async fn cancel_reset_drv_finalizes_prior_exec_log(
+    #[case] from_status: DerivationStatus,
+    #[case] expected_terminal: DerivationStatus,
+) -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // Seed the rows record_exec_correlation's UPDATE targets — same
+    // pattern as cancel_running_drv_finalizes_log.
+    let derivation_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO derivations (drv_hash, drv_path, pname, system, status) \
+         VALUES ($1, $2, 'pkg', 'x86_64-linux', 'ready') \
+         RETURNING derivation_id",
+    )
+    .bind("rst-drv")
+    .bind(test_drv_path("rst-drv"))
+    .fetch_one(&db.pool)
+    .await?;
+    let build_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO builds (build_id, status) VALUES ($1, 'active')")
+        .bind(build_id)
+        .execute(&db.pool)
+        .await?;
+    sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+        .bind(build_id)
+        .bind(derivation_id)
+        .execute(&db.pool)
+        .await?;
+
+    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(8);
+    let mut actor = DagActor::new(
+        SchedulerDb::new(db.pool.clone()),
+        DagActorConfig::default(),
+        DagActorPlumbing {
+            log_buffers: Some(log_buffers.clone()),
+            log_flush_tx: Some(flush_tx),
+            ..Default::default()
+        },
+    );
+
+    // The reset drv: `state.exec_id: None` (test_default — the shape
+    // reset_to_ready() leaves), no assigned executor, but a LogBuffers
+    // entry still stamped with the prior execution's exec_id.
+    let exec_id = uuid::Uuid::now_v7();
+    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+        derivation_id,
+        ..crate::db::RecoveryDerivationRow::test_default("rst-drv", "x86_64-linux")
+    });
+    {
+        let s = actor.dag.node_mut("rst-drv").expect("just injected");
+        s.set_status_for_test(from_status);
+        s.interested_builds.insert(build_id);
+    }
+    let drv_path = test_drv_path("rst-drv");
+    log_buffers.set_exec(&drv_path, exec_id, "old-worker");
+    assert!(log_buffers.push_for(
+        &drv_path,
+        &rio_proto::types::BuildLogBatch {
+            derivation_path: drv_path.clone(),
+            lines: vec![b"line from the reset execution".to_vec()],
+            first_line_number: 0,
+            executor_id: "old-worker".into(),
+        },
+        "old-worker",
+    ));
+
+    // The never-dispatched sibling: same build, no buffer, no exec_id
+    // from either carrier. Must NOT produce a FlushRequest or a seal.
+    //
+    // Fixture validity: `test_drv_path` stamps the SAME 32-char hash
+    // into every path, and `LogBuffers` keys on `drv_log_hash(path)`
+    // (the hash component) — the default path would alias the sibling
+    // onto rst-drv's stamped buffer entry and the gate would (correctly,
+    // for that key) fire for it. Give the sibling a distinct store-path
+    // hash so its buffer lookup is genuinely empty.
+    let nd_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-rst-nd.drv".to_string();
+    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+        drv_path: nd_path.clone(),
+        ..crate::db::RecoveryDerivationRow::test_default("rst-nd", "x86_64-linux")
+    });
+    {
+        let s = actor.dag.node_mut("rst-nd").expect("just injected");
+        s.set_status_for_test(DerivationStatus::Queued);
+        s.interested_builds.insert(build_id);
+    }
+
+    actor
+        .cancel_build_derivations(build_id, "test cancel")
+        .await;
+
+    // (1) Exactly one FlushRequest — for the reset drv's prior exec,
+    // with the scheduler's cancel disposition.
+    let req = flush_rx.try_recv().expect(
+        "cancel must finalize the retained prior-exec log of a reset \
+         Ready/Substituting drv instead of leaving its drv_logs row at \
+         is_complete=false for the 30-day TTL",
+    );
+    assert_eq!(
+        req.exec_id, exec_id,
+        "request pins the retained buffer's stamp"
+    );
+    assert_eq!(req.drv_path, drv_path);
+    assert_eq!(req.status.as_deref(), Some("cancelled"));
+    assert!(
+        flush_rx.try_recv().is_err(),
+        "the never-dispatched sibling has no exec to flush"
+    );
+
+    // (2) Buffer sealed for the reset drv only — the gate keeps
+    // never-dispatched drvs out of the epilogue entirely.
+    assert!(log_buffers.is_sealed(&drv_path));
+    assert!(
+        !log_buffers.is_sealed(&nd_path),
+        "never-dispatched drvs must not accumulate seal tombstones"
+    );
+
+    // (3) Both drvs reached the right terminal (the epilogue didn't
+    // perturb the transitions).
+    assert_eq!(
+        actor.dag.node("rst-drv").expect("still in DAG").status(),
+        expected_terminal
+    );
+    assert_eq!(
+        actor.dag.node("rst-nd").expect("still in DAG").status(),
+        DerivationStatus::DependencyFailed
+    );
+
+    // (4) Exec correlation recorded for the reset drv (spawned write;
+    // established 10ms × 100 poll pattern).
+    let mut got: Option<Uuid> = None;
+    for _ in 0..100 {
+        got = sqlx::query_scalar(
+            "SELECT exec_id FROM build_derivations \
+             WHERE build_id = $1 AND derivation_id = $2",
+        )
+        .bind(build_id)
+        .bind(derivation_id)
+        .fetch_one(&db.pool)
+        .await?;
+        if got.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        got,
+        Some(exec_id),
+        "cancel of a reset drv must record bd.exec_id so the dashboard \
+         fetches the exact partial log this build observed"
+    );
+    Ok(())
+}
