@@ -1355,7 +1355,7 @@ async fn send_banner_batch(
 }
 
 /// Map a [`run_daemon_lifecycle`] result to the banner footer's
-/// `result` string: `ok`, `failed (StatusName)`, or `cancelled`.
+/// `result` string: `ok`, `failed (<reason>)`, or `cancelled`.
 ///
 /// Display-only: the precise classification (`InfrastructureFailure`
 /// vs `Failed` vs `Cancelled`, retry eligibility, error chain) lives
@@ -1403,6 +1403,59 @@ mod tests {
             "ExecutorError::CgroupOom Display ({:?}) must contain rio_proto::CGROUP_OOM_MSG ({:?})",
             ExecutorError::CgroupOom.to_string(),
             rio_proto::CGROUP_OOM_MSG,
+        );
+    }
+
+    /// Pins the footer `result` string domain so `banner::footer_lines`'s
+    /// rustdoc example and `footer_renders_failed`'s fixture can't drift
+    /// from what production actually emits. `BuildStatus` carries no exit
+    /// code, so the footer never produces `failed (exit N)` — the failure
+    /// reason is the status discriminant or a hand-written phrase.
+    ///
+    /// One assertion per `match` arm in `footer_result_str` — keep this
+    /// 1:1 so a reviewer can verify completeness by counting; add a new
+    /// assertion when a new arm is added.
+    #[test]
+    fn footer_result_str_domain() {
+        use rio_nix::protocol::build::{BuildResult, BuildStatus};
+
+        let ok_result = |status| -> Result<BuildResult, ExecutorError> {
+            Ok(BuildResult {
+                status,
+                ..Default::default()
+            })
+        };
+
+        // Success → "ok".
+        assert_eq!(footer_result_str(&ok_result(BuildStatus::Built)), "ok");
+
+        // Special-cased human phrases.
+        assert_eq!(
+            footer_result_str(&ok_result(BuildStatus::TimedOut)),
+            "failed (timed out)"
+        );
+        assert_eq!(
+            footer_result_str(&ok_result(BuildStatus::LogLimitExceeded)),
+            "failed (log limit exceeded)"
+        );
+
+        // Catch-all: Debug discriminant. This is what `footer_lines`'s
+        // rustdoc example shows.
+        assert_eq!(
+            footer_result_str(&ok_result(BuildStatus::PermanentFailure)),
+            "failed (PermanentFailure)"
+        );
+
+        // Cancelled is its own discriminant, not a `failed (...)`.
+        assert_eq!(
+            footer_result_str(&Err(ExecutorError::Cancelled)),
+            "cancelled"
+        );
+
+        // Any other executor error → catch-all.
+        assert_eq!(
+            footer_result_str(&Err(ExecutorError::BuildFailed("boom".into()))),
+            "failed (executor error)"
         );
     }
 

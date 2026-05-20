@@ -86,13 +86,15 @@ pub(crate) fn header_lines(
 ///
 /// ```text
 /// rio: exec     01976e8b-1234-7890-abcd-ef0123456789
-/// rio: result   failed (exit 1) after 4m23s
+/// rio: result   failed (PermanentFailure) after 4m23s
 /// ```
 ///
-/// `result` is one of `ok`, `failed (exit N)`, or `cancelled`. The
-/// `exec` line repeats so a truncated tail (e.g. Nix's "last 10
-/// lines" failure summary) still includes the identifier without
-/// scrolling back to the header.
+/// `result` is one of `ok`, `failed (<reason>)`, or `cancelled` — the
+/// caller (`footer_result_str` in `crate::executor`) maps the build
+/// outcome to that string; see its doc for why exit codes aren't
+/// available. The `exec` line repeats so a truncated tail (e.g. Nix's
+/// "last 10 lines" failure summary) still includes the identifier
+/// without scrolling back to the header.
 pub(crate) fn footer_lines(exec_id: &str, result: &str, duration: Duration) -> Vec<Vec<u8>> {
     vec![
         format!("rio: exec     {exec_id}").into_bytes(),
@@ -187,11 +189,18 @@ mod tests {
 
     #[test]
     fn footer_renders_failed() {
-        let lines = footer_lines("01976e8b-test", "failed (exit 1)", Duration::from_secs(263));
+        // Fixture mirrors the real domain: footer_result_str produces
+        // `failed (<reason>)`, never `failed (exit N)` — BuildStatus has
+        // no exit code.
+        let lines = footer_lines(
+            "01976e8b-test",
+            "failed (PermanentFailure)",
+            Duration::from_secs(263),
+        );
         assert!(
             str::from_utf8(&lines[1])
                 .unwrap()
-                .contains("rio: result   failed (exit 1) after 4m23s")
+                .contains("rio: result   failed (PermanentFailure) after 4m23s")
         );
         // Footer repeats the exec line so a truncated tail still has it.
         assert!(
