@@ -730,15 +730,23 @@ impl DagActor {
     /// worker's final output and its `rio: result` footer precede the
     /// `CompletionReport` on the same ordered stream, so they are
     /// already in the buffer when this runs — the seal costs nothing.
-    /// The cancel caller inverts that: it seals BEFORE the
-    /// `CancelSignal` is even sent, so the worker's in-flight output
-    /// and its eventual `rio: result cancelled` footer arrive after the
-    /// seal and are dropped by `push_for`. Accepted: the cancel path
-    /// must finalize the log without depending on the worker responding
-    /// (the signal is a best-effort `try_send`), and the authoritative
-    /// outcome is the `drv_logs.status` this same call writes — a
-    /// stored cancelled log ends at whatever output had arrived when
-    /// the cancel was processed, with no footer. Flush before correlate
+    /// The in-flight cancel caller (`to_cancel`) inverts that: it seals
+    /// BEFORE the `CancelSignal` is even sent, so the worker's
+    /// in-flight output and its eventual `rio: result cancelled` footer
+    /// arrive after the seal and are dropped by `push_for`. Accepted:
+    /// the cancel path must finalize the log without depending on the
+    /// worker responding (the signal is a best-effort `try_send`), and
+    /// the authoritative outcome is the `drv_logs.status` this same
+    /// call writes — that log ends at whatever output had arrived when
+    /// the cancel was processed, normally with no footer. The reset-arm
+    /// callers (`to_cancel_substituting`/`to_depfail`) instead finalize
+    /// a buffer retained across `reset_to_ready()`, still stamped to
+    /// the lost worker — its parting footer (possibly `ok`, if the
+    /// success report was lost to the disconnect) may already be
+    /// buffered, and the seal cannot remove buffered lines. A
+    /// `status='cancelled'` log can therefore still end with a
+    /// `rio: result` line that disagrees with the row; the row is
+    /// authoritative. Flush before correlate
     /// — both fire-and-forget but the flush request pins the `exec_id`
     /// it resolves, so it should resolve from the same snapshot of
     /// `state` as the correlate.

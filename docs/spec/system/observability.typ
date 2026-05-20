@@ -53,10 +53,16 @@ output --- arbitrary build code can emit its own `rio: result ok` lines. The
 system's source of truth for `exec_id`, outcome, and sizing is `drv_logs` and
 `assignments`, not the log text. The `grep '^rio:'` extraction is a convenience
 for humans (the post-failure log tail Nix prints, the dashboard log viewer),
-not a protocol. On scheduler-initiated cancellation the footer never reaches
-the stored log: the scheduler seals and finalizes the cancelled execution's log
-before the worker receives the `CancelSignal`, so a cancelled log ends without
-a `rio: result` line and `drv_logs.status` carries the outcome. Pod and node
+not a protocol. On scheduler-initiated cancellation the footer may be absent or
+may disagree with the row. Cancelling an in-flight (`Assigned`/`Running`)
+execution seals and finalizes its log before the worker receives the
+`CancelSignal`, so the late footer is dropped and the log normally ends without
+a `rio: result` line. Cancelling a build whose derivation was already reset off
+a lost or force-drained worker finalizes that prior execution's retained
+buffer, which may already hold the footer the worker pushed on its way out ---
+possibly `rio: result ok` when the success report was lost to the disconnect
+--- so the stored line, if present, can disagree with the row. `drv_logs.status`
+carries the authoritative outcome in both cases. Pod and node
 identity are deliberately excluded --- the "cluster is one machine" abstraction
 holds at the log level too.
 

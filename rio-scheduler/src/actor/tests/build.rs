@@ -960,12 +960,14 @@ async fn cancel_running_drv_finalizes_log(#[case] from_status: DerivationStatus)
     // push_for instead of recreating an entry the flusher drained. The
     // class of late batch this drops includes the worker's
     // `rio: result cancelled` footer — it is sent only after the
-    // CancelSignal's cgroup.kill lands, which is after this seal. A
-    // stored cancelled log therefore has no footer; drv_logs.status is
-    // the outcome of record. If the cancel path ever stops sealing
-    // first, that tradeoff is being renegotiated — update
-    // terminal_log_epilogue's sequencing doc and the observability
-    // spec's cancelled-log sentence to match.
+    // CancelSignal's cgroup.kill lands, which is after this seal. A log
+    // cancelled in flight therefore normally has no footer (this arm
+    // only — the reset-arm finalize cannot drop the prior worker's
+    // already-buffered footer; cancel_reset_drv_finalizes_prior_exec_log
+    // pins the opposite). drv_logs.status is the outcome of record. If
+    // the cancel path ever stops sealing first, that tradeoff is being
+    // renegotiated — update terminal_log_epilogue's sequencing doc and
+    // the observability spec's cancelled-footer paragraph to match.
     assert!(
         log_buffers.is_sealed(&drv_path),
         "cancel must seal the buffer so late LogBatch can't recreate it"
@@ -1099,6 +1101,22 @@ async fn cancel_reset_drv_finalizes_prior_exec_log(
         },
         "old-worker",
     ));
+    // The lost worker's parting footer lands in the retained buffer
+    // AFTER the reset: the entry is still stamped to "old-worker" and
+    // not yet sealed, so push_for accepts it (force-drain sends the
+    // CancelSignal and resets the drv before the worker's footer batch
+    // arrives). This is the case observability.typ's cancelled-footer
+    // paragraph describes — the reset-arm finalize cannot drop it.
+    assert!(log_buffers.push_for(
+        &drv_path,
+        &rio_proto::types::BuildLogBatch {
+            derivation_path: drv_path.clone(),
+            lines: vec![b"rio: result   cancelled after 4s".to_vec()],
+            first_line_number: 1,
+            executor_id: "old-worker".into(),
+        },
+        "old-worker",
+    ));
 
     // The never-dispatched sibling: same build, no buffer, no exec_id
     // from either carrier. Must NOT produce a FlushRequest or a seal.
@@ -1148,6 +1166,21 @@ async fn cancel_reset_drv_finalizes_prior_exec_log(
     assert!(
         !log_buffers.is_sealed(&nd_path),
         "never-dispatched drvs must not accumulate seal tombstones"
+    );
+
+    // (2b) The seal blocks future pushes; it does not strip what the
+    // prior worker already pushed. The buffer the flusher will drain
+    // still ends with that worker's footer — a status='cancelled' log
+    // MAY carry a `rio: result` line that disagrees with the row
+    // (observability.typ's cancelled-footer paragraph; drv_logs.status
+    // is authoritative).
+    let retained = log_buffers
+        .read_since(&drv_path, 0)
+        .expect("entry survives the seal until the flusher drains it");
+    assert_eq!(
+        retained.last().map(|(_, l)| l.as_slice()),
+        Some(b"rio: result   cancelled after 4s".as_slice()),
+        "reset-arm finalize must not strip the prior worker's already-buffered footer"
     );
 
     // (3) Both drvs reached the right terminal (the epilogue didn't
