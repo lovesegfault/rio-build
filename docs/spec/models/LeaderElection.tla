@@ -226,6 +226,74 @@ BoundedDualLeadership ==
                   \/ snap[stale].holder /= stale
 
 \* -----------------------------------------------------------------------
+\* The bridge to sched.lease.generation-fence. When the dual-belief window
+\* is open, the executor's generation fence has to be able to tell the
+\* replicas apart -- the fresh leader's generation must be strictly
+\* greater than the stale believer's. The production mechanism is
+\* on_acquire()'s fetch_add(1) seeded from PG's generation high-water mark
+\* (seed_generation_from(), r[sched.recovery.fetch-max-seed]); the model
+\* collapses both into Steal(n)'s max(gen[n]+1, genHW+1).
+\*
+\* KNOWN COUNTEREXAMPLE -- this invariant is FALSIFIED by the model at
+\* depth 12 (disabled in the .cfg so CI stays green; the definition is
+\* kept so the fix can re-enable it). The trace, in protocol terms:
+\*
+\*   1-3.  n1 GETs the empty lease (rv=0).
+\*   4.    n1 Steals: gen[n1] = max(1+1, 0+1) = 2, lease = (n1, rv=1,
+\*         lease.gen=1), genHW STAYS 0 -- n1 has not yet persisted.
+\*   5.    n2 GETs, sees (n1, rv=1), starts observing rv=1 at its clock.
+\*   6-11. Clocks tick. n1 never Persists (in production: the leader is
+\*         still inside recovery, or has no dispatch traffic -- anything
+\*         that delays the first PG write of the new generation). n1
+\*         never RenewLeases either (partitioned from the apiserver
+\*         after the acquire: its snapshot was spent by the Steal and it
+\*         never completes another GET). n1's rv=1 therefore never
+\*         changes.
+\*   12.   n2's observed rv=1 has been stale for 4 > Ttl=3 on its clock
+\*         -> Steal: gen[n2] = max(1+1, 0+1) = 2 -- genHW is STILL 0, so
+\*         n2 seeds from the same high-water n1 seeded from. Both n1 and
+\*         n2 are Leading with gen = 2. The generation fence cannot tell
+\*         them apart.
+\*
+\* Protocol-level diagnosis: the window between acquire (seed the
+\* in-memory generation from PG's high-water mark) and the first Persist
+\* (write the new generation back to PG) is real. A leader deposed inside
+\* that window leaves genHW unchanged, and the thief seeds from the same
+\* value. r[sched.recovery.fetch-max-seed] protects against a CRASHED
+\* leader reusing an old generation; it does not protect against a
+\* DEPOSED-BEFORE-PERSISTING leader colliding with its successor.
+\*
+\* What this means for r[sched.lease.generation-fence]: in this
+\* interleaving the executor cannot distinguish the stale leader's
+\* WorkAssignments from the fresh leader's by generation alone. The
+\* existing fallback argument in that rule's text (the PG writes are
+\* idempotent upserts keyed by drv_hash with monotone status transitions)
+\* still applies -- the collision makes the fence ineffective, not the
+\* system incorrect. But the fence is the *stated* mechanism for
+\* executor-side staleness detection, and this shows it has a hole.
+\*
+\* Candidate fixes (a protocol design decision, not a model decision):
+\*   (a) Derive the generation from the lease's lease_transitions: the
+\*       apiserver bumps it atomically with the holder change, so there
+\*       is no persist window at all. (The model's lease.gen already
+\*       tracks this -- note lease.gen IS distinct across the two
+\*       acquisitions in the trace above: n1 acquired at lease.gen=1,
+\*       n2 at lease.gen=2.)
+\*   (b) Make the generation persist part of the acquire critical
+\*       section: block dispatch until the new generation is durably in
+\*       PG. recovery_complete almost does this, but the persist has to
+\*       happen-before the first generation-stamped WorkAssignment, not
+\*       just before recovery completes.
+\*   (c) Accept the gap: rely on the idempotent-PG-writes argument.
+\* -----------------------------------------------------------------------
+StaleLeaderHasStaleGeneration ==
+  \A m, n \in Nodes :
+    (state[m] = "Leading" /\ state[n] = "Leading" /\ m /= n) =>
+      LET stale == IF lease.holder = m THEN n ELSE m
+          fresh == IF lease.holder = m THEN m ELSE n
+      IN gen[stale] < gen[fresh]
+
+\* -----------------------------------------------------------------------
 \* Initial state. gen[n] = 1 mirrors the production `AtomicU64::new(1)`
 \* (rio-scheduler/src/main.rs:142, rio-controller/src/main.rs:313). genHW = 0
 \* is an empty PG. lease.gen = 0 is `lease_transitions` before any holder.
