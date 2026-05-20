@@ -133,6 +133,11 @@ let
     # devshell entry becomes slow, gate behind an opt-in `.#kani` shell.
     kaniToolchain.kani
 
+    # Formal models: TLC for docs/spec/models/. Run a model locally:
+    # `cd docs/spec/models && tlc -workers auto -config M.cfg M.tla`.
+    # See nix/tla.nix for the CI check.
+    tlaplus
+
     # crate2nix CLI for regenerating Cargo.json after
     # Cargo.lock changes. PoC — see
     # .claude/notes/crate2nix-migration-assessment.md.
