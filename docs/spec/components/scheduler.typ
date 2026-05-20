@@ -2266,7 +2266,7 @@ and retains it, rather than burning a generation --- and fencing its own
 in-flight work --- on every connectivity blip. A row at our generation with a
 _different_ `holder_id` is unambiguously a cross-incarnation collision and
 forces the bump. A claim-write failure degrades to a logged, counted
-(`rio_scheduler_generation_claim_failed_total`) proceed-without-claim: blocking
+(#(refs.metric)("rio_scheduler_generation_claim_failed_total")) proceed-without-claim: blocking
 recovery on the claim would turn a PG blip at failover time into a leader that
 holds the Lease but never dispatches.
 
