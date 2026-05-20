@@ -29,19 +29,18 @@ use super::SchedulerGrpc;
 /// per-connection and all clones must share the sequence.
 static STREAM_EPOCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Upper bound on distinct `derivation_path` values one
+/// Upper bound on distinct *accepted* `derivation_path` values one
 /// `BuildExecution` stream may push to `LogBuffers`. Per
 /// `[Single build per pod, no knob]` a legitimate stream pushes for
 /// exactly ONE; 8 covers reassign/retry slop. With `push_for` (the
-/// `(executor, drv)` binding gate) a fabricated path no longer
-/// allocates a `LogBuffers` entry — the load-bearing role of this
-/// cap is bounding the recv task's per-stream `seen_drvs:
-/// HashSet<String>`, which is forwarded to the actor on disconnect
-/// for log-buffer cleanup. Without the cap, a compromised worker
-/// could grow that set (and the `ExecutorDisconnected` command it's
-/// shipped in) without bound. The cap is also a defense-in-depth
-/// layer: if `push_for` ever regressed to the old `or_default()`
-/// behavior, this is the only remaining buffer-allocation bound.
+/// `(executor, drv)` binding gate) a fabricated path never allocates
+/// a `LogBuffers` entry, and with the gated `seen_drvs.insert()` a
+/// rejected path never grows the recv task's per-stream `seen_drvs:
+/// HashSet<String>` either. The cap bounds the *accepted* population
+/// — exactly the set that round-trips to the actor's
+/// `handle_executor_disconnected` cleanup — and is a defense-in-depth
+/// tripwire: if `push_for` or the gated insert ever regressed, this
+/// is the only remaining bound.
 const MAX_DRVS_PER_STREAM: usize = 8;
 
 #[tonic::async_trait]
@@ -288,30 +287,37 @@ impl ExecutorService for SchedulerGrpc {
                             // Two-step: buffer (never blocks on actor), then forward.
                             //
                             // 0. Per-stream distinct-path cap. The worker is NOT
-                            //    trusted; before `push_for` (the binding gate), a
-                            //    fabricated path could exhaust this set's memory.
-                            //    The cap bounds it. `seen_drvs` holds the FULL
-                            //    `derivation_path` (not the 32-char `drv_log_hash`)
-                            //    because it round-trips to the actor's
-                            //    `handle_executor_disconnected` cleanup, which
-                            //    looks each entry up via `dag.hash_for_path()` —
-                            //    a map keyed on full store paths. A bare hash
-                            //    would never match, so the cleanup's "discard
-                            //    ONLY paths the DAG has never heard of" gate
-                            //    would degrade to "discard EVERY path the stream
-                            //    touched" — including a completed drv whose
-                            //    `flush_final` is still queued (silent log loss)
-                            //    and a re-dispatched drv's freshly `set_exec`'d
-                            //    entry.
-                            if !seen_drvs.contains(&log.derivation_path) {
-                                if seen_drvs.len() >= MAX_DRVS_PER_STREAM {
-                                    metrics::counter!(
-                                        "rio_scheduler_log_unknown_drv_dropped_total"
-                                    )
+                            //    trusted. The cap is checked BEFORE `push_for`, but
+                            //    the INSERT is gated on `accepted` (below): a path the
+                            //    binding gate refused is unverified worker input and
+                            //    MUST NOT round-trip into the actor's
+                            //    `handle_executor_disconnected` cleanup — which would
+                            //    let a fabricated suffix for a victim's hash {H} fail
+                            //    the cleanup's `dag.hash_for_path()` exact-string gate
+                            //    while `discard()` re-normalizes to {H} and removes the
+                            //    victim's live buffer. r[impl sched.log.batch-binding]
+                            //
+                            //    Because rejected paths never enter `seen_drvs`, the
+                            //    cap no longer throttles a 100%-rejected flood — that
+                            //    flood is bounded only by `push_for`'s per-batch reject
+                            //    cost (string parse, DashMap lookup, warn log, metric;
+                            //    no allocation, no actor send), which a worker could
+                            //    already pay by re-sending the same 8 rejected paths
+                            //    under the old code. The cap bounds the *accepted*
+                            //    population, which is exactly what the cleanup acts on.
+                            //
+                            //    `seen_drvs` holds the FULL `derivation_path` (not the
+                            //    32-char `drv_log_hash`) because the cleanup looks
+                            //    each entry up via `dag.hash_for_path()` — a map keyed
+                            //    on full store paths. A bare hash would never match,
+                            //    degrading the cleanup to "discard EVERY path the
+                            //    stream touched."
+                            if !seen_drvs.contains(&log.derivation_path)
+                                && seen_drvs.len() >= MAX_DRVS_PER_STREAM
+                            {
+                                metrics::counter!("rio_scheduler_log_unknown_drv_dropped_total")
                                     .increment(1);
-                                    continue;
-                                }
-                                seen_drvs.insert(log.derivation_path.clone());
+                                continue;
                             }
                             // 1. Ring buffer write — direct, no actor involvement.
                             //    This is the durability path: even if the actor is
@@ -355,6 +361,11 @@ impl ExecutorService for SchedulerGrpc {
                             //    as the ring-buffer write; both consumers of the
                             //    worker-supplied `derivation_path` must respect the gate.
                             if accepted {
+                                // Bind-gate verified ⟹ this path identifies an
+                                // assignment held by THIS stream. Safe to round-trip
+                                // through the disconnect cleanup. Idempotent on
+                                // already-seen.
+                                seen_drvs.insert(log.derivation_path.clone());
                                 let drv_path = log.derivation_path.clone();
                                 if actor_for_recv
                                     .try_send(ActorCommand::ForwardLogBatch {

@@ -427,30 +427,45 @@ impl DagActor {
 
         // Log-buffer cleanup, AFTER the epoch check above (a stale
         // reader's `seen_drvs` reaches here only when the epoch
-        // matched) and with ownership awareness. Discard ONLY paths
-        // the DAG has never heard of — fabricated by an untrusted
-        // worker (the `MAX_DRVS_PER_STREAM` cap bounds count, not
-        // which paths) or post-cleanup. Real drvs are reaped by the
-        // existing machinery: `seal()` on completion, `discard()` on
-        // next `assign_to_worker`, `discard()` in
-        // `handle_cleanup_terminal_build`. This was previously in the
-        // reader task, branching on `is_sealed`; that raced the
-        // actor's `seal()` (TOCTOU under load → completed build's
-        // buffer discarded before flusher drained it) and had no
-        // ownership check (compromised worker → discard a victim's
-        // buffer by sending one `LogBatch{derivation_path=D_victim}`
-        // then disconnecting).
+        // matched). Two ownership gates, in order:
         //
-        // `seen_drvs` carries FULL `derivation_path`s (not the 32-char
-        // `drv_log_hash`) because `hash_for_path` is keyed on full
-        // paths — see the recv task's `LogBatch` arm. The `discard()`
-        // call below normalizes via `drv_log_hash`, so either form
-        // hits the right buffer key; the *gate* is the part that
-        // needs the full path.
+        // 1. DAG gate: only consider paths the DAG has never heard of.
+        //    With the recv task only inserting *accepted* batches into
+        //    `seen_drvs` (rejected paths never round-trip here), every
+        //    entry corresponds to a buffer stamped to THIS executor at
+        //    accept time — and therefore to a DAG node *for that hash*.
+        //    The entry's *string* may be an accepted alias (different
+        //    suffix, same hash) that is not in `path_to_hash`, which is
+        //    exactly why this gate fires for it and gate 2 is needed.
+        //    Real (canonical-path) drvs are reaped by `assign_to_worker`
+        //    (re-dispatch), `handle_cleanup_terminal_build` (terminal),
+        //    and the flusher (`drain`); the gate keeps this loop from
+        //    racing them.
+        //
+        // 2. Buffer gate (`discard_if_owned_by`): never remove an entry
+        //    stamped to another executor or one that is sealed. Without
+        //    it, an accepted alias for the worker's own drv, reassigned
+        //    to `E_b` after a transient failure, then a disconnect from
+        //    the original worker, would remove `E_b`'s freshly-stamped
+        //    buffer. Sealed = `FlushRequest` in flight; reaping would
+        //    cause `flush_final` to drop the request as stale.
+        //
+        // For the full exploit chain that motivated the gated insert
+        // (gate 0) and this two-gate shape, see the recv task's
+        // `LogBatch` arm in `executor_service.rs`. This loop was
+        // previously in the reader task, branching on `is_sealed`; that
+        // raced the actor's `seal()` (TOCTOU under load → completed
+        // build's buffer discarded before flusher drained it) and had no
+        // ownership check at all.
         if let Some(bufs) = &self.log_buffers {
             for drv in seen_drvs {
-                if self.dag.hash_for_path(&drv).is_none() {
-                    bufs.discard(&drv);
+                if self.dag.hash_for_path(&drv).is_none()
+                    && bufs.discard_if_owned_by(&drv, executor_id.as_str())
+                {
+                    debug!(
+                        executor_id = %executor_id, drv = %drv,
+                        "reaped DAG-unknown log buffer on disconnect"
+                    );
                 }
             }
         }

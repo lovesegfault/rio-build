@@ -4494,14 +4494,22 @@ async fn test_disconnect_discards_only_unknown_drvs() -> anyhow::Result<()> {
     merge_single_node(&handle, Uuid::new_v4(), "lbdisc", PriorityClass::Scheduled).await?;
     barrier(&handle).await;
 
-    // Seed both buffers (as the reader task's push() would).
+    // Seed both buffers as `set_log_exec` + the recv task would: stamp
+    // the entry to "lb-w" so the ownership check in
+    // `discard_if_owned_by` lets the discard through. (The legacy
+    // `push()` path creates UNSTAMPED entries, which the ownership
+    // gate now refuses to remove — that's the security property, not a
+    // bug, but it's not the production-realistic seeding for this
+    // test.)
     for p in [&real_path, &fake_path] {
-        log_buffers.push(&rio_proto::types::BuildLogBatch {
-            derivation_path: p.clone(),
+        log_buffers.set_exec(p, uuid::Uuid::now_v7(), "lb-w");
+        let batch = rio_proto::types::BuildLogBatch {
+            derivation_path: (*p).clone(),
             lines: vec![b"line".to_vec()],
             first_line_number: 0,
             executor_id: "lb-w".into(),
-        });
+        };
+        assert!(log_buffers.push_for(p, &batch, "lb-w"));
     }
     assert!(log_buffers.read_since(&real_path, 0).is_some());
     assert!(log_buffers.read_since(&fake_path, 0).is_some());
@@ -4524,6 +4532,54 @@ async fn test_disconnect_discards_only_unknown_drvs() -> anyhow::Result<()> {
         log_buffers.read_since(&real_path, 0).is_some(),
         "real DAG drv's buffer preserved — owned by seal/flusher, not \
          the (untrusted) stream's seen_drvs"
+    );
+    Ok(())
+}
+
+/// bug_004: the disconnect-cleanup gate (`hash_for_path`, exact-string
+/// match on the full canonical path) and the action (`discard()`,
+/// normalized to the 32-char hash) operate on different key spaces. A
+/// compromised executor that gets a fabricated SUFFIX of a victim's hash
+/// into `seen_drvs` would otherwise have the gate fire (no exact match)
+/// and `discard()` re-normalize to the victim's key. The ownership
+/// check in `discard_if_owned_by` MUST refuse to remove an entry stamped
+/// to another executor.
+// r[verify sched.log.batch-binding]
+#[tokio::test]
+async fn test_disconnect_preserves_other_executor_buffer() -> anyhow::Result<()> {
+    let db = TestDb::new(&MIGRATOR).await;
+    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let bufs_for_actor = std::sync::Arc::clone(&log_buffers);
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.log_buffers = Some(bufs_for_actor);
+    });
+
+    // Victim's buffer, stamped to "victim". Deliberately NOT merged into
+    // the DAG: this exercises the *ownership* gate when the DAG gate
+    // already fired (the worst case).
+    let victim_path = test_drv_path("victim");
+    log_buffers.set_exec(&victim_path, uuid::Uuid::now_v7(), "victim");
+    assert!(log_buffers.exec_id(&victim_path).is_some());
+
+    // Attacker's `seen_drvs` carries an alias: same TEST_HASH, different
+    // suffix. `hash_for_path(alias)` is `None` (not the canonical path),
+    // `drv_log_hash(alias)` normalizes to the same buffer key as
+    // `victim_path`. Pre-fix, `discard(alias)` would remove the victim's
+    // entry.
+    let alias = test_drv_path("attacker-renamed");
+    let _rx = connect_executor(&handle, "attacker", "x86_64-linux").await?;
+    handle
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: "attacker".into(),
+            stream_epoch: stream_epoch_for("attacker"),
+            seen_drvs: vec![alias],
+        })
+        .await?;
+    barrier(&handle).await;
+
+    assert!(
+        log_buffers.exec_id(&victim_path).is_some(),
+        "victim's buffer survives attacker disconnect with hash-aliased path"
     );
     Ok(())
 }

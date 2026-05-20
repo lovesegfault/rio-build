@@ -483,10 +483,10 @@ async fn test_log_buffer_survives_stream_close_before_actor_seal() -> anyhow::Re
 /// `MAX_DRVS_PER_STREAM` (8 keys per stream — a leak rate, not a
 /// closure). The `(executor, drv)` binding gate (`push_for`,
 /// sched.log.batch-binding) closes it entirely: a batch whose drv was
-/// never `set_exec`-stamped is rejected, no entry created. The
-/// `seen_drvs` cap is now a residual bound on the recv task's
-/// `HashSet<String>` memory, not the load-bearing defense for buffer
-/// allocation.
+/// never `set_exec`-stamped is rejected, no entry created, and (post
+/// bug_004) its path never enters the recv task's `seen_drvs` either —
+/// the cap now bounds the *accepted* population, a defense-in-depth
+/// tripwire rather than a memory bound against fabricated paths.
 ///
 /// Sends batches for 12 unsolicited drvs + 1 stamped sentinel. Asserts
 /// `active_count() == 1` (only the sentinel — proving the gate rejects
@@ -524,10 +524,11 @@ async fn test_log_batch_distinct_paths_capped_per_stream() -> anyhow::Result<()>
     // time sentinel batch #2 lands, the 12 unsolicited batches between
     // #1 and #2 were processed (and rejected by the gate).
     //
-    // The sentinel must be the FIRST distinct drv on the stream:
-    // `seen_drvs` caps at `MAX_DRVS_PER_STREAM` (8), and the cap fires
-    // BEFORE the gate. A sentinel sent 13th would hit the cap, not the
-    // gate, and its batch would be dropped — wrong layer under test.
+    // The sentinel is sent FIRST then LAST so its two batches bracket
+    // the 12 unsolicited ones. (Post bug_004, the cap doesn't constrain
+    // ordering: `seen_drvs.insert()` is gated on `accepted`, so the
+    // unsolicited paths never enter the set. The bracket is purely the
+    // FIFO drained-queue assertion's dependency.)
     let sentinel = "/nix/store/cap-sentinel-test.drv".to_string();
     log_buffers.set_exec(&sentinel, uuid::Uuid::now_v7(), "cap-worker");
     let send_sentinel = |line_no: u64| {
@@ -587,6 +588,94 @@ async fn test_log_batch_distinct_paths_capped_per_stream() -> anyhow::Result<()>
         "only the stamped sentinel allocates a buffer entry; unsolicited \
          drvs are rejected by the (executor, drv) binding gate, not capped"
     );
+
+    drop(stream_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(2), inbound.next()).await;
+    Ok(())
+}
+
+/// bug_004 / Fix 1 regression test: a path the binding gate rejected
+/// MUST NOT consume a `seen_drvs` slot. Pre-fix, the unconditional
+/// `seen_drvs.insert()` ran before `push_for`, so 8 rejected unsolicited
+/// paths filled `seen_drvs` to `MAX_DRVS_PER_STREAM` and the cap then
+/// dropped the 9th distinct path — even if it was a legitimately
+/// assigned one. Post-fix the insert is gated on `accepted`, so
+/// rejected paths never enter the set and the assigned drv's batch
+/// lands regardless of how many fabricated paths preceded it.
+// r[verify sched.log.batch-binding]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_log_batch_rejected_paths_do_not_consume_cap() -> anyhow::Result<()> {
+    let (_db, grpc, _handle, _actor_task) = setup_grpc().await;
+    let log_buffers = grpc.log_buffers();
+    let router = tonic::transport::Server::builder().add_service(ExecutorServiceServer::new(grpc));
+    let (addr, _server) = rio_test_support::grpc::spawn_grpc_server(router).await;
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    let mut worker_client = ExecutorServiceClient::new(channel);
+
+    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::ExecutorMessage>(32);
+    stream_tx
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::Register(
+                rio_proto::types::ExecutorRegister {
+                    executor_id: "fix1-worker".into(),
+                },
+            )),
+        })
+        .await?;
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
+    let mut inbound = worker_client.build_execution(outbound).await?.into_inner();
+
+    // Sentinel stamped via `set_exec` (as `assign_to_worker` would), so
+    // its batch is the only one `push_for` accepts.
+    let sentinel = "/nix/store/fix1-sentinel-test.drv".to_string();
+    log_buffers.set_exec(&sentinel, uuid::Uuid::now_v7(), "fix1-worker");
+
+    // 8 distinct UNSOLICITED paths first. Pre-fix, these fill
+    // `seen_drvs` to `MAX_DRVS_PER_STREAM` (8) before the binding gate
+    // rejects them. Post-fix, they never enter `seen_drvs`.
+    for i in 0..8 {
+        stream_tx
+            .send(rio_proto::types::ExecutorMessage {
+                msg: Some(rio_proto::types::executor_message::Msg::LogBatch(
+                    rio_proto::types::BuildLogBatch {
+                        derivation_path: format!("/nix/store/fix1-{i}-test.drv"),
+                        lines: vec![b"x".to_vec()],
+                        first_line_number: 0,
+                        executor_id: "fix1-worker".into(),
+                    },
+                )),
+            })
+            .await?;
+    }
+    // Sentinel batch LAST. Pre-fix, it's the 9th distinct path → hits
+    // the cap (`!seen_drvs.contains() && len >= 8 → continue`) and is
+    // dropped before `push_for` ever runs. Post-fix, `seen_drvs` is
+    // empty (8 rejected paths never inserted) and the sentinel sails
+    // through `push_for`'s accept path.
+    stream_tx
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::LogBatch(
+                rio_proto::types::BuildLogBatch {
+                    derivation_path: sentinel.clone(),
+                    lines: vec![b"sentinel".to_vec()],
+                    first_line_number: 0,
+                    executor_id: "fix1-worker".into(),
+                },
+            )),
+        })
+        .await?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while log_buffers
+            .read_since(&sentinel, 0)
+            .is_none_or(|v| v.is_empty())
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("sentinel batch must land — rejected paths do not consume seen_drvs slots");
 
     drop(stream_tx);
     let _ = tokio::time::timeout(Duration::from_secs(2), inbound.next()).await;

@@ -401,6 +401,53 @@ impl LogBuffers {
         self.sealed.remove(&key);
     }
 
+    /// Discard the buffer for `drv_path` **only if** it is currently
+    /// stamped to `executor` and not sealed. Returns whether anything
+    /// was removed.
+    ///
+    /// Called by the actor's `handle_executor_disconnected` cleanup for
+    /// paths the disconnecting executor's stream touched but the DAG no
+    /// longer recognizes (`dag.hash_for_path()` is `None`). The ownership
+    /// check is the load-bearing part: `hash_for_path` is an exact-string
+    /// lookup on the full canonical path, while [`drv_log_hash`] (which
+    /// keys this map) accepts a fabricated suffix or a bare hash. A
+    /// compromised worker can therefore choose a `derivation_path` that
+    /// fails the DAG gate but normalizes to a *victim's* buffer key. This
+    /// method refuses to remove an entry stamped to anyone else
+    /// (cross-tenant DoS) or one that is sealed (the flusher's `FlushRequest`
+    /// is in flight and `flush_final` would otherwise drop the request as
+    /// stale, silently losing the build log).
+    ///
+    /// Idempotent; no-op on a missing or unstamped entry.
+    ///
+    /// ## Concurrency
+    ///
+    /// The seal check and the `remove_if` are two operations, not one.
+    /// This is TOCTOU-safe because `seal()` is only called from actor
+    /// handlers (`trigger_log_flush` in `actor/event.rs`) — the same
+    /// single-threaded event loop that calls this method from
+    /// `handle_executor_disconnected`. There is no concurrent `seal()` to
+    /// race. The flusher's `unseal()` calls (`flush.rs`) are concurrent
+    /// but each follows a `drain()` (entry already gone) or a stale-exec
+    /// early-return (entry gone or restamped) — both outcomes the
+    /// `remove_if` ownership check handles independently.
+    ///
+    /// `remove_if` (rather than `get` + check + `remove`) is used because
+    /// it's shorter and harder to misuse if a future caller appears
+    /// off-actor — it is *not* load-bearing for atomicity with the
+    /// current actor-only caller.
+    pub fn discard_if_owned_by(&self, drv_path: &str, executor: &str) -> bool {
+        let key = drv_log_hash(drv_path);
+        if self.sealed.contains(&key) {
+            return false;
+        }
+        self.buffers
+            .remove_if(&key, |_, e| {
+                e.assigned_executor.as_deref() == Some(executor)
+            })
+            .is_some()
+    }
+
     /// Mark `drv_path` terminal: subsequent [`Self::push`] calls drop.
     ///
     /// Called by the actor's completion handlers (`handle_success_completion`,
@@ -946,5 +993,58 @@ mod tests {
             bufs.read_since("drv-a", 0),
             Some(vec![(0, b"legacy".to_vec())])
         );
+    }
+
+    #[test]
+    fn discard_if_owned_by_removes_own_unsealed_buffer() {
+        let bufs = LogBuffers::new();
+        bufs.set_exec("drv-a", Uuid::now_v7(), "executor-1");
+        assert!(bufs.push_for("drv-a", &mk_batch("drv-a", 0, &[b"l0"]), "executor-1"));
+        assert!(bufs.discard_if_owned_by("drv-a", "executor-1"));
+        assert_eq!(bufs.exec_id("drv-a"), None);
+        assert_eq!(bufs.read_since("drv-a", 0), None);
+    }
+
+    /// bug_004: the security invariant. A worker-supplied path that
+    /// normalizes (via `drv_log_hash`) to another executor's buffer key MUST
+    /// NOT remove that executor's entry on disconnect.
+    // r[verify sched.log.batch-binding]
+    #[test]
+    fn discard_if_owned_by_preserves_other_executor_buffer() {
+        let bufs = LogBuffers::new();
+        bufs.set_exec("drv-a", Uuid::now_v7(), "victim");
+        assert!(!bufs.discard_if_owned_by("drv-a", "attacker"));
+        assert!(bufs.exec_id("drv-a").is_some());
+    }
+
+    /// Sealed = the flusher owns drain. The disconnect cleanup MUST NOT
+    /// reap a sealed buffer or `flush_final`'s staleness check
+    /// (`buffers.exec_id(...) != Some(req.exec_id)`) would drop the request
+    /// and silently lose a completed build's log.
+    #[test]
+    fn discard_if_owned_by_preserves_sealed_buffer() {
+        let bufs = LogBuffers::new();
+        bufs.set_exec("drv-a", Uuid::now_v7(), "executor-1");
+        bufs.seal("drv-a");
+        assert!(!bufs.discard_if_owned_by("drv-a", "executor-1"));
+        assert!(bufs.is_sealed("drv-a"));
+        assert!(bufs.exec_id("drv-a").is_some());
+    }
+
+    #[test]
+    fn discard_if_owned_by_no_op_on_missing() {
+        let bufs = LogBuffers::new();
+        assert!(!bufs.discard_if_owned_by("drv-a", "executor-1"));
+    }
+
+    #[test]
+    fn discard_if_owned_by_preserves_unstamped_entry() {
+        let bufs = LogBuffers::new();
+        // Legacy `push()` creates an unstamped entry (test-only; production
+        // entries always come from `set_exec`). The ownership check refuses
+        // to remove it — there is no executor to attribute the discard to.
+        bufs.push(&mk_batch("drv-a", 0, &[b"l0"]));
+        assert!(!bufs.discard_if_owned_by("drv-a", "executor-1"));
+        assert!(bufs.read_since("drv-a", 0).is_some());
     }
 }
