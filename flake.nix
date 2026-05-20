@@ -505,6 +505,44 @@
                 globalExtraRustcOptsHost = [ ];
                 localExtraRustcOpts = [
                   "-Cllvm-args=--reachability=harnesses"
+                  # Function contracts: gate behind kani-compiler's
+                  # `-Z function-contracts` unstable feature. Without it,
+                  # any `#[kani::ensures]`/`#[kani::requires]`/
+                  # `#[kani::proof_for_contract]` errors out at compile
+                  # time (kani-compiler/src/kani_middle/attributes.rs:441).
+                  # The flag travels inside `-Cllvm-args` (the kani-compiler
+                  # arg channel — see encode_as_rustc_arg in
+                  # kani-driver/src/util.rs); rustc aggregates `-Cllvm-args`
+                  # across occurrences, and the attached `-Zname` form
+                  # avoids whitespace that buildRustCrate's lib.sh would
+                  # split into separate (and thus rustc-bound) words.
+                  "-Cllvm-args=-Zfunction-contracts"
+                  # Contract codegen needs the kani_macros-synthesized
+                  # contract-wrapper closures to remain distinct mono-
+                  # items. buildRustCrate's release profile sets
+                  # `-C opt-level=3` (build-crate.nix:32), which enables
+                  # MIR inlining and absorbs those closures; kani-compiler
+                  # then panics with `Function '<closure>' is not declared`
+                  # in codegen_modifies_contract (contract.rs:128).
+                  # `cargo kani` always runs the dev profile (opt-level=0),
+                  # so this is the upstream-default behavior. extraRustcOpts
+                  # is appended AFTER the release-derived opt flag
+                  # (build-crate.nix:52) and rustc is last-flag-wins, so
+                  # this overrides cleanly for workspace members without
+                  # touching dep drvPaths.
+                  #
+                  # CONSTRAINT: contracted functions must be defined in
+                  # workspace members. Deps compile at opt-level=3 without
+                  # -Zfunction-contracts (only localExtraRustcOpts gets
+                  # these flags), so a #[kani::ensures] on a dep function
+                  # fails loudly at compile time — either the inlining
+                  # panic (codegen_modifies_contract: "Function '<closure>'
+                  # is not declared") or the unstable-feature error. To
+                  # support dep-crate contracts the whole crateBuildKani
+                  # tree would need release=false + the contracts flag in
+                  # globalExtraRustcOpts (matching cargo kani's dev
+                  # profile).
+                  "-Copt-level=0"
                 ];
                 # Target deps are compiled `--reachability=none` —
                 # kani-compiler skips codegen and only encodes MIR into

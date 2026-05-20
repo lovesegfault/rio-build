@@ -30,14 +30,50 @@
 # this is fine; rio-{gateway,builder,...} need a `[lib]` split or a
 # crateBuildKani change before they can be wired here.
 #
-# Pipeline shape (replicates kani-driver, verified against spike #2;
-# kani 0.67.0, cbmc 6.8.0):
+# Pipeline shape (replicates kani-driver, verified against spike #2 and
+# spike #3 (contracts); kani 0.67.0, cbmc 6.8.0):
 #   1. goto-cc symtab + kani_lib.c → goto binary  (link_goto_binary)
 #   2. goto-cc --function <harness>               (specialize_to_proof_harness)
-#   3. goto-instrument --add-library              (CBMC C library models)
-#   4. goto-instrument --generate-function-body   (assert-false on undefined fns)
-#   5. goto-instrument --ensure-one-backedge-per-target
-#   6. cbmc                                       (the actual verification)
+#   3. goto-instrument --dfcc --enforce-contract  (instrument_contracts; only
+#                                                  when metadata.contract != null)
+#   4. goto-instrument --add-library              (CBMC C library models)
+#   5. goto-instrument --generate-function-body   (assert-false on undefined fns)
+#   6. goto-instrument --ensure-one-backedge-per-target
+#   7. cbmc                                       (the actual verification)
+#
+# Step 3 mirrors kani-driver/src/call_goto_instrument.rs::instrument_contracts
+# (called from instrument_model:46). For a `#[kani::proof_for_contract]`
+# harness, kani-compiler emits a `contract` object in kani-metadata.json:
+#
+#   {
+#     "contracted_function_name": "<mangled name of the modifies-wrapper closure>",
+#     "recursion_tracker": null | "<file>:<pretty path of REENTRY static>"
+#   }
+#
+# The `contracted_function_name` is NOT the original function under
+# contract — it is the doubly-nested closure that the kani_macros
+# `#[ensures]`/`#[requires]` proc-macro synthesizes inside the function
+# body (kani_macros/src/sysroot/contracts/check.rs::modifies_closure;
+# `add_one::{{closure}}::{{closure}}` for the simplest case). CBMC's
+# Dynamic Frame Condition Checking pass (`--dfcc`) wraps that closure
+# with the assigns/postcondition assertion and rewires the harness to
+# enter through the wrapper. `recursion_tracker` is non-null only when
+# the function is `#[kani::recursive]`; CBMC then needs
+# `--nondet-static-exclude <tracker>` so the REENTRY static is preserved
+# across the havoc.
+#
+# Two compiler-side prerequisites for step 3 to ever fire (see
+# `kaniBaseFlags` and `localExtraRustcOpts` in flake.nix):
+#   * `-Cllvm-args=-Zfunction-contracts` — kani-compiler errors on any
+#     `#[kani::ensures]`/`#[kani::requires]`/`#[kani::proof_for_contract]`
+#     attribute unless this unstable feature flag is set
+#     (kani-compiler/src/kani_middle/attributes.rs:441).
+#   * `-Copt-level=0` for the workspace member — at opt-level >= 1, MIR
+#     inlining absorbs the contract-wrapper closures into the function
+#     body, and kani-compiler panics with `Function '<closure>' is not
+#     declared` during `codegen_modifies_contract` (contract.rs:128).
+#     `cargo kani` never hits this because cargo's dev profile is
+#     opt-level=0; buildRustCrate's release profile is opt-level=3.
 #
 # Caveat: kani-compiler is invoked WITHOUT `--assertion-reach-checks`
 # (see kaniBaseFlags in flake.nix). With reach checks enabled, raw cbmc
@@ -176,15 +212,6 @@ let
           # Hard-fail on harness features this pipeline can't replicate
           # yet. A silent skip would let an unverified contract claim
           # "verified" — strictly worse than no pipeline at all.
-          if [ "$contract" != "null" ]; then
-            echo "ERROR: harness $pretty declares a function contract." >&2
-            echo "  Contract harnesses need an extra goto-instrument pass" >&2
-            echo "  (--apply-loop-contracts / --enforce-contract); see" >&2
-            echo "  kani-driver call_goto_instrument.rs:173. Not yet" >&2
-            echo "  supported in nix/kani.nix — extend the pipeline before" >&2
-            echo "  adding contract harnesses to $MEMBER." >&2
-            exit 1
-          fi
           if [ "$loop_contracts" = "true" ]; then
             echo "ERROR: harness $pretty has loop contracts." >&2
             echo "  Loop-contract harnesses need --apply-loop-contracts and a" >&2
@@ -199,6 +226,23 @@ let
             echo "  call_cbmc.rs::verification_outcome_from_properties); a should_panic" >&2
             echo "  harness that fails to panic would SILENTLY PASS here." >&2
             echo "  Either drop should_panic from the harness or implement the inversion." >&2
+            exit 1
+          fi
+          # Cross-check the harness kind against the contract field. A
+          # proof_for_contract harness MUST have .contract populated — if a
+          # future kani metadata schema change decouples them, the contract
+          # step would silently skip and the harness would vacuously pass.
+          # Hard-fail instead. (Same threat model as the hard-fail this
+          # contract pass replaced — vendored re-implementations must
+          # defend against schema drift kani-driver itself wouldn't see.)
+          # `attributes.kind` is set by a different kani-compiler codepath
+          # than `.contract`, and serializes as a string for unit variants
+          # ("Proof", "Test") or an object for ProofForContract.
+          kind=$(jq -r '.attributes.kind | if type == "object" then keys[0] else . end' <<<"$h")
+          if [ "$kind" = "ProofForContract" ] && [ "$contract" = "null" ]; then
+            echo "ERROR: harness '$pretty' is #[kani::proof_for_contract] (attributes.kind=ProofForContract)" >&2
+            echo "       but kani-metadata.json has no .contract entry. The kani metadata schema may" >&2
+            echo "       have changed; re-derive nix/kani.nix's contract pipeline from kani-driver." >&2
             exit 1
           fi
 
@@ -250,28 +294,60 @@ let
           gb="$scratch/$idx.goto"
           cbmc_log="$scratch/$idx.cbmc.log"
 
-          # The 6-step kani-driver verify pipeline, in order. Each
+          # The 7-step kani-driver verify pipeline, in order. Each
           # goto-instrument call is idempotent (rewrites $gb in place).
-          echo "  1/6 link_goto_binary" >&2
+          # Step 3 only fires for `#[kani::proof_for_contract]` harnesses.
+          echo "  1/7 link_goto_binary" >&2
           goto-cc "$symtab" "$kaniLib" -o "$gb"
 
-          echo "  2/6 specialize_to_proof_harness" >&2
+          echo "  2/7 specialize_to_proof_harness" >&2
           goto-cc "$gb" --function "$mangled" -o "$gb"
 
-          echo "  3/6 add_library" >&2
+          # Contract enforcement: kani-driver's instrument_contracts
+          # (call_goto_instrument.rs:173, called from instrument_model:46).
+          # Runs strictly between specialize and add-library — DFCC needs
+          # the harness as the GOTO entry point (set by --function above)
+          # and rewires it before the C-library models are linked. The
+          # contract itself (pre/postcondition assertions, assigns clause)
+          # is already encoded in the goto program by kani-compiler; this
+          # pass tells CBMC to *enforce* it as the proof obligation
+          # instead of merely *assume* it as a callee summary.
+          if [ "$contract" != "null" ]; then
+            contracted_fn=$(jq -r '.contract.contracted_function_name' <<<"$h")
+            recursion_tracker=$(jq -r '.contract.recursion_tracker'    <<<"$h")
+            recursion_args=()
+            if [ "$recursion_tracker" != "null" ]; then
+              # `#[kani::recursive]` only. CBMC must NOT havoc the REENTRY
+              # static that gates re-entrancy; --nondet-static-exclude
+              # takes "<file>:<pretty path>" (see kani PR #3045 and CBMC
+              # diffblue/cbmc#8225 for why pretty, not mangled).
+              recursion_args=(--nondet-static-exclude "$recursion_tracker")
+            fi
+            echo "  3/7 instrument_contracts (--enforce-contract $contracted_fn)" >&2
+            goto-instrument \
+              --dfcc "$mangled" \
+              --no-malloc-may-fail \
+              --enforce-contract "$contracted_fn" \
+              "''${recursion_args[@]}" \
+              "$gb" "$gb"
+          else
+            echo "  3/7 instrument_contracts (skipped; no contract)" >&2
+          fi
+
+          echo "  4/7 add_library" >&2
           goto-instrument --add-library --no-malloc-may-fail "$gb" "$gb"
 
-          echo "  4/6 undefined_functions" >&2
+          echo "  5/7 undefined_functions" >&2
           goto-instrument \
             --generate-function-body-options assert-false-assume-false \
             --generate-function-body '.*' \
             --drop-unused-functions \
             "$gb" "$gb"
 
-          echo "  5/6 rewrite_back_edges" >&2
+          echo "  6/7 rewrite_back_edges" >&2
           goto-instrument --ensure-one-backedge-per-target "$gb" "$gb"
 
-          echo "  6/6 cbmc" >&2
+          echo "  7/7 cbmc" >&2
           # Capture cbmc output to a file rather than gating on exit
           # code alone: cbmc returns 0=SUCCESSFUL, 10=FAILED, but a
           # crash mid-encode can also exit 0 with no verdict line. We
