@@ -979,17 +979,25 @@ pub const M_060: () = ();
 ///
 /// `exec_id` is UUIDv7 (time-sortable), minted by the scheduler at
 /// `assign_to_worker`. The PK is `exec_id` alone — globally unique by
-/// construction, schema-enforced — with a secondary `(drv_hash, exec_id DESC)`
-/// index for the latest-exec lookup. `drv_hash` is the 32-char `drv_log_hash()`
-/// form of the `.drv` store path, NOT `derivations.drv_hash` (the polymorphic
-/// dedup identity: full path for IA, modular hash for CA — they cannot be
-/// joined directly).
+/// construction, schema-enforced — with two secondary indexes:
+/// `drv_logs_drv_latest (drv_hash, exec_id DESC)` for the latest-exec lookup,
+/// and `drv_logs_started_at (started_at)` for the TTL GC sweep
+/// (`LogFlusher::sweep_expired_logs`). The latter exists because the sweep's
+/// `IN (SELECT … LIMIT N)` subquery cannot short-circuit a seq scan on a
+/// sub-`LIMIT` pass — without it, the empty terminal pass that breaks the GC
+/// loop scans the full heap on every hourly tick. Same pattern as
+/// `idx_build_event_log_created` (003) and `build_samples_completed_at_idx`
+/// (013). `drv_hash` is the 32-char `drv_log_hash()` form of the `.drv` store
+/// path, NOT `derivations.drv_hash` (the polymorphic dedup identity: full path
+/// for IA, modular hash for CA — they cannot be joined directly).
 ///
 /// Adds `assignments.exec_id` (recovery carrier — the new leader reloads it
 /// for active assignments after failover so the flusher keys subsequent
 /// uploads correctly) and `build_derivations.exec_id` (build↔exec
-/// correlation — set by the completion handler on Completed/Failed, NULL for
-/// Cached/never-ran terminals).
+/// correlation — set by the completion handler on terminal paths where an
+/// execution ran: `Completed`, `Poisoned`, and timeout-exhausted `Cancelled`;
+/// `NULL` for `Cached`/`DependencyFailed`/`Skipped`/never-dispatched/
+/// non-terminal — see `sched.merge.exec-correlation+2`).
 ///
 /// Greenfield drop+recreate, no backfill.
 pub const M_061: () = ();

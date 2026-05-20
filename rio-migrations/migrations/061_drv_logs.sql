@@ -23,10 +23,16 @@ CREATE TABLE drv_logs (
 -- ORDER BY exec_id DESC LIMIT 1. UUIDv7 time-sortability means DESC = newest.
 CREATE INDEX drv_logs_drv_latest ON drv_logs (drv_hash, exec_id DESC);
 
+-- TTL sweep: WHERE started_at < $cutoff LIMIT $batch (sweep_expired_logs).
+-- Sub-LIMIT passes (incl. the terminal 0-row pass) seq-scan without it.
+CREATE INDEX drv_logs_started_at ON drv_logs (started_at);
+
 -- Recovery carrier: the new leader reloads exec_id for active assignments
 -- so the flusher keys subsequent uploads correctly after failover.
 ALTER TABLE assignments ADD COLUMN exec_id UUID;
 
--- build_id ↔ exec_id correlation. Set on Completed/Failed; NULL for
--- Cached/DependencyFailed/Cancelled/Skipped/non-terminal.
+-- build_id ↔ exec_id correlation. Set on terminal paths where an execution
+-- ran (Completed, Poisoned, timeout-exhausted Cancelled); NULL for
+-- Cached/DependencyFailed/Skipped/never-dispatched/non-terminal.
+-- Spec: sched.merge.exec-correlation+2.
 ALTER TABLE build_derivations ADD COLUMN exec_id UUID;

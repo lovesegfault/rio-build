@@ -564,8 +564,11 @@ impl LogFlusher {
             // keys directly (rather than parsing the row's `s3_key`,
             // which carries only ONE of `.log.zst` / `.partial.log.zst`
             // depending on whether the final flush ran). No ORDER BY:
-            // any 1000 expired rows are equally good to delete, and
-            // skipping the sort lets PG short-circuit the seq scan.
+            // any 1000 expired rows are equally good to delete. The
+            // inner SELECT rides the `drv_logs_started_at` index so a
+            // sub-LIMIT pass (including the 0-row terminal pass that
+            // breaks the loop) stops at the first non-expired index
+            // entry instead of seq-scanning the heap.
             let expired: Vec<(Uuid, String)> = match sqlx::query_as(
                 "DELETE FROM drv_logs
                  WHERE exec_id IN (
@@ -1567,6 +1570,20 @@ mod tests {
     #[tokio::test]
     async fn gc_sweep_deletes_expired_logs_and_keeps_recent() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
+        // Migration 061 must carry the started_at index — without it the
+        // sweep's sub-LIMIT terminal pass seq-scans the full heap every
+        // tick. See M_061 commentary; same pattern as
+        // build_samples_completed_at_idx in db/tests/history.rs.
+        let (idx_exists,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM pg_indexes \
+             WHERE tablename = 'drv_logs' AND indexname = 'drv_logs_started_at')",
+        )
+        .fetch_one(&db.pool)
+        .await?;
+        assert!(
+            idx_exists,
+            "drv_logs_started_at index missing — GC sweep degrades to seq scan"
+        );
         let (s3, _puts, deletes) = mock_s3_capturing();
         let buffers = Arc::new(LogBuffers::new());
         let flusher = LogFlusher::new(
