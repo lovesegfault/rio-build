@@ -143,6 +143,89 @@ ClockSkewBound ==
 AtMostOneCASWinner == ~casRace
 
 \* -----------------------------------------------------------------------
+\* The soft half of sched.lease.at-most-one-leader+2. Two nodes
+\* simultaneously believing they lead IS reachable (the dual-belief
+\* window: a deposed leader that hasn't yet noticed). The property is
+\* that the window is BOUNDED to one loop iteration. That claim splits
+\* into an assumption and a theorem:
+\*
+\*   ASSUMPTION (LoopInterval, enforced by Tick's precondition): the
+\*   loop runs every Renew ticks, so a Leading node takes its next
+\*   GET / PUT / maybe_self_fence within Renew ticks of any state.
+\*
+\*   THEOREM (BoundedDualLeadership): in every dual-belief state, the
+\*   stale believer's next loop iteration DISCOVERS the loss -- one of
+\*   its three discovery paths is already armed. The window is therefore
+\*   <= one loop iteration. The paths:
+\*     (1) Self-fence: clocks[stale] - fence[stale] > Ttl - 2*MaxSkew.
+\*         The thief measured > Ttl of staleness on ITS clock before
+\*         stealing; the victim's own fence age is within 2*MaxSkew of
+\*         that, so the victim is at (or within 2*MaxSkew ticks of) its
+\*         own self-fence deadline. The 2*MaxSkew correction is the
+\*         price of per-node clocks -- with a shared clock the bound is
+\*         exactly Ttl. With MaxSkew >= Ttl/2 the disjunct is vacuous
+\*         (clocks - fence >= 0 always) and the protocol gives no fence
+\*         guarantee -- the steal threshold and the fence threshold are
+\*         only coupled when skew is small relative to Ttl.
+\*     (2) 409: snap[stale].rv /= lease.rv -- the snapshot in hand is
+\*         stale, the next PUT gets 409 Conflict, the loop flips to
+\*         Following (the lose transition).
+\*     (3) Observation: snap[stale].holder /= stale -- the snapshot
+\*         already shows the new holder; the next decide() returns
+\*         Standby and the loop flips to Following.
+\*   Path (1) covers the partitioned victim (no successful round-trips,
+\*   fence aging). Paths (2)/(3) cover the connected victim (its GETs
+\*   keep refreshing fence, but every refresh hands it a snapshot that
+\*   exposes the loss). A deposed believer with a fresh fence and NO
+\*   snapshot is unreachable: the only fence-refreshing actions either
+\*   produce a snapshot (Get) or require holding the lease (RenewLease).
+\*
+\* Why a state invariant and not the temporal [](Dual => <>~Dual) with
+\* WF on SelfFence: the temporal form is unsound under a bounded,
+\* fairness-free clock. TLC finds a stuttering counterexample in which
+\* the stale believer's clock simply stops one tick short of its fence
+\* deadline -- SelfFence is never *enabled*, so weak fairness never
+\* forces it. Adding WF on Tick does not fix this: Tick is disabled at
+\* the MaxTime ceiling, so a Dual window that opens within Ttl of the
+\* ceiling can never accumulate enough ticks to reach the deadline.
+\* "Eventually" is the wrong claim for a bounded model; "the discovery
+\* path is already armed" is the right claim, and it is stronger.
+\*
+\* Deliberately-weakened test (run once during development, NOT in CI):
+\* weakening Steal's staleness guard from `> Ttl` to `>= 0` (steal on
+\* first observation) produces a counterexample at depth 5: n1 acquires,
+\* n2 observes and steals immediately, n1 is deposed with a fresh fence
+\* (clocks - fence = 0) and no snapshot -- no discovery path is armed.
+\* The invariant is what couples the steal threshold to the fence
+\* threshold: a thief may only steal a lease whose holder is already at
+\* (or within 2*MaxSkew of) its own self-fence deadline.
+\* -----------------------------------------------------------------------
+Dual == \E m, n \in Nodes : m /= n /\ state[m] = "Leading" /\ state[n] = "Leading"
+
+\* The production loop's tick discipline, stated as a predicate over
+\* states: a Leading node is never more than Ttl + Renew past its last
+\* successful round-trip, because run_lease_loop() checks
+\* maybe_self_fence() every RENEW_INTERVAL and cannot skip the check.
+\* This is ENFORCED by Tick(n)'s precondition (see the comment there for
+\* why a precondition and not a state CONSTRAINT); it is listed as an
+\* INVARIANT in the .cfg purely as a tripwire -- if a future edit to
+\* Tick(n) drops the precondition, LoopInterval fails loudly instead of
+\* BoundedDualLeadership failing confusingly one tick past the bound.
+LoopInterval ==
+  \A n \in Nodes :
+    (alive[n] /\ state[n] = "Leading") => clocks[n] - fence[n] <= Ttl + Renew
+
+BoundedDualLeadership ==
+  \A m, n \in Nodes :
+    (state[m] = "Leading" /\ state[n] = "Leading" /\ m /= n) =>
+      /\ lease.holder \in {m, n}
+      /\ LET stale == IF lease.holder = m THEN n ELSE m
+         IN \/ clocks[stale] - fence[stale] > Ttl - 2 * MaxSkew
+            \/ /\ snap[stale] /= NULL
+               /\ \/ snap[stale].rv /= lease.rv
+                  \/ snap[stale].holder /= stale
+
+\* -----------------------------------------------------------------------
 \* Initial state. gen[n] = 1 mirrors the production `AtomicU64::new(1)`
 \* (rio-scheduler/src/main.rs:142, rio-controller/src/main.rs:313). genHW = 0
 \* is an empty PG. lease.gen = 0 is `lease_transitions` before any holder.
@@ -161,13 +244,26 @@ Init ==
   /\ casRace = FALSE
 
 \* -----------------------------------------------------------------------
-\* Time. clocks[n] advances independently. Always enabled -- CLOCK_MONOTONIC
-\* ticks regardless of process state (alive or not). Bounded skew is a state
-\* CONSTRAINT, not a Tick precondition: it bounds how far one node's clock
-\* can lag another's, not when Tick fires.
+\* Time. clocks[n] advances independently. Ticks regardless of process
+\* state (alive or not) -- CLOCK_MONOTONIC does not stop for a dead pod.
+\* Bounded skew is a state CONSTRAINT, not a Tick precondition: it bounds
+\* how far one node's clock can lag another's, not when Tick fires.
+\*
+\* The second conjunct encodes the production loop's tick discipline (the
+\* LoopInterval assumption): run_lease_loop() calls maybe_self_fence()
+\* every RENEW_INTERVAL, so a Leading node's clock cannot advance more
+\* than Ttl + Renew past its last successful round-trip -- the loop would
+\* have fenced it first. Encoding this as a Tick precondition (the state
+\* is never generated) rather than a state CONSTRAINT (the state is
+\* generated, checked against invariants, and only then discarded) keeps
+\* the production-unreachable states out of invariant checking: TLC
+\* checks invariants on constraint-violating states before pruning them,
+\* which would fail BoundedDualLeadership one tick past the bound.
 \* -----------------------------------------------------------------------
 Tick(n) ==
   /\ clocks[n] < MaxTime
+  /\ (alive[n] /\ state[n] = "Leading") =>
+       (clocks[n] + 1) - fence[n] <= Ttl + Renew
   /\ clocks' = [clocks EXCEPT ![n] = @ + 1]
   /\ UNCHANGED <<lease, alive, state, snap, obs, fence, gen, genHW, acquiredAt, casRace>>
 
