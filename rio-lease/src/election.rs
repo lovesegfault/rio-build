@@ -89,6 +89,99 @@ pub struct Observed {
     at: Instant,
 }
 
+/// Projection of `(holder, our_id)` for the pure decision predicate.
+/// `decide()` computes this from production data; `decide_pure()` and
+/// the Kani harness operate on it directly. Collapsing the string
+/// comparison into a small enum keeps `decide_pure()` CBMC-tractable —
+/// CBMC can't symbolically execute over `&str` arguments.
+///
+/// The variants map onto `decide()`'s case structure and the TLA+
+/// model's action partition (`docs/spec/models/LeaderElection.tla`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
+pub(crate) enum HolderKind {
+    /// `holder` is `None` or `Some("")` — graceful step-down. Steal now.
+    /// TLA+: a node with `snap[n].holder = NULL` takes `Steal(n)`.
+    Empty,
+    /// `holder == our_id` — we hold it. Renew.
+    /// TLA+: a node with `snap[n].holder = n` takes `Renew(n)`.
+    Us,
+    /// `holder` is a non-empty string that isn't us. Standby or steal
+    /// based on the observed-record clock.
+    /// TLA+: a node with `snap[n].holder /= n /\ snap[n].holder /= NULL`
+    /// takes `Discard(n)` (spike scope: standby) or, in Phase-1, `Steal(n)`
+    /// when the observed-record clock expires.
+    Other,
+}
+
+/// What `decide()` should do to its `observed` state after this tick.
+/// Returned by `decide_pure()` so the side-effect can live in `decide()`
+/// (which has `Instant` and `String`) while the decision logic stays in
+/// `decide_pure()` (which doesn't, and is therefore Kani-verifiable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObservedUpdate {
+    /// Don't touch `observed` — the lease state didn't change in a way
+    /// that resets the staleness clock.
+    Keep,
+    /// Clear `observed` — there's no holder to observe.
+    Clear,
+    /// Reset the clock — the lease's resourceVersion changed (someone
+    /// wrote) so the holder is alive. Re-observe at the new rv.
+    StartObserving,
+}
+
+/// Pure decision predicate. No I/O, no `Instant`, no `String` — every
+/// argument and return type is CBMC-tractable. `decide()` projects
+/// production data into these types, calls this, and applies the
+/// returned `ObservedUpdate`.
+///
+/// The case structure here is the formal contract: it parallels the
+/// `Decide(n)` action partition in `docs/spec/models/LeaderElection.tla`
+/// (`{Get, Steal, Renew, Observe, Discard}`). When either changes,
+/// update the other.
+///
+/// `matched_observation_age_ms` collapses two production cases into
+/// one: it's `Some(age)` only when there IS an observation AND its rv
+/// matches the current lease rv. `None` covers both "no observation"
+/// and "rv changed" — both reset the clock (`StartObserving`).
+// r[impl sched.lease.k8s-lease]
+pub(crate) fn decide_pure(
+    holder: HolderKind,
+    matched_observation_age_ms: Option<u64>,
+    ttl_ms: u64,
+) -> (Decision, ObservedUpdate) {
+    match holder {
+        // Empty holder: previous leader stepped down gracefully (set
+        // holder_identity: None). No one to wait for — steal now.
+        HolderKind::Empty => (Decision::Steal, ObservedUpdate::Clear),
+
+        // We hold it. Renew. Don't touch `observed` — it tracks OTHER
+        // holders' activity, not ours. If we restart with the same
+        // holder_id, this branch still applies; the rv guard on
+        // replace() catches any staleness.
+        HolderKind::Us => (Decision::Renew, ObservedUpdate::Keep),
+
+        // Someone else holds it. Check the observed-record clock.
+        HolderKind::Other => match matched_observation_age_ms {
+            // Same rv we saw before — nobody has written since. It's
+            // been > ttl since we FIRST saw it (not since the lease's
+            // renewTime — we never read that value, only watch rv for
+            // change). The holder is dead. Steal.
+            Some(age_ms) if age_ms > ttl_ms => (Decision::Steal, ObservedUpdate::Keep),
+
+            // Same rv, but not yet stale. Wait.
+            Some(_) => (Decision::Standby, ObservedUpdate::Keep),
+
+            // New rv (first observation, or the leader renewed since
+            // our last look). Reset the clock. This is also the
+            // "first-tick penalty": even if the lease is actually
+            // stale, we can't know without a prior observation, so we
+            // wait one full ttl.
+            None => (Decision::Standby, ObservedUpdate::StartObserving),
+        },
+    }
+}
+
 /// Pure decision function. No I/O, no clock reads — `now` is
 /// injected. Separated for table testing.
 ///
@@ -100,6 +193,11 @@ pub struct Observed {
 /// than as `&Lease` because the caller already has both and we
 /// don't want decide() coupled to the full k8s type (simpler
 /// table tests).
+///
+/// The decision logic itself lives in `decide_pure()` (crate-private,
+/// Kani-verified); this function projects production data (`&str`,
+/// `Instant`) into the CBMC-tractable types `decide_pure()` takes,
+/// delegates, and applies the returned `ObservedUpdate`.
 pub fn decide(
     holder: Option<&str>,
     resource_version: &str,
@@ -108,49 +206,39 @@ pub fn decide(
     ttl: Duration,
     now: Instant,
 ) -> Decision {
-    let holder = holder.unwrap_or("");
+    // ── Project production data → predicate inputs ──────────────────
+    // The projection is the only place `Instant` and `String` appear.
+    // `decide_pure()` is the verified core; this is the I/O-shaped shim.
+    let holder_kind = match holder {
+        None => HolderKind::Empty,
+        Some("") => HolderKind::Empty,
+        Some(s) if s == our_id => HolderKind::Us,
+        Some(_) => HolderKind::Other,
+    };
+    // `Some(age)` iff there's an observation whose rv matches the
+    // current lease rv. Collapses "no observation" and "rv changed" —
+    // both go to `StartObserving` in decide_pure().
+    let matched_observation_age_ms = observed
+        .as_ref()
+        .filter(|o| o.resource_version == resource_version)
+        .map(|o| now.duration_since(o.at).as_millis() as u64);
+    let ttl_ms = ttl.as_millis() as u64;
 
-    // Empty holder: previous leader stepped down gracefully (set
-    // holder_identity: None). No one to wait for — steal now.
-    if holder.is_empty() {
-        *observed = None;
-        return Decision::Steal;
-    }
+    let (decision, update) = decide_pure(holder_kind, matched_observation_age_ms, ttl_ms);
 
-    // We hold it. Renew. Don't touch `observed` — it tracks OTHER
-    // holders' activity, not ours. If we restart with the same
-    // holder_id, this branch still applies; the rv guard on
-    // replace() catches any staleness.
-    if holder == our_id {
-        return Decision::Renew;
-    }
-
-    // Someone else holds it. Check the observed-record clock.
-    match observed {
-        Some(obs) if obs.resource_version == resource_version => {
-            // Same rv we saw before — nobody has written since.
-            // Has it been ttl since we FIRST saw it? (Not since
-            // the lease's renewTime — we never read that value,
-            // only watch rv for change.)
-            if now.duration_since(obs.at) > ttl {
-                Decision::Steal
-            } else {
-                Decision::Standby
-            }
-        }
-        _ => {
-            // New rv (first observation, or the leader renewed
-            // since our last look). Reset the clock. This is
-            // also the "first-tick penalty": even if the lease
-            // is actually stale, we can't know without a prior
-            // observation, so we wait one full ttl.
+    // ── Apply the observed-record update ────────────────────────────
+    match update {
+        ObservedUpdate::Keep => {}
+        ObservedUpdate::Clear => *observed = None,
+        ObservedUpdate::StartObserving => {
             *observed = Some(Observed {
                 resource_version: resource_version.to_string(),
                 at: now,
             });
-            Decision::Standby
         }
     }
+
+    decision
 }
 
 pub struct LeaderElection {

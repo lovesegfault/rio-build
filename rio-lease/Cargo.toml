@@ -13,6 +13,13 @@ description = "Kubernetes Lease-based leader election for rio-build components"
 # wiring (ActorCommand::LeaderAcquired/Lost, rio_scheduler_* metrics)
 # stays in rio-scheduler via the `LeaseHooks` callback trait.
 
+[lints.rust]
+# `cfg(kani)` is set by kani-compiler (nix `crateBuildKani` passes
+# `--cfg=kani --check-cfg=cfg(kani)`); register it here so the regular
+# cargo build doesn't warn `unexpected_cfgs` on the
+# `#[cfg_attr(kani, derive(kani::Arbitrary))]` in election.rs.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
 [dependencies]
 # coordination.k8s.io/v1 Lease + Pod (deletion-cost annotation patch).
 kube = { workspace = true }
