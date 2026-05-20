@@ -406,11 +406,12 @@ impl DagActor {
             return;
         };
         // r[impl sched.log.phase-binding]
-        // Status precondition: `assigned_executor` is NOT cleared at
-        // terminal transitions (only re-dispatch paths clear it), so a
-        // bare executor match would accept a late phase from the
-        // just-finished executor for ~60s until `CleanupTerminalBuild`
-        // reaps the DAG node. Rationale in spec (`sched.log.phase-binding`).
+        // Status precondition: `transition()` never clears
+        // `assigned_executor`, and the worker-completion terminal handlers
+        // leave it set, so a bare executor match would accept a late phase
+        // from the just-finished executor for ~60s until
+        // `CleanupTerminalBuild` reaps the DAG node. Rationale in spec
+        // (`sched.log.phase-binding`).
         let Some(node) = self.dag.node(&hash) else {
             // hash_for_path() and dag.node() are kept in lockstep —
             // unreachable, but fail closed (consistent with the

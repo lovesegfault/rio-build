@@ -191,9 +191,10 @@ bypass the actor's bounded mpsc), phase updates have no recv-task side effect
 therefore runs in the actor against `(status, assigned_executor)`: the same
 `Assigned|Running` precondition + executor comparison as the
 #rref("sched.completion.idempotent") stale-report guard. The status
-precondition is load-bearing: terminal transitions do not clear
-`assigned_executor` (only re-dispatch paths like `reset_to_ready` do), so for
-the ~60s window before `CleanupTerminalBuild` reaps the DAG node a bare
+precondition is load-bearing: `transition()` never touches
+`assigned_executor`, and the worker-completion terminal handlers
+(`handle_success_completion`, `terminal_failure_epilogue`) leave it set, so
+for the ~60s window before `CleanupTerminalBuild` reaps the DAG node a bare
 executor comparison would accept a late phase from the just-finished
 executor. Unlike the completion guard, this one also fails closed on
 `assigned_executor = None`: a phase for a derivation with no active

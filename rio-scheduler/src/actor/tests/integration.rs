@@ -588,15 +588,17 @@ async fn test_forward_phase_rejects_unassigned_executor() -> TestResult {
 
 // r[verify sched.log.phase-binding]
 /// `ForwardPhase` from the *same* executor for a drv that has reached a
-/// terminal state MUST be dropped. `transition(Completed)` does not
-/// clear `state.assigned_executor` — only re-dispatch paths
-/// (`reset_to_ready`, transient retry, user-cancel, orphan adoption)
-/// do — so the field stays stamped for ~60s until `CleanupTerminalBuild`
-/// reaps the DAG node. Without the `Assigned|Running` status
-/// precondition, the executor-match gate would still pass for the
-/// just-finished executor in that window. Companion to
-/// `test_forward_phase_rejects_unassigned_executor`, which covers the
-/// cross-executor case.
+/// terminal state MUST be dropped. The worker-completion terminals
+/// (`handle_success_completion` → `Completed`, `terminal_failure_epilogue`
+/// → `Poisoned`/timeout-`Cancelled`) do not clear `state.assigned_executor`
+/// — re-dispatch paths (`reset_to_ready`, transient retry), user-cancel's
+/// in-flight `Assigned|Running` arm (`cancel_build_derivations`), and
+/// orphan adoption (`adopt_orphan_completion`) do — so the field stays
+/// stamped for ~60s until `CleanupTerminalBuild` reaps the DAG node.
+/// Without the `Assigned|Running` status precondition, the executor-match
+/// gate would still pass for the just-finished executor in that window.
+/// Companion to `test_forward_phase_rejects_unassigned_executor`, which
+/// covers the cross-executor case.
 ///
 /// Structural assertion via metric: a positive `not_active` increment
 /// proves the precondition fired (rather than waiting for the absence
