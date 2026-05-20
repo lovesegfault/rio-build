@@ -35,13 +35,28 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
 use k8s_openapi::jiff;
 use kube::api::{Api, ObjectMeta, PostParams};
 use rio_crds::KubeErrorExt;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Result of one `try_acquire_or_renew()` call.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ElectionResult {
     /// We hold the lease (acquired or renewed this tick).
-    Leading,
+    ///
+    /// `transitions` is the lease's `leaseTransitions` count as of the
+    /// write that produced this result: 0 from `create()` (the lease was
+    /// born with us as holder — zero holder *changes* have happened),
+    /// `old + 1` from a steal (the rv-guarded PUT bumped it atomically
+    /// with the holder change), unchanged from a renew. The caller
+    /// derives the leadership generation from it
+    /// ([`LeaderState::on_acquire`](crate::LeaderState::on_acquire)) —
+    /// because the apiserver's CAS admits exactly one writer per
+    /// resourceVersion, two replicas that both believe they lead can
+    /// never have acquired at the same transition count.
+    Leading {
+        /// `LeaseSpec.lease_transitions` as written by the PUT/POST that
+        /// made us leader.
+        transitions: u64,
+    },
     /// Someone else holds it and our observed-record clock hasn't
     /// elapsed yet. Steady state for a standby — no log.
     Standby,
@@ -414,7 +429,10 @@ impl LeaderElection {
         match self.api.create(&PostParams::default(), &lease).await {
             Ok(_) => {
                 debug!(lease = %self.lease_name, "created lease");
-                Ok(ElectionResult::Leading)
+                // We created the lease with `lease_transitions: 0` — the
+                // lease was born with us as holder, no transition has
+                // happened yet.
+                Ok(ElectionResult::Leading { transitions: 0 })
             }
             Err(e) if e.is_conflict() => Ok(ElectionResult::Conflict),
             Err(e) => Err(e),
@@ -453,6 +471,25 @@ impl LeaderElection {
             spec.acquire_time = Some(now);
             spec.lease_transitions = Some(spec.lease_transitions.unwrap_or(0) + 1);
         }
+        // The transition count this PUT writes — post-bump on a steal,
+        // unchanged on a renew. Captured before `spec` moves into `lease`.
+        // `leaseTransitions` is i32 in the k8s API; a negative value (a
+        // hand-edited or corrupt Lease object) clamps to 0 rather than
+        // wrapping to a huge generation. Loud: nothing in this crate ever
+        // writes a negative count, so seeing one means someone edited the
+        // Lease by hand and the generation is about to restart from the
+        // floor (the PG high-water seed is the backstop).
+        let raw_transitions = spec.lease_transitions.unwrap_or(0);
+        let transitions = u64::try_from(raw_transitions).unwrap_or_else(|_| {
+            warn!(
+                lease = %self.lease_name,
+                lease_transitions = raw_transitions,
+                "negative leaseTransitions on the Lease object (hand-edited?); \
+                 clamping to 0 — the generation restarts from the floor and the \
+                 PG high-water seed becomes the only collision defense"
+            );
+            0
+        });
         lease.spec = Some(spec);
 
         match self
@@ -464,7 +501,7 @@ impl LeaderElection {
                 if steal {
                     self.observed = None;
                 }
-                Ok(ElectionResult::Leading)
+                Ok(ElectionResult::Leading { transitions })
             }
             Err(e) if e.is_conflict() => {
                 debug!(lease = %self.lease_name, steal, "replace 409 (raced)");
@@ -683,6 +720,8 @@ mod tests {
 
     /// GET 404 → POST (create). The old crate's first-run path.
     /// POST 200 → Leading immediately (we created it, we own it).
+    /// The created lease has `leaseTransitions: 0` — the creator is
+    /// transition zero, so its generation is the floor (1).
     #[tokio::test]
     async fn create_on_404() {
         let (client, verifier) = ApiServerVerifier::new();
@@ -694,7 +733,56 @@ mod tests {
         let mut election =
             LeaderElection::new(client, "default", "rio-sched".into(), "us".into(), TTL);
         let result = election.try_acquire_or_renew().await.expect("not Err");
-        assert_eq!(result, ElectionResult::Leading);
+        assert_eq!(result, ElectionResult::Leading { transitions: 0 });
+
+        guard.verified().await;
+    }
+
+    /// A successful steal carries the POST-bump transition count. The
+    /// generation the caller derives from it is therefore distinct from
+    /// the deposed holder's even if that holder never wrote anything to
+    /// PG — the apiserver bumped `leaseTransitions` atomically with the
+    /// holder change inside the rv-guarded PUT. This is the production
+    /// half of the fix for the StaleLeaderHasStaleGeneration
+    /// counterexample in `docs/spec/models/LeaderElection.tla`.
+    // r[verify sched.lease.generation-fence]
+    #[tokio::test]
+    async fn successful_steal_carries_bumped_transitions() {
+        let (client, verifier) = ApiServerVerifier::new();
+        let guard = verifier.run(vec![
+            // GET: dead-leader holds it at transitions=2.
+            Scenario::ok(
+                http::Method::GET,
+                "/leases/rio-sched",
+                lease_json("dead-leader", 2, "100"),
+            ),
+            // PUT succeeds: we are now the holder at transitions=3.
+            Scenario::ok(
+                http::Method::PUT,
+                "/leases/rio-sched",
+                lease_json("us", 3, "101"),
+            ),
+        ]);
+
+        let mut election =
+            LeaderElection::new(client, "default", "rio-sched".into(), "us".into(), TTL);
+        // Pre-seed observed so decide() chooses Steal (stale).
+        let stale = Instant::now() - Duration::from_secs(20);
+        election.observed = Some(Observed {
+            resource_version: "100".into(),
+            at: stale,
+        });
+
+        let result = election.try_acquire_or_renew().await.expect("not Err");
+        assert_eq!(
+            result,
+            ElectionResult::Leading { transitions: 3 },
+            "steal of a transitions=2 lease yields transitions=3"
+        );
+        assert_eq!(
+            election.observed, None,
+            "successful steal clears the observed record"
+        );
 
         guard.verified().await;
     }

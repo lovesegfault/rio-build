@@ -1,12 +1,12 @@
 //! Kubernetes Lease-based leader election.
 //!
 //! When `lease_name` is configured, a background task acquires and
-//! renews a `coordination.k8s.io/v1` Lease. On acquire, it
-//! increments the generation counter (workers see the new gen in
+//! renews a `coordination.k8s.io/v1` Lease. On acquire, it derives
+//! the generation from the lease's transition count (workers see the
 // r[impl sched.lease.k8s-lease]
 // r[impl sched.lease.generation-fence]
-//! heartbeat, reject stale-gen assignments from the old leader)
-//! and sets `is_leader=true` (dispatch_ready checks this).
+//! new gen in heartbeat, reject stale-gen assignments from the old
+//! leader) and sets `is_leader=true` (dispatch_ready checks this).
 //!
 //! When NOT set (VM tests, single-scheduler deployments): no kube
 //! dependency at runtime, `is_leader` defaults to `true`,
@@ -68,7 +68,7 @@ pub use election::{Decision, ElectionResult, LeaderElection, Observed, decide};
 /// consumer names them per the `rio_{component}_` convention.
 pub trait LeaseHooks: Clone + Send + 'static {
     /// Called once per standby→leader transition, AFTER
-    /// [`LeaderState::on_acquire`] has incremented generation and set
+    /// [`LeaderState::on_acquire`] has written the generation and set
     /// `is_leader=true`.
     fn on_acquire(&self);
     /// Called once per leader→standby transition (explicit lose OR local
@@ -199,8 +199,8 @@ impl LeaseConfig {
 /// the health-toggle polling loop.
 #[derive(Clone)]
 pub struct LeaderState {
-    /// Generation counter. Incremented on each acquisition via
-    /// [`on_acquire`](Self::on_acquire). Same Arc as
+    /// Generation counter. Derived from the Lease's transition count on
+    /// each acquisition via [`on_acquire`](Self::on_acquire). Same Arc as
     /// DagActor.generation (see `generation_arc()` — this IS that
     /// Arc, cloned).
     generation: Arc<AtomicU64>,
@@ -258,7 +258,7 @@ impl LeaderState {
     }
 
     /// Current generation. `Acquire` load — pairs with the `SeqCst`
-    /// `fetch_add` in [`on_acquire`](Self::on_acquire) so a reader
+    /// `fetch_max` in [`on_acquire`](Self::on_acquire) so a reader
     /// observing the new generation also sees all prior stores.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
@@ -357,16 +357,52 @@ impl LeaderState {
         }
     }
 
-    /// Acquire transition: increment generation, set is_leader=true.
-    /// Returns the new generation.
+    /// Acquire transition: derive the generation from the lease's
+    /// transition count, set is_leader=true. Returns the new generation.
     ///
-    /// SeqCst on both stores: the generation increment happens-
-    /// before the is_leader write in the total order. A reader
-    /// seeing is_leader=true (SeqCst load) sees the new generation.
-    /// recovery_complete is NOT set here — that's the actor's job
-    /// after recover_from_pg finishes.
-    pub fn on_acquire(&self) -> u64 {
-        let new_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    /// The generation IS `lease_transitions + 1`. `leaseTransitions`
+    /// counts holder *changes* — the lease's creator is transition 0, the
+    /// first thief is 1 — and the rv-guarded PUT bumps it atomically with
+    /// the holder change, so two replicas that both believe they lead can
+    /// never have acquired at the same count. The `+ 1` maps the creator
+    /// onto the generation floor of 1 (the `AtomicU64::new(1)` init and
+    /// the non-K8s `always_leader` value): creator → 1, first thief → 2.
+    /// Without it the creator (`fetch_max(0)` → stays 1) and the first
+    /// thief (`fetch_max(1)` → stays 1) would collide at the floor.
+    ///
+    /// `fetch_max`, not a store or an increment: the recovery path's
+    /// [`seed_generation_from`](Self::seed_generation_from) may already
+    /// have raised the generation past `transitions + 1` after a
+    /// `kubectl delete lease` reset the transition count while PG's
+    /// high-water persisted. A local increment is what produced the
+    /// generation collision `StaleLeaderHasStaleGeneration` falsifies in
+    /// `docs/spec/models/LeaderElection.tla` — a leader deposed before
+    /// persisting its generation to PG left the high-water stale and its
+    /// successor seeded from the same value.
+    ///
+    /// A consequence of deriving from the holder-change count: a replica
+    /// that self-fences on a connectivity blip and then successfully
+    /// renews (nobody stole in between) re-acquires at the SAME
+    /// generation. That is the correct epoch semantics — its in-flight
+    /// assignments are still its own; bumping would spuriously invalidate
+    /// them. If somebody DID steal during the blind window, the re-acquire
+    /// is itself a steal (transitions bumps) or a 409 (we observe the new
+    /// holder first) — either way the holder change is what increments
+    /// the epoch.
+    ///
+    /// SeqCst on both stores: the generation write happens-before the
+    /// is_leader write in the total order. A reader seeing is_leader=true
+    /// (SeqCst load) sees the new generation. recovery_complete is NOT
+    /// set here — that's the actor's job after recover_from_pg finishes.
+    // r[impl sched.lease.generation-fence]
+    pub fn on_acquire(&self, lease_transitions: u64) -> u64 {
+        let target = lease_transitions.saturating_add(1);
+        // fetch_max returns the PREVIOUS value; the new value is the max
+        // of the two.
+        let new_gen = self
+            .generation
+            .fetch_max(target, Ordering::SeqCst)
+            .max(target);
         self.is_leader.store(true, Ordering::SeqCst);
         // AFTER is_leader=true: a reader seeing `leader_for().is_some()`
         // also sees is_leader=true (RwLock acquire/release pairs with
@@ -380,7 +416,9 @@ impl LeaderState {
     /// SeqCst on both stores: is_leader=false happens-before
     /// recovery_complete=false in the total order. A reader seeing
     /// recovery_complete=false (SeqCst) also sees is_leader=false.
-    /// Generation is NOT touched — the NEW leader increments it.
+    /// Generation is NOT touched — the NEW leader derives its own
+    /// from the lease's transition count on acquire; we don't know
+    /// (and don't need to know) what that will be.
     pub fn on_lose(&self) {
         self.is_leader.store(false, Ordering::SeqCst);
         self.recovery_complete.store(false, Ordering::SeqCst);
@@ -394,9 +432,9 @@ impl LeaderState {
 /// - `try_acquire_or_renew`: creates the Lease if it doesn't
 ///   exist, or updates `renewTime` if we hold it, or returns
 ///   "not leading" if someone else holds it.
-/// - On acquire transition (was standby, now leading): increment
-///   generation, flip `is_leader`, fire-and-forget
-///   `LeaderAcquired` to the actor. The actor's
+/// - On acquire transition (was standby, now leading): derive the
+///   generation from the lease's transition count, flip `is_leader`,
+///   fire-and-forget `LeaderAcquired` to the actor. The actor's
 ///   `handle_leader_acquired` runs recovery then sets
 ///   `recovery_complete=true`. CRITICAL: this loop does NOT
 ///   block on recovery — it keeps renewing the lease every 5s
@@ -404,8 +442,9 @@ impl LeaderState {
 ///   lease expire → another replica acquires → dual-leader.
 /// - On lose transition (was leading, now not): flip `is_leader`,
 ///   clear `recovery_complete` (re-acquire re-triggers recovery).
-///   DON'T increment generation — the NEW leader does that on
-///   THEIR acquire. We don't know the new gen.
+///   DON'T touch the generation — the NEW leader's steal bumps the
+///   lease's transition count, which is where generations come from.
+///   We don't know the new gen.
 ///
 /// On K8s API error (apiserver restarting, network blip): log
 /// warn and retry next tick. Don't crash — a transient API hiccup
@@ -489,7 +528,15 @@ pub async fn run_lease_loop<H: LeaseHooks>(
                 // standby raced us → we were never leading. Both
                 // map to now_leading=false; was_leading edge-
                 // detection below distinguishes the lose case.
-                let now_leading = matches!(result, ElectionResult::Leading);
+                //
+                // Leading carries the lease's transition count so the
+                // acquire arm can derive the generation from it;
+                // None ⇔ not leading.
+                let leading_transitions = match result {
+                    ElectionResult::Leading { transitions } => Some(transitions),
+                    ElectionResult::Standby | ElectionResult::Conflict => None,
+                };
+                let now_leading = leading_transitions.is_some();
 
                 // r[impl sched.lease.deletion-cost]
                 // Deferred deletion-cost clear: if we self-fenced
@@ -511,91 +558,105 @@ pub async fn run_lease_loop<H: LeaseHooks>(
                     );
                 }
 
-                if now_leading && !was_leading {
-                    // ---- Acquire transition ----
-                    // on_acquire: increment generation FIRST, then
-                    // set is_leader, both SeqCst. A reader seeing
-                    // is_leader=true also sees the new generation.
-                    // The other order would let dispatch run with
-                    // is_leader=true but OLD generation for one
-                    // pass — harmless (workers compare heartbeat
-                    // gen, not assignment gen, for staleness) but
-                    // conceptually wrong.
-                    let new_gen = state.on_acquire();
-                    info!(
-                        generation = new_gen,
-                        holder = %cfg.holder_id,
-                        "acquired leadership"
-                    );
+                // Edge detection on (leading?, was_leading). Binding
+                // the transition count in the acquire pattern makes
+                // "acquired without a transition count to derive the
+                // generation from" unrepresentable — the arm cannot
+                // execute without a value to hand to on_acquire.
+                match (leading_transitions, was_leading) {
+                    (Some(transitions), false) => {
+                        // ---- Acquire transition ----
+                        // on_acquire: write the generation FIRST, then
+                        // set is_leader, both SeqCst. A reader seeing
+                        // is_leader=true also sees the new generation.
+                        // The other order would let dispatch run with
+                        // is_leader=true but OLD generation for one
+                        // pass — harmless (workers compare heartbeat
+                        // gen, not assignment gen, for staleness) but
+                        // conceptually wrong.
+                        //
+                        // The generation derives from the lease's
+                        // transition count (see on_acquire's doc).
+                        let new_gen = state.on_acquire(transitions);
+                        info!(
+                            generation = new_gen,
+                            holder = %cfg.holder_id,
+                            "acquired leadership"
+                        );
 
-                    // r[impl sched.lease.deletion-cost]
-                    // Annotate our own Pod with pod-deletion-cost=1.
-                    // K8s's ReplicaSet controller sorts by this when
-                    // picking which pod to kill during scale-down
-                    // (incl. RollingUpdate). Leader gets the higher
-                    // cost → k8s kills the standby first → no
-                    // leadership churn on rollout. Fire-and-forget:
-                    // the lease loop MUST NOT block (see below).
-                    // Patch failure is non-fatal — without the
-                    // annotation, k8s picks arbitrarily (rollout
-                    // still works, just with possible double-churn).
-                    spawn_patch_deletion_cost(
-                        pod_patch_client.clone(),
-                        cfg.namespace.clone(),
-                        cfg.holder_id.clone(),
-                        1,
-                    );
+                        // r[impl sched.lease.deletion-cost]
+                        // Annotate our own Pod with pod-deletion-cost=1.
+                        // K8s's ReplicaSet controller sorts by this when
+                        // picking which pod to kill during scale-down
+                        // (incl. RollingUpdate). Leader gets the higher
+                        // cost → k8s kills the standby first → no
+                        // leadership churn on rollout. Fire-and-forget:
+                        // the lease loop MUST NOT block (see below).
+                        // Patch failure is non-fatal — without the
+                        // annotation, k8s picks arbitrarily (rollout
+                        // still works, just with possible double-churn).
+                        spawn_patch_deletion_cost(
+                            pod_patch_client.clone(),
+                            cfg.namespace.clone(),
+                            cfg.holder_id.clone(),
+                            1,
+                        );
 
-                    // r[impl sched.lease.non-blocking-acquire]
-                    // Fire the per-component on-acquire hook
-                    // (metrics + actor notification). The hook MUST
-                    // NOT block — see LeaseHooks doc.
-                    //
-                    // NON-BLOCKING IS LOAD-BEARING: if a hook
-                    // awaited recovery, a slow recovery (>15s for a
-                    // large DAG) would stall the renewal tick →
-                    // lease expires → another replica acquires →
-                    // dual-leader. Hooks spawn; the separate
-                    // recovery_complete flag lets the loop keep
-                    // renewing regardless.
-                    hooks.on_acquire();
-                } else if !now_leading && was_leading {
-                    // ---- Lose transition ----
-                    // Someone else acquired (we couldn't renew in
-                    // time). Stop dispatching. Generation is the
-                    // NEW leader's job to increment. on_lose clears
-                    // both is_leader and recovery_complete (SeqCst):
-                    // if we re-acquire, recovery runs again — the
-                    // other replica's actions may have changed PG.
-                    state.on_lose();
-                    warn!(
-                        holder = %cfg.holder_id,
-                        "lost leadership (another replica acquired)"
-                    );
+                        // r[impl sched.lease.non-blocking-acquire]
+                        // Fire the per-component on-acquire hook
+                        // (metrics + actor notification). The hook MUST
+                        // NOT block — see LeaseHooks doc.
+                        //
+                        // NON-BLOCKING IS LOAD-BEARING: if a hook
+                        // awaited recovery, a slow recovery (>15s for a
+                        // large DAG) would stall the renewal tick →
+                        // lease expires → another replica acquires →
+                        // dual-leader. Hooks spawn; the separate
+                        // recovery_complete flag lets the loop keep
+                        // renewing regardless.
+                        hooks.on_acquire();
+                    }
+                    (None, true) => {
+                        // ---- Lose transition ----
+                        // Someone else acquired (we couldn't renew in
+                        // time). Stop dispatching. The generation is
+                        // the NEW leader's concern — it derives its
+                        // own from the lease's transition count on
+                        // acquire. on_lose clears both is_leader and
+                        // recovery_complete (SeqCst): if we
+                        // re-acquire, recovery runs again — the
+                        // other replica's actions may have changed PG.
+                        state.on_lose();
+                        warn!(
+                            holder = %cfg.holder_id,
+                            "lost leadership (another replica acquired)"
+                        );
 
-                    // r[impl sched.lease.standby-tick-noop]
-                    // Symmetric with on_acquire above: fire the
-                    // per-component on-lose hook (metrics + actor
-                    // notification). Same non-blocking constraint.
-                    // is_leader is already false (above) so the
-                    // consumer's tick early-returns regardless;
-                    // this just lets it drop stale state and zero
-                    // leader-only gauges.
-                    hooks.on_lose();
+                        // r[impl sched.lease.standby-tick-noop]
+                        // Symmetric with on_acquire above: fire the
+                        // per-component on-lose hook (metrics + actor
+                        // notification). Same non-blocking constraint.
+                        // is_leader is already false (above) so the
+                        // consumer's tick early-returns regardless;
+                        // this just lets it drop stale state and zero
+                        // leader-only gauges.
+                        hooks.on_lose();
 
-                    // Clear deletion cost — we're standby now, K8s
-                    // should prefer to kill us over the new leader.
-                    spawn_patch_deletion_cost(
-                        pod_patch_client.clone(),
-                        cfg.namespace.clone(),
-                        cfg.holder_id.clone(),
-                        0,
-                    );
-                    owe_cost_clear = false;
+                        // Clear deletion cost — we're standby now, K8s
+                        // should prefer to kill us over the new leader.
+                        spawn_patch_deletion_cost(
+                            pod_patch_client.clone(),
+                            cfg.namespace.clone(),
+                            cfg.holder_id.clone(),
+                            0,
+                        );
+                        owe_cost_clear = false;
+                    }
+                    // Steady state: still leading and renewed, or
+                    // still standby while someone else holds. No log
+                    // — 5s interval would be noisy.
+                    (Some(_), true) | (None, false) => {}
                 }
-                // else: steady state (still leading, renewed; or
-                // still standby, someone else holds). No log —
-                // 5s interval would be noisy.
 
                 was_leading = now_leading;
             }
@@ -825,7 +886,7 @@ mod tests {
     fn leader_for_tracks_acquire_lose() {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
         assert!(state.leader_for().is_none(), "pending → None");
-        state.on_acquire();
+        state.on_acquire(0);
         assert!(state.leader_for().is_some(), "on_acquire → Some(elapsed)");
         state.on_lose();
         assert!(state.leader_for().is_none(), "on_lose → None");
@@ -857,6 +918,56 @@ mod tests {
         assert!(
             !state.is_leader.load(Ordering::Relaxed),
             "K8s mode: NOT leader until lease loop acquires"
+        );
+    }
+
+    /// The generation IS the lease's transition count plus one — derived
+    /// from the apiserver-CAS-guarded `leaseTransitions` field, not from a
+    /// local increment. Two replicas that both believe they lead can never
+    /// share a generation, because the transition count is bumped
+    /// atomically with the holder change (the depth-12 counterexample in
+    /// `docs/spec/models/LeaderElection.tla`'s StaleLeaderHasStaleGeneration
+    /// is exactly two local increments seeded from the same stale
+    /// high-water mark).
+    // r[verify sched.lease.generation-fence]
+    #[test]
+    fn generation_derives_from_lease_transitions() {
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+
+        // The lease creator: leaseTransitions=0 → generation 1. Matches
+        // the non-K8s always_leader floor ("generation 1" = "the first
+        // and only leader there has ever been").
+        assert_eq!(state.on_acquire(0), 1, "creator: transitions 0 → gen 1");
+        assert_eq!(state.generation(), 1);
+
+        // A re-acquire at the same transition count (self-fence false
+        // alarm: we fenced, connectivity returned, our renew succeeded,
+        // nobody stole in between) is the SAME leadership epoch — the
+        // generation must not move, or every in-flight assignment would
+        // be spuriously invalidated.
+        state.on_lose();
+        assert_eq!(
+            state.on_acquire(0),
+            1,
+            "re-acquire without a holder change keeps the epoch"
+        );
+
+        // The first thief: leaseTransitions=1 → generation 2. Distinct
+        // from the creator's even if the creator never persisted
+        // anything to PG.
+        let thief = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        assert_eq!(thief.on_acquire(1), 2, "first steal: transitions 1 → gen 2");
+
+        // The PG high-water seed (kubectl-delete-lease defense) can have
+        // raised the generation past the lease's transition count;
+        // fetch_max keeps the larger. A recreated Lease restarts
+        // transitions at 0 but PG remembers generation 7 was used.
+        let recovered = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        recovered.seed_generation_from(8);
+        assert_eq!(
+            recovered.on_acquire(0),
+            8,
+            "PG seed past the (reset) transition count wins"
         );
     }
 
