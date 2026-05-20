@@ -70,7 +70,7 @@ const LOG_GC_INTERVAL: Duration = Duration::from_secs(3600);
 const LOG_GC_BATCH: i64 = 1000;
 
 /// Request to flush one derivation's logs. Sent by the actor from
-/// `handle_completion_success` and `terminal_failure_epilogue` (both paths
+/// `handle_success_completion` and `terminal_failure_epilogue` (both paths
 /// flush — failed builds still have useful logs).
 #[derive(Debug)]
 pub struct FlushRequest {

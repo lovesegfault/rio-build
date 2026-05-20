@@ -475,7 +475,7 @@ impl DagActor {
     /// Fire a log-flush request for the given derivation. No-op if the
     /// flusher isn't configured (tests, or `RIO_LOG_S3_BUCKET` unset).
     ///
-    /// Called from `handle_completion_success` (status `"succeeded"`) AND
+    /// Called from `handle_success_completion` (status `"succeeded"`) AND
     /// `terminal_failure_epilogue` (status `"failed"`) — both paths flush
     /// because failed builds still have useful logs. NOT called from
     /// `handle_transient_failure`: the derivation gets re-queued, a new
