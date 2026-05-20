@@ -471,8 +471,8 @@
                 # No-op here: buildRustCrate appends `-Clinker=cc` AFTER
                 # extraRustcOpts (build-crate.nix), and rustc is last-flag-wins,
                 # so `cc` actually links — and rlibs never invoke a linker
-                # anyway. Kept so a diff against kani-driver's
-                # call_single_file.rs shows nothing missing on a kani bump.
+                # anyway. kani-compiler does NOT default `-Clinker` (it would
+                # clobber a real linker a build system needs). Kept defensively.
                 "-C"
                 "linker=echo"
                 # Marker flag — without it kani-compiler falls back to vanilla

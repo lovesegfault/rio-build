@@ -11,13 +11,22 @@
 # ABI → all goto-C artifacts rebuild). Bump deliberately, never via
 # `nix flake update`.
 #
-# Bumping `kaniVersion` ALSO requires re-deriving two flag transcriptions
-# from the new kani source — they do NOT show up in a build failure, they
-# just silently produce the wrong goto-C model for CBMC to verify:
-#   - flake.nix `kaniBaseFlags`  ← kani-driver/src/call_single_file.rs
-#                                  (base_rustc_flags + LibConfig::new + kani_rustc_flags)
-#   - nix/kani.nix verify steps  ← kani-driver/src/{call_goto_instrument,call_cbmc}.rs
-#                                  (6-step pipeline + cbmc flag list)
+# As of the lovesegfault/kani/rio-build pin (`6f9696f4f`), `nix/kani.nix`
+# no longer replicates kani-driver's verify pipeline (it delegates to
+# `kani verify-artifacts`), and `kaniBaseFlags` no longer transcribes the
+# soundness-critical rustc flags (kani-compiler sets them as defaults).
+# The surviving `kaniBaseFlags` transcription is install paths and the
+# `-Zcrate-attr` pair, which are stable across kani releases.
+#
+# Bump checklist:
+#   1. Has kani 0.68.0+ shipped with both upstream PRs merged?
+#      (`kani verify-artifacts`, kani-compiler default rustc flags.)
+#      If yes: swap `kaniSrcRaw` back to the release tag, drop this
+#      comment block.
+#   2. Re-read `rust-toolchain.toml` from the new kani source → bump
+#      `kaniNightlyDate`.
+#   3. Re-read `kani-dependencies` → check the CBMC pin still matches
+#      what nixpkgs ships (the eval-time `assertMsg` will catch a drift).
 #
 # Pins (verified against the kani-0.67.0 tag):
 #   kani:    rio-build branch (lovesegfault/kani) = kani-0.67.0 + 2 patches
