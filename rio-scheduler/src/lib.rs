@@ -321,7 +321,10 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_log_unknown_drv_dropped_total",
-        "LogBatch dropped: stream exceeded MAX_DRVS_PER_STREAM distinct derivation_path values"
+        "LogBatch dropped: stream already has MAX_DRVS_PER_STREAM distinct accepted \
+         derivation_path values. Defense-in-depth tripwire — only accepted paths grow \
+         the cap, so a flood of rejected/fabricated paths alone cannot fill it (those \
+         are counted by rio_scheduler_log_batches_rejected_total)."
     );
     describe_counter!(
         "rio_scheduler_log_batches_rejected_total",
