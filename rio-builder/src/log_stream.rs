@@ -109,7 +109,10 @@ impl LogBatcher {
     /// directly on `log_tx` *before* `run_daemon_lifecycle` constructs
     /// the batcher; seeding the counter lets the build's real output
     /// start numbering after the header instead of colliding at line 0.
-    /// Tests that exercise the batcher in isolation pass `0`.
+    /// On a daemon-transient retry the executor seeds at the prior
+    /// attempt's `final_line_count` so output numbering continues
+    /// monotonically across attempts. Tests that exercise the batcher
+    /// in isolation pass `0`.
     pub fn new(
         drv_path: String,
         executor_id: String,

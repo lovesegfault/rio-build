@@ -552,8 +552,16 @@ through the `LogBatcher` (which is created and consumed inside the daemon
 lifecycle). The `LogBatcher` is seeded with the header line count so the
 build's real output numbers after the header. The header carries the
 `WorkAssignment.exec_id`, the system + `hw_class`, and the assigned resource
-triple --- never pod or node identity. The normative requirement and the
-display-only / no-pod-identity rationale live in
+triple --- never pod or node identity. The banner is per-execution, not
+per-attempt: the daemon-transient retry loop
+(#rref("builder.retry.daemon-transient")) re-invokes the executor up to
+`DAEMON_RETRY_MAX` more times for one `exec_id`, but the header is sent only on
+the first attempt and the footer once after the loop with the most recent
+daemon-running attempt's outcome --- re-emitting the banner per attempt would
+write conflicting `rio: result` lines and break the scheduler ring buffer's
+line-number monotonicity. Subsequent attempts seed the `LogBatcher` with the
+prior attempt's final line count so output line numbers continue. The normative
+requirement and the display-only / no-pod-identity rationale live in
 #rref("obs.log.worker-header") in the observability spec.
 
 #r("builder.daemon.stderr-result-logs")[

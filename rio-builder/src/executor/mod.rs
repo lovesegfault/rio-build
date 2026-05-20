@@ -329,16 +329,42 @@ pub struct ExecuteOutcome {
     /// `None` = no prjquota OR pre-cgroup error. Sampled BEFORE
     /// `build_result?` so an OOM'd build also reports it.
     pub peak_disk_bytes: Option<u64>,
+    /// Highest line number this attempt's `BuildLogBatch`es reached
+    /// (header + LogBatcher output). The runtime daemon-transient retry
+    /// loop feeds it back as the next attempt's `first_line` so output
+    /// numbering continues monotonically across attempts; once the loop
+    /// breaks it places the banner footer here. `0` only for pre-header
+    /// errors on the first attempt (drv parse, WrongKind).
+    pub final_line_count: u64,
+    /// The build process's own outcome string for the banner footer
+    /// (`ok` / `failed (...)` / `cancelled`), computed BEFORE
+    /// collect_outputs so a successful build that fails its upload still
+    /// reports `ok` here (CompletionReport carries the upload failure).
+    /// `None` when no daemon process ran in THIS attempt — pre-daemon
+    /// setup error or `RIO_BUILDER_SCRIPT` fixture short-circuit. The
+    /// runtime tracks the most recent `Some(...)` across the retry loop
+    /// so a footer is sent whenever ANY attempt ran a daemon: an
+    /// all-pre-daemon assignment (header only, no output) gets no
+    /// footer — that absence is the documented "build never started"
+    /// signal. Sending one footer per attempt produces conflicting
+    /// `rio: result` lines for one exec_id (bug_013).
+    pub footer_result: Option<String>,
 }
 
 impl ExecuteOutcome {
     /// Pre-cgroup setup error: cgroup never populated, peaks genuinely 0.
-    fn pre_cgroup(e: ExecutorError) -> Self {
+    /// `final_line_count` is the watermark the caller has already pushed
+    /// (`first_line` for pre-header errors, `batcher_seed` for
+    /// post-header pre-daemon errors); `footer_result` is `None` —
+    /// no daemon process ran in this attempt.
+    fn pre_cgroup(e: ExecutorError, final_line_count: u64) -> Self {
         Self {
             result: Err(e),
             peak_memory_bytes: 0,
             peak_cpu_cores: 0.0,
             peak_disk_bytes: None,
+            final_line_count,
+            footer_result: None,
         }
     }
 
@@ -346,12 +372,14 @@ impl ExecuteOutcome {
     /// `ExecutionResult`; copy them out so the `Err`-path consumers
     /// (which only exist on real builds) see consistent shape.
     #[cfg(feature = "test-fixtures")]
-    fn fixture(r: ExecutionResult) -> Self {
+    fn fixture(r: ExecutionResult, final_line_count: u64) -> Self {
         Self {
             peak_memory_bytes: r.peak_memory_bytes,
             peak_cpu_cores: r.peak_cpu_cores,
             peak_disk_bytes: r.peak_disk_bytes,
             result: Ok(r),
+            final_line_count,
+            footer_result: None, // RIO_BUILDER_SCRIPT short-circuit: no daemon ran.
         }
     }
 }
@@ -398,6 +426,7 @@ pub async fn execute_build(
     env: &ExecutorEnv,
     store_client: &mut StoreServiceClient<Channel>,
     log_tx: &mpsc::Sender<ExecutorMessage>,
+    first_line: u64,
 ) -> ExecuteOutcome {
     let drv_path = &assignment.drv_path;
     let build_id = sanitize_build_id(drv_path);
@@ -419,7 +448,7 @@ pub async fn execute_build(
     let drv = if assignment.drv_content.is_empty() {
         match fetch_drv_from_store(store_client, drv_path).await {
             Ok(d) => d,
-            Err(e) => return ExecuteOutcome::pre_cgroup(e),
+            Err(e) => return ExecuteOutcome::pre_cgroup(e, first_line),
         }
     } else {
         // Strict UTF-8 — matches the else-branch (parse_from_nar uses
@@ -439,7 +468,7 @@ pub async fn execute_build(
             });
         match parsed {
             Ok(d) => d,
-            Err(e) => return ExecuteOutcome::pre_cgroup(e),
+            Err(e) => return ExecuteOutcome::pre_cgroup(e, first_line),
         }
     };
 
@@ -470,19 +499,19 @@ pub async fn execute_build(
     // Running pre-overlay also means a misroute wastes no mount
     // namespace setup and is unit-testable without CAP_SYS_ADMIN.
     if is_fod != (env.executor_kind == rio_proto::types::ExecutorKind::Fetcher) {
-        return ExecuteOutcome::pre_cgroup(ExecutorError::WrongKind {
-            is_fod,
-            executor_kind: env.executor_kind,
-        });
+        return ExecuteOutcome::pre_cgroup(
+            ExecutorError::WrongKind {
+                is_fod,
+                executor_kind: env.executor_kind,
+            },
+            first_line,
+        );
     }
 
     metrics::gauge!("rio_builder_builds_active").increment(1.0);
     // rio_builder_builds_total is incremented at completion (main.rs) with
     // an outcome label so SLI queries can compute success rate.
     let build_start = std::time::Instant::now();
-    // `Instant: Copy` — the scopeguard closure below copies it, so
-    // `build_start` is still readable for the banner footer's duration.
-    let exec_start = build_start;
     let _build_guard = scopeguard::guard((), move |()| {
         metrics::gauge!("rio_builder_builds_active").decrement(1.0);
         metrics::histogram!("rio_builder_build_duration_seconds")
@@ -493,8 +522,10 @@ pub async fn execute_build(
     // Banner header — the first thing in the build log, ahead of any
     // build output. Sent directly on `log_tx` (not through `LogBatcher`
     // — that's created inside `run_daemon_lifecycle`, three call frames
-    // down); the batcher is seeded with `HEADER_LINE_COUNT` so the
-    // build's real output numbers from line 3 instead of colliding.
+    // down); the batcher is seeded with `batcher_seed`
+    // (`HEADER_LINE_COUNT` on the first attempt, the prior attempt's
+    // `final_line_count` on a retry) so the build's real output numbers
+    // continue past the header instead of colliding at line 0.
     //
     // Display-only: see `banner.rs`'s module doc. The lines flow
     // through the normal `BuildLogBatch` → scheduler ring buffer →
@@ -506,25 +537,37 @@ pub async fn execute_build(
     // going to run. Sent BEFORE overlay setup so a failed mount still
     // leaves a self-describing log (header, no output, no footer).
     //
+    // Sent only on the FIRST daemon-transient retry attempt
+    // (`first_line == 0`): the runtime retry loop (runtime/mod.rs)
+    // re-invokes `execute_build` up to DAEMON_RETRY_MAX more times for
+    // one assignment; re-emitting the header per attempt would write
+    // duplicate "first lines" at line 0 and break the scheduler ring
+    // buffer's line-number monotonicity (bug_013).
+    //
     // `exec_id` is the per-execution UUIDv7 from `WorkAssignment` —
     // empty before commit `34956e1f4` plumbed `assign_to_worker`'s
     // mint, but always populated against the current scheduler. The
     // log header is the only place the worker echoes it.
-    send_banner_batch(
-        log_tx,
-        drv_path,
-        &env.executor_id,
-        0,
-        crate::banner::header_lines(
-            &assignment.exec_id,
-            drv.platform(),
-            env.hw_class.as_deref(),
-            assignment.assigned_cores,
-            assignment.assigned_mem_bytes,
-            assignment.assigned_disk_bytes,
-        ),
-    )
-    .await;
+    let batcher_seed = if first_line == 0 {
+        send_banner_batch(
+            log_tx,
+            drv_path,
+            &env.executor_id,
+            0,
+            crate::banner::header_lines(
+                &assignment.exec_id,
+                drv.platform(),
+                env.hw_class.as_deref(),
+                assignment.assigned_cores,
+                assignment.assigned_mem_bytes,
+                assignment.assigned_disk_bytes,
+            ),
+        )
+        .await;
+        crate::banner::HEADER_LINE_COUNT
+    } else {
+        first_line
+    };
 
     // ── Pre-daemon block: overlay → resolve → sandbox → daemon. ───────
     // Wrapped so the `?` sites stay `?`: every error here is pre-cgroup
@@ -654,7 +697,7 @@ pub async fn execute_build(
             // (I-060) can't shadow it. nix's nested sandbox bind-mounts inputs
             // from realStoreDir (`{build_dir}/nix/store/...`) to the build's
             // canonical `/nix/store/...`.
-            let opts = resolve_build_opts(assignment, env, effective_cores);
+            let opts = resolve_build_opts(assignment, env, effective_cores, batcher_seed);
 
             let outcome = run_daemon_lifecycle(
                 &overlay_mount,
@@ -683,9 +726,9 @@ pub async fn execute_build(
         peak_cpu_cores,
         final_line_count,
     ) = match pre {
-        Err(e) => return ExecuteOutcome::pre_cgroup(e),
+        Err(e) => return ExecuteOutcome::pre_cgroup(e, batcher_seed),
         #[cfg(feature = "test-fixtures")]
-        Ok(PreDaemon::Fixture(r)) => return ExecuteOutcome::fixture(r),
+        Ok(PreDaemon::Fixture(r)) => return ExecuteOutcome::fixture(r, batcher_seed),
         Ok(PreDaemon::Ran {
             overlay_mount,
             input_paths,
@@ -707,33 +750,24 @@ pub async fn execute_build(
     };
 
     // r[impl obs.log.worker-header]
-    // Banner footer — sent AFTER `run_daemon_lifecycle` returned (the
-    // `LogBatcher` was consumed inside it; we send a `BuildLogBatch`
-    // directly). `first_line_number` follows the build output so the
-    // footer doesn't collide with the last real lines or leave a gap
-    // in the dashboard's `since_line` resumption. Goes out BEFORE any
-    // post-daemon `?` (collect_outputs / teardown) so the stored log
-    // self-describes the build process's outcome even when upload
-    // failed afterward — `CompletionReport` carries the post-daemon
-    // failure, the footer carries the build's own result.
+    // Footer result string — computed BEFORE `collect_outputs` consumes
+    // `build_result` below so the eventual footer carries the build
+    // process's OWN result (`ok` even when upload fails afterward;
+    // `CompletionReport` carries the post-daemon failure). The footer
+    // batch itself is sent by the runtime AFTER the daemon-transient
+    // retry loop with the most recent attempt's `footer_result` /
+    // `final_line_count` — `execute_build` is called once per attempt,
+    // and re-emitting the footer per attempt would write conflicting
+    // `rio: result` lines for one exec_id (bug_013).
     //
-    // Pre-cgroup early returns above (`Err(e)`, `Fixture`) don't reach
-    // here: those builds never ran a daemon, so there's no exit to
-    // report. The header is still in the log; a reader sees the
-    // header with no output and no footer and knows setup failed
-    // before the build started.
-    send_banner_batch(
-        log_tx,
-        drv_path,
-        &env.executor_id,
-        final_line_count,
-        crate::banner::footer_lines(
-            &assignment.exec_id,
-            &footer_result_str(&build_result),
-            exec_start.elapsed(),
-        ),
-    )
-    .await;
+    // Pre-cgroup early returns above (`Err(e)`, `Fixture`) carry
+    // `footer_result: None`: those builds never ran a daemon in THIS
+    // attempt. The runtime tracks the most recent `Some(...)` across
+    // attempts so the footer is sent whenever any attempt produced
+    // output. If NO attempt ran a daemon, the runtime sends no footer:
+    // header with no output and no footer is the documented signal
+    // that the build never started.
+    let footer_result = footer_result_str(&build_result);
 
     // ── Post-daemon: peaks now in scope; carry across every Err. ──────
     // r[impl builder.cgroup.memory-peak+2]
@@ -750,6 +784,8 @@ pub async fn execute_build(
         peak_memory_bytes,
         peak_cpu_cores,
         peak_disk_bytes,
+        final_line_count,
+        footer_result: Some(footer_result.clone()),
     };
 
     // 10. Collect outputs (borrows &overlay_mount; must precede teardown).
@@ -822,15 +858,24 @@ pub async fn execute_build(
         peak_memory_bytes,
         peak_cpu_cores,
         peak_disk_bytes,
+        final_line_count,
+        footer_result: Some(footer_result),
     }
 }
 
-/// Effective per-build option triple after applying assignment →
-/// worker-config → cgroup-clamp precedence.
+/// Effective per-build options after applying assignment →
+/// worker-config → cgroup-clamp precedence, plus the `LogBatcher` line
+/// seed for daemon-transient retry continuity. `batcher_seed` is
+/// logging plumbing, not a build option — bundled here so
+/// `run_daemon_lifecycle` stays under `clippy::too_many_arguments`.
 struct BuildOpts {
     timeout: Duration,
     max_silent_time: u64,
     build_cores: u64,
+    /// Initial `LogBatcher` line counter: `HEADER_LINE_COUNT` on the
+    /// first attempt, the prior attempt's `final_line_count` on a
+    /// daemon-transient retry. See `execute_build`'s `first_line` param.
+    batcher_seed: u64,
 }
 
 /// Compute the effective build options for this assignment.
@@ -841,10 +886,14 @@ struct BuildOpts {
 /// silence, nproc cores. 0 → 0 on the wire = unbounded/all-cores to
 /// the daemon — the scheduler's `min_nonzero` already handles the
 /// 0-means-unset semantics; we pass through verbatim.
+///
+/// `batcher_seed` is passed through verbatim — it's not a build option,
+/// see [`BuildOpts`].
 fn resolve_build_opts(
     assignment: &WorkAssignment,
     env: &ExecutorEnv,
     effective_cores: u32,
+    batcher_seed: u64,
 ) -> BuildOpts {
     let opts = assignment.build_options.as_ref();
     let timeout = opts
@@ -899,6 +948,7 @@ fn resolve_build_opts(
         timeout,
         max_silent_time,
         build_cores,
+        batcher_seed,
     }
 }
 
@@ -913,7 +963,7 @@ struct DaemonOutcome {
     /// header offset + everything the stderr loop flushed). Read by
     /// [`execute_build`] to set the footer banner's `first_line_number`
     /// so it follows the build output instead of colliding. Equal to
-    /// [`crate::banner::HEADER_LINE_COUNT`] when [`run_daemon_build`]'s
+    /// the seeded `opts.batcher_seed` when [`run_daemon_build`]'s
     /// setup failed before the loop ran (no build output produced).
     final_line_count: u64,
 }
@@ -992,16 +1042,16 @@ async fn run_daemon_lifecycle(
     // net. The explicit kill below remains the primary cleanup
     // (graceful, bounded wait for reap); kill_on_drop covers early
     // returns between spawn and here.
-    // Seeded with `HEADER_LINE_COUNT`: `execute_build` already sent
-    // the `rio:` banner header (3 lines) directly on `log_tx` before
-    // calling us, so the build's real output should start at line 3.
-    // Without this, the build's line 0 collides with `rio: exec` and
-    // the dashboard's `since_line` resumption desyncs.
+    // Seeded with `opts.batcher_seed`: `execute_build` already sent the
+    // `rio:` banner header on the first attempt, or a prior attempt's
+    // output ended here on a daemon-transient retry. Without this, the
+    // build's line 0 collides with `rio: exec` (or with a prior attempt's
+    // output) and the dashboard's `since_line` resumption desyncs.
     let batcher = LogBatcher::new(
         drv_path.to_owned(),
         env.executor_id.clone(),
         env.log_limits,
-        crate::banner::HEADER_LINE_COUNT,
+        opts.batcher_seed,
     );
     let (build_result, final_line_count) = run_daemon_build(
         &mut daemon,
@@ -1330,7 +1380,12 @@ pub fn sanitize_build_id(drv_path: &str) -> String {
 /// in which case the build's `CompletionReport` won't reach the
 /// scheduler either — `runtime/` handles that. The banner is
 /// display-only; dropping it is harmless.
-async fn send_banner_batch(
+///
+/// `pub(crate)` because the banner footer is sent from
+/// `runtime::spawn_build_task` (after the daemon-transient retry loop —
+/// once per assignment) rather than from `execute_build` (once per
+/// attempt). See `execute_build`'s `first_line` param doc and bug_013.
+pub(crate) async fn send_banner_batch(
     log_tx: &mpsc::Sender<ExecutorMessage>,
     drv_path: &str,
     executor_id: &str,
@@ -1618,14 +1673,14 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert_eq!(resolve_build_opts(&a, &env, 8).build_cores, 4);
+        assert_eq!(resolve_build_opts(&a, &env, 8, 0).build_cores, 4);
 
         // assigned > cgroup ceiling → clamped (defense vs sched/kubelet drift).
         let a = WorkAssignment {
             assigned_cores: Some(16),
             ..Default::default()
         };
-        assert_eq!(resolve_build_opts(&a, &env, 8).build_cores, 8);
+        assert_eq!(resolve_build_opts(&a, &env, 8, 0).build_cores, 8);
 
         // No assigned_cores → pre-ADR-023 fallback: client capped at cgroup.
         let a = WorkAssignment {
@@ -1636,7 +1691,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert_eq!(resolve_build_opts(&a, &env, 8).build_cores, 8);
+        assert_eq!(resolve_build_opts(&a, &env, 8, 0).build_cores, 8);
 
         // assigned_cores=0 treated as unset (proto3 optional Some(0) is
         // possible if scheduler explicitly sends 0; never pass 0 to nix).
@@ -1644,7 +1699,7 @@ mod tests {
             assigned_cores: Some(0),
             ..Default::default()
         };
-        assert_eq!(resolve_build_opts(&a, &env, 8).build_cores, 8);
+        assert_eq!(resolve_build_opts(&a, &env, 8, 0).build_cores, 8);
     }
 
     /// `resolve_inputs` fetches each inputDrv from the store, resolves

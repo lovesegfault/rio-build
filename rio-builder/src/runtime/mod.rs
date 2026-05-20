@@ -378,11 +378,64 @@ pub async fn spawn_build_task(
         // takes over. Cancelled builds short-circuit the loop — the
         // cancelled flag is set by try_cancel_build before cgroup.kill,
         // so checking it here avoids retrying a user-cancelled build.
+        //
+        // Banner ownership: `execute_build` sends the `rio:` header
+        // only on the FIRST attempt (`prev_line_count == 0`); retried
+        // attempts seed the batcher at the prior attempt's
+        // `final_line_count` so output line numbers stay monotone in
+        // the scheduler's ring buffer. The footer is sent ONCE here
+        // after the loop with the most recent attempt that produced
+        // output — emitting it per attempt would write conflicting
+        // `rio: result` lines for one exec_id (bug_013).
+        // TODO: emit a single `rio: retry  N/M <error>` marker line
+        // between attempts so a reader sees why the output content
+        // jumps; needs a banner.rs function + spec note.
+        //
+        // `assignment_start`: total wall time for the assignment
+        // including inter-attempt retry backoff (≤ 3.5s). Reported in
+        // the footer's `after Ns` so it matches what the user
+        // perceives. INTENTIONALLY diverges from the per-attempt
+        // `rio_builder_build_duration_seconds` histogram inside
+        // `execute_build`, which measures individual build attempts.
+        let assignment_start = std::time::Instant::now();
         let mut attempt = 0u32;
+        let mut prev_line_count = 0u64;
+        // Most recent attempt's footer string (`Some(...)` only when a
+        // daemon ran in that attempt). Tracked across the loop so a
+        // footer is sent whenever ANY attempt ran a daemon — without
+        // this, a final attempt that fails pre-daemon (e.g.
+        // `DaemonSpawn` after a prior `Wire(UnexpectedEof)`) would
+        // silently drop the footer despite output being in the log.
+        let mut last_footer_result: Option<String> = None;
         let outcome = loop {
-            let o =
-                executor::execute_build(&assignment, &build_env, &mut store_client, &ctx.stream_tx)
-                    .await;
+            // First-attempt invariant: `execute_build` gates the
+            // banner header on `first_line == 0`, which is true ONLY
+            // on the first attempt. Every error in
+            // `is_daemon_transient()` fires AFTER the header
+            // (`DaemonSpawn`/`Handshake`/`Wire(UnexpectedEof)` all
+            // require a daemon spawn attempt, which is post-header),
+            // so a retried attempt always sees
+            // `prev_line_count >= HEADER_LINE_COUNT`. If a future
+            // transient variant fires pre-header (new ExecutorError,
+            // refactor of the early-return order), this catches the
+            // bug-recurrence: a re-emitted header at line 0 (bug_013).
+            debug_assert!(
+                attempt == 0 || prev_line_count >= crate::banner::HEADER_LINE_COUNT,
+                "retried attempt must follow a header-emitting prior attempt \
+                 (prev_line_count={prev_line_count}, attempt={attempt})"
+            );
+            let o = executor::execute_build(
+                &assignment,
+                &build_env,
+                &mut store_client,
+                &ctx.stream_tx,
+                prev_line_count,
+            )
+            .await;
+            prev_line_count = o.final_line_count;
+            if o.footer_result.is_some() {
+                last_footer_result.clone_from(&o.footer_result);
+            }
 
             match &o.result {
                 Err(e)
@@ -419,7 +472,41 @@ pub async fn spawn_build_task(
             peak_memory_bytes,
             peak_cpu_cores,
             peak_disk_bytes,
+            final_line_count,
+            footer_result: _, // tracked across attempts as `last_footer_result`
         } = outcome;
+
+        // r[impl obs.log.worker-header]
+        // Banner footer — ONE per assignment, after the retry loop.
+        // Carries the most recent daemon-running attempt's outcome
+        // (`last_footer_result`), not the post-daemon collect/teardown
+        // result on `result`. Skipped only when NO attempt ran a daemon
+        // (every attempt was a pre-daemon setup failure or the
+        // `RIO_BUILDER_SCRIPT` fixture) — header-without-footer is the
+        // documented signal that the build never started. Goes out
+        // BEFORE the CompletionReport so the scheduler ring buffer is
+        // settled by the time the build resolves.
+        // TODO: the runtime footer-send path (once-per-assignment,
+        // skipped-on-None, prev_line_count threading) has no unit test
+        // — `spawn_build_task` requires a full BuildContext + live gRPC
+        // stream. Covered by `nextest-rio-builder` compilation +
+        // existing VM scenarios; a `RIO_BUILDER_SCRIPT` VM test
+        // asserting "exactly one rio: result line per exec_id" would
+        // close the gap.
+        if let Some(footer_result) = &last_footer_result {
+            executor::send_banner_batch(
+                &ctx.stream_tx,
+                &drv_path,
+                &build_env.executor_id,
+                final_line_count,
+                crate::banner::footer_lines(
+                    &assignment.exec_id,
+                    footer_result,
+                    assignment_start.elapsed(),
+                ),
+            )
+            .await;
+        }
         let stamp = ctx.completion_stamp(peak_disk_bytes);
         let completion = match result {
             Ok(exec_result) => ok_completion(exec_result, stamp),
