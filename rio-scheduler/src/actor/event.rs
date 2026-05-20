@@ -700,7 +700,12 @@ impl DagActor {
     /// clean buffer. Covers transient-retry (old worker's partial lines
     /// would otherwise prefix the new worker's), poison-clear-resubmit
     /// (stale seal would silently drop the retry's pushes), and any
-    /// dropped-FlushRequest leak that survived to re-dispatch.
+    /// dropped-FlushRequest leak that survived to re-dispatch. Also
+    /// called from `rollback_assignment` (failed `try_send` rollback —
+    /// reaps the empty `set_log_exec`-stamped entry the failed dispatch
+    /// just created) and `adopt_orphan_completion` (post-terminal during
+    /// recovery — keeps the empty recovery-stamped entry from shadowing
+    /// the ex-leader's S3 `.partial` blob in `GetDerivationLogs`).
     /// Idempotent: first-ever dispatch finds no entry. No-op if
     /// `log_buffers` unwired (tests).
     pub(super) fn discard_log_buffer(&self, drv_hash: &DrvHash) {

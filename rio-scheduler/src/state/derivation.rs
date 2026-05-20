@@ -775,8 +775,9 @@ pub struct DerivationState {
     ///
     /// `None` on construction. Set by `assign_to_worker`; cleared by
     /// `reset_to_ready` (worker disconnect, phantom drain, orphan
-    /// reconcile — but NOT `rollback_assignment`, which also discards
-    /// the `LogBuffers` entry). Readers in `trigger_log_flush` and
+    /// reconcile, infra/timeout retry below cap, and `rollback_assignment` —
+    /// that last one ALSO discards the `LogBuffers` entry, so neither
+    /// carrier survives a failed dispatch). Readers in `trigger_log_flush` and
     /// `record_exec_correlation` (`actor/event.rs::exec_id_for_terminal`)
     /// can run between a `reset_to_ready` and the next `assign_to_worker`
     /// when a poison-while-Ready path (I-065 fleet exhaustion,

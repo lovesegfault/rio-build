@@ -403,12 +403,14 @@ impl LogBuffers {
 
     /// Discard a buffer without returning its contents. Also un-seals.
     ///
-    /// Called by the actor's `assign_to_worker` (every fresh dispatch
-    /// starts clean — clears a transient-failure predecessor's partial
-    /// lines and any stale seal from a poison-clear) and by
-    /// `handle_cleanup_terminal_build` for each reaped DAG node (bounds a
-    /// dropped-FlushRequest leak to `TERMINAL_CLEANUP_DELAY`, ~60s).
-    /// Idempotent; no-op on a missing entry.
+    /// Called via the actor wrapper `DagActor::discard_log_buffer`
+    /// (dispatch, rollback, and orphan-recovery — see its rustdoc for
+    /// the caller list and per-path rationale), and directly by
+    /// `handle_cleanup_terminal_build` for each reaped DAG node (bounds
+    /// a dropped-FlushRequest leak to `TERMINAL_CLEANUP_DELAY`, ~60s) and
+    /// `tick_process_expired_poisons` for never-re-dispatched poisoned
+    /// drvs (defense-in-depth against a slow leak). Idempotent; no-op
+    /// on a missing entry.
     pub fn discard(&self, drv_path: &str) {
         let key = drv_log_hash(drv_path);
         self.buffers.remove(&key);

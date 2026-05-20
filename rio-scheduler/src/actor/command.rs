@@ -339,12 +339,12 @@ pub enum ActorCommand {
     /// is a cosmetic nom regression, not a hang. Fire-and-forget.
     ///
     /// `executor_id` is the calling stream's identity; `handle_forward_phase`
-    /// checks it against the drv's `assigned_executor` and drops the update
-    /// on mismatch (`r[sched.log.phase-binding]`). Same source of truth as
-    /// [`ProcessCompletion`](Self::ProcessCompletion)'s stale-report guard
-    /// (`state.assigned_executor`), but stricter: also drops when
-    /// `assigned_executor` is `None`, since `Phase` has no upstream
-    /// `Assigned|Running` status gate the way completion does.
+    /// gates on `(status, assigned_executor)` and drops on mismatch
+    /// (`r[sched.log.phase-binding]`). Two-part gate mirroring
+    /// [`ProcessCompletion`](Self::ProcessCompletion)'s stale-report guard,
+    /// but stricter — also fails closed on `assigned_executor == None`. See
+    /// `event.rs::handle_forward_phase` for the gate mechanics and the
+    /// defense-in-depth rationale.
     ForwardPhase {
         phase: rio_proto::types::BuildPhase,
         executor_id: ExecutorId,
