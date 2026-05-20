@@ -671,12 +671,20 @@
               # Built from source against a nightly pinned by kani's
               # rust-toolchain.toml (NOT rustNightly — kani-compiler links
               # rustc_private, so the date is exact). `nix build
-              # .#kani-toolchain`. Toolchain only; no harness verification
-              # yet (a future crateBuildKani tree + nix/kani.nix consume
-              # kaniToolchain exports).
+              # .#kani-toolchain`. crateBuildKani + nix/kani.nix consume
+              # this for per-member CBMC verification.
               kaniToolchain = import ./nix/kani-toolchain.nix {
                 inherit pkgs;
                 inherit (pkgs) lib;
+              };
+
+              # Per-member CBMC verification. Shared between
+              # packages.kani-toolchain.kani-checks (manual `nix build
+              # .#kani-toolchain.kani-checks.<name>`) and checks.* (where
+              # members with #[kani::proof] harnesses are gated). See
+              # nix/kani.nix for the pipeline and the r[verify] markers.
+              kaniChecks = import ./nix/kani.nix {
+                inherit pkgs kaniToolchain crateBuildKani;
               };
 
               # --------------------------------------------------------------
@@ -1134,17 +1142,11 @@
                     # sidecars from `crates.<name>` and runs the
                     # goto-cc/goto-instrument/cbmc pipeline per harness.
                     # `nix build .#kani-toolchain.kani-checks.kani-rio-lease`.
-                    # Manual target until rio-lease has #[kani::proof]
-                    # harnesses (deferred to the rio-lease FV plan); a
-                    # vacuous 0-harness check in checks.* would dilute
-                    # the CI gate without verifying anything. Promote to
-                    # checks.* when harnesses land — into the `// {`
-                    # block alongside `cov-smoke` / `mutants-smoke`
-                    # (the existing manual-then-promoted precedent).
-                    # See nix/kani.nix.
-                    kani-checks = import ./nix/kani.nix {
-                      inherit pkgs kaniToolchain crateBuildKani;
-                    };
+                    # Members with #[kani::proof] harnesses are also gated
+                    # in checks.* (alongside cov-smoke / mutants-smoke) —
+                    # this passthru is the manual-target alias. See
+                    # nix/kani.nix for the pipeline + r[verify] markers.
+                    kani-checks = kaniChecks;
                   };
                 });
               }
@@ -1426,6 +1428,19 @@
                   # catches ≥1 mutant. The full sweep is .#mutants
                   # (dev-only, hours).
                   inherit mutants-smoke;
+                  # kani-rio-lease: CBMC verification of rio-lease's
+                  # decide_pure() against its #[kani::ensures] contracts
+                  # (proof_for_contract, exhaustive over the input domain).
+                  # Promoted from packages.kani-toolchain.kani-checks once
+                  # the harness landed — a vacuous 0-harness check would
+                  # have diluted the gate. The TLA+ model
+                  # (tla-leader-election, in miscChecks) verifies the
+                  # protocol-level safety property; this verifies the
+                  # per-decision logic that complements it (richer case
+                  # structure than the TLA+ spike — not a formal
+                  # refinement). r[verify] markers are at the wiring
+                  # point in nix/kani.nix.
+                  inherit (kaniChecks) kani-rio-lease;
                   # Regression: per-node profraw extract must not drop
                   # filename-colliding profraws across multi-worker nodes.
                   # No KVM needed (synthetic tarballs).

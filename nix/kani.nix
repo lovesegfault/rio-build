@@ -81,14 +81,13 @@
 # kani-driver's JSON post-processor flips the semantics, and we don't
 # have it. Without reach checks the cbmc verdict is direct.
 #
-# r[verify ...] markers: when rio-lease (or any other member) gains
-# #[kani::proof] harnesses, the markers go HERE — at the `kani-checks`
-# attrset entry that wires the member, NOT in the harness function or
-# the .typ spec source. Same wiring-point discipline as the
-# `subtests = [...]` entries in nix/tests/default.nix (P0341): a marker
-# at the wiring point structurally proves the harness is built; a marker
-# in election.rs would claim "verified" even if the kani-checks entry
-# were deleted. .config/tracey/config.styx already lists this file under
+# r[verify ...] markers go HERE — at the `kani-checks` attrset entry
+# that wires a member, NOT in the harness function or the .typ spec
+# source. Same wiring-point discipline as the `subtests = [...]`
+# entries in nix/tests/default.nix (P0341): a marker at the wiring
+# point structurally proves the harness is built; a marker in
+# election.rs would claim "verified" even if the kani-checks entry were
+# deleted. .config/tracey/config.styx already lists this file under
 # `test_include`.
 {
   pkgs,
@@ -173,15 +172,16 @@ let
 
         # 2. Vacuous pass on zero harnesses. NOT an error: a workspace
         # member can be wired into kani-checks before its #[kani::proof]
-        # contracts land (the rio-lease FV plan does exactly that). The
-        # vacuous result is recorded so a `cat result` is unambiguous —
-        # silence here would look like a pipeline that never ran.
+        # contracts land (rio-lease shipped vacuous for several commits
+        # under packages.* before its harness landed). The vacuous result
+        # is recorded so a `cat result` is unambiguous — silence here
+        # would look like a pipeline that never ran.
         if [ "$n_harnesses" -eq 0 ]; then
           {
             echo "kani verify: $MEMBER"
             echo "0 #[kani::proof] harnesses found — vacuous pass."
             echo
-            echo "This is expected until the rio-lease FV plan adds harnesses."
+            echo "This is expected until $MEMBER gains #[kani::proof] harnesses."
             echo "Once they land, promote kani-$MEMBER from packages.* to checks.*"
             echo "and add r[verify ...] markers at the kani-checks attr in nix/kani.nix."
             echo
@@ -404,12 +404,21 @@ in
 
   # rio-lease is the first kani-instrumented member (lease/election
   # state machine — small, self-contained, and an actual correctness
-  # nightmare to hand-test). Currently 0 harnesses (vacuous pass);
-  # the rio-lease FV plan adds #[kani::proof] contracts and promotes
-  # this to checks.*. Promotion target: the `// {` block at the tail of
-  # flake.nix's `checks =` definition where `cov-smoke` and
-  # `mutants-smoke` live — those are the precedent for manual-target →
-  # gated-check promotion.
+  # nightmare to hand-test). One #[kani::proof_for_contract(decide_pure)]
+  # harness verifies the four #[kani::ensures] iff-clauses on
+  # decide_pure() over the full input domain (HolderKind × Option<u64>
+  # × u64 — exhaustive, no bounded unwind; decide_pure has no loops).
+  # The contract case structure parallels the {Steal, Renew, Observe,
+  # Discard} action partition under `Next` in
+  # docs/spec/models/LeaderElection.tla — the TLA+ model verifies the
+  # protocol-level safety property, the Kani contract verifies the
+  # per-decision logic that complements it (the Kani contract has a
+  # richer case structure than the Phase-0 TLA+ spike, which doesn't
+  # model observed-clock staleness — this is not a formal refinement).
+  # Promoted to checks.* (in flake.nix's `// {` block alongside
+  # cov-smoke / mutants-smoke).
+  # r[verify sched.lease.k8s-lease]
+  # r[verify sched.lease.at-most-one-leader]
   kani-rio-lease = mkKaniCheck {
     name = "rio-lease";
     crate = crateBuildKani.members.rio-lease;

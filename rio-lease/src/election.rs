@@ -136,15 +136,55 @@ pub(crate) enum ObservedUpdate {
 /// returned `ObservedUpdate`.
 ///
 /// The case structure here is the formal contract: it parallels the
-/// `Decide(n)` action partition in `docs/spec/models/LeaderElection.tla`
-/// (`{Get, Steal, Renew, Observe, Discard}`). When either changes,
-/// update the other.
+/// action disjunction in `Next` in `docs/spec/models/LeaderElection.tla`
+/// (`Get(n) \/ Steal(n) \/ Renew(n) \/ Observe(n) \/ Discard(n)`). When
+/// either changes, update the other.
 ///
 /// `matched_observation_age_ms` collapses two production cases into
 /// one: it's `Some(age)` only when there IS an observation AND its rv
 /// matches the current lease rv. `None` covers both "no observation"
 /// and "rv changed" — both reset the clock (`StartObserving`).
 // r[impl sched.lease.k8s-lease]
+//
+// ── Kani contracts ───────────────────────────────────────────────────
+// Each `ensures` clause is one direction of an iff. The contract
+// closures restate decide_pure's spec from a different angle than the
+// implementation: instead of `if holder is X then return Y`, they say
+// `return is Y iff holder is X`. A bug that flips a comparison
+// (`>` to `>=`) or drops a case fails the contract.
+//
+// The case structure parallels the {Steal, Renew, Observe, Discard}
+// action partition under `Next` in docs/spec/models/LeaderElection.tla.
+// When either changes, update the other — `tracey bump` on the spec
+// rule will flag both.
+//
+// Verified by check_decide_pure_contract in #[cfg(kani)] mod kani_proofs.
+#[cfg_attr(kani, kani::ensures(|r: &(Decision, ObservedUpdate)| {
+    // Steal iff holder is empty, OR (holder is Other AND the observed
+    // rv matched AND has been stale for > ttl).
+    (r.0 == Decision::Steal) == (
+        matches!(holder, HolderKind::Empty)
+        || (matches!(holder, HolderKind::Other)
+            && matched_observation_age_ms.is_some_and(|age| age > ttl_ms))
+    )
+}))]
+#[cfg_attr(kani, kani::ensures(|r: &(Decision, ObservedUpdate)| {
+    // Renew iff holder is us. Steal and Standby are never returned for
+    // a holder we own — the rv guard on replace() catches staleness,
+    // not decide().
+    (r.0 == Decision::Renew) == matches!(holder, HolderKind::Us)
+}))]
+#[cfg_attr(kani, kani::ensures(|r: &(Decision, ObservedUpdate)| {
+    // Observed cleared iff holder is empty (graceful step-down).
+    (r.1 == ObservedUpdate::Clear) == matches!(holder, HolderKind::Empty)
+}))]
+#[cfg_attr(kani, kani::ensures(|r: &(Decision, ObservedUpdate)| {
+    // StartObserving iff holder is Other AND no matching observation.
+    (r.1 == ObservedUpdate::StartObserving) == (
+        matches!(holder, HolderKind::Other)
+        && matched_observation_age_ms.is_none()
+    )
+}))]
 pub(crate) fn decide_pure(
     holder: HolderKind,
     matched_observation_age_ms: Option<u64>,
@@ -167,6 +207,13 @@ pub(crate) fn decide_pure(
             // been > ttl since we FIRST saw it (not since the lease's
             // renewTime — we never read that value, only watch rv for
             // change). The holder is dead. Steal.
+            //
+            // Strict `>` (not `>=`) is an implementation choice: steal
+            // only when *strictly* past the TTL. `sched.lease.k8s-lease`
+            // is silent on the boundary case; the Kani contract above
+            // codifies this choice (the mutation `>` → `>=` fails the
+            // contract — that demonstrates non-tautology, not that the
+            // spec mandates `>`).
             Some(age_ms) if age_ms > ttl_ms => (Decision::Steal, ObservedUpdate::Keep),
 
             // Same rv, but not yet stale. Wait.
@@ -643,5 +690,46 @@ mod tests {
         assert_eq!(result, ElectionResult::Leading);
 
         guard.verified().await;
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Verify decide_pure() against its `kani::ensures` contracts for all
+    /// (holder, matched_observation_age_ms, ttl_ms) triples. `HolderKind`,
+    /// `Option<u64>`, and `u64` all impl `kani::Arbitrary`, so the harness
+    /// exercises the full type domain — a strict superset of the inputs
+    /// reachable from production (e.g. `Empty ∧ Some(age)` never occurs).
+    /// Proving over the superset is sound: it implies the property over
+    /// the reachable subset.
+    ///
+    /// CBMC verifies the `ensures` closures hold for every input. Since
+    /// decide_pure() has no loops, no allocation, no recursion, the proof
+    /// is exhaustive over the actual domain (not bounded).
+    ///
+    /// This is a *necessary* condition for `sched.lease.at-most-one-leader`:
+    /// `decide_pure()` never returns Steal for a holder we own, never Renew
+    /// for a holder we don't. The contract proves `decide_pure()` correct
+    /// *given a correct projection* — the string→`HolderKind` and
+    /// `Instant`→`u64` projection in `decide()` is outside the verified
+    /// core and is covered by the `decide()` table tests in `mod tests`
+    /// (which exercise the full `decide()` → projection → `decide_pure()`
+    /// path).
+    /// The *sufficient* condition (the CAS prevents dual leadership when
+    /// both racers' `decide()` returns Steal) is verified by the TLA+ model
+    /// in `docs/spec/models/LeaderElection.tla`.
+    ///
+    /// The verification stack:
+    ///   - table tests (`mod tests`)   → projection: `decide()` end-to-end
+    ///   - Kani contracts (this file)  → pure decision: `decide_pure()`
+    ///   - TLA+ (`LeaderElection.tla`) → protocol: the actions that call `decide()`
+    #[kani::proof_for_contract(decide_pure)]
+    fn check_decide_pure_contract() {
+        let holder: HolderKind = kani::any();
+        let matched_observation_age_ms: Option<u64> = kani::any();
+        let ttl_ms: u64 = kani::any();
+        let _ = decide_pure(holder, matched_observation_age_ms, ttl_ms);
     }
 }
