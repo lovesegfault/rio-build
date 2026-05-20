@@ -50,10 +50,11 @@ pub const BUILD_ID_HEADER: &str = "x-rio-build-id";
 /// `set_parent` ordering, is a NEW trace LINKED to the gateway's, not a
 /// child of it. Jaeger shows two traces connected by an OTel span link.
 ///
-/// The gateway emits THIS id in `STDERR_NEXT` (`rio trace_id: <32-hex>`)
-/// so operators grep the trace that actually spans scheduler→builder (via
-/// the `WorkAssignment.traceparent` data-carry). The gateway's own
-/// trace_id only reaches gateway spans.
+/// The gateway emits THIS id as the `(trace <32-hex>)` suffix on the
+/// `rio: build <id>` `STDERR_NEXT` preamble so operators grep the trace
+/// that actually spans scheduler→builder (via the
+/// `WorkAssignment.traceparent` data-carry). The gateway's own trace_id
+/// only reaches gateway spans.
 ///
 /// Value: 32 lowercase-hex characters (128-bit W3C trace_id). Always
 /// ASCII. Empty/absent → legacy scheduler; gateway falls back to its

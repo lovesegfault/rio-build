@@ -478,7 +478,8 @@ don't clear it (reduces throughput).
 #r("obs.trace.scheduler-id-in-metadata")[
   The scheduler sets `x-rio-trace-id` in `SubmitBuild` response metadata to
   its handler span's trace_id (captured AFTER `link_parent()`). The gateway
-  emits THIS id in `STDERR_NEXT` (`rio trace_id: <32-hex>`), not its own.
+  emits THIS id as the `(trace <32-hex>)` suffix on the `rio: build <id>`
+  `STDERR_NEXT` preamble, not its own.
   Rationale: `link_parent()` + `#[instrument]` produces an orphan --- the
   scheduler handler span has its own trace_id, LINKED to the gateway trace
   but not parented. The gateway's trace contains only gateway spans; the

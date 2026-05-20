@@ -74,8 +74,9 @@ pub fn inject_current(metadata: &mut MetadataMap) {
 /// Returns the current span's trace_id as a 32-char lowercase hex string,
 /// or empty if no span is active or the trace context is invalid.
 ///
-/// Used by the gateway to emit `rio trace_id: {hex}` to the Nix client via
-/// `STDERR_NEXT` — gives operators a grep handle for Tempo.
+/// Used by the gateway to emit the `(trace {hex})` suffix on the
+/// `rio: build <id>` `STDERR_NEXT` preamble — gives operators a grep
+/// handle for Tempo.
 pub fn current_trace_id_hex() -> String {
     use opentelemetry::trace::TraceContextExt;
     let cx = tracing::Span::current().context();
