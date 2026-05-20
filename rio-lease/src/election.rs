@@ -296,6 +296,7 @@ impl LeaderElection {
     ///
     /// On successful steal, clear `observed` — we're the holder
     /// now, the observed-record tracks OTHER holders.
+    // r[impl sched.lease.at-most-one-leader]
     async fn replace(
         &mut self,
         mut lease: Lease,
