@@ -265,7 +265,7 @@ impl SchedulerDb {
         //
         // bd.exec_id is the build↔exec observation recorded by the
         // completion handler on Completed/Failed — see
-        // r[sched.merge.exec-correlation]. It comes from the JOIN'd
+        // r[sched.merge.exec-correlation+2]. It comes from the JOIN'd
         // `build_derivations` edge (already in the query), not a new
         // table; nullable, NOT COALESCE'd (the proto layer maps None →
         // empty string and the dashboard treats empty as "fall back to

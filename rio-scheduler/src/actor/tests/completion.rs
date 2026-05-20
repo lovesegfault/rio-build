@@ -3396,7 +3396,7 @@ async fn test_infra_retry_cap_uniform_across_reasons(
 /// PG with the established 10ms × 100 pattern rather than asserting
 /// immediately after `barrier()` (which only drains the actor loop, not
 /// background tasks).
-// r[verify sched.merge.exec-correlation]
+// r[verify sched.merge.exec-correlation+2]
 #[tokio::test]
 async fn completion_records_build_exec_correlation() -> TestResult {
     let (db, handle, _task, mut stream_rx) = setup_with_worker("ec-worker", "x86_64-linux").await?;

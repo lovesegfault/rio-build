@@ -301,9 +301,12 @@ impl RecoveryDerivationRow {
 /// `exec_id` comes from the `build_derivations` edge (the build↔exec
 /// observation), not `derivations` — the same drv can have a different
 /// `exec_id` per build (rebuilt after GC, retried). NULL until the
-/// completion handler records it on `Completed`/`Failed`; stays NULL
-/// for `Cached` and never-ran terminals (no execution to record). The
-/// dashboard falls back to "latest exec" when empty.
+/// completion handler (or recovery's orphan adoption) records it after
+/// a terminal where an execution actually ran: `Completed`, `Poisoned`,
+/// timeout-exhausted `Cancelled`. Stays NULL for `Cached`,
+/// `DependencyFailed`, `Skipped`, never-dispatched terminals, and
+/// non-terminal drvs (no execution to record). The dashboard falls back
+/// to "latest exec" when empty.
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct GraphNodeRow {
     pub derivation_id: Uuid,

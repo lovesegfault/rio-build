@@ -1058,7 +1058,7 @@ impl DagActor {
         // dashboard build view can fetch this exact `drv_logs` row
         // instead of falling back to latest-exec (wrong after a retry
         // or a later rebuild of the same drv). Best-effort, spawned —
-        // see record_exec_correlation. r[impl sched.merge.exec-correlation]
+        // see record_exec_correlation. r[impl sched.merge.exec-correlation+2]
         self.record_exec_correlation(drv_hash, &interested_builds);
         let _ = &mut t_phase;
         let total = t_total.elapsed();
@@ -1877,7 +1877,7 @@ impl DagActor {
         // cascaded `DependencyFailed` parent never executed, so its
         // `state.exec_id` is `None` and `build_derivations.exec_id`
         // stays `NULL` for it (consumers fall back to latest-exec).
-        // r[impl sched.merge.exec-correlation]
+        // r[impl sched.merge.exec-correlation+2]
         self.record_exec_correlation(drv_hash, &trigger_builds);
         let trigger_path = self.dag.path_or_hash_fallback(drv_hash);
         for build_id in &trigger_builds {

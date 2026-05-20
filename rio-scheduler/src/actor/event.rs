@@ -262,9 +262,11 @@ impl BuildEventBus {
     /// `try_send`: if the flusher channel is full (shouldn't happen — 1000
     /// cap and the flusher's S3 PUT latency is sub-second), drop. The 30s
     /// periodic tick still snapshots the (sealed) buffer to
-    /// `logs/periodic/` until `CleanupTerminalBuild` reaps the DAG node
-    /// and discards the buffer (~30s later); no canonical PG row is
-    /// written, so the dashboard sees only the last periodic snapshot.
+    /// `logs/{drv_hash}/{exec_id}.partial.log.zst` and UPSERTs the
+    /// `drv_logs` row with `is_complete=false` until
+    /// `CleanupTerminalBuild` reaps the DAG node and discards the buffer
+    /// (~30s later); the row stays incomplete and the dashboard sees only
+    /// the last periodic snapshot.
     pub(super) fn try_log_flush(&self, req: crate::logs::FlushRequest) {
         let Some(tx) = &self.flush_tx else {
             return;
@@ -315,12 +317,11 @@ impl DagActor {
 
     pub(super) fn get_interested_builds(&self, drv_hash: &DrvHash) -> Vec<Uuid> {
         // Sorted: `interested_builds` is a HashSet (RandomState), so raw
-        // iteration order is process-dependent. The flusher uses
-        // `.first()` to pick the S3-key build_id; without a sort,
-        // re-dispatch across a restart can land the same drv under a
-        // different `logs/{bid}/` prefix → ON CONFLICT repoints PG rows
-        // and orphans the previous blob. Sorting at the chokepoint makes
-        // `.first()` == min(UUID) for all callers.
+        // iteration order is process-dependent. The flusher's S3 key is
+        // now `(drv_hash, exec_id)` and no longer derives from a build_id
+        // — but `record_exec_correlation` and the per-build `BuildEvent`
+        // emitters still iterate this set, and a deterministic order
+        // keeps test assertions and PG-side trace ordering stable.
         let mut v: Vec<Uuid> = self
             .dag
             .node(drv_hash)
@@ -461,7 +462,7 @@ impl DagActor {
     /// hasn't committed (impossible here — merge commits before any
     /// dispatch — but cheap to guard).
     ///
-    /// r[impl sched.merge.exec-correlation]
+    /// r[impl sched.merge.exec-correlation+2]
     pub(super) fn record_exec_correlation(&self, drv_hash: &DrvHash, interested_builds: &[Uuid]) {
         let Some(state) = self.dag.node(drv_hash) else {
             return;

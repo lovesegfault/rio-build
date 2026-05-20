@@ -56,8 +56,8 @@
   // svelte-ignore state_referenced_locally
   const stream: LogStream = createLogStream(drvPath, execId);
 
-  // The build view's GraphNode.exec_id is empty for Cached, never-ran
-  // terminals (DependencyFailed/Cancelled/Skipped), and non-terminal
+  // The build view's GraphNode.exec_id is empty for Cached,
+  // never-dispatched terminals (DependencyFailed/Skipped), and non-terminal
   // drvs — there's no per-build execution to observe. The server falls
   // back to MAX(exec_id) (the latest execution of the drv across all
   // builds), which is the right answer for a cache hit (it observed

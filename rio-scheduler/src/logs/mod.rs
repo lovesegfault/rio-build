@@ -33,11 +33,11 @@ mod flush;
 pub use flush::{FlushRequest, LogFlusher};
 
 /// Extract the 32-char nixbase32 store-path hash from a derivation
-/// identifier for use as the PG `build_logs.drv_hash` column and the
+/// identifier for use as the PG `drv_logs.drv_hash` column and the
 /// `{drv_hash}` component of the S3 key.
 ///
 /// This is the SINGLE source of truth shared by the flusher (write side,
-/// [`log_s3_key`] + `insert_log_rows`) and `AdminService.GetDerivationLogs`
+/// [`log_s3_key`] + `upsert_drv_log`) and `AdminService.GetDerivationLogs`
 /// (read side, PG lookup) so the derivation can never drift. Before this
 /// helper existed, the write side keyed on the full `/nix/store/...` path
 /// while the read side keyed on the basename — the PG lookup never matched
@@ -237,7 +237,7 @@ impl LogBuffers {
     /// `first_line` is the worker-assigned line number of `lines[0]` —
     /// non-zero iff ring eviction kicked in (>RING_CAPACITY lines emitted).
     /// `line_count` may be less than the total emitted by the worker for
-    /// the same reason. The S3 blob and PG `build_logs` row carry
+    /// the same reason. The S3 blob and PG `drv_logs` row carry
     /// `first_line` so the read path operates in the same true-line-number
     /// space as the ring buffer (bug_084: previously the offset was
     /// discarded here and `try_s3` treated the client's `since` cursor as
@@ -620,7 +620,7 @@ mod tests {
 
     /// Regression for bug_084: after ring eviction, `drain` must return
     /// the FIRST surviving line's true number — NOT zero, NOT line_count.
-    /// This is the offset persisted in `build_logs.first_line` so the
+    /// This is the offset persisted in `drv_logs.first_line` so the
     /// S3 read path stays in true-line-number space.
     #[test]
     fn drain_after_eviction_returns_first_surviving_line_number() {

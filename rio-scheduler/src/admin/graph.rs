@@ -54,7 +54,7 @@ fn node_row_to_proto(r: GraphNodeRow) -> GraphNode {
         // From `build_derivations.exec_id` — the per-build observation
         // of which execution this build watched, recorded by the
         // completion handler on Completed/Failed
-        // (r[sched.merge.exec-correlation]). Empty for Cached,
+        // (r[sched.merge.exec-correlation+2]). Empty for Cached,
         // never-ran terminals (DependencyFailed, Cancelled, Skipped),
         // and non-terminal — the dashboard falls back to "latest exec"
         // for those, which is the right answer (a cache hit observed

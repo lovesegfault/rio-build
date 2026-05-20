@@ -32,10 +32,16 @@ static STREAM_EPOCH_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Upper bound on distinct `derivation_path` values one
 /// `BuildExecution` stream may push to `LogBuffers`. Per
 /// `[Single build per pod, no knob]` a legitimate stream pushes for
-/// exactly ONE; 8 covers reassign/retry slop. A compromised worker
-/// streaming fabricated paths would otherwise create unbounded
-/// DashMap entries that `flush_periodic` iterates serially with one
-/// S3 PUT each — flusher starvation + memory growth + S3 cost.
+/// exactly ONE; 8 covers reassign/retry slop. With `push_for` (the
+/// `(executor, drv)` binding gate) a fabricated path no longer
+/// allocates a `LogBuffers` entry — the load-bearing role of this
+/// cap is bounding the recv task's per-stream `seen_drvs:
+/// HashSet<String>`, which is forwarded to the actor on disconnect
+/// for log-buffer cleanup. Without the cap, a compromised worker
+/// could grow that set (and the `ExecutorDisconnected` command it's
+/// shipped in) without bound. The cap is also a defense-in-depth
+/// layer: if `push_for` ever regressed to the old `or_default()`
+/// behavior, this is the only remaining buffer-allocation bound.
 const MAX_DRVS_PER_STREAM: usize = 8;
 
 #[tonic::async_trait]
