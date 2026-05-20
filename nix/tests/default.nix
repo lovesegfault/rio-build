@@ -937,6 +937,16 @@ in
       # r[verify sched.lease.deletion-cost]
       "graceful-release"
       "failover"
+      # r[verify sched.lease.generation-claim]
+      #   kubectl delete lease destroys the epoch source
+      #   (leaseTransitions resets to 0 on the recreated Lease); the
+      #   next acquisition's generation must still exceed every
+      #   generation the old regime claimed. Asserted against the
+      #   leader_generation_claims ledger (psql), not logs: MAX(gen)
+      #   strictly increases, the ledger is append-only, and the
+      #   lease-derived generation alone (transitions+1) is provably
+      #   below the claimed one — the PG floor did the work.
+      "lease-deletion"
     ];
   };
 

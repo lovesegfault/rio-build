@@ -31,6 +31,12 @@
 #   new leader's pod carries pod-deletion-cost=1 annotation so k8s
 #   RollingUpdate kills the standby first → no leadership churn.
 #
+# sched.lease.generation-claim — verify marker at default.nix:subtests[lease-deletion]
+#   lease-deletion: kubectl delete lease + kill the holder → the next
+#   acquisition derives a low generation from the fresh Lease but the
+#   PG claims-ledger floor pulls it above the old regime's high-water.
+#   Structural psql assertions on leader_generation_claims.
+#
 # Fixture: k3s-full (scheduler.replicas=2, podAntiAffinity spreads across
 # k3s-server + k3s-agent). Caller wiring: see nix/tests/default.nix.
 {
@@ -374,6 +380,143 @@ let
               f"{new_leader!r} acquired but isn't renewing? "
               f"RENEW_INTERVAL=5s → age should be 0-5s in steady state."
           )
+    '';
+
+    lease-deletion = ''
+      # Recover from the failover subtest above: it force-deletes the
+      # leader and does NOT wait for the Deployment replacement, so the
+      # cluster may be at 1/2 here. We are about to kill a leader again
+      # and need a standby to exist for the handover to be a real
+      # cross-process re-acquisition.
+      k3s_server.wait_until_succeeds(
+          "test \"$(k3s kubectl -n ${ns} get deploy rio-scheduler "
+          "-o jsonpath='{.status.readyReplicas}')\" = 2",
+          timeout=120,
+      )
+      k3s_server.wait_until_succeeds(
+          "k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+          "-o jsonpath='{.spec.holderIdentity}' | grep -q rio-scheduler",
+          timeout=90,
+      )
+
+      # ══════════════════════════════════════════════════════════════════
+      # lease-deletion — generation survives destruction of the epoch source
+      # ══════════════════════════════════════════════════════════════════
+      # The leadership generation derives from the Lease's leaseTransitions
+      # (bumped atomically with the holder change by the rv-guarded PUT).
+      # `kubectl delete lease` destroys that counter: the recreated Lease
+      # restarts at transitions=0, so the lease-derived generation restarts
+      # at 1-2. The ONLY thing keeping the new epoch above every generation
+      # the old regime handed to dispatch is the PG floor read during
+      # recovery: GREATEST(MAX(assignments.generation),
+      # MAX(leader_generation_claims.generation)). The claims ledger is the
+      # half of that floor that survives an idle cluster (the assignments
+      # high-water decays via the orphan-derivation sweep + migration 034's
+      # ON DELETE CASCADE) and a depose-before-persist (the claim is
+      # written during recovery, BEFORE dispatch is ungated, so it exists
+      # even if the leader never persisted an assignment).
+      #
+      # Deletion is a plausible operational event, not an exotic one:
+      # `kubectl delete lease` is the documented k8s remedy for a stuck
+      # election, and the platform treats leaseTransitions as advisory.
+      #
+      # Assertions are STRUCTURAL (psql against the claims ledger), not
+      # log-greps: kubectl-logs polling churns the kubelet log stream
+      # after a force-delete (see build-during-failover's comment) and
+      # the ledger row IS the property under test — the generation an
+      # executor would fence against is exactly MAX(claims).
+      with subtest("lease-deletion: generation stays monotonic across kubectl delete lease"):
+          # Every leadership acquisition so far (bootstrap + the
+          # graceful-release and failover handovers) wrote one claims
+          # row during its recovery. A populated ledger is the
+          # precondition for this subtest to prove anything.
+          rows_before = int(psql_k8s(k3s_server,
+              "SELECT COUNT(*) FROM leader_generation_claims"))
+          gen_before = int(psql_k8s(k3s_server,
+              "SELECT COALESCE(MAX(generation), 0) "
+              "FROM leader_generation_claims"))
+          assert rows_before >= 1 and gen_before >= 1, (
+              f"claims ledger empty before lease deletion "
+              f"(rows={rows_before}, max_gen={gen_before}). The "
+              f"write-ahead claim never ran during any prior "
+              f"acquisition — recovery is not reaching "
+              f"claim_generation()?"
+          )
+          old_leader = leader_pod()
+          tx_before = lease_transitions()
+          print(f"lease-deletion: leader={old_leader} tx={tx_before} "
+                f"max_claim={gen_before} rows={rows_before}")
+
+          # Destroy the epoch source FIRST, then kill the holder. The
+          # other order would let the standby steal the still-intact
+          # lease (inheriting its transition count) before the
+          # deletion lands, and the subtest would degenerate into a
+          # plain failover.
+          kubectl("delete lease rio-scheduler-leader")
+          kubectl(f"delete pod {old_leader} --grace-period=0 --force")
+
+          # A new holder appears on a FRESH lease. Whoever wins
+          # (standby or Deployment replacement) either create()s it at
+          # transitions=0 or steals the live leader's 404-recreated
+          # one at transitions=1 — both derive a generation of 1-2
+          # from the lease alone.
+          k3s_server.wait_until_succeeds(
+              "h=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+              "-o jsonpath='{.spec.holderIdentity}'); "
+              f"test -n \"$h\" && test \"$h\" != '{old_leader}'",
+              timeout=60,
+          )
+
+          # The new epoch's claim row lands during recovery (a few PG
+          # round-trips after the acquire edge). Poll the ledger
+          # itself: MAX(generation) must EXCEED the old regime's
+          # high-water. `SELECT expr` of a boolean prints t/f under
+          # -tA; grep -qx t is the structural wait.
+          k3s_server.wait_until_succeeds(
+              "k3s kubectl -n ${ns} exec rio-postgresql-0 -- "
+              "env PGPASSWORD=rio psql -h 127.0.0.1 -U rio rio -qtAc "
+              f"'SELECT MAX(generation) > {gen_before} "
+              f"FROM leader_generation_claims' | grep -qx t",
+              timeout=90,
+          )
+
+          gen_after = int(psql_k8s(k3s_server,
+              "SELECT MAX(generation) FROM leader_generation_claims"))
+          rows_after = int(psql_k8s(k3s_server,
+              "SELECT COUNT(*) FROM leader_generation_claims"))
+          tx_after = lease_transitions()
+          new_leader = leader_pod()
+
+          # Monotonic across the deletion: the new epoch exceeds every
+          # generation the old regime ever claimed.
+          assert gen_after > gen_before, (
+              f"generation did not advance past the old regime after "
+              f"lease deletion: max_claim {gen_before} -> {gen_after}. "
+              f"The PG floor (max_known_generation) is not pulling the "
+              f"recreated-lease generation above the old high-water."
+          )
+          # Append-only: the old regime's rows survive (forensic
+          # record), the new epoch added its own.
+          assert rows_after > rows_before, (
+              f"claims ledger did not grow across the deletion "
+              f"({rows_before} -> {rows_after} rows). New leader "
+              f"reused or overwrote an old row?"
+          )
+          # Non-vacuity: the lease-derived generation alone
+          # (transitions+1) must be BELOW the actual generation —
+          # otherwise this subtest proved nothing about the PG floor
+          # (the lease could have carried the monotonicity by itself,
+          # e.g. if the deletion silently failed).
+          assert tx_after + 1 < gen_after, (
+              f"lease-derived generation (leaseTransitions+1 = "
+              f"{tx_after + 1}) is not below the claimed generation "
+              f"({gen_after}) — the recreated Lease still carries the "
+              f"old transition count, so the deletion did not actually "
+              f"reset the epoch source and this subtest is vacuous."
+          )
+          print(f"lease-deletion PASS: {old_leader} -> {new_leader}, "
+                f"max_claim {gen_before} -> {gen_after}, "
+                f"rows {rows_before} -> {rows_after}, tx={tx_after}")
     '';
 
     build-during-failover = ''
