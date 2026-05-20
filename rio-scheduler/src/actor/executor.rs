@@ -440,6 +440,13 @@ impl DagActor {
         // ownership check (compromised worker → discard a victim's
         // buffer by sending one `LogBatch{derivation_path=D_victim}`
         // then disconnecting).
+        //
+        // `seen_drvs` carries FULL `derivation_path`s (not the 32-char
+        // `drv_log_hash`) because `hash_for_path` is keyed on full
+        // paths — see the recv task's `LogBatch` arm. The `discard()`
+        // call below normalizes via `drv_log_hash`, so either form
+        // hits the right buffer key; the *gate* is the part that
+        // needs the full path.
         if let Some(bufs) = &self.log_buffers {
             for drv in seen_drvs {
                 if self.dag.hash_for_path(&drv).is_none() {

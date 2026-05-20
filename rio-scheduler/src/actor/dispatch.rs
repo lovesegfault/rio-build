@@ -1890,8 +1890,14 @@ impl DagActor {
             // telemetry side (build_samples.cpu_limit_cores) records this
             // same value at completion — see record_build_sample.
             assigned_cores: state.sched.last_intent.as_ref().map(|i| i.cores),
-            assigned_mem_bytes: None,
-            assigned_disk_bytes: None,
+            // mem/disk are display-only on the worker side — the `rio:
+            // builder` banner renders them; runtime limits come from the
+            // pod's cgroup, which the spawn intent already shaped. Populate
+            // from the same `SolvedIntent` so the banner shows what was
+            // actually fitted instead of `?`. Absent (no intent — wildcard
+            // worker, or pre-ADR-023 path) → banner renders `?`.
+            assigned_mem_bytes: state.sched.last_intent.as_ref().map(|i| i.mem_bytes),
+            assigned_disk_bytes: state.sched.last_intent.as_ref().map(|i| i.disk_bytes),
             // Per-execution identifier minted in `assign_to_worker` and
             // stored on `DerivationState`. The worker echoes this in the
             // log header (display-only). Empty only on the unreachable

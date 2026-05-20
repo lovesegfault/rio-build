@@ -282,14 +282,22 @@ impl ExecutorService for SchedulerGrpc {
                             // Two-step: buffer (never blocks on actor), then forward.
                             //
                             // 0. Per-stream distinct-path cap. The worker is NOT
-                            //    trusted; `push()` only gates on `sealed` so a
-                            //    fabricated path always creates a fresh DashMap
-                            //    entry that `flush_periodic` then iterates with
-                            //    one S3 PUT each. The actor's `hash_for_path`
-                            //    gate runs AFTER push and only drops the
-                            //    gateway-forward, not the buffer entry.
-                            let key = crate::logs::drv_log_hash(&log.derivation_path);
-                            if !seen_drvs.contains(&key) {
+                            //    trusted; before `push_for` (the binding gate), a
+                            //    fabricated path could exhaust this set's memory.
+                            //    The cap bounds it. `seen_drvs` holds the FULL
+                            //    `derivation_path` (not the 32-char `drv_log_hash`)
+                            //    because it round-trips to the actor's
+                            //    `handle_executor_disconnected` cleanup, which
+                            //    looks each entry up via `dag.hash_for_path()` —
+                            //    a map keyed on full store paths. A bare hash
+                            //    would never match, so the cleanup's "discard
+                            //    ONLY paths the DAG has never heard of" gate
+                            //    would degrade to "discard EVERY path the stream
+                            //    touched" — including a completed drv whose
+                            //    `flush_final` is still queued (silent log loss)
+                            //    and a re-dispatched drv's freshly `set_exec`'d
+                            //    entry.
+                            if !seen_drvs.contains(&log.derivation_path) {
                                 if seen_drvs.len() >= MAX_DRVS_PER_STREAM {
                                     metrics::counter!(
                                         "rio_scheduler_log_unknown_drv_dropped_total"
@@ -297,7 +305,7 @@ impl ExecutorService for SchedulerGrpc {
                                     .increment(1);
                                     continue;
                                 }
-                                seen_drvs.insert(key);
+                                seen_drvs.insert(log.derivation_path.clone());
                             }
                             // 1. Ring buffer write — direct, no actor involvement.
                             //    This is the durability path: even if the actor is
