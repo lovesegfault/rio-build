@@ -151,8 +151,116 @@ Tick(n) ==
   /\ clocks' = [clocks EXCEPT ![n] = @ + 1]
   /\ UNCHANGED <<lease, alive, state, snap, obs, fence, gen, genHW, acquiredAt, casRace>>
 
-\* Temporary -- Tasks 3 and 5 expand Next with the apiserver and fault actions.
-Next == \E n \in Nodes : Tick(n)
+\* -----------------------------------------------------------------------
+\* Apiserver round-trip. Get(n) is the GET; Steal/RenewLease are the PUT
+\* (each through ReplaceGuard); Conflict is the 409. All four reset fence[n]
+\* -- any successful round-trip resets the self-fence clock (run_lease_loop()'s
+\* renew arm: "the clock tracks 'am I blind', not 'am I leader'").
+\* -----------------------------------------------------------------------
+
+\* GET the lease. obs[n] update follows decide_pure()'s ObservedUpdate:
+\*   - holder = NULL    -> Clear (steal now, observed-record meaningless)
+\*   - holder = n       -> Keep (we hold it; observed tracks OTHER holders)
+\*   - holder = other, same rv we observed -> Keep (clock still running)
+\*   - holder = other, new rv (or first observation) -> StartObserving
+Get(n) ==
+  /\ alive[n]
+  /\ snap'  = [snap EXCEPT ![n] = lease]
+  /\ fence' = [fence EXCEPT ![n] = clocks[n]]
+  /\ obs'   = [obs EXCEPT ![n] =
+       IF lease.holder = NULL THEN NULL
+       ELSE IF lease.holder = n THEN obs[n]
+       ELSE IF obs[n] /= NULL /\ obs[n].rv = lease.rv THEN obs[n]
+       ELSE [rv |-> lease.rv, since |-> clocks[n]]]
+  /\ UNCHANGED <<clocks, lease, alive, state, gen, genHW, acquiredAt, casRace>>
+
+\* The shared CAS guard for Steal/Renew. NOT a standalone action -- a helper
+\* that Steal and Renew conjoin. The casRace history is recorded HERE: it's
+\* the only place a CAS conflict can be observed. casRace flips when this
+\* node's PUT succeeds at an rv that another currently-Leading node also
+\* acquired at -- the apiserver let two writers through.
+ReplaceGuard(n) ==
+  /\ snap[n] /= NULL
+  /\ snap[n].rv < MaxRv
+  /\ lease.rv = snap[n].rv      \* THE CAS PRECONDITION (deliberately-weakened test 1, Task 4)
+  /\ casRace' = (casRace \/ \E m \in Nodes \ {n} :
+       alive[m] /\ state[m] = "Leading" /\ acquiredAt[m] = snap[n].rv)
+
+\* The decide()->Steal path. Phase-1 expansion: empty-holder OR stale-observed
+\* (the deposed-leader path the spike could not reach). gen[n] is set per
+\* on_acquire() + seed_generation_from() collapsed: the in-memory fetch_add(1)
+\* AND the PG fetch_max happen before recovery_complete=true, so the model
+\* treats them as one atomic step. r[sched.recovery.fetch-max-seed].
+Steal(n) ==
+  LET seeded == IF gen[n] + 1 > genHW + 1 THEN gen[n] + 1 ELSE genHW + 1 IN
+  /\ alive[n]
+  /\ snap[n] /= NULL
+  /\ \/ snap[n].holder = NULL
+     \/ /\ snap[n].holder /= NULL /\ snap[n].holder /= n
+        /\ obs[n] /= NULL /\ obs[n].rv = snap[n].rv
+        /\ clocks[n] - obs[n].since > Ttl
+  /\ ReplaceGuard(n)
+  /\ lease.gen < MaxGen   \* state-space bound; rv bound is in ReplaceGuard
+  \* gen[n] bound is a PRECONDITION (action disabled at the ceiling), not a
+  \* saturating clamp -- saturation would let two nodes reach equal
+  \* generations at MaxGen and falsify StaleLeaderHasStaleGeneration as a
+  \* state-space artifact. Disabling loses nothing: a state where the next
+  \* generation would exceed MaxGen is the exploration boundary, same as
+  \* MaxTime for clocks.
+  /\ seeded <= MaxGen
+  /\ lease' = [holder |-> n, rv |-> snap[n].rv + 1, gen |-> lease.gen + 1]
+  /\ state' = [state EXCEPT ![n] = "Leading"]
+  /\ gen'   = [gen EXCEPT ![n] = seeded]
+  /\ acquiredAt' = [acquiredAt EXCEPT ![n] = snap[n].rv]
+  /\ fence' = [fence EXCEPT ![n] = clocks[n]]
+  /\ obs'   = [obs   EXCEPT ![n] = NULL]      \* on_acquire clears observed
+  /\ snap'  = [snap  EXCEPT ![n] = NULL]      \* spent the snapshot
+  /\ UNCHANGED <<clocks, alive, genHW>>
+
+\* The decide()->Renew path: we hold the lease, refresh renew_time. Bumps rv
+\* (the apiserver bumps on every write); does NOT touch holder/gen.
+\* Named RenewLease (not Renew) -- the constant Renew is RENEW_INTERVAL.
+RenewLease(n) ==
+  /\ alive[n]
+  /\ snap[n] /= NULL /\ snap[n].holder = n
+  /\ ReplaceGuard(n)
+  /\ lease' = [lease EXCEPT !.rv = snap[n].rv + 1]
+  /\ fence' = [fence EXCEPT ![n] = clocks[n]]
+  /\ snap'  = [snap  EXCEPT ![n] = NULL]
+  /\ UNCHANGED <<clocks, alive, state, obs, gen, genHW, acquiredAt>>
+
+\* The 409 path: snap stale. Stamps fence (apiserver answered). If we were
+\* Leading this is an explicit lose -- someone stole between our GET and PUT.
+\* Production distinguishes 409-on-renew (lose) from 409-on-steal (never
+\* led); both end up Following, both reset fence -- the model collapses them.
+Conflict(n) ==
+  /\ alive[n]
+  /\ snap[n] /= NULL /\ lease.rv /= snap[n].rv
+  /\ fence' = [fence EXCEPT ![n] = clocks[n]]
+  /\ state' = [state EXCEPT ![n] = "Following"]
+  /\ snap'  = [snap  EXCEPT ![n] = NULL]
+  /\ UNCHANGED <<clocks, lease, alive, obs, gen, genHW, acquiredAt, casRace>>
+
+\* Persist the in-memory generation to PG. The production leader writes its
+\* generation during dispatch (after recovery_complete=true). The window
+\* between Steal(n) and Persist(n) is real -- a leader that crashes in it
+\* leaves genHW stale, and the next acquirer seeds from the old high-water.
+\* That's the genuinely-untested interleaving Phase-1 reaches.
+Persist(n) ==
+  /\ alive[n]
+  /\ state[n] = "Leading"
+  /\ gen[n] > genHW
+  /\ genHW' = gen[n]
+  /\ UNCHANGED <<clocks, lease, alive, state, snap, obs, fence, gen, acquiredAt, casRace>>
+
+\* Temporary -- Task 5 adds SelfFence, Crash, Recover.
+Next == \E n \in Nodes :
+  \/ Tick(n)
+  \/ Get(n)
+  \/ Steal(n)
+  \/ RenewLease(n)
+  \/ Conflict(n)
+  \/ Persist(n)
 
 Spec == Init /\ [][Next]_vars
 
