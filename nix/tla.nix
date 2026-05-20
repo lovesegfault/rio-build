@@ -15,8 +15,13 @@
 #
 # Caching: the .tla model and .cfg config are eval-time inputs. Editing
 # either rehashes the derivation and re-runs TLC. State space is bounded
-# via .cfg constants — keep CI runs ≲30s; an unbounded model belongs in
-# a manual `packages.*` target, not here.
+# via .cfg constants. A check around ~1min needs no further optimization;
+# there is no hard ceiling, but a model over ~5min should be tuned if
+# that's possible without losing the interleavings that make its
+# invariants non-vacuous. A correct slow check beats a fast faulty one —
+# never shrink constants past the point where a deliberately-weakened
+# test stops producing its counterexample. A genuinely unbounded model
+# belongs in a manual `packages.*` target, not here.
 #
 # r[verify ...] markers live HERE at the wiring point, not in the .tla
 # files — same discipline as nix/kani.nix's `kani-checks` attrset and
