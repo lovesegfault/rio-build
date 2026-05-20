@@ -69,150 +69,91 @@
 (* split: holder.is_empty() / holder == us / holder == other.              *)
 (***************************************************************************)
 
-EXTENDS Integers, FiniteSets
+EXTENDS Integers, FiniteSets, TLC
 
-CONSTANTS Nodes,    \* set of node identities, e.g. {"a", "b", "c"}
-          NULL      \* model value for "no holder"
+CONSTANTS Nodes,    \* set of node identities, e.g. {n1, n2, n3}
+          NULL,     \* model value for "no holder" / "no snapshot"
+          Ttl,      \* LEASE_TTL in ticks
+          Renew,    \* RENEW_INTERVAL in ticks (Ttl/Renew ~= 3)
+          MaxSkew,  \* clock skew bound
+          MaxTime,  \* clock ceiling (state-space bound)
+          MaxGen,   \* generation ceiling (state-space bound)
+          MaxRv     \* rv ceiling (state-space bound)
 
-VARIABLES lease,    \* [holder |-> Nodes \cup {NULL}, rv |-> Nat]
-          state,    \* [Nodes -> {"Standby", "Leading"}]
-          snap      \* [Nodes -> ([holder |-> ..., rv |-> ...] \cup {NULL})]
-                    \* per-node GET snapshot -- what the node believes the
-                    \* lease looks like. The CAS uses snap[n].rv as the
-                    \* expected resourceVersion.
+ASSUME Ttl \in Nat /\ Renew \in Nat /\ Renew >= 1 /\ Ttl >= Renew
+ASSUME MaxSkew \in Nat /\ MaxTime \in Nat /\ MaxGen \in Nat /\ MaxRv \in Nat
 
-vars == <<lease, state, snap>>
+VARIABLES
+  clocks,      \* [Nodes -> 0..MaxTime] -- per-node monotonic clock
+  lease,       \* [holder: Nodes \cup {NULL}, rv: 0..MaxRv, gen: 0..MaxGen]
+  alive,       \* [Nodes -> BOOLEAN] -- process running?
+  state,       \* [Nodes -> {"Following", "Leading"}] -- belief
+  snap,        \* [Nodes -> (LeaseRecord \cup {NULL})] -- last GET'd lease
+  obs,         \* [Nodes -> (ObsRecord \cup {NULL})] -- observed-record clock
+  fence,       \* [Nodes -> 0..MaxTime] -- last successful round-trip
+  gen,         \* [Nodes -> 0..MaxGen] -- in-memory generation (Arc<AtomicU64>)
+  genHW,       \* 0..MaxGen -- PG generation high-water mark (persistent)
+  acquiredAt,  \* [Nodes -> (0..MaxRv \cup {NULL})] -- rv at last acquire
+  casRace      \* BOOLEAN -- has any CAS race been observed?
 
-\* -----------------------------------------------------------------------
-\* Type invariant -- sanity check on the state space.
-\* -----------------------------------------------------------------------
+vars == <<clocks, lease, alive, state, snap, obs, fence, gen, genHW, acquiredAt, casRace>>
 
-LeaseRecord == [holder : Nodes \cup {NULL}, rv : Nat]
+LeaseRecord == [holder : Nodes \cup {NULL}, rv : 0..MaxRv, gen : 0..MaxGen]
+ObsRecord   == [rv : 0..MaxRv, since : 0..MaxTime]
 
 TypeOK ==
-  /\ lease \in LeaseRecord
-  /\ state \in [Nodes -> {"Standby", "Leading"}]
-  /\ snap \in [Nodes -> (LeaseRecord \cup {NULL})]
+  /\ clocks \in [Nodes -> 0..MaxTime]
+  /\ lease  \in LeaseRecord
+  /\ alive  \in [Nodes -> BOOLEAN]
+  /\ state  \in [Nodes -> {"Following", "Leading"}]
+  /\ snap   \in [Nodes -> (LeaseRecord \cup {NULL})]
+  /\ obs    \in [Nodes -> (ObsRecord \cup {NULL})]
+  /\ fence  \in [Nodes -> 0..MaxTime]
+  /\ gen    \in [Nodes -> 0..MaxGen]
+  /\ genHW  \in 0..MaxGen
+  /\ acquiredAt \in [Nodes -> (0..MaxRv \cup {NULL})]
+  /\ casRace \in BOOLEAN
+
+\* SYMMETRY: nodes are interchangeable. Cuts the state space by |Nodes|!.
+perm == Permutations(Nodes)
+
+\* The proof assumption: clocks are bounded-skew. The model does not explore
+\* states that violate this; the proof claim is "safe under skew <= MaxSkew."
+ClockSkewBound ==
+  \A m, n \in Nodes : clocks[m] - clocks[n] <= MaxSkew
 
 \* -----------------------------------------------------------------------
-\* THE safety invariant -- at most one node believes it is leading.
-\* The kube-leader-election 0.43 bug violates this: every CAS racer got
-\* HTTP 200, every racer set its local state to Leading.
+\* Initial state. gen[n] = 1 mirrors the production `AtomicU64::new(1)`
+\* (rio-scheduler/src/main.rs:142, rio-controller/src/main.rs:313). genHW = 0
+\* is an empty PG. lease.gen = 0 is `lease_transitions` before any holder.
 \* -----------------------------------------------------------------------
-
-AtMostOneLeader == Cardinality({n \in Nodes : state[n] = "Leading"}) <= 1
-
-\* -----------------------------------------------------------------------
-\* Initial state: no lease, all standby.
-\* -----------------------------------------------------------------------
-
 Init ==
-  /\ lease = [holder |-> NULL, rv |-> 0]
-  /\ state = [n \in Nodes |-> "Standby"]
-  /\ snap  = [n \in Nodes |-> NULL]
+  /\ clocks = [n \in Nodes |-> 0]
+  /\ lease  = [holder |-> NULL, rv |-> 0, gen |-> 0]
+  /\ alive  = [n \in Nodes |-> TRUE]
+  /\ state  = [n \in Nodes |-> "Following"]
+  /\ snap   = [n \in Nodes |-> NULL]
+  /\ obs    = [n \in Nodes |-> NULL]
+  /\ fence  = [n \in Nodes |-> 0]
+  /\ gen    = [n \in Nodes |-> 1]
+  /\ genHW  = 0
+  /\ acquiredAt = [n \in Nodes |-> NULL]
+  /\ casRace = FALSE
 
 \* -----------------------------------------------------------------------
-\* Actions
+\* Time. clocks[n] advances independently. Always enabled -- CLOCK_MONOTONIC
+\* ticks regardless of process state (alive or not). Bounded skew is a state
+\* CONSTRAINT, not a Tick precondition: it bounds how far one node's clock
+\* can lag another's, not when Tick fires.
 \* -----------------------------------------------------------------------
+Tick(n) ==
+  /\ clocks[n] < MaxTime
+  /\ clocks' = [clocks EXCEPT ![n] = @ + 1]
+  /\ UNCHANGED <<lease, alive, state, snap, obs, fence, gen, genHW, acquiredAt, casRace>>
 
-\* GET the lease -- atomic apiserver read. Snapshots the holder+rv.
-Get(n) ==
-  /\ snap[n] = NULL    \* don't re-GET an unspent snapshot
-  /\ snap' = [snap EXCEPT ![n] = lease]
-  /\ UNCHANGED <<lease, state>>
-
-\* Replace the lease -- apiserver write, CAS-PRECONDITIONED on the
-\* resourceVersion from the preceding GET. The apiserver returns 409
-\* Conflict if the rv changed between GET and PUT. Exactly one of N
-\* racing writers wins. This is the load-bearing line: delete the
-\* `lease.rv = snap[n].rv` test and TLC reproduces the
-\* kube-leader-election 0.43 bug (verified -- that's what the broken
-\* model in this commit's first draft looked like).
-Replace(n) ==
-  IF lease.rv = snap[n].rv
-  THEN \* CAS matched: write succeeds, apiserver bumps rv.
-    /\ lease' = [holder |-> n, rv |-> lease.rv + 1]
-    /\ state' = [state EXCEPT ![n] = "Leading"]
-    /\ snap'  = [snap EXCEPT ![n] = NULL]
-  ELSE \* CAS mismatch: 409 Conflict. Caller treats as not-leading
-       \* (ElectionResult::Conflict in election.rs).
-    /\ state' = [state EXCEPT ![n] = "Standby"]
-    /\ snap'  = [snap EXCEPT ![n] = NULL]
-    /\ UNCHANGED lease
-
-\* The decide()->Steal path: node n GOT a snapshot, the snapshot says
-\* the lease is empty, so steal it. (Spike scope: steal-only-when-empty.)
-Steal(n) ==
-  /\ state[n] = "Standby"
-  /\ snap[n] /= NULL
-  /\ snap[n].holder = NULL
-  /\ Replace(n)
-
-\* The decide()->Renew path: node n is leading and HAS a fresh GET
-\* snapshot showing it as the holder. Renew = Replace at the snapshot's rv.
-\* The CAS in Replace handles the "deposed since GET" case: if snap[n].rv
-\* is stale, the ELSE branch fires and n steps down. (Unreachable in the
-\* spike model -- no other node can ever pass the CAS once n is leading --
-\* but the structure is what the Phase-1 model will exercise.)
-Renew(n) ==
-  /\ state[n] = "Leading"
-  /\ snap[n] /= NULL
-  /\ snap[n].holder = n
-  /\ Replace(n)
-
-\* The decide()->Standby path for a former leader: node n was Leading
-\* but its GET shows someone else holds the lease. Step down. This is
-\* the `was_leading && result != Leading` edge in election.rs's loop.
-\* (Unreachable in the spike model for the same reason as Renew's 409
-\* branch -- kept for case-structure parallelism with decide().)
-Observe(n) ==
-  /\ state[n] = "Leading"
-  /\ snap[n] /= NULL
-  /\ snap[n].holder /= n
-  /\ state' = [state EXCEPT ![n] = "Standby"]
-  /\ snap'  = [snap EXCEPT ![n] = NULL]
-  /\ UNCHANGED lease
-
-\* A standby node whose snapshot shows someone else holds the lease.
-\* Spike scope: can't steal-when-non-empty (no time model). Clear the
-\* snapshot so the node re-GETs next tick. Two reasons to keep it:
-\*   (a) Fidelity: the implementation's try_acquire_or_renew() loop
-\*       always GETs at the top of every tick, even when the node
-\*       already knows it's standby. Discard models that per-tick
-\*       re-GET cycle without modeling the observed-record clock.
-\*   (b) Phase-1 forward-compat: once Renew's 409 branch becomes
-\*       reachable in the full model, a deposed leader lands Standby
-\*       with a stale non-NULL snap and would have no enabled action
-\*       without Discard.
-\* Note Discard is NOT load-bearing for the spike's deadlock check:
-\* dropping it from Next leaves the same 524 distinct states with no
-\* deadlock (verified). Next is `\E n \in Nodes`, and the leader
-\* always has an enabled action (Get/Renew), so TLC's *global*
-\* deadlock check never trips even when a per-node standby is stuck.
-Discard(n) ==
-  /\ state[n] = "Standby"
-  /\ snap[n] /= NULL
-  /\ snap[n].holder /= NULL
-  /\ snap' = [snap EXCEPT ![n] = NULL]
-  /\ UNCHANGED <<lease, state>>
-
-Next ==
-  \E n \in Nodes :
-    \/ Get(n)
-    \/ Steal(n)
-    \/ Renew(n)
-    \/ Observe(n)
-    \/ Discard(n)
+\* Temporary -- Tasks 3 and 5 expand Next with the apiserver and fault actions.
+Next == \E n \in Nodes : Tick(n)
 
 Spec == Init /\ [][Next]_vars
 
-\* -----------------------------------------------------------------------
-\* State-space bound -- TLC explores all reachable states; without this
-\* the rv counter is unbounded and TLC never terminates.
-\* -----------------------------------------------------------------------
-
-MaxRv == 4
-
-StateBound == lease.rv <= MaxRv
-
-===============================================================================
+==========================================================================
