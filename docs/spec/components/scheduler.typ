@@ -188,20 +188,22 @@ recv loop. Unlike #rref("sched.log.batch-binding"), whose check is colocated
 with the ring buffer in the recv task (because the durability write must
 bypass the actor's bounded mpsc), phase updates have no recv-task side effect
 --- they go only to the broadcast channel, which the actor owns. The gate
-therefore runs in the actor against `state.assigned_executor` --- the
-authoritative assignment record (set by `assign_to_worker`, cleared at
-completion, restored on failover) --- the same source the
-#rref("sched.completion.idempotent") stale-report guard reads. Unlike that
-guard, this one fails closed on `assigned_executor = None`: completion has
-an upstream `Assigned|Running` status gate that makes `None` unreachable,
-but phase updates have no such gate, and a phase for a drv with no current
+therefore runs in the actor against `(status, assigned_executor)`: the same
+`Assigned|Running` precondition + executor comparison as the
+#rref("sched.completion.idempotent") stale-report guard. The status
+precondition is load-bearing: terminal transitions do not clear
+`assigned_executor` (only re-dispatch paths like `reset_to_ready` do), so for
+the ~60s window before `CleanupTerminalBuild` reaps the DAG node a bare
+executor comparison would accept a late phase from the just-finished
+executor. Unlike the completion guard, this one also fails closed on
+`assigned_executor = None`: a phase for a derivation with no active
 assignment has no live build to render to. Without this gate, a compromised
 executor sending `BuildPhase` with a fabricated `derivation_path` injects
 attacker-controlled text into another tenant's `nix build -L` progress
 display via the gateway's `SetPhase` relay (cosmetic only --- no log or PG
 write). Dropped phase updates increment
 #(refs.metric)("rio_scheduler_phases_rejected_total"), labeled by reason
-(`no_assignment` | `executor_mismatch`).
+(`not_active` | `no_assignment` | `executor_mismatch`).
 
 #r("sched.merge.exec-correlation+2")[
   The scheduler MUST set `build_derivations.exec_id` for every interested

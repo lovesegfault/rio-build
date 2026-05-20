@@ -13,7 +13,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::state::{DrvHash, ExecutorId};
+use crate::state::{DerivationStatus, DrvHash, ExecutorId};
 
 use super::{BUILD_EVENT_BUFFER_SIZE, DagActor, LOG_EVENT_BUFFER_SIZE};
 
@@ -380,7 +380,7 @@ impl DagActor {
     /// silently (same rationale: late-arrival race or buggy worker).
     ///
     /// `executor_id` is the calling `BuildExecution` stream's identity.
-    /// The gate against `state.assigned_executor` is the actor-side
+    /// The gate against `(status, assigned_executor)` is the actor-side
     /// counterpart of `LogBuffers::push_for` (`r[sched.log.batch-binding]`):
     /// both close the same hole — a worker-supplied `derivation_path`
     /// consumed without checking the calling executor actually owns the
@@ -389,13 +389,14 @@ impl DagActor {
     /// gateway renders attacker-controlled `phase` text as `SetPhase`
     /// into another tenant's `nix build -L` progress display.
     ///
-    /// Reads the same source of truth as `ProcessCompletion`'s stale-report
-    /// guard (`r[sched.completion.idempotent]`), but is stricter: that guard
-    /// passes when `assigned_executor` is `None` (a late completion still
-    /// needs reconciling, and its preceding `Assigned|Running` status gate
-    /// makes `None` unreachable anyway); this one drops on `None` because a
-    /// phase update for a finished or never-dispatched drv has no live build
-    /// to render to.
+    /// Two-part gate, mirroring `ProcessCompletion`'s stale-report guard
+    /// (`r[sched.completion.idempotent]`): an `Assigned|Running` status
+    /// precondition, then an exact-match `assigned_executor` comparison.
+    /// Both checks are load-bearing — see `sched.log.phase-binding` in
+    /// `scheduler.typ` for why each matters and what fails without it.
+    /// Unlike that guard, this one also fails closed on
+    /// `assigned_executor == None` (defense-in-depth; unreachable when
+    /// the precondition passed).
     pub(super) fn handle_forward_phase(
         &mut self,
         phase: rio_proto::types::BuildPhase,
@@ -405,12 +406,37 @@ impl DagActor {
             return;
         };
         // r[impl sched.log.phase-binding]
-        // Actor's `state.assigned_executor` is the gate, not the LogBuffers
-        // mirror (which goes stale ~30s post-completion); rationale in spec.
-        let assigned = self
-            .dag
-            .node(&hash)
-            .and_then(|s| s.assigned_executor.as_ref());
+        // Status precondition: `assigned_executor` is NOT cleared at
+        // terminal transitions (only re-dispatch paths clear it), so a
+        // bare executor match would accept a late phase from the
+        // just-finished executor for ~60s until `CleanupTerminalBuild`
+        // reaps the DAG node. Rationale in spec (`sched.log.phase-binding`).
+        let Some(node) = self.dag.node(&hash) else {
+            // hash_for_path() and dag.node() are kept in lockstep —
+            // unreachable, but fail closed (consistent with the
+            // hash_for_path None-arm above).
+            return;
+        };
+        let status = node.status();
+        if !matches!(
+            status,
+            DerivationStatus::Assigned | DerivationStatus::Running
+        ) {
+            tracing::debug!(
+                drv = %phase.derivation_path,
+                sender = %executor_id,
+                status = ?status,
+                reason = "not_active",
+                "dropping phase update for non-active derivation"
+            );
+            metrics::counter!(
+                "rio_scheduler_phases_rejected_total",
+                "reason" => "not_active"
+            )
+            .increment(1);
+            return;
+        }
+        let assigned = node.assigned_executor.as_ref();
         if assigned != Some(executor_id) {
             // debug!, not warn!: the common cause is a benign late
             // phase from a heartbeat-timed-out executor whose drv was

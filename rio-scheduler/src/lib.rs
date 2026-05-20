@@ -330,9 +330,10 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_phases_rejected_total",
-        "BuildPhase dropped by the actor-side (executor, drv) binding check. \
-         Sender's stream is not the executor assigned to the named derivation. \
-         Labeled by reason: no_assignment | executor_mismatch."
+        "BuildPhase dropped by the actor-side (status, executor) binding check. \
+         Either the named derivation has no active (Assigned|Running) assignment, \
+         or the calling stream is not the assigned executor. \
+         Labeled by reason: not_active | no_assignment | executor_mismatch."
     );
     describe_counter!(
         "rio_scheduler_log_gc_swept_total",

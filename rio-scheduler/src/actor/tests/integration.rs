@@ -585,3 +585,83 @@ async fn test_forward_phase_rejects_unassigned_executor() -> TestResult {
     }
     Ok(())
 }
+
+// r[verify sched.log.phase-binding]
+/// `ForwardPhase` from the *same* executor for a drv that has reached a
+/// terminal state MUST be dropped. `transition(Completed)` does not
+/// clear `state.assigned_executor` — only re-dispatch paths
+/// (`reset_to_ready`, transient retry, user-cancel, orphan adoption)
+/// do — so the field stays stamped for ~60s until `CleanupTerminalBuild`
+/// reaps the DAG node. Without the `Assigned|Running` status
+/// precondition, the executor-match gate would still pass for the
+/// just-finished executor in that window. Companion to
+/// `test_forward_phase_rejects_unassigned_executor`, which covers the
+/// cross-executor case.
+///
+/// Structural assertion via metric: a positive `not_active` increment
+/// proves the precondition fired (rather than waiting for the absence
+/// of a `Phase` event on the broadcast). The `assigned_executor`
+/// pre-assert is a fixture-validity guard — if a future change clears
+/// the field at terminal, this test stops exercising the residual
+/// window and should be reviewed.
+#[tokio::test]
+async fn test_forward_phase_rejects_terminal_drv() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (_db, handle, _task, _rx) = setup_with_worker("w1", "x86_64-linux").await?;
+    let build_id = Uuid::new_v4();
+    let drv_hash = "termphase";
+    let drv_path = test_drv_path(drv_hash);
+    let _events = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+
+    // Sanity: drv dispatched to w1.
+    let pre = expect_drv(&handle, drv_hash).await;
+    assert_eq!(pre.status, DerivationStatus::Assigned);
+    assert_eq!(pre.assigned_executor.as_deref(), Some("w1"));
+
+    // Drive the drv to a terminal state via the legitimate executor.
+    complete_success_empty(&handle, "w1", &drv_path).await?;
+
+    // Fixture-validity guard: the residual window MUST exist for this
+    // test to mean anything. `transition(Completed)` does not clear
+    // `assigned_executor`; `CleanupTerminalBuild` runs ~60s later. If
+    // either changes and the field is now cleared at terminal, the
+    // status precondition is no longer load-bearing — re-evaluate
+    // whether this test (and the precondition itself) is still needed.
+    let post = expect_drv(&handle, drv_hash).await;
+    assert_eq!(post.status, DerivationStatus::Completed);
+    assert_eq!(
+        post.assigned_executor.as_deref(),
+        Some("w1"),
+        "transition(Completed) must NOT clear assigned_executor in this \
+         test's setup — otherwise the test no longer exercises the \
+         post-terminal residual window"
+    );
+
+    // Late phase from the now-terminal executor. Same `executor_id` that
+    // owned the assignment — the bare executor-match gate would pass.
+    handle
+        .send_unchecked(ActorCommand::ForwardPhase {
+            phase: rio_proto::types::BuildPhase {
+                derivation_path: drv_path.clone(),
+                phase: "stale-post-terminal".into(),
+            },
+            executor_id: "w1".into(),
+        })
+        .await?;
+    barrier(&handle).await;
+
+    // Status precondition fired with the `not_active` reason. Asserting
+    // the label proves the rejection branch ran — not the executor
+    // mismatch (would be `executor_mismatch`) and not a missing
+    // assignment (would be `no_assignment`).
+    assert_eq!(
+        recorder.get("rio_scheduler_phases_rejected_total{reason=not_active}"),
+        1,
+        "late phase from the just-finished executor must be rejected by \
+         the Assigned|Running status precondition; recorded keys: {:?}",
+        recorder.all_keys()
+    );
+    Ok(())
+}

@@ -588,7 +588,7 @@
         "name": "rio_scheduler_phantom_assignments_drained_total"
       },
       {
-        "help": "BuildPhase dropped by the actor-side (executor, drv) binding check. Sender's stream is not the executor assigned to the named derivation. Labeled by reason: no_assignment | executor_mismatch.",
+        "help": "BuildPhase dropped by the actor-side (status, executor) binding check. Either the named derivation has no active (Assigned|Running) assignment, or the calling stream is not the assigned executor. Labeled by reason: not_active | no_assignment | executor_mismatch.",
         "kind": "counter",
         "name": "rio_scheduler_phases_rejected_total"
       },
