@@ -134,7 +134,17 @@ fn svc_with_db_and_s3(
     db: &TestDb,
     s3: aws_sdk_s3::Client,
 ) -> (AdminServiceImpl, ActorHandle, tokio::task::JoinHandle<()>) {
-    let buffers = Arc::new(LogBuffers::new());
+    svc_with_db_buffers_and_s3(db, Arc::new(LogBuffers::new()), s3)
+}
+
+/// Like [`svc_with_db_and_s3`] but with a caller-supplied `LogBuffers`,
+/// for tests that need to pre-populate the ring buffer (e.g.
+/// `pinned_exec_skips_mismatched_ring_buffer`).
+fn svc_with_db_buffers_and_s3(
+    db: &TestDb,
+    buffers: Arc<LogBuffers>,
+    s3: aws_sdk_s3::Client,
+) -> (AdminServiceImpl, ActorHandle, tokio::task::JoinHandle<()>) {
     let (actor, task) = setup_actor(db.pool.clone());
     let svc = AdminServiceImpl::new(
         buffers,
@@ -530,6 +540,73 @@ async fn chunk_exec_id_reports_resolved_exec() -> anyhow::Result<()> {
         chunks[0].exec_id,
         exec_done.to_string(),
         "S3 chunk carries the resolved exec_id"
+    );
+    Ok(())
+}
+
+/// A request that pins a specific `exec_id` MUST NOT be satisfied by the
+/// ring buffer when the live entry is stamped with a *different*
+/// execution. Without the gate, the dashboard's build view (which pins
+/// `GraphNode.exec_id` for the exact execution that build observed)
+/// would silently get the *current* execution's in-progress lines —
+/// e.g., a rebuild of the same drv triggered by a later build — and the
+/// "approximate / latest available" banner would stay hidden because
+/// `execId` was non-empty. The handler must fall through to S3, which
+/// has the pinned execution's blob (or returns NotFound).
+#[tokio::test]
+async fn pinned_exec_skips_mismatched_ring_buffer() -> anyhow::Result<()> {
+    let db = TestDb::new(&crate::MIGRATOR).await;
+    let drv_path = "/nix/store/abcdefghijklmnopqrstuvwxyz012345-pin.drv";
+    let drv_hash = drv_log_hash(drv_path);
+
+    // exec_old's blob is in S3. exec_new is currently in the ring buffer
+    // (drv was rebuilt — by a retry or by a later build).
+    let compressed = compress_lines(&["old0", "old1"])?;
+    let exec_old = seed_drv_log(
+        &db.pool,
+        &drv_hash,
+        &format!("logs/{drv_hash}/old.log.zst"),
+        2,
+        true,
+    )
+    .await?;
+    let buffers = Arc::new(LogBuffers::new());
+    let exec_new = uuid::Uuid::now_v7();
+    buffers.set_exec(drv_path, exec_new, "executor-2");
+    buffers.push(&mk_batch(drv_path, 0, &[b"new-in-progress"]));
+    assert_ne!(
+        exec_old, exec_new,
+        "precondition: distinct executions (uuid 1.11+ monotonic counter)"
+    );
+
+    let rule = mock!(S3Client::get_object).then_output(move || {
+        GetObjectOutput::builder()
+            .body(ByteStream::from(compressed.clone()))
+            .build()
+    });
+    let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&rule]);
+    let (svc, _actor, _task) = svc_with_db_buffers_and_s3(&db, buffers, s3);
+
+    // Pin exec_old. The ring buffer holds exec_new — the gate must fall
+    // through to S3 and serve exec_old's blob.
+    let resp = svc
+        .get_derivation_logs(Request::new(GetDerivationLogsRequest {
+            exec_id: exec_old.to_string(),
+            derivation_path: drv_path.into(),
+            since_line: 0,
+        }))
+        .await?;
+    let chunks = collect_stream(resp.into_inner()).await;
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(
+        chunks[0].exec_id,
+        exec_old.to_string(),
+        "pinned request must serve the pinned execution, not the live ring buffer"
+    );
+    assert_eq!(
+        chunks[0].lines,
+        vec![b"old0".to_vec(), b"old1".to_vec()],
+        "must serve exec_old's S3 blob, not exec_new's in-progress lines"
     );
     Ok(())
 }

@@ -1165,6 +1165,17 @@ impl DagActor {
         // under-retains. output_paths was just set above
         // (= expected_outputs, verified present in store).
         self.upsert_path_tenants_for(drv_hash).await;
+        // r[impl sched.merge.exec-correlation]
+        // Same gap as path-tenants above: `handle_success_completion`
+        // never fired, so `build_derivations.exec_id` would stay NULL
+        // and the dashboard's build view would fall back to
+        // "latest-exec for this drv" — which can be a *later* build's
+        // rebuild, not the execution this build observed. The exec_id
+        // is recoverable here: the drv was `Assigned`/`Running` at
+        // crash, so `load_nonterminal_derivations`'s `assignments`
+        // JOIN populated `state.exec_id` at recovery load. The helper
+        // no-ops if it didn't (defensive).
+        self.record_exec_correlation(drv_hash, &interested);
         // Terminal → unpin. sweep_stale_live_pins ran BEFORE
         // reconcile (the drv was Assigned/Running in PG then —
         // kept), so it won't catch this one.

@@ -52,8 +52,7 @@ pub(super) async fn get_derivation_logs(
     req: GetDerivationLogsRequest,
 ) -> ReceiverStream<Result<DerivationLogChunk, Status>> {
     // Validate: `derivation_path` is the only required field. `exec_id`
-    // is optional everywhere — empty means "latest execution" for the
-    // S3 path; the ring buffer path is keyed on drv_path alone.
+    // is optional — empty means "latest execution".
     if req.derivation_path.is_empty() {
         return err_stream(Status::invalid_argument(
             "derivation_path is required (exec_id is optional — empty = \
@@ -61,20 +60,8 @@ pub(super) async fn get_derivation_logs(
         ));
     }
 
-    // Step 1: Ring buffer (active or just-completed-not-yet-drained).
-    // Carries `chunk.exec_id` from the buffer entry's `set_exec` stamp
-    // (empty if the entry is unstamped — a recovery gap or test state).
-    if let Some(chunks) = try_ring_buffer(log_buffers, &req.derivation_path, req.since_line) {
-        debug!(
-            drv_path = %req.derivation_path,
-            chunks = chunks.len(),
-            "serving from ring buffer"
-        );
-        return chunks_to_stream(chunks);
-    }
-
-    // Step 2: S3 (completed). Parse the caller's exec_id if they pinned
-    // one; otherwise `try_s3` resolves the latest execution for the drv.
+    // Parse the caller's exec_id BEFORE the ring-buffer probe so a
+    // pinned request is never satisfied by a different execution.
     // Parse failure (non-empty but malformed) is a caller error; an
     // empty string is the "latest" sentinel, not an error.
     let req_exec_id: Option<uuid::Uuid> = if req.exec_id.is_empty() {
@@ -90,7 +77,44 @@ pub(super) async fn get_derivation_logs(
         }
     };
 
-    // For the S3 path, we need drv_hash, not drv_path. The S3 key is
+    // Step 1: Ring buffer (active or just-completed-not-yet-drained).
+    // Carries `chunk.exec_id` from the buffer entry's `set_exec` stamp
+    // (empty if the entry is unstamped — a recovery gap or test state).
+    //
+    // Pinned-exec gate: if the caller pinned an `exec_id` (the
+    // dashboard's build view uses `GraphNode.exec_id` from
+    // `build_derivations` — the *exact* execution that build observed),
+    // serving the live ring buffer is wrong whenever the drv has been
+    // re-dispatched since. A retried build, or a later build's rebuild
+    // of the same drv, replaces the buffer entry with a new execution.
+    // Without this gate the handler would silently serve the new exec's
+    // in-progress lines under the pinned chunk.exec_id, and the
+    // dashboard's "approximate / latest available" banner — which keys
+    // on `execId === ''` — would stay hidden because the request
+    // carried a non-empty pin. Fall through to S3, which has the pinned
+    // execution's blob.
+    let pin_matches_live = req_exec_id
+        .map(|pin| log_buffers.exec_id(&req.derivation_path) == Some(pin))
+        .unwrap_or(true); // empty pin = "latest" = whatever's live
+    if pin_matches_live {
+        if let Some(chunks) = try_ring_buffer(log_buffers, &req.derivation_path, req.since_line) {
+            debug!(
+                drv_path = %req.derivation_path,
+                chunks = chunks.len(),
+                "serving from ring buffer"
+            );
+            return chunks_to_stream(chunks);
+        }
+    } else {
+        debug!(
+            drv_path = %req.derivation_path,
+            requested_exec = %req.exec_id,
+            "pinned exec_id does not match live ring buffer; falling through to S3"
+        );
+    }
+
+    // Step 2: S3 (completed, or pinned to an exec that isn't the live
+    // one). We need drv_hash, not drv_path. The S3 key is
     // `logs/{drv_hash}/{exec_id}.log.zst`. The client typically has
     // drv_path (that's what the gateway speaks). We could resolve
     // drv_path→drv_hash via the actor, but the DAG entry is likely

@@ -443,8 +443,9 @@ impl DagActor {
     /// inserts: spawned (not awaited in the actor loop) so a slow PG
     /// can't stall the next command.
     ///
-    /// Called from `handle_success_completion` and
-    /// `terminal_failure_epilogue`, the two terminal paths where an
+    /// Called from `handle_success_completion`,
+    /// `terminal_failure_epilogue`, and recovery's
+    /// `adopt_orphan_completion` — the three terminal paths where an
     /// execution actually ran. NOT called from cascaded
     /// `DependencyFailed`, `Cancelled`, or `Skipped` — those drvs
     /// didn't execute, `state.exec_id` is `None` for them, and
