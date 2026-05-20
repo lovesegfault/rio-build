@@ -508,8 +508,8 @@ impl DagActor {
     /// calls [`Self::discard_log_buffer`] so the old partial buffer is
     /// dropped before the new worker's first push.
     ///
-    /// `status` is recorded in `drv_logs.status` so the read path can
-    /// show outcome alongside the log without a join. The request pins
+    /// `status` lands in `drv_logs.status` (no production read path
+    /// consumes it yet — see `FlushRequest::status`). The request pins
     /// the resolved `exec_id` ([`Self::exec_id_for_terminal`]) so a
     /// re-dispatch racing the flusher's mpsc can't be drained by a stale
     /// request — see `FlushRequest::exec_id`.

@@ -94,8 +94,10 @@ pub struct FlushRequest {
     pub exec_id: Uuid,
     /// Build outcome for `drv_logs.status` (`"succeeded"` / `"failed"` /
     /// `"cancelled"`). `None` for periodic snapshots (build still running).
-    /// Recorded in PG so `rio-cli logs` and the dashboard can show outcome
-    /// alongside the log without a join against `derivations`.
+    /// Written on every final flush but not read by any production path yet —
+    /// `DerivationLogChunk` has no `status` field, so `rio-cli logs` and the
+    /// dashboard cannot surface it without a proto change. Available for ops
+    /// queries.
     pub status: Option<String>,
 }
 
