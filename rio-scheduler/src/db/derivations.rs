@@ -7,7 +7,9 @@ use crate::state::{DerivationStatus, DrvHash, ExecutorId};
 /// the active row should transition to. `None` for non-terminal
 /// statuses (the assignment stays `pending` until re-dispatch
 /// overwrites it via `insert_assignment`'s ON CONFLICT, or a later
-/// terminal write closes it).
+/// terminal write closes it). The recovery join's
+/// `assigned_builder_id IS NOT NULL` guard exists because of this
+/// leaked-`pending` window — see `load_nonterminal_derivations`.
 ///
 /// I-209/I-210: every terminal-status persist now closes the active
 /// assignment row in the same call, so a new terminal-transition

@@ -236,7 +236,8 @@ disconnected worker's log is already lost; only the correlation can be
 reconstructed from `assignments.exec_id`). The actual gate is
 `exec_id_for_terminal`, which reads `state.exec_id` (set by
 `assign_to_worker`, recoverable from `assignments.exec_id` after a leader
-failover) and falls back to the `LogBuffers` ring-buffer entry's stamped
+failover for a currently-assigned derivation; a reset drv's clear is
+preserved across failover) and falls back to the `LogBuffers` ring-buffer entry's stamped
 `exec_id` --- covering poison-while-Ready, where `reset_to_ready` clears
 `state.exec_id` but the buffer entry retains the disconnected execution's
 stamp through the disconnect→re-dispatch window. The helper no-ops only

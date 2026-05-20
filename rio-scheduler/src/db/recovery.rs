@@ -50,7 +50,19 @@ impl SchedulerDb {
     /// (`migrations/001_scheduler.sql:98`, a partial UNIQUE index on
     /// `derivation_id WHERE status IN ('pending', 'acknowledged')`)
     /// guarantees at most one active assignment per derivation, so the
-    /// join cannot fan out. `exec_id` is NULL for unassigned drvs.
+    /// join cannot fan out.
+    ///
+    /// The join additionally requires `d.assigned_builder_id IS NOT NULL`
+    /// so `exec_id` is NULL for any drv that is not *currently*
+    /// dispatched. A reset drv's `assignments` row stays open at
+    /// `pending` (`terminal_assignment_status(Ready) == None` — see
+    /// `db/derivations.rs`), so without the guard the dead execution's
+    /// `exec_id` would re-stamp `state.exec_id` after failover, undoing
+    /// `reset_to_ready()`'s documented clear. `assigned_builder_id IS
+    /// NOT NULL` ⟺ currently dispatched (the only non-NULL writer is
+    /// `record_assignment`); this mirrors the LogBuffers restamp gate's
+    /// `Assigned|Running` filter in `load_dag_from_rows`. Full harm
+    /// chain: `test_recovery_preserves_reset_exec_id_clear`.
     ///
     /// CAVEAT: this query has NO join to builds. A derivation whose
     /// own status is non-terminal loads even if every build that ever
@@ -77,6 +89,7 @@ impl SchedulerDb {
             FROM derivations d
             LEFT JOIN assignments a ON a.derivation_id = d.derivation_id
                                    AND a.status IN ('pending', 'acknowledged')
+                                   AND d.assigned_builder_id IS NOT NULL
             WHERE d.status NOT IN "
         ))
         .fetch_all(&self.pool)

@@ -2167,3 +2167,136 @@ async fn test_orphan_completion_discards_log_buffer() -> TestResult {
 
     Ok(())
 }
+
+/// A derivation that went through `reset_to_ready()` (worker disconnect,
+/// phantom drain, infra/timeout retry below cap) leaves its `assignments`
+/// row open at `pending` — `terminal_assignment_status(Ready)` is `None`,
+/// so `persist_status(Ready, None)` nulls `derivations.assigned_builder_id`
+/// without closing the assignment. Recovery's LEFT JOIN must NOT carry that
+/// leaked row's `exec_id` back into `state.exec_id`: `reset_to_ready()`
+/// cleared it, and re-stamping it on the new leader makes
+/// `exec_id_for_terminal` short-circuit on a carrier with no LogBuffers
+/// entry behind it. A cancel before re-dispatch then fires
+/// `terminal_log_epilogue` for a drv this leader never dispatched — durably
+/// writing `bd.exec_id` to an execution that may have no `drv_logs` row
+/// (dashboard pins to it and gets NotFound instead of the "approximate"
+/// fallback) and queueing a FlushRequest that flush_final's staleness guard
+/// drops.
+///
+/// r[verify sched.merge.exec-correlation+4]
+#[tokio::test]
+async fn test_recovery_preserves_reset_exec_id_clear() -> TestResult {
+    let stale_exec_id = Uuid::now_v7();
+    let drv_tag = "z-reset-noexec-drv";
+    let build_id = Uuid::new_v4();
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // --- Phase 1: post-reset PG shape on the "old leader". ---
+    // merge_single_node leaves the drv `ready` with NULL
+    // assigned_builder_id; the leaked `pending` assignments row carrying
+    // the dead execution's exec_id is what reset_to_ready()'s persist
+    // leaves behind (terminal_assignment_status(Ready) == None never
+    // closes it).
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        merge_single_node(&handle, build_id, drv_tag, PriorityClass::Scheduled).await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+    let (drv_id,): (Uuid,) =
+        sqlx::query_as("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+            .bind(drv_tag)
+            .fetch_one(&db.pool)
+            .await?;
+    sqlx::query(
+        "INSERT INTO assignments (derivation_id, builder_id, generation, status, exec_id) \
+         VALUES ($1, 'gone-worker', 1, 'pending', $2)",
+    )
+    .bind(drv_id)
+    .bind(stale_exec_id)
+    .execute(&db.pool)
+    .await?;
+
+    // --- Phase 2: fresh leader recovers with log_buffers + flusher wired. ---
+    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(8);
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, plumbing| {
+        plumbing.log_buffers = Some(log_buffers.clone());
+        plumbing.log_flush_tx = Some(flush_tx);
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // (A) The recovered state honors reset_to_ready()'s clear. The leaked
+    // pending assignment is not a live execution. THE load-bearing red
+    // assertion — stays red regardless of merged_bug_012's landing order.
+    let info = expect_drv(&handle, drv_tag).await;
+    assert_eq!(
+        info.status,
+        DerivationStatus::Ready,
+        "fixture premise: recovered as Ready"
+    );
+    assert_eq!(
+        info.exec_id, None,
+        "recovery must not re-stamp state.exec_id from a leaked 'pending' \
+         assignments row after reset_to_ready() cleared it"
+    );
+    // (B) No LogBuffers restamp either (already enforced by the restamp
+    // gate's own Assigned|Running filter — pinned here so the two
+    // consumers of row.exec_id can't diverge again).
+    assert_eq!(
+        log_buffers.exec_id(&test_drv_path(drv_tag)),
+        None,
+        "no LogBuffers restamp for a drv with no live assignment"
+    );
+
+    // --- Cancel before re-dispatch: the harm path. The sole-interest
+    // Ready drv lands in to_depfail; its exec_id_for_terminal gate must
+    // not fire (no execution to finalize on this leader). ---
+    let (tx, rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id,
+            caller_tenant: None,
+            reason: "test cancel".into(),
+            reply: tx,
+        })
+        .await?;
+    let _ = rx.await??;
+    barrier(&handle).await;
+
+    // (C) No FlushRequest — there is no buffer behind the leaked exec_id;
+    // flush_final would drop the request on its staleness guard and the
+    // enqueue would be pure waste.
+    assert!(
+        flush_rx.try_recv().is_err(),
+        "cancelling a recovered, never-redispatched Ready drv must not \
+         queue a FlushRequest"
+    );
+    // (D) No seal tombstone (terminal_log_epilogue's first step).
+    assert!(
+        !log_buffers.is_sealed(&test_drv_path(drv_tag)),
+        "no seal tombstone for an execution this leader never observed"
+    );
+    // (E) bd.exec_id stays NULL → the dashboard renders the documented
+    // "approximate / latest available" fallback instead of pinning to an
+    // exec that may have no drv_logs row. (record_exec_correlation's
+    // UPDATE is spawned, so this is a belt-and-suspenders check on top of
+    // the synchronous (C)/(D) — if the gate had fired, (C) catches it
+    // deterministically.)
+    let bd_exec: Option<Uuid> = sqlx::query_scalar(
+        "SELECT exec_id FROM build_derivations \
+         WHERE build_id = $1 AND derivation_id = $2",
+    )
+    .bind(build_id)
+    .bind(drv_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        bd_exec, None,
+        "bd.exec_id must stay NULL for a terminal reached without dispatch"
+    );
+
+    Ok(())
+}

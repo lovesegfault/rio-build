@@ -173,6 +173,7 @@ impl DagActor {
         self.dag.node(drv_hash).map(|s| DebugDerivationInfo {
             status: s.status(),
             assigned_executor: s.assigned_executor.as_ref().map(|w| w.to_string()),
+            exec_id: s.exec_id,
             output_paths: s.output_paths.clone(),
             retry: s.retry.clone(),
             ca: s.ca.clone(),

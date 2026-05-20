@@ -992,8 +992,9 @@ pub const M_060: () = ();
 /// for IA, modular hash for CA — they cannot be joined directly).
 ///
 /// Adds `assignments.exec_id` (recovery carrier — the new leader reloads it
-/// for active assignments after failover so the flusher keys subsequent
-/// uploads correctly) and `build_derivations.exec_id` (build↔exec
+/// for currently-dispatched derivations after failover so the flusher keys
+/// subsequent uploads correctly; a reset drv's leaked `pending` row is not
+/// reloaded) and `build_derivations.exec_id` (build↔exec
 /// correlation — set by the completion handler on terminal paths where an
 /// execution ran: `Completed`, `Poisoned`, `Cancelled` reached from
 /// `Assigned`/`Running`, and `Cancelled`/`DependencyFailed` swept by a

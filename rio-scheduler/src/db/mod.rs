@@ -255,9 +255,13 @@ pub(crate) struct RecoveryDerivationRow {
     pub floor_disk_bytes: i64,
     pub floor_deadline_secs: i64,
     /// Per-execution identifier from the active `assignments` row
-    /// (`migrations/061`). `None` for unassigned drvs (no
-    /// pending/acknowledged assignment). Recovery re-stamps this onto
-    /// `LogBuffers` so the new leader's flusher keys the right S3 blob.
+    /// (`migrations/061`). `None` unless the drv is currently dispatched
+    /// (`assigned_builder_id IS NOT NULL`) — a reset drv's assignments row
+    /// stays open at `pending`, so "has an active assignment row" is NOT
+    /// "has a live execution"; the JOIN filters on the builder column to
+    /// preserve `reset_to_ready()`'s exec_id clear across failover.
+    /// Recovery re-stamps this onto `LogBuffers` so the new leader's
+    /// flusher keys the right S3 blob.
     pub exec_id: Option<Uuid>,
 }
 

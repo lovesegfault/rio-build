@@ -58,6 +58,9 @@ pub struct DebugExecutorInfo {
 pub struct DebugDerivationInfo {
     pub status: DerivationStatus,
     pub assigned_executor: Option<String>,
+    /// Per-execution carrier — `None` unless an assignment is live or a
+    /// terminal epilogue is about to read it. See `DerivationState::exec_id`.
+    pub exec_id: Option<uuid::Uuid>,
     pub output_paths: Vec<String>,
     pub retry: crate::state::RetryState,
     pub ca: crate::state::CaState,

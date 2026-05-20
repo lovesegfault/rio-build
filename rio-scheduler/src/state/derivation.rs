@@ -786,6 +786,12 @@ pub struct DerivationState {
     /// exec_id, which `reset_to_ready` does NOT clear (the lines and
     /// stamp are still needed by the periodic flusher in the
     /// reset→re-dispatch window).
+    ///
+    /// Recovery preserves the clear across leader failover: the recovery
+    /// query only carries `assignments.exec_id` for currently-assigned
+    /// drvs (`load_nonterminal_derivations`), so a reset drv's leaked
+    /// `pending` assignments row cannot re-stamp this field on the new
+    /// leader.
     pub exec_id: Option<Uuid>,
     /// Scheduling hints (estimator outputs, resource_floor, critical-path priority).
     pub sched: SchedHint,
@@ -996,10 +1002,11 @@ impl DerivationState {
             status,
             interested_builds: HashSet::new(), // populated by build_derivations join
             assigned_executor: row.assigned_builder_id.map(Into::into),
-            // From the active `assignments` row (see
-            // `load_nonterminal_derivations`). Recovery re-stamps the
-            // LogBuffers ring buffer from this so the new leader's
-            // flusher keys the right S3 blob; see `load_dag_from_rows`.
+            // From the active `assignments` row, scoped by the JOIN to
+            // currently-assigned drvs (`load_nonterminal_derivations`) —
+            // NULL for a drv whose dispatch was reset, so recovery
+            // preserves `reset_to_ready()`'s clear. Recovery re-stamps
+            // the LogBuffers ring buffer from this; see `load_dag_from_rows`.
             exec_id: row.exec_id,
             sched: SchedHint {
                 // M_044: persisted reactive floor. PG bigint → i64;
