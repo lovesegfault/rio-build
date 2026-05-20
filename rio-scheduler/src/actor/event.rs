@@ -401,18 +401,31 @@ impl DagActor {
     /// dropped before the new worker's first push.
     ///
     /// `status` is recorded in `drv_logs.status` so the read path can
-    /// show outcome alongside the log without a join. The flusher reads
-    /// `exec_id` from the ring-buffer entry (stamped by `set_log_exec`),
-    /// not from this request — the actor doesn't carry it here.
+    /// show outcome alongside the log without a join. The request pins
+    /// `state.exec_id` so a re-dispatch racing the flusher's mpsc can't
+    /// be drained by a stale request — see `FlushRequest::exec_id`.
     pub(super) fn trigger_log_flush(&self, drv_hash: &DrvHash, status: &'static str) {
-        let Some(drv_path) = self.dag.path_for_hash(drv_hash).map(String::from) else {
+        let Some(state) = self.dag.node(drv_hash) else {
             // Should be impossible at this call site (completion handlers
             // already validated the hash exists in the DAG), but defensive.
             warn!(drv_hash = %drv_hash, "trigger_log_flush: hash not in DAG, skipping");
             return;
         };
+        let Some(exec_id) = state.exec_id else {
+            // No execution ran (cached terminal, or a recovery/poison path
+            // that never dispatched). There is nothing to key a `drv_logs`
+            // row on; the flusher would skip anyway. Don't queue a request.
+            warn!(
+                drv_hash = %drv_hash,
+                status,
+                "trigger_log_flush: no exec_id on DAG node, skipping (never dispatched?)"
+            );
+            return;
+        };
+        let drv_path = state.drv_path().to_string();
         self.events.try_log_flush(crate::logs::FlushRequest {
             drv_path,
+            exec_id,
             status: Some(status.to_string()),
         });
     }

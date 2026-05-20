@@ -314,7 +314,7 @@ impl ExecutorService for SchedulerGrpc {
                             //    above is a per-stream DoS bound; this is a per-batch
                             //    correctness gate. They're complementary, not redundant.
                             //    r[impl sched.log.batch-binding]
-                            log_buffers.push_for(
+                            let accepted = log_buffers.push_for(
                                 &log.derivation_path,
                                 &log,
                                 executor_id_for_recv.as_str(),
@@ -332,16 +332,26 @@ impl ExecutorService for SchedulerGrpc {
                             //    (which MUST use send_unchecked — a dropped completion
                             //    leaves a derivation stuck Running forever). A dropped
                             //    log batch is a degraded-mode nuisance, not a hang.
-                            let drv_path = log.derivation_path.clone();
-                            if actor_for_recv
-                                .try_send(ActorCommand::ForwardLogBatch {
-                                    drv_path,
-                                    batch: log,
-                                })
-                                .is_err()
-                            {
-                                metrics::counter!("rio_scheduler_log_forward_dropped_total")
-                                    .increment(1);
+                            //
+                            //    Gated on `accepted`: a batch the binding gate dropped
+                            //    is unverified worker input — fanning it out to
+                            //    interested builds' live `nix build -L` streams would
+                            //    let a compromised executor inject log lines into another
+                            //    drv's tail. Same `r[sched.log.batch-binding]` invariant
+                            //    as the ring-buffer write; both consumers of the
+                            //    worker-supplied `derivation_path` must respect the gate.
+                            if accepted {
+                                let drv_path = log.derivation_path.clone();
+                                if actor_for_recv
+                                    .try_send(ActorCommand::ForwardLogBatch {
+                                        drv_path,
+                                        batch: log,
+                                    })
+                                    .is_err()
+                                {
+                                    metrics::counter!("rio_scheduler_log_forward_dropped_total")
+                                        .increment(1);
+                                }
                             }
                         }
                     }

@@ -309,6 +309,13 @@ pub fn describe_metrics() {
         "Final-flush requests dropped due to flusher channel backpressure"
     );
     describe_counter!(
+        "rio_scheduler_log_flush_stale_total",
+        "Final-flush requests dropped because the drv was re-dispatched while the request \
+         was queued (the live ring-buffer exec_id no longer matches the request's). The \
+         re-dispatched execution's log is preserved; the stale request's exec was already \
+         lost when assign_to_worker discarded its buffer."
+    );
+    describe_counter!(
         "rio_scheduler_log_forward_dropped_total",
         "Log batches dropped (actor channel backpressure). Lines are still in the ring buffer."
     );

@@ -307,14 +307,22 @@ impl LogBuffers {
     /// Push a batch with `(executor, drv)` binding enforcement.
     /// r[impl sched.log.batch-binding]
     ///
-    /// Drops the batch (no-op + counted metric + warn log) when:
+    /// Returns `true` if the batch was accepted into the ring buffer.
+    /// Returns `false` (drop: no-op + counted metric + warn log) when:
     /// - no entry exists for `drv_path` (unsolicited drv — does NOT
     ///   create an entry; this changes the legacy [`Self::push`]'s
     ///   `or_default()` behavior, which is itself the threat: a
     ///   fabricated `derivation_path` should not allocate a fresh
     ///   buffer), or
     /// - the entry's `assigned_executor` does not match `executor`
-    ///   (calling stream is not the one assigned this drv).
+    ///   (calling stream is not the one assigned this drv), or
+    /// - the entry is sealed (late batch after terminal).
+    ///
+    /// **The caller MUST gate any sibling consumer on the return value.**
+    /// `r[sched.log.batch-binding]` requires the *ingestion path* to drop
+    /// rejected batches — that includes the recv task's gateway forward,
+    /// not just the ring buffer write. A `false` return means the batch
+    /// is unverified worker input and must not be fanned out.
     ///
     /// The completion path's analogous check
     /// (`sched.completion.output-membership`, `completion.rs`) runs
@@ -333,11 +341,12 @@ impl LogBuffers {
     /// then-`push()` shape would re-`or_default()` a freshly re-stamped
     /// entry and land the old executor's lines in the new exec's buffer
     /// — exactly the cross-executor pollution this gate exists to stop.)
-    pub fn push_for(&self, drv_path: &str, batch: &BuildLogBatch, executor: &str) {
+    #[must_use = "the caller must gate sibling consumers (gateway forward) on acceptance"]
+    pub fn push_for(&self, drv_path: &str, batch: &BuildLogBatch, executor: &str) -> bool {
         let key = drv_log_hash(drv_path);
         if self.sealed.contains(&key) {
             // Late batch after terminal; matches push()'s seal check.
-            return;
+            return false;
         }
         let Some(mut entry) = self.buffers.get_mut(&key) else {
             tracing::warn!(drv = %drv_path, executor, "rejected log batch: no active assignment");
@@ -346,7 +355,7 @@ impl LogBuffers {
                 "reason" => "no_assignment"
             )
             .increment(1);
-            return;
+            return false;
         };
         if entry.assigned_executor.is_none() {
             // Entry created by legacy `push()` (test-only path) — never
@@ -359,7 +368,7 @@ impl LogBuffers {
                 "reason" => "unstamped"
             )
             .increment(1);
-            return;
+            return false;
         }
         if entry.assigned_executor.as_deref() != Some(executor) {
             tracing::warn!(
@@ -371,10 +380,11 @@ impl LogBuffers {
                 "reason" => "executor_mismatch"
             )
             .increment(1);
-            return;
+            return false;
         }
         // Same write-lock guard for check AND write — no TOCTOU window.
         Self::push_into(&mut entry, batch);
+        true
     }
 
     /// Discard a buffer without returning its contents. Also un-seals.
@@ -883,8 +893,10 @@ mod tests {
     fn push_for_rejects_wrong_executor() {
         let bufs = LogBuffers::new();
         bufs.set_exec("drv-a", Uuid::now_v7(), "executor-1");
-        bufs.push_for("drv-a", &mk_batch("drv-a", 0, &[b"line1"]), "executor-2");
-        // Rejected — no lines stored.
+        let accepted = bufs.push_for("drv-a", &mk_batch("drv-a", 0, &[b"line1"]), "executor-2");
+        // Rejected — no lines stored, and the caller is told so it can
+        // gate the gateway forward (the second consumer of the batch).
+        assert!(!accepted);
         assert_eq!(bufs.read_since("drv-a", 0), Some(vec![]));
     }
 
@@ -892,7 +904,8 @@ mod tests {
     fn push_for_rejects_unknown_drv() {
         let bufs = LogBuffers::new();
         // No set_exec → no entry → rejected, does NOT create an entry.
-        bufs.push_for("drv-x", &mk_batch("drv-x", 0, &[b"line1"]), "executor-1");
+        let accepted = bufs.push_for("drv-x", &mk_batch("drv-x", 0, &[b"line1"]), "executor-1");
+        assert!(!accepted);
         assert_eq!(bufs.active_count(), 0);
     }
 
@@ -900,7 +913,8 @@ mod tests {
     fn push_for_accepts_matching_executor() {
         let bufs = LogBuffers::new();
         bufs.set_exec("drv-a", Uuid::now_v7(), "executor-1");
-        bufs.push_for("drv-a", &mk_batch("drv-a", 0, &[b"line1"]), "executor-1");
+        let accepted = bufs.push_for("drv-a", &mk_batch("drv-a", 0, &[b"line1"]), "executor-1");
+        assert!(accepted);
         let lines = bufs.read_since("drv-a", 0).unwrap();
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0], (0, b"line1".to_vec()));
@@ -911,8 +925,26 @@ mod tests {
         let bufs = LogBuffers::new();
         bufs.set_exec("drv-a", Uuid::now_v7(), "executor-1");
         bufs.seal("drv-a");
-        bufs.push_for("drv-a", &mk_batch("drv-a", 0, &[b"late"]), "executor-1");
-        // Sealed → rejected even from the right executor.
+        let accepted = bufs.push_for("drv-a", &mk_batch("drv-a", 0, &[b"late"]), "executor-1");
+        // Sealed → rejected even from the right executor, and the caller
+        // is told so the gateway forward is suppressed too.
+        assert!(!accepted);
         assert_eq!(bufs.read_since("drv-a", 0), Some(vec![]));
+    }
+
+    #[test]
+    fn push_for_rejects_unstamped_entry() {
+        let bufs = LogBuffers::new();
+        // Legacy push() creates an entry with no assigned_executor.
+        // push_for must reject — and report rejection — even though the
+        // entry exists.
+        bufs.push(&mk_batch("drv-a", 0, &[b"legacy"]));
+        let accepted = bufs.push_for("drv-a", &mk_batch("drv-a", 1, &[b"new"]), "executor-1");
+        assert!(!accepted);
+        // Only the legacy line is present.
+        assert_eq!(
+            bufs.read_since("drv-a", 0),
+            Some(vec![(0, b"legacy".to_vec())])
+        );
     }
 }

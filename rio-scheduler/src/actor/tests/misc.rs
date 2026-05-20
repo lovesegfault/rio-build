@@ -2214,6 +2214,7 @@ async fn try_log_flush_silent_on_closed() {
     let bus = BuildEventBus::new(None, Some(tx));
     bus.try_log_flush(crate::logs::FlushRequest {
         drv_path: "x".into(),
+        exec_id: uuid::Uuid::now_v7(),
         status: None,
     });
 

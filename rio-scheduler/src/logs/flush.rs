@@ -78,6 +78,18 @@ pub struct FlushRequest {
     /// source for the S3 key `logs/{drv_hash}/{exec_id}.log.zst` and PG
     /// `drv_logs.drv_hash` column via [`drv_log_hash`].
     pub drv_path: String,
+    /// The execution this request is FOR. The actor reads
+    /// `state.exec_id` at terminal time and pins it here so a stale
+    /// request can't drain a re-dispatched execution's buffer.
+    ///
+    /// `flush_final` compares this against the live ring-buffer entry's
+    /// `exec_id`. Mismatch ⇒ a re-dispatch (`discard` + `set_exec` with a
+    /// new UUIDv7) happened between queuing and processing — the request
+    /// is stale and is dropped without draining. Without the pin,
+    /// `flush_final` would `drain()` the *current* exec's buffer with the
+    /// *stale* exec's status, then `push_for` from the live executor
+    /// would hit `no_assignment` (entry gone) and the whole log is lost.
+    pub exec_id: Uuid,
     /// Build outcome for `drv_logs.status` (`"succeeded"` / `"failed"`).
     /// `None` for periodic snapshots (build still running). Recorded in PG
     /// so `rio-cli logs` and the dashboard can show outcome alongside the
@@ -96,6 +108,16 @@ pub struct LogFlusher {
     /// TTL for `drv_logs` rows + S3 blobs. Validated > 0 at config load
     /// (`Config::validate`). See [`Self::sweep_expired_logs`].
     log_retention_days: u32,
+    /// Leader gate. Periodic snapshots and the GC sweep no-op on
+    /// standbys and ex-leaders. Pre-`drv_logs` the periodic flush wrote
+    /// no PG rows so it was harmless to run unconditionally; now both
+    /// the periodic UPSERT and the GC DELETE+DeleteObjects are
+    /// leader-only writes. The completion-flush arm stays un-gated:
+    /// `FlushRequest`s only arrive from the actor, which only handles
+    /// completions when it holds the lease, and the request carries the
+    /// `exec_id` it's for so a stale post-flap request is dropped by the
+    /// staleness guard regardless.
+    is_leader: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LogFlusher {
@@ -105,6 +127,7 @@ impl LogFlusher {
         pool: PgPool,
         buffers: Arc<LogBuffers>,
         log_retention_days: u32,
+        is_leader: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             s3,
@@ -112,7 +135,18 @@ impl LogFlusher {
             pool,
             buffers,
             log_retention_days,
+            is_leader,
         }
+    }
+
+    /// Whether this replica currently holds the scheduler lease.
+    /// Relaxed is sufficient: this is a periodic poll (every 30s/1h),
+    /// not a synchronization point — a one-tick window where an
+    /// ex-leader's flusher hasn't observed the flip is bounded and
+    /// harmless (the GC DELETE is idempotent; a stale periodic UPSERT
+    /// is overwritten by the new leader's next snapshot).
+    fn is_leader(&self) -> bool {
+        self.is_leader.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Spawn the flusher task. Shutdown is channel-driven: when
@@ -176,11 +210,26 @@ impl LogFlusher {
                     }
 
                     _ = tick.tick() => {
-                        self.flush_periodic().await;
+                        // Leader-gated. A standby's `LogBuffers` is structurally
+                        // empty (no worker streams connect to it), but an
+                        // ex-leader after a lease flap retains its stamped
+                        // buffers and would otherwise keep UPSERTing stale
+                        // `drv_logs` rows and `.partial` blobs every 30s — for
+                        // builds the new leader is now driving under fresh
+                        // `exec_id`s.
+                        if self.is_leader() {
+                            self.flush_periodic().await;
+                        }
                     }
 
                     _ = gc_tick.tick() => {
-                        self.sweep_expired_logs().await;
+                        // Leader-gated. The DELETE is idempotent so a redundant
+                        // sweep on a standby is wasted PG/S3 traffic, not
+                        // corruption — but with `replicas: 2` (chart default)
+                        // it doubles every sweep for nothing.
+                        if self.is_leader() {
+                            self.sweep_expired_logs().await;
+                        }
                     }
                 }
             }
@@ -194,24 +243,66 @@ impl LogFlusher {
     async fn flush_final(&self, req: FlushRequest) {
         // Read exec_id BEFORE drain() removes the entry. The accessor
         // returns None if the entry doesn't exist (silent build, dup
-        // request) or was never set_exec'd — both make the flush a no-op
-        // anyway, so the ordering is safe.
-        let exec_id = self.buffers.exec_id(&req.drv_path);
+        // request) or was never set_exec'd.
+        let live_exec_id = self.buffers.exec_id(&req.drv_path);
+
+        // Stale-request guard. The flusher's mpsc is 1000-deep and a GC
+        // sweep or S3 burst can let requests queue for seconds. In that
+        // window the actor can re-dispatch the same drv (`discard` +
+        // `set_exec` with a fresh UUIDv7). Draining the re-stamped entry
+        // with the stale request's status would (a) record exec₂'s lines
+        // with exec₁'s outcome, marked `is_complete=true`, and (b) leave
+        // `push_for` from exec₂'s worker with no entry to land in — the
+        // entire re-dispatched execution's log is silently lost. Drop the
+        // stale request instead; exec₁'s log was already lost when
+        // `discard()` ran, which is the existing predecessor-cleanup
+        // contract — `assign_to_worker`'s comment names it.
+        //
+        // NOTE: `Some(req.exec_id)` is the *only* shape that proceeds.
+        // `live_exec_id == None` covers both (a) no entry at all (silent
+        // build / dup request — the drain below would be `None` anyway)
+        // and (b) an unstamped entry created by the legacy `push()`
+        // (test-only). Neither can be attributed to `req.exec_id`, so
+        // both skip the upload. The unseal still runs unconditionally —
+        // a stale seal from a request whose buffer was already discarded
+        // would otherwise leak in `sealed` forever.
+        if live_exec_id != Some(req.exec_id) {
+            self.buffers.unseal(&req.drv_path);
+            match live_exec_id {
+                Some(live) => {
+                    warn!(
+                        drv = %req.drv_path,
+                        requested_exec = %req.exec_id,
+                        live_exec = %live,
+                        "dropping stale flush request: drv was re-dispatched"
+                    );
+                    metrics::counter!("rio_scheduler_log_flush_stale_total").increment(1);
+                }
+                None => {
+                    debug!(
+                        drv_path = %req.drv_path,
+                        requested_exec = %req.exec_id,
+                        "no buffer to flush (silent build, dup request, or unstamped entry)"
+                    );
+                }
+            }
+            return;
+        }
+
         let drained = self.buffers.drain(&req.drv_path);
         // Seal bridged completion→drain; that window is now closed.
         // Clear so `sealed` stays bounded even if the recv task is
         // still running (or never saw a LogBatch — silent build).
         self.buffers.unseal(&req.drv_path);
         let Some((first_line, line_count, raw_bytes, lines)) = drained else {
-            // Buffer doesn't exist. Two legitimate causes:
-            // (a) Derivation produced zero log output. Rare but possible
-            //     (e.g., a silent `cp` FOD). No blob to write.
-            // (b) A prior flush_final for the same drv_path already drained it
-            //     (duplicate FlushRequest — actor retries are rare but possible).
-            debug!(drv_path = %req.drv_path, "no buffer to flush (silent build or dup)");
+            // Should be unreachable: the exec_id check above succeeded,
+            // which means the entry exists with the matching stamp.
+            // Defensive against a concurrent discard between the read
+            // and the drain.
+            debug!(drv_path = %req.drv_path, "buffer vanished between exec_id check and drain");
             return;
         };
-        self.upload_and_record(req, exec_id, first_line, line_count, raw_bytes, lines, true)
+        self.upload_and_record(req, first_line, line_count, raw_bytes, lines, true)
             .await;
     }
 
@@ -228,7 +319,23 @@ impl LogFlusher {
         debug!(active = keys.len(), "periodic log snapshot");
 
         for drv_path in keys {
-            let exec_id = self.buffers.exec_id(&drv_path);
+            // Periodic reads exec_id from the live entry — there is no
+            // queued request to go stale, and the snapshot below is taken
+            // under the same scan, so this is the same execution. (The
+            // staleness guard is for `flush_final`, where the request can
+            // sit in the mpsc across a re-dispatch.)
+            let Some(exec_id) = self.buffers.exec_id(&drv_path) else {
+                // Unstamped entry (legacy `push()` test fixture, or a
+                // recovery gap). Nothing to key on — skip. `set_exec` is
+                // always called at `assign_to_worker` and re-stamped by
+                // recovery for active assignments, so this is never hit
+                // in production; warn so the gap is visible if it is.
+                warn!(
+                    drv = %drv_path,
+                    "skipping flush: no exec_id (set_exec never called — recovery gap or test artifact)"
+                );
+                continue;
+            };
             let Some((first_line, line_count, raw_bytes, lines)) = self.buffers.snapshot(&drv_path)
             else {
                 // Buffer vanished between active_keys() and snapshot() —
@@ -238,14 +345,13 @@ impl LogFlusher {
 
             let req = FlushRequest {
                 drv_path,
+                exec_id,
                 // Build still running — outcome unknown. Stays NULL in
                 // PG until the final flush sets it.
                 status: None,
             };
-            self.upload_and_record(
-                req, exec_id, first_line, line_count, raw_bytes, lines, false,
-            )
-            .await;
+            self.upload_and_record(req, first_line, line_count, raw_bytes, lines, false)
+                .await;
         }
     }
 
@@ -261,32 +367,23 @@ impl LogFlusher {
     /// as it complicates the buffer lifecycle for a rare edge case;
     /// is_complete would stay false anyway).
     ///
-    /// `exec_id` is read from the ring-buffer entry by the caller (before
-    /// `drain()` removes it for finals). `None` ⇒ skip: there is no
-    /// meaningful S3 key without it. `set_exec` is always called at
-    /// `assign_to_worker` and re-stamped by recovery for active
-    /// assignments, so a `None` here is a recovery gap or a
-    /// test-construction artifact — drop loudly rather than write under a
-    /// garbage key the read path will never find.
+    /// `req.exec_id` keys the S3 blob and PG row. The actor pins it at
+    /// terminal time for finals; the periodic flusher reads it from the
+    /// live entry (no staleness window). Both callers verify it before
+    /// constructing the request — there is no `None` case here. `set_exec`
+    /// is always called at `assign_to_worker` and re-stamped by recovery
+    /// for active assignments.
     #[allow(clippy::too_many_arguments)] // call-site-local; threading a struct would just rename the args
     async fn upload_and_record(
         &self,
         req: FlushRequest,
-        exec_id: Option<Uuid>,
         first_line: u64,
         line_count: u64,
         raw_bytes: u64,
         lines: Vec<Vec<u8>>,
         is_final: bool,
     ) {
-        let Some(exec_id) = exec_id else {
-            warn!(
-                drv = %req.drv_path,
-                is_final,
-                "skipping flush: no exec_id (set_exec never called — recovery gap or test artifact)"
-            );
-            return;
-        };
+        let exec_id = req.exec_id;
         // set_exec creates an empty ring-buffer entry; the periodic tick
         // would otherwise flush a zero-line `.partial` blob and PG row for
         // the window between dispatch and the worker's first batch (overlay
@@ -787,6 +884,15 @@ mod tests {
         exec_id
     }
 
+    /// Always-leader gate for tests. The leader-gated arms (periodic
+    /// snapshot, GC sweep) only run when the gate is true; tests
+    /// exercise them directly via `flush_periodic()` / `sweep_expired_logs()`
+    /// rather than the spawned loop, so the gate only matters for the
+    /// `spawn`-loop tests.
+    fn always_leader() -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::new(std::sync::atomic::AtomicBool::new(true))
+    }
+
     #[test]
     fn compress_lines_is_zstd_roundtrippable() -> anyhow::Result<()> {
         let lines: Vec<Vec<u8>> = vec![b"hello".to_vec(), b"world".to_vec(), b"!".to_vec()];
@@ -831,11 +937,13 @@ mod tests {
             db.pool.clone(),
             Arc::clone(&buffers),
             30,
+            always_leader(),
         );
 
         flusher
             .flush_final(FlushRequest {
                 drv_path: drv_path.into(),
+                exec_id,
                 status: Some("succeeded".into()),
             })
             .await;
@@ -898,11 +1006,19 @@ mod tests {
         let buffers = Arc::new(LogBuffers::new());
         // DON'T set_exec or push anything.
 
-        let flusher = LogFlusher::new(s3, "test-bucket".into(), db.pool.clone(), buffers, 30);
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            buffers,
+            30,
+            always_leader(),
+        );
 
         flusher
             .flush_final(FlushRequest {
                 drv_path: "nonexistent".into(),
+                exec_id: Uuid::now_v7(),
                 status: Some("failed".into()),
             })
             .await;
@@ -912,6 +1028,81 @@ mod tests {
             .fetch_one(&db.pool)
             .await?;
         assert_eq!(count.0, 0, "no PG row");
+        Ok(())
+    }
+
+    /// A `FlushRequest` queued for exec₁ that arrives after the drv was
+    /// re-dispatched (and the buffer re-stamped with exec₂) must be
+    /// dropped, NOT drained — otherwise the re-dispatched execution's
+    /// in-progress lines would be uploaded under exec₂ with exec₁'s
+    /// `status`, marked `is_complete=true`, and `push_for` from exec₂'s
+    /// worker would land in nothing (entry gone). The whole re-dispatched
+    /// log would be silently lost.
+    /// r[verify obs.log.exec-keyed]
+    #[tokio::test]
+    async fn flush_final_stale_request_does_not_drain_redispatched_exec() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, _deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/aaaa-stale.drv";
+
+        // exec₁ runs and terminates. The actor queues a FlushRequest pinned
+        // to exec₁. Then the drv is re-dispatched (discard + set_exec exec₂).
+        let exec1 = stamp_and_push(&buffers, drv_path, &[b"exec1-line"]);
+        // ... actor would call trigger_log_flush here, queuing exec1 ...
+        buffers.discard(drv_path); // assign_to_worker
+        let exec2 = stamp_and_push(&buffers, drv_path, &[b"exec2-line0", b"exec2-line1"]);
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+
+        // The stale exec₁ request arrives now.
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id: exec1,
+                status: Some("failed".into()),
+            })
+            .await;
+
+        // Stale request dropped: no S3 PUT, no PG row, exec₂'s buffer intact.
+        assert!(puts.lock().unwrap().is_empty(), "stale flush must not PUT");
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM drv_logs")
+            .fetch_one(&db.pool)
+            .await?;
+        assert_eq!(count.0, 0, "stale flush must not write a PG row");
+        assert_eq!(
+            buffers.exec_id(drv_path),
+            Some(exec2),
+            "exec₂'s buffer must survive the stale flush"
+        );
+        assert_eq!(
+            buffers.read_since(drv_path, 0).map(|v| v.len()),
+            Some(2),
+            "exec₂'s lines must survive"
+        );
+
+        // Now the legitimate exec₂ flush arrives and is processed normally.
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id: exec2,
+                status: Some("succeeded".into()),
+            })
+            .await;
+        let row: (Uuid, i64, Option<String>) =
+            sqlx::query_as("SELECT exec_id, line_count, status FROM drv_logs")
+                .fetch_one(&db.pool)
+                .await?;
+        assert_eq!(row.0, exec2);
+        assert_eq!(row.1, 2);
+        assert_eq!(row.2.as_deref(), Some("succeeded"));
         Ok(())
     }
 
@@ -933,6 +1124,7 @@ mod tests {
             db.pool.clone(),
             Arc::clone(&buffers),
             30,
+            always_leader(),
         );
 
         // Both paths should skip.
@@ -940,6 +1132,7 @@ mod tests {
         flusher
             .flush_final(FlushRequest {
                 drv_path: "/nix/store/aaaa-nostamp.drv".into(),
+                exec_id: Uuid::now_v7(),
                 status: Some("succeeded".into()),
             })
             .await;
@@ -967,7 +1160,14 @@ mod tests {
         buffers.set_exec("/nix/store/aaaa-empty.drv", Uuid::now_v7(), "test-worker");
         assert_eq!(buffers.active_count(), 1, "set_exec creates the entry");
 
-        let flusher = LogFlusher::new(s3, "test-bucket".into(), db.pool.clone(), buffers, 30);
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            buffers,
+            30,
+            always_leader(),
+        );
 
         flusher.flush_periodic().await;
 
@@ -996,6 +1196,7 @@ mod tests {
             db.pool.clone(),
             Arc::clone(&buffers),
             30,
+            always_leader(),
         );
 
         flusher.flush_periodic().await;
@@ -1047,6 +1248,7 @@ mod tests {
             db.pool.clone(),
             Arc::clone(&buffers),
             30,
+            always_leader(),
         );
 
         flusher.flush_periodic().await;
@@ -1065,6 +1267,7 @@ mod tests {
         flusher
             .flush_final(FlushRequest {
                 drv_path: drv_path.into(),
+                exec_id,
                 status: Some("succeeded".into()),
             })
             .await;
@@ -1164,7 +1367,7 @@ mod tests {
         // Keys with no `-` so `drv_log_hash` leaves them distinct.
         let exec_fail = stamp_and_push(&buffers, "drvfail", &[b"will-be-lost"]);
         let exec_ok = stamp_and_push(&buffers, "drvok", &[b"will-survive"]);
-        let _ = exec_fail; // S3 PUT fails; never lands in PG.
+        // `exec_fail` is bound to the request below; the upload fails so it never lands in PG.
 
         let flusher = LogFlusher::new(
             client,
@@ -1172,6 +1375,7 @@ mod tests {
             db.pool.clone(),
             Arc::clone(&buffers),
             30,
+            always_leader(),
         );
 
         // First flush → S3 fails. Buffer is drained but upload fails → log
@@ -1179,6 +1383,7 @@ mod tests {
         flusher
             .flush_final(FlushRequest {
                 drv_path: "drvfail".into(),
+                exec_id: exec_fail,
                 status: Some("failed".into()),
             })
             .await;
@@ -1192,6 +1397,7 @@ mod tests {
         flusher
             .flush_final(FlushRequest {
                 drv_path: "drvok".into(),
+                exec_id: exec_ok,
                 status: Some("succeeded".into()),
             })
             .await;
@@ -1237,6 +1443,7 @@ mod tests {
             db.pool.clone(),
             Arc::clone(&buffers),
             30,
+            always_leader(),
         );
 
         flusher.flush_periodic().await;
@@ -1284,7 +1491,15 @@ mod tests {
         buffers.push(&mk_batch("/nix/store/ongoing-llvm.drv", 0, &[b"compiling"]));
 
         let (tx, rx) = mpsc::channel::<FlushRequest>(8);
-        LogFlusher::new(s3, "b".into(), db.pool.clone(), Arc::clone(&buffers), 30).spawn(rx);
+        LogFlusher::new(
+            s3,
+            "b".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        )
+        .spawn(rx);
 
         // Auto-advance drives the interval; tx open so the loop is
         // recv-vs-tick (not the channel-close final sweep).
@@ -1360,6 +1575,7 @@ mod tests {
             db.pool.clone(),
             Arc::clone(&buffers),
             30, // retention: 60d-old → expired, 0d-old → kept
+            always_leader(),
         );
 
         // Expired (60d, incomplete — the no-discriminator case) and
@@ -1423,6 +1639,7 @@ mod tests {
             db.pool.clone(),
             Arc::clone(&buffers),
             30,
+            always_leader(),
         );
 
         // LOG_GC_BATCH + 1 forces a second pass. Per-row INSERT round

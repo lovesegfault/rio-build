@@ -106,14 +106,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Shared log ring buffers. Written by the BuildExecution recv task
     // (inside SchedulerGrpc), drained by the flusher, read by AdminService.
+    // The flusher is spawned AFTER leader election so it can hold a
+    // leader gate — see `init_log_pipeline` below.
     let log_buffers = std::sync::Arc::new(rio_scheduler::logs::LogBuffers::new());
-    let (log_flush_tx, admin_s3) = init_log_pipeline(
-        cfg.log_s3_bucket.as_deref(),
-        cfg.log_retention_days,
-        pool.clone(),
-        Arc::clone(&log_buffers),
-    )
-    .await;
 
     if !cfg.soft_features.is_empty() {
         info!(soft_features = ?cfg.soft_features, "soft-feature stripping enabled");
@@ -162,6 +157,26 @@ async fn main() -> anyhow::Result<()> {
     let is_leader_for_health = leader.is_leader_arc();
     let is_leader_for_grpc = leader.is_leader_arc();
     let leader_for_admin = leader.clone();
+
+    // Spawn the log flusher AFTER the leader gate exists so it can
+    // hold one. `flush_periodic` and `sweep_expired_logs` no-op when
+    // not leader: the periodic UPSERT and the GC DELETE are the leader's
+    // prerogative — a standby's `LogBuffers` is structurally empty (no
+    // worker streams), but an *ex-leader* whose `LogBuffers` is still
+    // stamped from before a lease flap would otherwise keep writing
+    // stale `drv_logs` rows and `.partial` blobs every 30s; and the GC
+    // sweep would run hourly on every replica. The completion-flush arm
+    // stays un-gated — completion flushes are downstream of actor
+    // decisions, and the actor is only fed `FlushRequest`s when it's
+    // the leader (the gateway routes builds to the leader).
+    let (log_flush_tx, admin_s3) = init_log_pipeline(
+        cfg.log_s3_bucket.as_deref(),
+        cfg.log_retention_days,
+        pool.clone(),
+        Arc::clone(&log_buffers),
+        leader.is_leader_arc(),
+    )
+    .await;
 
     // Spawn the event-log persister. Bounded mpsc + single drain
     // task → FIFO write ordering (fire-and-forget spawns would
@@ -794,6 +809,7 @@ async fn init_log_pipeline(
     log_retention_days: u32,
     pool: sqlx::PgPool,
     log_buffers: Arc<rio_scheduler::logs::LogBuffers>,
+    is_leader: Arc<std::sync::atomic::AtomicBool>,
 ) -> (Option<LogFlushTx>, Option<AdminS3>) {
     let Some(bucket) = bucket else {
         tracing::warn!(
@@ -815,6 +831,7 @@ async fn init_log_pipeline(
         pool,
         log_buffers,
         log_retention_days,
+        is_leader,
     );
     flusher.spawn(flush_rx);
     info!(%bucket, "log flusher spawned");
