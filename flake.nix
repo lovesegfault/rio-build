@@ -437,28 +437,22 @@
               # rely on kani-compiler's `default_value = "none"`
               # (kani-compiler/src/args.rs) and only workspace members
               # pass `--reachability=harnesses` via localExtraRustcOpts.
+              # rustc flags for crateBuildKani. Soundness-critical flags
+              # (panic=abort, overflow-checks, always-encode-mir,
+              # mir-enable-passes, --cfg=kani, --check-cfg, …) are now set by
+              # kani-compiler unconditionally (lovesegfault/kani/rio-build's
+              # compiler-defaults patch); we only pass install-layout flags,
+              # routing markers, and the flags kani-compiler deliberately does
+              # NOT default.
               kaniBaseFlags = [
-                # base_rustc_flags() — kani-driver/src/call_single_file.rs
-                "-C"
-                "overflow-checks=on"
+                # Gates `--extern noprelude:` and other restricted flags. Not a
+                # kani-compiler default (caller preference) but load-bearing here.
                 "-Z"
                 "unstable-options"
-                "-Z"
-                "trim-diagnostic-paths=no"
-                "-Z"
-                "human_readable_cgu_names"
-                # deps' MIR encoded for cross-crate reachability
-                "-Z"
-                "always-encode-mir"
-                "--cfg=kani"
-                "-Z"
-                "crate-attr=feature(register_tool)"
-                "-Z"
-                "crate-attr=register_tool(kanitool)"
-                # LibConfig::new() — kani sysroot + library injection.
-                # `--sysroot` points at the kani install root; rustc
-                # appends `lib/rustlib/<target>/lib/`. `-L` makes
-                # libkani.rlib resolvable for the bare `--extern kani`.
+                # LibConfig::new() — kani sysroot + library injection. `--sysroot`
+                # points at the kani install root; rustc appends
+                # `lib/rustlib/<target>/lib/`. `-L` makes libkani.rlib resolvable
+                # for the bare `--extern kani`.
                 "--sysroot"
                 "${kaniToolchain.kani}"
                 "-L"
@@ -467,26 +461,23 @@
                 "kani"
                 "--extern"
                 "noprelude:std=${kaniToolchain.kani}/lib/libstd.rlib"
-                # kani_rustc_flags()
-                "-C"
-                "panic=abort"
-                "-C"
-                "symbol-mangling-version=v0"
+                # The kanitool attribute namespace. NOT a kani-compiler default
+                # because rustc errors on a duplicate registration and cargo kani
+                # already passes these. Build systems must pass them explicitly.
                 "-Z"
-                "panic_abort_tests=yes"
+                "crate-attr=feature(register_tool)"
                 "-Z"
-                "mir-enable-passes=-RemoveStorageMarkers"
-                "--check-cfg=cfg(kani)"
-                # No-op here: buildRustCrate appends `-Clinker=cc`
-                # AFTER extraRustcOpts (build-crate.nix:59-61) and
-                # rustc is last-flag-wins, so `cc` actually links —
-                # and rlibs never invoke a linker anyway. Kept so a
-                # diff against kani-driver/src/call_single_file.rs
-                # shows nothing missing on a kani bump.
+                "crate-attr=register_tool(kanitool)"
+                # No-op here: buildRustCrate appends `-Clinker=cc` AFTER
+                # extraRustcOpts (build-crate.nix), and rustc is last-flag-wins,
+                # so `cc` actually links — and rlibs never invoke a linker
+                # anyway. Kept so a diff against kani-driver's
+                # call_single_file.rs shows nothing missing on a kani bump.
                 "-C"
                 "linker=echo"
-                # marker flag — without it kani-compiler falls back to
-                # vanilla rustc_driver (see kani-compiler/src/main.rs).
+                # Marker flag — without it kani-compiler falls back to vanilla
+                # rustc_driver. This is what gates the compiler-defaults patch:
+                # only kani-mode invocations get the soundness flags.
                 "--kani-compiler"
               ];
               crateBuildKani = mkCrateBuild {
