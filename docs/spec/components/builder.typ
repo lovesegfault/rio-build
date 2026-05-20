@@ -184,11 +184,12 @@ symlinks, and the FUSE attribute layer
 (#rref("builder.fuse.canonical-metadata")) hardcodes canonical times for
 every node type regardless of on-disk state.
 
-#r("builder.fuse.canonical-metadata")[
+#r("builder.fuse.canonical-metadata+2")[
   The FUSE store filesystem MUST present canonical Nix store-path metadata
   (`mtime`/`atime`/`ctime` of one second past the Epoch, `perm` `0o444` for
-  non-executable regular files and `0o555` otherwise, `uid`/`gid` of `0`)
-  rather than the on-disk metadata of the backing cache files.
+  non-executable regular files, `0o777` for symlinks, and `0o555` otherwise,
+  `uid`/`gid` of `0`) rather than the on-disk metadata of the backing cache
+  files.
 ]
 
 The FUSE FS *is* the chroot store's lower layer; its visible metadata is the
@@ -202,7 +203,12 @@ forgets to canonicalize), the build never sees it. Canonical permissions
 also prevent a build from observing a writable mode on an input store path
 and attempting an in-place mutation (overlayfs would silently copy-up; a
 stock Nix build would `EACCES` --- a behavior divergence worth avoiding even
-though no in-tree build relies on it).
+though no in-tree build relies on it). Symlinks are the one exception:
+`canonicalisePathMetaData` never chmods them (Linux has no `lchmod(2)`), so a
+stock daemon presents the Linux-immutable `0o777`; rio mirrors that exactly.
+This does not reintroduce the writable-mode concern --- Linux ignores symlink
+permission bits for access control (`man 7 path_resolution`), so the perm
+value carries no semantics beyond cross-builder parity.
 
 == Prefetch Warm-Gate
 

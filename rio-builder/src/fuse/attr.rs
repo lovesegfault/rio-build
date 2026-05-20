@@ -30,10 +30,10 @@ const STORE_PATH_MTIME: Duration = Duration::from_secs(1);
 /// the chroot store's lower layer — what `stat_to_attr` returns is the
 /// metadata builds receive for their input store paths. Those MUST match
 /// what Nix's reference daemon presents (`canonicalisePathMetaData`):
-/// `mtime=1`, `0o444`/`0o555` perms, `root:root`. Leaking the cache
+/// `mtime=1`, `0o444`/`0o555`/`0o777` perms, `root:root`. Leaking the cache
 /// file's `mtime` is what made `set-source-date-epoch-to-latest.sh` set
 /// `SOURCE_DATE_EPOCH` to the fetch wall-clock and broke `fetchPnpmDeps`.
-// r[impl builder.fuse.canonical-metadata]
+// r[impl builder.fuse.canonical-metadata+2]
 pub fn stat_to_attr(ino: u64, meta: &std::fs::Metadata) -> FileAttr {
     use std::os::unix::fs::MetadataExt;
 
@@ -45,11 +45,14 @@ pub fn stat_to_attr(ino: u64, meta: &std::fs::Metadata) -> FileAttr {
         FileType::RegularFile
     };
 
-    // 0o444 only for non-executable regular files; everything else is
-    // 0o555. NAR has no perm bits beyond a single per-file `executable`
-    // flag, and Nix canonicalizes dirs/symlinks/exec-files identically.
+    // NAR has no perm bits beyond a single per-file `executable` flag.
+    // Nix's `canonicalisePathMetaData` chmods regular files and dirs to
+    // 0o444/0o555 but skips symlinks (`if (!S_ISLNK)` -- Linux has no
+    // `lchmod(2)`), so a stock daemon presents symlinks at 0o777.
     let executable = meta.mode() & 0o111 != 0;
-    let perm: u16 = if kind == FileType::RegularFile && !executable {
+    let perm: u16 = if kind == FileType::Symlink {
+        0o777
+    } else if kind == FileType::RegularFile && !executable {
         0o444
     } else {
         0o555
@@ -109,7 +112,7 @@ mod tests {
     /// is an implementation detail; the FUSE FS *is* the chroot store
     /// and store paths always have:
     ///   - mtime = atime = ctime = 1 second past Epoch
-    ///   - perm  = 0o444 (regular non-exec) / 0o555 (exec, dir, symlink)
+    ///   - perm  = 0o444 (regular non-exec) / 0o555 (exec, dir) / 0o777 (symlink)
     ///   - uid   = gid = 0
     ///
     /// If `stat_to_attr` leaks the cache file's `meta.modified()` /
@@ -118,7 +121,7 @@ mod tests {
     /// `set-source-date-epoch-to-latest.sh` derives a non-deterministic
     /// `SOURCE_DATE_EPOCH`, breaking tar-producing FODs (`fetchPnpmDeps`,
     /// `fetchYarnDeps`, …).
-    // r[verify builder.fuse.canonical-metadata]
+    // r[verify builder.fuse.canonical-metadata+2]
     #[test]
     fn stat_to_attr_canonicalizes_metadata() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
@@ -164,15 +167,15 @@ mod tests {
         assert_eq!(attr.mtime, canon, "directory mtime not canonical");
         assert_eq!(attr.perm, 0o555, "directory perm not 0o555");
 
-        // A symlink → 0o555 (Linux `lstat()` reports 0o777, but Nix's
-        // NAR has no perm bits for symlinks; 0o555 matches the
-        // exec/dir convention and avoids advertising writeability).
+        // A symlink → 0o777. canonicalisePathMetaData skips chmod for
+        // symlinks (`if (!S_ISLNK)`; Linux has no `lchmod()`), so a
+        // stock Nix daemon always presents `S_IFLNK | 0o777`.
         let l = dir.path().join("link");
         std::os::unix::fs::symlink("file.txt", &l)?;
         let attr = stat_to_attr(4, &l.symlink_metadata()?);
         assert_eq!(attr.kind, FileType::Symlink);
         assert_eq!(attr.mtime, canon, "symlink mtime not canonical");
-        assert_eq!(attr.perm, 0o555, "symlink perm not 0o555");
+        assert_eq!(attr.perm, 0o777, "symlink perm not 0o777");
 
         Ok(())
     }
