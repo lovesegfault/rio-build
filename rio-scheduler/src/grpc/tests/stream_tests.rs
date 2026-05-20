@@ -632,15 +632,17 @@ async fn test_log_batch_rejected_paths_do_not_consume_cap() -> anyhow::Result<()
     let sentinel = "/nix/store/fix1-sentinel-test.drv".to_string();
     log_buffers.set_exec(&sentinel, uuid::Uuid::now_v7(), "fix1-worker");
 
-    // 8 distinct UNSOLICITED paths first. Pre-fix, these fill
+    // 8 distinct UNSOLICITED paths, none stamped. Pre-fix, these fill
     // `seen_drvs` to `MAX_DRVS_PER_STREAM` (8) before the binding gate
-    // rejects them. Post-fix, they never enter `seen_drvs`.
+    // rejects them. Post-fix, they never enter `seen_drvs`. NO dash
+    // between `fix1` and `{i}` — `fix1-{i}` `drv_log_hash()`s to "fix1"
+    // and collides with the sentinel's key, going vacuous (bug_016).
     for i in 0..8 {
         stream_tx
             .send(rio_proto::types::ExecutorMessage {
                 msg: Some(rio_proto::types::executor_message::Msg::LogBatch(
                     rio_proto::types::BuildLogBatch {
-                        derivation_path: format!("/nix/store/fix1-{i}-test.drv"),
+                        derivation_path: format!("/nix/store/fix1{i}-test.drv"),
                         lines: vec![b"x".to_vec()],
                         first_line_number: 0,
                         executor_id: "fix1-worker".into(),
@@ -669,13 +671,22 @@ async fn test_log_batch_rejected_paths_do_not_consume_cap() -> anyhow::Result<()
     tokio::time::timeout(Duration::from_secs(2), async {
         while log_buffers
             .read_since(&sentinel, 0)
-            .is_none_or(|v| v.is_empty())
+            .is_none_or(|v| !v.iter().any(|(_, l)| l == b"sentinel"))
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .expect("sentinel batch must land — rejected paths do not consume seen_drvs slots");
+    let lines = log_buffers
+        .read_since(&sentinel, 0)
+        .expect("sentinel buffer must exist after the wait loop");
+    assert_eq!(
+        lines.len(),
+        1,
+        "sentinel buffer must hold exactly the sentinel's line — any other line \
+         means a fake collided with the sentinel's drv_log_hash() key (bug_016)"
+    );
 
     drop(stream_tx);
     let _ = tokio::time::timeout(Duration::from_secs(2), inbound.next()).await;
