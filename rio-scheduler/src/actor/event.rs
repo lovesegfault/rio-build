@@ -528,7 +528,11 @@ impl DagActor {
             // No execution ran (cached terminal, or a poison/cascade path
             // that never dispatched). There is nothing to key a `drv_logs`
             // row on; the flusher would skip anyway. Don't queue a request.
-            warn!(
+            // debug!, not warn!: every cause of a missing exec_id here is a
+            // documented expected no-op — same choice as handle_forward_phase's
+            // binding gate and push_for's reject arms. Pre-refactor this fell
+            // through to flush_final's debug!-level "no buffer" arm.
+            tracing::debug!(
                 drv_hash = %drv_hash,
                 status,
                 "trigger_log_flush: no exec_id (never dispatched)"
