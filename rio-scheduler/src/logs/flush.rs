@@ -263,11 +263,25 @@ impl LogFlusher {
         // build / dup request — the drain below would be `None` anyway)
         // and (b) an unstamped entry created by the legacy `push()`
         // (test-only). Neither can be attributed to `req.exec_id`, so
-        // both skip the upload. The unseal still runs unconditionally —
-        // a stale seal from a request whose buffer was already discarded
-        // would otherwise leak in `sealed` forever.
+        // both skip the upload.
+        //
+        // The `unseal()` is per-arm, NOT unconditional: the seal is keyed
+        // by `drv_log_hash(drv_path)` only, with no per-execution
+        // dimension, so in the `Some(live)` arm an unseal here would
+        // remove the seal that the *live* execution's terminal handler
+        // just set — re-opening `push_for` to post-terminal batches from
+        // the live executor until the live request drains and re-unseals
+        // (post-drain unseal below). Leave the live exec's seal alone;
+        // its own `flush_final` clears it after `drain()`.
+        //
+        // The `None` arm has no live owner of the seal (every re-dispatch
+        // path calls `discard()`, which removes both entry and seal — the
+        // only way to reach `None` with a leftover seal is a dup request,
+        // and the first request's post-drain unseal already cleared it).
+        // Keeping the unseal there is a free defensive bound; it's a
+        // no-op in steady state. `CleanupTerminalBuild` is the actual
+        // backstop if a `FlushRequest` was dropped (`try_send` full).
         if live_exec_id != Some(req.exec_id) {
-            self.buffers.unseal(&req.drv_path);
             match live_exec_id {
                 Some(live) => {
                     warn!(
@@ -279,6 +293,7 @@ impl LogFlusher {
                     metrics::counter!("rio_scheduler_log_flush_stale_total").increment(1);
                 }
                 None => {
+                    self.buffers.unseal(&req.drv_path);
                     debug!(
                         drv_path = %req.drv_path,
                         requested_exec = %req.exec_id,
@@ -1105,6 +1120,93 @@ mod tests {
                 .await?;
         assert_eq!(row.0, exec2);
         assert_eq!(row.1, 2);
+        assert_eq!(row.2.as_deref(), Some("succeeded"));
+        Ok(())
+    }
+
+    /// A stale `FlushRequest` (exec₁) processed after the live execution
+    /// (exec₂) reached terminal must NOT remove exec₂'s seal. The seal is
+    /// keyed by drv path, not by exec_id; an unconditional `unseal()` on
+    /// the stale-mismatch path would re-open `push_for` to post-terminal
+    /// batches from exec₂'s worker during the window between the stale
+    /// request's processing and exec₂'s own `flush_final`.
+    /// r[verify sched.log.batch-binding]
+    #[tokio::test]
+    async fn flush_final_stale_request_preserves_live_exec_seal() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, _deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/aaaa-staleseal.drv";
+
+        // exec₁ runs and terminates. Production order: terminal handler
+        // seals BEFORE queuing the FlushRequest.
+        let exec1 = stamp_and_push(&buffers, drv_path, &[b"exec1-line"]);
+        buffers.seal(drv_path); // terminal_failure_epilogue: seal_log_buffer
+        // ... actor would queue FlushRequest{D, exec1} here ...
+
+        // Drv re-dispatched (poison-clear). discard removes exec₁'s entry
+        // AND exec₁'s seal; set_exec stamps exec₂'s fresh entry.
+        buffers.discard(drv_path); // assign_to_worker: discard_log_buffer
+        let exec2 = stamp_and_push(&buffers, drv_path, &[b"exec2-line0", b"exec2-line1"]);
+
+        // exec₂ reaches terminal. Production order: seal BEFORE queue.
+        buffers.seal(drv_path); // handle_success_completion: seal_log_buffer
+        assert!(
+            buffers.is_sealed(drv_path),
+            "exec₂'s terminal handler sealed"
+        );
+        // ... actor would queue FlushRequest{D, exec2} here ...
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+
+        // The flusher dequeues exec₁'s STALE request first (FIFO).
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id: exec1,
+                status: Some("failed".into()),
+            })
+            .await;
+
+        // The stale request must not remove exec₂'s seal: a late batch
+        // from exec₂'s worker (still the assigned executor on the live
+        // entry) must continue to be rejected until exec₂'s own
+        // `flush_final` drains and clears the seal.
+        assert!(
+            buffers.is_sealed(drv_path),
+            "stale flush_final must not unseal the live execution"
+        );
+        assert!(
+            !buffers.push_for(drv_path, &mk_batch(drv_path, 2, &[b"late"]), "test-worker"),
+            "post-terminal batch from the live exec's worker must stay sealed out"
+        );
+        assert!(puts.lock().unwrap().is_empty(), "stale flush must not PUT");
+
+        // exec₂'s own request arrives. It drains, uploads, and unseals.
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id: exec2,
+                status: Some("succeeded".into()),
+            })
+            .await;
+        assert!(
+            !buffers.is_sealed(drv_path),
+            "live exec's own flush_final unseals after drain"
+        );
+        let row: (Uuid, i64, Option<String>) =
+            sqlx::query_as("SELECT exec_id, line_count, status FROM drv_logs")
+                .fetch_one(&db.pool)
+                .await?;
+        assert_eq!(row.0, exec2);
+        assert_eq!(row.1, 2, "the late batch must not have landed");
         assert_eq!(row.2.as_deref(), Some("succeeded"));
         Ok(())
     }
