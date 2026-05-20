@@ -466,12 +466,13 @@ impl LogBuffers {
 
     /// Mark `drv_path` terminal: subsequent [`Self::push`] calls drop.
     ///
-    /// Called by the actor's completion handlers (`handle_success_completion`,
-    /// `terminal_failure_epilogue`) BEFORE `trigger_log_flush`. The flusher's
-    /// [`Self::drain`] still owns buffer removal — sealing only prevents
-    /// post-drain recreation by a late batch. Any buffer present at seal
-    /// time is left for the flusher; sealing then draining yields the same
-    /// contents as draining alone.
+    /// Called by the actor's `terminal_log_epilogue` (via `seal_log_buffer`)
+    /// BEFORE `trigger_log_flush`; see `terminal_log_epilogue`'s rustdoc for
+    /// the terminal-path caller list. The flusher's [`Self::drain`] still
+    /// owns buffer removal — sealing only prevents post-drain recreation by
+    /// a late batch. Any buffer present at seal time is left for the
+    /// flusher; sealing then draining yields the same contents as draining
+    /// alone.
     ///
     /// Idempotent. Retry / re-dispatch un-seals via [`Self::unseal`] (or
     /// [`Self::discard`], which also un-seals).

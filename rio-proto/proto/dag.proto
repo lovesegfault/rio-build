@@ -137,7 +137,7 @@ message GraphNode {
   string assigned_executor_id = 5; // empty if unassigned
   // exec_id of the execution this build observed for this drv. Set after
   // a terminal where an execution actually ran (Completed, Poisoned,
-  // timeout-exhausted Cancelled, recovery's orphan adoption); empty for
+  // Cancelled from Assigned/Running, recovery's orphan adoption); empty for
   // Cached, DependencyFailed, Skipped, never-dispatched terminals, and
   // non-terminal. Empty → dashboard falls back to latest.
   string exec_id = 6;

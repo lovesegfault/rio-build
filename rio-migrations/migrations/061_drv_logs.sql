@@ -32,6 +32,6 @@ CREATE INDEX drv_logs_started_at ON drv_logs (started_at);
 ALTER TABLE assignments ADD COLUMN exec_id UUID;
 
 -- build_id ↔ exec_id correlation. Set on terminal paths where an execution
--- ran (Completed, Poisoned, timeout-exhausted Cancelled); NULL for
+-- ran (Completed, Poisoned, Cancelled from Assigned/Running); NULL for
 -- Cached/DependencyFailed/Skipped/never-dispatched/non-terminal.
 ALTER TABLE build_derivations ADD COLUMN exec_id UUID;
