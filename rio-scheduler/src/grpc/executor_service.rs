@@ -275,8 +275,16 @@ impl ExecutorService for SchedulerGrpc {
                             // Same try_send semantics as ForwardLogBatch:
                             // a dropped phase update is cosmetic (nom
                             // misses one phase column refresh), not a hang.
+                            //
+                            // (executor, drv) binding is checked actor-side
+                            // in handle_forward_phase — Phase has no
+                            // ring-buffer write to colocate a recv check
+                            // with. r[sched.log.phase-binding].
                             if actor_for_recv
-                                .try_send(ActorCommand::ForwardPhase { phase })
+                                .try_send(ActorCommand::ForwardPhase {
+                                    phase,
+                                    executor_id: executor_id_for_recv.clone().into(),
+                                })
                                 .is_err()
                             {
                                 metrics::counter!("rio_scheduler_log_forward_dropped_total")

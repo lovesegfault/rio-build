@@ -378,10 +378,64 @@ impl DagActor {
     /// [`handle_forward_log_batch`] without the ring-buffer side: phase
     /// is a state edge, not log content. Unknown drv_path → drop
     /// silently (same rationale: late-arrival race or buggy worker).
-    pub(super) fn handle_forward_phase(&mut self, phase: rio_proto::types::BuildPhase) {
+    ///
+    /// `executor_id` is the calling `BuildExecution` stream's identity.
+    /// The gate against `state.assigned_executor` is the actor-side
+    /// counterpart of `LogBuffers::push_for` (`r[sched.log.batch-binding]`):
+    /// both close the same hole — a worker-supplied `derivation_path`
+    /// consumed without checking the calling executor actually owns the
+    /// assignment. Without it, a compromised builder spoofs
+    /// `BuildPhase{derivation_path: <victim>, phase: <text>}` and the
+    /// gateway renders attacker-controlled `phase` text as `SetPhase`
+    /// into another tenant's `nix build -L` progress display.
+    ///
+    /// Reads the same source of truth as `ProcessCompletion`'s stale-report
+    /// guard (`r[sched.completion.idempotent]`), but is stricter: that guard
+    /// passes when `assigned_executor` is `None` (a late completion still
+    /// needs reconciling, and its preceding `Assigned|Running` status gate
+    /// makes `None` unreachable anyway); this one drops on `None` because a
+    /// phase update for a finished or never-dispatched drv has no live build
+    /// to render to.
+    pub(super) fn handle_forward_phase(
+        &mut self,
+        phase: rio_proto::types::BuildPhase,
+        executor_id: &ExecutorId,
+    ) {
         let Some(hash) = self.dag.hash_for_path(&phase.derivation_path).cloned() else {
             return;
         };
+        // r[impl sched.log.phase-binding]
+        // Actor's `state.assigned_executor` is the gate, not the LogBuffers
+        // mirror (which goes stale ~30s post-completion); rationale in spec.
+        let assigned = self
+            .dag
+            .node(&hash)
+            .and_then(|s| s.assigned_executor.as_ref());
+        if assigned != Some(executor_id) {
+            // debug!, not warn!: the common cause is a benign late
+            // phase from a heartbeat-timed-out executor whose drv was
+            // re-dispatched, same as ProcessCompletion's stale-report
+            // guard (completion.rs). The metric covers the
+            // attack-detection use case without log noise.
+            let reason = if assigned.is_none() {
+                "no_assignment"
+            } else {
+                "executor_mismatch"
+            };
+            tracing::debug!(
+                drv = %phase.derivation_path,
+                sender = %executor_id,
+                assigned = ?assigned,
+                reason,
+                "dropping phase update from non-assigned executor"
+            );
+            metrics::counter!(
+                "rio_scheduler_phases_rejected_total",
+                "reason" => reason
+            )
+            .increment(1);
+            return;
+        }
         for build_id in self.get_interested_builds(&hash) {
             self.events.emit(
                 build_id,

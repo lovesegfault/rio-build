@@ -177,6 +177,32 @@ blob, and a late batch from a heartbeat-timed-out executor lands after a
 re-dispatch and gets attributed to the *next* execution. Dropped batches
 increment #(refs.metric)("rio_scheduler_log_batches_rejected_total").
 
+#r("sched.log.phase-binding")[
+  The `BuildPhase` ingestion path MUST drop phase updates whose
+  `derivation_path` does not match an active assignment held by the calling
+  executor.
+]
+
+The third worker-supplied `derivation_path` consumer in the `BuildExecution`
+recv loop. Unlike #rref("sched.log.batch-binding"), whose check is colocated
+with the ring buffer in the recv task (because the durability write must
+bypass the actor's bounded mpsc), phase updates have no recv-task side effect
+--- they go only to the broadcast channel, which the actor owns. The gate
+therefore runs in the actor against `state.assigned_executor` --- the
+authoritative assignment record (set by `assign_to_worker`, cleared at
+completion, restored on failover) --- the same source the
+#rref("sched.completion.idempotent") stale-report guard reads. Unlike that
+guard, this one fails closed on `assigned_executor = None`: completion has
+an upstream `Assigned|Running` status gate that makes `None` unreachable,
+but phase updates have no such gate, and a phase for a drv with no current
+assignment has no live build to render to. Without this gate, a compromised
+executor sending `BuildPhase` with a fabricated `derivation_path` injects
+attacker-controlled text into another tenant's `nix build -L` progress
+display via the gateway's `SetPhase` relay (cosmetic only --- no log or PG
+write). Dropped phase updates increment
+#(refs.metric)("rio_scheduler_phases_rejected_total"), labeled by reason
+(`no_assignment` | `executor_mismatch`).
+
 #r("sched.merge.exec-correlation+2")[
   The scheduler MUST set `build_derivations.exec_id` for every interested
   build when a derivation that has been dispatched (and therefore carries

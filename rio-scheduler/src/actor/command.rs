@@ -337,7 +337,18 @@ pub enum ActorCommand {
     /// `emit_build_event`. Same `try_send`-under-backpressure semantics
     /// as [`ForwardLogBatch`](Self::ForwardLogBatch) — a dropped phase
     /// is a cosmetic nom regression, not a hang. Fire-and-forget.
-    ForwardPhase { phase: rio_proto::types::BuildPhase },
+    ///
+    /// `executor_id` is the calling stream's identity; `handle_forward_phase`
+    /// checks it against the drv's `assigned_executor` and drops the update
+    /// on mismatch (`r[sched.log.phase-binding]`). Same source of truth as
+    /// [`ProcessCompletion`](Self::ProcessCompletion)'s stale-report guard
+    /// (`state.assigned_executor`), but stricter: also drops when
+    /// `assigned_executor` is `None`, since `Phase` has no upstream
+    /// `Assigned|Running` status gate the way completion does.
+    ForwardPhase {
+        phase: rio_proto::types::BuildPhase,
+        executor_id: ExecutorId,
+    },
 
     /// Mark a worker draining: stop sending new assignments.
     ///

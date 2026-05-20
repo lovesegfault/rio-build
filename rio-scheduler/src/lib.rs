@@ -329,6 +329,12 @@ pub fn describe_metrics() {
          Labeled by reason: no_assignment | unstamped | executor_mismatch."
     );
     describe_counter!(
+        "rio_scheduler_phases_rejected_total",
+        "BuildPhase dropped by the actor-side (executor, drv) binding check. \
+         Sender's stream is not the executor assigned to the named derivation. \
+         Labeled by reason: no_assignment | executor_mismatch."
+    );
+    describe_counter!(
         "rio_scheduler_log_gc_swept_total",
         "drv_logs rows (and their .log.zst + .partial.log.zst S3 blobs) deleted \
          by the LogFlusher TTL GC sweep. Cadence ~1h; threshold scheduler.logRetentionDays."

@@ -511,3 +511,77 @@ async fn test_forward_log_batch_fanout_to_multiple_interested_builds() -> TestRe
     }
     Ok(())
 }
+
+// r[verify sched.log.phase-binding]
+/// `ForwardPhase` from an executor not assigned the derivation MUST be
+/// dropped. `handle_forward_phase` checks `state.assigned_executor`
+/// before fanning the event out — the actor-side counterpart of
+/// `push_for`'s binding gate (`sched.log.batch-binding`), reading the
+/// same authoritative record `ProcessCompletion`'s stale-report guard
+/// reads (`sched.completion.idempotent`). Without it, a compromised
+/// builder spoofs `BuildPhase{derivation_path: <victim>}` and the
+/// gateway renders attacker-controlled `phase` text as `SetPhase` into
+/// another tenant's `nix build -L` progress display.
+///
+/// Sentinel pattern (same as `test_forward_log_batch_unknown_drv_path_dropped`):
+/// send the rogue phase first, then a legitimate one. The first `Phase`
+/// event observed on the broadcast must be the legitimate one — if the
+/// rogue had been forwarded, it would appear first.
+#[tokio::test]
+async fn test_forward_phase_rejects_unassigned_executor() -> TestResult {
+    let (_db, handle, _task, _rx) = setup_with_worker("w1", "x86_64-linux").await?;
+    let build_id = Uuid::new_v4();
+    let drv_hash = "phasegate";
+    let drv_path = test_drv_path(drv_hash);
+    let mut events =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+
+    // Sanity: merge dispatched the drv to w1 (the only registered
+    // worker). The gate compares against this.
+    let pre = expect_drv(&handle, drv_hash).await;
+    assert_eq!(pre.status, DerivationStatus::Assigned);
+    assert_eq!(pre.assigned_executor.as_deref(), Some("w1"));
+
+    // Rogue executor "w2" — never registered, never assigned this drv —
+    // spoofs a Phase. MUST be dropped before reaching the broadcast.
+    handle
+        .send_unchecked(ActorCommand::ForwardPhase {
+            phase: rio_proto::types::BuildPhase {
+                derivation_path: drv_path.clone(),
+                phase: "rogue-injected-text".into(),
+            },
+            executor_id: "w2".into(),
+        })
+        .await?;
+
+    // Legitimate executor's Phase IS forwarded. Sentinel: proves the
+    // actor processed the rogue command (FIFO mailbox) and intentionally
+    // dropped it, rather than the test racing the broadcast.
+    handle
+        .send_unchecked(ActorCommand::ForwardPhase {
+            phase: rio_proto::types::BuildPhase {
+                derivation_path: drv_path.clone(),
+                phase: "buildPhase".into(),
+            },
+            executor_id: "w1".into(),
+        })
+        .await?;
+
+    // `Event::Phase` is NOT display_only (event.rs:173) → state ring,
+    // which `merge_single_node` returns. Drain merge/dispatch noise
+    // (Started, InputsResolved, Derivation events, Progress) until the
+    // first Phase appears; assert it's the sentinel.
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(5), events.recv()).await??;
+        if let Some(rio_proto::types::build_event::Event::Phase(got)) = ev.event {
+            assert_eq!(
+                got.phase, "buildPhase",
+                "rogue executor's spoofed Phase must be dropped; only the \
+                 assigned executor's Phase is fanned out to interested builds"
+            );
+            assert_eq!(got.derivation_path, drv_path);
+            break;
+        }
+    }
+    Ok(())
+}

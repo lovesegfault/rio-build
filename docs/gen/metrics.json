@@ -588,6 +588,11 @@
         "name": "rio_scheduler_phantom_assignments_drained_total"
       },
       {
+        "help": "BuildPhase dropped by the actor-side (executor, drv) binding check. Sender's stream is not the executor assigned to the named derivation. Labeled by reason: no_assignment | executor_mismatch.",
+        "kind": "counter",
+        "name": "rio_scheduler_phases_rejected_total"
+      },
+      {
         "help": "Derivations poisoned because failed_builders excluded every registered worker of the matching kind (I-065). Nonzero rate with small fleet = poison threshold unreachable; the build would otherwise defer forever.",
         "kind": "counter",
         "name": "rio_scheduler_poison_fleet_exhausted_total"
@@ -1118,6 +1123,7 @@
     "rio_scheduler_merge_phase_seconds",
     "rio_scheduler_orphan_builds_cancelled_total",
     "rio_scheduler_phantom_assignments_drained_total",
+    "rio_scheduler_phases_rejected_total",
     "rio_scheduler_poison_fleet_exhausted_total",
     "rio_scheduler_prefetch_hints_sent_total",
     "rio_scheduler_prefetch_paths_sent_total",

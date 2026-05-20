@@ -1161,8 +1161,8 @@ impl DagActor {
                 ActorCommand::ForwardLogBatch { drv_path, batch } => {
                     self.handle_forward_log_batch(&drv_path, batch);
                 }
-                ActorCommand::ForwardPhase { phase } => {
-                    self.handle_forward_phase(phase);
+                ActorCommand::ForwardPhase { phase, executor_id } => {
+                    self.handle_forward_phase(phase, &executor_id);
                 }
                 ActorCommand::LeaderLost => {
                     self.handle_leader_lost();
