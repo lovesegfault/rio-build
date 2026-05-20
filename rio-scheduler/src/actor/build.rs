@@ -141,6 +141,9 @@ impl DagActor {
             // `to_depfail` below — those drvs have no exec_id and no
             // buffer, so the call would be a guaranteed no-op (see
             // terminal_log_epilogue's doc for the carve-out).
+            // The seal here precedes the CancelSignal try_send below,
+            // so the worker's late `rio: result cancelled` footer is
+            // dropped — see terminal_log_epilogue's sequencing note.
             // r[impl sched.merge.exec-correlation+4]
             self.terminal_log_epilogue(drv_hash, "cancelled", &[build_id]);
             transitioned.push(drv_hash.as_str());

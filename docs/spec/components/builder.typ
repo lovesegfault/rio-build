@@ -557,7 +557,8 @@ per-attempt: the daemon-transient retry loop
 (#rref("builder.retry.daemon-transient")) re-invokes the executor up to
 `DAEMON_RETRY_MAX` more times for one `exec_id`, but the header is sent only on
 the first attempt and the footer once after the loop with the most recent
-daemon-running attempt's outcome --- re-emitting the banner per attempt would
+daemon-running attempt's outcome (overridden to `cancelled` by the assignment's
+cancel flag) --- re-emitting the banner per attempt would
 write conflicting `rio: result` lines and break the scheduler ring buffer's
 line-number monotonicity. Subsequent attempts seed the `LogBatcher` with the
 prior attempt's final line count so output line numbers continue. The normative

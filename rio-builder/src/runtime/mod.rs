@@ -26,7 +26,9 @@ pub use slot::{BuildSlot, BuildSlotGuard, try_cancel_build};
 
 use drain::{reconnect_drain_gate, wait_build_flushed};
 use prefetch::PrefetchDeps;
-use result::{err_completion, ok_completion, panic_completion, send_completion};
+use result::{
+    err_completion, final_footer_result, ok_completion, panic_completion, send_completion,
+};
 use setup::{BalanceGuards, WorkerClient};
 
 use crate::cgroup::ResourceSnapshotHandle;
@@ -486,6 +488,12 @@ pub async fn spawn_build_task(
         // documented signal that the build never started. Goes out
         // BEFORE the CompletionReport so the scheduler ring buffer is
         // settled by the time the build resolves.
+        // The cancel flag overrides the attempt's string to `cancelled`
+        // (`final_footer_result` — same flag read as `err_completion`
+        // below, so the footer and the CompletionReport agree).
+        // Best-effort: the scheduler's cancel-path seal drops this
+        // footer before it reaches the stored log — see
+        // `terminal_log_epilogue`'s sequencing note in rio-scheduler.
         // TODO: the runtime footer-send path (once-per-assignment,
         // skipped-on-None, prev_line_count threading) has no unit test
         // — `spawn_build_task` requires a full BuildContext + live gRPC
@@ -493,7 +501,10 @@ pub async fn spawn_build_task(
         // existing VM scenarios; a `RIO_BUILDER_SCRIPT` VM test
         // asserting "exactly one rio: result line per exec_id" would
         // close the gap.
-        if let Some(footer_result) = &last_footer_result {
+        if let Some(footer_result) = final_footer_result(
+            last_footer_result.as_deref(),
+            cancelled.load(std::sync::atomic::Ordering::Acquire),
+        ) {
             executor::send_banner_batch(
                 &ctx.stream_tx,
                 &drv_path,

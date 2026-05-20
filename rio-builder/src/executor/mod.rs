@@ -337,7 +337,8 @@ pub struct ExecuteOutcome {
     /// errors on the first attempt (drv parse, WrongKind).
     pub final_line_count: u64,
     /// The build process's own outcome string for the banner footer
-    /// (`ok` / `failed (...)` / `cancelled`), computed BEFORE
+    /// (`ok` / `failed (...)`; the `cancelled` override happens later,
+    /// in `runtime::result::final_footer_result`), computed BEFORE
     /// collect_outputs so a successful build that fails its upload still
     /// reports `ok` here (CompletionReport carries the upload failure).
     /// `None` when no daemon process ran in THIS attempt — pre-daemon
@@ -1410,7 +1411,19 @@ pub(crate) async fn send_banner_batch(
 }
 
 /// Map a [`run_daemon_lifecycle`] result to the banner footer's
-/// `result` string: `ok`, `failed (<reason>)`, or `cancelled`.
+/// `result` string: `ok` or `failed (<reason>)`.
+///
+/// `cancelled` is deliberately NOT in this function's domain. The error
+/// variant cannot decide it: a pre-cgroup cancel
+/// ([`ExecutorError::Cancelled`]) routes through
+/// [`ExecuteOutcome::pre_cgroup`] (`footer_result: None` — no daemon
+/// ran, no footer at all) and never reaches this function, and a
+/// post-cgroup cancel kills the daemon, which surfaces here as
+/// `Wire(Io(UnexpectedEof))` — indistinguishable from a daemon crash.
+/// The runtime's once-per-assignment footer send overrides this string
+/// to `cancelled` from the build's cancel flag
+/// (`runtime::result::final_footer_result`), the same way
+/// `err_completion` decides `BuildResultStatus::Cancelled`.
 ///
 /// Display-only: the precise classification (`InfrastructureFailure`
 /// vs `Failed` vs `Cancelled`, retry eligibility, error chain) lives
@@ -1431,7 +1444,6 @@ fn footer_result_str(
             BuildStatus::LogLimitExceeded => "failed (log limit exceeded)".to_string(),
             other => format!("failed ({other:?})"),
         },
-        Err(ExecutorError::Cancelled) => "cancelled".to_string(),
         // The full error string is on `CompletionReport.error_msg`;
         // the footer is a one-line summary.
         Err(_) => "failed (executor error)".to_string(),
@@ -1463,13 +1475,19 @@ mod tests {
 
     /// Pins the footer `result` string domain so `banner::footer_lines`'s
     /// rustdoc example and `footer_renders_failed`'s fixture can't drift
-    /// from what production actually emits. `BuildStatus` carries no exit
-    /// code, so the footer never produces `failed (exit N)` — the failure
-    /// reason is the status discriminant or a hand-written phrase.
+    /// from what production actually emits. The domain is `ok` /
+    /// `failed (<reason>)` only — `cancelled` is decided by
+    /// `runtime::result::final_footer_result` from the cancel flag, not
+    /// here (the error variant can't tell a post-cgroup cancel from a
+    /// daemon crash). `BuildStatus` carries no exit code, so the footer
+    /// never produces `failed (exit N)` — the failure reason is the
+    /// status discriminant or a hand-written phrase.
     ///
     /// One assertion per `match` arm in `footer_result_str` — keep this
     /// 1:1 so a reviewer can verify completeness by counting; add a new
-    /// assertion when a new arm is added.
+    /// assertion when a new arm is added. The `Err(_)` arm has two
+    /// fixtures (`BuildFailed` and `Wire(UnexpectedEof)`), both
+    /// asserting the catch-all.
     #[test]
     fn footer_result_str_domain() {
         use rio_nix::protocol::build::{BuildResult, BuildStatus};
@@ -1501,10 +1519,19 @@ mod tests {
             "failed (PermanentFailure)"
         );
 
-        // Cancelled is its own discriminant, not a `failed (...)`.
+        // Post-cgroup cancel / daemon crash both surface as
+        // Wire(Io(UnexpectedEof)) — the per-attempt mapper cannot tell
+        // them apart and renders the catch-all. The runtime's
+        // `final_footer_result` overrides this to "cancelled" at the
+        // once-per-assignment send when the cancel flag is set.
         assert_eq!(
-            footer_result_str(&Err(ExecutorError::Cancelled)),
-            "cancelled"
+            footer_result_str(&Err(ExecutorError::Wire(
+                rio_nix::protocol::wire::WireError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "early eof"
+                ))
+            ))),
+            "failed (executor error)"
         );
 
         // Any other executor error → catch-all.

@@ -89,12 +89,15 @@ pub(crate) fn header_lines(
 /// rio: result   failed (PermanentFailure) after 4m23s
 /// ```
 ///
-/// `result` is one of `ok`, `failed (<reason>)`, or `cancelled` — the
-/// caller (`footer_result_str` in `crate::executor`) maps the build
-/// outcome to that string; see its doc for why exit codes aren't
-/// available. The `exec` line repeats so a truncated tail (e.g. Nix's
-/// "last 10 lines" failure summary) still includes the identifier
-/// without scrolling back to the header.
+/// `result` is one of `ok`, `failed (<reason>)`, or `cancelled`.
+/// `footer_result_str` (in `crate::executor`) maps the per-attempt
+/// daemon outcome to `ok`/`failed (<reason>)` — see its doc for why
+/// exit codes aren't available — and `runtime::result::final_footer_result`
+/// overrides to `cancelled` from the assignment's cancel flag
+/// (best-effort: dropped by the scheduler's cancel-path seal before it
+/// reaches the stored log). The `exec` line repeats so a truncated
+/// tail (e.g. Nix's "last 10 lines" failure summary) still includes
+/// the identifier without scrolling back to the header.
 pub(crate) fn footer_lines(exec_id: &str, result: &str, duration: Duration) -> Vec<Vec<u8>> {
     vec![
         format!("rio: exec     {exec_id}").into_bytes(),

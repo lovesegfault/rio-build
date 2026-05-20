@@ -140,6 +140,44 @@ pub(super) fn panic_completion(
     }
 }
 
+/// The banner footer's `result` string for the final once-per-assignment
+/// send, after the cancel override.
+///
+/// `was_cancelled` (the build's cancel flag, set by `try_cancel_build`
+/// before it writes `cgroup.kill`) decides `cancelled` — not the error
+/// variant. The post-cgroup cancel kills the daemon, which surfaces as
+/// `Wire(Io(UnexpectedEof))`, indistinguishable from a daemon crash at
+/// the variant level; only the flag knows the kill was intentional. Same
+/// rule as [`err_completion`]'s status decision for the same assignment.
+///
+/// The override applies to a successful attempt's `ok` too: a cancel
+/// that lands after the daemon exits but before the footer send reports
+/// the assignment's disposition (the scheduler has already transitioned
+/// the derivation to Cancelled and finalized `drv_logs.status =
+/// 'cancelled'` — that is the only way the flag gets set), not the
+/// daemon's exit status.
+///
+/// `None` stays `None` even when cancelled: a pre-cgroup-cancelled build
+/// never ran a daemon and header-without-footer is the documented "build
+/// never started" signal — fabricating a footer would erase it.
+///
+/// Best-effort, like the rest of the banner: on the scheduler-initiated
+/// cancel path the footer is dropped by the scheduler's cancel-path seal
+/// and never reaches the stored log (see `terminal_log_epilogue`'s
+/// sequencing note in rio-scheduler); it is still observable on the
+/// force-drain/backstop `CancelSignal` paths and keeps the footer
+/// consistent with the `CompletionReport` built from the same outcome.
+pub(super) fn final_footer_result(
+    last_footer_result: Option<&str>,
+    was_cancelled: bool,
+) -> Option<&str> {
+    match last_footer_result {
+        None => None,
+        Some(_) if was_cancelled => Some("cancelled"),
+        Some(s) => Some(s),
+    }
+}
+
 /// SLI outcome label for `rio_builder_builds_total`.
 ///
 /// `Ok(exec)` doesn't mean success — check the proto status.
@@ -309,5 +347,32 @@ mod tests {
             msg.msg,
             Some(executor_message::Msg::Completion(_))
         ));
+    }
+
+    /// The cancel flag — not the executor error variant — decides the
+    /// `cancelled` footer, and a build that never ran a daemon gets no
+    /// footer even when cancelled. The `Some("failed ...")+cancelled`
+    /// fixture is the exact production shape: a post-cgroup cancel kills
+    /// the daemon, the per-attempt mapper renders the resulting
+    /// `Wire(UnexpectedEof)` as `failed (executor error)`, and the override
+    /// corrects it here. The `Some("ok")+cancelled` case pins that the
+    /// override is about the assignment's disposition, not the attempt's
+    /// error-ness.
+    #[test]
+    fn final_footer_result_cancel_overrides_variant() {
+        // Post-cgroup cancel: daemon ran, was killed, flag set.
+        assert_eq!(
+            final_footer_result(Some("failed (executor error)"), true),
+            Some("cancelled")
+        );
+        // Cancel lands after a successful daemon exit but before the
+        // footer send: the assignment was cancelled, the footer says so.
+        assert_eq!(final_footer_result(Some("ok"), true), Some("cancelled"));
+        // Pre-cgroup cancel: no daemon ran → no footer, even though the
+        // flag is set. Header-without-footer = "build never started".
+        assert_eq!(final_footer_result(None, true), None);
+        // Not cancelled: passthrough.
+        assert_eq!(final_footer_result(Some("ok"), false), Some("ok"));
+        assert_eq!(final_footer_result(None, false), None);
     }
 }

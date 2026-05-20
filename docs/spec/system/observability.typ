@@ -53,8 +53,12 @@ output --- arbitrary build code can emit its own `rio: result ok` lines. The
 system's source of truth for `exec_id`, outcome, and sizing is `drv_logs` and
 `assignments`, not the log text. The `grep '^rio:'` extraction is a convenience
 for humans (the post-failure log tail Nix prints, the dashboard log viewer),
-not a protocol. Pod and node identity are deliberately excluded --- the
-"cluster is one machine" abstraction holds at the log level too.
+not a protocol. On scheduler-initiated cancellation the footer never reaches
+the stored log: the scheduler seals and finalizes the cancelled execution's log
+before the worker receives the `CancelSignal`, so a cancelled log ends without
+a `rio: result` line and `drv_logs.status` carries the outcome. Pod and node
+identity are deliberately excluded --- the "cluster is one machine" abstraction
+holds at the log level too.
 
 == Log Lifecycle
 

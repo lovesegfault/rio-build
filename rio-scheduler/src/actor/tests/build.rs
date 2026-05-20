@@ -957,7 +957,15 @@ async fn cancel_running_drv_finalizes_log(#[case] from_status: DerivationStatus)
 
     // (1) Buffer sealed — late LogBatch from the still-streaming worker
     // (CancelSignal try_send may have dropped) is now rejected at
-    // push_for instead of recreating an entry the flusher drained.
+    // push_for instead of recreating an entry the flusher drained. The
+    // class of late batch this drops includes the worker's
+    // `rio: result cancelled` footer — it is sent only after the
+    // CancelSignal's cgroup.kill lands, which is after this seal. A
+    // stored cancelled log therefore has no footer; drv_logs.status is
+    // the outcome of record. If the cancel path ever stops sealing
+    // first, that tradeoff is being renegotiated — update
+    // terminal_log_epilogue's sequencing doc and the observability
+    // spec's cancelled-log sentence to match.
     assert!(
         log_buffers.is_sealed(&drv_path),
         "cancel must seal the buffer so late LogBatch can't recreate it"
