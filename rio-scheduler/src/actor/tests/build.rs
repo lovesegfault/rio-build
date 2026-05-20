@@ -865,3 +865,138 @@ async fn test_cancel_signals_total_counts_delivered_only() -> TestResult {
     );
     Ok(())
 }
+
+/// Cancellation of an `Assigned`/`Running` derivation MUST run the same
+/// log-finalization sequence as success and permanent-failure
+/// terminals: seal the ring buffer (block late `LogBatch` from
+/// recreating it), enqueue a final flush (`status="cancelled"`,
+/// `is_complete=true`, `.partial`→`.log.zst` swap), and record the
+/// exec→build correlation (`build_derivations.exec_id`).
+///
+/// Exercises `cancel_build_derivations` directly (the chokepoint shared
+/// by all four callers: user cancel, per-build wall-clock timeout,
+/// fail-fast, top-down substitute fail).
+///
+/// Pre-fix: `cancel_build_derivations` transitioned to `Cancelled`,
+/// sent `CancelSignal`, persisted — but never called the log-finalize
+/// sequence. The worker's `CompletionReport(Cancelled)` is a no-op
+/// early-return at `process_completion`. Net effect: the periodic
+/// flusher's `.partial` row stays `is_complete=false`/`status=NULL`
+/// for the 30-day TTL, the `.partial` blob is never replaced, and
+/// `bd.exec_id` stays NULL → dashboard shows the "approximate" banner
+/// for a log that was actually streamed.
+///
+/// r[verify sched.merge.exec-correlation+4]
+/// r[verify obs.log.exec-keyed]
+#[rstest::rstest]
+#[case::running(DerivationStatus::Running)]
+#[case::assigned(DerivationStatus::Assigned)]
+#[tokio::test]
+async fn cancel_running_drv_finalizes_log(#[case] from_status: DerivationStatus) -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // Seed the rows record_exec_correlation's UPDATE targets — same
+    // pattern as exec_correlation_falls_back_to_buffer_exec_id.
+    let derivation_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO derivations (drv_hash, drv_path, pname, system, status) \
+         VALUES ($1, $2, 'pkg', 'x86_64-linux', 'running') \
+         RETURNING derivation_id",
+    )
+    .bind("can-drv")
+    .bind(test_drv_path("can-drv"))
+    .fetch_one(&db.pool)
+    .await?;
+    let build_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO builds (build_id, status) VALUES ($1, 'active')")
+        .bind(build_id)
+        .execute(&db.pool)
+        .await?;
+    sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+        .bind(build_id)
+        .bind(derivation_id)
+        .execute(&db.pool)
+        .await?;
+
+    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(8);
+    let mut actor = DagActor::new(
+        SchedulerDb::new(db.pool.clone()),
+        DagActorConfig::default(),
+        DagActorPlumbing {
+            log_buffers: Some(log_buffers.clone()),
+            log_flush_tx: Some(flush_tx),
+            ..Default::default()
+        },
+    );
+
+    // Inject a drv with state.exec_id and assigned_executor — the shape
+    // assign_to_worker produces. test_inject_ready_row injects at Ready;
+    // promote to Assigned/Running via test helper and add the build
+    // interest the collect-loop filters on.
+    let exec_id = uuid::Uuid::now_v7();
+    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+        derivation_id,
+        exec_id: Some(exec_id),
+        assigned_builder_id: Some("worker-1".into()),
+        ..crate::db::RecoveryDerivationRow::test_default("can-drv", "x86_64-linux")
+    });
+    {
+        let s = actor.dag.node_mut("can-drv").expect("just injected");
+        s.set_status_for_test(from_status);
+        s.interested_builds.insert(build_id);
+    }
+    let drv_path = test_drv_path("can-drv");
+    log_buffers.set_exec(&drv_path, exec_id, "worker-1");
+
+    // Cancel the build — the drv is sole-interest Assigned/Running, so
+    // it lands in `to_cancel` (CancelSignal + transition Cancelled +
+    // log epilogue).
+    actor
+        .cancel_build_derivations(build_id, "test cancel")
+        .await;
+
+    // (1) Buffer sealed — late LogBatch from the still-streaming worker
+    // (CancelSignal try_send may have dropped) is now rejected at
+    // push_for instead of recreating an entry the flusher drained.
+    assert!(
+        log_buffers.is_sealed(&drv_path),
+        "cancel must seal the buffer so late LogBatch can't recreate it"
+    );
+    // (2) Final flush enqueued with status="cancelled".
+    let req = flush_rx.try_recv().expect(
+        "cancel must enqueue a final FlushRequest so the periodic \
+         flusher's .partial row is finalized (is_complete=true, status set, \
+         .partial blob replaced) instead of lingering for the 30-day TTL",
+    );
+    assert_eq!(
+        req.exec_id, exec_id,
+        "request pins the exec being cancelled"
+    );
+    assert_eq!(req.drv_path, drv_path);
+    assert_eq!(req.status.as_deref(), Some("cancelled"));
+    // (3) Exec correlation recorded — dashboard fetches the exact log
+    // observed by this build instead of the latest-exec fallback.
+    // Spawned write; poll PG (established 10ms × 100 pattern).
+    let mut got: Option<Uuid> = None;
+    for _ in 0..100 {
+        got = sqlx::query_scalar(
+            "SELECT exec_id FROM build_derivations \
+             WHERE build_id = $1 AND derivation_id = $2",
+        )
+        .bind(build_id)
+        .bind(derivation_id)
+        .fetch_one(&db.pool)
+        .await?;
+        if got.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        got,
+        Some(exec_id),
+        "cancel must record bd.exec_id so the dashboard fetches the \
+         exact log instead of the latest-exec fallback"
+    );
+    Ok(())
+}

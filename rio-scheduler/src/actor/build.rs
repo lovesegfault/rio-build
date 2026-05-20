@@ -123,6 +123,26 @@ impl DagActor {
                 }
                 state.assigned_executor = None;
             }
+            // Finalize the drv_logs row for the cancelled execution:
+            // seal + flush(status="cancelled") + correlate. The
+            // worker's eventual CompletionReport(Cancelled) is a no-op
+            // early-return at process_completion (completion.rs), so
+            // this is the only place that can finalize the cancelled
+            // exec's log — for any of cancel_build_derivations' callers
+            // (user cancel, per-build timeout, fail-fast, top-down
+            // substitute fail). Sole-interest filter at collect time
+            // means `&[build_id]` is the full interested set. Without
+            // this, every cancel of a ≥30s-running drv leaves a
+            // `drv_logs` row stuck at is_complete=false/status=NULL for
+            // the 30-day TTL and bd.exec_id NULL (dashboard shows the
+            // "approximate" banner for a log that was streamed).
+            //
+            // Deliberately NOT called from `to_cancel_substituting` or
+            // `to_depfail` below — those drvs have no exec_id and no
+            // buffer, so the call would be a guaranteed no-op (see
+            // terminal_log_epilogue's doc for the carve-out).
+            // r[impl sched.merge.exec-correlation+4]
+            self.terminal_log_epilogue(drv_hash, "cancelled", &[build_id]);
             transitioned.push(drv_hash.as_str());
             let Some(executor_id) = executor_id else {
                 continue;

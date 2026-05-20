@@ -205,23 +205,29 @@ write). Dropped phase updates increment
 #(refs.metric)("rio_scheduler_phases_rejected_total"), labeled by reason
 (`not_active` | `no_assignment` | `executor_mismatch`).
 
-#r("sched.merge.exec-correlation+3")[
+#r("sched.merge.exec-correlation+4")[
   The scheduler MUST set `build_derivations.exec_id` for every interested
   build when a derivation that has been dispatched (and therefore has an
   `exec_id` recorded for it) reaches a terminal state through a path
   where an execution actually ran: `Completed` (success or recovery's
-  orphan adoption), `Poisoned` (permanent failure), and `Cancelled` via
-  the timeout-exhaustion path. The column MUST stay `NULL` for
-  `Cached`, `DependencyFailed`, `Skipped`, non-terminal derivations, and
-  any terminal reached without dispatch (no execution to correlate).
+  orphan adoption), `Poisoned` (permanent failure), and `Cancelled`
+  reached from `Assigned`/`Running`. The column MUST stay `NULL` for
+  cache-hit `Completed`, cascaded `DependencyFailed`, `Skipped`,
+  non-terminal derivations, and any other terminal reached without
+  dispatch (no execution to correlate).
 ]
 
 `Failed` is _not_ a terminal status in the actor's state machine
 (`is_terminal()`); it is the transient retry intermediate
-(`Running → Failed → Ready`). The terminal-failure call site of
-`record_exec_correlation` is `terminal_failure_epilogue`, reached after a
-transition to `Poisoned` or `Cancelled` (timeout cap exhausted) — both of
-which imply the worker ran the build. The actual gate is
+(`Running → Failed → Ready`). The shared chokepoint is `terminal_log_epilogue`, called from
+`handle_success_completion` (`Completed`), `terminal_failure_epilogue`
+(`Poisoned` and timeout-exhausted `Cancelled`), and
+`cancel_build_derivations` (any path that cancels in-flight derivations:
+user cancel, per-build wall-clock timeout, fail-fast, top-down substitute
+fail) --- each of which implies the worker ran the build. Recovery's
+`adopt_orphan_completion` calls `record_exec_correlation` directly (the
+disconnected worker's log is already lost; only the correlation can be
+reconstructed from `assignments.exec_id`). The actual gate is
 `exec_id_for_terminal`, which reads `state.exec_id` (set by
 `assign_to_worker`, recoverable from `assignments.exec_id` after a leader
 failover) and falls back to the `LogBuffers` ring-buffer entry's stamped

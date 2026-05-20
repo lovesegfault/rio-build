@@ -3396,7 +3396,7 @@ async fn test_infra_retry_cap_uniform_across_reasons(
 /// PG with the established 10ms × 100 pattern rather than asserting
 /// immediately after `barrier()` (which only drains the actor loop, not
 /// background tasks).
-// r[verify sched.merge.exec-correlation+3]
+// r[verify sched.merge.exec-correlation+4]
 #[tokio::test]
 async fn completion_records_build_exec_correlation() -> TestResult {
     let (db, handle, _task, mut stream_rx) = setup_with_worker("ec-worker", "x86_64-linux").await?;
@@ -3598,7 +3598,7 @@ async fn flush_skips_when_neither_carrier_has_exec_id() -> TestResult {
 /// Pre-fix: early-returned on `state.exec_id == None`, no UPDATE,
 /// `build_derivations.exec_id` stays NULL forever.
 ///
-/// r[verify sched.merge.exec-correlation+3]
+/// r[verify sched.merge.exec-correlation+4]
 #[tokio::test]
 async fn exec_correlation_falls_back_to_buffer_exec_id() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;

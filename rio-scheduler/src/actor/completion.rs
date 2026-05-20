@@ -763,9 +763,11 @@ impl DagActor {
         }
 
         // Cancelled: scheduler transitioned BEFORE sending CancelSignal
-        // (build.rs:cancel_sole_interest_derivations), so the executor's
+        // (build.rs:cancel_build_derivations), so the executor's
         // Cancelled report finds the derivation already in this state.
-        // Expected; capacity was freed above. No further action.
+        // Expected; capacity was freed above. The drv_logs row was
+        // already finalized by terminal_log_epilogue at cancel time.
+        // No further action.
         if current_status == DerivationStatus::Cancelled {
             debug!(drv_hash = %drv_hash, executor_id = %executor_id,
                    "cancelled completion report (expected after CancelSignal)");
@@ -1041,25 +1043,14 @@ impl DagActor {
         .await;
         phase!("5-newly-ready+per-build-counts");
 
-        // Trigger log flush AFTER the Completed event has gone out (now
-        // emitted inside release_downstream, after Progress). By the
-        // time the gateway sees Completed, the ring buffer still has
-        // the full log (flusher hasn't drained yet — async on a
-        // separate task). So AdminService.GetDerivationLogs can serve from
-        // the ring buffer in the gap before the S3 upload lands. Seal
-        // first: late LogBatch pushes between now and the flusher's
-        // drain are dropped instead of recreating an orphan entry; the
-        // buffer present NOW survives for drain. Actor is single-
-        // threaded — no LogBatch can have arrived since the
-        // transition() above.
-        self.seal_log_buffer(drv_hash);
-        self.trigger_log_flush(drv_hash, "succeeded");
-        // Record which execution each interested build observed, so the
-        // dashboard build view can fetch this exact `drv_logs` row
-        // instead of falling back to latest-exec (wrong after a retry
-        // or a later rebuild of the same drv). Best-effort, spawned —
-        // see record_exec_correlation. r[impl sched.merge.exec-correlation+3]
-        self.record_exec_correlation(drv_hash, &interested_builds);
+        // Finalize the drv_logs row AFTER the Completed event has gone
+        // out (now emitted inside release_downstream, after Progress).
+        // By the time the gateway sees Completed, the ring buffer still
+        // has the full log (flusher hasn't drained yet — async on a
+        // separate task), so AdminService.GetDerivationLogs can serve
+        // from the ring buffer in the gap before the S3 upload lands.
+        // r[impl sched.merge.exec-correlation+4]
+        self.terminal_log_epilogue(drv_hash, "succeeded", &interested_builds);
         let _ = &mut t_phase;
         let total = t_total.elapsed();
         // IA-branch parity with the CA `info!` in `ca_insert_realisations`:
@@ -1863,22 +1854,18 @@ impl DagActor {
         error_msg: &str,
         status: rio_proto::types::BuildResultStatus,
     ) {
-        self.seal_log_buffer(drv_hash);
-
         // Flush + emit use the trigger's interested set (those builds
         // saw THIS drv fail); handle_derivation_failure below uses the
         // union (those builds saw SOME drv fail, possibly a cascaded
-        // one). Flush BEFORE handle_derivation_failure (which may
-        // transition builds to terminal and schedule cleanup).
+        // one). Finalize logs BEFORE handle_derivation_failure (which
+        // may transition builds to terminal and schedule cleanup).
+        // The trigger set (not the cascaded union) is correct for the
+        // exec correlation: a cascaded `DependencyFailed` parent never
+        // executed, so its `state.exec_id` is `None` and
+        // `build_derivations.exec_id` stays `NULL` for it.
+        // r[impl sched.merge.exec-correlation+4]
         let trigger_builds = self.get_interested_builds(drv_hash);
-        self.trigger_log_flush(drv_hash, "failed");
-        // Record which execution each interested build observed. The
-        // trigger set (not the cascaded union) is correct here: a
-        // cascaded `DependencyFailed` parent never executed, so its
-        // `state.exec_id` is `None` and `build_derivations.exec_id`
-        // stays `NULL` for it (consumers fall back to latest-exec).
-        // r[impl sched.merge.exec-correlation+3]
-        self.record_exec_correlation(drv_hash, &trigger_builds);
+        self.terminal_log_epilogue(drv_hash, "failed", &trigger_builds);
         let trigger_path = self.dag.path_or_hash_fallback(drv_hash);
         for build_id in &trigger_builds {
             // r[impl gw.activity.progress-before-stop]

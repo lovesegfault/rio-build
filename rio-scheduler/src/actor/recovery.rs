@@ -1168,7 +1168,7 @@ impl DagActor {
         // under-retains. output_paths was just set above
         // (= expected_outputs, verified present in store).
         self.upsert_path_tenants_for(drv_hash).await;
-        // r[impl sched.merge.exec-correlation+3]
+        // r[impl sched.merge.exec-correlation+4]
         // Same gap as path-tenants above: `handle_success_completion`
         // never fired, so `build_derivations.exec_id` would stay NULL
         // and the dashboard's build view would fall back to

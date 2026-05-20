@@ -501,9 +501,8 @@ impl DagActor {
     /// Fire a log-flush request for the given derivation. No-op if the
     /// flusher isn't configured (tests, or `RIO_LOG_S3_BUCKET` unset).
     ///
-    /// Called from `handle_success_completion` (status `"succeeded"`) AND
-    /// `terminal_failure_epilogue` (status `"failed"`) — both paths flush
-    /// because failed builds still have useful logs. NOT called from
+    /// Called from [`Self::terminal_log_epilogue`] — see its doc for
+    /// the call-site enumeration. NOT called from
     /// `handle_transient_failure`: the derivation gets re-queued, a new
     /// worker builds it from scratch, and the next `assign_to_worker`
     /// calls [`Self::discard_log_buffer`] so the old partial buffer is
@@ -556,13 +555,15 @@ impl DagActor {
     /// inserts: spawned (not awaited in the actor loop) so a slow PG
     /// can't stall the next command.
     ///
-    /// Called from `handle_success_completion`,
-    /// `terminal_failure_epilogue`, and recovery's
-    /// `adopt_orphan_completion` — the three terminal paths where an
-    /// execution actually ran. NOT called from cascaded
-    /// `DependencyFailed`, `Cancelled`, or `Skipped` — those drvs
-    /// didn't execute, `state.exec_id` is `None` for them, and
-    /// `build_derivations.exec_id` stays `NULL` so consumers fall back
+    /// Called from [`Self::terminal_log_epilogue`] (the seal/flush/
+    /// correlate chokepoint — success, permanent failure, and
+    /// build-level cancellation of an `Assigned`/`Running` drv) and
+    /// from recovery's `adopt_orphan_completion` directly. The
+    /// chokepoint doc enumerates the call sites and the
+    /// never-dispatched carve-outs (cascaded `DependencyFailed`,
+    /// `Skipped`, cache-hit `Completed`, `Substituting`-cancel) —
+    /// those drvs have no `exec_id`, so this helper no-ops anyway and
+    /// `build_derivations.exec_id` stays `NULL` for them, falling back
     /// to latest-exec resolution.
     ///
     /// No-op (silent) when both `state.exec_id` and the `LogBuffers`
@@ -571,7 +572,7 @@ impl DagActor {
     /// (nodes whose merge tx hasn't committed — impossible here; merge
     /// commits before any dispatch — but cheap to guard).
     ///
-    /// r[impl sched.merge.exec-correlation+3]
+    /// r[impl sched.merge.exec-correlation+4]
     pub(super) fn record_exec_correlation(&self, drv_hash: &DrvHash, interested_builds: &[Uuid]) {
         let Some(state) = self.dag.node(drv_hash) else {
             return;
@@ -612,13 +613,76 @@ impl DagActor {
         });
     }
 
+    /// Run the log-finalization sequence for a derivation execution
+    /// that just reached a terminal state on a *connected* worker.
+    ///
+    /// This is the single chokepoint for [`Self::seal_log_buffer`] →
+    /// [`Self::trigger_log_flush`] → [`Self::record_exec_correlation`].
+    /// A terminal path that ran an execution MUST call it; any terminal
+    /// that forgets leaves the `drv_logs` row stuck at
+    /// `is_complete=false`/`status=NULL` for the 30-day TTL, the
+    /// `.partial` S3 blob never replaced or best-effort-deleted (only
+    /// `flush_final` does that), and `build_derivations.exec_id` NULL —
+    /// the dashboard then shows the "approximate" banner for a log that
+    /// was actually streamed.
+    ///
+    /// Callers and their `status` argument:
+    /// - `handle_success_completion` — `"succeeded"`
+    /// - `terminal_failure_epilogue` — `"failed"` (covers `Poisoned` via
+    ///   `poison_and_cascade`/`handle_permanent_failure`, timeout-exhausted
+    ///   `Cancelled` via `handle_timeout_failure`, and `DependencyFailed`
+    ///   via `handle_substitute_complete`'s revert arm — the last is a
+    ///   never-dispatched no-op, see below)
+    /// - `cancel_build_derivations` (`to_cancel` arm) — `"cancelled"`
+    ///   (build-level cancellation/failure of an `Assigned`/`Running`
+    ///   drv: `handle_cancel_build`, per-build wall-clock timeout,
+    ///   fail-fast, top-down substitute fail)
+    ///
+    /// NOT called from:
+    /// - `adopt_orphan_completion` (recovery) — the worker disconnected
+    ///   before this leader started, the buffer is empty (or absent),
+    ///   the log is already lost. It calls `record_exec_correlation`
+    ///   directly (so the dashboard knows which exec produced the
+    ///   output) and `discard_log_buffer` (to remove recovery's empty
+    ///   placeholder — `flush_final` would no-op on it but the
+    ///   `GetDerivationLogs` read path would serve an empty re-poll
+    ///   chunk until `CleanupTerminalBuild` reaps it).
+    /// - never-dispatched terminals (cache-hit / substitute-success
+    ///   `Completed`, cascaded `DependencyFailed`, `Skipped`,
+    ///   `Substituting`-cancel, `Queued`/`Ready`/`Created`-cancel):
+    ///   no execution, no `exec_id`, no buffer. Calling would be a
+    ///   harmless no-op (`trigger_log_flush` early-returns on missing
+    ///   `exec_id`), but the call sites don't bother — see the
+    ///   cargo-cult note on `cancel_build_derivations`.
+    ///
+    /// Sequencing: seal first so late `LogBatch` pushes between now and
+    /// the flusher's drain are dropped instead of recreating an orphan
+    /// entry; the buffer present NOW survives for drain (single-threaded
+    /// actor: no `LogBatch` can have arrived since the terminal
+    /// transition). Flush before correlate — both fire-and-forget but
+    /// the flush request pins the `exec_id` it resolves, so it should
+    /// resolve from the same snapshot of `state` as the correlate.
+    ///
+    /// r[impl sched.merge.exec-correlation+4]
+    pub(super) fn terminal_log_epilogue(
+        &self,
+        drv_hash: &DrvHash,
+        status: &'static str,
+        interested_builds: &[Uuid],
+    ) {
+        self.seal_log_buffer(drv_hash);
+        self.trigger_log_flush(drv_hash, status);
+        self.record_exec_correlation(drv_hash, interested_builds);
+    }
+
     /// Seal the log ring buffer for `drv_hash` so late `LogBatch`
     /// pushes (still in flight on the BuildExecution stream after the
     /// worker sent CompletionReport) cannot recreate an entry the
-    /// flusher already drained. Called from terminal completion
-    /// handlers BEFORE [`Self::trigger_log_flush`] — the flusher's
-    /// drain still returns the pre-seal contents; sealing only blocks
-    /// post-drain recreation. No-op if `log_buffers` unwired (tests).
+    /// flusher already drained. Called from
+    /// [`Self::terminal_log_epilogue`] BEFORE
+    /// [`Self::trigger_log_flush`] — the flusher's drain still returns
+    /// the pre-seal contents; sealing only blocks post-drain
+    /// recreation. No-op if `log_buffers` unwired (tests).
     pub(super) fn seal_log_buffer(&self, drv_hash: &DrvHash) {
         let Some(bufs) = &self.log_buffers else {
             return;

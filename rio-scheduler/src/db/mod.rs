@@ -303,7 +303,7 @@ impl RecoveryDerivationRow {
 /// `exec_id` per build (rebuilt after GC, retried). NULL until the
 /// completion handler (or recovery's orphan adoption) records it after
 /// a terminal where an execution actually ran: `Completed`, `Poisoned`,
-/// timeout-exhausted `Cancelled`. Stays NULL for `Cached`,
+/// `Cancelled` reached from `Assigned`/`Running`. Stays NULL for cache-hit `Completed`,
 /// `DependencyFailed`, `Skipped`, never-dispatched terminals, and
 /// non-terminal drvs (no execution to record). The dashboard falls back
 /// to "latest exec" when empty.

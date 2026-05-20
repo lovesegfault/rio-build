@@ -2,7 +2,9 @@
 //!
 //! The flusher runs on its own task, driven by two triggers:
 //!   1. **Completion** — actor `try_send`s a [`FlushRequest`] when a
-//!      derivation hits a terminal state (success OR permanent failure).
+//!      derivation hits a terminal state on a connected worker (success,
+//!      permanent failure, or build-level cancellation — see the
+//!      scheduler actor's `terminal_log_epilogue` for the caller list).
 // r[impl obs.log.periodic-flush]
 //!      This drains the buffer (`LogBuffers::drain`) and uploads the final
 //!      blob to `logs/{drv_hash}/{exec_id}.log.zst` with `is_complete=true`.
@@ -90,10 +92,10 @@ pub struct FlushRequest {
     /// *stale* exec's status, then `push_for` from the live executor
     /// would hit `no_assignment` (entry gone) and the whole log is lost.
     pub exec_id: Uuid,
-    /// Build outcome for `drv_logs.status` (`"succeeded"` / `"failed"`).
-    /// `None` for periodic snapshots (build still running). Recorded in PG
-    /// so `rio-cli logs` and the dashboard can show outcome alongside the
-    /// log without a join against `derivations`.
+    /// Build outcome for `drv_logs.status` (`"succeeded"` / `"failed"` /
+    /// `"cancelled"`). `None` for periodic snapshots (build still running).
+    /// Recorded in PG so `rio-cli logs` and the dashboard can show outcome
+    /// alongside the log without a join against `derivations`.
     pub status: Option<String>,
 }
 
