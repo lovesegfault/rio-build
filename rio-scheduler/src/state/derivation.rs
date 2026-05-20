@@ -774,9 +774,17 @@ pub struct DerivationState {
     /// decoupled (see `logs/mod.rs` module header).
     ///
     /// `None` on construction. Set by `assign_to_worker`; cleared by
-    /// `reset_to_ready`. May be stale between a deassign (cancel, retry,
-    /// orphan-recovery) and the next re-dispatch — readers run only
-    /// during or after `assign_to_worker`, which always overwrites it.
+    /// `reset_to_ready` (worker disconnect, phantom drain, orphan
+    /// reconcile — but NOT `rollback_assignment`, which also discards
+    /// the `LogBuffers` entry). Readers in `trigger_log_flush` and
+    /// `record_exec_correlation` (`actor/event.rs::exec_id_for_terminal`)
+    /// can run between a `reset_to_ready` and the next `assign_to_worker`
+    /// when a poison-while-Ready path (I-065 fleet exhaustion,
+    /// max_infra/timeout_retries cap) reaches `terminal_failure_epilogue`
+    /// first. Those readers fall back to the `LogBuffers` entry's stamped
+    /// exec_id, which `reset_to_ready` does NOT clear (the lines and
+    /// stamp are still needed by the periodic flusher in the
+    /// reset→re-dispatch window).
     pub exec_id: Option<Uuid>,
     /// Scheduling hints (estimator outputs, resource_floor, critical-path priority).
     pub sched: SchedHint,

@@ -3468,3 +3468,210 @@ async fn completion_records_build_exec_correlation() -> TestResult {
     );
     Ok(())
 }
+
+/// `reset_to_ready()` (worker disconnect, phantom drain, orphan
+/// reconcile) clears `state.exec_id` WITHOUT discarding the
+/// `LogBuffers` entry — the entry's lines and stamped exec_id are
+/// still needed by the periodic flusher in the disconnect→re-dispatch
+/// window. If a poison path (I-065 fleet exhaustion, max_infra/timeout
+/// retries cap) reaches `terminal_failure_epilogue` BEFORE the next
+/// `assign_to_worker` re-stamps, `state.exec_id` is `None` while the
+/// buffer holds the disconnected execution's lines.
+///
+/// `trigger_log_flush` MUST fall back to the buffer's stamped exec_id
+/// so the execution that DID run gets its final `.log.zst` blob,
+/// `drv_logs` row marked `is_complete=true`/`status='failed'`, and
+/// `record_exec_correlation` gets a non-NULL `build_derivations.exec_id`.
+///
+/// Pre-fix: early-returned on `state.exec_id == None`, no
+/// `FlushRequest` queued.
+///
+/// Verifies the actor-side carrier resolution that feeds the
+/// exec-keyed storage; the storage-key shape itself is verified in
+/// `logs/flush.rs` and `admin/tests/logs_tests.rs`.
+///
+/// r[verify obs.log.exec-keyed]
+#[tokio::test]
+async fn flush_falls_back_to_buffer_exec_id_after_reset_to_ready() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(8);
+    let mut actor = DagActor::new(
+        SchedulerDb::new(db.pool.clone()),
+        DagActorConfig::default(),
+        DagActorPlumbing {
+            log_buffers: Some(log_buffers.clone()),
+            log_flush_tx: Some(flush_tx),
+            ..Default::default()
+        },
+    );
+
+    // Inject a Ready node. `RecoveryDerivationRow::test_default` leaves
+    // `exec_id: None` — the shape `reset_to_ready()` produces after a
+    // worker disconnect, before re-dispatch.
+    actor.test_inject_ready("fb-drv", None, "x86_64-linux", false);
+    let drv_path = test_drv_path("fb-drv");
+
+    // Pre-stamp the LogBuffers entry as `assign_to_worker` did before
+    // the disconnect. `reset_to_ready()` does NOT discard this entry —
+    // only `rollback_assignment` and the next `assign_to_worker` do.
+    let exec_id = uuid::Uuid::now_v7();
+    log_buffers.set_exec(&drv_path, exec_id, "old-worker");
+    assert!(
+        log_buffers.push_for(
+            &drv_path,
+            &rio_proto::types::BuildLogBatch {
+                derivation_path: drv_path.clone(),
+                lines: vec![b"line from disconnected execution".to_vec()],
+                first_line_number: 0,
+                executor_id: "old-worker".into(),
+            },
+            "old-worker",
+        ),
+        "push_for should accept a batch from the stamped executor"
+    );
+
+    // Trigger the flush. Pre-fix: early-returned on `state.exec_id ==
+    // None`, no FlushRequest. Post-fix: falls back to the buffer's stamp.
+    actor.trigger_log_flush(&DrvHash::from("fb-drv"), "failed");
+
+    let req = flush_rx.try_recv().expect(
+        "trigger_log_flush should fall back to the LogBuffers entry's \
+         exec_id when state.exec_id is None (reset_to_ready cleared it \
+         before poison-while-Ready reached terminal_failure_epilogue)",
+    );
+    assert_eq!(
+        req.exec_id, exec_id,
+        "request pins the buffer's stamped exec_id"
+    );
+    assert_eq!(req.drv_path, drv_path);
+    assert_eq!(req.status.as_deref(), Some("failed"));
+    Ok(())
+}
+
+/// Negative: when neither carrier has an exec_id (never dispatched),
+/// `trigger_log_flush` MUST still skip — there is no execution to
+/// flush and no `drv_logs` row to write. Guards against the fallback
+/// over-firing.
+///
+/// r[verify obs.log.exec-keyed]
+#[tokio::test]
+async fn flush_skips_when_neither_carrier_has_exec_id() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(8);
+    let mut actor = DagActor::new(
+        SchedulerDb::new(db.pool.clone()),
+        DagActorConfig::default(),
+        DagActorPlumbing {
+            log_buffers: Some(log_buffers),
+            log_flush_tx: Some(flush_tx),
+            ..Default::default()
+        },
+    );
+
+    // Ready node with no LogBuffers entry — never dispatched.
+    actor.test_inject_ready("nd-drv", None, "x86_64-linux", false);
+    actor.trigger_log_flush(&DrvHash::from("nd-drv"), "failed");
+
+    assert!(
+        flush_rx.try_recv().is_err(),
+        "no exec_id from either carrier → no FlushRequest"
+    );
+    Ok(())
+}
+
+/// `record_exec_correlation`'s fallback is the second of the two
+/// readers fixed by `exec_id_for_terminal`. The shared helper means a
+/// regression in the fallback itself is caught by
+/// `flush_falls_back_to_buffer_exec_id_after_reset_to_ready`, but a
+/// regression that re-inlines a bare `state.exec_id` read at this
+/// call site would not. Exercise the same `state.exec_id = None` /
+/// buffer-stamped shape and assert the `build_derivations` UPDATE
+/// landed with the buffer's stamp.
+///
+/// Seeds `derivations`/`builds`/`build_derivations` directly via SQL
+/// (the established pattern in `admin/tests/graph_tests.rs`) so the
+/// in-memory node's `db_id` matches a real row the UPDATE can hit —
+/// `test_inject_ready` alone does not persist to PG.
+///
+/// Pre-fix: early-returned on `state.exec_id == None`, no UPDATE,
+/// `build_derivations.exec_id` stays NULL forever.
+///
+/// r[verify sched.merge.exec-correlation+2]
+#[tokio::test]
+async fn exec_correlation_falls_back_to_buffer_exec_id() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // Seed the rows record_exec_correlation's UPDATE targets.
+    let derivation_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO derivations (drv_hash, drv_path, pname, system, status) \
+         VALUES ($1, $2, 'pkg', 'x86_64-linux', 'ready') \
+         RETURNING derivation_id",
+    )
+    .bind("ec-fb-drv")
+    .bind(test_drv_path("ec-fb-drv"))
+    .fetch_one(&db.pool)
+    .await?;
+    let build_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO builds (build_id, status) VALUES ($1, 'active')")
+        .bind(build_id)
+        .execute(&db.pool)
+        .await?;
+    sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+        .bind(build_id)
+        .bind(derivation_id)
+        .execute(&db.pool)
+        .await?;
+
+    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let mut actor = DagActor::new(
+        SchedulerDb::new(db.pool.clone()),
+        DagActorConfig::default(),
+        DagActorPlumbing {
+            log_buffers: Some(log_buffers.clone()),
+            ..Default::default()
+        },
+    );
+
+    // Inject the Ready node with the SAME derivation_id as the seeded
+    // row — `from_recovery_row` maps it to `state.db_id`. `exec_id`
+    // stays `None` (test_default) — the post-`reset_to_ready` shape.
+    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+        derivation_id,
+        ..crate::db::RecoveryDerivationRow::test_default("ec-fb-drv", "x86_64-linux")
+    });
+
+    // Pre-stamp the LogBuffers entry as `assign_to_worker` did before
+    // the disconnect.
+    let exec_id = uuid::Uuid::now_v7();
+    log_buffers.set_exec(&test_drv_path("ec-fb-drv"), exec_id, "old-worker");
+
+    // Pre-fix: early-returned on `state.exec_id == None`, no UPDATE.
+    actor.record_exec_correlation(&DrvHash::from("ec-fb-drv"), &[build_id]);
+
+    // Poll PG: the exec-correlation write is spawned (fire-and-forget).
+    // Established 10ms × 100 pattern (see helpers::wait_for_status).
+    let mut got: Option<Uuid> = None;
+    for _ in 0..100 {
+        got = sqlx::query_scalar(
+            "SELECT exec_id FROM build_derivations \
+             WHERE build_id = $1 AND derivation_id = $2",
+        )
+        .bind(build_id)
+        .bind(derivation_id)
+        .fetch_one(&db.pool)
+        .await?;
+        if got.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        got,
+        Some(exec_id),
+        "record_exec_correlation should fall back to the LogBuffers \
+         entry's exec_id when state.exec_id is None"
+    );
+    Ok(())
+}

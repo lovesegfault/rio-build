@@ -390,6 +390,34 @@ impl DagActor {
         }
     }
 
+    /// Resolve the exec_id to flush/correlate at a terminal transition.
+    ///
+    /// Reads `state.exec_id` (the actor's carrier, set by
+    /// `assign_to_worker`), falling back to the `LogBuffers` ring-buffer
+    /// entry's stamped exec_id. The fallback covers poison-while-Ready:
+    /// `reset_to_ready()` clears `state.exec_id` WITHOUT discarding the
+    /// buffer entry — the entry's lines are still needed by the periodic
+    /// flusher in the disconnect→re-dispatch window. If a poison path
+    /// (I-065 fleet exhaustion `dispatch.rs`, max_infra/timeout_retries
+    /// cap `executor.rs`) reaches `terminal_failure_epilogue` BEFORE the
+    /// next `assign_to_worker` re-stamps, `state.exec_id` is `None` while
+    /// the buffer holds the disconnected execution's lines + exec_id.
+    /// See [`crate::state::DerivationState::exec_id`] and
+    /// `reset_to_ready` for the carrier-divergence rationale.
+    ///
+    /// Returns `None` only when neither carrier has an exec_id — the
+    /// derivation never reached a worker (cached terminal,
+    /// never-dispatched poison, cascaded `DependencyFailed`, or the
+    /// assignment never landed: `rollback_assignment` discarded the
+    /// buffer before any push).
+    fn exec_id_for_terminal(&self, state: &crate::state::DerivationState) -> Option<Uuid> {
+        state.exec_id.or_else(|| {
+            self.log_buffers
+                .as_ref()
+                .and_then(|b| b.exec_id(state.drv_path().as_str()))
+        })
+    }
+
     /// Fire a log-flush request for the given derivation. No-op if the
     /// flusher isn't configured (tests, or `RIO_LOG_S3_BUCKET` unset).
     ///
@@ -403,8 +431,9 @@ impl DagActor {
     ///
     /// `status` is recorded in `drv_logs.status` so the read path can
     /// show outcome alongside the log without a join. The request pins
-    /// `state.exec_id` so a re-dispatch racing the flusher's mpsc can't
-    /// be drained by a stale request — see `FlushRequest::exec_id`.
+    /// the resolved `exec_id` ([`Self::exec_id_for_terminal`]) so a
+    /// re-dispatch racing the flusher's mpsc can't be drained by a stale
+    /// request — see `FlushRequest::exec_id`.
     pub(super) fn trigger_log_flush(&self, drv_hash: &DrvHash, status: &'static str) {
         let Some(state) = self.dag.node(drv_hash) else {
             // Should be impossible at this call site (completion handlers
@@ -412,14 +441,14 @@ impl DagActor {
             warn!(drv_hash = %drv_hash, "trigger_log_flush: hash not in DAG, skipping");
             return;
         };
-        let Some(exec_id) = state.exec_id else {
-            // No execution ran (cached terminal, or a recovery/poison path
+        let Some(exec_id) = self.exec_id_for_terminal(state) else {
+            // No execution ran (cached terminal, or a poison/cascade path
             // that never dispatched). There is nothing to key a `drv_logs`
             // row on; the flusher would skip anyway. Don't queue a request.
             warn!(
                 drv_hash = %drv_hash,
                 status,
-                "trigger_log_flush: no exec_id on DAG node, skipping (never dispatched?)"
+                "trigger_log_flush: no exec_id (never dispatched)"
             );
             return;
         };
@@ -456,18 +485,24 @@ impl DagActor {
     /// `build_derivations.exec_id` stays `NULL` so consumers fall back
     /// to latest-exec resolution.
     ///
-    /// No-op (silent) when `state.exec_id` or `state.db_id` is `None` —
-    /// the former for never-dispatched drvs (shouldn't reach this
-    /// terminal path; defensive), the latter for nodes whose merge tx
-    /// hasn't committed (impossible here — merge commits before any
-    /// dispatch — but cheap to guard).
+    /// No-op (silent) when both `state.exec_id` and the `LogBuffers`
+    /// entry's stamp are `None` (never-dispatched drvs — see
+    /// [`Self::exec_id_for_terminal`]), or when `state.db_id` is `None`
+    /// (nodes whose merge tx hasn't committed — impossible here; merge
+    /// commits before any dispatch — but cheap to guard).
     ///
     /// r[impl sched.merge.exec-correlation+2]
     pub(super) fn record_exec_correlation(&self, drv_hash: &DrvHash, interested_builds: &[Uuid]) {
         let Some(state) = self.dag.node(drv_hash) else {
             return;
         };
-        let (Some(exec_id), Some(derivation_id)) = (state.exec_id, state.db_id) else {
+        let Some(derivation_id) = state.db_id else {
+            return;
+        };
+        // Same fallback as `trigger_log_flush` — poison-while-Ready paths
+        // run after `reset_to_ready` cleared `state.exec_id` but before
+        // `assign_to_worker` re-stamps it. See `exec_id_for_terminal`.
+        let Some(exec_id) = self.exec_id_for_terminal(state) else {
             return;
         };
         if interested_builds.is_empty() {
