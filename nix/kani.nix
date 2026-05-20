@@ -95,7 +95,7 @@ in
   # the full input domain. The contract case structure parallels the action
   # partition in docs/spec/models/LeaderElection.tla.
   # r[verify sched.lease.k8s-lease]
-  # r[verify sched.lease.at-most-one-leader]
+  # r[verify sched.lease.at-most-one-leader+2]
   kani-rio-lease = mkKaniCheck {
     name = "rio-lease";
     crate = crateBuildKani.members.rio-lease;

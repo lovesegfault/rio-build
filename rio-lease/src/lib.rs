@@ -77,6 +77,31 @@ pub trait LeaseHooks: Clone + Send + 'static {
     fn on_lose(&self);
 }
 
+// TODO: tighten the dual-belief window with asymmetric TTLs. The same
+// LEASE_TTL gates the leader's self-fence (`maybe_self_fence`) and the
+// follower's steal threshold (`decide_pure()` `age_ms > ttl_ms`), but the
+// two timestamps are stamped at different moments: the leader stamps
+// `last_successful_renew` when its renew RESPONSE arrives, the follower
+// stamps `obs.since` when it OBSERVES the rv change. When the follower's
+// observation latency is less than the leader's response latency, the
+// follower's deadline is earlier than the leader's — a connectivity loss
+// in between produces a dual-belief window with no clock skew involved.
+// The standard tightening (Chubby, etcd, ZooKeeper) is a safety margin:
+// leader self-fences at LEASE_TTL - margin, follower steals at
+// LEASE_TTL + margin, with margin > 2 × max(latency_slack, clock_skew).
+// The current "same TTL" choice is defensible because
+// r[sched.lease.generation-fence] provides correctness regardless and the
+// executor-side check is a cheap integer compare; this becomes worth doing
+// if that fence ever grows hot.
+//
+// TODO: use CLOCK_BOOTTIME for the self-fence clock instead of
+// Instant::now() (= CLOCK_MONOTONIC on Linux). MONOTONIC does not advance
+// during host suspend; a suspend-and-resume leaves `last_successful_renew`
+// looking fresh while real time advanced past LEASE_TTL — the leader
+// resumes still believing it leads, until the next failed apiserver
+// round-trip. BOOTTIME advances during suspend, so the self-fence fires
+// immediately on resume. Low priority for k8s nodes (they don't suspend);
+// worth doing before any bare-metal or laptop deployment of the scheduler.
 /// Lease TTL. After this much time without renewal, another
 /// replica can acquire.
 const LEASE_TTL: Duration = Duration::from_secs(15);

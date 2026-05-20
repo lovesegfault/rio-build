@@ -2110,23 +2110,29 @@ CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
   derivation is dispatched twice, builds twice, produces the same deterministic
   output. Wasteful but correct.
 
-#r("sched.lease.at-most-one-leader")[
-  At most one scheduler replica MUST hold a valid lease at any moment. Two
-  replicas concurrently believing they are leader ("dual leadership") is the
-  protocol's safety violation: both write scheduler-owned PG state
-  (#rref("sched.lease.standby-drops-writes")) and emit duplicate spawn-intents.
-  The mechanism is the apiserver's optimistic concurrency: `replace()` is
-  preconditioned on `metadata.resourceVersion` from the preceding GET; the
-  apiserver returns 409 Conflict to all but one of N concurrent writers.
-  Without the precondition every writer gets HTTP 200 and last-write-wins ---
-  the failure mode the in-house implementation was written to avoid (see
-  `rio-lease/src/election.rs` header re: `kube-leader-election` 0.43). The
-  CAS bounds the dual-leadership window to one tick interval when the deposed
-  replica retains apiserver connectivity (its next GET sees the new holder, or
-  its PUT gets a 409); when partitioned, the self-fence rule
-  (#rref("sched.lease.self-fence")) provides the unconditional `lease_ttl`
-  ceiling. A formal model of the protocol lives in
-  `docs/spec/models/LeaderElection.tla`.
+#r("sched.lease.at-most-one-leader+2")[
+  The Lease MUST be held by at most one scheduler identity at the apiserver
+  at any moment. `replace()` is preconditioned on `metadata.resourceVersion`
+  from the preceding GET; the apiserver returns 409 Conflict to all but one
+  of N concurrent writers. Without the precondition every writer gets HTTP
+  200 and last-write-wins --- the `kube-leader-election` 0.43 failure mode
+  (see the `rio-lease/src/election.rs` header). This half is hard. A
+  replica's _belief_ that it leads (`is_leader=true`) MAY lag the Lease
+  state by a bounded window: a deposed replica that retains apiserver
+  connectivity learns it lost on its next GET (one `RENEW_INTERVAL`); a
+  partitioned replica self-fences after `LEASE_TTL` of no apiserver contact,
+  per its own monotonic clock (#rref("sched.lease.self-fence")). This half
+  is soft. The dual-belief window cannot be closed at the lease layer: a
+  process whose clock pauses or skews cannot self-fence at the moment its
+  lease expires --- it discovers its lateness only when the clock next
+  reads. The Chubby-style fix is a fencing token at the resource boundary,
+  which #rref("sched.lease.generation-fence") provides; that rule, not this
+  one, makes the dual-belief window safe rather than merely short. The
+  formal model in `docs/spec/models/LeaderElection.tla` verifies the two
+  halves separately: `AtMostOneCASWinner` (the hard half --- two `Replace`
+  actions cannot both succeed at the same `resourceVersion`) and
+  `BoundedDualLeadership` (the soft half --- if two replicas concurrently
+  believe they lead, the older one is past its self-fence deadline).
 ]
 
 #r("sched.lease.self-fence")[

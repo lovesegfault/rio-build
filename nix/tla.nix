@@ -110,7 +110,7 @@ in
     # The model abstracts the k8s apiserver as a CAS register; the
     # implementation's optimistic-concurrency retry loop is the
     # refinement target.
-    # r[verify sched.lease.at-most-one-leader]
+    # r[verify sched.lease.at-most-one-leader+2]
     # r[verify sched.lease.k8s-lease]
     tla-leader-election = mkTlcCheck {
       name = "leader-election";
