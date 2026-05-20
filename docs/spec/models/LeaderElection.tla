@@ -273,7 +273,50 @@ Persist(n) ==
   /\ genHW' = gen[n]
   /\ UNCHANGED <<clocks, lease, alive, state, snap, obs, fence, gen, acquiredAt, casRace>>
 
-\* Temporary -- Task 5 adds SelfFence, Crash, Recover.
+\* -----------------------------------------------------------------------
+\* Fault model. SelfFence is the production maybe_self_fence(); Crash and
+\* Recover model a pod restart (k8s crash-recovery: in-memory state is
+\* lost, the OS clock and the apiserver and PG persist, the identity --
+\* the pod name -- survives).
+\* -----------------------------------------------------------------------
+
+\* maybe_self_fence(): a Leading node that has not had a successful
+\* apiserver round-trip in > Ttl per its OWN clock flips is_leader=false
+\* locally, without an apiserver write. The production loop checks this
+\* every RENEW_INTERVAL; the model lets it fire any time the deadline has
+\* passed (a superset of the production schedule -- sound for safety).
+SelfFence(n) ==
+  /\ alive[n]
+  /\ state[n] = "Leading"
+  /\ clocks[n] - fence[n] > Ttl
+  /\ state' = [state EXCEPT ![n] = "Following"]
+  /\ UNCHANGED <<clocks, lease, alive, snap, obs, fence, gen, genHW, acquiredAt, casRace>>
+
+\* Pod crash. Loses ALL in-memory state: the belief (state), the snapshot,
+\* the observed-record clock, the self-fence clock, the in-memory
+\* generation (the Arc<AtomicU64> -- reset to the production
+\* AtomicU64::new(1) init value, not 0), and the acquiredAt history. The
+\* OS clock (clocks[n]), the apiserver (lease), and PG (genHW) persist.
+Crash(n) ==
+  /\ alive[n]
+  /\ alive'      = [alive      EXCEPT ![n] = FALSE]
+  /\ state'      = [state      EXCEPT ![n] = "Following"]
+  /\ snap'       = [snap       EXCEPT ![n] = NULL]
+  /\ obs'        = [obs        EXCEPT ![n] = NULL]
+  /\ fence'      = [fence      EXCEPT ![n] = 0]
+  /\ gen'        = [gen        EXCEPT ![n] = 1]
+  /\ acquiredAt' = [acquiredAt EXCEPT ![n] = NULL]
+  /\ UNCHANGED <<clocks, lease, genHW, casRace>>
+
+\* Pod restart. The recovered process has no observation (its first
+\* decide() returns StartObserving and waits a full Ttl before stealing)
+\* unless the lease still carries its identity (decide() returns Renew --
+\* the recovered leader re-acquires its own lease without contention).
+Recover(n) ==
+  /\ ~alive[n]
+  /\ alive' = [alive EXCEPT ![n] = TRUE]
+  /\ UNCHANGED <<clocks, lease, state, snap, obs, fence, gen, genHW, acquiredAt, casRace>>
+
 Next == \E n \in Nodes :
   \/ Tick(n)
   \/ Get(n)
@@ -281,6 +324,9 @@ Next == \E n \in Nodes :
   \/ RenewLease(n)
   \/ Conflict(n)
   \/ Persist(n)
+  \/ SelfFence(n)
+  \/ Crash(n)
+  \/ Recover(n)
 
 Spec == Init /\ [][Next]_vars
 
