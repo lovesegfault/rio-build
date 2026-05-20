@@ -571,7 +571,7 @@ impl DagActor {
     /// (nodes whose merge tx hasn't committed — impossible here; merge
     /// commits before any dispatch — but cheap to guard).
     ///
-    /// r[impl sched.merge.exec-correlation+2]
+    /// r[impl sched.merge.exec-correlation+3]
     pub(super) fn record_exec_correlation(&self, drv_hash: &DrvHash, interested_builds: &[Uuid]) {
         let Some(state) = self.dag.node(drv_hash) else {
             return;

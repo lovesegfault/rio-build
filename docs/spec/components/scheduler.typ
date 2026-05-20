@@ -205,10 +205,10 @@ write). Dropped phase updates increment
 #(refs.metric)("rio_scheduler_phases_rejected_total"), labeled by reason
 (`not_active` | `no_assignment` | `executor_mismatch`).
 
-#r("sched.merge.exec-correlation+2")[
+#r("sched.merge.exec-correlation+3")[
   The scheduler MUST set `build_derivations.exec_id` for every interested
-  build when a derivation that has been dispatched (and therefore carries
-  an `exec_id` on its actor state) reaches a terminal state through a path
+  build when a derivation that has been dispatched (and therefore has an
+  `exec_id` recorded for it) reaches a terminal state through a path
   where an execution actually ran: `Completed` (success or recovery's
   orphan adoption), `Poisoned` (permanent failure), and `Cancelled` via
   the timeout-exhaustion path. The column MUST stay `NULL` for
@@ -221,10 +221,15 @@ write). Dropped phase updates increment
 (`Running → Failed → Ready`). The terminal-failure call site of
 `record_exec_correlation` is `terminal_failure_epilogue`, reached after a
 transition to `Poisoned` or `Cancelled` (timeout cap exhausted) — both of
-which imply the worker ran the build. The actual gate is `state.exec_id`
-(set by `assign_to_worker`, recoverable from `assignments.exec_id` after a
-leader failover): the helper no-ops when it is `None`, which covers every
-never-dispatched terminal regardless of its enum value.
+which imply the worker ran the build. The actual gate is
+`exec_id_for_terminal`, which reads `state.exec_id` (set by
+`assign_to_worker`, recoverable from `assignments.exec_id` after a leader
+failover) and falls back to the `LogBuffers` ring-buffer entry's stamped
+`exec_id` --- covering poison-while-Ready, where `reset_to_ready` clears
+`state.exec_id` but the buffer entry retains the disconnected execution's
+stamp through the disconnect→re-dispatch window. The helper no-ops only
+when *both* carriers are `None`, which covers every never-dispatched
+terminal regardless of its enum value.
 
 The build↔exec correlation lets the dashboard's build view fetch the *exact*
 log a build observed (`GetDerivationLogs(drv, exec_id)`) instead of falling

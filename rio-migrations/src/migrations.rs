@@ -997,7 +997,7 @@ pub const M_060: () = ();
 /// correlation — set by the completion handler on terminal paths where an
 /// execution ran: `Completed`, `Poisoned`, and timeout-exhausted `Cancelled`;
 /// `NULL` for `Cached`/`DependencyFailed`/`Skipped`/never-dispatched/
-/// non-terminal — see `sched.merge.exec-correlation+2`).
+/// non-terminal — see `sched.merge.exec-correlation+3`).
 ///
 /// Greenfield drop+recreate, no backfill.
 pub const M_061: () = ();
