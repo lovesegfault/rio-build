@@ -11,10 +11,16 @@
 //! auth (`rio-jwt-signing`, `rio-service-hmac`, `rio-postgres*`) stays.
 //! Those live in `rio-system`, which is the one namespace this command
 //! does NOT delete.
+//!
+//! All-or-nothing on EKS: the wipe refuses to start if the PG URL
+//! cannot be captured up front. Deleting the leader-election Leases
+//! without resetting the PG schema leaves the lease generation epoch
+//! out of sync with postgres (the generation-collision precondition),
+//! so a wipe that cannot finish must not start.
 
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
 
 use super::eks::TF_DIR;
@@ -38,8 +44,30 @@ pub(super) async fn run(kind: ProviderKind) -> Result<()> {
     // GCs the synced Secret. The schema-reset step (step 8) runs AFTER
     // namespace deletes (open conns block DROP CASCADE), so by then
     // the Secret is gone. Read it now; pass the URL forward.
+    //
+    // PREFLIGHT: if the Secret is already gone, refuse to start. A wipe
+    // that deletes the leader-election Leases (step 3b) and namespaces
+    // (step 5) but cannot reset the PG schema (step 8) leaves the lease
+    // generation epoch out of sync with postgres: the recreated Lease
+    // restarts `leaseTransitions` at 0 while postgres still remembers
+    // every generation the old deployment claimed — the exact precondition
+    // for a generation collision on the next deploy. Failing here, before
+    // anything is deleted, is the only point where the operator can still
+    // choose a safe path.
     let pg_url = if matches!(kind, ProviderKind::Eks) {
-        kube::get_secret_key(&client, NS, "rio-postgres", "url").await?
+        let url = kube::get_secret_key(&client, NS, "rio-postgres", "url").await?;
+        if url.is_none() {
+            bail!(
+                "the rio-postgres Secret is already gone (prior partial wipe?) — \
+                 refusing to wipe: the leader-election Leases and namespaces would be \
+                 deleted but the PG schema could not be reset, leaving the lease \
+                 generation epoch out of sync with postgres. nothing has been deleted. \
+                 run `xtask k8s up` first so the ExternalSecret re-syncs rio-postgres, \
+                 then re-run `up --wipe`; or run `xtask k8s destroy` to tear down \
+                 postgres along with the cluster"
+            );
+        }
+        url
     } else {
         None
     };
@@ -102,12 +130,24 @@ pub(super) async fn run(kind: ProviderKind) -> Result<()> {
             // PG-schema reset MUST come after the namespace deletes:
             // store/scheduler pods hold connections that block DROP
             // SCHEMA on RDS until they're gone.
+            //
+            // The None arm is unreachable on EKS — the step-0 preflight
+            // bails before any destructive step if the URL could not be
+            // captured. It is a hard error (not a warn-and-skip) anyway:
+            // by this point the Leases and namespaces are gone, so
+            // silently skipping the schema reset would hand the next
+            // deploy a fresh Lease over a postgres that remembers the old
+            // generation history — the generation-collision precondition.
             match pg_url {
                 Some(url) => reset_pg_schema(&url).await?,
-                None => warn!(
-                    "rio-postgres Secret was already gone before wipe started \
-                     (prior partial wipe?) — skipping schema reset; \
-                     the deploy phase's migration will fail if old tables remain"
+                None => bail!(
+                    "no PG URL was captured before the destructive steps — the \
+                     leader-election Leases and namespaces are already deleted but \
+                     the PG schema was NOT reset; the lease generation epoch is now \
+                     out of sync with postgres. run `xtask k8s up` so the \
+                     ExternalSecret re-syncs rio-postgres and re-run `up --wipe` to \
+                     finish the reset, or run `xtask k8s destroy` to tear down both \
+                     sides"
                 ),
             }
         }
