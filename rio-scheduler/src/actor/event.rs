@@ -265,8 +265,8 @@ impl BuildEventBus {
     /// `logs/{drv_hash}/{exec_id}.partial.log.zst` and UPSERTs the
     /// `drv_logs` row with `is_complete=false` until
     /// `CleanupTerminalBuild` reaps the DAG node and discards the buffer
-    /// (~30s later); the row stays incomplete and the dashboard sees only
-    /// the last periodic snapshot.
+    /// (after `TERMINAL_CLEANUP_DELAY`, ~60s); the row stays incomplete
+    /// and the dashboard sees only the last periodic snapshot.
     pub(super) fn try_log_flush(&self, req: crate::logs::FlushRequest) {
         let Some(tx) = &self.flush_tx else {
             return;

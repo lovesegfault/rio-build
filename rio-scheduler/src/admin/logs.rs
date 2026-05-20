@@ -118,8 +118,9 @@ pub(super) async fn get_derivation_logs(
     // `logs/{drv_hash}/{exec_id}.log.zst`. The client typically has
     // drv_path (that's what the gateway speaks). We could resolve
     // drv_path→drv_hash via the actor, but the DAG entry is likely
-    // gone by now (CleanupTerminalBuild removes it ~30s after
-    // completion). Instead: accept EITHER in derivation_path —
+    // gone by now (CleanupTerminalBuild removes it after
+    // TERMINAL_CLEANUP_DELAY, ~60s). Instead: accept EITHER in
+    // derivation_path —
     // `drv_log_hash` normalizes full path / basename / bare hash to
     // the 32-char hash. Same helper the flusher uses for the PG row,
     // so the lookup key can't drift from what was written.

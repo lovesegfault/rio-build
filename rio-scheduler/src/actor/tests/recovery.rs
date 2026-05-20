@@ -2058,8 +2058,9 @@ async fn test_recovery_repopulates_log_buffers_exec_id() -> TestResult {
 ///    request the dashboard sends from `GraphNode.exec_id`),
 ///  - the GetDerivationLogs handler never falls through to `try_s3`,
 /// — and the ex-leader's already-uploaded `.partial.log.zst` and `drv_logs`
-/// row are unreachable until `CleanupTerminalBuild` reaps the *build* (~30s
-/// after the build, not the drv, goes terminal — hours for a large build).
+/// row are unreachable until `CleanupTerminalBuild` reaps the *build*
+/// (`TERMINAL_CLEANUP_DELAY`, ~60s after the build, not the drv, goes
+/// terminal — hours for a large build).
 /// The periodic flusher doesn't self-heal: `upload_and_record` early-returns
 /// on `line_count == 0` so it neither uploads nor reaps. Same shape as
 /// `rollback_assignment`'s discard for a failed `try_send`.

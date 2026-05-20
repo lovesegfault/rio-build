@@ -407,8 +407,8 @@ impl LogBuffers {
     /// starts clean — clears a transient-failure predecessor's partial
     /// lines and any stale seal from a poison-clear) and by
     /// `handle_cleanup_terminal_build` for each reaped DAG node (bounds a
-    /// dropped-FlushRequest leak to the ~30s cleanup delay). Idempotent;
-    /// no-op on a missing entry.
+    /// dropped-FlushRequest leak to `TERMINAL_CLEANUP_DELAY`, ~60s).
+    /// Idempotent; no-op on a missing entry.
     pub fn discard(&self, drv_path: &str) {
         let key = drv_log_hash(drv_path);
         self.buffers.remove(&key);
@@ -858,7 +858,7 @@ mod tests {
         bufs.seal("drv-a");
         assert_eq!(bufs.active_count(), 1, "dropped request leaves buffer");
         assert_eq!(bufs.sealed_count(), 1);
-        // ~30s later: CleanupTerminalBuild reaps the DAG node and discards.
+        // after TERMINAL_CLEANUP_DELAY (~60s): CleanupTerminalBuild discards.
         bufs.discard("drv-a");
         assert_eq!(bufs.active_count(), 0, "cleanup discard frees buffer");
         assert_eq!(bufs.sealed_count(), 0, "cleanup discard also unseals");

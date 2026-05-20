@@ -715,7 +715,7 @@ impl DagActor {
         // completion `FlushRequest` was dropped (channel-full burst),
         // the buffer would otherwise leak for the process lifetime and
         // `flush_periodic` would re-upload it every 30s. This bounds
-        // that leak to the ~30s CleanupTerminalBuild delay.
+        // that leak to TERMINAL_CLEANUP_DELAY (~60s).
         let reaped_paths = self.dag.remove_build_interest_and_reap(build_id);
         if let Some(bufs) = &self.log_buffers {
             for path in &reaped_paths {

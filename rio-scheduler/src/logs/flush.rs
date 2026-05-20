@@ -31,8 +31,8 @@
 //! dropped. The buffer stays in `LogBuffers.buffers` (sealed) and the next
 //! periodic tick still snapshots it — so the content survives at the
 //! `.partial` key with an `is_complete=false` PG row. `CleanupTerminalBuild`
-//! (~30s later) reaps the DAG node and discards the buffer
-//! (`LogBuffers::discard`), bounding the leak.
+//! (after `TERMINAL_CLEANUP_DELAY`, ~60s) reaps the DAG node and
+//! discards the buffer (`LogBuffers::discard`), bounding the leak.
 //!
 //! Compression is CPU-bound; runs in `spawn_blocking` so it doesn't hog a
 //! tokio worker thread during the typical 10-100ms compression of a few-MB log.

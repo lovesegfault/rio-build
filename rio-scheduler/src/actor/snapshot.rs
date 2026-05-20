@@ -330,7 +330,8 @@ impl DagActor {
                 BuildState::Pending => pending_builds += 1,
                 BuildState::Active => active_builds += 1,
                 // Terminal builds stay in the map until CleanupTerminalBuild
-                // (delayed ~30s). Don't count them — they're not "active"
+                // (after TERMINAL_CLEANUP_DELAY, ~60s). Don't count them —
+                // they're not "active"
                 // in any autoscaling sense. Unspecified never appears
                 // (proto3 default-0; scheduler always sets a real state).
                 BuildState::Succeeded

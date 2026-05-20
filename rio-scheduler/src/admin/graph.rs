@@ -2,8 +2,8 @@
 //!
 //! PG-backed DAG snapshot for dashboard viz. NOT actor-snapshot —
 //! completed builds have no actor state (CleanupTerminalBuild removes
-//! them ~30s after terminal), but PG persists the full graph. Dashboard
-//! polls at 5s for live status colors.
+//! them after `TERMINAL_CLEANUP_DELAY`, ~60s post-terminal), but PG
+//! persists the full graph. Dashboard polls at 5s for live status colors.
 
 use rio_proto::types::{GetBuildGraphResponse, GraphEdge, GraphNode};
 use tonic::Status;
