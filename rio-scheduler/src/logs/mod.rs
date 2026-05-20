@@ -308,7 +308,7 @@ impl LogBuffers {
     /// r[impl sched.log.batch-binding]
     ///
     /// Returns `true` if the batch was accepted into the ring buffer.
-    /// Returns `false` (drop: no-op + counted metric + warn log) when:
+    /// Returns `false` (drop: no-op + counted metric + debug log) when:
     /// - no entry exists for `drv_path` (unsolicited drv — does NOT
     ///   create an entry; this changes the legacy [`Self::push`]'s
     ///   `or_default()` behavior, which is itself the threat: a
@@ -348,8 +348,13 @@ impl LogBuffers {
             // Late batch after terminal; matches push()'s seal check.
             return false;
         }
+        // debug!, not warn!, on all three reject arms below — same shape as
+        // handle_forward_phase (event.rs) and ProcessCompletion's stale-report
+        // guard. Rejected paths bypass the seen_drvs cap (executor_service.rs),
+        // so a 100%-rejected stream fires this unbounded; the metric covers
+        // attack detection without log noise.
         let Some(mut entry) = self.buffers.get_mut(&key) else {
-            tracing::warn!(drv = %drv_path, executor, "rejected log batch: no active assignment");
+            tracing::debug!(drv = %drv_path, executor, "rejected log batch: no active assignment");
             metrics::counter!(
                 "rio_scheduler_log_batches_rejected_total",
                 "reason" => "no_assignment"
@@ -362,7 +367,7 @@ impl LogBuffers {
             // stamped with an executor. Reject under its own label so
             // dashboards can distinguish "test fixture wired wrong" from
             // a real cross-executor probe.
-            tracing::warn!(drv = %drv_path, executor, "rejected log batch: entry unstamped (no set_exec)");
+            tracing::debug!(drv = %drv_path, executor, "rejected log batch: entry unstamped (no set_exec)");
             metrics::counter!(
                 "rio_scheduler_log_batches_rejected_total",
                 "reason" => "unstamped"
@@ -371,7 +376,7 @@ impl LogBuffers {
             return false;
         }
         if entry.assigned_executor.as_deref() != Some(executor) {
-            tracing::warn!(
+            tracing::debug!(
                 drv = %drv_path, executor, assigned = ?entry.assigned_executor,
                 "rejected log batch: executor mismatch"
             );

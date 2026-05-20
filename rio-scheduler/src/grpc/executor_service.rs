@@ -308,7 +308,7 @@ impl ExecutorService for SchedulerGrpc {
                             //    Because rejected paths never enter `seen_drvs`, the
                             //    cap no longer throttles a 100%-rejected flood — that
                             //    flood is bounded only by `push_for`'s per-batch reject
-                            //    cost (string parse, DashMap lookup, warn log, metric;
+                            //    cost (string parse, DashMap lookup, debug log, metric;
                             //    no allocation, no actor send), which a worker could
                             //    already pay by re-sending the same 8 rejected paths
                             //    under the old code. The cap bounds the *accepted*
