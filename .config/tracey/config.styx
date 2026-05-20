@@ -84,6 +84,7 @@ specs (
           rio-migrations/tests/**/*.rs
           xtask/tests/**/*.rs
           nix/tests/default.nix
+          nix/kani.nix
           rio-dashboard/src/lib/__tests__/*.ts
           rio-dashboard/src/components/__tests__/*.ts
           rio-dashboard/src/pages/__tests__/*.ts

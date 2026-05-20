@@ -1091,6 +1091,18 @@
                     # passthru, not a checks.* member: the kani tree is
                     # ~500 drvs/member and a manual verification target.
                     crates = crateBuildKani.members;
+                    # Per-member CBMC verification — reads the goto-C
+                    # sidecars from `crates.<name>` and runs the
+                    # goto-cc/goto-instrument/cbmc pipeline per harness.
+                    # `nix build .#kani-toolchain.kani-checks.kani-rio-lease`.
+                    # Manual target until rio-lease has #[kani::proof]
+                    # harnesses (deferred to the rio-lease FV plan); a
+                    # vacuous 0-harness check in checks.* would dilute
+                    # the CI gate without verifying anything. Promote to
+                    # checks.* when harnesses land. See nix/kani.nix.
+                    kani-checks = import ./nix/kani.nix {
+                      inherit pkgs kaniToolchain crateBuildKani;
+                    };
                   };
                 });
               }
