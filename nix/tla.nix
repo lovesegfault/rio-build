@@ -51,12 +51,23 @@
 let
   modelsDir = unfilteredRoot + "/docs/spec/models";
 
-  # One TLC run per model. The .cfg bounds the state space (CONSTANT
-  # values, INVARIANT/PROPERTY names). TLC exits 0 iff every invariant
-  # holds across the explored state graph; a violation prints a
-  # counterexample trace and exits nonzero.
+  # One TLC run per (model, config) pair. The .cfg bounds the state
+  # space (CONSTANT values, INVARIANT/PROPERTY names). TLC exits 0 iff
+  # every invariant holds across the explored state graph; a violation
+  # prints a counterexample trace and exits nonzero.
+  #
+  # `config` defaults to `spec` (the usual one-cfg-per-model case) and
+  # exists so one .tla can be checked under several constant
+  # assignments — e.g. LeaderElection.tla under MaxDeletes=0 (the core
+  # protocol) and MaxDeletes=1 (the Lease-deletion fault) as two
+  # separate checks, so a regression in the core protocol surfaces in
+  # the small fast check instead of buried in the larger one.
   mkTlcCheck =
-    { name, spec }:
+    {
+      name,
+      spec,
+      config ? spec,
+    }:
     pkgs.runCommand "tla-${name}"
       {
         nativeBuildInputs = [ pkgs.tlaplus ];
@@ -68,7 +79,7 @@ let
           root = modelsDir;
           fileset = lib.fileset.unions [
             (modelsDir + "/${spec}.tla")
-            (modelsDir + "/${spec}.cfg")
+            (modelsDir + "/${config}.cfg")
           ];
         };
         # Surfaced in `nix log` and error messages.
@@ -93,7 +104,7 @@ let
         tlc \
           -workers "$workers" \
           -metadir "$TMPDIR/tlc-states" \
-          -config ${spec}.cfg \
+          -config ${config}.cfg \
           ${spec}.tla 2>&1 | tee $out
       '';
 in
@@ -122,15 +133,34 @@ in
     # (lease.gen+2) and claims it in PG at acquisition time (genHW
     # advances inside Steal, not in a separate dispatch-time Persist).
     # The fetch-max-seed marker covers that seeding-and-claiming
-    # encoding. Lease-object deletion is outside this model's fault set;
-    # the DeleteLease extension and the generation-claim verify marker
-    # land with it.
+    # encoding. Lease-object deletion is disabled here (MaxDeletes=0) so
+    # a regression in the core protocol surfaces in this small fast
+    # check; the deletion fault gets its own cfg below.
     # r[verify sched.lease.at-most-one-leader+2]
     # r[verify sched.lease.k8s-lease]
     # r[verify sched.recovery.fetch-max-seed+2]
     tla-leader-election = mkTlcCheck {
       name = "leader-election";
       spec = "LeaderElection";
+    };
+
+    # The same model with the Lease-deletion fault enabled
+    # (MaxDeletes=1): `kubectl delete lease` resets the leaseTransitions
+    # counter the generation derives from, which re-arms the
+    # generation-collision failure mode the transition-count derivation
+    # closed. The write-ahead claim (the generation is durably recorded
+    # in PG's claims ledger inside the acquisition step, before dispatch
+    # is ungated) is what survives it: TLC proves
+    # StaleLeaderHasStaleGeneration still holds with the fault injected,
+    # and the deliberately-weakened run (the claim reverted to a lazy
+    # dispatch-time persist) is falsified at depth 6 — two believers at
+    # the same generation. See LeaderElectionDeletion.cfg's non-vacuity
+    # section for both traces.
+    # r[verify sched.lease.generation-claim]
+    tla-leader-election-deletion = mkTlcCheck {
+      name = "leader-election-deletion";
+      spec = "LeaderElection";
+      config = "LeaderElectionDeletion";
     };
   };
 }

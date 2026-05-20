@@ -3,7 +3,7 @@
 (* Phase-1 model of rio-lease's apiserver-CAS leader election protocol:    *)
 (* per-node monotonic clocks with bounded skew, the observed-record        *)
 (* staleness clock, local self-fencing, the PG generation high-water       *)
-(* mark, and pod crash/recovery.                                           *)
+(* mark, pod crash/recovery, and Lease-object deletion.                    *)
 (*                                                                         *)
 (* Formalizes (from docs/spec/components/scheduler.typ; update both when   *)
 (* the protocol changes -- `tracey bump` on a rule flags the r[verify]     *)
@@ -12,18 +12,20 @@
 (*   - sched.lease.k8s-lease           (the protocol mechanism)            *)
 (*   - sched.recovery.fetch-max-seed   (the generation seeding on acquire) *)
 (*   - sched.lease.generation-claim    (the write-ahead claim in Steal;    *)
-(*     its r[verify] marker lands with the DeleteLease extension, which    *)
-(*     is the fault the claim exists to survive)                           *)
+(*     verified by the DeleteLease cfg, which injects the fault the claim  *)
+(*     exists to survive)                                                  *)
 (*                                                                         *)
 (* PROOF CLAIM, stated honestly: the invariants below hold under clock     *)
-(* skew <= MaxSkew ticks, no host suspend, no Lease-object deletion, over  *)
-(* a bounded state space of 2 nodes and ~2 leadership cycles (1.47M        *)
-(* distinct states). The bounds exclude: 3-party races (any k-party CAS    *)
-(* race contains a 2-party prefix, so AtMostOneCASWinner is unaffected; a  *)
-(* 3-party dual-belief scenario needs two simultaneously-stale ex-leaders  *)
-(* and is only partially covered), and a third leadership handoff. See     *)
-(* the .cfg for the full coverage-vs-cost argument and the non-vacuity     *)
-(* evidence.                                                               *)
+(* skew <= MaxSkew ticks, no host suspend, over a bounded state space of   *)
+(* 2 nodes and ~2 leadership cycles, with at most MaxDeletes Lease-object  *)
+(* deletions (LeaderElection.cfg pins MaxDeletes=0, ~1.47M distinct        *)
+(* states; LeaderElectionDeletion.cfg pins MaxDeletes=1 -- same .tla, the  *)
+(* deletion fault enabled). The bounds exclude: 3-party races (any         *)
+(* k-party CAS race contains a 2-party prefix, so AtMostOneCASWinner is    *)
+(* unaffected; a 3-party dual-belief scenario needs two                    *)
+(* simultaneously-stale ex-leaders and is only partially covered), a       *)
+(* third leadership handoff, and a second deletion. See the .cfgs for the  *)
+(* full coverage-vs-cost argument and the non-vacuity evidence.            *)
 (*                                                                         *)
 (* INVARIANTS, and which half of sched.lease.at-most-one-leader+2 each     *)
 (* verifies:                                                               *)
@@ -40,10 +42,13 @@
 (* every reachable dual-belief state already has a discovery mechanism     *)
 (* armed -- the stale believer is within 2*MaxSkew of its own self-fence   *)
 (* deadline, or its snapshot is stale (next renew 409s), or its snapshot   *)
-(* already names the thief. Combined with LoopInterval (the loop runs      *)
-(* every Renew ticks), the window is bounded to one loop iteration plus    *)
-(* the skew penalty. Weakened test: relaxing Steal's staleness threshold   *)
-(* from > Ttl to >= 0 violates it at depth 5 -- the > Ttl threshold is     *)
+(* already names the thief, or it was deposed by a Lease deletion (then    *)
+(* the bound degrades to its own self-fence deadline, Ttl + Renew, since   *)
+(* no thief ever measured its staleness). Combined with LoopInterval (the  *)
+(* loop runs every Renew ticks), the window is bounded to one loop         *)
+(* iteration plus the skew penalty (or one lease lifetime for a deletion   *)
+(* victim). Weakened test: relaxing Steal's staleness threshold from       *)
+(* > Ttl to >= 0 violates it at depth 5 -- the > Ttl threshold is          *)
 (* exactly what guarantees the victim is already at its own fence          *)
 (* deadline when deposed. Clock skew eats directly into that guarantee     *)
 (* (the 2*MaxSkew term); this is the formal version of the asymmetric-TTL  *)
@@ -51,14 +56,17 @@
 (*                                                                         *)
 (* StaleLeaderHasStaleGeneration -- the bridge to                          *)
 (* sched.lease.generation-fence+2: when the dual-belief window is open,    *)
-(* the executor must be able to tell the replicas apart by generation.     *)
-(* HOLDS over the full state space now that the generation derives from    *)
-(* the lease's transition count and is claimed in PG at acquisition time.  *)
-(* The pre-fix protocol (in-memory fetch_add seeded from a lazily-written  *)
-(* PG high-water mark) falsified it at depth 12; the weakened test         *)
-(* (revert Steal's derivation, move the genHW update back to a             *)
-(* dispatch-time Persist action) still reproduces that counterexample.     *)
-(* See the FIXED block at the invariant definition.                        *)
+(* the executor must be able to tell the replicas apart by generation      *)
+(* (the holder's strictly greatest when a holder exists among the          *)
+(* believers; merely distinct when a deletion has deposed both). HOLDS     *)
+(* over the full state space of BOTH cfgs now that the generation          *)
+(* derives from the lease's transition count and is claimed in PG at       *)
+(* acquisition time. The pre-fix protocol (in-memory fetch_add seeded      *)
+(* from a lazily-written PG high-water mark) falsified it at depth 12      *)
+(* with no deletion and at depth 6 with one; the weakened test (move the   *)
+(* genHW update back to a dispatch-time Persist action) still reproduces   *)
+(* both counterexamples. See the FIXED block at the invariant definition   *)
+(* and the non-vacuity section of LeaderElectionDeletion.cfg.              *)
 (*                                                                         *)
 (* ACTION <-> CODE CORRESPONDENCE (rio-lease/src/{lib,election}.rs):       *)
 (*   Tick        clock advance; CLOCK_MONOTONIC ticks regardless of state  *)
@@ -82,17 +90,22 @@
 (*               schedule -- sound for safety)                             *)
 (*   Crash/      pod restart: in-memory state lost, gen resets to the      *)
 (*   Recover     AtomicU64::new(1) init; OS clock, apiserver, PG persist   *)
+(*   DeleteLease `kubectl delete lease` + the next replica's create():     *)
+(*               holder and leaseTransitions reset, resourceVersion does   *)
+(*               not, PG survives. Disabled (MaxDeletes=0) in the base     *)
+(*               cfg; LeaderElectionDeletion.cfg enables one per trace.    *)
 (*                                                                         *)
 (* PHASE-2 DEFERRALS: liveness (eventually-some-leader needs an unbounded  *)
 (* clock, which TLC cannot check -- the temporal form stutters one tick    *)
 (* short of the fence deadline forever); NoDualDispatch (the worker-side   *)
 (* model that takes StaleLeaderHasStaleGeneration as an ASSUME -- now      *)
-(* unblocked); DeleteLease (the operator-resets-the-epoch-source fault     *)
-(* that re-arms the transition-count derivation's failure mode and is      *)
-(* closed by the write-ahead claim -- needs its own cfg and a fourth       *)
-(* BoundedDualLeadership discovery disjunct); asymmetric TTLs (if the      *)
-(* lib.rs TODO lands, StealTtl splits from FenceTtl and the 2*MaxSkew      *)
-(* penalty in BoundedDualLeadership shrinks).                              *)
+(* unblocked); a second deletion per trace (MaxDeletes=2 would cover an    *)
+(* operator deleting the lease twice before the first victim's window      *)
+(* closes -- the claim argument is inductive in genHW so nothing new is    *)
+(* expected, but it is unverified); asymmetric TTLs (if the lib.rs TODO    *)
+(* lands, StealTtl splits from FenceTtl and the 2*MaxSkew penalty in       *)
+(* BoundedDualLeadership shrinks); RenewLease restoring state[n] to        *)
+(* Leading after a SelfFence false alarm (see the note at RenewLease).     *)
 (***************************************************************************)
 
 EXTENDS Integers, FiniteSets, TLC
@@ -104,10 +117,12 @@ CONSTANTS Nodes,    \* set of node identities, e.g. {n1, n2, n3}
           MaxSkew,  \* clock skew bound
           MaxTime,  \* clock ceiling (state-space bound)
           MaxGen,   \* generation ceiling (state-space bound)
-          MaxRv     \* rv ceiling (state-space bound)
+          MaxRv,    \* rv ceiling (state-space bound)
+          MaxDeletes \* Lease-object deletions per trace (0 = fault disabled)
 
 ASSUME Ttl \in Nat /\ Renew \in Nat /\ Renew >= 1 /\ Ttl >= Renew
 ASSUME MaxSkew \in Nat /\ MaxTime \in Nat /\ MaxGen \in Nat /\ MaxRv \in Nat
+ASSUME MaxDeletes \in Nat
 
 VARIABLES
   clocks,      \* [Nodes -> 0..MaxTime] -- per-node monotonic clock
@@ -120,9 +135,12 @@ VARIABLES
   gen,         \* [Nodes -> 0..MaxGen] -- in-memory generation (Arc<AtomicU64>)
   genHW,       \* 0..MaxGen -- PG generation high-water mark (persistent)
   acquiredAt,  \* [Nodes -> (0..MaxRv \cup {NULL})] -- rv at last acquire
-  casRace      \* BOOLEAN -- has any CAS race been observed?
+  casRace,     \* BOOLEAN -- has any CAS race been observed?
+  deletes,     \* 0..MaxDeletes -- Lease-object deletions so far
+  delVictims   \* SUBSET Nodes -- holders deposed by a deletion, not a steal
 
-vars == <<clocks, lease, alive, state, snap, obs, fence, gen, genHW, acquiredAt, casRace>>
+vars == <<clocks, lease, alive, state, snap, obs, fence, gen, genHW, acquiredAt,
+          casRace, deletes, delVictims>>
 
 LeaseRecord == [holder : Nodes \cup {NULL}, rv : 0..MaxRv, gen : 0..MaxGen]
 ObsRecord   == [rv : 0..MaxRv, since : 0..MaxTime]
@@ -139,6 +157,8 @@ TypeOK ==
   /\ genHW  \in 0..MaxGen
   /\ acquiredAt \in [Nodes -> (0..MaxRv \cup {NULL})]
   /\ casRace \in BOOLEAN
+  /\ deletes \in 0..MaxDeletes
+  /\ delVictims \in SUBSET Nodes
 
 \* SYMMETRY: nodes are interchangeable. Cuts the state space by |Nodes|!.
 perm == Permutations(Nodes)
@@ -244,12 +264,46 @@ LoopInterval ==
 BoundedDualLeadership ==
   \A m, n \in Nodes :
     (state[m] = "Leading" /\ state[n] = "Leading" /\ m /= n) =>
-      /\ lease.holder \in {m, n}
-      /\ LET stale == IF lease.holder = m THEN n ELSE m
-         IN \/ clocks[stale] - fence[stale] > Ttl - 2 * MaxSkew
-            \/ /\ snap[stale] /= NULL
-               /\ \/ snap[stale].rv /= lease.rv
-                  \/ snap[stale].holder /= stale
+      \* In every dual one of the believers actually holds the lease --
+      \* unless an operator deleted it out from under the holder while a
+      \* previously-deposed believer still hadn't noticed ITS loss; then
+      \* neither does and BOTH believers are stale. With no deletion the
+      \* holder is always the most recent stealer, which is Leading (or
+      \* crashed, and a crashed node is not a believer).
+      /\ \/ lease.holder \in {m, n}
+         \/ lease.holder = NULL /\ deletes > 0
+      \* Every stale believer -- the believers that do NOT hold the
+      \* lease (one of the two normally; both after a deletion) -- has a
+      \* discovery mechanism armed:
+      /\ \A stale \in {m, n} \ {lease.holder} :
+           \/ clocks[stale] - fence[stale] > Ttl - 2 * MaxSkew
+           \/ /\ snap[stale] /= NULL
+              /\ \/ snap[stale].rv /= lease.rv
+                 \/ snap[stale].holder /= stale
+           \* (4) Deposed by an operator deleting the Lease out from
+           \*     under it (DeleteLease) rather than by a thief that
+           \*     observed it as stale. The steal-threshold coupling of
+           \*     disjunct (1) does not apply -- no thief ever measured
+           \*     this victim's staleness, so its fence can be arbitrarily
+           \*     fresh -- and its snapshot was spent at its own
+           \*     acquisition, so (2)/(3) have nothing to look at. Its
+           \*     window is bounded by its OWN self-fence deadline
+           \*     instead: LoopInterval caps a Leading node at
+           \*     Ttl + Renew ticks past its last round-trip and
+           \*     SelfFence is enabled from Ttl + 1, so the window is at
+           \*     most Ttl + Renew (one full lease lifetime) rather than
+           \*     2*MaxSkew + Renew. Weaker, but still finite, and the
+           \*     generation fence (StaleLeaderHasStaleGeneration) is
+           \*     what protects correctness inside the window. A victim
+           \*     that reaches the apiserver before its deadline
+           \*     discovers the loss sooner: its next GET returns a
+           \*     lease that does not name it (arming disjunct 3) or its
+           \*     next PUT 409s against the recreated object's fresh rv
+           \*     (disjunct 2). delVictims is cleaned on the victim's
+           \*     next Steal, so this disjunct cannot mask the discovery
+           \*     obligation of a LATER steal-deposition of the same
+           \*     node.
+           \/ stale \in delVictims
 
 \* -----------------------------------------------------------------------
 \* The bridge to sched.lease.generation-fence+2. When the dual-belief
@@ -284,9 +338,12 @@ BoundedDualLeadership ==
 \*       anything.
 \* Either change alone closes THIS counterexample; (b) is what survives
 \* Lease-object deletion (which resets lease.gen to 0 and re-arms the (a)
-\* mechanism's failure mode). Deletion is outside this model's fault set
-\* -- there is no DeleteLease action -- and is addressed by a follow-up
-\* model extension; the claim encoding it needs is already here.
+\* mechanism's failure mode). LeaderElectionDeletion.cfg injects exactly
+\* that fault (MaxDeletes=1) and the invariant still holds; reverting (b)
+\* alone -- genHW advancing at a dispatch-time Persist instead of inside
+\* Steal -- falsifies it under deletion (see that cfg's header for the
+\* trace). The claim is the load-bearing half once the operator can reset
+\* the transition count.
 \*
 \* The invariant is ENABLED in the .cfg and holds over the full state
 \* space. The deliberately-weakened test (run once during development,
@@ -296,12 +353,34 @@ BoundedDualLeadership ==
 \* counterexample. That proves the encoding change is what makes the
 \* invariant pass, not an accident of the surrounding edits.
 \* -----------------------------------------------------------------------
+\* Two cases on whether one of the believers actually holds the lease:
+\*
+\*   - A holder exists among the believers (every dual reachable without
+\*     a deletion): the holder is the authorized leader and its
+\*     generation must be STRICTLY GREATEST -- the executor's fence
+\*     converges to the max heartbeat generation it has seen, so the
+\*     stale believer's assignments are rejected and the holder's are
+\*     accepted.
+\*
+\*   - No holder (reachable only by deleting the Lease out from under a
+\*     dual -- both believers are now deposed): neither is authorized,
+\*     so there is no "right" believer for the fence to prefer. The
+\*     property degrades to DISTINCTNESS: the fence can still order
+\*     them, the lower one is rejected, and the higher one keeps acting
+\*     until the next real acquisition seeds from genHW+1 and exceeds
+\*     both. Distinctness is not a weakening that can hide a collision:
+\*     gen[m] = gen[n] fails both branches. And the holderless branch
+\*     cannot hide a wrong ORDERING either -- the deletion does not
+\*     change any generation, so the holderless state's generations are
+\*     exactly the predecessor state's, which the holder-exists branch
+\*     already checked with the strict inequality.
 StaleLeaderHasStaleGeneration ==
   \A m, n \in Nodes :
     (state[m] = "Leading" /\ state[n] = "Leading" /\ m /= n) =>
-      LET stale == IF lease.holder = m THEN n ELSE m
-          fresh == IF lease.holder = m THEN m ELSE n
-      IN gen[stale] < gen[fresh]
+      IF lease.holder \in {m, n}
+      THEN LET stale == IF lease.holder = m THEN n ELSE m
+           IN gen[stale] < gen[lease.holder]
+      ELSE gen[m] /= gen[n]
 
 \* -----------------------------------------------------------------------
 \* Initial state. gen[n] = 1 mirrors the production `AtomicU64::new(1)`
@@ -320,6 +399,8 @@ Init ==
   /\ genHW  = 0
   /\ acquiredAt = [n \in Nodes |-> NULL]
   /\ casRace = FALSE
+  /\ deletes = 0
+  /\ delVictims = {}
 
 \* -----------------------------------------------------------------------
 \* Time. clocks[n] advances independently. Ticks regardless of process
@@ -343,7 +424,8 @@ Tick(n) ==
   /\ (alive[n] /\ state[n] = "Leading") =>
        (clocks[n] + 1) - fence[n] <= Ttl + Renew
   /\ clocks' = [clocks EXCEPT ![n] = @ + 1]
-  /\ UNCHANGED <<lease, alive, state, snap, obs, fence, gen, genHW, acquiredAt, casRace>>
+  /\ UNCHANGED <<lease, alive, state, snap, obs, fence, gen, genHW, acquiredAt,
+                 casRace, deletes, delVictims>>
 
 \* -----------------------------------------------------------------------
 \* Apiserver round-trip. Get(n) is the GET; Steal/RenewLease are the PUT
@@ -366,7 +448,8 @@ Get(n) ==
        ELSE IF lease.holder = n THEN obs[n]
        ELSE IF obs[n] /= NULL /\ obs[n].rv = lease.rv THEN obs[n]
        ELSE [rv |-> lease.rv, since |-> clocks[n]]]
-  /\ UNCHANGED <<clocks, lease, alive, state, gen, genHW, acquiredAt, casRace>>
+  /\ UNCHANGED <<clocks, lease, alive, state, gen, genHW, acquiredAt, casRace,
+                 deletes, delVictims>>
 
 \* The shared CAS guard for Steal/RenewLease. NOT a standalone action -- a
 \* helper that Steal and RenewLease conjoin. The casRace history is
@@ -433,7 +516,13 @@ Steal(n) ==
   /\ fence' = [fence EXCEPT ![n] = clocks[n]]
   /\ obs'   = [obs   EXCEPT ![n] = NULL]      \* on_acquire clears observed
   /\ snap'  = [snap  EXCEPT ![n] = NULL]      \* spent the snapshot
-  /\ UNCHANGED <<clocks, alive>>
+  \* A fresh acquisition starts a fresh leadership term: n is no longer
+  \* the victim of a previous deletion. Without this cleanup a stale
+  \* delVictims entry would mask a later steal-deposition's discovery
+  \* obligation (the fourth BoundedDualLeadership disjunct would fire
+  \* for a victim that was deposed by a thief, not by a deletion).
+  /\ delVictims' = delVictims \ {n}
+  /\ UNCHANGED <<clocks, alive, deletes>>
 
 \* The decide()->Renew path: we hold the lease, refresh renew_time. Bumps rv
 \* (the apiserver bumps on every write); does NOT touch holder/gen.
@@ -459,7 +548,8 @@ RenewLease(n) ==
   /\ lease' = [lease EXCEPT !.rv = snap[n].rv + 1]
   /\ fence' = [fence EXCEPT ![n] = clocks[n]]
   /\ snap'  = [snap  EXCEPT ![n] = NULL]
-  /\ UNCHANGED <<clocks, alive, state, obs, gen, genHW, acquiredAt>>
+  /\ UNCHANGED <<clocks, alive, state, obs, gen, genHW, acquiredAt, deletes,
+                 delVictims>>
 
 \* The 409 path: snap stale. Stamps fence (apiserver answered). If we were
 \* Leading this is an explicit lose -- someone stole between our GET and PUT.
@@ -471,7 +561,8 @@ Conflict(n) ==
   /\ fence' = [fence EXCEPT ![n] = clocks[n]]
   /\ state' = [state EXCEPT ![n] = "Following"]
   /\ snap'  = [snap  EXCEPT ![n] = NULL]
-  /\ UNCHANGED <<clocks, lease, alive, obs, gen, genHW, acquiredAt, casRace>>
+  /\ UNCHANGED <<clocks, lease, alive, obs, gen, genHW, acquiredAt, casRace,
+                 deletes, delVictims>>
 
 \* Persist(n) -- REMOVED. It modeled the lazy dispatch-time PG write of the
 \* new generation (genHW' = gen[n] once the leader started dispatching);
@@ -504,7 +595,8 @@ SelfFence(n) ==
   /\ state[n] = "Leading"
   /\ clocks[n] - fence[n] > Ttl
   /\ state' = [state EXCEPT ![n] = "Following"]
-  /\ UNCHANGED <<clocks, lease, alive, snap, obs, fence, gen, genHW, acquiredAt, casRace>>
+  /\ UNCHANGED <<clocks, lease, alive, snap, obs, fence, gen, genHW, acquiredAt,
+                 casRace, deletes, delVictims>>
 
 \* Pod crash. Loses ALL in-memory state: the belief (state), the snapshot,
 \* the observed-record clock, the self-fence clock, the in-memory
@@ -520,7 +612,7 @@ Crash(n) ==
   /\ fence'      = [fence      EXCEPT ![n] = 0]
   /\ gen'        = [gen        EXCEPT ![n] = 1]
   /\ acquiredAt' = [acquiredAt EXCEPT ![n] = NULL]
-  /\ UNCHANGED <<clocks, lease, genHW, casRace>>
+  /\ UNCHANGED <<clocks, lease, genHW, casRace, deletes, delVictims>>
 
 \* Pod restart. The recovered process has no observation (its first
 \* decide() returns StartObserving and waits a full Ttl before stealing)
@@ -529,17 +621,64 @@ Crash(n) ==
 Recover(n) ==
   /\ ~alive[n]
   /\ alive' = [alive EXCEPT ![n] = TRUE]
-  /\ UNCHANGED <<clocks, lease, state, snap, obs, fence, gen, genHW, acquiredAt, casRace>>
+  /\ UNCHANGED <<clocks, lease, state, snap, obs, fence, gen, genHW, acquiredAt,
+                 casRace, deletes, delVictims>>
 
-Next == \E n \in Nodes :
-  \/ Tick(n)
-  \/ Get(n)
-  \/ Steal(n)
-  \/ RenewLease(n)
-  \/ Conflict(n)
-  \/ SelfFence(n)
-  \/ Crash(n)
-  \/ Recover(n)
+\* Operator fault: `kubectl delete lease` destroys the Lease object and
+\* the next replica to GET a 404 recreates it (election.rs::create()).
+\* The two steps collapse into one action: the holder and the transition
+\* count reset, the resourceVersion does NOT -- a recreated apiserver
+\* object takes a fresh rv from the global etcd revision, so a snapshot
+\* of the old incarnation can never satisfy ReplaceGuard's CAS against
+\* the new one (the deposed-by-deletion holder's next PUT 409s, exactly
+\* as production behaves). Resetting rv here would let a stale snap
+\* spuriously pass the CAS and report an AtMostOneCASWinner violation
+\* that no real apiserver admits.
+\*
+\* Everything else is UNCHANGED: the replicas do not observe the
+\* deletion until their next GET; a Leading believer keeps believing
+\* until its next round-trip exposes the loss or it self-fences; PG
+\* (genHW) survives. That asymmetry -- the Lease's epoch source resets
+\* while PG's does not -- is the fault this action injects, and the
+\* write-ahead claim (genHW advancing inside Steal) is what survives it:
+\* the next Steal of the recreated lease seeds from genHW+1, which
+\* exceeds every generation ever acquired, even one whose holder never
+\* dispatched anything. Without the claim (genHW advancing only at a
+\* dispatch-time Persist), a post-deletion holder deposed before
+\* persisting leaves genHW stale and its successor collides -- the
+\* red-first counterexample documented in LeaderElectionDeletion.cfg.
+\*
+\* The current holder is recorded in delVictims: it was deposed by an
+\* environmental fault rather than by a thief that observed it as stale,
+\* so BoundedDualLeadership's steal-threshold coupling (disjunct 1) does
+\* not apply to it -- see the fourth disjunct there.
+\*
+\* Guards: bounded by MaxDeletes (one deletion per trace is enough to
+\* exhibit both the post-deletion dual and the post-deletion generation
+\* collision); only a held lease (deleting an unheld lease changes
+\* nothing any invariant constrains and only inflates the state space);
+\* rv headroom for the recreation's fresh resourceVersion.
+DeleteLease ==
+  /\ deletes < MaxDeletes
+  /\ lease.holder /= NULL
+  /\ lease.rv < MaxRv
+  /\ lease' = [holder |-> NULL, rv |-> lease.rv + 1, gen |-> 0]
+  /\ deletes' = deletes + 1
+  /\ delVictims' = delVictims \cup {lease.holder}
+  /\ UNCHANGED <<clocks, alive, state, snap, obs, fence, gen, genHW,
+                 acquiredAt, casRace>>
+
+Next ==
+  \/ \E n \in Nodes :
+       \/ Tick(n)
+       \/ Get(n)
+       \/ Steal(n)
+       \/ RenewLease(n)
+       \/ Conflict(n)
+       \/ SelfFence(n)
+       \/ Crash(n)
+       \/ Recover(n)
+  \/ DeleteLease
 
 Spec == Init /\ [][Next]_vars
 
