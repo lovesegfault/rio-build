@@ -308,15 +308,24 @@ impl LogBuffers {
     /// r[impl sched.log.batch-binding]
     ///
     /// Returns `true` if the batch was accepted into the ring buffer.
-    /// Returns `false` (drop: no-op + counted metric + debug log) when:
-    /// - no entry exists for `drv_path` (unsolicited drv — does NOT
-    ///   create an entry; this changes the legacy [`Self::push`]'s
-    ///   `or_default()` behavior, which is itself the threat: a
-    ///   fabricated `derivation_path` should not allocate a fresh
-    ///   buffer), or
-    /// - the entry's `assigned_executor` does not match `executor`
-    ///   (calling stream is not the one assigned this drv), or
-    /// - the entry is sealed (late batch after terminal).
+    /// Returns `false` when:
+    /// - the entry is sealed (terminal completion already fired) — silent
+    ///   drop, mirrors [`Self::push`]'s seal check. Not counted: the seal
+    ///   check is drv-keyed and runs *before* the binding gate, so the
+    ///   typical hit is a benign late batch from the assigned executor;
+    ///   a wrong-executor batch for a sealed key is also dropped
+    ///   uncounted (the buffer is gone or about to be — there is nothing
+    ///   to pollute, and counting would noise the binding-violation
+    ///   signal with normal completion timing), or
+    /// - the binding gate rejects it: no entry exists for `drv_path`
+    ///   (`reason="no_assignment"` — unsolicited drv; does NOT create an
+    ///   entry, unlike legacy [`Self::push`]'s `or_default()`, which is
+    ///   itself the threat: a fabricated `derivation_path` should not
+    ///   allocate a fresh buffer), the entry was never `set_exec`'d
+    ///   (`reason="unstamped"`), or the entry's `assigned_executor` does
+    ///   not match `executor` (`reason="executor_mismatch"`). Each
+    ///   binding-gate reject increments
+    ///   `rio_scheduler_log_batches_rejected_total` and emits a `debug!`.
     ///
     /// **The caller MUST gate any sibling consumer on the return value.**
     /// `r[sched.log.batch-binding]` requires the *ingestion path* to drop
@@ -429,7 +438,7 @@ impl LogBuffers {
     ///
     /// The seal check and the `remove_if` are two operations, not one.
     /// This is TOCTOU-safe because `seal()` is only called from actor
-    /// handlers (`trigger_log_flush` in `actor/event.rs`) — the same
+    /// handlers (`seal_log_buffer` in `actor/event.rs`) — the same
     /// single-threaded event loop that calls this method from
     /// `handle_executor_disconnected`. There is no concurrent `seal()` to
     /// race. The flusher's `unseal()` calls (`flush.rs`) are concurrent
