@@ -431,6 +431,13 @@ impl LeaderElection {
     ///
     /// On successful steal, clear `observed` — we're the holder
     /// now, the observed-record tracks OTHER holders.
+    ///
+    /// Modeled as `Replace(n)` in `docs/spec/models/LeaderElection.tla`.
+    /// The rv-guarded CAS here is what keeps `AtMostOneLeader` during the
+    /// initial-acquisition race — the model checks it over all
+    /// interleavings of N replicas, which neither the table tests nor
+    /// the Kani contract on `decide_pure()` reach (both are
+    /// single-replica).
     // r[impl sched.lease.at-most-one-leader]
     async fn replace(
         &mut self,
