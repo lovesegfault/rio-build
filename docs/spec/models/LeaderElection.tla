@@ -1,72 +1,83 @@
 ---------------------------- MODULE LeaderElection ----------------------------
 (***************************************************************************)
-(* Formal model of rio-lease's apiserver-CAS leader election protocol.     *)
+(* Phase-1 model of rio-lease's apiserver-CAS leader election protocol:    *)
+(* per-node monotonic clocks with bounded skew, the observed-record        *)
+(* staleness clock, local self-fencing, the PG generation high-water       *)
+(* mark, and pod crash/recovery.                                           *)
 (*                                                                         *)
-(* Formalizes:                                                             *)
-(*   - sched.lease.at-most-one-leader  (the safety invariant)              *)
+(* Formalizes (from docs/spec/components/scheduler.typ; update both when   *)
+(* the protocol changes -- `tracey bump` on a rule flags the r[verify]     *)
+(* marker in nix/tla.nix as stale):                                        *)
+(*   - sched.lease.at-most-one-leader  (the safety invariant, both halves) *)
 (*   - sched.lease.k8s-lease           (the protocol mechanism)            *)
+(*   - sched.recovery.fetch-max-seed   (the generation seeding on acquire) *)
 (*                                                                         *)
-(* From docs/spec/components/scheduler.typ. Update both when the protocol  *)
-(* changes -- `tracey bump` on the rule will flag the r[verify] marker in  *)
-(* nix/tla.nix as stale.                                                   *)
+(* PROOF CLAIM, stated honestly: the invariants below hold under clock     *)
+(* skew <= MaxSkew ticks, no host suspend, over a bounded state space of   *)
+(* 2 nodes and ~2 leadership cycles (4.27M distinct states). The bounds    *)
+(* exclude: 3-party races (any k-party CAS race contains a 2-party prefix, *)
+(* so AtMostOneCASWinner is unaffected; a 3-party dual-belief scenario     *)
+(* needs two simultaneously-stale ex-leaders and is only partially         *)
+(* covered), and a third leadership handoff. See the .cfg for the full     *)
+(* coverage-vs-cost argument and the non-vacuity evidence.                 *)
 (*                                                                         *)
-(* SCOPE NOTE -- this is the Phase-0 spike model. It does NOT model:       *)
-(*   - the observed-record clock (rv-change staleness detection)           *)
-(*   - self-fencing on missed renew                                        *)
-(*   - leader crash / restart / network partition                          *)
-(* Nodes can only Steal when they observe an empty lease (holder = NULL).  *)
-(* This is enough to capture the kube-leader-election 0.43 bug class       *)
-(* (no CAS precondition on replace() -> all racers believe they won). The  *)
-(* full model with explicit time and self-fence is Phase 1.                *)
+(* INVARIANTS, and which half of sched.lease.at-most-one-leader+2 each     *)
+(* verifies:                                                               *)
 (*                                                                         *)
-(* The model includes the CAS precondition (Replace(n) checks lease.rv =   *)
-(* snap[n].rv). Removing it reproduces the kube-leader-election 0.43 bug:  *)
-(* TLC finds a dual-leadership counterexample at depth 5 -- both nodes GET *)
-(* an empty lease, both Steal on stale snapshots, both succeed, both       *)
-(* Leading.                                                                *)
+(* AtMostOneCASWinner -- the hard half: the apiserver's optimistic         *)
+(* concurrency admits at most one writer per resourceVersion. Weakened     *)
+(* test: deleting the CAS precondition from ReplaceGuard reproduces the    *)
+(* kube-leader-election 0.43 bug at depth 6 (both racers GET rv=0, both    *)
+(* PUT, both Leading -- and both reach gen=2, so the generation fence      *)
+(* cannot tell them apart either).                                         *)
 (*                                                                         *)
-(* SPIKE LIMITATION: with steal-only-when-empty and no time model, once    *)
-(* any node wins the first race the lease holder never returns to NULL     *)
-(* and AtMostOneLeader holds partly vacuously (there's only one contention *)
-(* window -- the race for the initial empty lease). After that, the only   *)
-(* writer that can pass the CAS is the leader itself, so Observe(n) and    *)
-(* the 409 branch of Renew(n) are unreachable. Real contention coverage    *)
-(* (deposed leader, repeated steals) requires the Phase-1 model with the   *)
-(* observed-record clock and self-fence TTL.                               *)
+(* BoundedDualLeadership -- the soft half: two replicas CAN concurrently   *)
+(* believe they lead (a deposed leader that has not yet noticed), but      *)
+(* every reachable dual-belief state already has a discovery mechanism     *)
+(* armed -- the stale believer is within 2*MaxSkew of its own self-fence   *)
+(* deadline, or its snapshot is stale (next renew 409s), or its snapshot   *)
+(* already names the thief. Combined with LoopInterval (the loop runs      *)
+(* every Renew ticks), the window is bounded to one loop iteration plus    *)
+(* the skew penalty. Weakened test: relaxing Steal's staleness threshold   *)
+(* from > Ttl to >= 0 violates it at depth 5 -- the > Ttl threshold is     *)
+(* exactly what guarantees the victim is already at its own fence          *)
+(* deadline when deposed. Clock skew eats directly into that guarantee     *)
+(* (the 2*MaxSkew term); this is the formal version of the asymmetric-TTL  *)
+(* TODO above LEASE_TTL in rio-lease/src/lib.rs.                           *)
 (*                                                                         *)
-(* INVARIANT NAMING -- sched.lease.at-most-one-leader+2 names the model's  *)
-(* invariants AtMostOneCASWinner (the hard half: two Replace actions       *)
-(* cannot both succeed at the same rv) and BoundedDualLeadership (the soft *)
-(* half: if two replicas concurrently believe they lead, the older one is  *)
-(* past its self-fence deadline). The spike's AtMostOneLeader is a         *)
-(* degenerate combination of both -- the CAS half holds by construction    *)
-(* of Replace(n), and the dual-belief window is empty because the spike    *)
-(* has no time model so the self-fence and observed-clock paths that open  *)
-(* it are unreachable. Phase-1 splits AtMostOneLeader into the two named   *)
-(* invariants so the soft half is checked non-vacuously over the           *)
-(* deposed-leader and crash/recovery interleavings.                        *)
+(* StaleLeaderHasStaleGeneration -- the bridge to                          *)
+(* sched.lease.generation-fence: when the dual-belief window is open, the  *)
+(* executor must be able to tell the replicas apart by generation.         *)
+(* FALSIFIED at depth 12; committed disabled in the .cfg. See the KNOWN    *)
+(* COUNTEREXAMPLE block at the invariant definition for the trace, the     *)
+(* protocol-level diagnosis (the acquire-to-Persist window leaves PG's     *)
+(* high-water stale), and the candidate fixes.                             *)
 (*                                                                         *)
-(* The {Get, Steal, Renew, Observe, Discard} disjunction parallels the     *)
-(* case structure of decide() in rio-lease/src/election.rs:                *)
-(*   - Steal   <-> Decision::Steal   (snap.holder = NULL)                  *)
-(*   - Renew   <-> Decision::Renew   (snap.holder = us)                    *)
-(*   - Observe/Discard <-> Decision::Standby (snap.holder = other)         *)
-(* Observe is the `was_leading && result != Leading` step-down edge in the *)
-(* lease loop; Discard is the standby's no-op tick. A Kani harness on      *)
-(* decide() (Phase-1, not yet landed) will verify the per-decision         *)
-(* logic; this model verifies the protocol that calls it.                  *)
+(* ACTION <-> CODE CORRESPONDENCE (rio-lease/src/{lib,election}.rs):       *)
+(*   Tick        clock advance; CLOCK_MONOTONIC ticks regardless of state  *)
+(*   Get         try_acquire_or_renew()'s GET + decide()'s ObservedUpdate  *)
+(*   Steal       decide()->Steal + replace(steal) + on_acquire() +         *)
+(*               seed_generation_from() collapsed into one atomic step     *)
+(*               (sound: recovery_complete gates dispatch until the seed)  *)
+(*   RenewLease  decide()->Renew + replace(renew) (named to avoid the      *)
+(*               Renew constant)                                           *)
+(*   Conflict    the 409 path; collapses 409-on-renew (lose) and           *)
+(*               409-on-steal (never led) -- both reset the fence clock    *)
+(*               and end Following                                         *)
+(*   Persist     the first dispatch-time PG write of the new generation    *)
+(*   SelfFence   maybe_self_fence(); may fire any time past the deadline   *)
+(*               (a superset of the production every-RENEW_INTERVAL        *)
+(*               schedule -- sound for safety)                             *)
+(*   Crash/      pod restart: in-memory state lost, gen resets to the      *)
+(*   Recover     AtomicU64::new(1) init; OS clock, apiserver, PG persist   *)
 (*                                                                         *)
-(* CORRESPONDENCE CAVEAT: the table above is exact only over reachable     *)
-(* spike states. The TLA preconditions are coarser than decide()'s         *)
-(* case split: Discard's `snap.holder /= NULL` admits `holder = n`         *)
-(* (which decide() maps to Renew, not Standby), and Observe's              *)
-(* `snap.holder /= n` admits `holder = NULL` (which decide() maps to       *)
-(* Steal regardless of was_leading). Both edge cases are unreachable       *)
-(* in the spike (a Standby never snapshots itself as holder; a             *)
-(* Leading node never snapshots an empty lease), so the partition is       *)
-(* sound here. A Phase-1 model with reachable deposed-leader states        *)
-(* MUST refine Observe/Discard to match decide()'s exact three-way         *)
-(* split: holder.is_empty() / holder == us / holder == other.              *)
+(* PHASE-2 DEFERRALS: liveness (eventually-some-leader needs an unbounded  *)
+(* clock, which TLC cannot check -- the temporal form stutters one tick    *)
+(* short of the fence deadline forever); NoDualDispatch (the worker-side   *)
+(* model that takes StaleLeaderHasStaleGeneration as an ASSUME -- blocked  *)
+(* on fixing the generation collision first); asymmetric TTLs (if the      *)
+(* lib.rs TODO lands, StealTtl splits from FenceTtl and the 2*MaxSkew      *)
+(* penalty in BoundedDualLeadership shrinks).                              *)
 (***************************************************************************)
 
 EXTENDS Integers, FiniteSets, TLC
@@ -138,7 +149,7 @@ ClockSkewBound ==
 \* Steals (Leading, acquiredAt=0), n2 Steals at its stale rv=0 snapshot --
 \* the PUT succeeds without the precondition, both Leading, casRace flips.
 \* Both also reach gen=2: the generation fence cannot tell them apart
-\* either. Recorded in the header (Task 9).
+\* either. Recorded in the header.
 \* -----------------------------------------------------------------------
 AtMostOneCASWinner == ~casRace
 
@@ -358,15 +369,18 @@ Get(n) ==
        ELSE [rv |-> lease.rv, since |-> clocks[n]]]
   /\ UNCHANGED <<clocks, lease, alive, state, gen, genHW, acquiredAt, casRace>>
 
-\* The shared CAS guard for Steal/Renew. NOT a standalone action -- a helper
-\* that Steal and Renew conjoin. The casRace history is recorded HERE: it's
-\* the only place a CAS conflict can be observed. casRace flips when this
-\* node's PUT succeeds at an rv that another currently-Leading node also
-\* acquired at -- the apiserver let two writers through.
+\* The shared CAS guard for Steal/RenewLease. NOT a standalone action -- a
+\* helper that Steal and RenewLease conjoin. The casRace history is
+\* recorded HERE: it's the only place a CAS conflict can be observed.
+\* casRace flips when this node's PUT succeeds at an rv that another
+\* currently-Leading node also acquired at -- the apiserver let two
+\* writers through.
 ReplaceGuard(n) ==
   /\ snap[n] /= NULL
   /\ snap[n].rv < MaxRv
-  /\ lease.rv = snap[n].rv      \* THE CAS PRECONDITION (deliberately-weakened test 1, Task 4)
+  \* THE CAS PRECONDITION. The deliberately-weakened CAS test documented
+  \* in the header deletes the next line.
+  /\ lease.rv = snap[n].rv
   /\ casRace' = (casRace \/ \E m \in Nodes \ {n} :
        alive[m] /\ state[m] = "Leading" /\ acquiredAt[m] = snap[n].rv)
 
