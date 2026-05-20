@@ -34,5 +34,4 @@ ALTER TABLE assignments ADD COLUMN exec_id UUID;
 -- build_id ↔ exec_id correlation. Set on terminal paths where an execution
 -- ran (Completed, Poisoned, timeout-exhausted Cancelled); NULL for
 -- Cached/DependencyFailed/Skipped/never-dispatched/non-terminal.
--- Spec: sched.merge.exec-correlation+2.
 ALTER TABLE build_derivations ADD COLUMN exec_id UUID;
