@@ -80,7 +80,7 @@
     # crateBuildKani needs it to compile proc-macros and build scripts
     # with vanilla rustc while target crates use kani-compiler.
     # Upstream: https://github.com/nix-community/crate2nix/pull/481.
-    # Drop the `/is-host-flag` suffix once that lands.
+    # Revert to `github:nix-community/crate2nix` once #481 lands.
     crate2nix = {
       url = "github:lovesegfault/crate2nix/is-host-flag";
       flake = false;
@@ -1039,6 +1039,7 @@
                   crate2nixCli
                   docsLib
                   shiroaPkg
+                  kaniToolchain
                   ;
                 treefmtWrapper = config.treefmt.build.wrapper;
                 preCommitInstall = config.pre-commit.installationScript;
@@ -1099,7 +1100,10 @@
                     # harnesses (deferred to the rio-lease FV plan); a
                     # vacuous 0-harness check in checks.* would dilute
                     # the CI gate without verifying anything. Promote to
-                    # checks.* when harnesses land. See nix/kani.nix.
+                    # checks.* when harnesses land — into the `// {`
+                    # block alongside `cov-smoke` / `mutants-smoke`
+                    # (the existing manual-then-promoted precedent).
+                    # See nix/kani.nix.
                     kani-checks = import ./nix/kani.nix {
                       inherit pkgs kaniToolchain crateBuildKani;
                     };

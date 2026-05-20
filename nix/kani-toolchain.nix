@@ -11,6 +11,14 @@
 # ABI → all goto-C artifacts rebuild). Bump deliberately, never via
 # `nix flake update`.
 #
+# Bumping `kaniVersion` ALSO requires re-deriving two flag transcriptions
+# from the new kani source — they do NOT show up in a build failure, they
+# just silently produce the wrong goto-C model for CBMC to verify:
+#   - flake.nix `kaniBaseFlags`  ← kani-driver/src/call_single_file.rs
+#                                  (base_rustc_flags + LibConfig::new + kani_rustc_flags)
+#   - nix/kani.nix verify steps  ← kani-driver/src/{call_goto_instrument,call_cbmc}.rs
+#                                  (6-step pipeline + cbmc flag list)
+#
 # Pins (verified against the kani-0.67.0 tag):
 #   kani:    0.67.0
 #   nightly: 2025-11-21        (rust-toolchain.toml)
@@ -265,11 +273,27 @@ let
     # `exec -a "$entry" …`).
     postFixup = ''
       mv $out/bin/kani-driver $out/bin/.kani-driver-real
-      for entry in kani-driver kani cargo-kani; do
+      for entry in kani-driver kani; do
         makeWrapper $out/bin/.kani-driver-real $out/bin/$entry \
           --argv0 "$entry" \
           --prefix PATH : ${kaniRuntimePath}
       done
+      # cargo-kani additionally needs a clean cargo environment. The dev
+      # shell exports CARGO_BUILD_BUILD_DIR to a shared inter-worktree
+      # build cache (nix/devshell.nix shellHook —
+      # project_shared_build_dir_contamination policy), but kani-driver
+      # passes its own --target-dir to the cargo it spawns and then
+      # globs that dir for *.kani-metadata.json + goto binaries. With
+      # both set, cargo splits intermediates to the shared build dir and
+      # kani-driver can't find them — `cargo kani` fails with `No such
+      # file or directory` inside `nix develop`. Unset is scoped to this
+      # wrapper; everything else in the dev shell keeps the shared
+      # cache. The standalone `kani` and `kani-driver` entries don't go
+      # through cargo, so they don't need it.
+      makeWrapper $out/bin/.kani-driver-real $out/bin/cargo-kani \
+        --argv0 cargo-kani \
+        --prefix PATH : ${kaniRuntimePath} \
+        --unset CARGO_BUILD_BUILD_DIR
     '';
 
     passthru = {
@@ -294,10 +318,12 @@ in
   # result/toolchain (nightly).
   kani = kaniBuild;
 
-  # Distinct attr so downstream consumers (nix/kani.nix, devshell) can
-  # reference the wrapper-aware bins without knowing the wrapping happens
-  # in postFixup. Today it's the same derivation; if the wrapping ever
-  # needs to move out of kaniBuild this stays a stable alias.
+  # Stable alias for the wrapper-aware bins (cargo-kani/kani get a
+  # PATH+CBMC env wrapper in postFixup). Today this is the same
+  # derivation as `kani`; the alias exists so the wrapping can move out
+  # of kaniBuild without touching consumers. Currently unconsumed —
+  # nix/kani.nix and the devshell both reference `kaniToolchain.kani`
+  # directly. Forward export only.
   kani-driver-wrapped = kaniBuild;
 
   # The "rust toolchain" a future crateBuildKani tree passes to
@@ -316,13 +342,18 @@ in
     ln -s ${kaniNightly}/bin/cargo $out/bin/cargo
   '';
 
-  # The sysroot dir crateBuildKani's globalExtraRustcOpts pass via
-  # `--sysroot`. Contains libkani.rlib, the always-encode-mir std, and
-  # rustlib/<target>/lib/.
+  # The kani verify-sysroot dir: libkani.rlib, the always-encode-mir
+  # std, and rustlib/<target>/lib/. This is the path `kaniBaseFlags`
+  # passes as `-L` (the `--sysroot` arg there is the install root,
+  # `${kaniToolchain.kani}`, not this dir). Currently unconsumed —
+  # flake.nix interpolates `${kaniToolchain.kani}/lib` inline. Forward
+  # export only.
   kani-sysroot = "${kaniBuild}/lib";
 
-  # The pinned nightly — re-exported so flake.nix can reference it for
-  # crateBuildKani's mkCrateBuild call. NOT rio-build's rustStable or
-  # rustNightly (different pin).
+  # The pinned nightly toolchain kani-compiler links against. NOT
+  # rio-build's rustStable or rustNightly (different pin). Currently
+  # unconsumed — crateBuildKani passes `kani-rustc` (the kani-compiler
+  # symlink shim) as its `rust`, not the bare nightly. Forward export
+  # only.
   inherit kaniNightly;
 }

@@ -62,9 +62,11 @@
 let
   # cbmc/kissat are version-asserted in nix/kani-toolchain.nix (kani
   # 0.67.0 pins cbmc 6.8.0, kissat >= 4.0.1). Reference them via the
-  # `kani` derivation's passthru so the assertion fires whenever this
-  # file is evaluated — a `nix flake update` that drifts cbmc fails here
-  # with a named pin instead of weeks later with a goto-cc segfault.
+  # `kani` derivation's passthru so the assertion fires when any
+  # `mkKaniCheck` derivation is forced (e.g. `nix build
+  # .#kani-toolchain.kani-checks.kani-rio-lease`) — a `nix flake update`
+  # that drifts cbmc fails there with a named pin instead of weeks later
+  # with a goto-cc segfault.
   inherit (kaniToolchain.kani) cbmc kissat;
   inherit (pkgs) jq;
 
@@ -328,7 +330,10 @@ in
   # state machine — small, self-contained, and an actual correctness
   # nightmare to hand-test). Currently 0 harnesses (vacuous pass);
   # the rio-lease FV plan adds #[kani::proof] contracts and promotes
-  # this to checks.*.
+  # this to checks.*. Promotion target: the `// {` block at the tail of
+  # flake.nix's `checks =` definition where `cov-smoke` and
+  # `mutants-smoke` live — those are the precedent for manual-target →
+  # gated-check promotion.
   kani-rio-lease = mkKaniCheck {
     name = "rio-lease";
     crate = crateBuildKani.members.rio-lease;

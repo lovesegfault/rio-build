@@ -19,6 +19,8 @@
   treefmtWrapper,
   # config.pre-commit.installationScript — installs git hooks on shell entry
   preCommitInstall,
+  # nix/kani-toolchain.nix — cargo-kani for local proof iteration
+  kaniToolchain,
 }:
 let
   # nixpkgs still ships sqlx-cli 0.8.6 while the workspace is on sqlx
@@ -122,6 +124,14 @@ let
 
     # Spec-coverage: `tracey query validate`, `tracey web`
     traceyPkg
+
+    # Formal verification: `cargo kani -p rio-lease` for local proof
+    # iteration. Wrapper unsets CARGO_BUILD_BUILD_DIR (see
+    # nix/kani-toolchain.nix postFixup) so kani-driver can find its
+    # goto-C artifacts despite the shared build cache below. NOTE:
+    # ~3.5GB closure (pinned rust nightly + rustc-dev + cbmc). If
+    # devshell entry becomes slow, gate behind an opt-in `.#kani` shell.
+    kaniToolchain.kani
 
     # crate2nix CLI for regenerating Cargo.json after
     # Cargo.lock changes. PoC — see
