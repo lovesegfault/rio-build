@@ -104,10 +104,12 @@ in
   # stays green between the wiring commit and the model commit.
   checks = lib.optionalAttrs (builtins.pathExists (modelsDir + "/LeaderElection.tla")) {
     # rio-lease's leader-election protocol over a Kubernetes Lease
-    # object: at-most-one-leader despite concurrent acquire attempts and
-    # crash-recovery within renewDeadline. The model abstracts the k8s
-    # apiserver as a CAS register; the implementation's optimistic-
-    # concurrency retry loop is the refinement target.
+    # object. The Phase-0 spike model verifies AtMostOneLeader holds
+    # for the initial-race contention window; deposed-leader behavior,
+    # crash-recovery, and the observed-record clock are Phase-1 scope.
+    # The model abstracts the k8s apiserver as a CAS register; the
+    # implementation's optimistic-concurrency retry loop is the
+    # refinement target.
     # r[verify sched.lease.at-most-one-leader]
     # r[verify sched.lease.k8s-lease]
     tla-leader-election = mkTlcCheck {
