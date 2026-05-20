@@ -2058,17 +2058,18 @@ impl DagActor {
             state.exec_id = Some(exec_id);
         }
 
-        // Single atomic load. The lease task may fetch_add the
-        // generation between the DB insert and the WorkAssignment send
-        // below (there's an await in between). Without this snapshot,
-        // the two reads could see DIFFERENT generations — the PG row
-        // says "assigned under gen N" but the worker receives "gen
-        // N+1." The worker then rejects its own assignment as stale.
-        // Loading once and reusing closes the tear.
+        // Single atomic load. The lease task may raise the generation
+        // (its fetch_max on an acquire at a new epoch) between the DB
+        // insert and the WorkAssignment send below (there's an await
+        // in between). Without this snapshot, the two reads could see
+        // DIFFERENT generations — the PG row says "assigned under gen
+        // N" but the worker receives "gen N+1." The worker then
+        // rejects its own assignment as stale. Loading once and
+        // reusing closes the tear.
         //
-        // Acquire pairs with the lease task's Release fetch_add. Sees
-        // the generation AND any writes the lease task did before it
-        // (is_leader=true, which dispatch_ready checked at loop top).
+        // Acquire pairs with the lease task's RMW (SeqCst ⊇ Release).
+        // Sees the generation AND any writes the lease task did before
+        // it (is_leader=true, which dispatch_ready checked at loop top).
         let generation = self.leader.generation();
 
         self.record_assignment(drv_hash, executor_id, generation, exec_id)

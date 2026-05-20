@@ -946,18 +946,19 @@ impl BackpressureReader {
 
 /// Read-only view of the leader generation counter.
 ///
-/// Same pattern as [`BackpressureReader`]: the lease task is the
-/// sole writer (via `fetch_add` on the inner Arc it holds directly);
-/// everyone else observes. `HeartbeatResponse.generation` and
-/// `WorkAssignment.generation` both read from here — workers compare
-/// to detect stale assignments after leader failover.
+/// Same pattern as [`BackpressureReader`]: the writers (the lease
+/// task's `on_acquire` deriving from the Lease's transition count, and
+/// recovery's PG-floor seed — both `fetch_max` on the inner Arc) only
+/// ever raise it; everyone else observes. `HeartbeatResponse.generation`
+/// and `WorkAssignment.generation` both read from here — workers
+/// compare to detect stale assignments after leader failover.
 ///
 /// `Acquire` not `Relaxed`: the generation is a fence. When the lease
-/// task acquires leadership and increments, it also sets
-/// `is_leader=true`. A reader seeing the new generation should
+/// task acquires leadership and writes the new generation, it also
+/// sets `is_leader=true`. A reader seeing the new generation should
 /// also see the new leader state. Relaxed would be fine in practice
 /// (the atomic itself has no reordering peers here) but Acquire makes
-/// the pairing with the lease task's Release store explicit.
+/// the pairing with the lease task's RMW explicit.
 ///
 /// Starts at 1 (not 0): generation=0 is the proto-default, so a worker
 /// receiving `generation=0` knows the field was unset (old scheduler)

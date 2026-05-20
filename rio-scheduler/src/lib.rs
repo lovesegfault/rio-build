@@ -529,6 +529,15 @@ pub fn describe_metrics() {
         "Scheduler state recoveries from PG after LeaderAcquired \
          (labeled by outcome=success|failure|discarded_flap)"
     );
+    describe_counter!(
+        "rio_scheduler_generation_claim_failed_total",
+        "Generation-claim INSERTs that failed during recovery (PG error between the \
+         seed read and the claim write). The leader proceeds unclaimed: dispatch is \
+         not blocked, but that term's generation is absent from the \
+         leader_generation_claims ledger, re-opening the deposed-before-persist \
+         collision window for that one term. Sustained nonzero means PG is flapping \
+         exactly at failover time."
+    );
     describe_histogram!(
         "rio_scheduler_recovery_duration_seconds",
         "Time to reconstruct actor state from PG on LeaderAcquired \

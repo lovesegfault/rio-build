@@ -313,6 +313,11 @@ async fn main() -> anyhow::Result<()> {
             cfg.nodeclaim_pool.lease_name.clone(),
             cfg.nodeclaim_pool.lease_namespace.clone(),
         );
+        // 1 is the generation FLOOR (the value the lease loop's
+        // fetch_max can only raise), not a base for an increment. The
+        // controller's generation has no readers — its lease is pure
+        // mutual exclusion, there is no fencing token to derive from
+        // it — so the floor is also the steady state in non-K8s mode.
         let generation = Arc::new(std::sync::atomic::AtomicU64::new(1));
         let leader = match &lease_cfg {
             Some(lc) => {

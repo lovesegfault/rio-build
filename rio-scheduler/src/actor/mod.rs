@@ -460,6 +460,11 @@ pub struct DagActor {
     /// cleared DAG is all the state that exists; `pending` (K8s mode)
     /// starts false until the first successful recovery.
     dag_authoritative: bool,
+    /// Lease holder identity (the pod name), recorded on
+    /// `leader_generation_claims` rows and compared against them on
+    /// re-acquire — see [`DagActorPlumbing::holder_id`]. Empty in
+    /// non-K8s/test mode.
+    holder_id: String,
     /// Weak clone of the actor's own command sender, for scheduling delayed
     /// internal commands (e.g., terminal build cleanup). Weak so the actor
     /// doesn't prevent channel close when all external handles are dropped.
@@ -747,6 +752,7 @@ impl DagActor {
             backpressure_active: Arc::new(AtomicBool::new(false)),
             leader: plumbing.leader,
             dag_authoritative,
+            holder_id: plumbing.holder_id,
             self_tx: None,
             soft_features: cfg.soft_features,
             hmac_signer: plumbing.hmac_signer,
@@ -833,6 +839,9 @@ impl DagActor {
             tick_count: _,
             backpressure_active: _,
             leader: _,
+            // Retained: static replica identity (the generation-claim
+            // ledger's holder column), not per-term state.
+            holder_id: _,
             self_tx: _,
             soft_features,
             hmac_signer: _,

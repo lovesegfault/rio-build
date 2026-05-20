@@ -1156,6 +1156,49 @@ pub const M_063: () = ();
 /// Read/written by **rio-scheduler** only.
 pub const M_064: () = ();
 
+/// `migrations/065_leader_generation_claims.sql`
+///
+/// Append-only ledger of every leadership generation handed to dispatch.
+/// A new leader INSERTs its generation during recovery, BEFORE
+/// `recovery_complete` ungates dispatch (the Chubby-sequencer
+/// discipline: the epoch must be durable somewhere the next leader will
+/// read before the current leader starts using it). The recovery seed
+/// reads `GREATEST(MAX(assignments.generation), MAX(claims))`.
+///
+/// Why a second table when `assignments.generation` already exists:
+/// (1) the assignments high-water only advances when an assignment
+/// *persists* — a leader deposed before its first dispatch leaves no
+/// trace, and after a `kubectl delete lease` resets `leaseTransitions`
+/// its successor would seed from the same stale value and reuse a
+/// generation a live believer may still hold; (2) the assignments
+/// high-water *decays* — M_034's `ON DELETE CASCADE` plus the periodic
+/// orphan-terminal-derivation sweep delete old assignment rows, so
+/// `MAX(generation)` regresses toward NULL on a quiescent cluster.
+///
+/// The PRIMARY KEY on `generation` doubles as the CAS: two holders
+/// claiming the same generation concurrently → one INSERT returns zero
+/// rows via `ON CONFLICT DO NOTHING` → that holder bumps past
+/// `MAX(claims)` and retries. `holder_id` is the replica's pod
+/// identity and is LOAD-BEARING: a holder re-acquiring its own epoch
+/// (self-fence false alarm → successful renew) finds its own row at
+/// the lease-derived generation and retains it instead of bumping —
+/// without the holder comparison every connectivity blip would burn a
+/// generation and fence the leader's own in-flight assignments. The
+/// safety argument is that no two LIVE processes ever share a
+/// `holder_id` — a container restart within the same pod reuses
+/// `HOSTNAME`, but the predecessor is dead before the successor
+/// starts, so there is never a second live believer to collide with.
+/// `claimed_at` is forensic.
+///
+/// Never garbage-collected: one row per leadership *epoch* (a holder
+/// change, or a post-deletion re-floor — a few per day at worst; a
+/// same-holder re-acquire of the same epoch reuses its existing row),
+/// and deleting rows would re-open the decay problem the table exists
+/// to close.
+///
+/// Read/written by **rio-scheduler** only.
+pub const M_065: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

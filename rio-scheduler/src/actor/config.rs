@@ -95,6 +95,15 @@ pub struct DagActorPlumbing {
     /// `recovery_complete`. Non-K8s/test default is
     /// [`LeaderState::always_leader`].
     pub leader: LeaderState,
+    /// This replica's lease holder identity (the pod name), recorded on
+    /// `leader_generation_claims` rows. LOAD-BEARING for the
+    /// same-epoch re-claim: recovery compares the claim row at the
+    /// lease-derived generation against this value to distinguish "our
+    /// own previous claim, retain it" from "another holder collided
+    /// onto our generation, exceed it". Empty in non-K8s/test mode
+    /// (where the claim path either never runs or has no concurrent
+    /// claimant to be distinguished from).
+    pub holder_id: String,
     /// ADR-023 phase-13 hw-band cost table. Shared with
     /// `spot_price_poller`; the actor reads a snapshot per
     /// `solve_intent_for`. Default → seed prices.
@@ -139,6 +148,7 @@ impl Default for DagActorPlumbing {
             hmac_signer: None,
             service_signer: None,
             leader: LeaderState::default(),
+            holder_id: String::new(),
             cost_table: Arc::default(),
             cost_was_leader: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             cost_reload_notify: Arc::default(),

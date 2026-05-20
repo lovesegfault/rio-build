@@ -1077,12 +1077,17 @@ async fn test_recovery_skips_bad_drv_path_rows() -> TestResult {
 }
 
 // r[verify sched.recovery.fetch-max-seed]
-/// Recovery must seed generation from `MAX(generation) FROM assignments`
-/// via fetch_max. Defensive monotonicity: if the k8s Lease annotation
-/// reset (deleted Lease, stale etcd restore), a worker holding a stale
+/// Recovery must seed generation from PG's floor (assignments ∪ claims)
+/// via fetch_max, and must durably CLAIM the generation it lands on
+/// before ungating dispatch. Defensive monotonicity: if the k8s Lease
+/// object is deleted (its `leaseTransitions` counter — the primary
+/// generation source — resets to 0), a worker holding a stale
 /// assignment with generation=100 would ALSO accept new ones from
-/// whatever the lease loop set (e.g., 1). Seeding from PG's high-water
-/// mark prevents that: after recovery, generation >= PG max + 1.
+/// whatever the fresh lease derived (e.g., 1). Seeding from PG's
+/// high-water mark bounds that: after recovery, generation >= PG max
+/// + 1, and the claims ledger now records that generation so the NEXT
+/// leader's floor covers it even if this one never persists an
+/// assignment.
 #[tokio::test]
 async fn test_recovery_seeds_generation_from_assignments() -> TestResult {
     let f = RecoveryFixture::run(async |handle, pool| {
@@ -1118,6 +1123,151 @@ async fn test_recovery_seeds_generation_from_assignments() -> TestResult {
         "generation should be seeded from PG high-water mark: expected >= 101, got {g}"
     );
 
+    // The seeded generation must be durably claimed BEFORE dispatch was
+    // ungated — that row is what a successor's floor query reads if
+    // this leader is deposed before persisting a single assignment.
+    let claimed: Vec<(i64,)> =
+        sqlx::query_as("SELECT generation FROM leader_generation_claims ORDER BY generation")
+            .fetch_all(&f.db.pool)
+            .await?;
+    assert!(
+        claimed.iter().any(|(c,)| *c == g as i64),
+        "the generation recovery landed on ({g}) must be in the claims ledger, got {claimed:?}"
+    );
+
+    Ok(())
+}
+
+/// The depose-before-persist scenario the claims ledger exists for: the
+/// previous leader claimed generation 200 but was deposed before a
+/// single assignment row landed (or its assignment rows have since been
+/// cascade-deleted by the orphan-terminal-derivation sweep — migration
+/// 034's `ON DELETE CASCADE` makes `MAX(generation) FROM assignments`
+/// regress on a quiescent cluster). The next leader's floor must still
+/// see 200 and seed past it. Without the claims arm of
+/// `max_known_generation`, the floor here is NULL and the new leader
+/// would re-use a generation a live believer may still hold.
+#[tokio::test]
+async fn test_recovery_seeds_generation_from_unpersisted_claim() -> TestResult {
+    let f = RecoveryFixture::run(async |_handle, pool| {
+        // The ONLY trace of the previous leadership term is its claim
+        // row — no builds, no derivations, no assignments.
+        sqlx::query(
+            "INSERT INTO leader_generation_claims (generation, holder_id) \
+             VALUES (200, 'deposed-before-persist')",
+        )
+        .execute(&pool)
+        .await?;
+        Ok(())
+    })
+    .await?;
+
+    // Floor = GREATEST(NULL, 200) = 200 → seed to 201.
+    let g = f.handle.leader_generation();
+    assert!(
+        g >= 201,
+        "generation must seed past a claimed-but-never-persisted term: expected >= 201, got {g}"
+    );
+
+    Ok(())
+}
+
+/// Same-epoch re-acquire is idempotent: a self-fence false alarm
+/// followed by a successful renew re-fires the acquire edge and re-runs
+/// recovery, and the PG floor now contains OUR OWN claim row from the
+/// previous run. The claim path must recognize it (same generation,
+/// same holder) and retain the generation rather than bumping past its
+/// own ledger entry — bumping would burn a generation per connectivity
+/// blip and fence the leader's own in-flight assignments, contradicting
+/// the lease-side same-epoch semantics. The ledger must not grow a new
+/// row either.
+#[tokio::test]
+async fn test_recovery_same_holder_reclaim_retains_generation() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    // Our own claim from the previous recovery run of this same epoch.
+    sqlx::query(
+        "INSERT INTO leader_generation_claims (generation, holder_id) VALUES (5, 'pod-us')",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    // gen_at_entry = 5: the lease-derived generation for the epoch we
+    // are re-acquiring (leaseTransitions never bumped — no holder
+    // change happened during the blip).
+    let generation = Arc::new(AtomicU64::new(5));
+    let g = Arc::clone(&generation);
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = crate::lease::LeaderState::from_parts(
+            g,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        p.holder_id = "pod-us".into();
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        generation.load(Ordering::Acquire),
+        5,
+        "a same-holder re-acquire of the same epoch must retain the generation"
+    );
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT generation, holder_id FROM leader_generation_claims ORDER BY generation",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(
+        rows,
+        vec![(5, "pod-us".to_string())],
+        "the ledger must not grow a new row on a same-epoch re-acquire"
+    );
+    Ok(())
+}
+
+/// The contrast case to the same-holder re-claim: the claim row at our
+/// lease-derived generation belongs to a DIFFERENT holder. That is the
+/// post-lease-deletion collision the PK-CAS exists for — two replicas
+/// raced through fresh acquisitions onto the same floor — and it MUST
+/// bump, not retain. Distinct holders must never share a generation.
+#[tokio::test]
+async fn test_recovery_other_holder_at_our_generation_bumps() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    // Another replica claimed generation 5 first.
+    sqlx::query(
+        "INSERT INTO leader_generation_claims (generation, holder_id) VALUES (5, 'pod-other')",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    let generation = Arc::new(AtomicU64::new(5));
+    let g = Arc::clone(&generation);
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = crate::lease::LeaderState::from_parts(
+            g,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        p.holder_id = "pod-us".into();
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        generation.load(Ordering::Acquire),
+        6,
+        "another holder at our generation is a collision; we must exceed it"
+    );
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT generation, holder_id FROM leader_generation_claims ORDER BY generation",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(
+        rows,
+        vec![(5, "pod-other".to_string()), (6, "pod-us".to_string())],
+        "the colliding claimer lands on the next generation with its own row"
+    );
     Ok(())
 }
 

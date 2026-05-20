@@ -361,23 +361,106 @@ impl SchedulerDb {
         .await
     }
 
-    /// Max assignment generation ever written. recover_from_pg()
-    /// seeds its generation counter from this + 1 — defensive
-    /// monotonicity guard in case the Lease's generation (in its
-    /// annotation) was lost/reset (e.g., someone `kubectl delete
-    /// lease`). Workers with a stale generation reject assignments;
-    /// if we accidentally reused a gen, workers that received old
-    /// assignments would ALSO accept new ones from that gen —
-    /// dual-processing. Seeding from PG's high-water mark prevents
-    /// that regardless of Lease state.
+    /// PG's generation high-water mark: the max over every generation
+    /// ever *persisted on an assignment* and every generation ever
+    /// *claimed by a leader*. recover_from_pg() seeds its generation
+    /// counter from this + 1 — the durable floor that survives the
+    /// Lease object (the primary generation source, via
+    /// `leaseTransitions`) being deleted and recreated at zero.
     ///
-    /// BIGINT → i64 → u64 cast at the caller. `None` = no
-    /// assignments ever (fresh cluster).
-    pub async fn max_assignment_generation(&self) -> Result<Option<i64>, sqlx::Error> {
-        let row: (Option<i64>,) = sqlx::query_as("SELECT MAX(generation) FROM assignments")
-            .fetch_one(&self.pool)
-            .await?;
+    /// Two arms because neither alone is a reliable floor:
+    /// - `assignments.generation` covers pre-claim history and
+    ///   in-flight work, but it only advances when an assignment
+    ///   persists (a leader deposed before its first dispatch leaves
+    ///   no trace) and it *decays* — migration 034's `ON DELETE
+    ///   CASCADE` plus the orphan-terminal-derivation sweep delete old
+    ///   rows, so `MAX(generation)` regresses toward NULL on a
+    ///   quiescent cluster.
+    /// - `leader_generation_claims` is the append-only ledger of every
+    ///   generation handed to dispatch, written at acquire time before
+    ///   `recovery_complete` (see [`Self::claim_generation`]). It never
+    ///   decays and covers generations that never reached an
+    ///   assignment row.
+    ///
+    /// Workers with a stale generation reject assignments; if a
+    /// generation were reused, workers that received old assignments
+    /// would ALSO accept new ones from that generation —
+    /// dual-processing. Seeding from this floor bounds that damage
+    /// regardless of Lease state (it cannot *prevent* it under a PG
+    /// point-in-time restore, which regresses both arms together).
+    ///
+    /// `GREATEST` of two NULLs is NULL: BIGINT → i64 → u64 cast at the
+    /// caller, `None` = fresh cluster (no assignments, no claims).
+    pub async fn max_known_generation(&self) -> Result<Option<i64>, sqlx::Error> {
+        let row: (Option<i64>,) = sqlx::query_as(
+            r#"
+            SELECT GREATEST(
+                (SELECT MAX(generation) FROM assignments),
+                (SELECT MAX(generation) FROM leader_generation_claims))
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
         Ok(row.0)
+    }
+
+    /// Durably record that this leader is about to dispatch at
+    /// `generation`. Returns `Ok(true)` if the claim row was inserted,
+    /// `Ok(false)` if another holder already claimed this exact
+    /// generation (the PRIMARY KEY conflict is the CAS — the caller
+    /// bumps past [`Self::max_claimed_generation`] and retries).
+    ///
+    /// Called from `handle_leader_acquired` BEFORE
+    /// `set_recovery_complete()` ungates dispatch, so a successor's
+    /// [`Self::max_known_generation`] sees this generation even if this
+    /// leader is deposed before persisting a single assignment. The
+    /// Chubby-sequencer discipline: the epoch is durable before it is
+    /// used.
+    ///
+    /// `holder_id` is the replica's pod identity and is LOAD-BEARING:
+    /// the caller's pre-INSERT check and conflict read-back compare it
+    /// to distinguish "this row is our own previous claim for the same
+    /// epoch" (retain the generation, the claim is already durable)
+    /// from "another holder claimed our generation" (the
+    /// post-lease-deletion collision; exceed it). Pod names are never
+    /// reused and two live replicas never share one.
+    pub async fn claim_generation(
+        &self,
+        generation: i64,
+        holder_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query(
+            "INSERT INTO leader_generation_claims (generation, holder_id) \
+             VALUES ($1, $2) ON CONFLICT (generation) DO NOTHING",
+        )
+        .bind(generation)
+        .bind(holder_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    /// The highest claim row in the ledger: `(generation, holder_id)`,
+    /// or `None` if no leader has ever claimed. Two callers, both in
+    /// `handle_leader_acquired`'s claim path:
+    ///
+    /// - the pre-INSERT check — when the PG floor lands exactly on the
+    ///   lease-derived generation, the holder of the row at that
+    ///   generation decides between "our own previous claim for this
+    ///   same epoch; retain it, the claim is already durable" and
+    ///   "another holder collided onto our generation
+    ///   (post-lease-deletion race); exceed it";
+    /// - the conflict-retry path — a `false` return from
+    ///   [`Self::claim_generation`] means someone owns that exact
+    ///   generation; if it is us the claim is idempotent, otherwise the
+    ///   claimer re-targets past this row's generation.
+    pub async fn max_claimed_generation(&self) -> Result<Option<(i64, String)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT generation, holder_id FROM leader_generation_claims \
+             ORDER BY generation DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
     }
 
     /// Max sequence number per build_id from build_event_log.

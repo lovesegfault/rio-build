@@ -122,9 +122,10 @@ async fn main() -> anyhow::Result<()> {
     // Some → K8s mode: is_leader=false until the lease loop
     // acquires. Standby replicas merge DAGs (state warm) but
     // don't dispatch (dispatch_ready early-returns). On acquire,
-    // the lease loop increments generation and flips is_leader;
-    // workers see the new gen in their next heartbeat and reject
-    // stale-gen assignments from the old leader.
+    // the lease loop derives the generation from the Lease's
+    // transition count and flips is_leader; workers see the new
+    // gen in their next heartbeat and reject stale-gen assignments
+    // from the old leader.
     //
     // The generation Arc is constructed HERE (not inside the
     // actor) so both the actor and the lease task share the same
@@ -135,6 +136,10 @@ async fn main() -> anyhow::Result<()> {
         cfg.lease_name.clone(),
         cfg.lease_namespace.clone(),
     );
+    // 1 is the generation FLOOR, not a base for an increment: every
+    // writer (the lease loop's on_acquire, recovery's PG seed) is a
+    // fetch_max that can only raise it. 0 is reserved as the proto
+    // "field unset" sentinel.
     let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
     let leader = match &lease_cfg {
         Some(cfg) => {
@@ -365,6 +370,15 @@ async fn main() -> anyhow::Result<()> {
             hmac_signer,
             service_signer: service_signer.map(Arc::new),
             leader: leader.clone(),
+            // The pod identity recorded on (and compared against)
+            // leader_generation_claims rows — the same-epoch re-claim
+            // discriminator. Empty in non-K8s mode, and unused there
+            // too: with no lease loop, LeaderAcquired never fires, so
+            // recovery (and with it the generation claim) never runs.
+            holder_id: lease_cfg
+                .as_ref()
+                .map(|c| c.holder_id.clone())
+                .unwrap_or_default(),
             cost_table: std::sync::Arc::clone(&cost_table),
             cost_was_leader,
             cost_reload_notify,

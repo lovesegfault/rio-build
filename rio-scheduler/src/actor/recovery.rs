@@ -13,7 +13,8 @@
 //! WAITED for recovery, the lease could expire (15s TTL) → another
 //! replica acquires → dual-leader. Instead:
 //!
-//! 1. Lease loop on acquire: `fetch_add(1)` + `is_leader.store(true)`
+//! 1. Lease loop on acquire: derive the generation from the Lease's
+//!    transition count (`fetch_max`) + `is_leader.store(true)`
 //!    IMMEDIATELY, then fire-and-forget `ActorCommand::LeaderAcquired`
 //!    (no reply). Lease loop continues renewing normally.
 //! 2. Actor handles `LeaderAcquired`: calls `recover_from_pg().await`
@@ -32,14 +33,23 @@
 //! block dispatch FOREVER while holding the lease — standby can
 //! never take over. Degrading is better.
 //!
-//! # Generation seeding
+//! # Generation seeding and the write-ahead claim
 //!
-//! Seed from `MAX(generation) FROM assignments` + 1 via `fetch_max`
-//! (not `store`) — the lease loop already did `fetch_add(1)` on the
-//! SAME `Arc<AtomicU64>`. `store` would clobber that. `fetch_max`
-//! takes the larger of (lease's post-increment value, PG high-water
-//! mark + 1). Defensive against Lease reset (`kubectl delete lease`
-//! resets the annotation; PG's high-water mark persists).
+//! The PRIMARY generation source is the Lease's transition count (the
+//! lease loop's `fetch_max` in `on_acquire` — the apiserver bumps
+//! `leaseTransitions` atomically with the holder change). The PG floor
+//! read here, `GREATEST(MAX(assignments.generation), MAX(claims))` + 1
+//! via `fetch_max` (not `store` — both writers only ever raise the
+//! SAME `Arc<AtomicU64>`), is the durable backstop that survives the
+//! Lease object being deleted and recreated at `leaseTransitions = 0`.
+//!
+//! Before `recovery_complete` ungates dispatch, the target generation
+//! is durably CLAIMED in `leader_generation_claims` — without that, a
+//! leader deposed before persisting a single assignment leaves no
+//! trace in PG, and its post-deletion successor seeds from the same
+//! stale floor and reuses its generation. The claim bounds the
+//! post-deletion damage; it cannot prevent it under a PG
+//! point-in-time restore (which regresses both floor arms together).
 
 use super::*;
 use crate::db::RecoveryBuildRow;
@@ -82,7 +92,7 @@ impl DagActor {
     /// writes to `self.leader`'s generation is load-bearing for the
     /// gen-snapshot check in `handle_leader_acquired` (any change
     /// to `generation` during recovery then unambiguously means
-    /// the lease loop fetch_add'd, i.e. a flap).
+    /// the lease loop raised it, i.e. a flap onto a new epoch).
     ///
     /// Returns Err on PG failure; caller sets `recovery_complete=
     /// true` anyway (see module doc — degrade not block).
@@ -162,7 +172,10 @@ impl DagActor {
         // NOT applied here: the caller (handle_leader_acquired) does
         // fetch_max AFTER the TOCTOU gen-snapshot check. Writing to
         // self.leader's generation here would false-positive that check.
-        let pg_max_gen = self.db.max_assignment_generation().await?;
+        // The floor spans assignments ∪ leader_generation_claims — see
+        // max_known_generation's doc for why neither arm alone is
+        // reliable.
+        let pg_max_gen = self.db.max_known_generation().await?;
 
         self.seed_ready_queue(&failed_dep_parents).await;
 
@@ -1054,8 +1067,9 @@ impl DagActor {
         self.cost_reload_notify.notify_one();
 
         // Snapshot generation BEFORE recovery. If the lease flaps
-        // (lose→reacquire) while recover_from_pg() is running, the
-        // lease loop will fetch_add again AND will have cleared
+        // (lose→reacquire WITH a holder change in between) while
+        // recover_from_pg() is running, the lease loop will fetch_max
+        // a higher lease-derived generation AND will have cleared
         // recovery_complete (lease/mod.rs lose-transition). An
         // unconditional store(true) here would clobber that clear
         // and let dispatch_ready fire with a DAG loaded under the
@@ -1065,7 +1079,12 @@ impl DagActor {
         // recover_from_pg() does NOT write to self.leader's generation (it
         // returns the PG high-water for us to seed below). So any
         // change between gen_at_entry and gen_now is unambiguously
-        // a lease-loop fetch_add — no false positives from PG seeding.
+        // a lease-loop write — no false positives from PG seeding.
+        // A self-fence false alarm followed by a successful renew
+        // re-acquires at the SAME generation (no holder change ⇒ no
+        // lease-transition bump ⇒ fetch_max is a no-op); that produces
+        // no change here and correctly does NOT discard this recovery —
+        // same epoch, same DAG, nothing to redo.
         let gen_at_entry = self.leader.generation();
 
         let start = Instant::now();
@@ -1114,11 +1133,219 @@ impl DagActor {
             }
         }
 
+        // --- Durably claim the generation this term will dispatch at ---
+        // r[impl sched.recovery.fetch-max-seed]
+        //
+        // The PRIMARY generation source is the Lease's transition count
+        // (the lease loop's fetch_max in on_acquire — the apiserver
+        // bumps leaseTransitions atomically with the holder change, so
+        // two holders can never share a generation). The PG floor
+        // (`pg_max_gen`, GREATEST over assignments ∪ claims) is the
+        // DURABLE backstop that survives the Lease object being deleted
+        // and recreated at transitions=0: it bounds how far back a
+        // post-deletion leader can land.
+        //
+        // The claim INSERT is what makes that floor cover generations
+        // that never persisted on an assignment row: a leader deposed
+        // before its first dispatch would otherwise leave no trace in
+        // PG, and its post-deletion successor would seed from the same
+        // stale floor and reuse its generation. Claiming BEFORE
+        // set_recovery_complete() means no assignment is ever stamped
+        // with an unclaimed generation (dispatch_ready gates on
+        // recovery_complete).
+        //
+        // This bounds the post-deletion damage; it cannot prevent it
+        // under a PG point-in-time restore (which regresses the claims
+        // table and the assignment history together).
+        //
+        // Placement: BEFORE the gen re-check below, like the
+        // sweep_stale_* calls above — these are the async PG
+        // round-trips of handle_leader_acquired and every one of them
+        // must sit inside the gen_at_entry window so a lease flap
+        // during any of these awaits is caught at the single TOCTOU
+        // gate. The claim does not write self.leader's generation, so
+        // it cannot false-positive that gate. (Only the
+        // seed_generation_from ATOMIC WRITE must come after the gate —
+        // it would look like a flap otherwise.) A claim row left
+        // behind by a recovery the gate then discards is a harmless
+        // over-claim: the next term's floor reads a value ≥ anything
+        // it would have read anyway.
+        //
+        // Same-epoch re-acquire (a self-fence false alarm followed by
+        // a successful renew, or a discarded-and-requeued recovery):
+        // the floor now CONTAINS our own claim row from the previous
+        // run. The rule is "exceed every generation ever used by
+        // anyone ELSE; retain our own current epoch's" — bumping past
+        // our own row would burn a generation per connectivity blip
+        // and fence our own in-flight assignments, contradicting the
+        // lease-side semantics (same epoch ⇒ same generation ⇒
+        // in-flight work stays valid). `holder_id` is the pod
+        // identity: stable across a blip (same process), never reused
+        // across pod restarts (a new pod steals the lease, bumps
+        // leaseTransitions, derives a fresh generation, and never
+        // needs the self re-claim). Two replicas never share one.
+        //
+        // Does the (max) claims-ledger row sit at exactly `gen` and
+        // belong to `holder`? The read-back guards the i64→u64 edge:
+        // a negative generation in the table is a hand-edited anomaly
+        // and matches nothing.
+        let claim_row_matches = |row: &Option<(i64, String)>, at_gen: u64, holder: &str| {
+            row.as_ref()
+                .is_some_and(|(g, h)| u64::try_from(*g).ok() == Some(at_gen) && h == holder)
+        };
+        let claim_target = match &result {
+            // The Err arm of the match below never seeds — this value
+            // is never read on that path.
+            Err(_) => gen_at_entry,
+            Ok(pg_max_gen) => {
+                // u64 view of the PG floor. A negative BIGINT is a
+                // hand-edited or corrupt row — clamp to 0 (below every
+                // real generation, so it demands nothing) and warn;
+                // same trust boundary as the negative-leaseTransitions
+                // clamp on the lease side.
+                let pg_floor = pg_max_gen.map(|g| {
+                    u64::try_from(g).unwrap_or_else(|_| {
+                        warn!(
+                            pg_floor = g,
+                            "negative generation in the PG floor; treating as no floor"
+                        );
+                        0
+                    })
+                });
+                // The holder at the floor only matters when the floor
+                // lands EXACTLY on our epoch: below it nothing demands
+                // a bump, above it we must exceed regardless of whose
+                // it is. One extra single-row PK scan on the
+                // re-acquire and collision paths only.
+                let max_claim = if pg_floor == Some(gen_at_entry) {
+                    self.db.max_claimed_generation().await.ok().flatten()
+                } else {
+                    None
+                };
+                let another_holder_at_our_gen = max_claim.as_ref().is_some_and(|(g, h)| {
+                    u64::try_from(*g).ok() == Some(gen_at_entry) && *h != self.holder_id
+                });
+                let initial = match pg_floor {
+                    // Someone's generation exceeds our epoch (the
+                    // post-deletion case: PG remembers a higher world
+                    // than the recreated Lease derives to). Exceed it.
+                    Some(f) if f > gen_at_entry => f.saturating_add(1),
+                    // The floor lands exactly on our epoch AND another
+                    // holder claimed it — the post-deletion collision
+                    // the PK-CAS exists for. Exceed it.
+                    Some(f) if f == gen_at_entry && another_holder_at_our_gen => {
+                        f.saturating_add(1)
+                    }
+                    // Everything in PG is at or below our epoch and
+                    // nothing at our epoch belongs to anyone else:
+                    // retain the lease-derived generation. This covers
+                    // max(assignments) == gen_at_entry too. Two ways
+                    // someone could have dispatched at gen_at_entry:
+                    // the holder of the lease epoch that derives to it
+                    // (the Lease says that's us), or a previous-epoch
+                    // holder whose own floor logic bumped it here — but
+                    // any such holder also CLAIMED gen_at_entry first,
+                    // which flips another_holder_at_our_gen above. The
+                    // one exception is a holder that proceeded
+                    // unclaimed (a PG error during its own claim),
+                    // which is the documented one-term residual.
+                    _ => gen_at_entry,
+                };
+                if claim_row_matches(&max_claim, initial, &self.holder_id) {
+                    // Same-epoch re-acquire: our own claim row from
+                    // the previous run is already durable. Nothing to
+                    // INSERT.
+                    debug!(
+                        generation = initial,
+                        "same-epoch re-acquire; generation claim already durable"
+                    );
+                    initial
+                } else {
+                    // The PK conflict is the CAS: another holder
+                    // already claimed exactly this generation
+                    // (reachable only when the Lease was deleted and
+                    // two replicas raced through fresh acquisitions) →
+                    // re-target past the claims high-water and retry,
+                    // bounded. Whatever happens, the seed below uses
+                    // the LAST ATTEMPTED value — never one that was
+                    // not offered to the ledger.
+                    let mut target = initial;
+                    for attempt in 0..3u32 {
+                        // Write-direction guard: a generation above
+                        // i64::MAX is unreachable (2^63 leadership
+                        // epochs), but a wrapping `as` would insert a
+                        // negative row and silently break the ledger's
+                        // monotonicity. Saturate instead.
+                        let target_db = i64::try_from(target).unwrap_or(i64::MAX);
+                        match self.db.claim_generation(target_db, &self.holder_id).await {
+                            Ok(true) => break,
+                            Ok(false) => {
+                                // Read back the winning row. If it is
+                                // OURS at this exact generation, the
+                                // "conflict" is an idempotent re-claim
+                                // of our own previous row — success,
+                                // not a collision. (Unreachable given
+                                // the pre-INSERT check above, but it
+                                // keeps the CAS semantics
+                                // self-consistent.)
+                                let winner = self.db.max_claimed_generation().await.ok().flatten();
+                                if claim_row_matches(&winner, target, &self.holder_id) {
+                                    break;
+                                }
+                                if attempt == 2 {
+                                    warn!(
+                                        target,
+                                        "generation claim still conflicting after retries; \
+                                         proceeding unclaimed at the last attempted target \
+                                         (collision window re-opens for this term)"
+                                    );
+                                    break;
+                                }
+                                let bumped = winner.map_or(target.saturating_add(1), |(g, _)| {
+                                    u64::try_from(g).unwrap_or(0).saturating_add(1)
+                                });
+                                let next = bumped.max(target.saturating_add(1));
+                                warn!(
+                                    target,
+                                    bumped = next,
+                                    attempt,
+                                    "generation claim conflict; re-targeting"
+                                );
+                                target = next;
+                            }
+                            Err(e) => {
+                                // PG died between the seed read and
+                                // the claim write. Proceed: blocking
+                                // recovery here would convert a PG
+                                // blip at failover time into a leader
+                                // that holds the lease but never
+                                // dispatches, while the standby cannot
+                                // take over. The cost of proceeding is
+                                // that THIS term's generation is not
+                                // in the claims ledger — exactly the
+                                // pre-claim window, for one term.
+                                error!(
+                                    error = %e,
+                                    target,
+                                    "generation claim failed; proceeding unclaimed"
+                                );
+                                metrics::counter!("rio_scheduler_generation_claim_failed_total")
+                                    .increment(1);
+                                break;
+                            }
+                        }
+                    }
+                    target
+                }
+            }
+        };
+
         // Test-only interleave gate: lets a test bump `generation`
         // between the awaits above and the gen re-check below,
-        // deterministically proving the TOCTOU fix covers BOTH
-        // recover_from_pg AND the sweep_stale_* calls. Signal "reached"
-        // then wait for "release".
+        // deterministically proving the TOCTOU fix covers
+        // recover_from_pg, the sweep_stale_* calls, AND the
+        // generation-claim loop. Signal "reached" then wait for
+        // "release".
         #[cfg(test)]
         if let Some((reached_tx, release_rx)) = self.recovery_toctou_gate.take() {
             let _ = reached_tx.send(());
@@ -1137,11 +1364,21 @@ impl DagActor {
         metrics::counter!("rio_scheduler_recovery_total", "outcome" => outcome).increment(1);
         info!(elapsed_ms = elapsed.as_millis(), outcome, "recovery timing");
 
-        // TOCTOU re-check: did the lease task fetch_add during
-        // recovery? recover_from_pg doesn't touch self.leader's
-        // generation, so gen_now != gen_at_entry ⇒ lease flap.
+        // TOCTOU re-check: did the lease task raise the generation
+        // during recovery? recover_from_pg doesn't touch self.leader's
+        // generation, so gen_now != gen_at_entry ⇒ lease flap onto a
+        // new epoch.
         // The re-acquire's LeaderAcquired is already queued in our
         // mpsc — discard this recovery, let the next one re-run.
+        //
+        // INVARIANT: no await may be introduced between this check and
+        // set_recovery_complete() (either match arm below). Any await
+        // here re-opens the window where a lose→re-acquire clears
+        // recovery_complete and is then clobbered by our store(true),
+        // ungating dispatch with a DAG loaded under a lost epoch — see
+        // the TOCTOU comment at the gen_at_entry snapshot. New PG
+        // round-trips belong ABOVE, with recover_from_pg, the
+        // sweep_stale_* calls, and the generation-claim loop.
         let gen_now = self.leader.generation();
         if gen_now != gen_at_entry {
             warn!(
@@ -1180,27 +1417,25 @@ impl DagActor {
         // of the flag before changing.
         match result {
             Ok(pg_max_gen) => {
-                // r[impl sched.recovery.fetch-max-seed]
-                // --- Seed generation from PG high-water mark ---
-                // fetch_max not store: the lease loop already did
-                // fetch_add(1) on this SAME Arc. store would clobber
-                // it. fetch_max takes the larger of (lease's value,
-                // PG + 1). Defensive against Lease annotation reset
-                // (`kubectl delete lease` zeros the annotation; PG's
-                // high-water persists). Applied HERE (not inside
-                // recover_from_pg) so it happens AFTER the TOCTOU
-                // check — this write is deliberate, not a flap.
-                if let Some(max_gen) = pg_max_gen {
-                    let target = (max_gen as u64).saturating_add(1);
-                    let prev = self.leader.seed_generation_from(target);
-                    if target > prev {
-                        info!(
-                            prev_gen = prev,
-                            pg_high_water = max_gen,
-                            new_gen = target,
-                            "seeded generation from PG high-water mark (defensive monotonicity)"
-                        );
-                    }
+                // --- Seed the generation, then ungate dispatch ---
+                //
+                // `claim_target` was computed AND durably claimed in
+                // the claim loop above, inside the gen_at_entry
+                // window. Only the ATOMIC WRITE happens here, after
+                // the TOCTOU check — writing the atomic before the
+                // check would make the seed itself look like a lease
+                // flap. fetch_max not store: both writers (the lease
+                // loop and this seed) only ever raise the same Arc.
+                // No awaits from here to set_recovery_complete() —
+                // see the INVARIANT comment at the gen re-check.
+                let prev = self.leader.seed_generation_from(claim_target);
+                if claim_target > prev {
+                    info!(
+                        prev_gen = prev,
+                        pg_high_water = ?pg_max_gen,
+                        new_gen = claim_target,
+                        "seeded generation from PG floor (assignments ∪ claims)"
+                    );
                 }
                 self.leader.set_recovery_complete();
                 // Only HERE: the DAG was rebuilt from PG by this
