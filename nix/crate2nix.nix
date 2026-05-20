@@ -51,6 +51,24 @@
   # escape hatch for a flag that genuinely must reach every crate.
   # Empty = no wrap.
   globalExtraRustcOpts ? [ ],
+  # Extra rustc flags injected into crates in the *host* graph (build
+  # scripts, proc-macros, and their transitive dependency closures).
+  # Defaults to `globalExtraRustcOpts` so trees that don't care about
+  # the host/target split see the legacy behavior (one flat opt list).
+  #
+  # crateBuildKani overrides this to `[]`: the global opts there
+  # include `--kani-compiler` and a kani sysroot, which make proc-macros
+  # emit goto-C JSON stubs instead of loadable .so files. Host
+  # artifacts must compile with vanilla rustc — kani-compiler falls
+  # back to vanilla rustc_driver when `--kani-compiler` is absent.
+  # Mirrors `cargo kani`'s `-Z target-applies-to-host`.
+  #
+  # The split is delivered via crate2nix's `isHost` flag (PR #481,
+  # carried on the `lovesegfault/crate2nix:is-host-flag` fork until it
+  # merges upstream): `buildRustCrateForPkgs` declares an extra curried
+  # `{ isHost ? false }` argument, and build-from-json.nix supplies
+  # `true` for crates resolved via `cratePkgs.buildPackages`.
+  globalExtraRustcOptsHost ? globalExtraRustcOpts,
   # Extra rustc flags applied only to crates listed in `memberSrcs`
   # (= local in-tree crates). Dep derivations stay byte-identical to
   # the uninstrumented tree's, so the store shares them. Two users:
@@ -66,6 +84,42 @@
   #   rio-* paths only, so dep coverage data would be discarded at
   #   report time anyway.
   localExtraRustcOpts ? [ ],
+  # Crate types to drop from `crate_.type` for *target*-graph crates.
+  # crateBuildKani sets `[ "cdylib" "staticlib" ]`: kani-compiler with
+  # the default `--reachability=none` skips codegen for deps (only MIR
+  # is encoded), so linking a cdylib/staticlib fails at the version-
+  # script stage with "symbol not defined". `cargo kani` never hits
+  # this — cargo only requests the crate type a downstream actually
+  # links against (rlib), but buildRustCrate builds every declared
+  # type. Host-graph crates are untouched: they compile with vanilla
+  # rustc opts (see `globalExtraRustcOptsHost`) and produce real
+  # codegen, so any declared type links fine. Default `[ ]` is a
+  # structural no-op — `crate_.type` is left untouched and every
+  # existing drvPath is bit-identical.
+  excludeCrateTypes ? [ ],
+  # When the host and target graphs build different drvs for the same
+  # crate, the proc-macro `.so`'s transitive *host* rlib closure must
+  # not be symlinked into the consumer's `target/deps/`.
+  #
+  # buildRustCrate populates `target/deps/` from `completeDeps`, the
+  # fully-recursive dependency closure including each proc-macro's own
+  # rlib chain. The `-C metadata` filename suffix is derived from
+  # crateName+version+features+depsMetadata+rustcTarget — *not* from
+  # `extraRustcOpts` — so the host build of e.g. `memchr` produces
+  # `libmemchr-<hash>.rlib` with the *same* `<hash>` as the target
+  # build but a *different* SVH. `symlink_dependency` does `ln -sf`,
+  # last-write-wins: whichever graph's rlib is symlinked last shadows
+  # the other, and the loser's downstreams fail with
+  # "E0460: found possibly newer version of crate `memchr`".
+  #
+  # Proc-macro `.so`s statically link their Rust deps, so the closure
+  # is dead weight in the consumer's link search path anyway — drop it.
+  # The proc-macro `.so` itself stays a direct dependency.
+  #
+  # Default `false` preserves existing drvPaths. On a non-cross build
+  # without this knob the host and target rlibs are the *same drv*, so
+  # the shadow is a no-op — the dead weight never showed.
+  pruneProcMacroTransitiveDeps ? false,
 }:
 let
   # ──────────────────────────────────────────────────────────────────
@@ -93,15 +147,27 @@ let
   # otherwise try to write profraws to the RO sandbox CWD when they
   # execute during a build. Gated on the specific flag — not on
   # "localExtraRustcOpts is non-empty" — so (a) the fuzz tree's
-  # sancov-only members don't pick up a pointless env var, and (b) a
+  # sancov-only members don't pick up a pointless env var, (b) a
   # local-only coverage tree leaves its dep derivations byte-identical
   # to the uninstrumented tree's (one extra env var on a dep would
-  # change its hash and forfeit the store sharing).
+  # change its hash and forfeit the store sharing), and (c) kani trees
+  # skip it entirely — `effectiveGlobalOpts` carries kani's MIR-linker
+  # flags there, never -Cinstrument-coverage, and kani-compiler doesn't
+  # emit profraws.
   #
-  # The wrap returns a plain `crate_: drv` function — build-from-json.nix's
-  # `.override { defaultCrateOverrides }` branch must be skipped for
-  # this to work; we arrange that by NOT passing our custom overrides
-  # to build-from-json.nix (they're already baked into `base` here).
+  # The wrap returns a plain `{ isHost ? false }: crate_: drv`
+  # function — build-from-json.nix's `.override { defaultCrateOverrides }`
+  # branch must be skipped for this to work; we arrange that by NOT
+  # passing our custom overrides to build-from-json.nix (they're already
+  # baked into `base` here).
+  #
+  # The `{ isHost ? false }` curried argument opts into crate2nix's
+  # host/target distinction (PR #481): build-from-json.nix detects it
+  # via `lib.functionArgs` and passes `true` when resolving the host
+  # graph (`cratePkgs.buildPackages`). Trees that don't differentiate
+  # leave `globalExtraRustcOptsHost` at its default (= the target opts)
+  # so the body collapses to the pre-isHost shape and every drvPath is
+  # bit-identical.
   remapOpts = [ "--remap-path-prefix=${rust}=/rustc" ];
 
   buildRustCrateForPkgs =
@@ -113,8 +179,16 @@ let
         inherit defaultCrateOverrides;
       };
     in
+    {
+      isHost ? false,
+    }:
     crate_:
     let
+      # Host graph (build scripts, proc-macros, and their dep closures)
+      # may need a different global flag set than the target graph
+      # (rlib chain). Default config makes them identical, so this is
+      # a no-op for crateBuild and crateBuildCov.
+      effectiveGlobalOpts = if isHost then globalExtraRustcOptsHost else globalExtraRustcOpts;
       # cargo-hakari's job is feature unification at LOCK time. crate2nix
       # reads Cargo.lock directly (features already baked into each dep's
       # `resolvedDefaultFeatures`), so building workspace-hack's 116 deps
@@ -152,6 +226,45 @@ let
       # takes effect for local source while deps still get
       # `<name>-<ver>/…` from the base remap.
       localRemap = "--remap-path-prefix=$NIX_BUILD_TOP/source=/${crate_.crateName}";
+      # Stop a proc-macro's host rlib closure from leaking into the
+      # consumer's `target/deps/`. See `pruneProcMacroTransitiveDeps`
+      # above for the why. Applied at every recursion level (every call
+      # to `buildRustCrateForPkgs`), not just root crates, so the prune
+      # compounds through `dep.completeDeps`. The `dep // { ... }` is a
+      # Nix-level attrset overlay — it does *not* re-evaluate the dep's
+      # drv, only what `buildRustCrate` reads off the dep at *this*
+      # call site.
+      #
+      # buildRustCrate runs `lib.getLib` on each dependency before
+      # reading `.completeDeps` (build-rust-crate/default.nix:422,425),
+      # so the overlay must land on the `.lib` output, not the top-level
+      # derivation attrset.
+      #
+      # NOTE: brittle by design — this prune only works because
+      # buildRustCrate happens to read `(lib.getLib dep).completeDeps`
+      # at the lines cited above. If a future nixpkgs bump changes how
+      # buildRustCrate walks dependencies (different attr name,
+      # different output, recomputed instead of read off the dep), the
+      # prune SILENTLY no-ops: there is no error here, the overlay just
+      # stops being read, and the symptom resurfaces as a confusing
+      # E0460 (std version mismatch) in some downstream crate far from
+      # this line. The proper long-term fix is upstream: nixpkgs
+      # `buildRustCrate` should incorporate `extraRustcOpts` into the
+      # `-C metadata` hash so host/target rlibs get distinct filenames
+      # and the shadow can't happen at all. Track via a nixpkgs issue
+      # when that becomes worth filing. Until then: if E0460 returns
+      # after a nixpkgs bump, check this comment first.
+      pruneDep =
+        dep:
+        if dep.crateType or [ ] == [ "proc-macro" ] then
+          dep
+          // {
+            lib = dep.lib // {
+              completeDeps = [ ];
+            };
+          }
+        else
+          dep;
       crate_' =
         if crate_.crateName == "workspace-hack" then
           crate_
@@ -164,26 +277,38 @@ let
           crate_ // { src = memberSrcs.${crate_.crateName}; }
         else
           crate_;
+      crate_'' =
+        crate_'
+        // lib.optionalAttrs (pruneProcMacroTransitiveDeps && (crate_' ? dependencies)) {
+          dependencies = map pruneDep crate_'.dependencies;
+        };
     in
     base (
-      crate_'
+      crate_''
       // {
         extraRustcOpts =
           remapOpts
-          ++ globalExtraRustcOpts
+          ++ effectiveGlobalOpts
           ++ lib.optionals isLocal (localExtraRustcOpts ++ [ localRemap ])
           ++ (crate_'.extraRustcOpts or [ ]);
       }
       //
         lib.optionalAttrs
           (lib.elem "-Cinstrument-coverage" (
-            globalExtraRustcOpts ++ lib.optionals isLocal localExtraRustcOpts
+            effectiveGlobalOpts ++ lib.optionals isLocal localExtraRustcOpts
           ))
           {
             # Discard build-time profraws. Test runners override at
             # runtime to collect real data.
             LLVM_PROFILE_FILE = "/dev/null";
           }
+      # Strip linked-output crate types when the *target* compiler
+      # cannot actually codegen them (kani: deps are MIR-only). Host
+      # crates compile with vanilla rustc opts and link normally, so
+      # they keep their declared types.
+      // lib.optionalAttrs (excludeCrateTypes != [ ] && !isHost && crate_' ? type) {
+        type = lib.subtractLists excludeCrateTypes crate_'.type;
+      }
     );
 
   # ──────────────────────────────────────────────────────────────────

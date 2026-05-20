@@ -74,8 +74,15 @@
     # Cargo.nix + nixpkgs' buildRustCrate; same machinery as
     # crate2nix's own bootstrap). See `crate2nixCli` in the
     # perSystem let-block.
+    #
+    # Pinned to a fork branch that adds the `isHost` flag to
+    # `buildRustCrateForPkgs` (host-vs-target graph distinction).
+    # crateBuildKani needs it to compile proc-macros and build scripts
+    # with vanilla rustc while target crates use kani-compiler.
+    # Upstream: https://github.com/nix-community/crate2nix/pull/481.
+    # Drop the `/is-host-flag` suffix once that lands.
     crate2nix = {
-      url = "github:nix-community/crate2nix";
+      url = "github:lovesegfault/crate2nix/is-host-flag";
       flake = false;
     };
 
@@ -408,6 +415,126 @@
                   "-Cdebuginfo=line-tables-only"
                 ];
                 stripBins = false;
+              };
+
+              # Kani verification tree: every crate compiled by
+              # kani-compiler so workspace members emit goto-C symbol
+              # tables alongside their .rlib. Deps get
+              # `--reachability=none` (MIR-only rlib, no codegen);
+              # workspace members get `--reachability=harnesses`
+              # (one goto-C model per `#[kani::proof]`). The flag list
+              # mirrors `kani-driver`'s base_rustc_flags() +
+              # LibConfig::new() + kani_rustc_flags() so the artifacts
+              # are bit-identical to what `cargo kani` would produce.
+              #
+              # The `--reachability=*` knob is read from `-Cllvm-args`,
+              # NOT a bare flag — kani-compiler is a rustc_driver plugin
+              # that parses its own args from `config.opts.cg.llvm_args`.
+              # rustc aggregates `-Cllvm-args` across occurrences but
+              # kani's clap parser ERRORS on a duplicate `--reachability`
+              # (verified empirically; clap derive uses `ArgAction::Set`
+              # but does not allow multiple occurrences). Deps therefore
+              # rely on kani-compiler's `default_value = "none"`
+              # (kani-compiler/src/args.rs) and only workspace members
+              # pass `--reachability=harnesses` via localExtraRustcOpts.
+              kaniBaseFlags = [
+                # base_rustc_flags() — kani-driver/src/call_single_file.rs
+                "-C"
+                "overflow-checks=on"
+                "-Z"
+                "unstable-options"
+                "-Z"
+                "trim-diagnostic-paths=no"
+                "-Z"
+                "human_readable_cgu_names"
+                # deps' MIR encoded for cross-crate reachability
+                "-Z"
+                "always-encode-mir"
+                "--cfg=kani"
+                "-Z"
+                "crate-attr=feature(register_tool)"
+                "-Z"
+                "crate-attr=register_tool(kanitool)"
+                # LibConfig::new() — kani sysroot + library injection.
+                # `--sysroot` points at the kani install root; rustc
+                # appends `lib/rustlib/<target>/lib/`. `-L` makes
+                # libkani.rlib resolvable for the bare `--extern kani`.
+                "--sysroot"
+                "${kaniToolchain.kani}"
+                "-L"
+                "${kaniToolchain.kani}/lib"
+                "--extern"
+                "kani"
+                "--extern"
+                "noprelude:std=${kaniToolchain.kani}/lib/libstd.rlib"
+                # kani_rustc_flags()
+                "-C"
+                "panic=abort"
+                "-C"
+                "symbol-mangling-version=v0"
+                "-Z"
+                "panic_abort_tests=yes"
+                "-Z"
+                "mir-enable-passes=-RemoveStorageMarkers"
+                "--check-cfg=cfg(kani)"
+                # No-op here: buildRustCrate appends `-Clinker=cc`
+                # AFTER extraRustcOpts (build-crate.nix:59-61) and
+                # rustc is last-flag-wins, so `cc` actually links —
+                # and rlibs never invoke a linker anyway. Kept so a
+                # diff against kani-driver/src/call_single_file.rs
+                # shows nothing missing on a kani bump.
+                "-C"
+                "linker=echo"
+                # marker flag — without it kani-compiler falls back to
+                # vanilla rustc_driver (see kani-compiler/src/main.rs).
+                "--kani-compiler"
+              ];
+              crateBuildKani = mkCrateBuild {
+                rust = kaniToolchain.kani-rustc;
+                # No explicit --reachability for deps: kani-compiler
+                # defaults to `none` and clap rejects a duplicate flag.
+                globalExtraRustcOpts = kaniBaseFlags;
+                # Host artifacts (build scripts, proc-macros, and their
+                # dep closures) compile with vanilla rustc opts.
+                # kani-compiler is still the rustc binary
+                # (rust = kani-rustc above) but without `--kani-compiler`
+                # it falls back to vanilla rustc_driver, so proc-macros
+                # produce loadable .so files instead of goto-C JSON
+                # stubs and build scripts execute normally. Mirrors
+                # `cargo kani`'s `-Z target-applies-to-host`.
+                globalExtraRustcOptsHost = [ ];
+                localExtraRustcOpts = [
+                  "-Cllvm-args=--reachability=harnesses"
+                ];
+                # Target deps are compiled `--reachability=none` —
+                # kani-compiler skips codegen and only encodes MIR into
+                # the rlib. Linking a cdylib/staticlib from such a crate
+                # fails ("symbol not defined" at the version script).
+                # `cargo kani` never builds these types for deps; cargo
+                # only requests what a downstream crate links against
+                # (rlib). `-Clinker=echo` in kaniBaseFlags doesn't help:
+                # buildRustCrate appends `-Clinker=cc` after
+                # extraRustcOpts so `cc` wins. Drop the linked-output
+                # types instead. Affects only crates that declare them
+                # (crc-fast, wasm-streams in the current lockfile).
+                excludeCrateTypes = [
+                  "cdylib"
+                  "staticlib"
+                ];
+                # The kani tree has *distinct* host and target drvs for
+                # the same crate (only the kani tree differentiates).
+                # buildRustCrate's `-C metadata` filename suffix doesn't
+                # incorporate `extraRustcOpts`, so a host rlib and its
+                # target sibling have the *same* filename but different
+                # SVHs. Stop proc-macros from leaking their host rlib
+                # closure into `target/deps/` where it would shadow the
+                # target rlibs (E0460). Other trees see no host/target
+                # split (host == target drv), so the leak is invisible
+                # there and the default stays off to preserve drvPaths.
+                pruneProcMacroTransitiveDeps = true;
+                # kani artifacts are .rlib + .symtab.out + .json sidecars,
+                # not binaries; strip is a no-op. Default kept explicit.
+                stripBins = true;
               };
 
               # ──────────────────────────────────────────────────────────
@@ -959,6 +1086,11 @@
                       kani-sysroot
                       kaniNightly
                       ;
+                    # Per-member kani-built outputs (.rlib + goto-C
+                    # sidecars). `nix build .#kani-toolchain.crates.rio-lease`.
+                    # passthru, not a checks.* member: the kani tree is
+                    # ~500 drvs/member and a manual verification target.
+                    crates = crateBuildKani.members;
                   };
                 });
               }

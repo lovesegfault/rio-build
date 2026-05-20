@@ -19,15 +19,16 @@
     "crate2nix": {
       "flake": false,
       "locked": {
-        "lastModified": 1774369503,
-        "narHash": "sha256-YeCF4iBhlvTqkn4mihjZgixnDcEVgfyQlNeBsbLYUgQ=",
-        "owner": "nix-community",
+        "lastModified": 1779237601,
+        "narHash": "sha256-8pzB7EqEV5Z48RA+aQYlN9lvVbTIYnQCEbVYwHjxwiw=",
+        "owner": "lovesegfault",
         "repo": "crate2nix",
-        "rev": "b873ca53dd64e12340416f0fd5e3b33792b9c17b",
+        "rev": "85778090a83b6f6677c8c86055a2ef1348a3bd9f",
         "type": "github"
       },
       "original": {
-        "owner": "nix-community",
+        "owner": "lovesegfault",
+        "ref": "is-host-flag",
         "repo": "crate2nix",
         "type": "github"
       }
