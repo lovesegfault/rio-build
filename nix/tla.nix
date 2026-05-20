@@ -109,14 +109,19 @@ in
   # stays green between the wiring commit and the model commit.
   checks = lib.optionalAttrs (builtins.pathExists (modelsDir + "/LeaderElection.tla")) {
     # rio-lease's leader-election protocol over a Kubernetes Lease
-    # object. The Phase-0 spike model verifies AtMostOneLeader holds
-    # for the initial-race contention window; deposed-leader behavior,
-    # crash-recovery, and the observed-record clock are Phase-1 scope.
-    # The model abstracts the k8s apiserver as a CAS register; the
-    # implementation's optimistic-concurrency retry loop is the
-    # refinement target.
+    # object. The Phase-1 model has per-node clocks (bounded skew), the
+    # observed-record staleness clock, local self-fencing, and
+    # crash/recovery. It verifies AtMostOneCASWinner (the apiserver
+    # admits at most one writer per resourceVersion) and
+    # BoundedDualLeadership (every dual-belief state has a discovery
+    # mechanism armed). StaleLeaderHasStaleGeneration is FALSIFIED and
+    # committed disabled -- see the KNOWN COUNTEREXAMPLE block in the
+    # model. The fetch-max-seed marker covers the gen seeding the model
+    # encodes (Steal's max(gen+1, genHW+1)), not the falsified bridge
+    # invariant.
     # r[verify sched.lease.at-most-one-leader+2]
     # r[verify sched.lease.k8s-lease]
+    # r[verify sched.recovery.fetch-max-seed]
     tla-leader-election = mkTlcCheck {
       name = "leader-election";
       spec = "LeaderElection";
