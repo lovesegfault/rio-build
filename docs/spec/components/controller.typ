@@ -843,10 +843,10 @@ from helm's apply manager).
   ≥ max(q_0.5(boot)/2, min_consolidation_time[h])` prevents a transient lull
   from collapsing to always-delete and lets the operator preserve the pre-§13e
   Karpenter `consolidateAfter` policy floor for cells the NA model would
-  otherwise reap aggressively (default `{"fetcher-*": 600s, "*": 60s}` --- the
+  otherwise reap aggressively (default `{"fetcher-*": 600s, "*": 300s}` --- the
   `q_0.5(boot)/2` model floor is below the boot cost it is supposed to amortize
-  for short-boot builder cells; the universal 60s floor covers a sequential
-  chain's typical inter-build gap at ≈ \$0.0014/node-reap-avoided).
+  for short-boot builder cells; the universal 300s floor covers the sequential
+  inter-build dispatch gap and `>-<` DAG bottlenecks at ≈ \$0.0083/node-reap-avoided).
 ]
 
 #r("ctrl.nodeclaim.shim-nodepool")[

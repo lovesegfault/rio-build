@@ -294,9 +294,9 @@ pub struct NodeClaimPoolConfig {
     /// correct (it observed the right λ); the *policy floor* was lost
     /// in the migration. Keys are class names or `<prefix>*` globs
     /// matched against `cell.0` (most-specific exact match wins, then
-    /// longest prefix). Default `{"fetcher-*": 600.0, "*": 60.0}`:
+    /// longest prefix). Default `{"fetcher-*": 600.0, "*": 300.0}`:
     /// fetchers restore the pre-§13e Karpenter behavior; builders get a
-    /// 60s floor (`boot_median/2 ≈ 9s` is below the ~18s boot cost it's
+    /// 300s floor (`boot_median/2 ≈ 9s` is below the ~18s boot cost it's
     /// supposed to amortize — reaping there is strictly dominated; see
     /// [`Self::default`]). Helm:
     /// `karpenter.nodeclaimPool.minConsolidationTime`.
@@ -1092,7 +1092,7 @@ impl NodeClaimPoolReconciler {
             // TODO(r43 merged_bug_016/bug_023): ticks 1..BOT_TICKS_BEFORE_
             // CONSOLIDATE_ONLY take this early exit and skip ALL kube-only
             // observations — `prev_idle` stays un-pruned (≤4×TICK ≈ 40s
-            // over-estimate, below the 60s builder floor) and
+            // over-estimate, below the 300s builder floor) and
             // `observe_registered` boot samples in that window are lost
             // (~20s after a Registered transition). Fixing both requires
             // fetching `live` here (extra kube round-trip every outage

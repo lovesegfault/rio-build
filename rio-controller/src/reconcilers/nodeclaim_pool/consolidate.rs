@@ -1225,7 +1225,7 @@ mod tests {
         // Fixture: boot=18 (small → tight `w`), gaps clustered just
         // past the model floor `boot/2≈9`, and `min_consolidation_time`
         // cleared so the policy floor doesn't dominate. With the chart
-        // default `*: 60.0` floor and any gap ring, the busy NA
+        // default `*: 300.0` floor and any gap ring, the busy NA
         // threshold is bounded by `max_t ≤ 2×max(floor, gap)` and
         // cannot strictly exceed `2×floor` unless gaps exceed the
         // floor — the bug_009 inversion is structurally about the
