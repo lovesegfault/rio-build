@@ -139,8 +139,8 @@ impl DagActor {
             //
             // The `to_cancel_substituting` and `to_depfail` arms below
             // call this too, gated on `has_buffered_exec_log`: most of
-            // those drvs never dispatched (no exec_id, no buffer — the
-            // call would only warn-spam trigger_log_flush), but a
+            // those drvs never dispatched (no exec_id, no buffer —
+            // nothing to finalize), but a
             // Ready/Substituting drv that went through reset_to_ready()
             // retains a LogBuffers entry stamped with the prior (reset)
             // execution's exec_id, and that execution's `.partial` row

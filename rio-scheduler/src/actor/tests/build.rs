@@ -1022,9 +1022,9 @@ async fn cancel_running_drv_finalizes_log(#[case] from_status: DerivationStatus)
 /// `drv_logs` row stays `is_complete=false`/`status=NULL` for the 30-day
 /// TTL as the drv's latest (and final) execution.
 ///
-/// The never-dispatched sibling pins the gate's other half: no exec_id
-/// from either carrier → no FlushRequest, no seal tombstone, no
-/// warn-spam from `trigger_log_flush`.
+/// The never-dispatched sibling pins the gate's other half: it has no
+/// exec_id from either carrier and no buffer, so the epilogue is
+/// skipped entirely — no FlushRequest, no seal tombstone.
 ///
 /// Pre-fix: the `to_depfail`/`to_cancel_substituting` arms skipped the
 /// epilogue on the (false) claim that those drvs "have no exec_id and

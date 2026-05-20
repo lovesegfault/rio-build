@@ -2,9 +2,10 @@
 //!
 //! The flusher runs on its own task, driven by two triggers:
 //!   1. **Completion** — actor `try_send`s a [`FlushRequest`] when a
-//!      derivation hits a terminal state on a connected worker (success,
-//!      permanent failure, or build-level cancellation — see the
-//!      scheduler actor's `terminal_log_epilogue` for the caller list).
+//!      derivation hits a terminal state with its log buffer still held
+//!      by this leader (success, permanent failure, or build-level
+//!      cancellation — see the scheduler actor's `terminal_log_epilogue`
+//!      for the caller list).
 // r[impl obs.log.periodic-flush]
 //!      This drains the buffer (`LogBuffers::drain`) and uploads the final
 //!      blob to `logs/{drv_hash}/{exec_id}.log.zst` with `is_complete=true`.

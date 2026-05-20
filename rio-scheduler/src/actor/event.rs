@@ -604,12 +604,12 @@ impl DagActor {
     /// Called from [`Self::terminal_log_epilogue`] (the seal/flush/
     /// correlate chokepoint — success, permanent failure, and
     /// build-level cancellation) and from recovery's
-    /// `adopt_orphan_completion` directly. The chokepoint doc
-    /// enumerates the call sites and the never-dispatched carve-outs
-    /// (cascaded `DependencyFailed`, `Skipped`, cache-hit
-    /// `Completed`) — those drvs have no `exec_id`, so this helper
-    /// no-ops anyway and `build_derivations.exec_id` stays `NULL` for
-    /// them, falling back to latest-exec resolution.
+    /// `adopt_orphan_completion` directly. The chokepoint doc is
+    /// authoritative for which terminal paths route through it and
+    /// which are carved out; a drv that never reaches this helper
+    /// (or reaches it without a resolvable exec_id — see the no-op
+    /// conditions below) keeps `build_derivations.exec_id` `NULL`,
+    /// falling back to latest-exec resolution.
     ///
     /// No-op (silent) when both `state.exec_id` and the `LogBuffers`
     /// entry's stamp are `None` (never-dispatched drvs — see
@@ -659,7 +659,8 @@ impl DagActor {
     }
 
     /// Run the log-finalization sequence for a derivation execution
-    /// that just reached a terminal state on a *connected* worker.
+    /// that just reached a terminal state and whose log buffer (if it
+    /// produced one) is still held by *this leader*.
     ///
     /// This is the single chokepoint for [`Self::seal_log_buffer`] →
     /// [`Self::trigger_log_flush`] → [`Self::record_exec_correlation`].
@@ -694,9 +695,9 @@ impl DagActor {
     ///   latest exec for the drv. The never-dispatched majority of
     ///   those arms (`Queued`/`Created`, first-attempt
     ///   `Ready`/`Substituting`) have no exec_id from either carrier
-    ///   and skip the call — nothing to finalize, and routing them
-    ///   through `trigger_log_flush` would warn-spam its no-exec_id
-    ///   arm on every cancel of a not-yet-started build.
+    ///   and skip the call — nothing to finalize, and the epilogue's
+    ///   unconditional seal would insert a tombstone for a buffer
+    ///   that never existed.
     ///
     /// NOT called from:
     /// - `adopt_orphan_completion` (recovery) — the worker disconnected
@@ -710,8 +711,8 @@ impl DagActor {
     /// - cascaded `DependencyFailed` and `Skipped`: structurally never
     ///   dispatched — a cascaded ancestor's deps were never all
     ///   `Completed`, so it was never `Ready`, so it has no exec_id
-    ///   from either carrier and no buffer. Calling would be a
-    ///   harmless warn-spamming no-op.
+    ///   from either carrier and no buffer. Calling would be
+    ///   harmless but pointless.
     /// - cache-hit / substitute-success `Completed`
     ///   (`complete_ready_from_store_batch`): usually never dispatched
     ///   (no buffer), but a *reset* drv completed via store hit or
