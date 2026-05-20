@@ -151,10 +151,11 @@ impl Drop for BuildSlotGuard {
 /// (build already finished, or the cancel is for a different drv —
 /// stale CancelSignal from a previous scheduler generation).
 ///
-/// Called from main.rs's `Msg::Cancel` handler. Fire-and-forget:
-/// the scheduler doesn't wait for confirmation (it's already
-/// transitioned the derivation to Cancelled on its side — this
-/// is just cleanup).
+/// Called from the runtime's `Msg::Cancel` stream handler.
+/// Fire-and-forget: the scheduler doesn't wait for confirmation (it
+/// moves the derivation on — to `Cancelled` or back to `Ready`,
+/// depending on the sender — in the same pass that sends the
+/// `CancelSignal`; this is just cleanup).
 pub fn try_cancel_build(slot: &BuildSlot, drv_path: &str) -> bool {
     // Single lock for the whole operation: drv_path match + flag set +
     // cgroup path read happen atomically. With one build per pod the
@@ -220,10 +221,10 @@ pub fn try_cancel_build(slot: &BuildSlot, drv_path: &str) -> bool {
             // `ExecutorError::Cancelled` without spawning the daemon.
             // The misclassification risk (an unrelated Err later
             // reported as Cancelled) is real but is the lesser evil:
-            // a build that the scheduler already transitioned to
-            // Cancelled has no client waiting on its real outcome,
-            // and an unkillable builder burns activeDeadlineSeconds
-            // (1h) of compute × N pods (I-166: ×86).
+            // an execution the scheduler has already abandoned has no
+            // one waiting on its real outcome, and an unkillable
+            // builder burns activeDeadlineSeconds (1h) of compute × N
+            // pods (I-166: ×86).
             tracing::info!(
                 drv_path,
                 cgroup = %cgroup_path.display(),

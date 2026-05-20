@@ -567,7 +567,8 @@ pub async fn spawn_build_task(
         // settled by the time the build resolves.
         // The cancel flag overrides the attempt's string to `cancelled`
         // (`final_footer_result` — same flag read as `err_completion`
-        // below, so the footer and the CompletionReport agree).
+        // below, so on the Err arm the footer and the report agree; the
+        // Ok arm is deliberately split, see `final_footer_result`'s doc).
         // Best-effort: the scheduler's cancel-path seal drops this
         // footer before it reaches the stored log — see
         // `terminal_log_epilogue`'s sequencing note in rio-scheduler.

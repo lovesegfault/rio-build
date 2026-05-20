@@ -54,10 +54,13 @@ pub(super) fn ok_completion(r: ExecutionResult, stamp: CompletionStamp) -> Compl
 /// the kill → SIGKILL → stdout-EOF → `Err` path has some latency, so by
 /// the time the result is observed the flag is set. Three buckets:
 ///
-/// - `was_cancelled` → `Cancelled`. Expected outcome of `CancelBuild` /
+/// - `was_cancelled` → `Cancelled`. Expected outcome of any
+///   `CancelSignal`: `CancelBuild`, the scheduler's backstop timeout, or
 ///   `DrainExecutor(force)`. Not an error — info-logged. Scheduler's
-///   completion handler treats `Cancelled` as a no-op (already
-///   transitioned the derivation when it sent the `CancelSignal`).
+///   completion handler treats `Cancelled` as a no-op (by the time the
+///   report arrives it has already moved the derivation on — to
+///   `Cancelled` on the cancel path, back to `Ready` on the
+///   backstop/force-drain paths).
 /// - `e.is_permanent()` → `InputRejected`. Deterministic per-derivation
 ///   under the scheduler's routing (`WrongKind`, `.drv` parse failure).
 ///   Another pod *of the kind the scheduler will pick* fails
@@ -152,10 +155,11 @@ pub(super) fn panic_completion(
 ///
 /// The override applies to a successful attempt's `ok` too: a cancel
 /// that lands after the daemon exits but before the footer send reports
-/// the assignment's disposition (the scheduler has already transitioned
-/// the derivation to Cancelled and finalized `drv_logs.status =
-/// 'cancelled'` — that is the only way the flag gets set), not the
-/// daemon's exit status.
+/// the assignment's disposition, not the daemon's exit status. The flag
+/// is set by `try_cancel_build` on any `CancelSignal` (the senders
+/// behind [`err_completion`]'s `was_cancelled`); every sender abandons
+/// this execution on the scheduler side, so `cancelled` is the right
+/// footer regardless of how the attempt ended.
 ///
 /// `None` stays `None` even when cancelled: a pre-cgroup-cancelled build
 /// never ran a daemon and header-without-footer is the documented "build
@@ -165,8 +169,7 @@ pub(super) fn panic_completion(
 /// cancel path the footer is dropped by the scheduler's cancel-path seal
 /// and never reaches the stored log (see `terminal_log_epilogue`'s
 /// sequencing note in rio-scheduler); it is still observable on the
-/// force-drain/backstop `CancelSignal` paths and keeps the footer
-/// consistent with the `CompletionReport` built from the same outcome.
+/// force-drain/backstop `CancelSignal` paths.
 pub(super) fn final_footer_result(
     last_footer_result: Option<&str>,
     was_cancelled: bool,
