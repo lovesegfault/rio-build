@@ -149,7 +149,7 @@ impl DagActor {
             // The seal here precedes the CancelSignal try_send below,
             // so the worker's late `rio: result cancelled` footer is
             // dropped — see terminal_log_epilogue's sequencing note.
-            // r[impl sched.merge.exec-correlation+4]
+            // r[impl sched.merge.exec-correlation+5]
             self.terminal_log_epilogue(drv_hash, "cancelled", &[build_id]);
             transitioned.push(drv_hash.as_str());
             let Some(executor_id) = executor_id else {
@@ -194,7 +194,7 @@ impl DagActor {
                 // I-047 terminal-exit resets) would attribute an
                 // already-finalized execution to a build that never
                 // observed it. See `has_buffered_exec_log`.
-                // r[impl sched.merge.exec-correlation+4]
+                // r[impl sched.merge.exec-correlation+5]
                 if self
                     .dag
                     .node(drv_hash)
@@ -244,7 +244,7 @@ impl DagActor {
                 // disposition of the *log* (the build went away), not
                 // the drv's terminal enum, and "failed" is reserved for
                 // permanent build failure.
-                // r[impl sched.merge.exec-correlation+4]
+                // r[impl sched.merge.exec-correlation+5]
                 if self
                     .dag
                     .node(drv_hash)

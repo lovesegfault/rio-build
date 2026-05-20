@@ -206,23 +206,27 @@ write). Dropped phase updates increment
 #(refs.metric)("rio_scheduler_phases_rejected_total"), labeled by reason
 (`not_active` | `no_assignment` | `executor_mismatch`).
 
-#r("sched.merge.exec-correlation+4")[
+#r("sched.merge.exec-correlation+5")[
   The scheduler MUST set `build_derivations.exec_id` for every interested
   build when a derivation that has been dispatched (and therefore has an
   `exec_id` recorded for it) reaches a terminal state through a path
   where an execution actually ran: `Completed` (success or recovery's
-  orphan adoption), `Poisoned` (permanent failure), and `Cancelled`
-  reached from `Assigned`/`Running`. The column MUST stay `NULL` for
-  cache-hit `Completed`, cascaded `DependencyFailed`, `Skipped`,
-  non-terminal derivations, and any other terminal reached without
-  dispatch (no execution to correlate).
+  orphan adoption), `Poisoned` (permanent failure), `Cancelled` reached
+  from `Assigned`/`Running`, and any terminal reached by a derivation
+  whose prior, reset execution left a stamped log buffer (the
+  build-cancel sweep's `Cancelled`/`DependencyFailed` arms and the
+  failed-substitute revert to `DependencyFailed`). The column MUST stay
+  `NULL` for cache-hit `Completed`, cascade-swept `DependencyFailed`
+  ancestors, `Skipped`, non-terminal derivations, and any other
+  terminal where no execution was ever observed (nothing to correlate).
 ]
 
 `Failed` is _not_ a terminal status in the actor's state machine
 (`is_terminal()`); it is the transient retry intermediate
 (`Running → Failed → Ready`). The shared chokepoint is `terminal_log_epilogue`, called from
 `handle_success_completion` (`Completed`), `terminal_failure_epilogue`
-(`Poisoned` and timeout-exhausted `Cancelled`), and
+(`Poisoned`, timeout-exhausted `Cancelled`, and the failed-substitute
+revert to `DependencyFailed`), and
 `cancel_build_derivations` (any path that cancels in-flight derivations:
 user cancel, per-build wall-clock timeout, fail-fast, top-down substitute
 fail) --- each of which implies the worker ran the build. The

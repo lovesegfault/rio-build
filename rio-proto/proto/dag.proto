@@ -136,10 +136,11 @@ message GraphNode {
   string status = 4;               // derivations.status CHECK constraint values
   string assigned_executor_id = 5; // empty if unassigned
   // exec_id of the execution this build observed for this drv. Set after
-  // a terminal where an execution actually ran (Completed, Poisoned,
-  // Cancelled from Assigned/Running, recovery's orphan adoption); empty for
-  // Cached, DependencyFailed, Skipped, never-dispatched terminals, and
-  // non-terminal. Empty → dashboard falls back to latest.
+  // a terminal where an execution actually ran; empty when no execution
+  // was ever observed for this (build, drv) pair (cache hit, cascaded
+  // failure, never dispatched, non-terminal). Empty → dashboard falls
+  // back to latest. Exact terminal-path enumeration:
+  // r[sched.merge.exec-correlation] in the scheduler spec.
   string exec_id = 6;
 }
 

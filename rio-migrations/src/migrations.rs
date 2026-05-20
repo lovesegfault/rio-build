@@ -997,11 +997,11 @@ pub const M_060: () = ();
 /// reloaded) and `build_derivations.exec_id` (build↔exec
 /// correlation — set by the completion handler on terminal paths where an
 /// execution ran: `Completed`, `Poisoned`, `Cancelled` reached from
-/// `Assigned`/`Running`, and `Cancelled`/`DependencyFailed` swept by a
-/// build cancel when the prior execution was reset and left a stamped
-/// log buffer; `NULL` for cascaded `DependencyFailed`/`Skipped`/
+/// `Assigned`/`Running`, and any terminal reached while a prior, reset
+/// execution's stamped log buffer is retained (build-cancel sweep,
+/// failed-substitute revert); `NULL` for cascade-swept `DependencyFailed`/`Skipped`/
 /// cache-hit `Completed`/never-dispatched/non-terminal — see
-/// `sched.merge.exec-correlation+4`).
+/// `sched.merge.exec-correlation+5`).
 ///
 /// Greenfield drop+recreate, no backfill.
 pub const M_061: () = ();

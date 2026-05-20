@@ -278,10 +278,11 @@ impl SchedulerDb {
         //
         // bd.exec_id is the build↔exec observation recorded by the
         // completion handler on terminal paths where an execution ran
-        // (Completed, Poisoned, Cancelled from Assigned/Running, and
-        // Cancelled/DependencyFailed swept by a build cancel when the
-        // prior execution was reset (retained log buffer)) — see
-        // r[sched.merge.exec-correlation+4]. It comes from the JOIN'd
+        // (Completed, Poisoned, Cancelled from Assigned/Running, and any
+        // terminal reached while a prior, reset execution's stamped log
+        // buffer is retained — build-cancel sweep or failed-substitute
+        // revert) — see
+        // r[sched.merge.exec-correlation+5]. It comes from the JOIN'd
         // `build_derivations` edge (already in the query), not a new
         // table; nullable, NOT COALESCE'd (the proto layer maps None →
         // empty string and the dashboard treats empty as "fall back to

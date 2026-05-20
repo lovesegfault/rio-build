@@ -532,7 +532,7 @@ impl DagActor {
     /// it without breaking the legitimate shapes (neither
     /// `reset_to_ready` nor the transient-retry window seals); not
     /// added because no test can deterministically exercise the window.
-    /// r[impl sched.merge.exec-correlation+4]
+    /// r[impl sched.merge.exec-correlation+5]
     pub(super) fn has_buffered_exec_log(&self, state: &crate::state::DerivationState) -> bool {
         self.log_buffers
             .as_ref()
@@ -617,7 +617,7 @@ impl DagActor {
     /// (nodes whose merge tx hasn't committed — impossible here; merge
     /// commits before any dispatch — but cheap to guard).
     ///
-    /// r[impl sched.merge.exec-correlation+4]
+    /// r[impl sched.merge.exec-correlation+5]
     pub(super) fn record_exec_correlation(&self, drv_hash: &DrvHash, interested_builds: &[Uuid]) {
         let Some(state) = self.dag.node(drv_hash) else {
             return;
@@ -752,7 +752,7 @@ impl DagActor {
     /// it resolves, so it should resolve from the same snapshot of
     /// `state` as the correlate.
     ///
-    /// r[impl sched.merge.exec-correlation+4]
+    /// r[impl sched.merge.exec-correlation+5]
     pub(super) fn terminal_log_epilogue(
         &self,
         drv_hash: &DrvHash,

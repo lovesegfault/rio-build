@@ -31,7 +31,8 @@ CREATE INDEX drv_logs_started_at ON drv_logs (started_at);
 -- so the flusher keys subsequent uploads correctly after failover.
 ALTER TABLE assignments ADD COLUMN exec_id UUID;
 
--- build_id ↔ exec_id correlation. Set on terminal paths where an execution
--- ran (Completed, Poisoned, Cancelled from Assigned/Running); NULL for
--- Cached/DependencyFailed/Skipped/never-dispatched/non-terminal.
+-- build_id ↔ exec_id correlation. NULL when no execution was ever observed
+-- for this (build, drv) pair. The terminal-path enumeration (which statuses
+-- set it vs. leave it NULL) lives in M_061 — this file is checksum-frozen
+-- and cannot track it.
 ALTER TABLE build_derivations ADD COLUMN exec_id UUID;
