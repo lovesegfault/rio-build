@@ -4,7 +4,7 @@
 //! renews a `coordination.k8s.io/v1` Lease. On acquire, it derives
 //! the generation from the lease's transition count (workers see the
 // r[impl sched.lease.k8s-lease]
-// r[impl sched.lease.generation-fence]
+// r[impl sched.lease.generation-fence+2]
 //! new gen in heartbeat, reject stale-gen assignments from the old
 //! leader) and sets `is_leader=true` (dispatch_ready checks this).
 //!
@@ -90,7 +90,7 @@ pub trait LeaseHooks: Clone + Send + 'static {
 // leader self-fences at LEASE_TTL - margin, follower steals at
 // LEASE_TTL + margin, with margin > 2 × max(latency_slack, clock_skew).
 // The current "same TTL" choice is defensible because
-// r[sched.lease.generation-fence] provides correctness regardless and the
+// r[sched.lease.generation-fence+2] provides correctness regardless and the
 // executor-side check is a cheap integer compare; this becomes worth doing
 // if that fence ever grows hot.
 //
@@ -394,7 +394,7 @@ impl LeaderState {
     /// is_leader write in the total order. A reader seeing is_leader=true
     /// (SeqCst load) sees the new generation. recovery_complete is NOT
     /// set here — that's the actor's job after recover_from_pg finishes.
-    // r[impl sched.lease.generation-fence]
+    // r[impl sched.lease.generation-fence+2]
     pub fn on_acquire(&self, lease_transitions: u64) -> u64 {
         let target = lease_transitions.saturating_add(1);
         // fetch_max returns the PREVIOUS value; the new value is the max
@@ -687,7 +687,7 @@ pub async fn run_lease_loop<H: LeaseHooks>(
                 // anyway. In the asymmetric case (WE are partitioned,
                 // peer is not) NOT flipping makes us a stale-assignment
                 // noise generator. Worker-side generation fence
-                // (r[sched.lease.generation-fence]) saves correctness
+                // (r[sched.lease.generation-fence+2]) saves correctness
                 // either way; this fence saves ops sanity.
                 if maybe_self_fence(
                     &state,
@@ -817,7 +817,7 @@ fn spawn_patch_deletion_cost(client: kube::Client, namespace: String, pod_name: 
 }
 
 // r[verify sched.lease.k8s-lease]
-// r[verify sched.lease.generation-fence]
+// r[verify sched.lease.generation-fence+2]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -929,7 +929,7 @@ mod tests {
     /// `docs/spec/models/LeaderElection.tla`'s StaleLeaderHasStaleGeneration
     /// is exactly two local increments seeded from the same stale
     /// high-water mark).
-    // r[verify sched.lease.generation-fence]
+    // r[verify sched.lease.generation-fence+2]
     #[test]
     fn generation_derives_from_lease_transitions() {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));

@@ -1134,7 +1134,7 @@ impl DagActor {
         }
 
         // --- Durably claim the generation this term will dispatch at ---
-        // r[impl sched.recovery.fetch-max-seed]
+        // r[impl sched.recovery.fetch-max-seed+2]
         //
         // The PRIMARY generation source is the Lease's transition count
         // (the lease loop's fetch_max in on_acquire — the apiserver
@@ -1193,6 +1193,7 @@ impl DagActor {
             row.as_ref()
                 .is_some_and(|(g, h)| u64::try_from(*g).ok() == Some(at_gen) && h == holder)
         };
+        // r[impl sched.lease.generation-claim]
         let claim_target = match &result {
             // The Err arm of the match below never seeds — this value
             // is never read on that path.

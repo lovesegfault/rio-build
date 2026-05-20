@@ -62,7 +62,7 @@ use crate::{executor, log_stream};
 /// event loop has no mock SchedulerMessage stream. Strictly-less (`<`):
 /// generation is constant during a leader's tenure, so `assignment_gen
 /// == latest_observed` is the steady state.
-// r[impl sched.lease.generation-fence]
+// r[impl sched.lease.generation-fence+2]
 pub fn is_stale_assignment(assignment_gen: u64, latest_observed: u64) -> bool {
     assignment_gen < latest_observed
 }
@@ -1071,7 +1071,7 @@ async fn handle_assignment(
     rt: &BuilderRuntime,
     done_watcher_spawned: &AtomicBool,
 ) {
-    // r[impl sched.lease.generation-fence]
+    // r[impl sched.lease.generation-fence+2]
     // Reject assignments from a deposed leader.
     // Strictly-less (`<`): equal is the steady
     // state (generation constant per leader
@@ -2786,7 +2786,7 @@ mod tests {
     }
 }
 
-// r[verify sched.lease.generation-fence]
+// r[verify sched.lease.generation-fence+2]
 #[cfg(test)]
 mod fence_tests {
     use super::heartbeat::apply_heartbeat_response;

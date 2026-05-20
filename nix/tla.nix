@@ -121,7 +121,7 @@ in
     # invariant.
     # r[verify sched.lease.at-most-one-leader+2]
     # r[verify sched.lease.k8s-lease]
-    # r[verify sched.recovery.fetch-max-seed]
+    # r[verify sched.recovery.fetch-max-seed+2]
     tla-leader-election = mkTlcCheck {
       name = "leader-election";
       spec = "LeaderElection";

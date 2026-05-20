@@ -2,7 +2,7 @@
 //!
 //! `build_heartbeat_request` assembles capability/resource data for the
 //! scheduler; `spawn_heartbeat` drives the 10s tick. The generation
-//! fence (`r[sched.lease.generation-fence]`) is updated from the
+//! fence (`r[sched.lease.generation-fence+2]`) is updated from the
 //! response.
 
 use std::sync::Arc;
@@ -203,7 +203,7 @@ pub(super) fn apply_heartbeat_response(
                 // (already-true → true is a no-op at the atomic
                 // level) and cheaper than a load-then-store.
                 ready.store(true, std::sync::atomic::Ordering::Relaxed);
-                // r[impl sched.lease.generation-fence]
+                // r[impl sched.lease.generation-fence+2]
                 // fetch_max, not store: during the 15s Lease TTL
                 // split-brain window (r[sched.lease.k8s-lease]),
                 // both old and new leader answer with accepted=true.

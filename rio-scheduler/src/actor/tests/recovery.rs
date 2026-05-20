@@ -4,7 +4,7 @@
 // sched.lease.k8s-lease (what happens on acquire). The test here
 // verifies the LeaderAcquired → recover_from_pg → recovery_complete
 // pipeline; the lease loop's acquire behavior is covered in
-// lease.rs tests (sched.lease.generation-fence verify).
+// lease.rs tests (sched.lease.generation-fence+2 verify).
 
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1076,7 +1076,7 @@ async fn test_recovery_skips_bad_drv_path_rows() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.recovery.fetch-max-seed]
+// r[verify sched.recovery.fetch-max-seed+2]
 /// Recovery must seed generation from PG's floor (assignments ∪ claims)
 /// via fetch_max, and must durably CLAIM the generation it lands on
 /// before ungating dispatch. Defensive monotonicity: if the k8s Lease
@@ -1147,6 +1147,7 @@ async fn test_recovery_seeds_generation_from_assignments() -> TestResult {
 /// see 200 and seed past it. Without the claims arm of
 /// `max_known_generation`, the floor here is NULL and the new leader
 /// would re-use a generation a live believer may still hold.
+// r[verify sched.lease.generation-claim]
 #[tokio::test]
 async fn test_recovery_seeds_generation_from_unpersisted_claim() -> TestResult {
     let f = RecoveryFixture::run(async |_handle, pool| {
@@ -1181,6 +1182,7 @@ async fn test_recovery_seeds_generation_from_unpersisted_claim() -> TestResult {
 /// blip and fence the leader's own in-flight assignments, contradicting
 /// the lease-side same-epoch semantics. The ledger must not grow a new
 /// row either.
+// r[verify sched.lease.generation-claim]
 #[tokio::test]
 async fn test_recovery_same_holder_reclaim_retains_generation() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1230,6 +1232,7 @@ async fn test_recovery_same_holder_reclaim_retains_generation() -> TestResult {
 /// post-lease-deletion collision the PK-CAS exists for — two replicas
 /// raced through fresh acquisitions onto the same floor — and it MUST
 /// bump, not retain. Distinct holders must never share a generation.
+// r[verify sched.lease.generation-claim]
 #[tokio::test]
 async fn test_recovery_other_holder_at_our_generation_bumps() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;

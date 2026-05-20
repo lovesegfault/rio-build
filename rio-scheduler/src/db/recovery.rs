@@ -422,8 +422,11 @@ impl SchedulerDb {
     /// to distinguish "this row is our own previous claim for the same
     /// epoch" (retain the generation, the claim is already durable)
     /// from "another holder claimed our generation" (the
-    /// post-lease-deletion collision; exceed it). Pod names are never
-    /// reused and two live replicas never share one.
+    /// post-lease-deletion collision; exceed it). No two LIVE processes
+    /// ever share a `holder_id` — a container restart within the same
+    /// pod reuses `HOSTNAME`, but the predecessor is dead before the
+    /// successor starts.
+    // r[impl sched.lease.generation-claim]
     pub async fn claim_generation(
         &self,
         generation: i64,

@@ -946,7 +946,7 @@ in
     subtests = [
       "build-during-failover"
       # r[verify sched.lease.k8s-lease]
-      # r[verify sched.lease.generation-fence]
+      # r[verify sched.lease.generation-fence+2]
       #   True ungraceful death: SIGKILL the leader's host PID via
       #   crictl (no SIGTERM, no step_down, no FIN). Kubelet restarts
       #   the container in-place; restarted process sees holder==our_id

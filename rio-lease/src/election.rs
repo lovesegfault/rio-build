@@ -745,7 +745,7 @@ mod tests {
     /// holder change inside the rv-guarded PUT. This is the production
     /// half of the fix for the StaleLeaderHasStaleGeneration
     /// counterexample in `docs/spec/models/LeaderElection.tla`.
-    // r[verify sched.lease.generation-fence]
+    // r[verify sched.lease.generation-fence+2]
     #[tokio::test]
     async fn successful_steal_carries_bumped_transitions() {
         let (client, verifier) = ApiServerVerifier::new();

@@ -1537,11 +1537,31 @@ tables) during state recovery.
 
 = State Recovery
 
-#r("sched.recovery.fetch-max-seed")[
-  Generation seeding uses `fetch_max` not `store`. The same `Arc<AtomicU64>` is
-  shared with the lease loop's `fetch_add(1)` on acquire --- `store` would
-  clobber that increment.
+#r("sched.recovery.fetch-max-seed+2")[
+  During recovery the scheduler MUST raise its generation to the claimed
+  generation target via `fetch_max`, not `store`: one past the durable PG
+  floor --- `GREATEST(MAX(assignments.generation),
+  MAX(leader_generation_claims.generation))` --- unless the floor is the
+  holder's own already-claimed epoch
+  (#rref("sched.lease.generation-claim")), in which case the floor itself.
+  The same `Arc<AtomicU64>` already holds the Lease-derived generation written
+  by the lease loop on acquire (#rref("sched.lease.generation-fence+2")); `store`
+  would clobber whichever of the two sources is larger.
 ]
+
+The PRIMARY generation source is the Lease's `leaseTransitions` count. The PG
+floor is the durable backstop that survives Lease-object deletion: a recreated
+Lease restarts its transition count at zero, and the floor puts the first
+post-deletion leader back above every generation PostgreSQL has ever seen. It
+_bounds_ the post-deletion damage; it does not prevent a collision under a PG
+point-in-time restore (both tables regress together, and the only remedy there
+is the etcd-style "bump the counter past anything that could have been
+issued"). The floor reads the claims ledger as well as the assignment history
+because the assignment high-water _decays_ --- terminal-derivation GC cascades
+assignment rows away, so `MAX(generation) FROM assignments` regresses toward
+`NULL` on a quiescent cluster --- and because a leader deposed before
+persisting any assignment leaves no trace in `assignments` at all
+(#rref("sched.lease.generation-claim")).
 
 #r("sched.reconcile.leader-gate")[
   The post-recovery reconcile pass (`ReconcileAssignments`) MUST early-return
@@ -2126,7 +2146,7 @@ CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
   process whose clock pauses or skews cannot self-fence at the moment its
   lease expires --- it discovers its lateness only when the clock next
   reads. The Chubby-style fix is a fencing token at the resource boundary,
-  which #rref("sched.lease.generation-fence") provides; that rule, not this
+  which #rref("sched.lease.generation-fence+2") provides; that rule, not this
   one, makes the dual-belief window safe rather than merely short. The
   formal model in `docs/spec/models/LeaderElection.tla` verifies the two
   halves separately: `AtMostOneCASWinner` (the hard half --- two `Replace`
@@ -2178,23 +2198,35 @@ CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
 ]
 
 - *Terminal-build cleanup:* the `CleanupTerminalBuild` arm also stays ungated
-  (in-memory build/event-map removal, the DAG reap, and log-buffer bookkeeping
-  run on standby); its post-reap survivor re-evaluation --- which can persist
-  derivation status, clear the persisted `topdown_pruned` mark, and terminally
-  fail builds via the topdown fail-fast --- is individually leader-gated, like
-  the per-sub-call gates above.
+  (in-memory build/event-map removal and the DAG reap run on standby); its
+  post-reap survivor re-evaluation --- which can persist derivation status,
+  clear the persisted `topdown_pruned` mark, and terminally fail builds via the
+  topdown fail-fast --- is individually leader-gated, like the per-sub-call
+  gates above.
 
-#r("sched.lease.generation-fence")[
-  *Generation-based staleness detection is executor-side only.* On each lease
-  acquisition, the new leader increments an in-memory `Arc<AtomicU64>`
-  generation counter. Executors see the new generation in `HeartbeatResponse`
-  and reject any `WorkAssignment` carrying an older generation. *No
-  PostgreSQL-level write fencing exists.* A deposed leader's in-flight PG
-  writes will succeed; the split-brain window is bounded by the Lease renew
-  deadline (default 15s). Because the writes in question are idempotent upserts
-  keyed by `drv_hash` and status transitions are monotone, brief dual-writer
-  windows do not corrupt state.
+#r("sched.lease.generation-fence+2")[
+  *Generation-based staleness detection is executor-side only.* The leadership
+  generation MUST derive from the Lease's `leaseTransitions` count
+  (`generation = leaseTransitions + 1`): the apiserver bumps that field
+  atomically with the holder change inside the resourceVersion-guarded PUT, so
+  two replicas that both believe they lead can never have acquired at the same
+  count --- their generations are distinct without any coordination beyond the
+  CAS that already serializes the steal. Executors see the new generation in
+  `HeartbeatResponse` and reject any `WorkAssignment` carrying an older
+  generation. *No PostgreSQL-level write fencing exists.* A deposed leader's
+  in-flight PG writes will succeed; the split-brain window is bounded by the
+  Lease renew deadline (default 15s). Because the writes in question are
+  idempotent upserts keyed by `drv_hash` and status transitions are monotone,
+  brief dual-writer windows do not corrupt state.
 ]
+
+A local counter cannot provide the distinctness half of this rule: an
+incremented-in-memory generation seeded from a high-water mark collides
+whenever a leader is deposed before persisting anything (the depth-12
+counterexample in `docs/spec/models/LeaderElection.tla`'s history). The
+transition count is the epoch source only while the Lease object exists;
+#rref("sched.lease.generation-claim") extends the distinctness guarantee
+across Lease-object deletion.
 
 #memo(title: [Optional future hardening])[
   If stricter at-most-one-writer semantics are needed, add a `scheduler_meta`
@@ -2203,6 +2235,40 @@ CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
   executor-side generation check plus idempotent PG schema is sufficient for
   correctness.
 ]
+
+#r("sched.lease.generation-claim")[
+  Before completing recovery and ungating dispatch, a newly-acquired leader
+  MUST durably record the generation it will dispatch at as a row in the
+  `leader_generation_claims` ledger, and the recovery generation floor
+  (#rref("sched.recovery.fetch-max-seed+2")) MUST be computed over both the
+  assignment history and that ledger. A holder whose own claim row already
+  sits at its lease-derived generation MUST retain that generation rather
+  than claim a new one.
+]
+
+This is the Chubby-sequencer discipline: a fencing token is only as durable as
+the state that allocates it. The Lease's transition count
+(#rref("sched.lease.generation-fence+2")) is the primary epoch source, but
+`kubectl delete lease` resets it to zero --- and the Kubernetes ecosystem
+treats Lease deletion as a routine remedy for a stuck election, not a
+disaster. The only store that survives Lease deletion in this architecture is
+PostgreSQL, so the generation must be recorded there _before_ it is used, not
+as a side effect of the first dispatch: a leader deposed before persisting any
+assignment would otherwise leave no trace, and its successor would seed from
+the same stale floor and collide. The `generation` PRIMARY KEY doubles as the
+CAS: two holders claiming the same generation concurrently resolve by `ON
+CONFLICT DO NOTHING` --- the loser re-targets past the claims high-water and
+retries, bounded. The `holder_id` column is the load-bearing same-epoch
+discriminator: a holder re-acquiring its own epoch (a self-fence false alarm
+followed by a successful renew --- the Lease's transition count did not move,
+so the epoch did not change) finds its own row at its lease-derived generation
+and retains it, rather than burning a generation --- and fencing its own
+in-flight work --- on every connectivity blip. A row at our generation with a
+_different_ `holder_id` is unambiguously a cross-incarnation collision and
+forces the bump. A claim-write failure degrades to a logged, counted
+(`rio_scheduler_generation_claim_failed_total`) proceed-without-claim: blocking
+recovery on the claim would turn a PG blip at failover time into a leader that
+holds the Lease but never dispatches.
 
 #r("sched.lease.graceful-release")[
   On graceful shutdown (SIGTERM), if the lease loop was leading, it calls

@@ -335,6 +335,7 @@ async fn test_load_parents_with_unproduced_terminal_children_ignores_produced_an
 /// `ON CONFLICT DO NOTHING` ever became `DO UPDATE`, `rows_affected()`
 /// would report 1 on conflict and two leaders would both believe they
 /// own the same generation.
+// r[verify sched.lease.generation-claim]
 #[tokio::test]
 async fn test_claim_generation_pk_conflict_is_the_cas() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -382,6 +383,7 @@ async fn test_claim_generation_pk_conflict_is_the_cas() -> anyhow::Result<()> {
 /// exists for: without the claims arm, `MAX(generation) FROM
 /// assignments` is NULL here and the next leader would seed from
 /// nothing.
+// r[verify sched.lease.generation-claim]
 #[tokio::test]
 async fn test_max_known_generation_covers_unpersisted_claims() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
