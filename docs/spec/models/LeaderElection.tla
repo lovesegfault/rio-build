@@ -11,15 +11,19 @@
 (*   - sched.lease.at-most-one-leader  (the safety invariant, both halves) *)
 (*   - sched.lease.k8s-lease           (the protocol mechanism)            *)
 (*   - sched.recovery.fetch-max-seed   (the generation seeding on acquire) *)
+(*   - sched.lease.generation-claim    (the write-ahead claim in Steal;    *)
+(*     its r[verify] marker lands with the DeleteLease extension, which    *)
+(*     is the fault the claim exists to survive)                           *)
 (*                                                                         *)
 (* PROOF CLAIM, stated honestly: the invariants below hold under clock     *)
-(* skew <= MaxSkew ticks, no host suspend, over a bounded state space of   *)
-(* 2 nodes and ~2 leadership cycles (4.27M distinct states). The bounds    *)
-(* exclude: 3-party races (any k-party CAS race contains a 2-party prefix, *)
-(* so AtMostOneCASWinner is unaffected; a 3-party dual-belief scenario     *)
-(* needs two simultaneously-stale ex-leaders and is only partially         *)
-(* covered), and a third leadership handoff. See the .cfg for the full     *)
-(* coverage-vs-cost argument and the non-vacuity evidence.                 *)
+(* skew <= MaxSkew ticks, no host suspend, no Lease-object deletion, over  *)
+(* a bounded state space of 2 nodes and ~2 leadership cycles (1.47M        *)
+(* distinct states). The bounds exclude: 3-party races (any k-party CAS    *)
+(* race contains a 2-party prefix, so AtMostOneCASWinner is unaffected; a  *)
+(* 3-party dual-belief scenario needs two simultaneously-stale ex-leaders  *)
+(* and is only partially covered), and a third leadership handoff. See     *)
+(* the .cfg for the full coverage-vs-cost argument and the non-vacuity     *)
+(* evidence.                                                               *)
 (*                                                                         *)
 (* INVARIANTS, and which half of sched.lease.at-most-one-leader+2 each     *)
 (* verifies:                                                               *)
@@ -46,25 +50,33 @@
 (* TODO above LEASE_TTL in rio-lease/src/lib.rs.                           *)
 (*                                                                         *)
 (* StaleLeaderHasStaleGeneration -- the bridge to                          *)
-(* sched.lease.generation-fence: when the dual-belief window is open, the  *)
-(* executor must be able to tell the replicas apart by generation.         *)
-(* FALSIFIED at depth 12; committed disabled in the .cfg. See the KNOWN    *)
-(* COUNTEREXAMPLE block at the invariant definition for the trace, the     *)
-(* protocol-level diagnosis (the acquire-to-Persist window leaves PG's     *)
-(* high-water stale), and the candidate fixes.                             *)
+(* sched.lease.generation-fence+2: when the dual-belief window is open,    *)
+(* the executor must be able to tell the replicas apart by generation.     *)
+(* HOLDS over the full state space now that the generation derives from    *)
+(* the lease's transition count and is claimed in PG at acquisition time.  *)
+(* The pre-fix protocol (in-memory fetch_add seeded from a lazily-written  *)
+(* PG high-water mark) falsified it at depth 12; the weakened test         *)
+(* (revert Steal's derivation, move the genHW update back to a             *)
+(* dispatch-time Persist action) still reproduces that counterexample.     *)
+(* See the FIXED block at the invariant definition.                        *)
 (*                                                                         *)
 (* ACTION <-> CODE CORRESPONDENCE (rio-lease/src/{lib,election}.rs):       *)
 (*   Tick        clock advance; CLOCK_MONOTONIC ticks regardless of state  *)
 (*   Get         try_acquire_or_renew()'s GET + decide()'s ObservedUpdate  *)
-(*   Steal       decide()->Steal + replace(steal) + on_acquire() +         *)
-(*               seed_generation_from() collapsed into one atomic step     *)
-(*               (sound: recovery_complete gates dispatch until the seed)  *)
+(*   Steal       decide()->Steal + replace(steal) + on_acquire(trans) +    *)
+(*               seed_generation_from() + claim_generation() collapsed     *)
+(*               into one atomic step (sound: recovery_complete gates      *)
+(*               dispatch until the seed AND the claim have both run)      *)
 (*   RenewLease  decide()->Renew + replace(renew) (named to avoid the      *)
-(*               Renew constant)                                           *)
+(*               Renew constant); a same-epoch re-acquire retains its      *)
+(*               generation and its claim row -- modeled by omission       *)
 (*   Conflict    the 409 path; collapses 409-on-renew (lose) and           *)
 (*               409-on-steal (never led) -- both reset the fence clock    *)
 (*               and end Following                                         *)
-(*   Persist     the first dispatch-time PG write of the new generation    *)
+(*   (Persist    REMOVED -- the write-ahead claim advances the PG floor    *)
+(*               inside Steal; the lazy dispatch-time persist no longer    *)
+(*               affects the floor abstraction. See the note at its old    *)
+(*               definition site.)                                         *)
 (*   SelfFence   maybe_self_fence(); may fire any time past the deadline   *)
 (*               (a superset of the production every-RENEW_INTERVAL        *)
 (*               schedule -- sound for safety)                             *)
@@ -74,8 +86,11 @@
 (* PHASE-2 DEFERRALS: liveness (eventually-some-leader needs an unbounded  *)
 (* clock, which TLC cannot check -- the temporal form stutters one tick    *)
 (* short of the fence deadline forever); NoDualDispatch (the worker-side   *)
-(* model that takes StaleLeaderHasStaleGeneration as an ASSUME -- blocked  *)
-(* on fixing the generation collision first); asymmetric TTLs (if the      *)
+(* model that takes StaleLeaderHasStaleGeneration as an ASSUME -- now      *)
+(* unblocked); DeleteLease (the operator-resets-the-epoch-source fault     *)
+(* that re-arms the transition-count derivation's failure mode and is      *)
+(* closed by the write-ahead claim -- needs its own cfg and a fourth       *)
+(* BoundedDualLeadership discovery disjunct); asymmetric TTLs (if the      *)
 (* lib.rs TODO lands, StealTtl splits from FenceTtl and the 2*MaxSkew      *)
 (* penalty in BoundedDualLeadership shrinks).                              *)
 (***************************************************************************)
@@ -237,65 +252,49 @@ BoundedDualLeadership ==
                   \/ snap[stale].holder /= stale
 
 \* -----------------------------------------------------------------------
-\* The bridge to sched.lease.generation-fence. When the dual-belief window
-\* is open, the executor's generation fence has to be able to tell the
-\* replicas apart -- the fresh leader's generation must be strictly
+\* The bridge to sched.lease.generation-fence+2. When the dual-belief
+\* window is open, the executor's generation fence has to be able to tell
+\* the replicas apart -- the fresh leader's generation must be strictly
 \* greater than the stale believer's. The production mechanism is
-\* on_acquire()'s fetch_add(1) seeded from PG's generation high-water mark
-\* (seed_generation_from(), r[sched.recovery.fetch-max-seed]); the model
-\* collapses both into Steal(n)'s max(gen[n]+1, genHW+1).
+\* on_acquire(transitions)'s fetch_max(leaseTransitions + 1) plus the
+\* write-ahead claim (sched.lease.generation-claim); the model encodes
+\* both in Steal(n): gen[n]' = max(gen[n], lease.gen+2, genHW+1) and
+\* genHW' = that same value.
 \*
-\* KNOWN COUNTEREXAMPLE -- this invariant is FALSIFIED by the model at
-\* depth 12 (disabled in the .cfg so CI stays green; the definition is
-\* kept so the fix can re-enable it). The trace, in protocol terms:
+\* FIXED -- this invariant was FALSIFIED at depth 12 by the pre-fix
+\* protocol (an in-memory fetch_add(1) seeded from a PG high-water mark
+\* that only advanced at first dispatch). The counterexample: n1 steals
+\* the empty lease (gen 2, seeded from genHW=0), is deposed before its
+\* first dispatch-time PG write, n2 observes the staleness and steals,
+\* seeding from the SAME genHW=0 -- both Leading at gen 2, and the
+\* executor fence cannot tell their WorkAssignments apart. The window
+\* between acquiring a generation and durably recording it was the hole.
 \*
-\*   1-3.  n1 GETs the empty lease (rv=0).
-\*   4.    n1 Steals: gen[n1] = max(1+1, 0+1) = 2, lease = (n1, rv=1,
-\*         lease.gen=1), genHW STAYS 0 -- n1 has not yet persisted.
-\*   5.    n2 GETs, sees (n1, rv=1), starts observing rv=1 at its clock.
-\*   6-11. Clocks tick. n1 never Persists (in production: the leader is
-\*         still inside recovery, or has no dispatch traffic -- anything
-\*         that delays the first PG write of the new generation). n1
-\*         never RenewLeases either (partitioned from the apiserver
-\*         after the acquire: its snapshot was spent by the Steal and it
-\*         never completes another GET). n1's rv=1 therefore never
-\*         changes.
-\*   12.   n2's observed rv=1 has been stale for 4 > Ttl=3 on its clock
-\*         -> Steal: gen[n2] = max(1+1, 0+1) = 2 -- genHW is STILL 0, so
-\*         n2 seeds from the same high-water n1 seeded from. Both n1 and
-\*         n2 are Leading with gen = 2. The generation fence cannot tell
-\*         them apart.
+\* Two protocol changes closed it, and the model encodes both:
+\*   (a) The generation derives from the lease's transition count
+\*       (lease.gen+2 in Steal's target) -- the apiserver bumps
+\*       leaseTransitions atomically with the holder change, so two
+\*       distinct holders can never derive the same generation from it.
+\*       In the counterexample trace, lease.gen was already 1 vs 2 while
+\*       the in-memory generations collided at 2 vs 2.
+\*   (b) The write-ahead claim (genHW' advances in Steal itself) -- the
+\*       generation is durably recorded in PG before dispatch is ungated,
+\*       so a successor's seed always exceeds every generation ever
+\*       handed to dispatch, even one whose holder never dispatched
+\*       anything.
+\* Either change alone closes THIS counterexample; (b) is what survives
+\* Lease-object deletion (which resets lease.gen to 0 and re-arms the (a)
+\* mechanism's failure mode). Deletion is outside this model's fault set
+\* -- there is no DeleteLease action -- and is addressed by a follow-up
+\* model extension; the claim encoding it needs is already here.
 \*
-\* Protocol-level diagnosis: the window between acquire (seed the
-\* in-memory generation from PG's high-water mark) and the first Persist
-\* (write the new generation back to PG) is real. A leader deposed inside
-\* that window leaves genHW unchanged, and the thief seeds from the same
-\* value. r[sched.recovery.fetch-max-seed] protects against a CRASHED
-\* leader reusing an old generation; it does not protect against a
-\* DEPOSED-BEFORE-PERSISTING leader colliding with its successor.
-\*
-\* What this means for r[sched.lease.generation-fence]: in this
-\* interleaving the executor cannot distinguish the stale leader's
-\* WorkAssignments from the fresh leader's by generation alone. The
-\* existing fallback argument in that rule's text (the PG writes are
-\* idempotent upserts keyed by drv_hash with monotone status transitions)
-\* still applies -- the collision makes the fence ineffective, not the
-\* system incorrect. But the fence is the *stated* mechanism for
-\* executor-side staleness detection, and this shows it has a hole.
-\*
-\* Candidate fixes (a protocol design decision, not a model decision):
-\*   (a) Derive the generation from the lease's lease_transitions: the
-\*       apiserver bumps it atomically with the holder change, so there
-\*       is no persist window at all. (The model's lease.gen already
-\*       tracks this -- note lease.gen IS distinct across the two
-\*       acquisitions in the trace above: n1 acquired at lease.gen=1,
-\*       n2 at lease.gen=2.)
-\*   (b) Make the generation persist part of the acquire critical
-\*       section: block dispatch until the new generation is durably in
-\*       PG. recovery_complete almost does this, but the persist has to
-\*       happen-before the first generation-stamped WorkAssignment, not
-\*       just before recovery completes.
-\*   (c) Accept the gap: rely on the idempotent-PG-writes argument.
+\* The invariant is ENABLED in the .cfg and holds over the full state
+\* space. The deliberately-weakened test (run once during development,
+\* NOT in CI): reverting Steal's derivation to the pre-fix
+\* max(gen[n]+1, genHW+1) AND moving the genHW update back out of Steal
+\* into a separate dispatch-time Persist action reproduces the depth-12
+\* counterexample. That proves the encoding change is what makes the
+\* invariant pass, not an accident of the surrounding edits.
 \* -----------------------------------------------------------------------
 StaleLeaderHasStaleGeneration ==
   \A m, n \in Nodes :
@@ -385,12 +384,30 @@ ReplaceGuard(n) ==
        alive[m] /\ state[m] = "Leading" /\ acquiredAt[m] = snap[n].rv)
 
 \* The decide()->Steal path. Phase-1 expansion: empty-holder OR stale-observed
-\* (the deposed-leader path the spike could not reach). gen[n] is set per
-\* on_acquire() + seed_generation_from() collapsed: the in-memory fetch_add(1)
-\* AND the PG fetch_max happen before recovery_complete=true, so the model
-\* treats them as one atomic step. r[sched.recovery.fetch-max-seed].
+\* (the deposed-leader path the spike could not reach). gen[n] and genHW are
+\* set per on_acquire(transitions) + seed_generation_from() +
+\* claim_generation() collapsed: all three run before recovery_complete=true
+\* gates dispatch, so the model treats acquire/seed/claim as one atomic
+\* step. r[sched.recovery.fetch-max-seed+2].
+\*
+\* The generation derives from the lease's POST-BUMP transition count: the
+\* PUT writes lease.gen+1 (= leaseTransitions after the holder change), and
+\* on_acquire() fetch_max'es (lease.gen+1)+1 = lease.gen+2 into the atomic
+\* (r[sched.lease.generation-fence+2] -- the apiserver bumps the count
+\* atomically with the holder change inside the rv-guarded PUT, so two
+\* distinct holders can never derive the same value from it). The PG floor
+\* contributes genHW+1 (seed_generation_from). Both are fetch_max against
+\* the atomic's current value gen[n] -- nothing unconditionally increments.
+\*
+\* genHW' is the write-ahead claim (sched.lease.generation-claim): the
+\* generation is durably recorded in PG's claims ledger before dispatch is
+\* ungated, so the floor advances at acquisition time. There is no
+\* acquire-to-persist window for a deposed leader to die inside -- the
+\* window the pre-fix counterexample exploited (see the FIXED note at
+\* StaleLeaderHasStaleGeneration).
 Steal(n) ==
-  LET seeded == IF gen[n] + 1 > genHW + 1 THEN gen[n] + 1 ELSE genHW + 1 IN
+  LET target == IF lease.gen + 2 > genHW + 1 THEN lease.gen + 2 ELSE genHW + 1
+      seeded == IF gen[n] > target THEN gen[n] ELSE target IN
   /\ alive[n]
   /\ snap[n] /= NULL
   /\ \/ snap[n].holder = NULL
@@ -409,15 +426,32 @@ Steal(n) ==
   /\ lease' = [holder |-> n, rv |-> snap[n].rv + 1, gen |-> lease.gen + 1]
   /\ state' = [state EXCEPT ![n] = "Leading"]
   /\ gen'   = [gen EXCEPT ![n] = seeded]
+  \* The claim: fetch_max in shape, though seeded >= genHW+1 always holds
+  \* here (target's ELSE arm is genHW+1 and seeded >= target).
+  /\ genHW' = IF seeded > genHW THEN seeded ELSE genHW
   /\ acquiredAt' = [acquiredAt EXCEPT ![n] = snap[n].rv]
   /\ fence' = [fence EXCEPT ![n] = clocks[n]]
   /\ obs'   = [obs   EXCEPT ![n] = NULL]      \* on_acquire clears observed
   /\ snap'  = [snap  EXCEPT ![n] = NULL]      \* spent the snapshot
-  /\ UNCHANGED <<clocks, alive, genHW>>
+  /\ UNCHANGED <<clocks, alive>>
 
 \* The decide()->Renew path: we hold the lease, refresh renew_time. Bumps rv
 \* (the apiserver bumps on every write); does NOT touch holder/gen.
 \* Named RenewLease (not Renew) -- the constant Renew is RENEW_INTERVAL.
+\*
+\* The idempotent self re-claim (sched.lease.generation-claim's "retain own
+\* epoch" clause) maps HERE, by omission: a self-fence false alarm followed
+\* by a successful renew is a re-acquisition of the SAME epoch (the holder
+\* did not change, leaseTransitions did not move), and the code's claim
+\* path finds its own row at its own generation and retains it. The model
+\* encodes that as RenewLease leaving gen and genHW unchanged. The
+\* "bump past a foreign claim" branch is Steal's genHW+1 arm. Known
+\* under-approximation: RenewLease does not restore state[n] to "Leading"
+\* after a SelfFence false alarm (production's acquire edge does). That
+\* path requires lease.holder = n, which precludes any other node holding
+\* the lease -- so the states it would add are sole-leader states already
+\* reachable via Steal, and no dual-belief state (the only states the
+\* generation invariant constrains) is missed.
 RenewLease(n) ==
   /\ alive[n]
   /\ snap[n] /= NULL /\ snap[n].holder = n
@@ -439,17 +473,19 @@ Conflict(n) ==
   /\ snap'  = [snap  EXCEPT ![n] = NULL]
   /\ UNCHANGED <<clocks, lease, alive, obs, gen, genHW, acquiredAt, casRace>>
 
-\* Persist the in-memory generation to PG. The production leader writes its
-\* generation during dispatch (after recovery_complete=true). The window
-\* between Steal(n) and Persist(n) is real -- a leader that crashes in it
-\* leaves genHW stale, and the next acquirer seeds from the old high-water.
-\* That's the genuinely-untested interleaving Phase-1 reaches.
-Persist(n) ==
-  /\ alive[n]
-  /\ state[n] = "Leading"
-  /\ gen[n] > genHW
-  /\ genHW' = gen[n]
-  /\ UNCHANGED <<clocks, lease, alive, state, snap, obs, fence, gen, acquiredAt, casRace>>
+\* Persist(n) -- REMOVED. It modeled the lazy dispatch-time PG write of the
+\* new generation (genHW' = gen[n] once the leader started dispatching);
+\* the acquire-to-Persist window was exactly what the pre-fix
+\* counterexample exploited. The write-ahead claim moves the genHW update
+\* into Steal(n) itself, which makes Persist's precondition
+\* (gen[n] > genHW for an alive Leading node) unreachable: every Steal
+\* establishes gen[n] = genHW = seeded, and only another node's later
+\* Steal can change either. A never-enabled action in Next is misleading
+\* -- it would suggest the persist window still exists -- so the action is
+\* gone rather than kept as a no-op. Production still writes assignment
+\* rows at dispatch time, but that write no longer affects the PG floor
+\* abstraction (the floor is GREATEST(assignments, claims) and the claims
+\* arm already holds every generation ever acquired).
 
 \* -----------------------------------------------------------------------
 \* Fault model. SelfFence is the production maybe_self_fence(); Crash and
@@ -501,7 +537,6 @@ Next == \E n \in Nodes :
   \/ Steal(n)
   \/ RenewLease(n)
   \/ Conflict(n)
-  \/ Persist(n)
   \/ SelfFence(n)
   \/ Crash(n)
   \/ Recover(n)

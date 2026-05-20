@@ -112,13 +112,19 @@ in
     # object. The Phase-1 model has per-node clocks (bounded skew), the
     # observed-record staleness clock, local self-fencing, and
     # crash/recovery. It verifies AtMostOneCASWinner (the apiserver
-    # admits at most one writer per resourceVersion) and
+    # admits at most one writer per resourceVersion),
     # BoundedDualLeadership (every dual-belief state has a discovery
-    # mechanism armed). StaleLeaderHasStaleGeneration is FALSIFIED and
-    # committed disabled -- see the KNOWN COUNTEREXAMPLE block in the
-    # model. The fetch-max-seed marker covers the gen seeding the model
-    # encodes (Steal's max(gen+1, genHW+1)), not the falsified bridge
-    # invariant.
+    # mechanism armed), and StaleLeaderHasStaleGeneration (concurrent
+    # believers always have distinct generations -- the bridge to the
+    # executor-side generation fence). The third invariant is what the
+    # pre-fix protocol falsified at depth 12; it holds now that Steal
+    # derives the generation from the lease's transition count
+    # (lease.gen+2) and claims it in PG at acquisition time (genHW
+    # advances inside Steal, not in a separate dispatch-time Persist).
+    # The fetch-max-seed marker covers that seeding-and-claiming
+    # encoding. Lease-object deletion is outside this model's fault set;
+    # the DeleteLease extension and the generation-claim verify marker
+    # land with it.
     # r[verify sched.lease.at-most-one-leader+2]
     # r[verify sched.lease.k8s-lease]
     # r[verify sched.recovery.fetch-max-seed+2]
