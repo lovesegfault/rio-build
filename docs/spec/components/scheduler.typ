@@ -228,16 +228,17 @@ user cancel, per-build wall-clock timeout, fail-fast, top-down substitute
 fail) --- each of which implies the worker ran the build. The
 not-yet-dispatched arms of the same cancel sweep (`Queued`/`Ready`/`Created` →
 `DependencyFailed`, `Substituting` → `Cancelled`) call the chokepoint only
-when `exec_id_for_terminal` resolves --- i.e. when a prior execution was
-reset and left a stamped log buffer; the never-dispatched majority skip it.
+when a prior execution was reset and left a stamped log buffer
+(`has_buffered_exec_log`); the never-dispatched majority skip it.
 Recovery's
 `adopt_orphan_completion` calls `record_exec_correlation` directly (the
 disconnected worker's log is already lost; only the correlation can be
-reconstructed from `assignments.exec_id`). The actual gate is
-`exec_id_for_terminal`, which reads `state.exec_id` (set by
+reconstructed from `assignments.exec_id`). Inside the epilogue, the carrier
+resolution is `exec_id_for_terminal`, which reads `state.exec_id` (set by
 `assign_to_worker`, recoverable from `assignments.exec_id` after a leader
-failover for a currently-assigned derivation; a reset drv's clear is
-preserved across failover) and falls back to the `LogBuffers` ring-buffer entry's stamped
+failover for a currently-assigned derivation, dropped by `transition()`
+when the node is reset out of a terminal) and falls back to the
+`LogBuffers` ring-buffer entry's stamped
 `exec_id` --- covering poison-while-Ready, where `reset_to_ready` clears
 `state.exec_id` but the buffer entry retains the disconnected execution's
 stamp through the disconnect→re-dispatch window. The helper no-ops only

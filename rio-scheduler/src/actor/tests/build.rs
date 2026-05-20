@@ -1186,3 +1186,127 @@ async fn cancel_reset_drv_finalizes_prior_exec_log(
     );
     Ok(())
 }
+
+/// A drv that went terminal (its execution finalized: buffer drained,
+/// `bd.exec_id` written for the builds that observed it) and was then
+/// reset out of that terminal — I-094 reprobe (`Poisoned →
+/// Substituting`/`Queued`), I-047 stale-output reset (`Completed →
+/// Ready`) — retains the finalized execution's `state.exec_id` but has
+/// NO LogBuffers entry. Cancelling the resubmitting build before
+/// re-dispatch lands it in the `to_depfail`/`to_cancel_substituting`
+/// arm; the finalization gate MUST NOT fire: there is nothing left to
+/// finalize, and running the epilogue would durably write `bd.exec_id`
+/// for an execution this build never observed (suppressing the
+/// dashboard's "approximate" banner) plus enqueue a FlushRequest that
+/// `flush_final`'s staleness guard immediately drops.
+///
+/// Counterpart to `cancel_reset_drv_finalizes_prior_exec_log`, which
+/// pins the inverse shape (`state.exec_id: None`, buffer PRESENT →
+/// gate fires). Together they pin the gate to the LogBuffers carrier.
+///
+/// The stale `state.exec_id` is set directly on the DAG node, NOT via
+/// `RecoveryDerivationRow.exec_id` — that field's recovery semantics
+/// are scoped to currently-assigned drvs and the fixture must model
+/// "stale by any means", not one specific writer.
+///
+/// r[verify sched.merge.exec-correlation+4]
+#[rstest::rstest]
+#[case::substituting(DerivationStatus::Substituting, DerivationStatus::Cancelled)]
+#[case::ready(DerivationStatus::Ready, DerivationStatus::DependencyFailed)]
+#[tokio::test]
+async fn cancel_reprobed_drv_skips_finalized_exec(
+    #[case] from_status: DerivationStatus,
+    #[case] expected_terminal: DerivationStatus,
+) -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    let derivation_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO derivations (drv_hash, drv_path, pname, system, status) \
+         VALUES ($1, $2, 'pkg', 'x86_64-linux', 'ready') \
+         RETURNING derivation_id",
+    )
+    .bind("rpb-drv")
+    .bind(test_drv_path("rpb-drv"))
+    .fetch_one(&db.pool)
+    .await?;
+    let build_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO builds (build_id, status) VALUES ($1, 'active')")
+        .bind(build_id)
+        .execute(&db.pool)
+        .await?;
+    // bd row: fixture realism (an interested build always has one) and
+    // FK target for cancel_build_derivations' status writes. NOT read
+    // back by this test — see assertion (1)'s comment.
+    sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+        .bind(build_id)
+        .bind(derivation_id)
+        .execute(&db.pool)
+        .await?;
+
+    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(8);
+    let mut actor = DagActor::new(
+        SchedulerDb::new(db.pool.clone()),
+        DagActorConfig::default(),
+        DagActorPlumbing {
+            log_buffers: Some(log_buffers.clone()),
+            log_flush_tx: Some(flush_tx),
+            ..Default::default()
+        },
+    );
+
+    // The reprobed drv: stale `state.exec_id` from the finalized prior
+    // execution, NO LogBuffers entry (flush_final drained it at the
+    // prior terminal). Single drv in this test — no drv_log_hash
+    // aliasing risk (LogBuffers keys on the store-path hash component,
+    // which `test_drv_path` stamps identically for every name).
+    let stale_exec = uuid::Uuid::now_v7();
+    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+        derivation_id,
+        ..crate::db::RecoveryDerivationRow::test_default("rpb-drv", "x86_64-linux")
+    });
+    {
+        let s = actor.dag.node_mut("rpb-drv").expect("just injected");
+        s.set_status_for_test(from_status);
+        s.exec_id = Some(stale_exec);
+        s.interested_builds.insert(build_id);
+    }
+    let drv_path = test_drv_path("rpb-drv");
+    assert_eq!(
+        log_buffers.exec_id(&drv_path),
+        None,
+        "precondition: the prior execution's buffer was already drained"
+    );
+
+    actor
+        .cancel_build_derivations(build_id, "test cancel")
+        .await;
+
+    // (1) No FlushRequest — there is no buffer to finalize, and a
+    // request pinning the stale exec would be dropped by flush_final's
+    // staleness guard anyway. THIS IS THE LOAD-BEARING ASSERTION for
+    // the durable damage too: trigger_log_flush and
+    // record_exec_correlation are both unconditionally inside the same
+    // gated terminal_log_epilogue call, so "no FlushRequest" proves the
+    // bd.exec_id UPDATE was never issued. (A direct SELECT for
+    // bd.exec_id IS NULL would need a flat sleep to wait out the
+    // spawned UPDATE — a negative proven by sleeping can only
+    // false-pass under load, so it is deliberately omitted.)
+    assert!(
+        flush_rx.try_recv().is_err(),
+        "cancel of a reprobed drv with no retained buffer must not \
+         enqueue a FlushRequest for the already-finalized execution"
+    );
+    // (2) No seal tombstone for a buffer that doesn't exist.
+    assert!(
+        !log_buffers.is_sealed(&drv_path),
+        "no seal tombstone may be left for a drv with no buffer entry"
+    );
+    // (3) The transition itself still happens — skipping the epilogue
+    // must not skip the terminal.
+    assert_eq!(
+        actor.dag.node("rpb-drv").expect("still in DAG").status(),
+        expected_terminal
+    );
+    Ok(())
+}

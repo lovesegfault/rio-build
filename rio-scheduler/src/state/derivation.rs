@@ -777,7 +777,11 @@ pub struct DerivationState {
     /// `reset_to_ready` (worker disconnect, phantom drain, orphan
     /// reconcile, infra/timeout retry below cap, and `rollback_assignment` —
     /// that last one ALSO discards the `LogBuffers` entry, so neither
-    /// carrier survives a failed dispatch). Readers in `trigger_log_flush` and
+    /// carrier survives a failed dispatch) and by `transition()` on any
+    /// terminal → non-terminal reset (I-094 reprobe, I-047 stale-output
+    /// reset — the prior execution was already finalized at its
+    /// terminal and must not be attributed to the node's next
+    /// lifecycle). Readers in `trigger_log_flush` and
     /// `record_exec_correlation` (`actor/event.rs::exec_id_for_terminal`)
     /// can run between a `reset_to_ready` and the next `assign_to_worker`
     /// when a poison-while-Ready path (I-065 fleet exhaustion,
@@ -1273,6 +1277,24 @@ impl DerivationState {
             self.running_since = Some(Instant::now());
         } else if from == DerivationStatus::Running {
             self.running_since = None;
+        }
+        // r[impl sched.merge.exec-correlation+4]
+        // A node leaving a terminal state (I-094 reprobe → Substituting/
+        // Queued, I-047 stale-output reset → Ready/Queued) is starting a
+        // fresh lifecycle. The terminal's epilogue already finalized the
+        // prior execution's log and bd.exec_id correlation; carrying its
+        // exec_id forward makes `exec_id_for_terminal` attribute that
+        // finalized execution to whatever build next terminates the
+        // reset node — a build that never observed it. Same contract as
+        // `reset_to_ready`'s clear, applied at the chokepoint every
+        // terminal-exit carve-out goes through (including the currently
+        // uncalled Poisoned → Created one). The LogBuffers entry is
+        // deliberately NOT touched: for a finalized execution it is
+        // already gone (flush_final's drain), and for the
+        // substitute-success known gap (un-finalized buffer on a reset
+        // node) it must survive as the fallback carrier.
+        if from.is_terminal() && !to.is_terminal() {
+            self.exec_id = None;
         }
 
         Ok(from)
@@ -1799,6 +1821,68 @@ mod tests {
             !state.ca.output_unchanged,
             "recovery MUST reset ca_output_unchanged to false (NOT persisted — \
              compare result from a prior scheduler instance is stale)"
+        );
+    }
+
+    // r[verify sched.merge.exec-correlation+4]
+    /// A terminal state's execution was finalized by that terminal's
+    /// epilogue. Every terminal → non-terminal reset carve-out in
+    /// `validate_transition` must drop the finalized execution's `exec_id`
+    /// so `exec_id_for_terminal` cannot attribute it to the node's next
+    /// lifecycle. Non-terminal → terminal must NOT clear: the epilogue runs
+    /// after the transition and still needs the carrier.
+    #[test]
+    fn transition_out_of_terminal_clears_exec_id() {
+        use DerivationStatus::*;
+        let mk = |status: DerivationStatus| {
+            let mut s = DerivationState::from_recovery_row(
+                crate::db::RecoveryDerivationRow::test_default("exid", "x86_64-linux"),
+                Ready,
+            )
+            .unwrap();
+            s.set_status_for_test(status);
+            s.exec_id = Some(uuid::Uuid::now_v7());
+            s
+        };
+        // The terminal-exit reset carve-outs (validate_transition), both
+        // source halves of each. (Poisoned, Created) is a valid carve-out
+        // with no live production caller (the poison-TTL sweep removes the
+        // node instead of transitioning it) — pinned anyway because the
+        // predicate is on terminality, not on the lane.
+        for (from, to) in [
+            (Poisoned, Substituting),         // I-094 substitutable reprobe
+            (DependencyFailed, Substituting), // I-094 substitutable reprobe
+            (Poisoned, Queued),               // I-094 deferred reprobe
+            (DependencyFailed, Queued),       // I-094 deferred reprobe
+            (Completed, Ready),               // I-047 stale-output reset
+            (Skipped, Queued),                // I-047 stale-output reset
+            (Poisoned, Created),              // carve-out only, no live caller
+        ] {
+            let mut s = mk(from);
+            s.transition(to)
+                .unwrap_or_else(|e| panic!("{from:?}→{to:?}: {e}"));
+            assert_eq!(
+                s.exec_id, None,
+                "{from:?}→{to:?} must clear the finalized execution's exec_id"
+            );
+        }
+        // Entering a terminal keeps the carrier — the epilogue reads it
+        // after the transition.
+        let mut s = mk(Running);
+        let kept = s.exec_id;
+        s.transition(Cancelled).unwrap();
+        assert_eq!(
+            s.exec_id, kept,
+            "Running→Cancelled must keep exec_id for the epilogue"
+        );
+        // Terminal → terminal (I-094 reprobe cache-hit) keeps it too — the
+        // guard is specifically about *leaving* terminality.
+        let mut s = mk(Poisoned);
+        let kept = s.exec_id;
+        s.transition(Completed).unwrap();
+        assert_eq!(
+            s.exec_id, kept,
+            "Poisoned→Completed is not a lifecycle reset"
         );
     }
 

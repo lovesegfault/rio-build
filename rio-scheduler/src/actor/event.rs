@@ -490,7 +490,10 @@ impl DagActor {
     /// derivation never reached a worker (cached terminal,
     /// never-dispatched poison, cascaded `DependencyFailed`, or the
     /// assignment never landed: `rollback_assignment` discarded the
-    /// buffer before any push).
+    /// buffer before any push), or the prior execution was already
+    /// finalized at an earlier terminal and the node was reset out of
+    /// it (I-094 reprobe / I-047 stale-output reset — `transition()`
+    /// drops the carrier on terminal-exit).
     pub(super) fn exec_id_for_terminal(
         &self,
         state: &crate::state::DerivationState,
@@ -500,6 +503,41 @@ impl DagActor {
                 .as_ref()
                 .and_then(|b| b.exec_id(state.drv_path().as_str()))
         })
+    }
+
+    /// Whether `state` has a retained, un-finalized execution log — a
+    /// `LogBuffers` ring-buffer entry stamped by a prior
+    /// `assign_to_worker` that no terminal epilogue has drained yet.
+    ///
+    /// This is the gate for the not-yet-dispatched cancel arms
+    /// (`to_cancel_substituting` / `to_depfail`): they run the
+    /// finalization epilogue ONLY when a reset drv's prior execution
+    /// would otherwise linger at `is_complete=false` for the 30-day TTL.
+    /// Deliberately NOT [`Self::exec_id_for_terminal`]: `state.exec_id`
+    /// answers "which execution do I attribute this terminal to", not
+    /// "is there an un-finalized log" — it can be `Some` long after the
+    /// execution's log was finalized (a recovery restamp from a leaked
+    /// `assignments` row; historically also the terminal-exit reset
+    /// lanes, now cleared by `transition()`). Firing the epilogue on
+    /// that stale carrier records `bd.exec_id` for an execution this
+    /// build never observed and enqueues a `FlushRequest` that
+    /// `flush_final`'s staleness guard immediately drops.
+    ///
+    /// Known residual (conscious choice): in the window between a
+    /// terminal's `trigger_log_flush` and the flusher's `drain()`, the
+    /// buffer still exists (sealed) and this returns `true` — a
+    /// reprobe-then-cancel landing inside that window still over-fires.
+    /// Requires two actor commands to be processed before a background
+    /// mpsc consumer runs once. An `&& !is_sealed(..)` term would close
+    /// it without breaking the legitimate shapes (neither
+    /// `reset_to_ready` nor the transient-retry window seals); not
+    /// added because no test can deterministically exercise the window.
+    /// r[impl sched.merge.exec-correlation+4]
+    pub(super) fn has_buffered_exec_log(&self, state: &crate::state::DerivationState) -> bool {
+        self.log_buffers
+            .as_ref()
+            .and_then(|b| b.exec_id(state.drv_path().as_str()))
+            .is_some()
     }
 
     /// Fire a log-flush request for the given derivation. No-op if the
@@ -648,7 +686,7 @@ impl DagActor {
     ///   fail-fast, top-down substitute fail)
     /// - `cancel_build_derivations` (`to_cancel_substituting` and
     ///   `to_depfail` arms) — `"cancelled"`, gated on
-    ///   [`Self::exec_id_for_terminal`]: a `Ready`/`Substituting` drv
+    ///   [`Self::has_buffered_exec_log`]: a `Ready`/`Substituting` drv
     ///   that went through `reset_to_ready()` retains a `LogBuffers`
     ///   entry stamped with the prior (reset) execution's `exec_id` —
     ///   that execution's `.partial` row must be finalized here or it

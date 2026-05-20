@@ -138,7 +138,7 @@ impl DagActor {
             // "approximate" banner for a log that was streamed).
             //
             // The `to_cancel_substituting` and `to_depfail` arms below
-            // call this too, gated on `exec_id_for_terminal`: most of
+            // call this too, gated on `has_buffered_exec_log`: most of
             // those drvs never dispatched (no exec_id, no buffer — the
             // call would only warn-spam trigger_log_flush), but a
             // Ready/Substituting drv that went through reset_to_ready()
@@ -189,11 +189,16 @@ impl DagActor {
             {
                 // Finalize the prior (reset) execution's log if one is
                 // still buffered — see the to_cancel arm's comment.
+                // Gates on the LogBuffers carrier, not state.exec_id: a
+                // stale exec_id (recovery restamp; pre-fix, the I-094/
+                // I-047 terminal-exit resets) would attribute an
+                // already-finalized execution to a build that never
+                // observed it. See `has_buffered_exec_log`.
                 // r[impl sched.merge.exec-correlation+4]
                 if self
                     .dag
                     .node(drv_hash)
-                    .is_some_and(|s| self.exec_id_for_terminal(s).is_some())
+                    .is_some_and(|s| self.has_buffered_exec_log(s))
                 {
                     self.terminal_log_epilogue(drv_hash, "cancelled", &[build_id]);
                 }
@@ -231,7 +236,9 @@ impl DagActor {
             {
                 self.ready_queue.remove(drv_hash);
                 // Finalize the prior (reset) execution's log if one is
-                // still buffered — see the to_cancel arm's comment.
+                // still buffered — see the to_cancel arm's comment and
+                // `has_buffered_exec_log` for why the gate is the
+                // LogBuffers carrier rather than state.exec_id.
                 // status="cancelled" even though this drv's terminal is
                 // DependencyFailed: the column records the scheduler's
                 // disposition of the *log* (the build went away), not
@@ -241,7 +248,7 @@ impl DagActor {
                 if self
                     .dag
                     .node(drv_hash)
-                    .is_some_and(|s| self.exec_id_for_terminal(s).is_some())
+                    .is_some_and(|s| self.has_buffered_exec_log(s))
                 {
                     self.terminal_log_epilogue(drv_hash, "cancelled", &[build_id]);
                 }
