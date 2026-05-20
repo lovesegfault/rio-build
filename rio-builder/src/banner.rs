@@ -40,8 +40,9 @@ pub(crate) const HEADER_LINE_COUNT: u64 = 3;
 /// ```
 ///
 /// Absent-field rendering:
-/// - `hw_class` absent (non-k8s, annotator timeout, read error) →
-///   drop the `/{hw_class}` suffix.
+/// - `hw_class` absent (non-k8s, annotator timeout, read error, bench
+///   still running at first assignment) → drop the `/{hw_class}`
+///   suffix.
 /// - Sizing fields absent (`WorkAssignment.assigned_*` not set —
 ///   pre-ADR-023 path) → `?` for the missing component. Do NOT fall
 ///   back to cgroup limits — the cgroup clamp `ceil()`s fractional

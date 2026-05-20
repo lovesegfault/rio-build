@@ -315,8 +315,9 @@ pub async fn setup(
         // Empty (non-k8s / VM tests) → None: proto3 optional string
         // semantics — absent on the wire, scheduler reads "unknown hw".
         node_name: (!cfg.node_name.is_empty()).then(|| cfg.node_name.clone()),
-        // Populated lazily by `spawn_build_task` when it awaits
-        // `hw_bench` on the first assignment. Before then, `None` —
+        // Populated lazily by `spawn_build_task` when it bounded-awaits
+        // `hw_bench` on the first assignment (falls back to a background
+        // task if the bench is still running). Before then, `None` —
         // the documented "unknown hw" semantics.
         hw_class: Arc::new(std::sync::Mutex::new(None)),
         // Same Arc as the heartbeat loop (above) — completion reads

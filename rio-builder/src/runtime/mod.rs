@@ -225,11 +225,14 @@ impl BuildSpawnContext {
             cgroup_parent: self.cgroup_parent.clone(),
             executor_kind: self.executor_kind,
             systems: Arc::clone(&self.systems),
-            // Snapshot for the `rio:` banner header. Lazily populated by
-            // `hw_bench` on first assignment (resolve runs concurrently
-            // with FUSE mount); `None` until the annotator stamps the
-            // downward-API volume, in which case the banner drops the
-            // `/{hw_class}` suffix.
+            // Snapshot for the `rio:` banner header. `spawn_build_task`
+            // bounded-awaits the resolve→bench task and writes this cell
+            // BEFORE spawning the task that calls executor_env(), so the
+            // snapshot sees the resolved value whenever it was available
+            // at build start (bug_014). Still `None` when non-k8s, when
+            // the annotator never stamped the downward-API volume, or
+            // when the bench was still running at first-assignment time
+            // — the banner then drops the `/{hw_class}` suffix.
             hw_class: self
                 .hw_class
                 .lock()
@@ -240,6 +243,53 @@ impl BuildSpawnContext {
             cancelled,
         }
     }
+}
+
+/// How long the first assignment waits inline for the init-time
+/// resolve→bench task before falling back to a background harvest.
+///
+/// The wait orders the `ctx.hw_class` write before the `executor_env()`
+/// snapshot that feeds the banner's `rio: builder {system}/{hw_class}`
+/// line — a fire-and-forget producer racing a freshly-spawned consumer
+/// has no happens-before edge, and workers are one-shot so a lost race
+/// permanently drops the suffix from that pod's log (bug_014).
+///
+/// The latency distribution is bimodal: in steady state the
+/// resolve→bench task finished during the ~30s FUSE cold-start and its
+/// JoinHandle is already `Ready` — `timeout` returns `Ok` on the first
+/// poll at zero cost. If it is still running it has *seconds* of bench
+/// left (~5s alu ‖ ioseq, +~3s membw when `bench_needed`), so no small
+/// bound would catch it. The value therefore only caps the added
+/// latency on the fall-back path; it is not a "wait for the bench"
+/// knob. The build must never block on the bench.
+const HW_BENCH_INLINE_WAIT: Duration = Duration::from_millis(100);
+
+/// Publish a finished resolve→bench result into the shared `hw_class`
+/// cell and return the `(hw_class, factor)` pair to forward to
+/// `AppendHwPerfSample` (`None` when there is nothing to send).
+///
+/// The cell write is **synchronous** — visible to any reader of `cell`
+/// the moment this returns. `spawn_build_task` relies on that to order
+/// the write before the `executor_env()` banner snapshot in the
+/// completed-within-bound path. Empty `hw_class` → `None` (proto3
+/// optional semantics: "unknown hw"); a panicked bench task is logged
+/// and leaves the cell untouched.
+fn publish_hw_class(
+    joined: Result<(String, Option<crate::hw_bench::HwBenchResult>), tokio::task::JoinError>,
+    cell: &std::sync::Mutex<Option<String>>,
+) -> Option<(String, crate::hw_bench::HwBenchResult)> {
+    let (hw_class, factor) = match joined {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "hw_bench: resolve+bench task panicked");
+            return None;
+        }
+    };
+    // Publish hw_class for the banner snapshot, completion_stamp, and
+    // the panic handler. Empty → None.
+    *cell.lock().unwrap_or_else(|e| e.into_inner()) =
+        (!hw_class.is_empty()).then(|| hw_class.clone());
+    factor.map(|factor| (hw_class, factor))
 }
 
 /// Handle a WorkAssignment: ACK the scheduler, spawn the build task, set up
@@ -276,34 +326,61 @@ pub async fn spawn_build_task(
         return; // Guard drops, no build spawned.
     }
 
-    // ADR-023 phase-10: now that we have an assignment token, await the
-    // resolve→bench task (spawned at init, runs concurrently with FUSE
-    // mount; ≤30s resolve poll + ~5s CPU bench, long since done by the
-    // time the first assignment arrives). Populate `ctx.hw_class` for
-    // every later `CompletionReport` and fire the `AppendHwPerfSample`
-    // RPC. `take()` so this is one-shot. Best-effort fire-and-forget —
-    // the build does not block on it.
-    if let Some(bench) = ctx.hw_bench.lock().unwrap().take() {
-        let mut store = ctx.store_clients.store.clone();
-        let hw_class_cell = Arc::clone(&ctx.hw_class);
-        let pod_id = ctx.executor_id.clone();
-        let token = assignment_token.clone();
-        rio_common::task::spawn_monitored("hw-bench-send", async move {
-            let (hw_class, factor) = match bench.await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "hw_bench: resolve+bench task panicked");
-                    return;
+    // ADR-023 phase-10: now that we have an assignment token, harvest
+    // the resolve→bench task (spawned at init, runs concurrently with
+    // FUSE mount; normally long since done by the time the first
+    // assignment arrives). Populate `ctx.hw_class` for the banner
+    // header and every later `CompletionReport`, and fire the
+    // `AppendHwPerfSample` RPC. `take()` so this is one-shot.
+    //
+    // The bounded inline await orders the `ctx.hw_class` write before
+    // the `executor_env()` snapshot at the top of `executor_future`
+    // (spawned below) — see `HW_BENCH_INLINE_WAIT` for the race and
+    // the latency budget (bug_014). If the bench is genuinely still
+    // running, do NOT block the build on it: fall back to the
+    // background harvest — that pod's banner drops the `/{hw_class}`
+    // suffix (display-only, documented `None` cause) and
+    // `completion_stamp` re-reads the cell after the build, by which
+    // point the write has landed. The `AppendHwPerfSample` RPC is
+    // fire-and-forget on both paths: the network call is the part the
+    // build must never wait on.
+    //
+    // The take() is hoisted out of the `if let` scrutinee so the
+    // MutexGuard dies before the `.await` — edition-2024 scrutinee
+    // temporaries live through the then-block, and guards held across
+    // awaits aren't Send (same convention as the panic handler below).
+    let bench = ctx.hw_bench.lock().unwrap().take();
+    if let Some(mut bench) = bench {
+        match tokio::time::timeout(HW_BENCH_INLINE_WAIT, &mut bench).await {
+            Ok(joined) => {
+                // Result in hand: write the cell HERE, before
+                // `executor_future` exists, so the banner snapshot is
+                // sequenced after it. Only the RPC stays backgrounded.
+                if let Some((hw_class, factor)) = publish_hw_class(joined, &ctx.hw_class) {
+                    let mut store = ctx.store_clients.store.clone();
+                    let pod_id = ctx.executor_id.clone();
+                    let token = assignment_token.clone();
+                    rio_common::task::spawn_monitored("hw-bench-send", async move {
+                        crate::hw_bench::send(&mut store, &hw_class, &pod_id, factor, &token).await;
+                    });
                 }
-            };
-            // Publish hw_class for completion_stamp / panic handler.
-            // Empty → None (proto3 optional semantics: "unknown hw").
-            *hw_class_cell.lock().unwrap_or_else(|e| e.into_inner()) =
-                (!hw_class.is_empty()).then(|| hw_class.clone());
-            if let Some(factor) = factor {
-                crate::hw_bench::send(&mut store, &hw_class, &pod_id, factor, &token).await;
             }
-        });
+            Err(_elapsed) => {
+                // Bench still running. `&mut bench` left the handle
+                // un-consumed — move it into the background task and
+                // publish + send from there once it finishes.
+                let mut store = ctx.store_clients.store.clone();
+                let hw_class_cell = Arc::clone(&ctx.hw_class);
+                let pod_id = ctx.executor_id.clone();
+                let token = assignment_token.clone();
+                rio_common::task::spawn_monitored("hw-bench-send", async move {
+                    if let Some((hw_class, factor)) = publish_hw_class(bench.await, &hw_class_cell)
+                    {
+                        crate::hw_bench::send(&mut store, &hw_class, &pod_id, factor, &token).await;
+                    }
+                });
+            }
+        }
     }
 
     // Record the cgroup path on the slot. We know it deterministically:
@@ -1242,6 +1319,61 @@ mod tests {
     use super::*;
     use rio_proto::types::ExecutorRegister;
     use rstest::rstest;
+
+    /// bug_014 (helper truth table, happy shape): a resolved class with a
+    /// bench factor is stored in the cell and forwarded for the RPC. The
+    /// ordering half of the fix — `spawn_build_task` calling this BEFORE
+    /// spawning the task that snapshots the cell — is a control-flow
+    /// property of `spawn_build_task` and is not unit-testable (see the
+    /// TODO at the footer-send path); this test only pins what the helper
+    /// does once called.
+    #[test]
+    fn publish_hw_class_with_factor_sets_cell_and_forwards() {
+        let cell = std::sync::Mutex::new(None);
+        let send = publish_hw_class(
+            Ok(("large-x86".to_string(), Some((1.5, None, None)))),
+            &cell,
+        );
+        assert_eq!(cell.lock().unwrap().as_deref(), Some("large-x86"));
+        assert_eq!(send, Some(("large-x86".to_string(), (1.5, None, None))));
+    }
+
+    /// Resolve succeeded but the bench was skipped/panicked (`factor=None`):
+    /// the class is still published for the banner + completion_stamp, but
+    /// nothing is forwarded to `AppendHwPerfSample`.
+    #[test]
+    fn publish_hw_class_no_factor_still_publishes_class() {
+        let cell = std::sync::Mutex::new(None);
+        assert_eq!(
+            publish_hw_class(Ok(("large-x86".to_string(), None)), &cell),
+            None
+        );
+        assert_eq!(cell.lock().unwrap().as_deref(), Some("large-x86"));
+    }
+
+    /// Empty hw_class (resolver expired / non-k8s) → cell is set to `None`
+    /// (proto3 "unknown hw" semantics), nothing forwarded. The pre-seeded
+    /// `Some` is unreachable in production (the cell is written at most
+    /// once); it is here to assert the write is an unconditional
+    /// assignment, not an insert-if-empty.
+    #[test]
+    fn publish_hw_class_empty_class_publishes_none() {
+        let cell = std::sync::Mutex::new(Some("stale".to_string()));
+        assert_eq!(publish_hw_class(Ok((String::new(), None)), &cell), None);
+        assert_eq!(*cell.lock().unwrap(), None);
+    }
+
+    /// A panicked resolve→bench task is logged and leaves the cell
+    /// untouched — same as the pre-fix behaviour of the spawned harvester.
+    #[tokio::test]
+    async fn publish_hw_class_join_error_leaves_cell() {
+        let cell = std::sync::Mutex::new(None);
+        let err = tokio::spawn(async { panic!("bench panicked") })
+            .await
+            .expect_err("task panicked");
+        assert_eq!(publish_hw_class(Err(err), &cell), None);
+        assert_eq!(*cell.lock().unwrap(), None);
+    }
 
     #[test]
     fn validate_host_arch_gates_builders() {

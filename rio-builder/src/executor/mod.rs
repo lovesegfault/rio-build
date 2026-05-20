@@ -109,8 +109,12 @@ pub struct ExecutorEnv {
     /// `Arc<Mutex<Option<String>>>` so [`execute_build`] gets a plain
     /// `Option<&str>` for the `rio:` banner header. `None` when
     /// non-k8s, the annotator hasn't stamped yet (first ~1s after
-    /// pod bind), or the resolve poll timed out — the banner renders
-    /// the system without the `/{hw_class}` suffix in that case.
+    /// pod bind), the resolve poll timed out, or the resolve→bench
+    /// task was still running when the first assignment arrived
+    /// (`spawn_build_task` waits at most `HW_BENCH_INLINE_WAIT` for
+    /// it — the build never blocks on the bench). The banner renders
+    /// the system without the `/{hw_class}` suffix in all of these
+    /// cases.
     pub hw_class: Option<String>,
     /// Handle to the FUSE local cache. The executor calls
     /// `register_inputs` (JIT allowlist, I-043 redesign) and
