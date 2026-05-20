@@ -3380,7 +3380,7 @@ async fn test_infra_retry_cap_uniform_across_reasons(
 
 /// `build_derivations.exec_id` is set on `Completed` to the `exec_id`
 /// the build actually observed for this derivation, so the dashboard
-/// build view (and `rio-cli derivations <build-id>`) can fetch the
+/// build view can fetch the
 /// exact `drv_logs` row instead of falling back to "latest exec for
 /// this drv" — which is wrong after a retry or a later build's rebuild
 /// of the same drv.

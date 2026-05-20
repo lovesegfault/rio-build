@@ -18,8 +18,8 @@ pub(crate) struct Args {
     /// basename, or bare 32-char hash.
     drv_path: String,
     /// Specific execution to fetch. Defaults to the latest. UUIDs come
-    /// from the worker's `rio: exec` log header line, the dashboard, or
-    /// `rio-cli derivations <build-id>`.
+    /// from the worker's `rio: exec` log header line (the first line of
+    /// every build log) or the dashboard's per-derivation log view.
     #[arg(long)]
     exec_id: Option<String>,
 }

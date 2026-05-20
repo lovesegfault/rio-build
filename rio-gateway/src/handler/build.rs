@@ -478,16 +478,36 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
                 );
             }
             // Log failure via STDERR_NEXT, with a copy-pasteable
-            // `rio-cli logs` hint. No `--build-id` needed — logs are
-            // keyed by `(drv_hash, exec_id)` and `rio-cli logs <drv>`
-            // resolves the latest execution, which is the one that just
-            // failed. The drv path is single-quoted so the line is
-            // shell-safe to copy-paste even when the drv name contains
-            // shell metacharacters.
+            // `rio-cli logs` hint for drvs that actually ran. No
+            // `--build-id` needed — logs are keyed by `(drv_hash,
+            // exec_id)` and `rio-cli logs <drv>` resolves the latest
+            // execution, which is the one that just failed. The drv
+            // path is single-quoted so the line is shell-safe to
+            // copy-paste even when the drv name contains shell
+            // metacharacters.
+            //
+            // Gated on `failure_status != DEPENDENCY_FAILED`: a
+            // cascaded ancestor never executed (the trigger drv
+            // failed first), so there is no log keyed by this drv —
+            // `rio-cli logs '<cascaded>'` would resolve to NotFound,
+            // or worse, a *prior* build's stale log of the same drv.
+            // The trigger drv (the one with the actual log) gets its
+            // own `Failed` event with a real `failure_status` and
+            // emits the hint. In a `--keep-going` build with N
+            // cascaded ancestors, suppressing N misleading hints is
+            // the difference between a copy-pasteable failure tail
+            // and noise.
+            let cascaded =
+                drv_event.failure_status == types::BuildResultStatus::DependencyFailed as i32;
+            let hint = if cascaded {
+                String::new()
+            } else {
+                format!("\n  ↳ rio-cli logs '{}'", drv_event.derivation_path)
+            };
             stderr
                 .log(&format!(
-                    "derivation '{}' failed: {}\n  ↳ rio-cli logs '{}'",
-                    drv_event.derivation_path, drv_event.error_message, drv_event.derivation_path
+                    "derivation '{}' failed: {}{hint}",
+                    drv_event.derivation_path, drv_event.error_message
                 ))
                 .await?;
         }

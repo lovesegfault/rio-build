@@ -431,11 +431,14 @@ impl DagActor {
     }
 
     /// Record which execution each interested build observed for
-    /// `drv_hash`, so the dashboard's build view (and `rio-cli
-    /// derivations <build-id>`) can fetch the *exact* `drv_logs` row
-    /// instead of falling back to "latest exec for this drv" — which
-    /// can be wrong after a retry or a later build's rebuild of the
-    /// same drv.
+    /// `drv_hash`, so the dashboard's build view (`GraphNode.exec_id` →
+    /// `GetDerivationLogs`) can fetch the *exact* `drv_logs` row instead
+    /// of falling back to "latest exec for this drv" — which can be
+    /// wrong after a retry or a later build's rebuild of the same drv.
+    /// (`rio-cli derivations <build-id>` does NOT surface `exec_id` —
+    /// `DerivationDiagnostic` has no field for it; the CLI half of this
+    /// wiring is unfinished. The CLI fallback is `rio-cli logs <drv>`,
+    /// which resolves the latest execution.)
     ///
     /// Best-effort, fire-and-forget — a failed write degrades the
     /// dashboard's build view to the latest-exec fallback, not a hard

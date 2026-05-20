@@ -1127,6 +1127,95 @@ async fn test_build_paths_derivation_failed_emits_log_and_stop() -> anyhow::Resu
     Ok(())
 }
 
+/// Cascaded `DependencyFailed` ancestors never executed — there is no
+/// log keyed by their `(drv_hash, exec_id)` to point at. The gateway
+/// MUST NOT emit the `↳ rio-cli logs '<drv>'` hint for them: in a
+/// `--keep-going` build with N cascaded ancestors, that's N
+/// copy-pasteable commands that each return NotFound (or, worse, a
+/// *prior* build's stale log of the same drv). Only the trigger drv —
+/// the one with a real `failure_status` and a real log — gets the hint.
+#[tokio::test]
+async fn test_build_paths_dependency_failed_omits_rio_cli_hint() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    let trigger = "/nix/store/aaa-trigger.drv".to_string();
+    let cascaded = "/nix/store/bbb-cascaded.drv".to_string();
+    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
+        ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 2,
+            cached_derivations: 0,
+        })),
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::started(trigger.clone(), "w1".into()),
+        )),
+        // Trigger drv actually ran and failed → has a log → gets the hint.
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::failed(
+                trigger.clone(),
+                "boom".into(),
+                types::BuildResultStatus::PermanentFailure,
+            ),
+        )),
+        // Cascaded ancestor never executed → no log → no hint.
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::failed(
+                cascaded.clone(),
+                format!("dependency '{trigger}' failed"),
+                types::BuildResultStatus::DependencyFailed,
+            ),
+        )),
+        ev(build_event::Event::Failed(types::BuildFailed {
+            error_message: "build failed".into(),
+            failed_derivation: trigger.clone(),
+            status: 0,
+        })),
+    ]));
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    let mut saw_trigger_hint = false;
+    let mut saw_cascaded_no_hint = false;
+    loop {
+        let msg = read_stderr_message(&mut h.stream)
+            .await
+            .expect("read stderr");
+        match msg {
+            // Match on the line PREFIX, not `contains` — the cascaded
+            // line's error message embeds the trigger drv path
+            // ("dependency '<trigger>' failed"), so a substring match
+            // on `'{trigger}' failed` would catch both lines.
+            StderrMessage::Next(s) if s.starts_with(&format!("derivation '{trigger}' failed")) => {
+                assert!(
+                    s.contains(&format!("↳ rio-cli logs '{trigger}'")),
+                    "trigger drv (executed) must carry the hint: {s:?}"
+                );
+                saw_trigger_hint = true;
+            }
+            StderrMessage::Next(s) if s.starts_with(&format!("derivation '{cascaded}' failed")) => {
+                assert!(
+                    !s.contains("rio-cli logs"),
+                    "cascaded DependencyFailed (never executed) must NOT carry the hint: {s:?}"
+                );
+                saw_cascaded_no_hint = true;
+            }
+            StderrMessage::Error(_) => break,
+            StderrMessage::Last => panic!("unexpected LAST before ERROR"),
+            _ => {}
+        }
+    }
+    assert!(
+        saw_trigger_hint && saw_cascaded_no_hint,
+        "trigger_hint={saw_trigger_hint} cascaded_no_hint={saw_cascaded_no_hint}"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
 /// BuildCancelled returns a BuildResult with MiscFailure + reason in error_msg.
 /// Use opcode 46 (BuildPathsWithResults) so we can read the BuildResult back.
 #[tokio::test]
