@@ -1113,12 +1113,15 @@ impl DagActor {
 
     /// Reconcile path for an orphaned assignment whose outputs ARE in
     /// the store: the build completed while the scheduler was down.
-    /// Transition Completed, persist, attribute tenants, unpin, then
-    /// reuse [`release_downstream`](Self::release_downstream) for the
-    /// newly-ready cascade + per-build completion check. Skips the
-    /// `handle_success_completion` steps that need worker-result data
-    /// (build_samples, CA bookkeeping, ancestor priorities — full_sweep
-    /// on next tick handles the latter).
+    /// Transition Completed, persist, attribute tenants, record exec
+    /// correlation, discard the (empty) recovery-stamped log buffer,
+    /// unpin, then reuse [`release_downstream`](Self::release_downstream)
+    /// for the newly-ready cascade + per-build completion check. Skips
+    /// the `handle_success_completion` steps that need worker-result
+    /// data (build_samples, CA bookkeeping, ancestor priorities —
+    /// full_sweep on next tick handles the latter; log seal+flush is
+    /// replaced by discard since the buffer is empty and the worker
+    /// never reconnects).
     async fn adopt_orphan_completion(
         &mut self,
         drv_hash: &DrvHash,
@@ -1176,6 +1179,16 @@ impl DagActor {
         // JOIN populated `state.exec_id` at recovery load. The helper
         // no-ops if it didn't (defensive).
         self.record_exec_correlation(drv_hash, &interested);
+        // Recovery's set_log_exec stamped an empty LogBuffers entry so a
+        // still-streaming worker could pass the push_for binding gate.
+        // On this arm the worker never reconnects (collect_orphaned_assignments
+        // only returns unregistered/phantom workers), so the entry has zero
+        // lines and the periodic flusher skips it (line_count==0 early-return
+        // — neither uploads nor reaps). Discard it so GetDerivationLogs falls
+        // through to S3 instead of serving an empty re-poll chunk until
+        // CleanupTerminalBuild reaps the build. Same shape as
+        // rollback_assignment (dispatch.rs:1675-1680).
+        self.discard_log_buffer(drv_hash);
         // Terminal → unpin. sweep_stale_live_pins ran BEFORE
         // reconcile (the drv was Assigned/Running in PG then —
         // kept), so it won't catch this one.

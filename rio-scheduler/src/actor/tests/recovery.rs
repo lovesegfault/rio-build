@@ -2048,3 +2048,121 @@ async fn test_recovery_repopulates_log_buffers_exec_id() -> TestResult {
 
     Ok(())
 }
+
+/// adopt_orphan_completion must discard the empty stamped LogBuffers entry
+/// that recovery's set_log_exec created. Without the discard, the entry has
+/// zero lines but exists, so:
+///  - `read_since(drv_path, since)` returns `Some([])` (entry present),
+///  - `try_ring_buffer` returns `Some([empty re-poll chunk])`,
+///  - `pin_matches_live` is `true` (the buffer exec_id matches the pinned
+///    request the dashboard sends from `GraphNode.exec_id`),
+///  - the GetDerivationLogs handler never falls through to `try_s3`,
+/// — and the ex-leader's already-uploaded `.partial.log.zst` and `drv_logs`
+/// row are unreachable until `CleanupTerminalBuild` reaps the *build* (~30s
+/// after the build, not the drv, goes terminal — hours for a large build).
+/// The periodic flusher doesn't self-heal: `upload_and_record` early-returns
+/// on `line_count == 0` so it neither uploads nor reaps. Same shape as
+/// `rollback_assignment`'s discard for a failed `try_send`.
+///
+/// Phase-1 reuses `seed_orphan_assigned` (proven by the other
+/// `test_orphan_completion_*` tests) plus an `assignments.exec_id` INSERT
+/// (the recovery carrier that `test_recovery_repopulates_log_buffers_exec_id`
+/// established). Phase-2 wires `log_buffers` so the buffer must actually be
+/// re-stamped at recovery for this test to be non-trivial, and an inproc
+/// store so reconcile finds the outputs and routes to
+/// `adopt_orphan_completion` rather than `reset_orphan_to_ready`.
+#[tokio::test]
+async fn test_orphan_completion_discards_log_buffer() -> TestResult {
+    use super::integration::{put_test_path, setup_inproc_store};
+
+    let exec_id = Uuid::now_v7();
+    let drv_tag = "orphan-discard-drv";
+    let dead_worker = "dead-discard-w1";
+    let sched_db = TestDb::new(&MIGRATOR).await;
+    let store_db = TestDb::new(&MIGRATOR).await;
+    let (mut store_client, _store_srv) = setup_inproc_store(store_db.pool.clone()).await?;
+    let out_path = test_store_path("orphan-discard-out");
+    put_test_path(&mut store_client, &out_path).await?;
+
+    // --- Phase 1: write state on the "old leader". ---
+    // seed_orphan_assigned merges a single-node build with
+    // expected_output_paths set, then backdates to Assigned with
+    // assigned_builder_id=dead_worker. Add an `assignments` row carrying
+    // the known exec_id (the recovery carrier — `assignments.exec_id`),
+    // matching the shape `load_nonterminal_derivations`'s LEFT JOIN reads.
+    let _build_id = seed_orphan_assigned(&sched_db.pool, drv_tag, &out_path, dead_worker).await?;
+    let (drv_id,): (Uuid,) =
+        sqlx::query_as("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+            .bind(drv_tag)
+            .fetch_one(&sched_db.pool)
+            .await?;
+    sqlx::query(
+        "INSERT INTO assignments (derivation_id, builder_id, generation, status, exec_id) \
+         VALUES ($1, $2, 1, 'pending', $3)",
+    )
+    .bind(drv_id)
+    .bind(dead_worker)
+    .bind(exec_id)
+    .execute(&sched_db.pool)
+    .await?;
+
+    // --- Phase 2: fresh actor recovers with log_buffers + store wired. ---
+    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let (handle, _task) =
+        setup_actor_configured(sched_db.pool.clone(), Some(store_client), |_, plumbing| {
+            plumbing.log_buffers = Some(log_buffers.clone());
+        });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // Pre-condition: recovery re-stamped the buffer. Without this
+    // assert, the test would pass trivially against a setup that never
+    // created the entry (e.g. a future regression in load_dag_from_rows
+    // that skipped set_log_exec for orphans).
+    let drv_path = test_drv_path(drv_tag);
+    assert_eq!(
+        log_buffers.exec_id(&drv_path),
+        Some(exec_id),
+        "recovery should re-stamp the LogBuffers entry before reconcile"
+    );
+    assert!(
+        log_buffers
+            .read_since(&drv_path, 0)
+            .is_some_and(|lines| lines.is_empty()),
+        "stamped entry should exist (read_since=Some) but be empty"
+    );
+
+    // ReconcileAssignments: dead_worker not in self.executors → orphan
+    // → FindMissingPaths finds out_path present → adopt_orphan_completion.
+    handle
+        .send_unchecked(ActorCommand::ReconcileAssignments)
+        .await?;
+    barrier(&handle).await;
+
+    let post = expect_drv(&handle, drv_tag).await;
+    assert_eq!(
+        post.status,
+        DerivationStatus::Completed,
+        "orphan completion should transition drv to Completed"
+    );
+
+    // KEY ASSERTIONS: the stamped entry must be gone. With it present,
+    // `try_ring_buffer` returns `Some([empty re-poll chunk])` and the
+    // GetDerivationLogs handler never falls through to S3, hiding the
+    // ex-leader's already-uploaded log until CleanupTerminalBuild reaps
+    // the build.
+    assert_eq!(
+        log_buffers.exec_id(&drv_path),
+        None,
+        "adopt_orphan_completion must discard the empty stamped entry \
+         (its worker never reconnects; the entry has zero lines and the \
+         periodic flusher skips it without reaping)"
+    );
+    assert!(
+        log_buffers.read_since(&drv_path, 0).is_none(),
+        "discarded entry → read_since=None → try_ring_buffer falls \
+         through to S3 instead of serving an empty re-poll chunk"
+    );
+
+    Ok(())
+}
