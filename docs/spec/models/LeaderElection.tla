@@ -123,6 +123,26 @@ ClockSkewBound ==
   \A m, n \in Nodes : clocks[m] - clocks[n] <= MaxSkew
 
 \* -----------------------------------------------------------------------
+\* THE hard half of sched.lease.at-most-one-leader+2: the apiserver's
+\* optimistic concurrency admits at most one writer per resourceVersion.
+\* casRace is flipped by ReplaceGuard(n) when a PUT succeeds at an rv that
+\* another currently-Leading node also acquired at -- i.e. the CAS let two
+\* writers through. With the precondition (lease.rv = snap[n].rv) this is
+\* unreachable: the second writer's snapshot is stale, its PUT 409s.
+\* Without it (delete the precondition), both racers GET rv=R, both PUT,
+\* both believe they won -- the kube-leader-election 0.43 bug.
+\*
+\* Deliberately-weakened test (run once during development, NOT in CI):
+\* replacing `lease.rv = snap[n].rv` with TRUE in ReplaceGuard produces a
+\* counterexample at depth 6: both nodes GET the empty lease at rv=0, n1
+\* Steals (Leading, acquiredAt=0), n2 Steals at its stale rv=0 snapshot --
+\* the PUT succeeds without the precondition, both Leading, casRace flips.
+\* Both also reach gen=2: the generation fence cannot tell them apart
+\* either. Recorded in the header (Task 9).
+\* -----------------------------------------------------------------------
+AtMostOneCASWinner == ~casRace
+
+\* -----------------------------------------------------------------------
 \* Initial state. gen[n] = 1 mirrors the production `AtomicU64::new(1)`
 \* (rio-scheduler/src/main.rs:142, rio-controller/src/main.rs:313). genHW = 0
 \* is an empty PG. lease.gen = 0 is `lease_transitions` before any holder.
