@@ -20,7 +20,9 @@
 #                                  (6-step pipeline + cbmc flag list)
 #
 # Pins (verified against the kani-0.67.0 tag):
-#   kani:    0.67.0
+#   kani:    rio-build branch (lovesegfault/kani) = kani-0.67.0 + 2 patches
+#            (verify-artifacts subcommand, compiler default rustc flags;
+#            upstream PRs to model-checking/kani in flight)
 #   nightly: 2025-11-21        (rust-toolchain.toml)
 #   cbmc:    6.8.0             (kani-dependencies; nixpkgs has exactly 6.8.0)
 #   kissat:  >= 4.0.1          (kani-dependencies; nixpkgs 4.0.4 satisfies)
@@ -54,10 +56,14 @@ let
   };
 
   kaniSrcRaw = pkgs.fetchFromGitHub {
-    owner = "model-checking";
+    owner = "lovesegfault";
     repo = "kani";
-    rev = "kani-${kaniVersion}";
-    hash = "sha256-XsBqBCJpOKuedn0Q/m/tLkO+e9F/jx7lpqlqhxmzTX8=";
+    # rio-build branch: kani-0.67.0 + 'kani verify-artifacts' subcommand +
+    # kani-compiler default rustc flags. Both are upstream PRs to
+    # model-checking/kani. Swap back to the release tag (and re-derive
+    # nightly/CBMC pins) when kani 0.68.0 ships with both merged.
+    rev = "6f9696f4fd126f6d50001ec5053fe109a61c4452";
+    hash = "sha256-RFYTgVKazZQeXsEsrArL3bPrtc+q+/AGuO0hfmS/BQE=";
   };
 
   kaniSrc = pkgs.runCommand "kani-${kaniVersion}-src" { } ''
