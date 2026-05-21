@@ -33,8 +33,5 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 [dev-dependencies]
 # ApiServerVerifier mock for the I/O-shell + hung-apiserver tests.
 rio-test-support = { workspace = true }
-# from_parts_reads_all_three uses figment::Jail to serialize HOSTNAME
-# env mutation across parallel tests.
-figment = { workspace = true }
 # election.rs mock-apiserver scenarios need http::Method.
 http = { workspace = true }

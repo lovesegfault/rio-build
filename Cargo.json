@@ -20089,10 +20089,6 @@
       ],
       "devDependencies": [
         {
-          "name": "figment",
-          "packageId": "figment"
-        },
-        {
           "name": "http",
           "packageId": "http 1.4.0"
         },

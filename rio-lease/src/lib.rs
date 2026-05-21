@@ -756,11 +756,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::result_large_err)] // figment::Error is 208B, API-fixed
     fn from_parts_reads_all_three() {
         // HOSTNAME is still a raw env read (K8s sets it, not us).
-        // figment Jail serializes env access across parallel tests.
-        figment::Jail::expect_with(|jail| {
+        // The jail serializes env access across parallel tests.
+        rio_test_support::Jail::expect_with(|jail| {
             jail.set_env("HOSTNAME", "rio-scheduler-0");
 
             let cfg = LeaseConfig::from_parts(
