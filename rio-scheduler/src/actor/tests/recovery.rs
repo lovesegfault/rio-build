@@ -1274,6 +1274,54 @@ async fn test_recovery_other_holder_at_our_generation_bumps() -> TestResult {
     Ok(())
 }
 
+/// The lease-derived-above-floor arm of the claim target: when the PG
+/// floor is NULL (fresh cluster) or below the Lease-derived generation,
+/// recovery must claim exactly the Lease-derived generation -- not "one
+/// past the floor", which here would be a different (lower) value. Pins
+/// the arm of the decision table where the Lease, not the PG floor,
+/// decides the generation, and guards against regressing the code
+/// toward a floor-only reading of the rule.
+// r[verify sched.recovery.fetch-max-seed+3]
+#[tokio::test]
+async fn test_recovery_claims_lease_derived_generation_on_empty_floor() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    // No assignments, no claims: the PG floor is NULL.
+
+    // gen_at_entry = 7: the lease-derived generation for this epoch
+    // (prior holder changes bumped leaseTransitions while PG stayed
+    // empty -- e.g. every prior term was deposed before persisting, or
+    // proceeded unclaimed).
+    let generation = Arc::new(AtomicU64::new(7));
+    let g = Arc::clone(&generation);
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = crate::lease::LeaderState::from_parts(
+            g,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        p.holder_id = "pod-us".into();
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        generation.load(Ordering::Acquire),
+        7,
+        "an empty PG floor demands nothing; the lease-derived generation is retained"
+    );
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT generation, holder_id FROM leader_generation_claims ORDER BY generation",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(
+        rows,
+        vec![(7, "pod-us".to_string())],
+        "the claims ledger must record the lease-derived generation, not a floor-derived one"
+    );
+    Ok(())
+}
+
 /// Recovery must skip builds that have ZERO build_derivations rows.
 /// These are orphans: crash-during-merge BEFORE the link rows were
 /// written, or a failed rollback. Without this skip, the all-terminal
