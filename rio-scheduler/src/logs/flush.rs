@@ -247,38 +247,53 @@ impl LogFlusher {
     /// On-completion flush: drain the buffer (derivation is done, no more
     /// writes coming) and upload with `is_complete=true`.
     async fn flush_final(&self, req: FlushRequest) {
-        // Read exec_id BEFORE drain() removes the entry. The accessor
-        // returns None if the entry doesn't exist (silent build, dup
-        // request) or was never set_exec'd.
-        let live_exec_id = self.buffers.exec_id(&req.drv_path);
-
-        // Stale-request guard. The flusher's mpsc is 1000-deep and a GC
-        // sweep or S3 burst can let requests queue for seconds. In that
-        // window the actor can re-dispatch the same drv (`discard` +
-        // `set_exec` with a fresh UUIDv7). Draining the re-stamped entry
-        // with the stale request's status would (a) record exec₂'s lines
-        // with exec₁'s outcome, marked `is_complete=true`, and (b) leave
-        // `push_for` from exec₂'s worker with no entry to land in — the
-        // entire re-dispatched execution's log is silently lost. Drop the
-        // stale request instead; exec₁'s log was already lost when
-        // `discard()` ran, which is the existing predecessor-cleanup
-        // contract — `assign_to_worker`'s comment names it.
+        // Stale-request guard, atomic with the drain. The flusher's mpsc
+        // is 1000-deep and a GC sweep or S3 burst can let requests queue
+        // for seconds. In that window the actor can re-dispatch the same
+        // drv (`discard` + `set_exec` with a fresh UUIDv7). Draining the
+        // re-stamped entry with the stale request's status would (a)
+        // record exec₂'s lines with exec₁'s outcome, marked
+        // `is_complete=true`, and (b) leave `push_for` from exec₂'s
+        // worker with no entry to land in — the entire re-dispatched
+        // execution's log is silently lost. `drain_if_exec` runs the
+        // exec_id comparison and the removal under one shard lock, so a
+        // successful drain is guaranteed to have removed the entry this
+        // request was pinned to. (The previous read-compare-drain shape
+        // had a TOCTOU: a re-dispatch landing between the read and the
+        // unconditional `drain()` removed the *freshly stamped* entry —
+        // bug_004, round 8.)
         //
-        // NOTE: `Some(req.exec_id)` is the *only* shape that proceeds.
-        // `live_exec_id == None` covers both (a) no entry at all (silent
-        // build / dup request — the drain below would be `None` anyway)
-        // and (b) an unstamped entry created by the legacy `push()`
-        // (test-only). Neither can be attributed to `req.exec_id`, so
-        // both skip the upload.
+        // `Some` → this request's execution was the live one and its
+        // buffer is now drained. Unseal: the seal bridged
+        // completion→drain and that window is closed. Clearing it here
+        // keeps `sealed` bounded even if the recv task is still running
+        // (or never saw a LogBatch — silent build).
+        if let Some((first_line, line_count, raw_bytes, lines)) =
+            self.buffers.drain_if_exec(&req.drv_path, req.exec_id)
+        {
+            self.buffers.unseal(&req.drv_path);
+            self.upload_and_record(req, first_line, line_count, raw_bytes, lines, true)
+                .await;
+            return;
+        }
+
+        // `None` → the entry is gone, was never stamped, or is stamped
+        // with a different (newer) execution. The follow-up `exec_id()`
+        // read below is *advisory only* — it picks the log line and
+        // decides a defensive no-op unseal. It is racy with concurrent
+        // discard/re-dispatch, and that is fine: the data-loss-critical
+        // decision (whether to remove the entry) was already made
+        // atomically above, and both arms below leave the buffers map
+        // untouched.
         //
         // The `unseal()` is per-arm, NOT unconditional: the seal is keyed
         // by `drv_log_hash(drv_path)` only, with no per-execution
         // dimension, so in the `Some(live)` arm an unseal here would
         // remove the seal that the *live* execution's terminal handler
         // just set — re-opening `push_for` to post-terminal batches from
-        // the live executor until the live request drains and re-unseals
-        // (post-drain unseal below). Leave the live exec's seal alone;
-        // its own `flush_final` clears it after `drain()`.
+        // the live executor until the live request drains and re-unseals.
+        // Leave the live exec's seal alone; its own `flush_final` clears
+        // it after its drain.
         //
         // The `None` arm has no live owner of the seal (every re-dispatch
         // path calls `discard()`, which removes both entry and seal — the
@@ -287,44 +302,25 @@ impl LogFlusher {
         // Keeping the unseal there is a free defensive bound; it's a
         // no-op in steady state. `CleanupTerminalBuild` is the actual
         // backstop if a `FlushRequest` was dropped (`try_send` full).
-        if live_exec_id != Some(req.exec_id) {
-            match live_exec_id {
-                Some(live) => {
-                    warn!(
-                        drv = %req.drv_path,
-                        requested_exec = %req.exec_id,
-                        live_exec = %live,
-                        "dropping stale flush request: drv was re-dispatched"
-                    );
-                    metrics::counter!("rio_scheduler_log_flush_stale_total").increment(1);
-                }
-                None => {
-                    self.buffers.unseal(&req.drv_path);
-                    debug!(
-                        drv_path = %req.drv_path,
-                        requested_exec = %req.exec_id,
-                        "no buffer to flush (silent build, dup request, or unstamped entry)"
-                    );
-                }
+        match self.buffers.exec_id(&req.drv_path) {
+            Some(live) => {
+                warn!(
+                    drv = %req.drv_path,
+                    requested_exec = %req.exec_id,
+                    live_exec = %live,
+                    "dropping stale flush request: drv was re-dispatched"
+                );
+                metrics::counter!("rio_scheduler_log_flush_stale_total").increment(1);
             }
-            return;
+            None => {
+                self.buffers.unseal(&req.drv_path);
+                debug!(
+                    drv_path = %req.drv_path,
+                    requested_exec = %req.exec_id,
+                    "no buffer to flush (silent build, dup request, or unstamped entry)"
+                );
+            }
         }
-
-        let drained = self.buffers.drain(&req.drv_path);
-        // Seal bridged completion→drain; that window is now closed.
-        // Clear so `sealed` stays bounded even if the recv task is
-        // still running (or never saw a LogBatch — silent build).
-        self.buffers.unseal(&req.drv_path);
-        let Some((first_line, line_count, raw_bytes, lines)) = drained else {
-            // Should be unreachable: the exec_id check above succeeded,
-            // which means the entry exists with the matching stamp.
-            // Defensive against a concurrent discard between the read
-            // and the drain.
-            debug!(drv_path = %req.drv_path, "buffer vanished between exec_id check and drain");
-            return;
-        };
-        self.upload_and_record(req, first_line, line_count, raw_bytes, lines, true)
-            .await;
     }
 
     /// Periodic flush: snapshot all active buffers (non-draining) and upload

@@ -230,8 +230,11 @@ impl LogBuffers {
 
     /// Drain all lines for a derivation, removing the buffer entry.
     ///
-    /// Called on completion flush. Returns `None` if the buffer doesn't
-    /// exist (never logged anything, or already drained).
+    /// Returns `None` if the buffer doesn't exist (never logged anything,
+    /// or already drained). The production completion flush goes through
+    /// [`Self::drain_if_exec`] instead (the unconditional remove here is
+    /// exactly the TOCTOU that method closes); `drain` remains for tests
+    /// and any future caller that owns the entry's whole lifecycle.
     ///
     /// Returns `(first_line, line_count, total_bytes, lines_in_order)`.
     /// `first_line` is the worker-assigned line number of `lines[0]` —
@@ -244,11 +247,54 @@ impl LogBuffers {
     /// a 0-based blob index → silent log-tail loss after eviction).
     pub fn drain(&self, drv_path: &str) -> Option<(u64, u64, u64, Vec<Vec<u8>>)> {
         let (_key, rb) = self.buffers.remove(&drv_log_hash(drv_path))?;
+        Some(Self::into_drained(rb))
+    }
+
+    /// Drain the buffer for `drv_path` **only if** it is currently stamped
+    /// with `expected`. Returns `None` both when no entry exists and when
+    /// the entry's `exec_id` differs — the caller can't distinguish, and
+    /// doesn't need to: both mean "the execution this request was pinned
+    /// to is not the live one".
+    ///
+    /// This is the atomic form of `exec_id() == Some(expected)` followed
+    /// by `drain()`. The two-step form is a TOCTOU: `assign_to_worker`'s
+    /// re-dispatch (`discard()` + `set_exec()` with a fresh UUIDv7) can
+    /// land between the flusher's read and its drain, in which case the
+    /// unconditional `remove` deletes the *freshly stamped* entry and
+    /// returns `Some((0, 0, 0, []))` — the new execution's ring buffer is
+    /// gone before its worker sends a byte, and every subsequent
+    /// `push_for` rejects with `no_assignment`. `remove_if` runs the
+    /// comparison and the removal under the same shard write-lock, so a
+    /// removed entry is guaranteed to have carried `expected`.
+    /// [`Self::discard_if_owned_by`] is the sibling pattern for the
+    /// disconnect-cleanup path (predicate on `assigned_executor` instead
+    /// of `exec_id`).
+    ///
+    /// Like [`Self::drain`], this does not touch `sealed` — the caller
+    /// owns the seal decision (see `flush_final`: unseal only after a
+    /// successful drain; a refused drain means the live execution owns
+    /// the seal, or there is no entry and `CleanupTerminalBuild` is the
+    /// backstop).
+    pub fn drain_if_exec(
+        &self,
+        drv_path: &str,
+        expected: Uuid,
+    ) -> Option<(u64, u64, u64, Vec<Vec<u8>>)> {
+        let (_key, rb) = self
+            .buffers
+            .remove_if(&drv_log_hash(drv_path), |_, e| e.exec_id == Some(expected))?;
+        Some(Self::into_drained(rb))
+    }
+
+    /// Shared tail of [`Self::drain`] / [`Self::drain_if_exec`]: unpack a
+    /// removed ring buffer into the `(first_line, line_count, total_bytes,
+    /// lines)` tuple the flusher uploads.
+    fn into_drained(rb: RingBuf) -> (u64, u64, u64, Vec<Vec<u8>>) {
         let first_line = rb.lines.front().map(|(n, _)| *n).unwrap_or(0);
         let line_count = rb.lines.len() as u64;
         let total_bytes = rb.bytes as u64;
         let lines: Vec<Vec<u8>> = rb.lines.into_iter().map(|(_n, bytes)| bytes).collect();
-        Some((first_line, line_count, total_bytes, lines))
+        (first_line, line_count, total_bytes, lines)
     }
 
     /// Read lines with line number ≥ `since`, non-consuming.
@@ -706,6 +752,80 @@ mod tests {
     fn drain_nonexistent_returns_none() {
         let bufs = LogBuffers::new();
         assert!(bufs.drain("not-there").is_none());
+    }
+
+    // ── drain_if_exec: atomic stale-request guard (bug_004, round 8) ──
+
+    #[test]
+    fn drain_if_exec_matching_exec_drains() {
+        let bufs = LogBuffers::new();
+        let exec = Uuid::now_v7();
+        bufs.set_exec("drv-a", exec, "executor-1");
+        assert!(bufs.push_for(
+            "drv-a",
+            &mk_batch("drv-a", 0, &[b"hello", b"world"]),
+            "executor-1"
+        ));
+
+        let (first, count, bytes, lines) = bufs
+            .drain_if_exec("drv-a", exec)
+            .expect("matching exec must drain");
+        assert_eq!(first, 0);
+        assert_eq!(count, 2);
+        assert_eq!(bytes, 5 + 5);
+        assert_eq!(lines, vec![b"hello".to_vec(), b"world".to_vec()]);
+        assert_eq!(bufs.active_count(), 0, "drain removed the entry");
+    }
+
+    /// The load-bearing half of the TOCTOU fix: a drain pinned to a stale
+    /// exec_id must refuse AND leave the live entry (lines and stamp)
+    /// untouched. The old read-compare-`drain()` shape removed the live
+    /// entry here and returned its (empty) contents.
+    #[test]
+    fn drain_if_exec_mismatched_exec_leaves_entry_intact() {
+        let bufs = LogBuffers::new();
+        let stale = Uuid::now_v7();
+        let live = Uuid::now_v7();
+        bufs.set_exec("drv-a", live, "executor-2");
+        assert!(bufs.push_for(
+            "drv-a",
+            &mk_batch("drv-a", 0, &[b"live-line"]),
+            "executor-2"
+        ));
+
+        assert!(
+            bufs.drain_if_exec("drv-a", stale).is_none(),
+            "mismatched exec must refuse to drain"
+        );
+        assert_eq!(
+            bufs.exec_id("drv-a"),
+            Some(live),
+            "live entry's stamp must survive the refused drain"
+        );
+        assert_eq!(
+            bufs.read_since("drv-a", 0).map(|v| v.len()),
+            Some(1),
+            "live entry's lines must survive the refused drain"
+        );
+        // And the live exec can still drain its own buffer afterwards.
+        let (_, count, _, _) = bufs.drain_if_exec("drv-a", live).expect("live exec drains");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn drain_if_exec_missing_entry_returns_none() {
+        let bufs = LogBuffers::new();
+        assert!(bufs.drain_if_exec("not-there", Uuid::now_v7()).is_none());
+    }
+
+    /// An entry created by the legacy `push()` (no `set_exec`) has
+    /// `exec_id == None` and can never match a request's pinned exec.
+    #[test]
+    fn drain_if_exec_unstamped_entry_returns_none() {
+        let bufs = LogBuffers::new();
+        bufs.push(&mk_batch("drv-a", 0, &[b"line"]));
+        assert!(bufs.drain_if_exec("drv-a", Uuid::now_v7()).is_none());
+        assert_eq!(bufs.active_count(), 1, "unstamped entry left in place");
     }
 
     #[test]
