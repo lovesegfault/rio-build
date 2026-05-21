@@ -19222,6 +19222,10 @@
           "path": "src/bin/spike_mountd.rs"
         },
         {
+          "name": "spike_mountd_client",
+          "path": "src/bin/spike_mountd_client.rs"
+        },
+        {
           "name": "spike_negdentry_fuse",
           "path": "src/bin/spike_negdentry_fuse.rs"
         },

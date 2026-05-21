@@ -63,6 +63,7 @@ let
   forecast-provisioning = import ./scenarios/forecast-provisioning.nix;
   kwok = import ./fixtures/kwok.nix { inherit pkgs; };
   kvm-hostpath-spike = import ./scenarios/kvm-hostpath-spike.nix;
+  mountd = import ./scenarios/mountd.nix;
   drvs = import ./lib/derivations.nix { inherit pkgs; };
 
   # SLA-sizing fixture: one worker with RIO_BUILDER_SCRIPT pointing at
@@ -271,6 +272,25 @@ in
   # r[verify builder.mountd.backing-broker]
   vm-composefs-spike-priv = composefs-spike-priv { inherit pkgs rio-workspace; };
   vm-spike-fuse-negdentry = spike-fuse-negdentry { inherit pkgs rio-workspace; };
+
+  # ── rio-mountd (P0567): the privileged broker, end-to-end ───────────
+  # Single VM, no rio fixture: the real rio-mountd binary against an
+  # XFS-prjquota staging loopback, driven over the SOCK_SEQPACKET
+  # protocol by spike_mountd_client. Carries the P0578-deferred
+  # mountd-protocol subtests; perf numbers are printed, not gated
+  # (TCG runners). See the scenario header for the subtest map.
+  # r[verify builder.mountd.fuse-handoff]
+  # r[verify builder.mountd.backing-broker]
+  # r[verify builder.mountd.concurrency]
+  # r[verify builder.mountd.build-id-validated]
+  # r[verify builder.mountd.uid-bound]
+  # r[verify builder.mountd.build-id-unique]
+  # r[verify builder.mountd.one-mount]
+  # r[verify builder.mountd.staging-quota]
+  # r[verify builder.mountd.promote-verified]
+  # r[verify builder.mountd.promote-bounded-copy]
+  # r[verify builder.mountd.orphan-scan]
+  vm-mountd = mountd { inherit pkgs rio-workspace; };
 
   # r[verify gw.conn.exit-status]
   #   nom-exit subtest: client ssh_config has ControlMaster auto +

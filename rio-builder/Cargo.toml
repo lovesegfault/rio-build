@@ -39,6 +39,13 @@ path = "src/bin/spike_negdentry_fuse.rs"
 name = "spike_passthrough_fuse"
 path = "src/bin/spike_passthrough_fuse.rs"
 
+# VM-test client for the production rio-mountd daemon (vm-mountd
+# scenario). Stands in for the builder side of the UDS protocol until
+# P0559's in-process client exists.
+[[bin]]
+name = "spike_mountd_client"
+path = "src/bin/spike_mountd_client.rs"
+
 [features]
 # RIO_BUILDER_SCRIPT fixture intercept (sla-sizing VM scenario): skips
 # the daemon lifecycle and reports scripted (wall, peak_mem, peak_cpu,
