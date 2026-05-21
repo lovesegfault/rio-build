@@ -265,13 +265,21 @@ pub fn check_bound(field: &str, got: usize, max: usize) -> Result<(), Status> {
 }
 
 /// Truncate `s` in place to at most `max` bytes, backing up to the nearest
-/// UTF-8 character boundary. No-op when `s.len() <= max`.
+/// UTF-8 character boundary, and release the excess allocation. No-op when
+/// `s.len() <= max`.
 ///
 /// For worker-supplied string fields that must be **bounded but not
 /// rejected** — e.g. `BuildResult.error_msg`, where dropping the whole
 /// `CompletionReport` would strand the derivation in `Running`. Reject-style
 /// bounds (drop the message / fail the RPC) should use [`check_bound`] or an
 /// explicit length comparison instead.
+///
+/// The `shrink_to_fit` is load-bearing, not a tidy-up: `String::truncate`
+/// keeps the original allocation, so a field decoded at the gRPC message cap
+/// (256 MiB) would report a 256-byte length while pinning a 256 MiB heap
+/// block in the actor mailbox for as long as the containing command lives.
+/// Same defense as the per-line `shrink_to_fit` in the LogBatch recv arm
+/// (`executor_service.rs`, "Vec::truncate keeps the oversized capacity").
 pub fn truncate_utf8(s: &mut String, max: usize) {
     if s.len() <= max {
         return;
@@ -281,6 +289,7 @@ pub fn truncate_utf8(s: &mut String, max: usize) {
         end -= 1;
     }
     s.truncate(end);
+    s.shrink_to_fit();
 }
 
 /// Extension trait for mapping `Result<T, E: Display>` to `Result<T, Status>`
@@ -517,5 +526,25 @@ mod tests {
         let mut s = "abc".to_string();
         truncate_utf8(&mut s, 0);
         assert!(s.is_empty());
+    }
+
+    #[test]
+    fn truncate_utf8_over_max_releases_capacity() {
+        // bug_011: a worker-supplied field decoded at the gRPC message cap
+        // arrives as a String whose capacity == its wire length. `truncate()`
+        // alone keeps that allocation, so a 256 MiB executor_id/error_msg
+        // would report a 256 B / 16 KiB length while pinning 256 MiB in the
+        // actor mailbox. Mirror of `push_truncates_oversized_line`'s
+        // capacity assertion for the per-line truncation.
+        let mut s = "a".repeat(1024 * 1024);
+        assert!(s.capacity() >= 1024 * 1024);
+        truncate_utf8(&mut s, 64);
+        assert_eq!(s.len(), 64);
+        assert!(
+            s.capacity() <= 64,
+            "truncate_utf8 must release the over-allocation, got capacity {} \
+             — truncate-without-shrink keeps the original 1 MiB block",
+            s.capacity()
+        );
     }
 }
