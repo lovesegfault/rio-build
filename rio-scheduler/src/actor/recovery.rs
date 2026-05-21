@@ -89,10 +89,12 @@ impl DagActor {
     /// Returns the PG high-water generation on success (for the
     /// caller's monotonicity seed). The caller does `fetch_max`
     /// AFTER the TOCTOU check — keeping this function free of
-    /// writes to `self.leader`'s generation is load-bearing for the
-    /// gen-snapshot check in `handle_leader_acquired` (any change
-    /// to `generation` during recovery then unambiguously means
-    /// the lease loop raised it, i.e. a flap onto a new epoch).
+    /// writes to `self.leader` (generation, acquired_transitions,
+    /// is_leader) is load-bearing for the snapshot check in
+    /// `handle_leader_acquired` (any change to the generation OR to
+    /// the recorded acquire-transitions, or a cleared is_leader,
+    /// during recovery then unambiguously means the lease loop wrote
+    /// it, i.e. a flap onto a new epoch or a lapsed lease).
     ///
     /// Returns Err on PG failure; caller sets `recovery_complete=
     /// true` anyway (see module doc — degrade not block).
@@ -1066,26 +1068,55 @@ impl DagActor {
         // housekeeping isn't yet at its select.
         self.cost_reload_notify.notify_one();
 
-        // Snapshot generation BEFORE recovery. If the lease flaps
-        // (lose→reacquire WITH a holder change in between) while
-        // recover_from_pg() is running, the lease loop will fetch_max
-        // a higher lease-derived generation AND will have cleared
-        // recovery_complete (lease/mod.rs lose-transition). An
-        // unconditional store(true) here would clobber that clear
-        // and let dispatch_ready fire with a DAG loaded under the
-        // OLD generation but stamped with the NEW one — worker-side
-        // gen fence can't catch that.
+        // Snapshot the flap-detection signals BEFORE recovery. If the
+        // lease flaps (lose→reacquire WITH a holder change in between)
+        // while recover_from_pg() is running, the lease loop will have
+        // cleared recovery_complete (`LeaderState::on_lose` in
+        // rio-lease). An unconditional store(true) here would clobber
+        // that clear and let dispatch_ready fire with a DAG loaded
+        // under the OLD epoch but stamped with the CURRENT generation
+        // — the worker-side gen fence can't catch that.
         //
-        // recover_from_pg() does NOT write to self.leader's generation (it
-        // returns the PG high-water for us to seed below). So any
-        // change between gen_at_entry and gen_now is unambiguously
-        // a lease-loop write — no false positives from PG seeding.
-        // A self-fence false alarm followed by a successful renew
-        // re-acquires at the SAME generation (no holder change ⇒ no
-        // lease-transition bump ⇒ fetch_max is a no-op); that produces
-        // no change here and correctly does NOT discard this recovery —
-        // same epoch, same DAG, nothing to redo.
+        // Three signals, re-checked at the gate below:
+        //
+        // - `acquired_transitions`: the holder-change signal. The lease
+        //   loop records the Lease's transition count on every acquire
+        //   edge, and the apiserver bumps that count atomically with
+        //   every holder change, so a foreign term that lands inside
+        //   our recovery window always moves it. The generation alone
+        //   cannot serve here: once the PG-floor seed has saturated the
+        //   generation above `leaseTransitions + 1` (the permanent
+        //   state after a `kubectl delete lease`), on_acquire's
+        //   fetch_max is a generation no-op on every subsequent holder
+        //   change.
+        // - `is_leader` (re-read at the gate, no snapshot needed): a
+        //   false there means a lose landed mid-recovery and we have
+        //   not re-acquired — the foreign term may still be in
+        //   progress.
+        // - `generation`: belt-and-suspenders. recover_from_pg() does
+        //   NOT write to self.leader's generation (it returns the PG
+        //   high-water for us to seed below), so any change here is
+        //   unambiguously a lease-loop write; keeping the comparison
+        //   also catches any future writer or seed-ordering mistake.
+        //
+        // Same-epoch re-acquire (self-fence false alarm followed by a
+        // successful renew — no holder change, transition count
+        // unchanged): none of the signals move and this recovery is
+        // KEPT. Its result is valid (no foreign PG writes happened) and
+        // is used by the inline post-recovery dispatch and by any
+        // commands queued ahead of the already-queued LeaderLost; the
+        // queued LeaderLost + second LeaderAcquired will clear and
+        // re-run recovery regardless.
+        //
+        // Documented residual: two lease deletions inside a single
+        // recovery window can return the transition count to its entry
+        // value (ABA) while a foreign term dispatched in between — the
+        // generation stays saturated and the holder has re-acquired by
+        // gate time, so the gate misses it. That needs two operator
+        // deletions plus a full foreign term inside one recovery
+        // window; accepted.
         let gen_at_entry = self.leader.generation();
+        let transitions_at_entry = self.leader.acquired_transitions();
 
         let start = Instant::now();
         let result = self.recover_from_pg().await;
@@ -1365,28 +1396,41 @@ impl DagActor {
         metrics::counter!("rio_scheduler_recovery_total", "outcome" => outcome).increment(1);
         info!(elapsed_ms = elapsed.as_millis(), outcome, "recovery timing");
 
-        // TOCTOU re-check: did the lease task raise the generation
-        // during recovery? recover_from_pg doesn't touch self.leader's
-        // generation, so gen_now != gen_at_entry ⇒ lease flap onto a
-        // new epoch.
-        // The re-acquire's LeaderAcquired is already queued in our
-        // mpsc — discard this recovery, let the next one re-run.
+        // TOCTOU re-check: did leadership change hands (or lapse)
+        // during recovery? Trips on any of:
+        // - the generation moved (a lease-loop write — recover_from_pg
+        //   doesn't touch self.leader's generation),
+        // - the recorded acquire-transitions moved (a holder change
+        //   whose generation fetch_max was a no-op in the saturated
+        //   regime),
+        // - is_leader is false (a lose landed and we have not
+        //   re-acquired).
+        // In every discard case the lease loop has already queued the
+        // follow-up commands in our mpsc — discard this recovery, let
+        // the next LeaderAcquired re-run it.
         //
         // INVARIANT: no await may be introduced between this check and
         // set_recovery_complete() (either match arm below). Any await
         // here re-opens the window where a lose→re-acquire clears
         // recovery_complete and is then clobbered by our store(true),
         // ungating dispatch with a DAG loaded under a lost epoch — see
-        // the TOCTOU comment at the gen_at_entry snapshot. New PG
-        // round-trips belong ABOVE, with recover_from_pg, the
-        // sweep_stale_* calls, and the generation-claim loop.
+        // the comment at the gen_at_entry/transitions_at_entry
+        // snapshot. New PG round-trips belong ABOVE, with
+        // recover_from_pg, the sweep_stale_* calls, and the
+        // generation-claim loop. (The reads below are atomic loads, not
+        // awaits — the invariant holds as written.)
         let gen_now = self.leader.generation();
-        if gen_now != gen_at_entry {
+        let transitions_now = self.leader.acquired_transitions();
+        let still_leader = self.leader.is_leader();
+        if gen_now != gen_at_entry || transitions_now != transitions_at_entry || !still_leader {
             warn!(
                 gen_at_entry,
                 gen_now,
+                transitions_at_entry,
+                transitions_now,
+                still_leader,
                 recovery_ok = result.is_ok(),
-                "generation changed during recovery \u{2014} lease flapped; \
+                "leadership changed during recovery \u{2014} lease flapped or lapsed; \
                  DISCARDING this recovery (next LeaderAcquired will retry)"
             );
             metrics::counter!("rio_scheduler_recovery_total", "outcome" => "discarded_flap")

@@ -244,21 +244,23 @@ impl LeaseConfig {
 
 /// Shared leader state. The lease task writes; actor + health read.
 ///
-/// Three atomics — generation, is_leader, recovery_complete — all
-/// updated together on acquire/lose transitions. **All writes and
-/// reads use SeqCst** to prevent reordering on weak memory models
-/// (ARM). Previously is_leader/recovery_complete used Relaxed, which
-/// allowed a reader on ARM to see `recovery_complete=true` before
-/// `is_leader=true` during an acquire transition (the two stores
-/// reordered). SeqCst gives a single total order across all three
-/// atomics: if a reader sees the last store of a transition, it sees
-/// all prior stores too.
+/// Four atomics — generation, acquired_transitions, is_leader,
+/// recovery_complete — updated together on acquire/lose transitions
+/// (acquired_transitions is written on acquire only; `on_lose`
+/// deliberately leaves it recording the last acquire edge). **All
+/// writes and reads use SeqCst** to prevent reordering on weak memory
+/// models (ARM). Previously is_leader/recovery_complete used Relaxed,
+/// which allowed a reader on ARM to see `recovery_complete=true`
+/// before `is_leader=true` during an acquire transition (the two
+/// stores reordered). SeqCst gives a single total order across all
+/// these atomics: if a reader sees the last store of a transition, it
+/// sees all prior stores too.
 ///
 /// Transitions go through [`on_acquire`](Self::on_acquire) /
 /// [`on_lose`](Self::on_lose) rather than raw field stores — these
 /// encapsulate the multi-field update order.
 ///
-/// `Clone` is a cheap triple-Arc clone; main.rs clones once for the
+/// `Clone` is a cheap all-Arc clone; main.rs clones once for the
 /// lease loop, once for the actor, and uses the per-field accessors for
 /// the health-toggle polling loop.
 #[derive(Clone)]
@@ -268,6 +270,15 @@ pub struct LeaderState {
     /// DagActor.generation (see `generation_arc()` — this IS that
     /// Arc, cloned).
     generation: Arc<AtomicU64>,
+    /// The `leaseTransitions` count observed at the most recent acquire
+    /// edge. Unlike `generation` (a `fetch_max` that the PG-floor seed
+    /// can saturate into a no-op), this is stored unconditionally on
+    /// every [`on_acquire`](Self::on_acquire) — it is the holder-change
+    /// signal the recovery TOCTOU gate compares when the generation
+    /// cannot move. Only meaningful after the first acquire; `on_lose`
+    /// does not touch it (it records the last acquire edge — the gate
+    /// compares acquire edges, not the current lease state).
+    acquired_transitions: Arc<AtomicU64>,
     /// Whether we currently hold the lease. dispatch_ready early-
     /// returns if false (standby schedulers merge DAGs but don't
     /// dispatch — state warm for fast takeover).
@@ -334,6 +345,17 @@ impl LeaderState {
         self.is_leader.load(Ordering::SeqCst)
     }
 
+    /// The `leaseTransitions` count recorded by the most recent
+    /// [`on_acquire`](Self::on_acquire). `SeqCst` load — same
+    /// discipline as [`is_leader`](Self::is_leader) /
+    /// [`recovery_complete`](Self::recovery_complete). Changes on every
+    /// acquire that follows a holder change, even when the generation
+    /// `fetch_max` is a no-op (the saturated post-lease-deletion
+    /// regime) — which is exactly what the recovery TOCTOU gate needs.
+    pub fn acquired_transitions(&self) -> u64 {
+        self.acquired_transitions.load(Ordering::SeqCst)
+    }
+
     /// Whether the actor's `recover_from_pg` has completed since the
     /// last acquire. `SeqCst` load — pairs with
     /// [`set_recovery_complete`](Self::set_recovery_complete) and
@@ -380,6 +402,7 @@ impl LeaderState {
         let became_leader_at = is_leader.load(Ordering::SeqCst).then(Instant::now);
         Self {
             generation,
+            acquired_transitions: Arc::new(AtomicU64::new(0)),
             is_leader,
             recovery_complete,
             became_leader_at: Arc::new(parking_lot::RwLock::new(became_leader_at)),
@@ -396,6 +419,7 @@ impl LeaderState {
     pub fn always_leader(generation: Arc<AtomicU64>) -> Self {
         Self {
             generation,
+            acquired_transitions: Arc::new(AtomicU64::new(0)),
             is_leader: Arc::new(AtomicBool::new(true)),
             recovery_complete: Arc::new(AtomicBool::new(true)),
             // Non-K8s/test mode reports a real (small but growing) age
@@ -415,6 +439,7 @@ impl LeaderState {
     pub fn pending(generation: Arc<AtomicU64>) -> Self {
         Self {
             generation,
+            acquired_transitions: Arc::new(AtomicU64::new(0)),
             is_leader: Arc::new(AtomicBool::new(false)),
             recovery_complete: Arc::new(AtomicBool::new(false)),
             became_leader_at: Arc::new(parking_lot::RwLock::new(None)),
@@ -454,9 +479,19 @@ impl LeaderState {
     /// holder first) — either way the holder change is what increments
     /// the epoch.
     ///
-    /// SeqCst on both stores: the generation write happens-before the
-    /// is_leader write in the total order. A reader seeing is_leader=true
-    /// (SeqCst load) sees the new generation. recovery_complete is NOT
+    /// In the post-lease-deletion regime (the PG floor seeded the
+    /// generation past `lease_transitions + 1` via
+    /// [`seed_generation_from`](Self::seed_generation_from)), the
+    /// generation `fetch_max` here is a no-op even on a holder change.
+    /// The raw `lease_transitions` value is therefore recorded
+    /// unconditionally in `acquired_transitions` — the recovery TOCTOU
+    /// gate keys on that recorded count (plus `is_leader`), not on the
+    /// generation, to detect holder changes that land mid-recovery.
+    ///
+    /// SeqCst on all stores: the generation and acquired_transitions
+    /// writes happen-before the is_leader write in the total order. A
+    /// reader seeing is_leader=true (SeqCst load) sees the new
+    /// generation and the new transition count. recovery_complete is NOT
     /// set here — that's the actor's job after recover_from_pg finishes.
     // r[impl sched.lease.generation-fence+2]
     pub fn on_acquire(&self, lease_transitions: u64) -> u64 {
@@ -467,6 +502,11 @@ impl LeaderState {
             .generation
             .fetch_max(target, Ordering::SeqCst)
             .max(target);
+        // Unconditional store — that is the point: it changes on every
+        // acquire that follows a holder change, even when the
+        // generation fetch_max above is a no-op.
+        self.acquired_transitions
+            .store(lease_transitions, Ordering::SeqCst);
         self.is_leader.store(true, Ordering::SeqCst);
         // AFTER is_leader=true: a reader seeing `leader_for().is_some()`
         // also sees is_leader=true (RwLock acquire/release pairs with
@@ -483,6 +523,9 @@ impl LeaderState {
     /// Generation is NOT touched — the NEW leader derives its own
     /// from the lease's transition count on acquire; we don't know
     /// (and don't need to know) what that will be.
+    /// `acquired_transitions` is NOT touched either — it records the
+    /// last acquire edge, and the recovery TOCTOU gate compares acquire
+    /// edges, not the current lease state.
     pub fn on_lose(&self) {
         self.is_leader.store(false, Ordering::SeqCst);
         self.recovery_complete.store(false, Ordering::SeqCst);
@@ -1044,6 +1087,43 @@ mod tests {
             recovered.on_acquire(0),
             8,
             "PG seed past the (reset) transition count wins"
+        );
+    }
+
+    /// `acquired_transitions` records the raw transition count of the
+    /// most recent acquire edge, unconditionally — including in the
+    /// saturated regime where the PG-floor seed makes the generation
+    /// `fetch_max` a no-op. This is the holder-change signal the
+    /// scheduler's recovery TOCTOU gate compares; the generation alone
+    /// cannot serve once it is seeded past `lease_transitions + 1`.
+    #[test]
+    fn acquired_transitions_tracks_acquire_edges() {
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        state.on_acquire(0);
+        assert_eq!(state.acquired_transitions(), 0, "creator records 0");
+
+        // Saturated regime: the seed raises the generation past any
+        // value the lease can derive; subsequent acquires still record
+        // their transition count even though the generation is frozen.
+        state.seed_generation_from(8);
+        state.on_lose();
+        state.on_acquire(2);
+        assert_eq!(state.generation(), 8, "generation fetch_max is a no-op");
+        assert_eq!(
+            state.acquired_transitions(),
+            2,
+            "acquire edge recorded despite the frozen generation"
+        );
+
+        // Same-epoch re-acquire (no holder change): the recorded count
+        // does not move.
+        state.on_lose();
+        state.on_acquire(2);
+        assert_eq!(state.generation(), 8);
+        assert_eq!(
+            state.acquired_transitions(),
+            2,
+            "same transition count re-recorded verbatim"
         );
     }
 

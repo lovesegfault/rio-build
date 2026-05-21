@@ -765,6 +765,14 @@ module leaderElection {
   /// acquire-to-persist window for a deposed leader to die inside -- the
   /// window the pre-fix counterexample exploited (see the FIXED note at
   /// staleLeaderHasStaleGeneration).
+  ///
+  /// A holder change that lands while a recovery is still in flight is
+  /// caught by the actor's recovery discard gate (the generation +
+  /// recorded acquire-transitions + is_leader re-check in
+  /// handle_leader_acquired), which keeps recovery_complete false until
+  /// a recovery that observed the post-change state completes -- so the
+  /// atomic-step collapse above remains justified even when the
+  /// PG-seeded generation makes on_acquire's fetch_max a no-op.
   action steal(n: Node): bool = {
     val target = if (lease.gen + 2 > genHW + 1) lease.gen + 2 else genHW + 1
     val seeded = if (gen.get(n) > target) gen.get(n) else target

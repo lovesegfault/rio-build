@@ -1642,9 +1642,10 @@ async fn test_recovery_poisoned_orphan_build_fails(#[case] keep_going: bool) -> 
 
 // ---- Recovery TOCTOU on lease flap (remediation 08) ------------
 // r[verify sched.recovery.gate-dispatch]
-//   Generation snapshot + re-check: if the lease flaps (lose→
-//   reacquire) mid-recovery, discard the stale DAG instead of
-//   dispatching from it with the NEW generation stamped on.
+//   Snapshot + re-check of generation, recorded acquire-transitions,
+//   and is_leader: if the lease flaps (lose→reacquire) or lapses
+//   mid-recovery, discard the stale DAG instead of dispatching from
+//   it with the wrong epoch stamped on.
 
 /// Recovery TOCTOU: if the lease flaps (lose→reacquire, generation
 /// bumps) mid-recovery, discard the stale DAG instead of dispatching
@@ -1700,6 +1701,81 @@ async fn test_recovery_toctou_on_lease_flap(
     if !bump_gen {
         assert_eq!(generation.load(Ordering::Acquire), 2, "gen unchanged");
     }
+    Ok(())
+}
+
+/// Recovery TOCTOU in the saturated-generation regime: after a
+/// `kubectl delete lease`, the PG floor seeds the generation well past
+/// `leaseTransitions + 1`, and from then on `on_acquire`'s `fetch_max`
+/// is a generation no-op on every holder change. A foreign term (we
+/// lose, another replica leads and dispatches, we re-steal) that lands
+/// entirely inside our recovery window therefore leaves the generation
+/// untouched — the gate must key on the recorded acquire-transitions
+/// and on `is_leader`, not on the generation alone, to discard the
+/// stale recovery.
+///
+/// Unlike `test_recovery_toctou_on_lease_flap` (manual `fetch_add`),
+/// this drives the PRODUCTION transition functions
+/// (`on_lose`/`on_acquire`), so the gate sees exactly what the lease
+/// loop writes in this regime.
+// r[verify sched.recovery.gate-dispatch]
+#[rstest::rstest]
+#[case::foreign_term_discards(Some(7), false)]
+#[case::same_epoch_completes(Some(5), true)]
+#[case::lost_without_reacquire_discards(None, false)]
+#[tokio::test]
+async fn test_recovery_toctou_saturated_generation_flaps(
+    #[case] reacquire_transitions: Option<u64>,
+    #[case] expect_recovery_complete: bool,
+) -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    // Saturated regime: a previous term seeded generation 13 from the
+    // PG floor while the recreated Lease counts transitions from ~0.
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::new(AtomicU64::new(13)),
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    // Production acquire edge for the term under test: the generation
+    // fetch_max is a no-op against 13; the transition count is 5.
+    leader.on_acquire(5);
+
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+
+    let l = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = l;
+        p.recovery_toctou_gate = Some((reached_tx, release_rx));
+    });
+
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    tokio::time::timeout(Duration::from_secs(10), reached_rx)
+        .await
+        .expect("actor reached gate")
+        .expect("reached_tx not dropped");
+
+    // The flap, via production transitions: on_lose clears is_leader +
+    // recovery_complete; a re-acquire in this regime never moves the
+    // generation, whatever the new transition count is.
+    leader.on_lose();
+    if let Some(transitions) = reacquire_transitions {
+        leader.on_acquire(transitions);
+    }
+
+    release_tx.send(()).expect("actor still listening");
+    barrier(&handle).await;
+
+    assert_eq!(
+        leader.recovery_complete(),
+        expect_recovery_complete,
+        "reacquire_transitions={reacquire_transitions:?}: recovery_complete must be \
+         {expect_recovery_complete}"
+    );
+    // In ALL cases the generation never moves — any discard above came
+    // from the transitions/is_leader signal, not from a generation
+    // change.
+    assert_eq!(leader.generation(), 13, "generation stays saturated");
     Ok(())
 }
 
