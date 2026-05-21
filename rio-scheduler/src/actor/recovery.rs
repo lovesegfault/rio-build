@@ -1180,9 +1180,17 @@ impl DagActor {
         // rebuild, not the execution this build observed. The exec_id
         // is recoverable here: the drv was `Assigned`/`Running` at
         // crash, so `load_nonterminal_derivations`'s `assignments`
-        // JOIN populated `state.exec_id` at recovery load. The helper
-        // no-ops if it didn't (defensive).
-        self.record_exec_correlation(drv_hash, &interested);
+        // JOIN populated `state.exec_id` at recovery load. Resolved at
+        // this call site (the epilogue is not used on this path — the
+        // buffer is empty and the log is already lost); skip the write
+        // if neither carrier has it.
+        if let Some(exec_id) = self
+            .dag
+            .node(drv_hash)
+            .and_then(|s| self.exec_id_for_terminal(s))
+        {
+            self.record_exec_correlation(drv_hash, exec_id, &interested);
+        }
         // Recovery's set_log_exec stamped a LogBuffers entry so a
         // still-streaming worker could pass the push_for binding gate.
         // On this arm the worker never reconnects (collect_orphaned_assignments

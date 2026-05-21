@@ -494,6 +494,13 @@ impl DagActor {
     /// finalized at an earlier terminal and the node was reset out of
     /// it (I-094 reprobe / I-047 stale-output reset — `transition()`
     /// drops the carrier on terminal-exit).
+    ///
+    /// Called from [`Self::terminal_log_epilogue`] (once, at the top —
+    /// the resolved value is threaded to the seal/flush/correlate
+    /// steps) and from recovery's `adopt_orphan_completion` (which
+    /// resolves at its own call site before calling
+    /// [`Self::record_exec_correlation`]). The flush/correlate helpers
+    /// no longer resolve it individually.
     pub(super) fn exec_id_for_terminal(
         &self,
         state: &crate::state::DerivationState,
@@ -521,7 +528,11 @@ impl DagActor {
     /// lanes, now cleared by `transition()`). Firing the epilogue on
     /// that stale carrier records `bd.exec_id` for an execution this
     /// build never observed and enqueues a `FlushRequest` that
-    /// `flush_final`'s staleness guard immediately drops.
+    /// `flush_final`'s staleness guard immediately drops. The epilogue
+    /// now *also* self-gates on `exec_id_for_terminal` internally, but
+    /// that inner gate would accept the stale `state.exec_id` carrier
+    /// this outer gate exists to reject — which is why both gates
+    /// coexist.
     ///
     /// Known residual (conscious choice): in the window between a
     /// terminal's `trigger_log_flush` and the flusher's `drain()`, the
@@ -552,29 +563,21 @@ impl DagActor {
     ///
     /// `status` lands in `drv_logs.status` (no production read path
     /// consumes it yet — see `FlushRequest::status`). The request pins
-    /// the resolved `exec_id` ([`Self::exec_id_for_terminal`]) so a
-    /// re-dispatch racing the flusher's mpsc can't be drained by a stale
-    /// request — see `FlushRequest::exec_id`.
-    pub(super) fn trigger_log_flush(&self, drv_hash: &DrvHash, status: &'static str) {
+    /// the `exec_id` resolved once by [`Self::terminal_log_epilogue`]
+    /// so a re-dispatch racing the flusher's mpsc can't be drained by a
+    /// stale request — see `FlushRequest::exec_id`.
+    pub(super) fn trigger_log_flush(
+        &self,
+        drv_hash: &DrvHash,
+        exec_id: Uuid,
+        status: &'static str,
+    ) {
         let Some(state) = self.dag.node(drv_hash) else {
-            // Should be impossible at this call site (completion handlers
-            // already validated the hash exists in the DAG), but defensive.
+            // Unreachable: the epilogue (sole caller) already early-returned
+            // on this condition and the two calls are synchronous in the same
+            // actor handler. Kept as a defensive arm — the lookup is needed
+            // for `drv_path` regardless.
             warn!(drv_hash = %drv_hash, "trigger_log_flush: hash not in DAG, skipping");
-            return;
-        };
-        let Some(exec_id) = self.exec_id_for_terminal(state) else {
-            // No execution ran (cached terminal, or a poison/cascade path
-            // that never dispatched). There is nothing to key a `drv_logs`
-            // row on; the flusher would skip anyway. Don't queue a request.
-            // debug!, not warn!: every cause of a missing exec_id here is a
-            // documented expected no-op — same choice as handle_forward_phase's
-            // binding gate and push_for's reject arms. Pre-refactor this fell
-            // through to flush_final's debug!-level "no buffer" arm.
-            tracing::debug!(
-                drv_hash = %drv_hash,
-                status,
-                "trigger_log_flush: no exec_id (never dispatched)"
-            );
             return;
         };
         let drv_path = state.drv_path().to_string();
@@ -611,11 +614,13 @@ impl DagActor {
     /// conditions below) keeps `build_derivations.exec_id` `NULL`,
     /// falling back to latest-exec resolution.
     ///
-    /// No-op (silent) when both `state.exec_id` and the `LogBuffers`
-    /// entry's stamp are `None` (never-dispatched drvs — see
-    /// [`Self::exec_id_for_terminal`]), or when `state.db_id` is `None`
-    /// (nodes whose merge tx hasn't committed — impossible here; merge
-    /// commits before any dispatch — but cheap to guard).
+    /// No-op (silent) when `state.db_id` is `None` (nodes whose merge
+    /// tx hasn't committed — impossible here; merge commits before any
+    /// dispatch — but cheap to guard). The never-dispatched skip (both
+    /// exec_id carriers `None`) now belongs to the callers: both
+    /// [`Self::terminal_log_epilogue`] and recovery's
+    /// `adopt_orphan_completion` resolve [`Self::exec_id_for_terminal`]
+    /// before calling and pass the resolved value in.
     ///
     /// The UPDATE carries `AND exec_id IS NULL`: a (build, drv)
     /// observation is written exactly once. A build that already
@@ -626,17 +631,16 @@ impl DagActor {
     /// it.
     ///
     /// r[impl sched.merge.exec-correlation+6]
-    pub(super) fn record_exec_correlation(&self, drv_hash: &DrvHash, interested_builds: &[Uuid]) {
+    pub(super) fn record_exec_correlation(
+        &self,
+        drv_hash: &DrvHash,
+        exec_id: Uuid,
+        interested_builds: &[Uuid],
+    ) {
         let Some(state) = self.dag.node(drv_hash) else {
             return;
         };
         let Some(derivation_id) = state.db_id else {
-            return;
-        };
-        // Same fallback as `trigger_log_flush` — poison-while-Ready paths
-        // run after `reset_to_ready` cleared `state.exec_id` but before
-        // `assign_to_worker` re-stamps it. See `exec_id_for_terminal`.
-        let Some(exec_id) = self.exec_id_for_terminal(state) else {
             return;
         };
         if interested_builds.is_empty() {
@@ -709,10 +713,11 @@ impl DagActor {
     /// - `terminal_failure_epilogue` — `"failed"` (covers `Poisoned` via
     ///   `poison_and_cascade`/`handle_permanent_failure`, timeout-exhausted
     ///   `Cancelled` via `handle_timeout_failure`, and `DependencyFailed`
-    ///   via `handle_substitute_complete`'s revert arm — a no-op for
-    ///   never-dispatched drvs, but a *reset* drv re-probed into
-    ///   `Substituting` retains the prior execution's buffer stamp and
-    ///   gets correctly finalized here)
+    ///   via `handle_substitute_complete`'s revert arm — the epilogue
+    ///   self-gates on [`Self::exec_id_for_terminal`] and skips
+    ///   never-dispatched drvs entirely (no seal tombstone), but a
+    ///   *reset* drv re-probed into `Substituting` retains the prior
+    ///   execution's buffer stamp and gets correctly finalized here)
     /// - `cancel_build_derivations` (`to_cancel` arm) — `"cancelled"`
     ///   (build-level cancellation/failure of an `Assigned`/`Running`
     ///   drv: `handle_cancel_build`, per-build wall-clock timeout,
@@ -724,12 +729,13 @@ impl DagActor {
     ///   entry stamped with the prior (reset) execution's `exec_id` —
     ///   that execution's `.partial` row must be finalized here or it
     ///   lingers at `is_complete=false` for the 30-day TTL as the
-    ///   latest exec for the drv. The never-dispatched majority of
-    ///   those arms (`Queued`/`Created`, first-attempt
-    ///   `Ready`/`Substituting`) have no exec_id from either carrier
-    ///   and skip the call — nothing to finalize, and the epilogue's
-    ///   unconditional seal would insert a tombstone for a buffer
-    ///   that never existed.
+    ///   latest exec for the drv. The outer `has_buffered_exec_log`
+    ///   gate is retained even though the epilogue now self-gates on
+    ///   [`Self::exec_id_for_terminal`]: the outer gate is *stricter*
+    ///   — it rejects a stale `state.exec_id` with no retained buffer
+    ///   (a recovery restamp from a leaked `assignments` row), which
+    ///   the inner gate would accept and mis-attribute. See
+    ///   [`Self::has_buffered_exec_log`] for the full rationale.
     ///
     /// NOT called from:
     /// - `adopt_orphan_completion` (recovery) — the worker disconnected
@@ -779,10 +785,9 @@ impl DagActor {
     /// buffered, and the seal cannot remove buffered lines. A
     /// `status='cancelled'` log can therefore still end with a
     /// `rio: result` line that disagrees with the row; the row is
-    /// authoritative. Flush before correlate
-    /// — both fire-and-forget but the flush request pins the `exec_id`
-    /// it resolves, so it should resolve from the same snapshot of
-    /// `state` as the correlate.
+    /// authoritative. All three steps share the single resolution
+    /// performed at the top of this function, so the flush request and
+    /// the `bd.exec_id` write cannot name different executions.
     ///
     /// r[impl sched.merge.exec-correlation+6]
     pub(super) fn terminal_log_epilogue(
@@ -791,9 +796,38 @@ impl DagActor {
         status: &'static str,
         interested_builds: &[Uuid],
     ) {
+        let Some(state) = self.dag.node(drv_hash) else {
+            // Should be impossible at this call site (terminal handlers
+            // already validated the hash exists in the DAG), but defensive
+            // — this is the lookup `trigger_log_flush` used to do.
+            warn!(drv_hash = %drv_hash, "terminal_log_epilogue: hash not in DAG, skipping");
+            return;
+        };
+        // Resolve the execution to finalize ONCE and thread it through all
+        // three steps. A per-step re-resolution diverges two ways: (a) a
+        // never-dispatched drv (no exec_id from either carrier) would seal
+        // a tombstone that the skipped flush never unseals — it lingers in
+        // `LogBuffers::sealed` until CleanupTerminalBuild reaps the build;
+        // (b) when the carrier is the LogBuffers entry (state.exec_id
+        // cleared by reset_to_ready), the flush's try_send wakes the
+        // flusher, which can drain the entry on a sibling thread before a
+        // re-resolution in the correlate step re-reads it — bd.exec_id
+        // would stay NULL for an execution that was just finalized.
+        let Some(exec_id) = self.exec_id_for_terminal(state) else {
+            // Never dispatched: nothing to seal, flush, or correlate.
+            // debug!, not warn!: every cause is a documented expected
+            // no-op (cached terminal, never-dispatched poison, cascaded
+            // DependencyFailed, first-attempt substitute revert).
+            tracing::debug!(
+                drv_hash = %drv_hash,
+                status,
+                "terminal_log_epilogue: no exec_id from either carrier (never dispatched), skipping"
+            );
+            return;
+        };
         self.seal_log_buffer(drv_hash);
-        self.trigger_log_flush(drv_hash, status);
-        self.record_exec_correlation(drv_hash, interested_builds);
+        self.trigger_log_flush(drv_hash, exec_id, status);
+        self.record_exec_correlation(drv_hash, exec_id, interested_builds);
     }
 
     /// Seal the log ring buffer for `drv_hash` so late `LogBatch`

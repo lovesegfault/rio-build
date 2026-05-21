@@ -295,9 +295,9 @@ when the node is reset out of a terminal) and falls back to the
 `LogBuffers` ring-buffer entry's stamped
 `exec_id` --- covering poison-while-Ready, where `reset_to_ready` clears
 `state.exec_id` but the buffer entry retains the disconnected execution's
-stamp through the disconnect→re-dispatch window. The helper no-ops only
-when *both* carriers are `None`, which covers every never-dispatched
-terminal regardless of its enum value.
+stamp through the disconnect→re-dispatch window. The epilogue skips all
+three steps (seal, flush, correlate) when *both* carriers are `None`, which
+covers every never-dispatched terminal regardless of its enum value.
 
 The build↔exec correlation lets the dashboard's build view fetch the *exact*
 log a build observed (`GetDerivationLogs(drv, exec_id)`) instead of falling

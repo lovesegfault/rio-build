@@ -82,9 +82,10 @@ pub struct FlushRequest {
     /// source for the S3 key `logs/{drv_hash}/{exec_id}.log.zst` and PG
     /// `drv_logs.drv_hash` column via [`drv_log_hash`].
     pub drv_path: String,
-    /// The execution this request is FOR. The actor reads
-    /// `state.exec_id` at terminal time and pins it here so a stale
-    /// request can't drain a re-dispatched execution's buffer.
+    /// The execution this request is FOR — resolved once by
+    /// `terminal_log_epilogue` via `exec_id_for_terminal` and pinned
+    /// here so a stale request can't drain a re-dispatched execution's
+    /// buffer.
     ///
     /// `flush_final` compares this against the live ring-buffer entry's
     /// `exec_id`. Mismatch ⇒ a re-dispatch (`discard` + `set_exec` with a

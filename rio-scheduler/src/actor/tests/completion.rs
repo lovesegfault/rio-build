@@ -3478,13 +3478,15 @@ async fn completion_records_build_exec_correlation() -> TestResult {
 /// `assign_to_worker` re-stamps, `state.exec_id` is `None` while the
 /// buffer holds the disconnected execution's lines.
 ///
-/// `trigger_log_flush` MUST fall back to the buffer's stamped exec_id
-/// so the execution that DID run gets its final `.log.zst` blob,
-/// `drv_logs` row marked `is_complete=true`/`status='failed'`, and
-/// `record_exec_correlation` gets a non-NULL `build_derivations.exec_id`.
+/// The epilogue's single resolution MUST fall back to the buffer's
+/// stamped exec_id so the execution that DID run gets its final
+/// `.log.zst` blob, `drv_logs` row marked
+/// `is_complete=true`/`status='failed'`, and `record_exec_correlation`
+/// gets a non-NULL `build_derivations.exec_id`. `trigger_log_flush`
+/// receives the resolved value as a parameter.
 ///
-/// Pre-fix: early-returned on `state.exec_id == None`, no
-/// `FlushRequest` queued.
+/// Pre-fix: the resolution early-returned on `state.exec_id == None`,
+/// no `FlushRequest` queued.
 ///
 /// Verifies the actor-side carrier resolution that feeds the
 /// exec-keyed storage; the storage-key shape itself is verified in
@@ -3531,14 +3533,17 @@ async fn flush_falls_back_to_buffer_exec_id_after_reset_to_ready() -> TestResult
         "push_for should accept a batch from the stamped executor"
     );
 
-    // Trigger the flush. Pre-fix: early-returned on `state.exec_id ==
-    // None`, no FlushRequest. Post-fix: falls back to the buffer's stamp.
-    actor.trigger_log_flush(&DrvHash::from("fb-drv"), "failed");
+    // Drive the full epilogue (the resolution now lives there, not in
+    // trigger_log_flush). Pre-fix the resolution early-returned on
+    // `state.exec_id == None`; post-fix it falls back to the buffer's
+    // stamp and threads the value to the flush.
+    actor.terminal_log_epilogue(&DrvHash::from("fb-drv"), "failed", &[]);
 
     let req = flush_rx.try_recv().expect(
-        "trigger_log_flush should fall back to the LogBuffers entry's \
-         exec_id when state.exec_id is None (reset_to_ready cleared it \
-         before poison-while-Ready reached terminal_failure_epilogue)",
+        "the epilogue's resolution should fall back to the LogBuffers \
+         entry's exec_id when state.exec_id is None (reset_to_ready \
+         cleared it before poison-while-Ready reached \
+         terminal_failure_epilogue)",
     );
     assert_eq!(
         req.exec_id, exec_id,
@@ -3546,17 +3551,36 @@ async fn flush_falls_back_to_buffer_exec_id_after_reset_to_ready() -> TestResult
     );
     assert_eq!(req.drv_path, drv_path);
     assert_eq!(req.status.as_deref(), Some("failed"));
+    // Inverse of `epilogue_skips_never_dispatched_drv`: a drv WITH a
+    // resolvable execution still gets sealed.
+    assert!(
+        log_buffers.is_sealed(&drv_path),
+        "a drv with a resolvable execution must still be sealed"
+    );
     Ok(())
 }
 
-/// Negative: when neither carrier has an exec_id (never dispatched),
-/// `trigger_log_flush` MUST still skip — there is no execution to
-/// flush and no `drv_logs` row to write. Guards against the fallback
-/// over-firing.
+/// A never-dispatched drv (no exec_id from either carrier, no LogBuffers
+/// entry) reaching `terminal_log_epilogue` must be a complete no-op:
+/// no FlushRequest, no `bd.exec_id` write, and — the regression — no
+/// seal tombstone. `seal()` inserts into `LogBuffers::sealed`
+/// unconditionally and the only reactive removal is `flush_final`'s
+/// post-drain `unseal()`, which never runs if no request is enqueued;
+/// an ungated seal therefore lingers until `CleanupTerminalBuild` reaps
+/// the build (hours under --keep-going) and inflates `sealed_count()`,
+/// the documented leak signal.
 ///
+/// Production shape: `handle_substitute_complete`'s ok=false revert on a
+/// first-attempt Substituting drv whose dep is Poisoned
+/// (`revert_target_for` → DependencyFailed → `terminal_failure_epilogue`
+/// → this epilogue), and `poison_and_cascade` on a Ready drv whose prior
+/// buffer is gone. Both call the epilogue ungated; the gate must live
+/// inside it.
+///
+/// r[verify sched.merge.exec-correlation+6]
 /// r[verify obs.log.exec-keyed]
 #[tokio::test]
-async fn flush_skips_when_neither_carrier_has_exec_id() -> TestResult {
+async fn epilogue_skips_never_dispatched_drv() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
     let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(8);
@@ -3564,39 +3588,64 @@ async fn flush_skips_when_neither_carrier_has_exec_id() -> TestResult {
         SchedulerDb::new(db.pool.clone()),
         DagActorConfig::default(),
         DagActorPlumbing {
-            log_buffers: Some(log_buffers),
+            log_buffers: Some(log_buffers.clone()),
             log_flush_tx: Some(flush_tx),
             ..Default::default()
         },
     );
 
-    // Ready node with no LogBuffers entry — never dispatched.
+    // Ready node, no LogBuffers entry, state.exec_id None — never dispatched.
     actor.test_inject_ready("nd-drv", None, "x86_64-linux", false);
-    actor.trigger_log_flush(&DrvHash::from("nd-drv"), "failed");
+    let drv_path = test_drv_path("nd-drv");
 
+    // `interested_builds` deliberately non-empty so the correlate skip is
+    // attributable to the exec_id gate, not the `is_empty()` early-return.
+    actor.terminal_log_epilogue(&DrvHash::from("nd-drv"), "failed", &[Uuid::new_v4()]);
+
+    // (1) No FlushRequest. Also proves no bd.exec_id UPDATE was issued:
+    // flush and correlate are gated by the same single resolution, so a
+    // skipped flush implies a skipped correlate (a direct NULL-check on
+    // build_derivations would need a flat sleep against a spawned write —
+    // a negative proven by sleeping can only false-pass under load).
     assert!(
         flush_rx.try_recv().is_err(),
-        "no exec_id from either carrier → no FlushRequest"
+        "never-dispatched drv must not enqueue a FlushRequest"
+    );
+    // (2) THE REGRESSION: no seal tombstone for a buffer that never
+    // existed. Pre-fix, seal_log_buffer ran before the gate.
+    assert!(
+        !log_buffers.is_sealed(&drv_path),
+        "never-dispatched drv must not leave a seal tombstone (nothing will ever unseal it)"
+    );
+    // Key-independent backstop: even if the assertion key above ever
+    // diverged from the key the actor seals (the drv_log_hash
+    // fixture-collision trap), an empty set cannot hide a tombstone.
+    assert_eq!(
+        log_buffers.sealed_count(),
+        0,
+        "sealed_count is the leak signal"
     );
     Ok(())
 }
 
-/// `record_exec_correlation`'s fallback is the second of the two
-/// readers fixed by `exec_id_for_terminal`. The shared helper means a
-/// regression in the fallback itself is caught by
-/// `flush_falls_back_to_buffer_exec_id_after_reset_to_ready`, but a
-/// regression that re-inlines a bare `state.exec_id` read at this
-/// call site would not. Exercise the same `state.exec_id = None` /
-/// buffer-stamped shape and assert the `build_derivations` UPDATE
-/// landed with the buffer's stamp.
+/// The correlate step must record the buffer-fallback exec_id when
+/// `state.exec_id` is `None`. Post-fix this also pins Facet B's
+/// structural fix: the correlate receives the exec_id resolved
+/// *before* `trigger_log_flush` woke the flusher, so a flusher that
+/// drains the buffer between the two steps cannot null out the
+/// correlation. (The race itself is not deterministically testable —
+/// same stance as `has_buffered_exec_log`'s "no test can
+/// deterministically exercise the window" note — but the value's
+/// provenance is now a function parameter, not a re-read.)
 ///
 /// Seeds `derivations`/`builds`/`build_derivations` directly via SQL
 /// (the established pattern in `admin/tests/graph_tests.rs`) so the
 /// in-memory node's `db_id` matches a real row the UPDATE can hit —
 /// `test_inject_ready` alone does not persist to PG.
 ///
-/// Pre-fix: early-returned on `state.exec_id == None`, no UPDATE,
-/// `build_derivations.exec_id` stays NULL forever.
+/// Pre-fix: the per-step resolution early-returned on
+/// `state.exec_id == None`, no UPDATE, `build_derivations.exec_id`
+/// stays NULL forever.
 ///
 /// r[verify sched.merge.exec-correlation+6]
 #[tokio::test]
@@ -3647,8 +3696,9 @@ async fn exec_correlation_falls_back_to_buffer_exec_id() -> TestResult {
     let exec_id = uuid::Uuid::now_v7();
     log_buffers.set_exec(&test_drv_path("ec-fb-drv"), exec_id, "old-worker");
 
-    // Pre-fix: early-returned on `state.exec_id == None`, no UPDATE.
-    actor.record_exec_correlation(&DrvHash::from("ec-fb-drv"), &[build_id]);
+    // Drive the full epilogue. Pre-fix the per-step resolution
+    // early-returned on `state.exec_id == None`, no UPDATE.
+    actor.terminal_log_epilogue(&DrvHash::from("ec-fb-drv"), "failed", &[build_id]);
 
     // Poll PG: the exec-correlation write is spawned (fire-and-forget).
     // Established 10ms × 100 pattern (see helpers::wait_for_status).
@@ -3772,7 +3822,7 @@ async fn exec_correlation_skips_terminal_builds() -> TestResult {
     actor.builds.insert(b2, info2);
 
     // The re-completion's fan-out still contains the finished B1.
-    actor.record_exec_correlation(&DrvHash::from("ec-term-drv"), &[b1, b2]);
+    actor.record_exec_correlation(&DrvHash::from("ec-term-drv"), x2, &[b1, b2]);
 
     // Wait for the write that SHOULD happen (B2 → X2), then check the
     // one that shouldn't (B1 stays X1). Established 10ms × 100 poll —

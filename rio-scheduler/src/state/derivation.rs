@@ -781,12 +781,14 @@ pub struct DerivationState {
     /// terminal → non-terminal reset (I-094 reprobe, I-047 stale-output
     /// reset — the prior execution was already finalized at its
     /// terminal and must not be attributed to the node's next
-    /// lifecycle). Readers in `trigger_log_flush` and
-    /// `record_exec_correlation` (`actor/event.rs::exec_id_for_terminal`)
-    /// can run between a `reset_to_ready` and the next `assign_to_worker`
-    /// when a poison-while-Ready path (I-065 fleet exhaustion,
+    /// lifecycle). The reader is `terminal_log_epilogue` (which
+    /// resolves once via `actor/event.rs::exec_id_for_terminal` and
+    /// threads the value to the seal/flush/correlate steps) plus
+    /// recovery's `adopt_orphan_completion`; the resolution can run
+    /// between a `reset_to_ready` and the next `assign_to_worker` when
+    /// a poison-while-Ready path (I-065 fleet exhaustion,
     /// max_infra/timeout_retries cap) reaches `terminal_failure_epilogue`
-    /// first. Those readers fall back to the `LogBuffers` entry's stamped
+    /// first, and falls back to the `LogBuffers` entry's stamped
     /// exec_id, which `reset_to_ready` does NOT clear (the lines and
     /// stamp are still needed by the periodic flusher in the
     /// reset→re-dispatch window).
