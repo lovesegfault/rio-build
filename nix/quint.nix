@@ -266,5 +266,46 @@ in
           "staleLeaderHasStaleGeneration"
         ];
       };
+
+      # The same model under the asymmetric-TTL constants — THE HEALTHY
+      # REGIME. The base and deletion regimes keep zero fence/steal
+      # separation and model the degraded case, where dual belief is
+      # reachable and boundedDualLeadership (every dual-belief state has
+      # a discovery mechanism armed) is the operative property. This
+      # regime gives the model the separation the asymmetric-TTL change
+      # gives production (fence at LEASE_TTL - FENCE_MARGIN, steal at
+      # LEASE_TTL + FENCE_MARGIN), and the operative property upgrades to
+      # neverDual: no two replicas ever simultaneously believe they lead,
+      # over the full state space. neverDual holds iff
+      # STEAL_AFTER - FENCE_AFTER >= RENEW + 2*MAX_SKEW (production:
+      # 2*FENCE_MARGIN >= RENEW_INTERVAL + 2*clock_skew — an 8s
+      # separation against a 5s renew interval leaves a 1.5s skew
+      # budget, which is rio-lease's compile-time assertion). The
+      # boundary is measured from both sides — one tick less separation
+      # and neverDual is violated — and the second-acquisition
+      # reachability probe proves the contention it constrains actually
+      # happens. See leaderElectionAsymmetric's module comment for the
+      # boundary procedure and the non-vacuity evidence; the measured
+      # depths are in the introducing commit. neverDual is the
+      # verification of both the self-fence ordering claim (the victim
+      # has provably stopped believing before any thief steals) and the
+      # at-most-one-leader soft half (the dual-belief window is empty
+      # under bounded skew).
+      # r[verify sched.lease.at-most-one-leader+3]
+      # r[verify sched.lease.self-fence+2]
+      quint-leader-election-asymmetric = mkQuintCheck {
+        name = "leader-election-asymmetric";
+        spec = "leaderElection";
+        main = "leaderElectionAsymmetric";
+        invariants = [
+          "boundsOK"
+          "clockSkewBound"
+          "atMostOneCASWinner"
+          "loopInterval"
+          "boundedDualLeadership"
+          "staleLeaderHasStaleGeneration"
+          "neverDual"
+        ];
+      };
     };
 }

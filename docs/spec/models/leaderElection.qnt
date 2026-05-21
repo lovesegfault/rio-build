@@ -1231,3 +1231,86 @@ module leaderElectionDeletion {
     MAX_RESTORES = 0
   ).*
 }
+
+// =========================================================================
+// THE HEALTHY REGIME: the asymmetric-TTL split. FENCE_AFTER = 2 and
+// STEAL_AFTER = 5 (separation 3); every other constant identical to
+// leaderElectionBase (see that module for the coverage-vs-cost argument
+// behind the shared constants). No faults beyond crash/recovery and
+// clock skew -- the separation, not a fault budget, is what
+// distinguishes this regime.
+//
+// The base and Deletion regimes keep ZERO separation and model the
+// DEGRADED case: dual belief is reachable there and
+// boundedDualLeadership (every dual-belief state has a discovery
+// mechanism armed) is the operative property. This regime models what
+// the asymmetric-TTL change gives production (SELF_FENCE_AFTER =
+// LEASE_TTL - FENCE_MARGIN = 11s, STEAL_AFTER = LEASE_TTL + FENCE_MARGIN
+// = 19s), and the operative property upgrades to neverDual: NO
+// dual-belief state is reachable at all.
+//
+// WHY IT HOLDS -- the separation condition:
+//
+//   neverDual holds  iff  STEAL_AFTER - FENCE_AFTER >= RENEW + 2*MAX_SKEW
+//
+// A thief may steal only after measuring > STEAL_AFTER of staleness on
+// its own clock since the last rv change. The victim's fence is anchored
+// to the same rv change (its last completed write -- a bare read does
+// not move the anchor; see apiGet), so the victim's fence age is within
+// 2*MAX_SKEW of the thief's measurement. The victim self-fences at
+// FENCE_AFTER and loopInterval gives it at most RENEW more ticks past
+// the deadline before the tick cap forces the fence to fire or the clock
+// to stop. The steal threshold is therefore unreachable while the victim
+// still believes iff STEAL_AFTER - 2*MAX_SKEW >= FENCE_AFTER + RENEW.
+// The RENEW term is the victim's fence-CHECK latency (the loop only
+// looks at the deadline once per tick) -- the textbook margin condition
+// that omits it is wrong, and the model is where the omission was
+// caught. The production translation: 2*FENCE_MARGIN >= RENEW_INTERVAL +
+// 2*clock_skew, i.e. 8s >= 5s + 2*skew -- a 1.5s one-sided clock-skew
+// budget, encoded as rio-lease's compile-time assertion. A clock pause
+// longer than that re-opens the window, which is the impossibility
+// result the generation fence backstops.
+//
+// BOUNDARY PROCEDURE (re-verify after any change to the tick/fence/steal
+// encoding or these constants; the violation depths are measurements and
+// live in the introducing commit's message, not here):
+//   - Separation 3 (this module: STEAL_AFTER = 5): 3 >= RENEW +
+//     2*MAX_SKEW = 3 -- neverDual HOLDS, with equality. The margin is
+//     exactly sufficient.
+//   - Separation 2 (set STEAL_AFTER = 4): 2 < 3 -- neverDual MUST be
+//     VIOLATED. The boundary from below: one tick less separation and a
+//     dual-belief state is reachable.
+//   - Separation 0 (set STEAL_AFTER = 2): neverDual MUST be VIOLATED.
+//     The degraded regime reproduced inside this instantiation.
+//   If either weakened run stops producing its counterexample, the
+//   constants no longer reach the dual-belief interleavings and
+//   neverDual is vacuously true -- revisit before trusting the green
+//   run.
+//
+// NON-VACUITY at these constants (re-verify after any constant change):
+//   - The margin is LOAD-BEARING: the separation-2 and separation-0 runs
+//     above. neverDual holds because of the separation, not because the
+//     constants made contention unreachable.
+//   - Steals are still REACHABLE at STEAL_AFTER = 5: a temporary
+//     invariant `lease.gen < 2` is violated -- the lease's transition
+//     count reaches 2 only via a steal of a previously-held lease, so
+//     the contention scenario neverDual constrains actually happens
+//     within MAX_TIME = 8 (a node that GETs at t=0 needs its observation
+//     to age past STEAL_AFTER = 5, so the steal fires in the last three
+//     ticks). neverDual is not vacuously true.
+// =========================================================================
+module leaderElectionAsymmetric {
+  import leaderElection(
+    NODES = Set("n1", "n2"),
+    FENCE_AFTER = 2,
+    STEAL_AFTER = 5,
+    RENEW = 1,
+    MAX_SKEW = 1,
+    MAX_TIME = 8,
+    MAX_GEN = 4,
+    MAX_RV = 8,
+    MAX_DELETES = 0,
+    MAX_CLAIM_FAILURES = 0,
+    MAX_RESTORES = 0
+  ).*
+}
