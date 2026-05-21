@@ -46,11 +46,16 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::serde_json::json;
 use kube::api::{Api, Patch, PatchParams};
+// tokio's Instant, not std's: identical semantics in production (a thin
+// wrapper over std's monotonic clock), but it follows tokio's test clock
+// under `start_paused`, which is what makes the lease loop's fence-check
+// cadence testable end to end (see the loop-cadence test in `mod tests`).
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 mod election;
@@ -131,11 +136,21 @@ const RENEW_SLOP: Duration = Duration::from_secs(2);
 ///       8s          ≥       5s        + 2 × skew
 /// ```
 ///
-/// The renew-interval term is the victim's fence-check latency (the loop
-/// only checks `maybe_self_fence` once per tick); what remains is a 1.5s
-/// one-sided clock-skew budget — far above NTP drift on cloud nodes. A
-/// clock pause longer than that re-opens the window, which is the
-/// impossibility result the generation fence
+/// The renew-interval term is the victim's fence-check latency:
+/// `run_lease_loop` evaluates `maybe_self_fence` at the top of every
+/// tick, before starting the renew attempt (the error arm re-evaluates
+/// when a failed attempt resolves — an additional, earlier opportunity,
+/// never the only one), so the fence fires at most one RENEW_INTERVAL
+/// after the deadline crossing. The model anchors the victim's fence at
+/// the apiserver COMMIT of its last renew, while production stamps
+/// `last_successful_renew` at the RESPONSE arrival; that is sound
+/// because renew attempts start exactly on interval ticks and the send
+/// precedes the commit, so the anchoring renew's response latency cannot
+/// push the firing tick past the commit-anchored bound (commit +
+/// SELF_FENCE_AFTER + RENEW_INTERVAL) the model assumes. What remains of
+/// the separation is a 1.5s one-sided clock-skew budget — far above NTP
+/// drift on cloud nodes. A clock pause longer than that re-opens the
+/// window, which is the impossibility result the generation fence
 /// (r\[sched.lease.generation-fence+2\]) backstops. The model also shows
 /// the bound is tight: one tick less separation and a dual-belief state
 /// is reachable.
@@ -167,11 +182,24 @@ const _: () = {
         "STEAL_AFTER must be LEASE_TTL + FENCE_MARGIN"
     );
     // The model-verified NeverDual condition: the fence/steal separation
-    // must exceed the renew interval (the remainder is the clock-skew
-    // budget).
+    // must exceed the renew interval — the victim's fence-check latency,
+    // which the tick-time check at the top of run_lease_loop's loop body
+    // bounds to one tick (the remainder is the clock-skew budget).
     assert!(
         2 * FENCE_MARGIN.as_secs() > RENEW_INTERVAL.as_secs(),
         "the fence/steal separation must exceed the renew interval"
+    );
+    // The tick-time fence check at the top of run_lease_loop's loop is
+    // the premise of the NeverDual derivation (fence-check latency at
+    // most one tick). It holds only if the loop body — bounded by the
+    // renew attempt deadline RENEW_INTERVAL - RENEW_SLOP — stays
+    // strictly inside the tick period, so MissedTickBehavior::Skip can
+    // never drop a tick and stretch the check cadence. Whole-second
+    // comparison on purpose, consistent with the neighboring asserts:
+    // do not weaken to `> Duration::ZERO`.
+    assert!(
+        RENEW_SLOP.as_secs() > 0,
+        "the renew attempt deadline must be strictly shorter than RENEW_INTERVAL"
     );
     // The leader must get at least one renew attempt before fencing.
     assert!(
@@ -583,6 +611,22 @@ pub async fn run_lease_loop<H: LeaseHooks>(
         }
     };
 
+    run_lease_loop_with_client(client, cfg, state, hooks, shutdown).await;
+}
+
+/// The lease loop proper, with the [`kube::Client`] injected. Everything
+/// [`run_lease_loop`] documents happens here; the public wrapper only
+/// constructs the in-cluster client. Split so tests can drive the real
+/// loop against an in-process mock apiserver
+/// (`rio_test_support::kube_mock::MockApiServer`) under a paused clock —
+/// the fence-check-cadence test in `mod tests` is the consumer.
+pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
+    client: kube::Client,
+    cfg: LeaseConfig,
+    state: LeaderState,
+    hooks: H,
+    shutdown: rio_common::signal::Token,
+) {
     // Clone for pod-deletion-cost patching. LeaderElection::new
     // takes ownership (wraps the client in Api<Lease>).
     let pod_patch_client = client.clone();
@@ -622,6 +666,20 @@ pub async fn run_lease_loop<H: LeaseHooks>(
             biased;
             _ = shutdown.cancelled() => break,
             _ = interval.tick() => {}
+        }
+
+        // Tick-time fence check, BEFORE the renew attempt. The error arm
+        // below re-evaluates when a failed attempt resolves, but that
+        // evaluation can lag the tick by up to the attempt deadline; the
+        // NeverDual derivation on FENCE_MARGIN assumes the fence-check
+        // latency is at most one tick, and this call is what delivers it.
+        if maybe_self_fence(
+            &state,
+            &mut was_leading,
+            &mut owe_cost_clear,
+            last_successful_renew,
+        ) {
+            hooks.on_lose();
         }
 
         let renew_deadline = RENEW_INTERVAL.saturating_sub(RENEW_SLOP);
@@ -792,7 +850,12 @@ pub async fn run_lease_loop<H: LeaseHooks>(
                 // steals, we have already stopped believing — that
                 // ordering is the neverDual proof in the
                 // leaderElectionAsymmetric regime of
-                // docs/spec/models/leaderElection.qnt.
+                // docs/spec/models/leaderElection.qnt. This is the
+                // SECOND fence evaluation in the tick: the tick-time
+                // check at the top of the loop body is what bounds the
+                // fence-check latency to one tick; this one just fires
+                // earlier when a failed attempt resolves before the
+                // next tick.
                 //
                 // The old "DON'T flip — apiserver down for EVERYONE"
                 // argument is wrong once elapsed > the fence deadline.
@@ -1328,5 +1391,152 @@ mod tests {
         );
         assert!(!fired);
         assert!(!owe_cost_clear, "no-fire → no debt recorded");
+    }
+
+    // ---- The loop's fence-check cadence (the NeverDual premise) ----
+
+    use std::sync::Mutex;
+
+    use rio_test_support::kube_mock::{MockApiServer, MockBehavior};
+
+    /// Hooks that record the (virtual) instant of every acquire/lose
+    /// callback. Clone is an Arc clone — the test body and the loop task
+    /// observe the same vectors.
+    #[derive(Clone, Default)]
+    struct RecordingHooks {
+        acquires: Arc<Mutex<Vec<Instant>>>,
+        loses: Arc<Mutex<Vec<Instant>>>,
+    }
+
+    impl LeaseHooks for RecordingHooks {
+        fn on_acquire(&self) {
+            self.acquires
+                .lock()
+                .expect("acquires lock")
+                .push(Instant::now());
+        }
+        fn on_lose(&self) {
+            self.loses.lock().expect("loses lock").push(Instant::now());
+        }
+    }
+
+    /// Let every task that is ready at the current (paused) instant run
+    /// to quiescence: tick → fence check → request → mock handler →
+    /// response → match arm. Same advance-then-yield driving pattern as
+    /// `rio_common::task`'s periodic-task tests; the count is generous —
+    /// once everything is quiescent the extra passes are no-ops.
+    async fn settle() {
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The NeverDual derivation on [`FENCE_MARGIN`] prices the victim's
+    /// fence-check latency at one [`RENEW_INTERVAL`]: a blind leader must
+    /// evaluate `maybe_self_fence` within one tick of the deadline
+    /// crossing. The error-arm evaluation alone does NOT deliver that
+    /// bound — a renew attempt that hangs resolves only at its deadline
+    /// (`RENEW_INTERVAL − RENEW_SLOP` after the tick), so the evaluation
+    /// can lag the tick by the attempt deadline. This drives the real
+    /// loop against the mock apiserver under a paused clock and pins the
+    /// bound structurally (constants-derived, never wall-clock).
+    // r[verify sched.lease.self-fence+2]
+    #[tokio::test(start_paused = true)]
+    async fn fence_check_latency_bounded_by_one_tick() {
+        let (client, mock) = MockApiServer::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state,
+            hooks.clone(),
+            shutdown.clone(),
+        ));
+
+        // t=0: the interval's first tick fires immediately; the mock is
+        // Healthy, so the attempt creates the Lease and the acquire arm
+        // runs. t_acquire is a valid proxy for `last_successful_renew`
+        // ONLY because this scripted schedule makes the t=0 acquire the
+        // last successful round-trip — if the schedule ever gains
+        // another Healthy tick, the anchor must move to that tick.
+        settle().await;
+        let t_acquire = {
+            let acquires = hooks.acquires.lock().expect("acquires lock");
+            assert_eq!(
+                acquires.len(),
+                1,
+                "the immediate first tick must acquire exactly once"
+            );
+            acquires[0]
+        };
+
+        // The FailFast@+5s/+10s → Hang@+15s choreography is load-bearing
+        // for what this test proves: an all-Hang schedule has the +10s
+        // attempt resolve at +13s (already past SELF_FENCE_AFTER), so the
+        // error-arm evaluation alone fires within the bound and the test
+        // could not distinguish a loop without the tick-time check. The
+        // fast failures keep the last under-deadline evaluation at +10s,
+        // and the hung +15s attempt delays the next error-arm evaluation
+        // to +18s — past the bound unless the tick-time check fires at
+        // +15s.
+        mock.set_behavior(MockBehavior::FailFast);
+        tokio::time::advance(RENEW_INTERVAL).await; // tick at +5s
+        settle().await;
+        tokio::time::advance(RENEW_INTERVAL).await; // tick at +10s
+        settle().await;
+
+        // Strictly BEFORE advancing into the +15s tick: that tick's
+        // attempt must never resolve.
+        mock.set_behavior(MockBehavior::Hang);
+        tokio::time::advance(RENEW_INTERVAL).await; // tick at +15s
+        settle().await;
+
+        // Let the +15s attempt's deadline (RENEW_INTERVAL − RENEW_SLOP
+        // past the tick) expire, plus a little slack so the timeout's
+        // wakeup is unambiguously due.
+        tokio::time::advance(RENEW_INTERVAL - RENEW_SLOP).await;
+        settle().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        settle().await;
+
+        // Stop the loop. By now it is parked on the next interval tick
+        // and the biased shutdown arm wins; the join may let tokio
+        // auto-advance the paused clock, which is benign — every
+        // assertion below is on instants recorded before this point.
+        shutdown.cancel();
+        loop_task.await.expect("lease loop task exits cleanly");
+
+        let acquires = hooks.acquires.lock().expect("acquires lock");
+        let loses = hooks.loses.lock().expect("loses lock");
+        assert_eq!(acquires.len(), 1, "exactly one acquire over the run");
+        assert_eq!(
+            loses.len(),
+            1,
+            "exactly one lose over the run (the self-fence)"
+        );
+        let gap = loses[0] - t_acquire;
+        assert!(
+            gap > SELF_FENCE_AFTER,
+            "self-fence fired {gap:?} after the last successful renew — \
+             before the SELF_FENCE_AFTER deadline ({SELF_FENCE_AFTER:?})"
+        );
+        assert!(
+            gap <= SELF_FENCE_AFTER + RENEW_INTERVAL,
+            "self-fence fired {gap:?} after the last successful renew; the \
+             NeverDual derivation prices the fence-check latency at one \
+             RENEW_INTERVAL past SELF_FENCE_AFTER ({:?})",
+            SELF_FENCE_AFTER + RENEW_INTERVAL
+        );
+        // election.rs's Observed/decide clock stays on std (real) time
+        // inside this paused-clock test — harmless here because the node
+        // under test is the lease's creator/holder and never exercises
+        // the steal-aging path that clock feeds.
     }
 }

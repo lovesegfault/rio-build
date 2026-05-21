@@ -21836,6 +21836,10 @@
         {
           "name": "serde_json",
           "packageId": "serde_json"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio"
         }
       ],
       "libCrateTypes": [

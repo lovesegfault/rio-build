@@ -431,9 +431,13 @@ impl MbtSystem {
         // the anchor must be a real past instant: now minus the model's
         // tick delta. checked_sub only fails if the host has been up for
         // less time than the delta, which the model's clock ceiling
-        // bounds to a handful of TICKs.
+        // bounds to a handful of TICKs. Qualified tokio path: the fence
+        // anchor is tokio's Instant (real time outside a paused test
+        // clock — same semantics as std here), while this file's
+        // file-wide `Instant` stays std for the election/`decide`
+        // observation clock.
         let blind_for = TICK * u32::try_from(h.ticks - h.fence_tick).expect("tick delta fits u32");
-        let last_renew = Instant::now()
+        let last_renew = tokio::time::Instant::now()
             .checked_sub(blind_for)
             .expect("host uptime exceeds the model's clock ceiling");
         let mut owe_cost_clear = false;

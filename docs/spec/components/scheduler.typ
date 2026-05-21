@@ -2191,7 +2191,8 @@ its observation when it _sees_ the rv change. Without a margin the standby's
 deadline can land first with zero clock skew. The margin condition the
 asymmetry must satisfy is `2 × FENCE_MARGIN ≥ RENEW_INTERVAL + 2 ×
 clock_skew` --- the renew interval is the victim's fence-check latency (the
-loop only evaluates `maybe_self_fence` once per tick), and what remains of
+loop evaluates `maybe_self_fence` at the top of every tick, before the renew
+attempt), and what remains of
 the 8s separation after the 5s renew interval is a 1.5s one-sided clock-skew
 budget. The formal model verifies this as `neverDual` over the
 `leaderElectionAsymmetric` module of `docs/spec/models/leaderElection.qnt`,

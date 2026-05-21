@@ -10,7 +10,10 @@
 //!   with real optimistic-concurrency semantics that serves any request
 //!   sequence correctly. The right tool for interleaved multi-client
 //!   races and model-based tests, where the request sequence is
-//!   generated rather than hand-planned.
+//!   generated rather than hand-planned. A [`MockBehavior`] switch
+//!   injects whole-apiserver failure modes (fail fast, hang) on top of
+//!   the healthy state machine, for tests that drive a client loop
+//!   through an outage-and-recovery schedule.
 //!
 //! Extracted from rio-controller so rio-scheduler's lease
 //! election tests can share the same mock-apiserver plumbing.
@@ -238,6 +241,33 @@ impl ApiServerVerifier {
     }
 }
 
+/// Failure-injection switch for [`MockApiServer`]: how the handler task
+/// answers requests, independent of the stored Lease state.
+///
+/// The healthy dispatch is the method table on [`MockApiServer`]; the
+/// failure modes model the two ways an apiserver outage looks from the
+/// client side — an error response right away, or no response at all
+/// (the client's own deadline is the only way out). Switching the
+/// behavior never touches the stored lease, so a test can script
+/// outage-and-recovery without re-seeding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MockBehavior {
+    /// Serve requests against the stored Lease state (the method table
+    /// in the [`MockApiServer`] docs).
+    #[default]
+    Healthy,
+    /// Answer every request immediately with a 503 `ServiceUnavailable`
+    /// `metav1.Status` — the "apiserver reachable but refusing" shape of
+    /// an outage (kube clients surface it as `kube::Error::Api`).
+    FailFast,
+    /// Never answer: the response channel is parked (not dropped — a
+    /// dropped channel surfaces as an immediate connection error, which
+    /// is [`FailFast`](Self::FailFast) with extra steps). The client's
+    /// request future pends until its own deadline fires — the
+    /// "apiserver hung" shape of an outage.
+    Hang,
+}
+
 /// A stateful in-memory mock of the `coordination.k8s.io` Lease API
 /// with real optimistic-concurrency semantics.
 ///
@@ -251,6 +281,14 @@ impl ApiServerVerifier {
 /// | PUT    | 409 unless the submitted `metadata.resourceVersion` equals the stored one (**the CAS**), else store with the rv bumped. |
 /// | DELETE | clear the stored object; 200 if one existed, 404 otherwise. |
 ///
+/// The table above is the [`MockBehavior::Healthy`] dispatch (the
+/// default). [`set_behavior`](Self::set_behavior) switches the whole
+/// mock into a failure mode — every request answered 503, or no request
+/// answered at all — for tests that script an apiserver outage around
+/// the healthy state machine. The failure modes never touch the stored
+/// lease, so flipping back to `Healthy` resumes from where the last
+/// successful write left off.
+///
 /// The handler task runs until the [`Client`] is dropped. The returned
 /// `MockApiServer` handle shares the stored state for inspection
 /// (assertions on who won a race) and out-of-band manipulation (an
@@ -258,32 +296,65 @@ impl ApiServerVerifier {
 /// under test performs).
 pub struct MockApiServer {
     state: Arc<Mutex<Option<serde_json::Value>>>,
+    /// How the handler task answers requests; see [`MockBehavior`].
+    /// Shared with the handler task so [`set_behavior`](Self::set_behavior)
+    /// applies to every request pulled after the store.
+    behavior: Arc<Mutex<MockBehavior>>,
 }
 
 impl MockApiServer {
     /// Create a mock Client backed by a fresh, empty Lease store and
-    /// spawn the handler task. The task exits when the Client (and
-    /// every clone of it) is dropped.
+    /// spawn the handler task (behavior [`MockBehavior::Healthy`]). The
+    /// task exits when the Client (and every clone of it) is dropped.
     pub fn new() -> (Client, Self) {
         let (mock_service, handle) = mock::pair::<Request<Body>, Response<Body>>();
         let client = Client::new(mock_service, "default");
         let state: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let behavior = Arc::new(Mutex::new(MockBehavior::default()));
         let task_state = Arc::clone(&state);
+        let task_behavior = Arc::clone(&behavior);
         tokio::spawn(async move {
             let mut handle = pin!(handle);
+            // Hang mode parks the send halves here: never responded to,
+            // never dropped (a drop completes the client's request
+            // future with a connection error — a fast failure, not a
+            // hang). The Vec lives as long as the handler task, i.e. as
+            // long as the Client — exactly the window a hung request
+            // must stay hung for.
+            let mut parked = Vec::new();
             while let Some((request, send)) = handle.next_request().await {
-                let method = request.method().clone();
-                let body_bytes = request
-                    .into_body()
-                    .collect()
-                    .await
-                    .expect("request body collectible")
-                    .to_bytes();
-                let response = Self::handle(&task_state, &method, &body_bytes);
-                send.send_response(response);
+                let behavior = *task_behavior.lock().expect("mock apiserver behavior lock");
+                match behavior {
+                    MockBehavior::Healthy => {
+                        let method = request.method().clone();
+                        let body_bytes = request
+                            .into_body()
+                            .collect()
+                            .await
+                            .expect("request body collectible")
+                            .to_bytes();
+                        send.send_response(Self::handle(&task_state, &method, &body_bytes));
+                    }
+                    MockBehavior::FailFast => send.send_response(Self::status(
+                        503,
+                        "ServiceUnavailable",
+                        "injected outage: the mock apiserver is failing fast",
+                    )),
+                    MockBehavior::Hang => parked.push(send),
+                }
             }
         });
-        (client, Self { state })
+        (client, Self { state, behavior })
+    }
+
+    /// Switch how the handler task answers subsequent requests. Takes
+    /// effect for every request pulled after the store; requests already
+    /// pulled keep the behavior they were dispatched under. The stored
+    /// lease state is never touched, so a test can script
+    /// `Healthy → FailFast → Hang → Healthy` sequences without
+    /// re-seeding.
+    pub fn set_behavior(&self, behavior: MockBehavior) {
+        *self.behavior.lock().expect("mock apiserver behavior lock") = behavior;
     }
 
     /// Dispatch one request against the stored state. Synchronous so the

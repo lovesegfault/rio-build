@@ -68,3 +68,7 @@ serde = { workspace = true }
 # The mbt driver seeds MockApiServer with the model's initial Lease
 # object and projects the stored object back out (both serde_json::Value).
 serde_json = { workspace = true }
+# test-util: the loop-cadence test (fence_check_latency_bounded_by_one_tick)
+# drives run_lease_loop_with_client under a paused clock (start_paused) and
+# advances virtual time manually.
+tokio = { workspace = true, features = ["test-util"] }
