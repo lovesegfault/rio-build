@@ -169,26 +169,72 @@ in
   # Per-model checks, gated on the .qnt file existing. Spliced into
   # checks.* via misc-checks.nix — `lib.optionalAttrs` makes the attr
   # absent (not present-and-failing) until the model lands.
-  checks = lib.optionalAttrs (builtins.pathExists (modelsDir + "/cas.qnt")) {
-    # The CAS fragment of the leader-election protocol: the rv-guarded
-    # apiserver PUT admits at most one writer per resourceVersion (the
-    # hard half of the at-most-one-leader rule — the half the apiserver's
-    # optimistic concurrency makes unconditional). Cross-validated
-    # against the TLA+ reference, which carries the same marker until
-    # the migration replaces it. This check doubles as the permanent
-    # quint-toolchain smoke test: it is small enough (~264 states, ~1s)
-    # that "the quint toolchain is broken" is caught at merge-gate
-    # rather than at the next model change, the same role cov-smoke
-    # plays for the coverage pipeline. The second invariant exists to
-    # keep the multi-invariant (--invariant=a,b) code path exercised.
-    # r[verify sched.lease.at-most-one-leader+3]
-    quint-cas-smoke = mkQuintCheck {
-      name = "cas-smoke";
-      spec = "cas";
-      invariants = [
-        "atMostOneCASWinner"
-        "rvInBounds"
-      ];
+  checks =
+    lib.optionalAttrs (builtins.pathExists (modelsDir + "/cas.qnt")) {
+      # The CAS fragment of the leader-election protocol: the rv-guarded
+      # apiserver PUT admits at most one writer per resourceVersion (the
+      # hard half of the at-most-one-leader rule — the half the apiserver's
+      # optimistic concurrency makes unconditional). Cross-validated
+      # against the TLA+ reference, which carries the same marker until
+      # the migration replaces it. This check doubles as the permanent
+      # quint-toolchain smoke test: it is small enough (~264 states, ~1s)
+      # that "the quint toolchain is broken" is caught at merge-gate
+      # rather than at the next model change, the same role cov-smoke
+      # plays for the coverage pipeline. The second invariant exists to
+      # keep the multi-invariant (--invariant=a,b) code path exercised.
+      # r[verify sched.lease.at-most-one-leader+3]
+      quint-cas-smoke = mkQuintCheck {
+        name = "cas-smoke";
+        spec = "cas";
+        invariants = [
+          "atMostOneCASWinner"
+          "rvInBounds"
+        ];
+      };
+    }
+    // lib.optionalAttrs (builtins.pathExists (modelsDir + "/leaderElection.qnt")) {
+      # rio-lease's leader-election protocol over a Kubernetes Lease
+      # object: per-node clocks (bounded skew), the observed-record
+      # staleness clock, local self-fencing, crash/recovery, and the
+      # write-ahead generation claim. The Quint port of the TLA+ model
+      # (which carries the same markers until the migration deletes it).
+      # The base regime disables every operator/infrastructure fault so a
+      # regression in the core protocol surfaces in this check rather than
+      # buried in the larger fault-injection regimes.
+      #
+      # It verifies atMostOneCASWinner (the apiserver admits at most one
+      # writer per resourceVersion), boundedDualLeadership (every
+      # dual-belief state has a discovery mechanism armed),
+      # staleLeaderHasStaleGeneration (concurrent believers always have
+      # distinct generations -- the bridge to the executor-side generation
+      # fence; the invariant the pre-fix protocol falsified), plus the
+      # loopInterval and clockSkewBound precondition tripwires and the
+      # boundsOK ceiling tripwire. The fetch-max-seed marker covers the
+      # seeding-and-claiming encoding inside steal (the generation derives
+      # from the lease's transition count and the PG floor advances at
+      # acquisition time).
+      #
+      # The state count, depth, and wall-clock are in this check's output
+      # transcript and in the commit that introduced (or last re-measured)
+      # the model -- never here. The durable claim: the port's state count
+      # is exactly |NODES|! times the symmetry-reduced TLA+ predecessor's,
+      # minus the self-symmetric states -- the structural-identity
+      # evidence that the two state spaces are the same space.
+      # r[verify sched.lease.at-most-one-leader+3]
+      # r[verify sched.lease.k8s-lease]
+      # r[verify sched.recovery.fetch-max-seed+2]
+      quint-leader-election = mkQuintCheck {
+        name = "leader-election";
+        spec = "leaderElection";
+        main = "leaderElectionBase";
+        invariants = [
+          "boundsOK"
+          "clockSkewBound"
+          "atMostOneCASWinner"
+          "loopInterval"
+          "boundedDualLeadership"
+          "staleLeaderHasStaleGeneration"
+        ];
+      };
     };
-  };
 }
