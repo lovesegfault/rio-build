@@ -1045,21 +1045,69 @@ module leaderElection {
   }
 
   // --- 8. step ----------------------------------------------------------
-  /// One node takes one protocol step.
-  action nodeStep(n: Node): bool = any {
-    tick(n),
-    apiGet(n),
-    steal(n),
-    renewLease(n),
-    conflict(n),
-    selfFence(n),
-    crash(n),
-    recover(n),
+  // Every disjunct of `step` is a NAMED action with its nondet choices
+  // bound directly inside it. Model-based testing (quint-connect) drives
+  // the implementation by matching on the action names recorded in a
+  // trace and reading their nondet picks as parameters -- an anonymous
+  // block in the disjunction cannot be matched. The flattening is
+  // semantics-preserving: `nondet n; any { a(n), b(n) }` and
+  // `any { nondet n; a(n), nondet n; b(n) }` are the same existential
+  // over the same (action, node) pairs (exists distributes over or), so
+  // the transition relation -- and therefore the verified state space --
+  // is bit-for-bit identical. Re-verify that claim against the
+  // distinct-state counts in the introducing commit after any change
+  // here.
+
+  /// One node's clock advances.
+  action tickAny = {
+    nondet n = NODES.oneOf()
+    tick(n)
+  }
+  /// One node GETs the lease.
+  action apiGetAny = {
+    nondet n = NODES.oneOf()
+    apiGet(n)
+  }
+  /// One node's decide()->Steal PUT lands.
+  action stealAny = {
+    nondet n = NODES.oneOf()
+    steal(n)
+  }
+  /// One node's decide()->Renew PUT lands.
+  action renewLeaseAny = {
+    nondet n = NODES.oneOf()
+    renewLease(n)
+  }
+  /// One node's PUT 409s against a stale snapshot.
+  action conflictAny = {
+    nondet n = NODES.oneOf()
+    conflict(n)
+  }
+  /// One node's self-fence deadline fires.
+  action selfFenceAny = {
+    nondet n = NODES.oneOf()
+    selfFence(n)
+  }
+  /// One node's process crashes.
+  action crashAny = {
+    nondet n = NODES.oneOf()
+    crash(n)
+  }
+  /// One crashed node's process restarts.
+  action recoverAny = {
+    nondet n = NODES.oneOf()
+    recover(n)
   }
 
   action step = any {
-    { nondet n = NODES.oneOf()
-      nodeStep(n) },
+    tickAny,
+    apiGetAny,
+    stealAny,
+    renewLeaseAny,
+    conflictAny,
+    selfFenceAny,
+    crashAny,
+    recoverAny,
     deleteLease,
     pgRestore,
   }
@@ -1144,7 +1192,7 @@ module leaderElection {
 //     dual-belief window, recovers, and renews its still-valid lease
 //     would lead at the reset gen=1, below the stale believer it
 //     deposed.
-//   - Note: removing selfFence from nodeStep does NOT violate
+//   - Note: removing selfFence from step does NOT violate
 //     boundedDualLeadership -- the invariant is a state property about
 //     discovery being ARMED, not a temporal property about the fence
 //     FIRING. The steal-threshold weakening is the correct falsification
@@ -1165,6 +1213,122 @@ module leaderElectionBase {
     MAX_CLAIM_FAILURES = 0,
     MAX_RESTORES = 0
   ).*
+
+  // --- deterministic protocol runs ---------------------------------------
+  // The executable versions of the protocol's known-critical scenarios:
+  // each is a counterexample trace from the model's development history
+  // (or the happy-path twin of one), pinned as a regression test.
+  // `quint test --main=leaderElectionBase --match=<run>` replays them;
+  // the MBT harness (quint-connect) replays the same named runs against
+  // the rio-lease implementation and diffs the projected state after
+  // every step. They do not change the verified state space (runs are
+  // not part of `step`).
+  //
+  // Tick choreography: tick(n)'s skew precondition keeps every clock
+  // within MAX_SKEW = 1 of every other, so advancing one node's clock to
+  // T requires alternating ticks that drag the other node's clock to at
+  // least T - 1. tick(n)'s loop-discipline precondition caps a LEADING
+  // node's clock at fence + FENCE_AFTER + RENEW; with fence = 0 that is
+  // exactly clock 4, which is also the first instant its self-fence
+  // deadline (clock - fence > FENCE_AFTER) and a follower's steal
+  // deadline (clock - since > STEAL_AFTER) have both passed. Every run
+  // below that needs a deadline to expire ticks to exactly that
+  // boundary.
+
+  /// The CAS race -- the hard half of at-most-one-leader. Both nodes GET
+  /// the empty lease at rv 0; n1's PUT lands first and bumps the rv to 1;
+  /// n2's PUT against its now-stale rv-0 snapshot is the 409 path (the
+  /// model's `conflict` action -- `steal(n2)` is *disabled* because casOk
+  /// requires the snapshot rv to match the live rv). Exactly one writer
+  /// per resourceVersion wins.
+  run casRaceRun =
+    init
+      .then(apiGet("n1"))
+      .then(apiGet("n2"))
+      .then(steal("n1"))
+      .then(conflict("n2"))
+      .expect(all {
+        leading.get("n1"),
+        not(leading.get("n2")),
+        lease.holder == Held("n1"),
+        lease.rv == 1,
+        gen.get("n1") == 2,
+        not(casRace),
+      })
+
+  /// The deposed-leader steal. n1 acquires and goes silent (no further
+  /// round-trips); n2 observes the lease at rv 1 and watches it not
+  /// change for STEAL_AFTER + 1 ticks; n2 steals. n1 has not yet
+  /// discovered the deposition (its next round-trip would 409, its
+  /// self-fence deadline has passed but not yet fired) -- this is the
+  /// dual-belief state boundedDualLeadership bounds -- but the
+  /// generation fence already tells the two apart: n2's generation is
+  /// strictly greater.
+  run deposedLeaderStealRun =
+    init
+      .then(apiGet("n1"))
+      .then(steal("n1"))
+      .then(apiGet("n2"))
+      .then(tick("n1")).then(tick("n2"))
+      .then(tick("n1")).then(tick("n2"))
+      .then(tick("n1")).then(tick("n2"))
+      .then(tick("n1")).then(tick("n2"))
+      .then(steal("n2"))
+      .expect(all {
+        leading.get("n2"),
+        leading.get("n1"),          // the dual-belief window is open...
+        gen.get("n2") > gen.get("n1"), // ...and the generation fence closes it
+        lease.holder == Held("n2"),
+        not(casRace),
+      })
+
+  /// The self-fence false alarm -- the idempotent re-acquisition. n1
+  /// acquires, then cannot reach the apiserver for FENCE_AFTER + 1 ticks
+  /// and self-fences (stops believing, no apiserver write). Connectivity
+  /// returns; its lease was never stolen; its renew succeeds. It leads
+  /// again at the SAME generation -- the lease's transition count did not
+  /// move, so on_acquire's fetch_max is a no-op and the claim path finds
+  /// its own row at the floor. A connectivity blip costs nothing: no
+  /// generation burn, no fencing of its own in-flight work.
+  run selfFenceFalseAlarmRun =
+    init
+      .then(apiGet("n1"))
+      .then(steal("n1"))
+      .then(tick("n1")).then(tick("n2"))
+      .then(tick("n1")).then(tick("n2"))
+      .then(tick("n1")).then(tick("n2"))
+      .then(tick("n1"))
+      .then(selfFence("n1"))
+      .then(apiGet("n1"))
+      .then(renewLease("n1"))
+      .expect(all {
+        leading.get("n1"),
+        gen.get("n1") == 2,         // the SAME generation -- no burn
+        genHW == 2,                 // no new claim row either
+        lease.holder == Held("n1"),
+        lease.gen == 1,             // the transition count never moved
+      })
+
+  /// The crash-recover-renew re-acquisition. n1 acquires, crashes (its
+  /// in-memory generation Arc resets to 1), recovers, GETs its
+  /// still-valid lease, and renews. It leads again at its PRE-CRASH
+  /// generation: the lease's transition count (lease.gen + 1 = 2) still
+  /// encodes the generation it originally derived, and its own claim row
+  /// sits at exactly that floor -- restored, not burned, and not the
+  /// reset in-memory value of 1.
+  run crashRecoverRenewRun =
+    init
+      .then(apiGet("n1"))
+      .then(steal("n1"))
+      .then(crash("n1"))
+      .then(recover("n1"))
+      .then(apiGet("n1"))
+      .then(renewLease("n1"))
+      .expect(all {
+        leading.get("n1"),
+        gen.get("n1") == 2,         // restored from the transition count
+        lease.holder == Held("n1"),
+      })
 }
 
 // =========================================================================
