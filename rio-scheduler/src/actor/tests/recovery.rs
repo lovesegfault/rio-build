@@ -1076,7 +1076,7 @@ async fn test_recovery_skips_bad_drv_path_rows() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.recovery.fetch-max-seed+2]
+// r[verify sched.recovery.fetch-max-seed+3]
 /// Recovery must seed generation from PG's floor (assignments ∪ claims)
 /// via fetch_max, and must durably CLAIM the generation it lands on
 /// before ungating dispatch. Defensive monotonicity: if the k8s Lease

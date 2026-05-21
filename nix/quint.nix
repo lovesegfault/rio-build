@@ -300,7 +300,7 @@ in
     # evidence that the two state spaces are the same space.
     # r[verify sched.lease.at-most-one-leader+3]
     # r[verify sched.lease.k8s-lease]
-    # r[verify sched.recovery.fetch-max-seed+2]
+    # r[verify sched.recovery.fetch-max-seed+3]
     quint-leader-election = mkQuintCheck {
       name = "leader-election";
       spec = "leaderElection";

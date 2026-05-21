@@ -1165,7 +1165,7 @@ impl DagActor {
         }
 
         // --- Durably claim the generation this term will dispatch at ---
-        // r[impl sched.recovery.fetch-max-seed+2]
+        // r[impl sched.recovery.fetch-max-seed+3]
         //
         // The PRIMARY generation source is the Lease's transition count
         // (the lease loop's fetch_max in on_acquire — the apiserver

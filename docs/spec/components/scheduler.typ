@@ -1537,16 +1537,22 @@ tables) during state recovery.
 
 = State Recovery
 
-#r("sched.recovery.fetch-max-seed+2")[
+#r("sched.recovery.fetch-max-seed+3")[
   During recovery the scheduler MUST raise its generation to the claimed
-  generation target via `fetch_max`, not `store`: one past the durable PG
-  floor --- `GREATEST(MAX(assignments.generation),
-  MAX(leader_generation_claims.generation))` --- unless the floor is the
-  holder's own already-claimed epoch
-  (#rref("sched.lease.generation-claim")), in which case the floor itself.
-  The same `Arc<AtomicU64>` already holds the Lease-derived generation written
-  by the lease loop on acquire (#rref("sched.lease.generation-fence+2")); `store`
-  would clobber whichever of the two sources is larger.
+  generation target via `fetch_max`, not `store`. The target is the
+  Lease-derived generation (#rref("sched.lease.generation-fence")) unless
+  the durable PG floor --- `GREATEST(MAX(assignments.generation),
+  MAX(leader_generation_claims.generation))` --- demands more: one past
+  the floor when the floor exceeds the Lease-derived generation, or when
+  it equals it and the claims ledger holds another holder's row at that
+  generation. In every other case (floor below the Lease-derived
+  generation, no floor at all, or a floor equal to it without another
+  holder's claim row there) the target is the Lease-derived generation
+  itself --- in particular a holder whose own claim row already sits at
+  that generation retains it rather than claiming a new one
+  (#rref("sched.lease.generation-claim")). The lease loop writes the same
+  `Arc<AtomicU64>` on acquire; both writers only ever raise it, and
+  `store` could regress the generation.
 ]
 
 The PRIMARY generation source is the Lease's `leaseTransitions` count. The PG
@@ -2275,7 +2281,7 @@ across Lease-object deletion.
   Before completing recovery and ungating dispatch, a newly-acquired leader
   MUST durably record the generation it will dispatch at as a row in the
   `leader_generation_claims` ledger, and the recovery generation floor
-  (#rref("sched.recovery.fetch-max-seed+2")) MUST be computed over both the
+  (#rref("sched.recovery.fetch-max-seed")) MUST be computed over both the
   assignment history and that ledger. A holder whose own claim row already
   sits at its lease-derived generation MUST retain that generation rather
   than claim a new one.
