@@ -1238,7 +1238,7 @@ impl DagActor {
         // lines on a same-exec restamp), and that tail is the log of
         // the execution whose outputs we just adopted. See
         // `terminal_log_epilogue`'s caller-list entry for the
-        // fresh-standby no-op shape and the never-dispatched
+        // fresh-standby empty-drain shape and the never-dispatched
         // self-gate.
         self.terminal_log_epilogue(drv_hash, "succeeded", &interested);
         // Terminal → unpin. sweep_stale_live_pins ran BEFORE

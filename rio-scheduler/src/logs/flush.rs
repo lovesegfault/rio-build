@@ -2907,7 +2907,7 @@ mod tests {
     /// flush stores the `.partial` blob + `drv_logs` row; then the lease
     /// moves and the fresh standby's recovery restamps an EMPTY entry with
     /// the SAME exec_id (modeled as discard + set_exec, the same modeling
-    /// as `flush_final_empty_drain_finalizes_partial_row`). The caller owns
+    /// as `flush_final_empty_drain_stamps_status_but_stays_incomplete`). The caller owns
     /// pushing the post-reconnect suffix and the flush under test.
     async fn failover_restamp_after_periodic(
         flusher: &LogFlusher,

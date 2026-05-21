@@ -2560,12 +2560,17 @@ async fn test_recovery_restamp_clears_stale_exec_lines() -> TestResult {
 /// outputs were just adopted (see
 /// `test_orphan_completion_preserves_ex_leader_log_tail` for that case —
 /// this test covers the fresh-standby shape where the entry is empty and
-/// the flush is a no-op write). The entry's removal moved from the actor
+/// the flush uploads nothing). The entry's removal moved from the actor
 /// (synchronous discard) to the flusher (`drain_if_exec` on the queued
-/// request); `upload_and_record`'s `line_count == 0` early-return keeps
-/// the empty case a no-op write, so the dead leader's `.partial` row
-/// remains incomplete in this shape — that residual is inherent (the
-/// recovering process holds no lines). The retained-vs-reaped contrast
+/// request); `upload_and_record`'s `line_count == 0` arm routes the
+/// final drain to `finalize_empty_drain`: nothing is uploaded; any
+/// `.partial` row the dead leader's periodic flusher wrote gets its
+/// terminal metadata stamped and stays `is_complete=false` (its blob is
+/// the execution's only stored content — the recovering process holds
+/// no lines — so the incomplete indicator stays surfaced; column-level
+/// claims live flusher-side in
+/// `flush_final_empty_drain_stamps_status_but_stays_incomplete`).
+/// The retained-vs-reaped contrast
 /// for a request that could NOT be enqueued is
 /// `test_orphan_completion_dropped_flush_discards_empty_buffer`.
 ///
@@ -2660,17 +2665,22 @@ async fn test_orphan_completion_routes_log_through_epilogue() -> TestResult {
     // recovered execution is enqueued — flush_final's drain_if_exec is
     // what removes the entry (so GetDerivationLogs falls through to the
     // ex-leader's S3 .partial instead of serving an empty re-poll chunk)
-    // and its line_count==0 early-return keeps the empty fresh-standby
-    // buffer a no-op write. trigger_log_flush and record_exec_correlation
-    // are both unconditionally inside the same gated terminal_log_epilogue
-    // call, so receiving the request also proves the bd.exec_id UPDATE
-    // was issued.
+    // and upload_and_record's line_count==0 arm routes the empty
+    // fresh-standby drain to finalize_empty_drain (terminal-metadata
+    // stamp on any .partial row the ex-leader's periodic flusher wrote;
+    // stays is_complete=false; nothing uploaded). trigger_log_flush and
+    // record_exec_correlation are both unconditionally inside the same
+    // gated terminal_log_epilogue call, so receiving the request also
+    // proves the bd.exec_id UPDATE was issued.
     let req = flush_rx.try_recv().expect(
         "adopt_orphan_completion must route log finalization through \
          terminal_log_epilogue: a FlushRequest pinned to the recovered \
          execution is enqueued and the flusher's drain_if_exec (not an \
          actor-side discard) reaps the entry. In this empty fresh-standby \
-         shape the flush itself is a no-op write — row finalization is \
+         shape the flush uploads nothing — the flusher-side handling of \
+         the ex-leader's .partial row is \
+         flush_final_empty_drain_stamps_status_but_stays_incomplete's \
+         claim; the retained-tail shape is \
          test_orphan_completion_preserves_ex_leader_log_tail's claim.",
     );
     assert_eq!(req.exec_id, exec_id, "request pins the recovered execution");

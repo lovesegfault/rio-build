@@ -770,10 +770,15 @@ impl DagActor {
     ///   found in the store for a drv whose worker never reconnected:
     ///   the execution ran to completion while the scheduler was
     ///   down). On a fresh standby the recovery-stamped entry has zero
-    ///   lines: the flush is a no-op write (`upload_and_record`'s
-    ///   `line_count == 0` early-return) whose `drain_if_exec` still
-    ///   reaps the entry, so `GetDerivationLogs` falls through to the
-    ///   ex-leader's S3 `.partial`. On an ex-leader re-acquiring the
+    ///   lines: the final flush uploads nothing — `upload_and_record`'s
+    ///   `line_count == 0` arm routes it to `finalize_empty_drain`,
+    ///   which stamps terminal metadata (`status`/`finished_at`) on any
+    ///   `.partial` `drv_logs` row the ex-leader's periodic flusher
+    ///   wrote while leaving `is_complete = false` (the stored log is
+    ///   truncated at the last snapshot, so the incomplete indicator
+    ///   stays surfaced) — and `drain_if_exec` still reaps the entry,
+    ///   so `GetDerivationLogs` serves the ex-leader's S3 `.partial`.
+    ///   On an ex-leader re-acquiring the
     ///   lease, the retained entry still holds the prior leadership's
     ///   unflushed tail for this same execution (`set_exec` keeps
     ///   lines on a same-exec restamp); the final flush preserves that
