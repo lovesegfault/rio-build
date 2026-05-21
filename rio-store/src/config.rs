@@ -501,19 +501,23 @@ mod tests {
         assert_eq!(Config::default().s3_max_attempts, 10);
     }
 
-    /// TOML parsing for the tagged enum via figment (what main.rs
-    /// actually uses via rio_common::config::load). The `kind` tag +
-    /// lowercase variant names are load-bearing — the NixOS module
-    /// writes TOML with these exact strings. A silent rename would
-    /// break every deployment with chunk_backend configured.
+    /// TOML parsing for the tagged enum via the config crate (what
+    /// main.rs actually uses via rio_common::config::load). The `kind`
+    /// tag + lowercase variant names are load-bearing — the NixOS
+    /// module writes TOML with these exact strings. A silent rename
+    /// would break every deployment with chunk_backend configured.
     ///
-    /// Testing via figment (not raw toml crate) catches figment-
-    /// specific deserialization quirks. figment's tagged-enum
-    /// handling is a known past pain point.
+    /// Testing via the config crate (not raw toml crate) catches
+    /// loader-specific deserialization quirks (the Value layer the
+    /// config crate deserializes through). Tagged-enum handling in
+    /// that layer is a known past pain point.
     fn parse_toml(s: &str) -> Config {
-        use figment::Figment;
-        use figment::providers::{Format, Toml};
-        Figment::from(Toml::string(s)).extract().unwrap()
+        ::config::Config::builder()
+            .add_source(::config::File::from_str(s, ::config::FileFormat::Toml))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap()
     }
 
     #[test]
@@ -581,18 +585,16 @@ mod tests {
     /// extract). The deploy overlays set chunk_backend this way —
     /// regression guard for kustomization.yaml.
     ///
-    /// The defaults layer serializes Inline as {kind: "inline"}; figment's
-    /// per-key merge must correctly replace it with {kind: "s3",
-    /// bucket: ..., prefix: ...} from the env layer. Half-merges (stale
-    /// kind, orphan fields) would fail tagged-enum deserialization.
+    /// The defaults layer serializes Inline as {kind: "inline"}; the
+    /// defaults layer's per-key merge must correctly replace it with
+    /// {kind: "s3", bucket: ..., prefix: ...} from the env layer.
+    /// Half-merges (stale kind, orphan fields) would fail tagged-enum
+    /// deserialization.
     ///
-    /// Jail: serializes env mutation under a global mutex. The closure's
-    /// Result<(), figment::Error> return type is figment's API (208-byte
-    /// error) — clippy allow is local to these tests.
+    /// Jail: serializes env mutation under a global mutex.
     #[test]
-    #[allow(clippy::result_large_err)]
     fn chunk_backend_kind_env_s3() {
-        figment::Jail::expect_with(|jail| {
+        rio_test_support::Jail::expect_with(|jail| {
             jail.set_env("RIO_CHUNK_BACKEND__KIND", "s3");
             jail.set_env("RIO_CHUNK_BACKEND__BUCKET", "rio-chunks");
             jail.set_env("RIO_CHUNK_BACKEND__PREFIX", "");
@@ -609,9 +611,8 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::result_large_err)]
     fn chunk_backend_kind_env_filesystem() {
-        figment::Jail::expect_with(|jail| {
+        rio_test_support::Jail::expect_with(|jail| {
             jail.set_env("RIO_CHUNK_BACKEND__KIND", "filesystem");
             jail.set_env("RIO_CHUNK_BACKEND__BASE_DIR", "/var/lib/chunks");
             let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
@@ -636,15 +637,14 @@ mod tests {
     /// covers the config-parse side; main()'s match at startup glues
     /// the two.
     #[test]
-    #[allow(clippy::result_large_err)]
     fn nar_buffer_budget_toml_roundtrip() {
-        figment::Jail::expect_with(|jail| {
+        rio_test_support::Jail::expect_with(|jail| {
             jail.create_file("store.toml", "nar_buffer_budget_bytes = 12345")?;
             let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
             assert_eq!(
                 cfg.nar_buffer_budget_bytes,
                 Some(12345),
-                "store.toml nar_buffer_budget_bytes must thread through figment"
+                "store.toml nar_buffer_budget_bytes must thread through the config layers"
             );
             Ok(())
         });
@@ -654,9 +654,8 @@ mod tests {
     /// `#[serde(default)]` handles absence via Default::default(),
     /// which sets None. main()'s match then keeps DEFAULT_NAR_BUDGET.
     #[test]
-    #[allow(clippy::result_large_err)]
     fn nar_buffer_budget_absent_is_none() {
-        figment::Jail::expect_with(|jail| {
+        rio_test_support::Jail::expect_with(|jail| {
             jail.create_file("store.toml", r#"listen_addr = "0.0.0.0:9002""#)?;
             let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
             assert!(
@@ -674,7 +673,7 @@ mod tests {
         CliArgs::command().debug_assert();
     }
 
-    // figment::Jail standing-guard tests — see rio-test-support/src/config.rs.
+    // Jailed standing-guard tests — see rio-test-support/src/config.rs.
     // When you add Config.newfield: ADD IT to both assert blocks below.
 
     rio_test_support::jail_roundtrip!(
@@ -699,11 +698,11 @@ mod tests {
             assert_eq!(cfg.s3_max_attempts, 5);
             assert!(
                 matches!(cfg.chunk_backend, ChunkBackendKind::Filesystem { .. }),
-                "[chunk_backend] table must thread through figment"
+                "[chunk_backend] table must thread through the config layers"
             );
             assert!(
                 cfg.jwt.required,
-                "[jwt] table must thread through figment into JwtConfig"
+                "[jwt] table must thread through the config layers into JwtConfig"
             );
             // Unspecified sub-field defaults via #[serde(default)]
             // on the sub-struct (partial table must work).
