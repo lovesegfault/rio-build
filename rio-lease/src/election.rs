@@ -345,9 +345,10 @@ pub struct LeaderElection {
     /// this replica acts on (that is `steal_after`).
     ttl: Duration,
     /// How long the same resourceVersion must be observed unchanged
-    /// before this replica steals. Deliberately LATER than the holder's
-    /// own self-fence deadline (`ttl − 2×margin`) so the deposed holder
-    /// has already stopped believing by the time anyone steals.
+    /// before this replica steals. Deliberately `2×FENCE_MARGIN` LATER
+    /// than the holder's own self-fence deadline (`SELF_FENCE_AFTER`,
+    /// i.e. `LEASE_TTL − FENCE_MARGIN`) so the deposed holder has
+    /// already stopped believing by the time anyone steals.
     steal_after: Duration,
     /// `pub(crate)` (not private) for the model-based tests
     /// (`crate::mbt_tests`): the driver re-evaluates `decide()` against a
