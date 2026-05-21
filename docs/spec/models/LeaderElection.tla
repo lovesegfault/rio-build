@@ -18,7 +18,7 @@
 (* PROOF CLAIM, stated honestly: the invariants below hold under clock     *)
 (* skew <= MaxSkew ticks, no host suspend, over a bounded state space of   *)
 (* 2 nodes and ~2 leadership cycles, with at most MaxDeletes Lease-object  *)
-(* deletions (LeaderElection.cfg pins MaxDeletes=0, ~1.47M distinct        *)
+(* deletions (LeaderElection.cfg pins MaxDeletes=0, ~1.97M distinct        *)
 (* states; LeaderElectionDeletion.cfg pins MaxDeletes=1 -- same .tla, the  *)
 (* deletion fault enabled). The bounds exclude: 3-party races (any         *)
 (* k-party CAS race contains a 2-party prefix, so AtMostOneCASWinner is    *)
@@ -76,8 +76,11 @@
 (*               into one atomic step (sound: recovery_complete gates      *)
 (*               dispatch until the seed AND the claim have both run)      *)
 (*   RenewLease  decide()->Renew + replace(renew) (named to avoid the      *)
-(*               Renew constant); a same-epoch re-acquire retains its      *)
-(*               generation and its claim row -- modeled by omission       *)
+(*               Renew constant) + the acquire arm's on_acquire(trans)     *)
+(*               with the UN-bumped count: restores Leading after a        *)
+(*               self-fence false alarm or a crash at the retained (or     *)
+(*               crash-restored) generation -- the same-epoch re-acquire   *)
+(*               and the idempotent self re-claim                          *)
 (*   Conflict    the 409 path; collapses 409-on-renew (lose) and           *)
 (*               409-on-steal (never led) -- both reset the fence clock    *)
 (*               and end Following                                         *)
@@ -104,8 +107,7 @@
 (* closes -- the claim argument is inductive in genHW so nothing new is    *)
 (* expected, but it is unverified); asymmetric TTLs (if the lib.rs TODO    *)
 (* lands, StealTtl splits from FenceTtl and the 2*MaxSkew penalty in       *)
-(* BoundedDualLeadership shrinks); RenewLease restoring state[n] to        *)
-(* Leading after a SelfFence false alarm (see the note at RenewLease).     *)
+(* BoundedDualLeadership shrinks).                                         *)
 (***************************************************************************)
 
 EXTENDS Integers, FiniteSets, TLC
@@ -525,31 +527,91 @@ Steal(n) ==
   /\ UNCHANGED <<clocks, alive, deletes>>
 
 \* The decide()->Renew path: we hold the lease, refresh renew_time. Bumps rv
-\* (the apiserver bumps on every write); does NOT touch holder/gen.
-\* Named RenewLease (not Renew) -- the constant Renew is RENEW_INTERVAL.
+\* (the apiserver bumps on every write); does NOT touch holder or the
+\* transition count. Named RenewLease (not Renew) -- the constant Renew is
+\* RENEW_INTERVAL.
 \*
-\* The idempotent self re-claim (sched.lease.generation-claim's "retain own
-\* epoch" clause) maps HERE, by omission: a self-fence false alarm followed
-\* by a successful renew is a re-acquisition of the SAME epoch (the holder
-\* did not change, leaseTransitions did not move), and the code's claim
-\* path finds its own row at its own generation and retains it. The model
-\* encodes that as RenewLease leaving gen and genHW unchanged. The
-\* "bump past a foreign claim" branch is Steal's genHW+1 arm. Known
-\* under-approximation: RenewLease does not restore state[n] to "Leading"
-\* after a SelfFence false alarm (production's acquire edge does). That
-\* path requires lease.holder = n, which precludes any other node holding
-\* the lease -- so the states it would add are sole-leader states already
-\* reachable via Steal, and no dual-belief state (the only states the
-\* generation invariant constrains) is missed.
+\* state' = Leading: a successful renew of a lease we hold means we lead,
+\* whether we already believed it (no-op) or had stopped believing it (a
+\* SelfFence false alarm, or a Crash/Recover cycle while the lease still
+\* named us). The production correspondence is run_lease_loop()'s acquire
+\* arm firing on the was_leading=false -> now_leading=true edge of a
+\* successful renew: is_leader flips back to true and on_acquire(trans)
+\* runs with the UNCHANGED transition count. Before this conjunct the
+\* model under-approximated -- a self-fenced or recovered replica stayed
+\* Following forever and TLC never explored the states where it leads
+\* again.
+\*
+\* gen'/genHW' are the SAME on_acquire + recovery-claim collapse that
+\* Steal performs (both run before recovery_complete ungates dispatch on
+\* every acquire edge, renew-based or steal-based), with the renew's
+\* UN-bumped transition count:
+\*
+\*   entry  = fetch_max(transitions + 1)      = max(gen[n], lease.gen + 1)
+\*            (Steal's target is lease.gen + 2 because the steal PUT bumps
+\*            the count first; a renew does not)
+\*   seeded = the claim path's floor comparison: a floor ABOVE what the
+\*            lease + the Arc gave us must be exceeded (someone -- possibly
+\*            our own pre-crash incarnation -- claimed higher); a floor AT
+\*            it is our own row and is retained.
+\*
+\* The three cases, each pinned by a TLC run:
+\*   - SelfFence false alarm (never crashed): the Arc still holds our
+\*     claimed generation, which equals genHW while we hold the lease --
+\*     entry = gen[n], seeded = entry, genHW unchanged. The generation is
+\*     RETAINED and no new claim row is written: the idempotent self
+\*     re-claim (sched.lease.generation-claim's "retain own epoch"
+\*     clause). A connectivity blip costs nothing.
+\*   - Crash/Recover, no deletion: the Arc reset to 1; the transition
+\*     count still encodes our generation (lease.gen + 1 = the value we
+\*     originally derived), and our own claim row sits at exactly that
+\*     floor -- entry = lease.gen + 1 = genHW, seeded = entry. RESTORED,
+\*     no burn. Leaving gen UNCHANGED here instead falsifies
+\*     StaleLeaderHasStaleGeneration in the BASE cfg at depth 15 (a
+\*     holder that crashes inside a dual-belief window, recovers, and
+\*     renews would lead at gen=1, below the believer it deposed) -- the
+\*     red test for the entry half of this conjunct.
+\*   - Crash/Recover after a DeleteLease: the recreated lease's
+\*     transition count restarted from 0, so it no longer encodes the
+\*     generation we acquired at (we derived it from the PG floor, not
+\*     the count) -- entry under-restores to lease.gen + 1 < genHW, and
+\*     the claim path bumps to genHW + 1 and writes a new claim row
+\*     (production: pg_floor > gen_at_entry -> target = pg_floor + 1).
+\*     Encoding only the entry half falsifies StaleLeaderHasStaleGeneration
+\*     in the DELETION cfg at depth 9 (the under-restored holder collides
+\*     with the deletion victim it cannot see) -- the red test for the
+\*     seeded half. Both red-test traces are recorded in the cfgs'
+\*     non-vacuity sections.
+\* The seeded <= MaxGen precondition is the same state-space bound as
+\* Steal's, for the same reason (a saturating clamp would manufacture
+\* equal generations at the ceiling).
+\*
+\* acquiredAt is UNCHANGED: it records the rv of the CAS-guarded write
+\* that made this node the HOLDER (the Steal), which is what casRace /
+\* AtMostOneCASWinner are about -- two acquisitions racing at the same
+\* resourceVersion. A renew is a CAS-guarded write but not an
+\* acquisition; refreshing acquiredAt to the renew's rv would erase the
+\* acquisition history the race detector reads. The rejected alternative
+\* (refresh to snap[n].rv) is also SAFE -- lease.rv is monotonic, so no
+\* later PUT can succeed at a generation's old acquisition rv either way
+\* -- but it answers the wrong question. A Crash resets acquiredAt to
+\* NULL; a recovered holder that re-acquires via renew therefore has
+\* acquiredAt = NULL, which compares unequal to every rv and cannot flip
+\* casRace.
 RenewLease(n) ==
+  LET entry  == IF gen[n] > lease.gen + 1 THEN gen[n] ELSE lease.gen + 1
+      seeded == IF genHW > entry THEN genHW + 1 ELSE entry IN
   /\ alive[n]
   /\ snap[n] /= NULL /\ snap[n].holder = n
   /\ ReplaceGuard(n)
+  /\ seeded <= MaxGen
   /\ lease' = [lease EXCEPT !.rv = snap[n].rv + 1]
+  /\ state' = [state EXCEPT ![n] = "Leading"]
+  /\ gen'   = [gen EXCEPT ![n] = seeded]
+  /\ genHW' = IF seeded > genHW THEN seeded ELSE genHW
   /\ fence' = [fence EXCEPT ![n] = clocks[n]]
   /\ snap'  = [snap  EXCEPT ![n] = NULL]
-  /\ UNCHANGED <<clocks, alive, state, obs, gen, genHW, acquiredAt, deletes,
-                 delVictims>>
+  /\ UNCHANGED <<clocks, alive, obs, acquiredAt, deletes, delVictims>>
 
 \* The 409 path: snap stale. Stamps fence (apiserver answered). If we were
 \* Leading this is an explicit lose -- someone stole between our GET and PUT.
