@@ -7,11 +7,14 @@ paths:
 
 # Quint specification rules
 
-Distilled from [quint-llm-kit](https://github.com/quint-co/quint-llm-kit) (Informal Systems'
-internal Claude Code toolkit for Quint) plus rio-build's own porting experience. When you need
-an idiom this file doesn't cover, clone the kit and grep its 803-spec example corpus:
-`git clone --depth 1 https://github.com/quint-co/quint-llm-kit ~/tmp/quint-llm-kit` →
-`~/tmp/quint-llm-kit/mcp-servers/kb/kb/examples/` (Paxos, TwoPhaseCommit, ReliableBroadcast, …).
+Distilled from [quint-llm-kit](https://github.com/informalsystems/quint-llm-kit) (Informal
+Systems' Claude Code toolkit for Quint; last reviewed at rev `520e563`) plus rio-build's own
+porting experience. When you need an idiom this file doesn't cover, clone the kit and grep its
+curated knowledge base — the language/builtin docs, a dozen pattern cards, and ~75 curated
+example specs:
+`git clone --depth 1 https://github.com/informalsystems/quint-llm-kit ~/tmp/quint-llm-kit` →
+`mcp-servers/kb/kb/docs/{builtin,lang}.md`, `kb/patterns/`, and `kb/examples/` (`classic/` has
+Paxos, TwoPhaseCommit, ReliableBroadcast; `cosmos/` has Tendermint).
 
 Quint is TLA+ with a programmer-facing syntax, a static type system, and an effect system.
 Same semantics: a spec is `init` + a nondeterministic `step` relation + invariants. The
@@ -96,12 +99,15 @@ productized:
 **An invariant that holds over a state space that never reaches the contended state proves
 nothing.** Every safety invariant MUST be paired with at least one witness showing the state
 it protects against is reachable, and (for the load-bearing guard conditions) a documented
-weakened-test procedure showing the invariant is falsified without the guard. The header
-comment records the PROCEDURE and the CLAIM ("this witness is violated; deleting guard X
-falsifies invariant Y — verified at <commit>"); the measured depths, state counts, and
-wall-clocks go in the commit message and the check's output transcript ONLY — volatile
-measurements never go in comments, because they shift on every model change and a stale
-figure is worse than none.
+weakened-test procedure showing the invariant is falsified without the guard. Wire the
+load-bearing witnesses as expect-violation checks (`mkQuintWitnessCheck` in `nix/quint.nix`,
+the `quint-leader-election-witness-*` checks are the exemplar): the check passes only when the
+checker violates the witness, so "the scenario is still reachable" is re-proven by CI instead
+of resting on a verified-at-a-commit note. The header comment records the PROCEDURE and the
+CLAIM ("this witness is violated; deleting guard X falsifies invariant Y"); the measured
+depths, state counts, and wall-clocks go in the commit message and the check's output
+transcript ONLY — volatile measurements never go in comments, because they shift on every
+model change and a stale figure is worse than none.
 
 ## The verification workflow
 
@@ -149,6 +155,32 @@ figure is worse than none.
 failed.** Re-run with `--verbosity=3`, count the `[Frame N]` lines to find the last action
 that executed, then check every `.expect()` after that frame against the dumped state.
 Reproduce a random-simulation violation with `--seed=<0x…>` from the failure output.
+
+## Debugging an unreachable witness
+
+When a witness refuses to be violated (or a simulation never finds the scenario you expected),
+work the spec, not the seed:
+
+- **Decompose the guard.** Find the action(s) that advance the goal variable, split each guard
+  into its conjuncts, and add one throwaway witness per conjunct (`val witness_guard_N =
+  not(<conjunct>)`). Run them all — the one that is never violated names the conjunct that is
+  never satisfiable, and that is where the bug (or the over-constraint) lives.
+- **Relax and compare.** Quantitative guard → halve the threshold; conjunction → drop the last
+  clause; `all(n => P)` → `exists(n => P)`. If the original is never violated but the relaxed
+  version is, the problem lives in the gap between the two.
+- **Read the simulator's behavior, not just its verdict.** No actions executed ⇒ stuck at
+  `init` (a precondition is false in the initial state). The same action looping ⇒ nothing
+  else is enabled — a progress bug. The key actions never appearing ⇒ the witness (or a guard
+  on the way to it) is too strong. Otherwise ⇒ raise `--max-steps`; the scenario may just be
+  deeper than the bound.
+- **Probe states in the REPL** for one-off questions instead of editing the spec:
+  `{ echo 'init'; echo 'someAction("n1")'; echo 'varName'; } | quint repl -r
+  docs/spec/models/<file>.qnt::<module>`.
+- **Classify before fixing.** A failing run or witness is either a spec bug (the model does
+  the wrong thing) or a test bug (the run/witness asks for the wrong thing) — decide which
+  before editing either. Remember that every `.expect(...)` after the same `.then(...)`
+  evaluates against that same frame's state, so a "wrong" expectation may just be reading the
+  wrong frame.
 
 ## MBT (model-based testing) — conformance between the model and the implementation
 
@@ -200,6 +232,9 @@ Rules the rio-lease driver established (the reasoning lives in its module header
 - [ ] Every `var` is assigned in `init` and in every branch of every action.
 - [ ] Every map is pre-populated over its full key domain in `init` (`mapBy`), never `Map()`.
 - [ ] Every safety invariant has a paired witness proving its contended state is reachable.
+- [ ] New (or behavior-changed) actions reachable from `step` have a reachability witness
+      wired as an expect-violation check (`mkQuintWitnessCheck`) — a witness only verified by
+      hand at review time goes stale on the next constant change; the check keeps it honest.
 - [ ] Every load-bearing guard has a documented weakened-test result (delete it → which
       invariant fails; the depth it failed at goes in the commit message, not the comment).
 - [ ] Business logic lives in `pure def`s; actions are thin (the pure logic is what an MBT
@@ -220,6 +255,8 @@ Rules the rio-lease driver established (the reasoning lives in its module header
 
 ## Deliberate omissions (revisit when the trigger occurs)
 
+Re-reviewed against the kit at rev `520e563`; everything below still stands.
+
 - **Choreo** (the kit's message-passing scaffolding): rio-build's protocols modeled so far
   are shared-register CAS races against the apiserver, not message-passing. Revisit when
   modeling a genuinely message-passing protocol (the builder↔scheduler heartbeat/assignment
@@ -229,4 +266,10 @@ Rules the rio-lease driver established (the reasoning lives in its module header
   kit's tooling only if a future component needs transition labeling quint-connect cannot
   express.
 - **The kit's Docker container and MCP servers**: rio-build uses the nix dev shell; the KB is
-  consumed by grepping the cloned repo.
+  consumed by grepping the cloned repo. The kit now packages its KB-search and LSP MCP
+  servers as a nix flake (`mcp-servers/flake.nix`), so packaging is no longer the obstacle —
+  the trigger for revisiting is model-authoring becoming frequent enough that grepping the
+  clone stops being good enough.
+- **Apalache's `--inductive-invariant` mode**: unnecessary while every regime's state space
+  stays small enough for exhaustive TLC; it is the escape hatch if a future model outgrows
+  that (prove the invariant inductive instead of enumerating the states).
