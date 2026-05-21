@@ -37,10 +37,11 @@
 #
 # The tlc backend requires a FINITE state space: every variable that can
 # grow without bound (a counter, a resourceVersion, a clock) needs a
-# ceiling as an action PRECONDITION in the .qnt itself (see cas.qnt's
-# MAX_RV). Without one TLC never terminates. Apalache does not need the
-# ceiling (it bounds by step count) but the ceiling must be present
-# anyway so the same spec is checkable under both backends.
+# ceiling as an action PRECONDITION in the .qnt itself (see the MAX_RV /
+# MAX_TIME / MAX_GEN preconditions in leaderElection.qnt). Without one
+# TLC never terminates. Apalache does not need the ceiling (it bounds by
+# step count) but the ceiling must be present anyway so the same spec is
+# checkable under both backends.
 #
 # Where the tools come from: quintPkg's bin/quint is a wrapper that puts
 # its own JRE on PATH and sets QUINT_HOME to the package's share/quint,
@@ -71,10 +72,13 @@
 # deleted. .config/tracey/config.styx must list nix/quint.nix under
 # `test_include` for tracey to scan the markers.
 #
-# Gating: each model entry below is wrapped in `lib.optionalAttrs
-# (builtins.pathExists …)` so the check only appears in checks.* once
-# the .qnt file lands — the wiring + markers can land first and the
-# model commit turns the check on without an intermediate red gate.
+# The checks reference their .qnt files unconditionally: a missing or
+# renamed model file is a loud eval/build failure, never a silently
+# absent check. (The bootstrap-era `lib.optionalAttrs (pathExists …)`
+# gating that let the wiring land before the model was dropped once
+# every wired model existed — a gated check whose model vanishes
+# disappears from checks.* instead of failing, which converts "the
+# proof is gone" into a silent coverage loss.)
 {
   pkgs,
   lib,
@@ -163,184 +167,158 @@ in
 {
   # Expose the constructor so a future cross-model aggregate (or an
   # ad-hoc spike) can build its own checks without going through the
-  # gated attrs below.
+  # attrs below.
   inherit mkQuintCheck;
 
-  # Per-model checks, gated on the .qnt file existing. Spliced into
-  # checks.* via misc-checks.nix — `lib.optionalAttrs` makes the attr
-  # absent (not present-and-failing) until the model lands.
-  checks =
-    lib.optionalAttrs (builtins.pathExists (modelsDir + "/cas.qnt")) {
-      # The CAS fragment of the leader-election protocol: the rv-guarded
-      # apiserver PUT admits at most one writer per resourceVersion (the
-      # hard half of the at-most-one-leader rule — the half the apiserver's
-      # optimistic concurrency makes unconditional). Cross-validated at
-      # migration time against the hand-written TLA+ reference it
-      # replaced (the same invariant, the same counterexample when the
-      # rv guard is deleted). This check doubles as the permanent
-      # quint-toolchain smoke test: it is by far the smallest model here,
-      # so "the quint toolchain is broken" is caught at merge-gate rather
-      # than at the next model change, the same role cov-smoke plays for
-      # the coverage pipeline. The second invariant exists to keep the
-      # multi-invariant (--invariant=a,b) code path exercised.
-      # r[verify sched.lease.at-most-one-leader+3]
-      quint-cas-smoke = mkQuintCheck {
-        name = "cas-smoke";
-        spec = "cas";
-        invariants = [
-          "atMostOneCASWinner"
-          "rvInBounds"
-        ];
-      };
-    }
-    // lib.optionalAttrs (builtins.pathExists (modelsDir + "/leaderElection.qnt")) {
-      # rio-lease's leader-election protocol over a Kubernetes Lease
-      # object: per-node clocks (bounded skew), the observed-record
-      # staleness clock, local self-fencing, crash/recovery, and the
-      # write-ahead generation claim. Ported from (and replacing) the
-      # hand-written TLA+ model; its r[verify ...] markers moved here
-      # with it.
-      # The base regime disables every operator/infrastructure fault so a
-      # regression in the core protocol surfaces in this check rather than
-      # buried in the larger fault-injection regimes.
-      #
-      # It verifies atMostOneCASWinner (the apiserver admits at most one
-      # writer per resourceVersion), boundedDualLeadership (every
-      # dual-belief state has a discovery mechanism armed),
-      # staleLeaderHasStaleGeneration (concurrent believers always have
-      # distinct generations -- the bridge to the executor-side generation
-      # fence; the invariant the pre-fix protocol falsified), plus the
-      # loopInterval and clockSkewBound precondition tripwires and the
-      # boundsOK ceiling tripwire. The fetch-max-seed marker covers the
-      # seeding-and-claiming encoding inside steal (the generation derives
-      # from the lease's transition count and the PG floor advances at
-      # acquisition time).
-      #
-      # The state count, depth, and wall-clock are in this check's output
-      # transcript and in the commit that introduced (or last re-measured)
-      # the model -- never here. The durable claim: the port's state count
-      # is exactly |NODES|! times the symmetry-reduced TLA+ predecessor's,
-      # minus the self-symmetric states -- the structural-identity
-      # evidence that the two state spaces are the same space.
-      # r[verify sched.lease.at-most-one-leader+3]
-      # r[verify sched.lease.k8s-lease]
-      # r[verify sched.recovery.fetch-max-seed+2]
-      quint-leader-election = mkQuintCheck {
-        name = "leader-election";
-        spec = "leaderElection";
-        main = "leaderElectionBase";
-        invariants = [
-          "boundsOK"
-          "clockSkewBound"
-          "atMostOneCASWinner"
-          "loopInterval"
-          "boundedDualLeadership"
-          "staleLeaderHasStaleGeneration"
-        ];
-      };
-
-      # The same model with the Lease-object-deletion fault enabled
-      # (MAX_DELETES = 1): `kubectl delete lease` resets the
-      # leaseTransitions counter the generation derives from — the one
-      # fault that re-arms the generation-collision failure mode the
-      # transition-count derivation closed — while PG survives. The
-      # write-ahead claim (the generation is durably recorded in PG's
-      # claims ledger inside the acquisition step, before dispatch is
-      # ungated) is what survives it: the checker proves
-      # staleLeaderHasStaleGeneration still holds with the fault
-      # injected, and the deliberately-weakened run (the claim reverted
-      # to the pre-claim protocol) is falsified with a shallow
-      # steal-delete-steal trace — two believers at the same generation.
-      # See leaderElectionDeletion's module comment for the red-first
-      # procedure and the rest of the regime's non-vacuity evidence.
-      # r[verify sched.lease.generation-claim]
-      quint-leader-election-deletion = mkQuintCheck {
-        name = "leader-election-deletion";
-        spec = "leaderElection";
-        main = "leaderElectionDeletion";
-        invariants = [
-          "boundsOK"
-          "clockSkewBound"
-          "atMostOneCASWinner"
-          "loopInterval"
-          "boundedDualLeadership"
-          "staleLeaderHasStaleGeneration"
-        ];
-      };
-
-      # The same model under the asymmetric-TTL constants — THE HEALTHY
-      # REGIME. The base and deletion regimes keep zero fence/steal
-      # separation and model the degraded case, where dual belief is
-      # reachable and boundedDualLeadership (every dual-belief state has
-      # a discovery mechanism armed) is the operative property. This
-      # regime gives the model the separation the asymmetric-TTL change
-      # gives production (fence at LEASE_TTL - FENCE_MARGIN, steal at
-      # LEASE_TTL + FENCE_MARGIN), and the operative property upgrades to
-      # neverDual: no two replicas ever simultaneously believe they lead,
-      # over the full state space. neverDual holds iff
-      # STEAL_AFTER - FENCE_AFTER >= RENEW + 2*MAX_SKEW (production:
-      # 2*FENCE_MARGIN >= RENEW_INTERVAL + 2*clock_skew — an 8s
-      # separation against a 5s renew interval leaves a 1.5s skew
-      # budget, which is rio-lease's compile-time assertion). The
-      # boundary is measured from both sides — one tick less separation
-      # and neverDual is violated — and the second-acquisition
-      # reachability probe proves the contention it constrains actually
-      # happens. See leaderElectionAsymmetric's module comment for the
-      # boundary procedure and the non-vacuity evidence; the measured
-      # depths are in the introducing commit. neverDual is the
-      # verification of both the self-fence ordering claim (the victim
-      # has provably stopped believing before any thief steals) and the
-      # at-most-one-leader soft half (the dual-belief window is empty
-      # under bounded skew).
-      # r[verify sched.lease.at-most-one-leader+3]
-      # r[verify sched.lease.self-fence+2]
-      quint-leader-election-asymmetric = mkQuintCheck {
-        name = "leader-election-asymmetric";
-        spec = "leaderElection";
-        main = "leaderElectionAsymmetric";
-        invariants = [
-          "boundsOK"
-          "clockSkewBound"
-          "atMostOneCASWinner"
-          "loopInterval"
-          "boundedDualLeadership"
-          "staleLeaderHasStaleGeneration"
-          "neverDual"
-        ];
-      };
-
-      # The same model with both PostgreSQL-side faults enabled and the
-      # Lease-deletion fault disabled (MAX_CLAIM_FAILURES = 1,
-      # MAX_RESTORES = 1, MAX_DELETES = 0): a claim INSERT that fails
-      # between the seed read and the claim write while recovery proceeds
-      # anyway (the production proceed-on-failure path), and a
-      # point-in-time restore that regresses the floor to zero. Every
-      # invariant still holds: the Lease object's transition count is an
-      # independent epoch source, so each PG fault alone is survivable —
-      # the Lease and the PG ledger are REDUNDANT epoch sources and a
-      # generation collision requires destroying both. The boundary is
-      # measured: re-enabling the deletion fault alongside either PG
-      # fault violates staleLeaderHasStaleGeneration with a shallow
-      # steal-delete-steal trace (see leaderElectionPgFaults's module
-      # comment for the conjunction-evidence procedure; the trace
-      # summaries and depths are in the introducing commit). Those
-      # conjunctions are the documented, accepted residuals of the
-      # proceed-on-failure choice and of relying on PG as the
-      # post-deletion backstop; this check pins the claim that they are
-      # the ONLY ways a PG-side fault reaches a collision.
-      # r[verify sched.lease.generation-claim]
-      quint-leader-election-pg-faults = mkQuintCheck {
-        name = "leader-election-pg-faults";
-        spec = "leaderElection";
-        main = "leaderElectionPgFaults";
-        invariants = [
-          "boundsOK"
-          "clockSkewBound"
-          "atMostOneCASWinner"
-          "loopInterval"
-          "boundedDualLeadership"
-          "staleLeaderHasStaleGeneration"
-        ];
-      };
+  # Per-model checks. Spliced into checks.* via misc-checks.nix.
+  checks = {
+    # rio-lease's leader-election protocol over a Kubernetes Lease
+    # object: per-node clocks (bounded skew), the observed-record
+    # staleness clock, local self-fencing, crash/recovery, and the
+    # write-ahead generation claim. Ported from (and replacing) the
+    # hand-written TLA+ model; its r[verify ...] markers moved here
+    # with it.
+    # The base regime disables every operator/infrastructure fault so a
+    # regression in the core protocol surfaces in this check rather than
+    # buried in the larger fault-injection regimes.
+    #
+    # It verifies atMostOneCASWinner (the apiserver admits at most one
+    # writer per resourceVersion), boundedDualLeadership (every
+    # dual-belief state has a discovery mechanism armed),
+    # staleLeaderHasStaleGeneration (concurrent believers always have
+    # distinct generations -- the bridge to the executor-side generation
+    # fence; the invariant the pre-fix protocol falsified), plus the
+    # loopInterval and clockSkewBound precondition tripwires and the
+    # boundsOK ceiling tripwire. The fetch-max-seed marker covers the
+    # seeding-and-claiming encoding inside steal (the generation derives
+    # from the lease's transition count and the PG floor advances at
+    # acquisition time).
+    #
+    # The state count, depth, and wall-clock are in this check's output
+    # transcript and in the commit that introduced (or last re-measured)
+    # the model -- never here. The durable claim: the port's state count
+    # is exactly |NODES|! times the symmetry-reduced TLA+ predecessor's,
+    # minus the self-symmetric states -- the structural-identity
+    # evidence that the two state spaces are the same space.
+    # r[verify sched.lease.at-most-one-leader+3]
+    # r[verify sched.lease.k8s-lease]
+    # r[verify sched.recovery.fetch-max-seed+2]
+    quint-leader-election = mkQuintCheck {
+      name = "leader-election";
+      spec = "leaderElection";
+      main = "leaderElectionBase";
+      invariants = [
+        "boundsOK"
+        "clockSkewBound"
+        "atMostOneCASWinner"
+        "loopInterval"
+        "boundedDualLeadership"
+        "staleLeaderHasStaleGeneration"
+      ];
     };
+
+    # The same model with the Lease-object-deletion fault enabled
+    # (MAX_DELETES = 1): `kubectl delete lease` resets the
+    # leaseTransitions counter the generation derives from — the one
+    # fault that re-arms the generation-collision failure mode the
+    # transition-count derivation closed — while PG survives. The
+    # write-ahead claim (the generation is durably recorded in PG's
+    # claims ledger inside the acquisition step, before dispatch is
+    # ungated) is what survives it: the checker proves
+    # staleLeaderHasStaleGeneration still holds with the fault
+    # injected, and the deliberately-weakened run (the claim reverted
+    # to the pre-claim protocol) is falsified with a shallow
+    # steal-delete-steal trace — two believers at the same generation.
+    # See leaderElectionDeletion's module comment for the red-first
+    # procedure and the rest of the regime's non-vacuity evidence.
+    # r[verify sched.lease.generation-claim]
+    quint-leader-election-deletion = mkQuintCheck {
+      name = "leader-election-deletion";
+      spec = "leaderElection";
+      main = "leaderElectionDeletion";
+      invariants = [
+        "boundsOK"
+        "clockSkewBound"
+        "atMostOneCASWinner"
+        "loopInterval"
+        "boundedDualLeadership"
+        "staleLeaderHasStaleGeneration"
+      ];
+    };
+
+    # The same model under the asymmetric-TTL constants — THE HEALTHY
+    # REGIME. The base and deletion regimes keep zero fence/steal
+    # separation and model the degraded case, where dual belief is
+    # reachable and boundedDualLeadership (every dual-belief state has
+    # a discovery mechanism armed) is the operative property. This
+    # regime gives the model the separation the asymmetric-TTL change
+    # gives production (fence at LEASE_TTL - FENCE_MARGIN, steal at
+    # LEASE_TTL + FENCE_MARGIN), and the operative property upgrades to
+    # neverDual: no two replicas ever simultaneously believe they lead,
+    # over the full state space. neverDual holds iff
+    # STEAL_AFTER - FENCE_AFTER >= RENEW + 2*MAX_SKEW (production:
+    # 2*FENCE_MARGIN >= RENEW_INTERVAL + 2*clock_skew — an 8s
+    # separation against a 5s renew interval leaves a 1.5s skew
+    # budget, which is rio-lease's compile-time assertion). The
+    # boundary is measured from both sides — one tick less separation
+    # and neverDual is violated — and the second-acquisition
+    # reachability probe proves the contention it constrains actually
+    # happens. See leaderElectionAsymmetric's module comment for the
+    # boundary procedure and the non-vacuity evidence; the measured
+    # depths are in the introducing commit. neverDual is the
+    # verification of both the self-fence ordering claim (the victim
+    # has provably stopped believing before any thief steals) and the
+    # at-most-one-leader soft half (the dual-belief window is empty
+    # under bounded skew).
+    # r[verify sched.lease.at-most-one-leader+3]
+    # r[verify sched.lease.self-fence+2]
+    quint-leader-election-asymmetric = mkQuintCheck {
+      name = "leader-election-asymmetric";
+      spec = "leaderElection";
+      main = "leaderElectionAsymmetric";
+      invariants = [
+        "boundsOK"
+        "clockSkewBound"
+        "atMostOneCASWinner"
+        "loopInterval"
+        "boundedDualLeadership"
+        "staleLeaderHasStaleGeneration"
+        "neverDual"
+      ];
+    };
+
+    # The same model with both PostgreSQL-side faults enabled and the
+    # Lease-deletion fault disabled (MAX_CLAIM_FAILURES = 1,
+    # MAX_RESTORES = 1, MAX_DELETES = 0): a claim INSERT that fails
+    # between the seed read and the claim write while recovery proceeds
+    # anyway (the production proceed-on-failure path), and a
+    # point-in-time restore that regresses the floor to zero. Every
+    # invariant still holds: the Lease object's transition count is an
+    # independent epoch source, so each PG fault alone is survivable —
+    # the Lease and the PG ledger are REDUNDANT epoch sources and a
+    # generation collision requires destroying both. The boundary is
+    # measured: re-enabling the deletion fault alongside either PG
+    # fault violates staleLeaderHasStaleGeneration with a shallow
+    # steal-delete-steal trace (see leaderElectionPgFaults's module
+    # comment for the conjunction-evidence procedure; the trace
+    # summaries and depths are in the introducing commit). Those
+    # conjunctions are the documented, accepted residuals of the
+    # proceed-on-failure choice and of relying on PG as the
+    # post-deletion backstop; this check pins the claim that they are
+    # the ONLY ways a PG-side fault reaches a collision.
+    # r[verify sched.lease.generation-claim]
+    quint-leader-election-pg-faults = mkQuintCheck {
+      name = "leader-election-pg-faults";
+      spec = "leaderElection";
+      main = "leaderElectionPgFaults";
+      invariants = [
+        "boundsOK"
+        "clockSkewBound"
+        "atMostOneCASWinner"
+        "loopInterval"
+        "boundedDualLeadership"
+        "staleLeaderHasStaleGeneration"
+      ];
+    };
+  };
 }
