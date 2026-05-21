@@ -462,6 +462,29 @@ in
       witness = "noReacquisitionAfterDeletion";
     };
 
+    # The claim-INSERT failure is explored in the pg-faults regime: its
+    # "each PG fault alone is survivable" verdict is about a state space
+    # in which the proceed-on-failure path actually fires, not one where
+    # the fault never bites.
+    quint-leader-election-witness-claim-failure = mkQuintWitnessCheck {
+      name = "leader-election-witness-claim-failure";
+      spec = "leaderElection";
+      main = "leaderElectionPgFaults";
+      witness = "noClaimFailure";
+    };
+
+    # The restore-then-reclaim sequence is explored in the pg-faults
+    # regime: a point-in-time restore zeroes the floor and a later
+    # acquisition's claim re-raises it, so surviving the floor
+    # regression is a property of the explored space rather than a
+    # vacuous one.
+    quint-leader-election-witness-restore-reclaim = mkQuintWitnessCheck {
+      name = "leader-election-witness-restore-reclaim";
+      spec = "leaderElection";
+      main = "leaderElectionPgFaults";
+      witness = "noReclaimAfterRestore";
+    };
+
     # Implementation conformance (model-based testing). The four checks
     # above prove the PROTOCOL; this one proves rio-lease implements
     # that protocol: rio-lease/src/mbt_tests.rs replays traces generated

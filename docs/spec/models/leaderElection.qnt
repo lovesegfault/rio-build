@@ -430,6 +430,33 @@ module leaderElection {
   /// containing the fault sequence, not one where the fault never bites.
   val noReacquisitionAfterDeletion = not(deletes > 0 and lease.gen > 0)
 
+  /// Violated when a write-ahead claim INSERT has failed: proves the
+  /// PgFaults regime actually explores the proceed-on-failure path
+  /// (claimFails) its "each PG fault alone is survivable" verdict is
+  /// about. claimFails is reachable only inside steal's / renewLease's
+  /// edge-branch claim disjunction, so a violation is always an
+  /// acquisition whose claim failed. Deliberately fault-firing only:
+  /// pinning a SUCCESSOR acquisition after the failed claim would need
+  /// a history variable (nothing the failure zeroes can order the
+  /// conjunction, unlike the restore witness below), so that boundary
+  /// stays with the conjunction procedure in the PgFaults module
+  /// header. Checked against the PgFaults regime only -- every other
+  /// regime disables the fault (MAX_CLAIM_FAILURES = 0), so the
+  /// predicate holds there by construction.
+  val noClaimFailure = claimFailures == 0
+
+  /// Violated when a PG point-in-time restore has occurred AND a later
+  /// claim INSERT succeeded: pgRestore zeroes genHW, and only claimOk
+  /// on an acquire edge (a steal or an edge renew) raises it again --
+  /// the steady-state renew offers genHW itself, a no-op -- so the
+  /// conjunction pins "restore, then a successful re-claim", the
+  /// post-fault recovery the regime's survivability verdict is about
+  /// (the same construction as noReacquisitionAfterDeletion above).
+  /// Its violation also proves pgRestore itself fired. Checked against
+  /// the PgFaults regime only -- every other regime disables the fault
+  /// (MAX_RESTORES = 0).
+  val noReclaimAfterRestore = not(restores > 0 and genHW > 0)
+
   /// The production loop's tick discipline, stated as a predicate over
   /// states: a Leading node is never more than FENCE_AFTER + RENEW past
   /// its last successful round-trip, because run_lease_loop() checks
@@ -1624,12 +1651,21 @@ module leaderElectionAsymmetric {
 //     the PG one, and the second steal has nothing left to be monotonic
 //     over.
 //   If either conjunction run ever PASSES, the constants no longer reach
-//   the collision and must be revisited -- that is this regime's
-//   non-vacuity evidence (the faults are load-bearing in conjunction
-//   with the deletion, so their single-fault survival is not an artifact
-//   of the faults never firing). If the MAX_DELETES = 0 run ever FAILS,
-//   a PG fault alone breaks the fence with no operator action: a new
-//   protocol finding, not a tuning problem.
+//   the collision and must be revisited -- that is the conjunction half
+//   of this regime's non-vacuity evidence (the faults are load-bearing
+//   in conjunction with the deletion). If the MAX_DELETES = 0 run ever
+//   FAILS, a PG fault alone breaks the fence with no operator action: a
+//   new protocol finding, not a tuning problem.
+//
+// SINGLE-FAULT REACHABILITY at these constants is machine-checked: the
+// expect-violation checks quint-leader-election-witness-claim-failure
+// (noClaimFailure) and quint-leader-election-witness-restore-reclaim
+// (noReclaimAfterRestore) in nix/quint.nix fail if a failed claim
+// INSERT, or a restore followed by a successful re-claim, ever stops
+// being reachable in this regime's explored space. The conjunction
+// runs above remain a manual procedure because they require
+// re-enabling MAX_DELETES -- different constants than this shipped
+// module.
 // =========================================================================
 module leaderElectionPgFaults {
   import leaderElection(
