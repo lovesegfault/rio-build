@@ -165,11 +165,16 @@ impl LogFlusher {
 
     /// Whether this replica currently holds the scheduler lease.
     /// Relaxed is sufficient: this is a periodic poll (every 30s/1h)
-    /// plus one check at shutdown,
-    /// not a synchronization point — a one-tick window where an
-    /// ex-leader's flusher hasn't observed the flip is bounded and
-    /// harmless (the GC DELETE is idempotent; a stale periodic UPSERT
-    /// is overwritten by the new leader's next snapshot).
+    /// plus one check at shutdown, not a synchronization point. The
+    /// window where an ex-leader's flusher hasn't observed the flip is
+    /// harmless — not because a later write repairs a stale one (a
+    /// finalized drv's buffer is drained; there is no "next snapshot")
+    /// but because the writes themselves are safe: the GC DELETE is
+    /// idempotent, and a stale periodic UPSERT cannot downgrade a
+    /// finalized row (`upsert_drv_log`'s conflict clause is monotone in
+    /// `is_complete`). The gates avoid wasted S3/PG traffic from a
+    /// replica that has no business writing; they are not the
+    /// corruption barrier.
     fn is_leader(&self) -> bool {
         self.is_leader.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -255,8 +260,7 @@ impl LogFlusher {
                     }
 
                     _ = tick.tick() => {
-                        // Leader-gated, and the gate is load-bearing here (not
-                        // just waste avoidance). A standby's `LogBuffers` is
+                        // Leader-gated. A standby's `LogBuffers` is
                         // structurally empty (no worker streams connect to it),
                         // but an ex-leader after a lease flap retains its
                         // stamped buffers — and for drvs that were still
@@ -264,11 +268,13 @@ impl LogFlusher {
                         // re-stamps the *same* `exec_id` from `assignments`
                         // (so a reconnecting worker keeps streaming under its
                         // in-flight execution). An un-gated ex-leader periodic
-                        // tick would therefore UPSERT a stale `.partial`
-                        // snapshot into the same `(exec_id)`-keyed `drv_logs`
-                        // row the new leader is writing — and could flip
-                        // `is_complete` back to `false` over the new leader's
-                        // completed final flush.
+                        // tick would therefore PUT stale `.partial` blobs and
+                        // churn the same `(exec_id)`-keyed `drv_logs` rows the
+                        // new leader is writing. It cannot downgrade a row the
+                        // new leader has finalized — `upsert_drv_log`'s
+                        // conflict clause refuses `is_complete` true→false —
+                        // so the gate is waste/churn avoidance, not the
+                        // corruption barrier.
                         if self.is_leader() {
                             self.flush_periodic().await;
                         }
@@ -535,7 +541,9 @@ impl LogFlusher {
 
         // PG UPSERT — one row per execution, keyed on exec_id. Periodic
         // and final flushes UPSERT the same row (is_complete flips
-        // false→true on the final).
+        // false→true on the final, and never back: the conflict clause
+        // refuses the downgrade, so a periodic UPSERT that loses a race
+        // with a final is a logged no-op, not corruption).
         if let Err(e) = upsert_drv_log(
             &self.pool,
             exec_id,
@@ -877,6 +885,16 @@ fn compress_lines(lines: &[Vec<u8>]) -> std::io::Result<Vec<u8>> {
 /// `db/history.rs:44`), so the timestamp is bound as f64 epoch seconds and
 /// PG's `to_timestamp()` does the conversion server-side; `finished_at`
 /// uses server-side `now()` matching the existing `builds` write path.
+///
+/// `is_complete` is **monotone**: the `DO UPDATE`'s `WHERE` clause refuses
+/// any write that would flip a finalized row back to `is_complete=false`
+/// (and with it the `s3_key`/`status`/`finished_at` clobber). A periodic
+/// snapshot is by definition stale relative to any final flush for the
+/// same execution — an ex-leader's still-running sweep, or a periodic tick
+/// queued behind a final, must not downgrade the row the final wrote,
+/// because `flush_final` drains the buffer and nothing would ever repair
+/// it. A refused write is reported via `rows_affected() == 0` and logged
+/// at `debug!`.
 #[allow(clippy::too_many_arguments)] // one UPSERT with the full row — a struct param would just rename the args
 async fn upsert_drv_log(
     pool: &PgPool,
@@ -906,7 +924,7 @@ async fn upsert_drv_log(
         // existed.
         .unwrap_or(0.0);
 
-    sqlx::query(
+    let result = sqlx::query(
         "INSERT INTO drv_logs
              (exec_id, drv_hash, s3_key, first_line, line_count, total_bytes,
               is_complete, status, started_at, finished_at)
@@ -919,7 +937,8 @@ async fn upsert_drv_log(
              total_bytes = EXCLUDED.total_bytes,
              is_complete = EXCLUDED.is_complete,
              status = EXCLUDED.status,
-             finished_at = EXCLUDED.finished_at",
+             finished_at = EXCLUDED.finished_at
+         WHERE NOT drv_logs.is_complete OR EXCLUDED.is_complete",
     )
     .bind(exec_id)
     .bind(drv_hash)
@@ -932,6 +951,21 @@ async fn upsert_drv_log(
     .bind(started_at_epoch)
     .execute(pool)
     .await?;
+    // rows_affected()==0 has exactly one cause for an INSERT … ON CONFLICT
+    // DO UPDATE: the conflict fired and the WHERE refused the update — i.e.
+    // the row is already finalized and this write would have downgraded it.
+    // That is a periodic snapshot racing a final flush for the same
+    // execution (an ex-leader's sweep landing after the new leader
+    // finalized the drv, or a queued periodic landing after a final).
+    // Working as designed; the `.partial` blob this write uploaded is
+    // orphaned and the TTL GC sweeps it at expiry.
+    if result.rows_affected() == 0 {
+        debug!(
+            %exec_id,
+            s3_key,
+            "drv_logs upsert refused: row is already finalized (is_complete is monotone)"
+        );
+    }
     Ok(())
 }
 
@@ -1693,6 +1727,130 @@ mod tests {
         Ok(())
     }
 
+    /// `upsert_drv_log`'s conflict clause is monotone in `is_complete`: a
+    /// periodic snapshot must never downgrade a row a final flush has
+    /// already completed. The race this pins: an ex-leader's
+    /// `flush_periodic` sweep is mid-flight when the lease flips; the new
+    /// leader re-stamps the same `exec_id` from `assignments`, the worker
+    /// completes there, and `flush_final` writes `is_complete=true` and
+    /// drains the buffer — so the ex-leader's still-running iteration for
+    /// that drv would be the LAST write for the 30-day TTL (no "next
+    /// snapshot" ever repairs it). The latch refuses that write at the one
+    /// chokepoint every flush goes through, for every caller and timing.
+    /// Single-process simulation of the cross-replica write order: PG only
+    /// sees the order of the UPSERTs, not which replica issued them.
+    ///
+    /// Anti-vacuousness: the row is proven finalized before the stale
+    /// sweep; the stale sweep is proven to have reached the UPSERT (its
+    /// `.partial` PUT is asserted — `upload_and_record` calls
+    /// `upsert_drv_log` unconditionally after a successful PUT); the
+    /// re-stamp reuses the SAME exec_id and the row count stays 1 (the
+    /// stale write conflicted, it did not insert a sibling row); and the
+    /// allowed direction (periodic refresh of an incomplete row) is pinned
+    /// so an over-strict latch fails here too.
+    #[tokio::test]
+    async fn final_then_stale_periodic_does_not_downgrade_row() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, _deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/aaaa-latch.drv";
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"compiling"]);
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+
+        // Allowed direction: a second periodic snapshot still refreshes an
+        // incomplete row (the latch's `NOT drv_logs.is_complete` disjunct).
+        flusher.flush_periodic().await;
+        buffers.push(&mk_batch(drv_path, 1, &[b"still compiling"]));
+        flusher.flush_periodic().await;
+        let partial: (bool, i64) =
+            sqlx::query_as("SELECT is_complete, line_count FROM drv_logs WHERE exec_id = $1")
+                .bind(exec_id)
+                .fetch_one(&db.pool)
+                .await?;
+        assert!(!partial.0);
+        assert_eq!(
+            partial.1, 2,
+            "a periodic re-snapshot must still refresh an incomplete row"
+        );
+
+        // The build completes: the final flush drains and finalizes the row.
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id,
+                status: Some("succeeded".into()),
+            })
+            .await;
+        let fin: (bool, String) =
+            sqlx::query_as("SELECT is_complete, s3_key FROM drv_logs WHERE exec_id = $1")
+                .bind(exec_id)
+                .fetch_one(&db.pool)
+                .await?;
+        assert!(fin.0, "precondition: the final flush landed");
+        assert!(fin.1.ends_with(".log.zst") && !fin.1.contains(".partial"));
+
+        // The ex-leader's retained buffer for the SAME execution: recovery
+        // re-stamps the same exec_id from `assignments`, and the worker's
+        // stream kept feeding the ex-leader through the flap. Its periodic
+        // sweep (already past the arm-level gate) now reaches this drv.
+        buffers.set_exec(drv_path, exec_id, "test-worker");
+        buffers.push(&mk_batch(drv_path, 0, &[b"stale line on the ex-leader"]));
+        let puts_before = puts.lock().unwrap().len();
+        flusher.flush_periodic().await;
+
+        // The stale sweep DID reach the UPSERT: it PUT a `.partial` blob,
+        // and upload_and_record calls upsert_drv_log unconditionally after
+        // a successful PUT. Without this assert, a fixture whose entry was
+        // skipped (unstamped / empty) would pass vacuously.
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        assert_eq!(
+            captured.len(),
+            puts_before + 1,
+            "the stale periodic sweep must reach the S3 PUT + PG UPSERT"
+        );
+        assert!(
+            captured.last().unwrap().0.ends_with(".partial.log.zst"),
+            "the stale write is a periodic `.partial` snapshot"
+        );
+
+        // …and the row did NOT move: the conflict clause refused the
+        // is_complete true→false downgrade and, with it, the s3_key /
+        // status / finished_at clobber.
+        let row: (bool, String, Option<String>, Option<f64>) = sqlx::query_as(
+            "SELECT is_complete, s3_key, status, \
+                    EXTRACT(EPOCH FROM finished_at)::float8 \
+             FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert!(
+            row.0,
+            "stale periodic UPSERT must not downgrade is_complete"
+        );
+        assert!(
+            row.1.ends_with(".log.zst") && !row.1.contains(".partial"),
+            "stale periodic UPSERT must not repoint s3_key at the .partial"
+        );
+        assert_eq!(row.2.as_deref(), Some("succeeded"), "status survives");
+        assert!(row.3.is_some(), "finished_at survives");
+
+        // Still exactly one row — the stale write conflicted with (and was
+        // refused by) the finalized row; it did not land under a new key.
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM drv_logs")
+            .fetch_one(&db.pool)
+            .await?;
+        assert_eq!(count.0, 1);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn started_at_decoded_from_uuidv7_timestamp() -> anyhow::Result<()> {
         // started_at must come from the UUIDv7's embedded dispatch
@@ -1920,9 +2078,10 @@ mod tests {
     /// the periodic-tick and gc-tick arms: an ex-leader's retained
     /// `LogBuffers` entries are stamped with `exec_id`s the new leader
     /// re-stamps from `assignments` and may have already finalized — an
-    /// un-gated last-gasp sweep would repoint `s3_key` at a stale `.partial`
-    /// blob and flip `is_complete` back to `false` over the new leader's
-    /// completed row.
+    /// un-gated last-gasp sweep would PUT stale `.partial` blobs and churn
+    /// the new leader's partial rows for nothing (the `upsert_drv_log`
+    /// latch refuses the `is_complete` downgrade on finalized rows, but
+    /// the wasted writes are reason enough to gate).
     ///
     /// Anti-vacuousness: the snapshot assert below proves the buffer is
     /// stamped AND non-empty at the moment the arm fires, and the sibling
