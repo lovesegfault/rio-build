@@ -146,12 +146,11 @@ impl SchedulerService for SchedulerGrpc {
         }
 
         // UUID v7 (time-ordered, RFC 9562): the high 48 bits are Unix-ms
-        // timestamp, so lexicographic sort == chronological sort. This makes
-        // the S3 log key space `logs/{build_id}/...` naturally prefix-scannable
-        // by time range, gives chronologically sorted `ls` output for
-        // debugging, and improves PG index locality on builds.build_id
-        // (recent builds cluster at the end of the index, not scattered
-        // randomly like v4).
+        // timestamp, so lexicographic sort == chronological sort. This
+        // improves PG index locality on builds.build_id (recent builds
+        // cluster at the end of the index, not scattered randomly like
+        // v4). Build logs are keyed by (drv_hash, exec_id), not build_id
+        // (see crate::logs::log_s3_key).
         //
         // Test code still uses v4 (~60 sites in actor/tests/) — test IDs
         // don't need ordering; changing them is pure churn.

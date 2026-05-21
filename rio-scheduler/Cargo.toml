@@ -82,7 +82,7 @@ rio-nix = { workspace = true }
 # OrderedFloat wraps it with a total ordering.
 ordered-float = { workspace = true }
 
-# phase2b: build-log S3 flush (zstd + PUT logs/{build_id}/{drv_hash}.log.zst).
+# phase2b: build-log S3 flush (zstd + PUT logs/{drv_hash}/{exec_id}[.partial].log.zst).
 # Client builder shared with rio-store via rio-common's `aws` feature;
 # aws-sdk-s3 stays a direct dep for ByteStream/PutObject types.
 # WONTFIX: not moving behind a rio-store PutLog RPC — see ADR-024.
