@@ -1314,3 +1314,78 @@ module leaderElectionAsymmetric {
     MAX_RESTORES = 0
   ).*
 }
+
+// =========================================================================
+// The PostgreSQL fault regime: both PG-side faults enabled, the
+// Lease-deletion fault DISABLED, every other constant identical to
+// leaderElectionBase (see that module for the coverage-vs-cost argument
+// behind the shared constants; the symmetric FENCE_AFTER = STEAL_AFTER
+// keeps this regime comparable to the base and Deletion regimes -- the
+// PG faults are orthogonal to the TTL asymmetry).
+//
+// The faults:
+//   - ClaimFails (MAX_CLAIM_FAILURES = 1): the claim INSERT errors
+//     between the seed read and the claim write and recovery proceeds
+//     anyway -- the production proceed-on-failure path
+//     (rio_scheduler_generation_claim_failed_total). The acquiring node
+//     still derives its generation and still leads, but the floor a
+//     successor seeds from never learns the generation it dispatches at.
+//     Encoded as the second disjunct of steal's (and renewLease's edge
+//     branch's) genHW update; the claimFailures counter is the trace
+//     marker.
+//   - PgRestore (MAX_RESTORES = 1): a point-in-time restore regresses
+//     the floor (the claims ledger and the assignment history together)
+//     to 0. The pgRestore action.
+//
+// What this regime proves -- THE LEASE AND THE PG LEDGER ARE REDUNDANT
+// EPOCH SOURCES: every invariant holds with both PG faults injected.
+// steal's generation target is max(lease.gen + 2, genHW + 1); when the
+// floor term lies (a failed claim left it behind, a restore zeroed it),
+// the lease-derived term still increases strictly across successive
+// stealers, because only a steal bumps the transition count and nothing
+// in the PG fault set resets it. Each PG fault alone is survivable. A
+// generation collision requires destroying BOTH epoch sources -- a PG
+// fault in conjunction with a Lease deletion -- and those conjunctions
+// are exactly the documented, accepted residuals of the
+// proceed-on-failure choice and of relying on PG as the post-deletion
+// backstop.
+//
+// CONJUNCTION-EVIDENCE PROCEDURE (the boundary of the documented
+// residuals; temporary edits to THIS module's constants, never CI
+// checks; re-verify after any constant or encoding change -- the
+// violation depths and trace summaries are measurements and live in the
+// introducing commit's message, not here):
+//   - DeleteLease + ClaimFails (MAX_DELETES = 1, MAX_CLAIM_FAILURES = 1,
+//     MAX_RESTORES = 0): staleLeaderHasStaleGeneration MUST be VIOLATED
+//     with a shallow steal-delete-steal trace -- the first steal's claim
+//     fails so the floor never learns its generation, the deletion
+//     resets the lease's transition count, and the second steal derives
+//     the same generation from the reset lease and the stale floor.
+//   - DeleteLease + PgRestore (MAX_DELETES = 1, MAX_CLAIM_FAILURES = 0,
+//     MAX_RESTORES = 1): VIOLATED -- the first steal's claim succeeds,
+//     the deletion resets the lease's epoch source, the restore wipes
+//     the PG one, and the second steal has nothing left to be monotonic
+//     over.
+//   If either conjunction run ever PASSES, the constants no longer reach
+//   the collision and must be revisited -- that is this regime's
+//   non-vacuity evidence (the faults are load-bearing in conjunction
+//   with the deletion, so their single-fault survival is not an artifact
+//   of the faults never firing). If the MAX_DELETES = 0 run ever FAILS,
+//   a PG fault alone breaks the fence with no operator action: a new
+//   protocol finding, not a tuning problem.
+// =========================================================================
+module leaderElectionPgFaults {
+  import leaderElection(
+    NODES = Set("n1", "n2"),
+    FENCE_AFTER = 3,
+    STEAL_AFTER = 3,
+    RENEW = 1,
+    MAX_SKEW = 1,
+    MAX_TIME = 8,
+    MAX_GEN = 4,
+    MAX_RV = 8,
+    MAX_DELETES = 0,
+    MAX_CLAIM_FAILURES = 1,
+    MAX_RESTORES = 1
+  ).*
+}

@@ -307,5 +307,39 @@ in
           "neverDual"
         ];
       };
+
+      # The same model with both PostgreSQL-side faults enabled and the
+      # Lease-deletion fault disabled (MAX_CLAIM_FAILURES = 1,
+      # MAX_RESTORES = 1, MAX_DELETES = 0): a claim INSERT that fails
+      # between the seed read and the claim write while recovery proceeds
+      # anyway (the production proceed-on-failure path), and a
+      # point-in-time restore that regresses the floor to zero. Every
+      # invariant still holds: the Lease object's transition count is an
+      # independent epoch source, so each PG fault alone is survivable —
+      # the Lease and the PG ledger are REDUNDANT epoch sources and a
+      # generation collision requires destroying both. The boundary is
+      # measured: re-enabling the deletion fault alongside either PG
+      # fault violates staleLeaderHasStaleGeneration with a shallow
+      # steal-delete-steal trace (see leaderElectionPgFaults's module
+      # comment for the conjunction-evidence procedure; the trace
+      # summaries and depths are in the introducing commit). Those
+      # conjunctions are the documented, accepted residuals of the
+      # proceed-on-failure choice and of relying on PG as the
+      # post-deletion backstop; this check pins the claim that they are
+      # the ONLY ways a PG-side fault reaches a collision.
+      # r[verify sched.lease.generation-claim]
+      quint-leader-election-pg-faults = mkQuintCheck {
+        name = "leader-election-pg-faults";
+        spec = "leaderElection";
+        main = "leaderElectionPgFaults";
+        invariants = [
+          "boundsOK"
+          "clockSkewBound"
+          "atMostOneCASWinner"
+          "loopInterval"
+          "boundedDualLeadership"
+          "staleLeaderHasStaleGeneration"
+        ];
+      };
     };
 }
