@@ -19383,10 +19383,6 @@
       ],
       "devDependencies": [
         {
-          "name": "figment",
-          "packageId": "figment"
-        },
-        {
           "name": "rio-nix",
           "packageId": "rio-nix"
         },

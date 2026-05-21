@@ -25,7 +25,7 @@ fn executor_kind<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ExecutorKind,
 }
 
 /// Serde serializer for ExecutorKind as string. Needed for the
-/// `Serialized::defaults` base layer in figment.
+/// compiled-defaults base layer of the config loader.
 fn executor_kind_ser<S: serde::Serializer>(k: &ExecutorKind, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(match k {
         ExecutorKind::Builder => "builder",
@@ -426,7 +426,7 @@ mod tests {
         assert_eq!(args.fuse_passthrough, None);
     }
 
-    // figment::Jail standing-guard tests — see rio-test-support/src/config.rs.
+    // Jailed standing-guard tests — see rio-test-support/src/config.rs.
     // When you add Config.newfield: ADD IT to both assert blocks below.
 
     rio_test_support::jail_roundtrip!(
@@ -454,7 +454,7 @@ mod tests {
         // The critical non-serde-bool default: fuse_passthrough
         // must survive the Serialized::defaults → TOML merge as
         // `true`. This is the load-bearing check — serde's bool
-        // default is `false`, so if figment's base-layer
+        // default is `false`, so if the loader's base-layer
         // serialization drops it, a pre-phase3a config silently
         // loses kernel passthrough.
         assert!(

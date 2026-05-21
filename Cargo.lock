@@ -6152,7 +6152,6 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
- "figment",
  "fuser",
  "futures-util",
  "hex",
