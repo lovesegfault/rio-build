@@ -1876,7 +1876,7 @@ CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
   reader captures the lease generation at stream-open and breaks the loop
   (closing the stream) before forwarding `ProcessCompletion` /
   `PrefetchComplete` if `is_leader=false` or the generation has changed --- the
-  worker reconnects to the new leader. `ProcessCompletion`,
+  worker reconnects to the new leader. `ProcessCompletion`, `CancelBuild`,
   `ReportExecutorTermination`, `AckSpawnedIntents`, `ReconcileAssignments`,
   `SubstituteComplete`, and `Tick` are additionally gated at actor dispatch as
   defense-in-depth. `ExecutorConnected`/`Disconnected`/`Heartbeat`/`PrefetchComplete`

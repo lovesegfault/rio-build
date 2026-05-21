@@ -989,10 +989,24 @@ impl DagActor {
                     reason,
                     reply,
                 } => {
-                    let result = self
-                        .handle_cancel_build(build_id, caller_tenant, &reason)
-                        .await;
-                    let _ = reply.send(result);
+                    // r[impl sched.lease.standby-drops-writes]
+                    // Defense-in-depth like ProcessCompletion: an
+                    // ex-leader's cancel writes terminal PG state from
+                    // a stale DAG, and its terminal_log_epilogue pins
+                    // the write-once build_derivations.exec_id (AND
+                    // exec_id IS NULL) — permanently blocking the new
+                    // leader's correct correlation. An unretried
+                    // gateway disconnect-cancel is backstopped by the
+                    // new leader's orphan-watcher sweep.
+                    if !self.leader.is_leader() {
+                        warn!(%build_id, "dropping CancelBuild: not leader");
+                        let _ = reply.send(Err(ActorError::NotLeader));
+                    } else {
+                        let result = self
+                            .handle_cancel_build(build_id, caller_tenant, &reason)
+                            .await;
+                        let _ = reply.send(result);
+                    }
                 }
                 ActorCommand::ExecutorConnected {
                     executor_id,

@@ -886,6 +886,13 @@ pub enum ActorError {
     /// not own the build. Maps to gRPC PERMISSION_DENIED.
     #[error("permission denied: build {build_id} belongs to a different tenant")]
     PermissionDenied { build_id: Uuid },
+
+    /// `r[sched.lease.standby-drops-writes]`: the actor dequeued a
+    /// state-writing command after losing the lease. Maps to gRPC
+    /// UNAVAILABLE (same string as the gRPC layer's `ensure_leader`)
+    /// so BalancedChannel clients retry against the new leader.
+    #[error("not leader (standby replica)")]
+    NotLeader,
 }
 
 /// Read-only view of the actor's backpressure state.

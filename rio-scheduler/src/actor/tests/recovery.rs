@@ -1779,6 +1779,113 @@ async fn ex_leader_drops_process_completion() -> TestResult {
 }
 
 // r[verify sched.lease.standby-drops-writes]
+/// `CancelBuild` dequeued after `on_lose()` MUST be dropped at actor
+/// dispatch with `Err(NotLeader)`. An ex-leader's cancel would write
+/// `persist_status_batch(Cancelled)` from a stale DAG and — worse —
+/// `terminal_log_epilogue` → `record_exec_correlation`, whose
+/// `AND exec_id IS NULL` guard makes `build_derivations.exec_id`
+/// write-once: a stale exec pinned here permanently blocks the new
+/// leader's correct correlation after it re-dispatches the drv.
+#[tokio::test]
+async fn ex_leader_drops_cancel_build() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let leader = crate::lease::LeaderState::default(); // always-leader
+    let leader_for_actor = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = leader_for_actor;
+    });
+
+    // Real merge + dispatch so the drv reaches Assigned with a real
+    // exec_id and the build_derivations row exists in PG (the merge tx
+    // creates it with exec_id NULL — the row record_exec_correlation's
+    // UPDATE targets).
+    let build_id = Uuid::new_v4();
+    let mut rx = connect_executor(&handle, "exlc-w", "x86_64-linux").await?;
+    merge_single_node(&handle, build_id, "exlc-drv", PriorityClass::Scheduled).await?;
+    let assignment = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assignment.drv_path,
+        test_drv_path("exlc-drv"),
+        "precondition: drv must be dispatched (exec_id stamped) before the lease flip, \
+         otherwise record_exec_correlation no-ops regardless of the gate and this test \
+         is vacuous"
+    );
+
+    // Lose the lease. on_lose only flips atomics — the LeaderLost actor
+    // command is sent separately in production (tokio::spawn in
+    // main.rs), so a CancelBuild already in the mailbox is processed
+    // with is_leader=false against the still-populated DAG. That is
+    // exactly the window under test.
+    leader.on_lose();
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id,
+            caller_tenant: None,
+            reason: "test cancel after lease loss".into(),
+            reply: reply_tx,
+        })
+        .await?;
+    let result = reply_rx
+        .await
+        .expect("gate must reply, not drop the oneshot");
+    assert!(
+        matches!(result, Err(ActorError::NotLeader)),
+        "ex-leader CancelBuild must be rejected with NotLeader (maps to retriable \
+         UNAVAILABLE); got {result:?}"
+    );
+    barrier(&handle).await;
+
+    // (1) The write-once exec correlation MUST NOT have been written:
+    // the new leader re-dispatches this drv under a fresh exec_id and
+    // its own record_exec_correlation must find the row still NULL.
+    let exec_id: Option<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT bd.exec_id FROM build_derivations bd \
+         JOIN derivations d USING (derivation_id) \
+         WHERE bd.build_id = $1 AND d.drv_hash = 'exlc-drv'",
+    )
+    .bind(build_id)
+    .fetch_optional(&db.pool)
+    .await?;
+    assert_eq!(
+        exec_id,
+        Some(None),
+        "ex-leader CancelBuild must not pin the write-once build_derivations.exec_id \
+         (row must exist and be NULL)"
+    );
+
+    // (2) No stale terminal status write: the drv stays at the
+    // pre-flip Assigned the dispatch path persisted.
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = 'exlc-drv'")
+            .fetch_optional(&db.pool)
+            .await?;
+    assert_eq!(
+        status.as_deref(),
+        Some(DerivationStatus::Assigned.as_str()),
+        "ex-leader CancelBuild must leave derivations.status untouched"
+    );
+
+    // (3) Build status untouched: positive pin against the post-merge
+    // 'active' (merge.rs transitions pending→active), not a
+    // negative assert_ne!("cancelled") that would pass vacuously if
+    // the row were missing.
+    let bstatus: Option<String> =
+        sqlx::query_scalar("SELECT status FROM builds WHERE build_id = $1")
+            .bind(build_id)
+            .fetch_optional(&db.pool)
+            .await?;
+    assert_eq!(
+        bstatus.as_deref(),
+        Some("active"),
+        "ex-leader CancelBuild must not transition the build (expected post-merge \
+         'active')"
+    );
+    Ok(())
+}
+
+// r[verify sched.lease.standby-drops-writes]
 /// `Heartbeat`/`PrefetchComplete` arms stay ungated (keep
 /// `self.executors` accurate) but their PG-touching sub-calls MUST be:
 /// `dispatch_ready` self-gates (dispatch.rs early-return); the

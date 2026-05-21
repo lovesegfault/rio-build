@@ -76,5 +76,8 @@ pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
             Status::unavailable("store service is unreachable; cache-check circuit breaker is open")
         }
         ActorError::PermissionDenied { .. } => Status::permission_denied(err.to_string()),
+        // Same string as `ensure_leader` above so operators grep for
+        // one signature.
+        ActorError::NotLeader => Status::unavailable("not leader (standby replica)"),
     }
 }
