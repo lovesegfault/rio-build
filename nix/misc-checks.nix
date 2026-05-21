@@ -949,9 +949,10 @@ in
   inherit pkgs unfilteredRoot;
   inherit (pkgs) lib;
 }).checks
-# Quint checks for the same models directory — the successor toolchain
-# to nix/tla.nix (typed source, the same exhaustive TLC checking under
-# `--backend=tlc`). Gated on the .qnt file existing, same as above.
+# Quint checks for formal protocol models in docs/spec/models/. Each
+# entry is gated on its .qnt file existing — the wiring + r[verify]
+# markers land before the model so the check turns on at the model
+# commit without an intermediate red gate. See nix/quint.nix.
 // (import ./quint.nix {
   inherit pkgs unfilteredRoot quintPkg;
   inherit (pkgs) lib;

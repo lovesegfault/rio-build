@@ -142,12 +142,15 @@ let
     # See nix/tla.nix for the CI check.
     tlaplus
 
-    # Quint — the candidate successor to raw TLA+ for new models
-    # (typed, effect-checked, simulator + Apalache symbolic verifier).
-    # `quint verify` finds Apalache via QUINT_HOME inside the package —
-    # a store path, no runtime download, so it will work in the
-    # network-less sandbox when a CI check is wired up. From the
-    # `nixpkgs-quint` input, NOT `pkgs` (see flake.nix).
+    # Quint — the formal-specification language for docs/spec/models/
+    # (typed, effect-checked, simulator + Apalache symbolic verifier +
+    # the exhaustive TLC backend the CI checks use). Run a model
+    # locally: `quint verify --backend=tlc --main=<module>
+    # --invariant=<i> docs/spec/models/M.qnt`. `quint verify` finds
+    # Apalache (and the TLC inside it) via QUINT_HOME inside the
+    # package — a store path, no runtime download, which is why the
+    # checks in nix/quint.nix work in the network-less sandbox. From
+    # the `nixpkgs-quint` input, NOT `pkgs` (see flake.nix).
     quintPkg
 
     # crate2nix CLI for regenerating Cargo.json after

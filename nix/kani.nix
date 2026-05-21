@@ -93,7 +93,7 @@ in
   # rio-lease: lease/election state machine. One #[kani::proof_for_contract(decide_pure)]
   # harness verifies the four #[kani::ensures] iff-clauses on decide_pure() over
   # the full input domain. The contract case structure parallels the action
-  # partition in docs/spec/models/LeaderElection.tla.
+  # partition in docs/spec/models/leaderElection.qnt.
   # r[verify sched.lease.k8s-lease]
   # r[verify sched.lease.at-most-one-leader+3]
   kani-rio-lease = mkKaniCheck {

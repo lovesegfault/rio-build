@@ -1452,13 +1452,13 @@
                   # (proof_for_contract, exhaustive over the input domain).
                   # Promoted from packages.kani-toolchain.kani-checks once
                   # the harness landed — a vacuous 0-harness check would
-                  # have diluted the gate. The TLA+ model
-                  # (tla-leader-election, in miscChecks) verifies the
+                  # have diluted the gate. The formal protocol model
+                  # (quint-leader-election, in miscChecks) verifies the
                   # protocol-level safety property; this verifies the
                   # per-decision logic that complements it (richer case
-                  # structure than the TLA+ spike — not a formal
-                  # refinement). r[verify] markers are at the wiring
-                  # point in nix/kani.nix.
+                  # structure than the model's action partition — not a
+                  # formal refinement). r[verify] markers are at the
+                  # wiring point in nix/kani.nix.
                   inherit (kaniChecks) kani-rio-lease;
                   # Regression: per-node profraw extract must not drop
                   # filename-colliding profraws across multi-worker nodes.

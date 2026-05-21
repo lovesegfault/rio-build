@@ -114,22 +114,23 @@ pub struct Observed {
 /// comparison into a small enum keeps `decide_pure()` CBMC-tractable —
 /// CBMC can't symbolically execute over `&str` arguments.
 ///
-/// The variants map onto `decide()`'s case structure and the TLA+
-/// model's action partition (`docs/spec/models/LeaderElection.tla`).
+/// The variants map onto `decide()`'s case structure and the formal
+/// model's action partition (`docs/spec/models/leaderElection.qnt`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(kani, derive(kani::Arbitrary))]
 pub(crate) enum HolderKind {
     /// `holder` is `None` or `Some("")` — graceful step-down. Steal now.
-    /// TLA+: a node with `snap[n].holder = NULL` takes `Steal(n)`.
+    /// Model: a node whose snapshot shows no holder takes `steal(n)`.
     Empty,
     /// `holder == our_id` — we hold it. Renew.
-    /// TLA+: a node with `snap[n].holder = n` takes `Renew(n)`.
+    /// Model: a node whose snapshot shows itself as holder takes
+    /// `renewLease(n)`.
     Us,
     /// `holder` is a non-empty string that isn't us. Standby or steal
     /// based on the observed-record clock.
-    /// TLA+: a node with `snap[n].holder /= n /\ snap[n].holder /= NULL`
-    /// takes `Discard(n)` (spike scope: standby) or, in Phase-1, `Steal(n)`
-    /// when the observed-record clock expires.
+    /// Model: a node whose snapshot shows another holder stays standby
+    /// (no PUT action fires) or takes `steal(n)` once the observed-record
+    /// clock expires.
     Other,
 }
 
@@ -155,9 +156,9 @@ pub(crate) enum ObservedUpdate {
 /// returned `ObservedUpdate`.
 ///
 /// The case structure here is the formal contract: it parallels the
-/// action disjunction in `Next` in `docs/spec/models/LeaderElection.tla`
-/// (`Get(n) \/ Steal(n) \/ Renew(n) \/ Observe(n) \/ Discard(n)`). When
-/// either changes, update the other.
+/// per-node action disjunction (`nodeStep`) in
+/// `docs/spec/models/leaderElection.qnt` (`apiGet`, `steal`,
+/// `renewLease`, `conflict`, …). When either changes, update the other.
 ///
 /// `matched_observation_age_ms` collapses two production cases into
 /// one: it's `Some(age)` only when there IS an observation AND its rv
@@ -172,8 +173,8 @@ pub(crate) enum ObservedUpdate {
 // `return is Y iff holder is X`. A bug that flips a comparison
 // (`>` to `>=`) or drops a case fails the contract.
 //
-// The case structure parallels the {Steal, Renew, Observe, Discard}
-// action partition under `Next` in docs/spec/models/LeaderElection.tla.
+// The case structure parallels the {steal, renewLease, standby} case
+// partition under `nodeStep` in docs/spec/models/leaderElection.qnt.
 // When either changes, update the other — `tracey bump` on the spec
 // rule will flag both.
 //
@@ -467,7 +468,8 @@ impl LeaderElection {
     /// On successful steal, clear `observed` — we're the holder
     /// now, the observed-record tracks OTHER holders.
     ///
-    /// Modeled as `Replace(n)` in `docs/spec/models/LeaderElection.tla`.
+    /// Modeled as the rv-guarded PUT (`casOk` conjoined by `steal` and
+    /// `renewLease`) in `docs/spec/models/leaderElection.qnt`.
     /// The rv-guarded CAS here is what keeps `AtMostOneLeader` during the
     /// initial-acquisition race — the model checks it over all
     /// interleavings of N replicas, which neither the table tests nor
@@ -761,7 +763,7 @@ mod tests {
     /// PG — the apiserver bumped `leaseTransitions` atomically with the
     /// holder change inside the rv-guarded PUT. This is the production
     /// half of the fix for the StaleLeaderHasStaleGeneration
-    /// counterexample in `docs/spec/models/LeaderElection.tla`.
+    /// counterexample documented in `docs/spec/models/leaderElection.qnt`.
     // r[verify sched.lease.generation-fence+2]
     #[tokio::test]
     async fn successful_steal_carries_bumped_transitions() {
@@ -882,13 +884,13 @@ mod kani_proofs {
     /// (which exercise the full `decide()` → projection → `decide_pure()`
     /// path).
     /// The *sufficient* condition (the CAS prevents dual leadership when
-    /// both racers' `decide()` returns Steal) is verified by the TLA+ model
-    /// in `docs/spec/models/LeaderElection.tla`.
+    /// both racers' `decide()` returns Steal) is verified by the formal
+    /// model in `docs/spec/models/leaderElection.qnt`.
     ///
     /// The verification stack:
     ///   - table tests (`mod tests`)   → projection: `decide()` end-to-end
     ///   - Kani contracts (this file)  → pure decision: `decide_pure()`
-    ///   - TLA+ (`LeaderElection.tla`) → protocol: the actions that call `decide()`
+    ///   - the model (`leaderElection.qnt`) → protocol: the actions that call `decide()`
     #[kani::proof_for_contract(decide_pure)]
     fn check_decide_pure_contract() {
         let holder: HolderKind = kani::any();

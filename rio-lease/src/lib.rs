@@ -108,8 +108,9 @@ const RENEW_SLOP: Duration = Duration::from_secs(2);
 /// different moments (the leader stamps `last_successful_renew` when its
 /// renew RESPONSE arrives; the follower stamps `obs.at` when it OBSERVES
 /// the rv change), so without a margin the follower's deadline can land
-/// first with zero clock skew. The TLA+ model
-/// (`docs/spec/models/LeaderElectionAsymmetric.cfg`) proves NeverDual —
+/// first with zero clock skew. The formal model
+/// (`docs/spec/models/leaderElection.qnt`, the `leaderElectionAsymmetric`
+/// regime) proves NeverDual —
 /// no two replicas ever simultaneously believe they lead — exactly when
 /// the separation exceeds the renew interval plus the round-trip clock
 /// skew:
@@ -428,7 +429,7 @@ impl LeaderState {
     /// `kubectl delete lease` reset the transition count while PG's
     /// high-water persisted. A local increment is what produced the
     /// generation collision `StaleLeaderHasStaleGeneration` falsifies in
-    /// `docs/spec/models/LeaderElection.tla` — a leader deposed before
+    /// `docs/spec/models/leaderElection.qnt` — a leader deposed before
     /// persisting its generation to PG left the high-water stale and its
     /// successor seeded from the same value.
     ///
@@ -735,8 +736,9 @@ pub async fn run_lease_loop<H: LeaseHooks>(
                 // than any follower's steal threshold (STEAL_AFTER), so
                 // by the time a replica that CAN reach the apiserver
                 // steals, we have already stopped believing — that
-                // ordering is the NeverDual proof in
-                // LeaderElectionAsymmetric.cfg.
+                // ordering is the neverDual proof in the
+                // leaderElectionAsymmetric regime of
+                // docs/spec/models/leaderElection.qnt.
                 //
                 // The old "DON'T flip — apiserver down for EVERYONE"
                 // argument is wrong once elapsed > the fence deadline.
@@ -793,7 +795,8 @@ pub async fn run_lease_loop<H: LeaseHooks>(
 /// flip `is_leader=false` locally. SELF_FENCE_AFTER is 2×FENCE_MARGIN
 /// ahead of any follower's steal threshold, so we stop believing
 /// BEFORE anyone who can reach the apiserver steals — that ordering is
-/// the NeverDual proof in `LeaderElectionAsymmetric.cfg`. The only
+/// the `neverDual` proof in the `leaderElectionAsymmetric` regime of
+/// `docs/spec/models/leaderElection.qnt`. The only
 /// world where we're still the rightful leader is one where NOBODY can
 /// reach the apiserver — in which case dispatch is pointless anyway.
 ///
@@ -987,10 +990,10 @@ mod tests {
     /// from the apiserver-CAS-guarded `leaseTransitions` field, not from a
     /// local increment. Two replicas that both believe they lead can never
     /// share a generation, because the transition count is bumped
-    /// atomically with the holder change (the depth-12 counterexample in
-    /// `docs/spec/models/LeaderElection.tla`'s StaleLeaderHasStaleGeneration
-    /// is exactly two local increments seeded from the same stale
-    /// high-water mark).
+    /// atomically with the holder change (the generation-collision
+    /// counterexample documented in `docs/spec/models/leaderElection.qnt`'s
+    /// StaleLeaderHasStaleGeneration archaeology is exactly two local
+    /// increments seeded from the same stale high-water mark).
     // r[verify sched.lease.generation-fence+2]
     #[test]
     fn generation_derives_from_lease_transitions() {

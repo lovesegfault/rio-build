@@ -5,11 +5,17 @@
 // staleness clock, local self-fencing, the PG generation high-water
 // mark, pod crash/recovery, and Lease-object deletion.
 //
-// This is the Quint port of LeaderElection.tla (which remains
-// authoritative until this port reproduces every documented result —
-// see the migration plan). The action-by-action correspondence with the
-// TLA+ source is deliberate: review this file conjunct-by-conjunct
-// against its TLA+ counterpart, not as a fresh model.
+// This is the Quint port of (and the replacement for) the hand-written
+// TLA+ model formerly at docs/spec/models/LeaderElection.tla. The port
+// was validated against every documented result of that predecessor
+// before it was removed: each fault regime's distinct-state count is
+// exactly |NODES|! times the symmetry-reduced original's (minus the
+// self-symmetric states), every weakened test reproduces its
+// counterexample, and every non-vacuity probe still fires — the
+// migration commits carry the figures. The action-by-action
+// correspondence with the TLA+ source is deliberate; the "TLA+ X"
+// annotations throughout map this file's encoding onto the
+// predecessor's for anyone reading the pre-migration history.
 //
 // Formalizes (from docs/spec/components/scheduler.typ; update both when
 // the protocol changes -- `tracey bump` on a rule flags the r[verify]

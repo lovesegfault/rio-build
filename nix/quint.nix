@@ -12,16 +12,16 @@
 # functions. Quint proves *protocol* properties ("no two nodes ever both
 # think they hold the lease") over the abstract distributed algorithm —
 # the thing the Rust implements but cannot itself observe across nodes.
-# Same crate, two complementary proof obligations. (Quint replaces the
-# hand-written TLA+ in nix/tla.nix; during the migration both toolchains
-# coexist and the TLA+ checks remain authoritative until the Quint port
-# reproduces every documented result.)
+# Same crate, two complementary proof obligations. (The models here
+# replaced a hand-written TLA+ toolchain; the port was validated against
+# every documented result of its predecessor before the TLA+ artifacts
+# were removed — the migration commits carry the evidence.)
 #
 # Backends — why the default is `tlc`, not quint's own default:
 #   - `tlc`: transpiles the spec to TLA+ and runs TLC's parallel BFS over
-#     the FULL reachable state space — the same checker, the same
-#     exhaustive guarantee, and the same all-cores parallelism as
-#     nix/tla.nix's mkTlcCheck. This is the CI backend.
+#     the FULL reachable state space — an exhaustive check of every
+#     reachable state, parallel across every core the build is allotted.
+#     This is the CI backend.
 #   - `apalache` (quint's own default if no --backend is given — which is
 #     exactly why this constructor must default to `tlc`): bounded
 #     symbolic model checking via one Z3 context, incrementally unrolled.
@@ -64,8 +64,8 @@
 # not here.
 #
 # r[verify ...] markers live HERE at the wiring point, not in the .qnt
-# files — same discipline as nix/tla.nix, nix/kani.nix's `kani-checks`
-# attrset, and nix/tests/default.nix's `subtests` entries: a marker at
+# files — same discipline as nix/kani.nix's `kani-checks` attrset and
+# nix/tests/default.nix's `subtests` entries: a marker at
 # the wiring point structurally proves the check is built; a marker in
 # the .qnt header would claim "verified" even if this file's attr were
 # deleted. .config/tracey/config.styx must list nix/quint.nix under
@@ -73,9 +73,8 @@
 #
 # Gating: each model entry below is wrapped in `lib.optionalAttrs
 # (builtins.pathExists …)` so the check only appears in checks.* once
-# the .qnt file lands — same trade-off as nix/tla.nix (the wiring +
-# markers can land first and the model commit turns the check on
-# without an intermediate red gate).
+# the .qnt file lands — the wiring + markers can land first and the
+# model commit turns the check on without an intermediate red gate.
 {
   pkgs,
   lib,
@@ -95,8 +94,8 @@ let
   # with several fault regimes declares one core module plus one thin
   # instantiation module per regime, and each regime is its own check so
   # a regression in the core protocol surfaces in the small fast check
-  # instead of buried in the largest one (the same role nix/tla.nix's
-  # `config` argument plays for .cfg files).
+  # instead of buried in the largest one (the role a separate .cfg per
+  # regime played for the hand-written-TLA+ predecessor of this file).
   mkQuintCheck =
     {
       name,
@@ -137,7 +136,7 @@ let
         # which oversubscribes badly under nix-fast-build's parallel
         # checks gate (each TLC instance thinks it owns the box).
         # NIX_BUILD_CORES=0 means "all"; TLC's `auto` does the same, so
-        # pass it through. Same shape as nix/tla.nix's -workers cap.
+        # pass it through.
         # --tlc-config accepts only JVM/runtime knobs ({workers,
         # maxHeap, stackSize}) — it is NOT a .cfg-directive escape
         # hatch; everything else lives in the .qnt.
@@ -175,9 +174,10 @@ in
       # The CAS fragment of the leader-election protocol: the rv-guarded
       # apiserver PUT admits at most one writer per resourceVersion (the
       # hard half of the at-most-one-leader rule — the half the apiserver's
-      # optimistic concurrency makes unconditional). Cross-validated
-      # against the TLA+ reference, which carries the same marker until
-      # the migration replaces it. This check doubles as the permanent
+      # optimistic concurrency makes unconditional). Cross-validated at
+      # migration time against the hand-written TLA+ reference it
+      # replaced (the same invariant, the same counterexample when the
+      # rv guard is deleted). This check doubles as the permanent
       # quint-toolchain smoke test: it is by far the smallest model here,
       # so "the quint toolchain is broken" is caught at merge-gate rather
       # than at the next model change, the same role cov-smoke plays for
@@ -197,8 +197,9 @@ in
       # rio-lease's leader-election protocol over a Kubernetes Lease
       # object: per-node clocks (bounded skew), the observed-record
       # staleness clock, local self-fencing, crash/recovery, and the
-      # write-ahead generation claim. The Quint port of the TLA+ model
-      # (which carries the same markers until the migration deletes it).
+      # write-ahead generation claim. Ported from (and replacing) the
+      # hand-written TLA+ model; its r[verify ...] markers moved here
+      # with it.
       # The base regime disables every operator/infrastructure fault so a
       # regression in the core protocol surfaces in this check rather than
       # buried in the larger fault-injection regimes.

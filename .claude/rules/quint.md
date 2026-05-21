@@ -138,7 +138,8 @@ figure is worse than none.
   module per regime that instantiates the core with that regime's values; each regime module
   is the `--main` of one check.
 - The escape hatch for anything the generated `.cfg` cannot express: `quint compile
-  --target tlaplus spec.qnt` + a hand-written `.cfg` + `nix/tla.nix`'s `mkTlcCheck`. The
+  --target tlaplus spec.qnt` + a hand-written `.cfg` + a `runCommand` that invokes `tlc`
+  directly (the pre-migration `nix/tla.nix` in the git history is the template). The
   generated TLA+ is a build artifact; never edit it.
 
 ## Debugging a failing `run`

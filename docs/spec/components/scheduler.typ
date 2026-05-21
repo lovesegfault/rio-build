@@ -2155,13 +2155,13 @@ CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
   token at the resource boundary, which #rref("sched.lease.generation-fence+2")
   provides; that rule, not this one, makes a dual-belief window safe rather
   than merely unreachable. The formal model in
-  `docs/spec/models/LeaderElection.tla` verifies the three claims
-  separately: `AtMostOneCASWinner` (the hard half --- two `Replace` actions
-  cannot both succeed at the same `resourceVersion`), `NeverDual` (the
-  healthy regime, `LeaderElectionAsymmetric.cfg` --- with the fence/steal
-  separation exceeding the renew interval plus the round-trip clock skew, no
-  two replicas ever simultaneously believe they lead), and
-  `BoundedDualLeadership` (the degraded regime, the base and deletion cfgs
+  `docs/spec/models/leaderElection.qnt` verifies the three claims
+  separately: `atMostOneCASWinner` (the hard half --- two rv-guarded PUT
+  actions cannot both succeed at the same `resourceVersion`), `neverDual` (the
+  healthy regime, the `leaderElectionAsymmetric` module --- with the
+  fence/steal separation exceeding the renew interval plus the round-trip
+  clock skew, no two replicas ever simultaneously believe they lead), and
+  `boundedDualLeadership` (the degraded regime, the base and deletion modules
   --- when the separation is insufficient, every reachable dual-belief state
   still has a discovery mechanism armed).
 ]
@@ -2193,8 +2193,9 @@ asymmetry must satisfy is `2 × FENCE_MARGIN ≥ RENEW_INTERVAL + 2 ×
 clock_skew` --- the renew interval is the victim's fence-check latency (the
 loop only evaluates `maybe_self_fence` once per tick), and what remains of
 the 8s separation after the 5s renew interval is a 1.5s one-sided clock-skew
-budget. The TLA+ model verifies this as `NeverDual` over
-`LeaderElectionAsymmetric.cfg`, with the boundary measured from both sides:
+budget. The formal model verifies this as `neverDual` over the
+`leaderElectionAsymmetric` module of `docs/spec/models/leaderElection.qnt`,
+with the boundary measured from both sides:
 one model tick less separation and a dual-belief state is reachable. The
 residual is a clock that pauses for longer than the budget (suspend, a long
 GC, a frozen VM) --- no fence/steal separation closes that, and
@@ -2254,8 +2255,9 @@ condition so no constant moves without the others.
 
 A local counter cannot provide the distinctness half of this rule: an
 incremented-in-memory generation seeded from a high-water mark collides
-whenever a leader is deposed before persisting anything (the depth-12
-counterexample in `docs/spec/models/LeaderElection.tla`'s history). The
+whenever a leader is deposed before persisting anything (the
+generation-collision counterexample preserved in
+`docs/spec/models/leaderElection.qnt`'s history). The
 transition count is the epoch source only while the Lease object exists;
 #rref("sched.lease.generation-claim") extends the distinctness guarantee
 across Lease-object deletion.
@@ -2303,7 +2305,8 @@ recovery on the claim would turn a PG blip at failover time into a leader that
 holds the Lease but never dispatches.
 
 The degradation is safe because the Lease's transition count and the claims
-ledger are _redundant_ epoch sources: the model's `LeaderElectionPgFaults.cfg`
+ledger are _redundant_ epoch sources: the model's `leaderElectionPgFaults`
+regime (`docs/spec/models/leaderElection.qnt`)
 proves every invariant survives a skipped claim write and a PG point-in-time
 restore _alone_ (the lease-derived term of the generation still increases
 strictly across successive stealers when the floor term lies), and only the
