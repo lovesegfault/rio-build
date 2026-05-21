@@ -274,11 +274,9 @@ in
   vm-spike-fuse-negdentry = spike-fuse-negdentry { inherit pkgs rio-workspace; };
 
   # ── rio-mountd (P0567): the privileged broker, end-to-end ───────────
-  # Single VM, no rio fixture: the real rio-mountd binary against an
-  # XFS-prjquota staging loopback, driven over the SOCK_SEQPACKET
-  # protocol by spike_mountd_client. Carries the P0578-deferred
-  # mountd-protocol subtests; perf numbers are printed, not gated
-  # (TCG runners). See the scenario header for the subtest map.
+  # The real rio-mountd binary against an XFS-prjquota staging loopback,
+  # driven over the SOCK_SEQPACKET protocol by spike_mountd_client.
+  # Subtest map and why perf is printed-not-gated: the scenario header.
   # r[verify builder.mountd.fuse-handoff]
   # r[verify builder.mountd.backing-broker]
   # r[verify builder.mountd.concurrency]

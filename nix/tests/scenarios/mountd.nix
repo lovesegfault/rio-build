@@ -54,7 +54,6 @@ pkgs.testers.runNixOSTest {
       "loop"
     ];
     boot.supportedFilesystems = [ "xfs" ];
-    environment.etc."fuse.conf".text = "user_allow_other\n";
     # SO_PEERCRED.gid is the peer's *primary* gid, so the builder uids
     # get rio-builder as their primary group (matching the production
     # pod fsGroup), not a supplementary one. `outsider` is not in
@@ -192,13 +191,15 @@ pkgs.testers.runNixOSTest {
         machine.succeed(f"{CLIENT} expect-rejected")
 
     # ── build_id validation ────────────────────────────────────────────
+    # The full rejection matrix lives in the build_id_validation unit
+    # test; this proves one rejection arrives as a typed error over the
+    # wire and leaves no filesystem trace.
     with subtest("traversal-reject: non-component build_ids are refused"):
-        for bad in ["../escape", "a/b", "a.b", "a" * 65]:
-            machine.succeed(
-                client("build1", f"expect-mount-err --build-id '{bad}' --expect BadBuildId")
-            )
-            wait_idle()
+        machine.succeed(
+            client("build1", "expect-mount-err --build-id '../escape' --expect BadBuildId")
+        )
         machine.succeed("test ! -e /var/rio/escape")
+        wait_idle()
 
     # ── uid-bound + build-id-unique (one holder proves both) ───────────
     with subtest("uid-bound + build-id-unique"):
@@ -337,6 +338,5 @@ pkgs.testers.runNixOSTest {
         # one block-reservation of slack, but 2x the quota means the
         # limit is not being enforced.
         assert written <= 16 * 1024 * 1024, f"wrote {written} bytes past an 8 MiB quota"
-        wait_idle()
   '';
 }

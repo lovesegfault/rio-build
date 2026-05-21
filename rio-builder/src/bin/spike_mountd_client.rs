@@ -260,8 +260,6 @@ enum Cmd {
         staging_root: PathBuf,
         #[arg(long, default_value_t = 8)]
         size_mib: usize,
-        #[arg(long, default_value_t = 1)]
-        count: usize,
         #[arg(long)]
         corrupt: bool,
     },
@@ -330,16 +328,8 @@ fn main() -> anyhow::Result<()> {
             build_id,
             staging_root,
             size_mib,
-            count,
             corrupt,
-        } => promote(
-            &args.socket,
-            &build_id,
-            &staging_root,
-            size_mib,
-            count,
-            corrupt,
-        ),
+        } => promote(&args.socket, &build_id, &staging_root, size_mib, corrupt),
         Cmd::AppendPromote {
             build_id,
             staging_root,
@@ -395,13 +385,12 @@ fn serve(socket: &Path, build_id: &str, ready_file: &Path) -> anyhow::Result<()>
     // Hold the UDS connection (teardown fires when it closes) and the
     // FUSE session until the test driver kills us.
     bg.join()?;
-    drop(conn);
     Ok(())
 }
 
 fn expect_mount_err(socket: &Path, build_id: &str, expect: &str) -> anyhow::Result<()> {
     let mut conn = Conn::connect(socket)?;
-    let (resp, fds) = conn.call(
+    let (resp, _) = conn.call(
         Req::Mount {
             build_id: build_id.to_owned(),
         },
@@ -412,7 +401,7 @@ fn expect_mount_err(socket: &Path, build_id: &str, expect: &str) -> anyhow::Resu
             println!("RESULT mount=err kind={expect}");
             Ok(())
         }
-        other => bail!("expected Err({expect}), got {other:?} (fds={})", fds.len()),
+        other => bail!("expected Err({expect}), got {other:?}"),
     }
 }
 
@@ -460,56 +449,49 @@ fn promote(
     build_id: &str,
     staging_root: &Path,
     size_mib: usize,
-    count: usize,
     corrupt: bool,
 ) -> anyhow::Result<()> {
     let mut conn = Conn::connect(socket)?;
     let (_, _fuse_fd) = mount(&mut conn, build_id)?;
-    let mut total_bytes = 0u64;
-    let mut total_elapsed = Duration::ZERO;
-    for i in 0..count {
-        let content = gen_content(i as u64, size_mib << 20);
-        let actual = *blake3::hash(&content).as_bytes();
-        // A corrupted stage claims a digest the content does not hash
-        // to: the digest of the content with its first byte flipped.
-        let claimed = if corrupt {
-            let mut other = content.clone();
-            other[0] ^= 0xFF;
-            *blake3::hash(&other).as_bytes()
-        } else {
-            actual
-        };
-        stage(staging_root, build_id, &claimed, &content)?;
-        let start = Instant::now();
-        let (resp, _) = conn.call(Req::Promote { digest: claimed }, &[])?;
-        let elapsed = start.elapsed();
-        match resp {
-            Resp::Ok => {
-                println!(
-                    "RESULT promote=ok digest={} bytes={} elapsed_ms={}",
-                    hex::encode(claimed),
-                    content.len(),
-                    elapsed.as_millis()
-                );
-                total_bytes += content.len() as u64;
-                total_elapsed += elapsed;
-            }
-            Resp::Err(kind) => {
-                println!(
-                    "RESULT promote=err kind={} digest={}",
-                    kind_name(&kind),
-                    hex::encode(claimed)
-                );
-                if !corrupt {
-                    bail!("promote of well-formed content failed: {kind}");
-                }
-            }
-            other => bail!("unexpected promote reply: {other:?}"),
+    let content = gen_content(0, size_mib << 20);
+    // A corrupted stage claims a digest the content does not hash to:
+    // the digest of the content with its first byte flipped.
+    let claimed = if corrupt {
+        let mut other = content.clone();
+        other[0] ^= 0xFF;
+        *blake3::hash(&other).as_bytes()
+    } else {
+        *blake3::hash(&content).as_bytes()
+    };
+    stage(staging_root, build_id, &claimed, &content)?;
+    let start = Instant::now();
+    let (resp, _) = conn.call(Req::Promote { digest: claimed }, &[])?;
+    let elapsed = start.elapsed();
+    match resp {
+        Resp::Ok => {
+            println!(
+                "RESULT promote=ok digest={} bytes={} elapsed_ms={}",
+                hex::encode(claimed),
+                content.len(),
+                elapsed.as_millis()
+            );
+            let mib_s = (content.len() as f64 / (1 << 20) as f64) / elapsed.as_secs_f64();
+            println!(
+                "PERF promote_throughput mib_s={mib_s:.1} bytes={}",
+                content.len()
+            );
         }
-    }
-    if total_elapsed > Duration::ZERO {
-        let mib_s = (total_bytes as f64 / (1 << 20) as f64) / total_elapsed.as_secs_f64();
-        println!("PERF promote_throughput mib_s={mib_s:.1} bytes={total_bytes}");
+        Resp::Err(kind) => {
+            println!(
+                "RESULT promote=err kind={} digest={}",
+                kind_name(&kind),
+                hex::encode(claimed)
+            );
+            if !corrupt {
+                bail!("promote of well-formed content failed: {kind}");
+            }
+        }
+        other => bail!("unexpected promote reply: {other:?}"),
     }
     Ok(())
 }
