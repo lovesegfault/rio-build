@@ -18,7 +18,7 @@
 (* PROOF CLAIM, stated honestly: the invariants below hold under clock     *)
 (* skew <= MaxSkew ticks, no host suspend, over a bounded state space of   *)
 (* 2 nodes and ~2 leadership cycles, with at most MaxDeletes Lease-object  *)
-(* deletions (LeaderElection.cfg pins MaxDeletes=0, ~1.97M distinct        *)
+(* deletions (LeaderElection.cfg pins MaxDeletes=0, ~1.61M distinct        *)
 (* states; LeaderElectionDeletion.cfg pins MaxDeletes=1 -- same .tla, the  *)
 (* deletion fault enabled). The bounds exclude: 3-party races (any         *)
 (* k-party CAS race contains a 2-party prefix, so AtMostOneCASWinner is    *)
@@ -221,12 +221,15 @@ AtMostOneCASWinner == ~casRace
 \*     (3) Observation: snap[stale].holder /= stale -- the snapshot
 \*         already shows the new holder; the next decide() returns
 \*         Standby and the loop flips to Following.
-\*   Path (1) covers the partitioned victim (no successful round-trips,
-\*   fence aging). Paths (2)/(3) cover the connected victim (its GETs
-\*   keep refreshing fence, but every refresh hands it a snapshot that
-\*   exposes the loss). A deposed believer with a fresh fence and NO
-\*   snapshot is unreachable: the only fence-refreshing actions either
-\*   produce a snapshot (Get) or require holding the lease (RenewLease).
+\*   Path (1) covers the blind victim (no completed write since its
+\*   acquisition, fence aging toward the deadline). Paths (2)/(3) cover
+\*   the connected victim (its GETs hand it a snapshot that exposes the
+\*   loss without touching its fence). A deposed believer's fence NEVER
+\*   refreshes: the only fence-resetting actions are a successful write
+\*   (Steal/RenewLease -- requires winning the CAS, which a deposed
+\*   believer's stale snapshot cannot) or a 409 (Conflict -- which makes
+\*   it Following, no longer a believer). Its fence is frozen at its last
+\*   successful write and only ages.
 \*
 \* Why a state invariant and not the temporal [](Dual => <>~Dual) with
 \* WF on SelfFence: the temporal form is unsound under a bounded,
@@ -431,9 +434,9 @@ Tick(n) ==
 
 \* -----------------------------------------------------------------------
 \* Apiserver round-trip. Get(n) is the GET; Steal/RenewLease are the PUT
-\* (each through ReplaceGuard); Conflict is the 409. All four reset fence[n]
-\* -- any successful round-trip resets the self-fence clock (run_lease_loop()'s
-\* renew arm: "the clock tracks 'am I blind', not 'am I leader'").
+\* (each through ReplaceGuard); Conflict is the 409. The WRITE-COMPLETING
+\* actions (Steal, RenewLease, Conflict) reset fence[n]; a bare Get does
+\* NOT -- see the comment on Get(n).
 \* -----------------------------------------------------------------------
 
 \* GET the lease. obs[n] update follows decide_pure()'s ObservedUpdate:
@@ -441,17 +444,36 @@ Tick(n) ==
 \*   - holder = n       -> Keep (we hold it; observed tracks OTHER holders)
 \*   - holder = other, same rv we observed -> Keep (clock still running)
 \*   - holder = other, new rv (or first observation) -> StartObserving
+\*
+\* fence[n] is UNCHANGED: a bare read does not reset the self-fence clock.
+\* Production resets `last_successful_renew` at exactly two sites -- the
+\* loop init (lib.rs:501, before the node has ever led) and the
+\* `Ok(Ok(result))` arm of the COMPLETE try_acquire_or_renew() round-trip
+\* (lib.rs:525). Every path through that function which returns Leading
+\* ends in an rv-bumping write (create()'s POST or replace()'s PUT); the
+\* paths that complete without a write return Standby or Conflict, both
+\* of which set now_leading=false -- the node is not a believer
+\* afterwards, so its fence value is moot. The combination "Leading, fresh
+\* fence clock, rv unchanged" is therefore unreachable in production. A
+\* model Get that refreshed fence[n] while leaving the node Leading and
+\* the rv unchanged manufactured exactly that state, and it is what
+\* falsified NeverDual in the asymmetric cfg: the victim's fence anchor
+\* crept forward on every read while the thief's obs.since anchor stayed
+\* at the last rv change, so the victim's Tick cap (anchored to its
+\* fence) could outrun the thief's steal deadline (anchored to the rv) by
+\* an unbounded number of reads. Anchoring both clocks to the same event
+\* -- the last completed write -- is what makes the fence/steal
+\* separation argument sound.
 Get(n) ==
   /\ alive[n]
   /\ snap'  = [snap EXCEPT ![n] = lease]
-  /\ fence' = [fence EXCEPT ![n] = clocks[n]]
   /\ obs'   = [obs EXCEPT ![n] =
        IF lease.holder = NULL THEN NULL
        ELSE IF lease.holder = n THEN obs[n]
        ELSE IF obs[n] /= NULL /\ obs[n].rv = lease.rv THEN obs[n]
        ELSE [rv |-> lease.rv, since |-> clocks[n]]]
-  /\ UNCHANGED <<clocks, lease, alive, state, gen, genHW, acquiredAt, casRace,
-                 deletes, delVictims>>
+  /\ UNCHANGED <<clocks, lease, alive, state, fence, gen, genHW, acquiredAt,
+                 casRace, deletes, delVictims>>
 
 \* The shared CAS guard for Steal/RenewLease. NOT a standalone action -- a
 \* helper that Steal and RenewLease conjoin. The casRace history is
