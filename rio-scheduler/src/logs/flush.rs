@@ -33,6 +33,9 @@
 //! Both flush kinds write **one** `drv_logs` row per execution, UPSERTed on
 //! `(exec_id)` — a periodic snapshot inserts the row at `is_complete=false`,
 //! the final flush flips it to `is_complete=true` and stamps `finished_at`.
+//! (Exception: a final whose drain yields zero lines — failover restamp, worker
+//! never reconnected — stamps `status`/`finished_at` only and leaves
+//! `is_complete=false`; see `finalize_empty_drain`.)
 //! The `exec_id` (per-execution UUIDv7 minted by `assign_to_worker`) lives
 //! on the `LogBuffers` ring-buffer entry; the flusher reads it from there
 //! because it has no actor `FlushRequest` for the periodic path. A flush
@@ -211,9 +214,12 @@ impl LogFlusher {
     /// but because the writes themselves are safe: the GC DELETE is
     /// idempotent, and a stale periodic UPSERT cannot downgrade a
     /// finalized row (`upsert_drv_log`'s conflict clause is monotone in
-    /// `is_complete`). The gates avoid wasted S3/PG traffic from a
-    /// replica that has no business writing; they are not the
-    /// corruption barrier.
+    /// `is_complete`; the exception is a row closed by
+    /// `finalize_empty_drain`, which stays `is_complete=false` and is
+    /// therefore not latched — a late UPSERT can refresh its content and
+    /// re-null its production-unread `status`/`finished_at`). The gates
+    /// avoid wasted S3/PG traffic from a replica that has no business
+    /// writing; they are not the corruption barrier.
     fn is_leader(&self) -> bool {
         self.is_leader.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -313,7 +319,11 @@ impl LogFlusher {
                         // new leader has finalized — `upsert_drv_log`'s
                         // conflict clause refuses `is_complete` true→false —
                         // so the gate is waste/churn avoidance, not the
-                        // corruption barrier.
+                        // corruption barrier. (A row closed by
+                        // `finalize_empty_drain` stays `is_complete=false`, so
+                        // it is not latched; a late UPSERT against it refreshes
+                        // content and re-nulls `status`/`finished_at` — see
+                        // that fn's doc.)
                         if self.is_leader() {
                             self.flush_periodic().await;
                         }
@@ -699,9 +709,13 @@ impl LogFlusher {
         //    restamp on a fresh standby leaves exactly that when the
         //    worker never reconnects before the drv terminates. There is
         //    nothing to upload, but a `drv_logs` row the ex-leader's
-        //    periodic flusher already wrote must still be closed — or it
-        //    rots at `is_complete=false` for the full retention TTL while
-        //    `record_exec_correlation` pins the dashboard to it. (The
+        //    periodic flusher already wrote still gets its terminal
+        //    stamps (status/finished_at) so it does not look in-flight
+        //    for the full retention TTL while `record_exec_correlation`
+        //    pins the dashboard to it. `is_complete` stays false: the
+        //    stored `.partial` is truncated at the last periodic snapshot
+        //    and the incomplete indicator must survive
+        //    (`obs.log.incomplete-surfaced`). (The
         //    `None` arm of `flush_final` has the analogous pre-existing
         //    gap for a re-dispatched drv — exec₁'s `.partial` row is never
         //    finalized when exec₂ takes over the entry — but the dashboard
@@ -866,32 +880,46 @@ impl LogFlusher {
         }
     }
 
-    /// Metadata-only finalization for a final flush whose drain yielded
-    /// zero lines.
+    /// Metadata-only close for a final flush whose drain yielded zero lines.
     ///
-    /// There is nothing to compress or PUT, but if a periodic snapshot of
-    /// this execution already produced a `.partial` blob and a `drv_logs`
-    /// row (typically on the ex-leader, before a failover handed the empty
-    /// re-stamped buffer to this replica), that row must still be closed.
+    /// There is nothing to compress or PUT, but if a periodic snapshot of this
+    /// execution already produced a `.partial` blob and a `drv_logs` row
+    /// (typically on the ex-leader, before a failover handed the empty
+    /// re-stamped buffer to this replica), that row gets its terminal stamps:
+    /// `status` and `finished_at`. It does NOT get `is_complete = true` — the
+    /// `.partial` snapshot is the execution's only stored content and is missing
+    /// everything after the ex-leader's last periodic flush, so the read path
+    /// must keep serving it with `is_complete=false` and the CLI/dashboard
+    /// incomplete indicator stays visible (`obs.log.incomplete-surfaced`).
+    /// "No further upload is coming" is deliberately NOT encoded anywhere: no
+    /// consumer needs it (the GC sweep has no `is_complete` discriminator and
+    /// no client re-polls a stored log).
+    ///
     /// A targeted UPDATE — not [`upsert_drv_log`] — so the content columns
-    /// (`s3_key`, `first_line`, `line_count`, `total_bytes`) keep
-    /// describing the `.partial` blob, which remains the only stored
-    /// content for this execution and is deliberately NOT deleted here.
-    /// The TTL GC sweep reconstructs both S3 keys from `(exec_id,
-    /// drv_hash)`, so the `.partial` blob is still swept at expiry.
+    /// (`s3_key`, `first_line`, `line_count`, `total_bytes`) keep describing
+    /// the `.partial` blob, which is deliberately NOT deleted here. The TTL GC
+    /// sweep reconstructs both S3 keys from `(exec_id, drv_hash)`, so the
+    /// `.partial` blob is still swept at expiry.
     ///
-    /// 0 rows affected ⇒ no periodic flush ever ran for this execution ⇒
-    /// the worker never streamed a line to any leader ⇒ there is no log
-    /// and there must be no row (a row pointing at a blob that was never
-    /// uploaded turns the read path's "no log found" into an S3 404).
+    /// Because the row stays `is_complete=false`, it is NOT protected by
+    /// `upsert_drv_log`'s monotonicity latch: a late periodic UPSERT from a
+    /// still-alive ex/re-acquired leader that retained this entry would
+    /// refresh the content columns to a newer snapshot and re-null
+    /// `status`/`finished_at`. Accepted — nothing in production reads those
+    /// two columns, the served content only gets fresher, and the row stays
+    /// flagged incomplete either way (see the leader-gate comments above).
     ///
-    /// On failure the row stays `is_complete=false` until the TTL sweep —
-    /// the pre-fix behavior, for this one execution, until then. The
-    /// content (`.partial` blob + row) is intact either way.
+    /// 0 rows affected ⇒ no periodic flush ever ran for this execution ⇒ the
+    /// worker never streamed a line to any leader ⇒ there is no log and there
+    /// must be no row (a row pointing at a blob that was never uploaded turns
+    /// the read path's "no log found" into an S3 404).
+    ///
+    /// On failure the row keeps whatever it had (still `is_complete=false`,
+    /// `status` possibly NULL) until the TTL sweep — content is intact either way.
     async fn finalize_empty_drain(&self, req: &FlushRequest) {
         match sqlx::query(
             "UPDATE drv_logs
-             SET is_complete = true, status = $2, finished_at = now()
+             SET status = $2, finished_at = now()
              WHERE exec_id = $1",
         )
         .bind(req.exec_id)
@@ -905,8 +933,9 @@ impl LogFlusher {
                     drv_path = %req.drv_path,
                     status = ?req.status,
                     rows_affected = r.rows_affected(),
-                    "empty final drain: finalized the prior .partial drv_logs row in \
-                     place (0 rows = never streamed, nothing to close)"
+                    "empty final drain: stamped status/finished_at on the prior .partial \
+                     drv_logs row; is_complete stays false — stored content is truncated \
+                     at the last periodic snapshot (0 rows = never streamed, nothing to close)"
                 );
             }
             Err(e) => {
@@ -1764,13 +1793,16 @@ mod tests {
     /// `set_log_exec`), while the ex-leader's periodic flusher already
     /// wrote a `.partial` blob and a `drv_logs` row at `is_complete=false`.
     /// If the drv terminates before the worker reconnects, the final drain
-    /// yields zero lines — the flusher must still finalize the existing
-    /// row (is_complete/status/finished_at) WITHOUT repointing `s3_key` at
-    /// a `.log.zst` blob that was never uploaded and WITHOUT deleting the
-    /// `.partial` blob (the only stored content).
+    /// yields zero lines — the flusher must stamp the terminal metadata
+    /// (`status`/`finished_at`) on the existing row but leave
+    /// `is_complete=false` (the `.partial` snapshot is truncated at the
+    /// ex-leader's last periodic flush, so the incomplete indicator must
+    /// stay visible), WITHOUT repointing `s3_key` at a `.log.zst` blob
+    /// that was never uploaded and WITHOUT deleting the `.partial` blob
+    /// (the only stored content).
     /// r[verify obs.log.exec-keyed]
     #[tokio::test]
-    async fn flush_final_empty_drain_finalizes_partial_row() -> anyhow::Result<()> {
+    async fn flush_final_empty_drain_stamps_status_but_stays_incomplete() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let (s3, puts, deletes) = mock_s3_capturing();
         let buffers = Arc::new(LogBuffers::new());
@@ -1830,8 +1862,13 @@ mod tests {
         .bind(exec_id)
         .fetch_one(&db.pool)
         .await?;
-        assert!(row.0, "empty final drain must still flip is_complete");
-        assert_eq!(row.1.as_deref(), Some("failed"));
+        assert!(
+            !row.0,
+            "empty final drain must NOT claim is_complete — the .partial content is \
+             truncated at the ex-leader's last periodic snapshot and the incomplete \
+             indicator (obs.log.incomplete-surfaced) must stay visible"
+        );
+        assert_eq!(row.1.as_deref(), Some("failed"), "status stamped");
         assert!(
             row.2.ends_with(".partial.log.zst"),
             "s3_key must keep pointing at the .partial blob (the only content): {}",

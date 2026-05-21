@@ -41,10 +41,11 @@ suffix and a `drv_logs` row with `is_complete = false`; the final flush
 overwrites the row, writes the non-`.partial` key, and best-effort deletes the
 snapshot. Both are swept by the same TTL.
 A final flush whose ring buffer drained empty (a failover left the new
-leader holding a re-stamped but never-streamed-to entry) closes the row in
-place --- `is_complete`, `status`, `finished_at` --- without re-keying
-`s3_key` or deleting the `.partial` blob, which remains the execution's
-only stored content.
+leader holding a re-stamped but never-streamed-to entry) stamps `status` and
+`finished_at` in place but leaves `is_complete = false`: the `.partial` blob
+--- neither re-keyed nor deleted, and the execution's only stored content ---
+is missing everything after the ex-leader's last periodic snapshot, so the
+incomplete indicator below stays visible.
 When the worker instead reconnects to the new leader and keeps streaming,
 the new leader's flusher fetches the execution's existing `.partial`
 snapshot once and prepends it to every subsequent flush of that execution,

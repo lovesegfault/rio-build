@@ -611,6 +611,69 @@ async fn pinned_exec_skips_mismatched_ring_buffer() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A row closed by an empty final drain (failover restamp, worker never
+/// reconnected): `status`/`finished_at` are stamped but `is_complete` stays
+/// false and `s3_key` still names the ex-leader's `.partial` snapshot. The
+/// served chunks must carry `is_complete=false` so the CLI notice and the
+/// dashboard `log-incomplete` banner stay visible — the stored content is
+/// truncated at the last periodic flush (`obs.log.incomplete-surfaced`).
+#[tokio::test]
+async fn s3_partial_closed_by_empty_drain_serves_incomplete() -> anyhow::Result<()> {
+    let db = TestDb::new(&crate::MIGRATOR).await;
+    let drv_path = "/nix/store/zyxwvutsrqponmlkjihgfedcba543210-failover.drv";
+    let drv_hash = drv_log_hash(drv_path);
+    let compressed = compress_lines(&["configuring", "compiling foo.c"])?;
+
+    // Shape written by the ex-leader's periodic flush…
+    let exec_id = seed_drv_log(
+        &db.pool,
+        &drv_hash,
+        &format!("logs/{drv_hash}/failover-exec.partial.log.zst"),
+        2,
+        false,
+    )
+    .await?;
+    // …then closed by the new leader's finalize_empty_drain (post-fix shape:
+    // status/finished_at stamped, is_complete still false).
+    sqlx::query("UPDATE drv_logs SET status = 'failed', finished_at = now() WHERE exec_id = $1")
+        .bind(exec_id)
+        .execute(&db.pool)
+        .await?;
+
+    let rule = mock!(S3Client::get_object).then_output(move || {
+        GetObjectOutput::builder()
+            .body(ByteStream::from(compressed.clone()))
+            .build()
+    });
+    let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&rule]);
+
+    // Ring buffer empty (the final drain removed the entry) — the pinned
+    // request falls through to S3, like the dashboard build view does.
+    let (svc, _actor, _task) = svc_with_db_and_s3(&db, s3);
+    let resp = svc
+        .get_derivation_logs(Request::new(GetDerivationLogsRequest {
+            derivation_path: drv_path.into(),
+            exec_id: exec_id.to_string(),
+            since_line: 0,
+        }))
+        .await?;
+    let chunks = collect_stream(resp.into_inner()).await;
+
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(
+        chunks[0].lines.len(),
+        2,
+        "the .partial content is served as-is"
+    );
+    assert_eq!(chunks[0].exec_id, exec_id.to_string());
+    assert!(
+        !chunks[0].is_complete,
+        "a status-stamped but truncated (.partial) row must serve is_complete=false \
+         so the incomplete indicator is not suppressed"
+    );
+    Ok(())
+}
+
 #[test]
 fn decompress_and_chunk_since_filtering() -> anyhow::Result<()> {
     use std::io::Write;
