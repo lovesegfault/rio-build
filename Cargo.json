@@ -857,31 +857,6 @@
         "Markus Klein"
       ]
     },
-    "atomic": {
-      "crateName": "atomic",
-      "version": "0.6.1",
-      "edition": "2018",
-      "sha256": "0h43ljcgbl6vk62hs6yk7zg7qn3myzvpw8k7isb9nzhkbdvvz758",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "bytemuck",
-          "packageId": "bytemuck"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "default",
-        "fallback"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Amanieu d'Antras <amanieu@gmail.com>"
-      ]
-    },
     "atomic-waker": {
       "crateName": "atomic-waker",
       "version": "1.1.2",
@@ -4606,11 +4581,11 @@
         },
         {
           "name": "toml",
-          "packageId": "toml 1.1.2+spec-1.1.0"
+          "packageId": "toml"
         },
         {
           "name": "winnow",
-          "packageId": "winnow 1.0.3"
+          "packageId": "winnow"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -6839,67 +6814,6 @@
       ],
       "authors": [
         "Fiat Crypto library authors <jgross@mit.edu>"
-      ]
-    },
-    "figment": {
-      "crateName": "figment",
-      "version": "0.10.19",
-      "edition": "2018",
-      "sha256": "1ww9sxdzjj2i80w7bq0kllnymjyrfb1cdx2h70ap5wqcdga1rc4c",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "atomic",
-          "packageId": "atomic",
-          "target": "cfg(any(target_pointer_width = \"8\", target_pointer_width = \"16\", target_pointer_width = \"32\"))"
-        },
-        {
-          "name": "parking_lot",
-          "packageId": "parking_lot"
-        },
-        {
-          "name": "pear",
-          "packageId": "pear"
-        },
-        {
-          "name": "serde",
-          "packageId": "serde"
-        },
-        {
-          "name": "tempfile",
-          "packageId": "tempfile"
-        },
-        {
-          "name": "toml",
-          "packageId": "toml 0.8.23"
-        },
-        {
-          "name": "uncased",
-          "packageId": "uncased"
-        }
-      ],
-      "buildDependencies": [
-        {
-          "name": "version_check",
-          "packageId": "version_check"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "env",
-        "parking_lot",
-        "parse-value",
-        "pear",
-        "tempfile",
-        "test",
-        "toml"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Sergio Benitez <sb@sergio.bz>"
       ]
     },
     "filetime": {
@@ -11942,7 +11856,7 @@
         },
         {
           "name": "toml",
-          "packageId": "toml 1.1.2+spec-1.1.0"
+          "packageId": "toml"
         },
         {
           "name": "uuid",
@@ -12806,21 +12720,6 @@
       ],
       "libCrateTypes": [
         "lib"
-      ]
-    },
-    "inlinable_string": {
-      "crateName": "inlinable_string",
-      "version": "0.1.15",
-      "edition": "2018",
-      "sha256": "1ysjci8yfvxgf51z0ny2nnwhxrclhmb3vbngin8v4bznhr3ybyn8",
-      "source": {
-        "type": "crates-io"
-      },
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Nick Fitzgerald <fitzgen@gmail.com>"
       ]
     },
     "inout 0.1.4": {
@@ -16676,71 +16575,6 @@
         "RustCrypto Developers"
       ]
     },
-    "pear": {
-      "crateName": "pear",
-      "version": "0.2.9",
-      "edition": "2018",
-      "sha256": "0rxlyizzaqq6lswgyfdxjxd3dyb1jfml9gwfpbx5g1j8rq0amvmx",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "inlinable_string",
-          "packageId": "inlinable_string"
-        },
-        {
-          "name": "pear_codegen",
-          "packageId": "pear_codegen"
-        },
-        {
-          "name": "yansi",
-          "packageId": "yansi"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "color",
-        "default",
-        "yansi"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Sergio Benitez <sb@sergio.bz>"
-      ]
-    },
-    "pear_codegen": {
-      "crateName": "pear_codegen",
-      "version": "0.2.9",
-      "edition": "2018",
-      "sha256": "0izijffdd2xs762497mk0xr7xwmyw62dzdqjz12v70n0bnc5pasb",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "proc-macro2",
-          "packageId": "proc-macro2"
-        },
-        {
-          "name": "proc-macro2-diagnostics",
-          "packageId": "proc-macro2-diagnostics"
-        },
-        {
-          "name": "quote",
-          "packageId": "quote"
-        },
-        {
-          "name": "syn",
-          "packageId": "syn"
-        }
-      ],
-      "procMacro": true,
-      "authors": [
-        "Sergio Benitez <sb@sergio.bz>"
-      ]
-    },
     "pem": {
       "crateName": "pem",
       "version": "3.0.6",
@@ -17616,7 +17450,7 @@
       "dependencies": [
         {
           "name": "toml_edit",
-          "packageId": "toml_edit 0.25.11+spec-1.1.0"
+          "packageId": "toml_edit"
         }
       ],
       "libCrateTypes": [
@@ -17650,50 +17484,6 @@
       "authors": [
         "David Tolnay <dtolnay@gmail.com>",
         "Alex Crichton <alex@alexcrichton.com>"
-      ]
-    },
-    "proc-macro2-diagnostics": {
-      "crateName": "proc-macro2-diagnostics",
-      "version": "0.10.1",
-      "edition": "2018",
-      "sha256": "1j48ipc80pykvhx6yhndfa774s58ax1h6sm6mlhf09ls76f6l1mg",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "proc-macro2",
-          "packageId": "proc-macro2"
-        },
-        {
-          "name": "quote",
-          "packageId": "quote"
-        },
-        {
-          "name": "syn",
-          "packageId": "syn"
-        },
-        {
-          "name": "yansi",
-          "packageId": "yansi"
-        }
-      ],
-      "buildDependencies": [
-        {
-          "name": "version_check",
-          "packageId": "version_check"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "colors",
-        "default",
-        "yansi"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Sergio Benitez <sb@sergio.bz>"
       ]
     },
     "prodash": {
@@ -19366,7 +19156,7 @@
         },
         {
           "name": "toml",
-          "packageId": "toml 1.1.2+spec-1.1.0"
+          "packageId": "toml"
         },
         {
           "name": "tonic",
@@ -20591,7 +20381,7 @@
         },
         {
           "name": "toml",
-          "packageId": "toml 1.1.2+spec-1.1.0"
+          "packageId": "toml"
         },
         {
           "name": "tracing-opentelemetry",
@@ -22797,28 +22587,7 @@
         "David Tolnay <dtolnay@gmail.com>"
       ]
     },
-    "serde_spanned 0.6.9": {
-      "crateName": "serde_spanned",
-      "version": "0.6.9",
-      "edition": "2021",
-      "sha256": "18vmxq6qfrm110caszxrzibjhy2s54n1g5w1bshxq9kjmz7y0hdz",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "serde",
-          "packageId": "serde"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "serde"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ]
-    },
-    "serde_spanned 1.1.1": {
+    "serde_spanned": {
       "crateName": "serde_spanned",
       "version": "1.1.1",
       "edition": "2024",
@@ -25498,42 +25267,7 @@
         "Tokio Contributors <team@tokio.rs>"
       ]
     },
-    "toml 0.8.23": {
-      "crateName": "toml",
-      "version": "0.8.23",
-      "edition": "2021",
-      "sha256": "0qnkrq4lm2sdhp3l6cb6f26i8zbnhqb7mhbmksd550wxdfcyn6yw",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "serde",
-          "packageId": "serde"
-        },
-        {
-          "name": "serde_spanned",
-          "packageId": "serde_spanned 0.6.9"
-        },
-        {
-          "name": "toml_datetime",
-          "packageId": "toml_datetime 0.6.11"
-        },
-        {
-          "name": "toml_edit",
-          "packageId": "toml_edit 0.22.27"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "default",
-        "display",
-        "parse"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ]
-    },
-    "toml 1.1.2+spec-1.1.0": {
+    "toml": {
       "crateName": "toml",
       "version": "1.1.2+spec-1.1.0",
       "edition": "2024",
@@ -25548,11 +25282,11 @@
         },
         {
           "name": "serde_spanned",
-          "packageId": "serde_spanned 1.1.1"
+          "packageId": "serde_spanned"
         },
         {
           "name": "toml_datetime",
-          "packageId": "toml_datetime 1.1.1+spec-1.1.0"
+          "packageId": "toml_datetime"
         },
         {
           "name": "toml_parser",
@@ -25564,7 +25298,7 @@
         },
         {
           "name": "winnow",
-          "packageId": "winnow 1.0.3"
+          "packageId": "winnow"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -25578,28 +25312,7 @@
         "lib"
       ]
     },
-    "toml_datetime 0.6.11": {
-      "crateName": "toml_datetime",
-      "version": "0.6.11",
-      "edition": "2021",
-      "sha256": "077ix2hb1dcya49hmi1avalwbixmrs75zgzb3b2i7g2gizwdmk92",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "serde",
-          "packageId": "serde"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "serde"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ]
-    },
-    "toml_datetime 1.1.1+spec-1.1.0": {
+    "toml_datetime": {
       "crateName": "toml_datetime",
       "version": "1.1.1+spec-1.1.0",
       "edition": "2024",
@@ -25623,50 +25336,7 @@
         "lib"
       ]
     },
-    "toml_edit 0.22.27": {
-      "crateName": "toml_edit",
-      "version": "0.22.27",
-      "edition": "2021",
-      "sha256": "16l15xm40404asih8vyjvnka9g0xs9i4hfb6ry3ph9g419k8rzj1",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "indexmap",
-          "packageId": "indexmap"
-        },
-        {
-          "name": "serde",
-          "packageId": "serde"
-        },
-        {
-          "name": "serde_spanned",
-          "packageId": "serde_spanned 0.6.9"
-        },
-        {
-          "name": "toml_datetime",
-          "packageId": "toml_datetime 0.6.11"
-        },
-        {
-          "name": "toml_write",
-          "packageId": "toml_write"
-        },
-        {
-          "name": "winnow",
-          "packageId": "winnow 0.7.15"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "display",
-        "parse",
-        "serde"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ]
-    },
-    "toml_edit 0.25.11+spec-1.1.0": {
+    "toml_edit": {
       "crateName": "toml_edit",
       "version": "0.25.11+spec-1.1.0",
       "edition": "2024",
@@ -25681,7 +25351,7 @@
         },
         {
           "name": "toml_datetime",
-          "packageId": "toml_datetime 1.1.1+spec-1.1.0"
+          "packageId": "toml_datetime"
         },
         {
           "name": "toml_parser",
@@ -25689,7 +25359,7 @@
         },
         {
           "name": "winnow",
-          "packageId": "winnow 1.0.3"
+          "packageId": "winnow"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -25710,26 +25380,9 @@
       "dependencies": [
         {
           "name": "winnow",
-          "packageId": "winnow 1.0.3"
+          "packageId": "winnow"
         }
       ],
-      "resolvedDefaultFeatures": [
-        "alloc",
-        "default",
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ]
-    },
-    "toml_write": {
-      "crateName": "toml_write",
-      "version": "0.1.2",
-      "edition": "2021",
-      "sha256": "008qlhqlqvljp1gpp9rn5cqs74gwvdgbvs92wnpq8y3jlz4zi6ax",
-      "source": {
-        "type": "crates-io"
-      },
       "resolvedDefaultFeatures": [
         "alloc",
         "default",
@@ -26822,31 +26475,6 @@
       },
       "libCrateTypes": [
         "lib"
-      ]
-    },
-    "uncased": {
-      "crateName": "uncased",
-      "version": "0.9.10",
-      "edition": "2018",
-      "sha256": "15q6r6g4fszr8c2lzg9z9k9g52h8g29h24awda3d72cyw37qzf71",
-      "source": {
-        "type": "crates-io"
-      },
-      "buildDependencies": [
-        {
-          "name": "version_check",
-          "packageId": "version_check"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "alloc",
-        "default"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Sergio Benitez <sb@sergio.bz>"
       ]
     },
     "unicase": {
@@ -28719,24 +28347,7 @@
         "lib"
       ]
     },
-    "winnow 0.7.15": {
-      "crateName": "winnow",
-      "version": "0.7.15",
-      "edition": "2021",
-      "sha256": "0i9rkl2rqpbnnxlgs20gmkj3nd0b2k8q55mjmpc2ybb84xwxjyfz",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "alloc",
-        "default",
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ]
-    },
-    "winnow 1.0.3": {
+    "winnow": {
       "crateName": "winnow",
       "version": "1.0.3",
       "edition": "2021",
@@ -29452,7 +29063,7 @@
         },
         {
           "name": "serde_spanned",
-          "packageId": "serde_spanned 1.1.1"
+          "packageId": "serde_spanned"
         },
         {
           "name": "sha1",
@@ -29550,11 +29161,11 @@
         },
         {
           "name": "toml",
-          "packageId": "toml 1.1.2+spec-1.1.0"
+          "packageId": "toml"
         },
         {
           "name": "toml_datetime",
-          "packageId": "toml_datetime 1.1.1+spec-1.1.0"
+          "packageId": "toml_datetime"
         },
         {
           "name": "toml_parser",
@@ -29606,7 +29217,7 @@
         },
         {
           "name": "winnow",
-          "packageId": "winnow 1.0.3"
+          "packageId": "winnow"
         },
         {
           "name": "zerocopy",
@@ -30035,7 +29646,7 @@
         },
         {
           "name": "serde_spanned",
-          "packageId": "serde_spanned 1.1.1"
+          "packageId": "serde_spanned"
         },
         {
           "name": "sha1",
@@ -30137,11 +29748,11 @@
         },
         {
           "name": "toml",
-          "packageId": "toml 1.1.2+spec-1.1.0"
+          "packageId": "toml"
         },
         {
           "name": "toml_datetime",
-          "packageId": "toml_datetime 1.1.1+spec-1.1.0"
+          "packageId": "toml_datetime"
         },
         {
           "name": "toml_parser",
@@ -30193,7 +29804,7 @@
         },
         {
           "name": "winnow",
-          "packageId": "winnow 1.0.3"
+          "packageId": "winnow"
         },
         {
           "name": "zerocopy",
@@ -30342,6 +29953,10 @@
           "packageId": "clap-verbosity-flag"
         },
         {
+          "name": "config",
+          "packageId": "config"
+        },
+        {
           "name": "console",
           "packageId": "console"
         },
@@ -30352,10 +29967,6 @@
         {
           "name": "ed25519-dalek",
           "packageId": "ed25519-dalek"
-        },
-        {
-          "name": "figment",
-          "packageId": "figment"
         },
         {
           "name": "filetime",
@@ -30475,7 +30086,7 @@
         },
         {
           "name": "toml",
-          "packageId": "toml 1.1.2+spec-1.1.0"
+          "packageId": "toml"
         },
         {
           "name": "tonic",

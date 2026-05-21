@@ -1415,7 +1415,7 @@
     },
     {
       "depth": 0,
-      "doc": "xtask configuration, loaded from `.env.local` + process env via figment.",
+      "doc": "xtask configuration, loaded from `.env.local` + process env.",
       "path": "config.rs"
     },
     {

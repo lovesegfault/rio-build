@@ -27,7 +27,8 @@ rio-proto.workspace = true
 # CLI + config
 clap = { workspace = true, features = ["derive", "env"] }
 clap-verbosity-flag.workspace = true
-figment = { workspace = true, features = ["env"] }
+# The config crate reads the RIO_-prefixed env into XtaskConfig (src/config.rs).
+config = { workspace = true }
 dotenvy.workspace = true
 
 # Async

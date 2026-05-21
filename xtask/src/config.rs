@@ -1,13 +1,11 @@
-//! xtask configuration, loaded from `.env.local` + process env via figment.
+//! xtask configuration, loaded from `.env.local` + process env.
 //!
-//! Same pattern as rio-* binaries (figment + RIO_ prefix), so one
-//! `.env.local` serves both xtask and `process-compose up`.
+//! Same pattern as rio-* binaries (RIO_ prefix via the config crate), so
+//! one `.env.local` serves both xtask and `process-compose up`.
 
 use std::path::PathBuf;
 
 use anyhow::Result;
-use figment::Figment;
-use figment::providers::Env;
 use serde::Deserialize;
 
 use crate::sh;
@@ -64,8 +62,8 @@ pub struct XtaskConfig {
     pub cloudflare_token: Option<String>,
 }
 
-/// Deserialize a comma-separated string into `Vec<String>`. figment's
-/// Env provider hands over the raw env var as a string; this splits it
+/// Deserialize a comma-separated string into `Vec<String>`. The env
+/// source hands over the raw env var as a string; this splits it
 /// so `.env.local` can express a list without JSON.
 fn csv<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
     Ok(String::deserialize(d)?
@@ -95,19 +93,24 @@ fn default_log_level() -> String {
 
 impl XtaskConfig {
     pub fn load() -> Result<Self> {
-        // dotenvy loads .env.local into process env; figment then reads
-        // from env with the RIO_ prefix stripped.
+        // dotenvy loads .env.local into process env; the env source then
+        // reads everything RIO_-prefixed (prefix stripped, key lowercased).
         let _ = dotenvy::from_path(sh::repo_root().join(".env.local"));
-        Ok(Figment::new()
-            .merge(Env::prefixed("RIO_"))
-            .extract::<Self>()?)
+        Self::from_process_env()
+    }
+
+    /// Build from the current process environment only. Split out so the
+    /// tests exercise exactly the path `load()` uses, minus the dotenvy
+    /// side effect (which a jailed test cannot sandbox).
+    fn from_process_env() -> Result<Self> {
+        Ok(::config::Config::builder()
+            .add_source(::config::Environment::with_prefix("RIO").prefix_separator("_"))
+            .build()?
+            .try_deserialize::<Self>()?)
     }
 }
 
 #[cfg(test)]
-// figment::Error is 208B, API-fixed — Jail closure signature is set
-// by the library (same allow as rio-test-support's macros).
-#[allow(clippy::result_large_err)]
 mod tests {
     use super::*;
 
@@ -117,14 +120,12 @@ mod tests {
     /// despite no flag/env override — this test pins the default.
     #[test]
     fn log_level_defaults_to_rio_debug_when_unset() {
-        figment::Jail::expect_with(|jail| {
+        rio_test_support::Jail::expect_with(|jail| {
             // Other RIO_* vars present (typical `.env.local` shape),
             // RIO_LOG_LEVEL deliberately absent.
             jail.set_env("RIO_K8S_PROVIDER", "eks");
             jail.set_env("RIO_PUBLIC_CIDRS", "192.0.2.1/32");
-            // Exercise the same figment path as load() (minus the
-            // dotenvy side-effect, which Jail can't sandbox).
-            let cfg: XtaskConfig = Figment::new().merge(Env::prefixed("RIO_")).extract()?;
+            let cfg = XtaskConfig::from_process_env()?;
             assert_eq!(
                 cfg.log_level, RIO_DEBUG,
                 "serde default_log_level should fire when RIO_LOG_LEVEL is unset"
@@ -136,9 +137,9 @@ mod tests {
 
     #[test]
     fn log_level_honors_explicit_env() {
-        figment::Jail::expect_with(|jail| {
+        rio_test_support::Jail::expect_with(|jail| {
             jail.set_env("RIO_LOG_LEVEL", "warn");
-            let cfg: XtaskConfig = Figment::new().merge(Env::prefixed("RIO_")).extract()?;
+            let cfg = XtaskConfig::from_process_env()?;
             assert_eq!(cfg.log_level, "warn");
             Ok(())
         });
