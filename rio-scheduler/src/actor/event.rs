@@ -838,12 +838,14 @@ impl DagActor {
         bufs.discard(drv_path);
     }
 
-    /// Stamp a fresh ring-buffer entry with `(exec_id, executor_id)` for
+    /// Stamp the ring-buffer entry with `(exec_id, executor_id)` for
     /// `drv_hash`. Called from [`super::dispatch`]'s `assign_to_worker`
     /// immediately after [`Self::discard_log_buffer`], and from recovery
-    /// for each active assignment loaded from PG (the new leader's
-    /// `LogBuffers` is empty and `set_exec` is the only carrier the
-    /// flusher reads — see `logs/mod.rs::LogBuffers::set_exec`).
+    /// for each active assignment loaded from PG (`set_exec` is the only
+    /// carrier the flusher reads; a fresh standby's `LogBuffers` is empty,
+    /// an ex-leader's is retained — `set_exec` itself drops retained lines
+    /// when the exec_id changed under an interim leader, see
+    /// `logs/mod.rs::LogBuffers::set_exec`).
     /// No-op if `log_buffers` unwired (tests) or the drv vanished.
     pub(super) fn set_log_exec(&self, drv_hash: &DrvHash, exec_id: Uuid, executor_id: &ExecutorId) {
         let Some(bufs) = &self.log_buffers else {

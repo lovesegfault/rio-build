@@ -326,7 +326,8 @@ impl LogBuffers {
         )
     }
 
-    /// Stamp a fresh ring-buffer entry with the execution metadata.
+    /// Stamp a ring-buffer entry with the execution metadata, creating it
+    /// if absent.
     ///
     /// Called at `assign_to_worker` immediately after [`Self::discard`]
     /// (which removes the prior entry and un-seals) and by recovery for
@@ -334,11 +335,51 @@ impl LogBuffers {
     /// the carrier for the periodic flush, which runs before the
     /// worker's first `BuildLogBatch` arrives.
     ///
+    /// **Re-stamping with a different `exec_id` clears the accumulated
+    /// lines.** The lines belong to the previous execution; carrying them
+    /// across the stamp would hand them to the flusher under the new
+    /// execution's `drv_logs` row and S3 key. The dispatch call site never
+    /// hits this (it discards first), but recovery's restamp runs against
+    /// an ex-leader's *retained* `LogBuffers` (`clear_persisted_state`
+    /// keeps it), and an interim leader may have re-dispatched the drv
+    /// under a new `exec_id` in between. A same-`exec_id` re-stamp keeps
+    /// the lines: that is a single lease flap with no interim re-dispatch,
+    /// and the still-streaming worker's in-flight execution must keep
+    /// accumulating across it. The seal is deliberately NOT reset here:
+    /// recovery only restamps PG-`Assigned|Running` rows and every
+    /// `seal()` site persists a terminal PG status in the same actor
+    /// turn, so a sealed entry meeting a cross-exec restamp additionally
+    /// requires a dropped `FlushRequest` and a missed
+    /// `CleanupTerminalBuild` — and the failure mode there is the
+    /// pre-existing "sealed entry drops pushes", not misattribution.
+    /// Re-dispatch un-seals via [`Self::discard`].
+    ///
     /// `executor` is stored for the `(executor, drv)` binding check in
     /// [`Self::push_for`].
     pub fn set_exec(&self, drv_path: &str, exec_id: Uuid, executor: &str) {
         let key = drv_log_hash(drv_path);
         let mut entry = self.buffers.entry(key).or_default();
+        if entry.exec_id.is_some() && entry.exec_id != Some(exec_id) {
+            // Cross-exec restamp: the assignment was re-issued under a
+            // different exec_id while this entry sat retained. Bounded,
+            // accepted data loss: everything the prior execution flushed
+            // is already stored under its own exec_id; only the ≤30s
+            // unflushed tail of an abandoned execution is dropped.
+            // info!, not debug!: fires at most once per drv per leader
+            // re-acquisition (recovery-driven, not worker-driven, so it
+            // cannot be log-spammed) and is the only trace an operator
+            // gets for "exec E1's stored log is missing its tail".
+            tracing::info!(
+                drv = %drv_path,
+                old_exec = ?entry.exec_id,
+                new_exec = %exec_id,
+                dropped_lines = entry.lines.len(),
+                dropped_bytes = entry.bytes,
+                "cross-exec log buffer restamp; dropping lines retained from the prior execution"
+            );
+            entry.lines.clear();
+            entry.bytes = 0;
+        }
         entry.exec_id = Some(exec_id);
         entry.assigned_executor = Some(executor.to_owned());
     }
@@ -1062,6 +1103,68 @@ mod tests {
         // Old lines gone, new exec_id.
         assert_eq!(bufs.exec_id("drv-a"), Some(exec2));
         assert_eq!(bufs.read_since("drv-a", 0), Some(vec![]));
+    }
+
+    /// bug_004 (r9): a re-stamp with a DIFFERENT exec_id and no preceding
+    /// `discard` — recovery restamping an ex-leader's retained entry after
+    /// an interim leader re-dispatched the drv — must not carry the old
+    /// execution's lines into the new execution's buffer. The periodic
+    /// flusher reads `(exec_id, snapshot)` off this entry and would upload
+    /// the old lines under the new exec's `drv_logs` row + S3 key.
+    #[test]
+    fn set_exec_with_new_exec_id_clears_stale_lines() {
+        let bufs = LogBuffers::new();
+        let exec1 = Uuid::now_v7();
+        bufs.set_exec("drv-a", exec1, "executor-1");
+        assert!(bufs.push_for(
+            "drv-a",
+            &mk_batch("drv-a", 0, &[b"old-exec-line"]),
+            "executor-1"
+        ));
+        // Precondition: the line is buffered under exec1.
+        assert_eq!(bufs.read_since("drv-a", 0).unwrap().len(), 1);
+
+        let exec2 = Uuid::now_v7();
+        bufs.set_exec("drv-a", exec2, "executor-2");
+
+        assert_eq!(bufs.exec_id("drv-a"), Some(exec2));
+        assert_eq!(
+            bufs.read_since("drv-a", 0),
+            Some(vec![]),
+            "exec1's lines must not survive a re-stamp to exec2"
+        );
+        // The new executor's batches are accepted into the now-clean buffer.
+        assert!(bufs.push_for(
+            "drv-a",
+            &mk_batch("drv-a", 0, &[b"new-exec-line"]),
+            "executor-2"
+        ));
+        assert_eq!(
+            bufs.read_since("drv-a", 0),
+            Some(vec![(0, b"new-exec-line".to_vec())])
+        );
+    }
+
+    /// The complement: a same-exec_id re-stamp (single lease flap, no
+    /// interim re-dispatch — recovery re-stamps the SAME exec_id from
+    /// `assignments`) must RETAIN the lines. The worker is still streaming
+    /// this execution; clearing here would lose the unflushed tail in the
+    /// common flap case.
+    #[test]
+    fn set_exec_with_same_exec_id_retains_lines() {
+        let bufs = LogBuffers::new();
+        let exec1 = Uuid::now_v7();
+        bufs.set_exec("drv-a", exec1, "executor-1");
+        assert!(bufs.push_for("drv-a", &mk_batch("drv-a", 0, &[b"line-0"]), "executor-1"));
+
+        bufs.set_exec("drv-a", exec1, "executor-1");
+
+        assert_eq!(bufs.exec_id("drv-a"), Some(exec1));
+        assert_eq!(
+            bufs.read_since("drv-a", 0),
+            Some(vec![(0, b"line-0".to_vec())]),
+            "a same-exec re-stamp is not a new execution; lines must survive"
+        );
     }
 
     #[test]

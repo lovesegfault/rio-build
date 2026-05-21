@@ -178,13 +178,17 @@ impl DagActor {
             id_to_hash.insert(derivation_id, hash.clone());
             self.dag.insert_recovered_node(state);
             // Re-stamp the LogBuffers ring buffer for active
-            // assignments. The new leader's `LogBuffers` is empty
-            // (per-process, never persisted), and `set_exec` runs only
-            // in `assign_to_worker` — which doesn't run for
+            // assignments. `set_exec` otherwise runs only in
+            // `assign_to_worker` — which doesn't run for
             // already-assigned drvs whose workers are still streaming.
             // Without this, the flusher writes wrong/missing S3 keys
             // after failover, and `push_for` rejects every batch from
             // the still-connected worker (no entry → no_assignment).
+            // A fresh standby's `LogBuffers` is empty and this creates
+            // the entry; an ex-leader re-acquiring the lease RETAINS
+            // its buffers (`clear_persisted_state`), and `set_exec`
+            // clears the retained lines iff the assignment was re-issued
+            // under a different exec_id while we weren't leader.
             if let Some((exec_id, executor_id)) = restamp {
                 self.set_log_exec(&hash, exec_id, &executor_id);
                 restamped_buffers += 1;
@@ -1179,14 +1183,17 @@ impl DagActor {
         // JOIN populated `state.exec_id` at recovery load. The helper
         // no-ops if it didn't (defensive).
         self.record_exec_correlation(drv_hash, &interested);
-        // Recovery's set_log_exec stamped an empty LogBuffers entry so a
+        // Recovery's set_log_exec stamped a LogBuffers entry so a
         // still-streaming worker could pass the push_for binding gate.
         // On this arm the worker never reconnects (collect_orphaned_assignments
-        // only returns unregistered/phantom workers), so the entry has zero
-        // lines and the periodic flusher skips it (line_count==0 early-return
-        // — neither uploads nor reaps). Discard it so GetDerivationLogs falls
-        // through to S3 instead of serving an empty re-poll chunk until
-        // CleanupTerminalBuild reaps the build. Same shape as
+        // only returns unregistered/phantom workers). On a fresh standby the
+        // entry has zero lines and the periodic flusher skips it
+        // (line_count==0 early-return — neither uploads nor reaps); on an
+        // ex-leader the retained entry can still hold the prior leadership's
+        // lines for this now-terminal execution, which makes the discard
+        // load-bearing rather than cosmetic. Discard it so GetDerivationLogs
+        // falls through to S3 instead of serving a stale or empty re-poll
+        // chunk until CleanupTerminalBuild reaps the build. Same shape as
         // rollback_assignment (dispatch.rs:1675-1680).
         self.discard_log_buffer(drv_hash);
         // Terminal → unpin. sweep_stale_live_pins ran BEFORE

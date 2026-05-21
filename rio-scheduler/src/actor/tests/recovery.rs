@@ -2081,14 +2081,15 @@ async fn test_recovery_restores_build_timeout_baseline() -> TestResult {
     Ok(())
 }
 
-/// After leader failover the new leader's `LogBuffers` is empty
-/// (per-process, never persisted). `set_exec` runs only in
-/// `assign_to_worker`, which doesn't run for already-assigned drvs —
-/// `collect_orphaned_assignments` deliberately leaves still-connected
-/// workers' Assigned/Running drvs in place, and those workers keep
-/// streaming logs to the new leader. Recovery must re-stamp the ring
-/// buffer from `assignments.exec_id` so the flusher keys the right S3
-/// blob and `push_for` accepts the in-flight batches.
+/// A fresh standby's `LogBuffers` is empty after failover, and `set_exec`
+/// otherwise runs only in `assign_to_worker`, which doesn't run for
+/// already-assigned drvs — `collect_orphaned_assignments` deliberately
+/// leaves still-connected workers' Assigned/Running drvs in place, and
+/// those workers keep streaming logs to the new leader. Recovery must
+/// re-stamp the ring buffer from `assignments.exec_id` so the flusher keys
+/// the right S3 blob and `push_for` accepts the in-flight batches. (An
+/// ex-leader re-acquiring the lease RETAINS its `LogBuffers` — that case
+/// is `test_recovery_restamp_clears_stale_exec_lines` below.)
 ///
 /// Cannot use `RecoveryFixture` — the phase-2 actor needs `log_buffers`
 /// wired (the default plumbing leaves it `None`, making `set_log_exec`
@@ -2153,6 +2154,112 @@ async fn test_recovery_repopulates_log_buffers_exec_id() -> TestResult {
         log_buffers.exec_id(&test_drv_path(drv_tag)),
     );
 
+    Ok(())
+}
+
+/// bug_004 (r9): recovery's restamp runs against an ex-leader's RETAINED
+/// `LogBuffers` (`clear_persisted_state` keeps `log_buffers`), not an empty
+/// one. If an interim leader re-dispatched the drv under a new exec_id while
+/// this replica was a standby, the retained entry still holds the OLD
+/// execution's lines — re-stamping it without clearing them hands those
+/// lines to the periodic flusher under the NEW execution's `drv_logs` row
+/// and `logs/{drv_hash}/{exec_id}.partial.log.zst` key, and `flush_final`
+/// later bakes them into the permanent blob.
+///
+/// r[verify obs.log.exec-keyed]
+#[tokio::test]
+async fn test_recovery_restamp_clears_stale_exec_lines() -> TestResult {
+    let old_exec = Uuid::now_v7();
+    let new_exec = Uuid::now_v7();
+    let drv_tag = "z-restamp-stale-drv";
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // --- Phase 1: seed PG with the INTERIM leader's view: the drv is
+    // Assigned to a different worker under a fresh exec_id. ---
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        merge_single_node(&handle, Uuid::new_v4(), drv_tag, PriorityClass::Scheduled).await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+    let (drv_id,): (Uuid,) =
+        sqlx::query_as("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+            .bind(drv_tag)
+            .fetch_one(&db.pool)
+            .await?;
+    sqlx::query(
+        "UPDATE derivations SET status = 'assigned', assigned_builder_id = 'interim-worker' \
+         WHERE derivation_id = $1",
+    )
+    .bind(drv_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO assignments (derivation_id, builder_id, generation, status, exec_id) \
+         VALUES ($1, 'interim-worker', 2, 'pending', $2)",
+    )
+    .bind(drv_id)
+    .bind(new_exec)
+    .execute(&db.pool)
+    .await?;
+
+    // --- Phase 2: the EX-LEADER re-acquires. Its LogBuffers was retained
+    // across the flap (`clear_persisted_state` keeps `log_buffers`) and
+    // still holds the OLD execution's entry + lines. ---
+    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let drv_path = test_drv_path(drv_tag);
+    log_buffers.set_exec(&drv_path, old_exec, "old-worker");
+    assert!(
+        log_buffers.push_for(
+            &drv_path,
+            &rio_proto::types::BuildLogBatch {
+                derivation_path: drv_path.clone(),
+                lines: vec![b"line from the abandoned execution".to_vec()],
+                first_line_number: 0,
+                executor_id: "old-worker".into(),
+            },
+            "old-worker",
+        ),
+        "fixture premise: the retained entry holds the old execution's lines"
+    );
+
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, plumbing| {
+        plumbing.log_buffers = Some(log_buffers.clone());
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // The entry is re-stamped to the interim leader's execution...
+    assert_eq!(
+        log_buffers.exec_id(&drv_path),
+        Some(new_exec),
+        "recovery must re-stamp the retained entry from assignments.exec_id"
+    );
+    // ...WITHOUT carrying the old execution's lines into it. This is what
+    // the periodic flusher would otherwise upload under
+    // logs/{drv_hash}/{new_exec}.partial.log.zst and drv_logs[new_exec].
+    assert_eq!(
+        log_buffers.read_since(&drv_path, 0),
+        Some(vec![]),
+        "the abandoned execution's lines must not be attributed to the \
+         re-issued exec_id"
+    );
+    // The binding stamp moved with the exec: the old worker's late batches
+    // are rejected, the new worker's are accepted.
+    assert!(
+        !log_buffers.push_for(
+            &drv_path,
+            &rio_proto::types::BuildLogBatch {
+                derivation_path: drv_path.clone(),
+                lines: vec![b"late line from the old worker".to_vec()],
+                first_line_number: 1,
+                executor_id: "old-worker".into(),
+            },
+            "old-worker",
+        ),
+        "old worker's batches must be rejected after the restamp (executor_mismatch)"
+    );
     Ok(())
 }
 
