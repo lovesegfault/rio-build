@@ -497,7 +497,7 @@ impl LogBuffers {
     /// Discard a buffer without returning its contents. Also un-seals.
     ///
     /// Called via the actor wrapper `DagActor::discard_log_buffer`
-    /// (dispatch, rollback, and orphan-recovery — see its rustdoc for
+    /// (dispatch and rollback — see its rustdoc for
     /// the caller list and per-path rationale), and directly by
     /// `handle_cleanup_terminal_build` for each reaped DAG node (bounds
     /// a dropped-FlushRequest leak to `TERMINAL_CLEANUP_DELAY`, ~60s) and

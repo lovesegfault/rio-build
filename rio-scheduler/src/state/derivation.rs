@@ -783,8 +783,8 @@ pub struct DerivationState {
     /// terminal and must not be attributed to the node's next
     /// lifecycle). The reader is `terminal_log_epilogue` (which
     /// resolves once via `actor/event.rs::exec_id_for_terminal` and
-    /// threads the value to the seal/flush/correlate steps) plus
-    /// recovery's `adopt_orphan_completion`; the resolution can run
+    /// threads the value to the seal/flush/correlate steps); the
+    /// resolution can run
     /// between a `reset_to_ready` and the next `assign_to_worker` when
     /// a poison-while-Ready path (I-065 fleet exhaustion,
     /// max_infra/timeout_retries cap) reaches `terminal_failure_epilogue`

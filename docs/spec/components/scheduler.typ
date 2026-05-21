@@ -279,15 +279,16 @@ with reason `phase_too_long`; completion rejections increment
 revert to `DependencyFailed`), and
 `cancel_build_derivations` (any path that cancels in-flight derivations:
 user cancel, per-build wall-clock timeout, fail-fast, top-down substitute
-fail) --- each of which implies the worker ran the build. The
+fail), and recovery's `adopt_orphan_completion` (an orphaned assignment
+whose outputs are found in the store --- the execution completed while the
+scheduler was down, and an ex-leader re-acquiring the lease may still hold
+its unflushed log tail) --- each of which implies the worker ran the build.
+The
 not-yet-dispatched arms of the same cancel sweep (`Queued`/`Ready`/`Created` →
 `DependencyFailed`, `Substituting` → `Cancelled`) call the chokepoint only
 when a prior execution was reset and left a stamped log buffer
 (`has_buffered_exec_log`); the never-dispatched majority skip it.
-Recovery's
-`adopt_orphan_completion` calls `record_exec_correlation` directly (the
-disconnected worker's log is already lost; only the correlation can be
-reconstructed from `assignments.exec_id`). Inside the epilogue, the carrier
+Inside the epilogue, the carrier
 resolution is `exec_id_for_terminal`, which reads `state.exec_id` (set by
 `assign_to_worker`, recoverable from `assignments.exec_id` after a leader
 failover for a currently-assigned derivation, dropped by `transition()`

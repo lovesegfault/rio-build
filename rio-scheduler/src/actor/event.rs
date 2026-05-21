@@ -497,10 +497,8 @@ impl DagActor {
     ///
     /// Called from [`Self::terminal_log_epilogue`] (once, at the top —
     /// the resolved value is threaded to the seal/flush/correlate
-    /// steps) and from recovery's `adopt_orphan_completion` (which
-    /// resolves at its own call site before calling
-    /// [`Self::record_exec_correlation`]). The flush/correlate helpers
-    /// no longer resolve it individually.
+    /// steps). The flush/correlate helpers no longer resolve it
+    /// individually.
     pub(super) fn exec_id_for_terminal(
         &self,
         state: &crate::state::DerivationState,
@@ -605,9 +603,9 @@ impl DagActor {
     /// can't stall the next command.
     ///
     /// Called from [`Self::terminal_log_epilogue`] (the seal/flush/
-    /// correlate chokepoint — success, permanent failure, and
-    /// build-level cancellation) and from recovery's
-    /// `adopt_orphan_completion` directly. The chokepoint doc is
+    /// correlate chokepoint — success, orphan-adopted recovery
+    /// completion, permanent failure, and build-level cancellation).
+    /// The chokepoint doc is
     /// authoritative for which terminal paths route through it and
     /// which are carved out; a drv that never reaches this helper
     /// (or reaches it without a resolvable exec_id — see the no-op
@@ -617,10 +615,10 @@ impl DagActor {
     /// No-op (silent) when `state.db_id` is `None` (nodes whose merge
     /// tx hasn't committed — impossible here; merge commits before any
     /// dispatch — but cheap to guard). The never-dispatched skip (both
-    /// exec_id carriers `None`) now belongs to the callers: both
-    /// [`Self::terminal_log_epilogue`] and recovery's
-    /// `adopt_orphan_completion` resolve [`Self::exec_id_for_terminal`]
-    /// before calling and pass the resolved value in.
+    /// exec_id carriers `None`) now belongs to the caller:
+    /// [`Self::terminal_log_epilogue`] resolves
+    /// [`Self::exec_id_for_terminal`] before calling and passes the
+    /// resolved value in.
     ///
     /// The UPDATE carries `AND exec_id IS NULL`: a (build, drv)
     /// observation is written exactly once. A build that already
@@ -710,6 +708,20 @@ impl DagActor {
     ///
     /// Callers and their `status` argument:
     /// - `handle_success_completion` — `"succeeded"`
+    /// - `adopt_orphan_completion` (recovery) — `"succeeded"` (outputs
+    ///   found in the store for a drv whose worker never reconnected:
+    ///   the execution ran to completion while the scheduler was
+    ///   down). On a fresh standby the recovery-stamped entry has zero
+    ///   lines: the flush is a no-op write (`upload_and_record`'s
+    ///   `line_count == 0` early-return) whose `drain_if_exec` still
+    ///   reaps the entry, so `GetDerivationLogs` falls through to the
+    ///   ex-leader's S3 `.partial`. On an ex-leader re-acquiring the
+    ///   lease, the retained entry still holds the prior leadership's
+    ///   unflushed tail for this same execution (`set_exec` keeps
+    ///   lines on a same-exec restamp); the final flush preserves that
+    ///   tail and finalizes the `drv_logs` row. The
+    ///   [`Self::exec_id_for_terminal`] self-gate covers the
+    ///   never-dispatched case.
     /// - `terminal_failure_epilogue` — `"failed"` (covers `Poisoned` via
     ///   `poison_and_cascade`/`handle_permanent_failure`, timeout-exhausted
     ///   `Cancelled` via `handle_timeout_failure`, and `DependencyFailed`
@@ -738,24 +750,6 @@ impl DagActor {
     ///   [`Self::has_buffered_exec_log`] for the full rationale.
     ///
     /// NOT called from:
-    /// - `adopt_orphan_completion` (recovery) — the worker disconnected
-    ///   before this leader started; it calls `record_exec_correlation`
-    ///   directly (so the dashboard knows which exec produced the
-    ///   output) and `discard_log_buffer` instead of this epilogue.
-    ///   KNOWN GAP: if the ex-leader's periodic flusher wrote a
-    ///   `.partial` row for that execution, nothing closes it — it rots
-    ///   at `is_complete=false` for the GC TTL while the correlation
-    ///   pins the dashboard to it (the same end-state as the
-    ///   failover-poison path, which IS routed through here).
-    ///   `flush_final` on the empty recovery placeholder now finalizes
-    ///   that row in place (`upload_and_record`'s empty-final-drain
-    ///   carve-out), and on an ex-leader the discard actively drops
-    ///   retained lines a flush would have uploaded — so routing this
-    ///   path through the epilogue is the fix. It needs a
-    ///   status-vocabulary decision first (the build succeeded during
-    ///   the scheduler's downtime; the *log* is truncated at the last
-    ///   periodic snapshot) — the same blocker as the
-    ///   cache-hit/substitute entry below.
     /// - cascaded `DependencyFailed` and `Skipped`: structurally never
     ///   dispatched — a cascaded ancestor's deps were never all
     ///   `Completed`, so it was never `Ready`, so it has no exec_id
@@ -867,9 +861,7 @@ impl DagActor {
     /// dropped-FlushRequest leak that survived to re-dispatch. Also
     /// called from `rollback_assignment` (failed `try_send` rollback —
     /// reaps the empty `set_log_exec`-stamped entry the failed dispatch
-    /// just created) and `adopt_orphan_completion` (post-terminal during
-    /// recovery — keeps the empty recovery-stamped entry from shadowing
-    /// the ex-leader's S3 `.partial` blob in `GetDerivationLogs`).
+    /// just created).
     /// Idempotent: first-ever dispatch finds no entry. No-op if
     /// `log_buffers` unwired (tests).
     pub(super) fn discard_log_buffer(&self, drv_hash: &DrvHash) {

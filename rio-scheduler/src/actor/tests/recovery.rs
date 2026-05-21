@@ -2263,31 +2263,35 @@ async fn test_recovery_restamp_clears_stale_exec_lines() -> TestResult {
     Ok(())
 }
 
-/// adopt_orphan_completion must discard the empty stamped LogBuffers entry
-/// that recovery's set_log_exec created. Without the discard, the entry has
-/// zero lines but exists, so:
-///  - `read_since(drv_path, since)` returns `Some([])` (entry present),
-///  - `try_ring_buffer` returns `Some([empty re-poll chunk])`,
-///  - `pin_matches_live` is `true` (the buffer exec_id matches the pinned
-///    request the dashboard sends from `GraphNode.exec_id`),
-///  - the GetDerivationLogs handler never falls through to `try_s3`,
-/// — and the ex-leader's already-uploaded `.partial.log.zst` and `drv_logs`
-/// row are unreachable until `CleanupTerminalBuild` reaps the *build*
-/// (`TERMINAL_CLEANUP_DELAY`, ~60s after the build, not the drv, goes
-/// terminal — hours for a large build).
-/// The periodic flusher doesn't self-heal: `upload_and_record` early-returns
-/// on `line_count == 0` so it neither uploads nor reaps. Same shape as
-/// `rollback_assignment`'s discard for a failed `try_send`.
+/// adopt_orphan_completion must route log finalization through
+/// `terminal_log_epilogue` (seal → flush → correlate) instead of
+/// discarding the recovery-stamped LogBuffers entry. The discard it
+/// previously did (a) never enqueued a FlushRequest, so the ex-leader's
+/// `.partial` `drv_logs` row stayed at `is_complete=false`/`status=NULL`
+/// for the 30-day TTL even when the adopting process held the tail
+/// needed to finalize it, and (b) on an ex-leader re-acquiring the
+/// lease, dropped the retained unflushed tail of the execution whose
+/// outputs were just adopted (see
+/// `test_orphan_completion_preserves_ex_leader_log_tail` for that case —
+/// this test covers the fresh-standby shape where the entry is empty and
+/// the flush is a no-op write). The entry's removal moved from the actor
+/// (synchronous discard) to the flusher (`drain_if_exec` on the queued
+/// request); `upload_and_record`'s `line_count == 0` early-return keeps
+/// the empty case a no-op write, so the dead leader's `.partial` row
+/// remains incomplete in this shape — that residual is inherent (the
+/// recovering process holds no lines).
 ///
 /// Phase-1 reuses `seed_orphan_assigned` (proven by the other
 /// `test_orphan_completion_*` tests) plus an `assignments.exec_id` INSERT
 /// (the recovery carrier that `test_recovery_repopulates_log_buffers_exec_id`
-/// established). Phase-2 wires `log_buffers` so the buffer must actually be
-/// re-stamped at recovery for this test to be non-trivial, and an inproc
-/// store so reconcile finds the outputs and routes to
-/// `adopt_orphan_completion` rather than `reset_orphan_to_ready`.
+/// established). Phase-2 wires `log_buffers` + a flush channel so the
+/// epilogue's FlushRequest is observable, and an inproc store so reconcile
+/// finds the outputs and routes to `adopt_orphan_completion` rather than
+/// `reset_orphan_to_ready`.
+///
+/// r[verify sched.merge.exec-correlation+6]
 #[tokio::test]
-async fn test_orphan_completion_discards_log_buffer() -> TestResult {
+async fn test_orphan_completion_routes_log_through_epilogue() -> TestResult {
     use super::integration::{put_test_path, setup_inproc_store};
 
     let exec_id = Uuid::now_v7();
@@ -2323,9 +2327,11 @@ async fn test_orphan_completion_discards_log_buffer() -> TestResult {
 
     // --- Phase 2: fresh actor recovers with log_buffers + store wired. ---
     let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(8);
     let (handle, _task) =
         setup_actor_configured(sched_db.pool.clone(), Some(store_client), |_, plumbing| {
             plumbing.log_buffers = Some(log_buffers.clone());
+            plumbing.log_flush_tx = Some(flush_tx);
         });
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
     barrier(&handle).await;
@@ -2361,24 +2367,157 @@ async fn test_orphan_completion_discards_log_buffer() -> TestResult {
         "orphan completion should transition drv to Completed"
     );
 
-    // KEY ASSERTIONS: the stamped entry must be gone. With it present,
-    // `try_ring_buffer` returns `Some([empty re-poll chunk])` and the
-    // GetDerivationLogs handler never falls through to S3, hiding the
-    // ex-leader's already-uploaded log until CleanupTerminalBuild reaps
-    // the build.
+    // KEY ASSERTIONS: the orphan adoption must run the log-finalization
+    // chokepoint, not hand-roll it. (1) A FlushRequest pinned to the
+    // recovered execution is enqueued — flush_final's drain_if_exec is
+    // what removes the entry (so GetDerivationLogs falls through to the
+    // ex-leader's S3 .partial instead of serving an empty re-poll chunk)
+    // and its line_count==0 early-return keeps the empty fresh-standby
+    // buffer a no-op write. trigger_log_flush and record_exec_correlation
+    // are both unconditionally inside the same gated terminal_log_epilogue
+    // call, so receiving the request also proves the bd.exec_id UPDATE
+    // was issued.
+    let req = flush_rx.try_recv().expect(
+        "adopt_orphan_completion must route log finalization through \
+         terminal_log_epilogue: a FlushRequest pinned to the recovered \
+         execution is enqueued and the flusher's drain_if_exec (not an \
+         actor-side discard) reaps the entry. In this empty fresh-standby \
+         shape the flush itself is a no-op write — row finalization is \
+         test_orphan_completion_preserves_ex_leader_log_tail's claim.",
+    );
+    assert_eq!(req.exec_id, exec_id, "request pins the recovered execution");
+    assert_eq!(req.drv_path, drv_path);
+    assert_eq!(req.status.as_deref(), Some("succeeded"));
+    // (2) Sealed: the worker never reconnects, but a late batch from a
+    // half-open stream must not recreate the entry after the flusher
+    // drains it.
+    assert!(
+        log_buffers.is_sealed(&drv_path),
+        "orphan adoption must seal the buffer before the flush"
+    );
+    // (3) The entry is RETAINED for the flusher's drain — the actor must
+    // not discard it out from under the queued request (drain_if_exec
+    // would return None and the request would be dropped as
+    // "no buffer to flush").
     assert_eq!(
         log_buffers.exec_id(&drv_path),
-        None,
-        "adopt_orphan_completion must discard the empty stamped entry \
-         (its worker never reconnects; the entry has zero lines and the \
-         periodic flusher skips it without reaping)"
-    );
-    assert!(
-        log_buffers.read_since(&drv_path, 0).is_none(),
-        "discarded entry → read_since=None → try_ring_buffer falls \
-         through to S3 instead of serving an empty re-poll chunk"
+        Some(exec_id),
+        "the stamped entry must survive until the flusher's drain_if_exec \
+         consumes it; a synchronous discard races the queued FlushRequest"
     );
 
+    Ok(())
+}
+
+/// The ex-leader half of `test_orphan_completion_routes_log_through_epilogue`:
+/// a single-replica self-fence + re-acquire retains `LogBuffers`
+/// (`clear_persisted_state` classes `log_buffers` as retained), and a drv
+/// whose worker finished and died while the lease was lost still holds the
+/// prior leadership's unflushed tail under the SAME exec_id (recovery's
+/// same-exec restamp deliberately keeps the lines — that is the round-9
+/// `set_exec` contract). Those lines are the log of the execution whose
+/// outputs the scheduler is adopting as a success. `adopt_orphan_completion`
+/// must hand them to the flusher, not discard them: the buffer must still
+/// hold the lines when the FlushRequest is enqueued, so `drain_if_exec`
+/// uploads them as the final `logs/{h}/{exec}.log.zst` blob and flips the
+/// `drv_logs` row to `is_complete=true`.
+///
+/// r[verify sched.merge.exec-correlation+6]
+/// r[verify obs.log.exec-keyed]
+#[tokio::test]
+async fn test_orphan_completion_preserves_ex_leader_log_tail() -> TestResult {
+    use super::integration::{put_test_path, setup_inproc_store};
+
+    let exec_id = Uuid::now_v7();
+    let drv_tag = "orphan-tail-drv";
+    let dead_worker = "dead-tail-w1";
+    let sched_db = TestDb::new(&MIGRATOR).await;
+    let store_db = TestDb::new(&MIGRATOR).await;
+    let (mut store_client, _store_srv) = setup_inproc_store(store_db.pool.clone()).await?;
+    let out_path = test_store_path("orphan-tail-out");
+    put_test_path(&mut store_client, &out_path).await?;
+
+    // --- Phase 1: PG state from the prior leadership. ---
+    let _build_id = seed_orphan_assigned(&sched_db.pool, drv_tag, &out_path, dead_worker).await?;
+    let (drv_id,): (Uuid,) =
+        sqlx::query_as("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+            .bind(drv_tag)
+            .fetch_one(&sched_db.pool)
+            .await?;
+    sqlx::query(
+        "INSERT INTO assignments (derivation_id, builder_id, generation, status, exec_id) \
+         VALUES ($1, $2, 1, 'pending', $3)",
+    )
+    .bind(drv_id)
+    .bind(dead_worker)
+    .bind(exec_id)
+    .execute(&sched_db.pool)
+    .await?;
+
+    // --- Phase 2: the EX-LEADER re-acquires. Its LogBuffers was retained
+    // across the flap and still holds the dying worker's unflushed tail
+    // for THIS execution. ---
+    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let drv_path = test_drv_path(drv_tag);
+    log_buffers.set_exec(&drv_path, exec_id, dead_worker);
+    assert!(
+        log_buffers.push_for(
+            &drv_path,
+            &rio_proto::types::BuildLogBatch {
+                derivation_path: drv_path.clone(),
+                lines: vec![b"unflushed tail line".to_vec()],
+                first_line_number: 0,
+                executor_id: dead_worker.into(),
+            },
+            dead_worker,
+        ),
+        "fixture premise: the retained entry holds the prior leadership's lines"
+    );
+
+    let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(8);
+    let (handle, _task) =
+        setup_actor_configured(sched_db.pool.clone(), Some(store_client), |_, plumbing| {
+            plumbing.log_buffers = Some(log_buffers.clone());
+            plumbing.log_flush_tx = Some(flush_tx);
+        });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // Precondition: the same-exec restamp retained the line (the round-9
+    // set_exec contract). Without this assert a regression there would
+    // make the final assertion vacuous.
+    assert_eq!(
+        log_buffers.read_since(&drv_path, 0),
+        Some(vec![(0, b"unflushed tail line".to_vec())]),
+        "same-exec recovery restamp must retain the in-flight execution's lines"
+    );
+
+    handle
+        .send_unchecked(ActorCommand::ReconcileAssignments)
+        .await?;
+    barrier(&handle).await;
+
+    let post = expect_drv(&handle, drv_tag).await;
+    assert_eq!(post.status, DerivationStatus::Completed);
+
+    // KEY ASSERTIONS: the tail survives to the flusher. The request is
+    // pinned to the execution and the buffer still holds the line, so
+    // flush_final's drain_if_exec(drv, exec_id) matches and uploads it
+    // as the final blob.
+    let req = flush_rx.try_recv().expect(
+        "adopt_orphan_completion must enqueue a final FlushRequest for the \
+         retained execution so its tail is uploaded and the .partial \
+         drv_logs row is finalized",
+    );
+    assert_eq!(req.exec_id, exec_id);
+    assert_eq!(req.status.as_deref(), Some("succeeded"));
+    assert_eq!(
+        log_buffers.read_since(&drv_path, 0),
+        Some(vec![(0, b"unflushed tail line".to_vec())]),
+        "the ex-leader's unflushed tail must survive to the flusher's \
+         drain; discarding it loses the log of the execution whose \
+         outputs were just adopted"
+    );
     Ok(())
 }
 

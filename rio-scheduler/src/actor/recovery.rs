@@ -1117,15 +1117,17 @@ impl DagActor {
 
     /// Reconcile path for an orphaned assignment whose outputs ARE in
     /// the store: the build completed while the scheduler was down.
-    /// Transition Completed, persist, attribute tenants, record exec
-    /// correlation, discard the (empty) recovery-stamped log buffer,
+    /// Transition Completed, persist, attribute tenants, run the
+    /// terminal log epilogue (seal → flush → correlate — see its
+    /// caller-list entry for the fresh-standby vs ex-leader shapes),
     /// unpin, then reuse [`release_downstream`](Self::release_downstream)
     /// for the newly-ready cascade + per-build completion check. Skips
     /// the `handle_success_completion` steps that need worker-result
     /// data (build_samples, CA bookkeeping, ancestor priorities —
-    /// full_sweep on next tick handles the latter; log seal+flush is
-    /// replaced by discard since the buffer is empty and the worker
-    /// never reconnects).
+    /// full_sweep on next tick handles the latter). The log epilogue
+    /// is NOT skipped: an ex-leader re-acquiring the lease retains the
+    /// prior leadership's unflushed tail for this execution, and it
+    /// must be flushed, not discarded.
     async fn adopt_orphan_completion(
         &mut self,
         drv_hash: &DrvHash,
@@ -1174,36 +1176,17 @@ impl DagActor {
         self.upsert_path_tenants_for(drv_hash).await;
         // r[impl sched.merge.exec-correlation+6]
         // Same gap as path-tenants above: `handle_success_completion`
-        // never fired, so `build_derivations.exec_id` would stay NULL
-        // and the dashboard's build view would fall back to
-        // "latest-exec for this drv" — which can be a *later* build's
-        // rebuild, not the execution this build observed. The exec_id
-        // is recoverable here: the drv was `Assigned`/`Running` at
-        // crash, so `load_nonterminal_derivations`'s `assignments`
-        // JOIN populated `state.exec_id` at recovery load. Resolved at
-        // this call site (the epilogue is not used on this path — the
-        // buffer is empty and the log is already lost); skip the write
-        // if neither carrier has it.
-        if let Some(exec_id) = self
-            .dag
-            .node(drv_hash)
-            .and_then(|s| self.exec_id_for_terminal(s))
-        {
-            self.record_exec_correlation(drv_hash, exec_id, &interested);
-        }
-        // Recovery's set_log_exec stamped a LogBuffers entry so a
-        // still-streaming worker could pass the push_for binding gate.
-        // On this arm the worker never reconnects (collect_orphaned_assignments
-        // only returns unregistered/phantom workers). On a fresh standby the
-        // entry has zero lines and the periodic flusher skips it
-        // (line_count==0 early-return — neither uploads nor reaps); on an
-        // ex-leader the retained entry can still hold the prior leadership's
-        // lines for this now-terminal execution, which makes the discard
-        // load-bearing rather than cosmetic. Discard it so GetDerivationLogs
-        // falls through to S3 instead of serving a stale or empty re-poll
-        // chunk until CleanupTerminalBuild reaps the build. Same shape as
-        // rollback_assignment (dispatch.rs:1675-1680).
-        self.discard_log_buffer(drv_hash);
+        // never fired for this drv, so the log-finalization chokepoint
+        // (seal → flush → correlate) must run here. It must be the
+        // epilogue, not a correlate + discard: an ex-leader
+        // re-acquiring the lease still holds the prior leadership's
+        // unflushed tail for this same execution (`set_exec` retains
+        // lines on a same-exec restamp), and that tail is the log of
+        // the execution whose outputs we just adopted. See
+        // `terminal_log_epilogue`'s caller-list entry for the
+        // fresh-standby no-op shape and the never-dispatched
+        // self-gate.
+        self.terminal_log_epilogue(drv_hash, "succeeded", &interested);
         // Terminal → unpin. sweep_stale_live_pins ran BEFORE
         // reconcile (the drv was Assigned/Running in PG then —
         // kept), so it won't catch this one.
