@@ -532,7 +532,7 @@ impl DagActor {
     /// it without breaking the legitimate shapes (neither
     /// `reset_to_ready` nor the transient-retry window seals); not
     /// added because no test can deterministically exercise the window.
-    /// r[impl sched.merge.exec-correlation+5]
+    /// r[impl sched.merge.exec-correlation+6]
     pub(super) fn has_buffered_exec_log(&self, state: &crate::state::DerivationState) -> bool {
         self.log_buffers
             .as_ref()
@@ -617,7 +617,15 @@ impl DagActor {
     /// (nodes whose merge tx hasn't committed — impossible here; merge
     /// commits before any dispatch — but cheap to guard).
     ///
-    /// r[impl sched.merge.exec-correlation+5]
+    /// The UPDATE carries `AND exec_id IS NULL`: a (build, drv)
+    /// observation is written exactly once. A build that already
+    /// recorded an observation — at its own completion — keeps it; a
+    /// post-completion re-execution of the same derivation (I-047/
+    /// I-094 reset inside the TERMINAL_CLEANUP_DELAY window, while the
+    /// finished build is still in `interested_builds`) does not revise
+    /// it.
+    ///
+    /// r[impl sched.merge.exec-correlation+6]
     pub(super) fn record_exec_correlation(&self, drv_hash: &DrvHash, interested_builds: &[Uuid]) {
         let Some(state) = self.dag.node(drv_hash) else {
             return;
@@ -636,10 +644,34 @@ impl DagActor {
         }
         let builds: Vec<Uuid> = interested_builds.to_vec();
         let pool = self.db.pool().clone();
+        // `AND exec_id IS NULL` — a (build, drv) observation is written
+        // exactly once, by the first terminal that build is interested
+        // in for that drv. A build's membership in `interested_builds`
+        // outlives its completion by TERMINAL_CLEANUP_DELAY (~60s) —
+        // `complete_build` only *schedules* the interest removal — so a
+        // drv reset out of a terminal state (I-047 GC'd-output reset,
+        // I-094 reprobe) and re-completed inside that window would
+        // otherwise stomp the already-recorded `bd.exec_id` with an
+        // execution the finished build never observed, and the
+        // dashboard would present the wrong log as exact (the
+        // "approximate" banner gates on `execId === ''`, not on
+        // correctness). The guard is SQL-side rather than an
+        // actor-side is_terminal() filter because the build that this
+        // very completion finishes is ALREADY terminal in
+        // `self.builds` by the time the epilogue runs
+        // (`release_downstream` → `complete_build` precedes
+        // `terminal_log_epilogue` in `handle_success_completion`) —
+        // an actor-side filter cannot distinguish "finished just now
+        // because of this drv" from "finished 60s ago". Transient
+        // retries never reach this function (only terminal transitions
+        // do), so first-write-wins == the-only-write-wins everywhere
+        // except a post-terminal reset, which is exactly the case
+        // being guarded.
         rio_common::task::spawn_monitored("exec-correlation", async move {
             if let Err(e) = sqlx::query(
                 "UPDATE build_derivations SET exec_id = $1 \
-                 WHERE derivation_id = $2 AND build_id = ANY($3)",
+                 WHERE derivation_id = $2 AND build_id = ANY($3) \
+                 AND exec_id IS NULL",
             )
             .bind(exec_id)
             .bind(derivation_id)
@@ -752,7 +784,7 @@ impl DagActor {
     /// it resolves, so it should resolve from the same snapshot of
     /// `state` as the correlate.
     ///
-    /// r[impl sched.merge.exec-correlation+5]
+    /// r[impl sched.merge.exec-correlation+6]
     pub(super) fn terminal_log_epilogue(
         &self,
         drv_hash: &DrvHash,

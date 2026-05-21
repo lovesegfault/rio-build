@@ -2183,7 +2183,7 @@ async fn test_orphan_completion_discards_log_buffer() -> TestResult {
 /// fallback) and queueing a FlushRequest that flush_final's staleness guard
 /// drops.
 ///
-/// r[verify sched.merge.exec-correlation+5]
+/// r[verify sched.merge.exec-correlation+6]
 #[tokio::test]
 async fn test_recovery_preserves_reset_exec_id_clear() -> TestResult {
     let stale_exec_id = Uuid::now_v7();

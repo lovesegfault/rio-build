@@ -1278,7 +1278,7 @@ impl DerivationState {
         } else if from == DerivationStatus::Running {
             self.running_since = None;
         }
-        // r[impl sched.merge.exec-correlation+5]
+        // r[impl sched.merge.exec-correlation+6]
         // A node leaving a terminal state (I-094 reprobe → Substituting/
         // Queued, I-047 stale-output reset → Ready/Queued) is starting a
         // fresh lifecycle. The terminal's epilogue already finalized the
@@ -1824,7 +1824,7 @@ mod tests {
         );
     }
 
-    // r[verify sched.merge.exec-correlation+5]
+    // r[verify sched.merge.exec-correlation+6]
     /// A terminal state's execution was finalized by that terminal's
     /// epilogue. Every terminal → non-terminal reset carve-out in
     /// `validate_transition` must drop the finalized execution's `exec_id`

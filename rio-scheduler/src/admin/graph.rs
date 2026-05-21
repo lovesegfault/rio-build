@@ -57,7 +57,7 @@ fn node_row_to_proto(r: GraphNodeRow) -> GraphNode {
         // Completed, Poisoned, Cancelled from Assigned/Running, and any
         // terminal reached while a prior, reset execution's stamped log
         // buffer is retained (build-cancel sweep, failed-substitute revert)
-        // (r[sched.merge.exec-correlation+5]). Empty for cache-hit Completed,
+        // (r[sched.merge.exec-correlation+6]). Empty for cache-hit Completed,
         // cascaded DependencyFailed, Skipped, never-dispatched
         // terminals, and non-terminal — the dashboard falls back to
         // "latest exec" for those, which is the right answer (a cache

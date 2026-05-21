@@ -1049,7 +1049,7 @@ impl DagActor {
         // has the full log (flusher hasn't drained yet — async on a
         // separate task), so AdminService.GetDerivationLogs can serve
         // from the ring buffer in the gap before the S3 upload lands.
-        // r[impl sched.merge.exec-correlation+5]
+        // r[impl sched.merge.exec-correlation+6]
         self.terminal_log_epilogue(drv_hash, "succeeded", &interested_builds);
         let _ = &mut t_phase;
         let total = t_total.elapsed();
@@ -1863,7 +1863,7 @@ impl DagActor {
         // exec correlation: a cascaded `DependencyFailed` parent never
         // executed, so its `state.exec_id` is `None` and
         // `build_derivations.exec_id` stays `NULL` for it.
-        // r[impl sched.merge.exec-correlation+5]
+        // r[impl sched.merge.exec-correlation+6]
         let trigger_builds = self.get_interested_builds(drv_hash);
         self.terminal_log_epilogue(drv_hash, "failed", &trigger_builds);
         let trigger_path = self.dag.path_or_hash_fallback(drv_hash);

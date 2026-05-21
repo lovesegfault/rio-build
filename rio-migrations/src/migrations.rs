@@ -1001,7 +1001,7 @@ pub const M_060: () = ();
 /// execution's stamped log buffer is retained (build-cancel sweep,
 /// failed-substitute revert); `NULL` for cascade-swept `DependencyFailed`/`Skipped`/
 /// cache-hit `Completed`/never-dispatched/non-terminal — see
-/// `sched.merge.exec-correlation+5`).
+/// `sched.merge.exec-correlation+6`).
 ///
 /// Greenfield drop+recreate, no backfill.
 pub const M_061: () = ();

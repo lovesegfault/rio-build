@@ -224,9 +224,10 @@ recv task's per-stream `seen_drvs` set (pinning
 the actor's single-threaded mailbox on disconnect. Rejections increment the
 arm's rejection counter with reason `path_too_long`.
 
-#r("sched.merge.exec-correlation+5")[
+#r("sched.merge.exec-correlation+6")[
   The scheduler MUST set `build_derivations.exec_id` for every interested
-  build when a derivation that has been dispatched (and therefore has an
+  build that has not already recorded an observation for that derivation
+  when a derivation that has been dispatched (and therefore has an
   `exec_id` recorded for it) reaches a terminal state through a path
   where an execution actually ran: `Completed` (success or recovery's
   orphan adoption), `Poisoned` (permanent failure), `Cancelled` reached
@@ -237,6 +238,10 @@ arm's rejection counter with reason `path_too_long`.
   `NULL` for cache-hit `Completed`, cascade-swept `DependencyFailed`
   ancestors, `Skipped`, non-terminal derivations, and any other
   terminal where no execution was ever observed (nothing to correlate).
+  A `(build, derivation)` observation is written exactly once --- a
+  post-completion reset and re-execution of the derivation inside the
+  terminal cleanup window MUST NOT revise an observation the build
+  already recorded.
 ]
 
 `Failed` is _not_ a terminal status in the actor's state machine
@@ -273,7 +278,15 @@ back to "latest execution for this derivation" --- which can differ if the drv
 was rebuilt by a later build. The write is best-effort fire-and-forget: a
 failed write degrades the dashboard view, not the build outcome. It runs in
 `record_exec_correlation`, called from the same per-build fan-out as
-`trigger_log_flush`.
+`trigger_log_flush`. The UPDATE is guarded with `AND exec_id IS NULL`
+(write-once per `(build, derivation)`): a build's `interested_builds`
+membership outlives its completion by the terminal cleanup delay, and a
+derivation reset and re-executed inside that window must not overwrite the
+observation the finished build recorded at its own completion. The guard is
+SQL-side rather than an actor-side terminal-state filter because the build
+that a derivation's completion finishes is already terminal in the actor's
+map by the time the correlation fires (build completion precedes the log
+epilogue in the success path).
 
 #r("sched.completion.idempotent")[
   A `CompletionReport` for an already-completed derivation is accepted and

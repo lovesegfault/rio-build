@@ -3396,7 +3396,7 @@ async fn test_infra_retry_cap_uniform_across_reasons(
 /// PG with the established 10ms × 100 pattern rather than asserting
 /// immediately after `barrier()` (which only drains the actor loop, not
 /// background tasks).
-// r[verify sched.merge.exec-correlation+5]
+// r[verify sched.merge.exec-correlation+6]
 #[tokio::test]
 async fn completion_records_build_exec_correlation() -> TestResult {
     let (db, handle, _task, mut stream_rx) = setup_with_worker("ec-worker", "x86_64-linux").await?;
@@ -3598,7 +3598,7 @@ async fn flush_skips_when_neither_carrier_has_exec_id() -> TestResult {
 /// Pre-fix: early-returned on `state.exec_id == None`, no UPDATE,
 /// `build_derivations.exec_id` stays NULL forever.
 ///
-/// r[verify sched.merge.exec-correlation+5]
+/// r[verify sched.merge.exec-correlation+6]
 #[tokio::test]
 async fn exec_correlation_falls_back_to_buffer_exec_id() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -3672,6 +3672,150 @@ async fn exec_correlation_falls_back_to_buffer_exec_id() -> TestResult {
         Some(exec_id),
         "record_exec_correlation should fall back to the LogBuffers \
          entry's exec_id when state.exec_id is None"
+    );
+    Ok(())
+}
+
+/// A finished build's `bd.exec_id` is final. Its `interested_builds`
+/// membership outlives its completion by TERMINAL_CLEANUP_DELAY (~60s)
+/// — `complete_build` only *schedules* the interest removal — so a drv
+/// reset out of a terminal state (I-047 GC'd-output reset, I-094
+/// reprobe) and re-completed inside that window fires
+/// `record_exec_correlation` again with the finished build still in
+/// the fan-out. The UPDATE must not revise the observation it recorded
+/// when the build was active (`AND exec_id IS NULL` — write-once per
+/// `(build, drv)`). The NULL-rowed sibling in the same fan-out is the
+/// positive control: it must get the new exec_id (proves the guard is
+/// per-row, not a dropped statement).
+///
+/// Pre-fix: the UPDATE binds every interested build unconditionally;
+/// B1's row is overwritten X1 → X2 and the dashboard presents X2's log
+/// as the exact log B1 observed (the "approximate" banner gates on
+/// `execId === ''`, not on correctness).
+///
+/// r[verify sched.merge.exec-correlation+6]
+#[tokio::test]
+async fn exec_correlation_skips_terminal_builds() -> TestResult {
+    use crate::state::{BuildInfo, BuildState};
+
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // One drv, two builds. B1 finished and already recorded X1; B2 is
+    // still active and NULL.
+    let derivation_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO derivations (drv_hash, drv_path, pname, system, status) \
+         VALUES ($1, $2, 'pkg', 'x86_64-linux', 'ready') \
+         RETURNING derivation_id",
+    )
+    .bind("ec-term-drv")
+    .bind(test_drv_path("ec-term-drv"))
+    .fetch_one(&db.pool)
+    .await?;
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+    let x1 = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO builds (build_id, status) VALUES ($1, 'succeeded'), ($2, 'active')")
+        .bind(b1)
+        .bind(b2)
+        .execute(&db.pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO build_derivations (build_id, derivation_id, exec_id) \
+         VALUES ($1, $3, $4), ($2, $3, NULL)",
+    )
+    .bind(b1)
+    .bind(b2)
+    .bind(derivation_id)
+    .bind(x1)
+    .execute(&db.pool)
+    .await?;
+
+    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let mut actor = DagActor::new(
+        SchedulerDb::new(db.pool.clone()),
+        DagActorConfig::default(),
+        DagActorPlumbing {
+            log_buffers: Some(log_buffers.clone()),
+            ..Default::default()
+        },
+    );
+
+    // The re-executed node (post-reset, re-dispatched as X2).
+    // `state.exec_id = Some(x2)` is the carrier `exec_id_for_terminal`
+    // reads first.
+    let x2 = uuid::Uuid::now_v7();
+    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+        derivation_id,
+        exec_id: Some(x2),
+        ..crate::db::RecoveryDerivationRow::test_default("ec-term-drv", "x86_64-linux")
+    });
+
+    // Register both builds in the actor's map: B1 terminal, B2 active.
+    // Pending → Active → Succeeded is the validated path
+    // (Pending → Succeeded directly is rejected by validate_transition).
+    let mk = |bid: Uuid| {
+        BuildInfo::new_pending(
+            bid,
+            None,
+            PriorityClass::Scheduled,
+            false,
+            BuildOptions::default(),
+            std::iter::once(DrvHash::from("ec-term-drv")).collect(),
+        )
+    };
+    let mut info1 = mk(b1);
+    info1.transition(BuildState::Active).unwrap();
+    info1.transition(BuildState::Succeeded).unwrap();
+    actor.builds.insert(b1, info1);
+    let mut info2 = mk(b2);
+    info2.transition(BuildState::Active).unwrap();
+    actor.builds.insert(b2, info2);
+
+    // The re-completion's fan-out still contains the finished B1.
+    actor.record_exec_correlation(&DrvHash::from("ec-term-drv"), &[b1, b2]);
+
+    // Wait for the write that SHOULD happen (B2 → X2), then check the
+    // one that shouldn't (B1 stays X1). Established 10ms × 100 poll —
+    // the exec-correlation write is spawned (fire-and-forget). Polling
+    // for B1 to *stay* X1 would be a timing-dependent absence
+    // assertion; anchoring on B2's positive write makes B1's read
+    // deterministic (same UPDATE statement, so by the time B2's row is
+    // visible the statement has committed in full).
+    let mut b2_got: Option<Uuid> = None;
+    for _ in 0..100 {
+        b2_got = sqlx::query_scalar(
+            "SELECT exec_id FROM build_derivations \
+             WHERE build_id = $1 AND derivation_id = $2",
+        )
+        .bind(b2)
+        .bind(derivation_id)
+        .fetch_one(&db.pool)
+        .await?;
+        if b2_got.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        b2_got,
+        Some(x2),
+        "build with no recorded observation in the same fan-out must \
+         still get the new exec_id (positive control: the write-once \
+         guard is per-row, not a dropped statement)"
+    );
+    let b1_got: Option<Uuid> = sqlx::query_scalar(
+        "SELECT exec_id FROM build_derivations \
+         WHERE build_id = $1 AND derivation_id = $2",
+    )
+    .bind(b1)
+    .bind(derivation_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        b1_got,
+        Some(x1),
+        "a finished build's recorded observation is final — a post-completion \
+         re-execution of the drv must not overwrite bd.exec_id"
     );
     Ok(())
 }
