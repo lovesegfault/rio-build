@@ -50,13 +50,16 @@
 //!    quint-connect's default config reads the action name from the
 //!    `mbt::actionTaken` trace variable, which only `quint run --mbt`
 //!    emits — `quint test` (the named-run runner) does not accept
-//!    `--mbt` at all (verified against quint 0.32.0). The named runs are
+//!    `--mbt` at all. The named runs are
 //!    therefore replayed by hand: `quint test --out-itf` still emits the
 //!    per-step *states*, and [`replay_named_run`] zips them with the
 //!    run's action sequence (mirrored from the model) and diffs after
-//!    every step. A model-side edit to a run's sequence changes its
-//!    trace's states and the replay diverges at the first edited step,
-//!    so the mirrored sequence cannot silently rot.
+//!    every step. A model-side edit that changes any projected variable
+//!    at any step makes the replay diverge there, and the trace-length
+//!    check catches insertions and deletions; only edits invisible to
+//!    the projection (e.g. reordering ticks within the skew constraint)
+//!    escape, which is acceptable because tick touches none of
+//!    lease/leading/gen.
 //! 2. **The model's initial state is "a Lease exists with no holder at
 //!    rv 0", not "no Lease object".** The driver's `init` seeds the mock
 //!    store accordingly. The implementation's 404→POST create path is
@@ -409,7 +412,8 @@ impl MbtSystem {
         // against the real clock (finding 4 in the module header), so
         // the anchor must be a real past instant: now minus the model's
         // tick delta. checked_sub only fails if the host has been up for
-        // less than the delta (≤ MAX_TIME×TICK = 56s).
+        // less time than the delta, which the model's clock ceiling
+        // bounds to a handful of TICKs.
         let blind_for = TICK * u32::try_from(h.ticks - h.fence_tick).expect("tick delta fits u32");
         let last_renew = Instant::now()
             .checked_sub(blind_for)
