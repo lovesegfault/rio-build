@@ -21,6 +21,10 @@
   preCommitInstall,
   # nix/kani-toolchain.nix — cargo-kani for local proof iteration
   kaniToolchain,
+  # Quint 0.32.0 + bundled Apalache from the `nixpkgs-quint` flake
+  # input (the primary nixpkgs only has 0.30.0, which cannot verify
+  # hermetically). Drop the arg when the primary nixpkgs catches up.
+  quintPkg,
 }:
 let
   # nixpkgs still ships sqlx-cli 0.8.6 while the workspace is on sqlx
@@ -137,6 +141,14 @@ let
     # `cd docs/spec/models && tlc -workers auto -config M.cfg M.tla`.
     # See nix/tla.nix for the CI check.
     tlaplus
+
+    # Quint — the candidate successor to raw TLA+ for new models
+    # (typed, effect-checked, simulator + Apalache symbolic verifier).
+    # `quint verify` finds Apalache via QUINT_HOME inside the package —
+    # a store path, no runtime download, so it will work in the
+    # network-less sandbox when a CI check is wired up. From the
+    # `nixpkgs-quint` input, NOT `pkgs` (see flake.nix).
+    quintPkg
 
     # crate2nix CLI for regenerating Cargo.json after
     # Cargo.lock changes. PoC — see

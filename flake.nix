@@ -19,6 +19,22 @@
 
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
+    # Quint (the TLA+-successor specification language) pinned past the
+    # primary nixpkgs. The pinned nixpkgs has quint 0.30.0, which has NO
+    # Apalache — `quint verify` tries to download it at runtime, which
+    # the sandbox forbids. Master's 0.32.0 bundles the Apalache dist as
+    # a store path inside the package (located via QUINT_HOME), so
+    # `quint verify` works hermetically. A second input rather than a
+    # copied package definition because quint has two FOD sub-builds
+    # (npmDepsHash + cargoHash) whose hashes are sensitive to the
+    # evaluating nixpkgs' fetcher normalization — pinning the whole rev
+    # gives the byte-identical derivation master builds and caches.
+    # Only `legacyPackages.<system>.quint` is ever evaluated from this
+    # input. DROP this input (and the quintPkg plumbing into
+    # nix/devshell.nix) when the primary nixpkgs is bumped past a rev
+    # whose quint is >= 0.32.0.
+    nixpkgs-quint.url = "github:NixOS/nixpkgs/fcc5c713107633fb50dbd513444b56504b158374";
+
     flake-compat = {
       url = "github:edolstra/flake-compat";
       flake = false;
@@ -1080,6 +1096,12 @@
                   ;
                 treefmtWrapper = config.treefmt.build.wrapper;
                 preCommitInstall = config.pre-commit.installationScript;
+                # Quint + bundled Apalache from the out-of-band nixpkgs
+                # pin (see the nixpkgs-quint input comment). Evaluated
+                # against ITS OWN nixpkgs so the npm/cargo FOD hashes
+                # match what master builds — only the dev shell forces
+                # this second nixpkgs eval; checks.* never reference it.
+                quintPkg = inputs.nixpkgs-quint.legacyPackages.${system}.quint;
               };
 
               # `nix run .#docs` — serve the post-processed HTML tree via

@@ -243,6 +243,22 @@
         "type": "github"
       }
     },
+    "nixpkgs-quint": {
+      "locked": {
+        "lastModified": 1779367897,
+        "narHash": "sha256-rhJ2QdA9Aw3TYCP46L+a9tc9ySqiNeZ2PEU7oU8QyaY=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "fcc5c713107633fb50dbd513444b56504b158374",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "fcc5c713107633fb50dbd513444b56504b158374",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "advisory-db": "advisory-db",
@@ -253,6 +269,7 @@
         "nix": "nix",
         "nixhelm": "nixhelm",
         "nixpkgs": "nixpkgs",
+        "nixpkgs-quint": "nixpkgs-quint",
         "rust-overlay": "rust-overlay",
         "tracey-src": "tracey-src",
         "treefmt-nix": "treefmt-nix"
