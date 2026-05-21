@@ -118,11 +118,28 @@ pub struct LogFlusher {
     /// standbys and ex-leaders. Pre-`drv_logs` the periodic flush wrote
     /// no PG rows so it was harmless to run unconditionally; now both
     /// the periodic UPSERT and the GC DELETE+DeleteObjects are
-    /// leader-only writes. The completion-flush arm stays un-gated:
-    /// `FlushRequest`s only arrive from the actor, which only handles
-    /// completions when it holds the lease, and the request carries the
-    /// `exec_id` it's for so a stale post-flap request is dropped by the
-    /// staleness guard regardless.
+    /// leader-only writes.
+    ///
+    /// The completion-flush arm stays un-gated, and the reason is
+    /// narrower than it looks: everything in `flush_rx` was enqueued by
+    /// the actor *while it held the lease*, for a derivation it fully
+    /// observed reaching terminal. Processing that request post-flap
+    /// still produces a correct `drv_logs` row — the data (the worker's
+    /// lines, the actor's status) is accurate, the UPSERT is keyed on
+    /// the request's pinned `exec_id`, and the new leader loads that
+    /// derivation as already-terminal so it never re-dispatches it under
+    /// that `exec_id` and never writes a competing row. A lease flap
+    /// *during* a build enqueues nothing (no terminal happened here).
+    ///
+    /// Note the staleness guard in [`Self::flush_final`] is NOT what
+    /// makes this safe: it is a *re-dispatch* cutoff (fires only when
+    /// the ring-buffer entry was discarded and re-stamped with a fresh
+    /// `exec_id`), not a "the lease moved on" cutoff. After a flap the
+    /// ex-leader's `LogBuffers` is retained (`clear_persisted_state`
+    /// wipes actor state on lease *acquisition* and explicitly classes
+    /// `log_buffers` as retained) and still carries the same `exec_id`
+    /// the request pinned, so the guard passes and the request is
+    /// processed — correctly, for the reason above.
     is_leader: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -216,13 +233,20 @@ impl LogFlusher {
                     }
 
                     _ = tick.tick() => {
-                        // Leader-gated. A standby's `LogBuffers` is structurally
-                        // empty (no worker streams connect to it), but an
-                        // ex-leader after a lease flap retains its stamped
-                        // buffers and would otherwise keep UPSERTing stale
-                        // `drv_logs` rows and `.partial` blobs every 30s — for
-                        // builds the new leader is now driving under fresh
-                        // `exec_id`s.
+                        // Leader-gated, and the gate is load-bearing here (not
+                        // just waste avoidance). A standby's `LogBuffers` is
+                        // structurally empty (no worker streams connect to it),
+                        // but an ex-leader after a lease flap retains its
+                        // stamped buffers — and for drvs that were still
+                        // Assigned|Running at failover, recovery deliberately
+                        // re-stamps the *same* `exec_id` from `assignments`
+                        // (so a reconnecting worker keeps streaming under its
+                        // in-flight execution). An un-gated ex-leader periodic
+                        // tick would therefore UPSERT a stale `.partial`
+                        // snapshot into the same `(exec_id)`-keyed `drv_logs`
+                        // row the new leader is writing — and could flip
+                        // `is_complete` back to `false` over the new leader's
+                        // completed final flush.
                         if self.is_leader() {
                             self.flush_periodic().await;
                         }
