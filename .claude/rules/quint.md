@@ -95,9 +95,12 @@ productized:
 **An invariant that holds over a state space that never reaches the contended state proves
 nothing.** Every safety invariant MUST be paired with at least one witness showing the state
 it protects against is reachable, and (for the load-bearing guard conditions) a documented
-weakened-test procedure showing the invariant is falsified without the guard. Record both
-results — the witness violation depth and the weakened-spec counterexample depth — in the
-spec's header comment, exactly as the TLA+ cfgs did.
+weakened-test procedure showing the invariant is falsified without the guard. The header
+comment records the PROCEDURE and the CLAIM ("this witness is violated; deleting guard X
+falsifies invariant Y — verified at <commit>"); the measured depths, state counts, and
+wall-clocks go in the commit message and the check's output transcript ONLY — volatile
+measurements never go in comments, because they shift on every model change and a stale
+figure is worse than none.
 
 ## The verification workflow
 
@@ -151,7 +154,7 @@ Reproduce a random-simulation violation with `--seed=<0x…>` from the failure o
 - [ ] Every map is pre-populated over its full key domain in `init` (`mapBy`), never `Map()`.
 - [ ] Every safety invariant has a paired witness proving its contended state is reachable.
 - [ ] Every load-bearing guard has a documented weakened-test result (delete it → which
-      invariant fails at what depth).
+      invariant fails; the depth it failed at goes in the commit message, not the comment).
 - [ ] Business logic lives in `pure def`s; actions are thin (the pure logic is what an MBT
       harness can replay against the implementation).
 - [ ] `quint test` invocations all pass `--match`.
@@ -160,8 +163,9 @@ Reproduce a random-simulation violation with `--seed=<0x…>` from the failure o
       exhaustive guarantee the CI checks claim.
 - [ ] Every unbounded variable has a ceiling as an action precondition.
 - [ ] The header comment states: what the spec models, the invariants and their witnesses,
-      the weakened-test evidence, and the state count / wall-clock the results were measured
-      at.
+      and the weakened-test procedures. It does NOT state measured figures (state counts,
+      depths, wall-clocks) — those live in the introducing commit's message and the check's
+      output transcript, where they cannot go stale.
 - [ ] Properties that reason about "the node had the opportunity to act" are encoded as
       action PRECONDITIONS, not inferred from enabledness — a thin action is always enabled
       (a rejected attempt is a no-op self-loop), so enabledness-based arguments from TLA+ do
