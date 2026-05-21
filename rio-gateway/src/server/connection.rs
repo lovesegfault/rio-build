@@ -386,9 +386,34 @@ impl Drop for ConnectionHandler {
 /// a string literal.
 // r[impl gw.auth.tenant-from-key-comment]
 fn normalize_key_comment(
-    comment: &str,
+    comment: &[u8],
     key_fingerprint: &dyn std::fmt::Display,
 ) -> Option<NormalizedName> {
+    // ssh-key 0.7 (via russh 0.61) models comments as raw bytes — RFC
+    // 4251 strings need not be UTF-8. A tenant name must be a string:
+    // treat invalid UTF-8 exactly like interior whitespace below — a
+    // MISCONFIGURED authorized_keys entry → degrade to single-tenant,
+    // but WARN + bump the counter so the operator notices. Strict
+    // `from_utf8` (not `Comment::as_str_lossy`): lossy truncates to the
+    // longest valid prefix, which could silently turn a corrupted
+    // `team-alpha\xFF…` comment into the REAL tenant `team-alpha`.
+    let comment = match std::str::from_utf8(comment) {
+        Ok(comment) => comment,
+        Err(_) => {
+            warn!(
+                key_fingerprint = %key_fingerprint,
+                "authorized_keys comment is not valid UTF-8 — \
+                 degrading to single-tenant mode; re-write the comment \
+                 as plain UTF-8 (e.g. `team-a`)"
+            );
+            metrics::counter!(
+                "rio_gateway_auth_degraded_total",
+                "reason" => "invalid_utf8"
+            )
+            .increment(1);
+            return None;
+        }
+    };
     match NormalizedName::new(comment) {
         Ok(name) => Some(name),
         // Intentional single-tenant: empty comment. No noise.
@@ -505,8 +530,10 @@ impl Handler for ConnectionHandler {
             // helper is extracted for direct unit-testability (no
             // full `ConnectionHandler` needed to assert the counter
             // fires).
-            self.tenant_name =
-                normalize_key_comment(matched.comment(), &matched.fingerprint(Default::default()));
+            self.tenant_name = normalize_key_comment(
+                matched.comment().as_bytes(),
+                &matched.fingerprint(Default::default()),
+            );
 
             // r[impl gw.jwt.dual-mode+2]
             //
@@ -939,7 +966,7 @@ mod tests {
 
         let recorder = CountingRecorder::default();
         let result = metrics::with_local_recorder(&recorder, || {
-            normalize_key_comment("team a", &"SHA256:test-fingerprint")
+            normalize_key_comment(b"team a", &"SHA256:test-fingerprint")
         });
 
         // Degrades to single-tenant:
@@ -964,7 +991,7 @@ mod tests {
 
         let recorder = CountingRecorder::default();
         let result =
-            metrics::with_local_recorder(&recorder, || normalize_key_comment("  team-a  ", &"fp"));
+            metrics::with_local_recorder(&recorder, || normalize_key_comment(b"  team-a  ", &"fp"));
 
         assert_eq!(
             result.as_deref(),
@@ -987,7 +1014,7 @@ mod tests {
         use rio_test_support::metrics::CountingRecorder;
 
         let recorder = CountingRecorder::default();
-        let result = metrics::with_local_recorder(&recorder, || normalize_key_comment("", &"fp"));
+        let result = metrics::with_local_recorder(&recorder, || normalize_key_comment(b"", &"fp"));
 
         assert_eq!(result, None, "empty comment → single-tenant (None)");
         assert_eq!(
@@ -997,12 +1024,35 @@ mod tests {
         );
         // Also whitespace-only (trims to empty → Empty variant):
         let ws_result =
-            metrics::with_local_recorder(&recorder, || normalize_key_comment("   ", &"fp"));
+            metrics::with_local_recorder(&recorder, || normalize_key_comment(b"   ", &"fp"));
         assert_eq!(ws_result, None);
         assert_eq!(
             recorder.get("rio_gateway_auth_degraded_total{reason=interior_whitespace}"),
             0,
             "whitespace-only → Empty (not InteriorWhitespace) → no counter"
+        );
+    }
+
+    /// Non-UTF-8 comment → None + counter. ssh-key 0.7 comments are raw
+    /// bytes (RFC 4251); a binary/corrupted comment is a misconfigured
+    /// entry, not a tenant identity. Strict rejection (vs `as_str_lossy`'s
+    /// longest-valid-prefix) so `team-alpha\xFF…` can't silently become
+    /// tenant `team-alpha`.
+    #[test]
+    fn invalid_utf8_comment_warns_and_degrades() {
+        use rio_test_support::metrics::CountingRecorder;
+
+        let recorder = CountingRecorder::default();
+        let result = metrics::with_local_recorder(&recorder, || {
+            normalize_key_comment(b"team-alpha\xff\xfe", &"fp")
+        });
+
+        assert_eq!(result, None, "invalid UTF-8 must degrade to single-tenant");
+        assert_eq!(
+            recorder.get("rio_gateway_auth_degraded_total{reason=invalid_utf8}"),
+            1,
+            "invalid UTF-8 must bump auth_degraded counter; saw keys: {:?}",
+            recorder.all_keys()
         );
     }
 }

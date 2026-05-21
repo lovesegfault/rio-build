@@ -40,7 +40,7 @@ use std::sync::Arc;
 /// Drop, so a single-shot `query_scalar` immediately after the
 /// handler's `Err` return can observe pre-reap state under nextest
 /// parallelism / builder load.
-pub async fn poll_scalar_until<T>(pool: &sqlx::PgPool, sql: &str, target: T) -> T
+pub async fn poll_scalar_until<T>(pool: &sqlx::PgPool, sql: &'static str, target: T) -> T
 where
     T: PartialEq
         + for<'r> sqlx::Decode<'r, sqlx::Postgres>

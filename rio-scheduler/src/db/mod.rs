@@ -7,10 +7,11 @@
 //! `.to_string()` conversions needed.
 //!
 //! `query!(...)` macros (compile-time SQL checking) read from `.sqlx/`
-//! (committed, regenerated via `cargo xtask regen sqlx`). The `TERMINAL_STATUS_SQL`
-//! `format!`-interpolated callsites are permanent exceptions — the macro
-//! requires a string literal, and the planner needs the literal for
-//! partial-index proof.
+//! (committed, regenerated via `cargo xtask regen sqlx`). The
+//! [`terminal_status_sql!`]-spliced callsites are permanent exceptions —
+//! `query!` requires a string literal, and the planner needs the literal
+//! for partial-index proof; the splice macro keeps those queries
+//! `&'static str` so they still satisfy sqlx 0.9's `SqlSafeStr` bound.
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -37,7 +38,14 @@ pub(crate) use recovery::read_event_log;
 pub use history::{BuildSampleRow, SlaOverrideRow};
 
 // r[impl sched.db.partial-index-literal]
-/// Terminal statuses as a SQL `NOT IN` literal fragment.
+/// Terminal statuses as a SQL `IN`/`NOT IN` tuple literal, spliced
+/// between two literal SQL fragments at compile time:
+/// `terminal_status_sql!("… WHERE status NOT IN ", " …")` (the second
+/// fragment may be omitted). The expansion is a single `&'static str`,
+/// which is what sqlx 0.9's `SqlSafeStr` bound on `query()`/`query_as()`
+/// requires — `concat!` can't expand a `const`, so the splice has to
+/// happen in macro position for the composed SQL to stay a
+/// compile-time literal.
 ///
 /// MUST match both:
 ///   - [`DerivationStatus::is_terminal`] (enum ground truth)
@@ -51,12 +59,32 @@ pub use history::{BuildSampleRow, SlaOverrideRow};
 ///
 /// The drift test [`tests::transactions::test_terminal_statuses_match_is_terminal`]
 /// iterates all `DerivationStatus` variants and asserts that
-/// `is_terminal() ⇔ as_str() ∈ TERMINAL_STATUSES`. Adding a new
-/// terminal status without updating this list fails that test.
+/// `is_terminal() ⇔ as_str() ∈ TERMINAL_STATUSES` (via
+/// `TERMINAL_STATUS_SQL`, which is derived from this macro). Adding a
+/// new terminal status without updating this list fails that test.
 /// Updating this list without updating the migration fails the
 /// PG-side check (`test_partial_index_predicate_matches_const`).
-pub(super) const TERMINAL_STATUS_SQL: &str =
-    "('completed', 'poisoned', 'dependency_failed', 'cancelled', 'skipped')";
+macro_rules! terminal_status_sql {
+    ($before:literal) => {
+        terminal_status_sql!($before, "")
+    };
+    ($before:literal, $after:literal) => {
+        concat!(
+            $before,
+            "('completed', 'poisoned', 'dependency_failed', 'cancelled', 'skipped')",
+            $after
+        )
+    };
+}
+pub(super) use terminal_status_sql;
+
+/// String form of [`terminal_status_sql!`] for the drift tests
+/// (`tests/transactions.rs` compares it against `TERMINAL_STATUSES` and
+/// the migration's partial-index predicate). The macro is the source of
+/// truth; this is just its expansion with empty surroundings. Test-only
+/// since the production queries splice the macro directly.
+#[cfg(test)]
+pub(super) const TERMINAL_STATUS_SQL: &str = terminal_status_sql!("");
 
 /// Encode a `&[String]` as a PostgreSQL text-array literal: `{a,b,c}`.
 /// Used for the nested-array columns in `batch_upsert_derivations` —
@@ -300,12 +328,14 @@ pub(crate) struct DerivationRow {
 }
 
 /// Shared SELECT / FROM clause for `list_builds` and
-/// `list_builds_keyset`. Single-table since I-103 — counts are
-/// denormalized columns; the old 4-table join was O(Σ drvs) (see
-/// `M_030`). The two methods differ only in their WHERE pagination
-/// clause and LIMIT/OFFSET tail. Kept as a `&str` const
-/// (not a macro) because the queries are runtime-built via `format!`
-/// — sqlx compile-time checks don't apply to dynamic strings anyway.
+/// `list_builds_keyset`, spliced ahead of each method's pagination
+/// tail at compile time: `list_builds_select!("WHERE … LIMIT $3")`.
+/// Single-table since I-103 — counts are denormalized columns; the old
+/// 4-table join was O(Σ drvs) (see `M_030`). The two methods differ
+/// only in their WHERE pagination clause and LIMIT/OFFSET tail. A
+/// macro (not a `format!`-ed const) since sqlx 0.9: `query_as()` only
+/// accepts `&'static str` SQL (`SqlSafeStr`), so the composition has
+/// to be a compile-time literal.
 ///
 /// `submitted_at_micros`: `EXTRACT(EPOCH)*1e6` gives fractional seconds
 /// with µs precision; `::bigint` truncates to integer microseconds.
@@ -314,7 +344,10 @@ pub(crate) struct DerivationRow {
 /// -remainder so the round-trip is exact (see its doc comment — direct
 /// bigint÷1e6 through `to_timestamp(float8)` would lose precision near
 /// the 16-significant-figure IEEE754 limit).
-pub(super) const LIST_BUILDS_SELECT: &str = r#"
+macro_rules! list_builds_select {
+    ($tail:literal) => {
+        concat!(
+            r#"
     SELECT
         b.build_id,
         b.tenant_id::text,
@@ -326,7 +359,12 @@ pub(super) const LIST_BUILDS_SELECT: &str = r#"
         b.completed_drvs::bigint AS completed_derivations,
         b.cached_drvs::bigint    AS cached_derivations
     FROM builds b
-"#;
+    "#,
+            $tail
+        )
+    };
+}
+pub(super) use list_builds_select;
 
 impl SchedulerDb {
     /// Create a new database handle from a connection pool.

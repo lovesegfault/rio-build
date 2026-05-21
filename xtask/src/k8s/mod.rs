@@ -557,7 +557,8 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
 /// `INSERT`/DDL) executes and prints rows-affected. The SQL is run
 /// verbatim — no injection guard, because the caller IS the operator
 /// and the threat model for `xtask` is "trusted shell on the operator
-/// box," not "untrusted user input."
+/// box," not "untrusted user input." (`AssertSqlSafe` below is that
+/// statement in type form — sqlx 0.9 makes the audit explicit.)
 async fn pg_exec(sql: &str) -> Result<()> {
     use sqlx::{Column, Row, ValueRef};
 
@@ -569,7 +570,9 @@ async fn pg_exec(sql: &str) -> Result<()> {
         "SELECT" | "WITH" | "EXPLAIN" | "SHOW" | "TABLE" | "VALUES"
     );
     if is_read {
-        let rows = sqlx::query(sql).fetch_all(&pg.pool).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.to_owned()))
+            .fetch_all(&pg.pool)
+            .await?;
         if rows.is_empty() {
             println!("(0 rows)");
             return Ok(());
@@ -602,7 +605,9 @@ async fn pg_exec(sql: &str) -> Result<()> {
         }
         println!("({} rows)", rows.len());
     } else {
-        let r = sqlx::query(sql).execute(&pg.pool).await?;
+        let r = sqlx::query(sqlx::AssertSqlSafe(sql.to_owned()))
+            .execute(&pg.pool)
+            .await?;
         println!("{} rows affected", r.rows_affected());
     }
     Ok(())

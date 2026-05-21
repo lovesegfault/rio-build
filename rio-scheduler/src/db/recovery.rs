@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use super::{
     GraphEdgeRow, GraphNodeRow, RecoveryBuildRow, RecoveryDerivationRow, SchedulerDb,
-    TERMINAL_STATUS_SQL,
+    terminal_status_sql,
 };
 
 impl SchedulerDb {
@@ -56,7 +56,7 @@ impl SchedulerDb {
     pub(crate) async fn load_nonterminal_derivations(
         &self,
     ) -> Result<Vec<RecoveryDerivationRow>, sqlx::Error> {
-        sqlx::query_as(&format!(
+        sqlx::query_as(terminal_status_sql!(
             r"
             SELECT derivation_id, drv_hash, drv_path, pname, system, status,
                    required_features,
@@ -67,8 +67,7 @@ impl SchedulerDb {
                    failed_builders,
                    floor_mem_bytes, floor_disk_bytes, floor_deadline_secs
             FROM derivations
-            WHERE status NOT IN {TERMINAL_STATUS_SQL}
-            "
+            WHERE status NOT IN "
         ))
         .fetch_all(&self.pool)
         .await

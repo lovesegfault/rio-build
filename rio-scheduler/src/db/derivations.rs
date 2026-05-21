@@ -1,6 +1,6 @@
 //! Per-derivation state + poison tracking — `derivations` table.
 
-use super::{AssignmentStatus, PoisonedDerivationRow, SchedulerDb, TERMINAL_STATUS_SQL};
+use super::{AssignmentStatus, PoisonedDerivationRow, SchedulerDb, terminal_status_sql};
 use crate::state::{DerivationStatus, DrvHash, ExecutorId};
 
 /// Map a terminal `DerivationStatus` to the `assignments.status` value
@@ -254,15 +254,16 @@ impl SchedulerDb {
     /// recovery; it's also defense-in-depth if a future caller forgets
     /// the transaction discipline.
     pub async fn sweep_stale_assignments(&self) -> Result<u64, sqlx::Error> {
-        // format! of a compile-time const — no injection surface.
-        // See TERMINAL_STATUS_SQL doc for why this isn't a bind param.
-        let result = sqlx::query(&format!(
+        // Compile-time splice of the terminal-status tuple — see
+        // terminal_status_sql! for why it isn't a bind param.
+        let result = sqlx::query(terminal_status_sql!(
             "UPDATE assignments \
              SET status = 'failed', completed_at = now() \
              WHERE status IN ('pending', 'acknowledged') \
                AND derivation_id IN \
                  (SELECT derivation_id FROM derivations \
-                  WHERE status IN {TERMINAL_STATUS_SQL})"
+                  WHERE status IN ",
+            ")"
         ))
         .execute(&self.pool)
         .await?;
@@ -358,10 +359,13 @@ impl SchedulerDb {
     /// the table still grows unbounded at avg-fanout× the I-169.2
     /// churn rate (1.16M derivations) without the edge delete.
     pub async fn gc_orphan_terminal_derivations(&self, limit: i64) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query(&format!(
+        // Compile-time splice of the terminal-status tuple — see
+        // terminal_status_sql! for why it isn't a bind param.
+        let result = sqlx::query(terminal_status_sql!(
             "WITH victims AS (
                  SELECT d.derivation_id FROM derivations d
-                 WHERE d.status IN {TERMINAL_STATUS_SQL}
+                 WHERE d.status IN ",
+            "
                    AND NOT EXISTS (SELECT 1 FROM build_derivations bd
                                    WHERE bd.derivation_id = d.derivation_id)
                    AND NOT EXISTS (SELECT 1 FROM assignments a

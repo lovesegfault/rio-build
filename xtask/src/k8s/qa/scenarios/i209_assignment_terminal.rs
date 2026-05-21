@@ -66,11 +66,13 @@ impl Scenario for AssignmentTerminal {
             let pat = pat.clone();
             let pg = ctx.pg().clone();
             async move {
-                sqlx::query_scalar::<_, i64>(&format!(
+                // AssertSqlSafe: `pred` is one of two &'static operator
+                // literals defined a few lines below — scenario-internal.
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
                     "SELECT COUNT(*) FROM assignments a \
                      JOIN derivations d ON d.derivation_id = a.derivation_id \
                      WHERE d.drv_path LIKE $1 AND a.status {pred}"
-                ))
+                )))
                 .bind(pat)
                 .fetch_one(&pg)
                 .await

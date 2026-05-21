@@ -50,8 +50,11 @@ bytes = "1"
 tokio = { version = "1", features = ["full"] }
 
 # SSH server
-russh = "0.60"
-ssh-key = { version = "0.6", features = ["ed25519", "std"] }
+russh = "0.61"
+# Tracks the pre-release russh 0.61 pins exactly (=0.7.0-rc.10) so the
+# tree carries a single ssh-key. Drop the -rc once 0.7.0 final lands
+# and russh follows.
+ssh-key = { version = "0.7.0-rc.10", features = ["ed25519", "std"] }
 async-trait = "0.1"
 
 # gRPC
@@ -66,7 +69,7 @@ prost-types = "0.14"
 # connections without TLS are rejected. aws-lc-rs matches the workspace
 # rustls CryptoProvider (see `rustls` dep below and tonic's tls-aws-lc).
 # Connection strings use `?sslmode=require` (encrypt, don't verify cert).
-sqlx = { version = "0.8", default-features = false, features = [
+sqlx = { version = "0.9", default-features = false, features = [
   "runtime-tokio",
   "postgres",
   "sqlite",
@@ -79,7 +82,7 @@ sqlx = { version = "0.8", default-features = false, features = [
 uuid = { version = "1", features = ["v4", "v7"] }
 
 # S3
-aws-sdk-s3 = { version = "1.130", default-features = false, features = [
+aws-sdk-s3 = { version = "1.133", default-features = false, features = [
   "sigv4a",
   "http-1x",
   "default-https-client",
@@ -126,10 +129,10 @@ metrics-util = { version = "0.20", features = ["debugging"] }
 
 # OpenTelemetry (phase2b: full OTLP, not just stdout — milestone requires
 # "traces visible in Jaeger")
-tracing-opentelemetry = "0.32"
-opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.33"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
 
 # Configuration (phase2b: TOML + RIO_ env overlay). `test` enables
 # figment::Jail (env/cwd isolation under a global mutex) for the per-
@@ -142,8 +145,9 @@ figment = { version = "0.10", features = ["toml", "env", "test"] }
 # BuildExecution recv tasks outside the actor loop)
 dashmap = "6"
 # Per-tenant SlaEstimator fit cache (ADR-023 §Threat-model gap c).
-# Already transitive via aws-sdk-* (zero lockfile churn).
-lru = "0.16"
+# aws-sdk-* still pins 0.16.x transitively, so 0.18 carries a (tiny)
+# second copy until the SDK catches up.
+lru = "0.18"
 # Short on-stack vecs (ADR-023 §13a `dispatched_cells` A' set, |A'|≤4
 # typical). Already transitive via tokio/dashmap (zero lockfile churn).
 smallvec = "1"
@@ -339,7 +343,7 @@ xshell = "0.2"
 # detection for the ECR image tag. status/dirwalk covers both tracked
 # changes and untracked files (the push script hashes `git diff HEAD` +
 # `git status --porcelain`).
-gix = { version = "0.81", default-features = false, features = [
+gix = { version = "0.83", default-features = false, features = [
   "basic",
   "dirwalk",
   "revision",

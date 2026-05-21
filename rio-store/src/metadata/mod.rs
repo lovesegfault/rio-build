@@ -465,9 +465,10 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
         for code in ["57P01", "57P02", "57P03"] {
-            let err: MetadataError = sqlx::query(&format!(
+            // AssertSqlSafe: SQLSTATE code from the fixed array above, test-only.
+            let err: MetadataError = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DO $$ BEGIN RAISE EXCEPTION 'shutdown' USING ERRCODE = '{code}'; END $$"
-            ))
+            )))
             .execute(&db.pool)
             .await
             .unwrap_err()

@@ -188,18 +188,20 @@ let
   };
 
   # query! macros read .sqlx/*.json instead of connecting to PG at
-  # compile time. sqlx-macros-core 0.8.x finds the cache by (in order,
-  # short-circuiting find() — query/mod.rs:166-176 @ 0.8.6):
-  #   1. `offline_dir` parsed from a `.env` file at $CARGO_MANIFEST_DIR/.env
-  #      (load_dot_env, query/mod.rs:390-435 — the SQLX_OFFLINE_DIR *env
-  #      var* is NOT consulted on this path, only the .env file)
+  # compile time. sqlx-macros-core 0.9.x finds the cache by (in order,
+  # short-circuiting — query/mod.rs:97-117 @ 0.9.0):
+  #   1. SQLX_OFFLINE_DIR — real env var or `.env` at $CARGO_MANIFEST_DIR
+  #      (merged in query/metadata.rs:120-155; .env wins only when the
+  #      env var is unset, which is the case here)
   #   2. $CARGO_MANIFEST_DIR/.sqlx
   #   3. workspace_root().join(".sqlx") — spawns `$CARGO metadata`
   # buildRustCrate calls rustc directly (no cargo, no CARGO env var, no
   # workspace Cargo.lock), so (3) would need a fake `cargo` shim. (1) is
   # checked first and short-circuits — write the .env in postUnpack so
-  # the macro never reaches (3). Applied to every crate with
-  # `query!()`/`query_as!()` callsites.
+  # the macro never reaches (3). (Setting the env var directly on the
+  # derivation would also work on 0.9; the .env file is kept because it
+  # predates that and is already proven against this fileset layout.)
+  # Applied to every crate with `query!()`/`query_as!()` callsites.
   sqlxOffline = {
     SQLX_OFFLINE = "true";
     postUnpack = ''

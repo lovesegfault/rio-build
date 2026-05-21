@@ -78,7 +78,8 @@ async fn check_reference_epoch_guards_across_restarts() -> anyhow::Result<()> {
     assert_eq!(got.as_deref(), Some("amd-8-nvme"));
     assert_eq!(epoch, 1);
     for t in ["build_samples", "hw_perf_samples"] {
-        let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {t}"))
+        // AssertSqlSafe: table name from the fixed array above, test-only.
+        let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {t}")))
             .fetch_one(&test_db.pool)
             .await?;
         assert_eq!(n, 0, "{t} reset");

@@ -8,7 +8,7 @@
 
 use uuid::Uuid;
 
-use super::{SchedulerDb, TERMINAL_STATUS_SQL};
+use super::{SchedulerDb, terminal_status_sql};
 use crate::state::DrvHash;
 
 impl SchedulerDb {
@@ -157,17 +157,18 @@ impl SchedulerDb {
     /// dispatch but before unpin at completion).
     ///
     /// The subquery matches `load_nonterminal_derivations`' filter
-    /// (both interpolate `TERMINAL_STATUS_SQL`): a drv NOT in that
+    /// (both splice `terminal_status_sql!`): a drv NOT in that
     /// set is terminal (or deleted entirely).
     pub async fn sweep_stale_live_pins(&self) -> Result<u64, sqlx::Error> {
-        // format! of a compile-time const — no injection surface.
-        // See TERMINAL_STATUS_SQL doc for why this isn't a bind param.
-        let result = sqlx::query(&format!(
+        // Compile-time splice of the terminal-status tuple — see
+        // terminal_status_sql! for why it isn't a bind param.
+        let result = sqlx::query(terminal_status_sql!(
             r"
             DELETE FROM scheduler_live_pins
              WHERE drv_hash NOT IN (
                SELECT drv_hash FROM derivations
-                WHERE status NOT IN {TERMINAL_STATUS_SQL}
+                WHERE status NOT IN ",
+            r"
              )
             "
         ))

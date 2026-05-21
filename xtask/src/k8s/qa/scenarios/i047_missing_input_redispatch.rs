@@ -65,12 +65,11 @@ impl Scenario for MissingInputRedispatch {
 
         // Delete the dep output's narinfo. We don't know the exact
         // store_path (drv hash isn't returned), but the name is unique.
-        let n = sqlx::query(&format!(
-            "DELETE FROM narinfo WHERE store_path LIKE '%-{dep_tag}-%'"
-        ))
-        .execute(ctx.pg())
-        .await?
-        .rows_affected();
+        let n = sqlx::query("DELETE FROM narinfo WHERE store_path LIKE $1")
+            .bind(format!("%-{dep_tag}-%"))
+            .execute(ctx.pg())
+            .await?
+            .rows_affected();
         if n == 0 {
             return Ok(Verdict::Fail(format!(
                 "no narinfo matched '%-{dep_tag}-%' after building it — \

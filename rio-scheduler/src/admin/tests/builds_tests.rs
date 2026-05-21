@@ -257,13 +257,14 @@ async fn test_list_builds_cursor_pagination_walks_full_set() -> anyhow::Result<(
     // `250 - i` makes the FIRST-inserted rows OLDEST, matching real-world
     // submission order — not load-bearing for correctness, just intuitive
     // when debugging.
-    sqlx::query(&format!(
+    // AssertSqlSafe: interpolates two integer consts, test-only fixture.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO builds (build_id, status, priority_class, submitted_at)
          SELECT gen_random_uuid(), 'pending', 'scheduled',
                 now() - (({TOTAL} - i) / {per_bucket}) * interval '1 second'
          FROM generate_series(1, {TOTAL}) AS i",
         per_bucket = TOTAL / BUCKETS,
-    ))
+    )))
     .execute(&db.pool)
     .await?;
 

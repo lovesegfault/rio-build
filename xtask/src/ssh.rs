@@ -74,7 +74,10 @@ pub fn tenant_for_key(authorized_keys: &str, key: &PublicKey) -> Option<String> 
         .lines()
         .filter_map(|l| PublicKey::from_openssh(l).ok())
         .find(|k| k.key_data() == key.key_data())
-        .map(|k| k.comment().to_owned())
+        // ssh-key 0.7 comments are raw bytes; non-UTF-8 → None, same
+        // strict treatment the gateway applies (it degrades such an
+        // entry to single-tenant), so xtask and gateway agree.
+        .and_then(|k| k.comment().as_str().ok().map(str::to_owned))
         .filter(|c| !c.is_empty())
 }
 
@@ -123,8 +126,11 @@ pub fn privkey_path(cfg: &XtaskConfig) -> Result<PathBuf> {
 /// Generate a fresh ed25519 keypair with the given comment.
 /// Returns (private_openssh, public_openssh).
 pub fn generate(comment: &str) -> Result<(String, String)> {
-    let priv_key =
-        ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Ed25519)?;
+    // rand::rng() (not ssh_key::rand_core::OsRng): ssh-key 0.7 moved to
+    // the rand_core 0.10 lineage where OsRng is fallible (TryCryptoRng);
+    // ThreadRng satisfies the infallible bound and matches how the
+    // gateway generates its host key (rio-gateway/src/server/keys.rs).
+    let priv_key = ssh_key::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519)?;
     let mut pub_key = priv_key.public_key().clone();
     pub_key.set_comment(comment);
     Ok((

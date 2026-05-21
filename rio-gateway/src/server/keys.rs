@@ -237,7 +237,7 @@ mod tests {
         let keys = load_authorized_keys(tmp.path()).expect("should load");
         assert_eq!(keys.len(), 1);
         assert_eq!(
-            keys[0].comment(),
+            keys[0].comment().as_str()?,
             "team-infra",
             "comment field should be preserved from the authorized_keys line"
         );
@@ -256,7 +256,7 @@ mod tests {
         let keys = load_authorized_keys(tmp.path()).expect("should load");
         assert_eq!(keys.len(), 1);
         assert_eq!(
-            keys[0].comment(),
+            keys[0].comment().as_str()?,
             "",
             "no comment → empty string (single-tenant mode)"
         );

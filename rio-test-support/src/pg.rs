@@ -404,10 +404,14 @@ impl TestDb {
             .connect(&admin_url)
             .await
             .expect("failed to connect to test postgres admin database");
-        sqlx::query(&format!(r#"CREATE DATABASE "{db_name}""#))
-            .execute(&admin_pool)
-            .await
-            .expect("failed to create test database");
+        // AssertSqlSafe: DDL can't take bind parameters and `db_name` is
+        // generated above (nanos + counter), never caller-supplied.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            r#"CREATE DATABASE "{db_name}""#
+        )))
+        .execute(&admin_pool)
+        .await
+        .expect("failed to create test database");
         admin_pool.close().await;
 
         // Connect to the new database and migrate. Small pool: tests
@@ -469,16 +473,19 @@ impl Drop for TestDb {
                 else {
                     return;
                 };
-                // Kick any lingering connections, then drop.
-                let _ = sqlx::query(&format!(
+                // Kick any lingering connections, then drop. AssertSqlSafe:
+                // same rationale as TestDb::new — internal db_name, DDL.
+                let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
                     "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
                      WHERE datname = '{db_name}' AND pid <> pg_backend_pid()"
-                ))
+                )))
                 .execute(&admin_pool)
                 .await;
-                let _ = sqlx::query(&format!(r#"DROP DATABASE IF EXISTS "{db_name}""#))
-                    .execute(&admin_pool)
-                    .await;
+                let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                    r#"DROP DATABASE IF EXISTS "{db_name}""#
+                )))
+                .execute(&admin_pool)
+                .await;
                 admin_pool.close().await;
             });
         });

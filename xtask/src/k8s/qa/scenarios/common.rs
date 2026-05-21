@@ -255,7 +255,11 @@ impl<'a> PgCleanup<'a> {
         }
     }
     pub async fn run(self) -> Result<()> {
-        sqlx::query(&self.sql).execute(self.pg).await?;
+        // AssertSqlSafe: cleanup SQL is authored by the scenario itself
+        // (operator tooling), never derived from external input.
+        sqlx::query(sqlx::AssertSqlSafe(self.sql))
+            .execute(self.pg)
+            .await?;
         Ok(())
     }
 }

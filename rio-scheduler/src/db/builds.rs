@@ -2,11 +2,11 @@
 //!
 //! Also hosts the `list_builds` / `list_builds_keyset` admin-facing read
 //! queries (single-table since I-103). The shared SELECT clause lives in
-//! [`super::LIST_BUILDS_SELECT`].
+//! [`super::list_builds_select!`].
 
 use uuid::Uuid;
 
-use super::{BuildListRow, LIST_BUILDS_SELECT, SchedulerDb};
+use super::{BuildListRow, SchedulerDb, list_builds_select};
 use crate::state::{BuildState, BuildStateExt};
 
 impl SchedulerDb {
@@ -28,9 +28,8 @@ impl SchedulerDb {
         offset: i64,
     ) -> Result<(i64, Vec<BuildListRow>), sqlx::Error> {
         let total = self.count_builds(status_opt, tenant_filter).await?;
-        let rows: Vec<BuildListRow> = sqlx::query_as(&format!(
-            "{LIST_BUILDS_SELECT}
-            WHERE ($1::text IS NULL OR b.status = $1)
+        let rows: Vec<BuildListRow> = sqlx::query_as(list_builds_select!(
+            "WHERE ($1::text IS NULL OR b.status = $1)
               AND ($2::uuid IS NULL OR b.tenant_id = $2)
             ORDER BY b.submitted_at DESC, b.build_id DESC
             LIMIT $3 OFFSET $4"
@@ -85,9 +84,8 @@ impl SchedulerDb {
         cursor_micros: i64,
         cursor_id: Uuid,
     ) -> Result<Vec<BuildListRow>, sqlx::Error> {
-        sqlx::query_as(&format!(
-            "{LIST_BUILDS_SELECT}
-            WHERE ($1::text IS NULL OR b.status = $1)
+        sqlx::query_as(list_builds_select!(
+            "WHERE ($1::text IS NULL OR b.status = $1)
               AND ($2::uuid IS NULL OR b.tenant_id = $2)
               AND (b.submitted_at, b.build_id)
                   < ( to_timestamp($3::bigint / 1000000)
