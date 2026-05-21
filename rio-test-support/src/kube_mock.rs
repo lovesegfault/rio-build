@@ -1,16 +1,22 @@
 //! tower-test fixtures for kube::Client integration tests.
 //!
-//! Wraps kube's `Client::new(mock_service, ns)` pattern in a
-//! scenario-driven verifier: the test spells out what HTTP
-//! requests it EXPECTS the code under test to make (in order),
-//! and what to respond with. The verifier task drains requests
-//! one at a time, asserting method/path, sending canned JSON
-//! bodies.
+//! Two mocks with opposite philosophies:
+//!
+//! - [`ApiServerVerifier`] is a *scripted scenario queue*: the test
+//!   spells out what HTTP requests it EXPECTS the code under test to
+//!   make (in order) and what to respond with. The right tool for
+//!   "assert the client sent exactly these requests".
+//! - [`MockApiServer`] is a *stateful fake*: an in-memory Lease store
+//!   with real optimistic-concurrency semantics that serves any request
+//!   sequence correctly. The right tool for interleaved multi-client
+//!   races and model-based tests, where the request sequence is
+//!   generated rather than hand-planned.
 //!
 //! Extracted from rio-controller so rio-scheduler's lease
 //! election tests can share the same mock-apiserver plumbing.
 
 use std::pin::pin;
+use std::sync::{Arc, Mutex};
 
 use http::{Request, Response};
 use http_body_util::BodyExt;
@@ -232,6 +238,187 @@ impl ApiServerVerifier {
     }
 }
 
+/// A stateful in-memory mock of the `coordination.k8s.io` Lease API
+/// with real optimistic-concurrency semantics.
+///
+/// One lease, dispatched purely on HTTP method (the only object the
+/// lease-election code touches):
+///
+/// | Method | Behavior |
+/// |---|---|
+/// | GET    | 200 with the stored object, or a 404 Status. |
+/// | POST   | 409 if one exists, else store with `resourceVersion: "1"`. |
+/// | PUT    | 409 unless the submitted `metadata.resourceVersion` equals the stored one (**the CAS**), else store with the rv bumped. |
+/// | DELETE | clear the stored object; 200 if one existed, 404 otherwise. |
+///
+/// The handler task runs until the [`Client`] is dropped. The returned
+/// `MockApiServer` handle shares the stored state for inspection
+/// (assertions on who won a race) and out-of-band manipulation (an
+/// operator's `kubectl delete lease`, which is not something the code
+/// under test performs).
+pub struct MockApiServer {
+    state: Arc<Mutex<Option<serde_json::Value>>>,
+}
+
+impl MockApiServer {
+    /// Create a mock Client backed by a fresh, empty Lease store and
+    /// spawn the handler task. The task exits when the Client (and
+    /// every clone of it) is dropped.
+    pub fn new() -> (Client, Self) {
+        let (mock_service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let client = Client::new(mock_service, "default");
+        let state: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let task_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut handle = pin!(handle);
+            while let Some((request, send)) = handle.next_request().await {
+                let method = request.method().clone();
+                let body_bytes = request
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("request body collectible")
+                    .to_bytes();
+                let response = Self::handle(&task_state, &method, &body_bytes);
+                send.send_response(response);
+            }
+        });
+        (client, Self { state })
+    }
+
+    /// Dispatch one request against the stored state. Synchronous so the
+    /// mutex is never held across an await.
+    fn handle(
+        state: &Mutex<Option<serde_json::Value>>,
+        method: &http::Method,
+        body: &[u8],
+    ) -> Response<Body> {
+        let mut stored = state.lock().expect("mock apiserver state lock");
+        match *method {
+            http::Method::GET => match stored.as_ref() {
+                Some(obj) => Self::json(200, obj.to_string()),
+                None => Self::status(404, "NotFound", "lease not found"),
+            },
+            http::Method::POST => {
+                if stored.is_some() {
+                    return Self::status(409, "AlreadyExists", "lease already exists");
+                }
+                let mut obj: serde_json::Value =
+                    serde_json::from_slice(body).expect("POST body is a JSON Lease");
+                obj["metadata"]["resourceVersion"] = serde_json::Value::String("1".into());
+                let response = Self::json(201, obj.to_string());
+                *stored = Some(obj);
+                response
+            }
+            http::Method::PUT => {
+                let Some(current) = stored.as_ref() else {
+                    return Self::status(404, "NotFound", "lease not found");
+                };
+                let submitted: serde_json::Value =
+                    serde_json::from_slice(body).expect("PUT body is a JSON Lease");
+                // THE CAS: the apiserver admits the write only if the
+                // submitted resourceVersion matches the stored one.
+                let stored_rv = current["metadata"]["resourceVersion"]
+                    .as_str()
+                    .expect("stored lease has a resourceVersion");
+                let submitted_rv = submitted["metadata"]["resourceVersion"].as_str();
+                if submitted_rv != Some(stored_rv) {
+                    return Self::status(
+                        409,
+                        "Conflict",
+                        "the object has been modified; please apply your changes to the \
+                         latest version and try again",
+                    );
+                }
+                let next_rv = stored_rv
+                    .parse::<u64>()
+                    .expect("mock-assigned resourceVersion is numeric")
+                    + 1;
+                let mut obj = submitted;
+                obj["metadata"]["resourceVersion"] = serde_json::Value::String(next_rv.to_string());
+                let response = Self::json(200, obj.to_string());
+                *stored = Some(obj);
+                response
+            }
+            http::Method::DELETE => {
+                if stored.take().is_some() {
+                    Self::status(200, "Success", "lease deleted")
+                } else {
+                    Self::status(404, "NotFound", "lease not found")
+                }
+            }
+            ref other => Self::status(405, "MethodNotAllowed", &format!("{other} not handled")),
+        }
+    }
+
+    fn json(status: u16, body: String) -> Response<Body> {
+        Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(Body::from(body.into_bytes()))
+            .expect("valid response")
+    }
+
+    /// A `metav1.Status` envelope — what `kube::Error::Api` deserializes
+    /// from. `code` is what `is_conflict()` / `get_opt()`'s 404 handling
+    /// actually match on.
+    fn status(code: u16, reason: &str, message: &str) -> Response<Body> {
+        Self::json(
+            code,
+            serde_json::json!({
+                "kind": "Status",
+                "apiVersion": "v1",
+                "status": "Failure",
+                "reason": reason,
+                "code": code,
+                "message": message,
+            })
+            .to_string(),
+        )
+    }
+
+    /// The currently stored Lease object, if any. For test assertions on
+    /// who won a race.
+    pub fn stored(&self) -> Option<serde_json::Value> {
+        self.state
+            .lock()
+            .expect("mock apiserver state lock")
+            .clone()
+    }
+
+    /// The stored object's `spec.holderIdentity`, if a lease exists and
+    /// the field is set.
+    pub fn holder(&self) -> Option<String> {
+        self.stored()
+            .and_then(|o| o["spec"]["holderIdentity"].as_str().map(str::to_owned))
+    }
+
+    /// The stored object's `metadata.resourceVersion`, if a lease exists.
+    pub fn resource_version(&self) -> Option<String> {
+        self.stored()
+            .and_then(|o| o["metadata"]["resourceVersion"].as_str().map(str::to_owned))
+    }
+
+    /// Pre-populate the store with a lease (e.g. one held by a dead
+    /// third party, so two live replicas can race to steal it). The
+    /// caller supplies the full JSON object including
+    /// `metadata.resourceVersion`.
+    pub fn seed(&self, lease: serde_json::Value) {
+        *self.state.lock().expect("mock apiserver state lock") = Some(lease);
+    }
+
+    /// Clear the stored lease out of band — an operator's
+    /// `kubectl delete lease`, which the code under test never performs
+    /// itself.
+    pub fn clear(&self) -> bool {
+        self.state
+            .lock()
+            .expect("mock apiserver state lock")
+            .take()
+            .is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +447,129 @@ mod tests {
         assert_eq!(pod.metadata.name.as_deref(), Some("test-pod"));
 
         guard.verified().await;
+    }
+
+    // ---- MockApiServer: the optimistic-concurrency contract --------
+
+    use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
+    use kube::api::{ObjectMeta, PostParams};
+
+    fn lease(name: &str, holder: &str, rv: Option<&str>) -> Lease {
+        Lease {
+            metadata: ObjectMeta {
+                name: Some(name.into()),
+                resource_version: rv.map(str::to_owned),
+                ..Default::default()
+            },
+            spec: Some(LeaseSpec {
+                holder_identity: Some(holder.into()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn is_conflict(e: &kube::Error) -> bool {
+        matches!(e, kube::Error::Api(ae) if ae.code == 409)
+    }
+
+    /// POST creates exactly once: the second creator gets 409 and the
+    /// stored object is the first creator's.
+    #[tokio::test]
+    async fn mock_create_then_create_conflicts() {
+        let (client, mock) = MockApiServer::new();
+        let api: Api<Lease> = Api::default_namespaced(client);
+
+        api.create(&PostParams::default(), &lease("l", "n1", None))
+            .await
+            .expect("first create succeeds");
+        assert_eq!(mock.holder().as_deref(), Some("n1"));
+        assert_eq!(mock.resource_version().as_deref(), Some("1"));
+
+        let err = api
+            .create(&PostParams::default(), &lease("l", "n2", None))
+            .await
+            .expect_err("second create conflicts");
+        assert!(is_conflict(&err), "expected 409, got {err:?}");
+        assert_eq!(
+            mock.holder().as_deref(),
+            Some("n1"),
+            "loser did not clobber"
+        );
+    }
+
+    /// GET → PUT at the fetched resourceVersion succeeds and bumps the
+    /// rv; the stored object is the submitted one.
+    #[tokio::test]
+    async fn mock_replace_at_current_rv_succeeds_and_bumps() {
+        let (client, mock) = MockApiServer::new();
+        let api: Api<Lease> = Api::default_namespaced(client);
+        api.create(&PostParams::default(), &lease("l", "n1", None))
+            .await
+            .expect("create");
+
+        let fetched = api.get("l").await.expect("get");
+        let rv = fetched.metadata.resource_version.clone();
+        assert_eq!(rv.as_deref(), Some("1"));
+
+        api.replace(
+            "l",
+            &PostParams::default(),
+            &lease("l", "n2", rv.as_deref()),
+        )
+        .await
+        .expect("replace at the fetched rv succeeds");
+        assert_eq!(mock.holder().as_deref(), Some("n2"));
+        assert_eq!(mock.resource_version().as_deref(), Some("2"), "rv bumped");
+    }
+
+    /// PUT at a stale resourceVersion gets 409 and the stored object is
+    /// untouched — THE CAS.
+    #[tokio::test]
+    async fn mock_replace_at_stale_rv_conflicts_and_preserves() {
+        let (client, mock) = MockApiServer::new();
+        let api: Api<Lease> = Api::default_namespaced(client);
+        api.create(&PostParams::default(), &lease("l", "n1", None))
+            .await
+            .expect("create");
+        // Someone else writes: rv 1 → 2.
+        api.replace("l", &PostParams::default(), &lease("l", "n1", Some("1")))
+            .await
+            .expect("first replace");
+        assert_eq!(mock.resource_version().as_deref(), Some("2"));
+
+        // A write still carrying rv 1 must bounce.
+        let err = api
+            .replace("l", &PostParams::default(), &lease("l", "thief", Some("1")))
+            .await
+            .expect_err("stale rv conflicts");
+        assert!(is_conflict(&err), "expected 409, got {err:?}");
+        assert_eq!(
+            mock.holder().as_deref(),
+            Some("n1"),
+            "loser did not clobber"
+        );
+        assert_eq!(
+            mock.resource_version().as_deref(),
+            Some("2"),
+            "rv unchanged"
+        );
+    }
+
+    /// GET on an empty store is a 404 that `get_opt` maps to `None`;
+    /// DELETE clears the store.
+    #[tokio::test]
+    async fn mock_get_404_and_delete() {
+        let (client, mock) = MockApiServer::new();
+        let api: Api<Lease> = Api::default_namespaced(client);
+
+        assert!(api.get_opt("l").await.expect("get_opt").is_none());
+
+        api.create(&PostParams::default(), &lease("l", "n1", None))
+            .await
+            .expect("create");
+        assert!(api.get_opt("l").await.expect("get_opt").is_some());
+
+        assert!(mock.clear(), "clear reports a lease existed");
+        assert!(api.get_opt("l").await.expect("get_opt").is_none());
     }
 }

@@ -91,6 +91,31 @@ pub enum Decision {
     Standby,
 }
 
+/// The result of [`LeaderElection::fetch_and_decide`]: everything the
+/// act phase needs to finish the round-trip.
+///
+/// Carrying the fetched [`Lease`] (rather than re-fetching in the act
+/// phase) is load-bearing: the PUT's optimistic-concurrency guard is the
+/// `metadata.resourceVersion` of *this* GET, so a write that races in
+/// between the two phases is rejected with 409 — the CAS the formal
+/// model verifies as `casOk` / `atMostOneCASWinner`.
+#[derive(Debug)]
+pub(crate) enum FetchOutcome {
+    /// The GET returned 404 — no lease exists. The act phase POSTs a
+    /// fresh one (which itself races: the apiserver admits exactly one
+    /// creator, the rest get 409).
+    Create,
+    /// A lease exists and [`decide`] chose what to do with it. The
+    /// lease is carried for the act phase's rv-guarded PUT; on
+    /// `Decision::Standby` it is simply dropped. Boxed so the
+    /// payload-free `Create` variant doesn't pay for the largest
+    /// variant's size (`clippy::large_enum_variant`).
+    Decided {
+        decision: Decision,
+        lease: Box<Lease>,
+    },
+}
+
 /// client-go's "observed record": when did WE (this process, our
 /// monotonic clock) first see this `resourceVersion`? The
 /// apiserver bumps rv on every write (including renew), so a
@@ -354,10 +379,32 @@ impl LeaderElection {
     /// errors. The caller retries on `Err` without flipping
     /// `is_leader`; see `run_lease_loop`'s error arm.
     pub async fn try_acquire_or_renew(&mut self) -> Result<ElectionResult, kube::Error> {
-        // 1. GET. 404 → create and done.
+        let outcome = self.fetch_and_decide(Instant::now()).await?;
+        self.act(outcome).await
+    }
+
+    /// The GET + decide half of [`Self::try_acquire_or_renew`].
+    ///
+    /// Exists so the model-based tests can drive the round-trip at the
+    /// formal model's grain: `docs/spec/models/leaderElection.qnt` splits
+    /// the apiserver GET and the subsequent PUT into separate actions so
+    /// the two-replica CAS race (both GET the same resourceVersion, both
+    /// PUT, exactly one wins) is explorable. Production code must only
+    /// ever call the composition — a fetch whose outcome is never acted
+    /// on leaves `observed` updated but the lease untouched, which is a
+    /// state the lease loop never produces.
+    ///
+    /// `now` is the instant `decide()` measures observation staleness
+    /// against; the composition passes `Instant::now()`, the model-based
+    /// tests inject their mock clock.
+    pub(crate) async fn fetch_and_decide(
+        &mut self,
+        now: Instant,
+    ) -> Result<FetchOutcome, kube::Error> {
+        // 1. GET. 404 → no lease exists; the act phase POSTs one.
         let lease = match self.api.get_opt(&self.lease_name).await? {
             Some(l) => l,
-            None => return self.create().await,
+            None => return Ok(FetchOutcome::Create),
         };
 
         // 2. Decide. resource_version is always set on objects
@@ -378,14 +425,30 @@ impl LeaderElection {
             &mut self.observed,
             &self.holder_id,
             self.steal_after,
-            Instant::now(),
+            now,
         );
 
+        Ok(FetchOutcome::Decided {
+            decision,
+            lease: Box::new(lease),
+        })
+    }
+
+    /// The act half of [`Self::try_acquire_or_renew`]: POST a fresh
+    /// lease, PUT a renew/steal, or do nothing (standby). See
+    /// [`Self::fetch_and_decide`] for why the round-trip is split.
+    pub(crate) async fn act(
+        &mut self,
+        outcome: FetchOutcome,
+    ) -> Result<ElectionResult, kube::Error> {
         // 3. Act.
-        match decision {
-            Decision::Standby => Ok(ElectionResult::Standby),
-            Decision::Renew => self.replace(lease, false).await,
-            Decision::Steal => self.replace(lease, true).await,
+        match outcome {
+            FetchOutcome::Create => self.create().await,
+            FetchOutcome::Decided { decision, lease } => match decision {
+                Decision::Standby => Ok(ElectionResult::Standby),
+                Decision::Renew => self.replace(*lease, false).await,
+                Decision::Steal => self.replace(*lease, true).await,
+            },
         }
     }
 
@@ -856,6 +919,132 @@ mod tests {
         );
 
         guard.verified().await;
+    }
+
+    // ---- Interleaved CAS races (stateful mock apiserver) ----------
+    //
+    // These are the races the formal model explores over all
+    // interleavings (`docs/spec/models/leaderElection.qnt`'s `casOk` /
+    // `atMostOneCASWinner`) and the scripted `ApiServerVerifier` can
+    // never express: two replicas' GET and PUT phases interleave, and
+    // the apiserver's optimistic concurrency admits exactly one writer.
+    // Expressible only because `try_acquire_or_renew()` is split into
+    // `fetch_and_decide()` + `act()` at the model's grain.
+
+    use rio_test_support::kube_mock::MockApiServer;
+
+    fn election_against(client: kube::Client, holder_id: &str) -> LeaderElection {
+        LeaderElection::new(
+            client,
+            "default",
+            "rio-sched".into(),
+            holder_id.into(),
+            Duration::from_secs(15),
+            Duration::from_secs(19),
+        )
+    }
+
+    /// The create race: no lease exists, both replicas GET a 404, both
+    /// decide to create, exactly one POST wins.
+    // r[verify sched.lease.at-most-one-leader+3]
+    #[tokio::test]
+    async fn interleaved_create_race_admits_one_winner() {
+        let (client, mock) = MockApiServer::new();
+        let mut n1 = election_against(client.clone(), "n1");
+        let mut n2 = election_against(client, "n2");
+        let now = Instant::now();
+
+        // Both fetch before either acts: both see 404, both decide to
+        // create.
+        let o1 = n1.fetch_and_decide(now).await.expect("n1 fetch");
+        let o2 = n2.fetch_and_decide(now).await.expect("n2 fetch");
+        assert!(matches!(o1, FetchOutcome::Create), "n1 sees no lease");
+        assert!(matches!(o2, FetchOutcome::Create), "n2 sees no lease");
+
+        // n1's POST lands first and wins.
+        let r1 = n1.act(o1).await.expect("n1 act");
+        assert_eq!(r1, ElectionResult::Leading { transitions: 0 });
+
+        // n2's POST bounces off the existing object.
+        let r2 = n2.act(o2).await.expect("n2 act");
+        assert_eq!(r2, ElectionResult::Conflict, "exactly one creator wins");
+
+        assert_eq!(mock.holder().as_deref(), Some("n1"), "the winner holds it");
+        assert_eq!(mock.resource_version().as_deref(), Some("1"));
+    }
+
+    /// The steal race: a lease held by a dead third party, both replicas
+    /// snapshot the same resourceVersion, both decide to steal, exactly
+    /// one rv-guarded PUT wins and the loser's 409 leaves it untouched.
+    // r[verify sched.lease.at-most-one-leader+3]
+    #[tokio::test]
+    async fn interleaved_steal_race_admits_one_winner() {
+        let (client, mock) = MockApiServer::new();
+        mock.seed(
+            k8s_openapi::serde_json::from_str(&lease_json("dead-leader", 2, "100"))
+                .expect("seed lease json"),
+        );
+
+        let mut n1 = election_against(client.clone(), "n1");
+        let mut n2 = election_against(client, "n2");
+        // Both have watched rv 100 sit unchanged past the steal
+        // threshold.
+        let stale = Instant::now() - Duration::from_secs(20);
+        n1.observed = Some(Observed {
+            resource_version: "100".into(),
+            at: stale,
+        });
+        n2.observed = Some(Observed {
+            resource_version: "100".into(),
+            at: stale,
+        });
+        let now = Instant::now();
+
+        // Both fetch before either acts: both snapshot rv 100, both
+        // decide Steal.
+        let o1 = n1.fetch_and_decide(now).await.expect("n1 fetch");
+        let o2 = n2.fetch_and_decide(now).await.expect("n2 fetch");
+        assert!(
+            matches!(
+                &o1,
+                FetchOutcome::Decided {
+                    decision: Decision::Steal,
+                    ..
+                }
+            ),
+            "n1 decides to steal the stale lease"
+        );
+        assert!(
+            matches!(
+                &o2,
+                FetchOutcome::Decided {
+                    decision: Decision::Steal,
+                    ..
+                }
+            ),
+            "n2 decides to steal the stale lease"
+        );
+
+        // n1's PUT at rv 100 lands first: wins, bumps transitions 2→3,
+        // bumps the rv.
+        let r1 = n1.act(o1).await.expect("n1 act");
+        assert_eq!(r1, ElectionResult::Leading { transitions: 3 });
+        assert_eq!(n1.observed, None, "the winner clears its observed record");
+
+        // n2's PUT still carries rv 100 — the CAS rejects it.
+        let r2 = n2.act(o2).await.expect("n2 act");
+        assert_eq!(r2, ElectionResult::Conflict, "exactly one thief wins");
+        assert!(
+            n2.observed.is_some(),
+            "the loser's observed record is untouched — it keeps watching"
+        );
+
+        assert_eq!(mock.holder().as_deref(), Some("n1"), "the winner holds it");
+        assert_eq!(
+            mock.resource_version().as_deref(),
+            Some("101"),
+            "the winning PUT bumped the rv exactly once"
+        );
     }
 }
 
