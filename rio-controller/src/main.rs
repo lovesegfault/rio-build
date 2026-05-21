@@ -404,7 +404,7 @@ mod tests {
         CliArgs::command().debug_assert();
     }
 
-    // figment::Jail standing-guard tests — see rio-test-support/src/config.rs.
+    // Jailed standing-guard tests — see rio-test-support/src/config.rs.
     // When you add Config.newfield: ADD IT to both assert blocks below.
 
     rio_test_support::jail_roundtrip!(

@@ -2,7 +2,7 @@
 //!
 //! Two distinct clusters that share the mock-apiserver fixtures:
 //!
-//! - figment::Jail env-propagation tests — prove
+//! - jailed env-propagation tests — prove
 //!   `build_pod_spec` injects `LLVM_PROFILE_FILE`/`RUST_LOG`
 //!   from the controller's own env (coverage-mode passthrough)
 //! - P0365's `warn_on_spec_degrades` event-reason tests — prove the
@@ -92,15 +92,14 @@ fn ephemeral_reconcile_scenarios() -> Vec<Scenario> {
 // -------------------------------------------------------------------
 // Coverage propagation (builders.rs LLVM_PROFILE_FILE check).
 //
-// figment::Jail serializes env access (global mutex) so parallel
-// tests don't see each other's set_env/remove_var. Same pattern
-// as rio-scheduler/src/lease.rs tests.
+// rio_test_support::Jail serializes env access (global mutex) so
+// parallel tests don't see each other's set_env/remove_var. Same
+// pattern as rio-scheduler/src/lease.rs tests.
 // -------------------------------------------------------------------
 
 #[test]
-#[allow(clippy::result_large_err)] // figment::Error is large, API-fixed
-fn coverage_propagated_when_controller_env_set() -> figment::error::Result<()> {
-    figment::Jail::expect_with(|jail| {
+fn coverage_propagated_when_controller_env_set() {
+    rio_test_support::Jail::expect_with(|jail| {
         jail.set_env("LLVM_PROFILE_FILE", "/var/lib/rio/cov/ctrl-%p-%m.profraw");
 
         let wp = test_wp();
@@ -140,13 +139,11 @@ fn coverage_propagated_when_controller_env_set() -> figment::error::Result<()> {
 
         Ok(())
     });
-    Ok(())
 }
 
 #[test]
-#[allow(clippy::result_large_err)]
-fn rust_log_propagated_verbatim() -> figment::error::Result<()> {
-    figment::Jail::expect_with(|jail| {
+fn rust_log_propagated_verbatim() {
+    rio_test_support::Jail::expect_with(|jail| {
         jail.set_env("RUST_LOG", "info,rio_builder=debug");
 
         let wp = test_wp();
@@ -166,13 +163,11 @@ fn rust_log_propagated_verbatim() -> figment::error::Result<()> {
 
         Ok(())
     });
-    Ok(())
 }
 
 #[test]
-#[allow(clippy::result_large_err)]
-fn rust_log_absent_when_controller_env_unset() -> figment::error::Result<()> {
-    figment::Jail::expect_with(|_jail| {
+fn rust_log_absent_when_controller_env_unset() {
+    rio_test_support::Jail::expect_with(|_jail| {
         // SAFETY: Jail's global mutex serializes env access.
         unsafe {
             std::env::remove_var("RUST_LOG");
@@ -190,13 +185,11 @@ fn rust_log_absent_when_controller_env_unset() -> figment::error::Result<()> {
 
         Ok(())
     });
-    Ok(())
 }
 
 #[test]
-#[allow(clippy::result_large_err)]
-fn coverage_absent_when_controller_env_unset() -> figment::error::Result<()> {
-    figment::Jail::expect_with(|_jail| {
+fn coverage_absent_when_controller_env_unset() {
+    rio_test_support::Jail::expect_with(|_jail| {
         // SAFETY: Jail serializes env access via a global mutex — no
         // other thread touches LLVM_PROFILE_FILE while we're here.
         // std::env::remove_var is unsafe in Rust 2024 for the general
@@ -229,7 +222,6 @@ fn coverage_absent_when_controller_env_unset() -> figment::error::Result<()> {
 
         Ok(())
     });
-    Ok(())
 }
 
 // =========================================================

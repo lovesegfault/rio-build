@@ -1220,11 +1220,10 @@ mod tests {
     /// the env vec — the index assertion is structural (catches a
     /// future reorder that would silently break expansion).
     #[test]
-    #[allow(clippy::result_large_err)] // figment::Error is 208B, API-fixed
     fn coverage_profraw_path_per_pod_unique() {
-        // figment Jail serializes env access across parallel tests
-        // (same pattern as the lease-config tests).
-        figment::Jail::expect_with(|jail| {
+        // rio_test_support::Jail serializes env access across parallel
+        // tests (same pattern as the lease-config tests).
+        rio_test_support::Jail::expect_with(|jail| {
             jail.set_env("LLVM_PROFILE_FILE", "/dev/null");
             let pool = crate::fixtures::test_pool("p", ExecutorKind::Builder);
             let c = build_executor_container(
