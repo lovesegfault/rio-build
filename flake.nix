@@ -716,6 +716,12 @@
                   docsLib
                   ;
                 xtaskBin = crateBuild.memberBins.xtask;
+                # Quint + bundled Apalache from the out-of-band nixpkgs
+                # pin (see the nixpkgs-quint input comment). The same
+                # memoized thunk the dev shell binds — referencing the
+                # flake input's legacyPackages twice does not evaluate
+                # the second nixpkgs twice.
+                quintPkg = inputs.nixpkgs-quint.legacyPackages.${system}.quint;
               };
 
               # Container images (Linux-only — dockerTools uses Linux VM

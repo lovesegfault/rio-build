@@ -24,6 +24,10 @@
   nodeAmi,
   docsLib,
   xtaskBin,
+  # Quint + bundled Apalache from the `nixpkgs-quint` flake input (NOT
+  # `pkgs` — the primary nixpkgs' quint is too old to verify offline).
+  # Only nix/quint.nix's checks consume it.
+  quintPkg,
 }:
 let
   # Regenerate-then-diff drift check. `generate` populates
@@ -943,5 +947,12 @@ in
 # without an intermediate red gate. See nix/tla.nix.
 // (import ./tla.nix {
   inherit pkgs unfilteredRoot;
+  inherit (pkgs) lib;
+}).checks
+# Quint checks for the same models directory — the successor toolchain
+# to nix/tla.nix (typed source, the same exhaustive TLC checking under
+# `--backend=tlc`). Gated on the .qnt file existing, same as above.
+// (import ./quint.nix {
+  inherit pkgs unfilteredRoot quintPkg;
   inherit (pkgs) lib;
 }).checks
