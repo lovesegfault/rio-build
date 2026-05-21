@@ -8,7 +8,7 @@
 //!
 //! `query!(...)` macros (compile-time SQL checking) read from `.sqlx/`
 //! (committed, regenerated via `cargo xtask regen sqlx`). The
-//! [`terminal_status_sql!`]-spliced callsites are permanent exceptions —
+//! `terminal_status_sql!`-spliced callsites are permanent exceptions —
 //! `query!` requires a string literal, and the planner needs the literal
 //! for partial-index proof; the splice macro keeps those queries
 //! `&'static str` so they still satisfy sqlx 0.9's `SqlSafeStr` bound.
