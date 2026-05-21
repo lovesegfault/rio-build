@@ -268,6 +268,22 @@ pub enum MockBehavior {
     Hang,
 }
 
+/// The stored side of [`MockApiServer`]: at most one Lease object plus
+/// the resourceVersion source the handler stamps writes from.
+// r[impl ts.kube.lease-cas]
+#[derive(Default)]
+struct LeaseStore {
+    /// The currently stored Lease object, if any.
+    stored: Option<serde_json::Value>,
+    /// Monotonic resourceVersion source mirroring the etcd global
+    /// revision: the highest rv ever issued (or seeded) by this
+    /// instance. Never reset, not even by DELETE/[`MockApiServer::clear`],
+    /// so a recreated lease always takes a fresh rv and a snapshot of a
+    /// previous incarnation can never pass the CAS again — exactly how a
+    /// real apiserver behaves across delete/recreate.
+    next_rv: u64,
+}
+
 /// A stateful in-memory mock of the `coordination.k8s.io` Lease API
 /// with real optimistic-concurrency semantics.
 ///
@@ -277,9 +293,17 @@ pub enum MockBehavior {
 /// | Method | Behavior |
 /// |---|---|
 /// | GET    | 200 with the stored object, or a 404 Status. |
-/// | POST   | 409 if one exists, else store with `resourceVersion: "1"`. |
+/// | POST   | 409 if one exists, else store with the next resourceVersion from the monotonic counter. |
 /// | PUT    | 409 unless the submitted `metadata.resourceVersion` equals the stored one (**the CAS**), else store with the rv bumped. |
 /// | DELETE | clear the stored object; 200 if one existed, 404 otherwise. |
+///
+/// resourceVersions come from a per-instance monotonic counter that
+/// survives DELETE and [`clear`](Self::clear) — like the etcd global
+/// revision behind a real apiserver. A recreated lease therefore always
+/// carries a strictly larger rv than every rv of the previous
+/// incarnation, so a snapshot taken before the deletion can never pass
+/// the PUT CAS against the recreated object (the model's `deleteLease`
+/// encodes the same property).
 ///
 /// The table above is the [`MockBehavior::Healthy`] dispatch (the
 /// default). [`set_behavior`](Self::set_behavior) switches the whole
@@ -295,7 +319,7 @@ pub enum MockBehavior {
 /// operator's `kubectl delete lease`, which is not something the code
 /// under test performs).
 pub struct MockApiServer {
-    state: Arc<Mutex<Option<serde_json::Value>>>,
+    state: Arc<Mutex<LeaseStore>>,
     /// How the handler task answers requests; see [`MockBehavior`].
     /// Shared with the handler task so [`set_behavior`](Self::set_behavior)
     /// applies to every request pulled after the store.
@@ -309,7 +333,7 @@ impl MockApiServer {
     pub fn new() -> (Client, Self) {
         let (mock_service, handle) = mock::pair::<Request<Body>, Response<Body>>();
         let client = Client::new(mock_service, "default");
-        let state: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let state = Arc::new(Mutex::new(LeaseStore::default()));
         let behavior = Arc::new(Mutex::new(MockBehavior::default()));
         let task_state = Arc::clone(&state);
         let task_behavior = Arc::clone(&behavior);
@@ -359,30 +383,28 @@ impl MockApiServer {
 
     /// Dispatch one request against the stored state. Synchronous so the
     /// mutex is never held across an await.
-    fn handle(
-        state: &Mutex<Option<serde_json::Value>>,
-        method: &http::Method,
-        body: &[u8],
-    ) -> Response<Body> {
-        let mut stored = state.lock().expect("mock apiserver state lock");
+    fn handle(state: &Mutex<LeaseStore>, method: &http::Method, body: &[u8]) -> Response<Body> {
+        let mut store = state.lock().expect("mock apiserver state lock");
         match *method {
-            http::Method::GET => match stored.as_ref() {
+            http::Method::GET => match store.stored.as_ref() {
                 Some(obj) => Self::json(200, obj.to_string()),
                 None => Self::status(404, "NotFound", "lease not found"),
             },
             http::Method::POST => {
-                if stored.is_some() {
+                if store.stored.is_some() {
                     return Self::status(409, "AlreadyExists", "lease already exists");
                 }
                 let mut obj: serde_json::Value =
                     serde_json::from_slice(body).expect("POST body is a JSON Lease");
-                obj["metadata"]["resourceVersion"] = serde_json::Value::String("1".into());
+                store.next_rv += 1;
+                obj["metadata"]["resourceVersion"] =
+                    serde_json::Value::String(store.next_rv.to_string());
                 let response = Self::json(201, obj.to_string());
-                *stored = Some(obj);
+                store.stored = Some(obj);
                 response
             }
             http::Method::PUT => {
-                let Some(current) = stored.as_ref() else {
+                let Some(current) = store.stored.as_ref() else {
                     return Self::status(404, "NotFound", "lease not found");
                 };
                 let submitted: serde_json::Value =
@@ -401,18 +423,19 @@ impl MockApiServer {
                          latest version and try again",
                     );
                 }
-                let next_rv = stored_rv
-                    .parse::<u64>()
-                    .expect("mock-assigned resourceVersion is numeric")
-                    + 1;
+                store.next_rv += 1;
                 let mut obj = submitted;
-                obj["metadata"]["resourceVersion"] = serde_json::Value::String(next_rv.to_string());
+                obj["metadata"]["resourceVersion"] =
+                    serde_json::Value::String(store.next_rv.to_string());
                 let response = Self::json(200, obj.to_string());
-                *stored = Some(obj);
+                store.stored = Some(obj);
                 response
             }
             http::Method::DELETE => {
-                if stored.take().is_some() {
+                // Drop the object only — next_rv keeps counting so the
+                // next incarnation's rv stays above every rv this one
+                // ever handed out.
+                if store.stored.take().is_some() {
                     Self::status(200, "Success", "lease deleted")
                 } else {
                     Self::status(404, "NotFound", "lease not found")
@@ -454,6 +477,7 @@ impl MockApiServer {
         self.state
             .lock()
             .expect("mock apiserver state lock")
+            .stored
             .clone()
     }
 
@@ -473,18 +497,31 @@ impl MockApiServer {
     /// Pre-populate the store with a lease (e.g. one held by a dead
     /// third party, so two live replicas can race to steal it). The
     /// caller supplies the full JSON object including
-    /// `metadata.resourceVersion`.
+    /// `metadata.resourceVersion`, which must be a numeric string — it
+    /// raises the monotonic rv counter to at least that value, so
+    /// subsequent writes bump from the seeded rv. Re-seeding a LOWER rv
+    /// after prior activity leaves the counter at its high-water mark:
+    /// later writes may skip numbers but never go backwards.
     pub fn seed(&self, lease: serde_json::Value) {
-        *self.state.lock().expect("mock apiserver state lock") = Some(lease);
+        let seeded_rv = lease["metadata"]["resourceVersion"]
+            .as_str()
+            .and_then(|rv| rv.parse::<u64>().ok())
+            .expect("seeded metadata.resourceVersion must be present and numeric");
+        let mut store = self.state.lock().expect("mock apiserver state lock");
+        store.next_rv = store.next_rv.max(seeded_rv);
+        store.stored = Some(lease);
     }
 
     /// Clear the stored lease out of band — an operator's
     /// `kubectl delete lease`, which the code under test never performs
-    /// itself.
+    /// itself. The rv counter is NOT reset (it mirrors the etcd global
+    /// revision), so a lease created after the clear takes a strictly
+    /// larger resourceVersion than anything handed out before it.
     pub fn clear(&self) -> bool {
         self.state
             .lock()
             .expect("mock apiserver state lock")
+            .stored
             .take()
             .is_some()
     }
@@ -523,7 +560,7 @@ mod tests {
     // ---- MockApiServer: the optimistic-concurrency contract --------
 
     use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
-    use kube::api::{ObjectMeta, PostParams};
+    use kube::api::{DeleteParams, ObjectMeta, PostParams};
 
     fn lease(name: &str, holder: &str, rv: Option<&str>) -> Lease {
         Lease {
@@ -642,5 +679,120 @@ mod tests {
 
         assert!(mock.clear(), "clear reports a lease existed");
         assert!(api.get_opt("l").await.expect("get_opt").is_none());
+    }
+
+    /// A snapshot taken before an HTTP DELETE can never pass the CAS
+    /// against the recreated lease: the recreated incarnation takes a
+    /// strictly larger resourceVersion (the rv source survives the
+    /// deletion, mirroring the etcd global revision), so the stale PUT
+    /// 409s instead of clobbering the new holder.
+    // r[verify ts.kube.lease-cas]
+    #[tokio::test]
+    async fn mock_recreate_after_delete_rejects_pre_deletion_snapshot() {
+        let (client, mock) = MockApiServer::new();
+        let api: Api<Lease> = Api::default_namespaced(client);
+
+        api.create(&PostParams::default(), &lease("l", "n1", None))
+            .await
+            .expect("first create succeeds");
+        let stale_rv = api
+            .get("l")
+            .await
+            .expect("get")
+            .metadata
+            .resource_version
+            .expect("created lease carries a resourceVersion");
+
+        api.delete("l", &DeleteParams::default())
+            .await
+            .expect("delete of an existing lease succeeds");
+        assert!(mock.stored().is_none(), "delete empties the store");
+
+        api.create(&PostParams::default(), &lease("l", "n2", None))
+            .await
+            .expect("recreate succeeds");
+
+        let stale: u64 = stale_rv.parse().expect("stale resourceVersion is numeric");
+        let recreated: u64 = mock
+            .resource_version()
+            .expect("recreated lease carries a resourceVersion")
+            .parse()
+            .expect("recreated resourceVersion is numeric");
+        assert!(
+            recreated > stale,
+            "recreated lease must take a strictly larger resourceVersion \
+             (stale {stale}, recreated {recreated})"
+        );
+
+        let err = api
+            .replace(
+                "l",
+                &PostParams::default(),
+                &lease("l", "n1", Some(&stale_rv)),
+            )
+            .await
+            .expect_err("a pre-deletion snapshot rv must not pass the CAS");
+        assert!(is_conflict(&err), "expected 409, got {err:?}");
+        assert_eq!(
+            mock.holder().as_deref(),
+            Some("n2"),
+            "the stale writer did not clobber the recreated lease"
+        );
+    }
+
+    /// Same property through `clear()` — the out-of-band
+    /// `kubectl delete lease` analogue: the resourceVersion source
+    /// survives, so a pre-clear snapshot can never pass the CAS against
+    /// the recreated lease.
+    // r[verify ts.kube.lease-cas]
+    #[tokio::test]
+    async fn mock_recreate_after_clear_rejects_pre_deletion_snapshot() {
+        let (client, mock) = MockApiServer::new();
+        let api: Api<Lease> = Api::default_namespaced(client);
+
+        api.create(&PostParams::default(), &lease("l", "n1", None))
+            .await
+            .expect("first create succeeds");
+        let stale_rv = api
+            .get("l")
+            .await
+            .expect("get")
+            .metadata
+            .resource_version
+            .expect("created lease carries a resourceVersion");
+
+        assert!(mock.clear(), "clear reports a lease existed");
+        assert!(mock.stored().is_none(), "clear empties the store");
+
+        api.create(&PostParams::default(), &lease("l", "n2", None))
+            .await
+            .expect("recreate succeeds");
+
+        let stale: u64 = stale_rv.parse().expect("stale resourceVersion is numeric");
+        let recreated: u64 = mock
+            .resource_version()
+            .expect("recreated lease carries a resourceVersion")
+            .parse()
+            .expect("recreated resourceVersion is numeric");
+        assert!(
+            recreated > stale,
+            "recreated lease must take a strictly larger resourceVersion \
+             (stale {stale}, recreated {recreated})"
+        );
+
+        let err = api
+            .replace(
+                "l",
+                &PostParams::default(),
+                &lease("l", "n1", Some(&stale_rv)),
+            )
+            .await
+            .expect_err("a pre-clear snapshot rv must not pass the CAS");
+        assert!(is_conflict(&err), "expected 409, got {err:?}");
+        assert_eq!(
+            mock.holder().as_deref(),
+            Some("n2"),
+            "the stale writer did not clobber the recreated lease"
+        );
     }
 }

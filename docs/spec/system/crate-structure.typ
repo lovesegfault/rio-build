@@ -200,6 +200,10 @@ Notable edges:
     )[`ApiServerVerifier::run` returns a `VerifierGuard` drop-bomb: dropping it without calling `.verified().await` panics. `Scenario::ok` and `Scenario::k8s_error` are the two response shorthands; `k8s_error` emits the `metav1.Status` envelope that `kube::Error::Api` deserializes from. `Scenario.body_contains` optionally asserts on request-body substrings.]
 
     #r(
+      "ts.kube.lease-cas",
+    )[`MockApiServer` enforces the apiserver's optimistic-concurrency contract: PUT is admitted only when the submitted `metadata.resourceVersion` equals the stored one, and resourceVersions are assigned from a per-instance monotonic counter that survives DELETE and `clear()`, so a resourceVersion is never reused across delete/recreate and a snapshot of a deleted incarnation can never pass the CAS against the recreated lease.]
+
+    #r(
       "ts.fixtures.builders",
     )[`fixtures` provides `rand_store_hash()` (32 random nixbase32 chars, distinct per call — use when scheduler dedup must NOT short-circuit), `make_derivation_node`/`make_edge` (DAG builders keyed on a tag), `make_nar`/`make_large_nar`/`make_path_info_for_nar` (NAR + ValidatedPathInfo builders), `pseudo_random_bytes` (FastCDC-friendly deterministic content), and `seed_store_output` (writes a file under `{tmp}/nix/store/{basename}` for builder upload/FOD tests).]
 
