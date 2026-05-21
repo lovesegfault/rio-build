@@ -2,6 +2,7 @@
 paths:
   - "docs/spec/models/**/*.qnt"
   - "nix/quint.nix"
+  - "**/mbt_tests.rs"
 ---
 
 # Quint specification rules
@@ -149,6 +150,51 @@ failed.** Re-run with `--verbosity=3`, count the `[Frame N]` lines to find the l
 that executed, then check every `.expect()` after that frame against the dumped state.
 Reproduce a random-simulation violation with `--seed=<0x…>` from the failure output.
 
+## MBT (model-based testing) — conformance between the model and the implementation
+
+The model checks prove the *protocol*; the MBT layer proves the *implementation is that
+protocol*: quint generates traces from the spec, a Rust driver replays every step against the
+real components, and the implementation's projected state is diffed against the model's after
+each one. `rio-lease/src/mbt_tests.rs` (driver + projection + tests) and the `mbt-rio-lease`
+check in `nix/quint.nix` are the exemplar — copy that shape. The full pattern for a component
+whose state machine multiple actors observe concurrently:
+
+1. **Model the protocol** in `docs/spec/models/<name>.qnt` (core module + one instantiation
+   module per fault regime, ceilings as preconditions, witness per invariant).
+2. **Verify it exhaustively** with `mkQuintCheck`, one check per regime.
+3. **Write the MBT driver** against the healthy regime: the action `switch!`, the state
+   projection, named runs for the known-critical scenarios, one seeded simulation.
+4. **Kani** the pure decision functions the model abstracts over.
+5. **One VM subtest** for the end-to-end integration the mocks cannot reach.
+
+Rules the rio-lease driver established (the reasoning lives in its module header):
+
+- **Every action reachable from `step` must be a named action — recursively.** quint's `--mbt`
+  tracker records the *innermost* `any` disjunct's name; an anonymous `all {…}` nested inside
+  any disjunct makes the whole step anonymous and undrivable. Name nested disjunctions as
+  their own actions (the model's `claimOk`/`claimFails`) and re-verify the state-count
+  regression — a naming refactor must not change the transition relation.
+- **Grain-match the implementation to the model.** One model action ↔ one implementation call
+  the driver can make. Split composed operations behind `pub(crate)` seams (rio-lease's
+  `fetch_and_decide`/`act`); the public API stays the composition. The split is a feature: it
+  makes the races the model explores expressible as plain Rust tests.
+- **The projection is the abstraction function.** Project only what the implementation
+  observably realizes; omit model-only history/bookkeeping variables, and justify every
+  omission in a comment next to the projection struct.
+- **Determinism policy.** The simulation's seed is pinned in the test attribute (an input,
+  not a measurement). Unseeded exploration is a local activity — pin any seed that finds a
+  divergence. Named runs are deterministic by construction.
+- **Tooling reality.** `#[quint_run]` (simulation) is the quint-connect macro path that works.
+  `quint test` cannot emit `--mbt` instrumentation, so named-run replay parses
+  `quint test --out-itf` traces directly via the `itf` crate and mirrors the run's action
+  sequence in Rust.
+- **The mbt tests are `#[ignore]`d** (they shell out to `quint`). The dedicated check stages
+  the model into the nextest workspace and runs them with `--run-ignored`; editing the model
+  re-runs the conformance check — that coupling is the point.
+- **A divergence is a finding to classify** — driver bug vs genuine model↔implementation
+  mismatch — never something to paper over in the driver. Genuine mismatches get written down
+  (the driver's module-header findings list) and either fixed or explicitly scoped out.
+
 ## Review checklist (Quint-specific; generic spec review still applies)
 
 - [ ] Every `var` is assigned in `init` and in every branch of every action.
@@ -178,7 +224,9 @@ Reproduce a random-simulation violation with `--seed=<0x…>` from the failure o
   are shared-register CAS races against the apiserver, not message-passing. Revisit when
   modeling a genuinely message-passing protocol (the builder↔scheduler heartbeat/assignment
   stream is the likely first candidate).
-- **The `/code:*` spec-to-implementation workflow and MBT (`label-transitions`)**: a later
-  adoption phase, after a Quint model is canonical for some component.
+- **The kit's `/code:*` spec-to-implementation workflow and `label-transitions` tooling**:
+  rio-build's MBT goes through quint-connect instead (see the MBT section above); revisit the
+  kit's tooling only if a future component needs transition labeling quint-connect cannot
+  express.
 - **The kit's Docker container and MCP servers**: rio-build uses the nix dev shell; the KB is
   consumed by grepping the cloned repo.
