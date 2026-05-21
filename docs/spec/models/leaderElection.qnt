@@ -1160,3 +1160,74 @@ module leaderElectionBase {
     MAX_RESTORES = 0
   ).*
 }
+
+// =========================================================================
+// The Lease-object-deletion fault regime: MAX_DELETES = 1, everything
+// else identical to leaderElectionBase (see that module for the
+// coverage-vs-cost argument behind the shared constants).
+//
+// The fault (the deleteLease action; see its doc comment for the
+// mechanics): `kubectl delete lease` is a documented operational remedy
+// for a stuck election in the Kubernetes ecosystem. The recreated
+// object's leaseTransitions counter restarts from 0 -- destroying the
+// epoch source the generation derivation reads -- while its
+// resourceVersion keeps counting (a recreated apiserver object takes a
+// fresh rv from the global etcd revision; resetting the model's rv
+// would let a stale snapshot pass the CAS and report a violation no
+// real apiserver admits). PG survives. That asymmetry -- the Lease's
+// epoch source resets while PG's does not -- is the one fault that
+// re-arms the generation-collision failure mode the transition-count
+// derivation closed.
+//
+// What this regime proves: the write-ahead claim (genHW advancing
+// inside steal/renewLease's acquire edge, before dispatch is ungated)
+// is what survives the deletion. The next steal of the recreated lease
+// seeds from the PG floor, which covers every generation ever
+// ACQUIRED -- not just every generation that happened to be persisted
+// on an assignment row before its holder was deposed.
+//
+// RED-FIRST PROCEDURE (re-verify after any change to steal's or
+// renewLease's generation/claim encoding; the violation depths and the
+// state counts are measurements and live in the introducing commit's
+// message, not here):
+//   - The claim is LOAD-BEARING under deletion: revert steal's genHW
+//     update to leave the floor unchanged (the pre-claim protocol,
+//     where the floor advanced only at a lazy dispatch-time persist a
+//     deposed leader never reaches) and staleLeaderHasStaleGeneration
+//     is falsified with a shallow trace -- steal, delete, steal: both
+//     believers derive the same generation because both acquisitions
+//     see the recreated lease's reset transition count and the same
+//     stale floor. If a constant change makes the claim-reverted model
+//     pass, the constants no longer reach the deletion collision and
+//     must be revisited.
+//   - boundedDualLeadership's fourth disjunct (the delVictims arm) is
+//     LOAD-BEARING: deleteLease deposes a holder that has no snapshot
+//     and a fresh fence, and the empty-holder steal branch lets a
+//     second node acquire immediately (no STEAL_AFTER observation
+//     wait) -- a dual with none of the steal-path discovery mechanisms
+//     armed. Removing the fourth disjunct falsifies the invariant.
+//   - renewLease's claim-path arm (seeded = genHW + 1 when the floor
+//     exceeds what the lease and the Arc gave us) is LOAD-BEARING here
+//     and only here: after a deletion the recreated lease's transition
+//     count no longer encodes a recovered holder's generation, so the
+//     entry half alone under-restores it to the deletion victim's
+//     generation. See renewLease's doc comment, case 3.
+//   - staleLeaderHasStaleGeneration's holder-exists/holderless split
+//     exists for this regime: deleting the Lease out from under an
+//     existing dual produces a state where NEITHER believer holds it.
+// =========================================================================
+module leaderElectionDeletion {
+  import leaderElection(
+    NODES = Set("n1", "n2"),
+    FENCE_AFTER = 3,
+    STEAL_AFTER = 3,
+    RENEW = 1,
+    MAX_SKEW = 1,
+    MAX_TIME = 8,
+    MAX_GEN = 4,
+    MAX_RV = 8,
+    MAX_DELETES = 1,
+    MAX_CLAIM_FAILURES = 0,
+    MAX_RESTORES = 0
+  ).*
+}

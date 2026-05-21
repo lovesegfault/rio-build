@@ -21,18 +21,19 @@
 #   - `tlc`: transpiles the spec to TLA+ and runs TLC's parallel BFS over
 #     the FULL reachable state space — the same checker, the same
 #     exhaustive guarantee, and the same all-cores parallelism as
-#     nix/tla.nix's mkTlcCheck. Measured on the CAS fragment: 264
-#     distinct states, depth 14, queue empty, ~1s. This is the CI
-#     backend.
+#     nix/tla.nix's mkTlcCheck. This is the CI backend.
 #   - `apalache` (quint's own default if no --backend is given — which is
 #     exactly why this constructor must default to `tlc`): bounded
 #     symbolic model checking via one Z3 context, incrementally unrolled.
-#     Single-threaded and superlinear in the step bound — measured 45s at
-#     10 steps and >20min (killed, unfinished) at 20 steps on the same
-#     CAS fragment. It proves "no violation within maxSteps steps", not
-#     "no violation". Use it only for a property that is shallow by
-#     construction, or in the dev loop where finding a depth-4
-#     counterexample in 3s beats waiting for the exhaustive run.
+#     Single-threaded, and its cost is superlinear in the step bound —
+#     measured at adoption time as an order of magnitude slower than the
+#     tlc backend at its default 10-step bound and unable to complete a
+#     20-step bound on a spec the tlc backend exhausts in under a second
+#     (the figures are in the evaluation record and the introducing
+#     commits). It proves "no violation within maxSteps steps", not "no
+#     violation". Use it only for a property that is shallow by
+#     construction, or in the dev loop where finding a shallow
+#     counterexample in seconds beats waiting for the exhaustive run.
 #
 # The tlc backend requires a FINITE state space: every variable that can
 # grow without bound (a counter, a resourceVersion, a clock) needs a
@@ -177,11 +178,11 @@ in
       # optimistic concurrency makes unconditional). Cross-validated
       # against the TLA+ reference, which carries the same marker until
       # the migration replaces it. This check doubles as the permanent
-      # quint-toolchain smoke test: it is small enough (~264 states, ~1s)
-      # that "the quint toolchain is broken" is caught at merge-gate
-      # rather than at the next model change, the same role cov-smoke
-      # plays for the coverage pipeline. The second invariant exists to
-      # keep the multi-invariant (--invariant=a,b) code path exercised.
+      # quint-toolchain smoke test: it is by far the smallest model here,
+      # so "the quint toolchain is broken" is caught at merge-gate rather
+      # than at the next model change, the same role cov-smoke plays for
+      # the coverage pipeline. The second invariant exists to keep the
+      # multi-invariant (--invariant=a,b) code path exercised.
       # r[verify sched.lease.at-most-one-leader+3]
       quint-cas-smoke = mkQuintCheck {
         name = "cas-smoke";
@@ -227,6 +228,35 @@ in
         name = "leader-election";
         spec = "leaderElection";
         main = "leaderElectionBase";
+        invariants = [
+          "boundsOK"
+          "clockSkewBound"
+          "atMostOneCASWinner"
+          "loopInterval"
+          "boundedDualLeadership"
+          "staleLeaderHasStaleGeneration"
+        ];
+      };
+
+      # The same model with the Lease-object-deletion fault enabled
+      # (MAX_DELETES = 1): `kubectl delete lease` resets the
+      # leaseTransitions counter the generation derives from — the one
+      # fault that re-arms the generation-collision failure mode the
+      # transition-count derivation closed — while PG survives. The
+      # write-ahead claim (the generation is durably recorded in PG's
+      # claims ledger inside the acquisition step, before dispatch is
+      # ungated) is what survives it: the checker proves
+      # staleLeaderHasStaleGeneration still holds with the fault
+      # injected, and the deliberately-weakened run (the claim reverted
+      # to the pre-claim protocol) is falsified with a shallow
+      # steal-delete-steal trace — two believers at the same generation.
+      # See leaderElectionDeletion's module comment for the red-first
+      # procedure and the rest of the regime's non-vacuity evidence.
+      # r[verify sched.lease.generation-claim]
+      quint-leader-election-deletion = mkQuintCheck {
+        name = "leader-election-deletion";
+        spec = "leaderElection";
+        main = "leaderElectionDeletion";
         invariants = [
           "boundsOK"
           "clockSkewBound"
