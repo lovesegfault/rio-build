@@ -8853,8 +8853,7 @@
         "type": "crates-io"
       },
       "resolvedDefaultFeatures": [
-        "arch",
-        "default"
+        "arch"
       ],
       "libCrateTypes": [
         "lib"
@@ -9629,12 +9628,6 @@
       "source": {
         "type": "crates-io"
       },
-      "dependencies": [
-        {
-          "name": "libm",
-          "packageId": "libm"
-        }
-      ],
       "buildDependencies": [
         {
           "name": "autocfg",
@@ -9644,7 +9637,6 @@
       "resolvedDefaultFeatures": [
         "default",
         "i128",
-        "libm",
         "std"
       ],
       "libCrateTypes": [
@@ -19771,11 +19763,6 @@
         },
         {
           "name": "getrandom",
-          "packageId": "getrandom 0.2.17",
-          "rename": "getrandom_6f8ce4dd05d13bba"
-        },
-        {
-          "name": "getrandom",
           "packageId": "getrandom 0.3.4",
           "rename": "getrandom_468e82937335b1c9"
         },
@@ -19868,10 +19855,6 @@
         {
           "name": "libc",
           "packageId": "libc"
-        },
-        {
-          "name": "libm",
-          "packageId": "libm"
         },
         {
           "name": "libsqlite3-sys",
@@ -20355,11 +20338,6 @@
         },
         {
           "name": "getrandom",
-          "packageId": "getrandom 0.2.17",
-          "rename": "getrandom_6f8ce4dd05d13bba"
-        },
-        {
-          "name": "getrandom",
           "packageId": "getrandom 0.3.4",
           "rename": "getrandom_468e82937335b1c9"
         },
@@ -20452,10 +20430,6 @@
         {
           "name": "libc",
           "packageId": "libc"
-        },
-        {
-          "name": "libm",
-          "packageId": "libm"
         },
         {
           "name": "libsqlite3-sys",

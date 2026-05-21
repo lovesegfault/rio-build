@@ -343,8 +343,12 @@ parking_lot = "0.12"
 # that fits mem=M(cores) per (pname,system) key. default-features off drops
 # rand/serde/macros — we only need DMatrix/DVector + decompositions.
 nalgebra = { version = "0.34", default-features = false, features = ["std"] }
-# Normal/Student-t CDF (Φ, t.ppf) for the SLA quantile bounds.
-statrs = "0.18"
+# Normal/Student-t CDF + quantile functions (Φ, Φ⁻¹, t.ppf) for the SLA
+# quantile bounds. Replaces statrs (no release since 2024; its default
+# features dragged a second nalgebra plus rand 0.8 for multivariate/
+# sampling code we never call). distrs is exactly these two
+# distributions (AS 241 + Hill's t-quantiles); only dep is libm.
+distrs = "0.2"
 
 # Testing
 proptest = "1"

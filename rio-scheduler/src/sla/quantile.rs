@@ -3,20 +3,28 @@
 //! `ε~N(0,σ²)`. Deterministic — finite-sum CDF + log-space bisection,
 //! no Monte Carlo.
 
-use statrs::distribution::{ContinuousCDF, Normal};
+/// Standard-normal CDF Φ. Thin wrapper so the distribution crate is a
+/// single seam — values are golden-pinned in `normal_cdf_ppf_golden`.
+fn phi(z: f64) -> f64 {
+    distrs::Normal::cdf(z, 0.0, 1.0)
+}
+
+/// Standard-normal quantile Φ⁻¹ (Wichura AS 241 via distrs).
+fn phi_inv(q: f64) -> f64 {
+    distrs::Normal::ppf(q, 0.0, 1.0)
+}
 
 /// CDF of `T_total` at `x`. Truncates the geometric tail at
 /// `p^k < 1e-6` (≤20 terms for p≤0.5). `p=0` collapses to the pure
 /// lognormal `Φ(ln(x/t)/σ)`.
 pub(super) fn cdf(x: f64, t: f64, sigma: f64, p: f64) -> f64 {
     let sigma = sigma.max(1e-3);
-    let n01 = Normal::standard();
     if p == 0.0 {
-        return n01.cdf((x / t).ln() / sigma);
+        return phi((x / t).ln() / sigma);
     }
     let k_max = ((1e-6f64).ln() / p.ln()).ceil() as usize;
     (1..=k_max)
-        .map(|k| (1.0 - p) * p.powi(k as i32 - 1) * n01.cdf((x / (k as f64 * t)).ln() / sigma))
+        .map(|k| (1.0 - p) * p.powi(k as i32 - 1) * phi((x / (k as f64 * t)).ln() / sigma))
         .sum()
 }
 
@@ -40,8 +48,7 @@ pub fn quantile(q: f64, t: f64, sigma: f64, p: f64, z_q: f64) -> f64 {
         // (ADR-023 alg-quantile L600).
         return t * (sigma * z_q).exp();
     }
-    let n01 = Normal::standard();
-    let ppf_q = n01.inverse_cdf(q);
+    let ppf_q = phi_inv(q);
     let sigma_p = if ppf_q.abs() < 1e-9 {
         sigma
     } else {
@@ -110,11 +117,10 @@ mod tests {
     #[test]
     fn quantile_monotone_in_q() {
         let (t, sigma, p) = (100.0, 0.2, 0.3);
-        let n01 = Normal::standard();
         let qs = [0.5, 0.7, 0.9, 0.95, 0.99];
         let xs: Vec<f64> = qs
             .iter()
-            .map(|&q| quantile(q, t, sigma, p, n01.inverse_cdf(q)))
+            .map(|&q| quantile(q, t, sigma, p, phi_inv(q)))
             .collect();
         for w in xs.windows(2) {
             assert!(w[0] < w[1], "non-monotone: {xs:?}");
@@ -132,6 +138,19 @@ mod tests {
         }
     }
 
+    /// Golden values (scipy.stats.norm) pinning Φ/Φ⁻¹ across
+    /// distribution-crate changes — a swap that shifted these would
+    /// silently move every SLA quantile.
+    #[test]
+    fn normal_cdf_ppf_golden() {
+        assert!((phi(0.0) - 0.5).abs() < 1e-12);
+        assert!((phi(1.0) - 0.841_344_746_068_542_9).abs() < 1e-9);
+        assert!((phi(-1.959_963_984_540_054) - 0.025).abs() < 1e-9);
+        assert!(phi_inv(0.5).abs() < 1e-12);
+        assert!((phi_inv(0.9) - Z90).abs() < 1e-9);
+        assert!((phi_inv(0.975) - 1.959_963_984_540_054).abs() < 1e-9);
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(256))]
         #[test]
@@ -142,7 +161,7 @@ mod tests {
             p in 0.0..0.49f64,
         ) {
             // z_q = Φ⁻¹(q) ⇒ σ' = σ (uninflated), so cdf(σ) round-trips.
-            let zq = Normal::standard().inverse_cdf(q);
+            let zq = phi_inv(q);
             let x = quantile(q, t, sigma, p, zq);
             let cq = cdf(x, t, sigma, p);
             // Bisection halts at ln(hi/lo)<1e-3 ⇒ x within 0.1%; CDF slope

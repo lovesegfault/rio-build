@@ -2017,7 +2017,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
- "libm",
 ]
 
 [[package]]
@@ -4345,7 +4344,6 @@ dependencies = [
  "futures-sink",
  "futures-util",
  "generic-array",
- "getrandom 0.2.17",
  "getrandom 0.3.4",
  "getrandom 0.4.2",
  "hashbrown 0.16.1",
@@ -4363,7 +4361,6 @@ dependencies = [
  "kube-client",
  "kube-core",
  "libc",
- "libm",
  "libsqlite3-sys",
  "log",
  "memchr",

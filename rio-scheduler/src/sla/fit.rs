@@ -1,5 +1,4 @@
 use nalgebra::{DMatrix, DVector};
-use statrs::distribution::{ContinuousCDF, StudentsT};
 
 use super::types::{DurationFit, FitDf, MemBytes, MemFit, RawCores, RefSeconds, RingNEff};
 
@@ -35,7 +34,8 @@ pub fn sample_weight(ordinal_age: u32, vdist: u32) -> f64 {
 /// under uniform unit weights).
 pub fn z_q(q: f64, fit_df: FitDf, n_distinct_c: u32, n_par: u32, sum_w: f64) -> f64 {
     let df = (fit_df.0.min(f64::from(n_distinct_c)) - f64::from(n_par)).max(3.0);
-    let t = StudentsT::new(0.0, 1.0, df).expect("df ≥ 3").inverse_cdf(q);
+    // Hill's t-quantile (distrs); golden-pinned in `t_ppf_golden`.
+    let t = distrs::StudentsT::ppf(q, df);
     t * (1.0 + 1.0 / sum_w.max(1.0)).sqrt()
 }
 
@@ -418,6 +418,22 @@ pub fn sigma_resid(cs: &[f64], ts: &[f64], w: &[f64], fit: &DurationFit) -> f64 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Golden values (scipy.stats.t.ppf) pinning the Student-t quantile
+    /// across distribution-crate changes — `z_q` scales every SLA bound.
+    ///
+    /// Tolerance 5e-5: distrs implements Hill's Algorithm 396, whose
+    /// absolute error at the df=3 floor is ~2e-5 (it is ≤1e-8 for
+    /// df ≥ 10). That is ~0.001% of z_q — far below what the sizing
+    /// bound can resolve — while still failing loudly on a wrong tail,
+    /// wrong df, or wrong algorithm (those are off by ≥1e-2).
+    #[test]
+    fn t_ppf_golden() {
+        assert!((distrs::StudentsT::ppf(0.9, 3.0) - 1.637_744_353_696_210_2).abs() < 5e-5);
+        assert!((distrs::StudentsT::ppf(0.95, 3.0) - 2.353_363_434_801_826_4).abs() < 5e-5);
+        assert!((distrs::StudentsT::ppf(0.975, 10.0) - 2.228_138_851_964_938_5).abs() < 5e-5);
+        assert!((distrs::StudentsT::ppf(0.9, 30.0) - 1.310_415_025_391_374_2).abs() < 5e-5);
+    }
 
     #[test]
     fn kish_n_eff_uniform() {

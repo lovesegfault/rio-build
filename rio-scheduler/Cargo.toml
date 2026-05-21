@@ -126,7 +126,7 @@ lru = { workspace = true }
 # ADR-023: NNLS fit + Φ/Student-t quantiles for SLA-driven sizing.
 # See sla/fit.rs.
 nalgebra = { workspace = true }
-statrs = { workspace = true }
+distrs = { workspace = true }
 # ADR-023 §4.2: weighted-case-pairs bootstrap for T_min CI (sla/bootstrap.rs).
 # StdRng seeded from sample content → reproducible CI per fit.
 rand = { workspace = true }

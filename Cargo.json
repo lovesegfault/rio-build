@@ -505,7 +505,6 @@
         }
       ],
       "resolvedDefaultFeatures": [
-        "default",
         "std"
       ],
       "libCrateTypes": [
@@ -5837,6 +5836,21 @@
       "procMacro": true,
       "authors": [
         "Jane Lusby <jlusby@yaah.dev>"
+      ]
+    },
+    "distrs": {
+      "crateName": "distrs",
+      "version": "0.2.3",
+      "edition": "2018",
+      "sha256": "1a9k32hpjq8agwl54rnp3ks8vbji7vv733mq4fda8nl8i9id61i9",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Andrew Kane <andrew@ankane.org>"
       ]
     },
     "dotenvy": {
@@ -14209,8 +14223,7 @@
         "type": "crates-io"
       },
       "resolvedDefaultFeatures": [
-        "arch",
-        "default"
+        "arch"
       ],
       "libCrateTypes": [
         "lib"
@@ -15125,69 +15138,7 @@
         "Håvar Nøvik <havar.novik@gmail.com>"
       ]
     },
-    "nalgebra 0.33.3": {
-      "crateName": "nalgebra",
-      "version": "0.33.3",
-      "edition": "2018",
-      "sha256": "1zdbhacayfy7nrkapbr22qqc5cg8v63ffbnysvgqac9lrz5dshwx",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "approx",
-          "packageId": "approx"
-        },
-        {
-          "name": "matrixmultiply",
-          "packageId": "matrixmultiply"
-        },
-        {
-          "name": "num-complex",
-          "packageId": "num-complex"
-        },
-        {
-          "name": "num-rational",
-          "packageId": "num-rational"
-        },
-        {
-          "name": "num-traits",
-          "packageId": "num-traits"
-        },
-        {
-          "name": "rand",
-          "packageId": "rand 0.8.6",
-          "rename": "rand_package"
-        },
-        {
-          "name": "rand_distr",
-          "packageId": "rand_distr"
-        },
-        {
-          "name": "simba",
-          "packageId": "simba"
-        },
-        {
-          "name": "typenum",
-          "packageId": "typenum"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "matrixmultiply",
-        "rand",
-        "rand-no-std",
-        "rand-package",
-        "rand_distr",
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Sébastien Crozet <developer@crozet.re>"
-      ]
-    },
-    "nalgebra 0.34.2": {
+    "nalgebra": {
       "crateName": "nalgebra",
       "version": "0.34.2",
       "edition": "2024",
@@ -15629,12 +15580,6 @@
       "source": {
         "type": "crates-io"
       },
-      "dependencies": [
-        {
-          "name": "libm",
-          "packageId": "libm"
-        }
-      ],
       "buildDependencies": [
         {
           "name": "autocfg",
@@ -15644,7 +15589,6 @@
       "resolvedDefaultFeatures": [
         "default",
         "i128",
-        "libm",
         "std"
       ],
       "libCrateTypes": [
@@ -17755,7 +17699,7 @@
         },
         {
           "name": "rand_chacha",
-          "packageId": "rand_chacha 0.9.0"
+          "packageId": "rand_chacha"
         },
         {
           "name": "rand_xorshift",
@@ -18410,46 +18354,6 @@
         "The Rust Project Developers"
       ]
     },
-    "rand 0.8.6": {
-      "crateName": "rand",
-      "version": "0.8.6",
-      "edition": "2018",
-      "sha256": "12kd4rljn86m00rcaz4c1rcya4mb4gk5ig6i8xq00a8wjgxfr82w",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "libc",
-          "packageId": "libc",
-          "target": "cfg(unix)"
-        },
-        {
-          "name": "rand_chacha",
-          "packageId": "rand_chacha 0.3.1"
-        },
-        {
-          "name": "rand_core",
-          "packageId": "rand_core 0.6.4"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "alloc",
-        "default",
-        "getrandom",
-        "libc",
-        "rand_chacha",
-        "std",
-        "std_rng"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "The Rand Project Developers",
-        "The Rust Project Developers"
-      ]
-    },
     "rand 0.9.4": {
       "crateName": "rand",
       "version": "0.9.4",
@@ -18461,7 +18365,7 @@
       "dependencies": [
         {
           "name": "rand_chacha",
-          "packageId": "rand_chacha 0.9.0"
+          "packageId": "rand_chacha"
         },
         {
           "name": "rand_core",
@@ -18485,37 +18389,7 @@
         "The Rust Project Developers"
       ]
     },
-    "rand_chacha 0.3.1": {
-      "crateName": "rand_chacha",
-      "version": "0.3.1",
-      "edition": "2018",
-      "sha256": "123x2adin558xbhvqb8w4f6syjsdkmqff8cxwhmjacpsl1ihmhg6",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "ppv-lite86",
-          "packageId": "ppv-lite86"
-        },
-        {
-          "name": "rand_core",
-          "packageId": "rand_core 0.6.4"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "The Rand Project Developers",
-        "The Rust Project Developers",
-        "The CryptoCorrosion Contributors"
-      ]
-    },
-    "rand_chacha 0.9.0": {
+    "rand_chacha": {
       "crateName": "rand_chacha",
       "version": "0.9.0",
       "edition": "2021",
@@ -18611,31 +18485,6 @@
       "authors": [
         "The Rand Project Developers",
         "The Rust Project Developers"
-      ]
-    },
-    "rand_distr": {
-      "crateName": "rand_distr",
-      "version": "0.4.3",
-      "edition": "2018",
-      "sha256": "0cgfwg3z0pkqhrl0x90c77kx70r6g9z4m6fxq9v0h2ibr2dhpjrj",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "num-traits",
-          "packageId": "num-traits"
-        },
-        {
-          "name": "rand",
-          "packageId": "rand 0.8.6"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "The Rand Project Developers"
       ]
     },
     "rand_xorshift": {
@@ -20493,6 +20342,10 @@
           "packageId": "dashmap"
         },
         {
+          "name": "distrs",
+          "packageId": "distrs"
+        },
+        {
           "name": "futures-util",
           "packageId": "futures-util"
         },
@@ -20522,7 +20375,7 @@
         },
         {
           "name": "nalgebra",
-          "packageId": "nalgebra 0.34.2"
+          "packageId": "nalgebra"
         },
         {
           "name": "ordered-float",
@@ -20599,10 +20452,6 @@
         {
           "name": "sqlx",
           "packageId": "sqlx"
-        },
-        {
-          "name": "statrs",
-          "packageId": "statrs"
         },
         {
           "name": "strum",
@@ -24739,44 +24588,6 @@
       ],
       "authors": [
         "Nikolai Vazquez"
-      ]
-    },
-    "statrs": {
-      "crateName": "statrs",
-      "version": "0.18.0",
-      "edition": "2021",
-      "sha256": "0pikgp74gg9a3jp2hhh5z6wdfjn96gdkahw7n1kff4k5ik1ffgra",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "approx",
-          "packageId": "approx"
-        },
-        {
-          "name": "nalgebra",
-          "packageId": "nalgebra 0.33.3"
-        },
-        {
-          "name": "num-traits",
-          "packageId": "num-traits"
-        },
-        {
-          "name": "rand",
-          "packageId": "rand 0.8.6"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "default",
-        "nalgebra",
-        "rand"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Michael Ma"
       ]
     },
     "stringprep": {
@@ -29346,11 +29157,6 @@
         },
         {
           "name": "getrandom",
-          "packageId": "getrandom 0.2.17",
-          "rename": "getrandom_6f8ce4dd05d13bba"
-        },
-        {
-          "name": "getrandom",
           "packageId": "getrandom 0.3.4",
           "rename": "getrandom_468e82937335b1c9"
         },
@@ -29443,10 +29249,6 @@
         {
           "name": "libc",
           "packageId": "libc"
-        },
-        {
-          "name": "libm",
-          "packageId": "libm"
         },
         {
           "name": "libsqlite3-sys",
@@ -29552,7 +29354,7 @@
         },
         {
           "name": "rand_chacha",
-          "packageId": "rand_chacha 0.9.0"
+          "packageId": "rand_chacha"
         },
         {
           "name": "regex",
@@ -29930,11 +29732,6 @@
         },
         {
           "name": "getrandom",
-          "packageId": "getrandom 0.2.17",
-          "rename": "getrandom_6f8ce4dd05d13bba"
-        },
-        {
-          "name": "getrandom",
           "packageId": "getrandom 0.3.4",
           "rename": "getrandom_468e82937335b1c9"
         },
@@ -30027,10 +29824,6 @@
         {
           "name": "libc",
           "packageId": "libc"
-        },
-        {
-          "name": "libm",
-          "packageId": "libm"
         },
         {
           "name": "libsqlite3-sys",
@@ -30136,7 +29929,7 @@
         },
         {
           "name": "rand_chacha",
-          "packageId": "rand_chacha 0.9.0"
+          "packageId": "rand_chacha"
         },
         {
           "name": "regex",

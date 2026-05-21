@@ -49,7 +49,6 @@ futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std", "wasm_js"] }
-getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["js", "std"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
 hex = { version = "0.4" }
@@ -64,13 +63,12 @@ kube = { version = "3", default-features = false, features = ["aws-lc-rs", "deri
 kube-client = { version = "3", default-features = false, features = ["aws-lc-rs", "jsonpatch", "rustls-tls", "ws"] }
 kube-core = { version = "3", default-features = false, features = ["jsonpatch", "schema", "ws"] }
 libc = { version = "0.2", features = ["extra_traits"] }
-libm = { version = "0.2" }
 libsqlite3-sys = { version = "0.30", default-features = false, features = ["bundled", "pkg-config", "unlock_notify", "vcpkg"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
 metrics-util = { version = "0.20" }
 num-integer = { version = "0.1", features = ["i128"] }
-num-traits = { version = "0.2", features = ["i128", "libm"] }
+num-traits = { version = "0.2", features = ["i128"] }
 once_cell = { version = "1" }
 ordered-float = { version = "5" }
 p256 = { version = "0.14.0-rc.9", features = ["ecdh"] }
@@ -170,7 +168,6 @@ futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std", "wasm_js"] }
-getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["js", "std"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
 hex = { version = "0.4" }
@@ -185,13 +182,12 @@ kube = { version = "3", default-features = false, features = ["aws-lc-rs", "deri
 kube-client = { version = "3", default-features = false, features = ["aws-lc-rs", "jsonpatch", "rustls-tls", "ws"] }
 kube-core = { version = "3", default-features = false, features = ["jsonpatch", "schema", "ws"] }
 libc = { version = "0.2", features = ["extra_traits"] }
-libm = { version = "0.2" }
 libsqlite3-sys = { version = "0.30", default-features = false, features = ["bundled", "pkg-config", "unlock_notify", "vcpkg"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
 metrics-util = { version = "0.20" }
 num-integer = { version = "0.1", features = ["i128"] }
-num-traits = { version = "0.2", features = ["i128", "libm"] }
+num-traits = { version = "0.2", features = ["i128"] }
 once_cell = { version = "1" }
 ordered-float = { version = "5" }
 p256 = { version = "0.14.0-rc.9", features = ["ecdh"] }
