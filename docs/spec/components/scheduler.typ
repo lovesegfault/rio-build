@@ -244,12 +244,18 @@ per-build state ring, and rendered as `SetPhase` into every interested
 tenant's terminal — multiplied by the derivation's interested-build count).
 Bounding per field rather than lowering the global decode limit preserves the
 per-field semantics: advisory messages are rejected whole, a
-`CompletionReport` is never rejected (a lost completion strands the
-derivation in `Running`) so its oversized fields are truncated or nulled
-instead, and a rejected heartbeat reaps the worker by design. Phase
+`CompletionReport` whose `drv_path` could name a live assignment is never
+rejected (a lost completion strands the derivation in `Running`) so its
+oversized payload fields are truncated or nulled instead, and a rejected
+heartbeat reaps the worker by design. The one completion-side rejection is
+the `drv_path` bound itself: a path longer than any valid store path can
+never name a live assignment, so dropping the report whole at the recv arm
+is the actor's inevitable unknown-derivation discard moved off the
+single-threaded event loop — no legitimate completion is lost. Phase
 rejections increment #(refs.metric)("rio_scheduler_phases_rejected_total")
-with reason `phase_too_long`; completion rejections increment
-#(refs.metric)("rio_scheduler_completions_rejected_total").
+with reason `phase_too_long`; the unresolvable-path completion drop
+increments #(refs.metric)("rio_scheduler_completions_rejected_total") with
+reason `path_too_long`.
 
 #r("sched.merge.exec-correlation+7")[
   The scheduler MUST set `build_derivations.exec_id` for every interested

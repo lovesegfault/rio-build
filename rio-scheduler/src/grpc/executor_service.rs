@@ -55,12 +55,15 @@ const MAX_DRVS_PER_STREAM: usize = 8;
 // or their nested messages, add a row — an unlisted field is a review
 // rejection. Three enforcement styles:
 //   reject   — drop the message / fail the RPC. For advisory messages
-//              (Phase, Ack, LogBatch) and for the heartbeat (a rejected
-//              heartbeat reaps the worker — the designed recovery).
+//              (Phase, Ack, LogBatch), for the heartbeat (a rejected
+//              heartbeat reaps the worker — the designed recovery), and for
+//              CompletionReport.drv_path (an over-bound path can never name
+//              a live assignment — see the comment at the recv arm).
 //   truncate — bound the field in place, keep the message. For
-//              CompletionReport (which must never be silently dropped —
-//              a lost completion strands the derivation in Running) and
-//              for LogBatch fields that must still reach the ring/forward.
+//              CompletionReport payload fields (the report itself must reach
+//              the actor — a lost completion strands the derivation in
+//              Running) and for LogBatch fields that must still reach the
+//              ring/forward.
 //   document — left at the gRPC decode cap, with the verified reason
 //              (decoded then dropped before any retention).
 //
