@@ -180,12 +180,93 @@ let
           } \
           "$src/${spec}.qnt" 2>&1 | tee $out
       '';
+
+  # The dual of mkQuintCheck: an expect-violation (non-vacuity) check.
+  # `quint verify` runs against a single witness predicate of the form
+  # "the interesting thing never happens", and the check PASSES only
+  # when the checker reports a violation -- machine-checked evidence
+  # that the scenario is still reachable in that regime's explored
+  # space. A witness that stops being violated means the regime's
+  # headline invariant has gone vacuous (the contention it constrains
+  # can no longer arise), which previously surfaced only as
+  # "re-verify by hand after a constant change" notes in the model's
+  # module comments.
+  #
+  # One witness per check: a conjunction of witnesses is violated as
+  # soon as ANY conjunct is, so a reachable witness would mask an
+  # unreachable one.
+  #
+  # Failure modes are distinguished: "no violation found" (the vacuity
+  # signal) and tool errors (typecheck failure, checker crash) both
+  # fail, with different messages -- success requires the checker's own
+  # violation report in the transcript, not just a nonzero exit.
+  #
+  # tlc backend only: TLC stops at the first violation, so these runs
+  # are far cheaper than the exhaustive proofs (timings live in each
+  # check's transcript and the introducing commit's message).
+  mkQuintWitnessCheck =
+    {
+      name,
+      spec,
+      main ? spec,
+      # The witness `val` expected to be violated.
+      witness,
+    }:
+    pkgs.runCommand "quint-${name}"
+      {
+        nativeBuildInputs = [ quintPkg ];
+        # Same single-file narrowing as mkQuintCheck.
+        src = lib.fileset.toSource {
+          root = modelsDir;
+          fileset = modelsDir + "/${spec}.qnt";
+        };
+        env = {
+          MODEL = spec;
+          MAIN = main;
+          WITNESS = witness;
+        };
+      }
+      ''
+        set -euo pipefail
+        cd "$TMPDIR"
+
+        # Same worker bound as mkQuintCheck (see its comment).
+        workers="''${NIX_BUILD_CORES:-1}"
+        [ "$workers" = "0" ] && workers='"auto"'
+        printf '{"workers": %s}\n' "$workers" > tlc-config.json
+
+        # The violation is the EXPECTED outcome, so the verify call's
+        # nonzero exit must not abort the script -- run it as an `if`
+        # condition. The transcript (including the counterexample trace,
+        # which is the reachability evidence) is the check's output.
+        if quint verify \
+          --backend=tlc \
+          --main=${main} \
+          --invariant=${witness} \
+          --tlc-config=tlc-config.json \
+          "$src/${spec}.qnt" 2>&1 | tee $out
+        then
+          echo "" >&2
+          echo "${name}: witness ${witness} was NOT violated in ${main}." >&2
+          echo "The scenario it probes is no longer reachable; the regime's invariants may now hold vacuously." >&2
+          exit 1
+        fi
+
+        # A nonzero exit alone is not enough: a typecheck error or a
+        # checker crash also exits nonzero. Require quint's own
+        # violation report.
+        if ! grep -qF '[violation] Found an issue' $out; then
+          echo "" >&2
+          echo "${name}: quint verify failed without reporting a violation of ${witness} (tool error?)." >&2
+          exit 1
+        fi
+      '';
 in
 {
-  # Expose the constructor so a future cross-model aggregate (or an
+  # Expose the constructors so a future cross-model aggregate (or an
   # ad-hoc spike) can build its own checks without going through the
   # attrs below.
-  inherit mkQuintCheck;
+  inherit mkQuintCheck mkQuintWitnessCheck;
 
   # Per-model checks. Spliced into checks.* via misc-checks.nix.
   checks = {
@@ -336,6 +417,49 @@ in
         "boundedDualLeadership"
         "staleLeaderHasStaleGeneration"
       ];
+    };
+
+    # Non-vacuity witnesses. Each regime's headline invariant constrains
+    # a scenario that must itself be REACHABLE for the green check to
+    # mean anything; each check below passes only when the checker
+    # violates its witness -- the machine-checked replacement for the
+    # "re-verify by hand after a constant change" notes in the model's
+    # module comments. Deliberately no tracey markers here: the spec
+    # rules are verified by the regime checks above; these guard those
+    # checks against going vacuous.
+
+    # Dual belief is reachable in the base regime: the antecedent of
+    # boundedDualLeadership and staleLeaderHasStaleGeneration actually
+    # arises (a deposed leader that has not yet noticed its loss).
+    # neverDual doubles as the witness -- it is the asymmetric regime's
+    # headline invariant and the base regime's reachability probe.
+    quint-leader-election-witness-dual-belief = mkQuintWitnessCheck {
+      name = "leader-election-witness-dual-belief";
+      spec = "leaderElection";
+      main = "leaderElectionBase";
+      witness = "neverDual";
+    };
+
+    # A second acquisition (a steal of a previously-held lease) is
+    # reachable in the asymmetric regime: neverDual holds there because
+    # of the fence/steal separation, not because the widened threshold
+    # made contention unreachable within the clock ceiling.
+    quint-leader-election-witness-second-acquisition = mkQuintWitnessCheck {
+      name = "leader-election-witness-second-acquisition";
+      spec = "leaderElection";
+      main = "leaderElectionAsymmetric";
+      witness = "atMostOneAcquisition";
+    };
+
+    # The steal-delete-steal sequence is explored in the deletion
+    # regime: its staleLeaderHasStaleGeneration verdict is about a state
+    # space that actually contains the post-deletion re-acquisition the
+    # write-ahead claim defends against.
+    quint-leader-election-witness-deletion-resteal = mkQuintWitnessCheck {
+      name = "leader-election-witness-deletion-resteal";
+      spec = "leaderElection";
+      main = "leaderElectionDeletion";
+      witness = "noReacquisitionAfterDeletion";
     };
 
     # Implementation conformance (model-based testing). The four checks

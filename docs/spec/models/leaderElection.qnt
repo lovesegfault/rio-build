@@ -393,8 +393,42 @@ module leaderElection {
   /// Deliberately VIOLATED in the base and Deletion regimes (zero
   /// separation), where it doubles as the non-vacuity probe for
   /// boundedDualLeadership: dual belief is reachable there, and every
-  /// instance has a discovery mechanism armed.
+  /// instance has a discovery mechanism armed. That violation is
+  /// machine-checked: the expect-violation witness check
+  /// quint-leader-election-witness-dual-belief (nix/quint.nix) fails if
+  /// dual belief ever stops being reachable in the base regime.
   val neverDual = not(dual)
+
+  // --- expect-violation witnesses (non-vacuity probes) -------------------
+  //
+  // The vals below are NOT invariants and must never be added to a
+  // regime check's invariant list. Each states "the interesting thing
+  // never happens"; the quint-leader-election-witness-* checks in
+  // nix/quint.nix verify one each and PASS only when the checker reports
+  // a violation -- machine-checked evidence that the scenario a regime's
+  // headline invariant constrains is actually reachable in that regime's
+  // explored space. (neverDual above doubles as the base regime's
+  // witness.)
+
+  /// Violated when a second acquisition (a steal of a previously-held
+  /// lease) occurs: the transition count reaches 2 only via a steal of a
+  /// lease already acquired once -- renewal never bumps it. Checked
+  /// against the asymmetric regime, where its violation proves the
+  /// contention neverDual constrains still arises under the widened
+  /// steal threshold; a constant change that made steals unreachable
+  /// within the clock ceiling would leave neverDual vacuously true and
+  /// turn this witness's check red.
+  val atMostOneAcquisition = lease.gen < 2
+
+  /// Violated when the Lease object has been deleted and subsequently
+  /// re-acquired: deletion resets the transition count to zero, so a
+  /// positive count alongside a positive deletion counter can only mean
+  /// a post-deletion steal. Checked against the deletion regime, where
+  /// its violation proves the steal-delete-steal sequence the write-ahead
+  /// claim defends against is actually explored -- that regime's
+  /// staleLeaderHasStaleGeneration verdict is about a state space
+  /// containing the fault sequence, not one where the fault never bites.
+  val noReacquisitionAfterDeletion = not(deletes > 0 and lease.gen > 0)
 
   /// The production loop's tick discipline, stated as a predicate over
   /// states: a Leading node is never more than FENCE_AFTER + RENEW past
@@ -1503,13 +1537,16 @@ module leaderElectionDeletion {
 //   - The margin is LOAD-BEARING: the separation-2 and separation-0 runs
 //     above. neverDual holds because of the separation, not because the
 //     constants made contention unreachable.
-//   - Steals are still REACHABLE at STEAL_AFTER = 5: a temporary
-//     invariant `lease.gen < 2` is violated -- the lease's transition
-//     count reaches 2 only via a steal of a previously-held lease, so
-//     the contention scenario neverDual constrains actually happens
-//     within MAX_TIME = 8 (a node that GETs at t=0 needs its observation
-//     to age past STEAL_AFTER = 5, so the steal fires in the last three
-//     ticks). neverDual is not vacuously true.
+//   - Steals are still REACHABLE at STEAL_AFTER = 5: the
+//     atMostOneAcquisition witness (lease.gen < 2) is violated -- the
+//     lease's transition count reaches 2 only via a steal of a
+//     previously-held lease, so the contention scenario neverDual
+//     constrains actually happens within MAX_TIME = 8 (a node that GETs
+//     at t=0 needs its observation to age past STEAL_AFTER = 5, so the
+//     steal fires in the last three ticks). neverDual is not vacuously
+//     true. Machine-checked: quint-leader-election-witness-second-
+//     acquisition (nix/quint.nix) fails if this re-verification ever
+//     stops producing its violation.
 // =========================================================================
 module leaderElectionAsymmetric {
   import leaderElection(
