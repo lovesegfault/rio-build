@@ -1952,6 +1952,292 @@ async fn ex_leader_heartbeat_prefetch_no_pg_writes() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.lease.standby-drops-writes]
+/// Worker disconnect processed by a deposed leader: the ungated
+/// `ExecutorDisconnected` arm keeps its in-memory bookkeeping, but its
+/// PG-writing tail `reassign_derivations` self-gates on `is_leader()`.
+/// Reset branch (no poison precondition — the common case on every
+/// mid-build disconnect in the flap window): the ungated tree persists
+/// `Ready` over the new leader's recovery; the gate must leave the
+/// dispatch-time `assigned` row untouched.
+#[tokio::test]
+async fn ex_leader_disconnect_drops_reassign_writes() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let leader = crate::lease::LeaderState::default(); // always-leader
+    let leader_for_actor = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = leader_for_actor;
+    });
+
+    // Real merge + dispatch so the drv reaches Assigned on this worker
+    // (PG `derivations.status='assigned'` written by the dispatch path).
+    let build_id = Uuid::new_v4();
+    let mut rx = connect_executor(&handle, "exldr-w", "x86_64-linux").await?;
+    merge_single_node(&handle, build_id, "exldr-drv", PriorityClass::Scheduled).await?;
+    let assignment = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assignment.drv_path,
+        test_drv_path("exldr-drv"),
+        "precondition: drv must be Assigned to exldr-w before the lease flip"
+    );
+
+    // Lose the lease. on_lose only flips atomics — the LeaderLost actor
+    // command is sent separately in production, so a disconnect already
+    // in the mailbox is processed with is_leader=false against the
+    // still-populated DAG. The lease flip itself manufactures these:
+    // every worker stream reader that trips the generation fence sends
+    // ExecutorDisconnected to the deposed leader's actor.
+    leader.on_lose();
+    disconnect(&handle, "exldr-w").await?;
+
+    // (1) Reset branch must NOT have persisted Ready: the drv stays at
+    // the pre-flip Assigned the dispatch path wrote. (Red-first
+    // discriminator: the ungated tree writes 'ready' here.)
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = 'exldr-drv'")
+            .fetch_optional(&db.pool)
+            .await?;
+    assert_eq!(
+        status.as_deref(),
+        Some(DerivationStatus::Assigned.as_str()),
+        "ex-leader disconnect must not persist Ready from a stale DAG \
+         (the new leader's recovery owns this derivation)"
+    );
+
+    // (2) Disconnect must not record failures regardless of the gate
+    // (guards against rerouting through the failure-recording path).
+    let (retry_count, failed_builders): (i32, Vec<String>) = sqlx::query_as(
+        "SELECT retry_count, failed_builders FROM derivations WHERE drv_hash = 'exldr-drv'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(retry_count, 0, "disconnect must not bump retry_count");
+    assert!(
+        failed_builders.is_empty(),
+        "disconnect must not record into failed_builders"
+    );
+
+    // (3) In-memory state is also untouched (stale state is
+    // LeaderLost's job to clear). NOTE: this assertion encodes the
+    // function-top gate placement (skip both PG and in-mem reset),
+    // not the spec rule — update it if the gate ever moves to the
+    // call sites.
+    let drv = expect_drv(&handle, "exldr-drv").await;
+    assert_eq!(
+        drv.status,
+        DerivationStatus::Assigned,
+        "gate skips the in-memory reset too; LeaderLost clears the DAG"
+    );
+    Ok(())
+}
+
+/// Shared fixture for the poison-threshold disconnect pair: connect a
+/// worker, dispatch a drv to it, backdate three prior failures (a
+/// previous incarnation's, recorded before a crash) in PG, then re-run
+/// recovery (`LeaderAcquired`) on the same actor so the in-memory node
+/// carries `failed_builders.len() == 3` while the worker stays
+/// connected with the assignment live. The next disconnect of that
+/// worker hits `reassign_derivations`' poison branch.
+///
+/// Distinct `tag`s per test are required, not cosmetic: STREAM_EPOCHS
+/// (helpers.rs) is process-global keyed by executor id, so concurrent
+/// tests sharing a worker id can stomp each other's epoch and turn the
+/// disconnect into the I-056a no-op.
+async fn poison_threshold_disconnect_fixture(
+    tag: &str,
+) -> anyhow::Result<(
+    TestDb,
+    ActorHandle,
+    crate::lease::LeaderState,
+    tokio::task::JoinHandle<()>,
+    Uuid,
+)> {
+    let db = TestDb::new(&MIGRATOR).await;
+    let leader = crate::lease::LeaderState::default(); // always-leader
+    let leader_for_actor = leader.clone();
+    let (handle, task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = leader_for_actor;
+    });
+
+    let worker = format!("{tag}-w");
+    let drv = format!("{tag}-drv");
+    let build_id = Uuid::new_v4();
+
+    // 1. Dispatch the drv to the worker: Assigned, exec_id stamped in
+    //    `assignments`, `build_derivations` row created with exec_id
+    //    NULL (the row record_exec_correlation's UPDATE targets).
+    let mut rx = connect_executor(&handle, &worker, "x86_64-linux").await?;
+    merge_single_node(&handle, build_id, &drv, PriorityClass::Scheduled).await?;
+    let assignment = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assignment.drv_path,
+        test_drv_path(&drv),
+        "fixture precondition: drv must be dispatched before the failure backdate"
+    );
+
+    // 2. Backdate the previous incarnation's failures: three distinct
+    //    workers already failed this drv (recorded by the completion
+    //    path before the crash). Disconnect itself never increments.
+    sqlx::query(
+        "UPDATE derivations SET failed_builders = '{ghost-a,ghost-b,ghost-c}' \
+         WHERE drv_hash = $1",
+    )
+    .bind(&drv)
+    .execute(&db.pool)
+    .await?;
+
+    // 3. Recover from PG on the same actor: the in-memory node is
+    //    rebuilt with the backdated failed_builders and the exec_id
+    //    from the assignments join; `self.executors` (and the worker's
+    //    running_build) are untouched by recovery.
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // 4. Anti-vacuity #1: if recovery ever stops loading
+    //    failed_builders, fail loudly here instead of silently skipping
+    //    the poison branch in the tests built on this fixture.
+    let info = expect_drv(&handle, &drv).await;
+    assert_eq!(
+        info.retry.failed_builders.len(),
+        3,
+        "fixture precondition: recovery must load the backdated failed_builders"
+    );
+
+    Ok((db, handle, leader, task, build_id))
+}
+
+/// Leader-side control for the poison-threshold pair: proves the
+/// fixture actually reaches `reassign_derivations`' poison branch and
+/// that the write-once correlation pin is reachable from it, so the
+/// ex-leader test below cannot pass vacuously. No `r[verify]` marker —
+/// the rule under test in the pair is the standby gate, not this.
+#[tokio::test]
+async fn leader_disconnect_at_poison_threshold_poisons_and_pins() -> TestResult {
+    let (db, handle, _leader, _task, build_id) =
+        poison_threshold_disconnect_fixture("exldpa").await?;
+
+    // Leader stays leader: disconnect hits the poison branch.
+    disconnect(&handle, "exldpa-w").await?;
+
+    // persist_poisoned is awaited inside the actor — direct read is fine.
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = 'exldpa-drv'")
+            .fetch_optional(&db.pool)
+            .await?;
+    assert_eq!(
+        status.as_deref(),
+        Some("poisoned"),
+        "leader-side disconnect at the poison threshold must poison the drv \
+         (the fixture must reach the poison branch)"
+    );
+
+    // The pin really happened, with the execution the fixture
+    // dispatched. record_exec_correlation writes from spawn_monitored —
+    // poll PG (established 10ms × 100 pattern).
+    let dispatched_exec: Uuid = sqlx::query_scalar(
+        "SELECT a.exec_id FROM assignments a \
+         JOIN derivations d USING (derivation_id) \
+         WHERE d.drv_hash = 'exldpa-drv'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    let mut pinned: Option<Uuid> = None;
+    for _ in 0..100 {
+        pinned = sqlx::query_scalar(
+            "SELECT bd.exec_id FROM build_derivations bd \
+             JOIN derivations d USING (derivation_id) \
+             WHERE bd.build_id = $1 AND d.drv_hash = 'exldpa-drv'",
+        )
+        .bind(build_id)
+        .fetch_one(&db.pool)
+        .await?;
+        if pinned.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        pinned,
+        Some(dispatched_exec),
+        "leader-side poison must pin bd.exec_id to the dispatched execution \
+         (control: the pin is reachable from this fixture)"
+    );
+    Ok(())
+}
+
+// r[verify sched.lease.standby-drops-writes]
+/// The headline harm: a deposed leader processing a worker disconnect
+/// for a drv at the poison threshold must NOT poison it, must NOT pin
+/// the write-once `build_derivations.exec_id`, and must NOT
+/// fail/cancel the build from stale state — the new leader's recovery
+/// and reconcile sweeps own those derivations. (The leader-side
+/// control above proves this fixture reaches the poison branch.)
+#[tokio::test]
+async fn ex_leader_disconnect_at_poison_threshold_writes_nothing() -> TestResult {
+    let (db, handle, leader, _task, build_id) =
+        poison_threshold_disconnect_fixture("exldpb").await?;
+
+    // Lease flips BEFORE the disconnect lands (atomic flip only;
+    // LeaderLost races behind it in the mailbox).
+    leader.on_lose();
+    disconnect(&handle, "exldpb-w").await?;
+
+    // (1) No stale poison (or Ready) write.
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = 'exldpb-drv'")
+            .fetch_optional(&db.pool)
+            .await?;
+    assert_eq!(
+        status.as_deref(),
+        Some(DerivationStatus::Assigned.as_str()),
+        "ex-leader disconnect at the poison threshold must not write 'poisoned' \
+         (or 'ready') from a stale DAG"
+    );
+
+    // (2) Write-once correlation left for the new leader. No poll
+    // needed: with the gate the actor never calls
+    // record_exec_correlation in this fixture, so there is no in-flight
+    // spawned write to wait out (red-first: the ungated tree pins the
+    // dispatched exec_id here).
+    let exec_id: Option<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT bd.exec_id FROM build_derivations bd \
+         JOIN derivations d USING (derivation_id) \
+         WHERE bd.build_id = $1 AND d.drv_hash = 'exldpb-drv'",
+    )
+    .bind(build_id)
+    .fetch_optional(&db.pool)
+    .await?;
+    assert_eq!(
+        exec_id,
+        Some(None),
+        "ex-leader disconnect must not pin the write-once build_derivations.exec_id \
+         (row must exist and be NULL for the new leader's correlation)"
+    );
+
+    // (3) keep_going=false escalation must not have run: build stays at
+    // the post-merge 'active' (positive pin, not assert_ne).
+    let bstatus: Option<String> =
+        sqlx::query_scalar("SELECT status FROM builds WHERE build_id = $1")
+            .bind(build_id)
+            .fetch_optional(&db.pool)
+            .await?;
+    assert_eq!(
+        bstatus.as_deref(),
+        Some("active"),
+        "ex-leader disconnect must not fail/cancel the build from stale state"
+    );
+
+    // (4) In-memory state untouched (LeaderLost clears it; the gate
+    // returns before the in-mem reset/poison too).
+    let drv = expect_drv(&handle, "exldpb-drv").await;
+    assert_eq!(
+        drv.status,
+        DerivationStatus::Assigned,
+        "gate must skip the in-memory poison/reset as well"
+    );
+    Ok(())
+}
+
 // r[verify sched.recovery.poisoned-failed-count]
 /// Sticky `had_failure` (`error_summary.is_some()`) MUST survive
 /// recovery. `restore_builds` reconstructs via `new_pending` →

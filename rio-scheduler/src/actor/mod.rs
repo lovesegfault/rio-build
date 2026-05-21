@@ -1033,6 +1033,11 @@ impl DagActor {
                     stream_epoch,
                     seen_drvs,
                 } => {
+                    // r[sched.lease.standby-drops-writes]: arm stays ungated
+                    // (executors-map/gauge/log-buffer bookkeeping must run on
+                    // standby); the PG-writing tail (reassign_derivations →
+                    // poison/Ready/terminal-log writes) self-gates on
+                    // is_leader() in executor.rs.
                     self.handle_executor_disconnected(&executor_id, stream_epoch, seen_drvs)
                         .await;
                 }

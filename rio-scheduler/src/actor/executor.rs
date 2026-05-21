@@ -477,6 +477,14 @@ impl DagActor {
     /// (force=true) can reuse it. Both callers have already decided these
     /// derivations should be retried elsewhere — this is the mechanism.
     ///
+    /// Leader-gated at the top: the routes in — worker disconnect (stream
+    /// loss via the ungated ExecutorDisconnected arm, heartbeat timeout via
+    /// handle_tick), force-drain (ungated DrainExecutor arm), and the tick
+    /// backstop — all converge on this function, so it is the single
+    /// chokepoint keeping a deposed leader from writing
+    /// poison/Ready/terminal-log state from a stale DAG
+    /// (r[sched.lease.standby-drops-writes]).
+    ///
     /// `reset_to_ready()` handles both Assigned → Ready and Running →
     /// Failed → Ready. A derivation in any other state (Completed,
     /// Poisoned, DepFailed) is skipped with a warn — it shouldn't be in
@@ -510,6 +518,32 @@ impl DagActor {
         drv_hashes: &[DrvHash],
         lost_worker: Option<&ExecutorId>,
     ) {
+        // r[impl sched.lease.standby-drops-writes]
+        // Same defense-in-depth as the ProcessCompletion/CancelBuild arm
+        // gates (mod.rs), placed HERE because the ExecutorDisconnected /
+        // DrainExecutor arms must stay ungated (executors-map + gauge
+        // bookkeeping runs on standby). A deposed leader processing a
+        // disconnect against its stale DAG would otherwise:
+        //   - poison branch: persist_poisoned + terminal_failure_epilogue
+        //     → terminal_log_epilogue, which finalizes the drv_logs row and
+        //     pins the write-once build_derivations.exec_id for an execution
+        //     the new leader is about to re-run (and, keep_going=false,
+        //     fails/cancels the whole build from stale state);
+        //   - reset branch: persist_status(Ready), racing the new leader's
+        //     recovery.
+        // The new leader's recovery + reconcile/orphan sweeps own the lost
+        // worker's derivations; in-memory state here is cleared by LeaderLost.
+        if !self.leader.is_leader() {
+            if !drv_hashes.is_empty() {
+                warn!(
+                    drvs = drv_hashes.len(),
+                    lost_worker = ?lost_worker,
+                    "dropping reassign_derivations: not leader \
+                     (new leader's recovery owns these derivations)"
+                );
+            }
+            return;
+        }
         let mut affected: std::collections::HashSet<Uuid> = Default::default();
         for drv_hash in drv_hashes {
             // Re-read existing poison state so 3 prior REAL failures

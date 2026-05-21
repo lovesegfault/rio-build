@@ -1938,10 +1938,13 @@ CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
   worker reconnects to the new leader. `ProcessCompletion`, `CancelBuild`,
   `ReportExecutorTermination`, `AckSpawnedIntents`, `ReconcileAssignments`,
   `SubstituteComplete`, and `Tick` are additionally gated at actor dispatch as
-  defense-in-depth. `ExecutorConnected`/`Disconnected`/`Heartbeat`/`PrefetchComplete`
+  defense-in-depth.
+  `ExecutorConnected`/`Disconnected`/`DrainExecutor`/`Heartbeat`/`PrefetchComplete`
   arms stay ungated (they keep `self.executors` accurate for dashboard +
   reconnect-after-reacquire); their PG-touching sub-calls (`drain_phantoms`,
-  `dispatch_ready`) are individually leader-gated.
+  `dispatch_ready`, and `reassign_derivations` --- the disconnect/force-drain
+  tail that can poison a derivation and run the terminal log epilogue) are
+  individually leader-gated.
   `ForwardLogBatch` is NOT gated (in-memory ring only). `ForwardPhase` is NOT
   gated either, and is a deliberate exception to the table list above:
   `Event::Phase` is persisted (#rref("sched.log.phase-binding")), so a deposed
