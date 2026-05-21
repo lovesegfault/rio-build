@@ -136,7 +136,7 @@ in
     # encoding. Lease-object deletion is disabled here (MaxDeletes=0) so
     # a regression in the core protocol surfaces in this small fast
     # check; the deletion fault gets its own cfg below.
-    # r[verify sched.lease.at-most-one-leader+2]
+    # r[verify sched.lease.at-most-one-leader+3]
     # r[verify sched.lease.k8s-lease]
     # r[verify sched.recovery.fetch-max-seed+2]
     tla-leader-election = mkTlcCheck {
@@ -179,6 +179,12 @@ in
     # separation 2 is violated. The condition only became provable once
     # the model anchored the self-fence clock to the last completed
     # write rather than any read — see Get(n)'s comment in the model.
+    # NeverDual is the verification of both the self-fence ordering claim
+    # (the victim has provably stopped believing before any thief steals)
+    # and the at-most-one-leader soft half (the dual-belief window is
+    # empty under bounded skew).
+    # r[verify sched.lease.at-most-one-leader+3]
+    # r[verify sched.lease.self-fence+2]
     tla-leader-election-asymmetric = mkTlcCheck {
       name = "leader-election-asymmetric";
       spec = "LeaderElection";

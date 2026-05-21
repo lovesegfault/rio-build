@@ -2113,24 +2113,28 @@ CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
   Instead, it records the lease's `metadata.resourceVersion` plus a local
   monotonic `Instant` when that rv was first seen. The apiserver bumps rv on
   every write, so a leader renewing every 5s produces a fresh rv every 5s. If
-  rv stays unchanged for `lease_ttl` of local time, nobody has written ---
-  steal. Only the standby's own `Instant` monotonicity matters; the
-  `renewTime` value is never read.
+  rv stays unchanged for `STEAL_AFTER` (`LEASE_TTL` + `FENCE_MARGIN` = 19s) of
+  local time, nobody has written --- steal. Only the standby's own `Instant`
+  monotonicity matters; the `renewTime` value is never read.
 - *Transient API errors:* On apiserver errors, the loop logs a warning and
   retries on the next tick without flipping `is_leader`. If errors persist past
-  the lease TTL, the local self-fence (#rref("sched.lease.self-fence")) flips
-  `is_leader=false` and another replica acquires --- correct behavior for a
-  replica with broken K8s connectivity.
-- *Split-brain window:* This is a polling loop, not a watch-based fence. During
-  a true network partition where the leader cannot reach the apiserver but can
-  still reach executors, both replicas may believe they are leader for up to
-  `lease_ttl` (15s). This is *acceptable* because dispatch is idempotent: DAG
-  merge dedups by `drv_hash`, and executors reject stale-generation assignments
-  after seeing the new generation in `HeartbeatResponse`. Worst case: a
-  derivation is dispatched twice, builds twice, produces the same deterministic
-  output. Wasteful but correct.
+  `SELF_FENCE_AFTER`, the local self-fence (#rref("sched.lease.self-fence+2"))
+  flips `is_leader=false` and another replica acquires --- correct behavior for
+  a replica with broken K8s connectivity.
+- *Split-brain window:* This is a polling loop, not a watch-based fence. The
+  self-fence deadline (11s) sits `2 × FENCE_MARGIN` (8s) before the steal
+  threshold (19s): a leader that loses apiserver connectivity stops believing
+  it leads before any replica that retains connectivity is allowed to steal,
+  so a partition does not produce two simultaneous believers unless one
+  replica's clock pauses or skews by more than the margin leaves over after
+  the renew-polling slack (1.5s). For that residual --- and for the
+  pre-asymmetric deployments the degraded-regime model cfgs describe ---
+  dispatch is idempotent: DAG merge dedups by `drv_hash`, and executors reject
+  stale-generation assignments after seeing the new generation in
+  `HeartbeatResponse`. Worst case: a derivation is dispatched twice, builds
+  twice, produces the same deterministic output. Wasteful but correct.
 
-#r("sched.lease.at-most-one-leader+2")[
+#r("sched.lease.at-most-one-leader+3")[
   The Lease MUST be held by at most one scheduler identity at the apiserver
   at any moment. `replace()` is preconditioned on `metadata.resourceVersion`
   from the preceding GET; the apiserver returns 409 Conflict to all but one
@@ -2138,37 +2142,65 @@ CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
   200 and last-write-wins --- the `kube-leader-election` 0.43 failure mode
   (see the `rio-lease/src/election.rs` header). This half is hard. A
   replica's _belief_ that it leads (`is_leader=true`) MAY lag the Lease
-  state by a bounded window: a deposed replica that retains apiserver
-  connectivity learns it lost on its next GET (one `RENEW_INTERVAL`); a
-  partitioned replica self-fences after `LEASE_TTL` of no apiserver contact,
-  per its own monotonic clock (#rref("sched.lease.self-fence")). This half
-  is soft. The dual-belief window cannot be closed at the lease layer: a
-  process whose clock pauses or skews cannot self-fence at the moment its
-  lease expires --- it discovers its lateness only when the clock next
-  reads. The Chubby-style fix is a fencing token at the resource boundary,
-  which #rref("sched.lease.generation-fence+2") provides; that rule, not this
-  one, makes the dual-belief window safe rather than merely short. The
-  formal model in `docs/spec/models/LeaderElection.tla` verifies the two
-  halves separately: `AtMostOneCASWinner` (the hard half --- two `Replace`
-  actions cannot both succeed at the same `resourceVersion`) and
-  `BoundedDualLeadership` (the soft half --- if two replicas concurrently
-  believe they lead, the older one is past its self-fence deadline).
+  state: a deposed replica that retains apiserver connectivity learns it
+  lost on its next GET (one `RENEW_INTERVAL`); a partitioned replica
+  self-fences after `SELF_FENCE_AFTER` of no apiserver contact, per its own
+  monotonic clock (#rref("sched.lease.self-fence+2")) --- `2 × FENCE_MARGIN`
+  before any replica's steal threshold, so under clock skew within the
+  margin's budget the lag never produces two simultaneous believers. This
+  half is soft only against a clock that _pauses_: a process whose clock
+  stops cannot self-fence at the moment its deadline passes --- it discovers
+  its lateness only when the clock next reads --- and no fence/steal
+  separation closes that. The Chubby-style fix for the residual is a fencing
+  token at the resource boundary, which #rref("sched.lease.generation-fence+2")
+  provides; that rule, not this one, makes a dual-belief window safe rather
+  than merely unreachable. The formal model in
+  `docs/spec/models/LeaderElection.tla` verifies the three claims
+  separately: `AtMostOneCASWinner` (the hard half --- two `Replace` actions
+  cannot both succeed at the same `resourceVersion`), `NeverDual` (the
+  healthy regime, `LeaderElectionAsymmetric.cfg` --- with the fence/steal
+  separation exceeding the renew interval plus the round-trip clock skew, no
+  two replicas ever simultaneously believe they lead), and
+  `BoundedDualLeadership` (the degraded regime, the base and deletion cfgs
+  --- when the separation is insufficient, every reachable dual-belief state
+  still has a discovery mechanism armed).
 ]
 
-#r("sched.lease.self-fence")[
+#r("sched.lease.self-fence+2")[
   If the lease loop believed it was leading but has not had a successful
-  apiserver round-trip in over `LEASE_TTL` (15s), it MUST flip
-  `is_leader=false` locally (`maybe_self_fence`) and emit
-  #(refs.metric)("rio_scheduler_lease_lost_total"). At that point any replica
-  that _can_ reach the apiserver has already stolen the lease via
-  observed-record expiry; the only world where this replica is still rightful
-  leader is one where no replica can reach the apiserver, in which case
-  dispatch is pointless anyway. The self-fence does NOT attempt `step_down()`
-  or `pod-deletion-cost` PATCH (the apiserver is unreachable).
-  `last_successful_renew` is reset on every Standby/Conflict observation as
-  well as on successful renew --- the clock tracks "am I blind", not "am I
-  leader".
+  apiserver round-trip in over `SELF_FENCE_AFTER` (`LEASE_TTL` −
+  `FENCE_MARGIN` = 11s), it MUST flip `is_leader=false` locally
+  (`maybe_self_fence`) and emit
+  #(refs.metric)("rio_scheduler_lease_lost_total"). The self-fence deadline
+  MUST sit `2 × FENCE_MARGIN` before the steal threshold (`STEAL_AFTER` =
+  `LEASE_TTL` + `FENCE_MARGIN` = 19s), so a leader deposed by
+  unreachability has provably stopped believing before any replica that
+  _can_ reach the apiserver is allowed to steal. The self-fence does NOT
+  attempt `step_down()` or `pod-deletion-cost` PATCH (the apiserver is
+  unreachable). `last_successful_renew` is reset on every Standby/Conflict
+  observation as well as on successful renew --- the clock tracks "am I
+  blind", not "am I leader" --- but every round-trip that leaves the
+  replica _leading_ ends in an rv-bumping write, so a fresh fence clock on
+  a believer always coincides with a fresh observation clock on every
+  standby.
 ]
+
+The two deadlines are anchored at different moments: the leader stamps
+`last_successful_renew` when its renew _response_ arrives, a standby stamps
+its observation when it _sees_ the rv change. Without a margin the standby's
+deadline can land first with zero clock skew. The margin condition the
+asymmetry must satisfy is `2 × FENCE_MARGIN ≥ RENEW_INTERVAL + 2 ×
+clock_skew` --- the renew interval is the victim's fence-check latency (the
+loop only evaluates `maybe_self_fence` once per tick), and what remains of
+the 8s separation after the 5s renew interval is a 1.5s one-sided clock-skew
+budget. The TLA+ model verifies this as `NeverDual` over
+`LeaderElectionAsymmetric.cfg`, with the boundary measured from both sides:
+one model tick less separation and a dual-belief state is reachable. The
+residual is a clock that pauses for longer than the budget (suspend, a long
+GC, a frozen VM) --- no fence/steal separation closes that, and
+#rref("sched.lease.generation-fence+2") is the backstop. The compile-time
+assertions on the rio-lease constants pin the derivations and the margin
+condition so no constant moves without the others.
 
 #r("sched.lease.standby-drops-writes")[
   A replica that has lost the lease MUST NOT write scheduler-owned PG state

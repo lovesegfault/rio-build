@@ -473,7 +473,7 @@ impl LeaderElection {
     /// interleavings of N replicas, which neither the table tests nor
     /// the Kani contract on `decide_pure()` reach (both are
     /// single-replica).
-    // r[impl sched.lease.at-most-one-leader+2]
+    // r[impl sched.lease.at-most-one-leader+3]
     async fn replace(
         &mut self,
         mut lease: Lease,
