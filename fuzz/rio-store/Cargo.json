@@ -7297,7 +7297,6 @@
         "log",
         "logging",
         "native-tokio",
-        "ring",
         "rustls-native-certs",
         "tls12"
       ],
@@ -8509,14 +8508,13 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "aws-lc-rs",
         "client",
         "config",
-        "default",
         "derive",
         "kube-client",
         "kube-derive",
         "kube-runtime",
-        "ring",
         "runtime",
         "rustls-tls",
         "ws"
@@ -8654,6 +8652,7 @@
       ],
       "resolvedDefaultFeatures": [
         "__non_core",
+        "aws-lc-rs",
         "base64",
         "bytes",
         "client",
@@ -8670,7 +8669,6 @@
         "jsonpatch",
         "jsonpath-rust",
         "pem",
-        "ring",
         "rustls",
         "rustls-tls",
         "serde_yaml",
@@ -9385,10 +9383,6 @@
           "packageId": "hyper"
         },
         {
-          "name": "hyper-rustls",
-          "packageId": "hyper-rustls"
-        },
-        {
           "name": "hyper-util",
           "packageId": "hyper-util"
         },
@@ -9413,10 +9407,6 @@
           "packageId": "quanta"
         },
         {
-          "name": "rustls",
-          "packageId": "rustls"
-        },
-        {
           "name": "thiserror",
           "packageId": "thiserror 2.0.18"
         },
@@ -9430,19 +9420,13 @@
         }
       ],
       "resolvedDefaultFeatures": [
-        "_hyper-client",
         "_hyper-server",
-        "_push-gateway-common",
         "async-runtime",
-        "default",
         "http-body-util",
         "http-listener",
         "hyper",
-        "hyper-rustls",
         "hyper-util",
         "ipnet",
-        "push-gateway",
-        "rustls",
         "tokio",
         "tracing"
       ],
@@ -14009,10 +13993,6 @@
           "packageId": "once_cell"
         },
         {
-          "name": "ring",
-          "packageId": "ring"
-        },
-        {
           "name": "rustls-pki-types",
           "packageId": "rustls-pki-types",
           "rename": "pki_types"
@@ -14037,7 +14017,6 @@
         "log",
         "logging",
         "prefer-post-quantum",
-        "ring",
         "std",
         "tls12"
       ],
@@ -14225,10 +14204,6 @@
           "packageId": "aws-lc-rs"
         },
         {
-          "name": "ring",
-          "packageId": "ring"
-        },
-        {
           "name": "rustls-pki-types",
           "packageId": "rustls-pki-types",
           "rename": "pki_types"
@@ -14241,7 +14216,6 @@
       "resolvedDefaultFeatures": [
         "alloc",
         "aws-lc-rs",
-        "ring",
         "std"
       ],
       "libName": "webpki",
@@ -20373,7 +20347,13 @@
         },
         {
           "name": "hyper-rustls",
-          "packageId": "hyper-rustls"
+          "packageId": "hyper-rustls",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "hyper-rustls",
+          "packageId": "hyper-rustls",
+          "target": "x86_64-unknown-linux-gnu"
         },
         {
           "name": "hyper-util",
@@ -20579,6 +20559,10 @@
           "packageId": "rustls"
         },
         {
+          "name": "rustls-pki-types",
+          "packageId": "rustls-pki-types"
+        },
+        {
           "name": "rustls-webpki",
           "packageId": "rustls-webpki"
         },
@@ -20693,10 +20677,6 @@
         {
           "name": "tokio",
           "packageId": "tokio"
-        },
-        {
-          "name": "tokio-rustls",
-          "packageId": "tokio-rustls"
         },
         {
           "name": "tokio-rustls",
@@ -20827,10 +20807,6 @@
         {
           "name": "bytes",
           "packageId": "bytes"
-        },
-        {
-          "name": "cc",
-          "packageId": "cc"
         },
         {
           "name": "chacha20",
@@ -20982,7 +20958,13 @@
         },
         {
           "name": "hyper-rustls",
-          "packageId": "hyper-rustls"
+          "packageId": "hyper-rustls",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "hyper-rustls",
+          "packageId": "hyper-rustls",
+          "target": "x86_64-unknown-linux-gnu"
         },
         {
           "name": "hyper-util",
@@ -21188,6 +21170,10 @@
           "packageId": "rustls"
         },
         {
+          "name": "rustls-pki-types",
+          "packageId": "rustls-pki-types"
+        },
+        {
           "name": "rustls-webpki",
           "packageId": "rustls-webpki"
         },
@@ -21306,10 +21292,6 @@
         {
           "name": "tokio",
           "packageId": "tokio"
-        },
-        {
-          "name": "tokio-rustls",
-          "packageId": "tokio-rustls"
         },
         {
           "name": "tokio-rustls",

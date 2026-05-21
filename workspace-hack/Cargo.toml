@@ -54,14 +54,13 @@ hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
 hex = { version = "0.4" }
 hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "ctutils", "extra-sizes", "subtle", "zeroize"] }
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "logging", "native-tokio", "ring", "tls12"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service", "tracing"] }
 indexmap = { version = "2" }
 inout = { version = "0.2", default-features = false, features = ["block-padding"] }
 jiff = { version = "0.2", features = ["serde"] }
 k8s-openapi = { version = "0.27", features = ["v1_35"] }
-kube = { version = "3", features = ["derive", "runtime", "ws"] }
-kube-client = { version = "3", default-features = false, features = ["jsonpatch", "ring", "rustls-tls", "ws"] }
+kube = { version = "3", default-features = false, features = ["aws-lc-rs", "derive", "runtime", "rustls-tls", "ws"] }
+kube-client = { version = "3", default-features = false, features = ["aws-lc-rs", "jsonpatch", "rustls-tls", "ws"] }
 kube-core = { version = "3", default-features = false, features = ["jsonpatch", "schema", "ws"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
@@ -96,8 +95,9 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 rsa = { version = "0.10.0-rc.18", features = ["sha2"] }
 rustcrypto-ff = { version = "0.14.0-rc.1", default-features = false, features = ["alloc"] }
 rustcrypto-group = { version = "0.14.0-rc.1", default-features = false, features = ["alloc"] }
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "aws_lc_rs", "logging", "ring", "std", "tls12"] }
-rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "ring", "std"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "aws_lc_rs", "logging", "std", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "std"] }
 scopeguard = { version = "1" }
 sec1 = { version = "0.8", features = ["ctutils", "pem", "std", "subtle"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
@@ -124,7 +124,6 @@ subtle = { version = "2", features = ["const-generics"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 thiserror = { version = "2" }
 tokio = { version = "1", features = ["full", "test-util"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 tokio-stream = { version = "0.1", features = ["fs", "net", "sync"] }
 tokio-util = { version = "0.7", features = ["codec", "io", "time"] }
 toml_datetime = { version = "1", features = ["serde"] }
@@ -149,7 +148,6 @@ base16ct = { version = "1", default-features = false, features = ["alloc"] }
 base64 = { version = "0.22" }
 byteorder = { version = "1" }
 bytes = { version = "1" }
-cc = { version = "1", default-features = false, features = ["parallel"] }
 chacha20 = { version = "0.10", default-features = false, features = ["legacy", "rng", "zeroize"] }
 cipher = { version = "0.5", default-features = false, features = ["block-padding", "stream-wrapper"] }
 crossbeam-epoch = { version = "0.9" }
@@ -182,14 +180,13 @@ hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
 hex = { version = "0.4" }
 hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "ctutils", "extra-sizes", "subtle", "zeroize"] }
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "logging", "native-tokio", "ring", "tls12"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service", "tracing"] }
 indexmap = { version = "2" }
 inout = { version = "0.2", default-features = false, features = ["block-padding"] }
 jiff = { version = "0.2", features = ["serde"] }
 k8s-openapi = { version = "0.27", features = ["v1_35"] }
-kube = { version = "3", features = ["derive", "runtime", "ws"] }
-kube-client = { version = "3", default-features = false, features = ["jsonpatch", "ring", "rustls-tls", "ws"] }
+kube = { version = "3", default-features = false, features = ["aws-lc-rs", "derive", "runtime", "rustls-tls", "ws"] }
+kube-client = { version = "3", default-features = false, features = ["aws-lc-rs", "jsonpatch", "rustls-tls", "ws"] }
 kube-core = { version = "3", default-features = false, features = ["jsonpatch", "schema", "ws"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
@@ -224,8 +221,9 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 rsa = { version = "0.10.0-rc.18", features = ["sha2"] }
 rustcrypto-ff = { version = "0.14.0-rc.1", default-features = false, features = ["alloc"] }
 rustcrypto-group = { version = "0.14.0-rc.1", default-features = false, features = ["alloc"] }
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "aws_lc_rs", "logging", "ring", "std", "tls12"] }
-rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "ring", "std"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "aws_lc_rs", "logging", "std", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "std"] }
 scopeguard = { version = "1" }
 sec1 = { version = "0.8", features = ["ctutils", "pem", "std", "subtle"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
@@ -253,7 +251,6 @@ syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "vis
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 thiserror = { version = "2" }
 tokio = { version = "1", features = ["full", "test-util"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 tokio-stream = { version = "0.1", features = ["fs", "net", "sync"] }
 tokio-util = { version = "0.7", features = ["codec", "io", "time"] }
 toml_datetime = { version = "1", features = ["serde"] }
@@ -274,40 +271,44 @@ zstd-sys = { version = "2", default-features = false, features = ["legacy", "std
 [target.x86_64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "logging", "native-tokio", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 miniz_oxide = { version = "0.8", default-features = false, features = ["simd", "with-alloc"] }
 nix = { version = "0.31", features = ["fs", "hostname", "mman", "mount", "sched", "signal", "user"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
 tower-http = { version = "0.6", default-features = false, features = ["follow-redirect"] }
 
 [target.x86_64-unknown-linux-gnu.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "logging", "native-tokio", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 miniz_oxide = { version = "0.8", default-features = false, features = ["simd", "with-alloc"] }
 nix = { version = "0.31", features = ["fs", "hostname", "mman", "mount", "sched", "signal", "user"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
 tower-http = { version = "0.6", default-features = false, features = ["follow-redirect"] }
 
 [target.aarch64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "logging", "native-tokio", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 miniz_oxide = { version = "0.8", default-features = false, features = ["simd", "with-alloc"] }
 nix = { version = "0.31", features = ["fs", "hostname", "mman", "mount", "sched", "signal", "user"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
 tower-http = { version = "0.6", default-features = false, features = ["follow-redirect"] }
 
 [target.aarch64-unknown-linux-gnu.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "logging", "native-tokio", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 miniz_oxide = { version = "0.8", default-features = false, features = ["simd", "with-alloc"] }
 nix = { version = "0.31", features = ["fs", "hostname", "mman", "mount", "sched", "signal", "user"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
 tower-http = { version = "0.6", default-features = false, features = ["follow-redirect"] }
 
