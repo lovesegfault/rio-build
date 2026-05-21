@@ -941,14 +941,6 @@ in
         touch $out
       '';
 }
-# TLC checks for formal protocol models in docs/spec/models/. Each entry
-# is gated on its .tla file existing — the wiring + r[verify] markers
-# land before the model so the check turns on at the model commit
-# without an intermediate red gate. See nix/tla.nix.
-// (import ./tla.nix {
-  inherit pkgs unfilteredRoot;
-  inherit (pkgs) lib;
-}).checks
 # Quint checks for formal protocol models in docs/spec/models/. Each
 # entry is gated on its .qnt file existing — the wiring + r[verify]
 # markers land before the model so the check turns on at the model

@@ -137,11 +137,6 @@ let
     # devshell entry becomes slow, gate behind an opt-in `.#kani` shell.
     kaniToolchain.kani
 
-    # Formal models: TLC for docs/spec/models/. Run a model locally:
-    # `cd docs/spec/models && tlc -workers auto -config M.cfg M.tla`.
-    # See nix/tla.nix for the CI check.
-    tlaplus
-
     # Quint — the formal-specification language for docs/spec/models/
     # (typed, effect-checked, simulator + Apalache symbolic verifier +
     # the exhaustive TLC backend the CI checks use). Run a model
