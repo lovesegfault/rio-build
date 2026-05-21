@@ -57,7 +57,8 @@
   const stream: LogStream = createLogStream(drvPath, execId);
 
   // The build view's GraphNode.exec_id is empty for Cached, never-ran
-  // terminals (e.g. cascaded DependencyFailed, Skipped), and non-terminal
+  // terminals (e.g. a never-dispatched cascaded DependencyFailed,
+  // Skipped), and non-terminal
   // drvs — there's no per-build execution to observe. The server falls
   // back to MAX(exec_id) (the latest execution of the drv across all
   // builds), which is the right answer for a cache hit (it observed

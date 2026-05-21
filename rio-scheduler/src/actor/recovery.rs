@@ -1174,7 +1174,7 @@ impl DagActor {
         // under-retains. output_paths was just set above
         // (= expected_outputs, verified present in store).
         self.upsert_path_tenants_for(drv_hash).await;
-        // r[impl sched.merge.exec-correlation+6]
+        // r[impl sched.merge.exec-correlation+7]
         // Same gap as path-tenants above: `handle_success_completion`
         // never fired for this drv, so the log-finalization chokepoint
         // (seal → flush → correlate) must run here. It must be the

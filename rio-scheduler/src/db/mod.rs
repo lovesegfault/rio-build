@@ -309,11 +309,12 @@ impl RecoveryDerivationRow {
 /// a terminal where an execution actually ran: `Completed`, `Poisoned`,
 /// `Cancelled` reached from `Assigned`/`Running`, or any terminal
 /// reached while a prior, reset execution's stamped log buffer is
-/// retained (build-cancel sweep, failed-substitute revert).
-/// Stays NULL for cache-hit `Completed`, cascaded `DependencyFailed`,
-/// `Skipped`, never-dispatched terminals, and non-terminal drvs (no
-/// execution to record). The dashboard falls back to "latest exec"
-/// when empty.
+/// retained (build-cancel sweep, failed-substitute revert,
+/// dependency-failure cascade).
+/// Stays NULL for cache-hit `Completed`, never-dispatched cascaded
+/// `DependencyFailed`, `Skipped`, never-dispatched terminals, and
+/// non-terminal drvs (no execution to record). The dashboard falls
+/// back to "latest exec" when empty.
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct GraphNodeRow {
     pub derivation_id: Uuid,

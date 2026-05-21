@@ -1049,7 +1049,7 @@ impl DagActor {
         // has the full log (flusher hasn't drained yet — async on a
         // separate task), so AdminService.GetDerivationLogs can serve
         // from the ring buffer in the gap before the S3 upload lands.
-        // r[impl sched.merge.exec-correlation+6]
+        // r[impl sched.merge.exec-correlation+7]
         self.terminal_log_epilogue(drv_hash, "succeeded", &interested_builds);
         let _ = &mut t_phase;
         let total = t_total.elapsed();
@@ -1859,11 +1859,14 @@ impl DagActor {
         // union (those builds saw SOME drv fail, possibly a cascaded
         // one). Finalize logs BEFORE handle_derivation_failure (which
         // may transition builds to terminal and schedule cleanup).
-        // The trigger set (not the cascaded union) is correct for the
-        // exec correlation: a cascaded `DependencyFailed` parent never
-        // executed, so its `state.exec_id` is `None` and
-        // `build_derivations.exec_id` stays `NULL` for it.
-        // r[impl sched.merge.exec-correlation+6]
+        // The trigger's correlation uses the trigger's set; cascaded
+        // ancestors get their own per-node finalization in the loop
+        // below, gated on a retained buffer — most never dispatched,
+        // but a parent that was dispatched, reset on worker disconnect
+        // (reset_to_ready retains the stamped LogBuffers entry), and
+        // demoted by an I-047 dep reset carries an un-finalized
+        // execution into the cascade.
+        // r[impl sched.merge.exec-correlation+7]
         let trigger_builds = self.get_interested_builds(drv_hash);
         self.terminal_log_epilogue(drv_hash, "failed", &trigger_builds);
         let trigger_path = self.dag.path_or_hash_fallback(drv_hash);
@@ -1902,8 +1905,19 @@ impl DagActor {
         // keep_going while the build moves on.
         let dep_msg = format!("dependency '{trigger_path}' failed: {error_msg}");
         for cascaded_hash in &cascaded {
+            let interested = self.get_interested_builds(cascaded_hash);
+            // A cascaded ancestor that was dispatched, reset_to_ready()'d
+            // on worker disconnect, and demoted by an I-047 dep reset
+            // still carries a LogBuffers entry stamped with the reset
+            // execution's exec_id. Finalize it (same gated form as the
+            // build-cancel sweep's to_depfail arm) before the build is
+            // torn down, with this node's OWN interested set — a
+            // cascaded node may belong to a merged build the trigger
+            // does not.
+            // r[impl sched.merge.exec-correlation+7]
+            self.finalize_buffered_exec_log(cascaded_hash, &interested);
             let cascaded_path = self.dag.path_or_hash_fallback(cascaded_hash);
-            for build_id in self.get_interested_builds(cascaded_hash) {
+            for build_id in interested {
                 self.events.emit(
                     build_id,
                     rio_proto::types::build_event::Event::Derivation(

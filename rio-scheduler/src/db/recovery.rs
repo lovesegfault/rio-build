@@ -280,9 +280,9 @@ impl SchedulerDb {
         // completion handler on terminal paths where an execution ran
         // (Completed, Poisoned, Cancelled from Assigned/Running, and any
         // terminal reached while a prior, reset execution's stamped log
-        // buffer is retained — build-cancel sweep or failed-substitute
-        // revert) — see
-        // r[sched.merge.exec-correlation+6]. It comes from the JOIN'd
+        // buffer is retained — build-cancel sweep, failed-substitute
+        // revert, or dependency-failure cascade) — see
+        // r[sched.merge.exec-correlation+7]. It comes from the JOIN'd
         // `build_derivations` edge (already in the query), not a new
         // table; nullable, NOT COALESCE'd (the proto layer maps None →
         // empty string and the dashboard treats empty as "fall back to

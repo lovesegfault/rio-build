@@ -251,7 +251,7 @@ rejections increment #(refs.metric)("rio_scheduler_phases_rejected_total")
 with reason `phase_too_long`; completion rejections increment
 #(refs.metric)("rio_scheduler_completions_rejected_total").
 
-#r("sched.merge.exec-correlation+6")[
+#r("sched.merge.exec-correlation+7")[
   The scheduler MUST set `build_derivations.exec_id` for every interested
   build that has not already recorded an observation for that derivation
   when a derivation that has been dispatched (and therefore has an
@@ -260,10 +260,12 @@ with reason `phase_too_long`; completion rejections increment
   orphan adoption), `Poisoned` (permanent failure), `Cancelled` reached
   from `Assigned`/`Running`, and any terminal reached by a derivation
   whose prior, reset execution left a stamped log buffer (the
-  build-cancel sweep's `Cancelled`/`DependencyFailed` arms and the
-  failed-substitute revert to `DependencyFailed`). The column MUST stay
-  `NULL` for cache-hit `Completed`, cascade-swept `DependencyFailed`
-  ancestors, `Skipped`, non-terminal derivations, and any other
+  build-cancel sweep's `Cancelled`/`DependencyFailed` arms, the
+  failed-substitute revert to `DependencyFailed`, and the
+  dependency-failure cascade's `DependencyFailed` ancestors). The column
+  MUST stay `NULL` for cache-hit `Completed`, cascade-swept
+  `DependencyFailed` ancestors that never left a stamped log buffer,
+  `Skipped`, non-terminal derivations, and any other
   terminal where no execution was ever observed (nothing to correlate).
   A `(build, derivation)` observation is written exactly once --- a
   post-completion reset and re-execution of the derivation inside the
@@ -285,9 +287,11 @@ scheduler was down, and an ex-leader re-acquiring the lease may still hold
 its unflushed log tail) --- each of which implies the worker ran the build.
 The
 not-yet-dispatched arms of the same cancel sweep (`Queued`/`Ready`/`Created` →
-`DependencyFailed`, `Substituting` → `Cancelled`) call the chokepoint only
+`DependencyFailed`, `Substituting` → `Cancelled`) and the dependency-failure
+cascade's swept ancestors call the chokepoint only
 when a prior execution was reset and left a stamped log buffer
-(`has_buffered_exec_log`); the never-dispatched majority skip it.
+(`has_buffered_exec_log`, via the shared gated form
+`finalize_buffered_exec_log`); the never-dispatched majority skip it.
 Inside the epilogue, the carrier
 resolution is `exec_id_for_terminal`, which reads `state.exec_id` (set by
 `assign_to_worker`, recoverable from `assignments.exec_id` after a leader

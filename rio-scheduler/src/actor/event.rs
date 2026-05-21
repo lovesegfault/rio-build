@@ -488,12 +488,13 @@ impl DagActor {
     ///
     /// Returns `None` only when neither carrier has an exec_id — the
     /// derivation never reached a worker (cached terminal,
-    /// never-dispatched poison, cascaded `DependencyFailed`, or the
-    /// assignment never landed: `rollback_assignment` discarded the
-    /// buffer before any push), or the prior execution was already
-    /// finalized at an earlier terminal and the node was reset out of
-    /// it (I-094 reprobe / I-047 stale-output reset — `transition()`
-    /// drops the carrier on terminal-exit).
+    /// never-dispatched poison, a never-dispatched cascaded
+    /// `DependencyFailed`, or the assignment never landed:
+    /// `rollback_assignment` discarded the buffer before any push), or
+    /// the prior execution was already finalized at an earlier terminal
+    /// and the node was reset out of it (I-094 reprobe / I-047
+    /// stale-output reset — `transition()` drops the carrier on
+    /// terminal-exit).
     ///
     /// Called from [`Self::terminal_log_epilogue`] (once, at the top —
     /// the resolved value is threaded to the seal/flush/correlate
@@ -541,12 +542,50 @@ impl DagActor {
     /// it without breaking the legitimate shapes (neither
     /// `reset_to_ready` nor the transient-retry window seals); not
     /// added because no test can deterministically exercise the window.
-    /// r[impl sched.merge.exec-correlation+6]
+    /// r[impl sched.merge.exec-correlation+7]
     pub(super) fn has_buffered_exec_log(&self, state: &crate::state::DerivationState) -> bool {
         self.log_buffers
             .as_ref()
             .and_then(|b| b.exec_id(state.drv_path().as_str()))
             .is_some()
+    }
+
+    /// Finalize a *retained, prior* execution's log on a derivation
+    /// being swept to a terminal from a non-executing state
+    /// (`Created|Queued|Ready|Substituting`) as a bystander of someone
+    /// else's event (a build cancellation, a dependency's permanent
+    /// failure). No-op unless a `LogBuffers` entry stamped by a reset
+    /// execution is still held — see [`Self::has_buffered_exec_log`]
+    /// for why the gate is the buffer carrier and not `state.exec_id`
+    /// (a bare `state.exec_id` on a swept node is a stale restamp the
+    /// inner gate would resolve and mis-attribute). Without this, the
+    /// reset execution's `drv_logs` row stays `is_complete=false`/
+    /// `status=NULL` for the 30-day TTL as the drv's latest exec, the
+    /// `.partial` blob is never replaced, and `bd.exec_id` stays NULL.
+    ///
+    /// `status` is `"cancelled"` at every call site: the column records
+    /// the scheduler's disposition of the *log* (the execution was
+    /// abandoned, never re-ran), not the drv's terminal enum —
+    /// `"failed"` is reserved for permanent build failure.
+    ///
+    /// Callers: `cancel_build_derivations`' `to_cancel_substituting`
+    /// and `to_depfail` arms, `terminal_failure_epilogue`'s
+    /// cascaded-ancestor loop. See [`Self::terminal_log_epilogue`] for
+    /// which terminal paths use this gated form vs. the unconditional
+    /// call.
+    /// r[impl sched.merge.exec-correlation+7]
+    pub(super) fn finalize_buffered_exec_log(
+        &self,
+        drv_hash: &DrvHash,
+        interested_builds: &[Uuid],
+    ) {
+        if self
+            .dag
+            .node(drv_hash)
+            .is_some_and(|s| self.has_buffered_exec_log(s))
+        {
+            self.terminal_log_epilogue(drv_hash, "cancelled", interested_builds);
+        }
     }
 
     /// Fire a log-flush request for the given derivation. No-op if the
@@ -628,7 +667,7 @@ impl DagActor {
     /// finished build is still in `interested_builds`) does not revise
     /// it.
     ///
-    /// r[impl sched.merge.exec-correlation+6]
+    /// r[impl sched.merge.exec-correlation+7]
     pub(super) fn record_exec_correlation(
         &self,
         drv_hash: &DrvHash,
@@ -734,9 +773,11 @@ impl DagActor {
     ///   (build-level cancellation/failure of an `Assigned`/`Running`
     ///   drv: `handle_cancel_build`, per-build wall-clock timeout,
     ///   fail-fast, top-down substitute fail)
-    /// - `cancel_build_derivations` (`to_cancel_substituting` and
-    ///   `to_depfail` arms) — `"cancelled"`, gated on
-    ///   [`Self::has_buffered_exec_log`]: a `Ready`/`Substituting` drv
+    /// - [`Self::finalize_buffered_exec_log`] — `"cancelled"`, gated on
+    ///   [`Self::has_buffered_exec_log`]. Three call sites:
+    ///   `cancel_build_derivations`' `to_cancel_substituting` and
+    ///   `to_depfail` arms, and `terminal_failure_epilogue`'s
+    ///   cascaded-ancestor loop. A `Queued`/`Ready`/`Substituting` drv
     ///   that went through `reset_to_ready()` retains a `LogBuffers`
     ///   entry stamped with the prior (reset) execution's `exec_id` —
     ///   that execution's `.partial` row must be finalized here or it
@@ -749,22 +790,52 @@ impl DagActor {
     ///   the inner gate would accept and mis-attribute. See
     ///   [`Self::has_buffered_exec_log`] for the full rationale.
     ///
+    /// Which form a new terminal path uses:
+    /// - The drv is the *subject* of the event being processed (its
+    ///   own completion, failure, timeout, substitute result, or
+    ///   fleet-exhaustion poison), or an execution is live
+    ///   (`Assigned`/`Running`) when the terminal is reached: call
+    ///   this function directly, unconditionally. The inner
+    ///   `exec_id_for_terminal` gate no-ops for never-dispatched
+    ///   triggers (the direct `Ready → Poisoned` I-065 arm, a
+    ///   first-attempt substitute revert) — see
+    ///   `epilogue_skips_never_dispatched_drv`.
+    /// - The drv is a *bystander* swept to a terminal by someone
+    ///   else's event from a non-executing state
+    ///   (`Created|Queued|Ready|Substituting`) — a build cancellation
+    ///   sweeping not-yet-dispatched members, a dependency-failure
+    ///   cascade sweeping ancestors: call
+    ///   [`Self::finalize_buffered_exec_log`] instead. The only
+    ///   legitimate carrier for a swept non-executing node is a
+    ///   buffer retained across `reset_to_ready()`; a bare
+    ///   `state.exec_id` with no buffer is a stale restamp the inner
+    ///   gate would resolve and mis-attribute (`bd.exec_id` written
+    ///   for an execution the build never observed).
+    ///
     /// NOT called from:
-    /// - cascaded `DependencyFailed` and `Skipped`: structurally never
-    ///   dispatched — a cascaded ancestor's deps were never all
-    ///   `Completed`, so it was never `Ready`, so it has no exec_id
-    ///   from either carrier and no buffer. Calling would be
-    ///   harmless but pointless.
+    /// - `seed_initial_states`' merged-in-already-failed nodes
+    ///   (`Created → DependencyFailed` at merge time): a node new to
+    ///   the DAG in this merge was never dispatched in this DAG —
+    ///   structurally cannot carry a buffer.
+    /// - recovery's crash-mid-cascade `DependencyFailed` sweep: a
+    ///   fresh leader's `LogBuffers` is empty (per-process). An
+    ///   ex-leader re-acquiring the lease retains its buffers and
+    ///   inherits the same GC-bounded residual as the cache-hit
+    ///   entry below — known, not wired (recovery's sweep has no
+    ///   per-node interested-set loop in hand).
     /// - cache-hit / substitute-success `Completed`
-    ///   (`complete_ready_from_store_batch`): usually never dispatched
-    ///   (no buffer), but a *reset* drv completed via store hit or
-    ///   substitute retains the prior execution's stamped buffer.
+    ///   (`complete_ready_from_store_batch`) and `Skipped` (CA
+    ///   early-cutoff): usually never dispatched (no buffer), but a
+    ///   *reset* drv completed via store hit / substitute / cutoff
+    ///   retains the prior execution's stamped buffer.
     ///   That exec's row stays `is_complete=false` for the GC TTL as
     ///   the drv's latest exec and the unsealed buffer is served as
     ///   "still active" until `CleanupTerminalBuild`. Known gap,
     ///   GC-bounded; closing it needs a status-vocabulary decision
     ///   (`"succeeded"` would attribute the substitute's success to
-    ///   the aborted execution), so it is deliberately not wired here.
+    ///   the aborted execution, and these are success-equivalent
+    ///   outcomes — the output materialized without this execution
+    ///   finishing), so it is deliberately not wired here.
     ///
     /// Sequencing: seal first so late `LogBatch` pushes between now and
     /// the flusher's drain are dropped instead of recreating an orphan
@@ -793,7 +864,7 @@ impl DagActor {
     /// performed at the top of this function, so the flush request and
     /// the `bd.exec_id` write cannot name different executions.
     ///
-    /// r[impl sched.merge.exec-correlation+6]
+    /// r[impl sched.merge.exec-correlation+7]
     pub(super) fn terminal_log_epilogue(
         &self,
         drv_hash: &DrvHash,
@@ -820,8 +891,8 @@ impl DagActor {
         let Some(exec_id) = self.exec_id_for_terminal(state) else {
             // Never dispatched: nothing to seal, flush, or correlate.
             // debug!, not warn!: every cause is a documented expected
-            // no-op (cached terminal, never-dispatched poison, cascaded
-            // DependencyFailed, first-attempt substitute revert).
+            // no-op (cached terminal, never-dispatched poison,
+            // first-attempt substitute revert).
             tracing::debug!(
                 drv_hash = %drv_hash,
                 status,

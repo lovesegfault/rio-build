@@ -999,9 +999,10 @@ pub const M_060: () = ();
 /// execution ran: `Completed`, `Poisoned`, `Cancelled` reached from
 /// `Assigned`/`Running`, and any terminal reached while a prior, reset
 /// execution's stamped log buffer is retained (build-cancel sweep,
-/// failed-substitute revert); `NULL` for cascade-swept `DependencyFailed`/`Skipped`/
+/// failed-substitute revert, dependency-failure cascade); `NULL` for
+/// never-dispatched cascade-swept `DependencyFailed`/`Skipped`/
 /// cache-hit `Completed`/never-dispatched/non-terminal — see
-/// `sched.merge.exec-correlation+6`).
+/// `sched.merge.exec-correlation+7`).
 ///
 /// Greenfield drop+recreate, no backfill.
 pub const M_061: () = ();

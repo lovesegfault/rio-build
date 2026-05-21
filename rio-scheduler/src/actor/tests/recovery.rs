@@ -2289,7 +2289,7 @@ async fn test_recovery_restamp_clears_stale_exec_lines() -> TestResult {
 /// finds the outputs and routes to `adopt_orphan_completion` rather than
 /// `reset_orphan_to_ready`.
 ///
-/// r[verify sched.merge.exec-correlation+6]
+/// r[verify sched.merge.exec-correlation+7]
 #[tokio::test]
 async fn test_orphan_completion_routes_log_through_epilogue() -> TestResult {
     use super::integration::{put_test_path, setup_inproc_store};
@@ -2422,7 +2422,7 @@ async fn test_orphan_completion_routes_log_through_epilogue() -> TestResult {
 /// uploads them as the final `logs/{h}/{exec}.log.zst` blob and flips the
 /// `drv_logs` row to `is_complete=true`.
 ///
-/// r[verify sched.merge.exec-correlation+6]
+/// r[verify sched.merge.exec-correlation+7]
 /// r[verify obs.log.exec-keyed]
 #[tokio::test]
 async fn test_orphan_completion_preserves_ex_leader_log_tail() -> TestResult {
@@ -2536,7 +2536,7 @@ async fn test_orphan_completion_preserves_ex_leader_log_tail() -> TestResult {
 /// fallback) and queueing a FlushRequest that flush_final's staleness guard
 /// drops.
 ///
-/// r[verify sched.merge.exec-correlation+6]
+/// r[verify sched.merge.exec-correlation+7]
 #[tokio::test]
 async fn test_recovery_preserves_reset_exec_id_clear() -> TestResult {
     let stale_exec_id = Uuid::now_v7();

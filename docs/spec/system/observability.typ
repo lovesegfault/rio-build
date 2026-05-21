@@ -63,7 +63,9 @@ may disagree with the row. Cancelling an in-flight (`Assigned`/`Running`)
 execution seals and finalizes its log before the worker receives the
 `CancelSignal`, so the late footer is dropped and the log normally ends without
 a `rio: result` line. Cancelling a build whose derivation was already reset off
-a lost or force-drained worker finalizes that prior execution's retained
+a lost or force-drained worker --- or sweeping such a derivation into
+`DependencyFailed` when one of its dependencies permanently fails --- finalizes
+that prior execution's retained
 buffer, which may already hold the footer the worker pushed on its way out ---
 possibly `rio: result ok` when the success report was lost to the disconnect
 --- so the stored line, if present, can disagree with the row. `drv_logs.status`

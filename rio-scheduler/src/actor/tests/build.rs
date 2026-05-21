@@ -886,7 +886,7 @@ async fn test_cancel_signals_total_counts_delivered_only() -> TestResult {
 /// `bd.exec_id` stays NULL → dashboard shows the "approximate" banner
 /// for a log that was actually streamed.
 ///
-/// r[verify sched.merge.exec-correlation+6]
+/// r[verify sched.merge.exec-correlation+7]
 /// r[verify obs.log.exec-keyed]
 #[rstest::rstest]
 #[case::running(DerivationStatus::Running)]
@@ -1030,7 +1030,7 @@ async fn cancel_running_drv_finalizes_log(#[case] from_status: DerivationStatus)
 /// epilogue on the (false) claim that those drvs "have no exec_id and
 /// no buffer, so the call would be a guaranteed no-op".
 ///
-/// r[verify sched.merge.exec-correlation+6]
+/// r[verify sched.merge.exec-correlation+7]
 /// r[verify obs.log.exec-keyed]
 #[rstest::rstest]
 #[case::ready(DerivationStatus::Ready, DerivationStatus::DependencyFailed)]
@@ -1242,7 +1242,7 @@ async fn cancel_reset_drv_finalizes_prior_exec_log(
 /// are scoped to currently-assigned drvs and the fixture must model
 /// "stale by any means", not one specific writer.
 ///
-/// r[verify sched.merge.exec-correlation+6]
+/// r[verify sched.merge.exec-correlation+7]
 #[rstest::rstest]
 #[case::substituting(DerivationStatus::Substituting, DerivationStatus::Cancelled)]
 #[case::ready(DerivationStatus::Ready, DerivationStatus::DependencyFailed)]

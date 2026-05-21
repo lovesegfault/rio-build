@@ -137,19 +137,13 @@ impl DagActor {
             // the 30-day TTL and bd.exec_id NULL (dashboard shows the
             // "approximate" banner for a log that was streamed).
             //
-            // The `to_cancel_substituting` and `to_depfail` arms below
-            // call this too, gated on `has_buffered_exec_log`: most of
-            // those drvs never dispatched (no exec_id, no buffer —
-            // nothing to finalize), but a
-            // Ready/Substituting drv that went through reset_to_ready()
-            // retains a LogBuffers entry stamped with the prior (reset)
-            // execution's exec_id, and that execution's `.partial` row
-            // must be finalized here or it lingers for the 30-day TTL
-            // as the drv's latest exec.
+            // The not-yet-dispatched arms below and the
+            // dependency-failure cascade use `finalize_buffered_exec_log`
+            // instead — see its doc for the gate-carrier rationale.
             // The seal here precedes the CancelSignal try_send below,
             // so the worker's late `rio: result cancelled` footer is
             // dropped — see terminal_log_epilogue's sequencing note.
-            // r[impl sched.merge.exec-correlation+6]
+            // r[impl sched.merge.exec-correlation+7]
             self.terminal_log_epilogue(drv_hash, "cancelled", &[build_id]);
             transitioned.push(drv_hash.as_str());
             let Some(executor_id) = executor_id else {
@@ -188,20 +182,10 @@ impl DagActor {
                 && state.transition(DerivationStatus::Cancelled).is_ok()
             {
                 // Finalize the prior (reset) execution's log if one is
-                // still buffered — see the to_cancel arm's comment.
-                // Gates on the LogBuffers carrier, not state.exec_id: a
-                // stale exec_id (recovery restamp; pre-fix, the I-094/
-                // I-047 terminal-exit resets) would attribute an
-                // already-finalized execution to a build that never
-                // observed it. See `has_buffered_exec_log`.
-                // r[impl sched.merge.exec-correlation+6]
-                if self
-                    .dag
-                    .node(drv_hash)
-                    .is_some_and(|s| self.has_buffered_exec_log(s))
-                {
-                    self.terminal_log_epilogue(drv_hash, "cancelled", &[build_id]);
-                }
+                // still buffered — see `finalize_buffered_exec_log` for
+                // the gate-carrier and status="cancelled" rationale.
+                // r[impl sched.merge.exec-correlation+7]
+                self.finalize_buffered_exec_log(drv_hash, &[build_id]);
                 transitioned.push(drv_hash.as_str());
             }
         }
@@ -236,22 +220,12 @@ impl DagActor {
             {
                 self.ready_queue.remove(drv_hash);
                 // Finalize the prior (reset) execution's log if one is
-                // still buffered — see the to_cancel arm's comment and
-                // `has_buffered_exec_log` for why the gate is the
-                // LogBuffers carrier rather than state.exec_id.
-                // status="cancelled" even though this drv's terminal is
-                // DependencyFailed: the column records the scheduler's
-                // disposition of the *log* (the build went away), not
-                // the drv's terminal enum, and "failed" is reserved for
-                // permanent build failure.
-                // r[impl sched.merge.exec-correlation+6]
-                if self
-                    .dag
-                    .node(drv_hash)
-                    .is_some_and(|s| self.has_buffered_exec_log(s))
-                {
-                    self.terminal_log_epilogue(drv_hash, "cancelled", &[build_id]);
-                }
+                // still buffered — see `finalize_buffered_exec_log` for
+                // the gate-carrier rationale and why status is
+                // "cancelled" even though this drv's terminal is
+                // DependencyFailed.
+                // r[impl sched.merge.exec-correlation+7]
+                self.finalize_buffered_exec_log(drv_hash, &[build_id]);
                 depfailed.push(drv_hash.as_str());
             }
         }

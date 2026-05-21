@@ -3396,7 +3396,7 @@ async fn test_infra_retry_cap_uniform_across_reasons(
 /// PG with the established 10ms × 100 pattern rather than asserting
 /// immediately after `barrier()` (which only drains the actor loop, not
 /// background tasks).
-// r[verify sched.merge.exec-correlation+6]
+// r[verify sched.merge.exec-correlation+7]
 #[tokio::test]
 async fn completion_records_build_exec_correlation() -> TestResult {
     let (db, handle, _task, mut stream_rx) = setup_with_worker("ec-worker", "x86_64-linux").await?;
@@ -3577,7 +3577,7 @@ async fn flush_falls_back_to_buffer_exec_id_after_reset_to_ready() -> TestResult
 /// buffer is gone. Both call the epilogue ungated; the gate must live
 /// inside it.
 ///
-/// r[verify sched.merge.exec-correlation+6]
+/// r[verify sched.merge.exec-correlation+7]
 /// r[verify obs.log.exec-keyed]
 #[tokio::test]
 async fn epilogue_skips_never_dispatched_drv() -> TestResult {
@@ -3647,7 +3647,7 @@ async fn epilogue_skips_never_dispatched_drv() -> TestResult {
 /// `state.exec_id == None`, no UPDATE, `build_derivations.exec_id`
 /// stays NULL forever.
 ///
-/// r[verify sched.merge.exec-correlation+6]
+/// r[verify sched.merge.exec-correlation+7]
 #[tokio::test]
 async fn exec_correlation_falls_back_to_buffer_exec_id() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -3743,7 +3743,7 @@ async fn exec_correlation_falls_back_to_buffer_exec_id() -> TestResult {
 /// as the exact log B1 observed (the "approximate" banner gates on
 /// `execId === ''`, not on correctness).
 ///
-/// r[verify sched.merge.exec-correlation+6]
+/// r[verify sched.merge.exec-correlation+7]
 #[tokio::test]
 async fn exec_correlation_skips_terminal_builds() -> TestResult {
     use crate::state::{BuildInfo, BuildState};
@@ -3866,6 +3866,192 @@ async fn exec_correlation_skips_terminal_builds() -> TestResult {
         Some(x1),
         "a finished build's recorded observation is final — a post-completion \
          re-execution of the drv must not overwrite bd.exec_id"
+    );
+    Ok(())
+}
+
+/// A cascaded `DependencyFailed` ancestor that was dispatched, reset on
+/// worker disconnect (`reset_to_ready()` clears `state.exec_id`,
+/// retains the stamped `LogBuffers` entry), and swept by
+/// `cascade_dependency_failure` MUST have that retained execution
+/// finalized — seal, flush (`status="cancelled"`, `is_complete=true`,
+/// `.partial` swap), correlate to the ancestor's OWN interested builds —
+/// exactly as the build-cancel sweep's `to_depfail` arm does for the
+/// same `Queued|Ready → DependencyFailed` transition (both now via
+/// `finalize_buffered_exec_log`). The never-dispatched trigger is the
+/// negative control: no buffer, no FlushRequest, no seal tombstone.
+///
+/// Pre-fix: `terminal_failure_epilogue` finalized only the trigger, on
+/// the (false) claim that cascaded ancestors "never executed".
+///
+/// r[verify sched.merge.exec-correlation+7]
+/// r[verify obs.log.exec-keyed]
+#[tokio::test]
+async fn cascade_finalizes_reset_ancestor_exec_log() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // Seed the rows record_exec_correlation's UPDATE targets for the
+    // PARENT (the cascaded node). The trigger's row is seeded too —
+    // not for correlation (it never dispatched, its epilogue is a
+    // no-op) but so persist_poisoned/unpin_best_effort hit a real row
+    // instead of logging best-effort errors.
+    let derivation_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO derivations (drv_hash, drv_path, pname, system, status) \
+         VALUES ($1, $2, 'pkg', 'x86_64-linux', 'ready') \
+         RETURNING derivation_id",
+    )
+    .bind("cflz-parent")
+    .bind(test_drv_path("cflz-parent"))
+    .fetch_one(&db.pool)
+    .await?;
+    let trigger_path = "/nix/store/cccccccccccccccccccccccccccccccc-cflz-trigger.drv".to_string();
+    sqlx::query(
+        "INSERT INTO derivations (drv_hash, drv_path, pname, system, status) \
+         VALUES ($1, $2, 'pkg', 'x86_64-linux', 'ready')",
+    )
+    .bind("cflz-trigger")
+    .bind(&trigger_path)
+    .execute(&db.pool)
+    .await?;
+    let build_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO builds (build_id, status) VALUES ($1, 'active')")
+        .bind(build_id)
+        .execute(&db.pool)
+        .await?;
+    sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+        .bind(build_id)
+        .bind(derivation_id)
+        .execute(&db.pool)
+        .await?;
+
+    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(8);
+    let mut actor = DagActor::new(
+        SchedulerDb::new(db.pool.clone()),
+        DagActorConfig::default(),
+        DagActorPlumbing {
+            log_buffers: Some(log_buffers.clone()),
+            log_flush_tx: Some(flush_tx),
+            ..Default::default()
+        },
+    );
+
+    // The trigger: Ready, never dispatched, no buffer. Distinct
+    // store-path hash so its LogBuffers key cannot alias onto the
+    // parent's stamped entry (drv_log_hash keys on the hash component;
+    // test_drv_path stamps the same TEST_HASH into every fixture).
+    // Its interested set is a build the PARENT is not interested in —
+    // if the cascade finalization used the trigger's set instead of
+    // the cascaded node's own, assertion (4) would target a
+    // nonexistent bd row and time out at NULL.
+    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+        drv_path: trigger_path.clone(),
+        ..crate::db::RecoveryDerivationRow::test_default("cflz-trigger", "x86_64-linux")
+    });
+    actor
+        .dag
+        .node_mut("cflz-trigger")
+        .expect("just injected")
+        .interested_builds
+        .insert(Uuid::new_v4());
+
+    // The parent (depends on the trigger): the post-reset shape —
+    // Queued (I-047 demotion), state.exec_id None (reset_to_ready
+    // cleared it), LogBuffers entry still stamped with the reset
+    // execution's exec_id and holding its streamed lines.
+    let exec_id = uuid::Uuid::now_v7();
+    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+        derivation_id,
+        ..crate::db::RecoveryDerivationRow::test_default("cflz-parent", "x86_64-linux")
+    });
+    {
+        let s = actor.dag.node_mut("cflz-parent").expect("just injected");
+        s.set_status_for_test(DerivationStatus::Queued);
+        s.interested_builds.insert(build_id);
+    }
+    actor.test_inject_edge("cflz-parent", "cflz-trigger");
+    let parent_path = test_drv_path("cflz-parent");
+    log_buffers.set_exec(&parent_path, exec_id, "old-worker");
+    assert!(log_buffers.push_for(
+        &parent_path,
+        &rio_proto::types::BuildLogBatch {
+            derivation_path: parent_path.clone(),
+            lines: vec![b"line from the reset execution".to_vec()],
+            first_line_number: 0,
+            executor_id: "old-worker".into(),
+        },
+        "old-worker",
+    ));
+
+    // Poison the never-dispatched trigger (Ready → Poisoned is the
+    // direct I-065 fleet-exhaustion arm; poison_and_cascade validates
+    // the precondition, transitions, then runs
+    // terminal_failure_epilogue → cascade_dependency_failure).
+    actor
+        .poison_and_cascade(&DrvHash::from("cflz-trigger"), "leaf busted")
+        .await;
+
+    // (1) Exactly one FlushRequest — the parent's retained exec, with
+    // the scheduler's "cancelled" disposition. The never-dispatched
+    // trigger contributes none (its epilogue self-gates on a missing
+    // exec_id).
+    let req = flush_rx.try_recv().expect(
+        "the cascade must finalize a swept ancestor's retained \
+         prior-exec log instead of leaving its drv_logs row at \
+         is_complete=false for the 30-day TTL",
+    );
+    assert_eq!(
+        req.exec_id, exec_id,
+        "request pins the retained buffer's stamp"
+    );
+    assert_eq!(req.drv_path, parent_path);
+    assert_eq!(req.status.as_deref(), Some("cancelled"));
+    assert!(
+        flush_rx.try_recv().is_err(),
+        "the never-dispatched trigger has no exec to flush"
+    );
+
+    // (2) Seal discipline: the parent's buffer is sealed (late batches
+    // from the lost worker can't recreate it); the trigger gets no
+    // tombstone. sealed_count is the key-independent leak signal.
+    assert!(log_buffers.is_sealed(&parent_path));
+    assert!(!log_buffers.is_sealed(&trigger_path));
+    assert_eq!(log_buffers.sealed_count(), 1);
+
+    // (3) Both reached the right terminal — the finalization didn't
+    // perturb the transitions.
+    assert_eq!(
+        actor.dag.node("cflz-trigger").expect("in DAG").status(),
+        DerivationStatus::Poisoned
+    );
+    assert_eq!(
+        actor.dag.node("cflz-parent").expect("in DAG").status(),
+        DerivationStatus::DependencyFailed
+    );
+
+    // (4) bd.exec_id recorded for the build that observed the parent's
+    // reset execution — keyed on the PARENT's own interested build
+    // (spawned write; established 10ms × 100 poll).
+    let mut got: Option<Uuid> = None;
+    for _ in 0..100 {
+        got = sqlx::query_scalar(
+            "SELECT exec_id FROM build_derivations \
+             WHERE build_id = $1 AND derivation_id = $2",
+        )
+        .bind(build_id)
+        .bind(derivation_id)
+        .fetch_one(&db.pool)
+        .await?;
+        if got.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        got,
+        Some(exec_id),
+        "cascade must record bd.exec_id for a swept ancestor's \
+         observed execution, against the ancestor's own interested set"
     );
     Ok(())
 }

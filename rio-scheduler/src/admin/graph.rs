@@ -56,14 +56,15 @@ fn node_row_to_proto(r: GraphNodeRow) -> GraphNode {
         // completion handler on terminal paths where an execution ran:
         // Completed, Poisoned, Cancelled from Assigned/Running, and any
         // terminal reached while a prior, reset execution's stamped log
-        // buffer is retained (build-cancel sweep, failed-substitute revert)
-        // (r[sched.merge.exec-correlation+6]). Empty for cache-hit Completed,
-        // cascaded DependencyFailed, Skipped, never-dispatched
-        // terminals, and non-terminal — the dashboard falls back to
-        // "latest exec" for those, which is the right answer (a cache
-        // hit observed whatever the last execution produced) but is
-        // labeled "approximate" because a later execution may have
-        // overwritten it by read time.
+        // buffer is retained (build-cancel sweep, failed-substitute
+        // revert, dependency-failure cascade)
+        // (r[sched.merge.exec-correlation+7]). Empty for cache-hit Completed,
+        // never-dispatched cascaded DependencyFailed, Skipped,
+        // never-dispatched terminals, and non-terminal — the dashboard
+        // falls back to "latest exec" for those, which is the right
+        // answer (a cache hit observed whatever the last execution
+        // produced) but is labeled "approximate" because a later
+        // execution may have overwritten it by read time.
         exec_id: r.exec_id.map(|u| u.to_string()).unwrap_or_default(),
     }
 }
