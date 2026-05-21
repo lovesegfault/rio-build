@@ -613,10 +613,12 @@ impl LogFlusher {
     /// `logs/` prefix can backstop it without code).
     ///
     /// **Failure modes.** PG DELETE failure aborts the pass (logged,
-    /// retried next tick). S3 DeleteObjects failure is logged and the
-    /// pass continues — the PG rows are already gone, and re-running the
-    /// query won't re-find them, so the orphan blobs are unreachable
-    /// from PG. They're bounded by the same lifecycle-rule backstop.
+    /// retried next tick). S3 DeleteObjects failure — request-level
+    /// (`Err`) or per-key (a 200 whose `output.errors()` lists keys S3
+    /// could not delete) — is logged and the pass continues: the PG rows
+    /// are already gone, and re-running the query won't re-find them, so
+    /// the orphan blobs are unreachable from PG. They're bounded by the
+    /// same lifecycle-rule backstop.
     async fn sweep_expired_logs(&self) {
         let mut total_swept = 0u64;
         loop {
@@ -686,7 +688,17 @@ impl LogFlusher {
                     .quiet(true)
                     .build()
                     .expect("Delete: objects is set");
-                if let Err(e) = self
+                // PG rows already gone — undeleted blobs are unreachable
+                // from PG, so they won't be re-tried. Bounded by the
+                // S3 lifecycle-rule backstop. Log at warn (operator
+                // should know S3 deletes are failing) but don't abort
+                // the pass — there may be more expired rows to sweep.
+                // Two failure shapes: the whole request failing (`Err` —
+                // transport/auth) and a 200 response that lists the keys
+                // it could NOT delete (`output.errors()` — KMS denied,
+                // Object Lock, transient backend). With `quiet(true)` the
+                // response body carries only the failed keys.
+                match self
                     .s3
                     .delete_objects()
                     .bucket(&self.bucket)
@@ -694,17 +706,26 @@ impl LogFlusher {
                     .send()
                     .await
                 {
-                    // PG rows already gone — these blobs are unreachable
-                    // from PG, so they won't be re-tried. Bounded by the
-                    // S3 lifecycle-rule backstop. Log at warn (operator
-                    // should know S3 deletes are failing) but don't abort
-                    // the pass — there may be more expired rows to sweep.
-                    warn!(
-                        error = %e,
-                        keys = chunk.len(),
-                        "log GC sweep: S3 DeleteObjects failed \
-                         (orphan blobs; lifecycle rule is the backstop)"
-                    );
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            keys = chunk.len(),
+                            "log GC sweep: S3 DeleteObjects failed \
+                             (orphan blobs; lifecycle rule is the backstop)"
+                        );
+                    }
+                    Ok(output) if !output.errors().is_empty() => {
+                        let errs = output.errors();
+                        warn!(
+                            failed = errs.len(),
+                            keys = chunk.len(),
+                            first_key = errs[0].key().unwrap_or("<unknown>"),
+                            first_code = errs[0].code().unwrap_or("<unknown>"),
+                            "log GC sweep: S3 DeleteObjects had per-key failures \
+                             (orphan blobs; lifecycle rule is the backstop)"
+                        );
+                    }
+                    Ok(_) => {}
                 }
             }
 
@@ -1963,6 +1984,119 @@ mod tests {
             deletes.lock().unwrap().len() as i64,
             n * 2,
             "2 S3 keys per swept row"
+        );
+        Ok(())
+    }
+
+    /// bug_015: S3 `DeleteObjects` returns 200 with the keys it could
+    /// NOT delete listed in `output.errors()` (KMS denied, Object Lock,
+    /// transient backend). `quiet(true)` means the response body carries
+    /// ONLY those failures — but the sweep used to bind only the `Err`
+    /// (request-level) arm, so a per-key failure produced an orphan blob
+    /// with no warn at all. Pin that the per-key arm now warns and that
+    /// the sweep still completes its PG work.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn gc_sweep_warns_on_per_key_delete_errors() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        // 200 OK with one per-key AccessDenied — the request itself
+        // succeeds. RuleMode::MatchAny: the sweep only calls
+        // delete_objects, so one rule suffices.
+        let del_rule = mock!(S3Client::delete_objects).then_output(|| {
+            DeleteObjectsOutput::builder()
+                .errors(
+                    aws_sdk_s3::types::Error::builder()
+                        .key("logs/feedfacefeedfacefeedfacefeedface/x.log.zst")
+                        .code("AccessDenied")
+                        .message("Access Denied")
+                        .build(),
+                )
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&del_rule]);
+
+        let buffers = Arc::new(LogBuffers::new());
+        let flusher = LogFlusher::new(
+            client,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        // One expired row (60d > 30d retention). Return value unused —
+        // the assertion below is on the table being empty, not on a
+        // specific exec_id surviving.
+        seed_drv_log_aged(&db.pool, 60, true).await?;
+
+        flusher.sweep_expired_logs().await;
+
+        // The per-key failure is surfaced — this is the whole bug. The
+        // needle is the arm-specific fragment, not the shared
+        // "lifecycle rule is the backstop" suffix.
+        assert!(
+            logs_contain("per-key failures"),
+            "Ok(output) with non-empty errors() must warn"
+        );
+        // And it did NOT route through the request-level arm.
+        assert!(!logs_contain("DeleteObjects failed"));
+        // The pass still did its PG work — a per-key S3 failure must not
+        // abort the sweep (parity with the request-level Err arm).
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM drv_logs")
+            .fetch_one(&db.pool)
+            .await?;
+        assert_eq!(count, 0, "expired row swept despite per-key S3 failure");
+        Ok(())
+    }
+
+    /// Sibling of `gc_sweep_warns_on_per_key_delete_errors`: the
+    /// request-level failure shape (transport/auth — the whole
+    /// `DeleteObjects` call returns `Err`). This arm pre-dates bug_015
+    /// but was untested; the fix relocates it from `if let Err` to a
+    /// `match` arm, so pin that it still warns and still does not abort
+    /// the pass.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn gc_sweep_warns_on_request_level_delete_error() -> anyhow::Result<()> {
+        use aws_sdk_s3::error::ErrorMetadata;
+        use aws_sdk_s3::operation::delete_objects::DeleteObjectsError;
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let del_rule = mock!(S3Client::delete_objects).then_error(|| {
+            DeleteObjectsError::generic(
+                ErrorMetadata::builder()
+                    .code("InternalError")
+                    .message("simulated S3 500")
+                    .build(),
+            )
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&del_rule]);
+
+        let buffers = Arc::new(LogBuffers::new());
+        let flusher = LogFlusher::new(
+            client,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        seed_drv_log_aged(&db.pool, 60, true).await?;
+
+        flusher.sweep_expired_logs().await;
+
+        // Routed through the request-level arm, not the per-key arm.
+        assert!(
+            logs_contain("DeleteObjects failed"),
+            "request-level Err must warn"
+        );
+        assert!(!logs_contain("per-key failures"));
+        // The pass still did its PG work.
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM drv_logs")
+            .fetch_one(&db.pool)
+            .await?;
+        assert_eq!(
+            count, 0,
+            "expired row swept despite request-level S3 failure"
         );
         Ok(())
     }
