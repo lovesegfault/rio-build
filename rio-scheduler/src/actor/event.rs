@@ -256,29 +256,44 @@ impl BuildEventBus {
         );
     }
 
-    /// Fire a log-flush request. No-op if the flusher isn't configured
-    /// (tests, or `RIO_LOG_S3_BUCKET` unset).
+    /// Fire a log-flush request. Returns whether the request was actually
+    /// handed to a live flusher: `false` means no flusher is configured
+    /// (tests, or `RIO_LOG_S3_BUCKET` unset), the channel is full, or the
+    /// flusher task died — in all of these the request will never be
+    /// processed, so the flusher's `drain_if_exec` will never remove the
+    /// ring-buffer entry and the caller must not rely on it for cleanup.
     ///
     /// `try_send`: if the flusher channel is full (shouldn't happen — 1000
-    /// cap and the flusher's S3 PUT latency is sub-second), drop. The 30s
-    /// periodic tick still snapshots the (sealed) buffer to
-    /// `logs/{drv_hash}/{exec_id}.partial.log.zst` and UPSERTs the
-    /// `drv_logs` row with `is_complete=false` until
-    /// `CleanupTerminalBuild` reaps the DAG node and discards the buffer
-    /// (after `TERMINAL_CLEANUP_DELAY`, ~60s); the row stays incomplete
-    /// and the dashboard sees only the last periodic snapshot.
-    pub(super) fn try_log_flush(&self, req: crate::logs::FlushRequest) {
+    /// cap and the flusher's S3 PUT latency is sub-second), drop. For an
+    /// entry that holds lines the degraded mode depends on why the enqueue
+    /// failed: on Full the (live) 30s periodic tick keeps snapshotting it
+    /// to `logs/{drv_hash}/{exec_id}.partial.log.zst` with
+    /// `is_complete=false`; on Closed or with no flusher configured there
+    /// is no periodic tick either, and the lines sit in the ring buffer
+    /// until `CleanupTerminalBuild` discards them at build cleanup. Either
+    /// way the row stays incomplete and the dashboard sees at most the
+    /// last periodic snapshot. A zero-line entry has nothing for any of
+    /// those paths to persist — `terminal_log_epilogue` reaps it
+    /// immediately when this returns `false` so it can't shadow the S3
+    /// read path.
+    #[must_use]
+    pub(super) fn try_log_flush(&self, req: crate::logs::FlushRequest) -> bool {
         let Some(tx) = &self.flush_tx else {
-            return;
+            return false;
         };
-        if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(req) {
-            warn!("log flush channel full, dropped; periodic tick will snapshot");
-            metrics::counter!("rio_scheduler_log_flush_dropped_total").increment(1);
+        match tx.try_send(req) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("log flush channel full, dropped; periodic tick will snapshot");
+                metrics::counter!("rio_scheduler_log_flush_dropped_total").increment(1);
+                false
+            }
+            // Closed: flusher task died — spawn_monitored already logged the
+            // panic. Don't spam the warn/metric (which would say "full" and
+            // imply the periodic tick recovers — it can't, it lives in the
+            // dead task).
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
-        // Closed: flusher task died — spawn_monitored already logged the
-        // panic. Don't spam the warn/metric (which would say "full" and
-        // imply the periodic tick recovers — it can't, it lives in the
-        // dead task).
     }
 }
 
@@ -591,6 +606,9 @@ impl DagActor {
     /// Fire a log-flush request for the given derivation. No-op if the
     /// flusher isn't configured (tests, or `RIO_LOG_S3_BUCKET` unset).
     ///
+    /// Returns whether the request was enqueued — see
+    /// [`BuildEventBus::try_log_flush`].
+    ///
     /// Called from [`Self::terminal_log_epilogue`] — see its doc for
     /// the call-site enumeration. NOT called from
     /// `handle_transient_failure`: the derivation gets re-queued, a new
@@ -603,26 +621,27 @@ impl DagActor {
     /// the `exec_id` resolved once by [`Self::terminal_log_epilogue`]
     /// so a re-dispatch racing the flusher's mpsc can't be drained by a
     /// stale request — see `FlushRequest::exec_id`.
+    #[must_use]
     pub(super) fn trigger_log_flush(
         &self,
         drv_hash: &DrvHash,
         exec_id: Uuid,
         status: &'static str,
-    ) {
+    ) -> bool {
         let Some(state) = self.dag.node(drv_hash) else {
             // Unreachable: the epilogue (sole caller) already early-returned
             // on this condition and the two calls are synchronous in the same
             // actor handler. Kept as a defensive arm — the lookup is needed
             // for `drv_path` regardless.
             warn!(drv_hash = %drv_hash, "trigger_log_flush: hash not in DAG, skipping");
-            return;
+            return false;
         };
         let drv_path = state.drv_path().to_string();
         self.events.try_log_flush(crate::logs::FlushRequest {
             drv_path,
             exec_id,
             status: Some(status.to_string()),
-        });
+        })
     }
 
     /// Record which execution each interested build observed for
@@ -760,7 +779,11 @@ impl DagActor {
     ///   lines on a same-exec restamp); the final flush preserves that
     ///   tail and finalizes the `drv_logs` row. The
     ///   [`Self::exec_id_for_terminal`] self-gate covers the
-    ///   never-dispatched case.
+    ///   never-dispatched case. If the FlushRequest cannot be enqueued
+    ///   (full channel / dead flusher / no flusher), the zero-line entry
+    ///   is discarded immediately at the epilogue instead — see the
+    ///   enqueue-failure branch below — so the read path still falls
+    ///   through to S3.
     /// - `terminal_failure_epilogue` — `"failed"` (covers `Poisoned` via
     ///   `poison_and_cascade`/`handle_permanent_failure`, timeout-exhausted
     ///   `Cancelled` via `handle_timeout_failure`, and `DependencyFailed`
@@ -901,7 +924,29 @@ impl DagActor {
             return;
         };
         self.seal_log_buffer(drv_hash);
-        self.trigger_log_flush(drv_hash, exec_id, status);
+        let enqueued = self.trigger_log_flush(drv_hash, exec_id, status);
+        if !enqueued && self.discard_log_buffer_if_empty(drv_hash) {
+            // The flusher will never see this request (channel full,
+            // flusher dead, or not configured), so its drain_if_exec will
+            // never remove the entry. A zero-line entry has nothing the
+            // periodic snapshot will ever persist (line_count==0 skip) and
+            // nothing to serve, but its existence makes GetDerivationLogs
+            // return an empty "still active" chunk instead of falling
+            // through to S3 — which can hold the ex-leader's `.partial`,
+            // the only stored content for this execution (recovery's
+            // restamp + adopt_orphan_completion). Reap it now; entries
+            // with lines keep the documented degraded mode (periodic
+            // `.partial` snapshots while a flusher exists, then
+            // CleanupTerminalBuild). A late LogBatch that would have hit
+            // the sealed-drop now hits the no-entry reject instead —
+            // dropped either way.
+            tracing::debug!(
+                drv_hash = %drv_hash,
+                exec_id = %exec_id,
+                status,
+                "flush enqueue failed; discarded empty sealed log buffer so reads fall through to S3"
+            );
+        }
         self.record_exec_correlation(drv_hash, exec_id, interested_builds);
     }
 
@@ -943,6 +988,23 @@ impl DagActor {
             return;
         };
         bufs.discard(drv_path);
+    }
+
+    /// Conditional sibling of [`Self::discard_log_buffer`]: drop the entry
+    /// for `drv_hash` only if it holds zero lines (also un-seals). Called
+    /// from [`Self::terminal_log_epilogue`] when the completion
+    /// `FlushRequest` could not be enqueued — see
+    /// `LogBuffers::discard_if_empty` for the rationale. Returns whether an
+    /// entry was removed. No-op if `log_buffers` unwired (tests) or the drv
+    /// vanished from the DAG.
+    pub(super) fn discard_log_buffer_if_empty(&self, drv_hash: &DrvHash) -> bool {
+        let Some(bufs) = &self.log_buffers else {
+            return false;
+        };
+        let Some(drv_path) = self.dag.path_for_hash(drv_hash) else {
+            return false;
+        };
+        bufs.discard_if_empty(drv_path)
     }
 
     /// Stamp the ring-buffer entry with `(exec_id, executor_id)` for

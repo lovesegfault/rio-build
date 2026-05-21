@@ -441,7 +441,9 @@ impl LogFlusher {
         // and the first request's post-drain unseal already cleared it).
         // Keeping the unseal there is a free defensive bound; it's a
         // no-op in steady state. `CleanupTerminalBuild` is the actual
-        // backstop if a `FlushRequest` was dropped (`try_send` full).
+        // backstop if a `FlushRequest` was dropped (`try_send` full)
+        // (zero-line entries are reaped at the epilogue the moment the
+        // enqueue fails).
         match self.buffers.exec_id(&req.drv_path) {
             Some(live) => {
                 warn!(

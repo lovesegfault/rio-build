@@ -2212,11 +2212,14 @@ async fn try_log_flush_silent_on_closed() {
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     drop(rx); // flusher died
     let bus = BuildEventBus::new(None, Some(tx));
-    bus.try_log_flush(crate::logs::FlushRequest {
-        drv_path: "x".into(),
-        exec_id: uuid::Uuid::now_v7(),
-        status: None,
-    });
+    assert!(
+        !bus.try_log_flush(crate::logs::FlushRequest {
+            drv_path: "x".into(),
+            exec_id: uuid::Uuid::now_v7(),
+            status: None,
+        }),
+        "Closed must report not-enqueued"
+    );
 
     assert_eq!(
         recorder.get("rio_scheduler_log_flush_dropped_total{}"),
@@ -2226,6 +2229,51 @@ async fn try_log_flush_silent_on_closed() {
     assert!(
         !logs_contain("log flush channel full"),
         "Closed must not warn 'channel full'"
+    );
+}
+
+/// The terminal epilogue's empty-buffer reap (bug_008) keys on this
+/// return value: `true` iff the request was handed to a live flusher.
+#[tokio::test]
+async fn try_log_flush_reports_enqueue_result() {
+    use crate::actor::event::BuildEventBus;
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let mk_req = || crate::logs::FlushRequest {
+        drv_path: "x".into(),
+        exec_id: uuid::Uuid::now_v7(),
+        status: None,
+    };
+
+    // No flusher configured → false.
+    let no_flusher = BuildEventBus::new(None, None);
+    assert!(
+        !no_flusher.try_log_flush(mk_req()),
+        "no flusher must report not-enqueued"
+    );
+
+    // Live channel with capacity → true, and the request is actually there.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let bus = BuildEventBus::new(None, Some(tx));
+    assert!(
+        bus.try_log_flush(mk_req()),
+        "successful enqueue must report true"
+    );
+    assert!(
+        rx.try_recv().is_ok(),
+        "the enqueued request reached the channel"
+    );
+
+    // Full → false, and the existing dropped_total contract still holds.
+    assert!(bus.try_log_flush(mk_req()), "refill the single slot");
+    assert!(
+        !bus.try_log_flush(mk_req()),
+        "Full must report not-enqueued"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_log_flush_dropped_total{}"),
+        1,
+        "Full still increments dropped_total exactly once"
     );
 }
 

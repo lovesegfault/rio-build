@@ -2565,7 +2565,9 @@ async fn test_recovery_restamp_clears_stale_exec_lines() -> TestResult {
 /// request); `upload_and_record`'s `line_count == 0` early-return keeps
 /// the empty case a no-op write, so the dead leader's `.partial` row
 /// remains incomplete in this shape — that residual is inherent (the
-/// recovering process holds no lines).
+/// recovering process holds no lines). The retained-vs-reaped contrast
+/// for a request that could NOT be enqueued is
+/// `test_orphan_completion_dropped_flush_discards_empty_buffer`.
 ///
 /// Phase-1 reuses `seed_orphan_assigned` (proven by the other
 /// `test_orphan_completion_*` tests) plus an `assignments.exec_id` INSERT
@@ -2804,6 +2806,157 @@ async fn test_orphan_completion_preserves_ex_leader_log_tail() -> TestResult {
          drain; discarding it loses the log of the execution whose \
          outputs were just adopted"
     );
+    Ok(())
+}
+
+/// Dropped-FlushRequest sibling of
+/// `test_orphan_completion_routes_log_through_epilogue`: when the flush
+/// channel is full at adoption time (post-failover terminal burst), the
+/// flusher will never `drain_if_exec` the recovery-stamped entry — the
+/// actor must reap the zero-line entry itself so `GetDerivationLogs`
+/// falls through to the ex-leader's S3 `.partial` instead of serving an
+/// empty "still active" chunk for the rest of the build's lifetime
+/// (bug_008, round 11). The retained-tail (non-empty) shape is NOT
+/// reaped — that is `test_orphan_completion_preserves_ex_leader_log_tail`
+/// plus the `discard_if_empty_removes_only_zero_line_entries` unit test.
+/// Also asserts `bd.exec_id` directly: the discard runs before
+/// `record_exec_correlation` and must not affect it.
+///
+/// r[verify sched.merge.exec-correlation+7]
+#[tokio::test]
+async fn test_orphan_completion_dropped_flush_discards_empty_buffer() -> TestResult {
+    use super::integration::{put_test_path, setup_inproc_store};
+
+    let exec_id = Uuid::now_v7();
+    let drv_tag = "orphan-dropflush-drv";
+    let dead_worker = "dead-dropflush-w1";
+    let sched_db = TestDb::new(&MIGRATOR).await;
+    let store_db = TestDb::new(&MIGRATOR).await;
+    let (mut store_client, _store_srv) = setup_inproc_store(store_db.pool.clone()).await?;
+    let out_path = test_store_path("orphan-dropflush-out");
+    put_test_path(&mut store_client, &out_path).await?;
+
+    // --- Phase 1: ex-leader's PG state (same shape as the sibling test). ---
+    let build_id = seed_orphan_assigned(&sched_db.pool, drv_tag, &out_path, dead_worker).await?;
+    let (drv_id,): (Uuid,) =
+        sqlx::query_as("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+            .bind(drv_tag)
+            .fetch_one(&sched_db.pool)
+            .await?;
+    sqlx::query(
+        "INSERT INTO assignments (derivation_id, builder_id, generation, status, exec_id) \
+         VALUES ($1, $2, 1, 'pending', $3)",
+    )
+    .bind(drv_id)
+    .bind(dead_worker)
+    .bind(exec_id)
+    .execute(&sched_db.pool)
+    .await?;
+
+    // --- Phase 2: fresh standby with a flush channel that is ALREADY full. ---
+    // Capacity 1, pre-filled with a dummy request: the epilogue's try_send
+    // must hit TrySendError::Full, which is the bug's trigger.
+    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(1);
+    let dummy_drv = "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-dummy.drv".to_string();
+    flush_tx
+        .try_send(crate::logs::FlushRequest {
+            drv_path: dummy_drv.clone(),
+            exec_id: Uuid::now_v7(),
+            status: None,
+        })
+        .expect("pre-fill the only slot");
+    let (handle, _task) =
+        setup_actor_configured(sched_db.pool.clone(), Some(store_client), |_, plumbing| {
+            plumbing.log_buffers = Some(log_buffers.clone());
+            plumbing.log_flush_tx = Some(flush_tx);
+        });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // Pre-condition (non-vacuous): recovery created the empty stamped entry.
+    let drv_path = test_drv_path(drv_tag);
+    assert_eq!(
+        log_buffers.exec_id(&drv_path),
+        Some(exec_id),
+        "recovery should re-stamp the LogBuffers entry before reconcile"
+    );
+    assert!(
+        log_buffers
+            .read_since(&drv_path, 0)
+            .is_some_and(|lines| lines.is_empty()),
+        "stamped entry should exist (read_since=Some) and be empty"
+    );
+
+    // Reconcile: dead worker → orphan → outputs present → adopt_orphan_completion.
+    handle
+        .send_unchecked(ActorCommand::ReconcileAssignments)
+        .await?;
+    barrier(&handle).await;
+
+    let post = expect_drv(&handle, drv_tag).await;
+    assert_eq!(post.status, DerivationStatus::Completed);
+
+    // Premise check: the epilogue's request really was dropped — the only
+    // message in the channel is the pre-filled dummy, and nothing else
+    // ever landed.
+    let only = flush_rx
+        .try_recv()
+        .expect("the pre-filled dummy is still there");
+    assert_eq!(
+        only.drv_path, dummy_drv,
+        "epilogue's request must not have replaced the dummy"
+    );
+    assert!(
+        flush_rx.try_recv().is_err(),
+        "exactly one message total: the adoption's FlushRequest was dropped (channel full)"
+    );
+
+    // KEY ASSERTION (the fix): the empty recovery-stamped entry is gone, so
+    // GetDerivationLogs' ring-buffer probe returns None and the handler
+    // falls through to S3, where the ex-leader's `.partial` row (when one
+    // exists) is the served content. Before the fix this read_since
+    // returned Some([]) and the handler answered with an empty
+    // is_complete=false "still active" chunk until the whole build's
+    // CleanupTerminalBuild.
+    assert!(
+        log_buffers.read_since(&drv_path, 0).is_none(),
+        "dropped FlushRequest must not leave an empty entry shadowing S3"
+    );
+    assert!(
+        log_buffers.exec_id(&drv_path).is_none(),
+        "pin gate now falls through to S3 for the pinned fetch too"
+    );
+    assert!(
+        !log_buffers.is_sealed(&drv_path),
+        "reap also clears the seal tombstone"
+    );
+
+    // The discard runs before record_exec_correlation and must not disturb
+    // it: the interested build still gets bd.exec_id = E even though the
+    // FlushRequest was dropped. Spawned write — poll PG (established
+    // 10ms × 100 pattern).
+    let mut bd_exec: Option<Uuid> = None;
+    for _ in 0..100 {
+        bd_exec = sqlx::query_scalar(
+            "SELECT exec_id FROM build_derivations \
+             WHERE build_id = $1 AND derivation_id = $2",
+        )
+        .bind(build_id)
+        .bind(drv_id)
+        .fetch_one(&sched_db.pool)
+        .await?;
+        if bd_exec.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        bd_exec,
+        Some(exec_id),
+        "correlation unaffected by the discard"
+    );
+
     Ok(())
 }
 

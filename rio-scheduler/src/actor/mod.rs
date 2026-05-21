@@ -265,7 +265,10 @@ pub struct DagActor {
     events: BuildEventBus,
     /// Shared log ring buffers. The actor only seals (via
     /// [`Self::seal_log_buffer`]) on terminal completion so a late
-    /// `LogBatch` can't recreate an entry the flusher already drained.
+    /// `LogBatch` can't recreate an entry the flusher already drained,
+    /// and discards a zero-line entry at the epilogue when the terminal
+    /// `FlushRequest` cannot be enqueued (see
+    /// [`Self::discard_log_buffer_if_empty`]).
     /// `None` in tests that don't exercise the log pipeline.
     log_buffers: Option<Arc<crate::logs::LogBuffers>>,
     /// Connected workers.

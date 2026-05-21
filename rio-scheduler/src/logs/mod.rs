@@ -583,7 +583,10 @@ impl LogBuffers {
     /// (dispatch and rollback — see its rustdoc for
     /// the caller list and per-path rationale), and directly by
     /// `handle_cleanup_terminal_build` for each reaped DAG node (bounds
-    /// a dropped-FlushRequest leak to `TERMINAL_CLEANUP_DELAY`, ~60s) and
+    /// a dropped-FlushRequest leak to `TERMINAL_CLEANUP_DELAY`, ~60s;
+    /// zero-line entries whose terminal FlushRequest could not be
+    /// enqueued are reaped earlier, at the epilogue, via
+    /// [`Self::discard_if_empty`]) and
     /// `tick_process_expired_poisons` for never-re-dispatched poisoned
     /// drvs (defense-in-depth against a slow leak), and by
     /// `discard_unsealed_not_in` (acquisition-time sweep — a `pub(crate)`
@@ -593,6 +596,47 @@ impl LogBuffers {
         let key = drv_log_hash(drv_path);
         self.buffers.remove(&key);
         self.sealed.remove(&key);
+    }
+
+    /// Remove the entry for `drv_path` **only if** it currently holds zero
+    /// lines. Returns whether an entry was removed; on removal also clears
+    /// the seal tombstone (mirrors [`Self::discard`]) so `sealed` stays
+    /// bounded. If no entry exists, nothing is removed and an existing
+    /// seal tombstone is deliberately left in place (it still guards
+    /// against a late batch; `CleanupTerminalBuild` bounds it, exactly as
+    /// today) — this method only reverses the entry+tombstone pair it
+    /// actually reaps.
+    ///
+    /// Called by the actor's `terminal_log_epilogue` when the completion
+    /// `FlushRequest` could not be enqueued (flush channel full, flusher
+    /// task dead, or no flusher configured): the flusher's `drain_if_exec`
+    /// will never remove the entry, the periodic snapshot skips zero-line
+    /// entries, and the drv is terminal so no re-dispatch `discard` is
+    /// coming. Left in place, the empty entry makes `GetDerivationLogs`
+    /// serve an empty "still active" chunk instead of falling through to
+    /// S3 — which can hold the ex-leader's `.partial`, the only stored
+    /// content for the execution (the fresh-standby recovery-restamp shape
+    /// of `adopt_orphan_completion`). A non-empty entry is deliberately
+    /// left alone: its lines are still wanted (the periodic flush keeps
+    /// snapshotting them while a flusher exists; `CleanupTerminalBuild`
+    /// discards at build cleanup).
+    ///
+    /// Atomicity: the emptiness check and the removal happen together
+    /// under `remove_if`'s per-shard lock. A `push_for` that passed the
+    /// seal check before the caller's seal landed either wins the race
+    /// (entry now non-empty → kept, lines preserved) or loses it (entry
+    /// gone → the batch is rejected as unassigned) — the seal alone does
+    /// not provide this guarantee; `remove_if` does.
+    pub fn discard_if_empty(&self, drv_path: &str) -> bool {
+        let key = drv_log_hash(drv_path);
+        let removed = self
+            .buffers
+            .remove_if(&key, |_, e| e.lines.is_empty())
+            .is_some();
+        if removed {
+            self.sealed.remove(&key);
+        }
+        removed
     }
 
     /// Discard the buffer for `drv_path` **only if** it is currently
@@ -706,10 +750,12 @@ impl LogBuffers {
     /// Called by the actor's `terminal_log_epilogue` (via `seal_log_buffer`)
     /// BEFORE `trigger_log_flush`; see `terminal_log_epilogue`'s rustdoc for
     /// the terminal-path caller list. The flusher's [`Self::drain`] still
-    /// owns buffer removal — sealing only prevents post-drain recreation by
-    /// a late batch. Any buffer present at seal time is left for the
-    /// flusher; sealing then draining yields the same contents as draining
-    /// alone.
+    /// owns buffer removal (except a zero-line entry whose terminal
+    /// FlushRequest could not be enqueued — the epilogue reaps that via
+    /// [`Self::discard_if_empty`]) — sealing only prevents post-drain
+    /// recreation by a late batch. Any buffer present at seal time is left
+    /// for the flusher; sealing then draining yields the same contents as
+    /// draining alone.
     ///
     /// Idempotent. Retry / re-dispatch un-seals via [`Self::unseal`] (or
     /// [`Self::discard`], which also un-seals).
@@ -1176,6 +1222,52 @@ mod tests {
         bufs.discard("drv-a");
         assert_eq!(bufs.active_count(), 0, "cleanup discard frees buffer");
         assert_eq!(bufs.sealed_count(), 0, "cleanup discard also unseals");
+    }
+
+    /// bug_008 (round 11): when the terminal FlushRequest cannot be
+    /// enqueued, the actor reaps a ZERO-line (recovery-restamped) entry so
+    /// GetDerivationLogs falls through to the ex-leader's S3 `.partial`,
+    /// but must keep an entry that holds lines (the ex-leader retained
+    /// tail) for the periodic snapshot + CleanupTerminalBuild path.
+    #[test]
+    fn discard_if_empty_removes_only_zero_line_entries() {
+        let bufs = LogBuffers::new();
+        let exec = Uuid::now_v7();
+
+        // Fresh-standby shape: stamped by recovery, sealed at terminal,
+        // zero lines (worker never reconnected).
+        bufs.set_exec("empty-drv", exec, "w1");
+        bufs.seal("empty-drv");
+
+        // Ex-leader shape: same stamp but the retained unflushed tail.
+        bufs.set_exec("tail-drv", exec, "w1");
+        assert!(bufs.push_for("tail-drv", &mk_batch("tail-drv", 0, &[b"l0"]), "w1"));
+        bufs.seal("tail-drv");
+
+        assert!(
+            bufs.discard_if_empty("empty-drv"),
+            "zero-line entry must be removed"
+        );
+        assert!(
+            bufs.read_since("empty-drv", 0).is_none(),
+            "no entry left to shadow the S3 fallthrough"
+        );
+        assert!(!bufs.is_sealed("empty-drv"), "removal also unseals");
+
+        assert!(
+            !bufs.discard_if_empty("tail-drv"),
+            "an entry holding lines must be kept for the periodic flush"
+        );
+        assert!(
+            bufs.read_since("tail-drv", 0).is_some_and(|l| l.len() == 1),
+            "retained tail still readable"
+        );
+        assert!(bufs.is_sealed("tail-drv"), "kept entry keeps its seal");
+
+        assert!(
+            !bufs.discard_if_empty("missing-drv"),
+            "missing entry is a no-op"
+        );
     }
 
     #[test]
