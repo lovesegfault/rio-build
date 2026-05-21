@@ -168,6 +168,7 @@ describe('createLogStream', () => {
     expect(s.done).toBe(true);
   });
 
+  // r[verify obs.log.incomplete-surfaced]
   it('marks done when the generator exhausts without isComplete', async () => {
     // Server closed the stream early (shutdown, abort observed), the
     // build is still running (ring-buffer snapshot), or the stored blob

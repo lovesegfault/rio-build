@@ -46,6 +46,20 @@ place --- `is_complete`, `status`, `finished_at` --- without re-keying
 `s3_key` or deleting the `.partial` blob, which remains the execution's
 only stored content.
 
+#r("obs.log.incomplete-surfaced")[
+  A `GetDerivationLogs` response whose final chunk carries
+  `is_complete = false` MUST be surfaced to the user as incomplete: the CLI
+  prints a trailing notice to stderr and the dashboard log viewer renders an
+  "incomplete" banner. The lines themselves are served as-is --- the flag is
+  display metadata, not a serving gate.
+]
+
+A `.partial`-only row (leader failover before the final flush, a dropped
+completion `FlushRequest`, an abandoned execution) serves the periodic
+snapshot --- strictly more useful than `NotFound`, but the missing tail is
+usually the most interesting part of the log: the build error. Without an
+explicit indicator the user reads a truncated log as the whole thing.
+
 #r("obs.log.worker-header")[
   The worker MUST write `rio: exec`, `rio: builder`, `rio: started` lines as
   the first lines of every build log, and a `rio: exec` + `rio: result` footer

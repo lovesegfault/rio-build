@@ -124,6 +124,7 @@ export function createLogStream(drvPath?: string, execId = ''): LogStream {
       // the missing tail is usually the build error itself. The error
       // path below does NOT set this: the err banner already signals
       // abnormal termination.
+      // r[impl obs.log.incomplete-surfaced]
       incomplete = true;
       done = true;
     } catch (e) {

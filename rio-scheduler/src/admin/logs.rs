@@ -234,7 +234,8 @@ pub(super) fn try_ring_buffer(
 /// Returns the row's `is_complete` propagated to the last chunk: a
 /// `.partial` blob (periodic snapshot of a build whose ring buffer was
 /// lost — leader failover, eviction) is normally served with
-/// `is_complete=false` so the client knows to re-poll; if the execution
+/// `is_complete=false` so the client can tell the user the log is
+/// incomplete (`obs.log.incomplete-surfaced`); if the execution
 /// reached a terminal with nothing further to upload (an empty final
 /// drain after a failover restamp), the row is finalized in place and
 /// the same `.partial` blob is served with `is_complete=true` — it is

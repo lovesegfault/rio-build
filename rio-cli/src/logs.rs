@@ -71,6 +71,7 @@ pub(crate) async fn run(client: &mut AdminClient, a: Args) -> anyhow::Result<()>
     // closed-without-is_complete warning. Initialized `true` so a
     // zero-chunk clean close (unreachable today — every server path
     // emits ≥1 chunk or an error) stays silent.
+    // r[impl obs.log.incomplete-surfaced]
     let mut last_complete = true;
     while let Some(chunk) = stream.message().await.map_err(|s| {
         anyhow!(
