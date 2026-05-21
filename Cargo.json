@@ -19066,6 +19066,10 @@
           "packageId": "axum"
         },
         {
+          "name": "blake3",
+          "packageId": "blake3"
+        },
+        {
           "name": "clap",
           "packageId": "clap"
         },
@@ -19088,6 +19092,10 @@
         {
           "name": "nix",
           "packageId": "nix 0.31.3"
+        },
+        {
+          "name": "postcard",
+          "packageId": "postcard"
         },
         {
           "name": "prost-types",
@@ -19200,6 +19208,10 @@
         {
           "name": "rio-builder",
           "path": "src/main.rs"
+        },
+        {
+          "name": "rio-mountd",
+          "path": "src/bin/rio-mountd.rs"
         },
         {
           "name": "spike_digest_fuse",

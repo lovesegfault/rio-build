@@ -251,13 +251,39 @@ The builder pod runs unprivileged with no device mounts. `/dev/fuse` is not open
 
 r[builder.mountd.backing-broker]
 
-`BackingOpen{}`/`BackingClose{id}` are the only ioctl-brokering requests: the fd travels in the frame's `SCM_RIGHTS` cmsg, never in the bincode body; mountd issues `FUSE_DEV_IOC_BACKING_OPEN` against its kept `/dev/fuse` dup and replies the conn-scoped `backing_id`.
+`BackingOpen{}`/`BackingClose{id}` are the only ioctl-brokering requests: the fd travels in the frame's `SCM_RIGHTS` cmsg, never in the serialized body; mountd issues `FUSE_DEV_IOC_BACKING_OPEN` against its kept `/dev/fuse` dup and replies the conn-scoped `backing_id`.
+
+The wire format is one postcard-encoded frame per `SOCK_SEQPACKET` datagram (`MAX_FRAME_BYTES = 4096`, enforced via `MSG_TRUNC` on the receive side). Not `SOCK_STREAM` + length-prefix: stream sockets associate `SCM_RIGHTS` ancillary data with a byte position rather than a frame, so a reader whose `recvmsg` boundaries drift from the writer's `sendmsg` boundaries can attach an fd to the wrong pipelined request. Message-boundary preservation makes one datagram == one frame == its fds.
 
 r[builder.mountd.concurrency]
 
 `Promote` and `PromoteChunks` (≤64 per batch, ≤16 MiB I/O) both run on `spawn_blocking` bounded by `Semaphore(num_cpus)`; replies correlate via `seq`. `BackingOpen`/`BackingClose` are answered inline (sub-ms). Per-conn state is `Send + Sync` and replies are `seq`-correlated, so out-of-order completion is well-defined.
 
-`rio-mountd` holds, per build, the UDS connection, a dup of that build's `/dev/fuse` fd, and the staging dirfds; ~250 LoC. Requests carry a `seq: u32` echoed in replies (so `spawn_blocking` `Promote`/`PromoteChunks` can reply out-of-order); errors are typed (`DigestMismatch`/`NotRegular`/`TooLarge`/`BadBuildId`/`AlreadyMounted` are build-fatal, `Retryable(..)` is infra-retry). The UDS socket is mode 0660 group `rio-builder`; mountd checks `SO_PEERCRED.gid` and rejects others. **`build_id` is validated as `^[A-Za-z0-9_-]{1,64}$`** (`r[builder.mountd.build-id-validated]`) and per-build paths are constructed via `openat(base_dirfd, build_id, O_NOFOLLOW)` against pre-opened `/var/rio/{castore,staging}` base dirfds — never string-interpolated. **One live connection per `SO_PEERCRED.uid`** (`r[builder.mountd.uid-bound]`): k8s userns maps each pod to a distinct host-uid range, so a sandbox-escaped build cannot open a second connection. **One live `build_id` per process** (`r[builder.mountd.build-id-unique]`): a process-wide set rejects `Mount{}` for a `build_id` another connection already owns — uid-bound alone does not stop a compromised builder using its first Mount to claim a victim's `build_id`. **One `Mount` per connection** (`r[builder.mountd.one-mount]`): a second `Mount{}` on the same conn is `AlreadyMounted`, so it cannot leak fuse mounts or staging dirs by spamming. **Staging quota is kernel-enforced** (`r[builder.mountd.staging-quota]`): mountd sets an XFS project quota on `staging/{build_id}` at `mkdirat`, so a compromised builder's `write(2)` hits `ENOSPC` at `staging_quota_bytes` regardless of whether it ever calls `Promote`. **Promote copies at most `st_size`** (`r[builder.mountd.promote-bounded-copy]`). It is a strictly smaller privileged surface than the pre-ADR-022 model, where the builder pod itself held `CAP_SYS_ADMIN`. The brokered `BACKING_OPEN` registers an fd the builder already holds (conn-scoped, depth-0-only); `Promote` is the integrity boundary for the shared cache.
+`rio-mountd` holds, per build, the UDS connection, a dup of that build's `/dev/fuse` fd, and the staging dirfds; ~250 LoC. Requests carry a `seq: u32` echoed in replies (so `spawn_blocking` `Promote`/`PromoteChunks` can reply out-of-order); errors are typed (`DigestMismatch`/`NotRegular`/`TooLarge`/`BadBuildId`/`AlreadyMounted` are build-fatal, `Retryable(..)` is infra-retry). The UDS socket is mode 0660 group `rio-builder`; mountd checks `SO_PEERCRED.gid` and rejects others. It is a strictly smaller privileged surface than the pre-ADR-022 model, where the builder pod itself held `CAP_SYS_ADMIN`: the brokered `BACKING_OPEN` registers an fd the builder already holds (conn-scoped, depth-0-only), and `Promote` is the integrity boundary for the shared cache. The five hardening invariants:
+
+r[builder.mountd.build-id-validated]
+
+`build_id` is validated as `^[A-Za-z0-9_-]{1,64}$` and per-build paths are constructed via `openat(base_dirfd, build_id, O_NOFOLLOW)` against pre-opened `/var/rio/{castore,staging}` base dirfds — never string-interpolated. The character class excludes `/`, `.` and NUL, so a validated `build_id` is always a single, non-traversing path component.
+
+r[builder.mountd.uid-bound]
+
+One live connection per `SO_PEERCRED.uid`. k8s userns maps each pod to a distinct host-uid range, so a sandbox-escaped build cannot open a second connection.
+
+r[builder.mountd.build-id-unique]
+
+One live `build_id` per process: a process-wide set rejects `Mount{}` for a `build_id` another connection already owns. uid-bound alone does not stop a compromised builder using its first Mount to claim a victim's `build_id`.
+
+r[builder.mountd.one-mount]
+
+One `Mount` per connection: a second `Mount{}` on the same conn is `AlreadyMounted`, so a build cannot leak fuse mounts or staging dirs by spamming.
+
+r[builder.mountd.staging-quota]
+
+Staging quota is kernel-enforced: mountd sets a filesystem project quota on `staging/{build_id}` at creation, so a compromised builder's `write(2)` hits `ENOSPC` at `staging_quota_bytes` regardless of whether it ever calls `Promote`. The project id is mountd-assigned and monotonic — never derived from the adversary-chosen `build_id`, so a build cannot collide into a victim's quota bucket.
+
+r[builder.mountd.promote-bounded-copy]
+
+`Promote` copies at most the source's `fstat`-time `st_size` bytes. The builder owns the staged inode and can append to it concurrently; copying "until EOF" would let it grow the privileged write into the shared cache without bound. Growth and truncation relative to `st_size` are both rejected as a digest mismatch.
 
 ## 12. Integrity
 
