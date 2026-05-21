@@ -81,4 +81,3 @@ rio-store = { workspace = true, features = ["test-utils"] }
 sqlx = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-figment.workspace = true

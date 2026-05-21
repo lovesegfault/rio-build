@@ -4,7 +4,7 @@
 //!   - [`Config`]: merged result, all fields concrete, `Default` =
 //!     compiled-in defaults (see `tests::config_defaults_are_stable`).
 //!   - [`CliArgs`]: clap-parsed, all fields `Option`, no `env=`
-//!     (figment's Env provider handles that), no `default_value`
+//!     (the RIO_ env layer handles that), no `default_value`
 //!     (absence = `None` = don't overlay).
 
 use clap::Parser;
@@ -178,7 +178,7 @@ impl rio_common::config::ValidateConfig for Config {
     /// the full gateway (gRPC connect, SSH listener).
     fn validate(&self) -> anyhow::Result<()> {
         // Required-field checks that `#[serde(default)]` can't express
-        // (figment's "missing field" error for `String` defaulting to `""`
+        // (the loader's "missing field" error for `String` defaulting to `""`
         // is a silent success, not an error).
         use rio_common::config::ensure_required;
         self.scheduler
@@ -264,7 +264,7 @@ mod tests {
         CliArgs::command().debug_assert();
     }
 
-    // figment::Jail standing-guard tests — see rio-test-support/src/config.rs.
+    // Jailed standing-guard tests — see rio-test-support/src/config.rs.
     // When you add Config.newfield: ADD IT to both assert blocks below.
 
     rio_test_support::jail_roundtrip!(
@@ -287,7 +287,7 @@ mod tests {
             assert_eq!(cfg.max_transitive_inputs, 250_000);
             assert!(
                 cfg.jwt.required,
-                "[jwt] table must thread through figment into JwtConfig"
+                "[jwt] table must thread through the config layers into JwtConfig"
             );
             assert_eq!(
                 cfg.jwt.key_path.as_deref(),

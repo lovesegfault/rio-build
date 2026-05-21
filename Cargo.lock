@@ -6302,7 +6302,6 @@ dependencies = [
  "base64",
  "clap",
  "ed25519-dalek",
- "figment",
  "futures-util",
  "governor",
  "hex",

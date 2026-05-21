@@ -19996,10 +19996,6 @@
       ],
       "devDependencies": [
         {
-          "name": "figment",
-          "packageId": "figment"
-        },
-        {
           "name": "rio-migrations",
           "packageId": "rio-migrations"
         },
