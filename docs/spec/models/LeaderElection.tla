@@ -102,6 +102,14 @@
 (*               holder and leaseTransitions reset, resourceVersion does   *)
 (*               not, PG survives. Disabled (MaxDeletes=0) in the base     *)
 (*               cfg; LeaderElectionDeletion.cfg enables one per trace.    *)
+(*   ClaimFails  (a disjunct inside Steal/RenewLease, not an action) the   *)
+(*               claim INSERT errors and recovery proceeds unclaimed --    *)
+(*               the documented proceed-on-failure path. Disabled          *)
+(*               (MaxClaimFailures=0) everywhere except                    *)
+(*               LeaderElectionPgFaults.cfg.                               *)
+(*   PgRestore   a PostgreSQL point-in-time restore regresses the floor    *)
+(*               to 0; the Lease object survives. Disabled (MaxRestores=0) *)
+(*               everywhere except LeaderElectionPgFaults.cfg.             *)
 (*                                                                         *)
 (* PHASE-2 DEFERRALS: liveness (eventually-some-leader needs an unbounded  *)
 (* clock, which TLC cannot check -- the temporal form stutters one tick    *)
@@ -145,12 +153,20 @@ CONSTANTS Nodes,    \* set of node identities, e.g. {n1, n2, n3}
           MaxTime,  \* clock ceiling (state-space bound)
           MaxGen,   \* generation ceiling (state-space bound)
           MaxRv,    \* rv ceiling (state-space bound)
-          MaxDeletes \* Lease-object deletions per trace (0 = fault disabled)
+          MaxDeletes, \* Lease-object deletions per trace (0 = fault disabled)
+          MaxClaimFailures, \* failed claim INSERTs per trace (0 = disabled).
+                    \* The production proceed-on-failure path: PG dies
+                    \* between the seed read and the claim write, recovery
+                    \* logs + counts + proceeds, the leader dispatches at a
+                    \* generation the ledger does not contain.
+          MaxRestores \* PG point-in-time restores per trace (0 = disabled).
+                    \* Regresses the claims ledger AND the assignment
+                    \* history together (the floor is GREATEST over both).
 
 ASSUME FenceAfter \in Nat /\ StealAfter \in Nat /\ Renew \in Nat
        /\ Renew >= 1 /\ FenceAfter >= Renew /\ StealAfter >= FenceAfter
 ASSUME MaxSkew \in Nat /\ MaxTime \in Nat /\ MaxGen \in Nat /\ MaxRv \in Nat
-ASSUME MaxDeletes \in Nat
+ASSUME MaxDeletes \in Nat /\ MaxClaimFailures \in Nat /\ MaxRestores \in Nat
 
 VARIABLES
   clocks,      \* [Nodes -> 0..MaxTime] -- per-node monotonic clock
@@ -165,10 +181,12 @@ VARIABLES
   acquiredAt,  \* [Nodes -> (0..MaxRv \cup {NULL})] -- rv at last acquire
   casRace,     \* BOOLEAN -- has any CAS race been observed?
   deletes,     \* 0..MaxDeletes -- Lease-object deletions so far
-  delVictims   \* SUBSET Nodes -- holders deposed by a deletion, not a steal
+  delVictims,  \* SUBSET Nodes -- holders deposed by a deletion, not a steal
+  claimFailures, \* 0..MaxClaimFailures -- failed claim INSERTs so far
+  restores     \* 0..MaxRestores -- PG point-in-time restores so far
 
 vars == <<clocks, lease, alive, state, snap, obs, fence, gen, genHW, acquiredAt,
-          casRace, deletes, delVictims>>
+          casRace, deletes, delVictims, claimFailures, restores>>
 
 LeaseRecord == [holder : Nodes \cup {NULL}, rv : 0..MaxRv, gen : 0..MaxGen]
 ObsRecord   == [rv : 0..MaxRv, since : 0..MaxTime]
@@ -187,6 +205,8 @@ TypeOK ==
   /\ casRace \in BOOLEAN
   /\ deletes \in 0..MaxDeletes
   /\ delVictims \in SUBSET Nodes
+  /\ claimFailures \in 0..MaxClaimFailures
+  /\ restores \in 0..MaxRestores
 
 \* SYMMETRY: nodes are interchangeable. Cuts the state space by |Nodes|!.
 perm == Permutations(Nodes)
@@ -466,6 +486,8 @@ Init ==
   /\ casRace = FALSE
   /\ deletes = 0
   /\ delVictims = {}
+  /\ claimFailures = 0
+  /\ restores = 0
 
 \* -----------------------------------------------------------------------
 \* Time. clocks[n] advances independently. Ticks regardless of process
@@ -490,7 +512,7 @@ Tick(n) ==
        (clocks[n] + 1) - fence[n] <= FenceAfter + Renew
   /\ clocks' = [clocks EXCEPT ![n] = @ + 1]
   /\ UNCHANGED <<lease, alive, state, snap, obs, fence, gen, genHW, acquiredAt,
-                 casRace, deletes, delVictims>>
+                 casRace, deletes, delVictims, claimFailures, restores>>
 
 \* -----------------------------------------------------------------------
 \* Apiserver round-trip. Get(n) is the GET; Steal/RenewLease are the PUT
@@ -533,7 +555,7 @@ Get(n) ==
        ELSE IF obs[n] /= NULL /\ obs[n].rv = lease.rv THEN obs[n]
        ELSE [rv |-> lease.rv, since |-> clocks[n]]]
   /\ UNCHANGED <<clocks, lease, alive, state, fence, gen, genHW, acquiredAt,
-                 casRace, deletes, delVictims>>
+                 casRace, deletes, delVictims, claimFailures, restores>>
 
 \* The shared CAS guard for Steal/RenewLease. NOT a standalone action -- a
 \* helper that Steal and RenewLease conjoin. The casRace history is
@@ -594,8 +616,22 @@ Steal(n) ==
   /\ state' = [state EXCEPT ![n] = "Leading"]
   /\ gen'   = [gen EXCEPT ![n] = seeded]
   \* The claim: fetch_max in shape, though seeded >= genHW+1 always holds
-  \* here (target's ELSE arm is genHW+1 and seeded >= target).
-  /\ genHW' = IF seeded > genHW THEN seeded ELSE genHW
+  \* here (target's ELSE arm is genHW+1 and seeded >= target). The
+  \* disjunction is the ClaimFails fault: the INSERT into the claims
+  \* ledger errors (PG dies between the seed read and the claim write)
+  \* and recovery proceeds anyway -- the node still acquires, still
+  \* derives gen[n] = seeded, still leads, but the floor a successor
+  \* seeds from does not cover the generation it dispatches at. The
+  \* claimFailures increment is the trace marker; the seeded > genHW
+  \* guard is the non-triviality condition (a claim that would not have
+  \* raised the floor cannot fail meaningfully). Never enabled with
+  \* MaxClaimFailures = 0.
+  /\ \/ /\ genHW' = IF seeded > genHW THEN seeded ELSE genHW
+        /\ UNCHANGED claimFailures
+     \/ /\ claimFailures < MaxClaimFailures
+        /\ seeded > genHW
+        /\ genHW' = genHW
+        /\ claimFailures' = claimFailures + 1
   /\ acquiredAt' = [acquiredAt EXCEPT ![n] = snap[n].rv]
   /\ fence' = [fence EXCEPT ![n] = clocks[n]]
   /\ obs'   = [obs   EXCEPT ![n] = NULL]      \* on_acquire clears observed
@@ -606,7 +642,7 @@ Steal(n) ==
   \* obligation (the fourth BoundedDualLeadership disjunct would fire
   \* for a victim that was deposed by a thief, not by a deletion).
   /\ delVictims' = delVictims \ {n}
-  /\ UNCHANGED <<clocks, alive, deletes>>
+  /\ UNCHANGED <<clocks, alive, deletes, restores>>
 
 \* The decide()->Renew path: we hold the lease, refresh renew_time. Bumps rv
 \* (the apiserver bumps on every write); does NOT touch holder or the
@@ -711,10 +747,22 @@ RenewLease(n) ==
   /\ lease' = [lease EXCEPT !.rv = snap[n].rv + 1]
   /\ state' = [state EXCEPT ![n] = "Leading"]
   /\ gen'   = [gen EXCEPT ![n] = IF state[n] = "Following" THEN seeded ELSE @]
-  /\ genHW' = IF state[n] = "Following" /\ seeded > genHW THEN seeded ELSE genHW
+  \* The same ClaimFails disjunction as Steal's, restricted to the edge
+  \* branch -- a steady-state renew never claims, so it cannot fail to
+  \* claim. The retry-on-the-next-acquire-edge behavior falls out: a
+  \* failed claim leaves genHW < gen[n], and the NEXT edge renew (or
+  \* steal) recomputes seeded and offers the ledger the claim again.
+  /\ \/ /\ genHW' = IF state[n] = "Following" /\ seeded > genHW
+                    THEN seeded ELSE genHW
+        /\ UNCHANGED claimFailures
+     \/ /\ claimFailures < MaxClaimFailures
+        /\ state[n] = "Following"
+        /\ seeded > genHW
+        /\ genHW' = genHW
+        /\ claimFailures' = claimFailures + 1
   /\ fence' = [fence EXCEPT ![n] = clocks[n]]
   /\ snap'  = [snap  EXCEPT ![n] = NULL]
-  /\ UNCHANGED <<clocks, alive, obs, acquiredAt, deletes, delVictims>>
+  /\ UNCHANGED <<clocks, alive, obs, acquiredAt, deletes, delVictims, restores>>
 
 \* The 409 path: snap stale. Stamps fence (apiserver answered). If we were
 \* Leading this is an explicit lose -- someone stole between our GET and PUT.
@@ -727,7 +775,7 @@ Conflict(n) ==
   /\ state' = [state EXCEPT ![n] = "Following"]
   /\ snap'  = [snap  EXCEPT ![n] = NULL]
   /\ UNCHANGED <<clocks, lease, alive, obs, gen, genHW, acquiredAt, casRace,
-                 deletes, delVictims>>
+                 deletes, delVictims, claimFailures, restores>>
 
 \* Persist(n) -- REMOVED. It modeled the lazy dispatch-time PG write of the
 \* new generation (genHW' = gen[n] once the leader started dispatching);
@@ -761,7 +809,7 @@ SelfFence(n) ==
   /\ clocks[n] - fence[n] > FenceAfter
   /\ state' = [state EXCEPT ![n] = "Following"]
   /\ UNCHANGED <<clocks, lease, alive, snap, obs, fence, gen, genHW, acquiredAt,
-                 casRace, deletes, delVictims>>
+                 casRace, deletes, delVictims, claimFailures, restores>>
 
 \* Pod crash. Loses ALL in-memory state: the belief (state), the snapshot,
 \* the observed-record clock, the self-fence clock, the in-memory
@@ -777,7 +825,8 @@ Crash(n) ==
   /\ fence'      = [fence      EXCEPT ![n] = 0]
   /\ gen'        = [gen        EXCEPT ![n] = 1]
   /\ acquiredAt' = [acquiredAt EXCEPT ![n] = NULL]
-  /\ UNCHANGED <<clocks, lease, genHW, casRace, deletes, delVictims>>
+  /\ UNCHANGED <<clocks, lease, genHW, casRace, deletes, delVictims,
+                 claimFailures, restores>>
 
 \* Pod restart. The recovered process has no observation (its first
 \* decide() returns StartObserving and waits a full StealAfter before stealing)
@@ -787,7 +836,7 @@ Recover(n) ==
   /\ ~alive[n]
   /\ alive' = [alive EXCEPT ![n] = TRUE]
   /\ UNCHANGED <<clocks, lease, state, snap, obs, fence, gen, genHW, acquiredAt,
-                 casRace, deletes, delVictims>>
+                 casRace, deletes, delVictims, claimFailures, restores>>
 
 \* Operator fault: `kubectl delete lease` destroys the Lease object and
 \* the next replica to GET a 404 recreates it (election.rs::create()).
@@ -831,7 +880,31 @@ DeleteLease ==
   /\ deletes' = deletes + 1
   /\ delVictims' = delVictims \cup {lease.holder}
   /\ UNCHANGED <<clocks, alive, state, snap, obs, fence, gen, genHW,
-                 acquiredAt, casRace>>
+                 acquiredAt, casRace, claimFailures, restores>>
+
+\* Operator/infrastructure fault: a PostgreSQL point-in-time restore
+\* regresses the claims ledger AND the assignment history together (the
+\* production floor is GREATEST over both, and a PITR rolls the whole
+\* database back). genHW' = 0 is the worst case -- a restore to before
+\* any claim was ever written; any partial regression is subsumed by it
+\* for the invariants in question (a floor that remembers MORE can only
+\* make a successor's seed HIGHER). Nothing else changes: the apiserver
+\* (the Lease object and its transition count) is a separate system and
+\* survives, which is exactly why this fault alone is survivable -- the
+\* generation derivation falls back to lease.gen + 2, which is monotonic
+\* across stealers as long as nobody resets the transition count. The
+\* etcd analogue is a snapshot restore regressing the revision counter;
+\* etcd's documented remedy is to over-bump the counter past anything
+\* that could have been issued, which is what the lease-derived term
+\* does implicitly here. Guarded by genHW > 0 (restoring an empty ledger
+\* changes nothing) and MaxRestores.
+PgRestore ==
+  /\ restores < MaxRestores
+  /\ genHW > 0
+  /\ genHW' = 0
+  /\ restores' = restores + 1
+  /\ UNCHANGED <<clocks, lease, alive, state, snap, obs, fence, gen,
+                 acquiredAt, casRace, deletes, delVictims, claimFailures>>
 
 Next ==
   \/ \E n \in Nodes :
@@ -844,6 +917,7 @@ Next ==
        \/ Crash(n)
        \/ Recover(n)
   \/ DeleteLease
+  \/ PgRestore
 
 Spec == Init /\ [][Next]_vars
 

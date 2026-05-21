@@ -190,5 +190,28 @@ in
       spec = "LeaderElection";
       config = "LeaderElectionAsymmetric";
     };
+
+    # The same model with both PostgreSQL-side faults enabled and the
+    # Lease-deletion fault disabled: a failed claim INSERT (the
+    # production proceed-on-failure path — recovery logs, counts, and
+    # dispatches at a generation the claims ledger does not contain) and
+    # a point-in-time restore (the floor regresses to zero). All five
+    # invariants still hold: the Lease object's transition count is an
+    # independent epoch source, so each PG fault alone is survivable —
+    # the Lease and the PG ledger are REDUNDANT epoch sources and a
+    # generation collision requires destroying both. The boundary is
+    # measured: re-enabling the deletion fault alongside either PG fault
+    # violates StaleLeaderHasStaleGeneration in a 7-state trace (see
+    # LeaderElectionPgFaults.cfg's header for both traces). Those
+    # conjunctions are the documented, accepted residuals of the
+    # proceed-on-failure choice and of relying on PG as the
+    # post-deletion backstop; this check pins the claim that they are
+    # the ONLY ways a PG-side fault reaches a collision.
+    # r[verify sched.lease.generation-claim]
+    tla-leader-election-pg-faults = mkTlcCheck {
+      name = "leader-election-pg-faults";
+      spec = "LeaderElection";
+      config = "LeaderElectionPgFaults";
+    };
   };
 }
