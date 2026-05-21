@@ -2134,7 +2134,9 @@ CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
   so a partition does not produce two simultaneous believers unless one
   replica's clock pauses or skews by more than the margin leaves over after
   the renew-polling slack (1.5s). For that residual --- and for the
-  pre-asymmetric deployments the degraded-regime model cfgs describe ---
+  pre-asymmetric deployments the degraded-regime modules
+  (`leaderElectionBase`, `leaderElectionDeletion` in
+  `docs/spec/models/leaderElection.qnt`) describe ---
   dispatch is idempotent: DAG merge dedups by `drv_hash`, and executors reject
   stale-generation assignments after seeing the new generation in
   `HeartbeatResponse`. Worst case: a derivation is dispatched twice, builds
@@ -2319,7 +2321,9 @@ restore _alone_ (the lease-derived term of the generation still increases
 strictly across successive stealers when the floor term lies), and only the
 conjunction of a PG fault with a Lease deletion --- both epoch sources
 destroyed --- reaches a collision. Those conjunctions are the documented
-residuals, reproduced as 7-state traces in that cfg's header.
+residuals; that regime's module header records the procedure for re-deriving
+them, and the trace evidence lives in that regime's introducing commit
+message.
 
 #r("sched.lease.graceful-release")[
   On graceful shutdown (SIGTERM), if the lease loop was leading, it calls
