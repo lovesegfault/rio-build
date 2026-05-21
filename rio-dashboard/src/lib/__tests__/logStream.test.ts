@@ -67,6 +67,8 @@ describe('createLogStream', () => {
 
     expect(s.lines).toEqual(['hello', 'world', '!']);
     expect(s.done).toBe(true);
+    // Final log (isComplete chunk seen) → no incomplete banner.
+    expect(s.incomplete).toBe(false);
     expect(s.err).toBeNull();
 
     // RPC was called with the expected request shape; sinceLine is the
@@ -167,8 +169,12 @@ describe('createLogStream', () => {
   });
 
   it('marks done when the generator exhausts without isComplete', async () => {
-    // Server closed the stream early (shutdown, abort observed). We
-    // shouldn't leave the spinner spinning.
+    // Server closed the stream early (shutdown, abort observed), the
+    // build is still running (ring-buffer snapshot), or the stored blob
+    // is a `.partial` whose final flush never landed. We shouldn't leave
+    // the spinner spinning, but the content is incomplete — the viewer
+    // renders a banner so the missing tail (usually the build error)
+    // isn't read as the whole log.
     getDerivationLogs.mockImplementation(async function* () {
       yield chunk([u8(0x7a)]);
       // No isComplete chunk, just end.
@@ -179,6 +185,7 @@ describe('createLogStream', () => {
 
     expect(s.lines).toEqual(['z']);
     expect(s.done).toBe(true);
+    expect(s.incomplete).toBe(true);
     expect(s.err).toBeNull();
   });
 

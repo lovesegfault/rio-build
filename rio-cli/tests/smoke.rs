@@ -211,11 +211,40 @@ async fn status_human_output_has_all_sections() -> anyhow::Result<()> {
 async fn logs_drains_stream_and_prints_bytes() -> anyhow::Result<()> {
     let (_admin, addr, _handle) = spawn_mock_admin().await?;
 
-    // MockAdmin's get_derivation_logs sends one chunk with b"mock log line".
-    // The CLI writes each line raw + newline.
+    // MockAdmin's get_derivation_logs sends one chunk with b"mock log line"
+    // and is_complete=true. The CLI writes each line raw + newline and,
+    // because the terminal chunk is complete, must NOT emit the
+    // "(log incomplete …)" stderr warning.
     let (status, stdout, stderr) = run_cli(&addr, &["logs", "/nix/store/abc-foo.drv"]);
     assert!(status.success(), "logs: {stderr}");
     assert_eq!(stdout, "mock log line\n");
+    assert!(
+        !stderr.contains("log incomplete"),
+        "unexpected incomplete warning for a complete log: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn logs_warns_on_incomplete_terminal_chunk() -> anyhow::Result<()> {
+    let (admin, addr, _handle) = spawn_mock_admin().await?;
+    // Flip the mock so its single chunk carries is_complete=false — the
+    // shape try_s3 produces for a `.partial` blob (periodic snapshot whose
+    // final flush never landed) and try_ring_buffer for a still-running
+    // build. The lines must still print to stdout, the incompleteness must
+    // be flagged on stderr, and the exit code stays 0 (an incomplete log
+    // is not a command failure — the build may simply still be running).
+    admin
+        .log_incomplete
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let (status, stdout, stderr) = run_cli(&addr, &["logs", "/nix/store/abc-foo.drv"]);
+    assert!(status.success(), "logs: {stderr}");
+    assert_eq!(stdout, "mock log line\n");
+    assert!(
+        stderr.contains("log incomplete"),
+        "expected incomplete warning on stderr: {stderr:?}"
+    );
     Ok(())
 }
 

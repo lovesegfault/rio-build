@@ -201,6 +201,12 @@
   {:else if stream.lines.length === 0 && !stream.err}
     <div class="empty">no log output</div>
   {/if}
+  {#if stream.incomplete}
+    <div class="incomplete" data-testid="log-incomplete">
+      — log incomplete: the build is still running or its final flush is
+      pending —
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -238,6 +244,13 @@
     font-style: italic;
     text-align: center;
     border-bottom: 1px dashed #334155;
+  }
+  .incomplete {
+    padding: 0.5rem 0.75rem;
+    color: #64748b;
+    font-style: italic;
+    text-align: center;
+    border-top: 1px dashed #334155;
   }
   .tail,
   .empty {

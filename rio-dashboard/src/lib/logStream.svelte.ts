@@ -41,6 +41,7 @@ export type LogStream = {
   readonly err: Error | null;
   readonly truncated: boolean;
   readonly droppedLines: number;
+  readonly incomplete: boolean;
   destroy: () => void;
 };
 
@@ -58,6 +59,7 @@ export function createLogStream(drvPath?: string, execId = ''): LogStream {
   let err = $state<Error | null>(null);
   let truncated = $state(false);
   let droppedLines = $state(0);
+  let incomplete = $state(false);
   const ctrl = new AbortController();
 
   (async () => {
@@ -113,9 +115,16 @@ export function createLogStream(drvPath?: string, execId = ''): LogStream {
           return;
         }
       }
-      // Generator exhausted without isComplete — server closed the
-      // stream early (shutdown, client abort observed). Treat as done
-      // so the spinner doesn't lie.
+      // Generator exhausted without isComplete — the build is still
+      // running (ring-buffer snapshot), the stored blob is a `.partial`
+      // periodic snapshot whose final flush never landed (leader
+      // failover, dropped FlushRequest), or the server shut down
+      // mid-stream. Treat as done so the spinner doesn't lie, but flag
+      // the content as incomplete so LogViewer can render a banner —
+      // the missing tail is usually the build error itself. The error
+      // path below does NOT set this: the err banner already signals
+      // abnormal termination.
+      incomplete = true;
       done = true;
     } catch (e) {
       // Swallow AbortError: that's our own destroy() firing. Anything
@@ -143,6 +152,9 @@ export function createLogStream(drvPath?: string, execId = ''): LogStream {
     },
     get droppedLines() {
       return droppedLines;
+    },
+    get incomplete() {
+      return incomplete;
     },
     destroy: () => ctrl.abort(),
   };

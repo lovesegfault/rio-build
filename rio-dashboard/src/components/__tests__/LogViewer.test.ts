@@ -95,6 +95,9 @@ describe('LogViewer', () => {
     // Non-empty lines → empty-state branch also absent.
     expect(screen.queryByText('no log output')).toBeNull();
     expect(screen.getByText('final line')).toBeInTheDocument();
+    // The mock omits `incomplete` (undefined → falsy): a complete log
+    // must not render the incomplete banner.
+    expect(screen.queryByTestId('log-incomplete')).toBeNull();
   });
 
   it('renders windowed subset, not all lines (virtualized)', () => {
@@ -178,6 +181,25 @@ describe('LogViewer', () => {
 
     expect(screen.getByTestId('log-truncated')).toBeInTheDocument();
     expect(screen.getByText(/12,340 earlier lines truncated/)).toBeInTheDocument();
+  });
+
+  it('renders incomplete banner when stream.incomplete is set', () => {
+    // logStream flips `incomplete` when the server stream ends without an
+    // is_complete=true terminal chunk — a `.partial` blob or a
+    // still-running build. The banner warns that the tail (usually the
+    // build error) may be missing. Asserting the testid rather than the
+    // exact copy, same as the truncation test.
+    createLogStream.mockReturnValue({
+      lines: ['some line'],
+      done: true,
+      err: null,
+      truncated: false,
+      incomplete: true,
+      destroy: vi.fn(),
+    });
+    render(LogViewer, { props: {} });
+
+    expect(screen.getByTestId('log-incomplete')).toBeInTheDocument();
   });
 
   it('derives lineH from computed style (a11y: non-16px root)', () => {

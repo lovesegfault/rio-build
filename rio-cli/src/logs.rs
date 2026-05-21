@@ -58,6 +58,20 @@ pub(crate) async fn run(client: &mut AdminClient, a: Args) -> anyhow::Result<()>
     // emit thousands.
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    // Track the terminal chunk's completeness. The server stamps
+    // `is_complete=true` only on the last chunk of a *final* log; a
+    // ring-buffer snapshot of a still-running build or a `.partial` S3
+    // blob (periodic snapshot whose final flush never landed — leader
+    // failover, dropped FlushRequest) closes the stream with
+    // `is_complete=false`. The lines are still worth printing, but the
+    // missing tail is usually the build error itself — say so on stderr
+    // rather than letting a truncated log read as the whole thing.
+    // Stderr keeps stdout pure log bytes; exit stays 0 (an incomplete
+    // log is not a command failure). Same shape as `gc`'s
+    // closed-without-is_complete warning. Initialized `true` so a
+    // zero-chunk clean close (unreachable today — every server path
+    // emits ≥1 chunk or an error) stays silent.
+    let mut last_complete = true;
     while let Some(chunk) = stream.message().await.map_err(|s| {
         anyhow!(
             "GetDerivationLogs: stream: {} ({:?})",
@@ -65,11 +79,15 @@ pub(crate) async fn run(client: &mut AdminClient, a: Args) -> anyhow::Result<()>
             s.code()
         )
     })? {
+        last_complete = chunk.is_complete;
         for line in &chunk.lines {
             out.write_all(line)?;
             out.write_all(b"\n")?;
         }
     }
     out.flush()?;
+    if !last_complete {
+        eprintln!("(log incomplete — build still running or flush pending)");
+    }
     Ok(())
 }
