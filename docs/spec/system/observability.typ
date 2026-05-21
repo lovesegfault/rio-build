@@ -45,6 +45,13 @@ leader holding a re-stamped but never-streamed-to entry) closes the row in
 place --- `is_complete`, `status`, `finished_at` --- without re-keying
 `s3_key` or deleting the `.partial` blob, which remains the execution's
 only stored content.
+When the worker instead reconnects to the new leader and keeps streaming,
+the new leader's flusher fetches the execution's existing `.partial`
+snapshot once and prepends it to every subsequent flush of that execution,
+so the periodic overwrite and the final blob keep covering the pre-failover
+output; lines emitted between the prior leader's last snapshot and the
+failover remain subject to the 30-second bound and are marked in-band with
+a `[rio: ~N earlier lines lost across scheduler failover]` line.
 
 #r("obs.log.incomplete-surfaced")[
   A `GetDerivationLogs` response whose final chunk carries

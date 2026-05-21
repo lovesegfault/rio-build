@@ -15,7 +15,20 @@
 //!      running, live serving via the ring buffer must continue. Per
 //!      `observability.typ` this bounds log loss on scheduler crash to
 //!      ≤30s. The `.partial` is best-effort deleted by the final flush
-//!      (or swept by the TTL GC at expiry if that delete fails).
+//!      (or swept by the TTL GC at expiry if that delete fails) — unless
+//!      the recovered prefix could not be re-read at final-flush time
+//!      (`FlushPayload::preserve_partial`), in which case it is left in
+//!      place for operator recovery / TTL sweep.
+//!
+//! A third behavior kicks in after a leader failover with a reconnecting
+//! worker: recovery restamps the same `exec_id` onto an empty buffer and
+//! the worker only re-streams undelivered batches, so the ring holds a
+//! suffix that starts past what the prior leader already flushed. The
+//! flusher detects that disjoint-range shape on the first non-empty flush,
+//! fetches the stored `.partial` once (cached on the ring-buffer entry as
+//! a [`RecoveredPrefix`]), and prepends it to every subsequent flush of
+//! that execution so the periodic overwrite and the final blob keep
+//! covering the pre-failover output.
 //!
 //! Both flush kinds write **one** `drv_logs` row per execution, UPSERTed on
 //! `(exec_id)` — a periodic snapshot inserts the row at `is_complete=false`,
@@ -49,7 +62,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use super::{LogBuffers, drv_log_hash, log_s3_key};
+use super::{LogBuffers, PrefixState, RecoveredPrefix, drv_log_hash, log_s3_key};
 
 /// How often to snapshot active buffers to S3. Per `observability.typ`:
 /// bounds log loss on crash to ≤30s; lower = more S3 PUTs + CPU.
@@ -102,6 +115,32 @@ pub struct FlushRequest {
     /// dashboard cannot surface it without a proto change. Available for ops
     /// queries.
     pub status: Option<String>,
+}
+
+/// One execution's flushable content: the ring snapshot/drain plus, after a
+/// leader failover with a reconnecting worker, the recovered prefix fetched
+/// from the prior leader's `.partial` blob.
+struct FlushPayload {
+    first_line: u64,
+    line_count: u64,
+    raw_bytes: u64,
+    lines: Vec<Vec<u8>>,
+    recovered_prefix: Option<Arc<RecoveredPrefix>>,
+    /// Final-flush-only escape hatch: a stored prefix is known to exist but
+    /// could not be fetched — upload what we have but do NOT delete the
+    /// `.partial` (it is the only copy of the prefix).
+    preserve_partial: bool,
+}
+
+/// Outcome of [`LogFlusher::lookup_stored_prefix`].
+enum StoredPrefixLookup {
+    /// No stored content precedes this snapshot (no row, finalized row, or
+    /// overlapping/self-covered range). Safe to flush as-is.
+    NotNeeded,
+    /// The prior leader's `.partial` content was fetched.
+    Found(Arc<RecoveredPrefix>),
+    /// A qualifying row exists but it could not be read — do not overwrite.
+    FetchFailed,
 }
 
 /// S3 log flusher. Owns no state except what's passed in — `Arc<LogBuffers>`
@@ -320,12 +359,51 @@ impl LogFlusher {
         // completion→drain and that window is closed. Clearing it here
         // keeps `sealed` bounded even if the recv task is still running
         // (or never saw a LogBatch — silent build).
+        //
+        // The recovered-prefix state is read BEFORE the drain (the drain
+        // removes the entry and the cached prefix with it). The one-off
+        // fallback lookup below fires only for a still-`Unchecked` entry —
+        // i.e. a recovery-restamped execution whose first non-empty flush
+        // is the final one (no periodic ran since the worker reconnected).
+        // A `Checked` entry (same-leader path, or a post-reconnect lookup
+        // that found nothing) takes today's path unchanged.
+        let pre_drain_prefix_state = self.buffers.prefix_state(&req.drv_path, req.exec_id);
         if let Some((first_line, line_count, raw_bytes, lines)) =
             self.buffers.drain_if_exec(&req.drv_path, req.exec_id)
         {
             self.buffers.unseal(&req.drv_path);
-            self.upload_and_record(req, first_line, line_count, raw_bytes, lines, true)
-                .await;
+            let (recovered_prefix, preserve_partial) = match pre_drain_prefix_state {
+                PrefixState::Cached(p) => (Some(p), false),
+                // Already looked (whatever the outcome): final behaves
+                // exactly as today.
+                PrefixState::Checked => (None, false),
+                // Recovery-restamped entry whose first non-empty flush IS
+                // the final.
+                PrefixState::Unchecked if line_count > 0 && first_line > 0 => {
+                    match self.lookup_stored_prefix(&req, first_line, true).await {
+                        StoredPrefixLookup::Found(p) => (Some(p), false),
+                        StoredPrefixLookup::NotNeeded => (None, false),
+                        // Buffer already drained: refusing would lose the
+                        // suffix too. Upload it, but leave the `.partial`
+                        // (the prefix's only copy) in place.
+                        StoredPrefixLookup::FetchFailed => (None, true),
+                    }
+                }
+                PrefixState::Unchecked => (None, false),
+            };
+            self.upload_and_record(
+                req,
+                FlushPayload {
+                    first_line,
+                    line_count,
+                    raw_bytes,
+                    lines,
+                    recovered_prefix,
+                    preserve_partial,
+                },
+                true,
+            )
+            .await;
             return;
         }
 
@@ -419,8 +497,153 @@ impl LogFlusher {
                 // PG until the final flush sets it.
                 status: None,
             };
-            self.upload_and_record(req, first_line, line_count, raw_bytes, lines, false)
-                .await;
+
+            // Recovered-prefix handling (failover with a reconnecting
+            // worker — see the module doc). Zero-line snapshots
+            // (dispatched but not yet streaming, including the
+            // post-failover window BEFORE the worker reconnects) must
+            // leave the prefix state Unchecked: the lookup needs the
+            // suffix's first line to evaluate the disjoint-range
+            // condition, and prematurely marking "checked" here would let
+            // the first real snapshot after reconnection clobber the
+            // stored prefix.
+            let recovered_prefix = if line_count == 0 {
+                None // upload_and_record's early-return skips this snapshot anyway
+            } else {
+                match self.buffers.prefix_state(&req.drv_path, exec_id) {
+                    PrefixState::Cached(p) => Some(p),
+                    PrefixState::Checked => None,
+                    PrefixState::Unchecked if first_line == 0 => {
+                        // This process observed the execution from line 0 —
+                        // nothing earlier can be stored. (Covers the
+                        // ex-leader-retained-buffer restamp, where the
+                        // overwrite is already non-lossy.)
+                        self.buffers.mark_prefix_checked(&req.drv_path, exec_id);
+                        None
+                    }
+                    PrefixState::Unchecked => {
+                        match self.lookup_stored_prefix(&req, first_line, false).await {
+                            StoredPrefixLookup::Found(p) => {
+                                self.buffers.set_recovered_prefix(
+                                    &req.drv_path,
+                                    exec_id,
+                                    Arc::clone(&p),
+                                );
+                                Some(p)
+                            }
+                            StoredPrefixLookup::NotNeeded => {
+                                self.buffers.mark_prefix_checked(&req.drv_path, exec_id);
+                                None
+                            }
+                            // Never overwrite content we failed to read;
+                            // retry next tick.
+                            StoredPrefixLookup::FetchFailed => continue,
+                        }
+                    }
+                }
+            };
+            self.upload_and_record(
+                req,
+                FlushPayload {
+                    first_line,
+                    line_count,
+                    raw_bytes,
+                    lines,
+                    recovered_prefix,
+                    preserve_partial: false,
+                },
+                false,
+            )
+            .await;
+        }
+    }
+
+    /// Detect and fetch a stored pre-failover prefix for the execution
+    /// `req` is about to flush. One point-SELECT + (at most one) S3 GET.
+    /// Only called when `ring_first_line > 0` and the entry hasn't been
+    /// checked yet — i.e. never on the steady-state path.
+    ///
+    /// The stored content needs rescuing iff a `drv_logs` row exists for
+    /// this `exec_id`, is not finalized, and its range ends at or before
+    /// the ring's first line (the in-memory buffer covers none of it). A
+    /// prior leader is the only writer that can have produced such a row —
+    /// exec_ids are minted fresh per dispatch — so this fires only after a
+    /// failover restamp with a reconnecting worker.
+    ///
+    /// `is_final` is the caller's flush kind, threaded into the
+    /// `flush_failure` chokepoint so fetch failures carry the real
+    /// `is_final` label.
+    async fn lookup_stored_prefix(
+        &self,
+        req: &FlushRequest,
+        ring_first_line: u64,
+        is_final: bool,
+    ) -> StoredPrefixLookup {
+        // The row's `s3_key` is what we'd GET; on PG failure we don't know
+        // it yet, so report the deterministic `.partial` key (what the row
+        // would point at) rather than a placeholder.
+        let partial_key = log_s3_key(&req.drv_path, &req.exec_id, true);
+        let row: Option<(String, i64, i64, i64, bool)> = match sqlx::query_as(
+            "SELECT s3_key, first_line, line_count, total_bytes, is_complete \
+             FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(req.exec_id)
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(row) => row,
+            Err(e) => {
+                // Treat as FetchFailed: don't clobber what we can't see.
+                flush_failure(is_final, "prefix_fetch", &partial_key, &e, &req.drv_path);
+                return StoredPrefixLookup::FetchFailed;
+            }
+        };
+
+        let Some((s3_key, first_line, line_count, total_bytes, is_complete)) = row else {
+            return StoredPrefixLookup::NotNeeded;
+        };
+        let (first_line, line_count, total_bytes) =
+            (first_line as u64, line_count as u64, total_bytes as u64);
+        // Finalized rows are protected by the monotone UPSERT clause
+        // already; overlapping ranges are the same-leader ring-eviction
+        // shape (out of scope — pre-existing accepted head loss).
+        if is_complete || line_count == 0 || first_line + line_count > ring_first_line {
+            return StoredPrefixLookup::NotNeeded;
+        }
+        match self
+            .s3
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&s3_key)
+            .send()
+            .await
+        {
+            Ok(out) => match out.body.collect().await {
+                Ok(bytes) => {
+                    metrics::counter!("rio_scheduler_log_prefix_recovered_total").increment(1);
+                    info!(
+                        drv = %req.drv_path,
+                        exec_id = %req.exec_id,
+                        prefix_lines = line_count,
+                        ring_first_line,
+                        "recovered pre-failover log prefix from stored .partial"
+                    );
+                    StoredPrefixLookup::Found(Arc::new(RecoveredPrefix {
+                        first_line,
+                        line_count,
+                        total_bytes,
+                        compressed: bytes.into_bytes().to_vec(),
+                    }))
+                }
+                Err(e) => {
+                    flush_failure(is_final, "prefix_fetch", &s3_key, &e, &req.drv_path);
+                    StoredPrefixLookup::FetchFailed
+                }
+            },
+            Err(e) => {
+                flush_failure(is_final, "prefix_fetch", &s3_key, &e, &req.drv_path);
+                StoredPrefixLookup::FetchFailed
+            }
         }
     }
 
@@ -436,23 +659,33 @@ impl LogFlusher {
     /// as it complicates the buffer lifecycle for a rare edge case;
     /// is_complete would stay false anyway).
     ///
+    /// `payload` carries the ring snapshot/drain plus, after a failover
+    /// with a reconnecting worker, the recovered pre-failover prefix
+    /// ([`FlushPayload::recovered_prefix`]). When the prefix is present the
+    /// stored blob and the row's `first_line`/`line_count`/`total_bytes`
+    /// describe prefix + (optional gap marker) + ring lines, so the
+    /// `.partial` overwrite is strictly coverage-growing and the final
+    /// `.log.zst` + `.partial` delete are safe again. When a final flush
+    /// could not re-read a known stored prefix
+    /// ([`FlushPayload::preserve_partial`]) the `.partial` delete is
+    /// skipped — that blob is the prefix's only copy.
+    ///
     /// `req.exec_id` keys the S3 blob and PG row. The actor pins it at
     /// terminal time for finals; the periodic flusher reads it from the
     /// live entry (no staleness window). Both callers verify it before
     /// constructing the request — there is no `None` case here. `set_exec`
     /// is always called at `assign_to_worker` and re-stamped by recovery
     /// for active assignments.
-    #[allow(clippy::too_many_arguments)] // call-site-local; threading a struct would just rename the args
-    async fn upload_and_record(
-        &self,
-        req: FlushRequest,
-        first_line: u64,
-        line_count: u64,
-        raw_bytes: u64,
-        lines: Vec<Vec<u8>>,
-        is_final: bool,
-    ) {
+    async fn upload_and_record(&self, req: FlushRequest, payload: FlushPayload, is_final: bool) {
         let exec_id = req.exec_id;
+        let FlushPayload {
+            first_line,
+            line_count,
+            raw_bytes,
+            lines,
+            recovered_prefix,
+            preserve_partial,
+        } = payload;
         // Empty drain/snapshot. `set_exec` creates an empty ring-buffer
         // entry, so BOTH callers can land here with zero lines:
         //
@@ -489,12 +722,48 @@ impl LogFlusher {
         );
         let s3_key = log_s3_key(&req.drv_path, &exec_id, !is_final);
 
+        // Effective row metadata. With a recovered prefix the stored blob
+        // covers prefix + (optional gap marker) + ring lines; the marker is
+        // one synthetic line flagging the spec-accepted ≤30s window that
+        // was never flushed by the prior leader. Ranges that abut exactly
+        // (gap == 0) get no marker.
+        let prefix_lines_recovered = recovered_prefix.as_ref().map(|p| p.line_count);
+        let (eff_first_line, eff_line_count, eff_total_bytes, gap_marker) = match &recovered_prefix
+        {
+            Some(p) => {
+                let prefix_end = p.first_line + p.line_count;
+                let gap = first_line.saturating_sub(prefix_end);
+                let marker = (gap > 0).then(|| {
+                    format!("[rio: ~{gap} earlier lines lost across scheduler failover]")
+                        .into_bytes()
+                });
+                let marker_len = marker.as_ref().map(|m| m.len() as u64).unwrap_or(0);
+                (
+                    p.first_line,
+                    p.line_count + u64::from(marker.is_some()) + line_count,
+                    p.total_bytes + marker_len + raw_bytes,
+                    marker,
+                )
+            }
+            None => (first_line, line_count, raw_bytes, None),
+        };
+
         // Compress in spawn_blocking. ~10 MiB of log compresses in ~50ms on
         // modern hardware; not long enough to matter for latency, but long
         // enough to hog a tokio worker thread under heavy log volume
         // (50 active derivations × 50ms = 2.5s of worker-thread time per
-        // periodic tick, spread across tokio's NUM_CPU workers).
-        let compressed = match tokio::task::spawn_blocking(move || compress_lines(&lines)).await {
+        // periodic tick, spread across tokio's NUM_CPU workers). The
+        // recovered prefix (already zstd) is streamed through a decoder
+        // into the same encoder — no full decompressed materialization.
+        let compressed = match tokio::task::spawn_blocking(move || {
+            compress_with_prefix(
+                recovered_prefix.as_ref().map(|p| p.compressed.as_slice()),
+                gap_marker.as_deref(),
+                &lines,
+            )
+        })
+        .await
+        {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(e)) => {
                 flush_failure(is_final, "compress", &s3_key, &e, &req.drv_path);
@@ -531,8 +800,9 @@ impl LogFlusher {
 
         debug!(
             s3_key = %s3_key,
-            first_line,
-            line_count,
+            first_line = eff_first_line,
+            line_count = eff_line_count,
+            recovered_prefix_lines = ?prefix_lines_recovered,
             compressed_size,
             is_final,
             "log flushed to S3"
@@ -549,9 +819,9 @@ impl LogFlusher {
             exec_id,
             &drv_hash,
             &s3_key,
-            first_line,
-            line_count,
-            raw_bytes,
+            eff_first_line,
+            eff_line_count,
+            eff_total_bytes,
             is_final,
             req.status.as_deref(),
         )
@@ -574,7 +844,10 @@ impl LogFlusher {
         // PG row landed — the final supersedes it. A failed delete leaves a
         // stale `.partial` that the TTL GC sweep catches at expiry; that's
         // an accepted residual leak (bounded by retention), not an error.
-        if is_final {
+        // Exception: `preserve_partial` (the final could not re-read a
+        // known stored prefix) — the `.partial` is the prefix's only copy,
+        // so it is deliberately left for operator recovery / TTL sweep.
+        if is_final && !preserve_partial {
             let partial_key = log_s3_key(&req.drv_path, &exec_id, true);
             if let Err(e) = self
                 .s3
@@ -859,13 +1132,42 @@ fn flush_failure(
 
 /// Zstd-compress lines, joined by `\n`. Returns the compressed bytes.
 ///
-/// Standalone fn so spawn_blocking can take it without capturing `self`.
+/// Test-facing thin wrapper over [`compress_with_prefix`] (production goes
+/// through the latter directly). Kept so tests can build expected bodies
+/// and mock `.partial` blobs that are byte-identical to what a no-prefix
+/// flush produces — the recovered-prefix tests depend on that equivalence.
+#[cfg(test)]
 fn compress_lines(lines: &[Vec<u8>]) -> std::io::Result<Vec<u8>> {
+    compress_with_prefix(None, None, lines)
+}
+
+/// Zstd-compress an optional already-compressed prefix, an optional gap
+/// marker line, and the ring lines into one frame.
+///
+/// `prefix_compressed` (the prior leader's `.partial` blob, itself produced
+/// by [`compress_lines`]) is streamed through a decoder into the encoder —
+/// no full decompressed materialization. Its content always ends with `\n`,
+/// so plain concatenation preserves line boundaries.
+///
+/// Standalone fn so spawn_blocking can take it without capturing `self`.
+fn compress_with_prefix(
+    prefix_compressed: Option<&[u8]>,
+    gap_marker: Option<&[u8]>,
+    lines: &[Vec<u8>],
+) -> std::io::Result<Vec<u8>> {
     // Level 6 (NOT the crate default 3): log text is already highly
     // compressible (~10:1 on typical build output), and the periodic
     // flush re-uploads ever-growing prefixes — the extra ratio at 6 is
     // worth the CPU on a path that's already off-thread in spawn_blocking.
     let mut encoder = zstd::stream::Encoder::new(Vec::new(), 6)?;
+    if let Some(prefix) = prefix_compressed {
+        let mut decoder = zstd::stream::Decoder::new(prefix)?;
+        std::io::copy(&mut decoder, &mut encoder)?;
+    }
+    if let Some(marker) = gap_marker {
+        encoder.write_all(marker)?;
+        encoder.write_all(b"\n")?;
+    }
     for line in lines {
         encoder.write_all(line)?;
         encoder.write_all(b"\n")?;
@@ -2473,6 +2775,632 @@ mod tests {
         assert_eq!(
             count, 0,
             "expired row swept despite request-level S3 failure"
+        );
+        Ok(())
+    }
+
+    // ── recovered pre-failover prefix (bug_003, bughunter r11) ─────────────
+    //
+    // After a leader failover with a reconnecting worker, recovery restamps
+    // the SAME exec_id onto an empty buffer and the worker only re-streams
+    // the post-failover suffix. The flusher must fetch the ex-leader's
+    // stored `.partial` once and prepend it to every flush of that
+    // execution instead of overwriting (and finally deleting) the only copy
+    // of the pre-failover prefix.
+
+    /// GET-call counter shared with the mock's match closure.
+    type GetCalls = Arc<std::sync::atomic::AtomicUsize>;
+
+    /// Like [`mock_s3_capturing`] but with a GetObject rule. `get_body`:
+    /// `Ok(bytes)` → 200 with that body; `Err(())` → generic 5xx (the
+    /// supported aws-smithy-mocks way to simulate a failed GET). Also
+    /// returns a counter of GetObject calls so tests can pin the
+    /// fetch-once-then-cache behavior.
+    fn mock_s3_capturing_with_get(
+        get_body: Result<Vec<u8>, ()>,
+    ) -> (S3Client, CapturedPuts, CapturedDeletes, GetCalls) {
+        use aws_sdk_s3::error::ErrorMetadata;
+        use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
+
+        let puts: CapturedPuts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let deletes: CapturedDeletes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gets: GetCalls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pcap = Arc::clone(&puts);
+        let dcap = Arc::clone(&deletes);
+        let gcap = Arc::clone(&gets);
+
+        let put_rule = mock!(S3Client::put_object)
+            .match_requests(move |req| {
+                let key = req.key().unwrap_or("<no-key>").to_string();
+                let body_bytes = req
+                    .body()
+                    .bytes()
+                    .map(|b| b.to_vec())
+                    .unwrap_or_else(|| b"<streaming-body-not-introspectable>".to_vec());
+                pcap.lock().unwrap().push((key, body_bytes));
+                true
+            })
+            .then_output(|| PutObjectOutput::builder().build());
+        let del_rule = mock!(S3Client::delete_object)
+            .match_requests(move |req| {
+                dcap.lock()
+                    .unwrap()
+                    .push(req.key().unwrap_or("<no-key>").to_string());
+                true
+            })
+            .then_output(|| DeleteObjectOutput::builder().build());
+        let count_get = move || gcap.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let get_rule = match get_body {
+            Ok(bytes) => mock!(S3Client::get_object)
+                .match_requests(move |_req| {
+                    count_get();
+                    true
+                })
+                .then_output(move || {
+                    GetObjectOutput::builder()
+                        .body(ByteStream::from(bytes.clone()))
+                        .build()
+                }),
+            Err(()) => mock!(S3Client::get_object)
+                .match_requests(move |_req| {
+                    count_get();
+                    true
+                })
+                .then_error(|| {
+                    GetObjectError::generic(
+                        ErrorMetadata::builder()
+                            .code("InternalError")
+                            .message("simulated S3 GET failure")
+                            .build(),
+                    )
+                }),
+        };
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[&put_rule, &del_rule, &get_rule]
+        );
+        (client, puts, deletes, gets)
+    }
+
+    /// Failover-fixture front half shared by the recovered-prefix tests:
+    /// leader A stamps + streams `prefix_lines` at line 0 and its periodic
+    /// flush stores the `.partial` blob + `drv_logs` row; then the lease
+    /// moves and the fresh standby's recovery restamps an EMPTY entry with
+    /// the SAME exec_id (modeled as discard + set_exec, the same modeling
+    /// as `flush_final_empty_drain_finalizes_partial_row`). The caller owns
+    /// pushing the post-reconnect suffix and the flush under test.
+    async fn failover_restamp_after_periodic(
+        flusher: &LogFlusher,
+        buffers: &LogBuffers,
+        drv_path: &str,
+        prefix_lines: &[&[u8]],
+    ) -> Uuid {
+        let exec_id = stamp_and_push(buffers, drv_path, prefix_lines);
+        flusher.flush_periodic().await;
+        buffers.discard(drv_path);
+        buffers.set_exec(drv_path, exec_id, "test-worker");
+        exec_id
+    }
+
+    /// Periodic flush after a failover restamp + worker reconnect must
+    /// fetch the ex-leader's stored `.partial` once and PUT a merged blob
+    /// (prefix + gap marker + suffix) instead of overwriting the prefix
+    /// with the suffix-only snapshot.
+    // r[verify obs.log.periodic-flush]
+    #[tokio::test]
+    async fn failover_reconnect_periodic_merges_stored_prefix() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let prefix: Vec<&[u8]> = vec![b"pfx-0", b"pfx-1", b"pfx-2"];
+        let prefix_zst = compress_lines(&prefix.iter().map(|l| l.to_vec()).collect::<Vec<_>>())?;
+        let (s3, puts, _deletes, gets) = mock_s3_capturing_with_get(Ok(prefix_zst));
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r11pfx1-merge-periodic.drv";
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        let exec_id = failover_restamp_after_periodic(&flusher, &buffers, drv_path, &prefix).await;
+
+        // A periodic tick fires before the worker reconnects: the snapshot
+        // is zero-line and must neither PUT nor poison the later merge
+        // (the prefix state stays Unchecked — the lookup needs the suffix's
+        // first line to evaluate the disjoint-range condition).
+        flusher.flush_periodic().await;
+        assert_eq!(
+            puts.lock().unwrap().len(),
+            1,
+            "zero-line tick before reconnect must not PUT"
+        );
+        assert!(
+            matches!(
+                buffers.prefix_state(drv_path, exec_id),
+                PrefixState::Unchecked
+            ),
+            "zero-line tick must leave the prefix state Unchecked"
+        );
+
+        // Worker reconnects and re-streams only the undelivered suffix.
+        buffers.push(&mk_batch(drv_path, 5, &[b"sfx-5", b"sfx-6"]));
+        flusher.flush_periodic().await;
+
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        let (key, body) = captured.last().expect("merged periodic PUT");
+        assert!(key.ends_with(".partial.log.zst"), "still a snapshot: {key}");
+        let decoded = String::from_utf8(zstd::decode_all(&body[..])?)?;
+        assert_eq!(
+            decoded,
+            "pfx-0\npfx-1\npfx-2\n[rio: ~2 earlier lines lost across scheduler failover]\nsfx-5\nsfx-6\n",
+            "snapshot must carry prefix + gap marker + suffix"
+        );
+        let row: (i64, i64, bool) = sqlx::query_as(
+            "SELECT first_line, line_count, is_complete FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(row.0, 0, "row covers the merged range from line 0");
+        assert_eq!(row.1, 6, "3 prefix + 1 marker + 2 suffix");
+        assert!(!row.2, "still a periodic snapshot");
+        assert_eq!(
+            gets.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "stored prefix fetched exactly once"
+        );
+        Ok(())
+    }
+
+    /// Final flush for a failover-restamped execution whose first non-empty
+    /// flush IS the final (no periodic ran since the reconnect) must also
+    /// merge — and only then is deleting the `.partial` safe.
+    // r[verify obs.log.periodic-flush]
+    #[tokio::test]
+    async fn failover_reconnect_final_merges_and_supersedes_partial() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let prefix: Vec<&[u8]> = vec![b"pfx-0", b"pfx-1", b"pfx-2"];
+        let prefix_zst = compress_lines(&prefix.iter().map(|l| l.to_vec()).collect::<Vec<_>>())?;
+        let (s3, puts, deletes, gets) = mock_s3_capturing_with_get(Ok(prefix_zst));
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r11pfx2-merge-final.drv";
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        let exec_id = failover_restamp_after_periodic(&flusher, &buffers, drv_path, &prefix).await;
+        let drv_hash = "r11pfx2";
+
+        buffers.push(&mk_batch(drv_path, 5, &[b"sfx-5", b"sfx-6"]));
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id,
+                status: Some("succeeded".into()),
+            })
+            .await;
+
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        let (key, body) = captured.last().expect("final PUT");
+        assert_eq!(key, &format!("logs/{drv_hash}/{exec_id}.log.zst"));
+        let decoded = String::from_utf8(zstd::decode_all(&body[..])?)?;
+        assert_eq!(
+            decoded,
+            "pfx-0\npfx-1\npfx-2\n[rio: ~2 earlier lines lost across scheduler failover]\nsfx-5\nsfx-6\n",
+            "final blob must carry prefix + gap marker + suffix"
+        );
+        let row: (i64, i64, bool, Option<String>) = sqlx::query_as(
+            "SELECT first_line, line_count, is_complete, status FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(row.0, 0);
+        assert_eq!(row.1, 6);
+        assert!(row.2, "final flush finalizes the row");
+        assert_eq!(row.3.as_deref(), Some("succeeded"));
+        // The merged final supersedes the .partial — deleting it is safe now.
+        assert_eq!(
+            deletes.lock().unwrap().clone(),
+            vec![format!("logs/{drv_hash}/{exec_id}.partial.log.zst")],
+            ".partial deleted only because the final blob now covers the prefix"
+        );
+        assert_eq!(buffers.active_count(), 0, "final flush drains");
+        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// The prefix is fetched ONCE and cached on the ring-buffer entry: a
+    /// merged periodic followed by more streaming and the final must keep
+    /// the prefix without a second GET. (Without the cache the second
+    /// flush's range test would go false against the merged row and the
+    /// suffix-only snapshot would clobber the merge — rejected alt §3.6.)
+    // r[verify obs.log.periodic-flush]
+    #[tokio::test]
+    async fn failover_reconnect_periodic_then_final_keeps_prefix() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let prefix: Vec<&[u8]> = vec![b"pfx-0", b"pfx-1", b"pfx-2"];
+        let prefix_zst = compress_lines(&prefix.iter().map(|l| l.to_vec()).collect::<Vec<_>>())?;
+        let (s3, puts, _deletes, gets) = mock_s3_capturing_with_get(Ok(prefix_zst));
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r11pfx3-merge-then-final.drv";
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        let exec_id = failover_restamp_after_periodic(&flusher, &buffers, drv_path, &prefix).await;
+
+        buffers.push(&mk_batch(drv_path, 5, &[b"sfx-5", b"sfx-6"]));
+        flusher.flush_periodic().await; // merged .partial
+        buffers.push(&mk_batch(drv_path, 7, &[b"sfx-7", b"sfx-8"]));
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id,
+                status: Some("succeeded".into()),
+            })
+            .await;
+
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        let (key, body) = captured.last().expect("final PUT");
+        assert!(key.ends_with(".log.zst") && !key.ends_with(".partial.log.zst"));
+        let decoded = String::from_utf8(zstd::decode_all(&body[..])?)?;
+        assert!(
+            decoded.starts_with("pfx-0\n"),
+            "final body must still start with the recovered prefix: {decoded:?}"
+        );
+        for line in ["sfx-5", "sfx-6", "sfx-7", "sfx-8"] {
+            assert!(decoded.contains(line), "missing {line} in {decoded:?}");
+        }
+        let row: (i64, i64, bool) = sqlx::query_as(
+            "SELECT first_line, line_count, is_complete FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(row.0, 0);
+        assert_eq!(row.1, 8, "3 prefix + 1 marker + 4 suffix");
+        assert!(row.2);
+        assert_eq!(
+            gets.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "prefix fetched once, then served from the entry cache"
+        );
+        Ok(())
+    }
+
+    /// A stored row whose range overlaps the ring snapshot is the
+    /// same-leader ring-eviction shape (pre-existing accepted head loss),
+    /// NOT a failover prefix — no merge, no GET.
+    #[tokio::test]
+    async fn overlapping_stored_range_is_not_merged() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let stored: Vec<&[u8]> = vec![b"pfx-0", b"pfx-1", b"pfx-2", b"pfx-3", b"pfx-4"];
+        let stored_zst = compress_lines(&stored.iter().map(|l| l.to_vec()).collect::<Vec<_>>())?;
+        let (s3, puts, _deletes, gets) = mock_s3_capturing_with_get(Ok(stored_zst));
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r11pfx4-overlap.drv";
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        // Stored row covers lines 0-4.
+        let exec_id = failover_restamp_after_periodic(&flusher, &buffers, drv_path, &stored).await;
+
+        // Re-streamed content starts at line 2 — overlapping the stored
+        // range (stored_end = 5 > 2), so nothing qualifies as a prefix.
+        buffers.push(&mk_batch(drv_path, 2, &[b"ovl-2", b"ovl-3", b"ovl-4"]));
+        flusher.flush_periodic().await;
+
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        let (_key, body) = captured.last().expect("snapshot PUT");
+        let decoded = String::from_utf8(zstd::decode_all(&body[..])?)?;
+        assert_eq!(
+            decoded, "ovl-2\novl-3\novl-4\n",
+            "overlapping stored range must not be merged"
+        );
+        assert!(!decoded.contains("[rio:"), "no gap marker either");
+        let row: (i64, i64) =
+            sqlx::query_as("SELECT first_line, line_count FROM drv_logs WHERE exec_id = $1")
+                .bind(exec_id)
+                .fetch_one(&db.pool)
+                .await?;
+        assert_eq!((row.0, row.1), (2, 3), "row takes the snapshot's values");
+        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    /// Failover restamp where the prior leader never flushed anything:
+    /// no `drv_logs` row exists, so the suffix-only flush is exactly
+    /// today's behavior, the lookup happens once (no GET — the SELECT
+    /// finds nothing), and the entry is marked checked.
+    #[tokio::test]
+    async fn reconnect_without_stored_row_flushes_suffix_only() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, _deletes, gets) = mock_s3_capturing_with_get(Ok(vec![]));
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r11pfx5-norow.drv";
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        // Recovery restamp on a fresh standby; leader A never flushed.
+        let exec_id = Uuid::now_v7();
+        buffers.set_exec(drv_path, exec_id, "test-worker");
+        // Reconnected worker re-streams from line 5.
+        buffers.push(&mk_batch(drv_path, 5, &[b"sfx-5", b"sfx-6"]));
+
+        flusher.flush_periodic().await;
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        let (key, body) = captured.last().expect("suffix-only PUT");
+        assert!(key.ends_with(".partial.log.zst"));
+        assert_eq!(
+            String::from_utf8(zstd::decode_all(&body[..])?)?,
+            "sfx-5\nsfx-6\n"
+        );
+        let row: (i64, i64) =
+            sqlx::query_as("SELECT first_line, line_count FROM drv_logs WHERE exec_id = $1")
+                .bind(exec_id)
+                .fetch_one(&db.pool)
+                .await?;
+        assert_eq!((row.0, row.1), (5, 2));
+        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 0, "no GET");
+        assert!(
+            matches!(
+                buffers.prefix_state(drv_path, exec_id),
+                PrefixState::Checked
+            ),
+            "entry marked checked after the no-row lookup"
+        );
+
+        // Second periodic: still no GET (and no re-SELECT churn observable
+        // here — the Checked state short-circuits the whole lookup).
+        flusher.flush_periodic().await;
+        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    /// Periodic flush must not overwrite stored content it failed to
+    /// re-read: on prefix-fetch failure the tick skips this drv entirely
+    /// (no PUT, no UPSERT) and retries next tick.
+    #[tokio::test]
+    async fn prefix_fetch_failure_periodic_skips_flush() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let prefix: Vec<&[u8]> = vec![b"pfx-0", b"pfx-1", b"pfx-2"];
+        let (s3, puts, _deletes, gets) = mock_s3_capturing_with_get(Err(()));
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r11pfx6-getfail-periodic.drv";
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        let exec_id = failover_restamp_after_periodic(&flusher, &buffers, drv_path, &prefix).await;
+        assert_eq!(puts.lock().unwrap().len(), 1, "fixture: prefix PUT");
+
+        buffers.push(&mk_batch(drv_path, 5, &[b"sfx-5", b"sfx-6"]));
+        flusher.flush_periodic().await;
+
+        assert_eq!(
+            puts.lock().unwrap().len(),
+            1,
+            "fetch failure must skip the PUT (never overwrite unread content)"
+        );
+        let row: (i64, i64, bool) = sqlx::query_as(
+            "SELECT first_line, line_count, is_complete FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(
+            (row.0, row.1, row.2),
+            (0, 3, false),
+            "row keeps describing the stored prefix"
+        );
+        assert!(gets.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        Ok(())
+    }
+
+    /// Final flush after a prefix-fetch failure uploads the drained suffix
+    /// (refusing would lose it too) but preserves the `.partial` — it is
+    /// the prefix's only copy.
+    #[tokio::test]
+    async fn prefix_fetch_failure_final_uploads_suffix_but_keeps_partial() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let prefix: Vec<&[u8]> = vec![b"pfx-0", b"pfx-1", b"pfx-2"];
+        let (s3, puts, deletes, _gets) = mock_s3_capturing_with_get(Err(()));
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r11pfx7-getfail-final.drv";
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        let exec_id = failover_restamp_after_periodic(&flusher, &buffers, drv_path, &prefix).await;
+
+        buffers.push(&mk_batch(drv_path, 5, &[b"sfx-5", b"sfx-6"]));
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id,
+                status: Some("failed".into()),
+            })
+            .await;
+
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        let (key, body) = captured.last().expect("final PUT");
+        assert!(key.ends_with(".log.zst") && !key.ends_with(".partial.log.zst"));
+        assert_eq!(
+            String::from_utf8(zstd::decode_all(&body[..])?)?,
+            "sfx-5\nsfx-6\n",
+            "suffix-only upload (the prefix could not be re-read)"
+        );
+        let row: (i64, i64, bool) = sqlx::query_as(
+            "SELECT first_line, line_count, is_complete FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!((row.0, row.1, row.2), (5, 2, true));
+        assert!(
+            deletes.lock().unwrap().is_empty(),
+            "the .partial (only copy of the prefix) must NOT be deleted"
+        );
+        Ok(())
+    }
+
+    /// Ranges that abut exactly (gap == 0) get no synthetic marker line.
+    #[tokio::test]
+    async fn reconnect_with_no_gap_omits_marker() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let prefix: Vec<&[u8]> = vec![b"pfx-0", b"pfx-1", b"pfx-2"];
+        let prefix_zst = compress_lines(&prefix.iter().map(|l| l.to_vec()).collect::<Vec<_>>())?;
+        let (s3, puts, _deletes, gets) = mock_s3_capturing_with_get(Ok(prefix_zst));
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r11pfx8-nogap.drv";
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        let exec_id = failover_restamp_after_periodic(&flusher, &buffers, drv_path, &prefix).await;
+
+        // Suffix starts exactly at prefix_end (line 3): nothing was lost.
+        buffers.push(&mk_batch(drv_path, 3, &[b"sfx-3", b"sfx-4"]));
+        flusher.flush_periodic().await;
+
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        let (_key, body) = captured.last().expect("merged PUT");
+        assert_eq!(
+            String::from_utf8(zstd::decode_all(&body[..])?)?,
+            "pfx-0\npfx-1\npfx-2\nsfx-3\nsfx-4\n",
+            "abutting ranges merge without a marker"
+        );
+        let row: (i64, i64) =
+            sqlx::query_as("SELECT first_line, line_count FROM drv_logs WHERE exec_id = $1")
+                .bind(exec_id)
+                .fetch_one(&db.pool)
+                .await?;
+        assert_eq!((row.0, row.1), (0, 5), "3 + 2, no marker slot");
+        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// Same-leader ring eviction (no failover): the entry was marked
+    /// checked by the first periodic (`first_line == 0` shortcut), so the
+    /// final flush takes today's path — no lookup, no merge, `.partial`
+    /// deleted. Regression test for the final-fallback `Unchecked` gate.
+    #[tokio::test]
+    async fn checked_entry_final_flush_skips_lookup() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, deletes, gets) = mock_s3_capturing_with_get(Ok(vec![]));
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r11pfx9-evicted.drv";
+        let drv_hash = "r11pfx9";
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        // Same-leader: streamed from line 0, periodic #1 stores lines 0-2
+        // and marks the entry checked via the first_line == 0 shortcut.
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"pfx-0", b"pfx-1", b"pfx-2"]);
+        flusher.flush_periodic().await;
+        assert!(
+            matches!(
+                buffers.prefix_state(drv_path, exec_id),
+                PrefixState::Checked
+            ),
+            "first_line == 0 snapshot marks the entry checked"
+        );
+
+        // The build keeps spewing: line-count eviction drops the head past
+        // line 2 (mirrors `ring_eviction_drops_oldest`).
+        let big: Vec<Vec<u8>> = (0..=crate::logs::RING_CAPACITY)
+            .map(|_| b"x".to_vec())
+            .collect();
+        let refs: Vec<&[u8]> = big.iter().map(|v| v.as_slice()).collect();
+        buffers.push(&mk_batch(drv_path, 3, &refs));
+
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id,
+                status: Some("succeeded".into()),
+            })
+            .await;
+
+        assert_eq!(
+            gets.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "Checked entry must not trigger the final-flush fallback lookup"
+        );
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        let (key, body) = captured.last().expect("final PUT");
+        assert!(key.ends_with(".log.zst") && !key.ends_with(".partial.log.zst"));
+        let decoded = String::from_utf8(zstd::decode_all(&body[..])?)?;
+        assert!(
+            !decoded.contains("pfx") && !decoded.contains("[rio:"),
+            "no merge of the leader's own stale .partial, no marker"
+        );
+        let row: (i64, i64, bool) = sqlx::query_as(
+            "SELECT first_line, line_count, is_complete FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        // Eviction math: 3 small lines + (RING_CAPACITY + 1) pushed lines
+        // exceed RING_CAPACITY by 4, so the head 4 lines (the 3 "pfx" +
+        // the first big line at 3) are evicted: first_line = 4,
+        // line_count = RING_CAPACITY.
+        assert_eq!(
+            (row.0, row.1, row.2),
+            (4, i64::try_from(crate::logs::RING_CAPACITY)?, true),
+            "row takes the drained snapshot's values"
+        );
+        assert_eq!(
+            deletes.lock().unwrap().clone(),
+            vec![format!("logs/{drv_hash}/{exec_id}.partial.log.zst")],
+            "today's .partial delete is unchanged for the same-leader path"
         );
         Ok(())
     }

@@ -122,6 +122,28 @@ pub(crate) const MAX_LINE_LEN: usize = 64 * 1024;
 /// build, not batch-local.
 type Line = (u64, Vec<u8>);
 
+/// Pre-failover log content recovered from the prior leader's `.partial`
+/// blob (see `flush.rs` "recovered prefix"). Held compressed; decompressed
+/// into the outgoing frame at flush time. Bounded by the prior leader's own
+/// ring caps (the blob was a snapshot of a capped ring buffer).
+pub(crate) struct RecoveredPrefix {
+    pub(crate) first_line: u64,
+    pub(crate) line_count: u64,
+    pub(crate) total_bytes: u64,
+    pub(crate) compressed: Vec<u8>,
+}
+
+/// Recovered-prefix state of an entry, read by the flusher.
+pub(crate) enum PrefixState {
+    /// Never looked for a stored prefix for this execution.
+    Unchecked,
+    /// Looked; none needed or none found. Don't look again.
+    Checked,
+    /// A stored prefix exists and MUST be prepended to every flush of this
+    /// execution.
+    Cached(std::sync::Arc<RecoveredPrefix>),
+}
+
 /// Per-derivation ring buffer with intrinsic byte-tracking.
 /// `bytes` is `lines.iter().map(|(_, l)| l.len()).sum()` — maintained
 /// incrementally so [`LogBuffers::push`] doesn't re-sum on every batch.
@@ -140,6 +162,14 @@ struct RingBuf {
     /// executor — a batch from any other source is dropped.
     /// r[impl sched.log.batch-binding]
     assigned_executor: Option<String>,
+    /// See [`RecoveredPrefix`]. Set at most once per execution by the
+    /// flusher after a recovery restamp; cleared by a cross-exec restamp.
+    /// Ignored by `push_into`/eviction — never counted against the ring's
+    /// line/byte caps.
+    recovered_prefix: Option<std::sync::Arc<RecoveredPrefix>>,
+    /// The flusher already looked for a stored prefix (whatever the
+    /// outcome) — avoids a per-tick SELECT for evicted long logs.
+    prefix_checked: bool,
 }
 
 /// Per-derivation log ring buffers, keyed by [`drv_log_hash`] of the
@@ -385,6 +415,12 @@ impl LogBuffers {
             );
             entry.lines.clear();
             entry.bytes = 0;
+            // The recovered prefix (and the "already looked" flag) belong
+            // to the previous execution — a different exec_id keys a
+            // different drv_logs row and S3 blob, so carrying them across
+            // would prepend the wrong execution's content.
+            entry.recovered_prefix = None;
+            entry.prefix_checked = false;
         }
         entry.exec_id = Some(exec_id);
         entry.assigned_executor = Some(executor.to_owned());
@@ -395,6 +431,53 @@ impl LogBuffers {
     /// flusher MUST skip those rather than write a garbage S3 key).
     pub fn exec_id(&self, drv_path: &str) -> Option<Uuid> {
         self.buffers.get(&drv_log_hash(drv_path))?.exec_id
+    }
+
+    /// Recovered-prefix state for `drv_path`, guarded on `exec_id` so a
+    /// re-dispatched entry can never leak the prior execution's prefix.
+    /// Missing entry / exec mismatch ⇒ [`PrefixState::Checked`] (the safe
+    /// "don't fetch").
+    pub(crate) fn prefix_state(&self, drv_path: &str, exec_id: Uuid) -> PrefixState {
+        match self.buffers.get(&drv_log_hash(drv_path)) {
+            Some(e) if e.exec_id == Some(exec_id) => {
+                match (&e.recovered_prefix, e.prefix_checked) {
+                    (Some(p), _) => PrefixState::Cached(std::sync::Arc::clone(p)),
+                    (None, true) => PrefixState::Checked,
+                    (None, false) => PrefixState::Unchecked,
+                }
+            }
+            _ => PrefixState::Checked,
+        }
+    }
+
+    /// Mark the stored-prefix lookup as done with no prefix to carry.
+    /// No-op when the entry is gone or stamped with a different exec.
+    pub(crate) fn mark_prefix_checked(&self, drv_path: &str, exec_id: Uuid) {
+        if let Some(mut e) = self.buffers.get_mut(&drv_log_hash(drv_path))
+            && e.exec_id == Some(exec_id)
+        {
+            e.prefix_checked = true;
+        }
+    }
+
+    /// Attach a recovered prefix (also marks checked). Returns `false`
+    /// when the entry is gone or stamped with a different exec — the
+    /// caller still holds the `Arc` and can use it for the in-flight
+    /// flush, it just won't be reused on later ticks.
+    pub(crate) fn set_recovered_prefix(
+        &self,
+        drv_path: &str,
+        exec_id: Uuid,
+        prefix: std::sync::Arc<RecoveredPrefix>,
+    ) -> bool {
+        match self.buffers.get_mut(&drv_log_hash(drv_path)) {
+            Some(mut e) if e.exec_id == Some(exec_id) => {
+                e.recovered_prefix = Some(prefix);
+                e.prefix_checked = true;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Push a batch with `(executor, drv)` binding enforcement.
@@ -1138,8 +1221,23 @@ mod tests {
             &mk_batch("drv-a", 0, &[b"old-exec-line"]),
             "executor-1"
         ));
-        // Precondition: the line is buffered under exec1.
+        // Precondition: the line is buffered under exec1, and a recovered
+        // prefix cached for exec1 is visible as such.
         assert_eq!(bufs.read_since("drv-a", 0).unwrap().len(), 1);
+        assert!(bufs.set_recovered_prefix(
+            "drv-a",
+            exec1,
+            std::sync::Arc::new(RecoveredPrefix {
+                first_line: 0,
+                line_count: 1,
+                total_bytes: 5,
+                compressed: vec![1, 2, 3],
+            })
+        ));
+        assert!(matches!(
+            bufs.prefix_state("drv-a", exec1),
+            PrefixState::Cached(_)
+        ));
 
         let exec2 = Uuid::now_v7();
         bufs.set_exec("drv-a", exec2, "executor-2");
@@ -1150,6 +1248,17 @@ mod tests {
             Some(vec![]),
             "exec1's lines must not survive a re-stamp to exec2"
         );
+        // exec1's recovered prefix must not survive either: the new
+        // execution starts Unchecked, and a query under the stale exec_id
+        // resolves to the safe "don't fetch" default.
+        assert!(matches!(
+            bufs.prefix_state("drv-a", exec2),
+            PrefixState::Unchecked
+        ));
+        assert!(matches!(
+            bufs.prefix_state("drv-a", exec1),
+            PrefixState::Checked
+        ));
         // The new executor's batches are accepted into the now-clean buffer.
         assert!(bufs.push_for(
             "drv-a",
@@ -1173,6 +1282,16 @@ mod tests {
         let exec1 = Uuid::now_v7();
         bufs.set_exec("drv-a", exec1, "executor-1");
         assert!(bufs.push_for("drv-a", &mk_batch("drv-a", 0, &[b"line-0"]), "executor-1"));
+        assert!(bufs.set_recovered_prefix(
+            "drv-a",
+            exec1,
+            std::sync::Arc::new(RecoveredPrefix {
+                first_line: 0,
+                line_count: 1,
+                total_bytes: 5,
+                compressed: vec![1, 2, 3],
+            })
+        ));
 
         bufs.set_exec("drv-a", exec1, "executor-1");
 
@@ -1181,6 +1300,10 @@ mod tests {
             bufs.read_since("drv-a", 0),
             Some(vec![(0, b"line-0".to_vec())]),
             "a same-exec re-stamp is not a new execution; lines must survive"
+        );
+        assert!(
+            matches!(bufs.prefix_state("drv-a", exec1), PrefixState::Cached(_)),
+            "the recovered prefix survives a same-exec re-stamp, like the lines"
         );
     }
 

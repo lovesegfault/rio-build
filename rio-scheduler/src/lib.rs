@@ -301,8 +301,13 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_log_flush_failures_total",
-        "Failed log flushes (labeled by phase: compress/s3/pg, is_final: true/false); \
+        "Failed log flushes (labeled by phase: compress/s3/pg/prefix_fetch, is_final: true/false); \
          alert on is_final=true rate > 0 sustained"
+    );
+    describe_counter!(
+        "rio_scheduler_log_prefix_recovered_total",
+        "Stored pre-failover log prefixes fetched from the prior leader's .partial blob and \
+         re-folded into this leader's flushes (failover with a reconnecting worker)."
     );
     describe_counter!(
         "rio_scheduler_log_flush_dropped_total",

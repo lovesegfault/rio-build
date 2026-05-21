@@ -538,7 +538,7 @@
         "name": "rio_scheduler_log_flush_dropped_total"
       },
       {
-        "help": "Failed log flushes (labeled by phase: compress/s3/pg, is_final: true/false); alert on is_final=true rate > 0 sustained",
+        "help": "Failed log flushes (labeled by phase: compress/s3/pg/prefix_fetch, is_final: true/false); alert on is_final=true rate > 0 sustained",
         "kind": "counter",
         "name": "rio_scheduler_log_flush_failures_total"
       },
@@ -566,6 +566,11 @@
         "help": "Log lines forwarded via BuildEvent::Log (worker -> scheduler -> gateway broadcast)",
         "kind": "counter",
         "name": "rio_scheduler_log_lines_forwarded_total"
+      },
+      {
+        "help": "Stored pre-failover log prefixes fetched from the prior leader's .partial blob and re-folded into this leader's flushes (failover with a reconnecting worker).",
+        "kind": "counter",
+        "name": "rio_scheduler_log_prefix_recovered_total"
       },
       {
         "help": "LogBatch dropped: stream already has MAX_DRVS_PER_STREAM distinct accepted derivation_path values. Defense-in-depth tripwire — only accepted paths grow the cap, so a flood of rejected/fabricated paths alone cannot fill it (those are counted by rio_scheduler_log_batches_rejected_total).",
@@ -1124,6 +1129,7 @@
     "rio_scheduler_log_forward_dropped_total",
     "rio_scheduler_log_gc_swept_total",
     "rio_scheduler_log_lines_forwarded_total",
+    "rio_scheduler_log_prefix_recovered_total",
     "rio_scheduler_log_unknown_drv_dropped_total",
     "rio_scheduler_malformed_built_output_total",
     "rio_scheduler_merge_phase_seconds",
