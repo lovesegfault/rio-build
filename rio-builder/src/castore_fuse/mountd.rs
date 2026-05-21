@@ -9,9 +9,8 @@
 //! FUSE and assembles its own overlay.
 //!
 //! See [`super::mountd_proto`] for the wire protocol and ADR-022 §11
-//! (`docs/src/decisions/022-design-overview.md`) for the privilege
-//! analysis. `bin/rio-mountd.rs` is a thin clap wrapper around
-//! [`run`].
+//! (the design overview) for the privilege analysis. `bin/rio-mountd.rs`
+//! is a thin clap wrapper around [`run`].
 //!
 //! # Concurrency
 //!
