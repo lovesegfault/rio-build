@@ -757,7 +757,24 @@ mod tests {
         assert_eq!(drv.outputs().len(), 1);
         assert_eq!(drv.outputs()[0].name(), "out");
         assert!(!drv.input_drvs().is_empty());
-        assert_eq!(drv.env().get("pname").unwrap(), "hello");
+        // stdenv's env layout depends on the host's <nixpkgs>: classic
+        // stdenv exposes `pname` as a flat env attr; __structuredAttrs
+        // stdenv collapses everything into one `__json` blob and the
+        // only flat keys left are the outputs. Accept either — the
+        // assertion is "env parsing surfaced hello's identity", not
+        // "which layout the host channel uses".
+        let env = drv.env();
+        let identity_ok = env.get("pname").is_some_and(|p| p == "hello")
+            || env.get("__json").is_some_and(|j| {
+                serde_json::from_str::<serde_json::Value>(j)
+                    .is_ok_and(|attrs| attrs["pname"] == "hello")
+            });
+        assert!(
+            identity_ok,
+            "env should carry hello's identity via flat `pname` or __structuredAttrs `__json`; \
+             env keys: {:?}",
+            env.keys().collect::<Vec<_>>()
+        );
         // <nixpkgs> -A hello → host-dependent; roundtrip below covers parsing.
         assert!(!drv.platform().is_empty());
 
