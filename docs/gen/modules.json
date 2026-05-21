@@ -1373,6 +1373,11 @@
     },
     {
       "depth": 0,
+      "doc": "Process-global test sandbox: temp-dir cwd + environment isolation.",
+      "path": "jail.rs"
+    },
+    {
+      "depth": 0,
       "doc": "tower-test fixtures for kube::Client integration tests.",
       "path": "kube_mock.rs"
     },

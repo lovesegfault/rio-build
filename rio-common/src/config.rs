@@ -15,7 +15,7 @@
 //!    the same values the old clap `#[arg(default_value = ...)]` did.
 //!
 //! 2. `CliArgs` — `#[derive(Parser, Serialize)]`, all fields are
-//!    `Option<T>`, NO `env =` attribute (figment's `Env` provider
+//!    `Option<T>`, NO `env =` attribute (the RIO_ env layer
 //!    replaces it), NO `default_value` (absence = `None`). Every field
 //!    has `#[serde(skip_serializing_if = "Option::is_none")]` so that
 //!    unset CLI flags don't overwrite lower layers with `null`.
@@ -36,7 +36,7 @@
 //! value and CLI would ALWAYS win, defeating the layering.
 //!
 //! The two-struct split makes each side clean: clap sees Optional,
-//! serde sees Required-With-Default, and figment bridges them.
+//! serde sees Required-With-Default, and the config layering bridges them.
 //!
 //! # Standing-guard tests
 //!
@@ -48,10 +48,7 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use figment::{
-    Figment,
-    providers::{Env, Format, Serialized, Toml},
-};
+use ::config::{Config as Loader, Environment, File, FileFormat, FileSourceFile, FileSourceString};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Serde adapter: `Duration` ⇄ integer seconds. Lets a `Config` field
@@ -228,6 +225,37 @@ pub fn env_or<T: FromStr>(name: &str, default: T) -> T {
     }
 }
 
+/// Build a config layer from any serializable value. Used for the
+/// compiled-defaults base layer and the clap CLI overlay in [`load`], and
+/// by per-crate tests that need the same defaults-plus-TOML layering.
+///
+/// Why a JSON round-trip instead of `config::Config::try_from`: the config
+/// crate's struct serializer flattens values into dotted path expressions,
+/// which (a) rejects map keys that aren't bare identifiers (the
+/// controller's glob-keyed pool maps like `"fetcher-*"`), and (b) drops
+/// empty maps/vecs entirely (the scheduler's empty `sla.hw_classes`
+/// baseline), both of which figment's `Serialized::defaults` preserved.
+/// Parsing the serialized value back through the JSON format source builds
+/// the same value tree figment did. Integer defaults must fit in i64 — the
+/// JSON value path degrades larger integers to f64; none of our configs
+/// carry such values.
+pub fn serialized_layer<T: Serialize>(
+    value: &T,
+) -> anyhow::Result<File<FileSourceString, FileFormat>> {
+    let json = serde_json::to_string(value)?;
+    Ok(File::from_str(&json, FileFormat::Json))
+}
+
+/// TOML file layer with figment-parity availability semantics: a missing
+/// file is skipped, but a file that exists and cannot be read or parsed is
+/// a hard error (config-rs's `required(false)` alone would silently skip
+/// an existing-but-unreadable file, e.g. a root-owned 0600 /etc/rio file
+/// read by an unprivileged service).
+fn file_layer(path: String) -> File<FileSourceFile, FileFormat> {
+    let exists = std::path::Path::new(&path).exists();
+    File::new(&path, FileFormat::Toml).required(exists)
+}
+
 /// Load configuration for `component` with the full precedence chain.
 ///
 /// TOML search paths (later overrides earlier; missing = skipped, not error):
@@ -245,24 +273,36 @@ pub fn env_or<T: FromStr>(name: &str, default: T) -> T {
 ///   for a numeric field).
 /// - Required field (no `#[serde(default)]`) missing from every layer.
 ///
-/// The error message includes which provider layer the failure came from.
+/// File errors name the offending path; type errors name the offending key.
 pub fn load<C, O>(component: &str, cli_overlay: O) -> anyhow::Result<C>
 where
     C: DeserializeOwned + Default + Serialize,
     O: Serialize,
 {
-    Figment::from(Serialized::defaults(C::default()))
-        .merge(Toml::file(format!("/etc/rio/{component}.toml")))
-        .merge(Toml::file(format!("{component}.toml")))
-        // Env::split("__") turns RIO_STORE__S3_BUCKET into store.s3_bucket.
-        // Note: figment lowercases the
-        // env var key after stripping the prefix, so RIO_LISTEN_ADDR maps
-        // to `listen_addr` in the Config struct.
-        .merge(Env::prefixed("RIO_").split("__"))
-        // CLI last = highest precedence. Serialized::defaults on a struct
-        // whose None fields skip_serializing means only set flags land.
-        .merge(Serialized::defaults(cli_overlay))
-        .extract()
+    let defaults = serialized_layer(&C::default()).map_err(|e| {
+        anyhow::anyhow!("config defaults for {component:?} failed to serialize: {e}")
+    })?;
+    // CLI last = highest precedence. serialized_layer on a struct whose None
+    // fields carry skip_serializing_if means only explicitly-set flags land.
+    let cli = serialized_layer(&cli_overlay)
+        .map_err(|e| anyhow::anyhow!("CLI overlay for {component:?} failed to serialize: {e}"))?;
+    Loader::builder()
+        .add_source(defaults)
+        .add_source(file_layer(format!("/etc/rio/{component}.toml")))
+        .add_source(file_layer(format!("{component}.toml")))
+        // RIO_STORE__S3_BUCKET → store.s3_bucket: "RIO" + "_" prefix is
+        // stripped, the key is lowercased, and "__" is the nesting
+        // separator — the same convention the figment Env provider used.
+        // try_parsing keeps env strings leniently typed (bool/int/float).
+        .add_source(
+            Environment::with_prefix("RIO")
+                .prefix_separator("_")
+                .separator("__")
+                .try_parsing(true),
+        )
+        .add_source(cli)
+        .build()
+        .and_then(|merged| merged.try_deserialize())
         .map_err(|e| anyhow::anyhow!("config load for {component:?} failed: {e}"))
 }
 
@@ -273,8 +313,8 @@ where
 /// are derived from `field` by convention: `field_name` → flag
 /// `--field-name`, env `RIO_FIELD_NAME`. All 10 call-sites across
 /// the 5 binaries follow this convention today; if a field ever
-/// diverges (unlikely — clap's `#[arg(long)]` and figment's
-/// `Env::prefixed("RIO_")` both derive the same way), add a sibling
+/// diverges (unlikely — clap's `#[arg(long)]` and the RIO_ env layer
+/// both derive the same way), add a sibling
 /// with explicit args rather than loosening this one.
 ///
 /// DRYs the 10× identical `ensure!(!field.is_empty(), "X is required
@@ -306,14 +346,14 @@ pub fn ensure_required(value: &str, field: &str, component: &str) -> anyhow::Res
 /// Derive the operator-facing `--flag, RIO_ENV, or component.toml` hint
 /// from a config field name. Used by [`ensure_required`] and any error
 /// message that names a config knob — keeps the three surfaces (clap
-/// kebab-case, figment `RIO_` prefix, toml filename) in lockstep with
+/// kebab-case, `RIO_` env prefix, toml filename) in lockstep with
 /// the field name so a rename can't strand a string literal (bug_156:
 /// `worker_id`→`executor_id` rename left `--worker-id, RIO_WORKER_ID,
 /// or worker.toml` in `resolve_executor_identity`'s error; an operator
 /// following it set `RIO_WORKER_ID`, figment silently ignored it, same
 /// error looped).
 ///
-/// `.` in `field` is figment's nesting separator → `__` in env, `-` in
+/// `.` in `field` is the env nesting separator → `__` in env, `-` in
 /// flag. So `scheduler.addr` → `--scheduler-addr`, `RIO_SCHEDULER__ADDR`.
 pub fn config_hint(field: &str, component: &str) -> String {
     format!(
@@ -389,8 +429,8 @@ pub struct JwtConfig {
 }
 
 /// Deserialize `Vec<String>` from EITHER a comma-separated string
-/// (env var layer) OR a sequence (TOML layer). Figment's `Env`
-/// provider gives strings; `Toml` gives sequences. A bare
+/// (env var layer) OR a sequence (TOML layer). The env layer gives
+/// strings; the TOML layer gives sequences. A bare
 /// `Vec<String>` field fails on the env layer ("invalid type:
 /// string, expected a sequence"). This visitor bridges both.
 ///
@@ -535,12 +575,22 @@ where
     C: DeserializeOwned + Default + Serialize,
     O: Serialize,
 {
-    Figment::from(Serialized::defaults(C::default()))
-        .merge(Toml::file(toml_path))
-        .merge(Env::prefixed("RIO_").split("__"))
-        .merge(Serialized::defaults(cli_overlay))
-        .extract()
-        .map_err(anyhow::Error::from)
+    let cfg = Loader::builder()
+        .add_source(serialized_layer(&C::default())?)
+        .add_source(
+            File::from(toml_path)
+                .format(FileFormat::Toml)
+                .required(toml_path.exists()),
+        )
+        .add_source(
+            Environment::with_prefix("RIO")
+                .prefix_separator("_")
+                .separator("__")
+                .try_parsing(true),
+        )
+        .add_source(serialized_layer(&cli_overlay)?)
+        .build()?;
+    Ok(cfg.try_deserialize()?)
 }
 
 #[cfg(test)]
@@ -604,8 +654,10 @@ mod tests {
     }
 
     /// Write TOML to a tempfile and return the handle (file lives until dropped).
+    /// The `.toml` suffix matters: the config crate resolves file format
+    /// from the extension.
     fn write_toml(content: &str) -> tempfile::NamedTempFile {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let mut f = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
         f.write_all(content.as_bytes()).unwrap();
         f.flush().unwrap();
         f
@@ -824,7 +876,7 @@ mod tests {
         features: Vec<String>,
     }
 
-    // Figment's Serialized::defaults needs a map-serializing overlay.
+    // The defaults/CLI overlay layers need a map-serializing value.
     // `()` serializes as unit → "invalid type: found unit, expected
     // map". Empty struct serializes as an empty map.
     #[derive(Serialize, Default)]
@@ -1058,23 +1110,58 @@ mod tests {
         tick: std::time::Duration,
     }
 
-    /// `secs` round-trip via figment's `Serialized` provider — the same
-    /// path `load()` uses for the base layer. Proves the adapter
-    /// composes with figment, not just raw serde.
+    /// `secs` round-trip via the defaults layer (`serialized_layer`) — the
+    /// same path `load()` uses for the base layer. Proves the adapter
+    /// composes with the config layering, not just raw serde.
     #[test]
-    fn duration_adapters_roundtrip_via_figment() {
+    fn duration_adapters_roundtrip_via_defaults_layer() {
         let original = DurCfg {
             tick: std::time::Duration::from_secs(7),
         };
-        let extracted: DurCfg = Figment::from(Serialized::defaults(&original))
-            .extract()
+        let extracted: DurCfg = Loader::builder()
+            .add_source(serialized_layer(&original).unwrap())
+            .build()
+            .unwrap()
+            .try_deserialize()
             .unwrap();
         assert_eq!(extracted, original);
         // Wire format: rename keeps the unit-suffixed key, value is a
         // plain integer (so env `RIO_TICK_SECS=7` and TOML `tick_secs
-        // = 7` both work via figment's existing layers).
+        // = 7` both work via the existing layers).
         let json = serde_json::to_value(&original).unwrap();
         assert_eq!(json["tick_secs"], 7);
+    }
+
+    /// serialized_layer must preserve glob map keys and empty maps — the
+    /// two places config-rs's struct serializer (Config::try_from) loses
+    /// information that figment's Serialized::defaults kept. Regression
+    /// guard for the controller (glob-keyed min_consolidation_time) and
+    /// scheduler (empty sla.hw_classes baseline) startup failures.
+    #[test]
+    fn serialized_layer_preserves_glob_keys_and_empty_maps() {
+        use std::collections::HashMap;
+
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct Globby {
+            // No #[serde(default)] on purpose: the empty map must survive
+            // the round-trip as a *present* empty table, not go missing.
+            thresholds: HashMap<String, f64>,
+            classes: HashMap<String, u32>,
+            systems: Vec<String>,
+        }
+
+        let value = Globby {
+            thresholds: HashMap::from([("fetcher-*".to_string(), 600.0), ("*".to_string(), 300.0)]),
+            classes: HashMap::new(),
+            systems: vec![],
+        };
+        let roundtripped: Globby = Loader::builder()
+            .add_source(serialized_layer(&value).unwrap())
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert_eq!(roundtripped, value);
     }
 
     #[test]

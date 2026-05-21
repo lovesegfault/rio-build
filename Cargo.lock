@@ -1458,6 +1458,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "config"
+version = "0.15.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f316c6237b2d38be61949ecd15268a4c6ca32570079394a2444d9ce2c72a72d8"
+dependencies = [
+ "pathdiff",
+ "serde_core",
+ "serde_json",
+ "toml 1.1.2+spec-1.1.0",
+ "winnow 1.0.3",
+]
+
+[[package]]
 name = "console"
 version = "0.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5279,6 +5292,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pathdiff"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
+
+[[package]]
 name = "pbkdf2"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6197,6 +6216,7 @@ dependencies = [
  "aws-sdk-s3",
  "axum",
  "base64",
+ "config",
  "figment",
  "futures-util",
  "libc",
@@ -9222,6 +9242,7 @@ dependencies = [
  "serde",
  "serde_core",
  "serde_json",
+ "serde_spanned 1.1.1",
  "sha1 0.10.6",
  "sha1 0.11.0",
  "sha2 0.10.9",
@@ -9244,6 +9265,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "tokio-util",
+ "toml 1.1.2+spec-1.1.0",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
  "tower",

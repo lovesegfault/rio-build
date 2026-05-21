@@ -9647,6 +9647,29 @@
         "David Tolnay <dtolnay@gmail.com>"
       ]
     },
+    "serde_spanned": {
+      "crateName": "serde_spanned",
+      "version": "1.1.1",
+      "edition": "2024",
+      "sha256": "09jzk7i6wihn3d8i3wi4j4n98ghi93c3b8m8k64nxq0ijn3vaqk6",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "serde_core",
+          "packageId": "serde_core"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc",
+        "serde",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
     "serde_yaml": {
       "crateName": "serde_yaml",
       "version": "0.9.34+deprecated",
@@ -11413,6 +11436,51 @@
         "Tokio Contributors <team@tokio.rs>"
       ]
     },
+    "toml": {
+      "crateName": "toml",
+      "version": "1.1.2+spec-1.1.0",
+      "edition": "2024",
+      "sha256": "1vpggpamqhw4852kic7465zsidczsla06wz6friqkkfbhigd3ww1",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "serde_core",
+          "packageId": "serde_core"
+        },
+        {
+          "name": "serde_spanned",
+          "packageId": "serde_spanned"
+        },
+        {
+          "name": "toml_datetime",
+          "packageId": "toml_datetime"
+        },
+        {
+          "name": "toml_parser",
+          "packageId": "toml_parser"
+        },
+        {
+          "name": "toml_writer",
+          "packageId": "toml_writer"
+        },
+        {
+          "name": "winnow",
+          "packageId": "winnow"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "display",
+        "parse",
+        "serde",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
     "toml_datetime": {
       "crateName": "toml_datetime",
       "version": "1.1.1+spec-1.1.0",
@@ -11439,9 +11507,9 @@
     },
     "toml_parser": {
       "crateName": "toml_parser",
-      "version": "1.1.0+spec-1.1.0",
+      "version": "1.1.2+spec-1.1.0",
       "edition": "2024",
-      "sha256": "04a0pfm9hp18mhk2lrm85fkia5ya2f5grf7r9nq7wq33wcgg2d13",
+      "sha256": "09kmzc55a0j21whm290wlf5a8b18a0qc87a1s8sncrckc6wfkax2",
       "source": {
         "type": "crates-io"
       },
@@ -11454,6 +11522,22 @@
       "resolvedDefaultFeatures": [
         "alloc",
         "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "toml_writer": {
+      "crateName": "toml_writer",
+      "version": "1.1.1+spec-1.1.0",
+      "edition": "2024",
+      "sha256": "1nwjhvvrxz8f4ck1qi4xcz2x9qhpci37nrknhxxf9sqk22dsyvbm",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "alloc",
         "std"
       ],
       "libCrateTypes": [
@@ -13890,6 +13974,10 @@
           "packageId": "serde_json"
         },
         {
+          "name": "serde_spanned",
+          "packageId": "serde_spanned"
+        },
+        {
           "name": "sha1",
           "packageId": "sha1 0.10.6",
           "rename": "sha1_93f6ce9d446188ac"
@@ -13982,6 +14070,10 @@
         {
           "name": "tokio-util",
           "packageId": "tokio-util"
+        },
+        {
+          "name": "toml",
+          "packageId": "toml"
         },
         {
           "name": "toml_datetime",
@@ -14465,6 +14557,10 @@
           "packageId": "serde_json"
         },
         {
+          "name": "serde_spanned",
+          "packageId": "serde_spanned"
+        },
+        {
           "name": "sha1",
           "packageId": "sha1 0.10.6",
           "rename": "sha1_93f6ce9d446188ac"
@@ -14561,6 +14657,10 @@
         {
           "name": "tokio-util",
           "packageId": "tokio-util"
+        },
+        {
+          "name": "toml",
+          "packageId": "toml"
         },
         {
           "name": "toml_datetime",

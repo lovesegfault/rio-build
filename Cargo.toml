@@ -145,6 +145,17 @@ opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
 # into every build, so listing it here costs nothing extra and lets
 # six crates' dev-deps say `figment.workspace = true` without overrides.
 figment = { version = "0.10", features = ["toml", "env", "test"] }
+# Configuration loading (TOML file + RIO_ env + CLI overlay layering) — see
+# rio_common::config::load. Replaces figment (dormant upstream: no release
+# since 2024-05). default-features off: the defaults pull json/yaml/ron/
+# ini/json5 readers and async-source traits we never use; TOML is the only
+# on-disk format; `json` exists solely so the compiled-defaults/CLI layers
+# can be fed through the JSON value parser (see
+# rio_common::config::serialized_layer).
+config = { version = "0.15", default-features = false, features = [
+  "toml",
+  "json",
+] }
 
 # Concurrent map (phase2b: scheduler log ring buffers, written from
 # BuildExecution recv tasks outside the actor loop)

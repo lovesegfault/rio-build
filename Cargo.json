@@ -4583,6 +4583,45 @@
         "John Nunley <dev@notgull.net>"
       ]
     },
+    "config": {
+      "crateName": "config",
+      "version": "0.15.23",
+      "edition": "2024",
+      "sha256": "1n3j5b3y572d8ji994q7f0js6v2ci8k1bkcyjihvwf1dgciwc5pk",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "pathdiff",
+          "packageId": "pathdiff"
+        },
+        {
+          "name": "serde_core",
+          "packageId": "serde_core"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        },
+        {
+          "name": "toml",
+          "packageId": "toml 1.1.2+spec-1.1.0"
+        },
+        {
+          "name": "winnow",
+          "packageId": "winnow 1.0.3"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "json",
+        "serde_json",
+        "toml"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
     "console": {
       "crateName": "console",
       "version": "0.16.3",
@@ -16593,6 +16632,21 @@
         "David Tolnay <dtolnay@gmail.com>"
       ]
     },
+    "pathdiff": {
+      "crateName": "pathdiff",
+      "version": "0.2.3",
+      "edition": "2018",
+      "sha256": "1lrqp4ip05df8dzldq6gb2c1sq2gs54gly8lcnv3rhav1qhwx56z",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Manish Goregaokar <manishsmail@gmail.com>"
+      ]
+    },
     "pbkdf2": {
       "crateName": "pbkdf2",
       "version": "0.13.0",
@@ -19498,8 +19552,8 @@
           "packageId": "base64"
         },
         {
-          "name": "figment",
-          "packageId": "figment"
+          "name": "config",
+          "packageId": "config"
         },
         {
           "name": "futures-util",
@@ -19536,6 +19590,10 @@
         {
           "name": "serde",
           "packageId": "serde"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
         },
         {
           "name": "thiserror",
@@ -19586,10 +19644,6 @@
         {
           "name": "proptest",
           "packageId": "proptest"
-        },
-        {
-          "name": "serde_json",
-          "packageId": "serde_json"
         },
         {
           "name": "tempfile",
@@ -29417,6 +29471,10 @@
           "packageId": "serde_json"
         },
         {
+          "name": "serde_spanned",
+          "packageId": "serde_spanned 1.1.1"
+        },
+        {
           "name": "sha1",
           "packageId": "sha1 0.10.6",
           "rename": "sha1_93f6ce9d446188ac"
@@ -29509,6 +29567,10 @@
         {
           "name": "tokio-util",
           "packageId": "tokio-util"
+        },
+        {
+          "name": "toml",
+          "packageId": "toml 1.1.2+spec-1.1.0"
         },
         {
           "name": "toml_datetime",
@@ -29992,6 +30054,10 @@
           "packageId": "serde_json"
         },
         {
+          "name": "serde_spanned",
+          "packageId": "serde_spanned 1.1.1"
+        },
+        {
           "name": "sha1",
           "packageId": "sha1 0.10.6",
           "rename": "sha1_93f6ce9d446188ac"
@@ -30088,6 +30154,10 @@
         {
           "name": "tokio-util",
           "packageId": "tokio-util"
+        },
+        {
+          "name": "toml",
+          "packageId": "toml 1.1.2+spec-1.1.0"
         },
         {
           "name": "toml_datetime",

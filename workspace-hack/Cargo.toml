@@ -99,6 +99,7 @@ sec1 = { version = "0.8", features = ["ctutils", "pem", "std", "subtle"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["alloc", "raw_value"] }
+serde_spanned = { version = "1", default-features = false, features = ["serde", "std"] }
 sha1-93f6ce9d446188ac = { package = "sha1", version = "0.10", features = ["compress"] }
 sha1-a6292c17cd707f01 = { package = "sha1", version = "0.11" }
 sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10" }
@@ -119,6 +120,7 @@ thiserror = { version = "2" }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "net", "sync"] }
 tokio-util = { version = "0.7", features = ["codec", "io", "time"] }
+toml = { version = "1" }
 toml_datetime = { version = "1", features = ["serde"] }
 toml_parser = { version = "1" }
 tower = { version = "0.5", default-features = false, features = ["balance", "buffer", "filter", "limit", "load-shed", "log", "retry"] }
@@ -218,6 +220,7 @@ sec1 = { version = "0.8", features = ["ctutils", "pem", "std", "subtle"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["alloc", "raw_value"] }
+serde_spanned = { version = "1", default-features = false, features = ["serde", "std"] }
 sha1-93f6ce9d446188ac = { package = "sha1", version = "0.10", features = ["compress"] }
 sha1-a6292c17cd707f01 = { package = "sha1", version = "0.11" }
 sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10" }
@@ -239,6 +242,7 @@ thiserror = { version = "2" }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "net", "sync"] }
 tokio-util = { version = "0.7", features = ["codec", "io", "time"] }
+toml = { version = "1" }
 toml_datetime = { version = "1", features = ["serde"] }
 toml_parser = { version = "1" }
 tower = { version = "0.5", default-features = false, features = ["balance", "buffer", "filter", "limit", "load-shed", "log", "retry"] }
