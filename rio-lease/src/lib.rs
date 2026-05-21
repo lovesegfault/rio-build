@@ -77,33 +77,20 @@ pub trait LeaseHooks: Clone + Send + 'static {
     fn on_lose(&self);
 }
 
-// TODO: tighten the dual-belief window with asymmetric TTLs. The same
-// LEASE_TTL gates the leader's self-fence (`maybe_self_fence`) and the
-// follower's steal threshold (`decide_pure()` `age_ms > ttl_ms`), but the
-// two timestamps are stamped at different moments: the leader stamps
-// `last_successful_renew` when its renew RESPONSE arrives, the follower
-// stamps `obs.since` when it OBSERVES the rv change. When the follower's
-// observation latency is less than the leader's response latency, the
-// follower's deadline is earlier than the leader's — a connectivity loss
-// in between produces a dual-belief window with no clock skew involved.
-// The standard tightening (Chubby, etcd, ZooKeeper) is a safety margin:
-// leader self-fences at LEASE_TTL - margin, follower steals at
-// LEASE_TTL + margin, with margin > 2 × max(latency_slack, clock_skew).
-// The current "same TTL" choice is defensible because
-// r[sched.lease.generation-fence+2] provides correctness regardless and the
-// executor-side check is a cheap integer compare; this becomes worth doing
-// if that fence ever grows hot.
-//
 // TODO: use CLOCK_BOOTTIME for the self-fence clock instead of
 // Instant::now() (= CLOCK_MONOTONIC on Linux). MONOTONIC does not advance
 // during host suspend; a suspend-and-resume leaves `last_successful_renew`
-// looking fresh while real time advanced past LEASE_TTL — the leader
+// looking fresh while real time advanced past SELF_FENCE_AFTER — the leader
 // resumes still believing it leads, until the next failed apiserver
 // round-trip. BOOTTIME advances during suspend, so the self-fence fires
 // immediately on resume. Low priority for k8s nodes (they don't suspend);
 // worth doing before any bare-metal or laptop deployment of the scheduler.
-/// Lease TTL. After this much time without renewal, another
-/// replica can acquire.
+/// Lease TTL as written to the Lease object's `leaseDurationSeconds`.
+/// Documentation for `kubectl describe lease` and any client-go
+/// co-tenant — NOT the threshold either side of this protocol acts on.
+/// The leader self-fences at [`SELF_FENCE_AFTER`] (earlier) and a
+/// follower steals at [`STEAL_AFTER`] (later); the gap between them is
+/// what closes the dual-belief window.
 const LEASE_TTL: Duration = Duration::from_secs(15);
 
 /// Renewal interval. LEASE_TTL / 3 per K8s convention.
@@ -113,8 +100,73 @@ const RENEW_INTERVAL: Duration = Duration::from_secs(5);
 /// attempt must return BEFORE the next interval tick would fire;
 /// otherwise a hung apiserver burns multiple ticks on one call.
 /// 3s deadline for a Lease GET+PUT is generous (healthy p99 <100ms)
-/// while still giving 3 attempts before LEASE_TTL.
+/// while still giving 2 attempts before SELF_FENCE_AFTER.
 const RENEW_SLOP: Duration = Duration::from_secs(2);
+
+/// The asymmetry margin between the leader's self-fence deadline and the
+/// follower's steal threshold. The two deadlines are anchored at
+/// different moments (the leader stamps `last_successful_renew` when its
+/// renew RESPONSE arrives; the follower stamps `obs.at` when it OBSERVES
+/// the rv change), so without a margin the follower's deadline can land
+/// first with zero clock skew. The TLA+ model
+/// (`docs/spec/models/LeaderElectionAsymmetric.cfg`) proves NeverDual —
+/// no two replicas ever simultaneously believe they lead — exactly when
+/// the separation exceeds the renew interval plus the round-trip clock
+/// skew:
+///
+/// ```text
+/// 2 × FENCE_MARGIN  ≥  RENEW_INTERVAL + 2 × clock_skew
+///       8s          ≥       5s        + 2 × skew
+/// ```
+///
+/// The renew-interval term is the victim's fence-check latency (the loop
+/// only checks `maybe_self_fence` once per tick); what remains is a 1.5s
+/// one-sided clock-skew budget — far above NTP drift on cloud nodes. A
+/// clock pause longer than that re-opens the window, which is the
+/// impossibility result the generation fence
+/// (r\[sched.lease.generation-fence+2\]) backstops. The model also shows
+/// the bound is tight: one tick less separation and a dual-belief state
+/// is reachable.
+const FENCE_MARGIN: Duration = Duration::from_secs(4);
+
+/// The leader self-fences after this long without a successful renew:
+/// LEASE_TTL − FENCE_MARGIN. Two missed renew ticks plus one in-flight
+/// attempt, instead of three. The idempotent same-epoch re-claim
+/// (r\[sched.lease.generation-claim\]) is what makes the more frequent
+/// false alarms free: a self-fence followed by a successful renew
+/// re-acquires at the SAME generation and in-flight work survives.
+const SELF_FENCE_AFTER: Duration = Duration::from_secs(11);
+
+/// A follower steals after observing the same resourceVersion for this
+/// long: LEASE_TTL + FENCE_MARGIN. Failover after a real leader death
+/// takes up to this long plus one renew interval.
+const STEAL_AFTER: Duration = Duration::from_secs(19);
+
+// The derivation and the NeverDual condition, enforced at compile time
+// so no constant moves without the others. `Duration::as_secs` is
+// const-stable.
+const _: () = {
+    assert!(
+        SELF_FENCE_AFTER.as_secs() == LEASE_TTL.as_secs() - FENCE_MARGIN.as_secs(),
+        "SELF_FENCE_AFTER must be LEASE_TTL - FENCE_MARGIN"
+    );
+    assert!(
+        STEAL_AFTER.as_secs() == LEASE_TTL.as_secs() + FENCE_MARGIN.as_secs(),
+        "STEAL_AFTER must be LEASE_TTL + FENCE_MARGIN"
+    );
+    // The model-verified NeverDual condition: the fence/steal separation
+    // must exceed the renew interval (the remainder is the clock-skew
+    // budget).
+    assert!(
+        2 * FENCE_MARGIN.as_secs() > RENEW_INTERVAL.as_secs(),
+        "the fence/steal separation must exceed the renew interval"
+    );
+    // The leader must get at least one renew attempt before fencing.
+    assert!(
+        SELF_FENCE_AFTER.as_secs() > RENEW_INTERVAL.as_secs(),
+        "the leader must get at least one renew attempt before fencing"
+    );
+};
 
 /// Lease configuration, built from the scheduler's loaded `Config`.
 ///
@@ -486,6 +538,7 @@ pub async fn run_lease_loop<H: LeaseHooks>(
         cfg.lease_name.clone(),
         cfg.holder_id.clone(),
         LEASE_TTL,
+        STEAL_AFTER,
     );
 
     info!(
@@ -493,6 +546,8 @@ pub async fn run_lease_loop<H: LeaseHooks>(
         namespace = %cfg.namespace,
         holder = %cfg.holder_id,
         ttl_secs = LEASE_TTL.as_secs(),
+        self_fence_secs = SELF_FENCE_AFTER.as_secs(),
+        steal_after_secs = STEAL_AFTER.as_secs(),
         "lease loop starting"
     );
 
@@ -674,21 +729,25 @@ pub async fn run_lease_loop<H: LeaseHooks>(
                     Ok(Ok(_)) => unreachable!(),
                 }
                 //
-                // Local self-fence: if LEASE_TTL has elapsed since
-                // the last SUCCESSFUL round-trip, flip is_leader
-                // locally. At this point, any replica that CAN reach
-                // the apiserver has already stolen (observed-record
-                // TTL = our TTL; same clock).
+                // Local self-fence: if SELF_FENCE_AFTER has elapsed
+                // since the last SUCCESSFUL round-trip, flip is_leader
+                // locally. SELF_FENCE_AFTER is 2×FENCE_MARGIN earlier
+                // than any follower's steal threshold (STEAL_AFTER), so
+                // by the time a replica that CAN reach the apiserver
+                // steals, we have already stopped believing — that
+                // ordering is the NeverDual proof in
+                // LeaderElectionAsymmetric.cfg.
                 //
                 // The old "DON'T flip — apiserver down for EVERYONE"
-                // argument is wrong once elapsed > TTL. In the
-                // symmetric-partition case (nobody reaches apiserver)
-                // flipping costs nothing: workers can't be scheduled
-                // anyway. In the asymmetric case (WE are partitioned,
-                // peer is not) NOT flipping makes us a stale-assignment
-                // noise generator. Worker-side generation fence
-                // (r[sched.lease.generation-fence+2]) saves correctness
-                // either way; this fence saves ops sanity.
+                // argument is wrong once elapsed > the fence deadline.
+                // In the symmetric-partition case (nobody reaches the
+                // apiserver) flipping costs nothing: workers can't be
+                // scheduled anyway. In the asymmetric case (WE are
+                // partitioned, peer is not) NOT flipping makes us a
+                // stale-assignment noise generator. Worker-side
+                // generation fence (r[sched.lease.generation-fence+2])
+                // saves correctness either way; this fence saves ops
+                // sanity.
                 if maybe_self_fence(
                     &state,
                     &mut was_leading,
@@ -706,23 +765,23 @@ pub async fn run_lease_loop<H: LeaseHooks>(
     // r[impl sched.lease.graceful-release]
     // Graceful release: on shutdown, release the lease so the next
     // replica acquires immediately (~1s poll) instead of waiting
-    // for TTL expiry (15s). Gate on was_leading to skip the
+    // out the steal threshold (19s). Gate on was_leading to skip the
     // apiserver round-trip when we were standby all along. Any
     // error is non-fatal: we're shutting down regardless, and
-    // TTL expiry is the fallback.
+    // the steal threshold is the fallback.
     if was_leading {
         let deadline = RENEW_INTERVAL.saturating_sub(RENEW_SLOP);
         match tokio::time::timeout(deadline, election.step_down()).await {
             Ok(Ok(())) => info!("released lease on shutdown"),
             Ok(Err(e)) => warn!(
                 error = %e,
-                "step_down failed; lease will expire in {}s",
-                LEASE_TTL.as_secs()
+                "step_down failed; the next replica will steal in {}s",
+                STEAL_AFTER.as_secs()
             ),
             Err(_) => warn!(
                 ?deadline,
-                "step_down timed out (apiserver hung?); lease will expire in {}s",
-                LEASE_TTL.as_secs()
+                "step_down timed out (apiserver hung?); the next replica will steal in {}s",
+                STEAL_AFTER.as_secs()
             ),
         }
     }
@@ -730,11 +789,13 @@ pub async fn run_lease_loop<H: LeaseHooks>(
 }
 
 /// Local self-fence: if we believed we were leading but haven't
-/// had a successful apiserver round-trip in over `LEASE_TTL`, flip
-/// `is_leader=false` locally. At this point, any replica that CAN
-/// reach the apiserver has already stolen. The only world where we're
-/// still the rightful leader is one where NOBODY can reach the
-/// apiserver — in which case dispatch is pointless anyway.
+/// had a successful apiserver round-trip in over [`SELF_FENCE_AFTER`],
+/// flip `is_leader=false` locally. SELF_FENCE_AFTER is 2×FENCE_MARGIN
+/// ahead of any follower's steal threshold, so we stop believing
+/// BEFORE anyone who can reach the apiserver steals — that ordering is
+/// the NeverDual proof in `LeaderElectionAsymmetric.cfg`. The only
+/// world where we're still the rightful leader is one where NOBODY can
+/// reach the apiserver — in which case dispatch is pointless anyway.
 ///
 /// Extracted from `run_lease_loop`'s error arm so it can be unit-
 /// tested without spawning the full loop (paused time + real TCP
@@ -748,10 +809,11 @@ fn maybe_self_fence(
     owe_cost_clear: &mut bool,
     last_successful_renew: Instant,
 ) -> bool {
-    if *was_leading && last_successful_renew.elapsed() > LEASE_TTL {
+    if *was_leading && last_successful_renew.elapsed() > SELF_FENCE_AFTER {
         warn!(
             blind_for = ?last_successful_renew.elapsed(),
-            "LOCAL SELF-FENCE: no successful renew in > LEASE_TTL, stepping down locally"
+            self_fence_after_secs = SELF_FENCE_AFTER.as_secs(),
+            "LOCAL SELF-FENCE: no successful renew in > SELF_FENCE_AFTER, stepping down locally"
         );
         state.on_lose();
         *was_leading = false;
@@ -1001,6 +1063,7 @@ mod tests {
             "rio-sched".into(),
             "us".into(),
             LEASE_TTL,
+            STEAL_AFTER,
         );
 
         let deadline = RENEW_INTERVAL.saturating_sub(RENEW_SLOP);
@@ -1037,6 +1100,7 @@ mod tests {
             "rio-sched".into(),
             "us".into(),
             LEASE_TTL,
+            STEAL_AFTER,
         );
 
         let deadline = RENEW_INTERVAL.saturating_sub(RENEW_SLOP);
@@ -1052,22 +1116,22 @@ mod tests {
     }
 
     /// Self-fence fires when `last_successful_renew` is older than
-    /// LEASE_TTL and we believed we were leading. Simulates the
-    /// state after 4+ failed renew ticks (5s each, TTL=15s).
+    /// SELF_FENCE_AFTER and we believed we were leading. Simulates
+    /// the state after 3+ failed renew ticks (5s each, fence at 11s).
     #[test]
-    fn self_fence_flips_is_leader_after_ttl_of_failures() {
+    fn self_fence_flips_is_leader_after_fence_deadline_of_failures() {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(2)));
         state.is_leader.store(true, Ordering::Relaxed);
         state.recovery_complete.store(true, Ordering::Relaxed);
 
         let mut was_leading = true;
         let mut owe_cost_clear = false;
-        // 20s ago > LEASE_TTL (15s). Pattern matches election.rs:535.
+        // 20s ago > SELF_FENCE_AFTER (11s). Pattern matches election.rs:535.
         let last_renew = Instant::now() - Duration::from_secs(20);
 
         let fired = maybe_self_fence(&state, &mut was_leading, &mut owe_cost_clear, last_renew);
 
-        assert!(fired, "self-fence should fire past TTL");
+        assert!(fired, "self-fence should fire past SELF_FENCE_AFTER");
         assert!(
             !state.is_leader.load(Ordering::Relaxed),
             "self-fence should flip is_leader=false"
@@ -1082,27 +1146,29 @@ mod tests {
         );
     }
 
-    /// Self-fence does NOT fire within TTL. One or two transient
-    /// apiserver blips should not cause step-down — the lease may
-    /// still be validly held (the original "DON'T flip" comment's
-    /// reasoning is correct for the FIRST few failures).
+    /// Self-fence does NOT fire within SELF_FENCE_AFTER. One or two
+    /// transient apiserver blips should not cause step-down — the
+    /// lease may still be validly held (the original "DON'T flip"
+    /// comment's reasoning is correct for the FIRST few failures).
+    /// 10s is SELF_FENCE_AFTER − 1s: the boundary's negative side.
     #[test]
-    fn self_fence_does_not_flip_before_ttl() {
+    fn self_fence_does_not_flip_before_fence_deadline() {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(2)));
         state.is_leader.store(true, Ordering::Relaxed);
         state.recovery_complete.store(true, Ordering::Relaxed);
 
         let mut was_leading = true;
         let mut owe_cost_clear = false;
-        // 10s ago < LEASE_TTL (15s). Two failed ticks, lease still valid.
+        // 10s ago < SELF_FENCE_AFTER (11s). Two failed ticks, lease
+        // still validly held as far as we know.
         let last_renew = Instant::now() - Duration::from_secs(10);
 
         let fired = maybe_self_fence(&state, &mut was_leading, &mut owe_cost_clear, last_renew);
 
-        assert!(!fired, "within TTL → no self-fence");
+        assert!(!fired, "within SELF_FENCE_AFTER → no self-fence");
         assert!(
             state.is_leader.load(Ordering::Relaxed),
-            "within TTL → still leader (transient blip)"
+            "within SELF_FENCE_AFTER → still leader (transient blip)"
         );
         assert!(state.recovery_complete.load(Ordering::Relaxed));
         assert!(was_leading);

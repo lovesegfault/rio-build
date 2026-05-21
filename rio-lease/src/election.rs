@@ -19,8 +19,12 @@
 //!    plus a local monotonic `Instant` when that rv was first
 //!    seen. The apiserver bumps rv on every write, so a leader
 //!    renewing every 5s produces a new rv every 5s. If rv doesn't
-//!    change for `ttl` of *local* time, nobody wrote — steal.
-//!    Cross-node clock skew is irrelevant; only our own `Instant`
+//!    change for the steal threshold of *local* time, nobody wrote —
+//!    steal. The steal threshold (`STEAL_AFTER`, 19s) is deliberately
+//!    LATER than the leader's own self-fence deadline
+//!    (`SELF_FENCE_AFTER`, 11s): by the time we steal, the deposed
+//!    leader has already stopped believing. Cross-node clock skew is
+//!    irrelevant up to the margin; only our own `Instant`
 //!    monotonicity matters.
 //!
 //! The split into a pure `decide()` function + an I/O shell is
@@ -91,13 +95,13 @@ pub enum Decision {
 /// monotonic clock) first see this `resourceVersion`? The
 /// apiserver bumps rv on every write (including renew), so a
 /// live leader produces a fresh rv every RENEW_INTERVAL. If rv
-/// doesn't change for `ttl`, nobody is writing — the holder is
-/// dead.
+/// doesn't change for the steal threshold, nobody is writing — the
+/// holder is dead.
 ///
 /// Tracking rv (not `(holder, transitions)`) is load-bearing:
 /// renew only touches `renew_time`, leaving holder/transitions
 /// unchanged — a standby watching only those would see a live
-/// leader as frozen and steal it after ttl.
+/// leader as frozen and steal it after the steal threshold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Observed {
     resource_version: String,
@@ -176,11 +180,11 @@ pub(crate) enum ObservedUpdate {
 // Verified by check_decide_pure_contract in #[cfg(kani)] mod kani_proofs.
 #[cfg_attr(kani, kani::ensures(|r: &(Decision, ObservedUpdate)| {
     // Steal iff holder is empty, OR (holder is Other AND the observed
-    // rv matched AND has been stale for > ttl).
+    // rv matched AND has been stale for > the steal threshold).
     (r.0 == Decision::Steal) == (
         matches!(holder, HolderKind::Empty)
         || (matches!(holder, HolderKind::Other)
-            && matched_observation_age_ms.is_some_and(|age| age > ttl_ms))
+            && matched_observation_age_ms.is_some_and(|age| age > steal_after_ms))
     )
 }))]
 #[cfg_attr(kani, kani::ensures(|r: &(Decision, ObservedUpdate)| {
@@ -203,7 +207,7 @@ pub(crate) enum ObservedUpdate {
 pub(crate) fn decide_pure(
     holder: HolderKind,
     matched_observation_age_ms: Option<u64>,
-    ttl_ms: u64,
+    steal_after_ms: u64,
 ) -> (Decision, ObservedUpdate) {
     match holder {
         // Empty holder: previous leader stepped down gracefully (set
@@ -219,17 +223,20 @@ pub(crate) fn decide_pure(
         // Someone else holds it. Check the observed-record clock.
         HolderKind::Other => match matched_observation_age_ms {
             // Same rv we saw before — nobody has written since. It's
-            // been > ttl since we FIRST saw it (not since the lease's
-            // renewTime — we never read that value, only watch rv for
-            // change). The holder is dead. Steal.
+            // been > the steal threshold since we FIRST saw it (not
+            // since the lease's renewTime — we never read that value,
+            // only watch rv for change). The holder is dead — and it
+            // self-fenced 2×FENCE_MARGIN ago, so it already stopped
+            // believing. Steal.
             //
             // Strict `>` (not `>=`) is an implementation choice: steal
-            // only when *strictly* past the TTL. `sched.lease.k8s-lease`
-            // is silent on the boundary case; the Kani contract above
-            // codifies this choice (the mutation `>` → `>=` fails the
-            // contract — that demonstrates non-tautology, not that the
-            // spec mandates `>`).
-            Some(age_ms) if age_ms > ttl_ms => (Decision::Steal, ObservedUpdate::Keep),
+            // only when *strictly* past the threshold.
+            // `sched.lease.k8s-lease` is silent on the boundary case;
+            // the Kani contract above codifies this choice (the
+            // mutation `>` → `>=` fails the contract — that
+            // demonstrates non-tautology, not that the spec mandates
+            // `>`).
+            Some(age_ms) if age_ms > steal_after_ms => (Decision::Steal, ObservedUpdate::Keep),
 
             // Same rv, but not yet stale. Wait.
             Some(_) => (Decision::Standby, ObservedUpdate::Keep),
@@ -238,7 +245,7 @@ pub(crate) fn decide_pure(
             // our last look). Reset the clock. This is also the
             // "first-tick penalty": even if the lease is actually
             // stale, we can't know without a prior observation, so we
-            // wait one full ttl.
+            // wait one full steal threshold.
             None => (Decision::Standby, ObservedUpdate::StartObserving),
         },
     }
@@ -265,7 +272,7 @@ pub fn decide(
     resource_version: &str,
     observed: &mut Option<Observed>,
     our_id: &str,
-    ttl: Duration,
+    steal_after: Duration,
     now: Instant,
 ) -> Decision {
     // ── Project production data → predicate inputs ──────────────────
@@ -284,9 +291,9 @@ pub fn decide(
         .as_ref()
         .filter(|o| o.resource_version == resource_version)
         .map(|o| now.duration_since(o.at).as_millis() as u64);
-    let ttl_ms = ttl.as_millis() as u64;
+    let steal_after_ms = steal_after.as_millis() as u64;
 
-    let (decision, update) = decide_pure(holder_kind, matched_observation_age_ms, ttl_ms);
+    let (decision, update) = decide_pure(holder_kind, matched_observation_age_ms, steal_after_ms);
 
     // ── Apply the observed-record update ────────────────────────────
     match update {
@@ -307,7 +314,15 @@ pub struct LeaderElection {
     api: Api<Lease>,
     lease_name: String,
     holder_id: String,
+    /// Written to the Lease's `leaseDurationSeconds` on every PUT/POST.
+    /// Documentation for `kubectl describe lease` — NOT the threshold
+    /// this replica acts on (that is `steal_after`).
     ttl: Duration,
+    /// How long the same resourceVersion must be observed unchanged
+    /// before this replica steals. Deliberately LATER than the holder's
+    /// own self-fence deadline (`ttl − 2×margin`) so the deposed holder
+    /// has already stopped believing by the time anyone steals.
+    steal_after: Duration,
     observed: Option<Observed>,
 }
 
@@ -318,12 +333,14 @@ impl LeaderElection {
         lease_name: String,
         holder_id: String,
         ttl: Duration,
+        steal_after: Duration,
     ) -> Self {
         Self {
             api: Api::namespaced(client, namespace),
             lease_name,
             holder_id,
             ttl,
+            steal_after,
             observed: None,
         }
     }
@@ -359,7 +376,7 @@ impl LeaderElection {
             rv,
             &mut self.observed,
             &self.holder_id,
-            self.ttl,
+            self.steal_after,
             Instant::now(),
         );
 
@@ -673,7 +690,7 @@ mod tests {
         ]);
 
         let mut election =
-            LeaderElection::new(client, "default", "rio-sched".into(), "us".into(), TTL);
+            LeaderElection::new(client, "default", "rio-sched".into(), "us".into(), TTL, TTL);
         let result = election.try_acquire_or_renew().await.expect("not Err");
         assert_eq!(result, ElectionResult::Conflict);
 
@@ -702,7 +719,7 @@ mod tests {
         ]);
 
         let mut election =
-            LeaderElection::new(client, "default", "rio-sched".into(), "us".into(), TTL);
+            LeaderElection::new(client, "default", "rio-sched".into(), "us".into(), TTL, TTL);
         // Pre-seed observed so decide() chooses Steal (stale).
         // Without this, first observation → Standby (no PUT, test
         // hangs waiting for the PUT scenario).
@@ -731,7 +748,7 @@ mod tests {
         ]);
 
         let mut election =
-            LeaderElection::new(client, "default", "rio-sched".into(), "us".into(), TTL);
+            LeaderElection::new(client, "default", "rio-sched".into(), "us".into(), TTL, TTL);
         let result = election.try_acquire_or_renew().await.expect("not Err");
         assert_eq!(result, ElectionResult::Leading { transitions: 0 });
 
@@ -765,7 +782,7 @@ mod tests {
         ]);
 
         let mut election =
-            LeaderElection::new(client, "default", "rio-sched".into(), "us".into(), TTL);
+            LeaderElection::new(client, "default", "rio-sched".into(), "us".into(), TTL, TTL);
         // Pre-seed observed so decide() chooses Steal (stale).
         let stale = Instant::now() - Duration::from_secs(20);
         election.observed = Some(Observed {
@@ -786,6 +803,58 @@ mod tests {
 
         guard.verified().await;
     }
+
+    /// The staleness threshold `try_acquire_or_renew()` consults is
+    /// `steal_after`, NOT the lease-duration `ttl` written to the Lease
+    /// object. With `ttl = 15s` and `steal_after = 19s`, an observation
+    /// that has been stale for 17s — past the advertised TTL but short
+    /// of the steal threshold — must NOT trigger a steal. If the struct
+    /// wrongly consulted `ttl`, this would PUT (and panic the mock,
+    /// which has no PUT scenario queued).
+    ///
+    /// This is the asymmetric-TTL boundary: the deposed leader's
+    /// self-fence fires at 11s, so by the time anyone reaches 19s of
+    /// observed staleness the old leader has long stopped believing.
+    #[tokio::test]
+    async fn stale_past_ttl_but_within_steal_after_stays_standby() {
+        let (client, verifier) = ApiServerVerifier::new();
+        let guard = verifier.run(vec![
+            // GET only — no PUT may happen.
+            Scenario::ok(
+                http::Method::GET,
+                "/leases/rio-sched",
+                lease_json("other-leader", 2, "100"),
+            ),
+        ]);
+
+        let mut election = LeaderElection::new(
+            client,
+            "default",
+            "rio-sched".into(),
+            "us".into(),
+            Duration::from_secs(15),
+            Duration::from_secs(19),
+        );
+        // 17s: past ttl (15s), short of steal_after (19s).
+        let aged = Instant::now() - Duration::from_secs(17);
+        election.observed = Some(Observed {
+            resource_version: "100".into(),
+            at: aged,
+        });
+
+        let result = election.try_acquire_or_renew().await.expect("not Err");
+        assert_eq!(
+            result,
+            ElectionResult::Standby,
+            "17s stale is past ttl but within steal_after — no steal"
+        );
+        assert!(
+            election.observed.is_some(),
+            "the observation keeps aging toward steal_after"
+        );
+
+        guard.verified().await;
+    }
 }
 
 #[cfg(kani)]
@@ -793,7 +862,7 @@ mod kani_proofs {
     use super::*;
 
     /// Verify decide_pure() against its `kani::ensures` contracts for all
-    /// (holder, matched_observation_age_ms, ttl_ms) triples. `HolderKind`,
+    /// (holder, matched_observation_age_ms, steal_after_ms) triples. `HolderKind`,
     /// `Option<u64>`, and `u64` all impl `kani::Arbitrary`, so the harness
     /// exercises the full type domain — a strict superset of the inputs
     /// reachable from production (e.g. `Empty ∧ Some(age)` never occurs).
@@ -824,7 +893,7 @@ mod kani_proofs {
     fn check_decide_pure_contract() {
         let holder: HolderKind = kani::any();
         let matched_observation_age_ms: Option<u64> = kani::any();
-        let ttl_ms: u64 = kani::any();
-        let _ = decide_pure(holder, matched_observation_age_ms, ttl_ms);
+        let steal_after_ms: u64 = kani::any();
+        let _ = decide_pure(holder, matched_observation_age_ms, steal_after_ms);
     }
 }
