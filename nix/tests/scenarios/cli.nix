@@ -209,18 +209,21 @@ pkgs.testers.runNixOSTest {
         )
 
     # ══════════════════════════════════════════════════════════════════
-    # logs — GetDerivationLogs streaming (error-path: no active derivation)
+    # logs — GetDerivationLogs streaming (error-path: no execution recorded)
     # ══════════════════════════════════════════════════════════════════
-    # No build running → no ring buffer entry → server requires
-    # exec_id for S3 lookup. Without --exec-id the server returns
-    # NotFound ("no active ring buffer and exec_id was not provided").
+    # No build running → no ring buffer entry → server falls through
+    # to the completed-log (S3) path. Empty exec_id is the "latest
+    # execution" sentinel, not a required field. This fixture has no
+    # log S3 bucket and the fake hash has no recorded execution, so
+    # the fallback yields nothing → NotFound ("no log found for
+    # derivation ... (no execution recorded, or all expired)").
     # Deliberate error-path: proves the CLI surfaces the stream-open
     # gRPC Status correctly (not the same as stream-message errors).
     #
     # cli() uses k3s_server.succeed which asserts exit 0; for this
     # one call, use .fail() directly. 2>&1 captures the anyhow error
     # message so the assert can grep for the expected code.
-    with subtest("cli logs: NotFound when no ring buffer + no exec_id"):
+    with subtest("cli logs: NotFound when drv has no recorded execution"):
         out = k3s_server.fail(
             "${common.covShellEnv}"
             "${cliEnv}"
