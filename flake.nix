@@ -642,13 +642,6 @@
                     "vm-composefs-spike-stream"
                     "vm-composefs-spike-priv"
                     "vm-spike-fuse-negdentry"
-                    # rio-mountd runs for real here, but the scenario has
-                    # no LLVM_PROFILE_FILE/collectCoverage wiring (it does
-                    # not use the fixture machinery that injects them), so
-                    # a coverage-mode rebuild produces zero profraws.
-                    # mountd VM coverage lands with vm-castore-e2e
-                    # (P0560), which does use the fixtures.
-                    "vm-mountd"
                     # Lix client variant: rio-side coverage is identical to
                     # vm-protocol-warm-standalone (only the client differs,
                     # and the client isn't instrumented). Excluding keeps

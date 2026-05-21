@@ -288,7 +288,7 @@ in
   # r[verify builder.mountd.promote-verified]
   # r[verify builder.mountd.promote-bounded-copy]
   # r[verify builder.mountd.orphan-scan]
-  vm-mountd = mountd { inherit pkgs rio-workspace; };
+  vm-mountd = mountd { inherit pkgs rio-workspace common; };
 
   # r[verify gw.conn.exit-status]
   #   nom-exit subtest: client ssh_config has ControlMaster auto +

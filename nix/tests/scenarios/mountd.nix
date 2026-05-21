@@ -39,10 +39,23 @@
 # the production targets (p99 < 200 µs, ≥ 1 GiB/s) are off by 10-100×
 # and a wall-clock gate would be permanently red (see
 # .claude/rules/ci-failure-patterns.md "Wall-clock gate under load").
-{ pkgs, rio-workspace }:
+{
+  pkgs,
+  rio-workspace,
+  common,
+}:
+let
+  # The client is codecov-ignored (bin/spike_*) and exercises nothing
+  # the daemon side doesn't, so its profile goes to /tmp instead of the
+  # collected cov dir — the env var only exists to stop the
+  # instrumented binary from spraying "cannot write default.profraw"
+  # warnings into output the subtests grep. `env` rather than a shell
+  # assignment-prefix because `runuser --` execs without a shell.
+  clientCov = pkgs.lib.optionalString common.coverage "env LLVM_PROFILE_FILE=/tmp/client-%m.profraw ";
+in
 pkgs.testers.runNixOSTest {
   name = "mountd";
-  globalTimeout = 900;
+  globalTimeout = 900 + common.covTimeoutHeadroom;
 
   nodes.machine = _: {
     virtualisation.memorySize = 2048;
@@ -96,16 +109,22 @@ pkgs.testers.runNixOSTest {
 
     # ── Setup: dirs + XFS staging loopback with project quotas ─────────
     machine.succeed("mkdir -p /var/rio/castore /var/rio/staging /var/rio/cache /var/rio/chunks")
+    # Profraw drop dir for coverage mode (collectCoverage tars it). No
+    # systemd unit means no covTmpfiles rule, so create it here.
+    machine.succeed("mkdir -p /var/lib/rio/cov")
     machine.succeed("truncate -s 1G /var/rio-staging.img && mkfs.xfs -q /var/rio-staging.img")
     machine.succeed("mount -o loop,prjquota /var/rio-staging.img /var/rio/staging")
 
     def start_mountd(quota_bytes):
         # Direct exec rather than a systemd unit so the staging quota can
-        # differ between the main phase and the quota/orphan phase. The
+        # differ between the crash/quota phase and the main phase. The
         # stale socket from a killed instance is removed first so the
         # readiness wait below cannot pass against the old inode.
+        # covShellEnv sets LLVM_PROFILE_FILE in coverage mode (empty
+        # otherwise); %p keeps the per-instance profraws distinct.
         machine.succeed("rm -f /run/rio-mountd.sock")
         machine.succeed(
+            "${common.covShellEnv}"
             "${rio-workspace}/bin/rio-mountd --socket /run/rio-mountd.sock"
             " --castore-dir /var/rio/castore --staging-dir /var/rio/staging"
             " --cache-dir /var/rio/cache --chunks-dir /var/rio/chunks"
@@ -115,9 +134,17 @@ pkgs.testers.runNixOSTest {
         )
         machine.wait_until_succeeds("test -S /run/rio-mountd.sock", timeout=15)
 
-    start_mountd(256 * 1024 * 1024)
+    def stop_mountd():
+        # SIGTERM, not SIGKILL: the daemon returns from main so atexit
+        # handlers run (LLVM profraw flush in coverage mode). Wait for
+        # the process to exit so the next instance can bind the socket
+        # and the metrics port.
+        machine.succeed("kill $(cat /run/rio-mountd.pid)")
+        machine.wait_until_succeeds(
+            "! kill -0 $(cat /run/rio-mountd.pid) 2>/dev/null", timeout=15
+        )
 
-    CLIENT = "${rio-workspace}/bin/spike_mountd_client --socket /run/rio-mountd.sock"
+    CLIENT = "${clientCov}${rio-workspace}/bin/spike_mountd_client --socket /run/rio-mountd.sock"
 
     def client(user, args):
         return f"runuser -u {user} -- {CLIENT} {args}"
@@ -149,6 +176,45 @@ pkgs.testers.runNixOSTest {
         m = re.search(rf"{key}=(\S+)", out)
         assert m, f"no {key}= in client output:\n{out}"
         return m.group(1)
+
+    # ═══ Phase 1: crash recovery + staging quota (8 MiB instances) ═════
+    # Runs first so the instance that gets SIGKILLed (the crash
+    # simulation) is a short-lived one. The instance serving the whole
+    # protocol phase below exits last via SIGTERM and so keeps its
+    # coverage profraw.
+
+    # ── Daemon crash: orphan reaping on the next incarnation ───────────
+    with subtest("orphan-scan: restart reaps mounts, staging, placeholders"):
+        start_mountd(8 * 1024 * 1024)
+        serve("build1", "b-orphan", "orphan")
+        # Kill the daemon first so it cannot tear down, then the client.
+        machine.succeed("kill -9 $(cat /run/rio-mountd.pid)")
+        machine.succeed("kill -9 $(cat /tmp/orphan.pid) || true")
+        machine.succeed("test -d /var/rio/staging/b-orphan")
+        machine.succeed("mkdir -p /var/rio/cache/zz && touch /var/rio/cache/zz/0000.promoting")
+        start_mountd(8 * 1024 * 1024)
+        machine.succeed(
+            "test ! -e /var/rio/castore/b-orphan"
+            " && test ! -e /var/rio/staging/b-orphan"
+            " && test ! -e /var/rio/cache/zz/0000.promoting"
+        )
+
+    with subtest("staging-quota: kernel stops writes at the project quota"):
+        out = machine.succeed(
+            client("build1", "fill-staging --build-id b-fill --staging-root /var/rio/staging --give-up-mib 64")
+        )
+        print(out)
+        written = int(result(out, "written"))
+        # The quota is 8 MiB; XFS accounts in filesystem blocks so allow
+        # one block-reservation of slack, but 2x the quota means the
+        # limit is not being enforced.
+        assert written <= 16 * 1024 * 1024, f"wrote {written} bytes past an 8 MiB quota"
+        wait_idle()
+
+    stop_mountd()
+
+    # ═══ Phase 2: protocol + broker (one 256 MiB instance) ═════════════
+    start_mountd(256 * 1024 * 1024)
 
     # ── fd-handoff: Mount → SCM_RIGHTS → unprivileged FUSE server ──────
     with subtest("fd-handoff: builder serves FUSE on the handed-off fd"):
@@ -300,9 +366,8 @@ pkgs.testers.runNixOSTest {
         wait_idle()
 
     # ── Metrics exporter sanity ────────────────────────────────────────
-    # Before the orphan-scan restart: metrics-rs only renders a series
-    # after its first emission, and the post-restart instance has served
-    # no promotes, so the promote counters only exist on this instance.
+    # metrics-rs only renders a series after its first emission, so this
+    # must run on the instance that served the promote subtests above.
     with subtest("metrics: request histogram and promote counters exported"):
         metrics = machine.succeed("curl -sf 127.0.0.1:9095/metrics")
         for name in [
@@ -313,30 +378,10 @@ pkgs.testers.runNixOSTest {
         ]:
             assert name in metrics, f"{name} missing from /metrics"
 
-    # ── Daemon restart: orphan reaping + a tighter staging quota ───────
-    with subtest("orphan-scan: restart reaps mounts, staging, placeholders"):
-        serve("build1", "b-orphan", "orphan")
-        # Kill the daemon first so it cannot tear down, then the client.
-        machine.succeed("kill -9 $(cat /run/rio-mountd.pid)")
-        machine.succeed("kill -9 $(cat /tmp/orphan.pid) || true")
-        machine.succeed("test -d /var/rio/staging/b-orphan")
-        machine.succeed("mkdir -p /var/rio/cache/zz && touch /var/rio/cache/zz/0000.promoting")
-        start_mountd(8 * 1024 * 1024)
-        machine.succeed(
-            "test ! -e /var/rio/castore/b-orphan"
-            " && test ! -e /var/rio/staging/b-orphan"
-            " && test ! -e /var/rio/cache/zz/0000.promoting"
-        )
-
-    with subtest("staging-quota: kernel stops writes at the project quota"):
-        out = machine.succeed(
-            client("build1", "fill-staging --build-id b-fill --staging-root /var/rio/staging --give-up-mib 64")
-        )
-        print(out)
-        written = int(result(out, "written"))
-        # The quota is 8 MiB; XFS accounts in filesystem blocks so allow
-        # one block-reservation of slack, but 2x the quota means the
-        # limit is not being enforced.
-        assert written <= 16 * 1024 * 1024, f"wrote {written} bytes past an 8 MiB quota"
+    # collectCoverage below only stops systemd-managed rio services;
+    # the raw-exec'd daemon needs an explicit SIGTERM to flush its
+    # profraws before the cov dir is tarred.
+    stop_mountd()
+    ${common.collectCoverage "machine"}
   '';
 }
