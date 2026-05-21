@@ -14,16 +14,16 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: '.spec.kind'
+    - jsonPath: .spec.kind
       name: Kind
       type: string
-    - jsonPath: '.status.readyReplicas'
+    - jsonPath: .status.readyReplicas
       name: Ready
       type: integer
-    - jsonPath: '.status.desiredReplicas'
+    - jsonPath: .status.desiredReplicas
       name: Desired
       type: integer
-    - jsonPath: '.metadata.creationTimestamp'
+    - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
     name: v1alpha1
@@ -191,7 +191,7 @@ spec:
                 type: object
                 x-kubernetes-validations:
                 - rule: self.type in ['RuntimeDefault', 'Localhost', 'Unconfined']
-                - rule: 'self.type == ''Localhost'' ? has(self.localhostProfile) : !has(self.localhostProfile)'
+                - rule: "self.type == 'Localhost' ? has(self.localhostProfile) : !has(self.localhostProfile)"
               systems:
                 description: |-
                   Target systems (e.g., `["x86_64-linux"]`). Builders AND
@@ -231,26 +231,51 @@ spec:
             x-kubernetes-validations:
             - message: systems must be non-empty — a pool with no target systems accepts no work
               rule: size(self.systems) > 0
-            - message: hostNetwork:true requires privileged:true — Kubernetes rejects hostUsers:false with hostNetwork:true at admission; the non-privileged path sets hostUsers:false (see ADR-012)
-              rule: '!(has(self.hostNetwork) && self.hostNetwork) || (has(self.privileged) && self.privileged)'
-            - message: kind=Fetcher forbids privileged:true — fetchers face the open internet; the escape hatch stays closed (ADR-019)
+            - message: >-
+                hostNetwork:true requires privileged:true — Kubernetes rejects hostUsers:false
+                with hostNetwork:true at admission; the non-privileged path sets hostUsers:false
+                (see ADR-012)
+              rule: "!(has(self.hostNetwork) && self.hostNetwork) || (has(self.privileged) && self.privileged)"
+            - message: >-
+                kind=Fetcher forbids privileged:true — fetchers face the open internet; the
+                escape hatch stays closed (ADR-019)
               rule: self.kind != 'Fetcher' || (!has(self.privileged) || !self.privileged)
-            - message: kind=Fetcher forbids hostNetwork:true — fetchers run on dedicated nodes with pod networking (ADR-019)
+            - message: >-
+                kind=Fetcher forbids hostNetwork:true — fetchers run on dedicated nodes with
+                pod networking (ADR-019)
               rule: self.kind != 'Fetcher' || (!has(self.hostNetwork) || !self.hostNetwork)
-            - message: kind=Fetcher forbids seccompProfile — the reconciler forces Localhost operator/rio-fetcher.json (ADR-019)
+            - message: >-
+                kind=Fetcher forbids seccompProfile — the reconciler forces Localhost
+                operator/rio-fetcher.json (ADR-019)
               rule: self.kind != 'Fetcher' || !has(self.seccompProfile)
-            - message: kind=Fetcher forbids FUSE tuning knobs — fetches are network-bound, not FUSE-bound
+            - message: >-
+                kind=Fetcher forbids FUSE tuning knobs — fetches are network-bound, not
+                FUSE-bound
               rule: self.kind != 'Fetcher' || (!has(self.fuseThreads) && !has(self.fusePassthrough))
-            - message: kind=Fetcher forbids spec.features — the controller derives [fetcher] from kind (§13e)
+            - message: >-
+                kind=Fetcher forbids spec.features — the controller derives [fetcher] from kind
+                (§13e)
               rule: self.kind != 'Fetcher' || !has(self.features) || size(self.features) == 0
-            - message: kind=Builder forbids fuseCacheBytes — Builder pools single-source from controller [nodeclaim_pool].fuse_cache_bytes so FFD/cover/stamp agree (mb_035)
+            - message: >-
+                kind=Builder forbids fuseCacheBytes — Builder pools single-source from
+                controller [nodeclaim_pool].fuse_cache_bytes so FFD/cover/stamp agree (mb_035)
               rule: self.kind != 'Builder' || !has(self.fuseCacheBytes)
-            - message: kind=Fetcher forbids fuseCacheBytes — §13e routes Fetcher Pools through nodeclaim_pool; per-pool override would diverge FFD from the stamped pod request (r35 merged_bug_024)
+            - message: >-
+                kind=Fetcher forbids fuseCacheBytes — §13e routes Fetcher Pools through
+                nodeclaim_pool; per-pool override would diverge FFD from the stamped pod request (r35
+                merged_bug_024)
               rule: self.kind != 'Fetcher' || !has(self.fuseCacheBytes)
-            - message: 'kind=Fetcher: nodeSelector[''rio.build/fetcher''] is reconciler-owned and may only be ''true'' — the dedicated-node constraint is universal and cannot be weakened (r35 bug_044)'
-              rule: self.kind != 'Fetcher' || !has(self.nodeSelector) || !('rio.build/fetcher' in self.nodeSelector) || self.nodeSelector['rio.build/fetcher'] == 'true'
-            - message: kind=Builder forbids nodeSelector['rio.build/fetcher'] — the fetcher taint repels Builder pods (no toleration) so the pod would be permanently Pending (r35 bug_044)
-              rule: self.kind != 'Builder' || !has(self.nodeSelector) || !('rio.build/fetcher' in self.nodeSelector)
+            - message: "kind=Fetcher: nodeSelector['rio.build/fetcher'] is reconciler-owned and may only be 'true' — the dedicated-node constraint is universal and cannot be weakened (r35 bug_044)"
+              rule: >-
+                self.kind != 'Fetcher' || !has(self.nodeSelector) || !('rio.build/fetcher' in
+                self.nodeSelector) || self.nodeSelector['rio.build/fetcher'] == 'true'
+            - message: >-
+                kind=Builder forbids nodeSelector['rio.build/fetcher'] — the fetcher taint
+                repels Builder pods (no toleration) so the pod would be permanently Pending (r35
+                bug_044)
+              rule: >-
+                self.kind != 'Builder' || !has(self.nodeSelector) || !('rio.build/fetcher' in
+                self.nodeSelector)
           status:
             description: |-
               Pool status — reconciler writes, operators read.

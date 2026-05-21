@@ -222,6 +222,22 @@
         "Zakarum <zaq.dev@icloud.com>"
       ]
     },
+    "anstyle": {
+      "crateName": "anstyle",
+      "version": "1.0.14",
+      "edition": "2021",
+      "sha256": "0030szmgj51fxkic1hpakxxgappxzwm6m154a3gfml83lq63l2wl",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
     "anyhow": {
       "crateName": "anyhow",
       "version": "1.0.102",
@@ -13480,6 +13496,10 @@
       },
       "dependencies": [
         {
+          "name": "anstyle",
+          "packageId": "anstyle"
+        },
+        {
           "name": "aws-lc-rs",
           "packageId": "aws-lc-rs"
         },
@@ -14059,6 +14079,10 @@
         }
       ],
       "buildDependencies": [
+        {
+          "name": "anstyle",
+          "packageId": "anstyle"
+        },
         {
           "name": "aws-lc-rs",
           "packageId": "aws-lc-rs"

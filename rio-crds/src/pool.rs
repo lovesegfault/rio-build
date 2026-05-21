@@ -398,7 +398,7 @@ mod tests {
     #[test]
     fn crd_serializes() {
         let crd = Pool::crd();
-        let yaml = serde_yml::to_string(&crd).expect("serializes");
+        let yaml = serde_saphyr::to_string(&crd).expect("serializes");
         assert!(yaml.contains("group: rio.build"));
         assert!(yaml.contains("kind: Pool"));
         assert!(yaml.contains("shortNames"));

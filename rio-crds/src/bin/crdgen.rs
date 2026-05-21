@@ -9,8 +9,8 @@
 //! hermetically and `diff -r`s. Both run this binary, so the bytes
 //! match by construction — there is no second encoder to drift.
 //!
-//! serde_yml is the maintained serde_yaml fork (RUSTSEC-2024-0320).
-//! Write-only here — serializes our own structs.
+//! serde-saphyr emits the YAML (the same crate kube is adopting for its
+//! kubeconfig parsing). Write-only here — serializes our own structs.
 
 use std::path::Path;
 
@@ -37,8 +37,19 @@ fn main() {
 /// CRD that can't serialize is a compile-surface bug, not a
 /// recoverable runtime condition.
 fn write<K: CustomResourceExt>(out: &Path) {
-    let yaml = serde_yml::to_string(&K::crd())
+    let yaml = serde_saphyr::to_string(&K::crd())
         .unwrap_or_else(|e| panic!("{} CRD serialize: {e}", K::crd_name()));
+    // serde-saphyr indents the blank paragraph-separator lines inside
+    // literal block scalars. An indentation-only line is equivalent to an
+    // empty one there, and the repo's trailing-whitespace hook would strip
+    // it post-hoc — normalize here so crdgen output and the committed
+    // files agree byte-for-byte (crds-drift compares them).
+    let yaml = yaml
+        .lines()
+        .map(|l| if l.trim().is_empty() { "" } else { l })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
     let path = out.join(format!("{}.yaml", K::crd_name()));
     std::fs::write(&path, yaml).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
 }

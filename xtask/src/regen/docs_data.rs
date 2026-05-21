@@ -579,16 +579,16 @@ fn helm_ns() -> Result<serde_json::Value> {
     }
     #[derive(serde::Deserialize)]
     struct Values {
-        namespaces: BTreeMap<String, serde_yml::Value>,
+        namespaces: BTreeMap<String, serde_json::Value>,
     }
     let body = fs::read_to_string(repo_root().join("infra/helm/rio-build/values.yaml"))?;
-    let v: Values = serde_yml::from_str(&body)?;
+    let v: Values = serde_saphyr::from_str(&body)?;
     let mut out = serde_json::Map::new();
     for (role, raw) in v.namespaces {
         if role == "create" {
             continue; // `create: true` flag, not a namespace entry
         }
-        let ns: Ns = serde_yml::from_value(raw)?;
+        let ns: Ns = serde_json::from_value(raw)?;
         out.insert(ns.name, json!({"psa": ns.psa, "role": role}));
     }
     Ok(json!(out))

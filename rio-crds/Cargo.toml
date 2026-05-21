@@ -37,7 +37,6 @@ serde = { workspace = true }
 # kube's CustomResource derive macro emits `serde_json::` paths
 # directly in the generated code — must be a direct dep, not dev.
 serde_json = { workspace = true }
-# Write-only for crdgen (and the crd_serializes test). Maintained
-# serde_yaml fork — see deny.toml RUSTSEC-2024-0320.
-serde_yml = { workspace = true }
+# Write-only for crdgen (and the crd_serializes test).
+serde-saphyr = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

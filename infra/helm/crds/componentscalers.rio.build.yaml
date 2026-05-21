@@ -14,19 +14,19 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: '.spec.targetRef.name'
+    - jsonPath: .spec.targetRef.name
       name: Target
       type: string
-    - jsonPath: '.status.desiredReplicas'
+    - jsonPath: .status.desiredReplicas
       name: Desired
       type: integer
-    - jsonPath: '.status.learnedRatio'
+    - jsonPath: .status.learnedRatio
       name: Ratio
       type: number
-    - jsonPath: '.status.observedLoadFactor'
+    - jsonPath: .status.observedLoadFactor
       name: Load
       type: number
-    - jsonPath: '.metadata.creationTimestamp'
+    - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
     name: v1alpha1
@@ -60,9 +60,7 @@ spec:
                 default:
                   high: 0.8
                   low: 0.3
-                description: |-
-                  Load thresholds for ratio correction. Defaults `{high: 0.8,
-                  low: 0.3}`.
+                description: "Load thresholds for ratio correction. Defaults `{high: 0.8,\nlow: 0.3}`."
                 properties:
                   high:
                     default: 0.8
@@ -133,19 +131,19 @@ spec:
                 description: The Deployment to scale. Same-namespace.
                 properties:
                   kind:
-                    description: '`Deployment`. CEL-enforced.'
+                    description: "`Deployment`. CEL-enforced."
                     type: string
                   name:
-                    description: |-
-                      `metadata.name` of the Deployment in the SAME namespace as
-                      this ComponentScaler.
+                    description: "`metadata.name` of the Deployment in the SAME namespace as\nthis ComponentScaler."
                     type: string
                 required:
                 - kind
                 - name
                 type: object
                 x-kubernetes-validations:
-                - message: targetRef.kind must be 'Deployment' — ComponentScaler patches the apps/v1 deployments/scale subresource; StatefulSet targets are not yet supported
+                - message: >-
+                    targetRef.kind must be 'Deployment' — ComponentScaler patches the apps/v1
+                    deployments/scale subresource; StatefulSet targets are not yet supported
                   rule: self.kind == 'Deployment'
             required:
             - loadEndpoint

@@ -312,6 +312,32 @@
         "Nicolas Silva <nical@fastmail.com>"
       ]
     },
+    "annotate-snippets": {
+      "crateName": "annotate-snippets",
+      "version": "0.12.16",
+      "edition": "2024",
+      "sha256": "1w8kdyj2fh4n666wvd1krj2zcyjls9vlqrmpslx1yr5w0lcaa4gj",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "anstyle",
+          "packageId": "anstyle"
+        },
+        {
+          "name": "unicode-width",
+          "packageId": "unicode-width"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
     "anstream": {
       "crateName": "anstream",
       "version": "1.0.0",
@@ -541,6 +567,21 @@
       ],
       "authors": [
         "RustCrypto Developers"
+      ]
+    },
+    "arraydeque": {
+      "crateName": "arraydeque",
+      "version": "0.5.1",
+      "edition": "2021",
+      "sha256": "0dn2xdfg3rkiqsh8a6achnmvf5nf11xk33xgjzpksliab4yjx43x",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "andylokandy"
       ]
     },
     "arrayref": {
@@ -6353,6 +6394,27 @@
         "Henri Sivonen <hsivonen@hsivonen.fi>"
       ]
     },
+    "encoding_rs_io": {
+      "crateName": "encoding_rs_io",
+      "version": "0.1.7",
+      "edition": "2015",
+      "sha256": "10ra4l688cdadd8h1lsbahld1zbywnnqv68366mbhamn3xjwbhqw",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "encoding_rs",
+          "packageId": "encoding_rs"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Andrew Gallant <jamslam@gmail.com>"
+      ]
+    },
     "endian-type": {
       "crateName": "endian-type",
       "version": "0.1.2",
@@ -11042,6 +11104,34 @@
         "Andreas Fuchs <asf@boinkor.net>"
       ]
     },
+    "granit-parser": {
+      "crateName": "granit-parser",
+      "version": "0.0.2",
+      "edition": "2021",
+      "sha256": "0y6pi7pbjvllf2c2yy0id7zdkl02haqmws70vjkm6748wggkdrxp",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "arraydeque",
+          "packageId": "arraydeque"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Ethiraric <ethiraric@gmail.com>",
+        "David Aguilar <davvid@gmail.com>",
+        "Yuheng Chen <yuhengchen@sensetime.com>",
+        "Bourumir Wyngs <bourumir-wyngs@gmail.com>"
+      ]
+    },
     "group": {
       "crateName": "group",
       "version": "0.13.0",
@@ -14170,36 +14260,6 @@
         "The rusqlite developers"
       ]
     },
-    "libyml": {
-      "crateName": "libyml",
-      "version": "0.0.5",
-      "edition": "2021",
-      "sha256": "106963pwg1gc3165bdlk8bbspmk919gk10vshhqglks3z8m700ik",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "anyhow",
-          "packageId": "anyhow"
-        }
-      ],
-      "buildDependencies": [
-        {
-          "name": "version_check",
-          "packageId": "version_check"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "default"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "LibYML Contributors"
-      ]
-    },
     "linux-raw-sys": {
       "crateName": "linux-raw-sys",
       "version": "0.12.1",
@@ -15292,6 +15352,25 @@
       ],
       "libCrateTypes": [
         "lib"
+      ]
+    },
+    "nohash-hasher": {
+      "crateName": "nohash-hasher",
+      "version": "0.2.0",
+      "edition": "2018",
+      "sha256": "0lf4p6k01w4wm7zn4grnihzj8s7zd5qczjmzng7wviwxawih5x9b",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Parity Technologies <admin@parity.io>"
       ]
     },
     "nom": {
@@ -19865,12 +19944,12 @@
           "packageId": "serde"
         },
         {
-          "name": "serde_json",
-          "packageId": "serde_json"
+          "name": "serde-saphyr",
+          "packageId": "serde-saphyr"
         },
         {
-          "name": "serde_yml",
-          "packageId": "serde_yml"
+          "name": "serde_json",
+          "packageId": "serde_json"
         },
         {
           "name": "workspace-hack",
@@ -22572,6 +22651,71 @@
         "David Tolnay <dtolnay@gmail.com>"
       ]
     },
+    "serde-saphyr": {
+      "crateName": "serde-saphyr",
+      "version": "0.0.26",
+      "edition": "2024",
+      "sha256": "1w7a4acvdyyf958wpakyqki7z975j65kn9g6r1xsj0jdwd4gxiyw",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "ahash",
+          "packageId": "ahash"
+        },
+        {
+          "name": "annotate-snippets",
+          "packageId": "annotate-snippets"
+        },
+        {
+          "name": "base64",
+          "packageId": "base64"
+        },
+        {
+          "name": "encoding_rs_io",
+          "packageId": "encoding_rs_io"
+        },
+        {
+          "name": "getrandom",
+          "packageId": "getrandom 0.3.4",
+          "target": "cfg(target_arch = \"wasm32\")"
+        },
+        {
+          "name": "granit-parser",
+          "packageId": "granit-parser",
+          "rename": "saphyr_parser"
+        },
+        {
+          "name": "nohash-hasher",
+          "packageId": "nohash-hasher"
+        },
+        {
+          "name": "num-traits",
+          "packageId": "num-traits"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        },
+        {
+          "name": "zmij",
+          "packageId": "zmij"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "deserialize",
+        "serialize"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
     "serde-value": {
       "crateName": "serde-value",
       "version": "0.7.0",
@@ -22882,56 +23026,6 @@
       ],
       "authors": [
         "David Tolnay <dtolnay@gmail.com>"
-      ]
-    },
-    "serde_yml": {
-      "crateName": "serde_yml",
-      "version": "0.0.12",
-      "edition": "2021",
-      "sha256": "1p8xwz4znd6fj962y22fdvvv16gb8c0hx4iv5hjplngiidcdvqjr",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "indexmap",
-          "packageId": "indexmap"
-        },
-        {
-          "name": "itoa",
-          "packageId": "itoa"
-        },
-        {
-          "name": "libyml",
-          "packageId": "libyml"
-        },
-        {
-          "name": "memchr",
-          "packageId": "memchr"
-        },
-        {
-          "name": "ryu",
-          "packageId": "ryu"
-        },
-        {
-          "name": "serde",
-          "packageId": "serde"
-        }
-      ],
-      "buildDependencies": [
-        {
-          "name": "version_check",
-          "packageId": "version_check"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "default"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Serde YML Contributors"
       ]
     },
     "serdect": {
@@ -29109,6 +29203,10 @@
       },
       "dependencies": [
         {
+          "name": "anstyle",
+          "packageId": "anstyle"
+        },
+        {
           "name": "aws-lc-rs",
           "packageId": "aws-lc-rs"
         },
@@ -29688,6 +29786,10 @@
         }
       ],
       "buildDependencies": [
+        {
+          "name": "anstyle",
+          "packageId": "anstyle"
+        },
         {
           "name": "aws-lc-rs",
           "packageId": "aws-lc-rs"
@@ -30501,12 +30603,12 @@
           "packageId": "serde"
         },
         {
-          "name": "serde_json",
-          "packageId": "serde_json"
+          "name": "serde-saphyr",
+          "packageId": "serde-saphyr"
         },
         {
-          "name": "serde_yml",
-          "packageId": "serde_yml"
+          "name": "serde_json",
+          "packageId": "serde_json"
         },
         {
           "name": "sha2",

@@ -251,7 +251,7 @@ mod tests {
     #[test]
     fn crd_serializes() {
         let crd = ComponentScaler::crd();
-        let yaml = serde_yml::to_string(&crd).expect("serializes");
+        let yaml = serde_saphyr::to_string(&crd).expect("serializes");
         assert!(yaml.contains("group: rio.build"));
         assert!(yaml.contains("kind: ComponentScaler"));
         assert!(yaml.contains("cscaler"));
@@ -320,7 +320,7 @@ mod tests {
             replicas: {min: 2, max: 14}
             loadEndpoint: rio-store-headless.rio-store:9002
         "#;
-        let spec: ComponentScalerSpec = serde_yml::from_str(yaml).expect("deserializes");
+        let spec: ComponentScalerSpec = serde_saphyr::from_str(yaml).expect("deserializes");
         assert_eq!(spec.signal, Signal::SchedulerBuilders);
         assert_eq!(spec.seed_ratio, 50.0);
         assert_eq!(spec.load_thresholds.high, 0.8);

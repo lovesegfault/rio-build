@@ -253,11 +253,13 @@ k8s-openapi = { version = "0.27", features = ["v1_35"] }
 # schemars 1.x NOT 0.8 — kube 3.0 requires the major break. CRD JSON
 # schema generation for #[derive(JsonSchema)].
 schemars = "1"
-# crdgen-only: serialize CustomResourceExt::crd() to YAML for kustomize.
-# serde_yml is the maintained fork of serde_yaml (which is RUSTSEC-
-# 2024-0320 unmaintained). Drop-in API. kube-client still transitively
-# pulls serde_yaml for kubeconfig parsing — see deny.toml.
-serde_yml = "0.0.12"
+# CRD YAML emission (crdgen → infra/helm/crds/) + xtask kubeconfig/values
+# parsing. Replaces serde_yml (RUSTSEC-2025-0068, unsound + unmaintained —
+# its deny.toml exception went with it). kube's next release moves its
+# kubeconfig parsing to serde-saphyr too, so the tree converges on one
+# YAML stack once that lands; until then kube still pulls serde_yaml
+# transitively.
+serde-saphyr = "0.0.26"
 
 # --- phase3a: health + streaming ---
 # grpc.health.v1.Health service. K8s readiness probes hit this.

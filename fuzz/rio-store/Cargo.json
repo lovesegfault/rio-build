@@ -19628,6 +19628,10 @@
       },
       "dependencies": [
         {
+          "name": "anstyle",
+          "packageId": "anstyle"
+        },
+        {
           "name": "aws-lc-rs",
           "packageId": "aws-lc-rs"
         },
@@ -20207,6 +20211,10 @@
         }
       ],
       "buildDependencies": [
+        {
+          "name": "anstyle",
+          "packageId": "anstyle"
+        },
         {
           "name": "aws-lc-rs",
           "packageId": "aws-lc-rs"

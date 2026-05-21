@@ -38,7 +38,9 @@ pub fn current_context() -> Result<String> {
     let path = crate::sh::kubeconfig_path();
     let body = std::fs::read_to_string(&path)
         .with_context(|| format!("read kubeconfig at {}", path.display()))?;
-    let cfg: serde_yml::Value = serde_yml::from_str(&body)?;
+    // serde-saphyr has no dynamic Value type of its own; serde_json::Value
+    // is the target for string-keyed YAML like kubeconfig.
+    let cfg: serde_json::Value = serde_saphyr::from_str(&body)?;
     cfg.get("current-context")
         .and_then(|v| v.as_str())
         .map(String::from)
@@ -54,7 +56,8 @@ pub async fn apply_crds(client: &Client) -> Result<()> {
     for e in std::fs::read_dir(&dir)? {
         let p = e?.path();
         if p.extension().is_some_and(|x| x == "yaml") {
-            let crd: CustomResourceDefinition = serde_yml::from_str(&std::fs::read_to_string(&p)?)?;
+            let crd: CustomResourceDefinition =
+                serde_saphyr::from_str(&std::fs::read_to_string(&p)?)?;
             let name = crd.name_any();
             api.patch(&name, &ssapply, &Patch::Apply(&crd)).await?;
         }
