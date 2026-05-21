@@ -70,6 +70,5 @@ tower.workspace = true
 libc = { workspace = true }
 # start_paused + tokio::time::advance in spawn_drain_task test.
 tokio = { workspace = true, features = ["test-util"] }
-figment.workspace = true
 # TcpListenerStream for test server.
 tokio-stream = { workspace = true, features = ["net"] }

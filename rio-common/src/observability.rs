@@ -298,9 +298,6 @@ fn log_format_from_env() -> LogFormat {
 }
 
 #[cfg(test)]
-// See config.rs test module for the same allow — figment::Jail closure's
-// Result<(), figment::Error> is 208 bytes, API-fixed, can't box it.
-#[allow(clippy::result_large_err)]
 mod tests {
     use super::*;
 
@@ -333,7 +330,7 @@ mod tests {
     /// `build_otel_layer` returns None/None when the endpoint is unset —
     /// the "OTel is opt-in, not opt-out" guarantee.
     ///
-    /// figment::Jail serializes env manipulation under its own mutex AND
+    /// crate::test_jail::Jail serializes env manipulation under its own mutex AND
     /// resets env on scope exit. Jail doesn't have a "remove var" API — if
     /// the host test env has RIO_OTEL_ENDPOINT set (it shouldn't; CI
     /// doesn't), this test would take the Some branch, try to connect to
@@ -341,9 +338,9 @@ mod tests {
     /// important invariant is "unset → None", and CI env is clean.
     #[test]
     fn build_otel_layer_unset_endpoint_returns_none() {
-        // figment::Jail::expect_with takes a thunk, no arg. It jails cwd +
+        // crate::test_jail::Jail::expect_with takes a thunk, no arg. It jails cwd +
         // env; we just want the mutex serialization, not the cwd jail.
-        figment::Jail::expect_with(|_jail| {
+        crate::test_jail::Jail::expect_with(|_jail| {
             // build_otel_layer is generic over S; monomorphize to Registry
             // for the test (we're not layering it over anything here).
             let (layer, guard) =
@@ -360,7 +357,7 @@ mod tests {
     /// empty URL and every export fails silently at DEBUG.
     #[test]
     fn build_otel_layer_empty_endpoint_returns_none() {
-        figment::Jail::expect_with(|jail| {
+        crate::test_jail::Jail::expect_with(|jail| {
             jail.set_env("RIO_OTEL_ENDPOINT", "");
             let (layer, guard) =
                 build_otel_layer::<tracing_subscriber::Registry>("test-component").unwrap();

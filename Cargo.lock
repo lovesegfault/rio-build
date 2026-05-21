@@ -6216,7 +6216,6 @@ dependencies = [
  "axum",
  "base64",
  "config",
- "figment",
  "futures-util",
  "libc",
  "metrics-exporter-prometheus",

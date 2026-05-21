@@ -355,6 +355,11 @@
       "depth": 0,
       "doc": "Tenant name normalization.",
       "path": "tenant.rs"
+    },
+    {
+      "depth": 0,
+      "doc": "Private test-only env/cwd sandbox for rio-common's own tests.",
+      "path": "test_jail.rs"
     }
   ],
   "rio-controller": [

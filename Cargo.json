@@ -19630,10 +19630,6 @@
       ],
       "devDependencies": [
         {
-          "name": "figment",
-          "packageId": "figment"
-        },
-        {
           "name": "libc",
           "packageId": "libc"
         },

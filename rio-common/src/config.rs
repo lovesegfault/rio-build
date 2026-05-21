@@ -41,7 +41,7 @@
 //! # Standing-guard tests
 //!
 //! Each binary's `main.rs` (or `config.rs` for rio-builder) carries a
-//! pair of `figment::Jail` tests via the `rio_test_support::jail_roundtrip!`
+//! pair of jailed standing-guard tests via the `rio_test_support::jail_roundtrip!`
 //! / `jail_defaults!` macros. See `rio-test-support/src/config.rs` for
 //! the pattern rationale and the P0219 failure mode that motivated it.
 
@@ -594,12 +594,6 @@ where
 }
 
 #[cfg(test)]
-// figment::Jail::expect_with's closure returns Result<(), figment::Error>
-// where figment::Error is 208 bytes. That's figment's API — the closure
-// signature is fixed by the library, we can't box the error type. The lint
-// is about return-value copy cost on the Err path; in a test module that
-// only runs in CI, the ~200-byte copy is irrelevant.
-#[allow(clippy::result_large_err)]
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
@@ -663,8 +657,8 @@ mod tests {
         f
     }
 
-    /// SAFETY NOTE: These tests use `figment::Jail` which manipulates the
-    /// process-global environment and cwd. Jail serializes itself via a
+    /// SAFETY NOTE: These tests use `crate::test_jail::Jail` which manipulates
+    /// the process-global environment and cwd. Jail serializes itself via a
     /// global mutex AND restores env+cwd on drop, so under cargo-test's
     /// single-process concurrent threads this is sound — but only because
     /// all env-manipulating tests in this crate go through Jail. If any
@@ -674,7 +668,7 @@ mod tests {
 
     #[test]
     fn defaults_only_no_toml_no_env_no_cli() {
-        figment::Jail::expect_with(|_jail| {
+        crate::test_jail::Jail::expect_with(|_jail| {
             // Nonexistent TOML path → falls through to Default.
             let cfg: TestConfig =
                 load_from_path(std::path::Path::new("/nonexistent"), TestCli::default()).unwrap();
@@ -685,7 +679,7 @@ mod tests {
 
     #[test]
     fn toml_overrides_defaults() {
-        figment::Jail::expect_with(|_jail| {
+        crate::test_jail::Jail::expect_with(|_jail| {
             let f = write_toml(
                 r#"
                 listen_addr = "1.2.3.4:5000"
@@ -702,7 +696,7 @@ mod tests {
 
     #[test]
     fn env_overrides_toml() {
-        figment::Jail::expect_with(|jail| {
+        crate::test_jail::Jail::expect_with(|jail| {
             let f = write_toml(r#"port = 1111"#);
             jail.set_env("RIO_PORT", "2222");
             let cfg: TestConfig = load_from_path(f.path(), TestCli::default()).unwrap();
@@ -713,7 +707,7 @@ mod tests {
 
     #[test]
     fn cli_overrides_env() {
-        figment::Jail::expect_with(|jail| {
+        crate::test_jail::Jail::expect_with(|jail| {
             jail.set_env("RIO_PORT", "3333");
             let cli = TestCli {
                 port: Some(4444),
@@ -730,7 +724,7 @@ mod tests {
     fn cli_none_does_not_override_lower_layers() {
         // Core regression guard: an unset CLI flag must NOT clobber a
         // value set by env/TOML. This is WHY skip_serializing_if matters.
-        figment::Jail::expect_with(|jail| {
+        crate::test_jail::Jail::expect_with(|jail| {
             jail.set_env("RIO_PORT", "5555");
             let cli = TestCli {
                 port: None, // ← NOT passed on CLI
@@ -750,7 +744,7 @@ mod tests {
     #[test]
     fn env_double_underscore_nesting() {
         // RIO_NESTED__S3_BUCKET → nested.s3_bucket via Env::split("__").
-        figment::Jail::expect_with(|jail| {
+        crate::test_jail::Jail::expect_with(|jail| {
             jail.set_env("RIO_NESTED__S3_BUCKET", "my-bucket");
             let cfg: TestConfig =
                 load_from_path(std::path::Path::new("/nonexistent"), TestCli::default()).unwrap();
@@ -763,7 +757,7 @@ mod tests {
     fn full_precedence_chain() {
         // Defaults < TOML < env < CLI, each layer visible where the
         // higher layers don't set a value.
-        figment::Jail::expect_with(|jail| {
+        crate::test_jail::Jail::expect_with(|jail| {
             let f = write_toml(
                 r#"
                 listen_addr = "toml-addr"
@@ -786,7 +780,7 @@ mod tests {
 
     #[test]
     fn malformed_toml_errors_with_layer_attribution() {
-        figment::Jail::expect_with(|_jail| {
+        crate::test_jail::Jail::expect_with(|_jail| {
             let f = write_toml("this is not = = valid toml [[");
             let err = load_from_path::<TestConfig, _>(f.path(), TestCli::default()).unwrap_err();
             let msg = err.to_string();
@@ -801,7 +795,7 @@ mod tests {
 
     #[test]
     fn env_type_mismatch_errors() {
-        figment::Jail::expect_with(|jail| {
+        crate::test_jail::Jail::expect_with(|jail| {
             jail.set_env("RIO_PORT", "not-a-number");
             let err = load_from_path::<TestConfig, _>(
                 std::path::Path::new("/nonexistent"),
@@ -821,7 +815,7 @@ mod tests {
     fn missing_toml_file_is_not_an_error() {
         // This is the common case — no config file deployed, all config
         // via env vars (e.g., NixOS modules set env vars). Must not fail.
-        figment::Jail::expect_with(|_jail| {
+        crate::test_jail::Jail::expect_with(|_jail| {
             let cfg: TestConfig = load_from_path(
                 std::path::Path::new("/definitely/not/there"),
                 TestCli::default(),
@@ -836,14 +830,14 @@ mod tests {
     fn bool_env_var_true_and_false() {
         // Figment's Env provider parses bool-ish strings. Guard: make sure
         // "true"/"false" actually work (important for RIO_FUSE_PASSTHROUGH).
-        figment::Jail::expect_with(|jail| {
+        crate::test_jail::Jail::expect_with(|jail| {
             jail.set_env("RIO_DEBUG", "true");
             let cfg: TestConfig =
                 load_from_path(std::path::Path::new("/nonexistent"), TestCli::default()).unwrap();
             assert!(cfg.debug);
             Ok(())
         });
-        figment::Jail::expect_with(|jail| {
+        crate::test_jail::Jail::expect_with(|jail| {
             jail.set_env("RIO_DEBUG", "false");
             let cfg: TestConfig =
                 load_from_path(std::path::Path::new("/nonexistent"), TestCli::default()).unwrap();
@@ -856,7 +850,7 @@ mod tests {
     /// In CI sandboxes neither exists — must still succeed with defaults.
     #[test]
     fn prod_load_with_no_toml_anywhere() {
-        figment::Jail::expect_with(|_jail| {
+        crate::test_jail::Jail::expect_with(|_jail| {
             // "rio-test-nonexistent-component" → neither /etc/rio/... nor
             // ./rio-test-...toml exists. Should fall through to defaults.
             let cfg: TestConfig =
@@ -884,7 +878,7 @@ mod tests {
 
     #[test]
     fn comma_vec_from_env_string() {
-        figment::Jail::expect_with(|jail| {
+        crate::test_jail::Jail::expect_with(|jail| {
             jail.set_env("RIO_SYSTEMS", "x86_64-linux,aarch64-linux");
             let cfg: VecConfig = load("rio-test-vec", NoCli::default()).unwrap();
             assert_eq!(
@@ -898,7 +892,7 @@ mod tests {
 
     #[test]
     fn comma_vec_from_toml_array() {
-        figment::Jail::expect_with(|_jail| {
+        crate::test_jail::Jail::expect_with(|_jail| {
             let f = write_toml(r#"systems = ["x86_64-linux", "aarch64-linux"]"#);
             let cfg: VecConfig = load_from_path(f.path(), NoCli::default()).unwrap();
             assert_eq!(
@@ -916,7 +910,7 @@ mod tests {
         // path. Before the fix, visit_seq pushed raw → " x86_64-linux"
         // never matched hard_filter() and the builder silently took
         // no work.
-        figment::Jail::expect_with(|_jail| {
+        crate::test_jail::Jail::expect_with(|_jail| {
             let f = write_toml(r#"systems = [" x86_64-linux", "", "kvm "]"#);
             let cfg: VecConfig = load_from_path(f.path(), NoCli::default()).unwrap();
             assert_eq!(
@@ -930,7 +924,7 @@ mod tests {
 
     #[test]
     fn comma_vec_empty_and_whitespace_filtered() {
-        figment::Jail::expect_with(|jail| {
+        crate::test_jail::Jail::expect_with(|jail| {
             // Trailing comma + internal empty + whitespace — should all
             // be filtered/trimmed. Operator fat-fingering the env var
             // is easy; spurious empty feature names would break
@@ -951,7 +945,7 @@ mod tests {
         // RIO_FEATURES="" → [], not [""]. Matches the "unset" case.
         // An empty feature name would never match any required_features
         // check but would pollute debug output.
-        figment::Jail::expect_with(|jail| {
+        crate::test_jail::Jail::expect_with(|jail| {
             jail.set_env("RIO_FEATURES", "");
             let cfg: VecConfig = load("rio-test-vec", NoCli::default()).unwrap();
             assert!(cfg.features.is_empty(), "empty env → empty vec");
@@ -962,7 +956,7 @@ mod tests {
     #[test]
     fn comma_vec_default_is_empty_when_unset() {
         // Neither TOML nor env → serde's #[serde(default)] gives [].
-        figment::Jail::expect_with(|_jail| {
+        crate::test_jail::Jail::expect_with(|_jail| {
             let cfg: VecConfig = load("rio-test-vec", NoCli::default()).unwrap();
             assert!(cfg.systems.is_empty());
             assert!(cfg.features.is_empty());
@@ -985,7 +979,7 @@ mod tests {
     /// timeout for graceful degradation.
     #[test]
     fn jwt_config_defaults() {
-        figment::Jail::expect_with(|_jail| {
+        crate::test_jail::Jail::expect_with(|_jail| {
             let cfg: JwtHost = load("rio-test-jwt", NoCli::default()).unwrap();
             assert!(!cfg.jwt.required, "default: not required (permissive)");
             assert!(cfg.jwt.key_path.is_none(), "default: no key → JWT off");
@@ -997,7 +991,7 @@ mod tests {
     fn jwt_config_env_nesting() {
         // RIO_JWT__REQUIRED=true → jwt.required. Double-underscore
         // nesting per the figment Env::split("__") convention.
-        figment::Jail::expect_with(|jail| {
+        crate::test_jail::Jail::expect_with(|jail| {
             jail.set_env("RIO_JWT__REQUIRED", "true");
             jail.set_env("RIO_JWT__KEY_PATH", "/etc/rio/jwt/seed");
             let cfg: JwtHost = load("rio-test-jwt", NoCli::default()).unwrap();
@@ -1168,8 +1162,8 @@ mod tests {
     fn env_or_parses_and_falls_back() {
         // Unset → default.
         assert_eq!(env_or::<u32>("RIO_TEST_DEFINITELY_UNSET", 42), 42);
-        // figment::Jail for thread-safe env mutation.
-        figment::Jail::expect_with(|jail| {
+        // crate::test_jail::Jail for thread-safe env mutation.
+        crate::test_jail::Jail::expect_with(|jail| {
             jail.set_env("RIO_TEST_ENV_OR_OK", "7");
             assert_eq!(env_or::<u32>("RIO_TEST_ENV_OR_OK", 0), 7);
             jail.set_env("RIO_TEST_ENV_OR_BAD", "notanumber");
