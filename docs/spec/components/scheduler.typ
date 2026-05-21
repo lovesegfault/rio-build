@@ -2302,6 +2302,15 @@ forces the bump. A claim-write failure degrades to a logged, counted
 recovery on the claim would turn a PG blip at failover time into a leader that
 holds the Lease but never dispatches.
 
+The degradation is safe because the Lease's transition count and the claims
+ledger are _redundant_ epoch sources: the model's `LeaderElectionPgFaults.cfg`
+proves every invariant survives a skipped claim write and a PG point-in-time
+restore _alone_ (the lease-derived term of the generation still increases
+strictly across successive stealers when the floor term lies), and only the
+conjunction of a PG fault with a Lease deletion --- both epoch sources
+destroyed --- reaches a collision. Those conjunctions are the documented
+residuals, reproduced as 7-state traces in that cfg's header.
+
 #r("sched.lease.graceful-release")[
   On graceful shutdown (SIGTERM), if the lease loop was leading, it calls
   `step_down()` to clear `holderIdentity` before the process exits. This is an
