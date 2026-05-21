@@ -744,6 +744,13 @@ let
       # gather profraws.
       preRun ? "",
       postRun ? "",
+      # Fires after the remapped workspace tree at $ws is populated and
+      # before nextest runs. Use it to stage extra runtime-read files
+      # into $ws that are not part of nextestRunSrc/memberRuntimeSrcs —
+      # the mbt-rio-lease check (nix/quint.nix) copies the Quint model
+      # here so the tests' workspace-relative spec path resolves inside
+      # the sandbox.
+      postWsSetup ? "",
     }:
     pkgs.runCommand name
       (
@@ -796,6 +803,7 @@ let
               ''}
             ''
         }
+        ${postWsSetup}
 
         # HOME stays /homeless-shelter — deliberately NOT set to a
         # writable dir. Several tests probe for a working nix-daemon/

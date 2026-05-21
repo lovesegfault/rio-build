@@ -722,6 +722,14 @@
                 # flake input's legacyPackages twice does not evaluate
                 # the second nixpkgs twice.
                 quintPkg = inputs.nixpkgs-quint.legacyPackages.${system}.quint;
+                # The nextest reuse-build helpers plus rio-lease's
+                # prebuilt test binary, for the mbt-rio-lease conformance
+                # check in nix/quint.nix (it runs the #[ignore]d mbt_*
+                # tests against the committed Quint model with quint on
+                # PATH — same test binary nextest-rio-lease runs,
+                # different filter and environment).
+                inherit (crateChecks) mkNextestRun mkNextestMeta;
+                rioLeaseTestBin = crateChecks.testBins.rio-lease;
               };
 
               # Container images (Linux-only — dockerTools uses Linux VM

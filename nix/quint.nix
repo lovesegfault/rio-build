@@ -89,9 +89,26 @@
   # runtime — impossible in the sandbox). See the input's comment in
   # flake.nix for when this goes away.
   quintPkg,
+  # nix/checks.nix's nextest reuse-build helpers and rio-lease's prebuilt
+  # test binary, threaded through misc-checks.nix. Only the mbt-rio-lease
+  # conformance check below consumes them — the model checks need
+  # nothing from the Rust build.
+  mkNextestRun,
+  mkNextestMeta,
+  rioLeaseTestBin,
 }:
 let
   modelsDir = unfilteredRoot + "/docs/spec/models";
+
+  # The leader-election model as its own single-file store path (the
+  # same narrowing mkQuintCheck's src uses): the conformance check
+  # depends on the model's content, not on whatever tree unfilteredRoot
+  # points at — an unrelated docs/ edit must not re-run it, a model edit
+  # must.
+  leaseModel = lib.fileset.toSource {
+    root = modelsDir;
+    fileset = modelsDir + "/leaderElection.qnt";
+  };
 
   # One `quint verify` run per (model, main-module, invariant-set,
   # backend) tuple. `main` selects the module within the file — a model
@@ -319,6 +336,70 @@ in
         "boundedDualLeadership"
         "staleLeaderHasStaleGeneration"
       ];
+    };
+
+    # Implementation conformance (model-based testing). The four checks
+    # above prove the PROTOCOL; this one proves rio-lease implements
+    # that protocol: rio-lease/src/mbt_tests.rs replays traces generated
+    # from the leaderElectionBase regime against the real election
+    # machinery — the #[quint_run] simulation walks `step` with quint's
+    # --mbt action tracking under a seed pinned in the test attribute,
+    # the four mbt_run_* tests replay the model's named runs from their
+    # ITF traces — and diffs the projected state (lease, leading, gen)
+    # after every step. Model↔implementation drift therefore surfaces
+    # here as a red check, not as a review-time judgment call.
+    #
+    # Wiring: the same prebuilt rio-lease test binary nextest-rio-lease
+    # runs (a rio-lease source edit rebuilds both), with quint on PATH
+    # and the model file staged into the remapped nextest workspace (a
+    # model edit re-runs this check — that coupling is the point). The
+    # staged copy serves both spec lookups in mbt_tests.rs: the
+    # #[quint_run] attribute's workspace-relative path resolves against
+    # the test CWD, and the named-run replays read the RIO_MBT_SPEC_PATH
+    # override (their compile-time fallback path names the sandbox that
+    # compiled the binary, which does not exist here). The mbt_* tests
+    # are #[ignore]d, so nextest-rio-lease stays quint-free and this
+    # check is the one place they run in CI.
+    #
+    # The markers below cover what the replayed traces genuinely
+    # exercise end-to-end: Lease-object CAS acquisition/renewal/conflict
+    # (k8s-lease), the single-writer-per-resourceVersion race and the
+    # belief/lease agreement diffed at every step (at-most-one-leader),
+    # and the blind-leader self-fence flip (self-fence). The PG-side
+    # rules (generation-claim, fetch-max-seed) are NOT marked: the
+    # phase-1 projection omits genHW and the mock has no claims ledger.
+    # r[verify sched.lease.k8s-lease]
+    # r[verify sched.lease.at-most-one-leader+3]
+    # r[verify sched.lease.self-fence+2]
+    mbt-rio-lease = mkNextestRun {
+      name = "mbt-rio-lease";
+      member = "rio-lease";
+      meta = mkNextestMeta { rio-lease = rioLeaseTestBin; };
+      extraRuntimeInputs = [ quintPkg ];
+      extraArgs = [
+        "-E"
+        "package(rio-lease) and test(/mbt_/)"
+        "--run-ignored"
+        "all"
+      ];
+      preRun = ''
+        export RIO_MBT_SPEC_PATH=$TMPDIR/ws/docs/spec/models/leaderElection.qnt
+      '';
+      postWsSetup = ''
+        mkdir -p $ws/docs/spec/models
+        cp ${leaseModel}/leaderElection.qnt $ws/docs/spec/models/
+      '';
+      postRun = ''
+        # The module-level nextest args pass --no-tests=warn, so a
+        # filter that matches nothing would otherwise yield a green
+        # check that ran no conformance test at all (e.g. after a test
+        # module rename). Assert at least one test actually ran; the
+        # exit code already covers failures.
+        grep -E ' [1-9][0-9]* tests? run:' $out/log > /dev/null || {
+          echo "mbt-rio-lease: the mbt_* filter matched no tests" >&2
+          exit 1
+        }
+      '';
     };
   };
 }

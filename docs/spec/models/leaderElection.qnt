@@ -27,6 +27,14 @@
 //     verified by the Deletion regime, which injects the fault the claim
 //     exists to survive)
 //
+// CONFORMANCE: beyond the per-regime model checks wired in
+// nix/quint.nix, the mbt-rio-lease check in the same file replays
+// traces generated from leaderElectionBase against the real rio-lease
+// election machinery (rio-lease/src/mbt_tests.rs) and diffs the
+// projected state after every step -- drift between this model and the
+// implementation surfaces as a red check, not a review-time judgment
+// call.
+//
 // PROOF CLAIM, stated honestly: the invariants below hold under clock
 // skew <= MAX_SKEW ticks, no host suspend, over a bounded state space of
 // 2 nodes and ~2 leadership cycles, with at most one fault per class per
@@ -124,9 +132,11 @@
 //               holder and leaseTransitions reset, resourceVersion does
 //               not, PG survives. Disabled (MAX_DELETES=0) in the base
 //               regime.
-//   (ClaimFails is a disjunct inside steal/renewLease, not an action:
-//               the claim INSERT errors and recovery proceeds unclaimed
-//               -- the documented proceed-on-failure path. Disabled
+//   (claimOk/claimFails are the named claim disjunction inside
+//               steal/renewLease, not step-level actions: the claim
+//               INSERT lands (claimOk) or errors with recovery
+//               proceeding unclaimed (claimFails -- the documented
+//               proceed-on-failure path). claimFails is disabled
 //               (MAX_CLAIM_FAILURES=0) everywhere except PgFaults.)
 //   pgRestore   a PostgreSQL point-in-time restore regresses the floor
 //               to 0; the Lease object survives. Disabled
@@ -177,8 +187,9 @@
 // clock; the temporal form stutters one tick short of the fence deadline
 // forever); NoDualDispatch (the worker-side model that takes
 // staleLeaderHasStaleGeneration as an assumption); a second deletion per
-// trace; deterministic `run` scenarios for the documented counterexample
-// traces (the TLA+ kept them as prose; executable runs are a follow-up).
+// trace; model-based testing of the Deletion/PgFaults regimes (the
+// mbt-rio-lease check drives leaderElectionBase only -- the fault
+// regimes need the claims-ledger mock and genHW in the projection).
 module leaderElection {
   // --- 1. types ---------------------------------------------------------
   type Node = str

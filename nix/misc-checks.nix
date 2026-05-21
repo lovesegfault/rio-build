@@ -28,6 +28,12 @@
   # `pkgs` — the primary nixpkgs' quint is too old to verify offline).
   # Only nix/quint.nix's checks consume it.
   quintPkg,
+  # nix/checks.nix's nextest reuse-build helpers and rio-lease's prebuilt
+  # test binary. Only nix/quint.nix's mbt-rio-lease conformance check
+  # consumes them (same pass-through posture as quintPkg).
+  mkNextestRun,
+  mkNextestMeta,
+  rioLeaseTestBin,
 }:
 let
   # Regenerate-then-diff drift check. `generate` populates
@@ -941,11 +947,17 @@ in
         touch $out
       '';
 }
-# Quint checks for formal protocol models in docs/spec/models/. Each
-# entry is gated on its .qnt file existing — the wiring + r[verify]
-# markers land before the model so the check turns on at the model
-# commit without an intermediate red gate. See nix/quint.nix.
+# Quint checks for formal protocol models in docs/spec/models/: the
+# per-regime model checks plus the mbt-rio-lease implementation
+# conformance check. See nix/quint.nix.
 // (import ./quint.nix {
-  inherit pkgs unfilteredRoot quintPkg;
+  inherit
+    pkgs
+    unfilteredRoot
+    quintPkg
+    mkNextestRun
+    mkNextestMeta
+    rioLeaseTestBin
+    ;
   inherit (pkgs) lib;
 }).checks

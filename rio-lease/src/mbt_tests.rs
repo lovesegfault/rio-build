@@ -98,7 +98,9 @@
 //!
 //! All tests are `#[ignore]`d: they shell out to `quint`, which the
 //! default `nextest-rio-lease` sandbox does not provide. The dedicated
-//! MBT check runs them with `--run-ignored`. Locally:
+//! check (`mbt-rio-lease`, wired in `nix/quint.nix` next to the model
+//! checks) stages the model into the nextest workspace and runs them
+//! with `--run-ignored`. Locally:
 //!
 //! ```text
 //! cargo nextest run -p rio-lease -E 'test(/mbt_/)' --run-ignored all
@@ -147,11 +149,27 @@ const _: () = {
 const NODES: [&str; 2] = ["n1", "n2"];
 
 /// The spec path for the hand-rolled named-run replay (absolute via the
-/// manifest dir, so it resolves regardless of the test CWD).
+/// manifest dir, so it resolves regardless of the test CWD in a
+/// checkout). The `mbt-rio-lease` check overrides it via
+/// [`spec_path`]'s env var: there the binary runs in a different
+/// sandbox than the one that compiled it, so this baked path points at
+/// a tree that no longer exists.
 const SPEC_ABS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../docs/spec/models/leaderElection.qnt"
 );
+
+/// Where the named-run replay finds the model: `RIO_MBT_SPEC_PATH` if
+/// set (the `mbt-rio-lease` check points it at the model file staged
+/// into the remapped nextest workspace), else [`SPEC_ABS`] (the local
+/// dev case). The `#[quint_run]` simulation is not affected — its
+/// workspace-relative `spec` attribute is resolved by quint against the
+/// test CWD (the crate root), which the same staged tree satisfies.
+fn spec_path() -> std::path::PathBuf {
+    std::env::var_os("RIO_MBT_SPEC_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(SPEC_ABS))
+}
 
 // =======================================================================
 // The projection (the abstraction function)
@@ -743,7 +761,7 @@ fn replay_named_run(run: &str, actions: &[Action]) -> Result {
     let out_pattern = out.join("trace_{seq}.itf.json");
     let output = Command::new("quint")
         .arg("test")
-        .arg(SPEC_ABS)
+        .arg(spec_path())
         .args(["--main", "leaderElectionBase"])
         .args(["--match", &format!("^{run}$")])
         .args(["--max-samples", "1"])
