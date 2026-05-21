@@ -1116,6 +1116,10 @@
                 # match what master builds — only the dev shell forces
                 # this second nixpkgs eval; checks.* never reference it.
                 quintPkg = inputs.nixpkgs-quint.legacyPackages.${system}.quint;
+                # Hermetically packaged quint-llm-kit MCP servers (KB
+                # search + LSP bridge) for the project-scoped .mcp.json;
+                # dev-shell-only, never referenced by checks.*.
+                quintMcp = pkgs.callPackage ./nix/quint-mcp.nix { };
               };
 
               # `nix run .#docs` — serve the post-processed HTML tree via

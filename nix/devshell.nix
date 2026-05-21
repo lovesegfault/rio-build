@@ -25,6 +25,9 @@
   # input (the primary nixpkgs only has 0.30.0, which cannot verify
   # hermetically). Drop the arg when the primary nixpkgs catches up.
   quintPkg,
+  # nix/quint-mcp.nix — hermetic quint-llm-kit MCP servers (KB search +
+  # LSP bridge), invoked by the project-scoped .mcp.json.
+  quintMcp,
 }:
 let
   # nixpkgs still ships sqlx-cli 0.8.6 while the workspace is on sqlx
@@ -147,6 +150,13 @@ let
     # checks in nix/quint.nix work in the network-less sandbox. From
     # the `nixpkgs-quint` input, NOT `pkgs` (see flake.nix).
     quintPkg
+
+    # MCP servers launched by the project-scoped .mcp.json (tracey above
+    # is the third): curated Quint knowledge-base search and LSP-grade
+    # .qnt diagnostics. Both run offline from the store — see
+    # nix/quint-mcp.nix.
+    quintMcp.quint-kb-mcp
+    quintMcp.quint-lsp-mcp
 
     # crate2nix CLI for regenerating Cargo.json after
     # Cargo.lock changes. PoC — see
