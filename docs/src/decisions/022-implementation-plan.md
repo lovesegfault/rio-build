@@ -1,10 +1,10 @@
 # ADR-022 Implementation Plan — castore-FUSE lazy store + per-AZ S3 Express chunk cache
 
-**Status:** Phase-0 gate passed (P0541, P0544, P0569 done; P0543 does not block the gate and is still UNIMPL; P0578 PARTIAL — kernel-mechanism subtests Q7-Q12 done, mountd-protocol subtests deferred to P0567). Phase 1/2 in progress: P0545, P0546, P0548, P0549, P0550, P0551, P0552, P0568, P0570, P0572, P0573, P0577, P0588, P0589 done. Castore RPC surface (`GetDirectory`/`Has*`/`ReadBlob`/`StatBlob`) is now complete. Phase 3 started: P0567 PARTIAL (rio-mountd daemon + UDS wire protocol + `vm-mountd` VM test landed; helm DS + eks-node pquota assert pending) — finishing it unblocks P0559 (castore-FUSE itself). P0574 (gateway delta-sync client) and P0586 (PutPathChunked) are the other unblocked feature items. P0557 (eager nar_index compute) is BLOCKED on P0586 — `set_nar_index`'s `path_tenants` cross-join (added by P0572 after P0557 was planned) makes a `finalize_single` spawn permanently lose the race against the scheduler's `upsert_path_tenants`; see P0557 note. Design is [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) + [Design Overview](./022-design-overview.md) + ADR-023. Per-item status is in the metadata line under each `### P05xx` heading.
+**Status:** Phase-0 gate passed (P0541, P0544, P0569 done; P0543 does not block the gate and is still UNIMPL; P0578 PARTIAL — kernel-mechanism subtests Q7-Q12 done; the deferred mountd-protocol subtests landed as `vm-mountd` under P0567, perf criteria measured there but ungated). Phase 1/2 in progress: P0545, P0546, P0548, P0549, P0550, P0551, P0552, P0568, P0570, P0572, P0573, P0577, P0588, P0589 done. Castore RPC surface (`GetDirectory`/`Has*`/`ReadBlob`/`StatBlob`) is now complete. Phase 3 started: P0567 PARTIAL (rio-mountd daemon + UDS wire protocol + `vm-mountd` VM test landed; helm DS + eks-node pquota assert pending) — the daemon+protocol half P0559 depends on is done, so **P0559 (castore-FUSE itself) is unblocked**; only P0567's deployment tail remains. P0574 (gateway delta-sync client) and P0586 (PutPathChunked) are the other unblocked feature items. P0557 (eager nar_index compute) is BLOCKED on P0586 — `set_nar_index`'s `path_tenants` cross-join (added by P0572 after P0557 was planned) makes a `finalize_single` spawn permanently lose the race against the scheduler's `upsert_path_tenants`; see P0557 note. Design is [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) + [Design Overview](./022-design-overview.md) + ADR-023. Per-item status is in the metadata line under each `### P05xx` heading.
 **Plan-number range:** P0541–P0589 (gaps at 0542/0547/0558/0561/0587 are abandoned numbers; P0556 abandoned 2026-04-23 — do not reuse).
 **Clean-cutover constraint:** no FUSE fallback flag, no `RIO_STORE_BACKEND` selector. P0560 deletes the old FUSE module wholesale.
 **Cross-region forward-compat:** object store (S3/GCS) is authoritative for bytes; S3 Express One Zone is a per-AZ read-through cache; PG is single-region. Nothing here precludes cross-region deployment (object-store-authoritative, cache tier stateless) but it is not implemented. No DRA. **Express AZ-ID availability constrains region/AZ choice** — see [Design Overview §9](./022-design-overview.md).
-**Migration-number range:** `054_*` (last shipped: `053_build_logs_first_line.sql`).
+**Migration-number range:** ADR-022 has shipped `061_nar_index`, `062_file_blob_size`, and `063_directory_paths` (`main` was at `060_sla_observed_instance_types.sql` when Phase 1 landed; the `054_*` slot this plan originally reserved was consumed by unrelated work). Next free: `064_*`. The prose below says "migration 061" wherever it predates 062/063.
 
 ---
 
@@ -280,6 +280,8 @@ Hoist `StoreClients` + the FUSE-independent fetch primitives (`JIT_MIN_THROUGHPU
 **Crate:** `rio-proto, rio-store` · **Deps:** P0545, P0546, P0551, P0552 · **Complexity:** LOW · **Status: DONE 2026-05-15** (`75ad6288`)
 
 > Implementation note: the bottom-up `dir_digest` pass landed in `rio-store/src/castore.rs` rather than `rio-nix/src/nar/` — the canonical encoding is a prost encode of `rio_proto::castore::Directory`, and `rio-nix` cannot depend on `rio-proto` (the dependency runs the other way). `nar_ls` still emits the entry list; `castore::build()` does the second pass over it.
+>
+> **Reconciliation (post-DONE): castore tenancy is resolved at read time, not materialized.** Migration `063_directory_paths` (commit `e617321f`) **drops** the `directory_tenants`/`file_blob_tenants` junctions this section and P0552/P0570/P0573/P0577/P0586 describe, and replaces them with `directory_paths (digest, store_path_hash)` mirroring `file_blobs`; every read joins through the path junction to `path_tenants`. Two reasons: (a) the materialized junctions were a one-shot snapshot of `path_tenants` taken at first-index time, keyed `(digest, tenant)` — coarser than the data they govern, so `ReadBlob`/`StatBlob` joining on digest alone could pick *another tenant's* NAR for a content-shared digest and leak that NAR's boundary-chunk hashes; (b) a tenant gaining a `path_tenants` row after first-index was permanently denied `DirectoryService` reads. Read every `JOIN directory_tenants`/`JOIN file_blob_tenants` in the file tables below as `JOIN directory_paths`/`file_blobs` `→ JOIN path_tenants ON store_path_hash`. The GC sweep's explicit `file_blob_tenants` cleanup is gone (path-junction rows cascade via the `manifests` FK). The same commit fences `set_nar_index` on the manifest's `claim_id` so an index computed before a GC + re-upload cannot land on the new manifest, and migration `062_file_blob_size` denormalizes `file_blobs.size` so the read path never decodes `nar_index.entries`. **This also voids the P0557 block's failure mode** — see the note there.
 
 **Load-bearing for the §2 mount path** — the castore-FUSE serves this DAG. The work happens once at PutPath/index time (<1 ms on top of P0546's blake3 pass; bytes already in RAM).
 
@@ -478,6 +480,16 @@ Hoist `StoreClients` + the FUSE-independent fetch primitives (`JIT_MIN_THROUGHPU
 > lands, the eager-index optimization is correct by construction (the bytes are
 > in RAM during the same txn). Implement P0557 inside P0586's commit path, not as
 > a separate `finalize_single` spawn.
+>
+> **Re-examine (2026-05-21).** Migration 063 (see the P0572 reconciliation note)
+> removed the write-time `path_tenants` cross-join that made this race
+> *permanent*: `set_nar_index` now writes only content- and path-keyed rows
+> (`directories`, `directory_paths`, `file_blobs`), and tenancy is joined from
+> `path_tenants` at read time — a read that races the scheduler's
+> `upsert_path_tenants` returns NotFound *until the row lands*, then self-heals.
+> The remaining argument for keeping P0557 inside P0586's commit txn is
+> coherence (one txn, bytes already in RAM), not correctness. Re-evaluate the
+> BLOCKED status when picking up P0586.
 
 | File | Change |
 |---|---|
@@ -935,7 +947,9 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 | `infra/helm/rio-build/values.yaml` | P0554, P0564 | distinct top-level keys |
 | `rio-controller/src/reconcilers/common/sts.rs` | P0564 only | — |
 | `nix/nixos-node/eks-node.nix` | P0564, P0571 | distinct hunks (drop smarter-device-manager static-pod vs tmpfiles) |
-| `migrations/061_nar_index.sql` | P0551 (creates the full ADR-022 castore schema) | P0572/P0581/P0586 schema is **pre-created** in 061 — those plans add only code, no DDL; pinned once. P0583's `DROP COLUMN inline_blob` is a separate migration (lands with the code change that stops reading it). |
+| `migrations/061_nar_index.sql` | P0551 (creates the full ADR-022 castore schema) | P0581/P0586 schema is **pre-created** in 061 — those plans add only code, no DDL; pinned once. P0583's `DROP COLUMN inline_blob` is a separate migration (lands with the code change that stops reading it). |
+| `migrations/062_file_blob_size.sql` | P0570/P0577 | `file_blobs.size` denormalization — the read path never decodes `nar_index.entries`. |
+| `migrations/063_directory_paths.sql` | tenancy rework (`e617321f`, post-P0572) | replaces `directory_tenants`/`file_blob_tenants` with `directory_paths` + read-time `path_tenants` joins — see the P0572 reconciliation note. |
 | `rio-proto/proto/types.proto` | P0545, P0572 | P0545 → P0572 (append fields 7, 8) |
 | `rio-proto/proto/store.proto` | P0568, P0570, P0573, P0577, P0586 | append-only RPC additions; no ordering constraint |
 | `rio-builder/src/upload.rs` | P0586 only (rewrite) | — |
