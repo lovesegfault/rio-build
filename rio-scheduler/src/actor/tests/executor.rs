@@ -4598,12 +4598,21 @@ async fn test_stale_epoch_disconnect_preserves_buffer() -> anyhow::Result<()> {
 
     let _rx = connect_executor(&handle, "stale-lb", "x86_64-linux").await?;
     let fake_path = test_drv_path("stale-fake");
-    log_buffers.push(&rio_proto::types::BuildLogBatch {
+    // Stamp + push as `set_log_exec` + the recv task would in production.
+    // The legacy `push()` path creates an UNSTAMPED entry, which
+    // `discard_if_owned_by` refuses to remove regardless of the epoch
+    // check — seeded that way, the "survives" assertion below passes for
+    // the wrong reason and cannot catch a regression in the I-056a
+    // early-return. Same rationale as the seeding comment in
+    // test_disconnect_discards_only_unknown_drvs.
+    log_buffers.set_exec(&fake_path, uuid::Uuid::now_v7(), "stale-lb");
+    let batch = rio_proto::types::BuildLogBatch {
         derivation_path: fake_path.clone(),
         lines: vec![b"line".to_vec()],
         first_line_number: 0,
         executor_id: "stale-lb".into(),
-    });
+    };
+    assert!(log_buffers.push_for(&fake_path, &batch, "stale-lb"));
 
     // Stale epoch (≠ the connected stream's) → early-return BEFORE
     // cleanup. Even a DAG-unknown path survives.
