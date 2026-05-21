@@ -45,7 +45,7 @@
 #
 # Where the tools come from: quintPkg's bin/quint is a wrapper that puts
 # its own JRE on PATH and sets QUINT_HOME to the package's share/quint,
-# which carries the Apalache 0.56.1 distribution as a store path. The
+# which carries the bundled Apalache distribution as a store path. The
 # tlc backend runs `java -cp <QUINT_HOME>/apalache-dist-*/apalache/lib/
 # apalache.jar tlc2.TLC` — TLC ships inside the Apalache jar, so neither
 # backend needs pkgs.tlaplus, a network connection, or a writable HOME.
@@ -83,9 +83,9 @@
   pkgs,
   lib,
   unfilteredRoot,
-  # Quint 0.32.0 + the bundled Apalache dist, evaluated from the
+  # Quint with the bundled Apalache dist, evaluated from the
   # `nixpkgs-quint` flake input rather than `pkgs` (the primary nixpkgs
-  # only has 0.30.0, which has no Apalache and tries to download one at
+  # quint has no bundled Apalache and tries to download one at
   # runtime — impossible in the sandbox). See the input's comment in
   # flake.nix for when this goes away.
   quintPkg,

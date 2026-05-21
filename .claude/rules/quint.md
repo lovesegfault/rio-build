@@ -119,8 +119,8 @@ figure is worse than none.
   clock) needs a ceiling **as an action precondition** (`s.lease.rv < MAX_RV` inside the
   guard), NOT a saturating clamp (two nodes parked at the same ceiling value falsify
   distinctness invariants as a state-space artifact). Without the ceiling TLC never
-  terminates — measured: the unbounded CAS fragment was at depth 763 / 36.8M distinct states
-  / still growing when killed. Apalache does not need the ceiling; add it anyway so the same
+  terminates — the unbounded CAS fragment from the migration had to be killed mid-run, still
+  growing. Apalache does not need the ceiling; add it anyway so the same
   spec works under both backends.
 - **Deadlock checking is already off** (quint passes `-deadlock` to TLC). The state-space
   ceiling is a "deadlock" to TLC; nothing to configure.

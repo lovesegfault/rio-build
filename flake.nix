@@ -20,9 +20,9 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     # Quint (the TLA+-successor specification language) pinned past the
-    # primary nixpkgs. The pinned nixpkgs has quint 0.30.0, which has NO
-    # Apalache — `quint verify` tries to download it at runtime, which
-    # the sandbox forbids. Master's 0.32.0 bundles the Apalache dist as
+    # primary nixpkgs, whose quint has NO bundled Apalache — `quint
+    # verify` tries to download it at runtime, which the sandbox
+    # forbids. The quint on nixpkgs master bundles the Apalache dist as
     # a store path inside the package (located via QUINT_HOME), so
     # `quint verify` works hermetically. A second input rather than a
     # copied package definition because quint has two FOD sub-builds
