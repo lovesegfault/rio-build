@@ -718,11 +718,20 @@ impl LogFlusher {
         //    stored `.partial` is truncated at the last periodic snapshot
         //    and the incomplete indicator must survive
         //    (`obs.log.incomplete-surfaced`). (The
-        //    `None` arm of `flush_final` has the analogous pre-existing
-        //    gap for a re-dispatched drv — exec₁'s `.partial` row is never
-        //    finalized when exec₂ takes over the entry — but the dashboard
-        //    pin moves to exec₂ at exec₂'s terminal, so that row is not
-        //    the one being served. Out of scope here.)
+        //    stale-request arm of `flush_final` — `drain_if_exec` misses,
+        //    the live entry is already stamped exec₂ — has the analogous
+        //    pre-existing gap for a re-dispatched drv: exec₁'s `.partial`
+        //    row is never finalized. The dashboard pin does NOT move:
+        //    `record_exec_correlation` is write-once
+        //    (`AND exec_id IS NULL`), so builds that observed exec₁'s
+        //    terminal keep exec₁ and ARE served that row (if a periodic
+        //    snapshot wrote one), minus the tail `discard_log_buffer`
+        //    dropped at re-dispatch (≤ ~PERIODIC_FLUSH_INTERVAL of
+        //    output). Accepted, not fixed here: the tail is already gone
+        //    when the stale request is seen, `is_complete=false` keeps
+        //    the incomplete banner honest, and `status`/`finished_at`
+        //    have no production read path. Pinned by
+        //    `flush_final_stale_request_leaves_prior_partial_row_untouched`.)
         if line_count == 0 {
             if is_final {
                 self.finalize_empty_drain(&req).await;
@@ -1624,6 +1633,95 @@ mod tests {
         assert_eq!(row.0, exec2);
         assert_eq!(row.1, 2);
         assert_eq!(row.2.as_deref(), Some("succeeded"));
+        Ok(())
+    }
+
+    /// The accepted residual of the stale-request arm, pinned: when a
+    /// `FlushRequest` for exec₁ goes stale (drv re-dispatched as exec₂
+    /// before the flusher dequeued it), exec₁'s prior periodic `.partial`
+    /// row is left exactly as the periodic flush wrote it — present,
+    /// `is_complete=false`, `status IS NULL` — and is NOT finalized,
+    /// deleted, or (worse) marked complete. Builds pinned to exec₁ via the
+    /// write-once `bd.exec_id` are served that row with the incomplete
+    /// banner; marking it complete here would suppress the banner for a
+    /// log that is genuinely missing its post-snapshot tail. exec₂'s later
+    /// final flush must touch only exec₂'s row.
+    #[tokio::test]
+    async fn flush_final_stale_request_leaves_prior_partial_row_untouched() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, _deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/bbbb-stalepartial.drv";
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+
+        // exec₁ runs and streams; a periodic tick snapshots it → `.partial`
+        // blob + drv_logs(exec₁, is_complete=false, status NULL).
+        let exec1 = stamp_and_push(&buffers, drv_path, &[b"exec1-line0", b"exec1-line1"]);
+        flusher.flush_periodic().await;
+        assert_eq!(puts.lock().unwrap().len(), 1, "periodic snapshot PUT");
+
+        // exec₁ reaches a terminal (actor queues FlushRequest{exec₁}), but
+        // before the flusher dequeues it the drv is re-dispatched:
+        // assign_to_worker discards the buffer and stamps exec₂.
+        buffers.discard(drv_path);
+        let exec2 = stamp_and_push(&buffers, drv_path, &[b"exec2-line0"]);
+
+        // The stale exec₁ final arrives now and must be a pure no-op on PG
+        // and S3: exec₁'s periodic row stays exactly as written.
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id: exec1,
+                status: Some("failed".into()),
+            })
+            .await;
+        assert_eq!(puts.lock().unwrap().len(), 1, "stale final must not PUT");
+        let rows: Vec<(Uuid, bool, Option<String>)> =
+            sqlx::query_as("SELECT exec_id, is_complete, status FROM drv_logs ORDER BY exec_id")
+                .fetch_all(&db.pool)
+                .await?;
+        assert_eq!(rows.len(), 1, "only exec₁'s periodic row exists");
+        assert_eq!(rows[0].0, exec1);
+        assert!(
+            !rows[0].1,
+            "stale final must NOT mark exec₁'s truncated row complete (incomplete banner stays)"
+        );
+        assert_eq!(rows[0].2, None, "stale final must not stamp exec₁'s status");
+
+        // exec₂'s legitimate final flush touches only exec₂'s row; exec₁'s
+        // row still reads as the incomplete periodic snapshot it is.
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id: exec2,
+                status: Some("succeeded".into()),
+            })
+            .await;
+        let rows: Vec<(Uuid, bool, Option<String>)> =
+            sqlx::query_as("SELECT exec_id, is_complete, status FROM drv_logs ORDER BY started_at")
+                .fetch_all(&db.pool)
+                .await?;
+        assert_eq!(rows.len(), 2, "exec₂'s final adds its own row");
+        let e1 = rows
+            .iter()
+            .find(|r| r.0 == exec1)
+            .expect("exec₁ row present");
+        let e2 = rows
+            .iter()
+            .find(|r| r.0 == exec2)
+            .expect("exec₂ row present");
+        assert!(!e1.1, "exec₁ stays is_complete=false after exec₂'s final");
+        assert_eq!(e1.2, None, "exec₁ status stays NULL after exec₂'s final");
+        assert!(e2.1, "exec₂'s own final completes exec₂'s row");
+        assert_eq!(e2.2.as_deref(), Some("succeeded"));
         Ok(())
     }
 
