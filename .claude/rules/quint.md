@@ -265,11 +265,11 @@ Re-reviewed against the kit at rev `520e563`; everything below still stands.
   rio-build's MBT goes through quint-connect instead (see the MBT section above); revisit the
   kit's tooling only if a future component needs transition labeling quint-connect cannot
   express.
-- **The kit's Docker container and MCP servers**: rio-build uses the nix dev shell; the KB is
-  consumed by grepping the cloned repo. The kit now packages its KB-search and LSP MCP
-  servers as a nix flake (`mcp-servers/flake.nix`), so packaging is no longer the obstacle —
-  the trigger for revisiting is model-authoring becoming frequent enough that grepping the
-  clone stops being good enough.
+- **The kit's Docker container**: rio-build uses the nix dev shell instead. The kit's MCP
+  servers are NOT omitted anymore: `nix/quint-mcp.nix` packages the KB-search server and the
+  quint LSP bridge hermetically (TypeScript build, search indices, and the embedding model
+  all vendored at build time), and the project-scoped `.mcp.json` launches them — dev-shell
+  Claude Code sessions get `quint-kb` and `quint-lsp` automatically, alongside `tracey`.
 - **Apalache's `--inductive-invariant` mode**: unnecessary while every regime's state space
   stays small enough for exhaustive TLC; it is the escape hatch if a future model outgrows
   that (prove the invariant inductive instead of enumerating the states).

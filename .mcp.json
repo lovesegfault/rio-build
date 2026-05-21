@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "tracey": {
+      "type": "stdio",
+      "command": "tracey",
+      "args": ["mcp"]
+    },
+    "quint-kb": {
+      "type": "stdio",
+      "command": "quint-kb-mcp",
+      "args": []
+    },
+    "quint-lsp": {
+      "type": "stdio",
+      "command": "quint-lsp-mcp",
+      "args": []
+    }
+  }
+}

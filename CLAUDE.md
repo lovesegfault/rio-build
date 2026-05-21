@@ -106,7 +106,11 @@ Pre-commit hooks run treefmt automatically on commit.
 - **Always run `nix develop -c cargo nextest run` before committing** to catch regressions early.
 - PostgreSQL integration tests bootstrap their own ephemeral postgres server (via `rio-test-support`) using `initdb`/`postgres` binaries from the dev shell. **No manual setup needed.** Tests panic (not skip) if postgres binaries are unavailable. Set `DATABASE_URL` to override with an external PG for debugging.
 - Use semantic commit messages scoped by crate (e.g., `feat(rio-nix): add ATerm derivation parser`).
-- **tracey MCP (optional):** `nix develop -c tracey ai --claude` registers the tracey MCP server + installs the annotation skill. After registration, Claude Code can query `tracey_uncovered` / `tracey_untested` / `tracey_rule` during dev sessions. The daemon caches scan results — `rm -rf .tracey/` to force rescan.
+- **MCP servers (project-scoped, `.mcp.json`):** Claude Code sessions started inside the dev shell (direnv or `nix develop`) automatically offer three stdio MCP servers — approve once per checkout:
+  - `tracey` — spec-coverage queries (`tracey_uncovered` / `tracey_untested` / `tracey_rule`). The daemon caches scan results — `rm -rf .tracey/` to force rescan. `tracey ai --claude` remains the way to install tracey's annotation *skill*; the MCP-registration half is covered by `.mcp.json`.
+  - `quint-kb` — search/browse the quint-llm-kit knowledge base (builtin-operator docs, pattern cards, worked example specs, templates). Built offline with vendored search indices + embedding model; see `nix/quint-mcp.nix`.
+  - `quint-lsp` — LSP diagnostics/navigation for `docs/spec/models/*.qnt` (mcp-language-server bridging quint-language-server; workspace defaults to `docs/spec/models`).
+  The commands are dev-shell binaries, so start `claude` from inside the shell.
 
 ### Generated files (`cargo xtask regen`)
 
