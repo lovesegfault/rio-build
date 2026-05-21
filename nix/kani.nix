@@ -84,6 +84,23 @@ let
           --output-format=terse \
           --jobs="''${NIX_BUILD_CORES:-1}" \
           2>&1 | tee "$out"
+
+        # Non-vacuity guard, same discipline as mbt-rio-lease's "N tests
+        # run" grep and mkQuintWitnessCheck's violation-report grep
+        # (nix/quint.nix): kani-driver exits 0 when the artifact set
+        # contains zero proof harnesses ("No proof harnesses ... were
+        # found to verify"), so the exit code alone cannot distinguish
+        # "all harnesses verified" from "verified nothing". Require the
+        # summary line to report at least one verified harness; kani
+        # already exits 1 on any verification failure, so this only has
+        # to catch the verified-nothing case (and any future exit-0 path
+        # that produces no summary line at all).
+        if ! grep -qE 'Complete - [1-9][0-9]* successfully verified harnesses' "$out"; then
+          echo "kani-$MEMBER: no proof harnesses were verified (vacuous check)." >&2
+          echo "Check that $artifacts contains a *.kani-metadata.json with a non-empty proof_harnesses list:" >&2
+          echo "either the #[cfg(kani)] proofs module stopped being compiled into the kani build, or the crateBuildKani / kani-compiler-defaults plumbing changed (flake.nix, nix/kani-toolchain.nix)." >&2
+          exit 1
+        fi
       '';
 in
 {
