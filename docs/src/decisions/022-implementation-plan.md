@@ -22,14 +22,7 @@ PLAN-GRAND-REFACTOR V1 (Path A / EROFS+fscache), V2/V3 (Path C, mkcomposefs subp
 
 ## Spike evidence
 
-Core-stack nixosTests consolidated on `adr-022` (commit `15a9db79`); chromium-146 closure topology (357 store paths, 23 218 regular files, 8 221 dirs, 3 374 symlinks) with synthetic content. **The metadata-zero-upcall numbers measured the §3 EROFS alternative; §2 pays one upcall per cold dirent and is dcache-absorbed thereafter (snix's exact configuration).**
-
-| Metric | Result | Applies to |
-|---|---|---|
-| `mount -t overlay` wall-clock | **<10 ms**; 0 FUSE upcalls during mount | §3 EROFS |
-| `find -type f` over 23 218 files | 60 ms, **0 FUSE upcalls** | §3 EROFS |
-| Warm `read` upcalls | **0** | both (passthrough) |
-| Metadata image (chromium closure) | **5.3 MiB**, encoded in **70 ms** | §3 EROFS only |
+Core-stack nixosTests consolidated on `adr-022` (commit `15a9db79`); chromium-146 closure topology (357 store paths, 23 218 regular files, 8 221 dirs, 3 374 symlinks) with synthetic content. The number that carries over to §2: **warm `read` upcalls = 0** under passthrough. The metadata-side zero-upcall numbers (mount <10 ms, `find` over 23 218 files in 60 ms with 0 upcalls, 5.3 MiB image encoded in 70 ms) measured the **rejected §3 EROFS alternative** — §2 pays one upcall per cold dirent and is dcache-absorbed thereafter (snix's exact configuration); the §3 numbers live in ADR-022 §3's deferred-alternative paragraph.
 
 **Privilege-boundary evidence** (P0541, commit `af8db499` on `adr-022`, kernel 6.18.20) — all PASS:
 
@@ -38,8 +31,7 @@ Core-stack nixosTests consolidated on `adr-022` (commit `15a9db79`); chromium-14
 | `userns-overlay` | PASS — unpriv builder mounts overlay itself with `-o userxattr,lowerdir=<lower>`. Carries over to §2 (single FUSE lower, no `::`). |
 | `userns-fuse-self` | PASS — builder cannot `open("/dev/fuse")` without `privileged:true` or device-plugin, but with fd-handoff it never needs to: `rio-mountd` opens+mounts in init-ns, passes the connected fd. **Builder pod drops `smarter-devices/fuse:1` entirely.** |
 | `kvm-hostpath-spike` (`9492019c` on `adr-022`) | PASS — Nix sandbox sees `/dev/kvm` via `extra-sandbox-paths` + char-device hostPath; `requiredSystemFeatures=["kvm"]` build does `ioctl(KVM_GET_API_VERSION)` → 12. **smarter-device-manager dropped entirely** — `/dev/kvm` is a capability flag (node label + hostPath), not a counted resource. |
-| `erofs-loop-unpriv` | FAIL as expected (`EPERM`) — **§3 alternative only**; §2 has no EROFS mount. |
-| `fsmount-handoff-erofs` | PASS — **§3 alternative only.** |
+| `erofs-loop-unpriv` / `fsmount-handoff-erofs` | **§3 alternative only** (EPERM as expected / PASS) — §2 has no EROFS mount. |
 | `fuse-dev-fd-handoff` | PASS — `/dev/fuse` fd via SCM_RIGHTS works; `fuser` accepts pre-opened fd. |
 | `teardown-under-load` | PASS — reader wakes `ENOTCONN` <1s, no D-state. |
 
@@ -827,20 +819,15 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 ## tracey `r[…]` marker inventory (P0544 writes spec; later phases write impl/verify)
 
 > **Spec-file column is the planned canonical location.** Where a marker pre-existed in `decisions/022-design-overview.md` §4–§15 (the canonical design reference, in tracey scope as of P0544), it stays there rather than being duplicated; `tracey query rule <id>` shows the actual defining file. ADR-022 §6 (chunked upload) and ADR-023 (tiered backend) carry their own markers. Component spec files carry the markers not covered by the ADR docs.
+>
+> **Rows are removed once the rule has both an `r[impl]` and an `r[verify]` in the tree** — `tracey query rule <id>` is then authoritative and a planned-location row can only drift from it. What remains below is the planned coverage for rules that are still uncovered, still untested, or not yet written into the spec.
 
 | Marker | Spec file (P0544) | `r[impl]` (plan) | `r[verify]` site (plan) |
 |---|---|---|---|
-| `store.backend.tiered-get-fallback` | components/store.md | tiered.rs `get()` (P0548) | vm-store-tiered `cold-miss-fallback` (P0555) |
-| `store.backend.tiered-put-remote-first` | components/store.md | tiered.rs `put()` (P0548) | vm-store-tiered `put-remote-only` (P0555) |
 | `store.put.builder-chunked-only` | components/store.md | grpc/put_path/mod.rs token-role gate (P0584) | unit (P0584) |
-| `store.index.nar-ls-offset` | components/store.md | rio-nix/nar/ (P0546) | proptest in nar/ (P0546) |
-| `store.index.file-digest` | components/store.md | rio-nix/nar/ (P0546) | proptest in nar/ (P0546) |
-| `store.index.table-cascade` | components/store.md | metadata/queries.rs (P0551) | rio-store/tests/nar_index.rs (P0552) |
 | `store.index.non-authoritative` | components/store.md | nar_index.rs `compute()` (P0552) | rio-store/tests/nar_index.rs (P0552) |
-| `store.index.sync-on-miss` | components/store.md | nar_index.rs (P0552) | rio-store/tests/nar_index.rs (P0552) |
 | `store.index.putpath-bg-warm` | components/store.md | nar_index.rs `indexer_loop` (P0552) | vm-castore-e2e `cold-read` (P0560§B) |
 | `store.index.putpath-eager` | components/store.md | put_path/ (P0557) | vm-protocol-warm (P0557) |
-| `store.index.rpc` | components/store.md | grpc/mod.rs (P0552) | rio-store/tests/nar_index.rs (P0552) |
 | `builder.fs.castore-stack` | decisions/022 §2.1 | castore_fuse/mount.rs (P0560§A) | vm-castore-e2e `cold-read` (P0560§B) |
 | `builder.fs.castore-dag-source` | decisions/022 §2.2 | castore_fuse/tree.rs (P0559) | vm-castore-e2e (P0560§B) |
 | `builder.fs.castore-inode-digest` | decisions/022 §2.3 | castore_fuse/tree.rs (P0559) | unit (P0559) + vm-castore-e2e `inode-dedup` (P0560§B) |
@@ -850,35 +837,15 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 | `builder.fs.passthrough-on-hit` | decisions/022 §2.6 | castore_fuse/open.rs (P0559) | vm-castore-e2e `passthrough-small`+`warm-read` (P0560§B) |
 | `builder.fs.passthrough-stack-depth` | decisions/022 §2.9 | castore_fuse/mod.rs init (P0559) | composefs-spike-priv `passthrough-under-overlay` (P0578) |
 | `builder.fs.file-digest-integrity` | decisions/022 §2.7 | castore_fuse/open.rs (P0559) | vm-castore-e2e `integrity-fail` (P0560§B) |
-| `store.castore.blob-stat` | components/store.md | rio-store/grpc/directory.rs (P0570) | fixed-geometry sweep + chunked-overrun (P0570; see reconciliation) |
-| `sched.dispatch.input-roots` | components/scheduler.md | rio-scheduler/actor/dispatch.rs (P0588) | unit (P0588) |
 | `builder.fs.fetch-circuit` | components/builder.md | castore_fuse/circuit.rs (P0559) | vm-castore-e2e `eio-on-fetch-fail` (P0560§B) |
 | `builder.fs.node-digest-cache` | components/builder.md | bin/rio-mountd.rs (P0571) | vm-castore-e2e `cross-build-dedup` (P0560§B) |
 | `builder.fs.node-chunk-cache` | decisions/022 §2.6 | castore_fuse/open.rs (P0575) + bin/rio-mountd.rs (P0567) | vm-castore-e2e `cross-build-dedup-streaming` (P0560§B) |
 | `builder.fs.shared-backing-cache` | decisions/022 §2.6 | castore_fuse/open.rs (P0559+P0571) | vm-castore-e2e `cross-build-dedup` (P0560§B) |
 | `builder.fs.streaming-open` | components/builder.md | castore_fuse/open.rs (P0575) | vm-castore-e2e `cold-read` <50ms (P0560§B) |
 | `builder.fs.streaming-open-threshold` | decisions/022 §2.8 | config.rs (P0575) | vm-castore-e2e `cold-read` (P0560§B) |
-| `store.index.dir-digest` | components/store.md | rio-nix/nar/ (P0572) | proptest (P0572) |
-| `store.castore.canonical-encoding` | decisions/022-design-overview §8 | rio-proto/castore.proto (P0572) | golden-bytes (P0572) |
-| `store.castore.directory-rpc` | decisions/022-design-overview §8 | rio-store/grpc/directory.rs (P0573) | unit (P0573) |
-| `store.castore.blob-read` | decisions/022-design-overview §8 | rio-store/grpc/directory.rs (P0577) | unit (P0577) |
-| `store.castore.gc` | components/store.md | rio-store/nar_index.rs + gc/sweep.rs (P0572) | rio-store/tests/gc.rs (P0572) |
-| `store.castore.tenant-scope` | components/store.md | rio-store/grpc/directory.rs (P0573+P0577+P0570) | unit cross-tenant-probe (P0573, P0577, P0570) |
-| `store.index.nar-ls-streaming` | components/store.md | rio-nix/nar/ (P0546) | unit panic-on-seek (P0546) |
 | `gw.substitute.dag-delta-sync` | components/gateway.md | rio-gateway/substitute/dag_sync.rs (P0574) | vm-dag-delta-sync (P0574) |
 | `builder.result.input-eio-is-infra` | components/builder.md | executor/mod.rs (P0560§A, ported) | vm-castore-e2e `eio-on-fetch-fail` (P0560§B) |
-| `builder.mountd.fuse-handoff` | decisions/022-design-overview §11 | castore_fuse/mountd.rs (P0567) | vm-mountd `fd-handoff` (P0567) + vm-castore-e2e `cold-read` (P0560§B) |
-| `builder.mountd.backing-broker` | decisions/022-design-overview §11 | castore_fuse/{mountd,mountd_proto}.rs (P0567) | composefs-spike-priv `passthrough-under-overlay` (P0578) + vm-mountd `backing-broker` (P0567) |
-| `builder.mountd.promote-verified` | decisions/022 §2.6 | castore_fuse/mountd.rs (P0567) | unit promote_* (P0567) + vm-mountd `promote-verified` (P0567) + vm-castore-e2e `integrity-fail` (P0560§B) |
-| `builder.mountd.orphan-scan` | decisions/022 §2.5 | castore_fuse/mountd.rs (P0567) | vm-mountd `orphan-scan` (P0567) + vm-castore-e2e `mountd-restart` (P0560§B) |
-| `builder.mountd.concurrency` | decisions/022-design-overview §11 | castore_fuse/mountd.rs (P0567) | vm-mountd `concurrency` (P0567) |
 | `sec.boundary.mountd` | security.md | bin/rio-mountd.rs (P0567) | vm-mountd `gid-gate`+`traversal-reject`+`uid-bound` (P0567) |
-| `builder.mountd.build-id-validated` | decisions/022-design-overview §11 | castore_fuse/mountd.rs (P0567) | unit build_id_validation (P0567) + vm-mountd `traversal-reject` (P0567) |
-| `builder.mountd.uid-bound` | decisions/022-design-overview §11 | castore_fuse/mountd.rs (P0567) | vm-mountd `uid-bound` (P0567) |
-| `builder.mountd.build-id-unique` | decisions/022-design-overview §11 | castore_fuse/mountd.rs (P0567) | vm-mountd `build-id-unique` (P0567) |
-| `builder.mountd.staging-quota` | decisions/022-design-overview §11 | castore_fuse/mountd.rs (P0567) | vm-mountd `staging-quota` (P0567) |
-| `builder.mountd.promote-bounded-copy` | decisions/022-design-overview §11 | castore_fuse/mountd.rs (P0567) | unit promote_bounded_* (P0567) + vm-mountd `promote-bounded-copy` (P0567) |
-| `builder.mountd.one-mount` | decisions/022-design-overview §11 | castore_fuse/mountd.rs (P0567) | vm-mountd `one-mount` (P0567) |
 | `builder.fs.listxattr-size-branch` | components/builder.md | castore_fuse/mod.rs (P0559) | vm-castore-e2e `shutil-copy2` (P0560§B) |
 | `obs.metric.mountd` | observability.md | castore_fuse/mountd.rs (P0567) | vm-castore-e2e (P0560§B) |
 | `builder.overlay.castore-lower` | components/builder.md | overlay.rs (P0560§A) | vm-castore-e2e (P0560§B) |
