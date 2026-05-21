@@ -2018,7 +2018,6 @@ dependencies = [
  "ff",
  "generic-array 0.14.7",
  "group",
- "hkdf 0.12.4",
  "pem-rfc7468 0.7.0",
  "pkcs8 0.10.2",
  "rand_core 0.6.4",
@@ -2037,7 +2036,7 @@ dependencies = [
  "crypto-bigint 0.7.3",
  "crypto-common 0.2.2",
  "digest 0.11.3",
- "hkdf 0.13.0",
+ "hkdf",
  "hybrid-array",
  "once_cell",
  "pem-rfc7468 1.0.0",
@@ -3727,15 +3726,6 @@ checksum = "e712f64ec3850b98572bffac52e2c6f282b29fe6c5fa6d42334b30be438d95c1"
 
 [[package]]
 name = "hkdf"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
-dependencies = [
- "hmac 0.12.1",
-]
-
-[[package]]
-name = "hkdf"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
@@ -4359,18 +4349,12 @@ version = "10.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eba32bfb4ffdeaca3e34431072faf01745c9b26d25504aa7a6cf5684334fc4fc"
 dependencies = [
+ "aws-lc-rs",
  "base64",
- "ed25519-dalek 2.2.0",
  "getrandom 0.2.17",
- "hmac 0.12.1",
  "js-sys",
- "p256 0.13.2",
- "p384 0.13.1",
- "rand 0.8.6",
- "rsa 0.9.10",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "signature 2.2.0",
  "zeroize",
 ]
@@ -4530,9 +4514,6 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
-dependencies = [
- "spin 0.9.8",
-]
 
 [[package]]
 name = "leb128fmt"
@@ -5021,22 +5002,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "num-bigint-dig"
-version = "0.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e661dda6640fad38e827a6d4a310ff4763082116fe217f279885c97f511bb0b7"
-dependencies = [
- "lazy_static",
- "libm",
- "num-integer",
- "num-iter",
- "num-traits",
- "rand 0.8.6",
- "smallvec",
- "zeroize",
-]
-
-[[package]]
 name = "num-complex"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5057,17 +5022,6 @@ version = "0.1.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7969661fd2958a5cb096e56c8e1ad0444ac2bbcd0061bd28660485a44879858f"
 dependencies = [
- "num-traits",
-]
-
-[[package]]
-name = "num-iter"
-version = "0.1.45"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1429034a0490724d0075ebb2bc9e875d6503c3cf69e235a8941aa757d83ef5bf"
-dependencies = [
- "autocfg",
- "num-integer",
  "num-traits",
 ]
 
@@ -5284,18 +5238,6 @@ dependencies = [
  "primefield",
  "primeorder 0.14.0-rc.9",
  "sha2 0.11.0",
-]
-
-[[package]]
-name = "p384"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe42f1670a52a47d448f14b6a5c61dd78fce51856e68edaa38f7ae3a46b8d6b6"
-dependencies = [
- "ecdsa 0.16.9",
- "elliptic-curve 0.13.8",
- "primeorder 0.13.6",
- "sha2 0.10.9",
 ]
 
 [[package]]
@@ -5562,17 +5504,6 @@ name = "pin-utils"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
-
-[[package]]
-name = "pkcs1"
-version = "0.7.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8ffb9f10fa047879315e6625af03c164b16962a5368d724ed16323b68ace47f"
-dependencies = [
- "der 0.7.10",
- "pkcs8 0.10.2",
- "spki 0.7.3",
-]
 
 [[package]]
 name = "pkcs1"
@@ -6723,26 +6654,6 @@ dependencies = [
 
 [[package]]
 name = "rsa"
-version = "0.9.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8573f03f5883dcaebdfcf4725caa1ecb9c15b2ef50c43a07b816e06799bb12d"
-dependencies = [
- "const-oid 0.9.6",
- "digest 0.10.7",
- "num-bigint-dig",
- "num-integer",
- "num-traits",
- "pkcs1 0.7.5",
- "pkcs8 0.10.2",
- "rand_core 0.6.4",
- "signature 2.2.0",
- "spki 0.7.3",
- "subtle",
- "zeroize",
-]
-
-[[package]]
-name = "rsa"
 version = "0.10.0-rc.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "30b2aa4ba0d89f73d1e332df05be0eeab8840351c36ca5654341dfdb57bb3caf"
@@ -6751,7 +6662,7 @@ dependencies = [
  "crypto-bigint 0.7.3",
  "crypto-primes",
  "digest 0.11.3",
- "pkcs1 0.8.0-rc.4",
+ "pkcs1",
  "pkcs8 0.11.0",
  "rand_core 0.10.1",
  "sha2 0.11.0",
@@ -6817,7 +6728,7 @@ dependencies = [
  "getrandom 0.2.17",
  "ghash",
  "hex-literal",
- "hkdf 0.13.0",
+ "hkdf",
  "hmac 0.13.0",
  "inout 0.1.4",
  "internal-russh-num-bigint",
@@ -6828,17 +6739,17 @@ dependencies = [
  "module-lattice",
  "num-bigint",
  "p256 0.14.0-rc.9",
- "p384 0.14.0-rc.9",
+ "p384",
  "p521",
  "pageant",
  "pbkdf2",
- "pkcs1 0.8.0-rc.4",
+ "pkcs1",
  "pkcs5",
  "pkcs8 0.11.0",
  "polyval",
  "rand 0.10.1",
  "rand_core 0.10.1",
- "rsa 0.10.0-rc.18",
+ "rsa",
  "russh-cryptovec",
  "russh-util",
  "salsa20",
@@ -7711,7 +7622,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "hex",
- "hkdf 0.13.0",
+ "hkdf",
  "hmac 0.13.0",
  "itoa",
  "log",
@@ -7803,10 +7714,10 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "p256 0.14.0-rc.9",
- "p384 0.14.0-rc.9",
+ "p384",
  "p521",
  "rand_core 0.10.1",
- "rsa 0.10.0-rc.18",
+ "rsa",
  "sec1 0.8.1",
  "sha1 0.11.0",
  "sha2 0.11.0",
@@ -9343,7 +9254,6 @@ dependencies = [
  "crypto-common 0.2.2",
  "ctutils",
  "curve25519-dalek 5.0.0-pre.6",
- "der 0.7.10",
  "digest 0.10.7",
  "digest 0.11.3",
  "ecdsa 0.17.0-rc.18",
@@ -9358,7 +9268,6 @@ dependencies = [
  "futures-io",
  "futures-sink",
  "futures-util",
- "generic-array 0.14.7",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
  "getrandom 0.4.2",
@@ -9376,8 +9285,8 @@ dependencies = [
  "kube",
  "kube-client",
  "kube-core",
- "lazy_static",
  "libc",
+ "libm",
  "libsqlite3-sys",
  "log",
  "memchr",
@@ -9389,11 +9298,10 @@ dependencies = [
  "once_cell",
  "ordered-float 5.3.0",
  "p256 0.14.0-rc.9",
- "p384 0.14.0-rc.9",
+ "p384",
  "p521",
  "pbkdf2",
  "percent-encoding",
- "pkcs8 0.10.2",
  "pkcs8 0.11.0",
  "portable-atomic",
  "ppv-lite86",
@@ -9401,14 +9309,13 @@ dependencies = [
  "prost",
  "quanta",
  "rand 0.10.1",
- "rand 0.8.6",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "regex",
  "regex-automata",
  "regex-syntax",
  "reqwest",
- "rsa 0.10.0-rc.18",
+ "rsa",
  "rustcrypto-ff",
  "rustcrypto-group",
  "rustls",
@@ -9423,13 +9330,10 @@ dependencies = [
  "sha1 0.11.0",
  "sha2 0.10.9",
  "sha2 0.11.0",
- "signature 2.2.0",
  "signature 3.0.0",
  "sketches-ddsketch",
  "slab",
  "smallvec",
- "spin 0.9.8",
- "spki 0.7.3",
  "spki 0.8.0",
  "sqlx-core",
  "sqlx-sqlite",

@@ -5239,10 +5239,6 @@
           "packageId": "group"
         },
         {
-          "name": "hkdf",
-          "packageId": "hkdf 0.12.4"
-        },
-        {
           "name": "pem-rfc7468",
           "packageId": "pem-rfc7468 0.7.0"
         },
@@ -5271,7 +5267,6 @@
         "alloc",
         "arithmetic",
         "digest",
-        "ecdh",
         "ff",
         "group",
         "hazmat",
@@ -5316,7 +5311,7 @@
         },
         {
           "name": "hkdf",
-          "packageId": "hkdf 0.13.0"
+          "packageId": "hkdf"
         },
         {
           "name": "hybrid-array",
@@ -6801,28 +6796,7 @@
         "KokaKiwi <kokakiwi@kokakiwi.net>"
       ]
     },
-    "hkdf 0.12.4": {
-      "crateName": "hkdf",
-      "version": "0.12.4",
-      "edition": "2018",
-      "sha256": "1xxxzcarz151p1b858yn5skmhyrvn8fs4ivx5km3i1kjmnr8wpvv",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "hmac",
-          "packageId": "hmac 0.12.1"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "RustCrypto Developers"
-      ]
-    },
-    "hkdf 0.13.0": {
+    "hkdf": {
       "crateName": "hkdf",
       "version": "0.13.0",
       "edition": "2024",
@@ -8367,12 +8341,12 @@
       },
       "dependencies": [
         {
-          "name": "base64",
-          "packageId": "base64"
+          "name": "aws-lc-rs",
+          "packageId": "aws-lc-rs"
         },
         {
-          "name": "ed25519-dalek",
-          "packageId": "ed25519-dalek 2.2.0"
+          "name": "base64",
+          "packageId": "base64"
         },
         {
           "name": "getrandom",
@@ -8380,29 +8354,9 @@
           "target": "cfg(target_arch = \"wasm32\")"
         },
         {
-          "name": "hmac",
-          "packageId": "hmac 0.12.1"
-        },
-        {
           "name": "js-sys",
           "packageId": "js-sys",
           "target": "cfg(target_arch = \"wasm32\")"
-        },
-        {
-          "name": "p256",
-          "packageId": "p256 0.13.2"
-        },
-        {
-          "name": "p384",
-          "packageId": "p384 0.13.1"
-        },
-        {
-          "name": "rand",
-          "packageId": "rand 0.8.5"
-        },
-        {
-          "name": "rsa",
-          "packageId": "rsa 0.9.10"
         },
         {
           "name": "serde",
@@ -8413,23 +8367,13 @@
           "packageId": "serde_json"
         },
         {
-          "name": "sha2",
-          "packageId": "sha2 0.10.9"
-        },
-        {
           "name": "signature",
           "packageId": "signature 2.2.0"
         }
       ],
       "resolvedDefaultFeatures": [
-        "ed25519-dalek",
-        "hmac",
-        "p256",
-        "p384",
-        "rand",
-        "rsa",
-        "rust_crypto",
-        "sha2"
+        "aws-lc-rs",
+        "aws_lc_rs"
       ],
       "libCrateTypes": [
         "lib"
@@ -8903,16 +8847,6 @@
       "source": {
         "type": "crates-io"
       },
-      "dependencies": [
-        {
-          "name": "spin",
-          "packageId": "spin 0.9.8"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "spin",
-        "spin_no_std"
-      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -9799,63 +9733,6 @@
         "The Nushell Project Developers"
       ]
     },
-    "num-bigint-dig": {
-      "crateName": "num-bigint-dig",
-      "version": "0.8.6",
-      "edition": "2021",
-      "sha256": "1dxh3d8pzjc5k0kpy8gy2qhhhqs7zw8a7m564zl3ib8gcjkdsqg6",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "lazy_static",
-          "packageId": "lazy_static"
-        },
-        {
-          "name": "libm",
-          "packageId": "libm"
-        },
-        {
-          "name": "num-integer",
-          "packageId": "num-integer"
-        },
-        {
-          "name": "num-iter",
-          "packageId": "num-iter"
-        },
-        {
-          "name": "num-traits",
-          "packageId": "num-traits"
-        },
-        {
-          "name": "rand",
-          "packageId": "rand 0.8.5"
-        },
-        {
-          "name": "smallvec",
-          "packageId": "smallvec"
-        },
-        {
-          "name": "zeroize",
-          "packageId": "zeroize"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "i128",
-        "prime",
-        "rand",
-        "u64_digit",
-        "zeroize"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "dignifiedquire <dignifiedquire@gmail.com>",
-        "The Rust Project Developers"
-      ]
-    },
     "num-conv": {
       "crateName": "num-conv",
       "version": "0.2.0",
@@ -9889,37 +9766,6 @@
         "default",
         "i128",
         "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "The Rust Project Developers"
-      ]
-    },
-    "num-iter": {
-      "crateName": "num-iter",
-      "version": "0.1.45",
-      "edition": "2018",
-      "sha256": "1gzm7vc5g9qsjjl3bqk9rz1h6raxhygbrcpbfl04swlh0i506a8l",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "num-integer",
-          "packageId": "num-integer"
-        },
-        {
-          "name": "num-traits",
-          "packageId": "num-traits"
-        }
-      ],
-      "buildDependencies": [
-        {
-          "name": "autocfg",
-          "packageId": "autocfg"
-        }
       ],
       "libCrateTypes": [
         "lib"
@@ -10454,56 +10300,7 @@
         "RustCrypto Developers"
       ]
     },
-    "p384 0.13.1": {
-      "crateName": "p384",
-      "version": "0.13.1",
-      "edition": "2021",
-      "sha256": "1dnnp133mbpp72mfss3fhm8wx3yp3p3abdhlix27v92j19kz2hpy",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "ecdsa",
-          "packageId": "ecdsa 0.16.9",
-          "rename": "ecdsa_core"
-        },
-        {
-          "name": "elliptic-curve",
-          "packageId": "elliptic-curve 0.13.8"
-        },
-        {
-          "name": "primeorder",
-          "packageId": "primeorder 0.13.6"
-        },
-        {
-          "name": "sha2",
-          "packageId": "sha2 0.10.9"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "alloc",
-        "arithmetic",
-        "default",
-        "digest",
-        "ecdh",
-        "ecdsa",
-        "ecdsa-core",
-        "pem",
-        "pkcs8",
-        "sha2",
-        "sha384",
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "RustCrypto Developers",
-        "Frank Denis <github@pureftpd.org>"
-      ]
-    },
-    "p384 0.14.0-rc.9": {
+    "p384": {
       "crateName": "p384",
       "version": "0.14.0-rc.9",
       "edition": "2024",
@@ -11173,43 +10970,7 @@
         "Josef Brandl <mail@josefbrandl.de>"
       ]
     },
-    "pkcs1 0.7.5": {
-      "crateName": "pkcs1",
-      "version": "0.7.5",
-      "edition": "2021",
-      "sha256": "0zz4mil3nchnxljdfs2k5ab1cjqn7kq5lqp62n9qfix01zqvkzy8",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "der",
-          "packageId": "der 0.7.10"
-        },
-        {
-          "name": "pkcs8",
-          "packageId": "pkcs8 0.10.2"
-        },
-        {
-          "name": "spki",
-          "packageId": "spki 0.7.3"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "alloc",
-        "pem",
-        "pkcs8",
-        "std",
-        "zeroize"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "RustCrypto Developers"
-      ]
-    },
-    "pkcs1 0.8.0-rc.4": {
+    "pkcs1": {
       "crateName": "pkcs1",
       "version": "0.8.0-rc.4",
       "edition": "2024",
@@ -12332,46 +12093,6 @@
         "The Rust Project Developers"
       ]
     },
-    "rand 0.8.5": {
-      "crateName": "rand",
-      "version": "0.8.5",
-      "edition": "2018",
-      "sha256": "013l6931nn7gkc23jz5mm3qdhf93jjf0fg64nz2lp4i51qd8vbrl",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "libc",
-          "packageId": "libc",
-          "target": "cfg(unix)"
-        },
-        {
-          "name": "rand_chacha",
-          "packageId": "rand_chacha 0.3.1"
-        },
-        {
-          "name": "rand_core",
-          "packageId": "rand_core 0.6.4"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "alloc",
-        "default",
-        "getrandom",
-        "libc",
-        "rand_chacha",
-        "std",
-        "std_rng"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "The Rand Project Developers",
-        "The Rust Project Developers"
-      ]
-    },
     "rand 0.9.2": {
       "crateName": "rand",
       "version": "0.9.2",
@@ -12383,7 +12104,7 @@
       "dependencies": [
         {
           "name": "rand_chacha",
-          "packageId": "rand_chacha 0.9.0"
+          "packageId": "rand_chacha"
         },
         {
           "name": "rand_core",
@@ -12407,37 +12128,7 @@
         "The Rust Project Developers"
       ]
     },
-    "rand_chacha 0.3.1": {
-      "crateName": "rand_chacha",
-      "version": "0.3.1",
-      "edition": "2018",
-      "sha256": "123x2adin558xbhvqb8w4f6syjsdkmqff8cxwhmjacpsl1ihmhg6",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "ppv-lite86",
-          "packageId": "ppv-lite86"
-        },
-        {
-          "name": "rand_core",
-          "packageId": "rand_core 0.6.4"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "The Rand Project Developers",
-        "The Rust Project Developers",
-        "The CryptoCorrosion Contributors"
-      ]
-    },
-    "rand_chacha 0.9.0": {
+    "rand_chacha": {
       "crateName": "rand_chacha",
       "version": "0.9.0",
       "edition": "2021",
@@ -13670,7 +13361,7 @@
         }
       ]
     },
-    "rsa 0.10.0-rc.18": {
+    "rsa": {
       "crateName": "rsa",
       "version": "0.10.0-rc.18",
       "edition": "2021",
@@ -13697,7 +13388,7 @@
         },
         {
           "name": "pkcs1",
-          "packageId": "pkcs1 0.8.0-rc.4"
+          "packageId": "pkcs1"
         },
         {
           "name": "pkcs8",
@@ -13729,79 +13420,6 @@
         "encoding",
         "sha2",
         "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "RustCrypto Developers",
-        "dignifiedquire <dignifiedquire@gmail.com>"
-      ]
-    },
-    "rsa 0.9.10": {
-      "crateName": "rsa",
-      "version": "0.9.10",
-      "edition": "2021",
-      "sha256": "0bdikdwhcvl1gfh4637m5rdw3fgcl752aiygvzmwlgc8yl1kymxq",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "const-oid",
-          "packageId": "const-oid 0.9.6"
-        },
-        {
-          "name": "digest",
-          "packageId": "digest 0.10.7"
-        },
-        {
-          "name": "num-bigint-dig",
-          "packageId": "num-bigint-dig",
-          "rename": "num_bigint"
-        },
-        {
-          "name": "num-integer",
-          "packageId": "num-integer"
-        },
-        {
-          "name": "num-traits",
-          "packageId": "num-traits"
-        },
-        {
-          "name": "pkcs1",
-          "packageId": "pkcs1 0.7.5"
-        },
-        {
-          "name": "pkcs8",
-          "packageId": "pkcs8 0.10.2"
-        },
-        {
-          "name": "rand_core",
-          "packageId": "rand_core 0.6.4"
-        },
-        {
-          "name": "signature",
-          "packageId": "signature 2.2.0"
-        },
-        {
-          "name": "spki",
-          "packageId": "spki 0.7.3"
-        },
-        {
-          "name": "subtle",
-          "packageId": "subtle"
-        },
-        {
-          "name": "zeroize",
-          "packageId": "zeroize"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "default",
-        "pem",
-        "std",
-        "u64_digit"
       ],
       "libCrateTypes": [
         "lib"
@@ -15105,7 +14723,6 @@
       ],
       "resolvedDefaultFeatures": [
         "default",
-        "oid",
         "std"
       ],
       "libCrateTypes": [
@@ -16037,7 +15654,7 @@
         },
         {
           "name": "hkdf",
-          "packageId": "hkdf 0.13.0"
+          "packageId": "hkdf"
         },
         {
           "name": "hmac",
@@ -16383,7 +16000,7 @@
         },
         {
           "name": "p384",
-          "packageId": "p384 0.14.0-rc.9"
+          "packageId": "p384"
         },
         {
           "name": "p521",
@@ -16395,7 +16012,7 @@
         },
         {
           "name": "rsa",
-          "packageId": "rsa 0.10.0-rc.18"
+          "packageId": "rsa"
         },
         {
           "name": "sec1",
@@ -20236,10 +19853,6 @@
           "packageId": "curve25519-dalek 5.0.0-pre.6"
         },
         {
-          "name": "der",
-          "packageId": "der 0.7.10"
-        },
-        {
           "name": "digest",
           "packageId": "digest 0.10.7",
           "rename": "digest_93f6ce9d446188ac"
@@ -20296,10 +19909,6 @@
         {
           "name": "futures-util",
           "packageId": "futures-util"
-        },
-        {
-          "name": "generic-array",
-          "packageId": "generic-array"
         },
         {
           "name": "getrandom",
@@ -20398,12 +20007,12 @@
           "packageId": "kube-core"
         },
         {
-          "name": "lazy_static",
-          "packageId": "lazy_static"
-        },
-        {
           "name": "libc",
           "packageId": "libc"
+        },
+        {
+          "name": "libm",
+          "packageId": "libm"
         },
         {
           "name": "libsqlite3-sys",
@@ -20463,7 +20072,7 @@
         },
         {
           "name": "p384",
-          "packageId": "p384 0.14.0-rc.9"
+          "packageId": "p384"
         },
         {
           "name": "p521",
@@ -20479,13 +20088,7 @@
         },
         {
           "name": "pkcs8",
-          "packageId": "pkcs8 0.10.2",
-          "rename": "pkcs8_93f6ce9d446188ac"
-        },
-        {
-          "name": "pkcs8",
-          "packageId": "pkcs8 0.11.0",
-          "rename": "pkcs8_a6292c17cd707f01"
+          "packageId": "pkcs8 0.11.0"
         },
         {
           "name": "portable-atomic",
@@ -20514,17 +20117,12 @@
         },
         {
           "name": "rand",
-          "packageId": "rand 0.8.5",
-          "rename": "rand_c38e5c1d305a1b54"
-        },
-        {
-          "name": "rand",
           "packageId": "rand 0.9.2",
           "rename": "rand_274715c4dabd11b0"
         },
         {
           "name": "rand_chacha",
-          "packageId": "rand_chacha 0.9.0"
+          "packageId": "rand_chacha"
         },
         {
           "name": "regex",
@@ -20544,7 +20142,7 @@
         },
         {
           "name": "rsa",
-          "packageId": "rsa 0.10.0-rc.18"
+          "packageId": "rsa"
         },
         {
           "name": "rustcrypto-ff",
@@ -20608,13 +20206,7 @@
         },
         {
           "name": "signature",
-          "packageId": "signature 2.2.0",
-          "rename": "signature_f595c2ba2a3f28df"
-        },
-        {
-          "name": "signature",
-          "packageId": "signature 3.0.0",
-          "rename": "signature_7b89eefb6aaa9bf3"
+          "packageId": "signature 3.0.0"
         },
         {
           "name": "sketches-ddsketch",
@@ -20629,18 +20221,8 @@
           "packageId": "smallvec"
         },
         {
-          "name": "spin",
-          "packageId": "spin 0.9.8"
-        },
-        {
           "name": "spki",
-          "packageId": "spki 0.7.3",
-          "rename": "spki_ca01ad9e24f5d932"
-        },
-        {
-          "name": "spki",
-          "packageId": "spki 0.8.0",
-          "rename": "spki_c38e5c1d305a1b54"
+          "packageId": "spki 0.8.0"
         },
         {
           "name": "sqlx-core",
@@ -20847,10 +20429,6 @@
           "packageId": "curve25519-dalek 5.0.0-pre.6"
         },
         {
-          "name": "der",
-          "packageId": "der 0.7.10"
-        },
-        {
           "name": "digest",
           "packageId": "digest 0.10.7",
           "rename": "digest_93f6ce9d446188ac"
@@ -20907,10 +20485,6 @@
         {
           "name": "futures-util",
           "packageId": "futures-util"
-        },
-        {
-          "name": "generic-array",
-          "packageId": "generic-array"
         },
         {
           "name": "getrandom",
@@ -21009,12 +20583,12 @@
           "packageId": "kube-core"
         },
         {
-          "name": "lazy_static",
-          "packageId": "lazy_static"
-        },
-        {
           "name": "libc",
           "packageId": "libc"
+        },
+        {
+          "name": "libm",
+          "packageId": "libm"
         },
         {
           "name": "libsqlite3-sys",
@@ -21074,7 +20648,7 @@
         },
         {
           "name": "p384",
-          "packageId": "p384 0.14.0-rc.9"
+          "packageId": "p384"
         },
         {
           "name": "p521",
@@ -21090,13 +20664,7 @@
         },
         {
           "name": "pkcs8",
-          "packageId": "pkcs8 0.10.2",
-          "rename": "pkcs8_93f6ce9d446188ac"
-        },
-        {
-          "name": "pkcs8",
-          "packageId": "pkcs8 0.11.0",
-          "rename": "pkcs8_a6292c17cd707f01"
+          "packageId": "pkcs8 0.11.0"
         },
         {
           "name": "portable-atomic",
@@ -21125,17 +20693,12 @@
         },
         {
           "name": "rand",
-          "packageId": "rand 0.8.5",
-          "rename": "rand_c38e5c1d305a1b54"
-        },
-        {
-          "name": "rand",
           "packageId": "rand 0.9.2",
           "rename": "rand_274715c4dabd11b0"
         },
         {
           "name": "rand_chacha",
-          "packageId": "rand_chacha 0.9.0"
+          "packageId": "rand_chacha"
         },
         {
           "name": "regex",
@@ -21155,7 +20718,7 @@
         },
         {
           "name": "rsa",
-          "packageId": "rsa 0.10.0-rc.18"
+          "packageId": "rsa"
         },
         {
           "name": "rustcrypto-ff",
@@ -21219,13 +20782,7 @@
         },
         {
           "name": "signature",
-          "packageId": "signature 2.2.0",
-          "rename": "signature_f595c2ba2a3f28df"
-        },
-        {
-          "name": "signature",
-          "packageId": "signature 3.0.0",
-          "rename": "signature_7b89eefb6aaa9bf3"
+          "packageId": "signature 3.0.0"
         },
         {
           "name": "sketches-ddsketch",
@@ -21240,18 +20797,8 @@
           "packageId": "smallvec"
         },
         {
-          "name": "spin",
-          "packageId": "spin 0.9.8"
-        },
-        {
           "name": "spki",
-          "packageId": "spki 0.7.3",
-          "rename": "spki_ca01ad9e24f5d932"
-        },
-        {
-          "name": "spki",
-          "packageId": "spki 0.8.0",
-          "rename": "spki_c38e5c1d305a1b54"
+          "packageId": "spki 0.8.0"
         },
         {
           "name": "sqlx-core",

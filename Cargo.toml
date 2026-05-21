@@ -196,11 +196,16 @@ ed25519-dalek = { version = "2", features = ["pkcs8"] }
 # EdDSA (ed25519) signing — scheduler/store/controller verify the gateway's
 # signature + expiry on every gRPC call. The signing key lives in a K8s
 # Secret; the public key is distributed via ConfigMap.
-# v10: crypto is trait-based; must pick a backend. rust_crypto (pure-Rust,
-# includes ed25519-dalek which we already depend on) over aws_lc_rs (adds
-# a C dep + build-time bindgen). use_pem is default but we only use DER.
+# v10: crypto is trait-based; must pick a backend. aws_lc_rs: every binary
+# already links aws-lc-rs (rustls CryptoProvider, aws-sdk, russh), so the
+# original "rust_crypto avoids a C dep + bindgen" rationale is gone — and
+# rust_crypto pulled the whole RustCrypto family set (rsa, p256/p384,
+# rand 0.8, a second ed25519-dalek) for algorithms we never mint. Key
+# formats at our call sites are backend-agnostic: PKCS#8 DER on sign,
+# raw 32-byte key on verify (rio-auth/src/jwt.rs). use_pem stays off —
+# we only use DER.
 jsonwebtoken = { version = "10", default-features = false, features = [
-  "rust_crypto",
+  "aws_lc_rs",
 ] }
 
 # --- phase2c: priority scheduling ---
