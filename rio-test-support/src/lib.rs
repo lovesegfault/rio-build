@@ -1,6 +1,7 @@
 //! Test harness for rio workspace integration tests.
 //!
 //! - [`pg`]: ephemeral PostgreSQL bootstrap
+//! - [`jail`]: process-global env/cwd test sandbox (Jail)
 //! - [`wire`]: Nix wire protocol client helpers (handshake, setOptions, stderr drain)
 //! - [`grpc`]: mock gRPC services and server spawn helpers
 //! - [`fixtures`]: NAR and PathInfo builders
@@ -8,10 +9,12 @@
 //! - [`metrics`]: test-only `metrics::Recorder` impls (DescribedNames, CountingRecorder)
 //! - [`config`]: figment::Jail standing-guard test macros (jail_roundtrip!, jail_defaults!)
 
-// `pg` is unconditional so xtask (default-features = false) can reuse
-// PgServer::get() without pulling rio-nix/rio-proto/tonic/kube. Every
-// other module is gated on `full` (the default).
+// `pg` and `jail` are unconditional so xtask (default-features = false) can
+// reuse them without pulling rio-nix/rio-proto/tonic/kube. Every other module
+// is gated on `full` (the default).
+pub mod jail;
 pub mod pg;
+pub use jail::Jail;
 
 #[cfg(feature = "full")]
 pub mod config;
