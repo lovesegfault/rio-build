@@ -43,16 +43,21 @@
 (* armed -- the stale believer is within 2*MaxSkew of its own self-fence   *)
 (* deadline, or its snapshot is stale (next renew 409s), or its snapshot   *)
 (* already names the thief, or it was deposed by a Lease deletion (then    *)
-(* the bound degrades to its own self-fence deadline, Ttl + Renew, since   *)
+(* the bound degrades to its own self-fence deadline, FenceAfter + Renew,  *)
+(* since                                                                   *)
 (* no thief ever measured its staleness). Combined with LoopInterval (the  *)
 (* loop runs every Renew ticks), the window is bounded to one loop         *)
 (* iteration plus the skew penalty (or one lease lifetime for a deletion   *)
 (* victim). Weakened test: relaxing Steal's staleness threshold from       *)
-(* > Ttl to >= 0 violates it at depth 5 -- the > Ttl threshold is          *)
-(* exactly what guarantees the victim is already at its own fence          *)
+(* > StealAfter to >= 0 violates it (BFS terminates at depth 12) -- the    *)
+(* > StealAfter threshold is exactly what guarantees the victim is         *)
+(* already at (or within 2*MaxSkew - separation of) its own fence          *)
 (* deadline when deposed. Clock skew eats directly into that guarantee     *)
-(* (the 2*MaxSkew term); this is the formal version of the asymmetric-TTL  *)
-(* TODO above LEASE_TTL in rio-lease/src/lib.rs.                           *)
+(* and the fence/steal separation buys it back: at separation >=           *)
+(* Renew + 2*MaxSkew the victim has ALREADY fenced (or its clock has       *)
+(* stopped at the LoopInterval cap) when the thief is first allowed to     *)
+(* steal, and NeverDual (below) holds instead. See the TWO OPERATING       *)
+(* REGIMES note at the end of this header.                                 *)
 (*                                                                         *)
 (* StaleLeaderHasStaleGeneration -- the bridge to                          *)
 (* sched.lease.generation-fence+2: when the dual-belief window is open,    *)
@@ -105,24 +110,45 @@
 (* unblocked); a second deletion per trace (MaxDeletes=2 would cover an    *)
 (* operator deleting the lease twice before the first victim's window      *)
 (* closes -- the claim argument is inductive in genHW so nothing new is    *)
-(* expected, but it is unverified); asymmetric TTLs (if the lib.rs TODO    *)
-(* lands, StealTtl splits from FenceTtl and the 2*MaxSkew penalty in       *)
-(* BoundedDualLeadership shrinks).                                         *)
+(* expected, but it is unverified).                                        *)
+(*                                                                         *)
+(* TWO OPERATING REGIMES (the asymmetric-TTL split): FenceAfter and        *)
+(* StealAfter are separate constants. A Leading victim's measured          *)
+(* staleness on a thief's clock is at most FenceAfter + Renew + 2*MaxSkew  *)
+(* (the LoopInterval Tick cap plus the round-trip skew), so:               *)
+(* When StealAfter - FenceAfter < Renew + 2*MaxSkew (the base and          *)
+(* deletion cfgs: zero separation), a thief can clear its steal threshold  *)
+(* while the victim still believes -- dual belief is reachable and         *)
+(* BoundedDualLeadership is the operative property. When StealAfter -      *)
+(* FenceAfter >= Renew + 2*MaxSkew (LeaderElectionAsymmetric.cfg,          *)
+(* separation 3 = 1 + 2 with equality), the steal threshold is             *)
+(* unreachable while the victim still believes and NeverDual holds: no     *)
+(* dual-belief state exists at all. Both boundaries are measured: the      *)
+(* separation-2 run violates NeverDual, the separation-3 run proves it.    *)
 (***************************************************************************)
 
 EXTENDS Integers, FiniteSets, TLC
 
 CONSTANTS Nodes,    \* set of node identities, e.g. {n1, n2, n3}
           NULL,     \* model value for "no holder" / "no snapshot"
-          Ttl,      \* LEASE_TTL in ticks
-          Renew,    \* RENEW_INTERVAL in ticks (Ttl/Renew ~= 3)
+          FenceAfter, \* SELF_FENCE_AFTER in ticks: the leader self-fences
+                    \* after this long without a successful round-trip.
+                    \* "The leader deciding it no longer leads."
+          StealAfter, \* STEAL_AFTER in ticks: a follower steals after
+                    \* observing the same rv for this long. "The follower
+                    \* deciding the leader is dead." The two were a single
+                    \* Ttl = LEASE_TTL before the asymmetric-TTL split;
+                    \* StealAfter - FenceAfter is the safety margin that
+                    \* decides which regime a cfg models (see NeverDual).
+          Renew,    \* RENEW_INTERVAL in ticks (FenceAfter/Renew ~= 2-3)
           MaxSkew,  \* clock skew bound
           MaxTime,  \* clock ceiling (state-space bound)
           MaxGen,   \* generation ceiling (state-space bound)
           MaxRv,    \* rv ceiling (state-space bound)
           MaxDeletes \* Lease-object deletions per trace (0 = fault disabled)
 
-ASSUME Ttl \in Nat /\ Renew \in Nat /\ Renew >= 1 /\ Ttl >= Renew
+ASSUME FenceAfter \in Nat /\ StealAfter \in Nat /\ Renew \in Nat
+       /\ Renew >= 1 /\ FenceAfter >= Renew /\ StealAfter >= FenceAfter
 ASSUME MaxSkew \in Nat /\ MaxTime \in Nat /\ MaxGen \in Nat /\ MaxRv \in Nat
 ASSUME MaxDeletes \in Nat
 
@@ -205,16 +231,27 @@ AtMostOneCASWinner == ~casRace
 \*   stale believer's next loop iteration DISCOVERS the loss -- one of
 \*   its three discovery paths is already armed. The window is therefore
 \*   <= one loop iteration. The paths:
-\*     (1) Self-fence: clocks[stale] - fence[stale] > Ttl - 2*MaxSkew.
-\*         The thief measured > Ttl of staleness on ITS clock before
-\*         stealing; the victim's own fence age is within 2*MaxSkew of
-\*         that, so the victim is at (or within 2*MaxSkew ticks of) its
-\*         own self-fence deadline. The 2*MaxSkew correction is the
-\*         price of per-node clocks -- with a shared clock the bound is
-\*         exactly Ttl. With MaxSkew >= Ttl/2 the disjunct is vacuous
+\*     (1) Self-fence: clocks[stale] - fence[stale] > StealAfter - 2*MaxSkew.
+\*         The thief measured > StealAfter of staleness on ITS clock
+\*         before stealing; the victim's own fence age is within
+\*         2*MaxSkew of that, so the victim's fence age exceeds
+\*         StealAfter - 2*MaxSkew on its own clock. It self-fences at
+\*         FenceAfter. The distance to its deadline is therefore at most
+\*         FenceAfter - (StealAfter - 2*MaxSkew) = 2*MaxSkew - separation.
+\*         With zero separation (the base/deletion cfgs) that is 2*MaxSkew
+\*         -- the victim is within 2*MaxSkew ticks of fencing. With
+\*         separation >= Renew + 2*MaxSkew (the asymmetric cfg) the
+\*         victim is at least Renew ticks PAST its deadline -- beyond the
+\*         LoopInterval slack, so the Tick cap has already forced its
+\*         fence to fire or its clock to stop before the thief's steal
+\*         threshold clears. That is why NeverDual holds there and this
+\*         disjunct never needs to fire. The 2*MaxSkew
+\*         correction is the price of per-node clocks -- with a shared
+\*         clock the victim's fence age is exactly what the thief
+\*         measured. With MaxSkew >= StealAfter/2 the disjunct is vacuous
 \*         (clocks - fence >= 0 always) and the protocol gives no fence
 \*         guarantee -- the steal threshold and the fence threshold are
-\*         only coupled when skew is small relative to Ttl.
+\*         only coupled when skew is small relative to StealAfter.
 \*     (2) 409: snap[stale].rv /= lease.rv -- the snapshot in hand is
 \*         stale, the next PUT gets 409 Conflict, the loop flips to
 \*         Following (the lose transition).
@@ -237,25 +274,47 @@ AtMostOneCASWinner == ~casRace
 \* the stale believer's clock simply stops one tick short of its fence
 \* deadline -- SelfFence is never *enabled*, so weak fairness never
 \* forces it. Adding WF on Tick does not fix this: Tick is disabled at
-\* the MaxTime ceiling, so a Dual window that opens within Ttl of the
-\* ceiling can never accumulate enough ticks to reach the deadline.
+\* the MaxTime ceiling, so a Dual window that opens within FenceAfter of
+\* the ceiling can never accumulate enough ticks to reach the deadline.
 \* "Eventually" is the wrong claim for a bounded model; "the discovery
 \* path is already armed" is the right claim, and it is stronger.
 \*
 \* Deliberately-weakened test (run once during development, NOT in CI):
-\* weakening Steal's staleness guard from `> Ttl` to `>= 0` (steal on
-\* first observation) produces a counterexample at depth 5: n1 acquires,
-\* n2 observes and steals immediately, n1 is deposed with a fresh fence
-\* (clocks - fence = 0) and no snapshot -- no discovery path is armed.
-\* The invariant is what couples the steal threshold to the fence
-\* threshold: a thief may only steal a lease whose holder is already at
-\* (or within 2*MaxSkew of) its own self-fence deadline.
+\* weakening Steal's staleness guard from `> StealAfter` to `>= 0` (steal
+\* on first observation) produces a counterexample at depth 5: n1
+\* acquires, n2 observes and steals immediately, n1 is deposed with a
+\* fresh fence (clocks - fence = 0) and no snapshot -- no discovery path
+\* is armed. The invariant is what couples the steal threshold to the
+\* fence threshold: a thief may only steal a lease whose holder is
+\* already at (or within 2*MaxSkew - (StealAfter - FenceAfter) of) its
+\* own self-fence deadline.
 \* -----------------------------------------------------------------------
 Dual == \E m, n \in Nodes : m /= n /\ state[m] = "Leading" /\ state[n] = "Leading"
 
+\* The healthy-regime invariant: no two replicas ever simultaneously
+\* believe they lead. Holds iff the fence/steal separation covers both
+\* the LoopInterval slack and the round-trip clock skew:
+\*   StealAfter - FenceAfter >= Renew + 2*MaxSkew.
+\* A thief's measured staleness is anchored to the victim's last
+\* completed write (the rv change); the victim's fence is anchored to the
+\* same event (a bare read does not move it -- see Get(n)); the victim's
+\* clock cannot advance more than FenceAfter + Renew past that anchor
+\* while it still believes (the LoopInterval Tick cap); the thief's clock
+\* is within MaxSkew of the victim's and its observation anchor is within
+\* MaxSkew the other way. So the thief's measured staleness while the
+\* victim still believes is at most FenceAfter + Renew + 2*MaxSkew, and a
+\* steal threshold at or above that is unreachable until the victim has
+\* stopped believing. Checked in LeaderElectionAsymmetric.cfg (separation
+\* 3 >= 1 + 2, holds; separation 2, violated -- the boundary is measured
+\* from both sides). Deliberately VIOLATED in the base and deletion cfgs
+\* (zero separation), where it doubles as the non-vacuity probe for
+\* BoundedDualLeadership: dual belief is reachable there, and every
+\* instance has a discovery mechanism armed.
+NeverDual == ~Dual
+
 \* The production loop's tick discipline, stated as a predicate over
-\* states: a Leading node is never more than Ttl + Renew past its last
-\* successful round-trip, because run_lease_loop() checks
+\* states: a Leading node is never more than FenceAfter + Renew past its
+\* last successful round-trip, because run_lease_loop() checks
 \* maybe_self_fence() every RENEW_INTERVAL and cannot skip the check.
 \* This is ENFORCED by Tick(n)'s precondition (see the comment there for
 \* why a precondition and not a state CONSTRAINT); it is listed as an
@@ -264,7 +323,7 @@ Dual == \E m, n \in Nodes : m /= n /\ state[m] = "Leading" /\ state[n] = "Leadin
 \* BoundedDualLeadership failing confusingly one tick past the bound.
 LoopInterval ==
   \A n \in Nodes :
-    (alive[n] /\ state[n] = "Leading") => clocks[n] - fence[n] <= Ttl + Renew
+    (alive[n] /\ state[n] = "Leading") => clocks[n] - fence[n] <= FenceAfter + Renew
 
 BoundedDualLeadership ==
   \A m, n \in Nodes :
@@ -281,7 +340,7 @@ BoundedDualLeadership ==
       \* lease (one of the two normally; both after a deletion) -- has a
       \* discovery mechanism armed:
       /\ \A stale \in {m, n} \ {lease.holder} :
-           \/ clocks[stale] - fence[stale] > Ttl - 2 * MaxSkew
+           \/ clocks[stale] - fence[stale] > StealAfter - 2 * MaxSkew
            \/ /\ snap[stale] /= NULL
               /\ \/ snap[stale].rv /= lease.rv
                  \/ snap[stale].holder /= stale
@@ -294,10 +353,11 @@ BoundedDualLeadership ==
            \*     acquisition, so (2)/(3) have nothing to look at. Its
            \*     window is bounded by its OWN self-fence deadline
            \*     instead: LoopInterval caps a Leading node at
-           \*     Ttl + Renew ticks past its last round-trip and
-           \*     SelfFence is enabled from Ttl + 1, so the window is at
-           \*     most Ttl + Renew (one full lease lifetime) rather than
-           \*     2*MaxSkew + Renew. Weaker, but still finite, and the
+           \*     FenceAfter + Renew ticks past its last round-trip and
+           \*     SelfFence is enabled from FenceAfter + 1, so the window
+           \*     is at most FenceAfter + Renew (one full fence lifetime)
+           \*     rather than 2*MaxSkew + Renew. Weaker, but still
+           \*     finite, and the
            \*     generation fence (StaleLeaderHasStaleGeneration) is
            \*     what protects correctness inside the window. A victim
            \*     that reaches the apiserver before its deadline
@@ -416,7 +476,7 @@ Init ==
 \* The second conjunct encodes the production loop's tick discipline (the
 \* LoopInterval assumption): run_lease_loop() calls maybe_self_fence()
 \* every RENEW_INTERVAL, so a Leading node's clock cannot advance more
-\* than Ttl + Renew past its last successful round-trip -- the loop would
+\* than FenceAfter + Renew past its last successful round-trip -- the loop would
 \* have fenced it first. Encoding this as a Tick precondition (the state
 \* is never generated) rather than a state CONSTRAINT (the state is
 \* generated, checked against invariants, and only then discarded) keeps
@@ -427,7 +487,7 @@ Init ==
 Tick(n) ==
   /\ clocks[n] < MaxTime
   /\ (alive[n] /\ state[n] = "Leading") =>
-       (clocks[n] + 1) - fence[n] <= Ttl + Renew
+       (clocks[n] + 1) - fence[n] <= FenceAfter + Renew
   /\ clocks' = [clocks EXCEPT ![n] = @ + 1]
   /\ UNCHANGED <<lease, alive, state, snap, obs, fence, gen, genHW, acquiredAt,
                  casRace, deletes, delVictims>>
@@ -520,7 +580,7 @@ Steal(n) ==
   /\ \/ snap[n].holder = NULL
      \/ /\ snap[n].holder /= NULL /\ snap[n].holder /= n
         /\ obs[n] /= NULL /\ obs[n].rv = snap[n].rv
-        /\ clocks[n] - obs[n].since > Ttl
+        /\ clocks[n] - obs[n].since > StealAfter
   /\ ReplaceGuard(n)
   /\ lease.gen < MaxGen   \* state-space bound; rv bound is in ReplaceGuard
   \* gen[n] bound is a PRECONDITION (action disabled at the ceiling), not a
@@ -670,14 +730,14 @@ Conflict(n) ==
 \* -----------------------------------------------------------------------
 
 \* maybe_self_fence(): a Leading node that has not had a successful
-\* apiserver round-trip in > Ttl per its OWN clock flips is_leader=false
+\* apiserver round-trip in > FenceAfter per its OWN clock flips is_leader=false
 \* locally, without an apiserver write. The production loop checks this
 \* every RENEW_INTERVAL; the model lets it fire any time the deadline has
 \* passed (a superset of the production schedule -- sound for safety).
 SelfFence(n) ==
   /\ alive[n]
   /\ state[n] = "Leading"
-  /\ clocks[n] - fence[n] > Ttl
+  /\ clocks[n] - fence[n] > FenceAfter
   /\ state' = [state EXCEPT ![n] = "Following"]
   /\ UNCHANGED <<clocks, lease, alive, snap, obs, fence, gen, genHW, acquiredAt,
                  casRace, deletes, delVictims>>
@@ -699,7 +759,7 @@ Crash(n) ==
   /\ UNCHANGED <<clocks, lease, genHW, casRace, deletes, delVictims>>
 
 \* Pod restart. The recovered process has no observation (its first
-\* decide() returns StartObserving and waits a full Ttl before stealing)
+\* decide() returns StartObserving and waits a full StealAfter before stealing)
 \* unless the lease still carries its identity (decide() returns Renew --
 \* the recovered leader re-acquires its own lease without contention).
 Recover(n) ==

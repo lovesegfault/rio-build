@@ -162,5 +162,27 @@ in
       spec = "LeaderElection";
       config = "LeaderElectionDeletion";
     };
+
+    # The same model in the HEALTHY regime: the fence/steal separation
+    # the asymmetric-TTL change gives production (the leader self-fences
+    # at LEASE_TTL - FENCE_MARGIN, a follower steals at LEASE_TTL +
+    # FENCE_MARGIN). The base and deletion cfgs above model the DEGRADED
+    # regime (zero separation — the pre-asymmetric constants, or a
+    # deployment whose clock skew exceeds the margin): dual belief is
+    # reachable there and BoundedDualLeadership proves every instance has
+    # a discovery mechanism armed. This cfg proves the stronger NeverDual
+    # — no two replicas ever simultaneously believe they lead — when
+    # StealAfter - FenceAfter >= Renew + 2*MaxSkew (production:
+    # 2*FENCE_MARGIN >= RENEW_INTERVAL + 2*clock_skew, an 8s separation
+    # against a 5s renew interval leaves a 1.5s skew budget). The
+    # boundary is measured from both sides: separation 3 holds,
+    # separation 2 is violated. The condition only became provable once
+    # the model anchored the self-fence clock to the last completed
+    # write rather than any read — see Get(n)'s comment in the model.
+    tla-leader-election-asymmetric = mkTlcCheck {
+      name = "leader-election-asymmetric";
+      spec = "LeaderElection";
+      config = "LeaderElectionAsymmetric";
+    };
   };
 }
