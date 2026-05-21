@@ -637,6 +637,24 @@ Steal(n) ==
 \*            our own pre-crash incarnation -- claimed higher); a floor AT
 \*            it is our own row and is retained.
 \*
+\* The collapse is GATED ON THE ACQUIRE EDGE (state[n] = "Following" in
+\* the pre-state): production's claim loop lives in
+\* handle_leader_acquired, which runs on the LeaderAcquired actor
+\* message, which the lease loop sends only on the was_leading=false ->
+\* now_leading=true transition. A steady-state renew (was_leading stays
+\* true) never re-runs recovery and never touches the Arc or the claims
+\* ledger. The gate is invisible without fault injection: a Leading node
+\* that can pass ReplaceGuard has a current snapshot showing itself as
+\* holder, so nobody has stolen -- and therefore nobody has claimed --
+\* since its own acquisition, so genHW = gen[n] = entry = seeded and the
+\* un-gated steady-state branch was already a provable no-op (the
+\* bit-for-bit state-count regression across all three cfgs is the
+\* proof). The gate exists for the PG fault model: an un-gated update
+\* would heal a FAILED claim (genHW < gen[n] for a Leading node) on the
+\* next steady-state renew, modeling a ledger retry that production only
+\* performs on the next acquire edge (a self-fence false alarm or a
+\* crash recovery re-runs handle_leader_acquired; a quiet term does not).
+\*
 \* The three cases, each pinned by a TLC run:
 \*   - SelfFence false alarm (never crashed): the Arc still holds our
 \*     claimed generation, which equals genHW while we hold the lease --
@@ -686,11 +704,14 @@ RenewLease(n) ==
   /\ alive[n]
   /\ snap[n] /= NULL /\ snap[n].holder = n
   /\ ReplaceGuard(n)
-  /\ seeded <= MaxGen
+  \* The generation ceiling only constrains the edge branch -- a
+  \* steady-state renew computes no new generation and must not be
+  \* disabled at the ceiling.
+  /\ (state[n] = "Following") => seeded <= MaxGen
   /\ lease' = [lease EXCEPT !.rv = snap[n].rv + 1]
   /\ state' = [state EXCEPT ![n] = "Leading"]
-  /\ gen'   = [gen EXCEPT ![n] = seeded]
-  /\ genHW' = IF seeded > genHW THEN seeded ELSE genHW
+  /\ gen'   = [gen EXCEPT ![n] = IF state[n] = "Following" THEN seeded ELSE @]
+  /\ genHW' = IF state[n] = "Following" /\ seeded > genHW THEN seeded ELSE genHW
   /\ fence' = [fence EXCEPT ![n] = clocks[n]]
   /\ snap'  = [snap  EXCEPT ![n] = NULL]
   /\ UNCHANGED <<clocks, alive, obs, acquiredAt, deletes, delVictims>>
