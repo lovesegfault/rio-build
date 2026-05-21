@@ -772,12 +772,12 @@ let
               timeout=90,
           )
 
-          # ── leadership recovered within TTL + slack ───────────────────
+          # ── leadership recovered within the steal threshold + slack ───
           # holderIdentity is NEVER cleared on this path (no step_down).
           # It stays = old_leader the whole time; what changes is WHO is
           # renewing it. renew_age_secs() going fresh again proves a live
           # process (restarted container OR standby post-steal) is
-          # writing. TTL=15s + 5s poll + init slack → 30s.
+          # writing.
           k3s_server.wait_until_succeeds(
               "h=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
               "-o jsonpath='{.spec.holderIdentity}'); "
@@ -786,12 +786,18 @@ let
           )
           # And renewing (not just a stale holder string). renewTime
           # advancing past renew_before proves a LIVE process wrote
-          # post-kill; THEN age<10 proves it's fresh.
+          # post-kill; THEN age<10 proves it's fresh. Structural floor:
+          # the restarted container renews as itself in ~5-15s (fast
+          # path), but the FALLBACK is the standby waiting out the
+          # staleness threshold — STEAL_AFTER=19s + 5s poll + init slack
+          # ≈ 25-30s — and under builder CPU contention the container
+          # restart can lose to the fallback. Budget for the tail
+          # (5x the slow path), not the typical.
           k3s_server.wait_until_succeeds(
               "test \"$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
               "-o jsonpath='{.spec.renewTime}')\" "
               f"!= '{renew_before}'",
-              timeout=30,
+              timeout=120,
           )
           age = renew_age_secs()
           assert age < 10, (
