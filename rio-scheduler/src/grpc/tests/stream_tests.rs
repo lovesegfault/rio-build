@@ -693,6 +693,114 @@ async fn test_log_batch_rejected_paths_do_not_consume_cap() -> anyhow::Result<()
     Ok(())
 }
 
+/// bug_003 (round 8): an oversized worker-supplied `derivation_path` is
+/// dropped by the `MAX_DERIVATION_PATH_LEN` bound BEFORE the binding
+/// gate. The attack shape is `"{H}-" + <megabytes>` for a legitimately
+/// assigned `{H}`: `drv_log_hash` collapses the alias back to `{H}`, so
+/// `push_for` accepts it and its full string is cloned into the recv
+/// task's `seen_drvs` set (~2 GiB pinned per stream at the proto's
+/// 256 MiB message cap × the 8-entry count cap). Pre-fix, the 8
+/// oversized aliases below each land a line in the `atk` buffer (9
+/// lines total); post-fix the length check drops them first (1 line).
+/// A path of exactly `MAX_DERIVATION_PATH_LEN` bytes is still accepted
+/// (boundary).
+// r[verify sched.log.path-length]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_log_batch_oversized_path_rejected_before_gate() -> anyhow::Result<()> {
+    let (_db, grpc, _handle, _actor_task) = setup_grpc().await;
+    let log_buffers = grpc.log_buffers();
+    let router = tonic::transport::Server::builder().add_service(ExecutorServiceServer::new(grpc));
+    let (addr, _server) = rio_test_support::grpc::spawn_grpc_server(router).await;
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    let mut worker_client = ExecutorServiceClient::new(channel);
+
+    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::ExecutorMessage>(32);
+    stream_tx
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::Register(
+                rio_proto::types::ExecutorRegister {
+                    executor_id: "len-worker".into(),
+                },
+            )),
+        })
+        .await?;
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
+    let mut inbound = worker_client.build_execution(outbound).await?.into_inner();
+
+    let send_batch = |path: String, line: &'static [u8]| {
+        let stream_tx = stream_tx.clone();
+        async move {
+            stream_tx
+                .send(rio_proto::types::ExecutorMessage {
+                    msg: Some(rio_proto::types::executor_message::Msg::LogBatch(
+                        rio_proto::types::BuildLogBatch {
+                            derivation_path: path,
+                            lines: vec![line.to_vec()],
+                            first_line_number: 0,
+                            executor_id: "len-worker".into(),
+                        },
+                    )),
+                })
+                .await
+        }
+    };
+
+    // Target drv, stamped as if `assign_to_worker` had run. Key `atk`
+    // (distinct from `bdy` below — drv_log_hash takes the part before
+    // the first `-`; bug_016).
+    let atk = "/nix/store/atk-real.drv".to_string();
+    log_buffers.set_exec(&atk, uuid::Uuid::now_v7(), "len-worker");
+    send_batch(atk.clone(), b"legit").await?;
+
+    // 8 distinct oversized aliases of the SAME assigned drv. Each
+    // normalizes to `atk` (passes the binding gate) and is a distinct
+    // string (a distinct ~620-byte `seen_drvs` entry pre-fix). Each
+    // exceeds MAX_DERIVATION_PATH_LEN, so the length check drops it
+    // before the cap check, the gate, and the insert.
+    for i in 0..8 {
+        let alias = format!("/nix/store/atk-{i}{}.drv", "e".repeat(600));
+        assert!(alias.len() > 512, "fixture must exceed the bound");
+        send_batch(alias, b"evil").await?;
+    }
+
+    // Boundary: a stamped path of EXACTLY MAX_DERIVATION_PATH_LEN bytes
+    // is accepted. Sent last → by FIFO, when its line lands the 8
+    // oversized batches above were processed (and dropped).
+    let bdy = format!("/nix/store/bdy-{}.drv", "a".repeat(493));
+    assert_eq!(bdy.len(), 512, "boundary fixture must be exactly the bound");
+    log_buffers.set_exec(&bdy, uuid::Uuid::now_v7(), "len-worker");
+    send_batch(bdy.clone(), b"boundary").await?;
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while log_buffers
+            .read_since(&bdy, 0)
+            .is_none_or(|v| !v.iter().any(|(_, l)| l == b"boundary"))
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("boundary-length batch must land — exactly MAX_DERIVATION_PATH_LEN is accepted");
+
+    let atk_lines = log_buffers
+        .read_since(&atk, 0)
+        .expect("target buffer must exist");
+    assert_eq!(
+        atk_lines.len(),
+        1,
+        "target buffer must hold only the legitimate batch's line — an oversized \
+         `{{H}}-<garbage>` alias normalizes to the same key and would land here \
+         if the length bound did not reject it before the binding gate"
+    );
+    assert_eq!(atk_lines[0].1, b"legit");
+
+    drop(stream_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(2), inbound.next()).await;
+    Ok(())
+}
+
 /// bug_077 / `r[sec.executor.identity-token]`: when the HMAC key is
 /// configured, `BuildExecution` rejects without a valid
 /// `x-rio-executor-token`, and `Heartbeat` rejects when the body

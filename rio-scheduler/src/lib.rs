@@ -328,15 +328,18 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_log_batches_rejected_total",
-        "BuildLogBatch dropped by the (executor, drv) binding check. \
-         Labeled by reason: no_assignment | unstamped | executor_mismatch."
+        "BuildLogBatch dropped by the (executor, drv) binding check or the \
+         derivation_path length bound. \
+         Labeled by reason: no_assignment | unstamped | executor_mismatch | path_too_long."
     );
     describe_counter!(
         "rio_scheduler_phases_rejected_total",
-        "BuildPhase dropped by the actor-side (status, executor) binding check. \
+        "BuildPhase dropped by the actor-side (status, executor) binding check \
+         or the recv-side derivation_path length bound. \
          Either the named derivation has no active (Assigned|Running) assignment, \
-         or the calling stream is not the assigned executor. \
-         Labeled by reason: not_active | no_assignment | executor_mismatch."
+         the calling stream is not the assigned executor, or the path exceeds \
+         MAX_DERIVATION_PATH_LEN. \
+         Labeled by reason: not_active | no_assignment | executor_mismatch | path_too_long."
     );
     describe_counter!(
         "rio_scheduler_log_gc_swept_total",

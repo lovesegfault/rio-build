@@ -204,7 +204,25 @@ attacker-controlled text into another tenant's `nix build -L` progress
 display via the gateway's `SetPhase` relay (cosmetic only --- no log or PG
 write). Dropped phase updates increment
 #(refs.metric)("rio_scheduler_phases_rejected_total"), labeled by reason
-(`not_active` | `no_assignment` | `executor_mismatch`).
+(`not_active` | `no_assignment` | `executor_mismatch` | `path_too_long`).
+
+#r("sched.log.path-length")[
+  The `BuildExecution` recv loop MUST drop any `BuildLogBatch` or
+  `BuildPhase` whose `derivation_path` exceeds 512 bytes, before the path is
+  cloned, hashed, or forwarded to the actor.
+]
+
+A legitimate Nix store path is at most ~259 bytes (`/nix/store/` + 32-char
+hash + `-` + the 211-char name limit + `.drv`); the proto `string` field is
+otherwise bounded only by the 256 MiB `max_decoding_message_size`. The
+binding gates verify the path's _normalized hash component_ — `drv_log_hash`
+collapses `"{hash}-<anything>"` back to `{hash}` — so a
+`"{hash}-" + 255 MiB` alias for a legitimately assigned derivation passes
+#rref("sched.log.batch-binding") and would otherwise be cloned whole into the
+recv task's per-stream `seen_drvs` set (pinning
+`MAX_DRVS_PER_STREAM × 255 MiB ≈ 2 GiB` resident per stream) and shipped to
+the actor's single-threaded mailbox on disconnect. Rejections increment the
+arm's rejection counter with reason `path_too_long`.
 
 #r("sched.merge.exec-correlation+5")[
   The scheduler MUST set `build_derivations.exec_id` for every interested

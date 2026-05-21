@@ -523,7 +523,7 @@
         "name": "rio_scheduler_lease_lost_total"
       },
       {
-        "help": "BuildLogBatch dropped by the (executor, drv) binding check. Labeled by reason: no_assignment | unstamped | executor_mismatch.",
+        "help": "BuildLogBatch dropped by the (executor, drv) binding check or the derivation_path length bound. Labeled by reason: no_assignment | unstamped | executor_mismatch | path_too_long.",
         "kind": "counter",
         "name": "rio_scheduler_log_batches_rejected_total"
       },
@@ -588,7 +588,7 @@
         "name": "rio_scheduler_phantom_assignments_drained_total"
       },
       {
-        "help": "BuildPhase dropped by the actor-side (status, executor) binding check. Either the named derivation has no active (Assigned|Running) assignment, or the calling stream is not the assigned executor. Labeled by reason: not_active | no_assignment | executor_mismatch.",
+        "help": "BuildPhase dropped by the actor-side (status, executor) binding check or the recv-side derivation_path length bound. Either the named derivation has no active (Assigned|Running) assignment, the calling stream is not the assigned executor, or the path exceeds MAX_DERIVATION_PATH_LEN. Labeled by reason: not_active | no_assignment | executor_mismatch | path_too_long.",
         "kind": "counter",
         "name": "rio_scheduler_phases_rejected_total"
       },

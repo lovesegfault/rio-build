@@ -40,8 +40,28 @@ static STREAM_EPOCH_SEQ: AtomicU64 = AtomicU64::new(0);
 /// — exactly the set that round-trips to the actor's
 /// `handle_executor_disconnected` cleanup — and is a defense-in-depth
 /// tripwire: if `push_for` or the gated insert ever regressed, this
-/// is the only remaining bound.
+/// is the only remaining bound on entry *count*. The bound on entry
+/// *bytes* is `MAX_DRVS_PER_STREAM * MAX_DERIVATION_PATH_LEN` — the
+/// count cap alone stopped bounding memory when `seen_drvs` switched
+/// from 32-char `drv_log_hash` keys to full paths (which the
+/// disconnect cleanup needs for its `dag.hash_for_path()` lookup).
 const MAX_DRVS_PER_STREAM: usize = 8;
+
+/// Upper bound on the byte length of a worker-supplied
+/// `derivation_path` (`BuildLogBatch` and `BuildPhase`). A legitimate
+/// Nix store path is at most ~259 bytes — `/nix/store/` (11) + 32-char
+/// hash + `-` + ≤211-char name (the protocol-level store-path name
+/// limit) + `.drv` — so 512 is generous margin that never affects real
+/// traffic. The proto `string` field is otherwise bounded only by
+/// `max_decoding_message_size` (256 MiB): without this check a
+/// compromised worker assigned drv `{H}` can send
+/// `"/nix/store/{H}-" + ~255 MiB` aliases that pass `push_for`'s
+/// binding gate (`drv_log_hash` normalizes the alias back to `{H}`)
+/// and pin `MAX_DRVS_PER_STREAM × 255 MiB ≈ 2 GiB` of resident
+/// `String` in `seen_drvs` per stream — then ship the whole set to the
+/// actor's single-threaded mailbox on disconnect. Checked at the top
+/// of both recv arms, before the path is cloned, hashed, or forwarded.
+const MAX_DERIVATION_PATH_LEN: usize = 512;
 
 #[tonic::async_trait]
 impl ExecutorService for SchedulerGrpc {
@@ -272,6 +292,24 @@ impl ExecutorService for SchedulerGrpc {
                             }
                         }
                         rio_proto::types::executor_message::Msg::Phase(phase) => {
+                            // Length-bound the worker-supplied path before it
+                            // crosses into the actor: `handle_forward_phase`
+                            // hashes it for the `dag.hash_for_path()` lookup
+                            // on the single-threaded event loop. Not
+                            // accumulated like `seen_drvs`, but the same
+                            // untrusted field. r[impl sched.log.path-length]
+                            if phase.derivation_path.len() > MAX_DERIVATION_PATH_LEN {
+                                tracing::debug!(
+                                    len = phase.derivation_path.len(),
+                                    "rejected phase update: derivation_path too long"
+                                );
+                                metrics::counter!(
+                                    "rio_scheduler_phases_rejected_total",
+                                    "reason" => "path_too_long"
+                                )
+                                .increment(1);
+                                continue;
+                            }
                             // Same try_send semantics as ForwardLogBatch:
                             // a dropped phase update is cosmetic (nom
                             // misses one phase column refresh), not a hang.
@@ -292,6 +330,28 @@ impl ExecutorService for SchedulerGrpc {
                             }
                         }
                         rio_proto::types::executor_message::Msg::LogBatch(log) => {
+                            // Length-bound the worker-supplied path BEFORE the
+                            // cap check, the binding gate, and the
+                            // `seen_drvs.insert()` clone. The binding gate
+                            // verifies the path's *normalized hash component*
+                            // (`drv_log_hash` collapses `"{H}-<anything>"` to
+                            // `{H}`), so a `"{H}-" + 255 MiB` alias for an
+                            // assigned drv passes it — the length check is the
+                            // only thing standing between that alias and a
+                            // ~255 MiB resident `String` in `seen_drvs`.
+                            // r[impl sched.log.path-length]
+                            if log.derivation_path.len() > MAX_DERIVATION_PATH_LEN {
+                                tracing::debug!(
+                                    len = log.derivation_path.len(),
+                                    "rejected log batch: derivation_path too long"
+                                );
+                                metrics::counter!(
+                                    "rio_scheduler_log_batches_rejected_total",
+                                    "reason" => "path_too_long"
+                                )
+                                .increment(1);
+                                continue;
+                            }
                             // Two-step: buffer (never blocks on actor), then forward.
                             //
                             // 0. Per-stream distinct-path cap. The worker is NOT
