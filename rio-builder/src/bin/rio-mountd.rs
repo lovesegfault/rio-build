@@ -56,11 +56,6 @@ async fn main() -> anyhow::Result<()> {
     // bootstrap would add a Config type, a validate impl, and a config
     // search path for nothing. Tracing + metrics init is the part that
     // matters and is shared directly.
-    //
-    // No graceful-shutdown handling either: on SIGTERM the process
-    // exits, live FUSE connections abort when the kept fds close, and
-    // the next incarnation's startup orphan scan reaps the leftover
-    // mountpoints and staging trees.
     let _otel_guard = rio_common::observability::init_tracing("mountd")?;
     // The crate-wide bucket table includes the rio_mountd_* histogram
     // ranges; passing the whole table is harmless for the buckets that
@@ -71,9 +66,16 @@ async fn main() -> anyhow::Result<()> {
         rio_builder::HISTOGRAM_BUCKETS,
     )?;
     mountd::describe_metrics();
+    // SIGTERM/SIGINT → return from main so atexit handlers run (otel
+    // span flush, LLVM profraw flush in coverage builds) instead of the
+    // default disposition's immediate kill. Deliberately no connection
+    // drain: live FUSE connections abort when the kept fds close, and
+    // the next incarnation's startup orphan scan reaps the leftover
+    // mountpoints, staging trees, and .promoting placeholders.
+    let shutdown = rio_common::signal::shutdown_signal();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting rio-mountd");
 
-    mountd::run(MountdConfig {
+    let serve = mountd::run(MountdConfig {
         socket_path: args.socket,
         castore_dir: args.castore_dir,
         staging_dir: args.staging_dir,
@@ -82,6 +84,9 @@ async fn main() -> anyhow::Result<()> {
         staging_quota_bytes: args.staging_quota_bytes,
         max_promote_bytes: args.max_promote_bytes,
         allowed_gid: args.allowed_gid,
-    })
-    .await
+    });
+    tokio::select! {
+        r = serve => r,
+        () = shutdown.cancelled() => Ok(()),
+    }
 }
