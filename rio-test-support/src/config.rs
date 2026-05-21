@@ -1,4 +1,4 @@
-//! `figment::Jail` config-test macros shared across all 5 binaries.
+//! [`crate::Jail`] config-test macros shared across all 5 binaries.
 //!
 //! Every binary's main.rs (or config.rs for rio-builder) carries the
 //! same pair of standing-guard tests:
@@ -8,7 +8,7 @@
 //!   each field round-tripped.
 //! - `all_subconfigs_default_when_absent`: near-empty TOML → every
 //!   sub-config at its `Default` impl. Catches "new required field
-//!   breaks existing deployments" (figment missing-field error).
+//!   breaks existing deployments" (missing-field error).
 //!
 //! These catch the P0219 failure mode: a builder `with_X()` method
 //! exists but `Config` has no corresponding field, so TOML-driven
@@ -17,7 +17,7 @@
 //! STRUCTURALLY BLIND to that — it only checks fields that ARE on
 //! Config, not fields that SHOULD be.
 //!
-//! The scaffolding (`figment::Jail::expect_with`, TOML file write,
+//! The scaffolding (`$crate::Jail::expect_with`, TOML file write,
 //! config load, `Ok(())`) was 5×-duplicated. These macros keep the
 //! per-field asserts at the call site — the **ADD IT HERE** edit
 //! point is the entire purpose — and extract only the boilerplate
@@ -37,25 +37,23 @@
 //! # Call-site requirements
 //!
 //! `#[macro_export]` macros resolve paths at the CALL SITE, not the
-//! definition site. The caller's crate must have these as (dev-)deps:
-//! - `figment` (with `test` feature) — for `figment::Jail`
+//! definition site. The caller's crate must have this as a (dev-)dep:
 //! - `rio-common` — for `rio_common::config::load`
 //!
-//! All 5 binaries already satisfy this (they were using
-//! `figment::Jail::expect_with` directly before this extraction).
+//! The jail itself resolves through `$crate` ([`crate::Jail`]), so
+//! callers no longer need a figment dev-dependency.
+//!
+//! All 5 binaries already satisfy this.
 
 /// Standing guard: TOML → Config roundtrip for EVERY sub-config
-/// table via the REAL `rio_common::config::load` path (not raw
-/// figment). Jail changes cwd to a temp dir; `./{component}.toml`
+/// table via the REAL `rio_common::config::load` path. The jail
+/// ([`crate::Jail`]) changes cwd to a temp dir; `./{component}.toml`
 /// there is picked up by load()'s `{component}.toml` layer.
 ///
 /// When you add `Config.newfield`: ADD AN ASSERT to the `|$cfg|`
 /// block or this macro's doc-comment is a lie. The companion
 /// [`jail_defaults!`](crate::jail_defaults) catches "new required
-/// field breaks existing deployments" (figment missing-field error).
-///
-/// `#[allow(result_large_err)]`: figment::Error is 208B,
-/// API-fixed — the closure signature is set by the library.
+/// field breaks existing deployments" (missing-field error).
 ///
 /// ```ignore
 /// jail_roundtrip!("gateway", r#"
@@ -70,9 +68,8 @@
 macro_rules! jail_roundtrip {
     ($component:expr, $toml:expr, |$cfg:ident: $cfg_ty:ty| $asserts:block) => {
         #[test]
-        #[allow(clippy::result_large_err)]
         fn all_subconfigs_roundtrip_toml() {
-            figment::Jail::expect_with(|jail| {
+            $crate::Jail::expect_with(|jail| {
                 jail.create_file(concat!($component, ".toml"), $toml)?;
                 let $cfg: $cfg_ty =
                     rio_common::config::load($component, <CliArgs as Default>::default()).unwrap();
@@ -85,8 +82,8 @@ macro_rules! jail_roundtrip {
 
 /// Near-empty `{component}.toml` → every sub-config at its Default
 /// impl. If `Config.foo` is added WITHOUT `#[serde(default)]` AND the
-/// sub-struct lacks `impl Default`, this fails with a figment
-/// missing-field error.
+/// sub-struct lacks `impl Default`, this fails with a missing-field
+/// error.
 ///
 /// `$sentinel` is a single TOML line that proves the file IS loaded
 /// (a truly empty file would be indistinguishable from a missing one
@@ -102,9 +99,8 @@ macro_rules! jail_roundtrip {
 macro_rules! jail_defaults {
     ($component:expr, $sentinel:expr, |$cfg:ident: $cfg_ty:ty| $asserts:block) => {
         #[test]
-        #[allow(clippy::result_large_err)]
         fn all_subconfigs_default_when_absent() {
-            figment::Jail::expect_with(|jail| {
+            $crate::Jail::expect_with(|jail| {
                 jail.create_file(concat!($component, ".toml"), $sentinel)?;
                 let $cfg: $cfg_ty =
                     rio_common::config::load($component, <CliArgs as Default>::default()).unwrap();

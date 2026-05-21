@@ -7,7 +7,7 @@
 //! - [`fixtures`]: NAR and PathInfo builders
 //! - [`kube_mock`]: scenario-driven mock kube::Client (tower-test)
 //! - [`metrics`]: test-only `metrics::Recorder` impls (DescribedNames, CountingRecorder)
-//! - [`config`]: figment::Jail standing-guard test macros (jail_roundtrip!, jail_defaults!)
+//! - [`config`]: jailed standing-guard test macros (jail_roundtrip!, jail_defaults!)
 
 // `pg` and `jail` are unconditional so xtask (default-features = false) can
 // reuse them without pulling rio-nix/rio-proto/tonic/kube. Every other module

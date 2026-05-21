@@ -1338,7 +1338,7 @@
   "rio-test-support": [
     {
       "depth": 0,
-      "doc": "`figment::Jail` config-test macros shared across all 5 binaries.",
+      "doc": "[`crate::Jail`] config-test macros shared across all 5 binaries.",
       "path": "config.rs"
     },
     {
