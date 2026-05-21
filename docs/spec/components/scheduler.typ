@@ -187,7 +187,7 @@ The third worker-supplied `derivation_path` consumer in the `BuildExecution`
 recv loop. Unlike #rref("sched.log.batch-binding"), whose check is colocated
 with the ring buffer in the recv task (because the durability write must
 bypass the actor's bounded mpsc), phase updates have no recv-task side effect
---- they go only to the broadcast channel, which the actor owns. The gate
+--- every sink they reach is fed from inside the actor. The gate
 therefore runs in the actor against `(status, assigned_executor)`: the same
 `Assigned|Running` precondition + executor comparison as the
 #rref("sched.completion.idempotent") stale-report guard. The status
@@ -1915,7 +1915,14 @@ CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
   arms stay ungated (they keep `self.executors` accurate for dashboard +
   reconnect-after-reacquire); their PG-touching sub-calls (`drain_phantoms`,
   `dispatch_ready`) are individually leader-gated.
-  `ForwardLogBatch`/`ForwardPhase` are NOT gated (in-memory ring only).
+  `ForwardLogBatch` is NOT gated (in-memory ring only). `ForwardPhase` is NOT
+  gated either, and is a deliberate exception to the table list above:
+  `Event::Phase` is persisted (#rref("sched.log.phase-binding")), so a deposed
+  leader whose stale DAG still holds the assignment writes `build_event_log`
+  rows. Gating the arm would not seal the table (the event-log persister task
+  has no leader gate); the sequence collision with the new leader is resolved
+  first-writer-wins by `ON CONFLICT (build_id, sequence) DO NOTHING` inside
+  the #rref("sched.lease.generation-fence") dual-writer window.
 ]
 
 #r("sched.lease.generation-fence")[

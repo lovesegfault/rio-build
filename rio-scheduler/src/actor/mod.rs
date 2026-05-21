@@ -1172,6 +1172,11 @@ impl DagActor {
                     let result = self.handle_drain_executor(&executor_id, force).await;
                     let _ = reply.send(result);
                 }
+                // r[sched.lease.standby-drops-writes]: both forward arms
+                // stay ungated. ForwardLogBatch is broadcast-ring only;
+                // ForwardPhase DOES persist Event::Phase to build_event_log
+                // — a documented exception. See the spec block before
+                // assuming this arm is PG-free.
                 ActorCommand::ForwardLogBatch { drv_path, batch } => {
                     self.handle_forward_log_batch(&drv_path, batch);
                 }
