@@ -12,7 +12,7 @@
 # Post-fix: decide() tracks metadata.resourceVersion. The apiserver bumps
 # rv on every write (including renew), so a live leader produces a fresh
 # rv every RENEW_INTERVAL=5s. Standby's clock resets on each bump →
-# never reaches TTL → never steals → leaseTransitions stays flat.
+# never reaches STEAL_AFTER (19s) → never steals → leaseTransitions stays flat.
 #
 #
 # Fragment architecture: returns { fragments, mkTest }. default.nix
@@ -21,13 +21,14 @@
 # sched.lease.k8s-lease — verify marker at default.nix:subtests[stable-leadership]
 #   stable-leadership: observed-record rv tracking → no live-lease steal.
 #   failover: ungraceful kill (no step_down) → standby observes unchanged
-#     rv for TTL → steals → leaseTransitions +1.
+#     rv for STEAL_AFTER (19s) → steals → leaseTransitions +1.
 #
 # sched.lease.graceful-release — verify marker at default.nix:subtests[graceful-release]
 # sched.lease.deletion-cost — verify marker at default.nix:subtests[graceful-release]
 #   graceful-release: SIGTERM leader (no --force, --grace-period=30)
 #   → step_down() runs to completion → standby acquires in <10s (vs
-#   ~15s TTL-steal on ungraceful kill). lease/mod.rs:409-420. The
+#   the 19s observed-staleness steal on ungraceful kill).
+#   lease/mod.rs:409-420. The
 #   new leader's pod carries pod-deletion-cost=1 annotation so k8s
 #   RollingUpdate kills the standby first → no leadership churn.
 #
@@ -50,9 +51,10 @@ let
   jq = "${pkgs.jq}/bin/jq";
 
   # 60s build: long enough to span one full failover cycle (kill +
-  # ~15s observed-ttl steal + gateway balanced-channel reprobe ~3s +
-  # worker relay reconnect). The build runs on the WORKER the whole
-  # time; leader failover just churns the control-plane stream.
+  # STEAL_AFTER=19s + one 5s poll observed-staleness steal + gateway
+  # balanced-channel reprobe ~3s + worker relay reconnect). The build
+  # runs on the WORKER the whole time; leader failover just churns the
+  # control-plane stream.
   failoverDrv = drvs.mkTrivial {
     marker = "leader-failover";
     sleepSecs = 60;
@@ -184,8 +186,8 @@ let
       # ══════════════════════════════════════════════════════════════════
       # Pre-fix: flip-flop every ~35s → over 60s, leaseTransitions climbs
       # by at least 1 (likely 2-3). Post-fix: rv bumps on every renew →
-      # standby's clock resets every ~5s → never reaches 15s TTL → no
-      # steal → leaseTransitions FLAT.
+      # standby's clock resets every ~5s → never reaches STEAL_AFTER (19s)
+      # → no steal → leaseTransitions FLAT.
       #
       # EXACT equality, not "small delta tolerated". ANY increment is a
       # steal, which is the bug. waitReady already confirmed a leader is
@@ -250,9 +252,11 @@ let
           )
 
           # step_down clears holderIdentity → standby sees empty →
-          # Steal on next 5s tick. TTL=15s is the FALLBACK if step_down
-          # failed. <10s proves step_down fired (5s poll + slack);
-          # 10-15s would be ambiguous; >15s = step_down broken.
+          # steal on next 5s tick. The FALLBACK if step_down failed is
+          # the observed-staleness steal at STEAL_AFTER=19s (~20-25s
+          # after the delete). <10s proves step_down fired (5s poll +
+          # slack); between 10s and the steal fallback would be
+          # ambiguous; at/after the fallback = step_down broken.
           t0 = _time.time()
           k3s_server.wait_until_succeeds(
               f"h=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
@@ -262,7 +266,7 @@ let
           )
           elapsed = _time.time() - t0
           assert elapsed < 10, (
-              f"standby took {elapsed:.1f}s to acquire (TTL=15s). "
+              f"standby took {elapsed:.1f}s to acquire (steal fallback 19s). "
               f"step_down didn't fire — graceful-release broken?"
           )
 
@@ -654,10 +658,11 @@ let
       #     First tick: GET shows holder == our_id → Decision::Renew
       #     → replace(steal=false). leaseTransitions UNCHANGED. The
       #     standby sees rv bump on that renew, resets its observed
-      #     clock, never reaches TTL.
-      #   - UNLESS kubelet restart + scheduler init takes >TTL=15s
-      #     (CrashLoopBackOff, slow image pull): standby's observed-rv
-      #     stays unchanged for TTL → Decision::Steal → tx +1.
+      #     clock, never reaches STEAL_AFTER.
+      #   - UNLESS kubelet restart + scheduler init takes longer than
+      #     STEAL_AFTER=19s (CrashLoopBackOff, slow image pull):
+      #     standby's observed-rv stays unchanged for STEAL_AFTER →
+      #     Decision::Steal → tx +1.
       # Either is correct. Assert tx delta ∈ {0, 1} and the build
       # completes regardless. The same-pod-resume path (delta=0) is the
       # production OOM-kill path; the standby-steal path (delta=1) is
@@ -750,7 +755,7 @@ let
           # Anchor: capture renewTime AFTER the kill. SIGKILL is
           # synchronous — the dead process cannot write again, and the
           # restarted container's first renew is seconds out (standby
-          # steal ~15s out), so this is guaranteed to be the dead
+          # steal ≥19s out), so this is guaranteed to be the dead
           # leader's FINAL write. Capturing BEFORE the kill is a
           # TOCTOU: the still-live leader may complete one more renew
           # (RENEW_INTERVAL=5s) in the ~100-800ms succeed()-round-trip
@@ -803,7 +808,7 @@ let
           assert age < 10, (
               f"renewTime is {age}s old after SIGKILL+restart. "
               f"No process is renewing the lease — restarted container "
-              f"stuck before first tick, AND standby didn't TTL-steal?"
+              f"stuck before first tick, AND standby didn't steal (STEAL_AFTER)?"
           )
 
           new_leader = leader_pod()
@@ -811,8 +816,8 @@ let
           delta = tx_after - tx_before
           # delta=0: same pod resumed via Renew (holder==our_id branch,
           #   election.rs:119-124). Production OOM-kill path.
-          # delta=1: standby TTL-stole (observed-record expiry,
-          #   election.rs:128-138). Restart took >15s.
+          # delta=1: standby stole (observed-record expiry,
+          #   election.rs:128-138). Restart took longer than STEAL_AFTER (19s).
           assert delta in (0, 1), (
               f"leaseTransitions {tx_before}→{tx_after} (delta={delta}). "
               f">1 = leadership bounced; <0 = impossible."

@@ -9,7 +9,7 @@ scope: with scope; ''
   # recovery_total was 0 (standby never ran recover_from_pg —
   # LeaderAcquired never fired). After acquiring, it's exactly 1.
   #
-  # Proves: lease TTL expiry detection → standby LeaderAcquired →
+  # Proves: observed-staleness steal (STEAL_AFTER) → standby LeaderAcquired →
   # recover_from_pg loads REAL non-terminal rows from PG → dispatch
   # gate unblocks (if !is_leader || !recovery_complete → no-op).
   with subtest("recovery: kill leader mid-build, standby acquires + recovers"):
@@ -98,10 +98,10 @@ scope: with scope; ''
       kubectl(f"delete pod {old_leader} --grace-period=0 --force")
 
       # Standby acquires. Lease holderIdentity becomes a DIFFERENT,
-      # NON-EMPTY pod name. 60s timeout: lease TTL + acquire tick
-      # (~5s poll). Two transient states to reject:
-      #   (a) holderIdentity stays old name until lease expires
-      #       (so != check, not just -n)
+      # NON-EMPTY pod name. 60s timeout: STEAL_AFTER (19s) + one 5s
+      # poll, with headroom. Two transient states to reject:
+      #   (a) holderIdentity stays old name until the standby's
+      #       STEAL_AFTER threshold elapses (so != check, not just -n)
       #   (b) under KVM, --grace-period=0 --force deletes the pod so
       #       fast that holderIdentity is briefly EMPTY before the
       #       standby claims it (observed: 0.2s window) — without

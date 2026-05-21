@@ -204,8 +204,11 @@ pub(super) fn apply_heartbeat_response(
                 // level) and cheaper than a load-then-store.
                 ready.store(true, std::sync::atomic::Ordering::Relaxed);
                 // r[impl sched.lease.generation-fence+2]
-                // fetch_max, not store: during the 15s Lease TTL
-                // split-brain window (r[sched.lease.k8s-lease]),
+                // fetch_max, not store: while a deposed leader still
+                // believes it leads (its belief lags by up to one
+                // RENEW_INTERVAL while it retains apiserver
+                // connectivity, or up to SELF_FENCE_AFTER when
+                // partitioned — see sched.lease.at-most-one-leader+3),
                 // both old and new leader answer with accepted=true.
                 // If responses interleave new-then-old, `store`
                 // would REGRESS the fence and let through exactly

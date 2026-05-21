@@ -22,9 +22,10 @@ use rio_scheduler::config::{CliArgs, Config, DashboardConfig};
 /// metrics and fire-and-forget `LeaderAcquired`/`LeaderLost` to the actor.
 ///
 /// `tokio::spawn` for the actor send: the lease loop calls these hooks
-/// synchronously from the renewal tick, and a blocked hook (>15s) would
-/// stall the tick → lease expires → another replica acquires → dual-leader
-/// (see `rio_lease::LeaseHooks` doc). `send_unchecked` bypasses
+/// synchronously from the renewal tick, and a blocked hook would stall
+/// the tick — the blocked loop can neither renew nor self-fence while a
+/// standby steals after `STEAL_AFTER` (19s) of observed staleness →
+/// dual-leader (see `rio_lease::LeaseHooks` doc). `send_unchecked` bypasses
 /// backpressure — control message, not work submission.
 #[derive(Clone)]
 struct SchedulerLeaseHooks {
@@ -391,10 +392,12 @@ async fn main() -> anyhow::Result<()> {
     // the actor's generation is already the shared Arc — when the
     // lease acquires and increments, the actor sees it.
     // Capture the handle: the lease loop calls step_down() on
-    // shutdown (graceful release, saves ~15s on rollouts). That's
+    // shutdown (graceful release: the standby takes over on its next
+    // 5s poll instead of waiting out the 19s steal threshold). That's
     // an async K8s API call that needs time to complete — if we
     // drop the handle and let main() race to exit, the process
-    // dies before the PATCH lands and we're back to TTL expiry.
+    // dies before the PATCH lands and we're back to the
+    // observed-staleness steal as fallback.
     let lease_loop = lease_cfg.map(|lease_cfg| {
         // Hooks fire-and-forget LeaderAcquired/LeaderLost. The lease
         // loop does NOT block on recovery — it keeps renewing while

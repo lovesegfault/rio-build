@@ -10,8 +10,9 @@
 //!
 //! Recovery for a large DAG (10k derivations) may take several
 //! seconds (PG roundtrips + critical-path sweep). If the lease loop
-//! WAITED for recovery, the lease could expire (15s TTL) → another
-//! replica acquires → dual-leader. Instead:
+//! WAITED for recovery, a standby would steal after `STEAL_AFTER`
+//! (19s) of observed staleness while this replica still believes it
+//! leads → dual-leader. Instead:
 //!
 //! 1. Lease loop on acquire: derive the generation from the Lease's
 //!    transition count (`fetch_max`) + `is_leader.store(true)`

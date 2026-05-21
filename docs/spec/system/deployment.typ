@@ -23,7 +23,7 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
   [rio-scheduler],
   [Deployment],
   [2 (leader-elected)],
-  [Leader election via Kubernetes Lease. One leader, one hot standby. \~15s failover.],
+  [Leader election via Kubernetes Lease. One leader, one hot standby. Failover: next 5s poll after graceful step_down; \~20--25s on ungraceful death (`STEAL_AFTER` 19s + one 5s poll).],
 
   [rio-store],
   [Deployment],

@@ -11,7 +11,8 @@
 {{- if and .Values.scheduler.enabled (gt (int .Values.scheduler.replicas) 1) }}
 ---
 # maxUnavailable=1: with replicas=2, one stays up during drain. Leader
-# election handles failover (15s Lease TTL → ~15s blip).
+# election handles failover (graceful step_down hands over within one 5s
+# poll; ungraceful worst case ~20-25s: 19s steal threshold + 5s poll).
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

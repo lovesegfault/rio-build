@@ -1485,8 +1485,9 @@ leadership transitions:
 
 #r("sched.lease.non-blocking-acquire")[
   LeaderAcquired send is fire-and-forget via `tokio::spawn` --- blocking on
-  recovery would let the lease expire (>15s) → another replica acquires →
-  dual-leader.
+  recovery would stall renewals: the blocked loop can neither renew nor
+  self-fence while a standby steals after `STEAL_AFTER` (19s) of observed
+  staleness → dual-leader.
 ]
 
 #r("sched.lease.standby-tick-noop")[
@@ -2256,10 +2257,15 @@ condition so no constant moves without the others.
   CAS that already serializes the steal. Executors see the new generation in
   `HeartbeatResponse` and reject any `WorkAssignment` carrying an older
   generation. *No PostgreSQL-level write fencing exists.* A deposed leader's
-  in-flight PG writes will succeed; the split-brain window is bounded by the
-  Lease renew deadline (default 15s). Because the writes in question are
-  idempotent upserts keyed by `drv_hash` and status transitions are monotone,
-  brief dual-writer windows do not corrupt state.
+  in-flight PG writes will succeed; the dual-belief window is closed by the
+  fence/steal asymmetry --- a leader that cannot renew self-fences at
+  `SELF_FENCE_AFTER` (11s), `2 × FENCE_MARGIN` before any standby's
+  `STEAL_AFTER` (19s) steal threshold, so the window is empty under bounded
+  clock skew (#rref("sched.lease.self-fence+2")) --- and this rule is the
+  backstop for the clock-pause residual that asymmetry cannot close. Because
+  the writes in question are idempotent upserts keyed by `drv_hash` and
+  status transitions are monotone, brief dual-writer windows do not corrupt
+  state.
 ]
 
 A local counter cannot provide the distinctness half of this rule: an
@@ -2329,9 +2335,10 @@ message.
   On graceful shutdown (SIGTERM), if the lease loop was leading, it calls
   `step_down()` to clear `holderIdentity` before the process exits. This is an
   optimization, not a correctness requirement: without it, the next replica
-  waits up to `lease_ttl` (15s) for observed-record expiry. With it, the next
-  replica's `decide()` sees an empty holder and steals immediately on its next
-  poll (\~1s). The `step_down()` call is a resourceVersion-guarded PUT (409 →
+  waits up to `STEAL_AFTER` (19s) for observed-record expiry. With it, the
+  next replica's `decide()` sees an empty holder and steals on its next poll
+  tick (one `RENEW_INTERVAL`, 5s). The `step_down()` call is a
+  resourceVersion-guarded PUT (409 →
   someone already stole, treated as success); `main()` awaits the lease-loop's
   `JoinHandle` after `serve_with_shutdown` returns, ensuring the PUT lands
   before process exit. If `step_down()` fails (apiserver unreachable), the loop
@@ -2839,8 +2846,10 @@ disconnected executors' running builds --- they go directly back to Ready
 partition heals, executors reconnect and replay buffered completions.
 
 For split-brain mitigation: the Kubernetes Lease prevents two active schedulers
-under normal conditions; brief dual-leader windows are bounded by the lease
-renew deadline (\~15s); the assignment-generation counter lets executors ignore
+under normal conditions; dual-leader windows are closed by the self-fence/steal
+asymmetry (11s vs 19s; empty under bounded clock skew) and, for the clock-pause
+residual, bounded by executor-side generation rejection; the
+assignment-generation counter lets executors ignore
 assignments from a deposed leader. PG writes are idempotent upserts. Optional
 future hardening: a `scheduler_meta` row with a generation-guard WHERE clause
 for strict fencing (current: idempotent writes tolerate the dual-leader

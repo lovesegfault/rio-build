@@ -170,8 +170,9 @@ let
   pinDrv = drvs.mkTrivial { marker = "lifecycle-pin"; };
 
   # In-flight build for recovery. 60s sleep survives the leader-kill
-  # window: lease TTL (~15s worst case for standby to detect) + standby's
-  # recovery query (~1s) + re-dispatch latency (~5s). phase3b rationale
+  # window: steal threshold (STEAL_AFTER=19s + one 5s poll worst case for
+  # standby to detect) + standby's recovery query (~1s) + re-dispatch
+  # latency (~5s). phase3b rationale
   # (phase3b.nix:85-99) applies verbatim — a shorter sleep lets the build
   # finish during the failover gap → PG has 0 non-terminal rows →
   # recovery loads nothing → hollow test.

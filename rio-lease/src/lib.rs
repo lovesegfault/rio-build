@@ -24,8 +24,8 @@
 //! the lease's `renewTime`).
 //!
 //! This STILL isn't a linearizable fence — a partitioned leader
-//! can keep dispatching until its TTL runs out locally. That's
-//! acceptable because dispatch is idempotent:
+//! can keep dispatching until it self-fences at `SELF_FENCE_AFTER`.
+//! That's acceptable because dispatch is idempotent:
 //!
 //! - DAG merge dedups by `drv_hash`. Two schedulers merging the
 //!   same SubmitBuild both end up with the same DAG node.
@@ -40,9 +40,10 @@
 //! # Lease TTL and renew cadence
 //!
 //! 15s TTL, renewed every 5s. The 3:1 ratio is the kubernetes
-//! convention (see kube-controller-manager's defaults). Three
-//! renewal attempts before the lease expires — survives one or
-//! two transient apiserver hiccups.
+//! convention (see kube-controller-manager's defaults). The
+//! thresholds the protocol acts on are `SELF_FENCE_AFTER` (11s —
+//! two missed renew ticks plus one in-flight attempt) and
+//! `STEAL_AFTER` (19s).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -76,7 +77,8 @@ mod mbt_tests;
 ///
 /// `run_lease_loop` calls these synchronously from the renewal tick.
 /// **They MUST NOT block** — a blocked hook stalls the renewal tick,
-/// the lease expires, and another replica acquires (dual-leader). Spawn
+/// so the loop can neither renew nor self-fence while a standby steals
+/// after `STEAL_AFTER` of observed staleness (dual-leader). Spawn
 /// a task if you need async work (e.g. notifying an actor channel).
 ///
 /// Per-component metrics (`rio_{scheduler,controller}_lease_*_total`)
@@ -573,8 +575,9 @@ impl LeaderState {
 ///   `handle_leader_acquired` runs recovery then sets
 ///   `recovery_complete=true`. CRITICAL: this loop does NOT
 ///   block on recovery — it keeps renewing the lease every 5s
-///   regardless. A slow recovery (>15s) would otherwise let the
-///   lease expire → another replica acquires → dual-leader.
+///   regardless. A loop blocked on a slow recovery could neither
+///   renew nor self-fence while a standby steals after
+///   `STEAL_AFTER` of observed staleness → dual-leader.
 /// - On lose transition (was leading, now not): flip `is_leader`,
 ///   clear `recovery_complete` (re-acquire re-triggers recovery).
 ///   DON'T touch the generation — the NEW leader's steal bumps the
@@ -584,9 +587,10 @@ impl LeaderState {
 /// On K8s API error (apiserver restarting, network blip): log
 /// warn and retry next tick. Don't crash — a transient API hiccup
 /// shouldn't kill the scheduler. If the error persists past
-/// `lease_ttl`, our lease expires and another replica takes over,
-/// which is exactly the desired behavior for "this replica's K8s
-/// connectivity is broken."
+/// `SELF_FENCE_AFTER`, the local self-fence flips `is_leader`; a
+/// standby steals after `STEAL_AFTER` of observed staleness and
+/// takes over, which is exactly the desired behavior for "this
+/// replica's K8s connectivity is broken."
 ///
 /// `hooks`: per-component callbacks (metrics + actor notification).
 /// Called synchronously on the transition edge — see [`LeaseHooks`]
@@ -655,7 +659,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
     let mut last_successful_renew = Instant::now();
     let mut interval = tokio::time::interval(RENEW_INTERVAL);
     // Skip: if one renewal is slow (apiserver busy), don't fire
-    // twice immediately. The lease TTL is 15s; we have slack.
+    // twice immediately. SELF_FENCE_AFTER is 11s; we have slack.
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Stateful loop (was_leading, last_successful_renew are
@@ -776,9 +780,11 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         // NOT block — see LeaseHooks doc.
                         //
                         // NON-BLOCKING IS LOAD-BEARING: if a hook
-                        // awaited recovery, a slow recovery (>15s for a
-                        // large DAG) would stall the renewal tick →
-                        // lease expires → another replica acquires →
+                        // awaited recovery, a slow recovery for a
+                        // large DAG would stall the renewal tick —
+                        // the blocked loop can neither renew nor
+                        // self-fence while a standby steals after
+                        // STEAL_AFTER of observed staleness →
                         // dual-leader. Hooks spawn; the separate
                         // recovery_complete flag lets the loop keep
                         // renewing regardless.
@@ -883,11 +889,11 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
 
     // r[impl sched.lease.graceful-release]
     // Graceful release: on shutdown, release the lease so the next
-    // replica acquires immediately (~1s poll) instead of waiting
-    // out the steal threshold (19s). Gate on was_leading to skip the
-    // apiserver round-trip when we were standby all along. Any
-    // error is non-fatal: we're shutting down regardless, and
-    // the steal threshold is the fallback.
+    // replica acquires on its next poll tick (one RENEW_INTERVAL, 5s)
+    // instead of waiting out the steal threshold (19s). Gate on
+    // was_leading to skip the apiserver round-trip when we were
+    // standby all along. Any error is non-fatal: we're shutting down
+    // regardless, and the steal threshold is the fallback.
     if was_leading {
         let deadline = RENEW_INTERVAL.saturating_sub(RENEW_SLOP);
         match tokio::time::timeout(deadline, election.step_down()).await {
@@ -958,8 +964,9 @@ fn maybe_self_fence(
 /// sets cost=1, standby sets cost=0, k8s kills the standby first.
 ///
 /// `tokio::spawn` because the lease loop MUST NOT block. A slow
-/// apiserver PATCH (>15s) would stall the renew tick, the lease
-/// expires, another replica acquires — dual-leader. Same constraint
+/// apiserver PATCH would stall the renew tick — the blocked loop can
+/// neither renew nor self-fence while a standby steals after
+/// `STEAL_AFTER` of observed staleness — dual-leader. Same constraint
 /// as the LeaderAcquired actor send (see `run_lease_loop`).
 ///
 /// Merge patch (not Apply): we only touch one annotation key; Apply

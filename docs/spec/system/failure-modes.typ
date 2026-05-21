@@ -40,7 +40,10 @@ If S3 writes fail but reads succeed (e.g., S3 rate limiting on PUTs):
 
 == Scheduler Split-Brain Mitigation
 
-Split-brain is bounded by the Kubernetes Lease renew deadline (default 15s):
+Split-brain is closed by the fence/steal asymmetry --- a leader that cannot
+renew self-fences at `SELF_FENCE_AFTER` (11s), `2 × FENCE_MARGIN` before any
+standby's `STEAL_AFTER` (19s) steal threshold --- and bounded by the
+executor-side generation fence for the clock-pause residual:
 - Each Lease acquisition increments an in-memory `Arc<AtomicU64>` generation
   counter
 - The generation flows into `WorkAssignment.generation`; executors reject

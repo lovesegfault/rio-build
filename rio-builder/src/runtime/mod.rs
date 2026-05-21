@@ -2826,9 +2826,12 @@ mod fence_tests {
         assert!(!is_stale_assignment(1, 0));
     }
 
-    /// During the 15s Lease TTL split-brain window, both old and new
-    /// leader answer heartbeats with `accepted=true`. If responses
-    /// interleave new-then-old, `store` would REGRESS the fence.
+    /// While a deposed leader still believes it leads (its belief lags
+    /// by up to one `RENEW_INTERVAL` with apiserver connectivity, or up
+    /// to `SELF_FENCE_AFTER` when partitioned — see
+    /// sched.lease.at-most-one-leader+3), both old and new leader answer
+    /// heartbeats with `accepted=true`. If responses interleave
+    /// new-then-old, `store` would REGRESS the fence.
     ///
     /// bug_417: previously called `fetch_max` on a local `AtomicU64`
     /// directly — that tested `std::sync::atomic`, not
