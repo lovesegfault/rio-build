@@ -42,3 +42,29 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 rio-test-support = { workspace = true }
 # election.rs mock-apiserver scenarios need http::Method.
 http = { workspace = true }
+# Model-based testing (src/mbt_tests.rs): replay generated traces from
+# docs/spec/models/leaderElection.qnt against the real election +
+# LeaderState machinery, diffing the projected state after every step.
+# Shells out to `quint` at test time — the mbt_* tests are #[ignore]d in
+# the default profile and run by the dedicated check that puts quint on
+# the PATH.
+quint-connect = { workspace = true }
+# ITF (Informal Trace Format) deserialization for the named-run replays:
+# `quint test --out-itf` emits the model's per-step states; the replay
+# diffs the implementation's projection against them. Already a
+# transitive dependency of quint-connect; declared directly because the
+# named-run replay parses traces itself (quint-connect's #[quint_test]
+# path requires mbt instrumentation that `quint test` does not emit).
+itf = { workspace = true }
+# The mbt driver owns a current-thread runtime to drive the async
+# election API from quint-connect's sync Driver::step, and surfaces
+# divergences as anyhow errors (quint-connect's Result alias).
+anyhow = { workspace = true }
+# The mbt projection structs derive Deserialize (the framework
+# deserializes the model's per-step state from the ITF trace into the
+# same struct the driver projects into); the `switch!` macro emits
+# `serde::Deserialize` paths for nondet-pick extraction.
+serde = { workspace = true }
+# The mbt driver seeds MockApiServer with the model's initial Lease
+# object and projects the stored object back out (both serde_json::Value).
+serde_json = { workspace = true }

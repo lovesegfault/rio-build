@@ -662,6 +662,40 @@ module leaderElection {
     claimFailures' = claimFailures, restores' = restores,
   }
 
+  /// The write-ahead claim INSERT succeeds: the PG floor advances to the
+  /// claimed generation. fetch_max in shape, though every caller passes a
+  /// `claimed >= genHW` value when the update is meant to apply (steal's
+  /// seeded is always >= genHW + 1; renewLease passes genHW itself off
+  /// the acquire edge, a provable no-op).
+  ///
+  /// A NAMED action (not an anonymous `all` block inside the claim
+  /// disjunction) for the same reason every disjunct of `step` is named:
+  /// quint's `--mbt` action tracker records the INNERMOST `any`
+  /// disjunct's name, so an anonymous block here makes the whole
+  /// steal/renewLease step anonymous in generated traces and undrivable
+  /// by the model-based tests (rio-lease/src/mbt_tests.rs). The
+  /// flattening discipline is recursive: no anonymous `any` disjunct
+  /// anywhere reachable from `step`.
+  action claimOk(claimed: int): bool = all {
+    genHW' = if (claimed > genHW) claimed else genHW,
+    claimFailures' = claimFailures,
+  }
+
+  /// The write-ahead claim INSERT fails: PG dies between the seed read
+  /// and the claim write, and recovery proceeds anyway -- the node still
+  /// acquires, still derives gen[n], still leads, but the floor a
+  /// successor seeds from does not cover the generation it dispatches
+  /// at. The claimFailures increment is the trace marker; the
+  /// `claimed > genHW` guard is the non-triviality condition (a claim
+  /// that would not have raised the floor cannot fail meaningfully).
+  /// Never enabled with MAX_CLAIM_FAILURES = 0.
+  action claimFails(claimed: int): bool = all {
+    claimFailures < MAX_CLAIM_FAILURES,
+    claimed > genHW,
+    genHW' = genHW,
+    claimFailures' = claimFailures + 1,
+  }
+
   /// The decide()->Steal path: empty-holder OR stale-observed (the
   /// deposed-leader path). gen[n] and genHW are set per
   /// on_acquire(transitions) + seed_generation_from() +
@@ -732,28 +766,15 @@ module leaderElection {
       alive' = alive,
       deletes' = deletes,
       restores' = restores,
-      // The claim: fetch_max in shape, though seeded >= genHW+1 always
-      // holds here (target's else arm is genHW+1 and seeded >= target).
-      // The second branch is the ClaimFails fault: the INSERT into the
-      // claims ledger errors (PG dies between the seed read and the
-      // claim write) and recovery proceeds anyway -- the node still
-      // acquires, still derives gen[n] = seeded, still leads, but the
-      // floor a successor seeds from does not cover the generation it
-      // dispatches at. The claimFailures increment is the trace marker;
-      // the seeded > genHW guard is the non-triviality condition (a
-      // claim that would not have raised the floor cannot fail
-      // meaningfully). Never enabled with MAX_CLAIM_FAILURES = 0.
+      // The claim disjunction: the INSERT into the claims ledger either
+      // lands (claimOk -- the floor advances; seeded >= genHW+1 always
+      // holds here since target's else arm is genHW+1 and seeded >=
+      // target) or errors (claimFails -- the ClaimFails fault). Both
+      // disjuncts are NAMED actions; see claimOk's doc for why an
+      // anonymous block here breaks the model-based tests.
       any {
-        all {
-          genHW' = if (seeded > genHW) seeded else genHW,
-          claimFailures' = claimFailures,
-        },
-        all {
-          claimFailures < MAX_CLAIM_FAILURES,
-          seeded > genHW,
-          genHW' = genHW,
-          claimFailures' = claimFailures + 1,
-        },
+        claimOk(seeded),
+        claimFails(seeded),
       },
     }
   }
@@ -839,6 +860,14 @@ module leaderElection {
     val entry = if (gen.get(n) > lease.gen + 1) gen.get(n) else lease.gen + 1
     val seeded = if (genHW > entry) genHW + 1 else entry
     val isEdge = not(leading.get(n))
+    // What the claim disjunction is offered: the seeded generation on
+    // the acquire edge, genHW itself (a provable no-op for claimOk and
+    // a disabled precondition for claimFails) off it. Algebraically
+    // identical to gating each claim branch on isEdge -- claimOk(genHW)
+    // leaves genHW unchanged and claimFails(genHW) fails its
+    // `claimed > genHW` guard -- which is how the steady-state renew
+    // never re-runs recovery and never touches the ledger.
+    val claimTarget = if (isEdge) seeded else genHW
     all {
       alive.get(n),
       hasSnap(n),
@@ -857,24 +886,15 @@ module leaderElection {
       clocks' = clocks, alive' = alive, obs' = obs,
       acquiredAt' = acquiredAt, deletes' = deletes,
       delVictims' = delVictims, restores' = restores,
-      // The same ClaimFails disjunction as steal's, restricted to the
-      // edge branch -- a steady-state renew never claims, so it cannot
-      // fail to claim. The retry-on-the-next-acquire-edge behavior falls
-      // out: a failed claim leaves genHW < gen[n], and the NEXT edge
-      // renew (or steal) recomputes seeded and offers the ledger the
-      // claim again.
+      // The same claim disjunction as steal's, restricted to the edge
+      // branch via claimTarget -- a steady-state renew never claims, so
+      // it cannot fail to claim. The retry-on-the-next-acquire-edge
+      // behavior falls out: a failed claim leaves genHW < gen[n], and
+      // the NEXT edge renew (or steal) recomputes seeded and offers the
+      // ledger the claim again.
       any {
-        all {
-          genHW' = if (isEdge and seeded > genHW) seeded else genHW,
-          claimFailures' = claimFailures,
-        },
-        all {
-          claimFailures < MAX_CLAIM_FAILURES,
-          isEdge,
-          seeded > genHW,
-          genHW' = genHW,
-          claimFailures' = claimFailures + 1,
-        },
+        claimOk(claimTarget),
+        claimFails(claimTarget),
       },
     }
   }
@@ -1057,6 +1077,17 @@ module leaderElection {
   // is bit-for-bit identical. Re-verify that claim against the
   // distinct-state counts in the introducing commit after any change
   // here.
+  //
+  // The rule is RECURSIVE: the tracker records the name of the
+  // INNERMOST `any` disjunct evaluated during the step, so an anonymous
+  // `all { ... }` block inside an `any` nested anywhere under a step
+  // disjunct makes the whole step anonymous -- naming only the
+  // top-level disjuncts is not enough. The claim disjunction inside
+  // steal/renewLease is the precedent: its two branches are the named
+  // actions claimOk/claimFails (referenced, not inlined) for exactly
+  // this reason, and a generated trace records a steal step as
+  // `claimOk`, not `stealAny`. A driver therefore matches on the leaf
+  // names; the outer disjunct's nondet picks are still recorded.
 
   /// One node's clock advances.
   action tickAny = {

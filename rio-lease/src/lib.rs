@@ -56,6 +56,17 @@ use tracing::{debug, info, warn};
 mod election;
 pub use election::{Decision, ElectionResult, LeaderElection, Observed, decide};
 
+/// Model-based tests: replay traces from
+/// `docs/spec/models/leaderElection.qnt` against the election machinery.
+/// A `#[cfg(test)]` module under `src/` (not `tests/mbt.rs`) because the
+/// driver needs the `pub(crate)` `fetch_and_decide`/`act` split — those
+/// stay crate-private so production code outside rio-lease can never
+/// separate the GET from the PUT (that separation is how TOCTOU bugs get
+/// written; the composition being the only public entry point is a
+/// structural guarantee).
+#[cfg(test)]
+mod mbt_tests;
+
 /// Callbacks fired on lease acquire/lose transitions.
 ///
 /// `run_lease_loop` calls these synchronously from the renewal tick.

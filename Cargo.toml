@@ -375,6 +375,17 @@ aws-smithy-mocks = "0.2"
 # pull tower transitively for prod, but no rio-* crate depends on it
 # directly outside [dev-dependencies].
 tower = { version = "0.5", features = ["util"] }
+# Model-based testing: replay traces generated from the Quint models in
+# docs/spec/models/ against the real implementation, diffing the
+# projected state after every step (rio-lease/src/mbt_tests.rs is the
+# exemplar). Shells out to `quint` at test time, so the mbt_* tests are
+# #[ignore]d outside the dedicated check that puts quint on the PATH.
+quint-connect = "0.1"
+# ITF (Informal Trace Format) deserialization. Transitive via
+# quint-connect; direct because the named-run replay parses
+# `quint test --out-itf` traces itself (`quint test` cannot emit the mbt
+# instrumentation quint-connect's #[quint_test] path requires).
+itf = "0.4"
 
 # Utility
 regex = "1"

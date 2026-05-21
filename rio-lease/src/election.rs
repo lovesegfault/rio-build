@@ -349,7 +349,12 @@ pub struct LeaderElection {
     /// own self-fence deadline (`ttl − 2×margin`) so the deposed holder
     /// has already stopped believing by the time anyone steals.
     steal_after: Duration,
-    observed: Option<Observed>,
+    /// `pub(crate)` (not private) for the model-based tests
+    /// (`crate::mbt_tests`): the driver re-evaluates `decide()` against a
+    /// stashed snapshot at the model's PUT-step clock, which needs `&mut`
+    /// access to the observed record from a sibling module. Production
+    /// code outside this module never touches it.
+    pub(crate) observed: Option<Observed>,
 }
 
 impl LeaderElection {
