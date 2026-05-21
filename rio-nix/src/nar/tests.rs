@@ -1364,4 +1364,88 @@ mod ls_tests {
         let paths: Vec<&[u8]> = entries.iter().map(|e| e.path.as_slice()).collect();
         assert_eq!(paths, vec![&b""[..], b"a", b"a/x", b"b"]);
     }
+
+    // ── Malformed-input rejection ──────────────────────────────────────
+    // `nar_ls` reimplements the token walk (it streams instead of
+    // buffering), so the `parse()` rejection tests above do not cover
+    // its error returns.
+
+    /// Encode a token sequence after the NAR magic. `serialize()` can
+    /// only emit well-formed NARs; every rejection case needs raw
+    /// tokens.
+    fn nar_tokens(tokens: &[&str]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_str(&mut buf, NAR_MAGIC).unwrap();
+        for t in tokens {
+            write_str(&mut buf, t).unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn nar_ls_rejects_invalid_magic() {
+        let mut buf = Vec::new();
+        write_str(&mut buf, "not-nar-magic").unwrap();
+        assert!(matches!(
+            nar_ls(Cursor::new(&buf)),
+            Err(NarError::InvalidMagic(_))
+        ));
+    }
+
+    #[test]
+    fn nar_ls_rejects_unknown_node_type() {
+        let buf = nar_tokens(&["(", "type", "fifo"]);
+        assert!(matches!(
+            nar_ls(Cursor::new(&buf)),
+            Err(NarError::UnknownNodeType(ref t)) if t == "fifo"
+        ));
+    }
+
+    /// `expect_token` mismatch — the other UnexpectedToken cases below
+    /// hit explicit match arms, not the generic helper.
+    #[test]
+    fn nar_ls_rejects_missing_open_paren() {
+        let buf = nar_tokens(&["garbage"]);
+        assert!(matches!(
+            nar_ls(Cursor::new(&buf)),
+            Err(NarError::UnexpectedToken { ref got, .. }) if got == "garbage"
+        ));
+    }
+
+    #[test]
+    fn nar_ls_rejects_regular_without_contents() {
+        let buf = nar_tokens(&["(", "type", "regular", "garbage"]);
+        assert!(matches!(
+            nar_ls(Cursor::new(&buf)),
+            Err(NarError::UnexpectedToken { ref got, .. }) if got == "garbage"
+        ));
+    }
+
+    #[test]
+    fn nar_ls_rejects_unknown_directory_token() {
+        let buf = nar_tokens(&["(", "type", "directory", "nonsense"]);
+        assert!(matches!(
+            nar_ls(Cursor::new(&buf)),
+            Err(NarError::UnexpectedToken { ref got, .. }) if got == "nonsense"
+        ));
+    }
+
+    #[test]
+    fn nar_ls_rejects_unsorted_entries() {
+        #[rustfmt::skip]
+        let buf = nar_tokens(&[
+            "(", "type", "directory",
+            "entry", "(", "name", "z", "node",
+                "(", "type", "symlink", "target", "t", ")",
+            ")",
+            "entry", "(", "name", "a", "node",
+                "(", "type", "symlink", "target", "t", ")",
+            ")",
+            ")",
+        ]);
+        assert!(matches!(
+            nar_ls(Cursor::new(&buf)),
+            Err(NarError::UnsortedEntries { ref prev, ref cur }) if prev == "z" && cur == "a"
+        ));
+    }
 }
