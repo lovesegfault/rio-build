@@ -164,11 +164,10 @@ mod tests {
 
     /// Fixed seed → deterministic keypair. Matches the pattern in
     /// `rio-store/src/signing.rs`. We never call `SigningKey::generate`
-    /// in tests: that needs a `rand_core` 0.6 RNG, but the workspace
-    /// is on `rand` 0.9 (→ `rand_core` 0.9). Building from seed bytes
-    /// sidesteps the trait-version mismatch entirely AND makes
-    /// proptest shrinking meaningful (same seed → same key → same
-    /// failure).
+    /// in tests — building from seed bytes makes proptest shrinking
+    /// meaningful (same seed → same key → same failure) and mirrors
+    /// production, where the key always arrives as seed bytes from a
+    /// K8s Secret rather than being generated in-process.
     fn key_from_seed(seed: [u8; 32]) -> SigningKey {
         SigningKey::from_bytes(&seed)
     }

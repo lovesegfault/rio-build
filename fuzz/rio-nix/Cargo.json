@@ -1262,26 +1262,11 @@
         "John Nunley <dev@notgull.net>"
       ]
     },
-    "const-oid 0.10.2": {
+    "const-oid": {
       "crateName": "const-oid",
       "version": "0.10.2",
       "edition": "2024",
       "sha256": "0p7m286mp8aai4sa72g7ji6qm0d4ns8wg4i4b2hj9p9615zm3vx6",
-      "source": {
-        "type": "crates-io"
-      },
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "RustCrypto Developers"
-      ]
-    },
-    "const-oid 0.9.6": {
-      "crateName": "const-oid",
-      "version": "0.9.6",
-      "edition": "2021",
-      "sha256": "1y0jnqaq7p2wvspnx7qj76m7hjcqpz73qzvr9l2p9n2s51vr6if2",
       "source": {
         "type": "crates-io"
       },
@@ -1723,68 +1708,7 @@
         "RustCrypto Developers"
       ]
     },
-    "curve25519-dalek 4.1.3": {
-      "crateName": "curve25519-dalek",
-      "version": "4.1.3",
-      "edition": "2021",
-      "sha256": "1gmjb9dsknrr8lypmhkyjd67p1arb8mbfamlwxm7vph38my8pywp",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "cfg-if",
-          "packageId": "cfg-if"
-        },
-        {
-          "name": "cpufeatures",
-          "packageId": "cpufeatures 0.2.17",
-          "target": "cfg(target_arch = \"x86_64\")"
-        },
-        {
-          "name": "curve25519-dalek-derive",
-          "packageId": "curve25519-dalek-derive",
-          "target": "cfg(all(not(curve25519_dalek_backend = \"fiat\"), not(curve25519_dalek_backend = \"serial\"), target_arch = \"x86_64\"))"
-        },
-        {
-          "name": "digest",
-          "packageId": "digest 0.10.7"
-        },
-        {
-          "name": "fiat-crypto",
-          "packageId": "fiat-crypto 0.2.9",
-          "target": "cfg(curve25519_dalek_backend = \"fiat\")"
-        },
-        {
-          "name": "subtle",
-          "packageId": "subtle"
-        },
-        {
-          "name": "zeroize",
-          "packageId": "zeroize"
-        }
-      ],
-      "buildDependencies": [
-        {
-          "name": "rustc_version",
-          "packageId": "rustc_version"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "alloc",
-        "digest",
-        "precomputed-tables",
-        "zeroize"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Isis Lovecruft <isis@patternsinthevoid.net>",
-        "Henry de Valence <hdevalence@hdevalence.ca>"
-      ]
-    },
-    "curve25519-dalek 5.0.0-pre.6": {
+    "curve25519-dalek": {
       "crateName": "curve25519-dalek",
       "version": "5.0.0-pre.6",
       "edition": "2024",
@@ -1813,7 +1737,7 @@
         },
         {
           "name": "fiat-crypto",
-          "packageId": "fiat-crypto 0.3.0",
+          "packageId": "fiat-crypto",
           "target": "cfg(curve25519_dalek_backend = \"fiat\")"
         },
         {
@@ -1987,38 +1911,7 @@
         "Julien Cretin <git@ia0.eu>"
       ]
     },
-    "der 0.7.10": {
-      "crateName": "der",
-      "version": "0.7.10",
-      "edition": "2021",
-      "sha256": "1jyxacyxdx6mxbkfw99jz59dzvcd9k17rq01a7xvn1dr6wl87hg7",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "const-oid",
-          "packageId": "const-oid 0.9.6"
-        },
-        {
-          "name": "zeroize",
-          "packageId": "zeroize"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "alloc",
-        "oid",
-        "std",
-        "zeroize"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "RustCrypto Developers"
-      ]
-    },
-    "der 0.8.0": {
+    "der": {
       "crateName": "der",
       "version": "0.8.0",
       "edition": "2024",
@@ -2029,7 +1922,7 @@
       "dependencies": [
         {
           "name": "const-oid",
-          "packageId": "const-oid 0.10.2"
+          "packageId": "const-oid"
         },
         {
           "name": "pem-rfc7468",
@@ -2213,7 +2106,7 @@
         },
         {
           "name": "const-oid",
-          "packageId": "const-oid 0.10.2"
+          "packageId": "const-oid"
         },
         {
           "name": "crypto-common",
@@ -2307,7 +2200,7 @@
       "dependencies": [
         {
           "name": "der",
-          "packageId": "der 0.8.0"
+          "packageId": "der"
         },
         {
           "name": "digest",
@@ -2323,11 +2216,11 @@
         },
         {
           "name": "signature",
-          "packageId": "signature 3.0.0"
+          "packageId": "signature"
         },
         {
           "name": "spki",
-          "packageId": "spki 0.8.0"
+          "packageId": "spki"
         },
         {
           "name": "zeroize",
@@ -2354,37 +2247,7 @@
         "RustCrypto Developers"
       ]
     },
-    "ed25519 2.2.3": {
-      "crateName": "ed25519",
-      "version": "2.2.3",
-      "edition": "2021",
-      "sha256": "0lydzdf26zbn82g7xfczcac9d7mzm3qgx934ijjrd5hjpjx32m8i",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "pkcs8",
-          "packageId": "pkcs8 0.10.2"
-        },
-        {
-          "name": "signature",
-          "packageId": "signature 2.2.0"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "alloc",
-        "pkcs8",
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "RustCrypto Developers"
-      ]
-    },
-    "ed25519 3.0.0": {
+    "ed25519": {
       "crateName": "ed25519",
       "version": "3.0.0",
       "edition": "2024",
@@ -2395,11 +2258,11 @@
       "dependencies": [
         {
           "name": "pkcs8",
-          "packageId": "pkcs8 0.11.0"
+          "packageId": "pkcs8"
         },
         {
           "name": "signature",
-          "packageId": "signature 3.0.0"
+          "packageId": "signature"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -2413,54 +2276,7 @@
         "RustCrypto Developers"
       ]
     },
-    "ed25519-dalek 2.2.0": {
-      "crateName": "ed25519-dalek",
-      "version": "2.2.0",
-      "edition": "2021",
-      "sha256": "1agcwij1z687hg26ngzwhnmpz29b2w56m8z1ap3pvrnfh709drvh",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "curve25519-dalek",
-          "packageId": "curve25519-dalek 4.1.3"
-        },
-        {
-          "name": "ed25519",
-          "packageId": "ed25519 2.2.3"
-        },
-        {
-          "name": "sha2",
-          "packageId": "sha2 0.10.9"
-        },
-        {
-          "name": "subtle",
-          "packageId": "subtle"
-        },
-        {
-          "name": "zeroize",
-          "packageId": "zeroize"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "alloc",
-        "default",
-        "fast",
-        "pkcs8",
-        "std",
-        "zeroize"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "isis lovecruft <isis@patternsinthevoid.net>",
-        "Tony Arcieri <bascule@gmail.com>",
-        "Michael Rosenberg <michael@mrosenberg.pub>"
-      ]
-    },
-    "ed25519-dalek 3.0.0-pre.7": {
+    "ed25519-dalek": {
       "crateName": "ed25519-dalek",
       "version": "3.0.0-pre.7",
       "edition": "2024",
@@ -2471,11 +2287,11 @@
       "dependencies": [
         {
           "name": "curve25519-dalek",
-          "packageId": "curve25519-dalek 5.0.0-pre.6"
+          "packageId": "curve25519-dalek"
         },
         {
           "name": "ed25519",
-          "packageId": "ed25519 3.0.0"
+          "packageId": "ed25519"
         },
         {
           "name": "rand_core",
@@ -2487,7 +2303,7 @@
         },
         {
           "name": "signature",
-          "packageId": "signature 3.0.0"
+          "packageId": "signature"
         },
         {
           "name": "subtle",
@@ -2622,7 +2438,7 @@
         },
         {
           "name": "pkcs8",
-          "packageId": "pkcs8 0.11.0"
+          "packageId": "pkcs8"
         },
         {
           "name": "rand_core",
@@ -2872,22 +2688,7 @@
         "Stjepan Glavina <stjepang@gmail.com>"
       ]
     },
-    "fiat-crypto 0.2.9": {
-      "crateName": "fiat-crypto",
-      "version": "0.2.9",
-      "edition": "2018",
-      "sha256": "07c1vknddv3ak7w89n85ik0g34nzzpms6yb845vrjnv9m4csbpi8",
-      "source": {
-        "type": "crates-io"
-      },
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Fiat Crypto library authors <jgross@mit.edu>"
-      ]
-    },
-    "fiat-crypto 0.3.0": {
+    "fiat-crypto": {
       "crateName": "fiat-crypto",
       "version": "0.3.0",
       "edition": "2021",
@@ -6638,7 +6439,7 @@
         },
         {
           "name": "fiat-crypto",
-          "packageId": "fiat-crypto 0.3.0",
+          "packageId": "fiat-crypto",
           "target": "cfg(not(p384_backend = \"bignum\"))"
         },
         {
@@ -7177,11 +6978,11 @@
       "dependencies": [
         {
           "name": "der",
-          "packageId": "der 0.8.0"
+          "packageId": "der"
         },
         {
           "name": "spki",
-          "packageId": "spki 0.8.0"
+          "packageId": "spki"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -7216,7 +7017,7 @@
         },
         {
           "name": "der",
-          "packageId": "der 0.8.0"
+          "packageId": "der"
         },
         {
           "name": "pbkdf2",
@@ -7236,7 +7037,7 @@
         },
         {
           "name": "spki",
-          "packageId": "spki 0.8.0"
+          "packageId": "spki"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -7251,36 +7052,7 @@
         "RustCrypto Developers"
       ]
     },
-    "pkcs8 0.10.2": {
-      "crateName": "pkcs8",
-      "version": "0.10.2",
-      "edition": "2021",
-      "sha256": "1dx7w21gvn07azszgqd3ryjhyphsrjrmq5mmz1fbxkj5g0vv4l7r",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "der",
-          "packageId": "der 0.7.10"
-        },
-        {
-          "name": "spki",
-          "packageId": "spki 0.7.3"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "alloc",
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "RustCrypto Developers"
-      ]
-    },
-    "pkcs8 0.11.0": {
+    "pkcs8": {
       "crateName": "pkcs8",
       "version": "0.11.0",
       "edition": "2024",
@@ -7291,7 +7063,7 @@
       "dependencies": [
         {
           "name": "der",
-          "packageId": "der 0.8.0"
+          "packageId": "der"
         },
         {
           "name": "pkcs5",
@@ -7303,7 +7075,7 @@
         },
         {
           "name": "spki",
-          "packageId": "spki 0.8.0"
+          "packageId": "spki"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -8143,33 +7915,6 @@
         "The Rand Project Developers"
       ]
     },
-    "rand_core 0.6.4": {
-      "crateName": "rand_core",
-      "version": "0.6.4",
-      "edition": "2018",
-      "sha256": "0b4j2v4cb5krak1pv6kakv4sz6xcwbrmy2zckc32hsigbrwy82zc",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "getrandom",
-          "packageId": "getrandom 0.2.17"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "alloc",
-        "getrandom",
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "The Rand Project Developers",
-        "The Rust Project Developers"
-      ]
-    },
     "rand_core 0.9.5": {
       "crateName": "rand_core",
       "version": "0.9.5",
@@ -8720,7 +8465,7 @@
         },
         {
           "name": "ed25519-dalek",
-          "packageId": "ed25519-dalek 2.2.0"
+          "packageId": "ed25519-dalek"
         },
         {
           "name": "hex",
@@ -8841,7 +8586,7 @@
       "dependencies": [
         {
           "name": "const-oid",
-          "packageId": "const-oid 0.10.2"
+          "packageId": "const-oid"
         },
         {
           "name": "crypto-bigint",
@@ -8861,7 +8606,7 @@
         },
         {
           "name": "pkcs8",
-          "packageId": "pkcs8 0.11.0"
+          "packageId": "pkcs8"
         },
         {
           "name": "rand_core",
@@ -8873,11 +8618,11 @@
         },
         {
           "name": "signature",
-          "packageId": "signature 3.0.0"
+          "packageId": "signature"
         },
         {
           "name": "spki",
-          "packageId": "spki 0.8.0"
+          "packageId": "spki"
         },
         {
           "name": "zeroize",
@@ -9552,7 +9297,7 @@
         },
         {
           "name": "der",
-          "packageId": "der 0.8.0"
+          "packageId": "der"
         },
         {
           "name": "hybrid-array",
@@ -10170,26 +9915,7 @@
         "Masaki Hara <ackie.h.gmai@gmail.com>"
       ]
     },
-    "signature 2.2.0": {
-      "crateName": "signature",
-      "version": "2.2.0",
-      "edition": "2021",
-      "sha256": "1pi9hd5vqfr3q3k49k37z06p7gs5si0in32qia4mmr1dancr6m3p",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "alloc",
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "RustCrypto Developers"
-      ]
-    },
-    "signature 3.0.0": {
+    "signature": {
       "crateName": "signature",
       "version": "3.0.0",
       "edition": "2024",
@@ -10421,32 +10147,7 @@
         "Joshua Barretto <joshua.s.barretto@gmail.com>"
       ]
     },
-    "spki 0.7.3": {
-      "crateName": "spki",
-      "version": "0.7.3",
-      "edition": "2021",
-      "sha256": "17fj8k5fmx4w9mp27l970clrh5qa7r5sjdvbsln987xhb34dc7nr",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "der",
-          "packageId": "der 0.7.10"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "alloc",
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "RustCrypto Developers"
-      ]
-    },
-    "spki 0.8.0": {
+    "spki": {
       "crateName": "spki",
       "version": "0.8.0",
       "edition": "2024",
@@ -10457,7 +10158,7 @@
       "dependencies": [
         {
           "name": "der",
-          "packageId": "der 0.8.0"
+          "packageId": "der"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -10874,7 +10575,7 @@
         },
         {
           "name": "ed25519-dalek",
-          "packageId": "ed25519-dalek 3.0.0-pre.7"
+          "packageId": "ed25519-dalek"
         },
         {
           "name": "hex",
@@ -10918,7 +10619,7 @@
         },
         {
           "name": "signature",
-          "packageId": "signature 3.0.0"
+          "packageId": "signature"
         },
         {
           "name": "ssh-cipher",
@@ -13848,7 +13549,11 @@
         },
         {
           "name": "curve25519-dalek",
-          "packageId": "curve25519-dalek 5.0.0-pre.6"
+          "packageId": "curve25519-dalek"
+        },
+        {
+          "name": "der",
+          "packageId": "der"
         },
         {
           "name": "digest",
@@ -13866,11 +13571,11 @@
         },
         {
           "name": "ed25519",
-          "packageId": "ed25519 3.0.0"
+          "packageId": "ed25519"
         },
         {
           "name": "ed25519-dalek",
-          "packageId": "ed25519-dalek 3.0.0-pre.7"
+          "packageId": "ed25519-dalek"
         },
         {
           "name": "either",
@@ -13907,6 +13612,10 @@
         {
           "name": "futures-util",
           "packageId": "futures-util"
+        },
+        {
+          "name": "generic-array",
+          "packageId": "generic-array"
         },
         {
           "name": "getrandom",
@@ -14077,16 +13786,12 @@
           "packageId": "p521"
         },
         {
-          "name": "pbkdf2",
-          "packageId": "pbkdf2"
-        },
-        {
           "name": "percent-encoding",
           "packageId": "percent-encoding"
         },
         {
           "name": "pkcs8",
-          "packageId": "pkcs8 0.11.0"
+          "packageId": "pkcs8"
         },
         {
           "name": "portable-atomic",
@@ -14204,7 +13909,7 @@
         },
         {
           "name": "signature",
-          "packageId": "signature 3.0.0"
+          "packageId": "signature"
         },
         {
           "name": "sketches-ddsketch",
@@ -14220,7 +13925,7 @@
         },
         {
           "name": "spki",
-          "packageId": "spki 0.8.0"
+          "packageId": "spki"
         },
         {
           "name": "sqlx-core",
@@ -14424,7 +14129,11 @@
         },
         {
           "name": "curve25519-dalek",
-          "packageId": "curve25519-dalek 5.0.0-pre.6"
+          "packageId": "curve25519-dalek"
+        },
+        {
+          "name": "der",
+          "packageId": "der"
         },
         {
           "name": "digest",
@@ -14442,11 +14151,11 @@
         },
         {
           "name": "ed25519",
-          "packageId": "ed25519 3.0.0"
+          "packageId": "ed25519"
         },
         {
           "name": "ed25519-dalek",
-          "packageId": "ed25519-dalek 3.0.0-pre.7"
+          "packageId": "ed25519-dalek"
         },
         {
           "name": "either",
@@ -14483,6 +14192,10 @@
         {
           "name": "futures-util",
           "packageId": "futures-util"
+        },
+        {
+          "name": "generic-array",
+          "packageId": "generic-array"
         },
         {
           "name": "getrandom",
@@ -14653,16 +14366,12 @@
           "packageId": "p521"
         },
         {
-          "name": "pbkdf2",
-          "packageId": "pbkdf2"
-        },
-        {
           "name": "percent-encoding",
           "packageId": "percent-encoding"
         },
         {
           "name": "pkcs8",
-          "packageId": "pkcs8 0.11.0"
+          "packageId": "pkcs8"
         },
         {
           "name": "portable-atomic",
@@ -14780,7 +14489,7 @@
         },
         {
           "name": "signature",
-          "packageId": "signature 3.0.0"
+          "packageId": "signature"
         },
         {
           "name": "sketches-ddsketch",
@@ -14796,7 +14505,7 @@
         },
         {
           "name": "spki",
-          "packageId": "spki 0.8.0"
+          "packageId": "spki"
         },
         {
           "name": "sqlx-core",

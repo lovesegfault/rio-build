@@ -31,6 +31,7 @@ crypto-common-6f8ce4dd05d13bba = { package = "crypto-common", version = "0.2", d
 crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", default-features = false, features = ["std"] }
 ctutils = { version = "0.4", default-features = false, features = ["subtle"] }
 curve25519-dalek = { version = "5.0.0-pre.6", features = ["digest"] }
+der = { version = "0.8", default-features = false, features = ["oid", "pem", "std"] }
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }
 ecdsa = { version = "0.17.0-rc.18", features = ["algorithm", "getrandom", "pem", "std"] }
@@ -45,6 +46,7 @@ futures-channel = { version = "0.3", features = ["sink"] }
 futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
+generic-array = { version = "0.14", default-features = false, features = ["more_lengths"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std", "wasm_js"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["js", "std"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
@@ -73,7 +75,6 @@ ordered-float = { version = "5" }
 p256 = { version = "0.14.0-rc.9", features = ["ecdh"] }
 p384 = { version = "0.14.0-rc.9", features = ["ecdh"] }
 p521 = { version = "0.14.0-rc.9", features = ["ecdh"] }
-pbkdf2 = { version = "0.13" }
 percent-encoding = { version = "2" }
 pkcs8 = { version = "0.11", default-features = false, features = ["encryption", "pem", "std"] }
 portable-atomic = { version = "1", features = ["require-cas"] }
@@ -150,6 +151,7 @@ crypto-common-6f8ce4dd05d13bba = { package = "crypto-common", version = "0.2", d
 crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", default-features = false, features = ["std"] }
 ctutils = { version = "0.4", default-features = false, features = ["subtle"] }
 curve25519-dalek = { version = "5.0.0-pre.6", features = ["digest"] }
+der = { version = "0.8", default-features = false, features = ["oid", "pem", "std"] }
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }
 ecdsa = { version = "0.17.0-rc.18", features = ["algorithm", "getrandom", "pem", "std"] }
@@ -164,6 +166,7 @@ futures-channel = { version = "0.3", features = ["sink"] }
 futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
+generic-array = { version = "0.14", default-features = false, features = ["more_lengths"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std", "wasm_js"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["js", "std"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
@@ -192,7 +195,6 @@ ordered-float = { version = "5" }
 p256 = { version = "0.14.0-rc.9", features = ["ecdh"] }
 p384 = { version = "0.14.0-rc.9", features = ["ecdh"] }
 p521 = { version = "0.14.0-rc.9", features = ["ecdh"] }
-pbkdf2 = { version = "0.13" }
 percent-encoding = { version = "2" }
 pkcs8 = { version = "0.11", default-features = false, features = ["encryption", "pem", "std"] }
 portable-atomic = { version = "1", features = ["require-cas"] }
