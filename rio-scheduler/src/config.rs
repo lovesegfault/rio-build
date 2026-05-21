@@ -1,4 +1,4 @@
-//! `rio-scheduler` binary configuration: figment-loaded `Config`
+//! `rio-scheduler` binary configuration: layered-config-loaded `Config`
 //! struct, clap `CliArgs` overlay, and the `ValidateConfig` bounds
 //! checks. Extracted from `main.rs` so config parsing/validation is
 //! unit-testable without the full bootstrap (PG connect, gRPC bind,
@@ -86,7 +86,7 @@ pub struct Config {
     /// ADR-023 SLA-driven sizing. `[sla]` table in scheduler.toml —
     /// mandatory (helm always renders it). No env override — structured
     /// config only. The figment baseline (`Default for Config`) is
-    /// [`crate::sla::config::SlaConfig::figment_baseline`],
+    /// [`crate::sla::config::SlaConfig::defaults_baseline`],
     /// which leaves `maxCores`/`maxMem`/`hwClasses` empty so a TOML
     /// that omits them is read as "unset" — figment merges per-key,
     /// so a populated baseline would mask the §13c-3 catalog derive.
@@ -155,7 +155,7 @@ impl Default for Config {
             retry: crate::RetryPolicy::default(),
             substitute_max_concurrent: default_substitute_concurrency(),
             dashboard: DashboardConfig::default(),
-            sla: crate::sla::config::SlaConfig::figment_baseline(),
+            sla: crate::sla::config::SlaConfig::defaults_baseline(),
             allow_reference_change: false,
         }
     }

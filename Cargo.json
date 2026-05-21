@@ -20550,8 +20550,8 @@
           "packageId": "aws-smithy-mocks"
         },
         {
-          "name": "figment",
-          "packageId": "figment"
+          "name": "config",
+          "packageId": "config"
         },
         {
           "name": "http",

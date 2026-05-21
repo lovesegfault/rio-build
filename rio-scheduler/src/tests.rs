@@ -21,7 +21,7 @@ fn config_defaults_are_stable() {
     assert_eq!(d.log_s3_bucket, None);
     // Size-classes: optional feature, off by default.
     assert_eq!(d.common.drain_grace, std::time::Duration::from_secs(6));
-    // Phase 4a (plan 21E): lease config via figment, not raw env.
+    // Phase 4a (plan 21E): lease config via the config layer, not raw env.
     assert_eq!(d.lease_name, None, "non-K8s mode by default");
     assert_eq!(d.lease_namespace, None);
     // D3: gRPC-Web CORS — default is the in-cluster nginx Service
@@ -49,12 +49,11 @@ fn config_defaults_are_stable() {
 /// these knobs were TOML-configurable; P0219 shipped the structs
 /// but left the Config side unwired. This proves the parse works.
 ///
-/// Raw figment (not `rio_common::config::load`) to test JUST
+/// Raw config layering (not `rio_common::config::load`) to test JUST
 /// the deserialize path — no env/CLI layering concern here.
 /// The Jail tests below exercise the full load() stack.
 #[test]
 fn poison_and_retry_load_from_toml() {
-    use figment::providers::{Format, Toml};
     let toml = r#"
         [poison]
         threshold = 5
@@ -67,11 +66,13 @@ fn poison_and_retry_load_from_toml() {
         backoff_max_secs = 600.0
         jitter_fraction = 0.1
     "#;
-    let cfg: Config =
-        figment::Figment::from(figment::providers::Serialized::defaults(Config::default()))
-            .merge(Toml::string(toml))
-            .extract()
-            .expect("toml parses into Config");
+    let cfg: Config = ::config::Config::builder()
+        .add_source(rio_common::config::serialized_layer(&Config::default()).unwrap())
+        .add_source(::config::File::from_str(toml, ::config::FileFormat::Toml))
+        .build()
+        .unwrap()
+        .try_deserialize::<Config>()
+        .unwrap();
 
     assert_eq!(cfg.poison.threshold, 5);
     assert!(!cfg.poison.require_distinct_workers);
@@ -86,25 +87,26 @@ fn poison_and_retry_load_from_toml() {
 /// parses into `Vec<String>`.
 #[test]
 fn soft_features_load_from_toml() {
-    use figment::providers::{Format, Toml};
     let toml = r#"
         soft_features = ["big-parallel", "benchmark"]
     "#;
-    let cfg: Config =
-        figment::Figment::from(figment::providers::Serialized::defaults(Config::default()))
-            .merge(Toml::string(toml))
-            .extract()
-            .expect("toml parses into Config");
+    let cfg: Config = ::config::Config::builder()
+        .add_source(rio_common::config::serialized_layer(&Config::default()).unwrap())
+        .add_source(::config::File::from_str(toml, ::config::FileFormat::Toml))
+        .build()
+        .unwrap()
+        .try_deserialize::<Config>()
+        .unwrap();
     assert_eq!(cfg.soft_features, ["big-parallel", "benchmark"]);
 }
 
 /// §13c-3 regression: `[sla].max_cores`/`max_mem` absent from TOML
-/// MUST extract as `None`, and the figment baseline MUST NOT inject a
+/// MUST extract as `None`, and the defaults baseline MUST NOT inject a
 /// phantom `test-hw` class.
 ///
 /// Before this fix, `Config::default()` used [`SlaConfig::test_default`]
-/// (`max_cores: Some(16.0)`, `hw_classes: {test-hw}`) as the figment
-/// baseline. Figment merges per-key — a TOML that omits
+/// (`max_cores: Some(16.0)`, `hw_classes: {test-hw}`) as the defaults
+/// baseline. The config layering merges per-key — a TOML that omits
 /// `[sla].max_cores` keeps the baseline's `Some(16.0)`, so
 /// [`SlaConfig::resolve_globals`] short-circuits BEFORE the §13c-2
 /// catalog derive ever runs. With `probe.cpu = 16` (the chart default)
@@ -115,7 +117,6 @@ fn soft_features_load_from_toml() {
 /// `hw_classes`.
 #[test]
 fn sla_globals_unset_in_toml_extract_as_none() {
-    use figment::providers::{Format, Toml};
     // Mirror the helm-rendered shape: `[sla]` present, full hwClasses
     // and probe set, `max_cores`/`max_mem` deliberately ABSENT (the
     // §13c-3 default — derive from catalog at boot under spot).
@@ -142,15 +143,17 @@ fn sla_globals_unset_in_toml_extract_as_none() {
         [[sla.tiers]]
         name = "normal"
     "#;
-    let cfg: Config =
-        figment::Figment::from(figment::providers::Serialized::defaults(Config::default()))
-            .merge(Toml::string(toml))
-            .extract()
-            .expect("toml parses into Config");
+    let cfg: Config = ::config::Config::builder()
+        .add_source(rio_common::config::serialized_layer(&Config::default()).unwrap())
+        .add_source(::config::File::from_str(toml, ::config::FileFormat::Toml))
+        .build()
+        .unwrap()
+        .try_deserialize::<Config>()
+        .unwrap();
     assert_eq!(
         cfg.sla.max_cores, None,
         "max_cores absent from TOML must extract as None (§13c-3 \
-         catalog-derive contract); a populated figment baseline masks it"
+         catalog-derive contract); a populated defaults baseline masks it"
     );
     assert_eq!(
         cfg.sla.max_mem, None,
@@ -158,8 +161,8 @@ fn sla_globals_unset_in_toml_extract_as_none() {
     );
     assert!(
         !cfg.sla.hw_classes.contains_key("test-hw"),
-        "the figment baseline must not inject a phantom test-hw class \
-         alongside the operator's hwClasses (figment deep-merges hashmaps)"
+        "the defaults baseline must not inject a phantom test-hw class \
+         alongside the operator's hwClasses (the config layering deep-merges hashmaps)"
     );
     assert_eq!(
         cfg.sla.hw_classes.len(),
@@ -175,12 +178,12 @@ fn sla_globals_unset_in_toml_extract_as_none() {
         .expect("merged config passes pass-1");
 }
 
-/// `Config::default()` ([`SlaConfig::figment_baseline`]) is
+/// `Config::default()` ([`SlaConfig::defaults_baseline`]) is
 /// intentionally NOT bootable on its own — `[sla]` is a mandatory
-/// table that every figment-loaded source (helm scheduler.toml,
+/// table that every config-loaded source (helm scheduler.toml,
 /// VM-test `extraSchedulerConfig.extraConfig`) must provide.
 ///
-/// Tripwire for the figment-baseline drift class: pre-3c16e0806,
+/// Tripwire for the defaults-baseline drift class: pre-3c16e0806,
 /// `Config::default()` used [`SlaConfig::test_default`]
 /// (`max_cores: Some(16.0)`, `hw_classes: {test-hw}`), which let a
 /// TOML-less scheduler boot silently. That masked 8 standalone
@@ -202,7 +205,7 @@ fn config_default_is_not_bootable_without_sla_source() {
     cfg.store.addr = "http://localhost:1".into();
     let err = cfg
         .validate()
-        .expect_err("Config::default() (figment baseline) must NOT validate");
+        .expect_err("Config::default() (defaults baseline) must NOT validate");
     assert!(
         err.to_string().contains("hwCostSource=static"),
         "must trip on the §13c-3 (None, None) ∧ Static guard; got: {err:#}"
@@ -215,21 +218,27 @@ fn config_default_is_not_bootable_without_sla_source() {
 /// with no `[poison]`/`[retry]` tables continue unchanged.
 #[test]
 fn poison_and_retry_default_when_absent() {
-    use figment::providers::{Format, Toml};
-    let cfg: Config =
-        figment::Figment::from(figment::providers::Serialized::defaults(Config::default()))
-            .merge(Toml::string(""))
-            .extract()
-            .expect("empty toml parses");
+    let cfg: Config = ::config::Config::builder()
+        .add_source(rio_common::config::serialized_layer(&Config::default()).unwrap())
+        .add_source(::config::File::from_str("", ::config::FileFormat::Toml))
+        .build()
+        .unwrap()
+        .try_deserialize::<Config>()
+        .unwrap();
     assert_eq!(cfg.poison, rio_scheduler::PoisonConfig::default());
     assert_eq!(cfg.retry, rio_scheduler::RetryPolicy::default());
     // Partial table: one field set, others default from the
     // struct-level `#[serde(default)]` on PoisonConfig.
-    let partial: Config =
-        figment::Figment::from(figment::providers::Serialized::defaults(Config::default()))
-            .merge(Toml::string("[poison]\nthreshold = 7"))
-            .extract()
-            .expect("partial poison table parses");
+    let partial: Config = ::config::Config::builder()
+        .add_source(rio_common::config::serialized_layer(&Config::default()).unwrap())
+        .add_source(::config::File::from_str(
+            "[poison]\nthreshold = 7",
+            ::config::FileFormat::Toml,
+        ))
+        .build()
+        .unwrap()
+        .try_deserialize::<Config>()
+        .unwrap();
     assert_eq!(partial.poison.threshold, 7);
     assert!(
         partial.poison.require_distinct_workers,
@@ -261,12 +270,12 @@ fn cli_args_parse_help() {
 /// returned config passes validation as-is (the "happy path" baseline
 /// that each rejection test mutates).
 ///
-/// Use [`SlaConfig::test_default`] (NOT the figment baseline) for
+/// Use [`SlaConfig::test_default`] (NOT the defaults baseline) for
 /// `sla`: `validate()` calls `validate_shape()`, which requires a
 /// non-empty `hw_classes`. `Config::default()` deliberately leaves
-/// `hw_classes` empty so figment doesn't merge a phantom `test-hw`
+/// `hw_classes` empty so the config layering doesn't merge a phantom `test-hw`
 /// over the operator's TOML — see
-/// [`SlaConfig::figment_baseline`](rio_scheduler::sla::config::SlaConfig::figment_baseline).
+/// [`SlaConfig::defaults_baseline`](rio_scheduler::sla::config::SlaConfig::defaults_baseline).
 fn test_valid_config() -> Config {
     let mut cfg = Config {
         database_url: "postgres://localhost/test".into(),
@@ -391,7 +400,7 @@ fn config_accepts_backoff_boundaries() {
         .expect("defaults should be valid");
 }
 
-// figment::Jail standing-guard tests — see rio-test-support/src/config.rs.
+// Jailed standing-guard tests — see rio-test-support/src/config.rs.
 // When you add Config.newfield: ADD IT to both assert blocks below.
 
 rio_test_support::jail_roundtrip!(
@@ -406,11 +415,11 @@ rio_test_support::jail_roundtrip!(
     |cfg: Config| {
         assert_eq!(
             cfg.poison.threshold, 7,
-            "[poison] table must thread through figment into PoisonConfig"
+            "[poison] table must thread through the config layers into PoisonConfig"
         );
         assert_eq!(
             cfg.retry.backoff_base_secs, 3.33,
-            "[retry] table must thread through figment into RetryPolicy"
+            "[retry] table must thread through the config layers into RetryPolicy"
         );
         // Unspecified fields default via #[serde(default)] on
         // the sub-struct — PARTIAL tables must work.
@@ -832,21 +841,22 @@ async fn set_service_status_empty_string_flips_whole_server() -> anyhow::Result<
 }
 
 /// `[dashboard]` table parses; env override (comma-joined) maps to
-/// the same field. Figment env nesting: `RIO_DASHBOARD__X` →
+/// the same field. Env nesting: `RIO_DASHBOARD__X` →
 /// `dashboard.x`. Helm renders `| join ","` so the value is a
 /// single string regardless of origin count.
 #[test]
 fn dashboard_loads_from_toml_and_splits_origins() {
-    use figment::providers::{Format, Toml};
     let toml = r#"
         [dashboard]
         cors_allow_origins = "http://a.example,http://b.example"
     "#;
-    let cfg: Config =
-        figment::Figment::from(figment::providers::Serialized::defaults(Config::default()))
-            .merge(Toml::string(toml))
-            .extract()
-            .expect("toml parses into Config");
+    let cfg: Config = ::config::Config::builder()
+        .add_source(rio_common::config::serialized_layer(&Config::default()).unwrap())
+        .add_source(::config::File::from_str(toml, ::config::FileFormat::Toml))
+        .build()
+        .unwrap()
+        .try_deserialize::<Config>()
+        .unwrap();
     assert_eq!(
         cfg.dashboard.cors_allow_origins,
         "http://a.example,http://b.example"

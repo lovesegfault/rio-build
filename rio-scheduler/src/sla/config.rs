@@ -915,10 +915,10 @@ impl SlaConfig {
         }
     }
 
-    /// Figment baseline for `rio-scheduler::config::Config::default()`.
+    /// Defaults baseline for `rio-scheduler::config::Config::default()`.
     ///
-    /// The binary's `Config::default()` is the figment layer that the
-    /// helm-rendered `scheduler.toml` is merged ONTO. Figment merges
+    /// The binary's `Config::default()` is the defaults layer that the
+    /// helm-rendered `scheduler.toml` is merged ONTO. Layer merging is
     /// per-key (not per-table), so a field set here is what the running
     /// process sees whenever the operator's TOML omits that key.
     ///
@@ -934,8 +934,9 @@ impl SlaConfig {
     ///   the resolved global pins to 16, `probe.cpu=16` then fails
     ///   `validate_resolved` (`probe.cpu ≤ maxCores/4 = 4`), and the
     ///   scheduler crash-loops at boot.
-    /// - `hw_classes`: figment deep-merges hashmaps. A `test-hw` entry
-    ///   here persists alongside the operator's classes; with
+    /// - `hw_classes`: the config layering deep-merges hashmaps (later
+    ///   layers override per key). A `test-hw` entry here persists
+    ///   alongside the operator's classes; with
     ///   `requirements = [kubernetes.io/os In [linux]]` it is a
     ///   match-everything phantom class the solver would route to.
     ///
@@ -948,7 +949,7 @@ impl SlaConfig {
     /// fails [`Self::validate_shape`] at boot (`hw_classes` empty,
     /// `reference_hw_class` not in `hw_classes`). Tests that need a
     /// usable config without a TOML use [`Self::test_default`].
-    pub fn figment_baseline() -> Self {
+    pub fn defaults_baseline() -> Self {
         Self {
             max_cores: None,
             max_mem: None,

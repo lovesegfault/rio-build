@@ -924,7 +924,7 @@
     },
     {
       "depth": 0,
-      "doc": "`rio-scheduler` binary configuration: figment-loaded `Config`",
+      "doc": "`rio-scheduler` binary configuration: layered-config-loaded `Config`",
       "path": "config.rs"
     },
     {
