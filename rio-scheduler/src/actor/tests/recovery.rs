@@ -2653,3 +2653,169 @@ async fn test_recovery_preserves_reset_exec_id_clear() -> TestResult {
 
     Ok(())
 }
+
+/// bug_012 (r11): acquisition-time reconciliation of an ex-leader's retained
+/// `LogBuffers` is two-part — the restamp loop covers PG-`Assigned|Running`
+/// drvs; the post-load sweep covers everything else. A retained entry for a
+/// drv that went terminal under an interim leader is never loaded, so without
+/// the sweep it shadows the execution's stored log in GetDerivationLogs (ring
+/// buffer is probed before S3) and flush_periodic re-uploads its `.partial`
+/// every 30s forever. Entries for drvs the rebuilt DAG still tracks must
+/// survive regardless of status: Assigned (reconnect window) and
+/// Ready-with-retained-buffer (cancel-sweep finalization reads that stamp).
+///
+/// r[verify sched.recovery.log-buffer-sweep]
+#[tokio::test]
+async fn test_recovery_sweeps_stale_log_buffers() -> TestResult {
+    let exec_keep = Uuid::now_v7();
+    let exec_ready = Uuid::now_v7();
+    let exec_gone = Uuid::now_v7();
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // Distinct store-path hashes so the three drvs occupy distinct
+    // LogBuffers keys (drv_log_hash keys on the path's hash part, and every
+    // test_drv_path() shares TEST_HASH).
+    let keep_path = test_drv_path("sweep-keep");
+    let ready_path = format!("/nix/store/{}-sweep-ready.drv", "b".repeat(32));
+    let gone_path = format!("/nix/store/{}-sweep-gone.drv", "c".repeat(32));
+
+    // --- Phase 1: PG state left by the prior leaderships. ---
+    let gone_build = Uuid::new_v4();
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        merge_single_node(
+            &handle,
+            Uuid::new_v4(),
+            "sweep-keep",
+            PriorityClass::Scheduled,
+        )
+        .await?;
+        merge_single_node(
+            &handle,
+            Uuid::new_v4(),
+            "sweep-ready",
+            PriorityClass::Scheduled,
+        )
+        .await?;
+        merge_single_node(&handle, gone_build, "sweep-gone", PriorityClass::Scheduled).await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+    // keep: in-flight Assigned with a live assignment → restamp covers it.
+    let (keep_id,): (Uuid,) =
+        sqlx::query_as("SELECT derivation_id FROM derivations WHERE drv_hash = 'sweep-keep'")
+            .fetch_one(&db.pool)
+            .await?;
+    sqlx::query(
+        "UPDATE derivations SET status = 'assigned', assigned_builder_id = 'w-keep' \
+         WHERE derivation_id = $1",
+    )
+    .bind(keep_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO assignments (derivation_id, builder_id, generation, status, exec_id) \
+         VALUES ($1, 'w-keep', 1, 'pending', $2)",
+    )
+    .bind(keep_id)
+    .bind(exec_keep)
+    .execute(&db.pool)
+    .await?;
+    // ready: stays `ready` (post-reset shape), distinct drv_path.
+    sqlx::query("UPDATE derivations SET drv_path = $1 WHERE drv_hash = 'sweep-ready'")
+        .bind(&ready_path)
+        .execute(&db.pool)
+        .await?;
+    // gone: went terminal under the interim leader; its build finished.
+    sqlx::query(
+        "UPDATE derivations SET status = 'completed', drv_path = $1 \
+         WHERE drv_hash = 'sweep-gone'",
+    )
+    .bind(&gone_path)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query("UPDATE builds SET status = 'succeeded' WHERE build_id = $1")
+        .bind(gone_build)
+        .execute(&db.pool)
+        .await?;
+
+    // --- Phase 2: the EX-LEADER re-acquires; its retained LogBuffers holds
+    // pre-flap lines for all three executions. ---
+    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    for (path, exec, worker) in [
+        (&keep_path, exec_keep, "w-keep"),
+        (&ready_path, exec_ready, "w-ready"),
+        (&gone_path, exec_gone, "w-gone"),
+    ] {
+        log_buffers.set_exec(path, exec, worker);
+        assert!(
+            log_buffers.push_for(
+                path,
+                &rio_proto::types::BuildLogBatch {
+                    derivation_path: path.clone(),
+                    lines: vec![b"retained pre-flap line".to_vec()],
+                    first_line_number: 0,
+                    executor_id: worker.to_string(),
+                },
+                worker,
+            ),
+            "fixture premise: retained entry for {path} holds pre-flap lines"
+        );
+    }
+
+    let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(8);
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, plumbing| {
+        plumbing.log_buffers = Some(log_buffers.clone());
+        plumbing.log_flush_tx = Some(flush_tx);
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // Fixture premise: ready recovered as Ready (in the DAG, not restamped).
+    // No status assert for sweep-keep: the cfg(test) 100ms ReconcileAssignments
+    // may reset the orphaned Assigned drv to Ready at any point after
+    // acquisition; the restamp assertion below proves the Assigned-recovery
+    // path ran, and the buffer assertions are insensitive to that reset.
+    assert_eq!(
+        expect_drv(&handle, "sweep-ready").await.status,
+        DerivationStatus::Ready
+    );
+
+    // (1) Assigned drv: restamped, lines retained (reconnect window).
+    assert_eq!(log_buffers.exec_id(&keep_path), Some(exec_keep));
+    assert_eq!(
+        log_buffers.read_since(&keep_path, 0).map(|l| l.len()),
+        Some(1),
+        "Assigned|Running entries must survive acquisition"
+    );
+    // (2) Ready drv with a retained prior-exec buffer: kept — DAG membership,
+    // not restamp coverage, is the survival criterion (cancel-sweep
+    // finalization reads this stamp).
+    assert_eq!(log_buffers.exec_id(&ready_path), Some(exec_ready));
+    assert_eq!(
+        log_buffers.read_since(&ready_path, 0).map(|l| l.len()),
+        Some(1),
+        "entries for drvs still tracked by the rebuilt DAG must not be swept"
+    );
+    // (3) Terminal-under-interim-leader drv: swept. read_since == None means
+    // GetDerivationLogs falls through to S3 (the interim leader's stored log)
+    // instead of serving stale pre-flap lines, and flush_periodic has no
+    // entry left to re-upload every 30s.
+    assert_eq!(
+        log_buffers.exec_id(&gone_path),
+        None,
+        "retained entry for a drv not in the rebuilt DAG must be discarded"
+    );
+    assert!(
+        log_buffers.read_since(&gone_path, 0).is_none(),
+        "stale pre-flap lines must not shadow the interim leader's stored log"
+    );
+    // (4) The sweep is a discard, not a finalization: no FlushRequest.
+    assert!(
+        flush_rx.try_recv().is_err(),
+        "acquisition-time sweep must not enqueue flush requests"
+    );
+
+    Ok(())
+}

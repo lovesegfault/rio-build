@@ -585,8 +585,10 @@ impl LogBuffers {
     /// `handle_cleanup_terminal_build` for each reaped DAG node (bounds
     /// a dropped-FlushRequest leak to `TERMINAL_CLEANUP_DELAY`, ~60s) and
     /// `tick_process_expired_poisons` for never-re-dispatched poisoned
-    /// drvs (defense-in-depth against a slow leak). Idempotent; no-op
-    /// on a missing entry.
+    /// drvs (defense-in-depth against a slow leak), and by
+    /// `discard_unsealed_not_in` (acquisition-time sweep — a `pub(crate)`
+    /// sibling, so plain backticks rather than an intra-doc link).
+    /// Idempotent; no-op on a missing entry.
     pub fn discard(&self, drv_path: &str) {
         let key = drv_log_hash(drv_path);
         self.buffers.remove(&key);
@@ -638,6 +640,65 @@ impl LogBuffers {
                 e.assigned_executor.as_deref() == Some(executor)
             })
             .is_some()
+    }
+
+    /// Discard every **unsealed** entry whose key is not in `live_keys`
+    /// (keys in [`drv_log_hash`] form). Returns how many were discarded.
+    ///
+    /// Recovery-only sweep, called via the actor's
+    /// `sweep_stale_log_buffers` right after the DAG is rebuilt from PG on
+    /// lease acquisition: an ex-leader's `LogBuffers` is retained across
+    /// the flap (`clear_persisted_state`), and the restamp loop only
+    /// covers PG-`Assigned|Running` drvs — an entry whose drv went
+    /// terminal under an interim leader would otherwise shadow that
+    /// execution's stored log in `GetDerivationLogs` (the ring buffer is
+    /// probed before S3) and be re-uploaded as a stale `.partial` by every
+    /// periodic flush for the process lifetime.
+    ///
+    /// Sealed entries are skipped: a seal marks a terminal observed by
+    /// THIS process whose final `FlushRequest` may still be queued — the
+    /// flusher's `drain_if_exec` owns that entry's removal. If that
+    /// request was instead dropped at enqueue (channel full) and the
+    /// lease flapped before the build's cleanup ran, the sealed entry
+    /// lingers until process restart — accepted residual: at acquisition
+    /// we cannot tell a queued request from a dropped one, and discarding
+    /// sealed entries would lose a queued final flush.
+    ///
+    /// Keys are snapshotted first and discarded after — `DashMap` iterators
+    /// hold shard locks, so removing while iterating the same map would
+    /// deadlock.
+    pub(crate) fn discard_unsealed_not_in(
+        &self,
+        live_keys: &std::collections::HashSet<String>,
+    ) -> usize {
+        let stale: Vec<(String, Option<Uuid>, usize, usize)> = self
+            .buffers
+            .iter()
+            .filter(|e| !live_keys.contains(e.key()) && !self.sealed.contains(e.key()))
+            .map(|e| {
+                (
+                    e.key().clone(),
+                    e.value().exec_id,
+                    e.value().lines.len(),
+                    e.value().bytes,
+                )
+            })
+            .collect();
+        for (key, exec_id, lines, bytes) in &stale {
+            // info!, not debug!: at most once per drv per re-acquisition,
+            // and it is the only trace an operator gets that this
+            // execution's unflushed tail was dropped (mirrors set_exec's
+            // cross-exec restamp log).
+            tracing::info!(
+                drv = %key,
+                exec_id = ?exec_id,
+                dropped_lines = lines,
+                dropped_bytes = bytes,
+                "discarding retained log buffer for a derivation not tracked after recovery"
+            );
+            self.discard(key);
+        }
+        stale.len()
     }
 
     /// Mark `drv_path` terminal: subsequent [`Self::push`] calls drop.
@@ -1426,5 +1487,33 @@ mod tests {
         bufs.push(&mk_batch("drv-a", 0, &[b"l0"]));
         assert!(!bufs.discard_if_owned_by("drv-a", "executor-1"));
         assert!(bufs.read_since("drv-a", 0).is_some());
+    }
+
+    /// Recovery-sweep primitive: only unsealed entries outside the live-key
+    /// set are discarded; live entries and sealed entries (final
+    /// FlushRequest may still be queued) are untouched.
+    #[test]
+    fn discard_unsealed_not_in_spares_live_and_sealed() {
+        let bufs = LogBuffers::new();
+        let exec = Uuid::now_v7();
+        for key in ["keepdrv", "stalecold", "stalesealed"] {
+            bufs.set_exec(key, exec, "w1");
+            // mk_batch hardcodes executor_id "test-worker"; push_for checks
+            // its `executor` argument against the assigned executor, not the
+            // batch field, so the "w1" binding is what's exercised here.
+            assert!(bufs.push_for(key, &mk_batch(key, 0, &[b"line"]), "w1"));
+        }
+        bufs.seal("stalesealed");
+
+        let live: std::collections::HashSet<String> = ["keepdrv".to_string()].into();
+        assert_eq!(bufs.discard_unsealed_not_in(&live), 1);
+
+        // Live entry untouched.
+        assert_eq!(bufs.read_since("keepdrv", 0).map(|l| l.len()), Some(1));
+        // Stale unsealed entry gone — the read path falls through to S3.
+        assert!(bufs.read_since("stalecold", 0).is_none());
+        // Stale sealed entry kept for the queued final flush; seal intact.
+        assert_eq!(bufs.read_since("stalesealed", 0).map(|l| l.len()), Some(1));
+        assert!(bufs.is_sealed("stalesealed"));
     }
 }
