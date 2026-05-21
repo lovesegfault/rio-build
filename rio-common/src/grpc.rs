@@ -264,6 +264,25 @@ pub fn check_bound(field: &str, got: usize, max: usize) -> Result<(), Status> {
     Ok(())
 }
 
+/// Truncate `s` in place to at most `max` bytes, backing up to the nearest
+/// UTF-8 character boundary. No-op when `s.len() <= max`.
+///
+/// For worker-supplied string fields that must be **bounded but not
+/// rejected** — e.g. `BuildResult.error_msg`, where dropping the whole
+/// `CompletionReport` would strand the derivation in `Running`. Reject-style
+/// bounds (drop the message / fail the RPC) should use [`check_bound`] or an
+/// explicit length comparison instead.
+pub fn truncate_utf8(s: &mut String, max: usize) {
+    if s.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
+
 /// Extension trait for mapping `Result<T, E: Display>` to `Result<T, Status>`
 /// with a context prefix.
 ///
@@ -460,5 +479,43 @@ mod tests {
         // timeout (rio-builder Config.daemon_timeout_secs, default
         // 7200s). The ordering invariant is enforced at
         // rio-builder/src/executor/daemon.rs test_timeout_ordering.
+    }
+
+    #[test]
+    fn truncate_utf8_under_max_is_noop() {
+        let mut s = "hello".to_string();
+        truncate_utf8(&mut s, 16);
+        assert_eq!(s, "hello");
+        // Exactly at the bound is also a no-op.
+        let mut s = "hello".to_string();
+        truncate_utf8(&mut s, 5);
+        assert_eq!(s, "hello");
+    }
+
+    #[test]
+    fn truncate_utf8_ascii_over_max_truncates_to_max() {
+        let mut s = "a".repeat(100);
+        truncate_utf8(&mut s, 64);
+        assert_eq!(s.len(), 64);
+    }
+
+    #[test]
+    fn truncate_utf8_backs_off_to_char_boundary() {
+        // A 4-byte char straddling the boundary: max-2 ASCII bytes then
+        // a 4-byte crab. Truncating at `max` would land mid-crab;
+        // the helper must back off to the boundary and not panic.
+        let max = 16;
+        let mut s = format!("{}🦀", "a".repeat(max - 2));
+        assert!(s.len() > max);
+        truncate_utf8(&mut s, max);
+        assert_eq!(s.len(), max - 2, "backs off to the char boundary");
+        assert!(s.chars().all(|c| c == 'a'));
+    }
+
+    #[test]
+    fn truncate_utf8_max_zero_empties() {
+        let mut s = "abc".to_string();
+        truncate_utf8(&mut s, 0);
+        assert!(s.is_empty());
     }
 }

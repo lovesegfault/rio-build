@@ -47,6 +47,49 @@ static STREAM_EPOCH_SEQ: AtomicU64 = AtomicU64::new(0);
 /// disconnect cleanup needs for its `dag.hash_for_path()` lookup).
 const MAX_DRVS_PER_STREAM: usize = 8;
 
+// ── Worker-supplied field bounds ─────────────────────────────────────
+// r[impl sched.executor.input-bounds]
+// EVERY string/bytes field a worker can set on the ExecutorService
+// surface is listed here with its bound or an explicit reason it is left
+// unbounded. When a field is added to ExecutorMessage / HeartbeatRequest
+// or their nested messages, add a row — an unlisted field is a review
+// rejection. Three enforcement styles:
+//   reject   — drop the message / fail the RPC. For advisory messages
+//              (Phase, Ack, LogBatch) and for the heartbeat (a rejected
+//              heartbeat reaps the worker — the designed recovery).
+//   truncate — bound the field in place, keep the message. For
+//              CompletionReport (which must never be silently dropped —
+//              a lost completion strands the derivation in Running) and
+//              for LogBatch fields that must still reach the ring/forward.
+//   document — left at the gRPC decode cap, with the verified reason
+//              (decoded then dropped before any retention).
+//
+// BuildExecution stream:
+//   ExecutorRegister.executor_id      → executors-map key, log lines      → reject RPC > MAX_IDENT_LEN
+//   WorkAssignmentAck.drv_path        → info! interpolation only          → skip arm > MAX_DERIVATION_PATH_LEN
+//   WorkAssignmentAck.assignment_token→ never read in the recv arm        → document (decoded then dropped)
+//   BuildLogBatch.derivation_path     → seen_drvs, ring key, actor fwd    → reject batch > MAX_DERIVATION_PATH_LEN
+//   BuildLogBatch.lines[i]            → ring buffer + Event::Log ring     → truncate to logs::MAX_LINE_LEN
+//   BuildLogBatch.executor_id         → retained whole in Event::Log      → truncate to MAX_IDENT_LEN
+//   BuildLogBatch.first_line_number   → numeric (base+i wraps in release,
+//                                       panics in debug; prod is release) → n/a
+//   CompletionReport.drv_path         → actor hash_for_path lookup        → reject report > MAX_DERIVATION_PATH_LEN
+//   CompletionReport.assignment_token → never read in the recv arm        → document (decoded then dropped)
+//   CompletionReport.node_name        → build_samples.node_name           → None if > MAX_IDENT_LEN
+//   CompletionReport.hw_class         → build_samples.hw_class            → None if > MAX_IDENT_LEN
+//   BuildResult.error_msg             → build_event_log × N, ring, term   → truncate to MAX_ERROR_MSG_LEN
+//   BuildResult.built_outputs[].name/path/hash → PG realisations          → validated actor-side (declared-output
+//                                       membership + StorePath::parse + [u8;32]); the pre-validation mailbox
+//                                       transit is a documented transient residual
+//   BuildPhase.derivation_path        → actor hash_for_path lookup        → reject phase > MAX_DERIVATION_PATH_LEN
+//   BuildPhase.phase                  → build_event_log × N, ring, term   → reject phase > MAX_PHASE_LEN
+//   PrefetchComplete.*                → numeric                           → n/a
+// Heartbeat RPC:
+//   executor_id, intent_id            → executor-lifetime actor state     → reject RPC > MAX_IDENT_LEN
+//   systems[i], supported_features[i] → executor-lifetime actor state     → reject RPC > MAX_IDENT_LEN each
+//   running_build                     → hash_for_path lookup              → reject RPC > MAX_DERIVATION_PATH_LEN
+//   resources / kind / flags          → numeric                           → n/a
+
 /// Upper bound on the byte length of a worker-supplied
 /// `derivation_path` (`BuildLogBatch` and `BuildPhase`). A legitimate
 /// Nix store path is at most ~259 bytes — `/nix/store/` (11) + 32-char
@@ -61,7 +104,46 @@ const MAX_DRVS_PER_STREAM: usize = 8;
 /// `String` in `seen_drvs` per stream — then ship the whole set to the
 /// actor's single-threaded mailbox on disconnect. Checked at the top
 /// of both recv arms, before the path is cloned, hashed, or forwarded.
-const MAX_DERIVATION_PATH_LEN: usize = 512;
+pub(super) const MAX_DERIVATION_PATH_LEN: usize = 512;
+
+/// Upper bound on the byte length of a worker-supplied `BuildPhase.phase`.
+/// A legitimate phase name (`unpackPhase`, `buildPhase`, a custom
+/// `runPhase` hook name) is tens of bytes; 256 never affects real
+/// traffic. Unlike `Log`, `Event::Phase` is NOT `display_only` (event.rs):
+/// after the actor's `(executor, drv)` binding gate it is cloned per
+/// interested build, prost-encoded into a `build_event_log` row, pinned
+/// in the per-build state broadcast ring, and rendered verbatim into
+/// every interested tenant's `nix build -L` terminal as `SetPhase` — so
+/// the 256 MiB message cap alone gives a hostile assigned worker a
+/// `N_builds × (1 PG row + 1 ring slot + 1 terminal flood)` amplifier.
+/// An over-long phase drops the UPDATE (cosmetic: nom misses one phase
+/// column refresh), never the build.
+pub(super) const MAX_PHASE_LEN: usize = 256;
+
+/// Upper bound on worker-supplied identifier/label fields: `executor_id`
+/// (stream register + heartbeat + log batch), `node_name`, `hw_class`,
+/// `intent_id`, and each element of `systems` / `supported_features`. All
+/// are either k8s object names (≤253 bytes by the DNS-subdomain rule),
+/// UUIDs, or Nix system/feature strings (tens of bytes). They live for
+/// the executor entry's lifetime in the actor's `executors` map, are
+/// interpolated into log lines, ride the per-build log broadcast ring
+/// inside `Event::Log`, or land in `build_samples` rows.
+pub(super) const MAX_IDENT_LEN: usize = 256;
+
+/// Upper bound on a worker-supplied `BuildResult.error_msg`. Truncated
+/// (not rejected — a dropped `CompletionReport` strands the derivation in
+/// `Running`). A legitimate daemon/executor error is well under 16 KiB;
+/// the field is fanned out as `DerivationEvent::failed.error_message` to
+/// `(1 + cascaded_ancestors) × interested_builds` `build_event_log` rows,
+/// state-ring slots, and `nix build -L` terminals.
+///
+/// Head-truncation cannot break the scheduler's semantic dispatch on this
+/// field: `handle_infrastructure_failure` greps for `CGROUP_OOM_MSG` and
+/// `CONCURRENT_PUTPATH_MSG`, both short builder-constructed prefixes that
+/// sit in the first few hundred bytes of a legitimate message. A hostile
+/// builder padding the marker past 16 KiB only denies itself the
+/// resource-floor bump.
+pub(super) const MAX_ERROR_MSG_LEN: usize = 16 * 1024;
 
 #[tonic::async_trait]
 impl ExecutorService for SchedulerGrpc {
@@ -99,6 +181,12 @@ impl ExecutorService for SchedulerGrpc {
                         "ExecutorRegister.executor_id is empty",
                     ));
                 }
+                // r[impl sched.executor.input-bounds]
+                rio_common::grpc::check_bound(
+                    "executor_id bytes",
+                    reg.executor_id.len(),
+                    MAX_IDENT_LEN,
+                )?;
                 reg.executor_id
             }
             _ => {
@@ -210,6 +298,21 @@ impl ExecutorService for SchedulerGrpc {
                             );
                         }
                         rio_proto::types::executor_message::Msg::Ack(ack) => {
+                            // Only consumer is the info! below — but that
+                            // interpolates the worker-supplied path into a JSON
+                            // log line, and a worker can send Acks at line rate.
+                            // No counter: the Ack has no consumer beyond this log
+                            // line, so there is no behavior to alert on — the
+                            // debug! is the parity-with-other-arms observability.
+                            // r[impl sched.executor.input-bounds]
+                            if ack.drv_path.len() > MAX_DERIVATION_PATH_LEN {
+                                tracing::debug!(
+                                    executor_id = %executor_id_for_recv,
+                                    len = ack.drv_path.len(),
+                                    "ignoring assignment ack: drv_path too long"
+                                );
+                                continue;
+                            }
                             info!(
                                 executor_id = %executor_id_for_recv,
                                 drv_path = %ack.drv_path,
@@ -252,11 +355,37 @@ impl ExecutorService for SchedulerGrpc {
                                 );
                                 break;
                             }
+                            // Bound the worker-supplied path before it crosses into
+                            // the actor (same threat as the Phase/LogBatch arms: one
+                            // ~255 MiB mailbox transit + one actor-thread hash). A
+                            // real store path is ≤259 bytes, so a >512-byte path can
+                            // never name a live assignment — the actor would drop
+                            // this report as "completion for unknown derivation"
+                            // anyway; rejecting it here only moves that drop off the
+                            // single-threaded event loop. Both paths leave
+                            // running_build to the heartbeat reconcile (the actor's
+                            // unknown-drv return precedes the free-worker-capacity
+                            // block), so no behavior change. No legitimate
+                            // completion is lost.
+                            // r[impl sched.executor.input-bounds]
+                            if report.drv_path.len() > MAX_DERIVATION_PATH_LEN {
+                                tracing::debug!(
+                                    executor_id = %executor_id_for_recv,
+                                    len = report.drv_path.len(),
+                                    "rejected completion report: derivation_path too long"
+                                );
+                                metrics::counter!(
+                                    "rio_scheduler_completions_rejected_total",
+                                    "reason" => "path_too_long"
+                                )
+                                .increment(1);
+                                continue;
+                            }
                             let drv_path = std::mem::take(&mut report.drv_path);
                             // A CompletionReport with result: None is malformed, but
                             // we must not silently drop it — the derivation would hang
                             // in Running forever. Synthesize an InfrastructureFailure.
-                            let result = report.result.unwrap_or_else(|| {
+                            let mut result = report.result.unwrap_or_else(|| {
                                 warn!(
                                     executor_id = %executor_id_for_recv,
                                     drv_path = %drv_path,
@@ -271,6 +400,15 @@ impl ExecutorService for SchedulerGrpc {
                                     ..Default::default()
                                 }
                             });
+                            // Bound-don't-reject: this message must reach the actor
+                            // (a dropped completion strands the drv in Running), so
+                            // oversized fields are truncated/nulled instead of
+                            // failing the whole report.
+                            // r[impl sched.executor.input-bounds]
+                            rio_common::grpc::truncate_utf8(
+                                &mut result.error_msg,
+                                MAX_ERROR_MSG_LEN,
+                            );
                             // Use blocking send for completion — dropping it would
                             // leave the derivation stuck in Running.
                             if actor_for_recv
@@ -280,8 +418,14 @@ impl ExecutorService for SchedulerGrpc {
                                     result,
                                     peak_memory_bytes: report.peak_memory_bytes,
                                     peak_cpu_cores: report.peak_cpu_cores,
-                                    node_name: report.node_name,
-                                    hw_class: report.hw_class,
+                                    // Pod-identity stamps headed for build_samples
+                                    // rows. Oversized → None, the existing "old
+                                    // executor / unknown hw" path; the completion
+                                    // itself is unaffected.
+                                    node_name: report
+                                        .node_name
+                                        .filter(|s| s.len() <= MAX_IDENT_LEN),
+                                    hw_class: report.hw_class.filter(|s| s.len() <= MAX_IDENT_LEN),
                                     final_resources: report.final_resources,
                                 })
                                 .await
@@ -310,6 +454,25 @@ impl ExecutorService for SchedulerGrpc {
                                 .increment(1);
                                 continue;
                             }
+                            // Sibling axis of the path check above: `phase.phase`
+                            // is the OTHER worker-supplied string in this message,
+                            // and unlike the path it is accumulated — see
+                            // MAX_PHASE_LEN. Same reject-don't-truncate policy
+                            // as the path: a >256-byte phase name is a hostile or
+                            // broken worker, and a dropped phase update is
+                            // cosmetic. r[impl sched.executor.input-bounds]
+                            if phase.phase.len() > MAX_PHASE_LEN {
+                                tracing::debug!(
+                                    len = phase.phase.len(),
+                                    "rejected phase update: phase text too long"
+                                );
+                                metrics::counter!(
+                                    "rio_scheduler_phases_rejected_total",
+                                    "reason" => "phase_too_long"
+                                )
+                                .increment(1);
+                                continue;
+                            }
                             // Same try_send semantics as ForwardLogBatch:
                             // a dropped phase update is cosmetic (nom
                             // misses one phase column refresh), not a hang.
@@ -329,7 +492,7 @@ impl ExecutorService for SchedulerGrpc {
                                     .increment(1);
                             }
                         }
-                        rio_proto::types::executor_message::Msg::LogBatch(log) => {
+                        rio_proto::types::executor_message::Msg::LogBatch(mut log) => {
                             // Length-bound the worker-supplied path BEFORE the
                             // cap check, the binding gate, and the
                             // `seen_drvs.insert()` clone. The binding gate
@@ -352,6 +515,25 @@ impl ExecutorService for SchedulerGrpc {
                                 .increment(1);
                                 continue;
                             }
+                            // Bound the batch's remaining worker-supplied fields
+                            // BEFORE both consumers (ring buffer + actor forward →
+                            // per-build log ring → WatchBuild wire). push_into()
+                            // also truncates lines, but (a) it clones the full
+                            // line first and Vec::truncate keeps the oversized
+                            // capacity, so the ring's byte cap counts 64 KiB while
+                            // holding a 255 MiB allocation, and (b) the
+                            // ForwardLogBatch → Event::Log path doesn't go through
+                            // push_into at all — it clones the ORIGINAL proto
+                            // (including executor_id, which nothing reads but
+                            // everything retains) per interested build.
+                            // r[impl sched.executor.input-bounds]
+                            for line in &mut log.lines {
+                                if line.len() > crate::logs::MAX_LINE_LEN {
+                                    line.truncate(crate::logs::MAX_LINE_LEN);
+                                    line.shrink_to_fit();
+                                }
+                            }
+                            rio_common::grpc::truncate_utf8(&mut log.executor_id, MAX_IDENT_LEN);
                             // Two-step: buffer (never blocks on actor), then forward.
                             //
                             // 0. Per-stream distinct-path cap. The worker is NOT
@@ -532,6 +714,27 @@ impl ExecutorService for SchedulerGrpc {
             req.supported_features.len(),
             MAX_HEARTBEAT_FEATURES,
         )?;
+        // Element-length bounds for the same reason as the count bounds
+        // above: heartbeats bypass backpressure (send_unchecked) and the
+        // payload lives on ExecutorState for the executor's lifetime.
+        // Rejecting a hostile heartbeat is the designed recovery path —
+        // the worker times out and is reaped; nothing is stranded.
+        // r[impl sched.executor.input-bounds]
+        rio_common::grpc::check_bound("executor_id bytes", req.executor_id.len(), MAX_IDENT_LEN)?;
+        rio_common::grpc::check_bound("intent_id bytes", req.intent_id.len(), MAX_IDENT_LEN)?;
+        if let Some(rb) = &req.running_build {
+            rio_common::grpc::check_bound(
+                "running_build bytes",
+                rb.len(),
+                MAX_DERIVATION_PATH_LEN,
+            )?;
+        }
+        for s in &req.systems {
+            rio_common::grpc::check_bound("system bytes", s.len(), MAX_IDENT_LEN)?;
+        }
+        for f in &req.supported_features {
+            rio_common::grpc::check_bound("supported_feature bytes", f.len(), MAX_IDENT_LEN)?;
+        }
 
         // intent_id: empty-string in proto → None. Proto doesn't have
         // Option for strings; empty is the conventional "unset." Empty

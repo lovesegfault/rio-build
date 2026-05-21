@@ -7,6 +7,9 @@
 //! completion, empty stream).
 
 use super::*;
+use crate::grpc::executor_service::{
+    MAX_DERIVATION_PATH_LEN, MAX_ERROR_MSG_LEN, MAX_IDENT_LEN, MAX_PHASE_LEN,
+};
 use rio_proto::{ExecutorServiceClient, ExecutorServiceServer, SchedulerServiceServer};
 use rio_test_support::fixtures::test_drv_path;
 use std::time::Duration;
@@ -1148,5 +1151,521 @@ async fn test_build_execution_empty_stream_rejected() -> anyhow::Result<()> {
         status.message()
     );
 
+    Ok(())
+}
+
+// ===========================================================================
+// Worker-supplied field bounds (sched.executor.input-bounds)
+// ===========================================================================
+
+/// `phase.phase` is the sibling worker-supplied string of the round-8
+/// `derivation_path` bound — and unlike the path it is accumulated
+/// (`Event::Phase` is not display-only: `build_event_log` row + state
+/// ring slot + `SetPhase` terminal render, × interested builds). An
+/// oversized phase text must be rejected at the recv arm before the
+/// `ForwardPhase` actor send; an oversized *path* is already rejected by
+/// the round-8 check (asserted here too — it previously had no verify
+/// marker on the Phase arm); a phase of exactly `MAX_PHASE_LEN` is
+/// accepted (boundary).
+///
+/// Red-first: pre-fix, send 2's oversized phase passes the recv arm (the
+/// drv is Assigned to this executor so it passes `handle_forward_phase`'s
+/// gate) and arrives as the FIRST `Event::Phase` on the build stream —
+/// the `len == MAX_PHASE_LEN` assertion fails. Post-fix only send 3's
+/// boundary phase arrives.
+// r[verify sched.executor.input-bounds]
+// r[verify sched.log.path-length]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_phase_oversized_text_rejected_before_forward() -> anyhow::Result<()> {
+    let (_db, grpc, _handle, _actor_task) = setup_grpc().await;
+    let router = tonic::transport::Server::builder()
+        .add_service(SchedulerServiceServer::new(grpc.clone()))
+        .add_service(ExecutorServiceServer::new(grpc));
+    let (addr, _server) = rio_test_support::grpc::spawn_grpc_server(router).await;
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    let mut worker_client = ExecutorServiceClient::new(channel.clone());
+    let mut sched_client = rio_proto::SchedulerServiceClient::new(channel);
+
+    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::ExecutorMessage>(32);
+    stream_tx
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::Register(
+                rio_proto::types::ExecutorRegister {
+                    executor_id: "phaselen-worker".into(),
+                },
+            )),
+        })
+        .await?;
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
+    let mut inbound = worker_client.build_execution(outbound).await?.into_inner();
+    worker_client
+        .heartbeat(rio_proto::types::HeartbeatRequest {
+            executor_id: "phaselen-worker".into(),
+            kind: rio_proto::types::ExecutorKind::Builder as i32,
+            systems: vec!["x86_64-linux".into()],
+            ..Default::default()
+        })
+        .await?;
+
+    let mut event_stream = sched_client
+        .submit_build(rio_proto::types::SubmitBuildRequest {
+            priority_class: "scheduled".into(),
+            nodes: vec![make_node("phaselen-hash")],
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    let assignment = tokio::time::timeout(Duration::from_secs(5), inbound.next())
+        .await?
+        .expect("assignment")
+        .expect("not an error");
+    let work = match assignment.msg {
+        Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a,
+        other => panic!("expected WorkAssignment, got {other:?}"),
+    };
+
+    let send_phase = |path: String, phase: String| {
+        let stream_tx = stream_tx.clone();
+        async move {
+            stream_tx
+                .send(rio_proto::types::ExecutorMessage {
+                    msg: Some(rio_proto::types::executor_message::Msg::Phase(
+                        rio_proto::types::BuildPhase {
+                            derivation_path: path,
+                            phase,
+                        },
+                    )),
+                })
+                .await
+        }
+    };
+
+    // 1. Oversized PATH → rejected by the round-8 check (path_too_long).
+    //    Closes the round-8 test gap: the Phase arm's derivation_path
+    //    check had no verify-marker coverage until now.
+    send_phase(
+        format!("/nix/store/{}.drv", "p".repeat(600)),
+        "unpackPhase".into(),
+    )
+    .await?;
+    // 2. Oversized PHASE TEXT for the assigned drv → must be rejected by
+    //    the NEW check. Pre-fix this passes the recv arm and the actor's
+    //    binding gate (the drv IS assigned to this executor) and arrives
+    //    first on the event stream.
+    send_phase(work.drv_path.clone(), "x".repeat(MAX_PHASE_LEN + 1)).await?;
+    // 3. Phase of exactly MAX_PHASE_LEN → accepted (boundary). FIFO
+    //    ordering means if either rejected phase had been forwarded it
+    //    would arrive before this one.
+    send_phase(work.drv_path.clone(), "b".repeat(MAX_PHASE_LEN)).await?;
+
+    let got = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(5), event_stream.next())
+            .await?
+            .expect("event")
+            .expect("not an error");
+        if let Some(rio_proto::types::build_event::Event::Phase(p)) = ev.event {
+            break p;
+        }
+    };
+    assert_eq!(
+        got.phase.len(),
+        MAX_PHASE_LEN,
+        "first Event::Phase on the build stream must be the boundary-length one — \
+         an oversized phase text arriving here means the recv-arm bound did not fire"
+    );
+    assert!(got.phase.starts_with('b'));
+    Ok(())
+}
+
+/// A `CompletionReport` with oversized `error_msg` / `node_name` /
+/// `hw_class` is BOUNDED, NOT DROPPED: the completion still terminates
+/// the build (a dropped completion strands the drv in Running), the
+/// error_msg arrives truncated to `MAX_ERROR_MSG_LEN` on the build event
+/// stream, and the pod-identity stamps fall back to `None`.
+// r[verify sched.executor.input-bounds]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_completion_oversized_fields_bounded_not_dropped() -> anyhow::Result<()> {
+    let (_db, grpc, _handle, _actor_task) = setup_grpc().await;
+    let router = tonic::transport::Server::builder()
+        .add_service(SchedulerServiceServer::new(grpc.clone()))
+        .add_service(ExecutorServiceServer::new(grpc));
+    let (addr, _server) = rio_test_support::grpc::spawn_grpc_server(router).await;
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    let mut worker_client = ExecutorServiceClient::new(channel.clone());
+    let mut sched_client = rio_proto::SchedulerServiceClient::new(channel);
+
+    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::ExecutorMessage>(32);
+    stream_tx
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::Register(
+                rio_proto::types::ExecutorRegister {
+                    executor_id: "complen-worker".into(),
+                },
+            )),
+        })
+        .await?;
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
+    let mut inbound = worker_client.build_execution(outbound).await?.into_inner();
+    worker_client
+        .heartbeat(rio_proto::types::HeartbeatRequest {
+            executor_id: "complen-worker".into(),
+            kind: rio_proto::types::ExecutorKind::Builder as i32,
+            systems: vec!["x86_64-linux".into()],
+            ..Default::default()
+        })
+        .await?;
+
+    let mut event_stream = sched_client
+        .submit_build(rio_proto::types::SubmitBuildRequest {
+            priority_class: "scheduled".into(),
+            nodes: vec![make_node("complen-hash")],
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    let assignment = tokio::time::timeout(Duration::from_secs(5), inbound.next())
+        .await?
+        .expect("assignment")
+        .expect("not an error");
+    let work = match assignment.msg {
+        Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a,
+        other => panic!("expected WorkAssignment, got {other:?}"),
+    };
+
+    stream_tx
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::Completion(
+                rio_proto::types::CompletionReport {
+                    drv_path: work.drv_path.clone(),
+                    result: Some(rio_proto::types::BuildResult {
+                        status: rio_proto::types::BuildResultStatus::PermanentFailure.into(),
+                        error_msg: "e".repeat(MAX_ERROR_MSG_LEN + 100),
+                        ..Default::default()
+                    }),
+                    assignment_token: work.assignment_token.clone(),
+                    node_name: Some("n".repeat(MAX_IDENT_LEN + 1)),
+                    hw_class: Some("h".repeat(MAX_IDENT_LEN + 1)),
+                    ..Default::default()
+                },
+            )),
+        })
+        .await?;
+
+    // The completion must be PROCESSED (not dropped): the build event
+    // stream yields a Failed DerivationEvent whose error_message is the
+    // truncated (not original, not empty) error_msg, then the build
+    // terminates.
+    let mut saw_failed_derivation = false;
+    let mut saw_build_terminal = false;
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(5), event_stream.next()).await;
+        let Ok(Some(Ok(event))) = ev else {
+            break;
+        };
+        match event.event {
+            Some(rio_proto::types::build_event::Event::Derivation(d))
+                if d.kind == rio_proto::types::DerivationEventKind::Failed as i32 =>
+            {
+                assert_eq!(
+                    d.error_message.len(),
+                    MAX_ERROR_MSG_LEN,
+                    "error_message must be truncated to MAX_ERROR_MSG_LEN — the original \
+                     was MAX_ERROR_MSG_LEN+100; an untruncated or empty value means the \
+                     recv-arm bound did not fire or the report was dropped"
+                );
+                saw_failed_derivation = true;
+            }
+            Some(rio_proto::types::build_event::Event::Failed(_)) => {
+                saw_build_terminal = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_failed_derivation,
+        "completion with oversized fields must still be processed (bounded, not dropped)"
+    );
+    assert!(
+        saw_build_terminal,
+        "build must reach a terminal state — a dropped CompletionReport strands it"
+    );
+    Ok(())
+}
+
+/// Regression guard, NOT red-first: an oversized `CompletionReport.drv_path`
+/// is rejected with `continue`, not `break` — the stream stays open and a
+/// subsequent legitimate batch is still processed. Pre-fix the oversized
+/// report was forwarded to the actor and dropped there as "unknown
+/// derivation", so this test passes before AND after the fix; it guards
+/// against the one way the new check could be wrong (`break` would
+/// disconnect the worker and strand its real build).
+// r[verify sched.executor.input-bounds]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_completion_oversized_path_rejected() -> anyhow::Result<()> {
+    let (_db, grpc, _handle, _actor_task) = setup_grpc().await;
+    let log_buffers = grpc.log_buffers();
+    let router = tonic::transport::Server::builder().add_service(ExecutorServiceServer::new(grpc));
+    let (addr, _server) = rio_test_support::grpc::spawn_grpc_server(router).await;
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    let mut worker_client = ExecutorServiceClient::new(channel);
+
+    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::ExecutorMessage>(32);
+    stream_tx
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::Register(
+                rio_proto::types::ExecutorRegister {
+                    executor_id: "cplen-worker".into(),
+                },
+            )),
+        })
+        .await?;
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
+    let mut inbound = worker_client.build_execution(outbound).await?.into_inner();
+
+    // Oversized completion path → rejected at the recv arm.
+    stream_tx
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::Completion(
+                rio_proto::types::CompletionReport {
+                    drv_path: format!("/nix/store/cplen-{}.drv", "e".repeat(600)),
+                    result: Some(rio_proto::types::BuildResult {
+                        status: rio_proto::types::BuildResultStatus::Built.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )),
+        })
+        .await?;
+
+    // Sentinel: a legitimate stamped LogBatch sent AFTER the oversized
+    // completion. FIFO ⟹ when its line lands, the completion was
+    // processed (and rejected with `continue`, not `break`).
+    let sentinel = "/nix/store/cpok-real.drv".to_string();
+    log_buffers.set_exec(&sentinel, uuid::Uuid::now_v7(), "cplen-worker");
+    stream_tx
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::LogBatch(
+                rio_proto::types::BuildLogBatch {
+                    derivation_path: sentinel.clone(),
+                    lines: vec![b"sentinel".to_vec()],
+                    first_line_number: 0,
+                    executor_id: "cplen-worker".into(),
+                },
+            )),
+        })
+        .await?;
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while log_buffers
+            .read_since(&sentinel, 0)
+            .is_none_or(|v| !v.iter().any(|(_, l)| l == b"sentinel"))
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("sentinel batch must land — the oversized completion must not break the stream");
+
+    // The stream must still be open: `inbound.next()` times out rather
+    // than returning None.
+    let poll = tokio::time::timeout(Duration::from_millis(200), inbound.next()).await;
+    assert!(
+        poll.is_err(),
+        "stream must remain open after an oversized completion path (continue, not break); \
+         got {poll:?}"
+    );
+    Ok(())
+}
+
+/// Heartbeat element-length bounds: each worker-supplied string field
+/// over its bound → `InvalidArgument`; every field AT its bound → Ok.
+/// Rejecting a hostile heartbeat is the designed recovery (the worker
+/// times out and is reaped); the payload otherwise lives on
+/// `ExecutorState` for the executor's lifetime.
+// r[verify sched.executor.input-bounds]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_heartbeat_oversized_strings_rejected() -> anyhow::Result<()> {
+    let (_handle, mut worker_client, _srv, _actor, _db) = setup_worker_svc().await?;
+
+    let base = || rio_proto::types::HeartbeatRequest {
+        executor_id: "hb-len-worker".into(),
+        kind: rio_proto::types::ExecutorKind::Builder as i32,
+        systems: vec!["x86_64-linux".into()],
+        ..Default::default()
+    };
+
+    // Each field over its bound, one at a time → InvalidArgument.
+    let cases: Vec<(&str, rio_proto::types::HeartbeatRequest)> = vec![
+        (
+            "executor_id",
+            rio_proto::types::HeartbeatRequest {
+                executor_id: "x".repeat(MAX_IDENT_LEN + 1),
+                ..base()
+            },
+        ),
+        (
+            "intent_id",
+            rio_proto::types::HeartbeatRequest {
+                intent_id: "x".repeat(MAX_IDENT_LEN + 1),
+                ..base()
+            },
+        ),
+        (
+            "running_build",
+            rio_proto::types::HeartbeatRequest {
+                running_build: Some("x".repeat(MAX_DERIVATION_PATH_LEN + 1)),
+                ..base()
+            },
+        ),
+        (
+            "systems element",
+            rio_proto::types::HeartbeatRequest {
+                systems: vec!["x".repeat(MAX_IDENT_LEN + 1)],
+                ..base()
+            },
+        ),
+        (
+            "supported_features element",
+            rio_proto::types::HeartbeatRequest {
+                supported_features: vec!["x".repeat(MAX_IDENT_LEN + 1)],
+                ..base()
+            },
+        ),
+    ];
+    for (field, req) in cases {
+        let err = worker_client
+            .heartbeat(req)
+            .await
+            .expect_err(&format!("oversized {field} must be rejected"));
+        assert_eq!(
+            err.code(),
+            tonic::Code::InvalidArgument,
+            "oversized {field} → InvalidArgument, got {err:?}"
+        );
+    }
+
+    // Every field AT its bound → accepted.
+    worker_client
+        .heartbeat(rio_proto::types::HeartbeatRequest {
+            executor_id: "x".repeat(MAX_IDENT_LEN),
+            intent_id: "y".repeat(MAX_IDENT_LEN),
+            running_build: Some("z".repeat(MAX_DERIVATION_PATH_LEN)),
+            systems: vec!["s".repeat(MAX_IDENT_LEN)],
+            supported_features: vec!["f".repeat(MAX_IDENT_LEN)],
+            kind: rio_proto::types::ExecutorKind::Builder as i32,
+            ..Default::default()
+        })
+        .await
+        .expect("every field at its bound must be accepted (boundary)");
+    Ok(())
+}
+
+/// `BuildLogBatch.lines[i]` and `BuildLogBatch.executor_id` are bounded
+/// at the recv arm BEFORE the `ForwardLogBatch` → `Event::Log` →
+/// per-build log ring → WatchBuild path (which clones the ORIGINAL proto
+/// per interested build and never goes through `push_into`'s truncation).
+///
+/// Red-first: pre-fix the `Event::Log` on the build stream carries the
+/// original 2×MAX_LINE_LEN line and the oversized executor_id.
+// r[verify sched.executor.input-bounds]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_log_batch_oversized_line_and_executor_id_bounded_before_forward() -> anyhow::Result<()>
+{
+    let (_db, grpc, _handle, _actor_task) = setup_grpc().await;
+    let log_buffers = grpc.log_buffers();
+    let router = tonic::transport::Server::builder()
+        .add_service(SchedulerServiceServer::new(grpc.clone()))
+        .add_service(ExecutorServiceServer::new(grpc));
+    let (addr, _server) = rio_test_support::grpc::spawn_grpc_server(router).await;
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    let mut worker_client = ExecutorServiceClient::new(channel.clone());
+    let mut sched_client = rio_proto::SchedulerServiceClient::new(channel);
+
+    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::ExecutorMessage>(32);
+    stream_tx
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::Register(
+                rio_proto::types::ExecutorRegister {
+                    executor_id: "linelen-worker".into(),
+                },
+            )),
+        })
+        .await?;
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
+    let mut inbound = worker_client.build_execution(outbound).await?.into_inner();
+    worker_client
+        .heartbeat(rio_proto::types::HeartbeatRequest {
+            executor_id: "linelen-worker".into(),
+            kind: rio_proto::types::ExecutorKind::Builder as i32,
+            systems: vec!["x86_64-linux".into()],
+            ..Default::default()
+        })
+        .await?;
+
+    let mut event_stream = sched_client
+        .submit_build(rio_proto::types::SubmitBuildRequest {
+            priority_class: "scheduled".into(),
+            nodes: vec![make_node("linelen-hash")],
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    let assignment = tokio::time::timeout(Duration::from_secs(5), inbound.next())
+        .await?
+        .expect("assignment")
+        .expect("not an error");
+    let work = match assignment.msg {
+        Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a,
+        other => panic!("expected WorkAssignment, got {other:?}"),
+    };
+
+    // Stamp the gRPC service's LogBuffers (separate Arc from the actor's
+    // — see test_log_pipeline_grpc_wire_end_to_end) so push_for accepts.
+    let exec_id: uuid::Uuid = work.exec_id.parse().expect("exec_id is a UUID");
+    log_buffers.set_exec(&work.drv_path, exec_id, "linelen-worker");
+
+    stream_tx
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::LogBatch(
+                rio_proto::types::BuildLogBatch {
+                    derivation_path: work.drv_path.clone(),
+                    lines: vec![vec![b'x'; 2 * crate::logs::MAX_LINE_LEN]],
+                    first_line_number: 0,
+                    executor_id: "x".repeat(MAX_IDENT_LEN + 100),
+                },
+            )),
+        })
+        .await?;
+
+    let batch = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(5), event_stream.next())
+            .await?
+            .expect("event")
+            .expect("not an error");
+        if let Some(rio_proto::types::build_event::Event::Log(log)) = ev.event {
+            break log;
+        }
+    };
+    assert_eq!(
+        batch.lines[0].len(),
+        crate::logs::MAX_LINE_LEN,
+        "the forwarded Event::Log must carry the truncated line — the ForwardLogBatch \
+         path clones the original proto and never goes through push_into's truncation"
+    );
+    assert_eq!(
+        batch.executor_id.len(),
+        MAX_IDENT_LEN,
+        "the forwarded Event::Log must carry the truncated executor_id"
+    );
     Ok(())
 }

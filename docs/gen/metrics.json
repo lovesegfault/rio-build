@@ -453,6 +453,11 @@
         "name": "rio_scheduler_cleanup_dropped_total"
       },
       {
+        "help": "CompletionReport dropped at the recv arm before reaching the actor. A real store path is ≤259 bytes, so path_too_long can only fire for a report that could never have matched a live assignment — the drop moves the actor's inevitable \"unknown derivation\" discard off the single-threaded event loop. Labeled by reason: path_too_long.",
+        "kind": "counter",
+        "name": "rio_scheduler_completions_rejected_total"
+      },
+      {
         "help": "Predicted vs actual completion ratio (actual/estimated; 1.0=perfect, >1.0=underestimate)",
         "kind": "histogram",
         "name": "rio_scheduler_critical_path_accuracy"
@@ -588,7 +593,7 @@
         "name": "rio_scheduler_phantom_assignments_drained_total"
       },
       {
-        "help": "BuildPhase dropped by the actor-side (status, executor) binding check or the recv-side derivation_path length bound. Either the named derivation has no active (Assigned|Running) assignment, the calling stream is not the assigned executor, or the path exceeds MAX_DERIVATION_PATH_LEN. Labeled by reason: not_active | no_assignment | executor_mismatch | path_too_long.",
+        "help": "BuildPhase dropped by the actor-side (status, executor) binding check or the recv-side length bounds. Either the named derivation has no active (Assigned|Running) assignment, the calling stream is not the assigned executor, the path exceeds MAX_DERIVATION_PATH_LEN, or the phase text exceeds MAX_PHASE_LEN. Labeled by reason: not_active | no_assignment | executor_mismatch | path_too_long | phase_too_long.",
         "kind": "counter",
         "name": "rio_scheduler_phases_rejected_total"
       },
@@ -1096,6 +1101,7 @@
     "rio_scheduler_cancel_signal_dropped_total",
     "rio_scheduler_cancel_signals_total",
     "rio_scheduler_cleanup_dropped_total",
+    "rio_scheduler_completions_rejected_total",
     "rio_scheduler_critical_path_accuracy",
     "rio_scheduler_derivations_gc_deleted_total",
     "rio_scheduler_derivations_queued",

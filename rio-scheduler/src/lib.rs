@@ -335,11 +335,20 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_scheduler_phases_rejected_total",
         "BuildPhase dropped by the actor-side (status, executor) binding check \
-         or the recv-side derivation_path length bound. \
+         or the recv-side length bounds. \
          Either the named derivation has no active (Assigned|Running) assignment, \
-         the calling stream is not the assigned executor, or the path exceeds \
-         MAX_DERIVATION_PATH_LEN. \
-         Labeled by reason: not_active | no_assignment | executor_mismatch | path_too_long."
+         the calling stream is not the assigned executor, the path exceeds \
+         MAX_DERIVATION_PATH_LEN, or the phase text exceeds MAX_PHASE_LEN. \
+         Labeled by reason: not_active | no_assignment | executor_mismatch | \
+         path_too_long | phase_too_long."
+    );
+    describe_counter!(
+        "rio_scheduler_completions_rejected_total",
+        "CompletionReport dropped at the recv arm before reaching the actor. \
+         A real store path is ≤259 bytes, so path_too_long can only fire for a \
+         report that could never have matched a live assignment — the drop \
+         moves the actor's inevitable \"unknown derivation\" discard off the \
+         single-threaded event loop. Labeled by reason: path_too_long."
     );
     describe_counter!(
         "rio_scheduler_log_gc_swept_total",

@@ -201,10 +201,12 @@ executor. Unlike the completion guard, this one also fails closed on
 assignment has no live build to render to. Without this gate, a compromised
 executor sending `BuildPhase` with a fabricated `derivation_path` injects
 attacker-controlled text into another tenant's `nix build -L` progress
-display via the gateway's `SetPhase` relay (cosmetic only --- no log or PG
-write). Dropped phase updates increment
+display via the gateway's `SetPhase` relay (persisted to `build_event_log`
+and pinned in the per-build state ring --- `Phase` is not a display-only
+event). Dropped phase updates increment
 #(refs.metric)("rio_scheduler_phases_rejected_total"), labeled by reason
-(`not_active` | `no_assignment` | `executor_mismatch` | `path_too_long`).
+(`not_active` | `no_assignment` | `executor_mismatch` | `path_too_long` |
+`phase_too_long`).
 
 #r("sched.log.path-length")[
   The `BuildExecution` recv loop MUST drop any `BuildLogBatch` or
@@ -223,6 +225,31 @@ recv task's per-stream `seen_drvs` set (pinning
 `MAX_DRVS_PER_STREAM × 255 MiB ≈ 2 GiB` resident per stream) and shipped to
 the actor's single-threaded mailbox on disconnect. Rejections increment the
 arm's rejection counter with reason `path_too_long`.
+
+#r("sched.executor.input-bounds")[
+  Every worker-supplied string field on the `ExecutorService` surface MUST be
+  either length-bounded before it is accumulated (persisted to PostgreSQL,
+  buffered in a broadcast ring, rendered to a client terminal, or stored in
+  long-lived actor state) or validated against a scheduler-trusted set. Fields
+  that are decoded and dropped without accumulation MAY remain bounded only by
+  the gRPC message-size cap, and MUST be enumerated as such at the
+  bounds-constant block in `executor_service.rs`.
+]
+
+The round-8 `derivation_path` bound (#rref("sched.log.path-length")) fixed one
+of two worker-supplied strings in the `BuildPhase` message; the sibling
+`phase` field had the larger blast radius (a `Phase` event is not
+display-only: it is prost-encoded into `build_event_log`, pinned in the
+per-build state ring, and rendered as `SetPhase` into every interested
+tenant's terminal — multiplied by the derivation's interested-build count).
+Bounding per field rather than lowering the global decode limit preserves the
+per-field semantics: advisory messages are rejected whole, a
+`CompletionReport` is never rejected (a lost completion strands the
+derivation in `Running`) so its oversized fields are truncated or nulled
+instead, and a rejected heartbeat reaps the worker by design. Phase
+rejections increment #(refs.metric)("rio_scheduler_phases_rejected_total")
+with reason `phase_too_long`; completion rejections increment
+#(refs.metric)("rio_scheduler_completions_rejected_total").
 
 #r("sched.merge.exec-correlation+6")[
   The scheduler MUST set `build_derivations.exec_id` for every interested

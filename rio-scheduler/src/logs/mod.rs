@@ -207,10 +207,16 @@ impl LogBuffers {
     fn push_into(buf: &mut RingBuf, batch: &BuildLogBatch) {
         let base = batch.first_line_number;
         for (i, line) in batch.lines.iter().enumerate() {
-            let mut l = line.clone();
-            if l.len() > MAX_LINE_LEN {
-                l.truncate(MAX_LINE_LEN);
-            }
+            // Slice-then-to_vec, NOT clone-then-truncate: `Vec::clone`
+            // allocates `len()` bytes and `truncate` does not shrink
+            // capacity, so an oversized line would be fully allocated and
+            // the retained `Vec` would keep that capacity while
+            // `buf.bytes` counts only `MAX_LINE_LEN` — the byte cap would
+            // bound *accounted* bytes, not *allocated* bytes. The recv
+            // arm already truncates worker-supplied lines before they get
+            // here; this is defense in depth for the legacy `push()` path
+            // (tests, future callers). r[impl sched.executor.input-bounds]
+            let l = line[..line.len().min(MAX_LINE_LEN)].to_vec();
             buf.bytes += l.len();
             buf.lines.push_back((base + i as u64, l));
         }
@@ -1074,6 +1080,17 @@ mod tests {
             "single line truncated to MAX_LINE_LEN"
         );
         assert_eq!(bytes, MAX_LINE_LEN as u64);
+        // The retained Vec's CAPACITY must also be bounded: clone-then-
+        // truncate would allocate the full 200 KiB and keep that capacity
+        // while `bytes` counts only MAX_LINE_LEN — the byte cap would
+        // bound accounted bytes, not allocated bytes. `into_drained`
+        // moves the stored Vecs out, so the capacity is observable here.
+        assert!(
+            lines[0].capacity() <= MAX_LINE_LEN,
+            "retained line capacity must be ≤ MAX_LINE_LEN (slice-then-to_vec), \
+             got {} — clone-then-truncate keeps the oversized allocation",
+            lines[0].capacity()
+        );
     }
 
     // ── set_exec / push_for binding check ───────────────────────────────
