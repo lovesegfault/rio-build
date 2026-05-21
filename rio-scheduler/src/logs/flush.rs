@@ -163,7 +163,8 @@ impl LogFlusher {
     }
 
     /// Whether this replica currently holds the scheduler lease.
-    /// Relaxed is sufficient: this is a periodic poll (every 30s/1h),
+    /// Relaxed is sufficient: this is a periodic poll (every 30s/1h)
+    /// plus one check at shutdown,
     /// not a synchronization point — a one-tick window where an
     /// ex-leader's flusher hasn't observed the flip is bounded and
     /// harmless (the GC DELETE is idempotent; a stale periodic UPSERT
@@ -225,8 +226,28 @@ impl LogFlusher {
                                 // Actor died. No more completions coming. One
                                 // last periodic sweep to save whatever's in
                                 // the buffers, then exit.
-                                debug!("flush channel closed; final periodic sweep then exit");
-                                self.flush_periodic().await;
+                                //
+                                // Leader-gated for the same reason as the
+                                // periodic-tick arm below: an ex-leader's
+                                // retained, re-stamped buffers would UPSERT a
+                                // stale `.partial` over the new leader's row
+                                // for the same `exec_id`. The gate does NOT
+                                // cost a current leader its last-gasp sweep:
+                                // graceful release calls `step_down()` only —
+                                // `on_lose()` (which clears `is_leader`)
+                                // fires on losing the lease to a peer or on
+                                // self-fence, never on plain shutdown — so a
+                                // still-leading replica passes. A
+                                // never-leader standby's buffers are
+                                // structurally empty either way.
+                                if self.is_leader() {
+                                    debug!("flush channel closed; final periodic sweep then exit");
+                                    self.flush_periodic().await;
+                                } else {
+                                    debug!(
+                                        "flush channel closed; skipping final sweep (not leader)"
+                                    );
+                                }
                                 break;
                             }
                         }
@@ -1653,6 +1674,129 @@ mod tests {
             }
         });
         drop(tx);
+        Ok(())
+    }
+
+    /// The shutdown arm (channel-closed `None =>`) must be leader-gated like
+    /// the periodic-tick and gc-tick arms: an ex-leader's retained
+    /// `LogBuffers` entries are stamped with `exec_id`s the new leader
+    /// re-stamps from `assignments` and may have already finalized — an
+    /// un-gated last-gasp sweep would repoint `s3_key` at a stale `.partial`
+    /// blob and flip `is_complete` back to `false` over the new leader's
+    /// completed row.
+    ///
+    /// Anti-vacuousness: the snapshot assert below proves the buffer is
+    /// stamped AND non-empty at the moment the arm fires, and the sibling
+    /// leader test proves this exact fixture produces a PUT through this
+    /// exact arm when the gate passes.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn shutdown_sweep_skipped_when_not_leader() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, _deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/notleader-shutdown-gate.drv";
+        let _exec_id = stamp_and_push(&buffers, drv_path, &[b"pre-flap line"]);
+
+        // Structural non-vacuousness: a stamped, NON-EMPTY entry is what the
+        // shutdown arm is about to see. An empty stamped entry would also
+        // produce "no PUT" (the line_count==0 early-return in
+        // upload_and_record) and make this test pass without the gate.
+        let (_, line_count, _, _) = buffers
+            .snapshot(drv_path)
+            .expect("fixture entry must be stamped");
+        assert_eq!(line_count, 1, "fixture must have a line to flush");
+
+        let (tx, rx) = mpsc::channel::<FlushRequest>(8);
+        LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            // Ex-leader: on_lose() flipped the gate, but the stamped
+            // buffers from before the flap are retained.
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .spawn(rx);
+
+        // Close the channel → recv() yields None → the shutdown arm runs →
+        // the loop breaks and logs "log flusher exited".
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !logs_contain("log flusher exited") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("flusher loop did not exit after channel close");
+
+        // The entry survived (the gate skips, it does not drain). NOT the
+        // regression catch — that is the two asserts below.
+        assert_eq!(buffers.active_count(), 1);
+        // The gate — not an empty buffer — is why nothing was written.
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "ex-leader shutdown sweep must not PUT to S3"
+        );
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM drv_logs")
+            .fetch_one(&db.pool)
+            .await?;
+        assert_eq!(
+            count.0, 0,
+            "ex-leader shutdown sweep must not write drv_logs"
+        );
+        Ok(())
+    }
+
+    /// Sibling of `shutdown_sweep_skipped_when_not_leader`: a replica that
+    /// still holds the lease at shutdown MUST get its last-gasp sweep —
+    /// graceful release calls `step_down()` without `on_lose()`, so
+    /// `is_leader` stays true and the ≤30s log-loss bound survives a clean
+    /// rolling restart. Also proves the negative test's fixture is capable
+    /// of producing a PUT through the same code path.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn shutdown_sweep_runs_when_leader() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, _deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/stillleader-shutdown-gate.drv";
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"about to be saved"]);
+
+        let (tx, rx) = mpsc::channel::<FlushRequest>(8);
+        LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        )
+        .spawn(rx);
+
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !logs_contain("log flusher exited") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("flusher loop did not exit after channel close");
+
+        // The last-gasp sweep ran: one `.partial` PUT + one
+        // is_complete=false row keyed on the live entry's exec_id.
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1, "leader shutdown sweep PUTs the snapshot");
+        assert_eq!(
+            captured[0].0,
+            format!("logs/stillleader/{exec_id}.partial.log.zst")
+        );
+        let row: (bool,) = sqlx::query_as("SELECT is_complete FROM drv_logs WHERE exec_id = $1")
+            .bind(exec_id)
+            .fetch_one(&db.pool)
+            .await?;
+        assert!(!row.0, "shutdown sweep is a periodic snapshot, not a final");
         Ok(())
     }
 
