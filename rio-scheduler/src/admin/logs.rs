@@ -233,10 +233,14 @@ pub(super) fn try_ring_buffer(
 ///
 /// Returns the row's `is_complete` propagated to the last chunk: a
 /// `.partial` blob (periodic snapshot of a build whose ring buffer was
-/// lost — leader failover, eviction) is still served, but with
-/// `is_complete=false` so the client knows to re-poll. The OLD model
-/// filtered `is_complete=true` because periodic snapshots had no PG row;
-/// now they do, and serving them is strictly more useful than NotFound.
+/// lost — leader failover, eviction) is normally served with
+/// `is_complete=false` so the client knows to re-poll; if the execution
+/// reached a terminal with nothing further to upload (an empty final
+/// drain after a failover restamp), the row is finalized in place and
+/// the same `.partial` blob is served with `is_complete=true` — it is
+/// that execution's complete stored log. The OLD model filtered
+/// `is_complete=true` because periodic snapshots had no PG row; now
+/// they do, and serving them is strictly more useful than NotFound.
 async fn try_s3(
     s3: &Option<(S3Client, String)>,
     pool: &PgPool,

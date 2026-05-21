@@ -40,6 +40,11 @@ carry the build↔execution correlation. Periodic snapshots get the `.partial`
 suffix and a `drv_logs` row with `is_complete = false`; the final flush
 overwrites the row, writes the non-`.partial` key, and best-effort deletes the
 snapshot. Both are swept by the same TTL.
+A final flush whose ring buffer drained empty (a failover left the new
+leader holding a re-stamped but never-streamed-to entry) closes the row in
+place --- `is_complete`, `status`, `finished_at` --- without re-keying
+`s3_key` or deleting the `.partial` blob, which remains the execution's
+only stored content.
 
 #r("obs.log.worker-header")[
   The worker MUST write `rio: exec`, `rio: builder`, `rio: started` lines as

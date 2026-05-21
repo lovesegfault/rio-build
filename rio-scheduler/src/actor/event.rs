@@ -739,13 +739,23 @@ impl DagActor {
     ///
     /// NOT called from:
     /// - `adopt_orphan_completion` (recovery) — the worker disconnected
-    ///   before this leader started, the buffer is empty (or absent),
-    ///   the log is already lost. It calls `record_exec_correlation`
+    ///   before this leader started; it calls `record_exec_correlation`
     ///   directly (so the dashboard knows which exec produced the
-    ///   output) and `discard_log_buffer` (to remove recovery's empty
-    ///   placeholder — `flush_final` would no-op on it but the
-    ///   `GetDerivationLogs` read path would serve an empty re-poll
-    ///   chunk until `CleanupTerminalBuild` reaps it).
+    ///   output) and `discard_log_buffer` instead of this epilogue.
+    ///   KNOWN GAP: if the ex-leader's periodic flusher wrote a
+    ///   `.partial` row for that execution, nothing closes it — it rots
+    ///   at `is_complete=false` for the GC TTL while the correlation
+    ///   pins the dashboard to it (the same end-state as the
+    ///   failover-poison path, which IS routed through here).
+    ///   `flush_final` on the empty recovery placeholder now finalizes
+    ///   that row in place (`upload_and_record`'s empty-final-drain
+    ///   carve-out), and on an ex-leader the discard actively drops
+    ///   retained lines a flush would have uploaded — so routing this
+    ///   path through the epilogue is the fix. It needs a
+    ///   status-vocabulary decision first (the build succeeded during
+    ///   the scheduler's downtime; the *log* is truncated at the last
+    ///   periodic snapshot) — the same blocker as the
+    ///   cache-hit/substitute entry below.
     /// - cascaded `DependencyFailed` and `Skipped`: structurally never
     ///   dispatched — a cascaded ancestor's deps were never all
     ///   `Completed`, so it was never `Ready`, so it has no exec_id

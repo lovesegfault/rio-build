@@ -447,14 +447,31 @@ impl LogFlusher {
         is_final: bool,
     ) {
         let exec_id = req.exec_id;
-        // set_exec creates an empty ring-buffer entry; the periodic tick
-        // would otherwise flush a zero-line `.partial` blob and PG row for
-        // the window between dispatch and the worker's first batch (overlay
-        // setup, FUSE warm — easily >30s). Skip — there's nothing to
-        // store. flush_final's caller already early-returns on a None
-        // drain (silent build), so this only fires for the periodic path's
-        // snapshot of a stamped-but-empty entry.
+        // Empty drain/snapshot. `set_exec` creates an empty ring-buffer
+        // entry, so BOTH callers can land here with zero lines:
+        //
+        //  - Periodic (`is_final=false`): the window between dispatch and
+        //    the worker's first batch (overlay setup, FUSE warm — easily
+        //    >30s). Skip entirely — a zero-line `.partial` blob and PG row
+        //    for every dispatched-but-not-yet-streaming drv would be noise.
+        //  - Final (`is_final=true`): `drain_if_exec` matches on `exec_id`
+        //    alone, so a stamped-but-empty entry drains as
+        //    `Some((0, 0, 0, []))`, not `None`. Recovery's `set_log_exec`
+        //    restamp on a fresh standby leaves exactly that when the
+        //    worker never reconnects before the drv terminates. There is
+        //    nothing to upload, but a `drv_logs` row the ex-leader's
+        //    periodic flusher already wrote must still be closed — or it
+        //    rots at `is_complete=false` for the full retention TTL while
+        //    `record_exec_correlation` pins the dashboard to it. (The
+        //    `None` arm of `flush_final` has the analogous pre-existing
+        //    gap for a re-dispatched drv — exec₁'s `.partial` row is never
+        //    finalized when exec₂ takes over the entry — but the dashboard
+        //    pin moves to exec₂ at exec₂'s terminal, so that row is not
+        //    the one being served. Out of scope here.)
         if line_count == 0 {
+            if is_final {
+                self.finalize_empty_drain(&req).await;
+            }
             return;
         }
 
@@ -564,6 +581,56 @@ impl LogFlusher {
                     error = %e,
                     "best-effort .partial delete failed (TTL sweep will catch it at expiry)"
                 );
+            }
+        }
+    }
+
+    /// Metadata-only finalization for a final flush whose drain yielded
+    /// zero lines.
+    ///
+    /// There is nothing to compress or PUT, but if a periodic snapshot of
+    /// this execution already produced a `.partial` blob and a `drv_logs`
+    /// row (typically on the ex-leader, before a failover handed the empty
+    /// re-stamped buffer to this replica), that row must still be closed.
+    /// A targeted UPDATE — not [`upsert_drv_log`] — so the content columns
+    /// (`s3_key`, `first_line`, `line_count`, `total_bytes`) keep
+    /// describing the `.partial` blob, which remains the only stored
+    /// content for this execution and is deliberately NOT deleted here.
+    /// The TTL GC sweep reconstructs both S3 keys from `(exec_id,
+    /// drv_hash)`, so the `.partial` blob is still swept at expiry.
+    ///
+    /// 0 rows affected ⇒ no periodic flush ever ran for this execution ⇒
+    /// the worker never streamed a line to any leader ⇒ there is no log
+    /// and there must be no row (a row pointing at a blob that was never
+    /// uploaded turns the read path's "no log found" into an S3 404).
+    ///
+    /// On failure the row stays `is_complete=false` until the TTL sweep —
+    /// the pre-fix behavior, for this one execution, until then. The
+    /// content (`.partial` blob + row) is intact either way.
+    async fn finalize_empty_drain(&self, req: &FlushRequest) {
+        match sqlx::query(
+            "UPDATE drv_logs
+             SET is_complete = true, status = $2, finished_at = now()
+             WHERE exec_id = $1",
+        )
+        .bind(req.exec_id)
+        .bind(req.status.as_deref())
+        .execute(&self.pool)
+        .await
+        {
+            Ok(r) => {
+                debug!(
+                    exec_id = %req.exec_id,
+                    drv_path = %req.drv_path,
+                    status = ?req.status,
+                    rows_affected = r.rows_affected(),
+                    "empty final drain: finalized the prior .partial drv_logs row in \
+                     place (0 rows = never streamed, nothing to close)"
+                );
+            }
+            Err(e) => {
+                let partial_key = log_s3_key(&req.drv_path, &req.exec_id, true);
+                flush_failure(true, "pg", &partial_key, &e, &req.drv_path);
             }
         }
     }
@@ -1353,6 +1420,156 @@ mod tests {
             .fetch_one(&db.pool)
             .await?;
         assert_eq!(count.0, 0, "no PG row for empty buffer");
+        Ok(())
+    }
+
+    /// Leader failover leaves the new leader with an empty ring-buffer
+    /// entry re-stamped to the in-flight execution (`recover_from_pg` →
+    /// `set_log_exec`), while the ex-leader's periodic flusher already
+    /// wrote a `.partial` blob and a `drv_logs` row at `is_complete=false`.
+    /// If the drv terminates before the worker reconnects, the final drain
+    /// yields zero lines — the flusher must still finalize the existing
+    /// row (is_complete/status/finished_at) WITHOUT repointing `s3_key` at
+    /// a `.log.zst` blob that was never uploaded and WITHOUT deleting the
+    /// `.partial` blob (the only stored content).
+    /// r[verify obs.log.exec-keyed]
+    #[tokio::test]
+    async fn flush_final_empty_drain_finalizes_partial_row() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/failoverempty-final.drv";
+
+        // Ex-leader: the worker streamed a line and the periodic flusher
+        // wrote the `.partial` blob + row.
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"streamed to the ex-leader"]);
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        flusher.flush_periodic().await;
+        let snap: (bool, String, i64) = sqlx::query_as(
+            "SELECT is_complete, s3_key, line_count FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert!(!snap.0, "fixture: periodic row starts incomplete");
+        assert!(snap.1.ends_with(".partial.log.zst"), "fixture: {}", snap.1);
+        assert_eq!(snap.2, 1, "fixture: periodic snapshot recorded the line");
+        assert_eq!(
+            puts.lock().unwrap().len(),
+            1,
+            "fixture: periodic PUT happened"
+        );
+
+        // Failover: the new leader's process has no lines for this drv.
+        // Recovery re-stamps an EMPTY entry with the SAME exec_id loaded
+        // from `assignments`. Modeled as discard (the ex-leader's memory
+        // is gone) + set_exec (recovery's restamp on the fresh standby) —
+        // set_exec alone would NOT model this, a same-exec restamp keeps
+        // the lines.
+        buffers.discard(drv_path);
+        buffers.set_exec(drv_path, exec_id, "test-worker");
+
+        // The drv terminates before the worker reconnects.
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id,
+                status: Some("failed".into()),
+            })
+            .await;
+
+        // Lifecycle columns flipped; content columns untouched.
+        let row: (bool, Option<String>, String, i64, Option<f64>) = sqlx::query_as(
+            "SELECT is_complete, status, s3_key, line_count, \
+                    EXTRACT(EPOCH FROM finished_at)::float8 \
+             FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert!(row.0, "empty final drain must still flip is_complete");
+        assert_eq!(row.1.as_deref(), Some("failed"));
+        assert!(
+            row.2.ends_with(".partial.log.zst"),
+            "s3_key must keep pointing at the .partial blob (the only content): {}",
+            row.2
+        );
+        assert_eq!(
+            row.3, 1,
+            "line_count from the periodic snapshot is preserved"
+        );
+        assert!(row.4.is_some(), "finished_at stamped");
+
+        // Nothing new uploaded, and the .partial blob — the only stored
+        // content for this execution — is not deleted.
+        assert_eq!(
+            puts.lock().unwrap().len(),
+            1,
+            "empty final drain must not PUT"
+        );
+        assert!(
+            deletes.lock().unwrap().is_empty(),
+            "empty final drain must not delete the .partial blob"
+        );
+        // The entry is still drained (the execution is over).
+        assert_eq!(buffers.active_count(), 0);
+        Ok(())
+    }
+
+    /// An empty final drain for an execution that never produced a
+    /// periodic snapshot (the worker never streamed a line to ANY leader
+    /// — assigned then immediately poisoned/cancelled) has no `drv_logs`
+    /// row to finalize. The metadata-only UPDATE must match zero rows and
+    /// must NOT create one: a row whose `s3_key` names a blob that was
+    /// never uploaded turns the read path's clean "no log found" into an
+    /// S3 404. Pins the UPDATE-not-INSERT decision; passes both before
+    /// and after the fix (the regression catch is the sibling test).
+    #[tokio::test]
+    async fn flush_final_empty_drain_without_prior_row_creates_nothing() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, _deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/norowempty-final.drv";
+        // Stamped at dispatch, never pushed to, never periodically flushed.
+        let exec_id = Uuid::now_v7();
+        buffers.set_exec(drv_path, exec_id, "test-worker");
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id,
+                status: Some("cancelled".into()),
+            })
+            .await;
+
+        assert!(puts.lock().unwrap().is_empty(), "no S3 PUT");
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM drv_logs")
+            .fetch_one(&db.pool)
+            .await?;
+        assert_eq!(
+            count.0, 0,
+            "no row may be created for a never-streamed execution"
+        );
+        assert_eq!(
+            buffers.active_count(),
+            0,
+            "the empty entry is still drained"
+        );
         Ok(())
     }
 
