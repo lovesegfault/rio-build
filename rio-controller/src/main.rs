@@ -332,9 +332,12 @@ async fn main() -> anyhow::Result<()> {
                 rio_lease::LeaderState::always_leader(Arc::clone(&generation))
             }
         };
-        // Controller has no recovery step — flip recovery_complete now
-        // so `leader_for()` consumers (none yet) see a coherent state.
-        leader.set_recovery_complete();
+        // Controller has no recovery step — record completion for the
+        // startup acquire-epoch so `leader_for()` consumers (none yet)
+        // see a coherent state. There is nothing to re-complete after
+        // later lease transitions; nothing in the controller reads the
+        // predicate.
+        leader.set_recovery_complete(leader.acquired_transitions());
 
         let hooks = ControllerLeaseHooks::default();
         if let Some(lease_cfg) = lease_cfg {

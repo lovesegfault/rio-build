@@ -19,7 +19,9 @@
 //!    IMMEDIATELY, then fire-and-forget `ActorCommand::LeaderAcquired`
 //!    (no reply). Lease loop continues renewing normally.
 //! 2. Actor handles `LeaderAcquired`: calls `recover_from_pg().await`
-//!    → on success `recovery_complete.store(true)`.
+//!    → on success the completion is recorded for the acquire-epoch
+//!    (transition count) the recovery was computed under
+//!    (`LeaderState::set_recovery_complete`).
 //! 3. `dispatch_ready` gates on BOTH `is_leader` AND `recovery_complete`.
 //!    Standby merges DAGs (state warm) but doesn't dispatch until
 //!    recovery is done.
@@ -1109,13 +1111,25 @@ impl DagActor {
         // Snapshot the flap-detection signals BEFORE recovery. If the
         // lease flaps (lose→reacquire WITH a holder change in between)
         // while recover_from_pg() is running, the lease loop will have
-        // cleared recovery_complete (`LeaderState::on_lose` in
+        // cleared the recovery completion (`LeaderState::on_lose` in
         // rio-lease; `on_rebound` is the second mid-recovery clearer,
         // for holder changes observed late on a still-leading round).
-        // An unconditional store(true) here would clobber
-        // that clear and let dispatch_ready fire with a DAG loaded
-        // under the OLD epoch but stamped with the CURRENT generation
-        // — the worker-side gen fence can't catch that.
+        // The completion at the end of this function is keyed to
+        // `transitions_at_entry` (recovery_complete() compares that
+        // stamp against the CURRENTLY recorded acquired_transitions),
+        // so a holder change that lands at ANY point — before the gate
+        // below, or in the window between the gate's loads and the
+        // completion call (the lease loop runs on its own thread; no
+        // actor-side await is needed for its writes to interleave) —
+        // leaves the stamp referring to an epoch that is no longer the
+        // recorded one, and dispatch stays gated. What the stamp cannot
+        // distinguish is an epoch that left and came back to the SAME
+        // count: the count-coincidence ABA, priced in the residual note
+        // below — the same residual the gate itself accepts. The gate
+        // is still what discards this recovery's WORK (the loaded DAG,
+        // the claim) when a flap is detected, so the next
+        // LeaderAcquired re-runs it instead of leaving a stale-epoch
+        // DAG behind a permanently-false completion.
         //
         // Three signals, re-checked at the gate below:
         //
@@ -1590,16 +1604,17 @@ impl DagActor {
         // the next LeaderAcquired re-run it.
         //
         // INVARIANT: no await may be introduced between this check and
-        // set_recovery_complete() (either match arm below). Any await
-        // here re-opens the window where a lose→re-acquire clears
-        // recovery_complete and is then clobbered by our store(true),
-        // ungating dispatch with a DAG loaded under a lost epoch — see
-        // the comment at the gen_at_entry/transitions_at_entry
-        // snapshot. New PG round-trips — and any new wait like the
-        // bump confirmation — belong ABOVE, with recover_from_pg, the
-        // sweep_stale_* calls, and the generation-claim loop. (The
-        // reads below are atomic loads, not awaits — the invariant
-        // holds as written.)
+        // set_recovery_complete() (either match arm below) — and new PG
+        // round-trips or waits (like the bump confirmation) belong
+        // ABOVE, with recover_from_pg, the sweep_stale_* calls, and the
+        // generation-claim loop. The completion below is keyed to
+        // transitions_at_entry, so a concurrent lease transition can no
+        // longer turn it into a false "complete" (see the entry-
+        // snapshot comment) — but an await here would still widen the
+        // window in which this attempt's already-checked WORK (the
+        // loaded DAG, the claim, the seed below) goes stale before it
+        // is applied, for no benefit. (The reads below are atomic
+        // loads, not awaits — the invariant holds as written.)
         let gen_now = self.leader.generation();
         let transitions_now = self.leader.acquired_transitions();
         let still_leader = self.leader.is_leader();
@@ -1650,18 +1665,16 @@ impl DagActor {
             return;
         }
 
-        // TODO: the unconditional set_recovery_complete() below runs even when
-        // the lease was lost while recovery was running (on_lose cleared the
-        // flag; the generation TOCTOU check above only detects re-acquires,
-        // not plain losses). The flag then stays true through standby, so the
-        // NEXT acquire's pre-recovery gap is not closed by
-        // LogFlusher::may_flush() / dispatch_ready. Not a stored-coverage
-        // hazard today: in that history every retained log-buffer entry is
-        // still Unchecked from this recovery's re-arm (no flush window existed
-        // since), so a gap flush reconciles rather than overwrites. Cleaner
-        // would be skipping the set when !is_leader(), or clearing the flag in
-        // on_acquire(); either needs its own look at dispatch_ready's reading
-        // of the flag before changing.
+        // A loss observed while recovery was running (a bare lose, not a
+        // re-acquire — the TOCTOU check above only catches the latter)
+        // still reaches the set_recovery_complete() below, but the stamp
+        // it records is keyed to THIS acquire's transition count: the
+        // next acquire moves `acquired_transitions`, the stale stamp no
+        // longer matches, and `recovery_complete()` reads false again —
+        // so the next tenure's pre-recovery gap stays gated for
+        // LogFlusher::may_flush() / dispatch_ready without any
+        // is_leader() special-casing here.
+        //
         // Final disposition of this attempt: exactly one
         // rio_scheduler_recovery_total increment per attempt. The
         // discard branch above counted discarded_*; every attempt that
@@ -1696,7 +1709,7 @@ impl DagActor {
                         "seeded generation from PG floor (assignments ∪ claims)"
                     );
                 }
-                self.leader.set_recovery_complete();
+                self.leader.set_recovery_complete(transitions_at_entry);
                 // Only HERE: the DAG was rebuilt from PG by this
                 // tenure's recover_from_pg, so "not in the DAG" means
                 // "stale" again and the disconnect-time log-buffer
@@ -1720,7 +1733,7 @@ impl DagActor {
                 // entries, and the disconnect-time discard must not
                 // treat "not in the (empty) DAG" as "stale".
                 self.clear_persisted_state();
-                self.leader.set_recovery_complete();
+                self.leader.set_recovery_complete(transitions_at_entry);
             }
         }
     }

@@ -1686,20 +1686,21 @@ async fn test_log_batch_oversized_line_and_executor_id_bounded_before_forward() 
 async fn heartbeat_advertises_generation_only_after_recovery_complete() -> anyhow::Result<()> {
     use rio_proto::ExecutorService;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
 
     let db = TestDb::new(&MIGRATOR).await;
     // Simulate the recovery window: the acquire edge has raised the
     // generation Arc to 7 and flipped is_leader, but recovery has not
-    // completed yet.
-    let recovery_complete = Arc::new(AtomicBool::new(false));
-    let rc = Arc::clone(&recovery_complete);
+    // completed yet. Keep a LeaderState clone so the test can complete
+    // recovery for the current acquire-epoch mid-test.
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::new(AtomicU64::new(7)),
+        Arc::new(AtomicBool::new(true)),
+        false,
+    );
+    let l = leader.clone();
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
-        p.leader = crate::lease::LeaderState::from_parts(
-            Arc::new(AtomicU64::new(7)),
-            Arc::new(AtomicBool::new(true)),
-            rc,
-        );
+        p.leader = l;
     });
     // `new_for_tests` keeps its own always-true `is_leader` Arc — that
     // is what lets the heartbeat pass `ensure_leader` while the
@@ -1727,8 +1728,8 @@ async fn heartbeat_advertises_generation_only_after_recovery_complete() -> anyho
 
     // Recovery completes → the post-recovery generation is advertised
     // (also pins that generation_reader() is wired to the leader's
-    // actual recovery_complete Arc).
-    recovery_complete.store(true, Ordering::SeqCst);
+    // actual recovery-completion state).
+    leader.set_recovery_complete(leader.acquired_transitions());
     let resp = grpc
         .heartbeat(Request::new(rio_proto::types::HeartbeatRequest {
             executor_id: "fence-w1".into(),

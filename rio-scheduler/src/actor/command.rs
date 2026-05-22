@@ -984,15 +984,12 @@ impl BackpressureReader {
 #[derive(Clone)]
 pub struct GenerationReader {
     generation: Arc<AtomicU64>,
-    recovery_complete: Arc<AtomicBool>,
+    leader: crate::lease::LeaderState,
 }
 
 impl GenerationReader {
-    pub(super) fn new(generation: Arc<AtomicU64>, recovery_complete: Arc<AtomicBool>) -> Self {
-        Self {
-            generation,
-            recovery_complete,
-        }
+    pub(super) fn new(generation: Arc<AtomicU64>, leader: crate::lease::LeaderState) -> Self {
+        Self { generation, leader }
     }
 
     /// Current leader generation — the raw acquire-edge value,
@@ -1009,19 +1006,22 @@ impl GenerationReader {
     /// for the executor's `fetch_max` fence latch) before that.
     ///
     /// Ordering: the recovery seed's `fetch_max` is sequenced before
-    /// the SeqCst `set_recovery_complete()` store on the actor task, so
-    /// a reader that observes `true` here also observes the seeded
-    /// generation. The two loads are NOT one atomic snapshot — a reply
-    /// composed exactly across a lose→re-acquire edge, or across a
-    /// rebound (`LeaderState::on_rebound` clears the flag first, then
-    /// raises the generation), can pair them
-    /// inconsistently for one heartbeat; that exposure is no worse than
-    /// the pre-gating default for every heartbeat. A TOCTOU-discarded
-    /// recovery leaves `recovery_complete` false, so a flapped recovery
-    /// keeps advertising 0 until the re-run completes — desired.
+    /// the SeqCst `set_recovery_complete()` call on the actor task, so
+    /// a reader that observes `recovery_complete()` true here also
+    /// observes the seeded generation. The loads are NOT one atomic
+    /// snapshot — a reply composed exactly across a lose→re-acquire
+    /// edge, or across a rebound (`LeaderState::on_rebound` clears the
+    /// completion stamp first, then raises the generation), can pair
+    /// them inconsistently for one heartbeat; that exposure is no worse
+    /// than the pre-gating default for every heartbeat. A
+    /// TOCTOU-discarded recovery never stamps a completion — and a
+    /// completion racing a lease transition is stamped with an epoch
+    /// the recorded count no longer matches — so a flapped or rebounded
+    /// recovery keeps advertising 0 until the re-run completes —
+    /// desired.
     // r[impl sched.lease.claim-before-advertise]
     pub fn advertised(&self) -> u64 {
-        if self.recovery_complete.load(Ordering::SeqCst) {
+        if self.leader.recovery_complete() {
             self.generation.load(Ordering::Acquire)
         } else {
             0

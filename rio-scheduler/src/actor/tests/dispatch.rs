@@ -2926,11 +2926,8 @@ async fn substitute_complete_on_standby_is_noop() -> TestResult {
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     // Wire a LeaderState we can flip from the test.
     let is_leader = Arc::new(AtomicBool::new(true));
-    let leader = crate::lease::LeaderState::from_parts(
-        Arc::new(AtomicU64::new(1)),
-        is_leader.clone(),
-        Arc::new(AtomicBool::new(true)),
-    );
+    let leader =
+        crate::lease::LeaderState::from_parts(Arc::new(AtomicU64::new(1)), is_leader.clone(), true);
     let (handle, _task) = setup_actor_configured(db.pool.clone(), Some(store_client), |_, p| {
         p.leader = leader;
     });

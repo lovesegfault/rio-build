@@ -307,10 +307,17 @@ impl LeaseConfig {
     }
 }
 
+/// Recovery-completion sentinel: no acquire-epoch has completed
+/// recovery. Lives outside the realistic `leaseTransitions` range (the
+/// apiserver count starts at 0 and increments per holder change), so it
+/// can never compare equal to a recorded `acquired_transitions`.
+const RECOVERY_NOT_COMPLETE: u64 = u64::MAX;
+
 /// Shared leader state. The lease task writes; actor + health read.
 ///
-/// Four atomics — generation, acquired_transitions, is_leader,
-/// recovery_complete — updated together on acquire/lose/rebound
+/// The atomics — generation, acquired_transitions, is_leader, and the
+/// epoch-keyed completion stamp behind `recovery_complete()` —
+/// updated together on acquire/lose/rebound
 /// transitions (acquired_transitions is written on acquire and on
 /// rebound; `on_lose` deliberately leaves it recording the last such
 /// edge). **All
@@ -351,17 +358,26 @@ pub struct LeaderState {
     /// returns if false (standby schedulers merge DAGs but don't
     /// dispatch — state warm for fast takeover).
     is_leader: Arc<AtomicBool>,
-    /// Whether recovery has completed. dispatch_ready gates on
-    /// BOTH is_leader AND this. Set by handle_leader_acquired
-    /// AFTER recover_from_pg finishes. Cleared by
-    /// [`on_lose`](Self::on_lose) so re-acquire re-triggers
-    /// recovery.
+    /// The `acquired_transitions` value recovery has completed FOR
+    /// ([`RECOVERY_NOT_COMPLETE`] = none). `recovery_complete()` ⇔ this
+    /// equals the currently recorded `acquired_transitions` — i.e. a
+    /// completion is only valid while the acquire-epoch it was computed
+    /// under is still the recorded one. dispatch_ready gates on BOTH
+    /// is_leader AND that predicate. Set by handle_leader_acquired
+    /// AFTER recover_from_pg finishes, with the transition count it
+    /// snapshotted at recovery entry; reset to the sentinel by
+    /// [`on_lose`](Self::on_lose) / [`on_rebound`](Self::on_rebound) so
+    /// re-acquire (or the rebound's re-fired hook) re-triggers recovery.
+    /// Keying the completion to the epoch — rather than a bare bool —
+    /// means a completion racing a concurrent lease transition can never
+    /// ungate dispatch for an epoch it was not computed under, with no
+    /// reliance on store ordering between the two writer tasks.
     ///
     /// Separate from is_leader because the lease loop sets
     /// is_leader IMMEDIATELY (non-blocking — must keep renewing),
     /// then fire-and-forgets LeaderAcquired. Recovery may take
     /// seconds; dispatch waits.
-    recovery_complete: Arc<AtomicBool>,
+    recovery_completed_for: Arc<AtomicU64>,
     /// Renew rounds started: incremented by the lease loop immediately
     /// before each `try_acquire_or_renew()` attempt
     /// ([`begin_renew_round`](Self::begin_renew_round)). Paired with
@@ -413,11 +429,6 @@ impl LeaderState {
         Arc::clone(&self.generation)
     }
 
-    /// Shared `recovery_complete` Arc.
-    pub fn recovery_complete_arc(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.recovery_complete)
-    }
-
     /// Current generation. `Acquire` load — pairs with the `SeqCst`
     /// `fetch_max` in [`on_acquire`](Self::on_acquire) so a reader
     /// observing the new generation also sees all prior stores.
@@ -444,20 +455,41 @@ impl LeaderState {
         self.acquired_transitions.load(Ordering::SeqCst)
     }
 
-    /// Whether the actor's `recover_from_pg` has completed since the
-    /// last acquire. `SeqCst` load — pairs with
-    /// [`set_recovery_complete`](Self::set_recovery_complete) and
-    /// [`on_lose`](Self::on_lose).
+    /// Whether the actor's `recover_from_pg` has completed for the
+    /// CURRENTLY recorded acquire-epoch: the completion stamp equals
+    /// `acquired_transitions`. Two `SeqCst` loads (stamp first, then
+    /// count) — pairs with
+    /// [`set_recovery_complete`](Self::set_recovery_complete),
+    /// [`on_lose`](Self::on_lose) and [`on_rebound`](Self::on_rebound).
+    /// A stamp from an epoch a later transition has already replaced
+    /// can never compare equal; a stamp loaded just before a concurrent
+    /// transition lands errs only toward `false` for one read — the
+    /// conservative direction (and the same benign window the previous
+    /// boolean flag had).
     pub fn recovery_complete(&self) -> bool {
-        self.recovery_complete.load(Ordering::SeqCst)
+        let completed_for = self.recovery_completed_for.load(Ordering::SeqCst);
+        completed_for != RECOVERY_NOT_COMPLETE
+            && completed_for == self.acquired_transitions.load(Ordering::SeqCst)
     }
 
-    /// Mark recovery complete. `SeqCst` store — the actor calls this
-    /// AFTER `recover_from_pg` returns (success or fail-empty); pairs
-    /// with the `SeqCst` load in `dispatch_ready` so dispatch sees all
-    /// recovery writes before proceeding.
-    pub fn set_recovery_complete(&self) {
-        self.recovery_complete.store(true, Ordering::SeqCst);
+    /// Mark recovery complete for the acquire-epoch
+    /// `transitions_at_entry` — the `acquired_transitions()` value the
+    /// caller snapshotted when that recovery began. `SeqCst` store — the
+    /// actor calls this AFTER `recover_from_pg` returns (success or
+    /// fail-empty); pairs with the `SeqCst` loads in `dispatch_ready` so
+    /// dispatch sees all recovery writes before proceeding. The store is
+    /// unconditional but stale-safe by construction: if a lease
+    /// transition (lose, rebound, re-acquire at a different count)
+    /// landed after the snapshot, the recorded `acquired_transitions` no
+    /// longer equals the stamp and `recovery_complete()` stays false —
+    /// the completion writers (the actor, serially; the controller once
+    /// at startup) never race each other, so no compare-and-set is
+    /// needed. The one shape the stamp cannot distinguish is an epoch
+    /// that left and came back to the SAME count (the count-coincidence
+    /// ABA) — the same residual the recovery TOCTOU gate already prices.
+    pub fn set_recovery_complete(&self, transitions_at_entry: u64) {
+        self.recovery_completed_for
+            .store(transitions_at_entry, Ordering::SeqCst);
     }
 
     /// Allocate the id of a renew round that is about to start. Called
@@ -509,14 +541,17 @@ impl LeaderState {
         self.generation.fetch_max(target, Ordering::Release)
     }
 
-    /// Construct from pre-existing shared Arcs. Test fixtures that need
-    /// to drive the flags from outside the lease loop (e.g. rio-scheduler's
-    /// actor recovery tests). Not `#[cfg(test)]`: cross-crate test callers
-    /// compile this crate without `--cfg test`.
+    /// Construct from pre-existing shared Arcs plus the initial
+    /// recovery-completion state. Test fixtures that need to drive the
+    /// flags from outside the lease loop (e.g. rio-scheduler's actor
+    /// recovery tests) keep a clone of the returned `LeaderState` and
+    /// observe/drive completion through the `recovery_complete()` /
+    /// `set_recovery_complete()` / `on_*` methods. Not `#[cfg(test)]`:
+    /// cross-crate test callers compile this crate without `--cfg test`.
     pub fn from_parts(
         generation: Arc<AtomicU64>,
         is_leader: Arc<AtomicBool>,
-        recovery_complete: Arc<AtomicBool>,
+        recovery_complete: bool,
     ) -> Self {
         // Test fixtures: `became_leader_at` mirrors `is_leader` —
         // Some(now) when leading, None when standby. Avoids a fourth
@@ -526,7 +561,13 @@ impl LeaderState {
             generation,
             acquired_transitions: Arc::new(AtomicU64::new(0)),
             is_leader,
-            recovery_complete,
+            // "Already complete" = complete for the fixture's initial
+            // acquire-epoch (acquired_transitions starts at 0).
+            recovery_completed_for: Arc::new(AtomicU64::new(if recovery_complete {
+                0
+            } else {
+                RECOVERY_NOT_COMPLETE
+            })),
             renew_rounds_started: Arc::new(AtomicU64::new(0)),
             last_leading_round: Arc::new(AtomicU64::new(0)),
             became_leader_at: Arc::new(parking_lot::RwLock::new(became_leader_at)),
@@ -545,7 +586,9 @@ impl LeaderState {
             generation,
             acquired_transitions: Arc::new(AtomicU64::new(0)),
             is_leader: Arc::new(AtomicBool::new(true)),
-            recovery_complete: Arc::new(AtomicBool::new(true)),
+            // Complete for the (only) epoch 0: no lease loop, no
+            // recovery to wait for.
+            recovery_completed_for: Arc::new(AtomicU64::new(0)),
             renew_rounds_started: Arc::new(AtomicU64::new(0)),
             last_leading_round: Arc::new(AtomicU64::new(0)),
             // Non-K8s/test mode reports a real (small but growing) age
@@ -567,7 +610,9 @@ impl LeaderState {
             generation,
             acquired_transitions: Arc::new(AtomicU64::new(0)),
             is_leader: Arc::new(AtomicBool::new(false)),
-            recovery_complete: Arc::new(AtomicBool::new(false)),
+            // No epoch has completed recovery yet: the first
+            // acquisition triggers recovery before dispatch ungates.
+            recovery_completed_for: Arc::new(AtomicU64::new(RECOVERY_NOT_COMPLETE)),
             renew_rounds_started: Arc::new(AtomicU64::new(0)),
             last_leading_round: Arc::new(AtomicU64::new(0)),
             became_leader_at: Arc::new(parking_lot::RwLock::new(None)),
@@ -619,13 +664,17 @@ impl LeaderState {
     /// SeqCst on all stores: the generation and acquired_transitions
     /// writes happen-before the is_leader write in the total order. A
     /// reader seeing is_leader=true (SeqCst load) sees the new
-    /// generation and the new transition count. recovery_complete is NOT
-    /// set here — that's the actor's job after recover_from_pg finishes.
+    /// generation and the new transition count. Recovery completion is
+    /// NOT recorded here — that's the actor's job after recover_from_pg
+    /// finishes (and a completion stamped under a previous epoch only
+    /// reads as complete again if this acquire records the SAME
+    /// transition count — the same-epoch re-acquire, which is exactly
+    /// the case whose in-flight work is still valid).
     ///
     /// A holder change observed only after we are already Leading again
     /// (no standby interval ever observed locally) goes through
     /// [`on_rebound`](Self::on_rebound) instead — same count recording
-    /// and generation derivation, different `recovery_complete`
+    /// and generation derivation, different recovery-completion
     /// handling.
     // r[impl sched.lease.generation-fence+2]
     pub fn on_acquire(&self, lease_transitions: u64) -> u64 {
@@ -658,17 +707,23 @@ impl LeaderState {
     /// ever fired locally. Returns the new generation.
     ///
     /// Store order differs from [`on_acquire`](Self::on_acquire), and it
-    /// is load-bearing: `recovery_complete` is cleared FIRST, then the
+    /// is load-bearing: the completion stamp is cleared FIRST, then the
     /// transition count is recorded, then the generation `fetch_max`
     /// runs. Every path into an acquire edge already has
-    /// `recovery_complete` false (`pending()`, the lose arm, the
+    /// `recovery_complete()` false (`pending()`, the lose arm, the
     /// self-fence), so `on_acquire` can never raise the generation while
-    /// the flag is true — a rebound is the first writer that could.
-    /// Clearing the flag first means a heartbeat reader cannot pair a
-    /// still-true flag with the rebound-raised generation, except in the
-    /// already-accepted two-load-straddle case documented at the
+    /// the predicate is true — a rebound is the first writer that could.
+    /// Clearing the stamp first means a heartbeat reader cannot pair a
+    /// still-true predicate with the rebound-raised generation, except
+    /// in the already-accepted two-load-straddle case documented at the
     /// scheduler's `advertised()` — preserving
-    /// `sched.lease.claim-before-advertise`.
+    /// `sched.lease.claim-before-advertise`. An in-flight recovery that
+    /// completes AFTER this rebound stamps the PRE-rebound transition
+    /// count, which the moved `acquired_transitions` no longer matches —
+    /// so the late completion cannot ungate dispatch either (the only
+    /// exception is an observed count that lands back exactly on the
+    /// recorded one: the count-coincidence ABA priced at the recovery
+    /// gate's entry-snapshot comment in rio-scheduler).
     ///
     /// `is_leader` is NOT touched: we hold the Lease at this
     /// observation, there is no moment of believed non-leadership to
@@ -685,7 +740,8 @@ impl LeaderState {
     // r[impl sched.lease.rebound]
     // r[impl sched.lease.generation-fence+2]
     pub fn on_rebound(&self, lease_transitions: u64) -> u64 {
-        self.recovery_complete.store(false, Ordering::SeqCst);
+        self.recovery_completed_for
+            .store(RECOVERY_NOT_COMPLETE, Ordering::SeqCst);
         self.acquired_transitions
             .store(lease_transitions, Ordering::SeqCst);
         let target = lease_transitions.saturating_add(1);
@@ -697,11 +753,12 @@ impl LeaderState {
         new_gen
     }
 
-    /// Lose transition: clear is_leader, clear recovery_complete.
+    /// Lose transition: clear is_leader, clear the recovery-completion
+    /// stamp.
     ///
-    /// SeqCst on both stores: is_leader=false happens-before
-    /// recovery_complete=false in the total order. A reader seeing
-    /// recovery_complete=false (SeqCst) also sees is_leader=false.
+    /// SeqCst on both stores: is_leader=false happens-before the stamp
+    /// clear in the total order. A reader seeing the cleared stamp
+    /// (SeqCst) also sees is_leader=false.
     /// Generation is NOT touched — the NEW leader derives its own
     /// from the lease's transition count on acquire; we don't know
     /// (and don't need to know) what that will be.
@@ -710,7 +767,8 @@ impl LeaderState {
     /// compares those edges, not the current lease state.
     pub fn on_lose(&self) {
         self.is_leader.store(false, Ordering::SeqCst);
-        self.recovery_complete.store(false, Ordering::SeqCst);
+        self.recovery_completed_for
+            .store(RECOVERY_NOT_COMPLETE, Ordering::SeqCst);
         *self.became_leader_at.write() = None;
     }
 }
@@ -949,7 +1007,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         // self-fence while a standby steals after
                         // STEAL_AFTER of observed staleness →
                         // dual-leader. Hooks spawn; the separate
-                        // recovery_complete flag lets the loop keep
+                        // recovery-completion gate lets the loop keep
                         // renewing regardless.
                         hooks.on_acquire();
                     }
@@ -1407,6 +1465,65 @@ mod tests {
         );
     }
 
+    /// A recovery completion computed before a rebound must not mark
+    /// recovery complete after the rebound. Models the actor finishing
+    /// `handle_leader_acquired` (TOCTOU gate already passed on the
+    /// pre-rebound snapshots) while the lease loop's `on_rebound` lands
+    /// concurrently between the gate's loads and the completion call:
+    /// the completion is stamped with the pre-rebound acquire-epoch, so
+    /// it cannot ungate dispatch for the post-rebound one — regardless
+    /// of store order between the two tasks. (Red-first: with the
+    /// previous unconditional boolean store(true) the first assertion
+    /// failed.) The same-epoch re-acquire deliberately still completes:
+    /// a lose + re-acquire at the SAME count is the same epoch, and its
+    /// in-flight recovery result is still valid — that is the recovery
+    /// gate's documented keep case, preserved by keying on the epoch
+    /// rather than a session counter.
+    // r[verify sched.lease.rebound]
+    #[test]
+    fn stale_completion_does_not_override_rebound_clear() {
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        state.on_acquire(2);
+        // The actor snapshots its recovery-entry state — including the
+        // acquire-epoch (transition count) — when it starts processing
+        // LeaderAcquired.
+        let transitions_at_entry = state.acquired_transitions();
+
+        // The lease loop observes a holder change that began and ended
+        // inside our observation gap — a rebound to a different count.
+        // Recovery must re-run before dispatch ungates.
+        state.on_rebound(4);
+
+        // The in-flight (pre-rebound) recovery now finishes and stamps
+        // the epoch it was computed under. The stamp is stale — it must
+        // NOT make recovery_complete() true.
+        state.set_recovery_complete(transitions_at_entry);
+        assert!(
+            !state.recovery_complete(),
+            "a completion computed before the rebound must not ungate dispatch"
+        );
+
+        // Control: the rebound's own recovery (entered after the
+        // rebound, so stamped with the new epoch) completing DOES
+        // ungate.
+        state.set_recovery_complete(state.acquired_transitions());
+        assert!(state.recovery_complete());
+
+        // Same-epoch keep: a lose + re-acquire at the SAME count while
+        // a recovery is in flight is the same epoch — its completion
+        // remains valid (the gate's documented keep case).
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        state.on_acquire(3);
+        let entry = state.acquired_transitions();
+        state.on_lose();
+        state.on_acquire(3);
+        state.set_recovery_complete(entry);
+        assert!(
+            state.recovery_complete(),
+            "a same-epoch re-acquire keeps the in-flight completion valid"
+        );
+    }
+
     /// `acquired_transitions` records the raw transition count of the
     /// most recent acquire edge, unconditionally — including in the
     /// saturated regime where the PG-floor seed makes the generation
@@ -1454,7 +1571,7 @@ mod tests {
     fn on_rebound_records_count_and_reruns_recovery() {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
         state.on_acquire(2); // gen 3, recorded transitions 2
-        state.set_recovery_complete();
+        state.set_recovery_complete(state.acquired_transitions());
 
         let new_gen = state.on_rebound(4);
         assert_eq!(new_gen, 5, "generation re-derives from the observed count");
@@ -1478,7 +1595,7 @@ mod tests {
         // generation past anything the count derives — the fetch_max is
         // a no-op but the count and the recovery flag still move.
         state.seed_generation_from(10);
-        state.set_recovery_complete();
+        state.set_recovery_complete(state.acquired_transitions());
         let saturated_gen = state.on_rebound(6);
         assert_eq!(saturated_gen, 10, "saturated regime: generation unchanged");
         assert_eq!(state.acquired_transitions(), 6);
@@ -1575,7 +1692,7 @@ mod tests {
     fn self_fence_flips_is_leader_after_fence_deadline_of_failures() {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(2)));
         state.is_leader.store(true, Ordering::Relaxed);
-        state.recovery_complete.store(true, Ordering::Relaxed);
+        state.set_recovery_complete(state.acquired_transitions());
 
         let mut was_leading = true;
         let mut owe_cost_clear = false;
@@ -1591,7 +1708,7 @@ mod tests {
             "self-fence should flip is_leader=false"
         );
         assert!(
-            !state.recovery_complete.load(Ordering::Relaxed),
+            !state.recovery_complete(),
             "self-fence should clear recovery_complete (re-acquire re-runs recovery)"
         );
         assert!(
@@ -1609,7 +1726,7 @@ mod tests {
     fn self_fence_does_not_flip_before_fence_deadline() {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(2)));
         state.is_leader.store(true, Ordering::Relaxed);
-        state.recovery_complete.store(true, Ordering::Relaxed);
+        state.set_recovery_complete(state.acquired_transitions());
 
         let mut was_leading = true;
         let mut owe_cost_clear = false;
@@ -1624,7 +1741,7 @@ mod tests {
             state.is_leader.load(Ordering::Relaxed),
             "within SELF_FENCE_AFTER → still leader (transient blip)"
         );
-        assert!(state.recovery_complete.load(Ordering::Relaxed));
+        assert!(state.recovery_complete());
         assert!(was_leading);
     }
 
@@ -1661,7 +1778,7 @@ mod tests {
     fn self_fence_sets_owe_cost_clear() {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(2)));
         state.is_leader.store(true, Ordering::Relaxed);
-        state.recovery_complete.store(true, Ordering::Relaxed);
+        state.set_recovery_complete(state.acquired_transitions());
 
         let mut was_leading = true;
         let mut owe_cost_clear = false;
@@ -2017,7 +2134,7 @@ mod tests {
         settle().await;
         assert!(state.is_leader(), "healthy first tick acquires");
         assert_eq!(state.acquired_transitions(), 0, "creator records 0");
-        state.set_recovery_complete();
+        state.set_recovery_complete(state.acquired_transitions());
 
         // A healthy renew that observes the same transition count must
         // NOT rebound — the steady state. (A delete/recreate whose count
@@ -2084,7 +2201,7 @@ mod tests {
         // The 404-recreate cousin: an operator deletes the Lease
         // outright; our next tick re-creates it at transitions 0 — a
         // second rebound (0 differs from the recorded 1).
-        state.set_recovery_complete();
+        state.set_recovery_complete(state.acquired_transitions());
         assert!(mock.clear(), "lease deleted out of band");
         tokio::time::advance(RENEW_INTERVAL).await; // +15s
         settle().await;

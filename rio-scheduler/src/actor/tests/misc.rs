@@ -60,7 +60,7 @@ fn spawn_actor_with_leader(
     let leader = crate::lease::LeaderState::from_parts(
         Arc::new(std::sync::atomic::AtomicU64::new(1)),
         Arc::new(AtomicBool::new(is_leader)),
-        Arc::new(AtomicBool::new(recovery_complete)),
+        recovery_complete,
     );
     let leader_clone = leader.clone();
     let (handle, task) = setup_actor_configured(pool, None, move |_, p| {

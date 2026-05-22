@@ -285,16 +285,17 @@ async fn test_recovery_transitive_failed_dep_persisted() -> TestResult {
 async fn test_recovery_failure_degrades_to_empty_dag() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
 
-    // Inject an observable recovery_complete via from_parts (same
-    // pattern as test_recovery_toctou_on_lease_flap below).
-    let recovery_complete = Arc::new(AtomicBool::new(false));
-    let rc = Arc::clone(&recovery_complete);
+    // Keep a clone of the LeaderState so the completion is observable
+    // from the test (same pattern as test_recovery_toctou_on_lease_flap
+    // below).
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::new(AtomicU64::new(1)),
+        Arc::new(AtomicBool::new(true)),
+        false,
+    );
+    let l = leader.clone();
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
-        p.leader = crate::lease::LeaderState::from_parts(
-            Arc::new(AtomicU64::new(1)),
-            Arc::new(AtomicBool::new(true)),
-            rc,
-        );
+        p.leader = l;
     });
     // Close the pool BEFORE sending LeaderAcquired — all PG queries
     // will fail. This simulates PG going down mid-recovery.
@@ -306,7 +307,7 @@ async fn test_recovery_failure_degrades_to_empty_dag() -> TestResult {
     barrier(&handle).await;
 
     assert!(
-        recovery_complete.load(Ordering::Acquire),
+        leader.recovery_complete(),
         "Err arm must set recovery_complete=true (degrade, don't block dispatch)"
     );
     let info = handle.debug_query_derivation("anything").await?;
@@ -1201,11 +1202,7 @@ async fn test_recovery_same_holder_reclaim_retains_generation() -> TestResult {
     let generation = Arc::new(AtomicU64::new(5));
     let g = Arc::clone(&generation);
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
-        p.leader = crate::lease::LeaderState::from_parts(
-            g,
-            Arc::new(AtomicBool::new(true)),
-            Arc::new(AtomicBool::new(false)),
-        );
+        p.leader = crate::lease::LeaderState::from_parts(g, Arc::new(AtomicBool::new(true)), false);
         p.holder_id = "pod-us".into();
     });
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
@@ -1250,7 +1247,7 @@ async fn test_recovery_other_holder_at_our_generation_bumps() -> TestResult {
     let leader = crate::lease::LeaderState::from_parts(
         Arc::clone(&generation),
         Arc::new(AtomicBool::new(true)),
-        Arc::new(AtomicBool::new(false)),
+        false,
     );
     // Bump target (5 → 6): the recovery waits for a post-claim Leading
     // round, so simulate a healthy lease loop.
@@ -1317,7 +1314,7 @@ async fn test_recovery_assignments_only_floor_at_our_generation_bumps() -> TestR
     let leader = crate::lease::LeaderState::from_parts(
         Arc::clone(&generation),
         Arc::new(AtomicBool::new(true)),
-        Arc::new(AtomicBool::new(false)),
+        false,
     );
     // Bump target (5 → 6): the recovery waits for a post-claim Leading
     // round, so simulate a healthy lease loop.
@@ -1380,11 +1377,7 @@ async fn test_recovery_assignment_and_own_claim_at_our_generation_retains() -> T
     let generation = Arc::new(AtomicU64::new(5));
     let g = Arc::clone(&generation);
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
-        p.leader = crate::lease::LeaderState::from_parts(
-            g,
-            Arc::new(AtomicBool::new(true)),
-            Arc::new(AtomicBool::new(false)),
-        );
+        p.leader = crate::lease::LeaderState::from_parts(g, Arc::new(AtomicBool::new(true)), false);
         p.holder_id = "pod-us".into();
     });
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
@@ -1432,7 +1425,7 @@ async fn test_recovery_unconfirmed_bump_above_live_holder_is_discarded() -> Test
     let leader = crate::lease::LeaderState::from_parts(
         Arc::clone(&generation),
         Arc::new(AtomicBool::new(true)),
-        Arc::new(AtomicBool::new(false)),
+        false,
     );
     let (reached_tx, reached_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
@@ -1498,7 +1491,7 @@ async fn test_recovery_confirmed_bump_seeds_and_completes() -> TestResult {
     let leader = crate::lease::LeaderState::from_parts(
         Arc::clone(&generation),
         Arc::new(AtomicBool::new(true)),
-        Arc::new(AtomicBool::new(false)),
+        false,
     );
     let (reached_tx, reached_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
@@ -1572,7 +1565,7 @@ async fn test_recovery_unconfirmed_gap_retain_below_entry_is_discarded() -> Test
     let leader = crate::lease::LeaderState::from_parts(
         Arc::clone(&generation),
         Arc::new(AtomicBool::new(true)),
-        Arc::new(AtomicBool::new(false)),
+        false,
     );
     let (reached_tx, reached_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
@@ -1642,7 +1635,7 @@ async fn test_recovery_gap_retain_with_confirmation_completes() -> TestResult {
     let leader = crate::lease::LeaderState::from_parts(
         Arc::clone(&generation),
         Arc::new(AtomicBool::new(true)),
-        Arc::new(AtomicBool::new(false)),
+        false,
     );
     let _confirmations = spawn_leading_confirmations(leader.clone());
     let l = leader.clone();
@@ -1701,7 +1694,7 @@ async fn test_recovery_adjacent_floor_retain_completes_without_confirmation() ->
     let leader = crate::lease::LeaderState::from_parts(
         Arc::clone(&generation),
         Arc::new(AtomicBool::new(true)),
-        Arc::new(AtomicBool::new(false)),
+        false,
     );
     let l = leader.clone();
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
@@ -1764,7 +1757,7 @@ async fn test_recovery_claims_lease_derived_generation_on_empty_floor() -> TestR
     let leader = crate::lease::LeaderState::from_parts(
         Arc::clone(&generation),
         Arc::new(AtomicBool::new(true)),
-        Arc::new(AtomicBool::new(false)),
+        false,
     );
     let _confirmations = spawn_leading_confirmations(leader.clone());
     let l = leader.clone();
@@ -2177,10 +2170,11 @@ async fn test_recovery_poisoned_orphan_build_fails(#[case] keep_going: bool) -> 
 /// test).
 ///
 /// Timeline (bump case): actor snapshots gen=2 → runs recover_from_pg
-/// → parks at gate → [test simulates lease flap: clear
-/// recovery_complete + fetch_add gen 2→3] → release → actor re-loads
-/// gen=3, sees 3≠2 → DISCARD. Pre-fix: unconditional `store(true)`
-/// clobbered the lease loop's clear → dispatch_ready fired with gen-2
+/// → parks at gate → [test simulates a lease flap's generation bump:
+/// fetch_add gen 2→3] → release → actor re-loads gen=3, sees 3≠2 →
+/// DISCARD (and never stamps a completion for this attempt's epoch).
+/// Pre-epoch-stamp, an unconditional boolean `store(true)` here could
+/// clobber the lease loop's clear → dispatch_ready fired with a gen-2
 /// DAG and gen-3 stamps.
 #[rstest::rstest]
 #[case::gen_bump_discards(true, false)]
@@ -2192,7 +2186,6 @@ async fn test_recovery_toctou_on_lease_flap(
 ) -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let generation = Arc::new(AtomicU64::new(2));
-    let recovery_complete = Arc::new(AtomicBool::new(false));
     // Entry generation 2 over an empty PG floor: the floor cannot vouch
     // for it, so the no-bump case completes only under a post-claim
     // Leading round -- simulate a healthy lease loop. The bump case
@@ -2200,7 +2193,7 @@ async fn test_recovery_toctou_on_lease_flap(
     let leader = crate::lease::LeaderState::from_parts(
         Arc::clone(&generation),
         Arc::new(AtomicBool::new(true)),
-        Arc::clone(&recovery_complete),
+        false,
     );
     let _confirmations = spawn_leading_confirmations(leader.clone());
     let (reached_tx, reached_rx) = oneshot::channel();
@@ -2219,15 +2212,16 @@ async fn test_recovery_toctou_on_lease_flap(
         .expect("reached_tx not dropped");
 
     if bump_gen {
-        // Simulate lease flap: lose (clear) + reacquire (bump gen).
-        recovery_complete.store(false, Ordering::Relaxed);
+        // Simulate the lease flap's generation signal (the gate keys on
+        // its own entry snapshot; the production-writer flap shapes are
+        // exercised by the saturated-regime and rebound tests below).
         generation.fetch_add(1, Ordering::Release);
     }
     release_tx.send(()).expect("actor still listening");
     barrier(&handle).await;
 
     assert_eq!(
-        recovery_complete.load(Ordering::Acquire),
+        leader.recovery_complete(),
         expect_recovery_complete,
         "bump_gen={bump_gen}: recovery_complete must be {expect_recovery_complete}"
     );
@@ -2260,11 +2254,10 @@ async fn test_discarded_recovery_increments_recovery_total_once() -> TestResult 
 
     let db = TestDb::new(&MIGRATOR).await;
     let generation = Arc::new(AtomicU64::new(2));
-    let recovery_complete = Arc::new(AtomicBool::new(false));
     let leader = crate::lease::LeaderState::from_parts(
         Arc::clone(&generation),
         Arc::new(AtomicBool::new(true)),
-        Arc::clone(&recovery_complete),
+        false,
     );
     let _confirmations = spawn_leading_confirmations(leader.clone());
     let (reached_tx, reached_rx) = oneshot::channel();
@@ -2283,7 +2276,6 @@ async fn test_discarded_recovery_increments_recovery_total_once() -> TestResult 
         .await
         .expect("actor reached gate")
         .expect("reached_tx not dropped");
-    recovery_complete.store(false, Ordering::Relaxed);
     generation.fetch_add(1, Ordering::Release);
     release_tx.send(()).expect("actor still listening");
     barrier(&handle).await;
@@ -2313,7 +2305,7 @@ async fn test_discarded_recovery_increments_recovery_total_once() -> TestResult 
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
     barrier(&handle).await;
     assert!(
-        recovery_complete.load(Ordering::Acquire),
+        leader.recovery_complete(),
         "second (clean) recovery should complete"
     );
     let by_outcome = counter_map_by(&snap, "rio_scheduler_recovery_total", Some("outcome"));
@@ -2365,7 +2357,7 @@ async fn test_recovery_toctou_saturated_generation_flaps(
     let leader = crate::lease::LeaderState::from_parts(
         Arc::new(AtomicU64::new(13)),
         Arc::new(AtomicBool::new(true)),
-        Arc::new(AtomicBool::new(false)),
+        false,
     );
     // Production acquire edge for the term under test: the generation
     // fetch_max is a no-op against 13; the transition count is 5.
@@ -2434,7 +2426,7 @@ async fn test_recovery_toctou_rebound_mid_recovery_discards_then_rerun_completes
     let leader = crate::lease::LeaderState::from_parts(
         Arc::new(AtomicU64::new(13)),
         Arc::new(AtomicBool::new(true)),
-        Arc::new(AtomicBool::new(false)),
+        false,
     );
     leader.on_acquire(5);
     // The first run claims (13, holder) before parking at the gate, so
@@ -2514,9 +2506,11 @@ async fn test_false_alarm_lost_then_acquired_in_order_ends_recovered() -> TestRe
     let leader = crate::lease::LeaderState::from_parts(
         Arc::new(AtomicU64::new(2)),
         Arc::new(AtomicBool::new(true)),
-        Arc::new(AtomicBool::new(true)),
+        false,
     );
     leader.on_acquire(1);
+    // Steady state under the current epoch: recovery already complete.
+    leader.set_recovery_complete(leader.acquired_transitions());
     // Same posture as the rebound completion test: keep the re-acquire's
     // confirmation leg satisfiable if the bump-confirm trigger ever
     // widens; the same-epoch path itself does not need it.
@@ -2583,11 +2577,7 @@ async fn test_reconcile_skipped_when_not_leader() -> TestResult {
     let is_leader = Arc::new(AtomicBool::new(true));
     let il = Arc::clone(&is_leader);
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
-        p.leader = crate::lease::LeaderState::from_parts(
-            Arc::new(AtomicU64::new(1)),
-            il,
-            Arc::new(AtomicBool::new(true)),
-        );
+        p.leader = crate::lease::LeaderState::from_parts(Arc::new(AtomicU64::new(1)), il, true);
     });
 
     // Seed an Assigned drv on a worker that won't be in self.executors

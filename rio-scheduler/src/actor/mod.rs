@@ -1362,9 +1362,6 @@ impl DagActor {
     /// reader. The reader type has no store/fetch_add methods, so
     /// handle consumers can't accidentally increment.
     pub(crate) fn generation_reader(&self) -> GenerationReader {
-        GenerationReader::new(
-            self.leader.generation_arc(),
-            self.leader.recovery_complete_arc(),
-        )
+        GenerationReader::new(self.leader.generation_arc(), self.leader.clone())
     }
 }
