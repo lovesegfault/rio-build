@@ -427,8 +427,12 @@ pub struct DagActor {
     /// (dispatch gate). Same Arcs as the lease task and `ActorHandle` —
     /// the lease task writes `is_leader`/`generation`/
     /// `acquired_transitions` via [`LeaderState::on_acquire`]/
-    /// [`LeaderState::on_rebound`]/[`LeaderState::on_lose`]; the actor
-    /// writes the epoch-keyed completion stamp via
+    /// [`LeaderState::on_rebound`]/[`LeaderState::on_lose`] (the latter
+    /// two also clear the completion stamp); the actor raises
+    /// `generation` during recovery via
+    /// [`LeaderState::seed_generation_from`] (the PG-floor seed — a
+    /// `fetch_max` placed after the TOCTOU gate) and writes the
+    /// epoch-keyed completion stamp via
     /// [`LeaderState::set_recovery_complete`] /
     /// [`LeaderState::invalidate_recovery_completion`]; everything else is
     /// `SeqCst`/`Acquire` reads. See [`LeaderState`] for the
