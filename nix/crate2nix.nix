@@ -43,19 +43,28 @@
   # flake.nix's sysCrateEnv — single source of truth so devShell
   # and crate2nix see the same linkage.
   sysCrateEnv,
-  # Extra rustc flags injected into EVERY crate in the tree. Used by
-  # the coverage variant (crateBuildCov in flake.nix) to build a
-  # parallel instrumented tree with `-Cinstrument-coverage`.
+  # Extra rustc flags injected into EVERY crate in the tree, deps
+  # included. A non-empty value forks the whole dep graph into a
+  # second derivation set, so nothing uses this today — instrumented
+  # trees (coverage, fuzz) restrict their flags to local crates to
+  # keep the dep derivations shared with the plain tree. Kept as the
+  # escape hatch for a flag that genuinely must reach every crate.
   # Empty = no wrap.
   globalExtraRustcOpts ? [ ],
   # Extra rustc flags applied only to crates listed in `memberSrcs`
-  # (= local in-tree crates). The fuzz tree uses this for sancov+asan
-  # instrumentation: cargo-fuzz instruments EVERYTHING via RUSTFLAGS,
-  # which buildRustCrate can't replicate (it has no host/target split,
-  # so build-deps and proc-macros would also be instrumented and then
-  # fail to link/load without the asan runtime). Restricting to local
-  # crates is the unit-fuzz compromise — libFuzzer's coverage signal
-  # comes from the code under test (rio-*), not from serde/tokio.
+  # (= local in-tree crates). Dep derivations stay byte-identical to
+  # the uninstrumented tree's, so the store shares them. Two users:
+  #
+  # - fuzz: sancov+asan. cargo-fuzz instruments EVERYTHING via
+  #   RUSTFLAGS, which buildRustCrate can't replicate (no host/target
+  #   split, so build-deps and proc-macros would also be instrumented
+  #   and then fail to link/load without the asan runtime).
+  #   Restricting to local crates is the unit-fuzz compromise —
+  #   libFuzzer's coverage signal comes from the code under test
+  #   (rio-*), not from serde/tokio.
+  # - coverage: -Cinstrument-coverage. The lcov pipeline extracts
+  #   rio-* paths only, so dep coverage data would be discarded at
+  #   report time anyway.
   localExtraRustcOpts ? [ ],
 }:
 let
@@ -78,10 +87,16 @@ let
   # RUNPATH is unaffected but stdenv's fixupPhase already shrinks it
   # to glibc/lib:gcc-lib/lib (rust-overlay's rustlib doesn't appear).
   #
-  # When `globalExtraRustcOpts` is non-empty (coverage tree), also
-  # set LLVM_PROFILE_FILE=/dev/null (build scripts and proc-macros are
-  # ALSO instrumented and would otherwise try to write profraws to the
-  # RO sandbox CWD).
+  # When a crate is compiled with -Cinstrument-coverage (via either
+  # opts list), also set LLVM_PROFILE_FILE=/dev/null: its build script
+  # and any proc-macro it exports are ALSO instrumented and would
+  # otherwise try to write profraws to the RO sandbox CWD when they
+  # execute during a build. Gated on the specific flag — not on
+  # "localExtraRustcOpts is non-empty" — so (a) the fuzz tree's
+  # sancov-only members don't pick up a pointless env var, and (b) a
+  # local-only coverage tree leaves its dep derivations byte-identical
+  # to the uninstrumented tree's (one extra env var on a dep would
+  # change its hash and forfeit the store sharing).
   #
   # The wrap returns a plain `crate_: drv` function — build-from-json.nix's
   # `.override { defaultCrateOverrides }` branch must be skipped for
@@ -159,11 +174,16 @@ let
           ++ lib.optionals isLocal (localExtraRustcOpts ++ [ localRemap ])
           ++ (crate_'.extraRustcOpts or [ ]);
       }
-      // lib.optionalAttrs (globalExtraRustcOpts != [ ]) {
-        # Discard build-time profraws. Test runners override at
-        # runtime to collect real data.
-        LLVM_PROFILE_FILE = "/dev/null";
-      }
+      //
+        lib.optionalAttrs
+          (lib.elem "-Cinstrument-coverage" (
+            globalExtraRustcOpts ++ lib.optionals isLocal localExtraRustcOpts
+          ))
+          {
+            # Discard build-time profraws. Test runners override at
+            # runtime to collect real data.
+            LLVM_PROFILE_FILE = "/dev/null";
+          }
     );
 
   # ──────────────────────────────────────────────────────────────────

@@ -7,7 +7,7 @@ paths:
 
 VM coverage architecture (`nix/coverage.nix`):
 
-1. **Instrumented build** (`rio-workspace-cov`): `RUSTFLAGS="-C instrument-coverage"` + distinct pname → separate deps cache, builds in parallel with normal workspace.
+1. **Instrumented build** (`rio-workspace-cov`): `-Cinstrument-coverage` applied to **workspace members only** (`localExtraRustcOpts` in `nix/crate2nix.nix`) — the third-party dep derivations are byte-identical to the normal tree's and shared in the store. Only the member crates exist in two variants (normal + instrumented).
 2. **Coverage-mode VM tests** (`vmTestsCov`): same tests with `coverage=true` → `LLVM_PROFILE_FILE=/var/lib/rio/cov/rio-%h-%p-%m.profraw` set in all rio-* service envs (`%h`=hostname for multi-worker disambiguation, `%p`=PID for restarts, `%m`=binary signature for safe merging).
 3. **Graceful shutdown** (`rio-common::signal::shutdown_signal`): SIGTERM or SIGINT → CancellationToken → main() returns normally → atexit handlers fire → LLVM profraw flush. All binaries: store, scheduler, gateway, worker, controller.
 4. **Collection** (`common.nix collectCoverage`): at end of each testScript, `systemctl stop rio-*` → graceful drain → tar `/var/lib/rio/cov` → `copy_from_vm` to `$out/coverage/<node>/profraw.tar.gz`. phase3a also deletes the k3s STS so the worker pod's hostPath-mounted profraws flush.

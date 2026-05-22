@@ -379,16 +379,32 @@
                 );
               crateBuild = mkCrateBuild { };
 
-              # Coverage-instrumented tree: re-import with
-              # globalExtraRustcOpts=["-Cinstrument-coverage"]. Doubles the
-              # derivation count (one normal + one instrumented per crate),
-              # but each half caches independently — touching a workspace
-              # crate only rebuilds that crate's two variants + dependents.
-              # `stripBins = false` keeps __llvm_covfun/__llvm_covmap intact.
+              # Coverage-instrumented tree: re-import with the
+              # instrumentation flags applied to WORKSPACE MEMBERS ONLY
+              # (localExtraRustcOpts). The third-party dep derivations end
+              # up bit-identical to crateBuild's — same rustc argv, same
+              # inputs — so the two trees share every dep store path and
+              # only the members exist twice (one normal + one
+              # instrumented variant each).
+              #
+              # Instrumenting the deps too (globalExtraRustcOpts) would
+              # build a second, fully disjoint copy of the entire dep
+              # graph whose coverage data the lcov pipeline then discards
+              # anyway (the report step extracts rio-* paths only — see
+              # the localRemap comment in nix/crate2nix.nix). Same
+              # local-only compromise the fuzz tree makes for sancov.
+              #
+              # `stripBins = false` keeps __llvm_covfun/__llvm_covmap
+              # intact in the scrubbed member binaries.
+              #
+              # The flag set is deliberately minimal — the instrumented
+              # member should be the normal member plus instrumentation,
+              # nothing else. line-tables-only is the one extra: the
+              # base build carries no debuginfo, and coverage-mode VM
+              # test failures need legible backtraces.
               crateBuildCov = mkCrateBuild {
-                globalExtraRustcOpts = [
+                localExtraRustcOpts = [
                   "-Cinstrument-coverage"
-                  "-Ccodegen-units=16"
                   "-Cdebuginfo=line-tables-only"
                 ];
                 stripBins = false;
