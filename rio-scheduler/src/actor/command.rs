@@ -416,14 +416,26 @@ pub enum ActorCommand {
     /// recovery runs in the actor task. handle_leader_acquired
     /// sets recovery_complete=true when done (or on failure —
     /// degrade to empty DAG, don't block; only the success arm also
-    /// marks the DAG authoritative for destructive consumers).
+    /// marks the DAG authoritative for destructive consumers); if
+    /// the TOCTOU/bump-confirmation gate discards the recovery
+    /// instead, neither flag is set and the next LeaderAcquired
+    /// retries.
     ///
-    /// In non-K8s mode (always_leader) this command is never sent:
-    /// its only production sender is the lease hook in main.rs, and
-    /// the lease loop is only spawned in K8s mode. recovery_complete
-    /// (and the actor's dag_authoritative) start true there — no
-    /// failover, nothing to recover; the DAG starts empty and is
-    /// populated by live MergeDag traffic only.
+    /// In non-K8s mode (always_leader): never sent in production —
+    /// the only production sender is the lease hooks' `on_acquire`
+    /// (scheduler main.rs), and without a configured `lease_name`
+    /// (env `RIO_LEASE_NAME`) no lease loop runs. So PG recovery
+    /// and the write-ahead generation claim never run there;
+    /// `recovery_complete` (and the actor's `dag_authoritative`)
+    /// start true, dispatch is never gated, and the DAG starts
+    /// empty and is populated by live MergeDag traffic only.
+    /// Adding a spawn-time send for single-scheduler startup
+    /// recovery requires first teaching the bump-confirmation gate
+    /// in `handle_leader_acquired` (`sched.recovery.bump-confirm`)
+    /// to confirm without a live lease loop: with `always_leader`'s
+    /// frozen renew rounds, a bump-demanding PG floor waits out
+    /// `BUMP_CONFIRMATION_CAP` and the recovery is discarded, with
+    /// no later acquire edge to retry it.
     LeaderAcquired,
 
     /// Lease lost (or self-fenced): clear in-memory builds/dag/events
