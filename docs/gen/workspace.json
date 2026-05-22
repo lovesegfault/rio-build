@@ -1,108 +1,166 @@
 {
+  "members": [
+    {
+      "name": "rio-auth",
+      "description": "Tenant JWT + assignment HMAC token sign/verify and the gRPC interceptor that wires them"
+    },
+    {
+      "name": "rio-cli",
+      "description": "Admin CLI for rio-build — talks to the scheduler's AdminService"
+    },
+    {
+      "name": "rio-common",
+      "description": "Shared configuration, observability, and error types for rio-build"
+    },
+    {
+      "name": "rio-controller",
+      "description": "Kubernetes operator for rio-build: Pool, ComponentScaler CRDs"
+    },
+    {
+      "name": "rio-gateway",
+      "description": "SSH gateway and Nix protocol frontend for rio-build"
+    },
+    {
+      "name": "rio-lease",
+      "description": "Kubernetes Lease-based leader election for rio-build components"
+    },
+    {
+      "name": "rio-migrations",
+      "description": "Database migration SQL, embedded migrator, and per-migration commentary"
+    },
+    {
+      "name": "rio-nix",
+      "description": "Nix protocol types and wire format"
+    },
+    {
+      "name": "rio-proto",
+      "description": "Protobuf/gRPC service definitions for rio-build"
+    },
+    {
+      "name": "rio-scheduler",
+      "description": "DAG-aware build scheduler for rio-build"
+    },
+    {
+      "name": "rio-store",
+      "description": "NAR content-addressable store for rio-build"
+    },
+    {
+      "name": "rio-test-support",
+      "description": "Test harness: ephemeral PostgreSQL, wire protocol helpers, mock gRPC services"
+    },
+    {
+      "name": "rio-builder",
+      "description": "Build executor with FUSE store for rio-build"
+    },
+    {
+      "name": "rio-crds",
+      "description": "CustomResourceDefinition types for rio-build (Pool, ComponentScaler)"
+    },
+    {
+      "name": "xtask",
+      "description": "Dev/ops tooling: codegen, local cluster lifecycle, AMI build, helm/k8s helpers"
+    }
+  ],
   "deps": {
     "rio-auth": {
-      "dev": [],
-      "optional": [],
       "prod": [
         "rio-common"
-      ]
-    },
-    "rio-builder": {
-      "dev": [
-        "rio-test-support"
       ],
       "optional": [],
+      "dev": []
+    },
+    "rio-builder": {
       "prod": [
         "rio-common",
         "rio-nix",
         "rio-proto"
+      ],
+      "optional": [],
+      "dev": [
+        "rio-test-support"
       ]
     },
     "rio-cli": {
-      "dev": [
-        "rio-test-support"
-      ],
-      "optional": [],
       "prod": [
         "rio-auth",
         "rio-common",
         "rio-crds",
         "rio-proto"
+      ],
+      "optional": [],
+      "dev": [
+        "rio-test-support"
       ]
     },
     "rio-common": {
-      "dev": [],
+      "prod": [],
       "optional": [],
-      "prod": []
+      "dev": []
     },
     "rio-controller": {
-      "dev": [
-        "rio-migrations",
-        "rio-test-support"
-      ],
-      "optional": [],
       "prod": [
         "rio-auth",
         "rio-common",
         "rio-crds",
         "rio-lease",
         "rio-proto"
+      ],
+      "optional": [],
+      "dev": [
+        "rio-migrations",
+        "rio-test-support"
       ]
     },
     "rio-crds": {
-      "dev": [],
+      "prod": [],
       "optional": [],
-      "prod": []
+      "dev": []
     },
     "rio-gateway": {
-      "dev": [
-        "rio-migrations",
-        "rio-store",
-        "rio-test-support"
-      ],
-      "optional": [],
       "prod": [
         "rio-auth",
         "rio-common",
         "rio-nix",
         "rio-proto"
+      ],
+      "optional": [],
+      "dev": [
+        "rio-migrations",
+        "rio-store",
+        "rio-test-support"
       ]
     },
     "rio-lease": {
-      "dev": [
-        "rio-test-support"
-      ],
-      "optional": [],
       "prod": [
         "rio-common",
         "rio-crds"
+      ],
+      "optional": [],
+      "dev": [
+        "rio-test-support"
       ]
     },
     "rio-migrations": {
+      "prod": [],
+      "optional": [],
       "dev": [
         "rio-test-support"
-      ],
-      "optional": [],
-      "prod": []
+      ]
     },
     "rio-nix": {
-      "dev": [],
+      "prod": [],
       "optional": [],
-      "prod": []
+      "dev": []
     },
     "rio-proto": {
-      "dev": [],
-      "optional": [],
       "prod": [
         "rio-common",
         "rio-nix"
-      ]
-    },
-    "rio-scheduler": {
-      "dev": [
-        "rio-test-support"
       ],
       "optional": [],
+      "dev": []
+    },
+    "rio-scheduler": {
       "prod": [
         "rio-auth",
         "rio-common",
@@ -112,101 +170,43 @@
         "rio-nix",
         "rio-proto",
         "rio-store"
+      ],
+      "optional": [],
+      "dev": [
+        "rio-test-support"
       ]
     },
     "rio-store": {
-      "dev": [],
-      "optional": [
-        "rio-test-support"
-      ],
       "prod": [
         "rio-auth",
         "rio-common",
         "rio-migrations",
         "rio-nix",
         "rio-proto"
-      ]
+      ],
+      "optional": [
+        "rio-test-support"
+      ],
+      "dev": []
     },
     "rio-test-support": {
-      "dev": [],
-      "optional": [],
       "prod": [
         "rio-nix",
         "rio-proto"
-      ]
+      ],
+      "optional": [],
+      "dev": []
     },
     "xtask": {
-      "dev": [],
-      "optional": [],
       "prod": [
         "rio-common",
         "rio-crds",
         "rio-proto",
         "rio-scheduler",
         "rio-test-support"
-      ]
+      ],
+      "optional": [],
+      "dev": []
     }
-  },
-  "members": [
-    {
-      "description": "Tenant JWT + assignment HMAC token sign/verify and the gRPC interceptor that wires them",
-      "name": "rio-auth"
-    },
-    {
-      "description": "Admin CLI for rio-build — talks to the scheduler's AdminService",
-      "name": "rio-cli"
-    },
-    {
-      "description": "Shared configuration, observability, and error types for rio-build",
-      "name": "rio-common"
-    },
-    {
-      "description": "Kubernetes operator for rio-build: Pool, ComponentScaler CRDs",
-      "name": "rio-controller"
-    },
-    {
-      "description": "SSH gateway and Nix protocol frontend for rio-build",
-      "name": "rio-gateway"
-    },
-    {
-      "description": "Kubernetes Lease-based leader election for rio-build components",
-      "name": "rio-lease"
-    },
-    {
-      "description": "Database migration SQL, embedded migrator, and per-migration commentary",
-      "name": "rio-migrations"
-    },
-    {
-      "description": "Nix protocol types and wire format",
-      "name": "rio-nix"
-    },
-    {
-      "description": "Protobuf/gRPC service definitions for rio-build",
-      "name": "rio-proto"
-    },
-    {
-      "description": "DAG-aware build scheduler for rio-build",
-      "name": "rio-scheduler"
-    },
-    {
-      "description": "NAR content-addressable store for rio-build",
-      "name": "rio-store"
-    },
-    {
-      "description": "Test harness: ephemeral PostgreSQL, wire protocol helpers, mock gRPC services",
-      "name": "rio-test-support"
-    },
-    {
-      "description": "Build executor with FUSE store for rio-build",
-      "name": "rio-builder"
-    },
-    {
-      "description": "CustomResourceDefinition types for rio-build (Pool, ComponentScaler)",
-      "name": "rio-crds"
-    },
-    {
-      "description": "Dev/ops tooling: codegen, local cluster lifecycle, AMI build, helm/k8s helpers",
-      "name": "xtask"
-    }
-  ]
+  }
 }

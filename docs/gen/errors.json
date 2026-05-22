@@ -1,1472 +1,1472 @@
 {
-  "enums": [
-    {
-      "crate": "rio-auth",
-      "doc": "",
-      "name": "HmacError"
-    },
-    {
-      "crate": "rio-auth",
-      "doc": "",
-      "name": "JwtError"
-    },
-    {
-      "crate": "rio-builder",
-      "doc": "Error type for executor operations. No `#[from] anyhow::Error` — every variant has a typed source. A catch-all `#[from] anyhow::Error` would mean any `?` on an anyhow::Result anywhere in execute_build silently becomes the wrong variant. Typed sources make the compiler catch misattribution at the `?` site.",
-      "name": "ExecutorError"
-    },
-    {
-      "crate": "rio-builder",
-      "doc": "Errors from overlay setup and teardown. Distinct from `anyhow::Error` so `ExecutorError::Overlay(#[from])` only catches overlay failures — a bare `?` on an unrelated `anyhow::Result` elsewhere in `execute_build` no longer silently becomes an \"overlay setup failed\" message.",
-      "name": "OverlayError"
-    },
-    {
-      "crate": "rio-builder",
-      "doc": "Errors from upload operations. NAR serialization happens inside the retry loop (each retry is a fresh disk read), so NAR errors surface as `UploadExhausted` wrapping a `tonic::Status::internal(\"NAR serialization failed...\")`.",
-      "name": "UploadError"
-    },
-    {
-      "crate": "rio-common",
-      "doc": "Construction-time rejection. The `Display` impl's message is what callers map to `Status::invalid_argument`.",
-      "name": "NameError"
-    },
-    {
-      "crate": "rio-controller",
-      "doc": "Top-level reconcile error. kube's `Controller::run` takes an `error_policy` fn that receives this and decides requeue timing. `Box` on the finalizer variant: `finalizer::Error<Self>` is recursive (it wraps our Error for ApplyFailed/CleanupFailed). Unboxed it's an infinite-size type. Box breaks the cycle with a pointer indirection.",
-      "name": "Error"
-    },
-    {
-      "crate": "rio-gateway",
-      "doc": "Typed errors for the handler layer. Converts to `anyhow::Error` at the boundary via `thiserror`'s `std::error::Error` impl + anyhow's blanket `From<E: Error>`. The outer handler signature remains `anyhow::Result<()>` — use `.into()` or `?` to convert.",
-      "name": "GatewayError"
-    },
-    {
-      "crate": "rio-gateway",
-      "doc": "Error from `process_build_events`. Distinguishes transport errors and stream EOF-without-terminal (both reconnect-worthy failover signatures — see the per-variant docs) from `Wire` (client-side disconnect — not retried).",
-      "name": "StreamProcessError"
-    },
-    {
-      "crate": "rio-nix",
-      "doc": "Errors from parsing or hashing ATerm derivations.",
-      "name": "DerivationError"
-    },
-    {
-      "crate": "rio-nix",
-      "doc": "Errors from parsing a `DerivedPath` string.",
-      "name": "DerivedPathError"
-    },
-    {
-      "crate": "rio-nix",
-      "doc": "Errors specific to the handshake.",
-      "name": "HandshakeError"
-    },
-    {
-      "crate": "rio-nix",
-      "doc": "",
-      "name": "HashError"
-    },
-    {
-      "crate": "rio-nix",
-      "doc": "Errors from NAR operations.",
-      "name": "NarError"
-    },
-    {
-      "crate": "rio-nix",
-      "doc": "Errors from narinfo parsing.",
-      "name": "NarInfoError"
-    },
-    {
-      "crate": "rio-nix",
-      "doc": "",
-      "name": "StorePathError"
-    },
-    {
-      "crate": "rio-nix",
-      "doc": "",
-      "name": "WireError"
-    },
-    {
-      "crate": "rio-proto",
-      "doc": "Error from [`collect_nar_stream`] / [`collect_nar_stream_to_writer`].",
-      "name": "NarCollectError"
-    },
-    {
-      "crate": "rio-proto",
-      "doc": "",
-      "name": "PathInfoValidationError"
-    },
-    {
-      "crate": "rio-scheduler",
-      "doc": "Errors from the actor.",
-      "name": "ActorError"
-    },
-    {
-      "crate": "rio-scheduler",
-      "doc": "Errors from DAG operations.",
-      "name": "DagError"
-    },
-    {
-      "crate": "rio-scheduler",
-      "doc": "Errors during CA input resolution.",
-      "name": "ResolveError"
-    },
-    {
-      "crate": "rio-scheduler",
-      "doc": "Errors from state machine transitions. Lives in mod.rs (not derivation.rs or build.rs) because variants reference both `DerivationStatus` and `BuildState` — putting it in either submodule would create a dependency on the other.",
-      "name": "TransitionError"
-    },
-    {
-      "crate": "rio-store",
-      "doc": "Domain error from [`AdmissionGate::acquire_bounded`]. Kept tonic-free so [`crate::substitute::Substituter`] can hold the gate without pulling gRPC types into its error enum; the gRPC layer maps via `From<AdmissionError> for Status`.",
-      "name": "AdmissionError"
-    },
-    {
-      "crate": "rio-store",
-      "doc": "Error from `ChunkCache::get_verified`.",
-      "name": "ChunkError"
-    },
-    {
-      "crate": "rio-store",
-      "doc": "",
-      "name": "ManifestError"
-    },
-    {
-      "crate": "rio-store",
-      "doc": "Typed error for the metadata/DB layer. Replaces `anyhow::Result` so callers can discriminate retriable failures (connection, serialization) from permanent ones (corruption) and map to precise gRPC status codes.",
-      "name": "MetadataError"
-    },
-    {
-      "crate": "rio-store",
-      "doc": "How [`persist_nar`] failed. The caller maps this to its own error domain (`tonic::Status` for gRPC, `SubstituteError` for substitution) and decides whether to [`abort_placeholder`]: the chunked path already rolled back internally.",
-      "name": "PersistError"
-    },
-    {
-      "crate": "rio-store",
-      "doc": "",
-      "name": "SignerError"
-    },
-    {
-      "crate": "rio-store",
-      "doc": "Errors surfaced by the substitution path. Callers map these to gRPC status; `NotFound` is the normal miss case (no upstream has the path, or the tenant has no upstreams configured). `Clone` so moka's `try_get_with` can hand the same error to every coalesced waiter (it stores `Arc<E>` internally; we unwrap to owned).",
-      "name": "SubstituteError"
-    }
-  ],
   "variants": [
     {
-      "crate": "rio-auth",
-      "doc": "",
       "enum": "HmacError",
+      "name": "Base64",
+      "crate": "rio-auth",
       "msg": "base64 decode failed: {0}",
-      "name": "Base64"
+      "doc": ""
     },
     {
-      "crate": "rio-auth",
-      "doc": "",
       "enum": "HmacError",
+      "name": "Clock",
+      "crate": "rio-auth",
       "msg": "(transparent — delegates to inner error)",
-      "name": "Clock"
+      "doc": ""
     },
     {
-      "crate": "rio-auth",
-      "doc": "",
       "enum": "HmacError",
+      "name": "EmptyKey",
+      "crate": "rio-auth",
       "msg": "key file is empty",
-      "name": "EmptyKey"
+      "doc": ""
     },
     {
-      "crate": "rio-auth",
-      "doc": "",
       "enum": "HmacError",
+      "name": "Expired",
+      "crate": "rio-auth",
       "msg": "token expired (expiry={expiry_unix}, now={now_unix})",
-      "name": "Expired"
+      "doc": ""
     },
     {
-      "crate": "rio-auth",
-      "doc": "",
       "enum": "HmacError",
+      "name": "Format",
+      "crate": "rio-auth",
       "msg": "token format invalid: expected 'claims.hmac', got {0} '.'-separated parts",
-      "name": "Format"
+      "doc": ""
     },
     {
-      "crate": "rio-auth",
-      "doc": "",
       "enum": "HmacError",
+      "name": "InvalidSignature",
+      "crate": "rio-auth",
       "msg": "HMAC verification failed (tampered or wrong key)",
-      "name": "InvalidSignature"
+      "doc": ""
     },
     {
-      "crate": "rio-auth",
-      "doc": "",
       "enum": "HmacError",
+      "name": "Io",
+      "crate": "rio-auth",
       "msg": "key file I/O ({path}): {source}",
-      "name": "Io"
+      "doc": ""
     },
     {
-      "crate": "rio-auth",
-      "doc": "",
       "enum": "HmacError",
+      "name": "Json",
+      "crate": "rio-auth",
       "msg": "JSON decode failed: {0}",
-      "name": "Json"
+      "doc": ""
     },
     {
-      "crate": "rio-auth",
-      "doc": "Covers signature mismatch, malformed token, expired `exp`, wrong algorithm. `jsonwebtoken` collapses these into one error type with a `.kind()` discriminator — the Display impl is descriptive enough for logs. A caller that needs to distinguish \"expired\" from \"bad signature\" (e.g., to return a different gRPC status detail) can downcast via `.kind()`.",
       "enum": "JwtError",
+      "name": "Jwt",
+      "crate": "rio-auth",
       "msg": "JWT verify/encode failed: {0}",
-      "name": "Jwt"
+      "doc": "Covers signature mismatch, malformed token, expired `exp`, wrong algorithm. `jsonwebtoken` collapses these into one error type with a `.kind()` discriminator — the Display impl is descriptive enough for logs. A caller that needs to distinguish \"expired\" from \"bad signature\" (e.g., to return a different gRPC status detail) can downcast via `.kind()`."
     },
     {
-      "crate": "rio-auth",
-      "doc": "Signing key → PKCS#8 DER encoding. Only reachable from [`sign`] (verify uses raw pubkey bytes). Never fails for a valid ed25519 key — it's a fixed-format serialization — so this variant firing means the key itself is corrupt. Kept as a variant rather than `.expect()` because key material comes from outside (K8s Secret) and a corrupt mount should error cleanly, not panic the gateway.",
       "enum": "JwtError",
+      "name": "KeyEncoding",
+      "crate": "rio-auth",
       "msg": "ed25519 signing key → PKCS#8 DER encoding failed (corrupt key?): {0}",
-      "name": "KeyEncoding"
+      "doc": "Signing key → PKCS#8 DER encoding. Only reachable from [`sign`] (verify uses raw pubkey bytes). Never fails for a valid ed25519 key — it's a fixed-format serialization — so this variant firing means the key itself is corrupt. Kept as a variant rather than `.expect()` because key material comes from outside (K8s Secret) and a corrupt mount should error cleanly, not panic the gateway."
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "ExecutorError",
+      "name": "BuildFailed",
+      "crate": "rio-builder",
       "msg": "build failed: {0}",
-      "name": "BuildFailed"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "Cancel flag observed before the per-build cgroup exists. I-166: distinct from the post-cgroup path (cgroup.kill → daemon EOF → `Wire(Io(UnexpectedEof))`) so `is_daemon_transient` doesn't retry it. `spawn_build_task` maps any `Err` with `cancelled=true` to `BuildResultStatus::Cancelled` regardless of variant; this variant just makes the pre-cgroup abort explicit in logs.",
       "enum": "ExecutorError",
+      "name": "Cancelled",
+      "crate": "rio-builder",
       "msg": "build cancelled before cgroup creation",
-      "name": "Cancelled"
+      "doc": "Cancel flag observed before the per-build cgroup exists. I-166: distinct from the post-cgroup path (cgroup.kill → daemon EOF → `Wire(Io(UnexpectedEof))`) so `is_daemon_transient` doesn't retry it. `spawn_build_task` maps any `Err` with `cancelled=true` to `BuildResultStatus::Cancelled` regardless of variant; this variant just makes the pre-cgroup abort explicit in logs."
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "ExecutorError",
+      "name": "Cgroup",
+      "crate": "rio-builder",
       "msg": "cgroup resource tracking failed: {0}",
-      "name": "Cgroup"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "Pod-level cgroup `memory.events` `oom_kill` incremented during the build. The kernel killed a build process (cc1, ld, …) for hitting `memory.max`; make typically respawns it → OOM-loop that never converges (I-196). Distinct from `BuildFailed` because the derivation isn't broken — this builder is undersized. Maps to `InfrastructureFailure` so the scheduler bumps the drv's `resource_floor` instead of marking it permanently failed.",
       "enum": "ExecutorError",
+      "name": "CgroupOom",
+      "crate": "rio-builder",
       "msg": "cgroup OOM during build; bumping resource floor",
-      "name": "CgroupOom"
+      "doc": "Pod-level cgroup `memory.events` `oom_kill` incremented during the build. The kernel killed a build process (cc1, ld, …) for hitting `memory.max`; make typically respawns it → OOM-loop that never converges (I-196). Distinct from `BuildFailed` because the derivation isn't broken — this builder is undersized. Maps to `InfrastructureFailure` so the scheduler bumps the drv's `resource_floor` instead of marking it permanently failed."
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "ExecutorError",
+      "name": "DaemonSetup",
+      "crate": "rio-builder",
       "msg": "daemon setup failed: {0}",
-      "name": "DaemonSetup"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "ExecutorError",
+      "name": "DaemonSpawn",
+      "crate": "rio-builder",
       "msg": "daemon spawn failed: {0}",
-      "name": "DaemonSpawn"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "ExecutorError",
+      "name": "Grpc",
+      "crate": "rio-builder",
       "msg": "gRPC error: {0}",
-      "name": "Grpc"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "ExecutorError",
+      "name": "Handshake",
+      "crate": "rio-builder",
       "msg": "daemon handshake failed: {0}",
-      "name": "Handshake"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "The assignment's `.drv` content is malformed (UTF-8, ATerm parse, BasicDerivation conversion). Deterministic per-derivation: every pod sees the same bytes, so retry-on-another-pod is pointless. Maps to `InputRejected` instead of `InfrastructureFailure`.",
       "enum": "ExecutorError",
+      "name": "InvalidDerivation",
+      "crate": "rio-builder",
       "msg": "invalid derivation: {0}",
-      "name": "InvalidDerivation"
+      "doc": "The assignment's `.drv` content is malformed (UTF-8, ATerm parse, BasicDerivation conversion). Deterministic per-derivation: every pod sees the same bytes, so retry-on-another-pod is pointless. Maps to `InputRejected` instead of `InfrastructureFailure`."
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "ExecutorError",
+      "name": "MetadataFetch",
+      "crate": "rio-builder",
       "msg": "input metadata fetch failed for {path}: {source}",
-      "name": "MetadataFetch"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "ExecutorError",
+      "name": "NixConf",
+      "crate": "rio-builder",
       "msg": "failed to write nix.conf: {0}",
-      "name": "NixConf"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "ExecutorError",
+      "name": "Overlay",
+      "crate": "rio-builder",
       "msg": "overlay setup failed: {0}",
-      "name": "Overlay"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "ExecutorError",
+      "name": "OverlayTaskPanic",
+      "crate": "rio-builder",
       "msg": "overlay setup task panicked: {0}",
-      "name": "OverlayTaskPanic"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "ExecutorError",
+      "name": "SynthDb",
+      "crate": "rio-builder",
       "msg": "synthetic DB generation failed: {0}",
-      "name": "SynthDb"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "ExecutorError",
+      "name": "Upload",
+      "crate": "rio-builder",
       "msg": "upload failed: {0}",
-      "name": "Upload"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "ExecutorError",
+      "name": "Wire",
+      "crate": "rio-builder",
       "msg": "wire protocol error: {0}",
-      "name": "Wire"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "ExecutorError",
+      "name": "WrongKind",
+      "crate": "rio-builder",
       "msg": "wrong executor kind: derivation is_fod={is_fod} but this executor is {executor_kind:?}",
-      "name": "WrongKind"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "OverlayError",
+      "name": "DirCreate",
+      "crate": "rio-builder",
       "msg": "failed to create directory {path}: {source}",
-      "name": "DirCreate"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "OverlayError",
+      "name": "InvalidBuildId",
+      "crate": "rio-builder",
       "msg": "invalid build_id {0:?}: must be non-empty and contain no '/' or NUL",
-      "name": "InvalidBuildId"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "OverlayError",
+      "name": "Mount",
+      "crate": "rio-builder",
       "msg": "mount overlay failed: {source} (mount_data: {mount_data})",
-      "name": "Mount"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "OverlayError",
+      "name": "SameFilesystem",
+      "crate": "rio-builder",
       "msg": "overlay upper ({upper}) and FUSE lower ({lower}) are on the same filesystem (st_dev={st_dev}); the kernel will reject this mount. Set --overlay-base-dir to a directory on a different mount (e.g., a local SSD emptyDir volume, not the FUSE mount).",
-      "name": "SameFilesystem"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "OverlayError",
+      "name": "Stat",
+      "crate": "rio-builder",
       "msg": "stat({path}) failed: {source}",
-      "name": "Stat"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "OverlayError",
+      "name": "Unmount",
+      "crate": "rio-builder",
       "msg": "umount2 overlay failed: {source}",
-      "name": "Unmount"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "OverlayError",
+      "name": "UpperOnOverlayfs",
+      "crate": "rio-builder",
       "msg": "overlay upperdir {path} is itself on an overlayfs mount (statfs f_type=OVERLAYFS_SUPER_MAGIC); the kernel refuses to use an overlayfs as upperdir/workdir. Set --overlay-base-dir to a directory on a real filesystem (e.g., a local SSD emptyDir volume), not the merged view of another overlay.",
-      "name": "UpperOnOverlayfs"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "Ref-scan returned a path that fails `StorePath::parse`. The candidate set is built from validated input-closure paths, so this indicates a bug in `CandidateSet::resolve` (or a mismatched store-prefix). Surfaced as an error — silently dropping the ref would publish a path with a broken reference graph.",
       "enum": "UploadError",
+      "name": "InvalidReference",
+      "crate": "rio-builder",
       "msg": "ref-scan returned unparseable store path {path:?}",
-      "name": "InvalidReference"
+      "doc": "Ref-scan returned a path that fails `StorePath::parse`. The candidate set is built from validated input-closure paths, so this indicates a bug in `CandidateSet::resolve` (or a mismatched store-prefix). Surfaced as an error — silently dropping the ref would publish a path with a broken reference graph."
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "UploadError",
+      "name": "Io",
+      "crate": "rio-builder",
       "msg": "I/O error: {0}",
-      "name": "Io"
+      "doc": ""
     },
     {
-      "crate": "rio-builder",
-      "doc": "",
       "enum": "UploadError",
+      "name": "UploadExhausted",
+      "crate": "rio-builder",
       "msg": "upload failed after {MAX_UPLOAD_RETRIES} retries for {path}: {source}",
-      "name": "UploadExhausted"
+      "doc": ""
     },
     {
-      "crate": "rio-common",
-      "doc": "Input was empty or contained only whitespace after trimming.",
       "enum": "NameError",
+      "name": "Empty",
+      "crate": "rio-common",
       "msg": "name is empty after trimming",
-      "name": "Empty"
+      "doc": "Input was empty or contained only whitespace after trimming."
     },
     {
-      "crate": "rio-common",
-      "doc": "Input contained whitespace between non-whitespace characters (e.g., `\"team a\"` — probably a misconfigured `authorized_keys` comment with a space where a dash was intended). Carries the trimmed input for the error message so the operator sees exactly what was rejected.",
       "enum": "NameError",
+      "name": "InteriorWhitespace",
+      "crate": "rio-common",
       "msg": "name contains interior whitespace: {0:?}",
-      "name": "InteriorWhitespace"
+      "doc": "Input contained whitespace between non-whitespace characters (e.g., `\"team a\"` — probably a misconfigured `authorized_keys` comment with a space where a dash was intended). Carries the trimmed input for the error message so the operator sees exactly what was rejected."
     },
     {
-      "crate": "rio-controller",
-      "doc": "finalizer() wrapper failed. Inner is either our own Error (ApplyFailed/CleanupFailed wrapping the reconcile body's error) or a finalizer-specific failure (couldn't patch metadata.finalizers).",
       "enum": "Error",
+      "name": "Finalizer",
+      "crate": "rio-controller",
       "msg": "finalizer error: {0}",
-      "name": "Finalizer"
+      "doc": "finalizer() wrapper failed. Inner is either our own Error (ApplyFailed/CleanupFailed wrapping the reconcile body's error) or a finalizer-specific failure (couldn't patch metadata.finalizers)."
     },
     {
-      "crate": "rio-controller",
-      "doc": "Failed to build a K8s object (Job, PodSpec) from the CRD spec. Usually a bad Quantity string (fuseCacheSize that doesn't parse) or some spec field we can't translate. These are OPERATOR errors — fix the CRD and reconcile retries. Not transient.",
       "enum": "Error",
+      "name": "InvalidSpec",
+      "crate": "rio-controller",
       "msg": "invalid spec: {0}",
-      "name": "InvalidSpec"
+      "doc": "Failed to build a K8s object (Job, PodSpec) from the CRD spec. Usually a bad Quantity string (fuseCacheSize that doesn't parse) or some spec field we can't translate. These are OPERATOR errors — fix the CRD and reconcile retries. Not transient."
     },
     {
-      "crate": "rio-controller",
-      "doc": "K8s API error (connection, permission, not-found).",
       "enum": "Error",
+      "name": "Kube",
+      "crate": "rio-controller",
       "msg": "kubernetes API error: {0}",
-      "name": "Kube"
+      "doc": "K8s API error (connection, permission, not-found)."
     },
     {
-      "crate": "rio-gateway",
-      "doc": "Error already reported to the client via `STDERR_ERROR`. Produced by the `stderr_err!` macro — the message was shown to the client and this error terminates the session.",
       "enum": "GatewayError",
+      "name": "ClientReported",
+      "crate": "rio-gateway",
       "msg": "{0}",
-      "name": "ClientReported"
+      "doc": "Error already reported to the client via `STDERR_ERROR`. Produced by the `stderr_err!` macro — the message was shown to the client and this error terminates the session."
     },
     {
-      "crate": "rio-gateway",
-      "doc": "Derivation lookup failed.",
       "enum": "GatewayError",
+      "name": "DerivationNotFound",
+      "crate": "rio-gateway",
       "msg": "derivation '{0}' not found in store",
-      "name": "DerivationNotFound"
+      "doc": "Derivation lookup failed."
     },
     {
-      "crate": "rio-gateway",
-      "doc": "Derivation ATerm parse failed.",
       "enum": "GatewayError",
+      "name": "DerivationParse",
+      "crate": "rio-gateway",
       "msg": "failed to parse .drv '{path}': {msg}",
-      "name": "DerivationParse"
+      "doc": "Derivation ATerm parse failed."
     },
     {
-      "crate": "rio-gateway",
-      "doc": "Per-session drv cache at cap.",
       "enum": "GatewayError",
+      "name": "DrvCacheFull",
+      "crate": "rio-gateway",
       "msg": "per-session derivation cache full ({count} entries, cap {cap})",
-      "name": "DrvCacheFull"
+      "doc": "Per-session drv cache at cap."
     },
     {
-      "crate": "rio-gateway",
-      "doc": "gRPC stream/channel error (channel closed, task panicked).",
       "enum": "GatewayError",
+      "name": "GrpcStream",
+      "crate": "rio-gateway",
       "msg": "gRPC stream: {0}",
-      "name": "GrpcStream"
+      "doc": "gRPC stream/channel error (channel closed, task panicked)."
     },
     {
-      "crate": "rio-gateway",
-      "doc": "PathInfo validation rejected wire input.",
       "enum": "GatewayError",
+      "name": "InvalidPathInfo",
+      "crate": "rio-gateway",
       "msg": "{context}: {source}",
-      "name": "InvalidPathInfo"
+      "doc": "PathInfo validation rejected wire input."
     },
     {
-      "crate": "rio-gateway",
-      "doc": "Invalid reference path in a reference list.",
       "enum": "GatewayError",
+      "name": "InvalidReference",
+      "crate": "rio-gateway",
       "msg": "invalid reference path '{path}' for {context}: {source}",
-      "name": "InvalidReference"
+      "doc": "Invalid reference path in a reference list."
     },
     {
-      "crate": "rio-gateway",
-      "doc": "Invalid store path from wire input.",
       "enum": "GatewayError",
+      "name": "InvalidStorePath",
+      "crate": "rio-gateway",
       "msg": "invalid store path '{path}': {source}",
-      "name": "InvalidStorePath"
+      "doc": "Invalid store path from wire input."
     },
     {
-      "crate": "rio-gateway",
-      "doc": "NAR read error (short read, IO error).",
       "enum": "GatewayError",
+      "name": "NarRead",
+      "crate": "rio-gateway",
       "msg": "{context}: NAR read: {source}",
-      "name": "NarRead"
+      "doc": "NAR read error (short read, IO error)."
     },
     {
-      "crate": "rio-gateway",
-      "doc": "NAR size exceeds configured limit.",
       "enum": "GatewayError",
+      "name": "NarTooLarge",
+      "crate": "rio-gateway",
       "msg": "{context}: nar_size {got} exceeds maximum {max}",
-      "name": "NarTooLarge"
+      "doc": "NAR size exceeds configured limit."
     },
     {
-      "crate": "rio-gateway",
-      "doc": "gRPC call to rio-scheduler failed.",
       "enum": "GatewayError",
+      "name": "Scheduler",
+      "crate": "rio-gateway",
       "msg": "scheduler gRPC: {0}",
-      "name": "Scheduler"
+      "doc": "gRPC call to rio-scheduler failed."
     },
     {
-      "crate": "rio-gateway",
-      "doc": "gRPC call to rio-store failed.",
       "enum": "GatewayError",
+      "name": "Store",
+      "crate": "rio-gateway",
       "msg": "store gRPC: {0}",
-      "name": "Store"
+      "doc": "gRPC call to rio-store failed."
     },
     {
-      "crate": "rio-gateway",
-      "doc": "Client sent an opcode we don't recognize. Connection must close to avoid stream desync (the payload shape is unknown).",
       "enum": "GatewayError",
+      "name": "UnknownOpcode",
+      "crate": "rio-gateway",
       "msg": "unknown opcode {0}, closing connection to avoid stream desynchronization",
-      "name": "UnknownOpcode"
+      "doc": "Client sent an opcode we don't recognize. Connection must close to avoid stream desync (the payload shape is unknown)."
     },
     {
-      "crate": "rio-gateway",
-      "doc": "Stream returned `Ok(None)` (EOF) without a Completed/ Failed/Cancelled event. This IS the primary failover signature: k8s pod kill → SIGTERM → graceful shutdown → TCP FIN → clean stream close. NOT a Transport error. Reconnect-worthy for the same reason as Transport.",
       "enum": "StreamProcessError",
+      "name": "EofWithoutTerminal",
+      "crate": "rio-gateway",
       "msg": "build event stream ended unexpectedly (scheduler disconnected?)",
-      "name": "EofWithoutTerminal"
+      "doc": "Stream returned `Ok(None)` (EOF) without a Completed/ Failed/Cancelled event. This IS the primary failover signature: k8s pod kill → SIGTERM → graceful shutdown → TCP FIN → clean stream close. NOT a Transport error. Reconnect-worthy for the same reason as Transport."
     },
     {
-      "crate": "rio-gateway",
-      "doc": "gRPC-level error (connection reset, timeout). Scheduler may have failed over — reconnecting via WatchBuild has a good chance of resuming.",
       "enum": "StreamProcessError",
+      "name": "Transport",
+      "crate": "rio-gateway",
       "msg": "build event stream error: {0}",
-      "name": "Transport"
+      "doc": "gRPC-level error (connection reset, timeout). Scheduler may have failed over — reconnecting via WatchBuild has a good chance of resuming."
     },
     {
-      "crate": "rio-gateway",
-      "doc": "Error writing STDERR to the client (WireError). The Nix client disconnected or the SSH channel closed. NOT reconnect-worthy — scheduler is fine, client is gone.",
       "enum": "StreamProcessError",
+      "name": "Wire",
+      "crate": "rio-gateway",
       "msg": "client disconnected: {0}",
-      "name": "Wire"
+      "doc": "Error writing STDERR to the client (WireError). The Nix client disconnected or the SSH channel closed. NOT reconnect-worthy — scheduler is fine, client is gone."
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "DerivationError",
+      "name": "CollectionTooLarge",
+      "crate": "rio-nix",
       "msg": "collection too large: {0} items (max {MAX_ATERM_LIST_ITEMS})",
-      "name": "CollectionTooLarge"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "DerivationError",
+      "name": "CycleDetected",
+      "crate": "rio-nix",
       "msg": "cycle detected in derivation graph at: {0}",
-      "name": "CycleDetected"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "DerivationError",
+      "name": "EmptyOutputName",
+      "crate": "rio-nix",
       "msg": "empty output name at index {0}",
-      "name": "EmptyOutputName"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "DerivationError",
+      "name": "Expected",
+      "crate": "rio-nix",
       "msg": "expected '{expected}', got '{got}'",
-      "name": "Expected"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "DerivationError",
+      "name": "ExpectedStringStart",
+      "crate": "rio-nix",
       "msg": "expected '\"' to start string",
-      "name": "ExpectedStringStart"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "DerivationError",
+      "name": "InputNotFound",
+      "crate": "rio-nix",
       "msg": "input derivation not found: {0}",
-      "name": "InputNotFound"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "DerivationError",
+      "name": "InvalidEscape",
+      "crate": "rio-nix",
       "msg": "invalid escape sequence: \\{0}",
-      "name": "InvalidEscape"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "DerivationError",
+      "name": "InvalidOutputPath",
+      "crate": "rio-nix",
       "msg": "computed output path is invalid: {0}",
-      "name": "InvalidOutputPath"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "DerivationError",
+      "name": "InvalidUtf8",
+      "crate": "rio-nix",
       "msg": "derivation content is not valid UTF-8: {0}",
-      "name": "InvalidUtf8"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "DerivationError",
+      "name": "NarExtract",
+      "crate": "rio-nix",
       "msg": "NAR extraction failed: {0}",
-      "name": "NarExtract"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "DerivationError",
+      "name": "NoOutputs",
+      "crate": "rio-nix",
       "msg": "derivation must have at least one output",
-      "name": "NoOutputs"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "DerivationError",
+      "name": "RecursionLimitExceeded",
+      "crate": "rio-nix",
       "msg": "derivation graph too deep at '{0}' (max {MAX_HASH_RECURSION_DEPTH} levels)",
-      "name": "RecursionLimitExceeded"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "DerivationError",
+      "name": "UnexpectedEof",
+      "crate": "rio-nix",
       "msg": "unexpected end of input",
-      "name": "UnexpectedEof"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "DerivedPathError",
+      "name": "DuplicateOutputName",
+      "crate": "rio-nix",
       "msg": "duplicate output name",
-      "name": "DuplicateOutputName"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "DerivedPathError",
+      "name": "EmptyOutputName",
+      "crate": "rio-nix",
       "msg": "output name must not be empty",
-      "name": "EmptyOutputName"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "DerivedPathError",
+      "name": "NotDerivation",
+      "crate": "rio-nix",
       "msg": "built path base must be a derivation (.drv): {0}",
-      "name": "NotDerivation"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "DerivedPathError",
+      "name": "StorePath",
+      "crate": "rio-nix",
       "msg": "(transparent — delegates to inner error)",
-      "name": "StorePath"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "DerivedPathError",
+      "name": "TooManyOutputs",
+      "crate": "rio-nix",
       "msg": "too many output names: {0} (max {MAX_OUTPUT_NAMES})",
-      "name": "TooManyOutputs"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "HandshakeError",
+      "name": "InvalidMagic",
+      "crate": "rio-nix",
       "msg": "invalid client magic: expected {WORKER_MAGIC_1:#018x}, got {0:#018x}",
-      "name": "InvalidMagic"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "HandshakeError",
+      "name": "VersionTooOld",
+      "crate": "rio-nix",
       "msg": "client protocol version {client_major}.{client_minor} is too old; rio-build requires 1.35+",
-      "name": "VersionTooOld"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "HandshakeError",
+      "name": "Wire",
+      "crate": "rio-nix",
       "msg": "wire format error: {0}",
-      "name": "Wire"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "HashError",
+      "name": "InvalidBase64",
+      "crate": "rio-nix",
       "msg": "invalid base64 encoding",
-      "name": "InvalidBase64"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "HashError",
+      "name": "InvalidFormat",
+      "crate": "rio-nix",
       "msg": "invalid hash format: {0}",
-      "name": "InvalidFormat"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "HashError",
+      "name": "InvalidNixbase32",
+      "crate": "rio-nix",
       "msg": "invalid nixbase32 encoding: {0}",
-      "name": "InvalidNixbase32"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "HashError",
+      "name": "UnknownAlgorithm",
+      "crate": "rio-nix",
       "msg": "unknown hash algorithm: {0}",
-      "name": "UnknownAlgorithm"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "HashError",
+      "name": "WrongDigestLength",
+      "crate": "rio-nix",
       "msg": "wrong digest length for {algo}: expected {expected}, got {got}",
-      "name": "WrongDigestLength"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "NarError",
+      "name": "ContentTooLarge",
+      "crate": "rio-nix",
       "msg": "content size {0} exceeds maximum {MAX_CONTENT_SIZE}",
-      "name": "ContentTooLarge"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "NarError",
+      "name": "InvalidEntryName",
+      "crate": "rio-nix",
       "msg": "invalid NAR entry name: {name:?}",
-      "name": "InvalidEntryName"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "NarError",
+      "name": "InvalidMagic",
+      "crate": "rio-nix",
       "msg": "invalid NAR magic: expected {NAR_MAGIC:?}, got {0:?}",
-      "name": "InvalidMagic"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "NarError",
+      "name": "InvalidUtf8",
+      "crate": "rio-nix",
       "msg": "invalid UTF-8 in {context} at byte offset {offset}",
-      "name": "InvalidUtf8"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "NarError",
+      "name": "Io",
+      "crate": "rio-nix",
       "msg": "I/O error: {0}",
-      "name": "Io"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "NarError",
+      "name": "NameTooLong",
+      "crate": "rio-nix",
       "msg": "name length {0} exceeds maximum {MAX_NAME_LEN}",
-      "name": "NameTooLong"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "NarError",
+      "name": "NestingTooDeep",
+      "crate": "rio-nix",
       "msg": "directory nesting depth {0} exceeds maximum {MAX_NAR_DEPTH}",
-      "name": "NestingTooDeep"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "NarError",
+      "name": "NonZeroPadding",
+      "crate": "rio-nix",
       "msg": "non-zero padding byte after {0}-byte field",
-      "name": "NonZeroPadding"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "NarError",
+      "name": "NotSingleFile",
+      "crate": "rio-nix",
       "msg": "not a single-file NAR",
-      "name": "NotSingleFile"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "NarError",
+      "name": "TargetTooLong",
+      "crate": "rio-nix",
       "msg": "target length {0} exceeds maximum {MAX_TARGET_LEN}",
-      "name": "TargetTooLong"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "NarError",
+      "name": "TooManyEntries",
+      "crate": "rio-nix",
       "msg": "directory entry count {0} exceeds maximum {MAX_DIRECTORY_ENTRIES}",
-      "name": "TooManyEntries"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "NarError",
+      "name": "UnexpectedToken",
+      "crate": "rio-nix",
       "msg": "expected token {expected:?}, got {got:?}",
-      "name": "UnexpectedToken"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "NarError",
+      "name": "UnknownNodeType",
+      "crate": "rio-nix",
       "msg": "unknown node type: {0:?}",
-      "name": "UnknownNodeType"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "NarError",
+      "name": "UnsortedEntries",
+      "crate": "rio-nix",
       "msg": "directory entries not in sorted order: {prev:?} >= {cur:?}",
-      "name": "UnsortedEntries"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "NarError",
+      "name": "UnsupportedFileType",
+      "crate": "rio-nix",
       "msg": "file {0:?} has an unsupported type (not regular/symlink/directory)",
-      "name": "UnsupportedFileType"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "NarInfoError",
+      "name": "DuplicateField",
+      "crate": "rio-nix",
       "msg": "duplicate field: {0}",
-      "name": "DuplicateField"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "NarInfoError",
+      "name": "InvalidFileSize",
+      "crate": "rio-nix",
       "msg": "invalid FileSize value {value:?}: {source}",
-      "name": "InvalidFileSize"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "NarInfoError",
+      "name": "InvalidNarSize",
+      "crate": "rio-nix",
       "msg": "invalid NarSize value {value:?}: {source}",
-      "name": "InvalidNarSize"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "NarInfoError",
+      "name": "MissingField",
+      "crate": "rio-nix",
       "msg": "missing required field: {0}",
-      "name": "MissingField"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "StorePathError",
+      "name": "EmptyName",
+      "crate": "rio-nix",
       "msg": "name is empty",
-      "name": "EmptyName"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "StorePathError",
+      "name": "FixedOutputRefsNotAllowed",
+      "crate": "rio-nix",
       "msg": "fixed-output path with references requires recursive SHA-256 (got {algo}, recursive={recursive})",
-      "name": "FixedOutputRefsNotAllowed"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "StorePathError",
+      "name": "InvalidBase32Char",
+      "crate": "rio-nix",
       "msg": "invalid nixbase32 character: {0:?}",
-      "name": "InvalidBase32Char"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "StorePathError",
+      "name": "InvalidBase32Length",
+      "crate": "rio-nix",
       "msg": "invalid nixbase32 length: expected {expected}, got {got}",
-      "name": "InvalidBase32Length"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "StorePathError",
+      "name": "InvalidBase32Padding",
+      "crate": "rio-nix",
       "msg": "invalid nixbase32 string: non-zero padding bits (non-canonical encoding)",
-      "name": "InvalidBase32Padding"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "StorePathError",
+      "name": "InvalidNameChar",
+      "crate": "rio-nix",
       "msg": "name contains invalid character: {0:?}",
-      "name": "InvalidNameChar"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "StorePathError",
+      "name": "InvalidPrefix",
+      "crate": "rio-nix",
       "msg": "path does not start with {STORE_DIR}/",
-      "name": "InvalidPrefix"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "StorePathError",
+      "name": "MissingDash",
+      "crate": "rio-nix",
       "msg": "missing dash separator after hash",
-      "name": "MissingDash"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "StorePathError",
+      "name": "NameStartsWithDot",
+      "crate": "rio-nix",
       "msg": "name starts with '.'",
-      "name": "NameStartsWithDot"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "StorePathError",
+      "name": "NameTooLong",
+      "crate": "rio-nix",
       "msg": "name too long: {0} chars (max {MAX_NAME_LEN})",
-      "name": "NameTooLong"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "StorePathError",
+      "name": "TextHashMustBeSha256",
+      "crate": "rio-nix",
       "msg": "text content-address requires sha256, got {got}",
-      "name": "TextHashMustBeSha256"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "StorePathError",
+      "name": "TooShort",
+      "crate": "rio-nix",
       "msg": "path is too short to contain a hash",
-      "name": "TooShort"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "WireError",
+      "name": "CollectionTooLarge",
+      "crate": "rio-nix",
       "msg": "collection count {0} exceeds maximum {MAX_COLLECTION_COUNT}",
-      "name": "CollectionTooLarge"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "WireError",
+      "name": "FrameTooLarge",
+      "crate": "rio-nix",
       "msg": "framed stream frame size {0} exceeds maximum {MAX_FRAME_SIZE}",
-      "name": "FrameTooLarge"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "WireError",
+      "name": "FramedStreamTooLarge",
+      "crate": "rio-nix",
       "msg": "framed stream total size {0} exceeds maximum {MAX_FRAMED_TOTAL}",
-      "name": "FramedStreamTooLarge"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "WireError",
+      "name": "InvalidNarHash",
+      "crate": "rio-nix",
       "msg": "invalid hex in narHash field: {0}",
-      "name": "InvalidNarHash"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "WireError",
+      "name": "InvalidUtf8",
+      "crate": "rio-nix",
       "msg": "invalid UTF-8 in string",
-      "name": "InvalidUtf8"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "WireError",
+      "name": "Io",
+      "crate": "rio-nix",
       "msg": "I/O error: {0}",
-      "name": "Io"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "WireError",
+      "name": "NonZeroPadding",
+      "crate": "rio-nix",
       "msg": "non-zero padding byte after {0}-byte string",
-      "name": "NonZeroPadding"
+      "doc": ""
     },
     {
-      "crate": "rio-nix",
-      "doc": "",
       "enum": "WireError",
+      "name": "StringTooLong",
+      "crate": "rio-nix",
       "msg": "string length {0} exceeds maximum {MAX_STRING_LEN}",
-      "name": "StringTooLong"
+      "doc": ""
     },
     {
-      "crate": "rio-proto",
-      "doc": "Spool write failure ([`collect_nar_stream_to_writer`] only). NOT transient — retrying the gRPC won't fix local disk.",
       "enum": "NarCollectError",
+      "name": "Io",
+      "crate": "rio-proto",
       "msg": "NAR spool write failed: {0}",
-      "name": "Io"
+      "doc": "Spool write failure ([`collect_nar_stream_to_writer`] only). NOT transient — retrying the gRPC won't fix local disk."
     },
     {
-      "crate": "rio-proto",
-      "doc": "",
       "enum": "NarCollectError",
+      "name": "SizeExceeded",
+      "crate": "rio-proto",
       "msg": "NAR exceeds maximum size: {got} > {limit}",
-      "name": "SizeExceeded"
+      "doc": ""
     },
     {
-      "crate": "rio-proto",
-      "doc": "",
       "enum": "NarCollectError",
+      "name": "Stream",
+      "crate": "rio-proto",
       "msg": "gRPC stream error: {0}",
-      "name": "Stream"
+      "doc": ""
     },
     {
-      "crate": "rio-proto",
-      "doc": "",
       "enum": "NarCollectError",
+      "name": "Validation",
+      "crate": "rio-proto",
       "msg": "store returned malformed PathInfo: {0}",
-      "name": "Validation"
+      "doc": ""
     },
     {
-      "crate": "rio-proto",
-      "doc": "",
       "enum": "PathInfoValidationError",
+      "name": "NarHashLen",
+      "crate": "rio-proto",
       "msg": "nar_hash must be 32 bytes (SHA-256), got {0}",
-      "name": "NarHashLen"
+      "doc": ""
     },
     {
-      "crate": "rio-proto",
-      "doc": "",
       "enum": "PathInfoValidationError",
+      "name": "Reference",
+      "crate": "rio-proto",
       "msg": "invalid reference path {path:?}: {source}",
-      "name": "Reference"
+      "doc": ""
     },
     {
-      "crate": "rio-proto",
-      "doc": "",
       "enum": "PathInfoValidationError",
+      "name": "StorePath",
+      "crate": "rio-proto",
       "msg": "invalid store_path {path:?}: {source}",
-      "name": "StorePath"
+      "doc": ""
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "",
       "enum": "ActorError",
+      "name": "Backpressure",
+      "crate": "rio-scheduler",
       "msg": "backpressure: actor queue is overloaded",
-      "name": "Backpressure"
+      "doc": ""
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "",
       "enum": "ActorError",
+      "name": "BuildNotFound",
+      "crate": "rio-scheduler",
       "msg": "build not found: {0}",
-      "name": "BuildNotFound"
+      "doc": ""
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "",
       "enum": "ActorError",
+      "name": "ChannelSend",
+      "crate": "rio-scheduler",
       "msg": "channel send error",
-      "name": "ChannelSend"
+      "doc": ""
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "",
       "enum": "ActorError",
+      "name": "Dag",
+      "crate": "rio-scheduler",
       "msg": "DAG merge failed: {0}",
-      "name": "Dag"
+      "doc": ""
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "",
       "enum": "ActorError",
+      "name": "Database",
+      "crate": "rio-scheduler",
       "msg": "database error: {0}",
-      "name": "Database"
+      "doc": ""
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "Invariant violation: an edge references a derivation that was never persisted to PG. Merge assigns db_ids to every node before processing edges; if `DerivationDag::db_id_for_path` returns None for an endpoint, the node was never in the submission (malformed request) or the id_map build loop has a bug.",
       "enum": "ActorError",
+      "name": "MissingDbId",
+      "crate": "rio-scheduler",
       "msg": "edge references unpersisted derivation (db_id missing): {drv_path}",
-      "name": "MissingDbId"
+      "doc": "Invariant violation: an edge references a derivation that was never persisted to PG. Merge assigns db_ids to every node before processing edges; if `DerivationDag::db_id_for_path` returns None for an endpoint, the node was never in the submission (malformed request) or the id_map build loop has a bug."
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "`r[sched.tenant.authz]`: caller's attested `claims.sub` does not own the build. Maps to gRPC PERMISSION_DENIED.",
       "enum": "ActorError",
+      "name": "PermissionDenied",
+      "crate": "rio-scheduler",
       "msg": "permission denied: build {build_id} belongs to a different tenant",
-      "name": "PermissionDenied"
+      "doc": "`r[sched.tenant.authz]`: caller's attested `claims.sub` does not own the build. Maps to gRPC PERMISSION_DENIED."
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "Store service is unreachable (cache-check circuit breaker is open). Maps to gRPC UNAVAILABLE. Rejecting SubmitBuild here is the user decision from phase2c planning: if the store is down, builds can't dispatch anyway (workers PutPath/GetPath also fail), so fail fast with a clear error instead of queueing builds that will all stall.",
       "enum": "ActorError",
+      "name": "StoreUnavailable",
+      "crate": "rio-scheduler",
       "msg": "store service unavailable (cache-check circuit breaker open)",
-      "name": "StoreUnavailable"
+      "doc": "Store service is unreachable (cache-check circuit breaker is open). Maps to gRPC UNAVAILABLE. Rejecting SubmitBuild here is the user decision from phase2c planning: if the store is down, builds can't dispatch anyway (workers PutPath/GetPath also fail), so fail fast with a clear error instead of queueing builds that will all stall."
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "",
       "enum": "DagError",
+      "name": "CycleDetected",
+      "crate": "rio-scheduler",
       "msg": "dependency cycle detected",
-      "name": "CycleDetected"
+      "doc": ""
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "",
       "enum": "DagError",
+      "name": "InvalidDrvPath",
+      "crate": "rio-scheduler",
       "msg": "invalid drv_path {path:?}: {source}",
-      "name": "InvalidDrvPath"
+      "doc": ""
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "DB error from the realisations lookup or `realisation_deps` insert. Transient (PG blip) — caller should defer and retry.",
       "enum": "ResolveError",
+      "name": "Db",
+      "crate": "rio-scheduler",
       "msg": "database error during resolution: {0}",
-      "name": "Db"
+      "doc": "DB error from the realisations lookup or `realisation_deps` insert. Transient (PG blip) — caller should defer and retry."
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "An `inputDrvs` path didn't parse as a `StorePath`. Nix never produces this — guard against manually-crafted derivations.",
       "enum": "ResolveError",
+      "name": "InvalidInputDrvPath",
+      "crate": "rio-scheduler",
       "msg": "input derivation path is not a valid store path: {0}",
-      "name": "InvalidInputDrvPath"
+      "doc": "An `inputDrvs` path didn't parse as a `StorePath`. Nix never produces this — guard against manually-crafted derivations."
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "The `drv_content` bytes weren't valid UTF-8. ATerm is ASCII; a non-UTF-8 blob means the gateway inlined garbage.",
       "enum": "ResolveError",
+      "name": "InvalidUtf8",
+      "crate": "rio-scheduler",
       "msg": "derivation content is not valid UTF-8: {0}",
-      "name": "InvalidUtf8"
+      "doc": "The `drv_content` bytes weren't valid UTF-8. ATerm is ASCII; a non-UTF-8 blob means the gateway inlined garbage."
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "No `drv_content` available. Resolution requires the full ATerm to parse `inputDrvs` and perform placeholder replacement. Caller should fetch from store or defer.",
       "enum": "ResolveError",
+      "name": "NoDrvContent",
+      "crate": "rio-scheduler",
       "msg": "drv_content is empty — cannot resolve without ATerm",
-      "name": "NoDrvContent"
+      "doc": "No `drv_content` available. Resolution requires the full ATerm to parse `inputDrvs` and perform placeholder replacement. Caller should fetch from store or defer."
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "ATerm parse failed. Likely a truncated or corrupted inline.",
       "enum": "ResolveError",
+      "name": "Parse",
+      "crate": "rio-scheduler",
       "msg": "failed to parse derivation ATerm: {0}",
-      "name": "Parse"
+      "doc": "ATerm parse failed. Likely a truncated or corrupted inline."
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "A CA input's realisation wasn't found. The DAG guarantees the input is Completed before the parent dispatches (all deps must be Completed for Queued→Ready), so a missing realisation means the input completed WITHOUT registering a realisation — either `wopRegisterDrvOutput` was never called (client bug) or the realisation row was GC'd (scheduler/GC bug).",
       "enum": "ResolveError",
+      "name": "RealisationMissing",
+      "crate": "rio-scheduler",
       "msg": "realisation for {drv_path}!{output_name} not found (modular hash {modular_hex})",
-      "name": "RealisationMissing"
+      "doc": "A CA input's realisation wasn't found. The DAG guarantees the input is Completed before the parent dispatches (all deps must be Completed for Queued→Ready), so a missing realisation means the input completed WITHOUT registering a realisation — either `wopRegisterDrvOutput` was never called (client bug) or the realisation row was GC'd (scheduler/GC bug)."
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "DB error from `rio_store::realisations::query`. Same retry-ability as [`Db`](Self::Db); separate variant only because rio-store's accessors return the SQLSTATE-classified [`MetadataError`](rio_store::error::MetadataError) rather than raw `sqlx::Error`.",
       "enum": "ResolveError",
+      "name": "Store",
+      "crate": "rio-scheduler",
       "msg": "realisations lookup: {0}",
-      "name": "Store"
+      "doc": "DB error from `rio_store::realisations::query`. Same retry-ability as [`Db`](Self::Db); separate variant only because rio-store's accessors return the SQLSTATE-classified [`MetadataError`](rio_store::error::MetadataError) rather than raw `sqlx::Error`."
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "",
       "enum": "TransitionError",
+      "name": "Invalid",
+      "crate": "rio-scheduler",
       "msg": "invalid derivation transition {from} -> {to}: {reason}",
-      "name": "Invalid"
+      "doc": ""
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "",
       "enum": "TransitionError",
+      "name": "InvalidBuild",
+      "crate": "rio-scheduler",
       "msg": "invalid build state transition {from:?} -> {to:?}",
-      "name": "InvalidBuild"
+      "doc": ""
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "",
       "enum": "TransitionError",
+      "name": "TerminalBuild",
+      "crate": "rio-scheduler",
       "msg": "cannot transition from terminal build state {from:?} to {to:?}",
-      "name": "TerminalBuild"
+      "doc": ""
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "",
       "enum": "TransitionError",
+      "name": "TerminalToNonTerminal",
+      "crate": "rio-scheduler",
       "msg": "cannot transition from terminal state {from} to {to}",
-      "name": "TerminalToNonTerminal"
+      "doc": ""
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "",
       "enum": "TransitionError",
+      "name": "UnknownBuildState",
+      "crate": "rio-scheduler",
       "msg": "unknown build state: {0}",
-      "name": "UnknownBuildState"
+      "doc": ""
     },
     {
-      "crate": "rio-scheduler",
-      "doc": "",
       "enum": "TransitionError",
+      "name": "UnknownStatus",
+      "crate": "rio-scheduler",
       "msg": "unknown derivation status: {0}",
-      "name": "UnknownStatus"
+      "doc": ""
     },
     {
-      "crate": "rio-store",
-      "doc": "Semaphore closed. Unreachable in production (nothing calls `Semaphore::close`); mapped so a future shutdown-close surfaces as transient retry, not panic.",
       "enum": "AdmissionError",
+      "name": "Closed",
+      "crate": "rio-store",
       "msg": "admission gate closed",
-      "name": "Closed"
+      "doc": "Semaphore closed. Unreachable in production (nothing calls `Semaphore::close`); mapped so a future shutdown-close surfaces as transient retry, not panic."
     },
     {
-      "crate": "rio-store",
-      "doc": "Queued for [`SUBSTITUTE_ADMISSION_WAIT`] without acquiring. Transient — caller retries per `r[sched.substitute.detached+2]`.",
       "enum": "AdmissionError",
+      "name": "Saturated",
+      "crate": "rio-store",
       "msg": "substitute admission saturated; retry (transient)",
-      "name": "Saturated"
+      "doc": "Queued for [`SUBSTITUTE_ADMISSION_WAIT`] without acquiring. Transient — caller retries per `r[sched.substitute.detached+2]`."
     },
     {
-      "crate": "rio-store",
-      "doc": "BLAKE3 of the fetched bytes doesn't match the requested hash. S3 bitrot, memory corruption, or a backend bug. The corrupt bytes are NOT cached (we verify before insert).",
       "enum": "ChunkError",
+      "name": "Corrupt",
+      "crate": "rio-store",
       "msg": "chunk {} failed BLAKE3 verification (corrupt; expected {}, got {})",
-      "name": "Corrupt"
+      "doc": "BLAKE3 of the fetched bytes doesn't match the requested hash. S3 bitrot, memory corruption, or a backend bug. The corrupt bytes are NOT cached (we verify before insert)."
     },
     {
-      "crate": "rio-store",
-      "doc": "Backend returned None — chunk not in S3. If the manifest says this hash exists, this is data loss. Caller should propagate as a hard error (not retry — retrying NotFound is pointless).",
       "enum": "ChunkError",
+      "name": "NotFound",
+      "crate": "rio-store",
       "msg": "chunk {} not found in backend (data loss if manifest claims it exists)",
-      "name": "NotFound"
+      "doc": "Backend returned None — chunk not in S3. If the manifest says this hash exists, this is data loss. Caller should propagate as a hard error (not retry — retrying NotFound is pointless)."
     },
     {
-      "crate": "rio-store",
-      "doc": "",
       "enum": "ManifestError",
+      "name": "BadLength",
+      "crate": "rio-store",
       "msg": "manifest body length {0} is not a multiple of {ENTRY_SIZE} (truncated or corrupt)",
-      "name": "BadLength"
+      "doc": ""
     },
     {
-      "crate": "rio-store",
-      "doc": "",
       "enum": "ManifestError",
+      "name": "Empty",
+      "crate": "rio-store",
       "msg": "manifest is empty (no version byte)",
-      "name": "Empty"
+      "doc": ""
     },
     {
-      "crate": "rio-store",
-      "doc": "",
       "enum": "ManifestError",
+      "name": "TooManyChunks",
+      "crate": "rio-store",
       "msg": "manifest has {0} entries, exceeds MAX_CHUNKS {MAX_CHUNKS}",
-      "name": "TooManyChunks"
+      "doc": ""
     },
     {
-      "crate": "rio-store",
-      "doc": "",
       "enum": "ManifestError",
+      "name": "UnknownVersion",
+      "crate": "rio-store",
       "msg": "unknown manifest version {0} (expected {VERSION})",
-      "name": "UnknownVersion"
+      "doc": ""
     },
     {
-      "crate": "rio-store",
-      "doc": "Unique or FK constraint violation (PG codes 23505, 23503). Usually means a concurrent writer won the race — the caller's operation is a no-op, not a failure. Maps to `already_exists`.",
       "enum": "MetadataError",
+      "name": "Conflict",
+      "crate": "rio-store",
       "msg": "conflict: {0}",
-      "name": "Conflict"
+      "doc": "Unique or FK constraint violation (PG codes 23505, 23503). Usually means a concurrent writer won the race — the caller's operation is a no-op, not a failure. Maps to `already_exists`."
     },
     {
-      "crate": "rio-store",
-      "doc": "Connection-level failure: pool exhausted, TCP reset, TLS error. Retriable — the operation never reached PG. Maps to `unavailable`.",
       "enum": "MetadataError",
+      "name": "Connection",
+      "crate": "rio-store",
       "msg": "connection error: {0}",
-      "name": "Connection"
+      "doc": "Connection-level failure: pool exhausted, TCP reset, TLS error. Retriable — the operation never reached PG. Maps to `unavailable`."
     },
     {
-      "crate": "rio-store",
-      "doc": "A `manifest_data.chunk_list` blob failed to deserialize. Written by us, read by us — if it doesn't round-trip, either the write was torn or the format version is wrong. NOT retriable. Maps to `data_loss`.",
       "enum": "MetadataError",
+      "name": "CorruptManifest",
+      "crate": "rio-store",
       "msg": "corrupt manifest_data for {store_path}: {source}",
-      "name": "CorruptManifest"
+      "doc": "A `manifest_data.chunk_list` blob failed to deserialize. Written by us, read by us — if it doesn't round-trip, either the write was torn or the format version is wrong. NOT retriable. Maps to `data_loss`."
     },
     {
-      "crate": "rio-store",
-      "doc": "Deadlock detected (PG code 40P01). Two transactions have a circular lock-wait on overlapping row sets. Retriable — PG aborted one txn; retry will likely succeed. Prevention: sort batch-UPDATE input so all writers acquire locks in the same order (see `metadata::with_sorted_retry`). Maps to `aborted`.",
       "enum": "MetadataError",
+      "name": "Deadlock",
+      "crate": "rio-store",
       "msg": "deadlock detected (retry)",
-      "name": "Deadlock"
+      "doc": "Deadlock detected (PG code 40P01). Two transactions have a circular lock-wait on overlapping row sets. Retriable — PG aborted one txn; retry will likely succeed. Prevention: sort batch-UPDATE input so all writers acquire locks in the same order (see `metadata::with_sorted_retry`). Maps to `aborted`."
     },
     {
-      "crate": "rio-store",
-      "doc": "Database state violates a code-enforced invariant that PG's schema can't express (e.g., `inline_blob IS NULL` but no `manifest_data` row — PG can't CHECK \"row in another table exists\"). This is corruption: manual DB surgery, a CASCADE we didn't expect, or a bug in cleanup ordering. NOT retriable. Maps to `internal`.",
       "enum": "MetadataError",
+      "name": "InvariantViolation",
+      "crate": "rio-store",
       "msg": "invariant violation: {0}",
-      "name": "InvariantViolation"
+      "doc": "Database state violates a code-enforced invariant that PG's schema can't express (e.g., `inline_blob IS NULL` but no `manifest_data` row — PG can't CHECK \"row in another table exists\"). This is corruption: manual DB surgery, a CASCADE we didn't expect, or a bug in cleanup ordering. NOT retriable. Maps to `internal`."
     },
     {
-      "crate": "rio-store",
-      "doc": "A narinfo row failed validation (bad store_path, wrong-length nar_hash). PG's schema doesn't enforce these as CHECK constraints. Caught at the egress boundary. NOT retriable. Maps to `internal`.",
       "enum": "MetadataError",
+      "name": "MalformedRow",
+      "crate": "rio-store",
       "msg": "malformed narinfo row: {0}",
-      "name": "MalformedRow"
+      "doc": "A narinfo row failed validation (bad store_path, wrong-length nar_hash). PG's schema doesn't enforce these as CHECK constraints. Caught at the egress boundary. NOT retriable. Maps to `internal`."
     },
     {
-      "crate": "rio-store",
-      "doc": "Row not found. From `sqlx::Error::RowNotFound`. Most metadata queries use `fetch_optional` so this is rare; shows up on `fetch_one` sites.",
       "enum": "MetadataError",
+      "name": "NotFound",
+      "crate": "rio-store",
       "msg": "not found",
-      "name": "NotFound"
+      "doc": "Row not found. From `sqlx::Error::RowNotFound`. Most metadata queries use `fetch_optional` so this is rare; shows up on `fetch_one` sites."
     },
     {
-      "crate": "rio-store",
-      "doc": "Unclassified sqlx error. Maps to `internal`.",
       "enum": "MetadataError",
+      "name": "Other",
+      "crate": "rio-store",
       "msg": "database error: {0}",
-      "name": "Other"
+      "doc": "Unclassified sqlx error. Maps to `internal`."
     },
     {
-      "crate": "rio-store",
-      "doc": "The write-ahead placeholder from `insert_manifest_uploading` is gone — `delete_manifest_uploading` raced us and won, or a crashed previous upload already cleaned it up. The caller's UPDATE hit `rows_affected() == 0`. Retriable. Maps to `aborted`.",
       "enum": "MetadataError",
+      "name": "PlaceholderMissing",
+      "crate": "rio-store",
       "msg": "placeholder missing for {store_path} (concurrently deleted?)",
-      "name": "PlaceholderMissing"
+      "doc": "The write-ahead placeholder from `insert_manifest_uploading` is gone — `delete_manifest_uploading` raced us and won, or a crashed previous upload already cleaned it up. The caller's UPDATE hit `rows_affected() == 0`. Retriable. Maps to `aborted`."
     },
     {
-      "crate": "rio-store",
-      "doc": "`realisations` insert hit `(drv_hash, output_name)` PK with a DIFFERENT `output_path` than the existing row. CA derivations are deterministic — same key, same output — so this means either a determinism bug or an attempted poison (pre-register `(public_hash → /nix/store/EVIL)`). NOT silently swallowed by `ON CONFLICT DO NOTHING`. Maps to `already_exists` + WARN.",
       "enum": "MetadataError",
+      "name": "RealisationConflict",
+      "crate": "rio-store",
       "msg": "realisation conflict: ({drv_hash}, {output_name}) already maps to {existing}, attempted {attempted}",
-      "name": "RealisationConflict"
+      "doc": "`realisations` insert hit `(drv_hash, output_name)` PK with a DIFFERENT `output_path` than the existing row. CA derivations are deterministic — same key, same output — so this means either a determinism bug or an attempted poison (pre-register `(public_hash → /nix/store/EVIL)`). NOT silently swallowed by `ON CONFLICT DO NOTHING`. Maps to `already_exists` + WARN."
     },
     {
-      "crate": "rio-store",
-      "doc": "Backpressure / quota exhaustion: PG pool timeout under load, signature count cap, or similar capacity conditions. Maps to `resource_exhausted`. Pool-timeout: retriable (transient). Sig-cap: per-path permanent — the UPDATE already committed and `DISTINCT` dedup means retry hits the same cardinality>cap forever (closer to `FAILED_PRECONDITION` semantics, but mapped here for now). Distinct from [`Connection`](Self::Connection): that's \"PG unreachable\" (connect failed, TCP reset, TLS error); this is \"PG reachable but at capacity\" (pool timed out waiting for a free connection). The gRPC code is different — `unavailable` tells clients to try another replica; `resource_exhausted` tells them to back off.",
       "enum": "MetadataError",
+      "name": "ResourceExhausted",
+      "crate": "rio-store",
       "msg": "resource exhausted: {0}",
-      "name": "ResourceExhausted"
+      "doc": "Backpressure / quota exhaustion: PG pool timeout under load, signature count cap, or similar capacity conditions. Maps to `resource_exhausted`. Pool-timeout: retriable (transient). Sig-cap: per-path permanent — the UPDATE already committed and `DISTINCT` dedup means retry hits the same cardinality>cap forever (closer to `FAILED_PRECONDITION` semantics, but mapped here for now). Distinct from [`Connection`](Self::Connection): that's \"PG unreachable\" (connect failed, TCP reset, TLS error); this is \"PG reachable but at capacity\" (pool timed out waiting for a free connection). The gRPC code is different — `unavailable` tells clients to try another replica; `resource_exhausted` tells them to back off."
     },
     {
-      "crate": "rio-store",
-      "doc": "Serialization failure (PG code 40001). Two transactions conflicted under REPEATABLE READ or SERIALIZABLE isolation. Retriable — the transaction was aborted cleanly, retry will likely succeed. Maps to `aborted`.",
       "enum": "MetadataError",
+      "name": "Serialization",
+      "crate": "rio-store",
       "msg": "serialization failure (retry)",
-      "name": "Serialization"
+      "doc": "Serialization failure (PG code 40001). Two transactions conflicted under REPEATABLE READ or SERIALIZABLE isolation. Retriable — the transaction was aborted cleanly, retry will likely succeed. Maps to `aborted`."
     },
     {
-      "crate": "rio-store",
-      "doc": "",
       "enum": "SignerError",
+      "name": "Base64",
+      "crate": "rio-store",
       "msg": "base64 decode failed: {0}",
-      "name": "Base64"
+      "doc": ""
     },
     {
-      "crate": "rio-store",
-      "doc": "",
       "enum": "SignerError",
+      "name": "EmptyName",
+      "crate": "rio-store",
       "msg": "key name is empty",
-      "name": "EmptyName"
+      "doc": ""
     },
     {
-      "crate": "rio-store",
-      "doc": "",
       "enum": "SignerError",
+      "name": "Format",
+      "crate": "rio-store",
       "msg": "key file format: expected 'name:base64', got {0} ':'-separated parts",
-      "name": "Format"
+      "doc": ""
     },
     {
-      "crate": "rio-store",
-      "doc": "",
       "enum": "SignerError",
+      "name": "Io",
+      "crate": "rio-store",
       "msg": "key file I/O: {0}",
-      "name": "Io"
+      "doc": ""
     },
     {
-      "crate": "rio-store",
-      "doc": "Nix's format is 64 bytes (seed + pubkey). We also accept just the 32-byte seed. Anything else is malformed.",
       "enum": "SignerError",
+      "name": "KeyLength",
+      "crate": "rio-store",
       "msg": "secret key must be 32 or 64 bytes, got {0}",
-      "name": "KeyLength"
+      "doc": "Nix's format is 64 bytes (seed + pubkey). We also accept just the 32-byte seed. Anything else is malformed."
     },
     {
-      "crate": "rio-store",
-      "doc": "DB lookup of a tenant's signing key failed. Stringified `MetadataError` — `metadata` is `pub(crate)`, so we can't put the typed error on a `pub` signature. The distinction between retriable (Connection) and permanent (InvariantViolation) is lost here; callers that care should hit `metadata::get_active_signer` directly. The cluster-key fallback (`tenant_id = None`) never touches the DB, so it never hits this variant.",
       "enum": "SignerError",
+      "name": "TenantKeyLookup",
+      "crate": "rio-store",
       "msg": "tenant key lookup: {0}",
-      "name": "TenantKeyLookup"
+      "doc": "DB lookup of a tenant's signing key failed. Stringified `MetadataError` — `metadata` is `pub(crate)`, so we can't put the typed error on a `pub` signature. The distinction between retriable (Connection) and permanent (InvariantViolation) is lost here; callers that care should hit `metadata::get_active_signer` directly. The cluster-key fallback (`tenant_id = None`) never touches the DB, so it never hits this variant."
     },
     {
-      "crate": "rio-store",
-      "doc": "Per-replica admission gate timed out (or closed). Transient — `Err` so moka does NOT cache it; the next caller after the burst clears retries cleanly.",
       "enum": "SubstituteError",
+      "name": "Admission",
+      "crate": "rio-store",
       "msg": "(transparent — delegates to inner error)",
-      "name": "Admission"
+      "doc": "Per-replica admission gate timed out (or closed). Transient — `Err` so moka does NOT cache it; the next caller after the burst clears retries cleanly."
     },
     {
-      "crate": "rio-store",
-      "doc": "Upstream HTTP request failed (connect, TLS, 5xx). The upstream URL is folded into the message for operator-side debugging.",
       "enum": "SubstituteError",
+      "name": "Fetch",
+      "crate": "rio-store",
       "msg": "upstream fetch failed: {0}",
-      "name": "Fetch"
+      "doc": "Upstream HTTP request failed (connect, TLS, 5xx). The upstream URL is folded into the message for operator-side debugging."
     },
     {
-      "crate": "rio-store",
-      "doc": "The ingested NAR's SHA-256 didn't match the narinfo's `NarHash:` line. Upstream served corrupt bytes (or lied in the narinfo).",
       "enum": "SubstituteError",
+      "name": "HashMismatch",
+      "crate": "rio-store",
       "msg": "NAR hash mismatch: expected {expected}, got {got}",
-      "name": "HashMismatch"
+      "doc": "The ingested NAR's SHA-256 didn't match the narinfo's `NarHash:` line. Upstream served corrupt bytes (or lied in the narinfo)."
     },
     {
-      "crate": "rio-store",
-      "doc": "Metadata-layer failure during ingest (write-ahead, complete_manifest, chunked S3/refcount).",
       "enum": "SubstituteError",
+      "name": "Ingest",
+      "crate": "rio-store",
       "msg": "ingest failed: {0}",
-      "name": "Ingest"
+      "doc": "Metadata-layer failure during ingest (write-ahead, complete_manifest, chunked S3/refcount)."
     },
     {
-      "crate": "rio-store",
-      "doc": "narinfo parse failed, or the `NarHash:` line didn't decode to a 32-byte SHA-256. Upstream served garbage.",
       "enum": "SubstituteError",
+      "name": "NarInfo",
+      "crate": "rio-store",
       "msg": "narinfo parse error: {0}",
-      "name": "NarInfo"
+      "doc": "narinfo parse failed, or the `NarHash:` line didn't decode to a 32-byte SHA-256. Upstream served garbage."
     },
     {
-      "crate": "rio-store",
-      "doc": "Transient placeholder-claim: another uploader holds the slot. Same-replica `try_substitute*` callers coalesce at the moka `inflight` singleflight and never reach `claim_placeholder` concurrently, so this only surfaces on **cross-replica** races (another rio-store pod) or a concurrent `PutPath`. Returned as `Err` (not `Ok(None)`) so moka does NOT cache it; the caller's retry re-runs `do_substitute` and reaches `AlreadyComplete` once the in-flight upload lands. gRPC maps to `NotFound` (the gateway's 2-attempt budget can't outlast a multi-second NAR fetch, so callers re-probe later).",
       "enum": "SubstituteError",
+      "name": "Raced",
+      "crate": "rio-store",
       "msg": "transient: concurrent uploader holds placeholder",
-      "name": "Raced"
+      "doc": "Transient placeholder-claim: another uploader holds the slot. Same-replica `try_substitute*` callers coalesce at the moka `inflight` singleflight and never reach `claim_placeholder` concurrently, so this only surfaces on **cross-replica** races (another rio-store pod) or a concurrent `PutPath`. Returned as `Err` (not `Ok(None)`) so moka does NOT cache it; the caller's retry re-runs `do_substitute` and reaches `AlreadyComplete` once the in-flight upload lands. gRPC maps to `NotFound` (the gateway's 2-attempt budget can't outlast a multi-second NAR fetch, so callers re-probe later)."
     },
     {
-      "crate": "rio-store",
-      "doc": "Transient upstream-429 (`r[store.substitute.probe-429-retry+2]`). `retry_after` is the parsed `Retry-After` header (delta-seconds or HTTP-date), `None` if absent or unparseable. Returned as `Err` so moka does NOT cache it; the admission permit is dropped on return so the wait happens caller-side without holding per-replica capacity. gRPC maps to `Unavailable` so the scheduler's 8-attempt backoff retries — a bare 429 (no `Retry-After`) is still a real rate-limit, NOT a miss.",
       "enum": "SubstituteError",
+      "name": "RateLimited",
+      "crate": "rio-store",
       "msg": "transient: upstream rate-limited (retry after {retry_after:?})",
-      "name": "RateLimited"
+      "doc": "Transient upstream-429 (`r[store.substitute.probe-429-retry+2]`). `retry_after` is the parsed `Retry-After` header (delta-seconds or HTTP-date), `None` if absent or unparseable. Returned as `Err` so moka does NOT cache it; the admission permit is dropped on return so the wait happens caller-side without holding per-replica capacity. gRPC maps to `Unavailable` so the scheduler's 8-attempt backoff retries — a bare 429 (no `Retry-After`) is still a real rate-limit, NOT a miss."
     },
     {
-      "crate": "rio-store",
-      "doc": "Decompressed NAR length differed from the narinfo's `NarSize:` line. Upstream lied; the Nix signature fingerprint includes `nar_size`, so persisting an unchecked size would store a row whose own signatures don't verify.",
       "enum": "SubstituteError",
+      "name": "SizeMismatch",
+      "crate": "rio-store",
       "msg": "NAR size mismatch: narinfo declared {declared}, got {actual} decompressed bytes",
-      "name": "SizeMismatch"
+      "doc": "Decompressed NAR length differed from the narinfo's `NarSize:` line. Upstream lied; the Nix signature fingerprint includes `nar_size`, so persisting an unchecked size would store a row whose own signatures don't verify."
     },
     {
-      "crate": "rio-store",
-      "doc": "An upstream-supplied body exceeded a size cap (narinfo, `/nix-cache-info`, declared `NarSize`, or decompressed NAR). `tenant_upstreams` rows are tenant-supplied; one tenant's hostile upstream must not OOM the process-global substituter.",
       "enum": "SubstituteError",
+      "name": "TooLarge",
+      "crate": "rio-store",
       "msg": "upstream {what} exceeds {limit}-byte cap",
-      "name": "TooLarge"
+      "doc": "An upstream-supplied body exceeded a size cap (narinfo, `/nix-cache-info`, declared `NarSize`, or decompressed NAR). `tenant_upstreams` rows are tenant-supplied; one tenant's hostile upstream must not OOM the process-global substituter."
+    }
+  ],
+  "enums": [
+    {
+      "name": "HmacError",
+      "crate": "rio-auth",
+      "doc": ""
+    },
+    {
+      "name": "JwtError",
+      "crate": "rio-auth",
+      "doc": ""
+    },
+    {
+      "name": "ExecutorError",
+      "crate": "rio-builder",
+      "doc": "Error type for executor operations. No `#[from] anyhow::Error` — every variant has a typed source. A catch-all `#[from] anyhow::Error` would mean any `?` on an anyhow::Result anywhere in execute_build silently becomes the wrong variant. Typed sources make the compiler catch misattribution at the `?` site."
+    },
+    {
+      "name": "OverlayError",
+      "crate": "rio-builder",
+      "doc": "Errors from overlay setup and teardown. Distinct from `anyhow::Error` so `ExecutorError::Overlay(#[from])` only catches overlay failures — a bare `?` on an unrelated `anyhow::Result` elsewhere in `execute_build` no longer silently becomes an \"overlay setup failed\" message."
+    },
+    {
+      "name": "UploadError",
+      "crate": "rio-builder",
+      "doc": "Errors from upload operations. NAR serialization happens inside the retry loop (each retry is a fresh disk read), so NAR errors surface as `UploadExhausted` wrapping a `tonic::Status::internal(\"NAR serialization failed...\")`."
+    },
+    {
+      "name": "NameError",
+      "crate": "rio-common",
+      "doc": "Construction-time rejection. The `Display` impl's message is what callers map to `Status::invalid_argument`."
+    },
+    {
+      "name": "Error",
+      "crate": "rio-controller",
+      "doc": "Top-level reconcile error. kube's `Controller::run` takes an `error_policy` fn that receives this and decides requeue timing. `Box` on the finalizer variant: `finalizer::Error<Self>` is recursive (it wraps our Error for ApplyFailed/CleanupFailed). Unboxed it's an infinite-size type. Box breaks the cycle with a pointer indirection."
+    },
+    {
+      "name": "GatewayError",
+      "crate": "rio-gateway",
+      "doc": "Typed errors for the handler layer. Converts to `anyhow::Error` at the boundary via `thiserror`'s `std::error::Error` impl + anyhow's blanket `From<E: Error>`. The outer handler signature remains `anyhow::Result<()>` — use `.into()` or `?` to convert."
+    },
+    {
+      "name": "StreamProcessError",
+      "crate": "rio-gateway",
+      "doc": "Error from `process_build_events`. Distinguishes transport errors and stream EOF-without-terminal (both reconnect-worthy failover signatures — see the per-variant docs) from `Wire` (client-side disconnect — not retried)."
+    },
+    {
+      "name": "DerivationError",
+      "crate": "rio-nix",
+      "doc": "Errors from parsing or hashing ATerm derivations."
+    },
+    {
+      "name": "DerivedPathError",
+      "crate": "rio-nix",
+      "doc": "Errors from parsing a `DerivedPath` string."
+    },
+    {
+      "name": "HandshakeError",
+      "crate": "rio-nix",
+      "doc": "Errors specific to the handshake."
+    },
+    {
+      "name": "HashError",
+      "crate": "rio-nix",
+      "doc": ""
+    },
+    {
+      "name": "NarError",
+      "crate": "rio-nix",
+      "doc": "Errors from NAR operations."
+    },
+    {
+      "name": "NarInfoError",
+      "crate": "rio-nix",
+      "doc": "Errors from narinfo parsing."
+    },
+    {
+      "name": "StorePathError",
+      "crate": "rio-nix",
+      "doc": ""
+    },
+    {
+      "name": "WireError",
+      "crate": "rio-nix",
+      "doc": ""
+    },
+    {
+      "name": "NarCollectError",
+      "crate": "rio-proto",
+      "doc": "Error from [`collect_nar_stream`] / [`collect_nar_stream_to_writer`]."
+    },
+    {
+      "name": "PathInfoValidationError",
+      "crate": "rio-proto",
+      "doc": ""
+    },
+    {
+      "name": "ActorError",
+      "crate": "rio-scheduler",
+      "doc": "Errors from the actor."
+    },
+    {
+      "name": "DagError",
+      "crate": "rio-scheduler",
+      "doc": "Errors from DAG operations."
+    },
+    {
+      "name": "ResolveError",
+      "crate": "rio-scheduler",
+      "doc": "Errors during CA input resolution."
+    },
+    {
+      "name": "TransitionError",
+      "crate": "rio-scheduler",
+      "doc": "Errors from state machine transitions. Lives in mod.rs (not derivation.rs or build.rs) because variants reference both `DerivationStatus` and `BuildState` — putting it in either submodule would create a dependency on the other."
+    },
+    {
+      "name": "AdmissionError",
+      "crate": "rio-store",
+      "doc": "Domain error from [`AdmissionGate::acquire_bounded`]. Kept tonic-free so [`crate::substitute::Substituter`] can hold the gate without pulling gRPC types into its error enum; the gRPC layer maps via `From<AdmissionError> for Status`."
+    },
+    {
+      "name": "ChunkError",
+      "crate": "rio-store",
+      "doc": "Error from `ChunkCache::get_verified`."
+    },
+    {
+      "name": "ManifestError",
+      "crate": "rio-store",
+      "doc": ""
+    },
+    {
+      "name": "MetadataError",
+      "crate": "rio-store",
+      "doc": "Typed error for the metadata/DB layer. Replaces `anyhow::Result` so callers can discriminate retriable failures (connection, serialization) from permanent ones (corruption) and map to precise gRPC status codes."
+    },
+    {
+      "name": "PersistError",
+      "crate": "rio-store",
+      "doc": "How [`persist_nar`] failed. The caller maps this to its own error domain (`tonic::Status` for gRPC, `SubstituteError` for substitution) and decides whether to [`abort_placeholder`]: the chunked path already rolled back internally."
+    },
+    {
+      "name": "SignerError",
+      "crate": "rio-store",
+      "doc": ""
+    },
+    {
+      "name": "SubstituteError",
+      "crate": "rio-store",
+      "doc": "Errors surfaced by the substitution path. Callers map these to gRPC status; `NotFound` is the normal miss case (no upstream has the path, or the tenant has no upstreams configured). `Clone` so moka's `try_get_with` can hand the same error to every coalesced waiter (it stores `Arc<E>` internally; we unwrap to owned)."
     }
   ]
 }

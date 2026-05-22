@@ -1,4 +1,9 @@
 {
+  "kinds": [
+    "ComponentScaler",
+    "NodeClaim",
+    "Pool"
+  ],
   "fields": {
     "ComponentScaler": [
       "targetRef",
@@ -33,10 +38,5 @@
       "seccompProfile",
       "hostNetwork"
     ]
-  },
-  "kinds": [
-    "ComponentScaler",
-    "NodeClaim",
-    "Pool"
-  ]
+  }
 }

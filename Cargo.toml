@@ -326,7 +326,13 @@ strum = { version = "0.28", features = ["derive"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order: schemars 1.x schemas are serde_json::Values, so the
+# committed config-schema fixtures (and docs/gen JSON) keep their key
+# order only while serde_json maps preserve insertion order. The feature
+# used to arrive transitively; once that enabler dropped out of the dep
+# graph, `BLESS=1` started rewriting fixtures alphabetically. Pin it
+# explicitly so snapshot order is deliberate, not an accident.
+serde_json = { version = "1", features = ["preserve_order"] }
 
 # Randomness (retry jitter)
 rand = "0.10"

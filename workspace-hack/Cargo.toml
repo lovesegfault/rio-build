@@ -98,7 +98,7 @@ scopeguard = { version = "1" }
 sec1 = { version = "0.8", features = ["ctutils", "pem", "std", "subtle"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
-serde_json = { version = "1", features = ["alloc", "raw_value"] }
+serde_json = { version = "1", features = ["alloc", "preserve_order", "raw_value"] }
 serde_spanned = { version = "1", default-features = false, features = ["serde", "std"] }
 sha1-93f6ce9d446188ac = { package = "sha1", version = "0.10", features = ["compress"] }
 sha1-a6292c17cd707f01 = { package = "sha1", version = "0.11" }
@@ -218,7 +218,7 @@ scopeguard = { version = "1" }
 sec1 = { version = "0.8", features = ["ctutils", "pem", "std", "subtle"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
-serde_json = { version = "1", features = ["alloc", "raw_value"] }
+serde_json = { version = "1", features = ["alloc", "preserve_order", "raw_value"] }
 serde_spanned = { version = "1", default-features = false, features = ["serde", "std"] }
 sha1-93f6ce9d446188ac = { package = "sha1", version = "0.10", features = ["compress"] }
 sha1-a6292c17cd707f01 = { package = "sha1", version = "0.11" }
