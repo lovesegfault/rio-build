@@ -221,7 +221,7 @@ pub struct LogBuffers {
     /// paths so a late `LogBatch` (still in flight on the
     /// BuildExecution stream after the worker sent CompletionReport)
     /// cannot recreate a buffer that the flusher already drained.
-    /// Cleared by [`LogFlusher::flush_final`] once the final resolves,
+    /// Cleared by `LogFlusher::flush_final` once the final resolves,
     /// by the discard-family reaps ([`Self::discard`], the empty-entry
     /// reaps, terminal cleanup), and by a cross-exec [`Self::set_exec`]
     /// restamp — the seal belongs to the execution being replaced.
@@ -1085,7 +1085,7 @@ impl LogBuffers {
     }
 
     /// Reverse [`Self::seal`]: re-open `drv_path` for pushes. Called by
-    /// [`LogFlusher::flush_final`]'s resolution arms (post-drain,
+    /// `LogFlusher::flush_final`'s resolution arms (post-drain,
     /// no-entry, already-finalized residue reap) and by the
     /// deferred-final retention-cap overflow drop to bound `sealed`.
     /// [`Self::discard`]-family reaps and a cross-exec [`Self::set_exec`]
