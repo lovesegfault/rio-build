@@ -389,7 +389,7 @@ directory, so a new proto file cannot ship without one.
   [`rustls`],
   [TLS provider selection],
   [3],
-  [Direct dep to call `install_default()`: kube pulls rustls via ring, aws-sdk via aws-lc-rs; with both active, rustls 0.23 panics on first TLS use.],
+  [Direct dep to call `install_default()`: the workspace links a single `aws-lc-rs` provider (kube is `default-features = false` + `aws-lc-rs`); the explicit install is defensive — a future transitive `ring` revival would otherwise re-create the rustls 0.23 dual-provider panic on first TLS use.],
 
   [`cargo-deny`],
   [License auditing, security advisories],
@@ -399,7 +399,7 @@ directory, so a new proto file cannot ship without one.
   [`opentelemetry` + `opentelemetry-otlp`],
   [OTLP pipeline],
   [2 (done)],
-  [Full OTLP/gRPC via `opentelemetry-otlp` 0.31, batch processor, `ParentBased(TraceIdRatioBased)` sampler. `RIO_OTEL_ENDPOINT` gate; unset = zero overhead. VM test uses Tempo (not Jaeger — not packaged in nixpkgs); OTLP works with both.],
+  [Full OTLP/gRPC via `opentelemetry-otlp`, batch processor, `ParentBased(TraceIdRatioBased)` sampler. `RIO_OTEL_ENDPOINT` gate; unset = zero overhead. VM test uses Tempo (not Jaeger — not packaged in nixpkgs); OTLP works with both.],
 
   [TypeScript/Svelte/Vite],
   [Web dashboard],
@@ -423,7 +423,7 @@ directory, so a new proto file cannot ship without one.
 
 - gRPC over HTTP/2 defeats L4 load balancers. Use a K8s headless Service + client-side DNS resolution, or an L7 proxy for inter-component gRPC.
 - kube-rs: status updates trigger watch events — use conditional updates to avoid infinite reconcile loops.
-- rustls dual-provider panic: kube pulls ring, aws-sdk pulls aws-lc-rs. With both features active, rustls 0.23 can't auto-select a `CryptoProvider` and panics at first TLS use. `rio_common::server::bootstrap()` calls `rustls::crypto::aws_lc_rs::default_provider().install_default()` as its first step before any TLS use.
+- rustls `CryptoProvider` selection: the workspace links a single `aws-lc-rs` provider (kube is `default-features = false` + `aws-lc-rs`, matching aws-sdk and the rest of the TLS stack). `rio_common::server::bootstrap()` still calls `rustls::crypto::aws_lc_rs::default_provider().install_default()` as its first step — a guard against a transitive dep re-enabling `ring`, which would re-create the rustls 0.23 dual-provider panic at first TLS use.
 - `rio-nix` implements the Nix protocol from scratch — reference Snix docs, Tweag blog, and Nix C++ source for protocol details. Target protocol version 1.35+ (Nix 2.18+ / Lix).
 
 == Risk Notes

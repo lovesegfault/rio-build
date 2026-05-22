@@ -10,7 +10,7 @@
 # `spec.resources.requests`) on a 2s/5s delay. That's the subset of
 # Karpenter behavior the reconciler observes: `LiveNode::from` reads
 # `status.allocatable`/`conditions`, `boot_secs()` records into the
-# DDSketch, `placeable` publishes.
+# lead-time sketch (HdrHistogram), `placeable` publishes.
 #
 # `kube-scheduler` (matching the `pins.nix` minor) is preloaded so
 # `buildScheduler.enabled=true` renders a working second-scheduler
@@ -185,7 +185,7 @@ let
   #     for) + `status.providerID` so the claim looks Karpenter-real.
   #   nodeclaim-registered 3s after: Launched=True ∧ no Registered →
   #     Registered=True + `status.nodeName=kwok-<nc>`. 5s−0s ≈
-  #     boot_secs → DDSketch records ~5, lead_time gauge ~5 once one
+  #     boot_secs → boot sketch records ~5, lead_time gauge ~5 once one
   #     claim cycles.
   #   nodeclaim-initialized 2s after: Registered=True → Initialized=
   #     True. `LiveNode` doesn't read it but `kubectl get nodeclaim`'s

@@ -190,9 +190,9 @@ spec:
             k8s:app.kubernetes.io/name: rio-store
       toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
     {{- if .Values.global.postgresCidr }}
-    # nodeclaim_pool reconciler persists DDSketch lead-time + idle-gap
-    # to PG (B5 `nodeclaim_lead_time` table). Mirrors the scheduler/
-    # store toCIDR rule.
+    # nodeclaim_pool reconciler persists HdrHistogram lead-time +
+    # idle-gap sketches to PG (`nodeclaim_cell_state`, migration 059).
+    # Mirrors the scheduler/store toCIDR rule.
     - toCIDR:
         - {{ .Values.global.postgresCidr | quote }}
       toPorts: [{ports: [{port: "5432", protocol: TCP}]}]

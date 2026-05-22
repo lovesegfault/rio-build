@@ -138,8 +138,9 @@ macro_rules! jail_defaults {
 /// Nix sandbox, so the write branch never runs against a read-only path.
 ///
 /// Comparison is `serde_json::Value::==` after parsing both sides —
-/// `Value::Object` is BTreeMap-backed (the workspace doesn't unify
-/// `preserve_order`), so source key order never causes a false mismatch.
+/// `Map`'s `PartialEq` is key-based (order-insensitive, with or without
+/// the workspace-pinned `preserve_order`), so source key order never
+/// causes a false mismatch.
 #[macro_export]
 macro_rules! config_schema_frozen {
     ($ty:ty) => {
