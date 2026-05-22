@@ -2210,8 +2210,10 @@ one model tick less separation and a dual-belief state is reachable. The
 residual is a clock that pauses for longer than the budget (suspend, a long
 GC, a frozen VM) --- no fence/steal separation closes that, and
 #rref("sched.lease.generation-fence+2") is the backstop. The compile-time
-assertions on the rio-lease constants pin the derivations and the margin
-condition so no constant moves without the others.
+assertions on the rio-lease constants pin the derivations, the margin
+condition, and the response-anchoring premise (the renew attempt deadline
+keeps the response-anchored fence within the commit-anchored bound the
+model assumes) so no constant moves without the others.
 
 #r("sched.lease.standby-drops-writes")[
   A replica that has lost the lease MUST NOT write scheduler-owned PG state

@@ -147,9 +147,14 @@ const RENEW_SLOP: Duration = Duration::from_secs(2);
 /// the apiserver COMMIT of its last renew, while production stamps
 /// `last_successful_renew` at the RESPONSE arrival; that is sound
 /// because renew attempts start exactly on interval ticks and the send
-/// precedes the commit, so the anchoring renew's response latency cannot
+/// precedes the commit, so the anchoring renew's response can lag its
+/// commit by at most the attempt deadline (RENEW_INTERVAL − RENEW_SLOP),
+/// and that deadline stays strictly under the gap from SELF_FENCE_AFTER
+/// up to the next RENEW_INTERVAL multiple — equivalently RENEW_SLOP >
+/// SELF_FENCE_AFTER mod RENEW_INTERVAL — so the response lag cannot
 /// push the firing tick past the commit-anchored bound (commit +
-/// SELF_FENCE_AFTER + RENEW_INTERVAL) the model assumes. What remains of
+/// SELF_FENCE_AFTER + RENEW_INTERVAL) the model assumes; that arithmetic
+/// premise is pinned by the const assert below. What remains of
 /// the separation is a 1.5s one-sided clock-skew budget — far above NTP
 /// drift on cloud nodes. A clock pause longer than that re-opens the
 /// window, which is the impossibility result the generation fence
@@ -202,6 +207,19 @@ const _: () = {
     assert!(
         RENEW_SLOP.as_secs() > 0,
         "the renew attempt deadline must be strictly shorter than RENEW_INTERVAL"
+    );
+    // The response-anchoring premise in FENCE_MARGIN's doc: production
+    // stamps last_successful_renew at the renew RESPONSE, which can lag
+    // the apiserver commit by up to the attempt deadline
+    // (RENEW_INTERVAL - RENEW_SLOP). The tick-grid fence checks — the
+    // only cadence the apiserver cannot delay; the error-arm re-check
+    // only fires earlier — then stay within the commit-anchored bound
+    // the model assumes (commit + SELF_FENCE_AFTER + RENEW_INTERVAL)
+    // only while that deadline is strictly under the gap from
+    // SELF_FENCE_AFTER up to the next tick multiple.
+    assert!(
+        RENEW_SLOP.as_secs() > SELF_FENCE_AFTER.as_secs() % RENEW_INTERVAL.as_secs(),
+        "the renew attempt deadline must keep the response-anchored self-fence within the model's commit-anchored bound"
     );
     // The leader must get at least one renew attempt before fencing.
     assert!(
