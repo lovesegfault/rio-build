@@ -8,6 +8,19 @@ use super::*;
 use rio_common::config::ValidateConfig as _;
 use rstest::rstest;
 
+/// Merge `toml` over the compiled defaults the same way the loader's
+/// defaults+TOML layers do (no env/CLI layers) — the shape every raw
+/// config-merge test in this module needs.
+fn merge_toml_over_defaults(toml: &str) -> Config {
+    ::config::Config::builder()
+        .add_source(rio_common::config::serialized_layer(&Config::default()).unwrap())
+        .add_source(::config::File::from_str(toml, ::config::FileFormat::Toml))
+        .build()
+        .unwrap()
+        .try_deserialize::<Config>()
+        .unwrap()
+}
+
 #[test]
 fn config_defaults_are_stable() {
     let d = Config::default();
@@ -66,13 +79,7 @@ fn poison_and_retry_load_from_toml() {
         backoff_max_secs = 600.0
         jitter_fraction = 0.1
     "#;
-    let cfg: Config = ::config::Config::builder()
-        .add_source(rio_common::config::serialized_layer(&Config::default()).unwrap())
-        .add_source(::config::File::from_str(toml, ::config::FileFormat::Toml))
-        .build()
-        .unwrap()
-        .try_deserialize::<Config>()
-        .unwrap();
+    let cfg: Config = merge_toml_over_defaults(toml);
 
     assert_eq!(cfg.poison.threshold, 5);
     assert!(!cfg.poison.require_distinct_workers);
@@ -90,13 +97,7 @@ fn soft_features_load_from_toml() {
     let toml = r#"
         soft_features = ["big-parallel", "benchmark"]
     "#;
-    let cfg: Config = ::config::Config::builder()
-        .add_source(rio_common::config::serialized_layer(&Config::default()).unwrap())
-        .add_source(::config::File::from_str(toml, ::config::FileFormat::Toml))
-        .build()
-        .unwrap()
-        .try_deserialize::<Config>()
-        .unwrap();
+    let cfg: Config = merge_toml_over_defaults(toml);
     assert_eq!(cfg.soft_features, ["big-parallel", "benchmark"]);
 }
 
@@ -143,13 +144,7 @@ fn sla_globals_unset_in_toml_extract_as_none() {
         [[sla.tiers]]
         name = "normal"
     "#;
-    let cfg: Config = ::config::Config::builder()
-        .add_source(rio_common::config::serialized_layer(&Config::default()).unwrap())
-        .add_source(::config::File::from_str(toml, ::config::FileFormat::Toml))
-        .build()
-        .unwrap()
-        .try_deserialize::<Config>()
-        .unwrap();
+    let cfg: Config = merge_toml_over_defaults(toml);
     assert_eq!(
         cfg.sla.max_cores, None,
         "max_cores absent from TOML must extract as None (§13c-3 \
@@ -218,27 +213,12 @@ fn config_default_is_not_bootable_without_sla_source() {
 /// with no `[poison]`/`[retry]` tables continue unchanged.
 #[test]
 fn poison_and_retry_default_when_absent() {
-    let cfg: Config = ::config::Config::builder()
-        .add_source(rio_common::config::serialized_layer(&Config::default()).unwrap())
-        .add_source(::config::File::from_str("", ::config::FileFormat::Toml))
-        .build()
-        .unwrap()
-        .try_deserialize::<Config>()
-        .unwrap();
+    let cfg: Config = merge_toml_over_defaults("");
     assert_eq!(cfg.poison, rio_scheduler::PoisonConfig::default());
     assert_eq!(cfg.retry, rio_scheduler::RetryPolicy::default());
     // Partial table: one field set, others default from the
     // struct-level `#[serde(default)]` on PoisonConfig.
-    let partial: Config = ::config::Config::builder()
-        .add_source(rio_common::config::serialized_layer(&Config::default()).unwrap())
-        .add_source(::config::File::from_str(
-            "[poison]\nthreshold = 7",
-            ::config::FileFormat::Toml,
-        ))
-        .build()
-        .unwrap()
-        .try_deserialize::<Config>()
-        .unwrap();
+    let partial: Config = merge_toml_over_defaults("[poison]\nthreshold = 7");
     assert_eq!(partial.poison.threshold, 7);
     assert!(
         partial.poison.require_distinct_workers,
@@ -850,13 +830,7 @@ fn dashboard_loads_from_toml_and_splits_origins() {
         [dashboard]
         cors_allow_origins = "http://a.example,http://b.example"
     "#;
-    let cfg: Config = ::config::Config::builder()
-        .add_source(rio_common::config::serialized_layer(&Config::default()).unwrap())
-        .add_source(::config::File::from_str(toml, ::config::FileFormat::Toml))
-        .build()
-        .unwrap()
-        .try_deserialize::<Config>()
-        .unwrap();
+    let cfg: Config = merge_toml_over_defaults(toml);
     assert_eq!(
         cfg.dashboard.cors_allow_origins,
         "http://a.example,http://b.example"
