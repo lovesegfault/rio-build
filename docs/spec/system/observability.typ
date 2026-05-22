@@ -101,9 +101,11 @@ can be finalized by the cancel/dependency-failure sweep. In-memory state alone
 cannot distinguish the two, so the flusher consults the row before uploading:
 an already-complete row means the durable record is authoritative, and any
 retained lines it lacks fall within the accepted periodic-flush failover-loss
-bound. The UPSERT monotonicity latch alone is not sufficient --- it only
-refuses `is_complete` downgrades, and the S3 PUT precedes the row write
-entirely.
+bound. The UPSERT latch alone is not sufficient --- it freezes a finalized
+row (any later flush write against it is refused, downgrade and
+re-finalization alike), but the S3 PUT precedes the row write entirely, so a
+stale re-finalization would still overwrite the final blob in place while the
+frozen row keeps pointing at it.
 When the row cannot be consulted at all (the lookup itself fails), the flusher
 fails closed: the final flush is deferred --- the buffer is left to the periodic
 snapshotter and the terminal-cleanup reaper rather than uploaded blind ---
