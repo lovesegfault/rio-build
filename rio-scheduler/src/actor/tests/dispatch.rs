@@ -342,7 +342,7 @@ async fn test_generation_consistent_between_heartbeat_and_assignment() -> TestRe
     assert_eq!(
         assignment.generation,
         handle.leader_generation(),
-        "WorkAssignment and the raw acquire-edge generation read the same atomic"
+        "WorkAssignment and the raw (not recovery-gated) generation read the same atomic"
     );
     assert_eq!(
         assignment.generation,
@@ -375,9 +375,10 @@ async fn test_generation_starts_at_one_not_zero() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
     // Not dispatching anything — just reading the reader directly.
-    // leader_generation() is the raw acquire-edge value; the heartbeat
-    // carries advertised_generation(), which equals it here because the
-    // always-leader fixture constructs recovery_complete = true.
+    // leader_generation() is the raw (not recovery-gated) value; the
+    // heartbeat carries advertised_generation(), which equals it here
+    // because the always-leader fixture constructs
+    // recovery_complete = true.
     assert_eq!(
         handle.leader_generation(),
         1,

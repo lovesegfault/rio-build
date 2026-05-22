@@ -962,9 +962,9 @@ impl BackpressureReader {
 /// Read-only view of the leader generation counter.
 ///
 /// Same pattern as [`BackpressureReader`]: the writers (the lease
-/// task's `on_acquire` deriving from the Lease's transition count, and
-/// recovery's PG-floor seed — both `fetch_max` on the inner Arc) only
-/// ever raise it; everyone else observes. The two worker-visible
+/// task's `on_acquire`/`on_rebound` deriving from the Lease's
+/// transition count, and recovery's PG-floor seed — all `fetch_max` on
+/// the inner Arc) only ever raise it; everyone else observes. The two worker-visible
 /// consumers are gated on the same recovery condition:
 /// `WorkAssignment.generation` reads the raw value actor-side
 /// (dispatch.rs) and is gated by `dispatch_ready`;
@@ -994,10 +994,9 @@ impl GenerationReader {
         Self { generation, leader }
     }
 
-    /// Current leader generation — the raw acquire-edge value,
-    /// regardless of recovery state. For callers that genuinely need
-    /// the recovery-independent value (currently tests only); the
-    /// worker-visible heartbeat payload reads
+    /// Current leader generation — the raw (not recovery-gated) value.
+    /// For callers that genuinely need the ungated value (currently
+    /// tests only); the worker-visible heartbeat payload reads
     /// [`advertised`](Self::advertised) instead.
     pub fn get(&self) -> u64 {
         self.generation.load(Ordering::Acquire)

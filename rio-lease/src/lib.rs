@@ -313,7 +313,9 @@ impl LeaseConfig {
 /// can never compare equal to a recorded `acquired_transitions`.
 const RECOVERY_NOT_COMPLETE: u64 = u64::MAX;
 
-/// Shared leader state. The lease task writes; actor + health read.
+/// Shared leader state. Written by the lease task and by the embedding
+/// service's recovery path (generation seed + epoch-keyed completion
+/// stamp); readers span dispatch gating, heartbeats, and health.
 ///
 /// The atomics — generation, acquired_transitions, is_leader, and the
 /// epoch-keyed completion stamp behind `recovery_complete()` —

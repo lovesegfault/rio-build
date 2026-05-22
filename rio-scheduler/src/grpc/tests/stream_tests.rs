@@ -1723,7 +1723,7 @@ async fn heartbeat_advertises_generation_only_after_recovery_complete() -> anyho
     );
     assert_eq!(
         resp.generation, 0,
-        "an incomplete recovery must advertise the 0 sentinel, not the acquire-edge value"
+        "an incomplete recovery must advertise the 0 sentinel, not the raw generation"
     );
 
     // Recovery completes → the post-recovery generation is advertised

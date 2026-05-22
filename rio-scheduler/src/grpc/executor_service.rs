@@ -809,7 +809,8 @@ impl ExecutorService for SchedulerGrpc {
             // information), the post-recovery generation after. Same
             // Arc<AtomicU64> the actor reads for
             // WorkAssignment.generation (dispatch.rs single-load); the
-            // lease task writes it on each leadership acquisition.
+            // lease task writes it on each leadership acquisition, and
+            // recovery's PG-floor seed can raise it.
             // Non-K8s mode: always-leader state is constructed with
             // recovery already complete, so this stays the raw value
             // (1) there. The RPC itself stays available during recovery

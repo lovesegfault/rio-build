@@ -80,11 +80,12 @@ pub struct ActorHandle {
     /// send() and is_backpressured(). Without hysteresis, the handle used a
     /// simple threshold -> flapping under load near 80%.
     pub(super) backpressure: BackpressureReader,
-    /// Leader generation reader. The lease task writes the underlying
-    /// Arc; the gRPC layer reads the recovery-gated view via
-    /// `advertised_generation()` for `HeartbeatResponse`, and
-    /// `leader_generation()` exposes the raw acquire-edge value. See
-    /// [`GenerationReader`] for ordering semantics.
+    /// Leader generation reader. The lease task and recovery's
+    /// PG-floor seed write the underlying Arc; the gRPC layer reads
+    /// the recovery-gated view via `advertised_generation()` for
+    /// `HeartbeatResponse`, and `leader_generation()` exposes the raw
+    /// (not recovery-gated) value. See [`GenerationReader`] for
+    /// ordering semantics.
     pub(super) generation: GenerationReader,
     /// Cached [`ClusterSnapshot`], refreshed each `Tick`. See
     /// [`ActorHandle::cluster_snapshot_cached`].
@@ -166,11 +167,11 @@ impl ActorHandle {
         self.snapshot_rx.borrow().clone()
     }
 
-    /// Current leader generation — the raw acquire-edge value,
-    /// independent of recovery state. NOT what the heartbeat reply
-    /// carries (that is [`advertised_generation`](Self::advertised_generation));
-    /// this serves tests and any future debug surface that wants the
-    /// recovery-independent value.
+    /// Current leader generation — the raw (not recovery-gated) value.
+    /// NOT what the heartbeat reply carries (that is
+    /// [`advertised_generation`](Self::advertised_generation)); this
+    /// serves tests and any future debug surface that wants the value
+    /// without the recovery gate.
     pub fn leader_generation(&self) -> u64 {
         self.generation.get()
     }

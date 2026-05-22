@@ -434,7 +434,11 @@ pub struct DagActor {
     /// `fetch_max` placed after the TOCTOU gate) and writes the
     /// epoch-keyed completion stamp via
     /// [`LeaderState::set_recovery_complete`] /
-    /// [`LeaderState::invalidate_recovery_completion`]; everything else is
+    /// [`LeaderState::invalidate_recovery_completion`]; the lease task
+    /// additionally advances the renew-round counters
+    /// ([`LeaderState::begin_renew_round`] /
+    /// [`LeaderState::confirm_leading_round`]) that the
+    /// bump-confirmation wait reads back; everything else is
     /// `SeqCst`/`Acquire` reads. See [`LeaderState`] for the
     /// multi-field ordering rationale.
     ///

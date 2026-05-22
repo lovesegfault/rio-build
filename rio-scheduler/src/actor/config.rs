@@ -90,9 +90,10 @@ pub struct DagActorPlumbing {
     /// degrades to local-presence-only —
     /// `r[sched.dispatch.fod-substitute]`.
     pub service_signer: Option<Arc<rio_auth::hmac::HmacSigner>>,
-    /// Leader-election shared state. The lease task writes
-    /// `is_leader`/`generation`; the actor reads both and writes
-    /// `recovery_complete`. Non-K8s/test default is
+    /// Leader-election shared state. Same Arcs as the actor's
+    /// `DagActor::leader` field — see that field's doc and
+    /// [`LeaderState`] for the full writer split (lease task vs
+    /// recovery path). Non-K8s/test default is
     /// [`LeaderState::always_leader`].
     pub leader: LeaderState,
     /// This replica's lease holder identity (the pod name), recorded on
