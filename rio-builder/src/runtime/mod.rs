@@ -2869,6 +2869,35 @@ mod fence_tests {
         assert!(ready.load(Ordering::Relaxed));
     }
 
+    /// `HeartbeatResponse.generation == 0` is the proto-unset / "leader
+    /// still recovering" sentinel (sched.lease.claim-before-advertise):
+    /// it must leave a non-zero fence untouched while still flipping
+    /// readiness on an accepted heartbeat. Pins the sentinel as a
+    /// contract — a future "treat 0 as a reset" refactor goes red here.
+    // r[verify sched.lease.claim-before-advertise]
+    #[test]
+    fn heartbeat_gen_zero_sentinel_keeps_fence() {
+        let g = AtomicU64::new(2);
+        let ready = AtomicBool::new(false);
+        apply_heartbeat_response(
+            Ok(HeartbeatResponse {
+                accepted: true,
+                generation: 0,
+            }),
+            &ready,
+            &g,
+        );
+        assert_eq!(
+            g.load(Ordering::Relaxed),
+            2,
+            "the 0 sentinel must not move the fence"
+        );
+        assert!(
+            ready.load(Ordering::Relaxed),
+            "accepted=true still flips readiness during the leader's recovery window"
+        );
+    }
+
     /// `accepted=false` (scheduler reachable but rejecting us) MUST
     /// NOT advance the generation fence. Kills a hypothetical "remove
     /// `if resp.accepted` guard" mutant — without the guard, a

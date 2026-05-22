@@ -80,8 +80,10 @@ pub struct ActorHandle {
     /// send() and is_backpressured(). Without hysteresis, the handle used a
     /// simple threshold -> flapping under load near 80%.
     pub(super) backpressure: BackpressureReader,
-    /// Leader generation for `HeartbeatResponse`. Lease task writes,
-    /// gRPC layer reads via `leader_generation()`. See
+    /// Leader generation reader. The lease task writes the underlying
+    /// Arc; the gRPC layer reads the recovery-gated view via
+    /// `advertised_generation()` for `HeartbeatResponse`, and
+    /// `leader_generation()` exposes the raw acquire-edge value. See
     /// [`GenerationReader`] for ordering semantics.
     pub(super) generation: GenerationReader,
     /// Cached [`ClusterSnapshot`], refreshed each `Tick`. See
@@ -164,14 +166,26 @@ impl ActorHandle {
         self.snapshot_rx.borrow().clone()
     }
 
-    /// Current leader generation for `HeartbeatResponse.generation`.
-    ///
-    /// Workers compare this against `WorkAssignment.generation` to
-    /// detect stale assignments after leader failover. Both reads come
-    /// from the same `Arc<AtomicU64>` (actor for WorkAssignment, handle
-    /// for heartbeat) so they agree modulo the atomic-load instant.
+    /// Current leader generation — the raw acquire-edge value,
+    /// independent of recovery state. NOT what the heartbeat reply
+    /// carries (that is [`advertised_generation`](Self::advertised_generation));
+    /// this serves tests and any future debug surface that wants the
+    /// recovery-independent value.
     pub fn leader_generation(&self) -> u64 {
         self.generation.get()
+    }
+
+    /// The worker-visible generation for `HeartbeatResponse.generation`:
+    /// carries 0 (the proto-unset sentinel) until the leader's recovery
+    /// completes, then the post-recovery generation. Workers compare it
+    /// against `WorkAssignment.generation` to detect stale assignments
+    /// after leader failover; both ultimately read the same
+    /// `Arc<AtomicU64>` (actor for WorkAssignment, handle for
+    /// heartbeat), and both are gated on the same recovery condition
+    /// (`dispatch_ready` for assignments, this accessor for the
+    /// heartbeat payload).
+    pub fn advertised_generation(&self) -> u64 {
+        self.generation.advertised()
     }
 
     /// Send a command without backpressure check (for worker lifecycle events).

@@ -2332,7 +2332,10 @@ generation-collision counterexample preserved in
 `docs/spec/models/leaderElection.qnt`'s history). The
 transition count is the epoch source only while the Lease object exists;
 #rref("sched.lease.generation-claim") extends the distinctness guarantee
-across Lease-object deletion.
+across Lease-object deletion. Executor-side _arming_ of this fence is deferred
+until the new leader's recovery completes
+(#rref("sched.lease.claim-before-advertise")); the interim is covered by the
+idempotent-writes pricing above.
 
 #memo(title: [Optional future hardening])[
   If stricter at-most-one-writer semantics are needed, add a `scheduler_meta`
@@ -2389,6 +2392,42 @@ destroyed --- reaches a collision. Those conjunctions are the documented
 residuals; that regime's module header records the procedure for re-deriving
 them, and the trace evidence lives in that regime's introducing commit
 message.
+
+#r("sched.lease.claim-before-advertise")[
+  A newly-acquired leader MUST NOT advertise a leadership generation to
+  executors while its recovery is incomplete: `HeartbeatResponse.generation`
+  MUST carry 0 --- the proto-unset sentinel, a no-op for the executor's
+  `fetch_max` fence latch --- from lease acquisition until recovery completes,
+  and the leader's post-recovery generation only after.
+]
+
+The executor fence only rises. An advertised-but-unclaimed generation latched
+from a leader that dies mid-recovery is recorded nowhere durable, so after a
+Lease deletion the surviving previous holder legitimately retains its lower
+claimed generation (per the retain behavior of
+#rref("sched.recovery.fetch-max-seed")) and the latched workers silently
+reject every assignment of the active leader until the next holder change or a
+worker restart. Gating the advertisement keeps "what a worker can latch"
+inside "what the durable floor covers". The rule is named for the claim
+association: the claim INSERT precedes `set_recovery_complete()`
+(#rref("sched.lease.generation-claim")), so on the non-degraded path the
+advertised generation is always durably claimed. The degraded paths inherit
+the existing pricing rather than new pricing: a claim-write failure or
+claim-conflict exhaustion proceeds unclaimed, and a recovery (DAG-load)
+failure completes with no claim attempted --- in each case that one term
+advertises an unclaimed generation, the same one-term residual already priced
+for the claim machinery above. The trade-off is that fence arming is deferred:
+workers learn the new generation only after the new leader's recovery
+completes, plus up to one heartbeat interval, so a paused-and-deposed
+ex-leader's stale assignments are not generation-rejected during that window
+--- covered by the existing #rref("sched.lease.generation-fence") pricing (the
+new leader dispatches nothing before recovery completes, since dispatch gates
+on the same flag, and brief dual-writer windows do not corrupt state).
+Rejecting heartbeats outright during recovery is deliberately not done ---
+executor re-registration and readiness must proceed while the new leader
+recovers; only the generation payload is withheld. Non-K8s single-scheduler
+deployments construct `LeaderState` with recovery already complete, so they
+never emit the sentinel.
 
 #r("sched.lease.graceful-release")[
   On graceful shutdown (SIGTERM), if the lease loop was leading, it calls

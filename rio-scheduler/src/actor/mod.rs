@@ -1354,12 +1354,17 @@ impl DagActor {
         BackpressureReader::new(Arc::clone(&self.backpressure_active))
     }
 
-    /// Clone the generation counter as a read-only reader for
-    /// `ActorHandle::leader_generation()`. The lease task holds a
+    /// Clone the generation counter (and the recovery-complete flag its
+    /// advertised view is gated on) as a read-only reader for
+    /// `ActorHandle::leader_generation()` /
+    /// `ActorHandle::advertised_generation()`. The lease task holds a
     /// direct `Arc<AtomicU64>` clone for writing — not through this
     /// reader. The reader type has no store/fetch_add methods, so
     /// handle consumers can't accidentally increment.
     pub(crate) fn generation_reader(&self) -> GenerationReader {
-        GenerationReader::new(self.leader.generation_arc())
+        GenerationReader::new(
+            self.leader.generation_arc(),
+            self.leader.recovery_complete_arc(),
+        )
     }
 }

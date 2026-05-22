@@ -802,10 +802,21 @@ impl ExecutorService for SchedulerGrpc {
 
         Ok(Response::new(rio_proto::types::HeartbeatResponse {
             accepted: true,
-            // Same Arc<AtomicU64> the actor reads for WorkAssignment.generation
-            // (dispatch.rs single-load). The lease task writes on each
-            // leadership acquisition. Non-K8s mode: stays at 1.
-            generation: self.actor.leader_generation(),
+            // r[impl sched.lease.claim-before-advertise]
+            // The generation advertised here is gated on recovery
+            // completion: 0 during the recovery window (the proto-unset
+            // sentinel — workers' fetch_max latch treats it as no
+            // information), the post-recovery generation after. Same
+            // Arc<AtomicU64> the actor reads for
+            // WorkAssignment.generation (dispatch.rs single-load); the
+            // lease task writes it on each leadership acquisition.
+            // Non-K8s mode: always-leader state is constructed with
+            // recovery already complete, so this stays the raw value
+            // (1) there. The RPC itself stays available during recovery
+            // on purpose — rejecting heartbeats would break executor
+            // re-registration and readiness while the new leader
+            // recovers; only the generation payload is withheld.
+            generation: self.actor.advertised_generation(),
         }))
     }
 }

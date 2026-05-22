@@ -418,7 +418,10 @@ message HeartbeatRequest {
 
 message HeartbeatResponse {
   bool accepted = 1;                      // Whether the scheduler accepted the heartbeat
-  uint64 generation = 2;                  // Current leader generation
+  // Current leader generation. 0 = unset / leader still recovering:
+  // executors treat 0 as no information (their fetch_max fence latch
+  // ignores it) and only latch the post-recovery value.
+  uint64 generation = 2;
 }
 
 // ───────────────────────────────────────────────────────────────────────────

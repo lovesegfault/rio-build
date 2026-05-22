@@ -949,9 +949,13 @@ impl BackpressureReader {
 /// Same pattern as [`BackpressureReader`]: the writers (the lease
 /// task's `on_acquire` deriving from the Lease's transition count, and
 /// recovery's PG-floor seed — both `fetch_max` on the inner Arc) only
-/// ever raise it; everyone else observes. `HeartbeatResponse.generation`
-/// and `WorkAssignment.generation` both read from here — workers
-/// compare to detect stale assignments after leader failover.
+/// ever raise it; everyone else observes. The two worker-visible
+/// consumers are gated on the same recovery condition:
+/// `WorkAssignment.generation` reads the raw value actor-side
+/// (dispatch.rs) and is gated by `dispatch_ready`;
+/// `HeartbeatResponse.generation` reads [`advertised`](Self::advertised)
+/// — workers compare the two to detect stale assignments after leader
+/// failover.
 ///
 /// `Acquire` not `Relaxed`: the generation is a fence. When the lease
 /// task acquires leadership and writes the new generation, it also
@@ -961,19 +965,51 @@ impl BackpressureReader {
 /// the pairing with the lease task's RMW explicit.
 ///
 /// Starts at 1 (not 0): generation=0 is the proto-default, so a worker
-/// receiving `generation=0` knows the field was unset (old scheduler)
-/// rather than "first generation." Non-K8s mode (no lease) stays at 1
-/// forever — correct for a single scheduler.
+/// receiving `generation=0` knows the field was unset (or the leader is
+/// still recovering) rather than "first generation." Non-K8s mode (no
+/// lease) stays at 1 forever — correct for a single scheduler.
 #[derive(Clone)]
-pub struct GenerationReader(Arc<AtomicU64>);
+pub struct GenerationReader {
+    generation: Arc<AtomicU64>,
+    recovery_complete: Arc<AtomicBool>,
+}
 
 impl GenerationReader {
-    pub(super) fn new(inner: Arc<AtomicU64>) -> Self {
-        Self(inner)
+    pub(super) fn new(generation: Arc<AtomicU64>, recovery_complete: Arc<AtomicBool>) -> Self {
+        Self {
+            generation,
+            recovery_complete,
+        }
     }
 
-    /// Current leader generation.
+    /// Current leader generation — the raw acquire-edge value,
+    /// regardless of recovery state. For callers that genuinely need
+    /// the recovery-independent value (currently tests only); the
+    /// worker-visible heartbeat payload reads
+    /// [`advertised`](Self::advertised) instead.
     pub fn get(&self) -> u64 {
-        self.0.load(Ordering::Acquire)
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// The worker-visible generation: the raw value once the leader's
+    /// recovery has completed, `0` (the proto-unset sentinel — a no-op
+    /// for the executor's `fetch_max` fence latch) before that.
+    ///
+    /// Ordering: the recovery seed's `fetch_max` is sequenced before
+    /// the SeqCst `set_recovery_complete()` store on the actor task, so
+    /// a reader that observes `true` here also observes the seeded
+    /// generation. The two loads are NOT one atomic snapshot — a reply
+    /// composed exactly across a lose→re-acquire edge can pair them
+    /// inconsistently for one heartbeat; that exposure is no worse than
+    /// the pre-gating default for every heartbeat. A TOCTOU-discarded
+    /// recovery leaves `recovery_complete` false, so a flapped recovery
+    /// keeps advertising 0 until the re-run completes — desired.
+    // r[impl sched.lease.claim-before-advertise]
+    pub fn advertised(&self) -> u64 {
+        if self.recovery_complete.load(Ordering::SeqCst) {
+            self.generation.load(Ordering::Acquire)
+        } else {
+            0
+        }
     }
 }

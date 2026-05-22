@@ -1669,3 +1669,78 @@ async fn test_log_batch_oversized_line_and_executor_id_bounded_before_forward() 
     );
     Ok(())
 }
+
+/// The heartbeat reply must not advertise the lease-derived generation
+/// while recovery is incomplete: an advertised-but-unclaimed generation
+/// latched by a worker from a leader that dies mid-recovery is recorded
+/// nowhere, so after a Lease deletion the surviving previous holder
+/// legitimately retains its lower claimed generation and the latched
+/// workers silently reject every assignment of the active leader. The
+/// reply carries the 0 sentinel until `recovery_complete`, then the
+/// post-recovery generation. The other half of the end-to-end property
+/// — the claim landing before recovery completes — is owned and
+/// verified by `sched.lease.generation-claim` (see the actor recovery
+/// seeding/claim tests).
+// r[verify sched.lease.claim-before-advertise]
+#[tokio::test]
+async fn heartbeat_advertises_generation_only_after_recovery_complete() -> anyhow::Result<()> {
+    use rio_proto::ExecutorService;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let db = TestDb::new(&MIGRATOR).await;
+    // Simulate the recovery window: the acquire edge has raised the
+    // generation Arc to 7 and flipped is_leader, but recovery has not
+    // completed yet.
+    let recovery_complete = Arc::new(AtomicBool::new(false));
+    let rc = Arc::clone(&recovery_complete);
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = crate::lease::LeaderState::from_parts(
+            Arc::new(AtomicU64::new(7)),
+            Arc::new(AtomicBool::new(true)),
+            rc,
+        );
+    });
+    // `new_for_tests` keeps its own always-true `is_leader` Arc — that
+    // is what lets the heartbeat pass `ensure_leader` while the
+    // fixture's `recovery_complete` is false; do not "fix" the apparent
+    // mismatch.
+    let grpc = SchedulerGrpc::new_for_tests(handle);
+
+    let resp = grpc
+        .heartbeat(Request::new(rio_proto::types::HeartbeatRequest {
+            executor_id: "fence-w1".into(),
+            systems: vec!["x86_64-linux".into()],
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    assert!(
+        resp.accepted,
+        "the heartbeat RPC stays available during recovery (executor re-registration \
+         and readiness must proceed); only the generation payload is withheld"
+    );
+    assert_eq!(
+        resp.generation, 0,
+        "an incomplete recovery must advertise the 0 sentinel, not the acquire-edge value"
+    );
+
+    // Recovery completes → the post-recovery generation is advertised
+    // (also pins that generation_reader() is wired to the leader's
+    // actual recovery_complete Arc).
+    recovery_complete.store(true, Ordering::SeqCst);
+    let resp = grpc
+        .heartbeat(Request::new(rio_proto::types::HeartbeatRequest {
+            executor_id: "fence-w1".into(),
+            systems: vec!["x86_64-linux".into()],
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    assert!(resp.accepted);
+    assert_eq!(
+        resp.generation, 7,
+        "after recovery completes the post-recovery generation is advertised"
+    );
+    Ok(())
+}
