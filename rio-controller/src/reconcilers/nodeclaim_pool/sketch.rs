@@ -1,15 +1,15 @@
-//! Per-cell DDSketch state + PG persist (migration 059
+//! Per-cell quantile-sketch state + PG persist (migration 059
 //! `nodeclaim_cell_state`).
 //!
 //! A "cell" is `(hw_class, capacity_type)` — the unit at which lead-time
 //! and boot-time distributions are tracked. Each cell carries an
-//! active/shadow DDSketch pair for `z = boot − eta_error` (the lead-time
-//! the reconciler should provision ahead by) and for raw `boot` (the
-//! Karpenter+kubelet overhead floor). Active/shadow rotation gives a
-//! sliding window without losing the warm quantile during cold-start.
+//! active/shadow quantile-sketch pair (HdrHistogram) for `z = boot −
+//! eta_error` (the lead-time the reconciler should provision ahead by)
+//! and for raw `boot` (the Karpenter+kubelet overhead floor). Active/
+//! shadow rotation gives a sliding window without losing the warm
+//! quantile during cold-start.
 //!
-//! Persisted as version-tagged postcard `bytea` (DDSketch's bucket array
-//! is dense-packed integers; ~1KiB binary vs ~8KiB JSON) per
+//! Persisted as version-tagged HdrHistogram-V2 `bytea` per
 //! `r[ctrl.nodeclaim.lead-time-ddsketch]`. The reconciler loads on
 //! construct, persists every tick.
 
@@ -19,16 +19,19 @@ use std::time::{Duration, SystemTime};
 use hdrhistogram::Histogram;
 use hdrhistogram::serialization::{Deserializer, Serializer, V2Serializer};
 use serde::{Deserialize, Serialize};
-use sketches_ddsketch::{Config, DDSketch};
 use tracing::{debug, warn};
 
 use super::consolidate::IdleGapEvent;
 use super::ffd::LiveNode;
 
-/// postcard encoding version tag (4 LE bytes prefix). Bump on any
-/// `sketches-ddsketch` serde-shape change; [`decode_versioned`] returns
-/// `None` on mismatch and the caller falls back to seed.
-const SKETCH_VERSION: u32 = 1;
+/// Sketch-blob version tag (4 LE bytes prefix). Version 2 = HdrHistogram
+/// V2 payload (version 1 was postcard-encoded sketches-ddsketch).
+/// [`decode_versioned`] returns `None` on mismatch and the caller falls
+/// back to seed — so a future format change is a re-learn, never a
+/// corruption. The decoded histogram adopts the bounds/sigfigs stored in
+/// the payload, so changing `MAX_TRACKABLE_MS`/sigfigs is also a version
+/// bump.
+const SKETCH_VERSION: u32 = 2;
 
 /// Upper bound of the trackable range: 24 h in ms. Boot/lead times are
 /// minutes; anything past this is recorded as the max (saturating).
@@ -101,18 +104,19 @@ impl std::fmt::Display for Cell {
 /// Per-cell state. Mirrors migration 059's columns 1:1 (modulo
 /// `sketch_epoch` which is a `SystemTime` here, `timestamptz` in PG).
 ///
-/// No `Debug`: `sketches_ddsketch::DDSketch` doesn't derive it.
+/// No `Debug`: deriving it would dump each histogram's counts array
+/// into assert/log output; nothing needs it.
 #[derive(Clone)]
 pub struct CellState {
     /// `z = boot − eta_error` active sketch. `lead_time_q`-quantile of
     /// this is what `cover_deficit` provisions ahead by.
-    pub z_active: DDSketch,
+    pub z_active: Sketch,
     /// Previous-epoch `z` sketch (warm fallback during rotation).
-    pub z_shadow: DDSketch,
+    pub z_shadow: Sketch,
     /// Raw Launch→Registered seconds, active.
-    pub boot_active: DDSketch,
+    pub boot_active: Sketch,
     /// Previous-epoch boot sketch.
-    pub boot_shadow: DDSketch,
+    pub boot_shadow: Sketch,
     /// Wall-clock of the last active→shadow rotation. PG round-trips
     /// this so a controller restart doesn't reset the rotation clock.
     pub epoch: SystemTime,
@@ -132,10 +136,10 @@ pub struct CellState {
 impl Default for CellState {
     fn default() -> Self {
         Self {
-            z_active: DDSketch::new(Config::defaults()),
-            z_shadow: DDSketch::new(Config::defaults()),
-            boot_active: DDSketch::new(Config::defaults()),
-            boot_shadow: DDSketch::new(Config::defaults()),
+            z_active: Sketch::default(),
+            z_shadow: Sketch::default(),
+            boot_active: Sketch::default(),
+            boot_shadow: Sketch::default(),
             epoch: SystemTime::now(),
             lead_time_q: 0.9,
             forecast_hit_ewma: 0.9,
@@ -199,10 +203,8 @@ impl CellState {
     /// it while active refills).
     pub fn maybe_rotate(&mut self, now: SystemTime, halflife: Duration) {
         if now.duration_since(self.epoch).unwrap_or(Duration::ZERO) > halflife {
-            self.z_shadow =
-                std::mem::replace(&mut self.z_active, DDSketch::new(Config::defaults()));
-            self.boot_shadow =
-                std::mem::replace(&mut self.boot_active, DDSketch::new(Config::defaults()));
+            self.z_shadow = std::mem::take(&mut self.z_active);
+            self.boot_shadow = std::mem::take(&mut self.boot_active);
             self.epoch = now;
         }
     }
@@ -245,7 +247,7 @@ impl CellState {
 ///
 /// `Histogram<u64>` over integer milliseconds, 1 ms ..= 24 h, 2
 /// significant figures — ≈1 % relative error, the same guarantee class
-/// as the DDSketch `α = 0.01` default this replaced. The f64-seconds ⇄
+/// as the `α = 0.01` quantile sketch this replaced. The f64-seconds ⇄
 /// u64-milliseconds conversion lives entirely inside this type so the
 /// rest of the module keeps speaking seconds.
 ///
@@ -296,7 +298,6 @@ impl Sketch {
 
     /// HdrHistogram V2 wire bytes (no version prefix — that is
     /// [`encode_versioned`]'s job).
-    #[allow(dead_code, reason = "wired into CellState in the next commit")]
     fn to_v2_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
         V2Serializer::new()
@@ -307,7 +308,6 @@ impl Sketch {
 
     /// Inverse of [`to_v2_bytes`]. `None` on any decode error — caller
     /// falls back to an empty sketch / seed.
-    #[allow(dead_code, reason = "wired into CellState in the next commit")]
     fn from_v2_bytes(bytes: &[u8]) -> Option<Self> {
         Deserializer::new()
             .deserialize(&mut std::io::Cursor::new(bytes))
@@ -316,10 +316,10 @@ impl Sketch {
     }
 }
 
-/// `s.quantile(q)` flattened. `None` ⇔ empty sketch (or `q∉[0,1]`,
-/// which callers don't emit).
-fn quantile_or(s: &DDSketch, q: f64) -> Option<f64> {
-    s.quantile(q).ok().flatten()
+/// `s.quantile(q)`. `None` ⇔ empty sketch (or `q∉[0,1]`, which callers
+/// don't emit).
+fn quantile_or(s: &Sketch, q: f64) -> Option<f64> {
+    s.quantile(q)
 }
 
 /// Shared sparse-active gate for the active/shadow sketch pairs.
@@ -332,7 +332,7 @@ fn quantile_or(s: &DDSketch, q: f64) -> Option<f64> {
 /// `ICE_REAL_THRESHOLD`). Final `.or_else(active)` so a
 /// sparse-active-only cell (shadow empty too) still returns its own
 /// estimate rather than `None`.
-fn quantile_with_shadow(active: &DDSketch, shadow: &DDSketch, q: f64) -> Option<f64> {
+fn quantile_with_shadow(active: &Sketch, shadow: &Sketch, q: f64) -> Option<f64> {
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -639,30 +639,27 @@ impl CellSketches {
     }
 }
 
-/// `[SKETCH_VERSION le-u32][postcard(DDSketch)]`. `unwrap`: DDSketch's
-/// derived `Serialize` is infallible into `Vec<u8>`.
-pub fn encode_versioned(s: &DDSketch) -> Vec<u8> {
+/// `[SKETCH_VERSION le-u32][HdrHistogram V2 bytes]`.
+pub fn encode_versioned(s: &Sketch) -> Vec<u8> {
     let mut buf = SKETCH_VERSION.to_le_bytes().to_vec();
-    buf.extend(postcard::to_stdvec(s).expect("DDSketch serialize is infallible"));
+    buf.extend(s.to_v2_bytes());
     buf
 }
 
 /// Inverse of [`encode_versioned`]. `None` on short input, version
-/// mismatch, or postcard error — caller falls back to seed/empty.
-pub fn decode_versioned(bytes: &[u8]) -> Option<DDSketch> {
+/// mismatch, or payload error — caller falls back to seed/empty.
+pub fn decode_versioned(bytes: &[u8]) -> Option<Sketch> {
     let tag: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
     if u32::from_le_bytes(tag) != SKETCH_VERSION {
         return None;
     }
-    postcard::from_bytes(&bytes[4..]).ok()
+    Sketch::from_v2_bytes(&bytes[4..])
 }
 
 /// `decode_versioned` with `None`-column / decode-failure both mapping
 /// to an empty sketch.
-fn decode_or_empty(bytes: Option<&[u8]>) -> DDSketch {
-    bytes
-        .and_then(decode_versioned)
-        .unwrap_or_else(|| DDSketch::new(Config::defaults()))
+fn decode_or_empty(bytes: Option<&[u8]>) -> Sketch {
+    bytes.and_then(decode_versioned).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -698,24 +695,20 @@ mod tests {
     }
 
     // r[verify ctrl.nodeclaim.lead-time-ddsketch]
-    /// Version-tagged encode/decode round-trips quantiles within
-    /// DDSketch's relative-error bound, and the version tag is the
-    /// 4-byte LE prefix.
+    /// Version-tagged encode/decode round-trips exactly (HdrHistogram V2
+    /// preserves counts bit-for-bit), and the version tag is the 4-byte
+    /// LE prefix.
     #[test]
     fn sketch_versioned_round_trip() {
-        let mut s = DDSketch::new(Config::defaults());
+        let mut s = Sketch::default();
         for v in [10.0, 12.0, 15.0, 18.0, 20.0] {
             s.add(v);
         }
         let bytes = encode_versioned(&s);
         assert_eq!(&bytes[..4], &SKETCH_VERSION.to_le_bytes());
         let back = decode_versioned(&bytes).expect("decodes");
-        let orig = s.quantile(0.9).unwrap().unwrap();
-        let rt = back.quantile(0.9).unwrap().unwrap();
-        assert!(
-            (orig - rt).abs() < 1e-9,
-            "postcard round-trip should be exact (got {orig} vs {rt})"
-        );
+        assert_eq!(back.quantile(0.9), s.quantile(0.9));
+        assert_eq!(back.count(), s.count());
     }
 
     /// Version mismatch / short / garbage → `None` (caller seeds).
@@ -725,7 +718,7 @@ mod tests {
         assert!(decode_versioned(&[1, 0, 0]).is_none(), "short tag");
         let bad_ver = [99u8, 0, 0, 0, 1, 2, 3];
         assert!(decode_versioned(&bad_ver).is_none(), "wrong version");
-        let bad_body = [1u8, 0, 0, 0, 0xff, 0xff];
+        let bad_body = [2u8, 0, 0, 0, 0xff, 0xff];
         assert!(decode_versioned(&bad_body).is_none(), "garbage body");
     }
 
@@ -830,7 +823,7 @@ mod tests {
         }
         assert_eq!(s.z_active.count(), 10);
         assert_eq!(s.boot_active.count(), 10);
-        // q=0.9 over 40..58 step 2 ≈ 56 (within DDSketch rel-error).
+        // q=0.9 over 40..58 step 2 ≈ 56 (within sketch rel-error).
         let lt = s.lead_time();
         assert!((54.0..=58.5).contains(&lt), "lead_time={lt}");
         // boot_median ≈ 48.
@@ -839,7 +832,7 @@ mod tests {
         // Non-zero eta_error: z = boot − eta_error.
         let mut s2 = CellState::default();
         s2.record(50.0, 10.0);
-        let z = s2.z_active.quantile(0.5).unwrap().unwrap();
+        let z = s2.z_active.quantile(0.5).expect("non-empty");
         assert!((z - 40.0).abs() < 1.0, "z=boot−eta_error, got {z}");
     }
 
@@ -1373,9 +1366,9 @@ mod tests {
         // boot = 1045 − 1000 = 45; eta = 30; z = 15.
         sk.observe_registered(&[a], &mut recorded, 1060.0);
         let s = sk.get(&cell).unwrap();
-        let z = s.z_active.quantile(0.5).unwrap().unwrap();
+        let z = s.z_active.quantile(0.5).expect("non-empty");
         assert!((z - 15.0).abs() < 1.0, "z = boot − eta = 15, got {z}");
-        let b = s.boot_active.quantile(0.5).unwrap().unwrap();
+        let b = s.boot_active.quantile(0.5).expect("non-empty");
         assert!((b - 45.0).abs() < 1.0, "raw boot = 45, got {b}");
 
         // No annotation → eta=0 → z=boot.
@@ -1391,8 +1384,7 @@ mod tests {
             .unwrap()
             .z_active
             .quantile(0.5)
-            .unwrap()
-            .unwrap();
+            .expect("non-empty");
         assert!((z2 - 45.0).abs() < 1.0, "no annotation → z=boot, got {z2}");
     }
 
