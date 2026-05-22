@@ -298,6 +298,13 @@ where
             Environment::with_prefix("RIO")
                 .prefix_separator("_")
                 .separator("__")
+                // Downward-API fieldRefs resolve absent annotations to "".
+                // Treat empty as unset so e.g. RIO_HW_BENCH_NEEDED="" falls
+                // through to the compiled default (the documented fail-closed
+                // behavior at rio-controller pool/jobs.rs) instead of failing
+                // the String→bool conversion. Trade-off: a string field cannot
+                // be explicitly set to "" via env; nothing relies on that.
+                .ignore_empty(true)
                 .try_parsing(true),
         )
         .add_source(cli)
@@ -586,6 +593,10 @@ where
             Environment::with_prefix("RIO")
                 .prefix_separator("_")
                 .separator("__")
+                // Keep in sync with the env source in `load()`: empty env
+                // values are treated as unset there, so the test mirror must
+                // match or env-layer tests would pin the wrong behavior.
+                .ignore_empty(true)
                 .try_parsing(true),
         )
         .add_source(serialized_layer(&cli_overlay)?)
@@ -842,6 +853,26 @@ mod tests {
             let cfg: TestConfig =
                 load_from_path(std::path::Path::new("/nonexistent"), TestCli::default()).unwrap();
             assert!(!cfg.debug);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn empty_bool_env_var_falls_through_to_default() {
+        // Kubernetes downward-API fieldRefs resolve absent annotations to ""
+        // (e.g. RIO_HW_BENCH_NEEDED="" on the recovery path — see
+        // rio-controller pool/jobs.rs). Without ignore_empty the "" survives
+        // try_parsing as String("") and hard-fails the String→bool conversion
+        // at deserialize time, crash-looping the pod. Empty must mean "unset"
+        // so the field falls through to its compiled default (fail-closed).
+        crate::test_jail::Jail::expect_with(|jail| {
+            jail.set_env("RIO_DEBUG", "");
+            let cfg: TestConfig =
+                load_from_path(std::path::Path::new("/nonexistent"), TestCli::default()).unwrap();
+            assert!(
+                !cfg.debug,
+                "empty env value must fall through to the compiled default"
+            );
             Ok(())
         });
     }
