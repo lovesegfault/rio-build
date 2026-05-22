@@ -16,6 +16,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
+use hdrhistogram::Histogram;
+use hdrhistogram::serialization::{Deserializer, Serializer, V2Serializer};
 use serde::{Deserialize, Serialize};
 use sketches_ddsketch::{Config, DDSketch};
 use tracing::{debug, warn};
@@ -27,6 +29,10 @@ use super::ffd::LiveNode;
 /// `sketches-ddsketch` serde-shape change; [`decode_versioned`] returns
 /// `None` on mismatch and the caller falls back to seed.
 const SKETCH_VERSION: u32 = 1;
+
+/// Upper bound of the trackable range: 24 h in ms. Boot/lead times are
+/// minutes; anything past this is recorded as the max (saturating).
+const MAX_TRACKABLE_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// Synthetic seed sample count. `r[ctrl.nodeclaim.lead-time-ddsketch]`:
 /// `n_seed = 1/(1−q) = 10` at `q=0.9` — enough that
@@ -232,6 +238,81 @@ impl CellState {
     /// absorb without unbounded idle cost).
     pub fn at_cap(&self, max_lead_time: f64) -> bool {
         self.lead_time_q >= 0.99 || self.lead_time() >= max_lead_time
+    }
+}
+
+/// Quantile sketch for one distribution (z or boot, active or shadow).
+///
+/// `Histogram<u64>` over integer milliseconds, 1 ms ..= 24 h, 2
+/// significant figures — ≈1 % relative error, the same guarantee class
+/// as the DDSketch `α = 0.01` default this replaced. The f64-seconds ⇄
+/// u64-milliseconds conversion lives entirely inside this type so the
+/// rest of the module keeps speaking seconds.
+///
+/// No `Debug`: deriving it would dump each histogram's counts array
+/// into assert/log output; nothing needs it.
+#[derive(Clone)]
+pub struct Sketch(Histogram<u64>);
+
+impl Default for Sketch {
+    fn default() -> Self {
+        // expect: bounds are compile-time constants; this can only fail
+        // on a programming error in MAX_TRACKABLE_MS / sigfigs.
+        Self(Histogram::new_with_bounds(1, MAX_TRACKABLE_MS, 2).expect("static bounds are valid"))
+    }
+}
+
+impl Sketch {
+    /// Record one observation in seconds.
+    ///
+    /// Negative values clamp to 0: HdrHistogram is unsigned, and for
+    /// `z = boot − eta_error` a negative lead-time means "no need to
+    /// provision ahead", which 0 already encodes (consumers only ever
+    /// compare `eta < lead_time`). Values above 24 h saturate into the
+    /// top bucket.
+    pub fn add(&mut self, secs: f64) {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "negatives are clamped by max(0.0) and float→int `as` saturates, so the cast cannot wrap"
+        )]
+        let ms = (secs.max(0.0) * 1000.0).round() as u64;
+        self.0.saturating_record(ms);
+    }
+
+    /// `q`-quantile in seconds. `None` ⇔ empty sketch.
+    pub fn quantile(&self, q: f64) -> Option<f64> {
+        if self.0.is_empty() {
+            return None;
+        }
+        #[allow(clippy::cast_precision_loss, reason = "ms values cap at 24h << 2^53")]
+        Some(self.0.value_at_quantile(q) as f64 / 1000.0)
+    }
+
+    /// Number of recorded observations.
+    pub fn count(&self) -> usize {
+        usize::try_from(self.0.len()).unwrap_or(usize::MAX)
+    }
+
+    /// HdrHistogram V2 wire bytes (no version prefix — that is
+    /// [`encode_versioned`]'s job).
+    #[allow(dead_code, reason = "wired into CellState in the next commit")]
+    fn to_v2_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(256);
+        V2Serializer::new()
+            .serialize(&self.0, &mut buf)
+            .expect("serializing into a Vec<u8> cannot fail");
+        buf
+    }
+
+    /// Inverse of [`to_v2_bytes`]. `None` on any decode error — caller
+    /// falls back to an empty sketch / seed.
+    #[allow(dead_code, reason = "wired into CellState in the next commit")]
+    fn from_v2_bytes(bytes: &[u8]) -> Option<Self> {
+        Deserializer::new()
+            .deserialize(&mut std::io::Cursor::new(bytes))
+            .ok()
+            .map(Self)
     }
 }
 
@@ -654,6 +735,81 @@ mod tests {
         assert_eq!(s.count(), 0);
         let s2 = decode_or_empty(Some(&[99, 0, 0, 0]));
         assert_eq!(s2.count(), 0, "bad version → empty");
+    }
+
+    /// `Sketch` is the seconds-facing wrapper around HdrHistogram.
+    /// Empty → `None`; values round-trip within the 2-sigfig (≈1 %)
+    /// guarantee; negatives clamp to 0; counts are exact.
+    #[test]
+    fn sketch_wrapper_basics() {
+        let mut s = Sketch::default();
+        assert_eq!(s.count(), 0);
+        assert_eq!(s.quantile(0.9), None, "empty sketch has no quantile");
+
+        for boot in [40.0, 42.0, 44.0, 46.0, 48.0, 50.0, 52.0, 54.0, 56.0, 58.0] {
+            s.add(boot);
+        }
+        assert_eq!(s.count(), 10);
+        let q90 = s.quantile(0.9).expect("non-empty");
+        assert!((54.0..=58.6).contains(&q90), "q90={q90}");
+        let q50 = s.quantile(0.5).expect("non-empty");
+        assert!((46.0..=50.5).contains(&q50), "q50={q50}");
+
+        // Relative accuracy: a single value reads back within 1 %.
+        let mut one = Sketch::default();
+        one.add(123.4);
+        let v = one.quantile(0.5).unwrap();
+        assert!((v - 123.4).abs() / 123.4 < 0.01, "got {v}");
+    }
+
+    /// Negative inputs (z = boot − eta_error when the node beat its
+    /// forecast) clamp to 0 rather than being dropped: the sample still
+    /// counts, and the learned quantile can reach 0 but never goes
+    /// negative.
+    #[test]
+    fn sketch_clamps_negative_to_zero() {
+        let mut s = Sketch::default();
+        s.add(-5.0);
+        s.add(-1.0);
+        s.add(-0.2);
+        assert_eq!(s.count(), 3);
+        assert_eq!(s.quantile(0.9), Some(0.0));
+    }
+
+    /// V2 bytes round-trip exactly (counts are preserved bit-for-bit,
+    /// so quantiles are identical, not just within tolerance).
+    #[test]
+    fn sketch_v2_bytes_round_trip() {
+        let mut s = Sketch::default();
+        for v in [10.0, 12.0, 15.0, 18.0, 20.0, 3600.0] {
+            s.add(v);
+        }
+        let bytes = s.to_v2_bytes();
+        assert!(!bytes.is_empty());
+        let back = Sketch::from_v2_bytes(&bytes).expect("decodes");
+        assert_eq!(back.count(), s.count());
+        for q in [0.5, 0.9, 0.99] {
+            assert_eq!(back.quantile(q), s.quantile(q), "q={q}");
+        }
+        // Garbage input → None, never panic.
+        assert!(Sketch::from_v2_bytes(&[0xde, 0xad, 0xbe, 0xef]).is_none());
+        assert!(Sketch::from_v2_bytes(&[]).is_none());
+    }
+
+    /// Out-of-range inputs saturate instead of erroring: anything above
+    /// the 24 h trackable max records as the max.
+    #[test]
+    fn sketch_saturates_above_max() {
+        let mut s = Sketch::default();
+        s.add(999_999_999.0); // ~31 years, way past 24 h
+        assert_eq!(s.count(), 1);
+        let v = s.quantile(0.5).unwrap();
+        // The top bucket's highest-equivalent value at 2 sigfigs reads
+        // ~86 507 s (just past 86 400), hence the 86 600 upper bound.
+        assert!(
+            (86_000.0..=86_600.0).contains(&v),
+            "saturated at ~24h, got {v}"
+        );
     }
 
     #[test]
