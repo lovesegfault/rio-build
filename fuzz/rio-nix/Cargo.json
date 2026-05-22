@@ -10047,17 +10047,6 @@
       "source": {
         "type": "crates-io"
       },
-      "dependencies": [
-        {
-          "name": "serde",
-          "packageId": "serde",
-          "rename": "serde"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "serde",
-        "use_serde"
-      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -14002,10 +13991,6 @@
           "packageId": "signature"
         },
         {
-          "name": "sketches-ddsketch",
-          "packageId": "sketches-ddsketch"
-        },
-        {
           "name": "slab",
           "packageId": "slab"
         },
@@ -14583,10 +14568,6 @@
         {
           "name": "signature",
           "packageId": "signature"
-        },
-        {
-          "name": "sketches-ddsketch",
-          "packageId": "sketches-ddsketch"
         },
         {
           "name": "slab",

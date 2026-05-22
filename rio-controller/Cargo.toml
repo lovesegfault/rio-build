@@ -40,13 +40,11 @@ tracing = { workspace = true }
 metrics = { workspace = true }
 
 # --- ADR-023 §13b nodeclaim_pool ---
-# DDSketch lead-time/boot quantiles, persisted to nodeclaim_cell_state
-# via postcard bytea (migration 059). rio-lease (above) for the leader-
-# elected reconcile loop. sqlx: the reconciler reads/writes
+# HdrHistogram lead-time/boot quantiles, persisted to nodeclaim_cell_state
+# as version-tagged V2 bytea (migration 059). rio-lease (above) for the
+# leader-elected reconcile loop. sqlx: the reconciler reads/writes
 # `nodeclaim_cell_state` directly (controller-only table; no store RPC
 # round-trip — see rio-migrations/src/migrations.rs M_059).
-sketches-ddsketch = { workspace = true }
-postcard = { workspace = true }
 hdrhistogram = { workspace = true }
 sqlx = { workspace = true }
 

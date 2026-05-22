@@ -4409,28 +4409,6 @@
         "RustCrypto Developers"
       ]
     },
-    "cobs": {
-      "crateName": "cobs",
-      "version": "0.3.0",
-      "edition": "2021",
-      "sha256": "18f0kxxa1fqb8pz2dxwssnhsrvhrs5j4p8xllgin5d7h36sn3a8g",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "thiserror",
-          "packageId": "thiserror"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Allen Welkie <>",
-        "James Munns <james@onevariable.com>"
-      ]
-    },
     "colorchoice": {
       "crateName": "colorchoice",
       "version": "1.0.5",
@@ -6367,36 +6345,6 @@
       ],
       "authors": [
         "RustCrypto Developers"
-      ]
-    },
-    "embedded-io 0.4.0": {
-      "crateName": "embedded-io",
-      "version": "0.4.0",
-      "edition": "2021",
-      "sha256": "1v9wrc5nsgaaady7i3ya394sik5251j0iq5rls7mrx7fv696h6pg",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "alloc"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ]
-    },
-    "embedded-io 0.6.1": {
-      "crateName": "embedded-io",
-      "version": "0.6.1",
-      "edition": "2021",
-      "sha256": "0v901xykajh3zffn6x4cnn4fhgfw3c8qpjwbsk6gai3gaccg3l7d",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "alloc"
-      ],
-      "libCrateTypes": [
-        "lib"
       ]
     },
     "encode_unicode": {
@@ -17265,35 +17213,6 @@
         "lib"
       ]
     },
-    "postcard": {
-      "crateName": "postcard",
-      "version": "1.1.3",
-      "edition": "2021",
-      "sha256": "094srff139n7m8g5ssq36ag6s29ikf7fgpz660x2hkj5vnsw6r37",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "cobs",
-          "packageId": "cobs"
-        },
-        {
-          "name": "serde",
-          "packageId": "serde"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "alloc",
-        "use-std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "James Munns <james@onevariable.com>"
-      ]
-    },
     "potential_utf": {
       "crateName": "potential_utf",
       "version": "0.1.5",
@@ -19562,10 +19481,6 @@
           "packageId": "parking_lot"
         },
         {
-          "name": "postcard",
-          "packageId": "postcard"
-        },
-        {
           "name": "rand",
           "packageId": "rand 0.10.1"
         },
@@ -19600,10 +19515,6 @@
         {
           "name": "serde_json",
           "packageId": "serde_json"
-        },
-        {
-          "name": "sketches-ddsketch",
-          "packageId": "sketches-ddsketch"
         },
         {
           "name": "sqlx",
@@ -23236,17 +23147,6 @@
       "source": {
         "type": "crates-io"
       },
-      "dependencies": [
-        {
-          "name": "serde",
-          "packageId": "serde",
-          "rename": "serde"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "serde",
-        "use_serde"
-      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -29160,10 +29060,6 @@
           "packageId": "signature 3.0.0"
         },
         {
-          "name": "sketches-ddsketch",
-          "packageId": "sketches-ddsketch"
-        },
-        {
           "name": "slab",
           "packageId": "slab"
         },
@@ -29741,10 +29637,6 @@
         {
           "name": "signature",
           "packageId": "signature 3.0.0"
-        },
-        {
-          "name": "sketches-ddsketch",
-          "packageId": "sketches-ddsketch"
         },
         {
           "name": "slab",

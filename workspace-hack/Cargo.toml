@@ -105,7 +105,6 @@ sha1-a6292c17cd707f01 = { package = "sha1", version = "0.11" }
 sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10" }
 sha2-a6292c17cd707f01 = { package = "sha2", version = "0.11" }
 signature = { version = "3", default-features = false, features = ["alloc", "digest", "rand_core"] }
-sketches-ddsketch = { version = "0.3", default-features = false, features = ["use_serde"] }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde", "write"] }
 spki = { version = "0.8", default-features = false, features = ["pem", "std"] }
@@ -226,7 +225,6 @@ sha1-a6292c17cd707f01 = { package = "sha1", version = "0.11" }
 sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10" }
 sha2-a6292c17cd707f01 = { package = "sha2", version = "0.11" }
 signature = { version = "3", default-features = false, features = ["alloc", "digest", "rand_core"] }
-sketches-ddsketch = { version = "0.3", default-features = false, features = ["use_serde"] }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde", "write"] }
 spki = { version = "0.8", default-features = false, features = ["pem", "std"] }
