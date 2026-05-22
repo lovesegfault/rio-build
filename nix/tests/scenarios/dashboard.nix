@@ -74,19 +74,29 @@
   # won't be 0x00.
   #
   # Empty proto body = 5-byte header (1 byte flag + 4 bytes len=0).
-  # wait_until_succeeds: the HTTPRoute backendRef load-balances
-  # across scheduler replicas; non-leader returns Unavailable. ~5
-  # retries covers the 50% hit rate.
-  with subtest("gRPC-Web unary via nginx: ClusterStatus 0x00 prefix"):
-      k3s_server.wait_until_succeeds(
-          "printf '\\x00\\x00\\x00\\x00\\x00' | "
-          "curl -sf -X POST http://localhost:18081/rio.admin.AdminService/ClusterStatus "
-          "-H 'content-type: application/grpc-web+proto' "
-          "-H 'x-grpc-web: 1' "
-          "--data-binary @- "
-          "| ${pkgs.xxd}/bin/xxd | head -1 | grep -q '^00000000: 00'",
-          timeout=60,
-      )
+  # wait_until_succeeds: nginx proxies to the rio-scheduler Service and
+  # both replicas are Ready (readiness is tcpSocket, not leadership), so
+  # a request that lands on the standby gets a Trailers-Only Unavailable
+  # (HTTP 200, empty body) and the grep fails. Retries normally
+  # re-balance per connection (observed: a geometric ~50%-per-attempt
+  # distribution across runs), but two failure modes can defeat the
+  # retry budget entirely: a hung upstream connection (nginx
+  # proxy_connect_timeout is 60s — one hang eats the whole budget
+  # without --max-time) and connection-level pinning to the standby.
+  # --max-time 5 caps each attempt so the budget always buys >=10
+  # independent tries; the except block captures the evidence needed to
+  # tell those modes apart if it still fails.
+  try:
+      with subtest("gRPC-Web unary via nginx: ClusterStatus 0x00 prefix"):
+          k3s_server.wait_until_succeeds(
+              "printf '\\x00\\x00\\x00\\x00\\x00' | "
+              "curl -sf --max-time 5 -X POST http://localhost:18081/rio.admin.AdminService/ClusterStatus "
+              "-H 'content-type: application/grpc-web+proto' "
+              "-H 'x-grpc-web: 1' "
+              "--data-binary @- "
+              "| ${pkgs.xxd}/bin/xxd | head -1 | grep -q '^00000000: 00'",
+              timeout=60,
+          )
 
   # ── (3b) service-token via nginx: njs HMAC verifies ──────────────
   # ListPoisoned is r[sched.sla.threat.read-path-auth]-gated: the
@@ -97,16 +107,16 @@
   # gated RPC returns PermissionDenied (Trailers-Only, first byte
   # 0x80 not 0x00). ClusterStatus/GetBuildLogs above are NOT gated,
   # so they can't witness a bad token; this subtest is the tripwire.
-  with subtest("service-token via nginx: njs HMAC verifies on gated RPC"):
-      k3s_server.wait_until_succeeds(
-          "printf '\\x00\\x00\\x00\\x00\\x00' | "
-          "curl -sf -X POST http://localhost:18081/rio.admin.AdminService/ListPoisoned "
-          "-H 'content-type: application/grpc-web+proto' "
-          "-H 'x-grpc-web: 1' "
-          "--data-binary @- "
-          "| ${pkgs.xxd}/bin/xxd | head -1 | grep -q '^00000000: 00'",
-          timeout=60,
-      )
+      with subtest("service-token via nginx: njs HMAC verifies on gated RPC"):
+          k3s_server.wait_until_succeeds(
+              "printf '\\x00\\x00\\x00\\x00\\x00' | "
+              "curl -sf --max-time 5 -X POST http://localhost:18081/rio.admin.AdminService/ListPoisoned "
+              "-H 'content-type: application/grpc-web+proto' "
+              "-H 'x-grpc-web: 1' "
+              "--data-binary @- "
+              "| ${pkgs.xxd}/bin/xxd | head -1 | grep -q '^00000000: 00'",
+              timeout=60,
+          )
 
   # ── (4) gRPC-Web server-streaming THROUGH nginx ──────────────────
   # THE proxy_buffering-off proof. GetBuildLogs with a nonexistent
@@ -132,16 +142,36 @@
   # → prefixed with 5-byte header (0x00,0x00,0x00,0x00,0x0a).
   # Proto refactor at b643ab82 moved derivation_path to field 2
   # (field 1 is build_id) — same encoding as dashboard-gateway.nix.
-  with subtest("gRPC-Web streaming via nginx: GetBuildLogs 0x80 trailer"):
-      k3s_server.wait_until_succeeds(
-          "printf '\\x00\\x00\\x00\\x00\\x0a\\x12\\x08nonexist' | "
-          "curl -sf -X POST http://localhost:18081/rio.admin.AdminService/GetBuildLogs "
+      with subtest("gRPC-Web streaming via nginx: GetBuildLogs 0x80 trailer"):
+          k3s_server.wait_until_succeeds(
+              "printf '\\x00\\x00\\x00\\x00\\x0a\\x12\\x08nonexist' | "
+              "curl -sf --max-time 5 -X POST http://localhost:18081/rio.admin.AdminService/GetBuildLogs "
+              "-H 'content-type: application/grpc-web+proto' "
+              "-H 'x-grpc-web: 1' "
+              "--data-binary @- "
+              "| ${pkgs.xxd}/bin/xxd | grep -q ' 80'",
+              timeout=60,
+          )
+  except Exception:
+      # Discriminate "every attempt hit the standby" (access log full of
+      # 200s with ~0 body bytes) from "connections to the leader hang"
+      # (504s / connect timeouts) from "leader not in the endpoint set".
+      print("== DIAGNOSTIC: nginx -> scheduler gRPC-Web proxy path ==")
+      print(k3s_server.execute(
+          "printf '\\x00\\x00\\x00\\x00\\x00' | "
+          "curl -sv --max-time 5 -X POST http://localhost:18081/rio.admin.AdminService/ClusterStatus "
           "-H 'content-type: application/grpc-web+proto' "
-          "-H 'x-grpc-web: 1' "
-          "--data-binary @- "
-          "| ${pkgs.xxd}/bin/xxd | grep -q ' 80'",
-          timeout=60,
-      )
+          "-H 'x-grpc-web: 1' --data-binary @- 2>&1 | head -40"
+      )[1])
+      print(k3s_server.execute(
+          "k3s kubectl -n ${ns} logs deploy/rio-dashboard --tail=80 2>&1"
+      )[1])
+      print(k3s_server.execute(
+          "k3s kubectl -n ${ns} get endpointslices -l kubernetes.io/service-name=rio-scheduler -o yaml 2>&1; "
+          "k3s kubectl -n ${ns} get pods -o wide 2>&1; "
+          "k3s kubectl -n ${ns} get lease rio-scheduler-leader -o jsonpath='{.spec.holderIdentity}' 2>&1"
+      )[1])
+      raise
 
   # ── (5) method-gate via nginx: allow-list fail-closed ────────────
   # nginx's catch-all /rio.* location (docker.nix dashboardNginxConf)
