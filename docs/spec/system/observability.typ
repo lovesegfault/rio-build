@@ -114,22 +114,38 @@ restamped entry reaps it so the read path falls through to the stored
 execution's row may remain `is_complete = false` (surfaced per
 `obs.log.incomplete-surfaced`) until a retry lands.
 
-#r("obs.log.deferred-final-retry+2")[
+#r("obs.log.deferred-final-retry+3")[
   A final flush deferred because the finalize guard could not consult
   `drv_logs` MUST be retained by the flusher --- up to a bounded retention
   cap --- and retried while the execution's sealed ring-buffer entry remains
   in memory, and terminal cleanup MUST NOT discard an entry whose final
   flush is still pending --- enqueued at the terminal epilogue and not yet
   resolved by the flusher, or retained for retry; a deferral beyond the cap
-  drops that execution's buffered entry instead of retaining it.
+  drops that execution's buffered entry instead of retaining it. A final
+  flush request --- first attempt or retained retry --- MUST NOT finalize
+  the execution under a leadership tenure other than the one that enqueued
+  it: the request carries the scheduler-lease generation at enqueue time and
+  the flusher MUST drop it, uploading nothing, when the replica no longer
+  holds the lease or its generation has moved on; the live tenure's own
+  terminal processing owns that execution's finalization.
 ]
 
 This is what keeps a transient PG failure at final-flush time from losing
 buffered log content while S3 stays healthy. The retention is a fixed cap of
-in-flight deferrals and does not survive process exit; the retry runs
-regardless of leadership, like the completion flush itself, because every
-retained request was enqueued while this replica held the lease. The
-protection starts at enqueue: a final still queued behind earlier stalled
+in-flight deferrals and does not survive process exit; the retry --- like
+the first attempt of a queued final --- is pinned to the leadership tenure
+that enqueued it: a queued or deferred final is evidence PG was unreachable
+at terminal time, the same window in which the terminal-status persist fails
+and the lease lapses, so after a leadership change the execution may still
+be live and being extended by the tenure that now owns it, and a late stale
+final must not freeze that row (`obs.log.finalize-immutable`,
+`obs.log.stored-coverage-preserved`). Requests orphaned by a leadership
+change are dropped and counted
+(#(refs.metric)("rio_scheduler_log_flush_stale_tenure_total")); the
+execution then either gets finalized by the live tenure's own terminal flush
+or remains at its `.partial` coverage (surfaced per
+`obs.log.incomplete-surfaced`).
+The protection starts at enqueue: a final still queued behind earlier stalled
 flushes during the same outage is protected exactly like one already
 attempted and deferred, and stays pinned until the flusher resolves the
 request (or the process exits --- the dead-flusher residual).

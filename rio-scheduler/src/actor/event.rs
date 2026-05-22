@@ -630,7 +630,10 @@ impl DagActor {
     /// consumes it yet — see `FlushRequest::status`). The request pins
     /// the `exec_id` resolved once by [`Self::terminal_log_epilogue`]
     /// so a re-dispatch racing the flusher's mpsc can't be drained by a
-    /// stale request — see `FlushRequest::exec_id`.
+    /// stale request — see `FlushRequest::exec_id`. The request also
+    /// carries the current lease generation; `flush_final` refuses to
+    /// finalize it under any other tenure (see
+    /// `FlushRequest::lease_generation`).
     #[must_use]
     pub(super) fn trigger_log_flush(
         &self,
@@ -651,6 +654,7 @@ impl DagActor {
             drv_path,
             exec_id,
             status: Some(status.to_string()),
+            lease_generation: self.leader.generation(),
         })
     }
 
@@ -951,7 +955,7 @@ impl DagActor {
             // the pool-acquire timeout per attempt) does not discard the
             // only copy of the log out from under it. Marking only at
             // deferral time left queued-but-unattempted finals unprotected.
-            // r[impl obs.log.deferred-final-retry+2]
+            // r[impl obs.log.deferred-final-retry+3]
             self.mark_log_final_pending(drv_hash, exec_id);
         } else if self.discard_log_buffer_if_empty(drv_hash) {
             // The flusher will never see this request (channel full,

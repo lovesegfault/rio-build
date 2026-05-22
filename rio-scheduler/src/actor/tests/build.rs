@@ -418,7 +418,7 @@ async fn test_cleanup_terminal_build_gc_deletes_event_log() -> TestResult {
 /// the default `test_drv_path` fixture uses one shared `TEST_HASH` for every
 /// name, which would silently collapse both buffers into one entry and make
 /// the assertions vacuous (the fixture-collision trap).
-/// r[verify obs.log.deferred-final-retry+2]
+/// r[verify obs.log.deferred-final-retry+3]
 #[tokio::test]
 async fn cleanup_skips_log_buffer_with_deferred_final_pending() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -513,7 +513,7 @@ async fn cleanup_skips_log_buffer_with_deferred_final_pending() -> TestResult {
 /// hash would collapse both into one entry and make the assertions
 /// vacuous. Buffers are seeded via set_exec + push_for (push() leaves
 /// entries unstamped and the epilogue would skip them).
-/// r[verify obs.log.deferred-final-retry+2]
+/// r[verify obs.log.deferred-final-retry+3]
 #[tokio::test]
 async fn epilogue_marks_enqueued_final_pending_and_cleanup_preserves_it() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -599,6 +599,11 @@ async fn epilogue_marks_enqueued_final_pending_and_cleanup_preserves_it() -> Tes
     // The request really is still queued — the exact window the fix covers.
     let queued = flush_rx.try_recv().expect("A's final must still be queued");
     assert_eq!(queued.exec_id, exec_a);
+    assert_eq!(
+        queued.lease_generation, 1,
+        "epilogue must stamp the enqueueing tenure's lease generation \
+         (the default test plumbing's LeaderState is at generation 1)"
+    );
     // B keeps the pre-existing dropped-enqueue bound.
     assert_eq!(
         bufs.exec_id(path_b),

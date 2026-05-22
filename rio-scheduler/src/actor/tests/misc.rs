@@ -2217,6 +2217,7 @@ async fn try_log_flush_silent_on_closed() {
             drv_path: "x".into(),
             exec_id: uuid::Uuid::now_v7(),
             status: None,
+            lease_generation: 1,
         }),
         "Closed must report not-enqueued"
     );
@@ -2243,6 +2244,7 @@ async fn try_log_flush_reports_enqueue_result() {
         drv_path: "x".into(),
         exec_id: uuid::Uuid::now_v7(),
         status: None,
+        lease_generation: 1,
     };
 
     // No flusher configured → false.

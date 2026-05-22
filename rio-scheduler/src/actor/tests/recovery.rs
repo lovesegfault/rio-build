@@ -2874,6 +2874,7 @@ async fn test_orphan_completion_dropped_flush_discards_empty_buffer() -> TestRes
             drv_path: dummy_drv.clone(),
             exec_id: Uuid::now_v7(),
             status: None,
+            lease_generation: 1,
         })
         .expect("pre-fill the only slot");
     let (handle, _task) =

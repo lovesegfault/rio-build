@@ -343,15 +343,29 @@ pub fn describe_metrics() {
          lease flapping."
     );
     describe_counter!(
+        "rio_scheduler_log_flush_stale_tenure_total",
+        "Final log-flush requests dropped because the scheduler lease moved (lost, or \
+         lost-and-reacquired) between the request's enqueue and its processing: the live \
+         leadership tenure owns that execution's finalization, and uploading the stale ring \
+         would freeze a drv_logs row the live tenure may still be extending. Counted for \
+         first attempts and retained-deferral retries alike. The execution's log is \
+         finalized by the live tenure's own terminal flush; if its terminal had already \
+         persisted before the outage (or the drv was re-dispatched under a new exec_id), \
+         the row instead stays at its .partial (is_complete=false) coverage — the bounded \
+         pre-retry loss."
+    );
+    describe_counter!(
         "rio_scheduler_log_flush_finalize_deferred_total",
         "Final-flush attempts deferred because the finalize guard could not read the \
          execution's drv_logs row (transient PG error): nothing is uploaded on that attempt. \
          A deferral with a non-empty buffer is retained by the flusher and retried each \
-         periodic tick until PG answers (terminal cleanup leaves the buffer to the retry); \
+         periodic tick until PG answers (terminal cleanup leaves the buffer to the retry; a \
+         request whose leadership tenure has ended by then is dropped instead — see \
+         rio_scheduler_log_flush_stale_tenure_total); \
          an empty buffer is reaped so reads fall through to the stored .partial. Counted per \
          attempt, so retries during one outage keep incrementing it. Sustained rate indicates \
-         PG trouble on the flush path; loss requires the retry retention cap to overflow or \
-         the process to exit before PG recovers."
+         PG trouble on the flush path; loss requires the retry retention cap to overflow, \
+         leadership to move before PG recovers, or the process to exit before PG recovers."
     );
     describe_counter!(
         "rio_scheduler_log_empty_drain_finalize_failures_total",

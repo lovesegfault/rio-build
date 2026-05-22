@@ -553,7 +553,7 @@
         "name": "rio_scheduler_log_flush_failures_total"
       },
       {
-        "help": "Final-flush attempts deferred because the finalize guard could not read the execution's drv_logs row (transient PG error): nothing is uploaded on that attempt. A deferral with a non-empty buffer is retained by the flusher and retried each periodic tick until PG answers (terminal cleanup leaves the buffer to the retry); an empty buffer is reaped so reads fall through to the stored .partial. Counted per attempt, so retries during one outage keep incrementing it. Sustained rate indicates PG trouble on the flush path; loss requires the retry retention cap to overflow or the process to exit before PG recovers.",
+        "help": "Final-flush attempts deferred because the finalize guard could not read the execution's drv_logs row (transient PG error): nothing is uploaded on that attempt. A deferral with a non-empty buffer is retained by the flusher and retried each periodic tick until PG answers (terminal cleanup leaves the buffer to the retry; a request whose leadership tenure has ended by then is dropped instead — see rio_scheduler_log_flush_stale_tenure_total); an empty buffer is reaped so reads fall through to the stored .partial. Counted per attempt, so retries during one outage keep incrementing it. Sustained rate indicates PG trouble on the flush path; loss requires the retry retention cap to overflow, leadership to move before PG recovers, or the process to exit before PG recovers.",
         "kind": "counter",
         "name": "rio_scheduler_log_flush_finalize_deferred_total"
       },
@@ -561,6 +561,11 @@
         "help": "Flush payloads whose ring lines carried non-monotone worker line numbers at span-recording time, so the drv_logs row recorded the physical line count instead of the line-number span (labeled kind: final|periodic). Should be zero — push_for rejects non-monotone batches at ingestion, so a non-zero rate means an ingestion-gate regression. Not a data-loss signal: the blob is still uploaded and served.",
         "kind": "counter",
         "name": "rio_scheduler_log_flush_span_fallback_total"
+      },
+      {
+        "help": "Final log-flush requests dropped because the scheduler lease moved (lost, or lost-and-reacquired) between the request's enqueue and its processing: the live leadership tenure owns that execution's finalization, and uploading the stale ring would freeze a drv_logs row the live tenure may still be extending. Counted for first attempts and retained-deferral retries alike. The execution's log is finalized by the live tenure's own terminal flush; if its terminal had already persisted before the outage (or the drv was re-dispatched under a new exec_id), the row instead stays at its .partial (is_complete=false) coverage — the bounded pre-retry loss.",
+        "kind": "counter",
+        "name": "rio_scheduler_log_flush_stale_tenure_total"
       },
       {
         "help": "Final-flush requests dropped because the drv was re-dispatched while the request was queued (the live ring-buffer exec_id no longer matches the request's). The re-dispatched execution's log is preserved; the stale request's exec was already lost when assign_to_worker discarded its buffer.",
@@ -1153,6 +1158,7 @@
     "rio_scheduler_log_flush_failures_total",
     "rio_scheduler_log_flush_finalize_deferred_total",
     "rio_scheduler_log_flush_span_fallback_total",
+    "rio_scheduler_log_flush_stale_tenure_total",
     "rio_scheduler_log_flush_stale_total",
     "rio_scheduler_log_flush_total",
     "rio_scheduler_log_forward_dropped_total",

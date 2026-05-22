@@ -743,8 +743,14 @@ impl DagActor {
         // pinned from enqueue until the flusher resolves the request —
         // bounded by the flush channel's depth plus the retention cap
         // (DEFERRED_FINALS_MAX; overflow now drops the entry itself) and
-        // by process restart.
-        // r[impl obs.log.deferred-final-retry+2]
+        // by process restart. A request the flusher drops because
+        // leadership moved (tenure mismatch) leaves the entry and this
+        // mark in place — the entry may be the live execution's buffer on
+        // a re-acquired leader; if this cleanup has already run by then
+        // (or the lease transition reset the DAG), the orphaned sealed
+        // entry lingers until the drv's next restamp/dispatch or process
+        // restart.
+        // r[impl obs.log.deferred-final-retry+3]
         let reaped_paths = self.dag.remove_build_interest_and_reap(build_id);
         if let Some(bufs) = &self.log_buffers {
             for path in &reaped_paths {

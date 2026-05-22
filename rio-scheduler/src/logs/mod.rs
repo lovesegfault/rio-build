@@ -187,7 +187,12 @@ struct RingBuf {
     /// retained for retry. `handle_cleanup_terminal_build` must not discard
     /// the entry while this is set — the flusher's processing of the request
     /// (drain, already-finalized refusal, empty-entry reap, or retention-cap
-    /// drop) is the entry's reaper. Set at enqueue by the actor and
+    /// drop) is the entry's reaper. Exception: a request the flusher drops
+    /// because its enqueueing lease tenure ended (`flush_final`'s tenure
+    /// pin) leaves the entry and this mark in place — the entry may be the
+    /// live execution's buffer on a re-acquired leader, so its reaper is
+    /// then the live tenure's own final, the drv's next dispatch discard,
+    /// or process exit. Set at enqueue by the actor and
     /// re-asserted at deferral by the flusher (both exec-guarded); cleared by
     /// a cross-exec restamp (`set_exec`) and removed with the entry.
     final_pending: bool,
@@ -560,7 +565,7 @@ impl LogBuffers {
     /// `terminal_log_epilogue` on a successful enqueue and by `flush_final`'s
     /// deferral arm (re-assert + does-an-entry-stamped-with-this-exec-still-
     /// exist check).
-    // r[impl obs.log.deferred-final-retry+2]
+    // r[impl obs.log.deferred-final-retry+3]
     pub(crate) fn mark_final_pending(&self, drv_path: &str, exec_id: Uuid) -> bool {
         match self.buffers.get_mut(&drv_log_hash(drv_path)) {
             Some(mut e) if e.exec_id == Some(exec_id) => {
