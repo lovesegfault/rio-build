@@ -1300,11 +1300,18 @@ impl DagActor {
         // burn a generation per connectivity blip and fence our own
         // in-flight assignments, contradicting the lease-side
         // semantics (same epoch ⇒ same generation ⇒ in-flight work
-        // stays valid). `holder_id` is the pod identity: stable across
-        // a blip (same process), never reused across pod restarts (a
-        // new pod steals the lease, bumps leaseTransitions, derives a
-        // fresh generation, and never needs the self re-claim). Two
-        // replicas never share one.
+        // stays valid). `holder_id` is the replica's pod identity:
+        // no two LIVE processes ever share one — the predecessor is
+        // dead before its successor starts. It IS reused when the
+        // kubelet restarts the container in place (same pod, same
+        // `HOSTNAME`): while the Lease still names the pod, that
+        // successor renews (same transition count, same generation)
+        // and retains through this very own-claim-row match, exactly
+        // like the same-process blip. Only a REPLACED pod gets a new
+        // name, steals, bumps leaseTransitions, and derives a fresh
+        // generation that needs no self re-claim. (See
+        // `SchedulerDb::claim_generation`'s doc for the load-bearing
+        // premise.)
         //
         // Does the (max) claims-ledger row sit at exactly `gen` and
         // belong to `holder`? The read-back guards the i64→u64 edge:

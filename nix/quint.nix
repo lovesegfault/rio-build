@@ -518,7 +518,7 @@ in
       witness = "noReclaimAfterRestore";
     };
 
-    # Implementation conformance (model-based testing). The four checks
+    # Implementation conformance (model-based testing). The regime checks
     # above prove the PROTOCOL; this one proves rio-lease implements
     # that protocol: rio-lease/src/mbt_tests.rs replays traces generated
     # from the leaderElectionBase regime against the real election

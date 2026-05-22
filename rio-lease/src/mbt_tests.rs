@@ -182,14 +182,16 @@ fn spec_path() -> std::path::PathBuf {
 ///
 /// Omitted, and why:
 /// - `clocks`, `alive`, `fence`, `acquiredAt`, `casRace`, `delVictims`,
-///   `deletes`, `claimFailures`, `restores`: model-only history
-///   bookkeeping (they exist to express the invariants) or pure driver
-///   bookkeeping (diffing the driver's tick counter against the model's
-///   clock proves nothing about the implementation).
-/// - `genHW`: lives in rio-scheduler's claims ledger — phase 2. Sound to
-///   omit in the base regime because the lease-derived and PG-derived
-///   epoch sources stay in lockstep when no fault separates them (the
-///   design doc's lockstep argument).
+///   `deletes`, `claimFailures`, `restores`, `stealRetained`,
+///   `stealBumpedForeignTie`: model-only history bookkeeping (they exist
+///   to express the invariants and the expect-violation witnesses) or
+///   pure driver bookkeeping (diffing the driver's tick counter against
+///   the model's clock proves nothing about the implementation).
+/// - `genHW`, `genHWHolder`: live in rio-scheduler's claims ledger (the
+///   floor and its owning holder) — phase 2. Sound to omit in the base
+///   regime because the lease-derived and PG-derived epoch sources stay
+///   in lockstep when no fault separates them (the design doc's lockstep
+///   argument).
 /// - `snap`, `obs`: projectable (the driver's stash and the election's
 ///   observed record) but deferred until the core projection is proven
 ///   stable — every added field is another way to get the projection
