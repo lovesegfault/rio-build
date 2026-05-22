@@ -181,7 +181,7 @@ pub(crate) enum ObservedUpdate {
 /// returned `ObservedUpdate`.
 ///
 /// The case structure here is the formal contract: it parallels the
-/// per-node action disjunction (`nodeStep`) in
+/// per-node action disjunction reachable from `step` in
 /// `docs/spec/models/leaderElection.qnt` (`apiGet`, `steal`,
 /// `renewLease`, `conflict`, …). When either changes, update the other.
 ///
@@ -199,7 +199,8 @@ pub(crate) enum ObservedUpdate {
 // (`>` to `>=`) or drops a case fails the contract.
 //
 // The case structure parallels the {steal, renewLease, standby} case
-// partition under `nodeStep` in docs/spec/models/leaderElection.qnt.
+// partition across the per-node actions reachable from `step` in
+// docs/spec/models/leaderElection.qnt.
 // When either changes, update the other — `tracey bump` on the spec
 // rule will flag both.
 //
@@ -539,8 +540,8 @@ impl LeaderElection {
     ///
     /// Modeled as the rv-guarded PUT (`casOk` conjoined by `steal` and
     /// `renewLease`) in `docs/spec/models/leaderElection.qnt`.
-    /// The rv-guarded CAS here is what keeps `AtMostOneLeader` during the
-    /// initial-acquisition race — the model checks it over all
+    /// The rv-guarded CAS here is what keeps `atMostOneCASWinner` during
+    /// the initial-acquisition race — the model checks it over all
     /// interleavings of N replicas, which neither the table tests nor
     /// the Kani contract on `decide_pure()` reach (both are
     /// single-replica).
