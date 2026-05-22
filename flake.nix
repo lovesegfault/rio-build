@@ -156,7 +156,7 @@
 
           # CI integration — see the perSystem ciMatrix definition.
           # Linux-only CI runners, so hardcode x86_64-linux. ci.yml /
-          # gen-matrix.sh address `.#githubActions.<kind>.<name>`.
+          # nix/gen_matrix.py address `.#githubActions.<kind>.<name>`.
           flake.githubActions = withSystem "x86_64-linux" ({ config, ... }: config.ciMatrix);
 
           perSystem =
@@ -704,7 +704,8 @@
               #
               # <name>: attrsets where keys → GHA matrix entries and
               #   values → derivations to build. Add/remove entries here;
-              #   the workflow picks them up automatically via gen-matrix.sh.
+              #   the workflow picks them up automatically via
+              #   `nix run .#gen-matrix` (nix/gen_matrix.py).
               #
               # Runner selection by naming convention: entries with a `vm-`
               # prefix run on `rio-ci-kvm` (bare-metal, /dev/kvm mounted);

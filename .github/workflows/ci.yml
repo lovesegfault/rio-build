@@ -13,19 +13,30 @@ concurrency:
   # Cancel stale PR runs; never cancel pushes to main.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+# Two-stage pipeline: gen-matrix evaluates everything once, then each
+# kind optionally runs a `warm-<kind>` job that builds the kind's
+# shared dependency trunk (`.#githubActions.warm.<kind>`) exactly once
+# before the kind's matrix fans out. Without the warm stage, N matrix
+# runners with empty stores all rebuild the same uncached trunk
+# simultaneously — niks3's post-build-hook can't help because they all
+# miss the cache before any of them finishes pushing.
+#
+# Matrix entries are clusters ({name, targets}): one runner builds
+# several flake attrs in a single `nix build --keep-going`, sharing
+# the store and the scheduler. gen-matrix decides the grouping; this
+# file just consumes it.
 jobs:
   # Matrix generator — the ONLY dependency for every build job.
   # ~2min: checkout + nix-install + nix-eval-jobs (parallel eval of
-  # all four matrices, ~35s) + S3 cache probe. Entries already in
-  # rio-nix-cache are dropped from the matrix so no runner spins up
-  # for them. Codecov upload is decoupled into coverage-upload (one
-  # job, always runs, substitutes lcov from cache). No workspace
-  # build on the critical path.
+  # all matrices + warm trunks, ~35s) + S3 cache probe. Entries
+  # already in rio-nix-cache are dropped so no runner spins up for
+  # them. No workspace build on the critical path.
   gen-matrix:
     name: gen-matrix
     runs-on: rio-ci
     timeout-minutes: 60
     outputs:
+      warm: ${{ steps.gen.outputs.warm }}
       checks: ${{ steps.gen.outputs.checks }}
       fuzz: ${{ steps.gen.outputs.fuzz }}
       vm-test: ${{ steps.gen.outputs.vm-test }}
@@ -36,10 +47,12 @@ jobs:
       - uses: ./.github/actions/setup-nix
       - name: Generate matrices from flake
         id: gen
-        # nix-eval-jobs --check-cache-status drops entries already in
-        # rio-nix-cache S3. Adding a new matrix to flake.nix → add one
-        # `outputs:` entry above + one `for m in` entry in the script.
-        run: bash .github/scripts/gen-matrix.sh
+        # Cache-filters + clusters every `.#githubActions.<kind>.<name>`
+        # and decides which warm trunks need building. Adding a new
+        # matrix kind to flake.nix → add one `outputs:` entry above,
+        # one warm-<kind>/<kind> job pair below, and teach
+        # nix/gen_matrix.py the kind's clustering rule.
+        run: nix run .#gen-matrix
       # setup-nix restores ~/.cache/nix everywhere; only this job
       # saves. It runs first and does the deepest eval, so downstream
       # jobs (which all `needs:` this one) restore what it just
@@ -51,44 +64,135 @@ jobs:
           path: ~/.cache/nix
           key: nix-eval-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock') }}
 
-  checks:
-    name: check / ${{ matrix.name }}
+  # ── Warm stage ─────────────────────────────────────────────────────
+  # One job per kind whose `.#githubActions.warm.<kind>` aggregate is
+  # not already substitutable. Builds the trunk once; the post-build
+  # hook pushes each constituent to niks3 as it completes, so the
+  # fan-out jobs (gated on this job finishing) substitute instead of
+  # rebuilding. Cached trunk → gen-matrix omits the kind from `warm`
+  # → job skipped → zero added latency.
+  #
+  # None of these need KVM: building a NixOS image / docker archive is
+  # an ordinary nix build. Only *booting* the result needs /dev/kvm.
+  # Keeping the warm jobs on spot reserves the KVM pool for jobs that
+  # actually run VMs.
+  #
+  # A warm failure (the trunk doesn't compile) skips the kind's whole
+  # fan-out: every leaf would have failed identically, and ci-gate
+  # still goes red on the warm job itself.
+  warm-checks:
+    name: warm / checks
     needs: gen-matrix
-    if: needs.gen-matrix.outputs.checks != '[]'
+    if: contains(fromJSON(needs.gen-matrix.outputs.warm), 'checks')
     runs-on: rio-ci
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        name: ${{ fromJSON(needs.gen-matrix.outputs.checks) }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-nix
-      - run: nix build ".#githubActions.checks.${{ matrix.name }}" --print-build-logs
-  fuzz:
-    name: fuzz / ${{ matrix.name }}
+      - run: nix build ".#githubActions.warm.checks" --print-build-logs
+  warm-fuzz:
+    name: warm / fuzz
     needs: gen-matrix
-    if: needs.gen-matrix.outputs.fuzz != '[]'
+    if: contains(fromJSON(needs.gen-matrix.outputs.warm), 'fuzz')
+    runs-on: rio-ci
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: ./.github/actions/setup-nix
+      - run: nix build ".#githubActions.warm.fuzz" --print-build-logs
+  warm-vm-test:
+    name: warm / vm-test
+    needs: gen-matrix
+    if: contains(fromJSON(needs.gen-matrix.outputs.warm), 'vm-test')
+    runs-on: rio-ci
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: ./.github/actions/setup-nix
+      - run: nix build ".#githubActions.warm.vm-test" --print-build-logs
+  warm-coverage:
+    name: warm / coverage
+    needs: gen-matrix
+    if: contains(fromJSON(needs.gen-matrix.outputs.warm), 'coverage')
+    runs-on: rio-ci
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: ./.github/actions/setup-nix
+      - run: nix build ".#githubActions.warm.coverage" --print-build-logs
+
+  # ── Fan-out stage ──────────────────────────────────────────────────
+  # `!cancelled()` overrides the implicit success() so a SKIPPED warm
+  # job (cached trunk) doesn't auto-skip the fan-out; the explicit
+  # `result != 'failure'` check still skips it when the warm job
+  # actually failed.
+  checks:
+    name: check / ${{ matrix.name }}
+    needs: [gen-matrix, warm-checks]
+    if: |
+      !cancelled()
+      && needs.gen-matrix.result == 'success'
+      && needs.warm-checks.result != 'failure'
+      && needs.gen-matrix.outputs.checks != '[]'
     runs-on: rio-ci
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        name: ${{ fromJSON(needs.gen-matrix.outputs.fuzz) }}
+        include: ${{ fromJSON(needs.gen-matrix.outputs.checks) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: ./.github/actions/setup-nix
+      - name: Build ${{ matrix.targets }}
+        # One nix invocation for the whole cluster: the targets share
+        # the store and the scheduler, so their common deps build once
+        # and the leaves build concurrently up to max-jobs.
+        # --keep-going so one failing target doesn't mask the others.
+        # The attribution loop re-checks each target's outPath (a
+        # cached eval + a store stat — no rebuild) and names the
+        # failures in the job summary, since a cluster is one GHA job.
+        run: |
+          read -ra targets <<< "${{ matrix.targets }}"
+          status=0
+          nix build --keep-going --print-build-logs \
+            "${targets[@]/#/.#githubActions.checks.}" || status=$?
+          for t in "${targets[@]}"; do
+            nix path-info ".#githubActions.checks.$t" >/dev/null 2>&1 \
+              || echo "::error title=check failed::$t"
+          done
+          exit "$status"
+  fuzz:
+    name: fuzz / ${{ matrix.name }}
+    needs: [gen-matrix, warm-fuzz]
+    if: |
+      !cancelled()
+      && needs.gen-matrix.result == 'success'
+      && needs.warm-fuzz.result != 'failure'
+      && needs.gen-matrix.outputs.fuzz != '[]'
+    runs-on: rio-ci
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.gen-matrix.outputs.fuzz) }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-nix
       - run: nix build ".#githubActions.fuzz.${{ matrix.name }}" --print-build-logs
   vm-test:
     name: vm / ${{ matrix.name }}
-    needs: gen-matrix
-    if: needs.gen-matrix.outputs.vm-test != '[]'
+    needs: [gen-matrix, warm-vm-test]
+    if: |
+      !cancelled()
+      && needs.gen-matrix.result == 'success'
+      && needs.warm-vm-test.result != 'failure'
+      && needs.gen-matrix.outputs.vm-test != '[]'
     runs-on: rio-ci-kvm
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        name: ${{ fromJSON(needs.gen-matrix.outputs.vm-test) }}
+        include: ${{ fromJSON(needs.gen-matrix.outputs.vm-test) }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-nix
@@ -99,17 +203,21 @@ jobs:
       - run: nix build ".#githubActions.vm-test.${{ matrix.name }}" --print-build-logs
   coverage:
     name: coverage / ${{ matrix.name }}
-    needs: gen-matrix
-    if: needs.gen-matrix.outputs.coverage != '[]'
+    needs: [gen-matrix, warm-coverage]
+    if: |
+      !cancelled()
+      && needs.gen-matrix.result == 'success'
+      && needs.warm-coverage.result != 'failure'
+      && needs.gen-matrix.outputs.coverage != '[]'
     # Runner selection by naming convention: `vm-*` entries need
-    # KVM (instrumented VM tests → profraw → lcov). `unit` runs
-    # on spot. See flake.nix githubActions comment.
+    # KVM (instrumented VM tests → profraw → lcov). The single
+    # `unit` cluster (every unit-* lcov in one job) runs on spot.
     runs-on: ${{ startsWith(matrix.name, 'vm-') && 'rio-ci-kvm' || 'rio-ci' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        name: ${{ fromJSON(needs.gen-matrix.outputs.coverage) }}
+        include: ${{ fromJSON(needs.gen-matrix.outputs.coverage) }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-nix
@@ -118,7 +226,17 @@ jobs:
       - name: Verify KVM
         if: startsWith(matrix.name, 'vm-')
         run: '[[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]'
-      - run: nix build ".#githubActions.coverage.${{ matrix.name }}" --print-build-logs
+      - name: Build ${{ matrix.targets }}
+        run: |
+          read -ra targets <<< "${{ matrix.targets }}"
+          status=0
+          nix build --keep-going --print-build-logs \
+            "${targets[@]/#/.#githubActions.coverage.}" || status=$?
+          for t in "${targets[@]}"; do
+            nix path-info ".#githubActions.coverage.$t" >/dev/null 2>&1 \
+              || echo "::error title=coverage failed::$t"
+          done
+          exit "$status"
 
   # Decoupled from the (cache-filtered, KVM-heavy) build matrix above:
   # this single job substitutes every lcov from S3 and posts each to
@@ -130,8 +248,8 @@ jobs:
   coverage-upload:
     needs: [gen-matrix, coverage]
     # always(): run regardless of coverage's result (skipped|success|
-    # failure). gen-matrix must have succeeded for coverage-all to be
-    # populated; cancellation should still abort.
+    # failure). gen-matrix must have succeeded for coverage-paths to
+    # be populated; cancellation should still abort.
     if: always() && !cancelled() && needs.gen-matrix.result == 'success'
     runs-on: rio-ci
     timeout-minutes: 30
@@ -149,6 +267,7 @@ jobs:
           # commit; Codecov needs the PR head SHA to associate uploads
           # with the PR's commit list (status checks + after_n_builds).
           COVERAGE_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
   # Single stable name for branch protection. Dynamic matrices
   # mean individual entry names change as tests are added/removed —
   # marking them required would break. This job fans-in and succeeds
@@ -159,7 +278,17 @@ jobs:
   # check silently passes).
   ci-gate:
     if: always()
-    needs: [gen-matrix, checks, fuzz, vm-test, coverage, coverage-upload]
+    needs:
+      - gen-matrix
+      - warm-checks
+      - warm-fuzz
+      - warm-vm-test
+      - warm-coverage
+      - checks
+      - fuzz
+      - vm-test
+      - coverage
+      - coverage-upload
     runs-on: rio-ci
     timeout-minutes: 60
     steps:
@@ -172,8 +301,9 @@ jobs:
       - uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe # v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
-          # gen-matrix.sh elides cached entries; a fully-cached matrix
-          # → job skipped via `if: != '[]'`. gen-matrix and
-          # coverage-upload are NOT listed: both must always run — if
-          # either skips, something is wrong.
-          allowed-skips: checks, fuzz, vm-test, coverage
+          # warm-* skip when their trunk is cached; the build matrices
+          # skip when fully cache-filtered or when their warm job
+          # failed (in which case the warm job is the red one).
+          # gen-matrix and coverage-upload are NOT listed: both must
+          # always run — if either skips, something is wrong.
+          allowed-skips: warm-checks, warm-fuzz, warm-vm-test, warm-coverage, checks, fuzz, vm-test, coverage
