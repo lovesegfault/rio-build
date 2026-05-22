@@ -1391,26 +1391,32 @@ tables) during state recovery.
   derivations` query restricted to terminal-failure child statuses.
 ]
 
-#r("sched.recovery.log-buffer-sweep")[
+#r("sched.recovery.log-buffer-sweep+2")[
   On lease acquisition, after re-stamping ring-buffer entries for
   PG-`Assigned|Running` assignments, the scheduler MUST discard every other
   retained, unsealed ring-buffer entry whose derivation is not present in the
-  rebuilt DAG.
+  rebuilt DAG in a non-terminal state.
 ]
 
 An ex-leader re-acquiring the lease retains its ring buffers across the flap
 (so a still-streaming worker's in-flight execution keeps accumulating), but a
-derivation that reached a terminal state under an interim leader is not loaded
-at recovery and no other cleanup path covers it --- the stale pre-flap lines
-would shadow the execution's stored log in `GetDerivationLogs` (the ring
-buffer is probed before S3) and the periodic flusher would re-upload its
-`.partial` snapshot every 30 seconds for the process lifetime. Entries for
-derivations the rebuilt DAG still tracks survive regardless of state (a
-post-reset retained buffer on a `Ready` node is finalized by the cancel-sweep
-paths, not discarded). Sealed entries are exempt: a seal marks a terminal this
-process already observed, whose final flush request may still be queued; the
-flusher owns their removal. The discarded entries' unflushed tails are
-accepted loss within the failover bound of `obs.log.periodic-flush`.
+derivation that reached a terminal state under an interim leader is either not
+loaded at recovery at all or loaded only as a Poisoned poison-TTL-tracking
+node, and no other cleanup path covers its retained entry --- the stale
+pre-flap lines would shadow the execution's stored log in `GetDerivationLogs`
+(the ring buffer is probed before S3) and the periodic flusher would re-upload
+its `.partial` snapshot every 30 seconds for the process lifetime. Poisoned
+derivations' executions were already finalized by whichever leader poisoned
+them, they are never re-dispatched while poisoned (a post-clear re-dispatch
+mints a fresh `exec_id` and discards the entry first), and the only other
+reaper is the 24-hour poison TTL --- so their retained entries are discarded
+as well. Entries for derivations the rebuilt DAG tracks in a non-terminal
+state survive regardless of which state (a post-reset retained buffer on a
+`Ready` node is finalized by the cancel-sweep paths, not discarded). Sealed
+entries are exempt: a seal marks a terminal this process already observed,
+whose final flush request may still be queued; the flusher owns their removal.
+The discarded entries' unflushed tails are accepted loss within the failover
+bound of `obs.log.periodic-flush`.
 
 Recovery sequence:
 

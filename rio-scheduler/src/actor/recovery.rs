@@ -110,9 +110,10 @@ impl DagActor {
 
         // Acquisition-time LogBuffers reconciliation, part 2 of 2 (part 1
         // is the restamp loop inside load_dag_from_rows): discard retained
-        // entries for derivations the rebuilt DAG does not track — they
-        // went terminal (or vanished) under an interim leader and no other
-        // reaper covers them. r[sched.recovery.log-buffer-sweep]
+        // entries for derivations the rebuilt DAG does not track in a
+        // non-terminal state — they went terminal (or vanished) under an
+        // interim leader and no other reaper covers them (Poisoned: none
+        // before the 24h TTL). r[sched.recovery.log-buffer-sweep+2]
         self.sweep_stale_log_buffers();
 
         self.restore_builds(build_rows, &build_ids, build_drv_hashes)
@@ -196,9 +197,10 @@ impl DagActor {
             // its buffers (`clear_persisted_state`), and `set_exec`
             // clears the retained lines iff the assignment was re-issued
             // under a different exec_id while we weren't leader.
-            // Retained entries whose drv is not loaded here at all
-            // (terminal under an interim leader) are reconciled by
-            // `sweep_stale_log_buffers` right after this load.
+            // Retained entries whose drv is not loaded here as a live
+            // assignment (terminal under an interim leader — including
+            // Poisoned rows loaded only for TTL tracking) are reconciled
+            // by `sweep_stale_log_buffers` right after this load.
             if let Some((exec_id, executor_id)) = restamp {
                 self.set_log_exec(&hash, exec_id, &executor_id);
                 restamped_buffers += 1;
@@ -351,20 +353,24 @@ impl DagActor {
     }
 
     /// Discard retained [`crate::logs::LogBuffers`] entries whose drv is
-    /// not in the just-rebuilt DAG.
+    /// not tracked in a non-terminal state by the just-rebuilt DAG.
     ///
     /// An ex-leader re-acquiring the lease retains its `LogBuffers`
     /// (`clear_persisted_state`) so a still-streaming worker's in-flight
     /// execution keeps its lines across the flap; the restamp loop above
     /// covers exactly those (PG-`Assigned|Running`) drvs. A drv that went
-    /// terminal under an interim leader is not loaded at all, so its
-    /// retained entry would otherwise survive forever: it shadows the
-    /// execution's stored log in `GetDerivationLogs` (ring buffer is
-    /// probed before S3) and `flush_periodic` re-uploads its `.partial`
-    /// every 30s. Membership is keyed on the rebuilt DAG (not on "was
+    /// terminal under an interim leader is either not loaded at all, or
+    /// loaded only as a Poisoned TTL-tracking node — in both cases its
+    /// retained entry would otherwise survive (for Poisoned: until the 24h
+    /// TTL, since reap excludes Poisoned and a poisoned drv is never
+    /// re-dispatched): it shadows the execution's stored log in
+    /// `GetDerivationLogs` (ring buffer is probed before S3) and
+    /// `flush_periodic` re-uploads its `.partial` every 30s. Membership is
+    /// keyed on **non-terminal** presence in the rebuilt DAG (not on "was
     /// restamped") so post-reset retained buffers on Ready/Queued nodes —
     /// which the cancel-sweep finalization (`finalize_buffered_exec_log`)
-    /// needs — survive. Sealed entries are the flusher's to drain and are
+    /// needs — survive, while Poisoned TTL-tracking nodes do not keep an
+    /// entry alive. Sealed entries are the flusher's to drain and are
     /// skipped (see `LogBuffers::discard_unsealed_not_in`).
     ///
     /// The unflushed tail of a discarded entry is accepted loss: it was
@@ -381,7 +387,7 @@ impl DagActor {
     /// terminal-or-absent in that snapshot, never a live stream's buffer.
     /// If the load itself fails, the sweep does not run and the
     /// retain-everything degraded behavior is unchanged.
-    // r[impl sched.recovery.log-buffer-sweep]
+    // r[impl sched.recovery.log-buffer-sweep+2]
     fn sweep_stale_log_buffers(&self) {
         let Some(bufs) = &self.log_buffers else {
             return;
@@ -389,6 +395,13 @@ impl DagActor {
         let live: HashSet<String> = self
             .dag
             .iter_values()
+            // Non-terminal nodes only. The sole terminal status loaded at
+            // recovery is Poisoned (TTL tracking): its execution was already
+            // finalized by whichever leader poisoned it and it is never
+            // re-dispatched while poisoned, so a retained entry is pure
+            // staleness; locally-poisoned drvs have sealed entries, which
+            // discard_unsealed_not_in skips regardless.
+            .filter(|s| !s.status().is_terminal())
             .map(|s| crate::logs::drv_log_hash(s.drv_path().as_str()))
             .collect();
         bufs.discard_unsealed_not_in(&live);

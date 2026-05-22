@@ -3103,33 +3103,39 @@ async fn test_recovery_preserves_reset_exec_id_clear() -> TestResult {
     Ok(())
 }
 
-/// bug_012 (r11): acquisition-time reconciliation of an ex-leader's retained
-/// `LogBuffers` is two-part — the restamp loop covers PG-`Assigned|Running`
-/// drvs; the post-load sweep covers everything else. A retained entry for a
-/// drv that went terminal under an interim leader is never loaded, so without
-/// the sweep it shadows the execution's stored log in GetDerivationLogs (ring
-/// buffer is probed before S3) and flush_periodic re-uploads its `.partial`
-/// every 30s forever. Entries for drvs the rebuilt DAG still tracks must
-/// survive regardless of status: Assigned (reconnect window) and
-/// Ready-with-retained-buffer (cancel-sweep finalization reads that stamp).
+/// bug_012 (r11) + bug_002 (r12): acquisition-time reconciliation of an
+/// ex-leader's retained `LogBuffers` is two-part — the restamp loop covers
+/// PG-`Assigned|Running` drvs; the post-load sweep covers everything else.
+/// A retained entry for a drv that went terminal under an interim leader is
+/// either not loaded at all (most terminal statuses) or loaded only as a
+/// Poisoned TTL-tracking node (r12); without the sweep it shadows the
+/// execution's stored log in GetDerivationLogs (ring buffer is probed before
+/// S3) and flush_periodic re-uploads its `.partial` every 30s — forever, or
+/// until the 24h poison TTL. The survival criterion is non-terminal
+/// membership in the rebuilt DAG: Assigned (reconnect window) and
+/// Ready-with-retained-buffer (cancel-sweep finalization reads that stamp)
+/// survive; absent and Poisoned do not.
 ///
-/// r[verify sched.recovery.log-buffer-sweep]
+/// r[verify sched.recovery.log-buffer-sweep+2]
 #[tokio::test]
 async fn test_recovery_sweeps_stale_log_buffers() -> TestResult {
     let exec_keep = Uuid::now_v7();
     let exec_ready = Uuid::now_v7();
     let exec_gone = Uuid::now_v7();
+    let exec_poisoned = Uuid::now_v7();
     let db = TestDb::new(&MIGRATOR).await;
 
-    // Distinct store-path hashes so the three drvs occupy distinct
+    // Distinct store-path hashes so the four drvs occupy distinct
     // LogBuffers keys (drv_log_hash keys on the path's hash part, and every
     // test_drv_path() shares TEST_HASH).
     let keep_path = test_drv_path("sweep-keep");
     let ready_path = format!("/nix/store/{}-sweep-ready.drv", "b".repeat(32));
     let gone_path = format!("/nix/store/{}-sweep-gone.drv", "c".repeat(32));
+    let poisoned_path = format!("/nix/store/{}-sweep-poisoned.drv", "d".repeat(32));
 
     // --- Phase 1: PG state left by the prior leaderships. ---
     let gone_build = Uuid::new_v4();
+    let poisoned_build = Uuid::new_v4();
     {
         let (handle, task) = setup_actor(db.pool.clone());
         merge_single_node(
@@ -3147,6 +3153,13 @@ async fn test_recovery_sweeps_stale_log_buffers() -> TestResult {
         )
         .await?;
         merge_single_node(&handle, gone_build, "sweep-gone", PriorityClass::Scheduled).await?;
+        merge_single_node(
+            &handle,
+            poisoned_build,
+            "sweep-poisoned",
+            PriorityClass::Scheduled,
+        )
+        .await?;
         barrier(&handle).await;
         drop(handle);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
@@ -3188,14 +3201,35 @@ async fn test_recovery_sweeps_stale_log_buffers() -> TestResult {
         .bind(gone_build)
         .execute(&db.pool)
         .await?;
+    // poisoned: poisoned under the interim leader (which finalized E1's
+    // drv_logs row at poison time); loaded into the rebuilt DAG for TTL
+    // tracking only. poisoned_at is future-dated so the cfg(test) 100ms
+    // POISON_TTL can never classify it expired-at-load — that path would
+    // clear+skip the row, the drv would be absent from the DAG, and the
+    // entry would be swept by the absent-from-DAG criterion, making this
+    // case degenerate into case (3). from_poisoned_row clamps the negative
+    // elapsed to 0, so TTL tracking still starts fresh.
+    sqlx::query(
+        "UPDATE derivations SET status = 'poisoned', \
+         poisoned_at = now() + interval '1 hour', drv_path = $1 \
+         WHERE drv_hash = 'sweep-poisoned'",
+    )
+    .bind(&poisoned_path)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query("UPDATE builds SET status = 'failed' WHERE build_id = $1")
+        .bind(poisoned_build)
+        .execute(&db.pool)
+        .await?;
 
     // --- Phase 2: the EX-LEADER re-acquires; its retained LogBuffers holds
-    // pre-flap lines for all three executions. ---
+    // pre-flap lines for all four executions. ---
     let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
     for (path, exec, worker) in [
         (&keep_path, exec_keep, "w-keep"),
         (&ready_path, exec_ready, "w-ready"),
         (&gone_path, exec_gone, "w-gone"),
+        (&poisoned_path, exec_poisoned, "w-poisoned"),
     ] {
         log_buffers.set_exec(path, exec, worker);
         assert!(
@@ -3238,19 +3272,19 @@ async fn test_recovery_sweeps_stale_log_buffers() -> TestResult {
         Some(1),
         "Assigned|Running entries must survive acquisition"
     );
-    // (2) Ready drv with a retained prior-exec buffer: kept — DAG membership,
-    // not restamp coverage, is the survival criterion (cancel-sweep
-    // finalization reads this stamp).
+    // (2) Ready drv with a retained prior-exec buffer: kept — non-terminal
+    // DAG membership, not restamp coverage, is the survival criterion
+    // (cancel-sweep finalization reads this stamp).
     assert_eq!(log_buffers.exec_id(&ready_path), Some(exec_ready));
     assert_eq!(
         log_buffers.read_since(&ready_path, 0).map(|l| l.len()),
         Some(1),
-        "entries for drvs still tracked by the rebuilt DAG must not be swept"
+        "entries for drvs the rebuilt DAG tracks in a non-terminal state must not be swept"
     );
-    // (3) Terminal-under-interim-leader drv: swept. read_since == None means
-    // GetDerivationLogs falls through to S3 (the interim leader's stored log)
-    // instead of serving stale pre-flap lines, and flush_periodic has no
-    // entry left to re-upload every 30s.
+    // (3) Terminal-under-interim-leader drv (absent from the rebuilt DAG):
+    // swept. read_since == None means GetDerivationLogs falls through to S3
+    // (the interim leader's stored log) instead of serving stale pre-flap
+    // lines, and flush_periodic has no entry left to re-upload every 30s.
     assert_eq!(
         log_buffers.exec_id(&gone_path),
         None,
@@ -3260,7 +3294,29 @@ async fn test_recovery_sweeps_stale_log_buffers() -> TestResult {
         log_buffers.read_since(&gone_path, 0).is_none(),
         "stale pre-flap lines must not shadow the interim leader's stored log"
     );
-    // (4) The sweep is a discard, not a finalization: no FlushRequest.
+    // (4) Poisoned-under-interim-leader drv: IS loaded into the rebuilt DAG
+    // (TTL tracking) — this guard keeps the case from degenerating into (3)
+    // via the expired-at-load path — but its retained entry is swept anyway:
+    // the exec was finalized by whichever leader poisoned it, a poisoned drv
+    // is never re-dispatched, and the only other discard is the 24h poison
+    // TTL. Without the terminal filter the stale entry would shadow the
+    // stored failure log in GetDerivationLogs and re-upload its .partial
+    // every 30s until then.
+    assert_eq!(
+        expect_drv(&handle, "sweep-poisoned").await.status,
+        DerivationStatus::Poisoned,
+        "fixture premise: poisoned drv must be loaded into the rebuilt DAG"
+    );
+    assert_eq!(
+        log_buffers.exec_id(&poisoned_path),
+        None,
+        "retained entry for a poisoned (terminal) drv must be discarded at acquisition"
+    );
+    assert!(
+        log_buffers.read_since(&poisoned_path, 0).is_none(),
+        "stale pre-flap lines must not shadow the poisoned exec's stored failure log"
+    );
+    // (5) The sweep is a discard, not a finalization: no FlushRequest.
     assert!(
         flush_rx.try_recv().is_err(),
         "acquisition-time sweep must not enqueue flush requests"

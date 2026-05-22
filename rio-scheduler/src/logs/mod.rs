@@ -766,10 +766,12 @@ impl LogBuffers {
     /// lease acquisition: an ex-leader's `LogBuffers` is retained across
     /// the flap (`clear_persisted_state`), and the restamp loop only
     /// covers PG-`Assigned|Running` drvs — an entry whose drv went
-    /// terminal under an interim leader would otherwise shadow that
-    /// execution's stored log in `GetDerivationLogs` (the ring buffer is
-    /// probed before S3) and be re-uploaded as a stale `.partial` by every
-    /// periodic flush for the process lifetime.
+    /// terminal under an interim leader (absent from the rebuilt DAG, or
+    /// present only as a Poisoned TTL-tracking node and therefore excluded
+    /// from `live_keys`) would otherwise shadow that execution's stored
+    /// log in `GetDerivationLogs` (the ring buffer is probed before S3)
+    /// and be re-uploaded as a stale `.partial` by every periodic flush
+    /// for the process lifetime.
     ///
     /// Sealed entries are skipped: a seal marks a terminal observed by
     /// THIS process whose final `FlushRequest` may still be queued — the
@@ -810,7 +812,7 @@ impl LogBuffers {
                 exec_id = ?exec_id,
                 dropped_lines = lines,
                 dropped_bytes = bytes,
-                "discarding retained log buffer for a derivation not tracked after recovery"
+                "discarding retained log buffer for a derivation not live after recovery"
             );
             self.discard(key);
         }
