@@ -1,7 +1,7 @@
 //! xtask configuration, loaded from `.env.local` + process env.
 //!
-//! Same pattern as rio-* binaries (RIO_ prefix via the config crate), so
-//! one `.env.local` serves both xtask and `process-compose up`.
+//! Same RIO_-prefix convention as the rio-* binaries, so one `.env.local`
+//! serves both xtask and `process-compose up`.
 
 use std::path::PathBuf;
 
@@ -104,6 +104,10 @@ impl XtaskConfig {
     /// side effect (which a jailed test cannot sandbox).
     fn from_process_env() -> Result<Self> {
         Ok(::config::Config::builder()
+            // Flat, string-only struct: unlike rio-common's nested Configs,
+            // this source deliberately skips `.separator("__")` (no nested
+            // fields to address) and `.try_parsing(true)` (every field is a
+            // string shape; literal values are what we want).
             .add_source(::config::Environment::with_prefix("RIO").prefix_separator("_"))
             .build()?
             .try_deserialize::<Self>()?)
