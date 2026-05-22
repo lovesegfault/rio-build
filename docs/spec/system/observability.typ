@@ -114,20 +114,25 @@ restamped entry reaps it so the read path falls through to the stored
 execution's row may remain `is_complete = false` (surfaced per
 `obs.log.incomplete-surfaced`) until a retry lands.
 
-#r("obs.log.deferred-final-retry")[
+#r("obs.log.deferred-final-retry+2")[
   A final flush deferred because the finalize guard could not consult
   `drv_logs` MUST be retained by the flusher --- up to a bounded retention
   cap --- and retried while the execution's sealed ring-buffer entry remains
-  in memory, and terminal cleanup MUST NOT discard an entry whose deferred
-  final flush is still retained; deferrals beyond the cap fall back to the
-  terminal-cleanup bound.
+  in memory, and terminal cleanup MUST NOT discard an entry whose final
+  flush is still pending --- enqueued at the terminal epilogue and not yet
+  resolved by the flusher, or retained for retry; a deferral beyond the cap
+  drops that execution's buffered entry instead of retaining it.
 ]
 
 This is what keeps a transient PG failure at final-flush time from losing
 buffered log content while S3 stays healthy. The retention is a fixed cap of
 in-flight deferrals and does not survive process exit; the retry runs
 regardless of leadership, like the completion flush itself, because every
-retained request was enqueued while this replica held the lease.
+retained request was enqueued while this replica held the lease. The
+protection starts at enqueue: a final still queued behind earlier stalled
+flushes during the same outage is protected exactly like one already
+attempted and deferred, and stays pinned until the flusher resolves the
+request (or the process exits --- the dead-flusher residual).
 
 #r("obs.log.incomplete-surfaced")[
   A `GetDerivationLogs` response whose final chunk carries

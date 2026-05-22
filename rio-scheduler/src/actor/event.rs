@@ -900,7 +900,10 @@ impl DagActor {
     /// `rio: result` line that disagrees with the row; the row is
     /// authoritative. All three steps share the single resolution
     /// performed at the top of this function, so the flush request and
-    /// the `bd.exec_id` write cannot name different executions.
+    /// the `bd.exec_id` write cannot name different executions. The
+    /// final-pending mark is set only after a successful enqueue, so the
+    /// dropped-enqueue degraded mode (periodic snapshots + cleanup
+    /// discard) is unchanged.
     ///
     /// r[impl sched.merge.exec-correlation+7]
     pub(super) fn terminal_log_epilogue(
@@ -940,7 +943,17 @@ impl DagActor {
         };
         self.seal_log_buffer(drv_hash);
         let enqueued = self.trigger_log_flush(drv_hash, exec_id, status);
-        if !enqueued && self.discard_log_buffer_if_empty(drv_hash) {
+        if enqueued {
+            // The flusher will resolve this request (drain, refusal, reap,
+            // or deferral + retry); mark the entry now so a
+            // CleanupTerminalBuild firing while the request is still queued
+            // behind earlier flusher work (a slow PG outage serially burns
+            // the pool-acquire timeout per attempt) does not discard the
+            // only copy of the log out from under it. Marking only at
+            // deferral time left queued-but-unattempted finals unprotected.
+            // r[impl obs.log.deferred-final-retry+2]
+            self.mark_log_final_pending(drv_hash, exec_id);
+        } else if self.discard_log_buffer_if_empty(drv_hash) {
             // The flusher will never see this request (channel full,
             // flusher dead, or not configured), so its drain_if_exec will
             // never remove the entry. A zero-line entry has nothing the
@@ -981,6 +994,27 @@ impl DagActor {
             return;
         };
         bufs.seal(drv_path);
+    }
+
+    /// Mark `drv_hash`'s ring entry as having a final flush pending with the
+    /// flusher (exec-guarded). Called from [`Self::terminal_log_epilogue`]
+    /// immediately after a successful [`Self::trigger_log_flush`] enqueue so
+    /// `handle_cleanup_terminal_build` leaves the sealed buffer for the
+    /// flusher to resolve even when the request is still queued (a slow PG
+    /// outage can hold the flusher past TERMINAL_CLEANUP_DELAY before the
+    /// first attempt — the request's eventual drain/refusal/reap is the
+    /// entry's reaper either way). No-op if `log_buffers` is unwired
+    /// (tests), the drv vanished from the DAG, or the entry is missing /
+    /// restamped to a different execution (the request will then resolve as
+    /// stale — nothing to protect).
+    pub(super) fn mark_log_final_pending(&self, drv_hash: &DrvHash, exec_id: Uuid) {
+        let Some(bufs) = &self.log_buffers else {
+            return;
+        };
+        let Some(drv_path) = self.dag.path_for_hash(drv_hash) else {
+            return;
+        };
+        bufs.mark_final_pending(drv_path, exec_id);
     }
 
     /// Drop any stale log buffer (and seal) for `drv_hash`. Called from

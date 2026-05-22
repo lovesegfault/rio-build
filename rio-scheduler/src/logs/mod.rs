@@ -181,13 +181,16 @@ struct RingBuf {
     /// content stays covered regardless because it lives in
     /// `recovered_prefix`, not the ring.
     prefix_checked: bool,
-    /// A final `FlushRequest` for this entry's execution was deferred by the
-    /// flusher (the finalize guard could not read `drv_logs`) and is being
+    /// A final `FlushRequest` for this entry's execution is pending with the
+    /// flusher: enqueued by the actor's `terminal_log_epilogue` and not yet
+    /// resolved, or deferred (finalize guard could not read `drv_logs`) and
     /// retained for retry. `handle_cleanup_terminal_build` must not discard
-    /// the entry while this is set — the retried flush's drain is its reaper.
-    /// Set/cleared only by the flusher (exec-guarded), cleared by a cross-exec
-    /// restamp (`set_exec`), and removed with the entry.
-    finalize_deferred: bool,
+    /// the entry while this is set — the flusher's processing of the request
+    /// (drain, already-finalized refusal, empty-entry reap, or retention-cap
+    /// drop) is the entry's reaper. Set at enqueue by the actor and
+    /// re-asserted at deferral by the flusher (both exec-guarded); cleared by
+    /// a cross-exec restamp (`set_exec`) and removed with the entry.
+    final_pending: bool,
 }
 
 /// Per-derivation log ring buffers, keyed by [`drv_log_hash`] of the
@@ -469,13 +472,13 @@ impl LogBuffers {
             // would prepend the wrong execution's content.
             entry.recovered_prefix = None;
             entry.prefix_checked = false;
-            // A deferred-final mark belongs to the prior execution too: the
-            // flusher's retained request names the old exec_id and will
-            // resolve as "no entry remains for this execution" once it sees
-            // the restamp. Carrying the mark across would make terminal
-            // cleanup skip the discard that bounds a dropped-FlushRequest
-            // leak for the NEW execution's buffer.
-            entry.finalize_deferred = false;
+            // A pending-final mark belongs to the prior execution too: the
+            // flusher's queued/retained request names the old exec_id and
+            // will resolve as stale/no-entry once it sees the restamp.
+            // Carrying the mark across would make terminal cleanup skip the
+            // discard that bounds a dropped-FlushRequest leak for the NEW
+            // execution's buffer.
+            entry.final_pending = false;
         } else if entry.exec_id == Some(exec_id) {
             // Same-exec re-stamp. Only recovery does this (dispatch always
             // discards first), i.e. this replica just (re-)acquired the
@@ -550,37 +553,31 @@ impl LogBuffers {
         }
     }
 
-    /// Mark `drv_path`'s entry as having a deferred final flush retained for
-    /// retry, iff it is stamped with `exec_id`. Returns whether the mark was
-    /// applied (false ⇒ entry missing or restamped — nothing to retry against).
-    // r[impl obs.log.deferred-final-retry]
-    pub(crate) fn mark_finalize_deferred(&self, drv_path: &str, exec_id: Uuid) -> bool {
+    /// Mark `drv_path`'s entry as having a final flush pending with the
+    /// flusher, iff it is stamped with `exec_id`. Returns whether the mark was
+    /// applied (false ⇒ entry missing or restamped — nothing to protect; the
+    /// request will resolve as stale/no-entry). Called by
+    /// `terminal_log_epilogue` on a successful enqueue and by `flush_final`'s
+    /// deferral arm (re-assert + does-an-entry-stamped-with-this-exec-still-
+    /// exist check).
+    // r[impl obs.log.deferred-final-retry+2]
+    pub(crate) fn mark_final_pending(&self, drv_path: &str, exec_id: Uuid) -> bool {
         match self.buffers.get_mut(&drv_log_hash(drv_path)) {
             Some(mut e) if e.exec_id == Some(exec_id) => {
-                e.finalize_deferred = true;
+                e.final_pending = true;
                 true
             }
             _ => false,
         }
     }
 
-    /// Reverse of [`Self::mark_finalize_deferred`] (exec-guarded). Used when
-    /// the flusher cannot retain the deferred request (retention cap), so
-    /// terminal cleanup goes back to owning the entry's discard.
-    pub(crate) fn clear_finalize_deferred(&self, drv_path: &str, exec_id: Uuid) {
-        if let Some(mut e) = self.buffers.get_mut(&drv_log_hash(drv_path))
-            && e.exec_id == Some(exec_id)
-        {
-            e.finalize_deferred = false;
-        }
-    }
-
-    /// Whether `drv_path`'s entry carries a deferred final flush awaiting
-    /// retry. Read by `handle_cleanup_terminal_build` to skip its discard.
-    pub(crate) fn finalize_deferred(&self, drv_path: &str) -> bool {
+    /// Whether `drv_path`'s entry has a final flush pending with the flusher
+    /// (enqueued and not yet resolved, or deferred and retained for retry).
+    /// Read by `handle_cleanup_terminal_build` to skip its discard.
+    pub(crate) fn final_pending(&self, drv_path: &str) -> bool {
         self.buffers
             .get(&drv_log_hash(drv_path))
-            .is_some_and(|e| e.finalize_deferred)
+            .is_some_and(|e| e.final_pending)
     }
 
     /// Exec-guarded sibling of [`Self::discard_if_empty`]: remove the entry
@@ -1622,45 +1619,36 @@ mod tests {
         assert_eq!(bufs.active_count(), 1, "discard must clear seal");
     }
 
-    /// Deferred-final mark plumbing: exec-guarded set/clear/read, and the
-    /// flag dies with the entry.
+    /// Pending-final mark plumbing: exec-guarded set/read, and the flag dies
+    /// with the entry.
     #[test]
-    fn finalize_deferred_mark_is_exec_guarded() {
+    fn final_pending_mark_is_exec_guarded() {
         let bufs = LogBuffers::new();
         let exec = Uuid::now_v7();
         let other = Uuid::now_v7();
 
         assert!(
-            !bufs.mark_finalize_deferred("r14m3f-missing", exec),
+            !bufs.mark_final_pending("r14m3f-missing", exec),
             "missing entry: nothing to mark"
         );
 
         bufs.set_exec("r14m3f-drv", exec, "w1");
         assert!(
-            !bufs.mark_finalize_deferred("r14m3f-drv", other),
+            !bufs.mark_final_pending("r14m3f-drv", other),
             "exec mismatch: not marked"
         );
-        assert!(!bufs.finalize_deferred("r14m3f-drv"));
+        assert!(!bufs.final_pending("r14m3f-drv"));
 
-        assert!(bufs.mark_finalize_deferred("r14m3f-drv", exec));
-        assert!(bufs.finalize_deferred("r14m3f-drv"));
+        assert!(bufs.mark_final_pending("r14m3f-drv", exec));
+        assert!(bufs.final_pending("r14m3f-drv"));
 
-        // Clear is exec-guarded too.
-        bufs.clear_finalize_deferred("r14m3f-drv", other);
-        assert!(
-            bufs.finalize_deferred("r14m3f-drv"),
-            "mismatch clear is a no-op"
-        );
-        bufs.clear_finalize_deferred("r14m3f-drv", exec);
-        assert!(!bufs.finalize_deferred("r14m3f-drv"));
-
-        // Re-mark, then the flag dies with the entry.
-        assert!(bufs.mark_finalize_deferred("r14m3f-drv", exec));
+        // Re-asserting is fine, then the flag dies with the entry.
+        assert!(bufs.mark_final_pending("r14m3f-drv", exec));
         bufs.discard("r14m3f-drv");
-        assert!(!bufs.finalize_deferred("r14m3f-drv"));
+        assert!(!bufs.final_pending("r14m3f-drv"));
     }
 
-    /// Restamp lifecycle of the deferred-final mark: a same-exec restamp
+    /// Restamp lifecycle of the pending-final mark: a same-exec restamp
     /// (recovery at lease re-acquisition) keeps it — the flusher's retained
     /// request still names that exec and its drain is still the entry's
     /// reaper — while a cross-exec restamp (an interim leader re-dispatched
@@ -1668,20 +1656,20 @@ mod tests {
     /// bookkeeping, so terminal cleanup goes back to bounding the NEW
     /// execution's buffer.
     #[test]
-    fn finalize_deferred_mark_restamp_lifecycle() {
+    fn final_pending_mark_restamp_lifecycle() {
         let bufs = LogBuffers::new();
         let e1 = Uuid::now_v7();
         let e2 = Uuid::now_v7();
 
         bufs.set_exec("r14m3g-drv", e1, "w1");
         assert!(bufs.push_for("r14m3g-drv", &mk_batch("r14m3g-drv", 0, &[b"l0"]), "w1"));
-        assert!(bufs.mark_finalize_deferred("r14m3g-drv", e1));
-        assert!(bufs.finalize_deferred("r14m3g-drv"));
+        assert!(bufs.mark_final_pending("r14m3g-drv", e1));
+        assert!(bufs.final_pending("r14m3g-drv"));
 
         // Same-exec restamp keeps the mark (and the lines).
         bufs.set_exec("r14m3g-drv", e1, "w1");
         assert!(
-            bufs.finalize_deferred("r14m3g-drv"),
+            bufs.final_pending("r14m3g-drv"),
             "same-exec restamp must not strand the entry to cleanup"
         );
         assert!(
@@ -1693,7 +1681,7 @@ mod tests {
         // Cross-exec restamp clears it (and the lines).
         bufs.set_exec("r14m3g-drv", e2, "w1");
         assert!(
-            !bufs.finalize_deferred("r14m3g-drv"),
+            !bufs.final_pending("r14m3g-drv"),
             "cross-exec restamp clears the prior execution's mark"
         );
         assert!(

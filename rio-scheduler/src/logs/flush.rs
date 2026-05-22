@@ -69,11 +69,13 @@
 //! `.partial` key with an `is_complete=false` PG row — and
 //! `CleanupTerminalBuild` (after `TERMINAL_CLEANUP_DELAY`, ~60s) reaps the
 //! DAG node and discards the buffer (`LogBuffers::discard`), bounding the
-//! leak. A final flush deferred because the already-finalized guard could
-//! not read `drv_logs` is handled differently: the request is retained by
-//! the flusher and retried on the periodic tick (and once at shutdown)
-//! while the sealed entry stays in memory; terminal cleanup leaves such
-//! entries to the retry (`obs.log.deferred-final-retry`).
+//! leak. A final whose `FlushRequest` *was* accepted is handled
+//! differently: the epilogue marks the entry final-pending at enqueue,
+//! terminal cleanup leaves marked entries to the flusher, and a deferral
+//! (already-finalized guard could not read `drv_logs`) keeps the request
+//! retained and retried on the periodic tick (and once at shutdown) while
+//! the sealed entry stays in memory (`obs.log.deferred-final-retry`); the
+//! cleanup discard therefore only bounds buffers whose enqueue failed.
 //!
 //! Compression is CPU-bound; runs in `spawn_blocking` so it doesn't hog a
 //! tokio worker thread during the typical 10-100ms compression of a few-MB log.
@@ -115,10 +117,15 @@ const LOG_GC_BATCH: i64 = 1000;
 
 /// How many deferred final flushes (finalize guard could not read `drv_logs`)
 /// the flusher retains for retry. Each retained request pins its sealed ring
-/// entry in memory until PG answers (≤ RING_BYTE_CAP each), so the cap bounds
-/// added memory during a long PG outage; deferrals beyond it fall back to the
-/// pre-retry behavior (consumed; terminal cleanup discards the buffer ~60s
-/// after build terminal).
+/// entry in memory until PG answers (≤ RING_BYTE_CAP each), and — since the
+/// final-pending mark is set at enqueue — entries whose finals are still
+/// *queued* are pinned too (bounded by the flush channel's 1000-deep
+/// backlog), so the cap bounds the *retained* set, not the whole pinned set,
+/// during a long PG outage. Deferrals beyond the cap drop the execution's
+/// buffered entry at overflow time — the same loss the pre-retry behavior
+/// accepted at terminal cleanup, which can no longer be relied on because
+/// the enqueue-time pending mark may already have made cleanup skip the
+/// entry.
 const DEFERRED_FINALS_MAX: usize = 64;
 
 /// Request to flush one derivation's logs. Sent by the actor from
@@ -430,7 +437,7 @@ impl LogFlusher {
                         // completion arm isn't either, and these are the same
                         // requests one PG error later); the snapshot sweep
                         // below keeps its gate.
-                        // r[impl obs.log.deferred-final-retry]
+                        // r[impl obs.log.deferred-final-retry+2]
                         self.retry_deferred(&mut deferred).await;
                         // Gated. A standby's `LogBuffers` is
                         // structurally empty (no worker streams connect to it),
@@ -572,7 +579,7 @@ impl LogFlusher {
                 // stored-coverage reconcile needs this same row (it skips the
                 // tick), and on a deposed leader it does not run at all, so
                 // "leave it to the snapshotter" is not a durability story.
-                // r[impl obs.log.deferred-final-retry]
+                // r[impl obs.log.deferred-final-retry+2]
                 metrics::counter!("rio_scheduler_log_flush_finalize_deferred_total").increment(1);
 
                 // A zero-line entry (failover restamp whose worker never
@@ -598,15 +605,14 @@ impl LogFlusher {
                     return None;
                 }
 
-                // Non-empty entry still stamped with this execution: retain
-                // the request for retry. The entry is marked so terminal
-                // cleanup leaves it alone; the retried flush re-runs this
-                // guard once PG answers and then drains/uploads (or refuses,
-                // if an interim leader finalized it meanwhile).
-                if self
-                    .buffers
-                    .mark_finalize_deferred(&req.drv_path, req.exec_id)
-                {
+                // Non-empty entry still stamped with this execution:
+                // re-assert the pending mark (normally already set at
+                // enqueue; the call doubles as the does-an-entry-stamped-
+                // with-this-exec-still-exist check) and retain the request
+                // for retry. The retried flush re-runs this guard once PG
+                // answers and then drains/uploads (or refuses, if an
+                // interim leader finalized it meanwhile).
+                if self.buffers.mark_final_pending(&req.drv_path, req.exec_id) {
                     warn!(
                         drv = %req.drv_path,
                         exec_id = %req.exec_id,
@@ -759,23 +765,39 @@ impl LogFlusher {
     /// Retain a deferred final for retry, bounded by [`DEFERRED_FINALS_MAX`]
     /// and deduplicated by `exec_id` (a duplicate final for the same execution
     /// resolves identically; keeping one is enough). On overflow the request
-    /// is dropped and the entry's deferred mark is cleared so terminal cleanup
-    /// goes back to bounding the buffer's lifetime exactly as before the
-    /// retry mechanism existed.
-    // r[impl obs.log.deferred-final-retry]
+    /// is dropped and the execution's buffered entry is dropped with it
+    /// (exec-guarded): the final-pending mark is set at enqueue, so terminal
+    /// cleanup may already have run and skipped the entry — handing it back
+    /// to cleanup is no longer a disposal, and clearing only the mark would
+    /// leak a sealed entry that nothing ever reaps.
+    // r[impl obs.log.deferred-final-retry+2]
     fn retain_deferred(&self, deferred: &mut Vec<FlushRequest>, req: FlushRequest) {
         if deferred.iter().any(|d| d.exec_id == req.exec_id) {
             return;
         }
         if deferred.len() >= DEFERRED_FINALS_MAX {
-            self.buffers
-                .clear_finalize_deferred(&req.drv_path, req.exec_id);
+            // Cap overflow: accept the loss of this execution's buffered
+            // tail (the documented fallback). The entry cannot be handed
+            // back to terminal cleanup any more — the final-pending mark is
+            // set at enqueue, so the build's CleanupTerminalBuild may
+            // already have run and skipped this entry on the strength of
+            // it; clearing the mark here would leave a sealed entry that
+            // nothing ever reaps. Drop it now instead (exec-guarded so a
+            // re-dispatched execution's fresh entry is never touched) and
+            // clear the seal tombstone with it.
+            if self
+                .buffers
+                .drain_if_exec(&req.drv_path, req.exec_id)
+                .is_some()
+            {
+                self.buffers.unseal(&req.drv_path);
+            }
             warn!(
                 drv = %req.drv_path,
                 exec_id = %req.exec_id,
                 retained = deferred.len(),
-                "deferred-final retry queue full; falling back to terminal-cleanup \
-                 bounding for this execution's buffer"
+                "deferred-final retry queue full; dropping this execution's \
+                 buffered log tail"
             );
             return;
         }
@@ -795,7 +817,7 @@ impl LogFlusher {
     /// and on shutdown, NOT gated on leadership: like the completion arm
     /// itself, every retained request was enqueued by the actor while it
     /// held the lease (see the `is_leader` field doc).
-    // r[impl obs.log.deferred-final-retry]
+    // r[impl obs.log.deferred-final-retry+2]
     async fn retry_deferred(&self, deferred: &mut Vec<FlushRequest>) {
         if deferred.is_empty() {
             return;
@@ -3333,7 +3355,7 @@ mod tests {
     /// first-attempt final would (scenario 1 of r14 merged_bug_003: a fast
     /// build whose first-ever flush met a transient PG blip must not lose its
     /// whole log to the ~60s terminal-cleanup discard while S3 is healthy).
-    /// r[verify obs.log.deferred-final-retry]
+    /// r[verify obs.log.deferred-final-retry+2]
     #[tokio::test]
     async fn deferred_final_is_retried_and_uploads_after_pg_recovers() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -3381,7 +3403,7 @@ mod tests {
         );
         assert!(buffers.is_sealed(drv_path), "seal left in place");
         assert!(
-            buffers.finalize_deferred(drv_path),
+            buffers.final_pending(drv_path),
             "entry marked so terminal cleanup leaves it to the retry"
         );
 
@@ -3440,7 +3462,7 @@ mod tests {
     /// assumption as the existing closed-pool deferral tests). If a future
     /// sqlx bump changes that, this test will hang/time out rather than
     /// pass vacuously.
-    /// r[verify obs.log.deferred-final-retry]
+    /// r[verify obs.log.deferred-final-retry+2]
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn deferred_final_retry_loop_runs_when_not_leader() -> anyhow::Result<()> {
@@ -3514,7 +3536,7 @@ mod tests {
     /// `.partial` instead of serving empty still-active chunks until build
     /// cleanup. A re-dispatched execution's fresh empty entry is never
     /// touched by a stale deferred request.
-    /// r[verify obs.log.deferred-final-retry]
+    /// r[verify obs.log.deferred-final-retry+2]
     #[tokio::test]
     async fn deferred_final_with_empty_entry_reaps_it_for_this_exec_only() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -3591,11 +3613,13 @@ mod tests {
     }
 
     /// Retention-cap behavior of the loop-side helpers: the cap bounds the
-    /// retry queue, an overflow clears the entry's deferred mark (so terminal
-    /// cleanup goes back to owning its discard), and duplicate exec_ids do
-    /// not consume cap slots.
+    /// retry queue, an overflow drops the execution's buffered entry outright
+    /// (terminal cleanup may already have run and skipped it on the
+    /// enqueue-time final-pending mark, so nothing else would ever reap it),
+    /// and duplicate exec_ids do not consume cap slots.
+    /// r[verify obs.log.deferred-final-retry+2]
     #[tokio::test]
-    async fn deferred_final_retention_cap_clears_mark_on_overflow() -> anyhow::Result<()> {
+    async fn deferred_final_retention_cap_drops_entry_on_overflow() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let (s3, _puts, _deletes) = mock_s3_capturing();
         let buffers = Arc::new(LogBuffers::new());
@@ -3608,13 +3632,14 @@ mod tests {
             always_leader(),
         );
 
-        // The overflow drv has a real, marked entry — the precondition that
-        // makes the "mark cleared on overflow" assertion non-vacuous.
+        // The overflow drv has a real, marked, sealed entry — the
+        // precondition that makes the "entry dropped on overflow" assertions
+        // non-vacuous.
         let drv_o = "/nix/store/r14m3e-overflow.drv";
         let exec_o = stamp_and_push(&buffers, drv_o, &[b"line"]);
         buffers.seal(drv_o);
-        assert!(buffers.mark_finalize_deferred(drv_o, exec_o));
-        assert!(buffers.finalize_deferred(drv_o), "precondition: marked");
+        assert!(buffers.mark_final_pending(drv_o, exec_o));
+        assert!(buffers.final_pending(drv_o), "precondition: marked");
 
         // Fill the queue to the cap with distinct exec_ids (no ring entries
         // needed — retain_deferred only inspects the Vec and the mark).
@@ -3643,8 +3668,8 @@ mod tests {
         );
         assert_eq!(deferred.len(), DEFERRED_FINALS_MAX, "dedup by exec_id");
 
-        // Overflow: the request is dropped and the mark is cleared so
-        // cleanup discards the buffer exactly as before the retry existed.
+        // Overflow: the request is dropped and the entry is dropped with it
+        // (cleanup may already have skipped it on the enqueue-time mark).
         flusher.retain_deferred(
             &mut deferred,
             FlushRequest {
@@ -3654,9 +3679,15 @@ mod tests {
             },
         );
         assert_eq!(deferred.len(), DEFERRED_FINALS_MAX, "cap holds");
+        assert_eq!(
+            buffers.exec_id(drv_o),
+            None,
+            "overflow drops the entry — terminal cleanup may already have \
+             skipped it on the enqueue-time mark, so nothing else would reap it"
+        );
         assert!(
-            !buffers.finalize_deferred(drv_o),
-            "overflow cleared the mark so terminal cleanup owns the discard again"
+            !buffers.is_sealed(drv_o),
+            "overflow clears the seal tombstone with the entry"
         );
         Ok(())
     }

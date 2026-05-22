@@ -733,22 +733,26 @@ impl DagActor {
         // are already reaped at the epilogue when the enqueue fails;
         // this backstop matters for buffers holding lines.)
         //
-        // Exception: an entry whose deferred final flush is retained by the
-        // flusher (finalize guard could not read drv_logs — PG outage at
-        // final-flush time). Discarding it here would destroy the only copy
-        // of the log while the flusher is still going to retry; the retried
-        // flush's drain is that entry's reaper. Bounded by the flusher's
-        // DEFERRED_FINALS_MAX retention cap (overflow entries are not
-        // marked and are discarded here as before) and by process restart.
-        // r[impl obs.log.deferred-final-retry]
+        // Exception: an entry whose final flush is still pending with the
+        // flusher — enqueued by the terminal epilogue and not yet resolved
+        // (it may still be queued behind earlier flushes during a PG
+        // outage), or deferred by the finalize guard and retained for
+        // retry. Discarding it here would destroy the only copy of the log
+        // while the flusher is still going to process it; that request's
+        // drain/refusal/reap is the entry's reaper. Pending entries are
+        // pinned from enqueue until the flusher resolves the request —
+        // bounded by the flush channel's depth plus the retention cap
+        // (DEFERRED_FINALS_MAX; overflow now drops the entry itself) and
+        // by process restart.
+        // r[impl obs.log.deferred-final-retry+2]
         let reaped_paths = self.dag.remove_build_interest_and_reap(build_id);
         if let Some(bufs) = &self.log_buffers {
             for path in &reaped_paths {
-                if bufs.finalize_deferred(path) {
+                if bufs.final_pending(path) {
                     debug!(
                         drv_path = %path,
-                        "skipping log-buffer discard at build cleanup: deferred \
-                         final flush pending retry"
+                        "skipping log-buffer discard at build cleanup: final \
+                         flush still pending with the flusher"
                     );
                     continue;
                 }

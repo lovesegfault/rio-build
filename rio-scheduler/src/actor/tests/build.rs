@@ -418,7 +418,7 @@ async fn test_cleanup_terminal_build_gc_deletes_event_log() -> TestResult {
 /// the default `test_drv_path` fixture uses one shared `TEST_HASH` for every
 /// name, which would silently collapse both buffers into one entry and make
 /// the assertions vacuous (the fixture-collision trap).
-/// r[verify obs.log.deferred-final-retry]
+/// r[verify obs.log.deferred-final-retry+2]
 #[tokio::test]
 async fn cleanup_skips_log_buffer_with_deferred_final_pending() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -467,7 +467,7 @@ async fn cleanup_skips_log_buffer_with_deferred_final_pending() -> TestResult {
         bufs.seal(path);
     }
     // Only A's final flush was deferred (the flusher marked it).
-    assert!(bufs.mark_finalize_deferred(path_a, exec_a));
+    assert!(bufs.mark_final_pending(path_a, exec_a));
 
     actor.handle_cleanup_terminal_build(build_id);
 
@@ -491,6 +491,119 @@ async fn cleanup_skips_log_buffer_with_deferred_final_pending() -> TestResult {
         bufs.exec_id(path_b),
         None,
         "unmarked buffer is discarded at cleanup as before"
+    );
+
+    Ok(())
+}
+
+/// A final FlushRequest that is still QUEUED (enqueued by the terminal
+/// epilogue, not yet attempted by the flusher) must survive
+/// CleanupTerminalBuild: the epilogue marks the entry final-pending at
+/// enqueue time and cleanup leaves marked entries to the flusher. Marking
+/// only at deferral time (round 14) left a final queued behind earlier
+/// flusher stalls unprotected — during a slow PG outage each attempt burns
+/// the ~30s pool-acquire timeout, so a final enqueued behind two or more
+/// stalls is first attempted only after its build's cleanup has discarded
+/// the sealed buffer, and the eventual attempt finds nothing to retain.
+/// The enqueue-failure path keeps today's behavior: an un-enqueued final's
+/// buffer is NOT marked, so cleanup still bounds that leak to ~60s.
+///
+/// Fixture note: the two drv_paths carry DISTINCT (valid, 32-char) store
+/// hashes because `drv_log_hash` keys buffers on the hash part — a shared
+/// hash would collapse both into one entry and make the assertions
+/// vacuous. Buffers are seeded via set_exec + push_for (push() leaves
+/// entries unstamped and the epilogue would skip them).
+/// r[verify obs.log.deferred-final-retry+2]
+#[tokio::test]
+async fn epilogue_marks_enqueued_final_pending_and_cleanup_preserves_it() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let bufs = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    // Capacity-1 flush channel, receiver held but never drained: the
+    // flusher-is-backed-up state (request enqueued, not yet attempted).
+    let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(1);
+    let mut actor = DagActor::new(
+        SchedulerDb::new(db.pool.clone()),
+        DagActorConfig::default(),
+        DagActorPlumbing {
+            log_buffers: Some(bufs.clone()),
+            log_flush_tx: Some(flush_tx),
+            ..Default::default()
+        },
+    );
+
+    let build_id = Uuid::new_v4();
+    let path_a = "/nix/store/cccccccccccccccccccccccccccccccc-r15qa-queued-final.drv";
+    let path_b = "/nix/store/dddddddddddddddddddddddddddddddd-r15qb-dropped-enqueue.drv";
+
+    // Two sole-interest terminal drvs, both reaped by this build's cleanup.
+    for (hash, path) in [("r15qa", path_a), ("r15qb", path_b)] {
+        actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+            drv_path: path.to_string(),
+            ..crate::db::RecoveryDerivationRow::test_default(hash, "x86_64-linux")
+        });
+        let s = actor.dag.node_mut(hash).expect("just injected");
+        s.set_status_for_test(DerivationStatus::Completed);
+        s.interested_builds.insert(build_id);
+    }
+
+    // Both buffers stamped and holding lines; the epilogue resolves the
+    // exec from the buffer carrier (state.exec_id stays None).
+    let exec_a = Uuid::now_v7();
+    let exec_b = Uuid::now_v7();
+    for (path, exec) in [(path_a, exec_a), (path_b, exec_b)] {
+        bufs.set_exec(path, exec, "worker-1");
+        assert!(bufs.push_for(
+            path,
+            &rio_proto::types::BuildLogBatch {
+                derivation_path: path.to_string(),
+                lines: vec![b"buffered line".to_vec()],
+                first_line_number: 0,
+                executor_id: "worker-1".into(),
+            },
+            "worker-1",
+        ));
+    }
+
+    // A's epilogue: seal + enqueue (fills the only slot) → marked pending.
+    actor.terminal_log_epilogue(&DrvHash::from("r15qa"), "succeeded", &[build_id]);
+    // B's epilogue: seal + enqueue fails (channel full) → NOT marked.
+    actor.terminal_log_epilogue(&DrvHash::from("r15qb"), "succeeded", &[build_id]);
+
+    assert!(
+        bufs.final_pending(path_a),
+        "successful enqueue must mark the entry final-pending at the epilogue"
+    );
+    assert!(
+        !bufs.final_pending(path_b),
+        "a final that was never handed to the flusher must NOT be marked \
+         (cleanup stays its only bound)"
+    );
+
+    // Cleanup fires while A's request is still sitting in the queue.
+    actor.handle_cleanup_terminal_build(build_id);
+
+    // A is preserved for the flusher: entry, lines, stamp, seal all intact.
+    assert_eq!(
+        bufs.exec_id(path_a),
+        Some(exec_a),
+        "queued final's buffer must survive terminal cleanup"
+    );
+    assert!(
+        bufs.read_since(path_a, 0).is_some_and(|l| l.len() == 1),
+        "queued final's buffer still holds its lines"
+    );
+    assert!(
+        bufs.is_sealed(path_a),
+        "seal stays until the flusher drains"
+    );
+    // The request really is still queued — the exact window the fix covers.
+    let queued = flush_rx.try_recv().expect("A's final must still be queued");
+    assert_eq!(queued.exec_id, exec_a);
+    // B keeps the pre-existing dropped-enqueue bound.
+    assert_eq!(
+        bufs.exec_id(path_b),
+        None,
+        "un-enqueued final's buffer is still discarded at cleanup"
     );
 
     Ok(())
