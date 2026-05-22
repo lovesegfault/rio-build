@@ -391,10 +391,12 @@ impl CellSketches {
     ///
     /// The shadow check matters for restart-after-rotation: `load()`
     /// restores `z_shadow` from PG; injecting `N_SEED=10` into the
-    /// empty active would make `quantile_with_shadow` at q=0.9 see
-    /// `count=10 ≥ min_n=10` and return the seed, never consulting
-    /// shadow's learned distribution. Malformed seed keys (not
-    /// `"h:cap"`) are skipped + warned.
+    /// empty active would out-vote the warm shadow wherever 10 clears
+    /// `quantile_with_shadow`'s `min_n` gate — immediately for the
+    /// q=0.5 `boot_median` read (min_n=2), and for `lead_time` once
+    /// the Schmitt loop narrows `lead_time_q` toward 0.5 — masking
+    /// shadow's learned distribution with the seed. Malformed seed
+    /// keys (not `"h:cap"`) are skipped + warned.
     // r[impl ctrl.nodeclaim.lead-time-ddsketch]
     pub fn seed(&mut self, lead_time_seed: &HashMap<String, f64>) {
         // r42 bug_018: canonicalize aliasing keys before seeding —
@@ -896,12 +898,13 @@ mod tests {
 
     /// mb_012: `seed()` skip-gate must check `z_shadow` too. After
     /// rotation persisted (`z_active=∅, z_shadow=200`) then restart/
-    /// reload, `seed()` injecting `N_SEED=10` into active makes
-    /// `quantile_with_shadow` at q=0.9 see `count=10 ≥ min_n=10` →
-    /// returns the seed value, never consulting shadow's learned
-    /// distribution. The mb_026 sparse-active gate is defeated on the
-    /// canonical sparse-active-with-mature-shadow path it was meant to
-    /// cover.
+    /// reload, `seed()` injecting `N_SEED=10` into active would
+    /// out-vote the warm shadow wherever 10 clears
+    /// `quantile_with_shadow`'s `min_n` gate (immediately at the
+    /// q=0.5 `boot_median` read; for `lead_time` once Schmitt narrows
+    /// `lead_time_q`), masking shadow's learned distribution. The
+    /// mb_026 sparse-active gate is defeated on the canonical
+    /// sparse-active-with-mature-shadow path it was meant to cover.
     #[test]
     fn seed_preserves_shadow_after_rotation() {
         let mut sk = CellSketches::default();
