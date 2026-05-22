@@ -3998,6 +3998,114 @@ mod tests {
         Ok(())
     }
 
+    /// bug_001 (r16): re-acquired-leader same-exec timeline. Tenure 1 seals
+    /// and enqueues a final for exec₁ during a PG/flusher backlog (the
+    /// CancelSignal is dropped, so the worker keeps building); the lease
+    /// flaps and the SAME replica re-acquires (generation bumps); recovery
+    /// restamps the SAME exec_id onto the retained entry. The restamp must
+    /// clear the prior tenure's seal (and mark): that tenure's final is
+    /// tenure-dropped without unsealing, so nothing else ever would — a
+    /// surviving seal mutes the reconnected worker's post-flap batches and
+    /// the live tenure's own final then uploads only the pre-flap prefix as
+    /// `is_complete=true`.
+    #[tokio::test]
+    async fn same_exec_restamp_after_flap_unmutes_worker_and_final_uploads_full_log()
+    -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, _deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r16b1b-same-exec-flap.drv";
+        let drv_hash = "r16b1b";
+
+        // Tenure 1 (leader, generation 1): exec₁ streams two lines, then a
+        // build-level cancel runs the terminal epilogue: seal + enqueue
+        // (stamped with generation 1) + final-pending mark.
+        let state = crate::lease::LeaderState::default();
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            state.clone(),
+        );
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"pre-flap l0", b"pre-flap l1"]);
+        buffers.seal(drv_path);
+        let old_final = FlushRequest {
+            drv_path: drv_path.into(),
+            exec_id,
+            status: Some("cancelled".into()),
+            lease_generation: state.generation(),
+        };
+        assert!(buffers.mark_final_pending(drv_path, exec_id));
+
+        // The lease flaps; the same replica re-acquires (generation bumps)
+        // and recovery restamps the SAME exec from `assignments` (the
+        // terminal persist failed in the same outage, so PG still holds the
+        // drv as Assigned/Running).
+        state.on_lose();
+        state.on_acquire();
+        buffers.set_exec(drv_path, exec_id, "test-worker");
+
+        // The reconnected worker keeps streaming the same execution: its
+        // post-flap batches MUST be accepted.
+        assert!(
+            buffers.push_for(
+                drv_path,
+                &mk_batch(drv_path, 2, &[b"post-flap l2"]),
+                "test-worker"
+            ),
+            "post-flap batch must be accepted after the same-exec restamp"
+        );
+
+        // The tenure-1 final is processed now: dropped by the tenure pin
+        // without touching the live entry.
+        assert!(flusher.flush_final(old_final).await.is_none());
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "the stale tenure-1 final uploads nothing"
+        );
+        assert_eq!(
+            buffers.exec_id(drv_path),
+            Some(exec_id),
+            "the live entry survives the tenure drop"
+        );
+
+        // Tenure 2 reaches the execution's real terminal: seal + final.
+        buffers.seal(drv_path);
+        assert!(
+            flusher
+                .flush_final(FlushRequest {
+                    drv_path: drv_path.into(),
+                    exec_id,
+                    status: Some("succeeded".into()),
+                    lease_generation: state.generation(),
+                })
+                .await
+                .is_none()
+        );
+
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1, "exactly the live tenure's final PUT");
+        let (key, body) = &captured[0];
+        assert_eq!(key, &format!("logs/{drv_hash}/{exec_id}.log.zst"));
+        assert_eq!(
+            String::from_utf8(zstd::decode_all(&body[..])?)?,
+            "pre-flap l0\npre-flap l1\npost-flap l2\n",
+            "the final must carry pre-flap AND post-flap lines"
+        );
+        let row: (bool, Option<String>, i64) = sqlx::query_as(
+            "SELECT is_complete, status, line_count FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert!(row.0, "the live tenure's final finalizes the row");
+        assert_eq!(row.1.as_deref(), Some("succeeded"));
+        assert_eq!(row.2, 3, "all three lines counted");
+        Ok(())
+    }
+
     /// Money test for the tenure pin, retry route (timeline A of r15
     /// bug_005): a leader cancels a build during a PG outage, the final
     /// defers, the lease moves, the live leader keeps extending the same

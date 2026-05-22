@@ -194,7 +194,9 @@ struct RingBuf {
     /// then the live tenure's own final, the drv's next dispatch discard,
     /// or process exit. Set at enqueue by the actor and
     /// re-asserted at deferral by the flusher (both exec-guarded); cleared by
-    /// a cross-exec restamp (`set_exec`) and removed with the entry.
+    /// any `set_exec` restamp — cross-exec, or the same-exec restamp recovery
+    /// performs at lease re-acquisition (the prior tenure's retained final
+    /// can no longer resolve the entry) — and removed with the entry.
     final_pending: bool,
 }
 
@@ -223,8 +225,10 @@ pub struct LogBuffers {
     /// cannot recreate a buffer that the flusher already drained.
     /// Cleared by `LogFlusher::flush_final` once the final resolves,
     /// by the discard-family reaps ([`Self::discard`], the empty-entry
-    /// reaps, terminal cleanup), and by a cross-exec [`Self::set_exec`]
-    /// restamp — the seal belongs to the execution being replaced.
+    /// reaps, terminal cleanup), and by any [`Self::set_exec`] restamp —
+    /// cross-exec because the seal belongs to the execution being
+    /// replaced, same-exec because at lease re-acquisition the prior
+    /// tenure's pending final can no longer drain the entry.
     sealed: DashSet<String>,
 }
 
@@ -456,9 +460,13 @@ impl LogBuffers {
     /// so the monotone gate has nothing to compare it against) — the
     /// same pre-existing exposure as a cross-exec restamp of an
     /// unsealed, still-Running entry, accepted in exchange for not
-    /// muting the new execution outright. The same-exec arm keeps the
-    /// seal: that execution's retained final is still this entry's
-    /// reaper and the seal still guards its pre-drain window.
+    /// muting the new execution outright. The same-exec arm clears the
+    /// seal (and the final-pending mark) too: only recovery restamps
+    /// the same exec_id, i.e. the lease generation has just bumped, so
+    /// the retained final the seal was waiting on is now always
+    /// tenure-dropped by the flusher without unsealing — the entry must
+    /// stay writable for the still-streaming execution, and the new
+    /// tenure's own terminal re-seals and re-marks it.
     /// Re-dispatch un-seals via [`Self::discard`].
     ///
     /// `executor` is stored for the `(executor, drv)` binding check in
@@ -527,6 +535,18 @@ impl LogBuffers {
             // re-acquisition. r[impl obs.log.stored-coverage-preserved]
             entry.recovered_prefix = None;
             entry.prefix_checked = false;
+            // A seal (and final-pending mark) left by the prior tenure's
+            // terminal can no longer be resolved: the re-acquisition bumped
+            // the lease generation, so the retained final that was going to
+            // drain this entry is now tenure-dropped by the flusher without
+            // unsealing, and no other path unseals a sealed entry. Clear
+            // both so the still-streaming worker's batches keep landing
+            // (`push_for` checks the seal before the binding gate) and so
+            // terminal cleanup regains its bound on this entry; the new
+            // tenure's own terminal re-seals and re-marks when it processes
+            // this execution's terminal.
+            self.sealed.remove(&key);
+            entry.final_pending = false;
         }
         entry.exec_id = Some(exec_id);
         entry.assigned_executor = Some(executor.to_owned());
@@ -1077,9 +1097,10 @@ impl LogBuffers {
     /// draining alone.
     ///
     /// Idempotent. Retry / re-dispatch un-seals via [`Self::unseal`] (or
-    /// [`Self::discard`], which also un-seals); a cross-exec
-    /// [`Self::set_exec`] restamp clears it too — the seal belongs to the
-    /// execution being replaced.
+    /// [`Self::discard`], which also un-seals); any [`Self::set_exec`]
+    /// restamp clears it too — cross-exec because the seal belongs to the
+    /// execution being replaced, same-exec because at lease re-acquisition
+    /// the prior tenure's pending final can no longer drain the entry.
     pub fn seal(&self, drv_path: &str) {
         self.sealed.insert(drv_log_hash(drv_path));
     }
@@ -1088,9 +1109,9 @@ impl LogBuffers {
     /// `LogFlusher::flush_final`'s resolution arms (post-drain,
     /// no-entry, already-finalized residue reap) and by the
     /// deferred-final retention-cap overflow drop to bound `sealed`.
-    /// [`Self::discard`]-family reaps and a cross-exec [`Self::set_exec`]
-    /// restamp clear the seal directly rather than through this method.
-    /// Idempotent; no-op if not sealed.
+    /// [`Self::discard`]-family reaps and [`Self::set_exec`] restamps
+    /// (cross- and same-exec) clear the seal directly rather than through
+    /// this method. Idempotent; no-op if not sealed.
     pub fn unseal(&self, drv_path: &str) {
         self.sealed.remove(&drv_log_hash(drv_path));
     }
@@ -1686,13 +1707,15 @@ mod tests {
         assert!(!bufs.final_pending("r14m3f-drv"));
     }
 
-    /// Restamp lifecycle of the pending-final mark: a same-exec restamp
-    /// (recovery at lease re-acquisition) keeps it — the flusher's retained
-    /// request still names that exec and its drain is still the entry's
-    /// reaper — while a cross-exec restamp (an interim leader re-dispatched
-    /// the drv) clears it along with the rest of the prior execution's
-    /// bookkeeping, so terminal cleanup goes back to bounding the NEW
-    /// execution's buffer.
+    /// Restamp lifecycle of the pending-final mark: any restamp clears it.
+    /// A same-exec restamp (recovery at lease re-acquisition) clears it
+    /// because the marked request is from the prior tenure and will be
+    /// tenure-dropped — keeping the mark would exempt the entry from
+    /// terminal cleanup with no remaining reaper (bug_001, round 16) — while
+    /// keeping the lines; a cross-exec restamp (an interim leader
+    /// re-dispatched the drv) clears it along with the rest of the prior
+    /// execution's bookkeeping, so terminal cleanup goes back to bounding
+    /// the NEW execution's buffer.
     #[test]
     fn final_pending_mark_restamp_lifecycle() {
         let bufs = LogBuffers::new();
@@ -1704,11 +1727,11 @@ mod tests {
         assert!(bufs.mark_final_pending("r14m3g-drv", e1));
         assert!(bufs.final_pending("r14m3g-drv"));
 
-        // Same-exec restamp keeps the mark (and the lines).
+        // Same-exec restamp clears the mark but keeps the lines.
         bufs.set_exec("r14m3g-drv", e1, "w1");
         assert!(
-            bufs.final_pending("r14m3g-drv"),
-            "same-exec restamp must not strand the entry to cleanup"
+            !bufs.final_pending("r14m3g-drv"),
+            "same-exec restamp must clear the prior tenure's dead mark"
         );
         assert!(
             bufs.read_since("r14m3g-drv", 0)
@@ -1729,10 +1752,12 @@ mod tests {
         );
     }
 
-    /// Seal lifecycle across restamps. A same-exec restamp (lease flap, no
-    /// interim re-dispatch) keeps the seal — the retained final for that
-    /// execution is still the entry's reaper and the seal still guards its
-    /// pre-drain window. A cross-exec restamp (an interim leader
+    /// Seal lifecycle across restamps: any restamp clears the seal. A
+    /// same-exec restamp (recovery at lease re-acquisition, no interim
+    /// re-dispatch) clears it because the prior tenure's pending final is
+    /// tenure-dropped and can never drain/unseal the entry — a surviving
+    /// seal would mute the still-streaming worker's post-flap batches
+    /// (bug_001, round 16). A cross-exec restamp (an interim leader
     /// re-dispatched the drv) clears it along with the rest of the prior
     /// execution's bookkeeping: the prior exec's final can no longer drain
     /// this entry, and a surviving seal would make push_for silently drop
@@ -1750,15 +1775,20 @@ mod tests {
         bufs.seal("r15b9a-drv");
         assert!(bufs.mark_final_pending("r15b9a-drv", e1));
 
-        // Same-exec restamp (recovery, no interim re-dispatch): seal stays.
+        // Same-exec restamp (recovery, no interim re-dispatch): seal cleared,
+        // the still-streaming execution's batches keep landing.
         bufs.set_exec("r15b9a-drv", e1, "w1");
         assert!(
-            bufs.is_sealed("r15b9a-drv"),
-            "same-exec restamp must keep the seal (the pending final still owns the drain)"
+            !bufs.is_sealed("r15b9a-drv"),
+            "same-exec restamp must clear the seal (the pending final is tenure-dropped, not drained)"
         );
         assert!(
-            !bufs.push_for("r15b9a-drv", &mk_batch("r15b9a-drv", 1, &[b"late"]), "w1"),
-            "post-terminal batch stays sealed out across a same-exec restamp"
+            bufs.push_for(
+                "r15b9a-drv",
+                &mk_batch("r15b9a-drv", 1, &[b"post-flap"]),
+                "w1"
+            ),
+            "the execution's batches must keep landing across a same-exec restamp"
         );
 
         // Cross-exec restamp (interim leader re-dispatched under e2 on w2):
@@ -1782,6 +1812,58 @@ mod tests {
             "the prior executor's late batches are still rejected by the binding gate"
         );
         assert_eq!(bufs.exec_id("r15b9a-drv"), Some(e2));
+    }
+
+    /// bug_001 (r16): the full same-exec restamp shape the terminal epilogue
+    /// leaves behind. A same-exec restamp happens only at lease
+    /// re-acquisition (recovery; dispatch always discards first), and the
+    /// re-acquisition bumped the lease generation — so the prior tenure's
+    /// retained final, the request the seal was waiting on, is now always
+    /// tenure-dropped by the flusher without unsealing. The restamp must
+    /// therefore clear the seal and the final-pending mark itself (the new
+    /// tenure's own terminal re-seals and re-marks), while keeping the
+    /// lines: otherwise the reconnected worker's post-flap batches are
+    /// silently rejected and the next final uploads a truncated log as
+    /// complete.
+    #[test]
+    fn same_exec_restamp_clears_seal_and_final_pending() {
+        let bufs = LogBuffers::new();
+        let exec = Uuid::now_v7();
+
+        bufs.set_exec("r16b1-drv", exec, "w1");
+        assert!(bufs.push_for("r16b1-drv", &mk_batch("r16b1-drv", 0, &[b"pre-flap"]), "w1"));
+        // Terminal epilogue shape: seal, then mark after the successful
+        // enqueue (the same APIs terminal_log_epilogue calls).
+        bufs.seal("r16b1-drv");
+        assert!(bufs.mark_final_pending("r16b1-drv", exec));
+
+        // Lease re-acquisition: recovery restamps the SAME exec_id.
+        bufs.set_exec("r16b1-drv", exec, "w1");
+
+        assert!(
+            !bufs.is_sealed("r16b1-drv"),
+            "same-exec restamp must clear the seal — the prior tenure's final \
+             is tenure-dropped and can never drain/unseal this entry"
+        );
+        assert!(
+            !bufs.final_pending("r16b1-drv"),
+            "same-exec restamp must clear the final-pending mark — the marked \
+             request is dead, and the mark would otherwise exempt the entry \
+             from terminal cleanup forever"
+        );
+        assert!(
+            bufs.read_since("r16b1-drv", 0)
+                .is_some_and(|l| l.len() == 1),
+            "lines are retained — the still-streaming execution keeps accumulating"
+        );
+        assert!(
+            bufs.push_for(
+                "r16b1-drv",
+                &mk_batch("r16b1-drv", 1, &[b"post-flap"]),
+                "w1"
+            ),
+            "the reconnected worker's post-flap batches must be accepted"
+        );
     }
 
     /// Exec-guarded empty-reap used by the flusher's deferral arm: removes
