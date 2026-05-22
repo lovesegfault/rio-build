@@ -495,6 +495,26 @@ in
       witness = "noForeignTieBumpAfterDeletion";
     };
 
+    # The floor-above-entry bump is explored in the deletion regime: a
+    # holder deposed by deleteLease that crashes and recovers re-acquires
+    # on the renew edge, and the surviving claims-ledger floor exceeds
+    # what the recreated lease's transition count can vouch for, so the
+    # claim path must bump past it -- the restore the deletion-regime
+    # header calls LOAD-BEARING for staleLeaderHasStaleGeneration. A
+    # ceiling or guard change that silently stranded that arm would leave
+    # the deletion regime check green while the proof claim quietly
+    # narrowed; this check pins it. A red here means the renew-edge
+    # instance of the arm is no longer reachable: either a deliberate
+    # regime-constant/guard change (adjust the constants or retire this
+    # check with the same deliberation) or the regression this check
+    # exists to catch.
+    quint-leader-election-witness-deletion-floor-bump = mkQuintWitnessCheck {
+      name = "leader-election-witness-deletion-floor-bump";
+      spec = "leaderElection";
+      main = "leaderElectionDeletion";
+      witness = "noFloorBumpAfterDeletion";
+    };
+
     # The claim-INSERT failure is explored in the pg-faults regime: its
     # "each PG fault alone is survivable" verdict is about a state space
     # in which the proceed-on-failure path actually fires, not one where

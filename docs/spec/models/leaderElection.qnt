@@ -317,6 +317,15 @@ module leaderElection {
   /// bookkeeping read by the noForeignTieBumpAfterDeletion witness;
   /// never read by an action guard.
   var stealBumpedForeignTie: bool
+  /// History flag: a renew-edge re-acquire's claim target had to exceed
+  /// a claims-ledger floor strictly ABOVE the entry generation (seedFor's
+  /// first arm -- renewLease case 3, the post-deletion crash/recover
+  /// restore the deletion-regime header calls load-bearing). Tracks the
+  /// renew-edge instance only; the steal-side instance of the same arm is
+  /// deliberately not tracked by this flag. Model-only bookkeeping read
+  /// by the noFloorBumpAfterDeletion witness; never read by an action
+  /// guard.
+  var renewBumpedAboveEntry: bool
 
   // --- 4. accessor / guard helpers --------------------------------------
   // The TLA+ reads snap[n].rv directly after guarding snap[n] /= NULL;
@@ -488,6 +497,22 @@ module leaderElection {
   /// strictly exceeds every recorded floor and a renew-edge tie is
   /// always the holder's own row).
   val noForeignTieBumpAfterDeletion = not(deletes > 0 and stealBumpedForeignTie)
+
+  /// Violated when a renew-edge re-acquire after a Lease deletion had to
+  /// bump to genHW + 1 because the surviving claims-ledger floor exceeds
+  /// what the recreated lease's transition count can vouch for (seedFor's
+  /// first arm; renewLease case 3) -- the restore that keeps
+  /// staleLeaderHasStaleGeneration true where the entry half alone would
+  /// under-restore a recovered holder to the deletion victim's
+  /// generation. renewBumpedAboveEntry is set only inside renewLease's
+  /// edge branch on that condition, so unlike a state-shape predicate
+  /// this cannot be satisfied by an ordinary bump-and-claim acquisition.
+  /// Checked against the deletion regime by
+  /// quint-leader-election-witness-deletion-floor-bump (nix/quint.nix);
+  /// the other regimes cannot reach the arm (without a deletion the
+  /// lease's transition count never regresses, so the floor never
+  /// exceeds the entry generation any holder computes).
+  val noFloorBumpAfterDeletion = not(deletes > 0 and renewBumpedAboveEntry)
 
   /// Violated when a write-ahead claim INSERT has failed: proves the
   /// PgFaults regime actually explores the proceed-on-failure path
@@ -754,6 +779,7 @@ module leaderElection {
     delVictims' = delVictims, claimFailures' = claimFailures,
     restores' = restores, stealRetained' = stealRetained,
     stealBumpedForeignTie' = stealBumpedForeignTie,
+    renewBumpedAboveEntry' = renewBumpedAboveEntry,
   }
 
   /// GET the lease. The obs[n] update follows decide_pure()'s
@@ -801,6 +827,7 @@ module leaderElection {
     claimFailures' = claimFailures, restores' = restores,
     stealRetained' = stealRetained,
     stealBumpedForeignTie' = stealBumpedForeignTie,
+    renewBumpedAboveEntry' = renewBumpedAboveEntry,
   }
 
   /// The write-ahead claim INSERT succeeds: the PG floor advances to the
@@ -984,6 +1011,7 @@ module leaderElection {
       // => bump" is the claim-target semantics).
       stealBumpedForeignTie' = (stealBumpedForeignTie or
         (genHW == entry and genHWHolder != Held(n))),
+      renewBumpedAboveEntry' = renewBumpedAboveEntry,
       // The claim disjunction: the INSERT into the claims ledger either
       // lands (claimOk -- the floor advances when seeded exceeds it; on
       // seedFor's own-row-tie retain path seeded equals genHW, so claimOk
@@ -1063,7 +1091,8 @@ module leaderElection {
   /// steady-state renew, modeling a ledger retry that production only
   /// performs on the next acquire edge.
   ///
-  /// The three cases, each pinned by a checker run:
+  /// The three cases, the first two pinned by checker runs and the third
+  /// by the noFloorBumpAfterDeletion witness check (nix/quint.nix):
   ///   - selfFence false alarm (never crashed): the Arc still holds our
   ///     claimed generation, which equals genHW while we hold the lease
   ///     -- entry = gen[n], seeded = entry, genHW unchanged. The
@@ -1128,6 +1157,14 @@ module leaderElection {
       delVictims' = delVictims, restores' = restores,
       stealRetained' = stealRetained,
       stealBumpedForeignTie' = stealBumpedForeignTie,
+      // The bump-event discriminator for the noFloorBumpAfterDeletion
+      // witness: records that this edge re-acquire's claim target had to
+      // exceed a floor strictly ABOVE the entry generation (seedFor's
+      // first arm -- renewLease's case 3). Evaluated on the same
+      // pre-state values seedFor reads; the parentheses around the
+      // right-hand side are load-bearing (`or` binds looser than `=`).
+      renewBumpedAboveEntry' = (renewBumpedAboveEntry or
+        (isEdge and genHW > entry)),
       // The same claim disjunction as steal's, restricted to the edge
       // branch via claimTarget -- a steady-state renew never claims, so
       // it cannot fail to claim. The retry-on-the-next-acquire-edge
@@ -1160,6 +1197,7 @@ module leaderElection {
     claimFailures' = claimFailures, restores' = restores,
     stealRetained' = stealRetained,
     stealBumpedForeignTie' = stealBumpedForeignTie,
+    renewBumpedAboveEntry' = renewBumpedAboveEntry,
   }
 
   /// maybe_self_fence(): a Leading node that has not had a successful
@@ -1180,6 +1218,7 @@ module leaderElection {
     delVictims' = delVictims, claimFailures' = claimFailures,
     restores' = restores, stealRetained' = stealRetained,
     stealBumpedForeignTie' = stealBumpedForeignTie,
+    renewBumpedAboveEntry' = renewBumpedAboveEntry,
   }
 
   /// Pod crash. Loses ALL in-memory state: the belief, the snapshot, the
@@ -1203,6 +1242,7 @@ module leaderElection {
     claimFailures' = claimFailures, restores' = restores,
     stealRetained' = stealRetained,
     stealBumpedForeignTie' = stealBumpedForeignTie,
+    renewBumpedAboveEntry' = renewBumpedAboveEntry,
   }
 
   /// Pod restart. The recovered process has no observation (its first
@@ -1220,6 +1260,7 @@ module leaderElection {
     delVictims' = delVictims, claimFailures' = claimFailures,
     restores' = restores, stealRetained' = stealRetained,
     stealBumpedForeignTie' = stealBumpedForeignTie,
+    renewBumpedAboveEntry' = renewBumpedAboveEntry,
   }
 
   /// Operator fault: `kubectl delete lease` destroys the Lease object and
@@ -1273,6 +1314,7 @@ module leaderElection {
     claimFailures' = claimFailures, restores' = restores,
     stealRetained' = stealRetained,
     stealBumpedForeignTie' = stealBumpedForeignTie,
+    renewBumpedAboveEntry' = renewBumpedAboveEntry,
   }
 
   /// Operator/infrastructure fault: a PostgreSQL point-in-time restore
@@ -1300,6 +1342,7 @@ module leaderElection {
     delVictims' = delVictims, claimFailures' = claimFailures,
     stealRetained' = stealRetained,
     stealBumpedForeignTie' = stealBumpedForeignTie,
+    renewBumpedAboveEntry' = renewBumpedAboveEntry,
   }
 
   // --- 7. init ----------------------------------------------------------
@@ -1326,6 +1369,7 @@ module leaderElection {
     restores' = 0,
     stealRetained' = false,
     stealBumpedForeignTie' = false,
+    renewBumpedAboveEntry' = false,
   }
 
   // --- 8. step ----------------------------------------------------------
@@ -1676,7 +1720,8 @@ module leaderElectionBase {
 //     and only here: after a deletion the recreated lease's transition
 //     count no longer encodes a recovered holder's generation, so the
 //     entry half alone under-restores it to the deletion victim's
-//     generation. See renewLease's doc comment, case 3.
+//     generation. The noFloorBumpAfterDeletion witness check is the
+//     standing evidence. See renewLease's doc comment, case 3.
 //   - steal's own-row-tie retain arm (seedFor returning the entry when
 //     the ledger row at the floor is the stealer's own) fires in this
 //     regime and only this regime -- the noRetainAfterDeletion witness

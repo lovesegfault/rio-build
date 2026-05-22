@@ -183,10 +183,11 @@ fn spec_path() -> std::path::PathBuf {
 /// Omitted, and why:
 /// - `clocks`, `alive`, `fence`, `acquiredAt`, `casRace`, `delVictims`,
 ///   `deletes`, `claimFailures`, `restores`, `stealRetained`,
-///   `stealBumpedForeignTie`: model-only history bookkeeping (they exist
-///   to express the invariants and the expect-violation witnesses) or
-///   pure driver bookkeeping (diffing the driver's tick counter against
-///   the model's clock proves nothing about the implementation).
+///   `stealBumpedForeignTie`, `renewBumpedAboveEntry`: model-only history
+///   bookkeeping (they exist to express the invariants and the
+///   expect-violation witnesses) or pure driver bookkeeping (diffing the
+///   driver's tick counter against the model's clock proves nothing
+///   about the implementation).
 /// - `genHW`, `genHWHolder`: live in rio-scheduler's claims ledger (the
 ///   floor and its owning holder) — phase 2. Sound to omit in the base
 ///   regime because the lease-derived and PG-derived epoch sources stay
