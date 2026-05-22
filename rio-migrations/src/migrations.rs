@@ -1181,7 +1181,7 @@ pub const M_064: () = ();
 /// `MAX(claims)` and retries. `holder_id` is the replica's pod
 /// identity and is LOAD-BEARING: a holder re-acquiring its own epoch
 /// (self-fence false alarm → successful renew) finds its own row at
-/// the lease-derived generation and retains it instead of bumping —
+/// its current (recovery-entry) generation and retains it instead of bumping —
 /// without the holder comparison every connectivity blip would burn a
 /// generation and fence the leader's own in-flight assignments. The
 /// safety argument is that no two LIVE processes ever share a
