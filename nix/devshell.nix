@@ -186,7 +186,7 @@ let
     (pkgs.mkShell.override {
       # mold via cc-wrapper: rustc's linker is `cc`, so this
       # speeds dev-loop relinks without touching RUSTFLAGS
-      # (shared build-dir fingerprints stay valid). crate2nix
+      # (target-dir fingerprints stay valid). crate2nix
       # uses its own stdenv — `nix build` stays on GNU ld.
       stdenv = pkgs.stdenvAdapters.useMoldLinker pkgs.stdenv;
     })
@@ -226,12 +226,6 @@ let
             # otherwise writes to docs/docs/.cache/). git rev-parse so
             # `nix develop` from a subdirectory also resolves correctly.
             export RIO_TYPST_XDG="$(git rev-parse --show-toplevel)/docs/.cache/typst-xdg"
-            # Shared intermediate build cache across all worktrees
-            # (~/src/rio-build/*). Per-worktree target/ keeps only
-            # final artifacts. Fine-grain locking (nightly; ignored
-            # on stable) lets concurrent `cargo check` run lock-free.
-            export CARGO_BUILD_BUILD_DIR="''${CARGO_BUILD_BUILD_DIR:-$HOME/.cache/rio-build/build}"
-            export CARGO_UNSTABLE_FINE_GRAIN_LOCKING=true
             ${preCommitInstall}
           '';
         }
