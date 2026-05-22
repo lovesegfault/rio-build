@@ -130,7 +130,7 @@ impl DagActor {
     }
 
     pub(super) async fn handle_tick(&mut self) {
-        // r[impl sched.lease.standby-tick-noop]
+        // r[impl sched.lease.standby-tick-noop+2]
         // Standby keeps stale self.builds/dag until LeaderLost lands;
         // every tick_* below either writes PG (orphan-cancel, build-
         // timeout, backstop-reassign, poison-clear, derivations-gc,

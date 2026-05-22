@@ -1483,28 +1483,43 @@ leadership transitions:
   stale-generation assignments.
 + *Recovery flag cleared*: The lease acquire transition clears
   `recovery_complete` and fires a `LeaderAcquired` command to the actor
-  (fire-and-forget via `tokio::spawn` --- lease renewal MUST NOT block on
+  (delivered asynchronously and in order --- lease renewal MUST NOT block on
   recovery completing). A still-leading renew round that observes a
   `leaseTransitions` count different from the one recorded at the last
   acquire edge or rebound is a holder change observed late: it re-records the
   count, re-derives the generation, clears `recovery_complete`, and re-fires
   `LeaderAcquired` without an acquire edge (#rref("sched.lease.rebound")).
 
-#r("sched.lease.non-blocking-acquire")[
-  LeaderAcquired send is fire-and-forget via `tokio::spawn` --- blocking on
-  recovery would stall renewals: the blocked loop can neither renew nor
-  self-fence while a standby steals after `STEAL_AFTER` (19s) of observed
-  staleness → dual-leader.
+#r("sched.lease.non-blocking-acquire+2")[
+  The LeaderAcquired send MUST NOT block the renewal tick --- delivery to the
+  actor is asynchronous. Blocking on recovery would stall renewals: the
+  blocked loop can neither renew nor self-fence while a standby steals after
+  `STEAL_AFTER` (19s) of observed staleness → dual-leader.
 ]
 
-#r("sched.lease.standby-tick-noop")[
+#r("sched.lease.standby-tick-noop+2")[
   On lease loss (or local self-fence) the lease loop sends `LeaderLost` to the
-  actor (symmetric with `LeaderAcquired`, same fire-and-forget spawn). The
+  actor (symmetric with `LeaderAcquired`, same non-blocking asynchronous
+  delivery). The
   actor clears in-memory builds/dag/events and zeros the leader-only state
   gauges. `handle_tick` early-returns on `!is_leader` so an ex-leader's
   PG-writing housekeeping (orphan-watcher cancel, build-timeout fail, backstop
   reassign, poison-clear, derivations-gc) cannot race the new leader.
 ]
+
+#r("sched.lease.hook-order")[
+  Lease hook commands MUST be delivered to the actor in invocation order; in
+  particular a `LeaderLost` followed by `LeaderAcquired` from the same renewal
+  tick MUST be processed in that order.
+]
+The actor's same-epoch recovery reasoning and the false-alarm end state (the
+tick-time self-fence fires `LeaderLost`, the same tick's successful renew
+fires `LeaderAcquired`) rely on that order: the lost arm wipes, the acquired
+arm re-recovers. An inverted pair would leave the leader with
+`is_leader = true`, `recovery_complete = true`, and an empty DAG --- every
+non-terminal build silently orphaned until the next leadership change.
+Delivery is a single FIFO handoff drained by one forwarder task into the
+actor's command channel, so invocation order is preserved end-to-end.
 
 #set enum(start: 3)
 + *State reconstruction*: The actor's `LeaderAcquired` handler invokes state
@@ -2492,9 +2507,11 @@ foreign holder still present at the next successful round resolves
 Standby/Conflict through the existing lose edge --- so an unequal count on a
 still-leading round is always a genuine discontinuity, and the cost of acting
 on one is a single recovery re-run with dispatch gated during it. Only the
-acquire hook is re-fired: the consumer's lose/acquire hooks are independent
-fire-and-forget spawns, so a synthesized lose+acquire pair could reorder and
-a late `LeaderLost` would clear the freshly re-recovered state. The accepted
+acquire hook is re-fired: a synthesized lose would force a pointless wipe of
+state the immediately-following re-recovery rebuilds, and would open a
+transient `recovery_complete = false` window on every rebound; hook delivery
+is ordered (#rref("sched.lease.hook-order")), so the choice is about avoiding
+wasted work, not about reordering. The accepted
 residual is the count coincidence: an observed count that lands exactly back
 on the recorded value is indistinguishable from steady state --- the same
 coincidence pricing as the recovery gate's deletion-ABA note --- and in that

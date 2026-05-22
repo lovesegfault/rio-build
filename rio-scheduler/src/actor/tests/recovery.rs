@@ -2397,6 +2397,82 @@ async fn test_recovery_toctou_rebound_mid_recovery_discards_then_rerun_completes
     Ok(())
 }
 
+/// Behavior pin for the end state the hook-ordering guarantee protects
+/// (`sched.lease.hook-order`): the tick-time self-fence false alarm
+/// delivers `LeaderLost` then `LeaderAcquired` (same epoch) in that
+/// order, the lost arm wipes, the acquired arm re-recovers from PG, and
+/// the leader ends recovered-and-dispatchable — DAG present,
+/// `recovery_complete = true`. The inverted order (what unordered
+/// per-spawn delivery allowed) would end with `is_leader = true`,
+/// `recovery_complete = true`, and an empty DAG. Not red-first: the
+/// ordering itself is pinned red-first by the `lease_hooks` unit test;
+/// this pins what the order buys at the actor level.
+// r[verify sched.lease.hook-order]
+#[tokio::test]
+async fn test_false_alarm_lost_then_acquired_in_order_ends_recovered() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    // Leading at generation 2 (transitions=1), recovery already complete
+    // — the steady state a false alarm interrupts.
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::new(AtomicU64::new(2)),
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(true)),
+    );
+    leader.on_acquire(1);
+    // Same posture as the rebound completion test: keep the re-acquire's
+    // confirmation leg satisfiable if the bump-confirm trigger ever
+    // widens; the same-epoch path itself does not need it.
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+
+    let l = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = l;
+        p.holder_id = "pod-us".into();
+    });
+
+    // A populated DAG owned by the current term, persisted to PG by the
+    // merge path (what the re-recovery below reloads).
+    let build_id = Uuid::new_v4();
+    let _event_rx = merge_single_node(
+        &handle,
+        build_id,
+        "false-alarm-drv",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // The false-alarm tick, in invocation order: the self-fence fires
+    // the lose (state first, then the hook command), the same tick's
+    // successful renew fires the acquire at the SAME epoch.
+    leader.on_lose();
+    handle.send_unchecked(ActorCommand::LeaderLost).await?;
+    leader.on_acquire(1);
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    assert!(
+        leader.is_leader(),
+        "the false-alarm re-acquire leaves us leading"
+    );
+    assert!(
+        leader.recovery_complete(),
+        "the in-order pair must end with recovery complete (dispatchable)"
+    );
+    assert_eq!(
+        leader.generation(),
+        2,
+        "a same-epoch false alarm must not move the generation"
+    );
+    let drv = expect_drv(&handle, "false-alarm-drv").await;
+    assert!(
+        !drv.status.is_terminal(),
+        "the re-recovered DAG must contain the term's derivation, got {:?}",
+        drv.status
+    );
+    Ok(())
+}
+
 /// `handle_reconcile_assignments` must NOT write to PG when not leader.
 /// The 45s reconcile timer is fire-and-forget and `on_lose` doesn't
 /// cancel it or clear the DAG; without an `is_leader()` gate, an

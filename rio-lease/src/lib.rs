@@ -931,7 +931,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             1,
                         );
 
-                        // r[impl sched.lease.non-blocking-acquire]
+                        // r[impl sched.lease.non-blocking-acquire+2]
                         // Fire the per-component on-acquire hook
                         // (metrics + actor notification). The hook MUST
                         // NOT block — see LeaseHooks doc.
@@ -963,7 +963,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             "lost leadership (another replica acquired)"
                         );
 
-                        // r[impl sched.lease.standby-tick-noop]
+                        // r[impl sched.lease.standby-tick-noop+2]
                         // Symmetric with on_acquire above: fire the
                         // per-component on-lose hook (metrics + actor
                         // notification). Same non-blocking constraint.
@@ -997,10 +997,14 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         // local state and re-fire the acquire hook so
                         // the consumer re-runs recovery against the
                         // post-term state. Deliberately NO on_lose():
-                        // the consumer's lose/acquire hooks spawn
-                        // independently, so a synthesized pair could
-                        // reorder and a late LeaderLost would wipe the
-                        // freshly re-recovered state. No
+                        // a synthesized lose would force a pointless
+                        // wipe of state the immediately-following
+                        // re-recovery rebuilds, and would open a
+                        // transient recovery_complete=false window on
+                        // every rebound. Hook delivery is ordered
+                        // (sched.lease.hook-order), so skipping the
+                        // lose is about avoiding wasted work, not a
+                        // reordering hazard. No
                         // spawn_patch_deletion_cost either — the cost
                         // annotation is already 1 from the original
                         // acquire. The count-coincidence ABA (the

@@ -952,7 +952,7 @@ in
 
   vm-le-build-k3s = leMod.mkTest {
     name = "build";
-    # r[verify sched.lease.non-blocking-acquire]
+    # r[verify sched.lease.non-blocking-acquire+2]
     subtests = [
       "build-during-failover"
       # r[verify sched.lease.k8s-lease+2]

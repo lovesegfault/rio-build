@@ -169,7 +169,7 @@ async fn test_not_leader_does_not_set_gauges() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.lease.standby-tick-noop]
+// r[verify sched.lease.standby-tick-noop+2]
 // r[verify obs.metric.scheduler-leader-gate+2]
 /// Was-leader → standby: `LeaderLost` clears in-memory state and zeros
 /// gauges; subsequent `Tick` early-returns so the orphan-watcher does

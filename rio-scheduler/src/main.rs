@@ -18,59 +18,6 @@ use rio_scheduler::grpc::SchedulerGrpc;
 
 use rio_scheduler::config::{CliArgs, Config, DashboardConfig};
 
-/// Scheduler-specific lease transition hooks: emit `rio_scheduler_lease_*`
-/// metrics and fire-and-forget `LeaderAcquired`/`LeaderLost` to the actor.
-///
-/// `tokio::spawn` for the actor send: the lease loop calls these hooks
-/// synchronously from the renewal tick, and a blocked hook would stall
-/// the tick — the blocked loop can neither renew nor self-fence while a
-/// standby steals after `STEAL_AFTER` (19s) of observed staleness →
-/// dual-leader (see `rio_lease::LeaseHooks` doc). `send_unchecked` bypasses
-/// backpressure — control message, not work submission.
-#[derive(Clone)]
-struct SchedulerLeaseHooks {
-    actor: ActorHandle,
-}
-
-impl rio_scheduler::lease::LeaseHooks for SchedulerLeaseHooks {
-    fn on_acquire(&self) {
-        // Counter for VM test observability: the leader-election VM
-        // scenario polls this to confirm the lease loop actually
-        // acquired (vs silently failing kube-client init and running
-        // standby forever). The info! log has the same signal but
-        // metrics are less brittle for VM grep. Also fired on a rebound
-        // (a holder change observed late on a still-leading round —
-        // `sched.lease.rebound`), so this counter counts rebounds too;
-        // deliberate, no separate counter.
-        metrics::counter!("rio_scheduler_lease_acquired_total").increment(1);
-        let actor = self.actor.clone();
-        tokio::spawn(async move {
-            if let Err(e) = actor
-                .send_unchecked(rio_scheduler::actor::ActorCommand::LeaderAcquired)
-                .await
-            {
-                // Actor dead. We're holding the lease but can't
-                // dispatch. Not much to do — the process is probably
-                // crashing.
-                tracing::error!(error = %e, "failed to send LeaderAcquired (actor dead?)");
-            }
-        });
-    }
-
-    fn on_lose(&self) {
-        metrics::counter!("rio_scheduler_lease_lost_total").increment(1);
-        let actor = self.actor.clone();
-        tokio::spawn(async move {
-            if let Err(e) = actor
-                .send_unchecked(rio_scheduler::actor::ActorCommand::LeaderLost)
-                .await
-            {
-                tracing::error!(error = %e, "failed to send LeaderLost (actor dead?)");
-            }
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests;
 
@@ -404,17 +351,16 @@ async fn main() -> anyhow::Result<()> {
     // dies before the PATCH lands and we're back to the
     // observed-staleness steal as fallback.
     let lease_loop = lease_cfg.map(|lease_cfg| {
-        // Hooks fire-and-forget LeaderAcquired/LeaderLost. The lease
-        // loop does NOT block on recovery — it keeps renewing while
-        // the actor handles LeaderAcquired.
+        // Hooks enqueue LeaderAcquired/LeaderLost for ordered, non-blocking
+        // delivery (rio_scheduler::lease_hooks). The lease loop does NOT
+        // block on recovery — it keeps renewing while the actor handles
+        // LeaderAcquired.
         rio_common::task::spawn_monitored(
             "lease-loop",
             rio_scheduler::lease::run_lease_loop(
                 lease_cfg,
                 leader,
-                SchedulerLeaseHooks {
-                    actor: actor.clone(),
-                },
+                rio_scheduler::lease_hooks::SchedulerLeaseHooks::new(&actor),
                 shutdown.clone(),
             ),
         )

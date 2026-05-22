@@ -193,6 +193,15 @@ impl ActorHandle {
         self.tx.send(cmd).await.map_err(|_| ActorError::ChannelSend)
     }
 
+    /// Raw clone of the actor's command sender — the channel half of
+    /// [`send_unchecked`](Self::send_unchecked) (hysteresis bypass:
+    /// control messages, not work submission). Used by the lease-hook
+    /// forwarder ([`crate::lease_hooks`]) so lease transitions reach the
+    /// actor in invocation order through a single sender it owns.
+    pub(crate) fn command_sender(&self) -> mpsc::Sender<ActorCommand> {
+        self.tx.clone()
+    }
+
     /// Send a command carrying a oneshot reply, await the reply. For
     /// admin-RPC patterns where the caller uses `send_unchecked` (bypass
     /// backpressure). Callers in the gRPC layer convert via

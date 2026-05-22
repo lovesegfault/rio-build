@@ -1064,7 +1064,7 @@ impl DagActor {
     /// `tick_publish_gauges` call is unreachable on standby via the
     /// `handle_tick` gate). Prometheus then sees two series per
     /// gauge until this pod restarts.
-    // r[impl sched.lease.standby-tick-noop]
+    // r[impl sched.lease.standby-tick-noop+2]
     // r[impl obs.metric.scheduler-leader-gate+2]
     pub(super) fn handle_leader_lost(&mut self) {
         info!("leader lost: clearing persisted actor state");
