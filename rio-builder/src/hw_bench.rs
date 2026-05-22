@@ -25,7 +25,7 @@
 //!
 //! The full K=3 bench runs only when the controller stamps
 //! `rio.build/hw-bench-needed=true` on the pod (downward-API →
-//! `RIO_HW_BENCH_NEEDED`). When unset only the scalar `alu` probe
+//! `RIO_HW_BENCH_NEEDED`). When `false` only the scalar `alu` probe
 //! runs and `membw`/`ioseq` are omitted (`None`); the row contributes
 //! nothing to those dimensions' fleet median (bug_037 — `1.0`
 //! placeholders dominated the median once the tenant gate opened).

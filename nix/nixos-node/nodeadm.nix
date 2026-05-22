@@ -5,8 +5,9 @@
 # CA, then exits. It does NOT manage kubelet/containerd lifecycle —
 # those are NixOS systemd units (eks-node.nix).
 #
-# Pinned to the release tag matching pins.nix kubernetes_version so the
-# KubeletConfiguration schema nodeadm emits matches the control plane.
+# Pinned to the release tag matching pins.cluster.kubernetes_version so
+# the KubeletConfiguration schema nodeadm emits matches the control
+# plane.
 # vendorHash: run with lib.fakeHash, copy the "got:" line.
 {
   lib,

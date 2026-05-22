@@ -12,11 +12,11 @@
 # `status.allocatable`/`conditions`, `boot_secs()` records into the
 # lead-time sketch (HdrHistogram), `placeable` publishes.
 #
-# `kube-scheduler` (matching the `pins.nix` minor) is preloaded so
-# `buildScheduler.enabled=true` renders a working second-scheduler
-# Deployment — the `forecast-provisioning` subtest asserts builder
-# pods get `schedulerName: kube-build-scheduler` per `r[ctrl.nodeclaim.
-# priority-bucket]`.
+# `kube-scheduler` (matching the `pins.cluster.kubernetes_version`
+# minor) is preloaded so `buildScheduler.enabled=true` renders a
+# working second-scheduler Deployment — the `forecast-provisioning`
+# subtest asserts builder pods get `schedulerName: kube-build-scheduler`
+# per `r[ctrl.nodeclaim.priority-bucket]`.
 { pkgs }:
 let
   pins = import ../../pins.nix;

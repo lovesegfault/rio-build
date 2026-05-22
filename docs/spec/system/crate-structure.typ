@@ -109,7 +109,7 @@ Notable edges:
 - *`rio-proto → rio-nix`*: `ValidatedPathInfo` wraps `StorePath` from rio-nix. No cycle — rio-nix has no rio-\* deps.
 - *`rio-proto → rio-common`*: `connect_channel`/`connect_with_retry` use `rio_common::backoff` and `rio_common::grpc` constants. Contract tests floor-assert `rio_common::limits` constants at compile time (e.g., `MAX_DAG_NODES >= 70_000`).
 - *`rio-scheduler → rio-nix` (prod)*: `Derivation` parsing for closure resolution and `StorePath` validation in the merge path.
-- *`rio-scheduler → rio-crds` (prod)*: lease-election only.
+- *`rio-lease → rio-crds` (prod)*: `KubeErrorExt::is_conflict` for the election 409 branches only.
 - *`rio-scheduler → rio-store` (prod, `schema` feature)*: `ca/resolve.rs` → `rio_store::realisations::query`; integration tests additionally pull `test-utils`.
 - *`rio-gateway → rio-store` (dev-only)*: golden-daemon tests assert against a real `StoreServiceServer` (with `test-utils` feature) instead of `MockStore`.
 

@@ -67,7 +67,8 @@ in
       default = pkgs.kubernetes;
       description = ''
         kubelet binary source. nixpkgs `kubernetes` tracks the version in
-        `nix/pins.nix` `kubernetes_version` (both follow upstream minor).
+        `nix/pins.toml` `[cluster] kubernetes_version` (both follow
+        upstream minor).
       '';
     };
 

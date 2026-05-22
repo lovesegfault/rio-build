@@ -1104,10 +1104,10 @@ tags. Key choices:
   which carries its own `nix`. Dropping the daemon saves \~80 MB closure and
   removes a root-socket attack surface. Debugging is `kubectl debug node/…` +
   SSM Session Manager --- neither needs an on-image Nix.
-+ *Pinned kernel minor in `nix/pins.nix`*, not `linuxPackages_latest`. A
-  nixpkgs flake-input bump can't surprise-rebuild the \~40 min kernel
-  derivation; bump deliberately when the per-page-FUSE work needs a particular
-  patch level.
++ *Pinned kernel minor in `nix/pins.toml` (`[node] kernel_minor`)*, not
+  `linuxPackages_latest`. A nixpkgs flake-input bump can't surprise-rebuild
+  the \~40 min kernel derivation; bump deliberately when the per-page-FUSE
+  work needs a particular patch level.
 + *Both arches from P1.* The NodePool requirements already span x86_64 +
   aarch64; a single-arch AMI would leave arm64 pods on Bottlerocket during
   migration with two userData formats live at once.
