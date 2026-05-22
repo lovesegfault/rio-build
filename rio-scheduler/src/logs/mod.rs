@@ -655,6 +655,63 @@ impl LogBuffers {
         removed
     }
 
+    /// Remove the entry only if it is currently SEALED, stamped with
+    /// `expected`, and (when `require_empty`) holds zero lines — all three
+    /// evaluated inside the `remove_if` predicate, i.e. under the same
+    /// shard write-lock as the removal. On removal the seal tombstone is
+    /// cleared too (mirrors `discard`). Returns whether an entry was
+    /// removed.
+    ///
+    /// Used by the flusher when it concludes a final request is out of
+    /// tenure (`flush_final`'s tenure-drop arm and its post-await tenure
+    /// re-checks with `require_empty = true`; the finalized-elsewhere
+    /// orphan reap with `require_empty = false`). The competing writer is
+    /// the actor task's `set_exec` same-exec restamp, which adopts the
+    /// entry as the live execution's carrier and clears the seal while
+    /// holding the same entry's lock — so the predicate sees either the
+    /// pre-restamp state (still sealed → removal proceeds, and the restamp
+    /// then recreates a fresh stamped, unsealed entry via
+    /// `entry().or_default()`) or the post-restamp state (seal cleared →
+    /// no removal, live carrier preserved). A third interleaving exists:
+    /// the restamp can land between the removal and this method's trailing
+    /// `sealed.remove`, recreating the entry while the stale seal is still
+    /// present for a few flusher instructions (late `push_for` calls drop
+    /// batches in that window) — the trailing remove then clears it, same
+    /// shape as [`Self::discard_if_empty_for_exec`]. What the predicate
+    /// guarantees is only that the removed entry was sealed (+ empty when
+    /// required) and stamped with `expected` *at removal time*. For an
+    /// out-of-tenure request that entry is either a true prior-tenure
+    /// orphan (terminal persisted under the old tenure, no reaper left) or
+    /// an empty entry whose own in-tenure final is still pending (the
+    /// current tenure's epilogue re-sealed it after a same-exec restamp);
+    /// reaping the latter is benign — that final then resolves via the
+    /// no-entry arm and only the empty drain's status stamp is lost. It
+    /// must NOT be read as "sealed ⇒ orphan".
+    ///
+    /// Lock order matches every other caller (buffers entry/shard lock,
+    /// then `sealed`); no path holds a `sealed` guard while acquiring
+    /// `buffers`, so reading the seal inside the predicate cannot deadlock.
+    pub(crate) fn discard_if_sealed_for_exec(
+        &self,
+        drv_path: &str,
+        expected: Uuid,
+        require_empty: bool,
+    ) -> bool {
+        let key = drv_log_hash(drv_path);
+        let removed = self
+            .buffers
+            .remove_if(&key, |_, e| {
+                self.sealed.contains(&key)
+                    && e.exec_id == Some(expected)
+                    && (!require_empty || e.lines.is_empty())
+            })
+            .is_some();
+        if removed {
+            self.sealed.remove(&key);
+        }
+        removed
+    }
+
     /// Push a batch with `(executor, drv)` binding enforcement.
     /// r[impl sched.log.batch-binding]
     ///
@@ -1902,6 +1959,61 @@ mod tests {
 
         // Missing entry → no-op.
         assert!(!bufs.discard_if_empty_for_exec("r14m3k-missing", exec));
+    }
+
+    /// r17 bug_003: the tenure-drop reap evaluates seal + exec + (optional)
+    /// emptiness inside one `remove_if` predicate. Each gate refuses on its
+    /// own; `require_empty=false` widens the reap to non-empty sealed
+    /// entries (the finalized-elsewhere case) without touching unsealed or
+    /// mis-stamped ones.
+    // r[verify obs.log.deferred-final-retry+3]
+    #[test]
+    fn discard_if_sealed_for_exec_checks_seal_exec_and_emptiness() {
+        let bufs = LogBuffers::new();
+        let exec = Uuid::now_v7();
+        let other = Uuid::now_v7();
+
+        // Sealed + empty + matching exec → removed and unsealed (both
+        // require_empty values would accept; use the strict one).
+        bufs.set_exec("r17p1-sealed-empty", exec, "w1");
+        bufs.seal("r17p1-sealed-empty");
+        assert!(bufs.discard_if_sealed_for_exec("r17p1-sealed-empty", exec, true));
+        assert!(bufs.read_since("r17p1-sealed-empty", 0).is_none());
+        assert!(!bufs.is_sealed("r17p1-sealed-empty"));
+
+        // Unsealed (live carrier shape) → untouched regardless of
+        // emptiness requirement.
+        bufs.set_exec("r17p2-unsealed", exec, "w1");
+        assert!(!bufs.discard_if_sealed_for_exec("r17p2-unsealed", exec, true));
+        assert!(!bufs.discard_if_sealed_for_exec("r17p2-unsealed", exec, false));
+        assert_eq!(bufs.exec_id("r17p2-unsealed"), Some(exec));
+
+        // Sealed + non-empty: refused with require_empty=true, removed
+        // (and unsealed) with require_empty=false.
+        bufs.set_exec("r17p3-tail", exec, "w1");
+        assert!(bufs.push_for("r17p3-tail", &mk_batch("r17p3-tail", 0, &[b"l0"]), "w1"));
+        bufs.seal("r17p3-tail");
+        assert!(!bufs.discard_if_sealed_for_exec("r17p3-tail", exec, true));
+        assert!(
+            bufs.read_since("r17p3-tail", 0)
+                .is_some_and(|l| l.len() == 1),
+            "refused reap leaves the lines"
+        );
+        assert!(bufs.is_sealed("r17p3-tail"), "refused reap leaves the seal");
+        assert!(bufs.discard_if_sealed_for_exec("r17p3-tail", exec, false));
+        assert!(bufs.read_since("r17p3-tail", 0).is_none());
+        assert!(!bufs.is_sealed("r17p3-tail"));
+
+        // Exec mismatch → untouched even when sealed and empty.
+        bufs.set_exec("r17p4-mismatch", exec, "w1");
+        bufs.seal("r17p4-mismatch");
+        assert!(!bufs.discard_if_sealed_for_exec("r17p4-mismatch", other, true));
+        assert!(!bufs.discard_if_sealed_for_exec("r17p4-mismatch", other, false));
+        assert_eq!(bufs.exec_id("r17p4-mismatch"), Some(exec));
+        assert!(bufs.is_sealed("r17p4-mismatch"));
+
+        // Missing entry → no-op.
+        assert!(!bufs.discard_if_sealed_for_exec("r17p5-missing", exec, true));
     }
 
     /// bug_080: `RING_CAPACITY` bounds line COUNT only; an untrusted
