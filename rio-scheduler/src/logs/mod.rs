@@ -294,7 +294,7 @@ impl LogBuffers {
     /// a 0-based blob index → silent log-tail loss after eviction).
     /// (`last_line` is not exposed here — the production flush paths that
     /// need the payload's true end use [`Self::drain_if_exec`] /
-    /// [`Self::snapshot`].)
+    /// `snapshot`.)
     pub fn drain(&self, drv_path: &str) -> Option<(u64, u64, u64, Vec<Vec<u8>>)> {
         let (_key, rb) = self.buffers.remove(&drv_log_hash(drv_path))?;
         let (first_line, _last_line, line_count, total_bytes, lines) = Self::into_drained(rb);
