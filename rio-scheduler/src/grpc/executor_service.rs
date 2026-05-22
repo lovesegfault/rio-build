@@ -48,10 +48,13 @@ static STREAM_EPOCH_SEQ: AtomicU64 = AtomicU64::new(0);
 const MAX_DRVS_PER_STREAM: usize = 8;
 
 // ── Worker-supplied field bounds ─────────────────────────────────────
-// r[impl sched.executor.input-bounds]
+// r[impl sched.executor.input-bounds+2]
 // EVERY string/bytes field a worker can set on the ExecutorService
 // surface is listed here with its bound or an explicit reason it is left
-// unbounded. When a field is added to ExecutorMessage / HeartbeatRequest
+// unbounded. Numeric fields are listed with their validation /
+// total-arithmetic treatment when the scheduler folds them into persisted
+// row metadata or per-execution ordering state; all other numerics stay
+// `n/a`. When a field is added to ExecutorMessage / HeartbeatRequest
 // or their nested messages, add a row — an unlisted field is a review
 // rejection. Three enforcement styles:
 //   reject   — drop the message / fail the RPC. For advisory messages
@@ -74,12 +77,19 @@ const MAX_DRVS_PER_STREAM: usize = 8;
 //   BuildLogBatch.derivation_path     → seen_drvs, ring key, actor fwd    → reject batch > MAX_DERIVATION_PATH_LEN
 //   BuildLogBatch.lines[i]            → ring buffer + Event::Log ring     → truncate to logs::MAX_LINE_LEN
 //   BuildLogBatch.executor_id         → retained whole in Event::Log      → truncate to MAX_IDENT_LEN
-//   BuildLogBatch.first_line_number   → numeric (base+i wraps in release,
-//                                       panics in debug; prod is release) → n/a
+//   BuildLogBatch.first_line_number   → ring line numbering + drv_logs    → reject batch if non-monotone vs the
+//                                       row span arithmetic                 ring's last line or if base+len would
+//                                                                           wrap u64 (push_for arms `non_monotonic`
+//                                                                           / `line_number_overflow`); flusher span
+//                                                                           arithmetic is total and the drv_logs
+//                                                                           binds clamp at i64::MAX as the
+//                                                                           magnitude backstop
 //   CompletionReport.drv_path         → actor hash_for_path lookup        → reject report > MAX_DERIVATION_PATH_LEN
 //   CompletionReport.assignment_token → never read in the recv arm        → document (decoded then dropped)
 //   CompletionReport.node_name        → build_samples.node_name           → None if > MAX_IDENT_LEN
 //   CompletionReport.hw_class         → build_samples.hw_class            → None if > MAX_IDENT_LEN
+//   BuildResult.peak_memory_bytes / peak_cpu_cores → build_samples row    → clamped/validated actor-side
+//                                       (completion.rs: .min(i64::MAX) clamp, finiteness/positivity checks)
 //   BuildResult.error_msg             → build_event_log × N, ring, term   → truncate to MAX_ERROR_MSG_LEN
 //   BuildResult.built_outputs[].name/path/hash → PG realisations          → validated actor-side (declared-output
 //                                       membership + StorePath::parse + [u8;32]); the pre-validation mailbox
@@ -184,7 +194,7 @@ impl ExecutorService for SchedulerGrpc {
                         "ExecutorRegister.executor_id is empty",
                     ));
                 }
-                // r[impl sched.executor.input-bounds]
+                // r[impl sched.executor.input-bounds+2]
                 rio_common::grpc::check_bound(
                     "executor_id bytes",
                     reg.executor_id.len(),
@@ -307,7 +317,7 @@ impl ExecutorService for SchedulerGrpc {
                             // No counter: the Ack has no consumer beyond this log
                             // line, so there is no behavior to alert on — the
                             // debug! is the parity-with-other-arms observability.
-                            // r[impl sched.executor.input-bounds]
+                            // r[impl sched.executor.input-bounds+2]
                             if ack.drv_path.len() > MAX_DERIVATION_PATH_LEN {
                                 tracing::debug!(
                                     executor_id = %executor_id_for_recv,
@@ -370,7 +380,7 @@ impl ExecutorService for SchedulerGrpc {
                             // unknown-drv return precedes the free-worker-capacity
                             // block), so no behavior change. No legitimate
                             // completion is lost.
-                            // r[impl sched.executor.input-bounds]
+                            // r[impl sched.executor.input-bounds+2]
                             if report.drv_path.len() > MAX_DERIVATION_PATH_LEN {
                                 tracing::debug!(
                                     executor_id = %executor_id_for_recv,
@@ -407,7 +417,7 @@ impl ExecutorService for SchedulerGrpc {
                             // (a dropped completion strands the drv in Running), so
                             // oversized fields are truncated/nulled instead of
                             // failing the whole report.
-                            // r[impl sched.executor.input-bounds]
+                            // r[impl sched.executor.input-bounds+2]
                             rio_common::grpc::truncate_utf8(
                                 &mut result.error_msg,
                                 MAX_ERROR_MSG_LEN,
@@ -463,7 +473,7 @@ impl ExecutorService for SchedulerGrpc {
                             // MAX_PHASE_LEN. Same reject-don't-truncate policy
                             // as the path: a >256-byte phase name is a hostile or
                             // broken worker, and a dropped phase update is
-                            // cosmetic. r[impl sched.executor.input-bounds]
+                            // cosmetic. r[impl sched.executor.input-bounds+2]
                             if phase.phase.len() > MAX_PHASE_LEN {
                                 tracing::debug!(
                                     len = phase.phase.len(),
@@ -529,7 +539,7 @@ impl ExecutorService for SchedulerGrpc {
                             // push_into at all — it clones the ORIGINAL proto
                             // (including executor_id, which nothing reads but
                             // everything retains) per interested build.
-                            // r[impl sched.executor.input-bounds]
+                            // r[impl sched.executor.input-bounds+2]
                             for line in &mut log.lines {
                                 if line.len() > crate::logs::MAX_LINE_LEN {
                                     line.truncate(crate::logs::MAX_LINE_LEN);
@@ -722,7 +732,7 @@ impl ExecutorService for SchedulerGrpc {
         // payload lives on ExecutorState for the executor's lifetime.
         // Rejecting a hostile heartbeat is the designed recovery path —
         // the worker times out and is reaped; nothing is stranded.
-        // r[impl sched.executor.input-bounds]
+        // r[impl sched.executor.input-bounds+2]
         rio_common::grpc::check_bound("executor_id bytes", req.executor_id.len(), MAX_IDENT_LEN)?;
         rio_common::grpc::check_bound("intent_id bytes", req.intent_id.len(), MAX_IDENT_LEN)?;
         if let Some(rb) = &req.running_build {

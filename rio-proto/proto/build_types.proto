@@ -182,7 +182,12 @@ message BuildPhase {
 message BuildLogBatch {
   string derivation_path = 1;              // Which derivation produced these lines
   repeated bytes lines = 2;                // Batch of log lines (raw bytes)
-  uint64 first_line_number = 3;            // For ordering
+  // For ordering. Per execution the numbering MUST be strictly increasing
+  // across batches: the scheduler rejects a batch that starts at or below
+  // the highest line number it already holds for the execution, or whose
+  // first_line_number + lines.len() would overflow u64. Forward gaps are
+  // allowed (suppressed/undelivered lines).
+  uint64 first_line_number = 3;
   string executor_id = 4;                  // For debugging
 }
 

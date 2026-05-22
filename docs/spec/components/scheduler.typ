@@ -226,14 +226,17 @@ recv task's per-stream `seen_drvs` set (pinning
 the actor's single-threaded mailbox on disconnect. Rejections increment the
 arm's rejection counter with reason `path_too_long`.
 
-#r("sched.executor.input-bounds")[
+#r("sched.executor.input-bounds+2")[
   Every worker-supplied string field on the `ExecutorService` surface MUST be
   either length-bounded before it is accumulated (persisted to PostgreSQL,
   buffered in a broadcast ring, rendered to a client terminal, or stored in
-  long-lived actor state) or validated against a scheduler-trusted set. Fields
-  that are decoded and dropped without accumulation MAY remain bounded only by
-  the gRPC message-size cap, and MUST be enumerated as such at the
-  bounds-constant block in `executor_service.rs`.
+  long-lived actor state) or validated against a scheduler-trusted set, and
+  every worker-supplied numeric field that the scheduler folds into persisted
+  row metadata or per-execution ordering state MUST be either validated at
+  ingestion or consumed only through total (non-wrapping, non-panicking)
+  arithmetic. Fields that are decoded and dropped without accumulation MAY
+  remain bounded only by the gRPC message-size cap, and MUST be enumerated as
+  such at the bounds-constant block in `executor_service.rs`.
 ]
 
 The round-8 `derivation_path` bound (#rref("sched.log.path-length")) fixed one
@@ -256,6 +259,29 @@ rejections increment #(refs.metric)("rio_scheduler_phases_rejected_total")
 with reason `phase_too_long`; the unresolvable-path completion drop
 increments #(refs.metric)("rio_scheduler_completions_rejected_total") with
 reason `path_too_long`.
+
+`BuildLogBatch.first_line_number` is the motivating numeric field: it keys
+the ring buffer's line numbering and the `drv_logs` row span, so out-of-order
+or overflowing numbering would otherwise wrap the span subtraction into a
+negative `line_count` (corrupting `s3_is_caught_up` and the
+physical-vs-claimed re-serve for every interested build of the execution) or
+panic the flusher task in debug builds. Ordering violations are rejected
+per-batch at ingestion (reasons `non_monotonic` / `line_number_overflow` on
+#(refs.metric)("rio_scheduler_log_batches_rejected_total")); magnitude is
+deliberately NOT bounded at ingestion (forward gaps are legitimate and
+unbounded — see #rref("obs.log.gap-span")) and is instead handled under the
+rule's total-arithmetic branch: the flusher's span computation falls back to
+the physical line count (tripwire
+#(refs.metric)("rio_scheduler_log_flush_span_fallback_total")) and the
+`drv_logs` numeric binds clamp at `i64::MAX`, which keeps every recorded
+`(first_line, line_count)` pair non-negative and overflow-free for the read
+path. The `BuildResult` resource telemetry persisted to `build_samples`
+(`peak_memory_bytes`, `peak_cpu_cores`, the start/stop-derived duration)
+already complies via the same branch — actor-side `i64::MAX` clamps,
+finiteness/positivity checks, and the duration sanity bound in
+`completion.rs`. Heartbeat resource numerics and `PrefetchComplete` counters
+stay enumerated as `n/a`: they are not folded into row metadata or ordering
+state.
 
 #r("sched.merge.exec-correlation+7")[
   The scheduler MUST set `build_derivations.exec_id` for every interested

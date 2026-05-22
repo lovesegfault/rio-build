@@ -1173,7 +1173,7 @@ async fn test_build_execution_empty_stream_rejected() -> anyhow::Result<()> {
 /// gate) and arrives as the FIRST `Event::Phase` on the build stream —
 /// the `len == MAX_PHASE_LEN` assertion fails. Post-fix only send 3's
 /// boundary phase arrives.
-// r[verify sched.executor.input-bounds]
+// r[verify sched.executor.input-bounds+2]
 // r[verify sched.log.path-length]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_phase_oversized_text_rejected_before_forward() -> anyhow::Result<()> {
@@ -1284,7 +1284,7 @@ async fn test_phase_oversized_text_rejected_before_forward() -> anyhow::Result<(
 /// the build (a dropped completion strands the drv in Running), the
 /// error_msg arrives truncated to `MAX_ERROR_MSG_LEN` on the build event
 /// stream, and the pod-identity stamps fall back to `None`.
-// r[verify sched.executor.input-bounds]
+// r[verify sched.executor.input-bounds+2]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_completion_oversized_fields_bounded_not_dropped() -> anyhow::Result<()> {
     let (_db, grpc, _handle, _actor_task) = setup_grpc().await;
@@ -1404,7 +1404,7 @@ async fn test_completion_oversized_fields_bounded_not_dropped() -> anyhow::Resul
 /// derivation", so this test passes before AND after the fix; it guards
 /// against the one way the new check could be wrong (`break` would
 /// disconnect the worker and strand its real build).
-// r[verify sched.executor.input-bounds]
+// r[verify sched.executor.input-bounds+2]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_completion_oversized_path_rejected() -> anyhow::Result<()> {
     let (_db, grpc, _handle, _actor_task) = setup_grpc().await;
@@ -1490,7 +1490,7 @@ async fn test_completion_oversized_path_rejected() -> anyhow::Result<()> {
 /// Rejecting a hostile heartbeat is the designed recovery (the worker
 /// times out and is reaped); the payload otherwise lives on
 /// `ExecutorState` for the executor's lifetime.
-// r[verify sched.executor.input-bounds]
+// r[verify sched.executor.input-bounds+2]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_heartbeat_oversized_strings_rejected() -> anyhow::Result<()> {
     let (_handle, mut worker_client, _srv, _actor, _db) = setup_worker_svc().await?;
@@ -1575,7 +1575,7 @@ async fn test_heartbeat_oversized_strings_rejected() -> anyhow::Result<()> {
 ///
 /// Red-first: pre-fix the `Event::Log` on the build stream carries the
 /// original 2×MAX_LINE_LEN line and the oversized executor_id.
-// r[verify sched.executor.input-bounds]
+// r[verify sched.executor.input-bounds+2]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_log_batch_oversized_line_and_executor_id_bounded_before_forward() -> anyhow::Result<()>
 {

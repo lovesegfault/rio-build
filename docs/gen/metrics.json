@@ -528,7 +528,7 @@
         "name": "rio_scheduler_lease_lost_total"
       },
       {
-        "help": "BuildLogBatch dropped by the (executor, drv) binding check or the derivation_path length bound. Labeled by reason: no_assignment | unstamped | executor_mismatch | path_too_long.",
+        "help": "BuildLogBatch dropped by the (executor, drv) binding check, the derivation_path length bound, or the line-number sanity checks (non-monotone vs the ring buffer, or numbering that would overflow u64). Labeled by reason: no_assignment | unstamped | executor_mismatch | path_too_long | non_monotonic | line_number_overflow.",
         "kind": "counter",
         "name": "rio_scheduler_log_batches_rejected_total"
       },
@@ -551,6 +551,11 @@
         "help": "Final-flush attempts deferred because the finalize guard could not read the execution's drv_logs row (transient PG error): nothing is uploaded on that attempt. A deferral with a non-empty buffer is retained by the flusher and retried each periodic tick until PG answers (terminal cleanup leaves the buffer to the retry); an empty buffer is reaped so reads fall through to the stored .partial. Counted per attempt, so retries during one outage keep incrementing it. Sustained rate indicates PG trouble on the flush path; loss requires the retry retention cap to overflow or the process to exit before PG recovers.",
         "kind": "counter",
         "name": "rio_scheduler_log_flush_finalize_deferred_total"
+      },
+      {
+        "help": "Flush payloads whose ring lines carried non-monotone worker line numbers at span-recording time, so the drv_logs row recorded the physical line count instead of the line-number span (labeled kind: final|periodic). Should be zero — push_for rejects non-monotone batches at ingestion, so a non-zero rate means an ingestion-gate regression. Not a data-loss signal: the blob is still uploaded and served.",
+        "kind": "counter",
+        "name": "rio_scheduler_log_flush_span_fallback_total"
       },
       {
         "help": "Final-flush requests dropped because the drv was re-dispatched while the request was queued (the live ring-buffer exec_id no longer matches the request's). The re-dispatched execution's log is preserved; the stale request's exec was already lost when assign_to_worker discarded its buffer.",
@@ -1141,6 +1146,7 @@
     "rio_scheduler_log_flush_dropped_total",
     "rio_scheduler_log_flush_failures_total",
     "rio_scheduler_log_flush_finalize_deferred_total",
+    "rio_scheduler_log_flush_span_fallback_total",
     "rio_scheduler_log_flush_stale_total",
     "rio_scheduler_log_flush_total",
     "rio_scheduler_log_forward_dropped_total",

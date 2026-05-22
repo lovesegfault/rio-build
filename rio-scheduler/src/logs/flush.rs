@@ -987,7 +987,13 @@ impl LogFlusher {
         // test and the caller's gap arithmetic operate on exact bounds.
         // r[impl obs.log.stored-coverage-preserved]
         let stored_end = first_line + line_count;
-        let ring_contiguous = ring_last_line - ring_first_line + 1 == ring_line_count;
+        // Checked: a non-monotone ring (only possible if the push_for
+        // ingestion gate regresses) classifies as non-contiguous — the
+        // conservative branch (the stored prefix is fetched and merged) —
+        // instead of underflowing.
+        let ring_contiguous = ring_last_line
+            .checked_sub(ring_first_line)
+            .is_some_and(|d| d.saturating_add(1) == ring_line_count);
         if ring_contiguous && ring_first_line <= first_line && ring_last_line + 1 >= stored_end {
             return StoredPrefixLookup::NotNeeded;
         }
@@ -1248,16 +1254,49 @@ impl LogFlusher {
         // accepted interim-leader loss, now without a lying row.
         // r[impl obs.log.gap-span]
         let prefix_lines_recovered = recovered_prefix.as_ref().map(|p| p.line_count);
-        // Non-empty payload (line_count == 0 returned above) with in-order
-        // batches ⇒ last_line ≥ first_line.
-        debug_assert!(
-            last_line >= first_line,
-            "non-empty flush payload with last_line {last_line} < first_line {first_line}"
-        );
+        // Ring contribution to the row span, in TRUE line-number space
+        // (last − first + 1; exceeds the physical count exactly when the ring
+        // carries an interior hole — see above). Ingestion enforces monotone
+        // numbering per entry (`LogBuffers::push_for` rejects non-monotone
+        // and overflowing batches), so for a non-empty payload
+        // last_line ≥ first_line always holds in production. Computed totally
+        // anyway: the ingestion gate only constrains a batch against the
+        // ring's CURRENT contents (it resets when the ring empties), so if a
+        // future ingestion gap lets out-of-order numbering through, the span
+        // must degrade to the physical line count (the well-formed
+        // pre-hole-aware behavior) rather than wrap into a negative BIGINT in
+        // drv_logs.line_count — which corrupts s3_is_caught_up and the
+        // physical-vs-claimed re-serve for every interested build — or panic
+        // the only flusher task.
+        // r[impl sched.executor.input-bounds+2]
+        let ring_span = match last_line.checked_sub(first_line) {
+            Some(d) => d.saturating_add(1),
+            None => {
+                warn!(
+                    drv = %req.drv_path,
+                    exec_id = %exec_id,
+                    first_line,
+                    last_line,
+                    line_count,
+                    is_final,
+                    "flush payload carries non-monotone line numbers; \
+                     recording the physical line count instead of the \
+                     line-number span"
+                );
+                metrics::counter!(
+                    "rio_scheduler_log_flush_span_fallback_total",
+                    "kind" => if is_final { "final" } else { "periodic" },
+                )
+                .increment(1);
+                line_count
+            }
+        };
         let (eff_first_line, eff_line_count, eff_total_bytes, gap_marker) = match &recovered_prefix
         {
             Some(p) => {
-                let prefix_end = p.first_line + p.line_count;
+                // Saturating: total under arbitrary stored/worker inputs;
+                // sane inputs are unaffected.
+                let prefix_end = p.first_line.saturating_add(p.line_count);
                 let gap = first_line.saturating_sub(prefix_end);
                 let marker = (gap > 0).then(|| {
                     format!("[rio: ~{gap} earlier lines lost across scheduler failover]")
@@ -1269,12 +1308,14 @@ impl LogFlusher {
                     // True span: prefix span + gap + ring line-number span
                     // (= ring true end − prefix start), NOT prefix + marker
                     // + physical ring lines.
-                    p.line_count + gap + (last_line - first_line + 1),
-                    p.total_bytes + marker_len + raw_bytes,
+                    p.line_count.saturating_add(gap).saturating_add(ring_span),
+                    p.total_bytes
+                        .saturating_add(marker_len)
+                        .saturating_add(raw_bytes),
                     marker,
                 )
             }
-            None => (first_line, last_line - first_line + 1, raw_bytes, None),
+            None => (first_line, ring_span, raw_bytes, None),
         };
 
         // Compress in spawn_blocking. ~10 MiB of log compresses in ~50ms on
@@ -1845,9 +1886,20 @@ async fn upsert_drv_log(
     .bind(exec_id)
     .bind(drv_hash)
     .bind(s3_key)
-    .bind(first_line as i64)
-    .bind(line_count as i64)
-    .bind(total_bytes as i64)
+    // Clamp before the i64 casts — same precedent as
+    // build_samples.peak_memory_bytes (completion.rs). The ingestion gate
+    // bounds ordering, not magnitude: a worker that claims line numbers,
+    // spans, or byte totals ≥ 2^63 would otherwise wrap these BIGINTs
+    // negative (corrupting s3_is_caught_up and the physical-vs-claimed
+    // re-serve), and a post-failover gate reset can let the prefix-arm sum
+    // reach u64::MAX. Clamping both halves to i64::MAX also guarantees
+    // first_line + line_count ≤ u64::MAX − 1 for every recorded row, so the
+    // read-side adds (s3_is_caught_up, lookup_stored_prefix /
+    // reconcile_stored_prefix stored_end) can never wrap either.
+    // r[impl sched.executor.input-bounds+2]
+    .bind(first_line.min(i64::MAX as u64) as i64)
+    .bind(line_count.min(i64::MAX as u64) as i64)
+    .bind(total_bytes.min(i64::MAX as u64) as i64)
     .bind(is_complete)
     .bind(status)
     .bind(started_at_epoch)
@@ -5671,6 +5723,137 @@ mod tests {
         assert!(row.4.is_some(), "terminal stamp recorded");
         assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(buffers.active_count(), 0, "the empty entry was drained");
+        Ok(())
+    }
+
+    /// Defense in depth for the span computation: a ring carrying
+    /// non-monotone worker numbering (only possible if the push_for
+    /// ingestion gate regresses — simulated here via the legacy push(),
+    /// which bypasses the gate) must neither panic the flusher nor wrap
+    /// drv_logs.line_count negative. It records the physical line count and
+    /// flags the fallback tripwire metric.
+    // r[verify sched.executor.input-bounds+2]
+    #[tokio::test]
+    async fn non_monotone_ring_records_physical_count_not_wrapped_span() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let drv_path = "/nix/store/r14mono1-out-of-order.drv";
+        let (s3, puts, _deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+
+        let exec_id = Uuid::now_v7();
+        buffers.set_exec(drv_path, exec_id, "test-worker");
+        // Legacy push() bypasses push_for's monotonicity gate: ring becomes
+        // front=(1000,"late"), back=(0,"early") — the ingestion-regression shape.
+        buffers.push(&mk_batch(drv_path, 1000, &[b"late"]));
+        buffers.push(&mk_batch(drv_path, 0, &[b"early"]));
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            flusher
+                .flush_final(FlushRequest {
+                    drv_path: drv_path.into(),
+                    exec_id,
+                    status: Some("succeeded".into()),
+                })
+                .await;
+        }
+
+        // Row is well-formed: physical count, never a negative/wrapped span.
+        let row: (i64, i64, bool) = sqlx::query_as(
+            "SELECT first_line, line_count, is_complete FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(
+            (row.0, row.1, row.2),
+            (1000, 2, true),
+            "physical-count fallback (2), not a wrapped span"
+        );
+
+        // Blob still uploaded with both lines, in arrival order.
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1);
+        let decoded = String::from_utf8(zstd::decode_all(&captured[0].1[..])?)?;
+        assert_eq!(decoded, "late\nearly\n");
+
+        // Tripwire fired, labeled as a final flush.
+        let counters = all_counters(&snap);
+        let fb: Vec<_> = counters
+            .iter()
+            .filter(|(n, _, _)| n == "rio_scheduler_log_flush_span_fallback_total")
+            .collect();
+        assert_eq!(fb.len(), 1, "exactly one fallback series: {counters:?}");
+        assert_eq!(fb[0].2, 1);
+        assert!(fb[0].1.contains(&("kind".to_string(), "final".to_string())));
+        Ok(())
+    }
+
+    /// Magnitude is deliberately NOT bounded at ingestion (forward jumps are
+    /// legal and unbounded): a gate-legal batch numbered ≥ 2^63 must not
+    /// sign-flip the drv_logs BIGINTs — the bind-site clamp records i64::MAX
+    /// instead of a negative first_line.
+    // r[verify sched.executor.input-bounds+2]
+    #[tokio::test]
+    async fn huge_monotone_line_numbers_clamp_at_bind_not_sign_flip() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let drv_path = "/nix/store/r14mono2-huge-line-numbers.drv";
+        let (s3, puts, _deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+
+        let exec_id = Uuid::now_v7();
+        buffers.set_exec(drv_path, exec_id, "test-worker");
+        // Gate-legal input: ring is empty and the numbering does not overflow,
+        // so push_for accepts it — this is exactly the shape the ingestion
+        // gate is NOT meant to reject (magnitude is the clamp's job).
+        assert!(buffers.push_for(
+            drv_path,
+            &mk_batch(drv_path, (i64::MAX as u64) + 5, &[b"huge"]),
+            "test-worker"
+        ));
+
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id,
+                status: Some("succeeded".into()),
+            })
+            .await;
+
+        let row: (i64, i64, i64, bool) = sqlx::query_as(
+            "SELECT first_line, line_count, total_bytes, is_complete FROM drv_logs \
+             WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(
+            row.0,
+            i64::MAX,
+            "first_line clamps at i64::MAX, never negative"
+        );
+        assert_eq!(row.1, 1, "single-line span stays 1");
+        assert!(row.2 > 0, "total_bytes stays physical and positive");
+        assert!(row.3);
+        assert_eq!(puts.lock().unwrap().len(), 1, "blob still uploaded");
         Ok(())
     }
 }

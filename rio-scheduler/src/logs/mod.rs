@@ -263,10 +263,13 @@ impl LogBuffers {
             // bound *accounted* bytes, not *allocated* bytes. The recv
             // arm already truncates worker-supplied lines before they get
             // here; this is defense in depth for the legacy `push()` path
-            // (tests, future callers). r[impl sched.executor.input-bounds]
+            // (tests, future callers). r[impl sched.executor.input-bounds+2]
             let l = line[..line.len().min(MAX_LINE_LEN)].to_vec();
             buf.bytes += l.len();
-            buf.lines.push_back((base + i as u64, l));
+            // Saturating: defense in depth for the legacy `push()` path
+            // (tests, future callers); production batches are pre-validated
+            // by `push_for`'s overflow arm.
+            buf.lines.push_back((base.saturating_add(i as u64), l));
         }
 
         // Evict oldest lines if over capacity (line count OR bytes).
@@ -621,7 +624,15 @@ impl LogBuffers {
     ///   (`reason="unstamped"`), or the entry's `assigned_executor` does
     ///   not match `executor` (`reason="executor_mismatch"`). Each
     ///   binding-gate reject increments
-    ///   `rio_scheduler_log_batches_rejected_total` and emits a `debug!`.
+    ///   `rio_scheduler_log_batches_rejected_total` and emits a `debug!`, or
+    /// - the line-numbering gate rejects it: the batch starts at or below
+    ///   the ring's highest stored line number (`reason="non_monotonic"`),
+    ///   or `first_line_number + lines.len()` would overflow u64
+    ///   (`reason="line_number_overflow"`). Same counter, same `debug!`
+    ///   discipline. This is what makes the ring's documented
+    ///   monotone-numbering invariant (`truncate_below`, `read_since`)
+    ///   enforced rather than assumed; upward gaps of any size remain
+    ///   accepted.
     ///
     /// **The caller MUST gate any sibling consumer on the return value.**
     /// `r[sched.log.batch-binding]` requires the *ingestion path* to drop
@@ -653,7 +664,7 @@ impl LogBuffers {
             // Late batch after terminal; matches push()'s seal check.
             return false;
         }
-        // debug!, not warn!, on all three reject arms below — same shape as
+        // debug!, not warn!, on all reject arms below — same shape as
         // handle_forward_phase (event.rs) and ProcessCompletion's stale-report
         // guard. Rejected paths bypass the seen_drvs cap (executor_service.rs),
         // so a 100%-rejected stream fires this unbounded; the metric covers
@@ -691,6 +702,64 @@ impl LogBuffers {
             )
             .increment(1);
             return false;
+        }
+        // Worker-supplied line numbering. The LogBatcher contract is strictly
+        // monotone numbering per execution (header banner once at line 0,
+        // daemon-transient retries reseed at the prior attempt's
+        // final_line_count, reconnects resume after the last delivered line —
+        // see rio-builder log_stream.rs / executor mod.rs, bug_013), so a
+        // batch that would wrap u64 numbering or that starts at/below the
+        // ring's highest stored line number is malformed worker input. Reject
+        // the batch — do NOT renumber it: the field's only purpose is
+        // ordering, and every downstream consumer (read_since's monotone
+        // scan, truncate_below's front-truncation, the flusher's span and
+        // stored-coverage subsumption arithmetic, drv_logs.line_count) relies
+        // on ring numbering being monotone. Per-batch, like the binding arms
+        // above: an in-order batch after a rejected one is accepted again.
+        // Scope: the comparison is against the CURRENT ring contents only
+        // (it resets when the ring empties — drain, failover truncate_below,
+        // discard), and absolute magnitude is deliberately unbounded —
+        // upward gaps of any size stay accepted (interior holes are
+        // legitimate, obs.log.gap-span). Whatever passes here is made
+        // harmless at the recording site: the flusher's span computation is
+        // total and the drv_logs numeric binds clamp at i64::MAX.
+        // r[impl sched.executor.input-bounds+2]
+        if !batch.lines.is_empty() {
+            if batch
+                .first_line_number
+                .checked_add(batch.lines.len() as u64)
+                .is_none()
+            {
+                tracing::debug!(
+                    drv = %drv_path, executor,
+                    first_line_number = batch.first_line_number,
+                    lines = batch.lines.len(),
+                    "rejected log batch: line numbering would overflow u64"
+                );
+                metrics::counter!(
+                    "rio_scheduler_log_batches_rejected_total",
+                    "reason" => "line_number_overflow"
+                )
+                .increment(1);
+                return false;
+            }
+            if let Some((last_line, _)) = entry.lines.back()
+                && batch.first_line_number <= *last_line
+            {
+                tracing::debug!(
+                    drv = %drv_path, executor,
+                    first_line_number = batch.first_line_number,
+                    ring_last_line = last_line,
+                    "rejected log batch: non-monotone first_line_number \
+                     (ring already holds an equal or higher line number)"
+                );
+                metrics::counter!(
+                    "rio_scheduler_log_batches_rejected_total",
+                    "reason" => "non_monotonic"
+                )
+                .increment(1);
+                return false;
+            }
         }
         // Same write-lock guard for check AND write — no TOCTOU window.
         Self::push_into(&mut entry, batch);
@@ -2095,6 +2164,64 @@ mod tests {
             bufs.read_since("drv-a", 0),
             Some(vec![(0, b"legacy".to_vec())])
         );
+    }
+
+    /// Worker numbering must be strictly monotone per execution: a batch
+    /// whose first_line_number is at or below the ring's highest stored
+    /// line number is rejected (per-batch), and the caller is told so the
+    /// gateway forward is suppressed too.
+    // r[verify sched.executor.input-bounds+2]
+    #[test]
+    fn push_for_rejects_non_monotonic_batch() {
+        let bufs = LogBuffers::new();
+        bufs.set_exec("drv-a", Uuid::now_v7(), "executor-1");
+        assert!(bufs.push_for("drv-a", &mk_batch("drv-a", 1000, &[b"l1000"]), "executor-1"));
+
+        // Below the ring's end → rejected, nothing stored.
+        assert!(!bufs.push_for("drv-a", &mk_batch("drv-a", 0, &[b"l0"]), "executor-1"));
+        // Equal to the ring's end → rejected (would double-number the line).
+        assert!(!bufs.push_for("drv-a", &mk_batch("drv-a", 1000, &[b"dup"]), "executor-1"));
+        assert_eq!(
+            bufs.read_since("drv-a", 0),
+            Some(vec![(1000, b"l1000".to_vec())]),
+            "rejected batches must not reach the ring"
+        );
+        // Rejection is per-batch: the next in-order batch is accepted.
+        assert!(bufs.push_for("drv-a", &mk_batch("drv-a", 1001, &[b"l1001"]), "executor-1"));
+        assert_eq!(bufs.read_since("drv-a", 0).unwrap().len(), 2);
+    }
+
+    /// Upward gaps stay accepted — that is the legitimate interior-hole /
+    /// resumed-suffix shape (obs.log.gap-span), not an ordering violation.
+    #[test]
+    fn push_for_accepts_forward_gap() {
+        let bufs = LogBuffers::new();
+        let exec = Uuid::now_v7();
+        bufs.set_exec("drv-a", exec, "executor-1");
+        assert!(bufs.push_for(
+            "drv-a",
+            &mk_batch("drv-a", 0, &[b"l0", b"l1"]),
+            "executor-1"
+        ));
+        assert!(bufs.push_for("drv-a", &mk_batch("drv-a", 8, &[b"l8"]), "executor-1"));
+        let (first, last, count) = bufs.span("drv-a", exec).unwrap();
+        assert_eq!((first, last, count), (0, 8, 3));
+    }
+
+    /// first_line_number near u64::MAX would make `base + i` wrap (panic in
+    /// debug, wrap in release): rejected before it reaches push_into.
+    // r[verify sched.executor.input-bounds+2]
+    #[test]
+    fn push_for_rejects_line_number_overflow() {
+        let bufs = LogBuffers::new();
+        bufs.set_exec("drv-a", Uuid::now_v7(), "executor-1");
+        let accepted = bufs.push_for(
+            "drv-a",
+            &mk_batch("drv-a", u64::MAX, &[b"a", b"b"]),
+            "executor-1",
+        );
+        assert!(!accepted);
+        assert_eq!(bufs.read_since("drv-a", 0), Some(vec![]));
     }
 
     #[test]

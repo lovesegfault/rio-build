@@ -364,9 +364,20 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_log_batches_rejected_total",
-        "BuildLogBatch dropped by the (executor, drv) binding check or the \
-         derivation_path length bound. \
-         Labeled by reason: no_assignment | unstamped | executor_mismatch | path_too_long."
+        "BuildLogBatch dropped by the (executor, drv) binding check, the \
+         derivation_path length bound, or the line-number sanity checks \
+         (non-monotone vs the ring buffer, or numbering that would overflow u64). \
+         Labeled by reason: no_assignment | unstamped | executor_mismatch | \
+         path_too_long | non_monotonic | line_number_overflow."
+    );
+    describe_counter!(
+        "rio_scheduler_log_flush_span_fallback_total",
+        "Flush payloads whose ring lines carried non-monotone worker line numbers \
+         at span-recording time, so the drv_logs row recorded the physical line \
+         count instead of the line-number span (labeled kind: final|periodic). \
+         Should be zero — push_for rejects non-monotone batches at ingestion, so a \
+         non-zero rate means an ingestion-gate regression. Not a data-loss signal: \
+         the blob is still uploaded and served."
     );
     describe_counter!(
         "rio_scheduler_phases_rejected_total",
