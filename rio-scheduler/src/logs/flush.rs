@@ -836,7 +836,7 @@ impl LogFlusher {
         // ring has an interior hole (lines delivered only to an interim
         // leader during an A→B→A flap) — means the stored blob may hold
         // lines this replica never had, and it must be folded in rather
-        // than overwritten. Finalized rows stay NotNeeded: the monotone
+        // than overwritten. Finalized rows stay NotNeeded: the frozen
         // UPSERT clause protects the row, and refusing the re-finalization
         // upload is the already-finalized gate's job in flush_final.
         //
