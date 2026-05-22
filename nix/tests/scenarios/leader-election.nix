@@ -28,7 +28,7 @@
 #   graceful-release: SIGTERM leader (no --force, --grace-period=30)
 #   → step_down() runs to completion → standby acquires in <10s (vs
 #   the 19s observed-staleness steal on ungraceful kill).
-#   lease/mod.rs:409-420. The
+#   Graceful-release body: rio-lease run_lease_loop's shutdown path. The
 #   new leader's pod carries pod-deletion-cost=1 annotation so k8s
 #   RollingUpdate kills the standby first → no leadership churn.
 #
@@ -176,7 +176,7 @@ let
           # brief steal-back before we check. ==0 is unambiguously broken.
           assert total_acq >= 1.0, (
               f"total lease_acquired across all schedulers = {total_acq}. "
-              f"Acquire transition body (lease/mod.rs:293-353) never fired."
+              f"Acquire transition body (LeaderState::on_acquire via run_lease_loop) never fired."
           )
     '';
 
@@ -228,7 +228,7 @@ let
       # the SIGKILL-before-atexit). This subtest is the PRODUCTION rollout
       # path: --grace-period=30, no --force → pure SIGTERM → full 30s
       # drain window → step_down() completes, main() returns, atexit
-      # flushes profraw. lease/mod.rs:409-420 graceful-release body.
+      # flushes profraw. Graceful-release body: step_down in run_lease_loop.
       #
       # deletion-cost: on acquire, spawn_patch_deletion_cost writes
       # controller.kubernetes.io/pod-deletion-cost=1 to the pod. K8s
@@ -271,7 +271,7 @@ let
           )
 
           # deletion-cost on the NEW leader. Fire-and-forget spawn
-          # (lease/mod.rs:320) — may take a tick to land. 5s slack.
+          # (spawn_patch_deletion_cost) — may take a tick to land. 5s slack.
           new_leader = leader_pod()
           k3s_server.wait_until_succeeds(
               f"test \"$(k3s kubectl -n ${ns} get pod {new_leader} "
