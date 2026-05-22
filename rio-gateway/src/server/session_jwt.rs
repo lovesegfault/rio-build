@@ -147,9 +147,11 @@ pub(crate) fn refresh_session_jwt<'a>(
 mod jwt_issuance_tests {
     use super::*;
 
-    /// Fixed-seed key. Same pattern as rio-common/src/jwt.rs tests —
-    /// SigningKey::generate needs rand_core 0.6 but the workspace is
-    /// on rand 0.9; from_bytes sidesteps the trait version mismatch.
+    /// Fixed-seed key. Same pattern as the `rio-auth/src/jwt.rs` tests —
+    /// we never call `SigningKey::generate`; building from seed bytes
+    /// gives a deterministic key and mirrors production, where the key
+    /// always arrives as seed bytes from a K8s Secret rather than being
+    /// generated in-process.
     fn test_key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
     }

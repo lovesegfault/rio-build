@@ -62,8 +62,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// scopeguard-unlock dance needed.
 ///
 /// `migrator` is taken by value: `set_locking` needs `&mut`, and
-/// `Migrator` is not `Clone` in sqlx 0.8.x. Callers pass
-/// [`crate::migrator()`] to get a fresh owned value.
+/// `Migrator` is not `Clone`. Callers pass [`crate::migrator()`]
+/// to get a fresh owned value.
 pub async fn run(pool: &PgPool, mut migrator: Migrator) -> Result<(), MigrateError> {
     // Dedicated lock connection, detached so dropping it closes the
     // socket (releasing the session lock) on ANY exit path. NOT the

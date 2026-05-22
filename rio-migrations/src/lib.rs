@@ -17,10 +17,10 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// Fresh `Migrator` value for callers that need ownership.
 ///
-/// `sqlx::migrate::Migrator` is NOT `Clone` in sqlx 0.8.x (derives
-/// `Debug` only). [`migrate::run`] takes `Migrator` by value because
-/// `set_locking` needs `&mut`. This function re-invokes the macro to
-/// produce a fresh owned value, sidestepping the missing `Clone`.
+/// `sqlx::migrate::Migrator` is not `Clone` (derives `Debug` only).
+/// [`migrate::run`] takes `Migrator` by value because `set_locking`
+/// needs `&mut`. This function re-invokes the macro to produce a
+/// fresh owned value, sidestepping the missing `Clone`.
 pub fn migrator() -> sqlx::migrate::Migrator {
     sqlx::migrate!("./migrations")
 }
