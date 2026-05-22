@@ -732,9 +732,26 @@ impl DagActor {
         // that leak to TERMINAL_CLEANUP_DELAY (~60s). (Zero-line buffers
         // are already reaped at the epilogue when the enqueue fails;
         // this backstop matters for buffers holding lines.)
+        //
+        // Exception: an entry whose deferred final flush is retained by the
+        // flusher (finalize guard could not read drv_logs — PG outage at
+        // final-flush time). Discarding it here would destroy the only copy
+        // of the log while the flusher is still going to retry; the retried
+        // flush's drain is that entry's reaper. Bounded by the flusher's
+        // DEFERRED_FINALS_MAX retention cap (overflow entries are not
+        // marked and are discarded here as before) and by process restart.
+        // r[impl obs.log.deferred-final-retry]
         let reaped_paths = self.dag.remove_build_interest_and_reap(build_id);
         if let Some(bufs) = &self.log_buffers {
             for path in &reaped_paths {
+                if bufs.finalize_deferred(path) {
+                    debug!(
+                        drv_path = %path,
+                        "skipping log-buffer discard at build cleanup: deferred \
+                         final flush pending retry"
+                    );
+                    continue;
+                }
                 bufs.discard(path);
             }
         }

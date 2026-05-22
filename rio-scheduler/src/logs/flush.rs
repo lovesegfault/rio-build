@@ -61,13 +61,16 @@
 //!
 //! The flusher NEVER blocks the actor. It's mpsc-fed (`try_send`, bounded
 //! channel); if the channel is full, the actor's completion flush is
-//! dropped. A final flush deferred because the already-finalized guard could
-//! not read `drv_logs` lands in the same shape. The buffer stays in
-//! `LogBuffers.buffers` (sealed) and the next
+//! dropped: the buffer stays in `LogBuffers.buffers` (sealed) and the next
 //! periodic tick still snapshots it — so the content survives at the
-//! `.partial` key with an `is_complete=false` PG row. `CleanupTerminalBuild`
-//! (after `TERMINAL_CLEANUP_DELAY`, ~60s) reaps the DAG node and
-//! discards the buffer (`LogBuffers::discard`), bounding the leak.
+//! `.partial` key with an `is_complete=false` PG row — and
+//! `CleanupTerminalBuild` (after `TERMINAL_CLEANUP_DELAY`, ~60s) reaps the
+//! DAG node and discards the buffer (`LogBuffers::discard`), bounding the
+//! leak. A final flush deferred because the already-finalized guard could
+//! not read `drv_logs` is handled differently: the request is retained by
+//! the flusher and retried on the periodic tick (and once at shutdown)
+//! while the sealed entry stays in memory; terminal cleanup leaves such
+//! entries to the retry (`obs.log.deferred-final-retry`).
 //!
 //! Compression is CPU-bound; runs in `spawn_blocking` so it doesn't hog a
 //! tokio worker thread during the typical 10-100ms compression of a few-MB log.
@@ -105,6 +108,14 @@ const LOG_GC_INTERVAL: Duration = Duration::from_secs(3600);
 /// row produces 2 keys — `.log.zst` + `.partial.log.zst` — so a batch
 /// of 1000 rows splits into 2 `DeleteObjects` calls).
 const LOG_GC_BATCH: i64 = 1000;
+
+/// How many deferred final flushes (finalize guard could not read `drv_logs`)
+/// the flusher retains for retry. Each retained request pins its sealed ring
+/// entry in memory until PG answers (≤ RING_BYTE_CAP each), so the cap bounds
+/// added memory during a long PG outage; deferrals beyond it fall back to the
+/// pre-retry behavior (consumed; terminal cleanup discards the buffer ~60s
+/// after build terminal).
+const DEFERRED_FINALS_MAX: usize = 64;
 
 /// Request to flush one derivation's logs. Sent by the actor from
 /// `terminal_log_epilogue` (see its doc for the caller list — success,
@@ -232,7 +243,9 @@ pub struct LogFlusher {
     /// wipes actor state on lease *acquisition* and explicitly classes
     /// `log_buffers` as retained) and still carries the same `exec_id`
     /// the request pinned, so the guard passes and the request is
-    /// processed — correctly, for the reason above.
+    /// processed — correctly, for the reason above. Deferred-final
+    /// retries ([`Self::retry_deferred`]) ride the same exemption: every
+    /// retained request was enqueued while this replica held the lease.
     is_leader: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -318,15 +331,35 @@ impl LogFlusher {
             // guarantees the tick fires within O(1) iterations once
             // ready; the worst case is one redundant periodic PUT just
             // before a final, which is harmless.
+            // Deferred final flushes retained for retry (finalize guard could
+            // not read drv_logs). Bounded by DEFERRED_FINALS_MAX; retried on
+            // each periodic tick and once at shutdown.
+            let mut deferred: Vec<FlushRequest> = Vec::new();
             loop {
                 tokio::select! {
                     maybe = flush_rx.recv() => {
                         match maybe {
-                            Some(req) => self.flush_final(req).await,
+                            Some(req) => {
+                                if let Some(d) = self.flush_final(req).await {
+                                    self.retain_deferred(&mut deferred, d);
+                                }
+                            }
                             None => {
-                                // Actor died. No more completions coming. One
-                                // last periodic sweep to save whatever's in
-                                // the buffers, then exit.
+                                // Actor died. One last retry of any deferred
+                                // finals (PG may have recovered since the last
+                                // tick), then the existing leader-gated sweep.
+                                self.retry_deferred(&mut deferred).await;
+                                if !deferred.is_empty() {
+                                    warn!(
+                                        pending = deferred.len(),
+                                        "exiting with deferred final flushes still \
+                                         unresolved; their buffered content is lost \
+                                         with process memory"
+                                    );
+                                }
+                                // No more completions coming. One last periodic
+                                // sweep to save whatever's in the buffers, then
+                                // exit.
                                 //
                                 // Leader-gated for the same reason as the
                                 // periodic-tick arm below: an ex-leader's
@@ -355,6 +388,12 @@ impl LogFlusher {
                     }
 
                     _ = tick.tick() => {
+                        // Deferred-final retries are NOT leader-gated (the
+                        // completion arm isn't either, and these are the same
+                        // requests one PG error later); the snapshot sweep
+                        // below keeps its gate.
+                        // r[impl obs.log.deferred-final-retry]
+                        self.retry_deferred(&mut deferred).await;
                         // Leader-gated. A standby's `LogBuffers` is
                         // structurally empty (no worker streams connect to it),
                         // but an ex-leader after a lease flap retains its
@@ -401,8 +440,16 @@ impl LogFlusher {
     /// Consults the execution's stored `drv_logs` row FIRST: an execution
     /// another leader already finalized is refused (residue reaped if still
     /// stamped with it, nothing uploaded), and a row that cannot be read
-    /// defers the flush entirely (fail closed — see the guard below).
-    async fn flush_final(&self, req: FlushRequest) {
+    /// defers the flush entirely (fail closed — the request is retained for
+    /// retry; see the `Err` arm below and [`Self::retry_deferred`]).
+    ///
+    /// Returns `Some(req)` when the final was deferred because the finalize
+    /// guard could not read `drv_logs` and the request should be retried
+    /// while the (non-empty) sealed entry is still held — the spawn loop
+    /// retains it and re-runs it on the periodic tick. `None` in every other
+    /// case (uploaded, refused, stale, no-op, or deferred with nothing left
+    /// to retry).
+    async fn flush_final(&self, req: FlushRequest) -> Option<FlushRequest> {
         // r[impl obs.log.finalize-immutable]
         // Refuse to re-finalize an execution another leader already
         // finalized — consulted FIRST, before the prefix reconcile, the
@@ -467,40 +514,75 @@ impl LogFlusher {
                         );
                     }
                 }
-                return;
+                return None;
             }
             Ok(_) => {}
             Err(e) => {
-                // Fail closed (`obs.log.finalize-immutable`): without the
-                // row we cannot tell "first finalization" from "another
-                // leader already finalized this exec", and proceeding is a
-                // destructive PUT at the finalized key. Defer instead: the
-                // request is consumed, but the entry is left undrained and
-                // sealed, so the periodic snapshotter keeps the lines
-                // durable at the `.partial` key (re-running its own row
-                // lookup every tick) and `CleanupTerminalBuild` reaps the
-                // entry at build cleanup (~60s after build terminal). The
-                // row — if any — stays `is_complete=false`, surfaced by the
-                // incomplete indicator (`obs.log.incomplete-surfaced`);
-                // `status`/`finished_at` may never be stamped for this
-                // execution, and a PG outage that outlasts both the
-                // periodic snapshotter and build cleanup loses the
-                // un-snapshotted tail (the old fall-through kept those
-                // bytes only as a blind PUT that may have just replaced a
-                // finalized log). That bounded loss is preferred over
-                // letting a transient PG blip on this one SELECT destroy
-                // an interim leader's finalized log in exactly the
-                // scenario this guard exists for.
-                warn!(
+                // Fail closed (`obs.log.finalize-immutable`): without the row we
+                // cannot tell "first finalization" from "another leader already
+                // finalized this exec", and proceeding is a destructive PUT at
+                // the finalized key. Defer instead — but do not abandon the
+                // request: the periodic snapshotter cannot PUT an entry whose
+                // stored-coverage reconcile needs this same row (it skips the
+                // tick), and on a deposed leader it does not run at all, so
+                // "leave it to the snapshotter" is not a durability story.
+                // r[impl obs.log.deferred-final-retry]
+                metrics::counter!("rio_scheduler_log_flush_finalize_deferred_total").increment(1);
+
+                // A zero-line entry (failover restamp whose worker never
+                // re-streamed) has nothing any retry could upload; left in
+                // place it shadows the ex-leader's stored `.partial` in
+                // GetDerivationLogs (empty is_complete=false chunks). Reap it
+                // now — exec-guarded so a re-dispatched execution's fresh
+                // empty entry is never touched. Mirrors the epilogue's
+                // enqueue-failure reap; the prior `.partial` row keeps
+                // status NULL until the TTL sweep, same as that path.
+                if self
+                    .buffers
+                    .discard_if_empty_for_exec(&req.drv_path, req.exec_id)
+                {
+                    debug!(
+                        drv = %req.drv_path,
+                        exec_id = %req.exec_id,
+                        error = %e,
+                        "deferring final flush with an empty entry: reaped it so \
+                         reads fall through to the stored .partial; row left to \
+                         the TTL sweep"
+                    );
+                    return None;
+                }
+
+                // Non-empty entry still stamped with this execution: retain
+                // the request for retry. The entry is marked so terminal
+                // cleanup leaves it alone; the retried flush re-runs this
+                // guard once PG answers and then drains/uploads (or refuses,
+                // if an interim leader finalized it meanwhile).
+                if self
+                    .buffers
+                    .mark_finalize_deferred(&req.drv_path, req.exec_id)
+                {
+                    warn!(
+                        drv = %req.drv_path,
+                        exec_id = %req.exec_id,
+                        error = %e,
+                        "deferring final flush: could not consult drv_logs to \
+                         rule out an existing finalization; nothing uploaded, \
+                         buffer retained and the request will be retried on the \
+                         next flusher tick"
+                    );
+                    return Some(req);
+                }
+
+                // No entry (or restamped to a newer execution): there is
+                // nothing a retry could ever drain — consume the request.
+                debug!(
                     drv = %req.drv_path,
                     exec_id = %req.exec_id,
                     error = %e,
-                    "deferring final flush: could not consult drv_logs to \
-                     rule out an existing finalization; nothing uploaded, \
-                     buffer left for the periodic snapshotter / terminal cleanup"
+                    "deferring final flush: drv_logs unreadable and no ring entry \
+                     remains for this execution; nothing to retain"
                 );
-                metrics::counter!("rio_scheduler_log_flush_finalize_deferred_total").increment(1);
-                return;
+                return None;
             }
         }
         // Stale-request guard, atomic with the drain. The flusher's mpsc
@@ -576,7 +658,7 @@ impl LogFlusher {
                 true,
             )
             .await;
-            return;
+            return None;
         }
 
         // `None` → the entry is gone, was never stamped, or is stamped
@@ -623,6 +705,65 @@ impl LogFlusher {
                     requested_exec = %req.exec_id,
                     "no buffer to flush (silent build, dup request, or unstamped entry)"
                 );
+            }
+        }
+        None
+    }
+
+    /// Retain a deferred final for retry, bounded by [`DEFERRED_FINALS_MAX`]
+    /// and deduplicated by `exec_id` (a duplicate final for the same execution
+    /// resolves identically; keeping one is enough). On overflow the request
+    /// is dropped and the entry's deferred mark is cleared so terminal cleanup
+    /// goes back to bounding the buffer's lifetime exactly as before the
+    /// retry mechanism existed.
+    // r[impl obs.log.deferred-final-retry]
+    fn retain_deferred(&self, deferred: &mut Vec<FlushRequest>, req: FlushRequest) {
+        if deferred.iter().any(|d| d.exec_id == req.exec_id) {
+            return;
+        }
+        if deferred.len() >= DEFERRED_FINALS_MAX {
+            self.buffers
+                .clear_finalize_deferred(&req.drv_path, req.exec_id);
+            warn!(
+                drv = %req.drv_path,
+                exec_id = %req.exec_id,
+                retained = deferred.len(),
+                "deferred-final retry queue full; falling back to terminal-cleanup \
+                 bounding for this execution's buffer"
+            );
+            return;
+        }
+        deferred.push(req);
+    }
+
+    /// Re-run retained deferred finals. Requests that resolve (uploaded,
+    /// refused, stale, entry gone) are dropped; the pass STOPS at the first
+    /// request that defers again — every retained request goes through the
+    /// same PG pool, so further attempts in the same pass would repeat the
+    /// failure and serially burn the acquire timeout each (with 64 retained
+    /// requests that would stall the select loop for minutes and back up
+    /// flush_rx). The un-attempted remainder stays at the front of the queue
+    /// for the next pass; the re-deferred request goes to the back, so a
+    /// request-specific persistent error (e.g. a row that fails to decode)
+    /// cannot head-of-line-block the rest forever. Runs on the periodic tick
+    /// and on shutdown, NOT gated on leadership: like the completion arm
+    /// itself, every retained request was enqueued by the actor while it
+    /// held the lease (see the `is_leader` field doc).
+    // r[impl obs.log.deferred-final-retry]
+    async fn retry_deferred(&self, deferred: &mut Vec<FlushRequest>) {
+        if deferred.is_empty() {
+            return;
+        }
+        debug!(pending = deferred.len(), "retrying deferred final flushes");
+        let mut pending = std::mem::take(deferred).into_iter();
+        while let Some(req) = pending.next() {
+            if let Some(again) = self.flush_final(req).await {
+                // PG still failing for this pass: keep the rest for the next
+                // one (front), rotate the failing request to the back. Same
+                // elements as were taken — cannot exceed the cap.
+                deferred.extend(pending);
+                deferred.push(again);
+                return;
             }
         }
     }
@@ -2861,7 +3002,9 @@ mod tests {
     /// flush (nothing drained, nothing uploaded) instead of falling through
     /// to a destructive PUT over another leader's finalized blob — the
     /// A→B→A flap shape with one extra ingredient (PG turbulence at
-    /// cancel-sweep time).
+    /// cancel-sweep time). The deferred request is also retained for retry
+    /// (`obs.log.deferred-final-retry`); this test exercises only the single
+    /// failed attempt.
     /// r[verify obs.log.finalize-immutable]
     #[tokio::test]
     async fn flush_final_guard_lookup_error_defers_and_preserves_finalized_blob()
@@ -2955,11 +3098,14 @@ mod tests {
         Ok(())
     }
 
-    /// Common-case cost of failing closed: a final deferred because the
-    /// guard's lookup failed must not lose the log — once PG recovers the
-    /// periodic snapshotter (which does not filter sealed entries) lands
-    /// the full content at the `.partial` key with an `is_complete=false`
-    /// row.
+    /// A deferred final's entry stays snapshot-able by the periodic flusher:
+    /// once PG recovers, the periodic sweep (which does not filter sealed
+    /// entries) lands the full content at the `.partial` key with an
+    /// `is_complete=false` row. Since r14 this is the *secondary* backstop —
+    /// the primary recovery is the flusher's own retry of the retained
+    /// request (`deferred_final_is_retried_and_uploads_after_pg_recovers`);
+    /// what this test pins is that the deferral leaves the entry in a shape
+    /// the periodic path can still serve.
     /// r[verify obs.log.finalize-immutable]
     #[tokio::test]
     async fn flush_final_guard_lookup_error_no_row_defers_to_periodic() -> anyhow::Result<()> {
@@ -3040,6 +3186,340 @@ mod tests {
         assert!(
             row.1.is_none(),
             "status never stamped for the deferred final"
+        );
+        Ok(())
+    }
+
+    /// The deferral is retained and retried, not abandoned: a final deferred
+    /// because the guard's lookup failed is handed back to the loop, and the
+    /// retried request — once PG answers — drains and finalizes exactly as a
+    /// first-attempt final would (scenario 1 of r14 merged_bug_003: a fast
+    /// build whose first-ever flush met a transient PG blip must not lose its
+    /// whole log to the ~60s terminal-cleanup discard while S3 is healthy).
+    /// r[verify obs.log.deferred-final-retry]
+    #[tokio::test]
+    async fn deferred_final_is_retried_and_uploads_after_pg_recovers() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r14m3a-fast-build.drv";
+
+        // Fast build: lines arrive, the epilogue seals, the FlushRequest
+        // follows. No drv_logs row exists yet (first-ever flush).
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"l0", b"l1"]);
+        buffers.seal(drv_path);
+
+        // PG is down at final-flush time.
+        let bad_pool = db.reopen().await;
+        bad_pool.close().await;
+        let flusher_bad = LogFlusher::new(
+            s3.clone(),
+            "test-bucket".into(),
+            bad_pool,
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        let deferred = flusher_bad
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id,
+                status: Some("succeeded".into()),
+            })
+            .await;
+
+        // Deferred AND handed back for retry.
+        let retained = deferred.expect("deferral must hand the request back for retry");
+        assert_eq!(retained.exec_id, exec_id, "retained request pins the exec");
+        assert_eq!(retained.drv_path, drv_path);
+        assert!(puts.lock().unwrap().is_empty(), "deferral uploads nothing");
+        assert!(
+            deletes.lock().unwrap().is_empty(),
+            "deferral makes no S3 calls"
+        );
+        assert_eq!(
+            buffers.exec_id(drv_path),
+            Some(exec_id),
+            "entry left undrained for the retry"
+        );
+        assert!(buffers.is_sealed(drv_path), "seal left in place");
+        assert!(
+            buffers.finalize_deferred(drv_path),
+            "entry marked so terminal cleanup leaves it to the retry"
+        );
+
+        // PG recovers; the retried request finalizes like a first attempt.
+        let flusher_ok = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        let again = flusher_ok.flush_final(retained).await;
+        assert!(again.is_none(), "retry resolves; nothing left to retain");
+
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1, "exactly the final PUT");
+        let (key, body) = &captured[0];
+        assert!(
+            key.ends_with(".log.zst") && !key.contains(".partial"),
+            "retried final lands at the final key: {key}"
+        );
+        assert_eq!(
+            String::from_utf8(zstd::decode_all(&body[..])?)?,
+            "l0\nl1\n",
+            "no content lost across the deferral"
+        );
+        let row: (bool, Option<String>, i64) = sqlx::query_as(
+            "SELECT is_complete, status, line_count FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert!(row.0, "row finalized by the retry");
+        assert_eq!(row.1.as_deref(), Some("succeeded"));
+        assert_eq!(row.2, 2);
+        assert_eq!(
+            buffers.exec_id(drv_path),
+            None,
+            "retry drained the entry (its reaper)"
+        );
+        assert!(!buffers.is_sealed(drv_path), "retry unsealed");
+        Ok(())
+    }
+
+    /// Scenario 2 of r14 merged_bug_003: on a deposed leader the periodic
+    /// snapshot sweep is leader-gated, so the deferred-final retry must run
+    /// OUTSIDE that gate (like the completion arm itself — every retained
+    /// request was enqueued while this replica held the lease). The spawn
+    /// loop's tick arm retries deferred finals even when `is_leader` is
+    /// false.
+    ///
+    /// Load-bearing assumption: a closed sqlx pool fails `acquire()`
+    /// immediately without arming a tokio timer, which is what keeps this
+    /// select loop from wedging under `tokio::time::pause()` (same
+    /// assumption as the existing closed-pool deferral tests). If a future
+    /// sqlx bump changes that, this test will hang/time out rather than
+    /// pass vacuously.
+    /// r[verify obs.log.deferred-final-retry]
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn deferred_final_retry_loop_runs_when_not_leader() -> anyhow::Result<()> {
+        // TestDb before pause(): sqlx pool acquire uses tokio::time for its
+        // timeout, which PoolTimedOuts under paused time.
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        // Take PG down for the whole test: every clone of db.pool is closed.
+        db.pool.close().await;
+        tokio::time::pause();
+
+        let (s3, puts, _deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r14m3b-deposed-retry.drv";
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"pre-flap line"]);
+        buffers.seal(drv_path);
+
+        let (tx, rx) = mpsc::channel::<FlushRequest>(8);
+        LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            // Deposed leader: on_lose() flipped the gate, but the request
+            // below was enqueued while it held the lease.
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .spawn(rx);
+
+        tx.send(FlushRequest {
+            drv_path: drv_path.into(),
+            exec_id,
+            status: Some("succeeded".into()),
+        })
+        .await?;
+
+        // Auto-advance drives the interval: ticks at T=30/60/90 each retry
+        // the retained deferral (and skip the leader-gated snapshot sweep).
+        tokio::time::sleep(Duration::from_secs(95)).await;
+
+        logs_assert(|lines: &[&str]| {
+            let n = lines
+                .iter()
+                .filter(|l| l.contains("deferring final flush"))
+                .count();
+            if n >= 2 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "first attempt + ≥1 not-leader tick retry → ≥2 deferral \
+                     warns, got {n}"
+                ))
+            }
+        });
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "PG never recovered → nothing uploaded"
+        );
+        assert_eq!(
+            buffers.exec_id(drv_path),
+            Some(exec_id),
+            "entry retained across retries"
+        );
+        drop(tx);
+        Ok(())
+    }
+
+    /// Scenario 3 of r14 merged_bug_003: a deferral that finds only an empty
+    /// (failover-restamped, never-streamed) entry reaps it — exec-guarded —
+    /// so `GetDerivationLogs` falls through to the ex-leader's stored
+    /// `.partial` instead of serving empty still-active chunks until build
+    /// cleanup. A re-dispatched execution's fresh empty entry is never
+    /// touched by a stale deferred request.
+    /// r[verify obs.log.deferred-final-retry]
+    #[tokio::test]
+    async fn deferred_final_with_empty_entry_reaps_it_for_this_exec_only() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, _deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+
+        let bad_pool = db.reopen().await;
+        bad_pool.close().await;
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            bad_pool,
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+
+        // (1) The scenario-3 shape: recovery restamped the exec onto a fresh
+        // standby's empty entry, the worker never re-streamed, the drv
+        // reached terminal (sealed), and the guard SELECT then failed.
+        let drv_a = "/nix/store/r14m3c-empty-restamp.drv";
+        let exec_a = Uuid::now_v7();
+        buffers.set_exec(drv_a, exec_a, "w");
+        buffers.seal(drv_a);
+        let ret = flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_a.into(),
+                exec_id: exec_a,
+                status: Some("succeeded".into()),
+            })
+            .await;
+        assert!(ret.is_none(), "nothing to retry for an empty entry");
+        assert!(puts.lock().unwrap().is_empty(), "no S3 calls");
+        assert_eq!(
+            buffers.exec_id(drv_a),
+            None,
+            "empty entry reaped so reads fall through to the stored .partial"
+        );
+        assert!(
+            !buffers.is_sealed(drv_a),
+            "seal tombstone cleared with the reaped entry"
+        );
+        assert!(
+            buffers.read_since(drv_a, 0).is_none(),
+            "ring no longer shadows S3"
+        );
+
+        // (2) Exec guard: a stale deferred request must not reap the NEW
+        // execution's freshly-stamped (still empty) entry.
+        let drv_b = "/nix/store/r14m3d-redispatch-guard.drv";
+        let exec_old = Uuid::now_v7();
+        buffers.set_exec(drv_b, exec_old, "w");
+        // Re-dispatch: discard + fresh stamp, worker hasn't streamed yet.
+        buffers.discard(drv_b);
+        let exec_new = Uuid::now_v7();
+        buffers.set_exec(drv_b, exec_new, "w");
+        let ret = flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_b.into(),
+                exec_id: exec_old,
+                status: Some("cancelled".into()),
+            })
+            .await;
+        assert!(
+            ret.is_none(),
+            "stale request resolves with nothing to retry"
+        );
+        assert_eq!(
+            buffers.exec_id(drv_b),
+            Some(exec_new),
+            "the new execution's empty entry was NOT reaped by the stale request"
+        );
+        Ok(())
+    }
+
+    /// Retention-cap behavior of the loop-side helpers: the cap bounds the
+    /// retry queue, an overflow clears the entry's deferred mark (so terminal
+    /// cleanup goes back to owning its discard), and duplicate exec_ids do
+    /// not consume cap slots.
+    #[tokio::test]
+    async fn deferred_final_retention_cap_clears_mark_on_overflow() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, _puts, _deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+
+        // The overflow drv has a real, marked entry — the precondition that
+        // makes the "mark cleared on overflow" assertion non-vacuous.
+        let drv_o = "/nix/store/r14m3e-overflow.drv";
+        let exec_o = stamp_and_push(&buffers, drv_o, &[b"line"]);
+        buffers.seal(drv_o);
+        assert!(buffers.mark_finalize_deferred(drv_o, exec_o));
+        assert!(buffers.finalize_deferred(drv_o), "precondition: marked");
+
+        // Fill the queue to the cap with distinct exec_ids (no ring entries
+        // needed — retain_deferred only inspects the Vec and the mark).
+        let mut deferred: Vec<FlushRequest> = Vec::new();
+        for i in 0..DEFERRED_FINALS_MAX {
+            flusher.retain_deferred(
+                &mut deferred,
+                FlushRequest {
+                    drv_path: format!("/nix/store/r14fill{i}-x.drv"),
+                    exec_id: Uuid::now_v7(),
+                    status: None,
+                },
+            );
+        }
+        assert_eq!(deferred.len(), DEFERRED_FINALS_MAX);
+
+        // Dedup: an already-retained exec_id does not grow the queue.
+        let dup_exec = deferred[0].exec_id;
+        flusher.retain_deferred(
+            &mut deferred,
+            FlushRequest {
+                drv_path: "/nix/store/r14dup-x.drv".into(),
+                exec_id: dup_exec,
+                status: None,
+            },
+        );
+        assert_eq!(deferred.len(), DEFERRED_FINALS_MAX, "dedup by exec_id");
+
+        // Overflow: the request is dropped and the mark is cleared so
+        // cleanup discards the buffer exactly as before the retry existed.
+        flusher.retain_deferred(
+            &mut deferred,
+            FlushRequest {
+                drv_path: drv_o.into(),
+                exec_id: exec_o,
+                status: Some("succeeded".into()),
+            },
+        );
+        assert_eq!(deferred.len(), DEFERRED_FINALS_MAX, "cap holds");
+        assert!(
+            !buffers.finalize_deferred(drv_o),
+            "overflow cleared the mark so terminal cleanup owns the discard again"
         );
         Ok(())
     }

@@ -406,6 +406,96 @@ async fn test_cleanup_terminal_build_gc_deletes_event_log() -> TestResult {
     Ok(())
 }
 
+/// Terminal-build cleanup must not destroy a log buffer whose final flush
+/// was deferred by the flusher (finalize guard could not read drv_logs — PG
+/// outage at final-flush time): the retried flush's drain is that entry's
+/// reaper, and discarding it here would lose the only copy of the log while
+/// S3 is healthy. Unmarked buffers keep today's behavior (the discard bounds
+/// a dropped-FlushRequest leak to ~60s).
+///
+/// Fixture note: the two drv_paths carry DISTINCT (valid, 32-char) store
+/// hashes because `drv_log_hash` keys the buffers on the path's hash part —
+/// the default `test_drv_path` fixture uses one shared `TEST_HASH` for every
+/// name, which would silently collapse both buffers into one entry and make
+/// the assertions vacuous (the fixture-collision trap).
+/// r[verify obs.log.deferred-final-retry]
+#[tokio::test]
+async fn cleanup_skips_log_buffer_with_deferred_final_pending() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let bufs = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let mut actor = DagActor::new(
+        SchedulerDb::new(db.pool.clone()),
+        DagActorConfig::default(),
+        DagActorPlumbing {
+            log_buffers: Some(bufs.clone()),
+            ..Default::default()
+        },
+    );
+
+    let build_id = Uuid::new_v4();
+    let path_a = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-r14clna-cleanup-deferred.drv";
+    let path_b = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-r14clnb-cleanup-plain.drv";
+
+    // Two sole-interest terminal drvs — both get reaped from the DAG by
+    // handle_cleanup_terminal_build.
+    for (hash, path) in [("r14clna", path_a), ("r14clnb", path_b)] {
+        actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+            drv_path: path.to_string(),
+            ..crate::db::RecoveryDerivationRow::test_default(hash, "x86_64-linux")
+        });
+        let s = actor.dag.node_mut(hash).expect("just injected");
+        s.set_status_for_test(DerivationStatus::Completed);
+        s.interested_builds.insert(build_id);
+    }
+
+    // Both buffers stamped, populated, and sealed (the shape a terminal drv
+    // leaves behind when its FlushRequest hasn't drained yet).
+    let exec_a = Uuid::now_v7();
+    let exec_b = Uuid::now_v7();
+    for (path, exec) in [(path_a, exec_a), (path_b, exec_b)] {
+        bufs.set_exec(path, exec, "worker-1");
+        assert!(bufs.push_for(
+            path,
+            &rio_proto::types::BuildLogBatch {
+                derivation_path: path.to_string(),
+                lines: vec![b"buffered line".to_vec()],
+                first_line_number: 0,
+                executor_id: "worker-1".into(),
+            },
+            "worker-1",
+        ));
+        bufs.seal(path);
+    }
+    // Only A's final flush was deferred (the flusher marked it).
+    assert!(bufs.mark_finalize_deferred(path_a, exec_a));
+
+    actor.handle_cleanup_terminal_build(build_id);
+
+    // Both DAG nodes reaped regardless.
+    assert!(actor.dag.node("r14clna").is_none(), "A's node reaped");
+    assert!(actor.dag.node("r14clnb").is_none(), "B's node reaped");
+
+    // A's buffer survives for the flusher's retry…
+    assert_eq!(
+        bufs.exec_id(path_a),
+        Some(exec_a),
+        "deferred-final buffer must be left for the retried flush to drain"
+    );
+    assert!(
+        bufs.read_since(path_a, 0).is_some_and(|l| l.len() == 1),
+        "deferred-final buffer still holds its lines"
+    );
+    // …while B's is discarded exactly as before (bounds the
+    // dropped-FlushRequest leak).
+    assert_eq!(
+        bufs.exec_id(path_b),
+        None,
+        "unmarked buffer is discarded at cleanup as before"
+    );
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Build not-found paths
 // ---------------------------------------------------------------------------

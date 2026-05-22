@@ -342,12 +342,14 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_log_flush_finalize_deferred_total",
-        "Final flushes deferred because the already-finalized guard could not read the \
-         execution's drv_logs row (transient PG error): nothing is uploaded, the buffer is \
-         left undrained for the periodic snapshotter and terminal cleanup, and the row may \
-         stay is_complete=false. Counted per deferred FlushRequest, including requests that \
-         would have turned out stale or no-op. Sustained rate indicates PG trouble on the \
-         flush path, not data loss by itself."
+        "Final-flush attempts deferred because the finalize guard could not read the \
+         execution's drv_logs row (transient PG error): nothing is uploaded on that attempt. \
+         A deferral with a non-empty buffer is retained by the flusher and retried each \
+         periodic tick until PG answers (terminal cleanup leaves the buffer to the retry); \
+         an empty buffer is reaped so reads fall through to the stored .partial. Counted per \
+         attempt, so retries during one outage keep incrementing it. Sustained rate indicates \
+         PG trouble on the flush path; loss requires the retry retention cap to overflow or \
+         the process to exit before PG recovers."
     );
     describe_counter!(
         "rio_scheduler_log_forward_dropped_total",

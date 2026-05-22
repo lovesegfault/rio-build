@@ -107,10 +107,27 @@ re-finalization alike), but the S3 PUT precedes the row write entirely, so a
 stale re-finalization would still overwrite the final blob in place while the
 frozen row keeps pointing at it.
 When the row cannot be consulted at all (the lookup itself fails), the flusher
-fails closed: the final flush is deferred --- the buffer is left to the periodic
-snapshotter and the terminal-cleanup reaper rather than uploaded blind ---
-accepting that the execution's row may remain `is_complete = false` (surfaced
-per `obs.log.incomplete-surfaced`) over risking an overwrite of a finalized log.
+fails closed: nothing is uploaded on that attempt. A deferral with a non-empty
+buffer is retained and retried (below); a deferral that finds only an empty
+restamped entry reaps it so the read path falls through to the stored
+`.partial` instead of serving empty still-active chunks. Either way the
+execution's row may remain `is_complete = false` (surfaced per
+`obs.log.incomplete-surfaced`) until a retry lands.
+
+#r("obs.log.deferred-final-retry")[
+  A final flush deferred because the finalize guard could not consult
+  `drv_logs` MUST be retained by the flusher --- up to a bounded retention
+  cap --- and retried while the execution's sealed ring-buffer entry remains
+  in memory, and terminal cleanup MUST NOT discard an entry whose deferred
+  final flush is still retained; deferrals beyond the cap fall back to the
+  terminal-cleanup bound.
+]
+
+This is what keeps a transient PG failure at final-flush time from losing
+buffered log content while S3 stays healthy. The retention is a fixed cap of
+in-flight deferrals and does not survive process exit; the retry runs
+regardless of leadership, like the completion flush itself, because every
+retained request was enqueued while this replica held the lease.
 
 #r("obs.log.incomplete-surfaced")[
   A `GetDerivationLogs` response whose final chunk carries
