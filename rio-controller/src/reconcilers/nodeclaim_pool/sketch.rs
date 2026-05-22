@@ -316,8 +316,7 @@ impl Sketch {
     }
 }
 
-/// `s.quantile(q)`. `None` ⇔ empty sketch (or `q∉[0,1]`, which callers
-/// don't emit).
+/// `s.quantile(q)`. `None` ⇔ empty sketch.
 fn quantile_or(s: &Sketch, q: f64) -> Option<f64> {
     s.quantile(q)
 }
@@ -327,9 +326,10 @@ fn quantile_or(s: &Sketch, q: f64) -> Option<f64> {
 /// count gate a post-rotation `active.count()=1..min_n` wins with
 /// noise instead of `shadow`'s learned distribution. `min_n` is
 /// derived from `q` as `⌈1/(1−q)⌉` (≥2): a `q`-quantile needs roughly
-/// that many samples before the tail estimate is meaningful — 2 at
-/// q=0.5, 10 at q=0.9, 100 at q=0.99 (matching `N_SEED` /
-/// `ICE_REAL_THRESHOLD`). Final `.or_else(active)` so a
+/// that many samples before the tail estimate is meaningful — ≈2 at
+/// q=0.5, ≈11 at q=0.9, ≈100 at q=0.99 (the same order as `N_SEED` /
+/// `ICE_REAL_THRESHOLD`; a freshly seeded cell still returns the seed
+/// via the final `.or_else(active)` arm). Final `.or_else(active)` so a
 /// sparse-active-only cell (shadow empty too) still returns its own
 /// estimate rather than `None`.
 fn quantile_with_shadow(active: &Sketch, shadow: &Sketch, q: f64) -> Option<f64> {

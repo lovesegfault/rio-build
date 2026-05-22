@@ -819,10 +819,12 @@ from helm's apply manager).
 
 #r("ctrl.nodeclaim.lead-time-ddsketch")[
   `lead_time[h,cap] = q_0.9(boot − eta_error)` is read from a sliding
-  active/shadow DDSketch pair per cell, persisted to PG as `u32`-version-tagged
-  BYTEA. Sketches are seeded from `sla.leadTimeSeed[h,cap]` at synthetic count
-  `n_seed = 1/(1-q) = 10`; the closed-loop `forecast_warm_hit_ratio` Schmitt
-  widens/narrows the quantile by `Δq=0.02` per firing, capped at `q ≤ 0.99` and
+  active/shadow quantile-sketch pair (HdrHistogram, 1 ms–24 h at 2
+  significant figures) per cell, persisted to PG as `u32`-version-tagged
+  BYTEA in the HdrHistogram V2 format. Sketches are seeded from
+  `sla.leadTimeSeed[h,cap]` at synthetic count `n_seed = 1/(1-q) = 10`; the
+  closed-loop `forecast_warm_hit_ratio` Schmitt widens/narrows the quantile
+  by `Δq=0.02` per firing, capped at `q ≤ 0.99` and
   `lead_time ≤ sla.maxLeadTime`.
 ]
 

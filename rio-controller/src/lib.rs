@@ -256,7 +256,7 @@ pub fn describe_metrics() {
     describe_gauge!(
         "rio_controller_nodeclaim_lead_time_seconds",
         "Per-`cell` provisioning lead-time: lead_time_q-quantile of the z=boot−eta_error \
-         DDSketch. What cover_deficit provisions ahead by. Stuck at the seed value = \
+         lead-time sketch. What cover_deficit provisions ahead by. Stuck at the seed value = \
          no Registered=True transitions recorded yet (check seed_fallback_total)."
     );
     describe_gauge!(

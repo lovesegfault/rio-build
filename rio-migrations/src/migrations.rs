@@ -932,16 +932,17 @@ pub const M_058: () = ();
 
 /// `migrations/059_nodeclaim_cell_state.sql`
 ///
-/// ADR-023 §13b @alg-pool: per-`(hw_class, capacity_type)` DDSketch
+/// ADR-023 §13b @alg-pool: per-`(hw_class, capacity_type)` quantile-sketch
 /// state for the `nodeclaim_pool` reconciler's lead-time forecast.
 /// `z_sketch_*` is the demand-to-Registered lead time; `boot_sketch_*`
 /// is Launch→Registered alone (the Karpenter+kubelet overhead the
 /// reconciler can't compress). Active/shadow pairs let the reconciler
 /// rotate at `sketch_epoch` without losing the warm quantile during
-/// the cold-start window. Sketches are `sketches-ddsketch` serialized
-/// via bincode v2 — `bytea` not `jsonb` because DDSketch's bucket
-/// array is dense-packed integers (~1KiB binary vs ~8KiB JSON at the
-/// 2048-bucket config).
+/// the cold-start window. Sketches are persisted as version-tagged
+/// HdrHistogram V2 `bytea` (originally postcard-encoded
+/// sketches-ddsketch; the version tag is what made that swap a
+/// re-learn instead of a migration) — `bytea` not `jsonb` because the
+/// payload is a packed counts array, not a JSON-friendly shape.
 ///
 /// `idle_gap_events` (jsonb) is the consolidator's recent reap log —
 /// small (capped ring), read-rarely, schema-evolving; jsonb avoids a

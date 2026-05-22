@@ -18,7 +18,7 @@
 //! 4. Reap idle Registered claims via windowed-rate break-even.
 //! 5. Reap unhealthy (scheduler-reported `dead_nodes`) and ICE-stuck
 //!    claims.
-//! 6. Persist `CellSketches` (DDSketch lead-time + idle-gap log) to PG.
+//! 6. Persist `CellSketches` (lead-time quantile sketches + idle-gap log) to PG.
 //!
 //! Lease-gated: only the leader replica runs `reconcile_once`. The
 //! lease makes rolling-upgrade surge safe for THIS reconciler — the
@@ -302,7 +302,7 @@ pub struct NodeClaimPoolConfig {
     /// `karpenter.nodeclaimPool.minConsolidationTime`.
     pub min_consolidation_time: HashMap<String, f64>,
     /// `(hw_class:cap)` → seed lead-time seconds, written by
-    /// `xtask k8s probe-boot`. Seeds the DDSketch on cold start.
+    /// `xtask k8s probe-boot`. Seeds the lead-time sketch on cold start.
     /// Helm: `sla.leadTimeSeed`.
     pub lead_time_seed: HashMap<String, f64>,
     /// Seed lead-time (seconds) for cells absent from
@@ -311,7 +311,7 @@ pub struct NodeClaimPoolConfig {
     /// 0 would reap every NodeClaim before it can register (~18s
     /// real boot). Helm: `sla.defaultLeadTimeSeed`.
     pub default_lead_time_seed: f64,
-    /// DDSketch active→shadow rotation interval (seconds). After
+    /// Quantile-sketch active→shadow rotation interval (seconds). After
     /// `2×halflife` a sample has aged out entirely. Helm: not surfaced;
     /// 6h default per ADR §13b.
     pub sketch_halflife_secs: u64,
@@ -362,7 +362,7 @@ impl NodeClaimPoolConfig {
     /// `nix/tests/helm/18-metal-feature-routing.sh §5` already apply.
     /// Without this, an operator who writes `"metal-x86:on-demand": 600.0`
     /// (matching the Karpenter `capacityTypes` vocabulary two lines
-    /// away) passes helm-lint, seeds the DDSketch, and STILL falls to
+    /// away) passes helm-lint, seeds the sketch, and STILL falls to
     /// `default_lead_time_seed=30s` here — `health::classify` reaps
     /// every ~600s metal boot at the `2×30=60s` timeout, the exact
     /// `RioNodeclaimPoolBootTimeoutLoop` this seed exists to prevent.

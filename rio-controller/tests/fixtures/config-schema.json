@@ -188,7 +188,7 @@
             }
           },
           "lead_time_seed": {
-            "description": "`(hw_class:cap)` → seed lead-time seconds, written by\n`xtask k8s probe-boot`. Seeds the DDSketch on cold start.\nHelm: `sla.leadTimeSeed`.",
+            "description": "`(hw_class:cap)` → seed lead-time seconds, written by\n`xtask k8s probe-boot`. Seeds the lead-time sketch on cold start.\nHelm: `sla.leadTimeSeed`.",
             "type": "object",
             "additionalProperties": {
               "type": "number",
@@ -203,7 +203,7 @@
             "default": 30.0
           },
           "sketch_halflife_secs": {
-            "description": "DDSketch active→shadow rotation interval (seconds). After\n`2×halflife` a sample has aged out entirely. Helm: not surfaced;\n6h default per ADR §13b.",
+            "description": "Quantile-sketch active→shadow rotation interval (seconds). After\n`2×halflife` a sample has aged out entirely. Helm: not surfaced;\n6h default per ADR §13b.",
             "type": "integer",
             "format": "uint64",
             "minimum": 0,

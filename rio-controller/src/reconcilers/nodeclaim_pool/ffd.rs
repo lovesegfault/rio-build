@@ -174,7 +174,7 @@ impl LiveNode {
     /// `Registered.lastTransitionTime − creationTimestamp`: the
     /// Karpenter+kubelet boot overhead. `Some` only when
     /// `Registered=True`. The value B9's [`super::sketch::CellState::
-    /// record`] feeds into the `boot_active` DDSketch.
+    /// record`] feeds into the `boot_active` quantile sketch.
     pub fn boot_secs(&self) -> Option<f64> {
         let created = self.created_secs?;
         match self.cond("Registered")? {

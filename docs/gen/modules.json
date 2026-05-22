@@ -440,7 +440,7 @@
     },
     {
       "depth": 2,
-      "doc": "Per-cell DDSketch state + PG persist (migration 059",
+      "doc": "Per-cell quantile-sketch state + PG persist (migration 059",
       "path": "reconcilers/nodeclaim_pool/sketch.rs"
     },
     {

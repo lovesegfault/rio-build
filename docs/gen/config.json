@@ -299,7 +299,7 @@
       },
       {
         "default": "21600",
-        "description": "DDSketch active→shadow rotation interval (seconds).",
+        "description": "Quantile-sketch active→shadow rotation interval (seconds).",
         "key": "nodeclaim_pool.sketch_halflife_secs",
         "type": "uint64"
       },
