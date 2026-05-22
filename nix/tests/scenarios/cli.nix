@@ -21,8 +21,9 @@ let
   # G10 gated AdminService RPCs on x-rio-service-token. rio-cli mints
   # the token via ServiceTokenInterceptor when RIO_SERVICE_HMAC_KEY_PATH
   # is set. The key is fetched from the live rio-service-hmac Secret
-  # below (NOT fixture.hmacKeys: openssl-rand is non-deterministic and
-  # the cached hmacSecretsManifest may embed a different realization).
+  # below (NOT fixture.hmacKeys: the keys are deterministic now, but
+  # signing with the bytes the cluster actually mounted can never
+  # diverge from what the scheduler verifies).
   cliEnv = "RIO_SCHEDULER_ADDR=localhost:19001 " + "RIO_SERVICE_HMAC_KEY_PATH=/tmp/service-hmac.key ";
 in
 pkgs.testers.runNixOSTest {

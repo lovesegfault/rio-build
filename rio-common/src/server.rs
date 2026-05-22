@@ -157,8 +157,10 @@ pub struct Bootstrap<C> {
 /// wiring. Canonical order:
 ///
 /// 1. `rustls` crypto provider install (aws-lc-rs; must precede any TLS
-///    use by kube-rs/aws-sdk — dual ring+aws-lc-rs feature activation
-///    panics otherwise)
+///    use by kube-rs/aws-sdk — the workspace links a single aws-lc-rs
+///    provider, and the explicit install guards against a transitive
+///    dep re-enabling `ring` and re-creating the rustls 0.23
+///    dual-provider panic)
 /// 2. tracing init (returns OtelGuard, held by `Bootstrap`). Runs BEFORE
 ///    config load so config-load errors land in structured logs — tracing
 ///    reads only env vars (`RUST_LOG`, `RIO_LOG_FORMAT`,
@@ -185,11 +187,13 @@ where
     A: Serialize,
 {
     // rustls CryptoProvider MUST be installed before any TLS use.
-    // kube → hyper-rustls enables `ring`; rio-proto → aws-sdk enables
-    // `aws-lc-rs`. With BOTH active, rustls 0.23 can't auto-select and
-    // PANICS on first TLS handshake. Pin aws-lc-rs (rustls default,
-    // faster than ring). `let _`: Err if already installed — can't
-    // happen at top-of-main, discard.
+    // The workspace links a single provider (aws-lc-rs — kube is
+    // default-features=false + aws-lc-rs, matching aws-sdk and the
+    // rest of the TLS stack); the explicit install is a guard against
+    // a future transitive dep re-enabling `ring`, which would
+    // re-create the rustls 0.23 dual-provider can't-auto-select panic
+    // on first TLS handshake. `let _`: Err if already installed —
+    // can't happen at top-of-main, discard.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let otel_guard = crate::observability::init_tracing(component)?;

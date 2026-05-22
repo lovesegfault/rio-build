@@ -69,8 +69,9 @@ fn main() -> std::process::ExitCode {
     // SAFETY: single-threaded — tokio runtime hasn't started yet.
     unsafe { sh::init_env() };
 
-    // aws-sdk + kube both pull rustls with different crypto feature flags;
-    // install the provider early so the first TLS use doesn't panic.
+    // The workspace links a single rustls CryptoProvider (aws-lc-rs);
+    // installing it early guards against a transitive dep re-enabling
+    // `ring`, which would make the first TLS use panic.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let cli = Cli::parse();

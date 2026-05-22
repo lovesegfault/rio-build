@@ -131,10 +131,11 @@ let
   # AdminService grpcurl calls. G10 gated CreateTenant/TriggerGC/etc.
   # on ensure_service_caller(); the test acts as rio-cli would. The
   # key is read from the LIVE rio-service-hmac Secret (base64 on
-  # stdin) — NOT from fixture.hmacKeys: hmac-keys.nix is openssl-rand
-  # non-deterministic, and the cached hmacSecretsManifest may embed a
-  # different realization than the one currently in the store
-  # (ci-failure-patterns.md "IFD × non-determinism"). Format matches
+  # stdin) — NOT from fixture.hmacKeys: hmac-keys.nix is deterministic
+  # now, but signing with the bytes the cluster actually mounted can
+  # never diverge from what the scheduler verifies even if the fixture
+  # and the deployed Secret drift apart again (the failure class in
+  # ci-failure-patterns.md "IFD × non-determinism"). Format matches
   # HmacSigner::sign: base64url_nopad(json) "." base64url_nopad(tag).
   # The decoded key is byte-trimmed for trailing CRLF/LF — mirrors
   # rio_auth::hmac::load_key (the verifier's loader); hmac-keys.nix

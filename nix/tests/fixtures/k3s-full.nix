@@ -77,7 +77,8 @@ let
   # live in rio-system; store lives in rio-store. Both keys go to both
   # namespaces (scheduler signs assignment tokens, store verifies both;
   # gateway signs service tokens). runCommand keeps base64 at build
-  # time — no IFD on a non-deterministic openssl-rand output.
+  # time — eval-time readFile of a derivation output would be IFD,
+  # even now that hmac-keys.nix is deterministic.
   hmacSecretsManifest = pkgs.runCommand "rio-hmac-secrets.yaml" { } ''
     for ns in rio-system rio-store; do
       cat >> $out <<EOF

@@ -391,9 +391,9 @@ impl NodeClaimPoolConfig {
     /// r35 bug_050: `min_consolidation_time[cell]` — the operator floor
     /// for `consolidate::consolidate_after`. `None` when no entry
     /// matches `cell.0`. Lookup precedence: exact hw-class match wins,
-    /// then the longest matching `<prefix>*` glob. (HashMap iteration
-    /// order is unstable; the longest-prefix rule keeps overlapping
-    /// globs deterministic.)
+    /// then the longest matching `<prefix>*` glob. (The longest-prefix
+    /// rule keeps overlapping globs deterministic regardless of map
+    /// iteration order.)
     pub fn min_consolidation_time_for(&self, cell: &Cell) -> Option<f64> {
         if let Some(&v) = self.min_consolidation_time.get(&cell.0) {
             return Some(v);
@@ -2029,7 +2029,7 @@ mod tests {
 
     /// r35 bug_050: `min_consolidation_time_for` lookup precedence.
     /// Exact hw-class match wins over any glob; among globs, the
-    /// longest prefix wins (HashMap iteration order is unstable — a
+    /// longest prefix wins regardless of map iteration order (a
     /// shorter-glob-wins outcome would be a determinism bug). A key
     /// that does NOT end with `*` is an EXACT match only; an operator
     /// who writes `"fetcher": 600.0` expecting a glob gets a silent

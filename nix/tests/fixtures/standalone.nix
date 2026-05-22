@@ -88,8 +88,9 @@ let
   # MUST be present), and a far-future expiry. Signed with the SAME
   # hmac.key the scheduler loads so require_executor() verifies.
   # Written as a systemd EnvironmentFile (KEY=value) — NOT
-  # readFile-into-env, which would be IFD on the non-deterministic
-  # hmacKeys derivation. r[sec.executor.identity-token].
+  # readFile-into-env: eval-time readFile of a derivation output is
+  # an IFD anti-pattern even now that the hmacKeys derivation is
+  # deterministic. r[sec.executor.identity-token].
   executorTokenEnv =
     pkgs.runCommand "rio-executor-token-env"
       {

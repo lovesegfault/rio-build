@@ -387,14 +387,13 @@ in
   # the nix docs build. Drift means CI's docs build accepts a metric the
   # dev's local `typst compile` rejects, and nextest under-covers.
   #
-  # serde_json's `preserve_order` feature is workspace-unified
-  # differently between cargo (workspace-hack) and crate2nix
-  # (workspace-hack stubbed), so the local and nix-built xtask emit
-  # identical content with different object-key AND array-iteration
-  # orders (`walk_props` iterates a serde_json::Map). The committed
-  # copy is the local one; this check cares about content. `jq -S` +
-  # `walk(sort)` canonicalises both sides — same approach as
-  # tfvars-fresh, deepened for nested arrays.
+  # Both the local and nix-built xtask now build serde_json with the
+  # workspace-pinned `preserve_order` feature, so they emit identical
+  # object-key and array ordering. The committed copy is the local
+  # one; this check cares about content. `jq -S` + `walk(sort)`
+  # canonicalises both sides as insurance against any future ordering
+  # difference between the local and hermetic builds — same approach
+  # as tfvars-fresh, deepened for nested arrays.
   docs-data-fresh = mkDriftCheck {
     name = "docs-data-fresh";
     nativeBuildInputs = [ pkgs.jq ];

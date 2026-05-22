@@ -770,9 +770,11 @@ fn describe_type(schema: &serde_json::Value, ref_name: Option<&str>) -> String {
 /// (rendered as `(required)` or `(unset)` in typst per the prose).
 /// Object defaults are key-sorted via BTreeMap so the rendered string
 /// is deterministic regardless of serde_json's `preserve_order`
-/// feature (workspace-unified differently between cargo and crate2nix
-/// — the docs-data-fresh check would otherwise see drift on a
-/// HashMap-backed default like `{"fetcher-*":600,"*":60}`).
+/// feature or the source map's iteration order (the workspace now
+/// pins `preserve_order` on both the cargo and crate2nix sides — see
+/// walk_props — but a HashMap-backed default like
+/// `{"fetcher-*":600,"*":60}` would still insert in per-process-random
+/// order, and the docs-data-fresh check would see that as drift).
 fn render_default(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::Null => String::new(),
