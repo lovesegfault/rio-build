@@ -257,9 +257,12 @@ pub async fn setup(
     let build_done = Arc::new(Notify::new());
 
     // Latest generation observed in an accepted HeartbeatResponse.
-    // Starts at 0 — scheduler generation is always ≥1 (lease/mod.rs
-    // non-K8s path starts at 1; k8s Lease increments from 1 on first
-    // acquire), so 0 never rejects a real assignment. Relaxed ordering:
+    // Starts at 0 — scheduler generation is always ≥1 (1 is the floor,
+    // kept as-is in non-K8s / always_leader mode; a K8s acquire derives
+    // it as fetch_max(leaseTransitions + 1) in rio-lease's
+    // LeaderState::on_acquire, and the recovery PG seed
+    // LeaderState::seed_generation_from only raises it), so 0 never
+    // rejects a real assignment. Relaxed ordering:
     // this is a fence against a DIFFERENT process's stale writes, not a
     // within-process happens-before. The value itself is the signal.
     let latest_generation = Arc::new(AtomicU64::new(0));

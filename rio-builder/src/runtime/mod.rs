@@ -2820,8 +2820,10 @@ mod fence_tests {
     #[test]
     fn fence_cold_start_accepts() {
         // latest_observed starts at 0 (before first heartbeat).
-        // Scheduler generation is always ≥1 (lease/mod.rs starts at 1
-        // for non-K8s; k8s lease increments from 1 on first acquire).
+        // Scheduler generation is always ≥1: 1 is the floor (non-K8s /
+        // always_leader keeps it), and every writer — rio-lease's
+        // LeaderState::on_acquire deriving fetch_max(leaseTransitions + 1),
+        // the recovery PG seed — is a fetch_max that can only raise it.
         // 1 < 0 is false → not rejected. Correct: no evidence yet.
         assert!(!is_stale_assignment(1, 0));
     }
