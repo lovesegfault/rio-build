@@ -2237,6 +2237,104 @@ async fn test_recovery_toctou_on_lease_flap(
     Ok(())
 }
 
+/// Counter partition: a discarded recovery must produce exactly ONE
+/// `rio_scheduler_recovery_total` increment (its `discarded_*`
+/// disposition), never an additional pre-gate `success`/`failure` —
+/// and an applied recovery counts exactly once as `success`.
+///
+/// Recorder mechanics: the increments fire inside the SPAWNED actor
+/// task, so the thread-local `set_default_local_recorder` pattern used
+/// elsewhere would observe nothing here; install the
+/// `DebuggingRecorder` process-globally before the actor spawns. Safe
+/// under nextest's process-per-test model — do not move this test to a
+/// shared-process runner.
+#[tokio::test]
+async fn test_discarded_recovery_increments_recovery_total_once() -> TestResult {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    use crate::sla::metrics::counter_map_by;
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    rec.install().expect("install global debugging recorder");
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let generation = Arc::new(AtomicU64::new(2));
+    let recovery_complete = Arc::new(AtomicBool::new(false));
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::clone(&generation),
+        Arc::new(AtomicBool::new(true)),
+        Arc::clone(&recovery_complete),
+    );
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+
+    let l = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = l;
+        p.recovery_toctou_gate = Some((reached_tx, release_rx));
+    });
+
+    // Recovery #1: park at the gate, flap the lease (lose + reacquire
+    // at a bumped generation), release — the gate discards.
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    tokio::time::timeout(Duration::from_secs(10), reached_rx)
+        .await
+        .expect("actor reached gate")
+        .expect("reached_tx not dropped");
+    recovery_complete.store(false, Ordering::Relaxed);
+    generation.fetch_add(1, Ordering::Release);
+    release_tx.send(()).expect("actor still listening");
+    barrier(&handle).await;
+
+    let by_outcome = counter_map_by(&snap, "rio_scheduler_recovery_total", Some("outcome"));
+    assert_eq!(
+        by_outcome.get("discarded_flap").copied(),
+        Some(1),
+        "discarded recovery must count exactly once as discarded_flap: {by_outcome:?}"
+    );
+    assert_eq!(
+        by_outcome.get("success").copied().unwrap_or(0),
+        0,
+        "a discarded recovery must NOT also count as success: {by_outcome:?}"
+    );
+    assert_eq!(
+        by_outcome.get("failure").copied().unwrap_or(0),
+        0,
+        "a discarded recovery must NOT count as failure: {by_outcome:?}"
+    );
+
+    // Recovery #2: clean run at the new generation — applied, so it
+    // counts exactly once as success with no further discard. The
+    // snapshotter DRAINS on read (see counter_map_by's caveat), so this
+    // second decode sees only the deltas since the post-discard
+    // snapshot above.
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+    assert!(
+        recovery_complete.load(Ordering::Acquire),
+        "second (clean) recovery should complete"
+    );
+    let by_outcome = counter_map_by(&snap, "rio_scheduler_recovery_total", Some("outcome"));
+    assert_eq!(
+        by_outcome.get("success").copied().unwrap_or(0),
+        1,
+        "applied recovery counts exactly once as success: {by_outcome:?}"
+    );
+    assert_eq!(
+        by_outcome.get("discarded_flap").copied().unwrap_or(0),
+        0,
+        "no additional discard increment on the second recovery: {by_outcome:?}"
+    );
+    assert_eq!(
+        by_outcome.get("failure").copied().unwrap_or(0),
+        0,
+        "no failure outcome for the applied recovery: {by_outcome:?}"
+    );
+    Ok(())
+}
+
 /// Recovery TOCTOU in the saturated-generation regime: after a
 /// `kubectl delete lease`, the PG floor seeds the generation well past
 /// `leaseTransitions + 1`, and from then on `on_acquire`'s `fetch_max`

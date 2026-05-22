@@ -527,8 +527,11 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_recovery_total",
-        "Scheduler state recoveries from PG after LeaderAcquired (labeled by \
-         outcome=success|failure|discarded_flap|discarded_unconfirmed)"
+        "Scheduler state recoveries from PG after LeaderAcquired; exactly one \
+         increment per attempt: outcome=success|failure when the loaded result \
+         is applied (or the load failed), outcome=discarded_flap|\
+         discarded_unconfirmed when the post-recovery gate throws the result \
+         away (discard outcomes take precedence over the load result)"
     );
     describe_counter!(
         "rio_scheduler_generation_claim_failed_total",

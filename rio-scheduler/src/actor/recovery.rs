@@ -1502,16 +1502,18 @@ impl DagActor {
             let _ = release_rx.await;
         }
 
-        // Record BEFORE the match — both arms need it, and the error
-        // arm's partial-state clear (.dag = new(), etc.) doesn't touch
-        // `start`. Label by outcome: a 30s failure (PG timeout) and a
-        // 30s success (huge DAG) are very different signals; without the
-        // label, one washes out the other.
+        // The duration histogram is recorded for EVERY attempt — even
+        // ones the gate below discards — because it measures the
+        // PG-load outcome/duration, and the error arm's partial-state
+        // clear (.dag = new(), etc.) doesn't touch `start`. Label by
+        // outcome: a 30s failure (PG timeout) and a 30s success (huge
+        // DAG) are very different signals; without the label, one
+        // washes out the other. The attempt COUNTER is recorded after
+        // the gate (one increment per attempt, final disposition).
         let outcome = if result.is_ok() { "success" } else { "failure" };
         let elapsed = start.elapsed();
         metrics::histogram!("rio_scheduler_recovery_duration_seconds", "outcome" => outcome)
             .record(elapsed.as_secs_f64());
-        metrics::counter!("rio_scheduler_recovery_total", "outcome" => outcome).increment(1);
         info!(elapsed_ms = elapsed.as_millis(), outcome, "recovery timing");
 
         // r[impl sched.recovery.bump-confirm+2]
@@ -1646,6 +1648,17 @@ impl DagActor {
         // would be skipping the set when !is_leader(), or clearing the flag in
         // on_acquire(); either needs its own look at dispatch_ready's reading
         // of the flag before changing.
+        // Final disposition of this attempt: exactly one
+        // rio_scheduler_recovery_total increment per attempt. The
+        // discard branch above counted discarded_*; every attempt that
+        // survives the gate counts success|failure here, so discard
+        // outcomes take precedence over the load result (a
+        // failed-then-discarded attempt counts only as discarded_*; the
+        // load failure stays visible in the duration histogram). The
+        // increment is synchronous — the no-awaits-before-
+        // set_recovery_complete() INVARIANT above is untouched.
+        metrics::counter!("rio_scheduler_recovery_total", "outcome" => outcome).increment(1);
+
         match result {
             Ok(pg_max_gen) => {
                 // --- Seed the generation, then ungate dispatch ---
