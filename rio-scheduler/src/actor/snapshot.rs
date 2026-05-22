@@ -180,7 +180,7 @@ fn passes_intent_filter(
 /// (the fit ingests hw-normalized samples and `h_placed` is unknown
 /// to the scheduler until the builder reports it on completion). The
 /// ref↔wall skew (factor ∈ [0.7, 1.4] across hw classes) is the
-/// `eta_error` term the §13b lead-time DDSketch closed-loop absorbs;
+/// `eta_error` term the §13b lead-time-sketch closed-loop absorbs;
 /// for §13a the controller filters on `ready` so only the
 /// `eta < max_lead` gate is sensitive to it.
 ///
@@ -582,7 +582,7 @@ impl DagActor {
         // out to thousands of intents (ADR-023 §Forecast memo).
         //
         // §13a/§13b: `lead_time` is the operator-supplied
-        // `lead_time_seed[h,cap]`. The controller-side DDSketch
+        // `lead_time_seed[h,cap]`. The controller-side lead-time sketch
         // (`CellSketches`, §13b) IS running, but
         // `AckSpawnedIntentsRequest` has no per-cell `lead_time`
         // return channel — the scheduler stays on the static seed
@@ -673,7 +673,7 @@ impl DagActor {
                 // the controller's `a_open` per-cell filter
                 // (`eta < lead_time(c)`), re-stated scheduler-side
                 // over the SOLVED `hw_class_names` (r34 merged_bug_006:
-                // the controller reads its learned per-cell DDSketch
+                // the controller reads its learned per-cell sketch
                 // quantile, which has no return channel here — see
                 // [`crate::sla::config::SlaConfig::max_lead_for`]).
                 // The pre-solve gate used the arch+features-routable
@@ -714,7 +714,7 @@ impl DagActor {
             // is what FFD wanted first — then `eta` asc (r33 bug_007:
             // under budget pressure, near-term actionable intents win
             // over far-term ones the controller may still strip at its
-            // per-cell DDSketch quantile, which can drift below the
+            // per-cell sketch quantile, which can drift below the
             // operator seed) — then `drv_hash` asc as the deterministic
             // tiebreak.
             forecast.sort_unstable_by(|(ha, sa, ia, ea), (hb, sb, ib, eb)| {

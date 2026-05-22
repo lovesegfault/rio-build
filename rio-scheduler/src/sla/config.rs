@@ -605,7 +605,7 @@ impl SlaConfig {
     /// over hwClasses [`Self::class_routes`] admits for `(system,
     /// features)`. **Seed-based approximation** of the controller's
     /// `a_open` per-cell filter (`eta < lead_time(c)`): the controller
-    /// reads its learned per-cell DDSketch quantile (`CellSketches::
+    /// reads its learned per-cell sketch quantile (`CellSketches::
     /// lead_time`, §13b), which has no return channel to the scheduler
     /// (`AckSpawnedIntentsRequest` carries `registered_cells` and
     /// `unfulfillable_cells` but not the gauge). When learned drifts

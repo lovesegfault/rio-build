@@ -148,7 +148,7 @@ pub fn describe_all() {
          over routable hwClasses pre-solve, over `intent.hw_class_names` \
          post-solve) — the scheduler's seed-based approximation of the \
          controller's `a_open` would drop it (r34 merged_bug_006: the \
-         controller reads a learned per-cell DDSketch quantile with no \
+         controller reads a learned per-cell sketch quantile with no \
          return channel to the scheduler, so when learned drifts above \
          the seed this over-counts); \
          `tenant_budget`: `max_forecast_cores_per_tenant` exhausted by \
