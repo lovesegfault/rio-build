@@ -2508,10 +2508,12 @@ Standby/Conflict through the existing lose edge --- so an unequal count on a
 still-leading round is always a genuine discontinuity, and the cost of acting
 on one is a single recovery re-run with dispatch gated during it. Only the
 acquire hook is re-fired: a synthesized lose would force a pointless wipe of
-state the immediately-following re-recovery rebuilds, and would open a
-transient `recovery_complete = false` window on every rebound; hook delivery
-is ordered (#rref("sched.lease.hook-order")), so the choice is about avoiding
-wasted work, not about reordering. The accepted
+state the immediately-following re-recovery rebuilds (and, if the full lose
+edge were synthesized, an `is_leader = false` blip), while
+adding nothing to the dispatch gating the rebound's own `recovery_complete`
+clear already provides; hook delivery is ordered
+(#rref("sched.lease.hook-order")), so the choice is about avoiding wasted
+work, not about reordering. The accepted
 residual is the count coincidence: an observed count that lands exactly back
 on the recorded value is indistinguishable from steady state --- the same
 coincidence pricing as the recovery gate's deletion-ABA note --- and in that

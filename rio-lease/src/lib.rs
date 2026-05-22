@@ -79,8 +79,14 @@ mod mbt_tests;
 /// `run_lease_loop` calls these synchronously from the renewal tick.
 /// **They MUST NOT block** — a blocked hook stalls the renewal tick,
 /// so the loop can neither renew nor self-fence while a standby steals
-/// after `STEAL_AFTER` of observed staleness (dual-leader). Spawn
-/// a task if you need async work (e.g. notifying an actor channel).
+/// after `STEAL_AFTER` of observed staleness (dual-leader). Defer async
+/// work through an order-preserving handoff — one queue drained by one
+/// forwarder task, as the scheduler's `SchedulerLeaseHooks` does — NOT
+/// one spawned task per call: independently spawned tasks can reorder,
+/// and the same-tick `on_lose` → `on_acquire` pair (self-fence false
+/// alarm) must reach the consumer in invocation order (the obligation
+/// `sched.lease.hook-order` makes normative for the scheduler's actor
+/// delivery).
 ///
 /// Per-component metrics (`rio_{scheduler,controller}_lease_*_total`)
 /// are emitted from the hook impl, not from `run_lease_loop`, so each
@@ -999,9 +1005,12 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         // post-term state. Deliberately NO on_lose():
                         // a synthesized lose would force a pointless
                         // wipe of state the immediately-following
-                        // re-recovery rebuilds, and would open a
-                        // transient recovery_complete=false window on
-                        // every rebound. Hook delivery is ordered
+                        // re-recovery rebuilds and (if the full lose
+                        // edge were synthesized) an is_leader=false
+                        // blip, while adding nothing to dispatch
+                        // gating — on_rebound's own recovery_complete
+                        // clear already gates dispatch during the
+                        // re-recovery. Hook delivery is ordered
                         // (sched.lease.hook-order), so skipping the
                         // lose is about avoiding wasted work, not a
                         // reordering hazard. No

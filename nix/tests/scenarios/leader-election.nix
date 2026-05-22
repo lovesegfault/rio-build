@@ -142,7 +142,7 @@ let
       # ══════════════════════════════════════════════════════════════════
       # lease-acquired-metric — acquire-transition sanity + profraw check
       # ══════════════════════════════════════════════════════════════════
-      # SchedulerLeaseHooks::on_acquire (rio-scheduler/src/main.rs)
+      # SchedulerLeaseHooks::on_acquire (rio-scheduler/src/lease_hooks.rs)
       # increments rio_scheduler_lease_acquired_total and its comment
       # says a VM scenario polls it. That check was lost when the legacy
       # phase fixtures were retired. Restoring it here guards two things

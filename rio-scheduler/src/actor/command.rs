@@ -423,8 +423,9 @@ pub enum ActorCommand {
     ///
     /// In non-K8s mode (always_leader): never sent in production —
     /// the only production sender is the lease hooks' `on_acquire`
-    /// (scheduler main.rs), and without a configured `lease_name`
-    /// (env `RIO_LEASE_NAME`) no lease loop runs. So PG recovery
+    /// (`SchedulerLeaseHooks`, rio-scheduler/src/lease_hooks.rs), and
+    /// without a configured `lease_name` (env `RIO_LEASE_NAME`) no
+    /// lease loop runs. So PG recovery
     /// and the write-ahead generation claim never run there;
     /// `recovery_complete` (and the actor's `dag_authoritative`)
     /// start true, dispatch is never gated, and the DAG starts
