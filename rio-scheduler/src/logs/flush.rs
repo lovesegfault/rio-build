@@ -1993,8 +1993,15 @@ async fn upsert_drv_log(
     // past `flush_final`'s already-finalized guard (a concurrent
     // finalization landing after the guard's lookup read the row as
     // unfinalized — the lookup-error case now defers instead of
-    // proceeding). Working as designed; any blob this write uploaded is
-    // orphaned and the TTL GC sweeps it at expiry.
+    // proceeding). Working as designed in both cases, but only the
+    // periodic case leaves an orphaned blob for the TTL GC to sweep at
+    // expiry (its PUT went to a `.partial` key the finalized row does not
+    // reference). A refused stale final already uploaded to the same
+    // canonical `.log.zst` key the frozen row points at — no separate
+    // orphan, and it may have replaced the finalized blob in place while
+    // the frozen row still describes the replaced content; see
+    // `flush_final`'s already-finalized guard comment and the
+    // `obs.log.finalize-immutable` prose in observability.typ.
     if result.rows_affected() == 0 {
         debug!(
             %exec_id,
