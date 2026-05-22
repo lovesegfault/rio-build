@@ -999,10 +999,30 @@
                       passthru = (old.passthru or { }) // subcharts;
                     });
 
-                # Parallel evaluator for gen-matrix's cache-aware filter
-                # (.github/scripts/gen-matrix.sh). Pinned via nixpkgs so the
-                # JSONL schema gen-matrix's jq depends on is stable.
+                # Parallel evaluator behind `packages.gen-matrix` (and
+                # nix-fast-build). Re-exported so local experiments use
+                # the same pinned binary whose JSONL schema gen_matrix.py
+                # depends on.
                 inherit (pkgs) nix-eval-jobs;
+
+                # CI matrix generator (.github/workflows/ci.yml gen-matrix
+                # job). writePython3Bin runs flake8 at build time, so a
+                # lint error fails the package build before the script
+                # ever runs in CI. nix-eval-jobs is baked in via
+                # replaceVars so the workflow needs no separate
+                # `nix build .#nix-eval-jobs` step.
+                gen-matrix =
+                  pkgs.writers.writePython3Bin "gen-matrix"
+                    {
+                      # Comments tracking the 79-col limit read worse
+                      # than the occasional long line.
+                      flakeIgnore = [ "E501" ];
+                    }
+                    (
+                      pkgs.replaceVars ./nix/gen_matrix.py {
+                        nix_eval_jobs = "${pkgs.nix-eval-jobs}/bin/nix-eval-jobs";
+                      }
+                    );
 
                 # Codecov uploader. The {name: outPath} map comes from
                 # gen-matrix via $COVERAGE_PATHS (NOT baked in — baking
@@ -1199,6 +1219,17 @@
                   # filename-colliding profraws across multi-worker nodes.
                   # No KVM needed (synthetic tarballs).
                   cov-extract-nocollide = coverage.extractNoCollide;
+                  # gen-matrix's embedded unit tests, run against the
+                  # flake8-checked, replaceVars-substituted script (the
+                  # exact bytes CI executes). A logic regression in the
+                  # matrix generator is caught by the local checks gate
+                  # instead of by a malformed CI run.
+                  gen-matrix-selftest =
+                    pkgs.runCommand "gen-matrix-selftest" { nativeBuildInputs = [ config.packages.gen-matrix ]; }
+                      ''
+                        gen-matrix --self-test
+                        touch $out
+                      '';
                   codecov-matrix-sync =
                     let
                       expected = builtins.length (builtins.attrNames ciMatrix.coverage);

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # Emit GitHub Actions matrix outputs for ci.yml from a single
 # nix-eval-jobs pass over `.#githubActions`, eliding entries already
 # in the binary cache and grouping the survivors into clusters that
