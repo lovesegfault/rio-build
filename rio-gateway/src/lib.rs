@@ -83,7 +83,8 @@ pub fn describe_metrics() {
         "rio_gateway_auth_degraded_total",
         "SSH auth accepted but tenant identity degraded to single-tenant mode \
          (labeled by reason: interior_whitespace = authorized_keys comment has \
-         a space where a dash was intended)"
+         a space where a dash was intended; invalid_utf8 = comment bytes are \
+         not valid UTF-8 — rewrite the comment as plain UTF-8)"
     );
     describe_counter!(
         "rio_gateway_quota_rejections_total",
