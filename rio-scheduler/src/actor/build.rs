@@ -749,8 +749,11 @@ impl DagActor {
         // restamp clears the seal and the mark so the entry serves as the
         // live execution's buffer; an entry that is still sealed AND empty
         // at that drop has no remaining owner and is reaped by the
-        // tenure-drop arm itself, while a non-empty sealed orphan lingers
-        // until the drv's next restamp/dispatch or process restart.
+        // tenure-drop arm itself, as is a sealed non-empty one whose
+        // execution another tenure already finalized in drv_logs (the
+        // durable record supersedes it), while a sealed non-empty orphan
+        // never finalized anywhere lingers until the drv's next
+        // restamp/dispatch or process restart.
         // r[impl obs.log.deferred-final-retry+3]
         let reaped_paths = self.dag.remove_build_interest_and_reap(build_id);
         if let Some(bufs) = &self.log_buffers {

@@ -192,9 +192,11 @@ struct RingBuf {
     /// pin) leaves the entry and this mark in place — the entry may be the
     /// live execution's buffer on a re-acquired leader, so its reaper is
     /// then the live tenure's own final, the drv's next dispatch discard,
-    /// or process exit — unless the entry is still sealed and empty for
-    /// that exec (no restamp adopted it), in which case the tenure-drop arm
-    /// reaps it. Set at enqueue by the actor and
+    /// or process exit — unless the entry is still sealed for that exec (no
+    /// restamp in the current tenure adopted it), in which case the
+    /// tenure-drop arm reaps it: outright when empty, and when non-empty
+    /// only after a read-only `drv_logs` consult shows another tenure
+    /// already finalized the execution. Set at enqueue by the actor and
     /// re-asserted at deferral by the flusher (both exec-guarded); cleared by
     /// any `set_exec` restamp — cross-exec, or the same-exec restamp recovery
     /// performs at lease re-acquisition (the prior tenure's retained final
@@ -226,8 +228,8 @@ pub struct LogBuffers {
     /// BuildExecution stream after the worker sent CompletionReport)
     /// cannot recreate a buffer that the flusher already drained.
     /// Cleared by `LogFlusher::flush_final` once the final resolves,
-    /// by the discard-family reaps ([`Self::discard`], the empty-entry
-    /// reaps, terminal cleanup), and by any [`Self::set_exec`] restamp —
+    /// by the discard-family reaps ([`Self::discard`], the conditional
+    /// entry reaps, terminal cleanup), and by any [`Self::set_exec`] restamp —
     /// cross-exec because the seal belongs to the execution being
     /// replaced, same-exec because at lease re-acquisition the prior
     /// tenure's pending final can no longer drain the entry.
