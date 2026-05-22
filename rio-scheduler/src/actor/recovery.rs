@@ -19,8 +19,10 @@
 //!    IMMEDIATELY, then fire-and-forget `ActorCommand::LeaderAcquired`
 //!    (no reply). Lease loop continues renewing normally.
 //! 2. Actor handles `LeaderAcquired`: calls `recover_from_pg().await`
-//!    → on success the completion is recorded for the acquire-epoch
-//!    (transition count) the recovery was computed under
+//!    (the DAG load), then reads the PG generation floor as an
+//!    independent step, claims the resulting target, and records the
+//!    completion for the acquire-epoch (transition count) the
+//!    recovery was computed under
 //!    (`LeaderState::set_recovery_complete`).
 //! 3. `dispatch_ready` gates on BOTH `is_leader` AND `recovery_complete`.
 //!    Standby merges DAGs (state warm) but doesn't dispatch until
@@ -29,9 +31,14 @@
 //!
 //! # Failure mode: degrade, don't block
 //!
-//! If recovery fails (PG down mid-recovery), log error + metric but
-//! still set `recovery_complete=true` — with an EMPTY DAG. Same as
-//! Phase 3a behavior (lost builds, not blocked cluster). A panicked
+//! If the DAG load fails (PG hiccup mid-recovery), log error + metric
+//! and continue with an EMPTY DAG — but the term is still floored,
+//! claimed, and (when required) confirmed before `recovery_complete`
+//! is set, so its dispatches stay inside what the durable floor
+//! covers (only the in-flight builds are lost). Only when the PG
+//! floor itself cannot be read does the term complete at the
+//! recovery-entry generation (the floor-unreadable fallback — see the
+//! disposition comment in `handle_leader_acquired`). A panicked
 //! recovery with `is_leader=true` + `recovery_complete=false` would
 //! block dispatch FOREVER while holding the lease — standby can
 //! never take over. Degrading is better.
@@ -47,12 +54,15 @@
 //! Lease object being deleted and recreated at `leaseTransitions = 0`.
 //!
 //! Before `recovery_complete` ungates dispatch, the target generation
-//! is durably CLAIMED in `leader_generation_claims` — without that, a
-//! leader deposed before persisting a single assignment leaves no
-//! trace in PG, and its post-deletion successor seeds from the same
-//! stale floor and reuses its generation. The claim bounds the
-//! post-deletion damage; it cannot prevent it under a PG
-//! point-in-time restore (which regresses both floor arms together).
+//! is durably CLAIMED in `leader_generation_claims` (the sole
+//! exception is the floor-unreadable fallback, where no claim is
+//! possible because PG cannot answer even the single-row floor query)
+//! — without that, a leader deposed before persisting a single
+//! assignment leaves no trace in PG, and its post-deletion successor
+//! seeds from the same stale floor and reuses its generation. The
+//! claim bounds the post-deletion damage; it cannot prevent it under
+//! a PG point-in-time restore (which regresses both floor arms
+//! together).
 //!
 //! A claim target the durable floor cannot vouch for — one ABOVE the
 //! entry generation, or a retained entry generation more than one above
@@ -126,19 +136,21 @@ impl DagActor {
     /// live), then loads from PG as the single source of truth.
     /// Priorities recomputed via critical_path::full_sweep.
     ///
-    /// Returns the PG high-water generation on success (for the
-    /// caller's monotonicity seed). The caller does `fetch_max`
-    /// AFTER the TOCTOU check — keeping this function free of
-    /// writes to `self.leader` (generation, acquired_transitions,
-    /// is_leader) is load-bearing for the snapshot check in
-    /// `handle_leader_acquired` (any change to the generation OR to
-    /// the recorded acquire-transitions, or a cleared is_leader,
-    /// during recovery then unambiguously means the lease loop wrote
-    /// it, i.e. a flap onto a new epoch or a lapsed lease).
+    /// The PG generation floor is NOT read here: the caller
+    /// (`handle_leader_acquired`) reads it as an independent step, so
+    /// a DAG-load failure cannot take the floor — and the claim and
+    /// confirmation built on it — down with it. Keeping this function
+    /// free of writes to `self.leader` (generation,
+    /// acquired_transitions, is_leader) is load-bearing for the
+    /// snapshot check in `handle_leader_acquired` (any change to the
+    /// generation OR to the recorded acquire-transitions, or a cleared
+    /// is_leader, during recovery then unambiguously means the lease
+    /// loop wrote it, i.e. a flap onto a new epoch or a lapsed lease).
     ///
-    /// Returns Err on PG failure; caller sets `recovery_complete=
-    /// true` anyway (see module doc — degrade not block).
-    pub(super) async fn recover_from_pg(&mut self) -> Result<Option<i64>, ActorError> {
+    /// Returns Err on PG failure; the caller still floors, claims, and
+    /// (when required) confirms before completing (see module doc —
+    /// degrade not block; only the in-flight builds are lost).
+    pub(super) async fn recover_from_pg(&mut self) -> Result<(), ActorError> {
         info!("starting state recovery from PG");
 
         // --- Clear in-mem state ---
@@ -190,6 +202,15 @@ impl DagActor {
             }
         }
 
+        // Test-only: deterministic DAG-load failure. Scoped to the load
+        // phase — the caller's independent PG-floor read must stay
+        // unaffected so the load-failure tests can exercise the floored
+        // degraded path.
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_recovery_load) {
+            return Err(ActorError::Database(sqlx::Error::PoolClosed));
+        }
+
         let RecoveryLoad {
             build_rows,
             build_ids,
@@ -210,15 +231,6 @@ impl DagActor {
         self.restore_builds(build_rows, &build_ids, build_drv_hashes)
             .await?;
 
-        // --- Fetch PG generation high-water mark (caller seeds) ---
-        // NOT applied here: the caller (handle_leader_acquired) does
-        // fetch_max AFTER the TOCTOU gen-snapshot check. Writing to
-        // self.leader's generation here would false-positive that check.
-        // The floor spans assignments ∪ leader_generation_claims — see
-        // max_known_generation's doc for why neither arm alone is
-        // reliable.
-        let pg_max_gen = self.db.max_known_generation().await?;
-
         self.seed_ready_queue(&failed_dep_parents).await;
 
         self.finalize_recovered_builds(&bd_rows).await;
@@ -230,7 +242,7 @@ impl DagActor {
             "state recovery complete"
         );
 
-        Ok(pg_max_gen)
+        Ok(())
     }
 
     /// Load builds + derivations + poisoned + edges + build_derivations
@@ -1245,6 +1257,31 @@ impl DagActor {
         let start = Instant::now();
         let result = self.recover_from_pg().await;
 
+        // --- Fetch PG generation high-water mark (independent step) ---
+        // Read OUTSIDE recover_from_pg so a DAG-load failure cannot
+        // take the floor — and the claim/confirmation built on it —
+        // down with it; reading after the load preserves the previous
+        // freshness ordering (the claim loop's PK-conflict retry
+        // tolerates a stale read either way). NOT applied here: the
+        // fetch_max happens at the shared post-gate tail below, AFTER
+        // the TOCTOU gen-snapshot check — writing self.leader's
+        // generation here would false-positive that check. The floor
+        // spans assignments ∪ leader_generation_claims — see
+        // max_known_generation's doc for why neither arm alone is
+        // reliable.
+        let pg_floor_read: Result<Option<i64>, ActorError> = self
+            .db
+            .max_known_generation()
+            .await
+            .map_err(ActorError::from);
+        // For the post-gate "seeded generation" log line: the floor
+        // value when readable (None when unreadable or empty — the
+        // field keeps its historical name).
+        let pg_high_water: Option<i64> = match &pg_floor_read {
+            Ok(v) => *v,
+            Err(_) => None,
+        };
+
         // Stale-pin cleanup: crash-between-pin-and-unpin (scheduler
         // crashed after dispatch pin but before completion unpin)
         // leaves rows in scheduler_live_pins for terminal drvs.
@@ -1373,10 +1410,14 @@ impl DagActor {
                 .is_some_and(|(g, h)| u64::try_from(*g).ok() == Some(at_gen) && h == holder)
         };
         // r[impl sched.lease.generation-claim+2]
-        let (claim_target, floor_vouches_entry) = match &result {
-            // The Err arm of the match below never seeds — the target
-            // is never read on that path — and it never waits for a
-            // confirmation either (degrade, don't block).
+        let (claim_target, floor_vouches_entry) = match &pg_floor_read {
+            // Floor unreadable: PG could not answer even the
+            // single-row floor query. The target degenerates to the
+            // entry generation — no claim is possible (the INSERT
+            // would fail the same way) and no confirmation is
+            // required — and the shared post-gate tail still runs the
+            // (no-op) seed and completes; see the floor-unreadable
+            // pricing at the disposition below.
             Err(_) => (gen_at_entry, true),
             Ok(pg_max_gen) => {
                 // u64 view of the PG floor. A negative BIGINT is a
@@ -1600,11 +1641,12 @@ impl DagActor {
         // because a successor over that floor either collides with our
         // claim at the entry generation (the PK CAS) or seeds above us
         // — except in the named adjacent-floor-race residual (see the
-        // confirmation fn's doc). The Err arm never waits (degrade,
-        // don't block), and the claim-failure/proceed-unclaimed
-        // degradation never blocks beyond the existing cap.
+        // confirmation fn's doc). The floor-unreadable fallback never
+        // waits (degrade, don't block), and the claim-failure/
+        // proceed-unclaimed degradation never blocks beyond the
+        // existing cap.
         let needs_confirmation =
-            result.is_ok() && (claim_target > gen_at_entry || !floor_vouches_entry);
+            pg_floor_read.is_ok() && (claim_target > gen_at_entry || !floor_vouches_entry);
         let confirm_started = Instant::now();
         let confirmed = if needs_confirmation {
             self.await_post_claim_leadership_confirmation(
@@ -1724,56 +1766,70 @@ impl DagActor {
         // set_recovery_complete() INVARIANT above is untouched.
         metrics::counter!("rio_scheduler_recovery_total", "outcome" => outcome).increment(1);
 
-        match result {
-            Ok(pg_max_gen) => {
-                // --- Seed the generation, then ungate dispatch ---
-                //
-                // `claim_target` was computed AND durably claimed in
-                // the claim loop above, inside the gen_at_entry
-                // window. Only the ATOMIC WRITE happens here, after
-                // the TOCTOU check — writing the atomic before the
-                // check would make the seed itself look like a lease
-                // flap. fetch_max not store: both writers (the lease
-                // loop and this seed) only ever raise the same Arc.
-                // No awaits from here to set_recovery_complete() —
-                // see the INVARIANT comment at the gen re-check.
-                let prev = self.leader.seed_generation_from(claim_target);
-                if claim_target > prev {
-                    info!(
-                        prev_gen = prev,
-                        pg_high_water = ?pg_max_gen,
-                        new_gen = claim_target,
-                        confirm_wait_ms = confirm_started.elapsed().as_millis(),
-                        "seeded generation from PG floor (assignments ∪ claims)"
-                    );
-                }
-                self.leader.set_recovery_complete(transitions_at_entry);
-                // Only HERE: the DAG was rebuilt from PG by this
-                // tenure's recover_from_pg, so "not in the DAG" means
-                // "stale" again and the disconnect-time log-buffer
-                // discard may resume.
-                self.dag_authoritative = true;
-            }
-            Err(e) => {
-                // PG failure mid-recovery. Set complete=true
-                // ANYWAY with EMPTY DAG. Same as Phase 3a behavior
-                // (builds lost, cluster keeps working). Better than
-                // blocking dispatch forever while holding the lease.
-                error!(
-                    error = %e,
-                    "state recovery FAILED — continuing with empty DAG \
-                     (Phase 3a behavior: in-flight builds lost)"
-                );
-                // Explicitly re-clear: recovery may have partially
-                // populated before failing. dag_authoritative stays
-                // false (clear_persisted_state keeps it cleared): the
-                // degraded empty-DAG tenure retains its log-buffer
-                // entries, and the disconnect-time discard must not
-                // treat "not in the (empty) DAG" as "stale".
-                self.clear_persisted_state();
-                self.leader.set_recovery_complete(transitions_at_entry);
-            }
+        if let Err(e) = &result {
+            // DAG load failed: continue with an EMPTY DAG (in-flight
+            // builds are lost for this term), but the generation
+            // handling is NOT skipped — the floor was read
+            // independently above, so this term is floored, claimed,
+            // and (when required) confirmed like any other; its
+            // dispatches stay inside what the durable floor covers.
+            // Only when the floor itself was unreadable
+            // (`floored = false` below) does the term proceed at the
+            // entry generation: in the saturated post-deletion regime
+            // that generation sits below the executors' fetch_max
+            // latch, so long-lived builders silently reject its
+            // dispatches until the next leadership transition — the
+            // operator signal is this error line plus the builder-side
+            // stale-assignment counter. Better than blocking dispatch
+            // forever while holding the lease.
+            error!(
+                error = %e,
+                floored = pg_floor_read.is_ok(),
+                "state recovery FAILED — continuing with empty DAG \
+                 (in-flight builds lost for this term)"
+            );
+            // Explicitly re-clear: recovery may have partially
+            // populated before failing. dag_authoritative stays false
+            // (clear_persisted_state keeps it cleared): the degraded
+            // empty-DAG tenure retains its log-buffer entries, and the
+            // disconnect-time discard must not treat "not in the
+            // (empty) DAG" as "stale".
+            self.clear_persisted_state();
         }
+        // Only on a successful load: the DAG was rebuilt from PG by
+        // this tenure's recover_from_pg, so "not in the DAG" means
+        // "stale" again and the disconnect-time log-buffer discard
+        // may resume. On the Err path the clear_persisted_state above
+        // keeps the bit false.
+        if result.is_ok() {
+            self.dag_authoritative = true;
+        }
+
+        // --- Seed the generation, then ungate dispatch ---
+        //
+        // Shared tail for every non-discard outcome. `claim_target`
+        // was computed AND durably claimed in the claim loop above,
+        // inside the gen_at_entry window. Only the ATOMIC WRITE
+        // happens here, after the TOCTOU check — writing the atomic
+        // before the check would make the seed itself look like a
+        // lease flap. fetch_max not store: both writers (the lease
+        // loop and this seed) only ever raise the same Arc. In the
+        // floor-unreadable fallback `claim_target` equals the entry
+        // generation, so the seed is a no-op — kept unconditional so
+        // there is exactly one seed call site (the gate-pass tail).
+        // No awaits from here to set_recovery_complete() — see the
+        // INVARIANT comment at the gen re-check.
+        let prev = self.leader.seed_generation_from(claim_target);
+        if claim_target > prev {
+            info!(
+                prev_gen = prev,
+                pg_high_water = ?pg_high_water,
+                new_gen = claim_target,
+                confirm_wait_ms = confirm_started.elapsed().as_millis(),
+                "seeded generation from PG floor (assignments ∪ claims)"
+            );
+        }
+        self.leader.set_recovery_complete(transitions_at_entry);
     }
 
     /// Wait for a post-claim apiserver round-trip that ended with this

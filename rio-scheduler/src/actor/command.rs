@@ -1030,12 +1030,17 @@ impl GenerationReader {
     /// a `fetch_max` floor either way; the ledger bound, though, only
     /// holds on the claimed path (a successor seeds above it via the PG
     /// floor, GREATEST(MAX(assignments), MAX(claims))). On a term that
-    /// proceeded unclaimed — claim-INSERT failure, conflict exhaustion,
-    /// or the recover_from_pg error arm (which also skips the
-    /// confirmation wait) — that leg does not hold and the exposure is
-    /// the pre-existing claim-failure residual priced in
+    /// proceeded unclaimed — claim-INSERT failure or conflict
+    /// exhaustion — that leg does not hold and the exposure is the
+    /// pre-existing claim-failure residual priced in
     /// `await_post_claim_leadership_confirmation`'s doc
-    /// (`sched.recovery.bump-confirm`) in recovery.rs. The exits are
+    /// (`sched.recovery.bump-confirm`) in recovery.rs. (A DAG-load
+    /// failure no longer lands here: the floor is read independently
+    /// of the load, so that term floors, claims, and confirms like any
+    /// other; only the floor-unreadable fallback remains, and its
+    /// exposure is under-floor advertisement — in the saturated regime
+    /// the latched builders silently reject its work — rather than an
+    /// unclaimed generation.) The exits are
     /// the queued-loss invalidation above, a re-acquire at a different
     /// count (the stamp mismatches — the different-count case above),
     /// or at the same count (the deliberate same-epoch keep); a rebound

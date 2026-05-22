@@ -279,7 +279,12 @@ async fn test_recovery_transitive_failed_dep_persisted() -> TestResult {
 /// Recovery failure (PG down mid-recovery) → recovery_complete set
 /// TRUE with empty DAG. Degrade, don't block. The alternative (leave
 /// recovery_complete=false) would block dispatch forever while the
-/// scheduler holds the lease.
+/// scheduler holds the lease. With the pool closed, BOTH the DAG load
+/// and the independent PG-floor read fail, so this pins the
+/// floor-unreadable fallback specifically: the term completes at the
+/// recovery-entry generation (no floor, no claim). The floored
+/// load-failure path is pinned by
+/// `test_recovery_load_failure_still_floors_claims_and_confirms`.
 // r[verify sched.recovery.gate-dispatch]
 #[tokio::test]
 async fn test_recovery_failure_degrades_to_empty_dag() -> TestResult {
@@ -309,6 +314,12 @@ async fn test_recovery_failure_degrades_to_empty_dag() -> TestResult {
     assert!(
         leader.recovery_complete(),
         "Err arm must set recovery_complete=true (degrade, don't block dispatch)"
+    );
+    assert_eq!(
+        leader.generation(),
+        1,
+        "with the floor unreadable the term completes at the recovery-entry \
+         generation (no floor to seed from, nothing to claim)"
     );
     let info = handle.debug_query_derivation("anything").await?;
     assert!(info.is_none(), "DAG should be empty after recovery failure");
@@ -1534,6 +1545,91 @@ async fn test_recovery_confirmed_bump_seeds_and_completes() -> TestResult {
             (13, "pod-us".to_string())
         ],
         "the bump is claimed; the predecessor's row stays"
+    );
+    Ok(())
+}
+
+/// A DAG-load failure must not skip the floor: the term still reads the
+/// PG floor, claims its target, and (the target exceeds the entry
+/// generation here) waits for the post-claim confirmation before
+/// ungating dispatch — only the builds are lost. Saturated regime: the
+/// durable floor sits well above the lease-derived entry generation, so
+/// completing at the entry generation would advertise a generation
+/// below every long-lived executor's `fetch_max` latch and its
+/// dispatches would be silently rejected (the inversion this pins
+/// against). Pairs with `test_recovery_failure_degrades_to_empty_dag`,
+/// which closes the pool so the floor read fails too and pins the
+/// floor-unreadable fallback.
+// r[verify sched.recovery.fetch-max-seed+4]
+// r[verify sched.lease.generation-claim+2]
+// r[verify sched.recovery.bump-confirm+2]
+#[tokio::test]
+async fn test_recovery_load_failure_still_floors_claims_and_confirms() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    // Saturated regime: a dead predecessor's claim row far above the
+    // lease-derived entry generation (2).
+    sqlx::query(
+        "INSERT INTO leader_generation_claims (generation, holder_id) \
+         VALUES (40, 'dead-previous')",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    let generation = Arc::new(AtomicU64::new(2));
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::clone(&generation),
+        Arc::new(AtomicBool::new(true)),
+        false,
+    );
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let l = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = l;
+        p.holder_id = "pod-us".into();
+        p.fail_next_recovery_load = true;
+        p.recovery_toctou_gate = Some((reached_tx, release_rx));
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    tokio::time::timeout(Duration::from_secs(10), reached_rx)
+        .await
+        .expect("actor reached gate")
+        .expect("reached_tx not dropped");
+    // Parked after the claim attempt and the rounds_at_claim snapshot:
+    // simulate the lease loop completing one post-claim Leading round so
+    // the bump confirmation can succeed.
+    let round = leader.begin_renew_round();
+    leader.confirm_leading_round(round);
+    release_tx.send(()).expect("actor still listening");
+    barrier(&handle).await;
+
+    assert_eq!(
+        generation.load(Ordering::Acquire),
+        41,
+        "a load-failure term must still seed one past the durable floor, \
+         not complete at the under-floor entry generation"
+    );
+    let claim: Option<(i64, String)> = sqlx::query_as(
+        "SELECT generation, holder_id FROM leader_generation_claims \
+         WHERE generation = 41",
+    )
+    .fetch_optional(&db.pool)
+    .await?;
+    assert_eq!(
+        claim,
+        Some((41, "pod-us".to_string())),
+        "a load-failure term must durably claim its floored target"
+    );
+    assert!(
+        leader.recovery_complete(),
+        "floored, claimed, and confirmed: the load-failure term completes \
+         (degrade, don't block — builds lost only)"
+    );
+    assert_eq!(
+        handle.generation.advertised(),
+        41,
+        "heartbeats advertise the floored, claimed generation — not the \
+         under-floor entry generation"
     );
     Ok(())
 }

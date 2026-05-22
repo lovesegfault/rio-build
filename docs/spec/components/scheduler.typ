@@ -2476,10 +2476,15 @@ association: the claim INSERT precedes `set_recovery_complete()`
 (#rref("sched.lease.generation-claim")), so on the non-degraded path the
 advertised generation is always durably claimed. The degraded paths inherit
 the existing pricing rather than new pricing: a claim-write failure or
-claim-conflict exhaustion proceeds unclaimed, and a recovery (DAG-load)
-failure completes with no claim attempted --- in each case that one term
-advertises an unclaimed generation, the same one-term residual already priced
-for the claim machinery above. The trade-off is that fence arming is deferred:
+claim-conflict exhaustion proceeds unclaimed (a DAG-load failure on its own
+does not --- the floor is read independently of the load, so that term still
+claims; only the builds are lost), and a floor-unreadable recovery completes
+at the recovery-entry generation --- the unclaimed term advertises an
+unclaimed generation (the same one-term residual already priced for the claim
+machinery above), while the floor-unreadable term's exposure is under-floor
+advertisement: in the saturated post-deletion regime the executors' latch
+silently rejects its dispatches until the next leadership transition. The
+trade-off is that fence arming is deferred:
 workers learn the new generation only after the new leader's recovery
 completes, plus up to one heartbeat interval, so a paused-and-deposed
 ex-leader's stale assignments are not generation-rejected during that window

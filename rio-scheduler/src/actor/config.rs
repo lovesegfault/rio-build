@@ -136,6 +136,13 @@ pub struct DagActorPlumbing {
         tokio::sync::oneshot::Sender<()>,
         tokio::sync::oneshot::Receiver<()>,
     )>,
+    /// Test-only: when set, the next `recover_from_pg()` call fails its
+    /// DAG-load phase up front (the independent PG-floor read in
+    /// `handle_leader_acquired` is deliberately unaffected) — lets the
+    /// load-failure tests exercise the floored degraded path
+    /// deterministically without closing the pool.
+    #[cfg(test)]
+    pub fail_next_recovery_load: bool,
 }
 
 impl Default for DagActorPlumbing {
@@ -155,6 +162,8 @@ impl Default for DagActorPlumbing {
             shutdown: rio_common::signal::Token::new(),
             #[cfg(test)]
             recovery_toctou_gate: None,
+            #[cfg(test)]
+            fail_next_recovery_load: false,
         }
     }
 }

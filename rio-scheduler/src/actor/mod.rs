@@ -626,6 +626,11 @@ pub struct DagActor {
     /// simulating a lease flap mid-recovery without mocking PG.
     #[cfg(test)]
     recovery_toctou_gate: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    /// Test-only: fail the next `recover_from_pg()` DAG-load phase up
+    /// front (the independent PG-floor read is unaffected). See
+    /// `DagActorPlumbing::fail_next_recovery_load`.
+    #[cfg(test)]
+    fail_next_recovery_load: bool,
     /// Test-only structural counters. Asserting on these (rather than
     /// wall-clock or absence-of-side-effect) makes the I-163 / I-139
     /// regression tests fail under their target mutation.
@@ -783,6 +788,8 @@ impl DagActor {
             #[cfg(test)]
             recovery_toctou_gate: plumbing.recovery_toctou_gate,
             #[cfg(test)]
+            fail_next_recovery_load: plumbing.fail_next_recovery_load,
+            #[cfg(test)]
             test_counters: TestCounters::default(),
         }
     }
@@ -876,6 +883,8 @@ impl DagActor {
             snapshot_tx: _,
             #[cfg(test)]
                 recovery_toctou_gate: _,
+            #[cfg(test)]
+                fail_next_recovery_load: _,
             #[cfg(test)]
                 test_counters: _,
         } = self;
