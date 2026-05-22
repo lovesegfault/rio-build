@@ -242,6 +242,11 @@ pub(super) fn try_ring_buffer(
 /// the post-failover tail. The OLD model filtered `is_complete=true`
 /// because periodic snapshots had no PG row; now they do, and serving them
 /// is strictly more useful than NotFound.
+///
+/// Blobs whose physical line count diverges from the row's span (a
+/// gap-merged blob — the failover marker stands in for the lost range,
+/// `obs.log.gap-span`) are re-served from the start regardless of
+/// `since`: bandwidth over silently skipping lines the client never got.
 async fn try_s3(
     s3: &Option<(S3Client, String)>,
     pool: &PgPool,
@@ -320,6 +325,7 @@ async fn try_s3(
     // Decompress in spawn_blocking — same rationale as the flusher's encode.
     let drv_hash_owned = drv_hash.to_string();
     let exec_for_chunk = exec_id_str.clone();
+    let row_line_count = line_count as u64;
     let mut chunks = tokio::task::spawn_blocking(move || {
         decompress_and_chunk(
             &compressed,
@@ -327,6 +333,7 @@ async fn try_s3(
             &exec_for_chunk,
             first_line,
             since,
+            row_line_count,
         )
     })
     .await
@@ -356,6 +363,9 @@ async fn try_s3(
 /// `first_line`: a 150k-line build with the client at `since=120000`
 /// short-circuited against `line_count=100000` (ring-capped survivors)
 /// → silently dropped the final 30k lines.
+///
+/// For gap-merged rows `line_count` is the true span (gap counted —
+/// `obs.log.gap-span`), so this stays in true line-number space.
 pub(super) fn s3_is_caught_up(since: u64, first_line: u64, line_count: u64) -> bool {
     since >= first_line + line_count
 }
@@ -378,6 +388,11 @@ pub(super) fn s3_is_caught_up(since: u64, first_line: u64, line_count: u64) -> b
 /// chunk so the client knows which execution it got even when the
 /// request asked for "latest".
 ///
+/// `row_line_count` is `drv_logs.line_count` — the row's true span; used
+/// only to detect blobs whose physical line count diverges from it. When
+/// they diverge the blob is served from its start (`since` ignored) — see
+/// the in-body comment.
+///
 /// All chunks are emitted with `is_complete=false` — this is a pure
 /// split/chunk fn that doesn't know whether the blob is a `.partial`
 /// snapshot or a final flush. The caller stamps the last chunk from the
@@ -388,6 +403,7 @@ pub(super) fn decompress_and_chunk(
     exec_id: &str,
     first_line: u64,
     since: u64,
+    row_line_count: u64,
 ) -> std::io::Result<Vec<DerivationLogChunk>> {
     let decoded = zstd::decode_all(compressed)?;
     // The flusher writes `line\nline\nline\n` — strip the trailing
@@ -398,6 +414,24 @@ pub(super) fn decompress_and_chunk(
     // into `chunks` first. Stripping at source eliminates the boundary
     // case structurally.
     let raw: &[u8] = decoded.strip_suffix(b"\n").unwrap_or(&decoded);
+
+    // r[impl obs.log.gap-span]
+    // A gap-merged blob (a failover marker replaced two or more lost lines —
+    // see `upload_and_record`'s effective-metadata block) has fewer physical
+    // lines than the row's true span, so the index→line mapping below is
+    // unreliable past the marker: slicing at `since` would skip lines the
+    // client never received and mislabel the rest. Ignore the cursor and
+    // re-serve from the start (the caller's caught-up short-circuit already
+    // handled cursors at/past the true end). Gapless blobs and markers that
+    // replaced exactly one line keep physical == row count, so exact resume
+    // is preserved; any other mismatch (writer bug) gets the same
+    // conservative full re-serve.
+    let physical_lines = raw.split(|b| *b == b'\n').count() as u64;
+    let since = if physical_lines != row_line_count {
+        0
+    } else {
+        since
+    };
 
     // True line numbers are blob-index + first_line offset (the flusher
     // writes survivors in buffer order, which IS line-number order, but

@@ -369,7 +369,7 @@ fn decompress_and_chunk_roundtrip() -> anyhow::Result<()> {
     }
     let zst = enc.finish()?;
 
-    let chunks = decompress_and_chunk(&zst, "test", "exec-1", 0, 0)?;
+    let chunks = decompress_and_chunk(&zst, "test", "exec-1", 0, 0, 5)?;
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].lines.len(), 5, "trailing \\n artifact stripped");
     assert_eq!(chunks[0].lines[0], b"line-0");
@@ -441,7 +441,7 @@ fn decompress_and_chunk_255_lines_no_trailing_empty() -> anyhow::Result<()> {
     }
     let zst = enc.finish()?;
 
-    let chunks = decompress_and_chunk(&zst, "test", "exec-1", 0, 0)?;
+    let chunks = decompress_and_chunk(&zst, "test", "exec-1", 0, 0, 255)?;
     assert_eq!(chunks.len(), 1, "255 < CHUNK_LINES → one chunk");
     assert_eq!(
         chunks[0].lines.len(),
@@ -684,7 +684,7 @@ fn decompress_and_chunk_since_filtering() -> anyhow::Result<()> {
     }
     let zst = enc.finish()?;
 
-    let chunks = decompress_and_chunk(&zst, "test", "exec-1", 0, 3)?;
+    let chunks = decompress_and_chunk(&zst, "test", "exec-1", 0, 3, 5)?;
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].lines.len(), 2, "since=3 → lines 3,4 only");
     assert_eq!(chunks[0].first_line_number, 3);
@@ -705,7 +705,7 @@ fn decompress_and_chunk_with_first_line_offset() -> anyhow::Result<()> {
     }
     let zst = enc.finish()?;
 
-    let chunks = decompress_and_chunk(&zst, "test", "exec-1", 50_000, 50_070)?;
+    let chunks = decompress_and_chunk(&zst, "test", "exec-1", 50_000, 50_070, 100)?;
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].lines.len(), 30, "true lines 50_070..50_099");
     assert_eq!(chunks[0].first_line_number, 50_070);
@@ -715,7 +715,7 @@ fn decompress_and_chunk_with_first_line_offset() -> anyhow::Result<()> {
     // since < first_line (client never saw the evicted head — fresh
     // poll after completion). All 100 survivors returned, labeled
     // from first_line.
-    let chunks = decompress_and_chunk(&zst, "test", "exec-1", 50_000, 0)?;
+    let chunks = decompress_and_chunk(&zst, "test", "exec-1", 50_000, 0, 100)?;
     assert_eq!(chunks[0].lines.len(), 100);
     assert_eq!(chunks[0].first_line_number, 50_000);
     assert_eq!(chunks[0].lines[0], b"orig-50000");
@@ -740,4 +740,113 @@ fn s3_short_circuit_respects_first_line() {
     // No-eviction case (first_line=0) reduces to the old comparison.
     assert!(s3_is_caught_up(5, 0, 5));
     assert!(!s3_is_caught_up(4, 0, 5));
+}
+
+/// A blob with fewer physical lines than the row's claimed span (the
+/// failover marker collapsed >= 2 lost lines) must ignore `since`.
+/// Equality (gapless blobs, or a marker standing in for exactly one
+/// line) keeps exact slicing — pinned by the existing roundtrip/offset
+/// tests via the new argument.
+// r[verify obs.log.gap-span]
+#[test]
+fn decompress_and_chunk_line_deficit_ignores_since() -> anyhow::Result<()> {
+    let zst = compress_lines(&[
+        "pfx-0",
+        "pfx-1",
+        "pfx-2",
+        "[rio: ~2 earlier lines lost across scheduler failover]",
+        "sfx-5",
+        "sfx-6",
+    ])?;
+    let chunks = decompress_and_chunk(&zst, "test", "exec-1", 0, 6, 7)?;
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(
+        chunks[0].lines.len(),
+        6,
+        "deficit -> full re-serve, never index-sliced"
+    );
+    assert_eq!(chunks[0].first_line_number, 0);
+    assert_eq!(chunks[0].lines[5], b"sfx-6");
+    Ok(())
+}
+
+/// A gap-merged blob (6 physical lines, true span 0..=6): `since_line > 0`
+/// is never sliced by physical index (full re-serve) and the caught-up
+/// short-circuit fires only at/past the TRUE end — pre-fix, since=6
+/// against this row was index-sliced to nothing and sfx-6 (true line 6)
+/// was silently lost.
+// r[verify obs.log.gap-span]
+#[tokio::test]
+async fn s3_gap_merged_blob_resumes_from_start_and_caught_up_uses_true_end() -> anyhow::Result<()> {
+    let db = TestDb::new(&crate::MIGRATOR).await;
+    // Physical blob: 6 lines. True span: 0..=6 (lines 3–4 lost to the gap).
+    let compressed = compress_lines(&[
+        "pfx-0",
+        "pfx-1",
+        "pfx-2",
+        "[rio: ~2 earlier lines lost across scheduler failover]",
+        "sfx-5",
+        "sfx-6",
+    ])?;
+    let exec_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO drv_logs
+             (exec_id, drv_hash, s3_key, first_line, line_count, is_complete, started_at)
+         VALUES ($1, 'gapmerged', $2, 0, 7, TRUE, now())",
+    )
+    .bind(exec_id)
+    .bind(format!("logs/gapmerged/{exec_id}.log.zst"))
+    .execute(&db.pool)
+    .await?;
+
+    let rule = mock!(S3Client::get_object).then_output(move || {
+        GetObjectOutput::builder()
+            .body(ByteStream::from(compressed.clone()))
+            .build()
+    });
+    let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&rule]);
+    let (svc, _actor, _task) = svc_with_db_and_s3(&db, s3);
+
+    // since_line=6: a client that tailed the live ring through true line 5.
+    let resp = svc
+        .get_derivation_logs(Request::new(GetDerivationLogsRequest {
+            derivation_path: "/nix/store/gapmerged-test.drv".into(),
+            exec_id: exec_id.to_string(),
+            since_line: 6,
+        }))
+        .await?;
+    let chunks = collect_stream(resp.into_inner()).await;
+    let lines: Vec<Vec<u8>> = chunks.iter().flat_map(|c| c.lines.clone()).collect();
+    assert_eq!(
+        lines.len(),
+        6,
+        "gap-merged blob is re-served in full, never index-sliced"
+    );
+    assert_eq!(
+        lines.last().unwrap().as_slice(),
+        b"sfx-6",
+        "the tail line must not be lost"
+    );
+    assert_eq!(
+        chunks[0].first_line_number, 0,
+        "re-serve starts at the blob's first line"
+    );
+    assert!(
+        chunks.last().unwrap().is_complete,
+        "final row -> terminal chunk"
+    );
+
+    // since_line=7 == true end: genuinely caught up -> single empty terminal chunk.
+    let resp = svc
+        .get_derivation_logs(Request::new(GetDerivationLogsRequest {
+            derivation_path: "/nix/store/gapmerged-test.drv".into(),
+            exec_id: exec_id.to_string(),
+            since_line: 7,
+        }))
+        .await?;
+    let chunks = collect_stream(resp.into_inner()).await;
+    assert_eq!(chunks.len(), 1);
+    assert!(chunks[0].lines.is_empty());
+    assert!(chunks[0].is_complete);
+    Ok(())
 }

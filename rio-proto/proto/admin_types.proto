@@ -108,7 +108,10 @@ message BuildInfo {
 message GetDerivationLogsRequest {
   string derivation_path = 1;            // Full path / basename / bare hash; drv_log_hash() normalizes
   string exec_id = 2;                    // Optional. Empty = latest (MAX(exec_id) for this drv)
-  uint64 since_line = 3;                 // Resume from this line number (0 = from start)
+  uint64 since_line = 3;                 // Resume from this line number (0 = from start).
+                                         // For stored logs that span a scheduler failover the
+                                         // server may re-send from the start; clients must
+                                         // tolerate receiving lines before since_line.
 }
 
 // Chunk of derivation log data streamed from scheduler.

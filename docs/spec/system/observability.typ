@@ -61,6 +61,31 @@ with a `[rio: ~N earlier lines lost across scheduler failover]` line;
 lines an interim leader received but never flushed are within the same
 30-second bound but their absence is not separately marked.
 
+#r("obs.log.gap-span")[
+  A `drv_logs` row whose blob folds a recovered pre-failover prefix MUST
+  describe the execution's true line-number span --- `first_line + line_count`
+  is one past the highest true worker line stored, with the lost range counted
+  even though the blob replaces it with a single marker line. A
+  `GetDerivationLogs` read with `since_line > 0` MUST NOT skip lines the
+  client has not received: when the stored blob's physical line count does not
+  match the row's claimed span, the server re-serves the blob from its start
+  unless the cursor is at or past the true end.
+]
+
+The marker collapses the lost range into one physical line, so blob index and
+true line number diverge once a marker stands in for two or more lines.
+Keeping the row's range in true line-number space keeps the `since_line`
+short-circuit and the next failover's prefix/gap computation honest; the read
+path detects the divergence by comparing the decoded blob's physical line
+count against the row's span, so gapless blobs (and a marker that replaced a
+single lost line) keep exact resume, and any mismatch is served in full ---
+bandwidth over silent loss. A client that derives its resume cursor from chunk
+labels will re-download such a blob on each poll until the row is finalized;
+no first-party client does (the CLI and dashboard both read from line 0).
+Per-chunk `first_line_number` labels inside a gap-merged blob remain
+physical-index based --- exact labels would need per-segment metadata, which
+no current client justifies.
+
 #r("obs.log.finalize-immutable")[
   Once an execution's `drv_logs` row has `is_complete = true`, its stored final
   blob and row content MUST NOT be overwritten or regressed by a later flush of

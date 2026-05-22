@@ -33,7 +33,9 @@
 //! [`RecoveredPrefix`]), drops any ring lines the stored copy supersedes,
 //! and folds the prefix into every subsequent flush of that execution so
 //! the periodic overwrite and the final blob keep covering output recorded
-//! by earlier tenures. An interior hole consisting of lines an interim
+//! by earlier tenures. A merged row's `first_line`/`line_count` stay in
+//! true line-number space (the gap is counted, the marker is not extra) —
+//! see `obs.log.gap-span`. An interior hole consisting of lines an interim
 //! leader received but never flushed remains a silent (unmarked) gap —
 //! unavoidable, and within the ≤30s periodic-flush budget.
 //!
@@ -768,12 +770,10 @@ impl LogFlusher {
         // UPSERT clause protects the row, and refusing the re-finalization
         // upload is the already-finalized gate's job in flush_final.
         //
-        // The stated end can undercount the blob's true line-number end
-        // when the blob carries an in-band gap marker (a known accounting
-        // skew). Safe here: batches arrive in order, so a ring that
-        // contiguously covers the stated range was streamed those lines
-        // directly and keeps receiving the remainder before any terminal
-        // flush; once the stated end is made exact this comment is moot.
+        // The stated end is the execution's true line-number end even for
+        // gap-merged blobs — `upload_and_record` keeps the row's range in
+        // true line-number space (`obs.log.gap-span`) — so this subsumption
+        // test and the caller's gap arithmetic operate on exact bounds.
         // r[impl obs.log.stored-coverage-preserved]
         let stored_end = first_line + line_count;
         let ring_contiguous = ring_last_line - ring_first_line + 1 == ring_line_count;
@@ -848,10 +848,9 @@ impl LogFlusher {
     /// the ring.
     ///
     /// The truncation threshold is the row's stated end
-    /// (`first_line + line_count`); when the stored blob contains an
-    /// in-band gap marker that stated end undercounts the true end (a
-    /// known, separately-tracked accounting skew), which can only make this
-    /// fold conservative (never lossy).
+    /// (`first_line + line_count`), which is the execution's true
+    /// line-number span even for gap-merged blobs (`obs.log.gap-span`),
+    /// so the threshold is exact.
     // r[impl obs.log.stored-coverage-preserved]
     async fn reconcile_stored_prefix(
         &self,
@@ -921,16 +920,23 @@ impl LogFlusher {
     /// `payload` carries the ring snapshot/drain plus, on any later tenure
     /// of the execution after a failover with a reconnecting worker, the
     /// recovered prior-tenure prefix ([`FlushPayload::recovered_prefix`]).
-    /// When the prefix is present the stored blob and the row's
-    /// `first_line`/`line_count`/`total_bytes` describe
-    /// prefix + (optional gap marker) + ring lines, so the `.partial`
-    /// overwrite is strictly coverage-growing and the final `.log.zst` +
-    /// `.partial` delete are safe again — including across A→B→A lease
-    /// flaps, where [`Self::reconcile_stored_prefix`] is what guarantees a
-    /// retained ring cannot un-cover what an interim leader stored. When a
-    /// final flush could not re-read a known stored prefix
-    /// ([`FlushPayload::preserve_partial`]) the `.partial` delete is
-    /// skipped — that blob is the prefix's only copy.
+    /// When the prefix is present the stored blob carries
+    /// prefix + (optional gap marker) + ring lines, while the row's
+    /// `first_line`/`line_count` describe the execution's TRUE
+    /// line-number span (the gap is counted, the marker is not extra —
+    /// `obs.log.gap-span`) and `total_bytes` stays physical. The
+    /// `.partial` overwrite is therefore strictly coverage-growing and the
+    /// final `.log.zst` + `.partial` delete are safe again — including
+    /// across A→B→A lease flaps, where [`Self::reconcile_stored_prefix`]
+    /// is what guarantees a retained ring cannot un-cover what an interim
+    /// leader stored. A worker that re-sent lines the stored row already
+    /// covers (excluded by the worker's resume-after-last-delivered
+    /// contract) now classifies as overlapping → no merge, suffix-only
+    /// snapshot — the understated end could previously have merged it
+    /// with a duplicated boundary line. When a final flush could not
+    /// re-read a known stored prefix ([`FlushPayload::preserve_partial`])
+    /// the `.partial` delete is skipped — that blob is the prefix's only
+    /// copy.
     ///
     /// `req.exec_id` keys the S3 blob and PG row. The actor pins it at
     /// terminal time for finals; the periodic flusher reads it from the
@@ -999,10 +1005,24 @@ impl LogFlusher {
         let s3_key = log_s3_key(&req.drv_path, &exec_id, !is_final);
 
         // Effective row metadata. With a recovered prefix the stored blob
-        // covers prefix + (optional gap marker) + ring lines; the marker is
-        // one synthetic line flagging the spec-accepted ≤30s window that
-        // was never flushed by the prior leader. Ranges that abut exactly
-        // (gap == 0) get no marker.
+        // covers prefix + (optional gap marker) + ring lines, but the row's
+        // (first_line, line_count) is kept in TRUE worker line-number
+        // space: the gap's lost lines are counted even though the blob
+        // replaces them with a single marker line, so `first_line +
+        // line_count` is one past the highest true line stored — the end
+        // `s3_is_caught_up` and the next failover's `lookup_stored_prefix`
+        // subsumption/gap arithmetic rely on. (Recording the physical
+        // count — prefix + marker + ring — understated the end by gap−1
+        // and made every further flap fold in a spurious "~1 earlier lines
+        // lost" marker.) `p.line_count` is the stored row's value, itself
+        // a true span for nested merges. The marker is one synthetic line
+        // flagging the spec-accepted ≤30s window that was never flushed by
+        // the prior leader; ranges that abut exactly (gap == 0) get no
+        // marker. `total_bytes` stays physical — it sizes the blob, not
+        // the span. The blob join assumes the flush payload is contiguous
+        // from `first_line` (today's ring drains/snapshots are); a future
+        // non-contiguous payload would have to revisit this block anyway.
+        // r[impl obs.log.gap-span]
         let prefix_lines_recovered = recovered_prefix.as_ref().map(|p| p.line_count);
         let (eff_first_line, eff_line_count, eff_total_bytes, gap_marker) = match &recovered_prefix
         {
@@ -1016,7 +1036,9 @@ impl LogFlusher {
                 let marker_len = marker.as_ref().map(|m| m.len() as u64).unwrap_or(0);
                 (
                     p.first_line,
-                    p.line_count + u64::from(marker.is_some()) + line_count,
+                    // True span: prefix span + gap + ring lines
+                    // (= ring end − prefix start), NOT prefix + marker + ring.
+                    p.line_count + gap + line_count,
                     p.total_bytes + marker_len + raw_bytes,
                     marker,
                 )
@@ -3507,6 +3529,143 @@ mod tests {
         exec_id
     }
 
+    /// Like [`mock_s3_capturing_with_get`] but GetObject returns the body of
+    /// the most recently captured PUT — chained failover tests need the next
+    /// leader's prefix fetch to read what the previous merge actually stored,
+    /// not a fixed fixture body.
+    fn mock_s3_capturing_serving_last_put() -> (S3Client, CapturedPuts, CapturedDeletes, GetCalls) {
+        use aws_sdk_s3::operation::get_object::GetObjectOutput;
+
+        let puts: CapturedPuts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let deletes: CapturedDeletes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gets: GetCalls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pcap = Arc::clone(&puts);
+        let dcap = Arc::clone(&deletes);
+        let gcap = Arc::clone(&gets);
+        let pserve = Arc::clone(&puts);
+
+        let put_rule = mock!(S3Client::put_object)
+            .match_requests(move |req| {
+                let key = req.key().unwrap_or("<no-key>").to_string();
+                let body_bytes = req
+                    .body()
+                    .bytes()
+                    .map(|b| b.to_vec())
+                    .unwrap_or_else(|| b"<streaming-body-not-introspectable>".to_vec());
+                pcap.lock().unwrap().push((key, body_bytes));
+                true
+            })
+            .then_output(|| PutObjectOutput::builder().build());
+        let del_rule = mock!(S3Client::delete_object)
+            .match_requests(move |req| {
+                dcap.lock()
+                    .unwrap()
+                    .push(req.key().unwrap_or("<no-key>").to_string());
+                true
+            })
+            .then_output(|| DeleteObjectOutput::builder().build());
+        let get_rule = mock!(S3Client::get_object)
+            .match_requests(move |_req| {
+                gcap.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                true
+            })
+            .then_output(move || {
+                let body = pserve
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .map(|(_, b)| b.clone())
+                    .unwrap_or_default();
+                GetObjectOutput::builder()
+                    .body(ByteStream::from(body))
+                    .build()
+            });
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[&put_rule, &del_rule, &get_rule]
+        );
+        (client, puts, deletes, gets)
+    }
+
+    /// Second failover for the same execution: the row the first merge wrote
+    /// is itself the next leader's recovered prefix. Its line_count covers
+    /// the TRUE span (0..7, gap counted), so a re-stream that abuts the true
+    /// end (line 7) merges with NO second marker. Pre-fix the first merge
+    /// recorded the physical count (6); this leg then computed gap = 7−6 = 1
+    /// and folded a spurious "[rio: ~1 earlier lines lost…]" marker per flap.
+    // r[verify obs.log.gap-span]
+    #[tokio::test]
+    async fn second_failover_merge_uses_true_span_of_stored_row() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, _deletes, gets) = mock_s3_capturing_serving_last_put();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r12gap1-second-failover.drv";
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+
+        // Leader A streams 0–2 and periodic-flushes; flap #1; leader B's
+        // recovery restamps an empty entry with the same exec.
+        let prefix: Vec<&[u8]> = vec![b"pfx-0", b"pfx-1", b"pfx-2"];
+        let exec_id = failover_restamp_after_periodic(&flusher, &buffers, drv_path, &prefix).await;
+
+        // Worker reconnects to B at line 5 (3–4 lost): merge #1.
+        buffers.push(&mk_batch(drv_path, 5, &[b"sfx-5", b"sfx-6"]));
+        flusher.flush_periodic().await;
+        let row: (i64, i64) =
+            sqlx::query_as("SELECT first_line, line_count FROM drv_logs WHERE exec_id = $1")
+                .bind(exec_id)
+                .fetch_one(&db.pool)
+                .await?;
+        assert_eq!(
+            (row.0, row.1),
+            (0, 7),
+            "merge #1 records the true span 0..7, not the 6 physical lines"
+        );
+
+        // Flap #2: the next leader restamps an empty entry again; the worker
+        // re-streams from line 7 — abutting the true end, nothing lost.
+        buffers.discard(drv_path);
+        buffers.set_exec(drv_path, exec_id, "test-worker");
+        buffers.push(&mk_batch(drv_path, 7, &[b"sfx-7"]));
+        flusher.flush_periodic().await;
+
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        let (_key, body) = captured.last().expect("merge #2 PUT");
+        let decoded = String::from_utf8(zstd::decode_all(&body[..])?)?;
+        assert_eq!(
+            decoded,
+            "pfx-0\npfx-1\npfx-2\n[rio: ~2 earlier lines lost across scheduler failover]\nsfx-5\nsfx-6\nsfx-7\n",
+            "abutting re-stream after a second failover must not add a spurious marker"
+        );
+        assert_eq!(
+            decoded.matches("[rio:").count(),
+            1,
+            "exactly the original marker"
+        );
+        let row: (i64, i64, bool) = sqlx::query_as(
+            "SELECT first_line, line_count, is_complete FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!((row.0, row.1), (0, 8), "true span grows 7 -> 8");
+        assert!(!row.2, "still a periodic snapshot");
+        assert_eq!(
+            gets.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one prefix fetch per post-failover merge"
+        );
+        Ok(())
+    }
+
     /// Periodic flush after a failover restamp + worker reconnect must
     /// fetch the ex-leader's stored `.partial` once and PUT a merged blob
     /// (prefix + gap marker + suffix) instead of overwriting the prefix
@@ -3569,7 +3728,7 @@ mod tests {
         .fetch_one(&db.pool)
         .await?;
         assert_eq!(row.0, 0, "row covers the merged range from line 0");
-        assert_eq!(row.1, 6, "3 prefix + 1 marker + 2 suffix");
+        assert_eq!(row.1, 7, "true span 0..7: 3 prefix + 2-line gap + 2 suffix");
         assert!(!row.2, "still a periodic snapshot");
         assert_eq!(
             gets.load(std::sync::atomic::Ordering::SeqCst),
@@ -3628,7 +3787,7 @@ mod tests {
         .fetch_one(&db.pool)
         .await?;
         assert_eq!(row.0, 0);
-        assert_eq!(row.1, 6);
+        assert_eq!(row.1, 7, "true span 0..7: 3 prefix + 2-line gap + 2 suffix");
         assert!(row.2, "final flush finalizes the row");
         assert_eq!(row.3.as_deref(), Some("succeeded"));
         // The merged final supersedes the .partial — deleting it is safe now.
@@ -3696,7 +3855,7 @@ mod tests {
         .fetch_one(&db.pool)
         .await?;
         assert_eq!(row.0, 0);
-        assert_eq!(row.1, 8, "3 prefix + 1 marker + 4 suffix");
+        assert_eq!(row.1, 9, "true span 0..9: 3 prefix + 2-line gap + 4 suffix");
         assert!(row.2);
         assert_eq!(
             gets.load(std::sync::atomic::Ordering::SeqCst),
@@ -3980,7 +4139,11 @@ mod tests {
                 .bind(exec_id)
                 .fetch_one(&db.pool)
                 .await?;
-        assert_eq!((row.0, row.1), (0, 5), "3 + 2, no marker slot");
+        assert_eq!(
+            (row.0, row.1),
+            (0, 5),
+            "3 + 2, no marker slot (abutting: span == physical)"
+        );
         assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 1);
         Ok(())
     }
