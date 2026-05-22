@@ -1305,13 +1305,20 @@ impl DagActor {
         // dead before its successor starts. It IS reused when the
         // kubelet restarts the container in place (same pod, same
         // `HOSTNAME`): while the Lease still names the pod, that
-        // successor renews (same transition count, same generation)
-        // and retains through this very own-claim-row match, exactly
-        // like the same-process blip. Only a REPLACED pod gets a new
-        // name, steals, bumps leaseTransitions, and derives a fresh
-        // generation that needs no self re-claim. (See
-        // `SchedulerDb::claim_generation`'s doc for the load-bearing
-        // premise.)
+        // successor renews at the same transition count. With no
+        // prior lease deletion it re-derives the same generation,
+        // ties the floor, and retains through this very own-claim-row
+        // match — like the same-process blip. In the saturated
+        // post-deletion regime its restarted in-memory counter
+        // re-derives transitions+1 BELOW the floor, so the floor-above
+        // arm bumps and waits for the post-claim confirmation instead
+        // (the modeled renewLease post-deletion crash/recover
+        // re-acquire, kept reachable in CI by the deletion-regime
+        // floor-bump witness check) — safe, just not a retain. Only a
+        // REPLACED pod gets a new name, steals, bumps
+        // leaseTransitions, and derives a fresh generation that needs
+        // no self re-claim. (See `SchedulerDb::claim_generation`'s doc
+        // for the load-bearing premise.)
         //
         // Does the (max) claims-ledger row sit at exactly `gen` and
         // belong to `holder`? The read-back guards the i64→u64 edge:
