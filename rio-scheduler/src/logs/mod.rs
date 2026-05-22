@@ -669,8 +669,9 @@ impl LogBuffers {
     ///
     /// Used by the flusher for entries it concludes are reapable orphan
     /// residue. `require_empty = true` callers — `flush_final`'s
-    /// out-of-tenure drop arm and its `finalize_guard_error` / `pre_drain`
-    /// post-await re-checks — hold no evidence about the stored row, so
+    /// out-of-tenure drop arm, its `finalize_guard_error` / `pre_drain`
+    /// post-await re-checks, and the periodic empty-snapshot reap in
+    /// `upload_and_record` — hold no evidence about the stored row, so
     /// they only ever remove the empty no-reaper shape.
     /// `require_empty = false` callers — the `already_finalized_refusal`
     /// post-await re-check and the periodic refused-UPSERT reap in

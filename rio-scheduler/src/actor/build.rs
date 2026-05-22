@@ -752,9 +752,13 @@ impl DagActor {
         // tenure-drop arm itself, while a sealed non-empty orphan whose
         // execution another tenure already finalized in drv_logs is reaped
         // by the periodic flush when its snapshot UPSERT is refused by the
-        // frozen row (the durable record supersedes it), and one never
-        // finalized anywhere keeps being snapshotted at `.partial`
-        // coverage until process restart.
+        // frozen row (the durable record supersedes it); one never
+        // finalized anywhere either keeps being snapshotted at `.partial`
+        // coverage until process restart, or — when the stored-coverage
+        // reconcile finds a prior tenure's row covering past the retained
+        // ring and empties it — is reaped by the periodic flush's
+        // sealed-empty empty-snapshot reap so reads fall through to that
+        // stored `.partial`.
         // r[impl obs.log.deferred-final-retry+3]
         let reaped_paths = self.dag.remove_build_interest_and_reap(build_id);
         if let Some(bufs) = &self.log_buffers {

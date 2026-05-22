@@ -170,9 +170,14 @@ discards the still-sealed entry on that refusal (the durable finalized record
 is authoritative and the retained lines are superseded by it), within one
 periodic tick of PG and leadership recovery. A sealed non-empty entry whose
 execution no tenure ever finalizes keeps being snapshotted at `.partial`
-coverage --- its ring lines are the best data available. Any other entry ---
-unsealed or restamped --- is left for its real owner: the live tenure's own
-final, the next dispatch discard, or process exit.
+coverage --- its ring lines are the best data available --- unless the
+per-tenure stored-coverage reconcile finds a prior tenure's row covering past
+the retained ring and empties it: an empty ring is never uploaded, so the
+refused-UPSERT chokepoint can no longer observe that entry, and the periodic
+flush instead reaps the sealed, now-empty entry at its empty-snapshot
+early-return so reads fall through to that stored `.partial`. Any other
+entry --- unsealed or restamped --- is left for its real owner: the live
+tenure's own final, the next dispatch discard, or process exit.
 The protection starts at enqueue: a final still queued behind earlier stalled
 flushes during the same outage is protected exactly like one already
 attempted and deferred, and stays pinned until the flusher resolves the
