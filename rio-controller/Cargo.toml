@@ -47,6 +47,7 @@ metrics = { workspace = true }
 # round-trip — see rio-migrations/src/migrations.rs M_059).
 sketches-ddsketch = { workspace = true }
 postcard = { workspace = true }
+hdrhistogram = { workspace = true }
 sqlx = { workspace = true }
 
 # --- Misc ---

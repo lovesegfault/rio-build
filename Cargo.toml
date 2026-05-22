@@ -161,6 +161,16 @@ lru = "0.18"
 # Short on-stack vecs (ADR-023 §13a `dispatched_cells` A' set, |A'|≤4
 # typical). Already transitive via tokio/dashmap (zero lockfile churn).
 smallvec = "1"
+# Lead-time/boot quantile sketches (ADR-023 §13b @alg-pool), persisted to
+# PG as version-tagged HdrHistogram V2 bytes — a specified, cross-language
+# format, unlike the serde shape of the crate it replaced. `serialization`
+# only: no `sync` (recording is single-threaded in the reconciler).
+# flate2/nom are already in the tree; hdrhistogram pins base64 ^0.21, so a
+# second base64 copy (0.21 next to our 0.22) rides along until upstream
+# bumps it — same situation as the lru 0.16/0.18 pair above.
+hdrhistogram = { version = "7", default-features = false, features = [
+  "serialization",
+] }
 # DDSketch lead-time/boot quantiles (ADR-023 §13b @alg-pool); persisted
 # to PG as bytea via postcard. `use_serde`: the sketch itself impls
 # Serialize so the on-the-wire shape is the crate's, not ours.

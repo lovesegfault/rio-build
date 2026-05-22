@@ -3232,7 +3232,28 @@
         "RustCrypto Developers"
       ]
     },
-    "base64": {
+    "base64 0.21.7": {
+      "crateName": "base64",
+      "version": "0.21.7",
+      "edition": "2018",
+      "sha256": "0rw52yvsk75kar9wgqfwgb414kvil1gn7mqkrhn9zf1537mpsacx",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "alloc",
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Alice Maz <alice@alicemaz.com>",
+        "Marshall Pierce <marshall@mpierce.org>"
+      ]
+    },
+    "base64 0.22.1": {
       "crateName": "base64",
       "version": "0.22.1",
       "edition": "2018",
@@ -11454,6 +11475,50 @@
         "lib"
       ]
     },
+    "hdrhistogram": {
+      "crateName": "hdrhistogram",
+      "version": "7.5.4",
+      "edition": "2018",
+      "sha256": "07ai0r66l1n53f2757gv07za1l5g1bprb7zz4v75kpbky6c92p3n",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "base64",
+          "packageId": "base64 0.21.7"
+        },
+        {
+          "name": "byteorder",
+          "packageId": "byteorder"
+        },
+        {
+          "name": "flate2",
+          "packageId": "flate2"
+        },
+        {
+          "name": "nom",
+          "packageId": "nom"
+        },
+        {
+          "name": "num-traits",
+          "packageId": "num-traits"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "base64",
+        "flate2",
+        "nom",
+        "serialization"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Jon Gjengset <jon@thesquareplanet.com>",
+        "Marshall Pierce <marshall@mpierce.org>"
+      ]
+    },
     "heapless": {
       "crateName": "heapless",
       "version": "0.8.0",
@@ -12189,7 +12254,7 @@
       "dependencies": [
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         },
         {
           "name": "bytes",
@@ -13420,7 +13485,7 @@
         },
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         },
         {
           "name": "getrandom",
@@ -13471,7 +13536,7 @@
       "dependencies": [
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         },
         {
           "name": "jiff",
@@ -13639,7 +13704,7 @@
       "dependencies": [
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         },
         {
           "name": "bytes",
@@ -14662,7 +14727,7 @@
       "dependencies": [
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         },
         {
           "name": "evmap",
@@ -15282,6 +15347,7 @@
       ],
       "resolvedDefaultFeatures": [
         "alloc",
+        "default",
         "std"
       ],
       "libCrateTypes": [
@@ -16586,7 +16652,7 @@
       "dependencies": [
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -18692,7 +18758,7 @@
       "dependencies": [
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         },
         {
           "name": "bytes",
@@ -18977,7 +19043,7 @@
         },
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         },
         {
           "name": "ed25519-dalek",
@@ -19335,7 +19401,7 @@
         },
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         },
         {
           "name": "config",
@@ -19474,6 +19540,10 @@
         {
           "name": "futures-util",
           "packageId": "futures-util"
+        },
+        {
+          "name": "hdrhistogram",
+          "packageId": "hdrhistogram"
         },
         {
           "name": "k8s-openapi",
@@ -19669,7 +19739,7 @@
         },
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         },
         {
           "name": "clap",
@@ -19940,7 +20010,7 @@
       "dependencies": [
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         },
         {
           "name": "ed25519-dalek",
@@ -20155,7 +20225,7 @@
         },
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         },
         {
           "name": "clap",
@@ -20440,7 +20510,7 @@
         },
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         },
         {
           "name": "blake3",
@@ -22343,7 +22413,7 @@
         },
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         },
         {
           "name": "encoding_rs_io",
@@ -23490,7 +23560,7 @@
       "dependencies": [
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         },
         {
           "name": "bytes",
@@ -23909,7 +23979,7 @@
         },
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         },
         {
           "name": "bitflags",
@@ -25427,7 +25497,7 @@
         },
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         },
         {
           "name": "bytes",
@@ -25714,7 +25784,7 @@
       "dependencies": [
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         },
         {
           "name": "bytes",
@@ -25856,7 +25926,7 @@
       "dependencies": [
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         },
         {
           "name": "bitflags",
@@ -28676,7 +28746,7 @@
         },
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         },
         {
           "name": "bitflags",
@@ -29259,7 +29329,7 @@
         },
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         },
         {
           "name": "bitflags",
@@ -29942,7 +30012,7 @@
         },
         {
           "name": "base64",
-          "packageId": "base64"
+          "packageId": "base64 0.22.1"
         },
         {
           "name": "clap",
