@@ -1484,7 +1484,11 @@ leadership transitions:
 + *Recovery flag cleared*: The lease acquire transition clears
   `recovery_complete` and fires a `LeaderAcquired` command to the actor
   (fire-and-forget via `tokio::spawn` --- lease renewal MUST NOT block on
-  recovery completing).
+  recovery completing). A still-leading renew round that observes a
+  `leaseTransitions` count different from the one recorded at the last
+  acquire edge or rebound is a holder change observed late: it re-records the
+  count, re-derives the generation, clears `recovery_complete`, and re-fires
+  `LeaderAcquired` without an acquire edge (#rref("sched.lease.rebound")).
 
 #r("sched.lease.non-blocking-acquire")[
   LeaderAcquired send is fire-and-forget via `tokio::spawn` --- blocking on
@@ -1586,13 +1590,16 @@ read counts as "not shown" and is likewise exceeded; the conservative cost is
 one burned generation and an idempotent re-dispatch of the holder's own
 in-flight work.
 
-#r("sched.recovery.bump-confirm")[
-  A claim target that exceeds the generation the recovery entered with MUST
-  NOT be seeded into the in-memory generation, and dispatch MUST NOT be
-  ungated at it, until this replica has completed an apiserver round-trip ---
-  initiated after the write-ahead claim step completed --- that ended with
-  this replica as the Lease holder; absent that confirmation the recovery
-  MUST be discarded.
+#r("sched.recovery.bump-confirm+2")[
+  A claim target that exceeds the generation the recovery entered with --- or
+  one that retains that entry generation while the durable PG floor, taken as
+  zero when no assignment or claim row exists at all, lies more than one
+  generation below it (the claims-and-assignments history then cannot vouch
+  for the generations in between) --- MUST NOT be seeded into the in-memory
+  generation, and dispatch MUST NOT be ungated at it, until this replica has
+  completed an apiserver round-trip --- initiated after the write-ahead claim
+  step completed --- that ended with this replica as the Lease holder; absent
+  that confirmation the recovery MUST be discarded.
 ]
 
 The PG floor cannot distinguish a dead predecessor's claim from a live
@@ -1605,23 +1612,43 @@ would compute a target one past the _live_ leader's
 it, inverting the executor fence (#rref("sched.lease.generation-fence")):
 every worker that heard the stale believer latches the higher generation and
 silently rejects the live leader's assignments for the rest of its term. The
-confirmation keeps apiserver I/O in the lease loop --- the recovery only
-observes the renew-round counters the loop publishes. It does not contradict
-the proceed-on-PG-failure rationale of #rref("sched.lease.generation-claim"):
-the wait applies only to bump-target (post-deletion) recoveries, ordinary
-failovers retain their entry generation and never wait, the wait is bounded by
-the lease loop's own renew/fence machinery, and a discarded recovery re-runs
-on the next acquire edge --- it does not reintroduce the
-indefinite-block-on-PG failure mode that rationale rejects. Residuals that
-remain: the deletion-ABA case documented at the recovery gate's entry-snapshot
-comment (a deletion plus enough in-window holder changes to return the
-recorded transition count to its entry value), the multi-deletion cousin where
-a foreign tenure both begins and is erased inside this replica's observation
-gap, and the below-entry variant that is reachable only as part of the
-claim-failure conjunction priced with the claim machinery above. Non-K8s
-single-scheduler deployments construct their leader state with recovery
-already complete and never run the lease loop, so no confirmation is ever
-required there.
+same inversion exists downward: a predecessor that died between its acquire
+edge and its claim INSERT leaves a derived-but-never-claimed generation with
+no durable trace, so the floor sits more than one generation below the next
+believer's entry value; a post-deletion successor seeds one past that stale
+floor --- _below_ the deposed believer's entry generation --- and without the
+wait the deposed believer completes at its higher retained generation and
+inverts the fence the same way. The confirmation keeps apiserver I/O in the
+lease loop --- the recovery only observes the renew-round counters the loop
+publishes. It does not contradict the proceed-on-PG-failure rationale of
+#rref("sched.lease.generation-claim"): the wait applies to bump targets and
+to retained entry generations the durable floor cannot vouch for; ordinary
+failovers --- whose entry generation the floor reaches to within one --- and
+same-epoch re-acquires --- where the floor ties the entry on this holder's
+own claim row --- never wait, the wait is bounded by the lease loop's own
+renew/fence machinery, and a discarded recovery re-runs on the next acquire
+edge --- it does not reintroduce the indefinite-block-on-PG failure mode that
+rationale rejects. (The rule keeps its historical `bump-confirm` name while
+also covering these non-bump retains; on the retain path the seed clause is
+an idempotent no-op and the operative prohibitions are dispatch-ungating and,
+via the sentinel of #rref("sched.lease.claim-before-advertise"), generation
+advertisement.) Residuals that remain: the count-coincidence ABA documented
+at the recovery gate's entry-snapshot comment --- an edge-ful re-steal, or a
+rebound (#rref("sched.lease.rebound")), whose observed transition count lands
+exactly back on the recorded value; in the rebound sub-case no command is
+queued, so the stale recovery persists until the next real leadership change
+or rebound; the claim-failure conjunction --- a term that proceeded unclaimed
+leaves no durable trace of its generation, so a Lease deletion after that
+term's confirmation still lets a successor seed below it; and the
+adjacent-floor race --- when the never-claimed gap is exactly one generation
+wide and the post-deletion successor's claim at the deposed believer's entry
+generation minus one lands _before_ that believer's floor read, the floor
+looks contiguous, no wait is required, and completing above the live
+successor additionally requires that believer's renew rounds to fail from the
+deletion through its recovery gate while staying under the self-fence
+deadline. Non-K8s single-scheduler deployments construct their leader state
+with recovery already complete and never run the lease loop, so no
+confirmation is ever required there.
 
 #r("sched.reconcile.leader-gate")[
   The post-recovery reconcile pass (`ReconcileAssignments`) MUST early-return
@@ -2442,6 +2469,40 @@ never emit the sentinel.
   before process exit. If `step_down()` fails (apiserver unreachable), the loop
   logs a warning and observed-record expiry is the fallback.
 ]
+
+#r("sched.lease.rebound")[
+  A renew round that resolves Leading while this replica already believes it
+  leads, but whose observed `leaseTransitions` count differs from the count
+  recorded at this replica's most recent acquire edge or rebound, MUST be
+  treated as a late-observed holder change: the lease loop MUST re-record the
+  observed count, re-derive the generation from it via `fetch_max`, clear
+  `recovery_complete`, and re-fire the acquire hook so recovery re-runs
+  against the post-change state; `is_leader` MUST NOT be cleared by this
+  transition.
+]
+
+The shapes this catches land entirely inside this replica's observation gap
+--- a foreign term that ended in a graceful vacate
+(#rref("sched.lease.graceful-release")), or a delete/recreate --- so neither
+an acquire nor a lose edge ever fires locally; one `kubectl delete lease`
+during a renew-blind window shorter than the self-fence deadline suffices.
+While this replica holds continuously, only a holder change or a
+delete/recreate can move `leaseTransitions` (renews never write it), and a
+foreign holder still present at the next successful round resolves
+Standby/Conflict through the existing lose edge --- so an unequal count on a
+still-leading round is always a genuine discontinuity, and the cost of acting
+on one is a single recovery re-run with dispatch gated during it. Only the
+acquire hook is re-fired: the consumer's lose/acquire hooks are independent
+fire-and-forget spawns, so a synthesized lose+acquire pair could reorder and
+a late `LeaderLost` would clear the freshly re-recovered state. The accepted
+residual is the count coincidence: an observed count that lands exactly back
+on the recorded value is indistinguishable from steady state --- the same
+coincidence pricing as the recovery gate's deletion-ABA note --- and in that
+shape no command is queued, so a recovery loaded across the foreign tenure
+persists until the next real leadership change or rebound. The scheduler's
+acquire-hook counter (#(refs.metric)("rio_scheduler_lease_acquired_total"))
+counts rebounds too; that is deliberate --- a rebound is operationally an
+acquisition-shaped event --- and no separate counter is added.
 
 #r("sched.health.shared-reporter+2")[
   The lease toggle calls `set_not_serving`/`set_serving` on the SAME

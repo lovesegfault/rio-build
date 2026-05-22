@@ -88,7 +88,11 @@ mod mbt_tests;
 pub trait LeaseHooks: Clone + Send + 'static {
     /// Called once per standby→leader transition, AFTER
     /// [`LeaderState::on_acquire`] has written the generation and set
-    /// `is_leader=true`.
+    /// `is_leader=true`. Also fired on a rebound — a holder change
+    /// observed late on a still-leading round, AFTER
+    /// [`LeaderState::on_rebound`] re-recorded the observed transition
+    /// count and cleared `recovery_complete` — so consumers MUST
+    /// tolerate a second call with no intervening [`on_lose`](Self::on_lose).
     fn on_acquire(&self);
     /// Called once per leader→standby transition (explicit lose OR local
     /// self-fence), AFTER [`LeaderState::on_lose`] has cleared `is_leader`
@@ -300,9 +304,10 @@ impl LeaseConfig {
 /// Shared leader state. The lease task writes; actor + health read.
 ///
 /// Four atomics — generation, acquired_transitions, is_leader,
-/// recovery_complete — updated together on acquire/lose transitions
-/// (acquired_transitions is written on acquire only; `on_lose`
-/// deliberately leaves it recording the last acquire edge). **All
+/// recovery_complete — updated together on acquire/lose/rebound
+/// transitions (acquired_transitions is written on acquire and on
+/// rebound; `on_lose` deliberately leaves it recording the last such
+/// edge). **All
 /// writes and reads use SeqCst** to prevent reordering on weak memory
 /// models (ARM). Previously is_leader/recovery_complete used Relaxed,
 /// which allowed a reader on ARM to see `recovery_complete=true`
@@ -312,8 +317,9 @@ impl LeaseConfig {
 /// sees all prior stores too.
 ///
 /// Transitions go through [`on_acquire`](Self::on_acquire) /
-/// [`on_lose`](Self::on_lose) rather than raw field stores — these
-/// encapsulate the multi-field update order.
+/// [`on_rebound`](Self::on_rebound) / [`on_lose`](Self::on_lose) rather
+/// than raw field stores — these encapsulate the multi-field update
+/// order.
 ///
 /// `Clone` is a cheap all-Arc clone; main.rs clones once for the
 /// lease loop, once for the actor, and uses the per-field accessors for
@@ -326,13 +332,14 @@ pub struct LeaderState {
     /// Arc, cloned).
     generation: Arc<AtomicU64>,
     /// The `leaseTransitions` count observed at the most recent acquire
-    /// edge. Unlike `generation` (a `fetch_max` that the PG-floor seed
-    /// can saturate into a no-op), this is stored unconditionally on
-    /// every [`on_acquire`](Self::on_acquire) — it is the holder-change
+    /// edge or rebound. Unlike `generation` (a `fetch_max` that the
+    /// PG-floor seed can saturate into a no-op), this is stored
+    /// unconditionally on every [`on_acquire`](Self::on_acquire) and
+    /// every [`on_rebound`](Self::on_rebound) — it is the holder-change
     /// signal the recovery TOCTOU gate compares when the generation
     /// cannot move. Only meaningful after the first acquire; `on_lose`
-    /// does not touch it (it records the last acquire edge — the gate
-    /// compares acquire edges, not the current lease state).
+    /// does not touch it (it records the last acquire edge or rebound —
+    /// the gate compares those edges, not the current lease state).
     acquired_transitions: Arc<AtomicU64>,
     /// Whether we currently hold the lease. dispatch_ready early-
     /// returns if false (standby schedulers merge DAGs but don't
@@ -354,8 +361,9 @@ pub struct LeaderState {
     /// ([`begin_renew_round`](Self::begin_renew_round)). Paired with
     /// `last_leading_round` so the actor's recovery can require a
     /// post-claim apiserver round-trip that ended with this replica as
-    /// the Lease holder before seeding a generation above its entry
-    /// value (`sched.recovery.bump-confirm`). A confirmed round began
+    /// the Lease holder before completing a recovery whose claim target
+    /// the durable PG floor cannot vouch for
+    /// (`sched.recovery.bump-confirm`). A confirmed round began
     /// strictly after every event that preceded its `begin_renew_round`
     /// call. Non-K8s/`always_leader` deployments never run the lease
     /// loop, so both counters legitimately stay 0 there — the actor's
@@ -418,12 +426,14 @@ impl LeaderState {
     }
 
     /// The `leaseTransitions` count recorded by the most recent
-    /// [`on_acquire`](Self::on_acquire). `SeqCst` load — same
+    /// [`on_acquire`](Self::on_acquire) or
+    /// [`on_rebound`](Self::on_rebound). `SeqCst` load — same
     /// discipline as [`is_leader`](Self::is_leader) /
     /// [`recovery_complete`](Self::recovery_complete). Changes on every
-    /// acquire that follows a holder change, even when the generation
-    /// `fetch_max` is a no-op (the saturated post-lease-deletion
-    /// regime) — which is exactly what the recovery TOCTOU gate needs.
+    /// acquire edge or rebound that follows a holder change, even when
+    /// the generation `fetch_max` is a no-op (the saturated
+    /// post-lease-deletion regime) — which is exactly what the recovery
+    /// TOCTOU gate needs.
     pub fn acquired_transitions(&self) -> u64 {
         self.acquired_transitions.load(Ordering::SeqCst)
     }
@@ -605,6 +615,12 @@ impl LeaderState {
     /// reader seeing is_leader=true (SeqCst load) sees the new
     /// generation and the new transition count. recovery_complete is NOT
     /// set here — that's the actor's job after recover_from_pg finishes.
+    ///
+    /// A holder change observed only after we are already Leading again
+    /// (no standby interval ever observed locally) goes through
+    /// [`on_rebound`](Self::on_rebound) instead — same count recording
+    /// and generation derivation, different `recovery_complete`
+    /// handling.
     // r[impl sched.lease.generation-fence+2]
     pub fn on_acquire(&self, lease_transitions: u64) -> u64 {
         let target = lease_transitions.saturating_add(1);
@@ -627,6 +643,54 @@ impl LeaderState {
         new_gen
     }
 
+    /// Rebound transition: a holder change observed late, on a
+    /// still-leading round. The lease loop calls this when a round
+    /// resolves `Leading` while we already believe we lead but the
+    /// observed `leaseTransitions` count differs from the recorded one —
+    /// a foreign term (or a delete/recreate) began and ended entirely
+    /// inside our observation gap, so neither an acquire nor a lose edge
+    /// ever fired locally. Returns the new generation.
+    ///
+    /// Store order differs from [`on_acquire`](Self::on_acquire), and it
+    /// is load-bearing: `recovery_complete` is cleared FIRST, then the
+    /// transition count is recorded, then the generation `fetch_max`
+    /// runs. Every path into an acquire edge already has
+    /// `recovery_complete` false (`pending()`, the lose arm, the
+    /// self-fence), so `on_acquire` can never raise the generation while
+    /// the flag is true — a rebound is the first writer that could.
+    /// Clearing the flag first means a heartbeat reader cannot pair a
+    /// still-true flag with the rebound-raised generation, except in the
+    /// already-accepted two-load-straddle case documented at the
+    /// scheduler's `advertised()` — preserving
+    /// `sched.lease.claim-before-advertise`.
+    ///
+    /// `is_leader` is NOT touched: we hold the Lease at this
+    /// observation, there is no moment of believed non-leadership to
+    /// publish (and no lose hook fires — see the loop arm).
+    /// `became_leader_at` IS reset: the foreign tenure may have shuffled
+    /// workers, so restarting `leader_for()` (read by `leader_for_secs`
+    /// and the controller's `orphan_reap_gate`) re-closes the
+    /// fail-closed grace window — the conservative direction.
+    ///
+    /// The count coincidence — an observed value that lands exactly back
+    /// on the recorded one — is undetectable here by construction; that
+    /// residual is priced at the recovery gate's entry-snapshot comment
+    /// in rio-scheduler.
+    // r[impl sched.lease.rebound]
+    // r[impl sched.lease.generation-fence+2]
+    pub fn on_rebound(&self, lease_transitions: u64) -> u64 {
+        self.recovery_complete.store(false, Ordering::SeqCst);
+        self.acquired_transitions
+            .store(lease_transitions, Ordering::SeqCst);
+        let target = lease_transitions.saturating_add(1);
+        let new_gen = self
+            .generation
+            .fetch_max(target, Ordering::SeqCst)
+            .max(target);
+        *self.became_leader_at.write() = Some(Instant::now());
+        new_gen
+    }
+
     /// Lose transition: clear is_leader, clear recovery_complete.
     ///
     /// SeqCst on both stores: is_leader=false happens-before
@@ -636,8 +700,8 @@ impl LeaderState {
     /// from the lease's transition count on acquire; we don't know
     /// (and don't need to know) what that will be.
     /// `acquired_transitions` is NOT touched either — it records the
-    /// last acquire edge, and the recovery TOCTOU gate compares acquire
-    /// edges, not the current lease state.
+    /// last acquire edge or rebound, and the recovery TOCTOU gate
+    /// compares those edges, not the current lease state.
     pub fn on_lose(&self) {
         self.is_leader.store(false, Ordering::SeqCst);
         self.recovery_complete.store(false, Ordering::SeqCst);
@@ -665,6 +729,12 @@ impl LeaderState {
 ///   DON'T touch the generation — the NEW leader's steal bumps the
 ///   lease's transition count, which is where generations come from.
 ///   We don't know the new gen.
+/// - On a rebound (still leading, but the observed `leaseTransitions`
+///   count differs from the recorded one — a holder change landed
+///   entirely inside our observation gap): re-record the count,
+///   re-derive the generation, clear `recovery_complete`, and re-fire
+///   the on-acquire hook so the consumer re-runs recovery. No lose
+///   hook fires (`sched.lease.rebound`).
 ///
 /// On K8s API error (apiserver restarting, network blip): log
 /// warn and retry next tick. Don't crash — a transient API hiccup
@@ -913,14 +983,55 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         );
                         owe_cost_clear = false;
                     }
-                    // Steady state: still leading and renewed, or
-                    // still standby while someone else holds. No log
-                    // — 5s interval would be noisy.
-                    (Some(_), true) | (None, false) => {}
+                    (Some(transitions), true) => {
+                        // ---- Still leading ----
+                        // Steady state is transitions == the count
+                        // recorded at our last acquire edge or rebound:
+                        // renews never bump the count, and a foreign
+                        // holder still present at our next successful
+                        // round resolves through the lose edge instead —
+                        // so an unequal value here means a holder change
+                        // (foreign term + vacate, or delete/recreate)
+                        // landed entirely inside our observation gap.
+                        // Synthesize the missing transition: re-derive
+                        // local state and re-fire the acquire hook so
+                        // the consumer re-runs recovery against the
+                        // post-term state. Deliberately NO on_lose():
+                        // the consumer's lose/acquire hooks spawn
+                        // independently, so a synthesized pair could
+                        // reorder and a late LeaderLost would wipe the
+                        // freshly re-recovered state. No
+                        // spawn_patch_deletion_cost either — the cost
+                        // annotation is already 1 from the original
+                        // acquire. The count-coincidence ABA (the
+                        // observed value lands back exactly on the
+                        // recorded one) remains the accepted residual —
+                        // see the recovery gate's entry-snapshot comment
+                        // in rio-scheduler. Equal counts stay a silent
+                        // no-op (a log every 5s would be noisy).
+                        // r[impl sched.lease.rebound]
+                        let recorded = state.acquired_transitions();
+                        if transitions != recorded {
+                            let new_gen = state.on_rebound(transitions);
+                            warn!(
+                                recorded,
+                                observed = transitions,
+                                generation = new_gen,
+                                holder = %cfg.holder_id,
+                                "lease transition count moved while still leading — \
+                                 unobserved holder change inside our observation gap; \
+                                 re-running recovery"
+                            );
+                            hooks.on_acquire();
+                        }
+                    }
+                    // Steady state: still standby while someone else
+                    // holds. No log — 5s interval would be noisy.
+                    (None, false) => {}
                 }
 
                 was_leading = now_leading;
-                // r[impl sched.recovery.bump-confirm]
+                // r[impl sched.recovery.bump-confirm+2]
                 // Confirm AFTER the edge-detection match: when an
                 // acquire edge and a confirmation land in the same
                 // round, on_acquire's stores are already visible by
@@ -1260,7 +1371,7 @@ mod tests {
     /// Confirmation-round bookkeeping: round ids increase per
     /// `begin_renew_round`, confirming records the round, and a stale
     /// (lower) confirmation never regresses `last_leading_round`.
-    // r[verify sched.recovery.bump-confirm]
+    // r[verify sched.recovery.bump-confirm+2]
     #[test]
     fn confirmation_rounds_are_monotone() {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
@@ -1318,6 +1429,48 @@ mod tests {
             2,
             "same transition count re-recorded verbatim"
         );
+    }
+
+    /// `on_rebound` — the holder-change-observed-late transition: it
+    /// re-records the observed transition count, re-derives the
+    /// generation via `fetch_max` (a no-op in the saturated regime),
+    /// clears `recovery_complete` so recovery re-runs, refreshes
+    /// `leader_for()`, and never touches `is_leader`.
+    // r[verify sched.lease.rebound]
+    #[test]
+    fn on_rebound_records_count_and_reruns_recovery() {
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        state.on_acquire(2); // gen 3, recorded transitions 2
+        state.set_recovery_complete();
+
+        let new_gen = state.on_rebound(4);
+        assert_eq!(new_gen, 5, "generation re-derives from the observed count");
+        assert_eq!(state.generation(), 5);
+        assert_eq!(
+            state.acquired_transitions(),
+            4,
+            "the observed count is re-recorded"
+        );
+        assert!(
+            !state.recovery_complete(),
+            "a rebound clears recovery_complete so recovery re-runs"
+        );
+        assert!(state.is_leader(), "a rebound is not a loss of leadership");
+        assert!(
+            state.leader_for().is_some(),
+            "leader_for refreshes rather than clears"
+        );
+
+        // Saturated regime: the PG-floor seed already raised the
+        // generation past anything the count derives — the fetch_max is
+        // a no-op but the count and the recovery flag still move.
+        state.seed_generation_from(10);
+        state.set_recovery_complete();
+        let saturated_gen = state.on_rebound(6);
+        assert_eq!(saturated_gen, 10, "saturated regime: generation unchanged");
+        assert_eq!(state.acquired_transitions(), 6);
+        assert!(!state.recovery_complete());
+        assert!(state.is_leader());
     }
 
     // ---- Renewal timeout + self-fence (remediation 08) -----------
@@ -1678,7 +1831,7 @@ mod tests {
     /// confirmation from a round that began before its claim, or from a
     /// round that did not end with us holding the Lease). Drives the
     /// real loop against the mock apiserver under a paused clock.
-    // r[verify sched.recovery.bump-confirm]
+    // r[verify sched.recovery.bump-confirm+2]
     #[tokio::test(start_paused = true)]
     async fn leading_rounds_confirm_failed_rounds_do_not() {
         let (client, mock) = MockApiServer::new();
@@ -1752,7 +1905,7 @@ mod tests {
     /// are never confirmed: `last_leading_round` only ever names rounds
     /// in which WE were the holder, which is exactly the evidence the
     /// scheduler's bump-confirmation consumes.
-    // r[verify sched.recovery.bump-confirm]
+    // r[verify sched.recovery.bump-confirm+2]
     #[tokio::test(start_paused = true)]
     async fn standby_rounds_never_confirm() {
         let (client, mock) = MockApiServer::new();
@@ -1805,6 +1958,146 @@ mod tests {
             0,
             "standby rounds must never be confirmed"
         );
+
+        shutdown.cancel();
+        loop_task.await.expect("lease loop task exits cleanly");
+    }
+
+    /// A holder change that lands entirely inside this replica's
+    /// observation gap — a foreign term that ended in a graceful vacate,
+    /// or a delete/recreate — produces no acquire or lose edge: the next
+    /// successful round resolves `Leading` while `was_leading` is already
+    /// true. The loop must treat the moved `leaseTransitions` count as a
+    /// late-observed holder change (a "rebound"): re-record the count,
+    /// re-derive the generation, clear `recovery_complete`, and re-fire
+    /// the acquire hook so the consumer re-runs recovery against the
+    /// post-change state — without ever firing the lose hook. A renew
+    /// that observes the SAME count must not rebound (steady state); a
+    /// delete/recreate whose count lands back exactly on the recorded
+    /// value is equally undetectable — that count coincidence is the
+    /// accepted residual (see the recovery gate's entry-snapshot comment
+    /// in rio-scheduler).
+    // r[verify sched.lease.rebound]
+    #[tokio::test(start_paused = true)]
+    async fn still_leading_rounds_rebound_on_moved_transition_count() {
+        let (client, mock) = MockApiServer::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+        ));
+
+        // t=0: the immediate first tick creates the Lease (creator:
+        // transitions 0) and acquires. Emulate the actor finishing its
+        // recovery so the rebound's clear is observable.
+        settle().await;
+        assert!(state.is_leader(), "healthy first tick acquires");
+        assert_eq!(state.acquired_transitions(), 0, "creator records 0");
+        state.set_recovery_complete();
+
+        // A healthy renew that observes the same transition count must
+        // NOT rebound — the steady state. (A delete/recreate whose count
+        // lands back exactly on the recorded value is indistinguishable
+        // from this arm; that coincidence is the accepted residual.)
+        tokio::time::advance(RENEW_INTERVAL).await; // +5s
+        settle().await;
+        assert_eq!(
+            hooks.acquires.lock().expect("acquires lock").len(),
+            1,
+            "a renew with an unchanged count must not re-fire the acquire hook"
+        );
+        assert!(
+            state.recovery_complete(),
+            "a renew with an unchanged count must not clear recovery_complete"
+        );
+
+        // Out of band: a foreign term ran and gracefully vacated inside
+        // our observation gap — the Lease now has an empty holder and a
+        // moved resourceVersion; the count our next steal derives will
+        // differ from the recorded one.
+        mock.seed(json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": "rio-sched",
+                "namespace": "default",
+                "resourceVersion": "50",
+            },
+            "spec": {
+                "holderIdentity": null,
+                "leaseTransitions": 0,
+                "leaseDurationSeconds": 15,
+            },
+        }));
+
+        // The next tick GETs an empty holder and steals it back
+        // (transitions 0 → 1) while `was_leading` is still true: the
+        // rebound path.
+        tokio::time::advance(RENEW_INTERVAL).await; // +10s
+        settle().await;
+        assert_eq!(
+            state.acquired_transitions(),
+            1,
+            "the rebound re-records the observed transition count"
+        );
+        assert_eq!(
+            state.generation(),
+            2,
+            "the generation re-derives from the observed count"
+        );
+        assert!(
+            !state.recovery_complete(),
+            "the rebound clears recovery_complete so recovery re-runs"
+        );
+        assert!(state.is_leader(), "a rebound never clears is_leader");
+        {
+            let acquires = hooks.acquires.lock().expect("acquires lock");
+            let loses = hooks.loses.lock().expect("loses lock");
+            assert_eq!(acquires.len(), 2, "the rebound re-fires the acquire hook");
+            assert_eq!(loses.len(), 0, "the rebound must not fire the lose hook");
+        }
+
+        // The 404-recreate cousin: an operator deletes the Lease
+        // outright; our next tick re-creates it at transitions 0 — a
+        // second rebound (0 differs from the recorded 1).
+        state.set_recovery_complete();
+        assert!(mock.clear(), "lease deleted out of band");
+        tokio::time::advance(RENEW_INTERVAL).await; // +15s
+        settle().await;
+        assert_eq!(
+            state.acquired_transitions(),
+            0,
+            "the recreate's transition count is re-recorded"
+        );
+        assert_eq!(
+            state.generation(),
+            2,
+            "the generation never regresses (fetch_max)"
+        );
+        assert!(
+            !state.recovery_complete(),
+            "the 404-recreate rebound re-runs recovery"
+        );
+        {
+            let acquires = hooks.acquires.lock().expect("acquires lock");
+            let loses = hooks.loses.lock().expect("loses lock");
+            assert_eq!(
+                acquires.len(),
+                3,
+                "the 404-recreate rebound re-fires the acquire hook"
+            );
+            assert_eq!(loses.len(), 0, "still no lose edge");
+        }
 
         shutdown.cancel();
         loop_task.await.expect("lease loop task exits cleanly");

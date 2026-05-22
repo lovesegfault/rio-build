@@ -1093,10 +1093,12 @@ pub(crate) async fn setup_with_big_ceilings() -> (TestDb, ActorHandle, tokio::ta
 /// Background driver for `LeaderState` confirmation rounds:
 /// `begin_renew_round` + `confirm_leading_round` every ~50ms, simulating
 /// a healthy lease loop that keeps completing Leading rounds. Recoveries
-/// whose claim target exceeds the entry generation wait for one
-/// post-claim confirmed round before seeding
+/// whose claim target the durable PG floor cannot vouch for — a target
+/// above the entry generation, or a retained entry generation more than
+/// one above the floor (or above an empty floor) — wait for one
+/// post-claim confirmed round before completing
 /// (`sched.recovery.bump-confirm`); tests that drive `LeaderAcquired` by
-/// hand on a bump-shaped PG state need this running or they would wait
+/// hand on such a PG state need this running or they would wait
 /// out the confirmation cap and discard. The returned guard aborts the
 /// task on drop.
 pub(crate) struct ConfirmationLoop(tokio::task::JoinHandle<()>);
@@ -1135,8 +1137,9 @@ pub(crate) struct RecoveryFixture {
     /// Keeps the phase-2 confirmation loop alive for the fixture's
     /// lifetime (aborts on drop). Phase-1 dispatches leave assignment
     /// rows at the entry generation with no claim row, which makes the
-    /// phase-2 recovery a bump target that waits for a post-claim
-    /// Leading round (`sched.recovery.bump-confirm`).
+    /// phase-2 recovery a claim target the floor cannot vouch for as
+    /// its own — it waits for a post-claim Leading round
+    /// (`sched.recovery.bump-confirm`).
     pub _confirmations: ConfirmationLoop,
     pub _task: tokio::task::JoinHandle<()>,
 }

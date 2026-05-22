@@ -115,8 +115,8 @@
 //               seed_generation_from() + claim_generation() collapsed
 //               into one atomic step (sound: recovery_complete gates
 //               dispatch until the seed AND the claim have both run,
-//               and a seed above the entry generation additionally
-//               requires a post-claim Leading round --
+//               and a claim target the durable PG floor cannot vouch
+//               for additionally requires a post-claim Leading round --
 //               sched.recovery.bump-confirm; see the steal action doc)
 //   renewLease  decide()->Renew + replace(renew) + the acquire arm's
 //               on_acquire(trans) with the UN-bumped count: restores
@@ -808,17 +808,32 @@ module leaderElection {
   /// a recovery that observed the post-change state completes -- even
   /// when the PG-seeded generation makes on_acquire's fetch_max a
   /// no-op. A holder change the loop has NOT yet observed moves none of
-  /// those signals; for that case a target above the entry generation
-  /// is additionally not seeded without a post-claim round-trip that
-  /// ended with this replica as the Lease holder
-  /// (sched.recovery.bump-confirm), so a deposed-but-unaware believer
-  /// cannot COMPLETE recovery above a live successor. Residuals, all
-  /// priced where they are accepted: the deletion ABA documented at the
-  /// gate's entry-snapshot comment in handle_leader_acquired (it adds
-  /// no dispatch interleaving beyond what that acceptance already
-  /// covers); the multi-deletion variant where a foreign tenure begins
-  /// and is erased entirely inside the observation gap; and the
-  /// claim-failure conjunction documented with the PgFaults regime.
+  /// those signals at the time; the next still-leading round that
+  /// observes the moved transition count re-records it, clears
+  /// recovery_complete, and re-fires the acquire hook
+  /// (sched.lease.rebound), so a foreign tenure that began and ended
+  /// inside the observation gap re-runs recovery unless its count lands
+  /// back exactly on the recorded value. For the recovery still in
+  /// flight, a claim target the durable PG floor cannot vouch for --
+  /// above the entry generation, or a retained entry generation more
+  /// than one above the floor -- is additionally not seeded without a
+  /// post-claim round-trip that ended with this replica as the Lease
+  /// holder (sched.recovery.bump-confirm), so a deposed-but-unaware
+  /// believer cannot COMPLETE recovery above a live successor when the
+  /// durable history exposes the gap. The acquire-to-claim crash window
+  /// (a leader that consumed a transition count but died before its
+  /// claim INSERT) is real in the implementation and unrepresentable
+  /// here precisely because this step collapses acquire/seed/claim;
+  /// the non-vouched-retain confirmation is what covers it. Residuals,
+  /// all priced where they are accepted: the count-coincidence ABA
+  /// documented at the gate's entry-snapshot comment in
+  /// handle_leader_acquired (an edge-ful re-steal, or a rebound, whose
+  /// observed count lands back on the recorded value -- it adds no
+  /// dispatch interleaving beyond what that acceptance already covers);
+  /// the claim-failure conjunction documented with the PgFaults regime;
+  /// and the adjacent-floor race, where the successor's claim at the
+  /// believer's entry generation minus one lands before the believer's
+  /// floor read and the floor looks contiguous.
   action steal(n: Node): bool = {
     val target = if (lease.gen + 2 > genHW + 1) lease.gen + 2 else genHW + 1
     val seeded = if (gen.get(n) > target) gen.get(n) else target

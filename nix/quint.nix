@@ -293,8 +293,10 @@ in
     # acquisition time). The model collapses acquire/seed/claim into one
     # atomic step; the unobserved-holder-change window that collapse
     # hides is discharged at the implementation level by
-    # sched.recovery.bump-confirm (a seed above the entry generation
-    # requires a post-claim Leading round) -- see the steal action doc.
+    # sched.recovery.bump-confirm (a claim target the durable floor
+    # cannot vouch for requires a post-claim Leading round) and by
+    # sched.lease.rebound (a still-leading round that observes a moved
+    # transition count re-runs recovery) -- see the steal action doc.
     #
     # The state count, depth, and wall-clock are in this check's output
     # transcript and in the commit that introduced (or last re-measured)

@@ -38,7 +38,10 @@ impl rio_scheduler::lease::LeaseHooks for SchedulerLeaseHooks {
         // scenario polls this to confirm the lease loop actually
         // acquired (vs silently failing kube-client init and running
         // standby forever). The info! log has the same signal but
-        // metrics are less brittle for VM grep.
+        // metrics are less brittle for VM grep. Also fired on a rebound
+        // (a holder change observed late on a still-leading round —
+        // `sched.lease.rebound`), so this counter counts rebounds too;
+        // deliberate, no separate counter.
         metrics::counter!("rio_scheduler_lease_acquired_total").increment(1);
         let actor = self.actor.clone();
         tokio::spawn(async move {

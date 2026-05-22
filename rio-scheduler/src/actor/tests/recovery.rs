@@ -1416,7 +1416,7 @@ async fn test_recovery_assignment_and_own_claim_at_our_generation_retains() -> T
 /// claim path ran) and no confirmation ever arrives — the recovery must
 /// be discarded, never seeded. The leftover (13, 'pod-us') claim row is
 /// the documented harmless over-claim and is deliberately not asserted.
-// r[verify sched.recovery.bump-confirm]
+// r[verify sched.recovery.bump-confirm+2]
 #[tokio::test]
 async fn test_recovery_unconfirmed_bump_above_live_holder_is_discarded() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1482,7 +1482,7 @@ async fn test_recovery_unconfirmed_bump_above_live_holder_is_discarded() -> Test
 /// completes. Pairs with
 /// `test_recovery_unconfirmed_bump_above_live_holder_is_discarded` to
 /// pin both directions of the confirmation gate.
-// r[verify sched.recovery.bump-confirm]
+// r[verify sched.recovery.bump-confirm+2]
 #[tokio::test]
 async fn test_recovery_confirmed_bump_seeds_and_completes() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1545,6 +1545,198 @@ async fn test_recovery_confirmed_bump_seeds_and_completes() -> TestResult {
     Ok(())
 }
 
+/// A deposed-but-unaware leader must not complete a gap-retain recovery
+/// either: when the durable floor sits more than one generation below
+/// the entry generation (a predecessor died between its acquire edge
+/// and its claim INSERT), the floor cannot vouch for the generations in
+/// between -- a post-deletion successor may be live inside that gap,
+/// below us. Retaining the entry generation therefore requires the same
+/// post-claim tenure confirmation a bump target requires; with no
+/// confirmation the recovery must be discarded, never completed. The
+/// leftover (6, 'pod-us') claim row is the documented harmless
+/// over-claim (it forces the next term above 6) and is deliberately not
+/// asserted, same as the bump-discard test above.
+// r[verify sched.recovery.bump-confirm+2]
+#[tokio::test]
+async fn test_recovery_unconfirmed_gap_retain_below_entry_is_discarded() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    // The last claimed generation is 4; generation 5 (a crashed,
+    // never-claimed predecessor) and our entry 6 left no durable trace.
+    sqlx::query(
+        "INSERT INTO leader_generation_claims (generation, holder_id) VALUES (4, 'old-term')",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    let generation = Arc::new(AtomicU64::new(6));
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::clone(&generation),
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let l = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = l;
+        p.holder_id = "pod-us".into();
+        p.recovery_toctou_gate = Some((reached_tx, release_rx));
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    tokio::time::timeout(Duration::from_secs(10), reached_rx)
+        .await
+        .expect("actor reached gate")
+        .expect("reached_tx not dropped");
+    release_tx.send(()).expect("actor still listening");
+
+    // No lease loop is running, so no confirmation can ever arrive. The
+    // completion must never land -- on the unconfirmed-retain regression
+    // it lands within the first few polls.
+    for _ in 0..20 {
+        assert!(
+            !leader.recovery_complete(),
+            "an unconfirmed gap-retain recovery must never complete"
+        );
+        assert_eq!(
+            generation.load(Ordering::Acquire),
+            6,
+            "the generation must stay at the entry value"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The deposal observation that in production arrives within a renew
+    // interval: the lose edge ends the wait and the gate discards.
+    leader.on_lose();
+    barrier(&handle).await;
+
+    assert!(
+        !leader.recovery_complete(),
+        "an unconfirmed gap-retain recovery must be discarded, not completed"
+    );
+    assert_eq!(
+        generation.load(Ordering::Acquire),
+        6,
+        "the generation must still be the entry generation after the discard"
+    );
+    Ok(())
+}
+
+/// The legitimate gap-retain still works: a predecessor that died
+/// between its acquire edge and its claim INSERT leaves a non-adjacent
+/// floor with nobody live inside the gap -- once the lease loop
+/// completes a post-claim Leading round, the recovery retains the entry
+/// generation, claims it, and completes. Pairs with
+/// `test_recovery_unconfirmed_gap_retain_below_entry_is_discarded` to
+/// pin both directions of the gap-retain trigger.
+// r[verify sched.recovery.bump-confirm+2]
+#[tokio::test]
+async fn test_recovery_gap_retain_with_confirmation_completes() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    sqlx::query(
+        "INSERT INTO leader_generation_claims (generation, holder_id) VALUES (4, 'old-term')",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    let generation = Arc::new(AtomicU64::new(6));
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::clone(&generation),
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let l = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = l;
+        p.holder_id = "pod-us".into();
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    assert!(
+        leader.recovery_complete(),
+        "a confirmed gap-retain recovery completes"
+    );
+    assert_eq!(
+        generation.load(Ordering::Acquire),
+        6,
+        "the entry generation is retained, not bumped"
+    );
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT generation, holder_id FROM leader_generation_claims ORDER BY generation",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(
+        rows,
+        vec![(4, "old-term".to_string()), (6, "pod-us".to_string())],
+        "the retained generation is claimed; the gap stays unclaimed"
+    );
+    Ok(())
+}
+
+/// The trigger boundary: a floor exactly one below the entry generation
+/// is indistinguishable from an ordinary dead predecessor's, so no
+/// confirmation is required and the recovery completes without any
+/// lease loop running. When that adjacent row was in fact written by a
+/// live post-deletion successor before our floor read, completing here
+/// is the documented adjacent-floor-race residual (see the residual
+/// list in the bump-confirm rationale); the narrowing conjunction it
+/// needs -- this replica's renew rounds blind from the deletion through
+/// its recovery gate, under the self-fence deadline -- is priced there.
+/// The test also guards against an over-broad trigger: if adjacent
+/// floors ever require confirmation, this only resolves after the
+/// confirmation cap and the completion assertion fails.
+#[tokio::test]
+async fn test_recovery_adjacent_floor_retain_completes_without_confirmation() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    sqlx::query(
+        "INSERT INTO leader_generation_claims (generation, holder_id) \
+         VALUES (4, 'old-term'), (5, 'pod-live')",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    let generation = Arc::new(AtomicU64::new(6));
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::clone(&generation),
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let l = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = l;
+        p.holder_id = "pod-us".into();
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    assert!(
+        leader.recovery_complete(),
+        "an adjacent floor vouches for the entry generation; no confirmation required"
+    );
+    assert_eq!(
+        generation.load(Ordering::Acquire),
+        6,
+        "the entry generation is retained"
+    );
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT generation, holder_id FROM leader_generation_claims ORDER BY generation",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(
+        rows,
+        vec![
+            (4, "old-term".to_string()),
+            (5, "pod-live".to_string()),
+            (6, "pod-us".to_string())
+        ],
+        "the adjacent-floor retain claims the entry generation"
+    );
+    Ok(())
+}
+
 /// The entry-generation-above-floor arm of the claim target: when the
 /// PG floor is NULL (fresh cluster) or below the generation at recovery
 /// entry, recovery must claim exactly the entry generation -- not "one
@@ -1552,8 +1744,12 @@ async fn test_recovery_confirmed_bump_seeds_and_completes() -> TestResult {
 /// this fresh shape the entry generation IS the Lease-derived one. Pins
 /// the arm of the decision table where the Lease, not the PG floor,
 /// decides the generation, and guards against regressing the code
-/// toward a floor-only reading of the rule.
+/// toward a floor-only reading of the rule. An empty floor cannot vouch
+/// for entry generation 7, so the recovery completes only under a
+/// post-claim Leading round -- the absent-floor arm of the confirmation
+/// trigger.
 // r[verify sched.recovery.fetch-max-seed+4]
+// r[verify sched.recovery.bump-confirm+2]
 #[tokio::test]
 async fn test_recovery_claims_lease_derived_generation_on_empty_floor() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1565,18 +1761,24 @@ async fn test_recovery_claims_lease_derived_generation_on_empty_floor() -> TestR
     // PG stayed empty -- e.g. every prior term was deposed before
     // persisting, or proceeded unclaimed).
     let generation = Arc::new(AtomicU64::new(7));
-    let g = Arc::clone(&generation);
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::clone(&generation),
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let l = leader.clone();
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
-        p.leader = crate::lease::LeaderState::from_parts(
-            g,
-            Arc::new(AtomicBool::new(true)),
-            Arc::new(AtomicBool::new(false)),
-        );
+        p.leader = l;
         p.holder_id = "pod-us".into();
     });
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
     barrier(&handle).await;
 
+    assert!(
+        leader.recovery_complete(),
+        "the absent-floor retain completes once a post-claim Leading round confirms"
+    );
     assert_eq!(
         generation.load(Ordering::Acquire),
         7,
@@ -1991,12 +2193,22 @@ async fn test_recovery_toctou_on_lease_flap(
     let db = TestDb::new(&MIGRATOR).await;
     let generation = Arc::new(AtomicU64::new(2));
     let recovery_complete = Arc::new(AtomicBool::new(false));
+    // Entry generation 2 over an empty PG floor: the floor cannot vouch
+    // for it, so the no-bump case completes only under a post-claim
+    // Leading round -- simulate a healthy lease loop. The bump case
+    // discards on the generation signal regardless.
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::clone(&generation),
+        Arc::new(AtomicBool::new(true)),
+        Arc::clone(&recovery_complete),
+    );
+    let _confirmations = spawn_leading_confirmations(leader.clone());
     let (reached_tx, reached_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
 
-    let (g, rc) = (Arc::clone(&generation), Arc::clone(&recovery_complete));
+    let l = leader.clone();
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
-        p.leader = crate::lease::LeaderState::from_parts(g, Arc::new(AtomicBool::new(true)), rc);
+        p.leader = l;
         p.recovery_toctou_gate = Some((reached_tx, release_rx));
     });
 
@@ -2060,6 +2272,11 @@ async fn test_recovery_toctou_saturated_generation_flaps(
     // Production acquire edge for the term under test: the generation
     // fetch_max is a no-op against 13; the transition count is 5.
     leader.on_acquire(5);
+    // Entry 13 over an empty floor cannot be vouched for, so the
+    // same-epoch case completes only under a post-claim Leading round.
+    // Not load-bearing for the two discard cases — they discard on the
+    // transitions / is_leader signal regardless.
+    let _confirmations = spawn_leading_confirmations(leader.clone());
 
     let (reached_tx, reached_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
@@ -2097,6 +2314,86 @@ async fn test_recovery_toctou_saturated_generation_flaps(
     // from the transitions/is_leader signal, not from a generation
     // change.
     assert_eq!(leader.generation(), 13, "generation stays saturated");
+    Ok(())
+}
+
+/// The recovery TOCTOU gate must discard on the production rebound
+/// writer (`LeaderState::on_rebound`) — the lease loop's translation of
+/// a holder change observed late, on a still-leading round (a foreign
+/// term that vacated, or a delete/recreate, entirely inside our
+/// observation gap). The rebound moves the recorded acquire-transitions
+/// without any lose/acquire edge, so the gate's transitions signal is
+/// what catches it; the follow-up `LeaderAcquired` the re-fired hook
+/// sends in production (the first back-to-back LeaderAcquired with no
+/// intervening LeaderLost) then re-runs recovery to completion.
+// r[verify sched.recovery.gate-dispatch]
+#[tokio::test]
+async fn test_recovery_toctou_rebound_mid_recovery_discards_then_rerun_completes() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    // Saturated regime, same fixture as the saturated-flaps test: the
+    // rebound's generation fetch_max is a no-op against 13 and only the
+    // recorded transition count moves.
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::new(AtomicU64::new(13)),
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    leader.on_acquire(5);
+    // The first run claims (13, holder) before parking at the gate, so
+    // the re-run retains on its own claim row; the confirmation loop
+    // covers the first run's non-vouched empty floor (and keeps the
+    // completion leg valid if the trigger ever widens further).
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+
+    let l = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = l;
+        p.recovery_toctou_gate = Some((reached_tx, release_rx));
+    });
+
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    tokio::time::timeout(Duration::from_secs(10), reached_rx)
+        .await
+        .expect("actor reached gate")
+        .expect("reached_tx not dropped");
+
+    // The unobserved holder change, observed late: the lease loop's
+    // rebound re-records the count and clears recovery_complete — no
+    // on_lose, no acquire edge.
+    leader.on_rebound(7);
+
+    release_tx.send(()).expect("actor still listening");
+    barrier(&handle).await;
+
+    assert!(
+        !leader.recovery_complete(),
+        "a recovery that straddled a rebound must be discarded"
+    );
+    assert_eq!(leader.generation(), 13, "generation stays saturated");
+
+    // What the re-fired acquire hook does in production: a second
+    // LeaderAcquired with no intervening LeaderLost. The re-run loads
+    // the post-change state and completes.
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    assert!(
+        leader.recovery_complete(),
+        "the re-run triggered by the rebound completes"
+    );
+    assert_eq!(
+        leader.generation(),
+        13,
+        "generation stays saturated after the re-run"
+    );
+    assert_eq!(
+        leader.acquired_transitions(),
+        7,
+        "the rebound's recorded count is what the re-run entered with"
+    );
     Ok(())
 }
 

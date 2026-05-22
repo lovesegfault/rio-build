@@ -1011,7 +1011,9 @@ impl GenerationReader {
     /// the SeqCst `set_recovery_complete()` store on the actor task, so
     /// a reader that observes `true` here also observes the seeded
     /// generation. The two loads are NOT one atomic snapshot — a reply
-    /// composed exactly across a lose→re-acquire edge can pair them
+    /// composed exactly across a lose→re-acquire edge, or across a
+    /// rebound (`LeaderState::on_rebound` clears the flag first, then
+    /// raises the generation), can pair them
     /// inconsistently for one heartbeat; that exposure is no worse than
     /// the pre-gating default for every heartbeat. A TOCTOU-discarded
     /// recovery leaves `recovery_complete` false, so a flapped recovery
