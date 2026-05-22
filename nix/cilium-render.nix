@@ -64,7 +64,21 @@
 let
   pins = import ./pins.nix;
   subcharts = import ./helm-charts.nix { inherit nixhelm system; };
-  chart = subcharts.cilium;
+  # Eval-time guard for the airgap invariant: the chart nixhelm ships and
+  # the image pins (pins.cilium_version → docker-pulled.nix tags) must
+  # agree, or the rendered manifests reference image tags that are not in
+  # the airgapped store and every k3s VM test dies in ImagePullBackOff at
+  # its global timeout. nixhelm's chartsMetadata is pure data (no IFD), so
+  # a skewed nixhelm bump fails evaluation immediately with this message
+  # instead.
+  chartVersion = nixhelm.chartsMetadata.cilium.cilium.version;
+  chart =
+    assert pkgs.lib.assertMsg (chartVersion == pins.cilium_version) ''
+      cilium chart from nixhelm is ${chartVersion} but nix/pins.nix pins ${pins.cilium_version}.
+      Bump pins.nix cilium_version, the cilium image digests/tags in
+      nix/docker-pulled.nix, and the infra/eks tfvars together with the
+      nixhelm flake input.'';
+    subcharts.cilium;
   split = import ./lib/helm-split.nix { inherit (pkgs) lib; };
 
   # Upstream Gateway API standard-channel CRDs. Cilium does NOT vendor

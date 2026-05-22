@@ -53,7 +53,7 @@
 #import "@preview/codly:1.3.0": codly, codly-init, codly-range
 #import "@preview/codly-languages:0.1.10": codly-languages
 #import "@preview/lovelace:0.3.1": pseudocode-list
-#import "@preview/unify:0.7.1": num, numrange, qty, qtyrange
+#import "@preview/unify:0.8.0": num, numrange, qty, qtyrange
 #import "@preview/gentle-clues:1.3.1": (
   gentle-clues, idea as _gc-idea, info as _gc-info, memo as _gc-memo,
   tip as _gc-tip, warning as _gc-warning,

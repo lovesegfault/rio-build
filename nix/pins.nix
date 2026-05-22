@@ -17,7 +17,7 @@
   # cilium: chart version == app version. 1.19+ required (IPv6 tunnel
   # underlay first-class only since PR #40324). Same pin as
   # nix/cilium-render.nix (k3s VM tests) and infra/eks/addons.tf.
-  cilium_version = "1.19.3";
+  cilium_version = "1.19.4";
 
   # Gateway API CRDs (standard channel). Cilium chart's gatewayAPI.
   # enabled gates on `.Capabilities.APIVersions.Has` — must be
@@ -37,13 +37,17 @@
   # by infra/eks/dns.tf — no VM-test consumer yet.
   external_dns_version = "1.20.0";
 
-  # NixOS node AMI kernel minor (ADR-021). String form ("6_19") so
+  # NixOS node AMI kernel minor (ADR-021). String form ("7_0") so
   # minimal.nix can do `pkgs."linuxPackages_${node_kernel_minor}"`.
   # Pinned (not linuxPackages_latest) so a nixpkgs flake-input bump
   # can't surprise-rebuild the ~40min kernel derivation.
-  # 6.18 EOL; 6.19 still carries e1b849cfa6b6 cgwb WARN-then-free (no
-  # upstream fix yet) — see Q-CGWB.
-  node_kernel_minor = "6_19";
+  # 6.19 was dropped from nixpkgs at upstream EOL → 7.0. The e1b849cfa6b6
+  # cgwb WARN-then-free is still unfixed in 7.0.x stable (the fix,
+  # 6689f01d6740 "writeback: Fix use after free in
+  # inode_switch_wbs_work_fn()", is mainline post-7.0 and not in 7.0.8
+  # yet) — the panic/kdump mitigations and NodeRepair recovery stay; see
+  # Q-CGWB.
+  node_kernel_minor = "7_0";
 
   # awslabs/amazon-eks-ami release tag for the packaged `nodeadm`
   # (nix/nixos-node/nodeadm.nix). Track kubernetes_version's minor —
