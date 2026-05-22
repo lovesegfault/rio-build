@@ -20,15 +20,22 @@
 //!      (`FlushPayload::preserve_partial`), in which case it is left in
 //!      place for operator recovery / TTL sweep.
 //!
-//! A third behavior kicks in after a leader failover with a reconnecting
-//! worker: recovery restamps the same `exec_id` onto an empty buffer and
-//! the worker only re-streams undelivered batches, so the ring holds a
-//! suffix that starts past what the prior leader already flushed. The
-//! flusher detects that disjoint-range shape on the first non-empty flush,
-//! fetches the stored `.partial` once (cached on the ring-buffer entry as
-//! a [`RecoveredPrefix`]), and prepends it to every subsequent flush of
-//! that execution so the periodic overwrite and the final blob keep
-//! covering the pre-failover output.
+//! A third behavior kicks in on any later tenure of an execution after a
+//! leader failover with a reconnecting worker: recovery restamps the same
+//! `exec_id` (onto a fresh standby's empty buffer, or onto a re-acquired
+//! ex-leader's retained one — even one whose ring still starts at line 0),
+//! and the worker only re-streams undelivered batches, so the ring no
+//! longer covers everything a prior tenure already flushed. On the first
+//! non-empty flush of the tenure the flusher reconciles the ring against
+//! the stored `drv_logs` row ([`LogFlusher::reconcile_stored_prefix`]):
+//! when the ring does not contiguously subsume the stored range it fetches
+//! the stored `.partial` once (cached on the ring-buffer entry as a
+//! [`RecoveredPrefix`]), drops any ring lines the stored copy supersedes,
+//! and folds the prefix into every subsequent flush of that execution so
+//! the periodic overwrite and the final blob keep covering output recorded
+//! by earlier tenures. An interior hole consisting of lines an interim
+//! leader received but never flushed remains a silent (unmarked) gap —
+//! unavoidable, and within the ≤30s periodic-flush budget.
 //!
 //! Both flush kinds write **one** `drv_logs` row per execution, UPSERTed on
 //! `(exec_id)` — a periodic snapshot inserts the row at `is_complete=false`,
@@ -137,12 +144,27 @@ struct FlushPayload {
 
 /// Outcome of [`LogFlusher::lookup_stored_prefix`].
 enum StoredPrefixLookup {
-    /// No stored content precedes this snapshot (no row, finalized row, or
-    /// overlapping/self-covered range). Safe to flush as-is.
+    /// No stored content needs rescuing (no row, finalized row, or the ring
+    /// contiguously subsumes the stored range). Safe to flush as-is.
     NotNeeded,
-    /// The prior leader's `.partial` content was fetched.
+    /// The prior tenure's stored content was fetched.
     Found(Arc<RecoveredPrefix>),
     /// A qualifying row exists but it could not be read — do not overwrite.
+    FetchFailed,
+}
+
+/// Outcome of [`LogFlusher::reconcile_stored_prefix`].
+enum PrefixReconcile {
+    /// Settled: the entry is now `Cached` (stored content must be folded
+    /// into every flush; any superseded ring head has been dropped) or
+    /// `Checked` (nothing stored needs rescuing).
+    Reconciled,
+    /// The ring holds no lines yet — nothing to evaluate. State stays
+    /// `Unchecked` so the first real flush re-runs this.
+    RingEmpty,
+    /// A qualifying stored row exists but its blob could not be read.
+    /// State stays `Unchecked`; the caller must not overwrite stored
+    /// content this round.
     FetchFailed,
 }
 
@@ -382,13 +404,25 @@ impl LogFlusher {
         // keeps `sealed` bounded even if the recv task is still running
         // (or never saw a LogBatch — silent build).
         //
-        // The recovered-prefix state is read BEFORE the drain (the drain
-        // removes the entry and the cached prefix with it). The one-off
-        // fallback lookup below fires only for a still-`Unchecked` entry —
-        // i.e. a recovery-restamped execution whose first non-empty flush
-        // is the final one (no periodic ran since the worker reconnected).
-        // A `Checked` entry (same-leader path, or a post-reconnect lookup
-        // that found nothing) takes today's path unchanged.
+        // Settle the stored-coverage question BEFORE the drain (see
+        // `reconcile_stored_prefix`): a superseded ring head must be
+        // dropped while the lines are still in the entry (the drained
+        // payload has no per-line numbers), and the recovered prefix must
+        // be cached before the drain removes the entry. A stale request
+        // (entry restamped to a newer exec) reads `Checked` here and
+        // skips — `drain_if_exec` below still owns the staleness call.
+        if matches!(
+            self.buffers.prefix_state(&req.drv_path, req.exec_id),
+            PrefixState::Unchecked
+        ) {
+            // FetchFailed leaves the state Unchecked; the match below maps
+            // that to "upload the drain but preserve the .partial".
+            let _ = self
+                .reconcile_stored_prefix(&req.drv_path, req.exec_id, true)
+                .await;
+        }
+        // Read AFTER the reconcile and BEFORE the drain (the drain removes
+        // the entry and the cached prefix with it).
         let pre_drain_prefix_state = self.buffers.prefix_state(&req.drv_path, req.exec_id);
         if let Some((first_line, line_count, raw_bytes, lines)) =
             self.buffers.drain_if_exec(&req.drv_path, req.exec_id)
@@ -453,22 +487,16 @@ impl LogFlusher {
             }
             let (recovered_prefix, preserve_partial) = match pre_drain_prefix_state {
                 PrefixState::Cached(p) => (Some(p), false),
-                // Already looked (whatever the outcome): final behaves
-                // exactly as today.
+                // Looked (or nothing stored): final behaves exactly as
+                // today.
                 PrefixState::Checked => (None, false),
-                // Recovery-restamped entry whose first non-empty flush IS
-                // the final.
-                PrefixState::Unchecked if line_count > 0 && first_line > 0 => {
-                    match self.lookup_stored_prefix(&req, first_line, true).await {
-                        StoredPrefixLookup::Found(p) => (Some(p), false),
-                        StoredPrefixLookup::NotNeeded => (None, false),
-                        // Buffer already drained: refusing would lose the
-                        // suffix too. Upload it, but leave the `.partial`
-                        // (the prefix's only copy) in place.
-                        StoredPrefixLookup::FetchFailed => (None, true),
-                    }
-                }
-                PrefixState::Unchecked => (None, false),
+                // Still Unchecked ⇒ the ring was empty at reconcile time
+                // (the drain is then empty too and `finalize_empty_drain`
+                // owns the row), or the stored blob could not be re-read.
+                // In neither case is deleting the `.partial` required, and
+                // in the fetch-failed case it is the only copy of content
+                // this upload does not carry — keep it.
+                PrefixState::Unchecked => (None, true),
             };
             self.upload_and_record(
                 req,
@@ -548,10 +576,11 @@ impl LogFlusher {
 
         for drv_path in keys {
             // Periodic reads exec_id from the live entry — there is no
-            // queued request to go stale, and the snapshot below is taken
-            // under the same scan, so this is the same execution. (The
-            // staleness guard is for `flush_final`, where the request can
-            // sit in the mpsc across a re-dispatch.)
+            // queued request to go stale. The reconcile below can await
+            // (SELECT + possibly a GET), so the stamp is re-checked after
+            // it before the snapshot is taken. (The staleness guard is for
+            // `flush_final`, where the request can sit in the mpsc across
+            // a re-dispatch.)
             let Some(exec_id) = self.buffers.exec_id(&drv_path) else {
                 // Unstamped entry (legacy `push()` test fixture, or a
                 // recovery gap). Nothing to key on — skip. `set_exec` is
@@ -564,6 +593,36 @@ impl LogFlusher {
                 );
                 continue;
             };
+
+            // First non-empty flush of this execution on this tenure:
+            // settle the stored-coverage question BEFORE snapshotting so a
+            // superseded ring head is dropped before it can be uploaded
+            // over durable content (A→B→A re-acquire), and the snapshot
+            // below already reflects the truncation. Zero-line rings leave
+            // the state Unchecked — the lookup needs the ring's span.
+            if matches!(
+                self.buffers.prefix_state(&drv_path, exec_id),
+                PrefixState::Unchecked
+            ) {
+                match self
+                    .reconcile_stored_prefix(&drv_path, exec_id, false)
+                    .await
+                {
+                    PrefixReconcile::Reconciled | PrefixReconcile::RingEmpty => {}
+                    // Never overwrite content we failed to read; retry next tick.
+                    PrefixReconcile::FetchFailed => continue,
+                }
+                // The reconcile awaited (SELECT + possibly a GET). A
+                // re-dispatch could have restamped the entry meanwhile;
+                // re-read the stamp so the snapshot below cannot upload a
+                // newer execution's lines under this exec's key. (Restores
+                // the pre-existing no-await-sized window between this check
+                // and the snapshot.)
+                if self.buffers.exec_id(&drv_path) != Some(exec_id) {
+                    continue;
+                }
+            }
+
             let Some((first_line, line_count, raw_bytes, lines)) = self.buffers.snapshot(&drv_path)
             else {
                 // Buffer vanished between active_keys() and snapshot() —
@@ -579,14 +638,13 @@ impl LogFlusher {
                 status: None,
             };
 
-            // Recovered-prefix handling (failover with a reconnecting
-            // worker — see the module doc). Zero-line snapshots
+            // Recovered-prefix handling (any later tenure of the same
+            // execution — see the module doc). Zero-line snapshots
             // (dispatched but not yet streaming, including the
             // post-failover window BEFORE the worker reconnects) must
-            // leave the prefix state Unchecked: the lookup needs the
-            // suffix's first line to evaluate the disjoint-range
-            // condition, and prematurely marking "checked" here would let
-            // the first real snapshot after reconnection clobber the
+            // leave the prefix state Unchecked: the reconcile needs the
+            // ring's span, and prematurely marking "checked" here would
+            // let the first real snapshot after reconnection clobber the
             // stored prefix.
             let recovered_prefix = if line_count == 0 {
                 None // upload_and_record's early-return skips this snapshot anyway
@@ -594,33 +652,11 @@ impl LogFlusher {
                 match self.buffers.prefix_state(&req.drv_path, exec_id) {
                     PrefixState::Cached(p) => Some(p),
                     PrefixState::Checked => None,
-                    PrefixState::Unchecked if first_line == 0 => {
-                        // This process observed the execution from line 0 —
-                        // nothing earlier can be stored. (Covers the
-                        // ex-leader-retained-buffer restamp, where the
-                        // overwrite is already non-lossy.)
-                        self.buffers.mark_prefix_checked(&req.drv_path, exec_id);
-                        None
-                    }
-                    PrefixState::Unchecked => {
-                        match self.lookup_stored_prefix(&req, first_line, false).await {
-                            StoredPrefixLookup::Found(p) => {
-                                self.buffers.set_recovered_prefix(
-                                    &req.drv_path,
-                                    exec_id,
-                                    Arc::clone(&p),
-                                );
-                                Some(p)
-                            }
-                            StoredPrefixLookup::NotNeeded => {
-                                self.buffers.mark_prefix_checked(&req.drv_path, exec_id);
-                                None
-                            }
-                            // Never overwrite content we failed to read;
-                            // retry next tick.
-                            StoredPrefixLookup::FetchFailed => continue,
-                        }
-                    }
+                    // Lines landed between the empty-span reconcile above
+                    // and this snapshot (sub-ms window): defer to the next
+                    // tick rather than upload without having consulted the
+                    // row.
+                    PrefixState::Unchecked => continue,
                 }
             };
             self.upload_and_record(
@@ -660,36 +696,46 @@ impl LogFlusher {
         ))
     }
 
-    /// Detect and fetch a stored pre-failover prefix for the execution
-    /// `req` is about to flush. One point-SELECT + (at most one) S3 GET.
-    /// Only called when `ring_first_line > 0` and the entry hasn't been
-    /// checked yet — i.e. never on the steady-state path.
+    /// Detect and fetch stored content of this execution that the current
+    /// in-memory ring does not cover. One point-SELECT + (at most one) S3
+    /// GET. Only called by [`Self::reconcile_stored_prefix`] while the
+    /// entry is still `Unchecked` and the ring is non-empty — i.e. at most
+    /// once per execution per tenure, never on the steady-state path.
     ///
     /// The stored content needs rescuing iff a `drv_logs` row exists for
-    /// this `exec_id`, is not finalized, and its range ends at or before
-    /// the ring's first line (the in-memory buffer covers none of it). A
-    /// prior leader is the only writer that can have produced such a row —
-    /// exec_ids are minted fresh per dispatch — so this fires only after a
-    /// failover restamp with a reconnecting worker.
+    /// this `exec_id`, is not finalized, and the ring does **not**
+    /// contiguously subsume the row's stated range. A prior tenure is the
+    /// only writer that can have produced such a row — exec_ids are minted
+    /// fresh per dispatch and the same-tenure first flush sees no row — so
+    /// this fires only after a recovery restamp: a fresh standby holding
+    /// the re-streamed suffix, or a re-acquired ex-leader whose retained
+    /// ring overlaps / has interior holes relative to what an interim
+    /// leader stored. Overlap handling (yielding the ring's head to the
+    /// stored copy) is the caller's job.
+    ///
+    /// `ring_span` is `(first_line, last_line, line_count)` of the stamped
+    /// ring entry, as returned by [`LogBuffers::span`]; `line_count > 0`.
     ///
     /// `is_final` is the caller's flush kind, threaded into the
     /// `flush_failure` chokepoint so fetch failures carry the real
     /// `is_final` label.
     async fn lookup_stored_prefix(
         &self,
-        req: &FlushRequest,
-        ring_first_line: u64,
+        drv_path: &str,
+        exec_id: Uuid,
+        ring_span: (u64, u64, u64),
         is_final: bool,
     ) -> StoredPrefixLookup {
+        let (ring_first_line, ring_last_line, ring_line_count) = ring_span;
         // The row's `s3_key` is what we'd GET; on PG failure we don't know
         // it yet, so report the deterministic `.partial` key (what the row
         // would point at) rather than a placeholder.
-        let partial_key = log_s3_key(&req.drv_path, &req.exec_id, true);
-        let row = match self.fetch_stored_drv_log(req.exec_id).await {
+        let partial_key = log_s3_key(drv_path, &exec_id, true);
+        let row = match self.fetch_stored_drv_log(exec_id).await {
             Ok(row) => row,
             Err(e) => {
                 // Treat as FetchFailed: don't clobber what we can't see.
-                flush_failure(is_final, "prefix_fetch", &partial_key, &e, &req.drv_path);
+                flush_failure(is_final, "prefix_fetch", &partial_key, &e, drv_path);
                 return StoredPrefixLookup::FetchFailed;
             }
         };
@@ -707,10 +753,31 @@ impl LogFlusher {
         // Finalized rows are refused upstream by `flush_final`'s
         // already-finalized guard and frozen at the UPSERT
         // (r[obs.log.finalize-immutable]); the `is_complete` arm here
-        // covers the periodic path, which has no such guard. Overlapping
-        // ranges are the same-leader ring-eviction shape (out of scope —
-        // pre-existing accepted head loss).
-        if is_complete || line_count == 0 || first_line + line_count > ring_first_line {
+        // covers the periodic path, which has no such guard.
+        if is_complete || line_count == 0 {
+            return StoredPrefixLookup::NotNeeded;
+        }
+        // The ring makes the stored row redundant only when it contiguously
+        // covers the row's whole stated range — the same-tenure steady state
+        // (this process wrote the row from this very ring). Anything short
+        // of that — the row extends past the ring's head or tail, or the
+        // ring has an interior hole (lines delivered only to an interim
+        // leader during an A→B→A flap) — means the stored blob may hold
+        // lines this replica never had, and it must be folded in rather
+        // than overwritten. Finalized rows stay NotNeeded: the monotone
+        // UPSERT clause protects the row, and refusing the re-finalization
+        // upload is the already-finalized gate's job in flush_final.
+        //
+        // The stated end can undercount the blob's true line-number end
+        // when the blob carries an in-band gap marker (a known accounting
+        // skew). Safe here: batches arrive in order, so a ring that
+        // contiguously covers the stated range was streamed those lines
+        // directly and keeps receiving the remainder before any terminal
+        // flush; once the stated end is made exact this comment is moot.
+        // r[impl obs.log.stored-coverage-preserved]
+        let stored_end = first_line + line_count;
+        let ring_contiguous = ring_last_line - ring_first_line + 1 == ring_line_count;
+        if ring_contiguous && ring_first_line <= first_line && ring_last_line + 1 >= stored_end {
             return StoredPrefixLookup::NotNeeded;
         }
         match self
@@ -725,11 +792,11 @@ impl LogFlusher {
                 Ok(bytes) => {
                     metrics::counter!("rio_scheduler_log_prefix_recovered_total").increment(1);
                     info!(
-                        drv = %req.drv_path,
-                        exec_id = %req.exec_id,
+                        drv = %drv_path,
+                        exec_id = %exec_id,
                         prefix_lines = line_count,
                         ring_first_line,
-                        "recovered pre-failover log prefix from stored .partial"
+                        "recovered prior-tenure log content from stored .partial"
                     );
                     StoredPrefixLookup::Found(Arc::new(RecoveredPrefix {
                         first_line,
@@ -739,14 +806,103 @@ impl LogFlusher {
                     }))
                 }
                 Err(e) => {
-                    flush_failure(is_final, "prefix_fetch", &s3_key, &e, &req.drv_path);
+                    flush_failure(is_final, "prefix_fetch", &s3_key, &e, drv_path);
                     StoredPrefixLookup::FetchFailed
                 }
             },
             Err(e) => {
-                flush_failure(is_final, "prefix_fetch", &s3_key, &e, &req.drv_path);
+                flush_failure(is_final, "prefix_fetch", &s3_key, &e, drv_path);
                 StoredPrefixLookup::FetchFailed
             }
+        }
+    }
+
+    /// Once-per-execution-per-tenure reconciliation of the ring against the
+    /// stored `drv_logs` row, run before the first non-empty flush of an
+    /// execution on this tenure (`PrefixState::Unchecked`).
+    ///
+    /// A non-finalized row that pre-exists this tenure's first flush was
+    /// written by a prior tenure: a fresh-standby failover (ring holds only
+    /// the re-streamed suffix) or an A→B→A re-acquire where this replica's
+    /// retained ring starts at line 0 but an interim leader flushed lines
+    /// this replica never received (interior hole, or stored coverage past
+    /// the ring's tail). In all of those the stored blob may be the only
+    /// copy of those lines: it is fetched and cached as the execution's
+    /// [`RecoveredPrefix`], and the ring yields every line below the row's
+    /// stated end ([`LogBuffers::truncate_below`]) so the standard
+    /// prefix + gap-marker + ring merge applies. Within the stored range
+    /// the stored copy wins; a retained head BELOW the stored range is
+    /// dropped too (the merge supports one prefix only) — that head is the
+    /// prior tenure's unflushed tail, inside the spec's ≤30s failover
+    /// budget. Healing in-band-marked gaps of the stored blob from retained
+    /// memory, and a lossless head+prefix+tail merge, are deliberately out
+    /// of scope (≤30s already-declared/budgeted loss). When the ring
+    /// contiguously subsumes the stored range, nothing is fetched and the
+    /// entry is marked checked.
+    ///
+    /// Once the entry is `Checked`/`Cached` this does not re-run within the
+    /// tenure, so same-tenure ring eviction past the stored row keeps the
+    /// pre-existing accepted head-loss behavior
+    /// (`checked_entry_final_flush_skips_lookup`); prior-tenure content
+    /// stays covered regardless because it lives in the cached prefix, not
+    /// the ring.
+    ///
+    /// The truncation threshold is the row's stated end
+    /// (`first_line + line_count`); when the stored blob contains an
+    /// in-band gap marker that stated end undercounts the true end (a
+    /// known, separately-tracked accounting skew), which can only make this
+    /// fold conservative (never lossy).
+    // r[impl obs.log.stored-coverage-preserved]
+    async fn reconcile_stored_prefix(
+        &self,
+        drv_path: &str,
+        exec_id: Uuid,
+        is_final: bool,
+    ) -> PrefixReconcile {
+        let Some((ring_first, ring_last, ring_count)) = self.buffers.span(drv_path, exec_id) else {
+            return PrefixReconcile::RingEmpty;
+        };
+        if ring_count == 0 {
+            return PrefixReconcile::RingEmpty;
+        }
+        match self
+            .lookup_stored_prefix(
+                drv_path,
+                exec_id,
+                (ring_first, ring_last, ring_count),
+                is_final,
+            )
+            .await
+        {
+            StoredPrefixLookup::NotNeeded => {
+                self.buffers.mark_prefix_checked(drv_path, exec_id);
+                PrefixReconcile::Reconciled
+            }
+            StoredPrefixLookup::Found(p) => {
+                let stored_end = p.first_line + p.line_count;
+                if stored_end > ring_first {
+                    // Stored coverage reaches into (or past) the retained
+                    // ring: the ring yields below the stored end so the
+                    // merge cannot un-cover durable content (overlapping
+                    // lines are superseded; a non-overlapping head below
+                    // the stored range is the prior tenure's ≤30s unflushed
+                    // tail — see the rustdoc).
+                    let (dropped_lines, dropped_bytes) =
+                        self.buffers.truncate_below(drv_path, exec_id, stored_end);
+                    info!(
+                        drv = %drv_path,
+                        exec_id = %exec_id,
+                        stored_end,
+                        ring_first,
+                        dropped_lines,
+                        dropped_bytes,
+                        "stored log coverage overlaps the retained ring; superseded ring head dropped in favor of the stored prefix"
+                    );
+                }
+                self.buffers.set_recovered_prefix(drv_path, exec_id, p);
+                PrefixReconcile::Reconciled
+            }
+            StoredPrefixLookup::FetchFailed => PrefixReconcile::FetchFailed,
         }
     }
 
@@ -762,23 +918,27 @@ impl LogFlusher {
     /// as it complicates the buffer lifecycle for a rare edge case;
     /// is_complete would stay false anyway).
     ///
-    /// `payload` carries the ring snapshot/drain plus, after a failover
-    /// with a reconnecting worker, the recovered pre-failover prefix
-    /// ([`FlushPayload::recovered_prefix`]). When the prefix is present the
-    /// stored blob and the row's `first_line`/`line_count`/`total_bytes`
-    /// describe prefix + (optional gap marker) + ring lines, so the
-    /// `.partial` overwrite is strictly coverage-growing and the final
-    /// `.log.zst` + `.partial` delete are safe again. When a final flush
-    /// could not re-read a known stored prefix
+    /// `payload` carries the ring snapshot/drain plus, on any later tenure
+    /// of the execution after a failover with a reconnecting worker, the
+    /// recovered prior-tenure prefix ([`FlushPayload::recovered_prefix`]).
+    /// When the prefix is present the stored blob and the row's
+    /// `first_line`/`line_count`/`total_bytes` describe
+    /// prefix + (optional gap marker) + ring lines, so the `.partial`
+    /// overwrite is strictly coverage-growing and the final `.log.zst` +
+    /// `.partial` delete are safe again — including across A→B→A lease
+    /// flaps, where [`Self::reconcile_stored_prefix`] is what guarantees a
+    /// retained ring cannot un-cover what an interim leader stored. When a
+    /// final flush could not re-read a known stored prefix
     /// ([`FlushPayload::preserve_partial`]) the `.partial` delete is
     /// skipped — that blob is the prefix's only copy.
     ///
     /// `req.exec_id` keys the S3 blob and PG row. The actor pins it at
     /// terminal time for finals; the periodic flusher reads it from the
-    /// live entry (no staleness window). Both callers verify it before
-    /// constructing the request — there is no `None` case here. `set_exec`
-    /// is always called at `assign_to_worker` and re-stamped by recovery
-    /// for active assignments.
+    /// live entry and re-checks it after the awaited reconcile, before the
+    /// snapshot. Both callers verify it before constructing the request —
+    /// there is no `None` case here. `set_exec` is always called at
+    /// `assign_to_worker` and re-stamped by recovery for active
+    /// assignments.
     async fn upload_and_record(&self, req: FlushRequest, payload: FlushPayload, is_final: bool) {
         let exec_id = req.exec_id;
         let FlushPayload {
@@ -3546,11 +3706,14 @@ mod tests {
         Ok(())
     }
 
-    /// A stored row whose range overlaps the ring snapshot is the
-    /// same-leader ring-eviction shape (pre-existing accepted head loss),
-    /// NOT a failover prefix — no merge, no GET.
+    /// A stored row whose range overlaps the re-streamed ring content: the
+    /// stored copy wins within its range — the superseded ring head is
+    /// dropped, the stored blob is folded in, and the re-streamed
+    /// duplicates are not uploaded over it. (Pre-fix this shape was
+    /// "accepted head loss": the snapshot overwrote the stored head.)
+    // r[verify obs.log.stored-coverage-preserved]
     #[tokio::test]
-    async fn overlapping_stored_range_is_not_merged() -> anyhow::Result<()> {
+    async fn overlapping_stored_range_supersedes_ring_head() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let stored: Vec<&[u8]> = vec![b"pfx-0", b"pfx-1", b"pfx-2", b"pfx-3", b"pfx-4"];
         let stored_zst = compress_lines(&stored.iter().map(|l| l.to_vec()).collect::<Vec<_>>())?;
@@ -3569,26 +3732,62 @@ mod tests {
         // Stored row covers lines 0-4.
         let exec_id = failover_restamp_after_periodic(&flusher, &buffers, drv_path, &stored).await;
 
-        // Re-streamed content starts at line 2 — overlapping the stored
-        // range (stored_end = 5 > 2), so nothing qualifies as a prefix.
+        // Re-streamed content starts at line 2 — entirely within the stored
+        // range (stored_end = 5 > 2). The reconcile fetches the stored blob,
+        // truncates the superseded ring head to empty, and the tick is
+        // skipped: nothing new to add, the stored `.partial` stays intact.
         buffers.push(&mk_batch(drv_path, 2, &[b"ovl-2", b"ovl-3", b"ovl-4"]));
         flusher.flush_periodic().await;
 
+        assert_eq!(
+            puts.lock().unwrap().len(),
+            1,
+            "no new PUT: the re-streamed duplicates are superseded by the stored copy"
+        );
+        let row: (i64, i64, bool) = sqlx::query_as(
+            "SELECT first_line, line_count, is_complete FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(
+            (row.0, row.1, row.2),
+            (0, 5, false),
+            "row keeps describing the stored content"
+        );
+        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            matches!(
+                buffers.prefix_state(drv_path, exec_id),
+                PrefixState::Cached(_)
+            ),
+            "stored content cached for the next flush"
+        );
+
+        // Once genuinely new lines arrive (past the stored end), the merge
+        // carries stored content + new tail with no marker (ranges abut).
+        buffers.push(&mk_batch(drv_path, 5, &[b"sfx-5", b"sfx-6"]));
+        flusher.flush_periodic().await;
+
         let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
-        let (_key, body) = captured.last().expect("snapshot PUT");
+        let (_key, body) = captured.last().expect("merged snapshot PUT");
         let decoded = String::from_utf8(zstd::decode_all(&body[..])?)?;
         assert_eq!(
-            decoded, "ovl-2\novl-3\novl-4\n",
-            "overlapping stored range must not be merged"
+            decoded, "pfx-0\npfx-1\npfx-2\npfx-3\npfx-4\nsfx-5\nsfx-6\n",
+            "stored head preserved; only the genuinely new tail is appended"
         );
-        assert!(!decoded.contains("[rio:"), "no gap marker either");
+        assert!(!decoded.contains("[rio:"), "no gap marker — ranges abut");
         let row: (i64, i64) =
             sqlx::query_as("SELECT first_line, line_count FROM drv_logs WHERE exec_id = $1")
                 .bind(exec_id)
                 .fetch_one(&db.pool)
                 .await?;
-        assert_eq!((row.0, row.1), (2, 3), "row takes the snapshot's values");
-        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!((row.0, row.1), (0, 7), "5 stored + 2 new, no marker slot");
+        assert_eq!(
+            gets.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "stored blob fetched once, then served from the entry cache"
+        );
         Ok(())
     }
 
@@ -3695,6 +3894,7 @@ mod tests {
     /// Final flush after a prefix-fetch failure uploads the drained suffix
     /// (refusing would lose it too) but preserves the `.partial` — it is
     /// the prefix's only copy.
+    // r[verify obs.log.stored-coverage-preserved]
     #[tokio::test]
     async fn prefix_fetch_failure_final_uploads_suffix_but_keeps_partial() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -3786,9 +3986,12 @@ mod tests {
     }
 
     /// Same-leader ring eviction (no failover): the entry was marked
-    /// checked by the first periodic (`first_line == 0` shortcut), so the
-    /// final flush takes today's path — no lookup, no merge, `.partial`
-    /// deleted. Regression test for the final-fallback `Unchecked` gate.
+    /// checked by the first periodic's no-row reconcile, so the final
+    /// flush takes today's path — no lookup, no merge, `.partial` deleted.
+    /// Also pins that the steady state does not regress to per-tick
+    /// SELECT/GETs and the same-tenure-eviction carve-out of
+    /// `obs.log.stored-coverage-preserved` (the row in this shape was
+    /// produced by this tenure from this very ring after its reconcile).
     #[tokio::test]
     async fn checked_entry_final_flush_skips_lookup() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -3806,7 +4009,8 @@ mod tests {
             always_leader(),
         );
         // Same-leader: streamed from line 0, periodic #1 stores lines 0-2
-        // and marks the entry checked via the first_line == 0 shortcut.
+        // and marks the entry checked via the no-row reconcile (one
+        // point-SELECT, no GET).
         let exec_id = stamp_and_push(&buffers, drv_path, &[b"pfx-0", b"pfx-1", b"pfx-2"]);
         flusher.flush_periodic().await;
         assert!(
@@ -3814,7 +4018,7 @@ mod tests {
                 buffers.prefix_state(drv_path, exec_id),
                 PrefixState::Checked
             ),
-            "first_line == 0 snapshot marks the entry checked"
+            "the first snapshot's no-row reconcile marks the entry checked"
         );
 
         // The build keeps spewing: line-count eviction drops the head past
@@ -3866,6 +4070,278 @@ mod tests {
             vec![format!("logs/{drv_hash}/{exec_id}.partial.log.zst")],
             "today's .partial delete is unchanged for the same-leader path"
         );
+        Ok(())
+    }
+
+    /// A→B→A lease flap with a retained ring: the re-acquired ex-leader's
+    /// ring still starts at line 0, but the interim leader durably extended
+    /// the stored `drv_logs` row past what this ring holds (the worker only
+    /// re-streams undelivered batches, so the retained ring has an interior
+    /// hole where the interim-leader-only lines should be). The next
+    /// periodic flush must fold the stored coverage in instead of
+    /// overwriting it with the holed snapshot.
+    // r[verify obs.log.stored-coverage-preserved]
+    #[tokio::test]
+    async fn aba_flap_retained_ring_folds_interim_leader_coverage_periodic() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let drv_path = "/nix/store/r12aba1-flap-periodic.drv";
+        let drv_hash = "r12aba1";
+        // The interim leader B's stored `.partial` content: A's lines 0-2
+        // plus the lines only B ever received (3-5). No internal gap marker
+        // — the ranges in this fixture all abut, keeping the line arithmetic
+        // skew-free.
+        let stored: Vec<&[u8]> = vec![b"a-0", b"a-1", b"a-2", b"b-3", b"b-4", b"b-5"];
+        let stored_zst = compress_lines(&stored.iter().map(|l| l.to_vec()).collect::<Vec<_>>())?;
+        let (s3, puts, _deletes, gets) = mock_s3_capturing_with_get(Ok(stored_zst));
+        let buffers = Arc::new(LogBuffers::new());
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+
+        // (1) A leads: the worker streams lines 0-2 and A's periodic flush
+        // stores them. No stored row exists yet, so the entry is checked
+        // without an S3 GET.
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"a-0", b"a-1", b"a-2"]);
+        flusher.flush_periodic().await;
+        assert!(
+            matches!(
+                buffers.prefix_state(drv_path, exec_id),
+                PrefixState::Checked
+            ),
+            "first periodic finds no stored row and marks the entry checked"
+        );
+        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(puts.lock().unwrap().len(), 1, "fixture: A's periodic PUT");
+
+        // (2) A loses the lease; the interim leader B receives lines 3-5
+        // and its periodic flush extends the stored row to cover [0..6).
+        let partial_key = log_s3_key(drv_path, &exec_id, true);
+        upsert_drv_log(
+            &db.pool,
+            exec_id,
+            drv_hash,
+            &partial_key,
+            0,
+            6,
+            24,
+            false,
+            None,
+        )
+        .await?;
+
+        // (3) A re-acquires: recovery restamps the SAME exec onto the
+        // retained entry (lines 0-2 still buffered). The prefix bookkeeping
+        // latched during A's first tenure must be re-armed.
+        buffers.set_exec(drv_path, exec_id, "test-worker");
+        assert!(
+            matches!(
+                buffers.prefix_state(drv_path, exec_id),
+                PrefixState::Unchecked
+            ),
+            "a same-exec recovery restamp must re-arm the stored-coverage check"
+        );
+
+        // (4) The worker reconnects to A and re-streams only undelivered
+        // lines (6-7): the retained ring is now {0,1,2,6,7} — an interior
+        // hole exactly where the interim-leader-only lines belong.
+        buffers.push(&mk_batch(drv_path, 6, &[b"c-6", b"c-7"]));
+
+        // (5) A's next periodic flush must fold B's stored coverage in
+        // instead of overwriting B's `.partial` with the holed snapshot.
+        flusher.flush_periodic().await;
+
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        let (key, body) = captured.last().expect("merged periodic PUT");
+        assert!(key.ends_with(".partial.log.zst"), "still a snapshot: {key}");
+        let decoded = String::from_utf8(zstd::decode_all(&body[..])?)?;
+        assert_eq!(
+            decoded, "a-0\na-1\na-2\nb-3\nb-4\nb-5\nc-6\nc-7\n",
+            "the lines only the interim leader had must survive the re-acquired leader's flush"
+        );
+        assert!(!decoded.contains("[rio:"), "ranges abut: no gap marker");
+        let row: (i64, i64, bool) = sqlx::query_as(
+            "SELECT first_line, line_count, is_complete FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!((row.0, row.1, row.2), (0, 8, false));
+        assert_eq!(
+            gets.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "stored blob fetched exactly once"
+        );
+        assert!(matches!(
+            buffers.prefix_state(drv_path, exec_id),
+            PrefixState::Cached(_)
+        ));
+        Ok(())
+    }
+
+    /// Same A→B→A shape as the periodic variant, but the first flush after
+    /// re-acquisition is the FINAL: the pre-drain reconcile must fold B's
+    /// stored coverage into the final blob — only then is finalizing the
+    /// row and deleting the `.partial` safe.
+    // r[verify obs.log.stored-coverage-preserved]
+    #[tokio::test]
+    async fn aba_flap_retained_ring_folds_interim_leader_coverage_final() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let drv_path = "/nix/store/r12aba2-flap-final.drv";
+        let drv_hash = "r12aba2";
+        let stored: Vec<&[u8]> = vec![b"a-0", b"a-1", b"a-2", b"b-3", b"b-4", b"b-5"];
+        let stored_zst = compress_lines(&stored.iter().map(|l| l.to_vec()).collect::<Vec<_>>())?;
+        let (s3, puts, deletes, gets) = mock_s3_capturing_with_get(Ok(stored_zst));
+        let buffers = Arc::new(LogBuffers::new());
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+
+        // Same fixture as the periodic variant through the worker's
+        // post-re-acquisition re-stream (steps 1-4 there).
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"a-0", b"a-1", b"a-2"]);
+        flusher.flush_periodic().await;
+        let partial_key = log_s3_key(drv_path, &exec_id, true);
+        upsert_drv_log(
+            &db.pool,
+            exec_id,
+            drv_hash,
+            &partial_key,
+            0,
+            6,
+            24,
+            false,
+            None,
+        )
+        .await?;
+        buffers.set_exec(drv_path, exec_id, "test-worker");
+        buffers.push(&mk_batch(drv_path, 6, &[b"c-6", b"c-7"]));
+
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id,
+                status: Some("succeeded".into()),
+            })
+            .await;
+
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        let (key, body) = captured.last().expect("final PUT");
+        assert_eq!(key, &format!("logs/{drv_hash}/{exec_id}.log.zst"));
+        let decoded = String::from_utf8(zstd::decode_all(&body[..])?)?;
+        assert_eq!(
+            decoded, "a-0\na-1\na-2\nb-3\nb-4\nb-5\nc-6\nc-7\n",
+            "the final blob must carry the lines only the interim leader had"
+        );
+        let row: (i64, i64, bool, Option<String>) = sqlx::query_as(
+            "SELECT first_line, line_count, is_complete, status FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!((row.0, row.1), (0, 8));
+        assert!(row.2, "final flush finalizes the row");
+        assert_eq!(row.3.as_deref(), Some("succeeded"));
+        assert_eq!(
+            deletes.lock().unwrap().clone(),
+            vec![format!("logs/{drv_hash}/{exec_id}.partial.log.zst")],
+            ".partial deleted only because the final blob now covers the stored content"
+        );
+        assert_eq!(
+            gets.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "stored blob fetched exactly once"
+        );
+        assert_eq!(buffers.active_count(), 0, "final flush drains");
+        Ok(())
+    }
+
+    /// Stored coverage extends past everything the retained ring holds and
+    /// no new lines ever arrive (the worker never reconnected before the
+    /// terminal): the reconcile truncates the ring to empty, the drain is
+    /// empty, and the final degrades to the existing fresh-standby
+    /// semantics — `finalize_empty_drain` stamps status/finished_at, the
+    /// row keeps describing the stored `.partial`, `is_complete` stays
+    /// false, and neither a new PUT nor a `.partial` delete happens.
+    #[tokio::test]
+    async fn stored_covers_ring_and_no_new_lines_final_keeps_partial() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let drv_path = "/nix/store/r12aba7-covered.drv";
+        let drv_hash = "r12aba7";
+        let stored: Vec<&[u8]> = vec![b"s-0", b"s-1", b"s-2", b"s-3", b"s-4", b"s-5"];
+        let stored_zst = compress_lines(&stored.iter().map(|l| l.to_vec()).collect::<Vec<_>>())?;
+        let (s3, puts, deletes, gets) = mock_s3_capturing_with_get(Ok(stored_zst));
+        let buffers = Arc::new(LogBuffers::new());
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+
+        // A's retained ring holds only lines 0-2 (its unflushed tail at
+        // lease loss); the interim leader's stored row covers [0..6).
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"s-0", b"s-1", b"s-2"]);
+        let partial_key = log_s3_key(drv_path, &exec_id, true);
+        upsert_drv_log(
+            &db.pool,
+            exec_id,
+            drv_hash,
+            &partial_key,
+            0,
+            6,
+            24,
+            false,
+            None,
+        )
+        .await?;
+        // A re-acquires; the worker never reconnects; the terminal arrives.
+        buffers.set_exec(drv_path, exec_id, "test-worker");
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id,
+                status: Some("failed".into()),
+            })
+            .await;
+
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "this tenure has nothing to add: no upload over the stored .partial"
+        );
+        assert!(
+            deletes.lock().unwrap().is_empty(),
+            "the stored .partial (the execution's only content) must not be deleted"
+        );
+        let row: (i64, i64, bool, Option<String>, Option<f64>) = sqlx::query_as(
+            "SELECT first_line, line_count, is_complete, status, \
+                    EXTRACT(EPOCH FROM finished_at)::float8 \
+             FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(
+            (row.0, row.1),
+            (0, 6),
+            "row keeps describing the stored coverage"
+        );
+        assert!(!row.2, "is_complete stays false: stored content is partial");
+        assert_eq!(row.3.as_deref(), Some("failed"));
+        assert!(row.4.is_some(), "terminal stamp recorded");
+        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(buffers.active_count(), 0, "the empty entry was drained");
         Ok(())
     }
 }

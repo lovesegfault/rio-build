@@ -46,13 +46,20 @@ leader holding a re-stamped but never-streamed-to entry) stamps `status` and
 --- neither re-keyed nor deleted, and the execution's only stored content ---
 is missing everything after the ex-leader's last periodic snapshot, so the
 incomplete indicator below stays visible.
-When the worker instead reconnects to the new leader and keeps streaming,
-the new leader's flusher fetches the execution's existing `.partial`
-snapshot once and prepends it to every subsequent flush of that execution,
-so the periodic overwrite and the final blob keep covering the pre-failover
-output; lines emitted between the prior leader's last snapshot and the
-failover remain subject to the 30-second bound and are marked in-band with
-a `[rio: ~N earlier lines lost across scheduler failover]` line.
+When the worker instead reconnects to a later tenure of the same execution
+and keeps streaming --- a fresh standby whose ring holds only the
+re-streamed suffix, or a re-acquiring ex-leader whose retained ring
+overlaps or has interior holes relative to what was stored in between ---
+that tenure's flusher fetches the execution's existing `.partial` snapshot
+once and folds it into every subsequent flush of that execution, so the
+periodic overwrite and the final blob keep covering output recorded by
+earlier tenures; stored coverage recorded by an earlier tenure is never
+reduced by a later flush. Lines emitted between the prior leader's last
+snapshot and the failover remain subject to the 30-second bound, and the
+gap between the folded prefix and the resumed stream is marked in-band
+with a `[rio: ~N earlier lines lost across scheduler failover]` line;
+lines an interim leader received but never flushed are within the same
+30-second bound but their absence is not separately marked.
 
 #r("obs.log.finalize-immutable")[
   Once an execution's `drv_logs` row has `is_complete = true`, its stored final
@@ -86,6 +93,30 @@ completion `FlushRequest`, an abandoned execution) serves the periodic
 snapshot --- strictly more useful than `NotFound`, but the missing tail is
 usually the most interesting part of the log: the build error. Without an
 explicit indicator the user reads a truncated log as the whole thing.
+
+#r("obs.log.stored-coverage-preserved")[
+  Log content recorded in an execution's `drv_logs` row by a prior scheduler
+  tenure and not contiguously covered by the current tenure's in-memory ring
+  MUST NOT be overwritten by a later flush of that execution: the flusher MUST
+  fold the stored blob into the outgoing upload (superseding any overlapping
+  in-memory lines), and when the stored blob cannot be re-read it MUST skip the
+  periodic snapshot or preserve the `.partial` blob on the final flush.
+]
+
+The durable record of what other tenures did is the `drv_logs` row, so the
+"is this overwrite lossy?" decision consults the row --- not the shape of the
+local ring, whose latches and line ranges encode conclusions reached in a
+previous tenure. Three carve-outs bound the rule:
+
+- Same-tenure ring eviction (the ring's head outruns the periodic flush within
+  one tenure) is the pre-existing, accepted `RING_CAPACITY`-bounded loss and is
+  outside this rule --- the row in that shape was produced by this tenure from
+  this very ring after its reconciliation.
+- Lines an interim leader received but never flushed are not "stored content";
+  they remain subject to the 30-second periodic-flush bound and their absence
+  is not separately marked in-band.
+- The fetch-failure fallback preserves the *blob*; the row's terminal stamping
+  in that degraded case is unchanged from the pre-existing behavior.
 
 #r("obs.log.worker-header")[
   The worker MUST write `rio: exec`, `rio: builder`, `rio: started` lines as

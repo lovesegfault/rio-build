@@ -162,13 +162,20 @@ struct RingBuf {
     /// executor — a batch from any other source is dropped.
     /// r[impl sched.log.batch-binding]
     assigned_executor: Option<String>,
-    /// See [`RecoveredPrefix`]. Set at most once per execution by the
-    /// flusher after a recovery restamp; cleared by a cross-exec restamp.
-    /// Ignored by `push_into`/eviction — never counted against the ring's
-    /// line/byte caps.
+    /// See [`RecoveredPrefix`]. Set at most once per execution **per
+    /// tenure** by the flusher's stored-coverage reconciliation; cleared by
+    /// **any** restamp (cross-exec, or the same-exec restamp recovery
+    /// performs at lease re-acquisition). Ignored by `push_into`/eviction —
+    /// never counted against the ring's line/byte caps.
     recovered_prefix: Option<std::sync::Arc<RecoveredPrefix>>,
-    /// The flusher already looked for a stored prefix (whatever the
-    /// outcome) — avoids a per-tick SELECT for evicted long logs.
+    /// The flusher already looked for a stored prefix **this tenure**
+    /// (whatever the outcome) — avoids a per-tick SELECT for evicted long
+    /// logs. Cleared by any restamp, like `recovered_prefix`. Once latched,
+    /// same-tenure ring eviction past the stored row keeps the pre-existing
+    /// accepted head-loss behavior (the row in that shape was produced by
+    /// this tenure from this very ring after its reconcile); prior-tenure
+    /// content stays covered regardless because it lives in
+    /// `recovered_prefix`, not the ring.
     prefix_checked: bool,
 }
 
@@ -392,6 +399,11 @@ impl LogBuffers {
     ///
     /// `executor` is stored for the `(executor, drv)` binding check in
     /// [`Self::push_for`].
+    ///
+    /// A same-exec re-stamp does, however, clear the prefix bookkeeping
+    /// (`recovered_prefix`/`prefix_checked`): the flusher re-reconciles
+    /// against the stored `drv_logs` row once per tenure, because an
+    /// interim leader may have extended it past what this ring holds.
     pub fn set_exec(&self, drv_path: &str, exec_id: Uuid, executor: &str) {
         let key = drv_log_hash(drv_path);
         let mut entry = self.buffers.entry(key).or_default();
@@ -419,6 +431,21 @@ impl LogBuffers {
             // to the previous execution — a different exec_id keys a
             // different drv_logs row and S3 blob, so carrying them across
             // would prepend the wrong execution's content.
+            entry.recovered_prefix = None;
+            entry.prefix_checked = false;
+        } else if entry.exec_id == Some(exec_id) {
+            // Same-exec re-stamp. Only recovery does this (dispatch always
+            // discards first), i.e. this replica just (re-)acquired the
+            // lease. The retained lines are kept — they belong to this
+            // execution — but the prefix bookkeeping encodes a conclusion
+            // from a previous tenure: an interim leader may have extended
+            // the stored drv_logs row past what this ring holds (or past
+            // the prefix cached back then), so "already checked" /
+            // "already cached" cannot be trusted across the flap. Clearing
+            // both makes the flusher re-consult the row once on the next
+            // non-empty flush (`reconcile_stored_prefix`); for an
+            // unflapped interim that costs one point-SELECT per
+            // re-acquisition. r[impl obs.log.stored-coverage-preserved]
             entry.recovered_prefix = None;
             entry.prefix_checked = false;
         }
@@ -639,6 +666,51 @@ impl LogBuffers {
         removed
     }
 
+    /// Drop every buffered line whose worker-assigned line number is below
+    /// `threshold`, only if the entry is stamped with `exec_id`. Returns
+    /// `(dropped_lines, dropped_bytes)`.
+    ///
+    /// Called by the flusher when a stored `drv_logs` row for this
+    /// execution ends at `threshold`: a re-acquired ex-leader's retained
+    /// ring can overlap the stored coverage, have an interior hole inside
+    /// it, or even hold a head that precedes the stored range entirely. The
+    /// stored blob cannot be sliced and the merge supports exactly one
+    /// prefix ahead of the ring, so the ring yields EVERYTHING below the
+    /// stored end — overlapping lines are superseded by the durable copy
+    /// (no loss), and a non-overlapping head below the stored range is
+    /// dropped (bounded by the ≤30s unflushed-tail budget the spec already
+    /// grants per failover; see the flusher's `reconcile_stored_prefix`).
+    ///
+    /// Live `read_since` serving of the dropped head ends here — the same
+    /// post-failover degradation a fresh leader's suffix-only ring already
+    /// has; the content (when it was ever flushed) stays readable from the
+    /// stored `.partial` once the entry is drained.
+    ///
+    /// Line numbers in the ring are monotone (batches arrive in order and
+    /// the worker never re-streams below what this leader already holds),
+    /// so a one-time front-truncation stays valid for the execution.
+    pub(crate) fn truncate_below(
+        &self,
+        drv_path: &str,
+        exec_id: Uuid,
+        threshold: u64,
+    ) -> (u64, u64) {
+        let Some(mut buf) = self.buffers.get_mut(&drv_log_hash(drv_path)) else {
+            return (0, 0);
+        };
+        if buf.exec_id != Some(exec_id) {
+            return (0, 0);
+        }
+        let (mut dropped_lines, mut dropped_bytes) = (0u64, 0u64);
+        while buf.lines.front().is_some_and(|(n, _)| *n < threshold) {
+            let (_, l) = buf.lines.pop_front().expect("front checked above");
+            dropped_lines += 1;
+            dropped_bytes += l.len() as u64;
+            buf.bytes -= l.len();
+        }
+        (dropped_lines, dropped_bytes)
+    }
+
     /// Discard the buffer for `drv_path` **only if** it is currently
     /// stamped to `executor` and not sealed. Returns whether anything
     /// was removed.
@@ -819,6 +891,26 @@ impl LogBuffers {
         let total_bytes = buf.bytes as u64;
         let lines: Vec<Vec<u8>> = buf.lines.iter().map(|(_n, bytes)| bytes.clone()).collect();
         Some((first_line, line_count, total_bytes, lines))
+    }
+
+    /// Line-number span of the entry for `drv_path` IF it is stamped with
+    /// `exec_id`: `(first_line, last_line, line_count)`. `None` when the
+    /// entry is missing, unstamped, or stamped with a different execution.
+    /// `line_count == 0` ⇒ first/last are meaningless zeros.
+    ///
+    /// Used by the flusher's stored-coverage reconciliation to decide
+    /// whether the ring contiguously subsumes what a prior tenure already
+    /// flushed for this execution — `snapshot()` deliberately drops
+    /// per-line numbers, and an interior hole (lines delivered only to an
+    /// interim leader) is invisible without the span.
+    pub(crate) fn span(&self, drv_path: &str, exec_id: Uuid) -> Option<(u64, u64, u64)> {
+        let buf = self.buffers.get(&drv_log_hash(drv_path))?;
+        if buf.exec_id != Some(exec_id) {
+            return None;
+        }
+        let first = buf.lines.front().map(|(n, _)| *n).unwrap_or(0);
+        let last = buf.lines.back().map(|(n, _)| *n).unwrap_or(0);
+        Some((first, last, buf.lines.len() as u64))
     }
 }
 
@@ -1428,7 +1520,10 @@ mod tests {
     /// interim re-dispatch — recovery re-stamps the SAME exec_id from
     /// `assignments`) must RETAIN the lines. The worker is still streaming
     /// this execution; clearing here would lose the unflushed tail in the
-    /// common flap case.
+    /// common flap case. The prefix bookkeeping is the exception: it
+    /// encodes a conclusion from a previous tenure, so the restamp re-arms
+    /// it and the flusher re-consults the stored row once this tenure
+    /// (deeper coverage in `same_exec_restamp_resets_prefix_state`).
     #[test]
     fn set_exec_with_same_exec_id_retains_lines() {
         let bufs = LogBuffers::new();
@@ -1455,8 +1550,119 @@ mod tests {
             "a same-exec re-stamp is not a new execution; lines must survive"
         );
         assert!(
-            matches!(bufs.prefix_state("drv-a", exec1), PrefixState::Cached(_)),
-            "the recovered prefix survives a same-exec re-stamp, like the lines"
+            matches!(bufs.prefix_state("drv-a", exec1), PrefixState::Unchecked),
+            "lines survive; prefix bookkeeping is re-armed so the new tenure re-consults the stored row"
+        );
+    }
+
+    /// A same-exec re-stamp (recovery at lease re-acquisition) re-arms the
+    /// prefix bookkeeping every time — both the `Checked` latch and a
+    /// cached prefix — while leaving the buffered lines untouched. The
+    /// flusher must re-consult the stored row once per tenure: an interim
+    /// leader may have extended it while this replica was deposed.
+    // r[verify obs.log.stored-coverage-preserved]
+    #[test]
+    fn same_exec_restamp_resets_prefix_state() {
+        let bufs = LogBuffers::new();
+        let exec = Uuid::now_v7();
+        bufs.set_exec("drv-a", exec, "executor-1");
+        assert!(bufs.push_for("drv-a", &mk_batch("drv-a", 0, &[b"line-0"]), "executor-1"));
+
+        // Tenure 1: the flusher looked and found nothing.
+        bufs.mark_prefix_checked("drv-a", exec);
+        assert!(matches!(
+            bufs.prefix_state("drv-a", exec),
+            PrefixState::Checked
+        ));
+
+        // Re-acquisition: the latch is cleared, lines are kept.
+        bufs.set_exec("drv-a", exec, "executor-1");
+        assert!(matches!(
+            bufs.prefix_state("drv-a", exec),
+            PrefixState::Unchecked
+        ));
+        assert_eq!(
+            bufs.read_since("drv-a", 0),
+            Some(vec![(0, b"line-0".to_vec())]),
+            "the re-arm must not touch the buffered lines"
+        );
+
+        // Tenure 2: the flusher cached a recovered prefix.
+        assert!(bufs.set_recovered_prefix(
+            "drv-a",
+            exec,
+            std::sync::Arc::new(RecoveredPrefix {
+                first_line: 0,
+                line_count: 1,
+                total_bytes: 5,
+                compressed: vec![1, 2, 3],
+            })
+        ));
+        assert!(matches!(
+            bufs.prefix_state("drv-a", exec),
+            PrefixState::Cached(_)
+        ));
+
+        // Another re-acquisition: the cache is cleared too, lines kept.
+        bufs.set_exec("drv-a", exec, "executor-1");
+        assert!(matches!(
+            bufs.prefix_state("drv-a", exec),
+            PrefixState::Unchecked
+        ));
+        assert_eq!(
+            bufs.read_since("drv-a", 0),
+            Some(vec![(0, b"line-0".to_vec())])
+        );
+    }
+
+    /// `truncate_below` drops exactly the ring lines below the threshold
+    /// (the range a stored row already covers), keeps the rest, keeps the
+    /// byte accounting consistent, and refuses to touch an entry stamped
+    /// with a different execution.
+    // r[verify obs.log.stored-coverage-preserved]
+    #[test]
+    fn truncate_below_drops_only_superseded_head() {
+        let bufs = LogBuffers::new();
+        let exec = Uuid::now_v7();
+        bufs.set_exec("drv-a", exec, "executor-1");
+        // Lines 0-4 (2 bytes each), then a hole, then lines 8-9.
+        assert!(bufs.push_for(
+            "drv-a",
+            &mk_batch("drv-a", 0, &[b"aa", b"bb", b"cc", b"dd", b"ee"]),
+            "executor-1"
+        ));
+        assert!(bufs.push_for(
+            "drv-a",
+            &mk_batch("drv-a", 8, &[b"ff", b"gg"]),
+            "executor-1"
+        ));
+
+        // A wrong-exec call is a no-op.
+        assert_eq!(bufs.truncate_below("drv-a", Uuid::now_v7(), 100), (0, 0));
+        assert_eq!(bufs.read_since("drv-a", 0).unwrap().len(), 7);
+
+        // Stored coverage ends at 6: lines 0-4 yield (5 lines, 10 bytes);
+        // the post-hole tail (8, 9) survives.
+        assert_eq!(bufs.truncate_below("drv-a", exec, 6), (5, 10));
+        assert_eq!(
+            bufs.read_since("drv-a", 0),
+            Some(vec![(8, b"ff".to_vec()), (9, b"gg".to_vec())])
+        );
+
+        // Threshold at or below the new first line is a no-op.
+        assert_eq!(bufs.truncate_below("drv-a", exec, 8), (0, 0));
+        assert_eq!(bufs.read_since("drv-a", 0).unwrap().len(), 2);
+
+        // Byte accounting stayed consistent: a follow-up push neither
+        // panics (debug-mode underflow) nor mis-evicts.
+        assert!(bufs.push_for("drv-a", &mk_batch("drv-a", 10, &[b"hh"]), "executor-1"));
+        assert_eq!(
+            bufs.read_since("drv-a", 0),
+            Some(vec![
+                (8, b"ff".to_vec()),
+                (9, b"gg".to_vec()),
+                (10, b"hh".to_vec())
+            ])
         );
     }
 
