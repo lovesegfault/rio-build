@@ -31,8 +31,9 @@
     # gives the byte-identical derivation master builds and caches.
     # Only `legacyPackages.<system>.quint` is ever evaluated from this
     # input. DROP this input (and the quintPkg plumbing into
-    # nix/devshell.nix) when the primary nixpkgs is bumped past a rev
-    # whose quint is >= 0.32.0.
+    # nix/devshell.nix and into nix/misc-checks.nix → nix/quint.nix)
+    # when the primary nixpkgs is bumped past a rev whose quint is
+    # >= 0.32.0.
     nixpkgs-quint.url = "github:NixOS/nixpkgs/fcc5c713107633fb50dbd513444b56504b158374";
 
     flake-compat = {
@@ -1113,8 +1114,10 @@
                 # Quint + bundled Apalache from the out-of-band nixpkgs
                 # pin (see the nixpkgs-quint input comment). Evaluated
                 # against ITS OWN nixpkgs so the npm/cargo FOD hashes
-                # match what master builds — only the dev shell forces
-                # this second nixpkgs eval; checks.* never reference it.
+                # match what master builds. The quint model/witness/MBT
+                # checks (nix/quint.nix, wired via nix/misc-checks.nix)
+                # consume this same memoized thunk, so checks.* forces
+                # this second nixpkgs eval too.
                 quintPkg = inputs.nixpkgs-quint.legacyPackages.${system}.quint;
                 # Hermetically packaged quint-llm-kit MCP servers (KB
                 # search + LSP bridge) for the project-scoped .mcp.json;
