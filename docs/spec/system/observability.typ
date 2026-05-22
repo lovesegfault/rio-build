@@ -146,12 +146,19 @@ execution then either gets finalized by the live tenure's own terminal flush
 or remains at its `.partial` coverage (surfaced per
 `obs.log.incomplete-surfaced`).
 The tenure check runs before the finalize guard's stored-row consult and is
-re-checked after each awaited step, so an orphaned request --- whether
-orphaned before its attempt or while the attempt was awaiting PG/S3 ---
-triggers no S3 work and none of the guard's destructive reap or deferral
-arms, which are execution-scoped but not tenure-scoped and could otherwise
-touch a ring entry that the new tenure's recovery has restamped onto the
-still-live execution. The drop itself performs no PG work. When the orphaned
+re-checked after the guard's stored-row consult and the stored-prefix
+reconcile --- the awaited steps that precede any destructive arm --- so a
+request orphaned before its attempt or during those awaits triggers no S3
+work, no drain, no row freeze, and no `.partial` delete; at most it reaps the
+seal-guarded residue of an entry whose execution the in-hand guard row
+already shows finalized. The destructive arms it is kept away from are
+execution-scoped but not tenure-scoped and could otherwise touch a ring
+entry that the new tenure's recovery has restamped onto the still-live
+execution. The post-drain window (compression, blob PUT, row upsert,
+`.partial` delete) is deliberately not re-checked --- the drained ring is the
+only copy of the terminal-observed lines; the accepted residual is a lease
+move during the upload freezing the row while the live tenure keeps extending
+the same execution elsewhere. The drop itself performs no PG work. When the orphaned
 request's entry is still sealed for that execution (no restamp in the current
 tenure adopted it), the drop reaps an empty entry outright (the terminal
 persisted under the old tenure, so nothing else will ever resolve it, and

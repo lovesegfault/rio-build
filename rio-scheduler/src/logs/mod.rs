@@ -193,10 +193,13 @@ struct RingBuf {
     /// live execution's buffer on a re-acquired leader, so its reaper is
     /// then the live tenure's own final, the drv's next dispatch discard,
     /// or process exit — unless the entry is still sealed for that exec (no
-    /// restamp in the current tenure adopted it), in which case the
-    /// tenure-drop arm reaps it: outright when empty, and when non-empty
-    /// only after a read-only `drv_logs` consult shows another tenure
-    /// already finalized the execution. Set at enqueue by the actor and
+    /// restamp in the current tenure adopted it), in which case it is
+    /// reaped: outright by the tenure-drop arm when empty, and — when
+    /// non-empty — by the periodic flush once its snapshot UPSERT is
+    /// refused because another tenure already finalized the execution
+    /// (this mark keeps doing its cleanup-skip job until then; an exec no
+    /// tenure ever finalizes keeps being snapshotted instead). Set at
+    /// enqueue by the actor and
     /// re-asserted at deferral by the flusher (both exec-guarded); cleared by
     /// any `set_exec` restamp — cross-exec, or the same-exec restamp recovery
     /// performs at lease re-acquisition (the prior tenure's retained final

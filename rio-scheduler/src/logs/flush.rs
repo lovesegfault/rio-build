@@ -78,9 +78,12 @@
 //! cleanup discard therefore only bounds buffers whose enqueue failed.
 //! A request is only ever finalized by the leadership tenure that enqueued
 //! it (`FlushRequest::lease_generation`): the tenure check runs before the
-//! finalize guard's row consult (and is re-checked after each awaited
-//! step), so a request orphaned by a leadership change is dropped without
-//! any PG or S3 work and uploads nothing. Its ring entry is reaped only
+//! finalize guard's row consult (and is re-checked after the guard SELECT
+//! and the stored-prefix reconcile — the awaits that precede any
+//! destructive arm; the post-drain upload window is deliberately not
+//! re-checked, see the pre-drain re-check's comment), so a request orphaned
+//! by a leadership change is dropped without any PG or S3 work and uploads
+//! nothing. Its ring entry is reaped only
 //! while still sealed and stamped with that exec: an empty one outright
 //! (left in place it would shadow the stored `.partial`); a non-empty one
 //! is left in place and reaped later by the periodic flush, whose snapshot
@@ -1057,8 +1060,11 @@ impl LogFlusher {
     /// to still be in tenure: an out-of-tenure victim's entry may be the
     /// live execution's restamped carrier, so the request is dropped without
     /// touching it — `flush_final`'s tenure-drop arm and its post-await
-    /// re-checks (each reaping at most a sealed, empty entry) are the only
-    /// entry-touching paths for stale requests.
+    /// re-checks are the only entry-touching paths for stale requests, and
+    /// they only ever remove SEALED entries, never the unsealed live
+    /// carrier (at most a sealed empty one, except the already-finalized
+    /// re-check, which also removes a sealed non-empty residue because its
+    /// guard row is already finalized).
     // r[impl obs.log.deferred-final-retry+3]
     fn retain_deferred(&self, deferred: &mut Vec<FlushRequest>, req: FlushRequest) {
         if let Some(existing) = deferred.iter_mut().find(|d| d.exec_id == req.exec_id) {
@@ -1087,9 +1093,10 @@ impl LogFlusher {
             // pin check and this retention (the guard SELECT awaits), and
             // recovery's same-exec restamp makes an out-of-tenure victim's
             // entry the LIVE execution's carrier, which must not be drained
-            // (the tenure-drop arm and the post-await re-checks — none of
-            // which drain a non-empty or unsealed entry — are the only
-            // entry-touching paths for stale requests).
+            // (the tenure-drop arm and the post-await re-checks — which
+            // never drain anything and never touch an unsealed entry, only
+            // seal-guarded reaps — are the only entry-touching paths for
+            // stale requests).
             let in_tenure = self.req_in_tenure(&req);
             if in_tenure
                 && self
@@ -1126,9 +1133,8 @@ impl LogFlusher {
     /// request is validated per-attempt inside [`Self::flush_final`] against
     /// the tenure that enqueued it (`FlushRequest::lease_generation`). An
     /// orphaned request resolves as a drop at the per-attempt tenure pin
-    /// (its only PG work is the read-only consult for a sealed non-empty
-    /// entry, and a failure there still drops the request — a still-down PG
-    /// cannot keep it retained);
+    /// with no PG work at all (a still-down PG can neither delay nor retain
+    /// it);
     /// what that drop costs is bounded — the live tenure's own terminal
     /// flush finalizes a still-live execution, an execution whose terminal
     /// had already persisted (or whose drv was re-dispatched under a new
