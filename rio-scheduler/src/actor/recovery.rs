@@ -115,9 +115,15 @@ impl DagActor {
         // recovery does not restamp: entries the sweep spares because
         // their drv is non-terminal in some other state (Ready/Queued/
         // Substituting after an interim leader's reset) and sealed
-        // entries with a queued final flush. Runs before the PG loads so
-        // recovery's round-trips don't extend the window in which a
-        // concurrently ticking flusher could still trust a stale latch,
+        // entries with a queued final flush. The flusher's self-driven
+        // arms additionally gate on `recovery_complete`
+        // (`LogFlusher::may_flush`), which is set only after this fn
+        // returns — so on the normal acquire path no self-driven flush
+        // runs until this re-arm (and the restamp + sweep below) have
+        // finished; keeping the re-arm first remains belt-and-suspenders
+        // (and still matters in the lose-during-recovery corner where a
+        // previous set left `recovery_complete` true — see the TODO at
+        // the set site). It still must precede `set_recovery_complete`,
         // and still runs when the load below fails (the degraded
         // empty-DAG tenure retains the entries).
         // r[impl obs.log.stored-coverage-preserved]
@@ -986,6 +992,18 @@ impl DagActor {
             return;
         }
 
+        // TODO: the unconditional set_recovery_complete() below runs even when
+        // the lease was lost while recovery was running (on_lose cleared the
+        // flag; the generation TOCTOU check above only detects re-acquires,
+        // not plain losses). The flag then stays true through standby, so the
+        // NEXT acquire's pre-recovery gap is not closed by
+        // LogFlusher::may_flush() / dispatch_ready. Not a stored-coverage
+        // hazard today: in that history every retained log-buffer entry is
+        // still Unchecked from this recovery's re-arm (no flush window existed
+        // since), so a gap flush reconciles rather than overwrites. Cleaner
+        // would be skipping the set when !is_leader(), or clearing the flag in
+        // on_acquire(); either needs its own look at dispatch_ready's reading
+        // of the flag before changing.
         match result {
             Ok(pg_max_gen) => {
                 // r[impl sched.recovery.fetch-max-seed]

@@ -44,7 +44,10 @@
 //! unavoidable, and within the ≤30s periodic-flush budget; the row's span
 //! still counts it, so a `since_line` past the hole is not told it is
 //! caught up — the read path's physical-vs-claimed check re-serves the
-//! blob from the start instead.
+//! blob from the start instead. The flusher's self-driven arms
+//! additionally wait for the actor's acquisition-time recovery to
+//! complete ([`LogFlusher::may_flush`]), so the first flush of a tenure
+//! always runs after that re-arm.
 //!
 //! Both flush kinds write **one** `drv_logs` row per execution, UPSERTed on
 //! `(exec_id)` — a periodic snapshot inserts the row at `is_complete=false`,
@@ -87,6 +90,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::{LogBuffers, PrefixState, RecoveredPrefix, drv_log_hash, log_s3_key};
+use crate::lease::LeaderState;
 
 /// How often to snapshot active buffers to S3. Per `observability.typ`:
 /// bounds log loss on crash to ≤30s; lower = more S3 PUTs + CPU.
@@ -218,11 +222,12 @@ pub struct LogFlusher {
     /// TTL for `drv_logs` rows + S3 blobs. Validated > 0 at config load
     /// (`Config::validate`). See [`Self::sweep_expired_logs`].
     log_retention_days: u32,
-    /// Leader gate. Periodic snapshots and the GC sweep no-op on
-    /// standbys and ex-leaders. Pre-`drv_logs` the periodic flush wrote
-    /// no PG rows so it was harmless to run unconditionally; now both
-    /// the periodic UPSERT and the GC DELETE+DeleteObjects are
-    /// leader-only writes.
+    /// Leadership + acquisition-recovery gate for the self-driven arms
+    /// (periodic snapshot, GC sweep, and the channel-close last-gasp
+    /// sweep): they no-op unless this replica holds the lease AND the
+    /// actor's acquisition-time recovery for this tenure has completed.
+    /// Why `is_leader` alone is not enough is explained once, in
+    /// [`Self::may_flush`].
     ///
     /// The completion-flush arm stays un-gated, and the reason is
     /// narrower than it looks: everything in `flush_rx` was enqueued by
@@ -234,6 +239,11 @@ pub struct LogFlusher {
     /// derivation as already-terminal so it never re-dispatches it under
     /// that `exec_id` and never writes a competing row. A lease flap
     /// *during* a build enqueues nothing (no terminal happened here).
+    /// An exec the interim leader DID finalize is refused by
+    /// `flush_final`'s already-finalized guard; a sealed entry whose
+    /// final is still queued cannot have been extended by an interim
+    /// leader (its build already ended), so the stale-latch hazard the
+    /// recovery gate closes does not apply to this arm.
     ///
     /// Note the staleness guard in [`Self::flush_final`] is NOT what
     /// makes this safe: it is a *re-dispatch* cutoff (fires only when
@@ -246,7 +256,7 @@ pub struct LogFlusher {
     /// processed — correctly, for the reason above. Deferred-final
     /// retries ([`Self::retry_deferred`]) ride the same exemption: every
     /// retained request was enqueued while this replica held the lease.
-    is_leader: Arc<std::sync::atomic::AtomicBool>,
+    leader: LeaderState,
 }
 
 impl LogFlusher {
@@ -256,7 +266,7 @@ impl LogFlusher {
         pool: PgPool,
         buffers: Arc<LogBuffers>,
         log_retention_days: u32,
-        is_leader: Arc<std::sync::atomic::AtomicBool>,
+        leader: LeaderState,
     ) -> Self {
         Self {
             s3,
@@ -264,27 +274,46 @@ impl LogFlusher {
             pool,
             buffers,
             log_retention_days,
-            is_leader,
+            leader,
         }
     }
 
-    /// Whether this replica currently holds the scheduler lease.
-    /// Relaxed is sufficient: this is a periodic poll (every 30s/1h)
-    /// plus one check at shutdown, not a synchronization point. The
-    /// window where an ex-leader's flusher hasn't observed the flip is
-    /// harmless — not because a later write repairs a stale one (a
-    /// finalized drv's buffer is drained; there is no "next snapshot")
-    /// but because the writes themselves are safe: the GC DELETE is
-    /// idempotent, and a stale periodic UPSERT cannot downgrade a
-    /// finalized row (`upsert_drv_log`'s conflict clause refuses any
-    /// update to a finalized row; the exception is a row closed by
-    /// `finalize_empty_drain`, which stays `is_complete=false` and is
-    /// therefore not latched — a late UPSERT can refresh its content and
-    /// re-null its production-unread `status`/`finished_at`). The gates
-    /// avoid wasted S3/PG traffic from a replica that has no business
-    /// writing; they are not the corruption barrier.
-    fn is_leader(&self) -> bool {
-        self.is_leader.load(std::sync::atomic::Ordering::Relaxed)
+    /// Whether this replica may run a self-driven flush right now: it
+    /// holds the scheduler lease AND the actor's acquisition-time
+    /// recovery for this tenure has completed.
+    ///
+    /// `is_leader` alone is not enough. The lease loop stores
+    /// `is_leader=true` synchronously at acquisition and only
+    /// fire-and-forgets `LeaderAcquired`; the per-tenure prefix
+    /// bookkeeping (`prefix_checked` / `recovered_prefix`) is re-armed
+    /// only when the actor dequeues that command and runs
+    /// `recover_from_pg` (re-arm, same-exec restamp, stale-entry
+    /// sweep). A periodic tick in that gap on a re-acquired ex-leader
+    /// would trust the PREVIOUS tenure's latch, skip
+    /// `reconcile_stored_prefix`, and overwrite the `.partial` blob and
+    /// non-finalized `drv_logs` row an interim leader extended — the
+    /// UPSERT's conflict clause only freezes finalized rows.
+    ///
+    /// `recovery_complete` is cleared by `on_lose` and set strictly
+    /// after the re-arm, even when the PG load fails — so the gate
+    /// cannot wedge a degraded tenure. The guarantee: a self-driven
+    /// flush only ever consults prefix latches that were re-armed at,
+    /// or reconciled after, the most recent recovery — never a previous
+    /// tenure's latch. (Not quite "never flush before this tenure's
+    /// re-arm": a lease lost while recovery is running leaves the flag
+    /// set through standby — see the TODO at the
+    /// `set_recovery_complete` call site — so the next acquire's gap is
+    /// open; but in exactly that history every retained entry is still
+    /// Unchecked from that recovery's re-arm, so a gap flush reconciles
+    /// stored coverage rather than overwriting it.) Mirrors
+    /// `dispatch_ready`'s two-flag gate. Both accessors are SeqCst, so
+    /// observing `recovery_complete=true` also observes the re-arm's
+    /// latch clears. The GC sweep needs no latch but inherits the gate
+    /// harmlessly (hourly cadence); the completion-flush arm stays
+    /// un-gated (see the `leader` field doc).
+    // r[impl obs.log.stored-coverage-preserved]
+    fn may_flush(&self) -> bool {
+        self.leader.is_leader() && self.leader.recovery_complete()
     }
 
     /// Spawn the flusher task. Shutdown is channel-driven: when
@@ -361,7 +390,7 @@ impl LogFlusher {
                                 // sweep to save whatever's in the buffers, then
                                 // exit.
                                 //
-                                // Leader-gated for the same reason as the
+                                // Gated for the same reason as the
                                 // periodic-tick arm below: an ex-leader's
                                 // retained, re-stamped buffers would UPSERT a
                                 // stale `.partial` over the new leader's row
@@ -373,13 +402,22 @@ impl LogFlusher {
                                 // self-fence, never on plain shutdown — so a
                                 // still-leading replica passes. A
                                 // never-leader standby's buffers are
-                                // structurally empty either way.
-                                if self.is_leader() {
+                                // structurally empty either way. A leader
+                                // shutting down before its recovery completed
+                                // skips the sweep too (see `may_flush()`): its
+                                // retained buffers are exactly the stale-latch
+                                // hazard, and the lines it abandons are those
+                                // pushed since this acquisition (≤ recovery
+                                // duration) plus pre-flap lines it never
+                                // flushed — already inside the flap's accepted
+                                // ≤30s loss budget when leadership moved.
+                                if self.may_flush() {
                                     debug!("flush channel closed; final periodic sweep then exit");
                                     self.flush_periodic().await;
                                 } else {
                                     debug!(
-                                        "flush channel closed; skipping final sweep (not leader)"
+                                        "flush channel closed; skipping final sweep (not leader \
+                                         or recovery pending)"
                                     );
                                 }
                                 break;
@@ -388,13 +426,13 @@ impl LogFlusher {
                     }
 
                     _ = tick.tick() => {
-                        // Deferred-final retries are NOT leader-gated (the
+                        // Deferred-final retries are NOT gated (the
                         // completion arm isn't either, and these are the same
                         // requests one PG error later); the snapshot sweep
                         // below keeps its gate.
                         // r[impl obs.log.deferred-final-retry]
                         self.retry_deferred(&mut deferred).await;
-                        // Leader-gated. A standby's `LogBuffers` is
+                        // Gated. A standby's `LogBuffers` is
                         // structurally empty (no worker streams connect to it),
                         // but an ex-leader after a lease flap retains its
                         // stamped buffers — and for drvs that were still
@@ -404,26 +442,34 @@ impl LogFlusher {
                         // in-flight execution). An un-gated ex-leader periodic
                         // tick would therefore PUT stale `.partial` blobs and
                         // churn the same `(exec_id)`-keyed `drv_logs` rows the
-                        // new leader is writing. It cannot downgrade a row the
-                        // new leader has finalized — `upsert_drv_log`'s
-                        // conflict clause refuses any update to a finalized
-                        // row — so the gate is waste/churn avoidance, not the
-                        // corruption barrier. (A row closed by
-                        // `finalize_empty_drain` stays `is_complete=false`, so
-                        // it is not latched; a late UPSERT against it refreshes
-                        // content and re-nulls `status`/`finished_at` — see
-                        // that fn's doc.)
-                        if self.is_leader() {
+                        // new leader is writing. For FINALIZED rows the UPSERT
+                        // conflict clause is the backstop; for a non-finalized
+                        // row an interim leader extended, the
+                        // recovery_complete half of the gate is the barrier —
+                        // see `may_flush()`.
+                        if self.may_flush() {
                             self.flush_periodic().await;
+                        } else if self.leader.is_leader() {
+                            // Leadership held but this tenure's recovery (and
+                            // its prefix re-arm) hasn't finished — defer rather
+                            // than trust latches from a previous tenure; see
+                            // `may_flush()`. Standbys stay silent
+                            // (is_leader=false is a replica's steady state).
+                            debug!(
+                                "periodic flush deferred: leadership acquired but recovery \
+                                 not yet complete this tenure"
+                            );
                         }
                     }
 
                     _ = gc_tick.tick() => {
-                        // Leader-gated. The DELETE is idempotent so a redundant
-                        // sweep on a standby is wasted PG/S3 traffic, not
-                        // corruption — but with `replicas: 2` (chart default)
-                        // it doubles every sweep for nothing.
-                        if self.is_leader() {
+                        // Leader-gated (and recovery-gated — inherited from
+                        // may_flush; an hour-cadence sweep losing a few seconds
+                        // is irrelevant). The DELETE is idempotent so a
+                        // redundant sweep on a standby is wasted PG/S3 traffic,
+                        // not corruption — but with `replicas: 2` (chart
+                        // default) it doubles every sweep for nothing.
+                        if self.may_flush() {
                             self.sweep_expired_logs().await;
                         }
                     }
@@ -2030,13 +2076,13 @@ mod tests {
         exec_id
     }
 
-    /// Always-leader gate for tests. The leader-gated arms (periodic
-    /// snapshot, GC sweep) only run when the gate is true; tests
-    /// exercise them directly via `flush_periodic()` / `sweep_expired_logs()`
-    /// rather than the spawned loop, so the gate only matters for the
-    /// `spawn`-loop tests.
-    fn always_leader() -> Arc<std::sync::atomic::AtomicBool> {
-        Arc::new(std::sync::atomic::AtomicBool::new(true))
+    /// Always-leader gate for tests: leader with recovery complete (the
+    /// non-K8s `LeaderState::default()`), i.e. the self-driven arms'
+    /// gate is open. The leader-gated arms only consult the gate in the
+    /// spawned loop; tests that call `flush_periodic()` /
+    /// `sweep_expired_logs()` directly bypass it either way.
+    fn always_leader() -> crate::lease::LeaderState {
+        crate::lease::LeaderState::default()
     }
 
     /// One captured counter series: `(metric name, sorted label pairs, value)`.
@@ -3381,7 +3427,7 @@ mod tests {
             30,
             // Deposed leader: on_lose() flipped the gate, but the request
             // below was enqueued while it held the lease.
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            crate::lease::LeaderState::pending(Arc::new(std::sync::atomic::AtomicU64::new(1))),
         )
         .spawn(rx);
 
@@ -3945,7 +3991,7 @@ mod tests {
             30,
             // Ex-leader: on_lose() flipped the gate, but the stamped
             // buffers from before the flap are retained.
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            crate::lease::LeaderState::pending(Arc::new(std::sync::atomic::AtomicU64::new(1))),
         )
         .spawn(rx);
 
@@ -5485,6 +5531,175 @@ mod tests {
             "stored blob fetched exactly once"
         );
         assert_eq!(buffers.active_count(), 0, "final flush drains");
+        Ok(())
+    }
+
+    /// A→B→A flap, but the periodic tick fires in the gap BETWEEN the lease
+    /// loop's synchronous `is_leader=true` store and the actor dequeuing
+    /// `LeaderAcquired` (so neither the prefix re-arm nor the same-exec
+    /// restamp has run and the entry still carries tenure-1's Checked
+    /// latch). The tick must be deferred by the recovery gate; once the
+    /// actor-side re-arm + recovery_complete happen, the next self-driven
+    /// flush must fold the interim leader's stored coverage instead of
+    /// having already shrunk it. Models the spawned loop (the gate lives
+    /// there), unlike the sibling aba_flap_* tests which drive
+    /// flush_periodic() directly after a restamp.
+    // r[verify obs.log.stored-coverage-preserved]
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn aba_flap_gap_tick_deferred_until_recovery_then_folds_interim_coverage()
+    -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let drv_path = "/nix/store/r14gap1-flap-gap-tick.drv";
+        let drv_hash = "r14gap1";
+        // Interim leader B's stored `.partial`: A's lines 0-2 plus the lines
+        // only B received (3-5). Same arithmetic as the aba_flap_* siblings.
+        let stored: Vec<&[u8]> = vec![b"a-0", b"a-1", b"a-2", b"b-3", b"b-4", b"b-5"];
+        let stored_zst = compress_lines(&stored.iter().map(|l| l.to_vec()).collect::<Vec<_>>())?;
+        let (s3, puts, _deletes, gets) = mock_s3_capturing_with_get(Ok(stored_zst));
+        let buffers = Arc::new(LogBuffers::new());
+
+        // Production-faithful gate: tenure 1 (leader, recovered) → on_lose →
+        // on_acquire stores is_leader=true ONLY (recovery_complete stays
+        // false until the "actor" runs recovery in phase 5).
+        let state = crate::lease::LeaderState::default();
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            state.clone(),
+        );
+
+        // (1) Tenure A1: worker streams 0-2, A's periodic flush latches the
+        // entry Checked and stores the row (line_count=3).
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"a-0", b"a-1", b"a-2"]);
+        flusher.flush_periodic().await;
+        assert_eq!(puts.lock().unwrap().len(), 1, "fixture: A's tenure-1 PUT");
+
+        // (2) A loses; interim leader B extends the stored row to [0..6).
+        state.on_lose();
+        let partial_key = log_s3_key(drv_path, &exec_id, true);
+        upsert_drv_log(
+            &db.pool,
+            exec_id,
+            drv_hash,
+            &partial_key,
+            0,
+            6,
+            24,
+            false,
+            None,
+        )
+        .await?;
+
+        // (3) A re-acquires: the lease loop stores is_leader=true; the actor
+        // has NOT dequeued LeaderAcquired (no rearm, no restamp).
+        state.on_acquire();
+        // Anti-vacuousness: the exact preconditions under which an un-gated
+        // tick would shrink B's row.
+        assert!(
+            matches!(
+                buffers.prefix_state(drv_path, exec_id),
+                PrefixState::Checked
+            ),
+            "latch from tenure 1 must still be stale (no rearm/restamp yet)"
+        );
+        let (_, _, ring_lines, _, _) = buffers.snapshot(drv_path).expect("entry stamped");
+        assert_eq!(
+            ring_lines, 3,
+            "retained ring is non-empty (an empty ring would also skip)"
+        );
+        let before: (i64, i64, bool) = sqlx::query_as(
+            "SELECT first_line, line_count, is_complete FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(
+            before,
+            (0, 6, false),
+            "B's coverage exceeds the retained ring"
+        );
+
+        // (4) The gap: periodic ticks fire while recovery is still pending.
+        // Paused time + auto-advance drives the 30s interval; the gate
+        // short-circuits before any PG/S3 I/O so paused time is safe here.
+        tokio::time::pause();
+        let (tx, rx) = mpsc::channel::<FlushRequest>(8);
+        flusher.spawn(rx);
+        tokio::time::sleep(Duration::from_secs(65)).await; // ticks at T=30, T=60
+        tokio::time::resume();
+
+        logs_assert(|lines: &[&str]| {
+            let n = lines
+                .iter()
+                .filter(|l| l.contains("periodic flush deferred"))
+                .count();
+            if n >= 2 {
+                Ok(())
+            } else {
+                Err(format!("two gap ticks → ≥2 deferrals, got {n}"))
+            }
+        });
+        assert_eq!(puts.lock().unwrap().len(), 1, "gap ticks must not PUT");
+        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(buffers.active_count(), 1, "entry retained, not drained");
+        let during: (i64, i64, bool) = sqlx::query_as(
+            "SELECT first_line, line_count, is_complete FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(
+            during,
+            (0, 6, false),
+            "interim leader's row must not shrink in the gap"
+        );
+
+        // (5) The actor dequeues LeaderAcquired: rearm (recover_from_pg part
+        // 1 — this entry is in the not-restamped class), then recovery
+        // completes. The worker re-streams only undelivered lines 6-7.
+        assert_eq!(
+            buffers.rearm_prefix_reconciliation(),
+            1,
+            "the stale latch existed"
+        );
+        state.set_recovery_complete();
+        buffers.push(&mk_batch(drv_path, 6, &[b"c-6", b"c-7"]));
+
+        // (6) Gate open: the next self-driven flush (channel-close arm —
+        // same may_flush() gate, same flush_periodic()) folds B's coverage.
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !logs_contain("log flusher exited") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("flusher loop did not exit after channel close");
+
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        let (key, body) = captured.last().expect("post-recovery merged PUT");
+        assert!(key.ends_with(".partial.log.zst"), "still a snapshot: {key}");
+        let decoded = String::from_utf8(zstd::decode_all(&body[..])?)?;
+        assert_eq!(
+            decoded, "a-0\na-1\na-2\nb-3\nb-4\nb-5\nc-6\nc-7\n",
+            "interim leader's lines survive once the gate opens"
+        );
+        assert_eq!(
+            gets.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "stored blob fetched once"
+        );
+        let after: (i64, i64, bool) = sqlx::query_as(
+            "SELECT first_line, line_count, is_complete FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(after, (0, 8, false));
         Ok(())
     }
 
