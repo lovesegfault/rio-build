@@ -2549,6 +2549,132 @@ async fn test_recovery_restamp_clears_stale_exec_lines() -> TestResult {
     Ok(())
 }
 
+/// bug_009 (r15): recovery's cross-exec restamp runs against an ex-leader's
+/// retained entry that is still SEALED for the prior execution's pending
+/// final (the request was deferred and retained by the flusher, and terminal
+/// cleanup skipped the discard on the final-pending mark). The restamp must
+/// clear that stale seal so the interim leader's re-dispatched execution —
+/// whose worker streams to this process after re-acquisition — is not
+/// silently muted by `push_for`'s seal check (which runs before the binding
+/// gate and gates the recv task's gateway forward with it).
+#[tokio::test]
+async fn test_recovery_restamp_unseals_sealed_deferred_entry() -> TestResult {
+    let old_exec = Uuid::now_v7();
+    let new_exec = Uuid::now_v7();
+    let drv_tag = "z-restamp-sealed-drv";
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // --- Phase 1: seed PG with the INTERIM leader's view: the drv is
+    // Assigned to a different worker under a fresh exec_id. ---
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        merge_single_node(&handle, Uuid::new_v4(), drv_tag, PriorityClass::Scheduled).await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+    let (drv_id,): (Uuid,) =
+        sqlx::query_as("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+            .bind(drv_tag)
+            .fetch_one(&db.pool)
+            .await?;
+    sqlx::query(
+        "UPDATE derivations SET status = 'assigned', assigned_builder_id = 'interim-worker' \
+         WHERE derivation_id = $1",
+    )
+    .bind(drv_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO assignments (derivation_id, builder_id, generation, status, exec_id) \
+         VALUES ($1, 'interim-worker', 2, 'pending', $2)",
+    )
+    .bind(drv_id)
+    .bind(new_exec)
+    .execute(&db.pool)
+    .await?;
+
+    // --- Phase 2: the EX-LEADER re-acquires. Its retained entry is in the
+    // round-14/15 retention shape: lines + seal + final-pending mark (the
+    // old execution's final was deferred and retained by the flusher, and
+    // CleanupTerminalBuild skipped the discard on the mark). ---
+    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let drv_path = test_drv_path(drv_tag);
+    log_buffers.set_exec(&drv_path, old_exec, "old-worker");
+    assert!(
+        log_buffers.push_for(
+            &drv_path,
+            &rio_proto::types::BuildLogBatch {
+                derivation_path: drv_path.clone(),
+                lines: vec![b"line from the abandoned execution".to_vec()],
+                first_line_number: 0,
+                executor_id: "old-worker".into(),
+            },
+            "old-worker",
+        ),
+        "fixture premise: the retained entry holds the old execution's lines"
+    );
+    log_buffers.seal(&drv_path);
+    assert!(
+        log_buffers.mark_final_pending(&drv_path, old_exec),
+        "fixture premise: the old execution's final is pending with the flusher"
+    );
+
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, plumbing| {
+        plumbing.log_buffers = Some(log_buffers.clone());
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // The entry is re-stamped to the interim leader's execution...
+    assert_eq!(
+        log_buffers.exec_id(&drv_path),
+        Some(new_exec),
+        "recovery must re-stamp the retained entry from assignments.exec_id"
+    );
+    // ...and the prior execution's seal must not survive the restamp — a
+    // surviving seal would silently drop every batch of the re-dispatched
+    // execution.
+    assert!(
+        !log_buffers.is_sealed(&drv_path),
+        "cross-exec restamp must clear the prior execution's seal"
+    );
+    assert!(
+        log_buffers.push_for(
+            &drv_path,
+            &rio_proto::types::BuildLogBatch {
+                derivation_path: drv_path.clone(),
+                lines: vec![b"line from the re-dispatched execution".to_vec()],
+                first_line_number: 0,
+                executor_id: "interim-worker".into(),
+            },
+            "interim-worker",
+        ),
+        "the re-dispatched execution's worker must not be muted after the restamp"
+    );
+    // The binding gate still rejects the old worker's late batches, and the
+    // prior execution's pending-final mark did not survive the restamp
+    // either.
+    assert!(
+        !log_buffers.push_for(
+            &drv_path,
+            &rio_proto::types::BuildLogBatch {
+                derivation_path: drv_path.clone(),
+                lines: vec![b"late line from the old worker".to_vec()],
+                first_line_number: 1,
+                executor_id: "old-worker".into(),
+            },
+            "old-worker",
+        ),
+        "old worker's batches must be rejected after the restamp (executor_mismatch)"
+    );
+    assert!(
+        !log_buffers.final_pending(&drv_path),
+        "the prior execution's pending-final mark must not survive the restamp"
+    );
+    Ok(())
+}
+
 /// adopt_orphan_completion must route log finalization through
 /// `terminal_log_epilogue` (seal → flush → correlate) instead of
 /// discarding the recovery-stamped LogBuffers entry. The discard it

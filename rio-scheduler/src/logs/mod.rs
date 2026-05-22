@@ -217,13 +217,14 @@ struct RingBuf {
 pub struct LogBuffers {
     buffers: DashMap<String, RingBuf>,
     /// Tombstone set: derivations that have reached a terminal state.
-    /// [`Self::push`] drops batches for sealed paths so a late
-    /// `LogBatch` (still in flight on the BuildExecution stream after
-    /// the worker sent CompletionReport) cannot recreate a buffer
-    /// that the flusher already drained. Unsealed by the
-    /// BuildExecution recv task on stream-close and by
-    /// [`LogFlusher::flush_final`] post-drain — bounds `sealed` to
-    /// drvs whose worker stream is still open.
+    /// [`Self::push`] / [`Self::push_for`] drop batches for sealed
+    /// paths so a late `LogBatch` (still in flight on the
+    /// BuildExecution stream after the worker sent CompletionReport)
+    /// cannot recreate a buffer that the flusher already drained.
+    /// Cleared by [`LogFlusher::flush_final`] once the final resolves,
+    /// by the discard-family reaps ([`Self::discard`], the empty-entry
+    /// reaps, terminal cleanup), and by a cross-exec [`Self::set_exec`]
+    /// restamp — the seal belongs to the execution being replaced.
     sealed: DashSet<String>,
 }
 
@@ -432,13 +433,32 @@ impl LogBuffers {
     /// under a new `exec_id` in between. A same-`exec_id` re-stamp keeps
     /// the lines: that is a single lease flap with no interim re-dispatch,
     /// and the still-streaming worker's in-flight execution must keep
-    /// accumulating across it. The seal is deliberately NOT reset here:
-    /// recovery only restamps PG-`Assigned|Running` rows and every
-    /// `seal()` site persists a terminal PG status in the same actor
-    /// turn, so a sealed entry meeting a cross-exec restamp additionally
-    /// requires a dropped `FlushRequest` and a missed
-    /// `CleanupTerminalBuild` — and the failure mode there is the
-    /// pre-existing "sealed entry drops pushes", not misattribution.
+    /// accumulating across it. A cross-exec restamp also clears the
+    /// seal tombstone. The seal was set by the prior execution's
+    /// terminal to bridge its completion→drain window; once the entry
+    /// is restamped that drain can never happen — the queued or
+    /// retained `FlushRequest` pins the OLD exec_id, so `drain_if_exec`
+    /// refuses the restamped entry and the request resolves as stale
+    /// without touching it. With final-pending retention (the final's
+    /// request is marked at enqueue, retained for retry on a guard
+    /// failure, and `handle_cleanup_terminal_build` skips the discard
+    /// for marked entries), a sealed entry meeting a cross-exec restamp
+    /// is a designed outcome of one PG outage at the prior execution's
+    /// terminal plus an interim re-dispatch — no longer the
+    /// dropped-request-plus-missed-cleanup double failure it once
+    /// required — and a surviving seal would make `push_for` (which
+    /// checks the seal before the binding gate) silently drop every
+    /// batch of the NEW execution, plus the gateway forward gated on
+    /// acceptance. Late batches from the prior execution's worker are
+    /// rejected by the `(executor, drv)` binding (re-stamped below); if
+    /// the interim leader re-dispatched to the SAME worker, a stray
+    /// prior-exec batch can still land (the restamp empties the ring,
+    /// so the monotone gate has nothing to compare it against) — the
+    /// same pre-existing exposure as a cross-exec restamp of an
+    /// unsealed, still-Running entry, accepted in exchange for not
+    /// muting the new execution outright. The same-exec arm keeps the
+    /// seal: that execution's retained final is still this entry's
+    /// reaper and the seal still guards its pre-drain window.
     /// Re-dispatch un-seals via [`Self::discard`].
     ///
     /// `executor` is stored for the `(executor, drv)` binding check in
@@ -450,7 +470,7 @@ impl LogBuffers {
     /// interim leader may have extended it past what this ring holds.
     pub fn set_exec(&self, drv_path: &str, exec_id: Uuid, executor: &str) {
         let key = drv_log_hash(drv_path);
-        let mut entry = self.buffers.entry(key).or_default();
+        let mut entry = self.buffers.entry(key.clone()).or_default();
         if entry.exec_id.is_some() && entry.exec_id != Some(exec_id) {
             // Cross-exec restamp: the assignment was re-issued under a
             // different exec_id while this entry sat retained. Bounded,
@@ -461,12 +481,20 @@ impl LogBuffers {
             // re-acquisition (recovery-driven, not worker-driven, so it
             // cannot be log-spammed) and is the only trace an operator
             // gets for "exec E1's stored log is missing its tail".
+            //
+            // The seal tombstone belongs to the prior execution too: with
+            // final-pending retention a sealed entry legitimately survives
+            // to this restamp, and a stale seal would mute the NEW
+            // execution (push_for checks it before the binding gate).
+            // Cleared exactly like discard() does; see the method docs.
+            let unsealed = self.sealed.remove(&key).is_some();
             tracing::info!(
                 drv = %drv_path,
                 old_exec = ?entry.exec_id,
                 new_exec = %exec_id,
                 dropped_lines = entry.lines.len(),
                 dropped_bytes = entry.bytes,
+                unsealed,
                 "cross-exec log buffer restamp; dropping lines retained from the prior execution"
             );
             entry.lines.clear();
@@ -1049,15 +1077,20 @@ impl LogBuffers {
     /// draining alone.
     ///
     /// Idempotent. Retry / re-dispatch un-seals via [`Self::unseal`] (or
-    /// [`Self::discard`], which also un-seals).
+    /// [`Self::discard`], which also un-seals); a cross-exec
+    /// [`Self::set_exec`] restamp clears it too — the seal belongs to the
+    /// execution being replaced.
     pub fn seal(&self, drv_path: &str) {
         self.sealed.insert(drv_log_hash(drv_path));
     }
 
-    /// Reverse [`Self::seal`]: re-open `drv_path` for pushes. Called on
-    /// re-dispatch after a terminal state (poison-clear, manual retry),
-    /// and by the recv task / flusher on terminal cleanup to bound
-    /// `sealed`. Idempotent; no-op if not sealed.
+    /// Reverse [`Self::seal`]: re-open `drv_path` for pushes. Called by
+    /// [`LogFlusher::flush_final`]'s resolution arms (post-drain,
+    /// no-entry, already-finalized residue reap) and by the
+    /// deferred-final retention-cap overflow drop to bound `sealed`.
+    /// [`Self::discard`]-family reaps and a cross-exec [`Self::set_exec`]
+    /// restamp clear the seal directly rather than through this method.
+    /// Idempotent; no-op if not sealed.
     pub fn unseal(&self, drv_path: &str) {
         self.sealed.remove(&drv_log_hash(drv_path));
     }
@@ -1694,6 +1727,61 @@ mod tests {
                 .is_some_and(|l| l.is_empty()),
             "cross-exec restamp clears the prior execution's lines"
         );
+    }
+
+    /// Seal lifecycle across restamps. A same-exec restamp (lease flap, no
+    /// interim re-dispatch) keeps the seal — the retained final for that
+    /// execution is still the entry's reaper and the seal still guards its
+    /// pre-drain window. A cross-exec restamp (an interim leader
+    /// re-dispatched the drv) clears it along with the rest of the prior
+    /// execution's bookkeeping: the prior exec's final can no longer drain
+    /// this entry, and a surviving seal would make push_for silently drop
+    /// every batch of the NEW execution (bug_009, round 15).
+    #[test]
+    fn seal_restamp_lifecycle() {
+        let bufs = LogBuffers::new();
+        let e1 = Uuid::now_v7();
+        let e2 = Uuid::now_v7();
+
+        // exec₁ streams, reaches terminal (seal), final is pending/deferred
+        // (mark).
+        bufs.set_exec("r15b9a-drv", e1, "w1");
+        assert!(bufs.push_for("r15b9a-drv", &mk_batch("r15b9a-drv", 0, &[b"l0"]), "w1"));
+        bufs.seal("r15b9a-drv");
+        assert!(bufs.mark_final_pending("r15b9a-drv", e1));
+
+        // Same-exec restamp (recovery, no interim re-dispatch): seal stays.
+        bufs.set_exec("r15b9a-drv", e1, "w1");
+        assert!(
+            bufs.is_sealed("r15b9a-drv"),
+            "same-exec restamp must keep the seal (the pending final still owns the drain)"
+        );
+        assert!(
+            !bufs.push_for("r15b9a-drv", &mk_batch("r15b9a-drv", 1, &[b"late"]), "w1"),
+            "post-terminal batch stays sealed out across a same-exec restamp"
+        );
+
+        // Cross-exec restamp (interim leader re-dispatched under e2 on w2):
+        // seal cleared, new execution's batches land, prior worker stays out.
+        bufs.set_exec("r15b9a-drv", e2, "w2");
+        assert!(
+            !bufs.is_sealed("r15b9a-drv"),
+            "cross-exec restamp must clear the prior execution's seal"
+        );
+        assert!(
+            bufs.push_for("r15b9a-drv", &mk_batch("r15b9a-drv", 0, &[b"e2-l0"]), "w2"),
+            "the re-dispatched execution's batches must be accepted after the restamp"
+        );
+        assert!(
+            bufs.read_since("r15b9a-drv", 0)
+                .is_some_and(|l| l.len() == 1),
+            "exec₂'s line is in the ring"
+        );
+        assert!(
+            !bufs.push_for("r15b9a-drv", &mk_batch("r15b9a-drv", 5, &[b"stray"]), "w1"),
+            "the prior executor's late batches are still rejected by the binding gate"
+        );
+        assert_eq!(bufs.exec_id("r15b9a-drv"), Some(e2));
     }
 
     /// Exec-guarded empty-reap used by the flusher's deferral arm: removes

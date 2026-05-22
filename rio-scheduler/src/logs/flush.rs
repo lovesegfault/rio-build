@@ -3848,6 +3848,156 @@ mod tests {
         Ok(())
     }
 
+    /// bug_009 (r15): A→B→A flap where the interim leader re-dispatched the
+    /// drv under exec₂. The re-acquired ex-leader retains exec₁'s SEALED
+    /// entry (its final was deferred → request retained, cleanup skipped the
+    /// discard); recovery restamps it to exec₂. The restamp must drop the
+    /// stale seal so exec₂'s batches are accepted and its final uploads the
+    /// full log; an exec₁-pinned request that still reaches `flush_final`
+    /// afterwards must resolve as stale without touching exec₂'s entry.
+    ///
+    /// The exec₁ request is replayed through `flush_final` directly under
+    /// the same (always-leader, generation-1) tenure — the queued-request
+    /// shape. A retained request whose enqueueing tenure has actually ended
+    /// is dropped even earlier by the per-attempt tenure pin, leaving the
+    /// entry/seal/mark untouched; this test pins the deeper exec-guards
+    /// that back that drop up, plus the user-visible symptom (exec₂'s
+    /// blob/row).
+    #[tokio::test]
+    async fn aba_flap_deferred_final_restamp_does_not_mute_redispatched_exec() -> anyhow::Result<()>
+    {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, _deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r15b9b-redispatch.drv";
+
+        // exec₁ on worker "test-worker" under leader A; terminal reached
+        // while PG is down: epilogue seals + enqueues, the guard SELECT
+        // fails, the request is retained and the entry marked.
+        let exec1 = stamp_and_push(&buffers, drv_path, &[b"e1-l0", b"e1-l1"]);
+        buffers.seal(drv_path);
+        let bad_pool = db.reopen().await;
+        bad_pool.close().await;
+        let flusher_down = LogFlusher::new(
+            s3.clone(),
+            "test-bucket".into(),
+            bad_pool,
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        let retained = flusher_down
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id: exec1,
+                status: Some("cancelled".into()),
+                lease_generation: 1,
+            })
+            .await
+            .expect("non-empty entry + unreadable drv_logs ⇒ deferred and retained");
+        assert!(
+            buffers.is_sealed(drv_path),
+            "premise: entry sealed for exec₁'s deferred final"
+        );
+        assert!(
+            buffers.final_pending(drv_path),
+            "premise: cleanup would skip the discard"
+        );
+
+        // Interim leader B re-dispatched under exec₂ to worker-2; A
+        // re-acquires and recovery restamps the retained entry from
+        // assignments.
+        let exec2 = Uuid::now_v7();
+        buffers.set_exec(drv_path, exec2, "worker-2");
+
+        // The restamp un-mutes the new execution.
+        assert!(
+            !buffers.is_sealed(drv_path),
+            "cross-exec restamp must clear exec₁'s stale seal"
+        );
+        assert!(
+            buffers.push_for(drv_path, &mk_batch(drv_path, 0, &[b"e2-l0"]), "worker-2"),
+            "worker-2's exec₂ batches must be accepted after the restamp"
+        );
+        assert!(buffers.push_for(drv_path, &mk_batch(drv_path, 1, &[b"e2-l1"]), "worker-2"));
+
+        // PG heals; the exec₁ request is replayed (queued-request shape):
+        // stale, no writes, and it must not touch exec₂'s entry or its
+        // (un)sealed state.
+        let flusher_up = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        assert!(
+            flusher_up.flush_final(retained).await.is_none(),
+            "stale exec₁ final resolves without re-deferring"
+        );
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "stale exec₁ final must not PUT"
+        );
+        assert_eq!(
+            buffers.exec_id(drv_path),
+            Some(exec2),
+            "exec₂'s entry untouched"
+        );
+        assert!(
+            !buffers.is_sealed(drv_path),
+            "stale request must not (re)seal"
+        );
+        assert!(
+            buffers
+                .read_since(drv_path, 0)
+                .is_some_and(|l| l.len() == 2),
+            "exec₂'s lines still in the ring"
+        );
+
+        // exec₂ reaches terminal: seal + final flush uploads the FULL log.
+        buffers.seal(drv_path);
+        assert!(
+            flusher_up
+                .flush_final(FlushRequest {
+                    drv_path: drv_path.into(),
+                    exec_id: exec2,
+                    status: Some("succeeded".into()),
+                    lease_generation: 1,
+                })
+                .await
+                .is_none()
+        );
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1, "exactly exec₂'s final PUT");
+        let (key, body) = &captured[0];
+        assert!(
+            key.contains(&exec2.to_string())
+                && key.ends_with(".log.zst")
+                && !key.contains(".partial")
+        );
+        assert_eq!(
+            String::from_utf8(zstd::decode_all(&body[..])?)?,
+            "e2-l0\ne2-l1\n",
+            "the re-dispatched execution's log survives intact"
+        );
+        let row: (bool, Option<String>, i64) = sqlx::query_as(
+            "SELECT is_complete, status, line_count FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec2)
+        .fetch_one(&db.pool)
+        .await?;
+        assert!(row.0, "exec₂'s row finalized");
+        assert_eq!(row.1.as_deref(), Some("succeeded"));
+        assert_eq!(row.2, 2);
+        assert!(
+            !buffers.is_sealed(drv_path),
+            "exec₂'s own final unseals after drain"
+        );
+        Ok(())
+    }
+
     /// Money test for the tenure pin, retry route (timeline A of r15
     /// bug_005): a leader cancels a build during a PG outage, the final
     /// defers, the lease moves, the live leader keeps extending the same
