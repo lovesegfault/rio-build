@@ -321,6 +321,14 @@ pub fn describe_metrics() {
          lost when assign_to_worker discarded its buffer."
     );
     describe_counter!(
+        "rio_scheduler_log_flush_already_finalized_total",
+        "Final-flush requests dropped because the execution's drv_logs row is already \
+         is_complete=true (an interim leader finalized it across a lease flap); the \
+         retained ring-buffer entry was stale pre-failover residue and was discarded \
+         instead of re-finalizing. Alert if rate is sustained — it implies repeated \
+         lease flapping."
+    );
+    describe_counter!(
         "rio_scheduler_log_forward_dropped_total",
         "Log batches dropped (actor channel backpressure). Lines are still in the ring buffer."
     );

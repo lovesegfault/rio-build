@@ -533,6 +533,11 @@
         "name": "rio_scheduler_log_batches_rejected_total"
       },
       {
+        "help": "Final-flush requests dropped because the execution's drv_logs row is already is_complete=true (an interim leader finalized it across a lease flap); the retained ring-buffer entry was stale pre-failover residue and was discarded instead of re-finalizing. Alert if rate is sustained — it implies repeated lease flapping.",
+        "kind": "counter",
+        "name": "rio_scheduler_log_flush_already_finalized_total"
+      },
+      {
         "help": "Final-flush requests dropped due to flusher channel backpressure",
         "kind": "counter",
         "name": "rio_scheduler_log_flush_dropped_total"
@@ -1122,6 +1127,7 @@
     "rio_scheduler_lease_acquired_total",
     "rio_scheduler_lease_lost_total",
     "rio_scheduler_log_batches_rejected_total",
+    "rio_scheduler_log_flush_already_finalized_total",
     "rio_scheduler_log_flush_dropped_total",
     "rio_scheduler_log_flush_failures_total",
     "rio_scheduler_log_flush_stale_total",

@@ -557,6 +557,16 @@ impl DagActor {
     /// it without breaking the legitimate shapes (neither
     /// `reset_to_ready` nor the transient-retry window seals); not
     /// added because no test can deterministically exercise the window.
+    ///
+    /// A second residual is cross-replica: after an A→B→A lease flap the
+    /// retained entry can be stamped with an exec an interim leader
+    /// already finalized; this gate cannot see PG, so the epilogue still
+    /// fires — the flusher's already-finalized check in `flush_final`
+    /// drops that request and reaps the residue, so the durable blob/row
+    /// are never regressed (`obs.log.finalize-immutable`). Until that
+    /// reap (or sweep hardening at lease acquisition) the retained entry
+    /// still shadows GetDerivationLogs reads and re-uploads its
+    /// `.partial` each periodic tick; bounded by the reap and the GC TTL.
     /// r[impl sched.merge.exec-correlation+7]
     pub(super) fn has_buffered_exec_log(&self, state: &crate::state::DerivationState) -> bool {
         self.log_buffers

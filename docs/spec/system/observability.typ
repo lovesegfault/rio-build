@@ -54,6 +54,25 @@ output; lines emitted between the prior leader's last snapshot and the
 failover remain subject to the 30-second bound and are marked in-band with
 a `[rio: ~N earlier lines lost across scheduler failover]` line.
 
+#r("obs.log.finalize-immutable")[
+  Once an execution's `drv_logs` row has `is_complete = true`, its stored final
+  blob and row content MUST NOT be overwritten or regressed by a later flush of
+  in-memory buffer state for that `exec_id`; a flusher holding retained lines
+  for an already-finalized execution MUST discard them instead of
+  re-finalizing.
+]
+
+Across an A→B→A lease flap the re-acquired ex-leader can still hold a ring
+entry stamped with an execution the interim leader already finalized --- the
+entry is pre-failover residue retained so that genuinely-abandoned executions
+can be finalized by the cancel/dependency-failure sweep. In-memory state alone
+cannot distinguish the two, so the flusher consults the row before uploading:
+an already-complete row means the durable record is authoritative, and any
+retained lines it lacks fall within the accepted periodic-flush failover-loss
+bound. The UPSERT monotonicity latch alone is not sufficient --- it only
+refuses `is_complete` downgrades, and the S3 PUT precedes the row write
+entirely.
+
 #r("obs.log.incomplete-surfaced")[
   A `GetDerivationLogs` response whose final chunk carries
   `is_complete = false` MUST be surfaced to the user as incomplete: the CLI
