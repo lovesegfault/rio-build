@@ -161,9 +161,11 @@ move during the upload freezing the row while the live tenure keeps extending
 the same execution elsewhere. The drop itself performs no PG work. When the orphaned
 request's entry is still sealed for that execution (no restamp in the current
 tenure adopted it), the drop reaps an empty entry outright (the terminal
-persisted under the old tenure, so nothing else will ever resolve it, and
-left in place it would shadow the stored `.partial` with an empty in-memory
-buffer); a sealed non-empty entry is left in place and reaped by the periodic
+persisted under the old tenure, so nothing else will ever resolve it; reads do
+not depend on the reap --- `GetDerivationLogs` probes the execution's stored
+`.partial` whenever the ring entry it finds holds zero lines --- so removing
+the entry is memory hygiene); a sealed non-empty entry is left in place and
+reaped by the periodic
 flush instead --- once another tenure has finalized the execution, the
 snapshot's row UPSERT is refused by the frozen-row latch and the flusher
 discards the still-sealed entry on that refusal (the durable finalized record
@@ -177,11 +179,19 @@ refused-UPSERT chokepoint can no longer observe that entry, and the periodic
 flush instead reaps the sealed, now-empty entry at its empty-snapshot
 early-return so reads fall through to that stored `.partial`. Any other
 entry --- unsealed or restamped --- is left for its real owner: the live
-tenure's own final, the next dispatch discard, or process exit.
+tenure's own final, the next dispatch discard, or process exit. (None of these
+reaps gates read availability: `GetDerivationLogs` probes the execution's
+stored `.partial` whenever the ring entry it finds holds zero lines, falling
+back to the empty re-poll chunk only when nothing is stored for that execution
+yet.)
 The protection starts at enqueue: a final still queued behind earlier stalled
 flushes during the same outage is protected exactly like one already
 attempted and deferred, and stays pinned until the flusher resolves the
-request (or the process exits --- the dead-flusher residual).
+request (or the process exits --- the dead-flusher residual; or, for an entry
+that is empty --- it never held a line, or the stored-coverage reconcile
+emptied it --- the periodic sealed-empty reap may remove it first, the final
+then resolving via the no-entry arm with only the empty drain's
+status/finished_at stamp lost).
 
 #r("obs.log.incomplete-surfaced")[
   A `GetDerivationLogs` response whose final chunk carries

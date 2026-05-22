@@ -743,7 +743,11 @@ impl DagActor {
         // pinned from enqueue until the flusher resolves the request —
         // bounded by the flush channel's depth plus the retention cap
         // (DEFERRED_FINALS_MAX; overflow now drops the entry itself) and
-        // by process restart. A request the flusher drops because
+        // by process restart — except an EMPTY pending entry, which the
+        // periodic flush's sealed-empty reap may remove before its final
+        // is processed (that final then takes the no-entry arm and only
+        // the empty drain's status stamp is lost). A request the flusher
+        // drops because
         // leadership moved (tenure mismatch) leaves a possibly-live entry
         // and this mark in place — on a re-acquired leader the same-exec
         // restamp clears the seal and the mark so the entry serves as the

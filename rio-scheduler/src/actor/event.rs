@@ -274,8 +274,10 @@ impl BuildEventBus {
     /// way the row stays incomplete and the dashboard sees at most the
     /// last periodic snapshot. A zero-line entry has nothing for any of
     /// those paths to persist — `terminal_log_epilogue` reaps it
-    /// immediately when this returns `false` so it can't shadow the S3
-    /// read path.
+    /// immediately when this returns `false`; reads never depended on
+    /// that entry anyway (GetDerivationLogs probes the stored side when
+    /// the entry it finds holds zero lines), the reap just avoids
+    /// retaining a dead carrier.
     #[must_use]
     pub(super) fn try_log_flush(&self, req: crate::logs::FlushRequest) -> bool {
         let Some(tx) = &self.flush_tx else {

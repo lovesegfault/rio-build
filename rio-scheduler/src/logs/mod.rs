@@ -195,10 +195,13 @@ struct RingBuf {
     /// or process exit — unless the entry is still sealed for that exec (no
     /// restamp in the current tenure adopted it), in which case it is
     /// reaped: outright by the tenure-drop arm when empty, and — when
-    /// non-empty — by the periodic flush once its snapshot UPSERT is
-    /// refused because another tenure already finalized the execution
-    /// (this mark keeps doing its cleanup-skip job until then; an exec no
-    /// tenure ever finalizes keeps being snapshotted instead). Set at
+    /// non-empty — by the periodic flush, either once its snapshot UPSERT
+    /// is refused because another tenure already finalized the execution,
+    /// or by the sealed-empty reap at the empty-snapshot early-return once
+    /// the stored-coverage reconcile has emptied its ring (this mark keeps
+    /// doing its cleanup-skip job until then; an exec no tenure ever
+    /// finalizes keeps being snapshotted only while its ring keeps lines
+    /// past the stored coverage). Set at
     /// enqueue by the actor and
     /// re-asserted at deferral by the flusher (both exec-guarded); cleared by
     /// any `set_exec` restamp — cross-exec, or the same-exec restamp recovery

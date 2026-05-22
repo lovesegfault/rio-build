@@ -74,7 +74,10 @@
 //! terminal cleanup leaves marked entries to the flusher, and a deferral
 //! (already-finalized guard could not read `drv_logs`) keeps the request
 //! retained and retried on the periodic tick (and once at shutdown) while
-//! the sealed entry stays in memory (`obs.log.deferred-final-retry`); the
+//! the sealed entry stays in memory (`obs.log.deferred-final-retry`) —
+//! unless the stored-coverage reconcile later empties that ring, in which
+//! case the periodic sealed-empty reap may remove the entry first and the
+//! retried final resolves via the no-entry arm; the
 //! cleanup discard therefore only bounds buffers whose enqueue failed.
 //! A request is only ever finalized by the leadership tenure that enqueued
 //! it (`FlushRequest::lease_generation`): the tenure check runs before the
@@ -85,12 +88,16 @@
 //! by a leadership change is dropped without any PG or S3 work and uploads
 //! nothing. Its ring entry is reaped only
 //! while still sealed and stamped with that exec: an empty one outright
-//! (left in place it would shadow the stored `.partial`); a non-empty one
-//! is left in place and reaped later by the periodic flush, whose snapshot
-//! UPSERT is refused by the frozen-row latch once another tenure has
-//! finalized the execution (the durable record supersedes the retained
-//! lines) — and the live tenure's own terminal processing finalizes the
-//! execution.
+//! (nothing to lose — and since the read path probes the stored `.partial`
+//! for an empty entry, the reap is memory/bookkeeping hygiene, not
+//! read-path rescue); a non-empty one is left in place and reaped later by
+//! the periodic flush — its snapshot UPSERT is refused by the frozen-row
+//! latch once another tenure has finalized the execution (the durable
+//! record supersedes the retained lines), or, when the stored-coverage
+//! reconcile finds a prior tenure's row covering past the retained ring
+//! and empties it, the sealed-empty reap at the empty-snapshot
+//! early-return removes it (see `flush_final` / `upload_and_record`) —
+//! and the live tenure's own terminal processing finalizes the execution.
 //!
 //! Compression is CPU-bound; runs in `spawn_blocking` so it doesn't hog a
 //! tokio worker thread during the typical 10-100ms compression of a few-MB log.
@@ -137,8 +144,11 @@ const LOG_GC_BATCH: i64 = 1000;
 /// `FlushRequest::lease_generation`) (≤ RING_BYTE_CAP each), and — since the
 /// final-pending mark is set at enqueue — entries whose finals are still
 /// *queued* are pinned too (bounded by the flush channel's 1000-deep
-/// backlog), so the cap bounds the *retained* set, not the whole pinned set,
-/// during a long PG outage. Deferrals beyond the cap drop the execution's
+/// backlog; an EMPTY entry is the exception — the periodic sealed-empty
+/// reap may remove it before its final is processed, that final then
+/// taking the no-entry arm), so the cap bounds the *retained* set, not the
+/// whole pinned set, during a long PG outage. Deferrals beyond the cap
+/// drop the execution's
 /// buffered entry at overflow time (only while the overflowing request is
 /// still in tenure — an out-of-tenure victim's entry may be the live
 /// execution's restamped carrier and is left untouched; see
@@ -619,10 +629,11 @@ impl LogFlusher {
             // tenure's epilogue re-sealed with its own final still pending;
             // both reaps below stay safe in that case — see each.)
             //
-            //  - Sealed and EMPTY: nothing to lose. Left in place it would
-            //    shadow the prior leader's stored `.partial` in
-            //    GetDerivationLogs (empty is_complete=false chunks) until
-            //    process restart; reap it so reads fall through. If it was
+            //  - Sealed and EMPTY: nothing to lose. Reads don't need it
+            //    either — GetDerivationLogs probes the prior leader's
+            //    stored `.partial` when the entry it finds holds zero
+            //    lines — so the reap is memory/bookkeeping hygiene rather
+            //    than read-path rescue; reap it. If it was
             //    the current tenure's empty pending final, that final takes
             //    the no-entry arm and only the empty drain's status stamp
             //    is lost. Seal, exec, and emptiness are evaluated inside
@@ -794,9 +805,11 @@ impl LogFlusher {
                 metrics::counter!("rio_scheduler_log_flush_finalize_deferred_total").increment(1);
 
                 // A zero-line entry (failover restamp whose worker never
-                // re-streamed) has nothing any retry could upload; left in
-                // place it shadows the ex-leader's stored `.partial` in
-                // GetDerivationLogs (empty is_complete=false chunks). Reap it
+                // re-streamed) has nothing any retry could upload, and
+                // reads don't need it (GetDerivationLogs probes the
+                // ex-leader's stored `.partial` when the entry it finds
+                // holds zero lines) — retaining it would only pin memory
+                // and the final-pending mark. Reap it
                 // now — exec-guarded so a re-dispatched execution's fresh
                 // empty entry is never touched. Mirrors the epilogue's
                 // enqueue-failure reap; the prior `.partial` row keeps
@@ -1601,9 +1614,10 @@ impl LogFlusher {
         //    for it, no other reaper remains (recovery restamps only
         //    Assigned|Running drvs, the acquisition sweep skips sealed
         //    keys, terminal cleanup skips final-pending entries), and left
-        //    in place it would shadow the stored `.partial` in
-        //    GetDerivationLogs (one empty is_complete=false chunk) until
-        //    process restart. Seal, exec, and emptiness are re-evaluated
+        //    in place it would just sit in memory until process restart
+        //    (reads are unaffected either way: GetDerivationLogs probes
+        //    the stored `.partial` when the entry it finds holds zero
+        //    lines). Seal, exec, and emptiness are re-evaluated
         //    inside the removal's own predicate
         //    (`discard_if_sealed_for_exec`), so a concurrent same-exec
         //    restamp either lands first (seal cleared, no reap) or
