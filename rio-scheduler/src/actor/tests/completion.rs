@@ -2701,6 +2701,384 @@ async fn test_completion_peak_memory_clamps_to_i64_max() -> TestResult {
     Ok(())
 }
 
+/// A worker-supplied `peak_cpu_cores = +Inf` is recorded as NULL ("not
+/// reported"), not persisted raw into build_samples where the SLA fit's
+/// saturation check reads it back. The row itself IS still written
+/// (null-out, not row-skip): duration_secs survives. The companion
+/// `final_resources.cpu_limit_cores = +Inf` can never displace the
+/// scheduler's own assigned-cores figure (`min(assigned, +Inf) =
+/// assigned` on this intent-present arm; the no-intent recovery arm is
+/// covered structurally — see the note on
+/// `test_completion_nonfinite_final_resources_recorded_as_null`).
+/// `cpu_seconds_total = 0.0` stays persistable — pins the `>=` (not
+/// `>`) boundary of the domain check.
+// r[verify sched.executor.input-bounds+2]
+#[tokio::test]
+async fn test_completion_infinite_peak_cpu_recorded_as_null() -> TestResult {
+    let (db, handle, _task, mut stream_rx) =
+        setup_with_worker("infcpu-worker", "x86_64-linux").await?;
+
+    let build_id = Uuid::new_v4();
+    let mut node = make_node("infcpu-drv");
+    node.pname = "infcpu-pkg".into();
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    let assignment = recv_assignment(&mut stream_rx).await;
+    let assigned = assignment
+        .assigned_cores
+        .expect("dispatch sets assigned_cores from last_intent");
+
+    // Precondition: no row for this pname yet, so the count below
+    // proves THIS completion wrote it.
+    let pre: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM build_samples WHERE pname = 'infcpu-pkg'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(pre, 0, "precondition: no infcpu-pkg row before completion");
+
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            executor_id: "infcpu-worker".into(),
+            drv_key: test_drv_path("infcpu-drv"),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
+                built_outputs: vec![rio_proto::types::BuiltOutput {
+                    output_name: "out".into(),
+                    output_path: test_store_path("infcpu-out"),
+                    output_hash: vec![0u8; 32],
+                }],
+                start_time: Some(prost_types::Timestamp {
+                    seconds: 2000,
+                    nanos: 0,
+                }),
+                stop_time: Some(prost_types::Timestamp {
+                    seconds: 2010,
+                    nanos: 0,
+                }),
+                ..Default::default()
+            },
+            peak_memory_bytes: 1 << 20,
+            // The pathological input: worker reports +Inf for both the
+            // poller peak and the cgroup limit.
+            peak_cpu_cores: f64::INFINITY,
+            node_name: None,
+            hw_class: None,
+            final_resources: Some(rio_proto::types::ResourceUsage {
+                cpu_limit_cores: Some(f64::INFINITY),
+                cpu_seconds_total: Some(0.0),
+                ..Default::default()
+            }),
+        })
+        .await?;
+    barrier(&handle).await;
+
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(Option<f64>, f64, Option<f64>, Option<f64>)> = sqlx::query_as(
+        "SELECT peak_cpu_cores, duration_secs, cpu_limit_cores, cpu_seconds_total \
+         FROM build_samples WHERE pname = 'infcpu-pkg'",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(
+        rows.len(),
+        1,
+        "one bad telemetry float must not suppress the sample row (null-out, not row-skip)"
+    );
+    let (peak_cpu, dur, cpu_limit, cpu_secs) = &rows[0];
+    assert_eq!(
+        *peak_cpu, None,
+        "+Inf peak_cpu_cores must be recorded as NULL, not persisted raw"
+    );
+    assert!(
+        (dur - 10.0).abs() < 1e-9,
+        "row still written with the real duration (stop=2010 - start=2000), got {dur}"
+    );
+    assert_eq!(
+        *cpu_limit,
+        Some(f64::from(assigned)),
+        "+Inf cgroup limit must never displace the scheduler's assigned cores ({assigned})"
+    );
+    assert_eq!(
+        *cpu_secs,
+        Some(0.0),
+        "cpu_seconds_total = 0.0 is in-domain and stays persistable (>= boundary)"
+    );
+
+    Ok(())
+}
+
+/// Non-finite / negative `final_resources` floats are recorded as NULL
+/// rather than persisted raw: a negative cgroup `cpu_limit_cores` must
+/// not win the `min()` against the scheduler's own assigned-cores
+/// figure, and `cpu_seconds_total = +Inf` / `peak_io_pressure_pct =
+/// NaN` must not reach the SLA fit's read path. `peak_disk_bytes =
+/// u64::MAX` keeps its existing i64::MAX clamp, and a NaN
+/// `peak_cpu_cores` stays NULL (the explicit `is_finite()` check
+/// preserves what the old `> 0.0` comparison rejected incidentally).
+///
+/// No-intent (recovery) arm coverage is structural: every test in this
+/// harness dispatches (which sets `last_intent`), so only the
+/// `(Some(assigned), cgroup)` arm of the cpu_limit_cores fold is driven
+/// directly — but the filter runs on the cgroup value BEFORE the
+/// `match`, so the no-intent `(None, Some(cgroup))` arm sees the
+/// already-sanitized value by construction.
+// r[verify sched.executor.input-bounds+2]
+#[tokio::test]
+async fn test_completion_nonfinite_final_resources_recorded_as_null() -> TestResult {
+    let (db, handle, _task, mut stream_rx) =
+        setup_with_worker("finres-worker", "x86_64-linux").await?;
+
+    let build_id = Uuid::new_v4();
+    let mut node = make_node("finres-drv");
+    node.pname = "finres-pkg".into();
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    let assignment = recv_assignment(&mut stream_rx).await;
+    let assigned = assignment
+        .assigned_cores
+        .expect("dispatch sets assigned_cores from last_intent");
+
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            executor_id: "finres-worker".into(),
+            drv_key: test_drv_path("finres-drv"),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
+                built_outputs: vec![rio_proto::types::BuiltOutput {
+                    output_name: "out".into(),
+                    output_path: test_store_path("finres-out"),
+                    output_hash: vec![0u8; 32],
+                }],
+                start_time: Some(prost_types::Timestamp {
+                    seconds: 2000,
+                    nanos: 0,
+                }),
+                stop_time: Some(prost_types::Timestamp {
+                    seconds: 2010,
+                    nanos: 0,
+                }),
+                ..Default::default()
+            },
+            peak_memory_bytes: 1 << 20,
+            peak_cpu_cores: f64::NAN,
+            node_name: None,
+            hw_class: None,
+            final_resources: Some(rio_proto::types::ResourceUsage {
+                cpu_limit_cores: Some(-3.0),
+                cpu_seconds_total: Some(f64::INFINITY),
+                peak_io_pressure_pct: Some(f64::NAN),
+                peak_disk_bytes: Some(u64::MAX),
+                ..Default::default()
+            }),
+        })
+        .await?;
+    barrier(&handle).await;
+
+    #[allow(clippy::type_complexity)]
+    let (cpu_limit, cpu_secs, io_pct, disk, peak_cpu): (
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<i64>,
+        Option<f64>,
+    ) = sqlx::query_as(
+        "SELECT cpu_limit_cores, cpu_seconds_total, peak_io_pressure_pct, \
+                peak_disk_bytes, peak_cpu_cores \
+         FROM build_samples WHERE pname = 'finres-pkg'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        cpu_limit,
+        Some(f64::from(assigned)),
+        "negative cgroup cpu_limit_cores must not win min() against assigned ({assigned})"
+    );
+    assert_eq!(
+        cpu_secs, None,
+        "+Inf cpu_seconds_total must be recorded as NULL"
+    );
+    assert_eq!(
+        io_pct, None,
+        "NaN peak_io_pressure_pct must be recorded as NULL"
+    );
+    assert_eq!(
+        disk,
+        Some(i64::MAX),
+        "u64::MAX peak_disk_bytes keeps the existing i64::MAX clamp"
+    );
+    assert_eq!(
+        peak_cpu, None,
+        "NaN peak_cpu_cores stays NULL (is_finite() preserves the old incidental rejection)"
+    );
+
+    Ok(())
+}
+
+/// Finite-but-out-of-domain readings are likewise recorded as NULL: a
+/// `peak_cpu_cores` above the structural cores ceiling
+/// (`sla::config::MAX_CORES_HARD`) would otherwise saturate the SLA
+/// fit's per-c anchor key and act as an extreme-leverage point; a 0.0
+/// cgroup `cpu_limit_cores` is "no signal", not a real limit, and must
+/// fall back to the assigned cores instead of winning the min(); a
+/// negative cumulative CPU-seconds counter and a 150% PSI reading are
+/// outside their physical domains (proto contract: pct in [0, 100]).
+// r[verify sched.executor.input-bounds+2]
+#[tokio::test]
+async fn test_completion_out_of_domain_final_resources_recorded_as_null() -> TestResult {
+    let (db, handle, _task, mut stream_rx) =
+        setup_with_worker("iodom-worker", "x86_64-linux").await?;
+
+    let build_id = Uuid::new_v4();
+    let mut node = make_node("iodom-drv");
+    node.pname = "iodom-pkg".into();
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    let assignment = recv_assignment(&mut stream_rx).await;
+    let assigned = assignment
+        .assigned_cores
+        .expect("dispatch sets assigned_cores from last_intent");
+
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            executor_id: "iodom-worker".into(),
+            drv_key: test_drv_path("iodom-drv"),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
+                built_outputs: vec![rio_proto::types::BuiltOutput {
+                    output_name: "out".into(),
+                    output_path: test_store_path("iodom-out"),
+                    output_hash: vec![0u8; 32],
+                }],
+                start_time: Some(prost_types::Timestamp {
+                    seconds: 2000,
+                    nanos: 0,
+                }),
+                stop_time: Some(prost_types::Timestamp {
+                    seconds: 2010,
+                    nanos: 0,
+                }),
+                ..Default::default()
+            },
+            peak_memory_bytes: 1 << 20,
+            // Finite but above MAX_CORES_HARD (1024): no node in the
+            // fleet can report this honestly.
+            peak_cpu_cores: 5000.0,
+            node_name: None,
+            hw_class: None,
+            final_resources: Some(rio_proto::types::ResourceUsage {
+                cpu_limit_cores: Some(0.0),
+                cpu_seconds_total: Some(-1.0),
+                peak_io_pressure_pct: Some(150.0),
+                ..Default::default()
+            }),
+        })
+        .await?;
+    barrier(&handle).await;
+
+    let (peak_cpu, cpu_limit, cpu_secs, io_pct): (
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+    ) = sqlx::query_as(
+        "SELECT peak_cpu_cores, cpu_limit_cores, cpu_seconds_total, peak_io_pressure_pct \
+         FROM build_samples WHERE pname = 'iodom-pkg'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        peak_cpu, None,
+        "finite peak_cpu_cores above MAX_CORES_HARD must be recorded as NULL"
+    );
+    assert_eq!(
+        cpu_limit,
+        Some(f64::from(assigned)),
+        "0.0 cgroup limit is no-signal: falls back to assigned ({assigned}), not min(assigned, 0)"
+    );
+    assert_eq!(
+        cpu_secs, None,
+        "negative cpu_seconds_total must be recorded as NULL"
+    );
+    assert_eq!(
+        io_pct, None,
+        "150% peak_io_pressure_pct is outside the proto's [0, 100] domain, must be NULL"
+    );
+
+    Ok(())
+}
+
+/// Over-filtering guard: legitimate in-domain readings round-trip
+/// unfiltered. (The valid-cgroup `cpu_limit_cores` round-trip — both
+/// directions of the min() — is already covered by
+/// `test_completion_writes_hw_class_and_intent_cores`.)
+// r[verify sched.executor.input-bounds+2]
+#[tokio::test]
+async fn test_completion_valid_final_resources_round_trip() -> TestResult {
+    let (db, handle, _task, mut stream_rx) =
+        setup_with_worker("okres-worker", "x86_64-linux").await?;
+
+    let build_id = Uuid::new_v4();
+    let mut node = make_node("okres-drv");
+    node.pname = "okres-pkg".into();
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    let _assignment = recv_assignment(&mut stream_rx).await;
+
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            executor_id: "okres-worker".into(),
+            drv_key: test_drv_path("okres-drv"),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
+                built_outputs: vec![rio_proto::types::BuiltOutput {
+                    output_name: "out".into(),
+                    output_path: test_store_path("okres-out"),
+                    output_hash: vec![0u8; 32],
+                }],
+                start_time: Some(prost_types::Timestamp {
+                    seconds: 2000,
+                    nanos: 0,
+                }),
+                stop_time: Some(prost_types::Timestamp {
+                    seconds: 2010,
+                    nanos: 0,
+                }),
+                ..Default::default()
+            },
+            peak_memory_bytes: 1 << 20,
+            peak_cpu_cores: 1.5,
+            node_name: None,
+            hw_class: None,
+            final_resources: Some(rio_proto::types::ResourceUsage {
+                cpu_seconds_total: Some(12.5),
+                peak_io_pressure_pct: Some(42.5),
+                ..Default::default()
+            }),
+        })
+        .await?;
+    barrier(&handle).await;
+
+    let (cpu_secs, io_pct, peak_cpu): (Option<f64>, Option<f64>, Option<f64>) = sqlx::query_as(
+        "SELECT cpu_seconds_total, peak_io_pressure_pct, peak_cpu_cores \
+         FROM build_samples WHERE pname = 'okres-pkg'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        cpu_secs,
+        Some(12.5),
+        "in-domain cpu_seconds_total round-trips unfiltered"
+    );
+    assert_eq!(
+        io_pct,
+        Some(42.5),
+        "in-domain peak_io_pressure_pct round-trips unfiltered"
+    );
+    assert_eq!(
+        peak_cpu,
+        Some(1.5),
+        "in-domain peak_cpu_cores round-trips unfiltered"
+    );
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // path_tenants upsert on completion (per-tenant GC retention)
 // ---------------------------------------------------------------------------

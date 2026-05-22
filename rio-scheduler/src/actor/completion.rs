@@ -1555,8 +1555,16 @@ impl DagActor {
                 // 0.0 CPU cores → "no samples taken" (build exited in
                 // <1s before the 1Hz poller fired). Filtered to None so
                 // the SLA fit's saturation detector doesn't see a
-                // spurious 0.
-                let peak_cpu = (peak_cpu_cores > 0.0).then_some(peak_cpu_cores);
+                // spurious 0. Worker floats are untrusted: non-finite
+                // readings (±Inf, NaN) and magnitudes above the
+                // structural cores ceiling (sla::config::MAX_CORES_HARD)
+                // are likewise recorded as not-reported rather than
+                // poisoning the fit's saturation check.
+                // r[impl sched.executor.input-bounds+2]
+                let peak_cpu = (peak_cpu_cores.is_finite()
+                    && peak_cpu_cores > 0.0
+                    && peak_cpu_cores <= crate::sla::config::MAX_CORES_HARD)
+                    .then_some(peak_cpu_cores);
                 // Raw sample for the SLA fit. Appends every completion
                 // — the fit needs the full distribution, not a smoothed
                 // scalar. Best-effort: warn, never fail completion on
@@ -1618,17 +1626,39 @@ impl DagActor {
                         cpu_limit_cores: {
                             let assigned =
                                 state.sched.last_intent.as_ref().map(|i| f64::from(i.cores));
-                            let cgroup = final_res.and_then(|r| r.cpu_limit_cores);
+                            // Worker-supplied cgroup reading: non-finite,
+                            // non-positive, or above MAX_CORES_HARD →
+                            // treat as not-reported, so it can neither
+                            // win the min() against the scheduler's own
+                            // assigned-cores figure nor land raw on the
+                            // no-intent (recovery) arm.
+                            // r[impl sched.executor.input-bounds+2]
+                            let cgroup = final_res.and_then(|r| r.cpu_limit_cores).filter(|c| {
+                                c.is_finite()
+                                    && *c > 0.0
+                                    && *c <= crate::sla::config::MAX_CORES_HARD
+                            });
                             match (assigned, cgroup) {
                                 (Some(a), Some(c)) => Some(a.min(c)),
                                 (a, c) => a.or(c),
                             }
                         },
-                        cpu_seconds_total: final_res.and_then(|r| r.cpu_seconds_total),
+                        // Worker-supplied floats below: kept only when
+                        // finite and inside their physical domain
+                        // (cumulative CPU-seconds ≥ 0, PSI pct ∈ [0,100]
+                        // per the proto contract), else None ("not
+                        // reported") — same convention as the 0-cores
+                        // filter above. Integer magnitudes keep their
+                        // i64::MAX clamps. r[impl sched.executor.input-bounds+2]
+                        cpu_seconds_total: final_res
+                            .and_then(|r| r.cpu_seconds_total)
+                            .filter(|s| s.is_finite() && *s >= 0.0),
                         peak_disk_bytes: final_res
                             .and_then(|r| r.peak_disk_bytes)
                             .map(|b| b.min(i64::MAX as u64) as i64),
-                        peak_io_pressure_pct: final_res.and_then(|r| r.peak_io_pressure_pct),
+                        peak_io_pressure_pct: final_res
+                            .and_then(|r| r.peak_io_pressure_pct)
+                            .filter(|p| p.is_finite() && (0.0..=100.0).contains(p)),
                         // drv-declared sizing inputs — on the dag node.
                         version: state.version.clone(),
                         enable_parallel_building: state.enable_parallel_building,

@@ -275,13 +275,23 @@ the physical line count (tripwire
 #(refs.metric)("rio_scheduler_log_flush_span_fallback_total")) and the
 `drv_logs` numeric binds clamp at `i64::MAX`, which keeps every recorded
 `(first_line, line_count)` pair non-negative and overflow-free for the read
-path. The `BuildResult` resource telemetry persisted to `build_samples`
-(`peak_memory_bytes`, `peak_cpu_cores`, the start/stop-derived duration)
-already complies via the same branch — actor-side `i64::MAX` clamps,
-finiteness/positivity checks, and the duration sanity bound in
-`completion.rs`. Heartbeat resource numerics and `PrefetchComplete` counters
-stay enumerated as `n/a`: they are not folded into row metadata or ordering
-state.
+path. The `CompletionReport` resource telemetry persisted to `build_samples`
+(`peak_memory_bytes`, `peak_cpu_cores`, the duration derived from the
+`BuildResult` start/stop timestamps) and the `CompletionReport.final_resources`
+cgroup snapshot folded into the same row (`cpu_limit_cores`,
+`cpu_seconds_total`, `peak_io_pressure_pct`, `peak_disk_bytes`) comply via
+validation at the actor's sample-record step in `completion.rs`: integer
+magnitudes clamp at `i64::MAX`, worker-supplied floats are kept only when
+finite and inside their physical domain (cores limits in
+`(0, MAX_CORES_HARD]`, non-negative CPU-seconds, pressure in [0, 100]) and
+are recorded as not-reported (SQL `NULL`) otherwise, and the duration sanity
+bound rejects out-of-order or >30-day timestamps. The bounds reject the
+structurally impossible, not the merely implausible — an in-domain reading is
+still self-reported telemetry. The remaining `final_resources` counters are
+decoded and dropped without being folded into the row and are enumerated as
+`n/a` in the bounds table. Heartbeat resource numerics and `PrefetchComplete`
+counters stay enumerated as `n/a`: they are not folded into row metadata or
+ordering state.
 
 #r("sched.merge.exec-correlation+7")[
   The scheduler MUST set `build_derivations.exec_id` for every interested

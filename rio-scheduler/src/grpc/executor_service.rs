@@ -88,8 +88,21 @@ const MAX_DRVS_PER_STREAM: usize = 8;
 //   CompletionReport.assignment_token → never read in the recv arm        → document (decoded then dropped)
 //   CompletionReport.node_name        → build_samples.node_name           → None if > MAX_IDENT_LEN
 //   CompletionReport.hw_class         → build_samples.hw_class            → None if > MAX_IDENT_LEN
-//   BuildResult.peak_memory_bytes / peak_cpu_cores → build_samples row    → clamped/validated actor-side
-//                                       (completion.rs: .min(i64::MAX) clamp, finiteness/positivity checks)
+//   CompletionReport.peak_memory_bytes / peak_cpu_cores → build_samples row → validated actor-side (completion.rs
+//                                       record_build_sample: memory .min(i64::MAX) clamp; peak_cpu kept only if
+//                                       finite, > 0 and ≤ sla::config::MAX_CORES_HARD, else NULL "not reported")
+//   CompletionReport.final_resources.{cpu_limit_cores, cpu_seconds_total, peak_io_pressure_pct, peak_disk_bytes}
+//                                     → same build_samples row            → validated actor-side (completion.rs
+//                                       record_build_sample: floats kept only if finite and in-domain (cores > 0
+//                                       and ≤ MAX_CORES_HARD, seconds ≥ 0 — magnitude not otherwise bounded,
+//                                       pct ∈ [0,100]), else NULL; a kept cpu_limit_cores is still min()'d with
+//                                       the dispatch intent; peak_disk_bytes .min(i64::MAX) clamp)
+//   CompletionReport.final_resources.{cpu_fraction, memory_used_bytes, memory_total_bytes, disk_used_bytes,
+//                                     disk_total_bytes}                   → numeric → n/a (decoded, forwarded to
+//                                       the actor, dropped at the build_samples fold — never persisted)
+//   BuildResult.start_time / stop_time → build_samples.duration_secs      → validated actor-side (domain.rs
+//                                       duration(): out-of-order / out-of-range timestamps → None; completion.rs
+//                                       0 < d < 30 days gate, else no sample row is written)
 //   BuildResult.error_msg             → build_event_log × N, ring, term   → truncate to MAX_ERROR_MSG_LEN
 //   BuildResult.built_outputs[].name/path/hash → PG realisations          → validated actor-side (declared-output
 //                                       membership + StorePath::parse + [u8;32]); the pre-validation mailbox
